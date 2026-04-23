@@ -1,0 +1,97 @@
+{
+  "servers": {
+    "github-agentic-workflows": {
+      "command": "/opt/homebrew/bin/gh",
+      "args": ["aw", "mcp-server"],
+      "type": "stdio"
+    },
+    "github": {
+      "url": "https://api.githubcopilot.com/mcp/",
+      "type": "http"
+    },
+    "context7": {
+      "command": "/opt/homebrew/bin/npx",
+      "args": ["-y", "@upstash/context7-mcp"],
+      "env": {
+        "PATH": "/opt/homebrew/bin:/opt/homebrew/opt/node@22/bin:/usr/local/bin:/usr/bin:/bin"
+      },
+      "type": "stdio"
+    },
+    "mcp-mermaid": {
+      "command": "/opt/homebrew/bin/npx",
+      "args": ["-y", "mcp-mermaid"],
+      "env": {
+        "PATH": "/opt/homebrew/bin:/opt/homebrew/opt/node@22/bin:/usr/local/bin:/usr/bin:/bin"
+      },
+      "type": "stdio"
+    },
+    "browsermcp": {
+      "command": "/opt/homebrew/bin/npx",
+      "args": ["-y", "@browsermcp/mcp"],
+      "env": {
+        "PATH": "/opt/homebrew/bin:/opt/homebrew/opt/node@22/bin:/usr/local/bin:/usr/bin:/bin"
+      },
+      "type": "stdio"
+    },
+    "gcp": {
+      "command": "/opt/homebrew/bin/npx",
+      "args": ["-y", "gcp-mcp"],
+      "env": {
+        "PATH": "/opt/homebrew/bin:/opt/homebrew/opt/node@22/bin:/usr/local/bin:/usr/bin:/bin"
+      },
+      "type": "stdio"
+    },
+    "notion": {
+      "url": "https://mcp.notion.com/mcp",
+      "type": "http"
+    },
+    "tavily": {
+      "command": "/opt/homebrew/bin/npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://mcp.tavily.com/mcp/?tavilyApiKey=${TAVILY_API_KEY}"
+      ],
+      "env": {
+        "PATH": "/opt/homebrew/bin:/opt/homebrew/opt/node@22/bin:/usr/local/bin:/usr/bin:/bin"
+      },
+      "type": "stdio"
+    },
+    "peekaboo": {
+      "command": "/opt/homebrew/bin/npx",
+      "args": ["-y", "@steipete/peekaboo", "mcp"],
+      "env": {
+        "PATH": "/opt/homebrew/bin:/opt/homebrew/opt/node@22/bin:/usr/local/bin:/usr/bin:/bin",
+        "PEEKABOO_AI_PROVIDERS": "openai/gpt-5.1,anthropic/claude-opus-4"
+      },
+      "type": "stdio"
+    },
+    "mcp-atlassian": {
+      "command": "${HOME}/.local/bin/uvx",
+      "args": ["--python=3.12", "mcp-atlassian"],
+      "env": {
+        "JIRA_URL": "${JIRA_URL}",
+        "JIRA_USERNAME": "${JIRA_USERNAME}",
+        "JIRA_API_TOKEN": "${JIRA_API_TOKEN}",
+        "CONFLUENCE_URL": "${CONFLUENCE_URL}",
+        "CONFLUENCE_USERNAME": "${CONFLUENCE_USERNAME}",
+        "CONFLUENCE_API_TOKEN": "${CONFLUENCE_API_TOKEN}"
+      },
+      "type": "stdio"
+    }
+  },
+  "inputs": [
+    {
+      "id": "tavily-api-key",
+      "type": "promptString",
+      "description": "Tavily API Key",
+      "password": true
+    },
+    {
+      "id": "atlassian-api-token",
+      "type": "promptString",
+      "description": "Atlassian API Token (Jira/Confluence)",
+      "password": true
+    }
+  ]
+}

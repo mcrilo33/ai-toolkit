@@ -1,0 +1,44 @@
+---
+description: Standard .gitignore template — read when creating or editing .gitignore files
+globs: "**/.gitignore"
+alwaysApply: false
+---
+# .gitignore Template
+
+Always ignore:
+
+```gitignore
+# Environment
+.env
+.env.*
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Dependencies
+node_modules/
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets (never commit)
+*.pem
+*.key
+*credentials*
+*secret*
+```

@@ -1,0 +1,57 @@
+# Development Workflow
+
+## Task Lifecycle
+
+```
+SOURCE → DEFINE → EXECUTE → CLOSE
+```
+
+| Step | Purpose | Artifacts |
+|------|---------|-----------|
+| SOURCE | Get or create work item | Issue/task linked to branch |
+| DEFINE | Clarify "done" criteria | Tests (TDD) or checklist |
+| EXECUTE | Implement until criteria met | Working code |
+| CLOSE | Record and ship | Commit, PR, closed issue |
+
+## Commands
+
+| Command | Skill | Purpose |
+|---------|-------|---------|
+| `/source` | `source-task` | Fetch task, create branch |
+| `/close` | `close-task` | Commit, push, create PR |
+
+## Workflow Variations
+
+### TDD Development
+
+```
+SOURCE → DEFINE (write tests) → EXECUTE (make tests pass) → CLOSE (2 commits)
+```
+
+- First commit: tests only
+- Second commit: implementation
+- Use `tdd-workflow` skill for guidance
+
+### Simple Development
+
+```
+SOURCE → DEFINE (mental/checklist) → EXECUTE → CLOSE (1 commit)
+```
+
+## During Work (EXECUTE)
+
+- Stay within scope defined in DEFINE step
+- Flag if work expands beyond original definition
+- Follow existing patterns (see `guidelines.md`)
+- For multi-step tasks, state a brief plan with verification checkpoints:
+  1. [Step] → verify: [how to confirm]
+  2. [Step] → verify: [how to confirm]
+- Strong success criteria ("tests X, Y, Z pass") > weak criteria ("make it work")
+
+## Related Skills
+
+- `source-task` — SOURCE step automation
+- `close-task` — CLOSE step automation
+- `tdd-workflow` — TDD guidance for DEFINE
+- `generate-commit-message` — Commit message format
+- `generate-tests` — Test generation

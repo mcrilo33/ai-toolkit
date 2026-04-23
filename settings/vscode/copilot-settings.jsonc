@@ -1,0 +1,112 @@
+// GitHub Copilot & Chat settings extracted from VS Code Insiders settings.json
+// Copy relevant keys into your own settings.json
+{
+  // --- Copilot Core ---
+  "github.copilot.enable": {
+    "*": true,
+    "plaintext": false,
+    "scminput": false
+  },
+
+  // --- Next Edit Suggestions ---
+  "github.copilot.nextEditSuggestions.enabled": true,
+  "github.copilot.nextEditSuggestions.fixes": true,
+
+  // --- Chat Features ---
+  "github.copilot.chat.agent.autoFix": true,
+  "github.copilot.chat.copilotMemory.enabled": true,
+  "github.copilot.chat.reviewAgent.enabled": true,
+  "github.copilot.chat.reviewSelection.enabled": true,
+  "github.copilot.chat.codesearch.enabled": true,
+  "github.copilot.chat.anthropic.thinking.budgetTokens": 128000,
+  "github.copilot.chat.setupTests.enabled": true,
+  "github.copilot.chat.getSearchViewResultsSkill.enabled": true,
+  "github.copilot.chat.installExtensionSkill.enabled": true,
+  "github.copilot.chat.notebook.followCellExecution.enabled": true,
+  "github.copilot.chat.cli.forkSessions.enabled": true,
+
+  // --- Custom OAI Models (LiteLLM proxy) ---
+  "github.copilot.chat.customOAIModels": [
+    {
+      "id": "o3-mini",
+      "name": "Claude Opus 4 (via LiteLLM)",
+      "url": "http://localhost:4000",
+      "apiKey": "${LITELLM_MASTER_KEY}",
+      "isDefault": false,
+      "sendSystemMessage": true,
+      "supportsToolCalling": true
+    }
+  ],
+
+  // --- MCP ---
+  "chat.mcp.autostart": "newAndOutdated",
+
+  // --- Chat UI ---
+  "chat.commandCenter.enabled": false,
+  "chat.viewProgressBadge.enabled": true,
+  "chat.restoreLastPanelSession": true,
+  "chat.viewSessions.orientation": "stacked",
+  "chat.editor.fontSize": 14,
+
+  // --- Auto-Approval: File Edits ---
+  "chat.tools.edits.autoApprove": {
+    "**Dockerfile*": false,
+    "**/{Makefile,Rakefile,Taskfile*,justfile}": false,
+    "**/.github{docker-compose*.yml,compose*.yml}": false,
+    "**/{terraform.tfvars,*.auto.tfvars}": false
+  },
+
+  // --- Auto-Approval: Terminal Commands ---
+  "chat.tools.terminal.autoApprove": {
+    "/./": true,
+    "rm": false,
+    "sudo": false,
+    "mkfs": false,
+    "dd": false,
+    "chmod": false,
+    "chown": false,
+    "curl": false,
+    "wget": false,
+    "ssh": false,
+    "scp": false,
+    "/^git (push|reset|rebase|force)/": false,
+    "eval": false,
+    "> /": false
+  },
+  "chat.tools.terminal.ignoreDefaultAutoApproveRules": true,
+
+  // --- Auto-Approval: Tool Calls ---
+  "chat.tools.eligibleForAutoApproval": {
+    "*": true,
+    "mcp_github_create_pull_request": false,
+    "mcp_github_merge_pull_request": false,
+    "mcp_github_push_files": false,
+    "mcp_github_create_or_update_file": false,
+    "mcp_github_delete_file": false,
+    "mcp_github_add_issue_comment": false,
+    "mcp_github_create_repository": false,
+    "mcp_github_assign_copilot_to_issue": false,
+    "mcp_github_create_pull_request_with_copilot": false,
+    "create_directory": false,
+    "kill_terminal": false
+  },
+
+  // --- Subagents ---
+  "chat.subagents.allowInvocationsFromSubagents": true,
+
+  // --- External Paths ---
+  "chat.agent.allowedExternalPaths": [
+    "${HOME}/Downloads",
+    "${HOME}/.agents",
+    "${HOME}/.config",
+    "${HOME}/Documents",
+    "${HOME}/Desktop",
+    "${HOME}/Library/Application Support/Code/User",
+    "${HOME}/Library/Application Support/Code/User/mcp.json",
+    "${HOME}/Library/Application Support/Code/User/settings.json"
+  ],
+
+  // --- GitLens AI ---
+  "gitlens.ai.model": "vscode",
+  "gitlens.ai.vscode.model": "copilot:gpt-4.1"
+}

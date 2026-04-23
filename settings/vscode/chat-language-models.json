@@ -1,0 +1,17 @@
+[
+  {
+    "name": "CustomOAI",
+    "vendor": "customoai",
+    "models": [
+      {
+        "id": "0",
+        "name": "Claude Opus 4 (via LiteLLM)",
+        "url": "http://localhost:4000",
+        "apiKey": "${LITELLM_MASTER_KEY}",
+        "isDefault": false,
+        "sendSystemMessage": true,
+        "supportsToolCalling": true
+      }
+    ]
+  }
+]
