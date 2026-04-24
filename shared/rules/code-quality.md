@@ -1,27 +1,5 @@
 # Code Quality
 
-## Error Handling
-
-- Provide informative error messages with context (what failed, why, what to do)
-- Use guard clauses for early returns to reduce nesting
-- Fail fast: validate inputs at function boundaries
-- Catch specific exceptions; never bare `except:`
-- Reraise with context when wrapping errors
-- Language-specific details live in their respective style rules
-
-## Logging
-
-- Use the language's logging framework, not print statements
-- Log at appropriate levels: DEBUG for dev, INFO for flow, WARNING for recoverable, ERROR for failures
-- Include correlation IDs or context for traceability
-
-## Testing
-
-- Write tests for edge cases, not just happy paths
-- Test failure modes explicitly
-- Prefer isolated unit tests; mock external dependencies
-- Name tests to describe the behavior being verified
-
 ## Clarity Over Cleverness
 
 - Write code that reads like prose; optimize for the next developer
@@ -44,6 +22,21 @@
 - Follow existing patterns in the codebase before inventing new ones
 - When in doubt, check how similar functionality is implemented elsewhere
 - Only fix style violations in code you're actively modifying
+
+## Error Handling
+
+- Provide informative error messages with context (what failed, why, what to do)
+- Use guard clauses for early returns to reduce nesting
+- Fail fast: validate inputs at function boundaries
+- Catch specific exceptions; never bare `except:`
+- Reraise with context when wrapping errors
+- Language-specific details live in their respective style rules
+
+## Logging
+
+- Use the language's logging framework, not print statements
+- Log at appropriate levels: DEBUG for dev, INFO for flow, WARNING for recoverable, ERROR for failures
+- Include correlation IDs or context for traceability
 
 ## Performance
 

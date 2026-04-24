@@ -1,0 +1,76 @@
+# Per-tool frontmatter for rules.
+# Key = filename without .md extension.
+# Shared fields at top level; per-tool overrides nested under tool name.
+# applyTo: "**" means always active for Copilot.
+
+guidelines:
+  name: "Guidelines"
+  description: "Agent behavior, clarification, autonomy, prohibitions, and response style"
+  applyTo: "**"
+  alwaysApply: true
+
+security:
+  name: "Security"
+  description: "Secrets management, credentials handling, macOS Keychain storage, input validation, and dependency security"
+  applyTo: "**"
+  alwaysApply: true
+
+code-quality:
+  name: "Code Quality"
+  description: "Design principles (clarity, single responsibility, consistency), error handling, logging, performance, documentation, surgical changes, and dependency management"
+  applyTo: "**/*.{py,ts,tsx,js,jsx,go,rs,java}"
+  globs: "**/*.{py,ts,tsx,js,jsx,go,rs,java}"
+  paths: "**/*.{py,ts,tsx,js,jsx,go,rs,java}"
+  alwaysApply: false
+
+python-style:
+  name: "Python Standards"
+  description: "Type annotations, docstrings, naming, imports, modern Python, Pydantic, and async patterns"
+  applyTo: "**/*.py"
+  globs: "**/*.py"
+  paths: "**/*.py"
+  alwaysApply: false
+
+# git-conventions: TODO move to a skill
+#   name: "Git Conventions"
+#   description: "Commit messages, branching, PRs, tags, and collaboration conventions"
+#   applyTo: "**"
+#   alwaysApply: false
+
+gitignore-template:
+  name: "Gitignore Template"
+  description: "Standard .gitignore patterns for environment, IDE, dependencies, build artifacts, and secrets"
+  applyTo: "**/.gitignore"
+  globs: "**/.gitignore"
+  paths: "**/.gitignore"
+  alwaysApply: false
+
+markdown-style:
+  name: "Markdown Style"
+  description: "Markdown structure, formatting, code blocks, lists, links, tables, and README conventions"
+  applyTo: "**/*.md"
+  globs: "**/*.md"
+  paths: "**/*.md"
+  alwaysApply: false
+
+mermaid-conventions:
+  name: "Mermaid Conventions"
+  description: "Diagram type selection, flowcharts, sequence, class, ER, and state diagrams"
+  applyTo: "**/*.md"
+  globs: "**/*.md"
+  paths: "**/*.md"
+  alwaysApply: false
+
+pytest-conventions:
+  name: "Pytest Conventions"
+  description: "Test file layout, naming, AAA structure, fixtures, parametrize, mocking, and assertions"
+  applyTo: "**/test_*.py,**/tests/**/*.py,**/conftest.py"
+  globs: "**/test_*.py,**/tests/**/*.py,**/conftest.py"
+  paths: "**/test_*.py,**/tests/**/*.py,**/conftest.py"
+  alwaysApply: false
+
+workflow:
+  name: "Development Workflow"
+  description: "Task lifecycle (SOURCE → DEFINE → EXECUTE → CLOSE), TDD, and related skills"
+  applyTo: "**"
+  alwaysApply: false

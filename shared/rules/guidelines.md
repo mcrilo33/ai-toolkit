@@ -33,6 +33,12 @@
 - Do not make assumptions about missing context — ask instead
 - Do not hallucinate APIs, functions, or imports that may not exist
 
+### Tool Unavailability
+- If a task requires a specific tool (MCP server, API, CLI) that is unavailable or inaccessible, **stop immediately**
+- State the blocker: which tool is missing and why
+- Do NOT produce a workaround, manual steps, or alternative content unless the user explicitly asks for one
+- Do NOT attempt the task with a different approach without asking first
+
 ### Self-Correction
 - If you realize a mistake mid-response, stop and correct immediately
 - When a solution doesn't work, analyze why before trying alternatives
@@ -53,30 +59,3 @@
 - Restating the obvious or generic advice
 - Long explanations when code is self-documenting
 - Obvious or self-explanatory comments in code
-
-## Security (Non-Negotiable)
-
-### Secrets & Credentials (CRITICAL)
-- **NEVER hardcode secrets, API keys, passwords, or credentials in code** — even temporarily
-- When handling secrets, ALWAYS:
-  1. Use environment variables in code
-  2. Update code to read from `os.environ` or equivalent
-- Never log or print sensitive data (tokens, passwords, PII)
-- Before committing: verify no secrets are present in the diff
-
-### Secrets Storage (macOS Keychain)
-
-- Store all personal secrets in macOS Keychain via `security add-generic-password`
-- Load in shell via `$(security find-generic-password -a "$USER" -s "KEY_NAME" -w 2>/dev/null)`
-- Reference as env vars in configs: `${env:VAR_NAME}` (VS Code) / `${VAR_NAME}` (Cursor)
-- Never write secrets to `.env`, `.zshrc`, or config files — even temporarily
-
-### Input Validation
-- Validate and sanitize all external inputs
-- Use parameterized queries for database operations
-- Escape user content before rendering in HTML/templates
-
-### Dependencies
-- Prefer well-maintained libraries with security track records
-- Pin dependency versions in production
-- Be cautious with `eval()`, `exec()`, or dynamic code execution

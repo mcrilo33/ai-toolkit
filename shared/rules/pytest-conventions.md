@@ -1,5 +1,11 @@
 # Pytest Conventions
 
+## Principles
+
+- Cover edge cases and boundary conditions, not just happy paths
+- Test failure modes explicitly — verify that errors are raised, messages are correct, and state is unchanged
+- Keep tests isolated; mock external dependencies at the boundary, not internals
+
 ## File Layout
 
 ```

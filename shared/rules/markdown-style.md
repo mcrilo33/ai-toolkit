@@ -102,19 +102,6 @@ See the [Python docs][python] and [Ruff][ruff] for more info.
 - Keep cells concise; link to details if needed
 - Use `—` or `N/A` for empty cells, not blank
 
-## README Structure
-
-### Recommended Sections
-
-1. **Title** + brief one-line description
-2. **Overview**: 2-3 sentences on what it does and why
-3. **Installation**: copy-paste commands
-4. **Quick Start**: minimal working example
-5. **Usage**: detailed examples (or link to docs)
-6. **Configuration**: options, environment variables
-7. **Contributing**: how to contribute (or link to CONTRIBUTING.md)
-8. **License**: license type + link
-
 ### Keep It Scannable
 
 - Use the first sentence of each section to summarize
