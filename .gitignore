@@ -6,8 +6,15 @@
 # IDE
 .idea/
 .vscode/
+.claude/
+.cursor/
+.github/
 *.swp
 *.swo
+
+# Python
+__pycache__/
+*.pyc
 
 # OS
 .DS_Store
