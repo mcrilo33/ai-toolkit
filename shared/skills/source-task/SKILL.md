@@ -35,6 +35,15 @@ Derive the branch name from the issue:
 
 Slug rules: lowercase, hyphens, max 4 words from title.
 
+Before creating, verify the name is available:
+
+```bash
+git fetch origin
+git branch -a | grep "<branch-name>"
+```
+
+If a conflict is found, append an incremental suffix (`-v2`, `-v3`) or ask the user.
+
 ```bash
 git checkout -b <branch-name>
 ```
@@ -51,9 +60,10 @@ Present to the user:
 ## Ad-hoc Tasks (No Issue)
 
 1. Summarize the request back to confirm understanding
-2. Suggest creating a GitHub issue for non-trivial work
-3. Create a branch with a descriptive name: `feature/<slug>` or `fix/<slug>`
-4. Proceed to DEFINE step
+2. If uncommitted changes exist, run `git diff` (or `git diff --cached` for staged) and analyze them to propose a branch name and type
+3. Suggest creating a GitHub issue for non-trivial work
+4. Create a branch with a descriptive name: `feature/<slug>` or `fix/<slug>`
+5. Proceed to DEFINE step
 
 ## Edge Cases
 

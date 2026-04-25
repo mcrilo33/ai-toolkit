@@ -66,6 +66,13 @@
 - Be explicit about nullability and optional parameters
 - Use type annotations as living documentation
 
+### External API Verification
+
+- Verify framework/library API usage against current, authoritative docs before writing code
+- Use Context7 proactively to fetch version-specific docs — don't wait for the user to ask
+- Never assume an API exists, kept its name, or behaves the same across versions
+- Cite the source when a decision relies on external documentation
+
 ## Surgical Changes
 
 - Don't "improve" adjacent code, comments, or formatting

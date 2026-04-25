@@ -4,30 +4,23 @@ Centralized AI agent configs for **GitHub Copilot**, **Cursor**, and **Claude Co
 
 ## Overview
 
-This repository is the single source of truth for AI agent rules, skills, prompts, and settings across multiple AI-powered development tools. Instead of maintaining separate configurations in each tool's dotfiles, everything lives here — with tool-specific overlays generated from shared canonical configs.
+Single source of truth for AI agent rules, skills, prompts, and settings across multiple AI-powered development tools. Everything lives in `shared/` — the sync script generates tool-specific formats (frontmatter, file extensions) on demand.
 
 ## Structure
 
 ```
 ai-toolkit/
-├── shared/                   # Canonical, tool-agnostic configs
+├── shared/                   # Single source of truth
 │   ├── rules/                # Coding guidelines, conventions, style guides
-│   └── skills/               # Reusable agent skills (close-task, TDD, etc.)
+│   ├── skills/               # Reusable agent skills (close-task, TDD, etc.)
+│   ├── prompts/              # Reusable prompts (commit-msg, etc.)
+│   └── agents/               # Agent definitions
 │
-├── copilot/                  # GitHub Copilot overlay (.github/ format)
-│   ├── copilot-instructions.md
-│   ├── instructions/         # *.instructions.md with applyTo frontmatter
-│   ├── skills/               # SKILL.md with Copilot frontmatter
-│   ├── agents/               # *.agent.md
-│   └── prompts/              # *.prompt.md
+├── claude/                   # Claude Code settings (tool-specific only)
+│   └── settings.json
 │
-├── cursor/                   # Cursor overlay
-│   ├── rules/                # *.mdc with description/globs/alwaysApply frontmatter
-│   └── skills/               # SKILL.md with Cursor conventions
-│
-├── claude/                   # Claude Code overlay
-│   ├── settings.json
-│   └── skills/
+├── copilot/                  # Copilot placeholder (agents)
+│   └── agents/
 │
 ├── settings/                 # IDE/CLI settings (LLM-related only)
 │   ├── vscode/               # Copilot settings, MCP servers, custom models
@@ -35,10 +28,25 @@ ai-toolkit/
 │   └── claude/               # Claude Code settings
 │
 └── scripts/
-    ├── install.sh            # Symlinks settings + tool overlays to expected locations
-    ├── sync-to-repo.sh       # Copies copilot/ into a target repo's .github/
-    └── diff-check.sh         # Detects drift between shared/ and tool overlays
+    ├── install.sh            # Symlinks tool settings to expected locations
+    └── sync-to-repo.sh       # Generates tool configs from shared/ into a repo
 ```
+
+## How it works
+
+### `shared/` = source of truth
+
+All rules, skills, prompts, and agents live in `shared/` as plain Markdown — no tool-specific frontmatter, no vendor lock-in.
+
+### `sync-to-repo.sh` = generates tool configs
+
+The sync script reads from `shared/` and generates the correct format for each tool:
+
+| Tool | Output location | What it generates |
+|------|----------------|-------------------|
+| **Copilot** | `<repo>/.github/` | `copilot-instructions.md`, `instructions/*.instructions.md` (with `applyTo`), `skills/`, `prompts/*.prompt.md`, `agents/` |
+| **Cursor** | `<repo>/.cursor/` | `rules/*.mdc` (with `description`/`globs`/`alwaysApply`), `skills/` |
+| **Claude** | `<repo>/.claude/` + `CLAUDE.md` | `CLAUDE.md` (guidelines), `skills/` |
 
 ## Setup
 
@@ -49,85 +57,91 @@ git clone https://github.com/mcrilo33/ai-toolkit.git ~/Repos/ai-toolkit
 cd ~/Repos/ai-toolkit
 ```
 
-### 2. Configure environment variables
-
-```bash
-cp .env.example .env
-# Edit .env with your actual values
-# OR store secrets in macOS Keychain (recommended):
-security add-generic-password -a "$USER" -s "LITELLM_MASTER_KEY" -w "your-key"
-```
-
-### 3. Install symlinks
+### 2. Install settings
 
 ```bash
 ./scripts/install.sh
 ```
 
-This creates symlinks from the repo to each tool's expected config location:
+This symlinks tool settings (MCP configs, Claude settings) to their expected locations:
 
 | Tool | What gets linked |
 |------|-----------------|
-| Cursor | `cursor/rules/*.mdc` → `~/.cursor/rules/` |
-| Cursor | `cursor/skills/*` → `~/.cursor/skills/` |
 | Cursor | `settings/cursor/mcp.json` → `~/.cursor/mcp.json` |
 | Claude | `claude/settings.json` → `~/.claude/settings.json` |
-| Claude | `claude/skills/*` → `~/.claude/skills/` |
 
 > [!NOTE]
 > VS Code settings can't be symlinked (partial `settings.json`). Copy keys manually from `settings/vscode/copilot-settings.jsonc`.
 
-### 4. Sync Copilot configs to a repo
+### 3. Sync configs to a project
 
 ```bash
+# Sync all tools
 ./scripts/sync-to-repo.sh ~/Repos/my-project
+
+# Sync a specific tool
+./scripts/sync-to-repo.sh ~/Repos/my-project copilot
+./scripts/sync-to-repo.sh ~/Repos/my-project cursor
+./scripts/sync-to-repo.sh ~/Repos/my-project claude
 ```
 
-This copies `copilot/` → `<repo>/.github/` for per-repo Copilot instructions.
+### 4. Configure environment variables
 
-## How it works
+#### Secrets (store in macOS Keychain)
 
-### Shared configs (`shared/`)
-
-The `shared/` directory contains **tool-agnostic** rules and skills. These are the canonical source of truth — no tool-specific frontmatter, no vendor lock-in.
-
-### Tool overlays
-
-Each tool directory (`copilot/`, `cursor/`, `claude/`) contains the same content adapted with tool-specific frontmatter:
-
-| Tool | Rule format | Frontmatter |
-|------|------------|-------------|
-| Copilot | `*.instructions.md` | `applyTo` glob |
-| Cursor | `*.mdc` | `description`, `globs`, `alwaysApply` |
-| Claude | `SKILL.md` | `name`, `description` |
-
-### Drift detection
+| Variable | Purpose | Used by |
+|----------|---------|---------|
+| `LITELLM_MASTER_KEY` | LiteLLM proxy API key | VS Code (Copilot custom models) |
+| `OPENAI_API_KEY` | OpenAI API key | General LLM access |
+| `GITHUB_MCP_TOKEN` | GitHub personal access token | Cursor MCP server |
+| `TAVILY_API_KEY` | Tavily search API key | VS Code & Cursor MCP servers |
+| `JIRA_API_TOKEN` | Jira API token | VS Code & Cursor MCP servers |
+| `CONFLUENCE_API_TOKEN` | Confluence API token | VS Code & Cursor MCP servers |
 
 ```bash
-./scripts/diff-check.sh
+# Store each secret in macOS Keychain:
+security add-generic-password -a "$USER" -s "LITELLM_MASTER_KEY" -w "your-key"
+security add-generic-password -a "$USER" -s "GITHUB_MCP_TOKEN" -w "your-token"
 ```
 
-Compares `shared/` content against tool overlays to flag when they've diverged.
+#### Configuration (non-secret, user-specific)
 
-## Adding new rules
+| Variable | Purpose | Used by |
+|----------|---------|---------|
+| `JIRA_URL` | Jira instance URL | VS Code & Cursor MCP servers |
+| `JIRA_USERNAME` | Jira username / email | VS Code & Cursor MCP servers |
+| `CONFLUENCE_URL` | Confluence instance URL | VS Code & Cursor MCP servers |
+| `CONFLUENCE_USERNAME` | Confluence username / email | VS Code & Cursor MCP servers |
+| `ANTHROPIC_VERTEX_PROJECT_ID` | GCP project ID for Vertex AI | Claude Code |
+| `CLOUD_ML_REGION` | GCP region for Vertex AI | Claude Code |
 
-1. Create the canonical rule in `shared/rules/<name>.md`
-2. Create the Copilot version in `copilot/instructions/<name>.instructions.md` (add `applyTo` frontmatter)
-3. Create the Cursor version in `cursor/rules/<name>.mdc` (add `description`/`globs`/`alwaysApply` frontmatter)
-4. Run `./scripts/diff-check.sh` to verify consistency
+## Adding new content
 
-## Adding new skills
+### New rule
 
-1. Create the canonical skill in `shared/skills/<name>/SKILL.md`
-2. Copy to `copilot/skills/<name>/SKILL.md` (add Copilot frontmatter)
-3. Copy to `cursor/skills/<name>/SKILL.md` (add Cursor conventions)
-4. Optionally add to `claude/skills/<name>/SKILL.md`
+1. Create `shared/rules/<name>.md`
+2. Add frontmatter mappings in `sync-to-repo.sh` (Copilot `applyTo`, Cursor `description`/`globs`/`alwaysApply`)
+3. Run `sync-to-repo.sh` on your repos
+
+### New skill
+
+1. Create `shared/skills/<name>/SKILL.md`
+2. Add frontmatter mappings in `sync-to-repo.sh` (Copilot and Cursor skill metadata)
+3. Run `sync-to-repo.sh` on your repos
+
+### New prompt
+
+1. Create `shared/prompts/<name>.md`
+2. Run `sync-to-repo.sh` — Copilot prompts get `*.prompt.md` format automatically
+
+### New agent
+
+1. Create `shared/agents/<name>.agent.md`
+2. Run `sync-to-repo.sh` — agents are copied to `<repo>/.github/agents/`
 
 ## Environment variables
 
-All secrets are referenced via `${ENV_VAR}` placeholders. See `.env.example` for the full list.
-
-**Never commit actual secrets.** Store them in macOS Keychain:
+All secrets are referenced via `${ENV_VAR}` placeholders. **Never commit actual secrets.** Store them in macOS Keychain:
 
 ```bash
 security add-generic-password -a "$USER" -s "KEY_NAME" -w "value"

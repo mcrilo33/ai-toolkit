@@ -17,11 +17,13 @@ Guide through Test-Driven Development following the DEFINE → EXECUTE pattern.
 RED → GREEN → REFACTOR → (repeat)
 ```
 
-| Phase | What | Artifact |
-|-------|------|----------|
-| RED | Write failing test | Test that fails |
-| GREEN | Minimal code to pass | Passing test |
-| REFACTOR | Improve without changing behavior | Clean code, tests still pass |
+Each phase has a dedicated agent with strict scope boundaries:
+
+| Phase | Agent | Scope | Artifact |
+|-------|-------|-------|----------|
+| RED | `tdd-red` | Write tests ONLY — no production code | Failing test + commit |
+| GREEN | `tdd-green` | Write implementation ONLY — no test changes | Passing test + commit |
+| REFACTOR | `tdd-refactor` | Improve quality ONLY — no behavior changes | Clean code + commit |
 
 ## Step-by-Step
 
@@ -35,64 +37,43 @@ Before writing tests, clarify:
 
 If unclear, ask before proceeding.
 
-### Step 2: Write Failing Tests (RED)
+### Step 2: RED — Write Failing Tests
 
-1. Start with the simplest case — happy path
-2. Name tests to describe behavior: `test_<function>_<scenario>`
-3. Write assertion first, then work backwards
+Use the `tdd-red` agent. One test at a time, starting with the simplest happy path.
 
-```python
-def test_add_returns_sum_of_two_numbers():
-    result = add(2, 3)
-    assert result == 5
-```
+1. Write one test describing expected behavior.
+2. Run it — verify it fails for the right reason (`NameError`, `ImportError`, `AssertionError`).
+3. Commit tests separately.
 
 **Critical:** Do NOT implement the function yet.
 
-### Step 3: Verify Tests Fail
+### Step 3: GREEN — Minimal Implementation
 
-```bash
-pytest <test_file> -v
-```
+Use the `tdd-green` agent. Write just enough code to make tests pass.
 
-Expected: `NameError` or `AssertionError`. If tests pass without implementation, the tests are wrong.
+1. Run the failing test to confirm what's needed.
+2. Write the simplest code that satisfies the test.
+3. Run all tests — new and existing must be green.
+4. Do NOT modify any test.
 
-### Step 4: Commit Tests (Checkpoint)
+### Step 4: REFACTOR — Clean Up
 
-```bash
-git add tests/
-git commit -m "test(<scope>): add tests for <feature>"
-```
+Use the `tdd-refactor` agent. Improve code quality without changing behavior.
 
-### Step 5: Write Minimal Code (GREEN)
+1. Run all tests first — confirm green baseline.
+2. Apply one improvement at a time, running tests after each.
+3. If a test breaks, revert — the refactor was wrong, not the test.
 
-Just enough to make tests pass. Don't optimize yet.
-
-```python
-def add(a, b):
-    return a + b
-```
-
-### Step 6: Verify Tests Pass
-
-```bash
-pytest <test_file> -v
-```
-
-### Step 7: Refactor (if needed)
-
-Improve code quality without changing behavior. Run tests after each refactor.
-
-### Step 8: Commit Implementation
+### Step 5: Commit Implementation
 
 ```bash
 git add .
 git commit -m "feat(<scope>): implement <feature>"
 ```
 
-### Step 9: Add Edge Cases
+### Step 6: Add Edge Cases
 
-Return to RED for each edge case. Repeat cycle.
+Return to RED for each edge case. Repeat the cycle.
 
 ## Two-Commit Pattern
 

@@ -1,0 +1,61 @@
+# Per-tool frontmatter for skills.
+# Key = skill directory name.
+# Shared fields at top level; per-tool overrides nested under tool name.
+
+close-task:
+  name: "close-task"
+  description: "Close a task by committing, pushing, and creating a PR."
+
+context-map:
+  name: "context-map"
+  description: "Analyze the blast radius of a task — map files, dependencies, tests, and risks before implementation."
+  cursor:
+    description: "Analyze the blast radius of a task — map files, dependencies, tests, and risks before implementation. Use when scope is unclear, multiple files are involved, or user says /map or \"analyze impact\"."
+
+create-readme:
+  name: "create-readme"
+  description: "Create a README.md file for a project."
+  cursor:
+    description: "Create a README.md file for a project. Use ONLY when explicitly asked to create a new README."
+  cursor:
+    description: "Close a task by committing, pushing, and creating a PR. Use when the user says /close, \"ship it\", \"create PR\", or wants to wrap up."
+
+git-commit:
+  name: "git-commit"
+  description: "Stage changes, generate conventional commit messages, and execute git commits."
+  cursor:
+    description: "Stage changes, generate conventional commit messages, and execute git commits. Use when user asks to commit, says /commit, or wants to create a git commit."
+
+generate-docs:
+  name: "generate-docs"
+  description: "Generate or update documentation — docstrings, README, API docs, inline comments."
+  cursor:
+    description: "Generate or update documentation — docstrings, README, API docs, inline comments. Use ONLY when explicitly asked."
+
+generate-tests:
+  name: "generate-tests"
+  description: "Generate or update pytest tests — unit, integration, TDD mode."
+  cursor:
+    description: "Generate or update pytest tests — unit, integration, TDD mode. Use ONLY when explicitly asked."
+
+source-task:
+  name: "source-task"
+  description: "Fetch a task and create a feature branch from a GitHub issue or ad-hoc request."
+  cursor:
+    description: "Fetch a task and create a feature branch. Use when the user says /source or wants to begin work."
+
+tdd-workflow:
+  name: "tdd-workflow"
+  description: "Guide through TDD red-green-refactor cycle."
+
+pytest-coverage:
+  name: "pytest-coverage"
+  description: "Run pytest with coverage, find uncovered lines, and add tests to reach 100%."
+  cursor:
+    description: "Run pytest with coverage, find uncovered lines, and add tests to reach 100%. Use when user asks to increase coverage, check coverage, or get to 100%."
+
+acquire-codebase-knowledge:
+  name: "acquire-codebase-knowledge"
+  description: "Map, document, or onboard into an existing codebase. Produces seven docs in docs/codebase/ covering stack, structure, architecture, conventions, integrations, testing, and concerns."
+  cursor:
+    description: "Map, document, or onboard into an existing codebase. Use when the user says 'map this codebase', 'document this architecture', 'onboard me to this repo', or 'create codebase docs'."

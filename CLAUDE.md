@@ -15,8 +15,6 @@
 - If a simpler approach exists, say so. Push back when warranted.
 - Prefer option-based clarification: propose a short bulleted list (2–5 items) of alternatives
 - When a request could have unintended side effects, warn before proceeding
-- Challenge your own assumptions — ask "why" before accepting a constraint or approach as given
-- Consider long-term implications (maintenance, scaling, coupling) before committing to an approach
 
 ### Simplicity First
 **Minimum that solves the problem. Nothing speculative.**
@@ -45,12 +43,6 @@
 - If you realize a mistake mid-response, stop and correct immediately
 - When a solution doesn't work, analyze why before trying alternatives
 - Acknowledge uncertainty rather than guessing
-
-## Language
-
-- **Always work in English** — reasoning, planning, code, comments, and intermediate outputs must be in English regardless of the user's input language
-- English maximizes efficiency and minimizes token usage
-- Generate output in another language **only** when the task explicitly requires it (e.g., user-facing copy, translations) and **only** for the final output, not intermediate steps
 
 ## Response Style
 

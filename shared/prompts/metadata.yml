@@ -1,0 +1,8 @@
+# Per-tool frontmatter for prompts.
+# Key = filename without .md extension.
+# Shared fields at top level; per-tool overrides nested under tool name.
+
+commit-msg:
+  name: "commit-msg"
+  description: "Generate a conventional commit message from staged changes"
+  agent: "agent"

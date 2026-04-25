@@ -16,7 +16,7 @@ If anything is incomplete, flag it and ask whether to proceed or fix first.
 
 ### 2. Generate commit message
 
-Use the `generate-commit-message` skill. Follow `git-conventions.md` for format.
+Use the `git-commit` skill. Follow `git-conventions.md` for format.
 
 Key rules:
 

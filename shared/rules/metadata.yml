@@ -74,3 +74,15 @@ workflow:
   description: "Task lifecycle (SOURCE → DEFINE → EXECUTE → CLOSE), TDD, and related skills"
   applyTo: "**"
   alwaysApply: false
+
+github-actions:
+  name: "GitHub Actions CI/CD"
+  description: "Comprehensive guide for building robust, secure, and efficient CI/CD pipelines using GitHub Actions. Covers workflow structure, jobs, steps, environment variables, secret management, caching, matrix strategies, testing, and deployment strategies."
+  applyTo: ".github/workflows/*.yml,.github/workflows/*.yaml"
+  globs: ".github/workflows/*.yml,.github/workflows/*.yaml"
+  paths: ".github/workflows/*.yml,.github/workflows/*.yaml"
+  alwaysApply: false
+
+codexer:
+  description: "Library documentation research using Context7 — resolve, fetch, and answer from current docs for any language"
+  alwaysApply: false
