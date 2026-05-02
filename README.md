@@ -115,6 +115,49 @@ security add-generic-password -a "$USER" -s "GITHUB_MCP_TOKEN" -w "your-token"
 | `ANTHROPIC_VERTEX_PROJECT_ID` | GCP project ID for Vertex AI | Claude Code |
 | `CLOUD_ML_REGION` | GCP region for Vertex AI | Claude Code |
 
+## Agents
+
+Eleven specialized agents are defined in `shared/agents/`. Each has a dedicated
+persona, tool restrictions, handoff chains, and (where relevant) scoped hooks.
+
+| Agent | Role | Edits code? |
+| ----- | ---- | :---------: |
+| **architect** | System design, ADRs, diagrams | ❌ |
+| **planner** | Decompose tasks into ordered steps | ❌ |
+| **tdd-red** | Write failing pytest tests | ✅ |
+| **tdd-green** | Make failing tests pass | ✅ |
+| **tdd-refactor** | Improve code quality, tests green | ✅ |
+| **code-review** | Review changes, report findings | ❌ |
+| **debug** | Reproduce, diagnose, fix bugs | ✅ |
+| **refactor** | Cross-cutting renames/restructures | ✅ |
+| **security-reviewer** | Security audit | ❌ |
+| **devops** | CI/CD, infrastructure, deployment | ✅ |
+| **documentation** | Write/update docs | ✅ |
+
+### Handoffs
+
+Agents chain together via handoffs — buttons that transition to the next agent
+with context. Deterministic transitions (`send: true`) auto-submit; decision
+points let the user choose.
+
+```text
+# TDD full cycle (auto)
+architect → planner → tdd-red → tdd-green → tdd-refactor → code-review
+
+# Code review with findings (manual)
+code-review → { debug | refactor | security-reviewer } → code-review
+```
+
+### Agent-scoped hooks
+
+Code-editing agents run PostToolUse hooks (`post-edit-format.sh`,
+`quality-gate.sh`) to auto-format and lint after every edit. `debug` also runs
+`console-log-warn.sh`. `devops` runs PreToolUse hooks (`secrets-scan.sh`,
+`config-protection.sh`) to guard infrastructure files.
+
+See [`docs/agents-frontmatter.md`](docs/agents-frontmatter.md) for the full
+configuration reference.
+
 ## Adding new content
 
 ### New rule
