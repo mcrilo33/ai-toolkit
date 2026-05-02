@@ -97,3 +97,45 @@ github-issues:
   description: "Create, update, and manage GitHub issues using MCP tools. Use this skill when users want to create bug reports, feature requests, or task issues, update existing issues, add labels/assignees/milestones, set issue fields (dates, priority, custom fields), set issue types, manage issue workflows, link issues, add dependencies, or track blocked-by/blocking relationships. Triggers on requests like 'create an issue', 'file a bug', 'request a feature', 'update issue X', 'set the priority', 'set the start date', 'link issues', 'add dependency', 'blocked by', 'blocking', or any GitHub issue management task."
   allowed-tools: "run_in_terminal"
   argument-hint: "[issue title, number, or URL]"
+
+backend-patterns:
+  name: "backend-patterns"
+  description: "Production-ready backend patterns — service layer, repository, error handling, DB access, caching, auth, rate limiting, background jobs, and structured logging. Use when building or reviewing API services."
+  allowed-tools: "read_file semantic_search"
+  argument-hint: "[pattern: service-layer|caching|auth|rate-limiting|logging]"
+
+frontend-patterns:
+  name: "frontend-patterns"
+  description: "React / Next.js patterns — component composition, custom hooks, state management, data fetching, forms, performance, error boundaries, and accessibility. Use when building or reviewing frontend code."
+  allowed-tools: "read_file semantic_search"
+  argument-hint: "[pattern: components|hooks|state|forms|performance|a11y]"
+
+deployment-patterns:
+  name: "deployment-patterns"
+  description: "Deployment strategies (rolling, blue-green, canary), health checks, environment config, rollback procedures, and production readiness checklists. Use when designing or reviewing deployment pipelines."
+  allowed-tools: "read_file semantic_search"
+  argument-hint: "[pattern: rolling|blue-green|canary|health-checks|rollback]"
+
+docker-patterns:
+  name: "docker-patterns"
+  description: "Docker and Docker Compose patterns — multi-stage builds, local dev setup, volumes, networking, container security, and .dockerignore. Use when dockerizing applications or reviewing Dockerfiles."
+  allowed-tools: "read_file semantic_search"
+  argument-hint: "[pattern: dockerfile|compose|volumes|networking|security]"
+
+database-migrations:
+  name: "database-migrations"
+  description: "Safe database migration patterns — zero-downtime strategies, expand-contract, ORM workflows (Prisma, Django, Alembic, golang-migrate), and anti-patterns. Use when adding, modifying, or reviewing migrations."
+  allowed-tools: "read_file semantic_search run_in_terminal"
+  argument-hint: "[migration type: add-column|rename|remove|index|data-migration]"
+
+api-design:
+  name: "api-design"
+  description: "REST API design patterns — resource naming, HTTP methods, status codes, response format, pagination, filtering, sorting, rate limiting, and versioning. Use when designing or reviewing API endpoints."
+  allowed-tools: "read_file semantic_search"
+  argument-hint: "[topic: resources|status-codes|pagination|filtering|versioning]"
+
+security-review:
+  name: "security-review"
+  description: "Interactive security audit — 10-point checklist covering secrets, input validation, SQL injection, auth, XSS, CSRF, rate limiting, data exposure, dependencies, and infrastructure. Use when auditing code before shipping."
+  allowed-tools: "read_file grep_search semantic_search get_changed_files run_in_terminal"
+  argument-hint: "[scope: file path, module, or 'full']"
