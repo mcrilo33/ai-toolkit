@@ -14,7 +14,8 @@ ai-toolkit/
 │   ├── rules/                # Coding guidelines, conventions, style guides
 │   ├── skills/               # Reusable agent skills (close-task, TDD, etc.)
 │   ├── prompts/              # Reusable prompts (commit-msg, etc.)
-│   └── agents/               # Agent definitions
+│   ├── agents/               # Agent definitions
+│   └── hooks/                # Lifecycle hook scripts (pre/post tool use)
 │
 ├── claude/                   # Claude Code settings (tool-specific only)
 │   └── settings.json
