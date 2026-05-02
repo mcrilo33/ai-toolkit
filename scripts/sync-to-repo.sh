@@ -274,11 +274,11 @@ sync_hooks() {
         info "hooks/scripts/$(basename "$f")"
     done
 
-    # Copy shared lib/ utilities
+    # Copy shared lib/ utilities (inside scripts/ so $HOOK_DIR/lib/ resolves)
     if [ -d "$SHARED_DIR/hooks/lib" ]; then
-        mkdir -p "$scripts_dst/../lib"
-        cp -R "$SHARED_DIR/hooks/lib/"* "$scripts_dst/../lib/" 2>/dev/null || true
-        info "hooks/lib/"
+        mkdir -p "$scripts_dst/lib"
+        cp -R "$SHARED_DIR/hooks/lib/"* "$scripts_dst/lib/" 2>/dev/null || true
+        info "hooks/scripts/lib/"
     fi
 
     # Generate platform-specific hooks config JSON
