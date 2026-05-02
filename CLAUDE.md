@@ -1,61 +1,35 @@
-# Guidelines
+# AI Toolkit — Agent Context
 
-## Agent Behavior
+This repository contains shared rules, skills, prompts, and agents for AI coding assistants (Copilot, Cursor, Claude Code).
 
-### Before Acting
-- Verify file paths and imports exist before referencing them
-- Check for existing patterns in similar files before creating new code
-- When modifying existing code, read the file first to understand context
-- Confirm understanding of ambiguous requirements before proceeding
-- State your assumptions explicitly before acting on them
+## Key references
 
-### Clarification
-- If something is unclear, stop. Name what's confusing. Ask.
-- If multiple interpretations exist, present them — don't pick silently
-- If a simpler approach exists, say so. Push back when warranted.
-- Prefer option-based clarification: propose a short bulleted list (2–5 items) of alternatives
-- When a request could have unintended side effects, warn before proceeding
+- `docs/available-tools.md` — Complete inventory of all tools accessible to agents (~140+ tools across file ops, terminal, Git, GitHub, browser, notebooks, Jira, Confluence, Notion, macOS automation, web research, GCP)
+- `docs/rules-frontmatter.md` — Rules frontmatter field reference per platform
+- `docs/skills-frontmatter.md` — Skills frontmatter field reference per platform
+- `docs/metadata-and-sync.md` — How `shared/` files are synced to platform-specific configs
 
-### Simplicity First
-**Minimum that solves the problem. Nothing speculative.**
-- Nothing beyond what was asked.
+## Repository structure
 
-### Autonomy Threshold
-- 1-2 files with clear scope → proceed without confirmation
-- 3+ files, ambiguous scope, or destructive operations → confirm plan first
+- `shared/rules/` — Instruction rules (guidelines, code quality, security, etc.)
+- `shared/skills/` — Skills with SKILL.md + optional scripts/references/templates/assets
+- `shared/prompts/` — Reusable prompt templates
+- `shared/agents/` — Agent mode definitions
+- `scripts/` — Sync pipeline (`sync-to-repo.sh`, `metadata_parser.py`)
+- `settings/` — IDE-specific settings (VS Code, Cursor, Claude)
+- `tests/` — Unit and integration tests
 
-### Prohibitions
-- Do not create new files unless explicitly requested or absolutely necessary
-- Do not add new dependencies without asking
-- Do not generate placeholder, stub, or incomplete implementations
-- Do not modify code unrelated to the current task
-- Do not remove or modify existing functionality unless explicitly asked
-- Do not make assumptions about missing context — ask instead
-- Do not hallucinate APIs, functions, or imports that may not exist
+## Sync pipeline
 
-### Tool Unavailability
-- If a task requires a specific tool (MCP server, API, CLI) that is unavailable or inaccessible, **stop immediately**
-- State the blocker: which tool is missing and why
-- Do NOT produce a workaround, manual steps, or alternative content unless the user explicitly asks for one
-- Do NOT attempt the task with a different approach without asking first
+```bash
+./scripts/sync-to-repo.sh <target-repo> [copilot|cursor|claude|all]
+```
 
-### Self-Correction
-- If you realize a mistake mid-response, stop and correct immediately
-- When a solution doesn't work, analyze why before trying alternatives
-- Acknowledge uncertainty rather than guessing
+Reads `metadata.yml` per category, merges shared defaults with per-tool overrides, prepends YAML frontmatter, writes to platform-specific paths.
 
-## Response Style
+## Conventions
 
-### What to Do
-- Be direct and concise; avoid unnecessary preamble
-- Code first, explanation second (when explanation is needed)
-- Working, complete code (not fragments unless asked)
-- Specific file paths when referencing code
-- State uncertainty explicitly: "I'm not sure if X, but..."
-- Present 2-3 options maximum with brief trade-offs; recommend one
-
-### What to Omit
-- Excessive praise or validation ("Great question!")
-- Restating the obvious or generic advice
-- Long explanations when code is self-documenting
-- Obvious or self-explanatory comments in code
+- All rules, skills, and prompts use `metadata.yml` for frontmatter definitions
+- Skill folders must contain `SKILL.md` as the entry point
+- Commit messages follow conventional commits format
+- Tests use pytest with AAA structure

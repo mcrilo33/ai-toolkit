@@ -31,12 +31,6 @@ python-style:
   paths: "**/*.py"
   alwaysApply: false
 
-# git-conventions: TODO move to a skill
-#   name: "Git Conventions"
-#   description: "Commit messages, branching, PRs, tags, and collaboration conventions"
-#   applyTo: "**"
-#   alwaysApply: false
-
 gitignore-template:
   name: "Gitignore Template"
   description: "Standard .gitignore patterns for environment, IDE, dependencies, build artifacts, and secrets"
@@ -76,13 +70,20 @@ workflow:
   alwaysApply: false
 
 github-actions:
-  name: "GitHub Actions CI/CD"
-  description: "Comprehensive guide for building robust, secure, and efficient CI/CD pipelines using GitHub Actions. Covers workflow structure, jobs, steps, environment variables, secret management, caching, matrix strategies, testing, and deployment strategies."
+  name: "GitHub Actions"
+  description: "Workflow structure, SHA pinning, permissions, secrets, caching, and job conventions for GitHub Actions"
   applyTo: ".github/workflows/*.yml,.github/workflows/*.yaml"
   globs: ".github/workflows/*.yml,.github/workflows/*.yaml"
   paths: ".github/workflows/*.yml,.github/workflows/*.yaml"
   alwaysApply: false
 
-codexer:
+agent-orchestration:
+  name: "Agent Orchestration"
+  description: "When to spawn specialist agents, parallel execution, multi-perspective review, and delegation protocol"
+  applyTo: "**"
+  alwaysApply: true
+
+library-research:
+  name: "Library Research"
   description: "Library documentation research using Context7 — resolve, fetch, and answer from current docs for any language"
   alwaysApply: false

@@ -58,9 +58,9 @@ Each category declares which fields each platform receives:
 | Category | Copilot | Cursor | Claude Code |
 | -------- | ------- | ------ | ----------- |
 | **Rules** | `name`, `description`, `applyTo`, `excludeAgent` | `description`, `globs`, `alwaysApply` | `paths` |
-| **Skills** | `name`, `description` | `name`, `description` | `name`, `description` |
+| **Skills** | `name`, `description`, `allowed-tools`, `license`, `disable-model-invocation`, `user-invocable`, `argument-hint` | `name`, `description`, `license`, `compatibility`, `metadata`, `disable-model-invocation` | `name`, `description`, `allowed-tools`, `disable-model-invocation`, `user-invocable`, `argument-hint`, `paths`, `context`, `agent`, `when_to_use`, `arguments`, `model`, `effort`, `hooks`, `shell` |
 | **Prompts** | `name`, `description`, `agent` | — | `name`, `description` |
-| **Agents** | plain copy | — | — |
+| **Agents** | `name`, `description`, `model`, `tools`, `disallowedTools`, `user-invocable`, `disable-model-invocation`, `target`, `argument-hint`, `agents`, `handoffs`, `mcp-servers`, `hooks`, `metadata` | `description`, `model`, `readonly`, `is_background` | `name`, `description`, `model`, `tools`, `disallowedTools`, `mcp-servers`, `hooks`, `effort`, `maxTurns`, `permissionMode`, `memory`, `background`, `isolation`, `skills`, `color`, `initialPrompt` |
 
 ## Output paths
 
@@ -69,7 +69,7 @@ Each category declares which fields each platform receives:
 | **Rules** | `.github/instructions/*.instructions.md` | `.cursor/rules/*.md` or `.mdc` | `.claude/rules/*.md` |
 | **Skills** | `.github/skills/<name>/SKILL.md` | `.cursor/skills/<name>/SKILL.md` | `.claude/skills/<name>/SKILL.md` |
 | **Prompts** | `.github/prompts/*.prompt.md` | — | `.claude/prompts/*.md` |
-| **Agents** | `.github/agents/*.agent.md` | — | — |
+| **Agents** | `.github/agents/*.agent.md` | `.cursor/agents/*.md` | `.claude/agents/*.md` |
 
 ## Special cases
 

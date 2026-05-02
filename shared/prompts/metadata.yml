@@ -6,3 +6,8 @@ commit-msg:
   name: "commit-msg"
   description: "Generate a conventional commit message from staged changes"
   agent: "agent"
+
+verify-rules:
+  name: "verify-rules"
+  description: "Verify all instruction rules are loaded — returns PASS or FAIL"
+  agent: "agent"

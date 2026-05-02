@@ -248,31 +248,69 @@ class APIResponse(BaseModel):
 | Mutable models for API schemas | `frozen=True` |
 | Validators with side effects | Pure validation; side effects in service layer |
 
-## Async/Await
+## Async (asyncio)
 
-### Fundamentals
+### General
 
-- Use `async def` for I/O-bound operations
-- Use `async with` for async context managers
-- Use `asyncio.run()` only at entry points
-- Never call blocking I/O from async code — offload with `asyncio.to_thread()`
-- Never mix sync and async without proper bridging
+- Use `async def` for I/O-bound operations (network, file, database)
+- Keep CPU-bound work synchronous; offload to threads with `asyncio.to_thread()`
+- Never call blocking I/O inside `async def` — it blocks the entire event loop
+- Annotate return types: `async def fetch(url: str) -> Response:`
 
-### Structured Concurrency with TaskGroups
+### Coroutines and Tasks
 
-- Prefer `asyncio.TaskGroup` (3.11+) over bare `asyncio.gather()`
-- TaskGroup cancels all sibling tasks when one raises — no silent failures
+- `await` for sequential async calls
+- `asyncio.gather()` for concurrent independent calls
+- `asyncio.TaskGroup` (3.11+) over `gather()` — structured concurrency with proper error handling
+- Cancel tasks explicitly when no longer needed
 
 ```python
+# Good: TaskGroup for concurrent work (3.11+)
 async def fetch_all(urls: list[str]) -> list[Response]:
     async with asyncio.TaskGroup() as tg:
         tasks = [tg.create_task(fetch(url)) for url in urls]
     return [t.result() for t in tasks]
+
+
+# Good: sequential when order matters
+async def pipeline(data: RawData) -> Result:
+    validated = await validate(data)
+    enriched = await enrich(validated)
+    return await store(enriched)
 ```
 
-- Fall back to `asyncio.gather(*coros, return_exceptions=True)` only when partial failure is acceptable and each result is handled individually
+### Context Managers and Iterators
 
-### Error Handling
+- Use `async with` for async resources (sessions, connections, locks)
+- Use `async for` for async iteration (streams, paginated APIs)
+- Implement `__aenter__` / `__aexit__` for custom async context managers
+
+```python
+async def process_stream(url: str) -> list[Record]:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            return [parse(chunk) async for chunk in resp.content.iter_any()]
+```
+
+### Event Loop
+
+- Never call `asyncio.run()` inside an already-running loop
+- Use `asyncio.run()` as the single top-level entry point
+- Prefer `asyncio.to_thread()` over `loop.run_in_executor()` (3.9+)
+
+### Testing Async Code
+
+- Use `@pytest.mark.asyncio` with `pytest-asyncio`
+- Set `asyncio_mode = "auto"` in `pyproject.toml` to avoid per-test markers
+- Use `async def test_...` directly — no manual event loop management
+
+```python
+async def test_fetch_returns_data(mock_client: AsyncClient) -> None:
+    result = await mock_client.get("/api/items")
+    assert result.status_code == 200
+```
+
+### Async Error Handling
 
 - Catch `ExceptionGroup` (3.11+) when using `TaskGroup`
 - Use `except*` for selective handling of specific exception types within a group
@@ -310,10 +348,22 @@ async def poll_until_ready(resource_id: str) -> Status:
             await asyncio.sleep(1)
 ```
 
-### Patterns
+### Async Anti-Patterns
+
+| Avoid | Prefer |
+| ----- | ------ |
+| `time.sleep()` in async code | `await asyncio.sleep()` |
+| `requests` in async code | `aiohttp` or `httpx.AsyncClient` |
+| Bare `asyncio.gather()` without error handling | `asyncio.TaskGroup` (3.11+) |
+| `loop.run_in_executor()` | `asyncio.to_thread()` (3.9+) |
+| `asyncio.get_event_loop()` | `asyncio.run()` at top level |
+| Fire-and-forget tasks | Track tasks; await or cancel them |
+| Mixing sync and async in one module | Clear boundary: async at edges, sync core |
+
+### Async Patterns
 
 | Scenario | Use |
-|----------|-----|
+| -------- | --- |
 | Run tasks concurrently, fail-fast | `asyncio.TaskGroup` |
 | Run tasks concurrently, tolerate partial failure | `asyncio.gather(return_exceptions=True)` |
 | Offload blocking call | `asyncio.to_thread(sync_fn, *args)` |

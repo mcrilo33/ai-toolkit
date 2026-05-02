@@ -82,6 +82,20 @@
         "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin /opt/homebrew/bin/npx -y @playwright/mcp@latest"
       ]
     },
+    "codebase-memory": {
+      "command": "/bin/zsh",
+      "args": [
+        "-lc",
+        "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin ${HOME}/.local/bin/codebase-memory-mcp"
+      ]
+    },
+    "markitdown": {
+      "command": "/bin/zsh",
+      "args": [
+        "-lc",
+        "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin ${HOME}/.local/bin/uvx --python=3.12 markitdown-mcp"
+      ]
+    },
     "mcp-atlassian": {
       "command": "/bin/zsh",
       "args": [

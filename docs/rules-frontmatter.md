@@ -22,5 +22,5 @@ Correspondence between `metadata.yml` fields and what each platform expects.
 | Platform | Fields injected | Output path | Extension |
 | -------- | --------------- | ----------- | --------- |
 | Copilot | `name`, `description`, `applyTo`, `excludeAgent` | `.github/instructions/` | `.instructions.md` |
-| Cursor | `description`, `globs`, `alwaysApply` | `.cursor/rules/` | `.md` or `.mdc` |
+| Cursor | `description`, `globs`, `alwaysApply` | `.cursor/rules/` | `.mdc` |
 | Claude Code | `paths` | `.claude/rules/` | `.md` |

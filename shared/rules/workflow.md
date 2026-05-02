@@ -3,7 +3,7 @@
 ## Task Lifecycle
 
 ```
-SOURCE → DEFINE → EXECUTE → CLOSE
+SOURCE → DEFINE → EXECUTE → VERIFY → CLOSE
 ```
 
 | Step | Purpose | Artifacts |
@@ -11,6 +11,7 @@ SOURCE → DEFINE → EXECUTE → CLOSE
 | SOURCE | Get or create work item | Issue/task linked to branch |
 | DEFINE | Clarify "done" criteria | Tests (TDD) or checklist |
 | EXECUTE | Implement until criteria met | Working code |
+| VERIFY | Validate quality gates pass | Pass/fail report |
 | CLOSE | Record and ship | Commit, PR, closed issue |
 
 ## Commands
@@ -20,12 +21,67 @@ SOURCE → DEFINE → EXECUTE → CLOSE
 | `/source` | `source-task` | Fetch task, create branch |
 | `/close` | `close-task` | Commit, push, create PR |
 
+## Phase Checklists
+
+### SOURCE — Research & Setup
+
+```
+- [ ] Task identified (issue URL or ad-hoc scope)
+- [ ] Issue details read and understood
+- [ ] Branch created from latest default branch
+- [ ] Existing code/patterns reviewed for context
+- [ ] Dependencies or blockers identified
+```
+
+### DEFINE — Plan & Acceptance Criteria
+
+```
+- [ ] Acceptance criteria written (specific, testable)
+- [ ] Scope boundaries stated ("this PR will NOT do X")
+- [ ] Approach chosen (TDD vs simple)
+- [ ] Files to create/modify listed
+- [ ] Edge cases and error scenarios identified
+- [ ] If TDD: failing tests written and committed
+```
+
+### EXECUTE — Implement
+
+```
+- [ ] One change at a time, verifying after each
+- [ ] Stays within DEFINE scope — flag if expanding
+- [ ] Follows existing patterns (see guidelines.md)
+- [ ] Error handling included (not deferred)
+- [ ] No placeholder/stub implementations
+```
+
+### VERIFY — Quality Gates
+
+Run the `verification-loop` skill before closing. All gates must pass:
+
+```
+- [ ] Build succeeds
+- [ ] Type check passes (if applicable)
+- [ ] Linter passes (no new warnings)
+- [ ] All tests pass (existing + new)
+- [ ] Security scan clean (no hardcoded secrets)
+- [ ] Diff review (no unintended changes, reasonable size)
+```
+
+### CLOSE — Ship
+
+```
+- [ ] Commit message follows conventional format
+- [ ] PR created with summary, test plan, linked issue
+- [ ] No debug/temp code left behind
+- [ ] Documentation updated (if behavior changed)
+```
+
 ## Workflow Variations
 
 ### TDD Development
 
 ```
-SOURCE → DEFINE (write tests) → EXECUTE (make tests pass) → CLOSE (2 commits)
+SOURCE → DEFINE (write tests) → EXECUTE (make tests pass) → VERIFY → CLOSE (2 commits)
 ```
 
 - First commit: tests only
@@ -35,7 +91,7 @@ SOURCE → DEFINE (write tests) → EXECUTE (make tests pass) → CLOSE (2 commi
 ### Simple Development
 
 ```
-SOURCE → DEFINE (mental/checklist) → EXECUTE → CLOSE (1 commit)
+SOURCE → DEFINE (mental/checklist) → EXECUTE → VERIFY → CLOSE (1 commit)
 ```
 
 ## During Work (EXECUTE)
@@ -52,6 +108,7 @@ SOURCE → DEFINE (mental/checklist) → EXECUTE → CLOSE (1 commit)
 
 - `source-task` — SOURCE step automation
 - `close-task` — CLOSE step automation
+- `verification-loop` — VERIFY step automation
 - `tdd-workflow` — TDD guidance for DEFINE
 - `generate-commit-message` — Commit message format
 - `generate-tests` — Test generation

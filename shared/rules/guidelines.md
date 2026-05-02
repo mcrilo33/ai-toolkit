@@ -41,6 +41,10 @@
 - Do NOT produce a workaround, manual steps, or alternative content unless the user explicitly asks for one
 - Do NOT attempt the task with a different approach without asking first
 
+### MCP Tool Preferences
+- **Codebase structure questions** (call chains, architecture, impact analysis, "what calls X?", "where is X defined?"): use `codebase-memory` graph tools (`search_graph`, `trace_call_path`, `get_architecture`, `detect_changes`) instead of grep/read cycles — 120× fewer tokens
+- **Binary/office file reading** (PDF, DOCX, PPTX, XLSX, HTML, images, audio): use `markitdown` (`convert_to_markdown`) instead of attempting to read binary files directly
+
 ### Self-Correction
 - If you realize a mistake mid-response, stop and correct immediately
 - When a solution doesn't work, analyze why before trying alternatives

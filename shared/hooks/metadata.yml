@@ -1,0 +1,77 @@
+# Per-tool hook definitions.
+# Key = script filename without .sh extension.
+# Each hook maps to one or more platform-specific configurations.
+#
+# Shared fields:
+#   event       — the lifecycle event (see hooks-frontmatter.md for mapping)
+#   matcher     — tool/command filter (platform-specific semantics)
+#   if          — Claude-only: fine-grained permission rule syntax
+#   description — human-readable purpose
+#   tier        — 1 (high value) / 2 (medium) / 3 (nice-to-have)
+#   timeout     — max seconds (default: 30)
+#
+# Per-tool overrides nested under copilot/cursor/claude keys.
+
+block-no-verify:
+  event: preToolUse
+  matcher: Bash
+  description: "Block git commands that use --no-verify flag"
+  tier: 1
+  claude:
+    if: "Bash(git * --no-verify *)"
+
+secrets-scan:
+  event: preToolUse
+  matcher: "Write|Edit"
+  description: "Scan for hardcoded secrets (API keys, tokens) before writing files"
+  tier: 1
+  copilot:
+    matcher: "edit|create"
+
+git-push-review:
+  event: preToolUse
+  matcher: Bash
+  description: "Show diff summary before git push for review"
+  tier: 2
+  claude:
+    if: "Bash(git push *)"
+
+config-protection:
+  event: preToolUse
+  matcher: "Write|Edit"
+  description: "Block modification of linter, formatter, and CI config files"
+  tier: 2
+  copilot:
+    matcher: "edit|create"
+
+post-edit-format:
+  event: postToolUse
+  matcher: "Edit|Write"
+  description: "Auto-format edited files using the project's configured formatter"
+  tier: 1
+  copilot:
+    matcher: "edit|create"
+
+quality-gate:
+  event: postToolUse
+  matcher: "Edit|Write"
+  description: "Run linter and typechecker on edited files"
+  tier: 1
+  copilot:
+    matcher: "edit|create"
+
+console-log-warn:
+  event: postToolUse
+  matcher: "Edit|Write"
+  description: "Warn when console.log, print(), or debug statements are added"
+  tier: 2
+  copilot:
+    matcher: "edit|create"
+
+commit-quality:
+  event: preToolUse
+  matcher: Bash
+  description: "Validate commit messages match conventional commits format"
+  tier: 2
+  claude:
+    if: "Bash(git commit *)"

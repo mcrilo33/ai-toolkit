@@ -66,6 +66,15 @@
       },
       "type": "stdio"
     },
+    "codebase-memory": {
+      "command": "${HOME}/.local/bin/codebase-memory-mcp",
+      "type": "stdio"
+    },
+    "markitdown": {
+      "command": "${HOME}/.local/bin/uvx",
+      "args": ["--python=3.12", "markitdown-mcp"],
+      "type": "stdio"
+    },
     "mcp-atlassian": {
       "command": "${HOME}/.local/bin/uvx",
       "args": ["--python=3.12", "mcp-atlassian"],

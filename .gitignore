@@ -15,6 +15,9 @@
 # Python
 __pycache__/
 *.pyc
+.coverage
+htmlcov/
+*.egg-info/
 
 # OS
 .DS_Store

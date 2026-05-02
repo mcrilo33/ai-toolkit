@@ -16,6 +16,12 @@
 - Each file/module should have a clear, singular purpose
 - If a function needs a comment explaining what it does, consider renaming or splitting it
 
+### Size Limits
+
+- **Functions**: ≤ 50 lines (excluding docstring/comments). If longer, split.
+- **Files**: ≤ 800 lines. If larger, decompose into modules.
+- **Classes**: ≤ 10 public methods. If more, extract a collaborator.
+
 ## Consistency
 
 - Match the style of surrounding code
@@ -27,6 +33,7 @@
 
 - Provide informative error messages with context (what failed, why, what to do)
 - Use guard clauses for early returns to reduce nesting
+- **Max nesting depth: 4 levels.** Flatten with early returns, helper functions, or inversion.
 - Fail fast: validate inputs at function boundaries
 - Catch specific exceptions; never bare `except:`
 - Reraise with context when wrapping errors
@@ -96,3 +103,14 @@
 - Avoid global state; pass dependencies explicitly
 - Use dependency injection for testability
 - Isolate third-party integrations behind abstractions
+
+## Pre-Completion Checklist
+
+Before marking work as done, verify every changed/added file against:
+
+- [ ] Functions are small (≤ 50 lines)
+- [ ] Files are focused (≤ 800 lines)
+- [ ] No deep nesting (> 4 levels)
+- [ ] No hardcoded values (URLs, ports, credentials, magic numbers) — use constants or config
+- [ ] No unnecessary mutation — prefer immutable data and pure functions
+- [ ] No dead code introduced (unused imports, variables, functions)

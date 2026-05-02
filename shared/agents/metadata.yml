@@ -5,31 +5,58 @@
 code-review:
   name: "code-review"
   description: "Review code changes for correctness, quality, and security as a skeptical reader — report findings, never modify code."
+  argument-hint: "Describe the changes to review or provide a PR link"
+  disallowedTools: [replace_string_in_file, multi_replace_string_in_file, create_file, edit_notebook_file, run_in_terminal, send_to_terminal]
 
 debug:
   name: "debug"
   description: "Systematically identify, analyze, and resolve bugs using a structured triage-reproduce-investigate-fix cycle."
+  argument-hint: "Describe the bug, error message, or paste a stack trace"
 
 tdd-red:
   name: "tdd-red"
   description: "Write failing pytest tests one at a time that describe desired behavior before implementation exists."
+  argument-hint: "Describe the behavior to test"
 
 tdd-green:
   name: "tdd-green"
   description: "Write minimal Python code to make failing tests pass without over-engineering."
+  argument-hint: "Point to the failing tests to implement against"
 
 devops:
   name: "devops"
   description: "Guide teams through CI/CD, infrastructure, deployment, and operational concerns following the DevOps lifecycle."
+  argument-hint: "Describe the CI/CD, infrastructure, or deployment task"
 
 documentation:
   name: "documentation"
   description: "Write or update project documentation as an isolated task — read code, produce docs, never modify source."
+  argument-hint: "Specify what to document — module, API, or feature"
 
 refactor:
   name: "refactor"
   description: "Apply systematic cross-cutting changes across multiple files while keeping all tests green."
+  argument-hint: "Describe the refactor — rename, move, or pattern change"
 
 tdd-refactor:
   name: "tdd-refactor"
   description: "Improve code quality, readability, and design while keeping all tests green."
+  argument-hint: "Point to the code to refactor (tests must already pass)"
+
+security-reviewer:
+  name: "security-reviewer"
+  description: "Dedicated security audit — injection, auth, data protection, dependencies, configuration. Assumes the code is hostile."
+  argument-hint: "Describe what to audit — file, module, PR, or area (auth, API, data)"
+  disallowedTools: [replace_string_in_file, multi_replace_string_in_file, create_file, edit_notebook_file, run_in_terminal, send_to_terminal]
+
+architect:
+  name: "architect"
+  description: "System design and architecture decisions — boundaries, trade-offs, ADRs, and diagrams. Designs structure; never writes implementation."
+  argument-hint: "Describe what to design — new service, module split, data model, or scaling decision"
+  disallowedTools: [replace_string_in_file, multi_replace_string_in_file, create_file, edit_notebook_file, run_in_terminal, send_to_terminal]
+
+planner:
+  name: "planner"
+  description: "Decompose complex tasks into ordered implementation plans with verification checkpoints. Plans the work; never implements."
+  argument-hint: "Describe the feature or task to plan"
+  disallowedTools: [replace_string_in_file, multi_replace_string_in_file, create_file, edit_notebook_file, run_in_terminal, send_to_terminal]

@@ -279,10 +279,34 @@ class TestRealMetadata:
                 id="skills-cursor",
             ),
             pytest.param(
+                "shared/skills/metadata.yml",
+                "claude",
+                "name,description",
+                id="skills-claude",
+            ),
+            pytest.param(
                 "shared/prompts/metadata.yml",
                 "copilot",
                 "name,description,agent",
                 id="prompts-copilot",
+            ),
+            pytest.param(
+                "shared/agents/metadata.yml",
+                "copilot",
+                "name,description,disallowedTools,argument-hint",
+                id="agents-copilot",
+            ),
+            pytest.param(
+                "shared/agents/metadata.yml",
+                "cursor",
+                "description",
+                id="agents-cursor",
+            ),
+            pytest.param(
+                "shared/agents/metadata.yml",
+                "claude",
+                "name,description",
+                id="agents-claude",
             ),
         ],
     )
@@ -300,3 +324,266 @@ class TestRealMetadata:
         for name, fm in results:
             assert name, "Item name must not be empty"
             assert fm, "Frontmatter must not be empty"
+
+
+# ── Skills-specific tests ─────────────────────────────────
+
+
+class TestSkillsMetadata:
+    """Validate skills metadata completeness and consistency."""
+
+    REPO_ROOT = Path(__file__).resolve().parents[2]
+    SKILLS_DIR = REPO_ROOT / "shared" / "skills"
+    SKILLS_META = SKILLS_DIR / "metadata.yml"
+
+    def _skill_dirs_on_disk(self) -> set[str]:
+        """Return names of skill directories that contain SKILL.md."""
+        return {
+            d.name
+            for d in self.SKILLS_DIR.iterdir()
+            if d.is_dir() and (d / "SKILL.md").exists()
+        }
+
+    def _metadata_entries(self) -> dict[str, dict]:
+        """Parse skills metadata and return all entries."""
+        return parse(str(self.SKILLS_META))
+
+    # ── Completeness ──
+
+    def test_every_skill_dir_has_metadata_entry(self) -> None:
+        """Every skill directory with SKILL.md must have an entry in metadata.yml."""
+        on_disk = self._skill_dirs_on_disk()
+        in_meta = set(self._metadata_entries().keys())
+
+        missing = on_disk - in_meta
+        assert not missing, (
+            f"Skill directories without metadata.yml entry: {sorted(missing)}"
+        )
+
+    def test_every_metadata_entry_has_skill_dir(self) -> None:
+        """Every metadata entry must have a matching skill directory with SKILL.md."""
+        on_disk = self._skill_dirs_on_disk()
+        in_meta = set(self._metadata_entries().keys())
+
+        orphaned = in_meta - on_disk
+        assert not orphaned, (
+            f"Metadata entries without skill directory: {sorted(orphaned)}"
+        )
+
+    # ── Required fields ──
+
+    def test_every_skill_has_name(self) -> None:
+        items = self._metadata_entries()
+
+        for skill_name, data in items.items():
+            assert "name" in data["__defaults"], (
+                f"Skill '{skill_name}' missing 'name' field"
+            )
+
+    def test_every_skill_has_description(self) -> None:
+        items = self._metadata_entries()
+
+        for skill_name, data in items.items():
+            desc = data["__defaults"].get("description", "")
+            assert desc, f"Skill '{skill_name}' has empty or missing 'description'"
+
+    # ── Field parsing ──
+
+    def test_allowed_tools_parsed_for_copilot(self) -> None:
+        """Skills with allowed-tools should emit that field for copilot."""
+        items = self._metadata_entries()
+
+        results = dict(
+            query(items, "copilot", ["name", "description", "allowed-tools"])
+        )
+        # close-task defines allowed-tools in metadata
+        assert "close-task" in results
+        assert "allowed-tools:" in results["close-task"]
+
+    def test_argument_hint_parsed(self) -> None:
+        """Skills with argument-hint should emit that field."""
+        items = self._metadata_entries()
+
+        results = dict(
+            query(items, "copilot", ["name", "argument-hint"])
+        )
+        # context-map defines argument-hint
+        assert "context-map" in results
+        assert "argument-hint:" in results["context-map"]
+
+    def test_disable_model_invocation_parsed(self) -> None:
+        """Skills with disable-model-invocation should emit that field."""
+        items = self._metadata_entries()
+
+        results = dict(
+            query(items, "copilot", ["name", "disable-model-invocation"])
+        )
+        # verify-rules defines disable-model-invocation: true
+        assert "verify-rules" in results
+        assert "disable-model-invocation: true" in results["verify-rules"]
+
+    # ── Cross-tool consistency ──
+
+    def test_all_tools_get_name_and_description(self) -> None:
+        """Every tool should receive name and description for every skill."""
+        items = self._metadata_entries()
+
+        for tool in ("copilot", "cursor", "claude"):
+            results = dict(query(items, tool, ["name", "description"]))
+            for skill_name in items:
+                assert skill_name in results, (
+                    f"Skill '{skill_name}' missing from {tool} results"
+                )
+                assert "name:" in results[skill_name], (
+                    f"Skill '{skill_name}' missing name for {tool}"
+                )
+                assert "description:" in results[skill_name], (
+                    f"Skill '{skill_name}' missing description for {tool}"
+                )
+
+    # ── Copilot-specific skill fields ──
+
+    def test_copilot_skill_fields_emitted(self) -> None:
+        """Copilot skill query with all skill fields produces results."""
+        items = self._metadata_entries()
+
+        copilot_fields = [
+            "name", "description", "allowed-tools",
+            "disable-model-invocation", "argument-hint",
+        ]
+        results = query(items, "copilot", copilot_fields)
+
+        assert len(results) > 0
+        result_names = {r[0] for r in results}
+        # Every skill has at least name+description
+        assert result_names == set(items.keys())
+
+    # ── Claude-specific skill fields ──
+
+    def test_claude_skill_fields_emitted(self) -> None:
+        """Claude skill query with all skill fields produces results."""
+        items = self._metadata_entries()
+
+        claude_fields = [
+            "name", "description", "allowed-tools",
+            "disable-model-invocation", "argument-hint",
+        ]
+        results = query(items, "claude", claude_fields)
+
+        assert len(results) > 0
+        result_names = {r[0] for r in results}
+        assert result_names == set(items.keys())
+
+
+# ── Agents-specific tests ─────────────────────────────────
+
+
+class TestAgentsMetadata:
+    """Validate agents metadata completeness and consistency."""
+
+    REPO_ROOT = Path(__file__).resolve().parents[2]
+    AGENTS_DIR = REPO_ROOT / "shared" / "agents"
+    AGENTS_META = AGENTS_DIR / "metadata.yml"
+
+    def _agent_files_on_disk(self) -> set[str]:
+        """Return names of agent .md files (excluding metadata.yml)."""
+        return {
+            f.stem
+            for f in self.AGENTS_DIR.glob("*.md")
+            if f.name != "metadata.yml"
+        }
+
+    def _metadata_entries(self) -> dict[str, dict]:
+        """Parse agents metadata and return all entries."""
+        return parse(str(self.AGENTS_META))
+
+    # ── Completeness ──
+
+    def test_every_agent_file_has_metadata_entry(self) -> None:
+        """Every agent .md file must have an entry in metadata.yml."""
+        on_disk = self._agent_files_on_disk()
+        in_meta = set(self._metadata_entries().keys())
+
+        missing = on_disk - in_meta
+        assert not missing, (
+            f"Agent files without metadata.yml entry: {sorted(missing)}"
+        )
+
+    def test_every_metadata_entry_has_agent_file(self) -> None:
+        """Every metadata entry must have a matching agent .md file."""
+        on_disk = self._agent_files_on_disk()
+        in_meta = set(self._metadata_entries().keys())
+
+        orphaned = in_meta - on_disk
+        assert not orphaned, (
+            f"Metadata entries without agent file: {sorted(orphaned)}"
+        )
+
+    # ── Required fields ──
+
+    def test_every_agent_has_name(self) -> None:
+        items = self._metadata_entries()
+
+        for agent_name, data in items.items():
+            assert "name" in data["__defaults"], (
+                f"Agent '{agent_name}' missing 'name' field"
+            )
+
+    def test_every_agent_has_description(self) -> None:
+        items = self._metadata_entries()
+
+        for agent_name, data in items.items():
+            desc = data["__defaults"].get("description", "")
+            assert desc, f"Agent '{agent_name}' has empty or missing 'description'"
+
+    # ── Field parsing ──
+
+    def test_disallowed_tools_parsed_for_copilot(self) -> None:
+        """Agents with disallowedTools should emit that field for copilot."""
+        items = self._metadata_entries()
+
+        results = dict(
+            query(items, "copilot", ["name", "description", "disallowedTools"])
+        )
+        # code-review defines disallowedTools in metadata
+        assert "code-review" in results
+        assert "disallowedTools:" in results["code-review"]
+
+    def test_argument_hint_parsed(self) -> None:
+        """Agents with argument-hint should emit that field."""
+        items = self._metadata_entries()
+
+        results = dict(
+            query(items, "copilot", ["name", "argument-hint"])
+        )
+        # code-review defines argument-hint
+        assert "code-review" in results
+        assert "argument-hint:" in results["code-review"]
+
+    # ── Cross-tool consistency ──
+
+    def test_all_tools_get_name_and_description(self) -> None:
+        """Every tool should receive name and description for every agent."""
+        items = self._metadata_entries()
+
+        for tool in ("copilot", "cursor", "claude"):
+            results = dict(query(items, tool, ["name", "description"]))
+            for agent_name in items:
+                assert agent_name in results, (
+                    f"Agent '{agent_name}' missing from {tool} results"
+                )
+
+    # ── Copilot-specific agent fields ──
+
+    def test_copilot_agent_fields_emitted(self) -> None:
+        """Copilot agent query with all agent fields produces results."""
+        items = self._metadata_entries()
+
+        copilot_fields = [
+            "name", "description", "disallowedTools", "argument-hint",
+        ]
+        results = query(items, "copilot", copilot_fields)
+
+        assert len(results) > 0
+        result_names = {r[0] for r in results}
+        assert result_names == set(items.keys())
