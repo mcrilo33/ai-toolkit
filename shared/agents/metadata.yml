@@ -7,26 +7,81 @@ code-review:
   description: "Review code changes for correctness, quality, and security as a skeptical reader — report findings, never modify code."
   argument-hint: "Describe the changes to review or provide a PR link"
   disallowedTools: [replace_string_in_file, multi_replace_string_in_file, create_file, edit_notebook_file, run_in_terminal, send_to_terminal]
+  handoffs:
+    - label: "Fix bugs found"
+      agent: debug
+      prompt: "Fix the bugs identified in the code review above."
+    - label: "Refactor quality issues"
+      agent: refactor
+      prompt: "Address the quality issues identified in the code review above."
+    - label: "Deep security audit"
+      agent: security-reviewer
+      prompt: "Perform a deeper security audit on the concerns flagged in the code review above."
+    - label: "Update documentation"
+      agent: documentation
+      prompt: "Update the documentation based on the changes reviewed above."
 
 debug:
   name: "debug"
   description: "Systematically identify, analyze, and resolve bugs using a structured triage-reproduce-investigate-fix cycle."
   argument-hint: "Describe the bug, error message, or paste a stack trace"
+  hooks:
+    PostToolUse:
+      - type: command
+        command: "./.github/hooks/scripts/post-edit-format.sh"
+      - type: command
+        command: "./.github/hooks/scripts/quality-gate.sh"
+      - type: command
+        command: "./.github/hooks/scripts/console-log-warn.sh"
+  handoffs:
+    - label: "Review the fix"
+      agent: code-review
+      prompt: "Review the bug fix applied above for correctness and regressions."
+      send: true
+    - label: "Add regression test"
+      agent: tdd-red
+      prompt: "Write a regression test that would have caught the bug fixed above."
 
 tdd-red:
   name: "tdd-red"
   description: "Write failing pytest tests one at a time that describe desired behavior before implementation exists."
   argument-hint: "Describe the behavior to test"
+  handoffs:
+    - label: "Make tests pass"
+      agent: tdd-green
+      prompt: "Implement the minimal code to make the failing tests written above pass."
+      send: true
 
 tdd-green:
   name: "tdd-green"
   description: "Write minimal Python code to make failing tests pass without over-engineering."
   argument-hint: "Point to the failing tests to implement against"
+  hooks:
+    PostToolUse:
+      - type: command
+        command: "./.github/hooks/scripts/post-edit-format.sh"
+      - type: command
+        command: "./.github/hooks/scripts/quality-gate.sh"
+  handoffs:
+    - label: "Refactor"
+      agent: tdd-refactor
+      prompt: "Refactor the implementation above — improve quality, naming, and design while keeping all tests green."
+      send: true
 
 devops:
   name: "devops"
   description: "Guide teams through CI/CD, infrastructure, deployment, and operational concerns following the DevOps lifecycle."
   argument-hint: "Describe the CI/CD, infrastructure, or deployment task"
+  hooks:
+    PreToolUse:
+      - type: command
+        command: "./.github/hooks/scripts/secrets-scan.sh"
+      - type: command
+        command: "./.github/hooks/scripts/config-protection.sh"
+  handoffs:
+    - label: "Review pipeline changes"
+      agent: code-review
+      prompt: "Review the CI/CD and infrastructure changes applied above."
 
 documentation:
   name: "documentation"
@@ -37,26 +92,64 @@ refactor:
   name: "refactor"
   description: "Apply systematic cross-cutting changes across multiple files while keeping all tests green."
   argument-hint: "Describe the refactor — rename, move, or pattern change"
+  hooks:
+    PostToolUse:
+      - type: command
+        command: "./.github/hooks/scripts/post-edit-format.sh"
+      - type: command
+        command: "./.github/hooks/scripts/quality-gate.sh"
+  handoffs:
+    - label: "Review refactor"
+      agent: code-review
+      prompt: "Review the refactoring changes above — verify no behavior changed and quality is acceptable."
+      send: true
 
 tdd-refactor:
   name: "tdd-refactor"
   description: "Improve code quality, readability, and design while keeping all tests green."
   argument-hint: "Point to the code to refactor (tests must already pass)"
+  hooks:
+    PostToolUse:
+      - type: command
+        command: "./.github/hooks/scripts/post-edit-format.sh"
+      - type: command
+        command: "./.github/hooks/scripts/quality-gate.sh"
+  handoffs:
+    - label: "Review changes"
+      agent: code-review
+      prompt: "Review the refactored code above for correctness and quality."
+      send: true
 
 security-reviewer:
   name: "security-reviewer"
   description: "Dedicated security audit — injection, auth, data protection, dependencies, configuration. Assumes the code is hostile."
   argument-hint: "Describe what to audit — file, module, PR, or area (auth, API, data)"
   disallowedTools: [replace_string_in_file, multi_replace_string_in_file, create_file, edit_notebook_file, run_in_terminal, send_to_terminal]
+  handoffs:
+    - label: "Fix vulnerabilities"
+      agent: debug
+      prompt: "Fix the security vulnerabilities identified in the audit above."
 
 architect:
   name: "architect"
   description: "System design and architecture decisions — boundaries, trade-offs, ADRs, and diagrams. Designs structure; never writes implementation."
   argument-hint: "Describe what to design — new service, module split, data model, or scaling decision"
   disallowedTools: [replace_string_in_file, multi_replace_string_in_file, create_file, edit_notebook_file, run_in_terminal, send_to_terminal]
+  handoffs:
+    - label: "Plan implementation"
+      agent: planner
+      prompt: "Decompose the architecture designed above into an ordered implementation plan with verification checkpoints."
+      send: true
 
 planner:
   name: "planner"
   description: "Decompose complex tasks into ordered implementation plans with verification checkpoints. Plans the work; never implements."
   argument-hint: "Describe the feature or task to plan"
   disallowedTools: [replace_string_in_file, multi_replace_string_in_file, create_file, edit_notebook_file, run_in_terminal, send_to_terminal]
+  handoffs:
+    - label: "Write tests first (TDD)"
+      agent: tdd-red
+      prompt: "Write failing tests for the first step of the plan outlined above."
+    - label: "Review the plan"
+      agent: code-review
+      prompt: "Review the implementation plan above for completeness, risks, and feasibility."
