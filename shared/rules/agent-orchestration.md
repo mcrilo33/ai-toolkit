@@ -1,4 +1,14 @@
-# Agent Orchestration
+# Agent Orchestration (MANDATORY)
+
+## Compliance Rule
+
+Before starting any task, you MUST:
+
+1. **Count files** that will be created or modified. If 3+ → spawn `planner`.
+2. **Scan the routing table below.** If ANY row matches your task → spawn that agent. Do NOT do the work inline.
+3. **If you catch yourself implementing a multi-file task without having delegated** → STOP, acknowledge the violation, and correct by spawning the appropriate agent now.
+
+Failure to delegate when the routing table matches is a process error — equivalent to skipping tests or committing secrets.
 
 ## When to Spawn Agents
 
@@ -22,9 +32,11 @@ Don't do everything yourself. Delegate to specialist agents when the task matche
 
 ### When NOT to Spawn
 
-- Task is a single file with clear scope — do it yourself
+- Task is a **single file** with clear scope — do it yourself
+- Task touches **exactly 2 files** with trivial scope — do it yourself
 - User explicitly says "don't use agents" or "do it inline"
-- The overhead of delegation exceeds the task complexity
+
+**When in doubt, spawn.** Over-delegating is a minor inefficiency. Under-delegating on a complex task is a process failure.
 
 ## Parallel Execution
 
@@ -86,3 +98,18 @@ When spawning an agent:
 2. **Provide context** — relevant file paths, diff, constraints
 3. **Specify output format** — "return a list of findings", "return the commit message"
 4. **Don't over-specify** — let the specialist agent use its own methodology
+
+## Self-Check Before EXECUTE
+
+Before writing any implementation code, answer these questions:
+
+| Question | If YES |
+| -------- | ------ |
+| Will I touch 3+ files? | → Spawn `planner` first |
+| Am I writing tests? | → Spawn `tdd-red`, not inline |
+| Am I making tests pass? | → Spawn `tdd-green`, not inline |
+| Is there a stack trace / bug? | → Spawn `debug` |
+| Does this touch auth/security/PII? | → Spawn `security-reviewer` in parallel |
+| Am I about to close / create a PR? | → Spawn `code-review` on the diff first |
+
+If you answered YES to any row and did NOT spawn → you are violating this rule. Stop and correct.

@@ -24,7 +24,9 @@
 
 ### Autonomy Threshold
 - 1-2 files with clear scope → proceed without confirmation
-- 3+ files, ambiguous scope, or destructive operations → confirm plan first
+- 3+ files → **MUST spawn `planner` agent** before implementing (see `agent-orchestration` rule). Do NOT plan inline and do NOT skip this.
+- Ambiguous scope or destructive operations → confirm plan first
+- If TDD approach is chosen → **MUST use `tdd-red` / `tdd-green` / `tdd-refactor` agents** — never write tests and implementation in the same agent loop
 
 ### Prohibitions
 - Do not create new files unless explicitly requested or absolutely necessary

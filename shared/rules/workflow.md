@@ -35,7 +35,18 @@ SOURCE → DEFINE → EXECUTE → VERIFY → CLOSE
 
 ### DEFINE — Plan & Acceptance Criteria
 
+**⚠️ MANDATORY SCOPE CHECK — before proceeding, evaluate:**
+
+1. Count files to create or modify. If **3+ files** → you MUST spawn the `planner` agent to decompose the task. Do NOT plan inline.
+2. Check the routing table in `agent-orchestration` rule. If ANY row matches → spawn that agent. This is not optional.
+3. If TDD is chosen → you MUST use `tdd-red` → `tdd-green` → `tdd-refactor` agents sequentially. Do NOT write tests and implementation in the same agent loop.
+
+Skipping this gate is a process violation. If you catch yourself implementing a 3+ file task without having spawned `planner`, stop and correct.
+
 ```
+- [ ] Scope check: file count assessed, routing table consulted
+- [ ] If 3+ files: planner agent spawned and plan received
+- [ ] If TDD: tdd-red agent spawned (not inline test writing)
 - [ ] Acceptance criteria written (specific, testable)
 - [ ] Scope boundaries stated ("this PR will NOT do X")
 - [ ] Approach chosen (TDD vs simple)
@@ -65,6 +76,7 @@ Run the `verification-loop` skill before closing. All gates must pass:
 - [ ] All tests pass (existing + new)
 - [ ] Security scan clean (no hardcoded secrets)
 - [ ] Diff review (no unintended changes, reasonable size)
+- [ ] If 5+ files changed: code-review agent spawned for diff review
 ```
 
 ### CLOSE — Ship
@@ -81,11 +93,14 @@ Run the `verification-loop` skill before closing. All gates must pass:
 ### TDD Development
 
 ```
-SOURCE → DEFINE (write tests) → EXECUTE (make tests pass) → VERIFY → CLOSE (2 commits)
+SOURCE → DEFINE (spawn tdd-red) → EXECUTE (spawn tdd-green → tdd-refactor) → VERIFY → CLOSE (2 commits)
 ```
 
-- First commit: tests only
-- Second commit: implementation
+- **MANDATORY:** Use `tdd-red` agent for RED phase — do NOT write tests inline
+- **MANDATORY:** Use `tdd-green` agent for GREEN phase — do NOT implement inline
+- **MANDATORY:** Use `tdd-refactor` agent for REFACTOR phase
+- First commit: tests only (from tdd-red)
+- Second commit: implementation (from tdd-green + tdd-refactor)
 - Use `tdd-workflow` skill for guidance
 
 ### Simple Development
