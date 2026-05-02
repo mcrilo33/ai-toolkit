@@ -158,6 +158,29 @@ Code-editing agents run PostToolUse hooks (`post-edit-format.sh`,
 See [`docs/agents-frontmatter.md`](docs/agents-frontmatter.md) for the full
 configuration reference.
 
+## Hooks
+
+Hooks execute shell scripts at key lifecycle points during agent sessions.
+They enforce security policies, automate code quality, and validate operations.
+All hooks live in `shared/hooks/` and are synced to platform-specific formats.
+
+| Hook | Event | Purpose |
+| ---- | ----- | ------- |
+| `block-no-verify` | PreToolUse | Block `git --no-verify` and improper force pushes |
+| `secrets-scan` | PreToolUse | Block hardcoded secrets in file writes |
+| `git-push-review` | PreToolUse | Show diff summary before `git push` |
+| `config-protection` | PreToolUse | Block modification of CI/linter config files |
+| `commit-quality` | PreToolUse | Validate conventional commits format |
+| `post-edit-format` | PostToolUse | Auto-format edited files (black, prettier, biome) |
+| `quality-gate` | PostToolUse | Run linter + typechecker on edited files |
+| `console-log-warn` | PostToolUse | Warn when debug statements are left behind |
+
+Hooks run globally via workspace-level config files. Some are also scoped to
+specific agents (see [Agent-scoped hooks](#agent-scoped-hooks) above).
+
+See [`docs/hooks-frontmatter.md`](docs/hooks-frontmatter.md) for the full
+configuration reference, platform mapping, and script contract.
+
 ## Adding new content
 
 ### New rule

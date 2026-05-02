@@ -15,6 +15,25 @@ and Claude.
 | `tier` | no | Priority: 1 (high), 2 (medium), 3 (nice-to-have) |
 | `timeout` | no | Max execution seconds (default: 30) |
 
+## Hook inventory
+
+All hooks defined in `shared/hooks/metadata.yml`:
+
+| Hook | Event | Matcher | Tier | Description | Agent-scoped |
+| ---- | ----- | ------- | :--: | ----------- | ------------ |
+| `block-no-verify` | preToolUse | Bash | 1 | Block `git` commands with `--no-verify` or improper force pushes | — |
+| `secrets-scan` | preToolUse | Write/Edit | 1 | Scan for hardcoded secrets (API keys, tokens) before writing | devops |
+| `git-push-review` | preToolUse | Bash | 2 | Show diff summary before `git push` for review | — |
+| `config-protection` | preToolUse | Write/Edit | 2 | Block modification of linter, formatter, and CI config files | devops |
+| `commit-quality` | preToolUse | Bash | 2 | Validate commit messages match conventional commits format | — |
+| `post-edit-format` | postToolUse | Edit/Write | 1 | Auto-format edited files using the project's configured formatter | debug, tdd-green, tdd-refactor, refactor |
+| `quality-gate` | postToolUse | Edit/Write | 1 | Run linter and typechecker on edited files | debug, tdd-green, tdd-refactor, refactor |
+| `console-log-warn` | postToolUse | Edit/Write | 2 | Warn when `console.log`, `print()`, or debug statements are added | debug |
+
+The **Agent-scoped** column shows which agents include the hook in their
+frontmatter (runs only when that agent is active). Hooks without an agent scope
+run globally via workspace-level hook files.
+
 ## Per-tool overrides
 
 Nest overrides under `copilot:`, `cursor:`, or `claude:` to change any field
@@ -150,7 +169,7 @@ All hook scripts follow the same stdin/stdout protocol:
 
 ## Directory structure
 
-```
+```text
 shared/hooks/
 ├── metadata.yml        # Hook registry (source of truth)
 ├── lib/
