@@ -113,3 +113,13 @@ Before writing any implementation code, answer these questions:
 | Am I about to close / create a PR? | → Spawn `code-review` on the diff first |
 
 If you answered YES to any row and did NOT spawn → you are violating this rule. Stop and correct.
+
+## Incremental Drift Guard
+
+Individual requests often feel small, but they can accumulate into a multi-file feature across turns. **Every turn**, before writing code:
+
+1. **Count total files modified in the current task/session** (not just this request)
+2. If cumulative file count ≥ 3 and you have NOT spawned `planner` → STOP. Spawn `planner` now with full context of what's been done and what remains.
+3. If cumulative file count ≥ 5 and you have NOT spawned `code-review` → flag to the user: "We've accumulated changes across 5+ files. I recommend spawning code-review before continuing."
+
+**This is the #1 observed failure mode.** The routing table catches single-request scope. This guard catches multi-turn drift.

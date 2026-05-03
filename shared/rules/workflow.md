@@ -63,6 +63,7 @@ Skipping this gate is a process violation. If you catch yourself implementing a 
 - [ ] Follows existing patterns (see guidelines.md)
 - [ ] Error handling included (not deferred)
 - [ ] No placeholder/stub implementations
+- [ ] Tests written/updated for every functional change (do NOT wait to be asked)
 ```
 
 ### VERIFY — Quality Gates

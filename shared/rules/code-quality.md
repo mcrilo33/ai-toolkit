@@ -104,6 +104,16 @@
 - Use dependency injection for testability
 - Isolate third-party integrations behind abstractions
 
+## Tests Are Not Optional
+
+**When you write or modify functional code, you must write or update tests.** Do not wait for the user to ask.
+
+- New function/class/module → write tests covering happy path + key edge cases
+- Modified behavior → update existing tests or add new ones to cover the change
+- Bug fix → add a regression test that would have caught the bug
+- The only exceptions: config files, documentation-only changes, simple renames with no behavior change
+- If unsure whether tests are needed, they are
+
 ## Pre-Completion Checklist
 
 Before marking work as done, verify every changed/added file against:
@@ -114,3 +124,4 @@ Before marking work as done, verify every changed/added file against:
 - [ ] No hardcoded values (URLs, ports, credentials, magic numbers) — use constants or config
 - [ ] No unnecessary mutation — prefer immutable data and pure functions
 - [ ] No dead code introduced (unused imports, variables, functions)
+- [ ] Tests written/updated for all functional changes (not deferred, not optional)

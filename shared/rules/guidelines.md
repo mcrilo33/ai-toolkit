@@ -25,6 +25,8 @@
 ### Autonomy Threshold
 - 1-2 files with clear scope → proceed without confirmation
 - 3+ files → **MUST spawn `planner` agent** before implementing (see `agent-orchestration` rule). Do NOT plan inline and do NOT skip this.
+- Accumulated 3+ files across related requests in the same session → **MUST spawn `planner`** to reassess scope (even if each individual request was 1-2 files)
+- Before any git push with 5+ changed files → **MUST spawn `code-review`** on the diff
 - Ambiguous scope or destructive operations → confirm plan first
 - If TDD approach is chosen → **MUST use `tdd-red` / `tdd-green` / `tdd-refactor` agents** — never write tests and implementation in the same agent loop
 
