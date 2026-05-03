@@ -64,6 +64,7 @@ Skipping this gate is a process violation. If you catch yourself implementing a 
 - [ ] Error handling included (not deferred)
 - [ ] No placeholder/stub implementations
 - [ ] Tests written/updated for every functional change (do NOT wait to be asked)
+- [ ] Documentation updated for any behavior change (docstrings, README, API docs — do NOT defer)
 ```
 
 ### VERIFY — Quality Gates

@@ -114,6 +114,16 @@
 - The only exceptions: config files, documentation-only changes, simple renames with no behavior change
 - If unsure whether tests are needed, they are
 
+## Documentation Follows Code
+
+**When tests pass, update documentation before moving on.** Do not defer to CLOSE.
+
+- New function/class/module → add docstrings (parameters, return, exceptions)
+- Changed behavior → update affected docstrings and any user-facing docs (README, API docs)
+- New CLI command/flag/config option → update usage docs
+- The only exceptions: pure refactors with no behavior change, internal-only helpers with self-documenting names
+- If unsure whether docs need updating, they do
+
 ## Pre-Completion Checklist
 
 Before marking work as done, verify every changed/added file against:
