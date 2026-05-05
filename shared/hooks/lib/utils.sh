@@ -113,15 +113,15 @@ log() {
 }
 
 # ── Detect project formatter ────────────────────────────────────────
-# Preferred stack: black (Python), prettier (JS/TS). Respects project
+# Preferred stack: ruff format (Python), prettier (JS/TS). Respects project
 # config if present, otherwise falls back to PATH.
 detect_formatter() {
   local dir="${1:-.}"
-  # Python — black first (harmonized across VS Code + Cursor + hooks)
-  if [ -f "$dir/pyproject.toml" ] && grep -q '\[tool\.black\]' "$dir/pyproject.toml" 2>/dev/null; then
-    echo "black"
-  elif command -v black &>/dev/null; then
-    echo "black"
+  # Python — ruff format first (harmonized: single tool for lint + format)
+  if [ -f "$dir/ruff.toml" ] || ([ -f "$dir/pyproject.toml" ] && grep -q '\[tool\.ruff\]' "$dir/pyproject.toml" 2>/dev/null); then
+    echo "ruff"
+  elif command -v ruff &>/dev/null; then
+    echo "ruff"
   # JS/TS — prettier
   elif [ -f "$dir/.prettierrc" ] || [ -f "$dir/.prettierrc.json" ] || [ -f "$dir/.prettierrc.yml" ] || [ -f "$dir/.prettierrc.js" ] || [ -f "$dir/prettier.config.js" ] || [ -f "$dir/prettier.config.mjs" ]; then
     echo "prettier"

@@ -21,13 +21,13 @@ PROJECT_ROOT=$(find_project_root "$(dirname "$FILE_PATH")")
 FORMATTER=$(detect_formatter "$PROJECT_ROOT")
 
 # ── Format by detected tool ─────────────────────────────────────────
-# Harmonized stack: black (Python), prettier (JS/TS)
+# Harmonized stack: ruff format (Python), prettier (JS/TS)
 case "$FORMATTER" in
-  black)
-    if command -v black &>/dev/null; then
+  ruff)
+    if command -v ruff &>/dev/null; then
       case "$EXT" in
         py|pyi)
-          black --quiet --line-length 88 "$FILE_PATH" 2>/dev/null && log "Formatted with black: $FILE_PATH"
+          ruff format --quiet "$FILE_PATH" 2>/dev/null && log "Formatted with ruff: $FILE_PATH"
           ;;
       esac
     fi
@@ -67,7 +67,7 @@ case "$FORMATTER" in
     # No formatter detected — try language-specific defaults
     case "$EXT" in
       py|pyi)
-        command -v black &>/dev/null && black --quiet --line-length 88 "$FILE_PATH" 2>/dev/null && log "Formatted with black (fallback): $FILE_PATH"
+        command -v ruff &>/dev/null && ruff format --quiet "$FILE_PATH" 2>/dev/null && log "Formatted with ruff (fallback): $FILE_PATH"
         ;;
       go)
         command -v gofmt &>/dev/null && gofmt -w "$FILE_PATH" 2>/dev/null && log "Formatted with gofmt: $FILE_PATH"

@@ -134,9 +134,9 @@ def process(data: Data | None) -> Result:
     return _do_process(data)
 ```
 
-## Formatting (Ruff/Black Compatible)
+## Formatting (Ruff)
 
-- Max line length: 88 characters
+- Max line length: 100 characters
 - Trailing commas in multi-line collections
 - Double quotes for strings (Ruff default)
 - No trailing whitespace

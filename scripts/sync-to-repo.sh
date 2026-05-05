@@ -361,6 +361,7 @@ sync_config_files() {
     }
 
     _sync_config "pyproject.toml"
+    _sync_config "ruff.toml"
     _sync_config ".gitignore"
     _sync_config ".editorconfig"
     _sync_config ".python-version"
