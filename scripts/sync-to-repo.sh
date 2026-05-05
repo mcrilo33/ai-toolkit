@@ -342,6 +342,23 @@ print(json.dumps(json.load(sys.stdin), indent=2))
 }
 
 # ═══════════════════════════════════════════
+#  SHARED CONFIG FILES (pyproject.toml, etc.)
+# ═══════════════════════════════════════════
+sync_config_files() {
+    section "Config files"
+
+    # pyproject.toml — only copy if target doesn't already have one
+    if [ -f "$SHARED_DIR/pyproject.toml" ]; then
+        if [ -f "$TARGET/pyproject.toml" ]; then
+            warn "pyproject.toml already exists in target — skipped (merge manually if needed)"
+        else
+            cp "$SHARED_DIR/pyproject.toml" "$TARGET/pyproject.toml"
+            info "pyproject.toml"
+        fi
+    fi
+}
+
+# ═══════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════
 echo ""
@@ -350,10 +367,10 @@ echo "║   ai-toolkit — Sync to Repo              ║"
 echo "╚══════════════════════════════════════════╝"
 
 case "$TOOL" in
-    copilot) sync_copilot; sync_hooks copilot ;;
-    cursor)  sync_cursor;  sync_hooks cursor ;;
-    claude)  sync_claude;  sync_hooks claude ;;
-    all)     sync_copilot; sync_hooks copilot; sync_cursor; sync_hooks cursor; sync_claude; sync_hooks claude ;;
+    copilot) sync_copilot; sync_hooks copilot; sync_config_files ;;
+    cursor)  sync_cursor;  sync_hooks cursor;  sync_config_files ;;
+    claude)  sync_claude;  sync_hooks claude;  sync_config_files ;;
+    all)     sync_copilot; sync_hooks copilot; sync_cursor; sync_hooks cursor; sync_claude; sync_hooks claude; sync_config_files ;;
     *)       error "Unknown tool: $TOOL"; usage ;;
 esac
 
