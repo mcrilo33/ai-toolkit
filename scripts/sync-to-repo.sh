@@ -347,15 +347,23 @@ print(json.dumps(json.load(sys.stdin), indent=2))
 sync_config_files() {
     section "Config files"
 
-    # pyproject.toml — only copy if target doesn't already have one
-    if [ -f "$SHARED_DIR/pyproject.toml" ]; then
-        if [ -f "$TARGET/pyproject.toml" ]; then
-            warn "pyproject.toml already exists in target — skipped (merge manually if needed)"
-        else
-            cp "$SHARED_DIR/pyproject.toml" "$TARGET/pyproject.toml"
-            info "pyproject.toml"
+    # Generic helper: copy a shared config file if target doesn't have one
+    _sync_config() {
+        local filename="$1"
+        if [ -f "$SHARED_DIR/$filename" ]; then
+            if [ -f "$TARGET/$filename" ]; then
+                warn "$filename already exists in target — skipped (merge manually if needed)"
+            else
+                cp "$SHARED_DIR/$filename" "$TARGET/$filename"
+                info "$filename"
+            fi
         fi
-    fi
+    }
+
+    _sync_config "pyproject.toml"
+    _sync_config ".gitignore"
+    _sync_config ".editorconfig"
+    _sync_config ".python-version"
 }
 
 # ═══════════════════════════════════════════
