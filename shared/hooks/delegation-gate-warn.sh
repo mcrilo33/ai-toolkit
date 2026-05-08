@@ -39,6 +39,13 @@ warn_once() {
   : > "$marker" 2>/dev/null || true
 }
 
+# Always warn regardless of prior markers — used at shipping gates (commit/push)
+# so that ignored hints are repeated at the last moment before code is shipped.
+warn_always() {
+  local message="$1"
+  warn "$message"
+}
+
 changed_files() {
   git -C "$PROJECT_ROOT" diff --name-only --diff-filter=ACMR HEAD 2>/dev/null || true
 }
@@ -84,6 +91,11 @@ if echo "$COMMAND" | grep -qiE '^\s*(git\s+push\b|gh\s+pr\s+(create|merge)\b)'; 
   SHIPPING=1
 fi
 
+COMMITTING=0
+if echo "$COMMAND" | grep -qiE '^\s*git\s+commit\b'; then
+  COMMITTING=1
+fi
+
 REFACTOR_PATTERN=0
 if echo "$COMMAND" | grep -qiE '(\bgit\s+mv\b|\bmv\b|\brename\b|\bsed\s+-i\b|\bperl\s+-pi\b|\brefactor\b)'; then
   REFACTOR_PATTERN=1
@@ -99,14 +111,18 @@ if echo "$COMMAND" | grep -qiE '(traceback|stack\s*trace|failing|failed|error)';
   DEBUG_PATTERN=1
 fi
 
-# planner
+# planner — warn once during editing, always at commit if still unresolved
 if [ "$CHANGED_COUNT" -ge 3 ]; then
-  warn_once "planner" "Routing hint: multi-file change detected ($CHANGED_COUNT files). Consider spawning planner first."
+  if [ "$COMMITTING" -eq 1 ] || [ "$SHIPPING" -eq 1 ]; then
+    warn_always "⚠ Delegation gate: $CHANGED_COUNT files changed — planner was not spawned. Strongly consider spawning planner before shipping."
+  else
+    warn_once "planner" "Routing hint: multi-file change detected ($CHANGED_COUNT files). Consider spawning planner first."
+  fi
 fi
 
-# code-review
+# code-review — always warn at push/PR, never silenced
 if [ "$SHIPPING" -eq 1 ] && [ "$CHANGED_COUNT" -ge 1 ]; then
-  warn_once "code-review" "Routing hint: shipping action detected. Consider spawning code-review before push/PR."
+  warn_always "⚠ Delegation gate: shipping detected — code-review was not spawned. Consider spawning code-review before push/PR."
 fi
 
 # debug
