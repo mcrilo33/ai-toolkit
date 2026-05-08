@@ -1,0 +1,11 @@
+# Shared Python tooling config — synced to target repos by sync-to-repo.sh.
+# Harmonized stack: ruff (linter + formatter) + pyright (typechecker) + pytest.
+# Ruff config lives in ruff.toml (also synced).
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

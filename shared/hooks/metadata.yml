@@ -75,3 +75,9 @@ commit-quality:
   tier: 2
   claude:
     if: "Bash(git commit *)"
+
+delegation-gate-warn:
+  event: preToolUse
+  matcher: Bash
+  description: "Warn with delegation hints for specialist agents based on command and diff heuristics"
+  tier: 2
