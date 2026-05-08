@@ -29,6 +29,7 @@
 - Before any git push with 5+ changed files → **MUST spawn `code-review`** on the diff
 - Ambiguous scope or destructive operations → confirm plan first
 - If TDD approach is chosen → **MUST use `tdd-red` / `tdd-green` / `tdd-refactor` agents** — never write tests and implementation in the same agent loop
+- **Hook routing hints are mandatory signals** — if `delegation-gate-warn` emits a warning, act on it immediately. See `agent-orchestration` for required action per hint. Do not proceed silently.
 
 ### Prohibitions
 - Do not create new files unless explicitly requested or absolutely necessary
