@@ -114,60 +114,60 @@ fi
 # planner — warn once during editing, always at commit if still unresolved
 if [ "$CHANGED_COUNT" -ge 3 ]; then
   if [ "$COMMITTING" -eq 1 ] || [ "$SHIPPING" -eq 1 ]; then
-    warn_always "⚠ Delegation gate: $CHANGED_COUNT files changed — planner was not spawned. Strongly consider spawning planner before shipping."
+    warn_always "⚠ STOP. $CHANGED_COUNT files changed and planner was never spawned. Do NOT ship. Spawn planner now, get an implementation plan, then resume."
   else
-    warn_once "planner" "Routing hint: multi-file change detected ($CHANGED_COUNT files). Consider spawning planner first."
+    warn_once "planner" "⚠ STOP. Multi-file change detected ($CHANGED_COUNT files). Spawn planner now before writing any more code."
   fi
 fi
 
 # code-review — always warn at push/PR, never silenced
 if [ "$SHIPPING" -eq 1 ] && [ "$CHANGED_COUNT" -ge 1 ]; then
-  warn_always "⚠ Delegation gate: shipping detected — code-review was not spawned. Consider spawning code-review before push/PR."
+  warn_always "⚠ STOP. Do NOT push yet. Spawn code-review on the current diff first, then push once it passes."
 fi
 
 # debug
 if [ "$RUNS_TESTS" -eq 1 ] || [ "$DEBUG_PATTERN" -eq 1 ]; then
-  warn_once "debug" "Routing hint: test/debug workflow detected. Consider spawning debug for faster root-cause analysis."
+  warn_once "debug" "⚠ STOP. Failure or test signals detected. Spawn debug now to isolate the root cause before making changes."
 fi
 
 # devops
 if [ "$DEVOPS_TOUCHED" -eq 1 ]; then
-  warn_once "devops" "Routing hint: CI/CD or infrastructure signals detected. Consider spawning devops."
+  warn_once "devops" "⚠ STOP. CI/CD or infrastructure files detected. Spawn devops now before modifying these files."
 fi
 
 # documentation
 if [ "$DOCS_ONLY" -eq 1 ]; then
-  warn_once "documentation" "Routing hint: docs-only change set detected. Consider spawning documentation."
+  warn_once "documentation" "⚠ STOP. Docs-only scope detected. Spawn documentation now — do not edit docs files directly in the main agent loop."
 fi
 
 # refactor
 if [ "$REFACTOR_PATTERN" -eq 1 ]; then
-  warn_once "refactor" "Routing hint: rename/restructure pattern detected. Consider spawning refactor for cross-cutting changes."
+  warn_once "refactor" "⚠ STOP. Cross-cutting rename or restructure detected. Spawn refactor now to handle this safely across all files."
 fi
 
 # security-reviewer
 if [ "$SECURITY_TOUCHED" -eq 1 ]; then
-  warn_once "security-reviewer" "Routing hint: security-sensitive area detected. Consider spawning security-reviewer."
+  warn_once "security-reviewer" "⚠ STOP. Security-sensitive area detected. Spawn security-reviewer in parallel before proceeding."
 fi
 
 # architect
 if [ "$ARCHITECT_PATTERN" -eq 1 ]; then
-  warn_once "architect" "Routing hint: architecture/design signals detected. Consider spawning architect before implementation."
+  warn_once "architect" "⚠ STOP. Architecture or design signals detected. Spawn architect first — do not implement before the structure is decided."
 fi
 
 # tdd-red
 if [ "$SOURCE_TOUCHED" -eq 1 ] && [ "$TESTS_TOUCHED" -eq 0 ]; then
-  warn_once "tdd-red" "Routing hint: source changed without tests. Consider spawning tdd-red to define failing tests first."
+  warn_once "tdd-red" "⚠ STOP. Source files changed but no tests written yet. Spawn tdd-red now to write failing tests before any implementation."
 fi
 
 # tdd-green
 if [ "$RUNS_TESTS" -eq 1 ] && [ "$TESTS_TOUCHED" -eq 1 ]; then
-  warn_once "tdd-green" "Routing hint: test-execution with test changes detected. Consider spawning tdd-green to make failing tests pass minimally."
+  warn_once "tdd-green" "⚠ STOP. Test changes + test run detected. Spawn tdd-green now to implement the minimal code that makes the tests pass."
 fi
 
 # tdd-refactor
 if [ "$REFACTOR_PATTERN" -eq 1 ] && [ "$RUNS_TESTS" -eq 1 ]; then
-  warn_once "tdd-refactor" "Routing hint: test-run plus refactor pattern detected. Consider spawning tdd-refactor once tests are green."
+  warn_once "tdd-refactor" "⚠ STOP. Tests are green and cleanup is in progress. Spawn tdd-refactor now — do not refactor in the main agent loop."
 fi
 
 exit 0

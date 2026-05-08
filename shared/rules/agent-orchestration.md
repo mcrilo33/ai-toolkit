@@ -92,17 +92,7 @@ For high-stakes changes (security-sensitive, public API, data model, auth), spli
 
 ## Hook Warnings Are Mandatory Signals
 
-The `delegation-gate-warn` hook emits routing hints visible in tool output. These are **not optional suggestions** — treat them as compliance signals:
-
-| Warning type | Required action |
-| ------------ | --------------- |
-| `Routing hint: multi-file change` | STOP. Spawn `planner` before continuing. |
-| `⚠ Delegation gate: ... planner was not spawned` | STOP. Spawn `planner` now. Do not commit. |
-| `⚠ Delegation gate: shipping detected — code-review` | STOP. Spawn `code-review` on the diff. Do not push. |
-| `Routing hint: security-sensitive area` | Spawn `security-reviewer` in parallel. |
-| `Routing hint: CI/CD or infrastructure` | Spawn `devops`. |
-| `Routing hint: source changed without tests` | Spawn `tdd-red`. |
-| Any other routing hint | Evaluate and act — do not silently ignore. |
+The `delegation-gate-warn` hook emits routing hints visible in tool output. These are **not optional suggestions** — treat them as compliance signals.
 
 If you receive a hook warning and proceed without acting on it:
 
