@@ -65,7 +65,7 @@ When a task decomposes into **independent** sub-tasks, run agents in parallel:
 
 - If sub-tasks share no data dependencies → parallel
 - If one agent's output feeds another → sequential
-- Never spawn more than 3 agents in parallel — diminishing returns
+- Only spawn agents in parallel when their tasks are truly independent — parallel agents whose outputs must be integrated add coordination overhead that can outweigh speed gains
 
 ## Multi-Perspective Review
 
