@@ -87,3 +87,9 @@ library-research:
   name: "Library Research"
   description: "Library documentation research using Context7 — resolve, fetch, and answer from current docs for any language"
   alwaysApply: false
+
+scientific-integrity:
+  name: "Scientific Integrity"
+  description: "No data leakage from eval/ground truth into prompts, and mechanism-first reasoning over metric chasing"
+  applyTo: "**"
+  alwaysApply: true
