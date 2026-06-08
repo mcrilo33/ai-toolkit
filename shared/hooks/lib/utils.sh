@@ -54,17 +54,27 @@ get_tool_input() {
   echo "$args"
 }
 
+# ── Normalize shell-escaped quotes in a command string ──────────────
+# Some agent runtimes serialize a Bash tool call with backslash-escaped inner
+# quotes (e.g. -m \"feat: x\"). Those backslashes are escaping artifacts, not
+# literal content, and break quote-aware parsing. Strip \" -> " and \' -> '.
+# Safe for match-only hooks (grep for flags) and required for subject parsing.
+normalize_escaped_quotes() {
+  printf '%s' "$1" | sed 's/\\"/"/g; s/\\'\''/'\''/g'
+}
+
 # ── Get the command from Bash tool input ─────────────────────────────
 get_bash_command() {
   local input="$1"
-  local tool_input
+  local tool_input cmd
   tool_input=$(get_tool_input "$input")
   if command -v jq &>/dev/null; then
-    echo "$tool_input" | jq -r '.command // empty' 2>/dev/null
+    cmd=$(echo "$tool_input" | jq -r '.command // empty' 2>/dev/null)
   else
-    echo "$tool_input" | grep -o '"command"[[:space:]]*:[[:space:]]*"[^"]*"' \
-      | head -1 | sed 's/.*: *"//;s/"$//'
+    cmd=$(echo "$tool_input" | grep -o '"command"[[:space:]]*:[[:space:]]*"[^"]*"' \
+      | head -1 | sed 's/.*: *"//;s/"$//')
   fi
+  normalize_escaped_quotes "$cmd"
 }
 
 # ── Get file path from Edit/Write tool input ─────────────────────────

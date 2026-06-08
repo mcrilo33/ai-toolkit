@@ -18,6 +18,10 @@ COMMAND=$(get_bash_command "$INPUT")
 
 [ -z "$COMMAND" ] && exit 0
 
+# Note: get_bash_command already normalizes shell-escaped quotes (\" -> ", \'
+# -> '), so the subject-extraction below sees clean quotes regardless of how
+# the runtime serialized the tool call.
+
 # Only act on git commit commands
 echo "$COMMAND" | grep -qE '^\s*git\s+commit\b' || exit 0
 

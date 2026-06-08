@@ -7,12 +7,21 @@
 # warns per-edit). It is the local enforcement of the verification-loop
 # gauntlet at the commit boundary.
 #
-# Degrades gracefully: if no linter/typechecker is configured, or the tool
-# is not installed, the relevant check is SKIPPED — absence of a tool is
-# never treated as a failure (critical for target repos without the stack).
+# Fairness / TDD design (see also red-proof-warn, tdd-workflow):
+#   • LINT is scoped to CHANGED LINES (git diff --cached -U0 hunks). A clean
+#     addition is never blocked by pre-existing lint debt elsewhere in the
+#     same file. Whole-file checks are unfair on legacy files.
+#   • TYPECHECK is SKIPPED for RED commits — those carrying a `Tested-RED:`
+#     trailer. A failing test that imports a not-yet-implemented symbol is the
+#     expected state of red-before-green; blocking it would contradict the
+#     cage's own TDD workflow. Lint still runs on RED commits.
 #
-# Exit 2 = block (real lint/type failure)
-# Exit 0 = allow (pass, no staged files, no tools, or non-commit command)
+# Degrades gracefully: if no linter/typechecker is configured, the tool is not
+# installed, or the typechecker fails to BOOTSTRAP (e.g. pyright cannot write
+# its cache in a sandbox), the relevant check is SKIPPED — never a failure.
+#
+# Exit 2 = block (real lint/type failure on changed code)
+# Exit 0 = allow (pass, no staged files, no tools, RED carve-out, non-commit)
 set -euo pipefail
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,81 +50,140 @@ if [ -z "$LINTER" ] && [ -z "$TYPECHECKER" ]; then
   exit 0
 fi
 
+# RED carve-out: a commit whose message carries a `Tested-RED:` trailer is a
+# red-before-green test commit. Skip TYPECHECK (unresolved imports expected);
+# keep LINT active. The trailer is matched against the full command string
+# (already quote-normalized by get_bash_command).
+RED_COMMIT=0
+if echo "$COMMAND" | grep -qiE '(^|[[:space:]"'"'"'])Tested-RED:[[:space:]]*\S'; then
+  RED_COMMIT=1
+fi
+
 ISSUES=""
+
+# changed_lines <file> → prints the set of added/changed line numbers in the
+# staged version of <file>, derived from unified-diff hunk headers (-U0).
+# Used to scope lint output to the lines this commit actually touched.
+changed_lines() {
+  local file="$1"
+  git -C "$PROJECT_ROOT" diff --cached -U0 --diff-filter=ACMR -- "$file" 2>/dev/null \
+    | awk '
+      /^@@/ {
+        # @@ -old +new[,count] @@   — parse the +new range
+        match($0, /\+[0-9]+(,[0-9]+)?/)
+        spec = substr($0, RSTART+1, RLENGTH-1)
+        n = split(spec, a, ",")
+        start = a[1]
+        len = (n > 1 ? a[2] : 1)
+        for (i = 0; i < len; i++) print start + i
+      }'
+}
+
+# lint_filter <file> <raw-lint-output>
+# Keeps only lint findings whose line number is in the changed-line set.
+# ruff/eslint emit "path:line:col: ...". If we cannot parse a line number,
+# keep the finding (fail safe toward reporting). A clean changed-line set with
+# only pre-existing violations elsewhere yields no kept findings → no block.
+lint_filter() {
+  local file="$1" raw="$2"
+  local changed
+  changed=$(changed_lines "$file" | tr '\n' ' ')
+  [ -z "$changed" ] && { printf '%s' ""; return 0; }
+  # Pass the changed-line set as a single space-separated arg (no embedded
+  # newlines — awk -v cannot hold a multiline value).
+  printf '%s\n' "$raw" | awk -v changed="$changed" '
+    BEGIN { n = split(changed, arr, " "); for (i=1;i<=n;i++) if (arr[i] != "") keep[arr[i]]=1 }
+    {
+      # extract the first  :<num>:  as the line number
+      if (match($0, /:[0-9]+:/)) {
+        ln = substr($0, RSTART+1, RLENGTH-2)
+        if (ln in keep) print
+      }
+    }'
+}
+
+run_lint() {
+  local file="$1" abs="$2" ext="$3"
+  local raw="" filtered=""
+  case "$LINTER" in
+    ruff)
+      command -v ruff &>/dev/null || return 0
+      case "$ext" in py|pyi)
+        raw=$(ruff check "$abs" 2>&1) || true
+      ;; *) return 0 ;; esac
+      ;;
+    eslint)
+      local bin="$PROJECT_ROOT/node_modules/.bin/eslint"
+      command -v eslint &>/dev/null && bin="eslint"
+      { [ -x "$bin" ] || command -v eslint &>/dev/null; } || return 0
+      case "$ext" in ts|tsx|js|jsx)
+        raw=$("$bin" --no-color "$abs" 2>&1) || true
+      ;; *) return 0 ;; esac
+      ;;
+    biome)
+      local bin="$PROJECT_ROOT/node_modules/.bin/biome"
+      command -v biome &>/dev/null && bin="biome"
+      { [ -x "$bin" ] || command -v biome &>/dev/null; } || return 0
+      case "$ext" in ts|tsx|js|jsx)
+        raw=$("$bin" lint "$abs" 2>&1) || true
+      ;; *) return 0 ;; esac
+      ;;
+    *) return 0 ;;
+  esac
+  [ -z "$raw" ] && return 0
+  filtered=$(lint_filter "$file" "$raw")
+  if [ -n "$filtered" ]; then
+    ISSUES="$ISSUES\n[$file] Lint:\n$filtered"
+  fi
+  return 0
+}
+
+# A typechecker invocation that failed to start (rather than finding type
+# errors) should degrade to SKIP. Detect common bootstrap/startup failures.
+typecheck_bootstrap_failed() {
+  echo "$1" | grep -qiE 'cannot (find|open|write)|permission denied|EACCES|ENOENT|cache|bootstrap|failed to (start|download|install)|no such file or directory'
+}
+
+run_typecheck() {
+  local file="$1" abs="$2" ext="$3"
+  [ "$RED_COMMIT" -eq 1 ] && return 0   # RED carve-out: skip typecheck
+  local raw="" rc=0
+  case "$TYPECHECKER" in
+    pyright)
+      command -v pyright &>/dev/null || return 0
+      case "$ext" in py|pyi) ;; *) return 0 ;; esac
+      raw=$(pyright "$abs" 2>&1) && rc=0 || rc=$?
+      ;;
+    mypy)
+      command -v mypy &>/dev/null || return 0
+      case "$ext" in py|pyi) ;; *) return 0 ;; esac
+      raw=$(mypy "$abs" 2>&1) && rc=0 || rc=$?
+      ;;
+    tsc)
+      local bin="$PROJECT_ROOT/node_modules/.bin/tsc"
+      command -v tsc &>/dev/null && bin="tsc"
+      { [ -x "$bin" ] || command -v tsc &>/dev/null; } || return 0
+      case "$ext" in ts|tsx) ;; *) return 0 ;; esac
+      raw=$("$bin" --noEmit --pretty false "$abs" 2>&1) && rc=0 || rc=$?
+      ;;
+    *) return 0 ;;
+  esac
+  [ "$rc" -eq 0 ] && return 0
+  if typecheck_bootstrap_failed "$raw"; then
+    warn "commit-gauntlet: $TYPECHECKER could not start (bootstrap/cache failure) — typecheck SKIPPED for $file."
+    return 0
+  fi
+  ISSUES="$ISSUES\n[$file] Typecheck:\n$raw"
+  return 0
+}
 
 run_checks() {
   local file="$1"
   local abs="$PROJECT_ROOT/$file"
   [ -f "$abs" ] || return 0
   local ext="${file##*.}"
-
-  # ── Linting ───────────────────────────────────────────────────────
-  case "$LINTER" in
-    ruff)
-      if command -v ruff &>/dev/null; then
-        case "$ext" in
-          py|pyi)
-            RESULT=$(ruff check "$abs" 2>&1) || ISSUES="$ISSUES\n[$file] Lint: $RESULT"
-            ;;
-        esac
-      fi
-      ;;
-    eslint)
-      local eslint_bin="$PROJECT_ROOT/node_modules/.bin/eslint"
-      if command -v eslint &>/dev/null; then eslint_bin="eslint"; fi
-      if [ -x "$eslint_bin" ] || command -v eslint &>/dev/null; then
-        case "$ext" in
-          ts|tsx|js|jsx)
-            RESULT=$("$eslint_bin" --no-color "$abs" 2>&1) || ISSUES="$ISSUES\n[$file] Lint: $RESULT"
-            ;;
-        esac
-      fi
-      ;;
-    biome)
-      local biome_bin="$PROJECT_ROOT/node_modules/.bin/biome"
-      if command -v biome &>/dev/null; then biome_bin="biome"; fi
-      if [ -x "$biome_bin" ] || command -v biome &>/dev/null; then
-        case "$ext" in
-          ts|tsx|js|jsx)
-            RESULT=$("$biome_bin" lint "$abs" 2>&1) || ISSUES="$ISSUES\n[$file] Lint: $RESULT"
-            ;;
-        esac
-      fi
-      ;;
-  esac
-
-  # ── Type checking ─────────────────────────────────────────────────
-  case "$TYPECHECKER" in
-    pyright)
-      if command -v pyright &>/dev/null; then
-        case "$ext" in
-          py|pyi)
-            RESULT=$(pyright "$abs" 2>&1) || ISSUES="$ISSUES\n[$file] Typecheck: $RESULT"
-            ;;
-        esac
-      fi
-      ;;
-    mypy)
-      if command -v mypy &>/dev/null; then
-        case "$ext" in
-          py|pyi)
-            RESULT=$(mypy "$abs" 2>&1) || ISSUES="$ISSUES\n[$file] Typecheck: $RESULT"
-            ;;
-        esac
-      fi
-      ;;
-    tsc)
-      local tsc_bin="$PROJECT_ROOT/node_modules/.bin/tsc"
-      if command -v tsc &>/dev/null; then tsc_bin="tsc"; fi
-      if [ -x "$tsc_bin" ] || command -v tsc &>/dev/null; then
-        case "$ext" in
-          ts|tsx)
-            RESULT=$("$tsc_bin" --noEmit --pretty false "$abs" 2>&1) || ISSUES="$ISSUES\n[$file] Typecheck: $RESULT"
-            ;;
-        esac
-      fi
-      ;;
-  esac
+  run_lint "$file" "$abs" "$ext"
+  run_typecheck "$file" "$abs" "$ext"
 }
 
 # Run all checks under a wall-clock budget. If the budget itself trips,
@@ -136,7 +204,9 @@ if [ "$TIMED_OUT" -eq 1 ]; then
 fi
 
 if [ -n "$ISSUES" ]; then
-  deny "commit-gauntlet blocked the commit — lint/type errors on staged files:
+  RED_NOTE=""
+  [ "$RED_COMMIT" -eq 1 ] && RED_NOTE=" (RED commit: typecheck skipped, lint still enforced)"
+  deny "commit-gauntlet blocked the commit — lint/type errors on changed lines$RED_NOTE:
 $(echo -e "$ISSUES")
 
 Fix the issues above and re-stage, or run the linter/typechecker locally to reproduce."
