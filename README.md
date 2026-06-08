@@ -165,16 +165,58 @@ Hooks execute shell scripts at key lifecycle points during agent sessions.
 They enforce security policies, automate code quality, and validate operations.
 All hooks live in `shared/hooks/` and are synced to platform-specific formats.
 
-| Hook | Event | Purpose |
-| ---- | ----- | ------- |
-| `block-no-verify` | PreToolUse | Block `git --no-verify` and improper force pushes |
-| `secrets-scan` | PreToolUse | Block hardcoded secrets in file writes |
-| `git-push-review` | PreToolUse | Show diff summary before `git push` |
-| `config-protection` | PreToolUse | Block modification of CI/linter config files |
-| `commit-quality` | PreToolUse | Validate conventional commits format |
-| `post-edit-format` | PostToolUse | Auto-format edited files (black, prettier, biome) |
-| `quality-gate` | PostToolUse | Run linter + typechecker on edited files |
-| `console-log-warn` | PostToolUse | Warn when debug statements are left behind |
+| Hook | Event | Enforcement | Purpose |
+| ---- | ----- | ----------- | ------- |
+| `block-no-verify` | PreToolUse | **hard** | Block `git --no-verify` and improper force pushes |
+| `secrets-scan` | PreToolUse | **hard** | Block hardcoded secrets in file writes |
+| `config-protection` | PreToolUse | **hard** | Block modification of CI/linter config files |
+| `commit-quality` | PreToolUse | **hard** | Validate conventional-commit format + issue-anchor |
+| `commit-gauntlet` | PreToolUse | **hard** | Lint/typecheck staged files; block on failure |
+| `git-push-review` | PreToolUse | advisory | Show diff summary before `git push` |
+| `red-proof-warn` | PreToolUse | advisory | Warn on push when source commits lack `Tested-RED:` |
+| `reviewer-sep-warn` | PreToolUse | advisory | Warn on push when commits lack `Reviewed-by:` |
+| `post-edit-format` | PostToolUse | advisory | Auto-format edited files (ruff, prettier, biome) |
+| `quality-gate` | PostToolUse | advisory | Run linter + typechecker on edited files |
+| `console-log-warn` | PostToolUse | advisory | Warn when debug statements are left behind |
+
+### Hard vs advisory gates
+
+- **Hard gates** (`deny`, exit 2) abort the operation: the commit/write does not
+  proceed. These are the deterministic cage — `commit-quality` and
+  `commit-gauntlet` block bad commits; `block-no-verify`, `secrets-scan`, and
+  `config-protection` block dangerous writes.
+- **Advisory gates** print a warning and **always exit 0** — they never block.
+  `red-proof-warn` and `reviewer-sep-warn` surface TDD/review gaps at push time
+  but cannot (and do not) stop the push.
+
+The cage's behavior is fully deterministic *given the same command*: piping an
+identical `{"tool_input":{"command":"..."}}` payload into a script always yields
+the same verdict. See `tests/unit/test_commit_hooks.py`.
+
+### Enforcement caveats
+
+- **Tooling must be on `PATH`.** `commit-gauntlet` detects the project's linter
+  and typechecker (ruff, eslint/biome; pyright, mypy, tsc). If none is installed
+  or configured, the check **degrades gracefully and SKIPS** — meaning it
+  enforces *nothing*. For real enforcement in a target repo, ensure ruff/pyright
+  (or your stack) are installed and resolvable.
+- **TDD carve-out.** `commit-gauntlet` skips the **typecheck** stage on commits
+  carrying a `Tested-RED:` trailer (an unresolved import is the expected state of
+  a red-before-green test commit); lint still runs. Lint is scoped to **changed
+  lines**, so pre-existing debt on untouched lines never blocks a clean addition.
+- **Agent-runtime dependency.** PreToolUse hooks only fire if the agent runtime
+  invokes them. To enforce the blocking gates on *real* `git commit`/`git push`
+  regardless of runtime (or for human-driven git), install them as native git
+  hooks:
+
+  ```bash
+  scripts/install-git-hooks.sh [target-repo]   # wires commit-msg + pre-push
+  scripts/install-git-hooks.sh --uninstall [target-repo]
+  ```
+
+  This reuses the same scripts (single source of truth), mapping
+  `commit-quality` + `commit-gauntlet` to `commit-msg` and the advisory warnings
+  to `pre-push`.
 
 Hooks run globally via workspace-level config files. Some are also scoped to
 specific agents (see [Agent-scoped hooks](#agent-scoped-hooks) above).
