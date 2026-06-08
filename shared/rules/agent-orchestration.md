@@ -120,6 +120,11 @@ When spawning an agent:
 
 ## Self-Check Before EXECUTE
 
+This table is a deliberate pre-flight restatement of the Routing Table above — not
+drift. It exists so the decision is re-triggered at the moment before you write code.
+The Routing Table remains the single source of truth; if the two ever disagree, the
+Routing Table wins.
+
 Before writing any implementation code, answer these questions:
 
 | Question | If YES |

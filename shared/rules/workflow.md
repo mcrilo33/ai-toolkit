@@ -35,13 +35,12 @@ SOURCE → DEFINE → EXECUTE → VERIFY → CLOSE
 
 ### DEFINE — Plan & Acceptance Criteria
 
-**⚠️ MANDATORY SCOPE CHECK — before proceeding, evaluate:**
+**⚠️ MANDATORY SCOPE CHECK — see the `agent-orchestration` rule for the binding thresholds.**
 
-1. Count files to create or modify. If **3+ files** → you MUST spawn the `planner` agent to decompose the task. Do NOT plan inline.
-2. Check the routing table in `agent-orchestration` rule. If ANY row matches → spawn that agent. This is not optional.
-3. If TDD is chosen → you MUST use `tdd-red` → `tdd-green` → `tdd-refactor` agents sequentially. Do NOT write tests and implementation in the same agent loop.
-
-Skipping this gate is a process violation. If you catch yourself implementing a 3+ file task without having spawned `planner`, stop and correct.
+Before planning, assess file count and consult the Routing Table in
+`agent-orchestration`. If a row matches, spawn that agent there — do NOT plan inline.
+The thresholds, the TDD agent sequence, and the violation rules all live in
+`agent-orchestration`; this phase only enforces that the check actually happens here.
 
 ```
 - [ ] Scope check: file count assessed, routing table consulted
