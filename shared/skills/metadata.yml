@@ -7,11 +7,23 @@ close-task:
   description: "Close a task by committing, pushing, and creating a PR. Use when the user says /close, 'ship it', 'create PR', or wants to wrap up."
   allowed-tools: "run_in_terminal get_changed_files read_file grep_search get_errors"
 
+brainstorming:
+  name: "brainstorming"
+  description: "Refine a rough idea into an agreed spec before any code is written — Socratic clarification, alternatives, and sign-off. Use at the start of DEFINE when a request is ambiguous or open-ended, or when the user says 'brainstorm', 'help me design', or 'I'm thinking about'."
+  allowed-tools: "read_file semantic_search create_file"
+  argument-hint: "[rough idea or feature to refine]"
+
 context-map:
   name: "context-map"
   description: "Analyze the blast radius of a task — map files, dependencies, tests, and risks before implementation. Use when scope is unclear, multiple files are involved, or user says /map or 'analyze impact'."
   allowed-tools: "grep_search semantic_search read_file"
   argument-hint: "[task description or issue reference]"
+
+iterative-retrieval:
+  name: "iterative-retrieval"
+  description: "Progressively refine context retrieval in a bounded 3-cycle loop (dispatch, evaluate, refine) when the files or terminology a task needs are unknown up front. Use when gathering context for a subagent, when a search misses because the codebase uses unfamiliar terms, or when a task fails with missing/too-much context. Triggers on 'find where X is handled' and subagent context gathering."
+  allowed-tools: "grep_search semantic_search read_file"
+  argument-hint: "[task or behavior to gather context for]"
 
 create-readme:
   name: "create-readme"

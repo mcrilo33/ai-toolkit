@@ -123,6 +123,7 @@ SOURCE → DEFINE (mental/checklist) → EXECUTE → VERIFY → CLOSE (1 commit)
 
 ## Related Skills
 
+- `brainstorming` — Spec refinement for DEFINE (use before context-map/planner on ambiguous work)
 - `source-task` — SOURCE step automation
 - `close-task` — CLOSE step automation
 - `verification-loop` — VERIFY step automation
