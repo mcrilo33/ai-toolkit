@@ -47,6 +47,8 @@ Use the `tdd-red` agent. One test at a time, starting with the simplest happy pa
 
 **Critical:** Do NOT implement the function yet.
 
+**No code before tests.** If production code for this behavior was written before its test exists, delete it and restart from RED. Tests must drive the implementation, not document it after the fact.
+
 ### Step 3: GREEN — Minimal Implementation
 
 Use the `tdd-green` agent. Write just enough code to make tests pass.
@@ -88,6 +90,7 @@ Return to RED for each edge case. Repeat the cycle.
 |---------|-----|
 | Writing too many tests at once | Start with ONE test, get it green |
 | Implementing before tests fail | Always verify RED before GREEN |
+| Code written before its test exists | Delete it and restart from RED — tests drive the code |
 | Testing implementation details | Test behavior, not internals |
 | Skipping the commit checkpoint | Commit tests before implementing |
 | Over-engineering in GREEN | Write minimal code, refactor later |
@@ -96,6 +99,7 @@ Return to RED for each edge case. Repeat the cycle.
 
 ```
 - [ ] Requirement understood
+- [ ] No pre-existing untested implementation (deleted if found)
 - [ ] Happy path test written
 - [ ] Tests fail (RED verified)
 - [ ] Tests committed
