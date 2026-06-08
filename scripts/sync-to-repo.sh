@@ -297,14 +297,23 @@ sync_hooks() {
             mkdir -p "$cursor_dir"
             # Merge into existing hooks.json or create new
             if [ -f "$cursor_dir/hooks.json" ]; then
-                # Preserve existing hooks, merge ai-toolkit hooks
+                # Preserve existing hooks, merge ai-toolkit hooks idempotently
+                # (de-duplicate by entry identity so repeated syncs don't append clones)
                 python3 -c "
 import json, sys
 with open('$cursor_dir/hooks.json') as f:
     existing = json.load(f)
 new = json.loads(sys.stdin.read())
+def key(entry):
+    return json.dumps(entry, sort_keys=True)
 for event, hooks in new.get('hooks', {}).items():
-    existing.setdefault('hooks', {}).setdefault(event, []).extend(hooks)
+    bucket = existing.setdefault('hooks', {}).setdefault(event, [])
+    seen = {key(e) for e in bucket}
+    for entry in hooks:
+        k = key(entry)
+        if k not in seen:
+            bucket.append(entry)
+            seen.add(k)
 existing['version'] = 1
 print(json.dumps(existing, indent=2))
 " <<< "$json" > "$cursor_dir/hooks.json.tmp"
