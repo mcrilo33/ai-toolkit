@@ -67,6 +67,15 @@ When a task decomposes into **independent** sub-tasks, run agents in parallel:
 - If one agent's output feeds another → sequential
 - Only spawn agents in parallel when their tasks are truly independent — parallel agents whose outputs must be integrated add coordination overhead that can outweigh speed gains
 
+## Two-Stage Review
+
+Every `code-review` runs in two stages, and the first gates the second:
+
+1. **Spec compliance** — does the change do what the plan/issue asked, with no scope creep? A correct implementation of the wrong thing fails here.
+2. **Code quality** — only once intent is confirmed, assess correctness, quality, and security.
+
+Report Stage 1 failures first and block on them before spending effort on Stage 2.
+
 ## Multi-Perspective Review
 
 For high-stakes changes (security-sensitive, public API, data model, auth), split the review into perspectives:
