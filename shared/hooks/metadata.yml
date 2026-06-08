@@ -71,10 +71,35 @@ console-log-warn:
 commit-quality:
   event: preToolUse
   matcher: Bash
-  description: "Validate commit messages match conventional commits format"
+  description: "Validate commit message format and issue-anchor before commit"
   tier: 2
   claude:
     if: "Bash(git commit *)"
+
+commit-gauntlet:
+  event: preToolUse
+  matcher: Bash
+  description: "Run linters/typecheckers on staged files before commit; block on failure"
+  tier: 1
+  timeout: 60
+  claude:
+    if: "Bash(git commit *)"
+
+red-proof-warn:
+  event: preToolUse
+  matcher: Bash
+  description: "Warn on push when HEAD-range source commits lack a Tested-RED trailer"
+  tier: 2
+  claude:
+    if: "Bash(git push *)"
+
+reviewer-sep-warn:
+  event: preToolUse
+  matcher: Bash
+  description: "Warn on push when HEAD-range commits lack a Reviewed-by trailer (advisory only)"
+  tier: 2
+  claude:
+    if: "Bash(git push *)"
 
 delegation-gate-warn:
   event: preToolUse

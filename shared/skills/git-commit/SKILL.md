@@ -45,13 +45,20 @@ Determine:
 - **Scope**: What module/area is affected?
 - **Description**: One-line summary (present tense, imperative mood, <72 chars)
 
-### 4. Get Issue Reference
+### 4. Get Issue Reference (required)
+
+Every commit must be anchored to an issue — the `commit-quality` hook blocks
+commits that have neither an issue ID in the branch name nor an anchor in the
+message.
 
 1. Extract from branch name: `git branch --show-current`
-   - `feature/123-desc` → `Closes #123`
-   - `fix/HEX-456-desc` → `Closes #HEX-456`
-2. If no issue in branch, check if `/source` command was used earlier
-3. Ask user if neither available and change is non-trivial (feat, fix, refactor)
+   - `feature/123-desc` → branch already carries the anchor, nothing to add
+   - `fix/HEX-456-desc` → branch already carries the anchor
+2. If no issue in the branch, check if `/source` was used earlier and recover
+   the ID from it.
+3. If neither is available, ask the user for the issue reference and add it to
+   the message as a second `-m "Closes #<id>"` (also accepted: `Fixes`,
+   `Resolves`, `Refs`). Do not commit without an anchor.
 
 ### 5. Generate and Execute Commit
 

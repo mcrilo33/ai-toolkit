@@ -35,12 +35,19 @@ If the test passes without implementation, the test is wrong — fix it or disca
 
 ## Commit Checkpoint
 
-After tests are written and confirmed failing:
+After tests are written and confirmed failing, commit the failing test and
+record which test was driven to RED with a `Tested-RED:` trailer. The trailer
+value is the pytest node ID of the failing test you just wrote — it makes the
+red-before-green step auditable in history and is later runnable to verify:
 
 ```bash
 git add tests/
-git commit -m "test(<scope>): add tests for <feature>"
+git commit -m "test(<scope>): add tests for <feature>" \
+           -m "Tested-RED: tests/test_<scope>.py::test_<behavior>"
 ```
+
+The `red-proof-warn` push hook flags any commit that adds source files without
+a matching `Tested-RED:` trailer, so write the trailer here at the RED step.
 
 ## Checklist
 
@@ -50,4 +57,4 @@ git commit -m "test(<scope>): add tests for <feature>"
 - [ ] Test name is descriptive and follows naming conventions
 - [ ] Test follows AAA pattern
 - [ ] No production code written
-- [ ] Tests committed separately
+- [ ] Tests committed separately with a `Tested-RED:` trailer

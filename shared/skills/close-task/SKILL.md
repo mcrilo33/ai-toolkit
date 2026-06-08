@@ -72,7 +72,7 @@ Present to the user:
 | Situation | Action |
 |-----------|--------|
 | No staged changes | Inform user, suggest `git add` |
-| No issue in branch name | Ask for issue reference or skip |
+| No issue in branch name | Ask for issue reference and add `Closes #<id>` to the message — the commit hook blocks unanchored commits |
 | Tests failing | Warn and ask whether to proceed |
 | Merge conflicts | Help resolve before pushing |
 | No remote set up | Run `git remote add origin <url>` first |
