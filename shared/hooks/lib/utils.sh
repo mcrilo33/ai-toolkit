@@ -383,3 +383,85 @@ find_project_root() {
   done
   echo "$(pwd)"
 }
+
+# ── Extract Tested-RED: node IDs from a commit-message command string ─
+# Reads the (quote-normalized) `git commit` command and prints every pytest
+# node ID carried by a `Tested-RED:` trailer, one per line. A node ID is the
+# token following the trailer keyword, up to the next quote/whitespace. Used by
+# the RED-proof verifier to know which test(s) to execute.
+extract_tested_red_nodes() {
+  local command="$1"
+  # grep exits 1 when there is no trailer; that is a normal "no nodes" result,
+  # not an error, so swallow it (|| true) to stay safe under `set -e`.
+  printf '%s\n' "$command" \
+    | grep -oiE 'Tested-RED:[[:space:]]*[^[:space:]"'"'"']+' \
+    | sed -E 's/^[Tt]ested-[Rr][Ee][Dd]:[[:space:]]*//' || true
+}
+
+# ── Detect a pytest runner for a project ────────────────────────────
+# Prints the command prefix used to invoke pytest, or empty if none resolves.
+# Honors a project virtualenv binary first, then `python -m pytest`, then a
+# bare `pytest` on PATH. Empty output ⇒ caller must degrade (cannot prove).
+detect_pytest() {
+  local dir="${1:-.}"
+  if [ -x "$dir/.venv/bin/pytest" ]; then
+    echo "$dir/.venv/bin/pytest"
+  elif command -v pytest &>/dev/null; then
+    echo "pytest"
+  elif command -v python3 &>/dev/null && python3 -c 'import pytest' &>/dev/null; then
+    echo "python3 -m pytest"
+  elif command -v python &>/dev/null && python -c 'import pytest' &>/dev/null; then
+    echo "python -m pytest"
+  else
+    echo ""
+  fi
+}
+
+# ── Classify a pytest run for RED/GREEN proof ───────────────────────
+# Runs a SINGLE pytest node and maps the outcome to a proof verdict, printed as
+# one of: PASS | FAIL | BOOTSTRAP.
+#
+# The hard part is telling a genuine RED state apart from an environment that
+# cannot run the test at all — the former must adjudicate, the latter must
+# degrade (never a false block).
+#
+# pytest exit codes (https://docs.pytest.org): 0 all passed, 1 tests failed,
+# 2 interrupted, 3 internal error, 4 usage error, 5 no tests collected.
+#   • 0 → PASS (trustworthy).
+#   • 1 → FAIL (trustworthy — assertion failed).
+#   • 2-5 → AMBIGUOUS. A canonical red-before-green test imports a symbol that
+#     does not exist yet, which pytest reports as a COLLECTION ImportError and
+#     exits 4/5 — that IS a legitimate RED (FAIL), not a bootstrap problem. So
+#     on 2-5 we inspect the output: an ImportError / ModuleNotFoundError /
+#     NameError / AttributeError at collection is the missing implementation
+#     under test → FAIL. Anything else (no runner, syntax error in harness,
+#     missing third-party dep, internal error) → BOOTSTRAP → degrade to allow.
+#
+# The project root is placed on PYTHONPATH so first-party packages import the
+# way they would under a normal project pytest config (rootdir is not always on
+# sys.path for a bare repo).
+#
+# Usage: run_pytest_node <project_root> <node_id>
+run_pytest_node() {
+  local root="$1" node="$2" runner raw rc
+  runner=$(detect_pytest "$root")
+  [ -z "$runner" ] && { echo "BOOTSTRAP"; return 0; }
+
+  # -p no:cacheprovider: never write a cache (sandbox-safe, no side effects).
+  # --no-header -q: quiet. Run only the named node.
+  raw=$(cd "$root" && PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" \
+        $runner -p no:cacheprovider --no-header -q "$node" 2>&1) && rc=0 || rc=$?
+
+  case "$rc" in
+    0) echo "PASS" ; return 0 ;;
+    1) echo "FAIL" ; return 0 ;;
+  esac
+
+  # Ambiguous exit (2-5): a collection error naming a missing symbol of the code
+  # under test is a real RED; anything else is an environment failure.
+  if echo "$raw" | grep -qE '(ModuleNotFoundError|ImportError|NameError|AttributeError)'; then
+    echo "FAIL"
+  else
+    echo "BOOTSTRAP"
+  fi
+}

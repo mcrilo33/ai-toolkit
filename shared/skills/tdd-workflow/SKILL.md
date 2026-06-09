@@ -43,9 +43,15 @@ Use the `tdd-red` agent. One test at a time, starting with the simplest happy pa
 
 1. Write one test describing expected behavior.
 2. Run it — verify it fails for the right reason (`NameError`, `ImportError`, `AssertionError`).
-3. Commit tests separately.
+3. Commit tests separately with a `Tested-RED: <node-id>` trailer.
 
 **Critical:** Do NOT implement the function yet.
+
+The RED state is mechanically proven locally — no CI required. At commit time
+the `red-proof-verify` hook runs the node named in the `Tested-RED:` trailer and
+blocks the commit if it PASSES (a passing test is not driving any new code). At
+push time `red-proof-warn` re-runs the same node as a GREEN backstop, requiring
+it to pass once the implementation lands.
 
 **No code before tests.** If production code for this behavior was written before its test exists, delete it and restart from RED. Tests must drive the implementation, not document it after the fact.
 

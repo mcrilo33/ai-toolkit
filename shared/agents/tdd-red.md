@@ -46,10 +46,23 @@ git commit -m "test(<scope>): add tests for <feature>" \
            -m "Tested-RED: tests/test_<scope>.py::test_<behavior>"
 ```
 
-The `red-proof-warn` push hook checks for commits that add source files without
-a matching `Tested-RED:` trailer. On Cursor it HARD-BLOCKS the push when the
-trailer is missing (advisory `warn` on Claude/Copilot and native git hooks), so
-write the trailer here at the RED step or the eventual `git push` will be denied.
+Two hooks enforce this, and the trailer is no longer a mere claim — it is
+executed:
+
+- `red-proof-verify` (commit time) RUNS the node named in the `Tested-RED:`
+  trailer against the staged tree and requires it to FAIL. At the RED commit the
+  implementation does not exist yet, so a genuine red-before-green test must
+  fail here. If the node PASSES, the commit is BLOCKED on Cursor — a passing
+  test needs no new code and cannot be driving the implementation.
+- `red-proof-warn` (push time) checks every source-adding commit for the trailer
+  and re-runs each `Tested-RED:` node as a GREEN backstop, requiring it to pass
+  now that the implementation exists. On Cursor a missing trailer or a still-
+  failing node HARD-BLOCKS the push (advisory `warn` on Claude/Copilot and
+  native git hooks).
+
+If pytest cannot run (no runner, missing deps, collection bootstrap failure),
+the execution check degrades to trailer-presence only — it never produces a
+false block. Write a runnable node ID here so the RED proof actually fires.
 
 ## Checklist
 
@@ -59,4 +72,5 @@ write the trailer here at the RED step or the eventual `git push` will be denied
 - [ ] Test name is descriptive and follows naming conventions
 - [ ] Test follows AAA pattern
 - [ ] No production code written
-- [ ] Tests committed separately with a `Tested-RED:` trailer
+- [ ] Tests committed separately with a `Tested-RED:` trailer naming a runnable pytest node
+- [ ] `red-proof-verify` observed the node FAIL at commit time (RED proven, not just claimed)

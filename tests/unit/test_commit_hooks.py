@@ -24,6 +24,7 @@ HOOKS_DIR = Path(__file__).resolve().parents[2] / "shared" / "hooks"
 COMMIT_QUALITY = HOOKS_DIR / "commit-quality.sh"
 COMMIT_GAUNTLET = HOOKS_DIR / "commit-gauntlet.sh"
 RED_PROOF = HOOKS_DIR / "red-proof-warn.sh"
+RED_PROOF_VERIFY = HOOKS_DIR / "red-proof-verify.sh"
 REVIEWER_SEP = HOOKS_DIR / "reviewer-sep-warn.sh"
 BLOCK_NO_VERIFY = HOOKS_DIR / "block-no-verify.sh"
 SECRETS_SCAN = HOOKS_DIR / "secrets-scan.sh"
@@ -366,3 +367,125 @@ def test_block_no_verify_cursor_shape(on_branch: Callable[[str], Path]) -> None:
     repo = on_branch("feature/1-x")
     flag = "--no-" + "verify"
     assert run_hook_cursor_shell(BLOCK_NO_VERIFY, f"git commit {flag}", cwd=repo) == BLOCK
+
+
+# ── red-proof-verify: execute the Tested-RED node at commit time ──────
+# A declared RED node must FAIL at the RED commit (allow). If it PASSES, the
+# test drives no new code → block. If pytest cannot run → degrade to allow.
+
+pytest_runner = pytest.mark.skipif(
+    subprocess.run(["bash", "-c", "command -v pytest"], capture_output=True).returncode != 0,
+    reason="pytest not on PATH",
+)
+
+
+@pytest_runner
+def test_red_verify_allows_when_node_fails(on_branch: Callable[[str], Path]) -> None:
+    # A genuine RED test: imports a symbol that does not exist yet → pytest
+    # reports the node as failing (collection error, exit 1) → RED proven → allow.
+    repo = on_branch("feature/1-x")
+    _stage(
+        repo,
+        "tests/test_feature.py",
+        "from pkg.feature import compute\n\n\ndef test_compute():\n    assert compute() == 42\n",
+    )
+    cmd = (
+        'git commit -m "test: add failing test" -m "Refs #1" '
+        '-m "Tested-RED: tests/test_feature.py::test_compute"'
+    )
+    assert run_hook(RED_PROOF_VERIFY, cmd, cwd=repo) == ALLOW
+
+
+@pytest_runner
+def test_red_verify_blocks_when_node_passes(on_branch: Callable[[str], Path]) -> None:
+    # A "RED" test that actually passes asserts already-existing behavior — it
+    # cannot be driving new code, so the commit must be blocked.
+    repo = on_branch("feature/1-x")
+    _stage(
+        repo,
+        "tests/test_trivial.py",
+        "def test_trivial():\n    assert True\n",
+    )
+    cmd = (
+        'git commit -m "test: add test" -m "Refs #1" '
+        '-m "Tested-RED: tests/test_trivial.py::test_trivial"'
+    )
+    assert run_hook(RED_PROOF_VERIFY, cmd, cwd=repo) == BLOCK
+
+
+def test_red_verify_no_trailer_allows(on_branch: Callable[[str], Path]) -> None:
+    # No Tested-RED trailer → nothing to verify → allow (no pytest needed).
+    repo = on_branch("feature/1-x")
+    _stage(repo, "tests/test_x.py", "def test_x():\n    assert True\n")
+    cmd = 'git commit -m "test: add" -m "Refs #1"'
+    assert run_hook(RED_PROOF_VERIFY, cmd, cwd=repo) == ALLOW
+
+
+def test_red_verify_degrades_when_pytest_absent(on_branch: Callable[[str], Path]) -> None:
+    # With no pytest resolvable (empty PATH, no importable module), the node
+    # cannot run → BOOTSTRAP → degrade to allow, never a false block — even
+    # though the trailer names a node that would otherwise be adjudicated.
+    repo = on_branch("feature/1-x")
+    _stage(repo, "tests/test_trivial.py", "def test_trivial():\n    assert True\n")
+    cmd = (
+        'git commit -m "test: add" -m "Refs #1" '
+        '-m "Tested-RED: tests/test_trivial.py::test_trivial"'
+    )
+    result = subprocess.run(
+        ["bash", str(RED_PROOF_VERIFY)],
+        input=_payload(cmd),
+        capture_output=True,
+        text=True,
+        cwd=str(repo),
+        env={"PATH": "/usr/bin:/bin", "HOME": str(repo)},
+    )
+    assert result.returncode == ALLOW
+
+
+def test_red_verify_non_commit_allows(on_branch: Callable[[str], Path]) -> None:
+    repo = on_branch("feature/1-x")
+    assert run_hook(RED_PROOF_VERIFY, "ls -la", cwd=repo) == ALLOW
+
+
+# ── red-proof-warn: GREEN backstop (Tested-RED node must pass now) ────
+
+
+@pytest_runner
+def test_red_proof_green_backstop_blocks_failing_node(git_repo: Path) -> None:
+    # A committed Tested-RED node that still FAILS at push time means the shipped
+    # code does not satisfy its test. On the Cursor shell shape this hard-blocks.
+    _stage(
+        git_repo,
+        "tests/test_unsatisfied.py",
+        "from pkg.thing import go\n\n\ndef test_go():\n    assert go() == 1\n",
+    )
+    subprocess.run(
+        ["git", "commit", "-qm", "test: add", "-m", "Refs #1",
+         "-m", "Tested-RED: tests/test_unsatisfied.py::test_go", "--no-verify"],
+        cwd=str(git_repo),
+        check=True,
+        capture_output=True,
+    )
+    assert run_hook_cursor_shell(RED_PROOF, "git push", cwd=git_repo) == BLOCK
+
+
+@pytest_runner
+def test_red_proof_green_backstop_allows_passing_node(git_repo: Path) -> None:
+    # The implementation exists and the Tested-RED node passes → backstop clears.
+    # The same commit adds source with the trailer, so the presence check also
+    # passes; the push is allowed.
+    _stage(git_repo, "pkg/__init__.py", "")
+    _stage(git_repo, "pkg/thing.py", "def go():\n    return 1\n")
+    _stage(
+        git_repo,
+        "tests/test_satisfied.py",
+        "from pkg.thing import go\n\n\ndef test_go():\n    assert go() == 1\n",
+    )
+    subprocess.run(
+        ["git", "commit", "-qm", "feat: add thing", "-m", "Refs #1",
+         "-m", "Tested-RED: tests/test_satisfied.py::test_go", "--no-verify"],
+        cwd=str(git_repo),
+        check=True,
+        capture_output=True,
+    )
+    assert run_hook_cursor_shell(RED_PROOF, "git push", cwd=git_repo) == ALLOW

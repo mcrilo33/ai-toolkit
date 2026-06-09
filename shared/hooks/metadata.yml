@@ -131,11 +131,24 @@ commit-gauntlet:
     event: beforeShellExecution
     matcher: "git( +-[^ ]+| +-C +[^ ]+)* +commit( |$)"
 
+red-proof-verify:
+  event: preToolUse
+  matcher: Bash
+  description: "Run each Tested-RED node at commit time; block if it PASSES (not a real RED test)"
+  tier: 1
+  timeout: 60
+  claude:
+    if: "Bash(git commit *)"
+  cursor:
+    event: beforeShellExecution
+    matcher: "git( +-[^ ]+| +-C +[^ ]+)* +commit( |$)"
+
 red-proof-warn:
   event: preToolUse
   matcher: Bash
-  description: "Warn on push when HEAD-range source commits lack a Tested-RED trailer"
+  description: "On push: enforce Tested-RED trailer presence and that each Tested-RED node passes"
   tier: 2
+  timeout: 60
   claude:
     if: "Bash(git push *)"
   cursor:
