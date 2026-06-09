@@ -112,6 +112,35 @@ def _merged(data: dict, tool: str) -> dict[str, str]:
     return {**data["__defaults"], **data["__overrides"].get(tool, {})}
 
 
+# Hooks forced to the end of their event bucket regardless of tier, so the
+# slow/expensive gates emit last and diffs stay stable across runs.
+_TRAILING_HOOKS = ("commit-gauntlet",)
+
+
+def _ordered_hooks(hooks: dict[str, dict]) -> list[tuple[str, dict]]:
+    """Return (name, data) pairs in deterministic emission order.
+
+    Ordering keys, in priority:
+      1. Blocking/high-value gates first (lower tier number first; tier 1 < 2 < 3).
+      2. Trailing hooks (e.g. commit-gauntlet, with its longer timeout) pinned last.
+      3. Hook name, alphabetically, as a stable tiebreaker.
+
+    A deterministic order keeps generated configs byte-identical across runs.
+    """
+
+    def sort_key(item: tuple[str, dict]) -> tuple[int, int, str]:
+        name, data = item
+        defaults = data.get("__defaults", {})
+        try:
+            tier = int(defaults.get("tier", 99))
+        except (TypeError, ValueError):
+            tier = 99
+        trailing = 1 if name in _TRAILING_HOOKS else 0
+        return (trailing, tier, name)
+
+    return sorted(hooks.items(), key=sort_key)
+
+
 # ── Generator functions ─────────────────────────────────────────────
 
 def _script_ref(hook_name: str, tool: str) -> str:
@@ -134,7 +163,7 @@ def generate_copilot(hooks: dict[str, dict]) -> dict:
     """
     config: dict[str, list] = {}
 
-    for name, data in hooks.items():
+    for name, data in _ordered_hooks(hooks):
         merged = _merged(data, "copilot")
         event = merged.get("event", "")
         event = COPILOT_EVENT_MAP.get(event, event)
@@ -160,7 +189,7 @@ def generate_cursor(hooks: dict[str, dict]) -> dict:
     """
     config: dict[str, list] = {}
 
-    for name, data in hooks.items():
+    for name, data in _ordered_hooks(hooks):
         merged = _merged(data, "cursor")
         event = merged.get("event", "")
         event = CURSOR_EVENT_MAP.get(event, event)
@@ -192,7 +221,7 @@ def generate_claude(hooks: dict[str, dict]) -> dict:
     """
     config: dict[str, list] = {}
 
-    for name, data in hooks.items():
+    for name, data in _ordered_hooks(hooks):
         merged = _merged(data, "claude")
         event = merged.get("event", "")
         event = CLAUDE_EVENT_MAP.get(event, event)

@@ -14,21 +14,42 @@ error()   { echo -e "${RED}✗${NC} $1" >&2; }
 section() { echo -e "\n${BLUE}── $1 ──${NC}"; }
 
 usage() {
-    echo "Usage: $0 <target-repo-path> [tool]"
+    echo "Usage: $0 <target-repo-path> [tool] [--with-git-hooks]"
     echo ""
     echo "Tools: copilot, cursor, claude, all (default: all)"
     echo ""
+    echo "Flags:"
+    echo "  --with-git-hooks   Also install the cage scripts as NATIVE git hooks"
+    echo "                     (fallback enforcement, independent of the agent runtime)"
+    echo ""
     echo "Examples:"
-    echo "  $0 ~/Repos/my-project              # Sync all tools"
-    echo "  $0 ~/Repos/my-project copilot       # Copilot only"
-    echo "  $0 ~/Repos/my-project cursor        # Cursor only"
-    echo "  $0 ~/Repos/my-project claude        # Claude only"
+    echo "  $0 ~/Repos/my-project                       # Sync all tools"
+    echo "  $0 ~/Repos/my-project copilot                # Copilot only"
+    echo "  $0 ~/Repos/my-project cursor                 # Cursor only"
+    echo "  $0 ~/Repos/my-project claude                 # Claude only"
+    echo "  $0 ~/Repos/my-project all --with-git-hooks   # Sync + native git hooks"
     exit 1
 }
 
 [ $# -lt 1 ] && usage
-TARGET="$1"
-TOOL="${2:-all}"
+TARGET=""
+TOOL="all"
+WITH_GIT_HOOKS=0
+for arg in "$@"; do
+    case "$arg" in
+        --with-git-hooks) WITH_GIT_HOOKS=1 ;;
+        copilot|cursor|claude|all) TOOL="$arg" ;;
+        -*) error "Unknown flag: $arg"; usage ;;
+        *)
+            if [ -z "$TARGET" ]; then
+                TARGET="$arg"
+            else
+                error "Unexpected argument: $arg"; usage
+            fi
+            ;;
+    esac
+done
+[ -z "$TARGET" ] && usage
 [ ! -d "$TARGET" ] && { error "Target directory does not exist: $TARGET"; exit 1; }
 
 if [ ! -d "$TARGET/.git" ]; then
@@ -294,57 +315,28 @@ sync_hooks() {
             ;;
         cursor)
             local cursor_dir="$TARGET/.cursor"
+            local cursor_file="$cursor_dir/hooks.json"
             mkdir -p "$cursor_dir"
-            # Merge into existing hooks.json or create new
-            if [ -f "$cursor_dir/hooks.json" ]; then
-                # Preserve existing hooks, merge ai-toolkit hooks idempotently
-                # (de-duplicate by entry identity so repeated syncs don't append clones)
-                python3 -c "
-import json, sys
-with open('$cursor_dir/hooks.json') as f:
-    existing = json.load(f)
-new = json.loads(sys.stdin.read())
-def key(entry):
-    return json.dumps(entry, sort_keys=True)
-for event, hooks in new.get('hooks', {}).items():
-    bucket = existing.setdefault('hooks', {}).setdefault(event, [])
-    seen = {key(e) for e in bucket}
-    for entry in hooks:
-        k = key(entry)
-        if k not in seen:
-            bucket.append(entry)
-            seen.add(k)
-existing['version'] = 1
-print(json.dumps(existing, indent=2))
-" <<< "$json" > "$cursor_dir/hooks.json.tmp"
-                mv "$cursor_dir/hooks.json.tmp" "$cursor_dir/hooks.json"
-            else
-                echo "$json" > "$cursor_dir/hooks.json"
-            fi
+            # Reconcile: ai-toolkit hooks are a managed/owned set. Existing owned
+            # entries are removed and replaced with the fresh set exactly once;
+            # user-authored hooks are preserved. Converges to a fixed point.
+            [ -f "$cursor_file" ] && cp "$cursor_file" "$cursor_file.bak"
+            python3 "$SCRIPT_DIR/hooks_reconciler.py" cursor \
+                "${cursor_file}" <<< "$json" > "$cursor_file.tmp"
+            mv "$cursor_file.tmp" "$cursor_file"
             info "hooks.json"
             ;;
         claude)
             local claude_dir="$TARGET/.claude"
+            local claude_file="$claude_dir/settings.json"
             mkdir -p "$claude_dir"
-            # Merge hooks into .claude/settings.json
-            if [ -f "$claude_dir/settings.json" ]; then
-                python3 -c "
-import json, sys
-with open('$claude_dir/settings.json') as f:
-    settings = json.load(f)
-new_hooks = json.loads(sys.stdin.read())
-settings.setdefault('hooks', {})
-for event, groups in new_hooks.items():
-    settings['hooks'].setdefault(event, []).extend(groups)
-print(json.dumps(settings, indent=2))
-" <<< "$json" > "$claude_dir/settings.json.tmp"
-                mv "$claude_dir/settings.json.tmp" "$claude_dir/settings.json"
-            else
-                echo "{\"hooks\": $json}" | python3 -c "
-import json, sys
-print(json.dumps(json.load(sys.stdin), indent=2))
-" > "$claude_dir/settings.json"
-            fi
+            # Reconcile ai-toolkit hooks into settings.json (ownership-aware,
+            # idempotent) — replaces the old pure-append .extend() that grew the
+            # file without bound on every sync.
+            [ -f "$claude_file" ] && cp "$claude_file" "$claude_file.bak"
+            python3 "$SCRIPT_DIR/hooks_reconciler.py" claude \
+                "${claude_file}" <<< "$json" > "$claude_file.tmp"
+            mv "$claude_file.tmp" "$claude_file"
             info "settings.json (hooks)"
             ;;
     esac
@@ -377,6 +369,26 @@ sync_config_files() {
 }
 
 # ═══════════════════════════════════════════
+#  NATIVE GIT HOOKS (fallback enforcement layer)
+# ═══════════════════════════════════════════
+# The cage scripts normally run as agent preToolUse hooks, which depends on the
+# agent runtime invoking them. Installing them as NATIVE git hooks makes the
+# blocking gates fire on real `git commit` / `git push` regardless of who drives
+# git (agent, human, CI). This is an opt-in fallback layer (--with-git-hooks).
+sync_git_hooks() {
+    section "Native git hooks (fallback enforcement)"
+    if [ ! -d "$TARGET/.git" ]; then
+        warn "Target is not a git repository — skipping native git hooks"
+        return 0
+    fi
+    if [ ! -x "$SCRIPT_DIR/install-git-hooks.sh" ]; then
+        warn "install-git-hooks.sh not found or not executable — skipping"
+        return 0
+    fi
+    bash "$SCRIPT_DIR/install-git-hooks.sh" "$TARGET"
+}
+
+# ═══════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════
 echo ""
@@ -392,5 +404,16 @@ case "$TOOL" in
     *)       error "Unknown tool: $TOOL"; usage ;;
 esac
 
+if [ "$WITH_GIT_HOOKS" -eq 1 ]; then
+    sync_git_hooks
+fi
+
 echo ""
 info "Sync complete! Review changes with: cd $TARGET && git diff"
+if [ "$WITH_GIT_HOOKS" -eq 1 ]; then
+    info "Native git hooks installed as a fallback enforcement layer."
+    echo "  Uninstall with: $SCRIPT_DIR/install-git-hooks.sh --uninstall $TARGET"
+else
+    warn "Agent hooks only. For enforcement independent of the agent runtime, re-run with --with-git-hooks"
+    echo "  (installs commit-quality + commit-gauntlet as native git hooks)"
+fi
