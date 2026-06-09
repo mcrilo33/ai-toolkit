@@ -1,23 +1,32 @@
 #!/usr/bin/env bash
-# quality-gate — PostToolUse hook
-# Runs linter and typechecker on edited files after Edit/Write.
-# Warns the agent about issues so it can fix them immediately.
+# quality-gate — file-edit hook.
+# Runs linter and typechecker on edited files.
 #
-# Non-blocking: writes warnings to stderr.
-# Exit 0 = always
+# Cursor runs this on afterFileEdit (real file_path); Claude/Copilot run it on
+# postToolUse (tool_input.file_path). get_edit_file_path handles both.
+#
+# NOTE: afterFileEdit has NO agent-visible output channel, so on Cursor the
+# findings below are only written to the Hooks output (stderr) for logging —
+# the agent does NOT see them. Enforcement the agent must act on lives at the
+# blocking commit gate (commit-gauntlet). On Claude/Copilot the stderr warnings
+# are surfaced to the agent as before.
+#
+# Non-blocking: writes warnings to stderr. Exit 0 = always.
 set -euo pipefail
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/lib/utils.sh"
 
 INPUT=$(read_stdin)
-FILE_PATH=$(get_file_path "$INPUT")
+FILE_PATH=$(get_edit_file_path "$INPUT")
 
 [ -z "$FILE_PATH" ] && exit 0
+is_agent_tools_path "$FILE_PATH" && exit 0
 [ -f "$FILE_PATH" ] || exit 0
 
 EXT="${FILE_PATH##*.}"
-PROJECT_ROOT=$(find_project_root "$(dirname "$FILE_PATH")")
+PROJECT_ROOT=$(project_root_from_payload "$INPUT")
+[ -d "$PROJECT_ROOT" ] || PROJECT_ROOT=$(find_project_root "$(dirname "$FILE_PATH")")
 LINTER=$(detect_linter "$PROJECT_ROOT")
 TYPECHECKER=$(detect_typechecker "$PROJECT_ROOT")
 

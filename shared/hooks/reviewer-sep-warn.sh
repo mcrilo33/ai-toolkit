@@ -1,30 +1,32 @@
 #!/usr/bin/env bash
-# reviewer-sep-warn — PreToolUse hook
-# On git push, warns for each HEAD-range commit lacking a
-# `Reviewed-by: code-review` trailer.
+# reviewer-sep-warn — shipping-gate hook (git push / gh pr).
+# For each HEAD-range commit lacking a `Reviewed-by: code-review` trailer,
+# surfaces the absence before shipping.
 #
-# ADVISORY ONLY — and deliberately so. A local hook inspecting a command
-# string CANNOT verify that a *different* agent (the code-review subagent)
-# authored the trailer versus the implementing agent simply typing it. The
-# trailer is auditable evidence of intent in history, not proof of reviewer
-# separation. This hook surfaces the ABSENCE of the trailer loudly; it makes
-# no claim about the honesty of its presence. NEVER blocks (always exits 0).
+# A local hook inspecting a command string CANNOT verify that a *different*
+# agent (the code-review subagent) authored the trailer versus the implementing
+# agent simply typing it. The trailer is auditable evidence of intent in
+# history, not proof of reviewer separation. This hook surfaces the ABSENCE of
+# the trailer; it makes no claim about the honesty of its presence.
 #
-# Exit 0 = always
+# Platform behavior (see ship_gate_enforce in lib/utils.sh):
+#   • Cursor (beforeShellExecution): hard DENY (exit 2) — push/PR blocked until
+#     every commit carries the trailer.
+#   • Claude/Copilot / native git hooks: advisory warn, never blocks (exit 0).
 set -euo pipefail
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/lib/utils.sh"
 
 INPUT=$(read_stdin)
-COMMAND=$(get_bash_command "$INPUT")
+COMMAND=$(get_shell_command "$INPUT")
 
 [ -z "$COMMAND" ] && exit 0
 
-# Only act on git push commands.
-echo "$COMMAND" | grep -qE '^\s*git\s+push\b' || exit 0
+# Only act on shipping-gate commands: git push, or gh pr create/merge.
+echo "$COMMAND" | grep -qE '^\s*(git\s+push\b|gh\s+pr\s+(create|merge)\b)' || exit 0
 
-PROJECT_ROOT=$(find_project_root "$(pwd)")
+PROJECT_ROOT=$(project_root_from_payload "$INPUT")
 
 # Commit range to be pushed. Prefer tracked upstream; fall back to a bounded
 # window. Any git failure ⇒ exit 0 (advisory hook must never block a push).
@@ -57,12 +59,13 @@ while IFS= read -r sha; do
 done <<< "$COMMITS"
 
 if [ -n "$OFFENDERS" ]; then
-  warn "reviewer-separation: these commits carry no 'Reviewed-by: code-review' trailer —
+  ship_gate_enforce "$INPUT" "reviewer-separation: these commits carry no 'Reviewed-by: code-review' trailer —
 no record that a separate code-review agent inspected them:$(echo -e "$OFFENDERS")
 
 Spawn the code-review agent on the diff; once it approves, add a
-'Reviewed-by: code-review' trailer to the commit. NOTE: this is advisory — the
-hook cannot verify a different agent authored the trailer, only that it exists."
+'Reviewed-by: code-review' trailer to the commit. On Cursor the push is BLOCKED
+until every commit carries the trailer. NOTE: the hook cannot verify a
+different agent authored the trailer, only that it exists."
 fi
 
 exit 0

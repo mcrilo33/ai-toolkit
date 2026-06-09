@@ -1,28 +1,29 @@
 #!/usr/bin/env bash
-# red-proof-warn — PreToolUse hook
-# On git push, warns for each HEAD-range commit that ADDS source files but
-# carries no `Tested-RED:` trailer — i.e. production code that has no record
-# of a failing test driving it (TDD red-before-green).
+# red-proof-warn — shipping-gate hook (git push / gh pr).
+# For each HEAD-range commit that ADDS source files but carries no
+# `Tested-RED:` trailer — production code with no record of a failing test
+# driving it (TDD red-before-green) — this surfaces the gap before shipping.
 #
-# Advisory only. NEVER blocks (always exits 0). The trailer is written by
-# the tdd-red agent into the failing-test commit; this hook only surfaces
-# its absence at the last moment before code is shipped.
+# Platform behavior (see ship_gate_enforce in lib/utils.sh):
+#   • Cursor (beforeShellExecution): hard DENY (exit 2). The push/PR is blocked
+#     until every offending commit carries a `Tested-RED:` trailer.
+#   • Claude/Copilot / native git hooks: advisory warn, never blocks (exit 0).
 #
-# Exit 0 = always
+# The trailer is written by the tdd-red agent into the failing-test commit.
 set -euo pipefail
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/lib/utils.sh"
 
 INPUT=$(read_stdin)
-COMMAND=$(get_bash_command "$INPUT")
+COMMAND=$(get_shell_command "$INPUT")
 
 [ -z "$COMMAND" ] && exit 0
 
-# Only act on git push commands.
-echo "$COMMAND" | grep -qE '^\s*git\s+push\b' || exit 0
+# Only act on shipping-gate commands: git push, or gh pr create/merge.
+echo "$COMMAND" | grep -qE '^\s*(git\s+push\b|gh\s+pr\s+(create|merge)\b)' || exit 0
 
-PROJECT_ROOT=$(find_project_root "$(pwd)")
+PROJECT_ROOT=$(project_root_from_payload "$INPUT")
 
 # Determine the commit range about to be pushed. Prefer the tracked upstream;
 # fall back to a bounded window if there is none. Any git failure ⇒ exit 0
@@ -65,11 +66,12 @@ while IFS= read -r sha; do
 done <<< "$COMMITS"
 
 if [ -n "$OFFENDERS" ]; then
-  warn "red-proof: these commits add source files with no 'Tested-RED:' trailer —
+  ship_gate_enforce "$INPUT" "red-proof: these commits add source files with no 'Tested-RED:' trailer —
 no record that a failing test drove the code (TDD red-before-green):$(echo -e "$OFFENDERS")
 
-If these were test-driven, add a 'Tested-RED: <pytest-node-id>' trailer on the
-commit that introduced the failing test. This is advisory — the push proceeds."
+Add a 'Tested-RED: <pytest-node-id>' trailer on the commit that introduced the
+failing test (the tdd-red agent writes this). On Cursor the push is BLOCKED
+until every offending commit carries the trailer."
 fi
 
 exit 0

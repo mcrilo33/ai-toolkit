@@ -28,14 +28,16 @@ HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/lib/utils.sh"
 
 INPUT=$(read_stdin)
-COMMAND=$(get_bash_command "$INPUT")
+COMMAND=$(get_shell_command "$INPUT")
 
 [ -z "$COMMAND" ] && exit 0
 
 # Only act on git commit commands.
 echo "$COMMAND" | grep -qE '^\s*git\s+commit\b' || exit 0
 
-PROJECT_ROOT=$(find_project_root "$(pwd)")
+# Resolve the repo from the payload (do not trust cwd — empty on Cursor's
+# beforeShellExecution). Falls back to walking up from cwd.
+PROJECT_ROOT=$(project_root_from_payload "$INPUT")
 
 # Staged files = the index (commit hasn't run yet at PreToolUse).
 # ACMR: Added, Copied, Modified, Renamed — skip Deleted (nothing to lint).

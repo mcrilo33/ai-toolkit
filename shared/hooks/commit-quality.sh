@@ -14,13 +14,15 @@ HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/lib/utils.sh"
 
 INPUT=$(read_stdin)
-COMMAND=$(get_bash_command "$INPUT")
+COMMAND=$(get_shell_command "$INPUT")
 
 [ -z "$COMMAND" ] && exit 0
 
-# Note: get_bash_command already normalizes shell-escaped quotes (\" -> ", \'
-# -> '), so the subject-extraction below sees clean quotes regardless of how
-# the runtime serialized the tool call.
+# Note: get_shell_command reads the dedicated-event top-level .command (Cursor
+# beforeShellExecution) and falls back to tool_input.command (Claude/Copilot),
+# normalizing shell-escaped quotes (\" -> ", \' -> ') either way, so the
+# subject-extraction below sees clean quotes regardless of how the runtime
+# serialized the call.
 
 # Only act on git commit commands
 echo "$COMMAND" | grep -qE '^\s*git\s+commit\b' || exit 0
@@ -80,7 +82,10 @@ fi
 # Deliberately permissive on UNPARSEABLE messages: this gate only runs on
 # the -m text we can read. Editor/-F/-c/heredoc messages already exited
 # above, so they are never denied here.
-BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+# Resolve the repo from the payload (workspace_roots / $CURSOR_PROJECT_DIR) so
+# the branch lookup does not depend on cwd (empty on Cursor beforeShellExecution).
+PROJECT_ROOT=$(project_root_from_payload "$INPUT")
+BRANCH=$(git -C "$PROJECT_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
 
 # An issue ID in the branch is a tracker key (PROJ-12) anywhere, OR a bare
 # number that is the FIRST segment right after the type prefix

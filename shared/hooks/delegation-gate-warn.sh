@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
-# delegation-gate-warn — PreToolUse hook
-# Emits warning-only delegation hints for specialist agents.
-# Non-blocking by design: always exits 0.
+# delegation-gate-warn — delegation-hint hook for specialist agents.
+#
+# During editing (most commands) the hints are advisory warnings, emitted once
+# per repo. At the SHIPPING gate (git push / gh pr create|merge) the unresolved
+# planner / code-review hints are promoted on Cursor to a hard DENY via
+# ship_gate_enforce (see lib/utils.sh):
+#   • Cursor (beforeShellExecution): hard DENY (exit 2) — ship blocked until the
+#     multi-file plan / code-review is addressed.
+#   • Claude/Copilot / native git hooks: advisory warn, never blocks (exit 0).
 set -euo pipefail
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/lib/utils.sh"
 
 INPUT=$(read_stdin)
-COMMAND=$(get_bash_command "$INPUT")
+COMMAND=$(get_shell_command "$INPUT")
 
 [ -z "$COMMAND" ] && exit 0
 
 # Resolve git dir for stable per-repo warning cache.
-PROJECT_ROOT=$(find_project_root "$(pwd)")
+PROJECT_ROOT=$(project_root_from_payload "$INPUT")
 GIT_DIR_RAW=$(git -C "$PROJECT_ROOT" rev-parse --git-dir 2>/dev/null || true)
 
 if [ -n "$GIT_DIR_RAW" ]; then
@@ -39,11 +45,19 @@ warn_once() {
   : > "$marker" 2>/dev/null || true
 }
 
-# Always warn regardless of prior markers — used at shipping gates (commit/push)
-# so that ignored hints are repeated at the last moment before code is shipped.
-warn_always() {
+# Shipping-gate messages are accumulated and enforced once at the end so a
+# Cursor DENY can carry every unresolved hint in a single agent_message rather
+# than halting on the first.
+SHIP_GATE_MSG=""
+ship_gate_add() {
   local message="$1"
-  warn "$message"
+  if [ -n "$SHIP_GATE_MSG" ]; then
+    SHIP_GATE_MSG="$SHIP_GATE_MSG
+
+$message"
+  else
+    SHIP_GATE_MSG="$message"
+  fi
 }
 
 changed_files() {
@@ -111,18 +125,18 @@ if echo "$COMMAND" | grep -qiE '(traceback|stack\s*trace|failing|failed|error)';
   DEBUG_PATTERN=1
 fi
 
-# planner — warn once during editing, always at commit if still unresolved
+# planner — warn once during editing, enforced at commit/ship if still unresolved
 if [ "$CHANGED_COUNT" -ge 3 ]; then
   if [ "$COMMITTING" -eq 1 ] || [ "$SHIPPING" -eq 1 ]; then
-    warn_always "⚠ STOP. $CHANGED_COUNT files changed and planner was never spawned. Do NOT ship. Spawn planner now, get an implementation plan, then resume."
+    ship_gate_add "⚠ STOP. $CHANGED_COUNT files changed and planner was never spawned. Do NOT ship. Spawn planner now, get an implementation plan, then resume."
   else
     warn_once "planner" "⚠ STOP. Multi-file change detected ($CHANGED_COUNT files). Spawn planner now before writing any more code."
   fi
 fi
 
-# code-review — always warn at push/PR, never silenced
+# code-review — enforced at push/PR, never silenced
 if [ "$SHIPPING" -eq 1 ] && [ "$CHANGED_COUNT" -ge 1 ]; then
-  warn_always "⚠ STOP. Do NOT push yet. Spawn code-review on the current diff first, then push once it passes."
+  ship_gate_add "⚠ STOP. Do NOT push yet. Spawn code-review on the current diff first, then push once it passes."
 fi
 
 # debug
@@ -168,6 +182,11 @@ fi
 # tdd-refactor
 if [ "$REFACTOR_PATTERN" -eq 1 ] && [ "$RUNS_TESTS" -eq 1 ]; then
   warn_once "tdd-refactor" "⚠ STOP. Tests are green and cleanup is in progress. Spawn tdd-refactor now — do not refactor in the main agent loop."
+fi
+
+# Enforce accumulated shipping-gate hints once: DENY on Cursor, warn elsewhere.
+if [ -n "$SHIP_GATE_MSG" ]; then
+  ship_gate_enforce "$INPUT" "$SHIP_GATE_MSG"
 fi
 
 exit 0

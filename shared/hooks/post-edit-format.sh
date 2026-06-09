@@ -1,23 +1,31 @@
 #!/usr/bin/env bash
-# post-edit-format — PostToolUse hook
+# post-edit-format — file-edit hook.
 # Auto-formats the edited file using the project's configured formatter.
-# Runs after Edit/Write tool calls.
+#
+# Cursor runs this on afterFileEdit (real file_path); Claude/Copilot run it on
+# postToolUse (tool_input.file_path). get_edit_file_path handles both. On
+# afterFileEdit there is no agent-visible output channel, so this is a pure
+# side-effect (the file is formatted on disk); the agent is not messaged.
 #
 # Non-blocking: failures are logged but don't interrupt the agent.
-# Exit 0 = always (postToolUse hooks can't block)
+# Exit 0 = always.
 set -euo pipefail
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/lib/utils.sh"
 
 INPUT=$(read_stdin)
-FILE_PATH=$(get_file_path "$INPUT")
+FILE_PATH=$(get_edit_file_path "$INPUT")
 
 [ -z "$FILE_PATH" ] && exit 0
+# The generic postToolUse/Write path can hand us the runtime's internal scratch
+# file instead of the real edit — never format that.
+is_agent_tools_path "$FILE_PATH" && exit 0
 [ -f "$FILE_PATH" ] || exit 0
 
 EXT="${FILE_PATH##*.}"
-PROJECT_ROOT=$(find_project_root "$(dirname "$FILE_PATH")")
+PROJECT_ROOT=$(project_root_from_payload "$INPUT")
+[ -d "$PROJECT_ROOT" ] || PROJECT_ROOT=$(find_project_root "$(dirname "$FILE_PATH")")
 FORMATTER=$(detect_formatter "$PROJECT_ROOT")
 
 # ── Format by detected tool ─────────────────────────────────────────

@@ -31,3 +31,10 @@ Thumbs.db
 *.key
 *credentials*
 *secret*
+
+# Exception: hook *source* scripts whose names legitimately contain "secret"
+# (the secrets-scan family). These are code, not credentials, and must be
+# tracked so the hook pipeline can sync them. The broad *secret* rule above
+# still guards every other path.
+!hooks/secrets-scan.sh
+!hooks/secrets-scan-revert.sh

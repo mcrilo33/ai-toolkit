@@ -11,9 +11,9 @@ HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/lib/utils.sh"
 
 INPUT=$(read_stdin)
-COMMAND=$(get_bash_command "$INPUT")
+COMMAND=$(get_shell_command "$INPUT")
 
-# No command — not a Bash tool call, allow
+# No command — not a shell call, allow
 [ -z "$COMMAND" ] && exit 0
 
 # Check for --no-verify flag

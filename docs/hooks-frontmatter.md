@@ -23,12 +23,21 @@ All hooks defined in `shared/hooks/metadata.yml`:
 | ---- | ----- | ------- | :--: | ----------- | ------------ |
 | `block-no-verify` | preToolUse | Bash | 1 | Block `git` commands with `--no-verify` or improper force pushes | — |
 | `secrets-scan` | preToolUse | Write/Edit | 1 | Scan for hardcoded secrets (API keys, tokens) before writing | devops |
+| `secrets-scan-revert` | postToolUse | Write/Edit | 1 | Revert a file whose edit introduced a hardcoded secret (Cursor `afterFileEdit`) | — |
 | `git-push-review` | preToolUse | Bash | 2 | Show diff summary before `git push` for review | — |
 | `config-protection` | preToolUse | Write/Edit | 2 | Block modification of linter, formatter, and CI config files | devops |
 | `commit-quality` | preToolUse | Bash | 2 | Validate commit messages match conventional commits format | — |
+| `commit-gauntlet` | preToolUse | Bash | 1 | Lint/typecheck staged files before commit; block on failure | — |
 | `post-edit-format` | postToolUse | Edit/Write | 1 | Auto-format edited files using the project's configured formatter | debug, tdd-green, tdd-refactor, refactor |
 | `quality-gate` | postToolUse | Edit/Write | 1 | Run linter and typechecker on edited files | debug, tdd-green, tdd-refactor, refactor |
 | `console-log-warn` | postToolUse | Edit/Write | 2 | Warn when `console.log`, `print()`, or debug statements are added | debug |
+| `red-proof-warn` | preToolUse | Bash | 2 | Flag pushed commits that add source with no `Tested-RED:` trailer | — |
+| `reviewer-sep-warn` | preToolUse | Bash | 2 | Flag pushed commits with no `Reviewed-by: code-review` trailer | — |
+| `delegation-gate-warn` | preToolUse | Bash | 2 | Delegation hints for specialist agents; enforced at the shipping gate | — |
+
+The events/matchers above are the **canonical** (Claude/Copilot) wiring. On
+Cursor these hooks are remapped onto **dedicated events** via per-hook `cursor:`
+overrides — see [cursor-hooks-migration-plan.md](./cursor-hooks-migration-plan.md).
 
 The **Agent-scoped** column shows which agents include the hook in their
 frontmatter (runs only when that agent is active). Hooks without an agent scope
@@ -64,6 +73,20 @@ native event name by the sync script.
 | `preCompact` | *(unsupported)* | `preCompact` | `PreCompact` |
 | `subagentStart` | *(unsupported)* | `subagentStart` | `SubagentStart` |
 | `subagentStop` | `subagentStop` | `subagentStop` | `SubagentStop` |
+
+### Cursor dedicated events
+
+Cursor also exposes dedicated events that carry the real command/file payload
+(the generic `preToolUse`/`postToolUse` path delivers an internal scratch
+payload). A hook opts into one via a per-hook `cursor: event:` override; the
+matcher is then a **command regex** (`beforeShellExecution`) or a dedicated tool
+token (`afterFileEdit`), not a `preToolUse` tool name.
+
+| Cursor event | Input (top-level) | Can block? | Agent-visible output |
+| --- | --- | :--: | --- |
+| `beforeShellExecution` | `command`, `cwd`, `sandbox`, `workspace_roots` | yes | `agent_message` on deny |
+| `afterFileEdit` | `file_path`, `edits[]`, `workspace_roots` | no | none |
+| `beforeReadFile` | `file_path`, `content`, `attachments` | yes (reads only) | `user_message` |
 
 ## Generated output per platform
 

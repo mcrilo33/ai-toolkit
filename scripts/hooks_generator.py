@@ -45,7 +45,27 @@ CURSOR_EVENT_MAP: dict[str, str] = {
     "subagentStart": "subagentStart",
     "subagentStop": "subagentStop",
     "afterFileEdit": "afterFileEdit",
+    # Dedicated events (Cursor 3.7.21). Unlike the generic preToolUse/postToolUse
+    # path, these carry the real command/file payload at the top level. A hook
+    # selects one via a per-hook ``cursor: event:`` override in metadata.yml.
+    "beforeShellExecution": "beforeShellExecution",
+    "afterShellExecution": "afterShellExecution",
+    "beforeReadFile": "beforeReadFile",
 }
+
+# Cursor dedicated events whose ``matcher`` is NOT a tool-type name. On
+# beforeShellExecution/afterShellExecution the matcher is a COMMAND REGEX; on
+# afterFileEdit/beforeReadFile it filters by the dedicated event's own tool
+# token (e.g. "Write|TabWrite"). In neither case should the
+# preToolUse/postToolUse tool-name translation (Bash->Shell, Edit->Write) run.
+CURSOR_DEDICATED_EVENTS: frozenset[str] = frozenset(
+    {
+        "beforeShellExecution",
+        "afterShellExecution",
+        "afterFileEdit",
+        "beforeReadFile",
+    }
+)
 
 # Cursor uses different tool-type names in preToolUse/postToolUse matchers than
 # the Claude/Copilot naming used in metadata.yml. A matcher referencing a tool
@@ -156,15 +176,20 @@ def _ordered_hooks(hooks: dict[str, dict]) -> list[tuple[str, dict]]:
 # ── Generator functions ─────────────────────────────────────────────
 
 def _script_ref(hook_name: str, tool: str) -> str:
-    """Return the command string pointing to the hook script."""
+    """Return the command string pointing to the hook script.
+
+    Cursor project hooks run from the project root and must use a root-relative
+    path WITHOUT a leading "./" (".cursor/hooks/..."). The "./.cursor/..." form
+    still executes but trips a false-positive warning icon in the Hooks settings
+    UI, so the canonical form is emitted instead.
+    """
     script = f"{hook_name}.sh"
-    if tool == "copilot":
-        return f"./.github/hooks/scripts/{script}"
-    elif tool == "cursor":
-        return f"./.cursor/hooks/scripts/{script}"
-    elif tool == "claude":
-        return f'"$CLAUDE_PROJECT_DIR"/.claude/hooks/scripts/{script}'
-    return f"./hooks/scripts/{script}"
+    refs = {
+        "copilot": f"./.github/hooks/scripts/{script}",
+        "cursor": f".cursor/hooks/scripts/{script}",
+        "claude": f'"$CLAUDE_PROJECT_DIR"/.claude/hooks/scripts/{script}',
+    }
+    return refs.get(tool, f"./hooks/scripts/{script}")
 
 
 def _cursor_matcher(matcher: str) -> str:
@@ -232,7 +257,12 @@ def generate_cursor(hooks: dict[str, dict]) -> dict:
 
         matcher = merged.get("matcher")
         if matcher:
-            entry["matcher"] = _cursor_matcher(matcher)
+            # Dedicated events use a command regex / dedicated tool token, not a
+            # preToolUse/postToolUse tool name — pass the matcher through verbatim.
+            if event in CURSOR_DEDICATED_EVENTS:
+                entry["matcher"] = matcher
+            else:
+                entry["matcher"] = _cursor_matcher(matcher)
 
         timeout = merged.get("timeout")
         if timeout:

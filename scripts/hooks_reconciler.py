@@ -92,6 +92,28 @@ def reconcile_bucket(existing: list[dict], generated: list[dict]) -> list[dict]:
     return deduped
 
 
+def _purge_owned_from_unemitted(
+    existing_hooks: dict, emitted_events: set[str]
+) -> None:
+    """Drop ai-toolkit-owned entries from buckets we no longer emit into.
+
+    When a hook migrates to a different event (e.g. preToolUse ->
+    beforeShellExecution), the old bucket would otherwise keep its stale owned
+    entry forever, because the reconcile loop only visits buckets present in the
+    freshly generated payload. Sweep every *other* existing bucket and remove
+    owned entries, leaving user-authored hooks untouched. Empty buckets are
+    deleted so the migration leaves no dangling event keys.
+    """
+    for event in list(existing_hooks.keys()):
+        if event in emitted_events:
+            continue
+        kept = [e for e in (existing_hooks.get(event) or []) if not _is_owned(e)]
+        if kept:
+            existing_hooks[event] = kept
+        else:
+            del existing_hooks[event]
+
+
 def reconcile_cursor(existing: dict, generated: dict) -> dict:
     """Reconcile a Cursor hooks.json document.
 
@@ -105,6 +127,10 @@ def reconcile_cursor(existing: dict, generated: dict) -> dict:
         existing_hooks[event] = reconcile_bucket(
             existing_hooks.get(event, []) or [], gen_entries
         )
+
+    # Migration cleanup: an owned hook that moved events leaves a stale entry in
+    # its old bucket. Remove owned entries from any bucket we did not just emit.
+    _purge_owned_from_unemitted(existing_hooks, set(generated_hooks.keys()))
 
     result["hooks"] = existing_hooks
     result["version"] = 1
@@ -124,6 +150,11 @@ def reconcile_claude(existing: dict, generated: dict) -> dict:
         existing_hooks[event] = reconcile_bucket(
             existing_hooks.get(event, []) or [], gen_groups
         )
+
+    # Migration cleanup: purge owned entries from buckets we no longer emit into
+    # (mirrors reconcile_cursor). Claude wiring is unchanged today, so this is a
+    # no-op now but keeps both reconcilers consistent for future migrations.
+    _purge_owned_from_unemitted(existing_hooks, set(generated.keys()))
 
     result["hooks"] = existing_hooks
     return result

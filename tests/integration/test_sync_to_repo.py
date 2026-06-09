@@ -22,16 +22,22 @@ SHARED_DIR = REPO_ROOT / "shared"
 # ── Expected hook counts derived from shared/hooks/metadata.yml ──────────
 
 
-def _hook_event_counts(tool_event_map: dict[str, str]) -> Counter[str]:
+def _hook_event_counts(tool_event_map: dict[str, str], *, tool: str | None = None) -> Counter[str]:
     """Count expected ai-toolkit hooks per platform event from metadata.yml.
 
     Returns a Counter keyed by the *platform* event name, so the same source of
     truth (shared/hooks/metadata.yml) drives the assertion for every tool.
+
+    A per-tool ``event`` override (e.g. the Cursor migration's
+    ``cursor: event: beforeShellExecution``) is honored when ``tool`` is given,
+    mirroring hooks_generator.py.
     """
     meta = yaml.safe_load((SHARED_DIR / "hooks" / "metadata.yml").read_text())
     counts: Counter[str] = Counter()
     for data in meta.values():
         canonical = data.get("event", "")
+        if tool and isinstance(data.get(tool), dict) and data[tool].get("event"):
+            canonical = data[tool]["event"]
         platform_event = tool_event_map.get(canonical, canonical)
         if platform_event:
             counts[platform_event] += 1
@@ -39,7 +45,14 @@ def _hook_event_counts(tool_event_map: dict[str, str]) -> Counter[str]:
 
 
 # Canonical → platform event maps (mirror hooks_generator.py)
-_CURSOR_EVENT_MAP = {"preToolUse": "preToolUse", "postToolUse": "postToolUse"}
+_CURSOR_EVENT_MAP = {
+    "preToolUse": "preToolUse",
+    "postToolUse": "postToolUse",
+    "beforeShellExecution": "beforeShellExecution",
+    "afterShellExecution": "afterShellExecution",
+    "afterFileEdit": "afterFileEdit",
+    "beforeReadFile": "beforeReadFile",
+}
 _CLAUDE_EVENT_MAP = {"preToolUse": "PreToolUse", "postToolUse": "PostToolUse"}
 
 # ── Expected rules derived from metadata ─────────────────
@@ -981,7 +994,7 @@ class TestHookIdempotency:
         _run_sync(target_repo, "all")
         hooks_json = json.loads((target_repo / ".cursor" / "hooks.json").read_text())
         assert self._owned_cursor_entries(hooks_json) == _hook_event_counts(
-            _CURSOR_EVENT_MAP
+            _CURSOR_EVENT_MAP, tool="cursor"
         )
 
     def test_claude_counts_match_metadata(self, target_repo: Path) -> None:
@@ -1002,7 +1015,7 @@ class TestHookIdempotency:
             (target_repo / ".claude" / "settings.json").read_text()
         )
         assert self._owned_cursor_entries(hooks_json) == _hook_event_counts(
-            _CURSOR_EVENT_MAP
+            _CURSOR_EVENT_MAP, tool="cursor"
         )
         assert self._owned_claude_handlers(settings) == _hook_event_counts(
             _CLAUDE_EVENT_MAP
@@ -1022,7 +1035,7 @@ class TestHookIdempotency:
         _run_sync(target_repo, "all")
         healed = json.loads(cursor_file.read_text())
         assert self._owned_cursor_entries(healed) == _hook_event_counts(
-            _CURSOR_EVENT_MAP
+            _CURSOR_EVENT_MAP, tool="cursor"
         )
 
     def test_user_authored_hook_survives_sync(self, target_repo: Path) -> None:
@@ -1030,13 +1043,13 @@ class TestHookIdempotency:
         _run_sync(target_repo, "all")
         cursor_file = target_repo / ".cursor" / "hooks.json"
         data = json.loads(cursor_file.read_text())
-        user_entry = {"command": "./scripts/user-precommit.sh", "matcher": "Bash"}
-        data["hooks"].setdefault("preToolUse", []).append(user_entry)
+        user_entry = {"command": "./scripts/user-precommit.sh", "matcher": "git commit"}
+        data["hooks"].setdefault("beforeShellExecution", []).append(user_entry)
         cursor_file.write_text(json.dumps(data, indent=2))
 
         _run_sync(target_repo, "all")
         result = json.loads(cursor_file.read_text())
-        assert user_entry in result["hooks"]["preToolUse"]
+        assert user_entry in result["hooks"]["beforeShellExecution"]
 
     def test_removed_shared_hook_drops_downstream(self, target_repo: Path) -> None:
         """A stale owned entry absent from the generated set is dropped on sync."""
@@ -1045,11 +1058,11 @@ class TestHookIdempotency:
         data = json.loads(cursor_file.read_text())
         stale = {
             "command": "./.cursor/hooks/scripts/deleted-hook.sh",
-            "matcher": "Bash",
+            "matcher": "git commit",
         }
-        data["hooks"]["preToolUse"].append(stale)
+        data["hooks"].setdefault("beforeShellExecution", []).append(stale)
         cursor_file.write_text(json.dumps(data, indent=2))
 
         _run_sync(target_repo, "all")
         result = json.loads(cursor_file.read_text())
-        assert stale not in result["hooks"]["preToolUse"]
+        assert stale not in result["hooks"]["beforeShellExecution"]

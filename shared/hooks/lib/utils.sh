@@ -90,6 +90,171 @@ get_file_path() {
   fi
 }
 
+# ── Cursor dedicated-event accessors ────────────────────────────────
+# Cursor 3.7.21 dedicated events (beforeShellExecution/afterFileEdit/
+# beforeReadFile) carry the REAL payload at the TOP LEVEL — unlike the generic
+# preToolUse/postToolUse path, which delivers an internal scratch payload under
+# tool_input. These accessors prefer the top-level shape and fall back to the
+# Claude/Copilot tool_input shape, so the same script works on every platform.
+
+# ── Detect the dedicated event name (Cursor only) ───────────────────
+# Empty on Claude/Copilot generic calls (they do not set hook_event_name to a
+# dedicated-event value). Used to branch behavior per platform.
+get_hook_event() {
+  local input="$1"
+  json_field "$input" "hook_event_name"
+}
+
+# ── True when running under a Cursor dedicated event ────────────────
+# Returns 0 (success) if hook_event_name is one of the dedicated events.
+on_cursor_dedicated_event() {
+  local input="$1" event
+  event=$(get_hook_event "$input")
+  case "$event" in
+    beforeShellExecution|afterShellExecution|afterFileEdit|beforeReadFile) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ── Get the shell command (cross-platform) ──────────────────────────
+# beforeShellExecution: top-level .command. Claude/Copilot: tool_input.command
+# (via get_bash_command). Both paths normalize shell-escaped quotes.
+get_shell_command() {
+  local input="$1" cmd=""
+  if command -v jq &>/dev/null; then
+    cmd=$(echo "$input" | jq -r '.command // empty' 2>/dev/null)
+  fi
+  if [ -z "$cmd" ]; then
+    # Fall back to the Claude/Copilot tool_input.command shape.
+    get_bash_command "$input"
+    return
+  fi
+  normalize_escaped_quotes "$cmd"
+}
+
+# ── Recognize a `git add` / `git commit` invocation ─────────────────
+# Matches the subcommand anywhere in the command string so chained or prefixed
+# forms are not bypassed: `cd sub && git add`, `git -C path commit`,
+# `foo; git add -A`, `git --no-pager commit`. The `git` token must be at a
+# command boundary (start, or after a shell separator) to avoid matching
+# substrings like `mygit`. Returns 0 on match.
+is_git_commit_or_add() {
+  local cmd="$1"
+  printf '%s' "$cmd" | grep -qE '(^|[;&|]|&&|\|\|)[[:space:]]*git([[:space:]]+(-[^[:space:]]+|--[^[:space:]]+|-C[[:space:]]+[^[:space:]]+))*[[:space:]]+(add|commit)\b'
+}
+
+# ── Get the edited file path (cross-platform) ───────────────────────
+# afterFileEdit: top-level .file_path. Claude/Copilot: tool_input.file_path
+# (via get_file_path).
+get_edit_file_path() {
+  local input="$1" path=""
+  if command -v jq &>/dev/null; then
+    path=$(echo "$input" | jq -r '.file_path // empty' 2>/dev/null)
+  fi
+  if [ -z "$path" ]; then
+    get_file_path "$input"
+    return
+  fi
+  echo "$path"
+}
+
+# ── Get the new content written (cross-platform) ────────────────────
+# afterFileEdit: concatenated .edits[].new_string. Claude/Copilot:
+# tool_input.content (Write) or tool_input.new_string (Edit).
+get_edit_new_content() {
+  local input="$1" content="" tool_input
+  if command -v jq &>/dev/null; then
+    content=$(echo "$input" | jq -r '
+      if (.edits | type) == "array"
+      then ([.edits[]?.new_string] | join(""))
+      else empty end' 2>/dev/null)
+  fi
+  if [ -z "$content" ]; then
+    tool_input=$(get_tool_input "$input")
+    if command -v jq &>/dev/null; then
+      content=$(echo "$tool_input" | jq -r '.content // .new_string // empty' 2>/dev/null)
+    fi
+  fi
+  echo "$content"
+}
+
+# ── Resolve the project root from the payload (never trust cwd) ─────
+# Cursor's beforeShellExecution reports an EMPTY cwd, so do NOT rely on it.
+# Prefer $CURSOR_PROJECT_DIR, then payload .workspace_roots[0], then walk up
+# to the nearest .git.
+project_root_from_payload() {
+  local input="${1:-}" root=""
+  if [ -n "${CURSOR_PROJECT_DIR:-}" ]; then
+    echo "$CURSOR_PROJECT_DIR"
+    return
+  fi
+  if [ -n "$input" ] && command -v jq &>/dev/null; then
+    root=$(echo "$input" | jq -r '.workspace_roots[0] // empty' 2>/dev/null)
+  fi
+  if [ -n "$root" ] && [ "$root" != "null" ]; then
+    echo "$root"
+    return
+  fi
+  find_project_root "$(pwd)"
+}
+
+# ── Guard against the internal scratch path ─────────────────────────
+# The generic postToolUse/Write path delivers paths like
+# ~/.cursor/projects/<proj>/agent-tools/<uuid>.txt — internal scratch, not the
+# real edit. Scripts should early-exit when handed one. Returns 0 if the path
+# matches the scratch pattern.
+is_agent_tools_path() {
+  local path="$1"
+  case "$path" in
+    */.cursor/*/agent-tools/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ── Hardcoded-secret detection ──────────────────────────────────────
+# Shared by secrets-scan (pre-write / commit-time deny) and secrets-scan-revert
+# (afterFileEdit containment). Each entry: ERE pattern<TAB>description.
+secret_patterns() {
+  cat <<'PATTERNS'
+sk-[a-zA-Z0-9]{20,}	OpenAI API key
+sk-proj-[a-zA-Z0-9_-]{20,}	OpenAI project key
+AKIA[0-9A-Z]{16}	AWS Access Key ID
+ghp_[a-zA-Z0-9]{36}	GitHub personal access token
+gho_[a-zA-Z0-9]{36}	GitHub OAuth token
+ghs_[a-zA-Z0-9]{36}	GitHub server token
+github_pat_[a-zA-Z0-9_]{22,}	GitHub fine-grained PAT
+glpat-[a-zA-Z0-9_-]{20,}	GitLab personal access token
+xoxb-[0-9]{10,}-[a-zA-Z0-9]{20,}	Slack bot token
+xoxp-[0-9]{10,}-[a-zA-Z0-9]{20,}	Slack user token
+sk_live_[a-zA-Z0-9]{24,}	Stripe secret key
+pk_live_[a-zA-Z0-9]{24,}	Stripe publishable key
+sq0csp-[a-zA-Z0-9_-]{40,}	Square credential
+AIza[0-9A-Za-z_-]{35}	Google API key
+ya29\.[0-9A-Za-z_-]+	Google OAuth token
+eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}	JWT token (if long)
+npm_[a-zA-Z0-9]{36}	npm access token
+pypi-AgEIcH[a-zA-Z0-9_-]{50,}	PyPI API token
+SG\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9_-]{43}	SendGrid API key
+key-[a-zA-Z0-9]{32}	Mailgun API key
+PATTERNS
+}
+
+# ── Scan a blob of text for a hardcoded secret ──────────────────────
+# Prints the description of the FIRST matching pattern (and returns 0) or
+# returns 1 if none match.
+scan_for_secret() {
+  local content="$1" pattern desc entry
+  [ -z "$content" ] && return 1
+  while IFS=$'\t' read -r pattern desc; do
+    [ -z "$pattern" ] && continue
+    if printf '%s' "$content" | grep -qE "$pattern"; then
+      printf '%s' "$desc"
+      return 0
+    fi
+  done < <(secret_patterns)
+  return 1
+}
+
 # ── Deny output (cross-platform) ────────────────────────────────────
 # Works for Copilot, Cursor, and Claude preToolUse hooks.
 deny() {
@@ -115,6 +280,25 @@ deny() {
 warn() {
   local message="$1"
   echo "[Hook] $message" >&2
+}
+
+# ── Shipping-gate enforcement (platform-aware) ──────────────────────
+# The advisory push/PR hooks (red-proof, reviewer-sep, delegation,
+# git-push-review) were warn-only. On Cursor's dedicated beforeShellExecution
+# event the agent CAN be blocked, so an unmet shipping condition is promoted to
+# a hard DENY (message lands in agent_message). On every other platform/event
+# (Claude/Copilot preToolUse, native git hooks) the historical advisory
+# behavior is preserved: warn and continue.
+#
+# Usage: ship_gate_enforce "$INPUT" "<message>"
+#   - On Cursor beforeShellExecution: deny() (exit 2) — does not return.
+#   - Otherwise: warn() and return 0.
+ship_gate_enforce() {
+  local input="$1" message="$2"
+  if [ "$(get_hook_event "$input")" = "beforeShellExecution" ]; then
+    deny "$message"
+  fi
+  warn "$message"
 }
 
 # ── Log to stderr (debugging) ───────────────────────────────────────

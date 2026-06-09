@@ -11,6 +11,14 @@
 #   timeout     — max seconds (default: 30)
 #
 # Per-tool overrides nested under copilot/cursor/claude keys.
+#
+# Cursor migration (3.7.21): the top-level event/matcher is the CANONICAL
+# (Claude/Copilot) wiring and stays unchanged. The nested `cursor:` block
+# remaps each hook onto Cursor's DEDICATED events (beforeShellExecution,
+# afterFileEdit) which deliver the real command/file payload at the top level;
+# the generic preToolUse/postToolUse path delivered an internal scratch
+# payload. On beforeShellExecution the `matcher` is a COMMAND REGEX; on
+# afterFileEdit it filters by the dedicated tool token (Write|TabWrite).
 
 block-no-verify:
   event: preToolUse
@@ -19,6 +27,9 @@ block-no-verify:
   tier: 1
   claude:
     if: "Bash(git * --no-verify *)"
+  cursor:
+    event: beforeShellExecution
+    matcher: ""
 
 secrets-scan:
   event: preToolUse
@@ -27,6 +38,20 @@ secrets-scan:
   tier: 1
   copilot:
     matcher: "edit|create"
+  cursor:
+    event: beforeShellExecution
+    matcher: "git( +-[^ ]+| +-C +[^ ]+)* +(add|commit)( |$)"
+
+secrets-scan-revert:
+  event: postToolUse
+  matcher: "Write|Edit"
+  description: "Revert a file whose edit introduced a hardcoded secret (Cursor afterFileEdit early containment)"
+  tier: 1
+  copilot:
+    matcher: "edit|create"
+  cursor:
+    event: afterFileEdit
+    matcher: "Write|TabWrite"
 
 git-push-review:
   event: preToolUse
@@ -35,6 +60,9 @@ git-push-review:
   tier: 2
   claude:
     if: "Bash(git push *)"
+  cursor:
+    event: beforeShellExecution
+    matcher: "git( +-[^ ]+| +-C +[^ ]+)* +push( |$)|gh +pr( |$)"
 
 config-protection:
   event: preToolUse
@@ -43,6 +71,9 @@ config-protection:
   tier: 2
   copilot:
     matcher: "edit|create"
+  cursor:
+    event: beforeShellExecution
+    matcher: "git( +-[^ ]+| +-C +[^ ]+)* +(add|commit)( |$)"
 
 post-edit-format:
   event: postToolUse
@@ -51,6 +82,9 @@ post-edit-format:
   tier: 1
   copilot:
     matcher: "edit|create"
+  cursor:
+    event: afterFileEdit
+    matcher: "Write|TabWrite"
 
 quality-gate:
   event: postToolUse
@@ -59,6 +93,9 @@ quality-gate:
   tier: 1
   copilot:
     matcher: "edit|create"
+  cursor:
+    event: afterFileEdit
+    matcher: "Write|TabWrite"
 
 console-log-warn:
   event: postToolUse
@@ -67,6 +104,9 @@ console-log-warn:
   tier: 2
   copilot:
     matcher: "edit|create"
+  cursor:
+    event: afterFileEdit
+    matcher: "Write|TabWrite"
 
 commit-quality:
   event: preToolUse
@@ -75,6 +115,9 @@ commit-quality:
   tier: 2
   claude:
     if: "Bash(git commit *)"
+  cursor:
+    event: beforeShellExecution
+    matcher: "git( +-[^ ]+| +-C +[^ ]+)* +commit( |$)"
 
 commit-gauntlet:
   event: preToolUse
@@ -84,6 +127,9 @@ commit-gauntlet:
   timeout: 60
   claude:
     if: "Bash(git commit *)"
+  cursor:
+    event: beforeShellExecution
+    matcher: "git( +-[^ ]+| +-C +[^ ]+)* +commit( |$)"
 
 red-proof-warn:
   event: preToolUse
@@ -92,6 +138,9 @@ red-proof-warn:
   tier: 2
   claude:
     if: "Bash(git push *)"
+  cursor:
+    event: beforeShellExecution
+    matcher: "git( +-[^ ]+| +-C +[^ ]+)* +push( |$)|gh +pr( |$)"
 
 reviewer-sep-warn:
   event: preToolUse
@@ -100,9 +149,15 @@ reviewer-sep-warn:
   tier: 2
   claude:
     if: "Bash(git push *)"
+  cursor:
+    event: beforeShellExecution
+    matcher: "git( +-[^ ]+| +-C +[^ ]+)* +push( |$)|gh +pr( |$)"
 
 delegation-gate-warn:
   event: preToolUse
   matcher: Bash
   description: "Warn with delegation hints for specialist agents based on command and diff heuristics"
   tier: 2
+  cursor:
+    event: beforeShellExecution
+    matcher: "git( +-[^ ]+| +-C +[^ ]+)* +push( |$)|gh +pr( |$)"

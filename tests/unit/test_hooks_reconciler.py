@@ -129,6 +129,48 @@ class TestReconcileCursor:
         second = reconcile_cursor(first, generated)
         assert first == second
 
+    def test_migration_purges_owned_from_unemitted_bucket(self) -> None:
+        """A hook that moved preToolUse -> beforeShellExecution leaves no stale entry.
+
+        The old bucket (preToolUse) is no longer emitted; its owned entry must be
+        removed so the migrated hook does not fire on BOTH the generic scratch
+        event and the dedicated event.
+        """
+        existing = {
+            "version": 1,
+            "hooks": {"preToolUse": [OWNED_CURSOR]},  # pre-migration wiring
+        }
+        generated = {
+            "version": 1,
+            "hooks": {"beforeShellExecution": [OWNED_CURSOR]},  # post-migration
+        }
+        result = reconcile_cursor(existing, generated)
+        # Stale preToolUse bucket is gone entirely (no owned entries remain).
+        assert "preToolUse" not in result["hooks"]
+        assert result["hooks"]["beforeShellExecution"] == [OWNED_CURSOR]
+
+    def test_migration_preserves_user_hook_in_old_bucket(self) -> None:
+        """Purging the old bucket must keep user-authored entries in place."""
+        existing = {
+            "version": 1,
+            "hooks": {"preToolUse": [OWNED_CURSOR, USER_CURSOR]},
+        }
+        generated = {
+            "version": 1,
+            "hooks": {"beforeShellExecution": [OWNED_CURSOR]},
+        }
+        result = reconcile_cursor(existing, generated)
+        # User hook survives in the old bucket; only the owned entry is purged.
+        assert result["hooks"]["preToolUse"] == [USER_CURSOR]
+        assert result["hooks"]["beforeShellExecution"] == [OWNED_CURSOR]
+
+    def test_migration_idempotent(self) -> None:
+        existing = {"version": 1, "hooks": {"preToolUse": [OWNED_CURSOR]}}
+        generated = {"version": 1, "hooks": {"beforeShellExecution": [OWNED_CURSOR]}}
+        first = reconcile_cursor(existing, generated)
+        second = reconcile_cursor(first, generated)
+        assert first == second
+
 
 # ── reconcile_claude() ────────────────────────────────────
 

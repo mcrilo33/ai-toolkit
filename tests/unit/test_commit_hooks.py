@@ -25,25 +25,65 @@ COMMIT_QUALITY = HOOKS_DIR / "commit-quality.sh"
 COMMIT_GAUNTLET = HOOKS_DIR / "commit-gauntlet.sh"
 RED_PROOF = HOOKS_DIR / "red-proof-warn.sh"
 REVIEWER_SEP = HOOKS_DIR / "reviewer-sep-warn.sh"
+BLOCK_NO_VERIFY = HOOKS_DIR / "block-no-verify.sh"
+SECRETS_SCAN = HOOKS_DIR / "secrets-scan.sh"
+SECRETS_SCAN_REVERT = HOOKS_DIR / "secrets-scan-revert.sh"
+CONFIG_PROTECTION = HOOKS_DIR / "config-protection.sh"
+GIT_PUSH_REVIEW = HOOKS_DIR / "git-push-review.sh"
+DELEGATION = HOOKS_DIR / "delegation-gate-warn.sh"
+UTILS = HOOKS_DIR / "lib" / "utils.sh"
 
 BLOCK = 2
 ALLOW = 0
 
 
 def _payload(command: str) -> str:
+    """Claude/Copilot generic shape: command under tool_input."""
     return json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
 
 
-def run_hook(script: Path, command: str, *, cwd: Path | None = None) -> int:
-    """Run a hook with a synthesized command payload; return its exit code."""
-    result = subprocess.run(
+def _cursor_shell_payload(command: str, *, root: Path | None = None) -> str:
+    """Cursor beforeShellExecution shape: top-level command + workspace_roots."""
+    payload: dict = {
+        "hook_event_name": "beforeShellExecution",
+        "command": command,
+        "cwd": "",
+    }
+    if root is not None:
+        payload["workspace_roots"] = [str(root)]
+    return json.dumps(payload)
+
+
+def _cursor_edit_payload(file_path: Path, new_string: str, *, root: Path | None = None) -> str:
+    """Cursor afterFileEdit shape: top-level file_path + edits[]."""
+    payload: dict = {
+        "hook_event_name": "afterFileEdit",
+        "file_path": str(file_path),
+        "edits": [{"old_string": "", "new_string": new_string}],
+    }
+    if root is not None:
+        payload["workspace_roots"] = [str(root)]
+    return json.dumps(payload)
+
+
+def _run(script: Path, payload: str, *, cwd: Path | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
         ["bash", str(script)],
-        input=_payload(command),
+        input=payload,
         capture_output=True,
         text=True,
         cwd=str(cwd) if cwd else None,
     )
-    return result.returncode
+
+
+def run_hook(script: Path, command: str, *, cwd: Path | None = None) -> int:
+    """Run a hook with a synthesized (Claude/Copilot) command payload; return exit code."""
+    return _run(script, _payload(command), cwd=cwd).returncode
+
+
+def run_hook_cursor_shell(script: Path, command: str, *, cwd: Path | None = None) -> int:
+    """Run a hook with a Cursor beforeShellExecution payload; return exit code."""
+    return _run(script, _cursor_shell_payload(command, root=cwd), cwd=cwd).returncode
 
 
 # ── Fixtures ──────────────────────────────────────────────
@@ -283,3 +323,46 @@ def test_reviewer_sep_never_blocks(git_repo: Path) -> None:
         capture_output=True,
     )
     assert run_hook(REVIEWER_SEP, "git push", cwd=git_repo) == ALLOW
+
+
+# ── Cursor beforeShellExecution shape: commit hooks parity ─
+# The same blocking decisions must hold when the command arrives at the TOP
+# LEVEL (Cursor's dedicated event) rather than under tool_input (Claude/Copilot).
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        pytest.param('git commit -m "feat: y" -m "Refs #1"', ALLOW, id="valid-feat"),
+        pytest.param('git commit -m "add helper" -m "Refs #1"', BLOCK, id="no-type"),
+        pytest.param("ls -la", ALLOW, id="non-git"),
+    ],
+)
+def test_commit_quality_cursor_shape(
+    on_branch: Callable[[str], Path], command: str, expected: int
+) -> None:
+    repo = on_branch("feature/1-x")
+    assert run_hook_cursor_shell(COMMIT_QUALITY, command, cwd=repo) == expected
+
+
+def test_commit_quality_cursor_escaped_quotes(on_branch: Callable[[str], Path]) -> None:
+    repo = on_branch("feature/1-x")
+    command = r'git commit -m \"feat(core): add helper\" -m \"Refs #1\"'
+    assert run_hook_cursor_shell(COMMIT_QUALITY, command, cwd=repo) == ALLOW
+
+
+@ruff
+def test_gauntlet_cursor_shape_blocks_lint_error(on_branch: Callable[[str], Path]) -> None:
+    repo = on_branch("feature/1-x")
+    _stage(repo, "ruff.toml", '[lint]\nselect = ["F"]\n')
+    _stage(repo, "pkg/bad.py", "import os\n")  # F401 unused import
+    assert (
+        run_hook_cursor_shell(COMMIT_GAUNTLET, 'git commit -m "feat: x" -m "Refs #1"', cwd=repo)
+        == BLOCK
+    )
+
+
+def test_block_no_verify_cursor_shape(on_branch: Callable[[str], Path]) -> None:
+    repo = on_branch("feature/1-x")
+    flag = "--no-" + "verify"
+    assert run_hook_cursor_shell(BLOCK_NO_VERIFY, f"git commit {flag}", cwd=repo) == BLOCK

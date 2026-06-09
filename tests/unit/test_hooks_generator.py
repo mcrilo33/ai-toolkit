@@ -11,14 +11,13 @@ import pytest
 # Make scripts/ importable
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
-from hooks_generator import (  # noqa: E402
+from hooks_generator import (
     _cursor_matcher,
     generate_claude,
     generate_copilot,
     generate_cursor,
     parse_hooks_metadata,
 )
-
 
 # ── Fixtures ──────────────────────────────────────────────
 
@@ -53,6 +52,55 @@ def hooks_meta(tmp_path: Path) -> Path:
     p = tmp_path / "metadata.yml"
     p.write_text(content)
     return p
+
+
+@pytest.fixture()
+def cursor_dedicated_meta(tmp_path: Path) -> Path:
+    """Metadata exercising the Cursor dedicated-event overrides.
+
+    Mirrors the real migration: canonical (Claude/Copilot) event/matcher stays
+    at the top level; a nested ``cursor:`` block remaps the hook onto a
+    dedicated event with a command-regex (beforeShellExecution) or dedicated
+    tool token (afterFileEdit) matcher.
+    """
+    content = textwrap.dedent("""\
+        commit-quality:
+          event: preToolUse
+          matcher: Bash
+          description: "Validate commit message"
+          tier: 2
+          claude:
+            if: "Bash(git commit *)"
+          cursor:
+            event: beforeShellExecution
+            matcher: "git commit"
+
+        block-no-verify:
+          event: preToolUse
+          matcher: Bash
+          description: "Block --no-verify"
+          tier: 1
+          cursor:
+            event: beforeShellExecution
+            matcher: ""
+
+        quality-gate:
+          event: postToolUse
+          matcher: "Edit|Write"
+          description: "Lint + typecheck"
+          tier: 1
+          cursor:
+            event: afterFileEdit
+            matcher: "Write|TabWrite"
+    """)
+    p = tmp_path / "metadata.yml"
+    p.write_text(content)
+    return p
+
+
+@pytest.fixture()
+def cursor_dedicated_data(cursor_dedicated_meta: Path) -> dict:
+    return parse_hooks_metadata(str(cursor_dedicated_meta))
 
 
 @pytest.fixture()
@@ -165,7 +213,10 @@ class TestGenerateCursor:
     def test_script_path_prefix(self, hooks_data: dict) -> None:
         result = generate_cursor(hooks_data)
         pre = result["hooks"]["preToolUse"][0]
-        assert pre["command"].startswith("./.cursor/hooks/scripts/")
+        # Project hooks must be root-relative WITHOUT a leading "./" — the
+        # "./.cursor/..." form trips a false-positive warning in the settings UI.
+        assert pre["command"].startswith(".cursor/hooks/scripts/")
+        assert not pre["command"].startswith("./")
 
     def test_no_type_field(self, hooks_data: dict) -> None:
         """Cursor format uses 'command' not 'type' + 'bash'."""
@@ -173,6 +224,80 @@ class TestGenerateCursor:
         pre = result["hooks"]["preToolUse"][0]
         assert "type" not in pre
         assert "command" in pre
+
+
+class TestCursorDedicatedEvents:
+    """Cursor migration: per-hook `cursor: event:` overrides onto dedicated events."""
+
+    def test_event_override_remaps_to_before_shell_execution(
+        self, cursor_dedicated_data: dict
+    ) -> None:
+        result = generate_cursor(cursor_dedicated_data)
+        assert "beforeShellExecution" in result["hooks"]
+        # The canonical preToolUse bucket must NOT be emitted for migrated hooks.
+        assert "preToolUse" not in result["hooks"]
+
+    def test_event_override_remaps_to_after_file_edit(
+        self, cursor_dedicated_data: dict
+    ) -> None:
+        result = generate_cursor(cursor_dedicated_data)
+        assert "afterFileEdit" in result["hooks"]
+        assert "postToolUse" not in result["hooks"]
+
+    def test_before_shell_matcher_is_command_regex_not_translated(
+        self, cursor_dedicated_data: dict
+    ) -> None:
+        """On beforeShellExecution the matcher is a command regex — verbatim, never Bash->Shell."""
+        result = generate_cursor(cursor_dedicated_data)
+        cq = next(
+            e
+            for e in result["hooks"]["beforeShellExecution"]
+            if "commit-quality.sh" in e["command"]
+        )
+        assert cq["matcher"] == "git commit"
+
+    def test_empty_cursor_matcher_emits_no_matcher(
+        self, cursor_dedicated_data: dict
+    ) -> None:
+        """A blank cursor matcher (block-no-verify) yields an entry with no matcher key."""
+        result = generate_cursor(cursor_dedicated_data)
+        bnv = next(
+            e
+            for e in result["hooks"]["beforeShellExecution"]
+            if "block-no-verify.sh" in e["command"]
+        )
+        assert "matcher" not in bnv
+
+    def test_after_file_edit_matcher_passthrough_keeps_tabwrite(
+        self, cursor_dedicated_data: dict
+    ) -> None:
+        """afterFileEdit matcher 'Write|TabWrite' passes through (no token translation)."""
+        result = generate_cursor(cursor_dedicated_data)
+        qg = next(
+            e
+            for e in result["hooks"]["afterFileEdit"]
+            if "quality-gate.sh" in e["command"]
+        )
+        assert qg["matcher"] == "Write|TabWrite"
+
+    def test_claude_unaffected_by_cursor_override(
+        self, cursor_dedicated_data: dict
+    ) -> None:
+        """The cursor override must not leak into Claude generation."""
+        result = generate_claude(cursor_dedicated_data)
+        assert "PreToolUse" in result
+        assert "PostToolUse" in result
+        # No dedicated Cursor event names appear in the Claude config.
+        assert "beforeShellExecution" not in result
+        assert "afterFileEdit" not in result
+
+    def test_copilot_unaffected_by_cursor_override(
+        self, cursor_dedicated_data: dict
+    ) -> None:
+        result = generate_copilot(cursor_dedicated_data)
+        assert "preToolUse" in result["hooks"]
+        assert "postToolUse" in result["hooks"]
+        assert "beforeShellExecution" not in result["hooks"]
 
 
 class TestCursorMatcherTranslation:
