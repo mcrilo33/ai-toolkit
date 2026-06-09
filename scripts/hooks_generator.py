@@ -47,6 +47,18 @@ CURSOR_EVENT_MAP: dict[str, str] = {
     "afterFileEdit": "afterFileEdit",
 }
 
+# Cursor uses different tool-type names in preToolUse/postToolUse matchers than
+# the Claude/Copilot naming used in metadata.yml. A matcher referencing a tool
+# name Cursor never emits (e.g. "Bash") silently never fires. Translate each
+# alternation token to Cursor's real tool name: shell tool is "Shell" (not
+# "Bash"); the file-write tool is "Write" (there is no "Edit" tool).
+CURSOR_MATCHER_TOKEN_MAP: dict[str, str] = {
+    "Bash": "Shell",
+    "Edit": "Write",
+    "Write": "Write",
+    "Read": "Read",
+}
+
 CLAUDE_EVENT_MAP: dict[str, str] = {
     "preToolUse": "PreToolUse",
     "postToolUse": "PostToolUse",
@@ -155,6 +167,24 @@ def _script_ref(hook_name: str, tool: str) -> str:
     return f"./hooks/scripts/{script}"
 
 
+def _cursor_matcher(matcher: str) -> str:
+    """Translate a metadata matcher to Cursor's tool-type names.
+
+    Matchers are pipe-alternations (e.g. ``Write|Edit``). Each token is mapped
+    to Cursor's real tool name; unknown tokens pass through unchanged. Duplicate
+    tokens that collapse after mapping (``Write|Edit`` -> ``Write|Write``) are
+    de-duplicated while preserving first-seen order.
+    """
+    seen: set[str] = set()
+    tokens: list[str] = []
+    for raw in matcher.split("|"):
+        token = CURSOR_MATCHER_TOKEN_MAP.get(raw, raw)
+        if token not in seen:
+            seen.add(token)
+            tokens.append(token)
+    return "|".join(tokens)
+
+
 def generate_copilot(hooks: dict[str, dict]) -> dict:
     """Generate Copilot hooks JSON (version 1 format).
 
@@ -202,7 +232,7 @@ def generate_cursor(hooks: dict[str, dict]) -> dict:
 
         matcher = merged.get("matcher")
         if matcher:
-            entry["matcher"] = matcher
+            entry["matcher"] = _cursor_matcher(matcher)
 
         timeout = merged.get("timeout")
         if timeout:

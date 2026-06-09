@@ -12,6 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from hooks_generator import (  # noqa: E402
+    _cursor_matcher,
     generate_claude,
     generate_copilot,
     generate_cursor,
@@ -142,15 +143,19 @@ class TestGenerateCursor:
         result = generate_cursor(hooks_data)
         assert result["version"] == 1
 
-    def test_pretooluse_has_matcher(self, hooks_data: dict) -> None:
+    def test_pretooluse_matcher_translated_to_shell(self, hooks_data: dict) -> None:
+        """Cursor's shell tool is 'Shell', not 'Bash' — a 'Bash' matcher never fires."""
         result = generate_cursor(hooks_data)
         pre = result["hooks"]["preToolUse"]
-        assert pre[0]["matcher"] == "Bash"
+        assert pre[0]["matcher"] == "Shell"
 
-    def test_posttooluse_has_matcher(self, hooks_data: dict) -> None:
+    def test_posttooluse_matcher_translated_and_deduped(
+        self, hooks_data: dict
+    ) -> None:
+        """'Edit|Write' collapses to 'Write' — Cursor has no 'Edit' tool."""
         result = generate_cursor(hooks_data)
         post = result["hooks"]["postToolUse"]
-        assert post[0]["matcher"] == "Edit|Write"
+        assert post[0]["matcher"] == "Write"
 
     def test_stop_event_name(self, hooks_data: dict) -> None:
         """Cursor uses 'stop' directly."""
@@ -168,6 +173,32 @@ class TestGenerateCursor:
         pre = result["hooks"]["preToolUse"][0]
         assert "type" not in pre
         assert "command" in pre
+
+
+class TestCursorMatcherTranslation:
+    """Pin the metadata→Cursor tool-name translation for matchers."""
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("Bash", "Shell"),
+            ("Edit", "Write"),
+            ("Write", "Write"),
+            ("Read", "Read"),
+            ("Write|Edit", "Write"),
+            ("Edit|Write", "Write"),
+            ("Bash|Shell", "Shell"),
+            ("Read|Write", "Read|Write"),
+        ],
+    )
+    def test_translation(self, raw: str, expected: str) -> None:
+        assert _cursor_matcher(raw) == expected
+
+    def test_unknown_token_passes_through(self) -> None:
+        assert _cursor_matcher("CustomTool") == "CustomTool"
+
+    def test_order_preserved_after_dedup(self) -> None:
+        assert _cursor_matcher("Write|Read|Edit") == "Write|Read"
 
 
 # ── generate_claude() ────────────────────────────────────
