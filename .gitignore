@@ -27,3 +27,6 @@ Thumbs.db
 # Secrets (never commit)
 *.pem
 *.key
+
+# Local placeholders (not yet handled by sync-to-repo.sh)
+settings/
