@@ -46,8 +46,10 @@ git commit -m "test(<scope>): add tests for <feature>" \
            -m "Tested-RED: tests/test_<scope>.py::test_<behavior>"
 ```
 
-The `red-proof-warn` push hook flags any commit that adds source files without
-a matching `Tested-RED:` trailer, so write the trailer here at the RED step.
+The `red-proof-warn` push hook checks for commits that add source files without
+a matching `Tested-RED:` trailer. On Cursor it HARD-BLOCKS the push when the
+trailer is missing (advisory `warn` on Claude/Copilot and native git hooks), so
+write the trailer here at the RED step or the eventual `git push` will be denied.
 
 ## Checklist
 

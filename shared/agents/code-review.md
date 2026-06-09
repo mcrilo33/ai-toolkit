@@ -118,10 +118,12 @@ the author to record the review on the next commit by adding a trailer:
 Reviewed-by: code-review
 ```
 
-The `reviewer-sep-warn` push hook flags commits missing this trailer. Note its
-limitation: the trailer is auditable *evidence* that a review happened, but a
-local hook cannot verify a separate agent authored it — do not treat its
-presence as proof of reviewer independence.
+The `reviewer-sep-warn` push hook checks for commits missing this trailer — on
+Cursor it HARD-BLOCKS the push when it is absent (advisory `warn` on
+Claude/Copilot and native git hooks). Note its limitation: the trailer is
+auditable *evidence* that a review happened, but a local hook cannot verify a
+separate agent authored it — do not treat its presence as proof of reviewer
+independence.
 
 ## Guidelines
 

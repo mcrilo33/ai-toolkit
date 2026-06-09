@@ -78,6 +78,13 @@ git diff --cached --name-only | grep -E '\.env($|\.)'
 
 If a project-specific scanner exists (e.g., `bandit`, `npm audit`, `cargo audit`), run it too.
 
+> On Cursor, the `secrets-scan` / `config-protection` hooks enforce at **commit
+> time** (`git add`/`git commit` staged scan), not pre-write. The `afterFileEdit`
+> hooks (auto-format, secret-revert) are best-effort, non-blocking, produce no
+> agent-visible output, and may not fire on subagent edits — never rely on them
+> as a gate. This staged scan is the real verification step; run it yourself
+> here even though the commit hook will also catch a leak.
+
 ### 6. Diff Review
 
 Analyze the current diff for quality issues:

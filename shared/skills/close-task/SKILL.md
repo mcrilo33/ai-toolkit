@@ -37,6 +37,14 @@ git commit -m "<message>"
 git push -u origin HEAD
 ```
 
+> On Cursor the shipping-gate hooks (`red-proof-warn`, `reviewer-sep-warn`,
+> `delegation-gate-warn`, `git-push-review`) HARD-BLOCK the push (not just warn)
+> when their conditions are unmet: source commits missing a `Tested-RED:`
+> trailer, commits missing a `Reviewed-by:` trailer, or a force-push without
+> `--force-with-lease`. Ensure those trailers exist on the relevant commits
+> before pushing, or the `git push` will be denied. On Claude/Copilot and native
+> git hooks these remain advisory.
+
 ### 4. Create pull request
 
 ```bash

@@ -32,6 +32,10 @@ git add -p
 ```
 
 **Never stage secrets** (`.env`, credentials, private keys, tokens). If detected, warn and exclude.
+On Cursor the `secrets-scan` and `config-protection` hooks enforce at commit
+time: a `git add`/`git commit` that stages a hardcoded secret or a protected
+config file (lockfiles, `pyproject.toml`, CI config, etc.) is DENIED. Remove the
+secret / unstage the config before committing rather than relying on the hook.
 
 ### 3. Analyze Diff
 
@@ -180,6 +184,8 @@ to improve testability and reduce controller complexity.
 
 - NEVER update git config
 - NEVER run destructive commands (`--force`, `hard reset`) without explicit request
-- NEVER skip hooks (`--no-verify`) unless user asks
-- NEVER force push to main/master
+- NEVER skip hooks (`--no-verify`) unless user asks — on Cursor the
+  `block-no-verify` hook DENIES any command carrying `--no-verify` regardless
+- NEVER force push to main/master — on Cursor a force push without
+  `--force-with-lease` is DENIED by the `git-push-review` hook
 - If commit fails due to hooks, fix the issue and create a NEW commit (don't amend)
