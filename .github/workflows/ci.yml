@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Pytest suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 1
+
+      # shellcheck is preinstalled on ubuntu-latest runners.
+      # Threshold: --severity=error. The codebase currently has 0 errors but
+      # 7 warning-level (SC2034, SC2155) and 16 info/style-level pre-existing
+      # findings; gating at error keeps CI green on the current code while
+      # still catching real breakage. Tighten to warning once those are fixed.
+      - name: Lint shell scripts
+        run: shellcheck --severity=error shared/hooks/*.sh shared/hooks/lib/*.sh scripts/*.sh
+
+  sync-idempotency:
+    name: Sync idempotency
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 1
+
+      - name: Run sync twice and assert no drift
+        run: |
+          set -euo pipefail
+          TMP="$(mktemp -d)"
+          # git init so sync-to-repo.sh skips its interactive non-git-repo prompt
+          git init -q "$TMP"
+          git -C "$TMP" config user.name "ci"
+          git -C "$TMP" config user.email "ci@example.com"
+
+          ./scripts/sync-to-repo.sh "$TMP" all
+          git -C "$TMP" add -A
+          git -C "$TMP" commit -m baseline -q
+
+          ./scripts/sync-to-repo.sh "$TMP" all
+
+          # The hooks reconciler backs up pre-existing hooks.json/settings.json
+          # as *.bak on every run, so the second sync legitimately creates two
+          # .bak files. Everything else must be byte-identical.
+          DRIFT="$(git -C "$TMP" status --porcelain | grep -v '\.bak$' || true)"
+          if [ -n "$DRIFT" ]; then
+            echo "Sync is not idempotent — drift detected after second run:"
+            echo "$DRIFT"
+            exit 1
+          fi
+          echo "Sync is idempotent (no drift beyond reconciler .bak backups)."

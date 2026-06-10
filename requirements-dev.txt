@@ -1,0 +1,4 @@
+# Development / CI dependencies. The sync pipeline itself is Python stdlib-only;
+# these are needed only to run the test suite (integration tests import yaml).
+pytest>=8,<9
+pyyaml>=6,<7
