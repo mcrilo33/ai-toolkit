@@ -20,6 +20,7 @@ SOURCE → DEFINE → EXECUTE → VERIFY → CLOSE
 |---------|-------|---------|
 | `/source` | `source-task` | Fetch task, create branch |
 | `/close` | `close-task` | Commit, push, create PR |
+| `/cycle` | `solo-cycle` | Solo per-subtask cycle: anchor, RED, GREEN, review, push |
 
 ## Phase Checklists
 
@@ -110,6 +111,16 @@ SOURCE → DEFINE (spawn tdd-red) → EXECUTE (spawn tdd-green → tdd-refactor)
 SOURCE → DEFINE (mental/checklist) → EXECUTE → VERIFY → CLOSE (1 commit)
 ```
 
+### Solo Development (no PR)
+
+```
+SOURCE → DEFINE → EXECUTE → VERIFY → CLOSE (push only) — per subtask
+```
+
+- No PR — the push is the ship gate; commit and push hooks enforce all evidence
+- One code-review (APPROVE artifact) and one push per subtask
+- Use the `solo-cycle` skill for the per-subtask mechanics
+
 ## During Work (EXECUTE)
 
 - Stay within scope defined in DEFINE step
@@ -125,6 +136,7 @@ SOURCE → DEFINE (mental/checklist) → EXECUTE → VERIFY → CLOSE (1 commit)
 - `brainstorming` — Spec refinement for DEFINE (use before context-map/planner on ambiguous work)
 - `source-task` — SOURCE step automation
 - `close-task` — CLOSE step automation
+- `solo-cycle` — Per-subtask cycle for solo, PR-less work
 - `verification-loop` — VERIFY step automation
 - `tdd-workflow` — TDD guidance for DEFINE
 - `generate-commit-message` — Commit message format

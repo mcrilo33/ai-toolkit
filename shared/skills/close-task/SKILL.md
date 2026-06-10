@@ -2,6 +2,10 @@
 
 Commit, push, and create a PR. This implements the CLOSE step of the development workflow.
 
+> [!NOTE]
+> Working solo without PRs? Use the `solo-cycle` skill instead — the push itself
+> is the ship gate and step 4 (Create pull request) is skipped.
+
 ## Workflow
 
 ### 1. Verify work is complete
@@ -39,11 +43,19 @@ git push -u origin HEAD
 
 > On Cursor the shipping-gate hooks (`red-proof-warn`, `reviewer-sep-warn`,
 > `delegation-gate-warn`, `git-push-review`) HARD-BLOCK the push (not just warn)
-> when their conditions are unmet: source commits missing a `Tested-RED:`
-> trailer, commits missing a `Reviewed-by:` trailer, or a force-push without
-> `--force-with-lease`. Ensure those trailers exist on the relevant commits
-> before pushing, or the `git push` will be denied. On Claude/Copilot and native
-> git hooks these remain advisory.
+> when their conditions are unmet:
+>
+> - `red-proof-warn` — source commits missing a `Tested-RED:` trailer, or a
+>   Tested-RED node that still fails (green backstop).
+> - `reviewer-sep-warn` — no APPROVE review-evidence artifact
+>   (`.review/<diff-hash>.json`) matching the diff being pushed. The code-review
+>   agent writes this on APPROVE; without it the push is denied.
+> - `git-push-review` — a force-push without `--force-with-lease`.
+>
+> Ensure the `Tested-RED:` trailer, the `.review/<hash>.json` APPROVE artifact,
+> and a `Reviewed-by: code-review` trailer exist before pushing, or the
+> `git push` will be denied. On Claude/Copilot and native git hooks these remain
+> advisory.
 
 ### 4. Create pull request
 
