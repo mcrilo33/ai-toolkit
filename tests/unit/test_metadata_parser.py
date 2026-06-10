@@ -2,16 +2,33 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import textwrap
 from pathlib import Path
 
 import pytest
+import yaml
 
 # Make scripts/ importable
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
-from metadata_parser import parse, query  # noqa: E402
+from metadata_parser import parse, query
+
+
+def _expand_transport(fm: str) -> str:
+    """Re-expand the single-line transport exactly as sync-to-repo.sh does.
+
+    The consumer is bash ``echo -e "$meta"``; run the real thing so the test
+    exercises the actual transport contract, not a Python re-implementation.
+    """
+    out = subprocess.run(
+        ["bash", "-c", 'echo -e "$1"', "_", fm],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return out.stdout
 
 
 # ── Fixtures ──────────────────────────────────────────────
@@ -64,6 +81,61 @@ def meta_with_overrides(tmp_path: Path) -> Path:
             description: "Claude-specific description"
     """)
     p = tmp_path / "overrides.yml"
+    p.write_text(content)
+    return p
+
+
+@pytest.fixture()
+def meta_with_handoffs(tmp_path: Path) -> Path:
+    """Metadata with a nested handoffs block (list of maps) plus a flat key."""
+    content = textwrap.dedent("""\
+        my-agent:
+          name: "my-agent"
+          handoffs:
+            - label: "Fix bugs"
+              agent: debug
+              prompt: "Fix the bugs above."
+              send: true
+            - label: "Review"
+              agent: code-review
+              prompt: "Review the fix."
+    """)
+    p = tmp_path / "handoffs.yml"
+    p.write_text(content)
+    return p
+
+
+@pytest.fixture()
+def meta_with_hooks(tmp_path: Path) -> Path:
+    """Metadata with a nested hooks block (map of lists of maps) plus a flat key."""
+    content = textwrap.dedent("""\
+        my-agent:
+          name: "my-agent"
+          hooks:
+            PostToolUse:
+              - type: command
+                command: "./.github/hooks/scripts/post-edit-format.sh"
+              - type: command
+                command: "./.github/hooks/scripts/quality-gate.sh"
+    """)
+    p = tmp_path / "hooks.yml"
+    p.write_text(content)
+    return p
+
+
+@pytest.fixture()
+def meta_with_override_list(tmp_path: Path) -> Path:
+    """Metadata with a tool override block containing a nested list."""
+    content = textwrap.dedent("""\
+        my-agent:
+          name: "my-agent"
+          claude:
+            model: claude-fable-5
+            skills:
+              - verification-loop
+              - security-review
+    """)
+    p = tmp_path / "override-list.yml"
     p.write_text(content)
     return p
 
@@ -200,7 +272,8 @@ class TestQuery:
         result_dict = dict(results)
 
         assert "code-quality" in result_dict
-        assert "paths: **/*.py" in result_dict["code-quality"]
+        # Leading '*' is a YAML alias indicator, so glob values emit quoted.
+        assert 'paths: "**/*.py"' in result_dict["code-quality"]
 
     def test_query_skips_items_without_requested_fields(self, meta_file: Path) -> None:
         items = parse(str(meta_file))
@@ -235,6 +308,255 @@ class TestQuery:
         results = query(items, "copilot", ["nonexistent_field"])
 
         assert results == []
+
+
+# ── Nested structures (parse) ─────────────────────────────
+
+
+class TestNestedStructures:
+    """parse() must materialize nested blocks instead of dropping them."""
+
+    def test_parse_handoffs_returns_list_of_dicts(self, meta_with_handoffs: Path) -> None:
+        items = parse(str(meta_with_handoffs))
+        defaults = items["my-agent"]["__defaults"]
+
+        assert defaults["name"] == "my-agent"
+        assert defaults["handoffs"] == [
+            {
+                "label": "Fix bugs",
+                "agent": "debug",
+                "prompt": "Fix the bugs above.",
+                "send": "true",
+            },
+            {
+                "label": "Review",
+                "agent": "code-review",
+                "prompt": "Review the fix.",
+            },
+        ]
+
+    def test_parse_hooks_returns_nested_dict(self, meta_with_hooks: Path) -> None:
+        items = parse(str(meta_with_hooks))
+        defaults = items["my-agent"]["__defaults"]
+
+        assert defaults["name"] == "my-agent"
+        assert defaults["hooks"] == {
+            "PostToolUse": [
+                {
+                    "type": "command",
+                    "command": "./.github/hooks/scripts/post-edit-format.sh",
+                },
+                {
+                    "type": "command",
+                    "command": "./.github/hooks/scripts/quality-gate.sh",
+                },
+            ],
+        }
+
+    def test_parse_override_with_nested_list(self, meta_with_override_list: Path) -> None:
+        items = parse(str(meta_with_override_list))
+        claude = items["my-agent"]["__overrides"]["claude"]
+
+        assert claude["model"] == "claude-fable-5"
+        assert claude["skills"] == ["verification-loop", "security-review"]
+
+    def test_parse_override_block_then_nested_block_no_bleed(self, tmp_path: Path) -> None:
+        content = textwrap.dedent("""\
+            my-agent:
+              name: "my-agent"
+              claude:
+                model: claude-fable-5
+              handoffs:
+                - label: "Fix bugs"
+                  agent: debug
+                  prompt: "Fix the bugs above."
+        """)
+        p = tmp_path / "override-then-nested.yml"
+        p.write_text(content)
+
+        items = parse(str(p))
+        agent = items["my-agent"]
+
+        assert agent["__overrides"]["claude"] == {"model": "claude-fable-5"}
+        assert agent["__defaults"]["handoffs"] == [
+            {"label": "Fix bugs", "agent": "debug", "prompt": "Fix the bugs above."},
+        ]
+
+    def test_parse_nested_block_then_override_block_still_detected(
+        self, tmp_path: Path
+    ) -> None:
+        content = textwrap.dedent("""\
+            my-agent:
+              name: "my-agent"
+              handoffs:
+                - label: "Fix bugs"
+                  agent: debug
+                  prompt: "Fix the bugs above."
+              claude:
+                model: claude-fable-5
+        """)
+        p = tmp_path / "nested-then-override.yml"
+        p.write_text(content)
+
+        items = parse(str(p))
+        agent = items["my-agent"]
+
+        assert agent["__overrides"]["claude"] == {"model": "claude-fable-5"}
+        assert agent["__defaults"]["handoffs"] == [
+            {"label": "Fix bugs", "agent": "debug", "prompt": "Fix the bugs above."},
+        ]
+
+
+# ── Nested structures (query emission) ────────────────────
+
+
+class TestNestedEmission:
+    """query() must emit nested values as valid YAML over the \\n transport.
+
+    Transport contract: the emitted frontmatter is a single line where real
+    newlines are encoded as the literal two-char sequence backslash-n; the
+    bash consumer re-expands it via ``echo -e``.
+    """
+
+    REPO_ROOT = Path(__file__).resolve().parents[2]
+
+    def test_query_handoffs_emits_valid_yaml(self, meta_with_handoffs: Path) -> None:
+        items = parse(str(meta_with_handoffs))
+
+        results = dict(query(items, "copilot", ["name", "handoffs"]))
+        fm = results["my-agent"]
+
+        assert "\n" not in fm, "transport must not carry real newlines"
+        assert "\\n" in fm
+        assert "name: my-agent" in fm
+        loaded = yaml.safe_load(fm.replace("\\n", "\n"))
+        assert isinstance(loaded["handoffs"], list)
+        assert len(loaded["handoffs"]) == 2
+        assert loaded["handoffs"][0]["label"] == "Fix bugs"
+        assert loaded["handoffs"][0]["send"] is True
+        assert loaded["handoffs"][1]["agent"] == "code-review"
+
+    def test_query_hooks_emits_valid_yaml(self, meta_with_hooks: Path) -> None:
+        items = parse(str(meta_with_hooks))
+
+        results = dict(query(items, "copilot", ["name", "hooks"]))
+        fm = results["my-agent"]
+
+        assert "\n" not in fm, "transport must not carry real newlines"
+        assert "\\n" in fm
+        assert "name: my-agent" in fm
+        loaded = yaml.safe_load(fm.replace("\\n", "\n"))
+        assert isinstance(loaded["hooks"], dict)
+        post = loaded["hooks"]["PostToolUse"]
+        assert post[0]["command"] == "./.github/hooks/scripts/post-edit-format.sh"
+        assert post[1]["command"] == "./.github/hooks/scripts/quality-gate.sh"
+
+    def test_query_real_agents_metadata_emits_nested_structures(self) -> None:
+        meta_path = self.REPO_ROOT / "shared" / "agents" / "metadata.yml"
+
+        items = parse(str(meta_path))
+        results = dict(query(items, "copilot", ["name", "handoffs", "hooks"]))
+        fm = results["debug"]
+
+        loaded = yaml.safe_load(fm.replace("\\n", "\n"))
+        assert isinstance(loaded["handoffs"], list)
+        assert len(loaded["handoffs"]) > 0
+        assert isinstance(loaded["hooks"], dict)
+        assert len(loaded["hooks"]) > 0
+
+    def test_query_backslash_value_doubled_for_echo_e(self, tmp_path: Path) -> None:
+        # Transport contract: bash re-expands the frontmatter via `echo -e`,
+        # which interprets \b, \t, … — so every literal backslash in a value
+        # must be emitted doubled (\\) to survive the expansion intact.
+        content = textwrap.dedent("""\
+            my-agent:
+              name: "my-agent"
+              description: "a\\b"
+        """)
+        p = tmp_path / "backslash.yml"
+        p.write_text(content)
+        items = parse(str(p))
+
+        results = dict(query(items, "copilot", ["name", "description"]))
+        fm = results["my-agent"]
+
+        assert "a\\\\b" in fm, "backslash must be doubled for echo -e transport"
+
+
+# ── Scalar quoting (YAML validity) ────────────────────────
+
+
+class TestScalarQuoting:
+    """Emitted scalars must survive emission + echo -e + yaml.safe_load.
+
+    Guards the solo-cycle regression: a description containing ``: `` was
+    emitted unquoted, producing invalid YAML frontmatter on every platform.
+    """
+
+    def _roundtrip(self, tmp_path: Path, description: str) -> dict:
+        content = f"my-skill:\n  name: 'my-skill'\n  description: '{description}'\n"
+        p = tmp_path / "quoting.yml"
+        p.write_text(content)
+        items = parse(str(p))
+
+        fm = dict(query(items, "copilot", ["name", "description"]))["my-skill"]
+
+        loaded = yaml.safe_load(_expand_transport(fm))
+        assert isinstance(loaded, dict)
+        return loaded
+
+    def test_value_with_colon_space_roundtrips(self, tmp_path: Path) -> None:
+        desc = "Per-subtask cycle for solo, PR-less work: anchor issue, RED test"
+
+        loaded = self._roundtrip(tmp_path, desc)
+
+        assert loaded["description"] == desc
+
+    def test_value_ending_with_colon_roundtrips(self, tmp_path: Path) -> None:
+        desc = "Triggers on the following:"
+
+        loaded = self._roundtrip(tmp_path, desc)
+
+        assert loaded["description"] == desc
+
+    def test_value_with_space_hash_roundtrips(self, tmp_path: Path) -> None:
+        desc = "Use when fixing issue #42 or any # comment"
+
+        loaded = self._roundtrip(tmp_path, desc)
+
+        assert loaded["description"] == desc
+
+    def test_value_with_double_quotes_roundtrips(self, tmp_path: Path) -> None:
+        desc = 'Say "ship it" to: trigger the close flow'
+
+        loaded = self._roundtrip(tmp_path, desc)
+
+        assert loaded["description"] == desc
+
+    def test_safe_scalar_stays_unquoted(self, tmp_path: Path) -> None:
+        """Plain-safe values must not churn existing golden outputs."""
+        content = "my-skill:\n  name: 'my-skill'\n  description: 'Plain safe text'\n"
+        p = tmp_path / "safe.yml"
+        p.write_text(content)
+        items = parse(str(p))
+
+        fm = dict(query(items, "copilot", ["name", "description"]))["my-skill"]
+
+        assert "description: Plain safe text" in fm
+        assert '"' not in fm
+
+    def test_solo_cycle_real_metadata_roundtrips(self) -> None:
+        """The actual solo-cycle description must produce valid YAML."""
+        meta_path = (
+            Path(__file__).resolve().parents[2] / "shared" / "skills" / "metadata.yml"
+        )
+        items = parse(str(meta_path))
+
+        fm = dict(query(items, "cursor", ["name", "description"]))["solo-cycle"]
+
+        loaded = yaml.safe_load(_expand_transport(fm))
+        assert isinstance(loaded, dict)
+        assert ": " in loaded["description"]
 
 
 # ── Real metadata files ──────────────────────────────────
@@ -587,3 +909,100 @@ class TestAgentsMetadata:
         assert len(results) > 0
         result_names = {r[0] for r in results}
         assert result_names == set(items.keys())
+
+    # ── Per-agent model / effort assignment (Claude-scoped) ──
+
+    def test_model_and_effort_emitted_for_claude(self) -> None:
+        """Agents declaring a claude model/effort override emit both fields.
+
+        The values are a tunable policy choice; this test asserts the
+        *mechanism* (Claude receives a model and effort) rather than any
+        specific alias, so re-tuning a model never breaks the suite.
+        """
+        items = self._metadata_entries()
+
+        results = dict(query(items, "claude", ["name", "model", "effort"]))
+
+        assigned = {
+            name: fm
+            for name, fm in results.items()
+            if "model:" in fm
+        }
+        assert assigned, "Expected at least one agent with a Claude model override"
+        for name, fm in assigned.items():
+            assert "effort:" in fm, f"Agent '{name}' has model but no effort"
+
+    def test_model_and_effort_do_not_leak_to_cursor(self) -> None:
+        """Claude-only model/effort must never appear in Cursor frontmatter.
+
+        Model and effort are declared exclusively under the `claude:` override
+        block, so Cursor output must contain neither field — `effort` is not a
+        Cursor field at all, and the model choice is a Claude-only policy.
+        """
+        items = self._metadata_entries()
+
+        results = dict(query(items, "cursor", ["description", "model", "effort"]))
+
+        for name, fm in results.items():
+            assert "effort:" not in fm, f"effort leaked into Cursor for '{name}'"
+            assert "model:" not in fm, f"model leaked into Cursor for '{name}'"
+
+    # ── Skills preloading (Claude-scoped) ──
+
+    def test_skills_emitted_for_claude(self) -> None:
+        """Agents declaring claude skills emit a YAML list for Claude only."""
+        items = self._metadata_entries()
+
+        results = dict(query(items, "claude", ["name", "skills"]))
+
+        with_skills = {name: fm for name, fm in results.items() if "skills:" in fm}
+        assert with_skills, "Expected at least one agent with Claude skills"
+        for name, fm in with_skills.items():
+            loaded = yaml.safe_load(fm.replace("\\n", "\n"))
+            assert isinstance(loaded["skills"], list), (
+                f"Agent '{name}' skills must emit as a YAML list"
+            )
+            assert loaded["skills"], f"Agent '{name}' has an empty skills list"
+
+    def test_skills_do_not_leak_to_cursor_or_copilot(self) -> None:
+        """Claude-only skills must never appear in Cursor or Copilot frontmatter."""
+        items = self._metadata_entries()
+
+        for tool in ("cursor", "copilot"):
+            results = dict(query(items, tool, ["description", "skills"]))
+            for name, fm in results.items():
+                assert "skills:" not in fm, f"skills leaked into {tool} for '{name}'"
+
+    def test_every_declared_skill_exists_on_disk(self) -> None:
+        """Every skills: entry must reference an existing shared/skills/<name>/SKILL.md."""
+        items = self._metadata_entries()
+        skills_dir = self.REPO_ROOT / "shared" / "skills"
+
+        for agent_name, data in items.items():
+            declared = data["__overrides"].get("claude", {}).get("skills", [])
+            for skill in declared:
+                assert (skills_dir / skill / "SKILL.md").exists(), (
+                    f"Agent '{agent_name}' references unknown skill '{skill}'"
+                )
+
+    def test_model_override_does_not_swallow_sibling_blocks(self) -> None:
+        """A claude model/effort block must coexist with hooks/handoffs.
+
+        The parser is line/indent based; a per-tool override placed next to a
+        nested `hooks:` or `handoffs:` block must not absorb that block's
+        indented children. Agents that define hooks must still emit the hooks
+        key alongside their Claude model override.
+        """
+        items = self._metadata_entries()
+
+        with_hooks = {
+            name
+            for name, data in items.items()
+            if "hooks" in data["__defaults"]
+        }
+        assert with_hooks, "Expected at least one agent defining hooks"
+
+        results = dict(query(items, "claude", ["name", "model", "hooks"]))
+        for name in with_hooks:
+            fm = results[name]
+            assert "hooks:" in fm, f"hooks block lost for '{name}'"
