@@ -143,6 +143,29 @@ is_git_commit_or_add() {
   printf '%s' "$cmd" | grep -qE '(^|[;&|]|&&|\|\|)[[:space:]]*git([[:space:]]+(-[^[:space:]]+|--[^[:space:]]+|-C[[:space:]]+[^[:space:]]+))*[[:space:]]+(add|commit)\b'
 }
 
+# ── Recognize a `git commit` invocation ──────────────────────────────
+# Same boundary-aware matching as is_git_commit_or_add, narrowed to the
+# commit subcommand (the commit-time hooks must not fire on `git add`).
+# The boundary class additionally covers `$(` / backtick substitutions and
+# env-assignment prefixes (`VAR=1 git commit`); newlines are boundaries too
+# (grep matches each line's `^` independently).
+is_git_commit() {
+  local cmd="$1"
+  printf '%s' "$cmd" | grep -qE '(^|[;&|`]|\$\()[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git([[:space:]]+(-[^[:space:]]+|--[^[:space:]]+|-C[[:space:]]+[^[:space:]]+))*[[:space:]]+commit\b'
+}
+
+# ── Recognize a `git push` / `gh pr create|merge` invocation ─────────
+# The shipping-gate analogue of is_git_commit_or_add: matches the command
+# anywhere at a command boundary (start of string/line, or after `;`, `&`,
+# `|`, `&&`, `||`, `$(`, or backtick), tolerating env-assignment prefixes,
+# so chained or prefixed forms are not bypassed: `cd x && git push`,
+# `true; git push`, `VAR=1 git push`, `git -C path push`, `gh pr create`.
+# Returns 0 on match.
+is_git_push_or_pr() {
+  local cmd="$1"
+  printf '%s' "$cmd" | grep -qE '(^|[;&|`]|\$\()[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*(git([[:space:]]+(-[^[:space:]]+|--[^[:space:]]+|-C[[:space:]]+[^[:space:]]+))*[[:space:]]+push\b|gh[[:space:]]+pr[[:space:]]+(create|merge)\b)'
+}
+
 # ── Get the edited file path (cross-platform) ───────────────────────
 # afterFileEdit: top-level .file_path. Claude/Copilot: tool_input.file_path
 # (via get_file_path).
@@ -243,7 +266,7 @@ PATTERNS
 # Prints the description of the FIRST matching pattern (and returns 0) or
 # returns 1 if none match.
 scan_for_secret() {
-  local content="$1" pattern desc entry
+  local content="$1" pattern desc
   [ -z "$content" ] && return 1
   while IFS=$'\t' read -r pattern desc; do
     [ -z "$pattern" ] && continue
@@ -255,10 +278,44 @@ scan_for_secret() {
   return 1
 }
 
+# ── Opt-in telemetry event log ──────────────────────────────────────
+# Appends one JSON object per event to
+# ${AI_TOOLKIT_TELEMETRY_DIR:-$HOME/.ai-toolkit/telemetry}/events.jsonl, ONLY
+# when AI_TOOLKIT_TELEMETRY=1 (otherwise a silent no-op that creates nothing).
+# Fields are metadata only: ts (ISO-8601 UTC), hook (script basename), decision
+# (deny/warn), repo (project-root BASENAME, never a path). NEVER log commands,
+# messages, paths, or payload content — deny/warn messages may quote the
+# blocked command (secret-leak risk).
+# Telemetry must be invisible: zero bytes on stdout/stderr, never changes the
+# hook's exit code — the whole body is redirected and failure-swallowed.
+# Reads the hook's global $INPUT payload (if set) to resolve the project root.
+telemetry_event() {
+  [ "${AI_TOOLKIT_TELEMETRY:-}" = "1" ] || return 0
+  local decision="${1:-}" dir ts hook root repo
+  {
+    dir="${AI_TOOLKIT_TELEMETRY_DIR:-$HOME/.ai-toolkit/telemetry}"
+    mkdir -p "$dir"
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    hook=$(basename "$0")
+    root=$(project_root_from_payload "${INPUT:-}")
+    repo=$(basename "$root")
+    [ -z "$repo" ] && repo="unknown"
+    if command -v jq &>/dev/null; then
+      jq -nc --arg ts "$ts" --arg hook "$hook" --arg decision "$decision" --arg repo "$repo" \
+        '{ts: $ts, hook: $hook, decision: $decision, repo: $repo}' >> "$dir/events.jsonl"
+    else
+      printf '{"ts":"%s","hook":"%s","decision":"%s","repo":"%s"}\n' \
+        "$ts" "$hook" "$decision" "$repo" >> "$dir/events.jsonl"
+    fi
+  } >/dev/null 2>&1 || true
+  return 0
+}
+
 # ── Deny output (cross-platform) ────────────────────────────────────
 # Works for Copilot, Cursor, and Claude preToolUse hooks.
 deny() {
   local reason="$1"
+  telemetry_event "deny"
   # Write to stderr for Claude (exit 2 reads stderr)
   echo "[Hook] $reason" >&2
   # Write JSON for Copilot/Cursor
@@ -279,6 +336,7 @@ deny() {
 # ── Warning output (non-blocking, shown to agent) ───────────────────
 warn() {
   local message="$1"
+  telemetry_event "warn"
   echo "[Hook] $message" >&2
 }
 
@@ -374,6 +432,83 @@ detect_typechecker() {
   fi
 }
 
+# ── Review-evidence artifact helpers (diff-bound reviewer separation) ─
+# A code-review APPROVE is recorded as `.review/<diff_hash>.json` in the repo.
+# The diff hash binds the approval to the EXACT content reviewed: the push hook
+# recomputes the hash of the pushed range and refuses to ship unless a matching
+# APPROVE artifact exists. This closes the "type the trailer, skip the review"
+# hole. It does NOT prove a *different agent* authored the artifact — that is
+# unprovable by a local hook (see reviewer-sep-warn header).
+#
+# CRITICAL invariant (verified by spike): the hash MUST be computed identically
+# at review time and push time. The only recipe that matches across clean adds,
+# modifies, renames, and CRLF files is:
+#   • review time:  stage all (git add -A), then `git diff --cached -M <BASE>`
+#   • push time:     `git diff -M <BASE>..HEAD`
+# both with --no-color --no-ext-diff, the `.review/` pathspec exclusion, and
+# LF-normalization, hashed with sha256. Renames only pair once staged/committed,
+# and untracked adds are invisible to a non-cached diff — hence the mandatory
+# `git add -A` before review-time hashing.
+
+# sha256 of stdin, portable across Linux (sha256sum) and macOS (shasum -a 256).
+sha256_stdin() {
+  if command -v sha256sum &>/dev/null; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
+  fi
+}
+
+# Resolve the base ref a change branches from. Tries the same chain as the
+# code-review agent recipe so review-time and push-time hashes agree: tracked
+# upstream → origin/main → origin/HEAD. Prints empty on total failure (caller
+# must then degrade to allow — never a false block).
+review_base_ref() {
+  local root="$1" base
+  base=$(git -C "$root" merge-base '@{upstream}' HEAD 2>/dev/null) \
+    || base=$(git -C "$root" merge-base origin/main HEAD 2>/dev/null) \
+    || base=$(git -C "$root" merge-base origin/HEAD HEAD 2>/dev/null) \
+    || base=""
+  echo "$base"
+}
+
+# Compute the content-bound diff hash. mode ∈ {staged, range}.
+#   staged: `git diff --cached -M <base>`   (review time, after `git add -A`)
+#   range:  `git diff -M <base>..HEAD`       (push time)
+# Prints the 64-char sha256, or empty on git failure / empty base.
+review_diff_hash() {
+  local root="$1" base="$2" mode="$3" spec
+  [ -z "$base" ] && { echo ""; return 0; }
+  case "$mode" in
+    staged) spec="--cached $base" ;;
+    range)  spec="$base..HEAD" ;;
+    *) echo ""; return 0 ;;
+  esac
+  # shellcheck disable=SC2086
+  git -C "$root" diff --no-color --no-ext-diff -M $spec -- . ':(exclude).review/' 2>/dev/null \
+    | sed -e 's/\r$//' \
+    | sha256_stdin
+}
+
+# Read the review artifact for a given hash; prints its JSON or empty.
+read_review_artifact() {
+  local root="$1" hash="$2" path
+  path="$root/.review/$hash.json"
+  [ -f "$path" ] && cat "$path" || echo ""
+}
+
+# Extract the verdict field (APPROVE | REQUEST_CHANGES) from artifact JSON.
+review_artifact_verdict() {
+  local json="$1"
+  [ -z "$json" ] && { echo ""; return 0; }
+  if command -v jq &>/dev/null; then
+    echo "$json" | jq -r '.verdict // empty' 2>/dev/null
+  else
+    echo "$json" | grep -oE '"verdict"[[:space:]]*:[[:space:]]*"[^"]*"' \
+      | head -1 | sed 's/.*: *"//;s/"$//'
+  fi
+}
+
 # ── Find project root (walk up to .git) ─────────────────────────────
 find_project_root() {
   local dir="${1:-$(pwd)}"
@@ -463,5 +598,62 @@ run_pytest_node() {
     echo "FAIL"
   else
     echo "BOOTSTRAP"
+  fi
+}
+
+# ── Review-stamp signature helpers (HMAC-signed review approval) ─────
+# The review-stamp MCP server signs each artifact with
+# HMAC-SHA256(key, "<diff_hash>:<verdict>") keyed by REVIEW_STAMP_KEY. These
+# helpers let the push gate verify that signature: forging an APPROVE now
+# requires the signing key, not just a file write.
+
+# Resolve the signing/verification key: env REVIEW_STAMP_KEY first, else the
+# macOS Keychain item REVIEW_STAMP_KEY, else empty (caller degrades).
+review_stamp_key() {
+  if [ -n "${REVIEW_STAMP_KEY:-}" ]; then
+    printf '%s' "$REVIEW_STAMP_KEY"
+    return 0
+  fi
+  if command -v security &>/dev/null; then
+    security find-generic-password -a "$USER" -s REVIEW_STAMP_KEY -w 2>/dev/null || true
+    return 0
+  fi
+  echo ""
+}
+
+# Verify an artifact signature. Usage:
+#   review_stamp_verify_sig <hash> <verdict> <signature> <key>
+# Recomputes HMAC-SHA256(key, "<hash>:<verdict>") and compares in constant
+# time. Returns 0 when the signature matches, non-zero otherwise (including
+# when python3 is unavailable — an unverifiable signature must never pass).
+#
+# The key and candidate signature travel via the ENVIRONMENT, never argv:
+# argv is visible to every same-user process (ps / /proc), which would leak
+# the key beyond the documented Keychain ceiling.
+review_stamp_verify_sig() {
+  local hash="$1" verdict="$2" signature="$3" key="$4"
+  command -v python3 &>/dev/null || return 1
+  printf '%s' "$hash:$verdict" \
+    | REVIEW_STAMP_VERIFY_KEY="$key" REVIEW_STAMP_VERIFY_SIG="$signature" python3 -c '
+import hashlib, hmac, os, sys
+
+expected = hmac.new(
+    os.environ["REVIEW_STAMP_VERIFY_KEY"].encode(),
+    sys.stdin.buffer.read(),
+    hashlib.sha256,
+).hexdigest()
+sys.exit(0 if hmac.compare_digest(expected, os.environ["REVIEW_STAMP_VERIFY_SIG"]) else 1)
+' 2>/dev/null
+}
+
+# Extract the signature field from artifact JSON (empty when absent).
+review_artifact_signature() {
+  local json="$1"
+  [ -z "$json" ] && { echo ""; return 0; }
+  if command -v jq &>/dev/null; then
+    echo "$json" | jq -r '.signature // empty' 2>/dev/null
+  else
+    echo "$json" | grep -oE '"signature"[[:space:]]*:[[:space:]]*"[^"]*"' \
+      | head -1 | sed 's/.*: *"//;s/"$//'
   fi
 }
