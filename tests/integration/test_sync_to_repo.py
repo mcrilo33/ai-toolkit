@@ -7,6 +7,7 @@ the correct files are generated with the right frontmatter and content.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from collections import Counter
 from pathlib import Path
@@ -159,7 +160,7 @@ def _strip_frontmatter(text: str) -> str:
 
 
 def _parse_frontmatter(text: str) -> dict[str, str]:
-    """Extract frontmatter fields as a flat dict."""
+    """Extract frontmatter fields as a flat dict (surrounding quotes stripped)."""
     if not text.startswith("---"):
         return {}
     parts = text.split("---", 2)
@@ -170,7 +171,10 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
     for line in fm_block.splitlines():
         if ":" in line:
             key, _, val = line.partition(":")
-            result[key.strip()] = val.strip()
+            val = val.strip()
+            if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
+                val = val[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+            result[key.strip()] = val
     return result
 
 
@@ -1066,3 +1070,160 @@ class TestHookIdempotency:
         _run_sync(target_repo, "all")
         result = json.loads(cursor_file.read_text())
         assert stale not in result["hooks"]["beforeShellExecution"]
+
+
+# ── Manifest + stale-file GC + dry-run ────────────────────
+
+
+class TestManifestAndGC:
+    """Sync writes a .ai-toolkit-manifest.json and GCs stale toolkit outputs."""
+
+    MANIFEST_NAME = ".ai-toolkit-manifest.json"
+
+    def test_sync_cursor_writes_manifest_with_cursor_list(
+        self, target_repo: Path
+    ) -> None:
+        _run_sync(target_repo, "cursor")
+
+        manifest = json.loads((target_repo / self.MANIFEST_NAME).read_text())
+        assert manifest["tools"]["cursor"], "cursor list is empty"
+        assert ".cursor/rules/guidelines.mdc" in manifest["tools"]["cursor"]
+
+    def test_resync_deletes_stale_manifest_listed_file(
+        self, target_repo: Path
+    ) -> None:
+        _run_sync(target_repo, "cursor")
+        stale = target_repo / ".cursor" / "rules" / "obsolete-rule.mdc"
+        stale.write_text("---\ndescription: obsolete\n---\n\n# Obsolete\n")
+        manifest_file = target_repo / self.MANIFEST_NAME
+        manifest = json.loads(manifest_file.read_text())
+        manifest["tools"]["cursor"].append(".cursor/rules/obsolete-rule.mdc")
+        manifest_file.write_text(json.dumps(manifest))
+
+        _run_sync(target_repo, "cursor")
+
+        assert not stale.exists()
+        manifest = json.loads(manifest_file.read_text())
+        assert ".cursor/rules/obsolete-rule.mdc" not in manifest["tools"]["cursor"]
+
+    def test_user_file_not_in_manifest_survives_resync(
+        self, target_repo: Path
+    ) -> None:
+        _run_sync(target_repo, "cursor")
+        user_rule = target_repo / ".cursor" / "rules" / "my-own-rule.mdc"
+        user_rule.write_text("---\ndescription: mine\n---\n\n# Mine\n")
+        manifest_file = target_repo / self.MANIFEST_NAME
+        manifest = json.loads(manifest_file.read_text())
+        assert ".cursor/rules/my-own-rule.mdc" not in manifest["tools"]["cursor"]
+
+        _run_sync(target_repo, "cursor")
+
+        assert user_rule.exists()
+        manifest = json.loads(manifest_file.read_text())
+        assert ".cursor/rules/my-own-rule.mdc" not in manifest["tools"]["cursor"]
+
+    def test_dry_run_touches_nothing_on_fresh_target(self, target_repo: Path) -> None:
+        result = subprocess.run(
+            ["bash", str(SYNC_SCRIPT), str(target_repo), "cursor", "--dry-run"],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0
+        assert "[dry-run]" in result.stdout
+        assert not (target_repo / ".cursor").exists()
+        assert not (target_repo / self.MANIFEST_NAME).exists()
+
+    def test_manifest_byte_identical_after_second_sync(
+        self, target_repo: Path
+    ) -> None:
+        _run_sync(target_repo, "cursor")
+        first = (target_repo / self.MANIFEST_NAME).read_bytes()
+
+        _run_sync(target_repo, "cursor")
+
+        second = (target_repo / self.MANIFEST_NAME).read_bytes()
+        assert first == second
+
+    def test_sync_all_writes_all_three_tool_lists(self, target_repo: Path) -> None:
+        _run_sync(target_repo, "all")
+
+        manifest = json.loads((target_repo / self.MANIFEST_NAME).read_text())
+        assert manifest["tools"]["copilot"], "copilot list is empty"
+        assert manifest["tools"]["cursor"], "cursor list is empty"
+        assert manifest["tools"]["claude"], "claude list is empty"
+
+
+# ── MCP servers (review-stamp) ────────────────────────────
+
+
+class TestMcpServerSync:
+    """Sync installs the review-stamp MCP server into the target.
+
+    The code-review agent frontmatter references
+    ./.ai-toolkit/mcp/review-stamp/run.sh — that path must exist in every
+    synced target, be executable, and be manifest-tracked so GC manages it.
+    """
+
+    MANIFEST_NAME = ".ai-toolkit-manifest.json"
+    RUN_SH = ".ai-toolkit/mcp/review-stamp/run.sh"
+    SERVER_PY = ".ai-toolkit/mcp/review-stamp/server.py"
+
+    def test_run_sh_installed_and_executable(self, target_repo: Path) -> None:
+        _run_sync(target_repo, "claude")
+
+        run_sh = target_repo / self.RUN_SH
+        assert run_sh.is_file(), f"{self.RUN_SH} not installed"
+        assert os.access(run_sh, os.X_OK), f"{self.RUN_SH} not executable"
+
+    def test_server_py_installed(self, target_repo: Path) -> None:
+        _run_sync(target_repo, "claude")
+
+        assert (target_repo / self.SERVER_PY).is_file()
+
+    def test_installed_files_match_source(self, target_repo: Path) -> None:
+        _run_sync(target_repo, "claude")
+
+        src_dir = REPO_ROOT / "mcp" / "review-stamp"
+        assert (target_repo / self.RUN_SH).read_bytes() == (
+            src_dir / "run.sh"
+        ).read_bytes()
+        assert (target_repo / self.SERVER_PY).read_bytes() == (
+            src_dir / "server.py"
+        ).read_bytes()
+
+    def test_both_files_recorded_in_manifest_for_every_tool(
+        self, target_repo: Path
+    ) -> None:
+        _run_sync(target_repo, "all")
+
+        manifest = json.loads((target_repo / self.MANIFEST_NAME).read_text())
+        for tool in ("copilot", "cursor", "claude"):
+            assert self.RUN_SH in manifest["tools"][tool], f"{tool}: run.sh missing"
+            assert (
+                self.SERVER_PY in manifest["tools"][tool]
+            ), f"{tool}: server.py missing"
+
+    def test_resync_is_byte_identical(self, target_repo: Path) -> None:
+        _run_sync(target_repo, "all")
+        first = {
+            p: (target_repo / p).read_bytes() for p in (self.RUN_SH, self.SERVER_PY)
+        }
+
+        _run_sync(target_repo, "all")
+
+        second = {
+            p: (target_repo / p).read_bytes() for p in (self.RUN_SH, self.SERVER_PY)
+        }
+        assert first == second
+
+    def test_dry_run_does_not_install(self, target_repo: Path) -> None:
+        result = subprocess.run(
+            ["bash", str(SYNC_SCRIPT), str(target_repo), "claude", "--dry-run"],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0
+        assert not (target_repo / ".ai-toolkit").exists()
+        assert f"[dry-run] would write {self.RUN_SH}" in result.stdout

@@ -14,13 +14,15 @@ error()   { echo -e "${RED}✗${NC} $1" >&2; }
 section() { echo -e "\n${BLUE}── $1 ──${NC}"; }
 
 usage() {
-    echo "Usage: $0 <target-repo-path> [tool] [--with-git-hooks]"
+    echo "Usage: $0 <target-repo-path> [tool] [--with-git-hooks] [--dry-run]"
     echo ""
     echo "Tools: copilot, cursor, claude, all (default: all)"
     echo ""
     echo "Flags:"
     echo "  --with-git-hooks   Also install the cage scripts as NATIVE git hooks"
     echo "                     (fallback enforcement, independent of the agent runtime)"
+    echo "  --dry-run          Print what would be written/deleted without touching"
+    echo "                     the target"
     echo ""
     echo "Examples:"
     echo "  $0 ~/Repos/my-project                       # Sync all tools"
@@ -28,6 +30,7 @@ usage() {
     echo "  $0 ~/Repos/my-project cursor                 # Cursor only"
     echo "  $0 ~/Repos/my-project claude                 # Claude only"
     echo "  $0 ~/Repos/my-project all --with-git-hooks   # Sync + native git hooks"
+    echo "  $0 ~/Repos/my-project cursor --dry-run       # Preview only"
     exit 1
 }
 
@@ -35,9 +38,11 @@ usage() {
 TARGET=""
 TOOL="all"
 WITH_GIT_HOOKS=0
+DRY_RUN=0
 for arg in "$@"; do
     case "$arg" in
         --with-git-hooks) WITH_GIT_HOOKS=1 ;;
+        --dry-run) DRY_RUN=1 ;;
         copilot|cursor|claude|all) TOOL="$arg" ;;
         -*) error "Unknown flag: $arg"; usage ;;
         *)
@@ -51,6 +56,7 @@ for arg in "$@"; do
 done
 [ -z "$TARGET" ] && usage
 [ ! -d "$TARGET" ] && { error "Target directory does not exist: $TARGET"; exit 1; }
+TARGET="$(cd "$TARGET" && pwd)"
 
 if [ ! -d "$TARGET/.git" ]; then
     warn "Target does not appear to be a git repository: $TARGET"
@@ -69,19 +75,72 @@ query_metadata() {
     python3 "$SCRIPT_DIR/metadata_parser.py" "$meta_file" "$tool" "$fields"
 }
 
+# ─── File recording for the sync manifest ───
+# Sync loops run inside `| while read` pipelines (subshells), so appends to a
+# plain bash array would not survive. Recording goes through a temp FILE
+# (one per tool, created in sync_tool) which subshells can append to.
+RECORD_FILE=""
+record_file() {
+    # $1 = path relative to $TARGET
+    echo "$1" >> "$RECORD_FILE"
+}
+
+# ─── Helper: create a directory (no-op in dry-run) ───
+make_dir() {
+    [ "$DRY_RUN" -eq 1 ] && return 0
+    mkdir -p "$@"
+}
+
 # ─── Helper: write file with YAML frontmatter ───
 add_frontmatter() {
     local src="$1" dst="$2" meta="$3"
+    local rel="${dst#"$TARGET/"}"
+    record_file "$rel"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "[dry-run] would write $rel"
+        return 0
+    fi
     { echo "---"; echo -e "$meta"; echo "---"; echo ""; cat "$src"; } > "$dst"
+}
+
+# ─── Helper: plain file copy (recorded, dry-run aware) ───
+copy_file() {
+    local src="$1" dst="$2"
+    local rel="${dst#"$TARGET/"}"
+    record_file "$rel"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "[dry-run] would write $rel"
+        return 0
+    fi
+    cp "$src" "$dst"
+}
+
+# ─── Helper: was this relpath already written in the current sync? ───
+# Used by the plain-copy fallback loops: in real mode the file exists on disk,
+# but in dry-run nothing is written, so the record file is the source of truth.
+already_synced() {
+    grep -qxF "$1" "$RECORD_FILE" 2>/dev/null
 }
 
 # ─── Helper: copy skill subdirectories (references, scripts, templates, assets) ───
 copy_skill_subdirs() {
     local src_dir="$1" dst_dir="$2"
+    local rel_dst="${dst_dir#"$TARGET/"}"
+    local subdir f rel
     for subdir in references scripts templates assets; do
         [ -d "$src_dir/$subdir" ] || continue
-        cp -R "$src_dir/$subdir" "$dst_dir/"
-        info "  └── $subdir/"
+        if [ "$DRY_RUN" -eq 0 ]; then
+            cp -R "$src_dir/$subdir" "$dst_dir/"
+            info "  └── $subdir/"
+        fi
+        # Record each copied file (enumerated from the source tree)
+        find "$src_dir/$subdir" -type f | while read -r f; do
+            rel="$rel_dst/$subdir/${f#"$src_dir/$subdir/"}"
+            record_file "$rel"
+            if [ "$DRY_RUN" -eq 1 ]; then
+                echo "[dry-run] would write $rel"
+            fi
+        done
     done
 }
 
@@ -99,7 +158,7 @@ CLAUDE_PROMPT_FIELDS="name,description"
 
 COPILOT_AGENT_FIELDS="name,description,model,tools,disallowedTools,user-invocable,disable-model-invocation,target,argument-hint,agents,handoffs,mcp-servers,hooks,metadata"
 CURSOR_AGENT_FIELDS="description,model,readonly,is_background"
-CLAUDE_AGENT_FIELDS="name,description,model,tools,disallowedTools,mcp-servers,hooks,effort,maxTurns,permissionMode,memory,background,isolation,skills,color,initialPrompt"
+CLAUDE_AGENT_FIELDS="name,description,model,tools,disallowedTools,mcp-servers,mcpServers,hooks,effort,maxTurns,permissionMode,memory,background,isolation,skills,color,initialPrompt"
 
 # ═══════════════════════════════════════════
 #  COPILOT
@@ -107,7 +166,7 @@ CLAUDE_AGENT_FIELDS="name,description,model,tools,disallowedTools,mcp-servers,ho
 sync_copilot() {
     local gh="$TARGET/.github"
     section "Copilot → $gh/"
-    mkdir -p "$gh/instructions" "$gh/skills" "$gh/agents" "$gh/prompts"
+    make_dir "$gh/instructions" "$gh/skills" "$gh/agents" "$gh/prompts"
 
     # instructions/*.instructions.md
     query_metadata "$SHARED_DIR/rules/metadata.yml" copilot "$COPILOT_RULE_FIELDS" | while IFS=$'\t' read -r name fm; do
@@ -119,7 +178,7 @@ sync_copilot() {
     # skills/
     query_metadata "$SHARED_DIR/skills/metadata.yml" copilot "$COPILOT_SKILL_FIELDS" | while IFS=$'\t' read -r name fm; do
         [ -f "$SHARED_DIR/skills/${name}/SKILL.md" ] || continue
-        mkdir -p "$gh/skills/$name"
+        make_dir "$gh/skills/$name"
         add_frontmatter "$SHARED_DIR/skills/${name}/SKILL.md" "$gh/skills/$name/SKILL.md" "$fm"
         info "skills/$name/"
     done
@@ -128,8 +187,8 @@ sync_copilot() {
         [ -d "$d" ] || continue
         local s="$(basename "$d")"
         [ -f "$d/SKILL.md" ] || continue
-        if [ ! -f "$gh/skills/$s/SKILL.md" ]; then
-            mkdir -p "$gh/skills/$s"; cp "$d/SKILL.md" "$gh/skills/$s/SKILL.md"
+        if ! already_synced ".github/skills/$s/SKILL.md"; then
+            make_dir "$gh/skills/$s"; copy_file "$d/SKILL.md" "$gh/skills/$s/SKILL.md"
             info "skills/$s/ (plain)"
         fi
         copy_skill_subdirs "$d" "$gh/skills/$s"
@@ -146,8 +205,8 @@ sync_copilot() {
         [ -f "$f" ] || continue
         local a="$(basename "$f" .md)"
         [ "$a" = "metadata" ] && continue
-        if [ ! -f "$gh/agents/${a}.agent.md" ]; then
-            cp "$f" "$gh/agents/${a}.agent.md"
+        if ! already_synced ".github/agents/${a}.agent.md"; then
+            copy_file "$f" "$gh/agents/${a}.agent.md"
             info "agents/${a}.agent.md (plain)"
         fi
     done
@@ -166,7 +225,7 @@ sync_copilot() {
 sync_cursor() {
     local cur="$TARGET/.cursor"
     section "Cursor → $cur/"
-    mkdir -p "$cur/rules" "$cur/skills" "$cur/agents"
+    make_dir "$cur/rules" "$cur/skills" "$cur/agents"
 
     # rules/*.mdc (Cursor requires .mdc extension)
     query_metadata "$SHARED_DIR/rules/metadata.yml" cursor "$CURSOR_RULE_FIELDS" | while IFS=$'\t' read -r name fm; do
@@ -178,7 +237,7 @@ sync_cursor() {
     # skills/
     query_metadata "$SHARED_DIR/skills/metadata.yml" cursor "$CURSOR_SKILL_FIELDS" | while IFS=$'\t' read -r name fm; do
         [ -f "$SHARED_DIR/skills/${name}/SKILL.md" ] || continue
-        mkdir -p "$cur/skills/$name"
+        make_dir "$cur/skills/$name"
         add_frontmatter "$SHARED_DIR/skills/${name}/SKILL.md" "$cur/skills/$name/SKILL.md" "$fm"
         info "skills/$name/"
     done
@@ -186,8 +245,8 @@ sync_cursor() {
         [ -d "$d" ] || continue
         local s="$(basename "$d")"
         [ -f "$d/SKILL.md" ] || continue
-        if [ ! -f "$cur/skills/$s/SKILL.md" ]; then
-            mkdir -p "$cur/skills/$s"; cp "$d/SKILL.md" "$cur/skills/$s/SKILL.md"
+        if ! already_synced ".cursor/skills/$s/SKILL.md"; then
+            make_dir "$cur/skills/$s"; copy_file "$d/SKILL.md" "$cur/skills/$s/SKILL.md"
             info "skills/$s/ (plain)"
         fi
         copy_skill_subdirs "$d" "$cur/skills/$s"
@@ -204,8 +263,8 @@ sync_cursor() {
         [ -f "$f" ] || continue
         local a="$(basename "$f" .md)"
         [ "$a" = "metadata" ] && continue
-        if [ ! -f "$cur/agents/${a}.md" ]; then
-            cp "$f" "$cur/agents/${a}.md"
+        if ! already_synced ".cursor/agents/${a}.md"; then
+            copy_file "$f" "$cur/agents/${a}.md"
             info "agents/${a}.md (plain)"
         fi
     done
@@ -217,7 +276,7 @@ sync_cursor() {
 sync_claude() {
     local cl="$TARGET/.claude"
     section "Claude → $cl/"
-    mkdir -p "$cl/rules" "$cl/skills" "$cl/agents"
+    make_dir "$cl/rules" "$cl/skills" "$cl/agents"
 
     # rules/*.md (with paths)
     query_metadata "$SHARED_DIR/rules/metadata.yml" claude "$CLAUDE_RULE_FIELDS" | while IFS=$'\t' read -r name fm; do
@@ -229,7 +288,7 @@ sync_claude() {
     # skills/
     query_metadata "$SHARED_DIR/skills/metadata.yml" claude "$CLAUDE_SKILL_FIELDS" | while IFS=$'\t' read -r name fm; do
         [ -f "$SHARED_DIR/skills/${name}/SKILL.md" ] || continue
-        mkdir -p "$cl/skills/$name"
+        make_dir "$cl/skills/$name"
         add_frontmatter "$SHARED_DIR/skills/${name}/SKILL.md" "$cl/skills/$name/SKILL.md" "$fm"
         info "skills/$name/"
     done
@@ -237,8 +296,8 @@ sync_claude() {
         [ -d "$d" ] || continue
         local s="$(basename "$d")"
         [ -f "$d/SKILL.md" ] || continue
-        if [ ! -f "$cl/skills/$s/SKILL.md" ]; then
-            mkdir -p "$cl/skills/$s"; cp "$d/SKILL.md" "$cl/skills/$s/SKILL.md"
+        if ! already_synced ".claude/skills/$s/SKILL.md"; then
+            make_dir "$cl/skills/$s"; copy_file "$d/SKILL.md" "$cl/skills/$s/SKILL.md"
             info "skills/$s/ (plain)"
         fi
         copy_skill_subdirs "$d" "$cl/skills/$s"
@@ -255,8 +314,8 @@ sync_claude() {
         [ -f "$f" ] || continue
         local a="$(basename "$f" .md)"
         [ "$a" = "metadata" ] && continue
-        if [ ! -f "$cl/agents/${a}.md" ]; then
-            cp "$f" "$cl/agents/${a}.md"
+        if ! already_synced ".claude/agents/${a}.md"; then
+            copy_file "$f" "$cl/agents/${a}.md"
             info "agents/${a}.md (plain)"
         fi
     done
@@ -264,7 +323,7 @@ sync_claude() {
     # prompts/
     query_metadata "$SHARED_DIR/prompts/metadata.yml" claude "$CLAUDE_PROMPT_FIELDS" | while IFS=$'\t' read -r name fm; do
         [ -f "$SHARED_DIR/prompts/${name}.md" ] || continue
-        mkdir -p "$cl/prompts"
+        make_dir "$cl/prompts"
         add_frontmatter "$SHARED_DIR/prompts/${name}.md" "$cl/prompts/${name}.md" "$fm"
         info "prompts/${name}.md"
     done
@@ -287,19 +346,45 @@ sync_hooks() {
         claude)  scripts_dst="$TARGET/.claude/hooks/scripts" ;;
     esac
 
-    mkdir -p "$scripts_dst"
+    local scripts_rel="${scripts_dst#"$TARGET/"}"
+
+    make_dir "$scripts_dst"
     for f in "$SHARED_DIR/hooks/"*.sh; do
         [ -f "$f" ] || continue
-        cp "$f" "$scripts_dst/"
-        chmod +x "$scripts_dst/$(basename "$f")"
-        info "hooks/scripts/$(basename "$f")"
+        copy_file "$f" "$scripts_dst/$(basename "$f")"
+        if [ "$DRY_RUN" -eq 0 ]; then
+            chmod +x "$scripts_dst/$(basename "$f")"
+            info "hooks/scripts/$(basename "$f")"
+        fi
     done
 
     # Copy shared lib/ utilities (inside scripts/ so $HOOK_DIR/lib/ resolves)
     if [ -d "$SHARED_DIR/hooks/lib" ]; then
-        mkdir -p "$scripts_dst/lib"
-        cp -R "$SHARED_DIR/hooks/lib/"* "$scripts_dst/lib/" 2>/dev/null || true
-        info "hooks/scripts/lib/"
+        make_dir "$scripts_dst/lib"
+        find "$SHARED_DIR/hooks/lib" -type f | while read -r f; do
+            local rel="$scripts_rel/lib/${f#"$SHARED_DIR/hooks/lib/"}"
+            record_file "$rel"
+            if [ "$DRY_RUN" -eq 1 ]; then
+                echo "[dry-run] would write $rel"
+            fi
+        done
+        if [ "$DRY_RUN" -eq 0 ]; then
+            cp -R "$SHARED_DIR/hooks/lib/"* "$scripts_dst/lib/" 2>/dev/null || true
+            info "hooks/scripts/lib/"
+        fi
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        # Generator/reconciler write .tmp/.bak files — skip entirely in dry-run.
+        # Reconciler-owned configs (.cursor/hooks.json, .claude/settings.json)
+        # are never recorded; only the copilot-owned ai-toolkit.json is.
+        case "$tool" in
+            copilot) record_file ".github/hooks/ai-toolkit.json"
+                     echo "[dry-run] would write .github/hooks/ai-toolkit.json" ;;
+            cursor)  echo "[dry-run] would reconcile .cursor/hooks.json" ;;
+            claude)  echo "[dry-run] would reconcile .claude/settings.json" ;;
+        esac
+        return 0
     fi
 
     # Generate platform-specific hooks config JSON
@@ -311,6 +396,7 @@ sync_hooks() {
             local hooks_dir="$TARGET/.github/hooks"
             mkdir -p "$hooks_dir"
             echo "$json" > "$hooks_dir/ai-toolkit.json"
+            record_file ".github/hooks/ai-toolkit.json"
             info "hooks/ai-toolkit.json"
             ;;
         cursor)
@@ -320,6 +406,7 @@ sync_hooks() {
             # Reconcile: ai-toolkit hooks are a managed/owned set. Existing owned
             # entries are removed and replaced with the fresh set exactly once;
             # user-authored hooks are preserved. Converges to a fixed point.
+            # NOT recorded in the manifest: reconciler-owned (and GC-protected).
             [ -f "$cursor_file" ] && cp "$cursor_file" "$cursor_file.bak"
             python3 "$SCRIPT_DIR/hooks_reconciler.py" cursor \
                 "${cursor_file}" <<< "$json" > "$cursor_file.tmp"
@@ -333,6 +420,7 @@ sync_hooks() {
             # Reconcile ai-toolkit hooks into settings.json (ownership-aware,
             # idempotent) — replaces the old pure-append .extend() that grew the
             # file without bound on every sync.
+            # NOT recorded in the manifest: reconciler-owned (and GC-protected).
             [ -f "$claude_file" ] && cp "$claude_file" "$claude_file.bak"
             python3 "$SCRIPT_DIR/hooks_reconciler.py" claude \
                 "${claude_file}" <<< "$json" > "$claude_file.tmp"
@@ -343,21 +431,51 @@ sync_hooks() {
 }
 
 # ═══════════════════════════════════════════
+#  MCP SERVERS (shared across all platforms)
+# ═══════════════════════════════════════════
+# The code-review agent frontmatter references the review-stamp server at
+# ./.ai-toolkit/mcp/review-stamp/run.sh — a repo-relative path that must
+# resolve in the TARGET repo, not just the toolkit. Install the server there.
+# Source lives at the toolkit repo root (mcp/), not under shared/.
+sync_mcp_servers() {
+    local src_dir="$REPO_DIR/mcp/review-stamp"
+    [ -d "$src_dir" ] || return 0
+
+    section "MCP servers"
+    local dst_dir="$TARGET/.ai-toolkit/mcp/review-stamp"
+    make_dir "$dst_dir"
+    local f
+    for f in run.sh server.py; do
+        [ -f "$src_dir/$f" ] || continue
+        copy_file "$src_dir/$f" "$dst_dir/$f"
+        if [ "$DRY_RUN" -eq 0 ]; then
+            if [ "$f" = "run.sh" ]; then
+                chmod +x "$dst_dir/$f"
+            fi
+            info "mcp/review-stamp/$f"
+        fi
+    done
+}
+
+# ═══════════════════════════════════════════
 #  SHARED CONFIG FILES (pyproject.toml, etc.)
 # ═══════════════════════════════════════════
 sync_config_files() {
     section "Config files"
 
-    # Generic helper: copy a shared config file if target doesn't have one
+    # Generic helper: copy a shared config file if target doesn't have one.
+    # NOT recorded in the manifest: copy-if-absent semantics mean the user
+    # owns the file after creation, so GC must never reclaim it.
     _sync_config() {
         local filename="$1"
-        if [ -f "$SHARED_DIR/$filename" ]; then
-            if [ -f "$TARGET/$filename" ]; then
-                warn "$filename already exists in target — skipped (merge manually if needed)"
-            else
-                cp "$SHARED_DIR/$filename" "$TARGET/$filename"
-                info "$filename"
-            fi
+        [ -f "$SHARED_DIR/$filename" ] || return 0
+        if [ -f "$TARGET/$filename" ]; then
+            warn "$filename already exists in target — skipped (merge manually if needed)"
+        elif [ "$DRY_RUN" -eq 1 ]; then
+            echo "[dry-run] would write $filename"
+        else
+            cp "$SHARED_DIR/$filename" "$TARGET/$filename"
+            info "$filename"
         fi
     }
 
@@ -366,6 +484,49 @@ sync_config_files() {
     _sync_config ".gitignore"
     _sync_config ".editorconfig"
     _sync_config ".python-version"
+}
+
+# ═══════════════════════════════════════════
+#  SYNC MANIFEST + STALE-FILE GC
+# ═══════════════════════════════════════════
+TOOLKIT_REV="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
+# Pipe the recorded file list to sync_manifest.py: updates the per-tool list
+# in .ai-toolkit-manifest.json and deletes files a previous sync wrote but
+# this one didn't (printed one per line on stdout).
+finalize_manifest() {
+    local tool="$1"
+    local args=(finalize "$TARGET" "$tool" "$TOOLKIT_REV")
+    [ "$DRY_RUN" -eq 1 ] && args+=(--dry-run)
+    local deleted p
+    deleted="$(sort -u "$RECORD_FILE" | python3 "$SCRIPT_DIR/sync_manifest.py" "${args[@]}")"
+    [ -n "$deleted" ] || return 0
+    while IFS= read -r p; do
+        if [ "$DRY_RUN" -eq 1 ]; then
+            info "GC [dry-run] would delete stale $p"
+        else
+            info "GC deleted stale $p"
+        fi
+    done <<< "$deleted"
+}
+
+# Run one tool's sync + hooks with a fresh record file, then finalize.
+# The record file is a temp FILE (not a bash array) because the sync loops
+# run in `| while read` pipeline subshells — file appends survive, array
+# appends don't.
+sync_tool() {
+    local tool="$1"
+    RECORD_FILE="$(mktemp)"
+    case "$tool" in
+        copilot) sync_copilot ;;
+        cursor)  sync_cursor ;;
+        claude)  sync_claude ;;
+    esac
+    sync_hooks "$tool"
+    sync_mcp_servers
+    finalize_manifest "$tool"
+    rm -f "$RECORD_FILE"
+    RECORD_FILE=""
 }
 
 # ═══════════════════════════════════════════
@@ -397,23 +558,24 @@ echo "║   ai-toolkit — Sync to Repo              ║"
 echo "╚══════════════════════════════════════════╝"
 
 case "$TOOL" in
-    copilot) sync_copilot; sync_hooks copilot; sync_config_files ;;
-    cursor)  sync_cursor;  sync_hooks cursor;  sync_config_files ;;
-    claude)  sync_claude;  sync_hooks claude;  sync_config_files ;;
-    all)     sync_copilot; sync_hooks copilot; sync_cursor; sync_hooks cursor; sync_claude; sync_hooks claude; sync_config_files ;;
+    copilot|cursor|claude) sync_tool "$TOOL"; sync_config_files ;;
+    all)     sync_tool copilot; sync_tool cursor; sync_tool claude; sync_config_files ;;
     *)       error "Unknown tool: $TOOL"; usage ;;
 esac
 
-if [ "$WITH_GIT_HOOKS" -eq 1 ]; then
+if [ "$WITH_GIT_HOOKS" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
     sync_git_hooks
 fi
 
 echo ""
-info "Sync complete! Review changes with: cd $TARGET && git diff"
-if [ "$WITH_GIT_HOOKS" -eq 1 ]; then
+if [ "$DRY_RUN" -eq 1 ]; then
+    info "[dry-run] No changes were made to $TARGET"
+elif [ "$WITH_GIT_HOOKS" -eq 1 ]; then
+    info "Sync complete! Review changes with: cd $TARGET && git diff"
     info "Native git hooks installed as a fallback enforcement layer."
     echo "  Uninstall with: $SCRIPT_DIR/install-git-hooks.sh --uninstall $TARGET"
 else
+    info "Sync complete! Review changes with: cd $TARGET && git diff"
     warn "Agent hooks only. For enforcement independent of the agent runtime, re-run with --with-git-hooks"
     echo "  (installs commit-quality + commit-gauntlet as native git hooks)"
 fi
