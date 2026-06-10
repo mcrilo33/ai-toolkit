@@ -17,14 +17,16 @@
 #   • It proves the named node fails NOW, at this commit — it cannot prevent a
 #     later history rewrite. That ceiling is inherent to any client-side hook.
 #   • If pytest cannot RUN (no runner, collection/usage/internal error, missing
-#     deps) the outcome is BOOTSTRAP, which DEGRADES to allow — never a false
-#     block. A genuine RED test commonly fails via ImportError/collection, which
-#     pytest still reports as exit 1 (FAIL), so the common case is provable.
+#     deps) the outcome is BOOTSTRAP, which DENIES: declaring a `Tested-RED:`
+#     pytest node claims pytest works, so a broken runner must be FIXED, not
+#     skipped — a trailer the hook cannot execute proves nothing. A genuine RED
+#     test commonly fails via ImportError/collection, which pytest still
+#     reports as exit 1 (FAIL), so the common case is provable.
 #   • pytest-only. Non-pytest stacks carry no `Tested-RED:` trailer in this
 #     toolkit, so there is nothing to verify and the hook no-ops.
 #
-# Exit 2 = block (a Tested-RED node PASSES — not a real RED test)
-# Exit 0 = allow (node correctly FAILS, no trailer, bootstrap, or non-commit)
+# Exit 2 = block (a Tested-RED node PASSES, or it cannot run — BOOTSTRAP)
+# Exit 0 = allow (node correctly FAILS, no trailer, or non-commit)
 set -euo pipefail
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -36,7 +38,8 @@ COMMAND=$(get_shell_command "$INPUT")
 [ -z "$COMMAND" ] && exit 0
 
 # Only act on git commit commands.
-echo "$COMMAND" | grep -qE '^\s*git\s+commit\b' || exit 0
+# Boundary-aware: chained/prefixed forms (`cd x && git commit`) must not bypass.
+is_git_commit "$COMMAND" || exit 0
 
 # Pull the Tested-RED node IDs from the commit message. No trailer ⇒ this is
 # not a declared RED commit; nothing to verify here (commit-gauntlet and the
@@ -47,6 +50,7 @@ NODES=$(extract_tested_red_nodes "$COMMAND")
 PROJECT_ROOT=$(project_root_from_payload "$INPUT")
 
 PASSERS=""
+BOOTSTRAPS=""
 while IFS= read -r node; do
   [ -z "$node" ] && continue
   case "$(run_pytest_node "$PROJECT_ROOT" "$node")" in
@@ -57,10 +61,18 @@ while IFS= read -r node; do
       PASSERS="$PASSERS\n  • $node"
       ;;
     BOOTSTRAP)
-      warn "red-proof-verify: could not run '$node' (no pytest runner or it failed to start) — RED proof SKIPPED for this node, falling back to trailer-presence only."
+      BOOTSTRAPS="$BOOTSTRAPS\n  • $node"
       ;;
   esac
 done <<< "$NODES"
+
+if [ -n "$BOOTSTRAPS" ]; then
+  deny "red-proof-verify blocked the commit — these Tested-RED nodes could not be RUN (no pytest runner, or it failed to start):$(echo -e "$BOOTSTRAPS")
+
+Declaring a 'Tested-RED:' pytest node claims pytest works in this environment.
+A node the hook cannot execute proves nothing — fix the environment (install
+pytest / repair the runner) so the RED state can be verified, then retry."
+fi
 
 if [ -n "$PASSERS" ]; then
   deny "red-proof-verify blocked the commit — these Tested-RED nodes PASS at the RED commit:$(echo -e "$PASSERS")

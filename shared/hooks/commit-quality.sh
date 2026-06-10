@@ -24,8 +24,11 @@ COMMAND=$(get_shell_command "$INPUT")
 # subject-extraction below sees clean quotes regardless of how the runtime
 # serialized the call.
 
-# Only act on git commit commands
-echo "$COMMAND" | grep -qE '^\s*git\s+commit\b' || exit 0
+# Only act on git commit commands.
+# Boundary-aware gate: chained/prefixed forms (`true; git commit -m x`) must
+# not bypass. The -m message extraction below scans the whole command string,
+# so it works regardless of where the commit appears.
+is_git_commit "$COMMAND" || exit 0
 
 # Extract the SUBJECT from the FIRST message flag. With multiple -m flags the
 # first is the subject and the rest are body/footer paragraphs (git's own

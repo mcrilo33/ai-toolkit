@@ -9,11 +9,17 @@ assert the decision, covering the bugs found in live stress-testing:
 * the ``Tested-RED:`` typecheck carve-out (Issue #2a)
 * changed-line lint scoping (Issue #2b)
 * advisory hooks never blocking
+* the strictness spec: configured-but-missing tools, the time budget, and a
+  BOOTSTRAP pytest runner now DENY instead of degrading to allow (see
+  ``TestStrictGauntlet`` / ``TestStrictRedProof``)
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import shlex
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -85,6 +91,48 @@ def run_hook(script: Path, command: str, *, cwd: Path | None = None) -> int:
 def run_hook_cursor_shell(script: Path, command: str, *, cwd: Path | None = None) -> int:
     """Run a hook with a Cursor beforeShellExecution payload; return exit code."""
     return _run(script, _cursor_shell_payload(command, root=cwd), cwd=cwd).returncode
+
+
+def _no_stamp_key_env(home: Path) -> dict[str, str]:
+    """Controlled hook env (mirrors _hook_env in test_review_stamp.py): strip
+    REVIEW_STAMP_KEY so a developer machine's real key never leaks in, and
+    redirect HOME so the macOS Keychain lookup cannot resolve one either.
+    Without this, reviewer-sep's signature-verification branch activates and
+    DENIES the unsigned artifacts these tests write."""
+    env = {k: v for k, v in os.environ.items() if k != "REVIEW_STAMP_KEY"}
+    env.pop("CURSOR_PROJECT_DIR", None)
+    env["HOME"] = str(home)
+    return env
+
+
+def run_reviewer_sep(command: str, repo: Path, *, cursor: bool = True) -> int:
+    """Run reviewer-sep-warn in the controlled (key-free) env; return exit code."""
+    payload = _cursor_shell_payload(command, root=repo) if cursor else _payload(command)
+    return subprocess.run(
+        ["bash", str(REVIEWER_SEP)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        cwd=str(repo),
+        env=_no_stamp_key_env(home=repo),
+    ).returncode
+
+
+def _run_restricted(
+    script: Path, command: str, repo: Path, *, cursor: bool = False
+) -> subprocess.CompletedProcess:
+    """Run a hook with PATH=/usr/bin:/bin — git/jq/bash resolve, but dev tools
+    (ruff, eslint, pyright, mypy, tsc, pytest) do not. Simulates the
+    'configured but not installed' / 'pytest cannot start' environments."""
+    payload = _cursor_shell_payload(command, root=repo) if cursor else _payload(command)
+    return subprocess.run(
+        ["bash", str(script)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        cwd=str(repo),
+        env={"PATH": "/usr/bin:/bin", "HOME": str(repo)},
+    )
 
 
 # ── Fixtures ──────────────────────────────────────────────
@@ -164,6 +212,13 @@ def test_commit_quality_escaped_double_quotes_pass(on_branch: Callable[[str], Pa
 # ── commit-quality: issue-anchor gate ─────────────────────
 
 
+def test_commit_quality_chained_commit_not_bypassed(on_branch: Callable[[str], Path]) -> None:
+    # Boundary-aware gate: a commit chained after another command must still
+    # hit the conventional-commit deny (was bypassed by the ^-anchored grep).
+    repo = on_branch("feature/1-x")
+    assert run_hook(COMMIT_QUALITY, 'true; git commit -m "bad message"', cwd=repo) == BLOCK
+
+
 def test_anchor_missing_blocks(on_branch: Callable[[str], Path]) -> None:
     repo = on_branch("no-issue-here")
     assert run_hook(COMMIT_QUALITY, 'git commit -m "feat: y"', cwd=repo) == BLOCK
@@ -233,11 +288,14 @@ def test_gauntlet_allows_clean_addition(on_branch: Callable[[str], Path]) -> Non
     assert run_hook(COMMIT_GAUNTLET, 'git commit -m "feat: x" -m "Refs #1"', cwd=repo) == ALLOW
 
 
-def test_gauntlet_degrades_when_tool_absent(on_branch: Callable[[str], Path]) -> None:
-    # Graceful degradation means "tool not on PATH", not "no project config":
-    # detect_linter falls back to `command -v ruff`, so absence of config alone
-    # still lints. Simulate a toolless environment by emptying PATH so no
-    # linter/typechecker resolves → nothing to enforce → allow.
+def test_gauntlet_unconfigured_repo_allows_when_tools_absent(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # UNCONFIGURED side of the configured-vs-unconfigured split: this repo has
+    # NO linter/typechecker config (no ruff.toml, no pyproject [tool.ruff], no
+    # eslint/pyright/tsconfig) and a PATH on which no tool resolves. It never
+    # opted in to any check → nothing to enforce → allow. Contrast with
+    # TestStrictGauntlet, where a CONFIGURED-but-missing tool must DENY.
     repo = on_branch("feature/1-x")
     _stage(repo, "pkg/whatever.py", "import os\n")  # would be F401 if ruff ran
     result = subprocess.run(
@@ -323,7 +381,7 @@ def test_reviewer_sep_never_blocks(git_repo: Path) -> None:
         check=True,
         capture_output=True,
     )
-    assert run_hook(REVIEWER_SEP, "git push", cwd=git_repo) == ALLOW
+    assert run_reviewer_sep("git push", git_repo, cursor=False) == ALLOW
 
 
 # ── Cursor beforeShellExecution shape: commit hooks parity ─
@@ -371,7 +429,9 @@ def test_block_no_verify_cursor_shape(on_branch: Callable[[str], Path]) -> None:
 
 # ── red-proof-verify: execute the Tested-RED node at commit time ──────
 # A declared RED node must FAIL at the RED commit (allow). If it PASSES, the
-# test drives no new code → block. If pytest cannot run → degrade to allow.
+# test drives no new code → block. If pytest cannot run (BOOTSTRAP) → block:
+# declaring a pytest node claims pytest works, so a broken runner must be
+# fixed, not skipped (see TestStrictRedProof).
 
 pytest_runner = pytest.mark.skipif(
     subprocess.run(["bash", "-c", "command -v pytest"], capture_output=True).returncode != 0,
@@ -421,25 +481,22 @@ def test_red_verify_no_trailer_allows(on_branch: Callable[[str], Path]) -> None:
     assert run_hook(RED_PROOF_VERIFY, cmd, cwd=repo) == ALLOW
 
 
-def test_red_verify_degrades_when_pytest_absent(on_branch: Callable[[str], Path]) -> None:
-    # With no pytest resolvable (empty PATH, no importable module), the node
-    # cannot run → BOOTSTRAP → degrade to allow, never a false block — even
-    # though the trailer names a node that would otherwise be adjudicated.
+def test_red_verify_blocks_when_pytest_absent(on_branch: Callable[[str], Path]) -> None:
+    # STRICTNESS change (was: degrade to allow). With no pytest resolvable
+    # (restricted PATH, no importable module), the node cannot run → BOOTSTRAP.
+    # Declaring a Tested-RED pytest node claims pytest works; a broken runner
+    # must be fixed, not skipped → DENY, with a message saying to fix the env.
     repo = on_branch("feature/1-x")
     _stage(repo, "tests/test_trivial.py", "def test_trivial():\n    assert True\n")
     cmd = (
         'git commit -m "test: add" -m "Refs #1" '
         '-m "Tested-RED: tests/test_trivial.py::test_trivial"'
     )
-    result = subprocess.run(
-        ["bash", str(RED_PROOF_VERIFY)],
-        input=_payload(cmd),
-        capture_output=True,
-        text=True,
-        cwd=str(repo),
-        env={"PATH": "/usr/bin:/bin", "HOME": str(repo)},
-    )
-    assert result.returncode == ALLOW
+
+    result = _run_restricted(RED_PROOF_VERIFY, cmd, repo)
+
+    assert result.returncode == BLOCK
+    assert "fix" in result.stderr.lower()
 
 
 def test_red_verify_non_commit_allows(on_branch: Callable[[str], Path]) -> None:
@@ -489,3 +546,304 @@ def test_red_proof_green_backstop_allows_passing_node(git_repo: Path) -> None:
         capture_output=True,
     )
     assert run_hook_cursor_shell(RED_PROOF, "git push", cwd=git_repo) == ALLOW
+
+
+# ── reviewer-sep-warn: diff-bound APPROVE artifact gate ───────────────
+# The hook recomputes the hash of the pushed range (BASE..HEAD) and ships only
+# if .review/<hash>.json carries an APPROVE verdict. No upstream → degrade allow.
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=str(repo), check=True, capture_output=True, text=True
+    ).stdout
+
+
+@pytest.fixture()
+def repo_with_upstream(tmp_path: Path) -> Path:
+    """A repo whose feature branch tracks an upstream, with one unpushed commit.
+
+    Mirrors the real workflow: seed is on the upstream; the feature branch adds
+    one commit that the reviewer-sep hook must adjudicate against the merge-base.
+    """
+    remote = tmp_path / "remote.git"
+    work = tmp_path / "work"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True, capture_output=True)
+    subprocess.run(["git", "init", "-q", str(work)], check=True, capture_output=True)
+    for k, v in (("user.email", "t@t.t"), ("user.name", "t"), ("commit.gpgsign", "false"),
+                 ("core.autocrlf", "false")):
+        _git(work, "config", k, v)
+    (work / "README.md").write_text("seed\n")
+    _git(work, "add", "README.md")
+    _git(work, "commit", "-qm", "chore: seed", "-m", "Refs #0")
+    _git(work, "remote", "add", "origin", str(remote))
+    _git(work, "push", "-q", "-u", "origin", "HEAD:main")
+    _git(work, "checkout", "-q", "-b", "feature/1-x")
+    # One unpushed change on the feature branch.
+    (work / "app.py").write_text("def add(a, b):\n    return a + b\n")
+    _git(work, "add", "app.py")
+    _git(work, "commit", "-qm", "feat: add", "-m", "Refs #1", "--no-verify")
+    _git(work, "branch", "--set-upstream-to=origin/main", "feature/1-x")
+    return work
+
+
+def _range_hash(repo: Path) -> str:
+    """Compute the push-time range hash the hook will compute (BASE..HEAD)."""
+    base = _git(repo, "merge-base", "@{upstream}", "HEAD").strip()
+    diff = subprocess.run(
+        ["git", "diff", "--no-color", "--no-ext-diff", "-M", f"{base}..HEAD",
+         "--", ".", ":(exclude).review/"],
+        cwd=str(repo), check=True, capture_output=True, text=True,
+    ).stdout
+    normalized = diff.replace("\r\n", "\n")
+    return hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def _write_artifact(repo: Path, diff_hash: str, verdict: str) -> None:
+    review = repo / ".review"
+    review.mkdir(exist_ok=True)
+    (review / f"{diff_hash}.json").write_text(
+        json.dumps({"schema_version": 1, "diff_hash": diff_hash, "verdict": verdict})
+    )
+
+
+def test_reviewer_sep_blocks_when_no_artifact(repo_with_upstream: Path) -> None:
+    # No .review/ artifact for the pushed diff → blocked on the Cursor shape.
+    assert run_reviewer_sep("git push", repo_with_upstream) == BLOCK
+
+
+def test_reviewer_sep_allows_with_matching_approve(repo_with_upstream: Path) -> None:
+    _write_artifact(repo_with_upstream, _range_hash(repo_with_upstream), "APPROVE")
+    assert run_reviewer_sep("git push", repo_with_upstream) == ALLOW
+
+
+def test_reviewer_sep_blocks_request_changes(repo_with_upstream: Path) -> None:
+    _write_artifact(repo_with_upstream, _range_hash(repo_with_upstream), "REQUEST_CHANGES")
+    assert run_reviewer_sep("git push", repo_with_upstream) == BLOCK
+
+
+def test_reviewer_sep_blocks_stale_artifact_for_other_diff(repo_with_upstream: Path) -> None:
+    # An APPROVE bound to a DIFFERENT hash does not satisfy this diff.
+    _write_artifact(repo_with_upstream, "0" * 64, "APPROVE")
+    assert run_reviewer_sep("git push", repo_with_upstream) == BLOCK
+
+
+def test_reviewer_sep_no_upstream_degrades_allow(git_repo: Path) -> None:
+    # No tracked upstream → cannot compute base → degrade to allow (no block).
+    _stage(git_repo, "app.py", "x = 1\n")
+    subprocess.run(
+        ["git", "commit", "-qm", "feat: x", "-m", "Refs #1", "--no-verify"],
+        cwd=str(git_repo), check=True, capture_output=True,
+    )
+    assert run_reviewer_sep("git push", git_repo) == ALLOW
+
+
+def test_reviewer_sep_non_push_allows(repo_with_upstream: Path) -> None:
+    assert run_reviewer_sep("ls -la", repo_with_upstream) == ALLOW
+
+
+def test_reviewer_sep_chained_push_not_bypassed(repo_with_upstream: Path) -> None:
+    # Boundary-aware gate: a push chained after another command must still be
+    # adjudicated (was bypassed by the ^-anchored grep). No artifact → block.
+    assert run_reviewer_sep("cd /tmp && git push", repo_with_upstream) == BLOCK
+
+
+# ── STRICTNESS SPEC: commit-gauntlet must fail closed ─────────────────
+# A repo that CONFIGURES a linter/typechecker (config file present) has opted
+# in to that gate. If the binary is then missing from PATH while staged files
+# match its extensions, silently skipping the check is fail-open — the hook
+# must DENY and name the tool. A repo with NO config never opted in and still
+# allows (test_gauntlet_unconfigured_repo_allows_when_tools_absent above).
+
+
+def _fake_tsc(repo: Path, output: str) -> None:
+    """Install a fake node_modules/.bin/tsc that prints `output` and exits 1.
+
+    The gauntlet resolves tsc through the project-local node_modules/.bin
+    before PATH, so this works under the restricted-PATH harness too."""
+    bin_dir = repo / "node_modules" / ".bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    fake = bin_dir / "tsc"
+    fake.write_text(f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(output)}\nexit 1\n")
+    fake.chmod(0o755)
+
+
+class TestStrictGauntlet:
+    def test_configured_linter_missing_blocks_matching_staged_files(
+        self, on_branch: Callable[[str], Path]
+    ) -> None:
+        # ruff is CONFIGURED (ruff.toml on disk) but not on the restricted
+        # PATH, and a .py file is staged → deny, naming the tool and saying it
+        # must be installed.
+        repo = on_branch("feature/1-x")
+        (repo / "ruff.toml").write_text('[lint]\nselect = ["F"]\n')
+        _stage(repo, "pkg/mod.py", "x = 1\n")
+
+        result = _run_restricted(COMMIT_GAUNTLET, 'git commit -m "feat: x" -m "Refs #1"', repo)
+
+        assert result.returncode == BLOCK
+        assert "ruff" in result.stderr.lower()
+        assert "install" in result.stderr.lower()
+
+    def test_configured_linter_missing_allows_non_matching_staged_files(
+        self, on_branch: Callable[[str], Path]
+    ) -> None:
+        # Same configured-but-missing ruff, but only a .md file is staged —
+        # ruff would never check it, so there is nothing to enforce → allow.
+        repo = on_branch("feature/1-x")
+        (repo / "ruff.toml").write_text('[lint]\nselect = ["F"]\n')
+        _stage(repo, "docs/notes.md", "# notes\n")
+
+        result = _run_restricted(COMMIT_GAUNTLET, 'git commit -m "feat: x" -m "Refs #1"', repo)
+
+        assert result.returncode == ALLOW
+
+    def test_configured_typechecker_missing_blocks_matching_staged_files(
+        self, on_branch: Callable[[str], Path]
+    ) -> None:
+        # pyright is CONFIGURED (pyrightconfig.json) but not on the restricted
+        # PATH, and a .py file is staged → deny, naming the tool.
+        repo = on_branch("feature/1-x")
+        (repo / "pyrightconfig.json").write_text("{}\n")
+        _stage(repo, "pkg/mod.py", "x = 1\n")
+
+        result = _run_restricted(COMMIT_GAUNTLET, 'git commit -m "feat: x" -m "Refs #1"', repo)
+
+        assert result.returncode == BLOCK
+        assert "pyright" in result.stderr.lower()
+        assert "install" in result.stderr.lower()
+
+    def test_red_commit_still_skips_missing_typechecker(
+        self, on_branch: Callable[[str], Path]
+    ) -> None:
+        # The RED carve-out stands: a Tested-RED commit skips typecheck
+        # entirely, so a configured-but-missing typechecker cannot block it.
+        repo = on_branch("feature/1-x")
+        (repo / "pyrightconfig.json").write_text("{}\n")
+        _stage(repo, "tests/test_x.py", "def test_x():\n    assert True\n")
+        cmd = (
+            'git commit -m "test: add" -m "Refs #1" '
+            '-m "Tested-RED: tests/test_x.py::test_x"'
+        )
+
+        result = _run_restricted(COMMIT_GAUNTLET, cmd, repo)
+
+        assert result.returncode == ALLOW
+
+    def test_red_commit_still_blocked_by_missing_configured_linter(
+        self, on_branch: Callable[[str], Path]
+    ) -> None:
+        # Lint strictness applies even to RED commits — only typecheck is
+        # carved out. Configured-but-missing ruff + staged .py → deny.
+        repo = on_branch("feature/1-x")
+        (repo / "ruff.toml").write_text('[lint]\nselect = ["F"]\n')
+        _stage(repo, "tests/test_x.py", "def test_x():\n    assert True\n")
+        cmd = (
+            'git commit -m "test: add" -m "Refs #1" '
+            '-m "Tested-RED: tests/test_x.py::test_x"'
+        )
+
+        result = _run_restricted(COMMIT_GAUNTLET, cmd, repo)
+
+        assert result.returncode == BLOCK
+        assert "ruff" in result.stderr.lower()
+
+    def test_type_error_with_cannot_find_wording_blocks(
+        self, on_branch: Callable[[str], Path]
+    ) -> None:
+        # Regression (fail-open): tsc's `error TS2304: Cannot find name 'x'`
+        # contains "cannot find", which the bootstrap classifier used to match
+        # — misclassifying a GENUINE type error as a bootstrap failure and
+        # degrading to warn + SKIP. A real type error must DENY.
+        repo = on_branch("feature/1-x")
+        (repo / "tsconfig.json").write_text("{}\n")
+        _fake_tsc(repo, "src/app.ts(1,1): error TS2304: Cannot find name 'x'.")
+        _stage(repo, "src/app.ts", "x;\n")
+
+        result = _run_restricted(COMMIT_GAUNTLET, 'git commit -m "feat: x" -m "Refs #1"', repo)
+
+        assert result.returncode == BLOCK
+        assert "TS2304" in result.stderr
+
+    def test_true_bootstrap_failure_still_skips_typecheck(
+        self, on_branch: Callable[[str], Path]
+    ) -> None:
+        # The bootstrap carve-out survives the tightened classifier: a
+        # typechecker that cannot START (ENOENT on its cache, not a type
+        # error) still degrades to warn + SKIP → allow.
+        repo = on_branch("feature/1-x")
+        (repo / "tsconfig.json").write_text("{}\n")
+        _fake_tsc(repo, "Error: ENOENT: no such file or directory, open '/x/.cache/tsc'")
+        _stage(repo, "src/app.ts", "const a = 1;\n")
+
+        result = _run_restricted(COMMIT_GAUNTLET, 'git commit -m "feat: x" -m "Refs #1"', repo)
+
+        assert result.returncode == ALLOW
+        assert "skip" in result.stderr.lower()
+
+    @ruff
+    def test_budget_trip_blocks_with_split_hint(self, on_branch: Callable[[str], Path]) -> None:
+        # AI_TOOLKIT_GAUNTLET_BUDGET (default 55) exists for testability and is
+        # NOT a bypass vector: raising it only INCREASES how much gets checked
+        # before the trip; lowering it only causes MORE blocking — neither
+        # direction fails open. Budget 0 trips instantly: with 2+ lintable
+        # files staged and a configured+installed linter, the trip must DENY
+        # (was: warn + skip remaining + allow) and advise splitting the commit.
+        repo = on_branch("feature/1-x")
+        _stage(repo, "ruff.toml", '[lint]\nselect = ["F"]\n')
+        _stage(repo, "pkg/a.py", "x = 1\n")
+        _stage(repo, "pkg/b.py", "y = 2\n")
+        env = {**os.environ, "AI_TOOLKIT_GAUNTLET_BUDGET": "0"}
+        env.pop("CURSOR_PROJECT_DIR", None)  # must not override temp-repo resolution
+
+        result = subprocess.run(
+            ["bash", str(COMMIT_GAUNTLET)],
+            input=_payload('git commit -m "feat: x" -m "Refs #1"'),
+            capture_output=True,
+            text=True,
+            cwd=str(repo),
+            env=env,
+        )
+
+        assert result.returncode == BLOCK
+        assert "split" in result.stderr.lower()
+
+
+# ── STRICTNESS SPEC: red-proof-warn GREEN backstop on BOOTSTRAP ───────
+# At push, a Tested-RED node that cannot run (BOOTSTRAP) now goes through
+# ship_gate_enforce instead of warn+skip: hard deny on Cursor payloads,
+# advisory elsewhere. PASS/FAIL backstop behavior is unchanged (pinned by
+# test_red_proof_green_backstop_* above).
+
+
+def _commit_with_red_trailer(repo: Path) -> None:
+    _stage(repo, "tests/test_pending.py", "def test_pending():\n    assert True\n")
+    subprocess.run(
+        ["git", "commit", "-qm", "test: add", "-m", "Refs #1",
+         "-m", "Tested-RED: tests/test_pending.py::test_pending", "--no-verify"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+    )
+
+
+class TestStrictRedProof:
+    def test_green_backstop_bootstrap_blocks_on_cursor_push(self, git_repo: Path) -> None:
+        # STRICTNESS change (was: warn + skip). The restricted PATH has no
+        # pytest, so the declared node returns BOOTSTRAP — on a Cursor
+        # beforeShellExecution payload ship_gate_enforce hard-denies.
+        _commit_with_red_trailer(git_repo)
+
+        result = _run_restricted(RED_PROOF, "git push", git_repo, cursor=True)
+
+        assert result.returncode == BLOCK
+
+    def test_green_backstop_bootstrap_advisory_on_claude_push(self, git_repo: Path) -> None:
+        # On non-Cursor payloads ship_gate_enforce stays advisory: the
+        # BOOTSTRAP node is reported on stderr but the push is allowed.
+        _commit_with_red_trailer(git_repo)
+
+        result = _run_restricted(RED_PROOF, "git push", git_repo, cursor=False)
+
+        assert result.returncode == ALLOW
+        assert result.stderr != ""

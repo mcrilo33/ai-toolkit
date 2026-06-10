@@ -16,12 +16,25 @@
 #     expected state of red-before-green; blocking it would contradict the
 #     cage's own TDD workflow. Lint still runs on RED commits.
 #
-# Degrades gracefully: if no linter/typechecker is configured, the tool is not
-# installed, or the typechecker fails to BOOTSTRAP (e.g. pyright cannot write
-# its cache in a sandbox), the relevant check is SKIPPED — never a failure.
+# Fail-closed contract (configured vs unconfigured):
+#   • UNCONFIGURED repo (no linter/typechecker detected): nothing was opted in
+#     to → allow. Degrading here is correct, not fail-open.
+#   • CONFIGURED tool whose binary cannot resolve (neither a local
+#     node_modules/.bin nor PATH) while staged files match its extensions:
+#     DENY. The repo opted in to that gate; silently skipping it would be
+#     fail-open. (RED commits still skip the typechecker entirely, including
+#     this missing-binary check — lint strictness applies even to RED.)
+#   • TIME BUDGET (AI_TOOLKIT_GAUNTLET_BUDGET, default 55s): if it trips
+#     before all staged files are checked, DENY and advise splitting the
+#     commit. An oversized commit that cannot be fully verified must not ship
+#     unchecked.
+#   • A typechecker that fails to BOOTSTRAP (e.g. pyright cannot write its
+#     cache in a sandbox) still degrades to SKIP — the binary exists; the
+#     sandbox, not the repo, is at fault.
 #
-# Exit 2 = block (real lint/type failure on changed code)
-# Exit 0 = allow (pass, no staged files, no tools, RED carve-out, non-commit)
+# Exit 2 = block (lint/type failure, configured-but-missing tool, budget trip)
+# Exit 0 = allow (pass, no staged files, unconfigured repo, RED carve-out,
+#                 non-commit)
 set -euo pipefail
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,7 +46,8 @@ COMMAND=$(get_shell_command "$INPUT")
 [ -z "$COMMAND" ] && exit 0
 
 # Only act on git commit commands.
-echo "$COMMAND" | grep -qE '^\s*git\s+commit\b' || exit 0
+# Boundary-aware: chained/prefixed forms (`cd x && git commit`) must not bypass.
+is_git_commit "$COMMAND" || exit 0
 
 # Resolve the repo from the payload (do not trust cwd — empty on Cursor's
 # beforeShellExecution). Falls back to walking up from cwd.
@@ -104,31 +118,39 @@ lint_filter() {
     }'
 }
 
+# A tool the repo CONFIGURED is missing while a staged file matches its
+# extensions — fail closed: silently skipping an opted-in gate is fail-open.
+missing_tool_deny() {
+  local kind="$1" tool="$2" file="$3"
+  deny "commit-gauntlet blocked the commit — $kind '$tool' is configured for this repo but its binary cannot be found. Staged file '$file' is in its scope, so the check cannot run.
+
+$tool must be installed (or its configuration removed) before this commit can proceed."
+}
+
 run_lint() {
   local file="$1" abs="$2" ext="$3"
   local raw="" filtered=""
   case "$LINTER" in
     ruff)
-      command -v ruff &>/dev/null || return 0
-      case "$ext" in py|pyi)
-        raw=$(ruff check "$abs" 2>&1) || true
-      ;; *) return 0 ;; esac
+      case "$ext" in py|pyi) ;; *) return 0 ;; esac
+      command -v ruff &>/dev/null || missing_tool_deny "linter" "ruff" "$file"
+      raw=$(ruff check "$abs" 2>&1) || true
       ;;
     eslint)
+      case "$ext" in ts|tsx|js|jsx) ;; *) return 0 ;; esac
       local bin="$PROJECT_ROOT/node_modules/.bin/eslint"
       command -v eslint &>/dev/null && bin="eslint"
-      { [ -x "$bin" ] || command -v eslint &>/dev/null; } || return 0
-      case "$ext" in ts|tsx|js|jsx)
-        raw=$("$bin" --no-color "$abs" 2>&1) || true
-      ;; *) return 0 ;; esac
+      { [ -x "$bin" ] || command -v eslint &>/dev/null; } \
+        || missing_tool_deny "linter" "eslint" "$file"
+      raw=$("$bin" --no-color "$abs" 2>&1) || true
       ;;
     biome)
+      case "$ext" in ts|tsx|js|jsx) ;; *) return 0 ;; esac
       local bin="$PROJECT_ROOT/node_modules/.bin/biome"
       command -v biome &>/dev/null && bin="biome"
-      { [ -x "$bin" ] || command -v biome &>/dev/null; } || return 0
-      case "$ext" in ts|tsx|js|jsx)
-        raw=$("$bin" lint "$abs" 2>&1) || true
-      ;; *) return 0 ;; esac
+      { [ -x "$bin" ] || command -v biome &>/dev/null; } \
+        || missing_tool_deny "linter" "biome" "$file"
+      raw=$("$bin" lint "$abs" 2>&1) || true
       ;;
     *) return 0 ;;
   esac
@@ -142,8 +164,17 @@ run_lint() {
 
 # A typechecker invocation that failed to start (rather than finding type
 # errors) should degrade to SKIP. Detect common bootstrap/startup failures.
+#
+# Genuine TYPE ERRORS reuse the same "cannot find" wording as bootstrap
+# failures (tsc `error TS2304: Cannot find name 'x'`, `TS2307: Cannot find
+# module './y'`, mypy `Cannot find implementation or library stub`). Those
+# lines are stripped BEFORE classifying — treating them as bootstrap would
+# skip the gate (fail-open) exactly when it must deny. Only the surviving
+# lines may mark the run as a bootstrap failure.
 typecheck_bootstrap_failed() {
-  echo "$1" | grep -qiE 'cannot (find|open|write)|permission denied|EACCES|ENOENT|cache|bootstrap|failed to (start|download|install)|no such file or directory'
+  printf '%s\n' "$1" \
+    | grep -viE 'error TS[0-9]+|cannot find (name|module|implementation)' \
+    | grep -qiE 'cannot (find|open|write)|permission denied|EACCES|ENOENT|command not found|config file not found|cache|bootstrap|failed to (start|download|install)|no such file or directory|unrecognized arguments'
 }
 
 run_typecheck() {
@@ -152,20 +183,21 @@ run_typecheck() {
   local raw="" rc=0
   case "$TYPECHECKER" in
     pyright)
-      command -v pyright &>/dev/null || return 0
       case "$ext" in py|pyi) ;; *) return 0 ;; esac
+      command -v pyright &>/dev/null || missing_tool_deny "typechecker" "pyright" "$file"
       raw=$(pyright "$abs" 2>&1) && rc=0 || rc=$?
       ;;
     mypy)
-      command -v mypy &>/dev/null || return 0
       case "$ext" in py|pyi) ;; *) return 0 ;; esac
+      command -v mypy &>/dev/null || missing_tool_deny "typechecker" "mypy" "$file"
       raw=$(mypy "$abs" 2>&1) && rc=0 || rc=$?
       ;;
     tsc)
+      case "$ext" in ts|tsx) ;; *) return 0 ;; esac
       local bin="$PROJECT_ROOT/node_modules/.bin/tsc"
       command -v tsc &>/dev/null && bin="tsc"
-      { [ -x "$bin" ] || command -v tsc &>/dev/null; } || return 0
-      case "$ext" in ts|tsx) ;; *) return 0 ;; esac
+      { [ -x "$bin" ] || command -v tsc &>/dev/null; } \
+        || missing_tool_deny "typechecker" "tsc" "$file"
       raw=$("$bin" --noEmit --pretty false "$abs" 2>&1) && rc=0 || rc=$?
       ;;
     *) return 0 ;;
@@ -188,13 +220,15 @@ run_checks() {
   run_typecheck "$file" "$abs" "$ext"
 }
 
-# Run all checks under a wall-clock budget. If the budget itself trips,
-# warn (do not block) so a slow machine can never permanently wedge commits.
+# Run all checks under a wall-clock budget (AI_TOOLKIT_GAUNTLET_BUDGET, default
+# 55s). If the budget trips before every staged file is checked, DENY: a commit
+# too large to verify must not ship unchecked — split it instead.
+BUDGET="${AI_TOOLKIT_GAUNTLET_BUDGET:-55}"
 SECONDS=0
 TIMED_OUT=0
 while IFS= read -r file; do
   [ -z "$file" ] && continue
-  if [ "$SECONDS" -ge 55 ]; then
+  if [ "$SECONDS" -ge "$BUDGET" ]; then
     TIMED_OUT=1
     break
   fi
@@ -202,7 +236,9 @@ while IFS= read -r file; do
 done <<< "$STAGED"
 
 if [ "$TIMED_OUT" -eq 1 ]; then
-  warn "commit-gauntlet: time budget exceeded — skipping remaining staged files (commit allowed)."
+  deny "commit-gauntlet blocked the commit — time budget (${BUDGET}s) exceeded before all staged files could be checked.
+
+This commit is too large to verify within the budget. Split the commit into smaller, independently verifiable commits and retry."
 fi
 
 if [ -n "$ISSUES" ]; then

@@ -13,8 +13,10 @@
 #      (red-proof-verify) proved the node FAILED before implementation; here we
 #      prove the SAME node now PASSES with the implementation in place. A node
 #      that still fails means the shipped code does not satisfy the test it
-#      claims to. Bootstrap failures (no runner / pytest cannot start) DEGRADE
-#      to a skip — never a false block.
+#      claims to. Bootstrap failures (no runner / pytest cannot start) are
+#      enforced through ship_gate_enforce like any other unmet condition — a
+#      declared node that cannot be executed at ship time is unproven, not
+#      excused.
 #
 # Platform behavior (see ship_gate_enforce in lib/utils.sh):
 #   • Cursor (beforeShellExecution): hard DENY (exit 2). The push/PR is blocked
@@ -35,7 +37,8 @@ COMMAND=$(get_shell_command "$INPUT")
 [ -z "$COMMAND" ] && exit 0
 
 # Only act on shipping-gate commands: git push, or gh pr create/merge.
-echo "$COMMAND" | grep -qE '^\s*(git\s+push\b|gh\s+pr\s+(create|merge)\b)' || exit 0
+# Boundary-aware: chained/prefixed forms (`cd x && git push`) must not bypass.
+is_git_push_or_pr "$COMMAND" || exit 0
 
 PROJECT_ROOT=$(project_root_from_payload "$INPUT")
 
@@ -97,8 +100,10 @@ fi
 # ── GREEN backstop: every declared Tested-RED node must PASS now ─────
 # Run each unique node against the current tree. A node that still FAILS means
 # the shipped implementation does not satisfy the test it claims to drive.
-# BOOTSTRAP (cannot run) degrades to skip — never a false block.
+# BOOTSTRAP (cannot run) is an unproven node — routed through ship_gate_enforce
+# (hard deny on Cursor, advisory elsewhere) instead of being skipped.
 FAILING_NODES=""
+BOOTSTRAP_NODES=""
 SEEN=""
 while IFS= read -r node; do
   [ -z "$node" ] && continue
@@ -107,11 +112,18 @@ while IFS= read -r node; do
   case "$(run_pytest_node "$PROJECT_ROOT" "$node")" in
     PASS) ;;
     FAIL) FAILING_NODES="$FAILING_NODES\n  • $node" ;;
-    BOOTSTRAP)
-      warn "red-proof: could not run '$node' (no pytest runner or it failed to start) — GREEN backstop SKIPPED for this node."
-      ;;
+    BOOTSTRAP) BOOTSTRAP_NODES="$BOOTSTRAP_NODES\n  • $node" ;;
   esac
 done <<< "$RED_NODES"
+
+if [ -n "$BOOTSTRAP_NODES" ]; then
+  ship_gate_enforce "$INPUT" "red-proof (green backstop): these Tested-RED nodes could not be RUN at push —
+no pytest runner, or it failed to start — so the GREEN state is unproven:$(echo -e "$BOOTSTRAP_NODES")
+
+A declared Tested-RED node claims pytest works; fix the environment (install
+pytest / repair the runner) so the node can be executed, then push again. On
+Cursor the push is BLOCKED until every Tested-RED node can run and passes."
+fi
 
 if [ -n "$FAILING_NODES" ]; then
   ship_gate_enforce "$INPUT" "red-proof (green backstop): these Tested-RED nodes still FAIL at push —
