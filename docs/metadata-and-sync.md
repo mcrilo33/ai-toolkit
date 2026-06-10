@@ -101,7 +101,64 @@ shared/<category>/*.md           ─┤  ─────────────
 ./scripts/sync-to-repo.sh <repo-path> copilot    # Copilot only
 ./scripts/sync-to-repo.sh <repo-path> cursor     # Cursor only
 ./scripts/sync-to-repo.sh <repo-path> claude     # Claude only
+./scripts/sync-to-repo.sh <repo-path> cursor --dry-run   # Preview only
 ```
+
+## Sync manifest and GC
+
+Every sync records the files it writes into `.ai-toolkit-manifest.json` at the
+target root, one sorted list per tool (`copilot`, `cursor`, `claude`) plus the
+toolkit git revision. On the next sync, `scripts/sync_manifest.py` compares the
+old list with the new one and deletes stale files — paths a previous sync wrote
+but the current one no longer produces (e.g. a rule removed from `shared/`).
+
+Safety guarantees:
+
+- **Per-tool scoping** — finalizing one tool never touches another tool's list.
+- **User files are never touched** — only paths listed in the manifest are
+  eligible for deletion; anything else in `.cursor/`, `.github/`, or `.claude/`
+  is left alone.
+- **Protected paths** — `.cursor/hooks.json`, `.claude/settings.json` (owned by
+  the hook reconciler), and `*.bak` backups are never deleted.
+- **Path validation** — absolute paths and `..` traversal segments are rejected,
+  both in recorded paths and in old manifest entries.
+- A corrupt or missing manifest is treated as a first run: nothing is deleted.
+
+## --dry-run
+
+`--dry-run` previews a sync without touching the target: each write is printed
+as `[dry-run] would write <path>`, stale files are reported as would-delete,
+and nothing is created — no directories, no configs, and no manifest.
+
+## Cursor plugin build
+
+`build-cursor-plugin.sh` packages the same Cursor emission (identical metadata
+fields and frontmatter) as a distributable Cursor plugin. It is additive — the
+existing `.cursor/` sync above is unchanged.
+
+```bash
+./scripts/build-cursor-plugin.sh                 # Build into dist/cursor-plugin
+./scripts/build-cursor-plugin.sh /tmp/my-plugin  # Custom output directory
+```
+
+Output layout:
+
+```text
+dist/cursor-plugin/
+├── .cursor-plugin/plugin.json    # Manifest (version from the VERSION file)
+├── rules/<name>.mdc              # Same content as the .cursor/rules sync output
+├── skills/<name>/SKILL.md        # Same content as .cursor/skills, + subdirs
+├── agents/<name>.md              # Same content as the .cursor/agents sync output
+├── hooks/hooks.json              # Hook wiring with plugin-relative script paths
+├── scripts/<hook>.sh             # All shared/hooks/*.sh (executable)
+├── scripts/lib/utils.sh          # Shared hook utilities
+└── README.md                     # Generated plugin README
+```
+
+Hook commands in `hooks/hooks.json` point at `./scripts/<hook>.sh` (plugin-relative)
+instead of `.cursor/hooks/scripts/<hook>.sh`, via the optional
+`--script-prefix` argument of `hooks_generator.py`. The build is a clean rebuild
+(`rm -rf` of the output dir), so repeated runs are byte-identical.
 
 ## Example: end-to-end for a skill
 
