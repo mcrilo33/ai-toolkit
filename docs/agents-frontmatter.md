@@ -32,6 +32,51 @@ Correspondence between `metadata.yml` fields and what each platform expects.
 | `readonly` | — | ✅ Optional (default `false`) | — | `boolean` | Restricts write permissions. |
 | `is_background` | — | ✅ Optional (default `false`) | — | `boolean` | Background execution. |
 
+## Per-agent MCP servers (review-stamp)
+
+The `code-review` agent declares the `review-stamp` MCP server (the signed
+review-approval authenticator — see [review-stamp.md](./review-stamp.md))
+under its `copilot:` and `claude:` override blocks in
+`shared/agents/metadata.yml`:
+
+```yaml
+claude:
+  mcpServers:
+    review-stamp:
+      type: stdio
+      command: "./.ai-toolkit/mcp/review-stamp/run.sh"
+copilot:
+  mcp-servers:
+    review-stamp:
+      command: "./.ai-toolkit/mcp/review-stamp/run.sh"
+```
+
+The field name differs per platform: Claude Code's subagent frontmatter expects
+the literal key `mcpServers` (inline stdio definition, scoped to the subagent —
+connected at start, disconnected at finish), while Copilot uses `mcp-servers`.
+Both names are whitelisted in `scripts/sync-to-repo.sh`, and the sync emits
+each key as-is into the generated frontmatter. Wiring the server only into
+`code-review` gives Claude and Copilot **positive control**: no other agent has
+the `approve_review` tool.
+
+The command path is repo-relative and resolves because the sync installs the
+server itself into every target at `.ai-toolkit/mcp/review-stamp/` (source:
+`mcp/review-stamp/` at the toolkit repo root). Both files are tracked in the
+sync manifest, so removal from the toolkit garbage-collects them downstream.
+
+> [!NOTE]
+> Claude Code has known issues initializing MCP connections for custom
+> subagents spawned via the Task tool (anthropic/claude-code#24841 and
+> duplicates). If `approve_review` is unavailable inside the subagent, the
+> push gate's signature fallback still warns rather than silently passing.
+
+**Cursor is deliberately excluded.** Cursor agent frontmatter has no MCP field
+(MCP servers are workspace-global), and Cursor's `readonly` mode blocks MCP
+access entirely — so `code-review` is not marked readonly on Cursor either.
+Cursor enforcement comes instead from the `beforeMCPExecution` review-window
+guard plus signature verification at push (see
+[review-stamp.md](./review-stamp.md)).
+
 ## Handoffs
 
 Handoffs enable sequential chaining between agents. After an agent completes,
@@ -83,6 +128,55 @@ debug → code-review
 # Security audit (manual)
 security-reviewer → debug → code-review
 ```
+
+## Model and effort assignment
+
+Each agent is matched to a model and effort level by **role type**, following the
+"strong models for leads/reviewers, cheaper models for mechanical builders"
+pattern. Reasoning-heavy roles whose output gates everything downstream get
+`opus` + `high`; deliberately minimal or mechanical roles get `sonnet`/`haiku` at
+a lower effort.
+
+| Agent | Model | Effort | Rationale |
+| ----- | ----- | ------ | --------- |
+| `architect` | `claude-fable-5` | `xhigh` | System design needs the strongest reasoning |
+| `planner` | `claude-fable-5` | `xhigh` | Decomposition quality gates all downstream work |
+| `code-review` | `claude-fable-5` | `xhigh` | Catching subtle bugs needs strong reasoning |
+| `security-reviewer` | `claude-fable-5` | `xhigh` | Highest stakes; assumes hostile code |
+| `debug` | `claude-fable-5` | `xhigh` | Root-cause investigation is hard |
+| `refactor` | `claude-fable-5` | `high` | Wide but mechanical; needs care, not genius |
+| `tdd-red` | `claude-fable-5` | `high` | Behaviour specification, moderate reasoning |
+| `tdd-green` | `claude-sonnet-4-6` | `low` | Deliberately minimal — over-thinking is a bug |
+| `tdd-refactor` | `claude-fable-5` | `high` | Quality pass with tests already green |
+| `devops` | `claude-fable-5` | `high` | Careful but bounded |
+| `documentation` | `claude-sonnet-4-6` | `low` | Cheapest; reads code, writes prose |
+
+These are declared **only under the `claude:` override block** in
+`shared/agents/metadata.yml`. Full model IDs (`claude-fable-5`,
+`claude-sonnet-4-6`) and the `effort` field are Claude-specific — Cursor's
+`model` accepts only `inherit`/`fast`/model-id, and `effort` is not a Cursor or
+Copilot field. Scoping them to `claude:` keeps invalid values out of the other
+platforms' frontmatter. The values are a tunable policy choice; adjust them per
+repository as needed.
+
+## Preloaded skills (Claude-scoped)
+
+The `skills` field injects the full content of each listed skill into the
+subagent's context at startup, giving it domain knowledge without discovery
+overhead. Like `model`/`effort`, it is declared **only under the `claude:`
+override block** — neither Copilot nor Cursor supports the field.
+
+| Agent | Preloaded skills | Rationale |
+| ----- | ---------------- | --------- |
+| `code-review` | `verification-loop`, `security-review` | Quality-gate pipeline + security checklist guide the review |
+| `planner` | `context-map`, `brainstorming` | Blast-radius analysis and spec refinement shape the plan |
+| `tdd-red` | `tdd-workflow`, `generate-tests` | Red-phase rules + test conventions |
+| `tdd-green` | `tdd-workflow` | Minimal-implementation discipline |
+| `tdd-refactor` | `tdd-workflow` | Refactor-phase rules with tests green |
+| `devops` | `ci-cd-review`, `docker-patterns`, `deployment-patterns` | Pipeline, container, and deployment references |
+
+Preloading controls startup context only — agents can still discover other
+skills at runtime through the Skill tool.
 
 ## Agent-scoped hooks
 

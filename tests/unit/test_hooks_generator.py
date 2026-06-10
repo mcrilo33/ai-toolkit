@@ -104,6 +104,44 @@ def cursor_dedicated_data(cursor_dedicated_meta: Path) -> dict:
 
 
 @pytest.fixture()
+def cursor_mcp_meta(tmp_path: Path) -> Path:
+    """Metadata exercising the Cursor MCP events (review-stamp feature).
+
+    beforeMCPExecution / afterMCPExecution are dedicated events: the matcher
+    is an MCP tool-name filter, never run through the Bash->Shell token
+    translation. ``failClosed: "true"`` must surface as a boolean entry field.
+    """
+    content = textwrap.dedent("""\
+        review-stamp-guard:
+          event: preToolUse
+          matcher: Bash
+          description: "Gate approve_review behind a review window"
+          tier: 1
+          cursor:
+            event: beforeMCPExecution
+            matcher: "approve_review"
+            failClosed: "true"
+
+        mcp-audit:
+          event: postToolUse
+          matcher: Bash
+          description: "Audit MCP tool results"
+          tier: 2
+          cursor:
+            event: afterMCPExecution
+            matcher: "Bash|approve_review"
+    """)
+    p = tmp_path / "metadata.yml"
+    p.write_text(content)
+    return p
+
+
+@pytest.fixture()
+def cursor_mcp_data(cursor_mcp_meta: Path) -> dict:
+    return parse_hooks_metadata(str(cursor_mcp_meta))
+
+
+@pytest.fixture()
 def hooks_data(hooks_meta: Path) -> dict:
     """Parsed hooks metadata."""
     return parse_hooks_metadata(str(hooks_meta))
@@ -298,6 +336,74 @@ class TestCursorDedicatedEvents:
         assert "preToolUse" in result["hooks"]
         assert "postToolUse" in result["hooks"]
         assert "beforeShellExecution" not in result["hooks"]
+
+
+class TestCursorMCPEvents:
+    """Cursor MCP events for the review-stamp guard (beforeMCPExecution/afterMCPExecution).
+
+    NOTE: generate_cursor falls back to ``CURSOR_EVENT_MAP.get(event, event)``,
+    so an unknown event ACCIDENTALLY passes through into a bucket. Deliberate
+    support means map membership (and dedicated-event membership, which drives
+    the matcher passthrough) — assert both, not just the bucket side effect.
+    """
+
+    def test_before_mcp_execution_is_supported_event(self, cursor_mcp_data: dict) -> None:
+        import hooks_generator
+
+        result = generate_cursor(cursor_mcp_data)
+
+        assert "beforeMCPExecution" in hooks_generator.CURSOR_EVENT_MAP
+        assert "beforeMCPExecution" in hooks_generator.CURSOR_DEDICATED_EVENTS
+        assert "beforeMCPExecution" in result["hooks"]
+        assert "preToolUse" not in result["hooks"]
+
+    def test_after_mcp_execution_is_supported_event(self, cursor_mcp_data: dict) -> None:
+        import hooks_generator
+
+        result = generate_cursor(cursor_mcp_data)
+
+        assert "afterMCPExecution" in hooks_generator.CURSOR_EVENT_MAP
+        assert "afterMCPExecution" in hooks_generator.CURSOR_DEDICATED_EVENTS
+        assert "afterMCPExecution" in result["hooks"]
+        assert "postToolUse" not in result["hooks"]
+
+    def test_fail_closed_emitted_only_when_metadata_sets_it(
+        self, cursor_mcp_data: dict
+    ) -> None:
+        """failClosed: "true" in metadata -> boolean true in the entry; absent otherwise."""
+        result = generate_cursor(cursor_mcp_data)
+
+        guard = next(
+            e
+            for e in result["hooks"]["beforeMCPExecution"]
+            if "review-stamp-guard.sh" in e["command"]
+        )
+        audit = next(
+            e
+            for e in result["hooks"]["afterMCPExecution"]
+            if "mcp-audit.sh" in e["command"]
+        )
+        assert guard["failClosed"] is True
+        assert "failClosed" not in audit
+
+    def test_before_mcp_matcher_passes_through_untranslated(
+        self, cursor_mcp_data: dict
+    ) -> None:
+        """MCP-event matchers are tool-name filters — never Bash->Shell translated."""
+        result = generate_cursor(cursor_mcp_data)
+
+        guard = next(
+            e
+            for e in result["hooks"]["beforeMCPExecution"]
+            if "review-stamp-guard.sh" in e["command"]
+        )
+        audit = next(
+            e
+            for e in result["hooks"]["afterMCPExecution"]
+            if "mcp-audit.sh" in e["command"]
+        )
+        assert guard["matcher"] == "approve_review"
+        assert audit["matcher"] == "Bash|approve_review"
 
 
 class TestCursorMatcherTranslation:

@@ -158,7 +158,7 @@ red-proof-warn:
 reviewer-sep-warn:
   event: preToolUse
   matcher: Bash
-  description: "Warn on push when HEAD-range commits lack a Reviewed-by trailer (advisory only)"
+  description: "On push: verify an APPROVE review-evidence artifact bound to the pushed diff hash"
   tier: 2
   claude:
     if: "Bash(git push *)"
@@ -174,3 +174,28 @@ delegation-gate-warn:
   cursor:
     event: beforeShellExecution
     matcher: "git( +-[^ ]+| +-C +[^ ]+)* +push( |$)|gh +pr( |$)"
+
+# Review-stamp window hooks (Cursor-only): the event is defined ONLY in the
+# cursor: block, so the generator skips Claude/Copilot (empty canonical event).
+# beforeMCPExecution gates the review-stamp MCP approve_review tool behind a
+# live code-review window; subagentStart/Stop open and close that window.
+
+review-stamp-guard:
+  description: "Gate the review-stamp approve_review MCP tool behind a fresh code-review window"
+  tier: 1
+  cursor:
+    event: beforeMCPExecution
+    matcher: "approve_review"
+    failClosed: "true"
+
+review-window-open:
+  description: "Open the review window (.review/.window) when a code-review subagent starts"
+  tier: 1
+  cursor:
+    event: subagentStart
+
+review-window-close:
+  description: "Close the review window when a code-review subagent stops"
+  tier: 1
+  cursor:
+    event: subagentStop

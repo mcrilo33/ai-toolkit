@@ -109,21 +109,35 @@ After all findings, provide:
 **Key concern:** <one sentence about the biggest risk, or "None">
 ```
 
-## On APPROVE — record the review
+## On verdict — call the `approve_review` tool
 
-You ONLY review; you never commit. When the verdict is **APPROVE**, instruct
-the author to record the review on the next commit by adding a trailer:
+You ONLY review; you never commit. When you reach a verdict, you MUST record it
+by calling the `approve_review` tool from the `review-stamp` MCP server:
 
-```text
-Reviewed-by: code-review
-```
+- On **APPROVE**: `approve_review(verdict: "APPROVE", summary: "<X blockers, Y warnings, Z nits — key concern or 'none'>")`
+- On **REQUEST CHANGES**: `approve_review(verdict: "REQUEST_CHANGES", summary: "<findings summary>")` — the push gate treats any non-APPROVE verdict as a block; the author fixes and re-requests review.
 
-The `reviewer-sep-warn` push hook checks for commits missing this trailer — on
-Cursor it HARD-BLOCKS the push when it is absent (advisory `warn` on
-Claude/Copilot and native git hooks). Note its limitation: the trailer is
-auditable *evidence* that a review happened, but a local hook cannot verify a
-separate agent authored it — do not treat its presence as proof of reviewer
-independence.
+The tool does everything server-side: it stages the changes (`git add -A`),
+computes the diff hash with the same pipeline the push hook uses, and writes a
+signed `.review/<hash>.json` artifact (HMAC-SHA256 over the hash and verdict).
+The `reviewer-sep-warn` push hook recomputes the hash of the pushed range and
+verifies the signature — without a valid signed APPROVE artifact the author
+cannot ship (hard block on Cursor).
+
+**Never compute diff hashes or write `.review/` files via shell.** A hand-written
+artifact carries no valid signature and the push gate will reject it.
+
+### Instruct the author to record the trailer
+
+Ask the author to add a `Reviewed-by: code-review` trailer to the commit and to
+commit the `.review/<hash>.json` artifact alongside the change.
+
+> **Honest ceiling:** the signed artifact proves a review of *exactly this diff*
+> exists with this verdict, and forging one now requires deliberately extracting
+> the signing key (Keychain/env) and hand-rolling an HMAC — no longer a single
+> innocent file write. The same-user ceiling still applies: the author agent
+> runs as the same OS user and *could* do that; only a server-side check fully
+> escapes it. Do not overclaim the artifact as proof of reviewer separation.
 
 ## Guidelines
 

@@ -51,6 +51,8 @@ CURSOR_EVENT_MAP: dict[str, str] = {
     "beforeShellExecution": "beforeShellExecution",
     "afterShellExecution": "afterShellExecution",
     "beforeReadFile": "beforeReadFile",
+    "beforeMCPExecution": "beforeMCPExecution",
+    "afterMCPExecution": "afterMCPExecution",
 }
 
 # Cursor dedicated events whose ``matcher`` is NOT a tool-type name. On
@@ -64,6 +66,10 @@ CURSOR_DEDICATED_EVENTS: frozenset[str] = frozenset(
         "afterShellExecution",
         "afterFileEdit",
         "beforeReadFile",
+        # MCP events: the matcher is an MCP tool-name filter, never run
+        # through the Bash->Shell token translation.
+        "beforeMCPExecution",
+        "afterMCPExecution",
     }
 )
 
@@ -175,15 +181,23 @@ def _ordered_hooks(hooks: dict[str, dict]) -> list[tuple[str, dict]]:
 
 # ── Generator functions ─────────────────────────────────────────────
 
-def _script_ref(hook_name: str, tool: str) -> str:
+def _script_ref(hook_name: str, tool: str, script_prefix: str | None = None) -> str:
     """Return the command string pointing to the hook script.
 
     Cursor project hooks run from the project root and must use a root-relative
     path WITHOUT a leading "./" (".cursor/hooks/..."). The "./.cursor/..." form
     still executes but trips a false-positive warning icon in the Hooks settings
     UI, so the canonical form is emitted instead.
+
+    Args:
+        hook_name: Hook key from metadata.yml (script basename without .sh).
+        tool: Target platform (copilot/cursor/claude).
+        script_prefix: Optional path prefix overriding the per-tool default
+            (used by the plugin build, e.g. "./scripts").
     """
     script = f"{hook_name}.sh"
+    if script_prefix is not None:
+        return f"{script_prefix.rstrip('/')}/{script}"
     refs = {
         "copilot": f"./.github/hooks/scripts/{script}",
         "cursor": f".cursor/hooks/scripts/{script}",
@@ -210,7 +224,7 @@ def _cursor_matcher(matcher: str) -> str:
     return "|".join(tokens)
 
 
-def generate_copilot(hooks: dict[str, dict]) -> dict:
+def generate_copilot(hooks: dict[str, dict], script_prefix: str | None = None) -> dict:
     """Generate Copilot hooks JSON (version 1 format).
 
     Config path: .github/hooks/<name>.json
@@ -227,7 +241,7 @@ def generate_copilot(hooks: dict[str, dict]) -> dict:
 
         entry: dict = {
             "type": "command",
-            "bash": _script_ref(name, "copilot"),
+            "bash": _script_ref(name, "copilot", script_prefix),
             "timeoutSec": int(merged.get("timeout", 30)),
         }
 
@@ -236,7 +250,7 @@ def generate_copilot(hooks: dict[str, dict]) -> dict:
     return {"version": 1, "hooks": config}
 
 
-def generate_cursor(hooks: dict[str, dict]) -> dict:
+def generate_cursor(hooks: dict[str, dict], script_prefix: str | None = None) -> dict:
     """Generate Cursor hooks JSON (version 1 format).
 
     Config path: .cursor/hooks.json
@@ -252,7 +266,7 @@ def generate_cursor(hooks: dict[str, dict]) -> dict:
             continue
 
         entry: dict = {
-            "command": _script_ref(name, "cursor"),
+            "command": _script_ref(name, "cursor", script_prefix),
         }
 
         matcher = merged.get("matcher")
@@ -268,12 +282,17 @@ def generate_cursor(hooks: dict[str, dict]) -> dict:
         if timeout:
             entry["timeout"] = int(timeout)
 
+        # failClosed: "true" in metadata -> boolean true in the entry (used by
+        # fail-closed MCP guards); any other value omits the field.
+        if str(merged.get("failClosed", "")).lower() == "true":
+            entry["failClosed"] = True
+
         config.setdefault(event, []).append(entry)
 
     return {"version": 1, "hooks": config}
 
 
-def generate_claude(hooks: dict[str, dict]) -> dict:
+def generate_claude(hooks: dict[str, dict], script_prefix: str | None = None) -> dict:
     """Generate Claude hooks JSON fragment.
 
     Config path: .claude/settings.json → hooks key
@@ -290,7 +309,7 @@ def generate_claude(hooks: dict[str, dict]) -> dict:
 
         hook_handler: dict = {
             "type": "command",
-            "command": _script_ref(name, "claude"),
+            "command": _script_ref(name, "claude", script_prefix),
         }
 
         if_cond = merged.get("if")
@@ -332,14 +351,16 @@ GENERATORS = {
 
 
 def main() -> None:
-    """CLI: python3 hooks_generator.py <shared-hooks-dir> <target-repo> <tool>
+    """CLI: python3 hooks_generator.py <shared-hooks-dir> <target-repo> <tool> [--script-prefix=<prefix>]
 
     Outputs JSON to stdout. The sync script captures and writes to the
-    appropriate file.
+    appropriate file. The optional ``--script-prefix`` overrides the per-tool
+    script path prefix (used by the plugin build, e.g. ``--script-prefix=./scripts``).
     """
     if len(sys.argv) < 4:
         print(
-            "Usage: hooks_generator.py <shared-hooks-dir> <target-repo> <tool>",
+            "Usage: hooks_generator.py <shared-hooks-dir> <target-repo> <tool> "
+            "[--script-prefix=<prefix>]",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -347,6 +368,14 @@ def main() -> None:
     hooks_dir = sys.argv[1]
     _target_dir = sys.argv[2]  # reserved for future use
     tool = sys.argv[3]
+
+    script_prefix: str | None = None
+    for extra in sys.argv[4:]:
+        if extra.startswith("--script-prefix="):
+            script_prefix = extra.split("=", 1)[1]
+        else:
+            print(f"Unknown argument: {extra}", file=sys.stderr)
+            sys.exit(1)
 
     if tool not in GENERATORS:
         print(f"Unknown tool: {tool}. Use: {', '.join(GENERATORS)}", file=sys.stderr)
@@ -358,7 +387,7 @@ def main() -> None:
         sys.exit(1)
 
     hooks = parse_hooks_metadata(meta_path)
-    result = GENERATORS[tool](hooks)
+    result = GENERATORS[tool](hooks, script_prefix)
     print(json.dumps(result, indent=2))
 
 

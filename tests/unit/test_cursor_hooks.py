@@ -9,6 +9,7 @@ Claude/Copilot (tool_input) shape still works unchanged.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -16,6 +17,7 @@ import pytest
 
 HOOKS_DIR = Path(__file__).resolve().parents[2] / "shared" / "hooks"
 UTILS = HOOKS_DIR / "lib" / "utils.sh"
+WINDOW_OPEN = HOOKS_DIR / "review-window-open.sh"
 SECRETS_SCAN = HOOKS_DIR / "secrets-scan.sh"
 SECRETS_SCAN_REVERT = HOOKS_DIR / "secrets-scan-revert.sh"
 CONFIG_PROTECTION = HOOKS_DIR / "config-protection.sh"
@@ -365,6 +367,26 @@ def _commit_source_no_red(repo: Path) -> None:
     )
 
 
+def _add_upstream_with_change(repo: Path) -> None:
+    """Give the seeded repo a tracked upstream plus one unpushed source commit.
+
+    reviewer-sep needs a resolvable merge-base to compute the diff hash; without
+    an upstream it degrades to allow. This sets origin/main as the base and adds
+    a change that has no review-evidence artifact.
+    """
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=str(repo), check=True, capture_output=True, text=True)
+
+    git("init", "-q", "--bare", str(repo / "remote.git"))
+    git("remote", "add", "origin", str(repo / "remote.git"))
+    git("push", "-q", "-u", "origin", "HEAD:main")
+    git("checkout", "-q", "-b", "feature/1-x")
+    git("branch", "--set-upstream-to=origin/main", "feature/1-x")
+    _stage(repo, "src.py", "def f():\n    return 1\n")
+    git("commit", "-qm", "feat: add", "-m", "Refs #1")
+
+
 class TestShippingGatePromotion:
     def test_red_proof_denies_on_cursor_push(self, git_repo: Path) -> None:
         _commit_source_no_red(git_repo)
@@ -382,12 +404,15 @@ class TestShippingGatePromotion:
         assert rc.returncode == ALLOW
 
     def test_reviewer_sep_denies_on_cursor_push(self, git_repo: Path) -> None:
-        _commit_source_no_red(git_repo)
+        # With a resolvable base and no APPROVE artifact for the pushed diff,
+        # the Cursor shape hard-blocks.
+        _add_upstream_with_change(git_repo)
         rc = _run(REVIEWER_SEP, cursor_shell("git push", git_repo), cwd=git_repo)
         assert rc.returncode == BLOCK
 
     def test_reviewer_sep_advisory_on_claude_push(self, git_repo: Path) -> None:
-        _commit_source_no_red(git_repo)
+        # Same missing-artifact condition, but the Claude shape only warns.
+        _add_upstream_with_change(git_repo)
         rc = _run(REVIEWER_SEP, claude_bash("git push"), cwd=git_repo)
         assert rc.returncode == ALLOW
 
@@ -454,6 +479,97 @@ class TestAfterFileEditHooks:
         rc = _run(CONSOLE_LOG_WARN, payload, cwd=git_repo)
         assert rc.returncode == ALLOW
         assert "print()" not in rc.stderr
+
+
+# ── review-window-open: exact subagent-identity match ─────
+
+
+class TestReviewWindowOpenIdentity:
+    """The window must open on the subagent's IDENTITY, not on the substring
+    "code-review" appearing anywhere in the payload (e.g. inside a planner
+    prompt that says "then spawn code-review")."""
+
+    @staticmethod
+    def _subagent_payload(root: Path, **fields: str) -> str:
+        return json.dumps(
+            {
+                "hook_event_name": "subagentStart",
+                "workspace_roots": [str(root)],
+                **fields,
+            }
+        )
+
+    @staticmethod
+    def _window(root: Path) -> Path:
+        return root / ".review" / ".window"
+
+    def test_code_review_identity_opens_window(self, git_repo: Path) -> None:
+        payload = self._subagent_payload(git_repo, subagent_type="code-review")
+
+        rc = _run(WINDOW_OPEN, payload, cwd=git_repo)
+
+        assert rc.returncode == ALLOW
+        assert self._window(git_repo).is_file()
+
+    def test_planner_prompt_mentioning_code_review_does_not_open(
+        self, git_repo: Path
+    ) -> None:
+        # Identity says planner; the prompt merely MENTIONS code-review.
+        payload = self._subagent_payload(
+            git_repo,
+            subagent_type="planner",
+            prompt="plan the feature, then spawn code-review on the diff",
+        )
+
+        rc = _run(WINDOW_OPEN, payload, cwd=git_repo)
+
+        assert rc.returncode == ALLOW
+        assert not self._window(git_repo).exists()
+
+    def test_agent_field_identity_opens_window(self, git_repo: Path) -> None:
+        payload = self._subagent_payload(git_repo, agent="code-review")
+
+        rc = _run(WINDOW_OPEN, payload, cwd=git_repo)
+
+        assert rc.returncode == ALLOW
+        assert self._window(git_repo).is_file()
+
+    def test_no_identity_field_falls_back_to_substring(self, git_repo: Path) -> None:
+        # Unknown payload shape with no identity field: the historical
+        # substring fallback keeps the hook working.
+        payload = self._subagent_payload(git_repo, description="code-review run")
+
+        rc = _run(WINDOW_OPEN, payload, cwd=git_repo)
+
+        assert rc.returncode == ALLOW
+        assert self._window(git_repo).is_file()
+
+    def test_broken_jq_falls_back_to_substring(
+        self, git_repo: Path, tmp_path: Path
+    ) -> None:
+        # When jq cannot parse the identity (broken/unavailable jq, simulated
+        # by shadowing it with an always-failing stub), the substring grep is
+        # the documented fallback so unknown environments keep working.
+        stub_bin = tmp_path / "stub-bin"
+        stub_bin.mkdir()
+        jq_stub = stub_bin / "jq"
+        jq_stub.write_text("#!/bin/sh\nexit 127\n")
+        jq_stub.chmod(0o755)
+        payload = self._subagent_payload(git_repo, subagent_type="code-review")
+        env = {k: v for k, v in os.environ.items() if k != "CURSOR_PROJECT_DIR"}
+        env["PATH"] = f"{stub_bin}:{env.get('PATH', '/usr/bin:/bin')}"
+
+        rc = subprocess.run(
+            ["bash", str(WINDOW_OPEN)],
+            input=payload,
+            capture_output=True,
+            text=True,
+            cwd=str(git_repo),
+            env=env,
+        )
+
+        assert rc.returncode == ALLOW
+        assert self._window(git_repo).is_file()
 
 
 # ── Cursor matcher regexes must survive `git -C` / global-option forms ──

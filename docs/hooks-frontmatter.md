@@ -32,8 +32,11 @@ All hooks defined in `shared/hooks/metadata.yml`:
 | `quality-gate` | postToolUse | Edit/Write | 1 | Run linter and typechecker on edited files | debug, tdd-green, tdd-refactor, refactor |
 | `console-log-warn` | postToolUse | Edit/Write | 2 | Warn when `console.log`, `print()`, or debug statements are added | debug |
 | `red-proof-warn` | preToolUse | Bash | 2 | Flag pushed commits that add source with no `Tested-RED:` trailer | — |
-| `reviewer-sep-warn` | preToolUse | Bash | 2 | Flag pushed commits with no `Reviewed-by: code-review` trailer | — |
+| `reviewer-sep-warn` | preToolUse | Bash | 2 | On push: verify the signed APPROVE review artifact bound to the pushed diff (see [review-stamp.md](./review-stamp.md)) | — |
 | `delegation-gate-warn` | preToolUse | Bash | 2 | Delegation hints for specialist agents; enforced at the shipping gate | — |
+| `review-stamp-guard` | beforeMCPExecution (Cursor-only) | — | 1 | Deny `approve_review` MCP calls outside an active code-review review-window (fail-closed) | — |
+| `review-window-open` | subagentStart (Cursor-only) | — | 1 | Open the review window (`.review/.window`) when a code-review subagent starts | — |
+| `review-window-close` | subagentStop (Cursor-only) | — | 1 | Close the review window when the code-review subagent stops | — |
 
 The events/matchers above are the **canonical** (Claude/Copilot) wiring. On
 Cursor these hooks are remapped onto **dedicated events** via per-hook `cursor:`
@@ -87,6 +90,17 @@ token (`afterFileEdit`), not a `preToolUse` tool name.
 | `beforeShellExecution` | `command`, `cwd`, `sandbox`, `workspace_roots` | yes | `agent_message` on deny |
 | `afterFileEdit` | `file_path`, `edits[]`, `workspace_roots` | no | none |
 | `beforeReadFile` | `file_path`, `content`, `attachments` | yes (reads only) | `user_message` |
+| `beforeMCPExecution` | `tool_name`, `tool_input`, `url`/`command` (server) | yes | `agent_message` on deny |
+
+`beforeMCPExecution` hooks can set `failClosed: true` so that a hook error
+denies the call instead of allowing it — used by `review-stamp-guard.sh`.
+Note the payload carries **no agent identity**: a guard can gate on state
+(e.g. an active review window) but cannot identify the calling agent.
+
+The `subagentStart` / `subagentStop` events (already in the mapping table
+above) are used by `review-window-open.sh` / `review-window-close.sh` to
+maintain the code-review review-window state file (`.review/.window`,
+30-minute TTL) — see [review-stamp.md](./review-stamp.md).
 
 ## Generated output per platform
 
