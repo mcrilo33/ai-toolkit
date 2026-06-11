@@ -76,7 +76,7 @@
 ### External API Verification
 
 - Verify framework/library API usage against current, authoritative docs before writing code
-- Use Context7 proactively to fetch version-specific docs — don't wait for the user to ask
+- Fetch version-specific docs proactively before coding — don't wait for the user to ask; see `library-research` for the workflow
 - Never assume an API exists, kept its name, or behaves the same across versions
 - Cite the source when a decision relies on external documentation
 
