@@ -4,6 +4,29 @@ Fetch a task and set up a branch for it. This implements the SOURCE step of the 
 
 ## Workflow
 
+### 0. Check workspace isolation (worktree guard)
+
+Before creating a branch or writing any code, check whether this session is in a
+dedicated worktree or the shared main checkout:
+
+```bash
+# Empty output → this IS the main checkout (shared). Non-empty → a linked worktree.
+git rev-parse --git-dir | grep -q '/worktrees/' && echo "worktree" || echo "main checkout"
+```
+
+If this is the **main checkout** and the task will write code, **warn and offer** —
+do not silently proceed:
+
+> You're in the shared main checkout. If another session is also editing here, the
+> staging area, `.review/` artifacts, and commit/push hooks collide. For an
+> isolated task, run `scripts/worktree-new.sh <issue>` and `/source` in the new
+> window. Want me to do that, or proceed here anyway?
+
+Proceed in the main checkout only when the user confirms (e.g. a quick one-off where
+a worktree is overkill) or when no other session is active. In a **worktree
+already**, skip the warning — the worktree creation already made the branch, so go
+straight to anchoring the issue.
+
 ### 1. Identify the task
 
 Determine the task origin. Ask the user if unclear:
