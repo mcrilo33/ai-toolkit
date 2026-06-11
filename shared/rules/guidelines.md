@@ -25,16 +25,15 @@
 ### Autonomy Threshold
 - 1-2 files with clear scope → proceed without confirmation
 - Ambiguous scope or destructive operations → confirm plan first
-- **Delegation thresholds (3+ files → `planner`, 5+ files before push → `code-review`, the TDD agent sequence, and hook signals) are defined in the `agent-orchestration` rule — that rule is binding. Follow them there; do not restate them here.**
+- **When to delegate (the planner/review rubric, mode-aware TDD, and hook signals) is defined in the `agent-orchestration` rule. Follow it there; do not restate it here.**
 
 ### Prohibitions
 - Do not create new files unless explicitly requested or absolutely necessary
 - Do not add new dependencies without asking
 - Do not generate placeholder, stub, or incomplete implementations
-- Do not modify code unrelated to the current task
-- Do not remove or modify existing functionality unless explicitly asked
+- Do not modify, refactor, or remove code unrelated to the task — see `code-quality` (Surgical Changes) for the binding rule
 - Do not make assumptions about missing context — ask instead
-- Do not hallucinate APIs, functions, imports, signatures, or parameters — if unsure one exists, verify it (read the source / docs) before using it
+- Do not hallucinate APIs, functions, imports, signatures, or parameters — verify before use (mechanics in `code-quality` → External API Verification; `library-research` for fetching docs)
 
 ### Tool Unavailability
 - If a task requires a specific tool (MCP server, API, CLI) that is unavailable or inaccessible, **stop immediately**

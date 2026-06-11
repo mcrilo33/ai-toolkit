@@ -1,26 +1,19 @@
-# Agent Orchestration (MANDATORY)
+# Agent Orchestration
 
-## Compliance Rule
+Delegate to specialist agents when a task matches their expertise. Over-delegating
+costs a little time; under-delegating on a complex task is the failure worth avoiding.
+When in doubt, spawn.
 
-Before starting any task, you MUST:
+## Routing Table
 
-1. **Count files** that will be created or modified. If 3+ → spawn `planner`.
-2. **Scan the routing table below.** If ANY row matches your task → spawn that agent. Do NOT do the work inline.
-3. **If you catch yourself implementing a multi-file task without having delegated** → STOP, acknowledge the violation, and correct by spawning the appropriate agent now.
-
-Failure to delegate when the routing table matches is a process error — equivalent to skipping tests or committing secrets.
-
-## When to Spawn Agents
-
-Don't do everything yourself. Delegate to specialist agents when the task matches their expertise.
-
-### Routing Table
+The single source of truth for who handles what. Scan it before starting a task; if a
+row matches, spawn that agent instead of doing the work inline.
 
 | Situation | Agent | Trigger signals |
 | --------- | ----- | --------------- |
-| Complex multi-file feature | `planner` | "plan how to", "break this down", 3+ files, DEFINE phase |
-| System design or structure decision | `architect` | "design the architecture", "how should we structure", new service/module, data model |
-| Security audit or vulnerability check | `security-reviewer` | "audit security", "is this safe?", auth/payments/PII changes |
+| Complex multi-file feature | `planner` | path unclear, crosses module/API/data boundaries, DEFINE phase |
+| System design or structure decision | `architect` | "design the architecture", new service/module, data model |
+| Security audit or vulnerability check | `security-reviewer` | "audit security", auth/payments/PII changes |
 | PR or diff review requested | `code-review` | "review this", PR link, "check my changes" |
 | Bug report, error, stack trace | `debug` | "it's broken", stack trace, `FAILED`, unexpected behavior |
 | New feature — write tests first | `tdd-red` | TDD mode, "write tests for X", DEFINE phase |
@@ -28,122 +21,83 @@ Don't do everything yourself. Delegate to specialist agents when the task matche
 | Tests pass — clean up | `tdd-refactor` | "refactor", REFACTOR phase, all tests green |
 | Cross-cutting rename/restructure | `refactor` | "rename X to Y across the codebase", pattern migration |
 | CI/CD, infra, deployment | `devops` | workflow files, Docker, deploy, pipeline |
-| Write or update docs only | `documentation` | "document this", "update the README", docs-only task |
+| Write or update docs only | `documentation` | "document this", docs-only task |
 
-### When NOT to Spawn
+Spawn `planner` when the **path is unclear** (real unknowns, multiple viable designs) or
+the **blast radius** is wide (crosses module/service boundaries, a public API, a data
+model, or shared state). Skip it for large-but-mechanical work — a rename, find/replace,
+or dependency bump — and do that directly or via `refactor`. File count is a smell, not a
+trigger: a 5-file rename needs no planner; a 1-file auth change needs review. The
+`delegation-gate-warn` hook nudges on file count but no longer blocks the ship on it — the
+hard ship gate is `code-review`.
 
-- Task is a **single file** with clear scope — do it yourself
-- Task touches **exactly 2 files** with trivial scope — do it yourself
-- User explicitly says "don't use agents" or "do it inline"
+### When not to spawn
 
-**When in doubt, spawn.** Over-delegating is a minor inefficiency. Under-delegating on a complex task is a process failure.
+- Single file, or exactly 2 files with trivial scope — do it yourself.
+- User said "don't use agents" or "do it inline".
+- Internal refactor with no behavior change, docs-only, or test-only additions.
 
-## Parallel Execution
+## Watch for multi-turn drift
 
-When a task decomposes into **independent** sub-tasks, run agents in parallel:
+Small requests accumulate into a multi-file change across turns. Re-assess each turn
+against the rubric above using the *cumulative* scope of the whole task, not just the
+current request: once the change crosses a boundary or the path stops being obvious,
+pause and spawn `planner` with full context of what's done and what remains. Gradual
+scope growth is the most common miss.
 
-```text
-# Good — independent tasks, run simultaneously
-├── Agent 1: code-review (reviews the diff)
-├── Agent 2: security-reviewer (audits for vulnerabilities)
-├── Agent 3: documentation (updates docs for the change)
+## What's enforced vs. how you do it
 
-# Good — multi-perspective review in parallel
-├── Agent 1: code-review (correctness + quality)
-├── Agent 2: security-reviewer (vulnerabilities + data protection)
+The commit/push hooks enforce *outcomes*, not which agent produced them: a
+failing-then-passing test (`red-proof-verify`), clean lint/types on changed lines
+(`commit-gauntlet`), and a `code-review` APPROVE artifact from a *separate* reviewer
+before push (`reviewer-sep-warn`). So the one load-bearing delegation — the only one a
+hook hard-blocks on — is an independent `code-review` before you ship.
 
-# Good — plan first, then build
-├── Agent 1: planner (decompose the feature)      ← sequential
-└── Then: tdd-red → tdd-green → tdd-refactor       ← sequential per step
+That splits the agents by what separation actually buys:
 
-# Bad — dependent tasks, must be sequential
-├── Agent 1: architect (design the structure)  ← must finish first
-└── Agent 2: planner (plan the implementation) ← depends on architecture
-```
+- `code-review` / `security-reviewer` — high value: an independent reader catches what
+  the implementer is blind to. It is the review a solo dev otherwise lacks. **Always
+  separate, before ship.**
+- `planner` / `architect` — real value on hard or uncertain work. Spawn by the rubric above.
+- `tdd-red` / `tdd-green` / `tdd-refactor` — low value as a separate agent: the test is
+  written first, so there is nothing to leak, and `red-proof-verify` enforces the RED
+  discipline from the trailer, not the agent boundary. **Inline is fine.**
 
-**Rules:**
+**Solo / PR-less work (`solo-cycle`):** write the RED test, GREEN implementation, and any
+refactor inline — the hooks still prove the test failed first and the lint/type gates
+pass. The one non-negotiable separate agent is `code-review` before each push. Reach for
+the `tdd-*` agents only when you want a clean context boundary (larger or collaborative
+work).
 
-- If sub-tasks share no data dependencies → parallel
-- If one agent's output feeds another → sequential
-- Only spawn agents in parallel when their tasks are truly independent — parallel agents whose outputs must be integrated add coordination overhead that can outweigh speed gains
+## Parallel vs sequential
 
-## Two-Stage Review
+- Independent sub-tasks (no shared data) → run in parallel: e.g. `code-review` +
+  `security-reviewer` + `documentation` on one diff.
+- One agent's output feeds the next → sequential: `architect` → `planner` →
+  `tdd-red` → `tdd-green` → `tdd-refactor`.
+- Don't parallelize work whose outputs must be merged back together — the coordination
+  cost outweighs the speedup.
 
-Every `code-review` runs in two stages, and the first gates the second:
+## Review depth
 
-1. **Spec compliance** — does the change do what the plan/issue asked, with no scope creep? A correct implementation of the wrong thing fails here.
-2. **Code quality** — only once intent is confirmed, assess correctness, quality, and security.
+Every `code-review` runs two stages, and the first gates the second:
 
-Report Stage 1 failures first and block on them before spending effort on Stage 2.
+1. **Spec compliance** — does the change do what the plan/issue asked, with no scope
+   creep? A correct implementation of the wrong thing fails here.
+2. **Code quality** — only once intent is confirmed: correctness, quality, security.
 
-## Multi-Perspective Review
+For high-stakes changes (auth, payments, PII, public API, schema migrations, wide blast
+radius), split the review across perspectives — `code-review` (correctness), `security-reviewer`
+(vulnerabilities), `architect` (coupling/scale) — rather than a single pass. An internal
+refactor, docs-only, or test-only change needs just one review.
 
-For high-stakes changes (security-sensitive, public API, data model, auth), split the review into perspectives:
+## Hook signals
 
-| Perspective | Focus | Agent |
-| ----------- | ----- | ----- |
-| Correctness | Logic, edge cases, regressions | `code-review` |
-| Security | Vulnerabilities, input validation, secrets | `security-reviewer` |
-| Architecture | Coupling, scalability, design patterns | `architect` |
+The `delegation-gate-warn` hook emits routing hints in tool output. The `code-review` ship
+hint is a **hard gate** — resolve it before pushing (`git push`, PR create). The planner
+and `tdd-*` hints are advisory nudges: act on them when the rubric agrees, not reflexively.
 
-**When to use multi-perspective:**
+## When spawning an agent
 
-- Changes touching auth, payments, or PII
-- Public API surface changes
-- Database schema migrations
-- Changes spanning 5+ files
-
-**When single review is enough:**
-
-- Internal refactor with no behavior change
-- Documentation-only changes
-- Test additions
-
-## Hook Warnings Are Mandatory Signals
-
-The `delegation-gate-warn` hook emits routing hints visible in tool output. These are **not optional suggestions** — treat them as compliance signals.
-
-If you receive a hook warning and proceed without acting on it:
-
-1. You are violating this rule.
-2. The warning will repeat at the next commit/push gate.
-3. Acknowledge the violation explicitly and correct before shipping.
-
-## Delegation Protocol
-
-When spawning an agent:
-
-1. **State the goal** — one sentence on what you need back
-2. **Provide context** — relevant file paths, diff, constraints
-3. **Specify output format** — "return a list of findings", "return the commit message"
-4. **Don't over-specify** — let the specialist agent use its own methodology
-
-## Self-Check Before EXECUTE
-
-This table is a deliberate pre-flight restatement of the Routing Table above — not
-drift. It exists so the decision is re-triggered at the moment before you write code.
-The Routing Table remains the single source of truth; if the two ever disagree, the
-Routing Table wins.
-
-Before writing any implementation code, answer these questions:
-
-| Question | If YES |
-| -------- | ------ |
-| Will I touch 3+ files? | → Spawn `planner` first |
-| Am I writing tests? | → Spawn `tdd-red`, not inline |
-| Am I making tests pass? | → Spawn `tdd-green`, not inline |
-| Is there a stack trace / bug? | → Spawn `debug` |
-| Does this touch auth/security/PII? | → Spawn `security-reviewer` in parallel |
-| Am I about to close / create a PR? | → Spawn `code-review` on the diff first |
-
-If you answered YES to any row and did NOT spawn → you are violating this rule. Stop and correct.
-
-## Incremental Drift Guard
-
-Individual requests often feel small, but they can accumulate into a multi-file feature across turns. **Every turn**, before writing code:
-
-1. **Count total files modified in the current task/session** (not just this request)
-2. If cumulative file count ≥ 3 and you have NOT spawned `planner` → STOP. Spawn `planner` now with full context of what's been done and what remains.
-3. If cumulative file count ≥ 5 and you have NOT spawned `code-review` → flag to the user: "We've accumulated changes across 5+ files. I recommend spawning code-review before continuing."
-
-**This is the #1 observed failure mode.** The routing table catches single-request scope. This guard catches multi-turn drift.
+State the goal in one sentence, hand over the relevant context (paths, diff, constraints),
+and name the output format you need back. Don't over-specify method — let the specialist work.
