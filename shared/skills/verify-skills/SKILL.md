@@ -16,25 +16,39 @@ Works across platforms: **Cursor**, **Copilot**, and **Claude Code**.
 
 ## Expected Skills
 
-The following 15 skills must exist on disk. Match by **directory name**.
+The following 29 skills must exist on disk. Match by **directory name**.
 
 | # | Skill |
 |---|-------|
 | 1 | `acquire-codebase-knowledge` |
-| 2 | `ci-cd-review` |
-| 3 | `close-task` |
-| 4 | `context-map` |
-| 5 | `create-readme` |
-| 6 | `generate-docs` |
-| 7 | `generate-tests` |
-| 8 | `git-commit` |
-| 9 | `github-issues` |
-| 10 | `pytest-coverage` |
-| 11 | `source-task` |
-| 12 | `tdd-workflow` |
-| 13 | `verify-agents` |
-| 14 | `verify-rules` |
-| 15 | `verify-skills` |
+| 2 | `api-design` |
+| 3 | `backend-patterns` |
+| 4 | `brainstorming` |
+| 5 | `ci-cd-review` |
+| 6 | `context-map` |
+| 7 | `create-readme` |
+| 8 | `database-migrations` |
+| 9 | `deployment-patterns` |
+| 10 | `docker-patterns` |
+| 11 | `frontend-patterns` |
+| 12 | `generate-docs` |
+| 13 | `generate-tests` |
+| 14 | `git-commit` |
+| 15 | `github-issues` |
+| 16 | `hub` |
+| 17 | `iterative-retrieval` |
+| 18 | `land-task` |
+| 19 | `pytest-coverage` |
+| 20 | `search-first` |
+| 21 | `security-review` |
+| 22 | `solo-cycle` |
+| 23 | `source-task` |
+| 24 | `start-task` |
+| 25 | `tdd-workflow` |
+| 26 | `verification-loop` |
+| 27 | `verify-agents` |
+| 28 | `verify-rules` |
+| 29 | `verify-skills` |
 
 ## Platform Detection
 
@@ -55,7 +69,7 @@ Determine which platform you are running on and use the corresponding skills dir
 
 ### Step 1 — Disk inventory (ground truth)
 
-List the platform's skills directory to check which of the 15 expected skill folders exist and contain a `SKILL.md` entry file:
+List the platform's skills directory to check which of the 29 expected skill folders exist and contain a `SKILL.md` entry file:
 
 ```bash
 # Cursor
@@ -104,13 +118,13 @@ Combine both checks into a single table:
 
 PASS requires **all** conditions:
 
-1. All 15 skill directories found on disk (Step 1)
-2. All 15 skill directories contain a `SKILL.md` entry file (Step 1)
-3. All 15 skills are **indexed** in the platform's skill context (Step 2)
+1. All 29 skill directories found on disk (Step 1)
+2. All 29 skill directories contain a `SKILL.md` entry file (Step 1)
+3. All 29 skills are **indexed** in the platform's skill context (Step 2)
 
 Verdicts:
 
-- `RESULT: PASS` — all 15 on disk with SKILL.md AND all indexed
+- `RESULT: PASS` — all 29 on disk with SKILL.md AND all indexed
 - `RESULT: FAIL (X missing from disk)` — one or more expected skill directories are missing
 - `RESULT: FAIL (X missing SKILL.md)` — skill directory exists but has no entry file
 - `RESULT: FAIL (X not indexed)` — skill files exist but platform is not aware of them

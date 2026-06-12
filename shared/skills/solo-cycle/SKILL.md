@@ -5,7 +5,8 @@ reviewed, pushed unit of work. There is no PR — the push IS the ship gate; all
 enforcement fires on `git commit` and `git push`. The cycle repeats per subtask
 within a session.
 
-When a PR IS wanted, use the `close-task` skill instead.
+Ending the task is not the spoke's job: once the final subtask is pushed, the **hub**
+lands it with `/land <id>` (the `land-task` skill) — merge, suite, ship, teardown.
 
 ## The cycle (per subtask)
 
@@ -108,8 +109,8 @@ The ledger is ephemeral session scratch; the GitHub issue is the durable contrac
 
 ## Related skills
 
-- `source-task` — anchor: fetch the issue and create the branch
+- `source-task` — anchor: fetch the issue and confirm the branch
 - `tdd-workflow` — RED/GREEN/REFACTOR guidance
-- `close-task` — use instead when a PR IS wanted
+- `land-task` — hub-side `/land <id>` that ends the task once the last subtask is pushed
 - `verification-loop` — deeper VERIFY pass before the review
 - `git-commit` — commit message format

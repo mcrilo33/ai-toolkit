@@ -13,7 +13,7 @@ shared/
 │   └── …
 ├── skills/
 │   ├── metadata.yml          # Frontmatter definitions for skills
-│   ├── close-task/SKILL.md
+│   ├── land-task/SKILL.md
 │   └── …
 ├── prompts/
 │   ├── metadata.yml          # Frontmatter definitions for prompts
@@ -165,36 +165,36 @@ instead of `.cursor/hooks/scripts/<hook>.sh`, via the optional
 **Source** — `shared/skills/metadata.yml`:
 
 ```yaml
-close-task:
-  name: "close-task"
-  description: "Close a task by committing, pushing, and creating a PR."
+land-task:
+  name: "land-task"
+  description: "Land a finished task from the hub: merge, suite, push, teardown."
   cursor:
-    description: "Close a task by committing, pushing, and creating a PR. Use when the user says /close."
+    description: "Land a finished task from the hub: merge, suite, push, teardown. Use when the user says /land."
 ```
 
-**Copilot output** — `.github/skills/close-task/SKILL.md`:
+**Copilot output** — `.github/skills/land-task/SKILL.md`:
 
 ```yaml
 ---
-name: close-task
-description: Close a task by committing, pushing, and creating a PR.
+name: land-task
+description: "Land a finished task from the hub: merge, suite, push, teardown."
 ---
 ```
 
-**Cursor output** — `.cursor/skills/close-task/SKILL.md`:
+**Cursor output** — `.cursor/skills/land-task/SKILL.md`:
 
 ```yaml
 ---
-name: close-task
-description: "Close a task by committing, pushing, and creating a PR. Use when the user says /close."
+name: land-task
+description: "Land a finished task from the hub: merge, suite, push, teardown. Use when the user says /land."
 ---
 ```
 
-**Claude output** — `.claude/skills/close-task/SKILL.md`:
+**Claude output** — `.claude/skills/land-task/SKILL.md`:
 
 ```yaml
 ---
-name: close-task
-description: Close a task by committing, pushing, and creating a PR.
+name: land-task
+description: "Land a finished task from the hub: merge, suite, push, teardown."
 ---
 ```

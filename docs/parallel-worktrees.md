@@ -75,8 +75,9 @@ code ~/Repos/ai-toolkit
 | Script | Role |
 |--------|------|
 | `scripts/worktree-new.sh` | Create a worktree + branch, copy `.claude/`, fold into VS Code, open a tmux window running `claude` |
+| `scripts/worktree-land.sh` | Land a pushed branch from the hub: guards → merge → suite → push → teardown → issue close |
 | `scripts/worktree-done.sh` | Resolve a worktree by issue / slug / branch / path and tear it down safely |
-| `scripts/worktree-lib.sh` | Shared slugify + main-root + worktree-resolution helpers (sourced by both) |
+| `scripts/worktree-lib.sh` | Shared slugify + main-root + worktree-resolution helpers (sourced by the others) |
 
 ## The daily loop
 
@@ -104,25 +105,24 @@ Each session is fully isolated: its own files, branch, staging area, and `.claud
 gates. In the one VS Code window, the Source Control panel shows **one group per
 worktree**, so you review every task's diff without leaving the window.
 
-### 3. Merge and tear down
+### 3. Land
 
-When a task's branch is committed and pushed:
+When a task's branch is committed and pushed, land it from the hub — `/land 42` in the
+hub session (the `land-task` skill), or directly:
 
 ```bash
 cd ~/Repos/ai-toolkit            # merge hub, already on main
-git merge feature/42-42           # land it (fast-forward when possible)
-git push origin main              # ship
-
-scripts/worktree-done.sh 42       # remove the worktree, fold its folder out of
-                                  # VS Code, and prune the now-merged branch
-                                  # (local + origin) — all automatic
+scripts/worktree-land.sh 42      # guards → merge (ff when possible) → full suite →
+                                 # push origin main → teardown → close issue #42
 ```
 
-Teardown is the mirror of creation: it runs `code --remove` to drop the folder
-from the review window, and because the branch is now merged into the hub it
-deletes both `feature/42-42` and `origin/feature/42-42` for you. An unmerged
-branch is kept untouched (with a push/merge-first hint); pass `--keep-branch` to
-keep a merged one, or `--no-code` to leave VS Code alone.
+One command runs the whole landing: it refuses with a precise reason unless the hub is
+clean on `main` and the spoke is clean and fully pushed; a failing suite rolls `main`
+back (`git reset --keep`) with nothing pushed. On success it calls `worktree-done.sh`
+for the teardown mirror of creation — `code --remove` drops the folder from the review
+window, and the now-merged branch is pruned local + origin (`--keep-branch` to keep it).
+An unmerged branch is never pruned. It then closes the issue via `gh` and kills the
+task's stranded tmux window.
 
 ## `worktree-new.sh` reference
 
