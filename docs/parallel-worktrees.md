@@ -113,10 +113,16 @@ cd ~/Repos/ai-toolkit            # merge hub, already on main
 git merge feature/42-42           # land it (fast-forward when possible)
 git push origin main              # ship
 
-scripts/worktree-done.sh 42       # remove the worktree
-git branch -d feature/42-42       # delete the merged branch
-# then in VS Code: right-click the stale folder → Remove Folder from Workspace
+scripts/worktree-done.sh 42       # remove the worktree, fold its folder out of
+                                  # VS Code, and prune the now-merged branch
+                                  # (local + origin) — all automatic
 ```
+
+Teardown is the mirror of creation: it runs `code --remove` to drop the folder
+from the review window, and because the branch is now merged into the hub it
+deletes both `feature/42-42` and `origin/feature/42-42` for you. An unmerged
+branch is kept untouched (with a push/merge-first hint); pass `--keep-branch` to
+keep a merged one, or `--no-code` to leave VS Code alone.
 
 ## `worktree-new.sh` reference
 
@@ -158,14 +164,27 @@ dropped. `[type]` must be `feature` (default), `fix`, or `chore`.
 ## `worktree-done.sh` reference
 
 ```
-scripts/worktree-done.sh <issue|slug|branch|path> [--force]
+scripts/worktree-done.sh <issue|slug|branch|path> [--force] [--no-code] [--keep-branch]
 ```
 
 Resolves the target against the live `git worktree list` — by issue number, slug,
 branch name, or path — and removes it. On no match or an ambiguous match it **lists the
-existing worktrees** instead of failing with a dead-end error. The branch is kept (push
-and merge first, then delete it by hand). `--force` (position-independent) removes a
-worktree with uncommitted or untracked changes.
+existing worktrees** instead of failing with a dead-end error.
+
+Teardown then mirrors `worktree-new.sh`: it folds the folder out of the VS Code review
+window (`code --remove`) and prunes the worktree's branch. The branch is pruned **only
+when it is fully merged** into the hub's current branch — local *and* `origin/<branch>`
+are deleted automatically. An unmerged branch is kept untouched, with a push/merge-first
+hint. `code` and remote failures warn but never abort: the worktree removal still
+succeeds.
+
+| Flag | Effect |
+|------|--------|
+| `--force` | remove a worktree with uncommitted or untracked changes |
+| `--no-code` | don't fold the folder out of VS Code (`code --remove`) |
+| `--keep-branch` | keep the branch even when it is fully merged |
+
+All three flags are position-independent.
 
 ## tmux
 
