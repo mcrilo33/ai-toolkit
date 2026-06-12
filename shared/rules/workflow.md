@@ -59,7 +59,7 @@ for lanes 1 and 2. See the `commit-quality` hook for the exact file-set rules.
 | `/source` | `source-task` | Anchor to the issue; branch creation only as non-hub fallback |
 | `/cycle` | `solo-cycle` | Solo per-subtask cycle: anchor, RED, GREEN, review, push |
 | `/land <id>` | `land-task` | Land a finished task from the hub: merge, suite, push, teardown |
-| `/land <branch> --local` | `land-task` | Land a micro-spoke (lane 1): skips upstream guards, merges locally, no issue to close |
+| `/land <branch> --local` | `land-task` | Land a micro-spoke (lane 1): skips upstream guards, merges the local-only branch and ships, no issue to close |
 
 ## Phase Checklists
 

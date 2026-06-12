@@ -76,7 +76,7 @@ For the triage heuristic and lane definitions see `shared/rules/workflow.md`.
    - That the commit must be `docs:` or `chore:` type.
    - That staging and committing must use plain `git add <files>` followed by a
      standalone `git commit -m "<message>"` — no `-a`, no pathspec on the commit command,
-     no chaining with `&&`.
+     no chaining or prefixes (the gate only exempts a standalone plain commit).
    - That the subagent must return its branch name and a diff summary when done.
 2. **Review** the returned diff on the hub before doing anything else.
 3. **Land** with:

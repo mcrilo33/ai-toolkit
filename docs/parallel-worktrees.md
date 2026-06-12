@@ -75,7 +75,7 @@ code ~/Repos/ai-toolkit
 | Script | Role |
 |--------|------|
 | `scripts/worktree-new.sh` | Create a worktree + branch, copy `.claude/`, fold into VS Code, open a tmux window running `claude` |
-| `scripts/worktree-land.sh` | Land a pushed branch from the hub: guards → merge → suite → push → teardown → issue close; `--local` for micro-spoke landing (no upstream required) |
+| `scripts/worktree-land.sh` | Land a pushed branch from the hub: guards → merge → suite → push → teardown → issue close |
 | `scripts/worktree-done.sh` | Resolve a worktree by issue / slug / branch / path and tear it down safely |
 | `scripts/worktree-lib.sh` | Shared slugify + main-root + worktree-resolution helpers (sourced by the others) |
 
@@ -255,10 +255,10 @@ worktree-isolated subagent therefore passes it by construction — no carve-outs
 are needed.
 
 **No-issue commit path.** `docs:`/`chore:` commits whose entire staged set is
-non-executable documentation (`.md`, `.txt`, `.rst`, regular file mode, outside
-`scripts/`, `shared/hooks/`, `tests/`, and any `*/scripts/` dir) pass the
-`commit-quality` gate without an issue anchor. This is the sanctioned path for lanes 1
-and 2.
+non-executable documentation (`.md`/`.markdown`/`.txt`/`.rst`, regular file mode,
+outside `scripts/`, `shared/hooks/`, `tests/`, and any `*/scripts/` dir) pass the
+`commit-quality` gate without an issue anchor — see that hook for the exact file-set
+rules. This is the sanctioned path for lanes 1 and 2.
 
 ## Related
 
