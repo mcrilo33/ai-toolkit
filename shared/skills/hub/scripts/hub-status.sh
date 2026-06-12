@@ -2,9 +2,10 @@
 # hub-status.sh — live dashboard for the planning hub.
 #
 # Surveys what is in flight across the parallel-worktrees workflow:
-#   - worktrees and, per task branch, ahead/behind vs main + dirty state
+#   - all tmux panes across every session (once, at startup)
+#   - worktrees and, per task branch, ahead/behind vs main + dirty state,
+#     linked GitHub issue state, and correlated tmux pane/jump command
 #   - open GitHub issues, flagged by whether a worktree already exists for them
-#   - tmux windows (when run inside tmux)
 #
 # Read-only. Run from the main checkout. Safe to run anytime.
 set -uo pipefail
@@ -17,6 +18,16 @@ default_branch="$(git -C "$main_root" symbolic-ref --quiet --short refs/remotes/
 default_branch="${default_branch:-main}"
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
+
+# --- Survey all tmux panes once ---------------------------------------------
+# Format: session:window<TAB>path  (one entry per pane across all sessions)
+all_panes="$(tmux list-panes -a -F '#{session_name}:#{window_index}	#{pane_current_path}' 2>/dev/null || true)"
+
+# Current session name (empty when outside tmux)
+current_session=""
+if [ -n "${TMUX:-}" ]; then
+  current_session="$(tmux display-message -p '#{session_name}' 2>/dev/null || true)"
+fi
 
 # --- Worktrees -------------------------------------------------------------
 bold "Worktrees"
@@ -56,7 +67,54 @@ while IFS= read -r line; do
       state="unpushed"
     fi
   fi
-  printf '  %-28s ↑%s ↓%s  %s\n' "$branch" "${ahead:-?}" "${behind:-?}" "$state"
+
+  # Extract leading digits from branch slug (e.g. feature/1-pushed → 1)
+  slug="${branch##*/}"
+  issue_num="$(printf '%s' "$slug" | sed 's/^\([0-9]*\).*/\1/')"
+
+  # Issue state column
+  issue_col=""
+  if [ -n "$issue_num" ]; then
+    issue_state="$(gh issue view "$issue_num" --json state -q .state 2>/dev/null || true)"
+    if [ -n "$issue_state" ]; then
+      issue_col="  #${issue_num} ${issue_state}"
+    else
+      issue_col="  #${issue_num} ?"
+    fi
+  fi
+
+  # Pane correlation: find first pane whose path equals this worktree path
+  pane_loc="no pane"
+  pane_sess=""
+  pane_idx=""
+  if [ -n "$all_panes" ]; then
+    while IFS='	' read -r sess_win pane_path; do
+      if [ "$pane_path" = "$path" ]; then
+        pane_loc="tmux ${sess_win}"
+        pane_sess="${sess_win%%:*}"
+        pane_idx="${sess_win#*:}"
+        break
+      fi
+    done <<<"$all_panes"
+  fi
+
+  printf '  %-28s ↑%s ↓%s  %s%s  %s\n' \
+    "$branch" "${ahead:-?}" "${behind:-?}" "$state" "$issue_col" "$pane_loc"
+
+  # Jump line under rows that have a pane
+  if [ "$pane_loc" != "no pane" ]; then
+    sess_win_key="${pane_sess}:${pane_idx}"
+    if [ -n "$current_session" ]; then
+      if [ "$pane_sess" = "$current_session" ]; then
+        printf "      ↳ jump: tmux select-window -t '%s'\n" "$sess_win_key"
+      else
+        printf "      ↳ jump: tmux switch-client -t '%s'\n" "$sess_win_key"
+      fi
+    else
+      printf "      ↳ jump: tmux attach -t %s \\; select-window -t '%s'\n" \
+        "$pane_sess" "$sess_win_key"
+    fi
+  fi
 done < <(git -C "$main_root" worktree list 2>/dev/null)
 echo
 
@@ -80,8 +138,4 @@ else
 fi
 echo
 
-# --- tmux windows ----------------------------------------------------------
-if [ -n "${TMUX:-}" ]; then
-  bold "tmux windows"
-  tmux list-windows -F '  #{window_index}: #{window_name}#{?window_active, (active),}' 2>/dev/null
-fi
+exit 0
