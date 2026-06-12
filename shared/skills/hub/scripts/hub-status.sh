@@ -44,7 +44,7 @@ try:
                 obj = json.loads(raw)
             except Exception:
                 continue
-            if obj.get("type") != "assistant":
+            if not isinstance(obj, dict) or obj.get("type") != "assistant":
                 continue
             content = (obj.get("message") or {}).get("content") or []
             for block in content:
@@ -57,12 +57,12 @@ except Exception:
 if result is None:
     print("none")
 else:
-    done = sum(1 for t in result if t.get("status") == "completed")
-    total = len(result)
-    ip = next((t for t in result if t.get("status") == "in_progress"), None)
-    line = f"{done}/{total}"
+    todos = [t for t in result if isinstance(t, dict)]
+    done = sum(1 for t in todos if t.get("status") == "completed")
+    ip = next((t for t in todos if t.get("status") == "in_progress"), None)
+    line = f"{done}/{len(todos)}"
     if ip:
-        content = (ip.get("content") or "")[:60]
+        content = (ip.get("content") or "").split("\n", 1)[0][:60]
         line += f" · in_progress: {content}"
     print(line)
 PYEOF

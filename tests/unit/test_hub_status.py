@@ -409,6 +409,26 @@ def test_todos_none_marker_when_transcript_has_no_todowrite(
     assert "↳ todos: none" in out
 
 
+def test_todos_survive_malformed_lines_and_entries(hub_with_spokes: Path, tmp_path: Path) -> None:
+    # A valid-JSON non-object line must not abort the scan (a later TodoWrite
+    # still wins), non-dict ledger entries are ignored, and the in_progress
+    # content is rendered single-line, truncated to 60 chars.
+    projects = tmp_path / "projects"
+    long_content = "x" * 70 + "\nsecond line"
+    lines = [
+        _todowrite_line([_todo("stale", "completed")]),
+        json.dumps([1, 2, 3]),
+        _todowrite_line(["stray-string", _todo(long_content, "in_progress")]),  # type: ignore[list-item]
+    ]
+    _write_transcript(projects, tmp_path / "pushed", lines)
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, projects_dir=projects)
+
+    assert f"↳ todos: 0/1 · in_progress: {'x' * 60}" in out
+    assert "second line" not in out
+    assert "todos: 1/1" not in out
+
+
 def test_todos_subline_omitted_without_project_dir(hub_with_spokes: Path, tmp_path: Path) -> None:
     # Positive control: the unpushed spoke HAS a transcript so its row gets a
     # todos sub-line, proving the column is active — while the pushed spoke
