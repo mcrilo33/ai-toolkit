@@ -509,6 +509,76 @@ def test_docs_pathspec_named_commit_still_requires_anchor(
     assert run_hook(COMMIT_QUALITY, 'git commit commit -m "docs: x"', cwd=repo) == BLOCK
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param('git commit "-a" -m "docs: x"', id="quoted-a"),
+        pytest.param('git commit "--amend" -m "docs: x"', id="quoted-amend"),
+        pytest.param('git commit -m "docs: x" "evil.sh"', id="quoted-pathspec"),
+    ],
+)
+def test_docs_quoted_flag_still_requires_anchor(
+    on_branch: Callable[[str], Path], command: str
+) -> None:
+    # The hook strips quoted strings before scanning for dangerous flags and
+    # bare pathspecs, so quoting a token ("-a", "--amend", "evil.sh") erases it
+    # from the scan — but the shell unquotes and git honors it, committing
+    # something other than the staged doc-only set. Quoting must not launder a
+    # disqualifying token.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/a.md", "# a\n")
+
+    assert run_hook(COMMIT_QUALITY, command, cwd=repo) == BLOCK
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param('git add -A && git commit -m "docs: x"', id="add-all"),
+        pytest.param('git add app.py; git commit -m "docs: x"', id="add-file"),
+        pytest.param('git stash pop; git commit -m "docs: x"', id="stash-pop"),
+        pytest.param('echo hi && git commit -m "docs: x"', id="echo"),
+    ],
+)
+def test_docs_pre_commit_chain_still_requires_anchor(
+    on_branch: Callable[[str], Path], command: str
+) -> None:
+    # Tokens BEFORE `commit` are never inspected, yet a chained prefix command
+    # (git add, stash pop, anything) runs first and mutates the index AFTER the
+    # hook reads it — the doc-only staged set the hook approved is not what the
+    # commit captures. Any chained prefix must disqualify the exemption.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/a.md", "# a\n")
+
+    assert run_hook(COMMIT_QUALITY, command, cwd=repo) == BLOCK
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(
+            'git commit -m "docs: x" -m "second paragraph"',
+            id="multi-m",
+        ),
+        pytest.param('git commit --message="docs: x"', id="message-eq"),
+        pytest.param(
+            'git commit -m "docs: x" --author="A B <a@b.c>"',
+            id="author",
+        ),
+    ],
+)
+def test_docs_multi_m_and_metadata_flags_keep_exemption(
+    on_branch: Callable[[str], Path], command: str
+) -> None:
+    # Retention pins for the upcoming stricter fix: legitimate message-only
+    # shapes (multi -m body, --message=, --author=) commit exactly the staged
+    # doc-only set and must KEEP the exemption.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/a.md", "# a\n")
+
+    assert run_hook(COMMIT_QUALITY, command, cwd=repo) == ALLOW
+
+
 # ── commit-gauntlet: lint scoping + RED carve-out ─────────
 
 ruff = pytest.mark.skipif(
