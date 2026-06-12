@@ -238,6 +238,7 @@ def test_no_server_falls_back_to_manual_advice(hub: Path, tmp_path: Path) -> Non
     assert proc.returncode == 0, proc.stderr
     assert not _calls(log.read_text(), "new-window")
     assert "Start the agent in a new terminal window:" in proc.stdout
+    assert "CLAUDE_EFFORT=max claude --model fable" in proc.stdout
     assert "/source" in proc.stdout
 
 
@@ -247,7 +248,7 @@ def test_agent_launch_pins_model_and_effort_by_default(hub: Path, tmp_path: Path
     assert proc.returncode == 0, proc.stderr
     send_keys = _calls(log.read_text(), "send-keys")
     assert send_keys, "expected a send-keys invocation launching the agent"
-    assert "CLAUDE_EFFORT=max claude --model fable" in send_keys[0]
+    assert "CLAUDE_EFFORT=max claude --model fable C-m" in send_keys[0]
 
 
 def test_agent_launch_respects_model_and_effort_overrides(hub: Path, tmp_path: Path) -> None:
@@ -258,7 +259,7 @@ def test_agent_launch_respects_model_and_effort_overrides(hub: Path, tmp_path: P
     assert proc.returncode == 0, proc.stderr
     send_keys = _calls(log.read_text(), "send-keys")
     assert send_keys, "expected a send-keys invocation launching the agent"
-    assert "CLAUDE_EFFORT=high claude --model sonnet" in send_keys[0]
+    assert "CLAUDE_EFFORT=high claude --model sonnet C-m" in send_keys[0]
 
 
 def test_agent_launch_keeps_seeded_prompt_after_pinning(hub: Path, tmp_path: Path) -> None:
@@ -268,3 +269,14 @@ def test_agent_launch_keeps_seeded_prompt_after_pinning(hub: Path, tmp_path: Pat
     send_keys = _calls(log.read_text(), "send-keys")
     assert send_keys, "expected a send-keys invocation launching the agent"
     assert "CLAUDE_EFFORT=max claude --model fable /source" in send_keys[0]
+
+
+def test_agent_launch_shell_quotes_metacharacter_overrides(hub: Path, tmp_path: Path) -> None:
+    overrides = {"WT_AGENT_MODEL": "foo bar"}
+
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", extra_env=overrides)
+
+    assert proc.returncode == 0, proc.stderr
+    send_keys = _calls(log.read_text(), "send-keys")
+    assert send_keys, "expected a send-keys invocation launching the agent"
+    assert "claude --model foo\\ bar C-m" in send_keys[0]
