@@ -61,6 +61,10 @@ def hub_with_spokes(tmp_path: Path) -> Path:
     pushed_even = tmp_path / "even"
     _git(hub, "worktree", "add", "-q", "-b", "feature/3-even", str(pushed_even))
     _git(pushed_even, "push", "-q", "-u", "origin", "feature/3-even")
+
+    # Ad-hoc spoke: non-numeric slug, so no issue to correlate with.
+    adhoc = tmp_path / "adhoc"
+    _git(hub, "worktree", "add", "-q", "-b", "chore/adhoc-slug", str(adhoc))
     return hub
 
 
@@ -254,6 +258,13 @@ def test_worktree_without_pane_shows_no_pane(hub_with_spokes: Path, tmp_path: Pa
     assert "no pane" in line
     assert "select-window" not in out
     assert "switch-client" not in out
+
+
+def test_non_numeric_slug_has_no_issue_column(hub_with_spokes: Path, tmp_path: Path) -> None:
+    out = _run_hub_status(hub_with_spokes, tmp_path, issue_state="OPEN")
+
+    line = next(ln for ln in out.splitlines() if "chore/adhoc-slug" in ln)
+    assert "#" not in line
 
 
 def test_degrades_when_tmux_unavailable(hub_with_spokes: Path, tmp_path: Path) -> None:

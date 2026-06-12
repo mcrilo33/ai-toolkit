@@ -72,10 +72,11 @@ while IFS= read -r line; do
   slug="${branch##*/}"
   issue_num="$(printf '%s' "$slug" | sed 's/^\([0-9]*\).*/\1/')"
 
-  # Issue state column
+  # Issue state column. </dev/null guards the outer loop's stdin: a
+  # stdin-draining gh wrapper would otherwise swallow the worktree list.
   issue_col=""
   if [ -n "$issue_num" ]; then
-    issue_state="$(gh issue view "$issue_num" --json state -q .state 2>/dev/null || true)"
+    issue_state="$(gh issue view "$issue_num" --json state -q .state 2>/dev/null </dev/null || true)"
     if [ -n "$issue_state" ]; then
       issue_col="  #${issue_num} ${issue_state}"
     else
@@ -85,14 +86,14 @@ while IFS= read -r line; do
 
   # Pane correlation: find first pane whose path equals this worktree path
   pane_loc="no pane"
+  pane_target=""
   pane_sess=""
-  pane_idx=""
   if [ -n "$all_panes" ]; then
     while IFS='	' read -r sess_win pane_path; do
       if [ "$pane_path" = "$path" ]; then
         pane_loc="tmux ${sess_win}"
+        pane_target="$sess_win"
         pane_sess="${sess_win%%:*}"
-        pane_idx="${sess_win#*:}"
         break
       fi
     done <<<"$all_panes"
@@ -103,16 +104,15 @@ while IFS= read -r line; do
 
   # Jump line under rows that have a pane
   if [ "$pane_loc" != "no pane" ]; then
-    sess_win_key="${pane_sess}:${pane_idx}"
     if [ -n "$current_session" ]; then
       if [ "$pane_sess" = "$current_session" ]; then
-        printf "      ↳ jump: tmux select-window -t '%s'\n" "$sess_win_key"
+        printf "      ↳ jump: tmux select-window -t '%s'\n" "$pane_target"
       else
-        printf "      ↳ jump: tmux switch-client -t '%s'\n" "$sess_win_key"
+        printf "      ↳ jump: tmux switch-client -t '%s'\n" "$pane_target"
       fi
     else
       printf "      ↳ jump: tmux attach -t %s \\; select-window -t '%s'\n" \
-        "$pane_sess" "$sess_win_key"
+        "$pane_sess" "$pane_target"
     fi
   fi
 done < <(git -C "$main_root" worktree list 2>/dev/null)
