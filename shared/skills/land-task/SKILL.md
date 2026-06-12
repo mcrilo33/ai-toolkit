@@ -36,7 +36,7 @@ scripts/worktree-land.sh <id>
 |------|--------|
 | `--skip-tests` | Land without running the suite on the merged hub |
 | `--keep-branch` | Keep the local + remote branch after landing |
-| `--test-cmd <cmd>` | Override the suite command (default `pytest -q`) |
+| `--test-cmd <cmd>` | Override the suite command (default `pytest -q` when pytest exists) |
 
 The script runs, in order, aborting safely at the first failure:
 
@@ -74,7 +74,7 @@ Then re-run `hub-status.sh` so the next move starts from a fresh picture.
 |-----------|--------|
 | Ad-hoc branch (no issue number) | Lands normally; the issue-close step is skipped |
 | `gh` missing or close fails | Warns; close by hand: `gh issue close <id>` |
-| Push succeeded but teardown failed | Work is shipped; re-run `worktree-done.sh <id>` alone |
+| Push succeeded but teardown failed | Work is shipped; re-run `worktree-done.sh <id>` alone and close the issue by hand |
 | Want the branch kept for follow-up | `--keep-branch`, then prune later via `worktree-done.sh` |
 
 ## Related skills
