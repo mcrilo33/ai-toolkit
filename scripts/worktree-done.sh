@@ -120,7 +120,7 @@ prune_branch() {
   hub_branch="$(git symbolic-ref --short -q HEAD || true)"
   if [ -z "$hub_branch" ] || ! git merge-base --is-ancestor "$WT_BRANCH" "$hub_branch"; then
     echo "  branch $WT_BRANCH is not merged into ${hub_branch:-HEAD} — kept."
-    echo "  Push and merge it first, then re-run; or delete by hand: git branch -d \"$WT_BRANCH\""
+    echo "  Push and merge it first, then re-run; or abandon it with: git branch -D \"$WT_BRANCH\""
     return
   fi
   # Local first: if `git branch -d` (the safe form, a second net under the

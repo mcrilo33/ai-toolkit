@@ -34,8 +34,12 @@ def hub(tmp_path: Path) -> Path:
     """A main checkout ('hub') on `main` with an `origin` bare remote."""
     remote = tmp_path / "remote.git"
     hub = tmp_path / "hub"
-    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True, capture_output=True)
-    subprocess.run(["git", "init", "-q", "-b", "main", str(hub)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "init", "-q", "--bare", str(remote)], check=True, capture_output=True, env=_GIT_ENV
+    )
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(hub)], check=True, capture_output=True, env=_GIT_ENV
+    )
     for k, v in (("user.email", "t@t.t"), ("user.name", "t"), ("commit.gpgsign", "false")):
         _git(hub, "config", k, v)
     (hub / "README.md").write_text("seed\n")
