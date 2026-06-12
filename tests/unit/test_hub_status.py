@@ -64,22 +64,100 @@ def hub_with_spokes(tmp_path: Path) -> Path:
     return hub
 
 
-def _run_hub_status(hub: Path, tmp_path: Path) -> str:
-    """Run hub-status.sh from the hub with a `gh` stub on PATH (exits 1, so the
-    issue survey degrades to '(none open)' without touching the network)."""
+def _run_hub_status_proc(
+    hub: Path,
+    tmp_path: Path,
+    *,
+    panes: str = "",
+    inside_tmux: bool = False,
+    current_session: str = "hub-sess",
+    issue_state: str = "",
+    tmux_fail: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """Run hub-status.sh from the hub with `gh` and `tmux` stubs on PATH.
+
+    Args:
+        hub: Main checkout to run the script from.
+        tmp_path: Test tmpdir; the stub bin dir is created under it.
+        panes: Multi-line ``session:window<TAB>path`` text the tmux stub
+            prints for ``list-panes`` (empty → no panes).
+        inside_tmux: When True, set a fake TMUX env var; otherwise TMUX is
+            popped so the run is hermetic.
+        current_session: What the tmux stub prints for ``display-message``.
+        issue_state: When non-empty, the gh stub answers ``issue view`` with
+            this on stdout (exit 0); ``issue list`` keeps failing. When empty,
+            every gh call exits 1 (degrades to "(none open)").
+        tmux_fail: When True, every tmux invocation exits 1 (no server).
+
+    Returns:
+        The CompletedProcess with captured stdout/stderr.
+    """
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     gh = bindir / "gh"
-    gh.write_text("#!/bin/sh\nexit 1\n")
+    if issue_state:
+        gh.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "issue" ] && [ "$2" = "view" ]; then\n'
+            "  printf '%s\\n' \"$HUB_STATUS_TEST_ISSUE_STATE\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 1\n"
+        )
+    else:
+        gh.write_text("#!/bin/sh\nexit 1\n")
     gh.chmod(0o755)
+    tmux = bindir / "tmux"
+    tmux.write_text(
+        "#!/bin/sh\n"
+        '[ "${HUB_STATUS_TEST_TMUX_FAIL:-}" = "1" ] && exit 1\n'
+        'case "$1" in\n'
+        "  list-panes)\n"
+        '    [ -n "${HUB_STATUS_TEST_PANES:-}" ] && printf \'%s\\n\' "$HUB_STATUS_TEST_PANES"\n'
+        "    ;;\n"
+        "  display-message)\n"
+        "    printf '%s\\n' \"$HUB_STATUS_TEST_SESSION\"\n"
+        "    ;;\n"
+        "esac\n"
+        "exit 0\n"
+    )
+    tmux.chmod(0o755)
     env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
-    env.pop("TMUX", None)  # skip the tmux section
+    env.pop("TMUX", None)  # hermetic by default; faked only when inside_tmux
+    if inside_tmux:
+        env["TMUX"] = "/tmp/tmux-test/default,1234,0"
+    env["HUB_STATUS_TEST_PANES"] = panes
+    env["HUB_STATUS_TEST_SESSION"] = current_session
+    env["HUB_STATUS_TEST_ISSUE_STATE"] = issue_state
+    env["HUB_STATUS_TEST_TMUX_FAIL"] = "1" if tmux_fail else ""
     return subprocess.run(
         ["bash", str(HUB_STATUS)],
         cwd=str(hub),
         capture_output=True,
         text=True,
         env=env,
+    )
+
+
+def _run_hub_status(
+    hub: Path,
+    tmp_path: Path,
+    *,
+    panes: str = "",
+    inside_tmux: bool = False,
+    current_session: str = "hub-sess",
+    issue_state: str = "",
+    tmux_fail: bool = False,
+) -> str:
+    """Run hub-status.sh and return its stdout (see _run_hub_status_proc)."""
+    return _run_hub_status_proc(
+        hub,
+        tmp_path,
+        panes=panes,
+        inside_tmux=inside_tmux,
+        current_session=current_session,
+        issue_state=issue_state,
+        tmux_fail=tmux_fail,
     ).stdout
 
 
@@ -105,3 +183,84 @@ def test_hub_branch_labelled_hub(hub_with_spokes: Path, tmp_path: Path) -> None:
     out = _run_hub_status(hub_with_spokes, tmp_path)
     line = next(ln for ln in out.splitlines() if ln.strip().startswith("main"))
     assert "(hub)" in line
+
+
+# --- Cross-session correlation (issue #8) -----------------------------------
+
+
+def test_spoke_pane_listed_across_sessions(hub_with_spokes: Path, tmp_path: Path) -> None:
+    panes = f"0:3\t{tmp_path / 'pushed'}"
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, panes=panes)
+
+    line = next(ln for ln in out.splitlines() if "feature/1-pushed" in ln)
+    assert "tmux 0:3" in line
+
+
+def test_worktree_row_shows_issue_number_and_state(hub_with_spokes: Path, tmp_path: Path) -> None:
+    out = _run_hub_status(hub_with_spokes, tmp_path, issue_state="OPEN")
+
+    line = next(ln for ln in out.splitlines() if "feature/1-pushed" in ln)
+    assert "#1 OPEN" in line
+
+
+def test_issue_state_degrades_to_question_mark_without_gh(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    out = _run_hub_status(hub_with_spokes, tmp_path)
+
+    line = next(ln for ln in out.splitlines() if "feature/1-pushed" in ln)
+    assert "#1 ?" in line
+
+
+def test_jump_select_window_when_pane_in_current_session(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    panes = f"0:3\t{tmp_path / 'pushed'}"
+
+    out = _run_hub_status(
+        hub_with_spokes, tmp_path, panes=panes, inside_tmux=True, current_session="0"
+    )
+
+    assert "tmux select-window -t '0:3'" in out
+
+
+def test_jump_switch_client_when_pane_in_other_session(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    panes = f"0:3\t{tmp_path / 'pushed'}"
+
+    out = _run_hub_status(
+        hub_with_spokes, tmp_path, panes=panes, inside_tmux=True, current_session="hub-sess"
+    )
+
+    assert "tmux switch-client -t '0:3'" in out
+
+
+def test_jump_attach_when_outside_tmux(hub_with_spokes: Path, tmp_path: Path) -> None:
+    panes = f"0:3\t{tmp_path / 'pushed'}"
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, panes=panes)
+
+    assert "tmux attach -t 0 \\; select-window -t '0:3'" in out
+
+
+def test_worktree_without_pane_shows_no_pane(hub_with_spokes: Path, tmp_path: Path) -> None:
+    panes = f"1:1\t{tmp_path / 'somewhere-unrelated'}"
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, panes=panes)
+
+    line = next(ln for ln in out.splitlines() if "feature/1-pushed" in ln)
+    assert "no pane" in line
+    assert "select-window" not in out
+    assert "switch-client" not in out
+
+
+def test_degrades_when_tmux_unavailable(hub_with_spokes: Path, tmp_path: Path) -> None:
+    # TMUX is set but every tmux call fails (stale env, dead server): the
+    # script must still exit 0 and print the branch-state rows.
+    result = _run_hub_status_proc(hub_with_spokes, tmp_path, inside_tmux=True, tmux_fail=True)
+
+    line = next(ln for ln in result.stdout.splitlines() if "feature/1-pushed" in ln)
+    assert result.returncode == 0
+    assert "pushed → mergeable" in line
