@@ -298,20 +298,29 @@ class TestCompoundFallThrough:
         command = 'rm /tmp/a\\"; rm /etc/passwd\\"'
         assert decision(command, repo) is None
 
-    def test_folded_quote_caught_in_every_payload_shape(self, repo: Path) -> None:
+    @pytest.mark.parametrize(
+        "build",
+        [
+            pytest.param(lambda cmd, repo: _payload(cmd, repo), id="claude"),
+            pytest.param(lambda cmd, repo: _cursor_payload(cmd, root=repo), id="cursor"),
+            pytest.param(lambda cmd, repo: _copilot_payload(cmd, repo), id="copilot"),
+        ],
+    )
+    def test_folded_quote_caught_in_every_payload_shape(self, repo: Path, build) -> None:
         """The raw backslash bail must read the command from EVERY source the
         extractor does — Claude tool_input, Cursor top-level, and the Copilot
         JSON-encoded toolArgs string — or the fold sneaks through one shape."""
-        command = 'rm /tmp/a\\"; rm /etc/passwd\\"'
-        for payload in (
-            _payload(command, repo),
-            _cursor_payload(command, root=repo),
-            _copilot_payload(command, repo),
-        ):
-            proc = _run(payload)
-            assert proc.returncode == 0
-            assert proc.stdout.strip() == ""
-            assert proc.stderr == ""
+        proc = _run(build('rm /tmp/a\\"; rm /etc/passwd\\"', repo))
+        assert proc.returncode == 0
+        assert proc.stdout.strip() == ""
+        assert proc.stderr == ""
+
+    def test_copilot_toolargs_scoped_rm_allows(self, repo: Path) -> None:
+        """The new toolArgs RAW source feeds only the backslash bail, never the
+        allow path: a clean scoped rm via Copilot's shape must still ALLOW."""
+        proc = _run(_copilot_payload("rm -f scratch.txt", repo))
+        assert proc.returncode == 0
+        assert json.loads(proc.stdout)["hookSpecificOutput"]["permissionDecision"] == ALLOW
 
 
 class TestNeverBreaks:
