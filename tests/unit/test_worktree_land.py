@@ -225,6 +225,45 @@ def test_refuses_spoke_ahead_of_upstream(hub: Path, tmp_path: Path) -> None:
     assert "push" in proc.stderr.lower()
 
 
+def test_refuses_spoke_behind_upstream(hub: Path, tmp_path: Path) -> None:
+    # Push two commits, then drop one locally (an ordinary post-push "undo").
+    # Landing the reduced branch would prune the remote ref and silently lose
+    # the dropped commit — the guard must refuse instead.
+    pre_sha = _git(hub, "rev-parse", "HEAD").strip()
+    wt = _make_spoke(hub, tmp_path, "feature/1-behind", push=False)
+    (wt / "second.txt").write_text("pushed then dropped\n")
+    _git(wt, "add", "second.txt")
+    _git(wt, "commit", "-qm", "feat: two", "-m", "Refs #1")
+    _git(wt, "push", "-q", "-u", "origin", "feature/1-behind")
+    _git(wt, "reset", "-q", "--hard", "HEAD~1")
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode != 0
+    assert "behind" in proc.stderr.lower()
+    assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha
+    assert _remote_sha(hub, "feature/1-behind") != ""  # remote ref untouched
+
+
+def test_merge_conflict_aborts_cleanly(hub: Path, tmp_path: Path) -> None:
+    wt = _make_spoke(hub, tmp_path, "feature/1-conflict", push=False)
+    (wt / "README.md").write_text("spoke version\n")
+    _git(wt, "add", "README.md")
+    _git(wt, "commit", "-qm", "feat: spoke readme", "-m", "Refs #1")
+    _git(wt, "push", "-q", "-u", "origin", "feature/1-conflict")
+    (hub / "README.md").write_text("hub version\n")
+    _git(hub, "add", "README.md")
+    _git(hub, "commit", "-qm", "chore: hub readme", "-m", "Refs #0")
+    pre_sha = _git(hub, "rev-parse", "HEAD").strip()
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode != 0
+    assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha
+    assert _git(hub, "status", "--porcelain") == ""  # no MERGE_HEAD left behind
+    assert wt.exists()
+
+
 def test_refuses_dirty_spoke_worktree(hub: Path, tmp_path: Path) -> None:
     wt = _make_spoke(hub, tmp_path, "feature/1-dirty", push=True)
     (wt / "wip.txt").write_text("uncommitted\n")
@@ -324,7 +363,7 @@ def test_adhoc_branch_skips_issue_close(hub: Path, tmp_path: Path) -> None:
 def test_stranded_tmux_window_is_killed(hub: Path, tmp_path: Path) -> None:
     _make_spoke(hub, tmp_path, "feature/1-stranded", push=True)
 
-    proc, logs = _run_land(hub, tmp_path, "1", tmux_windows="@3 1-stranded /gone/path")
+    proc, logs = _run_land(hub, tmp_path, "1", tmux_windows="@3\t1-stranded\t/gone/path")
 
     assert proc.returncode == 0, proc.stderr
     assert "kill-window" in _log_text(logs["tmux"])
@@ -333,7 +372,7 @@ def test_stranded_tmux_window_is_killed(hub: Path, tmp_path: Path) -> None:
 def test_live_tmux_window_is_kept(hub: Path, tmp_path: Path) -> None:
     _make_spoke(hub, tmp_path, "feature/1-alive", push=True)
 
-    proc, logs = _run_land(hub, tmp_path, "1", tmux_windows=f"@3 1-alive {tmp_path}")
+    proc, logs = _run_land(hub, tmp_path, "1", tmux_windows=f"@3\t1-alive\t{tmp_path}")
 
     assert proc.returncode == 0, proc.stderr
     assert "kill-window" not in _log_text(logs["tmux"])
@@ -342,7 +381,7 @@ def test_live_tmux_window_is_kept(hub: Path, tmp_path: Path) -> None:
 def test_unrelated_tmux_window_is_kept(hub: Path, tmp_path: Path) -> None:
     _make_spoke(hub, tmp_path, "feature/1-mine", push=True)
 
-    proc, logs = _run_land(hub, tmp_path, "1", tmux_windows="@4 2-other /gone/path")
+    proc, logs = _run_land(hub, tmp_path, "1", tmux_windows="@4\t2-other\t/gone/path")
 
     assert proc.returncode == 0, proc.stderr
     assert "kill-window" not in _log_text(logs["tmux"])
