@@ -902,9 +902,37 @@ def _write_payload(file_path: Path, content: str = "x\n") -> str:
     )
 
 
-def run_hub_guard_edit(file_path: Path, *, cwd: Path) -> int:
-    """Run hub-guard with a Write payload; return exit code."""
-    return _run(HUB_GUARD, _write_payload(file_path), cwd=cwd).returncode
+def _tool_payload(tool_name: str, tool_input: dict) -> str:
+    """Generic Claude tool-call shape for an arbitrary tool."""
+    return json.dumps({"tool_name": tool_name, "tool_input": tool_input})
+
+
+def _hub_env() -> dict[str, str]:
+    """Hook env with CURSOR_PROJECT_DIR stripped so the project-root resolution
+    falls to the payload/cwd. Without this, a Cursor-driven test run would point
+    every hub-guard probe at the IDE's project dir and flip the verdict (cf.
+    _no_stamp_key_env)."""
+    return {k: v for k, v in os.environ.items() if k != "CURSOR_PROJECT_DIR"}
+
+
+def run_hub_guard(payload: str, *, cwd: Path) -> subprocess.CompletedProcess:
+    """Run hub-guard with an explicit payload in a CURSOR_PROJECT_DIR-free env."""
+    return subprocess.run(
+        ["bash", str(HUB_GUARD)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        cwd=str(cwd),
+        env=_hub_env(),
+    )
+
+
+def hub_guard_edit_rc(file_path: Path, *, cwd: Path) -> int:
+    return run_hub_guard(_write_payload(file_path), cwd=cwd).returncode
+
+
+def hub_guard_cmd_rc(command: str, *, cwd: Path) -> int:
+    return run_hub_guard(_payload(command), cwd=cwd).returncode
 
 
 @pytest.fixture()
@@ -920,60 +948,104 @@ def linked_worktree(git_repo: Path, tmp_path: Path) -> Path:
     return wt
 
 
+@pytest.fixture()
+def hub_on_master(git_repo: Path) -> Path:
+    """The hub repo with its default branch renamed to master and no origin —
+    reproducing a CI ubuntu runner (bare `git init` → master). Pins that the
+    guard resolves the real default rather than assuming a literal "main"."""
+    subprocess.run(
+        ["git", "branch", "-m", "master"], cwd=str(git_repo), check=True, capture_output=True
+    )
+    return git_repo
+
+
 class TestHubGuard:
     # ── On the hub (main checkout, default branch): deny ──────────────
 
     def test_blocks_edit_on_hub(self, git_repo: Path) -> None:
-        assert run_hub_guard_edit(git_repo / "notes.md", cwd=git_repo) == BLOCK
+        assert hub_guard_edit_rc(git_repo / "notes.md", cwd=git_repo) == BLOCK
 
     def test_blocks_commit_on_hub(self, git_repo: Path) -> None:
-        assert run_hook(HUB_GUARD, 'git commit -m "feat: x"', cwd=git_repo) == BLOCK
+        assert hub_guard_cmd_rc('git commit -m "feat: x"', cwd=git_repo) == BLOCK
 
-    def test_blocks_branch_create_on_hub(self, git_repo: Path) -> None:
-        assert run_hook(HUB_GUARD, "git checkout -b feature/1-x", cwd=git_repo) == BLOCK
+    def test_blocks_notebook_edit_on_hub(self, git_repo: Path) -> None:
+        # NotebookEdit carries notebook_path (no file_path) — name-based dispatch
+        # must still catch it.
+        payload = _tool_payload(
+            "NotebookEdit", {"notebook_path": str(git_repo / "nb.ipynb"), "new_source": "x"}
+        )
+        assert run_hub_guard(payload, cwd=git_repo).returncode == BLOCK
 
-    def test_blocks_switch_create_on_hub(self, git_repo: Path) -> None:
-        assert run_hook(HUB_GUARD, "git switch -c feature/1-x", cwd=git_repo) == BLOCK
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git checkout -b feature/1-x",
+            "git switch -c feature/1-x",
+            "git checkout -B feature/1-x",
+            "git switch --create feature/1-x",
+            "git switch --force-create feature/1-x",
+            "git checkout --orphan feature/1-x",
+            "true && git checkout -b feature/1-x",  # chained must not bypass
+        ],
+    )
+    def test_blocks_branch_create_on_hub(self, git_repo: Path, command: str) -> None:
+        assert hub_guard_cmd_rc(command, cwd=git_repo) == BLOCK
 
-    def test_blocks_chained_branch_create_on_hub(self, git_repo: Path) -> None:
-        # Boundary-aware: a create chained after another command must not bypass.
-        assert run_hook(HUB_GUARD, "true && git checkout -b feature/1-x", cwd=git_repo) == BLOCK
+    def test_blocks_edit_on_master_default_without_origin(self, hub_on_master: Path) -> None:
+        # The guard must resolve master as the default, not assume "main".
+        assert hub_guard_edit_rc(hub_on_master / "notes.md", cwd=hub_on_master) == BLOCK
 
     def test_deny_message_points_to_start_task(self, git_repo: Path) -> None:
-        result = _run(HUB_GUARD, _write_payload(git_repo / "notes.md"), cwd=git_repo)
+        result = run_hub_guard(_write_payload(git_repo / "notes.md"), cwd=git_repo)
         assert result.returncode == BLOCK
         assert "start-task" in result.stderr.lower()
 
-    # ── Still allowed on the hub: non-mutating commands ───────────────
+    # ── Still allowed on the hub: non-mutating / sanctioned actions ───
 
     def test_allows_plain_command_on_hub(self, git_repo: Path) -> None:
-        assert run_hook(HUB_GUARD, "ls -la", cwd=git_repo) == ALLOW
+        assert hub_guard_cmd_rc("ls -la", cwd=git_repo) == ALLOW
 
     def test_allows_plain_branch_switch_on_hub(self, git_repo: Path) -> None:
         # Switching to an existing branch (no -b/-c) is not task-branch creation.
-        assert run_hook(HUB_GUARD, "git checkout main", cwd=git_repo) == ALLOW
+        assert hub_guard_cmd_rc("git checkout main", cwd=git_repo) == ALLOW
+
+    def test_allows_read_tool_on_hub(self, git_repo: Path) -> None:
+        # A read-only tool (no command) must not be denied — matters under
+        # Copilot, where this hook carries no matcher and sees every tool.
+        payload = _tool_payload("Read", {"file_path": str(git_repo / "README.md")})
+        assert run_hub_guard(payload, cwd=git_repo).returncode == ALLOW
+
+    def test_allows_worktree_add_on_hub(self, git_repo: Path, tmp_path: Path) -> None:
+        # Spawning a worktree is the sanctioned dispatch path — never blocked.
+        dest = tmp_path / "wt"
+        assert hub_guard_cmd_rc(f"git worktree add -b feature/2-x {dest}", cwd=git_repo) == ALLOW
+
+    def test_allows_edit_during_merge_on_hub(self, git_repo: Path) -> None:
+        # A merge in progress is sanctioned hub work; resolution needs edits.
+        (git_repo / ".git" / "MERGE_HEAD").write_text(f"{'0' * 40}\n")
+        assert hub_guard_edit_rc(git_repo / "notes.md", cwd=git_repo) == ALLOW
 
     # ── On a task branch in the main checkout: no-op ──────────────────
 
     def test_allows_edit_on_task_branch(self, on_branch: Callable[[str], Path]) -> None:
         repo = on_branch("feature/1-x")
-        assert run_hub_guard_edit(repo / "notes.md", cwd=repo) == ALLOW
+        assert hub_guard_edit_rc(repo / "notes.md", cwd=repo) == ALLOW
 
     def test_allows_commit_on_task_branch(self, on_branch: Callable[[str], Path]) -> None:
         repo = on_branch("feature/1-x")
-        assert run_hook(HUB_GUARD, 'git commit -m "feat: x"', cwd=repo) == ALLOW
+        assert hub_guard_cmd_rc('git commit -m "feat: x"', cwd=repo) == ALLOW
 
     # ── Inside a linked worktree (a spoke): no-op ─────────────────────
 
     def test_allows_edit_in_worktree(self, linked_worktree: Path) -> None:
-        assert run_hub_guard_edit(linked_worktree / "notes.md", cwd=linked_worktree) == ALLOW
+        assert hub_guard_edit_rc(linked_worktree / "notes.md", cwd=linked_worktree) == ALLOW
 
     def test_allows_commit_in_worktree(self, linked_worktree: Path) -> None:
-        assert run_hook(HUB_GUARD, 'git commit -m "feat: x"', cwd=linked_worktree) == ALLOW
+        assert hub_guard_cmd_rc('git commit -m "feat: x"', cwd=linked_worktree) == ALLOW
 
     # ── Outside any git repo: no-op ───────────────────────────────────
 
     def test_allows_outside_git_repo(self, tmp_path: Path) -> None:
         outside = tmp_path / "plain"
         outside.mkdir()
-        assert run_hub_guard_edit(outside / "notes.md", cwd=outside) == ALLOW
+        assert hub_guard_edit_rc(outside / "notes.md", cwd=outside) == ALLOW

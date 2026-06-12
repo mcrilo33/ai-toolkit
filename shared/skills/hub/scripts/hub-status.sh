@@ -38,11 +38,23 @@ while IFS= read -r line; do
   behind="$(awk '{print $1}' <<<"$counts")"; ahead="$(awk '{print $2}' <<<"$counts")"
   dirty=""
   [ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ] && dirty="dirty"
-  # pushed? (upstream exists and not ahead of it)
+  # Push state is measured against the branch's own UPSTREAM (not the default
+  # branch): a branch can be fully pushed yet still carry commits ahead of the
+  # default branch. Mergeability is the ahead-vs-default count.
   state="$dirty"
-  if [ -z "$dirty" ] && [ "${ahead:-0}" -gt 0 ]; then state="unpushed"; fi
-  if [ -z "$dirty" ] && [ "${ahead:-0}" = 0 ] && git -C "$path" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
-    state="pushed → mergeable"
+  if [ -z "$dirty" ]; then
+    if git -C "$path" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+      unpushed="$(git -C "$path" rev-list --count '@{u}..HEAD' 2>/dev/null)"
+      if [ "${unpushed:-0}" -gt 0 ]; then
+        state="unpushed"
+      elif [ "${ahead:-0}" -gt 0 ]; then
+        state="pushed → mergeable"
+      else
+        state="pushed"
+      fi
+    else
+      state="unpushed"
+    fi
   fi
   printf '  %-28s ↑%s ↓%s  %s\n' "$branch" "${ahead:-?}" "${behind:-?}" "$state"
 done < <(git -C "$main_root" worktree list 2>/dev/null)

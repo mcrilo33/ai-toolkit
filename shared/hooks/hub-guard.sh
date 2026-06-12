@@ -16,8 +16,11 @@
 #   • git checkout -b / git switch -c  (creating a task branch).
 #
 # It is a NO-OP (exit 0) inside any linked worktree, on any non-default branch,
-# outside a git repo, or for any other command — so execution spokes are never
-# touched. Modelled on config-protection.sh: one script, every platform.
+# outside a git repo, while a merge/rebase is in progress (sanctioned hub work),
+# or for any other command — so execution spokes are never touched. Modelled on
+# config-protection.sh: one script, every platform. On Cursor the metadata
+# override wires this hook to beforeShellExecution only, so there it gates
+# commit/branch-create (not pre-write file edits); Claude/Copilot gate all four.
 #
 # Exit 2 = block, Exit 0 = allow.
 set -euo pipefail
@@ -25,14 +28,24 @@ set -euo pipefail
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/lib/utils.sh"
 
-# Resolve the repository's default branch — the branch the hub stays on:
-# origin/HEAD if set, else the configured init.defaultBranch, else "main".
+# Resolve the repository's default branch — the branch the hub stays on. Tries,
+# in order: origin/HEAD; the configured init.defaultBranch (only if that branch
+# exists); then whichever of main/master exists; finally "main". The existence
+# checks matter because a bare `git init` lands on master on some platforms and
+# main on others, with init.defaultBranch frequently unset — a fixed "main"
+# fallback would silently disable the guard on a master-default hub.
 hub_default_branch() {
   local root="$1" def
   def=$(git -C "$root" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
   [ -n "$def" ] && { printf '%s' "$def"; return 0; }
   def=$(git -C "$root" config --get init.defaultBranch 2>/dev/null || true)
-  [ -n "$def" ] && { printf '%s' "$def"; return 0; }
+  if [ -n "$def" ] && git -C "$root" show-ref --verify --quiet "refs/heads/$def"; then
+    printf '%s' "$def"
+    return 0
+  fi
+  for def in main master; do
+    git -C "$root" show-ref --verify --quiet "refs/heads/$def" && { printf '%s' "$def"; return 0; }
+  done
   printf 'main'
 }
 
@@ -40,7 +53,7 @@ INPUT=$(read_stdin)
 ROOT=$(project_root_from_payload "$INPUT")
 
 # Not in a git repo → nothing to guard.
-GIT_DIR=$(git -C "$ROOT" rev-parse --git-dir 2>/dev/null || true)
+GIT_DIR=$(git -C "$ROOT" rev-parse --absolute-git-dir 2>/dev/null || true)
 [ -z "$GIT_DIR" ] && exit 0
 
 # Inside a linked worktree → this is an execution spoke, never the hub. A
@@ -54,6 +67,13 @@ DEFAULT_BRANCH=$(hub_default_branch "$ROOT")
 CURRENT_BRANCH=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
 [ -z "$CURRENT_BRANCH" ] && exit 0
 [ "$CURRENT_BRANCH" != "$DEFAULT_BRANCH" ] && exit 0
+
+# A merge / rebase / cherry-pick / revert in progress is sanctioned hub work
+# (the hub lands spoke branches): resolving conflicts needs edits + a commit, so
+# allow them until the operation finishes rather than dead-ending it.
+for marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do
+  [ -e "$GIT_DIR/$marker" ] && exit 0
+done
 
 # ── We are on the main checkout, on the default branch: the planning hub. ──
 DENY_MSG="The main checkout on '$DEFAULT_BRANCH' is the planning hub — it never holds task work.
@@ -73,8 +93,15 @@ if [ -n "$COMMAND" ]; then
   exit 0
 fi
 
-# Otherwise this is a file-mutating tool (Edit / Write / NotebookEdit). Skip
-# only the Cursor internal scratch path, which is never a real edit.
+# No command → a tool call. Deny only file-MUTATING tools (Write / Edit /
+# NotebookEdit, and the Copilot edit|create names), identified by tool name so
+# read-only tools (read_file, grep, …) still work on the hub — important under
+# Copilot, where this hook carries no matcher and fires for every tool. NB:
+# NotebookEdit carries notebook_path, not file_path, so a path-presence test
+# would miss it; the name match catches it. Skip the Cursor scratch path first.
 FILE_PATH=$(get_edit_file_path "$INPUT")
 is_agent_tools_path "$FILE_PATH" && exit 0
-deny "$DENY_MSG"
+case "$(get_tool_name "$INPUT")" in
+  *[Ww]rite* | *[Ee]dit* | *[Cc]reate* | *[Nn]otebook*) deny "$DENY_MSG" ;;
+esac
+exit 0

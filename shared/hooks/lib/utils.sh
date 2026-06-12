@@ -167,15 +167,18 @@ is_git_push_or_pr() {
 }
 
 # ── Recognize a branch-CREATING checkout/switch ──────────────────────
-# Matches `git checkout -b|-B <name>` and `git switch -c|-C <name>` at a
-# command boundary (same boundary-awareness as is_git_commit), tolerating
-# leading options and env-assignment prefixes, so chained/prefixed forms are
-# not bypassed: `cd x && git checkout -b y`, `git -C path switch -c y`. A plain
-# branch switch (`git checkout main`, `git switch x`) does NOT match — only
-# branch creation, which on the hub belongs in a worktree. Returns 0 on match.
+# Matches branch creation at a command boundary (same boundary-awareness as
+# is_git_commit), tolerating leading options and env-assignment prefixes, so
+# chained/prefixed forms are not bypassed: `cd x && git checkout -b y`,
+# `git -C path switch -c y`. Covers both short and long spellings:
+#   checkout -b|-B|--orphan          switch -c|-C|--create|--force-create
+# A plain branch switch (`git checkout main`, `git switch x`) does NOT match —
+# only branch creation, which on the hub belongs in a worktree. Returns 0 on
+# match. Note: `git worktree add -b` is the sanctioned dispatch path and is NOT
+# matched (its subcommand is `worktree`, not `checkout`/`switch`).
 is_git_branch_create() {
   local cmd="$1"
-  printf '%s' "$cmd" | grep -qE '(^|[;&|`]|\$\()[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git([[:space:]]+(-[^[:space:]]+|--[^[:space:]]+|-C[[:space:]]+[^[:space:]]+))*[[:space:]]+(checkout([[:space:]]+-[^[:space:]]+)*[[:space:]]+-[a-zA-Z]*[bB]\b|switch([[:space:]]+-[^[:space:]]+)*[[:space:]]+-[a-zA-Z]*[cC]\b)'
+  printf '%s' "$cmd" | grep -qE '(^|[;&|`]|\$\()[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git([[:space:]]+(-[^[:space:]]+|--[^[:space:]]+|-C[[:space:]]+[^[:space:]]+))*[[:space:]]+(checkout([[:space:]]+-[^[:space:]]+)*[[:space:]]+(-[a-zA-Z]*[bB]|--orphan)\b|switch([[:space:]]+-[^[:space:]]+)*[[:space:]]+(-[a-zA-Z]*[cC]|--create|--force-create)\b)'
 }
 
 # ── Get the edited file path (cross-platform) ───────────────────────
