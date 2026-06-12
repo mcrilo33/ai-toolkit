@@ -84,7 +84,7 @@ hub-guard:
     matcher: "edit|create"
   cursor:
     event: beforeShellExecution
-    matcher: "git( +-[^ ]+| +-C +[^ ]+)* +(commit|checkout|switch)( |$)"
+    matcher: "git( +-[^ ]+| +-C +[^ ]+)* +(commit|checkout|switch|branch)( |$)"
 
 post-edit-format:
   event: postToolUse

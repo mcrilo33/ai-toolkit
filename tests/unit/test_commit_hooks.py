@@ -985,11 +985,17 @@ class TestHubGuard:
             "git switch --create feature/1-x",
             "git switch --force-create feature/1-x",
             "git checkout --orphan feature/1-x",
+            "git branch feature/1-x",  # bare create
             "true && git checkout -b feature/1-x",  # chained must not bypass
         ],
     )
     def test_blocks_branch_create_on_hub(self, git_repo: Path, command: str) -> None:
         assert hub_guard_cmd_rc(command, cwd=git_repo) == BLOCK
+
+    def test_blocks_create_file_tool_on_hub(self, git_repo: Path) -> None:
+        # A "create"-named tool that writes a file (carries file_path) is denied.
+        payload = _tool_payload("create_file", {"file_path": str(git_repo / "x.py")})
+        assert run_hub_guard(payload, cwd=git_repo).returncode == BLOCK
 
     def test_blocks_edit_on_master_default_without_origin(self, hub_on_master: Path) -> None:
         # The guard must resolve master as the default, not assume "main".
@@ -1005,15 +1011,39 @@ class TestHubGuard:
     def test_allows_plain_command_on_hub(self, git_repo: Path) -> None:
         assert hub_guard_cmd_rc("ls -la", cwd=git_repo) == ALLOW
 
-    def test_allows_plain_branch_switch_on_hub(self, git_repo: Path) -> None:
-        # Switching to an existing branch (no -b/-c) is not task-branch creation.
-        assert hub_guard_cmd_rc("git checkout main", cwd=git_repo) == ALLOW
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git checkout main",  # switch to an existing branch (no -b/-c)
+            "git branch",  # list branches
+            "git branch -a",  # list all
+            "git branch -d old-branch",  # delete
+            "git branch --list 'feature/*'",  # list with pattern
+        ],
+    )
+    def test_allows_non_creating_branch_ops_on_hub(self, git_repo: Path, command: str) -> None:
+        assert hub_guard_cmd_rc(command, cwd=git_repo) == ALLOW
 
     def test_allows_read_tool_on_hub(self, git_repo: Path) -> None:
         # A read-only tool (no command) must not be denied — matters under
         # Copilot, where this hook carries no matcher and sees every tool.
         payload = _tool_payload("Read", {"file_path": str(git_repo / "README.md")})
         assert run_hub_guard(payload, cwd=git_repo).returncode == ALLOW
+
+    def test_allows_create_issue_tool_on_hub(self, git_repo: Path) -> None:
+        # A "create"-named tool with NO file_path (create_issue, create_pull_request)
+        # is hub planning work, not a file write — must not be collateral-blocked.
+        payload = _tool_payload("create_issue", {"title": "x", "body": "y"})
+        assert run_hub_guard(payload, cwd=git_repo).returncode == ALLOW
+
+    def test_allows_write_outside_repo_on_hub(
+        self, git_repo: Path, tmp_path_factory: pytest.TempPathFactory
+    ) -> None:
+        # Writing a scratch file outside the repo (e.g. a /tmp issue body) is not
+        # hub task work on the repo, so it is allowed. The dir is a sibling of
+        # git_repo (which is itself the test's tmp_path), so it is truly outside.
+        outside = tmp_path_factory.mktemp("elsewhere") / "body.md"
+        assert hub_guard_edit_rc(outside, cwd=git_repo) == ALLOW
 
     def test_allows_worktree_add_on_hub(self, git_repo: Path, tmp_path: Path) -> None:
         # Spawning a worktree is the sanctioned dispatch path — never blocked.

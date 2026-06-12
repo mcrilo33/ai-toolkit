@@ -55,6 +55,12 @@ def hub_with_spokes(tmp_path: Path) -> Path:
     (unpushed / "b.txt").write_text("b\n")
     _git(unpushed, "add", "b.txt")
     _git(unpushed, "commit", "-qm", "feat: b", "-m", "Refs #2")
+
+    # Pushed-but-not-ahead spoke: branched from main, pushed, no new commits —
+    # nothing left to merge, so "pushed" (not "pushed → mergeable").
+    pushed_even = tmp_path / "even"
+    _git(hub, "worktree", "add", "-q", "-b", "feature/3-even", str(pushed_even))
+    _git(pushed_even, "push", "-q", "-u", "origin", "feature/3-even")
     return hub
 
 
@@ -87,6 +93,12 @@ def test_unpushed_spoke_is_unpushed(hub_with_spokes: Path, tmp_path: Path) -> No
     out = _run_hub_status(hub_with_spokes, tmp_path)
     line = next(ln for ln in out.splitlines() if "feature/2-unpushed" in ln)
     assert "unpushed" in line
+
+
+def test_pushed_even_spoke_is_pushed_not_mergeable(hub_with_spokes: Path, tmp_path: Path) -> None:
+    out = _run_hub_status(hub_with_spokes, tmp_path)
+    line = next(ln for ln in out.splitlines() if "feature/3-even" in ln)
+    assert "pushed" in line and "mergeable" not in line
 
 
 def test_hub_branch_labelled_hub(hub_with_spokes: Path, tmp_path: Path) -> None:

@@ -57,9 +57,11 @@ GIT_DIR=$(git -C "$ROOT" rev-parse --absolute-git-dir 2>/dev/null || true)
 [ -z "$GIT_DIR" ] && exit 0
 
 # Inside a linked worktree → this is an execution spoke, never the hub. A
-# worktree's git-dir lives under <main>/.git/worktrees/<name>.
+# worktree's git-dir lives under <main>/.git/worktrees/<name>; matching the full
+# "/.git/worktrees/" segment (not a bare "/worktrees/") avoids misreading a main
+# checkout that merely sits under a directory named "worktrees".
 case "$GIT_DIR" in
-  *"/worktrees/"*) exit 0 ;;
+  */.git/worktrees/*) exit 0 ;;
 esac
 
 # The hub lives only on the default branch; any other branch is a spoke.
@@ -93,15 +95,26 @@ if [ -n "$COMMAND" ]; then
   exit 0
 fi
 
-# No command → a tool call. Deny only file-MUTATING tools (Write / Edit /
-# NotebookEdit, and the Copilot edit|create names), identified by tool name so
-# read-only tools (read_file, grep, …) still work on the hub — important under
-# Copilot, where this hook carries no matcher and fires for every tool. NB:
-# NotebookEdit carries notebook_path, not file_path, so a path-presence test
-# would miss it; the name match catches it. Skip the Cursor scratch path first.
+# No command → a tool call. Skip the Cursor scratch path first.
 FILE_PATH=$(get_edit_file_path "$INPUT")
 is_agent_tools_path "$FILE_PATH" && exit 0
+
+# A file path OUTSIDE this repo is not hub task work (e.g. writing a /tmp scratch
+# file to feed `gh issue create --body-file`) — let it through.
+case "$FILE_PATH" in
+  "" | "$ROOT" | "$ROOT"/*) ;; # no path, or inside the repo → keep guarding
+  /*) exit 0 ;;                # an absolute path outside the repo → allow
+esac
+
+# Deny only file-MUTATING tools, identified by tool name so read-only tools
+# (read_file, grep, …) still work on the hub — important under Copilot, where
+# this hook carries no matcher and fires for EVERY tool. Write/Edit/NotebookEdit
+# always mutate (NotebookEdit carries notebook_path, not file_path, so the name
+# match is what catches it); a "create"-named tool is only treated as a file
+# write when it carries a file_path, so the hub's own create_issue /
+# create_pull_request style tools are not collateral-blocked.
 case "$(get_tool_name "$INPUT")" in
-  *[Ww]rite* | *[Ee]dit* | *[Cc]reate* | *[Nn]otebook*) deny "$DENY_MSG" ;;
+  *[Ww]rite* | *[Ee]dit* | *[Nn]otebook*) deny "$DENY_MSG" ;;
+  *[Cc]reate*) [ -n "$FILE_PATH" ] && deny "$DENY_MSG" ;;
 esac
 exit 0
