@@ -112,5 +112,5 @@ Present to the user:
 |-----------|--------|
 | No repo context | Ask for owner/repo |
 | Issue not found | Verify number, check repo access |
-| Branch already exists | Ask to reuse or create new |
+| Branch already exists (3b fallback) | Ask to reuse or create new |
 | Multiple repos | Ask which repo to use |

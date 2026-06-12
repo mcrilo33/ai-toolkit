@@ -40,7 +40,7 @@ SPOKE:  SOURCE → DEFINE → EXECUTE → VERIFY → PUSH  (per subtask — solo
 ```
 - [ ] Task identified (issue URL or ad-hoc scope)
 - [ ] Issue details read and understood
-- [ ] Branch created from latest default branch
+- [ ] Branch confirmed (hub flow) — or created from latest default branch (non-hub fallback)
 - [ ] Existing code/patterns reviewed for context
 - [ ] Dependencies or blockers identified
 ```
@@ -59,7 +59,7 @@ The thresholds, the TDD agent sequence, and the violation rules all live in
 - [ ] If 3+ files: planner agent spawned and plan received
 - [ ] If TDD: tdd-red agent spawned (not inline test writing)
 - [ ] Acceptance criteria written (specific, testable)
-- [ ] Scope boundaries stated ("this PR will NOT do X")
+- [ ] Scope boundaries stated ("this task will NOT do X")
 - [ ] Approach chosen (TDD vs simple)
 - [ ] Files to create/modify listed
 - [ ] Edge cases and error scenarios identified
