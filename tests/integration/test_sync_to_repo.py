@@ -78,10 +78,11 @@ ALL_RULE_NAMES = {
     "library-research",
     "agent-orchestration",
     "scientific-integrity",
+    "planning-hub",
 }
 
 # Rules that have no applyTo/globs in metadata
-RULES_WITHOUT_GLOB = {"library-research"}
+RULES_WITHOUT_GLOB = {"library-research", "planning-hub"}
 
 # Rules that define 'paths' in metadata → generated as Claude rules
 CLAUDE_RULES_WITH_PATHS = {
@@ -96,9 +97,7 @@ CLAUDE_RULES_WITH_PATHS = {
 
 # All skill directories in shared/skills/ that contain SKILL.md
 ALL_SKILL_NAMES = {
-    d.name
-    for d in (SHARED_DIR / "skills").iterdir()
-    if d.is_dir() and (d / "SKILL.md").exists()
+    d.name for d in (SHARED_DIR / "skills").iterdir() if d.is_dir() and (d / "SKILL.md").exists()
 }
 
 # Skills that have metadata entries (parsed from metadata.yml)
@@ -111,9 +110,7 @@ if _skills_meta.exists():
 SKILLS_WITH_ALLOWED_TOOLS = {
     name
     for name, data in (
-        yaml.safe_load(_skills_meta.read_text()).items()
-        if _skills_meta.exists()
-        else []
+        yaml.safe_load(_skills_meta.read_text()).items() if _skills_meta.exists() else []
     )
     if "allowed-tools" in data
 }
@@ -135,9 +132,7 @@ if _agents_meta.exists():
 AGENTS_WITH_DISALLOWED_TOOLS = {
     name
     for name, data in (
-        yaml.safe_load(_agents_meta.read_text()).items()
-        if _agents_meta.exists()
-        else []
+        yaml.safe_load(_agents_meta.read_text()).items() if _agents_meta.exists() else []
     )
     if "disallowedTools" in data
 }
@@ -147,9 +142,7 @@ SKILL_SUBDIRS = ("references", "scripts", "templates", "assets")
 SKILLS_WITH_SUBDIRS = {
     d.name: [sub for sub in SKILL_SUBDIRS if (d / sub).is_dir()]
     for d in (SHARED_DIR / "skills").iterdir()
-    if d.is_dir()
-    and (d / "SKILL.md").exists()
-    and any((d / sub).is_dir() for sub in SKILL_SUBDIRS)
+    if d.is_dir() and (d / "SKILL.md").exists() and any((d / sub).is_dir() for sub in SKILL_SUBDIRS)
 }
 
 
@@ -209,9 +202,7 @@ def _run_sync(target: Path, tool: str = "all") -> subprocess.CompletedProcess[st
 class TestSyncCopilot:
     """Verify Copilot file generation."""
 
-    def test_copilot_instruction_files_have_frontmatter(
-        self, target_repo: Path
-    ) -> None:
+    def test_copilot_instruction_files_have_frontmatter(self, target_repo: Path) -> None:
         _run_sync(target_repo, "copilot")
 
         instructions = target_repo / ".github" / "instructions"
@@ -267,8 +258,7 @@ class TestCopilotRules:
 
         instructions = target_repo / ".github" / "instructions"
         generated = {
-            f.stem.removesuffix(".instructions")
-            for f in instructions.glob("*.instructions.md")
+            f.stem.removesuffix(".instructions") for f in instructions.glob("*.instructions.md")
         }
         assert generated == ALL_RULE_NAMES
 
@@ -362,9 +352,7 @@ class TestCursorRules:
         generated = {f.stem for f in rules_dir.glob("*.mdc")}
         assert generated == ALL_RULE_NAMES
 
-    def test_frontmatter_has_description_and_alwaysApply(
-        self, target_repo: Path
-    ) -> None:
+    def test_frontmatter_has_description_and_alwaysApply(self, target_repo: Path) -> None:
         """Each Cursor rule has description and alwaysApply."""
         _run_sync(target_repo, "cursor")
 
@@ -385,9 +373,7 @@ class TestCursorRules:
             expected_globs = meta.get(rule_name, {}).get("globs")
             fm = _parse_frontmatter(f.read_text())
             if expected_globs:
-                assert fm.get("globs") == str(
-                    expected_globs
-                ), f"{f.name}: globs mismatch"
+                assert fm.get("globs") == str(expected_globs), f"{f.name}: globs mismatch"
 
     def test_alwaysApply_value_matches_metadata(self, target_repo: Path) -> None:
         _run_sync(target_repo, "cursor")
@@ -398,9 +384,7 @@ class TestCursorRules:
             rule_name = f.stem
             expected = str(meta.get(rule_name, {}).get("alwaysApply", "")).lower()
             fm = _parse_frontmatter(f.read_text())
-            assert (
-                fm.get("alwaysApply", "").lower() == expected
-            ), f"{f.name}: alwaysApply mismatch"
+            assert fm.get("alwaysApply", "").lower() == expected, f"{f.name}: alwaysApply mismatch"
 
     def test_body_matches_source_for_every_rule(self, target_repo: Path) -> None:
         _run_sync(target_repo, "cursor")
@@ -480,9 +464,7 @@ class TestClaudeRules:
         rules_dir = target_repo / ".claude" / "rules"
         generated = {f.stem for f in rules_dir.glob("*.md")}
         excluded = {"guidelines", "security", "workflow", "library-research"}
-        assert generated.isdisjoint(
-            excluded
-        ), f"Unexpected rules in Claude: {generated & excluded}"
+        assert generated.isdisjoint(excluded), f"Unexpected rules in Claude: {generated & excluded}"
 
     def test_body_matches_source_for_every_rule(self, target_repo: Path) -> None:
         _run_sync(target_repo, "claude")
@@ -557,9 +539,7 @@ class TestCopilotSkills:
 
         skills_dir = target_repo / ".github" / "skills"
         generated = {
-            d.name
-            for d in skills_dir.iterdir()
-            if d.is_dir() and (d / "SKILL.md").exists()
+            d.name for d in skills_dir.iterdir() if d.is_dir() and (d / "SKILL.md").exists()
         }
         assert generated == ALL_SKILL_NAMES
 
@@ -573,9 +553,7 @@ class TestCopilotSkills:
             if not skill_md.exists():
                 continue
             content = skill_md.read_text()
-            assert content.startswith(
-                "---"
-            ), f"skills/{name}/SKILL.md missing frontmatter"
+            assert content.startswith("---"), f"skills/{name}/SKILL.md missing frontmatter"
 
     def test_frontmatter_has_name_and_description(self, target_repo: Path) -> None:
         _run_sync(target_repo, "copilot")
@@ -599,12 +577,8 @@ class TestCopilotSkills:
             if not skill_md.exists():
                 continue
             fm = _parse_frontmatter(skill_md.read_text())
-            assert (
-                "allowed-tools" in fm
-            ), f"skills/{name}/SKILL.md missing 'allowed-tools'"
-            assert fm[
-                "allowed-tools"
-            ], f"skills/{name}/SKILL.md has empty 'allowed-tools'"
+            assert "allowed-tools" in fm, f"skills/{name}/SKILL.md missing 'allowed-tools'"
+            assert fm["allowed-tools"], f"skills/{name}/SKILL.md has empty 'allowed-tools'"
 
     def test_body_matches_source_for_every_skill(self, target_repo: Path) -> None:
         """Body after frontmatter matches the original shared skill."""
@@ -621,9 +595,7 @@ class TestCopilotSkills:
             assert src.exists(), f"Source missing: {src}"
 
             dst_body = _strip_frontmatter(skill_md.read_text())
-            assert (
-                dst_body == src.read_text()
-            ), f"skills/{d.name}/SKILL.md body differs from source"
+            assert dst_body == src.read_text(), f"skills/{d.name}/SKILL.md body differs from source"
 
     def test_skill_subdirs_copied(self, target_repo: Path) -> None:
         """Skill subdirectories (references, scripts, etc.) are copied."""
@@ -650,9 +622,7 @@ class TestCursorSkills:
 
         skills_dir = target_repo / ".cursor" / "skills"
         generated = {
-            d.name
-            for d in skills_dir.iterdir()
-            if d.is_dir() and (d / "SKILL.md").exists()
+            d.name for d in skills_dir.iterdir() if d.is_dir() and (d / "SKILL.md").exists()
         }
         assert generated == ALL_SKILL_NAMES
 
@@ -665,9 +635,7 @@ class TestCursorSkills:
             if not skill_md.exists():
                 continue
             content = skill_md.read_text()
-            assert content.startswith(
-                "---"
-            ), f"skills/{name}/SKILL.md missing frontmatter"
+            assert content.startswith("---"), f"skills/{name}/SKILL.md missing frontmatter"
 
     def test_frontmatter_has_name_and_description(self, target_repo: Path) -> None:
         _run_sync(target_repo, "cursor")
@@ -695,9 +663,7 @@ class TestCursorSkills:
             assert src.exists(), f"Source missing: {src}"
 
             dst_body = _strip_frontmatter(skill_md.read_text())
-            assert (
-                dst_body == src.read_text()
-            ), f"skills/{d.name}/SKILL.md body differs from source"
+            assert dst_body == src.read_text(), f"skills/{d.name}/SKILL.md body differs from source"
 
     def test_skill_subdirs_copied(self, target_repo: Path) -> None:
         _run_sync(target_repo, "cursor")
@@ -720,9 +686,7 @@ class TestClaudeSkills:
 
         skills_dir = target_repo / ".claude" / "skills"
         generated = {
-            d.name
-            for d in skills_dir.iterdir()
-            if d.is_dir() and (d / "SKILL.md").exists()
+            d.name for d in skills_dir.iterdir() if d.is_dir() and (d / "SKILL.md").exists()
         }
         assert generated == ALL_SKILL_NAMES
 
@@ -735,9 +699,7 @@ class TestClaudeSkills:
             if not skill_md.exists():
                 continue
             content = skill_md.read_text()
-            assert content.startswith(
-                "---"
-            ), f"skills/{name}/SKILL.md missing frontmatter"
+            assert content.startswith("---"), f"skills/{name}/SKILL.md missing frontmatter"
 
     def test_frontmatter_has_name_and_description(self, target_repo: Path) -> None:
         _run_sync(target_repo, "claude")
@@ -765,9 +727,7 @@ class TestClaudeSkills:
             assert src.exists(), f"Source missing: {src}"
 
             dst_body = _strip_frontmatter(skill_md.read_text())
-            assert (
-                dst_body == src.read_text()
-            ), f"skills/{d.name}/SKILL.md body differs from source"
+            assert dst_body == src.read_text(), f"skills/{d.name}/SKILL.md body differs from source"
 
     def test_skill_subdirs_copied(self, target_repo: Path) -> None:
         _run_sync(target_repo, "claude")
@@ -790,9 +750,7 @@ class TestCopilotAgents:
         _run_sync(target_repo, "copilot")
 
         agents_dir = target_repo / ".github" / "agents"
-        generated = {
-            f.stem.removesuffix(".agent") for f in agents_dir.glob("*.agent.md")
-        }
+        generated = {f.stem.removesuffix(".agent") for f in agents_dir.glob("*.agent.md")}
         assert generated == ALL_AGENT_NAMES
 
     def test_agents_with_metadata_have_frontmatter(self, target_repo: Path) -> None:
@@ -804,9 +762,7 @@ class TestCopilotAgents:
             if not agent_md.exists():
                 continue
             content = agent_md.read_text()
-            assert content.startswith(
-                "---"
-            ), f"agents/{name}.agent.md missing frontmatter"
+            assert content.startswith("---"), f"agents/{name}.agent.md missing frontmatter"
 
     def test_frontmatter_has_name_and_description(self, target_repo: Path) -> None:
         _run_sync(target_repo, "copilot")
@@ -830,9 +786,7 @@ class TestCopilotAgents:
             if not agent_md.exists():
                 continue
             fm = _parse_frontmatter(agent_md.read_text())
-            assert (
-                "disallowedTools" in fm
-            ), f"agents/{name}.agent.md missing 'disallowedTools'"
+            assert "disallowedTools" in fm, f"agents/{name}.agent.md missing 'disallowedTools'"
 
     def test_body_matches_source_for_every_agent(self, target_repo: Path) -> None:
         """Body after frontmatter matches the original shared agent."""
@@ -845,9 +799,7 @@ class TestCopilotAgents:
             assert src.exists(), f"Source missing: {src}"
 
             dst_body = _strip_frontmatter(f.read_text())
-            assert (
-                dst_body == src.read_text()
-            ), f"agents/{f.name} body differs from source"
+            assert dst_body == src.read_text(), f"agents/{f.name} body differs from source"
 
 
 # ── Cursor Agents ─────────────────────────────────────────
@@ -894,9 +846,7 @@ class TestCursorAgents:
             assert src.exists(), f"Source missing: {src}"
 
             dst_body = _strip_frontmatter(f.read_text())
-            assert (
-                dst_body == src.read_text()
-            ), f"agents/{f.name} body differs from source"
+            assert dst_body == src.read_text(), f"agents/{f.name} body differs from source"
 
 
 # ── Claude Agents ─────────────────────────────────────────
@@ -944,9 +894,7 @@ class TestClaudeAgents:
             assert src.exists(), f"Source missing: {src}"
 
             dst_body = _strip_frontmatter(f.read_text())
-            assert (
-                dst_body == src.read_text()
-            ), f"agents/{f.name} body differs from source"
+            assert dst_body == src.read_text(), f"agents/{f.name} body differs from source"
 
 
 # ── Hook idempotency / reconciliation ─────────────────────
@@ -976,18 +924,14 @@ class TestHookIdempotency:
                         counts[event] += 1
         return counts
 
-    def test_cursor_config_byte_identical_across_runs(
-        self, target_repo: Path
-    ) -> None:
+    def test_cursor_config_byte_identical_across_runs(self, target_repo: Path) -> None:
         _run_sync(target_repo, "all")
         first = (target_repo / ".cursor" / "hooks.json").read_text()
         _run_sync(target_repo, "all")
         second = (target_repo / ".cursor" / "hooks.json").read_text()
         assert first == second, ".cursor/hooks.json changed on second sync"
 
-    def test_claude_settings_byte_identical_across_runs(
-        self, target_repo: Path
-    ) -> None:
+    def test_claude_settings_byte_identical_across_runs(self, target_repo: Path) -> None:
         _run_sync(target_repo, "all")
         first = (target_repo / ".claude" / "settings.json").read_text()
         _run_sync(target_repo, "all")
@@ -1003,27 +947,19 @@ class TestHookIdempotency:
 
     def test_claude_counts_match_metadata(self, target_repo: Path) -> None:
         _run_sync(target_repo, "all")
-        settings = json.loads(
-            (target_repo / ".claude" / "settings.json").read_text()
-        )
-        assert self._owned_claude_handlers(settings) == _hook_event_counts(
-            _CLAUDE_EVENT_MAP
-        )
+        settings = json.loads((target_repo / ".claude" / "settings.json").read_text())
+        assert self._owned_claude_handlers(settings) == _hook_event_counts(_CLAUDE_EVENT_MAP)
 
     def test_counts_stable_after_repeated_runs(self, target_repo: Path) -> None:
         """Five syncs yield exactly one entry per shared hook per event."""
         for _ in range(5):
             _run_sync(target_repo, "all")
         hooks_json = json.loads((target_repo / ".cursor" / "hooks.json").read_text())
-        settings = json.loads(
-            (target_repo / ".claude" / "settings.json").read_text()
-        )
+        settings = json.loads((target_repo / ".claude" / "settings.json").read_text())
         assert self._owned_cursor_entries(hooks_json) == _hook_event_counts(
             _CURSOR_EVENT_MAP, tool="cursor"
         )
-        assert self._owned_claude_handlers(settings) == _hook_event_counts(
-            _CLAUDE_EVENT_MAP
-        )
+        assert self._owned_claude_handlers(settings) == _hook_event_counts(_CLAUDE_EVENT_MAP)
 
     def test_self_heals_bloated_cursor_file(self, target_repo: Path) -> None:
         """A pre-bloated hooks.json shrinks to the canonical set on next sync."""
@@ -1031,9 +967,7 @@ class TestHookIdempotency:
         cursor_file = target_repo / ".cursor" / "hooks.json"
         bloated = json.loads(cursor_file.read_text())
         for event in list(bloated["hooks"]):
-            bloated["hooks"][event] = [
-                dict(e) for e in bloated["hooks"][event] for _ in range(5)
-            ]
+            bloated["hooks"][event] = [dict(e) for e in bloated["hooks"][event] for _ in range(5)]
         cursor_file.write_text(json.dumps(bloated, indent=2))
 
         _run_sync(target_repo, "all")
@@ -1080,18 +1014,14 @@ class TestManifestAndGC:
 
     MANIFEST_NAME = ".ai-toolkit-manifest.json"
 
-    def test_sync_cursor_writes_manifest_with_cursor_list(
-        self, target_repo: Path
-    ) -> None:
+    def test_sync_cursor_writes_manifest_with_cursor_list(self, target_repo: Path) -> None:
         _run_sync(target_repo, "cursor")
 
         manifest = json.loads((target_repo / self.MANIFEST_NAME).read_text())
         assert manifest["tools"]["cursor"], "cursor list is empty"
         assert ".cursor/rules/guidelines.mdc" in manifest["tools"]["cursor"]
 
-    def test_resync_deletes_stale_manifest_listed_file(
-        self, target_repo: Path
-    ) -> None:
+    def test_resync_deletes_stale_manifest_listed_file(self, target_repo: Path) -> None:
         _run_sync(target_repo, "cursor")
         stale = target_repo / ".cursor" / "rules" / "obsolete-rule.mdc"
         stale.write_text("---\ndescription: obsolete\n---\n\n# Obsolete\n")
@@ -1106,9 +1036,7 @@ class TestManifestAndGC:
         manifest = json.loads(manifest_file.read_text())
         assert ".cursor/rules/obsolete-rule.mdc" not in manifest["tools"]["cursor"]
 
-    def test_user_file_not_in_manifest_survives_resync(
-        self, target_repo: Path
-    ) -> None:
+    def test_user_file_not_in_manifest_survives_resync(self, target_repo: Path) -> None:
         _run_sync(target_repo, "cursor")
         user_rule = target_repo / ".cursor" / "rules" / "my-own-rule.mdc"
         user_rule.write_text("---\ndescription: mine\n---\n\n# Mine\n")
@@ -1134,9 +1062,7 @@ class TestManifestAndGC:
         assert not (target_repo / ".cursor").exists()
         assert not (target_repo / self.MANIFEST_NAME).exists()
 
-    def test_manifest_byte_identical_after_second_sync(
-        self, target_repo: Path
-    ) -> None:
+    def test_manifest_byte_identical_after_second_sync(self, target_repo: Path) -> None:
         _run_sync(target_repo, "cursor")
         first = (target_repo / self.MANIFEST_NAME).read_bytes()
 
@@ -1185,36 +1111,24 @@ class TestMcpServerSync:
         _run_sync(target_repo, "claude")
 
         src_dir = REPO_ROOT / "mcp" / "review-stamp"
-        assert (target_repo / self.RUN_SH).read_bytes() == (
-            src_dir / "run.sh"
-        ).read_bytes()
-        assert (target_repo / self.SERVER_PY).read_bytes() == (
-            src_dir / "server.py"
-        ).read_bytes()
+        assert (target_repo / self.RUN_SH).read_bytes() == (src_dir / "run.sh").read_bytes()
+        assert (target_repo / self.SERVER_PY).read_bytes() == (src_dir / "server.py").read_bytes()
 
-    def test_both_files_recorded_in_manifest_for_every_tool(
-        self, target_repo: Path
-    ) -> None:
+    def test_both_files_recorded_in_manifest_for_every_tool(self, target_repo: Path) -> None:
         _run_sync(target_repo, "all")
 
         manifest = json.loads((target_repo / self.MANIFEST_NAME).read_text())
         for tool in ("copilot", "cursor", "claude"):
             assert self.RUN_SH in manifest["tools"][tool], f"{tool}: run.sh missing"
-            assert (
-                self.SERVER_PY in manifest["tools"][tool]
-            ), f"{tool}: server.py missing"
+            assert self.SERVER_PY in manifest["tools"][tool], f"{tool}: server.py missing"
 
     def test_resync_is_byte_identical(self, target_repo: Path) -> None:
         _run_sync(target_repo, "all")
-        first = {
-            p: (target_repo / p).read_bytes() for p in (self.RUN_SH, self.SERVER_PY)
-        }
+        first = {p: (target_repo / p).read_bytes() for p in (self.RUN_SH, self.SERVER_PY)}
 
         _run_sync(target_repo, "all")
 
-        second = {
-            p: (target_repo / p).read_bytes() for p in (self.RUN_SH, self.SERVER_PY)
-        }
+        second = {p: (target_repo / p).read_bytes() for p in (self.RUN_SH, self.SERVER_PY)}
         assert first == second
 
     def test_dry_run_does_not_install(self, target_repo: Path) -> None:

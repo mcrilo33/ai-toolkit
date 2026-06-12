@@ -38,6 +38,7 @@ SECRETS_SCAN_REVERT = HOOKS_DIR / "secrets-scan-revert.sh"
 CONFIG_PROTECTION = HOOKS_DIR / "config-protection.sh"
 GIT_PUSH_REVIEW = HOOKS_DIR / "git-push-review.sh"
 DELEGATION = HOOKS_DIR / "delegation-gate-warn.sh"
+HUB_GUARD = HOOKS_DIR / "hub-guard.sh"
 UTILS = HOOKS_DIR / "lib" / "utils.sh"
 
 BLOCK = 2
@@ -205,7 +206,7 @@ def test_commit_quality_format(
 def test_commit_quality_escaped_double_quotes_pass(on_branch: Callable[[str], Path]) -> None:
     # Issue #1: a runtime that serializes inner quotes as \"...\" must still parse.
     repo = on_branch("feature/1-x")
-    command = r'git commit -m \"feat(core): add helper\" -m \"Refs #1\"'
+    command = r"git commit -m \"feat(core): add helper\" -m \"Refs #1\""
     assert run_hook(COMMIT_QUALITY, command, cwd=repo) == ALLOW
 
 
@@ -406,7 +407,7 @@ def test_commit_quality_cursor_shape(
 
 def test_commit_quality_cursor_escaped_quotes(on_branch: Callable[[str], Path]) -> None:
     repo = on_branch("feature/1-x")
-    command = r'git commit -m \"feat(core): add helper\" -m \"Refs #1\"'
+    command = r"git commit -m \"feat(core): add helper\" -m \"Refs #1\""
     assert run_hook_cursor_shell(COMMIT_QUALITY, command, cwd=repo) == ALLOW
 
 
@@ -517,8 +518,17 @@ def test_red_proof_green_backstop_blocks_failing_node(git_repo: Path) -> None:
         "from pkg.thing import go\n\n\ndef test_go():\n    assert go() == 1\n",
     )
     subprocess.run(
-        ["git", "commit", "-qm", "test: add", "-m", "Refs #1",
-         "-m", "Tested-RED: tests/test_unsatisfied.py::test_go", "--no-verify"],
+        [
+            "git",
+            "commit",
+            "-qm",
+            "test: add",
+            "-m",
+            "Refs #1",
+            "-m",
+            "Tested-RED: tests/test_unsatisfied.py::test_go",
+            "--no-verify",
+        ],
         cwd=str(git_repo),
         check=True,
         capture_output=True,
@@ -539,8 +549,17 @@ def test_red_proof_green_backstop_allows_passing_node(git_repo: Path) -> None:
         "from pkg.thing import go\n\n\ndef test_go():\n    assert go() == 1\n",
     )
     subprocess.run(
-        ["git", "commit", "-qm", "feat: add thing", "-m", "Refs #1",
-         "-m", "Tested-RED: tests/test_satisfied.py::test_go", "--no-verify"],
+        [
+            "git",
+            "commit",
+            "-qm",
+            "feat: add thing",
+            "-m",
+            "Refs #1",
+            "-m",
+            "Tested-RED: tests/test_satisfied.py::test_go",
+            "--no-verify",
+        ],
         cwd=str(git_repo),
         check=True,
         capture_output=True,
@@ -570,8 +589,12 @@ def repo_with_upstream(tmp_path: Path) -> Path:
     work = tmp_path / "work"
     subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True, capture_output=True)
     subprocess.run(["git", "init", "-q", str(work)], check=True, capture_output=True)
-    for k, v in (("user.email", "t@t.t"), ("user.name", "t"), ("commit.gpgsign", "false"),
-                 ("core.autocrlf", "false")):
+    for k, v in (
+        ("user.email", "t@t.t"),
+        ("user.name", "t"),
+        ("commit.gpgsign", "false"),
+        ("core.autocrlf", "false"),
+    ):
         _git(work, "config", k, v)
     (work / "README.md").write_text("seed\n")
     _git(work, "add", "README.md")
@@ -591,9 +614,21 @@ def _range_hash(repo: Path) -> str:
     """Compute the push-time range hash the hook will compute (BASE..HEAD)."""
     base = _git(repo, "merge-base", "@{upstream}", "HEAD").strip()
     diff = subprocess.run(
-        ["git", "diff", "--no-color", "--no-ext-diff", "-M", f"{base}..HEAD",
-         "--", ".", ":(exclude).review/"],
-        cwd=str(repo), check=True, capture_output=True, text=True,
+        [
+            "git",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "-M",
+            f"{base}..HEAD",
+            "--",
+            ".",
+            ":(exclude).review/",
+        ],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout
     normalized = diff.replace("\r\n", "\n")
     return hashlib.sha256(normalized.encode()).hexdigest()
@@ -633,7 +668,9 @@ def test_reviewer_sep_no_upstream_degrades_allow(git_repo: Path) -> None:
     _stage(git_repo, "app.py", "x = 1\n")
     subprocess.run(
         ["git", "commit", "-qm", "feat: x", "-m", "Refs #1", "--no-verify"],
-        cwd=str(git_repo), check=True, capture_output=True,
+        cwd=str(git_repo),
+        check=True,
+        capture_output=True,
     )
     assert run_reviewer_sep("git push", git_repo) == ALLOW
 
@@ -721,10 +758,7 @@ class TestStrictGauntlet:
         repo = on_branch("feature/1-x")
         (repo / "pyrightconfig.json").write_text("{}\n")
         _stage(repo, "tests/test_x.py", "def test_x():\n    assert True\n")
-        cmd = (
-            'git commit -m "test: add" -m "Refs #1" '
-            '-m "Tested-RED: tests/test_x.py::test_x"'
-        )
+        cmd = 'git commit -m "test: add" -m "Refs #1" -m "Tested-RED: tests/test_x.py::test_x"'
 
         result = _run_restricted(COMMIT_GAUNTLET, cmd, repo)
 
@@ -738,10 +772,7 @@ class TestStrictGauntlet:
         repo = on_branch("feature/1-x")
         (repo / "ruff.toml").write_text('[lint]\nselect = ["F"]\n')
         _stage(repo, "tests/test_x.py", "def test_x():\n    assert True\n")
-        cmd = (
-            'git commit -m "test: add" -m "Refs #1" '
-            '-m "Tested-RED: tests/test_x.py::test_x"'
-        )
+        cmd = 'git commit -m "test: add" -m "Refs #1" -m "Tested-RED: tests/test_x.py::test_x"'
 
         result = _run_restricted(COMMIT_GAUNTLET, cmd, repo)
 
@@ -819,8 +850,17 @@ class TestStrictGauntlet:
 def _commit_with_red_trailer(repo: Path) -> None:
     _stage(repo, "tests/test_pending.py", "def test_pending():\n    assert True\n")
     subprocess.run(
-        ["git", "commit", "-qm", "test: add", "-m", "Refs #1",
-         "-m", "Tested-RED: tests/test_pending.py::test_pending", "--no-verify"],
+        [
+            "git",
+            "commit",
+            "-qm",
+            "test: add",
+            "-m",
+            "Refs #1",
+            "-m",
+            "Tested-RED: tests/test_pending.py::test_pending",
+            "--no-verify",
+        ],
         cwd=str(repo),
         check=True,
         capture_output=True,
@@ -847,3 +887,195 @@ class TestStrictRedProof:
 
         assert result.returncode == ALLOW
         assert result.stderr != ""
+
+
+# ── hub-guard: enforce the planning-hub invariant ─────────────────────
+# The main checkout (the planning hub) stays on the default branch and never
+# holds task work. hub-guard DENIES edits/commits/branch-creation there, and is
+# a no-op inside any linked worktree or on any non-default branch.
+
+
+def _write_payload(file_path: Path, content: str = "x\n") -> str:
+    """Claude Write tool shape: file_path + content under tool_input."""
+    return json.dumps(
+        {"tool_name": "Write", "tool_input": {"file_path": str(file_path), "content": content}}
+    )
+
+
+def _tool_payload(tool_name: str, tool_input: dict) -> str:
+    """Generic Claude tool-call shape for an arbitrary tool."""
+    return json.dumps({"tool_name": tool_name, "tool_input": tool_input})
+
+
+def _hub_env() -> dict[str, str]:
+    """Hook env with CURSOR_PROJECT_DIR stripped so the project-root resolution
+    falls to the payload/cwd. Without this, a Cursor-driven test run would point
+    every hub-guard probe at the IDE's project dir and flip the verdict (cf.
+    _no_stamp_key_env)."""
+    return {k: v for k, v in os.environ.items() if k != "CURSOR_PROJECT_DIR"}
+
+
+def run_hub_guard(payload: str, *, cwd: Path) -> subprocess.CompletedProcess:
+    """Run hub-guard with an explicit payload in a CURSOR_PROJECT_DIR-free env."""
+    return subprocess.run(
+        ["bash", str(HUB_GUARD)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        cwd=str(cwd),
+        env=_hub_env(),
+    )
+
+
+def hub_guard_edit_rc(file_path: Path, *, cwd: Path) -> int:
+    return run_hub_guard(_write_payload(file_path), cwd=cwd).returncode
+
+
+def hub_guard_cmd_rc(command: str, *, cwd: Path) -> int:
+    return run_hub_guard(_payload(command), cwd=cwd).returncode
+
+
+@pytest.fixture()
+def linked_worktree(git_repo: Path, tmp_path: Path) -> Path:
+    """A linked git worktree of git_repo, on its own task branch."""
+    wt = tmp_path / "spoke"
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", "feature/9-spoke", str(wt)],
+        cwd=str(git_repo),
+        check=True,
+        capture_output=True,
+    )
+    return wt
+
+
+@pytest.fixture()
+def hub_on_master(git_repo: Path) -> Path:
+    """The hub repo with its default branch renamed to master and no origin —
+    reproducing a CI ubuntu runner (bare `git init` → master). Pins that the
+    guard resolves the real default rather than assuming a literal "main"."""
+    subprocess.run(
+        ["git", "branch", "-m", "master"], cwd=str(git_repo), check=True, capture_output=True
+    )
+    return git_repo
+
+
+class TestHubGuard:
+    # ── On the hub (main checkout, default branch): deny ──────────────
+
+    def test_blocks_edit_on_hub(self, git_repo: Path) -> None:
+        assert hub_guard_edit_rc(git_repo / "notes.md", cwd=git_repo) == BLOCK
+
+    def test_blocks_commit_on_hub(self, git_repo: Path) -> None:
+        assert hub_guard_cmd_rc('git commit -m "feat: x"', cwd=git_repo) == BLOCK
+
+    def test_blocks_notebook_edit_on_hub(self, git_repo: Path) -> None:
+        # NotebookEdit carries notebook_path (no file_path) — name-based dispatch
+        # must still catch it.
+        payload = _tool_payload(
+            "NotebookEdit", {"notebook_path": str(git_repo / "nb.ipynb"), "new_source": "x"}
+        )
+        assert run_hub_guard(payload, cwd=git_repo).returncode == BLOCK
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git checkout -b feature/1-x",
+            "git switch -c feature/1-x",
+            "git checkout -B feature/1-x",
+            "git switch --create feature/1-x",
+            "git switch --force-create feature/1-x",
+            "git checkout --orphan feature/1-x",
+            "git branch feature/1-x",  # bare create
+            "true && git checkout -b feature/1-x",  # chained must not bypass
+        ],
+    )
+    def test_blocks_branch_create_on_hub(self, git_repo: Path, command: str) -> None:
+        assert hub_guard_cmd_rc(command, cwd=git_repo) == BLOCK
+
+    def test_blocks_create_file_tool_on_hub(self, git_repo: Path) -> None:
+        # A "create"-named tool that writes a file (carries file_path) is denied.
+        payload = _tool_payload("create_file", {"file_path": str(git_repo / "x.py")})
+        assert run_hub_guard(payload, cwd=git_repo).returncode == BLOCK
+
+    def test_blocks_edit_on_master_default_without_origin(self, hub_on_master: Path) -> None:
+        # The guard must resolve master as the default, not assume "main".
+        assert hub_guard_edit_rc(hub_on_master / "notes.md", cwd=hub_on_master) == BLOCK
+
+    def test_deny_message_points_to_start_task(self, git_repo: Path) -> None:
+        result = run_hub_guard(_write_payload(git_repo / "notes.md"), cwd=git_repo)
+        assert result.returncode == BLOCK
+        assert "start-task" in result.stderr.lower()
+
+    # ── Still allowed on the hub: non-mutating / sanctioned actions ───
+
+    def test_allows_plain_command_on_hub(self, git_repo: Path) -> None:
+        assert hub_guard_cmd_rc("ls -la", cwd=git_repo) == ALLOW
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git checkout main",  # switch to an existing branch (no -b/-c)
+            "git branch",  # list branches
+            "git branch -a",  # list all
+            "git branch -d old-branch",  # delete
+            "git branch --list 'feature/*'",  # list with pattern
+        ],
+    )
+    def test_allows_non_creating_branch_ops_on_hub(self, git_repo: Path, command: str) -> None:
+        assert hub_guard_cmd_rc(command, cwd=git_repo) == ALLOW
+
+    def test_allows_read_tool_on_hub(self, git_repo: Path) -> None:
+        # A read-only tool (no command) must not be denied — matters under
+        # Copilot, where this hook carries no matcher and sees every tool.
+        payload = _tool_payload("Read", {"file_path": str(git_repo / "README.md")})
+        assert run_hub_guard(payload, cwd=git_repo).returncode == ALLOW
+
+    def test_allows_create_issue_tool_on_hub(self, git_repo: Path) -> None:
+        # A "create"-named tool with NO file_path (create_issue, create_pull_request)
+        # is hub planning work, not a file write — must not be collateral-blocked.
+        payload = _tool_payload("create_issue", {"title": "x", "body": "y"})
+        assert run_hub_guard(payload, cwd=git_repo).returncode == ALLOW
+
+    def test_allows_write_outside_repo_on_hub(
+        self, git_repo: Path, tmp_path_factory: pytest.TempPathFactory
+    ) -> None:
+        # Writing a scratch file outside the repo (e.g. a /tmp issue body) is not
+        # hub task work on the repo, so it is allowed. The dir is a sibling of
+        # git_repo (which is itself the test's tmp_path), so it is truly outside.
+        outside = tmp_path_factory.mktemp("elsewhere") / "body.md"
+        assert hub_guard_edit_rc(outside, cwd=git_repo) == ALLOW
+
+    def test_allows_worktree_add_on_hub(self, git_repo: Path, tmp_path: Path) -> None:
+        # Spawning a worktree is the sanctioned dispatch path — never blocked.
+        dest = tmp_path / "wt"
+        assert hub_guard_cmd_rc(f"git worktree add -b feature/2-x {dest}", cwd=git_repo) == ALLOW
+
+    def test_allows_edit_during_merge_on_hub(self, git_repo: Path) -> None:
+        # A merge in progress is sanctioned hub work; resolution needs edits.
+        (git_repo / ".git" / "MERGE_HEAD").write_text(f"{'0' * 40}\n")
+        assert hub_guard_edit_rc(git_repo / "notes.md", cwd=git_repo) == ALLOW
+
+    # ── On a task branch in the main checkout: no-op ──────────────────
+
+    def test_allows_edit_on_task_branch(self, on_branch: Callable[[str], Path]) -> None:
+        repo = on_branch("feature/1-x")
+        assert hub_guard_edit_rc(repo / "notes.md", cwd=repo) == ALLOW
+
+    def test_allows_commit_on_task_branch(self, on_branch: Callable[[str], Path]) -> None:
+        repo = on_branch("feature/1-x")
+        assert hub_guard_cmd_rc('git commit -m "feat: x"', cwd=repo) == ALLOW
+
+    # ── Inside a linked worktree (a spoke): no-op ─────────────────────
+
+    def test_allows_edit_in_worktree(self, linked_worktree: Path) -> None:
+        assert hub_guard_edit_rc(linked_worktree / "notes.md", cwd=linked_worktree) == ALLOW
+
+    def test_allows_commit_in_worktree(self, linked_worktree: Path) -> None:
+        assert hub_guard_cmd_rc('git commit -m "feat: x"', cwd=linked_worktree) == ALLOW
+
+    # ── Outside any git repo: no-op ───────────────────────────────────
+
+    def test_allows_outside_git_repo(self, tmp_path: Path) -> None:
+        outside = tmp_path / "plain"
+        outside.mkdir()
+        assert hub_guard_edit_rc(outside / "notes.md", cwd=outside) == ALLOW

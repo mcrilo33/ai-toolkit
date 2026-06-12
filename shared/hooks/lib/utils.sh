@@ -166,6 +166,22 @@ is_git_push_or_pr() {
   printf '%s' "$cmd" | grep -qE '(^|[;&|`]|\$\()[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*(git([[:space:]]+(-[^[:space:]]+|--[^[:space:]]+|-C[[:space:]]+[^[:space:]]+))*[[:space:]]+push\b|gh[[:space:]]+pr[[:space:]]+(create|merge)\b)'
 }
 
+# ── Recognize a branch-CREATING checkout/switch ──────────────────────
+# Matches branch creation at a command boundary (same boundary-awareness as
+# is_git_commit), tolerating leading options and env-assignment prefixes, so
+# chained/prefixed forms are not bypassed: `cd x && git checkout -b y`,
+# `git -C path switch -c y`. Covers the spellings:
+#   checkout -b|-B|--orphan     switch -c|-C|--create|--force-create
+#   branch <name>               (bare create; `git branch -d`/-a/--list etc. excluded)
+# A plain branch switch (`git checkout main`, `git switch x`) and a bare
+# `git branch` listing do NOT match — only branch creation, which on the hub
+# belongs in a worktree. Returns 0 on match. Note: `git worktree add -b` is the
+# sanctioned dispatch path and is NOT matched (its subcommand is `worktree`).
+is_git_branch_create() {
+  local cmd="$1"
+  printf '%s' "$cmd" | grep -qE '(^|[;&|`]|\$\()[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git([[:space:]]+(-[^[:space:]]+|--[^[:space:]]+|-C[[:space:]]+[^[:space:]]+))*[[:space:]]+(checkout([[:space:]]+-[^[:space:]]+)*[[:space:]]+(-[a-zA-Z]*[bB]|--orphan)\b|switch([[:space:]]+-[^[:space:]]+)*[[:space:]]+(-[a-zA-Z]*[cC]|--create|--force-create)\b|branch[[:space:]]+[^-[:space:]])'
+}
+
 # ── Get the edited file path (cross-platform) ───────────────────────
 # afterFileEdit: top-level .file_path. Claude/Copilot: tool_input.file_path
 # (via get_file_path).
@@ -510,10 +526,16 @@ review_artifact_verdict() {
 }
 
 # ── Find project root (walk up to .git) ─────────────────────────────
+# Stops at the first ancestor containing a .git entry — a DIRECTORY (normal
+# checkout) OR a FILE (a linked worktree / submodule gitlink). Honoring the
+# file form is essential inside a worktree: its .git is a gitlink file, so a
+# directory-only test walks straight past it to the next real .git up the tree
+# (e.g. a dotfiles repo at $HOME), misresolving the root for every hook that
+# relies on this. `-e` matches either form.
 find_project_root() {
   local dir="${1:-$(pwd)}"
   while [ "$dir" != "/" ]; do
-    [ -d "$dir/.git" ] && { echo "$dir"; return; }
+    [ -e "$dir/.git" ] && { echo "$dir"; return; }
     dir=$(dirname "$dir")
   done
   echo "$(pwd)"
