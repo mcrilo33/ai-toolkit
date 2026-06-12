@@ -14,13 +14,17 @@ invariants that are easy to regress silently:
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
-
-import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RULES_DIR = REPO_ROOT / "shared" / "rules"
 HOOKS_DIR = REPO_ROOT / "shared" / "hooks"
+
+# Make scripts/ importable
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+from metadata_parser import parse
 
 # Cursor always-on payload was 285 lines (2026-06) before the agent-orchestration
 # slim-down brought it to ~238. This ceiling ratchets it and stops it growing back
@@ -39,12 +43,20 @@ EXPECTED_ALWAYS_ON = {
 
 
 def _always_on_rule_names() -> set[str]:
-    """Return rule stems with ``alwaysApply: true`` in metadata.yml."""
-    meta = yaml.safe_load((RULES_DIR / "metadata.yml").read_text())
+    """Return rule stems that are ``alwaysApply: true`` in the synced Cursor payload.
+
+    Uses the production parser so per-tool override blocks (``cursor: {alwaysApply:
+    true}``) count — a naive top-level read would miss exactly that silent flip.
+    """
+    items = parse(str(RULES_DIR / "metadata.yml"))
     return {
         name
-        for name, data in meta.items()
-        if isinstance(data, dict) and data.get("alwaysApply") is True
+        for name, data in items.items()
+        # parse() keeps scalars as raw strings ("true"), not YAML booleans.
+        if str(
+            {**data["__defaults"], **data["__overrides"].get("cursor", {})}.get("alwaysApply")
+        ).lower()
+        == "true"
     }
 
 
@@ -80,11 +92,7 @@ class TestShipGateContract:
     def _ship_gate_calls(self) -> list[str]:
         """Lines that promote a hint to the hard ship gate (excludes the def)."""
         hook = (HOOKS_DIR / "delegation-gate-warn.sh").read_text()
-        return [
-            line
-            for line in hook.splitlines()
-            if "ship_gate_add " in line and "ship_gate_add()" not in line
-        ]
+        return [line for line in hook.splitlines() if line.lstrip().startswith("ship_gate_add ")]
 
     def test_only_code_review_hard_blocks_the_ship(self) -> None:
         calls = self._ship_gate_calls()

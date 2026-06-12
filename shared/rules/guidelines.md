@@ -32,6 +32,7 @@
 - Do not add new dependencies without asking
 - Do not generate placeholder, stub, or incomplete implementations
 - Do not modify, refactor, or remove code unrelated to the task — see `code-quality` (Surgical Changes) for the binding rule
+- Do not remove or modify existing functionality unless explicitly asked
 - Do not make assumptions about missing context — ask instead
 - Do not hallucinate APIs, functions, imports, signatures, or parameters — verify before use (mechanics in `code-quality` → External API Verification; `library-research` for fetching docs)
 

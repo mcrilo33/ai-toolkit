@@ -148,7 +148,7 @@ fi
 
 # refactor
 if [ "$REFACTOR_PATTERN" -eq 1 ]; then
-  warn_once "refactor" "⚠ STOP. Cross-cutting rename or restructure detected. Spawn refactor now to handle this safely across all files."
+  warn_once "refactor" "⚠ Cross-cutting rename or restructure detected. Doing it directly is fine for mechanical changes; spawn refactor to apply it safely across many files."
 fi
 
 # security-reviewer
@@ -173,7 +173,7 @@ fi
 
 # tdd-refactor
 if [ "$REFACTOR_PATTERN" -eq 1 ] && [ "$RUNS_TESTS" -eq 1 ]; then
-  warn_once "tdd-refactor" "⚠ STOP. Tests are green and cleanup is in progress. Spawn tdd-refactor now — do not refactor in the main agent loop."
+  warn_once "tdd-refactor" "⚠ Tests are green and cleanup is in progress. Refactoring inline is fine; spawn tdd-refactor when you want a clean context boundary."
 fi
 
 # Enforce accumulated shipping-gate hints once: DENY on Cursor, warn elsewhere.

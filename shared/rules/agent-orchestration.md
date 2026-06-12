@@ -6,8 +6,8 @@ When in doubt, spawn.
 
 ## Routing Table
 
-The single source of truth for who handles what. Scan it before starting a task; if a
-row matches, spawn that agent instead of doing the work inline.
+The single source of truth for who handles what. A matching row names the specialist;
+whether to spawn it or work inline is governed by the rubric and enforcement split below.
 
 | Situation | Agent | Trigger signals |
 | --------- | ----- | --------------- |
@@ -35,7 +35,7 @@ hard ship gate is `code-review`.
 
 - Single file, or exactly 2 files with trivial scope — do it yourself.
 - User said "don't use agents" or "do it inline".
-- Internal refactor with no behavior change, docs-only, or test-only additions.
+- Internal refactor with no behavior change.
 
 ## Watch for multi-turn drift
 
