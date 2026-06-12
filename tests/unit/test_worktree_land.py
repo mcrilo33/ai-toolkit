@@ -385,3 +385,88 @@ def test_unrelated_tmux_window_is_kept(hub: Path, tmp_path: Path) -> None:
 
     assert proc.returncode == 0, proc.stderr
     assert "kill-window" not in _log_text(logs["tmux"])
+
+
+# --- --local: micro-spoke landing (issue #10) ---
+
+
+def test_local_lands_never_pushed_worktree_branch(hub: Path, tmp_path: Path) -> None:
+    # A micro-spoke commits locally and never pushes its branch; --local skips
+    # the upstream guards and lands it like any other worktree.
+    wt = _make_spoke(hub, tmp_path, "feature/micro-tweak", push=False)
+
+    proc, _ = _run_land(hub, tmp_path, "micro-tweak", "--local")
+
+    assert proc.returncode == 0, proc.stderr
+    assert (hub / "feature-micro-tweak.txt").exists()
+    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
+    assert not wt.exists()
+    assert "feature/micro-tweak" not in _local_branches(hub)
+
+
+def test_local_lands_bare_branch_without_worktree(hub: Path, tmp_path: Path) -> None:
+    # A hub-dispatched subagent's temp worktree may already be gone; --local
+    # must land the bare local branch all the same.
+    wt = _make_spoke(hub, tmp_path, "claude/micro-docs", push=False)
+    _git(hub, "worktree", "remove", str(wt))  # clean post-commit, removal succeeds
+
+    proc, logs = _run_land(hub, tmp_path, "claude/micro-docs", "--local")
+
+    assert proc.returncode == 0, proc.stderr
+    assert (hub / "claude-micro-docs.txt").exists()
+    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
+    assert "claude/micro-docs" not in _local_branches(hub)
+    assert "issue close" not in _log_text(logs["gh"])  # non-numeric slug
+
+
+def test_bare_branch_without_local_flag_refused(hub: Path, tmp_path: Path) -> None:
+    # Without --local a branch with no registered worktree must not match —
+    # bare-branch landing is opt-in, not the default resolution path.
+    wt = _make_spoke(hub, tmp_path, "claude/micro-docs", push=False)
+    _git(hub, "worktree", "remove", str(wt))
+    pre_main = _remote_sha(hub, "main")
+
+    proc, _ = _run_land(hub, tmp_path, "claude/micro-docs")
+
+    assert proc.returncode != 0
+    assert _remote_sha(hub, "main") == pre_main
+
+
+def test_local_still_refuses_dirty_worktree(hub: Path, tmp_path: Path) -> None:
+    # --local only waives the upstream guards; uncommitted work in the spoke
+    # would be silently dropped by teardown, so that guard must hold.
+    wt = _make_spoke(hub, tmp_path, "feature/micro-dirty", push=False)
+    (wt / "wip.txt").write_text("uncommitted\n")
+
+    proc, _ = _run_land(hub, tmp_path, "micro-dirty", "--local")
+
+    assert proc.returncode != 0
+    assert "uncommitted" in proc.stderr
+    assert wt.exists()
+
+
+def test_local_suite_failure_rolls_back_bare_branch(hub: Path, tmp_path: Path) -> None:
+    # A failed suite must roll main back and keep the bare branch around so
+    # the work survives for a retry — same rollback contract as worktree lands.
+    pre_sha = _git(hub, "rev-parse", "HEAD").strip()
+    wt = _make_spoke(hub, tmp_path, "claude/micro-docs", push=False)
+    _git(hub, "worktree", "remove", str(wt))
+
+    proc, logs = _run_land(hub, tmp_path, "claude/micro-docs", "--local", suite_exit=1)
+
+    assert proc.returncode != 0
+    assert _log_text(logs["suite"]) != ""  # the abort came from the suite, not a guard
+    assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha
+    assert _remote_sha(hub, "main") == pre_sha  # nothing was pushed
+    assert "claude/micro-docs" in _local_branches(hub)
+
+
+def test_local_never_pushed_guard_stays_without_flag(hub: Path, tmp_path: Path) -> None:
+    # Pins that adding --local does not weaken the default path: a never-pushed
+    # branch without the flag still hits the upstream guard verbatim.
+    _make_spoke(hub, tmp_path, "feature/2-nopush", push=False)
+
+    proc, _ = _run_land(hub, tmp_path, "2")
+
+    assert proc.returncode != 0
+    assert "never been pushed" in proc.stderr
