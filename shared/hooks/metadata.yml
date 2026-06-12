@@ -180,7 +180,7 @@ reviewer-sep-warn:
 todo-ledger-warn:
   event: preToolUse
   matcher: Bash
-  description: "On push: verify a TodoWrite ledger was seeded this session (transcript scan); No-Ledger: trailer bypasses"
+  description: "On push: verify a task ledger (TodoWrite or Tasks) was seeded this session (transcript scan); No-Ledger: trailer bypasses"
   tier: 2
   claude:
     if: "Bash(git push *)"
@@ -190,7 +190,7 @@ todo-ledger-warn:
 
 todo-ledger-nudge:
   event: sessionStart
-  description: "At session start, nudge the agent to seed a TodoWrite ledger before the first commit (advisory; companion of todo-ledger-warn)"
+  description: "At session start, nudge the agent to seed a task ledger (TodoWrite or Tasks) before the first commit (advisory; companion of todo-ledger-warn)"
   tier: 3
 
 delegation-gate-warn:

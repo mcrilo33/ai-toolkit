@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # todo-ledger-warn — shipping-gate hook (git push / gh pr).
 #
-# Enforces that the spoke seeded a TodoWrite ledger this session, so the cycle
-# is visible (Ctrl+T) and resumable after a dead worktree. A hook cannot call
-# TodoWrite for the agent; it can only gate the ship action on EVIDENCE that a
-# ledger exists. That evidence is a `TodoWrite` tool call in the session
-# transcript:
+# Enforces that the spoke seeded a task ledger this session, so the cycle is
+# visible (Ctrl+T) and resumable after a dead worktree. Current runtimes keep
+# the ledger via the Tasks system (TaskCreate/TaskUpdate); older ones via
+# TodoWrite — either is a valid ledger. A hook cannot seed the ledger for the
+# agent; it can only gate the ship action on EVIDENCE that one exists. That
+# evidence is a ledger tool call in the session transcript:
 #
 #   • Read the session `transcript_path` from the hook stdin JSON.
-#   • Scan it for a `TodoWrite` tool_use this session.
+#   • Scan it for a `TodoWrite`, `TaskCreate`, or `TaskUpdate` tool_use this
+#     session (TaskUpdate alone counts: a resumed session may only ever update
+#     tasks created in a dead one).
 #   • If none is found → ship_gate_enforce (warn on Claude, hard-deny on Cursor).
 #
 # SINGLE-STEP ESCAPE HATCH: a `No-Ledger: <reason>` trailer on any commit in the
@@ -18,7 +21,7 @@
 #
 # Platform behavior (see ship_gate_enforce in lib/utils.sh):
 #   • Cursor (beforeShellExecution): hard DENY (exit 2) — push/PR blocked until a
-#     TodoWrite call exists in the transcript or a No-Ledger: trailer is added.
+#     ledger call exists in the transcript or a No-Ledger: trailer is added.
 #   • Claude/Copilot / native git hooks: advisory warn, never blocks (exit 0).
 #
 # Degrades to allow (never a false block) on any unadjudicable state: no
@@ -47,15 +50,16 @@ COMMAND=$(get_shell_command "$INPUT")
 # Boundary-aware: chained/prefixed forms (`cd x && git push`) must not bypass.
 is_git_push_or_pr "$COMMAND" || exit 0
 
-# The session transcript is the only evidence a hook has of a TodoWrite call.
+# The session transcript is the only evidence a hook has of a ledger call.
 # No transcript path, or one that does not resolve to a readable file ⇒ exit 0:
 # an advisory hook must never block a push it cannot adjudicate.
 TRANSCRIPT=$(json_field "$INPUT" "transcript_path")
 [ -z "$TRANSCRIPT" ] && exit 0
 [ -f "$TRANSCRIPT" ] && [ -r "$TRANSCRIPT" ] || exit 0
 
-# A TodoWrite tool_use anywhere in the transcript proves a ledger was seeded.
-if grep -qE '"name"[[:space:]]*:[[:space:]]*"TodoWrite"' "$TRANSCRIPT"; then
+# A ledger tool_use anywhere in the transcript proves a ledger was seeded —
+# either system: TodoWrite (older runtimes) or TaskCreate/TaskUpdate (Tasks).
+if grep -qE '"name"[[:space:]]*:[[:space:]]*"(TodoWrite|TaskCreate|TaskUpdate)"' "$TRANSCRIPT"; then
   exit 0
 fi
 
@@ -80,8 +84,8 @@ while IFS= read -r sha; do
   fi
 done <<< "$COMMITS"
 
-ship_gate_enforce "$INPUT" "todo-ledger: no TodoWrite ledger found in this session's transcript.
-The solo-cycle seeds a TodoWrite ledger (one todo per subtask x cycle step) so
+ship_gate_enforce "$INPUT" "todo-ledger: no task ledger (TodoWrite or Tasks) found in this session's transcript.
+The solo-cycle seeds a task ledger (one entry per subtask x cycle step) so
 the cycle is visible (Ctrl+T) and resumable after a dead worktree.
 
 Seed the ledger now, or — for genuinely single-step work (one tiny subtask, a
