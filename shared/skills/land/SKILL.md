@@ -1,4 +1,4 @@
-# Land Task
+# Land
 
 Land a finished task from the hub: `/land <id>`. The hub starts and ends tasks; spokes
 only execute. A spoke's push is its ship gate — landing (merge, suite, push, teardown,

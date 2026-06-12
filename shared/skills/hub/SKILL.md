@@ -52,7 +52,7 @@ anything that changes state:
 |------------------|-----------------|-----|
 | Open issue, `no worktree` | Start it | `start-task` skill (creates issue if needed + spawns spoke) |
 | New idea, no issue yet | Define then dispatch | discuss scope → `start-task` |
-| Branch `pushed → mergeable` | Land and tear down | `/land <id>` (`land-task` skill → `scripts/worktree-land.sh`) |
+| Branch `pushed → mergeable` | Land and tear down | `/land <id>` (`land` skill → `scripts/worktree-land.sh`) |
 | Branch `unpushed` / `dirty` | Leave it — spoke still working | paste the row's `↳ jump:` command to reach its pane |
 | Trivial non-executable change (docs/wording) | Lane 1 micro-spoke | spawn subagent with `isolation: worktree`, review diff, land with `scripts/worktree-land.sh <branch> --local` |
 | Small obvious one-subtask change (code) | Lane 2 express spoke | `worktree-new.sh <slug>` (no issue), single cycle, all push gates |

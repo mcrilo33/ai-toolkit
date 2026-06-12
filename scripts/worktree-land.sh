@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # worktree-land.sh — land a finished task branch from the hub (main checkout).
-# The deterministic half of the land-task skill (`/land <id>`): the hub starts
+# The deterministic half of the land skill (`/land <id>`): the hub starts
 # and ends tasks; spokes only execute. Run it FROM the hub, on the default
 # branch, after the spoke has pushed — never from inside a worktree.
 #

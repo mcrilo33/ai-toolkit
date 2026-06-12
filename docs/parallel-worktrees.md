@@ -110,7 +110,7 @@ worktree**, so you review every task's diff without leaving the window.
 ### 3. Land
 
 When a task's branch is committed and pushed, land it from the hub — `/land 42` in the
-hub session (the `land-task` skill), or directly:
+hub session (the `land` skill), or directly:
 
 ```bash
 cd ~/Repos/ai-toolkit            # merge hub, already on main

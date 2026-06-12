@@ -109,4 +109,4 @@ Tell the user: the issue URL, the branch, the worktree path, and the tmux window
 - `source-task` — the spoke runs this first to anchor to the issue and confirm the branch
 - `solo-cycle` — the per-subtask RED / GREEN / REVIEW / PUSH cycle the spoke follows
 - `brainstorming` — refine a fuzzy idea in the hub before dispatching
-- `land-task` — the hub-side `/land <id>` that ends the task once the spoke has pushed
+- `land` — the hub-side `/land <id>` that ends the task once the spoke has pushed
