@@ -188,13 +188,20 @@ if [ "$SPAWN_TERMINAL" -eq 1 ]; then
     # ensure session 0 (the spoke home) exists, detached if need be; '=' pins
     # the target to an exact session name so e.g. '0-foo' can never match
     if tmux has-session -t '=0' 2>/dev/null || tmux new-session -d -s 0 -c "$REPO_ROOT" 2>/dev/null; then
-      win="$(tmux new-window -t '=0:' -P -F '#{window_id}' -n "$win_name" -c "$WT_DIR")"
+      # The launch command is the window's own shell command, not keystrokes:
+      # typing it via send-keys raced interactive-zsh init (eaten Enter, zvm) —
+      # issue #15. `exec $SHELL` keeps the window alive after claude exits.
+      if [ "$LAUNCH_AGENT" -eq 1 ]; then
+        win="$(tmux new-window -t '=0:' -P -F '#{window_id}' -n "$win_name" -c "$WT_DIR" \
+               "$AGENT_CMD; exec ${SHELL:-zsh}")"
+      else
+        win="$(tmux new-window -t '=0:' -P -F '#{window_id}' -n "$win_name" -c "$WT_DIR")"
+      fi
       # pin name so the running process can't clobber it
       tmux set-window-option -t "$win" automatic-rename off
       tmux set-window-option -t "$win" allow-rename off
       echo "→ opened tmux window '$win_name' ($win) in session 0"
       if [ "$LAUNCH_AGENT" -eq 1 ]; then
-        tmux send-keys -t "$win" "$AGENT_CMD" C-m
         [ -n "$PROMPT" ] && echo "  launched: claude (seeded with first prompt)" || echo "  launched: claude"
       fi
       # print the exact jump command so the caller can copy-paste

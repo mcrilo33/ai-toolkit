@@ -203,6 +203,20 @@ per-task session with no client attached. Each run prints the exact jump command
 `tmux attach -t 0 \; select-window -t '0:<window>'` from a plain shell. Inside
 session `0`, switch between task windows with `prefix` + number.
 
+The agent launch (pinned model/effort plus the seeded `--prompt`) is passed to
+`new-window` as the window's own shell command — never typed into an interactive
+shell, where `send-keys` raced zsh init and lost the trailing Enter (issue #15).
+The command ends with `; exec $SHELL`, so the window drops back to a shell prompt
+instead of closing when claude exits.
+
+To re-seed a prompt into an **existing** pane manually (e.g. a claude sitting at
+its input without the kickoff), send the text literally and the Enter separately:
+
+```bash
+tmux send-keys -t '0:<window>' -l '/source'   # -l = literal text, no key-name parsing
+tmux send-keys -t '0:<window>' Enter          # separate Enter, not a trailing C-m
+```
+
 ## Notes and gotchas
 
 - **`.claude/` is copied, not symlinked.** A plain `git worktree add` checks out only
