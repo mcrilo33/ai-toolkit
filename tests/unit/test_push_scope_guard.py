@@ -240,6 +240,7 @@ def test_spoke_cursor_allows_bare_push_without_upstream(spoke: Path) -> None:
         pytest.param(f"git push -u origin '{OWN}'", id="single-quoted-branch"),
         pytest.param(f'git push -u origin "{OWN}"', id="double-quoted-branch"),
         pytest.param('git push -u origin "$BRANCH"', id="unexpanded-variable-degrades"),
+        pytest.param('git push -u origin "${BRANCH}"', id="braced-variable-degrades"),
     ],
 )
 def test_spoke_cursor_allows_shell_dressed_own_branch_push(spoke: Path, command: str) -> None:
@@ -338,6 +339,8 @@ def test_spoke_cursor_allows_cmdsub_capture_of_own_branch_push(spoke: Path) -> N
         pytest.param("git push --force-with-lease=$SHA origin main", id="variable-flag-value"),
         pytest.param("git push origin $SHA:main", id="dynamic-src-concrete-dst"),
         pytest.param('git push origin "$BRANCH":main', id="quoted-dynamic-src-concrete-dst"),
+        pytest.param("git push origin ${SHA}:main", id="braced-dynamic-src-concrete-dst"),
+        pytest.param('git push origin "${BRANCH}":main', id="quoted-braced-src-concrete-dst"),
         pytest.param("git -c protocol.version=2 push origin main", id="config-opt-not-a-disguise"),
     ],
 )
