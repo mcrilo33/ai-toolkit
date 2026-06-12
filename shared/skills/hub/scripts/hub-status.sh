@@ -4,7 +4,8 @@
 # Surveys what is in flight across the parallel-worktrees workflow:
 #   - all tmux panes across every session (once, at startup)
 #   - worktrees and, per task branch, ahead/behind vs main + dirty state,
-#     linked GitHub issue state, and correlated tmux pane/jump command
+#     linked GitHub issue state, correlated tmux pane/jump command, and
+#     TodoWrite ledger (done/total from the spoke's latest Claude session)
 #   - open GitHub issues, flagged by whether a worktree already exists for them
 #
 # Read-only. Run from the main checkout. Safe to run anytime.
@@ -18,6 +19,54 @@ default_branch="$(git -C "$main_root" symbolic-ref --quiet --short refs/remotes/
 default_branch="${default_branch:-main}"
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
+
+# todos_for_path <worktree-path>
+# Reads the newest .jsonl from the spoke's Claude project dir and returns
+# "<done>/<total> [· in_progress: <content>]", or "none", or "" if unavailable.
+todos_for_path() {
+  local wt_path="$1"
+  local projects_root="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+  local slug
+  slug="$(printf '%s' "$wt_path" | sed 's/[^A-Za-z0-9]/-/g')"
+  local project_dir="${projects_root}/${slug}"
+  [ -d "$project_dir" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  local jsonl
+  jsonl="$(ls -t "${project_dir}"/*.jsonl 2>/dev/null | head -1)"
+  [ -n "$jsonl" ] || return 0
+  _TODOS_JSONL="$jsonl" python3 2>/dev/null <<'PYEOF'
+import json, os
+result = None
+try:
+    with open(os.environ["_TODOS_JSONL"]) as fh:
+        for raw in fh:
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            if obj.get("type") != "assistant":
+                continue
+            content = (obj.get("message") or {}).get("content") or []
+            for block in content:
+                if (isinstance(block, dict)
+                        and block.get("type") == "tool_use"
+                        and block.get("name") == "TodoWrite"):
+                    result = (block.get("input") or {}).get("todos") or []
+except Exception:
+    pass
+if result is None:
+    print("none")
+else:
+    done = sum(1 for t in result if t.get("status") == "completed")
+    total = len(result)
+    ip = next((t for t in result if t.get("status") == "in_progress"), None)
+    line = f"{done}/{total}"
+    if ip:
+        content = (ip.get("content") or "")[:60]
+        line += f" · in_progress: {content}"
+    print(line)
+PYEOF
+}
 
 # --- Survey all tmux panes once ---------------------------------------------
 # Format: session:window<TAB>path  (one entry per pane across all sessions)
@@ -115,6 +164,10 @@ while IFS= read -r line; do
         "$pane_sess" "$pane_target"
     fi
   fi
+
+  # TodoWrite ledger sub-line
+  todos_out="$(todos_for_path "$path")"
+  [ -n "$todos_out" ] && printf "      ↳ todos: %s\n" "$todos_out"
 done < <(git -C "$main_root" worktree list 2>/dev/null)
 echo
 
