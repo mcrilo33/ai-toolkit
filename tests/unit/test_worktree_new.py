@@ -12,6 +12,11 @@ session `0`. The script must target that session explicitly (`new-window -t =0:`
 create it detached when missing (`has-session` → `new-session -d -s 0`), work
 even when invoked outside tmux ($TMUX unset), and print the exact jump command
 (`switch-client` inside tmux, `attach ... select-window` outside).
+
+Agent pinning (issue #8 follow-up): the spoke launch must pin model and effort
+explicitly (`CLAUDE_EFFORT=<effort> claude --model <model>`) from env vars
+`WT_AGENT_MODEL` (default `fable`) / `WT_AGENT_EFFORT` (default `max`) instead
+of relying on user-global settings; a seeded `--prompt` stays the trailing arg.
 """
 
 from __future__ import annotations
@@ -64,6 +69,7 @@ def _run_new(
     inside_tmux: bool = True,
     has_session_rc: int = 0,
     new_session_rc: int = 0,
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess, Path]:
     """Run worktree-new.sh from the hub with a logging `tmux` stub on PATH.
 
@@ -83,6 +89,8 @@ def _run_new(
         has_session_rc: Exit status of the stub's `has-session` answer.
         new_session_rc: Exit status of the stub's `new-session` answer
             (nonzero = no tmux server can be started).
+        extra_env: Extra environment variables merged into the subprocess env
+            (e.g. `WT_AGENT_MODEL` / `WT_AGENT_EFFORT` overrides).
 
     Returns:
         The completed process and the tmux call-log path.
@@ -108,6 +116,11 @@ def _run_new(
         "STUB_NEW_SESSION": str(new_session_rc),
     }
     env.pop("TMUX", None)  # the host's real tmux must never steer the script
+    # The host's agent pinning must never leak in — defaults are under test.
+    env.pop("WT_AGENT_MODEL", None)
+    env.pop("WT_AGENT_EFFORT", None)
+    if extra_env:
+        env.update(extra_env)
     if inside_tmux:
         env["TMUX"] = "/tmp/fake-tmux-socket,1234,0"
     proc = subprocess.run(
@@ -226,3 +239,32 @@ def test_no_server_falls_back_to_manual_advice(hub: Path, tmp_path: Path) -> Non
     assert not _calls(log.read_text(), "new-window")
     assert "Start the agent in a new terminal window:" in proc.stdout
     assert "/source" in proc.stdout
+
+
+def test_agent_launch_pins_model_and_effort_by_default(hub: Path, tmp_path: Path) -> None:
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code")
+
+    assert proc.returncode == 0, proc.stderr
+    send_keys = _calls(log.read_text(), "send-keys")
+    assert send_keys, "expected a send-keys invocation launching the agent"
+    assert "CLAUDE_EFFORT=max claude --model fable" in send_keys[0]
+
+
+def test_agent_launch_respects_model_and_effort_overrides(hub: Path, tmp_path: Path) -> None:
+    overrides = {"WT_AGENT_MODEL": "sonnet", "WT_AGENT_EFFORT": "high"}
+
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", extra_env=overrides)
+
+    assert proc.returncode == 0, proc.stderr
+    send_keys = _calls(log.read_text(), "send-keys")
+    assert send_keys, "expected a send-keys invocation launching the agent"
+    assert "CLAUDE_EFFORT=high claude --model sonnet" in send_keys[0]
+
+
+def test_agent_launch_keeps_seeded_prompt_after_pinning(hub: Path, tmp_path: Path) -> None:
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", "--prompt", "/source")
+
+    assert proc.returncode == 0, proc.stderr
+    send_keys = _calls(log.read_text(), "send-keys")
+    assert send_keys, "expected a send-keys invocation launching the agent"
+    assert "CLAUDE_EFFORT=max claude --model fable /source" in send_keys[0]
