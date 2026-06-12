@@ -493,6 +493,7 @@ def test_local_refuses_default_branch(hub: Path, tmp_path: Path) -> None:
     proc, _ = _run_land(hub, tmp_path, "main", "--local")
 
     assert proc.returncode != 0
+    assert "default branch" in proc.stderr  # the dedicated guard, not the upstream one
     assert _remote_sha(hub, "main") == pre
 
 
@@ -506,3 +507,17 @@ def test_local_keep_branch_keeps_bare_branch(hub: Path, tmp_path: Path) -> None:
 
     assert proc.returncode == 0, proc.stderr
     assert "claude/micro-keep" in _local_branches(hub)
+
+
+def test_local_refuses_bare_branch_with_upstream(hub: Path, tmp_path: Path) -> None:
+    # Same guard as above, but in BARE-BRANCH mode (worktree already gone).
+    # The guard is mode-independent today; this pins it so a refactor folding
+    # it into the resolution arms can't silently reopen the bare-branch hole.
+    wt = _make_spoke(hub, tmp_path, "feature/9-bare-pushed", push=True)
+    _git(hub, "worktree", "remove", str(wt))
+
+    proc, _ = _run_land(hub, tmp_path, "feature/9-bare-pushed", "--local")
+
+    assert proc.returncode != 0
+    assert "upstream" in proc.stderr.lower()
+    assert not (hub / "feature-9-bare-pushed.txt").exists()  # nothing was merged
