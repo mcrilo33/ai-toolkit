@@ -165,11 +165,23 @@ if [ ! -f "$SETTINGS_LOCAL" ]; then
     "$RULE_PUSH" "$RULE_PUSH_U" > "$SETTINGS_LOCAL"
   echo "→ seeded own-branch push allowlist (.claude/settings.local.json)"
 elif command -v jq >/dev/null 2>&1; then
+  # Append-without-churn: existing entries keep their order (no jq `unique`,
+  # which would lexicographically re-sort a user-curated list); only rules not
+  # already present are appended. A malformed file makes jq fail and a
+  # zero-byte file yields zero output documents with exit 0 — in both cases
+  # warn and leave the file untouched rather than abort the wiring or
+  # silently truncate (-s catches the empty-output case).
   TMP_SETTINGS="$(mktemp)"
-  jq --arg a "$RULE_PUSH" --arg b "$RULE_PUSH_U" \
-    '.permissions.allow = ((.permissions.allow // []) + [$a, $b] | unique)' \
-    "$SETTINGS_LOCAL" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$SETTINGS_LOCAL"
-  echo "→ merged own-branch push allowlist into settings.local.json"
+  if jq --arg a "$RULE_PUSH" --arg b "$RULE_PUSH_U" \
+       '(.permissions.allow // []) as $cur | .permissions.allow = ($cur + ([$a, $b] - $cur))' \
+       "$SETTINGS_LOCAL" > "$TMP_SETTINGS" 2>/dev/null && [ -s "$TMP_SETTINGS" ]; then
+    mv "$TMP_SETTINGS" "$SETTINGS_LOCAL"
+    echo "→ merged own-branch push allowlist into settings.local.json"
+  else
+    rm -f "$TMP_SETTINGS"
+    wt_warn "could not merge into settings.local.json (invalid JSON?) — add the allow rules yourself:"
+    wt_warn "  $RULE_PUSH  and  $RULE_PUSH_U"
+  fi
 else
   wt_warn "settings.local.json exists but jq is missing — add the allow rules yourself:"
   wt_warn "  $RULE_PUSH  and  $RULE_PUSH_U"
