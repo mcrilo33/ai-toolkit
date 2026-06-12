@@ -344,6 +344,100 @@ def test_docs_with_nothing_staged_still_requires_anchor(
     assert run_hook(COMMIT_QUALITY, 'git commit -am "docs: fix wording"', cwd=repo) == BLOCK
 
 
+def test_docs_dash_a_with_dirty_script_still_requires_anchor(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # `git commit -am` commits the index PLUS every dirty tracked file — the
+    # staged set the hook inspects is NOT what this command commits. A dirty
+    # tracked script must poison the exemption even when only a doc is staged.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "tools/deploy.sh", "#!/bin/sh\n")
+    subprocess.run(
+        ["git", "commit", "-qm", "chore: tool", "-m", "Refs #1"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+    )
+    (repo / "tools" / "deploy.sh").write_text("#!/bin/sh\necho changed\n")  # dirty, NOT staged
+    _stage(repo, "docs/a.md", "# a\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -am "docs: fix wording"', cwd=repo) == BLOCK
+
+
+def test_docs_pathspec_form_still_requires_anchor(on_branch: Callable[[str], Path]) -> None:
+    # `git commit -m ... <pathspec>` bypasses the index entirely and commits
+    # the named worktree paths — the staged doc-only set is irrelevant.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/a.md", "# a\n")
+
+    command = 'git commit -m "docs: fix wording" tools/deploy.sh'
+    assert run_hook(COMMIT_QUALITY, command, cwd=repo) == BLOCK
+
+
+def test_docs_amend_still_requires_anchor(on_branch: Callable[[str], Path]) -> None:
+    # `--amend -m "..."` HAS a parseable subject, so it reaches the gate (the
+    # no-message early-allow does not apply). An amend rewrites the previous
+    # commit — the staged doc is not what it commits — so no exemption.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/a.md", "# a\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit --amend -m "docs: x"', cwd=repo) == BLOCK
+
+
+def test_docs_executable_md_still_requires_anchor(on_branch: Callable[[str], Path]) -> None:
+    # "Non-executable documentation" must be literal: a .md staged with mode
+    # 100755 is executable and must not ride the exemption.
+    repo = on_branch("claude/micro-docs")
+    doc = repo / "docs" / "a.md"
+    doc.parent.mkdir(parents=True, exist_ok=True)
+    doc.write_text("# a\n")
+    os.chmod(doc, 0o755)
+    subprocess.run(["git", "add", "docs/a.md"], cwd=str(repo), check=True, capture_output=True)
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "docs: x"', cwd=repo) == BLOCK
+
+
+def test_docs_symlink_md_still_requires_anchor(on_branch: Callable[[str], Path]) -> None:
+    # A symlink staged as docs/link.md (mode 120000) is not a documentation
+    # FILE — it can point anywhere, so it must not ride the exemption.
+    repo = on_branch("claude/micro-docs")
+    link = repo / "docs" / "link.md"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink("../README.md", link)
+    subprocess.run(["git", "add", "docs/link.md"], cwd=str(repo), check=True, capture_output=True)
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "docs: x"', cwd=repo) == BLOCK
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        pytest.param("docs/n.markdown", id="markdown"),
+        pytest.param("docs/n.txt", id="txt"),
+        pytest.param("docs/n.rst", id="rst"),
+    ],
+)
+def test_docs_only_alternate_doc_extensions_pass_without_anchor(
+    on_branch: Callable[[str], Path], rel: str
+) -> None:
+    # Pins the extension alternation: .markdown/.txt/.rst are doc-only too.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, rel, "notes\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "docs: x"', cwd=repo) == ALLOW
+
+
+def test_docs_only_cursor_shape_passes_without_anchor(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # Pins the PROJECT_ROOT-based staged lookup: Cursor's beforeShellExecution
+    # payload has an empty cwd, so the index must resolve via workspace_roots.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/a.md", "# a\n")
+
+    assert run_hook_cursor_shell(COMMIT_QUALITY, 'git commit -m "docs: x"', cwd=repo) == ALLOW
+
+
 # ── commit-gauntlet: lint scoping + RED carve-out ─────────
 
 ruff = pytest.mark.skipif(
