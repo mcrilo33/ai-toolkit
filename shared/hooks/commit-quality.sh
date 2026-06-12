@@ -122,21 +122,48 @@ if [ "$BRANCH_HAS_ISSUE" -eq 0 ] && [ "$MSG_HAS_ISSUE" -eq 0 ]; then
   # or git unavailable) is never treated as "all documentation".
   DOC_ONLY_EXEMPT=0
   if echo "$MSG" | grep -qE '^(docs|chore)(\([a-zA-Z0-9._-]+\))?(!)?: '; then
-    STAGED=$(git -C "$PROJECT_ROOT" diff --cached --name-only 2>/dev/null || true)
-    if [ -n "$STAGED" ]; then
-      # Check every staged path is a doc-only path
-      NON_DOC=$(echo "$STAGED" | grep -vE '\.(md|markdown|txt|rst)$' || true)
-      # Exclude top-level scripts/, shared/hooks/, tests/
-      EXCLUDED_DIR=$(echo "$STAGED" | grep -E '^(scripts/|shared/hooks/|tests/)' || true)
-      # Exclude any */scripts/ directory segment
-      SCRIPTS_SUBDIR=$(echo "$STAGED" | grep -E '(^|/)scripts/' || true)
-      if [ -z "$NON_DOC" ] && [ -z "$EXCLUDED_DIR" ] && [ -z "$SCRIPTS_SUBDIR" ]; then
-        DOC_ONLY_EXEMPT=1
+    # The staged index is only authoritative for a PLAIN `git commit` with message
+    # flags. Deny the exemption when the command uses -a/-i/-p/--all/--include/
+    # --interactive/--patch/--amend (these commit more than the index), or when a
+    # trailing pathspec is present (commits the named worktree paths, not the index).
+    # Strip quoted strings first so a quoted message containing -am etc. is ignored,
+    # then check for the unsafe flag forms.
+    CMD_STRIPPED=$(echo "$COMMAND" | sed -E "s/\"[^\"]*\"//g; s/'[^']*'//g")
+    UNSAFE_SHORT=$(echo "$CMD_STRIPPED" | grep -E '(^|[[:space:]])-[a-zA-Z]*[aip]' || true)
+    UNSAFE_LONG=$(echo "$CMD_STRIPPED" | grep -E '(^|[[:space:]])--(all|include|interactive|patch|amend)([[:space:]=]|$)' || true)
+    # Detect trailing pathspec: after the word `commit`, every token must start with `-`.
+    UNSAFE_PATHSPEC=0
+    _SEEN_COMMIT=0
+    for _TOKEN in $CMD_STRIPPED; do
+      if [ "$_SEEN_COMMIT" -eq 1 ]; then
+        case "$_TOKEN" in
+          -*) ;;
+          *) UNSAFE_PATHSPEC=1; break ;;
+        esac
+      fi
+      if [ "$_TOKEN" = "commit" ]; then _SEEN_COMMIT=1; fi
+    done
+    if [ -z "$UNSAFE_SHORT" ] && [ -z "$UNSAFE_LONG" ] && [ "$UNSAFE_PATHSPEC" -eq 0 ]; then
+      STAGED=$(git -C "$PROJECT_ROOT" diff --cached --name-only 2>/dev/null || true)
+      if [ -n "$STAGED" ]; then
+        # Check every staged path is a doc-only path
+        NON_DOC=$(echo "$STAGED" | grep -vE '\.(md|markdown|txt|rst)$' || true)
+        # Exclude shared/hooks/ and tests/
+        EXCLUDED_DIR=$(echo "$STAGED" | grep -E '^(shared/hooks/|tests/)' || true)
+        # Exclude any */scripts/ directory segment
+        SCRIPTS_SUBDIR=$(echo "$STAGED" | grep -E '(^|/)scripts/' || true)
+        # Every staged file must be a plain file (mode 100644) or deletion (000000).
+        # Executable files (100755) and symlinks (120000) are not documentation.
+        RAW_MODES=$(git -C "$PROJECT_ROOT" diff --cached --raw 2>/dev/null || true)
+        UNSAFE_MODE=$(echo "$RAW_MODES" | awk '{print $2}' | grep -vE '^(100644|000000)$' || true)
+        if [ -z "$NON_DOC" ] && [ -z "$EXCLUDED_DIR" ] && [ -z "$SCRIPTS_SUBDIR" ] && [ -z "$UNSAFE_MODE" ]; then
+          DOC_ONLY_EXEMPT=1
+        fi
       fi
     fi
   fi
   if [ "$DOC_ONLY_EXEMPT" -eq 0 ]; then
-  deny "Commit is not anchored to an issue.
+    deny "Commit is not anchored to an issue.
 Every change must trace to a documented issue. Provide one of:
   • a branch named with the issue ID — e.g. feature/142-add-login or fix/PROJ-12-bug
   • an anchor in the commit message — e.g. a second -m \"Closes #142\" (also: Fixes, Resolves, Refs)
