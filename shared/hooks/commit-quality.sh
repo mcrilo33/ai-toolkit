@@ -112,11 +112,36 @@ if echo "$COMMAND" | grep -qiE '(^|[^[:alpha:]])(clos(e|es|ed)|fix(es|ed)?|resol
 fi
 
 if [ "$BRANCH_HAS_ISSUE" -eq 0 ] && [ "$MSG_HAS_ISSUE" -eq 0 ]; then
+  # ── Scoped exemption: docs/chore doc-only commits (issue #10) ───────
+  # This is a scoped exemption for micro/express spokes, not a general bypass.
+  # Three-lane triage: a docs: or chore: commit whose entire staged set consists
+  # of non-executable documentation files (.md/.markdown/.txt/.rst) outside
+  # top-level scripts/, shared/hooks/, tests/, and any */scripts/ directory
+  # does not require an issue anchor. Source-code commits still require anchoring.
+  # Fail closed: an empty staged index (e.g. git commit -am at PreToolUse time,
+  # or git unavailable) is never treated as "all documentation".
+  DOC_ONLY_EXEMPT=0
+  if echo "$MSG" | grep -qE '^(docs|chore)(\([a-zA-Z0-9._-]+\))?(!)?: '; then
+    STAGED=$(git -C "$PROJECT_ROOT" diff --cached --name-only 2>/dev/null || true)
+    if [ -n "$STAGED" ]; then
+      # Check every staged path is a doc-only path
+      NON_DOC=$(echo "$STAGED" | grep -vE '\.(md|markdown|txt|rst)$' || true)
+      # Exclude top-level scripts/, shared/hooks/, tests/
+      EXCLUDED_DIR=$(echo "$STAGED" | grep -E '^(scripts/|shared/hooks/|tests/)' || true)
+      # Exclude any */scripts/ directory segment
+      SCRIPTS_SUBDIR=$(echo "$STAGED" | grep -E '(^|/)scripts/' || true)
+      if [ -z "$NON_DOC" ] && [ -z "$EXCLUDED_DIR" ] && [ -z "$SCRIPTS_SUBDIR" ]; then
+        DOC_ONLY_EXEMPT=1
+      fi
+    fi
+  fi
+  if [ "$DOC_ONLY_EXEMPT" -eq 0 ]; then
   deny "Commit is not anchored to an issue.
 Every change must trace to a documented issue. Provide one of:
   • a branch named with the issue ID — e.g. feature/142-add-login or fix/PROJ-12-bug
   • an anchor in the commit message — e.g. a second -m \"Closes #142\" (also: Fixes, Resolves, Refs)
 Branch: ${BRANCH:-unknown}"
+  fi
 fi
 
 exit 0
