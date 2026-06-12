@@ -12,6 +12,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -429,7 +430,7 @@ def test_todos_subline_shows_done_count_and_in_progress_item(
 
     out = _run_hub_status(hub_with_spokes, tmp_path, projects_dir=projects)
 
-    assert "↳ todos: 1/3 · in_progress: GREEN the thing" in out
+    assert "↳ todos: 1/3 · step: GREEN" in out
 
 
 def test_todos_newest_jsonl_wins(hub_with_spokes: Path, tmp_path: Path) -> None:
@@ -470,7 +471,7 @@ def test_todos_without_in_progress_omits_suffix(hub_with_spokes: Path, tmp_path:
 
     line = next((ln for ln in out.splitlines() if "todos:" in ln), "")
     assert "↳ todos: 1/2" in line
-    assert "in_progress:" not in line
+    assert "step:" not in line
 
 
 def test_todos_none_marker_when_transcript_has_no_todowrite(
@@ -503,7 +504,7 @@ def test_todos_survive_malformed_lines_and_entries(hub_with_spokes: Path, tmp_pa
 
     out = _run_hub_status(hub_with_spokes, tmp_path, projects_dir=projects)
 
-    assert f"↳ todos: 0/1 · in_progress: {'x' * 60}" in out
+    assert f"↳ todos: 0/1 · step: {'x' * 60}" in out
     assert "second line" not in out
     assert "todos: 1/1" not in out
 
@@ -546,7 +547,7 @@ def test_tasks_ledger_shows_done_count_and_in_progress_subject(
 
     out = _run_hub_status(hub_with_spokes, tmp_path, projects_dir=projects)
 
-    assert "↳ todos: 1/3 · in_progress: RED the thing" in out
+    assert "↳ todos: 1/3 · step: RED" in out
 
 
 def test_tasks_ledger_preferred_over_todowrite(hub_with_spokes: Path, tmp_path: Path) -> None:
@@ -597,6 +598,165 @@ def test_tasks_deleted_status_removes_entry(hub_with_spokes: Path, tmp_path: Pat
 
     assert "↳ todos: 0/1" in out
     assert "doomed task" not in out
+
+
+# --- Step + attention line (issue #12 scope addition) -------------------------
+# Per worktree row the todos sub-line also surfaces: the cycle step from the
+# in_progress item (keyword or truncated text), the transcript's activity age,
+# and a waiting-on-input flag for an open AskUserQuestion or a trailing
+# notification event.
+
+
+def _ask_user_question_line(use_id: str) -> str:
+    """An assistant turn posing an AskUserQuestion (real tool_use shape)."""
+    block = {
+        "type": "tool_use",
+        "id": use_id,
+        "name": "AskUserQuestion",
+        "input": {
+            "questions": [
+                {"question": "Push now?", "header": "Push", "options": [], "multiSelect": False}
+            ]
+        },
+    }
+    return json.dumps({"type": "assistant", "message": {"content": [block]}})
+
+
+def _tool_result_line(use_id: str, content: str = "answered") -> str:
+    return json.dumps(
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"tool_use_id": use_id, "type": "tool_result", "content": content}],
+            },
+        }
+    )
+
+
+def test_step_keyword_extracted_from_in_progress_item(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    projects = tmp_path / "projects"
+    lines = [
+        *_taskcreate_lines("toolu_01", "1", "Subtask 1 · review — approve the diff"),
+        *_taskupdate_lines("toolu_02", "1", "pending", "in_progress"),
+    ]
+    _write_transcript(projects, tmp_path / "pushed", lines)
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, projects_dir=projects)
+
+    assert "↳ todos: 0/1 · step: REVIEW" in out
+
+
+def test_step_falls_back_to_truncated_text_without_keyword(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    # No cycle keyword → the item text as-is; "REDESIGN" must not match RED
+    # (word-boundary, not substring).
+    projects = tmp_path / "projects"
+    lines = [
+        *_taskcreate_lines("toolu_01", "1", "REDESIGN api layer"),
+        *_taskupdate_lines("toolu_02", "1", "pending", "in_progress"),
+    ]
+    _write_transcript(projects, tmp_path / "pushed", lines)
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, projects_dir=projects)
+
+    assert "↳ todos: 0/1 · step: REDESIGN api layer" in out
+
+
+def test_activity_age_active_seconds(hub_with_spokes: Path, tmp_path: Path) -> None:
+    projects = tmp_path / "projects"
+    _write_transcript(
+        projects,
+        tmp_path / "pushed",
+        [_todowrite_line([_todo("one", "completed")])],
+        mtime=time.time() - 5,
+    )
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, projects_dir=projects)
+
+    assert re.search(r"↳ todos: 1/1 · active \d+s ago", out)
+
+
+def test_activity_age_idle_minutes(hub_with_spokes: Path, tmp_path: Path) -> None:
+    projects = tmp_path / "projects"
+    _write_transcript(
+        projects,
+        tmp_path / "pushed",
+        [_todowrite_line([_todo("one", "completed")])],
+        mtime=time.time() - 9 * 60 - 5,
+    )
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, projects_dir=projects)
+
+    assert "↳ todos: 1/1 · idle 9m" in out
+
+
+def test_waiting_flag_on_open_ask_user_question(hub_with_spokes: Path, tmp_path: Path) -> None:
+    # An AskUserQuestion tool_use with no matching tool_result is an open
+    # question — the spoke is blocked on the user.
+    projects = tmp_path / "projects"
+    lines = [
+        *_taskcreate_lines("toolu_01", "1", "Subtask 1 · PUSH — ship it"),
+        *_taskupdate_lines("toolu_02", "1", "pending", "in_progress"),
+        _ask_user_question_line("toolu_ask"),
+    ]
+    _write_transcript(projects, tmp_path / "pushed", lines)
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, projects_dir=projects)
+
+    assert "⚠ WAITING ON INPUT" in out
+
+
+def test_no_waiting_flag_when_question_answered(hub_with_spokes: Path, tmp_path: Path) -> None:
+    projects = tmp_path / "projects"
+    lines = [
+        _ask_user_question_line("toolu_ask"),
+        _tool_result_line("toolu_ask"),
+    ]
+    _write_transcript(projects, tmp_path / "pushed", lines)
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, projects_dir=projects)
+
+    assert "WAITING ON INPUT" not in out
+
+
+def test_no_waiting_flag_when_session_moved_past_open_question(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    # The question was never answered but a later meaningful event exists
+    # (e.g. the user queued a new prompt) — the spoke is not blocked.
+    projects = tmp_path / "projects"
+    lines = [
+        _ask_user_question_line("toolu_ask"),
+        json.dumps({"type": "user", "message": {"role": "user", "content": "do this instead"}}),
+        json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "on it"}]}}
+        ),
+    ]
+    _write_transcript(projects, tmp_path / "pushed", lines)
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, projects_dir=projects)
+
+    assert "WAITING ON INPUT" not in out
+
+
+def test_waiting_flag_on_trailing_notification_event(hub_with_spokes: Path, tmp_path: Path) -> None:
+    # A notification entry as the newest transcript event flags waiting even
+    # with no ledger of either kind.
+    projects = tmp_path / "projects"
+    lines = [
+        json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}}),
+        json.dumps({"type": "notification", "content": "Claude is waiting for your input"}),
+    ]
+    _write_transcript(projects, tmp_path / "pushed", lines)
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, projects_dir=projects)
+
+    assert "↳ todos: none" in out
+    assert "⚠ WAITING ON INPUT" in out
 
 
 def test_degrades_when_tmux_unavailable(hub_with_spokes: Path, tmp_path: Path) -> None:
