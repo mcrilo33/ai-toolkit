@@ -510,10 +510,16 @@ review_artifact_verdict() {
 }
 
 # ── Find project root (walk up to .git) ─────────────────────────────
+# Stops at the first ancestor containing a .git entry — a DIRECTORY (normal
+# checkout) OR a FILE (a linked worktree / submodule gitlink). Honoring the
+# file form is essential inside a worktree: its .git is a gitlink file, so a
+# directory-only test walks straight past it to the next real .git up the tree
+# (e.g. a dotfiles repo at $HOME), misresolving the root for every hook that
+# relies on this. `-e` matches either form.
 find_project_root() {
   local dir="${1:-$(pwd)}"
   while [ "$dir" != "/" ]; do
-    [ -d "$dir/.git" ] && { echo "$dir"; return; }
+    [ -e "$dir/.git" ] && { echo "$dir"; return; }
     dir=$(dirname "$dir")
   done
   echo "$(pwd)"

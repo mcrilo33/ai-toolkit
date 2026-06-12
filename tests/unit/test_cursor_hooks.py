@@ -109,9 +109,7 @@ def _accessor(func_call: str, payload: str) -> subprocess.CompletedProcess:
     'get_shell_command "$IN"'. Returns the completed process (stdout/returncode).
     """
     script = f'source "{UTILS}"\nIN=$(cat)\n{func_call}\n'
-    return subprocess.run(
-        ["bash", "-c", script], input=payload, capture_output=True, text=True
-    )
+    return subprocess.run(["bash", "-c", script], input=payload, capture_output=True, text=True)
 
 
 # ── accessors ─────────────────────────────────────────────
@@ -127,7 +125,7 @@ class TestAccessors:
         assert out.stdout.strip() == "ls -la"
 
     def test_get_shell_command_normalizes_escaped_quotes(self, tmp_path: Path) -> None:
-        payload = cursor_shell(r'git commit -m \"feat: x\"', tmp_path)
+        payload = cursor_shell(r"git commit -m \"feat: x\"", tmp_path)
         out = _accessor('echo "$(get_shell_command "$IN")"', payload)
         assert out.stdout.strip() == 'git commit -m "feat: x"'
 
@@ -196,6 +194,17 @@ class TestAccessors:
         )
         assert out.stdout.strip() == "/explicit/root"
 
+    def test_find_project_root_stops_at_worktree_gitlink(self, tmp_path: Path) -> None:
+        # A linked worktree's .git is a FILE (gitlink), not a directory. The
+        # root walk must stop there and not climb past it to an ancestor repo
+        # (e.g. a dotfiles repo at $HOME) — otherwise every hook resolves the
+        # wrong root inside a worktree.
+        wt = tmp_path / "outer" / "wt"
+        wt.mkdir(parents=True)
+        (wt / ".git").write_text("gitdir: /somewhere/.git/worktrees/wt\n")
+        out = _accessor(f'echo "$(find_project_root "{wt}")"', claude_bash("git status"))
+        assert out.stdout.strip() == str(wt)
+
 
 class TestAgentToolsGuard:
     @pytest.mark.parametrize(
@@ -246,7 +255,9 @@ class TestSecretsScanCommitTime:
     def test_blocks_git_dash_c_commit(self, git_repo: Path) -> None:
         # `git -C path commit` must not bypass the staged-content scan.
         _stage(git_repo, "bad.py", f'KEY = "{FAKE_SECRET}"\n')
-        rc = _run(SECRETS_SCAN, cursor_shell(f"git -C {git_repo} commit -m x", git_repo), cwd=git_repo)
+        rc = _run(
+            SECRETS_SCAN, cursor_shell(f"git -C {git_repo} commit -m x", git_repo), cwd=git_repo
+        )
         assert rc.returncode == BLOCK
 
     def test_claude_pre_write_secret_blocks(self) -> None:
@@ -285,9 +296,7 @@ class TestSecretsScanRevert:
     def test_does_not_corrupt_identical_legit_lines(self, git_repo: Path) -> None:
         # A legit line whose text repeats around the secret must be preserved —
         # surgical line redaction removes only the secret line.
-        (git_repo / "b.py").write_text(
-            f'token = legit\nAPIKEY = "{FAKE_SECRET}"\ntoken = legit\n'
-        )
+        (git_repo / "b.py").write_text(f'token = legit\nAPIKEY = "{FAKE_SECRET}"\ntoken = legit\n')
         payload = cursor_edit(git_repo / "b.py", f'APIKEY = "{FAKE_SECRET}"\n', git_repo)
         rc = _run(SECRETS_SCAN_REVERT, payload, cwd=git_repo)
         assert rc.returncode == ALLOW
@@ -342,7 +351,9 @@ class TestConfigProtectionCommitTime:
 
     def test_allows_clean_commit(self, git_repo: Path) -> None:
         _stage(git_repo, "main.py", "x = 1\n")
-        rc = _run(CONFIG_PROTECTION, cursor_shell("git commit -m 'feat: x'", git_repo), cwd=git_repo)
+        rc = _run(
+            CONFIG_PROTECTION, cursor_shell("git commit -m 'feat: x'", git_repo), cwd=git_repo
+        )
         assert rc.returncode == ALLOW
 
     def test_claude_pre_write_protected_blocks(self) -> None:
@@ -430,12 +441,16 @@ class TestShippingGatePromotion:
 
     def test_git_push_review_denies_force_no_lease_on_cursor(self, git_repo: Path) -> None:
         force = "--for" + "ce"
-        rc = _run(GIT_PUSH_REVIEW, cursor_shell(f"git push {force} origin main", git_repo), cwd=git_repo)
+        rc = _run(
+            GIT_PUSH_REVIEW, cursor_shell(f"git push {force} origin main", git_repo), cwd=git_repo
+        )
         assert rc.returncode == BLOCK
 
     def test_git_push_review_allows_force_with_lease_on_cursor(self, git_repo: Path) -> None:
         lease = "--for" + "ce-with-lease"
-        rc = _run(GIT_PUSH_REVIEW, cursor_shell(f"git push {lease} origin main", git_repo), cwd=git_repo)
+        rc = _run(
+            GIT_PUSH_REVIEW, cursor_shell(f"git push {lease} origin main", git_repo), cwd=git_repo
+        )
         assert rc.returncode == ALLOW
 
     def test_git_push_review_plain_push_allows_on_cursor(self, git_repo: Path) -> None:
@@ -511,9 +526,7 @@ class TestReviewWindowOpenIdentity:
         assert rc.returncode == ALLOW
         assert self._window(git_repo).is_file()
 
-    def test_planner_prompt_mentioning_code_review_does_not_open(
-        self, git_repo: Path
-    ) -> None:
+    def test_planner_prompt_mentioning_code_review_does_not_open(self, git_repo: Path) -> None:
         # Identity says planner; the prompt merely MENTIONS code-review.
         payload = self._subagent_payload(
             git_repo,
@@ -544,9 +557,7 @@ class TestReviewWindowOpenIdentity:
         assert rc.returncode == ALLOW
         assert self._window(git_repo).is_file()
 
-    def test_broken_jq_falls_back_to_substring(
-        self, git_repo: Path, tmp_path: Path
-    ) -> None:
+    def test_broken_jq_falls_back_to_substring(self, git_repo: Path, tmp_path: Path) -> None:
         # When jq cannot parse the identity (broken/unavailable jq, simulated
         # by shadowing it with an always-failing stub), the substring grep is
         # the documented fallback so unknown environments keep working.
