@@ -235,9 +235,7 @@ class TestGenerateCursor:
         pre = result["hooks"]["preToolUse"]
         assert pre[0]["matcher"] == "Shell"
 
-    def test_posttooluse_matcher_translated_and_deduped(
-        self, hooks_data: dict
-    ) -> None:
+    def test_posttooluse_matcher_translated_and_deduped(self, hooks_data: dict) -> None:
         """'Edit|Write' collapses to 'Write' — Cursor has no 'Edit' tool."""
         result = generate_cursor(hooks_data)
         post = result["hooks"]["postToolUse"]
@@ -275,9 +273,7 @@ class TestCursorDedicatedEvents:
         # The canonical preToolUse bucket must NOT be emitted for migrated hooks.
         assert "preToolUse" not in result["hooks"]
 
-    def test_event_override_remaps_to_after_file_edit(
-        self, cursor_dedicated_data: dict
-    ) -> None:
+    def test_event_override_remaps_to_after_file_edit(self, cursor_dedicated_data: dict) -> None:
         result = generate_cursor(cursor_dedicated_data)
         assert "afterFileEdit" in result["hooks"]
         assert "postToolUse" not in result["hooks"]
@@ -294,9 +290,7 @@ class TestCursorDedicatedEvents:
         )
         assert cq["matcher"] == "git commit"
 
-    def test_empty_cursor_matcher_emits_no_matcher(
-        self, cursor_dedicated_data: dict
-    ) -> None:
+    def test_empty_cursor_matcher_emits_no_matcher(self, cursor_dedicated_data: dict) -> None:
         """A blank cursor matcher (block-no-verify) yields an entry with no matcher key."""
         result = generate_cursor(cursor_dedicated_data)
         bnv = next(
@@ -311,16 +305,10 @@ class TestCursorDedicatedEvents:
     ) -> None:
         """afterFileEdit matcher 'Write|TabWrite' passes through (no token translation)."""
         result = generate_cursor(cursor_dedicated_data)
-        qg = next(
-            e
-            for e in result["hooks"]["afterFileEdit"]
-            if "quality-gate.sh" in e["command"]
-        )
+        qg = next(e for e in result["hooks"]["afterFileEdit"] if "quality-gate.sh" in e["command"])
         assert qg["matcher"] == "Write|TabWrite"
 
-    def test_claude_unaffected_by_cursor_override(
-        self, cursor_dedicated_data: dict
-    ) -> None:
+    def test_claude_unaffected_by_cursor_override(self, cursor_dedicated_data: dict) -> None:
         """The cursor override must not leak into Claude generation."""
         result = generate_claude(cursor_dedicated_data)
         assert "PreToolUse" in result
@@ -329,9 +317,7 @@ class TestCursorDedicatedEvents:
         assert "beforeShellExecution" not in result
         assert "afterFileEdit" not in result
 
-    def test_copilot_unaffected_by_cursor_override(
-        self, cursor_dedicated_data: dict
-    ) -> None:
+    def test_copilot_unaffected_by_cursor_override(self, cursor_dedicated_data: dict) -> None:
         result = generate_copilot(cursor_dedicated_data)
         assert "preToolUse" in result["hooks"]
         assert "postToolUse" in result["hooks"]
@@ -367,9 +353,7 @@ class TestCursorMCPEvents:
         assert "afterMCPExecution" in result["hooks"]
         assert "postToolUse" not in result["hooks"]
 
-    def test_fail_closed_emitted_only_when_metadata_sets_it(
-        self, cursor_mcp_data: dict
-    ) -> None:
+    def test_fail_closed_emitted_only_when_metadata_sets_it(self, cursor_mcp_data: dict) -> None:
         """failClosed: "true" in metadata -> boolean true in the entry; absent otherwise."""
         result = generate_cursor(cursor_mcp_data)
 
@@ -379,16 +363,12 @@ class TestCursorMCPEvents:
             if "review-stamp-guard.sh" in e["command"]
         )
         audit = next(
-            e
-            for e in result["hooks"]["afterMCPExecution"]
-            if "mcp-audit.sh" in e["command"]
+            e for e in result["hooks"]["afterMCPExecution"] if "mcp-audit.sh" in e["command"]
         )
         assert guard["failClosed"] is True
         assert "failClosed" not in audit
 
-    def test_before_mcp_matcher_passes_through_untranslated(
-        self, cursor_mcp_data: dict
-    ) -> None:
+    def test_before_mcp_matcher_passes_through_untranslated(self, cursor_mcp_data: dict) -> None:
         """MCP-event matchers are tool-name filters — never Bash->Shell translated."""
         result = generate_cursor(cursor_mcp_data)
 
@@ -398,9 +378,7 @@ class TestCursorMCPEvents:
             if "review-stamp-guard.sh" in e["command"]
         )
         audit = next(
-            e
-            for e in result["hooks"]["afterMCPExecution"]
-            if "mcp-audit.sh" in e["command"]
+            e for e in result["hooks"]["afterMCPExecution"] if "mcp-audit.sh" in e["command"]
         )
         assert guard["matcher"] == "approve_review"
         assert audit["matcher"] == "Bash|approve_review"
@@ -479,3 +457,51 @@ class TestGenerateClaude:
         stop = result["Stop"]
         assert len(stop) == 1
         assert stop[0].get("matcher") is None
+
+
+# ── todo-ledger registration against the REAL shared/hooks/metadata.yml ──
+# todo-ledger-warn must be wired exactly like reviewer-sep-warn (tier 2, push/PR
+# shipping gate on both platforms); todo-ledger-nudge is a SessionStart advisory.
+
+REAL_META = Path(__file__).resolve().parents[2] / "shared" / "hooks" / "metadata.yml"
+
+
+def _claude_handler(cfg: dict, event: str, script: str) -> dict | None:
+    for group in cfg.get(event, []):
+        for handler in group.get("hooks", []):
+            if handler.get("command", "").endswith(script):
+                return handler
+    return None
+
+
+def _cursor_entry(cfg: dict, event: str, script: str) -> dict | None:
+    for entry in cfg.get("hooks", {}).get(event, []):
+        if entry.get("command", "").endswith(script):
+            return entry
+    return None
+
+
+class TestTodoLedgerRegistration:
+    def test_warn_claude_wiring_matches_reviewer_sep(self) -> None:
+        cfg = generate_claude(parse_hooks_metadata(str(REAL_META)))
+        ledger = _claude_handler(cfg, "PreToolUse", "todo-ledger-warn.sh")
+        reviewer = _claude_handler(cfg, "PreToolUse", "reviewer-sep-warn.sh")
+        assert ledger is not None, "todo-ledger-warn not registered for Claude PreToolUse"
+        assert reviewer is not None, "reviewer-sep-warn baseline missing"
+        assert ledger.get("if") == reviewer.get("if") == "Bash(git push *)"
+
+    def test_warn_is_tier_2(self) -> None:
+        meta = parse_hooks_metadata(str(REAL_META))
+        assert meta["todo-ledger-warn"]["__defaults"]["tier"] == "2"
+
+    def test_warn_cursor_matcher_matches_reviewer_sep(self) -> None:
+        cfg = generate_cursor(parse_hooks_metadata(str(REAL_META)))
+        ledger = _cursor_entry(cfg, "beforeShellExecution", "todo-ledger-warn.sh")
+        reviewer = _cursor_entry(cfg, "beforeShellExecution", "reviewer-sep-warn.sh")
+        assert ledger is not None, "todo-ledger-warn not wired to Cursor beforeShellExecution"
+        assert reviewer is not None, "reviewer-sep-warn baseline missing"
+        assert ledger["matcher"] == reviewer["matcher"]
+
+    def test_nudge_registered_as_session_start(self) -> None:
+        cfg = generate_claude(parse_hooks_metadata(str(REAL_META)))
+        assert _claude_handler(cfg, "SessionStart", "todo-ledger-nudge.sh") is not None

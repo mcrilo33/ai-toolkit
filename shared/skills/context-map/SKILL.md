@@ -144,8 +144,9 @@ Apply the autonomy threshold:
 
 | Condition | Action |
 |-----------|--------|
-| ≤ 2 files to modify, no risks checked | Proceed to EXECUTE |
-| 3+ files, no risks checked | Show map, ask to confirm |
+| Clear path, contained scope, no risks checked | Proceed to EXECUTE |
+| Wider but mechanical (rename, find/replace, dep bump), no risks checked | Proceed to EXECUTE |
+| Path unclear or change crosses module/API/data boundaries | Show map, ask to confirm |
 | Any risk checked | Show map, ask to confirm |
 | User said "just do it" | Proceed regardless |
 

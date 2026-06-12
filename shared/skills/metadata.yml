@@ -2,10 +2,11 @@
 # Key = skill directory name.
 # Shared fields at top level; per-tool overrides nested under tool name.
 
-close-task:
-  name: "close-task"
-  description: "Close a task by committing, pushing, and creating a PR. Use when the user says /close, 'ship it', 'create PR', or wants to wrap up."
+land-task:
+  name: "land-task"
+  description: "Land a finished task from the hub: verify the spoke pushed, merge into the default branch, run the suite, push, tear down the worktree, and close the issue. Use on the hub when the user says /land <id>, 'land it', or a branch shows pushed → mergeable."
   allowed-tools: "run_in_terminal get_changed_files read_file grep_search get_errors"
+  argument-hint: "[issue number, slug, or branch]"
 
 solo-cycle:
   name: "solo-cycle"
@@ -56,6 +57,17 @@ source-task:
   description: "Fetch a task and create a feature branch from a GitHub issue or ad-hoc request. Use when the user says /source or wants to begin work."
   allowed-tools: "run_in_terminal"
   argument-hint: "[GitHub issue number or URL]"
+
+start-task:
+  name: "start-task"
+  description: "Dispatch a planned task from the planning hub into a running worktree: draft and create the GitHub issue, spawn the worktree on its branch, and seed the spoke's first prompt via worktree-new.sh. Use in the planning session when the user says 'start this work', 'spin it up', or 'let's build X' after scope is clear."
+  allowed-tools: "run_in_terminal read_file grep_search"
+  argument-hint: "[task title or decided scope]"
+
+hub:
+  name: "hub"
+  description: "Orient a fresh planning-hub session and dispatch from it: survey in-flight worktrees, open issues, and mergeable branches, then propose the next move (start an unstarted issue, merge a pushed branch, tear down) and act only on confirmation. Use on the main checkout when the user says /hub, 'what's in flight', or 'hub status'."
+  allowed-tools: "run_in_terminal read_file grep_search"
 
 tdd-workflow:
   name: "tdd-workflow"

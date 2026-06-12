@@ -58,7 +58,9 @@ done
 [ ! -d "$TARGET" ] && { error "Target directory does not exist: $TARGET"; exit 1; }
 TARGET="$(cd "$TARGET" && pwd)"
 
-if [ ! -d "$TARGET/.git" ]; then
+# A normal checkout has a .git directory; a linked worktree has a .git FILE
+# (gitlink). Accept either so syncing into a worktree is not flagged as non-repo.
+if [ ! -e "$TARGET/.git" ]; then
     warn "Target does not appear to be a git repository: $TARGET"
     read -rp "Continue anyway? [y/N] " confirm
     [[ ! "$confirm" =~ ^[Yy]$ ]] && { echo "Aborted."; exit 0; }

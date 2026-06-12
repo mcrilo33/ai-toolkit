@@ -4,10 +4,10 @@ Run a structured quality-gate pipeline and produce a pass/fail report before clo
 
 ## When to Use
 
-- Before committing or creating a PR
+- Before committing or pushing
 - After finishing implementation (EXECUTE → VERIFY transition)
 - When the user says "verify", "check everything", "run quality gates", or "pre-flight"
-- Invoked automatically by the `close-task` skill if verification hasn't been run
+- The `land-task` gate is its hub-side last line — landing re-runs the full suite on the merged hub
 
 ## Gates
 

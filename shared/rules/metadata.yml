@@ -83,6 +83,11 @@ agent-orchestration:
   applyTo: "**"
   alwaysApply: true
 
+planning-hub:
+  name: "Planning Hub"
+  description: "Role of a main-checkout session in the parallel-worktrees workflow — hub stays on main, dispatches spokes via start-task, merges and tears down, never writes task code. Surfaced on demand for hub sessions (via the hub skill), not auto-applied to every session."
+  alwaysApply: false
+
 library-research:
   name: "Library Research"
   description: "Library documentation research using Context7 — resolve, fetch, and answer from current docs for any language"

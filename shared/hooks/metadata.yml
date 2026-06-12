@@ -75,6 +75,17 @@ config-protection:
     event: beforeShellExecution
     matcher: "git( +-[^ ]+| +-C +[^ ]+)* +(add|commit)( |$)"
 
+hub-guard:
+  event: preToolUse
+  matcher: "Edit|Write|NotebookEdit|Bash"
+  description: "On the main checkout's default branch (the planning hub), block file edits, commits, and task-branch creation; point to start-task"
+  tier: 1
+  copilot:
+    matcher: "edit|create"
+  cursor:
+    event: beforeShellExecution
+    matcher: "git( +-[^ ]+| +-C +[^ ]+)* +(commit|checkout|switch|branch)( |$)"
+
 post-edit-format:
   event: postToolUse
   matcher: "Edit|Write"
@@ -165,6 +176,22 @@ reviewer-sep-warn:
   cursor:
     event: beforeShellExecution
     matcher: "git( +-[^ ]+| +-C +[^ ]+)* +push( |$)|gh +pr( |$)"
+
+todo-ledger-warn:
+  event: preToolUse
+  matcher: Bash
+  description: "On push: verify a TodoWrite ledger was seeded this session (transcript scan); No-Ledger: trailer bypasses"
+  tier: 2
+  claude:
+    if: "Bash(git push *)"
+  cursor:
+    event: beforeShellExecution
+    matcher: "git( +-[^ ]+| +-C +[^ ]+)* +push( |$)|gh +pr( |$)"
+
+todo-ledger-nudge:
+  event: sessionStart
+  description: "At session start, nudge the agent to seed a TodoWrite ledger before the first commit (advisory; companion of todo-ledger-warn)"
+  tier: 3
 
 delegation-gate-warn:
   event: preToolUse

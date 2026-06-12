@@ -2,25 +2,36 @@
 
 ## Task Lifecycle
 
+**The hub starts and ends tasks; spokes only execute.** A task begins on the hub
+(`start-task` drafts the issue and spawns the worktree spoke) and ends on the hub
+(`land-task` merges, gates, ships, and tears down). The spoke's endpoint is its
+**push** — there is no PR.
+
 ```
-SOURCE → DEFINE → EXECUTE → VERIFY → CLOSE
+HUB:    START (start-task)                                LAND (/land <id>)
+            │ issue + worktree + seeded session               ▲ merge → suite → push → teardown → close issue
+            ▼                                                 │
+SPOKE:  SOURCE → DEFINE → EXECUTE → VERIFY → PUSH  (per subtask — solo-cycle)
 ```
 
-| Step | Purpose | Artifacts |
-|------|---------|-----------|
-| SOURCE | Get or create work item | Issue/task linked to branch |
-| DEFINE | Clarify "done" criteria | Tests (TDD) or checklist |
-| EXECUTE | Implement until criteria met | Working code |
-| VERIFY | Validate quality gates pass | Pass/fail report |
-| CLOSE | Record and ship | Commit, PR, closed issue |
+| Step | Where | Purpose | Artifacts |
+|------|-------|---------|-----------|
+| START | hub | Draft issue, spawn the spoke | Issue + worktree + branch |
+| SOURCE | spoke | Anchor to the issue | Issue read; branch confirmed |
+| DEFINE | spoke | Clarify "done" criteria | Tests (TDD) or checklist |
+| EXECUTE | spoke | Implement until criteria met | Working code |
+| VERIFY | spoke | Validate quality gates pass | Pass/fail report |
+| PUSH | spoke | Ship gate — push the subtask | Pushed branch + review evidence |
+| LAND | hub | Merge, re-gate, ship, tear down | Merged default branch, closed issue |
 
 ## Commands
 
 | Command | Skill | Purpose |
 |---------|-------|---------|
-| `/source` | `source-task` | Fetch task, create branch |
-| `/close` | `close-task` | Commit, push, create PR |
+| `/hub` | `hub` | Survey what is in flight, propose the next move (hub) |
+| `/source` | `source-task` | Anchor to the issue; branch creation only as non-hub fallback |
 | `/cycle` | `solo-cycle` | Solo per-subtask cycle: anchor, RED, GREEN, review, push |
+| `/land <id>` | `land-task` | Land a finished task from the hub: merge, suite, push, teardown |
 
 ## Phase Checklists
 
@@ -29,7 +40,7 @@ SOURCE → DEFINE → EXECUTE → VERIFY → CLOSE
 ```
 - [ ] Task identified (issue URL or ad-hoc scope)
 - [ ] Issue details read and understood
-- [ ] Branch created from latest default branch
+- [ ] Branch confirmed (hub flow) — or created from latest default branch (non-hub fallback)
 - [ ] Existing code/patterns reviewed for context
 - [ ] Dependencies or blockers identified
 ```
@@ -47,7 +58,7 @@ change crosses module/API/data boundaries; otherwise plan inline.
 - [ ] If path unclear or change crosses boundaries: planner spawned and plan received
 - [ ] If TDD: a failing test is written first (inline, or via tdd-red)
 - [ ] Acceptance criteria written (specific, testable)
-- [ ] Scope boundaries stated ("this PR will NOT do X")
+- [ ] Scope boundaries stated ("this task will NOT do X")
 - [ ] Approach chosen (TDD vs simple)
 - [ ] Files to create/modify listed
 - [ ] Edge cases and error scenarios identified
@@ -68,7 +79,7 @@ change crosses module/API/data boundaries; otherwise plan inline.
 
 ### VERIFY — Quality Gates
 
-Run the `verification-loop` skill before closing. All gates must pass:
+Run the `verification-loop` skill before the subtask's push. All gates must pass:
 
 ```
 - [ ] Build succeeds
@@ -80,13 +91,24 @@ Run the `verification-loop` skill before closing. All gates must pass:
 - [ ] Before shipping: code-review agent spawned on the diff (mandatory gate)
 ```
 
-### CLOSE — Ship
+### PUSH — Ship the subtask (spoke endpoint)
 
 ```
-- [ ] Commit message follows conventional format
-- [ ] PR created with summary, test plan, linked issue
+- [ ] Commit messages follow conventional format, anchored to the issue
+- [ ] Review evidence in place (APPROVE artifact) — push hooks verify it
 - [ ] No debug/temp code left behind
 - [ ] Documentation updated (if behavior changed)
+- [ ] Pushed — outcome synced to the issue (check the subtask's box)
+```
+
+### LAND — End the task (hub only)
+
+Run `/land <id>` (the `land-task` skill) from the hub once the spoke has pushed:
+
+```
+- [ ] Spoke branch fully pushed; hub clean on the default branch
+- [ ] Merged (ff when possible), full suite green on the merged hub
+- [ ] Pushed to origin; worktree torn down; branch pruned; issue closed
 ```
 
 ## Workflow Variations
@@ -94,7 +116,7 @@ Run the `verification-loop` skill before closing. All gates must pass:
 ### TDD Development
 
 ```
-SOURCE → DEFINE (RED) → EXECUTE (GREEN → REFACTOR) → VERIFY → CLOSE (2 commits)
+SOURCE → DEFINE (RED) → EXECUTE (GREEN → REFACTOR) → VERIFY → PUSH (2 commits)
 ```
 
 - RED, GREEN, and REFACTOR may be done **inline** — `red-proof-verify` and
@@ -109,18 +131,19 @@ SOURCE → DEFINE (RED) → EXECUTE (GREEN → REFACTOR) → VERIFY → CLOSE (2
 ### Simple Development
 
 ```
-SOURCE → DEFINE (mental/checklist) → EXECUTE → VERIFY → CLOSE (1 commit)
+SOURCE → DEFINE (mental/checklist) → EXECUTE → VERIFY → PUSH (1 commit)
 ```
 
-### Solo Development (no PR)
+### Solo Development (the default — no PR)
 
 ```
-SOURCE → DEFINE → EXECUTE → VERIFY → CLOSE (push only) — per subtask
+SOURCE → DEFINE → EXECUTE → VERIFY → PUSH — per subtask; the hub lands when done
 ```
 
 - No PR — the push is the ship gate; commit and push hooks enforce all evidence
 - One code-review (APPROVE artifact) and one push per subtask
 - Use the `solo-cycle` skill for the per-subtask mechanics
+- When the last subtask is pushed, the **hub** runs `/land <id>` — never the spoke
 
 ## During Work (EXECUTE)
 
@@ -135,8 +158,9 @@ SOURCE → DEFINE → EXECUTE → VERIFY → CLOSE (push only) — per subtask
 ## Related Skills
 
 - `brainstorming` — Spec refinement for DEFINE (use before context-map/planner on ambiguous work)
+- `start-task` — START step automation (hub: issue + worktree + seeded spoke)
 - `source-task` — SOURCE step automation
-- `close-task` — CLOSE step automation
+- `land-task` — LAND step automation (hub: merge, suite, ship, teardown)
 - `solo-cycle` — Per-subtask cycle for solo, PR-less work
 - `verification-loop` — VERIFY step automation
 - `tdd-workflow` — TDD guidance for DEFINE
