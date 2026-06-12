@@ -8,7 +8,7 @@ PATH keeps the test hermetic while a fake TMUX env var steers the script down
 the tmux branch.
 
 Spoke-home decision (issue #8 follow-up): every spoke window lives in tmux
-session `0`. The script must target that session explicitly (`new-window -t 0:`),
+session `0`. The script must target that session explicitly (`new-window -t =0:`),
 create it detached when missing (`has-session` → `new-session -d -s 0`), work
 even when invoked outside tmux ($TMUX unset), and print the exact jump command
 (`switch-client` inside tmux, `attach ... select-window` outside).
@@ -63,14 +63,16 @@ def _run_new(
     *args: str,
     inside_tmux: bool = True,
     has_session_rc: int = 0,
+    new_session_rc: int = 0,
 ) -> tuple[subprocess.CompletedProcess, Path]:
     """Run worktree-new.sh from the hub with a logging `tmux` stub on PATH.
 
     The stub appends each invocation's argument string to a log (one line per
     call), answers `new-window` with a fake window id `@1` (captured by the
-    script via `-P -F '#{window_id}'`), and answers `has-session` with exit
-    status `has_session_rc` (0 = session 0 exists). The log file is pre-created
-    so a run that never reaches tmux reads as an empty log, not a missing one.
+    script via `-P -F '#{window_id}'`), and answers `has-session` /
+    `new-session` with exit statuses `has_session_rc` / `new_session_rc`
+    (0 = session 0 exists / was created). The log file is pre-created so a run
+    that never reaches tmux reads as an empty log, not a missing one.
 
     Args:
         hub: Main checkout to run the script from.
@@ -79,6 +81,8 @@ def _run_new(
         inside_tmux: If True, export a fake TMUX env var (invoked-inside-tmux);
             if False, leave TMUX unset (invoked from a plain shell).
         has_session_rc: Exit status of the stub's `has-session` answer.
+        new_session_rc: Exit status of the stub's `new-session` answer
+            (nonzero = no tmux server can be started).
 
     Returns:
         The completed process and the tmux call-log path.
@@ -93,6 +97,7 @@ def _run_new(
         f'printf "%s\\n" "$*" >> "{log}"\n'
         'if [ "$1" = "new-window" ]; then printf "@1\\n"; fi\n'
         'if [ "$1" = "has-session" ]; then exit "${STUB_HAS_SESSION:-0}"; fi\n'
+        'if [ "$1" = "new-session" ]; then exit "${STUB_NEW_SESSION:-0}"; fi\n'
         "exit 0\n"
     )
     tmux.chmod(0o755)
@@ -100,6 +105,7 @@ def _run_new(
         **_GIT_ENV,
         "PATH": f"{bindir}:{os.environ['PATH']}",
         "STUB_HAS_SESSION": str(has_session_rc),
+        "STUB_NEW_SESSION": str(new_session_rc),
     }
     env.pop("TMUX", None)  # the host's real tmux must never steer the script
     if inside_tmux:
@@ -157,7 +163,7 @@ def test_window_spawned_into_session_zero(hub: Path, tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation"
-    assert "-t 0:" in new_window[0]
+    assert "-t =0:" in new_window[0]
 
 
 def test_session_zero_created_when_missing(hub: Path, tmp_path: Path) -> None:
@@ -187,7 +193,7 @@ def test_spawns_via_tmux_even_outside_tmux(hub: Path, tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation even with TMUX unset"
-    assert "-t 0:" in new_window[0]
+    assert "-t =0:" in new_window[0]
 
 
 def test_dispatch_prints_switch_client_jump_when_inside_tmux(hub: Path, tmp_path: Path) -> None:
@@ -202,3 +208,21 @@ def test_dispatch_prints_attach_jump_when_outside_tmux(hub: Path, tmp_path: Path
 
     assert proc.returncode == 0, proc.stderr
     assert "tmux attach -t 0 \\; select-window -t '0:8-some-slug'" in proc.stdout
+
+
+def test_no_server_falls_back_to_manual_advice(hub: Path, tmp_path: Path) -> None:
+    proc, log = _run_new(
+        hub,
+        tmp_path,
+        "8",
+        "some-slug",
+        "--no-code",
+        inside_tmux=False,
+        has_session_rc=1,
+        new_session_rc=1,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert not _calls(log.read_text(), "new-window")
+    assert "Start the agent in a new terminal window:" in proc.stdout
+    assert "/source" in proc.stdout
