@@ -64,6 +64,17 @@ git-push-review:
     event: beforeShellExecution
     matcher: "git( +-[^ ]+| +-C +[^ ]+)* +push( |$)|gh +pr( |$)"
 
+push-scope-guard:
+  event: preToolUse
+  matcher: Bash
+  description: "Spoke worktrees may push only their own branch; the default branch is published by the hub (hard deny on Cursor, advisory elsewhere)"
+  tier: 1
+  claude:
+    if: "Bash(git push *)"
+  cursor:
+    event: beforeShellExecution
+    matcher: "git( +-[^ ]+| +-C +[^ ]+)* +push( |$)"
+
 config-protection:
   event: preToolUse
   matcher: "Write|Edit"
