@@ -172,6 +172,7 @@ class TestFallThrough:
         proc = _run(_cursor_payload("rm -f scratch.txt", root=repo))
         assert proc.returncode == 0
         assert proc.stdout.strip() == ""
+        assert proc.stderr == ""
 
     def test_falls_through_when_dir_contains_env_file(self, repo: Path) -> None:
         """The .env* rule must not be bypassable by deleting the parent dir."""
@@ -204,6 +205,7 @@ class TestFallThrough:
         )
         assert proc.returncode == 0
         assert proc.stdout.strip() == ""
+        assert proc.stderr == ""
 
 
 class TestCompoundAllow:
@@ -283,6 +285,23 @@ class TestNeverBreaks:
         proc = _run(payload)
         assert proc.returncode == 0
         assert proc.stdout.strip() == ""
+
+    def test_malformed_workspace_roots_neither_kills_nor_swallows(self) -> None:
+        """A non-array workspace_roots makes jq error at runtime; unguarded
+        that errexits the hook with rc=5 (review round 2 finding). The guard
+        must keep rc=0 AND still deliver the legitimate /tmp allow."""
+        payload = json.dumps(
+            {
+                "hook_event_name": "beforeShellExecution",
+                "command": "rm /tmp/x",
+                "cwd": "",
+                "workspace_roots": "not-an-array",
+            }
+        )
+        proc = _run(payload)
+        assert proc.returncode == 0
+        data = json.loads(proc.stdout)
+        assert data["hookSpecificOutput"]["permissionDecision"] == ALLOW
 
 
 def test_allow_payload_shape(repo: Path) -> None:

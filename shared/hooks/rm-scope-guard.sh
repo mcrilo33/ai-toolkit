@@ -13,8 +13,13 @@
 #   • silent — no output, exit 0: the user's ask rule stays the backstop
 #
 # ALLOW requires ALL of:
-#   • the command is a single rm invocation (no `;`/`&`/`|` chaining, no
-#     substitution, no redirection — anything compound falls through),
+#   • the command splits cleanly on `&&`/`||`/`;`/`|` (quote-aware; lone `&`,
+#     newlines, unbalanced quotes, substitution, and redirection all fall
+#     through), with at least one rm segment,
+#   • every rm segment passes the target scope test below, and every non-rm
+#     segment is on the built-in read-only list: git status/log/diff/
+#     rev-parse (without write-capable flags like --output), ls, head, tail,
+#     grep, cat, echo — pipes between them are fine,
 #   • every target is a static literal (no `$`, backticks, or glob chars),
 #   • every target, resolved against the PAYLOAD cwd (realpath -m semantics
 #     via python3 — symlink-aware for existing prefixes), lands strictly
@@ -43,16 +48,20 @@ INPUT=$(read_stdin)
 COMMAND=$(get_shell_command "$INPUT")
 [ -z "$COMMAND" ] && exit 0
 
-# ── Bail on anything dynamic or compound (silent → normal prompt) ────
+# ── Bail on anything dynamic (silent → normal prompt) ───────────────
 # `$`/backtick: substitution and variables are unknowable statically.
-# `;`/`&`/`|`/newline: chained commands (compound handling is out of scope
-# for a single-rm check). `<`/`>`: redirection. `(`/`)`: subshells.
-# `*`/`?`/`[`: globs — rm may expand to anything the shell matched.
+# `<`/`>`: redirection (a write primitive even in "read-only" segments).
+# `(`/`)`: subshells. `*`/`?`/`[`: globs — rm may expand to anything the
+# shell matched. Newlines: not a sanctioned separator. Chaining via
+# `&&`/`||`/`;`/`|` is handled by the quote-aware splitter below.
+# The length cap bounds the char-scan splitter; an over-long command just
+# prompts like any other unproven one.
 NL=$'\n'
 case "$COMMAND" in
-  *'$'* | *'`'* | *';'* | *'&'* | *'|'* | *'<'* | *'>'* | \
+  *'$'* | *'`'* | *'<'* | *'>'* | \
   *'('* | *')'* | *'*'* | *'?'* | *'['* | *"$NL"*) exit 0 ;;
 esac
+[ "${#COMMAND}" -gt 4096 ] && exit 0
 
 # Resolution requires python3 (macOS /bin/realpath has no -m).
 command -v python3 >/dev/null 2>&1 || exit 0
@@ -96,7 +105,10 @@ if [ -n "$CWD" ]; then
 else
   ROOT="${CURSOR_PROJECT_DIR:-}"
   if [ -z "$ROOT" ] && command -v jq &>/dev/null; then
-    ROOT=$(echo "$INPUT" | jq -r '.workspace_roots[0] // empty' 2>/dev/null)
+    # `|| ROOT=""` guards a malformed (non-array) workspace_roots: jq exits
+    # non-zero at runtime there, and unguarded that would errexit the hook
+    # with rc=5 — breaking the exit-0-always contract.
+    ROOT=$(echo "$INPUT" | jq -r '.workspace_roots[0] // empty' 2>/dev/null) || ROOT=""
   fi
   if [ -n "$ROOT" ] && ! git -C "$ROOT" rev-parse --show-toplevel >/dev/null 2>&1; then
     ROOT=""
@@ -156,11 +168,12 @@ check_target() {
 }
 
 # ── Validate one rm invocation ───────────────────────────────────────
-# Tokenize with the shell's own quoting rules: the bail-list above already
-# rejected every metacharacter that could make `eval set --` execute or
-# substitute anything, and `set -f` suppresses globbing, so the eval can
-# only word-split, strip quotes, and expand `~` — exactly what rm itself
-# would see. Unparseable (unbalanced quotes) → fail → silent.
+# Tokenize with the shell's own quoting rules: the global bail-list rejected
+# substitution, redirection, subshells, and globs, and the quote-aware
+# splitter guarantees no UNQUOTED `;`/`&`/`|` reaches a segment (quoted ones
+# are inert words). With `set -f` suppressing globbing, the eval can only
+# word-split, strip quotes, and expand `~` — exactly what rm itself would
+# see. Unparseable (unbalanced quotes) → fail → silent.
 # Flags are skipped up to `--`; --no-preserve-root fails the segment; at
 # least one target is required (nothing to prove otherwise).
 check_rm_segment() {
@@ -182,6 +195,101 @@ check_rm_segment() {
     found_target=1
   done
   [ "$found_target" -eq 1 ]
+}
+
+# ── Is a non-rm segment read-only/benign? ────────────────────────────
+# The built-in list from issue #13: git status/log/diff/rev-parse (the git
+# flag alternation mirrors lib/utils.sh so `git -C path status` parses),
+# ls, head, tail, grep, cat, echo. None can write without redirection, and
+# redirection was globally rejected above — except git's own --output flag,
+# which turns read-only subcommands into a file-write primitive, so any
+# --output spelling disqualifies the segment.
+is_benign_segment() {
+  local seg="$1"
+  if printf '%s' "$seg" | grep -qE '^(ls|head|tail|grep|cat|echo)([[:space:]]|$)'; then
+    return 0
+  fi
+  if printf '%s' "$seg" \
+    | grep -qE '^git([[:space:]]+(-[^[:space:]]+|--[^[:space:]]+|-C[[:space:]]+[^[:space:]]+))*[[:space:]]+(status|log|diff|rev-parse)([[:space:]]|$)'; then
+    printf '%s' "$seg" | grep -qE -- '--output' && return 1
+    return 0
+  fi
+  return 1
+}
+
+# ── Validate one split-out segment ───────────────────────────────────
+# Empty segments (a trailing `;`) are skipped. An rm segment must pass the
+# scope test and flips RM_SEEN — the whole command needs at least one, or
+# this hook has nothing to vouch for. Everything else must be benign.
+RM_SEEN=0
+check_segment() {
+  local seg="$1"
+  seg="${seg#"${seg%%[![:space:]]*}"}"
+  seg="${seg%"${seg##*[![:space:]]}"}"
+  [ -z "$seg" ] && return 0
+  case "$seg" in
+    rm | rm[[:space:]]*)
+      RM_SEEN=1
+      check_rm_segment "$seg"
+      ;;
+    *)
+      is_benign_segment "$seg"
+      ;;
+  esac
+}
+
+# ── Quote-aware compound split ───────────────────────────────────────
+# Walk the command once, tracking single/double-quote state ($ and backtick
+# are already banned, so quoted content is inert). At top level, `&&`, `||`,
+# `;`, and `|` end a segment, which is validated immediately; a lone `&`
+# (background) and unbalanced quotes fall through. Each segment must pass
+# check_segment, and at least one must be an rm.
+check_compound() {
+  local cmd="$1" seg="" ch next i=0 len in_sq=0 in_dq=0
+  len=${#cmd}
+  while [ "$i" -lt "$len" ]; do
+    ch=${cmd:$i:1}
+    if [ "$in_sq" -eq 1 ]; then
+      [ "$ch" = "'" ] && in_sq=0
+      seg+=$ch
+      i=$((i + 1))
+      continue
+    fi
+    if [ "$in_dq" -eq 1 ]; then
+      [ "$ch" = '"' ] && in_dq=0
+      seg+=$ch
+      i=$((i + 1))
+      continue
+    fi
+    case "$ch" in
+      "'") in_sq=1; seg+=$ch ;;
+      '"') in_dq=1; seg+=$ch ;;
+      ';')
+        check_segment "$seg" || return 1
+        seg=""
+        ;;
+      '&')
+        next=${cmd:$((i + 1)):1}
+        [ "$next" = '&' ] || return 1
+        i=$((i + 1))
+        check_segment "$seg" || return 1
+        seg=""
+        ;;
+      '|')
+        next=${cmd:$((i + 1)):1}
+        [ "$next" = '|' ] && i=$((i + 1))
+        check_segment "$seg" || return 1
+        seg=""
+        ;;
+      *) seg+=$ch ;;
+    esac
+    i=$((i + 1))
+  done
+  if [ "$in_sq" -eq 1 ] || [ "$in_dq" -eq 1 ]; then
+    return 1
+  fi
+  check_segment "$seg" || return 1
+  [ "$RM_SEEN" -eq 1 ]
 }
 
 # ── Allow output (cross-platform) ────────────────────────────────────
@@ -206,5 +314,5 @@ allow() {
   exit 0
 }
 
-check_rm_segment "$COMMAND" || exit 0
-allow "rm-scope-guard: every rm target resolves inside the project root or /tmp — auto-allowed (out-of-scope or protected paths still prompt)"
+check_compound "$COMMAND" || exit 0
+allow "rm-scope-guard: every rm target resolves inside the project root or /tmp and every chained segment is read-only — auto-allowed (out-of-scope or protected paths still prompt)"
