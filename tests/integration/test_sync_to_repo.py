@@ -54,7 +54,11 @@ _CURSOR_EVENT_MAP = {
     "afterFileEdit": "afterFileEdit",
     "beforeReadFile": "beforeReadFile",
 }
-_CLAUDE_EVENT_MAP = {"preToolUse": "PreToolUse", "postToolUse": "PostToolUse"}
+_CLAUDE_EVENT_MAP = {
+    "preToolUse": "PreToolUse",
+    "postToolUse": "PostToolUse",
+    "sessionStart": "SessionStart",
+}
 
 # ── Expected rules derived from metadata ─────────────────
 

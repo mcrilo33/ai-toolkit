@@ -52,7 +52,7 @@ anything that changes state:
 |------------------|-----------------|-----|
 | Open issue, `no worktree` | Start it | `start-task` skill (creates issue if needed + spawns spoke) |
 | New idea, no issue yet | Define then dispatch | discuss scope → `start-task` |
-| Branch `pushed → mergeable` | Land and tear down | `git merge <branch>` → `git push origin <default>` → `scripts/worktree-done.sh <id>` |
+| Branch `pushed → mergeable` | Land and tear down | `/land <id>` (`land-task` skill → `scripts/worktree-land.sh`) |
 | Branch `unpushed` / `dirty` | Leave it — spoke still working | paste the row's `↳ jump:` command to reach its pane |
 
 Never auto-merge or auto-teardown. Restate the branch/issue and the exact command, get a

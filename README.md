@@ -12,7 +12,7 @@ Single source of truth for AI agent rules, skills, prompts, and settings across 
 ai-toolkit/
 ├── shared/                   # Single source of truth
 │   ├── rules/                # Coding guidelines, conventions, style guides
-│   ├── skills/               # Reusable agent skills (close-task, TDD, etc.)
+│   ├── skills/               # Reusable agent skills (land-task, TDD, etc.)
 │   ├── prompts/              # Reusable prompts (commit-msg, etc.)
 │   ├── agents/               # Agent definitions
 │   └── hooks/                # Lifecycle hook scripts (pre/post tool use)

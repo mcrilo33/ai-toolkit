@@ -1,6 +1,11 @@
 # Source Task
 
-Fetch a task and set up a branch for it. This implements the SOURCE step of the development workflow.
+Anchor the session to its task. This implements the SOURCE step of the development
+workflow: fetch the issue, confirm the branch, and restate the contract before any code.
+
+In the hub flow (the default) the branch **already exists** — `worktree-new.sh` created
+it when the hub dispatched this spoke — so anchoring is the whole job. Creating a branch
+is the fallback for non-hub work only (step 3b).
 
 ## Workflow
 
@@ -46,9 +51,22 @@ Extract from the response:
 - Acceptance criteria (look for checklists, "AC", "done when")
 - Labels and assignees
 
-### 3. Create branch
+### 3. Confirm the branch (hub flow — the default)
 
-Derive the branch name from the issue:
+In a worktree the branch was already created by `worktree-new.sh`. Confirm it matches
+the issue and move on — do **not** create another one:
+
+```bash
+git branch --show-current   # expect <type>/<id>-<slug>, e.g. feature/123-user-auth
+```
+
+If the branch doesn't reference the issue being anchored, stop and ask — the worktree
+may have been spawned for a different task.
+
+### 3b. Create branch (non-hub fallback only)
+
+Only when working outside the hub flow (no worktree, branch doesn't exist yet), derive
+the branch name from the issue:
 
 | Issue type | Branch pattern | Example |
 |-----------|----------------|---------|
@@ -94,5 +112,5 @@ Present to the user:
 |-----------|--------|
 | No repo context | Ask for owner/repo |
 | Issue not found | Verify number, check repo access |
-| Branch already exists | Ask to reuse or create new |
+| Branch already exists (3b fallback) | Ask to reuse or create new |
 | Multiple repos | Ask which repo to use |
