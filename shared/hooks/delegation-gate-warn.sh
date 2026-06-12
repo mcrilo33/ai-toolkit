@@ -101,7 +101,7 @@ if echo "$COMMAND" | grep -qiE '(^|[[:space:]])(pytest|npm[[:space:]]+test|pnpm[
 fi
 
 SHIPPING=0
-if echo "$COMMAND" | grep -qiE '^\s*(git\s+push\b|gh\s+pr\s+(create|merge)\b)'; then
+if is_git_push_or_pr "$COMMAND"; then
   SHIPPING=1
 fi
 
