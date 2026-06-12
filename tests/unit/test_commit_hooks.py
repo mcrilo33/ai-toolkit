@@ -258,6 +258,92 @@ def test_branch_issue_detection(
     assert run_hook(COMMIT_QUALITY, 'git commit -m "feat: y"', cwd=repo) == expected
 
 
+# ── commit-quality: docs/chore doc-only exemption (issue #10) ─────────
+# Three-lane triage: a sanctioned no-issue path for micro/express spokes. The
+# anchor gate must EXEMPT a commit when (1) the subject type is docs or chore
+# AND (2) every staged path is a non-executable documentation file (.md,
+# .markdown, .txt, .rst) outside top-level scripts/, shared/hooks/, tests/,
+# and outside any */scripts/ directory. Everything else stays anchored.
+
+
+def test_docs_only_md_staged_passes_without_anchor(on_branch: Callable[[str], Path]) -> None:
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/guide.md", "# guide\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "docs: fix wording"', cwd=repo) == ALLOW
+
+
+def test_chore_only_md_staged_passes_without_anchor(on_branch: Callable[[str], Path]) -> None:
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "shared/rules/workflow.md", "# workflow\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "chore: tidy rule wording"', cwd=repo) == ALLOW
+
+
+def test_feat_with_only_md_staged_still_requires_anchor(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # Only docs/chore types are exempt — feat must stay anchored even when the
+    # staged set is documentation-only.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/guide.md", "# guide\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "feat: add guide"', cwd=repo) == BLOCK
+
+
+def test_docs_with_script_staged_still_requires_anchor(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # A staged executable path (wrong extension, top-level scripts/) breaks the
+    # allowlist — the whole commit stays anchored.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "scripts/helper.sh", "#!/bin/sh\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "docs: fix wording"', cwd=repo) == BLOCK
+
+
+def test_docs_with_md_under_tests_still_requires_anchor(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # Right extension, excluded directory: tests/ is never a doc-only path.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "tests/README.md", "# tests\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "docs: explain test layout"', cwd=repo) == BLOCK
+
+
+def test_docs_with_md_in_skill_scripts_dir_still_requires_anchor(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # Any */scripts/ directory (skill scripts) is excluded even for .md files.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "shared/skills/foo/scripts/README.md", "# scripts\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "docs: describe scripts"', cwd=repo) == BLOCK
+
+
+def test_docs_with_mixed_staged_files_still_requires_anchor(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # EVERY staged path must be on the allowlist — one stray .py poisons the lot.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/a.md", "# a\n")
+    _stage(repo, "pkg/b.py", "x = 1\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "docs: update a"', cwd=repo) == BLOCK
+
+
+def test_docs_with_nothing_staged_still_requires_anchor(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # Fail closed: the hook reads the index at PreToolUse time, so a
+    # `git commit -am` style command sees an EMPTY index here — an empty staged
+    # set must not count as "all documentation".
+    repo = on_branch("claude/micro-docs")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -am "docs: fix wording"', cwd=repo) == BLOCK
+
+
 # ── commit-gauntlet: lint scoping + RED carve-out ─────────
 
 ruff = pytest.mark.skipif(
