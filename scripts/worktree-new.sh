@@ -150,6 +150,31 @@ if [ -d "$REPO_ROOT/.claude" ]; then
   fi
 fi
 
+# --- seed the spoke's narrow push allowlist ------------------------------------
+# The spoke's own-branch push IS its ship gate (push-scope-guard.sh + the push
+# hooks enforce it), so the sanctioned `git push [-u] origin <branch>` should
+# not also stall on a permission ask — gates, not asks, do the enforcing.
+# Template exactly the two narrow rules for THIS branch into the worktree's
+# settings.local.json; every other push stays behind the user-level ask.
+RULE_PUSH="Bash(git push origin ${BRANCH})"
+RULE_PUSH_U="Bash(git push -u origin ${BRANCH})"
+SETTINGS_LOCAL="$WT_DIR/.claude/settings.local.json"
+mkdir -p "$WT_DIR/.claude"
+if [ ! -f "$SETTINGS_LOCAL" ]; then
+  printf '{\n  "permissions": {\n    "allow": [\n      "%s",\n      "%s"\n    ]\n  }\n}\n' \
+    "$RULE_PUSH" "$RULE_PUSH_U" > "$SETTINGS_LOCAL"
+  echo "→ seeded own-branch push allowlist (.claude/settings.local.json)"
+elif command -v jq >/dev/null 2>&1; then
+  TMP_SETTINGS="$(mktemp)"
+  jq --arg a "$RULE_PUSH" --arg b "$RULE_PUSH_U" \
+    '.permissions.allow = ((.permissions.allow // []) + [$a, $b] | unique)' \
+    "$SETTINGS_LOCAL" > "$TMP_SETTINGS" && mv "$TMP_SETTINGS" "$SETTINGS_LOCAL"
+  echo "→ merged own-branch push allowlist into settings.local.json"
+else
+  wt_warn "settings.local.json exists but jq is missing — add the allow rules yourself:"
+  wt_warn "  $RULE_PUSH  and  $RULE_PUSH_U"
+fi
+
 echo
 echo "✓ worktree ready: $WT_DIR"
 echo "  branch:         $BRANCH"
