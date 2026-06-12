@@ -83,26 +83,40 @@ CURRENT=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
 [ -z "$CURRENT" ] && exit 0
 
 # ── Parse the first git push clause from the command string ─────────────────
-# Extract the tail of the first `git [global-opts] push <tail>` up to the next
-# shell operator (; & | backtick newline).
+# Extract the tail of the first `git [global-opts] push <tail>`: take the rest
+# of its line (the -C alternative must appear in BOTH regexes — detection
+# without parsing would misjudge `git -C x push origin main` as a bare push),
+# neutralize redirections (`2>&1`, `>file` are shell plumbing, not refspecs),
+# then cut at the first remaining shell operator (; & | backtick).
 PUSH_TAIL=$(printf '%s' "$COMMAND" \
-  | grep -oE '(^|[;&|`]|\$\()[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git([[:space:]]+(-[^[:space:]]+|--[^[:space:]]+))*[[:space:]]+push[^;&|`$]*' \
+  | grep -oE '(^|[;&|`]|\$\()[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git([[:space:]]+(-C[[:space:]]+[^[:space:]]+|-[^[:space:]]+|--[^[:space:]]+))*[[:space:]]+push([[:space:]].*)?$' \
   | head -1 \
-  | sed -E 's/^.*git([[:space:]]+-[^[:space:]]+|[[:space:]]+--[^[:space:]]+)*[[:space:]]+push[[:space:]]*//' \
+  | sed -E 's/^.*git([[:space:]]+(-C[[:space:]]+[^[:space:]]+|-[^[:space:]]+|--[^[:space:]]+))*[[:space:]]+push[[:space:]]*//' \
+  | sed -E 's/[0-9]*>&[0-9]+//g; s/[0-9]*[<>]{1,2}[[:space:]]*[^[:space:];&|]+//g; s/[0-9]*[<>]{1,2}//g' \
   || true)
+PUSH_TAIL="${PUSH_TAIL%%[;&|\`]*}"
 
 # Flags we care about
 DELETE=0; MIRROR=0; ALL=0
 REMOTE=""
 REFSPECS=()
 
-# Tokenize PUSH_TAIL
+# Tokenize PUSH_TAIL. Globbing is off for the unquoted expansion — a refspec
+# like 'release/*' must not be rewritten by a matching filename in the cwd.
 _skip_next=0
+set -f
 for _tok in $PUSH_TAIL; do
   if [ "$_skip_next" = "1" ]; then
     _skip_next=0
     continue
   fi
+  # Quote characters are shell dressing, not refspec content ('x' names x).
+  _tok="${_tok//\'/}"
+  _tok="${_tok//\"/}"
+  [ -z "$_tok" ] && continue
+  # An unexpanded $substitution cannot be adjudicated by a hook — degrade to
+  # allow rather than misread it as a foreign refspec (never false-block).
+  case "$_tok" in *'$'*) exit 0 ;; esac
   case "$_tok" in
     --delete|-d)      DELETE=1 ;;
     --mirror)         MIRROR=1 ;;
@@ -122,6 +136,7 @@ for _tok in $PUSH_TAIL; do
       ;;
   esac
 done
+set +f
 
 # ── Helper: normalize a refspec dst to a bare branch name ───────────────────
 # Strips refs/heads/ prefix. Returns the result on stdout.
@@ -198,7 +213,9 @@ fi
 # --delete from hub = teardown cleanup → silent allow
 [ "$DELETE" = "1" ] && exit 0
 # --mirror / --all → silent allow
-[ "$MIRROR" = "1" ] || [ "$ALL" = "1" ] && exit 0
+if [ "$MIRROR" = "1" ] || [ "$ALL" = "1" ]; then
+  exit 0
+fi
 
 # Explicit refspecs: warn only when pushing a branch that isn't DEFAULT or CURRENT
 if [ "${#REFSPECS[@]}" -gt 0 ]; then
