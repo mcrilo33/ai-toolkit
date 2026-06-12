@@ -17,6 +17,12 @@ Agent pinning (issue #8 follow-up): the spoke launch must pin model and effort
 explicitly (`CLAUDE_EFFORT=<effort> claude --model <model>`) from env vars
 `WT_AGENT_MODEL` (default `fable`) / `WT_AGENT_EFFORT` (default `max`) instead
 of relying on user-global settings; a seeded `--prompt` stays the trailing arg.
+
+Launch delivery (issue #15): typing the launch command into an interactive zsh
+via `send-keys` races shell init (eaten Enter, zvm interference). The command
+must instead be passed as the `new-window` shell-command argument, suffixed
+with `; exec <shell>` so the window survives claude's exit; `send-keys` must
+never deliver the launch. `--no-agent` spawns a plain interactive window.
 """
 
 from __future__ import annotations
@@ -246,9 +252,9 @@ def test_agent_launch_pins_model_and_effort_by_default(hub: Path, tmp_path: Path
     proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code")
 
     assert proc.returncode == 0, proc.stderr
-    send_keys = _calls(log.read_text(), "send-keys")
-    assert send_keys, "expected a send-keys invocation launching the agent"
-    assert "CLAUDE_EFFORT=max claude --model fable C-m" in send_keys[0]
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    assert "CLAUDE_EFFORT=max claude --model fable; exec " in new_window[0]
 
 
 def test_agent_launch_respects_model_and_effort_overrides(hub: Path, tmp_path: Path) -> None:
@@ -257,18 +263,18 @@ def test_agent_launch_respects_model_and_effort_overrides(hub: Path, tmp_path: P
     proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", extra_env=overrides)
 
     assert proc.returncode == 0, proc.stderr
-    send_keys = _calls(log.read_text(), "send-keys")
-    assert send_keys, "expected a send-keys invocation launching the agent"
-    assert "CLAUDE_EFFORT=high claude --model sonnet C-m" in send_keys[0]
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    assert "CLAUDE_EFFORT=high claude --model sonnet; exec " in new_window[0]
 
 
 def test_agent_launch_keeps_seeded_prompt_after_pinning(hub: Path, tmp_path: Path) -> None:
     proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", "--prompt", "/source")
 
     assert proc.returncode == 0, proc.stderr
-    send_keys = _calls(log.read_text(), "send-keys")
-    assert send_keys, "expected a send-keys invocation launching the agent"
-    assert "CLAUDE_EFFORT=max claude --model fable /source" in send_keys[0]
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    assert "CLAUDE_EFFORT=max claude --model fable /source; exec " in new_window[0]
 
 
 def test_agent_launch_shell_quotes_metacharacter_overrides(hub: Path, tmp_path: Path) -> None:
@@ -277,6 +283,37 @@ def test_agent_launch_shell_quotes_metacharacter_overrides(hub: Path, tmp_path: 
     proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", extra_env=overrides)
 
     assert proc.returncode == 0, proc.stderr
-    send_keys = _calls(log.read_text(), "send-keys")
-    assert send_keys, "expected a send-keys invocation launching the agent"
-    assert "claude --model foo\\ bar C-m" in send_keys[0]
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    assert "claude --model foo\\ bar; exec " in new_window[0]
+
+
+def test_agent_launch_never_typed_via_send_keys(hub: Path, tmp_path: Path) -> None:
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", "--prompt", "/source")
+
+    assert proc.returncode == 0, proc.stderr
+    assert not _calls(log.read_text(), "send-keys"), (
+        "launch must be the new-window shell-command argument, never typed via send-keys"
+    )
+
+
+def test_window_survives_agent_exit_via_exec_shell(hub: Path, tmp_path: Path) -> None:
+    overrides = {"SHELL": "/bin/zsh"}
+
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", extra_env=overrides)
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    assert new_window[0].endswith("; exec /bin/zsh")
+
+
+def test_no_agent_spawns_plain_window(hub: Path, tmp_path: Path) -> None:
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", "--no-agent")
+
+    assert proc.returncode == 0, proc.stderr
+    calls = log.read_text()
+    new_window = _calls(calls, "new-window")
+    assert new_window, "expected a new-window invocation"
+    assert "claude" not in new_window[0]
+    assert not _calls(calls, "send-keys")
