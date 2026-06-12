@@ -6,6 +6,12 @@ and the name must be pinned (`automatic-rename off`, `allow-rename off`) so the
 process running inside the window cannot clobber it. A logging `tmux` stub on
 PATH keeps the test hermetic while a fake TMUX env var steers the script down
 the tmux branch.
+
+Spoke-home decision (issue #8 follow-up): every spoke window lives in tmux
+session `0`. The script must target that session explicitly (`new-window -t 0:`),
+create it detached when missing (`has-session` → `new-session -d -s 0`), work
+even when invoked outside tmux ($TMUX unset), and print the exact jump command
+(`switch-client` inside tmux, `attach ... select-window` outside).
 """
 
 from __future__ import annotations
@@ -51,30 +57,53 @@ def hub(tmp_path: Path) -> Path:
     return hub
 
 
-def _run_new(hub: Path, tmp_path: Path, *args: str) -> tuple[subprocess.CompletedProcess, Path]:
+def _run_new(
+    hub: Path,
+    tmp_path: Path,
+    *args: str,
+    inside_tmux: bool = True,
+    has_session_rc: int = 0,
+) -> tuple[subprocess.CompletedProcess, Path]:
     """Run worktree-new.sh from the hub with a logging `tmux` stub on PATH.
 
-    A fake TMUX in the environment steers the script down the tmux branch. The
-    stub appends each invocation's argument string to a log (one line per call)
-    and answers `new-window` with a fake window id `@1`, which the script
-    captures via `-P -F '#{window_id}'`. Returns the completed process and the
-    log path."""
+    The stub appends each invocation's argument string to a log (one line per
+    call), answers `new-window` with a fake window id `@1` (captured by the
+    script via `-P -F '#{window_id}'`), and answers `has-session` with exit
+    status `has_session_rc` (0 = session 0 exists). The log file is pre-created
+    so a run that never reaches tmux reads as an empty log, not a missing one.
+
+    Args:
+        hub: Main checkout to run the script from.
+        tmp_path: Per-test scratch dir for the stub and its log.
+        *args: Arguments forwarded to worktree-new.sh.
+        inside_tmux: If True, export a fake TMUX env var (invoked-inside-tmux);
+            if False, leave TMUX unset (invoked from a plain shell).
+        has_session_rc: Exit status of the stub's `has-session` answer.
+
+    Returns:
+        The completed process and the tmux call-log path.
+    """
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     log = tmp_path / "tmux-calls.log"
+    log.touch()
     tmux = bindir / "tmux"
     tmux.write_text(
         "#!/bin/sh\n"
         f'printf "%s\\n" "$*" >> "{log}"\n'
         'if [ "$1" = "new-window" ]; then printf "@1\\n"; fi\n'
+        'if [ "$1" = "has-session" ]; then exit "${STUB_HAS_SESSION:-0}"; fi\n'
         "exit 0\n"
     )
     tmux.chmod(0o755)
     env = {
         **_GIT_ENV,
         "PATH": f"{bindir}:{os.environ['PATH']}",
-        "TMUX": "/tmp/fake-tmux-socket,1234,0",
+        "STUB_HAS_SESSION": str(has_session_rc),
     }
+    env.pop("TMUX", None)  # the host's real tmux must never steer the script
+    if inside_tmux:
+        env["TMUX"] = "/tmp/fake-tmux-socket,1234,0"
     proc = subprocess.run(
         ["bash", str(WORKTREE_NEW), *args],
         cwd=str(hub),
@@ -90,6 +119,11 @@ def _new_window_name(calls: str) -> str:
     line = next(ln for ln in calls.splitlines() if ln.startswith("new-window"))
     tokens = line.split()
     return tokens[tokens.index("-n") + 1]
+
+
+def _calls(calls: str, command: str) -> list[str]:
+    """All logged stub invocations of the given tmux subcommand."""
+    return [ln for ln in calls.splitlines() if ln.startswith(command)]
 
 
 def _pins_option_off(calls: str, option: str) -> bool:
@@ -115,3 +149,56 @@ def test_tmux_window_name_pinned_against_rename(hub: Path, tmp_path: Path) -> No
     calls = log.read_text()
     assert _pins_option_off(calls, "automatic-rename")
     assert _pins_option_off(calls, "allow-rename")
+
+
+def test_window_spawned_into_session_zero(hub: Path, tmp_path: Path) -> None:
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code")
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    assert "-t 0:" in new_window[0]
+
+
+def test_session_zero_created_when_missing(hub: Path, tmp_path: Path) -> None:
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", has_session_rc=1)
+
+    assert proc.returncode == 0, proc.stderr
+    calls = log.read_text()
+    new_session = _calls(calls, "new-session")
+    assert new_session, "expected session 0 to be created when has-session fails"
+    assert "-d" in new_session[0].split()
+    assert "-s 0" in new_session[0]
+    assert calls.find("new-session") < calls.find("new-window")
+
+
+def test_session_zero_not_recreated_when_present(hub: Path, tmp_path: Path) -> None:
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", has_session_rc=0)
+
+    assert proc.returncode == 0, proc.stderr
+    calls = log.read_text()
+    assert _calls(calls, "has-session"), "expected the script to probe for session 0"
+    assert not _calls(calls, "new-session")
+
+
+def test_spawns_via_tmux_even_outside_tmux(hub: Path, tmp_path: Path) -> None:
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", inside_tmux=False)
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation even with TMUX unset"
+    assert "-t 0:" in new_window[0]
+
+
+def test_dispatch_prints_switch_client_jump_when_inside_tmux(hub: Path, tmp_path: Path) -> None:
+    proc, _ = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", inside_tmux=True)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "tmux switch-client -t '0:8-some-slug'" in proc.stdout
+
+
+def test_dispatch_prints_attach_jump_when_outside_tmux(hub: Path, tmp_path: Path) -> None:
+    proc, _ = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", inside_tmux=False)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "tmux attach -t 0 \\; select-window -t '0:8-some-slug'" in proc.stdout
