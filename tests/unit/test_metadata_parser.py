@@ -382,9 +382,7 @@ class TestNestedStructures:
             {"label": "Fix bugs", "agent": "debug", "prompt": "Fix the bugs above."},
         ]
 
-    def test_parse_nested_block_then_override_block_still_detected(
-        self, tmp_path: Path
-    ) -> None:
+    def test_parse_nested_block_then_override_block_still_detected(self, tmp_path: Path) -> None:
         content = textwrap.dedent("""\
             my-agent:
               name: "my-agent"
@@ -547,9 +545,7 @@ class TestScalarQuoting:
 
     def test_solo_cycle_real_metadata_roundtrips(self) -> None:
         """The actual solo-cycle description must produce valid YAML."""
-        meta_path = (
-            Path(__file__).resolve().parents[2] / "shared" / "skills" / "metadata.yml"
-        )
+        meta_path = Path(__file__).resolve().parents[2] / "shared" / "skills" / "metadata.yml"
         items = parse(str(meta_path))
 
         fm = dict(query(items, "cursor", ["name", "description"]))["solo-cycle"]
@@ -661,9 +657,7 @@ class TestSkillsMetadata:
     def _skill_dirs_on_disk(self) -> set[str]:
         """Return names of skill directories that contain SKILL.md."""
         return {
-            d.name
-            for d in self.SKILLS_DIR.iterdir()
-            if d.is_dir() and (d / "SKILL.md").exists()
+            d.name for d in self.SKILLS_DIR.iterdir() if d.is_dir() and (d / "SKILL.md").exists()
         }
 
     def _metadata_entries(self) -> dict[str, dict]:
@@ -678,9 +672,7 @@ class TestSkillsMetadata:
         in_meta = set(self._metadata_entries().keys())
 
         missing = on_disk - in_meta
-        assert not missing, (
-            f"Skill directories without metadata.yml entry: {sorted(missing)}"
-        )
+        assert not missing, f"Skill directories without metadata.yml entry: {sorted(missing)}"
 
     def test_every_metadata_entry_has_skill_dir(self) -> None:
         """Every metadata entry must have a matching skill directory with SKILL.md."""
@@ -688,9 +680,7 @@ class TestSkillsMetadata:
         in_meta = set(self._metadata_entries().keys())
 
         orphaned = in_meta - on_disk
-        assert not orphaned, (
-            f"Metadata entries without skill directory: {sorted(orphaned)}"
-        )
+        assert not orphaned, f"Metadata entries without skill directory: {sorted(orphaned)}"
 
     # ── Required fields ──
 
@@ -698,9 +688,7 @@ class TestSkillsMetadata:
         items = self._metadata_entries()
 
         for skill_name, data in items.items():
-            assert "name" in data["__defaults"], (
-                f"Skill '{skill_name}' missing 'name' field"
-            )
+            assert "name" in data["__defaults"], f"Skill '{skill_name}' missing 'name' field"
 
     def test_every_skill_has_description(self) -> None:
         items = self._metadata_entries()
@@ -715,20 +703,16 @@ class TestSkillsMetadata:
         """Skills with allowed-tools should emit that field for copilot."""
         items = self._metadata_entries()
 
-        results = dict(
-            query(items, "copilot", ["name", "description", "allowed-tools"])
-        )
-        # close-task defines allowed-tools in metadata
-        assert "close-task" in results
-        assert "allowed-tools:" in results["close-task"]
+        results = dict(query(items, "copilot", ["name", "description", "allowed-tools"]))
+        # land-task defines allowed-tools in metadata
+        assert "land-task" in results
+        assert "allowed-tools:" in results["land-task"]
 
     def test_argument_hint_parsed(self) -> None:
         """Skills with argument-hint should emit that field."""
         items = self._metadata_entries()
 
-        results = dict(
-            query(items, "copilot", ["name", "argument-hint"])
-        )
+        results = dict(query(items, "copilot", ["name", "argument-hint"]))
         # context-map defines argument-hint
         assert "context-map" in results
         assert "argument-hint:" in results["context-map"]
@@ -737,9 +721,7 @@ class TestSkillsMetadata:
         """Skills with disable-model-invocation should emit that field."""
         items = self._metadata_entries()
 
-        results = dict(
-            query(items, "copilot", ["name", "disable-model-invocation"])
-        )
+        results = dict(query(items, "copilot", ["name", "disable-model-invocation"]))
         # verify-rules defines disable-model-invocation: true
         assert "verify-rules" in results
         assert "disable-model-invocation: true" in results["verify-rules"]
@@ -753,9 +735,7 @@ class TestSkillsMetadata:
         for tool in ("copilot", "cursor", "claude"):
             results = dict(query(items, tool, ["name", "description"]))
             for skill_name in items:
-                assert skill_name in results, (
-                    f"Skill '{skill_name}' missing from {tool} results"
-                )
+                assert skill_name in results, f"Skill '{skill_name}' missing from {tool} results"
                 assert "name:" in results[skill_name], (
                     f"Skill '{skill_name}' missing name for {tool}"
                 )
@@ -770,8 +750,11 @@ class TestSkillsMetadata:
         items = self._metadata_entries()
 
         copilot_fields = [
-            "name", "description", "allowed-tools",
-            "disable-model-invocation", "argument-hint",
+            "name",
+            "description",
+            "allowed-tools",
+            "disable-model-invocation",
+            "argument-hint",
         ]
         results = query(items, "copilot", copilot_fields)
 
@@ -787,8 +770,11 @@ class TestSkillsMetadata:
         items = self._metadata_entries()
 
         claude_fields = [
-            "name", "description", "allowed-tools",
-            "disable-model-invocation", "argument-hint",
+            "name",
+            "description",
+            "allowed-tools",
+            "disable-model-invocation",
+            "argument-hint",
         ]
         results = query(items, "claude", claude_fields)
 
@@ -809,11 +795,7 @@ class TestAgentsMetadata:
 
     def _agent_files_on_disk(self) -> set[str]:
         """Return names of agent .md files (excluding metadata.yml)."""
-        return {
-            f.stem
-            for f in self.AGENTS_DIR.glob("*.md")
-            if f.name != "metadata.yml"
-        }
+        return {f.stem for f in self.AGENTS_DIR.glob("*.md") if f.name != "metadata.yml"}
 
     def _metadata_entries(self) -> dict[str, dict]:
         """Parse agents metadata and return all entries."""
@@ -827,9 +809,7 @@ class TestAgentsMetadata:
         in_meta = set(self._metadata_entries().keys())
 
         missing = on_disk - in_meta
-        assert not missing, (
-            f"Agent files without metadata.yml entry: {sorted(missing)}"
-        )
+        assert not missing, f"Agent files without metadata.yml entry: {sorted(missing)}"
 
     def test_every_metadata_entry_has_agent_file(self) -> None:
         """Every metadata entry must have a matching agent .md file."""
@@ -837,9 +817,7 @@ class TestAgentsMetadata:
         in_meta = set(self._metadata_entries().keys())
 
         orphaned = in_meta - on_disk
-        assert not orphaned, (
-            f"Metadata entries without agent file: {sorted(orphaned)}"
-        )
+        assert not orphaned, f"Metadata entries without agent file: {sorted(orphaned)}"
 
     # ── Required fields ──
 
@@ -847,9 +825,7 @@ class TestAgentsMetadata:
         items = self._metadata_entries()
 
         for agent_name, data in items.items():
-            assert "name" in data["__defaults"], (
-                f"Agent '{agent_name}' missing 'name' field"
-            )
+            assert "name" in data["__defaults"], f"Agent '{agent_name}' missing 'name' field"
 
     def test_every_agent_has_description(self) -> None:
         items = self._metadata_entries()
@@ -864,9 +840,7 @@ class TestAgentsMetadata:
         """Agents with disallowedTools should emit that field for copilot."""
         items = self._metadata_entries()
 
-        results = dict(
-            query(items, "copilot", ["name", "description", "disallowedTools"])
-        )
+        results = dict(query(items, "copilot", ["name", "description", "disallowedTools"]))
         # code-review defines disallowedTools in metadata
         assert "code-review" in results
         assert "disallowedTools:" in results["code-review"]
@@ -875,9 +849,7 @@ class TestAgentsMetadata:
         """Agents with argument-hint should emit that field."""
         items = self._metadata_entries()
 
-        results = dict(
-            query(items, "copilot", ["name", "argument-hint"])
-        )
+        results = dict(query(items, "copilot", ["name", "argument-hint"]))
         # code-review defines argument-hint
         assert "code-review" in results
         assert "argument-hint:" in results["code-review"]
@@ -891,9 +863,7 @@ class TestAgentsMetadata:
         for tool in ("copilot", "cursor", "claude"):
             results = dict(query(items, tool, ["name", "description"]))
             for agent_name in items:
-                assert agent_name in results, (
-                    f"Agent '{agent_name}' missing from {tool} results"
-                )
+                assert agent_name in results, f"Agent '{agent_name}' missing from {tool} results"
 
     # ── Copilot-specific agent fields ──
 
@@ -902,7 +872,10 @@ class TestAgentsMetadata:
         items = self._metadata_entries()
 
         copilot_fields = [
-            "name", "description", "disallowedTools", "argument-hint",
+            "name",
+            "description",
+            "disallowedTools",
+            "argument-hint",
         ]
         results = query(items, "copilot", copilot_fields)
 
@@ -923,11 +896,7 @@ class TestAgentsMetadata:
 
         results = dict(query(items, "claude", ["name", "model", "effort"]))
 
-        assigned = {
-            name: fm
-            for name, fm in results.items()
-            if "model:" in fm
-        }
+        assigned = {name: fm for name, fm in results.items() if "model:" in fm}
         assert assigned, "Expected at least one agent with a Claude model override"
         for name, fm in assigned.items():
             assert "effort:" in fm, f"Agent '{name}' has model but no effort"
@@ -995,11 +964,7 @@ class TestAgentsMetadata:
         """
         items = self._metadata_entries()
 
-        with_hooks = {
-            name
-            for name, data in items.items()
-            if "hooks" in data["__defaults"]
-        }
+        with_hooks = {name for name, data in items.items() if "hooks" in data["__defaults"]}
         assert with_hooks, "Expected at least one agent defining hooks"
 
         results = dict(query(items, "claude", ["name", "model", "hooks"]))
