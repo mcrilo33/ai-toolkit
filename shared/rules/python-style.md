@@ -87,11 +87,12 @@ from .utils import helper
 
 ## Module Size
 
-- Aim for <300 lines per module; consider splitting if larger
+- Aim for <300 lines per module — tighter than the general ≤800 file limit in `code-quality`, since Python favors small, focused modules. Split if larger.
 
 ## Functions
 
-- Max ~50 lines per function (prefer shorter, single-purpose)
+Function size (≤50 lines) and nesting (≤4 levels) limits live in `code-quality`. Python-specific guidance:
+
 - Single return type when possible (avoid `int | str | None`)
 - Use keyword-only args (`*, arg`) for functions with >3 parameters
 - Default arguments: immutable only (`None`, not `[]` or `{}`)
@@ -118,11 +119,11 @@ def process(items: list[str] | None = None) -> list[str]:
 
 ## Error Handling
 
-- Catch specific exceptions: `except ValueError as e:`
-- Never bare `except:` — minimum is `except Exception as e:`
-- Reraise with context: `raise NewError(...) from e`
-- Use guard clauses for early returns
-- Custom exceptions inherit from appropriate base (`ValueError`, `RuntimeError`)
+General principles (catch specific exceptions, never bare `except`, reraise with context, guard clauses, fail-fast at boundaries) live in `code-quality`. Python specifics:
+
+- Bare-`except` floor is `except Exception as e:` — never silence everything
+- Reraise with `from` to preserve the chain: `raise NewError(...) from e`
+- Custom exceptions inherit from an appropriate base (`ValueError`, `RuntimeError`)
 
 ```python
 # Good: guard clause

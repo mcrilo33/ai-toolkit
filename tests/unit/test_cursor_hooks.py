@@ -439,6 +439,14 @@ class TestShippingGatePromotion:
         rc = _run(DELEGATION, claude_bash("git push"), cwd=git_repo)
         assert rc.returncode == ALLOW
 
+    def test_delegation_denies_chained_push_on_cursor(self, git_repo: Path) -> None:
+        # A push reached through a command chain must not bypass the ship gate
+        # (boundary-aware is_git_push_or_pr, not a start-anchored match).
+        for n in ("a.py", "b.py", "c.py"):
+            _stage(git_repo, n, "x = 1\n")
+        rc = _run(DELEGATION, cursor_shell("cd . && git push", git_repo), cwd=git_repo)
+        assert rc.returncode == BLOCK
+
     def test_git_push_review_denies_force_no_lease_on_cursor(self, git_repo: Path) -> None:
         force = "--for" + "ce"
         rc = _run(

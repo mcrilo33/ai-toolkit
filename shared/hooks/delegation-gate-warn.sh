@@ -3,10 +3,10 @@
 #
 # During editing (most commands) the hints are advisory warnings, emitted once
 # per repo. At the SHIPPING gate (git push / gh pr create|merge) the unresolved
-# planner / code-review hints are promoted on Cursor to a hard DENY via
-# ship_gate_enforce (see lib/utils.sh):
+# code-review hint is promoted on Cursor to a hard DENY via ship_gate_enforce
+# (see lib/utils.sh); the planner hint stays advisory — file count is a proxy:
 #   • Cursor (beforeShellExecution): hard DENY (exit 2) — ship blocked until the
-#     multi-file plan / code-review is addressed.
+#     code-review is addressed.
 #   • Claude/Copilot / native git hooks: advisory warn, never blocks (exit 0).
 set -euo pipefail
 
@@ -101,13 +101,8 @@ if echo "$COMMAND" | grep -qiE '(^|[[:space:]])(pytest|npm[[:space:]]+test|pnpm[
 fi
 
 SHIPPING=0
-if echo "$COMMAND" | grep -qiE '^\s*(git\s+push\b|gh\s+pr\s+(create|merge)\b)'; then
+if is_git_push_or_pr "$COMMAND"; then
   SHIPPING=1
-fi
-
-COMMITTING=0
-if echo "$COMMAND" | grep -qiE '^\s*git\s+commit\b'; then
-  COMMITTING=1
 fi
 
 REFACTOR_PATTERN=0
@@ -125,13 +120,10 @@ if echo "$COMMAND" | grep -qiE '(traceback|stack\s*trace|failing|failed|error)';
   DEBUG_PATTERN=1
 fi
 
-# planner — warn once during editing, enforced at commit/ship if still unresolved
-if [ "$CHANGED_COUNT" -ge 3 ]; then
-  if [ "$COMMITTING" -eq 1 ] || [ "$SHIPPING" -eq 1 ]; then
-    ship_gate_add "⚠ STOP. $CHANGED_COUNT files changed and planner was never spawned. Do NOT ship. Spawn planner now, get an implementation plan, then resume."
-  else
-    warn_once "planner" "⚠ STOP. Multi-file change detected ($CHANGED_COUNT files). Spawn planner now before writing any more code."
-  fi
+# planner — advisory nudge only. File count is a proxy, so it never blocks the
+# ship, and it is skipped for mechanical changes (rename/move/format).
+if [ "$CHANGED_COUNT" -ge 3 ] && [ "$REFACTOR_PATTERN" -eq 0 ]; then
+  warn_once "planner" "⚠ $CHANGED_COUNT files changed. If the path isn't obvious or the change crosses module/API/data boundaries, spawn planner before writing more code."
 fi
 
 # code-review — enforced at push/PR, never silenced
@@ -156,7 +148,7 @@ fi
 
 # refactor
 if [ "$REFACTOR_PATTERN" -eq 1 ]; then
-  warn_once "refactor" "⚠ STOP. Cross-cutting rename or restructure detected. Spawn refactor now to handle this safely across all files."
+  warn_once "refactor" "⚠ Cross-cutting rename or restructure detected. Doing it directly is fine for mechanical changes; spawn refactor to apply it safely across many files."
 fi
 
 # security-reviewer
@@ -171,17 +163,17 @@ fi
 
 # tdd-red
 if [ "$SOURCE_TOUCHED" -eq 1 ] && [ "$TESTS_TOUCHED" -eq 0 ]; then
-  warn_once "tdd-red" "⚠ STOP. Source files changed but no tests written yet. Spawn tdd-red now to write failing tests before any implementation."
+  warn_once "tdd-red" "⚠ Source changed with no test yet. Write a failing test first (inline is fine) — the RED commit needs a Tested-RED trailer that red-proof-verify can prove fails."
 fi
 
 # tdd-green
 if [ "$RUNS_TESTS" -eq 1 ] && [ "$TESTS_TOUCHED" -eq 1 ]; then
-  warn_once "tdd-green" "⚠ STOP. Test changes + test run detected. Spawn tdd-green now to implement the minimal code that makes the tests pass."
+  warn_once "tdd-green" "⚠ Tests present and running. Implement the minimal code to make them pass (inline is fine); commit-gauntlet lints and typechecks the changed lines."
 fi
 
 # tdd-refactor
 if [ "$REFACTOR_PATTERN" -eq 1 ] && [ "$RUNS_TESTS" -eq 1 ]; then
-  warn_once "tdd-refactor" "⚠ STOP. Tests are green and cleanup is in progress. Spawn tdd-refactor now — do not refactor in the main agent loop."
+  warn_once "tdd-refactor" "⚠ Tests are green and cleanup is in progress. Refactoring inline is fine; spawn tdd-refactor when you want a clean context boundary."
 fi
 
 # Enforce accumulated shipping-gate hints once: DENY on Cursor, warn elsewhere.

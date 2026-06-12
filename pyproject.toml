@@ -5,6 +5,9 @@
 [tool.pyright]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
+# Tests import scripts/ modules after a runtime sys.path.insert; mirror that
+# for static analysis so the commit gauntlet's typecheck sees what pytest sees.
+extraPaths = ["scripts"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

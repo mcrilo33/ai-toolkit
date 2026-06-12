@@ -75,17 +75,16 @@ for lanes 1 and 2. See the `commit-quality` hook for the exact file-set rules.
 
 ### DEFINE — Plan & Acceptance Criteria
 
-**⚠️ MANDATORY SCOPE CHECK — see the `agent-orchestration` rule for the binding thresholds.**
+**Scope check — see the `agent-orchestration` rule for the delegation rubric.**
 
-Before planning, assess file count and consult the Routing Table in
-`agent-orchestration`. If a row matches, spawn that agent there — do NOT plan inline.
-The thresholds, the TDD agent sequence, and the violation rules all live in
-`agent-orchestration`; this phase only enforces that the check actually happens here.
+Before planning, assess complexity and blast radius (not just file count) and consult the
+routing table in `agent-orchestration`. Spawn `planner` when the path is unclear or the
+change crosses module/API/data boundaries; otherwise plan inline.
 
 ```
-- [ ] Scope check: file count assessed, routing table consulted
-- [ ] If 3+ files: planner agent spawned and plan received
-- [ ] If TDD: tdd-red agent spawned (not inline test writing)
+- [ ] Scope check: complexity and blast radius assessed, routing table consulted
+- [ ] If path unclear or change crosses boundaries: planner spawned and plan received
+- [ ] If TDD: a failing test is written first (inline, or via tdd-red)
 - [ ] Acceptance criteria written (specific, testable)
 - [ ] Scope boundaries stated ("this task will NOT do X")
 - [ ] Approach chosen (TDD vs simple)
@@ -102,8 +101,8 @@ The thresholds, the TDD agent sequence, and the violation rules all live in
 - [ ] Follows existing patterns (see guidelines.md)
 - [ ] Error handling included (not deferred)
 - [ ] No placeholder/stub implementations
-- [ ] Tests written/updated for every functional change (do NOT wait to be asked)
-- [ ] Documentation updated for any behavior change (docstrings, README, API docs — do NOT defer)
+- [ ] Tests written/updated for every functional change (binding rule in `code-quality`)
+- [ ] Documentation updated for any behavior change (binding rule in `code-quality`)
 ```
 
 ### VERIFY — Quality Gates
@@ -117,7 +116,7 @@ Run the `verification-loop` skill before the subtask's push. All gates must pass
 - [ ] All tests pass (existing + new)
 - [ ] Security scan clean (no hardcoded secrets)
 - [ ] Diff review (no unintended changes, reasonable size)
-- [ ] If 5+ files changed: code-review agent spawned for diff review
+- [ ] Before shipping: code-review agent spawned on the diff (mandatory gate)
 ```
 
 ### PUSH — Ship the subtask (spoke endpoint)
@@ -145,15 +144,17 @@ Run `/land <id>` (the `land-task` skill) from the hub once the spoke has pushed:
 ### TDD Development
 
 ```
-SOURCE → DEFINE (spawn tdd-red) → EXECUTE (spawn tdd-green → tdd-refactor) → VERIFY → PUSH (2 commits)
+SOURCE → DEFINE (RED) → EXECUTE (GREEN → REFACTOR) → VERIFY → PUSH (2 commits)
 ```
 
-- **MANDATORY:** Use `tdd-red` agent for RED phase — do NOT write tests inline
-- **MANDATORY:** Use `tdd-green` agent for GREEN phase — do NOT implement inline
-- **MANDATORY:** Use `tdd-refactor` agent for REFACTOR phase
-- First commit: tests only (from tdd-red)
-- Second commit: implementation (from tdd-green + tdd-refactor)
-- Use `tdd-workflow` skill for guidance
+- RED, GREEN, and REFACTOR may be done **inline** — `red-proof-verify` and
+  `commit-gauntlet` enforce the evidence (a test that failed first, clean lint/types),
+  not which agent wrote it
+- Use the `tdd-red`/`tdd-green`/`tdd-refactor` agents when you want a clean context
+  boundary (larger or collaborative work) — they are optional, not required
+- First commit: tests only. Second commit: implementation
+- The one mandatory separate agent before shipping is `code-review`
+- Use the `tdd-workflow` skill for guidance
 
 ### Simple Development
 

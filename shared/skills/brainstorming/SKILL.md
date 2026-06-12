@@ -88,7 +88,7 @@ Present the design one section at a time and get sign-off on each before moving 
 | Next step | Skill / Agent | When |
 |-----------|---------------|------|
 | Impact analysis | `context-map` | Spec touches existing code |
-| Task decomposition | `planner` | 3+ files or multi-step work |
+| Task decomposition | `planner` | path unclear or change crosses boundaries |
 | Tests first | `tdd-workflow` | TDD approach chosen |
 
 ## Checklist

@@ -32,15 +32,16 @@ one. Then either:
 
 ### 2. RED
 
-Spawn the `tdd-red` agent. The failing test is committed with a
-`Tested-RED: <pytest-node-id>` trailer. At commit time `red-proof-verify` runs
-that node and blocks the commit if it PASSES — a passing test is not driving
-any new code.
+Write the failing test (inline is fine; use the `tdd-red` agent when you want a
+clean context boundary). Commit it with a `Tested-RED: <pytest-node-id>`
+trailer. At commit time `red-proof-verify` runs that node and blocks the commit
+if it PASSES — a passing test is not driving any new code. The gate is the
+proof, not the author.
 
 ### 3. GREEN
 
-Spawn the `tdd-green` agent (then `tdd-refactor` if needed) and commit the
-implementation. `commit-gauntlet` lints and typechecks the changed lines;
+Write the implementation (inline, or via the `tdd-green` then `tdd-refactor`
+agents) and commit it. `commit-gauntlet` lints and typechecks the changed lines;
 `secrets-scan` blocks hardcoded credentials.
 
 ### 4. REVIEW
