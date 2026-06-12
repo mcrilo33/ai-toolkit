@@ -22,9 +22,17 @@
 #   • Claude/Copilot / native git hooks: advisory warn, never blocks (exit 0).
 #
 # Degrades to allow (never a false block) on any unadjudicable state: no
-# transcript path in the payload, an unreadable transcript, or no resolvable
-# base ref for the escape-hatch range. An advisory hook must never block a push
-# it cannot adjudicate.
+# transcript path in the payload, an unreadable transcript, an empty pushed
+# range, or no resolvable base ref for the escape-hatch range. An advisory hook
+# must never block a push it cannot adjudicate.
+#
+# CURSOR CAVEAT: the hard-deny is contingent on Cursor's beforeShellExecution
+# payload carrying a `transcript_path`. The live probe behind
+# docs/cursor-hooks-migration-plan.md recorded {command, cwd, sandbox,
+# workspace_roots} for that event and did NOT confirm transcript_path (a Claude
+# Code field). If Cursor does not supply it, this hook degrades to allow there
+# (fail-open) and the gate is effectively Claude-advisory-only. The deny path is
+# kept so the gate activates if/when the field is present.
 set -euo pipefail
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -60,6 +68,10 @@ BASE=$(review_base_ref "$PROJECT_ROOT")
 [ -z "$BASE" ] && exit 0
 
 COMMITS=$(git -C "$PROJECT_ROOT" rev-list --no-merges "$BASE..HEAD" 2>/dev/null || true)
+# Empty range (HEAD == base, e.g. `gh pr create` after the push): nothing is
+# being shipped, so there is nothing to gate — and the No-Ledger: escape hatch
+# would be impossible to apply. Mirror red-proof-warn and allow.
+[ -z "$COMMITS" ] && exit 0
 while IFS= read -r sha; do
   [ -z "$sha" ] && continue
   BODY=$(git -C "$PROJECT_ROOT" log -1 --format=%B "$sha" 2>/dev/null || true)

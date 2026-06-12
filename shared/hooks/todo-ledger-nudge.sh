@@ -27,6 +27,9 @@ if command -v jq &>/dev/null; then
   jq -nc --arg ctx "$NUDGE" \
     '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $ctx}}'
 else
+  # Fallback only: NUDGE is a fixed literal with no " or \, so it is safe to
+  # interpolate raw. Keep it that way — any future quote/backslash here would
+  # produce invalid JSON on the no-jq path.
   printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' "$NUDGE"
 fi
 

@@ -1186,6 +1186,17 @@ def test_todo_ledger_no_base_degrades_allow(git_repo: Path, tmp_path: Path) -> N
     assert run_todo_ledger("git push", git_repo, transcript).returncode == ALLOW
 
 
+def test_todo_ledger_empty_range_degrades_allow(repo_with_upstream: Path, tmp_path: Path) -> None:
+    # HEAD == base (nothing ahead of upstream, e.g. `gh pr create` after the
+    # push): nothing is being shipped → allow, even on the Cursor shape with no
+    # TodoWrite. The No-Ledger: escape hatch is impossible on an empty range, so
+    # enforcing here would be an unfixable false-block.
+    _git(repo_with_upstream, "reset", "--hard", "origin/main")
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, with_todowrite=False)
+    assert run_todo_ledger("gh pr create", repo_with_upstream, transcript).returncode == ALLOW
+
+
 def test_todo_ledger_missing_transcript_degrades_allow(git_repo: Path) -> None:
     # No transcript_path in the payload → cannot adjudicate → degrade to allow.
     assert run_todo_ledger("git push", git_repo, None).returncode == ALLOW
