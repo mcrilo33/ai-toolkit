@@ -63,6 +63,26 @@ case "$COMMAND" in
 esac
 [ "${#COMMAND}" -gt 4096 ] && exit 0
 
+# ── Bail on backslash escaping (silent → normal prompt) ─────────────
+# A backslash desyncs this hook's tokenizer from bash. The splitter has no
+# escape model, so `rm /tmp/ok\; head /outside` splits at the `;` — but bash
+# treats `\;` as a literal char joining ONE rm whose operand then includes
+# `/outside`, which never gets scope-checked. Separately,
+# normalize_escaped_quotes has already folded any `\"`/`\'` artifact into a
+# real quote, which can disagree with bash's word boundaries. Rather than
+# model every escape rule, refuse any backslash: scoped targets containing
+# spaces can be single-quoted instead. RAW is the PRE-normalization command,
+# so the folded `\"`/`\'` cases are caught too (COMMAND alone would miss
+# them). jq-less platforms cannot use the allow decision anyway, so an empty
+# RAW there costs nothing.
+RAW=""
+if command -v jq &>/dev/null; then
+  RAW=$(printf '%s' "$INPUT" | jq -r '.command // .tool_input.command // empty' 2>/dev/null) || RAW=""
+fi
+case "$COMMAND$RAW" in
+  *'\'*) exit 0 ;;
+esac
+
 # Resolution requires python3 (macOS /bin/realpath has no -m).
 command -v python3 >/dev/null 2>&1 || exit 0
 
@@ -169,11 +189,12 @@ check_target() {
 
 # ── Validate one rm invocation ───────────────────────────────────────
 # Tokenize with the shell's own quoting rules: the global bail-list rejected
-# substitution, redirection, subshells, and globs, and the quote-aware
-# splitter guarantees no UNQUOTED `;`/`&`/`|` reaches a segment (quoted ones
-# are inert words). With `set -f` suppressing globbing, the eval can only
-# word-split, strip quotes, and expand `~` — exactly what rm itself would
-# see. Unparseable (unbalanced quotes) → fail → silent.
+# substitution, redirection, subshells, globs, AND every backslash, so the
+# only quoting left is `'`/`"` — a model the splitter shares with bash, which
+# guarantees no UNQUOTED `;`/`&`/`|` reaches a segment (quoted ones are inert
+# words). With `set -f` suppressing globbing, the eval can only word-split,
+# strip quotes, and expand `~` — exactly what rm itself would see.
+# Unparseable (unbalanced quotes) → fail → silent.
 # Flags are skipped up to `--`; --no-preserve-root fails the segment; at
 # least one target is required (nothing to prove otherwise).
 check_rm_segment() {
@@ -198,19 +219,21 @@ check_rm_segment() {
 }
 
 # ── Is a non-rm segment read-only/benign? ────────────────────────────
-# The built-in list from issue #13: git status/log/diff/rev-parse (the git
-# flag alternation mirrors lib/utils.sh so `git -C path status` parses),
-# ls, head, tail, grep, cat, echo. None can write without redirection, and
-# redirection was globally rejected above — except git's own --output flag,
-# which turns read-only subcommands into a file-write primitive, so any
-# --output spelling disqualifies the segment.
+# The built-in list from issue #13: git status/log/diff/rev-parse, ls, head,
+# tail, grep, cat, echo. None can write without redirection, and redirection
+# was globally rejected above. Pre-subcommand git global flags are restricted
+# to a known-safe allowlist (-C <path>, --no-pager, -P) rather than a wildcard
+# passthrough — a bare `-[^space]+` would vouch for `git --exec-path=…` and
+# `-c <write-config>` forms whose read-only subcommand can be turned into a
+# write or code-exec primitive. Post-subcommand, git's own --output flag is
+# still a file-write primitive, so any --output spelling disqualifies it.
 is_benign_segment() {
   local seg="$1"
   if printf '%s' "$seg" | grep -qE '^(ls|head|tail|grep|cat|echo)([[:space:]]|$)'; then
     return 0
   fi
   if printf '%s' "$seg" \
-    | grep -qE '^git([[:space:]]+(-[^[:space:]]+|--[^[:space:]]+|-C[[:space:]]+[^[:space:]]+))*[[:space:]]+(status|log|diff|rev-parse)([[:space:]]|$)'; then
+    | grep -qE '^git([[:space:]]+(-C[[:space:]]+[^[:space:]]+|--no-pager|-P))*[[:space:]]+(status|log|diff|rev-parse)([[:space:]]|$)'; then
     printf '%s' "$seg" | grep -qE -- '--output' && return 1
     return 0
   fi

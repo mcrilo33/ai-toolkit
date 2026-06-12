@@ -233,6 +233,9 @@ class TestCompoundAllow:
             # Separators inside quotes are NOT separators.
             "rm 'a && b.txt'",
             'echo "rm /etc/hosts; x" && rm scratch.txt',
+            # Allowlisted git global flags stay benign after hardening.
+            "rm /tmp/x && git -C /tmp status",
+            "rm scratch.txt && git --no-pager log",
         ],
     )
     def test_allows(self, repo: Path, command: str) -> None:
@@ -271,9 +274,25 @@ class TestCompoundFallThrough:
             "rm /tmp/x && git diff --output=/tmp/zzz",
             # No rm segment at all: nothing for this hook to vouch for.
             "git status && ls",
+            # Backslash-escaped separators desync the splitter from bash:
+            # bash runs ONE rm whose hidden operand (/etc/passwd) escapes
+            # scope-checking. Refuse any backslash (review S2 blocker).
+            pytest.param("rm /tmp/ok\\; cat /etc/passwd", id="backslash-semicolon-hides-operand"),
+            pytest.param("rm /tmp/ok\\| cat /etc/passwd", id="backslash-pipe-hides-operand"),
+            # Escaped space prompts now: quote scoped spaced targets instead.
+            "rm scratch\\ file.txt",
+            # Wildcard git global flags must not be vouched for (hardening).
+            pytest.param("rm /tmp/x && git --exec-path=/evil log", id="git-unknown-global-flag"),
         ],
     )
     def test_falls_through(self, repo: Path, command: str) -> None:
+        assert decision(command, repo) is None
+
+    def test_normalize_folded_escaped_quote_does_not_false_allow(self, repo: Path) -> None:
+        """normalize_escaped_quotes folds a raw \\" into a real quote before
+        the splitter sees it; bash would treat the \\" as an escaped literal
+        and honor the separator. Refusing any raw backslash closes the gap."""
+        command = 'rm /tmp/a\\"; rm /etc/passwd\\"'
         assert decision(command, repo) is None
 
 
