@@ -75,6 +75,17 @@ config-protection:
     event: beforeShellExecution
     matcher: "git( +-[^ ]+| +-C +[^ ]+)* +(add|commit)( |$)"
 
+hub-guard:
+  event: preToolUse
+  matcher: "Edit|Write|NotebookEdit|Bash"
+  description: "On the main checkout's default branch (the planning hub), block file edits, commits, and task-branch creation; point to start-task"
+  tier: 1
+  copilot:
+    matcher: "edit|create"
+  cursor:
+    event: beforeShellExecution
+    matcher: "git( +-[^ ]+| +-C +[^ ]+)* +(commit|checkout|switch)( |$)"
+
 post-edit-format:
   event: postToolUse
   matcher: "Edit|Write"

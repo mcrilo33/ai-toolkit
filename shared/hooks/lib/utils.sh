@@ -166,6 +166,18 @@ is_git_push_or_pr() {
   printf '%s' "$cmd" | grep -qE '(^|[;&|`]|\$\()[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*(git([[:space:]]+(-[^[:space:]]+|--[^[:space:]]+|-C[[:space:]]+[^[:space:]]+))*[[:space:]]+push\b|gh[[:space:]]+pr[[:space:]]+(create|merge)\b)'
 }
 
+# ── Recognize a branch-CREATING checkout/switch ──────────────────────
+# Matches `git checkout -b|-B <name>` and `git switch -c|-C <name>` at a
+# command boundary (same boundary-awareness as is_git_commit), tolerating
+# leading options and env-assignment prefixes, so chained/prefixed forms are
+# not bypassed: `cd x && git checkout -b y`, `git -C path switch -c y`. A plain
+# branch switch (`git checkout main`, `git switch x`) does NOT match — only
+# branch creation, which on the hub belongs in a worktree. Returns 0 on match.
+is_git_branch_create() {
+  local cmd="$1"
+  printf '%s' "$cmd" | grep -qE '(^|[;&|`]|\$\()[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git([[:space:]]+(-[^[:space:]]+|--[^[:space:]]+|-C[[:space:]]+[^[:space:]]+))*[[:space:]]+(checkout([[:space:]]+-[^[:space:]]+)*[[:space:]]+-[a-zA-Z]*[bB]\b|switch([[:space:]]+-[^[:space:]]+)*[[:space:]]+-[a-zA-Z]*[cC]\b)'
+}
+
 # ── Get the edited file path (cross-platform) ───────────────────────
 # afterFileEdit: top-level .file_path. Claude/Copilot: tool_input.file_path
 # (via get_file_path).
