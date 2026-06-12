@@ -16,16 +16,30 @@
 #
 #   HUB (main checkout):
 #     Publishing the default branch or the current branch is exactly the hub's
-#     job — always silent.  --delete is teardown cleanup — silent.  --mirror and
-#     --all are also silently allowed.  Pushing some OTHER task's branch is
-#     suspicious (the spoke should be shipping it) → advisory warn on every
-#     platform, never a hard deny.
+#     job — always silent.  --delete (either spelling, flag or :branch refspec)
+#     is teardown cleanup — silent.  --mirror, --all, and tag pushes are also
+#     silently allowed.  Pushing some OTHER task's branch is suspicious (the
+#     spoke should be shipping it) → advisory warn on every platform, never a
+#     hard deny.
 #
 #   BARE PUSH (no refspecs):
 #     Resolved against the tracked upstream.  Own branch → allow.  Default branch
 #     upstream → enforce/warn.  No upstream → allow (git itself will refuse).
 #
 #   NON-PUSH COMMANDS and NON-REPO DIRS: immediate exit 0 (no-op).
+#
+# PARSING
+#   The command is split into clauses on shell operators (; & | backtick,
+#   newlines) and EVERY git push clause is adjudicated — a compliant clause
+#   must not launder an out-of-scope one (`git push origin main && git push
+#   origin <own>`).  Within a clause, redirections (2>&1, >file) are shell
+#   plumbing and are neutralized before tokenizing; quote characters are
+#   stripped from tokens; a token carrying an unexpanded $substitution cannot
+#   be adjudicated by a hook and degrades to allow — but a CONCRETE refspec in
+#   the same clause is still judged (a $var must not smuggle `main` through).
+#   `git -C <path> push` is parsed, but scope is judged against the payload
+#   root's repo — the hook adjudicates the session's worktree, not arbitrary
+#   other checkouts.
 #
 # PER-PLATFORM ENFORCEMENT
 #   ship_gate_enforce "$INPUT" "<msg>" (from lib/utils.sh):
@@ -47,7 +61,8 @@ COMMAND=$(get_shell_command "$INPUT")
 
 # Only act when the command contains a git push at a command boundary.
 # We deliberately do NOT match `gh pr` here — only `git push`.
-if ! printf '%s' "$COMMAND" | grep -qE '(^|[;&|`]|\$\()[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git([[:space:]]+(-[^[:space:]]+|--[^[:space:]]+|-C[[:space:]]+[^[:space:]]+))*[[:space:]]+push\b'; then
+PUSH_RE='(^|[;&|`]|\$\()[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git([[:space:]]+(-C[[:space:]]+[^[:space:]]+|-[^[:space:]]+|--[^[:space:]]+))*[[:space:]]+push\b'
+if ! printf '%s' "$COMMAND" | grep -qE "$PUSH_RE"; then
   exit 0
 fi
 
@@ -82,160 +97,172 @@ DEFAULT=$(hub_default_branch "$ROOT")
 CURRENT=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
 [ -z "$CURRENT" ] && exit 0
 
-# ── Parse the first git push clause from the command string ─────────────────
-# Extract the tail of the first `git [global-opts] push <tail>`: take the rest
-# of its line (the -C alternative must appear in BOTH regexes — detection
-# without parsing would misjudge `git -C x push origin main` as a bare push),
-# neutralize redirections (`2>&1`, `>file` are shell plumbing, not refspecs),
-# then cut at the first remaining shell operator (; & | backtick).
-PUSH_TAIL=$(printf '%s' "$COMMAND" \
-  | grep -oE '(^|[;&|`]|\$\()[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git([[:space:]]+(-C[[:space:]]+[^[:space:]]+|-[^[:space:]]+|--[^[:space:]]+))*[[:space:]]+push([[:space:]].*)?$' \
-  | head -1 \
-  | sed -E 's/^.*git([[:space:]]+(-C[[:space:]]+[^[:space:]]+|-[^[:space:]]+|--[^[:space:]]+))*[[:space:]]+push[[:space:]]*//' \
-  | sed -E 's/[0-9]*>&[0-9]+//g; s/[0-9]*[<>]{1,2}[[:space:]]*[^[:space:];&|]+//g; s/[0-9]*[<>]{1,2}//g' \
-  || true)
-PUSH_TAIL="${PUSH_TAIL%%[;&|\`]*}"
+OWN_MSG="'$DEFAULT' is published only by the hub's land step — a spoke ships its own branch: git push -u origin $CURRENT"
+SCOPE_MSG="A spoke pushes only its own branch ($CURRENT). Use: git push -u origin $CURRENT"
 
-# Flags we care about
-DELETE=0; MIRROR=0; ALL=0
-REMOTE=""
-REFSPECS=()
+# Strip the `git [global-opts] push` prefix from a clause, leaving the tail.
+# The -C alternative must mirror PUSH_RE — detection without parsing would
+# misjudge `git -C x push origin main` as a bare push.
+STRIP_PREFIX='s/^.*git([[:space:]]+(-C[[:space:]]+[^[:space:]]+|-[^[:space:]]+|--[^[:space:]]+))*[[:space:]]+push([[:space:]]+|$)//'
 
-# Tokenize PUSH_TAIL. Globbing is off for the unquoted expansion — a refspec
-# like 'release/*' must not be rewritten by a matching filename in the cwd.
-_skip_next=0
-set -f
-for _tok in $PUSH_TAIL; do
-  if [ "$_skip_next" = "1" ]; then
-    _skip_next=0
-    continue
-  fi
-  # Quote characters are shell dressing, not refspec content ('x' names x).
-  _tok="${_tok//\'/}"
-  _tok="${_tok//\"/}"
-  [ -z "$_tok" ] && continue
-  # An unexpanded $substitution cannot be adjudicated by a hook — degrade to
-  # allow rather than misread it as a foreign refspec (never false-block).
-  case "$_tok" in *'$'*) exit 0 ;; esac
-  case "$_tok" in
-    --delete|-d)      DELETE=1 ;;
-    --mirror)         MIRROR=1 ;;
-    --all|--branches) ALL=1 ;;
-    # flags that consume the next token as their value
-    --repo|--receive-pack|--exec|-o|--push-option)
-      _skip_next=1 ;;
-    # any other flag → ignore
-    -*)               ;;
-    # non-flag: first is remote, rest are refspecs
-    *)
-      if [ -z "$REMOTE" ]; then
-        REMOTE="$_tok"
-      else
-        REFSPECS+=("$_tok")
-      fi
-      ;;
-  esac
-done
-set +f
-
-# ── Helper: normalize a refspec dst to a bare branch name ───────────────────
-# Strips refs/heads/ prefix. Returns the result on stdout.
-_normalize_dst() {
-  local dst="$1"
-  # Strip refs/heads/ prefix
-  dst="${dst#refs/heads/}"
-  printf '%s' "$dst"
+# Neutralize redirections — shell plumbing, not refspecs.  Whole-word forms
+# may carry an fd prefix (`2>&1`, `2> file`); a redirect GLUED to a word may
+# not (`feature/30>log` pushes feature/30 — fd digits only count as their own
+# word).  Quoted targets (`> "my log.txt"`) are consumed as one unit.
+strip_redirections() {
+  sed -E \
+    -e 's/(^|[[:space:]])[0-9]*>&[0-9]+/\1/g' \
+    -e "s/(^|[[:space:]])[0-9]*[<>]{1,2}[[:space:]]*(\"[^\"]*\"|'[^']*'|[^[:space:]]+)/\1/g" \
+    -e 's/(^|[[:space:]])[0-9]*[<>]{1,2}//g' \
+    -e 's/>&[0-9]+//g' \
+    -e "s/[<>]{1,2}[[:space:]]*(\"[^\"]*\"|'[^']*'|[^[:space:]]+)//g" \
+    -e 's/[<>]{1,2}//g'
 }
 
-# ── SPOKE rules ──────────────────────────────────────────────────────────────
-if [ "$IS_SPOKE" = "1" ]; then
-  OWN_MSG="'$DEFAULT' is published only by the hub's land step — a spoke ships its own branch: git push -u origin $CURRENT"
-  SCOPE_MSG="A spoke pushes only its own branch ($CURRENT). Use: git push -u origin $CURRENT"
+# ── Adjudicate ONE git push clause ───────────────────────────────────────────
+# Allowed clauses return 0; a violation enforces (exit 2 on Cursor) and exits 0
+# so the advisory platforms get exactly one warning.
+judge_clause() {
+  local clause="$1" tail tok spec src dst upstream
+  local delete=0 mirror=0 all=0 skip_next=0 dynamic=0 remote=""
+  local refspecs=()
 
-  # --delete / --mirror / --all → always out of scope for a spoke
-  if [ "$DELETE" = "1" ] || [ "$MIRROR" = "1" ] || [ "$ALL" = "1" ]; then
-    ship_gate_enforce "$INPUT" "$SCOPE_MSG"
-    exit 0
+  tail=$(printf '%s' "$clause" | sed -E "$STRIP_PREFIX" | strip_redirections)
+
+  # Tokenize. Globbing is off for the unquoted expansion — a refspec like
+  # 'release/*' must not be rewritten by a matching filename in the cwd.
+  set -f
+  for tok in $tail; do
+    if [ "$skip_next" = "1" ]; then
+      skip_next=0
+      continue
+    fi
+    # Quote characters are shell dressing, not refspec content ('x' names x).
+    tok="${tok//\'/}"
+    tok="${tok//\"/}"
+    [ -z "$tok" ] && continue
+    case "$tok" in
+      --delete|-d)      delete=1; continue ;;
+      --mirror)         mirror=1; continue ;;
+      --all|--branches) all=1; continue ;;
+      # flags that consume the next token as their value
+      --repo|--receive-pack|--exec|-o|--push-option) skip_next=1; continue ;;
+      # any other flag is scope-neutral, even with a $value (--force-with-lease=$SHA)
+      -*) continue ;;
+    esac
+    # An unexpanded $substitution cannot be adjudicated by a hook: it consumes
+    # its position (remote first, then refspec) but is never judged — concrete
+    # refspecs in the same clause still are.
+    case "$tok" in
+      *'$'*)
+        if [ -z "$remote" ]; then remote="$tok"; else dynamic=1; fi
+        continue
+        ;;
+    esac
+    if [ -z "$remote" ]; then
+      remote="$tok"
+    else
+      refspecs+=("$tok")
+    fi
+  done
+  set +f
+
+  if [ "$IS_SPOKE" = "1" ]; then
+    # --delete / --mirror / --all → always out of scope for a spoke
+    if [ "$delete" = "1" ] || [ "$mirror" = "1" ] || [ "$all" = "1" ]; then
+      ship_gate_enforce "$INPUT" "$SCOPE_MSG"
+      exit 0
+    fi
+
+    if [ "${#refspecs[@]}" -gt 0 ]; then
+      for spec in "${refspecs[@]}"; do
+        spec="${spec#+}" # force marker
+        case "$spec" in
+          *:*) src="${spec%%:*}"; dst="${spec#*:}" ;;
+          *)   src="$spec";       dst="$spec" ;;
+        esac
+        # Empty src means remote delete (:branch)
+        if [ -z "$src" ]; then
+          ship_gate_enforce "$INPUT" "$SCOPE_MSG"
+          exit 0
+        fi
+        dst="${dst#refs/heads/}"
+        if [ "$dst" = "HEAD" ] || [ "$dst" = "$CURRENT" ]; then
+          : # ok
+        elif [ "$dst" = "$DEFAULT" ]; then
+          ship_gate_enforce "$INPUT" "$OWN_MSG"
+          exit 0
+        else
+          ship_gate_enforce "$INPUT" "$SCOPE_MSG"
+          exit 0
+        fi
+      done
+      return 0
+    fi
+
+    # An explicit but unexpandable refspec → degrade to allow (never judge a
+    # bare-push upstream the command did not name).
+    if [ "$dynamic" = "1" ]; then
+      return 0
+    fi
+
+    # Bare push (no refspecs) — resolve upstream
+    upstream=$(git -C "$ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
+    if [ -z "$upstream" ]; then
+      return 0 # no upstream: git itself will refuse; degrade to allow
+    fi
+    dst="${upstream#*/}" # strip leading <remote>/ (first path segment only)
+    if [ "$dst" = "$CURRENT" ]; then
+      return 0
+    elif [ "$dst" = "$DEFAULT" ]; then
+      ship_gate_enforce "$INPUT" "$OWN_MSG"
+      exit 0
+    else
+      ship_gate_enforce "$INPUT" "$SCOPE_MSG"
+      exit 0
+    fi
   fi
 
-  # Explicit refspecs
-  if [ "${#REFSPECS[@]}" -gt 0 ]; then
-    for _spec in "${REFSPECS[@]}"; do
-      # Strip leading + (force marker)
-      _spec="${_spec#+}"
-      # Determine dst
-      if printf '%s' "$_spec" | grep -q ':'; then
-        _src="${_spec%%:*}"
-        _dst="${_spec#*:}"
-      else
-        _src="$_spec"
-        _dst="$_spec"
-      fi
-      # Empty src means remote delete (:branch)
-      if [ -z "$_src" ]; then
-        ship_gate_enforce "$INPUT" "$SCOPE_MSG"
-        exit 0
-      fi
-      _dst_norm=$(_normalize_dst "$_dst")
-      if [ "$_dst_norm" = "HEAD" ] || [ "$_dst_norm" = "$CURRENT" ]; then
-        : # ok
-      elif [ "$_dst_norm" = "$DEFAULT" ]; then
-        ship_gate_enforce "$INPUT" "$OWN_MSG"
-        exit 0
-      else
-        ship_gate_enforce "$INPUT" "$SCOPE_MSG"
+  # ── HUB rules (all advisory, never hard deny) ──────────────────────────────
+  # --delete is teardown cleanup; --mirror / --all are sanctioned hub bulk ops.
+  if [ "$delete" = "1" ] || [ "$mirror" = "1" ] || [ "$all" = "1" ]; then
+    return 0
+  fi
+  if [ "${#refspecs[@]}" -gt 0 ]; then
+    for spec in "${refspecs[@]}"; do
+      spec="${spec#+}"
+      case "$spec" in
+        :*) continue ;; # refspec-form delete → teardown cleanup, silent
+        refs/tags/*|*:refs/tags/*) continue ;; # release tags are not task branches
+        *:*) dst="${spec#*:}" ;;
+        *)   dst="$spec" ;;
+      esac
+      dst="${dst#refs/heads/}"
+      if [ "$dst" != "HEAD" ] && [ "$dst" != "$DEFAULT" ] && [ "$dst" != "$CURRENT" ]; then
+        warn "That task branch ($dst) belongs to its spoke worktree — the spoke ships it via its own push."
         exit 0
       fi
     done
-    exit 0
   fi
+  return 0
+}
 
-  # Bare push (no refspecs) — resolve upstream
-  UPSTREAM=$(git -C "$ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
-  if [ -z "$UPSTREAM" ]; then
-    # No upstream: git itself will refuse; degrade to allow
-    exit 0
-  fi
-  # Strip leading <remote>/ (first path segment only)
-  UPSTREAM_BRANCH="${UPSTREAM#*/}"
-  if [ "$UPSTREAM_BRANCH" = "$CURRENT" ]; then
-    exit 0
-  elif [ "$UPSTREAM_BRANCH" = "$DEFAULT" ]; then
-    ship_gate_enforce "$INPUT" "$OWN_MSG"
-    exit 0
-  else
-    ship_gate_enforce "$INPUT" "$SCOPE_MSG"
-    exit 0
-  fi
-fi
+# ── Split into clauses and judge EVERY git push clause ──────────────────────
+# Backticks and ; & | become clause boundaries (newlines already are); `&&`
+# and `||` collapse to one boundary.  `2>&1` splits as `2>` + `1` — the
+# residue is neutralized by strip_redirections, and the stray `1` clause
+# contains no push, so it is skipped.
+CLAUSES=$(printf '%s\n' "$COMMAND" | tr '`' '\n' | sed -E 's/[;&|]+/\n/g')
 
-# ── HUB rules (all advisory, never hard deny) ────────────────────────────────
-# --delete from hub = teardown cleanup → silent allow
-[ "$DELETE" = "1" ] && exit 0
-# --mirror / --all → silent allow
-if [ "$MIRROR" = "1" ] || [ "$ALL" = "1" ]; then
-  exit 0
-fi
+while IFS= read -r CLAUSE; do
+  case "$CLAUSE" in
+    *[![:space:]]*) ;; # non-blank → consider
+    *) continue ;;
+  esac
+  printf '%s' "$CLAUSE" | grep -qE "$PUSH_RE" || continue
+  judge_clause "$CLAUSE"
+done <<EOF
+$CLAUSES
+EOF
 
-# Explicit refspecs: warn only when pushing a branch that isn't DEFAULT or CURRENT
-if [ "${#REFSPECS[@]}" -gt 0 ]; then
-  for _spec in "${REFSPECS[@]}"; do
-    _spec="${_spec#+}"
-    if printf '%s' "$_spec" | grep -q ':'; then
-      _dst="${_spec#*:}"
-    else
-      _dst="$_spec"
-    fi
-    _dst_norm=$(_normalize_dst "$_dst")
-    if [ "$_dst_norm" = "HEAD" ] || [ "$_dst_norm" = "$DEFAULT" ] || [ "$_dst_norm" = "$CURRENT" ]; then
-      : # ok
-    else
-      warn "That task branch ($_dst_norm) belongs to its spoke worktree — the spoke ships it via its own push."
-      exit 0
-    fi
-  done
-  exit 0
-fi
-
-# Bare push from hub → allow silently
 exit 0
