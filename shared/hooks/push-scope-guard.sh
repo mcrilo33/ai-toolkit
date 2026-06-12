@@ -47,6 +47,12 @@
 #   judged against the payload root's repo — the hook adjudicates the
 #   session's worktree, not arbitrary other checkouts.
 #
+#   CEILING (degrades to allow, never false-blocks): like the other pattern
+#   hooks, this cannot see through eval, `sh -c`, `/usr/bin/git`, or
+#   keyword/word prefixes (`if (x); then git push …; fi`, `command git push`).
+#   A `$(cmd):dst` src is orphaned by the $() split — the inner command is
+#   judged as its own clause instead.
+#
 # PER-PLATFORM ENFORCEMENT
 #   ship_gate_enforce "$INPUT" "<msg>" (from lib/utils.sh):
 #     • Cursor beforeShellExecution → deny() → exit 2 (hard block).
@@ -273,7 +279,15 @@ judge_clause() {
 # -u origin <own>)` must not glue the `)` onto the refspec.  `2>&1` splits as
 # `2>` + `1` — the residue is neutralized by strip_redirections, and the
 # stray `1` clause contains no push, so it is skipped.
-CLAUSES=$(printf '%s\n' "$COMMAND" | tr '`' '\n' | sed -E 's/[;&|(){}]+/\n/g')
+#
+# Simple ${NAME} expansions are masked to $DYN FIRST, so the brace spelling of
+# a dynamic src cannot sever at the {} boundary and orphan its concrete dst
+# (`git push origin ${SHA}:main` must deny exactly like `$SHA:main`).  Only
+# the plain ${NAME} form is masked — ${X:-...} could nest a $(git push …) that
+# must keep splitting.  A $(cmd):dst src does stay orphaned by the split (the
+# inner push is judged instead) — the accepted cost of seeing through $(...).
+MASKED=$(printf '%s' "$COMMAND" | sed -E 's/\$\{[A-Za-z_][A-Za-z0-9_]*\}/$DYN/g')
+CLAUSES=$(printf '%s\n' "$MASKED" | tr '`' '\n' | sed -E 's/[;&|(){}]+/\n/g')
 
 while IFS= read -r CLAUSE; do
   case "$CLAUSE" in
