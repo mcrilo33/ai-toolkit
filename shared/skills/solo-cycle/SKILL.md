@@ -15,7 +15,7 @@ When a PR IS wanted, use the `close-task` skill instead.
 | 2 | RED | Failing test committed with `Tested-RED:` trailer | `red-proof-verify` (runs the node; blocks the commit if it passes) |
 | 3 | GREEN | Implementation commit; tests pass | `commit-gauntlet` (lint/typecheck on changed lines), `secrets-scan` |
 | 4 | REVIEW | APPROVE artifact `.review/<diff-hash>.json` exists | Written by the `code-review` agent on APPROVE |
-| 5 | PUSH | `git push` succeeds — work is shipped | `red-proof-warn`, `reviewer-sep-warn`, `git-push-review` |
+| 5 | PUSH | `git push` succeeds — work is shipped | `red-proof-warn`, `reviewer-sep-warn`, `todo-ledger-warn`, `git-push-review` |
 
 Then: next subtask → back to step 1 (or step 2 if it is the same issue).
 
@@ -91,6 +91,9 @@ The ledger is ephemeral session scratch; the GitHub issue is the durable contrac
 - The TodoWrite ledger is ephemeral session scratch; the GitHub issue is the durable
   contract — sync only outcomes at PUSH, and skip the ledger entirely for single-step
   work (one tiny subtask, a docs/config one-liner), where it is pure overhead
+- `todo-ledger-warn` enforces the ledger at PUSH by scanning the session transcript for
+  a `TodoWrite` call (warn on Claude, hard-deny on Cursor). For genuinely single-step
+  work, add a `No-Ledger: <reason>` trailer to a commit in the pushed range to bypass it
 
 ## Edge cases
 
@@ -98,6 +101,7 @@ The ledger is ephemeral session scratch; the GitHub issue is the durable contrac
 |-----------|--------|
 | Push blocked by `reviewer-sep-warn` | Run the `code-review` agent, get APPROVE |
 | Push blocked by `red-proof-warn` | A source-adding commit is missing its trailer — amend/reword it, or add the failing-test commit |
+| Push blocked by `todo-ledger-warn` | Seed a `TodoWrite` ledger this session, or add a `No-Ledger: <reason>` trailer for single-step work |
 | Working on `main` with no issue branch | Add `Refs #<id>` to every commit message |
 | Review says REQUEST_CHANGES | Fix and re-review — never bypass |
 | Tempted to use `--no-verify` | Blocked by `block-no-verify`, by design |

@@ -39,6 +39,7 @@ CONFIG_PROTECTION = HOOKS_DIR / "config-protection.sh"
 GIT_PUSH_REVIEW = HOOKS_DIR / "git-push-review.sh"
 DELEGATION = HOOKS_DIR / "delegation-gate-warn.sh"
 HUB_GUARD = HOOKS_DIR / "hub-guard.sh"
+TODO_LEDGER = HOOKS_DIR / "todo-ledger-warn.sh"
 UTILS = HOOKS_DIR / "lib" / "utils.sh"
 
 BLOCK = 2
@@ -1079,3 +1080,143 @@ class TestHubGuard:
         outside = tmp_path / "plain"
         outside.mkdir()
         assert hub_guard_edit_rc(outside / "notes.md", cwd=outside) == ALLOW
+
+
+# ── todo-ledger-warn: TodoWrite-use ship gate ─────────────────────────
+# Mirrors reviewer-sep-warn: warn on Claude / hard-deny on Cursor when the
+# session transcript shows NO TodoWrite tool call. A `No-Ledger:` trailer on
+# the pushed range bypasses the gate (single-step escape hatch). Any
+# unadjudicable state (no transcript_path, unreadable transcript) degrades to
+# allow — an advisory hook must never false-block.
+
+
+def _transcript_payload(
+    command: str, transcript_path: Path | None, *, cursor: bool, root: Path | None = None
+) -> str:
+    """A push payload carrying a top-level transcript_path (both platforms)."""
+    if cursor:
+        payload: dict = {"hook_event_name": "beforeShellExecution", "command": command, "cwd": ""}
+        if root is not None:
+            payload["workspace_roots"] = [str(root)]
+    else:
+        payload = {"tool_name": "Bash", "tool_input": {"command": command}}
+    if transcript_path is not None:
+        payload["transcript_path"] = str(transcript_path)
+    return json.dumps(payload)
+
+
+def _write_transcript(path: Path, *, with_todowrite: bool) -> None:
+    """Write a minimal Claude-style JSONL transcript with/without a TodoWrite call."""
+    tool = "TodoWrite" if with_todowrite else "Bash"
+    lines = [
+        json.dumps({"type": "user", "message": {"role": "user", "content": "go"}}),
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "tool_use", "name": tool, "input": {}}]},
+            }
+        ),
+    ]
+    path.write_text("\n".join(lines) + "\n")
+
+
+def run_todo_ledger(
+    command: str, repo: Path, transcript: Path | None, *, cursor: bool = True
+) -> subprocess.CompletedProcess:
+    """Run todo-ledger-warn with CURSOR_PROJECT_DIR stripped so the root resolves
+    from the payload/cwd (cf. _hub_env)."""
+    payload = _transcript_payload(command, transcript, cursor=cursor, root=repo)
+    env = {k: v for k, v in os.environ.items() if k != "CURSOR_PROJECT_DIR"}
+    return subprocess.run(
+        ["bash", str(TODO_LEDGER)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        cwd=str(repo),
+        env=env,
+    )
+
+
+def test_todo_ledger_allows_when_todowrite_present(git_repo: Path, tmp_path: Path) -> None:
+    # The session transcript shows a TodoWrite call → ledger exists → allow.
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, with_todowrite=True)
+    assert run_todo_ledger("git push", git_repo, transcript).returncode == ALLOW
+
+
+def test_todo_ledger_blocks_on_cursor_when_no_todowrite(
+    repo_with_upstream: Path, tmp_path: Path
+) -> None:
+    # No TodoWrite in the transcript, no escape hatch → hard-deny on the Cursor
+    # beforeShellExecution shape.
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, with_todowrite=False)
+    assert run_todo_ledger("git push", repo_with_upstream, transcript).returncode == BLOCK
+
+
+def test_todo_ledger_warns_but_allows_on_claude(repo_with_upstream: Path, tmp_path: Path) -> None:
+    # Same missing-ledger state on the Claude shape → advisory warn, never block.
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, with_todowrite=False)
+    result = run_todo_ledger("git push", repo_with_upstream, transcript, cursor=False)
+    assert result.returncode == ALLOW
+    assert result.stderr != ""
+
+
+def test_todo_ledger_no_ledger_trailer_bypasses(repo_with_upstream: Path, tmp_path: Path) -> None:
+    # A `No-Ledger:` trailer on a commit in the pushed range is the single-step
+    # escape hatch — the gate is skipped even with no TodoWrite in the transcript.
+    _stage(repo_with_upstream, "notes.md", "tweak\n")
+    subprocess.run(
+        ["git", "commit", "-qm", "docs: tweak", "-m", "Refs #1", "-m", "No-Ledger: one-liner"],
+        cwd=str(repo_with_upstream),
+        check=True,
+        capture_output=True,
+    )
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, with_todowrite=False)
+    assert run_todo_ledger("git push", repo_with_upstream, transcript).returncode == ALLOW
+
+
+def test_todo_ledger_no_base_degrades_allow(git_repo: Path, tmp_path: Path) -> None:
+    # A repo with no resolvable base (no upstream, no origin) cannot adjudicate
+    # the escape-hatch range → degrade to allow even with no TodoWrite present.
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, with_todowrite=False)
+    assert run_todo_ledger("git push", git_repo, transcript).returncode == ALLOW
+
+
+def test_todo_ledger_empty_range_degrades_allow(repo_with_upstream: Path, tmp_path: Path) -> None:
+    # HEAD == base (nothing ahead of upstream, e.g. `gh pr create` after the
+    # push): nothing is being shipped → allow, even on the Cursor shape with no
+    # TodoWrite. The No-Ledger: escape hatch is impossible on an empty range, so
+    # enforcing here would be an unfixable false-block.
+    _git(repo_with_upstream, "reset", "--hard", "origin/main")
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, with_todowrite=False)
+    assert run_todo_ledger("gh pr create", repo_with_upstream, transcript).returncode == ALLOW
+
+
+def test_todo_ledger_missing_transcript_degrades_allow(git_repo: Path) -> None:
+    # No transcript_path in the payload → cannot adjudicate → degrade to allow.
+    assert run_todo_ledger("git push", git_repo, None).returncode == ALLOW
+
+
+def test_todo_ledger_unreadable_transcript_degrades_allow(git_repo: Path, tmp_path: Path) -> None:
+    # transcript_path points at a nonexistent file → degrade to allow.
+    assert run_todo_ledger("git push", git_repo, tmp_path / "missing.jsonl").returncode == ALLOW
+
+
+def test_todo_ledger_non_push_allows(git_repo: Path, tmp_path: Path) -> None:
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, with_todowrite=False)
+    assert run_todo_ledger("ls -la", git_repo, transcript).returncode == ALLOW
+
+
+def test_todo_ledger_chained_push_not_bypassed(repo_with_upstream: Path, tmp_path: Path) -> None:
+    # Boundary-aware gate: a push chained after another command is still gated.
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, with_todowrite=False)
+    assert (
+        run_todo_ledger("cd /tmp && git push", repo_with_upstream, transcript).returncode == BLOCK
+    )
