@@ -99,6 +99,10 @@ UPSTREAM="$(git rev-parse --symbolic-full-name "${WT_BRANCH}@{upstream}" 2>/dev/
 [ -n "$UPSTREAM" ] || wt_die "branch $WT_BRANCH has never been pushed — the spoke's push is its ship gate"
 AHEAD="$(git rev-list --count "${UPSTREAM}..${WT_BRANCH}")"
 [ "$AHEAD" -eq 0 ] || wt_die "branch $WT_BRANCH is $AHEAD commit(s) ahead of $UPSTREAM — push from the spoke first"
+# Behind is just as fatal as ahead: landing a reduced local branch would later
+# prune the remote ref and silently lose the commits only the remote still has.
+BEHIND="$(git rev-list --count "${WT_BRANCH}..${UPSTREAM}")"
+[ "$BEHIND" -eq 0 ] || wt_die "branch $WT_BRANCH is $BEHIND commit(s) behind $UPSTREAM — the remote has work this checkout lacks; reconcile on the spoke first"
 
 # Issue number = leading number of the branch slug (feature/42-foo → 42);
 # ad-hoc branches have none and skip the issue close.
@@ -123,7 +127,8 @@ else
   echo "→ running test suite: $TEST_CMD"
   if ! bash -c "$TEST_CMD"; then
     wt_warn "suite FAILED on the merged $DEFAULT — rolling back: git reset --keep $PRE_SHA"
-    git reset --keep "$PRE_SHA"
+    git reset --keep "$PRE_SHA" \
+      || wt_die "rollback failed — hub is still on the merged commit; reset by hand: git reset --keep $PRE_SHA"
     wt_die "landing aborted; nothing was pushed. Fix on the spoke, push, and re-run."
   fi
   SUITE_RESULT="passed"
@@ -155,7 +160,7 @@ TAG="${ISSUE:-$BSLUG}"
 cleanup_tmux() {
   command -v tmux >/dev/null 2>&1 || return 0
   local win name path
-  while read -r win name path; do
+  while IFS=$'\t' read -r win name path; do
     [ -n "$win" ] || continue
     case "$name" in
       "$TAG"|"$TAG"-*) ;;
@@ -168,7 +173,7 @@ cleanup_tmux() {
         wt_warn "couldn't kill tmux window '$name' ($win) — close it by hand"
       fi
     fi
-  done < <(tmux list-windows -t 0 -F '#{window_id} #{window_name} #{pane_current_path}' 2>/dev/null || true)
+  done < <(tmux list-windows -t 0 -F $'#{window_id}\t#{window_name}\t#{pane_current_path}' 2>/dev/null || true)
 }
 cleanup_tmux
 
