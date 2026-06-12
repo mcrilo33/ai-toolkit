@@ -178,11 +178,12 @@ AGENT_CMD="claude"
 
 if [ "$SPAWN_TERMINAL" -eq 1 ]; then
   if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
-    win="$(tmux new-window -P -F '#{window_id}' -n "${BRANCH##*/}" -c "$WT_DIR")"
+    win_name="${BRANCH##*/}"
+    win="$(tmux new-window -P -F '#{window_id}' -n "$win_name" -c "$WT_DIR")"
     # pin name so the running process can't clobber it
     tmux set-window-option -t "$win" automatic-rename off
     tmux set-window-option -t "$win" allow-rename off
-    echo "→ opened tmux window '${BRANCH##*/}' ($win)"
+    echo "→ opened tmux window '$win_name' ($win)"
     if [ "$LAUNCH_AGENT" -eq 1 ]; then
       tmux send-keys -t "$win" "$AGENT_CMD" C-m
       [ -n "$PROMPT" ] && echo "  launched: claude (seeded with first prompt)" || echo "  launched: claude"

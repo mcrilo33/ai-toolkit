@@ -15,9 +15,9 @@ own worktree, on its own branch, driven by its own Claude in its own tmux window
 │
 ├── one VS Code window  ◄──── `code --add` folds every worktree in (your review surface)
 │
-├─ ai-toolkit-42  feature/42-…  ◄─ tmux window "42" → claude   ┐
-├─ ai-toolkit-57  feature/57-…  ◄─ tmux window "57" → claude   │ N isolated tasks
-└─ ai-toolkit-63  feature/63-…  ◄─ tmux window "63" → claude   ┘
+├─ ai-toolkit-42  feature/42-…  ◄─ tmux window "42-…" → claude   ┐
+├─ ai-toolkit-57  feature/57-…  ◄─ tmux window "57-…" → claude   │ N isolated tasks
+└─ ai-toolkit-63  feature/63-…  ◄─ tmux window "63-…" → claude   ┘
 ```
 
 | Concept | Maps to |
@@ -93,7 +93,8 @@ Each run automatically:
 1. creates `~/Repos/ai-toolkit-<tag>` on branch `feature/<id>-<slug>`,
 2. copies the gitignored `.claude/` runtime config (skills + hooks + gates) into it,
 3. runs `code --add` to fold the worktree into your single VS Code window,
-4. opens a new tmux window named `<tag>`, running `claude` in the worktree.
+4. opens a new tmux window named after the branch leaf (e.g. `42-fix-crash`),
+   pinned against renames, running `claude` in the worktree.
 
 Switch to that tmux window (`prefix` + number) and drive Claude — typically
 `/source` then `/cycle`.
