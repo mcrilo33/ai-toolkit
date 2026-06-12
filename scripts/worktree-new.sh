@@ -15,15 +15,20 @@
 #   [slug]   short branch slug; derived from the issue title when omitted (needs gh)
 #   [type]   feature | fix | chore   (default: feature)
 #
-#   --new-window   open a SEPARATE VS Code window instead of code --add
-#   --no-code      don't touch VS Code
-#   --no-terminal  don't spawn a tmux/terminal window
-#   --no-agent     spawn the terminal but don't launch `claude` in it
+#   -t, --type <t>   branch type (feature|fix|chore) — unambiguous, beats the
+#                    positional [type] slot
+#   --prompt <text>  seed the spawned claude with this first message (e.g. /source
+#                    or a task kickoff) — used by the start-task skill to dispatch
+#   --new-window     open a SEPARATE VS Code window instead of code --add
+#   --no-code        don't touch VS Code
+#   --no-terminal    don't spawn a tmux/terminal window
+#   --no-agent       spawn the terminal but don't launch `claude` in it
 #
 # Examples:
-#   scripts/worktree-new.sh 42                 # feature/42-<title>, folds into review window + tmux
+#   scripts/worktree-new.sh 42                          # feature/42-<title>, review window + tmux
 #   scripts/worktree-new.sh 57 null-pointer fix
-#   scripts/worktree-new.sh refactor-sync chore --no-agent
+#   scripts/worktree-new.sh refactor-sync -t chore      # chore/refactor-sync (ad-hoc + type)
+#   scripts/worktree-new.sh 42 --prompt "/source"       # spoke starts anchored to the issue
 #
 set -euo pipefail
 
@@ -37,21 +42,27 @@ POSITIONAL=()
 OPEN_MODE="add"        # add | new-window | none
 SPAWN_TERMINAL=1
 LAUNCH_AGENT=1
-for arg in "$@"; do
-  case "$arg" in
-    --new-window)  OPEN_MODE="new-window" ;;
-    --no-code)     OPEN_MODE="none" ;;
-    --no-terminal) SPAWN_TERMINAL=0 ;;
-    --no-agent)    LAUNCH_AGENT=0 ;;
-    -*)            wt_die "unknown option: $arg" ;;
-    *)             POSITIONAL+=("$arg") ;;
+PROMPT=""              # seed the spawned claude with this first message
+TYPE_FLAG=""           # --type overrides the positional type (no footgun)
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --new-window)  OPEN_MODE="new-window"; shift ;;
+    --no-code)     OPEN_MODE="none"; shift ;;
+    --no-terminal) SPAWN_TERMINAL=0; shift ;;
+    --no-agent)    LAUNCH_AGENT=0; shift ;;
+    -t|--type)     [ "$#" -ge 2 ] || wt_die "--type needs a value"; TYPE_FLAG="$2"; shift 2 ;;
+    --type=*)      TYPE_FLAG="${1#--type=}"; shift ;;
+    --prompt)      [ "$#" -ge 2 ] || wt_die "--prompt needs a value"; PROMPT="$2"; shift 2 ;;
+    --prompt=*)    PROMPT="${1#--prompt=}"; shift ;;
+    -*)            wt_die "unknown option: $1" ;;
+    *)             POSITIONAL+=("$1"); shift ;;
   esac
 done
 
 [ "${#POSITIONAL[@]}" -ge 1 ] || wt_die "usage: worktree-new.sh <issue> [slug] [type] [flags]"
 ISSUE="${POSITIONAL[0]}"
 SLUG_ARG="${POSITIONAL[1]:-}"
-TYPE="${POSITIONAL[2]:-feature}"
+TYPE="${TYPE_FLAG:-${POSITIONAL[2]:-feature}}"   # --type wins, else 3rd positional, else feature
 
 case "$TYPE" in
   feature|fix|chore) ;;
@@ -160,19 +171,24 @@ if [ "$OPEN_MODE" != none ]; then
 fi
 
 # --- 2. spawn a terminal/tmux window for the agent ---------------------------
+# Build the launch command, optionally seeded with a first prompt that claude
+# receives as its initial message (e.g. "/source", or a task kickoff).
+AGENT_CMD="claude"
+[ -n "$PROMPT" ] && AGENT_CMD="claude $(printf '%q' "$PROMPT")"
+
 if [ "$SPAWN_TERMINAL" -eq 1 ]; then
   if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
     win="$(tmux new-window -P -F '#{window_id}' -n "$WT_TAG" -c "$WT_DIR")"
     echo "→ opened tmux window '$WT_TAG' ($win)"
     if [ "$LAUNCH_AGENT" -eq 1 ]; then
-      tmux send-keys -t "$win" 'claude' C-m
-      echo "  launched: claude"
+      tmux send-keys -t "$win" "$AGENT_CMD" C-m
+      [ -n "$PROMPT" ] && echo "  launched: claude (seeded with first prompt)" || echo "  launched: claude"
     fi
   else
     echo
     echo "  Start the agent in a new terminal window:"
     if [ "$LAUNCH_AGENT" -eq 1 ]; then
-      echo "    cd \"$WT_DIR\" && claude"
+      echo "    cd \"$WT_DIR\" && $AGENT_CMD"
     else
       echo "    cd \"$WT_DIR\""
     fi

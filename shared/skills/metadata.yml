@@ -57,6 +57,12 @@ source-task:
   allowed-tools: "run_in_terminal"
   argument-hint: "[GitHub issue number or URL]"
 
+start-task:
+  name: "start-task"
+  description: "Dispatch a planned task from the planning hub into a running worktree: draft and create the GitHub issue, spawn the worktree on its branch, and seed the spoke's first prompt via worktree-new.sh. Use in the planning session when the user says 'start this work', 'spin it up', or 'let's build X' after scope is clear."
+  allowed-tools: "run_in_terminal read_file grep_search"
+  argument-hint: "[task title or decided scope]"
+
 tdd-workflow:
   name: "tdd-workflow"
   description: "Guide through TDD red-green-refactor cycle."

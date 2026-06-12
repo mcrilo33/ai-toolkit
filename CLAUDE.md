@@ -8,6 +8,7 @@ This repository contains shared rules, skills, prompts, and agents for AI coding
 - `docs/rules-frontmatter.md` — Rules frontmatter field reference per platform
 - `docs/skills-frontmatter.md` — Skills frontmatter field reference per platform
 - `docs/metadata-and-sync.md` — How `shared/` files are synced to platform-specific configs
+- `docs/parallel-worktrees.md` — Running parallel Claude sessions with one git worktree per task (`worktree-new.sh` / `worktree-done.sh`, review window, merge flow)
 
 ## Repository structure
 
