@@ -10,6 +10,11 @@ One invariant makes the whole flow clean: **the main checkout always stays on `m
 and never holds task work.** It is your launcher and merge hub. Every task lives in its
 own worktree, on its own branch, driven by its own Claude in its own tmux window.
 
+The mirror invariant governs pushes: **a spoke pushes only its own branch** — its
+`origin/<branch>` is ephemeral staging, deleted at teardown once merged — and **`main`
+is published exclusively from the hub**. The `push-scope-guard` hook enforces both
+directions (hard deny on Cursor, advisory elsewhere).
+
 ```
 ~/Repos/ai-toolkit          MAIN CHECKOUT — always on `main`. Launch + merge here.
 │
@@ -93,8 +98,12 @@ Each run automatically:
 
 1. creates `~/Repos/ai-toolkit-<tag>` on branch `feature/<id>-<slug>`,
 2. copies the gitignored `.claude/` runtime config (skills + hooks + gates) into it,
-3. runs `code --add` to fold the worktree into your single VS Code window,
-4. opens a new tmux window in session `0` (the spoke home), named after the branch
+3. seeds `.claude/settings.local.json` with the two narrow allow rules for the
+   spoke's own-branch push (`git push [-u] origin <branch>`) — the ship push is
+   enforced by the push gates, so it skips the permission ask; every other push
+   stays gated,
+4. runs `code --add` to fold the worktree into your single VS Code window,
+5. opens a new tmux window in session `0` (the spoke home), named after the branch
    leaf (e.g. `42-fix-crash`), pinned against renames, running `claude` in the
    worktree — and prints the exact jump command to reach it.
 
