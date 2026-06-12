@@ -29,17 +29,23 @@
 #   NON-PUSH COMMANDS and NON-REPO DIRS: immediate exit 0 (no-op).
 #
 # PARSING
-#   The command is split into clauses on shell operators (; & | backtick,
-#   newlines) and EVERY git push clause is adjudicated — a compliant clause
-#   must not launder an out-of-scope one (`git push origin main && git push
-#   origin <own>`).  Within a clause, redirections (2>&1, >file) are shell
-#   plumbing and are neutralized before tokenizing; quote characters are
-#   stripped from tokens; a token carrying an unexpanded $substitution cannot
-#   be adjudicated by a hook and degrades to allow — but a CONCRETE refspec in
-#   the same clause is still judged (a $var must not smuggle `main` through).
-#   `git -C <path> push` is parsed, but scope is judged against the payload
-#   root's repo — the hook adjudicates the session's worktree, not arbitrary
-#   other checkouts.
+#   The command is split into clauses on shell operators (; & | ( ) { }
+#   backtick, newlines) and EVERY git push clause is adjudicated — a compliant
+#   clause must not launder an out-of-scope one (`git push origin main && git
+#   push origin <own>`), and a subshell or $(...) capture is not a disguise.
+#   (Trade-off: a branch name containing parens would mis-split, but this
+#   repo's worktree-new.sh convention is feature/<id>-<slug>.)  Within a
+#   clause, redirections (2>&1, >file) are shell plumbing and are neutralized
+#   before tokenizing; quote characters are stripped from tokens; a token
+#   carrying an unexpanded $substitution cannot be adjudicated by a hook and
+#   degrades to allow — but a CONCRETE refspec in the same clause is still
+#   judged (a $var must not smuggle `main` through, including as the src of a
+#   src:dst refspec).  A $token still consumes its argument position, so
+#   `git push $OPTS origin <own>` reads `origin` as a refspec and false-warns
+#   /denies — the accepted cost of not re-opening `git push $REMOTE main`.
+#   `git -C <path> push` and `git -c key=val push` are parsed, but scope is
+#   judged against the payload root's repo — the hook adjudicates the
+#   session's worktree, not arbitrary other checkouts.
 #
 # PER-PLATFORM ENFORCEMENT
 #   ship_gate_enforce "$INPUT" "<msg>" (from lib/utils.sh):
@@ -61,7 +67,7 @@ COMMAND=$(get_shell_command "$INPUT")
 
 # Only act when the command contains a git push at a command boundary.
 # We deliberately do NOT match `gh pr` here — only `git push`.
-PUSH_RE='(^|[;&|`]|\$\()[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git([[:space:]]+(-C[[:space:]]+[^[:space:]]+|-[^[:space:]]+|--[^[:space:]]+))*[[:space:]]+push\b'
+PUSH_RE='(^|[;&|`(){}]|\$\()[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git([[:space:]]+(-[cC][[:space:]]+[^[:space:]]+|-[^[:space:]]+|--[^[:space:]]+))*[[:space:]]+push\b'
 if ! printf '%s' "$COMMAND" | grep -qE "$PUSH_RE"; then
   exit 0
 fi
@@ -101,9 +107,9 @@ OWN_MSG="'$DEFAULT' is published only by the hub's land step — a spoke ships i
 SCOPE_MSG="A spoke pushes only its own branch ($CURRENT). Use: git push -u origin $CURRENT"
 
 # Strip the `git [global-opts] push` prefix from a clause, leaving the tail.
-# The -C alternative must mirror PUSH_RE — detection without parsing would
-# misjudge `git -C x push origin main` as a bare push.
-STRIP_PREFIX='s/^.*git([[:space:]]+(-C[[:space:]]+[^[:space:]]+|-[^[:space:]]+|--[^[:space:]]+))*[[:space:]]+push([[:space:]]+|$)//'
+# The -C/-c value alternative must mirror PUSH_RE — detection without parsing
+# would misjudge `git -C x push origin main` as a bare push.
+STRIP_PREFIX='s/^.*git([[:space:]]+(-[cC][[:space:]]+[^[:space:]]+|-[^[:space:]]+|--[^[:space:]]+))*[[:space:]]+push([[:space:]]+|$)//'
 
 # Neutralize redirections — shell plumbing, not refspecs.  Whole-word forms
 # may carry an fd prefix (`2>&1`, `2> file`); a redirect GLUED to a word may
@@ -152,10 +158,23 @@ judge_clause() {
     esac
     # An unexpanded $substitution cannot be adjudicated by a hook: it consumes
     # its position (remote first, then refspec) but is never judged — concrete
-    # refspecs in the same clause still are.
+    # refspecs in the same clause still are, including the CONCRETE dst of a
+    # src:dst refspec whose src is dynamic ($SHA:main is still a push to main).
     case "$tok" in
       *'$'*)
-        if [ -z "$remote" ]; then remote="$tok"; else dynamic=1; fi
+        if [ -z "$remote" ]; then
+          remote="$tok"
+        else
+          case "$tok" in
+            *:*)
+              case "${tok#*:}" in
+                *'$'*) dynamic=1 ;;        # dst itself dynamic → unjudgeable
+                *)     refspecs+=("$tok") ;; # concrete dst → judged below
+              esac
+              ;;
+            *) dynamic=1 ;;
+          esac
+        fi
         continue
         ;;
     esac
@@ -248,11 +267,13 @@ judge_clause() {
 }
 
 # ── Split into clauses and judge EVERY git push clause ──────────────────────
-# Backticks and ; & | become clause boundaries (newlines already are); `&&`
-# and `||` collapse to one boundary.  `2>&1` splits as `2>` + `1` — the
-# residue is neutralized by strip_redirections, and the stray `1` clause
-# contains no push, so it is skipped.
-CLAUSES=$(printf '%s\n' "$COMMAND" | tr '`' '\n' | sed -E 's/[;&|]+/\n/g')
+# Backticks and ; & | ( ) { } become clause boundaries (newlines already
+# are); `&&` and `||` collapse to one boundary.  Parens/braces matter both
+# ways: `(git push origin main)` must not slip detection, and `OUT=$(git push
+# -u origin <own>)` must not glue the `)` onto the refspec.  `2>&1` splits as
+# `2>` + `1` — the residue is neutralized by strip_redirections, and the
+# stray `1` clause contains no push, so it is skipped.
+CLAUSES=$(printf '%s\n' "$COMMAND" | tr '`' '\n' | sed -E 's/[;&|(){}]+/\n/g')
 
 while IFS= read -r CLAUSE; do
   case "$CLAUSE" in
