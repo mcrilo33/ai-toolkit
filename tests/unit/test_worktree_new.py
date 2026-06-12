@@ -434,6 +434,50 @@ def test_adhoc_branch_allowlist(hub: Path) -> None:
 
 
 @pytest.mark.skipif(shutil.which("jq") is None, reason="merge templating requires jq")
+def test_malformed_settings_local_warns_but_does_not_abort(hub: Path) -> None:
+    # A hub-copied settings.local.json that jq cannot parse must not abort the
+    # worktree wiring mid-flight, and must not be rewritten blind — warn with
+    # the rules and leave the file as it was.
+    marker = _seed_hub_claude(hub)
+    (hub / ".claude" / "settings.local.json").write_text("not json{")
+    assert marker.is_file()
+
+    proc = _run_new(hub, "99", "pushguard")
+
+    assert proc.returncode == 0, proc.stderr
+    spoke_settings = _worktree_dir(hub, "99") / ".claude" / "settings.local.json"
+    assert spoke_settings.read_text() == "not json{"
+    assert "add the allow rules yourself" in proc.stderr + proc.stdout
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="merge templating requires jq")
+def test_empty_settings_local_is_not_silently_truncated(hub: Path) -> None:
+    # jq emits zero documents for a zero-byte file and still exits 0 — the
+    # merge must not claim success while leaving the spoke with no rules.
+    _seed_hub_claude(hub)
+    (hub / ".claude" / "settings.local.json").write_text("")
+
+    proc = _run_new(hub, "99", "pushguard")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "merged" not in proc.stdout
+    assert "add the allow rules yourself" in proc.stderr + proc.stdout
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="merge templating requires jq")
+def test_merge_preserves_existing_allow_order(hub: Path) -> None:
+    # The merge must not lexicographically churn a user-curated allow list —
+    # existing entries keep their order; the push rules append at the end.
+    _seed_hub_claude(hub, settings={"permissions": {"allow": ["Bash(z *)", "Bash(m *)"]}})
+
+    proc = _run_new(hub, "99", "pushguard")
+
+    assert proc.returncode == 0, proc.stderr
+    allow = _load_allowlist(_worktree_dir(hub, "99"))["permissions"]["allow"]
+    assert allow[:2] == ["Bash(z *)", "Bash(m *)"]
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="merge templating requires jq")
 def test_no_duplicate_rules_when_rerun_source_present(hub: Path) -> None:
     plain_rule, u_rule = _push_rules("feature/99-pushguard")
     _seed_hub_claude(hub, settings={"permissions": {"allow": [plain_rule]}})
