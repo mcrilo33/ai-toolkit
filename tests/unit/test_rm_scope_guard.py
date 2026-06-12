@@ -45,6 +45,13 @@ def _cursor_payload(command: str, *, root: Path | None = None) -> str:
     return json.dumps(payload)
 
 
+def _copilot_payload(command: str, cwd: Path | str) -> str:
+    """Copilot shape: command nested in the JSON-encoded toolArgs string."""
+    return json.dumps(
+        {"toolName": "Bash", "toolArgs": json.dumps({"command": command}), "cwd": str(cwd)}
+    )
+
+
 def _run(payload: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["bash", str(RM_SCOPE_GUARD)],
@@ -216,12 +223,8 @@ class TestCompoundAllow:
     @pytest.mark.parametrize(
         "command",
         [
-            # Verbatim must-auto-allow case from issue #13 (comment 1).
-            pytest.param(
-                "rm -rf /tmp/psg-probe-r3-V0WwmT && git -C "
-                "/Users/mathieucrilout/Repos/ai-toolkit-11 status --short | head -5",
-                id="verbatim-psg-probe",
-            ),
+            # The verbatim must-auto-allow case from issue #13 comment 1 has
+            # its own named test below (test_verbatim_compound_case_auto_allows).
             "rm -f scratch.txt && git status",
             "rm /tmp/a; rm /tmp/b",
             "rm /tmp/a || rm /tmp/b",
@@ -294,6 +297,21 @@ class TestCompoundFallThrough:
         and honor the separator. Refusing any raw backslash closes the gap."""
         command = 'rm /tmp/a\\"; rm /etc/passwd\\"'
         assert decision(command, repo) is None
+
+    def test_folded_quote_caught_in_every_payload_shape(self, repo: Path) -> None:
+        """The raw backslash bail must read the command from EVERY source the
+        extractor does — Claude tool_input, Cursor top-level, and the Copilot
+        JSON-encoded toolArgs string — or the fold sneaks through one shape."""
+        command = 'rm /tmp/a\\"; rm /etc/passwd\\"'
+        for payload in (
+            _payload(command, repo),
+            _cursor_payload(command, root=repo),
+            _copilot_payload(command, repo),
+        ):
+            proc = _run(payload)
+            assert proc.returncode == 0
+            assert proc.stdout.strip() == ""
+            assert proc.stderr == ""
 
 
 class TestNeverBreaks:

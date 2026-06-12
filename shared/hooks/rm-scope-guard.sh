@@ -71,13 +71,18 @@ esac
 # normalize_escaped_quotes has already folded any `\"`/`\'` artifact into a
 # real quote, which can disagree with bash's word boundaries. Rather than
 # model every escape rule, refuse any backslash: scoped targets containing
-# spaces can be single-quoted instead. RAW is the PRE-normalization command,
-# so the folded `\"`/`\'` cases are caught too (COMMAND alone would miss
-# them). jq-less platforms cannot use the allow decision anyway, so an empty
-# RAW there costs nothing.
+# spaces can be single-quoted instead. RAW is the PRE-normalization command
+# pulled from EVERY source get_shell_command reads — top-level .command
+# (Cursor), .tool_input.command (Claude), and the JSON-encoded .toolArgs
+# string (Copilot) — so a folded `\"`/`\'` artifact is caught regardless of
+# which shape delivered it (COMMAND alone would miss it; checking only
+# .command/.tool_input.command would miss the toolArgs shape). jq-less
+# platforms cannot use the allow decision anyway, so an empty RAW costs
+# nothing there.
 RAW=""
 if command -v jq &>/dev/null; then
-  RAW=$(printf '%s' "$INPUT" | jq -r '.command // .tool_input.command // empty' 2>/dev/null) || RAW=""
+  RAW=$(printf '%s' "$INPUT" \
+    | jq -r '.command // .tool_input.command // (.toolArgs | fromjson? | .command) // empty' 2>/dev/null) || RAW=""
 fi
 case "$COMMAND$RAW" in
   *'\'*) exit 0 ;;
