@@ -49,9 +49,10 @@
 #
 #   CEILING (degrades to allow, never false-blocks): like the other pattern
 #   hooks, this cannot see through eval, `sh -c`, `/usr/bin/git`, or
-#   keyword/word prefixes (`if (x); then git push …; fi`, `command git push`).
-#   A `$(cmd):dst` src is orphaned by the $() split — the inner command is
-#   judged as its own clause instead.
+#   keyword/word prefixes (`if (x); then git push …; fi`, `command git push`,
+#   `${X}git push` — the masked prefix glues onto `git`).  A `$(cmd):dst` src
+#   is orphaned by the $() split — the inner command is judged as its own
+#   clause instead.
 #
 # PER-PLATFORM ENFORCEMENT
 #   ship_gate_enforce "$INPUT" "<msg>" (from lib/utils.sh):

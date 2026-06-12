@@ -461,6 +461,23 @@ def test_hub_cursor_silent_on_refspec_form_delete(hub: Path) -> None:
     assert "[Hook]" not in result.stderr
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param("git push --mirror origin", id="mirror"),
+        pytest.param("git push --all origin", id="all"),
+    ],
+)
+def test_hub_cursor_silent_on_bulk_push(hub: Path, command: str) -> None:
+    # --mirror / --all are sanctioned hub bulk operations → silent allow.
+    payload = _cursor_shell_payload(command, root=hub)
+
+    result = run_guard(payload, cwd=hub)
+
+    assert result.returncode == ALLOW
+    assert "[Hook]" not in result.stderr
+
+
 def test_hub_cursor_silent_on_tag_push(hub: Path) -> None:
     # A qualified tag ref is a release artifact, not some spoke's task branch.
     payload = _cursor_shell_payload("git push origin refs/tags/v1.0.0", root=hub)
