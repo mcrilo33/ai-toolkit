@@ -219,6 +219,57 @@ def test_spoke_cursor_allows_bare_push_without_upstream(spoke: Path) -> None:
     assert result.returncode == ALLOW
 
 
+# ── Spoke: shell dressing must not flip the verdict ───────
+# Redirections, quoting, and unexpandable variables are not refspecs; a -C
+# global option must not detach the push clause from the parser.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(f"git push -u origin {OWN} 2>&1", id="stderr-redirect"),
+        pytest.param(f"git push -u origin {OWN} >push.log 2>&1", id="file-and-stderr-redirect"),
+        pytest.param(f"git push -u origin '{OWN}'", id="single-quoted-branch"),
+        pytest.param(f'git push -u origin "{OWN}"', id="double-quoted-branch"),
+        pytest.param('git push -u origin "$BRANCH"', id="unexpanded-variable-degrades"),
+    ],
+)
+def test_spoke_cursor_allows_shell_dressed_own_branch_push(spoke: Path, command: str) -> None:
+    payload = _cursor_shell_payload(command, root=spoke)
+
+    result = run_guard(payload, cwd=spoke)
+
+    assert result.returncode == ALLOW
+
+
+def test_spoke_cursor_denies_dash_c_push_of_default_branch(spoke: Path) -> None:
+    # `git -C <path> push` is still a push of this repo's default branch; the
+    # -C global option must not detach the clause from the refspec parser.
+    payload = _cursor_shell_payload(f"git -C {spoke} push origin main", root=spoke)
+
+    result = run_guard(payload, cwd=spoke)
+
+    assert result.returncode == BLOCK
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param("git -C . push origin main", id="dash-c-relative"),
+        pytest.param("VAR=1 git push origin main", id="env-prefixed"),
+        pytest.param("git push origin +main", id="forced-refspec"),
+        pytest.param("git push origin refs/heads/main", id="fully-qualified-ref"),
+        pytest.param("git push origin HEAD:main", id="head-to-default"),
+    ],
+)
+def test_spoke_cursor_denies_dressed_default_branch_push(spoke: Path, command: str) -> None:
+    payload = _cursor_shell_payload(command, root=spoke)
+
+    result = run_guard(payload, cwd=spoke)
+
+    assert result.returncode == BLOCK
+
+
 # ── Spoke, Claude shape: advisory only ────────────────────
 
 
@@ -261,6 +312,17 @@ def test_hub_cursor_allows_bare_push(hub: Path) -> None:
     result = run_guard(payload, cwd=hub)
 
     assert result.returncode == ALLOW
+
+
+def test_hub_cursor_allows_default_branch_push_with_redirect(hub: Path) -> None:
+    # Redirection suffixes are not refspecs — the hub's own publish step often
+    # captures output and must stay silent.
+    payload = _cursor_shell_payload("git push origin main 2>&1", root=hub)
+
+    result = run_guard(payload, cwd=hub)
+
+    assert result.returncode == ALLOW
+    assert "[Hook]" not in result.stderr
 
 
 def test_hub_cursor_warns_on_other_task_branch_push(hub: Path) -> None:
