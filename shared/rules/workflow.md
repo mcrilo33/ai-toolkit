@@ -24,6 +24,33 @@ SPOKE:  SOURCE → DEFINE → EXECUTE → VERIFY → PUSH  (per subtask — solo
 | PUSH | spoke | Ship gate — push the subtask | Pushed branch + review evidence |
 | LAND | hub | Merge, re-gate, ship, tear down | Merged default branch, closed issue |
 
+## Task triage — the three lanes
+
+Before starting any task, the hub classifies it into one of three lanes (~10 seconds):
+
+| Lane | Executor | Contract | Gates |
+|------|----------|----------|-------|
+| 1 — Micro-spoke | Subagent in a temp worktree (no issue, no tmux window, no session) | The prompt | Hub diff-review before merge |
+| 2 — Express spoke | Full spoke via `worktree-new.sh <slug>` (ad-hoc, no issue) | Kickoff prompt | All push gates, single cycle, no ledger |
+| 3 — Full | Full spoke from a GitHub issue | The issue | Everything (current flow) |
+
+**Triage heuristic:**
+
+- Does the change touch executable behavior? **No** → Lane 1 — restricted to non-executable
+  paths only: docs, comments, wording. Lane 1 must never touch `scripts/`, `shared/hooks/`,
+  `tests/`, or skill scripts.
+- One subtask, obvious approach, small diff? → Lane 2.
+- Otherwise, when in doubt, or when the "why" should be findable later → Lane 3.
+
+The Task Lifecycle diagram above describes **Lane 3** — the full flow for anything
+substantial. Lanes 1 and 2 shed orchestration overhead (no issue, no ledger for lane 2; no
+worktree, no issue, no tmux for lane 1), but **never shed gates**: lane 2 runs all push
+gates in a single cycle; lane 1's gate is the hub's diff review before `--local` landing.
+
+`docs:`/`chore:` commits whose entire staged set is non-executable documentation pass the
+commit-anchor gate without an issue anchor — this is the sanctioned no-issue commit path
+for lanes 1 and 2. See the `commit-quality` hook for the exact file-set rules.
+
 ## Commands
 
 | Command | Skill | Purpose |
@@ -32,6 +59,7 @@ SPOKE:  SOURCE → DEFINE → EXECUTE → VERIFY → PUSH  (per subtask — solo
 | `/source` | `source-task` | Anchor to the issue; branch creation only as non-hub fallback |
 | `/cycle` | `solo-cycle` | Solo per-subtask cycle: anchor, RED, GREEN, review, push |
 | `/land <id>` | `land-task` | Land a finished task from the hub: merge, suite, push, teardown |
+| `/land <branch> --local` | `land-task` | Land a micro-spoke (lane 1): skips upstream guards, merges locally, no issue to close |
 
 ## Phase Checklists
 

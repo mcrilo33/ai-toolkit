@@ -16,6 +16,28 @@ and lifecycle see `docs/parallel-worktrees.md`.
 
 ## Workflow
 
+### 0. Triage the lane
+
+Before creating an issue or spawning a worktree, classify the task (~10 seconds):
+
+- Does the change touch executable behavior? **No** → **Lane 1 (micro-spoke).** Do not
+  create an issue and do not call `worktree-new.sh`. Dispatch a micro-spoke from the hub
+  instead: spawn a subagent with `isolation: worktree`, review its diff, and land with
+  `scripts/worktree-land.sh <branch> --local`. Lane 1 is restricted to non-executable
+  paths only (docs, comments, wording) — never `scripts/`, `shared/hooks/`, `tests/`, or
+  skill scripts. See the hub skill's "Micro-spoke dispatch (lane 1)" section for the full
+  flow.
+- One subtask, obvious approach, small diff? → **Lane 2 (express spoke).** Skip issue
+  creation (steps 1–3 below). Dispatch directly:
+
+  ```bash
+  scripts/worktree-new.sh <slug> --prompt "<kickoff>"
+  ```
+
+  The spoke runs a single cycle under all push gates. No issue, no TodoWrite ledger.
+- Otherwise, when in doubt, or when the "why" should be findable later → **Lane 3
+  (full).** Continue with step 1 below.
+
 ### 1. Confirm the scope
 
 Restate the decided task back to the user as a draft issue — **title** plus a short
@@ -79,7 +101,8 @@ Tell the user: the issue URL, the branch, the worktree path, and the tmux window
 | Not on the main checkout | `cd` to the hub first; worktrees are created relative to the main root |
 | `gh` not authenticated | Ask the user to `gh auth login`, or proceed ad-hoc with a slug instead of an issue |
 | Scope still fuzzy | Stay in the hub; use the `brainstorming` skill before dispatching |
-| Task is tiny / docs-only | Still dispatch a worktree so gates apply, or handle inline if truly trivial |
+| Task is tiny / docs-only | Lane 1 micro-spoke: no issue, no worktree-new — dispatch a subagent with `isolation: worktree` from the hub and land with `--local` |
+| Task is small but touches code | Lane 2 express spoke: skip steps 1–3, dispatch `worktree-new.sh <slug>` ad-hoc |
 
 ## Related skills
 

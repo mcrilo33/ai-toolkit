@@ -37,6 +37,7 @@ scripts/worktree-land.sh <id>
 | `--skip-tests` | Land without running the suite on the merged hub |
 | `--keep-branch` | Keep the local + remote branch after landing |
 | `--test-cmd <cmd>` | Override the suite command (default `pytest -q` when pytest exists) |
+| `--local` | Micro-spoke landing: skips upstream guards; accepts a bare local branch with no upstream; refuses any branch that has an upstream and refuses the default branch itself |
 
 The script runs, in order, aborting safely at the first failure:
 
@@ -72,6 +73,7 @@ Then re-run `hub-status.sh` so the next move starts from a fresh picture.
 
 | Situation | Action |
 |-----------|--------|
+| Micro-spoke (lane 1) branch | Review the diff first — lane 1 is non-executable paths only (docs, comments, wording; never `scripts/`, `shared/hooks/`, `tests/`, skill scripts). Then `scripts/worktree-land.sh <branch> --local`: skips upstream guards; no issue to close; the branch is deleted after merge; temp worktree is torn down if still registered |
 | Ad-hoc branch (no issue number) | Lands normally; the issue-close step is skipped |
 | `gh` missing or close fails | Warns; close by hand: `gh issue close <id>` |
 | Push succeeded but teardown failed | Work is shipped; re-run `worktree-done.sh <id>` alone and close the issue by hand |

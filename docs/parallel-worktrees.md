@@ -75,7 +75,7 @@ code ~/Repos/ai-toolkit
 | Script | Role |
 |--------|------|
 | `scripts/worktree-new.sh` | Create a worktree + branch, copy `.claude/`, fold into VS Code, open a tmux window running `claude` |
-| `scripts/worktree-land.sh` | Land a pushed branch from the hub: guards → merge → suite → push → teardown → issue close |
+| `scripts/worktree-land.sh` | Land a pushed branch from the hub: guards → merge → suite → push → teardown → issue close; `--local` for micro-spoke landing (no upstream required) |
 | `scripts/worktree-done.sh` | Resolve a worktree by issue / slug / branch / path and tear it down safely |
 | `scripts/worktree-lib.sh` | Shared slugify + main-root + worktree-resolution helpers (sourced by the others) |
 
@@ -209,6 +209,56 @@ number.
   + number), not a split pane.
 - **Removal needs `--force` only when dirty.** Because `.claude/` is gitignored, a copied
   config does not make the worktree dirty, so a clean task removes without `--force`.
+
+## Task triage — three lanes
+
+Every task is classified on the hub (~10 seconds) before any worktree or issue is created:
+
+| Lane | Executor | Contract | Gates |
+|------|----------|----------|-------|
+| 1 — Micro-spoke | Subagent in a temp worktree (no issue, no tmux window, no session) | The prompt | Hub diff-review before merge |
+| 2 — Express spoke | Full spoke via `worktree-new.sh <slug>` (ad-hoc, no issue) | Kickoff prompt | All push gates, single cycle, no ledger |
+| 3 — Full | Full spoke from a GitHub issue | The issue | Everything (current flow) |
+
+**Triage heuristic:** Does the change touch executable behavior? No → Lane 1. One subtask,
+obvious approach, small diff? → Lane 2. Otherwise → Lane 3.
+
+### Micro-spoke lifecycle (lane 1)
+
+Lane 1 is restricted to **non-executable paths only**: docs, comments, and wording.
+It must never touch `scripts/`, `shared/hooks/`, `tests/`, or any skill script.
+
+1. Hub spawns a subagent with `isolation: worktree` and a tight prompt (files, exact
+   change, commit as `docs:`/`chore:` with plain `git add <files>` + standalone
+   `git commit -m`, return branch + diff summary).
+2. Subagent edits and commits inside the temp worktree. The `docs:`/`chore:` commit
+   passes the `commit-quality` no-issue-anchor exemption because the entire staged set is
+   non-executable documentation outside the restricted directories.
+3. Hub reviews the diff.
+4. Hub lands it:
+
+   ```bash
+   scripts/worktree-land.sh <branch> --local
+   ```
+
+   `--local` skips upstream guards (micro-spokes never push to origin), accepts a bare
+   local branch whose temp worktree may already be gone, refuses any branch that has an
+   upstream ("not a micro-spoke"), and refuses the default branch itself. No issue to
+   close. The branch is deleted after the merge.
+
+5. Cleanup: nothing is left behind — no branch, no worktree, no tmux window. None were
+   created beyond the temp worktree managed by `isolation: worktree`.
+
+**Hub-guard note.** `shared/hooks/hub-guard.sh` is path-anchored: it denies only on the
+main checkout on the default branch and is a no-op in any linked worktree. A
+worktree-isolated subagent therefore passes it by construction — no carve-outs exist or
+are needed.
+
+**No-issue commit path.** `docs:`/`chore:` commits whose entire staged set is
+non-executable documentation (`.md`, `.txt`, `.rst`, regular file mode, outside
+`scripts/`, `shared/hooks/`, `tests/`, and any `*/scripts/` dir) pass the
+`commit-quality` gate without an issue anchor. This is the sanctioned path for lanes 1
+and 2.
 
 ## Related
 
