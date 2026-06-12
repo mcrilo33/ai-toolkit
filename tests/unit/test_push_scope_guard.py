@@ -135,6 +135,14 @@ def spoke(hub: Path, tmp_path: Path) -> Path:
     return wt
 
 
+@pytest.fixture()
+def spoke30(hub: Path, tmp_path: Path) -> Path:
+    """A spoke on a branch ending in digits — the redirect-fd parsing edge."""
+    wt = tmp_path / "spoke30"
+    _git(hub, "worktree", "add", "-q", "-b", "feature/30", str(wt))
+    return wt
+
+
 # ── Spoke, Cursor shape: out-of-scope pushes hard-deny ────
 
 
@@ -270,6 +278,67 @@ def test_spoke_cursor_denies_dressed_default_branch_push(spoke: Path, command: s
     assert result.returncode == BLOCK
 
 
+# ── Spoke: EVERY push clause is judged, not just one ──────
+
+
+def test_spoke_cursor_denies_default_branch_in_first_clause(spoke: Path) -> None:
+    # A compliant second clause must not launder an out-of-scope first one.
+    payload = _cursor_shell_payload(f"git push origin main && git push origin {OWN}", root=spoke)
+
+    result = run_guard(payload, cwd=spoke)
+
+    assert result.returncode == BLOCK
+
+
+def test_spoke_cursor_denies_default_branch_in_second_clause(spoke: Path) -> None:
+    payload = _cursor_shell_payload(f"git push origin {OWN} && git push origin main", root=spoke)
+
+    result = run_guard(payload, cwd=spoke)
+
+    assert result.returncode == BLOCK
+
+
+# ── Spoke: a dynamic token must not smuggle a concrete refspec ─
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param("git push origin main $EXTRA", id="trailing-variable"),
+        pytest.param("git push --force-with-lease=$SHA origin main", id="variable-flag-value"),
+    ],
+)
+def test_spoke_cursor_denies_concrete_default_despite_variable(spoke: Path, command: str) -> None:
+    # The $-degrade covers tokens the hook cannot expand — a CONCRETE refspec
+    # naming the default branch is still adjudicable and still out of scope.
+    payload = _cursor_shell_payload(command, root=spoke)
+
+    result = run_guard(payload, cwd=spoke)
+
+    assert result.returncode == BLOCK
+
+
+# ── Spoke: redirect-target edge cases stay in scope ───────
+
+
+def test_spoke_cursor_allows_own_branch_push_with_quoted_log_target(spoke: Path) -> None:
+    payload = _cursor_shell_payload(f'git push -u origin {OWN} > "my log.txt"', root=spoke)
+
+    result = run_guard(payload, cwd=spoke)
+
+    assert result.returncode == ALLOW
+
+
+def test_spoke_cursor_allows_digit_branch_with_glued_redirect(spoke30: Path) -> None:
+    # `feature/30>log` redirects stdout — the 30 belongs to the branch, not to
+    # a file descriptor (fd digits only count as their own word).
+    payload = _cursor_shell_payload("git push -u origin feature/30>log", root=spoke30)
+
+    result = run_guard(payload, cwd=spoke30)
+
+    assert result.returncode == ALLOW
+
+
 # ── Spoke, Claude shape: advisory only ────────────────────
 
 
@@ -339,6 +408,26 @@ def test_hub_cursor_warns_on_other_task_branch_push(hub: Path) -> None:
 def test_hub_cursor_allows_delete_of_task_branch(hub: Path) -> None:
     # Remote branch deletion from the hub is teardown cleanup → silent allow.
     payload = _cursor_shell_payload(f"git push --delete origin {OTHER}", root=hub)
+
+    result = run_guard(payload, cwd=hub)
+
+    assert result.returncode == ALLOW
+    assert "[Hook]" not in result.stderr
+
+
+def test_hub_cursor_silent_on_refspec_form_delete(hub: Path) -> None:
+    # `:branch` is the refspec spelling of --delete — same teardown cleanup.
+    payload = _cursor_shell_payload(f"git push origin :{OTHER}", root=hub)
+
+    result = run_guard(payload, cwd=hub)
+
+    assert result.returncode == ALLOW
+    assert "[Hook]" not in result.stderr
+
+
+def test_hub_cursor_silent_on_tag_push(hub: Path) -> None:
+    # A qualified tag ref is a release artifact, not some spoke's task branch.
+    payload = _cursor_shell_payload("git push origin refs/tags/v1.0.0", root=hub)
 
     result = run_guard(payload, cwd=hub)
 
