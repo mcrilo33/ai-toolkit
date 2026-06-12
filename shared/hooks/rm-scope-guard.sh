@@ -21,9 +21,16 @@
 #     inside the project root (git toplevel of the payload cwd) or under
 #     /tmp//private/tmp,
 #   • no target matches a protected pattern: the repo root itself, `.git`,
+#     `.claude` (the dir — deleting it would take settings with it) and
 #     `.claude/settings*`, `.review/`, any `.env*` basename, `/`, or $HOME.
+#     Pattern matching is CASE-INSENSITIVE: macOS APFS is case-insensitive,
+#     so `.GIT` IS `.git` on disk. A directory target that exists is also
+#     scanned for contained `.env*` files — the basename rule must not be
+#     bypassable by deleting the parent.
 #
-# Never auto-allowed regardless of targets: sudo rm, --no-preserve-root.
+# Never auto-allowed regardless of targets: sudo rm, --no-preserve-root,
+# `=`-prefixed relative targets (zsh equals-expansion would resolve them to
+# PATH binaries).
 # No python3 → fall through (degrade to the prompt, never a false allow).
 #
 # Exit 0 always — this hook cannot block anything.
@@ -72,46 +79,71 @@ print(os.path.realpath(target))
 # ── Anchor everything to the PAYLOAD cwd (never hub assumptions) ─────
 # Claude delivers the live session cwd at the payload top level (it tracks
 # `cd`). The project root is that cwd's git toplevel — in a worktree that IS
-# the worktree root. Cursor's beforeShellExecution reports an empty cwd: fall
-# back to the workspace root for the ROOT scope only (absolute targets stay
-# checkable; relative ones fail in resolve_path).
+# the worktree root. Cursor's beforeShellExecution reports an empty cwd: only
+# EXPLICIT anchors ($CURSOR_PROJECT_DIR, payload workspace_roots) may supply
+# the ROOT scope then — never a walk up from the hook process's own pwd,
+# which can sit in an unrelated repo (e.g. a $HOME dotfiles checkout) and
+# would falsely scope absolute targets to it. Relative targets always need a
+# real cwd (they fail in resolve_path without one). ROOT = $HOME is refused
+# outright: the home directory is never a deletion scope.
 CWD=$(json_field "$INPUT" "cwd")
 ROOT=""
 if [ -n "$CWD" ]; then
   CWD=$(resolve_path "" "$CWD") || CWD=""
-else
-  CWD=""
 fi
 if [ -n "$CWD" ]; then
   ROOT=$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null || true)
 else
-  ROOT=$(project_root_from_payload "$INPUT")
-  git -C "$ROOT" rev-parse --show-toplevel >/dev/null 2>&1 || ROOT=""
+  ROOT="${CURSOR_PROJECT_DIR:-}"
+  if [ -z "$ROOT" ] && command -v jq &>/dev/null; then
+    ROOT=$(echo "$INPUT" | jq -r '.workspace_roots[0] // empty' 2>/dev/null)
+  fi
+  if [ -n "$ROOT" ] && ! git -C "$ROOT" rev-parse --show-toplevel >/dev/null 2>&1; then
+    ROOT=""
+  fi
 fi
-[ -n "$ROOT" ] && { ROOT=$(resolve_path "" "$ROOT") || ROOT=""; }
+if [ -n "$ROOT" ]; then
+  ROOT=$(resolve_path "" "$ROOT") || ROOT=""
+fi
+if [ -n "$ROOT" ] && [ "$ROOT" = "${HOME:-}" ]; then
+  ROOT=""
+fi
 
 # ── Is one resolved target deletable without asking? ─────────────────
 # In scope: strictly inside ROOT (never ROOT itself) or under /tmp or
 # /private/tmp. Protected even in scope: .git (the dir and its content),
-# .claude/settings*, .review/, and any .env* basename anywhere. `/` and
-# $HOME are never deletable (they would fail the scope test anyway — the
-# explicit checks document the contract).
+# .claude (the dir itself) and .claude/settings*, .review/, and any .env*
+# basename anywhere — all matched case-insensitively (APFS is
+# case-insensitive: .GIT IS .git on disk). An existing directory target is
+# scanned for contained .env* files so the basename rule cannot be bypassed
+# by deleting the parent. `/` and $HOME are never deletable (they would fail
+# the scope test anyway — the explicit checks document the contract).
+# `=`-prefixed relative targets are refused: the hook tokenizes with bash
+# semantics, but a zsh-executing platform would equals-expand them to PATH
+# binaries far outside any scope this hook proved.
 check_target() {
-  local t="$1" resolved rel
+  local t="$1" resolved rel lc
+  case "$t" in
+    =*) return 1 ;;
+  esac
   resolved=$(resolve_path "$CWD" "$t") || return 1
   [ -n "$resolved" ] || return 1
   [ "$resolved" = "/" ] && return 1
   [ "$resolved" = "${HOME:-/nonexistent}" ] && return 1
-  case "$(basename "$resolved")" in
+  case "$(basename "$resolved" | tr '[:upper:]' '[:lower:]')" in
     .env*) return 1 ;;
   esac
+  if [ -d "$resolved" ] && [ -n "$(find "$resolved" -iname '.env*' 2>/dev/null | head -1)" ]; then
+    return 1
+  fi
   if [ -n "$ROOT" ]; then
     [ "$resolved" = "$ROOT" ] && return 1
     case "$resolved" in
       "$ROOT"/*)
         rel="${resolved#"$ROOT"/}"
-        case "$rel" in
-          .git | .git/* | .claude/settings* | .review | .review/*) return 1 ;;
+        lc=$(printf '%s' "$rel" | tr '[:upper:]' '[:lower:]')
+        case "$lc" in
+          .git | .git/* | .claude | .claude/settings* | .review | .review/*) return 1 ;;
           *) return 0 ;;
         esac
         ;;

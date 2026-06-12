@@ -16,6 +16,7 @@ issue, including the JSON output shape.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -57,10 +58,11 @@ def decision(command: str, cwd: Path | str) -> str | None:
     """Run the guard; return the permissionDecision or None when silent.
 
     Asserts the design invariant on every call: the hook never blocks
-    (exit 0 always) and silence means an empty stdout.
+    (exit 0 always), never writes stderr, and silence means an empty stdout.
     """
     proc = _run(_payload(command, cwd))
     assert proc.returncode == 0, proc.stderr
+    assert proc.stderr == ""
     out = proc.stdout.strip()
     if not out:
         return None
@@ -135,6 +137,17 @@ class TestFallThrough:
             "rm .review/abc.json",
             # The repo root itself.
             "rm -rf .",
+            # Case variants must match protected patterns too: macOS APFS is
+            # case-insensitive, so .GIT IS .git on disk.
+            "rm -rf .GIT",
+            "rm .ENV",
+            "rm .Claude/settings.json",
+            "rm -rf .Review",
+            # Deleting .claude itself would take settings with it.
+            "rm -rf .claude",
+            "rm -rf .claude/",
+            # zsh expands =name to the PATH binary — never auto-allow.
+            "rm =python3",
             # Never auto-allow sudo / --no-preserve-root.
             "sudo rm -rf /tmp/x",
             "rm --no-preserve-root -rf /tmp/x",
@@ -160,6 +173,48 @@ class TestFallThrough:
         assert proc.returncode == 0
         assert proc.stdout.strip() == ""
 
+    def test_falls_through_when_dir_contains_env_file(self, repo: Path) -> None:
+        """The .env* rule must not be bypassable by deleting the parent dir."""
+        (repo / "build" / ".env").write_text("KEY=1\n")
+        assert decision("rm -rf build/", repo) is None
+
+    def test_symlink_to_outside_falls_through(self, repo: Path) -> None:
+        """realpath resolution is the load-bearing property: a repo-internal
+        symlink whose destination is outside scope must not auto-allow."""
+        (repo / "escape").symlink_to("/etc")
+        assert decision("rm escape/hosts", repo) is None
+        assert decision("rm -rf escape", repo) is None
+
+    def test_cwdless_payload_never_anchors_to_process_cwd(self, tmp_path: Path) -> None:
+        """With no payload cwd, ROOT must come only from explicit anchors
+        (workspace_roots / CURSOR_PROJECT_DIR) — never from walking up the
+        hook process's own working directory into an unrelated repo."""
+        other = tmp_path.resolve() / "other"
+        other.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=other, check=True)
+        (other / "f.txt").write_text("x\n")
+        env = {k: v for k, v in os.environ.items() if k != "CURSOR_PROJECT_DIR"}
+        proc = subprocess.run(
+            ["bash", str(RM_SCOPE_GUARD)],
+            input=_cursor_payload(f"rm {other}/f.txt"),
+            capture_output=True,
+            text=True,
+            cwd=str(other),
+            env=env,
+        )
+        assert proc.returncode == 0
+        assert proc.stdout.strip() == ""
+
+
+class TestNeverBreaks:
+    """Malformed input must never produce an exit code or output."""
+
+    @pytest.mark.parametrize("payload", ["", "not json", "{}", '{"tool_input": 3}'])
+    def test_malformed_payload_is_silent(self, payload: str) -> None:
+        proc = _run(payload)
+        assert proc.returncode == 0
+        assert proc.stdout.strip() == ""
+
 
 def test_allow_payload_shape(repo: Path) -> None:
     """The allow decision carries the full Claude hookSpecificOutput shape."""
@@ -177,3 +232,4 @@ def test_silent_fall_through_is_truly_silent(repo: Path) -> None:
     proc = _run(_payload("rm /etc/hosts", repo))
     assert proc.returncode == 0
     assert proc.stdout.strip() == ""
+    assert proc.stderr == ""
