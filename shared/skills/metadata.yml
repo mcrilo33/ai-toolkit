@@ -63,6 +63,11 @@ start-task:
   allowed-tools: "run_in_terminal read_file grep_search"
   argument-hint: "[task title or decided scope]"
 
+hub:
+  name: "hub"
+  description: "Orient a fresh planning-hub session and dispatch from it: survey in-flight worktrees, open issues, and mergeable branches, then propose the next move (start an unstarted issue, merge a pushed branch, tear down) and act only on confirmation. Use on the main checkout when the user says /hub, 'what's in flight', or 'hub status'."
+  allowed-tools: "run_in_terminal read_file grep_search"
+
 tdd-workflow:
   name: "tdd-workflow"
   description: "Guide through TDD red-green-refactor cycle."
