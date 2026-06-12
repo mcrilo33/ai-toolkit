@@ -32,11 +32,16 @@ bash shared/skills/hub/scripts/hub-status.sh
 
 It reports, read-only:
 
-- **Worktrees** — each task branch with ahead/behind vs the default branch and its state
-  (`dirty`, `unpushed`, or `pushed → mergeable`).
+- **Worktrees** — each task branch with ahead/behind vs the default branch, its state
+  (`dirty`, `unpushed`, or `pushed → mergeable`), its issue (`#N OPEN`, `#N ?` when `gh`
+  is unreachable), and its live tmux pane (`tmux <session>:<window>`, matched across
+  **all** sessions by pane path, or `no pane`). Rows with a pane include a copy-paste
+  `↳ jump:` command (`select-window` / `switch-client` / `attach`, picked for where you
+  are). A `↳ todos:` sub-line shows the spoke's TodoWrite ledger from its latest Claude
+  session (`<done>/<total> · in_progress: <item>`); `todos: none` means the spoke never
+  seeded a ledger — that absence is signal, since kickoffs mandate one.
 - **Open issues** — flagged `worktree active` or `no worktree` so you can see what is
   unstarted.
-- **tmux windows** — the running spokes (when inside tmux).
 
 ### 3. Propose the next move — act only on confirmation
 
@@ -48,7 +53,7 @@ anything that changes state:
 | Open issue, `no worktree` | Start it | `start-task` skill (creates issue if needed + spawns spoke) |
 | New idea, no issue yet | Define then dispatch | discuss scope → `start-task` |
 | Branch `pushed → mergeable` | Land and tear down | `/land <id>` (`land-task` skill → `scripts/worktree-land.sh`) |
-| Branch `unpushed` / `dirty` | Leave it — spoke still working | switch to its tmux window (`prefix` + number) |
+| Branch `unpushed` / `dirty` | Leave it — spoke still working | paste the row's `↳ jump:` command to reach its pane |
 
 Never auto-merge or auto-teardown. Restate the branch/issue and the exact command, get a
 quick yes, then run it. Merges and teardowns happen **on the hub**; task edits never do.

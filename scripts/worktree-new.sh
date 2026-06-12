@@ -3,7 +3,7 @@
 # worktree-new.sh — create an isolated git worktree for one task and wire it into
 # a "multiple terminals + one review window" workflow:
 #   - folds the worktree into your single VS Code review window (`code --add`)
-#   - opens a tmux window cd'd into it, launching `claude` (when run inside tmux)
+#   - opens a tmux window cd'd into it in session 0, launching `claude`
 #
 # One task = one issue = one branch = one checkout = its own staging area, hooks,
 # and .review/ approval artifacts (the isolation solo-cycle/close-task assume).
@@ -23,6 +23,9 @@
 #   --no-code        don't touch VS Code
 #   --no-terminal    don't spawn a tmux/terminal window
 #   --no-agent       spawn the terminal but don't launch `claude` in it
+#
+# Env: WT_AGENT_MODEL / WT_AGENT_EFFORT pin the spawned agent's model and effort
+#      (defaults: fable / max).
 #
 # Examples:
 #   scripts/worktree-new.sh 42                          # feature/42-<title>, review window + tmux
@@ -173,26 +176,40 @@ fi
 # --- 2. spawn a terminal/tmux window for the agent ---------------------------
 # Build the launch command, optionally seeded with a first prompt that claude
 # receives as its initial message (e.g. "/source", or a task kickoff).
-AGENT_CMD="claude"
-[ -n "$PROMPT" ] && AGENT_CMD="claude $(printf '%q' "$PROMPT")"
+# Model+effort are pinned at dispatch time so spokes stay deterministic even
+# when user-global settings change; override via WT_AGENT_MODEL / WT_AGENT_EFFORT.
+AGENT_CMD="CLAUDE_EFFORT=$(printf '%q' "${WT_AGENT_EFFORT:-max}") claude --model $(printf '%q' "${WT_AGENT_MODEL:-fable}")"
+[ -n "$PROMPT" ] && AGENT_CMD="$AGENT_CMD $(printf '%q' "$PROMPT")"
 
 if [ "$SPAWN_TERMINAL" -eq 1 ]; then
-  if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
-    win="$(tmux new-window -P -F '#{window_id}' -n "$WT_TAG" -c "$WT_DIR")"
-    echo "→ opened tmux window '$WT_TAG' ($win)"
-    if [ "$LAUNCH_AGENT" -eq 1 ]; then
-      tmux send-keys -t "$win" "$AGENT_CMD" C-m
-      [ -n "$PROMPT" ] && echo "  launched: claude (seeded with first prompt)" || echo "  launched: claude"
+  SPAWNED=0
+  if command -v tmux >/dev/null 2>&1; then
+    win_name="${BRANCH##*/}"
+    # ensure session 0 (the spoke home) exists, detached if need be; '=' pins
+    # the target to an exact session name so e.g. '0-foo' can never match
+    if tmux has-session -t '=0' 2>/dev/null || tmux new-session -d -s 0 -c "$REPO_ROOT" 2>/dev/null; then
+      win="$(tmux new-window -t '=0:' -P -F '#{window_id}' -n "$win_name" -c "$WT_DIR")"
+      # pin name so the running process can't clobber it
+      tmux set-window-option -t "$win" automatic-rename off
+      tmux set-window-option -t "$win" allow-rename off
+      echo "→ opened tmux window '$win_name' ($win) in session 0"
+      if [ "$LAUNCH_AGENT" -eq 1 ]; then
+        tmux send-keys -t "$win" "$AGENT_CMD" C-m
+        [ -n "$PROMPT" ] && echo "  launched: claude (seeded with first prompt)" || echo "  launched: claude"
+      fi
+      # print the exact jump command so the caller can copy-paste
+      if [ -n "${TMUX:-}" ]; then
+        echo "  tmux switch-client -t '0:${win_name}'"
+      else
+        echo "  tmux attach -t 0 \\; select-window -t '0:${win_name}'"
+      fi
+      SPAWNED=1
     fi
-  else
+  fi
+  if [ "$SPAWNED" -eq 0 ]; then
     echo
     echo "  Start the agent in a new terminal window:"
-    if [ "$LAUNCH_AGENT" -eq 1 ]; then
-      echo "    cd \"$WT_DIR\" && $AGENT_CMD"
-    else
-      echo "    cd \"$WT_DIR\""
-    fi
-    [ -z "${TMUX:-}" ] && echo "  (run this inside tmux to auto-open a window per task)"
+    [ "$LAUNCH_AGENT" -eq 1 ] && echo "    cd \"$WT_DIR\" && $AGENT_CMD" || echo "    cd \"$WT_DIR\""
   fi
 fi
 
