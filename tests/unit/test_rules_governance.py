@@ -17,14 +17,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+# Make scripts/ importable
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+
+from metadata_parser import parse
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RULES_DIR = REPO_ROOT / "shared" / "rules"
 HOOKS_DIR = REPO_ROOT / "shared" / "hooks"
-
-# Make scripts/ importable
-sys.path.insert(0, str(REPO_ROOT / "scripts"))
-
-from metadata_parser import parse
 
 # Cursor always-on payload was 285 lines (2026-06) before the agent-orchestration
 # slim-down brought it to ~238. This ceiling ratchets it and stops it growing back
