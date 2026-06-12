@@ -38,6 +38,7 @@ SECRETS_SCAN_REVERT = HOOKS_DIR / "secrets-scan-revert.sh"
 CONFIG_PROTECTION = HOOKS_DIR / "config-protection.sh"
 GIT_PUSH_REVIEW = HOOKS_DIR / "git-push-review.sh"
 DELEGATION = HOOKS_DIR / "delegation-gate-warn.sh"
+HUB_GUARD = HOOKS_DIR / "hub-guard.sh"
 UTILS = HOOKS_DIR / "lib" / "utils.sh"
 
 BLOCK = 2
@@ -205,7 +206,7 @@ def test_commit_quality_format(
 def test_commit_quality_escaped_double_quotes_pass(on_branch: Callable[[str], Path]) -> None:
     # Issue #1: a runtime that serializes inner quotes as \"...\" must still parse.
     repo = on_branch("feature/1-x")
-    command = r'git commit -m \"feat(core): add helper\" -m \"Refs #1\"'
+    command = r"git commit -m \"feat(core): add helper\" -m \"Refs #1\""
     assert run_hook(COMMIT_QUALITY, command, cwd=repo) == ALLOW
 
 
@@ -406,7 +407,7 @@ def test_commit_quality_cursor_shape(
 
 def test_commit_quality_cursor_escaped_quotes(on_branch: Callable[[str], Path]) -> None:
     repo = on_branch("feature/1-x")
-    command = r'git commit -m \"feat(core): add helper\" -m \"Refs #1\"'
+    command = r"git commit -m \"feat(core): add helper\" -m \"Refs #1\""
     assert run_hook_cursor_shell(COMMIT_QUALITY, command, cwd=repo) == ALLOW
 
 
@@ -517,8 +518,17 @@ def test_red_proof_green_backstop_blocks_failing_node(git_repo: Path) -> None:
         "from pkg.thing import go\n\n\ndef test_go():\n    assert go() == 1\n",
     )
     subprocess.run(
-        ["git", "commit", "-qm", "test: add", "-m", "Refs #1",
-         "-m", "Tested-RED: tests/test_unsatisfied.py::test_go", "--no-verify"],
+        [
+            "git",
+            "commit",
+            "-qm",
+            "test: add",
+            "-m",
+            "Refs #1",
+            "-m",
+            "Tested-RED: tests/test_unsatisfied.py::test_go",
+            "--no-verify",
+        ],
         cwd=str(git_repo),
         check=True,
         capture_output=True,
@@ -539,8 +549,17 @@ def test_red_proof_green_backstop_allows_passing_node(git_repo: Path) -> None:
         "from pkg.thing import go\n\n\ndef test_go():\n    assert go() == 1\n",
     )
     subprocess.run(
-        ["git", "commit", "-qm", "feat: add thing", "-m", "Refs #1",
-         "-m", "Tested-RED: tests/test_satisfied.py::test_go", "--no-verify"],
+        [
+            "git",
+            "commit",
+            "-qm",
+            "feat: add thing",
+            "-m",
+            "Refs #1",
+            "-m",
+            "Tested-RED: tests/test_satisfied.py::test_go",
+            "--no-verify",
+        ],
         cwd=str(git_repo),
         check=True,
         capture_output=True,
@@ -570,8 +589,12 @@ def repo_with_upstream(tmp_path: Path) -> Path:
     work = tmp_path / "work"
     subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True, capture_output=True)
     subprocess.run(["git", "init", "-q", str(work)], check=True, capture_output=True)
-    for k, v in (("user.email", "t@t.t"), ("user.name", "t"), ("commit.gpgsign", "false"),
-                 ("core.autocrlf", "false")):
+    for k, v in (
+        ("user.email", "t@t.t"),
+        ("user.name", "t"),
+        ("commit.gpgsign", "false"),
+        ("core.autocrlf", "false"),
+    ):
         _git(work, "config", k, v)
     (work / "README.md").write_text("seed\n")
     _git(work, "add", "README.md")
@@ -591,9 +614,21 @@ def _range_hash(repo: Path) -> str:
     """Compute the push-time range hash the hook will compute (BASE..HEAD)."""
     base = _git(repo, "merge-base", "@{upstream}", "HEAD").strip()
     diff = subprocess.run(
-        ["git", "diff", "--no-color", "--no-ext-diff", "-M", f"{base}..HEAD",
-         "--", ".", ":(exclude).review/"],
-        cwd=str(repo), check=True, capture_output=True, text=True,
+        [
+            "git",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "-M",
+            f"{base}..HEAD",
+            "--",
+            ".",
+            ":(exclude).review/",
+        ],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout
     normalized = diff.replace("\r\n", "\n")
     return hashlib.sha256(normalized.encode()).hexdigest()
@@ -633,7 +668,9 @@ def test_reviewer_sep_no_upstream_degrades_allow(git_repo: Path) -> None:
     _stage(git_repo, "app.py", "x = 1\n")
     subprocess.run(
         ["git", "commit", "-qm", "feat: x", "-m", "Refs #1", "--no-verify"],
-        cwd=str(git_repo), check=True, capture_output=True,
+        cwd=str(git_repo),
+        check=True,
+        capture_output=True,
     )
     assert run_reviewer_sep("git push", git_repo) == ALLOW
 
@@ -721,10 +758,7 @@ class TestStrictGauntlet:
         repo = on_branch("feature/1-x")
         (repo / "pyrightconfig.json").write_text("{}\n")
         _stage(repo, "tests/test_x.py", "def test_x():\n    assert True\n")
-        cmd = (
-            'git commit -m "test: add" -m "Refs #1" '
-            '-m "Tested-RED: tests/test_x.py::test_x"'
-        )
+        cmd = 'git commit -m "test: add" -m "Refs #1" -m "Tested-RED: tests/test_x.py::test_x"'
 
         result = _run_restricted(COMMIT_GAUNTLET, cmd, repo)
 
@@ -738,10 +772,7 @@ class TestStrictGauntlet:
         repo = on_branch("feature/1-x")
         (repo / "ruff.toml").write_text('[lint]\nselect = ["F"]\n')
         _stage(repo, "tests/test_x.py", "def test_x():\n    assert True\n")
-        cmd = (
-            'git commit -m "test: add" -m "Refs #1" '
-            '-m "Tested-RED: tests/test_x.py::test_x"'
-        )
+        cmd = 'git commit -m "test: add" -m "Refs #1" -m "Tested-RED: tests/test_x.py::test_x"'
 
         result = _run_restricted(COMMIT_GAUNTLET, cmd, repo)
 
@@ -819,8 +850,17 @@ class TestStrictGauntlet:
 def _commit_with_red_trailer(repo: Path) -> None:
     _stage(repo, "tests/test_pending.py", "def test_pending():\n    assert True\n")
     subprocess.run(
-        ["git", "commit", "-qm", "test: add", "-m", "Refs #1",
-         "-m", "Tested-RED: tests/test_pending.py::test_pending", "--no-verify"],
+        [
+            "git",
+            "commit",
+            "-qm",
+            "test: add",
+            "-m",
+            "Refs #1",
+            "-m",
+            "Tested-RED: tests/test_pending.py::test_pending",
+            "--no-verify",
+        ],
         cwd=str(repo),
         check=True,
         capture_output=True,
@@ -847,3 +887,93 @@ class TestStrictRedProof:
 
         assert result.returncode == ALLOW
         assert result.stderr != ""
+
+
+# ── hub-guard: enforce the planning-hub invariant ─────────────────────
+# The main checkout (the planning hub) stays on the default branch and never
+# holds task work. hub-guard DENIES edits/commits/branch-creation there, and is
+# a no-op inside any linked worktree or on any non-default branch.
+
+
+def _write_payload(file_path: Path, content: str = "x\n") -> str:
+    """Claude Write tool shape: file_path + content under tool_input."""
+    return json.dumps(
+        {"tool_name": "Write", "tool_input": {"file_path": str(file_path), "content": content}}
+    )
+
+
+def run_hub_guard_edit(file_path: Path, *, cwd: Path) -> int:
+    """Run hub-guard with a Write payload; return exit code."""
+    return _run(HUB_GUARD, _write_payload(file_path), cwd=cwd).returncode
+
+
+@pytest.fixture()
+def linked_worktree(git_repo: Path, tmp_path: Path) -> Path:
+    """A linked git worktree of git_repo, on its own task branch."""
+    wt = tmp_path / "spoke"
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", "feature/9-spoke", str(wt)],
+        cwd=str(git_repo),
+        check=True,
+        capture_output=True,
+    )
+    return wt
+
+
+class TestHubGuard:
+    # ── On the hub (main checkout, default branch): deny ──────────────
+
+    def test_blocks_edit_on_hub(self, git_repo: Path) -> None:
+        assert run_hub_guard_edit(git_repo / "notes.md", cwd=git_repo) == BLOCK
+
+    def test_blocks_commit_on_hub(self, git_repo: Path) -> None:
+        assert run_hook(HUB_GUARD, 'git commit -m "feat: x"', cwd=git_repo) == BLOCK
+
+    def test_blocks_branch_create_on_hub(self, git_repo: Path) -> None:
+        assert run_hook(HUB_GUARD, "git checkout -b feature/1-x", cwd=git_repo) == BLOCK
+
+    def test_blocks_switch_create_on_hub(self, git_repo: Path) -> None:
+        assert run_hook(HUB_GUARD, "git switch -c feature/1-x", cwd=git_repo) == BLOCK
+
+    def test_blocks_chained_branch_create_on_hub(self, git_repo: Path) -> None:
+        # Boundary-aware: a create chained after another command must not bypass.
+        assert run_hook(HUB_GUARD, "true && git checkout -b feature/1-x", cwd=git_repo) == BLOCK
+
+    def test_deny_message_points_to_start_task(self, git_repo: Path) -> None:
+        result = _run(HUB_GUARD, _write_payload(git_repo / "notes.md"), cwd=git_repo)
+        assert result.returncode == BLOCK
+        assert "start-task" in result.stderr.lower()
+
+    # ── Still allowed on the hub: non-mutating commands ───────────────
+
+    def test_allows_plain_command_on_hub(self, git_repo: Path) -> None:
+        assert run_hook(HUB_GUARD, "ls -la", cwd=git_repo) == ALLOW
+
+    def test_allows_plain_branch_switch_on_hub(self, git_repo: Path) -> None:
+        # Switching to an existing branch (no -b/-c) is not task-branch creation.
+        assert run_hook(HUB_GUARD, "git checkout main", cwd=git_repo) == ALLOW
+
+    # ── On a task branch in the main checkout: no-op ──────────────────
+
+    def test_allows_edit_on_task_branch(self, on_branch: Callable[[str], Path]) -> None:
+        repo = on_branch("feature/1-x")
+        assert run_hub_guard_edit(repo / "notes.md", cwd=repo) == ALLOW
+
+    def test_allows_commit_on_task_branch(self, on_branch: Callable[[str], Path]) -> None:
+        repo = on_branch("feature/1-x")
+        assert run_hook(HUB_GUARD, 'git commit -m "feat: x"', cwd=repo) == ALLOW
+
+    # ── Inside a linked worktree (a spoke): no-op ─────────────────────
+
+    def test_allows_edit_in_worktree(self, linked_worktree: Path) -> None:
+        assert run_hub_guard_edit(linked_worktree / "notes.md", cwd=linked_worktree) == ALLOW
+
+    def test_allows_commit_in_worktree(self, linked_worktree: Path) -> None:
+        assert run_hook(HUB_GUARD, 'git commit -m "feat: x"', cwd=linked_worktree) == ALLOW
+
+    # ── Outside any git repo: no-op ───────────────────────────────────
+
+    def test_allows_outside_git_repo(self, tmp_path: Path) -> None:
+        outside = tmp_path / "plain"
+        outside.mkdir()
+        assert run_hub_guard_edit(outside / "notes.md", cwd=outside) == ALLOW
