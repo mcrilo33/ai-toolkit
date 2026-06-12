@@ -94,7 +94,8 @@ done < <(wt_task_worktrees "$REPO_ROOT")
 [ -z "$(git -C "$WT_DIR" status --porcelain)" ] \
   || wt_die "worktree $WT_DIR has uncommitted or untracked changes — finish or stash them on the spoke"
 
-git fetch origin --quiet 2>/dev/null || true
+git fetch origin --quiet 2>/dev/null \
+  || wt_warn "fetch failed — ahead/behind checks use the last-known remote state"
 UPSTREAM="$(git rev-parse --symbolic-full-name "${WT_BRANCH}@{upstream}" 2>/dev/null || true)"
 [ -n "$UPSTREAM" ] || wt_die "branch $WT_BRANCH has never been pushed — the spoke's push is its ship gate"
 AHEAD="$(git rev-list --count "${UPSTREAM}..${WT_BRANCH}")"
