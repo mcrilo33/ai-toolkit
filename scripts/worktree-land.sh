@@ -100,19 +100,23 @@ else
   # wt_resolve failed — no registered worktree matched TARGET.
   if [ -n "$LOCAL" ] && git show-ref --verify --quiet "refs/heads/$TARGET"; then
     # --local + bare local branch: the temp worktree is already gone; land directly.
+    # Never the default branch itself — a typo'd target would otherwise "land" as
+    # a no-op self-merge that exits 0 and then advises deleting it by hand.
+    [ "$TARGET" != "$DEFAULT" ] || wt_die "refusing to land the default branch '$DEFAULT' into itself"
     WT_BRANCH="$TARGET"
     WT_DIR=""
   else
+    HINT="pass one of the paths above, or its issue number / slug / branch."
+    [ -n "$LOCAL" ] && HINT="$HINT (--local also accepts a full local branch name)"
     wt_warn "no single worktree matches '$TARGET'. Existing task worktrees:"
     wt_print_worktrees "$REPO_ROOT"
-    wt_die "pass one of the paths above, or its issue number / slug / branch."
+    wt_die "$HINT"
   fi
 fi
 
-git fetch origin --quiet 2>/dev/null \
-  || wt_warn "fetch failed — ahead/behind checks use the last-known remote state"
-
 if [ -z "$LOCAL" ]; then
+  git fetch origin --quiet 2>/dev/null \
+    || wt_warn "fetch failed — ahead/behind checks use the last-known remote state"
   # Upstream guards: the spoke's push is its ship gate.
   UPSTREAM="$(git rev-parse --symbolic-full-name "${WT_BRANCH}@{upstream}" 2>/dev/null || true)"
   [ -n "$UPSTREAM" ] || wt_die "branch $WT_BRANCH has never been pushed — the spoke's push is its ship gate"
@@ -122,6 +126,12 @@ if [ -z "$LOCAL" ]; then
   # prune the remote ref and silently lose the commits only the remote still has.
   BEHIND="$(git rev-list --count "${WT_BRANCH}..${UPSTREAM}")"
   [ "$BEHIND" -eq 0 ] || wt_die "branch $WT_BRANCH is $BEHIND commit(s) behind $UPSTREAM — the remote has work this checkout lacks; reconcile on the spoke first"
+else
+  # --local is for micro-spokes, which never push. A branch WITH an upstream is
+  # not a micro-spoke: skipping the behind guard could merge a reduced local tip
+  # and later prune the remote ref, losing the commits only the remote still has.
+  ! git rev-parse --symbolic-full-name "${WT_BRANCH}@{upstream}" >/dev/null 2>&1 \
+    || wt_die "branch $WT_BRANCH has an upstream — not a micro-spoke; land it without --local"
 fi
 
 # Issue number = leading number of the branch slug (feature/42-foo → 42);
@@ -135,7 +145,7 @@ PRE_SHA="$(git rev-parse HEAD)"
 echo "→ merging $WT_BRANCH into $DEFAULT"
 if ! git merge --no-edit "$WT_BRANCH"; then
   git merge --abort 2>/dev/null || true
-  wt_die "merge of $WT_BRANCH conflicts with $DEFAULT — rebase the spoke on $DEFAULT, push, and re-run"
+  wt_die "merge of $WT_BRANCH conflicts with $DEFAULT — rebase the branch on $DEFAULT (on the spoke, then push, when it has one) and re-run"
 fi
 MERGED_SHA="$(git rev-parse HEAD)"
 
@@ -149,7 +159,7 @@ else
     wt_warn "suite FAILED on the merged $DEFAULT — rolling back: git reset --keep $PRE_SHA"
     git reset --keep "$PRE_SHA" \
       || wt_die "rollback failed — hub is still on the merged commit; reset by hand: git reset --keep $PRE_SHA"
-    wt_die "landing aborted; nothing was pushed. Fix on the spoke, push, and re-run."
+    wt_die "landing aborted; nothing was pushed. Fix on the branch (on the spoke, then push, when it has one) and re-run."
   fi
   SUITE_RESULT="passed"
 fi
