@@ -24,6 +24,9 @@
 #   --no-terminal    don't spawn a tmux/terminal window
 #   --no-agent       spawn the terminal but don't launch `claude` in it
 #
+# Env: WT_AGENT_MODEL / WT_AGENT_EFFORT pin the spawned agent's model and effort
+#      (defaults: fable / max).
+#
 # Examples:
 #   scripts/worktree-new.sh 42                          # feature/42-<title>, review window + tmux
 #   scripts/worktree-new.sh 57 null-pointer fix
@@ -173,8 +176,10 @@ fi
 # --- 2. spawn a terminal/tmux window for the agent ---------------------------
 # Build the launch command, optionally seeded with a first prompt that claude
 # receives as its initial message (e.g. "/source", or a task kickoff).
-AGENT_CMD="claude"
-[ -n "$PROMPT" ] && AGENT_CMD="claude $(printf '%q' "$PROMPT")"
+# Model+effort are pinned at dispatch time so spokes stay deterministic even
+# when user-global settings change; override via WT_AGENT_MODEL / WT_AGENT_EFFORT.
+AGENT_CMD="CLAUDE_EFFORT=$(printf '%q' "${WT_AGENT_EFFORT:-max}") claude --model $(printf '%q' "${WT_AGENT_MODEL:-fable}")"
+[ -n "$PROMPT" ] && AGENT_CMD="$AGENT_CMD $(printf '%q' "$PROMPT")"
 
 if [ "$SPAWN_TERMINAL" -eq 1 ]; then
   SPAWNED=0

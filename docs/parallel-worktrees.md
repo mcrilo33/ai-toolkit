@@ -147,6 +147,11 @@ scripts/worktree-new.sh <issue> [slug] [type] [flags]
 | `--no-terminal` | do not spawn a tmux/terminal window |
 | `--no-agent` | spawn the terminal but do not launch `claude` |
 
+The spawned agent's model and effort are pinned at dispatch time
+(`CLAUDE_EFFORT=max claude --model fable` by default) so a spoke stays
+deterministic even when user-global settings change; override with the
+`WT_AGENT_MODEL` / `WT_AGENT_EFFORT` env vars.
+
 Branch naming: `feature/<id>-<slug>` for numeric issues, `<type>/<slug>` for ad-hoc.
 This convention matches the `source-task` and `solo-cycle` skills and the
 `commit-quality` issue-anchor gate.
