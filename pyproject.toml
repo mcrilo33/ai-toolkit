@@ -5,6 +5,8 @@
 [tool.pyright]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
+# Tests import scripts/ modules via sys.path.insert; mirror that for pyright.
+extraPaths = ["scripts"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
