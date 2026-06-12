@@ -93,11 +93,12 @@ Each run automatically:
 1. creates `~/Repos/ai-toolkit-<tag>` on branch `feature/<id>-<slug>`,
 2. copies the gitignored `.claude/` runtime config (skills + hooks + gates) into it,
 3. runs `code --add` to fold the worktree into your single VS Code window,
-4. opens a new tmux window named after the branch leaf (e.g. `42-fix-crash`),
-   pinned against renames, running `claude` in the worktree.
+4. opens a new tmux window in session `0` (the spoke home), named after the branch
+   leaf (e.g. `42-fix-crash`), pinned against renames, running `claude` in the
+   worktree — and prints the exact jump command to reach it.
 
-Switch to that tmux window (`prefix` + number) and drive Claude — typically
-`/source` then `/cycle`.
+Paste the printed jump command (or switch with `prefix` + number inside session `0`)
+and drive Claude — typically `/source` then `/cycle`.
 
 ### 2. Work and review
 
@@ -189,11 +190,13 @@ All three flags are position-independent.
 
 ## tmux
 
-The per-task tmux window only opens when you run inside a tmux session. For the
-"one task per window across monitors" workflow, each terminal should be its **own**
-tmux session rather than all attaching to one shared session (otherwise every terminal
-mirrors the same windows). Switch between a session's task windows with `prefix` +
-number.
+All spokes live as windows of tmux session `0` — the **spoke home**. The script
+targets it explicitly (creating it detached when missing), regardless of which tmux
+session — or none — you invoke it from, so a spoke can never land in a stray
+per-task session with no client attached. Each run prints the exact jump command:
+`tmux switch-client -t '0:<window>'` from inside tmux, or
+`tmux attach -t 0 \; select-window -t '0:<window>'` from a plain shell. Inside
+session `0`, switch between task windows with `prefix` + number.
 
 ## Notes and gotchas
 
