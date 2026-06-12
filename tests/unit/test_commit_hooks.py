@@ -1144,6 +1144,92 @@ def test_todo_ledger_allows_when_todowrite_present(git_repo: Path, tmp_path: Pat
     assert run_todo_ledger("git push", git_repo, transcript).returncode == ALLOW
 
 
+def _write_tasks_transcript(path: Path, *, update_only: bool = False) -> None:
+    """A Tasks-system ledger transcript in the real claude ≥2.1.175 shape: the
+    TaskCreate input carries no id — it arrives in the tool_result line's
+    toolUseResult. With update_only, only a TaskUpdate appears (a resumed
+    session driving tasks created in an earlier one)."""
+    create_use = {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_01",
+                    "name": "TaskCreate",
+                    "input": {"subject": "Subtask 1 · RED", "description": "failing test"},
+                }
+            ]
+        },
+    }
+    create_result = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "tool_use_id": "toolu_01",
+                    "type": "tool_result",
+                    "content": "Task #1 created successfully: Subtask 1 · RED",
+                }
+            ],
+        },
+        "toolUseResult": {"task": {"id": "1", "subject": "Subtask 1 · RED"}},
+    }
+    update_use = {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_02",
+                    "name": "TaskUpdate",
+                    "input": {"taskId": "1", "status": "in_progress"},
+                }
+            ]
+        },
+    }
+    update_result = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {"tool_use_id": "toolu_02", "type": "tool_result", "content": "Updated task #1"}
+            ],
+        },
+        "toolUseResult": {
+            "success": True,
+            "taskId": "1",
+            "updatedFields": ["status"],
+            "statusChange": {"from": "pending", "to": "in_progress"},
+        },
+    }
+    events = [update_use, update_result] if update_only else [create_use, create_result]
+    lines = [json.dumps({"type": "user", "message": {"role": "user", "content": "go"}})]
+    lines += [json.dumps(e) for e in events]
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_todo_ledger_allows_when_tasks_ledger_present(
+    repo_with_upstream: Path, tmp_path: Path
+) -> None:
+    # A Tasks-system ledger (TaskCreate in the transcript) is as valid as
+    # TodoWrite — the gate must not fire for current-runtime spokes.
+    transcript = tmp_path / "t.jsonl"
+    _write_tasks_transcript(transcript)
+    assert run_todo_ledger("git push", repo_with_upstream, transcript).returncode == ALLOW
+
+
+def test_todo_ledger_allows_on_resumed_tasks_session(
+    repo_with_upstream: Path, tmp_path: Path
+) -> None:
+    # Tasks persist across sessions: a resumed spoke may only ever call
+    # TaskUpdate on tasks created in a dead session — still a live ledger.
+    transcript = tmp_path / "t.jsonl"
+    _write_tasks_transcript(transcript, update_only=True)
+    assert run_todo_ledger("git push", repo_with_upstream, transcript).returncode == ALLOW
+
+
 def test_todo_ledger_blocks_on_cursor_when_no_todowrite(
     repo_with_upstream: Path, tmp_path: Path
 ) -> None:
