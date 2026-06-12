@@ -438,6 +438,57 @@ def test_docs_only_cursor_shape_passes_without_anchor(
     assert run_hook_cursor_shell(COMMIT_QUALITY, 'git commit -m "docs: x"', cwd=repo) == ALLOW
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(
+            'git commit --pathspec-from-file=paths.txt -m "docs: tidy"',
+            id="pathspec-from-file",
+        ),
+        pytest.param(
+            'git commit --pathspec-from-file=paths.txt --pathspec-file-nul -m "docs: tidy"',
+            id="pathspec-from-file-nul",
+        ),
+    ],
+)
+def test_docs_pathspec_from_file_still_requires_anchor(
+    on_branch: Callable[[str], Path], command: str
+) -> None:
+    # `--pathspec-from-file` delivers the pathspec via a FILE, so no bare
+    # trailing token appears in the command — the trailing-pathspec detector
+    # never fires and the exact long-option denylist does not list it. Like an
+    # inline pathspec, it commits the named worktree paths and bypasses the
+    # staged doc-only set entirely, so it must stay anchored.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/a.md", "# a\n")
+    (repo / "README.md").write_text("seed\nchanged\n")  # dirty, NOT staged
+    (repo / "paths.txt").write_text("README.md\n")
+
+    assert run_hook(COMMIT_QUALITY, command, cwd=repo) == BLOCK
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param('git commit --amen -m "docs: x"', id="amen"),
+        pytest.param('git commit --am -m "docs: x"', id="am"),
+        pytest.param('git commit --patc -m "docs: x"', id="patc"),
+    ],
+)
+def test_docs_long_option_abbreviation_still_requires_anchor(
+    on_branch: Callable[[str], Path], command: str
+) -> None:
+    # Git accepts unambiguous long-option PREFIXES: --amen/--am mean --amend
+    # and --patc means --patch. The denylist matches only the exact spellings,
+    # and the short-cluster regex requires whitespace before a single dash, so
+    # these abbreviations slip past both — yet they commit something other than
+    # the staged doc-only set and must stay anchored.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/a.md", "# a\n")
+
+    assert run_hook(COMMIT_QUALITY, command, cwd=repo) == BLOCK
+
+
 # ── commit-gauntlet: lint scoping + RED carve-out ─────────
 
 ruff = pytest.mark.skipif(
