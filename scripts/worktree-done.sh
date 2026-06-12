@@ -71,12 +71,13 @@ esac
 # Capture the worktree's branch BEFORE removal — afterwards git no longer
 # associates the path with a branch, so this is our only chance to learn it.
 # wt_task_worktrees emits "path<TAB>branch"; detached worktrees yield an empty
-# branch (nothing to prune).
+# branch (nothing to prune). WT_DIR is the verbatim path wt_resolve printed from
+# this same stream, so a literal match is exact — never canonicalize here: a
+# missing directory (the --force case) resolves to an empty path that would
+# collide with any OTHER absent worktree and prune the wrong branch.
 WT_BRANCH=""
-wt_canon="$(wt_realpath "$WT_DIR")"
 while IFS=$'\t' read -r wt br; do
-  [ -n "$wt" ] || continue
-  if [ "$(wt_realpath "$wt")" = "$wt_canon" ]; then
+  if [ "$wt" = "$WT_DIR" ]; then
     WT_BRANCH="$br"
     break
   fi
@@ -108,12 +109,12 @@ fi
 # current branch — the integration target. A branch that is its ancestor is
 # fully merged and safe to delete; otherwise keep it and print the hint.
 prune_branch() {
+  if [ -z "$WT_BRANCH" ]; then
+    return                       # detached worktree — no branch to prune
+  fi
   if [ -n "$KEEP_BRANCH" ]; then
     echo "  branch $WT_BRANCH kept (--keep-branch)."
     return
-  fi
-  if [ -z "$WT_BRANCH" ]; then
-    return                       # detached worktree — no branch to prune
   fi
   local hub_branch
   hub_branch="$(git symbolic-ref --short -q HEAD || true)"
@@ -122,11 +123,14 @@ prune_branch() {
     echo "  Push and merge it first, then re-run; or delete by hand: git branch -d \"$WT_BRANCH\""
     return
   fi
-  if git branch -d "$WT_BRANCH"; then
-    echo "  pruned merged branch $WT_BRANCH."
-  else
-    wt_warn "couldn't delete local branch $WT_BRANCH — see git's message above."
+  # Local first: if `git branch -d` (the safe form, a second net under the
+  # merge-base gate) refuses, leave origin/<branch> alone too rather than delete
+  # a remote whose local counterpart we couldn't remove.
+  if ! git branch -d "$WT_BRANCH"; then
+    wt_warn "couldn't delete local branch $WT_BRANCH — see git's message above; leaving origin/$WT_BRANCH (if any) in place."
+    return
   fi
+  echo "  pruned merged branch $WT_BRANCH."
   if git show-ref --verify --quiet "refs/remotes/origin/$WT_BRANCH"; then
     if git push origin --delete "$WT_BRANCH" >/dev/null 2>&1; then
       echo "  deleted origin/$WT_BRANCH."
