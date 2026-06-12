@@ -123,27 +123,40 @@ if [ "$BRANCH_HAS_ISSUE" -eq 0 ] && [ "$MSG_HAS_ISSUE" -eq 0 ]; then
   DOC_ONLY_EXEMPT=0
   if echo "$MSG" | grep -qE '^(docs|chore)(\([a-zA-Z0-9._-]+\))?(!)?: '; then
     # The staged index is only authoritative for a PLAIN `git commit` with message
-    # flags. Deny the exemption when the command uses -a/-i/-p/--all/--include/
-    # --interactive/--patch/--amend (these commit more than the index), or when a
-    # trailing pathspec is present (commits the named worktree paths, not the index).
-    # Strip quoted strings first so a quoted message containing -am etc. is ignored,
-    # then check for the unsafe flag forms.
+    # flags. The exemption is only granted when EVERY token after `commit` is on
+    # the known-safe allowlist. An allowlist is used instead of a denylist because
+    # git accepts unambiguous long-option prefix abbreviations (--amen → --amend,
+    # --patc → --patch) and file-delivered pathspecs (--pathspec-from-file), so
+    # enumerating unsafe forms can never be complete. Anything not explicitly
+    # recognized — unknown flags, abbreviations, bare tokens, --, chained-command
+    # tokens — disqualifies the exemption and fails closed.
+    # Strip quoted strings first so a message containing -am etc. is ignored.
     CMD_STRIPPED=$(echo "$COMMAND" | sed -E "s/\"[^\"]*\"//g; s/'[^']*'//g")
-    UNSAFE_SHORT=$(echo "$CMD_STRIPPED" | grep -E '(^|[[:space:]])-[a-zA-Z]*[aip]' || true)
-    UNSAFE_LONG=$(echo "$CMD_STRIPPED" | grep -E '(^|[[:space:]])--(all|include|interactive|patch|amend)([[:space:]=]|$)' || true)
-    # Detect trailing pathspec: after the word `commit`, every token must start with `-`.
-    UNSAFE_PATHSPEC=0
+    _CMD_SAFE=1
     _SEEN_COMMIT=0
+    set -f
     for _TOKEN in $CMD_STRIPPED; do
+      # Only the FIRST `commit` token is the subcommand; a later one would be
+      # a pathspec naming a file called "commit" and must disqualify like any
+      # other bare token.
+      if [ "$_SEEN_COMMIT" -eq 0 ] && [ "$_TOKEN" = "commit" ]; then
+        _SEEN_COMMIT=1
+        continue
+      fi
       if [ "$_SEEN_COMMIT" -eq 1 ]; then
         case "$_TOKEN" in
-          -*) ;;
-          *) UNSAFE_PATHSPEC=1; break ;;
+          -m|--message|--message=*) ;;
+          -q|--quiet|-v|--verbose) ;;
+          -s|--signoff|-n|--no-verify) ;;
+          -S|--gpg-sign|--gpg-sign=*|--no-gpg-sign) ;;
+          --author=*|--date=*|--trailer=*) ;;
+          *) _CMD_SAFE=0; break ;;
         esac
       fi
-      if [ "$_TOKEN" = "commit" ]; then _SEEN_COMMIT=1; fi
     done
-    if [ -z "$UNSAFE_SHORT" ] && [ -z "$UNSAFE_LONG" ] && [ "$UNSAFE_PATHSPEC" -eq 0 ]; then
+    set +f
+    if [ "$_SEEN_COMMIT" -eq 0 ]; then _CMD_SAFE=0; fi
+    if [ "$_CMD_SAFE" -eq 1 ]; then
       STAGED=$(git -C "$PROJECT_ROOT" diff --cached --name-only 2>/dev/null || true)
       if [ -n "$STAGED" ]; then
         # Check every staged path is a doc-only path

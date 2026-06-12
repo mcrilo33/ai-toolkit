@@ -489,6 +489,26 @@ def test_docs_long_option_abbreviation_still_requires_anchor(
     assert run_hook(COMMIT_QUALITY, command, cwd=repo) == BLOCK
 
 
+def test_docs_pathspec_named_commit_still_requires_anchor(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # A pathspec literally named "commit" must not read as a second subcommand
+    # token: only the FIRST `commit` is the subcommand; a later one is a bare
+    # pathspec and disqualifies the exemption like any other.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "commit", "tracked file named commit\n")
+    subprocess.run(
+        ["git", "commit", "-qm", "chore: seed file", "-m", "Refs #1"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+    )
+    (repo / "commit").write_text("dirty, NOT staged\n")
+    _stage(repo, "docs/a.md", "# a\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit commit -m "docs: x"', cwd=repo) == BLOCK
+
+
 # ── commit-gauntlet: lint scoping + RED carve-out ─────────
 
 ruff = pytest.mark.skipif(
