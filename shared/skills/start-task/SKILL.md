@@ -47,8 +47,12 @@ run on its own:
 
 ```
 You're in a dedicated worktree for issue #N. Run /source to anchor to issue #N and
-read it, then implement it following the solo-cycle (/cycle: RED → GREEN → REVIEW →
-PUSH). Ask me before any irreversible step.
+read it. Before touching code, break the issue body into a TodoWrite ledger — one
+todo per subtask × the solo-cycle steps that apply (ANCHOR/RED/GREEN/REVIEW/PUSH),
+exactly one in_progress. Then implement it following the solo-cycle (/cycle: RED → GREEN →
+REVIEW → PUSH). The TodoWrite list is ephemeral session scratch; issue #N stays the
+durable contract — skip the ledger only if the task is genuinely single-step. Ask me
+before any irreversible step.
 ```
 
 ### 5. Report the handoff
@@ -61,7 +65,9 @@ Tell the user: the issue URL, the branch, the worktree path, and the tmux window
 - The **hub stays on `main` and read-only** — it decides *what*; the spoke does the
   *how*. The `source-task` guard nudges you here if you start coding on the hub.
 - The **issue is the contract** between hub and spoke. The spoke begins with a fresh,
-  focused context containing just that issue — planning noise doesn't leak in.
+  focused context containing just that issue — planning noise doesn't leak in. The
+  spoke's TodoWrite ledger is ephemeral session scratch; the issue stays the durable
+  contract.
 - For several **independent** tasks, repeat per task (each its own issue + worktree +
   tmux window). Sequence dependent tasks instead of fanning out.
 - If the user already has an issue number, skip steps 1–3 and dispatch directly.

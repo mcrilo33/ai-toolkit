@@ -58,6 +58,29 @@ the exact diff — any new commit invalidates the artifact.
 `git-push-review` all fire here; on Cursor they hard-block. The push only
 succeeds when all evidence is in place.
 
+## The session ledger (TodoWrite)
+
+GitHub issues hold the durable contract; your head holds the momentary edit. The
+middle layer — *which subtask and which cycle step is live right now* — is what a
+dead worktree session forgets, leaving you to reconstruct mid-cycle state by
+archaeology. Track it in a `TodoWrite` ledger so the cycle is visible and resumable.
+
+**Seed it** before the first commit: one todo per subtask × the cycle steps that
+apply — `Subtask 1 · ANCHOR`, `Subtask 1 · RED`, `Subtask 1 · GREEN`,
+`Subtask 1 · REVIEW`, `Subtask 1 · PUSH`, then the same for subtask 2 (ANCHOR only
+once when subtasks share the issue). Keep exactly one todo `in_progress` — the step
+you are on — and flip it to `completed` the moment its gate passes, moving the next
+step to `in_progress`.
+
+**Maintain it** as the cycle turns:
+
+- On REQUEST_CHANGES, insert a `Subtask N · Fix review findings` todo before that
+  subtask's REVIEW todo, work it, then re-review.
+- At PUSH, sync only the *outcome* to the GitHub issue — check the subtask's box,
+  leave a one-line note. Never mirror the live todo list into the issue.
+
+The ledger is ephemeral session scratch; the GitHub issue is the durable contract.
+
 ## Rules of thumb
 
 - Push once per subtask; the review artifact covers the whole `upstream..HEAD` diff
@@ -65,6 +88,9 @@ succeeds when all evidence is in place.
 - Any commit after APPROVE invalidates the artifact (hash mismatch) — re-review before pushing
 - Non-TDD subtasks (docs, config, chores) need no `Tested-RED` trailer —
   `red-proof-warn` only gates source-adding commits — but anchor and review still apply
+- The TodoWrite ledger is ephemeral session scratch; the GitHub issue is the durable
+  contract — sync only outcomes at PUSH, and skip the ledger entirely for single-step
+  work (one tiny subtask, a docs/config one-liner), where it is pure overhead
 
 ## Edge cases
 
