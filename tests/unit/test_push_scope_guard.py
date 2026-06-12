@@ -298,6 +298,36 @@ def test_spoke_cursor_denies_default_branch_in_second_clause(spoke: Path) -> Non
     assert result.returncode == BLOCK
 
 
+# ── Spoke: parentheses and braces are clause boundaries ───
+
+
+def test_spoke_cursor_denies_subshell_default_branch_push(spoke: Path) -> None:
+    # A subshell is not a disguise — the clause inside is still a push.
+    payload = _cursor_shell_payload("(git push origin main)", root=spoke)
+
+    result = run_guard(payload, cwd=spoke)
+
+    assert result.returncode == BLOCK
+
+
+def test_spoke_cursor_denies_braced_default_branch_push(spoke: Path) -> None:
+    payload = _cursor_shell_payload("{ git push origin main; }", root=spoke)
+
+    result = run_guard(payload, cwd=spoke)
+
+    assert result.returncode == BLOCK
+
+
+def test_spoke_cursor_allows_cmdsub_capture_of_own_branch_push(spoke: Path) -> None:
+    # Capturing the output of the sanctioned own-branch push must not be
+    # denied just because the closing paren glues onto the refspec.
+    payload = _cursor_shell_payload(f"OUT=$(git push -u origin {OWN})", root=spoke)
+
+    result = run_guard(payload, cwd=spoke)
+
+    assert result.returncode == ALLOW
+
+
 # ── Spoke: a dynamic token must not smuggle a concrete refspec ─
 
 
@@ -306,6 +336,9 @@ def test_spoke_cursor_denies_default_branch_in_second_clause(spoke: Path) -> Non
     [
         pytest.param("git push origin main $EXTRA", id="trailing-variable"),
         pytest.param("git push --force-with-lease=$SHA origin main", id="variable-flag-value"),
+        pytest.param("git push origin $SHA:main", id="dynamic-src-concrete-dst"),
+        pytest.param('git push origin "$BRANCH":main', id="quoted-dynamic-src-concrete-dst"),
+        pytest.param("git -c protocol.version=2 push origin main", id="config-opt-not-a-disguise"),
     ],
 )
 def test_spoke_cursor_denies_concrete_default_despite_variable(spoke: Path, command: str) -> None:
