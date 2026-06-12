@@ -470,3 +470,39 @@ def test_local_never_pushed_guard_stays_without_flag(hub: Path, tmp_path: Path) 
 
     assert proc.returncode != 0
     assert "never been pushed" in proc.stderr
+
+
+def test_local_refuses_branch_with_upstream(hub: Path, tmp_path: Path) -> None:
+    # --local is for micro-spokes, which never push. A branch WITH an upstream
+    # is not a micro-spoke: skipping the behind guard could merge a reduced
+    # local tip and later prune the remote ref, losing remote-only commits.
+    _make_spoke(hub, tmp_path, "feature/9-pushed", push=True)
+
+    proc, _ = _run_land(hub, tmp_path, "9", "--local")
+
+    assert proc.returncode != 0
+    assert "upstream" in proc.stderr.lower()
+    assert not (hub / "feature-9-pushed.txt").exists()  # nothing was merged
+
+
+def test_local_refuses_default_branch(hub: Path, tmp_path: Path) -> None:
+    # A typo'd target equal to the default branch must not "land" as a no-op
+    # self-merge that exits 0 and advises deleting main by hand.
+    pre = _remote_sha(hub, "main")
+
+    proc, _ = _run_land(hub, tmp_path, "main", "--local")
+
+    assert proc.returncode != 0
+    assert _remote_sha(hub, "main") == pre
+
+
+def test_local_keep_branch_keeps_bare_branch(hub: Path, tmp_path: Path) -> None:
+    # --keep-branch must survive bare-branch mode: the merged local branch is
+    # kept for follow-up work instead of being deleted after the push.
+    wt = _make_spoke(hub, tmp_path, "claude/micro-keep", push=False)
+    _git(hub, "worktree", "remove", str(wt))
+
+    proc, _ = _run_land(hub, tmp_path, "claude/micro-keep", "--local", "--keep-branch")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "claude/micro-keep" in _local_branches(hub)
