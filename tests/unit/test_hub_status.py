@@ -401,7 +401,7 @@ def test_non_numeric_slug_has_no_issue_column(hub_with_spokes: Path, tmp_path: P
     assert "#" not in line
 
 
-# --- TodoWrite ledger column (issue #8 scope addition) -----------------------
+# --- TodoWrite ledger column (issue #8; kept as the older-runtime fallback) ---
 
 
 def test_todos_subline_shows_done_count_and_in_progress_item(
