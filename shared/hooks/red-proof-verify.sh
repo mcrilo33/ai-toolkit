@@ -54,6 +54,7 @@ PROJECT_ROOT=$(project_root_from_payload "$INPUT")
 
 PASSERS=""
 BOOTSTRAPS=""
+BREACHES=""
 while IFS= read -r node; do
   [ -z "$node" ] && continue
   case "$(run_pytest_node "$PROJECT_ROOT" "$node")" in
@@ -66,8 +67,22 @@ while IFS= read -r node; do
     BOOTSTRAP)
       BOOTSTRAPS="$BOOTSTRAPS\n  • $node"
       ;;
+    BREACH)
+      # Issue #31: the node mutated THIS repo (escaped isolation). The tripwire
+      # already restored the snapshot; block so a corrupting test can't commit.
+      BREACHES="$BREACHES\n  • $node"
+      ;;
   esac
 done <<< "$NODES"
+
+if [ -n "$BREACHES" ]; then
+  deny "red-proof-verify blocked the commit — these Tested-RED nodes mutated the
+real repo when run (a test escaped isolation — issue #31):$(echo -e "$BREACHES")
+
+The tripwire restored the repo, but a test that moves a ref or flips git config
+is corrupting your checkout, not driving an implementation. Fix the test's
+isolation (it must operate on its own tmpdir, never the real repo), then retry."
+fi
 
 if [ -n "$BOOTSTRAPS" ]; then
   deny "red-proof-verify blocked the commit — these Tested-RED nodes could not be RUN (no pytest runner, or it failed to start):$(echo -e "$BOOTSTRAPS")

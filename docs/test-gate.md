@@ -72,6 +72,50 @@ Two layers close it, and **both must stay**:
 decoy is untouched. Do not remove the strip without removing that test's reason
 to exist.
 
+## The repo-integrity tripwire
+
+The env strip closes the **known** leak vector. The tripwire (issue #31) is the
+safety net for the whole **class** of isolation breaches: the #29/#30 incident
+corrupted the real repo *silently* — a ref moved and `core.bare` flipped, and
+nothing noticed until a bogus commit was found on `main` by hand. Any future
+breach (a different env var, a fixture that `cd`s wrong, a plain bug) could do
+the same. The tripwire turns silent corruption into a loud, blocked push.
+
+It brackets every pytest run the gate launches with a snapshot/verify:
+
+1. **Before** the run, snapshot the real repo's integrity markers —
+   `HEAD` + every local ref tip (`git show-ref --head`), `core.bare`, and
+   `core.worktree`.
+2. Run the tests (still with the git-hook env stripped).
+3. **After**, re-read the markers. If any changed, a test escaped isolation and
+   mutated **this** repo: **abort** the push (exit `97`) naming the marker that
+   moved, and **restore** the snapshot — reset the ref, drop a ref that appeared,
+   set `core.bare`/`core.worktree` back — so the checkout is left clean.
+
+It is cheap (one `git show-ref` + two `git config` reads per side) and wraps both
+pytest entry points: every `test-select.sh` tier (`run_under_tripwire`) and the
+`run_pytest_node` red-proof backstop (a mutation there yields a `BREACH` verdict
+that `red-proof-verify` and `red-proof-warn` block on).
+
+**No false positives.** Because the pytest child still runs with `GIT_*` stripped,
+a hermetic test that creates and deletes its **own** tmpdir repo never touches
+these markers — only a real escape into this repo trips it. The already-fixed
+`GIT_DIR` scenario passes cleanly through.
+
+**Only `TEST_SELECT_SKIP` bypasses it** — the same `--skip-tests` escape hatch
+that skips the gate skips its tripwire; there is no separate opt-out.
+
+> [!NOTE]
+> The tripwire **detects** a HEAD symbolic-target re-point (a stray
+> `git checkout`/detach) and aborts on it, but restores branch refs and config
+> rather than rewinding HEAD's symref — the abort, not the rewind, is the
+> protection. The incident's actual vectors (a branch-ref move and a `core.bare`
+> flip) are fully restored.
+
+`tests/unit/test_tripwire.py` is the regression guard: clean run (no trip),
+ref-moved and `core.bare`-flip (trip + restore), plus the hermetic-tmpdir and
+`GIT_DIR` no-false-positive cases.
+
 ## Installation
 
 The gate fires only where the native hooks are installed:

@@ -67,8 +67,9 @@ if [ -n "${TEST_SELECT_CMD:-}" ]; then
   note "running custom suite (TEST_SELECT_CMD)"
   rc=0
   # The custom suite is a test command too (worktree-land --test-cmd) — run it
-  # under the same git-hook env strip so it can't reach the real repo either.
-  "${GIT_HOOK_UNSET[@]}" bash -c "$TEST_SELECT_CMD" || rc=$?
+  # under the same git-hook env strip so it can't reach the real repo either, and
+  # under the repo-integrity tripwire (issue #31) so an escape still aborts.
+  run_under_tripwire "${GIT_HOOK_UNSET[@]}" bash -c "$TEST_SELECT_CMD" || rc=$?
   exit "$rc"
 fi
 
@@ -179,20 +180,25 @@ runner_has_testmon() {
   esac
 }
 
+# Every tier runs pytest under the repo-integrity tripwire (issue #31): the run
+# is bracketed by a snapshot/verify of HEAD + ref tips + core.bare/worktree, so a
+# test that escapes isolation and mutates THIS repo aborts the push (and the
+# snapshot is restored) instead of corrupting it silently. Only TEST_SELECT_SKIP
+# (handled above) bypasses the gate.
 rc=0
 case "$DECISION" in
   PYTHON)
     if runner_has_testmon; then
       note "python-only diff — pytest --testmon"
-      "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" --testmon || rc=$?
+      run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" --testmon || rc=$?
     else
       note "python-only diff but testmon not installed — full suite"
-      "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" || rc=$?
+      run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" || rc=$?
     fi
     ;;
   FULL)
     note "non-python or unrecognized changes — full suite"
-    "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" || rc=$?
+    run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" || rc=$?
     ;;
 esac
 exit "$rc"
