@@ -133,6 +133,14 @@ class SpanStore:
         )
         return [row["spoke_run_id"] for row in rows]
 
+    def workflow_revs(self) -> list[str]:
+        """All known ``workflow_rev``s, sorted — the A/B view's pick list."""
+        rows = self._query(
+            "SELECT DISTINCT workflow_rev FROM spans "
+            "WHERE workflow_rev IS NOT NULL ORDER BY workflow_rev"
+        )
+        return [row["workflow_rev"] for row in rows]
+
     def spoke_tree(self, spoke_run_id: str) -> list[dict[str, Any]]:
         """The step/sub-step tree for one spoke.
 
@@ -220,6 +228,94 @@ class SpanStore:
             row["frequency"] = row["invocations"]
             row["human_per_invocation"] = row["human_count"] / row["invocations"]
         return rows
+
+    def ab_compare(
+        self,
+        rev_a: str,
+        rev_b: str,
+        *,
+        low_confidence_n: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Per-step delta between two ``workflow_rev``s, normalized per invocation.
+
+        For each ``(kind, name, phase)`` present in either rev, reports the
+        per-invocation mean time, cost, and human-interaction rate on each side
+        and their B-minus-A deltas. Normalizing per invocation makes revs with
+        different spoke counts comparable; a negative delta is an improvement
+        (less time/cost/human). Each row carries sample sizes ``n_a``/``n_b``
+        and a ``low_confidence`` flag set when ``min(n_a, n_b) < low_confidence_n``
+        — small spoke counts are noisy and must not imply significance. Rows are
+        sorted by the magnitude of the time delta, descending.
+        """
+        rows = self._query(
+            """
+            SELECT
+                kind, name, phase, workflow_rev,
+                COUNT(*) AS n,
+                AVG(duration_ms) AS mean_duration,
+                AVG(COALESCE(cost_usd, 0)) AS mean_cost,
+                SUM(CASE WHEN human_type IS NOT NULL THEN 1 ELSE 0 END) * 1.0
+                    / COUNT(*) AS human_per_invocation
+            FROM spans
+            WHERE workflow_rev IN (?, ?)
+            GROUP BY kind, name, phase, workflow_rev
+            """,
+            [rev_a, rev_b],
+        )
+
+        groups: dict[tuple[Any, Any, Any], dict[str, dict[str, Any]]] = {}
+        for row in rows:
+            key = (row["kind"], row["name"], row["phase"])
+            groups.setdefault(key, {})[row["workflow_rev"]] = row
+
+        result = [
+            _ab_row(kind, name, phase, per_rev.get(rev_a), per_rev.get(rev_b), low_confidence_n)
+            for (kind, name, phase), per_rev in groups.items()
+        ]
+        result.sort(
+            key=lambda r: (-abs(r["delta_duration_ms"]), r["kind"], r["name"], r["phase"] or "")
+        )
+        return result
+
+
+def _ab_row(
+    kind: Any,
+    name: Any,
+    phase: Any,
+    side_a: dict[str, Any] | None,
+    side_b: dict[str, Any] | None,
+    low_confidence_n: int,
+) -> dict[str, Any]:
+    """Build one A/B comparison row from each side's per-rev aggregate.
+
+    A missing side (the step never ran under that rev) reads as zero metrics
+    with ``n = 0``, which always trips ``low_confidence``.
+    """
+    n_a = side_a["n"] if side_a else 0
+    n_b = side_b["n"] if side_b else 0
+    dur_a = side_a["mean_duration"] if side_a else 0.0
+    dur_b = side_b["mean_duration"] if side_b else 0.0
+    cost_a = side_a["mean_cost"] if side_a else 0.0
+    cost_b = side_b["mean_cost"] if side_b else 0.0
+    human_a = side_a["human_per_invocation"] if side_a else 0.0
+    human_b = side_b["human_per_invocation"] if side_b else 0.0
+    return {
+        "kind": kind,
+        "name": name,
+        "phase": phase,
+        "n_a": n_a,
+        "n_b": n_b,
+        "mean_duration_a": dur_a,
+        "mean_duration_b": dur_b,
+        "delta_duration_ms": dur_b - dur_a,
+        "mean_cost_a": cost_a,
+        "mean_cost_b": cost_b,
+        "delta_cost_usd": cost_b - cost_a,
+        "human_per_invocation_a": human_a,
+        "human_per_invocation_b": human_b,
+        "delta_human_per_invocation": human_b - human_a,
+        "low_confidence": min(n_a, n_b) < low_confidence_n,
+    }
 
 
 def _roll_up(node: dict[str, Any]) -> dict[str, int | float]:

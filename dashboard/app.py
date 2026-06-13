@@ -151,6 +151,54 @@ def render_aggregate_view(store: queries.SpanStore) -> None:
     st.dataframe(table, use_container_width=True, hide_index=True)
 
 
+def _fmt_delta_secs(ms: float) -> str:
+    arrow = "🔻" if ms < 0 else ("🔺" if ms > 0 else "▪️")
+    return f"{arrow} {ms / 1000:+.1f}s"
+
+
+def _fmt_delta_cost(usd: float) -> str:
+    arrow = "🔻" if usd < 0 else ("🔺" if usd > 0 else "▪️")
+    return f"{arrow} {usd:+.4f}"
+
+
+def render_compare_view(store: queries.SpanStore) -> None:
+    st.header("A/B compare view")
+    st.caption(
+        "Did a workflow change help? Per-step delta between two revisions, "
+        "normalized per invocation. 🔻 = improvement, 🔺 = regression."
+    )
+
+    revs = store.workflow_revs()
+    if len(revs) < 2:
+        st.info("Need at least two workflow revisions to compare.")
+        return
+
+    cols = st.columns(2)
+    rev_a = cols[0].selectbox("Baseline rev (A)", revs, index=0)
+    rev_b = cols[1].selectbox("Candidate rev (B)", revs, index=len(revs) - 1)
+
+    rows = store.ab_compare(rev_a, rev_b)
+    low_conf = [r for r in rows if r["low_confidence"]]
+    if low_conf:
+        st.warning(
+            f"{len(low_conf)} of {len(rows)} steps are low-confidence (small spoke "
+            "counts) — deltas marked ⚠️ are noisy; don't read significance into them."
+        )
+
+    table = [
+        {
+            "Step": _step_label(row),
+            "n (A→B)": f"{row['n_a']}→{row['n_b']}",
+            "Δ time/inv": _fmt_delta_secs(row["delta_duration_ms"]),
+            "Δ cost/inv": _fmt_delta_cost(row["delta_cost_usd"]),
+            "Δ human/inv": f"{row['delta_human_per_invocation']:+.2f}",
+            "Confidence": "⚠️ low" if row["low_confidence"] else "ok",
+        }
+        for row in rows
+    ]
+    st.dataframe(table, use_container_width=True, hide_index=True)
+
+
 def main() -> None:
     st.set_page_config(page_title="Workflow observability", layout="wide")
     st.title("Workflow observability dashboard")
@@ -167,11 +215,13 @@ def main() -> None:
         return
 
     store = load_store(span_log)
-    view = st.sidebar.radio("View", ["Spoke", "Aggregate"])
+    view = st.sidebar.radio("View", ["Spoke", "Aggregate", "A/B compare"])
     if view == "Spoke":
         render_spoke_view(store)
     elif view == "Aggregate":
         render_aggregate_view(store)
+    elif view == "A/B compare":
+        render_compare_view(store)
 
 
 if __name__ == "__main__":

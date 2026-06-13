@@ -23,6 +23,10 @@ def _group(rows, kind, name, phase):
     raise KeyError((kind, name, phase))
 
 
+def test_workflow_revs_are_unique_and_sorted():
+    assert store().workflow_revs() == ["new5678", "old1234"]
+
+
 def test_green_delta_is_normalized_per_invocation():
     rows = store().ab_compare(REV_A, REV_B)
     green = _group(rows, "step", "solo-cycle", "green")
