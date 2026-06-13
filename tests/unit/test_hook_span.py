@@ -1,4 +1,4 @@
-"""Unit tests for hook span-wrapping (Issue #21, subtask 2 — RED).
+"""Unit tests for hook span-wrapping (Issue #21, subtask 2).
 
 Subtask 2 extends the hook lib so that **every hook invocation** emits exactly
 one span (``kind: hook``) to the telemetry log — not only the deny/warn counts
