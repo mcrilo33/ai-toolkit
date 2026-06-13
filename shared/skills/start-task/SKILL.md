@@ -11,7 +11,8 @@ and lifecycle see `docs/parallel-worktrees.md`.
 ## Preconditions
 
 - Run from the **main checkout** (the hub), which stays on `main`.
-- `gh` is authenticated and `scripts/worktree-new.sh` exists on `main`.
+- `gh` is authenticated and `.ai-toolkit/scripts/worktree-new.sh` is installed
+  (every synced repo has it; `sync-to-repo.sh` puts it there).
 - The scope has been discussed enough to write a clear issue.
 
 ## Workflow
@@ -23,7 +24,7 @@ Before creating an issue or spawning a worktree, classify the task (~10 seconds)
 - Does the change touch executable behavior? **No** → **Lane 1 (micro-spoke).** Do not
   create an issue and do not call `worktree-new.sh`. Dispatch a micro-spoke from the hub
   instead: spawn a subagent with `isolation: worktree`, review its diff, and land with
-  `scripts/worktree-land.sh <branch> --local`. Lane 1 is restricted to non-executable
+  `.ai-toolkit/scripts/worktree-land.sh <branch> --local`. Lane 1 is restricted to non-executable
   paths only (docs, comments, wording) — never `scripts/`, `shared/hooks/`, `tests/`, or
   skill scripts. See the hub skill's "Micro-spoke dispatch (lane 1)" section for the full
   flow.
@@ -31,7 +32,7 @@ Before creating an issue or spawning a worktree, classify the task (~10 seconds)
   creation (steps 1–3 below). Dispatch directly:
 
   ```bash
-  scripts/worktree-new.sh <slug> --prompt "<kickoff>"
+  .ai-toolkit/scripts/worktree-new.sh <slug> --prompt "<kickoff>"
   ```
 
   The spoke runs a single cycle under all push gates. No issue, no task ledger.
@@ -59,7 +60,7 @@ Capture the issue number `N` from the returned URL.
 ### 4. Dispatch the worktree + seed the spoke
 
 ```bash
-scripts/worktree-new.sh N --type <type> --prompt "<kickoff>"
+.ai-toolkit/scripts/worktree-new.sh N --type <type> --prompt "<kickoff>"
 ```
 
 This creates `feature/N-<slug>` (or `<type>/N-<slug>`), copies `.claude/`, folds the
