@@ -17,6 +17,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+# `queries` is the sibling module in this directory; it resolves because
+# `streamlit run dashboard/app.py` injects the script's directory onto sys.path.
 import queries
 import streamlit as st
 
