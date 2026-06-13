@@ -22,7 +22,9 @@ SYNC_SCRIPT = REPO_ROOT / "scripts" / "sync-to-repo.sh"
 # Workflow scripts and their source locations in the toolkit checkout.
 WORKTREE_SCRIPTS = ("worktree-new.sh", "worktree-land.sh", "worktree-done.sh", "worktree-lib.sh")
 SOURCES = {name: REPO_ROOT / "scripts" / name for name in WORKTREE_SCRIPTS}
-SOURCES["hub-status.sh"] = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "hub-status.sh"
+HUB_SCRIPTS_DIR = REPO_ROOT / "shared" / "skills" / "hub" / "scripts"
+SOURCES["hub-status.sh"] = HUB_SCRIPTS_DIR / "hub-status.sh"
+SOURCES["hub-ready-watch.sh"] = HUB_SCRIPTS_DIR / "hub-ready-watch.sh"
 
 INSTALLED = {name: f".ai-toolkit/scripts/{name}" for name in SOURCES}
 

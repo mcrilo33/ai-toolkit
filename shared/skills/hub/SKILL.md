@@ -55,6 +55,27 @@ otherwise it reads `pushed (in progress)` — the spoke is between subtasks and 
 per-subtask push must not be mistaken for a finished issue. Ad-hoc/express branches
 (non-numbered slug) need no marker — their single push IS completion.
 
+### Proactive ready-to-land watch (optional)
+
+`hub-status.sh` is **pull** — you only see `pushed → mergeable` when you run it. To be
+told the moment a spoke finishes, run the **push** companion on a loop:
+
+```bash
+bash .ai-toolkit/scripts/hub-ready-watch.sh
+```
+
+Each run best-effort fetches tags, diffs the `ready/<issue>` markers against a last-seen
+set (kept under the git common dir), and prints `#N → run /land N <branch> ↑ahead ↓behind`
+for each **newly**-ready spoke — nothing when there is no change, so it is quiet enough to
+loop (`/loop 2m bash .ai-toolkit/scripts/hub-ready-watch.sh`). It is detection only:
+
+- Only a `ready/*` tag **at its branch tip** fires — a mid-task push (no tag) or a stale
+  marker (tag behind the tip) is ignored, so it never false-fires between subtasks.
+- It **never merges.** The surfaced `/land N` stays a human-invoked one-confirm step
+  (section 3) — the watcher proposes, you land.
+- Offline-safe: a finished spoke's tag is locally visible (shared ref store), so a failed
+  fetch is non-fatal and local markers still surface.
+
 ### 3. Propose the next move — act only on confirmation
 
 From the dashboard, surface concrete next steps and wait for the user's OK before doing
