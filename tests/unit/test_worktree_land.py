@@ -1,13 +1,17 @@
 """Unit tests for scripts/worktree-land.sh — the hub-side landing sequence.
 
 Landing is hub-owned: verify the spoke pushed → merge into the default branch →
-run the full suite → push main → tear down the worktree (worktree-done.sh) →
-close the issue → kill the stranded tmux window. Every guard must abort with a
-precise reason BEFORE the merge, and a suite failure must roll main back.
+push main (the pre-push hook is the single test gate, issue #19) → tear down the
+worktree (worktree-done.sh) → close the issue → kill the stranded tmux window.
+Every guard must abort with a precise reason BEFORE the merge; landing no longer
+runs the suite itself, and a pre-push rejection (the gate failing) must roll main
+back.
 
 Hermetic like test_worktree_done.py: git runs against a local bare `origin`, and
-`gh`, `tmux`, `code`, and the test suite are logging stubs on PATH — no network,
-no real issue closes, no real tmux server, no recursive pytest.
+`gh`, `tmux`, `code`, and `pytest` are logging stubs on PATH — no network, no
+real issue closes, no real tmux server, and no land-side pytest (a stub proves
+landing never invokes it). A stub hub pre-push hook stands in for the real gate
+when a test needs to assert env threading or rollback.
 """
 
 from __future__ import annotations
@@ -70,20 +74,19 @@ def _run_land(
     hub: Path,
     tmp_path: Path,
     *args: str,
-    suite_exit: int = 0,
     gh_exit: int = 0,
     tmux_windows: str = "",
 ) -> tuple[subprocess.CompletedProcess, dict[str, Path]]:
     """Run worktree-land.sh from the hub with logging stubs on PATH.
 
-    Stubs `gh`, `tmux`, and `code` (one log line per invocation each) plus a
-    `suite` script logging its cwd and exiting `suite_exit`, always passed via
-    --test-cmd so the real pytest never runs recursively. `tmux_windows` is the
-    line(s) the tmux stub prints for `list-windows`. Returns the completed
-    process and the stub logs by name."""
+    Stubs `gh`, `tmux`, and `code` (one log line per invocation each), plus a
+    `pytest` stub logging every call — landing must NOT run pytest itself anymore
+    (issue #19): the suite runs once via the pre-push hook on the main push.
+    `tmux_windows` is the line(s) the tmux stub prints for `list-windows`.
+    Returns the completed process and the stub logs by name."""
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
-    logs = {name: tmp_path / f"{name}-calls.log" for name in ("gh", "tmux", "code", "suite")}
+    logs = {name: tmp_path / f"{name}-calls.log" for name in ("gh", "tmux", "code", "pytest")}
     for name, exit_code in (("gh", gh_exit), ("code", 0)):
         stub = bindir / name
         stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{logs[name]}"\nexit {exit_code}\n')
@@ -94,19 +97,34 @@ def _run_land(
         f'case "$1" in list-windows) printf "%s\\n" "{tmux_windows}" ;; esac\nexit 0\n'
     )
     tmux.chmod(0o755)
-    suite = bindir / "suite"
-    suite.write_text(f'#!/bin/sh\nprintf "%s\\n" "$PWD" >> "{logs["suite"]}"\nexit {suite_exit}\n')
-    suite.chmod(0o755)
+    pytest_stub = bindir / "pytest"
+    pytest_stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{logs["pytest"]}"\nexit 0\n')
+    pytest_stub.chmod(0o755)
     env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
     env.pop("TMUX", None)
     proc = subprocess.run(
-        ["bash", str(WORKTREE_LAND), *args, "--test-cmd", str(suite)],
+        ["bash", str(WORKTREE_LAND), *args],
         cwd=str(hub),
         capture_output=True,
         text=True,
         env=env,
     )
     return proc, logs
+
+
+def _install_prepush_stub(hub: Path, *, exit_code: int = 0, env_log: Path | None = None) -> None:
+    """Install a hub pre-push hook standing in for the real test gate.
+
+    It records the threaded TEST_SELECT_* environment (when `env_log` is given)
+    and exits `exit_code`, so a test can assert what landing delegates to the
+    hook and that a rejection (non-zero) rolls the merge back."""
+    hook = hub / ".git" / "hooks" / "pre-push"
+    body = "#!/bin/sh\n"
+    if env_log is not None:
+        body += f'env | grep -E "^TEST_SELECT_" >> "{env_log}" || true\n'
+    body += f"exit {exit_code}\n"
+    hook.write_text(body)
+    hook.chmod(0o755)
 
 
 def _local_branches(hub: Path) -> list[str]:
@@ -283,50 +301,76 @@ def test_refuses_unknown_target(hub: Path, tmp_path: Path) -> None:
     assert "feature/1-real" in proc.stderr  # candidates are listed for recovery
 
 
-# --- the suite gate --------------------------------------------------------------
+# --- the pre-push hook is the single test gate (issue #19) -----------------------
 
 
-def test_suite_runs_from_hub_root(hub: Path, tmp_path: Path) -> None:
-    _make_spoke(hub, tmp_path, "feature/1-suite", push=True)
+def test_default_land_runs_no_land_side_pytest(hub: Path, tmp_path: Path) -> None:
+    # Landing no longer runs the suite itself; the pre-push hook tests once on the
+    # main push. With no hook installed here, the push just succeeds.
+    _make_spoke(hub, tmp_path, "feature/1-nopytest", push=True)
 
     proc, logs = _run_land(hub, tmp_path, "1")
 
     assert proc.returncode == 0, proc.stderr
-    assert _log_text(logs["suite"]).strip() == str(hub.resolve())
+    assert _log_text(logs["pytest"]) == ""  # land never invoked pytest itself
+    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
 
 
-def test_suite_failure_rolls_back_merge(hub: Path, tmp_path: Path) -> None:
+def test_push_gate_failure_rolls_back(hub: Path, tmp_path: Path) -> None:
+    # A pre-push rejection (the test gate failing) must roll the merged hub back
+    # and ship nothing — the clean-hub invariant the old land-side gate held.
     pre_sha = _git(hub, "rev-parse", "HEAD").strip()
     wt = _make_spoke(hub, tmp_path, "feature/1-broken", push=True)
+    _install_prepush_stub(hub, exit_code=1)
 
-    proc, _ = _run_land(hub, tmp_path, "1", suite_exit=1)
+    proc, _ = _run_land(hub, tmp_path, "1")
 
     assert proc.returncode != 0
-    assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha
+    assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha  # rolled back
     assert _remote_sha(hub, "main") == pre_sha  # nothing was pushed
     assert wt.exists()  # teardown never ran
     assert "feature/1-broken" in _local_branches(hub)
 
 
-def test_skip_tests_flag_skips_suite(hub: Path, tmp_path: Path) -> None:
+def test_skip_tests_threads_skip_env(hub: Path, tmp_path: Path) -> None:
+    # --skip-tests bypasses the suite by threading TEST_SELECT_SKIP to the push,
+    # not by a land-side run — the hook stays the single executor.
     _make_spoke(hub, tmp_path, "feature/1-untested", push=True)
+    env_log = tmp_path / "prepush-env.log"
+    _install_prepush_stub(hub, exit_code=0, env_log=env_log)
 
-    proc, logs = _run_land(hub, tmp_path, "1", "--skip-tests", suite_exit=1)
+    proc, logs = _run_land(hub, tmp_path, "1", "--skip-tests")
 
     assert proc.returncode == 0, proc.stderr
-    assert _log_text(logs["suite"]) == ""
+    assert "TEST_SELECT_SKIP=1" in _log_text(env_log)
+    assert _log_text(logs["pytest"]) == ""  # still no land-side pytest
+
+
+def test_test_cmd_threads_cmd_env(hub: Path, tmp_path: Path) -> None:
+    # --test-cmd overrides the suite by threading TEST_SELECT_CMD to the push, so
+    # the hook runs the custom command instead of the tiered selection.
+    _make_spoke(hub, tmp_path, "feature/1-custom", push=True)
+    env_log = tmp_path / "prepush-env.log"
+    _install_prepush_stub(hub, exit_code=0, env_log=env_log)
+
+    proc, _ = _run_land(hub, tmp_path, "1", "--test-cmd", "my-suite --fast")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "TEST_SELECT_CMD=my-suite --fast" in _log_text(env_log)
 
 
 # --- ship and teardown -----------------------------------------------------------
 
 
 def test_push_failure_aborts_before_teardown(hub: Path, tmp_path: Path) -> None:
+    pre_sha = _git(hub, "rev-parse", "HEAD").strip()
     wt = _make_spoke(hub, tmp_path, "feature/1-stuck", push=True)
     _git(hub, "remote", "set-url", "origin", str(tmp_path / "does-not-exist.git"))
 
     proc, logs = _run_land(hub, tmp_path, "1")
 
     assert proc.returncode != 0
+    assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha  # merge rolled back
     assert wt.exists()  # worktree survives a failed ship
     assert _log_text(logs["gh"]) == ""  # issue was not closed
 
@@ -445,17 +489,17 @@ def test_local_still_refuses_dirty_worktree(hub: Path, tmp_path: Path) -> None:
     assert wt.exists()
 
 
-def test_local_suite_failure_rolls_back_bare_branch(hub: Path, tmp_path: Path) -> None:
-    # A failed suite must roll main back and keep the bare branch around so
+def test_local_push_gate_failure_rolls_back_bare_branch(hub: Path, tmp_path: Path) -> None:
+    # A pre-push rejection must roll main back and keep the bare branch around so
     # the work survives for a retry — same rollback contract as worktree lands.
     pre_sha = _git(hub, "rev-parse", "HEAD").strip()
     wt = _make_spoke(hub, tmp_path, "claude/micro-docs", push=False)
     _git(hub, "worktree", "remove", str(wt))
+    _install_prepush_stub(hub, exit_code=1)
 
-    proc, logs = _run_land(hub, tmp_path, "claude/micro-docs", "--local", suite_exit=1)
+    proc, _ = _run_land(hub, tmp_path, "claude/micro-docs", "--local")
 
     assert proc.returncode != 0
-    assert _log_text(logs["suite"]) != ""  # the abort came from the suite, not a guard
     assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha
     assert _remote_sha(hub, "main") == pre_sha  # nothing was pushed
     assert "claude/micro-docs" in _local_branches(hub)
