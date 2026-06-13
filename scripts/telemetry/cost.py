@@ -112,12 +112,19 @@ def _event_total(event: UsageEvent) -> int:
 
 
 def _within(ts: str | None, start: str | None, end: str | None) -> bool:
+    """Half-open [start, end) membership.
+
+    The upper bound is exclusive so an event landing exactly on the boundary
+    shared by two adjacent spans (span A's ``ts_end`` == span B's ``ts_start``)
+    is attributed to exactly one of them — never both — which keeps the
+    "attributed cost never exceeds the ccusage session total" invariant intact.
+    """
     if not ts or not start or not end:
         return False
     moment, lo, hi = _parse(ts), _parse(start), _parse(end)
     if moment is None or lo is None or hi is None:
         return False
-    return lo <= moment <= hi
+    return lo <= moment < hi
 
 
 def _parse(ts: str) -> datetime | None:

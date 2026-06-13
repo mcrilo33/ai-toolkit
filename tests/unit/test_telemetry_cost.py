@@ -21,7 +21,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from telemetry.cost import attribute, load_ccusage_costs
-from telemetry.session_parser import parse_session_file
+from telemetry.session_parser import ParsedSession, UsageEvent, parse_session_file
+from telemetry.spans import Span
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "telemetry" / "projects"
 SESSION = FIXTURES / "-Users-demo-Repos-proj" / "11111111-1111-1111-1111-111111111111.jsonl"
@@ -101,6 +102,49 @@ class TestCostAttribution:
         assert all(s.cost_usd is None for s in parsed.spans)
         # tokens are still attributed even without cost data.
         assert _one(parsed, "agent").tokens_in == 700
+
+
+class TestBoundaryBracketing:
+    def test_boundary_event_attributed_to_exactly_one_adjacent_span(self) -> None:
+        # Span A ends where span B starts; a usage event lands on the shared
+        # boundary. Half-open [start, end) must give it to exactly one span so
+        # the cost invariant holds.
+        session = "S"
+        span_a = Span(
+            span_id="A",
+            kind="skill",
+            name="a",
+            session_id=session,
+            ts_start="2026-01-01T00:00:01.000Z",
+            ts_end="2026-01-01T00:00:03.000Z",
+        )
+        span_b = Span(
+            span_id="B",
+            kind="skill",
+            name="b",
+            session_id=session,
+            ts_start="2026-01-01T00:00:03.000Z",
+            ts_end="2026-01-01T00:00:06.000Z",
+        )
+        event = UsageEvent(
+            session_id=session,
+            ts="2026-01-01T00:00:03.000Z",
+            model=None,
+            input_tokens=100,
+            output_tokens=0,
+            cache_read=0,
+            cache_creation=0,
+            source="main",
+        )
+        parsed = ParsedSession(spans=[span_a, span_b], usage_events=[event], agent_links={})
+
+        attribute(parsed, {session: 1.0})
+
+        assert span_a.tokens_in is not None and span_b.tokens_in is not None
+        assert span_a.tokens_in + span_b.tokens_in == 100
+        assert (span_a.tokens_in == 0) != (span_b.tokens_in == 0)
+        total = sum(s.cost_usd or 0.0 for s in parsed.spans)
+        assert total <= 1.0 + 1e-9
 
 
 class TestCcusageLoader:
