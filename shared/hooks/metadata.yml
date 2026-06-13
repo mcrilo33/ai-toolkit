@@ -64,6 +64,17 @@ git-push-review:
     event: beforeShellExecution
     matcher: "git( +-[^ ]+| +-C +[^ ]+)* +push( |$)|gh +pr( |$)"
 
+push-scope-guard:
+  event: preToolUse
+  matcher: Bash
+  description: "Spoke worktrees may push only their own branch; the default branch is published by the hub (hard deny on Cursor, advisory elsewhere)"
+  tier: 1
+  claude:
+    if: "Bash(git push *)"
+  cursor:
+    event: beforeShellExecution
+    matcher: "git( +-[^ ]+| +-C +[^ ]+)* +push( |$)"
+
 config-protection:
   event: preToolUse
   matcher: "Write|Edit"
@@ -226,3 +237,22 @@ review-window-close:
   tier: 1
   cursor:
     event: subagentStop
+
+# rm-scope-guard (issue #13): auto-allow rm whose every target provably
+# resolves inside the worktree or /tmp//private/tmp (and, for compound
+# commands, whose every chained segment is read-only); stay SILENT otherwise
+# so the user's `Bash(rm *)` ask rule keeps prompting. The hook never denies —
+# platforms without permissionDecision support simply keep prompting. Wired
+# like hub-guard/git-push-review: Claude gates it with the same `Bash(rm *)`
+# rule the ask backstop uses; Cursor remaps onto beforeShellExecution with a
+# command regex that fires on rm at a segment boundary.
+rm-scope-guard:
+  event: preToolUse
+  matcher: Bash
+  description: "Auto-allow rm scoped to the worktree or /tmp (read-only chained segments only); stay silent otherwise so the ask rule still prompts"
+  tier: 1
+  claude:
+    if: "Bash(rm *)"
+  cursor:
+    event: beforeShellExecution
+    matcher: "(^|[;&|] *)rm( |$)"

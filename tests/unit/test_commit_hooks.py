@@ -258,6 +258,327 @@ def test_branch_issue_detection(
     assert run_hook(COMMIT_QUALITY, 'git commit -m "feat: y"', cwd=repo) == expected
 
 
+# ── commit-quality: docs/chore doc-only exemption (issue #10) ─────────
+# Three-lane triage: a sanctioned no-issue path for micro/express spokes. The
+# anchor gate must EXEMPT a commit when (1) the subject type is docs or chore
+# AND (2) every staged path is a non-executable documentation file (.md,
+# .markdown, .txt, .rst) outside top-level scripts/, shared/hooks/, tests/,
+# and outside any */scripts/ directory. Everything else stays anchored.
+
+
+def test_docs_only_md_staged_passes_without_anchor(on_branch: Callable[[str], Path]) -> None:
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/guide.md", "# guide\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "docs: fix wording"', cwd=repo) == ALLOW
+
+
+def test_chore_only_md_staged_passes_without_anchor(on_branch: Callable[[str], Path]) -> None:
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "shared/rules/workflow.md", "# workflow\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "chore: tidy rule wording"', cwd=repo) == ALLOW
+
+
+def test_feat_with_only_md_staged_still_requires_anchor(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # Only docs/chore types are exempt — feat must stay anchored even when the
+    # staged set is documentation-only.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/guide.md", "# guide\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "feat: add guide"', cwd=repo) == BLOCK
+
+
+def test_docs_with_script_staged_still_requires_anchor(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # A staged executable path (wrong extension, top-level scripts/) breaks the
+    # allowlist — the whole commit stays anchored.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "scripts/helper.sh", "#!/bin/sh\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "docs: fix wording"', cwd=repo) == BLOCK
+
+
+def test_docs_with_md_under_tests_still_requires_anchor(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # Right extension, excluded directory: tests/ is never a doc-only path.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "tests/README.md", "# tests\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "docs: explain test layout"', cwd=repo) == BLOCK
+
+
+def test_docs_with_md_in_skill_scripts_dir_still_requires_anchor(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # Any */scripts/ directory (skill scripts) is excluded even for .md files.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "shared/skills/foo/scripts/README.md", "# scripts\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "docs: describe scripts"', cwd=repo) == BLOCK
+
+
+def test_docs_with_mixed_staged_files_still_requires_anchor(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # EVERY staged path must be on the allowlist — one stray .py poisons the lot.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/a.md", "# a\n")
+    _stage(repo, "pkg/b.py", "x = 1\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "docs: update a"', cwd=repo) == BLOCK
+
+
+def test_docs_with_nothing_staged_still_requires_anchor(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # Fail closed: the hook reads the index at PreToolUse time, so a
+    # `git commit -am` style command sees an EMPTY index here — an empty staged
+    # set must not count as "all documentation".
+    repo = on_branch("claude/micro-docs")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -am "docs: fix wording"', cwd=repo) == BLOCK
+
+
+def test_docs_dash_a_with_dirty_script_still_requires_anchor(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # `git commit -am` commits the index PLUS every dirty tracked file — the
+    # staged set the hook inspects is NOT what this command commits. A dirty
+    # tracked script must poison the exemption even when only a doc is staged.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "tools/deploy.sh", "#!/bin/sh\n")
+    subprocess.run(
+        ["git", "commit", "-qm", "chore: tool", "-m", "Refs #1"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+    )
+    (repo / "tools" / "deploy.sh").write_text("#!/bin/sh\necho changed\n")  # dirty, NOT staged
+    _stage(repo, "docs/a.md", "# a\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -am "docs: fix wording"', cwd=repo) == BLOCK
+
+
+def test_docs_pathspec_form_still_requires_anchor(on_branch: Callable[[str], Path]) -> None:
+    # `git commit -m ... <pathspec>` bypasses the index entirely and commits
+    # the named worktree paths — the staged doc-only set is irrelevant.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/a.md", "# a\n")
+
+    command = 'git commit -m "docs: fix wording" tools/deploy.sh'
+    assert run_hook(COMMIT_QUALITY, command, cwd=repo) == BLOCK
+
+
+def test_docs_amend_still_requires_anchor(on_branch: Callable[[str], Path]) -> None:
+    # `--amend -m "..."` HAS a parseable subject, so it reaches the gate (the
+    # no-message early-allow does not apply). An amend rewrites the previous
+    # commit — the staged doc is not what it commits — so no exemption.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/a.md", "# a\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit --amend -m "docs: x"', cwd=repo) == BLOCK
+
+
+def test_docs_executable_md_still_requires_anchor(on_branch: Callable[[str], Path]) -> None:
+    # "Non-executable documentation" must be literal: a .md staged with mode
+    # 100755 is executable and must not ride the exemption.
+    repo = on_branch("claude/micro-docs")
+    doc = repo / "docs" / "a.md"
+    doc.parent.mkdir(parents=True, exist_ok=True)
+    doc.write_text("# a\n")
+    os.chmod(doc, 0o755)
+    subprocess.run(["git", "add", "docs/a.md"], cwd=str(repo), check=True, capture_output=True)
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "docs: x"', cwd=repo) == BLOCK
+
+
+def test_docs_symlink_md_still_requires_anchor(on_branch: Callable[[str], Path]) -> None:
+    # A symlink staged as docs/link.md (mode 120000) is not a documentation
+    # FILE — it can point anywhere, so it must not ride the exemption.
+    repo = on_branch("claude/micro-docs")
+    link = repo / "docs" / "link.md"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink("../README.md", link)
+    subprocess.run(["git", "add", "docs/link.md"], cwd=str(repo), check=True, capture_output=True)
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "docs: x"', cwd=repo) == BLOCK
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        pytest.param("docs/n.markdown", id="markdown"),
+        pytest.param("docs/n.txt", id="txt"),
+        pytest.param("docs/n.rst", id="rst"),
+    ],
+)
+def test_docs_only_alternate_doc_extensions_pass_without_anchor(
+    on_branch: Callable[[str], Path], rel: str
+) -> None:
+    # Pins the extension alternation: .markdown/.txt/.rst are doc-only too.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, rel, "notes\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit -m "docs: x"', cwd=repo) == ALLOW
+
+
+def test_docs_only_cursor_shape_passes_without_anchor(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # Pins the PROJECT_ROOT-based staged lookup: Cursor's beforeShellExecution
+    # payload has an empty cwd, so the index must resolve via workspace_roots.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/a.md", "# a\n")
+
+    assert run_hook_cursor_shell(COMMIT_QUALITY, 'git commit -m "docs: x"', cwd=repo) == ALLOW
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(
+            'git commit --pathspec-from-file=paths.txt -m "docs: tidy"',
+            id="pathspec-from-file",
+        ),
+        pytest.param(
+            'git commit --pathspec-from-file=paths.txt --pathspec-file-nul -m "docs: tidy"',
+            id="pathspec-from-file-nul",
+        ),
+    ],
+)
+def test_docs_pathspec_from_file_still_requires_anchor(
+    on_branch: Callable[[str], Path], command: str
+) -> None:
+    # `--pathspec-from-file` delivers the pathspec via a FILE, so no bare
+    # trailing token appears in the command — the trailing-pathspec detector
+    # never fires and the exact long-option denylist does not list it. Like an
+    # inline pathspec, it commits the named worktree paths and bypasses the
+    # staged doc-only set entirely, so it must stay anchored.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/a.md", "# a\n")
+    (repo / "README.md").write_text("seed\nchanged\n")  # dirty, NOT staged
+    (repo / "paths.txt").write_text("README.md\n")
+
+    assert run_hook(COMMIT_QUALITY, command, cwd=repo) == BLOCK
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param('git commit --amen -m "docs: x"', id="amen"),
+        pytest.param('git commit --am -m "docs: x"', id="am"),
+        pytest.param('git commit --patc -m "docs: x"', id="patc"),
+    ],
+)
+def test_docs_long_option_abbreviation_still_requires_anchor(
+    on_branch: Callable[[str], Path], command: str
+) -> None:
+    # Git accepts unambiguous long-option PREFIXES: --amen/--am mean --amend
+    # and --patc means --patch. The denylist matches only the exact spellings,
+    # and the short-cluster regex requires whitespace before a single dash, so
+    # these abbreviations slip past both — yet they commit something other than
+    # the staged doc-only set and must stay anchored.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/a.md", "# a\n")
+
+    assert run_hook(COMMIT_QUALITY, command, cwd=repo) == BLOCK
+
+
+def test_docs_pathspec_named_commit_still_requires_anchor(
+    on_branch: Callable[[str], Path],
+) -> None:
+    # A pathspec literally named "commit" must not read as a second subcommand
+    # token: only the FIRST `commit` is the subcommand; a later one is a bare
+    # pathspec and disqualifies the exemption like any other.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "commit", "tracked file named commit\n")
+    subprocess.run(
+        ["git", "commit", "-qm", "chore: seed file", "-m", "Refs #1"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+    )
+    (repo / "commit").write_text("dirty, NOT staged\n")
+    _stage(repo, "docs/a.md", "# a\n")
+
+    assert run_hook(COMMIT_QUALITY, 'git commit commit -m "docs: x"', cwd=repo) == BLOCK
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param('git commit "-a" -m "docs: x"', id="quoted-a"),
+        pytest.param('git commit "--amend" -m "docs: x"', id="quoted-amend"),
+        pytest.param('git commit -m "docs: x" "evil.sh"', id="quoted-pathspec"),
+    ],
+)
+def test_docs_quoted_flag_still_requires_anchor(
+    on_branch: Callable[[str], Path], command: str
+) -> None:
+    # The hook strips quoted strings before scanning for dangerous flags and
+    # bare pathspecs, so quoting a token ("-a", "--amend", "evil.sh") erases it
+    # from the scan — but the shell unquotes and git honors it, committing
+    # something other than the staged doc-only set. Quoting must not launder a
+    # disqualifying token.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/a.md", "# a\n")
+
+    assert run_hook(COMMIT_QUALITY, command, cwd=repo) == BLOCK
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param('git add -A && git commit -m "docs: x"', id="add-all"),
+        pytest.param('git add app.py; git commit -m "docs: x"', id="add-file"),
+        pytest.param('git stash pop; git commit -m "docs: x"', id="stash-pop"),
+        pytest.param('echo hi && git commit -m "docs: x"', id="echo"),
+    ],
+)
+def test_docs_pre_commit_chain_still_requires_anchor(
+    on_branch: Callable[[str], Path], command: str
+) -> None:
+    # Tokens BEFORE `commit` are never inspected, yet a chained prefix command
+    # (git add, stash pop, anything) runs first and mutates the index AFTER the
+    # hook reads it — the doc-only staged set the hook approved is not what the
+    # commit captures. Any chained prefix must disqualify the exemption.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/a.md", "# a\n")
+
+    assert run_hook(COMMIT_QUALITY, command, cwd=repo) == BLOCK
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(
+            'git commit -m "docs: x" -m "second paragraph"',
+            id="multi-m",
+        ),
+        pytest.param('git commit --message="docs: x"', id="message-eq"),
+        pytest.param(
+            'git commit -m "docs: x" --author="A B <a@b.c>"',
+            id="author",
+        ),
+    ],
+)
+def test_docs_multi_m_and_metadata_flags_keep_exemption(
+    on_branch: Callable[[str], Path], command: str
+) -> None:
+    # Retention pins for the upcoming stricter fix: legitimate message-only
+    # shapes (multi -m body, --message=, --author=) commit exactly the staged
+    # doc-only set and must KEEP the exemption.
+    repo = on_branch("claude/micro-docs")
+    _stage(repo, "docs/a.md", "# a\n")
+
+    assert run_hook(COMMIT_QUALITY, command, cwd=repo) == ALLOW
+
+
 # ── commit-gauntlet: lint scoping + RED carve-out ─────────
 
 ruff = pytest.mark.skipif(

@@ -7,7 +7,7 @@ Run a structured quality-gate pipeline and produce a pass/fail report before clo
 - Before committing or pushing
 - After finishing implementation (EXECUTE → VERIFY transition)
 - When the user says "verify", "check everything", "run quality gates", or "pre-flight"
-- The `land-task` gate is its hub-side last line — landing re-runs the full suite on the merged hub
+- The `land` gate is its hub-side last line — landing re-runs the full suite on the merged hub
 
 ## Gates
 

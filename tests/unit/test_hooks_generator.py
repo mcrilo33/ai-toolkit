@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import textwrap
 from pathlib import Path
@@ -505,3 +506,67 @@ class TestTodoLedgerRegistration:
     def test_nudge_registered_as_session_start(self) -> None:
         cfg = generate_claude(parse_hooks_metadata(str(REAL_META)))
         assert _claude_handler(cfg, "SessionStart", "todo-ledger-nudge.sh") is not None
+
+
+# ── rm-scope-guard registration against the REAL shared/hooks/metadata.yml ──
+# rm-scope-guard is a PreToolUse Bash guard like hub-guard: Claude gates it with
+# the same `Bash(rm *)` rule the user's ask backstop uses, and Cursor remaps it
+# onto beforeShellExecution with a command-regex matcher that fires on rm.
+
+
+class TestRmScopeGuardRegistration:
+    SCRIPT = "rm-scope-guard.sh"
+
+    def test_claude_if_is_bash_rm(self) -> None:
+        cfg = generate_claude(parse_hooks_metadata(str(REAL_META)))
+        guard = _claude_handler(cfg, "PreToolUse", self.SCRIPT)
+        assert guard is not None, "rm-scope-guard not registered for Claude PreToolUse"
+        assert guard.get("if") == "Bash(rm *)"
+
+    def test_tier_1(self) -> None:
+        meta = parse_hooks_metadata(str(REAL_META))
+        assert meta["rm-scope-guard"]["__defaults"]["tier"] == "1"
+
+    def test_cursor_wired_to_before_shell_execution(self) -> None:
+        cfg = generate_cursor(parse_hooks_metadata(str(REAL_META)))
+        guard = _cursor_entry(cfg, "beforeShellExecution", self.SCRIPT)
+        assert guard is not None, "rm-scope-guard not wired to Cursor beforeShellExecution"
+
+    def test_cursor_matcher_fires_on_rm_not_on_plain_git(self) -> None:
+        cfg = generate_cursor(parse_hooks_metadata(str(REAL_META)))
+        guard = _cursor_entry(cfg, "beforeShellExecution", self.SCRIPT)
+        assert guard is not None
+        pattern = re.compile(guard["matcher"])
+        assert pattern.search("rm -rf /tmp/x")
+        assert pattern.search("git status && rm /tmp/x")
+        assert not pattern.search("git status --short")
+
+
+# ── push-scope-guard registration against the REAL shared/hooks/metadata.yml ──
+# push-scope-guard is a tier-1 enforcement gate (like hub-guard, not advisory).
+# On Claude it shares git-push-review's if-clause; on Cursor it matches push
+# ONLY — it judges git refspecs, so `gh pr` is out of its scope.
+
+
+class TestPushScopeGuardRegistration:
+    def test_claude_wiring_matches_git_push_review(self) -> None:
+        cfg = generate_claude(parse_hooks_metadata(str(REAL_META)))
+        guard = _claude_handler(cfg, "PreToolUse", "push-scope-guard.sh")
+        review = _claude_handler(cfg, "PreToolUse", "git-push-review.sh")
+        assert guard is not None, "push-scope-guard not registered for Claude PreToolUse"
+        assert review is not None, "git-push-review baseline missing"
+        assert guard.get("if") == review.get("if") == "Bash(git push *)"
+
+    def test_is_tier_1(self) -> None:
+        meta = parse_hooks_metadata(str(REAL_META))
+        assert meta["push-scope-guard"]["__defaults"]["tier"] == "1"
+
+    def test_cursor_wiring_is_push_only(self) -> None:
+        cfg = generate_cursor(parse_hooks_metadata(str(REAL_META)))
+        guard = _cursor_entry(cfg, "beforeShellExecution", "push-scope-guard.sh")
+        review = _cursor_entry(cfg, "beforeShellExecution", "git-push-review.sh")
+        assert guard is not None, "push-scope-guard not wired to Cursor beforeShellExecution"
+        assert review is not None, "git-push-review cursor baseline missing"
+        assert guard["matcher"] == "git( +-[^ ]+| +-C +[^ ]+)* +push( |$)"
+        assert "gh +pr" in review["matcher"], "git-push-review baseline should cover gh pr"
+        assert guard["matcher"] != review["matcher"]

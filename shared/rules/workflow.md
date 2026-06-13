@@ -4,7 +4,7 @@
 
 **The hub starts and ends tasks; spokes only execute.** A task begins on the hub
 (`start-task` drafts the issue and spawns the worktree spoke) and ends on the hub
-(`land-task` merges, gates, ships, and tears down). The spoke's endpoint is its
+(`land` merges, gates, ships, and tears down). The spoke's endpoint is its
 **push** — there is no PR.
 
 ```
@@ -24,6 +24,33 @@ SPOKE:  SOURCE → DEFINE → EXECUTE → VERIFY → PUSH  (per subtask — solo
 | PUSH | spoke | Ship gate — push the subtask | Pushed branch + review evidence |
 | LAND | hub | Merge, re-gate, ship, tear down | Merged default branch, closed issue |
 
+## Task triage — the three lanes
+
+Before starting any task, the hub classifies it into one of three lanes (~10 seconds):
+
+| Lane | Executor | Contract | Gates |
+|------|----------|----------|-------|
+| 1 — Micro-spoke | Subagent in a temp worktree (no issue, no tmux window, no session) | The prompt | Hub diff-review before merge |
+| 2 — Express spoke | Full spoke via `worktree-new.sh <slug>` (ad-hoc, no issue) | Kickoff prompt | All push gates, single cycle, no ledger |
+| 3 — Full | Full spoke from a GitHub issue | The issue | Everything (current flow) |
+
+**Triage heuristic:**
+
+- Does the change touch executable behavior? **No** → Lane 1 — restricted to non-executable
+  paths only: docs, comments, wording. Lane 1 must never touch `scripts/`, `shared/hooks/`,
+  `tests/`, or skill scripts.
+- One subtask, obvious approach, small diff? → Lane 2.
+- Otherwise, when in doubt, or when the "why" should be findable later → Lane 3.
+
+The Task Lifecycle diagram above describes **Lane 3** — the full flow for anything
+substantial. Lanes 1 and 2 shed orchestration overhead (no issue, no ledger for lane 2; no
+worktree, no issue, no tmux for lane 1), but **never shed gates**: lane 2 runs all push
+gates in a single cycle; lane 1's gate is the hub's diff review before `--local` landing.
+
+`docs:`/`chore:` commits whose entire staged set is non-executable documentation pass the
+commit-anchor gate without an issue anchor — this is the sanctioned no-issue commit path
+for lanes 1 and 2. See the `commit-quality` hook for the exact file-set rules.
+
 ## Commands
 
 | Command | Skill | Purpose |
@@ -31,7 +58,8 @@ SPOKE:  SOURCE → DEFINE → EXECUTE → VERIFY → PUSH  (per subtask — solo
 | `/hub` | `hub` | Survey what is in flight, propose the next move (hub) |
 | `/source` | `source-task` | Anchor to the issue; branch creation only as non-hub fallback |
 | `/cycle` | `solo-cycle` | Solo per-subtask cycle: anchor, RED, GREEN, review, push |
-| `/land <id>` | `land-task` | Land a finished task from the hub: merge, suite, push, teardown |
+| `/land <id>` | `land` | Land a finished task from the hub: merge, suite, push, teardown |
+| `/land <branch> --local` | `land` | Land a micro-spoke (lane 1): skips upstream guards, merges the local-only branch and ships, no issue to close |
 
 ## Phase Checklists
 
@@ -103,7 +131,7 @@ Run the `verification-loop` skill before the subtask's push. All gates must pass
 
 ### LAND — End the task (hub only)
 
-Run `/land <id>` (the `land-task` skill) from the hub once the spoke has pushed:
+Run `/land <id>` (the `land` skill) from the hub once the spoke has pushed:
 
 ```
 - [ ] Spoke branch fully pushed; hub clean on the default branch
@@ -160,7 +188,7 @@ SOURCE → DEFINE → EXECUTE → VERIFY → PUSH — per subtask; the hub lands
 - `brainstorming` — Spec refinement for DEFINE (use before context-map/planner on ambiguous work)
 - `start-task` — START step automation (hub: issue + worktree + seeded spoke)
 - `source-task` — SOURCE step automation
-- `land-task` — LAND step automation (hub: merge, suite, ship, teardown)
+- `land` — LAND step automation (hub: merge, suite, ship, teardown)
 - `solo-cycle` — Per-subtask cycle for solo, PR-less work
 - `verification-loop` — VERIFY step automation
 - `tdd-workflow` — TDD guidance for DEFINE

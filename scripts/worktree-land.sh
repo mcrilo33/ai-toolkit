@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 #
 # worktree-land.sh — land a finished task branch from the hub (main checkout).
-# The deterministic half of the land-task skill (`/land <id>`): the hub starts
+# The deterministic half of the land skill (`/land <id>`): the hub starts
 # and ends tasks; spokes only execute. Run it FROM the hub, on the default
 # branch, after the spoke has pushed — never from inside a worktree.
 #
 # Usage:
-#   scripts/worktree-land.sh <issue|slug|branch|path> [--skip-tests] [--keep-branch] [--test-cmd <cmd>]
+#   scripts/worktree-land.sh <issue|slug|branch|path> [--skip-tests] [--keep-branch] [--local] [--test-cmd <cmd>]
 #
 #   <issue|slug|branch|path>  anything that identifies the task worktree
 #   --skip-tests              land without running the suite on the merged hub
 #   --keep-branch             keep the branch after landing (passed to worktree-done.sh)
+#   --local                   micro-spoke path: skip upstream guards and accept a bare
+#                             local branch with no registered worktree (the hub's diff
+#                             review is the gate; merge+push is what ships the work)
 #   --test-cmd <cmd>          suite command (default: `pytest -q` when pytest exists)
 #
 # Sequence, each step aborting safely on failure:
@@ -30,21 +33,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET=""
 SKIP_TESTS=""
 KEEP_BRANCH=""
+LOCAL=""
 TEST_CMD=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --skip-tests)  SKIP_TESTS=1; shift ;;
     --keep-branch) KEEP_BRANCH=1; shift ;;
+    --local)       LOCAL=1; shift ;;
     --test-cmd)    [ "$#" -ge 2 ] || wt_die "--test-cmd needs a value"; TEST_CMD="$2"; shift 2 ;;
     --test-cmd=*)  TEST_CMD="${1#--test-cmd=}"; shift ;;
-    -*)            wt_die "unknown option: $1 (supported: --skip-tests, --keep-branch, --test-cmd)" ;;
+    -*)            wt_die "unknown option: $1 (supported: --skip-tests, --keep-branch, --local, --test-cmd)" ;;
     *)
       [ -z "$TARGET" ] || wt_die "unexpected extra argument: $1"
       TARGET="$1"; shift
       ;;
   esac
 done
-[ -n "$TARGET" ] || wt_die "usage: worktree-land.sh <issue|slug|branch|path> [--skip-tests] [--keep-branch] [--test-cmd <cmd>]"
+[ -n "$TARGET" ] || wt_die "usage: worktree-land.sh <issue|slug|branch|path> [--skip-tests] [--keep-branch] [--local] [--test-cmd <cmd>]"
 
 # --- guards: the hub ----------------------------------------------------------
 git rev-parse --git-dir >/dev/null 2>&1 || wt_die "run this from inside your checkout (cd into the repo first)"
@@ -75,35 +80,59 @@ if [ -z "$SKIP_TESTS" ] && [ -z "$TEST_CMD" ]; then
 fi
 
 # --- guards: the spoke ----------------------------------------------------------
-if ! WT_DIR="$(wt_resolve "$TARGET" "$REPO_ROOT")"; then
-  wt_warn "no single worktree matches '$TARGET'. Existing task worktrees:"
-  wt_print_worktrees "$REPO_ROOT"
-  wt_die "pass one of the paths above, or its issue number / slug / branch."
-fi
+WT_DIR=""
 WT_BRANCH=""
-while IFS=$'\t' read -r wt br; do
-  if [ "$wt" = "$WT_DIR" ]; then
-    WT_BRANCH="$br"
-    break
+if WT_DIR="$(wt_resolve "$TARGET" "$REPO_ROOT")"; then
+  # Normal worktree path: resolve branch from the registered worktree list.
+  while IFS=$'\t' read -r wt br; do
+    if [ "$wt" = "$WT_DIR" ]; then
+      WT_BRANCH="$br"
+      break
+    fi
+  done < <(wt_task_worktrees "$REPO_ROOT")
+  [ -n "$WT_BRANCH" ] || wt_die "worktree $WT_DIR is on a detached HEAD — nothing to land"
+
+  # Untracked files count as dirty: `git worktree remove` would refuse them later,
+  # and a stray WIP file is exactly what landing must not destroy.
+  [ -z "$(git -C "$WT_DIR" status --porcelain)" ] \
+    || wt_die "worktree $WT_DIR has uncommitted or untracked changes — finish or stash them on the spoke"
+else
+  # wt_resolve failed — no registered worktree matched TARGET.
+  if [ -n "$LOCAL" ] && git show-ref --verify --quiet "refs/heads/$TARGET"; then
+    # --local + bare local branch: the temp worktree is already gone; land directly.
+    # Never the default branch itself — a typo'd target would otherwise "land" as
+    # a no-op self-merge that exits 0 and then advises deleting it by hand.
+    [ "$TARGET" != "$DEFAULT" ] || wt_die "refusing to land the default branch '$DEFAULT' into itself"
+    WT_BRANCH="$TARGET"
+    WT_DIR=""
+  else
+    HINT="pass one of the paths above, or its issue number / slug / branch."
+    [ -n "$LOCAL" ] && HINT="$HINT (--local also accepts a full local branch name)"
+    wt_warn "no single worktree matches '$TARGET'. Existing task worktrees:"
+    wt_print_worktrees "$REPO_ROOT"
+    wt_die "$HINT"
   fi
-done < <(wt_task_worktrees "$REPO_ROOT")
-[ -n "$WT_BRANCH" ] || wt_die "worktree $WT_DIR is on a detached HEAD — nothing to land"
+fi
 
-# Untracked files count as dirty: `git worktree remove` would refuse them later,
-# and a stray WIP file is exactly what landing must not destroy.
-[ -z "$(git -C "$WT_DIR" status --porcelain)" ] \
-  || wt_die "worktree $WT_DIR has uncommitted or untracked changes — finish or stash them on the spoke"
-
-git fetch origin --quiet 2>/dev/null \
-  || wt_warn "fetch failed — ahead/behind checks use the last-known remote state"
-UPSTREAM="$(git rev-parse --symbolic-full-name "${WT_BRANCH}@{upstream}" 2>/dev/null || true)"
-[ -n "$UPSTREAM" ] || wt_die "branch $WT_BRANCH has never been pushed — the spoke's push is its ship gate"
-AHEAD="$(git rev-list --count "${UPSTREAM}..${WT_BRANCH}")"
-[ "$AHEAD" -eq 0 ] || wt_die "branch $WT_BRANCH is $AHEAD commit(s) ahead of $UPSTREAM — push from the spoke first"
-# Behind is just as fatal as ahead: landing a reduced local branch would later
-# prune the remote ref and silently lose the commits only the remote still has.
-BEHIND="$(git rev-list --count "${WT_BRANCH}..${UPSTREAM}")"
-[ "$BEHIND" -eq 0 ] || wt_die "branch $WT_BRANCH is $BEHIND commit(s) behind $UPSTREAM — the remote has work this checkout lacks; reconcile on the spoke first"
+if [ -z "$LOCAL" ]; then
+  git fetch origin --quiet 2>/dev/null \
+    || wt_warn "fetch failed — ahead/behind checks use the last-known remote state"
+  # Upstream guards: the spoke's push is its ship gate.
+  UPSTREAM="$(git rev-parse --symbolic-full-name "${WT_BRANCH}@{upstream}" 2>/dev/null || true)"
+  [ -n "$UPSTREAM" ] || wt_die "branch $WT_BRANCH has never been pushed — the spoke's push is its ship gate"
+  AHEAD="$(git rev-list --count "${UPSTREAM}..${WT_BRANCH}")"
+  [ "$AHEAD" -eq 0 ] || wt_die "branch $WT_BRANCH is $AHEAD commit(s) ahead of $UPSTREAM — push from the spoke first"
+  # Behind is just as fatal as ahead: landing a reduced local branch would later
+  # prune the remote ref and silently lose the commits only the remote still has.
+  BEHIND="$(git rev-list --count "${WT_BRANCH}..${UPSTREAM}")"
+  [ "$BEHIND" -eq 0 ] || wt_die "branch $WT_BRANCH is $BEHIND commit(s) behind $UPSTREAM — the remote has work this checkout lacks; reconcile on the spoke first"
+else
+  # --local is for micro-spokes, which never push. A branch WITH an upstream is
+  # not a micro-spoke: skipping the behind guard could merge a reduced local tip
+  # and later prune the remote ref, losing the commits only the remote still has.
+  ! git rev-parse --symbolic-full-name "${WT_BRANCH}@{upstream}" >/dev/null 2>&1 \
+    || wt_die "branch $WT_BRANCH has an upstream — not a micro-spoke; land it without --local"
+fi
 
 # Issue number = leading number of the branch slug (feature/42-foo → 42);
 # ad-hoc branches have none and skip the issue close.
@@ -116,7 +145,7 @@ PRE_SHA="$(git rev-parse HEAD)"
 echo "→ merging $WT_BRANCH into $DEFAULT"
 if ! git merge --no-edit "$WT_BRANCH"; then
   git merge --abort 2>/dev/null || true
-  wt_die "merge of $WT_BRANCH conflicts with $DEFAULT — rebase the spoke on $DEFAULT, push, and re-run"
+  wt_die "merge of $WT_BRANCH conflicts with $DEFAULT — rebase the branch on $DEFAULT (on the spoke, then push, when it has one) and re-run"
 fi
 MERGED_SHA="$(git rev-parse HEAD)"
 
@@ -130,7 +159,7 @@ else
     wt_warn "suite FAILED on the merged $DEFAULT — rolling back: git reset --keep $PRE_SHA"
     git reset --keep "$PRE_SHA" \
       || wt_die "rollback failed — hub is still on the merged commit; reset by hand: git reset --keep $PRE_SHA"
-    wt_die "landing aborted; nothing was pushed. Fix on the spoke, push, and re-run."
+    wt_die "landing aborted; nothing was pushed. Fix on the branch (on the spoke, then push, when it has one) and re-run."
   fi
   SUITE_RESULT="passed"
 fi
@@ -140,7 +169,14 @@ echo "→ pushing $DEFAULT to origin"
 git push origin "$DEFAULT" \
   || wt_die "push failed — the merge is local-only. Fix the remote and re-run, or back out: git reset --keep $PRE_SHA"
 
-bash "$SCRIPT_DIR/worktree-done.sh" "$WT_DIR" ${KEEP_BRANCH:+--keep-branch}
+if [ -n "$WT_DIR" ]; then
+  bash "$SCRIPT_DIR/worktree-done.sh" "$WT_DIR" ${KEEP_BRANCH:+--keep-branch}
+elif [ -z "$KEEP_BRANCH" ]; then
+  # Bare-branch mode: the worktree is already gone; just delete the merged local branch.
+  # Safe — just merged; warn rather than abort if deletion fails.
+  git branch -d "$WT_BRANCH" \
+    || wt_warn "couldn't delete local branch $WT_BRANCH — delete it by hand: git branch -d $WT_BRANCH"
+fi
 
 if [ -n "$ISSUE" ]; then
   if command -v gh >/dev/null 2>&1; then

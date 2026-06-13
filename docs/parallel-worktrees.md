@@ -10,6 +10,11 @@ One invariant makes the whole flow clean: **the main checkout always stays on `m
 and never holds task work.** It is your launcher and merge hub. Every task lives in its
 own worktree, on its own branch, driven by its own Claude in its own tmux window.
 
+The mirror invariant governs pushes: **a spoke pushes only its own branch** — its
+`origin/<branch>` is ephemeral staging, deleted at teardown once merged — and **`main`
+is published exclusively from the hub**. The `push-scope-guard` hook enforces both
+directions (hard deny on Cursor, advisory elsewhere).
+
 ```
 ~/Repos/ai-toolkit          MAIN CHECKOUT — always on `main`. Launch + merge here.
 │
@@ -93,8 +98,12 @@ Each run automatically:
 
 1. creates `~/Repos/ai-toolkit-<tag>` on branch `feature/<id>-<slug>`,
 2. copies the gitignored `.claude/` runtime config (skills + hooks + gates) into it,
-3. runs `code --add` to fold the worktree into your single VS Code window,
-4. opens a new tmux window in session `0` (the spoke home), named after the branch
+3. seeds `.claude/settings.local.json` with the two narrow allow rules for the
+   spoke's own-branch push (`git push [-u] origin <branch>`) — the ship push is
+   enforced by the push gates, so it skips the permission ask; every other push
+   stays gated,
+4. runs `code --add` to fold the worktree into your single VS Code window,
+5. opens a new tmux window in session `0` (the spoke home), named after the branch
    leaf (e.g. `42-fix-crash`), pinned against renames, running `claude` in the
    worktree — and prints the exact jump command to reach it.
 
@@ -110,7 +119,7 @@ worktree**, so you review every task's diff without leaving the window.
 ### 3. Land
 
 When a task's branch is committed and pushed, land it from the hub — `/land 42` in the
-hub session (the `land-task` skill), or directly:
+hub session (the `land` skill), or directly:
 
 ```bash
 cd ~/Repos/ai-toolkit            # merge hub, already on main
@@ -203,6 +212,20 @@ per-task session with no client attached. Each run prints the exact jump command
 `tmux attach -t 0 \; select-window -t '0:<window>'` from a plain shell. Inside
 session `0`, switch between task windows with `prefix` + number.
 
+The agent launch (pinned model/effort plus the seeded `--prompt`) is passed to
+`new-window` as the window's own shell command — never typed into an interactive
+shell, where `send-keys` raced zsh init and lost the trailing Enter (issue #15).
+The command ends with `; exec $SHELL`, so the window drops back to a shell prompt
+instead of closing when claude exits.
+
+To re-seed a prompt into an **existing** pane manually (e.g. a claude sitting at
+its input without the kickoff), send the text literally and the Enter separately:
+
+```bash
+tmux send-keys -t '0:<window>' -l '/source'   # -l = literal text, no key-name parsing
+tmux send-keys -t '0:<window>' Enter          # separate Enter, not a trailing C-m
+```
+
 ## Notes and gotchas
 
 - **`.claude/` is copied, not symlinked.** A plain `git worktree add` checks out only
@@ -218,6 +241,56 @@ session `0`, switch between task windows with `prefix` + number.
   + number), not a split pane.
 - **Removal needs `--force` only when dirty.** Because `.claude/` is gitignored, a copied
   config does not make the worktree dirty, so a clean task removes without `--force`.
+
+## Task triage — three lanes
+
+Every task is classified on the hub (~10 seconds) before any worktree or issue is created:
+
+| Lane | Executor | Contract | Gates |
+|------|----------|----------|-------|
+| 1 — Micro-spoke | Subagent in a temp worktree (no issue, no tmux window, no session) | The prompt | Hub diff-review before merge |
+| 2 — Express spoke | Full spoke via `worktree-new.sh <slug>` (ad-hoc, no issue) | Kickoff prompt | All push gates, single cycle, no ledger |
+| 3 — Full | Full spoke from a GitHub issue | The issue | Everything (current flow) |
+
+**Triage heuristic:** Does the change touch executable behavior? No → Lane 1. One subtask,
+obvious approach, small diff? → Lane 2. Otherwise → Lane 3.
+
+### Micro-spoke lifecycle (lane 1)
+
+Lane 1 is restricted to **non-executable paths only**: docs, comments, and wording.
+It must never touch `scripts/`, `shared/hooks/`, `tests/`, or any skill script.
+
+1. Hub spawns a subagent with `isolation: worktree` and a tight prompt (files, exact
+   change, commit as `docs:`/`chore:` with plain `git add <files>` + standalone
+   `git commit -m`, return branch + diff summary).
+2. Subagent edits and commits inside the temp worktree. The `docs:`/`chore:` commit
+   passes the `commit-quality` no-issue-anchor exemption because the entire staged set is
+   non-executable documentation outside the restricted directories.
+3. Hub reviews the diff.
+4. Hub lands it:
+
+   ```bash
+   scripts/worktree-land.sh <branch> --local
+   ```
+
+   `--local` skips upstream guards (micro-spokes never push to origin), accepts a bare
+   local branch whose temp worktree may already be gone, refuses any branch that has an
+   upstream ("not a micro-spoke"), and refuses the default branch itself. No issue to
+   close. The branch is deleted after the merge.
+
+5. Cleanup: nothing is left behind — no branch, no worktree, no tmux window. None were
+   created beyond the temp worktree managed by `isolation: worktree`.
+
+**Hub-guard note.** `shared/hooks/hub-guard.sh` is path-anchored: it denies only on the
+main checkout on the default branch and is a no-op in any linked worktree. A
+worktree-isolated subagent therefore passes it by construction — no carve-outs exist or
+are needed.
+
+**No-issue commit path.** `docs:`/`chore:` commits whose entire staged set is
+non-executable documentation (`.md`/`.markdown`/`.txt`/`.rst`, regular file mode,
+outside `scripts/`, `shared/hooks/`, `tests/`, and any `*/scripts/` dir) pass the
+`commit-quality` gate without an issue anchor — see that hook for the exact file-set
+rules. This is the sanctioned path for lanes 1 and 2.
 
 ## Related
 

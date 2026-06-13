@@ -6,7 +6,7 @@ enforcement fires on `git commit` and `git push`. The cycle repeats per subtask
 within a session.
 
 Ending the task is not the spoke's job: once the final subtask is pushed, the **hub**
-lands it with `/land <id>` (the `land-task` skill) — merge, suite, ship, teardown.
+lands it with `/land <id>` (the `land` skill) — merge, suite, ship, teardown.
 
 ## The cycle (per subtask)
 
@@ -16,7 +16,7 @@ lands it with `/land <id>` (the `land-task` skill) — merge, suite, ship, teard
 | 2 | RED | Failing test committed with `Tested-RED:` trailer | `red-proof-verify` (runs the node; blocks the commit if it passes) |
 | 3 | GREEN | Implementation commit; tests pass | `commit-gauntlet` (lint/typecheck on changed lines), `secrets-scan` |
 | 4 | REVIEW | APPROVE artifact `.review/<diff-hash>.json` exists | Written by the `code-review` agent on APPROVE |
-| 5 | PUSH | `git push` succeeds — work is shipped | `red-proof-warn`, `reviewer-sep-warn`, `todo-ledger-warn`, `git-push-review` |
+| 5 | PUSH | `git push` succeeds — work is shipped | `push-scope-guard`, `red-proof-warn`, `reviewer-sep-warn`, `todo-ledger-warn`, `git-push-review` |
 
 Then: next subtask → back to step 1 (or step 2 if it is the same issue).
 
@@ -59,6 +59,11 @@ the exact diff — any new commit invalidates the artifact.
 `git push` is the ship gate. `red-proof-warn`, `reviewer-sep-warn`, and
 `git-push-review` all fire here; on Cursor they hard-block. The push only
 succeeds when all evidence is in place.
+
+Push only the task's own branch — `git push [-u] origin <branch>`.
+`push-scope-guard` denies a spoke push whose refspec touches the default
+branch or another task's ref: the spoke's origin branch is ephemeral staging,
+and `main` is published exclusively from the hub.
 
 ## The session ledger (Tasks or TodoWrite)
 
@@ -112,6 +117,6 @@ The ledger is ephemeral session scratch; the GitHub issue is the durable contrac
 
 - `source-task` — anchor: fetch the issue and confirm the branch
 - `tdd-workflow` — RED/GREEN/REFACTOR guidance
-- `land-task` — hub-side `/land <id>` that ends the task once the last subtask is pushed
+- `land` — hub-side `/land <id>` that ends the task once the last subtask is pushed
 - `verification-loop` — deeper VERIFY pass before the review
 - `git-commit` — commit message format
