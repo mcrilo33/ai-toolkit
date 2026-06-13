@@ -9,7 +9,7 @@
 #   scripts/worktree-land.sh <issue|slug|branch|path> [--skip-tests] [--keep-branch] [--local] [--force-land] [--test-cmd <cmd>]
 #
 #   <issue|slug|branch|path>  anything that identifies the task worktree
-#   --skip-tests              land without running the suite on the merged hub
+#   --skip-tests              skip the pre-push test gate (threads TEST_SELECT_SKIP=1)
 #   --keep-branch             keep the branch after landing (passed to worktree-done.sh)
 #   --local                   micro-spoke path: skip upstream guards and accept a bare
 #                             local branch with no registered worktree (the hub's diff
@@ -17,14 +17,21 @@
 #   --force-land              land a numbered branch that carries no ready/<issue>
 #                             completion marker (express/ad-hoc branches that never
 #                             emit one); the marker guard is otherwise mandatory
-#   --test-cmd <cmd>          suite command (default: `pytest -q` when pytest exists)
+#   --test-cmd <cmd>          run <cmd> as the gate instead of the tiered selection
+#                             (threads TEST_SELECT_CMD to the pre-push hook)
+#
+# The pre-push hook is the SINGLE owner of test execution (issue #19): landing
+# merges locally and pushes main, and that push's pre-push hook runs the tiered,
+# diff-aware suite — "one push = one run". Landing no longer runs pytest itself;
+# --skip-tests/--test-cmd are threaded to the hook via TEST_SELECT_*.
 #
 # Sequence, each step aborting safely on failure:
 #   guards  hub on default branch + clean; worktree resolved, clean, fully pushed;
 #           numbered branches carry a ready/<issue> marker at their tip (issue #16)
 #   merge   --ff-only when possible, else a merge commit (plain `git merge`)
-#   gate    full suite on the merged hub; on failure `git reset --keep` back
-#   ship    push origin <default> → worktree-done.sh → `gh issue close` (numeric ids)
+#   ship    push origin <default> — the pre-push hook is the test gate; a rejected
+#           push (gate failed or remote refused) rolls back `git reset --keep`.
+#           Then worktree-done.sh → `gh issue close` (numeric ids)
 #   tmux    kill the task's window in session 0 when its pane path is gone
 #
 set -euo pipefail
@@ -33,6 +40,15 @@ WT_PROG="worktree-land"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=worktree-lib.sh
 . "$SCRIPT_DIR/worktree-lib.sh"
+
+# --- guard: role, not directory (issue #26) -------------------------------------
+# A spoke's claude has full filesystem access, so it can cd into the main checkout
+# and slip past a "must run from the hub" directory check. worktree-new.sh stamps
+# the spoke session with WT_SPOKE; that marker rides every command it runs, so
+# refuse here before any work. No override flag — an escape hatch is exactly how a
+# spoke would self-land again. The hub is user-started and never carries WT_SPOKE.
+[ -z "${WT_SPOKE:-}" ] \
+  || wt_die "this is the spoke session for '$WT_SPOKE' — lands run on the hub. Emit your ready/<issue> marker (your push is your ship gate); the hub will land it."
 
 # Span start clock for the lifecycle/land span emitted after a successful merge.
 WT_T0="$(wt_now_ms)"
@@ -81,12 +97,6 @@ HUB_BRANCH="$(git symbolic-ref --short -q HEAD || true)"
   || wt_die "hub is on '${HUB_BRANCH:-detached HEAD}' — land from the default branch '$DEFAULT'"
 [ -z "$(git status --porcelain -uno)" ] \
   || wt_die "hub checkout is dirty — commit or stash before landing"
-
-# Resolve the suite command BEFORE merging, so a missing one can never strand a merge.
-if [ -z "$SKIP_TESTS" ] && [ -z "$TEST_CMD" ]; then
-  command -v pytest >/dev/null 2>&1 && TEST_CMD="pytest -q"
-  [ -n "$TEST_CMD" ] || wt_die "no test command found — pass --test-cmd <cmd> or --skip-tests"
-fi
 
 # --- guards: the spoke ----------------------------------------------------------
 WT_DIR=""
@@ -177,25 +187,38 @@ if ! git merge --no-edit "$WT_BRANCH"; then
 fi
 MERGED_SHA="$(git rev-parse HEAD)"
 
-# --- gate: full suite on the merged hub ------------------------------------------
+# --- ship: push main; the pre-push hook is the single test gate (issue #19) -------
+# --skip-tests / --test-cmd are threaded to the hook via TEST_SELECT_*, so the
+# hook stays the single executor. A rejected push — the gate failing, or a remote
+# refusal — rolls the merge back, so a failed land always leaves a clean hub.
 if [ -n "$SKIP_TESTS" ]; then
   SUITE_RESULT="skipped (--skip-tests)"
-  echo "→ skipping test suite (--skip-tests)"
+elif [ -n "$TEST_CMD" ]; then
+  SUITE_RESULT="via pre-push hook (--test-cmd: $TEST_CMD)"
 else
-  echo "→ running test suite: $TEST_CMD"
-  if ! bash -c "$TEST_CMD"; then
-    wt_warn "suite FAILED on the merged $DEFAULT — rolling back: git reset --keep $PRE_SHA"
-    git reset --keep "$PRE_SHA" \
-      || wt_die "rollback failed — hub is still on the merged commit; reset by hand: git reset --keep $PRE_SHA"
-    wt_die "landing aborted; nothing was pushed. Fix on the branch (on the spoke, then push, when it has one) and re-run."
-  fi
-  SUITE_RESULT="passed"
+  SUITE_RESULT="via pre-push hook (tiered)"
 fi
-
-# --- ship -------------------------------------------------------------------------
-echo "→ pushing $DEFAULT to origin"
-git push origin "$DEFAULT" \
-  || wt_die "push failed — the merge is local-only. Fix the remote and re-run, or back out: git reset --keep $PRE_SHA"
+# The pre-push hook IS the test gate (issue #19). If it is not installed here,
+# the push runs NOTHING — warn so a green land is never mistaken for a tested
+# one, and report it honestly rather than claiming the gate ran.
+if [ -z "$SKIP_TESTS" ]; then
+  PREPUSH_HOOK="$(git rev-parse --git-path hooks/pre-push 2>/dev/null || true)"
+  if [ -z "$PREPUSH_HOOK" ] || [ ! -x "$PREPUSH_HOOK" ]; then
+    wt_warn "no executable pre-push hook here — the test gate will NOT run on this push; install it with scripts/install-git-hooks.sh"
+    SUITE_RESULT="NOT RUN — no pre-push hook installed"
+  fi
+fi
+echo "→ pushing $DEFAULT to origin (the pre-push hook runs the test gate)"
+if ! (
+  if [ -n "$SKIP_TESTS" ]; then export TEST_SELECT_SKIP=1; fi
+  if [ -n "$TEST_CMD" ]; then export TEST_SELECT_CMD="$TEST_CMD"; fi
+  git push origin "$DEFAULT"
+); then
+  wt_warn "push rejected (pre-push test gate or remote) — rolling back: git reset --keep $PRE_SHA"
+  git reset --keep "$PRE_SHA" \
+    || wt_die "rollback failed — hub is still on the merged commit; reset by hand: git reset --keep $PRE_SHA"
+  wt_die "landing aborted; nothing was pushed. Fix on the branch (push from the spoke when it has one) and re-run."
+fi
 
 # --- telemetry: lifecycle/land span ----------------------------------------------
 # Emit AFTER the merge+push succeeds but BEFORE teardown, while the worktree (and

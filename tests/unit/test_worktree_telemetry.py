@@ -74,6 +74,11 @@ def _tele_env(telemetry_dir: Path | None, *, enabled: bool = True) -> dict[str, 
     for var in ("AI_TOOLKIT_TELEMETRY", "AI_TOOLKIT_TELEMETRY_DIR", "AI_TOOLKIT_WORKFLOW_REV"):
         env.pop(var, None)
     env.pop("TMUX", None)
+    # These lifecycle tests model the HUB running worktree-done/land (the only
+    # role those scripts proceed in). A spoke session carries WT_SPOKE (issue
+    # #26) and the scripts refuse under it, so drop any inherited marker — e.g.
+    # when the suite runs from a spoke's pre-push gate.
+    env.pop("WT_SPOKE", None)
     if enabled:
         env["AI_TOOLKIT_TELEMETRY"] = "1"
     if telemetry_dir is not None:
