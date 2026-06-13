@@ -118,8 +118,8 @@ worktree**, so you review every task's diff without leaving the window.
 
 ### 3. Land
 
-When a task's branch is committed and pushed, land it from the hub — `/land 42` in the
-hub session (the `land` skill), or directly:
+When a task's branch is committed, pushed, **and signalled complete**, land it from the
+hub — `/land 42` in the hub session (the `land` skill), or directly:
 
 ```bash
 cd ~/Repos/ai-toolkit            # merge hub, already on main
@@ -127,13 +127,20 @@ scripts/worktree-land.sh 42      # guards → merge (ff when possible) → full 
                                  # push origin main → teardown → close issue #42
 ```
 
+Completion is explicit: a per-subtask push is indistinguishable from a finished issue,
+so a numbered branch must carry a `ready/<issue>` git tag at its tip — the marker the
+spoke emits after its FINAL subtask's push (`git tag ready/42 && git push origin
+ready/42`). Without it the land refuses (the branch reads `pushed (in progress)` on the
+dashboard); pass `--force-land` only for an express/ad-hoc branch that never carries
+one. A successful land consumes the marker (deletes the local + remote tag).
+
 One command runs the whole landing: it refuses with a precise reason unless the hub is
-clean on `main` and the spoke is clean and fully pushed; a failing suite rolls `main`
-back (`git reset --keep`) with nothing pushed. On success it calls `worktree-done.sh`
-for the teardown mirror of creation — `code --remove` drops the folder from the review
-window, and the now-merged branch is pruned local + origin (`--keep-branch` to keep it).
-An unmerged branch is never pruned. It then closes the issue via `gh` and kills the
-task's stranded tmux window.
+clean on `main` and the spoke is clean, fully pushed, and marked ready; a failing suite
+rolls `main` back (`git reset --keep`) with nothing pushed. On success it calls
+`worktree-done.sh` for the teardown mirror of creation — `code --remove` drops the
+folder from the review window, and the now-merged branch is pruned local + origin
+(`--keep-branch` to keep it). An unmerged branch is never pruned. It then closes the
+issue via `gh` and kills the task's stranded tmux window.
 
 ## `worktree-new.sh` reference
 

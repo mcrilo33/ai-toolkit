@@ -5,8 +5,10 @@ reviewed, pushed unit of work. There is no PR — the push IS the ship gate; all
 enforcement fires on `git commit` and `git push`. The cycle repeats per subtask
 within a session.
 
-Ending the task is not the spoke's job: once the final subtask is pushed, the **hub**
-lands it with `/land <id>` (the `land` skill) — merge, suite, ship, teardown.
+Ending the task is not the spoke's job: once the final subtask is pushed **and the
+ready-to-land marker is emitted**, the **hub** lands it with `/land <id>` (the `land`
+skill) — merge, suite, ship, teardown. The marker is what tells the hub the whole
+issue is done, not just one subtask (see [The final-push marker](#the-final-push-marker)).
 
 ## The cycle (per subtask)
 
@@ -64,6 +66,32 @@ Push only the task's own branch — `git push [-u] origin <branch>`.
 `push-scope-guard` denies a spoke push whose refspec touches the default
 branch or another task's ref: the spoke's origin branch is ephemeral staging,
 and `main` is published exclusively from the hub.
+
+## The final-push marker
+
+A per-subtask push looks identical to task completion — clean tree, branch pushed.
+The hub can't tell "subtask 1 of 3 shipped" from "issue done" by branch state alone,
+so completion must be **signalled explicitly**. After the **FINAL** subtask's push —
+and only then — emit a `ready/<issue>` git tag at the branch tip:
+
+```bash
+git tag ready/<issue>
+git push origin ready/<issue>
+```
+
+This is the whole-issue ship gate, distinct from the per-subtask push gate. The hub's
+`hub-status.sh` flips the branch from `pushed (in progress)` to `pushed → mergeable`
+only once the marker points at the tip, and `worktree-land.sh` refuses to land until
+then. So:
+
+- Emit the marker **once**, after the last subtask — never after an intermediate one.
+- If you push more work after tagging, the marker goes stale (sha ≠ tip); re-tag at the
+  new tip (`git tag -f ready/<issue> && git push -f origin ready/<issue>`).
+- Ad-hoc/express (lane-2, non-numbered) branches carry no marker — their single push IS
+  completion, and the hub lands them with `--force-land`.
+
+The hub consumes the marker on landing (deletes the local + remote tag), so it can't
+re-flag a future branch that reuses the issue number.
 
 ## The session ledger (TodoWrite)
 

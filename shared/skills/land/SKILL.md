@@ -11,7 +11,11 @@ it: pick the target, confirm, run, then report and refresh the hub picture.
 
 - Run from the **hub** (main checkout) on the default branch, with a clean tree —
   the script aborts otherwise, with the precise reason.
-- The spoke has pushed (`hub-status.sh` shows the branch `pushed → mergeable`).
+- The spoke has finished and signalled it: `hub-status.sh` shows the branch
+  `pushed → mergeable`, which requires a `ready/<issue>` completion marker at the tip.
+  A branch reading `pushed (in progress)` has pushed a subtask but isn't done — landing
+  it refuses (use `--force-land` only for a branch that legitimately never carries a
+  marker, e.g. an ad-hoc/express branch).
 - `gh` authenticated for the issue close (degrades to a warning without it).
 
 ## Workflow
@@ -38,16 +42,20 @@ scripts/worktree-land.sh <id>
 | `--keep-branch` | Keep the local + remote branch after landing |
 | `--test-cmd <cmd>` | Override the suite command (default `pytest -q` when pytest exists) |
 | `--local` | Micro-spoke landing: skips upstream guards; accepts a bare local branch with no upstream; refuses any branch that has an upstream and refuses the default branch itself |
+| `--force-land` | Land a numbered branch that carries no `ready/<issue>` marker (an express/ad-hoc branch that never emits one); the marker guard is otherwise mandatory |
 
 The script runs, in order, aborting safely at the first failure:
 
 1. **Guards** — hub on a clean default branch; worktree resolved, clean, fully pushed
-   (neither ahead of nor behind its upstream).
+   (neither ahead of nor behind its upstream); for a numbered branch, a `ready/<issue>`
+   marker points at the tip (unless `--force-land`).
 2. **Merge** — fast-forward when possible, else a merge commit.
 3. **Gate** — full suite on the merged hub; on failure it rolls back with
    `git reset --keep` and nothing is pushed.
 4. **Ship** — `git push origin <default>` → `worktree-done.sh` (removes the worktree,
-   prunes the merged branch local + origin) → `gh issue close <id>` with a ship comment.
+   prunes the merged branch local + origin) → consume the `ready/<issue>` marker
+   (delete the local + remote tag, so it can't re-flag a future branch) →
+   `gh issue close <id>` with a ship comment.
 5. **tmux** — kills the task's session-0 window when its pane's directory vanished with
    the worktree; live windows are kept.
 
@@ -61,6 +69,7 @@ The script's abort message names the failed guard. Typical moves:
 | Worktree has uncommitted changes | Spoke finishes its cycle first — switch to its window |
 | Branch never pushed / ahead of upstream | Spoke pushes (`/cycle` PUSH step), re-run |
 | Branch behind upstream | Reconcile on the spoke (`git pull`), re-run |
+| No `ready/<issue>` marker / stale marker | Spoke isn't done, or pushed after tagging — finish on the spoke and emit/refresh the marker after the final push, or `--force-land` if it legitimately never carries one |
 | Merge conflict | Rebase the spoke on the default branch, push, re-run |
 | Suite failed (rolled back) | Fix on the spoke, push, re-run — main was restored |
 

@@ -33,8 +33,9 @@ bash shared/skills/hub/scripts/hub-status.sh
 It reports, read-only:
 
 - **Worktrees** — each task branch with ahead/behind vs the default branch, its state
-  (`dirty`, `unpushed`, or `pushed → mergeable`), its issue (`#N OPEN`, `#N ?` when `gh`
-  is unreachable), and its live tmux pane (`tmux <session>:<window>`, matched across
+  (`dirty`, `unpushed`, `pushed (in progress)`, or `pushed → mergeable`), its issue
+  (`#N OPEN`, `#N ?` when `gh` is unreachable), and its live tmux pane
+  (`tmux <session>:<window>`, matched across
   **all** sessions by pane path, or `no pane`). Rows with a pane include a copy-paste
   `↳ jump:` command (`select-window` / `switch-client` / `attach`, picked for where you
   are). A `↳ todos:` sub-line shows the spoke's TodoWrite ledger from its latest Claude
@@ -42,6 +43,12 @@ It reports, read-only:
   seeded a ledger — that absence is signal, since kickoffs mandate one.
 - **Open issues** — flagged `worktree active` or `no worktree` so you can see what is
   unstarted.
+
+A fully-pushed branch reads `pushed → mergeable` only when a `ready/<issue>` completion
+marker (a git tag the spoke pushes after its FINAL subtask) points at the branch tip;
+otherwise it reads `pushed (in progress)` — the spoke is between subtasks and a
+per-subtask push must not be mistaken for a finished issue. Ad-hoc/express branches
+(non-numbered slug) need no marker — their single push IS completion.
 
 ### 3. Propose the next move — act only on confirmation
 
@@ -53,6 +60,7 @@ anything that changes state:
 | Open issue, `no worktree` | Start it | `start-task` skill (creates issue if needed + spawns spoke) |
 | New idea, no issue yet | Define then dispatch | discuss scope → `start-task` |
 | Branch `pushed → mergeable` | Land and tear down | `/land <id>` (`land` skill → `scripts/worktree-land.sh`) |
+| Branch `pushed (in progress)` | Leave it — spoke pushed a subtask but isn't done | paste the row's `↳ jump:` command; land only once it flips to `mergeable` (or `--force-land` for a branch that never carries a marker) |
 | Branch `unpushed` / `dirty` | Leave it — spoke still working | paste the row's `↳ jump:` command to reach its pane |
 | Trivial non-executable change (docs/wording) | Lane 1 micro-spoke | spawn subagent with `isolation: worktree`, review diff, land with `scripts/worktree-land.sh <branch> --local` |
 | Small obvious one-subtask change (code) | Lane 2 express spoke | `worktree-new.sh <slug>` (no issue), single cycle, all push gates |
