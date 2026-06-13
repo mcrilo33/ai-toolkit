@@ -141,6 +141,23 @@ def test_restore_resets_bare_flip(repo: Path) -> None:
     assert _git(repo, "config", "--get", "core.bare").strip() == "false"
 
 
+def test_restore_preserves_worktree_path_with_spaces(repo: Path, tmp_path: Path) -> None:
+    # core.worktree can be a path containing spaces; restore must round-trip it
+    # verbatim, not truncate at the first space. Use a real dir (git validates it).
+    spaced_dir = tmp_path / "work dir"
+    spaced_dir.mkdir()
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    _git(repo, "config", "core.worktree", str(spaced_dir))
+    proc = _lib(
+        repo,
+        f'b="$(tripwire_capture)"\ngit config core.worktree "{other_dir}"\ntripwire_restore "$b"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert _git(repo, "config", "--get", "core.worktree").strip() == str(spaced_dir)
+
+
 # --- integration: the test-select.sh pre-push gate -------------------------------
 
 

@@ -746,9 +746,30 @@ _tripwire_restore_cfg() {
   fi
 }
 
+# Read a captured config marker's value from the snapshot, verbatim. The value
+# is everything after the `cfg <key> ` prefix, so a path containing spaces (a
+# core.worktree) round-trips intact rather than being truncated at the first
+# space. Prints the sentinel TRIPWIRE_UNSET when the key was not captured.
+_tripwire_cfg_value() {
+  local snapshot="$1" key="$2" line
+  line="$(printf '%s\n' "$snapshot" | grep -m1 -F "cfg $key " || true)"
+  if [ -z "$line" ]; then
+    printf '%s' "$TRIPWIRE_UNSET"
+    return 0
+  fi
+  printf '%s' "${line#cfg "$key" }"
+}
+
 # Restore the markers captured in $1 after a breach: reset each ref to its
 # snapshot tip, delete refs that appeared during the run, and restore
 # core.bare/core.worktree. Best-effort — leaves the repo as the snapshot found it.
+#
+# HEAD scope: a moved BRANCH ref is restored directly, and HEAD (symbolic) then
+# follows its branch. A breach that re-points HEAD's own symbolic target (a stray
+# `git checkout`/detach) is still DETECTED — the HEAD line in the snapshot differs,
+# so the push is aborted — but its symref is not auto-rewound here; the abort,
+# not the rewind, is the protection. The #29/#30 incident moved a branch ref and
+# flipped core.bare, both fully restored.
 tripwire_restore() {
   local before="$1" kind sha name snap_refs cur_sha cur_ref
   # Reset every snapshot ref to its captured tip (HEAD is symbolic — it follows
@@ -766,11 +787,9 @@ tripwire_restore() {
       git update-ref -d "$cur_ref" 2>/dev/null || true
     fi
   done < <(git show-ref 2>/dev/null || true)
-  # Restore the config markers.
-  _tripwire_restore_cfg core.bare \
-    "$(printf '%s\n' "$before" | awk '$1=="cfg" && $2=="core.bare" {print $3}')"
-  _tripwire_restore_cfg core.worktree \
-    "$(printf '%s\n' "$before" | awk '$1=="cfg" && $2=="core.worktree" {print $3}')"
+  # Restore the config markers (whitespace-preserving extraction).
+  _tripwire_restore_cfg core.bare "$(_tripwire_cfg_value "$before" core.bare)"
+  _tripwire_restore_cfg core.worktree "$(_tripwire_cfg_value "$before" core.worktree)"
 }
 
 # Run "$@" under the tripwire. On a clean run, returns the command's own exit
