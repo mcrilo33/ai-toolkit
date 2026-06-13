@@ -276,3 +276,27 @@ chmod-scope-guard:
   cursor:
     event: beforeShellExecution
     matcher: "(^|[;&|] *)chmod( |$)"
+
+# spoke-main-guard (issue #32): the DENY mirror of the allow-or-silent
+# rm/push/chmod scope guards. In a spoke (WT_SPOKE set, or a linked worktree) it
+# DENIES any command that checks out or mutates the LOCAL default-branch ref —
+# checkout/switch main, merge while on main, branch -f/move/delete/bare-create of
+# main, push to the local main ref, update-ref refs/heads/main, reset while on
+# main, and invoking worktree-land.sh — closing the self-land hole push-scope-
+# guard (#26) left open (it blocked the push, not the local merge into main). The
+# sanctioned reconciliation flow (git merge origin/main into the feature branch,
+# git fetch) and all own-branch work stay allowed; on the hub it is a no-op.
+# Unlike the if-gated rm/push/chmod guards it spans many git subcommands, so
+# Claude wires it with NO `if` (matcher Bash; the script self-filters), exactly
+# like hub-guard. Cursor remaps onto beforeShellExecution with a command regex
+# firing on the ref-touching verbs and the land script (the `-[cC] <val>`
+# alternative leads so a `-c key=val` value is consumed and cannot break the
+# chain to the verb).
+spoke-main-guard:
+  event: preToolUse
+  matcher: Bash
+  description: "In a spoke (WT_SPOKE/linked worktree), DENY any command that checks out or mutates the local default branch (checkout/switch/merge-into/branch -f/push-to-local/update-ref/reset-on/worktree-land.sh); reconciliation (merge origin/main into the feature branch, fetch) stays allowed; hub is a no-op"
+  tier: 1
+  cursor:
+    event: beforeShellExecution
+    matcher: "git( +-[cC] +[^ ]+| +-[^ ]+)* +(checkout|switch|merge|branch|reset|update-ref|push)( |$)|worktree-land[.]sh"

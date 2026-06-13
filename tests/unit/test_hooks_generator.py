@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import textwrap
@@ -570,3 +571,66 @@ class TestPushScopeGuardRegistration:
         assert guard["matcher"] == "git( +-[^ ]+| +-C +[^ ]+)* +push( |$)"
         assert "gh +pr" in review["matcher"], "git-push-review baseline should cover gh pr"
         assert guard["matcher"] != review["matcher"]
+
+
+# ── spoke-main-guard registration against the REAL shared/hooks/metadata.yml ──
+# spoke-main-guard (issue #32) is a tier-1 DENY guard. Like hub-guard it spans
+# many git subcommands, so on Claude it carries NO `if` clause (matcher Bash,
+# the script self-filters); on Cursor it remaps onto beforeShellExecution with a
+# command regex firing on the ref-touching verbs and the land script.
+
+
+class TestSpokeMainGuardRegistration:
+    SCRIPT = "spoke-main-guard.sh"
+
+    def test_claude_registered_on_bash_without_if(self) -> None:
+        cfg = generate_claude(parse_hooks_metadata(str(REAL_META)))
+        guard = _claude_handler(cfg, "PreToolUse", self.SCRIPT)
+        assert guard is not None, "spoke-main-guard not registered for Claude PreToolUse"
+        # Spans checkout/switch/merge/branch/reset/update-ref/push — no single
+        # `if` rule fits, so it fires on all Bash and the script self-filters.
+        assert guard.get("if") is None
+
+    def test_claude_grouped_under_bash_matcher(self) -> None:
+        cfg = generate_claude(parse_hooks_metadata(str(REAL_META)))
+        for group in cfg.get("PreToolUse", []):
+            for handler in group.get("hooks", []):
+                if handler.get("command", "").endswith(self.SCRIPT):
+                    assert group.get("matcher") == "Bash"
+                    return
+        raise AssertionError("spoke-main-guard not found under a Bash matcher group")
+
+    def test_is_tier_1(self) -> None:
+        meta = parse_hooks_metadata(str(REAL_META))
+        assert meta["spoke-main-guard"]["__defaults"]["tier"] == "1"
+
+    def test_cursor_wired_to_before_shell_execution(self) -> None:
+        cfg = generate_cursor(parse_hooks_metadata(str(REAL_META)))
+        guard = _cursor_entry(cfg, "beforeShellExecution", self.SCRIPT)
+        assert guard is not None, "spoke-main-guard not wired to Cursor beforeShellExecution"
+
+    def test_cursor_matcher_fires_on_ref_verbs_and_land_script(self) -> None:
+        cfg = generate_cursor(parse_hooks_metadata(str(REAL_META)))
+        guard = _cursor_entry(cfg, "beforeShellExecution", self.SCRIPT)
+        assert guard is not None
+        pattern = re.compile(guard["matcher"])
+        assert pattern.search("git checkout main")
+        assert pattern.search("git switch main")
+        assert pattern.search("git merge origin/main")
+        assert pattern.search("git branch -f main")
+        assert pattern.search("git reset --hard origin/main")
+        assert pattern.search("git update-ref refs/heads/main HEAD")
+        assert pattern.search("git push . HEAD:main")
+        # `-c key=val` value must not break the chain to the verb.
+        assert pattern.search("git -c core.pager=cat checkout main")
+        assert pattern.search("scripts/worktree-land.sh 32")
+        # Read-only git commands must not fire.
+        assert not pattern.search("git status --short")
+        assert not pattern.search("git log --oneline")
+
+    def test_script_exists_and_executable(self) -> None:
+        script = REAL_META.parent / self.SCRIPT
+        assert script.is_file(), "spoke-main-guard.sh missing from shared/hooks/"
+        assert os.access(script, os.X_OK), (
+            "spoke-main-guard.sh must be executable for sync to install"
+        )
