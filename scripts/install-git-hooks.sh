@@ -15,6 +15,8 @@
 #                  carve-out. At commit-msg both the staged index AND the
 #                  message file exist, so this is the correct stage for both.)
 #   pre-push    → red-proof-warn + reviewer-sep-warn (advisory; read git log)
+#                 + test-select (BLOCKING: the single owner of test execution —
+#                 a tiered, diff-aware suite; non-zero exit aborts the push, #19)
 #
 # The native hooks synthesize the {"tool_input":{"command":"..."}} JSON the
 # cage scripts expect (reusing the exact same scripts — single source of truth)
@@ -83,7 +85,8 @@ mkdir -p "$SCRIPTS_DST/lib"
 cp "$SHARED_HOOKS/commit-quality.sh" \
    "$SHARED_HOOKS/commit-gauntlet.sh" \
    "$SHARED_HOOKS/red-proof-warn.sh" \
-   "$SHARED_HOOKS/reviewer-sep-warn.sh" "$SCRIPTS_DST/"
+   "$SHARED_HOOKS/reviewer-sep-warn.sh" \
+   "$SHARED_HOOKS/test-select.sh" "$SCRIPTS_DST/"
 cp "$SHARED_HOOKS/lib/utils.sh" "$SCRIPTS_DST/lib/"
 chmod +x "$SCRIPTS_DST"/*.sh
 info "Copied cage scripts → $SCRIPTS_DST"
@@ -126,17 +129,33 @@ emit_pre_push_hook() {
   cat <<'HOOK'
 #!/usr/bin/env bash
 # >>> ai-toolkit cage >>>
-# Native pre-push hook: runs the advisory red-proof / reviewer-sep warnings.
-# These never block (always exit 0); we ignore their exit code on purpose.
+# Native pre-push hook, two stages:
+#   1. Advisory warnings (red-proof / reviewer-sep) — never block (exit 0 each).
+#   2. BLOCKING test gate (test-select) — the single owner of test execution
+#      (issue #19). It classifies the pushed diff (fed git's pre-push stdin) and
+#      runs the tiered suite; a non-zero exit aborts the push ("one push = one
+#      run"). worktree-land threads its --skip-tests/--test-cmd via TEST_SELECT_*.
 set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS="$SELF_DIR/ai-toolkit-scripts"
+
+# Drain git's pre-push stdin (the pushed "<local ref> <local sha> <remote ref>
+# <remote sha>" lines) once: the test gate needs the SHA range, while the
+# advisory scripts take a synthesized Bash payload, not git's stdin.
+PREPUSH_REFS="$(cat || true)"
+
 PAYLOAD='{"tool_name":"Bash","tool_input":{"command":"git push"}}'
 for s in red-proof-warn reviewer-sep-warn; do
   if [ -x "$SCRIPTS/$s.sh" ]; then
     printf '%s' "$PAYLOAD" | "$SCRIPTS/$s.sh" || true
   fi
 done
+
+# Blocking gate: the tiered, diff-aware selector. Its exit code becomes the
+# push's — a failing suite aborts the push.
+if [ -x "$SCRIPTS/test-select.sh" ]; then
+  printf '%s\n' "$PREPUSH_REFS" | "$SCRIPTS/test-select.sh" || exit $?
+fi
 exit 0
 # <<< ai-toolkit cage <<<
 HOOK
@@ -164,5 +183,6 @@ install_hook pre-push  emit_pre_push_hook
 echo ""
 info "ai-toolkit cage installed as native git hooks in $TARGET"
 warn "Blocking gates (commit-quality, commit-gauntlet) now enforce on real git commit."
+warn "The pre-push test gate (test-select) blocks the push when the selected tests fail."
 warn "Advisory gates (red-proof-warn, reviewer-sep-warn) run on git push and never block."
 echo "  Uninstall with: scripts/install-git-hooks.sh --uninstall $TARGET"
