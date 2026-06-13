@@ -20,6 +20,9 @@ COMMAND=$(get_shell_command "$INPUT")
 # Only act on git push commands
 echo "$COMMAND" | grep -qE '^\s*git\s+push\b' || exit 0
 
+# Cycle step: this push IS the solo-cycle PUSH gate.
+telemetry_mark_step push
+
 # Resolve the repo from the payload — Cursor's beforeShellExecution reports an
 # empty cwd, so the ambient working directory cannot be trusted.
 PROJECT_ROOT=$(project_root_from_payload "$INPUT")

@@ -62,7 +62,10 @@ fi
 # neutralizes the secret without disturbing unrelated content. Preserves the
 # original trailing-newline state byte-for-byte.
 TMP=$(mktemp 2>/dev/null) || { log "secrets-scan-revert: mktemp failed for $FILE_PATH ($FOUND)."; exit 0; }
-trap 'rm -f "$TMP"' EXIT
+# Register cleanup via the lib's atexit stack rather than `trap … EXIT`, which
+# would replace the hook-span EXIT trap installed by utils.sh. The cleanup runs
+# whether or not telemetry is enabled.
+telemetry_atexit "rm -f \"$TMP\""
 
 removed=0
 while IFS= read -r line || [ -n "$line" ]; do

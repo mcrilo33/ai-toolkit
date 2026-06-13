@@ -14,6 +14,21 @@
 #     Enforcement is via ship_gate_enforce: hard DENY (exit 2) on Cursor's
 #     beforeShellExecution, advisory warn + exit 0 on Claude/Copilot.
 #
+# WHAT IT AUTO-ALLOWS (issue #24)
+#   A spoke's own-branch push IS its ship gate; it should not ALSO stall on a
+#   permission ask.  When — and only when — every clause is a push that provably
+#   resolves (via refspec or tracked upstream) to ONLY the spoke's own current
+#   branch, the hook emits hookSpecificOutput.permissionDecision: "allow" and
+#   the redundant prompt disappears.  This mirrors rm-scope-guard's discipline:
+#   the decision is allow-or-silent, it NEVER denies on this path and never
+#   weakens an existing deny (the allow is reached only after the loop above
+#   finds nothing to enforce).  It is conservative by construction — force
+#   (--force/-f/--force-with-lease/--force-if-includes/+refspec), --delete/:dst,
+#   --mirror/--all, --no-verify, tag pushes, default/other-branch pushes, any
+#   $-dynamic or otherwise unprovable token, a bare push without an own-branch
+#   upstream, the hub side, and any non-push clause in the chain ALL fall
+#   through to silent so the normal prompt still fires.  jq-less → silent.
+#
 #   HUB (main checkout):
 #     Publishing the default branch or the current branch is exactly the hub's
 #     job — always silent.  --delete (either spelling, flag or :branch refspec)
@@ -273,13 +288,131 @@ judge_clause() {
   return 0
 }
 
+# ── Is ONE clause a provably-safe own-branch push? (auto-allow gate) ─────────
+# Stricter than judge_clause's silent-pass: this returns 0 ONLY when the clause
+# is a push that resolves to the spoke's OWN current branch and carries nothing
+# that makes the push non-routine. judge_clause stays the enforcement authority
+# (it warns/denies the out-of-scope cases first); this is a conservative second
+# opinion that gates the ALLOW emission. Anything it cannot prove → return 1, so
+# the command stays silent and the normal permission prompt fires.
+#
+# Disqualifiers (return 1 → silent, never allow):
+#   force (--force/--force-with-lease[=…]/--force-if-includes, a `+`-prefixed
+#   refspec, or a short bundle carrying f like -f/-fu) — history rewrites;
+#   --delete or a short bundle carrying d and a :dst refspec (deletes);
+#   --mirror/--all/--branches (bulk); --tags/--follow-tags or a tag refspec
+#   (tags are not task branches); --no-verify (skips the push hooks — the gate
+#   this allow sits downstream of); any $-dynamic token (unprovable); and a bare
+#   push whose tracked upstream is not the own branch.
+clause_auto_allowable() {
+  local clause="$1" tail tok spec src dst upstream
+  local skip_next=0 remote="" had_refspec=0
+
+  tail=$(printf '%s' "$clause" | sed -E "$STRIP_PREFIX" | strip_redirections)
+
+  set -f
+  for tok in $tail; do
+    if [ "$skip_next" = "1" ]; then
+      skip_next=0
+      continue
+    fi
+    tok="${tok//\'/}"
+    tok="${tok//\"/}"
+    [ -z "$tok" ] && continue
+    case "$tok" in
+      --force | --force-with-lease | --force-with-lease=* | --force-if-includes | \
+        --delete | --mirror | --all | --branches | --no-verify | --tags | --follow-tags)
+        set +f
+        return 1
+        ;;
+      # flags that consume the next token as their value (mirror judge_clause)
+      --repo | --receive-pack | --exec | -o | --push-option)
+        skip_next=1
+        continue
+        ;;
+      # any other long flag is scope-neutral (e.g. --set-upstream, --quiet)
+      --*) continue ;;
+      # a single-dash short bundle is force/delete if it carries f or d
+      # (`-f`, `-fu`, `-uf`, `-d`); git's parser splits bundled short options.
+      -*[fd]*)
+        set +f
+        return 1
+        ;;
+      # other short flags are scope-neutral (-u, -q, -v, -n)
+      -*) continue ;;
+    esac
+    # A $-dynamic token cannot be adjudicated → cannot prove own-branch.
+    case "$tok" in
+      *'$'*)
+        set +f
+        return 1
+        ;;
+    esac
+    if [ -z "$remote" ]; then
+      remote="$tok"
+      continue
+    fi
+    had_refspec=1
+    spec="${tok#+}"
+    [ "$spec" != "$tok" ] && { set +f; return 1; } # +refspec = forced push
+    case "$spec" in
+      refs/tags/* | *:refs/tags/*)
+        set +f
+        return 1
+        ;;
+      *:*) src="${spec%%:*}"; dst="${spec#*:}" ;;
+      *)   src="$spec";       dst="$spec" ;;
+    esac
+    [ -z "$src" ] && { set +f; return 1; } # :dst = delete
+    dst="${dst#refs/heads/}"
+    if [ "$dst" != "HEAD" ] && [ "$dst" != "$CURRENT" ]; then
+      set +f
+      return 1
+    fi
+  done
+  set +f
+
+  # Every concrete refspec named the own branch → safe.
+  [ "$had_refspec" = "1" ] && return 0
+
+  # Bare push: allow ONLY when the tracked upstream is the own branch. No
+  # upstream (or a default/other-branch upstream) → cannot prove → silent.
+  upstream=$(git -C "$ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
+  [ -z "$upstream" ] && return 1
+  dst="${upstream#*/}"
+  [ "$dst" = "$CURRENT" ]
+}
+
+# ── Emit a cross-platform ALLOW decision (auto-approve, never deny) ──────────
+# Claude reads hookSpecificOutput.permissionDecision; Cursor's
+# beforeShellExecution reads the top-level permission. jq is required to emit
+# valid JSON; without it (or on any platform that understands neither) the hook
+# degrades to SILENT — the user's `Bash(git push)` ask stays the backstop.
+allow() {
+  local reason="$1"
+  command -v jq &>/dev/null || exit 0
+  telemetry_event "allow"
+  jq -nc --arg r "$reason" '{
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "allow",
+      permissionDecisionReason: $r
+    },
+    permission: "allow"
+  }'
+  exit 0
+}
+
 # ── Split into clauses and judge EVERY git push clause ──────────────────────
 # Backticks and ; & | ( ) { } become clause boundaries (newlines already
 # are); `&&` and `||` collapse to one boundary.  Parens/braces matter both
 # ways: `(git push origin main)` must not slip detection, and `OUT=$(git push
-# -u origin <own>)` must not glue the `)` onto the refspec.  `2>&1` splits as
-# `2>` + `1` — the residue is neutralized by strip_redirections, and the
-# stray `1` clause contains no push, so it is skipped.
+# -u origin <own>)` must not glue the `)` onto the refspec.  An fd-duplication
+# like `2>&1` is neutralized FIRST (its `&` is shell plumbing, not a clause
+# boundary), so it never severs into a `2>` + standalone `1` pair — that stray
+# `1` is a runnable command name and must not be mistaken for benign residue on
+# the auto-allow path.  Plain `>file`/`<file` redirects carry no separator, so
+# they stay within their clause and are stripped there.
 #
 # Simple ${NAME} expansions are masked to $DYN FIRST, so the brace spelling of
 # a dynamic src cannot sever at the {} boundary and orphan its concrete dst
@@ -288,17 +421,44 @@ judge_clause() {
 # must keep splitting.  A $(cmd):dst src does stay orphaned by the split (the
 # inner push is judged instead) — the accepted cost of seeing through $(...).
 MASKED=$(printf '%s' "$COMMAND" | sed -E 's/\$\{[A-Za-z_][A-Za-z0-9_]*\}/$DYN/g')
-CLAUSES=$(printf '%s\n' "$MASKED" | tr '`' '\n' | sed -E 's/[;&|(){}]+/\n/g')
+CLAUSES=$(printf '%s\n' "$MASKED" | tr '`' '\n' | sed -E 's/[0-9]*>&[0-9]+//g; s/[;&|(){}]+/\n/g')
 
+# AUTO_ALLOW gates the spoke ALLOW emission: it stays 1 only while EVERY
+# non-blank clause is a provably-own-branch push.  A single non-push clause
+# (`cd x && git push …`) or any clause judge_clause/clause_auto_allowable cannot
+# vouch for drops it to 0 — the command then stays silent (normal prompt).
+AUTO_ALLOW=1
+PUSH_SEEN=0
 while IFS= read -r CLAUSE; do
   case "$CLAUSE" in
     *[![:space:]]*) ;; # non-blank → consider
     *) continue ;;
   esac
-  printf '%s' "$CLAUSE" | grep -qE "$PUSH_RE" || continue
-  judge_clause "$CLAUSE"
+  if printf '%s' "$CLAUSE" | grep -qE "$PUSH_RE"; then
+    judge_clause "$CLAUSE" # enforces (deny/warn) on any out-of-scope clause
+    PUSH_SEEN=1
+    clause_auto_allowable "$CLAUSE" || AUTO_ALLOW=0
+  else
+    # A non-push clause drops the allow — we cannot vouch for an arbitrary
+    # command (`cd x`, `tee log`, even a bare `1`) riding alongside the push.
+    # Only PURE redirection residue is benign: a `>file`/`<file` fragment that
+    # strip_redirections empties out.  fd-duplication (`2>&1`) was neutralized
+    # before the clause split, so no standalone digit fragment reaches here;
+    # any non-empty remainder is therefore a real command.
+    RESIDUE=$(printf '%s' "$CLAUSE" | strip_redirections | tr -d '[:space:]')
+    case "$RESIDUE" in
+      ?*) AUTO_ALLOW=0 ;;
+    esac
+  fi
 done <<EOF
 $CLAUSES
 EOF
+
+# Reaching here means no clause enforced (a deny/warn would have exited): a
+# spoke push proven to target only its own branch is auto-approved, removing the
+# redundant ask.  Everything else falls through to silent.
+if [ "$IS_SPOKE" = "1" ] && [ "$PUSH_SEEN" = "1" ] && [ "$AUTO_ALLOW" = "1" ]; then
+  allow "push-scope-guard: a linked worktree pushing only its own current branch ($CURRENT) is in scope — auto-allowed (force/delete/mirror/all/tag/other-branch/default-branch pushes still prompt)"
+fi
 
 exit 0

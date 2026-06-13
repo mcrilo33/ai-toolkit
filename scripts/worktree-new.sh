@@ -40,6 +40,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=worktree-lib.sh
 . "$SCRIPT_DIR/worktree-lib.sh"
 
+# Span start clock for the lifecycle/spawn span emitted at the end.
+WT_T0="$(wt_now_ms)"
+
 # --- parse flags vs positionals ----------------------------------------------
 POSITIONAL=()
 OPEN_MODE="add"        # add | new-window | none
@@ -131,6 +134,30 @@ fi
 echo "→ creating worktree  $WT_DIR"
 echo "→ new branch         $BRANCH"
 git worktree add "$WT_DIR" -b "$BRANCH"
+
+# --- mint the spoke_run_id ---------------------------------------------------
+# Every hook/script emitting telemetry inside this worktree reads this id, so
+# all spans of one spoke share it across sessions and resumes. Format:
+# <branch>+<spawn-epoch>. Minting is INDEPENDENT of AI_TOOLKIT_TELEMETRY — the
+# spoke's identity must exist even if telemetry is enabled later mid-run.
+#
+# Make .ai-toolkit/ ignored via the repo's git exclude (resolved for this
+# worktree) rather than trusting the consuming repo's committed .gitignore: a
+# synced target may ship its own .gitignore without .ai-toolkit/, and then the
+# minted file would land UNTRACKED and break worktree-done (git worktree remove)
+# and worktree-land (untracked-as-dirty guard). The exclude entry is local to
+# the repo's git dir, never committed, and appended at most once.
+EXCLUDE_FILE="$(git -C "$WT_DIR" rev-parse --git-path info/exclude 2>/dev/null || true)"
+if [ -n "$EXCLUDE_FILE" ]; then
+  mkdir -p "$(dirname "$EXCLUDE_FILE")"
+  grep -qxF '.ai-toolkit/' "$EXCLUDE_FILE" 2>/dev/null \
+    || printf '%s\n' '.ai-toolkit/' >> "$EXCLUDE_FILE"
+fi
+
+SPOKE_RUN_ID="${BRANCH}+$(date +%s)"
+mkdir -p "$WT_DIR/.ai-toolkit"
+printf '%s\n' "$SPOKE_RUN_ID" > "$WT_DIR/.ai-toolkit/spoke-run-id"
+echo "→ spoke_run_id       $SPOKE_RUN_ID"
 
 # .claude/ is gitignored runtime config (skills, hooks, settings) synced from
 # shared/. `git worktree add` checks out only TRACKED files, so without this copy
@@ -259,6 +286,11 @@ if [ "$SPAWN_TERMINAL" -eq 1 ]; then
     [ "$LAUNCH_AGENT" -eq 1 ] && echo "    cd \"$WT_DIR\" && $AGENT_CMD" || echo "    cd \"$WT_DIR\""
   fi
 fi
+
+# --- telemetry: lifecycle/spawn span -----------------------------------------
+# Attributed to the new spoke (emitted with the worktree as CWD), carrying the
+# spoke_run_id minted above. No-op unless AI_TOOLKIT_TELEMETRY=1.
+wt_emit_lifecycle "worktree-new" "spawn" "success" "$WT_T0" "$WT_DIR"
 
 echo
 echo "  Then in that session, run:  /source   (anchor to the issue, then /cycle)"

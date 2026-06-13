@@ -1,22 +1,23 @@
-"""Unit tests for the opt-in hook telemetry event log (RED phase).
+"""Unit tests for the opt-in hook telemetry log.
 
-Telemetry spec under test (not implemented yet):
+Spec under test (the unified span model — see docs/telemetry-span-schema.md):
 
 * Opt-in via ``AI_TOOLKIT_TELEMETRY=1``; when unset / not "1", NO telemetry
   file or directory is created.
 * Events append to
   ``${AI_TOOLKIT_TELEMETRY_DIR:-$HOME/.ai-toolkit/telemetry}/events.jsonl`` —
-  one JSON object per line.
-* Each event carries ONLY metadata: ``ts`` (ISO-8601 UTC timestamp), ``hook``
-  (basename of the hook script), ``decision`` (allow/warn/deny), ``repo``
-  (basename of the project root — never the full path). No command strings,
-  no messages, no file contents (messages may quote the blocked command →
-  secret-leak risk).
-* ``deny()`` logs decision=deny, ``warn()`` logs decision=warn. Telemetry
+  one JSON span per line.
+* Each span carries ONLY metadata: ``kind`` (``hook`` here), ``name`` (basename
+  of the hook script), ``status`` (success/warn/deny), ``repo`` (basename of the
+  project root — never the full path), and ``ts_start``/``ts_end``. No command
+  strings, no messages, no file contents (messages may quote the blocked command
+  → secret-leak risk).
+* ``deny()`` records status=deny, ``warn()`` records status=warn. Telemetry
   failures must never change a hook's exit code or output.
 
 These tests subprocess the real hook scripts with Cursor-shaped payloads,
 mirroring tests/unit/test_commit_hooks.py and tests/unit/test_cursor_hooks.py.
+The richer per-span coverage lives in tests/unit/test_hook_span.py.
 """
 
 from __future__ import annotations
@@ -135,9 +136,10 @@ class TestTelemetryOptIn:
         assert events_file.exists()
         events = _read_events(events_file)
         assert len(events) == 1
-        assert events[0]["decision"] == "deny"
-        assert events[0]["hook"] == "block-no-verify.sh"
-        assert "ts" in events[0]
+        assert events[0]["kind"] == "hook"
+        assert events[0]["status"] == "deny"
+        assert events[0]["name"] == "block-no-verify.sh"
+        assert "ts_start" in events[0]
         assert "repo" in events[0]
 
     def test_no_telemetry_file_when_disabled(self, project_root: Path, tmp_path: Path) -> None:
@@ -166,8 +168,8 @@ class TestTelemetryEvents:
         assert "print()" in result.stderr  # the warn path actually fired
         events = _read_events(telemetry_dir / "events.jsonl")
         assert len(events) == 1
-        assert events[0]["decision"] == "warn"
-        assert events[0]["hook"] == "console-log-warn.sh"
+        assert events[0]["status"] == "warn"
+        assert events[0]["name"] == "console-log-warn.sh"
 
     def test_multiple_events_append(self, project_root: Path, telemetry_dir: Path) -> None:
         payload = _cursor_shell_payload(DENY_COMMAND, project_root)
@@ -178,8 +180,8 @@ class TestTelemetryEvents:
 
         events = _read_events(telemetry_dir / "events.jsonl")
         assert len(events) == 2
-        assert events[0]["decision"] == "deny"
-        assert events[1]["decision"] == "deny"
+        assert events[0]["status"] == "deny"
+        assert events[1]["status"] == "deny"
 
     def test_ts_field_is_iso8601_utc(self, project_root: Path, telemetry_dir: Path) -> None:
         payload = _cursor_shell_payload(DENY_COMMAND, project_root)
@@ -188,7 +190,7 @@ class TestTelemetryEvents:
         _run(BLOCK_NO_VERIFY, payload, env, cwd=project_root)
 
         events = _read_events(telemetry_dir / "events.jsonl")
-        ts = datetime.fromisoformat(events[0]["ts"])
+        ts = datetime.fromisoformat(events[0]["ts_start"])
         assert ts.tzinfo is not None
         assert ts.utcoffset() == timedelta(0)
 

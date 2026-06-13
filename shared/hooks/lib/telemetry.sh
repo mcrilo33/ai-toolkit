@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# telemetry.sh — the unified workflow span emit layer (schema v1).
+#
+# Single source of truth for appending one **span** object per event to
+#   ${AI_TOOLKIT_TELEMETRY_DIR:-$HOME/.ai-toolkit/telemetry}/events.jsonl
+# ONLY when AI_TOOLKIT_TELEMETRY=1 (otherwise a silent no-op that creates
+# nothing). One append-only JSONL event type models the whole hub/spoke
+# workflow: lifecycle, steps, hooks, scripts (and, later, via the parser,
+# skills/agents/todos/human). See docs/telemetry-span-schema.md for the frozen
+# contract that downstream issues (parser + dashboard) build against.
+#
+# This file is sourced by BOTH the hook lib (shared/hooks/lib/utils.sh) and the
+# worktree/cycle scripts, so it is intentionally self-contained: it defines its
+# own minimal project-root resolver and never depends on utils.sh.
+#
+# PRIVACY CONTRACT (enforced by tests/unit/test_telemetry_span.py):
+#   Metadata only. `repo` is a basename, NEVER a path. We NEVER log commands,
+#   messages, file paths, or any payload content — only the session_id field is
+#   read out of the hook payload, nothing else.
+#
+# INVISIBILITY CONTRACT:
+#   Zero bytes on stdout/stderr; never changes the caller's exit code. The whole
+#   emit body is redirected and failure-swallowed.
+
+# ── time helpers ────────────────────────────────────────────────────
+# Epoch milliseconds, best-effort across platforms. Tiers, fastest first:
+#   1. bash 5 $EPOCHREALTIME (seconds.microseconds)  2. python3  3. GNU date %N
+#   4. second-precision date (coarse, but always a valid integer).
+_telemetry_now_ms() {
+  if [ -n "${EPOCHREALTIME:-}" ]; then
+    # "1700000000.123456" -> strip the dot, keep ms (first 3 frac digits).
+    # The fractional field is not fixed-width ("…0.5" means 500ms, not 5ms), so
+    # right-pad with zeros BEFORE truncating to 3 digits.
+    local s="${EPOCHREALTIME%%.*}" f="${EPOCHREALTIME#*.}000"
+    printf '%d' "$((10#$s * 1000 + 10#${f:0:3}))"
+    return
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null && return
+  fi
+  local ns
+  ns=$(date +%s%N 2>/dev/null)
+  case "$ns" in
+    *N|"" ) printf '%d' "$(( $(date +%s) * 1000 ))" ;;   # BSD date: %N unsupported
+    *)      printf '%d' "$(( ns / 1000000 ))" ;;
+  esac
+}
+
+# ISO-8601 UTC, second precision (matches the legacy telemetry_event ts).
+_telemetry_iso_utc() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+# ISO-8601 UTC for a given epoch-ms value (so ts_start reflects the real start,
+# not emit time). Falls back to now() if conversion is unavailable.
+_telemetry_iso_from_ms() {
+  # NOTE: split declaration — a combined `local ms="$1" secs=$(( ms / 1000 ))`
+  # evaluates the arithmetic before `ms` is bound on bash 3.2 (macOS), zeroing
+  # `secs` and pinning ts_start to 1970. Keep these on separate lines.
+  local ms="$1"
+  local secs=$(( ms / 1000 ))
+  date -u -r "$secs" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -d "@$secs" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || _telemetry_iso_utc
+}
+
+# ── id helper ───────────────────────────────────────────────────────
+# A short opaque span id. Carries no payload content — purely random hex.
+_telemetry_span_id() {
+  if [ -n "${RANDOM:-}" ]; then
+    printf '%04x%04x%04x' "$RANDOM" "$RANDOM" "$RANDOM"
+    return
+  fi
+  od -An -N6 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || echo "span"
+}
+
+# ── context resolvers ───────────────────────────────────────────────
+# Project root: prefer Cursor's env, then the Claude payload's workspace_roots,
+# else walk up from $PWD to a .git marker. Self-contained (no utils.sh dep).
+_telemetry_project_root() {
+  local input="${INPUT:-}" root="" dir
+  if [ -n "${CURSOR_PROJECT_DIR:-}" ]; then
+    echo "$CURSOR_PROJECT_DIR"
+    return
+  fi
+  if [ -n "$input" ] && command -v jq >/dev/null 2>&1; then
+    root=$(printf '%s' "$input" | jq -r '.workspace_roots[0] // empty' 2>/dev/null)
+  fi
+  if [ -n "$root" ] && [ "$root" != "null" ]; then
+    echo "$root"
+    return
+  fi
+  dir="$(pwd)"
+  while [ "$dir" != "/" ]; do
+    [ -e "$dir/.git" ] && { echo "$dir"; return; }
+    dir=$(dirname "$dir")
+  done
+  pwd
+}
+
+# session_id: read ONLY this one field out of the hook payload — never anything
+# else (privacy). Empty when absent / no jq.
+_telemetry_session_id() {
+  local input="${INPUT:-}"
+  [ -n "$input" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null
+}
+
+# spoke_run_id: minted at worktree-new, written to <root>/.ai-toolkit/spoke-run-id.
+# Every span emitted inside that worktree reads it; empty when not in a spoke.
+_telemetry_spoke_run_id() {
+  local root="$1" f="$1/.ai-toolkit/spoke-run-id"
+  [ -f "$f" ] || return 0
+  # First line only; trim whitespace. The file holds a metadata id, no content.
+  head -n1 "$f" 2>/dev/null | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+# workflow_rev: the ai-toolkit short SHA active at emit time (the A/B anchor).
+# Precedence: explicit override → synced-target manifest → ai-toolkit checkout
+# git SHA → VERSION file → empty. The manifest matters because a hook running
+# inside a synced TARGET repo must report ai-toolkit's rev, not the target's.
+_telemetry_workflow_rev() {
+  local root="$1" rev=""
+  if [ -n "${AI_TOOLKIT_WORKFLOW_REV:-}" ]; then
+    echo "$AI_TOOLKIT_WORKFLOW_REV"
+    return
+  fi
+  local manifest="$root/.ai-toolkit-manifest.json"
+  if [ -f "$manifest" ] && command -v jq >/dev/null 2>&1; then
+    rev=$(jq -r '.toolkit_rev // empty' "$manifest" 2>/dev/null)
+    [ -n "$rev" ] && { echo "$rev"; return; }
+  fi
+  # ai-toolkit checkout itself: the toolkit IS this repo when shared/ + the sync
+  # script are present. Use the working-tree SHA.
+  if [ -d "$root/shared" ] && [ -f "$root/scripts/sync-to-repo.sh" ]; then
+    rev=$(git -C "$root" rev-parse --short HEAD 2>/dev/null) || rev=""
+    [ -n "$rev" ] && { echo "$rev"; return; }
+  fi
+  if [ -f "$root/VERSION" ]; then
+    head -n1 "$root/VERSION" 2>/dev/null | tr -d '[:space:]'
+    return
+  fi
+}
+
+# Current branch of the project root (metadata; part of the schema).
+_telemetry_branch() {
+  git -C "$1" rev-parse --abbrev-ref HEAD 2>/dev/null || true
+}
+
+# ── the emit helper ─────────────────────────────────────────────────
+# Append one span (schema v1) to events.jsonl. Opt-in + invisible + failure-
+# swallowed. Flag-based so callers pass only what they have; everything else is
+# resolved from context or defaulted to null.
+#
+# Usage:
+#   telemetry_emit_span --kind <k> --name <n> [--phase <p>] [--status <s>]
+#                       [--start-ms <ms>] [--span-id <id>] [--parent-id <id>]
+#                       [--human-type <t>] [--human-wait-ms <ms>]
+#
+#   --kind     lifecycle|step|hook|script|skill|agent|todo|human|rule (required)
+#   --name     span name, a constant (worktree-new | commit-gauntlet | ...) — a
+#              caller-supplied label, NEVER payload content (required)
+#   --phase    spawn|land|teardown|red|green|review|push (default: null)
+#   --status   success|failure|deny|warn|skipped (default: success)
+#   --start-ms epoch-ms when the span opened; ts_start + duration_ms derive from
+#              it. Omitted → ts_start = now, duration_ms = 0.
+#   --parent-id  nesting parent (default: $TELEMETRY_PARENT_ID, else null)
+telemetry_emit_span() {
+  [ "${AI_TOOLKIT_TELEMETRY:-}" = "1" ] || return 0
+  local kind="" name="" phase="" status="success" start_ms="" span_id="" \
+        parent_id="${TELEMETRY_PARENT_ID:-}" human_type="" human_wait_ms=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --kind)          kind="$2"; shift 2 ;;
+      --name)          name="$2"; shift 2 ;;
+      --phase)         phase="$2"; shift 2 ;;
+      --status)        status="$2"; shift 2 ;;
+      --start-ms)      start_ms="$2"; shift 2 ;;
+      --span-id)       span_id="$2"; shift 2 ;;
+      --parent-id)     parent_id="$2"; shift 2 ;;
+      --human-type)    human_type="$2"; shift 2 ;;
+      --human-wait-ms) human_wait_ms="$2"; shift 2 ;;
+      *)               shift ;;   # ignore unknowns; never fail a caller
+    esac
+  done
+
+  {
+    local dir end_ms ts_start ts_end duration_ms root repo branch \
+          session_id spoke_run_id workflow_rev
+    dir="${AI_TOOLKIT_TELEMETRY_DIR:-$HOME/.ai-toolkit/telemetry}"
+    mkdir -p "$dir"
+
+    end_ms=$(_telemetry_now_ms)
+    if [ -n "$start_ms" ]; then
+      ts_start=$(_telemetry_iso_from_ms "$start_ms")
+      duration_ms=$(( end_ms - start_ms ))
+      [ "$duration_ms" -lt 0 ] && duration_ms=0
+    else
+      ts_start=$(_telemetry_iso_utc)
+      duration_ms=0
+    fi
+    ts_end=$(_telemetry_iso_utc)
+
+    [ -n "$span_id" ] || span_id=$(_telemetry_span_id)
+    root=$(_telemetry_project_root)
+    repo=$(basename "$root"); [ -n "$repo" ] || repo="unknown"
+    branch=$(_telemetry_branch "$root")
+    session_id=$(_telemetry_session_id)
+    spoke_run_id=$(_telemetry_spoke_run_id "$root")
+    workflow_rev=$(_telemetry_workflow_rev "$root")
+
+    if command -v jq >/dev/null 2>&1; then
+      local human='null'
+      if [ -n "$human_type" ]; then
+        human=$(jq -nc --arg t "$human_type" --argjson w "${human_wait_ms:-0}" \
+          '{type: $t, wait_ms: $w}')
+      fi
+      # Empty strings for optional join keys serialize as JSON null, so the
+      # parser sees a clean absent value rather than "".
+      jq -nc \
+        --arg span_id "$span_id" \
+        --arg parent_id "$parent_id" \
+        --arg spoke_run_id "$spoke_run_id" \
+        --arg session_id "$session_id" \
+        --arg workflow_rev "$workflow_rev" \
+        --arg repo "$repo" \
+        --arg branch "$branch" \
+        --arg kind "$kind" \
+        --arg name "$name" \
+        --arg phase "$phase" \
+        --arg ts_start "$ts_start" \
+        --arg ts_end "$ts_end" \
+        --argjson duration_ms "$duration_ms" \
+        --arg status "$status" \
+        --argjson human "$human" \
+        '{
+          span_id: $span_id,
+          parent_id: (if $parent_id == "" then null else $parent_id end),
+          spoke_run_id: (if $spoke_run_id == "" then null else $spoke_run_id end),
+          session_id: (if $session_id == "" then null else $session_id end),
+          workflow_rev: (if $workflow_rev == "" then null else $workflow_rev end),
+          repo: $repo,
+          branch: (if $branch == "" then null else $branch end),
+          kind: $kind,
+          name: $name,
+          phase: (if $phase == "" then null else $phase end),
+          ts_start: $ts_start,
+          ts_end: $ts_end,
+          duration_ms: $duration_ms,
+          status: $status,
+          human: $human,
+          tokens_in: null,
+          tokens_out: null,
+          cost_usd: null
+        }' >> "$dir/events.jsonl"
+    else
+      # jq-less fallback. Emits the same shape with a string-only escaper; the
+      # only free-text fields (kind/name/phase/status) are caller constants.
+      _telemetry_json_str() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+      _telemetry_or_null() { [ -n "$1" ] && printf '"%s"' "$(_telemetry_json_str "$1")" || printf 'null'; }
+      local human_json='null'
+      [ -n "$human_type" ] && human_json="{\"type\":\"$(_telemetry_json_str "$human_type")\",\"wait_ms\":${human_wait_ms:-0}}"
+      printf '{"span_id":"%s","parent_id":%s,"spoke_run_id":%s,"session_id":%s,"workflow_rev":%s,"repo":"%s","branch":%s,"kind":"%s","name":"%s","phase":%s,"ts_start":"%s","ts_end":"%s","duration_ms":%d,"status":"%s","human":%s,"tokens_in":null,"tokens_out":null,"cost_usd":null}\n' \
+        "$(_telemetry_json_str "$span_id")" \
+        "$(_telemetry_or_null "$parent_id")" \
+        "$(_telemetry_or_null "$spoke_run_id")" \
+        "$(_telemetry_or_null "$session_id")" \
+        "$(_telemetry_or_null "$workflow_rev")" \
+        "$(_telemetry_json_str "$repo")" \
+        "$(_telemetry_or_null "$branch")" \
+        "$(_telemetry_json_str "$kind")" \
+        "$(_telemetry_json_str "$name")" \
+        "$(_telemetry_or_null "$phase")" \
+        "$ts_start" "$ts_end" "$duration_ms" \
+        "$(_telemetry_json_str "$status")" \
+        "$human_json" >> "$dir/events.jsonl"
+    fi
+  } >/dev/null 2>&1 || true
+  return 0
+}
+
+# ── hook auto-span ──────────────────────────────────────────────────
+# Every hook that sources the hook lib (utils.sh) emits exactly one kind=hook
+# span at exit, with status = the decision recorded by deny()/warn() (else
+# success). A tiny atexit stack lets a hook that needs its OWN cleanup compose
+# with the span instead of clobbering the single bash EXIT-trap slot.
+
+_TELEMETRY_ATEXIT=()
+_TELEMETRY_HOOK_STATUS="success"
+_TELEMETRY_STEP_PHASE=""
+
+# Register a command to run when the hook exits. Use this from a hook INSTEAD of
+# `trap '…' EXIT`, which would replace the span trap. Cleanups run regardless of
+# the opt-in gate (so containment/cleanup is never silently skipped).
+telemetry_atexit() {
+  _TELEMETRY_ATEXIT+=("$1")
+}
+
+# Record the hook's decision; the span emitted at exit carries it as `status`.
+telemetry_set_status() {
+  _TELEMETRY_HOOK_STATUS="${1:-success}"
+}
+
+# Mark this hook invocation as the named solo-cycle step (red|green|review|push).
+# When set, the hook emits an ADDITIONAL kind=step span at exit alongside its
+# kind=hook span — the cycle-semantic view of the gate firing. Called by the
+# canonical gate hook for each phase.
+telemetry_mark_step() {
+  _TELEMETRY_STEP_PHASE="${1:-}"
+}
+
+# EXIT-trap handler: run registered cleanups, then emit the single hook span.
+# Never changes the hook's exit status — it does not call `exit`, and the span
+# write is failure-swallowed. basename "$0" is the hook script name (metadata).
+_telemetry_hook_exit() {
+  local rc=$? cmd
+  for cmd in "${_TELEMETRY_ATEXIT[@]:-}"; do
+    [ -n "$cmd" ] && { eval "$cmd" >/dev/null 2>&1 || true; }
+  done
+  if [ "${AI_TOOLKIT_TELEMETRY:-}" = "1" ]; then
+    telemetry_emit_span --kind hook --name "$(basename "$0")" \
+      --status "${_TELEMETRY_HOOK_STATUS:-success}" \
+      --start-ms "${_TELEMETRY_HOOK_START_MS:-}"
+    # A gate hook that marked a cycle phase also emits a kind=step span (the
+    # cycle-semantic view), sharing the hook's status and start clock.
+    if [ -n "${_TELEMETRY_STEP_PHASE:-}" ]; then
+      telemetry_emit_span --kind step --name solo-cycle \
+        --phase "$_TELEMETRY_STEP_PHASE" \
+        --status "${_TELEMETRY_HOOK_STATUS:-success}" \
+        --start-ms "${_TELEMETRY_HOOK_START_MS:-}"
+    fi
+  fi
+  return $rc
+}
+
+# Arm the hook span once. Called by utils.sh at source time so the start clock
+# is captured near the hook's beginning. The clock is only read when telemetry
+# is on, so a disabled run pays no extra `date`; the trap is always installed so
+# registered cleanups still run when telemetry is off.
+telemetry_arm_hook_span() {
+  [ -n "${_TELEMETRY_HOOK_ARMED:-}" ] && return 0
+  _TELEMETRY_HOOK_ARMED=1
+  [ "${AI_TOOLKIT_TELEMETRY:-}" = "1" ] && _TELEMETRY_HOOK_START_MS="$(_telemetry_now_ms)"
+  trap '_telemetry_hook_exit' EXIT
+  return 0
+}
