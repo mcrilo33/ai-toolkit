@@ -74,8 +74,13 @@ read it. Before touching code, break the issue body into a task ledger (TaskCrea
 todo per subtask × the solo-cycle steps that apply (ANCHOR/RED/GREEN/REVIEW/PUSH),
 exactly one in_progress. Then implement it following the solo-cycle (/cycle: RED → GREEN →
 REVIEW → PUSH). The task ledger is ephemeral session scratch; issue #N stays the
-durable contract — skip the ledger only if the task is genuinely single-step. Ask me
-before any irreversible step.
+durable contract — skip the ledger only if the task is genuinely single-step. Push your
+own branch on every subtask without asking; when your ledger shows the issue's
+acceptance criteria are all met, that is the final subtask — push and emit the
+`ready/N` marker, also without asking. The routine own-branch push plus ready emission
+needs no approval. Still ask me before genuinely dangerous or irreversible ops:
+force-push / `--force-with-lease`, history rewrites, anything touching the default
+branch (`main`), or deletions outside the worktree. Do NOT self-land — the hub lands #N.
 ```
 
 ### 5. Report the handoff
