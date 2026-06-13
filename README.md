@@ -52,6 +52,9 @@ The sync script reads from `shared/` and generates the correct format for each t
 | **Copilot** | `<repo>/.github/` | `copilot-instructions.md`, `instructions/*.instructions.md` (with `applyTo`), `skills/`, `prompts/*.prompt.md`, `agents/` |
 | **Cursor** | `<repo>/.cursor/` | `rules/*.mdc` (with `description`/`globs`/`alwaysApply`), `skills/` |
 | **Claude** | `<repo>/.claude/` + `CLAUDE.md` | `CLAUDE.md` (guidelines), `skills/` |
+| **Shared** | `<repo>/.ai-toolkit/` | `mcp/review-stamp/` server + `scripts/` (the parallel-worktrees `worktree-*.sh` + `hub-status.sh` helpers) |
+
+The `.ai-toolkit/scripts/` install makes the hub/spoke/land [parallel-worktrees workflow](docs/parallel-worktrees.md) usable in any synced repo with no manual setup — the `hub`, `start-task`, and `land` skills reference the helpers there.
 
 ## Setup
 

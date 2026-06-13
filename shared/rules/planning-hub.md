@@ -41,11 +41,11 @@ reviews the micro-spoke's diff and lands it; it never writes the diff.
   The **issue is the contract** between hub and spoke, so the spoke starts with clean
   context and planning noise never leaks in.
 - **Dispatch.** Once scope is clear, hand off with the `start-task` skill — it creates the
-  issue, spawns the worktree via `scripts/worktree-new.sh`, and seeds the spoke's first
+  issue, spawns the worktree via `.ai-toolkit/scripts/worktree-new.sh`, and seeds the spoke's first
   prompt. Lanes 2 and 3 both route through `start-task`; lane 1 is handled directly from
   the hub as a micro-spoke (see below).
 - **Merge and tear down.** When a spoke's branch is pushed, land it from the hub
-  (`git merge`), push `main`, then `scripts/worktree-done.sh` to remove the worktree.
+  (`git merge`), push `main`, then `.ai-toolkit/scripts/worktree-done.sh` to remove the worktree.
 
 ### Delegating trivial work (micro-spokes)
 
@@ -66,7 +66,7 @@ Full lane-1 flow:
 4. Hub lands it:
 
    ```bash
-   scripts/worktree-land.sh <branch> --local
+   .ai-toolkit/scripts/worktree-land.sh <branch> --local
    ```
 
    `--local` skips upstream guards (micro-spokes never push), accepts a bare local branch
