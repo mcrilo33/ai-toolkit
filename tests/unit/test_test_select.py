@@ -95,6 +95,32 @@ def _make_pytest_stub(bindir: Path, runlog: Path, *, testmon: bool, exit_code: i
     (bindir / "pytest").chmod(0o755)
 
 
+def _make_python_module_stub(bindir: Path, runlog: Path, *, testmon: bool) -> None:
+    """Install a `python3` stub that resolves as the `python3 -m pytest` runner.
+
+    With no `pytest` binary on PATH, detect_pytest falls back to `python3 -m
+    pytest` when `python3 -c 'import pytest'` succeeds. This stub answers that
+    import probe, advertises `--testmon` in `-m pytest --help` (per `testmon`),
+    and logs `RUN <args>` for `-m pytest <args>` — covering the multi-word runner.
+    """
+    bindir.mkdir(parents=True, exist_ok=True)
+    testmon_line = 'echo "  --testmon  select impacted tests"' if testmon else ":"
+    (bindir / "python3").write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "-c" ]; then exit 0; fi\n'  # `import pytest` succeeds
+        'if [ "$1" = "-m" ] && [ "$2" = "pytest" ]; then\n'
+        "  shift 2\n"
+        '  case "$1" in\n'
+        f'    --help|-h) echo "usage: pytest"; {testmon_line}; exit 0 ;;\n'
+        "  esac\n"
+        f'  printf "RUN %s\\n" "$*" >> "{runlog}"\n'
+        "  exit 0\n"
+        "fi\n"
+        "exit 0\n"
+    )
+    (bindir / "python3").chmod(0o755)
+
+
 def _run_select(
     repo: Path, stdin: str, bindir: Path, *, env_extra: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
@@ -193,6 +219,18 @@ def test_mixed_docs_and_python_runs_testmon(repo: Path, tmp_path: Path) -> None:
 
     assert proc.returncode == 0, proc.stderr
     assert "--testmon" in _runlog(runlog)  # docs alongside python stay python-tier
+
+
+def test_python_under_docs_runs_testmon(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    tip = _commit(repo, {"docs/conf.py": "project = 'x'\n"})  # code, not a doc
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "--testmon" in _runlog(runlog)  # a *.py is python even under docs/
 
 
 # --- the full-suite tier: default-to-full safety ---------------------------------
@@ -320,6 +358,32 @@ def test_no_pytest_runs_nothing(repo: Path, tmp_path: Path) -> None:
     )
 
     assert proc.returncode == 0, proc.stderr
+
+
+def test_module_runner_form_uses_testmon(repo: Path, tmp_path: Path) -> None:
+    # With no `pytest` binary, the runner resolves to `python3 -m pytest`; the
+    # multi-word form must still probe testmon and run it for a python diff.
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    sandbox = tmp_path / "mbin"
+    runlog = tmp_path / "run.log"
+    _make_python_module_stub(sandbox, runlog, testmon=True)
+    git_bin = shutil.which("git")
+    assert git_bin, "git must be on PATH for this test"
+    os.symlink(git_bin, sandbox / "git")  # no pytest binary, only python3 -m pytest
+    env = {**_GIT_ENV, "PATH": f"{sandbox}:/usr/bin:/bin"}
+
+    proc = subprocess.run(
+        ["/bin/bash", str(TEST_SELECT)],
+        cwd=str(repo),
+        input=_stdin(tip, base),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "--testmon" in _runlog(runlog)
 
 
 # --- env escape hatches (threaded from worktree-land's --skip-tests/--test-cmd) ---

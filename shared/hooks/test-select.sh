@@ -118,23 +118,25 @@ while read -r _lref lsha _rref rsha; do
 done <<< "$STDIN"
 
 # ── Decide the tier ─────────────────────────────────────────────────────────────
-has_nondoc=0
+# A *.py file is code even when it lives under docs/ (e.g. docs/conf.py): classify
+# it python so testmon can judge its impact, rather than skipping it as a doc.
+has_py=0
 has_other=0
 while IFS= read -r f; do
   [ -n "$f" ] || continue
+  if is_py "$f"; then has_py=1; continue; fi
   if is_doc "$f"; then continue; fi
-  has_nondoc=1
-  is_py "$f" || has_other=1
+  has_other=1
 done <<< "$FILES"
 
 if [ "$CANNOT_PROVE" = "1" ]; then
   DECISION=FULL
-elif [ "$has_nondoc" = "0" ]; then
-  DECISION=NOTHING
 elif [ "$has_other" = "1" ]; then
   DECISION=FULL
-else
+elif [ "$has_py" = "1" ]; then
   DECISION=PYTHON
+else
+  DECISION=NOTHING
 fi
 
 if [ "$DECISION" = "NOTHING" ]; then
@@ -152,7 +154,15 @@ read -r -a RUNNER_ARR <<< "$RUNNER"
 
 runner_has_testmon() {
   # testmon advertises --testmon in `pytest --help` when its plugin is installed.
-  "${RUNNER_ARR[@]}" --help 2>/dev/null | grep -q -- '--testmon'
+  # Capture the help text rather than piping into grep: under pipefail an early
+  # -q match would SIGPIPE the (longer, real) pytest --help into a non-zero exit
+  # and falsely report testmon absent.
+  local help=""
+  help="$("${RUNNER_ARR[@]}" --help 2>/dev/null || true)"
+  case "$help" in
+    *--testmon*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 rc=0
