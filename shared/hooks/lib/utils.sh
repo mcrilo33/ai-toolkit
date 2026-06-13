@@ -616,7 +616,10 @@ run_pytest_node() {
   # corrupted the repo is untrustworthy regardless of its exit code.
   if ! changed="$(cd "$root" && tripwire_check "$before")"; then
     _tripwire_report_breach "$changed" "restoring the snapshot — verdict BREACH (the caller blocks)."
-    (cd "$root" && tripwire_restore "$before")
+    # `|| true`: never let a restore hiccup abort under set -e before the verdict
+    # is printed — an empty verdict matches no caller arm and would silently NOT
+    # block, the exact failure mode this guards against.
+    (cd "$root" && tripwire_restore "$before") || true
     echo "BREACH"
     return 0
   fi
