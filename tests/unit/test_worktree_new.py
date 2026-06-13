@@ -442,7 +442,7 @@ def test_malformed_settings_local_warns_but_does_not_abort(hub: Path) -> None:
     (hub / ".claude" / "settings.local.json").write_text("not json{")
     assert marker.is_file()
 
-    proc = _run_new(hub, "99", "pushguard")
+    proc = _run_new_quiet(hub, "99", "pushguard")
 
     assert proc.returncode == 0, proc.stderr
     spoke_settings = _worktree_dir(hub, "99") / ".claude" / "settings.local.json"
@@ -457,7 +457,7 @@ def test_empty_settings_local_is_not_silently_truncated(hub: Path) -> None:
     _seed_hub_claude(hub)
     (hub / ".claude" / "settings.local.json").write_text("")
 
-    proc = _run_new(hub, "99", "pushguard")
+    proc = _run_new_quiet(hub, "99", "pushguard")
 
     assert proc.returncode == 0, proc.stderr
     assert "merged" not in proc.stdout
@@ -470,7 +470,7 @@ def test_merge_preserves_existing_allow_order(hub: Path) -> None:
     # existing entries keep their order; the push rules append at the end.
     _seed_hub_claude(hub, settings={"permissions": {"allow": ["Bash(z *)", "Bash(m *)"]}})
 
-    proc = _run_new(hub, "99", "pushguard")
+    proc = _run_new_quiet(hub, "99", "pushguard")
 
     assert proc.returncode == 0, proc.stderr
     allow = _load_allowlist(_worktree_dir(hub, "99"))["permissions"]["allow"]
