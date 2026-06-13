@@ -169,3 +169,17 @@ def test_advisory_warns_do_not_block(repo: Path) -> None:
 
     assert push.returncode == 0, push.stderr  # advisory exit codes never block
     assert _remote_sha(repo) == _git(repo, "rev-parse", "HEAD").strip()
+
+
+def test_pre_push_blocks_when_selector_missing(repo: Path) -> None:
+    # Fail closed: a missing selector means the gate can't run, so the push must
+    # be refused rather than shipping untested ("never silently skip tests").
+    seed = _remote_sha(repo)
+    _unpushed_commit(repo)
+    hooks = _install(repo)
+    (_scripts_dir(hooks) / "test-select.sh").unlink()
+
+    push = _push(repo)
+
+    assert push.returncode != 0  # no gate, no ship
+    assert _remote_sha(repo) == seed

@@ -151,11 +151,16 @@ for s in red-proof-warn reviewer-sep-warn; do
   fi
 done
 
-# Blocking gate: the tiered, diff-aware selector. Its exit code becomes the
-# push's — a failing suite aborts the push.
-if [ -x "$SCRIPTS/test-select.sh" ]; then
-  printf '%s\n' "$PREPUSH_REFS" | "$SCRIPTS/test-select.sh" || exit $?
+# Blocking gate: the tiered, diff-aware selector is the single owner of test
+# execution. Fail CLOSED — if it is missing or not executable the gate cannot
+# run, so refuse the push rather than ship untested (re-run install-git-hooks.sh
+# to restore it). Its exit code otherwise becomes the push's: a failing suite
+# aborts the push.
+if [ ! -x "$SCRIPTS/test-select.sh" ]; then
+  echo "pre-push: test-select.sh is missing or not executable — re-run scripts/install-git-hooks.sh" >&2
+  exit 1
 fi
+printf '%s\n' "$PREPUSH_REFS" | "$SCRIPTS/test-select.sh" || exit $?
 exit 0
 # <<< ai-toolkit cage <<<
 HOOK
