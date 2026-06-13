@@ -1,63 +1,49 @@
-"""Suite-wide pytest fixtures.
+"""Project-wide pytest configuration.
 
-WHY THE GIT-HOOK ENV STRIP (issue #30 — DO NOT REMOVE):
+Git exports a set of environment variables to the hooks it runs (``GIT_DIR``,
+``GIT_INDEX_FILE``, …). When this suite is executed FROM a git hook — the
+pre-push test gate (``test-select.sh``) is the live case — those variables are
+inherited by pytest and, in turn, by any test that shells out to ``git``. A test
+that builds a throwaway repo in ``tmp_path`` and runs ``git init`` / ``git
+worktree add`` there would then have its commands silently retargeted at the
+REAL repository (``GIT_DIR`` overrides the subprocess cwd), erroring the test and
+corrupting the working repo.
 
-Git exports ``GIT_DIR``, ``GIT_WORK_TREE``, ``GIT_INDEX_FILE`` and friends into
-the environment of its *native hooks*. The pre-push test gate runs ``pytest``
-from inside such a hook (``test-select.sh`` / the ``red-proof-warn`` backstop), so
-those vars are live in ``os.environ`` for the whole run. Many tests here shell out
-to ``git`` against a throwaway tmpdir; a leaked ``GIT_DIR`` overrides their cwd, so
-without this strip they operate on the REAL repository instead — which is how
-issue #24's push moved the hub's ``main`` to a bogus ``chore: seed`` commit and
-flipped ``core.bare``.
+Strip those variables from ``os.environ`` at import time — this conftest is
+imported before any test module, so the cleanup lands before a test module's
+top-level ``_GIT_ENV = {**os.environ, …}`` capture runs. Every test is then
+hermetic regardless of whether the suite was launched from a shell or a git hook.
+``GIT_EXEC_PATH`` is deliberately preserved (it locates git's own helpers, not a
+target repo).
 
-The strip runs in TWO places, on purpose:
-
-  * at MODULE IMPORT (below) — conftest is imported before any test module is
-    collected, so this guarantees module-level ``{**os.environ}`` snapshots (e.g.
-    ``test_install_git_hooks._GIT_ENV``) cannot capture a leaked pointer; and
-  * via an AUTOUSE fixture — re-strips per test in case anything re-sets the vars
-    mid-session.
-
-See docs/test-gate.md for the rationale. The regression guard is
-tests/unit/test_git_env_isolation.py.
+The list also covers ``GIT_NAMESPACE`` and the ``GIT_CONFIG`` / ``GIT_CONFIG_*``
+family (issue #30): ``GIT_CONFIG_*`` redirects git's config resolution, so a
+leaked value could still steer a child git process. ``GIT_CONFIG_*`` is a family
+(``COUNT``, ``KEY``/``VALUE`` pairs, ``GLOBAL``, ``SYSTEM``) handled by the prefix
+sweep below. The regression guard is ``tests/unit/test_git_env_isolation.py`` —
+do not drop this strip without removing that test's reason to exist.
 """
 
 from __future__ import annotations
 
 import os
 
-import pytest
-
-# Vars git injects into native-hook environments. Any one of them can redirect a
-# child git process away from the repo its cwd names. ``GIT_CONFIG_*`` is a family
-# (COUNT, KEY/VALUE pairs, GLOBAL, SYSTEM) handled by the prefix sweep below.
-_GIT_HOOK_ENV_VARS = (
+_LEAKED_GIT_HOOK_VARS = (
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
     "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
     "GIT_NAMESPACE",
     "GIT_PREFIX",
     "GIT_CONFIG",
+    "GIT_REFLOG_ACTION",
 )
 
+for _var in _LEAKED_GIT_HOOK_VARS:
+    os.environ.pop(_var, None)
 
-def _strip_git_hook_env(environ: os._Environ[str] | dict[str, str]) -> None:
-    """Remove every git-hook env var from *environ* in place (idempotent)."""
-    for var in _GIT_HOOK_ENV_VARS:
-        environ.pop(var, None)
-    for key in [k for k in environ if k.startswith("GIT_CONFIG_")]:
-        environ.pop(key, None)
-
-
-# Strip at import time — before any test MODULE is imported during collection —
-# so module-level os.environ snapshots start clean.
-_strip_git_hook_env(os.environ)
-
-
-@pytest.fixture(autouse=True)
-def _isolate_git_hook_env() -> None:
-    """Re-strip the git-hook env before every test (defends mid-session re-sets)."""
-    _strip_git_hook_env(os.environ)
+# GIT_CONFIG_* is an open-ended family (GIT_CONFIG_COUNT, GIT_CONFIG_KEY_n /
+# GIT_CONFIG_VALUE_n, GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM) — sweep by prefix.
+for _var in [_k for _k in os.environ if _k.startswith("GIT_CONFIG_")]:
+    os.environ.pop(_var, None)

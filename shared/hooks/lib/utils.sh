@@ -6,6 +6,15 @@
 
 set -euo pipefail
 
+# ── Unified telemetry span layer ────────────────────────────────────
+# Source the (self-contained) emit layer from this lib's own directory — both
+# files are synced together into the same hooks/lib/ dir — and arm the per-hook
+# span so every hook that sources utils.sh emits one kind=hook span at exit.
+_UTILS_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=telemetry.sh
+source "$_UTILS_LIB_DIR/telemetry.sh"
+telemetry_arm_hook_span
+
 # ── Read JSON from stdin (capped at 1MB) ────────────────────────────
 read_stdin() {
   head -c 1048576
@@ -294,37 +303,15 @@ scan_for_secret() {
   return 1
 }
 
-# ── Opt-in telemetry event log ──────────────────────────────────────
-# Appends one JSON object per event to
-# ${AI_TOOLKIT_TELEMETRY_DIR:-$HOME/.ai-toolkit/telemetry}/events.jsonl, ONLY
-# when AI_TOOLKIT_TELEMETRY=1 (otherwise a silent no-op that creates nothing).
-# Fields are metadata only: ts (ISO-8601 UTC), hook (script basename), decision
-# (deny/warn), repo (project-root BASENAME, never a path). NEVER log commands,
-# messages, paths, or payload content — deny/warn messages may quote the
-# blocked command (secret-leak risk).
-# Telemetry must be invisible: zero bytes on stdout/stderr, never changes the
-# hook's exit code — the whole body is redirected and failure-swallowed.
-# Reads the hook's global $INPUT payload (if set) to resolve the project root.
+# ── Opt-in telemetry decision record ────────────────────────────────
+# Back-compat shim. A hook no longer writes a per-decision line here; instead
+# every hook invocation emits ONE kind=hook span at exit (see telemetry.sh).
+# This records the decision so that span's `status` reflects deny/warn rather
+# than the default success. Kept so existing deny()/warn() callers are unchanged
+# and any external caller keeps working. Invisible + no-op when telemetry is off
+# (telemetry_set_status only mutates a shell var; nothing is written here).
 telemetry_event() {
-  [ "${AI_TOOLKIT_TELEMETRY:-}" = "1" ] || return 0
-  local decision="${1:-}" dir ts hook root repo
-  {
-    dir="${AI_TOOLKIT_TELEMETRY_DIR:-$HOME/.ai-toolkit/telemetry}"
-    mkdir -p "$dir"
-    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    hook=$(basename "$0")
-    root=$(project_root_from_payload "${INPUT:-}")
-    repo=$(basename "$root")
-    [ -z "$repo" ] && repo="unknown"
-    if command -v jq &>/dev/null; then
-      jq -nc --arg ts "$ts" --arg hook "$hook" --arg decision "$decision" --arg repo "$repo" \
-        '{ts: $ts, hook: $hook, decision: $decision, repo: $repo}' >> "$dir/events.jsonl"
-    else
-      printf '{"ts":"%s","hook":"%s","decision":"%s","repo":"%s"}\n' \
-        "$ts" "$hook" "$decision" "$repo" >> "$dir/events.jsonl"
-    fi
-  } >/dev/null 2>&1 || true
-  return 0
+  telemetry_set_status "${1:-success}"
 }
 
 # ── Deny output (cross-platform) ────────────────────────────────────
