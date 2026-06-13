@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import textwrap
 from pathlib import Path
@@ -505,3 +506,37 @@ class TestTodoLedgerRegistration:
     def test_nudge_registered_as_session_start(self) -> None:
         cfg = generate_claude(parse_hooks_metadata(str(REAL_META)))
         assert _claude_handler(cfg, "SessionStart", "todo-ledger-nudge.sh") is not None
+
+
+# ── rm-scope-guard registration against the REAL shared/hooks/metadata.yml ──
+# rm-scope-guard is a PreToolUse Bash guard like hub-guard: Claude gates it with
+# the same `Bash(rm *)` rule the user's ask backstop uses, and Cursor remaps it
+# onto beforeShellExecution with a command-regex matcher that fires on rm.
+
+
+class TestRmScopeGuardRegistration:
+    SCRIPT = "rm-scope-guard.sh"
+
+    def test_claude_if_is_bash_rm(self) -> None:
+        cfg = generate_claude(parse_hooks_metadata(str(REAL_META)))
+        guard = _claude_handler(cfg, "PreToolUse", self.SCRIPT)
+        assert guard is not None, "rm-scope-guard not registered for Claude PreToolUse"
+        assert guard.get("if") == "Bash(rm *)"
+
+    def test_tier_1(self) -> None:
+        meta = parse_hooks_metadata(str(REAL_META))
+        assert meta["rm-scope-guard"]["__defaults"]["tier"] == "1"
+
+    def test_cursor_wired_to_before_shell_execution(self) -> None:
+        cfg = generate_cursor(parse_hooks_metadata(str(REAL_META)))
+        guard = _cursor_entry(cfg, "beforeShellExecution", self.SCRIPT)
+        assert guard is not None, "rm-scope-guard not wired to Cursor beforeShellExecution"
+
+    def test_cursor_matcher_fires_on_rm_not_on_plain_git(self) -> None:
+        cfg = generate_cursor(parse_hooks_metadata(str(REAL_META)))
+        guard = _cursor_entry(cfg, "beforeShellExecution", self.SCRIPT)
+        assert guard is not None
+        pattern = re.compile(guard["matcher"])
+        assert pattern.search("rm -rf /tmp/x")
+        assert pattern.search("git status && rm /tmp/x")
+        assert not pattern.search("git status --short")
