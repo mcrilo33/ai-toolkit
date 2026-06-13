@@ -116,6 +116,14 @@ class TestViews:
         assert human_count == 1
 
 
+class TestRobustness:
+    def test_legacy_non_span_lines_in_events_are_skipped(self, con) -> None:
+        # The append-only events.jsonl holds a legacy {ts,hook,decision,repo}
+        # line; it must not become a span (no span_id / unknown kind).
+        (n,) = con.execute("SELECT count(*) FROM spans WHERE name = 'old-hook.sh'").fetchone()
+        assert n == 0
+
+
 class TestMissingEvents:
     def test_missing_events_file_yields_pull_only(self) -> None:
         connection = connect(

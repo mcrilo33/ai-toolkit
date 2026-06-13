@@ -43,16 +43,46 @@ def attribute(parsed: ParsedSession, ccusage_costs: dict[str, float]) -> ParsedS
     Returns:
         The same :class:`ParsedSession`, mutated.
     """
-    rate = _session_rates(parsed.usage_events, ccusage_costs)
-    for span in parsed.spans:
-        events = _span_events(span, parsed)
+    attribute_spans(
+        parsed.spans, parsed.usage_events, ccusage_costs, agent_links=parsed.agent_links
+    )
+    return parsed
+
+
+def attribute_spans(
+    spans: list[Span],
+    usage_events: list[UsageEvent],
+    ccusage_costs: dict[str, float],
+    *,
+    agent_links: dict[str, str] | None = None,
+) -> list[Span]:
+    """Attribute tokens and cost to any spans — push or pull (in place).
+
+    The unified dataset feeds push spans (cycle steps, hooks) through here too:
+    a push span brackets the same session ``usage_events`` over its wider window,
+    so its tokens include the narrower pull spans nested inside it.
+
+    Args:
+        spans: Spans to attribute.
+        usage_events: Per-turn usage from the relevant sessions.
+        ccusage_costs: Map of ``session_id`` to ccusage ``totalCost``.
+        agent_links: Map of agent span_id to subagent ``agentId`` — agent spans
+            take their tokens from that subagent transcript instead of bracketing.
+
+    Returns:
+        The same ``spans`` list, mutated.
+    """
+    links = agent_links or {}
+    rate = _session_rates(usage_events, ccusage_costs)
+    for span in spans:
+        events = _span_events(span, usage_events, links)
         span.tokens_in = sum(e.input_tokens for e in events)
         span.tokens_out = sum(e.output_tokens for e in events)
         session_rate = rate.get(span.session_id)
         if session_rate is None:
             continue
         span.cost_usd = session_rate * sum(_event_total(e) for e in events)
-    return parsed
+    return spans
 
 
 def load_ccusage_costs(runner: Callable[[], str] | None = None) -> dict[str, float]:
@@ -92,15 +122,17 @@ def _session_rates(
     return rates
 
 
-def _span_events(span: Span, parsed: ParsedSession) -> list[UsageEvent]:
+def _span_events(
+    span: Span, usage_events: list[UsageEvent], agent_links: dict[str, str]
+) -> list[UsageEvent]:
     if span.kind == "agent":
-        agent_id = parsed.agent_links.get(span.span_id)
+        agent_id = agent_links.get(span.span_id)
         if agent_id is None:
             return []
-        return [e for e in parsed.usage_events if e.source == "subagent" and e.agent_id == agent_id]
+        return [e for e in usage_events if e.source == "subagent" and e.agent_id == agent_id]
     return [
         e
-        for e in parsed.usage_events
+        for e in usage_events
         if e.source == "main"
         and e.session_id == span.session_id
         and _within(e.ts, span.ts_start, span.ts_end)
