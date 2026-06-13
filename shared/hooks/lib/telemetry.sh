@@ -29,7 +29,9 @@
 _telemetry_now_ms() {
   if [ -n "${EPOCHREALTIME:-}" ]; then
     # "1700000000.123456" -> strip the dot, keep ms (first 3 frac digits).
-    local s="${EPOCHREALTIME%%.*}" f="${EPOCHREALTIME#*.}"
+    # The fractional field is not fixed-width ("…0.5" means 500ms, not 5ms), so
+    # right-pad with zeros BEFORE truncating to 3 digits.
+    local s="${EPOCHREALTIME%%.*}" f="${EPOCHREALTIME#*.}000"
     printf '%d' "$((10#$s * 1000 + 10#${f:0:3}))"
     return
   fi
@@ -52,7 +54,11 @@ _telemetry_iso_utc() {
 # ISO-8601 UTC for a given epoch-ms value (so ts_start reflects the real start,
 # not emit time). Falls back to now() if conversion is unavailable.
 _telemetry_iso_from_ms() {
-  local ms="$1" secs=$(( ms / 1000 ))
+  # NOTE: split declaration — a combined `local ms="$1" secs=$(( ms / 1000 ))`
+  # evaluates the arithmetic before `ms` is bound on bash 3.2 (macOS), zeroing
+  # `secs` and pinning ts_start to 1970. Keep these on separate lines.
+  local ms="$1"
+  local secs=$(( ms / 1000 ))
   date -u -r "$secs" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
     || date -u -d "@$secs" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
     || _telemetry_iso_utc

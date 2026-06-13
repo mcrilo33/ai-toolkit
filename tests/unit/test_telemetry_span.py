@@ -196,6 +196,23 @@ class TestSpanSchema:
         assert isinstance(span["duration_ms"], int)
         assert span["duration_ms"] >= 0
 
+    def test_ts_start_reflects_supplied_start_ms(
+        self, project_root: Path, telemetry_dir: Path
+    ) -> None:
+        # --start-ms must drive ts_start, not emit time. 1_700_000_000_000 ms
+        # == 2023-11-14T22:13:20Z. A start clock that decays to epoch zero
+        # (1970) is the bug class this pins.
+        _emit(
+            "--kind lifecycle --name worktree-new --phase spawn "
+            "--status success --start-ms 1700000000000",
+            _env(telemetry_dir),
+            cwd=project_root,
+        )
+
+        span = _read_events(telemetry_dir / "events.jsonl")[0]
+        assert span["ts_start"] == "2023-11-14T22:13:20Z"
+        assert span["ts_start"] < span["ts_end"]
+
     def test_default_phase_and_human_are_null(
         self, project_root: Path, telemetry_dir: Path
     ) -> None:
