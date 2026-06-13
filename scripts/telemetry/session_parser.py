@@ -188,6 +188,8 @@ def _tool_results(records: list[dict]) -> dict[str, dict]:
         message = rec.get("message")
         if not isinstance(message, dict):
             continue
+        # A record's toolUseResult carries the agentId for the agent it spawned;
+        # a user record holds exactly one tool_result, so the id maps 1:1 to it.
         tool_use_result = rec.get("toolUseResult")
         agent_id = tool_use_result.get("agentId") if isinstance(tool_use_result, dict) else None
         for block in message.get("content") or []:

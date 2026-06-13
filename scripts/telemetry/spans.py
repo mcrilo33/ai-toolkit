@@ -74,6 +74,10 @@ class Span:
     tokens_out: int | None = None
     cost_usd: float | None = None
 
+    def __post_init__(self) -> None:
+        if self.kind not in SPAN_KINDS:
+            raise ValueError(f"unknown span kind: {self.kind!r} (expected one of {SPAN_KINDS})")
+
     def to_dict(self) -> dict[str, object]:
         """Serialize in frozen schema field order."""
         return {name: getattr(self, name) for name in SPAN_FIELDS}

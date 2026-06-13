@@ -147,6 +147,10 @@ class TestSchemaConformance:
             assert span.repo == "proj"
             assert span.branch == "feature/22-demo"
 
+    def test_span_rejects_unknown_kind(self) -> None:
+        with pytest.raises(ValueError, match="unknown span kind"):
+            Span(span_id="x", kind="bogus", name="n")
+
 
 class TestPrivacy:
     def test_no_prompt_or_output_text_leaks_into_spans(self, parsed: ParsedSession) -> None:
