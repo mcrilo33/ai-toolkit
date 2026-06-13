@@ -152,6 +152,15 @@ if [ -z "$RUNNER" ]; then
 fi
 read -r -a RUNNER_ARR <<< "$RUNNER"
 
+# Defense-in-depth for issue #30: git exports GIT_DIR/GIT_WORK_TREE/etc. into this
+# hook's environment. tests/conftest.py strips them before fixtures load, but we
+# also drop them for the pytest CHILD here so a test that spawns git before the
+# conftest loads (or a repo without that conftest) can't have its throwaway-repo
+# operations retargeted at the REAL repo. Scoped to the pytest invocation only —
+# this script's own git classification calls above still need GIT_DIR.
+GIT_HOOK_UNSET=(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+  -u GIT_OBJECT_DIRECTORY -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_PREFIX)
+
 runner_has_testmon() {
   # testmon advertises --testmon in `pytest --help` when its plugin is installed.
   # Capture the help text rather than piping into grep: under pipefail an early
@@ -170,15 +179,15 @@ case "$DECISION" in
   PYTHON)
     if runner_has_testmon; then
       note "python-only diff — pytest --testmon"
-      "${RUNNER_ARR[@]}" --testmon || rc=$?
+      "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" --testmon || rc=$?
     else
       note "python-only diff but testmon not installed — full suite"
-      "${RUNNER_ARR[@]}" || rc=$?
+      "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" || rc=$?
     fi
     ;;
   FULL)
     note "non-python or unrecognized changes — full suite"
-    "${RUNNER_ARR[@]}" || rc=$?
+    "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" || rc=$?
     ;;
 esac
 exit "$rc"
