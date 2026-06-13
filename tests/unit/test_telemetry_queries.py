@@ -99,7 +99,9 @@ class TestViews:
         span_count, session_count, total_cost = row
         assert span_count >= 8  # 4 push + 4+ pull
         assert session_count == 1
-        assert total_cost > 0
+        # The run's one session's ccusage total — not a cross-granularity sum of
+        # span costs (which would exceed it by double-counting nested spans).
+        assert total_cost == pytest.approx(2.80)
 
     def test_step_metrics_view_has_red_step_invocation(self, con) -> None:
         (invocations,) = con.execute(
@@ -122,6 +124,14 @@ class TestRobustness:
         # line; it must not become a span (no span_id / unknown kind).
         (n,) = con.execute("SELECT count(*) FROM spans WHERE name = 'old-hook.sh'").fetchone()
         assert n == 0
+
+    def test_partial_push_line_keeps_schema_defaults(self, con) -> None:
+        # A partial line omitting repo/duration_ms/status must not overwrite the
+        # frozen-schema defaults with NULL.
+        row = con.execute(
+            "SELECT repo, duration_ms, status FROM spans WHERE name = 'partial-hook.sh'"
+        ).fetchone()
+        assert row == ("unknown", 0, "success")
 
 
 class TestMissingEvents:

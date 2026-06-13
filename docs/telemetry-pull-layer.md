@@ -56,7 +56,10 @@ in-memory DuckDB (no separate database to run) with:
 - `spans` — the unified table (the 18 schema fields, with `human` flattened to
   `human_type` / `human_wait_ms` for SQL ergonomics).
 - `spoke_run_summary` — per spoke run: span count, distinct sessions, total cost,
-  lifetime.
+  lifetime. `total_cost_usd` is the sum of the run's distinct sessions' ccusage
+  totals — not a sum over `spans.cost_usd`, which would double-count because a
+  step span's cost already includes the spans nested inside it. This makes the
+  run total cross-check against ccusage directly.
 - `step_metrics` — per spoke run and step key (`kind:name[:phase]`): invocation
   count, mean / median duration, total cost, human-interaction count.
 

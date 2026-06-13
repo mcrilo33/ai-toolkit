@@ -80,6 +80,9 @@ def connect(
     if rows:
         placeholders = ", ".join("?" for _ in _COLUMNS)
         con.executemany(f"INSERT INTO spans VALUES ({placeholders})", rows)
+    con.execute("CREATE TABLE session_costs (session_id VARCHAR, cost_usd DOUBLE)")
+    if ccusage_costs:
+        con.executemany("INSERT INTO session_costs VALUES (?, ?)", list(ccusage_costs.items()))
     _create_views(con)
     return con
 
@@ -110,10 +113,16 @@ def _load_push_spans(events_path: Path) -> list[Span]:
             except json.JSONDecodeError:
                 continue
             # The append-only log may hold legacy / partial lines that pre-date
-            # the span schema; keep only well-formed spans.
-            if not record.get("span_id") or record.get("kind") not in SPAN_KINDS:
+            # the span schema; keep only well-formed spans (identity + valid
+            # kind). Skip absent fields so the dataclass defaults apply rather
+            # than overwriting them with None (e.g. repo "unknown", status
+            # "success") on a partial line.
+            if not record.get("span_id") or not record.get("name"):
                 continue
-            spans.append(Span(**{field: record.get(field) for field in SPAN_FIELDS}))
+            if record.get("kind") not in SPAN_KINDS:
+                continue
+            present = {f: v for f in SPAN_FIELDS if (v := record.get(f)) is not None}
+            spans.append(Span(**present))
     return spans
 
 
@@ -147,13 +156,27 @@ def _row(span: dict[str, object]) -> tuple[object, ...]:
 
 def _create_views(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(f"CREATE VIEW span_steps AS SELECT *, {_STEP_KEY_SQL} AS step_key FROM spans")
+    # total_cost_usd is the sum of the run's distinct sessions' ccusage totals —
+    # NOT sum(spans.cost_usd), which would double-count because a step span's
+    # cost already includes the pull spans nested inside it. Sourcing from
+    # session_costs makes the run total cross-check against ccusage directly.
     con.execute(
         "CREATE VIEW spoke_run_summary AS "
-        "SELECT spoke_run_id, count(*) AS span_count, "
-        "count(DISTINCT session_id) AS session_count, "
-        "sum(cost_usd) AS total_cost_usd, "
-        "min(ts_start) AS ts_start, max(ts_end) AS ts_end "
-        "FROM spans GROUP BY spoke_run_id"
+        "WITH lifetime AS ("
+        "  SELECT spoke_run_id, count(*) AS span_count, "
+        "         count(DISTINCT session_id) AS session_count, "
+        "         min(ts_start) AS ts_start, max(ts_end) AS ts_end "
+        "  FROM spans GROUP BY spoke_run_id"
+        "), run_cost AS ("
+        "  SELECT d.spoke_run_id, sum(sc.cost_usd) AS total_cost_usd "
+        "  FROM (SELECT DISTINCT spoke_run_id, session_id FROM spans) d "
+        "  JOIN session_costs sc ON d.session_id = sc.session_id "
+        "  GROUP BY d.spoke_run_id"
+        ") "
+        "SELECT l.spoke_run_id, l.span_count, l.session_count, "
+        "       c.total_cost_usd, l.ts_start, l.ts_end "
+        "FROM lifetime l "
+        "LEFT JOIN run_cost c ON l.spoke_run_id IS NOT DISTINCT FROM c.spoke_run_id"
     )
     con.execute(
         "CREATE VIEW step_metrics AS "
