@@ -279,3 +279,52 @@ telemetry_emit_span() {
   } >/dev/null 2>&1 || true
   return 0
 }
+
+# ── hook auto-span ──────────────────────────────────────────────────
+# Every hook that sources the hook lib (utils.sh) emits exactly one kind=hook
+# span at exit, with status = the decision recorded by deny()/warn() (else
+# success). A tiny atexit stack lets a hook that needs its OWN cleanup compose
+# with the span instead of clobbering the single bash EXIT-trap slot.
+
+_TELEMETRY_ATEXIT=()
+_TELEMETRY_HOOK_STATUS="success"
+
+# Register a command to run when the hook exits. Use this from a hook INSTEAD of
+# `trap '…' EXIT`, which would replace the span trap. Cleanups run regardless of
+# the opt-in gate (so containment/cleanup is never silently skipped).
+telemetry_atexit() {
+  _TELEMETRY_ATEXIT+=("$1")
+}
+
+# Record the hook's decision; the span emitted at exit carries it as `status`.
+telemetry_set_status() {
+  _TELEMETRY_HOOK_STATUS="${1:-success}"
+}
+
+# EXIT-trap handler: run registered cleanups, then emit the single hook span.
+# Never changes the hook's exit status — it does not call `exit`, and the span
+# write is failure-swallowed. basename "$0" is the hook script name (metadata).
+_telemetry_hook_exit() {
+  local rc=$? cmd
+  for cmd in "${_TELEMETRY_ATEXIT[@]:-}"; do
+    [ -n "$cmd" ] && { eval "$cmd" >/dev/null 2>&1 || true; }
+  done
+  if [ "${AI_TOOLKIT_TELEMETRY:-}" = "1" ]; then
+    telemetry_emit_span --kind hook --name "$(basename "$0")" \
+      --status "${_TELEMETRY_HOOK_STATUS:-success}" \
+      --start-ms "${_TELEMETRY_HOOK_START_MS:-}"
+  fi
+  return $rc
+}
+
+# Arm the hook span once. Called by utils.sh at source time so the start clock
+# is captured near the hook's beginning. The clock is only read when telemetry
+# is on, so a disabled run pays no extra `date`; the trap is always installed so
+# registered cleanups still run when telemetry is off.
+telemetry_arm_hook_span() {
+  [ -n "${_TELEMETRY_HOOK_ARMED:-}" ] && return 0
+  _TELEMETRY_HOOK_ARMED=1
+  [ "${AI_TOOLKIT_TELEMETRY:-}" = "1" ] && _TELEMETRY_HOOK_START_MS="$(_telemetry_now_ms)"
+  trap '_telemetry_hook_exit' EXIT
+  return 0
+}
