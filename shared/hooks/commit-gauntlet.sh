@@ -50,10 +50,12 @@ COMMAND=$(get_shell_command "$INPUT")
 is_git_commit "$COMMAND" || exit 0
 
 # Cycle step: a NON-RED commit is the solo-cycle GREEN gate (a RED commit —
-# carrying a Tested-RED: trailer — is red-proof-verify's gate, not green). Mark
-# before the staged/linter early-exits below so the green step is recorded even
-# when the gauntlet then no-ops (e.g. nothing staged, or no linter present).
-if ! echo "$COMMAND" | grep -qiE '(^|[[:space:]"'"'"'])Tested-RED:[[:space:]]*\S'; then
+# carrying a Tested-RED: trailer — is red-proof-verify's gate, not green). Reuse
+# extract_tested_red_nodes (red-proof-verify's own detector) as the single
+# source of truth so green/red attribution can never drift. Mark before the
+# staged/linter early-exits below so the green step is recorded even when the
+# gauntlet then no-ops (e.g. nothing staged, or no linter present).
+if [ -z "$(extract_tested_red_nodes "$COMMAND")" ]; then
   telemetry_mark_step green
 fi
 

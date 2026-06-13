@@ -79,6 +79,25 @@ class TestReportSpans:
         assert "worktree-new" in out
         assert "deny" in out
 
+    def test_surfaces_cycle_phase_of_step_spans(self, events_file: Path) -> None:
+        # Step spans share the constant name "solo-cycle"; the distinguishing
+        # dimension is phase. The report must surface phases, not collapse them.
+        events_file.write_text(
+            "\n".join(
+                [
+                    _span(kind="step", name="solo-cycle", phase="red", status="success"),
+                    _span(kind="step", name="solo-cycle", phase="push", status="warn"),
+                ]
+            )
+            + "\n"
+        )
+
+        result = _run(events_file)
+
+        assert result.returncode == 0
+        assert "red" in result.stdout
+        assert "push" in result.stdout
+
     def test_reports_total_event_count(self, events_file: Path) -> None:
         events_file.write_text("\n".join(_span() for _ in range(3)) + "\n")
 
