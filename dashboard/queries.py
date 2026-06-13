@@ -20,6 +20,7 @@ nothing is re-derived here.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -115,6 +116,39 @@ class SpanStore:
         ``spans`` views, hand that connection here instead of re-ingesting JSONL.
         """
         return cls(con)
+
+    @classmethod
+    def from_telemetry(
+        cls,
+        *,
+        events_path: str | Path,
+        projects_root: str | Path,
+        ccusage_costs: dict[str, float] | None = None,
+        scripts_dir: str | Path | None = None,
+    ) -> SpanStore:
+        """Build a store from Issue #22's correlated unified-span dataset.
+
+        Issue #22's ``telemetry.queries.connect`` parses session logs, joins the
+        push ``events.jsonl`` spans, and ccusage-attributes tokens/cost — then
+        exposes a ``spans`` table whose columns match this module's exactly, so
+        every query here runs against it unchanged. This is the live path; the
+        JSONL constructors are for fixtures and the raw log.
+
+        The import is lazy and ``scripts_dir`` (the ai-toolkit ``scripts/``
+        directory) is added to ``sys.path`` only here, so the fixture path and
+        the unit suite never depend on the ``telemetry`` package being importable.
+        ``ccusage_costs`` is reused verbatim — costs are never re-derived here.
+        """
+        if scripts_dir is not None:
+            sys.path.insert(0, str(scripts_dir))
+        from telemetry.queries import connect
+
+        con = connect(
+            events_path=Path(events_path),
+            projects_root=Path(projects_root),
+            ccusage_costs=ccusage_costs or {},
+        )
+        return cls.from_connection(con)
 
     def close(self) -> None:
         self.con.close()
@@ -275,6 +309,64 @@ class SpanStore:
         result.sort(
             key=lambda r: (-abs(r["delta_duration_ms"]), r["kind"], r["name"], r["phase"] or "")
         )
+        return result
+
+    def automatability_candidates(self, *, min_frequency: int = 1) -> list[dict[str, Any]]:
+        """Rank human-interaction points by how worth automating they look.
+
+        Groups spans that waited on a human (``human_type`` set) by
+        ``(name, phase, human_type)`` and scores each group by
+        ``frequency * consistency * on_critical_path``:
+
+        - ``frequency`` — how often the interaction occurs.
+        - ``consistency`` — modal-status fraction (the share of the most common
+          outcome); high means low decision variance, so a rule could likely
+          replace the human.
+        - ``on_critical_path`` — fraction of the spans that are ``step`` or
+          ``lifecycle`` (blocking the workflow's spine) rather than incidental.
+
+        Reports ``mean_wait_ms`` too. This only SURFACES candidates; judging
+        whether one is truly automatable is a later LLM-judge step. Groups below
+        ``min_frequency`` are dropped; rows sort by score descending.
+        """
+        groups = self._query(
+            """
+            SELECT
+                name, phase, human_type,
+                COUNT(*) AS frequency,
+                AVG(human_wait_ms) AS mean_wait_ms,
+                AVG(CASE WHEN kind IN ('step', 'lifecycle') THEN 1.0 ELSE 0.0 END)
+                    AS on_critical_path
+            FROM spans
+            WHERE human_type IS NOT NULL
+            GROUP BY name, phase, human_type
+            """
+        )
+        # Modal-status count per group, computed in Python: a SQL self-join on
+        # (name, phase, human_type) would drop null-phase groups (NULL != NULL).
+        status_rows = self._query(
+            """
+            SELECT name, phase, human_type, COUNT(*) AS cnt
+            FROM spans
+            WHERE human_type IS NOT NULL
+            GROUP BY name, phase, human_type, status
+            """
+        )
+        modal: dict[tuple[Any, Any, Any], int] = {}
+        for row in status_rows:
+            key = (row["name"], row["phase"], row["human_type"])
+            modal[key] = max(modal.get(key, 0), row["cnt"])
+
+        result: list[dict[str, Any]] = []
+        for group in groups:
+            if group["frequency"] < min_frequency:
+                continue
+            key = (group["name"], group["phase"], group["human_type"])
+            consistency = modal[key] / group["frequency"]
+            group["consistency"] = consistency
+            group["score"] = group["frequency"] * consistency * group["on_critical_path"]
+            result.append(group)
+        result.sort(key=lambda r: (-r["score"], r["name"], r["phase"] or "", r["human_type"]))
         return result
 
 

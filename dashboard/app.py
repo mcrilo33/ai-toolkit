@@ -15,7 +15,9 @@ file is the thin presentation layer.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
+from typing import Any
 
 # `queries` is the sibling module in this directory; it resolves because
 # `streamlit run dashboard/app.py` injects the script's directory onto sys.path.
@@ -23,6 +25,18 @@ import queries
 import streamlit as st
 
 _DEFAULT_TELEMETRY_DIR = Path.home() / ".ai-toolkit" / "telemetry"
+_DEFAULT_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+
+def _scripts_dir() -> Path:
+    """The ai-toolkit ``scripts/`` dir (sibling of ``dashboard/``) holding #22."""
+    return Path(__file__).resolve().parent.parent / "scripts"
+
+
+def resolve_projects_dir() -> Path:
+    """Claude session-logs root for Issue #22's pull-span parser."""
+    base = os.environ.get("AI_TOOLKIT_PROJECTS_DIR")
+    return Path(base) if base else _DEFAULT_PROJECTS_DIR
 
 
 def resolve_span_log() -> Path:
@@ -50,6 +64,33 @@ def _load_events(path: str, mtime: float) -> list[dict]:
 def load_store(path: Path) -> queries.SpanStore:
     mtime = path.stat().st_mtime
     return queries.SpanStore.from_events(_load_events(str(path), mtime))
+
+
+@st.cache_resource(show_spinner=False)
+def _ccusage_costs() -> dict[str, float]:
+    """Best-effort per-session ccusage cost map; empty on any failure.
+
+    ccusage is an external ``npx`` tool, not a Python dep — if it is absent or
+    errors, cost columns simply read blank rather than breaking the dashboard.
+    """
+    try:
+        sys.path.insert(0, str(_scripts_dir()))
+        from telemetry.cost import load_ccusage_costs
+
+        return load_ccusage_costs()
+    except Exception:
+        return {}
+
+
+@st.cache_resource(show_spinner=True)
+def load_correlated_store(span_log: str, projects_dir: str) -> queries.SpanStore:
+    """Build a store over Issue #22's correlated push+pull span dataset."""
+    return queries.SpanStore.from_telemetry(
+        events_path=span_log,
+        projects_root=projects_dir,
+        ccusage_costs=_ccusage_costs(),
+        scripts_dir=_scripts_dir(),
+    )
 
 
 def _fmt_secs(ms: int | float | None) -> str:
@@ -111,7 +152,7 @@ def render_spoke_view(store: queries.SpanStore) -> None:
         _render_node(root)
 
 
-def _step_label(row: dict) -> str:
+def _step_label(row: dict[str, Any]) -> str:
     label = f"{row['kind']} · {row['name']}"
     if row["phase"]:
         label += f" · {row['phase']}"
@@ -151,14 +192,21 @@ def render_aggregate_view(store: queries.SpanStore) -> None:
     st.dataframe(table, use_container_width=True, hide_index=True)
 
 
+def _delta_arrow(value: float) -> str:
+    """Less is better across time/cost/human, so a negative delta improves."""
+    return "🔻" if value < 0 else ("🔺" if value > 0 else "▪️")
+
+
 def _fmt_delta_secs(ms: float) -> str:
-    arrow = "🔻" if ms < 0 else ("🔺" if ms > 0 else "▪️")
-    return f"{arrow} {ms / 1000:+.1f}s"
+    return f"{_delta_arrow(ms)} {ms / 1000:+.1f}s"
 
 
 def _fmt_delta_cost(usd: float) -> str:
-    arrow = "🔻" if usd < 0 else ("🔺" if usd > 0 else "▪️")
-    return f"{arrow} {usd:+.4f}"
+    return f"{_delta_arrow(usd)} {usd:+.4f}"
+
+
+def _fmt_delta_count(value: float) -> str:
+    return f"{_delta_arrow(value)} {value:+.2f}"
 
 
 def render_compare_view(store: queries.SpanStore) -> None:
@@ -191,7 +239,7 @@ def render_compare_view(store: queries.SpanStore) -> None:
             "n (A→B)": f"{row['n_a']}→{row['n_b']}",
             "Δ time/inv": _fmt_delta_secs(row["delta_duration_ms"]),
             "Δ cost/inv": _fmt_delta_cost(row["delta_cost_usd"]),
-            "Δ human/inv": f"{row['delta_human_per_invocation']:+.2f}",
+            "Δ human/inv": _fmt_delta_count(row["delta_human_per_invocation"]),
             "Confidence": "⚠️ low" if row["low_confidence"] else "ok",
         }
         for row in rows
@@ -199,29 +247,84 @@ def render_compare_view(store: queries.SpanStore) -> None:
     st.dataframe(table, use_container_width=True, hide_index=True)
 
 
+def _interaction_label(row: dict[str, Any]) -> str:
+    label = f"{row['human_type']} · {row['name']}"
+    if row["phase"]:
+        label += f" · {row['phase']}"
+    return label
+
+
+def render_automatability_view(store: queries.SpanStore) -> None:
+    st.header("Automatability candidates")
+    st.caption(
+        "Human interactions ranked by frequency x low decision-variance x "
+        "on-critical-path. This surfaces what's worth a closer look — it does "
+        "not decide whether an interaction is actually automatable."
+    )
+
+    min_freq = st.slider("Minimum frequency", 1, 10, 1)
+    rows = store.automatability_candidates(min_frequency=min_freq)
+    if not rows:
+        st.info("No human interactions recorded.")
+        return
+
+    table = [
+        {
+            "Interaction": _interaction_label(row),
+            "Score": f"{row['score']:.2f}",
+            "Freq": row["frequency"],
+            "Consistency": f"{row['consistency']:.0%}",
+            "On critical path": f"{row['on_critical_path']:.0%}",
+            "Mean wait": _fmt_secs(row["mean_wait_ms"]),
+        }
+        for row in rows
+    ]
+    st.dataframe(table, use_container_width=True, hide_index=True)
+
+
+def _resolve_store(span_log: Path) -> queries.SpanStore | None:
+    """Pick the span source from the sidebar and build the store, or warn."""
+    correlated = st.sidebar.toggle("Correlate via Issue #22 (session logs + ccusage)", value=False)
+    if not correlated:
+        st.sidebar.caption(f"Raw push-span log:\n`{span_log}`")
+        if not span_log.exists():
+            st.warning(
+                f"Span log not found at `{span_log}`. Set `AI_TOOLKIT_TELEMETRY=1` "
+                "to record spans, or point `AI_TOOLKIT_SPAN_LOG` at an existing log."
+            )
+            return None
+        return load_store(span_log)
+
+    projects_dir = resolve_projects_dir()
+    st.sidebar.caption(f"Push log:\n`{span_log}`\nSession logs:\n`{projects_dir}`")
+    if not projects_dir.exists():
+        st.warning(
+            f"Claude session logs not found at `{projects_dir}`. Set "
+            "`AI_TOOLKIT_PROJECTS_DIR`, or switch off correlation."
+        )
+        return None
+    return load_correlated_store(str(span_log), str(projects_dir))
+
+
 def main() -> None:
     st.set_page_config(page_title="Workflow observability", layout="wide")
     st.title("Workflow observability dashboard")
     st.caption("100% local · metrics only, never prompt content")
 
-    span_log = resolve_span_log()
-    st.sidebar.subheader("Span log")
-    st.sidebar.code(str(span_log))
-    if not span_log.exists():
-        st.warning(
-            f"Span log not found at `{span_log}`. Set `AI_TOOLKIT_TELEMETRY=1` to "
-            "record spans, or point `AI_TOOLKIT_SPAN_LOG` at an existing log."
-        )
+    st.sidebar.subheader("Span source")
+    store = _resolve_store(resolve_span_log())
+    if store is None:
         return
 
-    store = load_store(span_log)
-    view = st.sidebar.radio("View", ["Spoke", "Aggregate", "A/B compare"])
+    view = st.sidebar.radio("View", ["Spoke", "Aggregate", "A/B compare", "Automatability"])
     if view == "Spoke":
         render_spoke_view(store)
     elif view == "Aggregate":
         render_aggregate_view(store)
     elif view == "A/B compare":
         render_compare_view(store)
+    elif view == "Automatability":
+        render_automatability_view(store)
 
 
 if __name__ == "__main__":
