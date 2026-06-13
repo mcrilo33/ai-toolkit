@@ -43,6 +43,7 @@ set -euo pipefail
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/lib/utils.sh"
+source "$HOOK_DIR/lib/scope-guard.sh"
 
 INPUT=$(read_stdin)
 COMMAND=$(get_shell_command "$INPUT")
@@ -91,24 +92,10 @@ esac
 # Resolution requires python3 (macOS /bin/realpath has no -m).
 command -v python3 >/dev/null 2>&1 || exit 0
 
-# ── Resolve a target to an absolute physical path ────────────────────
-# realpath -m semantics: symlinks resolved for the existing prefix, `..`
-# squashed lexically past it (targets may not exist yet). Relative targets
-# need a known base — empty base + relative target fails (Cursor reports an
-# empty cwd; a relative rm there is unprovable).
-resolve_path() {
-  local base="$1" target="$2"
-  python3 -c '
-import os, sys
-
-base, target = sys.argv[1], sys.argv[2]
-if not os.path.isabs(target):
-    if not base:
-        sys.exit(1)
-    target = os.path.join(base, target)
-print(os.path.realpath(target))
-' "$base" "$target" 2>/dev/null
-}
+# Target resolution (sg_resolve_path), the protected-path test
+# (sg_is_protected), the read-only benign-segment list (sg_is_benign_segment),
+# and the quote-aware compound splitter (sg_walk_segments) are shared with
+# chmod-scope-guard via lib/scope-guard.sh.
 
 # ── Anchor everything to the PAYLOAD cwd (never hub assumptions) ─────
 # Claude delivers the live session cwd at the payload top level (it tracks
@@ -123,7 +110,7 @@ print(os.path.realpath(target))
 CWD=$(json_field "$INPUT" "cwd")
 ROOT=""
 if [ -n "$CWD" ]; then
-  CWD=$(resolve_path "" "$CWD") || CWD=""
+  CWD=$(sg_resolve_path "" "$CWD") || CWD=""
 fi
 if [ -n "$CWD" ]; then
   ROOT=$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null || true)
@@ -140,7 +127,7 @@ else
   fi
 fi
 if [ -n "$ROOT" ]; then
-  ROOT=$(resolve_path "" "$ROOT") || ROOT=""
+  ROOT=$(sg_resolve_path "" "$ROOT") || ROOT=""
 fi
 if [ -n "$ROOT" ] && [ "$ROOT" = "${HOME:-}" ]; then
   ROOT=""
@@ -159,31 +146,17 @@ fi
 # semantics, but a zsh-executing platform would equals-expand them to PATH
 # binaries far outside any scope this hook proved.
 check_target() {
-  local t="$1" resolved rel lc
+  local t="$1" resolved
   case "$t" in
     =*) return 1 ;;
   esac
-  resolved=$(resolve_path "$CWD" "$t") || return 1
+  resolved=$(sg_resolve_path "$CWD" "$t") || return 1
   [ -n "$resolved" ] || return 1
-  [ "$resolved" = "/" ] && return 1
-  [ "$resolved" = "${HOME:-/nonexistent}" ] && return 1
-  case "$(basename "$resolved" | tr '[:upper:]' '[:lower:]')" in
-    .env*) return 1 ;;
-  esac
-  if [ -d "$resolved" ] && [ -n "$(find "$resolved" -iname '.env*' 2>/dev/null | head -1)" ]; then
-    return 1
-  fi
+  sg_is_protected "$resolved" "$ROOT" && return 1
   if [ -n "$ROOT" ]; then
     [ "$resolved" = "$ROOT" ] && return 1
     case "$resolved" in
-      "$ROOT"/*)
-        rel="${resolved#"$ROOT"/}"
-        lc=$(printf '%s' "$rel" | tr '[:upper:]' '[:lower:]')
-        case "$lc" in
-          .git | .git/* | .claude | .claude/settings* | .review | .review/*) return 1 ;;
-          *) return 0 ;;
-        esac
-        ;;
+      "$ROOT"/*) return 0 ;;
     esac
   fi
   case "$resolved" in
@@ -223,32 +196,11 @@ check_rm_segment() {
   [ "$found_target" -eq 1 ]
 }
 
-# ── Is a non-rm segment read-only/benign? ────────────────────────────
-# The built-in list from issue #13: git status/log/diff/rev-parse, ls, head,
-# tail, grep, cat, echo. None can write without redirection, and redirection
-# was globally rejected above. Pre-subcommand git global flags are restricted
-# to a known-safe allowlist (-C <path>, --no-pager, -P) rather than a wildcard
-# passthrough — a bare `-[^space]+` would vouch for `git --exec-path=…` and
-# `-c <write-config>` forms whose read-only subcommand can be turned into a
-# write or code-exec primitive. Post-subcommand, git's own --output flag is
-# still a file-write primitive, so any --output spelling disqualifies it.
-is_benign_segment() {
-  local seg="$1"
-  if printf '%s' "$seg" | grep -qE '^(ls|head|tail|grep|cat|echo)([[:space:]]|$)'; then
-    return 0
-  fi
-  if printf '%s' "$seg" \
-    | grep -qE '^git([[:space:]]+(-C[[:space:]]+[^[:space:]]+|--no-pager|-P))*[[:space:]]+(status|log|diff|rev-parse)([[:space:]]|$)'; then
-    printf '%s' "$seg" | grep -qE -- '--output' && return 1
-    return 0
-  fi
-  return 1
-}
-
 # ── Validate one split-out segment ───────────────────────────────────
 # Empty segments (a trailing `;`) are skipped. An rm segment must pass the
 # scope test and flips RM_SEEN — the whole command needs at least one, or
-# this hook has nothing to vouch for. Everything else must be benign.
+# this hook has nothing to vouch for. Everything else must be on the shared
+# read-only benign list (sg_is_benign_segment).
 RM_SEEN=0
 check_segment() {
   local seg="$1"
@@ -261,63 +213,9 @@ check_segment() {
       check_rm_segment "$seg"
       ;;
     *)
-      is_benign_segment "$seg"
+      sg_is_benign_segment "$seg"
       ;;
   esac
-}
-
-# ── Quote-aware compound split ───────────────────────────────────────
-# Walk the command once, tracking single/double-quote state ($ and backtick
-# are already banned, so quoted content is inert). At top level, `&&`, `||`,
-# `;`, and `|` end a segment, which is validated immediately; a lone `&`
-# (background) and unbalanced quotes fall through. Each segment must pass
-# check_segment, and at least one must be an rm.
-check_compound() {
-  local cmd="$1" seg="" ch next i=0 len in_sq=0 in_dq=0
-  len=${#cmd}
-  while [ "$i" -lt "$len" ]; do
-    ch=${cmd:$i:1}
-    if [ "$in_sq" -eq 1 ]; then
-      [ "$ch" = "'" ] && in_sq=0
-      seg+=$ch
-      i=$((i + 1))
-      continue
-    fi
-    if [ "$in_dq" -eq 1 ]; then
-      [ "$ch" = '"' ] && in_dq=0
-      seg+=$ch
-      i=$((i + 1))
-      continue
-    fi
-    case "$ch" in
-      "'") in_sq=1; seg+=$ch ;;
-      '"') in_dq=1; seg+=$ch ;;
-      ';')
-        check_segment "$seg" || return 1
-        seg=""
-        ;;
-      '&')
-        next=${cmd:$((i + 1)):1}
-        [ "$next" = '&' ] || return 1
-        i=$((i + 1))
-        check_segment "$seg" || return 1
-        seg=""
-        ;;
-      '|')
-        next=${cmd:$((i + 1)):1}
-        [ "$next" = '|' ] && i=$((i + 1))
-        check_segment "$seg" || return 1
-        seg=""
-        ;;
-      *) seg+=$ch ;;
-    esac
-    i=$((i + 1))
-  done
-  if [ "$in_sq" -eq 1 ] || [ "$in_dq" -eq 1 ]; then
-    return 1
-  fi
-  check_segment "$seg" || return 1
-  [ "$RM_SEEN" -eq 1 ]
 }
 
 # ── Allow output (cross-platform) ────────────────────────────────────
@@ -342,5 +240,9 @@ allow() {
   exit 0
 }
 
-check_compound "$COMMAND" || exit 0
+# Split the command on shell separators (quote-aware) and validate every
+# segment; then require at least one rm segment, or this hook has nothing to
+# vouch for. Either failing → silent (the ask rule still prompts).
+sg_walk_segments "$COMMAND" check_segment || exit 0
+[ "$RM_SEEN" -eq 1 ] || exit 0
 allow "rm-scope-guard: every rm target resolves inside the project root or /tmp and every chained segment is read-only — auto-allowed (out-of-scope or protected paths still prompt)"

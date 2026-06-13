@@ -256,3 +256,23 @@ rm-scope-guard:
   cursor:
     event: beforeShellExecution
     matcher: "(^|[;&|] *)rm( |$)"
+
+# chmod-scope-guard (issue #27): the third scope-guard sibling (rm → push →
+# chmod). Auto-allow a chmod that uses a provably-safe mode (no setuid/setgid,
+# no world/group-write, not recursive) on static literal targets strictly
+# inside the project root — and, for compound commands, whose every other
+# segment is read-only or a pytest invocation. Stay SILENT otherwise so the
+# user's `Bash(chmod *)` ask rule keeps prompting. Never denies. Wired exactly
+# like rm-scope-guard: Claude gates it with the same `Bash(chmod *)` rule the
+# ask backstop uses; Cursor remaps onto beforeShellExecution with a command
+# regex that fires on chmod at a segment boundary.
+chmod-scope-guard:
+  event: preToolUse
+  matcher: Bash
+  description: "Auto-allow chmod with a safe mode on static in-repo targets (read-only/pytest chained segments only); stay silent otherwise so the ask rule still prompts"
+  tier: 1
+  claude:
+    if: "Bash(chmod *)"
+  cursor:
+    event: beforeShellExecution
+    matcher: "(^|[;&|] *)chmod( |$)"
