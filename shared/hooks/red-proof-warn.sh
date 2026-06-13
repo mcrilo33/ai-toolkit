@@ -104,6 +104,7 @@ fi
 # (hard deny on Cursor, advisory elsewhere) instead of being skipped.
 FAILING_NODES=""
 BOOTSTRAP_NODES=""
+BREACH_NODES=""
 SEEN=""
 while IFS= read -r node; do
   [ -z "$node" ] && continue
@@ -113,8 +114,19 @@ while IFS= read -r node; do
     PASS) ;;
     FAIL) FAILING_NODES="$FAILING_NODES\n  • $node" ;;
     BOOTSTRAP) BOOTSTRAP_NODES="$BOOTSTRAP_NODES\n  • $node" ;;
+    BREACH) BREACH_NODES="$BREACH_NODES\n  • $node" ;;
   esac
 done <<< "$RED_NODES"
+
+if [ -n "$BREACH_NODES" ]; then
+  ship_gate_enforce "$INPUT" "red-proof (green backstop): these Tested-RED nodes mutated the real repo
+when run at push — a test escaped isolation (issue #31):$(echo -e "$BREACH_NODES")
+
+The tripwire restored the repo, but a node that moves a ref or flips git config
+is corrupting the checkout, not proving the shipped code. Fix the test's
+isolation (own tmpdir only), then push again. On Cursor the push is BLOCKED
+until no Tested-RED node mutates the repo."
+fi
 
 if [ -n "$BOOTSTRAP_NODES" ]; then
   ship_gate_enforce "$INPUT" "red-proof (green backstop): these Tested-RED nodes could not be RUN at push —

@@ -563,7 +563,9 @@ detect_pytest() {
 
 # ── Classify a pytest run for RED/GREEN proof ───────────────────────
 # Runs a SINGLE pytest node and maps the outcome to a proof verdict, printed as
-# one of: PASS | FAIL | BOOTSTRAP.
+# one of: PASS | FAIL | BOOTSTRAP | BREACH. BREACH (issue #31) signals the node
+# mutated the real repo and was rolled back — callers must treat it as a block,
+# never PASS/FAIL.
 #
 # The hard part is telling a genuine RED state apart from an environment that
 # cannot run the test at all — the former must adjudicate, the latter must
@@ -587,9 +589,15 @@ detect_pytest() {
 #
 # Usage: run_pytest_node <project_root> <node_id>
 run_pytest_node() {
-  local root="$1" node="$2" runner raw rc
+  local root="$1" node="$2" runner raw rc before changed
   runner=$(detect_pytest "$root")
   [ -z "$runner" ] && { echo "BOOTSTRAP"; return 0; }
+
+  # Issue #31: snapshot the real repo's integrity markers around the node run, the
+  # same tripwire the gate uses. The env -u strip below keeps a git-shelling node
+  # in its own tmpdir; if a node escapes anyway and mutates THIS repo, restore the
+  # snapshot and report BREACH so the caller blocks instead of trusting the run.
+  before="$(cd "$root" && tripwire_capture)"
 
   # -p no:cacheprovider: never write a cache (sandbox-safe, no side effects).
   # --no-header -q: quiet. Run only the named node.
@@ -603,6 +611,15 @@ run_pytest_node() {
             -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_PREFIX \
             -u GIT_CONFIG -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM -u GIT_CONFIG_COUNT \
         $runner -p no:cacheprovider --no-header -q "$node" 2>&1) && rc=0 || rc=$?
+
+  # Tripwire verdict takes precedence over the pass/fail outcome: a node that
+  # corrupted the repo is untrustworthy regardless of its exit code.
+  if ! changed="$(cd "$root" && tripwire_check "$before")"; then
+    _tripwire_report_breach "$changed" "restoring the snapshot — verdict BREACH (the caller blocks)."
+    (cd "$root" && tripwire_restore "$before")
+    echo "BREACH"
+    return 0
+  fi
 
   case "$rc" in
     0) echo "PASS" ; return 0 ;;
@@ -792,25 +809,33 @@ tripwire_restore() {
   _tripwire_restore_cfg core.worktree "$(_tripwire_cfg_value "$before" core.worktree)"
 }
 
+# Print a breach report to stderr: the header, each changed marker (one per
+# line), and the caller's action line. Shared by run_under_tripwire (the gate)
+# and run_pytest_node (the red-proof backstop) so both speak the same language.
+_tripwire_report_breach() {
+  local changed="$1" action="$2" m
+  {
+    echo "tripwire: REPO-INTEGRITY BREACH — the test run mutated THIS repo:"
+    while IFS= read -r m; do
+      [ -n "$m" ] && echo "tripwire:   - $m"
+    done <<< "$changed"
+    echo "tripwire: a test escaped isolation and wrote to the real repo (issue #31)."
+    echo "tripwire: $action"
+  } >&2
+}
+
 # Run "$@" under the tripwire. On a clean run, returns the command's own exit
 # code. On a breach (the run changed THIS repo's markers), restores the snapshot,
 # prints which markers moved to stderr, and returns TRIPWIRE_BREACH_RC so the
 # caller aborts the push.
 run_under_tripwire() {
-  local before changed rc=0 m
+  local before changed rc=0
   before="$(tripwire_capture)"
   "$@" || rc=$?
   if changed="$(tripwire_check "$before")"; then
     return "$rc"
   fi
-  {
-    echo "tripwire: REPO-INTEGRITY BREACH — the test gate mutated THIS repo:"
-    while IFS= read -r m; do
-      [ -n "$m" ] && echo "tripwire:   - $m"
-    done <<< "$changed"
-    echo "tripwire: a test escaped isolation and wrote to the real repo (issue #31)."
-    echo "tripwire: restoring the snapshot and ABORTING the push."
-  } >&2
+  _tripwire_report_breach "$changed" "restoring the snapshot and ABORTING the push."
   tripwire_restore "$before"
   return "$TRIPWIRE_BREACH_RC"
 }
