@@ -288,6 +288,7 @@ telemetry_emit_span() {
 
 _TELEMETRY_ATEXIT=()
 _TELEMETRY_HOOK_STATUS="success"
+_TELEMETRY_STEP_PHASE=""
 
 # Register a command to run when the hook exits. Use this from a hook INSTEAD of
 # `trap '…' EXIT`, which would replace the span trap. Cleanups run regardless of
@@ -299,6 +300,14 @@ telemetry_atexit() {
 # Record the hook's decision; the span emitted at exit carries it as `status`.
 telemetry_set_status() {
   _TELEMETRY_HOOK_STATUS="${1:-success}"
+}
+
+# Mark this hook invocation as the named solo-cycle step (red|green|review|push).
+# When set, the hook emits an ADDITIONAL kind=step span at exit alongside its
+# kind=hook span — the cycle-semantic view of the gate firing. Called by the
+# canonical gate hook for each phase.
+telemetry_mark_step() {
+  _TELEMETRY_STEP_PHASE="${1:-}"
 }
 
 # EXIT-trap handler: run registered cleanups, then emit the single hook span.
@@ -313,6 +322,14 @@ _telemetry_hook_exit() {
     telemetry_emit_span --kind hook --name "$(basename "$0")" \
       --status "${_TELEMETRY_HOOK_STATUS:-success}" \
       --start-ms "${_TELEMETRY_HOOK_START_MS:-}"
+    # A gate hook that marked a cycle phase also emits a kind=step span (the
+    # cycle-semantic view), sharing the hook's status and start clock.
+    if [ -n "${_TELEMETRY_STEP_PHASE:-}" ]; then
+      telemetry_emit_span --kind step --name solo-cycle \
+        --phase "$_TELEMETRY_STEP_PHASE" \
+        --status "${_TELEMETRY_HOOK_STATUS:-success}" \
+        --start-ms "${_TELEMETRY_HOOK_START_MS:-}"
+    fi
   fi
   return $rc
 }

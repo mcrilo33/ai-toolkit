@@ -34,6 +34,9 @@ else
   printf '%s' "$INPUT" | grep -q "code-review" || exit 0
 fi
 
+# Cycle step: a code-review subagent starting IS the solo-cycle REVIEW gate.
+telemetry_mark_step review
+
 PROJECT_ROOT=$(project_root_from_payload "$INPUT")
 mkdir -p "$PROJECT_ROOT/.review"
 date +%s > "$PROJECT_ROOT/.review/.window"

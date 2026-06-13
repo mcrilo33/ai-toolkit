@@ -49,6 +49,14 @@ COMMAND=$(get_shell_command "$INPUT")
 # Boundary-aware: chained/prefixed forms (`cd x && git commit`) must not bypass.
 is_git_commit "$COMMAND" || exit 0
 
+# Cycle step: a NON-RED commit is the solo-cycle GREEN gate (a RED commit —
+# carrying a Tested-RED: trailer — is red-proof-verify's gate, not green). Mark
+# before the staged/linter early-exits below so the green step is recorded even
+# when the gauntlet then no-ops (e.g. nothing staged, or no linter present).
+if ! echo "$COMMAND" | grep -qiE '(^|[[:space:]"'"'"'])Tested-RED:[[:space:]]*\S'; then
+  telemetry_mark_step green
+fi
+
 # Resolve the repo from the payload (do not trust cwd — empty on Cursor's
 # beforeShellExecution). Falls back to walking up from cwd.
 PROJECT_ROOT=$(project_root_from_payload "$INPUT")
