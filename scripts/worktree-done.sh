@@ -27,6 +27,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=worktree-lib.sh
 . "$SCRIPT_DIR/worktree-lib.sh"
 
+# Span start clock for the lifecycle/teardown span emitted before removal.
+WT_T0="$(wt_now_ms)"
+
 # Position-independent flag parsing; reject unknown options instead of swallowing
 # them into the target.
 TARGET=""
@@ -82,6 +85,11 @@ while IFS=$'\t' read -r wt br; do
     break
   fi
 done < <(wt_task_worktrees "$REPO_ROOT")
+
+# --- telemetry: lifecycle/teardown span --------------------------------------
+# Emit BEFORE removal so the worktree's spoke_run_id file is still readable.
+# No-op unless AI_TOOLKIT_TELEMETRY=1.
+wt_emit_lifecycle "worktree-done" "teardown" "success" "$WT_T0" "$WT_DIR"
 
 echo "→ removing worktree: $WT_DIR"
 if ! git worktree remove $FORCE "$WT_DIR"; then

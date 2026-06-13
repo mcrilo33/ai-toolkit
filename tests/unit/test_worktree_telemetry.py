@@ -54,7 +54,10 @@ def hub(tmp_path: Path) -> Path:
     for k, v in (("user.email", "t@t.t"), ("user.name", "t"), ("commit.gpgsign", "false")):
         _git(hub, "config", k, v)
     (hub / "README.md").write_text("seed\n")
-    _git(hub, "add", "README.md")
+    # .ai-toolkit/ holds synced runtime state (incl. the minted spoke-run-id) and
+    # is gitignored in every real repo, so it never counts as a dirty worktree.
+    (hub / ".gitignore").write_text(".ai-toolkit/\n")
+    _git(hub, "add", "README.md", ".gitignore")
     _git(hub, "commit", "-qm", "chore: seed", "-m", "Refs #0")
     _git(hub, "remote", "add", "origin", str(remote))
     _git(hub, "push", "-q", "-u", "origin", "main")

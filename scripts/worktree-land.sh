@@ -34,6 +34,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=worktree-lib.sh
 . "$SCRIPT_DIR/worktree-lib.sh"
 
+# Span start clock for the lifecycle/land span emitted after a successful merge.
+WT_T0="$(wt_now_ms)"
+
 TARGET=""
 SKIP_TESTS=""
 KEEP_BRANCH=""
@@ -193,6 +196,11 @@ fi
 echo "→ pushing $DEFAULT to origin"
 git push origin "$DEFAULT" \
   || wt_die "push failed — the merge is local-only. Fix the remote and re-run, or back out: git reset --keep $PRE_SHA"
+
+# --- telemetry: lifecycle/land span ----------------------------------------------
+# Emit AFTER the merge+push succeeds but BEFORE teardown, while the worktree (and
+# its spoke_run_id) still exists. No-op unless AI_TOOLKIT_TELEMETRY=1.
+[ -n "$WT_DIR" ] && wt_emit_lifecycle "worktree-land" "land" "success" "$WT_T0" "$WT_DIR"
 
 if [ -n "$WT_DIR" ]; then
   bash "$SCRIPT_DIR/worktree-done.sh" "$WT_DIR" ${KEEP_BRANCH:+--keep-branch}
