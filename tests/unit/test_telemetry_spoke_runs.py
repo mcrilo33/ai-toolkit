@@ -14,6 +14,7 @@ runs that invoked a step a different number of times.
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
@@ -24,22 +25,22 @@ from telemetry.spoke_runs import backfill_spoke_run_ids, group_spoke_runs
 RUN_A = "feature/22-demo+1700000000"
 RUN_B = "feature/22-other+1700009999"
 
+_BASE = Span(
+    span_id="s",
+    kind="step",
+    name="solo-cycle",
+    phase="red",
+    session_id="sess-1",
+    spoke_run_id=RUN_A,
+    ts_start="2026-06-13T12:00:00Z",
+    ts_end="2026-06-13T12:00:01Z",
+    duration_ms=1000,
+    cost_usd=0.1,
+)
+
 
 def _span(**over) -> Span:
-    base = dict(
-        span_id="s",
-        kind="step",
-        name="solo-cycle",
-        phase="red",
-        session_id="sess-1",
-        spoke_run_id=RUN_A,
-        ts_start="2026-06-13T12:00:00Z",
-        ts_end="2026-06-13T12:00:01Z",
-        duration_ms=1000,
-        cost_usd=0.1,
-    )
-    base.update(over)
-    return Span(**base)
+    return replace(_BASE, **over)
 
 
 class TestBackfill:
