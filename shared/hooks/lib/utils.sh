@@ -609,10 +609,12 @@ run_pytest_node() {
   # env -u GIT_*: this backstop runs from the pre-push hook, where git exports
   # GIT_DIR/GIT_WORK_TREE/etc.; drop them for the pytest child (defense-in-depth
   # behind tests/conftest.py, issue #30) so a node that shells out to git hits
-  # its own tmpdir, never the REAL repo.
+  # its own tmpdir, never the REAL repo. The GIT_CONFIG_* KEY/VALUE family that
+  # `env -u` can't glob is left to the conftest layer.
   raw=$(cd "$root" && PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" \
         env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY \
             -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_PREFIX \
+            -u GIT_CONFIG -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM -u GIT_CONFIG_COUNT \
         $runner -p no:cacheprovider --no-header -q "$node" 2>&1) && rc=0 || rc=$?
 
   case "$rc" in

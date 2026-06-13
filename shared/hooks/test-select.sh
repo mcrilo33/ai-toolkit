@@ -42,6 +42,18 @@ source "$HOOK_DIR/lib/utils.sh"
 
 note() { echo "test-select: $*" >&2; }
 
+# Defense-in-depth for issue #30: git exports GIT_DIR/GIT_WORK_TREE/etc. into this
+# hook's environment. tests/conftest.py strips them before fixtures load, but we
+# also drop them for every pytest CHILD here so a test that spawns git before the
+# conftest loads (or a repo without that conftest) can't have its throwaway-repo
+# operations retargeted at the REAL repo. Scoped to the pytest invocations only —
+# this script's own git classification calls below still need GIT_DIR.
+# The repo-targeting vars are stripped here; the GIT_CONFIG_* family (KEY/VALUE_n
+# pairs that `env -u` can't glob) is the conftest layer's job.
+GIT_HOOK_UNSET=(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+  -u GIT_OBJECT_DIRECTORY -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_PREFIX \
+  -u GIT_CONFIG -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM -u GIT_CONFIG_COUNT)
+
 # Drain git's pre-push stdin up front: the env escape hatches exit early, and an
 # unread pipe would hand the caller a SIGPIPE under pipefail.
 STDIN="$(cat || true)"
@@ -54,7 +66,9 @@ fi
 if [ -n "${TEST_SELECT_CMD:-}" ]; then
   note "running custom suite (TEST_SELECT_CMD)"
   rc=0
-  bash -c "$TEST_SELECT_CMD" || rc=$?
+  # The custom suite is a test command too (worktree-land --test-cmd) — run it
+  # under the same git-hook env strip so it can't reach the real repo either.
+  "${GIT_HOOK_UNSET[@]}" bash -c "$TEST_SELECT_CMD" || rc=$?
   exit "$rc"
 fi
 
@@ -151,15 +165,6 @@ if [ -z "$RUNNER" ]; then
   exit 0
 fi
 read -r -a RUNNER_ARR <<< "$RUNNER"
-
-# Defense-in-depth for issue #30: git exports GIT_DIR/GIT_WORK_TREE/etc. into this
-# hook's environment. tests/conftest.py strips them before fixtures load, but we
-# also drop them for the pytest CHILD here so a test that spawns git before the
-# conftest loads (or a repo without that conftest) can't have its throwaway-repo
-# operations retargeted at the REAL repo. Scoped to the pytest invocation only —
-# this script's own git classification calls above still need GIT_DIR.
-GIT_HOOK_UNSET=(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
-  -u GIT_OBJECT_DIRECTORY -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_PREFIX)
 
 runner_has_testmon() {
   # testmon advertises --testmon in `pytest --help` when its plugin is installed.

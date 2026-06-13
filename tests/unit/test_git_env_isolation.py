@@ -111,12 +111,16 @@ def test_child_pytest_does_not_corrupt_repo_when_git_dir_leaks(tmp_path: Path) -
         **_clean_env(),
         "GIT_DIR": str(decoy / ".git"),
     }
-    subprocess.run(
+    child = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(childdir)],
         env=polluted,
         capture_output=True,
         text=True,
     )
+
+    # The child must run its commit to completion — otherwise a clean decoy would
+    # prove nothing (a crashed child never reaches the commit either way).
+    assert child.returncode == 0, f"child pytest did not pass:\n{child.stdout}\n{child.stderr}"
 
     # ── The decoy must be exactly as we left it ─────────────────────────────────
     assert _git(decoy, "rev-parse", "HEAD") == head_before, (
