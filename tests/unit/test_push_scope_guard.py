@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -84,6 +85,32 @@ def run_guard(payload: str, cwd: Path) -> subprocess.CompletedProcess:
         cwd=str(cwd),
         env=_hook_env(),
     )
+
+
+def allow_decision(payload: str, cwd: Path, *, env: dict[str, str] | None = None) -> str | None:
+    """Run the guard; return the emitted permissionDecision or None when silent.
+
+    The allow path is reached only when no clause enforced (so a deny/warn is
+    never weakened): the hook either prints a single ``permissionDecision:
+    allow`` JSON object on stdout, or stays silent (no parseable allow) so the
+    user's ``Bash(git push)`` ask stays the backstop. Asserts exit 0 always.
+    """
+    proc = subprocess.run(
+        ["bash", str(HOOK)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        cwd=str(cwd),
+        env=env if env is not None else _hook_env(),
+    )
+    assert proc.returncode == ALLOW, proc.stderr
+    out = proc.stdout.strip()
+    if not out:
+        return None
+    try:
+        return json.loads(out)["hookSpecificOutput"]["permissionDecision"]
+    except (ValueError, KeyError):
+        return None
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -524,3 +551,143 @@ def test_outside_git_repo_allows(tmp_path: Path) -> None:
     result = run_guard(payload, cwd=outside)
 
     assert result.returncode == ALLOW
+
+
+# ── AUTO-ALLOW: a provably-own-branch spoke push removes the prompt ────────────
+# Issue #24: the hook already detects the own-branch case; it must now EMIT
+# `hookSpecificOutput.permissionDecision: allow` so the redundant manual click
+# disappears. The decision space stays two-valued — allow or silent (prompt) —
+# and an out-of-scope clause still enforces (deny/warn) BEFORE the allow path,
+# so a deny is never weakened.
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(f"git push origin {OWN}", id="own-branch"),
+        pytest.param(f"git push -u origin {OWN}", id="first-push-with-u"),
+        pytest.param(f"git push --set-upstream origin {OWN}", id="set-upstream-long"),
+        pytest.param("git push origin HEAD", id="head-counts-as-own"),
+        pytest.param(f"git push origin {OWN}:{OWN}", id="explicit-own-refspec"),
+        pytest.param(f"git push origin HEAD:{OWN}", id="head-to-own"),
+        pytest.param(f"git push -u origin '{OWN}'", id="single-quoted-own"),
+        pytest.param(f"git push -u origin {OWN} 2>&1", id="own-with-redirect"),
+    ],
+)
+def test_spoke_allows_provably_own_branch_push(spoke: Path, command: str) -> None:
+    assert allow_decision(_payload(command), spoke) == "allow"
+
+
+def test_spoke_allows_own_branch_push_cursor_shape(spoke: Path) -> None:
+    # The allow decision is cross-platform (Cursor beforeShellExecution too).
+    payload = _cursor_shell_payload(f"git push -u origin {OWN}", root=spoke)
+
+    assert allow_decision(payload, spoke) == "allow"
+
+
+def test_spoke_allows_bare_push_with_own_upstream(spoke: Path) -> None:
+    _git(spoke, "push", "-q", "-u", "origin", OWN)
+
+    assert allow_decision(_payload("git push"), spoke) == "allow"
+
+
+# ── STILL SILENT → the normal prompt fires (no false allow) ───────────────────
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(f"git push --force origin {OWN}", id="force"),
+        pytest.param(f"git push -f origin {OWN}", id="force-short"),
+        pytest.param(f"git push -fu origin {OWN}", id="force-bundled-short"),
+        pytest.param("git push --tags origin", id="tags-flag"),
+        pytest.param(f"git push --follow-tags origin {OWN}", id="follow-tags"),
+        pytest.param(f"git push --force-with-lease origin {OWN}", id="force-with-lease"),
+        pytest.param(f"git push --force-if-includes origin {OWN}", id="force-if-includes"),
+        pytest.param(f"git push origin +{OWN}", id="forced-refspec"),
+        pytest.param(f"git push --no-verify origin {OWN}", id="no-verify"),
+        pytest.param(f"git push --delete origin {OWN}", id="delete-flag"),
+        pytest.param("git push --mirror origin", id="mirror"),
+        pytest.param("git push --all origin", id="all"),
+        pytest.param("git push origin refs/tags/v1.0.0", id="tag"),
+        pytest.param(f"git push origin {OTHER}", id="other-task-branch"),
+        pytest.param("git push origin main", id="default-branch"),
+        pytest.param('git push -u origin "$BRANCH"', id="dynamic-branch"),
+        pytest.param(f"cd /tmp && git push -u origin {OWN}", id="non-push-chained"),
+        pytest.param(f"git push origin {OWN} && 1", id="trailing-numeric-clause"),
+        pytest.param(f"git push origin {OWN}; 9 9", id="trailing-numeric-args"),
+        pytest.param(f"git push origin {OWN} && tee log", id="trailing-real-command"),
+    ],
+)
+def test_spoke_silent_on_non_provable_push(spoke: Path, command: str) -> None:
+    # None of these are a provable bare own-branch push, so the hook must NOT
+    # emit an allow — the user's ask prompt (or the advisory warn) stands.
+    assert allow_decision(_payload(command), spoke) is None
+
+
+def test_spoke_silent_on_bare_push_without_upstream(spoke: Path) -> None:
+    # No upstream → the target cannot be proven; degrade to silent (prompt),
+    # never a false allow.
+    assert allow_decision(_payload("git push"), spoke) is None
+
+
+# ── HUB never auto-allows (publishing keeps its own flow) ─────────────────────
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param("git push origin main", id="default-branch"),
+        pytest.param("git push", id="bare"),
+    ],
+)
+def test_hub_never_auto_allows(hub: Path, command: str) -> None:
+    assert allow_decision(_payload(command), hub) is None
+
+
+# ── jq-less platforms fall through to silent (no false allow) ─────────────────
+
+
+@pytest.fixture()
+def no_jq_path(tmp_path: Path) -> str:
+    """A PATH bindir with the hook's helpers symlinked but jq deliberately
+    absent, so `command -v jq` fails inside the hook."""
+    bindir = tmp_path / "nojqbin"
+    bindir.mkdir()
+    tools = [
+        "bash",
+        "sh",
+        "dirname",
+        "basename",
+        "head",
+        "grep",
+        "sed",
+        "tr",
+        "cat",
+        "git",
+        "env",
+        "awk",
+        "date",
+        "mktemp",
+        "rm",
+        "find",
+        "python3",
+        "shasum",
+        "sha256sum",
+        "cut",
+        "sort",
+        "uniq",
+    ]
+    for tool in tools:
+        resolved = shutil.which(tool)
+        if resolved:
+            os.symlink(resolved, bindir / tool)
+    return str(bindir)
+
+
+def test_spoke_silent_without_jq(spoke: Path, no_jq_path: str) -> None:
+    # Same own-branch push that allows WITH jq must stay silent without it.
+    env = _hook_env()
+    env["PATH"] = no_jq_path
+
+    assert allow_decision(_payload(f"git push -u origin {OWN}"), spoke, env=env) is None
