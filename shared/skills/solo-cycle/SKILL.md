@@ -67,6 +67,15 @@ Push only the task's own branch — `git push [-u] origin <branch>`.
 branch or another task's ref: the spoke's origin branch is ephemeral staging,
 and `main` is published exclusively from the hub.
 
+Push **without prompting** the user. An own-branch push is low-stakes and
+force-push-recoverable, it targets the spoke's own ephemeral branch (never
+`main`), and every hard gate — red-proof, commit-gauntlet, the review artifact —
+has already passed before you reach PUSH. There is no human judgment left at
+push time; the one human checkpoint is `/land <id>` on the hub. Still ask before
+genuinely dangerous or irreversible ops — force-push / `--force-with-lease`,
+history rewrites, a push touching the default branch, or deletions outside the
+worktree — but never for the routine own-branch push (or the marker below).
+
 ## The final-push marker
 
 A per-subtask push looks identical to task completion — clean tree, branch pushed.
@@ -78,6 +87,15 @@ and only then — emit a `ready/<issue>` git tag at the branch tip:
 git tag ready/<issue>
 git push origin ready/<issue>
 ```
+
+**Completion is agent-determined, not a human call.** You decide a subtask is the
+final one by checking the issue's **acceptance criteria** against your task ledger:
+every criterion met (every box tickable) means the whole issue is done. On that final
+push, emit the marker **automatically, with no human prompt**; a mid-cycle push emits
+no marker. The push-only-vs-push-plus-ready choice is deterministic — "is this the
+final subtask?" — so there is nothing for the human to adjudicate. The marker merges
+nothing and is trivially reversible (delete/re-tag); the real, gated decision is
+`/land <id>` on the hub, 30 seconds later.
 
 This is the whole-issue ship gate, distinct from the per-subtask push gate. The hub's
 `hub-status.sh` flips the branch from `pushed (in progress)` to `pushed → mergeable`
