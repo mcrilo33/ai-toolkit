@@ -70,10 +70,12 @@ code ~/Repos/ai-toolkit
 ```
 
 > [!NOTE]
-> The helper scripts must be present on `main` so that every worktree branched from it
-> carries them. They live under `scripts/`; if a worktree reports `no such file`, the
-> branch predates the merge — run the script from the main checkout by absolute path,
-> or merge the scripts into `main`.
+> The skills and the `planning-hub` rule invoke the helpers at the canonical
+> `.ai-toolkit/scripts/` path so the same reference resolves in this checkout and in any
+> synced target. `sync-to-repo.sh` installs them there (see
+> [Installing into another repo](#installing-the-workflow-into-another-repo)); the
+> ai-toolkit checkout gets them by syncing into itself. The hub commands run on the main
+> checkout, where `.ai-toolkit/scripts/` lives — spokes never invoke them directly.
 
 ## The scripts
 
@@ -83,6 +85,30 @@ code ~/Repos/ai-toolkit
 | `scripts/worktree-land.sh` | Land a pushed branch from the hub: guards → merge → suite → push → teardown → issue close |
 | `scripts/worktree-done.sh` | Resolve a worktree by issue / slug / branch / path and tear it down safely |
 | `scripts/worktree-lib.sh` | Shared slugify + main-root + worktree-resolution helpers (sourced by the others) |
+
+The paths above are the **source** locations in this repo. In a synced target the same
+four scripts (plus `hub-status.sh`) live under `.ai-toolkit/scripts/` — see below.
+
+## Installing the workflow into another repo
+
+The hub/spoke/land flow is not specific to the ai-toolkit checkout: `sync-to-repo.sh`
+installs it into **any** repo, with no manual steps afterwards.
+
+```bash
+./scripts/sync-to-repo.sh ~/Repos/my-project
+```
+
+This copies `worktree-{new,land,done,lib}.sh` and `hub-status.sh` into
+`my-project/.ai-toolkit/scripts/` (executable, manifest-tracked, consistent with the
+`.ai-toolkit/mcp/` convention). The `hub`, `start-task`, and `land` skills and the
+`planning-hub` rule all invoke the scripts via that canonical `.ai-toolkit/scripts/`
+path, which resolves identically in the ai-toolkit checkout and in the synced target —
+so no sync-time path rewrite is needed.
+
+The scripts locate the main checkout by git introspection (`wt_main_root` via
+`git worktree list`) and source their siblings by their own directory, so they run
+unmodified from `.ai-toolkit/scripts/` in a foreign repo. After a sync, run `/hub` in
+`my-project` and the dashboard, dispatch, and land commands work there directly.
 
 ## The daily loop
 

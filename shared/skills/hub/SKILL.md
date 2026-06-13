@@ -12,7 +12,8 @@ status", or starts a fresh main-checkout session and wants to get oriented.
 
 - Run from the **main checkout** (the hub), which stays on `main`.
 - `gh` authenticated (issue survey degrades gracefully without it).
-- The worktree scripts exist on `main` (`scripts/worktree-new.sh`, `worktree-done.sh`).
+- The worktree scripts are installed at `.ai-toolkit/scripts/` (`worktree-new.sh`,
+  `worktree-done.sh`) — `sync-to-repo.sh` puts them there in any synced repo.
 
 ## Workflow
 
@@ -27,7 +28,7 @@ is a task branch or you are inside a worktree, you are a **spoke** — stop and 
 Run the dashboard:
 
 ```bash
-bash shared/skills/hub/scripts/hub-status.sh
+bash .ai-toolkit/scripts/hub-status.sh
 ```
 
 It reports, read-only:
@@ -63,11 +64,11 @@ anything that changes state:
 |------------------|-----------------|-----|
 | Open issue, `no worktree` | Start it | `start-task` skill (creates issue if needed + spawns spoke) |
 | New idea, no issue yet | Define then dispatch | discuss scope → `start-task` |
-| Branch `pushed → mergeable` | Land and tear down | `/land <id>` (`land` skill → `scripts/worktree-land.sh`) |
+| Branch `pushed → mergeable` | Land and tear down | `/land <id>` (`land` skill → `.ai-toolkit/scripts/worktree-land.sh`) |
 | Branch `pushed (in progress)` | Leave it — spoke pushed a subtask but isn't done | paste the row's `↳ jump:` command; land only once it flips to `mergeable` (or `--force-land` for a branch that never carries a marker) |
 | Branch `unpushed` / `dirty` | Leave it — spoke still working | paste the row's `↳ jump:` command to reach its pane |
-| Trivial non-executable change (docs/wording) | Lane 1 micro-spoke | spawn subagent with `isolation: worktree`, review diff, land with `scripts/worktree-land.sh <branch> --local` |
-| Small obvious one-subtask change (code) | Lane 2 express spoke | `worktree-new.sh <slug>` (no issue), single cycle, all push gates |
+| Trivial non-executable change (docs/wording) | Lane 1 micro-spoke | spawn subagent with `isolation: worktree`, review diff, land with `.ai-toolkit/scripts/worktree-land.sh <branch> --local` |
+| Small obvious one-subtask change (code) | Lane 2 express spoke | `.ai-toolkit/scripts/worktree-new.sh <slug>` (no issue), single cycle, all push gates |
 
 Never auto-merge or auto-teardown. Restate the branch/issue and the exact command, get a
 quick yes, then run it. Merges and teardowns happen **on the hub**; task edits never do.
@@ -99,7 +100,7 @@ For the triage heuristic and lane definitions see `shared/rules/workflow.md`.
 3. **Land** with:
 
    ```bash
-   scripts/worktree-land.sh <branch> --local
+   .ai-toolkit/scripts/worktree-land.sh <branch> --local
    ```
 
    `--local` skips upstream guards (micro-spokes never push). It accepts a bare local

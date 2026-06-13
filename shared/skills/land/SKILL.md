@@ -4,7 +4,7 @@ Land a finished task from the hub: `/land <id>`. The hub starts and ends tasks; 
 only execute. A spoke's push is its ship gate — landing (merge, suite, push, teardown,
 issue close) happens **here**, on the main checkout, never inside the worktree.
 
-The deterministic sequence lives in `scripts/worktree-land.sh`; this skill orchestrates
+The deterministic sequence lives in `.ai-toolkit/scripts/worktree-land.sh`; this skill orchestrates
 it: pick the target, confirm, run, then report and refresh the hub picture.
 
 ## Preconditions
@@ -23,7 +23,7 @@ it: pick the target, confirm, run, then report and refresh the hub picture.
 ### 1. Identify the landing target
 
 Resolve `<id>` (issue number, slug, branch, or worktree path) against the live
-worktrees — `bash shared/skills/hub/scripts/hub-status.sh` if the state is not already
+worktrees — `bash .ai-toolkit/scripts/hub-status.sh` if the state is not already
 known. If the branch is `dirty` or `unpushed`, stop: the spoke is still working; landing
 verifies pushes, it never rescues them.
 
@@ -33,7 +33,7 @@ Restate what is about to happen (branch, merge target, teardown) and get a quick
 a land is a merge plus an irreversible teardown. Then:
 
 ```bash
-scripts/worktree-land.sh <id>
+.ai-toolkit/scripts/worktree-land.sh <id>
 ```
 
 | Flag | Effect |
@@ -82,7 +82,7 @@ Then re-run `hub-status.sh` so the next move starts from a fresh picture.
 
 | Situation | Action |
 |-----------|--------|
-| Micro-spoke (lane 1) branch | Review the diff first — lane 1 is non-executable paths only (docs, comments, wording; never `scripts/`, `shared/hooks/`, `tests/`, skill scripts). Then `scripts/worktree-land.sh <branch> --local`: skips upstream guards; no issue to close; the branch is deleted after merge; temp worktree is torn down if still registered |
+| Micro-spoke (lane 1) branch | Review the diff first — lane 1 is non-executable paths only (docs, comments, wording; never `scripts/`, `shared/hooks/`, `tests/`, skill scripts). Then `.ai-toolkit/scripts/worktree-land.sh <branch> --local`: skips upstream guards; no issue to close; the branch is deleted after merge; temp worktree is torn down if still registered |
 | Ad-hoc branch (no issue number) | Lands normally; the issue-close step is skipped |
 | `gh` missing or close fails | Warns; close by hand: `gh issue close <id>` |
 | Push succeeded but teardown failed | Work is shipped; re-run `worktree-done.sh <id>` alone and close the issue by hand |
