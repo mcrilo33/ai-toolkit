@@ -50,6 +50,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -z "${WT_SPOKE:-}" ] \
   || wt_die "this is the spoke session for '$WT_SPOKE' — lands run on the hub. Emit your ready/<issue> marker (your push is your ship gate); the hub will land it."
 
+# Span start clock for the lifecycle/land span emitted after a successful merge.
+WT_T0="$(wt_now_ms)"
+
 TARGET=""
 SKIP_TESTS=""
 KEEP_BRANCH=""
@@ -216,6 +219,11 @@ if ! (
     || wt_die "rollback failed — hub is still on the merged commit; reset by hand: git reset --keep $PRE_SHA"
   wt_die "landing aborted; nothing was pushed. Fix on the branch (push from the spoke when it has one) and re-run."
 fi
+
+# --- telemetry: lifecycle/land span ----------------------------------------------
+# Emit AFTER the merge+push succeeds but BEFORE teardown, while the worktree (and
+# its spoke_run_id) still exists. No-op unless AI_TOOLKIT_TELEMETRY=1.
+[ -n "$WT_DIR" ] && wt_emit_lifecycle "worktree-land" "land" "success" "$WT_T0" "$WT_DIR"
 
 if [ -n "$WT_DIR" ]; then
   bash "$SCRIPT_DIR/worktree-done.sh" "$WT_DIR" ${KEEP_BRANCH:+--keep-branch}

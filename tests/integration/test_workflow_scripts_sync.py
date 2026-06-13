@@ -23,6 +23,9 @@ SYNC_SCRIPT = REPO_ROOT / "scripts" / "sync-to-repo.sh"
 WORKTREE_SCRIPTS = ("worktree-new.sh", "worktree-land.sh", "worktree-done.sh", "worktree-lib.sh")
 SOURCES = {name: REPO_ROOT / "scripts" / name for name in WORKTREE_SCRIPTS}
 SOURCES["hub-status.sh"] = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "hub-status.sh"
+# Co-installed so the worktree scripts can source it as a sibling for lifecycle
+# telemetry (it also lives under .claude/hooks/lib/ for the hooks).
+SOURCES["telemetry.sh"] = REPO_ROOT / "shared" / "hooks" / "lib" / "telemetry.sh"
 
 INSTALLED = {name: f".ai-toolkit/scripts/{name}" for name in SOURCES}
 

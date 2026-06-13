@@ -13,6 +13,37 @@
 wt_die()  { printf '%s: %s\n' "${WT_PROG:-worktree}" "$*" >&2; exit 1; }
 wt_warn() { printf '%s: %s\n' "${WT_PROG:-worktree}" "$*" >&2; }
 
+# --- telemetry (opt-in, optional) ---------------------------------------------
+# Source the shared span emit layer if present, so the worktree scripts can emit
+# lifecycle spans. It is self-contained and gated by AI_TOOLKIT_TELEMETRY=1, so
+# sourcing it is a no-op when telemetry is off. Locate it relative to THIS lib:
+# in the ai-toolkit checkout it lives under shared/hooks/lib/; in a synced target
+# the sync co-locates it next to these scripts in .ai-toolkit/scripts/.
+_WT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for _c in "$_WT_LIB_DIR/telemetry.sh" "$_WT_LIB_DIR/../shared/hooks/lib/telemetry.sh"; do
+  if [ -f "$_c" ]; then . "$_c"; break; fi
+done
+unset _c
+
+# Emit one lifecycle span for a worktree action, attributing it to the SPOKE:
+# run the emit with the worktree as CWD so the span resolves that worktree's
+# spoke_run_id / branch / repo. No-op when the emit layer or telemetry is absent.
+# Usage: wt_emit_lifecycle <name> <phase> <status> <start_ms> <worktree_dir>
+wt_emit_lifecycle() {
+  command -v telemetry_emit_span >/dev/null 2>&1 || return 0
+  local name="$1" phase="$2" status="$3" start_ms="$4" wt="$5"
+  [ -d "$wt" ] || return 0
+  ( cd "$wt" && telemetry_emit_span --kind lifecycle --name "$name" \
+      --phase "$phase" --status "$status" --start-ms "$start_ms" ) || true
+  return 0
+}
+
+# Epoch-ms clock for span start times; empty string when the emit layer is
+# absent (callers pass it through to wt_emit_lifecycle, which then defaults).
+wt_now_ms() {
+  command -v _telemetry_now_ms >/dev/null 2>&1 && _telemetry_now_ms || true
+}
+
 # --- paths --------------------------------------------------------------------
 
 # Canonical absolute path (resolves symlinks, e.g. /tmp -> /private/tmp on macOS).
