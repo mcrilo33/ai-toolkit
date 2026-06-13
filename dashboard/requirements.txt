@@ -1,0 +1,8 @@
+# Dashboard runtime dependencies (Issue #23).
+# Isolated from the repo's own tooling — install into a dedicated venv, never
+# the repo environment. See README.md.
+#
+# Token/cost numbers come from ccusage, invoked by Issue #22 as an external
+# `npx ccusage` (Node, not a Python dep). It is intentionally NOT listed here.
+streamlit>=1.40,<2
+duckdb>=1.1,<2
