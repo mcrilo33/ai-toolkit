@@ -70,12 +70,13 @@ def _make_spoke(hub: Path, tmp_path: Path, branch: str, *, push: bool, merge: bo
 
 
 def _run_done(
-    hub: Path, tmp_path: Path, *args: str, code_exit: int = 0
+    hub: Path, tmp_path: Path, *args: str, code_exit: int = 0, spoke_marker: str | None = None
 ) -> tuple[subprocess.CompletedProcess, Path]:
     """Run worktree-done.sh from the hub with a logging `code` stub on PATH.
 
     The stub appends its argument string to a log (one line per invocation) and
     exits `code_exit` — pass a nonzero value to simulate a VS Code failure.
+    `spoke_marker` sets WT_SPOKE to model a spoke session (issue #26).
     Returns the completed process and the log path."""
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
@@ -85,6 +86,11 @@ def _run_done(
     code.chmod(0o755)
     env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
     env.pop("TMUX", None)
+    # The host's own spoke marker must never steer the guard; set it explicitly
+    # only when a test means to model a spoke session (issue #26).
+    env.pop("WT_SPOKE", None)
+    if spoke_marker is not None:
+        env["WT_SPOKE"] = spoke_marker
     proc = subprocess.run(
         ["bash", str(WORKTREE_DONE), *args],
         cwd=str(hub),
@@ -155,6 +161,31 @@ def test_code_and_remote_failures_are_non_fatal(hub: Path, tmp_path: Path) -> No
     proc, _ = _run_done(hub, tmp_path, "6", code_exit=1)
     assert proc.returncode == 0, proc.stderr
     assert "feature/6-merged" not in _local_branches(hub)  # local delete still ran
+
+
+def test_refuses_when_run_as_spoke_session(hub: Path, tmp_path: Path) -> None:
+    # Teardown is hub-owned: a spoke must not tear down its own worktree. Even a
+    # cleanly-merged worktree (the happy teardown case) must be refused when the
+    # session carries WT_SPOKE (issue #26). No override flag.
+    wt = _make_spoke(hub, tmp_path, "feature/1-spoke", push=True, merge=True)
+
+    proc, _ = _run_done(hub, tmp_path, "1", spoke_marker="1")
+
+    assert proc.returncode != 0
+    assert "spoke" in proc.stderr.lower()
+    assert "hub" in proc.stderr.lower()
+    assert wt.exists()  # worktree untouched
+    assert "feature/1-spoke" in _local_branches(hub)  # branch not pruned
+
+
+def test_tears_down_when_not_a_spoke_session(hub: Path, tmp_path: Path) -> None:
+    # The mirror: with WT_SPOKE unset (the hub), teardown proceeds.
+    wt = _make_spoke(hub, tmp_path, "feature/1-hub", push=True, merge=True)
+
+    proc, _ = _run_done(hub, tmp_path, "1", spoke_marker=None)
+
+    assert proc.returncode == 0, proc.stderr
+    assert not wt.exists()
 
 
 def test_missing_target_dir_does_not_prune_another_branch(hub: Path, tmp_path: Path) -> None:

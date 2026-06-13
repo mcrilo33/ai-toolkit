@@ -27,6 +27,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=worktree-lib.sh
 . "$SCRIPT_DIR/worktree-lib.sh"
 
+# --- guard: role, not directory (issue #26) -------------------------------------
+# A spoke must not tear down its own worktree (it strands the very tmux window
+# it runs in). worktree-new.sh stamps the spoke session with WT_SPOKE, which
+# rides every command it runs, so refuse here before any work. No override flag.
+# The hub is user-started and never carries WT_SPOKE, so it tears down freely —
+# including worktree-land.sh's internal call, which inherits the hub's clean env.
+[ -z "${WT_SPOKE:-}" ] \
+  || wt_die "this is the spoke session for '$WT_SPOKE' — teardowns run on the hub. Emit your ready/<issue> marker (your push is your ship gate); the hub will tear it down after landing."
+
 # Position-independent flag parsing; reject unknown options instead of swallowing
 # them into the target.
 TARGET=""

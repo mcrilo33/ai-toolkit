@@ -41,6 +41,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=worktree-lib.sh
 . "$SCRIPT_DIR/worktree-lib.sh"
 
+# --- guard: role, not directory (issue #26) -------------------------------------
+# A spoke's claude has full filesystem access, so it can cd into the main checkout
+# and slip past a "must run from the hub" directory check. worktree-new.sh stamps
+# the spoke session with WT_SPOKE; that marker rides every command it runs, so
+# refuse here before any work. No override flag — an escape hatch is exactly how a
+# spoke would self-land again. The hub is user-started and never carries WT_SPOKE.
+[ -z "${WT_SPOKE:-}" ] \
+  || wt_die "this is the spoke session for '$WT_SPOKE' — lands run on the hub. Emit your ready/<issue> marker (your push is your ship gate); the hub will land it."
+
 TARGET=""
 SKIP_TESTS=""
 KEEP_BRANCH=""

@@ -215,7 +215,10 @@ fi
 # receives as its initial message (e.g. "/source", or a task kickoff).
 # Model+effort are pinned at dispatch time so spokes stay deterministic even
 # when user-global settings change; override via WT_AGENT_MODEL / WT_AGENT_EFFORT.
-AGENT_CMD="CLAUDE_EFFORT=$(printf '%q' "${WT_AGENT_EFFORT:-max}") claude --model $(printf '%q' "${WT_AGENT_MODEL:-opus}")"
+# WT_SPOKE marks the session's ROLE, not its directory (issue #26): every command
+# the spoke runs inherits it, so worktree-land.sh / worktree-done.sh refuse a
+# spoke that cd's to the hub and tries to land or tear down its own worktree.
+AGENT_CMD="WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(printf '%q' "${WT_AGENT_EFFORT:-max}") claude --model $(printf '%q' "${WT_AGENT_MODEL:-opus}")"
 [ -n "$PROMPT" ] && AGENT_CMD="$AGENT_CMD $(printf '%q' "$PROMPT")"
 
 if [ "$SPAWN_TERMINAL" -eq 1 ]; then

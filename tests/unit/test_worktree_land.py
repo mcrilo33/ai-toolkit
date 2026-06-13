@@ -93,6 +93,7 @@ def _run_land(
     *args: str,
     gh_exit: int = 0,
     tmux_windows: str = "",
+    spoke_marker: str | None = None,
 ) -> tuple[subprocess.CompletedProcess, dict[str, Path]]:
     """Run worktree-land.sh from the hub with logging stubs on PATH.
 
@@ -119,6 +120,11 @@ def _run_land(
     pytest_stub.chmod(0o755)
     env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
     env.pop("TMUX", None)
+    # The host's own spoke marker must never steer the guard; set it explicitly
+    # only when a test means to model a spoke session (issue #26).
+    env.pop("WT_SPOKE", None)
+    if spoke_marker is not None:
+        env["WT_SPOKE"] = spoke_marker
     proc = subprocess.run(
         ["bash", str(WORKTREE_LAND), *args],
         cwd=str(hub),
@@ -222,6 +228,38 @@ def test_keep_branch_flag_keeps_branch(hub: Path, tmp_path: Path) -> None:
 
     assert proc.returncode == 0, proc.stderr
     assert "feature/1-kept" in _local_branches(hub)
+
+
+# --- spoke-session guard (issue #26) --------------------------------------------
+# Landing is hub-owned. A spoke's claude carries WT_SPOKE in its environment, so
+# even if it cd's into the main checkout (where the directory guard would pass),
+# the role marker must abort the land before any merge. The hub session is
+# started directly by the user, never carries WT_SPOKE, and lands freely.
+
+
+def test_refuses_when_run_as_spoke_session(hub: Path, tmp_path: Path) -> None:
+    # A fully-ready spoke (pushed + matching marker) would otherwise land — the
+    # WT_SPOKE marker alone must stop it before the merge.
+    _make_spoke(hub, tmp_path, "feature/1-spoke", push=True, ready=True)
+    pre_main = _remote_sha(hub, "main")
+
+    proc, _ = _run_land(hub, tmp_path, "1", spoke_marker="1")
+
+    assert proc.returncode != 0
+    assert "spoke" in proc.stderr.lower()
+    assert "hub" in proc.stderr.lower()
+    assert not (hub / "feature-1-spoke.txt").exists()  # nothing merged
+    assert _remote_sha(hub, "main") == pre_main
+
+
+def test_lands_when_not_a_spoke_session(hub: Path, tmp_path: Path) -> None:
+    # The mirror: with WT_SPOKE unset (the hub), landing proceeds as normal.
+    _make_spoke(hub, tmp_path, "feature/1-hub", push=True, ready=True)
+
+    proc, _ = _run_land(hub, tmp_path, "1", spoke_marker=None)
+
+    assert proc.returncode == 0, proc.stderr
+    assert (hub / "feature-1-hub.txt").exists()
 
 
 # --- guards (all must abort BEFORE the merge) -----------------------------------

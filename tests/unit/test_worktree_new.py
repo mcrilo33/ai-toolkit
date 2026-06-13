@@ -327,6 +327,50 @@ def test_no_agent_spawns_plain_window(hub: Path, tmp_path: Path) -> None:
     assert not _calls(calls, "send-keys")
 
 
+# ── WT_SPOKE session marker (issue #26) ──────────────────────────────────────
+# worktree-new.sh tags the spawned spoke's environment with WT_SPOKE=<issue-or-
+# slug>. Every command that spoke runs inherits it (regardless of how it cd's
+# around), which is what worktree-land.sh / worktree-done.sh key off to refuse a
+# spoke that tries to land or tear down its own worktree.
+
+
+def test_agent_launch_injects_wt_spoke_marker_for_numbered_issue(hub: Path, tmp_path: Path) -> None:
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code")
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    # The marker prefixes the launch and precedes the existing CLAUDE_EFFORT pin.
+    assert "WT_SPOKE=8 CLAUDE_EFFORT=max claude --model opus" in new_window[0]
+
+
+def test_agent_launch_injects_wt_spoke_marker_for_adhoc_slug(hub: Path, tmp_path: Path) -> None:
+    proc, log = _run_new(hub, tmp_path, "fix-parser", "--no-code")
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    assert "WT_SPOKE=fix-parser CLAUDE_EFFORT=max claude --model opus" in new_window[0]
+
+
+def test_manual_fallback_advice_carries_wt_spoke_marker(hub: Path, tmp_path: Path) -> None:
+    # When no tmux server can be started, the printed manual launch command must
+    # still carry the marker so a hand-started spoke is governed by the guard too.
+    proc, _ = _run_new(
+        hub,
+        tmp_path,
+        "8",
+        "some-slug",
+        "--no-code",
+        inside_tmux=False,
+        has_session_rc=1,
+        new_session_rc=1,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "WT_SPOKE=8 CLAUDE_EFFORT=max claude --model opus" in proc.stdout
+
+
 # ── Push-allowlist templating (issue #11) ────────────────────────────────────
 # A quiet runner (no VS Code, no tmux) for the settings.local.json assertions —
 # distinct from the tmux-stub `_run_new` above, which the window/agent tests need.

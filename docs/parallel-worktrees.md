@@ -168,6 +168,13 @@ folder from the review window, and the now-merged branch is pruned local + origi
 (`--keep-branch` to keep it). An unmerged branch is never pruned. It then closes the
 issue via `gh` and kills the task's stranded tmux window.
 
+Landing is hub-owned by **role**, not directory. `worktree-new.sh` stamps each spoke
+session with a `WT_SPOKE=<issue-or-slug>` env var that rides every command it runs, so
+even a spoke that `cd`s into the main checkout is refused by `worktree-land.sh` and
+`worktree-done.sh` before any work — there is no override flag. A spoke that is finished
+emits its `ready/<issue>` marker and hands off; the hub (started directly by you, never
+carrying `WT_SPOKE`) does the merge and teardown.
+
 ## `worktree-new.sh` reference
 
 ```
