@@ -76,8 +76,9 @@ def _make_pytest_stub(bindir: Path, runlog: Path, *, testmon: bool, exit_code: i
 
     `--help` prints usage, advertising `--testmon` only when `testmon` is True
     (this is how test-select.sh probes plugin availability). Any other call logs
-    `RUN <args>` to `runlog` and exits `exit_code` — so a test can assert which
-    tier ran and that a failure propagates.
+    `RUN <args>` plus the `GIT_DIR` it inherited as `GITDIR=[<val>|UNSET]` to
+    `runlog`, then exits `exit_code` — so a test can assert which tier ran, that a
+    failure propagates, and that the git-hook env strip reached the pytest child.
     """
     bindir.mkdir(parents=True, exist_ok=True)
     testmon_line = '  echo "  --testmon  select impacted tests"' if testmon else ":"
@@ -90,6 +91,7 @@ def _make_pytest_stub(bindir: Path, runlog: Path, *, testmon: bool, exit_code: i
         "    exit 0 ;;\n"
         "esac\n"
         f'printf "RUN %s\\n" "$*" >> "{runlog}"\n'
+        f'printf "GITDIR=[%s]\\n" "${{GIT_DIR-UNSET}}" >> "{runlog}"\n'
         f"exit {exit_code}\n"
     )
     (bindir / "pytest").chmod(0o755)
@@ -286,6 +288,43 @@ def test_mixed_python_and_shell_runs_full_suite(repo: Path, tmp_path: Path) -> N
 
     assert proc.returncode == 0, proc.stderr
     assert "--testmon" not in _runlog(runlog)  # one non-py file downgrades to full
+
+
+# --- the git-hook env strip reaches the pytest child (issue #30) -----------------
+def test_runner_child_does_not_inherit_leaked_git_dir(repo: Path, tmp_path: Path) -> None:
+    # GIT_DIR points at the (valid) test repo, mimicking git's native-hook export.
+    # Classification still resolves the diff under it, but the pytest child must
+    # run with GIT_DIR stripped so a git-shelling test can't reach the real repo.
+    base = _rev(repo)
+    tip = _commit(repo, {"ci/build.yml": "on: push\n"})  # non-py → FULL tier
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(
+        repo, _stdin(tip, base), tmp_path / "bin", env_extra={"GIT_DIR": str(repo / ".git")}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN" in _runlog(runlog)  # classification under GIT_DIR worked, tier ran
+    assert "GITDIR=[UNSET]" in _runlog(runlog)  # the child saw GIT_DIR stripped
+
+
+def test_custom_suite_does_not_inherit_leaked_git_dir(repo: Path, tmp_path: Path) -> None:
+    # The TEST_SELECT_CMD escape hatch (worktree-land --test-cmd) is a test command
+    # too, so it must run under the same strip.
+    out = tmp_path / "cmd.log"
+    proc = _run_select(
+        repo,
+        _stdin(_rev(repo), ZERO_SHA),
+        tmp_path / "bin",
+        env_extra={
+            "GIT_DIR": str(repo / ".git"),
+            "TEST_SELECT_CMD": f'printf "CMDGITDIR=[%s]\\n" "${{GIT_DIR-UNSET}}" >> "{out}"',
+        },
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert out.read_text().strip() == "CMDGITDIR=[UNSET]"
 
 
 # --- range resolution from the pre-push stdin ------------------------------------

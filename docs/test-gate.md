@@ -44,6 +44,34 @@ ref is `remote_sha..local_sha`; a new branch (all-zero remote sha) falls back to
 the merge-base with the default branch; a deletion (all-zero local sha)
 contributes nothing.
 
+## Test isolation: the git-hook env strip
+
+Git runs the pre-push hook with `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` and
+related vars **exported** into its environment. Because the gate launches `pytest`
+from inside that hook, those vars are live for the whole test run — and a leaked
+`GIT_DIR` overrides a subprocess's working directory. Tests here shell out to
+`git` against throwaway tmpdirs; without protection they would instead operate on
+the **real repository**. This is not hypothetical: issue #24's push committed a
+bogus `chore: seed` onto the hub's `main` and flipped `core.bare` to `true`
+through exactly this leak (issue #30).
+
+Two layers close it, and **both must stay**:
+
+- **`tests/conftest.py` strips the git-hook env** (`GIT_DIR`, `GIT_WORK_TREE`,
+  `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_COMMON_DIR`, `GIT_NAMESPACE`,
+  `GIT_PREFIX`, `GIT_CONFIG`, `GIT_CONFIG_*`) both at module import — before any
+  test module snapshots `os.environ` — and via an autouse fixture per test. This
+  protects every run regardless of how `pytest` was launched (hook, CI, or local).
+- **The hook scripts also drop those vars for the pytest child** (`env -u …` in
+  `test-select.sh` and the `run_pytest_node` backstop), scoped so the scripts'
+  own `git` classification calls keep their context. This is defense-in-depth for
+  a repo whose tests lack the conftest strip.
+
+`tests/unit/test_git_env_isolation.py` is the regression guard: it runs a child
+`pytest` under a leaked `GIT_DIR` pointing at a **decoy** repo and asserts the
+decoy is untouched. Do not remove the strip without removing that test's reason
+to exist.
+
 ## Installation
 
 The gate fires only where the native hooks are installed:
