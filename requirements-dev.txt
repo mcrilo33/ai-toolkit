@@ -1,4 +1,8 @@
 # Development / CI dependencies. The sync pipeline itself is Python stdlib-only;
-# these are needed only to run the test suite (integration tests import yaml).
+# these are needed to run the test suite (integration tests import yaml) and to
+# power the pre-push test gate's python tier — pytest-testmon provides the
+# coverage-based test-impact selection `test-select.sh` runs as `pytest
+# --testmon` (absent, the gate falls back to the full suite). See docs/test-gate.md.
 pytest>=8,<9
+pytest-testmon>=2,<3
 pyyaml>=6,<7

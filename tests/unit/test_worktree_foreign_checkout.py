@@ -57,12 +57,16 @@ def synced_repo(tmp_path: Path) -> Path:
 
 
 def _run(repo: Path, script: str, *args: str) -> subprocess.CompletedProcess[str]:
+    # Drop the host's spoke marker so worktree-{land,done}.sh aren't refused by
+    # the issue #26 role guard when these tests happen to run inside a spoke.
+    env = {**_GIT_ENV}
+    env.pop("WT_SPOKE", None)
     return subprocess.run(
         ["bash", str(repo / ".ai-toolkit" / "scripts" / script), *args],
         cwd=str(repo),
         capture_output=True,
         text=True,
-        env=_GIT_ENV,
+        env=env,
     )
 
 
