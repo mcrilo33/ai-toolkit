@@ -94,3 +94,8 @@ def test_start_task_kickoff_does_not_gate_routine_push() -> None:
     assert "ready/" in flat, (
         "the kickoff must mention the ready marker as part of the routine, ungated flow"
     )
+    # Bind the ready emission to the ungated context so a future edit can't move
+    # the marker into a prompted sentence and still pass.
+    assert "ready emission needs no approval" in flat, (
+        "the ready emission must be explicitly marked as not needing approval"
+    )

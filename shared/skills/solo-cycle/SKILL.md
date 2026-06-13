@@ -95,7 +95,7 @@ push, emit the marker **automatically, with no human prompt**; a mid-cycle push 
 no marker. The push-only-vs-push-plus-ready choice is deterministic — "is this the
 final subtask?" — so there is nothing for the human to adjudicate. The marker merges
 nothing and is trivially reversible (delete/re-tag); the real, gated decision is
-`/land <id>` on the hub, 30 seconds later.
+`/land <id>` on the hub, which runs the suite on the merged result.
 
 This is the whole-issue ship gate, distinct from the per-subtask push gate. The hub's
 `hub-status.sh` flips the branch from `pushed (in progress)` to `pushed → mergeable`
