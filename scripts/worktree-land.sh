@@ -161,6 +161,16 @@ elif [ -n "$TEST_CMD" ]; then
 else
   SUITE_RESULT="via pre-push hook (tiered)"
 fi
+# The pre-push hook IS the test gate (issue #19). If it is not installed here,
+# the push runs NOTHING — warn so a green land is never mistaken for a tested
+# one, and report it honestly rather than claiming the gate ran.
+if [ -z "$SKIP_TESTS" ]; then
+  PREPUSH_HOOK="$(git rev-parse --git-path hooks/pre-push 2>/dev/null || true)"
+  if [ -z "$PREPUSH_HOOK" ] || [ ! -x "$PREPUSH_HOOK" ]; then
+    wt_warn "no executable pre-push hook here — the test gate will NOT run on this push; install it with scripts/install-git-hooks.sh"
+    SUITE_RESULT="NOT RUN — no pre-push hook installed"
+  fi
+fi
 echo "→ pushing $DEFAULT to origin (the pre-push hook runs the test gate)"
 if ! (
   if [ -n "$SKIP_TESTS" ]; then export TEST_SELECT_SKIP=1; fi

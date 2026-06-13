@@ -314,6 +314,7 @@ def test_default_land_runs_no_land_side_pytest(hub: Path, tmp_path: Path) -> Non
     assert proc.returncode == 0, proc.stderr
     assert _log_text(logs["pytest"]) == ""  # land never invoked pytest itself
     assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
+    assert "test gate will NOT run" in proc.stderr  # honest about the absent hook
 
 
 def test_push_gate_failure_rolls_back(hub: Path, tmp_path: Path) -> None:
@@ -357,6 +358,7 @@ def test_test_cmd_threads_cmd_env(hub: Path, tmp_path: Path) -> None:
 
     assert proc.returncode == 0, proc.stderr
     assert "TEST_SELECT_CMD=my-suite --fast" in _log_text(env_log)
+    assert "test gate will NOT run" not in proc.stderr  # hook present → no warning
 
 
 # --- ship and teardown -----------------------------------------------------------
