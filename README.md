@@ -219,8 +219,13 @@ the same verdict. See `tests/unit/test_commit_hooks.py`.
   ```
 
   This reuses the same scripts (single source of truth), mapping
-  `commit-quality` + `commit-gauntlet` to `commit-msg` and the advisory warnings
-  to `pre-push`.
+  `commit-quality` + `commit-gauntlet` to `commit-msg` and, on `pre-push`, the
+  advisory warnings plus **`test-select`** — a tiered, diff-aware test gate that
+  is the single owner of test execution ("one push = one run"). It classifies the
+  pushed diff and runs nothing / `pytest --testmon` / the full suite accordingly,
+  blocking the push when the selected tests fail (and falling back to the full
+  suite when `pytest-testmon` is absent). See
+  [`docs/test-gate.md`](docs/test-gate.md).
 
 Hooks run globally via workspace-level config files. Some are also scoped to
 specific agents (see [Agent-scoped hooks](#agent-scoped-hooks) above).
