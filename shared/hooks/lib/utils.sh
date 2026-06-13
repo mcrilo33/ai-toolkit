@@ -563,7 +563,9 @@ detect_pytest() {
 
 # ── Classify a pytest run for RED/GREEN proof ───────────────────────
 # Runs a SINGLE pytest node and maps the outcome to a proof verdict, printed as
-# one of: PASS | FAIL | BOOTSTRAP.
+# one of: PASS | FAIL | BOOTSTRAP | BREACH. BREACH (issue #31) signals the node
+# mutated the real repo and was rolled back — callers must treat it as a block,
+# never PASS/FAIL.
 #
 # The hard part is telling a genuine RED state apart from an environment that
 # cannot run the test at all — the former must adjudicate, the latter must
@@ -587,9 +589,15 @@ detect_pytest() {
 #
 # Usage: run_pytest_node <project_root> <node_id>
 run_pytest_node() {
-  local root="$1" node="$2" runner raw rc
+  local root="$1" node="$2" runner raw rc before changed
   runner=$(detect_pytest "$root")
   [ -z "$runner" ] && { echo "BOOTSTRAP"; return 0; }
+
+  # Issue #31: snapshot the real repo's integrity markers around the node run, the
+  # same tripwire the gate uses. The env -u strip below keeps a git-shelling node
+  # in its own tmpdir; if a node escapes anyway and mutates THIS repo, restore the
+  # snapshot and report BREACH so the caller blocks instead of trusting the run.
+  before="$(cd "$root" && tripwire_capture)"
 
   # -p no:cacheprovider: never write a cache (sandbox-safe, no side effects).
   # --no-header -q: quiet. Run only the named node.
@@ -603,6 +611,18 @@ run_pytest_node() {
             -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_PREFIX \
             -u GIT_CONFIG -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM -u GIT_CONFIG_COUNT \
         $runner -p no:cacheprovider --no-header -q "$node" 2>&1) && rc=0 || rc=$?
+
+  # Tripwire verdict takes precedence over the pass/fail outcome: a node that
+  # corrupted the repo is untrustworthy regardless of its exit code.
+  if ! changed="$(cd "$root" && tripwire_check "$before")"; then
+    _tripwire_report_breach "$changed" "restoring the snapshot — verdict BREACH (the caller blocks)."
+    # `|| true`: never let a restore hiccup abort under set -e before the verdict
+    # is printed — an empty verdict matches no caller arm and would silently NOT
+    # block, the exact failure mode this guards against.
+    (cd "$root" && tripwire_restore "$before") || true
+    echo "BREACH"
+    return 0
+  fi
 
   case "$rc" in
     0) echo "PASS" ; return 0 ;;
@@ -673,4 +693,152 @@ review_artifact_signature() {
     echo "$json" | grep -oE '"signature"[[:space:]]*:[[:space:]]*"[^"]*"' \
       | head -1 | sed 's/.*: *"//;s/"$//'
   fi
+}
+
+# ── Repo-integrity tripwire (issue #31) ─────────────────────────────
+# Belt-and-suspenders for the #29/#30 isolation-breach CLASS. The GIT_DIR leak
+# corrupted the real repo SILENTLY — a fixture's git call moved `main` and
+# flipped core.bare during the pre-push gate, unnoticed until found by hand. The
+# env strip (#30) closed the KNOWN vector; this tripwire catches ANY future one.
+#
+# Wrap the gate's pytest run: snapshot the real repo's integrity markers before,
+# re-read after, and if anything moved, ABORT the push and RESTORE the snapshot.
+# Markers (cheap — one show-ref + two config reads per side):
+#   • HEAD + every local ref tip   (git show-ref --head)
+#   • core.bare
+#   • core.worktree
+# The pytest child runs with GIT_* unset (#30), so a hermetic test that
+# creates/deletes its OWN tmpdir repo never touches these markers — only a real
+# escape into THIS repo trips it (no false positives).
+#
+# Snapshot format (one marker per line, parseable by check/restore):
+#   ref <sha> <refname>        # HEAD line included via --head
+#   cfg core.bare <value|—>
+#   cfg core.worktree <value|—>
+TRIPWIRE_UNSET='—'            # sentinel for a config marker that is not set
+TRIPWIRE_BREACH_RC=97        # exit code on breach; outside pytest's 0-5 range
+
+# Capture the integrity markers for the repo of the current git context (the
+# real repo the hook targets). Read-only.
+tripwire_capture() {
+  local line bare worktree
+  while IFS= read -r line; do
+    [ -n "$line" ] && printf 'ref %s\n' "$line"
+  done < <(git show-ref --head 2>/dev/null || true)
+  bare="$(git config --get core.bare 2>/dev/null || printf '%s' "$TRIPWIRE_UNSET")"
+  worktree="$(git config --get core.worktree 2>/dev/null || printf '%s' "$TRIPWIRE_UNSET")"
+  printf 'cfg core.bare %s\n' "$bare"
+  printf 'cfg core.worktree %s\n' "$worktree"
+}
+
+# Compare a prior snapshot ($1) against the markers now. Prints the names of the
+# markers that changed (e.g. `refs/heads/main`, `core.bare`) and returns 1 when
+# anything changed, 0 when the repo is intact.
+tripwire_check() {
+  local before="$1" after
+  after="$(tripwire_capture)"
+  if [ "$before" = "$after" ]; then
+    return 0
+  fi
+  awk '
+    NR==FNR { b[$0] = 1; next }
+            { a[$0] = 1 }
+    END {
+      for (l in b) if (!(l in a)) mark(l)
+      for (l in a) if (!(l in b)) mark(l)
+      for (k in ch) print k
+    }
+    function mark(line, p) {
+      if (line ~ /^ref /)      { split(line, p, " "); ch[p[3]] = 1 }
+      else if (line ~ /^cfg /) { split(line, p, " "); ch[p[2]] = 1 }
+      else                       ch[line] = 1
+    }
+  ' <(printf '%s\n' "$before") <(printf '%s\n' "$after")
+  return 1
+}
+
+_tripwire_restore_cfg() {
+  local key="$1" val="$2"
+  if [ -z "$val" ] || [ "$val" = "$TRIPWIRE_UNSET" ]; then
+    git config --unset "$key" 2>/dev/null || true
+  else
+    git config "$key" "$val" 2>/dev/null || true
+  fi
+}
+
+# Read a captured config marker's value from the snapshot, verbatim. The value
+# is everything after the `cfg <key> ` prefix, so a path containing spaces (a
+# core.worktree) round-trips intact rather than being truncated at the first
+# space. Prints the sentinel TRIPWIRE_UNSET when the key was not captured.
+_tripwire_cfg_value() {
+  local snapshot="$1" key="$2" line
+  line="$(printf '%s\n' "$snapshot" | grep -m1 -F "cfg $key " || true)"
+  if [ -z "$line" ]; then
+    printf '%s' "$TRIPWIRE_UNSET"
+    return 0
+  fi
+  printf '%s' "${line#cfg "$key" }"
+}
+
+# Restore the markers captured in $1 after a breach: reset each ref to its
+# snapshot tip, delete refs that appeared during the run, and restore
+# core.bare/core.worktree. Best-effort — leaves the repo as the snapshot found it.
+#
+# HEAD scope: a moved BRANCH ref is restored directly, and HEAD (symbolic) then
+# follows its branch. A breach that re-points HEAD's own symbolic target (a stray
+# `git checkout`/detach) is still DETECTED — the HEAD line in the snapshot differs,
+# so the push is aborted — but its symref is not auto-rewound here; the abort,
+# not the rewind, is the protection. The #29/#30 incident moved a branch ref and
+# flipped core.bare, both fully restored.
+tripwire_restore() {
+  local before="$1" kind sha name snap_refs cur_sha cur_ref
+  # Reset every snapshot ref to its captured tip (HEAD is symbolic — it follows
+  # its branch, so resetting the branch ref restores it).
+  while read -r kind sha name; do
+    [ "$kind" = "ref" ] || continue
+    [ "$name" = "HEAD" ] && continue
+    git update-ref "$name" "$sha" 2>/dev/null || true
+  done <<< "$before"
+  # Drop refs that appeared during the run (present now, absent in the snapshot).
+  snap_refs="$(printf '%s\n' "$before" | awk '$1=="ref" && $3!="HEAD" {print $3}')"
+  while read -r cur_sha cur_ref; do
+    [ -n "$cur_ref" ] || continue
+    if ! printf '%s\n' "$snap_refs" | grep -qxF "$cur_ref"; then
+      git update-ref -d "$cur_ref" 2>/dev/null || true
+    fi
+  done < <(git show-ref 2>/dev/null || true)
+  # Restore the config markers (whitespace-preserving extraction).
+  _tripwire_restore_cfg core.bare "$(_tripwire_cfg_value "$before" core.bare)"
+  _tripwire_restore_cfg core.worktree "$(_tripwire_cfg_value "$before" core.worktree)"
+}
+
+# Print a breach report to stderr: the header, each changed marker (one per
+# line), and the caller's action line. Shared by run_under_tripwire (the gate)
+# and run_pytest_node (the red-proof backstop) so both speak the same language.
+_tripwire_report_breach() {
+  local changed="$1" action="$2" m
+  {
+    echo "tripwire: REPO-INTEGRITY BREACH — the test run mutated THIS repo:"
+    while IFS= read -r m; do
+      [ -n "$m" ] && echo "tripwire:   - $m"
+    done <<< "$changed"
+    echo "tripwire: a test escaped isolation and wrote to the real repo (issue #31)."
+    echo "tripwire: $action"
+  } >&2
+}
+
+# Run "$@" under the tripwire. On a clean run, returns the command's own exit
+# code. On a breach (the run changed THIS repo's markers), restores the snapshot,
+# prints which markers moved to stderr, and returns TRIPWIRE_BREACH_RC so the
+# caller aborts the push.
+run_under_tripwire() {
+  local before changed rc=0
+  before="$(tripwire_capture)"
+  "$@" || rc=$?
+  if changed="$(tripwire_check "$before")"; then
+    return "$rc"
+  fi
+  _tripwire_report_breach "$changed" "restoring the snapshot and ABORTING the push."
+  tripwire_restore "$before"
+  return "$TRIPWIRE_BREACH_RC"
 }

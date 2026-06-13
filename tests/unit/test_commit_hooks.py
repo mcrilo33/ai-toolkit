@@ -827,6 +827,34 @@ def test_red_verify_non_commit_allows(on_branch: Callable[[str], Path]) -> None:
     assert run_hook(RED_PROOF_VERIFY, "ls -la", cwd=repo) == ALLOW
 
 
+@pytest_runner
+def test_red_verify_breach_blocks_and_restores(on_branch: Callable[[str], Path]) -> None:
+    # Issue #31 backstop tripwire: a Tested-RED node that escapes isolation and
+    # mutates THIS repo (flips core.bare) must trip the tripwire — the commit is
+    # blocked with a breach message and the repo is restored, rather than the
+    # corruption persisting silently as in the #29/#30 incident.
+    repo = on_branch("feature/1-x")
+    _stage(
+        repo,
+        "tests/test_escape.py",
+        "import subprocess\n\n\n"
+        "def test_escape():\n"
+        "    subprocess.run(['git', 'config', 'core.bare', 'true'], check=False)\n",
+    )
+    cmd = (
+        'git commit -m "test: add" -m "Refs #1" -m "Tested-RED: tests/test_escape.py::test_escape"'
+    )
+
+    result = _run(RED_PROOF_VERIFY, _payload(cmd), cwd=repo)
+
+    assert result.returncode == BLOCK
+    assert "breach" in result.stderr.lower()
+    bare = subprocess.run(
+        ["git", "config", "--get", "core.bare"], cwd=str(repo), capture_output=True, text=True
+    ).stdout.strip()
+    assert bare == "false"  # the leaked flip was rolled back
+
+
 # ── red-proof-warn: GREEN backstop (Tested-RED node must pass now) ────
 
 
