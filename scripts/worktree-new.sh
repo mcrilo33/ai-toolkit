@@ -150,6 +150,43 @@ if [ -d "$REPO_ROOT/.claude" ]; then
   fi
 fi
 
+# --- seed the spoke's narrow push allowlist ------------------------------------
+# The spoke's own-branch push IS its ship gate (push-scope-guard.sh + the push
+# hooks enforce it), so the sanctioned `git push [-u] origin <branch>` should
+# not also stall on a permission ask — gates, not asks, do the enforcing.
+# Template exactly the two narrow rules for THIS branch into the worktree's
+# settings.local.json; every other push stays behind the user-level ask.
+RULE_PUSH="Bash(git push origin ${BRANCH})"
+RULE_PUSH_U="Bash(git push -u origin ${BRANCH})"
+SETTINGS_LOCAL="$WT_DIR/.claude/settings.local.json"
+mkdir -p "$WT_DIR/.claude"
+if [ ! -f "$SETTINGS_LOCAL" ]; then
+  printf '{\n  "permissions": {\n    "allow": [\n      "%s",\n      "%s"\n    ]\n  }\n}\n' \
+    "$RULE_PUSH" "$RULE_PUSH_U" > "$SETTINGS_LOCAL"
+  echo "→ seeded own-branch push allowlist (.claude/settings.local.json)"
+elif command -v jq >/dev/null 2>&1; then
+  # Append-without-churn: existing entries keep their order (no jq `unique`,
+  # which would lexicographically re-sort a user-curated list); only rules not
+  # already present are appended. A malformed file makes jq fail and a
+  # zero-byte file yields zero output documents with exit 0 — in both cases
+  # warn and leave the file untouched rather than abort the wiring or
+  # silently truncate (-s catches the empty-output case).
+  TMP_SETTINGS="$(mktemp)"
+  if jq --arg a "$RULE_PUSH" --arg b "$RULE_PUSH_U" \
+       '(.permissions.allow // []) as $cur | .permissions.allow = ($cur + ([$a, $b] - $cur))' \
+       "$SETTINGS_LOCAL" > "$TMP_SETTINGS" 2>/dev/null && [ -s "$TMP_SETTINGS" ]; then
+    mv "$TMP_SETTINGS" "$SETTINGS_LOCAL"
+    echo "→ merged own-branch push allowlist into settings.local.json"
+  else
+    rm -f "$TMP_SETTINGS"
+    wt_warn "could not merge into settings.local.json (invalid JSON?) — add the allow rules yourself:"
+    wt_warn "  $RULE_PUSH  and  $RULE_PUSH_U"
+  fi
+else
+  wt_warn "settings.local.json exists but jq is missing — add the allow rules yourself:"
+  wt_warn "  $RULE_PUSH  and  $RULE_PUSH_U"
+fi
+
 echo
 echo "✓ worktree ready: $WT_DIR"
 echo "  branch:         $BRANCH"
@@ -188,13 +225,20 @@ if [ "$SPAWN_TERMINAL" -eq 1 ]; then
     # ensure session 0 (the spoke home) exists, detached if need be; '=' pins
     # the target to an exact session name so e.g. '0-foo' can never match
     if tmux has-session -t '=0' 2>/dev/null || tmux new-session -d -s 0 -c "$REPO_ROOT" 2>/dev/null; then
-      win="$(tmux new-window -t '=0:' -P -F '#{window_id}' -n "$win_name" -c "$WT_DIR")"
+      # The launch command is the window's own shell command, not keystrokes:
+      # typing it via send-keys raced interactive-zsh init (eaten Enter, zvm) —
+      # issue #15. `exec $SHELL` keeps the window alive after claude exits.
+      if [ "$LAUNCH_AGENT" -eq 1 ]; then
+        win="$(tmux new-window -t '=0:' -P -F '#{window_id}' -n "$win_name" -c "$WT_DIR" \
+               "$AGENT_CMD; exec ${SHELL:-zsh}")"
+      else
+        win="$(tmux new-window -t '=0:' -P -F '#{window_id}' -n "$win_name" -c "$WT_DIR")"
+      fi
       # pin name so the running process can't clobber it
       tmux set-window-option -t "$win" automatic-rename off
       tmux set-window-option -t "$win" allow-rename off
       echo "→ opened tmux window '$win_name' ($win) in session 0"
       if [ "$LAUNCH_AGENT" -eq 1 ]; then
-        tmux send-keys -t "$win" "$AGENT_CMD" C-m
         [ -n "$PROMPT" ] && echo "  launched: claude (seeded with first prompt)" || echo "  launched: claude"
       fi
       # print the exact jump command so the caller can copy-paste

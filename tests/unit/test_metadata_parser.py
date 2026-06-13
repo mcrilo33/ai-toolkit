@@ -704,9 +704,9 @@ class TestSkillsMetadata:
         items = self._metadata_entries()
 
         results = dict(query(items, "copilot", ["name", "description", "allowed-tools"]))
-        # land-task defines allowed-tools in metadata
-        assert "land-task" in results
-        assert "allowed-tools:" in results["land-task"]
+        # land defines allowed-tools in metadata
+        assert "land" in results
+        assert "allowed-tools:" in results["land"]
 
     def test_argument_hint_parsed(self) -> None:
         """Skills with argument-hint should emit that field."""

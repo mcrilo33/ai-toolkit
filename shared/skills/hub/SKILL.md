@@ -52,8 +52,10 @@ anything that changes state:
 |------------------|-----------------|-----|
 | Open issue, `no worktree` | Start it | `start-task` skill (creates issue if needed + spawns spoke) |
 | New idea, no issue yet | Define then dispatch | discuss scope → `start-task` |
-| Branch `pushed → mergeable` | Land and tear down | `/land <id>` (`land-task` skill → `scripts/worktree-land.sh`) |
+| Branch `pushed → mergeable` | Land and tear down | `/land <id>` (`land` skill → `scripts/worktree-land.sh`) |
 | Branch `unpushed` / `dirty` | Leave it — spoke still working | paste the row's `↳ jump:` command to reach its pane |
+| Trivial non-executable change (docs/wording) | Lane 1 micro-spoke | spawn subagent with `isolation: worktree`, review diff, land with `scripts/worktree-land.sh <branch> --local` |
+| Small obvious one-subtask change (code) | Lane 2 express spoke | `worktree-new.sh <slug>` (no issue), single cycle, all push gates |
 
 Never auto-merge or auto-teardown. Restate the branch/issue and the exact command, get a
 quick yes, then run it. Merges and teardowns happen **on the hub**; task edits never do.
@@ -62,6 +64,39 @@ quick yes, then run it. Merges and teardowns happen **on the hub**; task edits n
 
 Give the user a short read: how many spokes are running, which issues are unstarted, which
 branches are ready to merge, and your single recommended next action.
+
+### Micro-spoke dispatch (lane 1)
+
+Use a micro-spoke for any change that touches only non-executable paths: docs, comments,
+and wording. Path restriction is absolute — lane 1 must never touch `scripts/`,
+`shared/hooks/`, `tests/`, or any skill script (`.sh`, `.py`).
+
+For the triage heuristic and lane definitions see `shared/rules/workflow.md`.
+
+**Full lane-1 flow:**
+
+1. **Spawn** a subagent with `isolation: worktree` and a tight prompt. The prompt must
+   specify:
+   - The exact files to touch and the exact change to make.
+   - That the commit must be `docs:` or `chore:` type.
+   - That staging and committing must use plain `git add <files>` followed by a
+     standalone `git commit -m "<message>"` — no `-a`, no pathspec on the commit command,
+     no chaining or prefixes (the gate only exempts a standalone plain commit).
+   - That the subagent must return its branch name and a diff summary when done.
+2. **Review** the returned diff on the hub before doing anything else.
+3. **Land** with:
+
+   ```bash
+   scripts/worktree-land.sh <branch> --local
+   ```
+
+   `--local` skips upstream guards (micro-spokes never push). It accepts a bare local
+   branch whose temp worktree may already be gone, refuses any branch that has an
+   upstream (that is not a micro-spoke), and refuses the default branch itself. No issue
+   to close. `--keep-branch` is honored if you need the branch for follow-up.
+
+4. **Verify cleanup.** A landed micro-spoke leaves nothing behind: no branch, no
+   worktree, no tmux window (none were created beyond the temp worktree).
 
 ## Rules of thumb
 

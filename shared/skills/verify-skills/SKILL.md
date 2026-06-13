@@ -37,7 +37,7 @@ The following 29 skills must exist on disk. Match by **directory name**.
 | 15 | `github-issues` |
 | 16 | `hub` |
 | 17 | `iterative-retrieval` |
-| 18 | `land-task` |
+| 18 | `land` |
 | 19 | `pytest-coverage` |
 | 20 | `search-first` |
 | 21 | `security-review` |

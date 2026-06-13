@@ -25,6 +25,7 @@ All hooks defined in `shared/hooks/metadata.yml`:
 | `secrets-scan` | preToolUse | Write/Edit | 1 | Scan for hardcoded secrets (API keys, tokens) before writing | devops |
 | `secrets-scan-revert` | postToolUse | Write/Edit | 1 | Revert a file whose edit introduced a hardcoded secret (Cursor `afterFileEdit`) | — |
 | `git-push-review` | preToolUse | Bash | 2 | Show diff summary before `git push` for review | — |
+| `push-scope-guard` | preToolUse | Bash | 1 | Spoke worktrees push only their own branch; the default branch is published by the hub (hard deny on Cursor, advisory elsewhere) | — |
 | `config-protection` | preToolUse | Write/Edit | 2 | Block modification of linter, formatter, and CI config files | devops |
 | `commit-quality` | preToolUse | Bash | 2 | Validate commit messages match conventional commits format | — |
 | `commit-gauntlet` | preToolUse | Bash | 1 | Lint/typecheck staged files before commit; block on failure | — |

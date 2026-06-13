@@ -2,8 +2,8 @@
 # Key = skill directory name.
 # Shared fields at top level; per-tool overrides nested under tool name.
 
-land-task:
-  name: "land-task"
+land:
+  name: "land"
   description: "Land a finished task from the hub: verify the spoke pushed, merge into the default branch, run the suite, push, tear down the worktree, and close the issue. Use on the hub when the user says /land <id>, 'land it', or a branch shows pushed → mergeable."
   allowed-tools: "run_in_terminal get_changed_files read_file grep_search get_errors"
   argument-hint: "[issue number, slug, or branch]"

@@ -13,7 +13,7 @@ shared/
 │   └── …
 ├── skills/
 │   ├── metadata.yml          # Frontmatter definitions for skills
-│   ├── land-task/SKILL.md
+│   ├── land/SKILL.md
 │   └── …
 ├── prompts/
 │   ├── metadata.yml          # Frontmatter definitions for prompts
@@ -165,36 +165,36 @@ instead of `.cursor/hooks/scripts/<hook>.sh`, via the optional
 **Source** — `shared/skills/metadata.yml`:
 
 ```yaml
-land-task:
-  name: "land-task"
+land:
+  name: "land"
   description: "Land a finished task from the hub: merge, suite, push, teardown."
   cursor:
     description: "Land a finished task from the hub: merge, suite, push, teardown. Use when the user says /land."
 ```
 
-**Copilot output** — `.github/skills/land-task/SKILL.md`:
+**Copilot output** — `.github/skills/land/SKILL.md`:
 
 ```yaml
 ---
-name: land-task
+name: land
 description: "Land a finished task from the hub: merge, suite, push, teardown."
 ---
 ```
 
-**Cursor output** — `.cursor/skills/land-task/SKILL.md`:
+**Cursor output** — `.cursor/skills/land/SKILL.md`:
 
 ```yaml
 ---
-name: land-task
+name: land
 description: "Land a finished task from the hub: merge, suite, push, teardown. Use when the user says /land."
 ---
 ```
 
-**Claude output** — `.claude/skills/land-task/SKILL.md`:
+**Claude output** — `.claude/skills/land/SKILL.md`:
 
 ```yaml
 ---
-name: land-task
+name: land
 description: "Land a finished task from the hub: merge, suite, push, teardown."
 ---
 ```

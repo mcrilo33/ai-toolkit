@@ -112,11 +112,110 @@ if echo "$COMMAND" | grep -qiE '(^|[^[:alpha:]])(clos(e|es|ed)|fix(es|ed)?|resol
 fi
 
 if [ "$BRANCH_HAS_ISSUE" -eq 0 ] && [ "$MSG_HAS_ISSUE" -eq 0 ]; then
-  deny "Commit is not anchored to an issue.
+  # ── Scoped exemption: docs/chore doc-only commits (issue #10) ───────
+  # This is a scoped exemption for micro/express spokes, not a general bypass.
+  # Three-lane triage: a docs: or chore: commit whose entire staged set consists
+  # of non-executable documentation files (.md/.markdown/.txt/.rst) outside
+  # top-level scripts/, shared/hooks/, tests/, and any */scripts/ directory
+  # does not require an issue anchor. Source-code commits still require anchoring.
+  # Fail closed: an empty staged index (e.g. git commit -am at PreToolUse time,
+  # or git unavailable) is never treated as "all documentation".
+  DOC_ONLY_EXEMPT=0
+  if echo "$MSG" | grep -qE '^(docs|chore)(\([a-zA-Z0-9._-]+\))?(!)?: '; then
+    # The staged index is only authoritative for a PLAIN `git commit` with message
+    # flags. The exemption is only granted when EVERY token after `commit` is on
+    # the known-safe allowlist. An allowlist is used instead of a denylist because
+    # git accepts unambiguous long-option prefix abbreviations (--amen → --amend,
+    # --patc → --patch) and file-delivered pathspecs (--pathspec-from-file), so
+    # enumerating unsafe forms can never be complete. Anything not explicitly
+    # recognized — unknown flags, abbreviations, bare tokens, --, chained-command
+    # tokens — disqualifies the exemption and fails closed.
+    #
+    # Tokenization: quoted regions are replaced with the opaque placeholder __QV__
+    # rather than deleted. Deleting them would make `git commit "-a" -m "docs: x"`
+    # look like a plain `git commit -m`, hiding the dangerous flag. An attached
+    # value like --message="docs: x" becomes --message=__QV__ and is still visible
+    # as a recognisable token. A quoted flag like "-a" becomes a bare __QV__ token
+    # which hits the "anything else" arm and disqualifies.
+    #
+    # State machine (strictly fail-closed):
+    #   GIT   — first token must be exactly `git`; anything else disqualifies.
+    #   COMMIT — next token must be exactly `commit`; anything else disqualifies.
+    #            This kills chained prefixes (git add && git commit, env FOO=1 git
+    #            commit, git -C path commit, etc.) because those extra tokens appear
+    #            before `commit` and are not `git`. The sanctioned shape is a
+    #            standalone `git commit …`.
+    #   ARGS  — subsequent tokens must each be on the explicit allowlist.
+    #            _EXPECT_VALUE: when set, the next token is consumed as the message
+    #            value regardless of its content (git would do the same).
+    # Deliberately uncovered but legitimate spellings that fail closed by design:
+    #   combined clusters (-sm), space-separated --author <value>, -S<keyid>.
+    CMD_TOKENIZED=$(echo "$COMMAND" | sed -E 's/"[^"]*"/__QV__/g; s/'"'"'[^'"'"']*'"'"'/__QV__/g')
+    _CMD_SAFE=1
+    _STATE=GIT
+    _EXPECT_VALUE=0
+    set -f
+    for _TOKEN in $CMD_TOKENIZED; do
+      case "$_STATE" in
+        GIT)
+          if [ "$_TOKEN" = "git" ]; then
+            _STATE=COMMIT
+          else
+            _CMD_SAFE=0; break
+          fi
+          ;;
+        COMMIT)
+          if [ "$_TOKEN" = "commit" ]; then
+            _STATE=ARGS
+          else
+            _CMD_SAFE=0; break
+          fi
+          ;;
+        ARGS)
+          if [ "$_EXPECT_VALUE" -eq 1 ]; then
+            _EXPECT_VALUE=0
+            continue
+          fi
+          case "$_TOKEN" in
+            -m|--message) _EXPECT_VALUE=1 ;;
+            --message=*) ;;
+            -q|--quiet|-v|--verbose) ;;
+            -s|--signoff|-n|--no-verify) ;;
+            -S|--gpg-sign|--gpg-sign=*|--no-gpg-sign) ;;
+            --author=*|--date=*|--trailer=*) ;;
+            *) _CMD_SAFE=0; break ;;
+          esac
+          ;;
+      esac
+    done
+    set +f
+    if [ "$_STATE" != "ARGS" ]; then _CMD_SAFE=0; fi
+    if [ "$_CMD_SAFE" -eq 1 ]; then
+      STAGED=$(git -C "$PROJECT_ROOT" diff --cached --name-only 2>/dev/null || true)
+      if [ -n "$STAGED" ]; then
+        # Check every staged path is a doc-only path
+        NON_DOC=$(echo "$STAGED" | grep -vE '\.(md|markdown|txt|rst)$' || true)
+        # Exclude shared/hooks/ and tests/
+        EXCLUDED_DIR=$(echo "$STAGED" | grep -E '^(shared/hooks/|tests/)' || true)
+        # Exclude any */scripts/ directory segment
+        SCRIPTS_SUBDIR=$(echo "$STAGED" | grep -E '(^|/)scripts/' || true)
+        # Every staged file must be a plain file (mode 100644) or deletion (000000).
+        # Executable files (100755) and symlinks (120000) are not documentation.
+        RAW_MODES=$(git -C "$PROJECT_ROOT" diff --cached --raw 2>/dev/null || true)
+        UNSAFE_MODE=$(echo "$RAW_MODES" | awk '{print $2}' | grep -vE '^(100644|000000)$' || true)
+        if [ -z "$NON_DOC" ] && [ -z "$EXCLUDED_DIR" ] && [ -z "$SCRIPTS_SUBDIR" ] && [ -z "$UNSAFE_MODE" ]; then
+          DOC_ONLY_EXEMPT=1
+        fi
+      fi
+    fi
+  fi
+  if [ "$DOC_ONLY_EXEMPT" -eq 0 ]; then
+    deny "Commit is not anchored to an issue.
 Every change must trace to a documented issue. Provide one of:
   • a branch named with the issue ID — e.g. feature/142-add-login or fix/PROJ-12-bug
   • an anchor in the commit message — e.g. a second -m \"Closes #142\" (also: Fixes, Resolves, Refs)
 Branch: ${BRANCH:-unknown}"
+  fi
 fi
 
 exit 0
