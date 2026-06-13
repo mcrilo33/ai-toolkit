@@ -111,6 +111,46 @@ def render_spoke_view(store: queries.SpanStore) -> None:
         _render_node(root)
 
 
+def _step_label(row: dict) -> str:
+    label = f"{row['kind']} · {row['name']}"
+    if row["phase"]:
+        label += f" · {row['phase']}"
+    return label
+
+
+def render_aggregate_view(store: queries.SpanStore) -> None:
+    st.header("Aggregate view")
+    st.caption(
+        "Where time and tokens go: per-step rollup across all spokes in a window, "
+        "normalized per invocation."
+    )
+
+    cols = st.columns(2)
+    start = cols[0].text_input("Window start (ISO-8601 UTC, optional)", "")
+    end = cols[1].text_input("Window end (ISO-8601 UTC, optional)", "")
+
+    rows = store.aggregate(start.strip() or None, end.strip() or None)
+    if not rows:
+        st.info("No spans in this window.")
+        return
+
+    table = [
+        {
+            "Step": _step_label(row),
+            "Freq": row["frequency"],
+            "Mean time": _fmt_secs(row["mean_duration_ms"]),
+            "Median time": _fmt_secs(row["median_duration_ms"]),
+            "Total time": _fmt_secs(row["total_duration_ms"]),
+            "Mean cost": _fmt_cost(row["mean_cost_usd"]),
+            "Total cost": _fmt_cost(row["total_cost_usd"]),
+            "Mean tok": f"{row['mean_tokens']:.0f}",
+            "Human/inv": f"{row['human_per_invocation']:.2f}",
+        }
+        for row in rows
+    ]
+    st.dataframe(table, use_container_width=True, hide_index=True)
+
+
 def main() -> None:
     st.set_page_config(page_title="Workflow observability", layout="wide")
     st.title("Workflow observability dashboard")
@@ -127,9 +167,11 @@ def main() -> None:
         return
 
     store = load_store(span_log)
-    view = st.sidebar.radio("View", ["Spoke"])
+    view = st.sidebar.radio("View", ["Spoke", "Aggregate"])
     if view == "Spoke":
         render_spoke_view(store)
+    elif view == "Aggregate":
+        render_aggregate_view(store)
 
 
 if __name__ == "__main__":

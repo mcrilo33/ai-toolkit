@@ -168,7 +168,9 @@ class SpanStore:
         roots: list[dict[str, Any]] = []
         for node in nodes.values():
             parent = nodes.get(node["parent_id"])
-            if parent is None:
+            # A node with no in-spoke parent — or a malformed self-reference —
+            # is a root, so a bad span can never vanish or recurse forever.
+            if parent is None or parent is node:
                 roots.append(node)
             else:
                 parent["children"].append(node)
@@ -176,6 +178,48 @@ class SpanStore:
         for root in roots:
             _roll_up(root)
         return roots
+
+    def aggregate(
+        self,
+        window_start: str | None = None,
+        window_end: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Roll spans up across all spokes in a time window.
+
+        Groups by ``(kind, name, phase)`` and reports, per group: frequency
+        (invocation count), totals, and per-invocation mean/median for time and
+        cost, plus human-interaction count normalized per invocation. The window
+        is a half-open ``[window_start, window_end)`` interval on ``ts_start``
+        (ISO-8601 strings compare lexicographically); ``None`` drops that bound.
+        Null cost/token values count as zero. Rows are sorted by total time
+        spent, descending — the dashboard's "where does time go" ordering.
+        """
+        rows = self._query(
+            """
+            SELECT
+                kind, name, phase,
+                COUNT(*) AS invocations,
+                SUM(duration_ms) AS total_duration_ms,
+                AVG(duration_ms) AS mean_duration_ms,
+                MEDIAN(duration_ms) AS median_duration_ms,
+                SUM(COALESCE(cost_usd, 0)) AS total_cost_usd,
+                AVG(COALESCE(cost_usd, 0)) AS mean_cost_usd,
+                MEDIAN(COALESCE(cost_usd, 0)) AS median_cost_usd,
+                SUM(COALESCE(tokens_in, 0) + COALESCE(tokens_out, 0)) AS total_tokens,
+                AVG(COALESCE(tokens_in, 0) + COALESCE(tokens_out, 0)) AS mean_tokens,
+                SUM(CASE WHEN human_type IS NOT NULL THEN 1 ELSE 0 END) AS human_count
+            FROM spans
+            WHERE (? IS NULL OR ts_start >= ?)
+              AND (? IS NULL OR ts_start < ?)
+            GROUP BY kind, name, phase
+            ORDER BY total_duration_ms DESC, kind, name, phase
+            """,
+            [window_start, window_start, window_end, window_end],
+        )
+        for row in rows:
+            row["frequency"] = row["invocations"]
+            row["human_per_invocation"] = row["human_count"] / row["invocations"]
+        return rows
 
 
 def _roll_up(node: dict[str, Any]) -> dict[str, int | float]:
