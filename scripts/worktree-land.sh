@@ -6,7 +6,7 @@
 # branch, after the spoke has pushed — never from inside a worktree.
 #
 # Usage:
-#   scripts/worktree-land.sh <issue|slug|branch|path> [--skip-tests] [--keep-branch] [--local] [--test-cmd <cmd>]
+#   scripts/worktree-land.sh <issue|slug|branch|path> [--skip-tests] [--keep-branch] [--local] [--force-land] [--test-cmd <cmd>]
 #
 #   <issue|slug|branch|path>  anything that identifies the task worktree
 #   --skip-tests              skip the pre-push test gate (threads TEST_SELECT_SKIP=1)
@@ -14,6 +14,9 @@
 #   --local                   micro-spoke path: skip upstream guards and accept a bare
 #                             local branch with no registered worktree (the hub's diff
 #                             review is the gate; merge+push is what ships the work)
+#   --force-land              land a numbered branch that carries no ready/<issue>
+#                             completion marker (express/ad-hoc branches that never
+#                             emit one); the marker guard is otherwise mandatory
 #   --test-cmd <cmd>          run <cmd> as the gate instead of the tiered selection
 #                             (threads TEST_SELECT_CMD to the pre-push hook)
 #
@@ -23,7 +26,8 @@
 # --skip-tests/--test-cmd are threaded to the hook via TEST_SELECT_*.
 #
 # Sequence, each step aborting safely on failure:
-#   guards  hub on default branch + clean; worktree resolved, clean, fully pushed
+#   guards  hub on default branch + clean; worktree resolved, clean, fully pushed;
+#           numbered branches carry a ready/<issue> marker at their tip (issue #16)
 #   merge   --ff-only when possible, else a merge commit (plain `git merge`)
 #   ship    push origin <default> — the pre-push hook is the test gate; a rejected
 #           push (gate failed or remote refused) rolls back `git reset --keep`.
@@ -41,22 +45,24 @@ TARGET=""
 SKIP_TESTS=""
 KEEP_BRANCH=""
 LOCAL=""
+FORCE_LAND=""
 TEST_CMD=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --skip-tests)  SKIP_TESTS=1; shift ;;
     --keep-branch) KEEP_BRANCH=1; shift ;;
     --local)       LOCAL=1; shift ;;
+    --force-land)  FORCE_LAND=1; shift ;;
     --test-cmd)    [ "$#" -ge 2 ] || wt_die "--test-cmd needs a value"; TEST_CMD="$2"; shift 2 ;;
     --test-cmd=*)  TEST_CMD="${1#--test-cmd=}"; shift ;;
-    -*)            wt_die "unknown option: $1 (supported: --skip-tests, --keep-branch, --local, --test-cmd)" ;;
+    -*)            wt_die "unknown option: $1 (supported: --skip-tests, --keep-branch, --local, --force-land, --test-cmd)" ;;
     *)
       [ -z "$TARGET" ] || wt_die "unexpected extra argument: $1"
       TARGET="$1"; shift
       ;;
   esac
 done
-[ -n "$TARGET" ] || wt_die "usage: worktree-land.sh <issue|slug|branch|path> [--skip-tests] [--keep-branch] [--local] [--test-cmd <cmd>]"
+[ -n "$TARGET" ] || wt_die "usage: worktree-land.sh <issue|slug|branch|path> [--skip-tests] [--keep-branch] [--local] [--force-land] [--test-cmd <cmd>]"
 
 # --- guards: the hub ----------------------------------------------------------
 git rev-parse --git-dir >/dev/null 2>&1 || wt_die "run this from inside your checkout (cd into the repo first)"
@@ -141,6 +147,25 @@ BSLUG="${WT_BRANCH##*/}"
 ISSUE="${BSLUG%%-*}"
 [[ "$ISSUE" =~ ^[0-9]+$ ]] || ISSUE=""
 
+# --- guard: the ready-to-land marker (issue #16) --------------------------------
+# A per-subtask push is indistinguishable from task completion. For a numbered,
+# pushed branch, require an explicit ready/<issue> tag at the branch tip before
+# landing — otherwise a spoke caught between subtasks (clean + pushed) would be
+# landed as a finished issue and have its worktree torn down. The tag is shared
+# between hub and spoke worktrees, so a marker the spoke set is visible here.
+# Exempt: --local micro-spokes (never push, no marker), ad-hoc/non-numbered
+# branches (their one push IS completion), and --force-land (explicit override).
+if [ -z "$LOCAL" ] && [ -z "$FORCE_LAND" ] && [ -n "$ISSUE" ]; then
+  MARKER="ready/${ISSUE}"
+  MARKER_SHA="$(git rev-parse -q --verify "refs/tags/${MARKER}^{commit}" 2>/dev/null || true)"
+  TIP_SHA="$(git rev-parse -q --verify "refs/heads/${WT_BRANCH}" 2>/dev/null || true)"
+  if [ -z "$MARKER_SHA" ]; then
+    wt_die "branch $WT_BRANCH carries no ${MARKER} marker — it looks mid-task (pushed but not signalled complete). Emit it on the spoke after the FINAL subtask's push (git tag ${MARKER} && git push origin ${MARKER}), or pass --force-land for a branch that never carries one."
+  elif [ "$MARKER_SHA" != "$TIP_SHA" ]; then
+    wt_die "${MARKER} marker is stale (points at ${MARKER_SHA:0:9}, branch tip is ${TIP_SHA:0:9}) — the spoke pushed more work after signalling complete. Re-tag at the tip on the spoke (git tag -f ${MARKER} && git push -f origin ${MARKER}), or pass --force-land."
+  fi
+fi
+
 # --- merge ----------------------------------------------------------------------
 PRE_SHA="$(git rev-parse HEAD)"
 echo "→ merging $WT_BRANCH into $DEFAULT"
@@ -190,6 +215,20 @@ elif [ -z "$KEEP_BRANCH" ]; then
   # Safe — just merged; warn rather than abort if deletion fails.
   git branch -d "$WT_BRANCH" \
     || wt_warn "couldn't delete local branch $WT_BRANCH — delete it by hand: git branch -d $WT_BRANCH"
+fi
+
+# Consume the ready/<issue> completion marker (issue #16): the work is landed,
+# so the tag has done its job. Leaving it behind would let a stale marker
+# re-flag a future branch reusing the issue number as mergeable. Local then
+# remote, warn-only — a missing tag (--force-land, ad-hoc) is a no-op.
+if [ -n "$ISSUE" ] && [ -z "$LOCAL" ]; then
+  MARKER="ready/${ISSUE}"
+  if git rev-parse -q --verify "refs/tags/${MARKER}" >/dev/null 2>&1; then
+    git tag -d "$MARKER" >/dev/null 2>&1 \
+      || wt_warn "couldn't delete local tag $MARKER — delete it by hand: git tag -d $MARKER"
+    git push origin ":refs/tags/${MARKER}" >/dev/null 2>&1 \
+      || wt_warn "couldn't delete remote tag $MARKER — delete it by hand: git push origin :refs/tags/$MARKER"
+  fi
 fi
 
 if [ -n "$ISSUE" ]; then

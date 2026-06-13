@@ -70,10 +70,12 @@ code ~/Repos/ai-toolkit
 ```
 
 > [!NOTE]
-> The helper scripts must be present on `main` so that every worktree branched from it
-> carries them. They live under `scripts/`; if a worktree reports `no such file`, the
-> branch predates the merge — run the script from the main checkout by absolute path,
-> or merge the scripts into `main`.
+> The skills and the `planning-hub` rule invoke the helpers at the canonical
+> `.ai-toolkit/scripts/` path so the same reference resolves in this checkout and in any
+> synced target. `sync-to-repo.sh` installs them there (see
+> [Installing into another repo](#installing-the-workflow-into-another-repo)); the
+> ai-toolkit checkout gets them by syncing into itself. The hub commands run on the main
+> checkout, where `.ai-toolkit/scripts/` lives — spokes never invoke them directly.
 
 ## The scripts
 
@@ -83,6 +85,30 @@ code ~/Repos/ai-toolkit
 | `scripts/worktree-land.sh` | Land a pushed branch from the hub: guards → merge → suite → push → teardown → issue close |
 | `scripts/worktree-done.sh` | Resolve a worktree by issue / slug / branch / path and tear it down safely |
 | `scripts/worktree-lib.sh` | Shared slugify + main-root + worktree-resolution helpers (sourced by the others) |
+
+The paths above are the **source** locations in this repo. In a synced target the same
+four scripts (plus `hub-status.sh`) live under `.ai-toolkit/scripts/` — see below.
+
+## Installing the workflow into another repo
+
+The hub/spoke/land flow is not specific to the ai-toolkit checkout: `sync-to-repo.sh`
+installs it into **any** repo, with no manual steps afterwards.
+
+```bash
+./scripts/sync-to-repo.sh ~/Repos/my-project
+```
+
+This copies `worktree-{new,land,done,lib}.sh` and `hub-status.sh` into
+`my-project/.ai-toolkit/scripts/` (executable, manifest-tracked, consistent with the
+`.ai-toolkit/mcp/` convention). The `hub`, `start-task`, and `land` skills and the
+`planning-hub` rule all invoke the scripts via that canonical `.ai-toolkit/scripts/`
+path, which resolves identically in the ai-toolkit checkout and in the synced target —
+so no sync-time path rewrite is needed.
+
+The scripts locate the main checkout by git introspection (`wt_main_root` via
+`git worktree list`) and source their siblings by their own directory, so they run
+unmodified from `.ai-toolkit/scripts/` in a foreign repo. After a sync, run `/hub` in
+`my-project` and the dashboard, dispatch, and land commands work there directly.
 
 ## The daily loop
 
@@ -118,8 +144,8 @@ worktree**, so you review every task's diff without leaving the window.
 
 ### 3. Land
 
-When a task's branch is committed and pushed, land it from the hub — `/land 42` in the
-hub session (the `land` skill), or directly:
+When a task's branch is committed, pushed, **and signalled complete**, land it from the
+hub — `/land 42` in the hub session (the `land` skill), or directly:
 
 ```bash
 cd ~/Repos/ai-toolkit            # merge hub, already on main
@@ -127,13 +153,20 @@ scripts/worktree-land.sh 42      # guards → merge (ff when possible) → full 
                                  # push origin main → teardown → close issue #42
 ```
 
+Completion is explicit: a per-subtask push is indistinguishable from a finished issue,
+so a numbered branch must carry a `ready/<issue>` git tag at its tip — the marker the
+spoke emits after its FINAL subtask's push (`git tag ready/42 && git push origin
+ready/42`). Without it the land refuses (the branch reads `pushed (in progress)` on the
+dashboard); pass `--force-land` only for an express/ad-hoc branch that never carries
+one. A successful land consumes the marker (deletes the local + remote tag).
+
 One command runs the whole landing: it refuses with a precise reason unless the hub is
-clean on `main` and the spoke is clean and fully pushed; a failing suite rolls `main`
-back (`git reset --keep`) with nothing pushed. On success it calls `worktree-done.sh`
-for the teardown mirror of creation — `code --remove` drops the folder from the review
-window, and the now-merged branch is pruned local + origin (`--keep-branch` to keep it).
-An unmerged branch is never pruned. It then closes the issue via `gh` and kills the
-task's stranded tmux window.
+clean on `main` and the spoke is clean, fully pushed, and marked ready; a failing suite
+rolls `main` back (`git reset --keep`) with nothing pushed. On success it calls
+`worktree-done.sh` for the teardown mirror of creation — `code --remove` drops the
+folder from the review window, and the now-merged branch is pruned local + origin
+(`--keep-branch` to keep it). An unmerged branch is never pruned. It then closes the
+issue via `gh` and kills the task's stranded tmux window.
 
 ## `worktree-new.sh` reference
 

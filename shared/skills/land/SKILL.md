@@ -5,14 +5,18 @@ only execute. A spoke's push is its ship gate — landing (merge, push, teardown
 close) happens **here**, on the main checkout, never inside the worktree. Landing runs
 no suite itself: the push's pre-push hook is the single test gate (`docs/test-gate.md`).
 
-The deterministic sequence lives in `scripts/worktree-land.sh`; this skill orchestrates
+The deterministic sequence lives in `.ai-toolkit/scripts/worktree-land.sh`; this skill orchestrates
 it: pick the target, confirm, run, then report and refresh the hub picture.
 
 ## Preconditions
 
 - Run from the **hub** (main checkout) on the default branch, with a clean tree —
   the script aborts otherwise, with the precise reason.
-- The spoke has pushed (`hub-status.sh` shows the branch `pushed → mergeable`).
+- The spoke has finished and signalled it: `hub-status.sh` shows the branch
+  `pushed → mergeable`, which requires a `ready/<issue>` completion marker at the tip.
+  A branch reading `pushed (in progress)` has pushed a subtask but isn't done — landing
+  it refuses (use `--force-land` only for a branch that legitimately never carries a
+  marker, e.g. an ad-hoc/express branch).
 - `gh` authenticated for the issue close (degrades to a warning without it).
 
 ## Workflow
@@ -20,7 +24,7 @@ it: pick the target, confirm, run, then report and refresh the hub picture.
 ### 1. Identify the landing target
 
 Resolve `<id>` (issue number, slug, branch, or worktree path) against the live
-worktrees — `bash shared/skills/hub/scripts/hub-status.sh` if the state is not already
+worktrees — `bash .ai-toolkit/scripts/hub-status.sh` if the state is not already
 known. If the branch is `dirty` or `unpushed`, stop: the spoke is still working; landing
 verifies pushes, it never rescues them.
 
@@ -30,7 +34,7 @@ Restate what is about to happen (branch, merge target, teardown) and get a quick
 a land is a merge plus an irreversible teardown. Then:
 
 ```bash
-scripts/worktree-land.sh <id>
+.ai-toolkit/scripts/worktree-land.sh <id>
 ```
 
 | Flag | Effect |
@@ -39,17 +43,21 @@ scripts/worktree-land.sh <id>
 | `--keep-branch` | Keep the local + remote branch after landing |
 | `--test-cmd <cmd>` | Run `<cmd>` as the gate instead of the tiered selection (threads `TEST_SELECT_CMD`) |
 | `--local` | Micro-spoke landing: skips upstream guards; accepts a bare local branch with no upstream; refuses any branch that has an upstream and refuses the default branch itself |
+| `--force-land` | Land a numbered branch that carries no `ready/<issue>` marker (an express/ad-hoc branch that never emits one); the marker guard is otherwise mandatory |
 
 The script runs, in order, aborting safely at the first failure:
 
 1. **Guards** — hub on a clean default branch; worktree resolved, clean, fully pushed
-   (neither ahead of nor behind its upstream).
+   (neither ahead of nor behind its upstream); for a numbered branch, a `ready/<issue>`
+   marker points at the tip (unless `--force-land`).
 2. **Merge** — fast-forward when possible, else a merge commit.
 3. **Ship** — `git push origin <default>`; the **pre-push hook is the test gate**
    (tiered and diff-aware — `docs/test-gate.md`), so the suite runs once on that push.
    A rejected push (the gate failing or a remote refusal) rolls back with
    `git reset --keep` and nothing is pushed. Then `worktree-done.sh` (removes the
-   worktree, prunes the merged branch local + origin) → `gh issue close <id>`.
+   worktree, prunes the merged branch local + origin) → consume the `ready/<issue>`
+   marker (delete the local + remote tag, so it can't re-flag a future branch) →
+   `gh issue close <id>`.
 4. **tmux** — kills the task's session-0 window when its pane's directory vanished with
    the worktree; live windows are kept.
 
@@ -63,6 +71,7 @@ The script's abort message names the failed guard. Typical moves:
 | Worktree has uncommitted changes | Spoke finishes its cycle first — switch to its window |
 | Branch never pushed / ahead of upstream | Spoke pushes (`/cycle` PUSH step), re-run |
 | Branch behind upstream | Reconcile on the spoke (`git pull`), re-run |
+| No `ready/<issue>` marker / stale marker | Spoke isn't done, or pushed after tagging — finish on the spoke and emit/refresh the marker after the final push, or `--force-land` if it legitimately never carries one |
 | Merge conflict | Rebase the spoke on the default branch, push, re-run |
 | Pre-push gate failed (rolled back) | Fix on the spoke, push, re-run — main was restored |
 
@@ -75,7 +84,7 @@ Then re-run `hub-status.sh` so the next move starts from a fresh picture.
 
 | Situation | Action |
 |-----------|--------|
-| Micro-spoke (lane 1) branch | Review the diff first — lane 1 is non-executable paths only (docs, comments, wording; never `scripts/`, `shared/hooks/`, `tests/`, skill scripts). Then `scripts/worktree-land.sh <branch> --local`: skips upstream guards; no issue to close; the branch is deleted after merge; temp worktree is torn down if still registered |
+| Micro-spoke (lane 1) branch | Review the diff first — lane 1 is non-executable paths only (docs, comments, wording; never `scripts/`, `shared/hooks/`, `tests/`, skill scripts). Then `.ai-toolkit/scripts/worktree-land.sh <branch> --local`: skips upstream guards; no issue to close; the branch is deleted after merge; temp worktree is torn down if still registered |
 | Ad-hoc branch (no issue number) | Lands normally; the issue-close step is skipped |
 | `gh` missing or close fails | Warns; close by hand: `gh issue close <id>` |
 | Push succeeded but teardown failed | Work is shipped; re-run `worktree-done.sh <id>` alone and close the issue by hand |

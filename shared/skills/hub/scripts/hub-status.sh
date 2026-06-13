@@ -150,6 +150,27 @@ print(" · ".join(parts))
 PYEOF
 }
 
+# mergeable_state <worktree-path> <issue-num>
+# A fully-pushed, ahead branch is mergeable only when completion is explicit:
+# a ready/<issue> tag pointing at the branch tip (issue #16) — a per-subtask
+# push looks identical to task completion otherwise. Branches without an
+# issue number (ad-hoc/express) are exempt: their one push IS completion.
+mergeable_state() {
+  local wt_path="$1" issue="$2"
+  if [ -z "$issue" ]; then
+    printf 'pushed → mergeable'
+    return
+  fi
+  local tip marker
+  tip="$(git -C "$wt_path" rev-parse HEAD 2>/dev/null)"
+  marker="$(git -C "$wt_path" rev-parse -q --verify "refs/tags/ready/${issue}^{commit}" 2>/dev/null)"
+  if [ -n "$marker" ] && [ "$marker" = "$tip" ]; then
+    printf 'pushed → mergeable'
+  else
+    printf 'pushed (in progress)'
+  fi
+}
+
 # --- Survey all tmux panes once ---------------------------------------------
 # Format: session:window<TAB>path  (one entry per pane across all sessions)
 all_panes="$(tmux list-panes -a -F '#{session_name}:#{window_index}	#{pane_current_path}' 2>/dev/null || true)"
@@ -180,9 +201,15 @@ while IFS= read -r line; do
   behind="$(awk '{print $1}' <<<"$counts")"; ahead="$(awk '{print $2}' <<<"$counts")"
   dirty=""
   [ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ] && dirty="dirty"
+
+  # Extract leading digits from branch slug (e.g. feature/1-pushed → 1)
+  slug="${branch##*/}"
+  issue_num="$(printf '%s' "$slug" | sed 's/^\([0-9]*\).*/\1/')"
+
   # Push state is measured against the branch's own UPSTREAM (not the default
   # branch): a branch can be fully pushed yet still carry commits ahead of the
-  # default branch. Mergeability is the ahead-vs-default count.
+  # default branch. Mergeability is the ahead-vs-default count, gated on the
+  # explicit ready/<issue> completion marker (mergeable_state).
   state="$dirty"
   if [ -z "$dirty" ]; then
     if git -C "$path" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
@@ -190,7 +217,7 @@ while IFS= read -r line; do
       if [ "${unpushed:-0}" -gt 0 ]; then
         state="unpushed"
       elif [ "${ahead:-0}" -gt 0 ]; then
-        state="pushed → mergeable"
+        state="$(mergeable_state "$path" "$issue_num")"
       else
         state="pushed"
       fi
@@ -198,10 +225,6 @@ while IFS= read -r line; do
       state="unpushed"
     fi
   fi
-
-  # Extract leading digits from branch slug (e.g. feature/1-pushed → 1)
-  slug="${branch##*/}"
-  issue_num="$(printf '%s' "$slug" | sed 's/^\([0-9]*\).*/\1/')"
 
   # Issue state column. </dev/null guards the outer loop's stdin: a
   # stdin-draining gh wrapper would otherwise swallow the worktree list.

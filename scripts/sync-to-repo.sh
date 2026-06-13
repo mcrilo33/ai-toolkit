@@ -460,6 +460,38 @@ sync_mcp_servers() {
 }
 
 # ═══════════════════════════════════════════
+#  WORKFLOW SCRIPTS (hub / spoke / land)
+# ═══════════════════════════════════════════
+# The hub/start-task/land skills invoke the parallel-worktrees scripts at
+# .ai-toolkit/scripts/<name> — a canonical location that resolves in both the
+# ai-toolkit checkout and a synced target (same convention as .ai-toolkit/mcp/).
+# Install them there so the whole flow works after a plain sync, with no manual
+# steps. The worktree scripts source each other via $SCRIPT_DIR (BASH_SOURCE),
+# so co-locating all four keeps the cross-references intact; they locate the
+# main checkout by git introspection, so they run unmodified from here.
+# Sources: worktree-*.sh at the toolkit root scripts/, hub-status.sh under the
+# hub skill (shared/skills/hub/scripts/).
+sync_workflow_scripts() {
+    section "Workflow scripts (hub/spoke/land)"
+    local dst_dir="$TARGET/.ai-toolkit/scripts"
+    make_dir "$dst_dir"
+
+    local name src
+    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh hub-status.sh; do
+        case "$name" in
+            hub-status.sh) src="$SHARED_DIR/skills/hub/scripts/$name" ;;
+            *)             src="$SCRIPT_DIR/$name" ;;
+        esac
+        [ -f "$src" ] || continue
+        copy_file "$src" "$dst_dir/$name"
+        if [ "$DRY_RUN" -eq 0 ]; then
+            chmod +x "$dst_dir/$name"
+            info "scripts/$name"
+        fi
+    done
+}
+
+# ═══════════════════════════════════════════
 #  SHARED CONFIG FILES (pyproject.toml, etc.)
 # ═══════════════════════════════════════════
 sync_config_files() {
@@ -526,6 +558,7 @@ sync_tool() {
     esac
     sync_hooks "$tool"
     sync_mcp_servers
+    sync_workflow_scripts
     finalize_manifest "$tool"
     rm -f "$RECORD_FILE"
     RECORD_FILE=""

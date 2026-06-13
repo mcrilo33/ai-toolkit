@@ -299,7 +299,8 @@ def _taskupdate_lines(use_id: str, task_id: str, from_status: str, to_status: st
     return [json.dumps(use), json.dumps(result)]
 
 
-def test_pushed_spoke_is_mergeable(hub_with_spokes: Path, tmp_path: Path) -> None:
+def test_pushed_spoke_with_ready_marker_is_mergeable(hub_with_spokes: Path, tmp_path: Path) -> None:
+    _git(hub_with_spokes, "tag", "ready/1", "feature/1-pushed")
     out = _run_hub_status(hub_with_spokes, tmp_path)
     line = next(ln for ln in out.splitlines() if "feature/1-pushed" in ln)
     assert "pushed → mergeable" in line
@@ -315,6 +316,52 @@ def test_pushed_even_spoke_is_pushed_not_mergeable(hub_with_spokes: Path, tmp_pa
     out = _run_hub_status(hub_with_spokes, tmp_path)
     line = next(ln for ln in out.splitlines() if "feature/3-even" in ln)
     assert "pushed" in line and "mergeable" not in line
+
+
+# --- Ready-to-land marker (issue #16) ----------------------------------------
+# A per-subtask push is indistinguishable from task completion, so "pushed →
+# mergeable" must require an explicit `ready/<issue>` tag at the branch tip.
+
+
+def test_pushed_spoke_without_marker_shows_in_progress(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    out = _run_hub_status(hub_with_spokes, tmp_path)
+    line = next(ln for ln in out.splitlines() if "feature/1-pushed" in ln)
+    assert "pushed (in progress)" in line
+    assert "mergeable" not in line
+
+
+def test_pushed_spoke_with_stale_marker_shows_in_progress(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    # Marker sha != branch tip: the spoke pushed more work after tagging, so
+    # the completion claim no longer covers the tip — treat as in progress.
+    seed_sha = _git(hub_with_spokes, "rev-parse", "main").strip()
+    _git(hub_with_spokes, "tag", "ready/1", seed_sha)
+
+    out = _run_hub_status(hub_with_spokes, tmp_path)
+
+    line = next(ln for ln in out.splitlines() if "feature/1-pushed" in ln)
+    assert "pushed (in progress)" in line
+    assert "mergeable" not in line
+
+
+def test_adhoc_pushed_spoke_is_mergeable_without_marker(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    # Non-numeric slug = express lane: there is no issue to anchor a marker to,
+    # and the one push IS completion — exempt from the marker requirement.
+    adhoc = tmp_path / "adhoc"
+    (adhoc / "c.txt").write_text("c\n")
+    _git(adhoc, "add", "c.txt")
+    _git(adhoc, "commit", "-qm", "chore: c", "-m", "Refs #0")
+    _git(adhoc, "push", "-q", "-u", "origin", "chore/adhoc-slug")
+
+    out = _run_hub_status(hub_with_spokes, tmp_path)
+
+    line = next(ln for ln in out.splitlines() if "chore/adhoc-slug" in ln)
+    assert "pushed → mergeable" in line
 
 
 def test_hub_branch_labelled_hub(hub_with_spokes: Path, tmp_path: Path) -> None:
@@ -766,4 +813,4 @@ def test_degrades_when_tmux_unavailable(hub_with_spokes: Path, tmp_path: Path) -
 
     line = next(ln for ln in result.stdout.splitlines() if "feature/1-pushed" in ln)
     assert result.returncode == 0
-    assert "pushed → mergeable" in line
+    assert "pushed (in progress)" in line

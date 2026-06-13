@@ -15,7 +15,7 @@ even when invoked outside tmux ($TMUX unset), and print the exact jump command
 
 Agent pinning (issue #8 follow-up): the spoke launch must pin model and effort
 explicitly (`CLAUDE_EFFORT=<effort> claude --model <model>`) from env vars
-`WT_AGENT_MODEL` (default `fable`) / `WT_AGENT_EFFORT` (default `max`) instead
+`WT_AGENT_MODEL` (default `opus`) / `WT_AGENT_EFFORT` (default `max`) instead
 of relying on user-global settings; a seeded `--prompt` stays the trailing arg.
 
 Launch delivery (issue #15): typing the launch command into an interactive zsh
@@ -252,7 +252,7 @@ def test_no_server_falls_back_to_manual_advice(hub: Path, tmp_path: Path) -> Non
     assert proc.returncode == 0, proc.stderr
     assert not _calls(log.read_text(), "new-window")
     assert "Start the agent in a new terminal window:" in proc.stdout
-    assert "CLAUDE_EFFORT=max claude --model fable" in proc.stdout
+    assert "CLAUDE_EFFORT=max claude --model opus" in proc.stdout
     assert "/source" in proc.stdout
 
 
@@ -262,7 +262,7 @@ def test_agent_launch_pins_model_and_effort_by_default(hub: Path, tmp_path: Path
     assert proc.returncode == 0, proc.stderr
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation"
-    assert "CLAUDE_EFFORT=max claude --model fable; exec " in new_window[0]
+    assert "CLAUDE_EFFORT=max claude --model opus; exec " in new_window[0]
 
 
 def test_agent_launch_respects_model_and_effort_overrides(hub: Path, tmp_path: Path) -> None:
@@ -282,7 +282,7 @@ def test_agent_launch_keeps_seeded_prompt_after_pinning(hub: Path, tmp_path: Pat
     assert proc.returncode == 0, proc.stderr
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation"
-    assert "CLAUDE_EFFORT=max claude --model fable /source; exec " in new_window[0]
+    assert "CLAUDE_EFFORT=max claude --model opus /source; exec " in new_window[0]
 
 
 def test_agent_launch_shell_quotes_metacharacter_overrides(hub: Path, tmp_path: Path) -> None:

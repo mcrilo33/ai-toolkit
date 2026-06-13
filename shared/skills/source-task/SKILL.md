@@ -24,7 +24,7 @@ do not silently proceed:
 
 > You're in the shared main checkout. If another session is also editing here, the
 > staging area, `.review/` artifacts, and commit/push hooks collide. For an
-> isolated task, run `scripts/worktree-new.sh <issue>` and `/source` in the new
+> isolated task, run `.ai-toolkit/scripts/worktree-new.sh <issue>` and `/source` in the new
 > window. Want me to do that, or proceed here anyway?
 
 Proceed in the main checkout only when the user confirms (e.g. a quick one-off where

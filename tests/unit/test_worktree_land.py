@@ -57,8 +57,21 @@ def hub(tmp_path: Path) -> Path:
     return hub
 
 
-def _make_spoke(hub: Path, tmp_path: Path, branch: str, *, push: bool) -> Path:
-    """Add a worktree on `branch` with one commit; optionally push it to origin."""
+def _issue_of(branch: str) -> str:
+    """Leading digits of the branch slug (feature/1-foo → '1'); '' when ad-hoc."""
+    slug = branch.rsplit("/", 1)[-1]
+    num = slug.split("-", 1)[0]
+    return num if num.isdigit() else ""
+
+
+def _make_spoke(hub: Path, tmp_path: Path, branch: str, *, push: bool, ready: bool = True) -> Path:
+    """Add a worktree on `branch` with one commit; optionally push it to origin.
+
+    A normally-completed spoke also carries the issue #16 completion marker: when
+    `push` and `ready` and the slug has an issue number, tag `ready/<issue>` at the
+    branch tip and push it. Tests that exercise the marker guard pass `ready=False`
+    (or mutate the tag afterwards) to model a mid-task or stale push.
+    """
     wt = tmp_path / branch.replace("/", "-")
     _git(hub, "worktree", "add", "-q", "-b", branch, str(wt))
     fname = f"{branch.replace('/', '-')}.txt"
@@ -67,6 +80,10 @@ def _make_spoke(hub: Path, tmp_path: Path, branch: str, *, push: bool) -> Path:
     _git(wt, "commit", "-qm", "feat: work", "-m", "Refs #1")
     if push:
         _git(wt, "push", "-q", "-u", "origin", branch)
+        issue = _issue_of(branch)
+        if ready and issue:
+            _git(wt, "tag", f"ready/{issue}")
+            _git(wt, "push", "-q", "origin", f"ready/{issue}")
     return wt
 
 
@@ -134,6 +151,16 @@ def _local_branches(hub: Path) -> list[str]:
 
 def _remote_sha(hub: Path, branch: str) -> str:
     out = _git(hub, "ls-remote", "--heads", "origin", branch)
+    return out.split()[0] if out.strip() else ""
+
+
+def _local_tags(hub: Path) -> list[str]:
+    out = _git(hub, "tag", "--list")
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
+def _remote_tag_sha(hub: Path, tag: str) -> str:
+    out = _git(hub, "ls-remote", "--tags", "origin", tag)
     return out.split()[0] if out.strip() else ""
 
 
@@ -269,6 +296,8 @@ def test_merge_conflict_aborts_cleanly(hub: Path, tmp_path: Path) -> None:
     _git(wt, "add", "README.md")
     _git(wt, "commit", "-qm", "feat: spoke readme", "-m", "Refs #1")
     _git(wt, "push", "-q", "-u", "origin", "feature/1-conflict")
+    _git(wt, "tag", "ready/1")  # marked complete, so landing reaches the merge step
+    _git(wt, "push", "-q", "origin", "ready/1")
     (hub / "README.md").write_text("hub version\n")
     _git(hub, "add", "README.md")
     _git(hub, "commit", "-qm", "chore: hub readme", "-m", "Refs #0")
@@ -299,6 +328,99 @@ def test_refuses_unknown_target(hub: Path, tmp_path: Path) -> None:
 
     assert proc.returncode != 0
     assert "feature/1-real" in proc.stderr  # candidates are listed for recovery
+
+
+# --- ready-to-land marker guard (issue #16) -------------------------------------
+# A per-subtask push is indistinguishable from task completion. Landing a
+# numbered branch therefore requires an explicit ready/<issue> marker at the
+# branch tip; --force-land overrides, and ad-hoc/express branches are exempt.
+
+
+def test_refuses_pushed_branch_without_marker(hub: Path, tmp_path: Path) -> None:
+    # Mid-task: pushed and clean, but no completion marker → must refuse so the
+    # hub never lands a half-finished issue and tears down its worktree.
+    _make_spoke(hub, tmp_path, "feature/1-midtask", push=True, ready=False)
+    pre_main = _remote_sha(hub, "main")
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode != 0
+    assert "ready/1" in proc.stderr
+    assert not (hub / "feature-1-midtask.txt").exists()  # nothing merged
+    assert _remote_sha(hub, "main") == pre_main
+
+
+def test_refuses_stale_marker(hub: Path, tmp_path: Path) -> None:
+    # Marker sha != branch tip: the spoke pushed more work after tagging, so the
+    # completion claim no longer covers the tip — refuse like a missing marker.
+    wt = _make_spoke(hub, tmp_path, "feature/1-stale", push=True, ready=True)
+    (wt / "more.txt").write_text("pushed after tagging\n")
+    _git(wt, "add", "more.txt")
+    _git(wt, "commit", "-qm", "feat: more", "-m", "Refs #1")
+    _git(wt, "push", "-q", "origin", "feature/1-stale")
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode != 0
+    assert "ready/1" in proc.stderr
+    assert not (hub / "more.txt").exists()  # nothing merged
+
+
+def test_lands_with_matching_marker(hub: Path, tmp_path: Path) -> None:
+    # The marker points at the tip → land normally.
+    _make_spoke(hub, tmp_path, "feature/1-ready", push=True, ready=True)
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode == 0, proc.stderr
+    assert (hub / "feature-1-ready.txt").exists()
+    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
+
+
+def test_force_land_overrides_missing_marker(hub: Path, tmp_path: Path) -> None:
+    # --force-land is the escape hatch for branches that never carry a marker.
+    _make_spoke(hub, tmp_path, "feature/1-forced", push=True, ready=False)
+
+    proc, _ = _run_land(hub, tmp_path, "1", "--force-land")
+
+    assert proc.returncode == 0, proc.stderr
+    assert (hub / "feature-1-forced.txt").exists()
+
+
+def test_adhoc_branch_lands_without_marker(hub: Path, tmp_path: Path) -> None:
+    # Non-numeric slug = no issue to anchor a marker to; the single push IS
+    # completion, so the guard is exempt without --force-land.
+    _make_spoke(hub, tmp_path, "chore/adhoc-marker", push=True)
+
+    proc, _ = _run_land(hub, tmp_path, "adhoc-marker")
+
+    assert proc.returncode == 0, proc.stderr
+    assert (hub / "chore-adhoc-marker.txt").exists()
+
+
+def test_marker_tag_deleted_after_landing(hub: Path, tmp_path: Path) -> None:
+    # Landing consumes the marker: the local and remote ready/<issue> tags are
+    # cleaned up so a stale tag can never re-flag a future branch as mergeable.
+    _make_spoke(hub, tmp_path, "feature/1-consumed", push=True, ready=True)
+    assert "ready/1" in _local_tags(hub)
+    assert _remote_tag_sha(hub, "ready/1") != ""
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "ready/1" not in _local_tags(hub)
+    assert _remote_tag_sha(hub, "ready/1") == ""
+
+
+def test_local_micro_spoke_exempt_from_marker(hub: Path, tmp_path: Path) -> None:
+    # --local micro-spokes never push and carry no marker; the hub's diff review
+    # is their gate, so the marker guard must not apply.
+    _make_spoke(hub, tmp_path, "feature/2-micro", push=False, ready=False)
+
+    proc, _ = _run_land(hub, tmp_path, "2", "--local")
+
+    assert proc.returncode == 0, proc.stderr
+    assert (hub / "feature-2-micro.txt").exists()
 
 
 # --- the pre-push hook is the single test gate (issue #19) -----------------------
