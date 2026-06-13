@@ -102,8 +102,10 @@ class TestSpanKinds:
             s for s in _by_kind(parsed, "human") if s.human and s.human["type"] == "question"
         ]
         assert len(questions) == 1
+        human = questions[0].human
+        assert human is not None
         # AskUserQuestion fired at 12:01:10, answered at 12:01:40 → 30s wait.
-        assert questions[0].human["wait_ms"] == 30000
+        assert human["wait_ms"] == 30000
 
 
 class TestSubagentWalk:
