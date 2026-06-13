@@ -139,8 +139,21 @@ git worktree add "$WT_DIR" -b "$BRANCH"
 # Every hook/script emitting telemetry inside this worktree reads this id, so
 # all spans of one spoke share it across sessions and resumes. Format:
 # <branch>+<spawn-epoch>. Minting is INDEPENDENT of AI_TOOLKIT_TELEMETRY — the
-# spoke's identity must exist even if telemetry is enabled later mid-run. The
-# file lives under .ai-toolkit/ (gitignored), so it never enters a commit.
+# spoke's identity must exist even if telemetry is enabled later mid-run.
+#
+# Make .ai-toolkit/ ignored via the repo's git exclude (resolved for this
+# worktree) rather than trusting the consuming repo's committed .gitignore: a
+# synced target may ship its own .gitignore without .ai-toolkit/, and then the
+# minted file would land UNTRACKED and break worktree-done (git worktree remove)
+# and worktree-land (untracked-as-dirty guard). The exclude entry is local to
+# the repo's git dir, never committed, and appended at most once.
+EXCLUDE_FILE="$(git -C "$WT_DIR" rev-parse --git-path info/exclude 2>/dev/null || true)"
+if [ -n "$EXCLUDE_FILE" ]; then
+  mkdir -p "$(dirname "$EXCLUDE_FILE")"
+  grep -qxF '.ai-toolkit/' "$EXCLUDE_FILE" 2>/dev/null \
+    || printf '%s\n' '.ai-toolkit/' >> "$EXCLUDE_FILE"
+fi
+
 SPOKE_RUN_ID="${BRANCH}+$(date +%s)"
 mkdir -p "$WT_DIR/.ai-toolkit"
 printf '%s\n' "$SPOKE_RUN_ID" > "$WT_DIR/.ai-toolkit/spoke-run-id"

@@ -229,6 +229,48 @@ class TestWorktreeDoneSpoke:
         assert spans[0]["phase"] == "teardown"
         assert spans[0]["spoke_run_id"] == srid
 
+    def test_done_succeeds_when_repo_gitignore_omits_ai_toolkit(self, tmp_path: Path) -> None:
+        # A repo whose COMMITTED .gitignore does not list .ai-toolkit/. The minted
+        # spoke-run-id must still not count as an untracked change — worktree-new
+        # adds .ai-toolkit/ to the repo's git exclude — so a plain (no --force)
+        # teardown succeeds instead of failing on `git worktree remove` (exit 128).
+        remote = tmp_path / "remote.git"
+        hub = tmp_path / "hub"
+        subprocess.run(
+            ["git", "init", "-q", "--bare", str(remote)],
+            check=True,
+            capture_output=True,
+            env=_GIT_ENV,
+        )
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(hub)],
+            check=True,
+            capture_output=True,
+            env=_GIT_ENV,
+        )
+        for k, v in (("user.email", "t@t.t"), ("user.name", "t"), ("commit.gpgsign", "false")):
+            _git(hub, "config", k, v)
+        (hub / "README.md").write_text("seed\n")
+        (hub / ".gitignore").write_text("*.log\n")  # deliberately NOT .ai-toolkit/
+        _git(hub, "add", "README.md", ".gitignore")
+        _git(hub, "commit", "-qm", "chore: seed", "-m", "Refs #0")
+        _git(hub, "remote", "add", "origin", str(remote))
+        _git(hub, "push", "-q", "-u", "origin", "main")
+
+        new = _run(
+            WORKTREE_NEW,
+            hub,
+            _tele_env(None, enabled=False),
+            "5",
+            "delta",
+            "--no-code",
+            "--no-terminal",
+        )
+        assert new.returncode == 0, new.stderr
+
+        done = _run(WORKTREE_DONE, hub, _tele_env(None, enabled=False), "5", "--no-code")
+        assert done.returncode == 0, done.stderr
+
 
 # ── worktree-land: land span ───────────────────────────────
 
