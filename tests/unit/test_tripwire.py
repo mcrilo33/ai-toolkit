@@ -256,3 +256,50 @@ def test_known_gitdir_scenario_passes_through(repo: Path, tmp_path: Path) -> Non
     )
 
     assert proc.returncode == 0, proc.stderr
+
+
+# --- the backstop: run_pytest_node under the tripwire (issue #31) -----------------
+# The red-proof hooks run individual Tested-RED nodes through run_pytest_node,
+# which shells out to pytest just like the gate. The tripwire wraps that run too:
+# a node that mutates THIS repo yields the BREACH verdict and the snapshot is
+# restored, so the caller can block instead of shipping a corrupted repo.
+
+
+def _run_node(
+    repo: Path, bindir: Path, node: str = "tests/test_x.py::test_x"
+) -> subprocess.CompletedProcess[str]:
+    """Source utils.sh and call run_pytest_node with `bindir` (the stub) on PATH."""
+    env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    script = (
+        f'set -uo pipefail\nsource "{UTILS}"\n'
+        f'v="$(run_pytest_node "{repo}" "{node}")"\necho "VERDICT=$v"\n'
+    )
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+
+
+def test_backstop_clean_node_passes_through(repo: Path, tmp_path: Path) -> None:
+    _make_pytest_stub(tmp_path / "bin", ":")  # exits 0, mutates nothing
+
+    proc = _run_node(repo, tmp_path / "bin")
+
+    assert "VERDICT=PASS" in proc.stdout, proc.stderr  # normal verdict still flows
+
+
+def test_backstop_node_bare_flip_breaches_and_restores(repo: Path, tmp_path: Path) -> None:
+    _make_pytest_stub(tmp_path / "bin", "git config core.bare true")
+
+    proc = _run_node(repo, tmp_path / "bin")
+
+    assert "VERDICT=BREACH" in proc.stdout, proc.stderr  # breach beats the PASS verdict
+    assert "core.bare" in proc.stderr  # names the marker
+    assert _git(repo, "config", "--get", "core.bare").strip() == "false"  # restored
+
+
+def test_backstop_node_ref_move_breaches_and_restores(repo: Path, tmp_path: Path) -> None:
+    before = _rev(repo, "main")
+    _make_pytest_stub(tmp_path / "bin", "git commit --allow-empty -q -m sneak")
+
+    proc = _run_node(repo, tmp_path / "bin")
+
+    assert "VERDICT=BREACH" in proc.stdout, proc.stderr
+    assert _rev(repo, "main") == before  # the moved ref is back
