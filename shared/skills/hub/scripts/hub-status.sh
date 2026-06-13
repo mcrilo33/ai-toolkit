@@ -5,7 +5,8 @@
 #   - all tmux panes across every session (once, at startup)
 #   - worktrees and, per task branch, ahead/behind vs main + dirty state,
 #     linked GitHub issue state, correlated tmux pane/jump command, and
-#     TodoWrite ledger (done/total from the spoke's latest Claude session)
+#     task ledger (Tasks system or TodoWrite; done/total from the spoke's
+#     latest Claude session)
 #   - open GitHub issues, flagged by whether a worktree already exists for them
 #
 # Read-only. Run from the main checkout. Safe to run anytime.
@@ -22,7 +23,15 @@ bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 
 # todos_for_path <worktree-path>
 # Reads the newest .jsonl from the spoke's Claude project dir and returns
-# "<done>/<total> [· in_progress: <content>]", or "none", or "" if unavailable.
+# "<done>/<total> [· step: <X>] · <activity> [· ⚠ WAITING ON INPUT]", or the
+# same extras after "none", or "" if unavailable.
+# Current runtimes keep the ledger via the Tasks system (TaskCreate/TaskUpdate);
+# those records are reconstructed first, with the last TodoWrite snapshot as
+# fallback for older runtimes. "none" only when NEITHER system has entries.
+# step: cycle keyword (ANCHOR/RED/GREEN/REVIEW/PUSH) from the in_progress item,
+# else its truncated text. Activity age comes from the transcript's mtime. The
+# waiting flag fires on an open AskUserQuestion (no tool_result, no later
+# meaningful event) or a trailing notification entry.
 todos_for_path() {
   local wt_path="$1"
   local projects_root="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
@@ -35,8 +44,14 @@ todos_for_path() {
   jsonl="$(ls -t "${project_dir}"/*.jsonl 2>/dev/null | head -1)"
   [ -n "$jsonl" ] || return 0
   _TODOS_JSONL="$jsonl" python3 2>/dev/null <<'PYEOF'
-import json, os
-result = None
+import json, os, re, time
+
+tasks = {}        # task id -> {"content", "status"}, insertion-ordered
+create_uses = set()   # TaskCreate tool_use ids awaiting their tool_result
+update_uses = {}      # TaskUpdate tool_use id -> input (taskId fallback)
+todos = None          # last TodoWrite snapshot (older-runtime fallback)
+pending_ask = None    # open AskUserQuestion ids; any later meaningful event clears
+last_type = None      # type of the newest parsed transcript entry
 try:
     with open(os.environ["_TODOS_JSONL"]) as fh:
         for raw in fh:
@@ -44,27 +59,94 @@ try:
                 obj = json.loads(raw)
             except Exception:
                 continue
-            if not isinstance(obj, dict) or obj.get("type") != "assistant":
+            if not isinstance(obj, dict):
                 continue
+            last_type = obj.get("type")
             content = (obj.get("message") or {}).get("content") or []
-            for block in content:
-                if (isinstance(block, dict)
-                        and block.get("type") == "tool_use"
-                        and block.get("name") == "TodoWrite"):
-                    result = (block.get("input") or {}).get("todos") or []
+            if not isinstance(content, list):
+                if last_type == "user":
+                    pending_ask = None  # plain text prompt — session moved on
+                continue
+            if last_type == "assistant":
+                asks = set()
+                for block in content:
+                    if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+                        continue
+                    name = block.get("name")
+                    if name == "TodoWrite":
+                        todos = (block.get("input") or {}).get("todos") or []
+                    elif name == "TaskCreate":
+                        create_uses.add(block.get("id"))
+                    elif name == "TaskUpdate":
+                        update_uses[block.get("id")] = block.get("input") or {}
+                    elif name == "AskUserQuestion":
+                        asks.add(block.get("id"))
+                # A meaningful assistant event supersedes an older open question;
+                # one carrying an AskUserQuestion opens a new one.
+                pending_ask = asks or None
+            elif last_type == "user":
+                pending_ask = None
+                # The task id is NOT in the TaskCreate input — it only exists in
+                # the tool_result line's toolUseResult; same for the authoritative
+                # TaskUpdate status transition.
+                tur = obj.get("toolUseResult")
+                if not isinstance(tur, dict):
+                    continue
+                for block in content:
+                    if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+                        continue
+                    uid = block.get("tool_use_id")
+                    if uid in create_uses:
+                        task = tur.get("task") or {}
+                        tid = task.get("id")
+                        if tid is not None:
+                            tasks[str(tid)] = {
+                                "content": str(task.get("subject") or ""),
+                                "status": "pending",
+                            }
+                    elif uid in update_uses:
+                        change = tur.get("statusChange") or {}
+                        tid = str(tur.get("taskId") or update_uses[uid].get("taskId") or "")
+                        new = change.get("to")
+                        if tid in tasks and new:
+                            if new == "deleted":
+                                del tasks[tid]
+                            else:
+                                tasks[tid]["status"] = new
 except Exception:
     pass
-if result is None:
-    print("none")
+
+if tasks:
+    entries = list(tasks.values())
+elif todos is not None:
+    entries = [t for t in todos if isinstance(t, dict)]
 else:
-    todos = [t for t in result if isinstance(t, dict)]
-    done = sum(1 for t in todos if t.get("status") == "completed")
-    ip = next((t for t in todos if t.get("status") == "in_progress"), None)
-    line = f"{done}/{len(todos)}"
+    entries = None
+
+parts = []
+if entries is None:
+    parts.append("none")
+else:
+    done = sum(1 for t in entries if t.get("status") == "completed")
+    parts.append(f"{done}/{len(entries)}")
+    ip = next((t for t in entries if t.get("status") == "in_progress"), None)
     if ip:
-        content = (ip.get("content") or "").split("\n", 1)[0][:60]
-        line += f" · in_progress: {content}"
-    print(line)
+        text = (ip.get("content") or "").split("\n", 1)[0]
+        m = re.search(r"\b(anchor|red|green|review|push)\b", text, re.I)
+        parts.append(f"step: {m.group(1).upper() if m else text[:60]}")
+try:
+    age = max(0, time.time() - os.path.getmtime(os.environ["_TODOS_JSONL"]))
+    if age < 60:
+        parts.append(f"active {int(age)}s ago")
+    elif age < 3600:
+        parts.append(f"idle {int(age // 60)}m")
+    else:
+        parts.append(f"idle {int(age // 3600)}h")
+except Exception:
+    pass
+if pending_ask or last_type == "notification":
+    parts.append("⚠ WAITING ON INPUT")
+print(" · ".join(parts))
 PYEOF
 }
 
@@ -188,7 +270,7 @@ while IFS= read -r line; do
     fi
   fi
 
-  # TodoWrite ledger sub-line
+  # Task ledger sub-line (Tasks system or TodoWrite)
   todos_out="$(todos_for_path "$path")"
   [ -n "$todos_out" ] && printf "      ↳ todos: %s\n" "$todos_out"
 done < <(git -C "$main_root" worktree list 2>/dev/null)

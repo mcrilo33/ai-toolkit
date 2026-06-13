@@ -38,9 +38,13 @@ It reports, read-only:
   (`tmux <session>:<window>`, matched across
   **all** sessions by pane path, or `no pane`). Rows with a pane include a copy-paste
   `↳ jump:` command (`select-window` / `switch-client` / `attach`, picked for where you
-  are). A `↳ todos:` sub-line shows the spoke's TodoWrite ledger from its latest Claude
-  session (`<done>/<total> · in_progress: <item>`); `todos: none` means the spoke never
-  seeded a ledger — that absence is signal, since kickoffs mandate one.
+  are). A `↳ todos:` sub-line shows the spoke's task ledger (Tasks system, or TodoWrite
+  on older runtimes) from its latest Claude session: `<done>/<total> · step: <X> ·
+  <activity>`, where `step:` is the in_progress item's cycle keyword
+  (ANCHOR/RED/GREEN/REVIEW/PUSH) or its truncated text, activity is `active Ns ago` /
+  `idle Nm`, and `⚠ WAITING ON INPUT` is appended when the spoke is blocked on an
+  unanswered question; `todos: none` means the spoke never seeded a ledger of either
+  kind — that absence is signal, since kickoffs mandate one.
 - **Open issues** — flagged `worktree active` or `no worktree` so you can see what is
   unstarted.
 

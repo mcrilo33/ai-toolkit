@@ -28,9 +28,13 @@ ai-toolkit/
 │   ├── cursor/               # MCP servers
 │   └── claude/               # Claude Code settings
 │
-└── scripts/
-    ├── install.sh            # Symlinks tool settings to expected locations
-    └── sync-to-repo.sh       # Generates tool configs from shared/ into a repo
+├── docs/                     # Frontmatter references, sync model, workflow guides
+│
+├── scripts/
+│   ├── install.sh            # Symlinks tool settings to expected locations
+│   └── sync-to-repo.sh       # Generates tool configs from shared/ into a repo
+│
+└── tests/                    # pytest unit + integration suites
 ```
 
 ## How it works

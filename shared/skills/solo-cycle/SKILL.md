@@ -93,12 +93,12 @@ then. So:
 The hub consumes the marker on landing (deletes the local + remote tag), so it can't
 re-flag a future branch that reuses the issue number.
 
-## The session ledger (TodoWrite)
+## The session ledger (Tasks or TodoWrite)
 
 GitHub issues hold the durable contract; your head holds the momentary edit. The
 middle layer — *which subtask and which cycle step is live right now* — is what a
 dead worktree session forgets, leaving you to reconstruct mid-cycle state by
-archaeology. Track it in a `TodoWrite` ledger so the cycle is visible and resumable.
+archaeology. Track it in a task ledger — `TaskCreate`/`TaskUpdate`, or `TodoWrite` on older runtimes — so the cycle is visible and resumable.
 
 **Seed it** before the first commit: one todo per subtask × the cycle steps that
 apply — `Subtask 1 · ANCHOR`, `Subtask 1 · RED`, `Subtask 1 · GREEN`,
@@ -123,11 +123,11 @@ The ledger is ephemeral session scratch; the GitHub issue is the durable contrac
 - Any commit after APPROVE invalidates the artifact (hash mismatch) — re-review before pushing
 - Non-TDD subtasks (docs, config, chores) need no `Tested-RED` trailer —
   `red-proof-warn` only gates source-adding commits — but anchor and review still apply
-- The TodoWrite ledger is ephemeral session scratch; the GitHub issue is the durable
+- The task ledger is ephemeral session scratch; the GitHub issue is the durable
   contract — sync only outcomes at PUSH, and skip the ledger entirely for single-step
   work (one tiny subtask, a docs/config one-liner), where it is pure overhead
 - `todo-ledger-warn` enforces the ledger at PUSH by scanning the session transcript for
-  a `TodoWrite` call (warn on Claude, hard-deny on Cursor). For genuinely single-step
+  a ledger call — `TodoWrite`, `TaskCreate`, or `TaskUpdate` (warn on Claude, hard-deny on Cursor). For genuinely single-step
   work, add a `No-Ledger: <reason>` trailer to a commit in the pushed range to bypass it
 
 ## Edge cases
@@ -136,7 +136,7 @@ The ledger is ephemeral session scratch; the GitHub issue is the durable contrac
 |-----------|--------|
 | Push blocked by `reviewer-sep-warn` | Run the `code-review` agent, get APPROVE |
 | Push blocked by `red-proof-warn` | A source-adding commit is missing its trailer — amend/reword it, or add the failing-test commit |
-| Push blocked by `todo-ledger-warn` | Seed a `TodoWrite` ledger this session, or add a `No-Ledger: <reason>` trailer for single-step work |
+| Push blocked by `todo-ledger-warn` | Seed a task ledger (`TaskCreate` or `TodoWrite`) this session, or add a `No-Ledger: <reason>` trailer for single-step work |
 | Working on `main` with no issue branch | Add `Refs #<id>` to every commit message |
 | Review says REQUEST_CHANGES | Fix and re-review — never bypass |
 | Tempted to use `--no-verify` | Blocked by `block-no-verify`, by design |

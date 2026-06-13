@@ -34,8 +34,8 @@ All hooks defined in `shared/hooks/metadata.yml`:
 | `console-log-warn` | postToolUse | Edit/Write | 2 | Warn when `console.log`, `print()`, or debug statements are added | debug |
 | `red-proof-warn` | preToolUse | Bash | 2 | Flag pushed commits that add source with no `Tested-RED:` trailer | — |
 | `reviewer-sep-warn` | preToolUse | Bash | 2 | On push: verify the signed APPROVE review artifact bound to the pushed diff (see [review-stamp.md](./review-stamp.md)) | — |
-| `todo-ledger-warn` | preToolUse | Bash | 2 | On push: scan the session transcript for a `TodoWrite` call; warn (Claude) / hard-deny (Cursor) if absent. A `No-Ledger:` commit trailer bypasses the gate for single-step work | — |
-| `todo-ledger-nudge` | sessionStart | — | 3 | At session start, nudge the agent to seed a `TodoWrite` ledger before the first commit (advisory; companion of `todo-ledger-warn`) | — |
+| `todo-ledger-warn` | preToolUse | Bash | 2 | On push: scan the session transcript for a ledger call (`TodoWrite`, `TaskCreate`, or `TaskUpdate`); warn (Claude) / hard-deny (Cursor) if absent. A `No-Ledger:` commit trailer bypasses the gate for single-step work | — |
+| `todo-ledger-nudge` | sessionStart | — | 3 | At session start, nudge the agent to seed a task ledger (TodoWrite or Tasks) before the first commit (advisory; companion of `todo-ledger-warn`) | — |
 | `delegation-gate-warn` | preToolUse | Bash | 2 | Delegation hints for specialist agents; enforced at the shipping gate | — |
 | `review-stamp-guard` | beforeMCPExecution (Cursor-only) | — | 1 | Deny `approve_review` MCP calls outside an active code-review review-window (fail-closed) | — |
 | `review-window-open` | subagentStart (Cursor-only) | — | 1 | Open the review window (`.review/.window`) when a code-review subagent starts | — |
