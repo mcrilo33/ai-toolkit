@@ -20,7 +20,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
-from telemetry.cost import attribute, load_ccusage_costs
+from telemetry.cost import attribute, load_ccusage_costs, per_turn_rows
 from telemetry.session_parser import ParsedSession, UsageEvent, parse_session_file
 from telemetry.spans import Span
 
@@ -145,6 +145,21 @@ class TestBoundaryBracketing:
         assert (span_a.tokens_in == 0) != (span_b.tokens_in == 0)
         total = sum(s.cost_usd or 0.0 for s in parsed.spans)
         assert total <= 1.0 + 1e-9
+
+
+class TestPerTurnRows:
+    def test_rows_sum_to_ccusage_session_total(self) -> None:
+        parsed = parse_session_file(SESSION)
+        rows = per_turn_rows(parsed.usage_events, {SESSION_ID: CCUSAGE_COST})
+        total = sum(float(r["cost_usd"]) for r in rows if r["session_id"] == SESSION_ID)  # type: ignore[arg-type]
+        assert total == pytest.approx(CCUSAGE_COST)
+
+    def test_cost_is_none_when_session_absent_from_ccusage(self) -> None:
+        parsed = parse_session_file(SESSION)
+        rows = per_turn_rows(parsed.usage_events, {})
+        assert rows  # turns still emitted
+        assert all(r["cost_usd"] is None for r in rows)
+        assert all(int(r["tokens_total"]) > 0 for r in rows)  # type: ignore[arg-type]
 
 
 class TestCcusageLoader:

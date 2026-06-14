@@ -85,6 +85,46 @@ def attribute_spans(
     return spans
 
 
+def per_turn_rows(
+    usage_events: list[UsageEvent], ccusage_costs: dict[str, float]
+) -> list[dict[str, object]]:
+    """One row per usage event, with model and a per-turn cost.
+
+    Unlike span attribution — which brackets a turn onto every overlapping span —
+    each turn appears exactly once here, so the rows sum to the ccusage session
+    total with no double-count. Cost reuses the same blended session rate
+    (ccusage total ÷ session tokens); a session absent from ``ccusage_costs``
+    gets ``cost_usd`` None (tokens still counted).
+
+    Args:
+        usage_events: Per-turn usage from the parsed sessions (main + subagent).
+        ccusage_costs: Map of ``session_id`` to ccusage ``totalCost``.
+
+    Returns:
+        One dict per turn: ``session_id, ts, model, source, agent_id,
+        tokens_in, tokens_out, tokens_total, cost_usd``.
+    """
+    rate = _session_rates(usage_events, ccusage_costs)
+    rows: list[dict[str, object]] = []
+    for event in usage_events:
+        total = _event_total(event)
+        session_rate = rate.get(event.session_id)
+        rows.append(
+            {
+                "session_id": event.session_id,
+                "ts": event.ts,
+                "model": event.model,
+                "source": event.source,
+                "agent_id": event.agent_id,
+                "tokens_in": event.input_tokens,
+                "tokens_out": event.output_tokens,
+                "tokens_total": total,
+                "cost_usd": session_rate * total if session_rate is not None else None,
+            }
+        )
+    return rows
+
+
 def load_ccusage_costs(runner: Callable[[], str] | None = None) -> dict[str, float]:
     """Load per-session cost from ``ccusage session --json`` (Claude rows only).
 

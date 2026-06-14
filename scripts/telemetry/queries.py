@@ -23,8 +23,8 @@ from pathlib import Path
 
 import duckdb
 
-from telemetry.cost import attribute_spans
-from telemetry.session_parser import parse_projects_dir
+from telemetry.cost import attribute_spans, per_turn_rows
+from telemetry.session_parser import ParsedSession, parse_projects_dir
 from telemetry.spans import SPAN_FIELDS, SPAN_KINDS, Span
 from telemetry.spoke_runs import backfill_spoke_run_ids
 
@@ -56,6 +56,22 @@ _STEP_KEY_SQL = (
     "CASE WHEN phase IS NOT NULL AND phase != '' THEN ':' || phase ELSE '' END"
 )
 
+# Per-turn relation: one row per assistant usage event (main + walked subagent),
+# carrying model and a per-turn cost that — unlike the overlapping span costs —
+# is counted exactly once, so the rows reconcile to the ccusage session total.
+_TURN_COLUMNS = (
+    "session_id VARCHAR",
+    "ts VARCHAR",
+    "model VARCHAR",
+    "source VARCHAR",
+    "agent_id VARCHAR",
+    "tokens_in BIGINT",
+    "tokens_out BIGINT",
+    "tokens_total BIGINT",
+    "cost_usd DOUBLE",
+)
+_TURN_FIELDS = tuple(col.split(" ", 1)[0] for col in _TURN_COLUMNS)
+
 
 def connect(
     *, events_path: Path, projects_root: Path, ccusage_costs: dict[str, float]
@@ -71,9 +87,12 @@ def connect(
         A connection exposing the ``spans`` table plus the ``spoke_run_summary``
         and ``step_metrics`` views.
     """
-    spans = build_unified_spans(
-        events_path=events_path, projects_root=projects_root, ccusage_costs=ccusage_costs
-    )
+    # Parse the session logs once and reuse for both relations: spans (attributed,
+    # joined to push spans) and turns (per-turn usage with model + once-only cost).
+    parsed = parse_projects_dir(projects_root)
+    spans = _attributed_span_dicts(parsed, events_path, ccusage_costs)
+    turns = per_turn_rows(parsed.usage_events, ccusage_costs)
+
     con = duckdb.connect(":memory:")
     con.execute(f"CREATE TABLE spans ({', '.join(_COLUMNS)})")
     rows = [_row(span) for span in spans]
@@ -83,6 +102,7 @@ def connect(
     con.execute("CREATE TABLE session_costs (session_id VARCHAR, cost_usd DOUBLE)")
     if ccusage_costs:
         con.executemany("INSERT INTO session_costs VALUES (?, ?)", list(ccusage_costs.items()))
+    _create_turns(con, turns)
     _create_views(con)
     return con
 
@@ -92,6 +112,18 @@ def build_unified_spans(
 ) -> list[dict[str, object]]:
     """Parse, attribute, and join push + pull spans into one span-dict list."""
     parsed = parse_projects_dir(projects_root)
+    return _attributed_span_dicts(parsed, events_path, ccusage_costs)
+
+
+def build_turns(*, projects_root: Path, ccusage_costs: dict[str, float]) -> list[dict[str, object]]:
+    """Per-turn rows (model + once-only cost) parsed from the session logs."""
+    parsed = parse_projects_dir(projects_root)
+    return per_turn_rows(parsed.usage_events, ccusage_costs)
+
+
+def _attributed_span_dicts(
+    parsed: ParsedSession, events_path: Path, ccusage_costs: dict[str, float]
+) -> list[dict[str, object]]:
     push_spans = _load_push_spans(events_path)
     all_spans = parsed.spans + push_spans
     backfill_spoke_run_ids(all_spans)
@@ -151,6 +183,17 @@ def _row(span: dict[str, object]) -> tuple[object, ...]:
         scalar["tokens_in"],
         scalar["tokens_out"],
         scalar["cost_usd"],
+    )
+
+
+def _create_turns(con: duckdb.DuckDBPyConnection, turns: list[dict[str, object]]) -> None:
+    con.execute(f"CREATE TABLE turns ({', '.join(_TURN_COLUMNS)})")
+    if not turns:
+        return
+    placeholders = ", ".join("?" for _ in _TURN_FIELDS)
+    con.executemany(
+        f"INSERT INTO turns VALUES ({placeholders})",
+        [tuple(turn[field] for field in _TURN_FIELDS) for turn in turns],
     )
 
 
