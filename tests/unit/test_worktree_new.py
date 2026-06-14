@@ -7,10 +7,13 @@ process running inside the window cannot clobber it. A logging `tmux` stub on
 PATH keeps the test hermetic while a fake TMUX env var steers the script down
 the tmux branch.
 
-Spoke-home decision (issue #8 follow-up): every spoke window lives in tmux
-session `0`. The script must target that session explicitly (`new-window -t =0:`),
-create it detached when missing (`has-session` → `new-session -d -s 0`), work
-even when invoked outside tmux ($TMUX unset), and print the exact jump command
+Per-project session (issue #39): every spoke window lives in a tmux session named
+after the project — the parent-dir prefix plus the repo basename (`<parent>-<base>`),
+sanitized for tmux (forbidden `.`/`:` → `-`) — not a hardcoded session `0`. Two
+repos sharing a basename under different parents get distinct sessions. The script
+must target that session explicitly (`new-window -t =<sess>:`), create it detached
+when missing (`has-session` → `new-session -d -s <sess>`), work even when invoked
+outside tmux ($TMUX unset), and print the exact jump command targeting that session
 (`switch-client` inside tmux, `attach ... select-window` outside).
 
 Agent pinning (issue #8 follow-up): the spoke launch must pin model and effort
@@ -61,11 +64,15 @@ def _git(repo: Path, *args: str) -> str:
     ).stdout
 
 
-@pytest.fixture()
-def hub(tmp_path: Path) -> Path:
-    """A main checkout ('hub') on `main` with an `origin` bare remote."""
-    remote = tmp_path / "remote.git"
-    hub = tmp_path / "hub"
+def _make_hub(base: Path, name: str = "hub") -> Path:
+    """Create a main checkout named `name` under `base`, with an `origin` remote.
+
+    Factored out of the `hub` fixture so collision/derivation tests can build
+    repos with custom basenames and parent dirs (issue #39).
+    """
+    base.mkdir(parents=True, exist_ok=True)
+    remote = base / f"{name}-remote.git"
+    hub = base / name
     subprocess.run(
         ["git", "init", "-q", "--bare", str(remote)], check=True, capture_output=True, env=_GIT_ENV
     )
@@ -80,6 +87,12 @@ def hub(tmp_path: Path) -> Path:
     _git(hub, "remote", "add", "origin", str(remote))
     _git(hub, "push", "-q", "-u", "origin", "main")
     return hub
+
+
+@pytest.fixture()
+def hub(tmp_path: Path) -> Path:
+    """A main checkout ('hub') on `main` with an `origin` bare remote."""
+    return _make_hub(tmp_path, "hub")
 
 
 def _run_new(
@@ -165,6 +178,20 @@ def _calls(calls: str, command: str) -> list[str]:
     return [ln for ln in calls.splitlines() if ln.startswith(command)]
 
 
+def _session(calls: str) -> str:
+    """Extract the derived session name from the `new-window -t '=<sess>:'` call.
+
+    Keeps the session-derivation tests algorithm-agnostic: assert the jump
+    commands reuse whatever session the spawn block targeted, rather than
+    hardcoding the derivation (issue #39).
+    """
+    line = next(ln for ln in calls.splitlines() if ln.startswith("new-window"))
+    tokens = line.split()
+    target = tokens[tokens.index("-t") + 1]  # '=<sess>:'
+    assert target.startswith("=") and target.endswith(":"), target
+    return target[1:-1]
+
+
 def _pins_option_off(calls: str, option: str) -> bool:
     """True if some `set-window-option` call targets @1 and sets `option` off."""
     return any(
@@ -190,33 +217,41 @@ def test_tmux_window_name_pinned_against_rename(hub: Path, tmp_path: Path) -> No
     assert _pins_option_off(calls, "allow-rename")
 
 
-def test_window_spawned_into_session_zero(hub: Path, tmp_path: Path) -> None:
+def test_window_spawned_into_project_session(hub: Path, tmp_path: Path) -> None:
     proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code")
 
     assert proc.returncode == 0, proc.stderr
-    new_window = _calls(log.read_text(), "new-window")
+    calls = log.read_text()
+    new_window = _calls(calls, "new-window")
     assert new_window, "expected a new-window invocation"
-    assert "-t =0:" in new_window[0]
+    sess = _session(calls)
+    assert sess != "0", "spoke must not land in the hardcoded session 0"
+    # the '=' exact-match guard must be preserved so <sess> can't fuzzy-match
+    assert f"-t ={sess}:" in new_window[0]
 
 
-def test_session_zero_created_when_missing(hub: Path, tmp_path: Path) -> None:
+def test_project_session_created_when_missing(hub: Path, tmp_path: Path) -> None:
     proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", has_session_rc=1)
 
     assert proc.returncode == 0, proc.stderr
     calls = log.read_text()
+    sess = _session(calls)
     new_session = _calls(calls, "new-session")
-    assert new_session, "expected session 0 to be created when has-session fails"
+    assert new_session, "expected the project session to be created when has-session fails"
     assert "-d" in new_session[0].split()
-    assert "-s 0" in new_session[0]
+    assert f"-s {sess}" in new_session[0]
     assert calls.find("new-session") < calls.find("new-window")
 
 
-def test_session_zero_not_recreated_when_present(hub: Path, tmp_path: Path) -> None:
+def test_project_session_not_recreated_when_present(hub: Path, tmp_path: Path) -> None:
     proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", has_session_rc=0)
 
     assert proc.returncode == 0, proc.stderr
     calls = log.read_text()
-    assert _calls(calls, "has-session"), "expected the script to probe for session 0"
+    has_session = _calls(calls, "has-session")
+    assert has_session, "expected the script to probe for the project session"
+    sess = _session(calls)
+    assert f"={sess}" in has_session[0], "has-session must exact-match the project session"
     assert not _calls(calls, "new-session")
 
 
@@ -224,23 +259,57 @@ def test_spawns_via_tmux_even_outside_tmux(hub: Path, tmp_path: Path) -> None:
     proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", inside_tmux=False)
 
     assert proc.returncode == 0, proc.stderr
-    new_window = _calls(log.read_text(), "new-window")
+    calls = log.read_text()
+    new_window = _calls(calls, "new-window")
     assert new_window, "expected a new-window invocation even with TMUX unset"
-    assert "-t =0:" in new_window[0]
+    assert f"-t ={_session(calls)}:" in new_window[0]
 
 
 def test_dispatch_prints_switch_client_jump_when_inside_tmux(hub: Path, tmp_path: Path) -> None:
-    proc, _ = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", inside_tmux=True)
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", inside_tmux=True)
 
     assert proc.returncode == 0, proc.stderr
-    assert "tmux switch-client -t '0:8-some-slug'" in proc.stdout
+    sess = _session(log.read_text())
+    assert f"tmux switch-client -t '{sess}:8-some-slug'" in proc.stdout
 
 
 def test_dispatch_prints_attach_jump_when_outside_tmux(hub: Path, tmp_path: Path) -> None:
-    proc, _ = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", inside_tmux=False)
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", inside_tmux=False)
 
     assert proc.returncode == 0, proc.stderr
-    assert "tmux attach -t 0 \\; select-window -t '0:8-some-slug'" in proc.stdout
+    sess = _session(log.read_text())
+    assert f"tmux attach -t '{sess}' \\; select-window -t '{sess}:8-some-slug'" in proc.stdout
+
+
+def test_session_named_after_project_basename(hub: Path, tmp_path: Path) -> None:
+    # The hub fixture's repo is basenamed 'hub' — the derived session must carry it.
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "hub" in _session(log.read_text())
+
+
+def test_session_name_sanitized_for_tmux(tmp_path: Path) -> None:
+    # tmux forbids '.' and ':' in session names — a repo dir with a '.' must map it.
+    hub = _make_hub(tmp_path, "svc.api")
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code")
+
+    assert proc.returncode == 0, proc.stderr
+    sess = _session(log.read_text())
+    assert "." not in sess and ":" not in sess, sess
+    assert "svc-api" in sess
+
+
+def test_same_basename_repos_get_distinct_sessions(tmp_path: Path) -> None:
+    # Two repos both basenamed 'proj' under different parents must not collide.
+    hub_a = _make_hub(tmp_path / "alpha", "proj")
+    hub_b = _make_hub(tmp_path / "beta", "proj")
+    proc_a, log_a = _run_new(hub_a, tmp_path / "alpha", "8", "some-slug", "--no-code")
+    proc_b, log_b = _run_new(hub_b, tmp_path / "beta", "8", "some-slug", "--no-code")
+
+    assert proc_a.returncode == 0, proc_a.stderr
+    assert proc_b.returncode == 0, proc_b.stderr
+    assert _session(log_a.read_text()) != _session(log_b.read_text())
 
 
 def test_no_server_falls_back_to_manual_advice(hub: Path, tmp_path: Path) -> None:
