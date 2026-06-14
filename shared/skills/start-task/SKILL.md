@@ -74,7 +74,7 @@ the durable contract (the spoke reads it when it anchors), then create the issue
 ```bash
 gh issue create --title "<title>" --body "<plan>
 
-Gate: plan   # or: none | plan+red | plan+human-accept+draft"
+Gate: plan   # plan (default) or none; the richer levels are pending follow-ups"
 ```
 
 Capture the issue number `N` from the returned URL.
@@ -114,6 +114,12 @@ genuinely dangerous or irreversible ops: force-push / `--force-with-lease`, hist
 rewrites, anything touching the default branch (`main`), or deletions outside the
 worktree. Do NOT self-land — the hub lands #N.
 ```
+
+> [!NOTE]
+> On Claude the marker tag pushes (`gate/N`, `ready/N`) are advisory and proceed.
+> On Cursor `push-scope-guard` denies a spoke's tag pushes by default (it allows
+> only the spoke's own branch), so approve the marker-push prompt when it appears —
+> the same applies to the existing `ready/N` push.
 
 ### 5. Report the handoff
 
