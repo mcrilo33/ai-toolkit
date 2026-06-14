@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,32 @@ _COLUMNS: tuple[tuple[str, str], ...] = (
     ("cost_usd", "DOUBLE"),
 )
 _COLUMN_NAMES: tuple[str, ...] = tuple(name for name, _ in _COLUMNS)
+
+# Per-turn relation (mirrors Issue #22's ``turns`` table). One row per assistant
+# usage event, carrying model and a per-turn cost counted exactly once — the
+# source the v2 spoke view uses for model attribution and once-per-turn cost.
+_TURN_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("session_id", "VARCHAR"),
+    ("ts", "VARCHAR"),
+    ("model", "VARCHAR"),
+    ("source", "VARCHAR"),
+    ("agent_id", "VARCHAR"),
+    ("tokens_in", "BIGINT"),
+    ("tokens_out", "BIGINT"),
+    ("tokens_total", "BIGINT"),
+    ("cost_usd", "DOUBLE"),
+)
+_TURN_COLUMN_NAMES: tuple[str, ...] = tuple(name for name, _ in _TURN_COLUMNS)
+
+# Status severity for collapsing many spans into one line: a collapsed hooks row
+# must surface the worst outcome, never hide a deny/failure/warn behind success.
+_STATUS_SEVERITY: dict[str, int] = {
+    "deny": 4,
+    "failure": 3,
+    "warn": 2,
+    "skipped": 1,
+    "success": 0,
+}
 
 
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
@@ -90,8 +117,15 @@ class SpanStore:
         self.con = con
 
     @classmethod
-    def from_events(cls, events: list[dict[str, Any]]) -> SpanStore:
-        """Build an in-memory store from already-parsed span dicts."""
+    def from_events(
+        cls, events: list[dict[str, Any]], turns: list[dict[str, Any]] | None = None
+    ) -> SpanStore:
+        """Build an in-memory store from already-parsed span dicts.
+
+        ``turns`` (optional per-turn rows) seeds a ``turns`` table so the v2
+        spoke view's once-per-turn cost/model attribution has data; the raw
+        push-span log has none, so it defaults to an empty table.
+        """
         con = duckdb.connect(":memory:")
         ddl = ", ".join(f"{name} {sqltype}" for name, sqltype in _COLUMNS)
         con.execute(f"CREATE TABLE spans ({ddl})")
@@ -101,12 +135,13 @@ class SpanStore:
                 f"INSERT INTO spans VALUES ({placeholders})",
                 [_row_tuple(span) for span in events],
             )
+        _create_turns_table(con, turns or [])
         return cls(con)
 
     @classmethod
-    def from_jsonl(cls, path: str | Path) -> SpanStore:
+    def from_jsonl(cls, path: str | Path, turns: list[dict[str, Any]] | None = None) -> SpanStore:
         """Build an in-memory store from a raw ``events.jsonl`` span log."""
-        return cls.from_events(load_jsonl(path))
+        return cls.from_events(load_jsonl(path), turns=turns)
 
     @classmethod
     def from_connection(cls, con: duckdb.DuckDBPyConnection) -> SpanStore:
@@ -220,6 +255,31 @@ class SpanStore:
         for root in roots:
             _roll_up(root)
         return roots
+
+    def spoke_steps(self, spoke_run_id: str) -> list[dict[str, Any]]:
+        """The v2 collapse-to-steps drill-down tree for one spoke.
+
+        Real spans carry ``parent_id: null``, so the tree is rebuilt by
+        *time-bracketing*: each span nests under the smallest span whose
+        ``[ts_start, ts_end]`` window contains it. The lifecycle/step spine
+        surfaces as the Level-1 roots; skills/agents/todos/humans nest beneath by
+        their windows (to arbitrary depth); hook spans among any node's children
+        collapse into one expandable ``hooks`` node that surfaces the worst
+        status. Each node shows its own wall-clock ``duration_ms`` and a
+        ``rollup`` of additive subtree metrics (``human_count`` here; cost/tokens
+        /models are layered on by the once-per-turn attribution pass).
+
+        Returns a forest ordered by ``ts_start``; an unknown spoke yields ``[]``.
+        """
+        rows = self._query(
+            "SELECT * FROM spans WHERE spoke_run_id = ? ORDER BY ts_start, span_id",
+            [spoke_run_id],
+        )
+        nodes = [_step_node(row) for row in rows]
+        forest = _collapse_hooks(_nest_by_time(nodes))
+        for root in forest:
+            _roll_up_steps(root)
+        return forest
 
     def aggregate(
         self,
@@ -408,6 +468,155 @@ def _ab_row(
         "delta_human_per_invocation": human_b - human_a,
         "low_confidence": min(n_a, n_b) < low_confidence_n,
     }
+
+
+def _create_turns_table(con: duckdb.DuckDBPyConnection, turns: list[dict[str, Any]]) -> None:
+    """Create the ``turns`` table and seed it (empty when no turns are given)."""
+    ddl = ", ".join(f"{name} {sqltype}" for name, sqltype in _TURN_COLUMNS)
+    con.execute(f"CREATE TABLE turns ({ddl})")
+    if not turns:
+        return
+    placeholders = ", ".join("?" for _ in _TURN_COLUMN_NAMES)
+    con.executemany(
+        f"INSERT INTO turns VALUES ({placeholders})",
+        [tuple(turn.get(name) for name in _TURN_COLUMN_NAMES) for turn in turns],
+    )
+
+
+def _parse_ts(ts: str | None) -> float | None:
+    """ISO-8601 UTC string to epoch seconds (None if missing/malformed).
+
+    Parsed numerically rather than compared lexically because push spans carry
+    second precision (``…00Z``) and pull spans millisecond (``…00.000Z``), which
+    sort in the wrong order as strings.
+    """
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _step_node(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "span_id": row["span_id"],
+        "kind": row["kind"],
+        "name": row["name"],
+        "phase": row["phase"],
+        "status": row["status"],
+        "ts_start": row["ts_start"],
+        "ts_end": row["ts_end"],
+        "duration_ms": row["duration_ms"] or 0,
+        "human_type": row["human_type"],
+        "human_wait_ms": row["human_wait_ms"],
+        "human_count": 1 if row["human_type"] else 0,
+        "children": [],
+    }
+
+
+def _sort_key(node: dict[str, Any]) -> tuple[float, str]:
+    return (_parse_ts(node["ts_start"]) or 0.0, node["span_id"] or "")
+
+
+def _nest_by_time(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Nest each node under the smallest span whose window contains it."""
+    bounds = {n["span_id"]: (_parse_ts(n["ts_start"]), _parse_ts(n["ts_end"])) for n in nodes}
+    by_id = {n["span_id"]: n for n in nodes}
+    roots: list[dict[str, Any]] = []
+    for node in nodes:
+        parent_id = _smallest_container(node, nodes, bounds)
+        if parent_id is None:
+            roots.append(node)
+        else:
+            by_id[parent_id]["children"].append(node)
+    return roots
+
+
+def _smallest_container(
+    child: dict[str, Any],
+    nodes: list[dict[str, Any]],
+    bounds: dict[str, tuple[float | None, float | None]],
+) -> str | None:
+    """The id of the tightest-windowed span strictly enclosing ``child``.
+
+    A span with an identical window is a sibling, not a parent (its window is not
+    *strictly* larger), so equal-window peers like repeated ``TaskCreate`` calls
+    stay flat. Ties between equal-window containers break on ``span_id``.
+    """
+    cs, ce = bounds[child["span_id"]]
+    if cs is None or ce is None:
+        return None
+    best_key: tuple[float, float, str] | None = None
+    best_id: str | None = None
+    for cand in nodes:
+        if cand is child:
+            continue
+        ps, pe = bounds[cand["span_id"]]
+        if ps is None or pe is None:
+            continue
+        if ps <= cs and pe >= ce and (ps, pe) != (cs, ce):
+            key = (pe - ps, ps, cand["span_id"])
+            if best_key is None or key < best_key:
+                best_key, best_id = key, cand["span_id"]
+    return best_id
+
+
+def _collapse_hooks(siblings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse hook spans among ``siblings`` into one node (recursively)."""
+    others = [n for n in siblings if n["kind"] != "hook"]
+    hooks = [n for n in siblings if n["kind"] == "hook"]
+    for node in others:
+        node["children"] = _collapse_hooks(node["children"])
+    for hook in hooks:
+        hook["children"] = _collapse_hooks(hook["children"])
+    result = list(others)
+    if hooks:
+        result.append(_hooks_node(hooks))
+    return sorted(result, key=_sort_key)
+
+
+def _hooks_node(hooks: list[dict[str, Any]]) -> dict[str, Any]:
+    starts = [h["ts_start"] for h in hooks if h["ts_start"]]
+    ends = [h["ts_end"] for h in hooks if h["ts_end"]]
+    return {
+        "span_id": None,
+        "kind": "hooks",
+        "name": "hooks",
+        "phase": None,
+        "status": _worst_status(hooks),
+        "ts_start": min(starts, key=lambda s: _parse_ts(s) or 0.0) if starts else None,
+        "ts_end": max(ends, key=lambda s: _parse_ts(s) or 0.0) if ends else None,
+        "duration_ms": sum(h["duration_ms"] for h in hooks),
+        "human_type": None,
+        "human_wait_ms": None,
+        "human_count": 0,
+        "collapsed": True,
+        "collapsed_count": len(hooks),
+        "children": list(hooks),
+    }
+
+
+def _worst_status(nodes: list[dict[str, Any]]) -> str:
+    return max(
+        (n["status"] for n in nodes),
+        key=lambda s: _STATUS_SEVERITY.get(s, 0),
+        default="success",
+    )
+
+
+def _roll_up_steps(node: dict[str, Any]) -> dict[str, int]:
+    """Attach an additive subtree ``rollup`` to ``node`` (post-order).
+
+    A collapsed ``hooks`` node owns no metrics itself — its hook children carry
+    them — so summing self + children never double-counts.
+    """
+    rollup = {"human_count": node["human_count"]}
+    for child in node["children"]:
+        child_rollup = _roll_up_steps(child)
+        rollup["human_count"] += child_rollup["human_count"]
+    node["rollup"] = rollup
+    return rollup
 
 
 def _roll_up(node: dict[str, Any]) -> dict[str, int | float]:
