@@ -195,3 +195,40 @@ def test_raw_path_without_turns_has_zero_owned_cost():
 
     assert red["rollup"]["cost_usd"] == 0.0
     assert red["own_cost_usd"] == 0.0
+
+
+def test_spoke_steps_without_turns_table_degrades_gracefully():
+    # A connection predating the turns relation (the #22 from_connection seam)
+    # has no turns table; spoke_steps must degrade, not raise.
+    store = store_v2()
+    store.con.execute("DROP TABLE turns")
+
+    red = _find(store.spoke_steps(RUN), "v2_red")
+
+    assert red["rollup"]["cost_usd"] == 0.0
+
+
+def test_untracked_node_ignores_malformed_turn_timestamps():
+    queries = load_queries()
+    spans = queries.load_jsonl(FIXTURE_V2_SPANS)
+    turns = [
+        {
+            "session_id": "sess-v2",
+            "ts": "not-a-date",
+            "model": "claude-opus-4-8",
+            "source": "main",
+            "agent_id": None,
+            "tokens_in": 5,
+            "tokens_out": 2,
+            "tokens_total": 7,
+            "cost_usd": 0.01,
+        }
+    ]
+    store = queries.SpanStore.from_events(spans, turns=turns)
+
+    untracked = _roots(store.spoke_steps(RUN), "untracked")
+
+    # The turn is still counted, but its garbage ts never frames the window.
+    assert len(untracked) == 1
+    assert untracked[0]["own_cost_usd"] == pytest.approx(0.01)
+    assert untracked[0]["ts_start"] is None

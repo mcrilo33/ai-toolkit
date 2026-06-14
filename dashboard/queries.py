@@ -287,13 +287,21 @@ class SpanStore:
         return forest
 
     def _turns_for_sessions(self, session_ids: list[str]) -> list[dict[str, Any]]:
-        """Per-turn rows for the spoke's sessions (empty on the raw path)."""
-        if not session_ids:
+        """Per-turn rows for the spoke's sessions (empty on the raw path).
+
+        A connection handed to :meth:`from_connection` that predates the ``turns``
+        relation has no such table; rather than crash, degrade to no owned cost.
+        """
+        if not session_ids or not self._has_table("turns"):
             return []
         placeholders = ", ".join("?" for _ in session_ids)
         return self._query(
             f"SELECT * FROM turns WHERE session_id IN ({placeholders})", list(session_ids)
         )
+
+    def _has_table(self, name: str) -> bool:
+        rows = self._query("SELECT 1 FROM information_schema.tables WHERE table_name = ?", [name])
+        return bool(rows)
 
     def aggregate(
         self,
@@ -702,7 +710,9 @@ def _untracked_node(orphans: list[dict[str, Any]]) -> dict[str, Any] | None:
     """A synthetic root holding turns no span owned, so totals still reconcile."""
     if not orphans:
         return None
-    stamps = [t["ts"] for t in orphans if t["ts"]]
+    # Only parseable stamps frame the window; a malformed ts must not become the
+    # node's ts_start/ts_end (it would format as garbage downstream).
+    stamps = [t["ts"] for t in orphans if t["ts"] and _parse_ts(t["ts"]) is not None]
     return {
         "span_id": None,
         "kind": "untracked",
