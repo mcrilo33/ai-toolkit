@@ -83,3 +83,38 @@ def test_solo_cycle_defines_gate_marker_convention() -> None:
     )
     # ready/<id> stays the distinct final-completion marker.
     assert "ready/<issue>" in flat or "ready/<id>" in flat
+
+
+# ── Subtask 2: start-task declares the gate level + wires the kickoff ───
+
+
+def test_start_task_triages_a_gate_level() -> None:
+    """start-task picks a gate level by risk/novelty, defaulting to PLAN."""
+    flat = _flat(START_TASK)
+    assert "gate level" in flat or "gate spectrum" in flat, (
+        "start-task must triage a gate level for the dispatched task"
+    )
+    assert "default" in flat and "plan" in flat and "non-trivial" in flat, (
+        "PLAN must be the declared default for non-trivial work"
+    )
+    assert "very-clear" in flat or "very clear" in flat, (
+        "very-clear tasks must be called out as the autonomous lane"
+    )
+
+
+def test_start_task_records_gate_level_in_the_issue() -> None:
+    """The gate level is recorded in the issue body — the durable contract."""
+    flat = _flat(START_TASK)
+    assert "gate:" in flat, "start-task must record the gate level as a Gate: line in the issue"
+
+
+def test_start_task_kickoff_pauses_at_the_plan_gate() -> None:
+    """The kickoff tells a non-trivial spoke to park at the PLAN gate."""
+    flat = _flat(START_TASK)
+    assert "plan gate" in flat, "the kickoff must name the PLAN gate"
+    assert "plan mode" in flat, "the PLAN gate is presented in plan mode"
+    assert "before green" in flat or "before writing code" in flat, (
+        "the kickoff must pause before implementation for non-trivial work"
+    )
+    # The marker the spoke emits when it parks (consumed by the hub watch).
+    assert "gate/" in flat, "the kickoff references the gate/<id> park marker"
