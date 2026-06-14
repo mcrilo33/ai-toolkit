@@ -20,7 +20,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SYNC_SCRIPT = REPO_ROOT / "scripts" / "sync-to-repo.sh"
 
 # Workflow scripts and their source locations in the toolkit checkout.
-WORKTREE_SCRIPTS = ("worktree-new.sh", "worktree-land.sh", "worktree-done.sh", "worktree-lib.sh")
+# spoke-push.sh ships alongside the worktree scripts so the spoke's PUSH step
+# runs as one allowlistable process (issue #37).
+WORKTREE_SCRIPTS = (
+    "worktree-new.sh",
+    "worktree-land.sh",
+    "worktree-done.sh",
+    "worktree-lib.sh",
+    "spoke-push.sh",
+)
 SOURCES = {name: REPO_ROOT / "scripts" / name for name in WORKTREE_SCRIPTS}
 HUB_SCRIPTS_DIR = REPO_ROOT / "shared" / "skills" / "hub" / "scripts"
 SOURCES["hub-status.sh"] = HUB_SCRIPTS_DIR / "hub-status.sh"

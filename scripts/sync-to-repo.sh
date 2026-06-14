@@ -469,8 +469,11 @@ sync_mcp_servers() {
 # steps. The worktree scripts source each other via $SCRIPT_DIR (BASH_SOURCE),
 # so co-locating all four keeps the cross-references intact; they locate the
 # main checkout by git introspection, so they run unmodified from here.
-# Sources: worktree-*.sh at the toolkit root scripts/, hub-status.sh and
-# hub-ready-watch.sh under the hub skill (shared/skills/hub/scripts/).
+# spoke-push.sh ships here too so the spoke's PUSH step runs as one
+# allowlistable process (issue #37).
+# Sources: worktree-*.sh and spoke-push.sh at the toolkit root scripts/,
+# hub-status.sh and hub-ready-watch.sh under the hub skill
+# (shared/skills/hub/scripts/).
 sync_workflow_scripts() {
     section "Workflow scripts (hub/spoke/land)"
     local dst_dir="$TARGET/.ai-toolkit/scripts"
@@ -480,7 +483,7 @@ sync_workflow_scripts() {
     # scripts can source it as a sibling to emit lifecycle spans — see
     # worktree-lib.sh's telemetry block.
     local name src
-    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh hub-status.sh hub-ready-watch.sh telemetry.sh; do
+    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh spoke-push.sh hub-status.sh hub-ready-watch.sh telemetry.sh; do
         case "$name" in
             hub-status.sh|hub-ready-watch.sh) src="$SHARED_DIR/skills/hub/scripts/$name" ;;
             telemetry.sh)                     src="$SHARED_DIR/hooks/lib/$name" ;;
