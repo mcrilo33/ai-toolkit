@@ -9,6 +9,8 @@ This repository contains shared rules, skills, prompts, and agents for AI coding
 - `docs/skills-frontmatter.md` — Skills frontmatter field reference per platform
 - `docs/metadata-and-sync.md` — How `shared/` files are synced to platform-specific configs
 - `docs/parallel-worktrees.md` — Running parallel Claude sessions with one git worktree per task (`worktree-new.sh` / `worktree-done.sh`, review window, merge flow)
+- `docs/telemetry-pull-layer.md` — Telemetry pull layer: how the dashboard attributes tokens and reconciles per-session/run cost via `ccusage` (offline), joined to push spans
+- `dashboard/README.md` — Observability dashboard: correlated push+pull telemetry with `ccusage`-sourced token/cost numbers
 
 ## Repository structure
 
