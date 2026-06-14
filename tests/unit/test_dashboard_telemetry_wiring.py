@@ -46,3 +46,29 @@ def test_aggregate_runs_over_unified_dataset():
 
     assert rows
     assert all("mean_duration_ms" in row and "frequency" in row for row in rows)
+
+
+def _find_kind(nodes, kind):
+    for node in nodes:
+        if node["kind"] == kind:
+            return node
+        found = _find_kind(node["children"], kind)
+        if found is not None:
+            return found
+    return None
+
+
+def test_spoke_steps_attributes_model_and_agent_over_real_dataset():
+    forest = _telemetry_store().spoke_steps(SPOKE_RUN_ID)
+
+    # The lifecycle/step spine surfaces as the real-span roots, time-ordered.
+    spine = [n["span_id"] for n in forest if n["span_id"] is not None]
+    assert spine == ["push000life01", "push000step01", "push000life02"]
+
+    # Subagent turns from the walked transcript attribute to the agent node, with
+    # its own model — proving #22's turns relation flows through from_telemetry.
+    agent = _find_kind(forest, "agent")
+    assert agent is not None
+    assert agent["agent"] == "subagent"
+    assert agent["own_tokens_in"] == 700
+    assert agent["models"] == ["claude-opus-4-8"]

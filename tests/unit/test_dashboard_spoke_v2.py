@@ -36,13 +36,10 @@ def test_level1_is_the_spine_in_time_order():
     forest = store_v2().spoke_steps(RUN)
 
     # Roots are the lifecycle/step spine, ordered by ts_start — no flat dump,
-    # no hook or pull span leaking to the top level.
-    assert [n["span_id"] for n in forest] == [
-        "v2_life_new",
-        "v2_red",
-        "v2_green",
-        "v2_life_done",
-    ]
+    # no hook or pull span leaking to the top level. (A synthetic untracked-turns
+    # node may also be a root; the real-span spine is what's pinned here.)
+    spine = [n["span_id"] for n in forest if n["span_id"] is not None]
+    assert spine == ["v2_life_new", "v2_red", "v2_green", "v2_life_done"]
 
 
 def test_substeps_nest_under_their_step_by_time():

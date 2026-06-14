@@ -276,10 +276,24 @@ class SpanStore:
             [spoke_run_id],
         )
         nodes = [_step_node(row) for row in rows]
+        session_ids = sorted({row["session_id"] for row in rows if row["session_id"]})
+        orphans = _attribute_turns(nodes, self._turns_for_sessions(session_ids))
         forest = _collapse_hooks(_nest_by_time(nodes))
+        untracked = _untracked_node(orphans)
+        if untracked is not None:
+            forest = sorted([*forest, untracked], key=_sort_key)
         for root in forest:
             _roll_up_steps(root)
         return forest
+
+    def _turns_for_sessions(self, session_ids: list[str]) -> list[dict[str, Any]]:
+        """Per-turn rows for the spoke's sessions (empty on the raw path)."""
+        if not session_ids:
+            return []
+        placeholders = ", ".join("?" for _ in session_ids)
+        return self._query(
+            f"SELECT * FROM turns WHERE session_id IN ({placeholders})", list(session_ids)
+        )
 
     def aggregate(
         self,
@@ -511,6 +525,13 @@ def _step_node(row: dict[str, Any]) -> dict[str, Any]:
         "human_type": row["human_type"],
         "human_wait_ms": row["human_wait_ms"],
         "human_count": 1 if row["human_type"] else 0,
+        # Filled by the once-per-turn attribution pass; the span schema carries
+        # no model, so these come from the turns relation, never spans.cost_usd.
+        "own_cost_usd": 0.0,
+        "own_tokens_in": 0,
+        "own_tokens_out": 0,
+        "models": [],
+        "agent": "subagent" if row["kind"] == "agent" else "main",
         "children": [],
     }
 
@@ -591,6 +612,12 @@ def _hooks_node(hooks: list[dict[str, Any]]) -> dict[str, Any]:
         "human_type": None,
         "human_wait_ms": None,
         "human_count": 0,
+        # A collapsed node owns no turns itself — its hook children carry any.
+        "own_cost_usd": 0.0,
+        "own_tokens_in": 0,
+        "own_tokens_out": 0,
+        "models": [],
+        "agent": "main",
         "collapsed": True,
         "collapsed_count": len(hooks),
         "children": list(hooks),
@@ -605,18 +632,132 @@ def _worst_status(nodes: list[dict[str, Any]]) -> str:
     )
 
 
-def _roll_up_steps(node: dict[str, Any]) -> dict[str, int]:
+def _attribute_turns(
+    nodes: list[dict[str, Any]], turns: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Assign each turn to exactly one node and fill its own cost/tokens/models.
+
+    A subagent turn attaches to the deepest ``agent`` span containing it (that
+    subagent's own cost); a main turn to the deepest non-``agent`` span. A turn
+    contained by no eligible span is returned as an orphan. Counting each turn
+    once is what makes rolled-up cost reconcile to the run total — the per-span
+    ``cost_usd`` from the upstream attribution is intentionally NOT used here, as
+    it brackets a turn onto every overlapping span.
+    """
+    bounds = {n["span_id"]: (_parse_ts(n["ts_start"]), _parse_ts(n["ts_end"])) for n in nodes}
+    owned: dict[str, dict[str, Any]] = {
+        n["span_id"]: {"cost": 0.0, "in": 0, "out": 0, "models": set()} for n in nodes
+    }
+    orphans: list[dict[str, Any]] = []
+    for turn in turns:
+        owner_id = _turn_owner(turn, nodes, bounds)
+        if owner_id is None:
+            orphans.append(turn)
+            continue
+        acc = owned[owner_id]
+        acc["cost"] += turn["cost_usd"] or 0.0
+        acc["in"] += turn["tokens_in"] or 0
+        acc["out"] += turn["tokens_out"] or 0
+        if turn["model"]:
+            acc["models"].add(turn["model"])
+    for node in nodes:
+        acc = owned[node["span_id"]]
+        node["own_cost_usd"] = acc["cost"]
+        node["own_tokens_in"] = acc["in"]
+        node["own_tokens_out"] = acc["out"]
+        node["models"] = sorted(acc["models"])
+    return orphans
+
+
+def _turn_owner(
+    turn: dict[str, Any],
+    nodes: list[dict[str, Any]],
+    bounds: dict[str, tuple[float | None, float | None]],
+) -> str | None:
+    """The id of the tightest span (right agent/main class) containing the turn.
+
+    A parallel-agent caveat: with overlapping agent windows the smallest one
+    wins by ``span_id`` tie-break — still counted once, just possibly attributed
+    to a sibling agent.
+    """
+    ts = _parse_ts(turn["ts"])
+    if ts is None:
+        return None
+    want_agent = turn["source"] == "subagent"
+    best_key: tuple[float, float, str] | None = None
+    best_id: str | None = None
+    for node in nodes:
+        if (node["kind"] == "agent") != want_agent:
+            continue
+        start, end = bounds[node["span_id"]]
+        if start is None or end is None or not (start <= ts <= end):
+            continue
+        key = (end - start, start, node["span_id"])
+        if best_key is None or key < best_key:
+            best_key, best_id = key, node["span_id"]
+    return best_id
+
+
+def _untracked_node(orphans: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """A synthetic root holding turns no span owned, so totals still reconcile."""
+    if not orphans:
+        return None
+    stamps = [t["ts"] for t in orphans if t["ts"]]
+    return {
+        "span_id": None,
+        "kind": "untracked",
+        "name": "(untracked turns)",
+        "phase": None,
+        "status": "success",
+        "ts_start": min(stamps, key=lambda s: _parse_ts(s) or 0.0) if stamps else None,
+        "ts_end": max(stamps, key=lambda s: _parse_ts(s) or 0.0) if stamps else None,
+        "duration_ms": 0,
+        "human_type": None,
+        "human_wait_ms": None,
+        "human_count": 0,
+        "own_cost_usd": sum(t["cost_usd"] or 0.0 for t in orphans),
+        "own_tokens_in": sum(t["tokens_in"] or 0 for t in orphans),
+        "own_tokens_out": sum(t["tokens_out"] or 0 for t in orphans),
+        "models": sorted({t["model"] for t in orphans if t["model"]}),
+        "agent": "main",
+        "collapsed_count": len(orphans),
+        "children": [],
+    }
+
+
+def _roll_up_steps(node: dict[str, Any]) -> dict[str, Any]:
     """Attach an additive subtree ``rollup`` to ``node`` (post-order).
 
     A collapsed ``hooks`` node owns no metrics itself — its hook children carry
-    them — so summing self + children never double-counts.
+    them — so summing self + children never double-counts. The returned dict
+    carries ``models`` as a set for merging; the node stores it sorted.
     """
-    rollup = {"human_count": node["human_count"]}
+    models: set[str] = set(node.get("models") or [])
+    human = node["human_count"]
+    cost = node.get("own_cost_usd", 0.0)
+    tokens_in = node.get("own_tokens_in", 0)
+    tokens_out = node.get("own_tokens_out", 0)
     for child in node["children"]:
         child_rollup = _roll_up_steps(child)
-        rollup["human_count"] += child_rollup["human_count"]
-    node["rollup"] = rollup
-    return rollup
+        human += child_rollup["human_count"]
+        cost += child_rollup["cost_usd"]
+        tokens_in += child_rollup["tokens_in"]
+        tokens_out += child_rollup["tokens_out"]
+        models |= child_rollup["models"]
+    node["rollup"] = {
+        "human_count": human,
+        "cost_usd": cost,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "models": sorted(models),
+    }
+    return {
+        "human_count": human,
+        "cost_usd": cost,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "models": models,
+    }
 
 
 def _roll_up(node: dict[str, Any]) -> dict[str, int | float]:
