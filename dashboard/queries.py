@@ -773,9 +773,10 @@ def format_step_label(node: dict[str, Any]) -> str:
 def format_step_metrics(node: dict[str, Any]) -> dict[str, str]:
     """Display-ready metrics for a v2 spoke node.
 
-    Time is the node's own wall-clock; cost/tokens/models come from the
-    rolled-up once-per-turn subtree totals (falling back to the node's own when
-    no rollup is attached). Zero values render as an em dash.
+    Time is the node's own wall-clock; cost/tokens/models/humans come from the
+    rolled-up once-per-turn subtree totals that ``spoke_steps`` attaches to every
+    node (cost and models fall back to the node's own only for a node built
+    without a rollup). Zero values render as an em dash.
     """
     rollup = node.get("rollup") or {}
     cost = rollup.get("cost_usd", node.get("own_cost_usd", 0.0))

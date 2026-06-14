@@ -34,6 +34,22 @@ def load_queries() -> ModuleType:
     return module
 
 
+def load_app() -> ModuleType:
+    """Import ``dashboard/app.py`` as a standalone module.
+
+    The caller must first inject a ``streamlit`` stub and the ``queries`` module
+    into ``sys.modules`` (app.py does ``import streamlit as st`` / ``import
+    queries``, and streamlit's real import is unavailable in the base test env).
+    """
+    path = DASHBOARD_DIR / "app.py"
+    spec = importlib.util.spec_from_file_location("dashboard_app", path)
+    if spec is None or spec.loader is None:  # pragma: no cover - defensive
+        raise ImportError(f"cannot load app module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def store():
     """A :class:`SpanStore` built from the shared JSONL fixture."""
     queries = load_queries()

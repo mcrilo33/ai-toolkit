@@ -346,6 +346,14 @@ def test_format_step_metrics_marks_subagent():
     assert metrics["model"] == "haiku-4-5"
 
 
+def test_format_step_metrics_rolls_up_human_count():
+    queries = load_queries()
+    forest = store_v2().spoke_steps(RUN)
+
+    assert queries.format_step_metrics(_find(forest, "v2_green"))["humans"] == "1"
+    assert queries.format_step_metrics(_find(forest, "v2_red"))["humans"] == "—"
+
+
 def test_format_step_metrics_blanks_zero_values():
     queries = load_queries()
     done = _find(store_v2().spoke_steps(RUN), "v2_life_done")

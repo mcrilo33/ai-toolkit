@@ -110,8 +110,8 @@ _STATUS_ICON = {
 }
 
 
-_STEP_COLS = [5, 1, 1, 1, 2, 1]
-_STEP_HEADERS = ("Step", "Time", "Cost", "Tokens", "Model", "Agent")
+_STEP_COLS = [5, 1, 1, 1, 1, 2, 1]
+_STEP_HEADERS = ("Step", "Time", "Cost", "Tokens", "Human", "Model", "Agent")
 
 
 def _node_row(node: dict, depth: int) -> None:
@@ -124,8 +124,9 @@ def _node_row(node: dict, depth: int) -> None:
     cols[1].markdown(metrics["time"])
     cols[2].markdown(metrics["cost"])
     cols[3].markdown(metrics["tokens"])
-    cols[4].markdown(metrics["model"])
-    cols[5].markdown(metrics["agent"])
+    cols[4].markdown(metrics["humans"])
+    cols[5].markdown(metrics["model"])
+    cols[6].markdown(metrics["agent"])
 
 
 def _render_descendants(nodes: list[dict], depth: int) -> None:
@@ -162,7 +163,7 @@ def _render_meta(store: queries.SpanStore, spoke_id: str) -> None:
             "Median time": _fmt_secs(row["median_duration_ms"]),
             "Total cost": _fmt_cost(row["total_cost_usd"]),
             "Mean cost": _fmt_cost(row["mean_cost_usd"]),
-            "Models": ", ".join(m.removeprefix("claude-") for m in row["models"]) or "—",
+            "Models": ", ".join(queries._short_model(m) for m in row["models"]) or "—",
         }
         for row in rows
     ]
