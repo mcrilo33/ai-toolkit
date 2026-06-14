@@ -187,8 +187,10 @@ fi
 # + the pre-push hooks), not permission asks, do the enforcing.
 #
 # `git branch --show-current` is seeded EXACT — never `git branch:*`, which would
-# hand over `git branch -D`. Nothing destructive is seeded: no `git tag:*` /
-# `git push:*` / `git checkout|reset|clean:*` / `pytest:*` / `rm` / `mv`.
+# hand over `git branch -D`. The runner tier (#38) is scoped to the pytest verbs
+# and `chmod +x` only. Nothing destructive or arbitrary-exec is seeded: no
+# `python:*` / `python -c:*` / `chmod:*` / `git tag:*` / `git push:*` /
+# `git checkout|reset|clean:*` / `rm` / `mv`.
 ALLOW_RULES=(
   "Bash(bash .ai-toolkit/scripts/spoke-push.sh:*)"
   # Tier 1 — read-only, no side effects
@@ -199,6 +201,10 @@ ALLOW_RULES=(
   # Tier 2 — network-read / read-only GitHub
   "Bash(git fetch:*)" "Bash(git remote -v)" "Bash(git stash list)"
   "Bash(gh issue view:*)" "Bash(gh pr view:*)"
+  # Runner (#38) — the RED→GREEN→test loop + chmod +x on new scripts; the bare
+  # python/chmod verbs stay gated (arbitrary exec / unrestricted mode bits).
+  "Bash(python -m pytest:*)" "Bash(.venv/bin/python -m pytest:*)" "Bash(pytest:*)"
+  "Bash(chmod +x:*)"
 )
 SETTINGS_LOCAL="$WT_DIR/.claude/settings.local.json"
 mkdir -p "$WT_DIR/.claude"

@@ -29,9 +29,11 @@ allowlist so the routine PUSH + read-only diagnostics run without a permission
 prompt — gates, not asks, do the enforcing. Issue #37 replaces the two bare
 exact-push rules (which never matched once the spoke decorated/chained the push)
 with one allowlistable process rule — `Bash(bash .ai-toolkit/scripts/spoke-push.sh:*)`
-— plus a read-only Tier 1 (local) + Tier 2 (network-read) helper allowlist; the
-bare-push rules are dropped, and no destructive wildcard (`git branch:*`,
-`git tag:*`, `git push:*`, `pytest:*`, `rm`/`mv`) is ever seeded. The file is
+— plus a read-only Tier 1 (local) + Tier 2 (network-read) helper allowlist, and a
+runner tier (#38: `pytest`/`python -m pytest`/`chmod +x`) for the RED→GREEN→test
+loop; the bare-push rules are dropped, and no destructive or arbitrary-exec
+wildcard (`git branch:*`, `git tag:*`, `git push:*`, `python:*`, `chmod:*`,
+`rm`/`mv`) is ever seeded. The file is
 created when the hub has no `.claude/` and merged (never clobbered, never
 duplicated, order preserved) when one was copied.
 
