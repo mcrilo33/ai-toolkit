@@ -10,7 +10,8 @@ meta-by-kind (S4) are tested separately.
 
 from __future__ import annotations
 
-from _dashboard_helpers import store_v2
+import pytest
+from _dashboard_helpers import FIXTURE_V2_SPANS, load_queries, store_v2
 
 RUN = "feature/v2+1000"
 
@@ -109,3 +110,91 @@ def test_human_count_rolls_up_without_double_counting():
 
 def test_unknown_spoke_returns_empty_forest():
     assert store_v2().spoke_steps("does/not+exist") == []
+
+
+# --- S3: once-per-turn cost + model/agent attribution --------------------------
+
+
+def _roots(forest, kind):
+    return [n for n in forest if n["kind"] == kind]
+
+
+def test_subagent_turns_attribute_to_the_agent_node():
+    forest = store_v2().spoke_steps(RUN)
+    agent = _find(forest, "v2_agent")
+
+    # The two subagent turns (haiku) land on the agent node, not the main spine.
+    assert agent["own_cost_usd"] == pytest.approx(0.35)
+    assert agent["own_tokens_in"] == 350
+    assert agent["own_tokens_out"] == 180
+    assert agent["models"] == ["claude-haiku-4-5"]
+    assert agent["agent"] == "subagent"
+
+
+def test_main_turn_attributes_to_deepest_non_agent_span():
+    forest = store_v2().spoke_steps(RUN)
+    skill = _find(forest, "v2_skill")
+
+    # The 12:00:10 main turn falls inside the skill window → owned by the skill,
+    # never by the agent nested within it.
+    assert skill["own_cost_usd"] == pytest.approx(0.05)
+    assert skill["models"] == ["claude-opus-4-8"]
+    assert skill["agent"] == "main"
+
+
+def test_identical_window_turn_counted_once_not_per_sibling():
+    forest = store_v2().spoke_steps(RUN)
+    green = _find(forest, "v2_green")
+    tasks = [c for c in green["children"] if c["kind"] == "todo"]
+
+    # One turn brackets three identical-window TaskCreate spans; its cost lands on
+    # exactly one of them — never replicated across all three.
+    own = [t["own_cost_usd"] for t in tasks]
+    assert sum(own) == pytest.approx(0.03)
+    assert sum(1 for c in own if c > 0) == 1
+
+
+def test_step_rollup_sums_owned_turns_without_double_count():
+    forest = store_v2().spoke_steps(RUN)
+    red = _find(forest, "v2_red")
+    green = _find(forest, "v2_green")
+
+    # red: own 0.02 + skill 0.05 + agent 0.35 + todo 0.01 + hooks 0 = 0.43
+    assert red["rollup"]["cost_usd"] == pytest.approx(0.43)
+    # green: tasks 0.03 (once) + ask 0.02 = 0.05  (not 0.09)
+    assert green["rollup"]["cost_usd"] == pytest.approx(0.05)
+
+
+def test_rollup_models_bubble_up_distinct_and_sorted():
+    forest = store_v2().spoke_steps(RUN)
+    red = _find(forest, "v2_red")
+    green = _find(forest, "v2_green")
+
+    assert red["rollup"]["models"] == ["claude-haiku-4-5", "claude-opus-4-8"]
+    assert green["rollup"]["models"] == ["claude-opus-4-8", "claude-sonnet-4-6"]
+
+
+def test_orphan_turns_surface_in_an_untracked_node():
+    forest = store_v2().spoke_steps(RUN)
+    untracked = _roots(forest, "untracked")
+
+    assert len(untracked) == 1
+    assert untracked[0]["own_cost_usd"] == pytest.approx(0.005)
+
+
+def test_run_total_reconciles_to_the_turn_costs():
+    forest = store_v2().spoke_steps(RUN)
+
+    # Every turn counted exactly once → the forest's rolled-up cost equals the
+    # sum of all turn costs (0.495), the trustworthy run total.
+    total = sum(root["rollup"]["cost_usd"] for root in forest)
+    assert total == pytest.approx(0.495)
+
+
+def test_raw_path_without_turns_has_zero_owned_cost():
+    queries = load_queries()
+    store = queries.SpanStore.from_jsonl(FIXTURE_V2_SPANS)  # no turns table data
+    red = _find(store.spoke_steps(RUN), "v2_red")
+
+    assert red["rollup"]["cost_usd"] == 0.0
+    assert red["own_cost_usd"] == 0.0
