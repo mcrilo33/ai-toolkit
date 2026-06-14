@@ -414,10 +414,22 @@ TIER2_RULES = [
     "Bash(gh pr view:*)",
 ]
 
-SEEDED_RULES = [SCRIPT_RULE, *TIER1_RULES, *TIER2_RULES]
+# Test runner + `chmod +x` (issue #38). The spoke's inner loop is RED→GREEN→test,
+# so prompting on every run defeats autonomy; the GIT_DIR-leak hazard is confined to
+# pytest *inside the pre-push hook*, not manual worktree runs, so these are safe.
+# Scoped narrowly: only the runner verbs and `chmod +x`, never bare `python`/`chmod`.
+TIER_RUNNER_RULES = [
+    "Bash(python -m pytest:*)",
+    "Bash(.venv/bin/python -m pytest:*)",
+    "Bash(pytest:*)",
+    "Bash(chmod +x:*)",
+]
+
+SEEDED_RULES = [SCRIPT_RULE, *TIER1_RULES, *TIER2_RULES, *TIER_RUNNER_RULES]
 
 # Wildcards that must NEVER be seeded — each would hand over a destructive verb
-# (`git branch -D`, `git tag -d`, an arbitrary push refspec, etc.).
+# (`git branch -D`, `git tag -d`, an arbitrary push refspec, etc.) or arbitrary
+# code execution (`python … -c …`) / unrestricted mode bits (`chmod -R 777 …`).
 FORBIDDEN_RULES = [
     "Bash(git branch:*)",
     "Bash(git tag:*)",
@@ -425,7 +437,9 @@ FORBIDDEN_RULES = [
     "Bash(git checkout:*)",
     "Bash(git reset:*)",
     "Bash(git clean:*)",
-    "Bash(pytest:*)",
+    "Bash(python:*)",
+    "Bash(python -c:*)",
+    "Bash(chmod:*)",
     "Bash(rm:*)",
     "Bash(mv:*)",
 ]
@@ -504,6 +518,21 @@ def test_no_destructive_wildcards_seeded(hub: Path) -> None:
     allow = _load_allowlist(_worktree_dir(hub, "99"))["permissions"]["allow"]
     for rule in FORBIDDEN_RULES:
         assert rule not in allow, f"destructive wildcard seeded: {rule}"
+
+
+def test_seeds_test_runner_and_chmod_exec(hub: Path) -> None:
+    # Issue #38 — the spoke's RED→GREEN→test loop and `chmod +x` on new scripts
+    # run without a prompt; the bare `python`/`chmod` verbs stay gated.
+    _seed_hub_claude(hub)
+
+    proc = _run_new_quiet(hub, "99", "pushguard")
+
+    assert proc.returncode == 0, proc.stderr
+    allow = _load_allowlist(_worktree_dir(hub, "99"))["permissions"]["allow"]
+    for rule in TIER_RUNNER_RULES:
+        assert rule in allow, f"missing seeded runner rule: {rule}"
+    for rule in ("Bash(python:*)", "Bash(python -c:*)", "Bash(chmod:*)"):
+        assert rule not in allow, f"arbitrary-exec wildcard seeded: {rule}"
 
 
 def test_copied_runtime_config_still_present(hub: Path) -> None:
