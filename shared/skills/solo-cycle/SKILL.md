@@ -43,8 +43,9 @@ while #B sits at its own gate) — never one-at-a-time.
 After ANCHOR and before writing any code, a PLAN-gated spoke:
 
 1. **Explores the code** and presents a concrete implementation plan — files,
-   approach, test strategy, and **open questions** — using **plan mode**
-   (`EnterPlanMode` → present → `ExitPlanMode`, the primitive already exists).
+   approach, test strategy, and **open questions** — in **plan mode** (enter
+   plan mode, present the plan, then exit plan mode to proceed), reusing the
+   harness's existing plan-mode flow rather than a new primitive.
 2. Asks if anything is unclear and **parks for the user to review / challenge /
    approve before writing code**. The hub planned the *what/why* (the issue);
    the PLAN gate is the *how* (it needs the codebase in front of it), so scope

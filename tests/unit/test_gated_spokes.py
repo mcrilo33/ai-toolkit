@@ -21,6 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILLS_DIR = REPO_ROOT / "shared" / "skills"
 
 SOLO_CYCLE = SKILLS_DIR / "solo-cycle" / "SKILL.md"
+# START_TASK is exercised by the subtask-2 kickoff assertions added below.
 START_TASK = SKILLS_DIR / "start-task" / "SKILL.md"
 
 
