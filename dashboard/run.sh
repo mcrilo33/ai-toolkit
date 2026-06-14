@@ -17,6 +17,12 @@ if [ "${1:-}" != "" ]; then
   export AI_TOOLKIT_SPAN_LOG="$1"
 fi
 
+# Pick a free port so we never collide with another Streamlit on the default
+# 8501. Honour STREAMLIT_SERVER_PORT if the caller set one; else grab a free
+# ephemeral port (a tiny race window, fine for local dev).
+PORT="${STREAMLIT_SERVER_PORT:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("localhost", 0)); print(s.getsockname()[1]); s.close()')}"
+
 exec streamlit run "$HERE/app.py" \
   --server.address localhost \
+  --server.port "$PORT" \
   --browser.gatherUsageStats false

@@ -761,6 +761,51 @@ def _untracked_node(orphans: list[dict[str, Any]]) -> dict[str, Any] | None:
     }
 
 
+def format_step_label(node: dict[str, Any]) -> str:
+    """Human label for a v2 spoke node: ``name · phase``, or ``hooks xN``."""
+    if node["kind"] == "hooks":
+        return f"hooks x{node['collapsed_count']}"
+    if node.get("phase"):
+        return f"{node['name']} · {node['phase']}"
+    return node["name"]
+
+
+def format_step_metrics(node: dict[str, Any]) -> dict[str, str]:
+    """Display-ready metrics for a v2 spoke node.
+
+    Time is the node's own wall-clock; cost/tokens/models come from the
+    rolled-up once-per-turn subtree totals (falling back to the node's own when
+    no rollup is attached). Zero values render as an em dash.
+    """
+    rollup = node.get("rollup") or {}
+    cost = rollup.get("cost_usd", node.get("own_cost_usd", 0.0))
+    tokens = rollup.get("tokens_in", 0) + rollup.get("tokens_out", 0)
+    models = rollup.get("models") or node.get("models") or []
+    humans = rollup.get("human_count", node.get("human_count", 0))
+    return {
+        "time": _format_secs(node.get("duration_ms")),
+        "cost": _format_cost(cost),
+        "tokens": f"{tokens:,}" if tokens else "—",
+        "model": ", ".join(_short_model(m) for m in models) if models else "—",
+        "agent": node.get("agent", "main"),
+        "humans": str(humans) if humans else "—",
+        "status": node.get("status", ""),
+    }
+
+
+def _format_secs(ms: int | float | None) -> str:
+    return "—" if not ms else f"{ms / 1000:.1f}s"
+
+
+def _format_cost(usd: float | None) -> str:
+    return "—" if not usd else f"${usd:.4f}"
+
+
+def _short_model(model: str) -> str:
+    """Drop the ``claude-`` vendor prefix for compact display."""
+    return model.removeprefix("claude-")
+
+
 def _aggregate_by_kind(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Group attributed span nodes by ``kind`` into meta-view rows."""
     by_kind: dict[str, list[dict[str, Any]]] = {}
