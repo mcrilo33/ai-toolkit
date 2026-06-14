@@ -20,6 +20,7 @@ nothing is re-derived here.
 from __future__ import annotations
 
 import json
+import statistics
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -271,13 +272,7 @@ class SpanStore:
 
         Returns a forest ordered by ``ts_start``; an unknown spoke yields ``[]``.
         """
-        rows = self._query(
-            "SELECT * FROM spans WHERE spoke_run_id = ? ORDER BY ts_start, span_id",
-            [spoke_run_id],
-        )
-        nodes = [_step_node(row) for row in rows]
-        session_ids = sorted({row["session_id"] for row in rows if row["session_id"]})
-        orphans = _attribute_turns(nodes, self._turns_for_sessions(session_ids))
+        nodes, orphans = self._attributed_nodes(spoke_run_id)
         forest = _collapse_hooks(_nest_by_time(nodes))
         untracked = _untracked_node(orphans)
         if untracked is not None:
@@ -285,6 +280,37 @@ class SpanStore:
         for root in forest:
             _roll_up_steps(root)
         return forest
+
+    def spoke_meta_by_kind(self, spoke_run_id: str) -> list[dict[str, Any]]:
+        """Aggregate one spoke's spans by ``kind`` to spot "launched too much".
+
+        Per span kind: invocation ``count``, total/mean/median ``duration_ms``,
+        total/mean ``cost_usd``, and the distinct ``models`` seen. Cost is the
+        once-per-turn OWNED cost (the same de-duped attribution the drill-down
+        uses), never the bracketed per-span cost — so summing across kinds equals
+        the run total minus any untracked (non-span) turns. Rows sort by total
+        cost then count, descending. Unknown spoke yields ``[]``.
+        """
+        nodes, _ = self._attributed_nodes(spoke_run_id)
+        return _aggregate_by_kind(nodes)
+
+    def _attributed_nodes(
+        self, spoke_run_id: str
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Load one spoke's spans as nodes with once-per-turn cost attributed.
+
+        Returns ``(nodes, orphan_turns)`` — the flat real-span nodes (each with
+        ``own_cost_usd`` / ``own_tokens_*`` / ``models`` filled) and the turns no
+        span owned. Shared by the drill-down and the meta-by-kind view.
+        """
+        rows = self._query(
+            "SELECT * FROM spans WHERE spoke_run_id = ? ORDER BY ts_start, span_id",
+            [spoke_run_id],
+        )
+        nodes = [_step_node(row) for row in rows]
+        session_ids = sorted({row["session_id"] for row in rows if row["session_id"]})
+        orphans = _attribute_turns(nodes, self._turns_for_sessions(session_ids))
+        return nodes, orphans
 
     def _turns_for_sessions(self, session_ids: list[str]) -> list[dict[str, Any]]:
         """Per-turn rows for the spoke's sessions (empty on the raw path).
@@ -732,6 +758,32 @@ def _untracked_node(orphans: list[dict[str, Any]]) -> dict[str, Any] | None:
         "agent": "main",
         "collapsed_count": len(orphans),
         "children": [],
+    }
+
+
+def _aggregate_by_kind(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group attributed span nodes by ``kind`` into meta-view rows."""
+    by_kind: dict[str, list[dict[str, Any]]] = {}
+    for node in nodes:
+        by_kind.setdefault(node["kind"], []).append(node)
+    rows = [_kind_row(kind, group) for kind, group in by_kind.items()]
+    rows.sort(key=lambda r: (-r["total_cost_usd"], -r["count"], r["kind"]))
+    return rows
+
+
+def _kind_row(kind: str, group: list[dict[str, Any]]) -> dict[str, Any]:
+    durations = [node["duration_ms"] for node in group]
+    costs = [node["own_cost_usd"] for node in group]
+    models = sorted({model for node in group for model in node["models"]})
+    return {
+        "kind": kind,
+        "count": len(group),
+        "total_duration_ms": sum(durations),
+        "mean_duration_ms": statistics.mean(durations),
+        "median_duration_ms": statistics.median(durations),
+        "total_cost_usd": sum(costs),
+        "mean_cost_usd": sum(costs) / len(group),
+        "models": models,
     }
 
 
