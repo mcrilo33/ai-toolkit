@@ -45,14 +45,36 @@ Restate the decided task back to the user as a draft issue — **title** plus a 
 **body** (problem, proposal, acceptance criteria drawn from the planning conversation).
 Get a quick OK before creating anything. Don't invent scope the user didn't agree to.
 
-### 2. Pick the branch type
+### 2. Pick the branch type and the gate level
 
-Choose one: `feature` (new capability), `fix` (bug), or `chore` (maintenance).
+Choose a branch type: `feature` (new capability), `fix` (bug), or `chore`
+(maintenance).
+
+Then choose the **gate level** — where the spoke pauses for human review, declared
+per task by **risk / novelty** (see the gate spectrum in `solo-cycle`):
+
+| Task type | Gate level |
+|-----------|------------|
+| Very-clear / trivial / mechanical | **none** — autonomous to `ready/` |
+| **Standard (DEFAULT)** | **PLAN gate** |
+| Novel / risky / ambiguous | PLAN + RED gate |
+| GUI / behavioral | PLAN + human-acceptance RED + draft-review |
+
+**PLAN is the default for all but very-clear work** — a rubber-stamped plan costs
+seconds, a wrong autonomous dev costs the whole cycle. Only declare `none` when the
+task is genuinely very-clear. (Only the PLAN gate is live today; the RED, human-
+acceptance, and draft levels are declared the same way but their machinery is pending
+follow-up issues — see `solo-cycle`.)
 
 ### 3. Create the issue
 
+Record the chosen gate level as a **`Gate:`** line in the issue body so it is part of
+the durable contract (the spoke reads it when it anchors), then create the issue:
+
 ```bash
-gh issue create --title "<title>" --body "<plan>"
+gh issue create --title "<title>" --body "<plan>
+
+Gate: plan   # plan (default) or none; the richer levels are pending follow-ups"
 ```
 
 Capture the issue number `N` from the returned URL.
@@ -69,19 +91,35 @@ worktree into the VS Code review window, opens a tmux window named `N`, and laun
 run on its own:
 
 ```
-You're in a dedicated worktree for issue #N. Run /source to anchor to issue #N and
-read it. Before touching code, break the issue body into a task ledger (TaskCreate, or TodoWrite on older runtimes) — one
-todo per subtask × the solo-cycle steps that apply (ANCHOR/RED/GREEN/REVIEW/PUSH),
-exactly one in_progress. Then implement it following the solo-cycle (/cycle: RED → GREEN →
-REVIEW → PUSH). The task ledger is ephemeral session scratch; issue #N stays the
-durable contract — skip the ledger only if the task is genuinely single-step. Push your
-own branch on every subtask without asking; when your ledger shows the issue's
-acceptance criteria are all met, that is the final subtask — push and emit the
-`ready/N` marker, also without asking. The routine own-branch push plus ready emission
-needs no approval. Still ask me before genuinely dangerous or irreversible ops:
-force-push / `--force-with-lease`, history rewrites, anything touching the default
-branch (`main`), or deletions outside the worktree. Do NOT self-land — the hub lands #N.
+You're in a dedicated worktree for issue #N (Gate: <level>). Run /source to anchor to
+issue #N and read it. Before touching code, break the issue body into a task ledger
+(TaskCreate, or TodoWrite on older runtimes) — one todo per subtask × the solo-cycle
+steps that apply (ANCHOR/RED/GREEN/REVIEW/PUSH), exactly one in_progress.
+
+This task's gate is <level>. If it is `plan` (the default for non-trivial work): the
+PLAN gate comes first — explore the code and present a concrete implementation plan
+(files, approach, test strategy, open questions) in plan mode, and WAIT for my approval
+before writing code (before GREEN). Park there rather than blocking: emit the `gate/N`
+marker (`git tag -f -a gate/N -m plan && git push -f origin gate/N`) so the hub sees you
+parked, and proceed into the cycle once I approve. If the gate is `none` (very-clear
+work), skip the PLAN gate and run autonomous straight through.
+
+Then implement it following the solo-cycle (/cycle: RED → GREEN → REVIEW → PUSH). The
+task ledger is ephemeral session scratch; issue #N stays the durable contract — skip the
+ledger only if the task is genuinely single-step. Push your own branch on every subtask
+without asking; when your ledger shows the issue's acceptance criteria are all met, that
+is the final subtask — push and emit the `ready/N` marker, also without asking. The
+routine own-branch push plus ready emission needs no approval. Still ask me before
+genuinely dangerous or irreversible ops: force-push / `--force-with-lease`, history
+rewrites, anything touching the default branch (`main`), or deletions outside the
+worktree. Do NOT self-land — the hub lands #N.
 ```
+
+> [!NOTE]
+> On Claude the marker tag pushes (`gate/N`, `ready/N`) are advisory and proceed.
+> On Cursor `push-scope-guard` denies a spoke's tag pushes by default (it allows
+> only the spoke's own branch), so approve the marker-push prompt when it appears —
+> the same applies to the existing `ready/N` push.
 
 ### 5. Report the handoff
 

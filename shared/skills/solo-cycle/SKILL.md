@@ -10,6 +10,73 @@ ready-to-land marker is emitted**, the **hub** lands it with `/land <id>` (the `
 skill) — merge, suite, ship, teardown. The marker is what tells the hub the whole
 issue is done, not just one subtask (see [The final-push marker](#the-final-push-marker)).
 
+## The gate spectrum
+
+The single human checkpoint used to be `/land` on the hub — *after* a spoke had
+fully run and pushed, so a wrong direction was only caught post-hoc and cost a
+whole cycle plus a post-fix. Gating moves that checkpoint to its cheapest,
+highest-leverage point, but gating *everything* would erase the fire-and-forget
+parallelism that makes the hub/spoke model valuable. So the **gate level is
+declared per task** by risk/novelty (in the issue and the kickoff — see
+`start-task`), not applied uniformly:
+
+| Task type | Gates |
+|-----------|-------|
+| Very-clear / trivial / mechanical | **none** — fully autonomous to `ready/` |
+| **Standard (DEFAULT)** | **PLAN gate** |
+| Novel / risky / ambiguous | PLAN + RED gate |
+| GUI / behavioral | PLAN + human-acceptance RED + draft-review |
+
+**PLAN is the default for all but very-clear work.** Approving a plan you agree
+with costs seconds (even a rubber-stamp); a wrong autonomous dev costs the whole
+cycle plus a post-fix — so defaulting non-trivial work to a PLAN gate wins on
+expected value even when most plans pass. The no-gate skip-lane is widened
+**empirically** over time from the dashboard's observed redirect-vs-rubber-stamp
+rate — not guessed up front.
+
+Gates do **not** serialize the queue: a spoke runs **in parallel to its gate**
+and **parks** there, so the user reviews the queue in any order (PLAN-gate #A
+while #B sits at its own gate) — never one-at-a-time.
+
+### The PLAN gate (default, before RED)
+
+After ANCHOR and before writing any code, a PLAN-gated spoke:
+
+1. **Explores the code** and presents a concrete implementation plan — files,
+   approach, test strategy, and **open questions** — in **plan mode** (enter
+   plan mode, present the plan, then exit plan mode to proceed), reusing the
+   harness's existing plan-mode flow rather than a new primitive.
+2. Asks if anything is unclear and **parks for the user to review / challenge /
+   approve before writing code**. The hub planned the *what/why* (the issue);
+   the PLAN gate is the *how* (it needs the codebase in front of it), so scope
+   is not re-litigated twice.
+3. On approval, proceeds into the RED → GREEN → REVIEW → PUSH cycle below.
+
+A **very-clear / trivial / mechanical** task declares no gate and runs
+**autonomous** straight through to `ready/`, exactly as before.
+
+The other spectrum levels — the **RED gate** (user validates the failing test as
+the executable spec), **human-acceptance RED** (a manual checklist for
+GUI/behavioral work with no clean automated red), and **draft-review** (park
+with a diff + run command after GREEN, before the gauntlet) — are declared in
+the same way but their machinery is **pending follow-up issues**; only the PLAN
+gate is live in this version.
+
+### The gate marker
+
+A parked gate is surfaced to the hub the same git-native way completion is: the
+spoke emits an annotated **`gate/<issue>`** tag whose message names the current
+park state (`plan` now; `red` / `draft` reserved for the follow-ups), force-moved
+as the spoke advances and dropped once it moves past the gate. This is distinct
+from the final-completion marker: **`ready/<issue>`** still means *the whole
+issue is done* and is what `/land` consumes — `gate/<issue>` only means *parked,
+awaiting review*. Emit it when you park:
+
+```bash
+git tag -f -a gate/<issue> -m plan
+git push -f origin gate/<issue>
+```
+
 ## The cycle (per subtask)
 
 | # | Step | Outcome | Enforced by |
