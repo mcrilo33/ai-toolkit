@@ -110,8 +110,8 @@ def _run_new(
     call), answers `new-window` with a fake window id `@1` (captured by the
     script via `-P -F '#{window_id}'`), and answers `has-session` /
     `new-session` with exit statuses `has_session_rc` / `new_session_rc`
-    (0 = session 0 exists / was created). The log file is pre-created so a run
-    that never reaches tmux reads as an empty log, not a missing one.
+    (0 = the project session exists / was created). The log file is pre-created
+    so a run that never reaches tmux reads as an empty log, not a missing one.
 
     Args:
         hub: Main checkout to run the script from.
