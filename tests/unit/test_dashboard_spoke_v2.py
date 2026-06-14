@@ -306,3 +306,52 @@ def test_meta_by_kind_total_reconciles_minus_untracked():
 
 def test_meta_by_kind_unknown_spoke_is_empty():
     assert store_v2().spoke_meta_by_kind("does/not+exist") == []
+
+
+# --- S5: display formatting helpers (the thin glue app.py renders) --------------
+
+
+def test_format_step_label_per_kind():
+    queries = load_queries()
+    forest = store_v2().spoke_steps(RUN)
+    red = _find(forest, "v2_red")
+    hooks = next(c for c in red["children"] if c["kind"] == "hooks")
+
+    assert queries.format_step_label(red) == "solo-cycle · red"
+    assert queries.format_step_label(hooks) == "hooks x2"  # collapsed count
+    assert queries.format_step_label(_find(forest, "v2_agent")) == "tdd-red"
+
+
+def test_format_step_metrics_rolls_up_for_a_step():
+    queries = load_queries()
+    red = _find(store_v2().spoke_steps(RUN), "v2_red")
+
+    metrics = queries.format_step_metrics(red)
+
+    assert metrics["time"] == "50.0s"  # own wall-clock
+    assert metrics["cost"] == "$0.4300"  # rolled-up, de-duped
+    assert metrics["tokens"] == "740"
+    assert metrics["model"] == "haiku-4-5, opus-4-8"  # claude- prefix stripped
+    assert metrics["agent"] == "main"
+    assert metrics["status"] == "success"
+
+
+def test_format_step_metrics_marks_subagent():
+    queries = load_queries()
+    agent = _find(store_v2().spoke_steps(RUN), "v2_agent")
+
+    metrics = queries.format_step_metrics(agent)
+
+    assert metrics["agent"] == "subagent"
+    assert metrics["model"] == "haiku-4-5"
+
+
+def test_format_step_metrics_blanks_zero_values():
+    queries = load_queries()
+    done = _find(store_v2().spoke_steps(RUN), "v2_life_done")
+
+    metrics = queries.format_step_metrics(done)
+
+    assert metrics["cost"] == "—"
+    assert metrics["tokens"] == "—"
+    assert metrics["model"] == "—"
