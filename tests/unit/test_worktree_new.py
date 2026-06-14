@@ -23,11 +23,17 @@ via `send-keys` races shell init (eaten Enter, zvm interference). The command
 must instead be passed as the `new-window` shell-command argument, suffixed
 with `; exec <shell>` so the window survives claude's exit; `send-keys` must
 never deliver the launch. `--no-agent` spawns a plain interactive window.
-Push-allowlist templating (issue #11): after the `.claude/` copy, the script
-seeds `<worktree>/.claude/settings.local.json` with two narrow allow rules so
-the spoke's own-branch ship push runs without a permission prompt — gates, not
-asks, do the enforcing. The file is created when the hub has no `.claude/` and
-merged (never clobbered, never duplicated, order preserved) when one was copied.
+Command-allowlist templating (issues #11, #37): after the `.claude/` copy, the
+script seeds `<worktree>/.claude/settings.local.json` with the spoke's command
+allowlist so the routine PUSH + read-only diagnostics run without a permission
+prompt — gates, not asks, do the enforcing. Issue #37 replaces the two bare
+exact-push rules (which never matched once the spoke decorated/chained the push)
+with one allowlistable process rule — `Bash(bash .ai-toolkit/scripts/spoke-push.sh:*)`
+— plus a read-only Tier 1 (local) + Tier 2 (network-read) helper allowlist; the
+bare-push rules are dropped, and no destructive wildcard (`git branch:*`,
+`git tag:*`, `git push:*`, `pytest:*`, `rm`/`mv`) is ever seeded. The file is
+created when the hub has no `.claude/` and merged (never clobbered, never
+duplicated, order preserved) when one was copied.
 
 """
 
@@ -371,9 +377,63 @@ def test_manual_fallback_advice_carries_wt_spoke_marker(hub: Path, tmp_path: Pat
     assert "WT_SPOKE=8 CLAUDE_EFFORT=max claude --model opus" in proc.stdout
 
 
-# ── Push-allowlist templating (issue #11) ────────────────────────────────────
+# ── Command-allowlist templating (issues #11, #37) ───────────────────────────
 # A quiet runner (no VS Code, no tmux) for the settings.local.json assertions —
 # distinct from the tmux-stub `_run_new` above, which the window/agent tests need.
+
+# The single allowlistable PUSH process rule (#37) — branch-independent, unlike
+# the old bare-push rules it replaces.
+SCRIPT_RULE = "Bash(bash .ai-toolkit/scripts/spoke-push.sh:*)"
+
+# Tier 1 — read-only, no side effects.
+TIER1_RULES = [
+    "Bash(git status:*)",
+    "Bash(git diff:*)",
+    "Bash(git log:*)",
+    "Bash(git show:*)",
+    "Bash(git rev-parse:*)",
+    "Bash(git branch --show-current)",
+    "Bash(ls:*)",
+    "Bash(cat:*)",
+    "Bash(head:*)",
+    "Bash(tail:*)",
+    "Bash(wc:*)",
+    "Bash(grep:*)",
+    "Bash(rg:*)",
+    "Bash(find:*)",
+    "Bash(echo:*)",
+    "Bash(tree:*)",
+]
+
+# Tier 2 — network-read / read-only GitHub.
+TIER2_RULES = [
+    "Bash(git fetch:*)",
+    "Bash(git remote -v)",
+    "Bash(git stash list)",
+    "Bash(gh issue view:*)",
+    "Bash(gh pr view:*)",
+]
+
+SEEDED_RULES = [SCRIPT_RULE, *TIER1_RULES, *TIER2_RULES]
+
+# Wildcards that must NEVER be seeded — each would hand over a destructive verb
+# (`git branch -D`, `git tag -d`, an arbitrary push refspec, etc.).
+FORBIDDEN_RULES = [
+    "Bash(git branch:*)",
+    "Bash(git tag:*)",
+    "Bash(git push:*)",
+    "Bash(git checkout:*)",
+    "Bash(git reset:*)",
+    "Bash(git clean:*)",
+    "Bash(pytest:*)",
+    "Bash(rm:*)",
+    "Bash(mv:*)",
+]
+
+
+def _bare_push_rules(branch: str) -> list[str]:
+    """The two exact-match push rules issue #37 drops."""
+    return [f"Bash(git push origin {branch})", f"Bash(git push -u origin {branch})"]
 
 
 def _run_new_quiet(hub: Path, *args: str) -> subprocess.CompletedProcess:
@@ -394,10 +454,6 @@ def _worktree_dir(hub: Path, tag: str) -> Path:
     return hub.parent / f"{hub.name}-{tag}"
 
 
-def _push_rules(branch: str) -> list[str]:
-    return [f"Bash(git push origin {branch})", f"Bash(git push -u origin {branch})"]
-
-
 def _load_allowlist(wt: Path) -> dict:
     settings = wt / ".claude" / "settings.local.json"
     assert settings.is_file(), f"missing {settings}"
@@ -414,16 +470,40 @@ def _seed_hub_claude(hub: Path, settings: dict | None = None) -> Path:
     return marker
 
 
-def test_seeds_own_branch_push_allowlist(hub: Path) -> None:
+def test_seeds_spoke_command_allowlist(hub: Path) -> None:
     _seed_hub_claude(hub)
 
     proc = _run_new_quiet(hub, "99", "pushguard")
 
     assert proc.returncode == 0, proc.stderr
-    data = _load_allowlist(_worktree_dir(hub, "99"))
-    allow = data["permissions"]["allow"]
-    for rule in _push_rules("feature/99-pushguard"):
-        assert rule in allow
+    allow = _load_allowlist(_worktree_dir(hub, "99"))["permissions"]["allow"]
+    for rule in SEEDED_RULES:
+        assert rule in allow, f"missing seeded rule: {rule}"
+
+
+def test_drops_bare_push_rules(hub: Path) -> None:
+    # The two exact-match push rules are replaced by the script rule (#37) — a
+    # decorated/chained push never matched them, so they only added noise.
+    _seed_hub_claude(hub)
+
+    proc = _run_new_quiet(hub, "99", "pushguard")
+
+    assert proc.returncode == 0, proc.stderr
+    allow = _load_allowlist(_worktree_dir(hub, "99"))["permissions"]["allow"]
+    for rule in _bare_push_rules("feature/99-pushguard"):
+        assert rule not in allow, f"dropped bare-push rule still seeded: {rule}"
+
+
+def test_no_destructive_wildcards_seeded(hub: Path) -> None:
+    # Read-only tiers only — never a wildcard that hands over a destructive verb.
+    _seed_hub_claude(hub)
+
+    proc = _run_new_quiet(hub, "99", "pushguard")
+
+    assert proc.returncode == 0, proc.stderr
+    allow = _load_allowlist(_worktree_dir(hub, "99"))["permissions"]["allow"]
+    for rule in FORBIDDEN_RULES:
+        assert rule not in allow, f"destructive wildcard seeded: {rule}"
 
 
 def test_copied_runtime_config_still_present(hub: Path) -> None:
@@ -442,10 +522,9 @@ def test_creates_allowlist_without_hub_claude_dir(hub: Path) -> None:
     proc = _run_new_quiet(hub, "7", "bare")
 
     assert proc.returncode == 0, proc.stderr
-    data = _load_allowlist(_worktree_dir(hub, "7"))
-    allow = data["permissions"]["allow"]
-    for rule in _push_rules("feature/7-bare"):
-        assert rule in allow
+    allow = _load_allowlist(_worktree_dir(hub, "7"))["permissions"]["allow"]
+    for rule in SEEDED_RULES:
+        assert rule in allow, f"missing seeded rule: {rule}"
 
 
 @pytest.mark.skipif(shutil.which("jq") is None, reason="merge templating requires jq")
@@ -463,18 +542,19 @@ def test_merges_existing_settings_local(hub: Path) -> None:
     assert "Bash(ls *)" in data["permissions"]["allow"]
     assert "Bash(rm *)" in data["permissions"]["deny"]
     assert data["other"] is True
-    for rule in _push_rules("feature/99-pushguard"):
-        assert rule in data["permissions"]["allow"]
+    for rule in SEEDED_RULES:
+        assert rule in data["permissions"]["allow"], f"missing seeded rule: {rule}"
 
 
 def test_adhoc_branch_allowlist(hub: Path) -> None:
     proc = _run_new_quiet(hub, "fix-parser")
 
     assert proc.returncode == 0, proc.stderr
-    data = _load_allowlist(_worktree_dir(hub, "fix-parser"))
-    allow = data["permissions"]["allow"]
-    for rule in _push_rules("feature/fix-parser"):
-        assert rule in allow
+    allow = _load_allowlist(_worktree_dir(hub, "fix-parser"))["permissions"]["allow"]
+    # The seeded rules are branch-independent now, so an ad-hoc spoke gets the
+    # same allowlist as a numbered one.
+    for rule in SEEDED_RULES:
+        assert rule in allow, f"missing seeded rule: {rule}"
 
 
 @pytest.mark.skipif(shutil.which("jq") is None, reason="merge templating requires jq")
@@ -511,7 +591,7 @@ def test_empty_settings_local_is_not_silently_truncated(hub: Path) -> None:
 @pytest.mark.skipif(shutil.which("jq") is None, reason="merge templating requires jq")
 def test_merge_preserves_existing_allow_order(hub: Path) -> None:
     # The merge must not lexicographically churn a user-curated allow list —
-    # existing entries keep their order; the push rules append at the end.
+    # existing entries keep their order; the seeded rules append at the end.
     _seed_hub_claude(hub, settings={"permissions": {"allow": ["Bash(z *)", "Bash(m *)"]}})
 
     proc = _run_new_quiet(hub, "99", "pushguard")
@@ -523,12 +603,13 @@ def test_merge_preserves_existing_allow_order(hub: Path) -> None:
 
 @pytest.mark.skipif(shutil.which("jq") is None, reason="merge templating requires jq")
 def test_no_duplicate_rules_when_rerun_source_present(hub: Path) -> None:
-    plain_rule, u_rule = _push_rules("feature/99-pushguard")
-    _seed_hub_claude(hub, settings={"permissions": {"allow": [plain_rule]}})
+    # A rule already present in the copied settings must not be re-appended.
+    _seed_hub_claude(hub, settings={"permissions": {"allow": [SCRIPT_RULE]}})
 
     proc = _run_new_quiet(hub, "99", "pushguard")
 
     assert proc.returncode == 0, proc.stderr
     allow = _load_allowlist(_worktree_dir(hub, "99"))["permissions"]["allow"]
-    assert allow.count(plain_rule) == 1
-    assert u_rule in allow
+    assert allow.count(SCRIPT_RULE) == 1
+    for rule in SEEDED_RULES:
+        assert rule in allow, f"missing seeded rule: {rule}"
