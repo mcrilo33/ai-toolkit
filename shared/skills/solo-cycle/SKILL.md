@@ -125,14 +125,31 @@ the exact diff — any new commit invalidates the artifact.
 
 ### 5. PUSH
 
-`git push` is the ship gate. `red-proof-warn`, `reviewer-sep-warn`, and
-`git-push-review` all fire here; on Cursor they hard-block. The push only
-succeeds when all evidence is in place.
+The push is the ship gate. Run it through the one allowlistable process:
 
-Push only the task's own branch — `git push [-u] origin <branch>`.
-`push-scope-guard` denies a spoke push whose refspec touches the default
-branch or another task's ref: the spoke's origin branch is ephemeral staging,
-and `main` is published exclusively from the hub.
+```bash
+bash .ai-toolkit/scripts/spoke-push.sh            # normal per-subtask push
+bash .ai-toolkit/scripts/spoke-push.sh --ready N  # final subtask: push + ready/N marker
+```
+
+The script refuses on the default branch, prints diagnostics, then runs the
+real `git push -u origin <branch>` — so `red-proof-warn`, `reviewer-sep-warn`,
+`git-push-review` and `push-scope-guard` all fire exactly as for a hand-typed
+push; on Cursor they hard-block. It does **not** use `--no-verify`. The push
+only succeeds when all evidence is in place.
+
+**Never chain the push.** Claude Code's Bash matcher decomposes a compound
+command and requires every segment to be separately allowed, so a decorated push
+(`git push … | tail`, `git status && … && git push`, `git tag X && git push
+origin X`) re-prompts on every ship. Run any diagnostics as their own commands
+and let the script own the push + marker — that is the whole reason the seeded
+allowlist is `Bash(bash .ai-toolkit/scripts/spoke-push.sh:*)` and not a bare
+`git push` rule.
+
+The script pushes only the task's own branch. `push-scope-guard` denies a spoke
+push whose refspec touches the default branch or another task's ref: the spoke's
+origin branch is ephemeral staging, and `main` is published exclusively from the
+hub.
 
 Push **without prompting** the user. An own-branch push is low-stakes and
 force-push-recoverable, it targets the spoke's own ephemeral branch (never
@@ -147,13 +164,16 @@ worktree — but never for the routine own-branch push (or the marker below).
 
 A per-subtask push looks identical to task completion — clean tree, branch pushed.
 The hub can't tell "subtask 1 of 3 shipped" from "issue done" by branch state alone,
-so completion must be **signalled explicitly**. After the **FINAL** subtask's push —
-and only then — emit a `ready/<issue>` git tag at the branch tip:
+so completion must be **signalled explicitly**. On the **FINAL** subtask — and
+only then — pass `--ready <issue>` to the push script so the branch push and the
+`ready/<issue>` marker emit from the same single allowlistable process (never a
+separate `git tag … && git push …` chain, which would re-prompt):
 
 ```bash
-git tag ready/<issue>
-git push origin ready/<issue>
+bash .ai-toolkit/scripts/spoke-push.sh --ready <issue>
 ```
+
+This tags `ready/<issue>` at the branch tip and pushes it after the branch push.
 
 **Completion is agent-determined, not a human call.** You decide a subtask is the
 final one by checking the issue's **acceptance criteria** against your task ledger:

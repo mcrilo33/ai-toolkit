@@ -177,20 +177,41 @@ if [ -d "$REPO_ROOT/.claude" ]; then
   fi
 fi
 
-# --- seed the spoke's narrow push allowlist ------------------------------------
-# The spoke's own-branch push IS its ship gate (push-scope-guard.sh + the push
-# hooks enforce it), so the sanctioned `git push [-u] origin <branch>` should
-# not also stall on a permission ask — gates, not asks, do the enforcing.
-# Template exactly the two narrow rules for THIS branch into the worktree's
-# settings.local.json; every other push stays behind the user-level ask.
-RULE_PUSH="Bash(git push origin ${BRANCH})"
-RULE_PUSH_U="Bash(git push -u origin ${BRANCH})"
+# --- seed the spoke's command allowlist ----------------------------------------
+# The spoke's PUSH step runs as ONE allowlistable process — spoke-push.sh —
+# because Claude Code's Bash matcher decomposes a compound command and requires
+# every segment to be allowed, so a decorated/chained push (or the intrinsically
+# two-command `ready/N` marker) never matched a bare exact-push rule and always
+# re-prompted (issue #37). Seed that script rule plus a read-only helper
+# allowlist (Tier 1 local, Tier 2 network-read); the ship gates (push-scope-guard
+# + the pre-push hooks), not permission asks, do the enforcing.
+#
+# `git branch --show-current` is seeded EXACT — never `git branch:*`, which would
+# hand over `git branch -D`. Nothing destructive is seeded: no `git tag:*` /
+# `git push:*` / `git checkout|reset|clean:*` / `pytest:*` / `rm` / `mv`.
+ALLOW_RULES=(
+  "Bash(bash .ai-toolkit/scripts/spoke-push.sh:*)"
+  # Tier 1 — read-only, no side effects
+  "Bash(git status:*)" "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)"
+  "Bash(git rev-parse:*)" "Bash(git branch --show-current)"
+  "Bash(ls:*)" "Bash(cat:*)" "Bash(head:*)" "Bash(tail:*)" "Bash(wc:*)"
+  "Bash(grep:*)" "Bash(rg:*)" "Bash(find:*)" "Bash(echo:*)" "Bash(tree:*)"
+  # Tier 2 — network-read / read-only GitHub
+  "Bash(git fetch:*)" "Bash(git remote -v)" "Bash(git stash list)"
+  "Bash(gh issue view:*)" "Bash(gh pr view:*)"
+)
 SETTINGS_LOCAL="$WT_DIR/.claude/settings.local.json"
 mkdir -p "$WT_DIR/.claude"
 if [ ! -f "$SETTINGS_LOCAL" ]; then
-  printf '{\n  "permissions": {\n    "allow": [\n      "%s",\n      "%s"\n    ]\n  }\n}\n' \
-    "$RULE_PUSH" "$RULE_PUSH_U" > "$SETTINGS_LOCAL"
-  echo "→ seeded own-branch push allowlist (.claude/settings.local.json)"
+  {
+    printf '{\n  "permissions": {\n    "allow": [\n'
+    for i in "${!ALLOW_RULES[@]}"; do
+      sep=","; [ "$i" -eq "$(( ${#ALLOW_RULES[@]} - 1 ))" ] && sep=""
+      printf '      "%s"%s\n' "${ALLOW_RULES[$i]}" "$sep"
+    done
+    printf '    ]\n  }\n}\n'
+  } > "$SETTINGS_LOCAL"
+  echo "→ seeded spoke command allowlist (.claude/settings.local.json)"
 elif command -v jq >/dev/null 2>&1; then
   # Append-without-churn: existing entries keep their order (no jq `unique`,
   # which would lexicographically re-sort a user-curated list); only rules not
@@ -198,20 +219,21 @@ elif command -v jq >/dev/null 2>&1; then
   # zero-byte file yields zero output documents with exit 0 — in both cases
   # warn and leave the file untouched rather than abort the wiring or
   # silently truncate (-s catches the empty-output case).
+  RULES_JSON="$(printf '%s\n' "${ALLOW_RULES[@]}" | jq -Rn '[inputs]')"
   TMP_SETTINGS="$(mktemp)"
-  if jq --arg a "$RULE_PUSH" --arg b "$RULE_PUSH_U" \
-       '(.permissions.allow // []) as $cur | .permissions.allow = ($cur + ([$a, $b] - $cur))' \
+  if jq --argjson rules "$RULES_JSON" \
+       '(.permissions.allow // []) as $cur | .permissions.allow = ($cur + ($rules - $cur))' \
        "$SETTINGS_LOCAL" > "$TMP_SETTINGS" 2>/dev/null && [ -s "$TMP_SETTINGS" ]; then
     mv "$TMP_SETTINGS" "$SETTINGS_LOCAL"
-    echo "→ merged own-branch push allowlist into settings.local.json"
+    echo "→ merged spoke command allowlist into settings.local.json"
   else
     rm -f "$TMP_SETTINGS"
     wt_warn "could not merge into settings.local.json (invalid JSON?) — add the allow rules yourself:"
-    wt_warn "  $RULE_PUSH  and  $RULE_PUSH_U"
+    for r in "${ALLOW_RULES[@]}"; do wt_warn "  $r"; done
   fi
 else
   wt_warn "settings.local.json exists but jq is missing — add the allow rules yourself:"
-  wt_warn "  $RULE_PUSH  and  $RULE_PUSH_U"
+  for r in "${ALLOW_RULES[@]}"; do wt_warn "  $r"; done
 fi
 
 echo
