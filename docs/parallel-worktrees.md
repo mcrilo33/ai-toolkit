@@ -129,12 +129,12 @@ Each run automatically:
    enforced by the push gates, so it skips the permission ask; every other push
    stays gated,
 4. runs `code --add` to fold the worktree into your single VS Code window,
-5. opens a new tmux window in session `0` (the spoke home), named after the branch
-   leaf (e.g. `42-fix-crash`), pinned against renames, running `claude` in the
-   worktree — and prints the exact jump command to reach it.
+5. opens a new tmux window in the project's session (named after the repo — see
+   [tmux](#tmux)), named after the branch leaf (e.g. `42-fix-crash`), pinned against
+   renames, running `claude` in the worktree — and prints the exact jump command.
 
-Paste the printed jump command (or switch with `prefix` + number inside session `0`)
-and drive Claude — typically `/source` then `/cycle`.
+Paste the printed jump command (or switch with `prefix` + number inside the project
+session) and drive Claude — typically `/source` then `/cycle`.
 
 ### 2. Work and review
 
@@ -244,13 +244,18 @@ All three flags are position-independent.
 
 ## tmux
 
-All spokes live as windows of tmux session `0` — the **spoke home**. The script
-targets it explicitly (creating it detached when missing), regardless of which tmux
-session — or none — you invoke it from, so a spoke can never land in a stray
-per-task session with no client attached. Each run prints the exact jump command:
-`tmux switch-client -t '0:<window>'` from inside tmux, or
-`tmux attach -t 0 \; select-window -t '0:<window>'` from a plain shell. Inside
-session `0`, switch between task windows with `prefix` + number.
+Each project gets **one tmux session**, and every spoke lives as a window of it.
+The session name is derived from the repo root — the parent directory plus the repo
+basename (`<parent>-<base>`, e.g. `Repos-ai-toolkit`), with tmux's forbidden `.` and
+`:` mapped to `-`. Two checkouts that share a basename under different parents
+therefore get distinct sessions, and `tmux ls` reads as a per-project portfolio
+with each project's spokes nested under it. The script targets the session
+explicitly (creating it detached when missing), regardless of which tmux session —
+or none — you invoke it from, so a spoke can never land in a stray per-task session
+with no client attached. Each run prints the exact jump command:
+`tmux switch-client -t '<sess>:<window>'` from inside tmux, or
+`tmux attach -t '<sess>' \; select-window -t '<sess>:<window>'` from a plain shell.
+Inside a project session, switch between task windows with `prefix` + number.
 
 The agent launch (pinned model/effort plus the seeded `--prompt`) is passed to
 `new-window` as the window's own shell command — never typed into an interactive
@@ -262,8 +267,8 @@ To re-seed a prompt into an **existing** pane manually (e.g. a claude sitting at
 its input without the kickoff), send the text literally and the Enter separately:
 
 ```bash
-tmux send-keys -t '0:<window>' -l '/source'   # -l = literal text, no key-name parsing
-tmux send-keys -t '0:<window>' Enter          # separate Enter, not a trailing C-m
+tmux send-keys -t '<sess>:<window>' -l '/source'   # -l = literal text, no key-name parsing
+tmux send-keys -t '<sess>:<window>' Enter          # separate Enter, not a trailing C-m
 ```
 
 ## Notes and gotchas
