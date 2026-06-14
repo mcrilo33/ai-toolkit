@@ -99,6 +99,10 @@ quick yes, then run it. Merges and teardowns happen **on the hub**; task edits n
 Give the user a short read: how many spokes are running, which issues are unstarted, which
 branches are ready to merge, and your single recommended next action.
 
+`hub-status.sh` does not surface cost. For per-spoke token/cost attribution across runs,
+point the user at the observability dashboard (`dashboard/README.md`) — cost is reconciled
+from `ccusage` offline; see `docs/telemetry-pull-layer.md` for the pull layer.
+
 ### Micro-spoke dispatch (lane 1)
 
 Use a micro-spoke for any change that touches only non-executable paths: docs, comments,
