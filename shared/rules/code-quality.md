@@ -10,6 +10,49 @@
 - If the implementation is significantly longer than needed, rewrite shorter
 - "Would a senior engineer say this is overcomplicated?" If yes, simplify.
 
+## Reach Before You Write
+
+Before authoring code, walk this ladder top to bottom and stop at the first rung that
+solves the problem. Write new code only when every rung above it has come up empty.
+
+1. **Does this need to exist?** The cheapest code is the code you don't write. Drop
+   speculative requirements; the best fix is often deleting the need.
+2. **Standard library?** Reach for what the language already ships before anything else.
+3. **Native platform feature?** Use the runtime, framework, or OS capability that's
+   already present (built-in HTTP client, env loader, scheduler) over a hand-rolled one.
+4. **Already-installed dependency?** Solve it with a library the project already depends
+   on before adding a new one. (Adopting a *new* dependency is governed by
+   Dependency Management below; verifying its API by `library-research`.)
+5. **One line?** If a small expression or existing helper does it, write that — not a
+   new function, class, or abstraction.
+6. **Only then, minimal code.** Author the smallest version that meets the requirement.
+
+### Upgrade markers
+
+When you deliberately stop at a lower rung — a stub, a narrow happy path, an O(n) scan
+where a map would scale — leave a tagged comment naming the upgrade path so "minimal"
+stays honest and reviewable:
+
+```python
+# UPGRADE: swap the linear scan for a set lookup if callers grow past ~100 items
+```
+
+Format: `UPGRADE: <what to change> — <when or why it'd be worth it>`. It records a
+conscious trade-off, not a defect; reserve `TODO`/`FIXME` for those.
+
+### Non-negotiables
+
+Minimize everything *except* the following — never trade these away for brevity:
+
+- **Security** — authn/authz checks, secret handling, safe defaults
+- **Data-loss handling** — durability, transactions, and the error paths that protect
+  user data
+- **Trust-boundary validation** — validate every input crossing a boundary (user,
+  network, file, env), even when the happy path is one line
+- **Accessibility** — semantics, labels, and keyboard/screen-reader support in any UI
+
+"Minimal" means the smallest *complete* solution — never one that skipped the validation.
+
 ## Single Responsibility
 
 - Each function should do one thing well
