@@ -232,3 +232,58 @@ def test_untracked_node_ignores_malformed_turn_timestamps():
     assert len(untracked) == 1
     assert untracked[0]["own_cost_usd"] == pytest.approx(0.01)
     assert untracked[0]["ts_start"] is None
+
+
+# --- S4: meta-by-kind aggregation ----------------------------------------------
+
+
+def _by_kind(rows):
+    return {row["kind"]: row for row in rows}
+
+
+def test_meta_by_kind_counts_each_span_kind():
+    meta = _by_kind(store_v2().spoke_meta_by_kind(RUN))
+
+    assert meta["hook"]["count"] == 2  # "launched too much" signal lives here
+    assert meta["todo"]["count"] == 4  # TodoWrite + 3 TaskCreate
+    assert meta["step"]["count"] == 2
+    assert meta["lifecycle"]["count"] == 2
+    assert meta["agent"]["count"] == 1
+
+
+def test_meta_by_kind_time_stats_are_real_durations():
+    meta = _by_kind(store_v2().spoke_meta_by_kind(RUN))
+
+    # Hooks: 100 + 80 = 180 total, median of the two = 90.
+    assert meta["hook"]["total_duration_ms"] == 180
+    assert meta["hook"]["median_duration_ms"] == 90
+    assert meta["todo"]["median_duration_ms"] == 1000
+
+
+def test_meta_by_kind_cost_is_deduped_owned_cost():
+    meta = _by_kind(store_v2().spoke_meta_by_kind(RUN))
+
+    # Owned (once-per-turn) cost grouped by kind — never the bracketed span cost.
+    assert meta["agent"]["total_cost_usd"] == pytest.approx(0.35)
+    assert meta["skill"]["total_cost_usd"] == pytest.approx(0.05)
+    assert meta["todo"]["total_cost_usd"] == pytest.approx(0.04)  # 0.01 + 0.03, once
+    assert meta["hook"]["total_cost_usd"] == pytest.approx(0.0)
+
+
+def test_meta_by_kind_surfaces_models_per_kind():
+    meta = _by_kind(store_v2().spoke_meta_by_kind(RUN))
+
+    assert meta["agent"]["models"] == ["claude-haiku-4-5"]
+
+
+def test_meta_by_kind_total_reconciles_minus_untracked():
+    rows = store_v2().spoke_meta_by_kind(RUN)
+
+    # Each turn is owned once; summed across span kinds that is the run total
+    # minus the untracked (non-span) turns: 0.495 - 0.005 = 0.49.
+    total = sum(row["total_cost_usd"] for row in rows)
+    assert total == pytest.approx(0.49)
+
+
+def test_meta_by_kind_unknown_spoke_is_empty():
+    assert store_v2().spoke_meta_by_kind("does/not+exist") == []
