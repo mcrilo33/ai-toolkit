@@ -267,7 +267,26 @@ def test_meta_by_kind_cost_is_deduped_owned_cost():
     assert meta["agent"]["total_cost_usd"] == pytest.approx(0.35)
     assert meta["skill"]["total_cost_usd"] == pytest.approx(0.05)
     assert meta["todo"]["total_cost_usd"] == pytest.approx(0.04)  # 0.01 + 0.03, once
+    assert meta["step"]["total_cost_usd"] == pytest.approx(0.02)  # red own only
+    assert meta["human"]["total_cost_usd"] == pytest.approx(0.02)
+    assert meta["lifecycle"]["total_cost_usd"] == pytest.approx(0.01)
     assert meta["hook"]["total_cost_usd"] == pytest.approx(0.0)
+
+
+def test_meta_by_kind_sorts_by_cost_then_count_then_kind():
+    rows = store_v2().spoke_meta_by_kind(RUN)
+
+    # total cost desc, then count desc (step 2 before human 1 at equal 0.02), then
+    # kind asc — a deterministic order the meta table renders in.
+    assert [row["kind"] for row in rows] == [
+        "agent",
+        "skill",
+        "todo",
+        "step",
+        "human",
+        "lifecycle",
+        "hook",
+    ]
 
 
 def test_meta_by_kind_surfaces_models_per_kind():
