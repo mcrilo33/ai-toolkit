@@ -6,7 +6,10 @@ solo-cycle step, a hook firing, a worktree script, and (reconstructed later by t
 parser) skills, agents, todos, and human waits — is emitted as a span to a single
 JSONL log. This document is the **frozen v1 contract**. Issue B (session-log
 parser + token/cost correlation) and Issue C (the Streamlit dashboard) build
-against it; change it only by versioning, never in place.
+against it; change it only by versioning, never in place. The one exception is
+*additive, optional, pull-only* fields that push emitters never write and that
+default to `null` — `summary` (Issue #47) is the first; these extend the contract
+without breaking any push producer or existing consumer.
 
 ## Where spans live
 
@@ -58,6 +61,7 @@ payload leakage, basename-only repo, opt-in no-op, invisibility).
   "duration_ms": 3000,            // non-negative integer
   "status": "success",            // success|failure|deny|warn|skipped
   "human": null,                  // {type, wait_ms} when a human was waited on
+  "summary": null,                // pull-only few-word node label (Issue #47); null on push
   "tokens_in": null,              // \
   "tokens_out": null,             //  } null at emit — filled by Issue B's
   "cost_usd": null                // /  token/cost correlation pass, not here
@@ -82,6 +86,7 @@ payload leakage, basename-only repo, opt-in no-op, invisibility).
 | `duration_ms` | integer | `ts_end - ts_start` in ms (≥ 0). `0` when no start clock was supplied. |
 | `status` | string | `success, failure, deny, warn, skipped`. |
 | `human` | object \| null | `{ "type": "prompt\|question\|approval", "wait_ms": <int> }` when a human interaction was timed; else `null`. |
+| `summary` | string \| null | **Additive, pull-only (Issue #47).** A few-word node label the parser derives for display: the todo a step advances, an agent's task `description`, a trimmed prompt/question snippet. `null` on push spans and whenever none resolves; `name` stays the stable grouping key. |
 | `tokens_in` / `tokens_out` / `cost_usd` | null | Always `null` at emit. Issue B's correlation pass fills these by joining on `session_id`. |
 
 ### `kind` values

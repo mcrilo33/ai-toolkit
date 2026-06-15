@@ -50,6 +50,7 @@ _COLUMNS: tuple[tuple[str, str], ...] = (
     ("status", "VARCHAR"),
     ("human_type", "VARCHAR"),
     ("human_wait_ms", "BIGINT"),
+    ("summary", "VARCHAR"),
     ("tokens_in", "BIGINT"),
     ("tokens_out", "BIGINT"),
     ("cost_usd", "DOUBLE"),
@@ -87,11 +88,6 @@ _STATUS_SEVERITY: dict[str, int] = {
 # ``span_id``, so these sentinels never collide with a real span.
 _SETUP_KEY = "__setup__"
 _UNRESOLVED_KEY = "__unresolved__"
-
-# Bare todo-tool names (Issue #47): a todo span still carrying one of these as its
-# name has no in-progress item derived, so it must not override a phase label.
-# Keep in sync with session_parser.TODO_TOOLS (the parser's fallback names).
-_TODO_TOOL_NAMES = frozenset({"TodoWrite", "TaskCreate", "TaskUpdate"})
 
 
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
@@ -584,6 +580,7 @@ def _step_node(row: dict[str, Any]) -> dict[str, Any]:
         "span_id": row["span_id"],
         "kind": row["kind"],
         "name": row["name"],
+        "summary": row["summary"],
         "phase": row["phase"],
         "status": row["status"],
         "ts_start": row["ts_start"],
@@ -937,16 +934,16 @@ def _bucket_node(
 
 
 def _bucket_todo_label(bucket_spans: list[dict[str, Any]]) -> str | None:
-    """The todo item a bucket advances: the latest resolved todo span in it.
+    """The todo item a bucket advances: the latest summarised todo span in it.
 
-    A todo span still named for its bare tool (``TodoWrite`` …) carries no derived
-    in-progress item, so it is ignored — the bucket then keeps its phase label.
+    A todo span with no derived ``summary`` (no in-progress item resolved) is
+    ignored — the bucket then keeps its phase label.
     """
     todos = sorted(
-        (n for n in bucket_spans if n["kind"] == "todo" and n["name"] not in _TODO_TOOL_NAMES),
+        (n for n in bucket_spans if n["kind"] == "todo" and n.get("summary")),
         key=_sort_key,
     )
-    return todos[-1]["name"] if todos else None
+    return todos[-1]["summary"] if todos else None
 
 
 def _unresolved_node(acc: dict[str, Any] | None, children: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1022,9 +1019,15 @@ def format_spoke_label(spoke_run_id: str) -> str:
 
 
 def format_step_label(node: dict[str, Any]) -> str:
-    """Human label for a v2 spoke node: ``name · phase``, or ``hooks xN``."""
+    """Human label for a v2 spoke node.
+
+    Prefers the node's few-word ``summary`` (Issue #47: the todo it advances, the
+    agent's task, a prompt snippet); else ``name · phase``, or ``hooks xN``.
+    """
     if node["kind"] == "hooks":
         return f"hooks x{node['collapsed_count']}"
+    if node.get("summary"):
+        return node["summary"]
     if node.get("phase"):
         return f"{node['name']} · {node['phase']}"
     return node["name"]

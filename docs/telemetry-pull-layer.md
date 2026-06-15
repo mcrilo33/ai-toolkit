@@ -9,9 +9,11 @@ emitting spans at runtime) and builds against #21's frozen span schema
 Everything here is **read-only and 100% local**. Session logs contain prompt
 content, so they are parsed on-machine and only metadata / metrics are surfaced —
 never raw prompt, answer, thinking, or tool-output text. **Exception (Issue #47):**
-the todo-ledger item text is retained as the L1 step label (the meaningful name of
-the work a step advances); all other prompt/answer/thinking/tool-output text stays
-filtered.
+each node carries a few-word `summary` for display — the todo a step advances
+(`TodoWrite`/`TaskCreate`/`TaskUpdate`), an agent's short task `description`, and a
+trimmed first-line snippet of a human prompt or question. This widens the surface
+to *short intent* metadata only; long-form content — extended thinking, an agent's
+full task prompt, agent output, and human answers — stays filtered.
 
 ## Modules
 

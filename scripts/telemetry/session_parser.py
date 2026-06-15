@@ -53,7 +53,7 @@ def parse_session_file(path: Path) -> ParsedSession:
     records = _load_jsonl(path)
     meta = _session_meta(records)
     results = _tool_results(records)
-    todo_labels = _todo_labels(records)
+    todo_summaries = _todo_summaries(records)
 
     parsed = ParsedSession()
     for rec in records:
@@ -65,7 +65,7 @@ def parse_session_file(path: Path) -> ParsedSession:
         if isinstance(message.get("usage"), dict):
             parsed.usage_events.append(_usage_event(rec, "main", None))
         for block in message.get("content") or []:
-            _consume_tool_use(block, rec, results, meta, path, parsed, todo_labels)
+            _consume_tool_use(block, rec, results, meta, path, parsed, todo_summaries)
 
     parsed.spans.extend(_human_prompt_spans(records, meta))
     return parsed
@@ -96,11 +96,11 @@ def _consume_tool_use(
     meta: dict[str, str | None],
     path: Path,
     parsed: ParsedSession,
-    todo_labels: dict[str, str],
+    todo_summaries: dict[str, str],
 ) -> None:
     if not (isinstance(block, dict) and block.get("type") == "tool_use"):
         return
-    span = _span_for_tool_use(block, rec, results, meta, todo_labels)
+    span = _span_for_tool_use(block, rec, results, meta, todo_summaries)
     if span is None:
         return
     parsed.spans.append(span)
@@ -117,7 +117,7 @@ def _span_for_tool_use(
     rec: dict,
     results: dict[str, dict],
     meta: dict[str, str | None],
-    todo_labels: dict[str, str],
+    todo_summaries: dict[str, str],
 ) -> Span | None:
     name = block.get("name")
     tool_use_id = block.get("id") or ""
@@ -138,31 +138,51 @@ def _span_for_tool_use(
     if name == "Skill":
         return Span(kind="skill", name=inputs.get("skill", "skill"), **common)
     if name in AGENT_TOOLS:
-        return Span(kind="agent", name=inputs.get("subagent_type", "agent"), **common)
+        # summary = the Task tool's short `description`; the long `prompt` is never read.
+        return Span(
+            kind="agent",
+            name=inputs.get("subagent_type", "agent"),
+            summary=_snippet(inputs.get("description")),
+            **common,
+        )
     if name in TODO_TOOLS:
-        todo_name = todo_labels.get(tool_use_id) or (name if isinstance(name, str) else "todo")
-        return Span(kind="todo", name=todo_name, **common)
+        # name stays the bare tool (grouping key); summary names the ledger item.
+        return Span(
+            kind="todo",
+            name=name if isinstance(name, str) else "todo",
+            summary=todo_summaries.get(tool_use_id),
+            **common,
+        )
     if name == "AskUserQuestion":
         human = {"type": "question", "wait_ms": _duration_ms(ts_start, ts_end)}
-        return Span(kind="human", name="AskUserQuestion", human=human, **common)
+        return Span(
+            kind="human",
+            name="AskUserQuestion",
+            summary=_question_snippet(inputs),
+            human=human,
+            **common,
+        )
     return None
 
 
-def _todo_labels(records: list[dict]) -> dict[str, str]:
-    """Map each todo ``tool_use`` id to the item it advances (Issue #47).
+def _todo_summaries(records: list[dict]) -> dict[str, str]:
+    """Map each todo ``tool_use`` id to the few-word item it advances (Issue #47).
 
-    The solo-cycle seeds a ``TodoWrite`` ledger and marks one item ``in_progress``
-    per step. Walking the writes in order and diffing each snapshot's in-progress
-    set against the previous one isolates the item that *newly* entered progress —
-    the step's todo — which becomes the L1 step label. A write with no
-    distinguishable transition falls back to whatever is in progress; a write
-    with nothing in progress yields no label (the span keeps its tool name).
+    Two ledger shapes are resolved into one summary per write:
 
-    UPGRADE: resolve ``TaskCreate``/``TaskUpdate`` (incremental, id-keyed) ledgers
-    too — they carry no full snapshot, so id→subject tracking is a follow-up.
+    - ``TodoWrite`` snapshots: diff each write's in-progress set against the
+      previous one to isolate the item that *newly* entered progress — the step's
+      todo. No distinguishable transition falls back to whatever is in progress;
+      nothing in progress yields no summary (the span keeps its bare tool name).
+    - ``TaskCreate`` / ``TaskUpdate`` (incremental, id-keyed): a ``TaskCreate``
+      summarises to its ``subject`` and is assigned the next sequential id (the
+      runtime numbers them 1, 2, … in creation order); a later ``TaskUpdate``
+      resolves its ``taskId`` back to that subject.
     """
-    labels: dict[str, str] = {}
+    summaries: dict[str, str] = {}
     prev: set[str] = set()
+    subject_by_id: dict[str, str] = {}
+    created = 0
     for rec in records:
         if rec.get("type") != "assistant":
             continue
@@ -172,16 +192,27 @@ def _todo_labels(records: list[dict]) -> dict[str, str]:
         for block in message.get("content") or []:
             if not (isinstance(block, dict) and block.get("type") == "tool_use"):
                 continue
-            if block.get("name") not in TODO_TOOLS:
+            tool = block.get("name")
+            if tool not in TODO_TOOLS:
                 continue
-            label, prev = _derive_todo_label(block.get("input") or {}, prev)
-            if label:
-                labels[block.get("id") or ""] = label
-    return labels
+            inputs = block.get("input") or {}
+            tool_use_id = block.get("id") or ""
+            if tool == "TodoWrite":
+                summary, prev = _derive_todo_summary(inputs, prev)
+            elif tool == "TaskCreate":
+                created += 1
+                summary = _snippet(inputs.get("subject"))
+                if summary:
+                    subject_by_id[str(created)] = summary
+            else:  # TaskUpdate
+                summary = subject_by_id.get(str(inputs.get("taskId")))
+            if summary:
+                summaries[tool_use_id] = summary
+    return summaries
 
 
-def _derive_todo_label(inputs: dict, prev: set[str]) -> tuple[str | None, set[str]]:
-    """The in-progress item text for one ledger write, plus its in-progress set."""
+def _derive_todo_summary(inputs: dict, prev: set[str]) -> tuple[str | None, set[str]]:
+    """The in-progress item for one ``TodoWrite`` snapshot, plus its in-progress set."""
     items = inputs.get("todos")
     if not isinstance(items, list):
         return None, prev
@@ -191,8 +222,36 @@ def _derive_todo_label(inputs: dict, prev: set[str]) -> tuple[str | None, set[st
         if isinstance(item, dict) and item.get("status") == "in_progress" and item.get("content")
     }
     newly = sorted(in_progress - prev)
-    label = newly[0] if newly else (sorted(in_progress)[0] if in_progress else None)
-    return label, in_progress
+    summary = newly[0] if newly else (sorted(in_progress)[0] if in_progress else None)
+    return _snippet(summary), in_progress
+
+
+def _question_snippet(inputs: dict) -> str | None:
+    """A few-word snippet of an ``AskUserQuestion``'s first question."""
+    questions = inputs.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return None
+    first = questions[0]
+    return _snippet(first.get("question")) if isinstance(first, dict) else None
+
+
+def _snippet(text: object, *, max_words: int = 8, max_chars: int = 60) -> str | None:
+    """A trimmed first-line preview of free text — a few words, never the whole thing.
+
+    Returns ``None`` for empty / non-string input. The first line is collapsed to
+    its leading ``max_words`` words and capped at ``max_chars``; an ellipsis marks
+    any truncation so a label never silently looks complete.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    line = text.strip().splitlines()[0].strip()
+    words = line.split()
+    snippet = " ".join(words[:max_words])
+    truncated = len(words) > max_words
+    if len(snippet) > max_chars:
+        snippet = snippet[:max_chars].rstrip()
+        truncated = True
+    return f"{snippet}…" if truncated else snippet
 
 
 def _human_prompt_spans(records: list[dict], meta: dict[str, str | None]) -> list[Span]:
@@ -206,6 +265,7 @@ def _human_prompt_spans(records: list[dict], meta: dict[str, str | None]) -> lis
                 span_id=derive_span_id(meta["session_id"] or "", rec.get("uuid") or ts or ""),
                 kind="human",
                 name="prompt",
+                summary=_snippet(_prompt_text(rec)),
                 session_id=meta["session_id"],
                 repo=meta["repo"] or "unknown",
                 branch=meta["branch"],
@@ -232,6 +292,18 @@ def _is_human_prompt(rec: dict) -> bool:
     has_text = any(isinstance(b, dict) and b.get("type") == "text" for b in content)
     has_tool_result = any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
     return has_text and not has_tool_result
+
+
+def _prompt_text(rec: dict) -> str | None:
+    """The human prompt's text — a plain string or the first text block."""
+    content = (rec.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                return block["text"]
+    return None
 
 
 def _tool_results(records: list[dict]) -> dict[str, dict]:
