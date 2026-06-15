@@ -42,15 +42,21 @@ while #B sits at its own gate) — never one-at-a-time.
 
 After ANCHOR and before writing any code, a PLAN-gated spoke:
 
-1. **Explores the code** and presents a concrete implementation plan — files,
-   approach, test strategy, and **open questions** — in **plan mode** (enter
-   plan mode, present the plan, then exit plan mode to proceed), reusing the
-   harness's existing plan-mode flow rather than a new primitive.
-2. Asks if anything is unclear and **parks for the user to review / challenge /
-   approve before writing code**. The hub planned the *what/why* (the issue);
-   the PLAN gate is the *how* (it needs the codebase in front of it), so scope
-   is not re-litigated twice.
+1. **Explores the code** and **writes the complete plan as a normal visible
+   message** — files, approach, test strategy, and **open questions**. The plan
+   is the message itself, never an empty or abbreviated stub deferred to an
+   approval card.
+2. **Parks** by emitting the `gate/<issue>` marker (below) and **stops** with an
+   explicit "reply to approve, or tell me what to change" — all **before writing
+   code**. The hub planned the *what/why* (the issue); the PLAN gate is the *how*
+   (it needs the codebase in front of it), so scope is not re-litigated twice.
 3. On approval, proceeds into the RED → GREEN → REVIEW → PUSH cycle below.
+
+The git-native `gate/<issue>` park is the **sole** PLAN-gate mechanism — the plan
+is a visible message and the tag is the only park, surfaced to the hub exactly
+the way `ready/<issue>` surfaces completion. There is no separate approval card,
+and no auto-approve shortcut that would disable review at the very moment human
+review of the *how* is wanted.
 
 A **very-clear / trivial / mechanical** task declares no gate and runs
 **autonomous** straight through to `ready/`, exactly as before.
