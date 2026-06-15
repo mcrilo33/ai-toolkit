@@ -44,22 +44,22 @@ SCHEMA_KEYS = {
     "duration_ms",
     "status",
     "human",
+    "summary",
     "tokens_in",
     "tokens_out",
     "cost_usd",
 }
 
-# Every prompt / answer / tool-output string planted in the fixtures. None may
-# appear anywhere in the emitted span data. Todo item text is deliberately NOT
-# here: Issue #47 lifts the privacy filter for the todo ledger (it is the L1
-# step label), so retained todo text is metadata, not a leaked secret.
+# Strings planted in the fixtures that must NEVER appear in span data. Issue #47
+# lifts the filter for short *intent* metadata only — the todo item, the agent's
+# task description, and a trimmed prompt/question snippet become the node summary.
+# The long-form content stays filtered: extended thinking, the agent's full task
+# prompt, agent output / work, and the human's answer.
 SECRETS = (
-    "SECRET_HUMAN_PROMPT",
     "SECRET_THINKING",
     "SECRET_TASK_PROMPT",
     "SECRET_AGENT_OUTPUT",
     "SECRET_AGENT_WORK",
-    "SECRET_Q",
     "SECRET_ANSWER",
 )
 
@@ -90,16 +90,40 @@ class TestSpanKinds:
         assert len(agents) == 1
         assert agents[0].name == "Explore"
 
+    def test_agent_summary_is_the_task_description(self, parsed: ParsedSession) -> None:
+        # Issue #47: the agent node's few-word summary is the Task tool's short
+        # `description` (a 3-5 word task summary), NOT the long private `prompt`.
+        # `name` stays the subagent_type so the Aggregate / A-B views still group.
+        agent = _by_kind(parsed, "agent")[0]
+        assert agent.summary == "explore code"
+        assert agent.name == "Explore"
+
     def test_emits_todo_span(self, parsed: ParsedSession) -> None:
         todos = _by_kind(parsed, "todo")
         assert len(todos) == 1
         assert todos[0].kind == "todo"
 
-    def test_todo_span_named_for_its_in_progress_item(self, parsed: ParsedSession) -> None:
-        # Issue #47: the todo span is named for the ledger item it advances (the
-        # in_progress one), not the bare tool name — that name is the L1 step label.
+    def test_todo_summary_is_its_in_progress_item(self, parsed: ParsedSession) -> None:
+        # Issue #47: the todo node's summary is the in-progress ledger item it
+        # advances (the L1 step label); `name` stays the bare tool for grouping.
         todo = _by_kind(parsed, "todo")[0]
-        assert todo.name == "Add RED telemetry test"
+        assert todo.summary == "Add RED telemetry test"
+        assert todo.name == "TodoWrite"
+
+    def test_human_prompt_summary_is_a_short_snippet(self, parsed: ParsedSession) -> None:
+        # Issue #47: the human-prompt node summarises the prompt in a few words
+        # (a trimmed first-line snippet); `name` stays "prompt" for grouping.
+        prompt = next(
+            s for s in _by_kind(parsed, "human") if s.human and s.human["type"] == "prompt"
+        )
+        assert prompt.summary == "Wire the parser and add tests"
+        assert prompt.name == "prompt"
+
+    def test_question_summary_is_a_short_snippet(self, parsed: ParsedSession) -> None:
+        question = next(
+            s for s in _by_kind(parsed, "human") if s.human and s.human["type"] == "question"
+        )
+        assert question.summary == "Which carrier field should we use"
 
     def test_emits_human_prompt_span(self, parsed: ParsedSession) -> None:
         prompts = [s for s in _by_kind(parsed, "human") if s.human and s.human["type"] == "prompt"]
@@ -218,13 +242,12 @@ class TestTodoLedgerDiff:
 
         todos = sorted(_by_kind(parse_session_file(path), "todo"), key=lambda s: s.ts_start or "")
 
-        assert [t.name for t in todos] == ["Add RED test", "Implement GREEN"]
+        assert [t.summary for t in todos] == ["Add RED test", "Implement GREEN"]
+        assert [t.name for t in todos] == ["TodoWrite", "TodoWrite"]
 
-    def test_todo_write_without_in_progress_item_falls_back_to_tool_name(
-        self, tmp_path: Path
-    ) -> None:
-        # A snapshot with nothing in_progress has no item to advance → the span
-        # keeps the bare tool name as a sane fallback (never crashes, never blank).
+    def test_todo_write_without_in_progress_item_has_no_summary(self, tmp_path: Path) -> None:
+        # A snapshot with nothing in_progress has no item to advance → no summary
+        # is derived; the span keeps its bare tool name (never crashes, never blank).
         records = [
             _assistant_todo(
                 "w1",
@@ -239,6 +262,92 @@ class TestTodoLedgerDiff:
         todo = _by_kind(parse_session_file(path), "todo")[0]
 
         assert todo.name == "TodoWrite"
+        assert todo.summary is None
+
+
+def _assistant_tasks(uuid: str, ts: str, blocks: list[dict]) -> dict:
+    return {
+        "type": "assistant",
+        "sessionId": "task-sess",
+        "cwd": "/Users/demo/Repos/proj",
+        "gitBranch": "feature/47-demo",
+        "timestamp": ts,
+        "uuid": uuid,
+        "message": {"role": "assistant", "model": "claude-opus-4-8", "content": blocks},
+    }
+
+
+class TestTaskLedgerResolution:
+    """Issue #47: TaskCreate/TaskUpdate are id-keyed; resolve to the task subject."""
+
+    def test_task_create_summary_is_its_subject(self, tmp_path: Path) -> None:
+        records = [
+            _assistant_tasks(
+                "a1",
+                "2026-06-15T12:00:01.000Z",
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tc1",
+                        "name": "TaskCreate",
+                        "input": {"subject": "Add RED parser test", "description": "x"},
+                    }
+                ],
+            )
+        ]
+        path = tmp_path / "task-sess.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        todo = _by_kind(parse_session_file(path), "todo")[0]
+
+        assert todo.summary == "Add RED parser test"
+        assert todo.name == "TaskCreate"
+
+    def test_task_update_resolves_to_the_subject_of_the_task_it_updates(
+        self, tmp_path: Path
+    ) -> None:
+        # Two TaskCreates assign ids 1, 2 in creation order; a later TaskUpdate
+        # referencing taskId "2" must name the second task, never a generic label.
+        records = [
+            _assistant_tasks(
+                "a1",
+                "2026-06-15T12:00:01.000Z",
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tc1",
+                        "name": "TaskCreate",
+                        "input": {"subject": "First task"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "tc2",
+                        "name": "TaskCreate",
+                        "input": {"subject": "Second task"},
+                    },
+                ],
+            ),
+            _assistant_tasks(
+                "a2",
+                "2026-06-15T12:01:00.000Z",
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tu1",
+                        "name": "TaskUpdate",
+                        "input": {"taskId": "2", "status": "in_progress"},
+                    }
+                ],
+            ),
+        ]
+        path = tmp_path / "task-sess.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        update = next(
+            s for s in _by_kind(parse_session_file(path), "todo") if s.name == "TaskUpdate"
+        )
+
+        assert update.summary == "Second task"
 
 
 class TestProjectsDirWalk:

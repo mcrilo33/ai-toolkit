@@ -399,8 +399,8 @@ def test_unresolved_node_ignores_malformed_turn_timestamps():
 
 def test_interval_bucket_labelled_by_the_todo_it_advances():
     queries = load_queries()
-    # A resolved todo span (its name is the in-progress item text, not the bare
-    # tool name) sits in the red interval → the L1 bucket is named for that todo.
+    # A resolved todo span (its `summary` carries the in-progress item text) sits
+    # in the red interval → the L1 bucket is named for that todo, not the phase.
     spans = [
         _span("l_spawn", "2026-06-12T12:00:00Z", "2026-06-12T12:00:01Z", **_LIFE_NEW),
         _span("l_anchor", "2026-06-12T12:00:05Z", "2026-06-12T12:00:05Z", phase="anchor"),
@@ -409,7 +409,8 @@ def test_interval_bucket_labelled_by_the_todo_it_advances():
             "2026-06-12T12:00:08Z",
             "2026-06-12T12:00:09Z",
             kind="todo",
-            name="Add RED parser test",
+            name="TodoWrite",
+            summary="Add RED parser test",
             phase=None,
         ),
         _span("l_red", "2026-06-12T12:00:15Z", "2026-06-12T12:00:15Z", phase="red"),
@@ -423,7 +424,7 @@ def test_interval_bucket_labelled_by_the_todo_it_advances():
 
 def test_bucket_falls_back_to_phase_name_when_no_todo_resolves():
     queries = load_queries()
-    # A bare-tool-name todo (unresolved, no in-progress item derived) must NOT
+    # A todo with no derived summary (unresolved in-progress item) must NOT
     # override the phase label — the bucket stays named for its phase.
     spans = [
         _span("f_spawn", "2026-06-12T12:00:00Z", "2026-06-12T12:00:01Z", **_LIFE_NEW),
@@ -434,6 +435,7 @@ def test_bucket_falls_back_to_phase_name_when_no_todo_resolves():
             "2026-06-12T12:00:09Z",
             kind="todo",
             name="TodoWrite",
+            summary=None,
             phase=None,
         ),
         _span("f_red", "2026-06-12T12:00:15Z", "2026-06-12T12:00:15Z", phase="red"),
@@ -456,7 +458,8 @@ def test_latest_resolved_todo_in_the_interval_wins():
             "2026-06-12T12:00:08Z",
             "2026-06-12T12:00:09Z",
             kind="todo",
-            name="First item",
+            name="TodoWrite",
+            summary="First item",
             phase=None,
         ),
         _span(
@@ -464,7 +467,8 @@ def test_latest_resolved_todo_in_the_interval_wins():
             "2026-06-12T12:00:12Z",
             "2026-06-12T12:00:13Z",
             kind="todo",
-            name="Second item",
+            name="TodoWrite",
+            summary="Second item",
             phase=None,
         ),
         _span("m_red", "2026-06-12T12:00:15Z", "2026-06-12T12:00:15Z", phase="red"),
@@ -473,6 +477,17 @@ def test_latest_resolved_todo_in_the_interval_wins():
     forest = queries.SpanStore.from_events(spans).spoke_steps("ka/run+1")
 
     assert _bucket(forest, "Second item")
+
+
+def test_format_step_label_prefers_summary_over_name():
+    queries = load_queries()
+    # A node carrying a few-word summary renders it as the label; name stays the
+    # stable id underneath for grouping. Falls back to name when no summary.
+    agent = {"kind": "agent", "name": "Plan", "phase": None, "summary": "review S1 changes"}
+    bare = {"kind": "agent", "name": "Plan", "phase": None, "summary": None}
+
+    assert queries.format_step_label(agent) == "review S1 changes"
+    assert queries.format_step_label(bare) == "Plan"
 
 
 # --- S4: meta-by-kind aggregation -----------------------------------------------
