@@ -109,8 +109,10 @@ Environment variables:
 > group same-granularity spans, so they never double-count. The v2 Spoke view
 > does **not** use that overlapping per-span cost — it attributes each turn's
 > cost to exactly one node and rolls it up, so its subtree totals are an
-> additive, trustworthy ledger (any turn it can't place in a span surfaces in an
-> "(untracked)" row).
+> additive, trustworthy ledger. Main-agent turns attribute to their reconstructed
+> **phase interval** (the `step`/`lifecycle` marker spine), subagent turns to
+> their `agent` span; a main turn off the lifecycle envelope (or with an
+> unparseable timestamp) surfaces in an "(unresolved)" row.
 
 ## Tests
 

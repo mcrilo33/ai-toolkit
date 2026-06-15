@@ -61,9 +61,11 @@ def _find_kind(nodes, kind):
 def test_spoke_steps_attributes_model_and_agent_over_real_dataset():
     forest = _telemetry_store().spoke_steps(SPOKE_RUN_ID)
 
-    # The lifecycle/step spine surfaces as the real-span roots, time-ordered.
-    spine = [n["span_id"] for n in forest if n["span_id"] is not None]
-    assert spine == ["push000life01", "push000step01", "push000life02"]
+    # Level-1 roots are reconstructed phase-interval buckets (#46), time-ordered:
+    # spawn + the first `red` step collapse into `setup`; the trailing lifecycle
+    # keeps its `teardown` label. The raw marker spans nest beneath as children.
+    assert [n["name"] for n in forest] == ["setup", "teardown"]
+    assert all(n["span_id"] is None for n in forest)
 
     # Subagent turns from the walked transcript attribute to the agent node, with
     # its own model — proving #22's turns relation flows through from_telemetry.
