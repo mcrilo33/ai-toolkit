@@ -1,0 +1,365 @@
+"""v2 Spoke-view query tests (Issue #35).
+
+The v2 spoke view fixes the v1 flat dump: real spans carry ``parent_id: null``,
+so the tree is reconstructed by *time-bracketing* (smallest-enclosing window).
+``spoke_steps`` returns the Level-1 spine (lifecycle/step) with sub-steps and raw
+spans nested by their windows, hooks collapsed into one line, and metrics rolled
+up. These tests pin the structural side (S2); cost/model attribution (S3) and
+meta-by-kind (S4) are tested separately.
+"""
+
+from __future__ import annotations
+
+import pytest
+from _dashboard_helpers import FIXTURE_V2_SPANS, load_queries, store_v2
+
+RUN = "feature/v2+1000"
+
+
+def _find(nodes, span_id):
+    """Depth-first lookup by span_id within a forest (raises if absent)."""
+    for node in nodes:
+        if node["span_id"] == span_id:
+            return node
+        try:
+            return _find(node["children"], span_id)
+        except KeyError:
+            continue
+    raise KeyError(span_id)
+
+
+def _kinds(nodes):
+    return sorted(n["kind"] for n in nodes)
+
+
+def test_level1_is_the_spine_in_time_order():
+    forest = store_v2().spoke_steps(RUN)
+
+    # Roots are the lifecycle/step spine, ordered by ts_start — no flat dump,
+    # no hook or pull span leaking to the top level. (A synthetic untracked-turns
+    # node may also be a root; the real-span spine is what's pinned here.)
+    spine = [n["span_id"] for n in forest if n["span_id"] is not None]
+    assert spine == ["v2_life_new", "v2_red", "v2_green", "v2_life_done"]
+
+
+def test_substeps_nest_under_their_step_by_time():
+    forest = store_v2().spoke_steps(RUN)
+    red = _find(forest, "v2_red")
+
+    # red brackets a skill, a todo, and two hooks (collapsed) — by window only.
+    assert _kinds(red["children"]) == ["hooks", "skill", "todo"]
+
+
+def test_hooks_collapse_into_one_expandable_node():
+    forest = store_v2().spoke_steps(RUN)
+    red = _find(forest, "v2_red")
+    hooks = next(c for c in red["children"] if c["kind"] == "hooks")
+
+    assert hooks["collapsed_count"] == 2
+    assert hooks["duration_ms"] == 180  # 100 + 80, summed
+    # The raw hook spans remain reachable for expansion.
+    assert {c["span_id"] for c in hooks["children"]} == {"v2_red_hook1", "v2_red_hook2"}
+
+
+def test_collapsed_hooks_surface_worst_status():
+    forest = store_v2().spoke_steps(RUN)
+    red = _find(forest, "v2_red")
+    hooks = next(c for c in red["children"] if c["kind"] == "hooks")
+
+    # One hook warned — the collapsed line must not hide it behind "success".
+    assert hooks["status"] == "warn"
+
+
+def test_third_level_nests_agent_under_skill():
+    forest = store_v2().spoke_steps(RUN)
+    skill = _find(forest, "v2_skill")
+
+    # The agent ran inside the skill's window → depth-3 drill-down.
+    assert [c["span_id"] for c in skill["children"]] == ["v2_agent"]
+
+
+def test_identical_window_siblings_do_not_nest():
+    forest = store_v2().spoke_steps(RUN)
+    green = _find(forest, "v2_green")
+
+    # Three TaskCreate spans share one window; none parents another, no hooks.
+    todos = [c for c in green["children"] if c["kind"] == "todo"]
+    assert {c["span_id"] for c in todos} == {"v2_task1", "v2_task2", "v2_task3"}
+    assert all(not c["children"] for c in todos)
+
+
+def test_step_shows_own_wallclock_duration_not_a_rolled_sum():
+    forest = store_v2().spoke_steps(RUN)
+    red = _find(forest, "v2_red")
+
+    # Duration is the step's own wall-clock, never a sum of overlapping children.
+    assert red["duration_ms"] == 50000
+
+
+def test_human_count_rolls_up_without_double_counting():
+    forest = store_v2().spoke_steps(RUN)
+    green = _find(forest, "v2_green")
+
+    # One human interaction (the approval) under green, counted once.
+    assert green["rollup"]["human_count"] == 1
+    assert _find(forest, "v2_red")["rollup"]["human_count"] == 0
+
+
+def test_unknown_spoke_returns_empty_forest():
+    assert store_v2().spoke_steps("does/not+exist") == []
+
+
+# --- S3: once-per-turn cost + model/agent attribution --------------------------
+
+
+def _roots(forest, kind):
+    return [n for n in forest if n["kind"] == kind]
+
+
+def test_subagent_turns_attribute_to_the_agent_node():
+    forest = store_v2().spoke_steps(RUN)
+    agent = _find(forest, "v2_agent")
+
+    # The two subagent turns (haiku) land on the agent node, not the main spine.
+    assert agent["own_cost_usd"] == pytest.approx(0.35)
+    assert agent["own_tokens_in"] == 350
+    assert agent["own_tokens_out"] == 180
+    assert agent["models"] == ["claude-haiku-4-5"]
+    assert agent["agent"] == "subagent"
+
+
+def test_main_turn_attributes_to_deepest_non_agent_span():
+    forest = store_v2().spoke_steps(RUN)
+    skill = _find(forest, "v2_skill")
+
+    # The 12:00:10 main turn falls inside the skill window → owned by the skill,
+    # never by the agent nested within it.
+    assert skill["own_cost_usd"] == pytest.approx(0.05)
+    assert skill["models"] == ["claude-opus-4-8"]
+    assert skill["agent"] == "main"
+
+
+def test_identical_window_turn_counted_once_not_per_sibling():
+    forest = store_v2().spoke_steps(RUN)
+    green = _find(forest, "v2_green")
+    tasks = [c for c in green["children"] if c["kind"] == "todo"]
+
+    # One turn brackets three identical-window TaskCreate spans; its cost lands on
+    # exactly one of them — never replicated across all three.
+    own = [t["own_cost_usd"] for t in tasks]
+    assert sum(own) == pytest.approx(0.03)
+    assert sum(1 for c in own if c > 0) == 1
+
+
+def test_step_rollup_sums_owned_turns_without_double_count():
+    forest = store_v2().spoke_steps(RUN)
+    red = _find(forest, "v2_red")
+    green = _find(forest, "v2_green")
+
+    # red: own 0.02 + skill 0.05 + agent 0.35 + todo 0.01 + hooks 0 = 0.43
+    assert red["rollup"]["cost_usd"] == pytest.approx(0.43)
+    # green: tasks 0.03 (once) + ask 0.02 = 0.05  (not 0.09)
+    assert green["rollup"]["cost_usd"] == pytest.approx(0.05)
+
+
+def test_rollup_models_bubble_up_distinct_and_sorted():
+    forest = store_v2().spoke_steps(RUN)
+    red = _find(forest, "v2_red")
+    green = _find(forest, "v2_green")
+
+    assert red["rollup"]["models"] == ["claude-haiku-4-5", "claude-opus-4-8"]
+    assert green["rollup"]["models"] == ["claude-opus-4-8", "claude-sonnet-4-6"]
+
+
+def test_orphan_turns_surface_in_an_untracked_node():
+    forest = store_v2().spoke_steps(RUN)
+    untracked = _roots(forest, "untracked")
+
+    assert len(untracked) == 1
+    assert untracked[0]["own_cost_usd"] == pytest.approx(0.005)
+
+
+def test_run_total_reconciles_to_the_turn_costs():
+    forest = store_v2().spoke_steps(RUN)
+
+    # Every turn counted exactly once → the forest's rolled-up cost equals the
+    # sum of all turn costs (0.495), the trustworthy run total.
+    total = sum(root["rollup"]["cost_usd"] for root in forest)
+    assert total == pytest.approx(0.495)
+
+
+def test_raw_path_without_turns_has_zero_owned_cost():
+    queries = load_queries()
+    store = queries.SpanStore.from_jsonl(FIXTURE_V2_SPANS)  # no turns table data
+    red = _find(store.spoke_steps(RUN), "v2_red")
+
+    assert red["rollup"]["cost_usd"] == 0.0
+    assert red["own_cost_usd"] == 0.0
+
+
+def test_spoke_steps_without_turns_table_degrades_gracefully():
+    # A connection predating the turns relation (the #22 from_connection seam)
+    # has no turns table; spoke_steps must degrade, not raise.
+    store = store_v2()
+    store.con.execute("DROP TABLE turns")
+
+    red = _find(store.spoke_steps(RUN), "v2_red")
+
+    assert red["rollup"]["cost_usd"] == 0.0
+
+
+def test_untracked_node_ignores_malformed_turn_timestamps():
+    queries = load_queries()
+    spans = queries.load_jsonl(FIXTURE_V2_SPANS)
+    turns = [
+        {
+            "session_id": "sess-v2",
+            "ts": "not-a-date",
+            "model": "claude-opus-4-8",
+            "source": "main",
+            "agent_id": None,
+            "tokens_in": 5,
+            "tokens_out": 2,
+            "tokens_total": 7,
+            "cost_usd": 0.01,
+        }
+    ]
+    store = queries.SpanStore.from_events(spans, turns=turns)
+
+    untracked = _roots(store.spoke_steps(RUN), "untracked")
+
+    # The turn is still counted, but its garbage ts never frames the window.
+    assert len(untracked) == 1
+    assert untracked[0]["own_cost_usd"] == pytest.approx(0.01)
+    assert untracked[0]["ts_start"] is None
+
+
+# --- S4: meta-by-kind aggregation ----------------------------------------------
+
+
+def _by_kind(rows):
+    return {row["kind"]: row for row in rows}
+
+
+def test_meta_by_kind_counts_each_span_kind():
+    meta = _by_kind(store_v2().spoke_meta_by_kind(RUN))
+
+    assert meta["hook"]["count"] == 2  # "launched too much" signal lives here
+    assert meta["todo"]["count"] == 4  # TodoWrite + 3 TaskCreate
+    assert meta["step"]["count"] == 2
+    assert meta["lifecycle"]["count"] == 2
+    assert meta["agent"]["count"] == 1
+
+
+def test_meta_by_kind_time_stats_are_real_durations():
+    meta = _by_kind(store_v2().spoke_meta_by_kind(RUN))
+
+    # Hooks: 100 + 80 = 180 total, median of the two = 90.
+    assert meta["hook"]["total_duration_ms"] == 180
+    assert meta["hook"]["median_duration_ms"] == 90
+    assert meta["todo"]["median_duration_ms"] == 1000
+
+
+def test_meta_by_kind_cost_is_deduped_owned_cost():
+    meta = _by_kind(store_v2().spoke_meta_by_kind(RUN))
+
+    # Owned (once-per-turn) cost grouped by kind — never the bracketed span cost.
+    assert meta["agent"]["total_cost_usd"] == pytest.approx(0.35)
+    assert meta["skill"]["total_cost_usd"] == pytest.approx(0.05)
+    assert meta["todo"]["total_cost_usd"] == pytest.approx(0.04)  # 0.01 + 0.03, once
+    assert meta["step"]["total_cost_usd"] == pytest.approx(0.02)  # red own only
+    assert meta["human"]["total_cost_usd"] == pytest.approx(0.02)
+    assert meta["lifecycle"]["total_cost_usd"] == pytest.approx(0.01)
+    assert meta["hook"]["total_cost_usd"] == pytest.approx(0.0)
+
+
+def test_meta_by_kind_sorts_by_cost_then_count_then_kind():
+    rows = store_v2().spoke_meta_by_kind(RUN)
+
+    # total cost desc, then count desc (step 2 before human 1 at equal 0.02), then
+    # kind asc — a deterministic order the meta table renders in.
+    assert [row["kind"] for row in rows] == [
+        "agent",
+        "skill",
+        "todo",
+        "step",
+        "human",
+        "lifecycle",
+        "hook",
+    ]
+
+
+def test_meta_by_kind_surfaces_models_per_kind():
+    meta = _by_kind(store_v2().spoke_meta_by_kind(RUN))
+
+    assert meta["agent"]["models"] == ["claude-haiku-4-5"]
+
+
+def test_meta_by_kind_total_reconciles_minus_untracked():
+    rows = store_v2().spoke_meta_by_kind(RUN)
+
+    # Each turn is owned once; summed across span kinds that is the run total
+    # minus the untracked (non-span) turns: 0.495 - 0.005 = 0.49.
+    total = sum(row["total_cost_usd"] for row in rows)
+    assert total == pytest.approx(0.49)
+
+
+def test_meta_by_kind_unknown_spoke_is_empty():
+    assert store_v2().spoke_meta_by_kind("does/not+exist") == []
+
+
+# --- S5: display formatting helpers (the thin glue app.py renders) --------------
+
+
+def test_format_step_label_per_kind():
+    queries = load_queries()
+    forest = store_v2().spoke_steps(RUN)
+    red = _find(forest, "v2_red")
+    hooks = next(c for c in red["children"] if c["kind"] == "hooks")
+
+    assert queries.format_step_label(red) == "solo-cycle · red"
+    assert queries.format_step_label(hooks) == "hooks x2"  # collapsed count
+    assert queries.format_step_label(_find(forest, "v2_agent")) == "tdd-red"
+
+
+def test_format_step_metrics_rolls_up_for_a_step():
+    queries = load_queries()
+    red = _find(store_v2().spoke_steps(RUN), "v2_red")
+
+    metrics = queries.format_step_metrics(red)
+
+    assert metrics["time"] == "50.0s"  # own wall-clock
+    assert metrics["cost"] == "$0.4300"  # rolled-up, de-duped
+    assert metrics["tokens"] == "740"
+    assert metrics["model"] == "haiku-4-5, opus-4-8"  # claude- prefix stripped
+    assert metrics["agent"] == "main"
+    assert metrics["status"] == "success"
+
+
+def test_format_step_metrics_marks_subagent():
+    queries = load_queries()
+    agent = _find(store_v2().spoke_steps(RUN), "v2_agent")
+
+    metrics = queries.format_step_metrics(agent)
+
+    assert metrics["agent"] == "subagent"
+    assert metrics["model"] == "haiku-4-5"
+
+
+def test_format_step_metrics_rolls_up_human_count():
+    queries = load_queries()
+    forest = store_v2().spoke_steps(RUN)
+
+    assert queries.format_step_metrics(_find(forest, "v2_green"))["humans"] == "1"
+    assert queries.format_step_metrics(_find(forest, "v2_red"))["humans"] == "—"
+
+
+def test_format_step_metrics_blanks_zero_values():
+    queries = load_queries()
+    done = _find(store_v2().spoke_steps(RUN), "v2_life_done")
+
+    metrics = queries.format_step_metrics(done)
+
+    assert metrics["cost"] == "—"
+    assert metrics["tokens"] == "—"
+    assert metrics["model"] == "—"

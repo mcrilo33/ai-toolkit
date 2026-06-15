@@ -134,6 +134,46 @@ class TestRobustness:
         assert row == ("unknown", 0, "success")
 
 
+class TestTurns:
+    """The per-turn relation the v2 dashboard needs for model + once-per-turn cost.
+
+    One row per assistant usage event (``main`` and walked ``subagent`` turns),
+    carrying model and a per-turn cost computed from the same session rate the
+    span attribution uses. Unlike the overlapping span costs, every turn is
+    counted exactly once, so the turn costs sum to the ccusage session total.
+    """
+
+    def test_turns_table_holds_main_and_subagent_sources(self, con) -> None:
+        sources = set(_flat(con.execute("SELECT DISTINCT source FROM turns").fetchall()))
+        assert sources == {"main", "subagent"}
+
+    def test_turns_count_main_and_subagent(self, con) -> None:
+        # main a1..a4 (4) + walked subagent s2,s3 (2).
+        (n,) = con.execute(
+            "SELECT count(*) FROM turns WHERE session_id = ?", [SESSION_ID]
+        ).fetchone()
+        assert n == 6
+
+    def test_turns_carry_model(self, con) -> None:
+        models = set(_flat(con.execute("SELECT DISTINCT model FROM turns").fetchall()))
+        assert models == {"claude-opus-4-8"}
+
+    def test_subagent_turns_carry_agent_id(self, con) -> None:
+        (n,) = con.execute(
+            "SELECT count(*) FROM turns WHERE source = 'subagent' AND agent_id = ?",
+            ["aaaa1111bbbb2222"],
+        ).fetchone()
+        assert n == 2
+
+    def test_per_turn_cost_sums_to_ccusage_session_total(self, con) -> None:
+        # Every turn counted once → the session's turn costs reconcile to ccusage
+        # exactly (no double-count, no unattributed parent turn).
+        (total,) = con.execute(
+            "SELECT sum(cost_usd) FROM turns WHERE session_id = ?", [SESSION_ID]
+        ).fetchone()
+        assert total == pytest.approx(2.80)
+
+
 class TestMissingEvents:
     def test_missing_events_file_yields_pull_only(self) -> None:
         connection = connect(

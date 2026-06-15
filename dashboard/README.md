@@ -23,9 +23,14 @@ Everything runs on your machine and nothing is ever exported.
 
 ## The views
 
-1. **Spoke** — pick a `spoke_run_id` and drill down the step/sub-step tree
-   (lifecycle → cycle phase → hook), each node showing time, token cost, status,
-   and human interactions, with per-subtree rollups.
+1. **Spoke** — pick a `spoke_run_id` and drill down a collapse-to-steps view:
+   the lifecycle/step spine (spawn · RED · GREEN · REVIEW · PUSH · land …) with
+   rolled-up time, tokens, cost, **model(s)**, and **main/subagent** attribution;
+   expand a step to drill into its sub-steps and raw spans. Hooks collapse into
+   one line so the signal spans lead. A **Meta by kind** tab aggregates the
+   spoke's spans per kind (counts + time/cost stats) to spot "launched too much".
+   Nesting is reconstructed by time-bracketing (spans carry no `parent_id`) and
+   cost is counted **once per turn**, so the totals are trustworthy.
 2. **Aggregate** — pick a time window and roll the tree up across all spokes:
    per-step frequency, totals, and per-invocation mean/median for time and cost.
    Shows where time and tokens actually go.
@@ -76,6 +81,9 @@ dashboard/run.sh                 # read the default span log
 dashboard/run.sh path/to/events.jsonl
 ```
 
+`run.sh` binds a free ephemeral port (so it never collides with another
+Streamlit on the default `8501`); set `STREAMLIT_SERVER_PORT` to pin one.
+
 ### Span source
 
 The sidebar chooses the data source:
@@ -96,11 +104,13 @@ Environment variables:
 | `AI_TOOLKIT_PROJECTS_DIR` | Claude session-logs root (correlated mode) | `~/.claude/projects` |
 
 > [!NOTE]
-> Spans are hierarchical: a `step` span's cost already includes the skill/agent
-> spans nested inside it. The aggregate and A/B views group same-granularity
-> spans, so they never double-count. The Spoke view's per-subtree rollup does
-> sum a node with its descendants — read it as a rough subtree total, not an
-> additive cost ledger.
+> The upstream per-span cost is hierarchical: a `step` span's cost already
+> includes the skill/agent spans nested inside it. The aggregate and A/B views
+> group same-granularity spans, so they never double-count. The v2 Spoke view
+> does **not** use that overlapping per-span cost — it attributes each turn's
+> cost to exactly one node and rolls it up, so its subtree totals are an
+> additive, trustworthy ledger (any turn it can't place in a span surfaces in an
+> "(untracked)" row).
 
 ## Tests
 

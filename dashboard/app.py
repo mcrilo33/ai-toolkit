@@ -110,30 +110,76 @@ _STATUS_ICON = {
 }
 
 
-def _render_node(node: dict, depth: int = 0) -> None:
-    indent = "&nbsp;&nbsp;&nbsp;&nbsp;" * depth  # markdown-rendered indent per depth
+_STEP_COLS = [5, 1, 1, 1, 1, 2, 1]
+_STEP_HEADERS = ("Step", "Time", "Cost", "Tokens", "Human", "Model", "Agent")
+
+
+def _node_row(node: dict, depth: int) -> None:
+    """One drill-down row: indented label + rolled-up metric columns."""
+    indent = "&nbsp;&nbsp;&nbsp;&nbsp;" * depth
     icon = _STATUS_ICON.get(node["status"], "•")
-    label = node["name"]
-    if node["phase"]:
-        label += f" · {node['phase']}"
-    human = ""
-    if node["human_count"]:
-        human = f"  👤 {node['human_type']} ({_fmt_secs(node['human_wait_ms'])})"
+    metrics = queries.format_step_metrics(node)
+    cols = st.columns(_STEP_COLS)
+    cols[0].markdown(f"{indent}{icon} `{node['kind']}` **{queries.format_step_label(node)}**")
+    cols[1].markdown(metrics["time"])
+    cols[2].markdown(metrics["cost"])
+    cols[3].markdown(metrics["tokens"])
+    cols[4].markdown(metrics["humans"])
+    cols[5].markdown(metrics["model"])
+    cols[6].markdown(metrics["agent"])
 
-    cols = st.columns([5, 1, 1, 1])
-    cols[0].markdown(f"{indent}{icon} `{node['kind']}` **{label}**{human}")
-    cols[1].markdown(_fmt_secs(node["duration_ms"]))
-    cols[2].markdown(_fmt_cost(node["cost_usd"]))
-    tokens = (node["tokens_in"] or 0) + (node["tokens_out"] or 0)
-    cols[3].markdown(f"{tokens:,} tok" if tokens else "—")
 
-    for child in node["children"]:
-        _render_node(child, depth + 1)
+def _render_descendants(nodes: list[dict], depth: int) -> None:
+    """Render a node's subtree as indented rows; collapsed hooks stay one line."""
+    for node in nodes:
+        _node_row(node, depth)
+        # A hooks node is the collapsed line itself — never expand its children.
+        if node["kind"] != "hooks":
+            _render_descendants(node["children"], depth + 1)
+
+
+def _render_step(root: dict) -> None:
+    """A Level-1 step row (rolled-up metrics, collapsed) with a drill expander.
+
+    Streamlit forbids nesting expanders, so the whole subtree drills inside one
+    expander as indented rows rather than per-level expanders.
+    """
+    _node_row(root, 0)
+    if root["children"]:
+        with st.expander(f"↳ drill into {queries.format_step_label(root)}", expanded=False):
+            _render_descendants(root["children"], 1)
+
+
+def _render_meta(store: queries.SpanStore, spoke_id: str) -> None:
+    rows = store.spoke_meta_by_kind(spoke_id)
+    if not rows:
+        st.info("No spans to aggregate for this spoke.")
+        return
+    table = [
+        {
+            "Kind": row["kind"],
+            "Count": row["count"],
+            "Total time": _fmt_secs(row["total_duration_ms"]),
+            "Median time": _fmt_secs(row["median_duration_ms"]),
+            "Total cost": _fmt_cost(row["total_cost_usd"]),
+            "Mean cost": _fmt_cost(row["mean_cost_usd"]),
+            "Models": ", ".join(queries._short_model(m) for m in row["models"]) or "—",
+        }
+        for row in rows
+    ]
+    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.caption(
+        "Cost is counted once per turn; summed across kinds it is the run total "
+        "minus any untracked (non-span) turns."
+    )
 
 
 def render_spoke_view(store: queries.SpanStore) -> None:
     st.header("Spoke view")
-    st.caption("One spoke run, drilled down: step → sub-step → hook.")
+    st.caption(
+        "Collapse-to-steps drill-down: main steps with rolled-up metrics; expand a "
+        "step to drill into sub-steps and spans. Hooks collapse into one line."
+    )
 
     spoke_ids = store.spoke_run_ids()
     if not spoke_ids:
@@ -141,15 +187,21 @@ def render_spoke_view(store: queries.SpanStore) -> None:
         return
 
     spoke_id = st.selectbox("Spoke run", spoke_ids)
-    tree = store.spoke_tree(spoke_id)
+    steps_tab, meta_tab = st.tabs(["Steps", "Meta by kind"])
 
-    head = st.columns([5, 1, 1, 1])
-    head[0].markdown("**Step**")
-    head[1].markdown("**Time**")
-    head[2].markdown("**Cost**")
-    head[3].markdown("**Tokens**")
-    for root in tree:
-        _render_node(root)
+    with steps_tab:
+        forest = store.spoke_steps(spoke_id)
+        if not forest:
+            st.info("No spans for this spoke run.")
+        else:
+            head = st.columns(_STEP_COLS)
+            for col, name in zip(head, _STEP_HEADERS, strict=True):
+                col.markdown(f"**{name}**")
+            for root in forest:
+                _render_step(root)
+
+    with meta_tab:
+        _render_meta(store, spoke_id)
 
 
 def _step_label(row: dict[str, Any]) -> str:
