@@ -368,6 +368,54 @@ def test_empty_stdin_runs_nothing(repo: Path, tmp_path: Path) -> None:
     assert "RUN" not in _runlog(runlog)
 
 
+# --- tag-only marker pushes: carry no code, skip the suite (issue #45) ------------
+
+
+def test_tag_only_push_runs_nothing(repo: Path, tmp_path: Path) -> None:
+    # Pushing a marker tag (ready/N, gate/N) carries no new code — the testable
+    # unit is the branch push, not the pointer. A tag-only push must skip the
+    # suite even though the tagged commit (ahead of the default branch) touches
+    # python, which would otherwise trip the merge-base fallback into testmon.
+    _git(repo, "checkout", "-q", "-b", "feature/ahead")
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, ZERO_SHA, "refs/tags/ready/45"), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN" not in _runlog(runlog), "a tag-only push must not run the suite"
+
+
+def test_tag_only_push_with_shell_change_runs_nothing(repo: Path, tmp_path: Path) -> None:
+    # Even a tag over a .sh change (which would otherwise force the FULL suite)
+    # is skipped — it is the tag ref, not the code, that is being pushed.
+    _git(repo, "checkout", "-q", "-b", "feature/ahead")
+    tip = _commit(repo, {"scripts/do.sh": "#!/bin/sh\necho hi\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, ZERO_SHA, "refs/tags/gate/45"), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN" not in _runlog(runlog)
+
+
+def test_branch_and_tag_mix_runs_the_suite(repo: Path, tmp_path: Path) -> None:
+    # A push that carries a branch ref alongside a tag is NOT tag-only — the
+    # branch carries code, so the suite runs as usual.
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    stdin = _stdin(tip, base, "refs/heads/feature/x") + _stdin(tip, ZERO_SHA, "refs/tags/ready/45")
+
+    proc = _run_select(repo, stdin, tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "--testmon" in _runlog(runlog), "a branch+tag push still tests the branch"
+
+
 # --- safe fallback: no pytest at all ---------------------------------------------
 
 
