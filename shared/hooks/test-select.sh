@@ -114,10 +114,18 @@ default_branch() {
 # ── Resolve the changed files across every pushed ref ───────────────────────────
 CANNOT_PROVE=0
 FILES=""
+SAW_TAG_REF=0
+SAW_NONTAG_REF=0
 DEFAULT="$(default_branch)"
 while read -r _lref lsha _rref rsha; do
   [ -n "${lsha:-}" ] || continue
   if is_zero_sha "$lsha"; then continue; fi   # deleting a ref — nothing added
+  # Track ref kind for the tag-only short-circuit below: a marker (ready/N,
+  # gate/N) is pushed as a refs/tags/* ref and carries no new code (#45).
+  case "$_lref" in
+    refs/tags/*) SAW_TAG_REF=1 ;;
+    *)           SAW_NONTAG_REF=1 ;;
+  esac
   if is_zero_sha "${rsha:-0}"; then
     base="$(git merge-base "$DEFAULT" "$lsha" 2>/dev/null || true)"
     [ -n "$base" ] || { CANNOT_PROVE=1; continue; }
@@ -131,6 +139,17 @@ while read -r _lref lsha _rref rsha; do
     CANNOT_PROVE=1   # range unresolved → can't prove safe
   fi
 done <<< "$STDIN"
+
+# ── Tag-only marker push: carries no code, skip the suite (issue #45) ────────────
+# A push whose every ref is refs/tags/* (no branch refs) only moves a pointer —
+# the shipped unit is the branch push, which runs the suite on its own. So
+# emitting a marker (ready/N completion, gate/N PLAN-gate park) never re-runs the
+# ~5-min suite for a tag that introduces nothing. Guards a hand-typed
+# `git push origin <tag>` too, not just spoke-ready.sh.
+if [ "$SAW_TAG_REF" = "1" ] && [ "$SAW_NONTAG_REF" = "0" ]; then
+  note "tag-only push (no branch refs) — marker carries no code, skipping suite"
+  exit 0
+fi
 
 # ── Decide the tier ─────────────────────────────────────────────────────────────
 # A *.py file is code even when it lives under docs/ (e.g. docs/conf.py): classify
