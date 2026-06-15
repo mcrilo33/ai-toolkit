@@ -1,9 +1,10 @@
 """The unified span — the frozen v1 contract from Issue #21.
 
 This is the Python mirror of ``docs/telemetry-span-schema.md``. The parser emits
-spans of this exact shape (18 fields, in schema order); the correlation pass
-fills ``tokens_in`` / ``tokens_out`` / ``cost_usd``. The shape is reused
-verbatim — no divergent fields are added here.
+spans of this exact shape, in schema order; the correlation pass fills
+``tokens_in`` / ``tokens_out`` / ``cost_usd``. The frozen field set is reused
+verbatim, plus the additive, optional, pull-only ``summary`` field (Issue #47)
+that push emitters never set.
 
 Note: the issue text mentions a ``cache_read`` metric, but the frozen v1 span has
 no such field. Cache-read tokens are tracked internally during correlation (they

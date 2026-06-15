@@ -28,7 +28,8 @@ from telemetry.session_parser import ParsedSession, parse_projects_dir
 from telemetry.spans import SPAN_FIELDS, SPAN_KINDS, Span
 from telemetry.spoke_runs import backfill_spoke_run_ids
 
-# Table columns: the 18 frozen span fields with `human` flattened to two columns.
+# Table columns: the frozen span fields (incl. the additive pull-only `summary`,
+# Issue #47) with `human` flattened to `human_type` / `human_wait_ms`.
 _COLUMNS = (
     "span_id VARCHAR",
     "parent_id VARCHAR",
