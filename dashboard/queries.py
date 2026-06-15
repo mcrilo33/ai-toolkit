@@ -20,6 +20,7 @@ nothing is re-derived here.
 from __future__ import annotations
 
 import json
+import re
 import statistics
 import sys
 from collections.abc import Iterator
@@ -110,6 +111,23 @@ def _row_tuple(span: dict[str, Any]) -> tuple[Any, ...]:
         "human_wait_ms": human.get("wait_ms"),
     }
     return tuple(values.get(name) for name in _COLUMN_NAMES)
+
+
+_SPOKE_ISSUE_RE = re.compile(r"^(\d+)-")
+
+
+def _issue_from_spoke_run_id(spoke_run_id: str | None) -> str | None:
+    """Parse the issue number out of a ``<type>/<issue>-<slug>+<epoch>`` run id.
+
+    Returns the leading-digits issue of the branch slug, or ``None`` for an
+    ad-hoc/express run whose slug has no leading number (e.g. ``feature/a+1000``).
+    """
+    if not spoke_run_id:
+        return None
+    branch = spoke_run_id.rsplit("+", 1)[0]
+    slug = branch.rsplit("/", 1)[-1]
+    match = _SPOKE_ISSUE_RE.match(slug)
+    return match.group(1) if match else None
 
 
 class SpanStore:
@@ -224,6 +242,36 @@ class SpanStore:
             reverse=True,
         )
         return [row["spoke_run_id"] for row in rows]
+
+    def morning_rows(self, triage: dict[str, str] | None = None) -> list[dict[str, Any]]:
+        """The night-mode 'morning' lens: one row per spoke run, newest-first.
+
+        A filtered view over the SAME #35 data (AC#6 "morning view shared with
+        #35"): each spoke run with its issue (parsed from the ``spoke_run_id``),
+        its authoritative per-run cost (reused from the ``spoke_run_summary`` view
+        when this store is the correlated/telemetry one — ``None`` over a raw-JSONL
+        fixture that has no such view), and a land-readiness annotation from the
+        night's land-triage cache. ``triage`` maps issue -> ``clean``/``conflict``
+        (the verdict ``hub-morning.sh --triage`` wrote); it complements the shell
+        worklist rather than re-deriving the tiers here.
+        """
+        triage = triage or {}
+        cost_by_run: dict[str, Any] = {}
+        if self._has_table("spoke_run_summary"):
+            for row in self._query("SELECT spoke_run_id, total_cost_usd FROM spoke_run_summary"):
+                cost_by_run[row["spoke_run_id"]] = row["total_cost_usd"]
+        out: list[dict[str, Any]] = []
+        for spoke_run_id in self.spoke_run_ids():
+            issue = _issue_from_spoke_run_id(spoke_run_id)
+            out.append(
+                {
+                    "spoke_run_id": spoke_run_id,
+                    "issue": issue,
+                    "total_cost_usd": cost_by_run.get(spoke_run_id),
+                    "merge": triage.get(issue) if issue else None,
+                }
+            )
+        return out
 
     def workflow_revs(self) -> list[str]:
         """All known ``workflow_rev``s, sorted — the A/B view's pick list."""

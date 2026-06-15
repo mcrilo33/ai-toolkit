@@ -372,6 +372,28 @@ def _resolve_store(span_log: Path) -> queries.SpanStore | None:
     return load_store(span_log)
 
 
+def render_morning_view(store: queries.SpanStore) -> None:
+    st.header("Morning")
+    st.caption(
+        "Last night's spoke runs — the cost lens that complements the shell worklist "
+        "(`hub-morning.sh`). Land readiness is the night's land-triage verdict."
+    )
+    rows = store.morning_rows()
+    if not rows:
+        st.info("No spoke runs found.")
+        return
+    table = [
+        {
+            "Issue": f"#{row['issue']}" if row["issue"] else "—",
+            "Spoke run": row["spoke_run_id"],
+            "Cost": _fmt_cost(row["total_cost_usd"]),
+            "Land": row["merge"] or "—",
+        }
+        for row in rows
+    ]
+    st.dataframe(table, use_container_width=True, hide_index=True)
+
+
 def main() -> None:
     st.set_page_config(page_title="Workflow observability", layout="wide")
     st.title("Workflow observability dashboard")
@@ -382,9 +404,13 @@ def main() -> None:
     if store is None:
         return
 
-    view = st.sidebar.radio("View", ["Spoke", "Aggregate", "A/B compare", "Automatability"])
+    view = st.sidebar.radio(
+        "View", ["Spoke", "Morning", "Aggregate", "A/B compare", "Automatability"]
+    )
     if view == "Spoke":
         render_spoke_view(store)
+    elif view == "Morning":
+        render_morning_view(store)
     elif view == "Aggregate":
         render_aggregate_view(store)
     elif view == "A/B compare":
