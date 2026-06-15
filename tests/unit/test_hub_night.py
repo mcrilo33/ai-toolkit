@@ -373,6 +373,11 @@ def test_night_kickoff_emits_terminal_markers_via_script() -> None:
         "terminal markers emit via the scripted spoke-ready.sh path"
     )
     assert "git tag -f -a" not in flat, "no hand-written git tag/push chain"
+    # ready/N is emitted by spoke-push.sh --ready (which pushes then emits), NOT by a
+    # non-existent spoke-ready.sh --ready flag — a literal-following night spoke must
+    # not run an invalid command and fail to free its slot.
+    assert "spoke-ready.sh --ready" not in flat, "ready/N uses spoke-push.sh --ready"
+    assert "spoke-push.sh --ready" in flat, "the final ready push uses spoke-push.sh --ready"
 
 
 def test_kickoff_is_not_plan_mode() -> None:

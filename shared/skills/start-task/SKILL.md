@@ -66,6 +66,14 @@ task is genuinely very-clear. (Only the PLAN gate is live today; the RED, human-
 acceptance, and draft levels are declared the same way but their machinery is pending
 follow-up issues — see `solo-cycle`.)
 
+The `Gate:` line records *which* gate, not *who* services it. **Who** is the
+**gate action** — `{ human-pause | agent-review | none }` — and it is derived from
+the **mode** the spoke runs in, not declared per task: dispatched by day a gate is
+**human-pause** (parks for you); dispatched into the unattended overnight queue
+(`hub-night.sh`) the judgment gates become **agent-review** and escalate to park.
+So the same issue body is mode-agnostic; only the harness decides day-vs-night (see
+`solo-cycle`'s "Gate action").
+
 ### 3. Create the issue
 
 Record the chosen gate level as a **`Gate:`** line in the issue body so it is part of

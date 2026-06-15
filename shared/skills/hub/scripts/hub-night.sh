@@ -325,29 +325,57 @@ reap_overrun_spokes() {
   done < <(inflight_worktrees)
 }
 
-# kickoff_for <issue> -> the spoke's first prompt. Placeholder: the standard
-# start-task gate-`plan` kickoff with the issue number substituted. The
-# night-specific kickoff + agent gate-review is Phase 2 (out of scope here).
+# kickoff_for <issue> -> the spoke's first prompt: the NIGHT kickoff (Phase 2).
+# The behavioral inversion of the daytime kickoff — judgment gates route to an
+# independent adversarial reviewer (gate action = agent-review), and uncertainty
+# escalates to PARK, never to "ask" (which hangs the slot until morning) or "guess".
+# See solo-cycle's "Gate action — who services a parked gate".
 kickoff_for() {
   local n="$1"
   cat <<EOF
-You're in a dedicated worktree for issue #$n (Gate: plan). Run /source to anchor to
-issue #$n and read it. Before touching code, break the issue body into a task ledger
-(TaskCreate, or TodoWrite on older runtimes) — one todo per subtask × the solo-cycle
-steps that apply (ANCHOR/RED/GREEN/REVIEW/PUSH), exactly one in_progress.
+You're in a dedicated worktree for issue #$n (Gate: plan), running UNATTENDED in night
+mode. Run /source to anchor to issue #$n and read it. Before touching code, break the
+issue body into a task ledger (TaskCreate, or TodoWrite on older runtimes) — one todo
+per subtask × the solo-cycle steps that apply (ANCHOR/RED/GREEN/REVIEW/PUSH), exactly
+one in_progress.
 
-This task's gate is plan: the PLAN gate comes first — explore the code and print the
-full implementation plan (files, approach, test strategy, open questions) as a normal
-visible message, and WAIT for approval before writing code (before GREEN). Do not
-defer the plan into an approval card — the message itself is the plan. Park there
-rather than blocking: emit the gate/$n marker
-(bash .ai-toolkit/scripts/spoke-ready.sh --gate $n) so the hub sees you parked,
-and proceed into the cycle once approved.
+THE NIGHT RULE — park, never ask, never guess. Nobody is awake. Any decision that
+needs human judgment you cannot resolve, you STOP CLEANLY and emit a terminal marker;
+you never block waiting for input (that hangs your slot until morning) and you never
+guess. Keep a STATUS.md heartbeat and /compact when context grows.
 
-Then implement it following the solo-cycle (/cycle: RED → GREEN → REVIEW → PUSH). Push
-your own branch on every subtask without asking; when your ledger shows the issue's
-acceptance criteria are all met, that is the final subtask — push and emit the ready/$n
-marker, also without asking. Do NOT self-land — the hub lands #$n.
+Night gate action is AGENT-REVIEW, not a human pause. At each JUDGMENT gate, spawn an
+INDEPENDENT adversarial reviewer — a fresh code-review subagent (model: opus), never
+yourself grading your own work — prompted to REFUTE, approving only on strong evidence.
+The revise loop is bounded to TWO ROUNDS; if it still refuses on the 2nd revision, PARK
+(do not loop a third time, do not lower the bar). If a reviewer cannot be spawned
+non-interactively, PARK rather than wait.
+
+- PLAN gate (first, before writing code): explore the code and print the full plan
+  (files, approach, test strategy, open questions) as a normal visible message — the
+  message itself is the plan, not an approval card. Then agent-review it (correct,
+  complete, in scope?). Approve → proceed to RED. Refuted after two rounds → park as
+  blocked/$n.
+- RED / REVIEW (code): agent-review the failing test, then the implementation. The
+  code review must confirm the impl did NOT gut the tests to go green (no sys.exit(0),
+  no deleted or weakened assertions, no added skip/xfail) — the anti-gutting pre-push
+  tripwire enforces this under NIGHT and will refuse such a push.
+- DRAFT / acceptance gate (inherently human): build + push, then ALWAYS park as
+  accept/$n — the final sign-off is a person's.
+
+Implement following the solo-cycle (/cycle: RED → GREEN → REVIEW → PUSH), pushing your
+own branch each subtask without asking. End with exactly one TERMINAL marker, emitted
+through the one allowlistable script (never a hand-written git tag/push chain):
+
+- ready/$n  — all gates auto-passed, machine-verifiable (tests green); emit it on the
+              FINAL push (the push script pushes the branch, then emits ready/$n):
+              bash .ai-toolkit/scripts/spoke-push.sh --ready $n
+- accept/$n — built + pushed + agent-reviewed, final sign-off inherently human:
+              bash .ai-toolkit/scripts/spoke-ready.sh --accept $n -m "<what to eyeball>"
+- blocked/$n — stuck (ambiguity, a reviewer that refused twice, suspected cheating, or
+              a budget/time ceiling): bash .ai-toolkit/scripts/spoke-ready.sh --blocked $n -m "<the blocker>"
+
+Each terminal marker frees your supervisor slot. Do NOT self-land — the hub lands #$n.
 EOF
 }
 
