@@ -69,10 +69,15 @@ def test_spoke_steps_attributes_model_and_agent_over_real_dataset():
     assert [n["name"] for n in forest] == ["Add RED telemetry test", "teardown"]
     assert all(n["span_id"] is None for n in forest)
 
-    # Subagent turns from the walked transcript attribute to the agent node, with
-    # its own model — proving #22's turns relation flows through from_telemetry.
+    # Subagent turns from the walked transcript become sub-turn nodes under the
+    # agent (Issue #47 S3); the agent's subtree rolls them up with their model —
+    # proving #22's turns relation flows through from_telemetry.
     agent = _find_kind(forest, "agent")
     assert agent is not None
     assert agent["agent"] == "subagent"
-    assert agent["own_tokens_in"] == 700
-    assert agent["models"] == ["claude-opus-4-8"]
+    # The two sub-agent inferences (s2/s3 carry usage) are sub-turn nodes; the
+    # sub-agent's Read tool (its s2b turn had no usage) is an orphan under the agent.
+    assert len([c for c in agent["children"] if c["kind"] == "turn"]) == 2
+    assert any(c["kind"] == "tool" and c["name"] == "Read" for c in agent["children"])
+    assert agent["rollup"]["tokens_in"] == 700
+    assert agent["rollup"]["models"] == ["claude-opus-4-8"]

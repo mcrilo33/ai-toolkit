@@ -281,26 +281,25 @@ class SpanStore:
         return roots
 
     def spoke_steps(self, spoke_run_id: str) -> list[dict[str, Any]]:
-        """The v2 collapse-to-steps drill-down tree for one spoke.
+        """The turn-centric drill-down tree for one spoke (Issues #46/#47 S3).
 
-        Level-1 roots are reconstructed **phase-interval buckets** (Issue #46):
-        ``step``/``lifecycle`` spans are point markers that fire at phase
-        *completion*, so the marker spine partitions the run into intervals and a
-        main turn attributes to the bucket whose interval contains it. The leading
-        region up to the first ``step`` marker is one ``setup`` bucket; trailing
-        lifecycle markers keep their own labels; main turns outside the lifecycle
-        envelope go to ``(unresolved)``. Subagent turns still attribute to their
-        ``agent`` span. The real spans nest *under* their bucket by time-bracketing
-        (smallest enclosing window), hooks collapse into one ``hooks`` node, and
-        each node carries a ``rollup`` of additive subtree metrics. The bucket
-        owns no wall-clock — intervals are attribution-only, never durations.
+        Level-1 roots are reconstructed **phase-interval buckets** (#46): the
+        ``step``/``lifecycle`` marker spine partitions the run into intervals, each
+        labelled by the todo it advances. Inside a bucket the marker shows as a thin
+        header (its own wall-clock), then come **turn nodes** — one per assistant
+        inference (a ``turns`` row), time-ordered, each owning its once-per-turn
+        cost. The skill/tool/todo/human spans an inference issued nest *under their
+        turn* (matched by ``ts_start``); hooks nest under the tool whose window
+        contains them; an ``agent`` span holds the sub-agent's own **sub-turn**
+        nodes and spans. Every node carries an additive ``rollup``; the cost rolls
+        up to the same run total as #46 — each turn is counted exactly once.
 
         Returns a forest ordered by ``ts_start``; an unknown spoke yields ``[]``.
         """
-        nodes, intervals, buckets, traces = self._attributed_nodes(spoke_run_id)
+        nodes, intervals, turns_by_owner = self._attributed_nodes(spoke_run_id)
         if not nodes:
             return []
-        forest = _interval_forest(nodes, intervals, buckets, traces)
+        forest = _interval_forest(nodes, intervals, turns_by_owner)
         for root in forest:
             _roll_up_steps(root)
         return forest
@@ -316,7 +315,7 @@ class SpanStore:
         cost). The "launched too much" signal lives in the ``count``/``duration``
         columns. Rows sort by total cost then count, descending. Unknown → ``[]``.
         """
-        nodes, _, _, _ = self._attributed_nodes(spoke_run_id)
+        nodes, _, _ = self._attributed_nodes(spoke_run_id)
         return _aggregate_by_kind(nodes)
 
     def _attributed_nodes(
@@ -324,18 +323,17 @@ class SpanStore:
     ) -> tuple[
         list[dict[str, Any]],
         list[dict[str, Any]],
-        dict[str, dict[str, Any]],
         dict[str, list[dict[str, Any]]],
     ]:
         """Load one spoke's spans as nodes with once-per-turn cost attributed.
 
-        Returns ``(nodes, intervals, bucket_costs, bucket_traces)`` — the flat
-        real-span nodes (``agent`` nodes carry their subagent ``own_cost_usd`` /
-        ``own_tokens_*`` / ``models``; every other node owns nothing, since main
-        cost lives on the phase intervals), the reconstructed phase ``intervals``,
-        the per-bucket owned main-turn cost keyed by bucket id, and the per-bucket
-        main-turn ``turns_trace`` (Issue #47). Shared by the drill-down (which
-        materializes the buckets) and the meta-by-kind view (which ignores them).
+        Returns ``(nodes, intervals, turns_by_owner)`` — the flat real-span nodes
+        (``agent`` nodes carry their subagent ``own_cost_usd`` / ``own_tokens_*`` /
+        ``models`` for the meta-by-kind view; every other node owns nothing), the
+        reconstructed phase ``intervals``, and the turn rows grouped by their owner
+        (a phase-interval bucket key for a main turn, an ``agent`` span id for a
+        subagent turn). The drill-down materialises a turn node per row; meta-by-kind
+        ignores ``turns_by_owner`` and reads the node ``own_cost`` instead.
         """
         rows = self._query(
             "SELECT * FROM spans WHERE spoke_run_id = ? ORDER BY ts_start, span_id",
@@ -345,9 +343,12 @@ class SpanStore:
         intervals = _build_intervals(nodes)
         session_ids = sorted({row["session_id"] for row in rows if row["session_id"]})
         turns = self._turns_for_sessions(session_ids)
-        buckets = _attribute_turns(nodes, turns, intervals)
-        traces = _bucket_traces(turns, intervals)
-        return nodes, intervals, buckets, traces
+        bounds = {n["span_id"]: (_parse_ts(n["ts_start"]), _parse_ts(n["ts_end"])) for n in nodes}
+        # Fill node own_cost for meta-by-kind (agent nodes get their subagent pool);
+        # the drill-down ignores this and routes the raw turn rows to turn nodes.
+        _attribute_turns(nodes, turns, intervals)
+        turns_by_owner = _turns_by_owner(turns, intervals, nodes, bounds)
+        return nodes, intervals, turns_by_owner
 
     def _turns_for_sessions(self, session_ids: list[str]) -> list[dict[str, Any]]:
         """Per-turn rows for the spoke's sessions (empty on the raw path).
@@ -586,6 +587,7 @@ def _parse_ts(ts: str | None) -> float | None:
 def _step_node(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "span_id": row["span_id"],
+        "parent_id": row["parent_id"],
         "kind": row["kind"],
         "name": row["name"],
         "summary": row["summary"],
@@ -613,12 +615,26 @@ def _sort_key(node: dict[str, Any]) -> tuple[float, str]:
 
 
 def _nest_by_time(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Nest each node under the smallest span whose window contains it."""
-    bounds = {n["span_id"]: (_parse_ts(n["ts_start"]), _parse_ts(n["ts_end"])) for n in nodes}
+    """Nest each node under its parent: explicit ``parent_id`` first, else by time.
+
+    A node carrying a ``parent_id`` that resolves to a peer in this set is attached
+    there directly (Issue #47 S3 — sub-agent spans bind to their agent regardless of
+    overlapping windows) and is excluded from the time-bracketing candidate pool.
+    Every other node (all main/push spans, which carry no ``parent_id``) nests under
+    the smallest span that *started before it* and whose window contains it — so
+    tool calls issued in the same turn (shared ``ts_start``) stay siblings, while a
+    hook that fires during a tool nests under it.
+    """
     by_id = {n["span_id"]: n for n in nodes}
+    explicit = [n for n in nodes if n.get("parent_id") and n["parent_id"] in by_id]
+    for node in explicit:
+        by_id[node["parent_id"]]["children"].append(node)
+
+    floating = [n for n in nodes if n not in explicit]
+    bounds = {n["span_id"]: (_parse_ts(n["ts_start"]), _parse_ts(n["ts_end"])) for n in floating}
     roots: list[dict[str, Any]] = []
-    for node in nodes:
-        parent_id = _smallest_container(node, nodes, bounds)
+    for node in floating:
+        parent_id = _smallest_container(node, floating, bounds)
         if parent_id is None:
             roots.append(node)
         else:
@@ -631,11 +647,11 @@ def _smallest_container(
     nodes: list[dict[str, Any]],
     bounds: dict[str, tuple[float | None, float | None]],
 ) -> str | None:
-    """The id of the tightest-windowed span strictly enclosing ``child``.
+    """The id of the tightest span that *started strictly before* and encloses ``child``.
 
-    A span with an identical window is a sibling, not a parent (its window is not
-    *strictly* larger), so equal-window peers like repeated ``TaskCreate`` calls
-    stay flat. Ties between equal-window containers break on ``span_id``.
+    Requiring a strictly-earlier start (``ps < cs``) keeps tool calls issued in the
+    same turn — which share their inference's ``ts_start`` — as siblings, while a
+    hook that fires after a tool began nests under it. Ties break on ``span_id``.
     """
     cs, ce = bounds[child["span_id"]]
     if cs is None or ce is None:
@@ -648,7 +664,7 @@ def _smallest_container(
         ps, pe = bounds[cand["span_id"]]
         if ps is None or pe is None:
             continue
-        if ps <= cs and pe >= ce and (ps, pe) != (cs, ce):
+        if ps < cs and pe >= ce:
             key = (pe - ps, ps, cand["span_id"])
             if best_key is None or key < best_key:
                 best_key, best_id = key, cand["span_id"]
@@ -855,17 +871,16 @@ def _subagent_owner(
 def _interval_forest(
     nodes: list[dict[str, Any]],
     intervals: list[dict[str, Any]],
-    buckets: dict[str, dict[str, Any]],
-    traces: dict[str, list[dict[str, Any]]],
+    turns_by_owner: dict[str, list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
-    """Build the Level-1 interval-bucket roots with their spans nested beneath.
+    """Build the Level-1 interval-bucket roots with the turn-centric tree beneath.
 
-    Each distinct bucket key becomes one root; real spans nest under the bucket
-    whose interval contains their ``ts_start`` (clamped to the envelope so a span
-    always displays), reusing the time-bracketing + hooks-collapse inner pass.
-    Each bucket also carries its ``turns_trace`` — the per-turn token spikes for
-    the main turns it owns (Issue #47). ``(unresolved)`` appears only when an
-    off-spine turn or span exists.
+    Each distinct bucket key becomes one root; its spans nest under the bucket
+    whose interval contains their ``ts_start`` (clamped to the envelope). Inside a
+    bucket (Issue #47 S3): step/lifecycle markers become thin header leaves, the
+    bucket's main turns become turn nodes owning their cost, and the inference's
+    spans nest under their turn by ``ts_start`` match. ``(unresolved)`` appears
+    only when an off-spine turn or span exists.
     """
     windows = _bucket_windows(intervals)
     spans_by_key: dict[str, list[dict[str, Any]]] = {}
@@ -875,58 +890,130 @@ def _interval_forest(
     roots: list[dict[str, Any]] = []
     for key, window in windows.items():
         bucket_spans = spans_by_key.get(key, [])
-        children = _collapse_hooks(_nest_by_time(bucket_spans))
-        roots.append(
-            _bucket_node(
-                window,
-                buckets.get(key),
-                children,
-                _bucket_todo_label(bucket_spans),
-                traces.get(key, []),
-            )
-        )
+        children = _bucket_children(bucket_spans, turns_by_owner.get(key, []), turns_by_owner)
+        roots.append(_bucket_node(window, children, _bucket_todo_label(bucket_spans)))
 
     orphan_spans = spans_by_key.get(_UNRESOLVED_KEY, [])
-    if _UNRESOLVED_KEY in buckets or orphan_spans:
-        children = _collapse_hooks(_nest_by_time(orphan_spans))
-        roots.append(
-            _unresolved_node(
-                buckets.get(_UNRESOLVED_KEY), children, traces.get(_UNRESOLVED_KEY, [])
-            )
-        )
+    orphan_turns = turns_by_owner.get(_UNRESOLVED_KEY, [])
+    if orphan_turns or orphan_spans:
+        children = _bucket_children(orphan_spans, orphan_turns, turns_by_owner)
+        roots.append(_unresolved_node(children))
     roots.sort(key=_bucket_sort_key)
     return roots
 
 
-def _bucket_traces(
-    turns: list[dict[str, Any]], intervals: list[dict[str, Any]]
-) -> dict[str, list[dict[str, Any]]]:
-    """Per-bucket main-turn trace: token spikes for the prompt-cycle, by bucket.
+def _bucket_children(
+    bucket_spans: list[dict[str, Any]],
+    bucket_turns: list[dict[str, Any]],
+    turns_by_owner: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """The turn-centric children of one bucket: marker headers + turn nodes.
 
-    A divider is one main turn's ``{ts, tokens, model}`` read straight from the
-    turns relation — never recomputed from spans and never a span itself, so it
-    cannot enter the rollup. Subagent turns are excluded (they belong to their
-    ``agent`` node, not the main trace). Entries sort by ``ts``.
+    Markers (``step``/``lifecycle``) become thin non-container header leaves that
+    keep their own wall-clock. The remaining spans nest by window (hooks under
+    their tool, sub-agent spans under their agent via ``parent_id``); each
+    resulting top-level span is then re-homed under the turn node whose ``ts``
+    equals its ``ts_start`` (the inference that issued it), with no-match spans
+    left directly under the bucket. Agent nodes get their sub-agent turn nodes.
     """
-    traces: dict[str, list[dict[str, Any]]] = {}
+    markers = [_marker_leaf(n) for n in bucket_spans if n["kind"] in ("step", "lifecycle")]
+    others = [n for n in bucket_spans if n["kind"] not in ("step", "lifecycle")]
+    forest = _collapse_hooks(_nest_by_time(others))
+    for node in _flatten(forest):
+        if node["kind"] == "agent":
+            _install_sub_turns(node, turns_by_owner.get(node["span_id"], []))
+
+    turn_nodes = {turn["ts"]: _turn_node(turn) for turn in bucket_turns}
+    orphans: list[dict[str, Any]] = []
+    for node in forest:
+        turn = turn_nodes.get(node["ts_start"])
+        (turn["children"] if turn is not None else orphans).append(node)
+
+    children = markers + list(turn_nodes.values()) + orphans
+    return sorted(children, key=_sort_key)
+
+
+def _install_sub_turns(agent: dict[str, Any], sub_turns: list[dict[str, Any]]) -> None:
+    """Insert the sub-agent's turn nodes between an agent span and its sub-spans.
+
+    The agent's existing children are the sub-agent spans (bound by ``parent_id``);
+    they re-home under the sub-turn whose ``ts`` matches their ``ts_start``. The
+    sub-turn nodes own the sub-agent cost, so the agent's own owned cost is moved
+    onto them (the agent keeps it for the meta-by-kind view, not the tree) to avoid
+    double-counting in the rollup.
+    """
+    if not sub_turns:
+        return
+    sub_nodes = {turn["ts"]: _turn_node(turn) for turn in sub_turns}
+    orphans: list[dict[str, Any]] = []
+    for child in agent["children"]:
+        turn = sub_nodes.get(child["ts_start"])
+        (turn["children"] if turn is not None else orphans).append(child)
+    agent["children"] = sorted(list(sub_nodes.values()) + orphans, key=_sort_key)
+    agent["own_cost_usd"] = 0.0
+    agent["own_tokens_in"] = 0
+    agent["own_tokens_out"] = 0
+    agent["models"] = []
+
+
+def _turn_node(turn: dict[str, Any]) -> dict[str, Any]:
+    """A synthetic L2 node for one assistant inference, owning its once-per-turn cost.
+
+    Never a span: ``span_id`` is None, it has no wall-clock, and it never enters the
+    spans table, the ``turns`` table, or meta-by-kind — it exists only in the
+    drill-down tree, like the ``interval`` / ``hooks`` synthetic nodes.
+    """
+    tokens_in = turn.get("tokens_in") or 0
+    tokens_out = turn.get("tokens_out") or 0
+    return {
+        "span_id": None,
+        "parent_id": None,
+        "kind": "turn",
+        "name": "turn",
+        "summary": None,
+        "phase": None,
+        "status": "success",
+        "ts_start": turn["ts"],
+        "ts_end": turn["ts"],
+        "duration_ms": None,
+        "human_type": None,
+        "human_wait_ms": None,
+        "human_count": 0,
+        "own_cost_usd": turn.get("cost_usd") or 0.0,
+        "own_tokens_in": tokens_in,
+        "own_tokens_out": tokens_out,
+        "models": [turn["model"]] if turn.get("model") else [],
+        "agent": turn.get("source", "main"),
+        "model": turn.get("model"),
+        "children": [],
+    }
+
+
+def _marker_leaf(node: dict[str, Any]) -> dict[str, Any]:
+    """A step/lifecycle marker as a thin header leaf — its own wall-clock, no children."""
+    return {**node, "children": []}
+
+
+def _turns_by_owner(
+    turns: list[dict[str, Any]],
+    intervals: list[dict[str, Any]],
+    nodes: list[dict[str, Any]],
+    bounds: dict[str, tuple[float | None, float | None]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Group turn rows by owner: a main turn → its phase-interval bucket key; a
+    subagent turn → the tightest enclosing ``agent`` span id (or ``(unresolved)``).
+    Each list is time-ordered, so turn nodes render in inference order.
+    """
+    owners: dict[str, list[dict[str, Any]]] = {}
     for turn in turns:
-        if turn.get("source") != "main":
-            continue
-        tokens = turn.get("tokens_total")
-        if tokens is None:
-            tokens = (turn.get("tokens_in") or 0) + (turn.get("tokens_out") or 0)
-        traces.setdefault(_main_turn_bucket(turn, intervals), []).append(
-            {
-                "kind": "turn_divider",
-                "ts": turn["ts"],
-                "tokens": tokens,
-                "model": turn.get("model"),
-                "cost_usd": turn.get("cost_usd") or 0.0,
-            }
-        )
-    for entries in traces.values():
-        entries.sort(key=lambda e: _parse_ts(e["ts"]) or 0.0)
-    return traces
+        if turn.get("source") == "subagent":
+            owner = _subagent_owner(turn, nodes, bounds) or _UNRESOLVED_KEY
+        else:
+            owner = _main_turn_bucket(turn, intervals)
+        owners.setdefault(owner, []).append(turn)
+    for rows in owners.values():
+        rows.sort(key=lambda t: _parse_ts(t["ts"]) or 0.0)
+    return owners
 
 
 def _bucket_windows(intervals: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -966,25 +1053,20 @@ def _flatten(nodes: list[dict[str, Any]]) -> Iterator[dict[str, Any]]:
 
 def _bucket_node(
     window: dict[str, Any],
-    acc: dict[str, Any] | None,
     children: list[dict[str, Any]],
     todo_label: str | None = None,
-    turns_trace: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """A synthetic phase-interval root owning its main-turn cost; no own duration.
+    """A synthetic phase-interval root; owns no cost (its turn nodes do), no duration.
 
     ``todo_label`` (Issue #47) names the bucket for the in-progress todo it
-    advances, falling back to the phase/``setup`` label when none resolved;
-    ``turns_trace`` carries the bucket's per-turn token spikes for the trace.
+    advances, falling back to the phase/``setup`` label when none resolved.
     """
     return _synthetic_root(
         kind="interval",
         name=todo_label or window["label"],
         ts_start=window["lo_iso"],
         ts_end=window["hi_iso"],
-        acc=acc or _acc(),
         children=children,
-        turns_trace=turns_trace or [],
     )
 
 
@@ -1001,24 +1083,14 @@ def _bucket_todo_label(bucket_spans: list[dict[str, Any]]) -> str | None:
     return todos[-1]["summary"] if todos else None
 
 
-def _unresolved_node(
-    acc: dict[str, Any] | None,
-    children: list[dict[str, Any]],
-    turns_trace: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
+def _unresolved_node(children: list[dict[str, Any]]) -> dict[str, Any]:
     """A synthetic root for turns/spans off the lifecycle envelope, so totals reconcile.
 
     Off-spine turns never frame a window (a malformed ts must not format as garbage),
     so the node carries no ``ts_start``/``ts_end``.
     """
     return _synthetic_root(
-        kind="unresolved",
-        name="(unresolved)",
-        ts_start=None,
-        ts_end=None,
-        acc=acc or _acc(),
-        children=children,
-        turns_trace=turns_trace or [],
+        kind="unresolved", name="(unresolved)", ts_start=None, ts_end=None, children=children
     )
 
 
@@ -1028,15 +1100,15 @@ def _synthetic_root(
     name: str,
     ts_start: str | None,
     ts_end: str | None,
-    acc: dict[str, Any],
     children: list[dict[str, Any]],
-    turns_trace: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """A synthetic bucket root: owns its main-turn cost, never a phase duration."""
+    """A synthetic bucket root: owns no cost (its turn-node children do), no duration."""
     return {
         "span_id": None,
+        "parent_id": None,
         "kind": kind,
         "name": name,
+        "summary": None,
         "phase": None,
         "status": _worst_status(list(_flatten(children))),
         "ts_start": ts_start,
@@ -1045,14 +1117,11 @@ def _synthetic_root(
         "human_type": None,
         "human_wait_ms": None,
         "human_count": 0,
-        "own_cost_usd": acc["cost"],
-        "own_tokens_in": acc["in"],
-        "own_tokens_out": acc["out"],
-        "models": sorted(acc["models"]),
+        "own_cost_usd": 0.0,
+        "own_tokens_in": 0,
+        "own_tokens_out": 0,
+        "models": [],
         "agent": "main",
-        # Per-turn token-spike dividers for the trace (Issue #47); display-only
-        # metadata, never a child node, so it can't enter any rollup.
-        "turns_trace": turns_trace,
         "children": children,
     }
 
@@ -1090,6 +1159,12 @@ def format_step_label(node: dict[str, Any]) -> str:
     """
     if node["kind"] == "hooks":
         return f"hooks x{node['collapsed_count']}"
+    # A turn node (one inference) is labelled by its clock time + model, e.g.
+    # "turn 12:01:05 · opus-4-8" — the per-turn token spike shows in the metrics.
+    if node["kind"] == "turn":
+        clock = _clock(node.get("ts_start"))
+        model = node.get("model")
+        return f"turn {clock} · {_short_model(model)}" if model else f"turn {clock}"
     summary = node.get("summary")
     # A tool leaf keeps its name visible alongside the parameter it acted on, so
     # the trace reads e.g. "Read · /path"; other kinds show the summary alone.
@@ -1137,6 +1212,13 @@ def _format_cost(usd: float | None) -> str:
 def _short_model(model: str) -> str:
     """Drop the ``claude-`` vendor prefix for compact display."""
     return model.removeprefix("claude-")
+
+
+def _clock(ts: str | None) -> str:
+    """``2026-06-12T12:01:05Z`` → ``12:01:05`` for a compact turn-node label."""
+    if not ts or "T" not in ts:
+        return ts or "—"
+    return ts.split("T", 1)[1].rstrip("Z")[:8]
 
 
 def _aggregate_by_kind(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:

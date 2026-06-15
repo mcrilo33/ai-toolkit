@@ -138,40 +138,17 @@ def _render_descendants(nodes: list[dict], depth: int) -> None:
             _render_descendants(node["children"], depth + 1)
 
 
-def _fmt_turn_time(ts: str | None) -> str:
-    """``2026-06-12T12:01:05Z`` → ``12:01:05`` for a compact divider label."""
-    if not ts or "T" not in ts:
-        return ts or "—"
-    return ts.split("T", 1)[1].rstrip("Z")[:8]
-
-
-def _render_turn_dividers(trace: list[dict]) -> None:
-    """Per-turn token-spike dividers for the prompt-cycle trace (Issue #47)."""
-    for divider in trace:
-        cols = st.columns(_STEP_COLS)
-        cols[0].markdown(f"&nbsp;&nbsp;— turn `{_fmt_turn_time(divider['ts'])}` —")
-        cols[1].markdown("—")
-        cols[2].markdown("—")
-        cols[3].markdown(f"{divider['tokens']:,}" if divider.get("tokens") else "—")
-        cols[4].markdown("—")
-        cols[5].markdown(queries._short_model(divider["model"]) if divider.get("model") else "—")
-        cols[6].markdown("—")
-
-
 def _render_step(root: dict) -> None:
-    """A Level-1 step row (rolled-up metrics, collapsed) with a drill expander.
+    """A Level-1 phase-interval bucket row (rolled-up metrics) with a drill expander.
 
     Streamlit forbids nesting expanders, so the whole subtree drills inside one
-    expander as indented rows rather than per-level expanders. The per-turn token
-    spikes render as dividers at the top of the drill (the L2 cycle trace).
+    expander as indentation depth (Issue #47 S3): marker headers, then the turn
+    nodes, with the tools/skills each turn issued nested beneath — and a sub-agent's
+    own turns under its agent node.
     """
     _node_row(root, 0)
-    trace = root.get("turns_trace") or []
-    if root["children"] or trace:
+    if root["children"]:
         with st.expander(f"↳ drill into {queries.format_step_label(root)}", expanded=False):
-            if trace:
-                st.caption("Per-turn token spikes (prompt-cycle trace)")
-                _render_turn_dividers(trace)
             _render_descendants(root["children"], 1)
 
 
