@@ -206,6 +206,7 @@ def _run_once(
     projects_dir: Path | None = None,
     timeout: float = 15.0,
     env: dict[str, str] | None = None,
+    bodies: dict[int, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     """Run ``hub-night.sh`` from the hub with gh + WT_NEW stubbed.
 
@@ -228,11 +229,24 @@ def _run_once(
     """
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
+    # Per-issue body files for the directive parse (Serial-after:/Merge-into:).
+    # Unset NIGHT_BODIES_DIR (no bodies) -> every issue reads as empty -> no
+    # directives -> the pre-ST5 dispatch behavior, so existing tests are unaffected.
+    bodies_dir = tmp_path / "bodies"
+    if bodies:
+        bodies_dir.mkdir(exist_ok=True)
+        for num, text in bodies.items():
+            (bodies_dir / str(num)).write_text(text)
     gh = bindir / "gh"
     gh.write_text(
         "#!/bin/sh\n"
         'if [ "$1" = "issue" ] && [ "$2" = "list" ]; then\n'
         '  for n in $NIGHT_QUEUE; do echo "$n"; done\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [ "$1" = "issue" ] && [ "$2" = "view" ]; then\n'
+        '  f="$NIGHT_BODIES_DIR/$3"\n'
+        '  [ -n "$NIGHT_BODIES_DIR" ] && [ -f "$f" ] && cat "$f"\n'
         "  exit 0\n"
         "fi\n"
         "exit 1\n"
@@ -268,6 +282,7 @@ def _run_once(
         "WT_NEW_LOG": str(log),
         "SPOKE_READY": str(SPOKE_READY),
         "NIGHT_STATE_DIR": str(tmp_path / "night-state"),
+        "NIGHT_BODIES_DIR": str(bodies_dir) if bodies else "",
         "CLAUDE_PROJECTS_DIR": str(projects_dir if projects_dir is not None else fallback_projects),
     }
     if env:
@@ -606,6 +621,102 @@ def test_gate_parked_idle_spoke_is_not_reaped(night_hub: Path, tmp_path: Path) -
         "a gate-parked spoke must not be reaped"
     )
     assert lines == [], "a gate-parked spoke keeps its slot"
+
+
+# --- Pre-flight batching: SERIAL / MERGE disjointness filter (issue #40 ST5) --
+# The scout's approved plan is stored in the issue body as Serial-after:/Merge-into:
+# lines beside Gate: (no new source of truth). The supervisor honors them: a
+# Serial-after task waits until its predecessor has LANDED (closed + torn down =
+# absent from both the open queue and the in-flight set); a Merge-into child is
+# never dispatched on its own (the owner spoke closes it). The skip is NON-consuming
+# so a blocked task never starves a ready one behind it.
+
+
+@pytest.mark.parametrize(
+    "body,key,expected",
+    [
+        ("Gate: plan\nSerial-after: 41\n", "Serial-after", "41"),
+        ("Merge-into: 41\nGate: plan", "Merge-into", "41"),
+        ("Gate: plan\nno directive here", "Serial-after", ""),
+    ],
+)
+def test_parse_directive(body: str, key: str, expected: str) -> None:
+    result = _call(f"parse_directive {body!r} {key}")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
+
+
+@pytest.mark.parametrize(
+    "pred,open_q,inflight,landed",
+    [
+        ("41", "42 43", "44", True),  # 41 absent from both -> landed
+        ("41", "41 42", "44", False),  # still queued -> not landed
+        ("41", "42 43", "41", False),  # still in flight -> not landed
+    ],
+)
+def test_predecessor_landed(pred: str, open_q: str, inflight: str, landed: bool) -> None:
+    result = _call(f"predecessor_landed {pred} {open_q!r} {inflight!r}")
+
+    assert (result.returncode == 0) == landed, result.stderr
+
+
+def test_serial_after_waits_for_unlanded_predecessor(night_hub: Path, tmp_path: Path) -> None:
+    # 102 is Serial-after 101; 101 is still queued (not landed) -> 102 is NOT
+    # dispatched this tick. The skip is non-consuming, so the disjoint 103 still
+    # dispatches into the same target.
+    now = _epoch(2026, 6, 15, 4, 30)  # 150 min -> target ceil(3*90/150)=2
+
+    proc, lines = _run_once(
+        night_hub,
+        tmp_path,
+        queue="101 102 103",
+        now=now,
+        bodies={102: "Gate: plan\nSerial-after: 101\n"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    dispatched = [ln.split()[1] for ln in lines]
+    assert "issue=102" not in dispatched, "102 must wait for its predecessor 101 to land"
+    assert "issue=101" in dispatched and "issue=103" in dispatched, (
+        "the serial skip must not consume a slot — 101 and 103 still dispatch"
+    )
+
+
+def test_serial_after_releases_once_predecessor_landed(night_hub: Path, tmp_path: Path) -> None:
+    # 101 has landed (absent from the queue and not in flight); 102 (Serial-after
+    # 101) is now free to dispatch.
+    now = _epoch(2026, 6, 15, 4, 30)
+
+    proc, lines = _run_once(
+        night_hub,
+        tmp_path,
+        queue="102",
+        now=now,
+        bodies={102: "Gate: plan\nSerial-after: 101\n"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert [ln.split()[1] for ln in lines] == ["issue=102"]
+
+
+def test_merge_child_is_never_dispatched(night_hub: Path, tmp_path: Path) -> None:
+    # 52 is Merge-into 41 — the 41 spoke owns it (Closes #41 #52), so 52 is never
+    # dispatched on its own; only 41 spawns.
+    now = _epoch(2026, 6, 15, 4, 30)
+
+    proc, lines = _run_once(
+        night_hub,
+        tmp_path,
+        queue="41 52",
+        now=now,
+        bodies={52: "Gate: plan\nMerge-into: 41\n"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    dispatched = [ln.split()[1] for ln in lines]
+    assert "issue=41" in dispatched
+    assert "issue=52" not in dispatched, "a Merge-into child is owned by 41, never dispatched alone"
 
 
 # --- Supervisor loop termination (ST3) ---------------------------------------
