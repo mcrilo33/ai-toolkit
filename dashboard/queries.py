@@ -88,6 +88,10 @@ _STATUS_SEVERITY: dict[str, int] = {
 _SETUP_KEY = "__setup__"
 _UNRESOLVED_KEY = "__unresolved__"
 
+# Bare todo-tool names (Issue #47): a todo span still carrying one of these as its
+# name has no in-progress item derived, so it must not override a phase label.
+_TODO_TOOL_NAMES = frozenset({"TodoWrite", "TaskCreate", "TaskUpdate"})
+
 
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
     """Parse an append-only span log: one JSON object per non-blank line."""
@@ -861,8 +865,11 @@ def _interval_forest(
 
     roots: list[dict[str, Any]] = []
     for key, window in windows.items():
-        children = _collapse_hooks(_nest_by_time(spans_by_key.get(key, [])))
-        roots.append(_bucket_node(window, buckets.get(key), children))
+        bucket_spans = spans_by_key.get(key, [])
+        children = _collapse_hooks(_nest_by_time(bucket_spans))
+        roots.append(
+            _bucket_node(window, buckets.get(key), children, _bucket_todo_label(bucket_spans))
+        )
 
     orphan_spans = spans_by_key.get(_UNRESOLVED_KEY, [])
     if _UNRESOLVED_KEY in buckets or orphan_spans:
@@ -911,16 +918,34 @@ def _bucket_node(
     window: dict[str, Any],
     acc: dict[str, Any] | None,
     children: list[dict[str, Any]],
+    todo_label: str | None = None,
 ) -> dict[str, Any]:
-    """A synthetic phase-interval root owning its main-turn cost; no own duration."""
+    """A synthetic phase-interval root owning its main-turn cost; no own duration.
+
+    ``todo_label`` (Issue #47) names the bucket for the in-progress todo it
+    advances, falling back to the phase/``setup`` label when none resolved.
+    """
     return _synthetic_root(
         kind="interval",
-        name=window["label"],
+        name=todo_label or window["label"],
         ts_start=window["lo_iso"],
         ts_end=window["hi_iso"],
         acc=acc or _acc(),
         children=children,
     )
+
+
+def _bucket_todo_label(bucket_spans: list[dict[str, Any]]) -> str | None:
+    """The todo item a bucket advances: the latest resolved todo span in it.
+
+    A todo span still named for its bare tool (``TodoWrite`` …) carries no derived
+    in-progress item, so it is ignored — the bucket then keeps its phase label.
+    """
+    todos = sorted(
+        (n for n in bucket_spans if n["kind"] == "todo" and n["name"] not in _TODO_TOOL_NAMES),
+        key=_sort_key,
+    )
+    return todos[-1]["name"] if todos else None
 
 
 def _unresolved_node(acc: dict[str, Any] | None, children: list[dict[str, Any]]) -> dict[str, Any]:

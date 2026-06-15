@@ -53,6 +53,7 @@ def parse_session_file(path: Path) -> ParsedSession:
     records = _load_jsonl(path)
     meta = _session_meta(records)
     results = _tool_results(records)
+    todo_labels = _todo_labels(records)
 
     parsed = ParsedSession()
     for rec in records:
@@ -64,7 +65,7 @@ def parse_session_file(path: Path) -> ParsedSession:
         if isinstance(message.get("usage"), dict):
             parsed.usage_events.append(_usage_event(rec, "main", None))
         for block in message.get("content") or []:
-            _consume_tool_use(block, rec, results, meta, path, parsed)
+            _consume_tool_use(block, rec, results, meta, path, parsed, todo_labels)
 
     parsed.spans.extend(_human_prompt_spans(records, meta))
     return parsed
@@ -95,10 +96,11 @@ def _consume_tool_use(
     meta: dict[str, str | None],
     path: Path,
     parsed: ParsedSession,
+    todo_labels: dict[str, str],
 ) -> None:
     if not (isinstance(block, dict) and block.get("type") == "tool_use"):
         return
-    span = _span_for_tool_use(block, rec, results, meta)
+    span = _span_for_tool_use(block, rec, results, meta, todo_labels)
     if span is None:
         return
     parsed.spans.append(span)
@@ -111,7 +113,11 @@ def _consume_tool_use(
 
 
 def _span_for_tool_use(
-    block: dict, rec: dict, results: dict[str, dict], meta: dict[str, str | None]
+    block: dict,
+    rec: dict,
+    results: dict[str, dict],
+    meta: dict[str, str | None],
+    todo_labels: dict[str, str],
 ) -> Span | None:
     name = block.get("name")
     tool_use_id = block.get("id") or ""
@@ -134,11 +140,59 @@ def _span_for_tool_use(
     if name in AGENT_TOOLS:
         return Span(kind="agent", name=inputs.get("subagent_type", "agent"), **common)
     if name in TODO_TOOLS:
-        return Span(kind="todo", name=name, **common)
+        todo_name = todo_labels.get(tool_use_id) or (name if isinstance(name, str) else "todo")
+        return Span(kind="todo", name=todo_name, **common)
     if name == "AskUserQuestion":
         human = {"type": "question", "wait_ms": _duration_ms(ts_start, ts_end)}
         return Span(kind="human", name="AskUserQuestion", human=human, **common)
     return None
+
+
+def _todo_labels(records: list[dict]) -> dict[str, str]:
+    """Map each todo ``tool_use`` id to the item it advances (Issue #47).
+
+    The solo-cycle seeds a ``TodoWrite`` ledger and marks one item ``in_progress``
+    per step. Walking the writes in order and diffing each snapshot's in-progress
+    set against the previous one isolates the item that *newly* entered progress —
+    the step's todo — which becomes the L1 step label. A write with no
+    distinguishable transition falls back to whatever is in progress; a write
+    with nothing in progress yields no label (the span keeps its tool name).
+
+    UPGRADE: resolve ``TaskCreate``/``TaskUpdate`` (incremental, id-keyed) ledgers
+    too — they carry no full snapshot, so id→subject tracking is a follow-up.
+    """
+    labels: dict[str, str] = {}
+    prev: set[str] = set()
+    for rec in records:
+        if rec.get("type") != "assistant":
+            continue
+        message = rec.get("message")
+        if not isinstance(message, dict):
+            continue
+        for block in message.get("content") or []:
+            if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+                continue
+            if block.get("name") not in TODO_TOOLS:
+                continue
+            label, prev = _derive_todo_label(block.get("input") or {}, prev)
+            if label:
+                labels[block.get("id") or ""] = label
+    return labels
+
+
+def _derive_todo_label(inputs: dict, prev: set[str]) -> tuple[str | None, set[str]]:
+    """The in-progress item text for one ledger write, plus its in-progress set."""
+    items = inputs.get("todos")
+    if not isinstance(items, list):
+        return None, prev
+    in_progress = {
+        item["content"]
+        for item in items
+        if isinstance(item, dict) and item.get("status") == "in_progress" and item.get("content")
+    }
+    newly = sorted(in_progress - prev)
+    label = newly[0] if newly else (sorted(in_progress)[0] if in_progress else None)
+    return label, in_progress
 
 
 def _human_prompt_spans(records: list[dict], meta: dict[str, str | None]) -> list[Span]:

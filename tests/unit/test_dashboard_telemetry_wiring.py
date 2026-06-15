@@ -62,9 +62,11 @@ def test_spoke_steps_attributes_model_and_agent_over_real_dataset():
     forest = _telemetry_store().spoke_steps(SPOKE_RUN_ID)
 
     # Level-1 roots are reconstructed phase-interval buckets (#46), time-ordered:
-    # spawn + the first `red` step collapse into `setup`; the trailing lifecycle
-    # keeps its `teardown` label. The raw marker spans nest beneath as children.
-    assert [n["name"] for n in forest] == ["setup", "teardown"]
+    # spawn + the first `red` step collapse into the leading bucket; the trailing
+    # lifecycle keeps its `teardown` label. The raw marker spans nest beneath as
+    # children. Issue #47: the leading bucket is named for the in-progress todo it
+    # advances (the retained ledger item), not the bare `setup` fallback.
+    assert [n["name"] for n in forest] == ["Add RED telemetry test", "teardown"]
     assert all(n["span_id"] is None for n in forest)
 
     # Subagent turns from the walked transcript attribute to the agent node, with
