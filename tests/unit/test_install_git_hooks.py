@@ -84,14 +84,23 @@ def _unpushed_commit(repo: Path, fname: str = "change.txt") -> str:
     return _git(repo, "rev-parse", "HEAD").strip()
 
 
-def _push(repo: Path) -> subprocess.CompletedProcess[str]:
+def _push(repo: Path, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", "push", "origin", "main"],
         cwd=str(repo),
         capture_output=True,
         text=True,
-        env=_GIT_ENV,
+        env={**_GIT_ENV, **(extra_env or {})},
     )
+
+
+def _unpushed_gutting_commit(repo: Path) -> str:
+    """Commit a test file with a tautological assert (a gutting signature)."""
+    (repo / "tests").mkdir(exist_ok=True)
+    (repo / "tests" / "test_g.py").write_text("def test_g():\n    assert True\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "test: weaken", "-m", "Refs #40")
+    return _git(repo, "rev-parse", "HEAD").strip()
 
 
 def _remote_sha(repo: Path, branch: str = "main") -> str:
@@ -108,6 +117,44 @@ def test_test_select_copied_into_hooks(repo: Path) -> None:
     sel = _scripts_dir(hooks) / "test-select.sh"
     assert sel.is_file()
     assert os.access(sel, os.X_OK)
+
+
+def test_anti_gutting_copied_into_hooks(repo: Path) -> None:
+    # The anti-gutting tripwire (issue #40) ships alongside the other cage scripts
+    # so the native pre-push hook can run it.
+    hooks = _install(repo)
+
+    scan = _scripts_dir(hooks) / "anti-gutting-scan.sh"
+    assert scan.is_file()
+    assert os.access(scan, os.X_OK)
+
+
+# --- the anti-gutting tripwire blocks a test-gutting push under NIGHT=1 ----------
+
+
+def test_pre_push_blocks_gutting_under_night(repo: Path) -> None:
+    seed = _remote_sha(repo)
+    _unpushed_gutting_commit(repo)
+    hooks = _install(repo)
+    _stub_selector(hooks, exit_code=0)  # isolate: only anti-gutting may block
+
+    push = _push(repo, extra_env={"NIGHT": "1"})
+
+    assert push.returncode != 0, "NIGHT must block a test-gutting push"
+    assert _remote_sha(repo) == seed, "nothing may ship when the tripwire fires"
+
+
+def test_pre_push_allows_gutting_off_night(repo: Path) -> None:
+    # Off the night path the tripwire is advisory — a human's ordinary test edit
+    # (which may legitimately remove/weaken an assert) is never gated.
+    _unpushed_gutting_commit(repo)
+    hooks = _install(repo)
+    _stub_selector(hooks, exit_code=0)
+
+    push = _push(repo)
+
+    assert push.returncode == 0, push.stderr
+    assert _remote_sha(repo) == _git(repo, "rev-parse", "HEAD").strip()
 
 
 # --- the blocking contract: a failing selector aborts the push ------------------
