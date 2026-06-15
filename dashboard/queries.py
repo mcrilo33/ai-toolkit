@@ -297,10 +297,10 @@ class SpanStore:
 
         Returns a forest ordered by ``ts_start``; an unknown spoke yields ``[]``.
         """
-        nodes, intervals, buckets = self._attributed_nodes(spoke_run_id)
+        nodes, intervals, buckets, traces = self._attributed_nodes(spoke_run_id)
         if not nodes:
             return []
-        forest = _interval_forest(nodes, intervals, buckets)
+        forest = _interval_forest(nodes, intervals, buckets, traces)
         for root in forest:
             _roll_up_steps(root)
         return forest
@@ -316,19 +316,25 @@ class SpanStore:
         cost). The "launched too much" signal lives in the ``count``/``duration``
         columns. Rows sort by total cost then count, descending. Unknown → ``[]``.
         """
-        nodes, _, _ = self._attributed_nodes(spoke_run_id)
+        nodes, _, _, _ = self._attributed_nodes(spoke_run_id)
         return _aggregate_by_kind(nodes)
 
     def _attributed_nodes(
         self, spoke_run_id: str
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    ) -> tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, dict[str, Any]],
+        dict[str, list[dict[str, Any]]],
+    ]:
         """Load one spoke's spans as nodes with once-per-turn cost attributed.
 
-        Returns ``(nodes, intervals, bucket_costs)`` — the flat real-span nodes
-        (``agent`` nodes carry their subagent ``own_cost_usd`` / ``own_tokens_*`` /
-        ``models``; every other node owns nothing, since main cost lives on the
-        phase intervals), the reconstructed phase ``intervals``, and the per-bucket
-        owned main-turn cost keyed by bucket id. Shared by the drill-down (which
+        Returns ``(nodes, intervals, bucket_costs, bucket_traces)`` — the flat
+        real-span nodes (``agent`` nodes carry their subagent ``own_cost_usd`` /
+        ``own_tokens_*`` / ``models``; every other node owns nothing, since main
+        cost lives on the phase intervals), the reconstructed phase ``intervals``,
+        the per-bucket owned main-turn cost keyed by bucket id, and the per-bucket
+        main-turn ``turns_trace`` (Issue #47). Shared by the drill-down (which
         materializes the buckets) and the meta-by-kind view (which ignores them).
         """
         rows = self._query(
@@ -338,8 +344,10 @@ class SpanStore:
         nodes = [_step_node(row) for row in rows]
         intervals = _build_intervals(nodes)
         session_ids = sorted({row["session_id"] for row in rows if row["session_id"]})
-        buckets = _attribute_turns(nodes, self._turns_for_sessions(session_ids), intervals)
-        return nodes, intervals, buckets
+        turns = self._turns_for_sessions(session_ids)
+        buckets = _attribute_turns(nodes, turns, intervals)
+        traces = _bucket_traces(turns, intervals)
+        return nodes, intervals, buckets, traces
 
     def _turns_for_sessions(self, session_ids: list[str]) -> list[dict[str, Any]]:
         """Per-turn rows for the spoke's sessions (empty on the raw path).
@@ -848,13 +856,16 @@ def _interval_forest(
     nodes: list[dict[str, Any]],
     intervals: list[dict[str, Any]],
     buckets: dict[str, dict[str, Any]],
+    traces: dict[str, list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
     """Build the Level-1 interval-bucket roots with their spans nested beneath.
 
     Each distinct bucket key becomes one root; real spans nest under the bucket
     whose interval contains their ``ts_start`` (clamped to the envelope so a span
     always displays), reusing the time-bracketing + hooks-collapse inner pass.
-    ``(unresolved)`` appears only when an off-spine turn or span exists.
+    Each bucket also carries its ``turns_trace`` — the per-turn token spikes for
+    the main turns it owns (Issue #47). ``(unresolved)`` appears only when an
+    off-spine turn or span exists.
     """
     windows = _bucket_windows(intervals)
     spans_by_key: dict[str, list[dict[str, Any]]] = {}
@@ -866,15 +877,56 @@ def _interval_forest(
         bucket_spans = spans_by_key.get(key, [])
         children = _collapse_hooks(_nest_by_time(bucket_spans))
         roots.append(
-            _bucket_node(window, buckets.get(key), children, _bucket_todo_label(bucket_spans))
+            _bucket_node(
+                window,
+                buckets.get(key),
+                children,
+                _bucket_todo_label(bucket_spans),
+                traces.get(key, []),
+            )
         )
 
     orphan_spans = spans_by_key.get(_UNRESOLVED_KEY, [])
     if _UNRESOLVED_KEY in buckets or orphan_spans:
         children = _collapse_hooks(_nest_by_time(orphan_spans))
-        roots.append(_unresolved_node(buckets.get(_UNRESOLVED_KEY), children))
+        roots.append(
+            _unresolved_node(
+                buckets.get(_UNRESOLVED_KEY), children, traces.get(_UNRESOLVED_KEY, [])
+            )
+        )
     roots.sort(key=_bucket_sort_key)
     return roots
+
+
+def _bucket_traces(
+    turns: list[dict[str, Any]], intervals: list[dict[str, Any]]
+) -> dict[str, list[dict[str, Any]]]:
+    """Per-bucket main-turn trace: token spikes for the prompt-cycle, by bucket.
+
+    A divider is one main turn's ``{ts, tokens, model}`` read straight from the
+    turns relation — never recomputed from spans and never a span itself, so it
+    cannot enter the rollup. Subagent turns are excluded (they belong to their
+    ``agent`` node, not the main trace). Entries sort by ``ts``.
+    """
+    traces: dict[str, list[dict[str, Any]]] = {}
+    for turn in turns:
+        if turn.get("source") != "main":
+            continue
+        tokens = turn.get("tokens_total")
+        if tokens is None:
+            tokens = (turn.get("tokens_in") or 0) + (turn.get("tokens_out") or 0)
+        traces.setdefault(_main_turn_bucket(turn, intervals), []).append(
+            {
+                "kind": "turn_divider",
+                "ts": turn["ts"],
+                "tokens": tokens,
+                "model": turn.get("model"),
+                "cost_usd": turn.get("cost_usd") or 0.0,
+            }
+        )
+    for entries in traces.values():
+        entries.sort(key=lambda e: _parse_ts(e["ts"]) or 0.0)
+    return traces
 
 
 def _bucket_windows(intervals: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -917,11 +969,13 @@ def _bucket_node(
     acc: dict[str, Any] | None,
     children: list[dict[str, Any]],
     todo_label: str | None = None,
+    turns_trace: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """A synthetic phase-interval root owning its main-turn cost; no own duration.
 
     ``todo_label`` (Issue #47) names the bucket for the in-progress todo it
-    advances, falling back to the phase/``setup`` label when none resolved.
+    advances, falling back to the phase/``setup`` label when none resolved;
+    ``turns_trace`` carries the bucket's per-turn token spikes for the trace.
     """
     return _synthetic_root(
         kind="interval",
@@ -930,6 +984,7 @@ def _bucket_node(
         ts_end=window["hi_iso"],
         acc=acc or _acc(),
         children=children,
+        turns_trace=turns_trace or [],
     )
 
 
@@ -946,7 +1001,11 @@ def _bucket_todo_label(bucket_spans: list[dict[str, Any]]) -> str | None:
     return todos[-1]["summary"] if todos else None
 
 
-def _unresolved_node(acc: dict[str, Any] | None, children: list[dict[str, Any]]) -> dict[str, Any]:
+def _unresolved_node(
+    acc: dict[str, Any] | None,
+    children: list[dict[str, Any]],
+    turns_trace: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """A synthetic root for turns/spans off the lifecycle envelope, so totals reconcile.
 
     Off-spine turns never frame a window (a malformed ts must not format as garbage),
@@ -959,6 +1018,7 @@ def _unresolved_node(acc: dict[str, Any] | None, children: list[dict[str, Any]])
         ts_end=None,
         acc=acc or _acc(),
         children=children,
+        turns_trace=turns_trace or [],
     )
 
 
@@ -970,6 +1030,7 @@ def _synthetic_root(
     ts_end: str | None,
     acc: dict[str, Any],
     children: list[dict[str, Any]],
+    turns_trace: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """A synthetic bucket root: owns its main-turn cost, never a phase duration."""
     return {
@@ -989,6 +1050,9 @@ def _synthetic_root(
         "own_tokens_out": acc["out"],
         "models": sorted(acc["models"]),
         "agent": "main",
+        # Per-turn token-spike dividers for the trace (Issue #47); display-only
+        # metadata, never a child node, so it can't enter any rollup.
+        "turns_trace": turns_trace,
         "children": children,
     }
 

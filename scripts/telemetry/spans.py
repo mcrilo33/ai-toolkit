@@ -21,6 +21,7 @@ SPAN_KINDS: tuple[str, ...] = (
     "step",
     "hook",
     "script",
+    "tool",
     "skill",
     "agent",
     "todo",

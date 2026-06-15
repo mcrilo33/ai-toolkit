@@ -162,7 +162,10 @@ def _span_for_tool_use(
             human=human,
             **common,
         )
-    return None
+    # Every other tool_use is a name-only leaf span (Issue #47 S2b): the tool name
+    # is metadata, but its `input` (Bash command, file path, Grep pattern) is user
+    # content and is never read — so no summary, and nothing leaks.
+    return Span(kind="tool", name=name if isinstance(name, str) else "tool", **common)
 
 
 def _todo_summaries(records: list[dict]) -> dict[str, str]:

@@ -79,7 +79,7 @@ payload leakage, basename-only repo, opt-in no-op, invisibility).
 | `workflow_rev` | string \| null | ai-toolkit short SHA at emit time. Resolution order: `$AI_TOOLKIT_WORKFLOW_REV` → synced-target `.ai-toolkit-manifest.json` `toolkit_rev` → ai-toolkit checkout git SHA → `VERSION`. |
 | `repo` | string | Project-root **basename**. `unknown` if unresolved. |
 | `branch` | string \| null | Current git branch of the project root. |
-| `kind` | string | One of `lifecycle, step, hook, script, skill, agent, todo, human, rule`. |
+| `kind` | string | One of `lifecycle, step, hook, script, tool, skill, agent, todo, human, rule`. |
 | `name` | string | The toolkit construct: `worktree-new`, `commit-gauntlet`, `solo-cycle`, `tdd-red`, … |
 | `phase` | string \| null | Sub-phase: `spawn, land, teardown` (lifecycle); `red, green, review, push` (step); else `null`. |
 | `ts_start` / `ts_end` | string | ISO-8601 UTC, second precision. |
@@ -97,6 +97,7 @@ payload leakage, basename-only repo, opt-in no-op, invisibility).
 | `step` | cycle gate scripts (`red/green/review/push`) | — |
 | `hook` | every hook invocation (auto, via the hook lib) | — |
 | `script` | reserved for other instrumented scripts | — |
+| `tool` | — | one name-only leaf per `tool_use` (Issue #47): `Bash`, `Edit`, `Read`, … |
 | `skill`, `agent`, `todo`, `human`, `rule` | — | reconstructed from CC session logs |
 
 ## The three key mechanisms

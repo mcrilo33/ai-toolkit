@@ -21,8 +21,8 @@ All live in `scripts/telemetry/`:
 
 | Module | Responsibility |
 |--------|----------------|
-| `spans.py` | The `Span` dataclass — the frozen 18-field schema, verbatim. |
-| `session_parser.py` | Parse `~/.claude/projects/*/*.jsonl` into `skill` / `agent` / `todo` / `human` spans; walk `<session>/subagents/agent-<id>.jsonl` subagent transcripts into `UsageEvent`s. |
+| `spans.py` | The `Span` dataclass — the frozen schema plus the additive, optional, pull-only `summary` field (Issue #47). |
+| `session_parser.py` | Parse `~/.claude/projects/*/*.jsonl` into `skill` / `agent` / `todo` / `human` spans plus a name-only `tool` leaf per `tool_use` (Issue #47); walk `<session>/subagents/agent-<id>.jsonl` subagent transcripts into `UsageEvent`s. |
 | `cost.py` | Attribute tokens and cost to every span; reuse `ccusage` for cost. |
 | `spoke_runs.py` | Group spans into spoke-run lifetimes; per-invocation normalized metrics. |
 | `queries.py` | Expose the unified push + pull dataset as in-memory DuckDB views. |
