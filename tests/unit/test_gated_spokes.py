@@ -162,3 +162,77 @@ def test_start_task_kickoff_parks_at_the_plan_gate_git_native() -> None:
     )
     # The marker the spoke emits when it parks (consumed by the hub watch).
     assert "gate/" in flat, "the kickoff references the gate/<id> park marker"
+
+
+# ── Subtask: the gate-ACTION enum {human-pause | agent-review | none} (#40 ST4) ─
+# A second dimension layered onto the gate spectrum: WHO services a parked gate.
+# It is derived from MODE, not declared per task — day mode pauses for a human,
+# night mode routes judgment gates to an independent adversarial reviewer and
+# escalates to PARK. Shared with #34 as documented convention (substring-guarded),
+# not a typed contract.
+
+
+def test_solo_cycle_documents_gate_action_enum() -> None:
+    flat = _flat(SOLO_CYCLE)
+    assert "gate action" in flat, "solo-cycle must document the gate-action dimension"
+    for value in ("human-pause", "agent-review", "none"):
+        assert value in flat, f"the gate-action enum must name '{value}'"
+
+
+def test_solo_cycle_gate_action_is_mode_derived() -> None:
+    flat = _flat(SOLO_CYCLE)
+    # Day mode = human-pause (today's behavior); night mode = agent-review.
+    assert "day" in flat and "human-pause" in flat
+    assert "night" in flat and "agent-review" in flat
+    assert "mode" in flat, "the action is derived from mode, not declared per task"
+
+
+def test_solo_cycle_night_reviewer_is_independent_adversarial_bounded() -> None:
+    flat = _flat(SOLO_CYCLE)
+    assert "independent" in flat and "adversarial" in flat
+    assert "refute" in flat, "the night reviewer is prompted to refute, not rubber-stamp"
+    assert "two round" in flat or "2-round" in flat or "two-round" in flat, (
+        "the revise loop is bounded to two rounds"
+    )
+    assert "park" in flat, "the bounded loop escalates to park"
+
+
+def test_solo_cycle_inherently_human_gate_always_parks() -> None:
+    flat = _flat(SOLO_CYCLE)
+    assert "always park" in flat, "draft/acceptance gates always park (agent cannot stand in)"
+    assert "draft" in flat or "acceptance" in flat
+    assert "accept/" in flat, "the inherently-human park emits the accept/<issue> marker"
+
+
+def test_solo_cycle_documents_anti_gutting_clause() -> None:
+    flat = _flat(SOLO_CYCLE)
+    assert "sys.exit(0)" in flat, "the code-review reviewer checks for a sys.exit(0) cheat"
+    assert "gut" in flat or "weaken" in flat
+    assert "assert" in flat, "the cheat to catch is deleted/weakened assertions"
+
+
+def test_solo_cycle_is_honest_about_enforceability() -> None:
+    flat = _flat(SOLO_CYCLE)
+    # The PLAN/RED adversarial review is policy (a spoke can narrate a review it
+    # never ran); the mechanical backstops are named honestly.
+    assert "policy" in flat or "behavioral" in flat
+    assert "anti-gutting" in flat, "the anti-gutting tripwire is the mechanical backstop"
+    assert "test-select" in flat, "test-select (tests must pass) is the other backstop"
+
+
+def test_solo_cycle_three_terminal_markers_free_a_slot() -> None:
+    flat = _flat(SOLO_CYCLE)
+    for marker in ("ready/", "accept/", "blocked/"):
+        assert marker in flat, f"the {marker} terminal marker must be documented"
+    assert (
+        "frees a slot" in flat
+        or "free a supervisor slot" in flat
+        or "frees a supervisor slot" in flat
+    )
+
+
+def test_start_task_documents_mode_derived_gate_action() -> None:
+    flat = _flat(START_TASK)
+    assert "gate action" in flat, "start-task must note the gate-action dimension"
+    assert "mode" in flat
+    assert "human-pause" in flat and "agent-review" in flat

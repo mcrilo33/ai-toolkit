@@ -329,20 +329,50 @@ def test_dispatch_passes_type_feature_and_prompt(night_hub: Path, tmp_path: Path
     assert all("type=yes" in ln and "prompt=yes" in ln for ln in lines)
 
 
-# --- The night kickoff parks via the scripted marker path (issue #45) ---------
+# --- The night kickoff: agent-review + park-don't-guess (issue #40 ST4) --------
+# The behavioral inversion of the daytime kickoff. Daytime parks at the PLAN gate
+# for a human (gate/N); overnight the judgment gates route to an independent
+# adversarial reviewer and uncertainty escalates to PARK (blocked/N), never to
+# "ask" (which hangs the slot) or "guess". Markers emit via the scripted path.
 
 
-def test_kickoff_emits_gate_via_script() -> None:
-    """kickoff_for parks on gate/N via spoke-ready.sh, not a hand-written chain."""
-    proc = _call("kickoff_for 7")
+def _kickoff_flat(issue: int = 7) -> tuple[subprocess.CompletedProcess[str], str]:
+    proc = _call(f"kickoff_for {issue}")
+    return proc, re.sub(r"\s+", " ", proc.stdout).lower()
+
+
+def test_night_kickoff_is_park_dont_guess() -> None:
+    proc, flat = _kickoff_flat()
 
     assert proc.returncode == 0, proc.stderr
-    assert "spoke-ready.sh --gate 7" in proc.stdout, (
-        "the night kickoff must emit the gate marker via spoke-ready.sh"
+    assert "unattended" in flat, "the night kickoff must state it runs unattended"
+    assert "park" in flat
+    assert "never" in flat and ("ask" in flat or "guess" in flat), (
+        "uncertainty routes to park, never to ask (hangs) or guess"
     )
-    assert "git tag -f -a gate/7" not in proc.stdout, (
-        "the night kickoff must not hand-write the git tag/push gate chain"
+
+
+def test_night_kickoff_routes_judgment_gates_to_adversarial_review() -> None:
+    proc, flat = _kickoff_flat()
+
+    assert proc.returncode == 0, proc.stderr
+    assert "adversarial" in flat or "refute" in flat
+    assert "code-review" in flat, "the reviewer is the independent code-review agent"
+    assert "two round" in flat or "2-round" in flat or "two-round" in flat, (
+        "the revise loop is bounded to two rounds, then park"
     )
+
+
+def test_night_kickoff_emits_terminal_markers_via_script() -> None:
+    proc, flat = _kickoff_flat()
+
+    assert proc.returncode == 0, proc.stderr
+    for marker in ("ready/", "accept/", "blocked/"):
+        assert marker in flat, f"the night kickoff must name the {marker} terminal marker"
+    assert "spoke-ready.sh" in flat and "--accept" in flat and "--blocked" in flat, (
+        "terminal markers emit via the scripted spoke-ready.sh path"
+    )
+    assert "git tag -f -a" not in flat, "no hand-written git tag/push chain"
 
 
 def test_kickoff_is_not_plan_mode() -> None:
