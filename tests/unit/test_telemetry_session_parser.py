@@ -61,7 +61,19 @@ SECRETS = (
     "SECRET_AGENT_OUTPUT",
     "SECRET_AGENT_WORK",
     "SECRET_ANSWER",
+    # Tool inputs/outputs (Issue #47 S2b): tool leaf spans are name-only — the
+    # Bash command, Read/Write path & content, Edit text, Grep pattern, and the
+    # tool result body must never appear in a span.
+    "SECRET_COMMAND",
+    "SECRET_PATH",
+    "SECRET_EDIT_OLD",
+    "SECRET_PATTERN",
+    "SECRET_WRITE_CONTENT",
+    "SECRET_FILE_CONTENT",
 )
+
+# Tool names planted in the fixture's tool_use blocks (Issue #47 S2b).
+TOOL_NAMES = {"Bash", "Read", "Edit", "Grep", "Write"}
 
 
 @pytest.fixture()
@@ -138,6 +150,43 @@ class TestSpanKinds:
         assert human is not None
         # AskUserQuestion fired at 12:01:10, answered at 12:01:40 → 30s wait.
         assert human["wait_ms"] == 30000
+
+
+class TestToolSpans:
+    """Issue #47 S2b: every tool_use becomes a name-only `tool` leaf span."""
+
+    def test_every_tool_use_emits_a_leaf_span_named_by_tool(self, parsed: ParsedSession) -> None:
+        tools = _by_kind(parsed, "tool")
+        assert {t.name for t in tools} == TOOL_NAMES
+
+    def test_specific_tools_keep_their_own_kinds(self, parsed: ParsedSession) -> None:
+        # Skill/Agent/Todo/AskUserQuestion are NOT generic `tool` leaves.
+        assert not [t for t in _by_kind(parsed, "tool") if t.name in {"Skill", "Task", "TodoWrite"}]
+        assert len(_by_kind(parsed, "skill")) == 1
+        assert len(_by_kind(parsed, "agent")) == 1
+
+    def test_tool_span_brackets_tool_use_to_tool_result(self, parsed: ParsedSession) -> None:
+        bash = next(t for t in _by_kind(parsed, "tool") if t.name == "Bash")
+        assert bash.ts_start == "2026-06-13T12:02:00.000Z"
+        assert bash.ts_end == "2026-06-13T12:02:05.000Z"
+        assert bash.duration_ms == 5000
+
+    def test_tool_span_carries_no_summary_or_cost_at_parse_time(
+        self, parsed: ParsedSession
+    ) -> None:
+        for tool in _by_kind(parsed, "tool"):
+            assert tool.summary is None
+            assert tool.tokens_in is None
+            assert tool.tokens_out is None
+            assert tool.cost_usd is None
+
+    def test_no_tool_input_or_output_leaks_into_tool_spans(self, parsed: ParsedSession) -> None:
+        blob = "".join(str(t.to_dict()) for t in _by_kind(parsed, "tool"))
+        for secret in SECRETS:
+            assert secret not in blob
+
+    def test_tool_kind_is_accepted_by_the_schema(self) -> None:
+        assert Span(span_id="x", kind="tool", name="Bash").kind == "tool"
 
 
 class TestSubagentWalk:

@@ -490,6 +490,86 @@ def test_format_step_label_prefers_summary_over_name():
     assert queries.format_step_label(bare) == "Plan"
 
 
+# --- S7: tool leaf spans + hook nesting + per-turn trace (Issue #47 S2b) --------
+
+
+def test_tool_leaves_emit_in_the_spoke_forest():
+    forest = store_v2().spoke_steps(RUN)
+    tools = [n for n in _walk(forest) if n["kind"] == "tool"]
+
+    # Every tool_use is a leaf in the tree (here Bash + Read), nested by time.
+    assert {n["name"] for n in tools} == {"Bash", "Read"}
+
+
+def test_hook_nests_under_its_triggering_tool_by_time_window():
+    forest = store_v2().spoke_steps(RUN)
+    bash = next(n for n in _walk(forest) if n["span_id"] == "v2_bash")
+
+    # The hook whose window falls inside the Bash tool's window nests UNDER it
+    # (collapsed), not at the bucket level — hooks bind to their triggering tool.
+    hooks = [c for c in bash["children"] if c["kind"] == "hooks"]
+    assert hooks and {h["span_id"] for h in hooks[0]["children"]} == {"v2_bash_hook"}
+
+
+def test_hook_outside_any_tool_window_still_collapses_at_its_level():
+    forest = store_v2().spoke_steps(RUN)
+    red = _find(forest, "v2_red")
+
+    # The red-step hooks fall in no tool window → still collapse at the red level,
+    # proving tool nesting is purely additive (the collapse rule is unchanged).
+    hooks = next(c for c in red["children"] if c["kind"] == "hooks")
+    assert hooks["collapsed_count"] == 2
+
+
+def test_tool_leaves_own_zero_cost_and_tokens():
+    forest = store_v2().spoke_steps(RUN)
+    tools = [n for n in _walk(forest) if n["kind"] == "tool"]
+
+    assert tools
+    assert all(
+        n["own_cost_usd"] == 0.0 and n["own_tokens_in"] == 0 and n["own_tokens_out"] == 0
+        for n in tools
+    )
+
+
+def test_conservation_unchanged_with_tool_leaves():
+    forest = store_v2().spoke_steps(RUN)
+
+    # The #46 run total must not move when tool/hook leaves are added.
+    total = sum(root["rollup"]["cost_usd"] for root in forest)
+    assert total == pytest.approx(0.495)
+
+
+def test_per_turn_dividers_attached_to_bucket_from_turns_relation():
+    forest = store_v2().spoke_steps(RUN)
+    green = _bucket(forest, "green")
+
+    # The green bucket carries a per-turn trace sourced from the turns relation:
+    # the two main turns whose ts falls in (red, green] with their token spikes.
+    trace = green["turns_trace"]
+    assert [e["tokens"] for e in trace] == [80, 55]
+    assert [e["ts"] for e in trace] == ["2026-06-12T12:01:05Z", "2026-06-12T12:01:35Z"]
+    assert all(e["kind"] == "turn_divider" and "span_id" not in e for e in trace)
+
+
+def test_per_turn_dividers_empty_without_turns_relation():
+    queries = load_queries()
+    store = queries.SpanStore.from_jsonl(FIXTURE_V2_SPANS)  # no turns table data
+
+    green = _bucket(store.spoke_steps(RUN), "green")
+
+    assert green["turns_trace"] == []
+
+
+def test_dividers_are_not_spans_and_do_not_enter_rollups():
+    forest = store_v2().spoke_steps(RUN)
+
+    # Dividers live only in the bucket's turns_trace metadata — never as child
+    # nodes — so they cannot leak into _walk-based meta/kind/conservation math.
+    assert not [n for n in _walk(forest) if n["kind"] == "turn_divider"]
+    assert sum(r["rollup"]["cost_usd"] for r in forest) == pytest.approx(0.495)
+
+
 # --- S4: meta-by-kind aggregation -----------------------------------------------
 
 
@@ -500,19 +580,20 @@ def _by_kind(rows):
 def test_meta_by_kind_counts_each_span_kind():
     meta = _by_kind(store_v2().spoke_meta_by_kind(RUN))
 
-    assert meta["hook"]["count"] == 2  # "launched too much" signal lives here
+    assert meta["hook"]["count"] == 3  # 2 red-step hooks + 1 under the Bash tool
     assert meta["todo"]["count"] == 4  # TodoWrite + 3 TaskCreate
     assert meta["step"]["count"] == 2
     assert meta["lifecycle"]["count"] == 2
     assert meta["agent"]["count"] == 1
+    assert meta["tool"]["count"] == 2  # Bash + Read leaf spans (Issue #47 S2b)
 
 
 def test_meta_by_kind_time_stats_are_real_durations():
     meta = _by_kind(store_v2().spoke_meta_by_kind(RUN))
 
-    # Hooks: 100 + 80 = 180 total, median of the two = 90.
-    assert meta["hook"]["total_duration_ms"] == 180
-    assert meta["hook"]["median_duration_ms"] == 90
+    # Hooks: 100 + 80 + 500 (the Bash-nested hook) = 680 total, median of three = 100.
+    assert meta["hook"]["total_duration_ms"] == 680
+    assert meta["hook"]["median_duration_ms"] == 100
     assert meta["todo"]["median_duration_ms"] == 1000
 
 
@@ -528,18 +609,22 @@ def test_meta_by_kind_cost_is_subagent_only_after_source_split():
     assert meta["human"]["total_cost_usd"] == 0.0
     assert meta["lifecycle"]["total_cost_usd"] == 0.0
     assert meta["hook"]["total_cost_usd"] == 0.0
+    assert meta["tool"]["total_cost_usd"] == 0.0  # tool leaves own nothing (Issue #47)
 
 
 def test_meta_by_kind_sorts_by_cost_then_count_then_kind():
     rows = store_v2().spoke_meta_by_kind(RUN)
 
     # agent ($0.35) first; the rest at $0 by count desc then kind asc.
+    # counts: todo 4, hook 3, then the count-2 group (lifecycle, step, tool) and
+    # the count-1 group (human, skill), each ordered by kind ascending.
     assert [row["kind"] for row in rows] == [
         "agent",
         "todo",
         "hook",
         "lifecycle",
         "step",
+        "tool",
         "human",
         "skill",
     ]
