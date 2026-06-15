@@ -30,19 +30,22 @@ set -euo pipefail
 # ── Diff-safe chmod of the repo's scripts ────────────────────────────────────
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   # Tracked-100755 files whose working-tree bit was dropped — restore it (this
-  # only re-matches the index, so it adds no change to the diff).
-  while IFS= read -r f; do
-    if [ -n "$f" ] && [ ! -x "$f" ]; then
-      chmod +x "$f"
+  # only re-matches the index, so it adds no change to the diff). `-z` emits each
+  # record NUL-terminated and the path verbatim (no space-splitting, no octal
+  # quoting of non-ASCII), so a path with spaces or unicode is handled correctly.
+  # Each record is "<mode> <object> <stage>\t<path>": the mode is the first
+  # field, the path is everything after the tab.
+  while IFS= read -r -d '' entry; do
+    if [ "${entry%% *}" = "100755" ]; then
+      f="${entry#*$'\t'}"
+      [ ! -x "$f" ] && chmod +x "$f"
     fi
-  done < <(git ls-files -s -- '*.sh' | awk '$1 == "100755" { print $4 }')
+  done < <(git ls-files -s -z -- '*.sh')
 
   # Brand-new untracked scripts — make them runnable so the suite can exec them.
-  while IFS= read -r f; do
-    if [ -n "$f" ]; then
-      chmod +x "$f"
-    fi
-  done < <(git ls-files --others --exclude-standard -- '*.sh')
+  while IFS= read -r -d '' f; do
+    [ -n "$f" ] && chmod +x "$f"
+  done < <(git ls-files --others --exclude-standard -z -- '*.sh')
 fi
 
 # ── Resolve a pytest runner ──────────────────────────────────────────────────

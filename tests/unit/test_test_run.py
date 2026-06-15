@@ -82,6 +82,13 @@ def project(tmp_path: Path) -> Path:
     lib_sh.write_text("# sourced, not executed\n")
     _git(repo, "add", "scripts/lib.sh")
 
+    # A tracked-100755 script whose path has a space — its restore loop is the one
+    # that word-split and aborted the wrapper before the NUL-delimited read fix.
+    spaced_sh = repo / "scripts" / "has space.sh"
+    spaced_sh.write_text("#!/usr/bin/env bash\necho spaced\n")
+    spaced_sh.chmod(0o755)
+    _git(repo, "add", "scripts/has space.sh")
+
     # A trivial passing test so real pytest exits 0 fast.
     tests_dir = repo / "tests"
     tests_dir.mkdir()
@@ -90,13 +97,20 @@ def project(tmp_path: Path) -> Path:
     _git(repo, "add", "tests/test_ok.py")
     _git(repo, "commit", "-qm", "chore: seed")
 
-    # Drop the exec bit on the tracked-100755 script (fresh-checkout simulation).
+    # Drop the exec bit on the tracked-100755 scripts (fresh-checkout simulation).
     exec_sh.chmod(0o644)
+    spaced_sh.chmod(0o644)
 
     # A brand-new untracked script the spoke just wrote, not yet executable.
     new_sh = repo / "scripts" / "new.sh"
     new_sh.write_text("#!/usr/bin/env bash\necho new\n")
     new_sh.chmod(0o644)
+
+    # An untracked script whose name has a space and a non-ASCII char — the chmod
+    # step must not split on the space nor choke on git's octal path-quoting.
+    awkward_sh = repo / "scripts" / "my scrïpt.sh"
+    awkward_sh.write_text("#!/usr/bin/env bash\necho awkward\n")
+    awkward_sh.chmod(0o644)
 
     return repo
 
@@ -108,7 +122,7 @@ def test_runs_pytest_and_passes(project: Path) -> None:
     result = _run(project, "tests/")
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "passed" in (result.stdout + result.stderr)
+    assert "1 passed" in (result.stdout + result.stderr)
 
 
 def test_returns_pytest_failure_exit_code(project: Path) -> None:
@@ -128,10 +142,27 @@ def test_chmods_untracked_script(project: Path) -> None:
     assert _is_exec(project / "scripts" / "new.sh"), "untracked new script not made executable"
 
 
+def test_chmods_untracked_script_with_awkward_name(project: Path) -> None:
+    # A space- and unicode-laden path must be read verbatim (NUL-delimited), not
+    # word-split or octal-quoted, or the chmod targets the wrong path and the
+    # whole wrapper aborts under `set -e` before pytest ever runs.
+    result = _run(project, "tests/")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _is_exec(project / "scripts" / "my scrïpt.sh"), "awkwardly-named script not made exec"
+
+
 def test_restores_bit_on_tracked_executable(project: Path) -> None:
     _run(project, "tests/")
 
     assert _is_exec(project / "scripts" / "exec.sh"), "tracked-100755 script's bit not restored"
+
+
+def test_restores_bit_on_tracked_executable_with_space(project: Path) -> None:
+    result = _run(project, "tests/")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _is_exec(project / "scripts" / "has space.sh"), "spaced tracked-100755 bit not restored"
 
 
 def test_leaves_tracked_lib_non_executable(project: Path) -> None:
