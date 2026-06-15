@@ -123,11 +123,31 @@ starts a spoke once less than `T_task` of the night remains, reuses a freed slot
 spoke finishes (`ready/N`) or goes idle, and is idempotent — re-running skips branches
 already in flight. Knobs (env, defaults): `NIGHT_END=07:00`, `NIGHT_MAX_CONCURRENCY=3`,
 `NIGHT_TASK_MINUTES=90`. Use `--once` for a single tick (e.g. under cron). It dispatches
-only — the hub still lands finished spokes on `/land`.
+only — the hub still lands finished spokes on `/land`. The dispatcher also enforces a
+per-spoke wall-clock ceiling (`NIGHT_SPOKE_MAX_MINUTES`, default 180): a hung, idle, or
+runaway spoke is reaped (its window killed and a `blocked/N` emitted on its behalf) so
+the unattended night never runs unbounded. At end of night it pre-computes the
+land-triage for the morning report.
 
-> [!NOTE]
-> This is Phase 1 (the dispatcher) of night mode. The night-specific kickoff, pre-flight
-> batching scout, and morning report are separate follow-ups (epic #40).
+### Morning report (night mode)
+
+On waking, run the morning report on the hub to turn the drained queue into a worklist
+sorted fastest → slowest human effort:
+
+```bash
+bash .ai-toolkit/scripts/hub-morning.sh
+```
+
+It reads the terminal markers and tiers them — **LAND** (`ready/N`, merges clean,
+agent-approved → rubber-stamp `/land N`), **EYEBALL** (`accept/N`, built + reviewed →
+glance then land/send back), **THINK** (`blocked/N` → read the parked blocker, answer +
+re-queue), **CONFLICTS** (`ready/N` whose throwaway merge hit a conflict → hand-resolve)
+— with each row's diff size, trust summary (the marker's annotated-tag body), per-spoke
+cost (reused from the #35 dashboard's pull layer), and the exact next command. A `gate/N`
+still parked at the PLAN gate shows in a footer. The land-triage that decides LAND vs
+CONFLICTS is pre-computed at end of night (`hub-morning.sh --triage`, called by the
+dispatcher) in a hermetic throwaway worktree — a merge-conflict probe only, never the
+test suite (the real gate fires at `/land`).
 
 ### 3. Propose the next move — act only on confirmation
 

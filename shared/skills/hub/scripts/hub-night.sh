@@ -553,6 +553,21 @@ night_done() {
   [ "$queue_count" -eq 0 ] && [ "$inflight_count" -eq 0 ]
 }
 
+# pre_compute_land_triage — at end of night, merge-probe every ready branch so the
+# 07:00 morning report is instant (the throwaway merge is the only slow/risky step,
+# and must not run while a human reads the report). Delegates to hub-morning.sh
+# --triage; best-effort — a missing hub-morning.sh is a no-op.
+pre_compute_land_triage() {
+  local main_root="${MAIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}"
+  local hm="${HUB_MORNING:-$SCRIPT_DIR/hub-morning.sh}"
+  if [ ! -x "$hm" ] && [ -x "$main_root/.ai-toolkit/scripts/hub-morning.sh" ]; then
+    hm="$main_root/.ai-toolkit/scripts/hub-morning.sh"
+  fi
+  [ -x "$hm" ] || { log "land-triage: hub-morning.sh not found — skipping pre-compute"; return 0; }
+  log "→ pre-computing land-triage for the morning report"
+  "$hm" --triage || log "land-triage: pre-compute failed (non-fatal)"
+}
+
 main() {
   local once=0
   while [ "$#" -gt 0 ]; do
@@ -576,6 +591,12 @@ main() {
     night_done && { log "night dispatcher done"; break; }
     sleep "$NIGHT_TICK_SECONDS"
   done
+
+  # End of the supervising night (both exit paths: queue drained or launch cutoff
+  # past) — pre-compute the land-triage so the morning report is instant. A single
+  # --once tick is not end-of-night, so it skips this.
+  [ "$once" -eq 0 ] && pre_compute_land_triage
+  return 0
 }
 
 [[ "${BASH_SOURCE[0]}" == "${0}" ]] && main "$@"

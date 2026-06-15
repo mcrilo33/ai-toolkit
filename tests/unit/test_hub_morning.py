@@ -120,8 +120,10 @@ def test_probe_merge_conflict_and_no_leftover_worktree(repo: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "conflict"
-    # The throwaway worktree must be torn down — never strand a probe worktree.
-    assert "probe" not in _git(repo, "worktree", "list")
+    # The throwaway worktree must be torn down — only the main checkout remains
+    # (count entries; the repo's own tmp path happens to contain "probe").
+    entries = [ln for ln in _git(repo, "worktree", "list").splitlines() if ln.strip()]
+    assert len(entries) == 1, f"a probe worktree was stranded: {entries}"
 
 
 # ── end-to-end: the report tiers the markers and prints the next command ──────
@@ -182,7 +184,19 @@ def test_report_shows_blocker_reason_for_blocked(hub: Path, tmp_path: Path) -> N
     (wt / "f.txt").write_text("x\n")
     _git(wt, "add", "-A")
     _git(wt, "commit", "-qm", "feat: x", "-m", "Refs #103")
-    _git(hub, "tag", "-a", "blocked/103", "-m", "ambiguous acceptance criteria", "feature/103-wip")
+    # spoke-ready.sh emits the marker as subject=state word, body=reason
+    # (git tag -a -m "<state>" -m "<reason>"); the report reads the body as trust.
+    _git(
+        hub,
+        "tag",
+        "-a",
+        "blocked/103",
+        "-m",
+        "blocked",
+        "-m",
+        "ambiguous acceptance criteria",
+        "feature/103-wip",
+    )
 
     result = _run_report(hub, tmp_path)
 
@@ -190,3 +204,45 @@ def test_report_shows_blocker_reason_for_blocked(hub: Path, tmp_path: Path) -> N
     assert "ambiguous acceptance criteria" in result.stdout, (
         "the blocker reason (tag body) is shown"
     )
+
+
+def _run_triage(hub: Path, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(HUB_MORNING), "--triage"],
+        cwd=str(hub),
+        capture_output=True,
+        text=True,
+        env={**_GIT_ENV, "NIGHT_STATE_DIR": str(tmp_path / "night-state")},
+    )
+
+
+def test_triage_then_report_routes_a_conflicting_ready_to_conflicts(
+    hub: Path, tmp_path: Path
+) -> None:
+    # End-to-end of the load-bearing path: land_triage_all merge-probes a ready
+    # branch that conflicts with the (diverged) default, caches "conflict", and the
+    # report then routes that ready/N into CONFLICTS rather than LAND.
+    wt = tmp_path / "wt-104"
+    _git(hub, "worktree", "add", "-q", "-b", "feature/104-edit", str(wt))
+    (wt / "README.md").write_text("branch change\n")  # same file the hub seeds
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-qm", "feat: edit", "-m", "Refs #104")
+    _git(hub, "tag", "-a", "ready/104", "-m", "ready", "feature/104-edit")
+    # Diverge main on the same file so the merge conflicts.
+    (hub / "README.md").write_text("main change\n")
+    _git(hub, "add", "-A")
+    _git(hub, "commit", "-qm", "fix: edit", "-m", "Refs #0")
+
+    triage = _run_triage(hub, tmp_path)
+    assert triage.returncode == 0, triage.stderr
+    cache = tmp_path / "night-state" / "land-triage"
+    assert cache.is_file() and "104 conflict" in cache.read_text(), "triage must cache the verdict"
+
+    result = _run_report(hub, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+    conflicts_section = out.split("CONFLICTS")[1] if "CONFLICTS" in out else ""
+    assert "#104" in conflicts_section, "a conflicting ready/N must land in the CONFLICTS tier"
+    land_section = out.split("LAND")[1].split("EYEBALL")[0]
+    assert "#104" not in land_section, "a conflicting ready/N must NOT be in LAND"
