@@ -148,3 +148,153 @@ def test_launch_cutoff_not_reached_at_or_above_t_task() -> None:
     result = _call("launch_cutoff_reached 90")
 
     assert result.returncode != 0
+
+
+# --- Dispatch tick (--once): queue, idempotent skip, cutoff ------------------
+# These run the script end-to-end for one tick from a hub checkout, with `gh`
+# (the night queue) and worktree-new.sh (WT_NEW, the dispatcher) stubbed so no
+# real worktree, tmux window, or network is touched. The WT_NEW stub logs one
+# line per call so a test can count dispatches and inspect the args.
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=str(repo), check=True, capture_output=True, text=True
+    ).stdout
+
+
+@pytest.fixture()
+def night_hub(tmp_path: Path) -> Path:
+    """A hub (main checkout) with a bare origin and no in-flight worktrees.
+
+    Tests add in-flight worktrees with ``_add_inflight`` and drive the queue
+    via the ``gh`` stub's ``NIGHT_QUEUE`` env var.
+    """
+    remote = tmp_path / "remote.git"
+    hub = tmp_path / "hub"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True, capture_output=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(hub)], check=True, capture_output=True)
+    for k, v in (("user.email", "t@t.t"), ("user.name", "t"), ("commit.gpgsign", "false")):
+        _git(hub, "config", k, v)
+    (hub / "README.md").write_text("seed\n")
+    _git(hub, "add", "README.md")
+    _git(hub, "commit", "-qm", "chore: seed", "-m", "Refs #0")
+    _git(hub, "remote", "add", "origin", str(remote))
+    _git(hub, "push", "-q", "-u", "origin", "main")
+    return hub
+
+
+def _add_inflight(hub: Path, tmp_path: Path, issue: int, slug: str = "wip") -> Path:
+    """Create an in-flight worktree+branch for ``issue`` (feature/<issue>-<slug>)."""
+    wt = tmp_path / f"wt-{issue}"
+    _git(hub, "worktree", "add", "-q", "-b", f"feature/{issue}-{slug}", str(wt))
+    return wt
+
+
+def _run_once(
+    hub: Path,
+    tmp_path: Path,
+    *,
+    queue: str,
+    now: int,
+    env: dict[str, str] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    """Run ``hub-night.sh --once`` from the hub with gh + WT_NEW stubbed.
+
+    Args:
+        hub: Hub checkout to run from.
+        tmp_path: Test tmpdir; the stub bin and dispatch log live under it.
+        queue: Space-separated issue numbers the gh stub returns as the queue.
+        now: Injected current time (epoch seconds) -> NIGHT_NOW.
+        env: Extra knob overrides.
+
+    Returns:
+        (completed process, dispatch-log lines). Each log line is
+        ``DISPATCH issue=<n> type=<yes|no> prompt=<yes|no>``.
+    """
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    gh = bindir / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "issue" ] && [ "$2" = "list" ]; then\n'
+        '  for n in $NIGHT_QUEUE; do echo "$n"; done\n'
+        "  exit 0\n"
+        "fi\n"
+        "exit 1\n"
+    )
+    gh.chmod(0o755)
+    wt_new = bindir / "wt-new-stub"
+    log = tmp_path / "dispatch.log"
+    wt_new.write_text(
+        "#!/bin/sh\n"
+        'issue="$1"; has_type=no; has_prompt=no\n'
+        'for a in "$@"; do\n'
+        '  [ "$a" = "--type" ] && has_type=yes\n'
+        '  [ "$a" = "--prompt" ] && has_prompt=yes\n'
+        "done\n"
+        'printf "DISPATCH issue=%s type=%s prompt=%s\\n" "$issue" "$has_type" "$has_prompt" >> "$WT_NEW_LOG"\n'
+    )
+    wt_new.chmod(0o755)
+    full_env = {
+        **os.environ,
+        "TZ": "UTC",
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "NIGHT_QUEUE": queue,
+        "NIGHT_NOW": str(now),
+        "WT_NEW": str(wt_new),
+        "WT_NEW_LOG": str(log),
+    }
+    if env:
+        full_env.update(env)
+    proc = subprocess.run(
+        ["bash", str(HUB_NIGHT), "--once"],
+        cwd=str(hub),
+        capture_output=True,
+        text=True,
+        env=full_env,
+    )
+    lines = log.read_text().splitlines() if log.exists() else []
+    return proc, lines
+
+
+def test_dispatch_up_to_target_from_queue(night_hub: Path, tmp_path: Path) -> None:
+    # 5 queued, 150 min left -> target ceil(5*90/150)=3; no in-flight -> 3 spawn.
+    now = _epoch(2026, 6, 15, 4, 30)  # 07:00 - 150m
+
+    proc, lines = _run_once(night_hub, tmp_path, queue="101 102 103 104 105", now=now)
+
+    assert proc.returncode == 0, proc.stderr
+    assert len(lines) == 3
+    assert [ln.split()[1] for ln in lines] == ["issue=101", "issue=102", "issue=103"]
+
+
+def test_inflight_issue_is_not_redispatched(night_hub: Path, tmp_path: Path) -> None:
+    # Idempotent restart: issue 101 already has a worktree, so the only queued
+    # task is skipped — no dispatch, no error (safe to re-run after a crash).
+    _add_inflight(night_hub, tmp_path, 101)
+    now = _epoch(2026, 6, 15, 4, 30)
+
+    proc, lines = _run_once(night_hub, tmp_path, queue="101", now=now)
+
+    assert proc.returncode == 0, proc.stderr
+    assert lines == []
+
+
+def test_launch_cutoff_blocks_all_dispatch(night_hub: Path, tmp_path: Path) -> None:
+    # 60 min left (< T_task=90) -> strict cutoff: nothing is started.
+    now = _epoch(2026, 6, 15, 6, 0)  # 07:00 - 60m
+
+    proc, lines = _run_once(night_hub, tmp_path, queue="101 102", now=now)
+
+    assert proc.returncode == 0, proc.stderr
+    assert lines == []
+
+
+def test_dispatch_passes_type_feature_and_prompt(night_hub: Path, tmp_path: Path) -> None:
+    now = _epoch(2026, 6, 15, 4, 30)
+
+    _, lines = _run_once(night_hub, tmp_path, queue="101 102 103 104 105", now=now)
+
+    assert lines, "expected at least one dispatch"
+    assert all("type=yes" in ln and "prompt=yes" in ln for ln in lines)
