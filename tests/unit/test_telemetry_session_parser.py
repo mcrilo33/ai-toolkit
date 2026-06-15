@@ -213,8 +213,8 @@ class TestSubagentWalk:
 
     def test_main_session_usage_events_captured(self, parsed: ParsedSession) -> None:
         main = [e for e in parsed.usage_events if e.source == "main"]
-        # Five assistant turns carry usage (the tool-call turn a5 now has usage too).
-        assert len(main) == 5
+        # Four assistant turns carry usage in the fixture.
+        assert len(main) == 4
         assert all(e.session_id == SESSION_ID for e in main)
 
 

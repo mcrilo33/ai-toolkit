@@ -134,7 +134,11 @@ def _consume_tool_use(
     agent_id = results.get(block.get("id") or "", {}).get("agent_id")
     if agent_id:
         parsed.agent_links[span.span_id] = agent_id
-        parsed.usage_events.extend(_walk_subagent(path, agent_id))
+        events, sub_spans = _walk_subagent(
+            path, agent_id, parent_meta=meta, agent_span_id=span.span_id
+        )
+        parsed.usage_events.extend(events)
+        parsed.spans.extend(sub_spans)
 
 
 def _span_for_tool_use(
@@ -372,18 +376,48 @@ def _tool_results(records: list[dict]) -> dict[str, dict]:
     return index
 
 
-def _walk_subagent(main_path: Path, agent_id: str) -> list[UsageEvent]:
+def _walk_subagent(
+    main_path: Path, agent_id: str, *, parent_meta: dict[str, str | None], agent_span_id: str
+) -> tuple[list[UsageEvent], list[Span]]:
+    """Walk a sub-agent transcript into usage events and its own step spans.
+
+    The transcript (``<session>/subagents/agent-<id>.jsonl``) is a session-shaped
+    log. Its ``tool_use`` blocks become the sub-agent's spans (#47 S3) — but its
+    leading user record is the *orchestrator's task prompt*, so human-prompt spans
+    are deliberately NOT emitted (that text stays private; the agent span already
+    summarises the task via its ``description``). Each emitted span is re-homed
+    onto the spoke: ``session_id`` becomes the parent's (so it joins the run and
+    nests under the agent) and ``parent_id`` the agent span; ``span_id`` stays
+    derived from the sub-agent transcript, keeping ids idempotent and collision-free.
+    """
     sub = main_path.parent / main_path.stem / "subagents" / f"agent-{agent_id}.jsonl"
     if not sub.exists():
-        return []
+        return [], []
+    records = _load_jsonl(sub)
+    meta = _session_meta(records)
+    results = _tool_results(records)
+    todo_summaries = _todo_summaries(records)
     events: list[UsageEvent] = []
-    for rec in _load_jsonl(sub):
+    spans: list[Span] = []
+    for rec in records:
         message = rec.get("message")
         if rec.get("type") != "assistant" or not isinstance(message, dict):
             continue
         if isinstance(message.get("usage"), dict):
             events.append(_usage_event(rec, "subagent", agent_id))
-    return events
+        for block in message.get("content") or []:
+            span = (
+                _span_for_tool_use(block, rec, results, meta, todo_summaries)
+                if isinstance(block, dict) and block.get("type") == "tool_use"
+                else None
+            )
+            if span is not None:
+                span.session_id = parent_meta["session_id"]
+                span.repo = parent_meta["repo"] or "unknown"
+                span.branch = parent_meta["branch"]
+                span.parent_id = agent_span_id
+                spans.append(span)
+    return events, spans
 
 
 def _usage_event(rec: dict, source: str, agent_id: str | None) -> UsageEvent:
