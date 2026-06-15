@@ -332,6 +332,27 @@ def test_kickoff_emits_gate_via_script() -> None:
     )
 
 
+def test_kickoff_is_not_plan_mode() -> None:
+    """The kickoff prints the plan as a visible message — never harness plan mode.
+
+    Regression lock (issue #40): the placeholder kickoff said 'present a concrete
+    implementation plan in plan mode', which violates the #34 invariant the
+    test_gated_spokes suite enforces for the docs — but kickoff_for lives in a .sh
+    those wording tests don't scan, so the bug was latent and shipped to every
+    night spoke. Lock it here so it can't be reintroduced.
+    """
+    proc = _call("kickoff_for 7")
+    flat = re.sub(r"\s+", " ", proc.stdout).lower()
+
+    assert proc.returncode == 0, proc.stderr
+    assert "plan mode" not in flat, "the kickoff must not invoke plan mode"
+    assert "exitplanmode" not in flat, "the kickoff must not invoke ExitPlanMode"
+    assert "visible message" in flat, "the plan is presented as a normal visible message"
+    assert "before green" in flat or "before writing code" in flat, (
+        "the PLAN gate must pause before any implementation"
+    )
+
+
 # --- Slot-free detection + backfill (ST3) ------------------------------------
 # An in-flight spoke frees its slot when it is done (a ready/<issue> tag at its
 # branch tip) or idle (its newest transcript is older than NIGHT_IDLE_MINUTES);
@@ -359,6 +380,46 @@ def _seed_transcript(projects_dir: Path, wt_path: Path, *, mtime: int) -> Path:
     transcript.write_text('{"type":"assistant"}\n')
     os.utime(transcript, (mtime, mtime))
     return transcript
+
+
+def _seed_terminal_tag(hub: Path, kind: str, issue: int, slug: str = "wip") -> None:
+    """Tag the in-flight branch tip <kind>/<issue> -> slot_state 'done' (issue #40).
+
+    kind is one of the terminal namespaces ready/accept/blocked; the supervisor
+    treats all three as freeing a slot, unlike the non-terminal gate/<issue> park.
+    """
+    _git(hub, "tag", f"{kind}/{issue}", f"feature/{issue}-{slug}")
+
+
+@pytest.mark.parametrize("kind", ["accept", "blocked"])
+def test_terminal_marker_frees_slot_for_backfill(
+    night_hub: Path, tmp_path: Path, kind: str
+) -> None:
+    # 101 in flight + <kind>/101 at its tip -> terminal -> doesn't occupy a slot,
+    # so the pending 102 backfills even though the full-night target is 1. This is
+    # the accept/blocked counterpart of test_done_spoke_frees_slot_for_backfill.
+    _add_inflight(night_hub, tmp_path, 101)
+    _seed_terminal_tag(night_hub, kind, 101)
+    now = _epoch(2026, 6, 15, 1, 0)  # ~6h to 07:00 -> target 1
+
+    proc, lines = _run_once(night_hub, tmp_path, queue="101 102", now=now)
+
+    assert proc.returncode == 0, proc.stderr
+    assert [ln.split()[1] for ln in lines] == ["issue=102"]
+
+
+def test_gate_marker_does_not_free_slot(night_hub: Path, tmp_path: Path) -> None:
+    # gate/101 is the NON-terminal PLAN park: a gate-parked spoke is awaiting
+    # review and still owns its slot, so under a full-night target of 1 the
+    # pending 102 is NOT backfilled. (Contrast the accept/blocked case above.)
+    _add_inflight(night_hub, tmp_path, 101)
+    _git(night_hub, "tag", "gate/101", "feature/101-wip")
+    now = _epoch(2026, 6, 15, 1, 0)
+
+    proc, lines = _run_once(night_hub, tmp_path, queue="101 102", now=now)
+
+    assert proc.returncode == 0, proc.stderr
+    assert lines == [], "a gate-parked spoke must keep occupying its slot"
 
 
 def test_done_spoke_frees_slot_for_backfill(night_hub: Path, tmp_path: Path) -> None:

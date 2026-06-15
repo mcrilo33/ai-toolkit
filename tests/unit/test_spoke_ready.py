@@ -171,6 +171,9 @@ def test_ready_retags_at_new_head(spoke: Path) -> None:
     (spoke / "more.txt").write_text("more work\n")
     _git(spoke, "add", "more.txt")
     _git(spoke, "commit", "-qm", "feat: more", "-m", "Refs #45")
+    # A terminal marker requires the tip to be on origin (durability, issue #40),
+    # so push the new commit before re-emitting at the new tip.
+    _git(spoke, "push", "-q", "origin", OWN)
 
     result = _run(spoke, "45")
 
@@ -188,6 +191,9 @@ def test_ready_force_moves_the_remote_tag(spoke: Path, remote: Path) -> None:
     (spoke / "more.txt").write_text("more work\n")
     _git(spoke, "add", "more.txt")
     _git(spoke, "commit", "-qm", "feat: more", "-m", "Refs #45")
+    # Push the new commit first — a terminal marker is refused over un-pushed
+    # work (durability, issue #40), so the force-move re-emits at a pushed tip.
+    _git(spoke, "push", "-q", "origin", OWN)
 
     result = _run(spoke, "45")
 
@@ -228,6 +234,102 @@ def test_gate_does_not_emit_ready(spoke: Path, remote: Path) -> None:
     assert not _remote_has_ref(remote, "refs/tags/ready/45")
 
 
+# ── accept/N and blocked/N: the terminal markers (issue #40) ─────────────────
+# Night mode adds two more terminal markers beside ready/N, each frees a
+# supervisor slot:
+#   accept/N  — built + pushed + agent-reviewed, final sign-off inherently human
+#               (the morning EYEBALL tier).
+#   blocked/N — stuck (ambiguity, suspected cheating, budget) → answer + re-queue
+#               (the morning THINK tier).
+# They are annotated, force-moved, pushed tags exactly like ready/N, selected by a
+# NAMED flag mirroring --gate (so they ride the existing `spoke-ready.sh:*`
+# wildcard allowlist with no new spoke permission). Payload schema: the tag
+# SUBJECT is the state word; the tag BODY is the optional -m reason — the trust
+# summary / blocker text the morning report renders.
+
+
+@pytest.mark.parametrize("flag,kind", [("--accept", "accept"), ("--blocked", "blocked")])
+def test_terminal_marker_creates_annotated_pushed_tag(
+    spoke: Path, remote: Path, flag: str, kind: str
+) -> None:
+    result = _run(spoke, flag, "45")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _git(spoke, "tag", "-l", f"{kind}/45").strip() == f"{kind}/45", "local tag not created"
+    assert _tag_type(spoke, f"{kind}/45") == "tag", "marker must be an annotated tag"
+    assert _remote_has_ref(remote, f"refs/tags/{kind}/45"), f"{kind}/45 not pushed to origin"
+
+
+@pytest.mark.parametrize("flag,kind", [("--accept", "accept"), ("--blocked", "blocked")])
+def test_terminal_marker_subject_defaults_to_state_word(spoke: Path, flag: str, kind: str) -> None:
+    result = _run(spoke, flag, "45")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    subject = _git(spoke, "tag", "-l", "--format=%(contents:subject)", f"{kind}/45").strip()
+    assert subject == kind, "the tag subject must default to the state word"
+
+
+def test_terminal_marker_reason_lands_in_tag_body(spoke: Path) -> None:
+    result = _run(spoke, "--blocked", "45", "-m", "ambiguous acceptance criteria")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    subject = _git(spoke, "tag", "-l", "--format=%(contents:subject)", "blocked/45").strip()
+    body = _git(spoke, "tag", "-l", "--format=%(contents:body)", "blocked/45")
+    assert subject == "blocked", "the subject stays the state word even with a reason"
+    assert "ambiguous acceptance criteria" in body, "the -m reason must be the tag body"
+
+
+@pytest.mark.parametrize("flag", ["--accept", "--blocked"])
+def test_terminal_marker_does_not_emit_ready(spoke: Path, remote: Path, flag: str) -> None:
+    result = _run(spoke, flag, "45")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not _git(spoke, "tag", "-l", "ready/45").strip(), f"{flag} must not also emit ready/N"
+    assert not _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+# ── Durability: a terminal marker must not be emitted over un-pushed work ─────
+# A terminal marker claims the issue's work is finished and landable. If the
+# branch commits never reached origin (the #43 narrated-push failure), the hub
+# would free the slot and the morning report would show a LAND row for work that
+# is not durable. So spoke-ready.sh refuses a terminal marker when HEAD is not
+# contained in the branch's pushed upstream. The non-terminal gate/N park is
+# EXEMPT — it legitimately precedes any branch push.
+
+
+def _commit_without_pushing(repo: Path, name: str = "more.txt") -> None:
+    (repo / name).write_text("unpushed work\n")
+    _git(repo, "add", name)
+    _git(repo, "commit", "-qm", "feat: unpushed", "-m", "Refs #45")
+
+
+@pytest.mark.parametrize(
+    "args,kind",
+    [(("45",), "ready"), (("--accept", "45"), "accept"), (("--blocked", "45"), "blocked")],
+)
+def test_terminal_marker_refused_over_unpushed_work(
+    spoke: Path, remote: Path, args: tuple[str, ...], kind: str
+) -> None:
+    _commit_without_pushing(spoke)  # HEAD now ahead of @{upstream}
+
+    result = _run(spoke, *args)
+
+    assert result.returncode != 0, "a terminal marker over un-pushed work must be refused"
+    assert not _remote_has_ref(remote, f"refs/tags/{kind}/45"), (
+        "no terminal marker may reach origin"
+    )
+
+
+def test_gate_marker_allowed_over_unpushed_work(spoke: Path, remote: Path) -> None:
+    # The PLAN-gate park is non-terminal and precedes any push — never refused.
+    _commit_without_pushing(spoke)
+
+    result = _run(spoke, "--gate", "45")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remote_has_ref(remote, "refs/tags/gate/45")
+
+
 # ── Misuse ───────────────────────────────────────────────────────────────────
 
 
@@ -236,3 +338,9 @@ def test_missing_issue_number_errors(spoke: Path) -> None:
 
     assert result.returncode == 2, "a missing issue number is a usage error (exit 2)"
     assert "issue number is required" in result.stderr
+
+
+def test_conflicting_state_flags_error(spoke: Path) -> None:
+    result = _run(spoke, "--gate", "--accept", "45")
+
+    assert result.returncode == 2, "two mutually-exclusive state flags is a usage error (exit 2)"
