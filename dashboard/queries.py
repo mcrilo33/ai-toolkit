@@ -90,6 +90,7 @@ _UNRESOLVED_KEY = "__unresolved__"
 
 # Bare todo-tool names (Issue #47): a todo span still carrying one of these as its
 # name has no in-progress item derived, so it must not override a phase label.
+# Keep in sync with session_parser.TODO_TOOLS (the parser's fallback names).
 _TODO_TOOL_NAMES = frozenset({"TodoWrite", "TaskCreate", "TaskUpdate"})
 
 

@@ -8,7 +8,10 @@ emitting spans at runtime) and builds against #21's frozen span schema
 
 Everything here is **read-only and 100% local**. Session logs contain prompt
 content, so they are parsed on-machine and only metadata / metrics are surfaced —
-never raw prompt, answer, thinking, or tool-output text.
+never raw prompt, answer, thinking, or tool-output text. **Exception (Issue #47):**
+the todo-ledger item text is retained as the L1 step label (the meaningful name of
+the work a step advances); all other prompt/answer/thinking/tool-output text stays
+filtered.
 
 ## Modules
 
