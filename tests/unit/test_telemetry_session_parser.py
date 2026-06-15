@@ -213,9 +213,63 @@ class TestSubagentWalk:
 
     def test_main_session_usage_events_captured(self, parsed: ParsedSession) -> None:
         main = [e for e in parsed.usage_events if e.source == "main"]
-        # Four assistant turns carry usage in the fixture.
-        assert len(main) == 4
+        # Five assistant turns carry usage (the tool-call turn a5 now has usage too).
+        assert len(main) == 5
         assert all(e.session_id == SESSION_ID for e in main)
+
+
+def _agent_span(parsed: ParsedSession) -> Span:
+    return _by_kind(parsed, "agent")[0]
+
+
+def _subagent_spans(parsed: ParsedSession) -> list[Span]:
+    """Spans the parser reconstructs from the walked sub-agent transcript."""
+    agent_id = _agent_span(parsed).span_id
+    return [s for s in parsed.spans if s.parent_id == agent_id]
+
+
+class TestSubagentSpans:
+    """Issue #47 S3: the sub-agent's own steps become spans under the agent span."""
+
+    def test_subagent_tool_use_emits_a_span(self, parsed: ParsedSession) -> None:
+        reads = [s for s in _subagent_spans(parsed) if s.kind == "tool" and s.name == "Read"]
+        assert len(reads) == 1
+
+    def test_subagent_span_inherits_parent_session_and_repo(self, parsed: ParsedSession) -> None:
+        # The sub-agent span joins the spoke via the PARENT session id, not the
+        # sub-agent transcript's own session metadata.
+        sub = _subagent_spans(parsed)[0]
+        assert sub.session_id == SESSION_ID
+        assert sub.repo == "proj"
+        assert sub.branch == "feature/22-demo"
+
+    def test_subagent_span_parent_id_is_the_agent_span(self, parsed: ParsedSession) -> None:
+        sub = next(s for s in _subagent_spans(parsed) if s.name == "Read")
+        assert sub.parent_id == _agent_span(parsed).span_id
+
+    def test_subagent_span_summary_is_its_main_parameter(self, parsed: ParsedSession) -> None:
+        sub = next(s for s in _subagent_spans(parsed) if s.name == "Read")
+        assert sub.summary == "/repo/sub/code.py"
+
+    def test_subagent_span_ids_are_idempotent(self) -> None:
+        a = {s.span_id for s in _subagent_spans(parse_session_file(SESSION))}
+        b = {s.span_id for s in _subagent_spans(parse_session_file(SESSION))}
+        assert a == b and a
+
+    def test_subagent_spans_carry_no_tokens_or_cost_at_parse_time(
+        self, parsed: ParsedSession
+    ) -> None:
+        for sub in _subagent_spans(parsed):
+            assert sub.tokens_in is None
+            assert sub.tokens_out is None
+            assert sub.cost_usd is None
+
+    def test_subagent_usage_event_totals_unchanged(self, parsed: ParsedSession) -> None:
+        # Emitting sub-agent spans must not add usage events: s2b carries no usage,
+        # so the agent's token pool stays 700/450/1000.
+        sub = [e for e in parsed.usage_events if e.source == "subagent"]
+        assert sum(e.input_tokens for e in sub) == 700
+        assert sum(e.output_tokens for e in sub) == 450
 
 
 class TestSchemaConformance:
