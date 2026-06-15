@@ -241,6 +241,72 @@ def test_no_unresolved_bucket_when_every_turn_is_placed():
     assert not [n for n in forest if n["name"] == "(unresolved)"]
 
 
+def test_same_ts_main_turns_are_both_kept_no_cost_dropped():
+    queries = load_queries()
+    # Two main inferences can share a timestamp (ms precision collisions happen).
+    # Both must become turn nodes — neither the turn nor its cost may be dropped.
+    spans = [
+        _span("c_spawn", "2026-06-12T12:00:00Z", "2026-06-12T12:00:01Z", **_LIFE_NEW),
+        _span("c_red", "2026-06-12T12:00:15Z", "2026-06-12T12:00:15Z", phase="red"),
+        _span("c_teardown", "2026-06-12T12:00:35Z", "2026-06-12T12:00:36Z", **_LIFE_DONE),
+    ]
+    turns = [_turn("2026-06-12T12:00:05Z", 1000), _turn("2026-06-12T12:00:05Z", 2000)]
+    forest = queries.SpanStore.from_events(spans, turns=turns).spoke_steps("ka/run+1")
+
+    setup = _bucket(forest, "setup")
+    assert len(_turns(setup)) == 2
+    assert sum(_rolled_tokens(root) for root in forest) == 3000
+
+
+def test_same_ts_subagent_turns_are_both_kept():
+    queries = load_queries()
+    # Two sub-agent inferences sharing a ts under one agent must both survive.
+    spans = [
+        _span("s_spawn", "2026-06-12T12:00:00Z", "2026-06-12T12:00:01Z", **_LIFE_NEW),
+        _span(
+            "s_agent", "2026-06-12T12:00:10Z", "2026-06-12T12:00:50Z", kind="agent", name="Explore"
+        ),
+        _span("s_teardown", "2026-06-12T12:01:00Z", "2026-06-12T12:01:01Z", **_LIFE_DONE),
+    ]
+    turns = [
+        _turn("2026-06-12T12:00:20Z", 300, source="subagent"),
+        _turn("2026-06-12T12:00:20Z", 200, source="subagent"),
+    ]
+    forest = queries.SpanStore.from_events(spans, turns=turns).spoke_steps("ka/run+1")
+    agent = _find(forest, "s_agent")
+
+    assert len(_turns(agent)) == 2
+    assert agent["rollup"]["tokens_in"] == 500
+
+
+def test_subagent_span_follows_its_agent_across_a_phase_boundary():
+    queries = load_queries()
+    # A long-running agent can straddle a phase marker: the agent's ts lands in one
+    # bucket while a sub-agent span's ts lands in the next. The sub-agent span must
+    # still nest under its agent (by parent_id), never under a main turn elsewhere.
+    spans = [
+        _span("x_spawn", "2026-06-12T12:00:00Z", "2026-06-12T12:00:01Z", **_LIFE_NEW),
+        _span(
+            "x_agent", "2026-06-12T12:00:10Z", "2026-06-12T12:00:30Z", kind="agent", name="Explore"
+        ),
+        _span(
+            "x_sub",
+            "2026-06-12T12:00:20Z",
+            "2026-06-12T12:00:22Z",
+            kind="tool",
+            name="Read",
+            parent_id="x_agent",
+            summary="/x.py",
+        ),
+        _span("x_red", "2026-06-12T12:00:15Z", "2026-06-12T12:00:15Z", phase="red"),
+        _span("x_teardown", "2026-06-12T12:00:35Z", "2026-06-12T12:00:36Z", **_LIFE_DONE),
+    ]
+    forest = queries.SpanStore.from_events(spans).spoke_steps("ka/run+1")
+    agent = _find(forest, "x_agent")
+
+    assert _find(agent["children"], "x_sub")["span_id"] == "x_sub"
+
+
 def test_raw_path_without_turns_has_no_turn_nodes():
     queries = load_queries()
     store = queries.SpanStore.from_jsonl(FIXTURE_V2_SPANS)  # no turns table data

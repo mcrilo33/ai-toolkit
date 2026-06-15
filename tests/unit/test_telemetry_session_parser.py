@@ -271,6 +271,13 @@ class TestSubagentSpans:
         assert sum(e.input_tokens for e in sub) == 700
         assert sum(e.output_tokens for e in sub) == 450
 
+    def test_subagent_emits_no_human_prompt_span(self, parsed: ParsedSession) -> None:
+        # The sub-agent transcript's leading user record is the orchestrator's task
+        # prompt — it must NEVER become a human-prompt span (it would leak the
+        # prompt). Locked structurally, not only via the secret-string scan.
+        agent_id = _agent_span(parsed).span_id
+        assert not [s for s in parsed.spans if s.kind == "human" and s.parent_id == agent_id]
+
 
 class TestSchemaConformance:
     def test_every_span_dict_has_exactly_the_frozen_schema_keys(
