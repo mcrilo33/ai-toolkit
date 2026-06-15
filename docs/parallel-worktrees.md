@@ -155,8 +155,9 @@ scripts/worktree-land.sh 42      # guards → merge (ff when possible) → full 
 
 Completion is explicit: a per-subtask push is indistinguishable from a finished issue,
 so a numbered branch must carry a `ready/<issue>` git tag at its tip — the marker the
-spoke emits after its FINAL subtask's push (`git tag ready/42 && git push origin
-ready/42`). Without it the land refuses (the branch reads `pushed (in progress)` on the
+spoke emits after its FINAL subtask's push via the canonical emitter
+(`bash .ai-toolkit/scripts/spoke-ready.sh 42`, also reached by `spoke-push.sh --ready
+42`). Without it the land refuses (the branch reads `pushed (in progress)` on the
 dashboard); pass `--force-land` only for an express/ad-hoc branch that never carries
 one. A successful land consumes the marker (deletes the local + remote tag).
 
