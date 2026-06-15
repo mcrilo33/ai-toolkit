@@ -113,18 +113,79 @@ queue_issues() {
     | grep -E '^[0-9]+$' || true
 }
 
-# inflight_issues -> issue numbers that already have a worktree/branch, one per
-# line, via `git worktree list` + the leading-digits slug parse hub-status.sh
-# uses. Drives the idempotent skip: a branch already in flight is never re-spawned.
-inflight_issues() {
-  local line branch slug num
+# inflight_worktrees -> "<path>\t<issue>" for every worktree whose branch slug
+# leads with an issue number, via `git worktree list` + the leading-digits slug
+# parse hub-status.sh uses. The hub's own `main` checkout (no digits) drops out.
+inflight_worktrees() {
+  local line path branch slug num
   git worktree list 2>/dev/null | while IFS= read -r line; do
+    path="$(awk '{print $1}' <<<"$line")"
     branch="$(sed -n 's/.*\[\(.*\)\].*/\1/p' <<<"$line")"
     [ -n "$branch" ] || continue
     slug="${branch##*/}"
     num="$(printf '%s' "$slug" | sed 's/^\([0-9]*\).*/\1/')"
-    [ -n "$num" ] && printf '%s\n' "$num"
+    [ -n "$num" ] && printf '%s\t%s\n' "$path" "$num"
   done
+}
+
+# inflight_issues -> just the issue numbers, one per line. Drives the idempotent
+# skip: a branch already in flight is never re-spawned.
+inflight_issues() {
+  inflight_worktrees | cut -f2
+}
+
+# _transcript_idle_seconds <worktree-path> -> seconds since the spoke's newest
+# Claude transcript was touched, or empty when there is no transcript yet. Same
+# slug + newest-jsonl selection hub-status.sh uses; mtime via BSD/GNU stat.
+_transcript_idle_seconds() {
+  local wt_path="$1" projects_root slug project_dir jsonl mtime
+  projects_root="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+  slug="$(printf '%s' "$wt_path" | sed 's/[^A-Za-z0-9]/-/g')"
+  project_dir="$projects_root/$slug"
+  [ -d "$project_dir" ] || return 0
+  jsonl="$(ls -t "$project_dir"/*.jsonl 2>/dev/null | head -1)"
+  [ -n "$jsonl" ] || return 0
+  mtime="$(stat -f %m "$jsonl" 2>/dev/null || stat -c %Y "$jsonl" 2>/dev/null)"
+  [ -n "$mtime" ] || return 0
+  printf '%s\n' "$(( $(now_epoch) - mtime ))"
+}
+
+# slot_state <worktree-path> <issue> -> done|free|busy. A slot is freed when the
+# spoke is done (a ready/<issue> tag at the branch tip — the hub-status.sh
+# mergeable rule) or idle longer than NIGHT_IDLE_MINUTES; otherwise it is busy
+# and keeps occupying its slot. A spoke with no transcript yet (just spawned)
+# reads as busy so the supervisor never backfills over a starting spoke.
+# UPGRADE: surface explicit waiting-on-input (open AskUserQuestion / trailing
+# notification) as a freed slot once Phase 2's richer markers land; folded into
+# idle for now.
+slot_state() {
+  local wt_path="$1" issue="$2" tip marker age
+  tip="$(git -C "$wt_path" rev-parse HEAD 2>/dev/null)"
+  marker="$(git -C "$wt_path" rev-parse -q --verify "refs/tags/ready/${issue}^{commit}" 2>/dev/null)"
+  if [ -n "$tip" ] && [ "$marker" = "$tip" ]; then
+    printf 'done\n'; return
+  fi
+  age="$(_transcript_idle_seconds "$wt_path")"
+  if [ -n "$age" ] && [ "$age" -gt $(( NIGHT_IDLE_MINUTES * 60 )) ]; then
+    printf 'free\n'; return
+  fi
+  printf 'busy\n'
+}
+
+# slot_counts -> "<busy> <done>" across all in-flight worktrees. busy spokes
+# occupy a slot; done spokes are finished work (drop out of tasks_left); free
+# (idle) spokes count as neither, so their slot is available for backfill.
+slot_counts() {
+  local path issue st busy=0 finished=0
+  while IFS="$(printf '\t')" read -r path issue; do
+    [ -n "$issue" ] || continue
+    st="$(slot_state "$path" "$issue")"
+    case "$st" in
+      busy) busy=$(( busy + 1 )) ;;
+      done) finished=$(( finished + 1 )) ;;
+    esac
+  done < <(inflight_worktrees)
+  printf '%s %s\n' "$busy" "$finished"
 }
 
 # kickoff_for <issue> -> the spoke's first prompt. Placeholder: the standard
@@ -177,7 +238,8 @@ dispatch_issue() {
 # honoring the strict launch cutoff. (Slot-free detection for in-flight spokes
 # arrives in ST3; here every in-flight spoke is counted as occupying a slot.)
 supervise_tick() {
-  local now queue inflight time_left tasks_left occupied target free_slots attempts dispatched n
+  local now queue inflight time_left queue_count busy_count done_count
+  local tasks_left target free_slots attempts dispatched n
   now="$(now_epoch)"
   queue="$(queue_issues)"
   inflight="$(inflight_issues)"
@@ -188,12 +250,16 @@ supervise_tick() {
     return 0
   fi
 
-  tasks_left="$(printf '%s\n' "$queue" | grep -c '^[0-9]' || true)"
-  occupied="$(printf '%s\n' "$inflight" | grep -c '^[0-9]' || true)"
+  queue_count="$(printf '%s\n' "$queue" | grep -c '^[0-9]' || true)"
+  read -r busy_count done_count <<<"$(slot_counts)"
+  # Remaining work = queued issues not yet done; done spokes await the hub's land.
+  tasks_left=$(( queue_count - done_count ))
+  [ "$tasks_left" -lt 0 ] && tasks_left=0
   target="$(night_target "$tasks_left" "$time_left")"
-  free_slots=$(( target - occupied ))
+  # Only busy spokes hold a slot; done/idle ones free theirs for backfill.
+  free_slots=$(( target - busy_count ))
   [ "$free_slots" -lt 0 ] && free_slots=0
-  log "tick: queue=$tasks_left inflight=$occupied time_left=${time_left}m target=$target free=$free_slots"
+  log "tick: queue=$queue_count busy=$busy_count done=$done_count time_left=${time_left}m target=$target free=$free_slots"
 
   # Bound the work to free_slots ATTEMPTS, not successes: a systemic dispatch
   # failure (e.g. worktree-new.sh missing) then can't hammer the whole queue —
@@ -212,10 +278,23 @@ EOF
   log "dispatched $dispatched spoke(s) this tick ($attempts attempted)"
 }
 
+# night_done -> true when the supervisor has nothing left to do: the launch
+# cutoff has passed (no window to start anything tonight), or the queue is fully
+# drained with nothing still in flight. Ends the loop instead of spinning.
+night_done() {
+  local time_left queue_count inflight_count
+  time_left="$(minutes_until "$NIGHT_END" "$(now_epoch)")"
+  launch_cutoff_reached "$time_left" && return 0
+  queue_count="$(queue_issues | grep -c '^[0-9]' || true)"
+  inflight_count="$(inflight_issues | grep -c '^[0-9]' || true)"
+  [ "$queue_count" -eq 0 ] && [ "$inflight_count" -eq 0 ]
+}
+
 main() {
+  local once=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --once)    shift ;;  # single tick; ST3 adds the repeating loop for the no-flag case
+      --once)    once=1; shift ;;
       -h|--help) echo "usage: hub-night.sh [--once]" >&2; return 0 ;;
       *)         log "unknown argument: $1"; return 2 ;;
     esac
@@ -225,8 +304,15 @@ main() {
     log "not inside a git repository"; return 1
   }
 
-  # ST3 wires the repeating supervisor loop; for now run a single tick.
-  supervise_tick
+  # The supervisor loop: tick, then (unless --once) sleep and tick again until
+  # the night is over or the queue is drained. The termination check runs before
+  # the sleep so an already-finished night exits immediately.
+  while :; do
+    supervise_tick
+    [ "$once" -eq 1 ] && break
+    night_done && { log "night dispatcher done"; break; }
+    sleep "$NIGHT_TICK_SECONDS"
+  done
 }
 
 [[ "${BASH_SOURCE[0]}" == "${0}" ]] && main "$@"

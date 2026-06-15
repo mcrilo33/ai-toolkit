@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -197,15 +198,24 @@ def _run_once(
     *,
     queue: str,
     now: int,
+    once: bool = True,
+    projects_dir: Path | None = None,
+    timeout: float = 15.0,
     env: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
-    """Run ``hub-night.sh --once`` from the hub with gh + WT_NEW stubbed.
+    """Run ``hub-night.sh`` from the hub with gh + WT_NEW stubbed.
 
     Args:
         hub: Hub checkout to run from.
         tmp_path: Test tmpdir; the stub bin and dispatch log live under it.
         queue: Space-separated issue numbers the gh stub returns as the queue.
         now: Injected current time (epoch seconds) -> NIGHT_NOW.
+        once: Pass ``--once`` (single tick). Set False to exercise the loop;
+            ``timeout`` then guards against a hang.
+        projects_dir: Claude projects root exported as CLAUDE_PROJECTS_DIR (for
+            transcript-idle slot detection). When None, a nonexistent dir is
+            used so the host's real ~/.claude/projects can never leak in.
+        timeout: Wall-clock cap (seconds) on the subprocess.
         env: Extra knob overrides.
 
     Returns:
@@ -236,6 +246,7 @@ def _run_once(
         'printf "DISPATCH issue=%s type=%s prompt=%s\\n" "$issue" "$has_type" "$has_prompt" >> "$WT_NEW_LOG"\n'
     )
     wt_new.chmod(0o755)
+    fallback_projects = tmp_path / "no-claude-projects"
     full_env = {
         **os.environ,
         "TZ": "UTC",
@@ -244,15 +255,20 @@ def _run_once(
         "NIGHT_NOW": str(now),
         "WT_NEW": str(wt_new),
         "WT_NEW_LOG": str(log),
+        "CLAUDE_PROJECTS_DIR": str(projects_dir if projects_dir is not None else fallback_projects),
     }
     if env:
         full_env.update(env)
+    argv = ["bash", str(HUB_NIGHT)]
+    if once:
+        argv.append("--once")
     proc = subprocess.run(
-        ["bash", str(HUB_NIGHT), "--once"],
+        argv,
         cwd=str(hub),
         capture_output=True,
         text=True,
         env=full_env,
+        timeout=timeout,
     )
     lines = log.read_text().splitlines() if log.exists() else []
     return proc, lines
@@ -298,3 +314,99 @@ def test_dispatch_passes_type_feature_and_prompt(night_hub: Path, tmp_path: Path
 
     assert lines, "expected at least one dispatch"
     assert all("type=yes" in ln and "prompt=yes" in ln for ln in lines)
+
+
+# --- Slot-free detection + backfill (ST3) ------------------------------------
+# An in-flight spoke frees its slot when it is done (a ready/<issue> tag at its
+# branch tip) or idle (its newest transcript is older than NIGHT_IDLE_MINUTES);
+# a busy spoke keeps occupying one. The supervisor backfills freed slots from
+# the still-pending queue. With a full night the target is 1, so a backfill can
+# only happen if the done/idle spoke stops counting against the cap — which is
+# exactly what distinguishes ST3 from the ST2 "every in-flight occupies" rule.
+
+
+def _seed_ready_tag(hub: Path, issue: int, slug: str = "wip") -> None:
+    """Tag the in-flight branch tip ready/<issue> -> slot_state 'done'."""
+    _git(hub, "tag", f"ready/{issue}", f"feature/{issue}-{slug}")
+
+
+def _seed_transcript(projects_dir: Path, wt_path: Path, *, mtime: int) -> Path:
+    """Write a newest-wins transcript for a worktree with a given mtime.
+
+    The project dir is slugged from the worktree's realpath (git reports
+    realpaths, e.g. /private/var on macOS), matching hub-night's lookup.
+    """
+    slug = re.sub(r"[^A-Za-z0-9]", "-", str(wt_path.resolve()))
+    project_dir = projects_dir / slug
+    project_dir.mkdir(parents=True, exist_ok=True)
+    transcript = project_dir / "sess.jsonl"
+    transcript.write_text('{"type":"assistant"}\n')
+    os.utime(transcript, (mtime, mtime))
+    return transcript
+
+
+def test_done_spoke_frees_slot_for_backfill(night_hub: Path, tmp_path: Path) -> None:
+    # 101 in flight + ready/101 at its tip -> done -> doesn't occupy a slot, so
+    # the pending 102 is backfilled even though the full-night target is 1.
+    _add_inflight(night_hub, tmp_path, 101)
+    _seed_ready_tag(night_hub, 101)
+    now = _epoch(2026, 6, 15, 1, 0)  # ~6h to 07:00 -> target 1
+
+    proc, lines = _run_once(night_hub, tmp_path, queue="101 102", now=now)
+
+    assert proc.returncode == 0, proc.stderr
+    assert [ln.split()[1] for ln in lines] == ["issue=102"]
+
+
+def test_idle_spoke_frees_slot_for_backfill(night_hub: Path, tmp_path: Path) -> None:
+    # 101 in flight but its transcript is 20 min stale (> NIGHT_IDLE_MINUTES=15)
+    # -> idle -> frees its slot, so pending 102 backfills under a target of 1.
+    wt = _add_inflight(night_hub, tmp_path, 101)
+    projects = tmp_path / "projects"
+    now = _epoch(2026, 6, 15, 1, 0)
+    _seed_transcript(projects, wt, mtime=now - 20 * 60)
+
+    proc, lines = _run_once(night_hub, tmp_path, queue="101 102", now=now, projects_dir=projects)
+
+    assert proc.returncode == 0, proc.stderr
+    assert [ln.split()[1] for ln in lines] == ["issue=102"]
+
+
+def test_busy_spoke_occupies_slot_and_blocks_backfill(night_hub: Path, tmp_path: Path) -> None:
+    # 101 in flight, transcript active 1 min ago -> busy -> occupies the only
+    # slot (full-night target 1), so pending 102 is NOT backfilled this tick.
+    wt = _add_inflight(night_hub, tmp_path, 101)
+    projects = tmp_path / "projects"
+    now = _epoch(2026, 6, 15, 1, 0)
+    _seed_transcript(projects, wt, mtime=now - 60)
+
+    proc, lines = _run_once(night_hub, tmp_path, queue="101 102", now=now, projects_dir=projects)
+
+    assert proc.returncode == 0, proc.stderr
+    assert lines == []
+
+
+# --- Supervisor loop termination (ST3) ---------------------------------------
+# Without --once the script loops, but it must terminate (not hang) when the
+# night is over or there is nothing left to supervise. timeout in _run_once is
+# the safety net that turns a hang into a test failure.
+
+
+def test_loop_exits_when_queue_empty_and_nothing_in_flight(night_hub: Path, tmp_path: Path) -> None:
+    now = _epoch(2026, 6, 15, 1, 0)
+
+    proc, lines = _run_once(night_hub, tmp_path, queue="", now=now, once=False)
+
+    assert proc.returncode == 0, proc.stderr
+    assert lines == []
+
+
+def test_loop_exits_at_launch_cutoff(night_hub: Path, tmp_path: Path) -> None:
+    # Past the cutoff there is nothing left to launch -> the loop ends rather
+    # than spinning forever waiting for a window that will not open tonight.
+    now = _epoch(2026, 6, 15, 6, 30)  # 30 min to 07:00 (< T_task)
+
+    proc, lines = _run_once(night_hub, tmp_path, queue="101 102", now=now, once=False)
+
+    assert proc.returncode == 0, proc.stderr
+    assert lines == []
