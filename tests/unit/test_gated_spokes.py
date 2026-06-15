@@ -117,11 +117,14 @@ def test_start_task_records_gate_level_in_the_issue() -> None:
     assert "gate:" in flat, "start-task must record the gate level as a Gate: line in the issue"
 
 
-def test_start_task_kickoff_pauses_at_the_plan_gate() -> None:
-    """The kickoff tells a non-trivial spoke to park at the PLAN gate."""
+def test_start_task_kickoff_parks_at_the_plan_gate_git_native() -> None:
+    """The kickoff has the spoke print the plan as a message, then park on gate/N."""
     flat = _flat(START_TASK)
     assert "plan gate" in flat, "the kickoff must name the PLAN gate"
-    assert "plan mode" in flat, "the PLAN gate is presented in plan mode"
+    # No harness plan-mode / ExitPlanMode — the plan is a normal visible message.
+    assert "plan mode" not in flat, "the kickoff must not invoke plan mode"
+    assert "exitplanmode" not in flat, "the kickoff must not invoke ExitPlanMode"
+    assert "visible message" in flat, "the plan is presented as a visible message"
     assert "before green" in flat or "before writing code" in flat, (
         "the kickoff must pause before implementation for non-trivial work"
     )
