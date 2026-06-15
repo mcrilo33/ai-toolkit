@@ -97,12 +97,15 @@ issue #N and read it. Before touching code, break the issue body into a task led
 steps that apply (ANCHOR/RED/GREEN/REVIEW/PUSH), exactly one in_progress.
 
 This task's gate is <level>. If it is `plan` (the default for non-trivial work): the
-PLAN gate comes first — explore the code and present a concrete implementation plan
-(files, approach, test strategy, open questions) in plan mode, and WAIT for my approval
-before writing code (before GREEN). Park there rather than blocking: emit the `gate/N`
-marker (`git tag -f -a gate/N -m plan && git push -f origin gate/N`) so the hub sees you
-parked, and proceed into the cycle once I approve. If the gate is `none` (very-clear
-work), skip the PLAN gate and run autonomous straight through.
+PLAN gate comes first — explore the code, then **print the full implementation plan
+(files, approach, test strategy, open questions) as a normal visible message** before
+any approval ask, and WAIT for my approval before writing code (before GREEN). Do not
+defer the plan into an approval card — the message itself is the plan. Park there
+rather than blocking: emit the `gate/N` marker (`git tag -f -a gate/N -m plan && git
+push -f origin gate/N`) so the hub sees you parked, then stop with an explicit "reply
+to approve, or tell me what to change" and proceed into the cycle once I approve. If
+the gate is `none` (very-clear work), skip the PLAN gate and run autonomous straight
+through.
 
 Then implement it following the solo-cycle (/cycle: RED → GREEN → REVIEW → PUSH). The
 task ledger is ephemeral session scratch; issue #N stays the durable contract — skip the
