@@ -186,7 +186,7 @@ def render_spoke_view(store: queries.SpanStore) -> None:
         st.info("No spoke runs found in the span log.")
         return
 
-    spoke_id = st.selectbox("Spoke run", spoke_ids)
+    spoke_id = st.selectbox("Spoke run", spoke_ids, format_func=queries.format_spoke_label)
     steps_tab, meta_tab = st.tabs(["Steps", "Meta by kind"])
 
     with steps_tab:
@@ -334,28 +334,41 @@ def render_automatability_view(store: queries.SpanStore) -> None:
     st.dataframe(table, use_container_width=True, hide_index=True)
 
 
-def _resolve_store(span_log: Path) -> queries.SpanStore | None:
-    """Pick the span source from the sidebar and build the store, or warn."""
-    correlated = st.sidebar.toggle("Correlate via Issue #22 (session logs + ccusage)", value=False)
-    if not correlated:
-        st.sidebar.caption(f"Raw push-span log:\n`{span_log}`")
-        if not span_log.exists():
-            st.warning(
-                f"Span log not found at `{span_log}`. Set `AI_TOOLKIT_TELEMETRY=1` "
-                "to record spans, or point `AI_TOOLKIT_SPAN_LOG` at an existing log."
-            )
-            return None
-        return load_store(span_log)
+def resolve_mode(correlated_requested: bool, projects_dir: Path) -> str:
+    """Pick the span source: ``"correlated"`` or ``"raw"``.
 
+    Correlation needs Issue #22's Claude session logs; when that dir is absent we
+    fall back to the raw push-span log rather than blanking the dashboard.
+    """
+    return "correlated" if correlated_requested and projects_dir.exists() else "raw"
+
+
+def _resolve_store(span_log: Path) -> queries.SpanStore | None:
+    """Pick the span source from the sidebar and build the store, or warn.
+
+    Correlation is on by default; when it's requested but the session-logs dir is
+    missing, the mode falls back to raw (with a note) instead of returning None.
+    """
+    correlated = st.sidebar.toggle("Correlate via Issue #22 (session logs + ccusage)", value=True)
     projects_dir = resolve_projects_dir()
-    st.sidebar.caption(f"Push log:\n`{span_log}`\nSession logs:\n`{projects_dir}`")
-    if not projects_dir.exists():
+
+    if resolve_mode(correlated, projects_dir) == "correlated":
+        st.sidebar.caption(f"Push log:\n`{span_log}`\nSession logs:\n`{projects_dir}`")
+        return load_correlated_store(str(span_log), str(projects_dir))
+
+    if correlated:
+        st.sidebar.info(
+            f"Claude session logs not found at `{projects_dir}`; showing the raw "
+            "push-span log. Set `AI_TOOLKIT_PROJECTS_DIR` to correlate."
+        )
+    st.sidebar.caption(f"Raw push-span log:\n`{span_log}`")
+    if not span_log.exists():
         st.warning(
-            f"Claude session logs not found at `{projects_dir}`. Set "
-            "`AI_TOOLKIT_PROJECTS_DIR`, or switch off correlation."
+            f"Span log not found at `{span_log}`. Set `AI_TOOLKIT_TELEMETRY=1` "
+            "to record spans, or point `AI_TOOLKIT_SPAN_LOG` at an existing log."
         )
         return None
-    return load_correlated_store(str(span_log), str(projects_dir))
+    return load_store(span_log)
 
 
 def main() -> None:

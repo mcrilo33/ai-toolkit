@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import statistics
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -196,10 +196,25 @@ class SpanStore:
         return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
 
     def spoke_run_ids(self) -> list[str]:
-        """All known ``spoke_run_id``s, sorted."""
+        """All known ``spoke_run_id``s, newest-first by latest activity.
+
+        Ordered by ``max(ts_end)`` descending, tie-broken by ``min(ts_start)``
+        descending — not by the ``<branch>+<epoch>`` id string, which sorts
+        alphabetically by branch. Ordering happens in Python via :func:`_parse_ts`
+        because push spans carry second precision and pull spans millisecond, so a
+        lexical sort on the raw timestamps would misorder them.
+        """
         rows = self._query(
-            "SELECT DISTINCT spoke_run_id FROM spans "
-            "WHERE spoke_run_id IS NOT NULL ORDER BY spoke_run_id"
+            "SELECT spoke_run_id, MAX(ts_end) AS last_end, MIN(ts_start) AS first_start "
+            "FROM spans WHERE spoke_run_id IS NOT NULL GROUP BY spoke_run_id"
+        )
+        rows.sort(
+            key=lambda r: (
+                _parse_ts(r["last_end"]) or 0.0,
+                _parse_ts(r["first_start"]) or 0.0,
+                r["spoke_run_id"],
+            ),
+            reverse=True,
         )
         return [row["spoke_run_id"] for row in rows]
 
@@ -759,6 +774,24 @@ def _untracked_node(orphans: list[dict[str, Any]]) -> dict[str, Any] | None:
         "collapsed_count": len(orphans),
         "children": [],
     }
+
+
+def format_spoke_label(spoke_run_id: str) -> str:
+    """Human dropdown label for a spoke run: ``<branch> · <YYYY-MM-DD>``.
+
+    The raw id is ``<branch>+<spawn-epoch>``; the trailing epoch renders as a UTC
+    spawn date while the id stays the lookup key. A malformed id — no ``+`` epoch,
+    a non-numeric one, or an epoch outside the platform's timestamp range — falls
+    back to the raw id unchanged, so this never raises in a selectbox format_func.
+    """
+    branch, sep, epoch = spoke_run_id.rpartition("+")
+    if not sep or not epoch.isdigit():
+        return spoke_run_id
+    try:
+        date = datetime.fromtimestamp(int(epoch), tz=UTC).strftime("%Y-%m-%d")
+    except (OverflowError, OSError, ValueError):
+        return spoke_run_id
+    return f"{branch} · {date}"
 
 
 def format_step_label(node: dict[str, Any]) -> str:
