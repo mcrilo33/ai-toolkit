@@ -326,6 +326,60 @@ def _assistant_tasks(uuid: str, ts: str, blocks: list[dict]) -> dict:
     }
 
 
+class TestSummaryIsFullText:
+    """Issue #47: node labels show the full text — never truncated with an ellipsis."""
+
+    def test_long_subject_is_not_truncated(self, tmp_path: Path) -> None:
+        # A long ledger item must render in full so it is readable in the L1 label;
+        # no word/char cap and no trailing ellipsis.
+        long_subject = (
+            "PLAN gate explore the code and present the full implementation plan then park"
+        )
+        records = [
+            _assistant_tasks(
+                "a1",
+                "2026-06-15T12:00:01.000Z",
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tc1",
+                        "name": "TaskCreate",
+                        "input": {"subject": long_subject},
+                    }
+                ],
+            )
+        ]
+        path = tmp_path / "task-sess.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        todo = _by_kind(parse_session_file(path), "todo")[0]
+
+        assert todo.summary == long_subject
+        assert "…" not in (todo.summary or "")
+
+    def test_multiline_prompt_keeps_its_full_first_line(self, tmp_path: Path) -> None:
+        # A multi-line prompt scopes to its first line (the gist), but that line is
+        # never truncated — internal whitespace is just collapsed.
+        text = "Refactor the parser to retain the   in-progress todo\nplus some more detail below"
+        records = [
+            {
+                "type": "user",
+                "sessionId": "p-sess",
+                "cwd": "/Users/demo/Repos/proj",
+                "gitBranch": "feature/47-demo",
+                "timestamp": "2026-06-15T12:00:00.000Z",
+                "uuid": "u1",
+                "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+            }
+        ]
+        path = tmp_path / "p-sess.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        prompt = _by_kind(parse_session_file(path), "human")[0]
+
+        assert prompt.summary == "Refactor the parser to retain the in-progress todo"
+
+
 class TestTaskLedgerResolution:
     """Issue #47: TaskCreate/TaskUpdate are id-keyed; resolve to the task subject."""
 
