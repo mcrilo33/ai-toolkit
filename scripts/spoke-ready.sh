@@ -87,24 +87,28 @@ if ! git rev-parse --verify -q HEAD >/dev/null; then
   exit 1
 fi
 
-# Durability: a TERMINAL marker (ready/accept/blocked) claims the issue's work is
-# finished and landable, so the hub frees the slot and the morning report shows a
-# LAND/EYEBALL/THINK row for it. If the branch commits never reached origin (the
-# #43 narrated-push failure), that disposition is over un-pushed work the hub
-# can't see. Refuse unless HEAD is contained in the branch's pushed upstream. The
-# non-terminal gate/<N> park is EXEMPT — it legitimately precedes any push.
-if [ "$KIND" != "gate" ]; then
-  if ! git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
-    echo "spoke-ready: refusing $KIND/$ISSUE — the branch has no pushed upstream." >&2
-    echo "  Push it first (bash .ai-toolkit/scripts/spoke-push.sh), then re-run." >&2
-    exit 1
-  fi
-  if ! git merge-base --is-ancestor HEAD '@{upstream}' 2>/dev/null; then
-    echo "spoke-ready: refusing $KIND/$ISSUE — HEAD is ahead of the pushed branch (un-pushed work)." >&2
-    echo "  Push it first (bash .ai-toolkit/scripts/spoke-push.sh), then re-run." >&2
-    exit 1
-  fi
-fi
+# Durability: ready/<N> and accept/<N> CLAIM the work is landable/reviewable, so
+# the hub frees the slot and the morning report shows a LAND/EYEBALL row. If the
+# branch commits never reached origin (the #43 narrated-push failure), that claim
+# is over un-pushed work the hub can't see — refuse unless HEAD is contained in the
+# branch's pushed upstream. gate/<N> (PLAN park) and blocked/<N> (stuck) are STOP
+# signals over incomplete work that make no landable claim — and the hub itself
+# emits blocked/<N> when it reaps a hung spoke whose work never landed — so they
+# are EXEMPT.
+case "$KIND" in
+  ready|accept)
+    if ! git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
+      echo "spoke-ready: refusing $KIND/$ISSUE — the branch has no pushed upstream." >&2
+      echo "  Push it first (bash .ai-toolkit/scripts/spoke-push.sh), then re-run." >&2
+      exit 1
+    fi
+    if ! git merge-base --is-ancestor HEAD '@{upstream}' 2>/dev/null; then
+      echo "spoke-ready: refusing $KIND/$ISSUE — HEAD is ahead of the pushed branch (un-pushed work)." >&2
+      echo "  Push it first (bash .ai-toolkit/scripts/spoke-push.sh), then re-run." >&2
+      exit 1
+    fi
+    ;;
+esac
 
 TAG="$KIND/$ISSUE"
 

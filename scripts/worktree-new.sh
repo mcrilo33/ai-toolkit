@@ -276,6 +276,12 @@ fi
 # the spoke runs inherits it, so worktree-land.sh / worktree-done.sh refuse a
 # spoke that cd's to the hub and tries to land or tear down its own worktree.
 AGENT_CMD="WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(printf '%q' "${WT_AGENT_EFFORT:-max}") claude --model $(printf '%q' "${WT_AGENT_MODEL:-opus}")"
+# Best-effort in-process budget cap for unattended (night) spokes. hub-night sets
+# WT_AGENT_BUDGET_ARGS (e.g. "--max-budget-usd 5") from NIGHT_MAX_BUDGET_USD; it is
+# a pre-formed multi-arg string appended verbatim (NOT %q-quoted), so leave it
+# unset for ordinary day spokes to keep the launch unchanged. The supervisor-side
+# wall-clock reap is the reliable ceiling; this is a backstop.
+[ -n "${WT_AGENT_BUDGET_ARGS:-}" ] && AGENT_CMD="$AGENT_CMD ${WT_AGENT_BUDGET_ARGS}"
 [ -n "$PROMPT" ] && AGENT_CMD="$AGENT_CMD $(printf '%q' "$PROMPT")"
 
 if [ "$SPAWN_TERMINAL" -eq 1 ]; then
