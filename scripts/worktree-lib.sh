@@ -72,6 +72,20 @@ wt_slugify() {
     | cut -d- -f1-4
 }
 
+# --- tmux session name --------------------------------------------------------
+
+# Derive a stable, tmux-safe session name for a repo root: parent-dir prefix +
+# basename ('<parent>-<base>'), so two repos sharing a basename under different
+# parents get distinct sessions and 'tmux ls' reads as a per-project portfolio.
+# tmux forbids '.' and ':' in session names → map them to '-'. The caller passes
+# the canonical main-worktree root, so the result is deterministic per repo.
+wt_tmux_session() {
+  local root="$1" parent base
+  parent="$(basename "$(dirname "$root")")"
+  base="$(basename "$root")"
+  printf '%s-%s' "$parent" "$base" | tr '.:' '-'
+}
+
 # --- worktree enumeration / resolution ---------------------------------------
 
 # Emit "path<TAB>branch" (branch without refs/heads/) for every worktree EXCEPT

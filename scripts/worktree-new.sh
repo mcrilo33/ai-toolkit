@@ -3,7 +3,7 @@
 # worktree-new.sh — create an isolated git worktree for one task and wire it into
 # a "multiple terminals + one review window" workflow:
 #   - folds the worktree into your single VS Code review window (`code --add`)
-#   - opens a tmux window cd'd into it in session 0, launching `claude`
+#   - opens a tmux window cd'd into it in the project's session, launching `claude`
 #
 # One task = one issue = one branch = one checkout = its own staging area, hooks,
 # and .review/ approval artifacts (the isolation solo-cycle/close-task assume).
@@ -280,30 +280,33 @@ if [ "$SPAWN_TERMINAL" -eq 1 ]; then
   SPAWNED=0
   if command -v tmux >/dev/null 2>&1; then
     win_name="${BRANCH##*/}"
-    # ensure session 0 (the spoke home) exists, detached if need be; '=' pins
-    # the target to an exact session name so e.g. '0-foo' can never match
-    if tmux has-session -t '=0' 2>/dev/null || tmux new-session -d -s 0 -c "$REPO_ROOT" 2>/dev/null; then
+    # one tmux session per project (issue #39): derive it from the repo root so
+    # spokes nest under their project and 'tmux ls' reads as a portfolio.
+    sess="$(wt_tmux_session "$REPO_ROOT")"
+    # ensure the project session exists, detached if need be; '=' pins the
+    # target to an exact session name so e.g. '<sess>-foo' can never match
+    if tmux has-session -t "=$sess" 2>/dev/null || tmux new-session -d -s "$sess" -c "$REPO_ROOT" 2>/dev/null; then
       # The launch command is the window's own shell command, not keystrokes:
       # typing it via send-keys raced interactive-zsh init (eaten Enter, zvm) —
       # issue #15. `exec $SHELL` keeps the window alive after claude exits.
       if [ "$LAUNCH_AGENT" -eq 1 ]; then
-        win="$(tmux new-window -t '=0:' -P -F '#{window_id}' -n "$win_name" -c "$WT_DIR" \
+        win="$(tmux new-window -t "=$sess:" -P -F '#{window_id}' -n "$win_name" -c "$WT_DIR" \
                "$AGENT_CMD; exec ${SHELL:-zsh}")"
       else
-        win="$(tmux new-window -t '=0:' -P -F '#{window_id}' -n "$win_name" -c "$WT_DIR")"
+        win="$(tmux new-window -t "=$sess:" -P -F '#{window_id}' -n "$win_name" -c "$WT_DIR")"
       fi
       # pin name so the running process can't clobber it
       tmux set-window-option -t "$win" automatic-rename off
       tmux set-window-option -t "$win" allow-rename off
-      echo "→ opened tmux window '$win_name' ($win) in session 0"
+      echo "→ opened tmux window '$win_name' ($win) in session $sess"
       if [ "$LAUNCH_AGENT" -eq 1 ]; then
         [ -n "$PROMPT" ] && echo "  launched: claude (seeded with first prompt)" || echo "  launched: claude"
       fi
       # print the exact jump command so the caller can copy-paste
       if [ -n "${TMUX:-}" ]; then
-        echo "  tmux switch-client -t '0:${win_name}'"
+        echo "  tmux switch-client -t '${sess}:${win_name}'"
       else
-        echo "  tmux attach -t 0 \\; select-window -t '0:${win_name}'"
+        echo "  tmux attach -t '${sess}' \\; select-window -t '${sess}:${win_name}'"
       fi
       SPAWNED=1
     fi

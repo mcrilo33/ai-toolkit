@@ -32,7 +32,7 @@
 #   ship    push origin <default> — the pre-push hook is the test gate; a rejected
 #           push (gate failed or remote refused) rolls back `git reset --keep`.
 #           Then worktree-done.sh → `gh issue close` (numeric ids)
-#   tmux    kill the task's window in session 0 when its pane path is gone
+#   tmux    kill the task's window in the project session when its pane path is gone
 #
 set -euo pipefail
 
@@ -260,13 +260,17 @@ if [ -n "$ISSUE" ]; then
   fi
 fi
 
-# --- tmux: kill the task's stranded window in session 0 ---------------------------
-# Spokes live as windows of session 0 named "<id>" or "<id>-<slug>". A window is
+# --- tmux: kill the task's stranded window in the project session -----------------
+# Spokes live as windows of the project's tmux session (issue #39: derived from
+# the repo root, '<parent>-<base>'), named "<id>" or "<id>-<slug>". A window is
 # stranded when its pane's cwd vanished with the worktree; live windows are kept.
+# The session name MUST match worktree-new.sh's spawn target, so derive it the
+# same way ('=' pins the exact match so a sibling session can't be enumerated).
 TAG="${ISSUE:-$BSLUG}"
 cleanup_tmux() {
   command -v tmux >/dev/null 2>&1 || return 0
-  local win name path
+  local sess win name path
+  sess="$(wt_tmux_session "$REPO_ROOT")"
   while IFS=$'\t' read -r win name path; do
     [ -n "$win" ] || continue
     case "$name" in
@@ -280,7 +284,7 @@ cleanup_tmux() {
         wt_warn "couldn't kill tmux window '$name' ($win) — close it by hand"
       fi
     fi
-  done < <(tmux list-windows -t 0 -F $'#{window_id}\t#{window_name}\t#{pane_current_path}' 2>/dev/null || true)
+  done < <(tmux list-windows -t "=$sess" -F $'#{window_id}\t#{window_name}\t#{pane_current_path}' 2>/dev/null || true)
 }
 cleanup_tmux
 

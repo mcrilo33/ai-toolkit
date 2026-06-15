@@ -563,7 +563,22 @@ def test_adhoc_branch_skips_issue_close(hub: Path, tmp_path: Path) -> None:
     assert "issue close" not in _log_text(logs["gh"])
 
 
-# --- tmux window cleanup (session-0 convention) -----------------------------------
+# --- tmux window cleanup (per-project session, issue #39) -------------------------
+
+
+def test_cleanup_lists_windows_in_project_session(hub: Path, tmp_path: Path) -> None:
+    # The land-side cleanup must enumerate the project session that
+    # worktree-new.sh spawned spokes into — not the retired hardcoded session 0,
+    # or stranded windows would never be found and would accumulate.
+    _make_spoke(hub, tmp_path, "feature/1-stranded", push=True)
+
+    proc, logs = _run_land(hub, tmp_path, "1", tmux_windows="@3\t1-stranded\t/gone/path")
+
+    assert proc.returncode == 0, proc.stderr
+    lw = next(ln for ln in _log_text(logs["tmux"]).splitlines() if ln.startswith("list-windows"))
+    assert "-t 0" not in lw, "cleanup still targets the retired session 0"
+    assert "-t =" in lw, "the '=' exact-match guard must be preserved"
+    assert "hub" in lw, "the session must be named after the project (repo basename)"
 
 
 def test_stranded_tmux_window_is_killed(hub: Path, tmp_path: Path) -> None:
