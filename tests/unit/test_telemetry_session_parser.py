@@ -61,13 +61,11 @@ SECRETS = (
     "SECRET_AGENT_OUTPUT",
     "SECRET_AGENT_WORK",
     "SECRET_ANSWER",
-    # Tool inputs/outputs (Issue #47 S2b): tool leaf spans are name-only — the
-    # Bash command, Read/Write path & content, Edit text, Grep pattern, and the
-    # tool result body must never appear in a span.
-    "SECRET_COMMAND",
-    "SECRET_PATH",
+    # Tool leaves surface only their MAIN identifying parameter (Bash command,
+    # Read/Edit/Write path, Grep pattern). Bulk/secondary fields stay filtered —
+    # Edit's replacement text, Write's content body, and tool result output must
+    # never appear in a span.
     "SECRET_EDIT_OLD",
-    "SECRET_PATTERN",
     "SECRET_WRITE_CONTENT",
     "SECRET_FILE_CONTENT",
 )
@@ -171,16 +169,27 @@ class TestToolSpans:
         assert bash.ts_end == "2026-06-13T12:02:05.000Z"
         assert bash.duration_ms == 5000
 
-    def test_tool_span_carries_no_summary_or_cost_at_parse_time(
-        self, parsed: ParsedSession
-    ) -> None:
+    def test_tool_span_summary_is_its_main_parameter(self, parsed: ParsedSession) -> None:
+        # The tool leaf names what it acted on: Bash → command, Read/Edit/Write →
+        # file path, Grep → pattern. So the trace reads "what over what".
+        by_name = {t.name: t for t in _by_kind(parsed, "tool")}
+        assert by_name["Bash"].summary == "pytest tests/unit -q"
+        assert by_name["Read"].summary == "/repo/dashboard/queries.py"
+        assert by_name["Edit"].summary == "/repo/app.py"
+        assert by_name["Grep"].summary == "_bucket_traces"
+        assert by_name["Write"].summary == "/repo/notes.md"
+
+    def test_tool_span_carries_no_cost_at_parse_time(self, parsed: ParsedSession) -> None:
         for tool in _by_kind(parsed, "tool"):
-            assert tool.summary is None
             assert tool.tokens_in is None
             assert tool.tokens_out is None
             assert tool.cost_usd is None
 
-    def test_no_tool_input_or_output_leaks_into_tool_spans(self, parsed: ParsedSession) -> None:
+    def test_only_the_main_parameter_leaks_not_bulk_input_or_output(
+        self, parsed: ParsedSession
+    ) -> None:
+        # Edit's replacement text, Write's content body, and the tool result output
+        # are secondary/bulk fields — surfacing the main param must not drag them in.
         blob = "".join(str(t.to_dict()) for t in _by_kind(parsed, "tool"))
         for secret in SECRETS:
             assert secret not in blob

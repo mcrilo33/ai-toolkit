@@ -490,6 +490,17 @@ def test_format_step_label_prefers_summary_over_name():
     assert queries.format_step_label(bare) == "Plan"
 
 
+def test_format_step_label_for_tool_shows_name_and_param():
+    queries = load_queries()
+    # A tool leaf shows BOTH its tool name and the main parameter it acted on, so
+    # the trace reads e.g. "Read · /repo/queries.py" (name alone when no param).
+    tool = {"kind": "tool", "name": "Read", "phase": None, "summary": "/repo/queries.py"}
+    bare = {"kind": "tool", "name": "Bash", "phase": None, "summary": None}
+
+    assert queries.format_step_label(tool) == "Read · /repo/queries.py"
+    assert queries.format_step_label(bare) == "Bash"
+
+
 # --- S7: tool leaf spans + hook nesting + per-turn trace (Issue #47 S2b) --------
 
 
