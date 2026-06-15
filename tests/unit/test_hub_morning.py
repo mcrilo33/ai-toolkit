@@ -246,3 +246,83 @@ def test_triage_then_report_routes_a_conflicting_ready_to_conflicts(
     assert "#104" in conflicts_section, "a conflicting ready/N must land in the CONFLICTS tier"
     land_section = out.split("LAND")[1].split("EYEBALL")[0]
     assert "#104" not in land_section, "a conflicting ready/N must NOT be in LAND"
+
+
+# ── --comments: echo each terminal marker as a gh issue comment (AC#3) ────────
+# AC#3 wants the three terminal markers emitted as tags AND issue comments. The
+# spoke stays gh-READ-ONLY (it only writes the annotated tag); the HUB echoes the
+# tag body as a `gh issue comment`, idempotently (one per issue+kind) and
+# best-effort (no gh / no remote -> skip, never crash).
+
+
+def _seed_marker(hub: Path, tmp_path: Path, issue: int, kind: str, reason: str) -> None:
+    """A feature worktree tagged <kind>/<issue> whose tag body is <reason>."""
+    wt = tmp_path / f"wt-{issue}"
+    _git(hub, "worktree", "add", "-q", "-b", f"feature/{issue}-wip", str(wt))
+    (wt / f"f{issue}.txt").write_text("work\n")
+    _git(wt, "add", "-A")
+    _git(wt, "commit", "-qm", f"feat: {issue}", "-m", f"Refs #{issue}")
+    _git(hub, "tag", "-a", f"{kind}/{issue}", "-m", kind, "-m", reason, f"feature/{issue}-wip")
+
+
+def _run_comments(hub: Path, tmp_path: Path) -> tuple[subprocess.CompletedProcess[str], Path]:
+    """Run `hub-morning.sh --comments` with a gh stub that logs each comment."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    gh_log = tmp_path / "gh-comments.log"
+    gh = bindir / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "issue" ] && [ "$2" = "comment" ]; then\n'
+        '  printf "comment %s :: %s\\n" "$3" "$5" >> "$GH_LOG"\n'
+        "fi\n"
+        "exit 0\n"
+    )
+    gh.chmod(0o755)
+    proc = subprocess.run(
+        ["bash", str(HUB_MORNING), "--comments"],
+        cwd=str(hub),
+        capture_output=True,
+        text=True,
+        env={
+            **_GIT_ENV,
+            "PATH": f"{bindir}:{os.environ['PATH']}",
+            "GH_LOG": str(gh_log),
+            "NIGHT_STATE_DIR": str(tmp_path / "night-state"),
+        },
+    )
+    return proc, gh_log
+
+
+def test_comments_echo_each_terminal_marker(hub: Path, tmp_path: Path) -> None:
+    _seed_marker(hub, tmp_path, 101, "ready", "all gates passed")
+    _seed_marker(hub, tmp_path, 102, "accept", "needs a human glance")
+    _seed_marker(hub, tmp_path, 103, "blocked", "ambiguous acceptance criteria")
+
+    proc, gh_log = _run_comments(hub, tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    log = gh_log.read_text() if gh_log.exists() else ""
+    assert "comment 101" in log and "comment 102" in log and "comment 103" in log
+    assert "needs a human glance" in log, "the comment body carries the marker's reason"
+
+
+def test_comments_skip_the_gate_park(hub: Path, tmp_path: Path) -> None:
+    # gate/N is a non-terminal PLAN park, not a completion marker — no comment.
+    _seed_marker(hub, tmp_path, 104, "gate", "plan")
+
+    proc, gh_log = _run_comments(hub, tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    log = gh_log.read_text() if gh_log.exists() else ""
+    assert "comment 104" not in log, "the gate park must not be echoed as a terminal comment"
+
+
+def test_comments_are_idempotent(hub: Path, tmp_path: Path) -> None:
+    _seed_marker(hub, tmp_path, 101, "accept", "needs a human glance")
+
+    _run_comments(hub, tmp_path)
+    _proc, gh_log = _run_comments(hub, tmp_path)
+
+    log = gh_log.read_text() if gh_log.exists() else ""
+    assert log.count("comment 101") == 1, "a marker must be echoed once, not on every run"
