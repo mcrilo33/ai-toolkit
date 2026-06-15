@@ -74,15 +74,23 @@ def _run_done(
 ) -> tuple[subprocess.CompletedProcess, Path]:
     """Run worktree-done.sh from the hub with a logging `code` stub on PATH.
 
-    The stub appends its argument string to a log (one line per invocation) and
-    exits `code_exit` — pass a nonzero value to simulate a VS Code failure.
+    The stub logs one line per invocation — `<present|absent> <args>`, where the
+    first token records whether the path passed to `code --remove` ($2) still
+    exists on disk at call time — and exits `code_exit` (pass a nonzero value to
+    simulate a VS Code failure). The existence token lets a test assert ordering:
+    `code --remove` must run while the worktree is still on disk (issue #43).
     `spoke_marker` sets WT_SPOKE to model a spoke session (issue #26).
     Returns the completed process and the log path."""
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     log = tmp_path / "code-calls.log"
     code = bindir / "code"
-    code.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{log}"\nexit {code_exit}\n')
+    code.write_text(
+        "#!/bin/sh\n"
+        'if [ -e "$2" ]; then exists=present; else exists=absent; fi\n'
+        f'printf "%s %s\\n" "$exists" "$*" >> "{log}"\n'
+        f"exit {code_exit}\n"
+    )
     code.chmod(0o755)
     env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
     env.pop("TMUX", None)
@@ -144,6 +152,21 @@ def test_code_remove_called_with_worktree_path(hub: Path, tmp_path: Path) -> Non
     calls = log.read_text() if log.exists() else ""
     assert "--remove" in calls
     assert str(wt) in calls
+
+
+def test_code_remove_runs_before_worktree_deletion(hub: Path, tmp_path: Path) -> None:
+    # Issue #43: `code --remove` must fire BEFORE `git worktree remove` deletes
+    # the directory, so VS Code resolves the path and folds the folder out
+    # cleanly (no ghost pane). The stub stamps each call with whether the path
+    # still exists on disk — `present` proves the on-disk delete had not yet run.
+    _make_spoke(hub, tmp_path, "feature/7-order", push=False, merge=True)
+    proc, log = _run_done(hub, tmp_path, "7")
+    assert proc.returncode == 0, proc.stderr
+    calls = log.read_text() if log.exists() else ""
+    assert "--remove" in calls  # sanity: code --remove ran
+    assert "present" in calls and "absent" not in calls, (
+        f"code --remove ran after the worktree was deleted (ghost pane): {calls!r}"
+    )
 
 
 def test_no_code_flag_skips_code_remove(hub: Path, tmp_path: Path) -> None:

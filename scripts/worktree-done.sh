@@ -100,6 +100,18 @@ done < <(wt_task_worktrees "$REPO_ROOT")
 # No-op unless AI_TOOLKIT_TELEMETRY=1.
 wt_emit_lifecycle "worktree-done" "teardown" "success" "$WT_T0" "$WT_DIR"
 
+# --- fold the folder out of the VS Code review window ------------------------
+# The mirror of worktree-new.sh's `code --add`. Run BEFORE the on-disk delete
+# below, while $WT_DIR still exists, so VS Code resolves the path, drops the
+# folder from the workspace, and stops watching it — otherwise it leaves an
+# empty ghost pane (issue #43). Gated on `--no-code` and the presence of the
+# `code` CLI; a failed call warns, never aborts teardown.
+if [ -z "$NO_CODE" ] && command -v code >/dev/null 2>&1; then
+  echo "→ removing folder from your VS Code review window (code --remove)"
+  code --remove "$WT_DIR" \
+    || wt_warn "couldn't remove the folder from VS Code — right-click it → Remove Folder from Workspace."
+fi
+
 echo "→ removing worktree: $WT_DIR"
 if ! git worktree remove $FORCE "$WT_DIR"; then
   if [ -z "$FORCE" ]; then
@@ -111,15 +123,6 @@ fi
 
 git worktree prune
 echo "✓ removed: $WT_DIR"
-
-# --- fold the folder out of the VS Code review window ------------------------
-# The mirror of worktree-new.sh's `code --add`. Gated on `--no-code` and the
-# presence of the `code` CLI; a failed call warns, never aborts teardown.
-if [ -z "$NO_CODE" ] && command -v code >/dev/null 2>&1; then
-  echo "→ removing folder from your VS Code review window (code --remove)"
-  code --remove "$WT_DIR" \
-    || wt_warn "couldn't remove the folder from VS Code — right-click it → Remove Folder from Workspace."
-fi
 
 # --- prune the branch, but only when it is fully merged ----------------------
 # We removed the worktree from the hub (now cwd), so HEAD here is the hub's
