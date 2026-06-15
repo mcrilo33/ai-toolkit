@@ -94,6 +94,38 @@ def test_solo_cycle_defines_gate_marker_convention() -> None:
     assert "ready/<issue>" in flat or "ready/<id>" in flat
 
 
+# ── Marker emission is the scripted spoke-ready.sh path, not hand-written git (#45)
+
+
+def test_solo_cycle_emits_gate_via_script() -> None:
+    """The gate marker emits via spoke-ready.sh, not a hand-written git tag/push."""
+    flat = _flat(SOLO_CYCLE)
+    assert "spoke-ready.sh --gate" in flat, "the gate marker must emit via `spoke-ready.sh --gate`"
+    # The LLM-narrated chain that #45 replaces must be gone.
+    assert "git tag -f -a gate" not in flat, (
+        "the hand-written `git tag … && git push …` gate chain must be removed"
+    )
+
+
+def test_solo_cycle_retag_uses_script() -> None:
+    """The re-tag-at-new-tip guidance points at the idempotent spoke-ready.sh."""
+    flat = _flat(SOLO_CYCLE)
+    assert "git tag -f ready/" not in flat, (
+        "the hand-written ready re-tag chain must be replaced by spoke-ready.sh"
+    )
+
+
+def test_start_task_emits_gate_via_script() -> None:
+    """The kickoff parks via spoke-ready.sh, not a hand-written git tag/push."""
+    flat = _flat(START_TASK)
+    assert "spoke-ready.sh --gate" in flat, (
+        "the kickoff's gate marker must emit via `spoke-ready.sh --gate`"
+    )
+    assert "git tag -f -a gate" not in flat, (
+        "the kickoff must not hand-write the git tag/push gate chain"
+    )
+
+
 # ── Subtask 2: start-task declares the gate level + wires the kickoff ───
 
 

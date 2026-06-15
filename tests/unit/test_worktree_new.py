@@ -456,6 +456,10 @@ def test_manual_fallback_advice_carries_wt_spoke_marker(hub: Path, tmp_path: Pat
 # the old bare-push rules it replaces.
 SCRIPT_RULE = "Bash(bash .ai-toolkit/scripts/spoke-push.sh:*)"
 
+# The single allowlistable marker-emit process rule (#45) — emits ready/N and
+# gate/N via one command so the chained `git tag … && git push …` never re-prompts.
+READY_SCRIPT_RULE = "Bash(bash .ai-toolkit/scripts/spoke-ready.sh:*)"
+
 # Tier 1 — read-only, no side effects.
 TIER1_RULES = [
     "Bash(git status:*)",
@@ -496,7 +500,7 @@ TIER_RUNNER_RULES = [
     "Bash(chmod +x:*)",
 ]
 
-SEEDED_RULES = [SCRIPT_RULE, *TIER1_RULES, *TIER2_RULES, *TIER_RUNNER_RULES]
+SEEDED_RULES = [SCRIPT_RULE, READY_SCRIPT_RULE, *TIER1_RULES, *TIER2_RULES, *TIER_RUNNER_RULES]
 
 # Wildcards that must NEVER be seeded — each would hand over a destructive verb
 # (`git branch -D`, `git tag -d`, an arbitrary push refspec, etc.) or arbitrary

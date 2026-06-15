@@ -316,6 +316,22 @@ def test_dispatch_passes_type_feature_and_prompt(night_hub: Path, tmp_path: Path
     assert all("type=yes" in ln and "prompt=yes" in ln for ln in lines)
 
 
+# --- The night kickoff parks via the scripted marker path (issue #45) ---------
+
+
+def test_kickoff_emits_gate_via_script() -> None:
+    """kickoff_for parks on gate/N via spoke-ready.sh, not a hand-written chain."""
+    proc = _call("kickoff_for 7")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "spoke-ready.sh --gate 7" in proc.stdout, (
+        "the night kickoff must emit the gate marker via spoke-ready.sh"
+    )
+    assert "git tag -f -a gate/7" not in proc.stdout, (
+        "the night kickoff must not hand-write the git tag/push gate chain"
+    )
+
+
 # --- Slot-free detection + backfill (ST3) ------------------------------------
 # An in-flight spoke frees its slot when it is done (a ready/<issue> tag at its
 # branch tip) or idle (its newest transcript is older than NIGHT_IDLE_MINUTES);

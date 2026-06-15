@@ -155,3 +155,14 @@ def test_plain_push_emits_no_marker(spoke: Path, remote: Path) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     assert not _git(spoke, "tag", "-l", "ready/37").strip(), "marker emitted without --ready"
     assert not _remote_has_ref(remote, "refs/tags/ready/37")
+
+
+def test_ready_is_idempotent(spoke: Path, remote: Path) -> None:
+    # The marker emits via spoke-ready.sh's force tag + force push (#45), so a
+    # re-run of the final push must not error on an already-existing tag.
+    first = _run(spoke, "--ready", "37")
+    second = _run(spoke, "--ready", "37")
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert second.returncode == 0, "re-running the ready push must be idempotent"
+    assert _remote_has_ref(remote, "refs/tags/ready/37")

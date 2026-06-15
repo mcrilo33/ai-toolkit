@@ -21,13 +21,15 @@ SYNC_SCRIPT = REPO_ROOT / "scripts" / "sync-to-repo.sh"
 
 # Workflow scripts and their source locations in the toolkit checkout.
 # spoke-push.sh ships alongside the worktree scripts so the spoke's PUSH step
-# runs as one allowlistable process (issue #37).
+# runs as one allowlistable process (issue #37); spoke-ready.sh ships too so
+# marker emission (ready/N, gate/N) is one allowlistable command (issue #45).
 WORKTREE_SCRIPTS = (
     "worktree-new.sh",
     "worktree-land.sh",
     "worktree-done.sh",
     "worktree-lib.sh",
     "spoke-push.sh",
+    "spoke-ready.sh",
 )
 SOURCES = {name: REPO_ROOT / "scripts" / name for name in WORKTREE_SCRIPTS}
 HUB_SCRIPTS_DIR = REPO_ROOT / "shared" / "skills" / "hub" / "scripts"
