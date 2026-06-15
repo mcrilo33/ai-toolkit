@@ -106,6 +106,17 @@ def _remote_has_ref(remote: Path, ref: str) -> bool:
     return bool(out.strip())
 
 
+def _remote_sha(remote: Path, ref: str) -> str:
+    """First field of the ls-remote line for `ref` (``^{}`` peels annotated tags)."""
+    out = subprocess.run(
+        ["git", "ls-remote", str(remote), ref],
+        capture_output=True,
+        text=True,
+        env=_GIT_ENV,
+    ).stdout
+    return out.split()[0] if out.strip() else ""
+
+
 def _tag_type(repo: Path, tag: str) -> str:
     return _git(repo, "cat-file", "-t", tag).strip()
 
@@ -169,6 +180,27 @@ def test_ready_retags_at_new_head(spoke: Path) -> None:
     assert tagged == head, "re-run must force-move the marker to the new tip"
 
 
+def test_ready_force_moves_the_remote_tag(spoke: Path, remote: Path) -> None:
+    # The push uses `-f`: when the marker moves to a new tip a re-run must
+    # force-update the REMOTE tag, not be rejected as a non-fast-forward.
+    _run(spoke, "45")
+    first_remote = _remote_sha(remote, "refs/tags/ready/45")
+    (spoke / "more.txt").write_text("more work\n")
+    _git(spoke, "add", "more.txt")
+    _git(spoke, "commit", "-qm", "feat: more", "-m", "Refs #45")
+
+    result = _run(spoke, "45")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remote_sha(remote, "refs/tags/ready/45") != first_remote, (
+        "remote marker must force-update to the new tag object"
+    )
+    peeled = _remote_sha(remote, "refs/tags/ready/45^{}")
+    assert peeled == _git(spoke, "rev-parse", "HEAD").strip(), (
+        "remote marker must point at the new tip"
+    )
+
+
 # ── --gate N: the PLAN-gate park marker ──────────────────────────────────────
 
 
@@ -202,4 +234,5 @@ def test_gate_does_not_emit_ready(spoke: Path, remote: Path) -> None:
 def test_missing_issue_number_errors(spoke: Path) -> None:
     result = _run(spoke)
 
-    assert result.returncode != 0, "an issue number is required"
+    assert result.returncode == 2, "a missing issue number is a usage error (exit 2)"
+    assert "issue number is required" in result.stderr
