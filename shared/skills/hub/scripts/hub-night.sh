@@ -151,19 +151,29 @@ _transcript_idle_seconds() {
 }
 
 # slot_state <worktree-path> <issue> -> done|free|busy. A slot is freed when the
-# spoke is done (a ready/<issue> tag at the branch tip — the hub-status.sh
-# mergeable rule) or idle longer than NIGHT_IDLE_MINUTES; otherwise it is busy
-# and keeps occupying its slot. A spoke with no transcript yet (just spawned)
-# reads as busy so the supervisor never backfills over a starting spoke.
+# spoke is done (a TERMINAL marker at the branch tip) or idle longer than
+# NIGHT_IDLE_MINUTES; otherwise it is busy and keeps occupying its slot. A spoke
+# with no transcript yet (just spawned) reads as busy so the supervisor never
+# backfills over a starting spoke.
+#
+# Terminal markers (issue #40) are ready/<issue> (whole issue done — the
+# hub-status.sh mergeable rule), accept/<issue> (built + pushed + agent-reviewed,
+# final sign-off inherently human) and blocked/<issue> (stuck — answer + re-queue).
+# Each frees the slot. The non-terminal gate/<issue> PLAN park is deliberately NOT
+# in this set: a gate-parked spoke is awaiting review and keeps its slot.
 # UPGRADE: surface explicit waiting-on-input (open AskUserQuestion / trailing
 # notification) as a freed slot once Phase 2's richer markers land; folded into
 # idle for now.
 slot_state() {
-  local wt_path="$1" issue="$2" tip marker age
+  local wt_path="$1" issue="$2" tip marker age kind
   tip="$(git -C "$wt_path" rev-parse HEAD 2>/dev/null)"
-  marker="$(git -C "$wt_path" rev-parse -q --verify "refs/tags/ready/${issue}^{commit}" 2>/dev/null)"
-  if [ -n "$tip" ] && [ "$marker" = "$tip" ]; then
-    printf 'done\n'; return
+  if [ -n "$tip" ]; then
+    for kind in ready accept blocked; do
+      marker="$(git -C "$wt_path" rev-parse -q --verify "refs/tags/${kind}/${issue}^{commit}" 2>/dev/null)"
+      if [ "$marker" = "$tip" ]; then
+        printf 'done\n'; return
+      fi
+    done
   fi
   age="$(_transcript_idle_seconds "$wt_path")"
   if [ -n "$age" ] && [ "$age" -gt $(( NIGHT_IDLE_MINUTES * 60 )) ]; then
@@ -199,9 +209,11 @@ issue #$n and read it. Before touching code, break the issue body into a task le
 (TaskCreate, or TodoWrite on older runtimes) — one todo per subtask × the solo-cycle
 steps that apply (ANCHOR/RED/GREEN/REVIEW/PUSH), exactly one in_progress.
 
-This task's gate is plan: the PLAN gate comes first — explore the code and present a
-concrete implementation plan in plan mode, and WAIT for approval before writing code
-(before GREEN). Park there rather than blocking: emit the gate/$n marker
+This task's gate is plan: the PLAN gate comes first — explore the code and print the
+full implementation plan (files, approach, test strategy, open questions) as a normal
+visible message, and WAIT for approval before writing code (before GREEN). Do not
+defer the plan into an approval card — the message itself is the plan. Park there
+rather than blocking: emit the gate/$n marker
 (bash .ai-toolkit/scripts/spoke-ready.sh --gate $n) so the hub sees you parked,
 and proceed into the cycle once approved.
 

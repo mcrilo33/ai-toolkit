@@ -23,31 +23,58 @@
 # runs the suite.
 #
 # Usage:
-#   spoke-ready.sh <issue>          # emit ready/<issue> at HEAD and push it
-#   spoke-ready.sh --gate <issue>   # emit gate/<issue> (the PLAN-gate park marker)
+#   spoke-ready.sh <issue>               # emit ready/<issue>  (whole issue done)
+#   spoke-ready.sh --gate <issue>        # emit gate/<issue>   (PLAN-gate park)
+#   spoke-ready.sh --accept <issue>      # emit accept/<issue> (built+reviewed; human sign-off)
+#   spoke-ready.sh --blocked <issue>     # emit blocked/<issue> (stuck; answer + re-queue)
+#   spoke-ready.sh --blocked <issue> -m "<reason>"   # stamp a reason into the tag body
 #
 set -euo pipefail
 
 usage() {
-  echo "usage: spoke-ready.sh [--gate] <issue>" >&2
+  echo "usage: spoke-ready.sh [--gate|--accept|--blocked] <issue> [-m <reason>]" >&2
   exit 2
 }
 
-# KIND selects the marker namespace; MSG is the annotated tag's message. ready/<N>
-# carries a plain "ready"; gate/<N> carries the park state ("plan" for the PLAN
-# gate). The red/draft park states named in solo-cycle are reserved for their
-# follow-up issues.
-# UPGRADE: add a --state flag for gate/<N> when the red/draft gates go live.
+# KIND selects the marker namespace and SUBJECT is the annotated tag's subject
+# line (the state word). ready/<N> means the whole issue is done; gate/<N> is the
+# non-terminal PLAN park (subject "plan"); accept/<N> and blocked/<N> are the two
+# extra TERMINAL markers night mode adds (issue #40) — accept = built + pushed +
+# agent-reviewed, final sign-off inherently human; blocked = stuck. A -m <reason>
+# becomes the tag BODY (the trust summary / blocker the morning report renders);
+# omitted, the body is empty and the subject is the only payload.
+#
+# The state flags are mutually exclusive: passing two is a usage error.
 KIND="ready"
-MSG="ready"
+SUBJECT="ready"
+STATE_FLAG=""
 ISSUE=""
+BODY=""
+
+# set_state <kind> <subject> — select the marker namespace, rejecting a second
+# state flag so e.g. `--gate --accept` can't emit an ambiguous marker.
+set_state() {
+  if [ -n "$STATE_FLAG" ]; then
+    echo "spoke-ready: --$1 conflicts with --$STATE_FLAG (pick one)" >&2
+    usage
+  fi
+  STATE_FLAG="$1"
+  KIND="$1"
+  SUBJECT="$2"
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --gate)    KIND="gate"; MSG="plan"; shift ;;
-    -h|--help) usage ;;
-    -*)        echo "spoke-ready: unknown option: $1" >&2; usage ;;
-    *)         [ -z "$ISSUE" ] || { echo "spoke-ready: unexpected argument: $1" >&2; usage; }
-               ISSUE="$1"; shift ;;
+    --gate)        set_state gate plan; shift ;;
+    --accept)      set_state accept accept; shift ;;
+    --blocked)     set_state blocked blocked; shift ;;
+    -m|--message)  [ "$#" -ge 2 ] || { echo "spoke-ready: -m needs a value" >&2; usage; }
+                   BODY="$2"; shift 2 ;;
+    --message=*)   BODY="${1#--message=}"; shift ;;
+    -h|--help)     usage ;;
+    -*)            echo "spoke-ready: unknown option: $1" >&2; usage ;;
+    *)             [ -z "$ISSUE" ] || { echo "spoke-ready: unexpected argument: $1" >&2; usage; }
+                   ISSUE="$1"; shift ;;
   esac
 done
 
@@ -60,10 +87,37 @@ if ! git rev-parse --verify -q HEAD >/dev/null; then
   exit 1
 fi
 
+# Durability: a TERMINAL marker (ready/accept/blocked) claims the issue's work is
+# finished and landable, so the hub frees the slot and the morning report shows a
+# LAND/EYEBALL/THINK row for it. If the branch commits never reached origin (the
+# #43 narrated-push failure), that disposition is over un-pushed work the hub
+# can't see. Refuse unless HEAD is contained in the branch's pushed upstream. The
+# non-terminal gate/<N> park is EXEMPT — it legitimately precedes any push.
+if [ "$KIND" != "gate" ]; then
+  if ! git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
+    echo "spoke-ready: refusing $KIND/$ISSUE — the branch has no pushed upstream." >&2
+    echo "  Push it first (bash .ai-toolkit/scripts/spoke-push.sh), then re-run." >&2
+    exit 1
+  fi
+  if ! git merge-base --is-ancestor HEAD '@{upstream}' 2>/dev/null; then
+    echo "spoke-ready: refusing $KIND/$ISSUE — HEAD is ahead of the pushed branch (un-pushed work)." >&2
+    echo "  Push it first (bash .ai-toolkit/scripts/spoke-push.sh), then re-run." >&2
+    exit 1
+  fi
+fi
+
 TAG="$KIND/$ISSUE"
 
-echo "→ git tag -f -a $TAG -m $MSG"
-git tag -f -a "$TAG" -m "$MSG"
+# The annotated tag carries SUBJECT (the state word) and, when a reason was
+# given, BODY as a second message paragraph — read back by consumers via
+# %(contents:subject) / %(contents:body). Force-move + force-push keep emission
+# idempotent (a re-run re-points the marker at the current tip and re-pushes).
+MSG_ARGS=(-m "$SUBJECT")
+if [ -n "$BODY" ]; then
+  MSG_ARGS+=(-m "$BODY")
+fi
+echo "→ git tag -f -a $TAG ${MSG_ARGS[*]}"
+git tag -f -a "$TAG" "${MSG_ARGS[@]}"
 echo "→ git push -f origin $TAG"
 git push -f origin "$TAG"
 
