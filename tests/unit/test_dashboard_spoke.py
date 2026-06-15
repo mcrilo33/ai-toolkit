@@ -34,14 +34,16 @@ def test_load_jsonl_skips_blank_lines_and_parses_human():
     assert green["human"] == {"type": "approval", "wait_ms": 4000}
 
 
-def test_spoke_run_ids_are_unique_and_sorted():
+def test_spoke_run_ids_are_unique_and_newest_first():
+    # Ordered by latest activity (max ts_end), newest first — not by id string.
+    # max(ts_end): d 06-11T13:00:05 > c 06-11T12:00:11 > b 06-10T13:00:10 > a 06-10T12:00:20.
     ids = store().spoke_run_ids()
 
     assert ids == [
-        "feature/a+1000",
-        "feature/b+1100",
-        "feature/c+2000",
         "feature/d+2100",
+        "feature/c+2000",
+        "feature/b+1100",
+        "feature/a+1000",
     ]
 
 
@@ -101,3 +103,61 @@ def test_spoke_tree_nests_hooks_under_steps():
 
 def test_unknown_spoke_returns_empty_forest():
     assert store().spoke_tree("does/not+exist") == []
+
+
+def test_format_spoke_label_renders_branch_and_spawn_date():
+    queries = load_queries()
+
+    # id is "<branch>+<spawn-epoch>"; 1700000000 == 2023-11-14 UTC.
+    label = queries.format_spoke_label("feature/22-demo+1700000000")
+
+    assert label == "feature/22-demo · 2023-11-14"
+
+
+def test_format_spoke_label_keeps_branch_with_internal_plus():
+    queries = load_queries()
+
+    # Only the final "+epoch" is the spawn stamp; earlier '+' stays in the branch.
+    label = queries.format_spoke_label("feature/a+b+1700000000")
+
+    assert label == "feature/a+b · 2023-11-14"
+
+
+def test_format_spoke_label_falls_back_to_raw_id_when_malformed():
+    queries = load_queries()
+
+    assert queries.format_spoke_label("no-epoch") == "no-epoch"
+    assert queries.format_spoke_label("branch+abc") == "branch+abc"
+
+
+def test_format_spoke_label_falls_back_when_epoch_out_of_range():
+    queries = load_queries()
+
+    # All-digits but past time_t range — must not crash the selectbox format_func.
+    assert queries.format_spoke_label("branch+99999999999999999999") == (
+        "branch+99999999999999999999"
+    )
+    assert queries.format_spoke_label("branch+10000000000000") == "branch+10000000000000"
+
+
+def test_spoke_run_ids_ordering_is_deterministic_on_tied_activity():
+    queries = load_queries()
+    # Two spokes with identical activity windows must order deterministically.
+    spans = [
+        {
+            "span_id": "s1",
+            "spoke_run_id": "feature/aaa+1000",
+            "ts_start": "2026-01-01T00:00:00Z",
+            "ts_end": "2026-01-01T00:00:10Z",
+        },
+        {
+            "span_id": "s2",
+            "spoke_run_id": "feature/bbb+1000",
+            "ts_start": "2026-01-01T00:00:00Z",
+            "ts_end": "2026-01-01T00:00:10Z",
+        },
+    ]
+
+    ids = queries.SpanStore.from_events(spans).spoke_run_ids()
+
+    assert ids == ["feature/bbb+1000", "feature/aaa+1000"]
