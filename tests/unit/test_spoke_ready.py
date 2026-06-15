@@ -303,10 +303,11 @@ def _commit_without_pushing(repo: Path, name: str = "more.txt") -> None:
     _git(repo, "commit", "-qm", "feat: unpushed", "-m", "Refs #45")
 
 
-@pytest.mark.parametrize(
-    "args,kind",
-    [(("45",), "ready"), (("--accept", "45"), "accept"), (("--blocked", "45"), "blocked")],
-)
+# ready/N and accept/N CLAIM landable/reviewable work, so they require the tip on
+# origin. blocked/N and gate/N are STOP signals that make no such claim (the work
+# is incomplete by definition), so they are durability-EXEMPT — the hub also emits
+# blocked/N when it reaps a hung/idle spoke whose work never landed (issue #40 ST2).
+@pytest.mark.parametrize("args,kind", [(("45",), "ready"), (("--accept", "45"), "accept")])
 def test_terminal_marker_refused_over_unpushed_work(
     spoke: Path, remote: Path, args: tuple[str, ...], kind: str
 ) -> None:
@@ -314,20 +315,24 @@ def test_terminal_marker_refused_over_unpushed_work(
 
     result = _run(spoke, *args)
 
-    assert result.returncode != 0, "a terminal marker over un-pushed work must be refused"
+    assert result.returncode != 0, "ready/accept over un-pushed work must be refused"
     assert not _remote_has_ref(remote, f"refs/tags/{kind}/45"), (
-        "no terminal marker may reach origin"
+        "no landable marker may reach origin"
     )
 
 
-def test_gate_marker_allowed_over_unpushed_work(spoke: Path, remote: Path) -> None:
-    # The PLAN-gate park is non-terminal and precedes any push — never refused.
+@pytest.mark.parametrize("flag,kind", [("--gate", "gate"), ("--blocked", "blocked")])
+def test_stop_marker_allowed_over_unpushed_work(
+    spoke: Path, remote: Path, flag: str, kind: str
+) -> None:
+    # gate/N (PLAN park) and blocked/N (stuck) are STOP signals — emitted over
+    # incomplete, possibly un-pushed work — so durability never refuses them.
     _commit_without_pushing(spoke)
 
-    result = _run(spoke, "--gate", "45")
+    result = _run(spoke, flag, "45")
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert _remote_has_ref(remote, "refs/tags/gate/45")
+    assert _remote_has_ref(remote, f"refs/tags/{kind}/45")
 
 
 # ── Misuse ───────────────────────────────────────────────────────────────────

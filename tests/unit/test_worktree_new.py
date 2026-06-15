@@ -154,6 +154,7 @@ def _run_new(
     # The host's agent pinning must never leak in — defaults are under test.
     env.pop("WT_AGENT_MODEL", None)
     env.pop("WT_AGENT_EFFORT", None)
+    env.pop("WT_AGENT_BUDGET_ARGS", None)
     if extra_env:
         env.update(extra_env)
     if inside_tmux:
@@ -351,6 +352,20 @@ def test_agent_launch_respects_model_and_effort_overrides(hub: Path, tmp_path: P
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation"
     assert "CLAUDE_EFFORT=high claude --model sonnet; exec " in new_window[0]
+
+
+def test_agent_launch_appends_budget_args_when_set(hub: Path, tmp_path: Path) -> None:
+    # A best-effort in-process budget cap for unattended night spokes: hub-night
+    # sets WT_AGENT_BUDGET_ARGS from NIGHT_MAX_BUDGET_USD, appended after the model
+    # (before any seeded prompt). Day spokes leave it unset → launch unchanged.
+    overrides = {"WT_AGENT_BUDGET_ARGS": "--max-budget-usd 5"}
+
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", extra_env=overrides)
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    assert "claude --model opus --max-budget-usd 5" in new_window[0]
 
 
 def test_agent_launch_keeps_seeded_prompt_after_pinning(hub: Path, tmp_path: Path) -> None:

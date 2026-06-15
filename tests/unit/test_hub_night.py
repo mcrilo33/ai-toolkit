@@ -27,6 +27,10 @@ import pytest
 HUB_NIGHT = (
     Path(__file__).resolve().parents[2] / "shared" / "skills" / "hub" / "scripts" / "hub-night.sh"
 )
+# The hub reaps a hung/idle/overrun spoke by emitting blocked/<issue> on its
+# behalf via the canonical marker emitter (issue #40 ST2). Tests point the
+# supervisor at the real script so a reap actually emits the marker.
+SPOKE_READY = Path(__file__).resolve().parents[2] / "scripts" / "spoke-ready.sh"
 
 
 def _call(fn_call: str, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -246,6 +250,13 @@ def _run_once(
         'printf "DISPATCH issue=%s type=%s prompt=%s\\n" "$issue" "$has_type" "$has_prompt" >> "$WT_NEW_LOG"\n'
     )
     wt_new.chmod(0o755)
+    # A logging tmux stub keeps the reap's best-effort `tmux kill-window` hermetic
+    # (no real windows touched); list-windows returns nothing so no kill is matched.
+    tmux = bindir / "tmux"
+    tmux_log = tmp_path / "tmux-calls.log"
+    tmux_log.touch()
+    tmux.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{tmux_log}"\nexit 0\n')
+    tmux.chmod(0o755)
     fallback_projects = tmp_path / "no-claude-projects"
     full_env = {
         **os.environ,
@@ -255,6 +266,8 @@ def _run_once(
         "NIGHT_NOW": str(now),
         "WT_NEW": str(wt_new),
         "WT_NEW_LOG": str(log),
+        "SPOKE_READY": str(SPOKE_READY),
+        "NIGHT_STATE_DIR": str(tmp_path / "night-state"),
         "CLAUDE_PROJECTS_DIR": str(projects_dir if projects_dir is not None else fallback_projects),
     }
     if env:
@@ -435,9 +448,13 @@ def test_done_spoke_frees_slot_for_backfill(night_hub: Path, tmp_path: Path) -> 
     assert [ln.split()[1] for ln in lines] == ["issue=102"]
 
 
-def test_idle_spoke_frees_slot_for_backfill(night_hub: Path, tmp_path: Path) -> None:
+def test_idle_spoke_is_reaped_then_frees_slot(night_hub: Path, tmp_path: Path) -> None:
     # 101 in flight but its transcript is 20 min stale (> NIGHT_IDLE_MINUTES=15)
-    # -> idle -> frees its slot, so pending 102 backfills under a target of 1.
+    # with NO terminal/gate marker -> hung -> the supervisor REAPS it: emits
+    # blocked/101 on its behalf (so the morning report shows a THINK row instead
+    # of a silent disappearance) and only then frees the slot, so pending 102
+    # backfills under a target of 1. (Issue #40 ST2: idle is a teardown, not a
+    # bare accounting flip — a still-alive idle process must not be backfilled over.)
     wt = _add_inflight(night_hub, tmp_path, 101)
     projects = tmp_path / "projects"
     now = _epoch(2026, 6, 15, 1, 0)
@@ -446,6 +463,9 @@ def test_idle_spoke_frees_slot_for_backfill(night_hub: Path, tmp_path: Path) -> 
     proc, lines = _run_once(night_hub, tmp_path, queue="101 102", now=now, projects_dir=projects)
 
     assert proc.returncode == 0, proc.stderr
+    assert _git(night_hub, "tag", "-l", "blocked/101").strip() == "blocked/101", (
+        "a hung idle spoke must be reaped with a blocked/N marker"
+    )
     assert [ln.split()[1] for ln in lines] == ["issue=102"]
 
 
@@ -461,6 +481,96 @@ def test_busy_spoke_occupies_slot_and_blocks_backfill(night_hub: Path, tmp_path:
 
     assert proc.returncode == 0, proc.stderr
     assert lines == []
+
+
+# --- Supervisor runtime ceiling + reap (issue #40 ST2) -----------------------
+# hub-night.sh had NO per-spoke runtime kill: launch_cutoff only gates NEW
+# launches and idle only changed slot ACCOUNTING, so a doom-looping or hung spoke
+# ran unbounded on Opus until 07:00 and an idle-but-alive spoke got backfilled
+# beside (breaching the cap). ST2 adds a real ceiling: a persisted per-spoke
+# dispatch epoch + a wall-clock kill, and turns idle into an actual reap (kill the
+# tmux window + emit blocked/N from the hub). gate-parked spokes are EXEMPT — they
+# stopped on purpose awaiting review and are not hung.
+
+
+def _epoch_file(tmp_path: Path, issue: int) -> Path:
+    """The persisted dispatch-epoch file the supervisor stamps (NIGHT_STATE_DIR)."""
+    return tmp_path / "night-state" / f"dispatch-{issue}.epoch"
+
+
+def _seed_dispatch_epoch(tmp_path: Path, issue: int, epoch: int) -> None:
+    """Pre-seed a spoke's dispatch epoch so a test can age it past the ceiling."""
+    f = _epoch_file(tmp_path, issue)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(f"{epoch}\n")
+
+
+@pytest.mark.parametrize(
+    "age_min,over",
+    [(179, False), (180, False), (181, True), (0, False)],
+)
+def test_spoke_over_ceiling(age_min: int, over: bool) -> None:
+    # spoke_over_ceiling <dispatch_epoch> <now> -> true when the spoke has run
+    # longer than NIGHT_SPOKE_MAX_MINUTES (default 180 = 2*T_task). Strict ">".
+    now = _epoch(2026, 6, 15, 4, 0)
+    epoch = now - age_min * 60
+
+    result = _call(f"spoke_over_ceiling {epoch} {now}")
+
+    assert (result.returncode == 0) == over, result.stderr
+
+
+def test_dispatch_stamps_a_persisted_epoch(night_hub: Path, tmp_path: Path) -> None:
+    # A dispatched spoke gets its start time persisted (survives a supervisor
+    # restart) so the wall-clock ceiling is measured from the real launch.
+    now = _epoch(2026, 6, 15, 4, 30)
+
+    proc, lines = _run_once(night_hub, tmp_path, queue="101", now=now)
+
+    assert proc.returncode == 0, proc.stderr
+    assert lines == ["DISPATCH issue=101 type=yes prompt=yes"]
+    epoch_file = _epoch_file(tmp_path, 101)
+    assert epoch_file.is_file(), "dispatch must stamp a persisted epoch"
+    assert epoch_file.read_text().strip() == str(now), "the stamped epoch is the dispatch time"
+
+
+def test_over_ceiling_spoke_is_reaped(night_hub: Path, tmp_path: Path) -> None:
+    # 101 in flight, active transcript (not idle) but dispatched 200 min ago
+    # (> ceiling 180) -> the supervisor reaps it: blocked/101 emitted on its
+    # behalf, then the slot frees so pending 102 backfills under a target of 1.
+    wt = _add_inflight(night_hub, tmp_path, 101)
+    projects = tmp_path / "projects"
+    now = _epoch(2026, 6, 15, 1, 0)
+    _seed_transcript(projects, wt, mtime=now - 60)  # active, NOT idle
+    _seed_dispatch_epoch(tmp_path, 101, now - 200 * 60)  # ran 200 min -> over ceiling
+
+    proc, lines = _run_once(night_hub, tmp_path, queue="101 102", now=now, projects_dir=projects)
+
+    assert proc.returncode == 0, proc.stderr
+    assert _git(night_hub, "tag", "-l", "blocked/101").strip() == "blocked/101", (
+        "an over-ceiling spoke must be reaped with a blocked/N marker"
+    )
+    assert [ln.split()[1] for ln in lines] == ["issue=102"]
+
+
+def test_gate_parked_idle_spoke_is_not_reaped(night_hub: Path, tmp_path: Path) -> None:
+    # A PLAN-gate-parked spoke (gate/101 at tip) goes transcript-idle while it
+    # waits for the human reply — but it stopped ON PURPOSE, it is not hung. The
+    # supervisor must NOT reap it (no blocked/101) and it keeps its slot, so 102
+    # is not backfilled. This is the parked-vs-hung distinction ST2 introduces.
+    wt = _add_inflight(night_hub, tmp_path, 101)
+    _git(night_hub, "tag", "gate/101", "feature/101-wip")
+    projects = tmp_path / "projects"
+    now = _epoch(2026, 6, 15, 1, 0)
+    _seed_transcript(projects, wt, mtime=now - 20 * 60)  # idle, but gate-parked
+
+    proc, lines = _run_once(night_hub, tmp_path, queue="101 102", now=now, projects_dir=projects)
+
+    assert proc.returncode == 0, proc.stderr
+    assert not _git(night_hub, "tag", "-l", "blocked/101").strip(), (
+        "a gate-parked spoke must not be reaped"
+    )
+    assert lines == [], "a gate-parked spoke keeps its slot"
 
 
 # --- Supervisor loop termination (ST3) ---------------------------------------
