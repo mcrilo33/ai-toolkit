@@ -271,9 +271,9 @@ def _span(span_id, ts_start, ts_end, **over):
     return base
 
 
-def _turn(ts, tokens, *, source="main", agent_id=None, model="claude-opus-4-8"):
+def _turn(ts, tokens, *, source="main", agent_id=None, model="claude-opus-4-8", session="sess-ka"):
     return {
-        "session_id": "sess-ka",
+        "session_id": session,
         "ts": ts,
         "model": model,
         "source": source,
@@ -359,7 +359,8 @@ def test_out_of_envelope_main_turn_lands_in_unresolved():
 def test_unresolved_node_ignores_malformed_turn_timestamps():
     queries = load_queries()
     spans = queries.load_jsonl(FIXTURE_V2_SPANS)
-    turns = [_turn("not-a-date", 7)]  # unparseable ts → unresolved, never dropped
+    # session must match the fixture spans so the turn is fetched for this spoke.
+    turns = [_turn("not-a-date", 7, session="sess-v2")]  # unparseable ts → unresolved
     store = queries.SpanStore.from_events(spans, turns=turns)
 
     unresolved = _bucket(store.spoke_steps(RUN), "(unresolved)")

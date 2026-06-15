@@ -169,8 +169,9 @@ def _render_meta(store: queries.SpanStore, spoke_id: str) -> None:
     ]
     st.dataframe(table, use_container_width=True, hide_index=True)
     st.caption(
-        "Cost is counted once per turn; summed across kinds it is the run total "
-        "minus any untracked (non-span) turns."
+        "Cost is counted once per turn. Main-agent cost belongs to its phase "
+        "interval, so summed across span kinds this is the subagent total — the "
+        "run total minus the setup / phase / unresolved (non-span) buckets."
     )
 
 

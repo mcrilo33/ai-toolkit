@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import statistics
 import sys
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -80,6 +81,12 @@ _STATUS_SEVERITY: dict[str, int] = {
     "skipped": 1,
     "success": 0,
 }
+
+# Synthetic bucket ids for the phase-interval attribution (Issue #46): the leading
+# pre-cycle region and the off-spine catch-all. Real intervals key on their marker's
+# ``span_id``, so these sentinels never collide with a real span.
+_SETUP_KEY = "__setup__"
+_UNRESOLVED_KEY = "__unresolved__"
 
 
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
@@ -275,23 +282,24 @@ class SpanStore:
     def spoke_steps(self, spoke_run_id: str) -> list[dict[str, Any]]:
         """The v2 collapse-to-steps drill-down tree for one spoke.
 
-        Real spans carry ``parent_id: null``, so the tree is rebuilt by
-        *time-bracketing*: each span nests under the smallest span whose
-        ``[ts_start, ts_end]`` window contains it. The lifecycle/step spine
-        surfaces as the Level-1 roots; skills/agents/todos/humans nest beneath by
-        their windows (to arbitrary depth); hook spans among any node's children
-        collapse into one expandable ``hooks`` node that surfaces the worst
-        status. Each node shows its own wall-clock ``duration_ms`` and a
-        ``rollup`` of additive subtree metrics (``human_count`` here; cost/tokens
-        /models are layered on by the once-per-turn attribution pass).
+        Level-1 roots are reconstructed **phase-interval buckets** (Issue #46):
+        ``step``/``lifecycle`` spans are point markers that fire at phase
+        *completion*, so the marker spine partitions the run into intervals and a
+        main turn attributes to the bucket whose interval contains it. The leading
+        region up to the first ``step`` marker is one ``setup`` bucket; trailing
+        lifecycle markers keep their own labels; main turns outside the lifecycle
+        envelope go to ``(unresolved)``. Subagent turns still attribute to their
+        ``agent`` span. The real spans nest *under* their bucket by time-bracketing
+        (smallest enclosing window), hooks collapse into one ``hooks`` node, and
+        each node carries a ``rollup`` of additive subtree metrics. The bucket
+        owns no wall-clock — intervals are attribution-only, never durations.
 
         Returns a forest ordered by ``ts_start``; an unknown spoke yields ``[]``.
         """
-        nodes, orphans = self._attributed_nodes(spoke_run_id)
-        forest = _collapse_hooks(_nest_by_time(nodes))
-        untracked = _untracked_node(orphans)
-        if untracked is not None:
-            forest = sorted([*forest, untracked], key=_sort_key)
+        nodes, intervals, buckets = self._attributed_nodes(spoke_run_id)
+        if not nodes:
+            return []
+        forest = _interval_forest(nodes, intervals, buckets)
         for root in forest:
             _roll_up_steps(root)
         return forest
@@ -306,26 +314,30 @@ class SpanStore:
         the run total minus any untracked (non-span) turns. Rows sort by total
         cost then count, descending. Unknown spoke yields ``[]``.
         """
-        nodes, _ = self._attributed_nodes(spoke_run_id)
+        nodes, _, _ = self._attributed_nodes(spoke_run_id)
         return _aggregate_by_kind(nodes)
 
     def _attributed_nodes(
         self, spoke_run_id: str
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, Any]]]:
         """Load one spoke's spans as nodes with once-per-turn cost attributed.
 
-        Returns ``(nodes, orphan_turns)`` — the flat real-span nodes (each with
-        ``own_cost_usd`` / ``own_tokens_*`` / ``models`` filled) and the turns no
-        span owned. Shared by the drill-down and the meta-by-kind view.
+        Returns ``(nodes, intervals, bucket_costs)`` — the flat real-span nodes
+        (``agent`` nodes carry their subagent ``own_cost_usd`` / ``own_tokens_*`` /
+        ``models``; every other node owns nothing, since main cost lives on the
+        phase intervals), the reconstructed phase ``intervals``, and the per-bucket
+        owned main-turn cost keyed by bucket id. Shared by the drill-down (which
+        materializes the buckets) and the meta-by-kind view (which ignores them).
         """
         rows = self._query(
             "SELECT * FROM spans WHERE spoke_run_id = ? ORDER BY ts_start, span_id",
             [spoke_run_id],
         )
         nodes = [_step_node(row) for row in rows]
+        intervals = _build_intervals(nodes)
         session_ids = sorted({row["session_id"] for row in rows if row["session_id"]})
-        orphans = _attribute_turns(nodes, self._turns_for_sessions(session_ids))
-        return nodes, orphans
+        buckets = _attribute_turns(nodes, self._turns_for_sessions(session_ids), intervals)
+        return nodes, intervals, buckets
 
     def _turns_for_sessions(self, session_ids: list[str]) -> list[dict[str, Any]]:
         """Per-turn rows for the spoke's sessions (empty on the raw path).
@@ -681,62 +693,139 @@ def _worst_status(nodes: list[dict[str, Any]]) -> str:
     )
 
 
-def _attribute_turns(
-    nodes: list[dict[str, Any]], turns: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """Assign each turn to exactly one node and fill its own cost/tokens/models.
+def _build_intervals(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reconstruct contiguous phase intervals from the step/lifecycle marker spine.
 
-    A subagent turn attaches to the deepest ``agent`` span containing it (that
-    subagent's own cost); a main turn to the deepest non-``agent`` span. A turn
-    contained by no eligible span is returned as an orphan. Counting each turn
-    once is what makes rolled-up cost reconcile to the run total — the per-span
-    ``cost_usd`` from the upstream attribution is intentionally NOT used here, as
-    it brackets a turn onto every overlapping span.
+    Markers are sorted by ``ts_start``; ``interval[0] = [M0.ts_start, M0.ts_end]``
+    and ``interval[i] = (M[i-1].ts_end, M[i].ts_end]``, so they tile
+    ``[M0.ts_start, Mn.ts_end]`` with no gap. Every interval up to and including the
+    first ``step`` marker keys to the ``setup`` bucket (the pre-cycle gap has no
+    phase-start signal, so its work is honestly coarse rather than mislabelled); the
+    rest key per-phase by their marker's ``span_id``.
+    """
+    markers = sorted(
+        (
+            n
+            for n in nodes
+            if n["kind"] in ("step", "lifecycle")
+            and _parse_ts(n["ts_start"]) is not None
+            and _parse_ts(n["ts_end"]) is not None
+        ),
+        key=lambda n: (_parse_ts(n["ts_start"]) or 0.0, n["span_id"] or ""),
+    )
+    if not markers:
+        return []
+    first_step = next((i for i, m in enumerate(markers) if m["kind"] == "step"), None)
+    intervals: list[dict[str, Any]] = []
+    for i, marker in enumerate(markers):
+        lo_iso = markers[0]["ts_start"] if i == 0 else markers[i - 1]["ts_end"]
+        is_setup = first_step is not None and i <= first_step
+        intervals.append(
+            {
+                "lo": _parse_ts(lo_iso),
+                "hi": _parse_ts(marker["ts_end"]),
+                "lo_iso": lo_iso,
+                "hi_iso": marker["ts_end"],
+                "first": i == 0,
+                "key": _SETUP_KEY if is_setup else marker["span_id"],
+                "label": "setup" if is_setup else (marker["phase"] or marker["name"]),
+            }
+        )
+    return intervals
+
+
+def _interval_containing(ts: float, intervals: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The interval whose window holds ``ts`` (right-closed at each marker boundary).
+
+    The first interval is closed at both ends; the rest are left-open, so a turn on
+    a shared marker boundary lands in the earlier interval — counted exactly once.
+    """
+    for iv in intervals:
+        lo, hi = iv["lo"], iv["hi"]
+        if lo is None or hi is None:
+            continue
+        if (lo <= ts if iv["first"] else lo < ts) and ts <= hi:
+            return iv
+    return None
+
+
+def _main_turn_bucket(turn: dict[str, Any], intervals: list[dict[str, Any]]) -> str:
+    """The bucket id a main turn belongs to (``(unresolved)`` when off the spine)."""
+    ts = _parse_ts(turn["ts"])
+    if ts is None or not intervals:
+        return _UNRESOLVED_KEY
+    iv = _interval_containing(ts, intervals)
+    return iv["key"] if iv is not None else _UNRESOLVED_KEY
+
+
+def _acc() -> dict[str, Any]:
+    return {"cost": 0.0, "in": 0, "out": 0, "models": set()}
+
+
+def _add_turn(acc: dict[str, Any], turn: dict[str, Any]) -> None:
+    acc["cost"] += turn["cost_usd"] or 0.0
+    acc["in"] += turn["tokens_in"] or 0
+    acc["out"] += turn["tokens_out"] or 0
+    if turn["model"]:
+        acc["models"].add(turn["model"])
+
+
+def _fill_owned(node: dict[str, Any], acc: dict[str, Any]) -> None:
+    node["own_cost_usd"] = acc["cost"]
+    node["own_tokens_in"] = acc["in"]
+    node["own_tokens_out"] = acc["out"]
+    node["models"] = sorted(acc["models"])
+
+
+def _attribute_turns(
+    nodes: list[dict[str, Any]],
+    turns: list[dict[str, Any]],
+    intervals: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Source-split once-per-turn attribution; fill agent nodes, return bucket costs.
+
+    A **subagent** turn attaches to the tightest enclosing ``agent`` span (its own
+    cost). A **main** turn attaches to the phase interval containing it — a
+    synthetic bucket, never a window-nested leaf — so no hook/skill/todo/human can
+    own a main turn. Counting each turn once makes the rolled-up cost reconcile to
+    the run total. Returns the per-bucket owned cost keyed by bucket id.
     """
     bounds = {n["span_id"]: (_parse_ts(n["ts_start"]), _parse_ts(n["ts_end"])) for n in nodes}
-    owned: dict[str, dict[str, Any]] = {
-        n["span_id"]: {"cost": 0.0, "in": 0, "out": 0, "models": set()} for n in nodes
-    }
-    orphans: list[dict[str, Any]] = []
+    owned: dict[str, dict[str, Any]] = {n["span_id"]: _acc() for n in nodes}
+    buckets: dict[str, dict[str, Any]] = {}
     for turn in turns:
-        owner_id = _turn_owner(turn, nodes, bounds)
-        if owner_id is None:
-            orphans.append(turn)
-            continue
-        acc = owned[owner_id]
-        acc["cost"] += turn["cost_usd"] or 0.0
-        acc["in"] += turn["tokens_in"] or 0
-        acc["out"] += turn["tokens_out"] or 0
-        if turn["model"]:
-            acc["models"].add(turn["model"])
+        if turn["source"] == "subagent":
+            owner_id = _subagent_owner(turn, nodes, bounds)
+            if owner_id is not None:
+                target = owned[owner_id]
+            else:
+                target = buckets.setdefault(_UNRESOLVED_KEY, _acc())
+        else:
+            target = buckets.setdefault(_main_turn_bucket(turn, intervals), _acc())
+        _add_turn(target, turn)
     for node in nodes:
-        acc = owned[node["span_id"]]
-        node["own_cost_usd"] = acc["cost"]
-        node["own_tokens_in"] = acc["in"]
-        node["own_tokens_out"] = acc["out"]
-        node["models"] = sorted(acc["models"])
-    return orphans
+        _fill_owned(node, owned[node["span_id"]])
+    return buckets
 
 
-def _turn_owner(
+def _subagent_owner(
     turn: dict[str, Any],
     nodes: list[dict[str, Any]],
     bounds: dict[str, tuple[float | None, float | None]],
 ) -> str | None:
-    """The id of the tightest span (right agent/main class) containing the turn.
+    """The id of the tightest ``agent`` span containing a subagent turn.
 
-    A parallel-agent caveat: with overlapping agent windows the smallest one
-    wins by ``span_id`` tie-break — still counted once, just possibly attributed
-    to a sibling agent.
+    A parallel-agent caveat: with overlapping agent windows the smallest one wins
+    by ``span_id`` tie-break — still counted once, just possibly attributed to a
+    sibling agent.
     """
     ts = _parse_ts(turn["ts"])
     if ts is None:
         return None
-    want_agent = turn["source"] == "subagent"
     best_key: tuple[float, float, str] | None = None
     best_id: str | None = None
     for node in nodes:
-        if (node["kind"] == "agent") != want_agent:
+        if node["kind"] != "agent":
             continue
         start, end = bounds[node["span_id"]]
         if start is None or end is None or not (start <= ts <= end):
@@ -747,33 +836,139 @@ def _turn_owner(
     return best_id
 
 
-def _untracked_node(orphans: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """A synthetic root holding turns no span owned, so totals still reconcile."""
-    if not orphans:
-        return None
-    # Only parseable stamps frame the window; a malformed ts must not become the
-    # node's ts_start/ts_end (it would format as garbage downstream).
-    stamps = [t["ts"] for t in orphans if t["ts"] and _parse_ts(t["ts"]) is not None]
+def _interval_forest(
+    nodes: list[dict[str, Any]],
+    intervals: list[dict[str, Any]],
+    buckets: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build the Level-1 interval-bucket roots with their spans nested beneath.
+
+    Each distinct bucket key becomes one root; real spans nest under the bucket
+    whose interval contains their ``ts_start`` (clamped to the envelope so a span
+    always displays), reusing the time-bracketing + hooks-collapse inner pass.
+    ``(unresolved)`` appears only when an off-spine turn or span exists.
+    """
+    windows = _bucket_windows(intervals)
+    spans_by_key: dict[str, list[dict[str, Any]]] = {}
+    for node in nodes:
+        spans_by_key.setdefault(_span_bucket_key(node, intervals), []).append(node)
+
+    roots: list[dict[str, Any]] = []
+    for key, window in windows.items():
+        children = _collapse_hooks(_nest_by_time(spans_by_key.get(key, [])))
+        roots.append(_bucket_node(window, buckets.get(key), children))
+
+    orphan_spans = spans_by_key.get(_UNRESOLVED_KEY, [])
+    if _UNRESOLVED_KEY in buckets or orphan_spans:
+        children = _collapse_hooks(_nest_by_time(orphan_spans))
+        roots.append(_unresolved_node(buckets.get(_UNRESOLVED_KEY), children))
+    roots.sort(key=_bucket_sort_key)
+    return roots
+
+
+def _bucket_windows(intervals: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """One display window per bucket key, merging the leading ``setup`` intervals."""
+    windows: dict[str, dict[str, Any]] = {}
+    for iv in intervals:
+        window = windows.get(iv["key"])
+        if window is None:
+            windows[iv["key"]] = {
+                "label": iv["label"],
+                "lo_iso": iv["lo_iso"],
+                "hi_iso": iv["hi_iso"],
+            }
+        else:
+            window["hi_iso"] = iv["hi_iso"]  # extend setup over its merged intervals
+    return windows
+
+
+def _span_bucket_key(span: dict[str, Any], intervals: list[dict[str, Any]]) -> str:
+    """The bucket a span displays under: its interval, clamped into the envelope."""
+    if not intervals:
+        return _UNRESOLVED_KEY
+    ts = _parse_ts(span["ts_start"])
+    if ts is None or ts < intervals[0]["lo"]:
+        return intervals[0]["key"]
+    if ts > intervals[-1]["hi"]:
+        return intervals[-1]["key"]
+    iv = _interval_containing(ts, intervals)
+    return iv["key"] if iv is not None else intervals[-1]["key"]
+
+
+def _flatten(nodes: list[dict[str, Any]]) -> Iterator[dict[str, Any]]:
+    for node in nodes:
+        yield node
+        yield from _flatten(node["children"])
+
+
+def _bucket_node(
+    window: dict[str, Any],
+    acc: dict[str, Any] | None,
+    children: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """A synthetic phase-interval root owning its main-turn cost; no own duration."""
+    return _synthetic_root(
+        kind="interval",
+        name=window["label"],
+        ts_start=window["lo_iso"],
+        ts_end=window["hi_iso"],
+        acc=acc or _acc(),
+        children=children,
+    )
+
+
+def _unresolved_node(acc: dict[str, Any] | None, children: list[dict[str, Any]]) -> dict[str, Any]:
+    """A synthetic root for turns/spans off the lifecycle envelope, so totals reconcile.
+
+    Off-spine turns never frame a window (a malformed ts must not format as garbage),
+    so the node carries no ``ts_start``/``ts_end``.
+    """
+    return _synthetic_root(
+        kind="unresolved",
+        name="(unresolved)",
+        ts_start=None,
+        ts_end=None,
+        acc=acc or _acc(),
+        children=children,
+    )
+
+
+def _synthetic_root(
+    *,
+    kind: str,
+    name: str,
+    ts_start: str | None,
+    ts_end: str | None,
+    acc: dict[str, Any],
+    children: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """A synthetic bucket root: owns its main-turn cost, never a phase duration."""
     return {
         "span_id": None,
-        "kind": "untracked",
-        "name": "(untracked turns)",
+        "kind": kind,
+        "name": name,
         "phase": None,
-        "status": "success",
-        "ts_start": min(stamps, key=lambda s: _parse_ts(s) or 0.0) if stamps else None,
-        "ts_end": max(stamps, key=lambda s: _parse_ts(s) or 0.0) if stamps else None,
-        "duration_ms": 0,
+        "status": _worst_status(list(_flatten(children))),
+        "ts_start": ts_start,
+        "ts_end": ts_end,
+        "duration_ms": None,  # intervals are attribution-only, never a phase width
         "human_type": None,
         "human_wait_ms": None,
         "human_count": 0,
-        "own_cost_usd": sum(t["cost_usd"] or 0.0 for t in orphans),
-        "own_tokens_in": sum(t["tokens_in"] or 0 for t in orphans),
-        "own_tokens_out": sum(t["tokens_out"] or 0 for t in orphans),
-        "models": sorted({t["model"] for t in orphans if t["model"]}),
+        "own_cost_usd": acc["cost"],
+        "own_tokens_in": acc["in"],
+        "own_tokens_out": acc["out"],
+        "models": sorted(acc["models"]),
         "agent": "main",
-        "collapsed_count": len(orphans),
-        "children": [],
+        "children": children,
     }
+
+
+def _bucket_sort_key(node: dict[str, Any]) -> tuple[float, str]:
+    """Order buckets by interval start; ``(unresolved)`` always sorts last."""
+    if node["kind"] == "unresolved":
+        return (float("inf"), "")
+    return (_parse_ts(node["ts_start"]) or 0.0, node["name"])
 
 
 def format_spoke_label(spoke_run_id: str) -> str:
