@@ -238,23 +238,17 @@ def _question_snippet(inputs: dict) -> str | None:
     return _snippet(first.get("question")) if isinstance(first, dict) else None
 
 
-def _snippet(text: object, *, max_words: int = 8, max_chars: int = 60) -> str | None:
-    """A trimmed first-line preview of free text — a few words, never the whole thing.
+def _snippet(text: object) -> str | None:
+    """The full first line of free text as a node label, whitespace-collapsed.
 
-    Returns ``None`` for empty / non-string input. The first line is collapsed to
-    its leading ``max_words`` words and capped at ``max_chars``; an ellipsis marks
-    any truncation so a label never silently looks complete.
+    Returns ``None`` for empty / non-string input. Multi-line text keeps only its
+    first non-empty line (the gist), but the line is never truncated — the label
+    is always readable in full, with no ellipsis.
     """
     if not isinstance(text, str) or not text.strip():
         return None
-    line = text.strip().splitlines()[0].strip()
-    words = line.split()
-    snippet = " ".join(words[:max_words])
-    truncated = len(words) > max_words
-    if len(snippet) > max_chars:
-        snippet = snippet[:max_chars].rstrip()
-        truncated = True
-    return f"{snippet}…" if truncated else snippet
+    first_line = text.strip().splitlines()[0]
+    return " ".join(first_line.split()) or None
 
 
 def _human_prompt_spans(records: list[dict], meta: dict[str, str | None]) -> list[Span]:
