@@ -339,6 +339,30 @@ def test_missing_marker_falls_to_setup_not_green():
     assert _own_tokens(_bucket(degenerate, "setup")) == 3000
 
 
+def test_non_monotonic_marker_ends_tile_by_completion_order():
+    queries = load_queries()
+    # A wide `red` [05, 40] overlaps a `green` [10, 26] that completes first. The
+    # spine tiles by completion (ts_end) order, so neither phase's work spills into
+    # setup/teardown (a ts_start tiling would invert green's interval and lose it).
+    spans = [
+        _span("nm_spawn", "2026-06-12T12:00:00Z", "2026-06-12T12:00:01Z", **_LIFE_NEW),
+        _span("nm_anchor", "2026-06-12T12:00:02Z", "2026-06-12T12:00:03Z", phase="anchor"),
+        _span("nm_red", "2026-06-12T12:00:05Z", "2026-06-12T12:00:40Z", phase="red"),
+        _span("nm_green", "2026-06-12T12:00:10Z", "2026-06-12T12:00:26Z", phase="green"),
+        _span("nm_teardown", "2026-06-12T12:00:45Z", "2026-06-12T12:00:46Z", **_LIFE_DONE),
+    ]
+    turns = [
+        _turn("2026-06-12T12:00:20Z", 1000),  # before green completes → green
+        _turn("2026-06-12T12:00:30Z", 2000),  # after green, before red completes → red
+    ]
+    forest = queries.SpanStore.from_events(spans, turns=turns).spoke_steps("ka/run+1")
+
+    assert _own_tokens(_bucket(forest, "green")) == 1000
+    assert _own_tokens(_bucket(forest, "red")) == 2000
+    assert _own_tokens(_bucket(forest, "setup")) == 0  # nothing spilled into setup
+    assert sum(r["rollup"]["tokens_in"] + r["rollup"]["tokens_out"] for r in forest) == 3000
+
+
 def test_out_of_envelope_main_turn_lands_in_unresolved():
     queries = load_queries()
     spans = [

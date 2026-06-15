@@ -308,11 +308,12 @@ class SpanStore:
         """Aggregate one spoke's spans by ``kind`` to spot "launched too much".
 
         Per span kind: invocation ``count``, total/mean/median ``duration_ms``,
-        total/mean ``cost_usd``, and the distinct ``models`` seen. Cost is the
-        once-per-turn OWNED cost (the same de-duped attribution the drill-down
-        uses), never the bracketed per-span cost — so summing across kinds equals
-        the run total minus any untracked (non-span) turns. Rows sort by total
-        cost then count, descending. Unknown spoke yields ``[]``.
+        total/mean ``cost_usd``, and the distinct ``models`` seen. Since the source
+        split (#46) attributes main-agent cost to phase intervals rather than spans,
+        only ``agent`` spans carry owned cost here — so summing across kinds equals
+        the subagent total (the run total minus every phase bucket's owned main
+        cost). The "launched too much" signal lives in the ``count``/``duration``
+        columns. Rows sort by total cost then count, descending. Unknown → ``[]``.
         """
         nodes, _, _ = self._attributed_nodes(spoke_run_id)
         return _aggregate_by_kind(nodes)
@@ -696,12 +697,16 @@ def _worst_status(nodes: list[dict[str, Any]]) -> str:
 def _build_intervals(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Reconstruct contiguous phase intervals from the step/lifecycle marker spine.
 
-    Markers are sorted by ``ts_start``; ``interval[0] = [M0.ts_start, M0.ts_end]``
-    and ``interval[i] = (M[i-1].ts_end, M[i].ts_end]``, so they tile
-    ``[M0.ts_start, Mn.ts_end]`` with no gap. Every interval up to and including the
-    first ``step`` marker keys to the ``setup`` bucket (the pre-cycle gap has no
-    phase-start signal, so its work is honestly coarse rather than mislabelled); the
-    rest key per-phase by their marker's ``span_id``.
+    Markers fire at phase *completion*, so the spine is sorted by ``ts_end`` and
+    ``interval[i] = (M[i-1].ts_end, M[i].ts_end]`` is the work that culminated in
+    marker ``M[i]``; ``interval[0]`` floors at the earliest marker ``ts_start`` (the
+    spawn). Sorting by completion time keeps ``hi`` monotonic, so the intervals tile
+    ``[earliest_start, Mn.ts_end]`` with no gap or inversion even when a wide marker
+    overlaps a later one (point markers make this moot, but the contract is robust).
+    Every interval up to and including the first ``step`` marker keys to the
+    ``setup`` bucket (the pre-cycle gap has no phase-start signal, so its work is
+    honestly coarse rather than mislabelled); the rest key per-phase by their
+    marker's ``span_id``.
     """
     markers = sorted(
         (
@@ -711,14 +716,15 @@ def _build_intervals(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
             and _parse_ts(n["ts_start"]) is not None
             and _parse_ts(n["ts_end"]) is not None
         ),
-        key=lambda n: (_parse_ts(n["ts_start"]) or 0.0, n["span_id"] or ""),
+        key=lambda n: (_parse_ts(n["ts_end"]) or 0.0, n["span_id"] or ""),
     )
     if not markers:
         return []
     first_step = next((i for i, m in enumerate(markers) if m["kind"] == "step"), None)
+    floor_iso = min(markers, key=lambda n: _parse_ts(n["ts_start"]) or 0.0)["ts_start"]
     intervals: list[dict[str, Any]] = []
     for i, marker in enumerate(markers):
-        lo_iso = markers[0]["ts_start"] if i == 0 else markers[i - 1]["ts_end"]
+        lo_iso = floor_iso if i == 0 else markers[i - 1]["ts_end"]
         is_setup = first_step is not None and i <= first_step
         intervals.append(
             {
