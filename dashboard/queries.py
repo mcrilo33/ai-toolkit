@@ -1090,8 +1090,13 @@ def format_step_label(node: dict[str, Any]) -> str:
     """
     if node["kind"] == "hooks":
         return f"hooks x{node['collapsed_count']}"
-    if node.get("summary"):
-        return node["summary"]
+    summary = node.get("summary")
+    # A tool leaf keeps its name visible alongside the parameter it acted on, so
+    # the trace reads e.g. "Read · /path"; other kinds show the summary alone.
+    if node["kind"] == "tool" and summary:
+        return f"{node['name']} · {summary}"
+    if summary:
+        return summary
     if node.get("phase"):
         return f"{node['name']} · {node['phase']}"
     return node["name"]

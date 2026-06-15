@@ -97,7 +97,7 @@ payload leakage, basename-only repo, opt-in no-op, invisibility).
 | `step` | cycle gate scripts (`red/green/review/push`) | — |
 | `hook` | every hook invocation (auto, via the hook lib) | — |
 | `script` | reserved for other instrumented scripts | — |
-| `tool` | — | one name-only leaf per `tool_use` (Issue #47): `Bash`, `Edit`, `Read`, … |
+| `tool` | — | one leaf per `tool_use` (Issue #47): `name` is the tool (`Bash`, `Edit`, `Read`, …), `summary` its main parameter (command / file path / pattern) |
 | `skill`, `agent`, `todo`, `human`, `rule` | — | reconstructed from CC session logs |
 
 ## The three key mechanisms

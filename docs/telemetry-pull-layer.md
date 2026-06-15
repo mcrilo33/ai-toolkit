@@ -10,10 +10,13 @@ Everything here is **read-only and 100% local**. Session logs contain prompt
 content, so they are parsed on-machine and only metadata / metrics are surfaced —
 never raw prompt, answer, thinking, or tool-output text. **Exception (Issue #47):**
 each node carries a few-word `summary` for display — the todo a step advances
-(`TodoWrite`/`TaskCreate`/`TaskUpdate`), an agent's short task `description`, and a
-trimmed first-line snippet of a human prompt or question. This widens the surface
-to *short intent* metadata only; long-form content — extended thinking, an agent's
-full task prompt, agent output, and human answers — stays filtered.
+(`TodoWrite`/`TaskCreate`/`TaskUpdate`), an agent's short task `description`, the
+first line of a human prompt or question, and a tool's single main parameter (the
+`Bash` command, the file path a `Read`/`Edit`/`Write` acted on, a `Grep` pattern).
+This widens the surface to *short intent* metadata only; long-form content —
+extended thinking, an agent's full task prompt, a tool's secondary input
+(replacement text, file content) and its output, and human answers — stays
+filtered.
 
 ## Modules
 

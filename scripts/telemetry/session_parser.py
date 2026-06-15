@@ -6,9 +6,13 @@ matching ``<session>/subagents/agent-<id>.jsonl`` transcript so the subagent's
 own token usage can be attributed to the parent agent span by the correlation
 pass.
 
-Privacy: only metadata is read out of a record — tool name, skill name,
-subagent type, timestamps, token counts, the ``agentId`` link. Prompt text,
-answers, thinking, and tool output are never copied into a span.
+Privacy: metadata plus short *intent* labels are read out of a record — tool
+name, skill name, subagent type, timestamps, token counts, the ``agentId`` link,
+and (Issue #47) a few-word ``summary`` per node: the in-progress todo item, an
+agent's task ``description``, a human prompt/question's first line, and a tool's
+single main parameter (Bash command, file path, Grep pattern). Bulk/long-form
+content — thinking, an agent's full prompt, a tool's secondary input (replacement
+text, file content) and its output, and human answers — is never copied.
 """
 
 from __future__ import annotations
@@ -22,6 +26,27 @@ from telemetry.spans import Span, derive_span_id
 
 AGENT_TOOLS = frozenset({"Task", "Agent"})
 TODO_TOOLS = frozenset({"TodoWrite", "TaskCreate", "TaskUpdate"})
+
+# The one input key naming what a tool acted on — surfaced as the tool leaf's
+# summary so the trace reads "what over what" (Issue #47). Only this main
+# identifying parameter is read; bulk/secondary fields (Edit's replacement text,
+# Write's content, Read's output) are never copied into a span.
+TOOL_MAIN_PARAM: dict[str, str] = {
+    "Bash": "command",
+    "Read": "file_path",
+    "Edit": "file_path",
+    "MultiEdit": "file_path",
+    "Write": "file_path",
+    "NotebookEdit": "notebook_path",
+    "Grep": "pattern",
+    "Glob": "pattern",
+    "LS": "path",
+    "WebFetch": "url",
+    "WebSearch": "query",
+}
+# Conservative fallback for tools absent from the map: the first present target
+# key. Deliberately excludes free-form content keys (prompt/content/old_string).
+_GENERIC_PARAM_KEYS = ("file_path", "path", "command", "pattern", "query", "url")
 
 
 @dataclass(slots=True)
@@ -162,10 +187,15 @@ def _span_for_tool_use(
             human=human,
             **common,
         )
-    # Every other tool_use is a name-only leaf span (Issue #47 S2b): the tool name
-    # is metadata, but its `input` (Bash command, file path, Grep pattern) is user
-    # content and is never read — so no summary, and nothing leaks.
-    return Span(kind="tool", name=name if isinstance(name, str) else "tool", **common)
+    # Every other tool_use is a leaf span (Issue #47 S2b) summarising what it acted
+    # on — the tool's MAIN identifying parameter only (Bash command, file path, Grep
+    # pattern). Bulk/secondary input (replacement text, file content) is never read.
+    return Span(
+        kind="tool",
+        name=name if isinstance(name, str) else "tool",
+        summary=_tool_param(name, inputs),
+        **common,
+    )
 
 
 def _todo_summaries(records: list[dict]) -> dict[str, str]:
@@ -227,6 +257,19 @@ def _derive_todo_summary(inputs: dict, prev: set[str]) -> tuple[str | None, set[
     newly = sorted(in_progress - prev)
     summary = newly[0] if newly else (sorted(in_progress)[0] if in_progress else None)
     return _snippet(summary), in_progress
+
+
+def _tool_param(name: object, inputs: dict) -> str | None:
+    """The main identifying parameter of a tool call, as a node-label summary.
+
+    Uses the per-tool key in :data:`TOOL_MAIN_PARAM`, else the first present
+    generic target key. Only this one key is read — bulk/secondary fields never
+    are — so the trace shows what a tool acted on without leaking its payload.
+    """
+    key = TOOL_MAIN_PARAM.get(name) if isinstance(name, str) else None
+    if key is None:
+        key = next((k for k in _GENERIC_PARAM_KEYS if inputs.get(k)), None)
+    return _snippet(inputs.get(key)) if key else None
 
 
 def _question_snippet(inputs: dict) -> str | None:
