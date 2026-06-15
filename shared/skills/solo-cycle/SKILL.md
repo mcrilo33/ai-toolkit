@@ -76,12 +76,17 @@ park state (`plan` now; `red` / `draft` reserved for the follow-ups), force-move
 as the spoke advances and dropped once it moves past the gate. This is distinct
 from the final-completion marker: **`ready/<issue>`** still means *the whole
 issue is done* and is what `/land` consumes — `gate/<issue>` only means *parked,
-awaiting review*. Emit it when you park:
+awaiting review*. Emit it when you park through the one allowlistable marker
+process — never a hand-written `git tag … && git push …` chain, which re-prompts
+(the same compound-command gotcha as the push, issues #37/#45):
 
 ```bash
-git tag -f -a gate/<issue> -m plan
-git push -f origin gate/<issue>
+bash .ai-toolkit/scripts/spoke-ready.sh --gate <issue>
 ```
+
+It force-moves the annotated `gate/<issue>` tag and pushes it as a tag-only push,
+which the pre-push gate short-circuits (a marker carries no code), so emitting it
+never runs the suite; re-running is idempotent.
 
 ## The cycle (per subtask)
 
@@ -179,7 +184,11 @@ separate `git tag … && git push …` chain, which would re-prompt):
 bash .ai-toolkit/scripts/spoke-push.sh --ready <issue>
 ```
 
-This tags `ready/<issue>` at the branch tip and pushes it after the branch push.
+This pushes the branch, then delegates the marker to
+`bash .ai-toolkit/scripts/spoke-ready.sh <issue>` — the same canonical emitter the
+`gate/<issue>` park uses. The marker is an annotated, force-moved tag pushed as a
+tag-only push (the pre-push gate skips it — a tag carries no code) and re-running
+is idempotent.
 
 **Completion is agent-determined, not a human call.** You decide a subtask is the
 final one by checking the issue's **acceptance criteria** against your task ledger:
@@ -196,8 +205,8 @@ only once the marker points at the tip, and `worktree-land.sh` refuses to land u
 then. So:
 
 - Emit the marker **once**, after the last subtask — never after an intermediate one.
-- If you push more work after tagging, the marker goes stale (sha ≠ tip); re-tag at the
-  new tip (`git tag -f ready/<issue> && git push -f origin ready/<issue>`).
+- If you push more work after tagging, the marker goes stale (sha ≠ tip); re-emit it at
+  the new tip with `bash .ai-toolkit/scripts/spoke-ready.sh <issue>` (idempotent).
 - Ad-hoc/express (lane-2, non-numbered) branches carry no marker — their single push IS
   completion, and the hub lands them with `--force-land`.
 

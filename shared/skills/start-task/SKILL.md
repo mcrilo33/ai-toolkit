@@ -101,9 +101,9 @@ PLAN gate comes first — explore the code, then **print the full implementation
 (files, approach, test strategy, open questions) as a normal visible message** before
 any approval ask, and WAIT for my approval before writing code (before GREEN). Do not
 defer the plan into an approval card — the message itself is the plan. Park there
-rather than blocking: emit the `gate/N` marker (`git tag -f -a gate/N -m plan && git
-push -f origin gate/N`) so the hub sees you parked, then stop with an explicit "reply
-to approve, or tell me what to change" and proceed into the cycle once I approve. If
+rather than blocking: emit the `gate/N` marker (`bash .ai-toolkit/scripts/spoke-ready.sh
+--gate N`) so the hub sees you parked, then stop with an explicit "reply to approve, or
+tell me what to change" and proceed into the cycle once I approve. If
 the gate is `none` (very-clear work), skip the PLAN gate and run autonomous straight
 through.
 

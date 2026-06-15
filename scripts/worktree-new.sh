@@ -178,13 +178,14 @@ if [ -d "$REPO_ROOT/.claude" ]; then
 fi
 
 # --- seed the spoke's command allowlist ----------------------------------------
-# The spoke's PUSH step runs as ONE allowlistable process — spoke-push.sh —
-# because Claude Code's Bash matcher decomposes a compound command and requires
-# every segment to be allowed, so a decorated/chained push (or the intrinsically
-# two-command `ready/N` marker) never matched a bare exact-push rule and always
-# re-prompted (issue #37). Seed that script rule plus a read-only helper
-# allowlist (Tier 1 local, Tier 2 network-read); the ship gates (push-scope-guard
-# + the pre-push hooks), not permission asks, do the enforcing.
+# The spoke's PUSH step and marker emission each run as ONE allowlistable
+# process — spoke-push.sh and spoke-ready.sh — because Claude Code's Bash matcher
+# decomposes a compound command and requires every segment to be allowed, so a
+# decorated/chained push (or the intrinsically two-command `ready/N` / `gate/N`
+# marker `git tag … && git push …`) never matched a bare exact-push rule and
+# always re-prompted (issues #37, #45). Seed those script rules plus a read-only
+# helper allowlist (Tier 1 local, Tier 2 network-read); the ship gates
+# (push-scope-guard + the pre-push hooks), not permission asks, do the enforcing.
 #
 # `git branch --show-current` is seeded EXACT — never `git branch:*`, which would
 # hand over `git branch -D`. The runner tier (#38) is scoped to the pytest verbs
@@ -193,6 +194,7 @@ fi
 # `git checkout|reset|clean:*` / `rm` / `mv`.
 ALLOW_RULES=(
   "Bash(bash .ai-toolkit/scripts/spoke-push.sh:*)"
+  "Bash(bash .ai-toolkit/scripts/spoke-ready.sh:*)"
   # Tier 1 — read-only, no side effects
   "Bash(git status:*)" "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)"
   "Bash(git rev-parse:*)" "Bash(git branch --show-current)"

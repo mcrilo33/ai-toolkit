@@ -67,15 +67,15 @@ fi
 echo "→ git push -u origin $BRANCH"
 git push -u origin "$BRANCH"
 
-# Final subtask: emit the ready/<issue> completion marker at the branch tip.
-# The hub consumes it on /land; a mid-cycle push passes no --ready and so emits
-# nothing.
+# Final subtask: emit the ready/<issue> completion marker via the canonical
+# marker emitter (issue #45) — one annotated, force-moved (idempotent) tag pushed
+# as a tag-only push the pre-push gate short-circuits. spoke-ready.sh is
+# co-located with this script (both in the toolkit scripts/ and a synced
+# .ai-toolkit/scripts/), so resolve it as a sibling. The hub consumes the marker
+# on /land; a mid-cycle push passes no --ready and so emits nothing.
 if [ -n "$READY" ]; then
-  TAG="ready/$READY"
-  echo "→ git tag $TAG"
-  git tag "$TAG"
-  echo "→ git push origin $TAG"
-  git push origin "$TAG"
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  bash "$SCRIPT_DIR/spoke-ready.sh" "$READY"
 fi
 
 echo "✓ spoke-push complete: pushed $BRANCH${READY:+ + marker ready/$READY}"

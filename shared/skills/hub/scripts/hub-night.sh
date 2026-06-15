@@ -202,7 +202,7 @@ steps that apply (ANCHOR/RED/GREEN/REVIEW/PUSH), exactly one in_progress.
 This task's gate is plan: the PLAN gate comes first — explore the code and present a
 concrete implementation plan in plan mode, and WAIT for approval before writing code
 (before GREEN). Park there rather than blocking: emit the gate/$n marker
-(git tag -f -a gate/$n -m plan && git push -f origin gate/$n) so the hub sees you parked,
+(bash .ai-toolkit/scripts/spoke-ready.sh --gate $n) so the hub sees you parked,
 and proceed into the cycle once approved.
 
 Then implement it following the solo-cycle (/cycle: RED → GREEN → REVIEW → PUSH). Push
