@@ -472,7 +472,7 @@ sync_mcp_servers() {
 # spoke-push.sh ships here too so the spoke's PUSH step runs as one
 # allowlistable process (issue #37).
 # Sources: worktree-*.sh and spoke-push.sh at the toolkit root scripts/,
-# hub-status.sh and hub-ready-watch.sh under the hub skill
+# hub-status.sh, hub-ready-watch.sh and hub-night.sh under the hub skill
 # (shared/skills/hub/scripts/).
 sync_workflow_scripts() {
     section "Workflow scripts (hub/spoke/land)"
@@ -483,9 +483,9 @@ sync_workflow_scripts() {
     # scripts can source it as a sibling to emit lifecycle spans — see
     # worktree-lib.sh's telemetry block.
     local name src
-    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh spoke-push.sh hub-status.sh hub-ready-watch.sh telemetry.sh; do
+    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh spoke-push.sh hub-status.sh hub-ready-watch.sh hub-night.sh telemetry.sh; do
         case "$name" in
-            hub-status.sh|hub-ready-watch.sh) src="$SHARED_DIR/skills/hub/scripts/$name" ;;
+            hub-status.sh|hub-ready-watch.sh|hub-night.sh) src="$SHARED_DIR/skills/hub/scripts/$name" ;;
             telemetry.sh)                     src="$SHARED_DIR/hooks/lib/$name" ;;
             *)                                src="$SCRIPT_DIR/$name" ;;
         esac

@@ -76,6 +76,29 @@ loop (`/loop 2m bash .ai-toolkit/scripts/hub-ready-watch.sh`). It is detection o
 - Offline-safe: a finished spoke's tag is locally visible (shared ref store), so a failed
   fetch is non-fatal and local markers still surface.
 
+### Overnight queue dispatcher (optional)
+
+To drain a queue of pre-scoped issues overnight without supervision, run the night
+dispatcher on the hub before bed:
+
+```bash
+bash .ai-toolkit/scripts/hub-night.sh
+```
+
+It reads the `night`-labelled open issues (`gh issue list --label night`) and dispatches
+each via `worktree-new.sh`, recomputing an adaptive concurrency target every tick —
+`clamp(ceil(tasks_left × T_task / time_left), 1, NIGHT_MAX_CONCURRENCY)` — so a short queue
+runs sequentially and a long one ramps up to the cap as wake time approaches. It never
+starts a spoke once less than `T_task` of the night remains, reuses a freed slot when a
+spoke finishes (`ready/N`) or goes idle, and is idempotent — re-running skips branches
+already in flight. Knobs (env, defaults): `NIGHT_END=07:00`, `NIGHT_MAX_CONCURRENCY=3`,
+`NIGHT_TASK_MINUTES=90`. Use `--once` for a single tick (e.g. under cron). It dispatches
+only — the hub still lands finished spokes on `/land`.
+
+> [!NOTE]
+> This is Phase 1 (the dispatcher) of night mode. The night-specific kickoff, pre-flight
+> batching scout, and morning report are separate follow-ups (epic #40).
+
 ### 3. Propose the next move — act only on confirmation
 
 From the dashboard, surface concrete next steps and wait for the user's OK before doing
