@@ -12,6 +12,7 @@ prompt / answer / tool-output text that the session logs contain.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -49,14 +50,15 @@ SCHEMA_KEYS = {
 }
 
 # Every prompt / answer / tool-output string planted in the fixtures. None may
-# appear anywhere in the emitted span data.
+# appear anywhere in the emitted span data. Todo item text is deliberately NOT
+# here: Issue #47 lifts the privacy filter for the todo ledger (it is the L1
+# step label), so retained todo text is metadata, not a leaked secret.
 SECRETS = (
     "SECRET_HUMAN_PROMPT",
     "SECRET_THINKING",
     "SECRET_TASK_PROMPT",
     "SECRET_AGENT_OUTPUT",
     "SECRET_AGENT_WORK",
-    "SECRET_TODO",
     "SECRET_Q",
     "SECRET_ANSWER",
 )
@@ -92,6 +94,12 @@ class TestSpanKinds:
         todos = _by_kind(parsed, "todo")
         assert len(todos) == 1
         assert todos[0].kind == "todo"
+
+    def test_todo_span_named_for_its_in_progress_item(self, parsed: ParsedSession) -> None:
+        # Issue #47: the todo span is named for the ledger item it advances (the
+        # in_progress one), not the bare tool name — that name is the L1 step label.
+        todo = _by_kind(parsed, "todo")[0]
+        assert todo.name == "Add RED telemetry test"
 
     def test_emits_human_prompt_span(self, parsed: ParsedSession) -> None:
         prompts = [s for s in _by_kind(parsed, "human") if s.human and s.human["type"] == "prompt"]
@@ -157,6 +165,80 @@ class TestPrivacy:
         blob = "".join(str(s.to_dict()) for s in parsed.spans)
         for secret in SECRETS:
             assert secret not in blob
+
+
+def _assistant_todo(uuid: str, ts: str, tool_id: str, todos: list[dict]) -> dict:
+    return {
+        "type": "assistant",
+        "sessionId": "diff-sess",
+        "cwd": "/Users/demo/Repos/proj",
+        "gitBranch": "feature/47-demo",
+        "timestamp": ts,
+        "uuid": uuid,
+        "message": {
+            "role": "assistant",
+            "model": "claude-opus-4-8",
+            "content": [
+                {"type": "tool_use", "id": tool_id, "name": "TodoWrite", "input": {"todos": todos}}
+            ],
+        },
+    }
+
+
+class TestTodoLedgerDiff:
+    """Issue #47: the in-progress item per ledger write drives the L1 step label."""
+
+    def test_newly_in_progress_item_is_chosen_across_consecutive_writes(
+        self, tmp_path: Path
+    ) -> None:
+        # Two snapshots: write 1 marks A in_progress; write 2 advances to B. The
+        # diff must pick the item that NEWLY entered in_progress on each write.
+        records = [
+            _assistant_todo(
+                "w1",
+                "2026-06-15T12:00:01.000Z",
+                "tool_w1",
+                [
+                    {"content": "Add RED test", "status": "in_progress"},
+                    {"content": "Implement GREEN", "status": "pending"},
+                ],
+            ),
+            _assistant_todo(
+                "w2",
+                "2026-06-15T12:00:30.000Z",
+                "tool_w2",
+                [
+                    {"content": "Add RED test", "status": "completed"},
+                    {"content": "Implement GREEN", "status": "in_progress"},
+                ],
+            ),
+        ]
+        path = tmp_path / "diff-sess.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        todos = sorted(_by_kind(parse_session_file(path), "todo"), key=lambda s: s.ts_start or "")
+
+        assert [t.name for t in todos] == ["Add RED test", "Implement GREEN"]
+
+    def test_todo_write_without_in_progress_item_falls_back_to_tool_name(
+        self, tmp_path: Path
+    ) -> None:
+        # A snapshot with nothing in_progress has no item to advance → the span
+        # keeps the bare tool name as a sane fallback (never crashes, never blank).
+        records = [
+            _assistant_todo(
+                "w1",
+                "2026-06-15T12:00:01.000Z",
+                "tool_w1",
+                [{"content": "Add RED test", "status": "pending"}],
+            )
+        ]
+        path = tmp_path / "diff-sess.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        todo = _by_kind(parse_session_file(path), "todo")[0]
+
+        assert todo.name == "TodoWrite"
 
 
 class TestProjectsDirWalk:

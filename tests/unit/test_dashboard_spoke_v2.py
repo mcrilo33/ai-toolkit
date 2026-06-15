@@ -394,6 +394,87 @@ def test_unresolved_node_ignores_malformed_turn_timestamps():
     assert unresolved["ts_start"] is None
 
 
+# --- S6: todo-text L1 labels (Issue #47) ----------------------------------------
+
+
+def test_interval_bucket_labelled_by_the_todo_it_advances():
+    queries = load_queries()
+    # A resolved todo span (its name is the in-progress item text, not the bare
+    # tool name) sits in the red interval → the L1 bucket is named for that todo.
+    spans = [
+        _span("l_spawn", "2026-06-12T12:00:00Z", "2026-06-12T12:00:01Z", **_LIFE_NEW),
+        _span("l_anchor", "2026-06-12T12:00:05Z", "2026-06-12T12:00:05Z", phase="anchor"),
+        _span(
+            "l_todo",
+            "2026-06-12T12:00:08Z",
+            "2026-06-12T12:00:09Z",
+            kind="todo",
+            name="Add RED parser test",
+            phase=None,
+        ),
+        _span("l_red", "2026-06-12T12:00:15Z", "2026-06-12T12:00:15Z", phase="red"),
+        _span("l_teardown", "2026-06-12T12:00:35Z", "2026-06-12T12:00:36Z", **_LIFE_DONE),
+    ]
+    forest = queries.SpanStore.from_events(spans).spoke_steps("ka/run+1")
+
+    assert _bucket(forest, "Add RED parser test")
+    assert not [n for n in forest if n["name"] == "red"]
+
+
+def test_bucket_falls_back_to_phase_name_when_no_todo_resolves():
+    queries = load_queries()
+    # A bare-tool-name todo (unresolved, no in-progress item derived) must NOT
+    # override the phase label — the bucket stays named for its phase.
+    spans = [
+        _span("f_spawn", "2026-06-12T12:00:00Z", "2026-06-12T12:00:01Z", **_LIFE_NEW),
+        _span("f_anchor", "2026-06-12T12:00:05Z", "2026-06-12T12:00:05Z", phase="anchor"),
+        _span(
+            "f_todo",
+            "2026-06-12T12:00:08Z",
+            "2026-06-12T12:00:09Z",
+            kind="todo",
+            name="TodoWrite",
+            phase=None,
+        ),
+        _span("f_red", "2026-06-12T12:00:15Z", "2026-06-12T12:00:15Z", phase="red"),
+        _span("f_teardown", "2026-06-12T12:00:35Z", "2026-06-12T12:00:36Z", **_LIFE_DONE),
+    ]
+    forest = queries.SpanStore.from_events(spans).spoke_steps("ka/run+1")
+
+    assert _bucket(forest, "red")
+
+
+def test_latest_resolved_todo_in_the_interval_wins():
+    queries = load_queries()
+    # Two resolved todos land in the same red interval; the later one is the item
+    # actually being advanced when the phase completes → it names the bucket.
+    spans = [
+        _span("m_spawn", "2026-06-12T12:00:00Z", "2026-06-12T12:00:01Z", **_LIFE_NEW),
+        _span("m_anchor", "2026-06-12T12:00:05Z", "2026-06-12T12:00:05Z", phase="anchor"),
+        _span(
+            "m_todo1",
+            "2026-06-12T12:00:08Z",
+            "2026-06-12T12:00:09Z",
+            kind="todo",
+            name="First item",
+            phase=None,
+        ),
+        _span(
+            "m_todo2",
+            "2026-06-12T12:00:12Z",
+            "2026-06-12T12:00:13Z",
+            kind="todo",
+            name="Second item",
+            phase=None,
+        ),
+        _span("m_red", "2026-06-12T12:00:15Z", "2026-06-12T12:00:15Z", phase="red"),
+        _span("m_teardown", "2026-06-12T12:00:35Z", "2026-06-12T12:00:36Z", **_LIFE_DONE),
+    ]
+    forest = queries.SpanStore.from_events(spans).spoke_steps("ka/run+1")
+
+    assert _bucket(forest, "Second item")
+
+
 # --- S4: meta-by-kind aggregation -----------------------------------------------
 
 
