@@ -484,9 +484,9 @@ sync_workflow_scripts() {
     # scripts can source it as a sibling to emit lifecycle spans — see
     # worktree-lib.sh's telemetry block.
     local name src
-    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh spoke-push.sh spoke-ready.sh hub-status.sh hub-ready-watch.sh hub-night.sh telemetry.sh; do
+    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh spoke-push.sh spoke-ready.sh hub-status.sh hub-ready-watch.sh hub-night.sh hub-scout.sh telemetry.sh; do
         case "$name" in
-            hub-status.sh|hub-ready-watch.sh|hub-night.sh) src="$SHARED_DIR/skills/hub/scripts/$name" ;;
+            hub-status.sh|hub-ready-watch.sh|hub-night.sh|hub-scout.sh) src="$SHARED_DIR/skills/hub/scripts/$name" ;;
             telemetry.sh)                     src="$SHARED_DIR/hooks/lib/$name" ;;
             *)                                src="$SCRIPT_DIR/$name" ;;
         esac

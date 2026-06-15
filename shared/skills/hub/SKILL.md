@@ -76,6 +76,36 @@ loop (`/loop 2m bash .ai-toolkit/scripts/hub-ready-watch.sh`). It is detection o
 - Offline-safe: a finished spoke's tag is locally visible (shared ref store), so a failed
   fetch is non-fatal and local markers still surface.
 
+### Pre-flight batching scout (night mode, optional)
+
+Parallel night spokes are blind to each other, so before launching the dispatcher,
+run the **scout** at setup (while you are awake) to avoid collisions:
+
+```bash
+bash .ai-toolkit/scripts/hub-scout.sh
+```
+
+It prints a dossier of facts — each `night` issue's file-scope hints (from its
+`Scope:` line, see `start-task`), the raw file overlap between issues, and a
+critical-path feasibility check (does an all-parallel / all-serial makespan fit
+before `NIGHT_END`?). Then, reading that dossier, classify each overlapping pair and
+stamp the verdict into the issues as body lines (an Opus scout agent does this; you
+**approve** the plan before any spoke starts):
+
+- **PARALLEL** — disjoint (or only incidentally overlapping) → run concurrently; no
+  directive.
+- **SERIAL** — would textually conflict → add `Serial-after: <earlier>` to the later
+  issue so the dispatcher defers it until the earlier one has landed.
+- **MERGE** — logically coupled (one spoke should own both, `Closes #a #b`) → add
+  `Merge-into: <owner>` to the child so it is never dispatched alone. Keep merge
+  clusters small (accept/reject as a unit); a large cluster falls back to SERIAL.
+
+The scout only reports facts and the agent only classifies — the mechanical overlap
+and feasibility math stay in the script (`#43`: don't let the LLM narrate mechanical
+work). The supervisor then honors `Serial-after:` / `Merge-into:` from the issue
+bodies; an over-committed night ("these 4 serialize → won't fit before 07:00") is
+caught here, at setup, not wasted overnight.
+
 ### Overnight queue dispatcher (optional)
 
 To drain a queue of pre-scoped issues overnight without supervision, run the night

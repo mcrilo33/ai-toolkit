@@ -637,11 +637,16 @@ def test_gate_parked_idle_spoke_is_not_reaped(night_hub: Path, tmp_path: Path) -
     [
         ("Gate: plan\nSerial-after: 41\n", "Serial-after", "41"),
         ("Merge-into: 41\nGate: plan", "Merge-into", "41"),
+        # The natural GitHub `#41` form must NOT fail open (silently no directive).
+        ("Serial-after: #41\n", "Serial-after", "41"),
         ("Gate: plan\nno directive here", "Serial-after", ""),
+        # A `Closes #41 #52` line is not a directive — must not be misparsed.
+        ("Closes #41 #52\nGate: plan", "Serial-after", ""),
     ],
 )
 def test_parse_directive(body: str, key: str, expected: str) -> None:
-    result = _call(f"parse_directive {body!r} {key}")
+    # Pass the (multi-line) body via env so real newlines survive into the shell.
+    result = _call(f'parse_directive "$BODY" {key}', env={"BODY": body})
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == expected

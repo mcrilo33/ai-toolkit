@@ -51,7 +51,7 @@ def _epoch(year: int, month: int, day: int, hour: int, minute: int = 0) -> int:
 def test_scope_hints_prefers_explicit_scope_line() -> None:
     body = "Some text\nScope: shared/hooks/foo.sh tests/unit/test_foo.py\nmore"
 
-    result = _call(f"scope_hints {repr(body)}")
+    result = _call('scope_hints "$BODY"', env={"BODY": body})
 
     out = result.stdout.split()
     assert "shared/hooks/foo.sh" in out
@@ -62,7 +62,7 @@ def test_scope_hints_prefers_explicit_scope_line() -> None:
 def test_scope_hints_falls_back_to_backticked_paths() -> None:
     body = "Touches `scripts/spoke-ready.sh` and `dashboard/app.py` here."
 
-    result = _call(f"scope_hints {repr(body)}")
+    result = _call('scope_hints "$BODY"', env={"BODY": body})
 
     out = result.stdout.split()
     assert "scripts/spoke-ready.sh" in out
@@ -72,7 +72,7 @@ def test_scope_hints_falls_back_to_backticked_paths() -> None:
 def test_scope_hints_unknown_when_no_signal() -> None:
     body = "A vague description with no paths and no scope line."
 
-    result = _call(f"scope_hints {repr(body)}")
+    result = _call('scope_hints "$BODY"', env={"BODY": body})
 
     assert result.stdout.strip() == "UNKNOWN", "no signal must be an explicit UNKNOWN, not empty"
 
@@ -177,3 +177,41 @@ def test_hub_skill_documents_the_scout_step() -> None:
         "the scout classifies overlap into PARALLEL / SERIAL / MERGE"
     )
     assert "approve" in flat, "the user approves the batching plan before any spoke starts"
+
+
+# ── dossier: the rendered output must include the pairwise overlap matrix ──────
+
+
+def test_dossier_renders_pairwise_overlap(tmp_path: Path) -> None:
+    # Two issues both touching shared/foo.sh -> the dossier must surface that
+    # overlap as a fact (the scout's headline output, not just per-issue hints).
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    bodies = tmp_path / "bodies"
+    bodies.mkdir()
+    (bodies / "1").write_text("Scope: shared/foo.sh tests/test_one.py\n")
+    (bodies / "2").write_text("Scope: shared/foo.sh dashboard/app.py\n")
+    gh = bindir / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "issue" ] && [ "$2" = "list" ]; then echo 1; echo 2; exit 0; fi\n'
+        'if [ "$1" = "issue" ] && [ "$2" = "view" ]; then cat "$BODIES/$3"; exit 0; fi\n'
+        "exit 1\n"
+    )
+    gh.chmod(0o755)
+    env = {
+        **os.environ,
+        "TZ": "UTC",
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "BODIES": str(bodies),
+        "NIGHT_NOW": str(_epoch(2026, 6, 15, 23, 0)),
+    }
+    result = subprocess.run(["bash", str(HUB_SCOUT)], capture_output=True, text=True, env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "shared/foo.sh" in result.stdout
+    assert "#1" in result.stdout and "#2" in result.stdout
+    # The overlap line names BOTH issues and the shared file.
+    overlap_lines = [ln for ln in result.stdout.splitlines() if "∩" in ln]
+    assert overlap_lines, "the dossier must render a pairwise overlap line"
+    assert any("shared/foo.sh" in ln for ln in overlap_lines)

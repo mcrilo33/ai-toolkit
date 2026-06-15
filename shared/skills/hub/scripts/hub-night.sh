@@ -177,6 +177,52 @@ inflight_issues() {
   inflight_worktrees | cut -f2
 }
 
+# --- pre-flight batching directives (issue #40 ST5) ---------------------------
+# The scout's approved plan is stored IN THE ISSUE BODY as Gate-style lines beside
+# `Gate:` — no new source of truth, and the supervisor reads them from the same
+# `gh issue view` it already has rights to:
+#   Serial-after: <N>   this issue waits until #<N> has LANDED before dispatch
+#   Merge-into: <N>     this issue is owned by the #<N> spoke; never dispatched alone
+
+# parse_directive <body> <Key> -> the issue number after a `<Key>: <num>` line, or
+# empty. Tolerates an optional leading `#` (the natural GitHub `#41` form) so a
+# `Serial-after: #41` is NOT silently treated as "no directive" (which would fail
+# OPEN and quietly disable the serialization the guard exists to enforce).
+# UPGRADE: a multi-value `Serial-after: 41, 52` keeps only the first; surface a
+# warning when a `<Key>:` line is present but yields no number, to catch typos.
+parse_directive() {
+  local body="$1" key="$2"
+  printf '%s\n' "$body" \
+    | sed -n "s/^[[:space:]]*${key}:[[:space:]]*#\\{0,1\\}\\([0-9][0-9]*\\).*/\\1/p" | head -1
+}
+
+# issue_directives -> "<issue>\t<serial-after>\t<merge-into>" per queued issue
+# (the directive fields empty when absent). One gh round-trip per issue; a missing/
+# unauthed gh degrades to empty directives (dispatch normally).
+# UPGRADE: one `gh issue view` per issue per tick — batch via a single
+# `gh issue list --json number,body` if the night queue ever grows past ~dozens.
+issue_directives() {
+  local n body
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    body="$(gh issue view "$n" --json body -q .body 2>/dev/null || true)"
+    printf '%s\t%s\t%s\n' "$n" \
+      "$(parse_directive "$body" 'Serial-after')" "$(parse_directive "$body" 'Merge-into')"
+  done < <(queue_issues)
+}
+
+# predecessor_landed <pred> <open_queue> <inflight> -> true (exit 0) when <pred> is
+# absent from BOTH the open night queue and the in-flight set — i.e. it has been
+# closed AND torn down, which is exactly what `worktree-land.sh` does on a land. A
+# predecessor still queued or still in flight is NOT landed, so its successors wait.
+predecessor_landed() {
+  local pred="$1" open_q="$2" inflight="$3" tok
+  for tok in $open_q $inflight; do
+    [ "$tok" = "$pred" ] && return 1
+  done
+  return 0
+}
+
 # _transcript_idle_seconds <worktree-path> -> seconds since the spoke's newest
 # Claude transcript was touched, or empty when there is no transcript yet. Same
 # slug + newest-jsonl selection hub-status.sh uses; mtime via BSD/GNU stat.
@@ -427,8 +473,8 @@ dispatch_issue() {
 # honoring the strict launch cutoff. (Slot-free detection for in-flight spokes
 # arrives in ST3; here every in-flight spoke is counted as occupying a slot.)
 supervise_tick() {
-  local now queue inflight time_left queue_count busy_count done_count
-  local tasks_left target free_slots attempts dispatched n
+  local now queue inflight directives time_left queue_count busy_count done_count
+  local tasks_left target free_slots attempts dispatched n sa mi merge_children
   now="$(now_epoch)"
   # Reap hung / over-ceiling spokes FIRST (before the cutoff check), so a runaway
   # spoke is killed every tick — including the cutoff tick — not only while there
@@ -436,6 +482,7 @@ supervise_tick() {
   reap_overrun_spokes
   queue="$(queue_issues)"
   inflight="$(inflight_issues)"
+  directives="$(issue_directives)"   # "<n>\t<serial-after>\t<merge-into>" per issue
   time_left="$(minutes_until "$NIGHT_END" "$now")"
 
   if launch_cutoff_reached "$time_left"; then
@@ -444,16 +491,20 @@ supervise_tick() {
   fi
 
   queue_count="$(printf '%s\n' "$queue" | grep -c '^[0-9]' || true)"
+  # Merge-into children are owned by their target spoke (Closes #a #b) — never
+  # separately launchable, so they must not inflate the adaptive concurrency target.
+  merge_children="$(printf '%s\n' "$directives" | awk -F'\t' '$3 != "" {c++} END {print c+0}')"
   read -r busy_count done_count <<<"$(slot_counts)"
-  # Remaining work = queued issues not yet done; done spokes await the hub's land.
-  tasks_left=$(( queue_count - done_count ))
+  # Remaining work = queued issues not yet done, minus the merge children; done
+  # spokes await the hub's land.
+  tasks_left=$(( queue_count - done_count - merge_children ))
   [ "$tasks_left" -lt 0 ] && tasks_left=0
   target="$(night_target "$tasks_left" "$time_left")"
   # busy + parked spokes hold a slot; done spokes (incl. ones reaped this tick)
   # free theirs for backfill.
   free_slots=$(( target - busy_count ))
   [ "$free_slots" -lt 0 ] && free_slots=0
-  log "tick: queue=$queue_count busy=$busy_count done=$done_count time_left=${time_left}m target=$target free=$free_slots"
+  log "tick: queue=$queue_count busy=$busy_count done=$done_count merge=$merge_children time_left=${time_left}m target=$target free=$free_slots"
 
   # Bound the work to free_slots ATTEMPTS, not successes: a systemic dispatch
   # failure (e.g. worktree-new.sh missing) then can't hammer the whole queue —
@@ -463,6 +514,24 @@ supervise_tick() {
   while IFS= read -r n; do
     [ -n "$n" ] || continue
     printf '%s\n' "$inflight" | grep -qxF "$n" && continue   # already in flight (idempotent skip)
+    # Pre-flight batching guards (issue #40 ST5) — both are NON-consuming skips
+    # (they do not touch `attempts`), so a deferred task never starves a ready one.
+    sa="$(printf '%s\n' "$directives" | awk -F'\t' -v n="$n" '$1 == n {print $2}')"
+    mi="$(printf '%s\n' "$directives" | awk -F'\t' -v n="$n" '$1 == n {print $3}')"
+    if [ -n "$mi" ]; then
+      log "→ skip #$n: Merge-into #$mi (owned by that spoke, never dispatched alone)"
+      continue
+    fi
+    if [ -n "$sa" ] && ! predecessor_landed "$sa" "$queue" "$inflight"; then
+      # Conservative: never run a successor before its dependency lands. A
+      # predecessor that PARKED (blocked/N, re-queued but never closed) stays in
+      # the open queue, so its successors stall until the cutoff — correct, but it
+      # reads as a never-dispatched issue + a wall of identical skip lines.
+      # UPGRADE: distinguish "predecessor parked" from "still working" here; the
+      # morning report (Phase 4) reconciles chains stalled behind a parked predecessor.
+      log "→ skip #$n: Serial-after #$sa not yet landed — deferred to a later tick"
+      continue
+    fi
     [ "$attempts" -ge "$free_slots" ] && break
     attempts=$(( attempts + 1 ))
     dispatch_issue "$n" && dispatched=$(( dispatched + 1 ))

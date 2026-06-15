@@ -77,12 +77,20 @@ So the same issue body is mode-agnostic; only the harness decides day-vs-night (
 ### 3. Create the issue
 
 Record the chosen gate level as a **`Gate:`** line in the issue body so it is part of
-the durable contract (the spoke reads it when it anchors), then create the issue:
+the durable contract (the spoke reads it when it anchors). For a task you may queue
+into **night mode**, also prompt the author for a **`Scope:`** line — a short
+space- or comma-separated list of the files/globs the task is expected to touch
+(e.g. `Scope: shared/hooks/foo.sh tests/unit/test_foo.py`). The pre-flight scout
+(`hub-scout.sh`) reads it to compute the file-overlap matrix that drives the
+PARALLEL/SERIAL/MERGE batching plan; a missing `Scope:` line degrades to a heuristic
+guess and, failing that, to `UNKNOWN` (the scout holds the issue out rather than
+assume disjoint). Then create the issue:
 
 ```bash
 gh issue create --title "<title>" --body "<plan>
 
-Gate: plan   # plan (default) or none; the richer levels are pending follow-ups"
+Gate: plan   # plan (default) or none; the richer levels are pending follow-ups
+Scope: <files/globs the task touches>   # optional; feeds the night scout's overlap check"
 ```
 
 Capture the issue number `N` from the returned URL.
