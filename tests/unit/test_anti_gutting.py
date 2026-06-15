@@ -137,6 +137,7 @@ def test_gutting_signature_is_advisory_off_night(repo: Path) -> None:
     result = _scan(repo, base, head, night=False)
 
     assert result.returncode == 0, "off the night path the scan must not block (advisory)"
+    assert "weakens tests" in result.stderr, "advisory mode must still warn, not stay silent"
 
 
 # ── a clean diff passes even under NIGHT ─────────────────────────────────────
@@ -157,7 +158,9 @@ def test_clean_diff_passes_under_night(repo: Path) -> None:
 def test_new_branch_zero_remote_sha_uses_merge_base(repo: Path) -> None:
     # A first push has an all-zero remote sha; the scan must fall back to the
     # merge-base with the default branch rather than erroring, and still catch a
-    # gutting signature in the new commits.
+    # gutting signature in the new commits. The commits must live on a branch
+    # AHEAD of the default so the merge-base is the fork point, not the tip.
+    _git(repo, "checkout", "-q", "-b", "feature")
     _, head = _commit(repo, {"tests/test_taut.py": "def test_t():\n    assert True\n"})
     zero = "0" * 40
     stdin = f"refs/heads/feature {head} refs/heads/feature {zero}\n"
