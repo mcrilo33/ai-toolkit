@@ -566,6 +566,9 @@ pre_compute_land_triage() {
   [ -x "$hm" ] || { log "land-triage: hub-morning.sh not found — skipping pre-compute"; return 0; }
   log "→ pre-computing land-triage for the morning report"
   "$hm" --triage || log "land-triage: pre-compute failed (non-fatal)"
+  # Mirror the night's terminal markers to gh issue comments (AC#3) from the hub,
+  # which has gh-write — the spoke only ever wrote the tag. Best-effort.
+  "$hm" --comments || log "comment echo: failed (non-fatal)"
 }
 
 main() {

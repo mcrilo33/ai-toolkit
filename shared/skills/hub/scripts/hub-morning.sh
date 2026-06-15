@@ -197,11 +197,48 @@ report() {
   return 0
 }
 
+# _echoed_file -> the seen-file recording which markers were mirrored to a gh
+# issue comment (one line per "<kind>/<issue>"), so a re-run never double-comments.
+_echoed_file() { printf '%s/echoed-comments\n' "$(_night_state_dir)"; }
+
+# echo_marker_comments — AC#3's "+ issue comments": mirror each TERMINAL marker
+# (ready/accept/blocked) at its branch tip to a gh issue comment whose body is the
+# marker's tag reason. The spoke stays gh-READ-ONLY (it writes only the annotated
+# tag); the hub, which has gh-write, echoes the human-facing comment here. The
+# non-terminal gate/<N> PLAN park is deliberately NOT echoed. Idempotent (the
+# seen-file) and best-effort (no gh, or a gh failure, logs and continues — a
+# missing comment must never break the night).
+echo_marker_comments() {
+  command -v gh >/dev/null 2>&1 || { echo "hub-morning: gh not found — skipping comment echo" >&2; return 0; }
+  local seen ref kind issue body
+  seen="$(_echoed_file)"
+  mkdir -p "$(dirname "$seen")" 2>/dev/null || true
+  touch "$seen" 2>/dev/null || true
+  while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    kind="${ref%%/*}"
+    issue="${ref##*/}"
+    _at_tip "$issue" "$ref" || continue
+    grep -qxF "$ref" "$seen" 2>/dev/null && continue   # already echoed once
+    body="$(git -C "$MAIN_ROOT" tag -l --format='%(contents:body)' "$ref" 2>/dev/null \
+      | sed '/^[[:space:]]*$/d' | head -5)"
+    [ -n "$body" ] || body="$kind"
+    if gh issue comment "$issue" --body "night-mode ${kind}/${issue}: ${body}" >/dev/null 2>&1; then
+      printf '%s\n' "$ref" >> "$seen"
+    else
+      echo "hub-morning: gh issue comment $issue failed (non-fatal)" >&2
+    fi
+  done < <(git -C "$MAIN_ROOT" for-each-ref --format='%(refname:short)' \
+             'refs/tags/ready/*' 'refs/tags/accept/*' 'refs/tags/blocked/*')
+  return 0
+}
+
 main() {
   case "${1:-}" in
     --triage) land_triage_all ;;
+    --comments) echo_marker_comments ;;
     ""|--report) report ;;
-    -h|--help) echo "usage: hub-morning.sh [--report|--triage]" >&2; return 0 ;;
+    -h|--help) echo "usage: hub-morning.sh [--report|--triage|--comments]" >&2; return 0 ;;
     *) echo "hub-morning: unknown argument: $1" >&2; return 2 ;;
   esac
 }

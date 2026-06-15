@@ -149,6 +149,12 @@ CONFLICTS is pre-computed at end of night (`hub-morning.sh --triage`, called by 
 dispatcher) in a hermetic throwaway worktree — a merge-conflict probe only, never the
 test suite (the real gate fires at `/land`).
 
+The terminal markers are also mirrored to GitHub as issue comments
+(`hub-morning.sh --comments`, also run by the dispatcher at end of night): the spoke
+only ever writes the git tag (it stays gh-read-only), and the hub — which has
+gh-write — echoes each ready/accept/blocked marker's reason as a `gh issue comment`,
+idempotently. A marker is thus durable as a git tag and visible on GitHub.
+
 ### 3. Propose the next move — act only on confirmation
 
 From the dashboard, surface concrete next steps and wait for the user's OK before doing
