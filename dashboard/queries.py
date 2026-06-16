@@ -397,7 +397,15 @@ class SpanStore:
             [spoke_run_id],
         )
         forest = forest + build_dividers(rows)
-        forest.sort(key=lambda n: (_parse_ts(n["ts_start"]) or float("inf"), n["name"]))
+        # Order by start; ``(unresolved)`` stays last by an explicit kind flag (not
+        # just its null ts), and ``name`` is the final deterministic tiebreak.
+        forest.sort(
+            key=lambda n: (
+                _parse_ts(n["ts_start"]) or float("inf"),
+                n["kind"] == "unresolved",
+                n["name"],
+            )
+        )
         for root in forest:
             _roll_up_steps(root)
         return forest
@@ -420,10 +428,11 @@ class SpanStore:
     def cold_context(self, spoke_run_id: str) -> list[dict[str, Any]]:
         """The cold-context lens: context loaded for one spoke, by subtype (Issue #52).
 
-        A rollup of the ``rule`` / ``memory`` / ``tool-schema`` loads — the
-        trimming/automation candidates the spec calls out: context paid for at
-        startup whose payoff a reader should be able to weigh. Rows carry the subtype
-        ``phase`` and its load ``count``, ordered by count then subtype, descending.
+        A rollup of the loaded-context spans — the trimming/automation candidates the
+        spec calls out: context paid for at startup whose payoff a reader should be
+        able to weigh. Every subtype is a ``kind='rule'`` span keyed by ``phase``
+        (``rule`` / ``memory`` / ``tool-schema``); rows carry that ``phase`` and its
+        load ``count``, ordered by count descending then phase ascending.
 
         UPGRADE: surface only context never *exercised* once span→turn reference
         edges exist; today there is no usage signal, so every load is listed.

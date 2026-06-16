@@ -64,7 +64,10 @@ def test_overnight_idle_renders_as_a_gap_divider() -> None:
     forest = _forest()
     gaps = [r for r in forest if r["kind"] == "gap"]
     assert gaps, "the overnight idle did not render as a gap divider"
-    assert any((g["duration_ms"] or 0) >= _IDLE_GAP_SECONDS * 1000 for g in gaps)
+    assert all((g["duration_ms"] or 0) >= _IDLE_GAP_SECONDS * 1000 for g in gaps)
+    # Only the overnight break crosses the threshold; sub-threshold inter-phase gaps
+    # (e.g. 23:01:01 → 23:02:00 = 59s) must NOT spawn dividers.
+    assert len(gaps) == 1, f"sub-threshold idle leaked a gap divider: {len(gaps)} gaps"
 
 
 def test_session_resume_renders_as_a_divider() -> None:

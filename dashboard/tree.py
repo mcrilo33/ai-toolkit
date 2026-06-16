@@ -436,6 +436,8 @@ def build_dividers(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _session_divider(iso: str) -> dict[str, Any]:
+    # UPGRADE: surface the real re-read magnitude once the turns schema carries
+    # cache_creation tokens; today the note is static (no per-resume signal).
     return dict(
         synthetic_node(
             kind="session",
@@ -631,6 +633,9 @@ def _collapse_context(siblings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for the startup batch, and again in any later phase where context re-loads
     mid-run (the ``ctx-bust`` inline event). Recurses so a rule nested under a turn is
     grouped too; groups own ``$0`` (rules carry no cost).
+
+    UPGRADE: a mid-run re-load is identified only positionally (a context group in a
+    non-spawn bucket); tag it so a reader can tell a re-synced-rules bust from a load.
     """
     others = [n for n in siblings if n["kind"] != "rule"]
     rules = [n for n in siblings if n["kind"] == "rule"]
