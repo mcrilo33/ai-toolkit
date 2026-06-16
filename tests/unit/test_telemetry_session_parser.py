@@ -891,52 +891,73 @@ class TestSidecarSeam:
 
 
 class TestRuleAndContextLoads:
-    """Issue #51 S4: the loaded-context injection is extracted — rule files become
-    `rule` spans, CLAUDE.md / memory become ParsedSession.context_loads — names only,
-    never the rule/memory/CLAUDE.md body text.
+    """Issue #59: loaded context is read from the session log's real `attachment`
+    records — `nested_memory` (rules / CLAUDE.md / memory, path + body) and
+    `deferred_tools_delta` (tool schemas). Every item becomes a `rule`-kind span
+    whose `phase` names its subtype (`rule` / `CLAUDE.md` / `memory` / `tool-schema`),
+    so the dashboard groups them into one `context` node per subtype. Only the name
+    and a body-size token estimate are read — never the rule/memory/CLAUDE.md body.
+
+    This supersedes #51 S4, whose `Contents of <path>` system-reminder detection only
+    ever matched the hand-built fixture: real transcripts carry no such header, so the
+    surface measured zero on all 31 audited spokes (the defect #59 closes).
     """
 
     BODY_SECRETS = ("CLAUDEMD_BODY_SECRET", "RULE_BODY_SECRET", "MEMORY_BODY_SECRET")
 
+    def _ctx(self, parsed: ParsedSession, phase: str) -> list[Span]:
+        return [s for s in parsed.spans if s.kind == "rule" and s.phase == phase]
+
     def test_emits_a_rule_span_per_loaded_rule(self, wf_parsed: ParsedSession) -> None:
-        names = {s.name for s in wf_parsed.spans if s.kind == "rule"}
+        names = {s.name for s in self._ctx(wf_parsed, "rule")}
         assert {"python-style", "code-quality"} <= names
 
     def test_rule_span_window_is_at_load_time(self, wf_parsed: ParsedSession) -> None:
-        rule = next(s for s in wf_parsed.spans if s.kind == "rule" and s.name == "python-style")
+        rule = next(s for s in self._ctx(wf_parsed, "rule") if s.name == "python-style")
         assert rule.ts_start == "2026-06-14T12:00:59.000Z"
         assert rule.session_id == WF_SESSION_ID
         assert rule.repo == "proj"
 
-    def test_claude_md_is_a_context_load(self, wf_parsed: ParsedSession) -> None:
-        loads = {(c.kind, c.name) for c in wf_parsed.context_loads}
-        assert ("claude_md", "CLAUDE.md") in loads
+    def test_claude_md_is_a_context_span(self, wf_parsed: ParsedSession) -> None:
+        names = {s.name for s in self._ctx(wf_parsed, "CLAUDE.md")}
+        assert "CLAUDE.md" in names
 
-    def test_memory_is_a_context_load(self, wf_parsed: ParsedSession) -> None:
-        assert any(c.kind == "memory" for c in wf_parsed.context_loads)
+    def test_memory_is_a_context_span(self, wf_parsed: ParsedSession) -> None:
+        assert self._ctx(wf_parsed, "memory")
 
-    def test_rules_are_not_context_loads(self, wf_parsed: ParsedSession) -> None:
-        # Rules are real `rule` spans; only the no-real-kind items go to context_loads.
-        assert all(c.kind != "rule" for c in wf_parsed.context_loads)
+    def test_tool_schemas_become_context_spans(self, wf_parsed: ParsedSession) -> None:
+        names = {s.name for s in self._ctx(wf_parsed, "tool-schema")}
+        assert {"WebFetch", "WebSearch", "Bash"} <= names
+
+    def test_context_subtypes_cover_every_kind(self, wf_parsed: ParsedSession) -> None:
+        subtypes = {s.phase for s in wf_parsed.spans if s.kind == "rule"}
+        assert {"rule", "memory", "CLAUDE.md", "tool-schema"} <= subtypes
+
+    def test_each_context_item_carries_a_per_item_token_estimate(
+        self, wf_parsed: ParsedSession
+    ) -> None:
+        # "drillable to per-item tokens": each item's summary is a token estimate so a
+        # reader can weigh its context cost. The longer rule estimates more than memory.
+        rule = next(s for s in self._ctx(wf_parsed, "rule") if s.name == "python-style")
+        assert rule.summary is not None and "token" in rule.summary
+        assert any(char.isdigit() for char in rule.summary)
 
     def test_each_rule_loaded_once(self, wf_parsed: ParsedSession) -> None:
-        rules = [s for s in wf_parsed.spans if s.kind == "rule" and s.name == "python-style"]
+        rules = [s for s in self._ctx(wf_parsed, "rule") if s.name == "python-style"]
         assert len(rules) == 1
 
     def test_no_rule_or_context_body_text_leaks(self, wf_parsed: ParsedSession) -> None:
         blob = "".join(str(s.to_dict()) for s in wf_parsed.spans if s.kind == "rule")
-        blob += "".join(str(c) for c in wf_parsed.context_loads)
         for secret in self.BODY_SECRETS:
             assert secret not in blob
 
-    def test_parse_projects_dir_merges_context_loads(self) -> None:
+    def test_parse_projects_dir_merges_context_spans(self) -> None:
         merged = parse_projects_dir(FIXTURES)
-        assert any(c.kind == "memory" for c in merged.context_loads)
+        assert any(s.kind == "rule" and s.phase == "memory" for s in merged.spans)
 
     def test_prose_quoting_a_contents_header_is_not_a_load(self, tmp_path: Path) -> None:
-        # An assistant message (and a plain user message) that merely quotes a
-        # "Contents of …" line must NOT mint a phantom rule span or context load —
-        # only the system-reminder/meta injection carrier is scanned.
+        # Only `attachment` records mint context spans; ordinary prose that merely
+        # quotes a "Contents of …" line must NOT mint a phantom rule span.
         records = [
             {
                 "type": "assistant",
@@ -956,18 +977,6 @@ class TestRuleAndContextLoads:
                     ],
                 },
             },
-            {
-                "type": "user",
-                "sessionId": "prose-sess",
-                "cwd": "/Users/demo/Repos/proj",
-                "gitBranch": "feature/51-demo",
-                "timestamp": "2026-06-15T09:00:02.000Z",
-                "uuid": "p2",
-                "message": {
-                    "role": "user",
-                    "content": [{"type": "text", "text": "see Contents of /repo/CLAUDE.md please"}],
-                },
-            },
         ]
         path = tmp_path / "prose-sess.jsonl"
         path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
@@ -975,7 +984,6 @@ class TestRuleAndContextLoads:
         parsed = parse_session_file(path)
 
         assert not [s for s in parsed.spans if s.kind == "rule"]
-        assert not parsed.context_loads
 
 
 class TestProjectsDirWalk:
