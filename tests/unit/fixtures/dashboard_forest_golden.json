@@ -77,34 +77,6 @@
           "children": [
             {
               "actor": "main",
-              "children": [],
-              "duration_ms": 3000,
-              "human_count": 0,
-              "human_type": null,
-              "human_wait_ms": null,
-              "kind": "lifecycle",
-              "models": [],
-              "name": "worktree-new",
-              "own_cost_usd": 0.0,
-              "own_tokens_in": 0,
-              "own_tokens_out": 0,
-              "parent_id": null,
-              "phase": "spawn",
-              "rollup": {
-                "cost_usd": 0.0,
-                "human_count": 0,
-                "models": [],
-                "tokens_in": 0,
-                "tokens_out": 0
-              },
-              "span_id": "sa_root",
-              "status": "success",
-              "summary": null,
-              "ts_end": "2026-06-10T12:00:03Z",
-              "ts_start": "2026-06-10T12:00:00Z"
-            },
-            {
-              "actor": "main",
               "children": [
                 {
                   "actor": "main",
@@ -217,6 +189,34 @@
           "children": [
             {
               "actor": "main",
+              "children": [],
+              "duration_ms": 3000,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "lifecycle",
+              "models": [],
+              "name": "worktree-new",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "parent_id": null,
+              "phase": "spawn",
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 0,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": "sa_root",
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-10T12:00:03Z",
+              "ts_start": "2026-06-10T12:00:00Z"
+            },
+            {
+              "actor": "main",
               "children": [
                 {
                   "actor": "main",
@@ -271,7 +271,34 @@
               "summary": null,
               "ts_end": "2026-06-10T12:00:03Z",
               "ts_start": "2026-06-10T12:00:03Z"
-            },
+            }
+          ],
+          "duration_ms": null,
+          "human_count": 0,
+          "kind": "interval",
+          "models": [],
+          "name": "spawn",
+          "own_cost_usd": 0.0,
+          "own_tokens_in": 0,
+          "own_tokens_out": 0,
+          "parent_id": null,
+          "phase": null,
+          "rollup": {
+            "cost_usd": 0.0,
+            "human_count": 0,
+            "models": [],
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "span_id": null,
+          "status": "success",
+          "summary": null,
+          "ts_end": "2026-06-10T12:00:03Z",
+          "ts_start": "2026-06-10T12:00:01Z"
+        },
+        {
+          "actor": "main",
+          "children": [
             {
               "actor": "main",
               "children": [],
@@ -299,34 +326,7 @@
               "summary": null,
               "ts_end": "2026-06-10T12:00:04Z",
               "ts_start": "2026-06-10T12:00:03Z"
-            }
-          ],
-          "duration_ms": null,
-          "human_count": 0,
-          "kind": "interval",
-          "models": [],
-          "name": "spawn",
-          "own_cost_usd": 0.0,
-          "own_tokens_in": 0,
-          "own_tokens_out": 0,
-          "parent_id": null,
-          "phase": null,
-          "rollup": {
-            "cost_usd": 0.0,
-            "human_count": 1,
-            "models": [],
-            "tokens_in": 0,
-            "tokens_out": 0
-          },
-          "span_id": null,
-          "status": "success",
-          "summary": null,
-          "ts_end": "2026-06-10T12:00:03Z",
-          "ts_start": "2026-06-10T12:00:01Z"
-        },
-        {
-          "actor": "main",
-          "children": [
+            },
             {
               "actor": "main",
               "children": [
@@ -397,7 +397,7 @@
           "phase": null,
           "rollup": {
             "cost_usd": 0.0,
-            "human_count": 1,
+            "human_count": 2,
             "models": [],
             "tokens_in": 0,
             "tokens_out": 0

@@ -75,6 +75,10 @@ def test_red_phase_splits_off_at_first_in_progress_todo() -> None:
     # The split-off phase is named for the todo it advances (#47 naming, now on the
     # phase bucket rather than hijacking setup).
     assert red["name"] == _RED_TODO
+    # The RED step marker heads its own phase bucket (markers place by completion),
+    # never orphaning back into setup.
+    assert "g_red" in _span_ids(red)
+    assert "g_red" not in _span_ids(spawn)
 
 
 def test_setup_label_is_not_overridden_by_a_todo() -> None:
@@ -119,3 +123,40 @@ def test_no_marker_activity_never_falls_to_unresolved() -> None:
         return
     orphaned = _span_ids(unresolved)
     assert not ({"g_tool_b1", "g_hook_b", "g_tool_b2"} & orphaned)
+
+
+def _load_tree():
+    import importlib.util
+
+    from _dashboard_helpers import DASHBOARD_DIR
+
+    spec = importlib.util.spec_from_file_location("tree", DASHBOARD_DIR / "tree.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _marker(span_id: str, kind: str, start: str, end: str, **extra) -> dict:
+    return {"span_id": span_id, "kind": kind, "ts_start": start, "ts_end": end, **extra}
+
+
+def test_each_no_marker_transition_gets_its_own_badged_bucket() -> None:
+    # Two summarised todos inside one teardown region are two distinct phases — each
+    # must synthesize its own badged interval, never collapse into the first.
+    tree = _load_tree()
+    nodes = [
+        _marker(
+            "life0", "lifecycle", "2026-01-01T00:00:00Z", "2026-01-01T00:00:01Z", phase="spawn"
+        ),
+        _marker("step0", "step", "2026-01-01T00:00:02Z", "2026-01-01T00:00:03Z", phase="red"),
+        _marker(
+            "life1", "lifecycle", "2026-01-01T00:00:04Z", "2026-01-01T01:00:00Z", phase="teardown"
+        ),
+        _marker("todoA", "todo", "2026-01-01T00:10:00Z", "2026-01-01T00:10:00Z", summary="phase A"),
+        _marker("todoB", "todo", "2026-01-01T00:20:00Z", "2026-01-01T00:20:00Z", summary="phase B"),
+    ]
+    intervals = tree._build_intervals(nodes)
+    badged = {iv["key"]: iv["label"] for iv in intervals if _NO_MARKER_BADGE in iv["label"]}
+    assert set(badged) == {"todoA", "todoB"}, f"each transition needs its own bucket: {badged}"
+    assert badged["todoA"].startswith("phase A")
+    assert badged["todoB"].startswith("phase B")

@@ -268,6 +268,10 @@ def _build_intervals(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
     intervals = _split_spawn(intervals, markers, first_step, floor_iso, todos)
     intervals = _synthesize_no_marker(intervals, markers, todos)
+    # Capping a merged setup interval at the split can invert a sub-interval whose
+    # ``lo`` already sat past the split (overlapping wide markers); drop those — the
+    # first=True setup interval still floors the envelope, so no key is lost.
+    intervals = [iv for iv in intervals if (iv["lo"] or 0.0) <= (iv["hi"] or 0.0)]
     # Keep ``hi`` monotonic so ``_span_bucket_key`` floors/ceils on the true envelope.
     intervals.sort(key=lambda iv: (iv["hi"] or 0.0, iv["lo_iso"] or ""))
     return intervals
@@ -322,45 +326,52 @@ def _synthesize_no_marker(
     markers: list[dict[str, Any]],
     todos: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Carve a marker-less phase out of a lifecycle region at a todo transition.
+    """Carve marker-less phases out of a lifecycle region at todo transitions.
 
-    A lifecycle (teardown) interval is coarse — it has no phase-start signal. A
-    summarised todo inside one began a phase that emitted no ``step`` marker; split
-    the region at the transition and give the tail its own ``⟨from todo — no
-    marker⟩``-badged bucket so its work never falls to ``(unresolved)`` (Issue #52).
+    A lifecycle (teardown) interval is coarse — it has no phase-start signal. Each
+    summarised todo strictly inside one began a phase that emitted no ``step``
+    marker; the region keeps ``[lo, first todo]`` under its own (teardown) key and
+    every transition opens its own ``⟨from todo — no marker⟩``-badged bucket running
+    to the next transition (or the region end), so each phase is distinct and its
+    work never falls to ``(unresolved)`` (Issue #52). ``< hi`` is strict so a todo on
+    the region boundary never synthesizes an empty zero-width bucket.
     """
     lifecycle_keys = {m["span_id"] for m in markers if m["kind"] == "lifecycle"}
     out: list[dict[str, Any]] = []
     for iv in intervals:
+        lo, hi = iv["lo"], iv["hi"]
         inside = (
-            [
-                t
-                for t in todos
-                if iv["lo"] is not None
-                and iv["hi"] is not None
-                and iv["lo"] < (_parse_ts(t["ts_start"]) or 0.0) <= iv["hi"]
-            ]
+            sorted(
+                (
+                    t
+                    for t in todos
+                    if lo is not None
+                    and hi is not None
+                    and lo < (_parse_ts(t["ts_start"]) or 0.0) < hi
+                ),
+                key=lambda t: (_parse_ts(t["ts_start"]) or 0.0, t["span_id"] or ""),
+            )
             if iv["key"] in lifecycle_keys
             else []
         )
         if not inside:
             out.append(iv)
             continue
-        todo = inside[0]
-        ts, iso = _parse_ts(todo["ts_start"]), todo["ts_start"]
-        out.append({**iv, "hi": ts, "hi_iso": iso})
-        out.append(
-            {
-                "lo": ts,
-                "hi": iv["hi"],
-                "lo_iso": iso,
-                "hi_iso": iv["hi_iso"],
-                "first": False,
-                "key": todo["span_id"],
-                "label": f"{todo['summary']} {_NO_MARKER_BADGE}",
-                "lock_label": True,
-            }
-        )
+        out.append({**iv, "hi": _parse_ts(inside[0]["ts_start"]), "hi_iso": inside[0]["ts_start"]})
+        for i, todo in enumerate(inside):
+            nxt = inside[i + 1] if i + 1 < len(inside) else None
+            out.append(
+                {
+                    "lo": _parse_ts(todo["ts_start"]),
+                    "hi": _parse_ts(nxt["ts_start"]) if nxt else hi,
+                    "lo_iso": todo["ts_start"],
+                    "hi_iso": nxt["ts_start"] if nxt else iv["hi_iso"],
+                    "first": False,
+                    "key": todo["span_id"],
+                    "label": f"{todo['summary']} {_NO_MARKER_BADGE}",
+                    "lock_label": True,
+                }
+            )
     return out
 
 
@@ -637,10 +648,17 @@ def _bucket_windows(intervals: list[dict[str, Any]]) -> dict[str, dict[str, Any]
 
 
 def _span_bucket_key(span: dict[str, Any], intervals: list[dict[str, Any]]) -> str:
-    """The bucket a span displays under: its interval, clamped into the envelope."""
+    """The bucket a span displays under: its interval, clamped into the envelope.
+
+    A ``step``/``lifecycle`` marker fires at phase *completion*, so it is placed by
+    its ``ts_end`` — it heads the interval it concludes (keyed by its own span_id),
+    even when a wide marker began in an earlier phase or its first-phase split point
+    (Issue #52) falls after its start. Every other span is placed by ``ts_start``.
+    """
     if not intervals:
         return _UNRESOLVED_KEY
-    ts = _parse_ts(span["ts_start"])
+    stamp = span["ts_end"] if span["kind"] in ("step", "lifecycle") else span["ts_start"]
+    ts = _parse_ts(stamp)
     if ts is None or ts < intervals[0]["lo"]:
         return intervals[0]["key"]
     if ts > intervals[-1]["hi"]:
