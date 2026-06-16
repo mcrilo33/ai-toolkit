@@ -1,7 +1,0 @@
-{
-  "name": "review-changes",
-  "agents": {
-    "cccc3333dddd4444": {"agentType": "code-review", "label": "review:bugs"},
-    "eeee5555ffff6666": {"agentType": "Explore", "label": "scan"}
-  }
-}

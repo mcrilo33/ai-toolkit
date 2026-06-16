@@ -1,0 +1,11 @@
+{
+  "runId": "wf_review01",
+  "workflowName": "review-changes",
+  "phases": [{"title": "Scan"}, {"title": "Review"}],
+  "workflowProgress": [
+    {"type": "workflow_phase", "index": 1, "title": "Scan"},
+    {"type": "workflow_phase", "index": 2, "title": "Review"},
+    {"type": "workflow_agent", "index": 1, "agentId": "eeee5555ffff6666", "phaseTitle": "Scan", "label": "scan"},
+    {"type": "workflow_agent", "index": 2, "agentId": "cccc3333dddd4444", "phaseTitle": "Review", "label": "review:bugs"}
+  ]
+}

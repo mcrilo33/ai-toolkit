@@ -641,6 +641,20 @@ class TestWorkflowAgentDiscovery:
         grep = next(c for c in children if c.kind == "tool" and c.name == "Grep")
         assert grep.summary == "_walk_workflow_agents"
 
+    def test_fan_out_groups_under_a_workflow_phase_subtree(self, wf_parsed: ParsedSession) -> None:
+        # Issue #58: the canonical fixture's fan-out renders as workflow → phase →
+        # agent. ``cccc`` ran in "Review", ``eeee`` in "Scan" (per workflowProgress).
+        workflow = next(s for s in wf_parsed.spans if s.kind == "workflow")
+        assert workflow.name == "review-changes" and workflow.parent_id is None
+        phase_of = {
+            s.name: s.span_id
+            for s in wf_parsed.spans
+            if s.kind == "workflow_phase" and s.parent_id == workflow.span_id
+        }
+        assert phase_of.keys() == {"Scan", "Review"}
+        assert _wf_agent(wf_parsed, "cccc3333dddd4444").parent_id == phase_of["Review"]
+        assert _wf_agent(wf_parsed, "eeee5555ffff6666").parent_id == phase_of["Scan"]
+
     def test_span_ids_are_idempotent(self) -> None:
         a = {s.span_id for s in parse_session_file(WF_SESSION).spans if s.kind == "agent"}
         b = {s.span_id for s in parse_session_file(WF_SESSION).spans if s.kind == "agent"}
@@ -1054,7 +1068,9 @@ class TestWorkflowGroupingNodes:
             "ccc3333333333333": ("general-purpose", "Verify"),
         }
         for i, (agent_id, (agent_type, _phase)) in enumerate(agents.items()):
-            agent_transcript(agent_id, f"2026-06-15T09:0{i + 1}:00.000Z", f"2026-06-15T09:0{i + 1}:30.000Z")
+            agent_transcript(
+                agent_id, f"2026-06-15T09:0{i + 1}:00.000Z", f"2026-06-15T09:0{i + 1}:30.000Z"
+            )
             (wf_dir / f"agent-{agent_id}.meta.json").write_text(
                 json.dumps({"agentType": agent_type}), encoding="utf-8"
             )
@@ -1109,9 +1125,7 @@ class TestWorkflowGroupingNodes:
         assert all(p.agent_link is None for p in phases)
 
     def test_each_agent_nests_under_its_phase(self, grouped: ParsedSession) -> None:
-        phase_by_name = {
-            p.name: p.span_id for p in grouped.spans if p.kind == "workflow_phase"
-        }
+        phase_by_name = {p.name: p.span_id for p in grouped.spans if p.kind == "workflow_phase"}
         agent_phase = {
             "aaa1111111111111": "Review",
             "bbb2222222222222": "Review",

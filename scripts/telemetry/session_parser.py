@@ -730,51 +730,155 @@ def _link_and_walk_agent(
 def _walk_workflow_agents(
     main_path: Path, *, parent_meta: dict[str, str | None], seen: set[str]
 ) -> tuple[list[UsageEvent], list[Span], dict[str, str]]:
-    """Discover the agents of every ``Workflow`` fan-out under this session (Issue #51).
+    """Discover every ``Workflow`` fan-out under this session as a drillable subtree.
 
     Workflow agents live one level deeper than Task sub-agents — at
     ``<session>/subagents/workflows/wf_*/agent-<id>.jsonl`` — and no Task ``tool_use``
-    links them, so they are found by walking that tree. Each gets its own ``agent``
-    span (``name`` = the ``meta.json`` ``agentType``, ``summary`` = the workflow name,
-    window = the transcript's first/last timestamp), its ``agent_link`` registered for
-    cost attribution, and its ``tool_use`` blocks walked as nested spans — so its turns
-    no longer orphan to ``(unresolved)``. ``seen`` is the session-global walked-id set,
-    so an agent already reached through a link is not discovered (and walked) again.
+    links them, so they are found by walking that tree (Issue #51). Each ``wf_*`` run is
+    grouped into a ``workflow → workflow_phase → agent`` subtree from its sidecar
+    definition (Issue #58 — see :func:`_walk_one_workflow`). ``seen`` is the
+    session-global walked-id set, so an agent already reached through a link is not
+    discovered (and walked) again.
     """
     root = main_path.parent / main_path.stem / "subagents" / "workflows"
     if not root.is_dir():
         return [], [], {}
+    session_dir = main_path.parent / main_path.stem
     events: list[UsageEvent] = []
     spans: list[Span] = []
     links: dict[str, str] = {}
     for wf_dir in sorted(p for p in root.glob("wf_*") if p.is_dir()):
-        name, agent_types = _workflow_meta(wf_dir)
-        for agent_path in sorted(wf_dir.glob("agent-*.jsonl")):
-            agent_id = agent_path.stem[len("agent-") :]
-            if agent_id in seen:
-                continue
-            seen.add(agent_id)
-            records = _load_jsonl(agent_path)
-            span = _workflow_agent_span(
-                agent_id, agent_types.get(agent_id), name, records, parent_meta
-            )
-            links[span.span_id] = agent_id
-            spans.append(span)
-            # A workflow agent may itself spawn Task sub-agents — recurse with the
-            # session-global ``seen`` (this agent is already in it) so any nested
-            # agent is walked once across the whole session.
-            sub_events, sub_spans, sub_links = _walk_transcript(
-                records,
-                agent_id,
-                main_path=main_path,
-                parent_meta=parent_meta,
-                agent_span_id=span.span_id,
-                seen=seen,
-            )
-            events.extend(sub_events)
-            spans.extend(sub_spans)
-            links.update(sub_links)
+        wf_events, wf_spans, wf_links = _walk_one_workflow(
+            wf_dir, session_dir, main_path=main_path, parent_meta=parent_meta, seen=seen
+        )
+        events.extend(wf_events)
+        spans.extend(wf_spans)
+        links.update(wf_links)
     return events, spans, links
+
+
+def _walk_one_workflow(
+    wf_dir: Path,
+    session_dir: Path,
+    *,
+    main_path: Path,
+    parent_meta: dict[str, str | None],
+    seen: set[str],
+) -> tuple[list[UsageEvent], list[Span], dict[str, str]]:
+    """Walk one ``wf_*`` fan-out: emit its agent spans (+ nested transcripts) and the
+    ``workflow``/``workflow_phase`` containers that group them (Issue #58).
+
+    Each agent gets an ``agent`` span (``name`` = the sidecar ``agentType``, ``summary``
+    = the workflow name, window = the transcript's first/last timestamp), its
+    ``agent_link`` registered for cost attribution, and its ``tool_use`` blocks walked
+    as nested spans. No container span is emitted when every agent id is already
+    ``seen`` — a fully-revisited workflow plants no empty subtree.
+    """
+    defn = _workflow_def(session_dir, wf_dir.name)
+    events: list[UsageEvent] = []
+    spans: list[Span] = []
+    links: dict[str, str] = {}
+    agent_phases: list[tuple[Span, str | None]] = []
+    for agent_path in sorted(wf_dir.glob("agent-*.jsonl")):
+        agent_id = agent_path.stem[len("agent-") :]
+        if agent_id in seen:
+            continue
+        seen.add(agent_id)
+        records = _load_jsonl(agent_path)
+        span = _workflow_agent_span(
+            agent_id, _agent_type(wf_dir, agent_id), defn.name, records, parent_meta
+        )
+        links[span.span_id] = agent_id
+        spans.append(span)
+        agent_phases.append((span, defn.agent_phase.get(agent_id)))
+        # A workflow agent may itself spawn Task sub-agents — recurse with the
+        # session-global ``seen`` (this agent is already in it) so any nested
+        # agent is walked once across the whole session.
+        sub_events, sub_spans, sub_links = _walk_transcript(
+            records,
+            agent_id,
+            main_path=main_path,
+            parent_meta=parent_meta,
+            agent_span_id=span.span_id,
+            seen=seen,
+        )
+        events.extend(sub_events)
+        spans.extend(sub_spans)
+        links.update(sub_links)
+    if agent_phases:
+        spans.extend(_workflow_containers(wf_dir.name, defn, agent_phases, parent_meta))
+    return events, spans, links
+
+
+def _workflow_containers(
+    run_id: str,
+    defn: _WorkflowDef,
+    agent_phases: list[tuple[Span, str | None]],
+    parent_meta: dict[str, str | None],
+) -> list[Span]:
+    """The ``workflow`` span and one ``workflow_phase`` per phase, re-homing each agent's
+    ``parent_id`` onto its phase (or the workflow directly when the phase is unmapped).
+
+    Phases render in the workflow's declared order, restricted to those with a
+    discovered agent — an empty phase plants no node. Each container's window spans its
+    members' windows and carries no ``agent_link``, so cost stays on the agent leaves
+    (own-cost $0; conservation Σ owned == Σ turns).
+    """
+    session_id = parent_meta["session_id"] or ""
+    members = [span for span, _ in agent_phases]
+    workflow = _container_span(
+        derive_span_id(session_id, run_id), "workflow", defn.name, members, parent_meta
+    )
+    by_phase: dict[str, list[Span]] = {}
+    for span, phase in agent_phases:
+        if phase is None:
+            span.parent_id = workflow.span_id
+        else:
+            by_phase.setdefault(phase, []).append(span)
+    order = list(defn.phase_order)
+    order += [phase for phase in by_phase if phase not in order]
+    containers = [workflow]
+    for phase in order:
+        phase_members = by_phase.get(phase)
+        if not phase_members:
+            continue
+        phase_span = _container_span(
+            derive_span_id(session_id, run_id, phase),
+            "workflow_phase",
+            phase,
+            phase_members,
+            parent_meta,
+        )
+        phase_span.parent_id = workflow.span_id
+        for member in phase_members:
+            member.parent_id = phase_span.span_id
+        containers.append(phase_span)
+    return containers
+
+
+def _container_span(
+    span_id: str,
+    kind: str,
+    name: str,
+    members: list[Span],
+    parent_meta: dict[str, str | None],
+) -> Span:
+    """A ``workflow``/``workflow_phase`` container bracketing its members' time window."""
+    starts = [m.ts_start for m in members if m.ts_start]
+    ends = [m.ts_end for m in members if m.ts_end]
+    ts_start = min(starts) if starts else None
+    ts_end = max(ends) if ends else None
+    return Span(
+        span_id=span_id,
+        kind=kind,
+        name=name,
+        session_id=parent_meta["session_id"],
+        repo=parent_meta["repo"] or "unknown",
+        branch=parent_meta["branch"],
+        ts_start=ts_start,
+        ts_end=ts_end,
+        duration_ms=_duration_ms(ts_start, ts_end),
+    )
 
 
 def _workflow_agent_span(
@@ -787,8 +891,8 @@ def _workflow_agent_span(
     """One ``agent`` span for a discovered workflow agent, bracketing its transcript.
 
     The window is the transcript's first and last record timestamps; ``name`` is the
-    ``meta.json`` ``agentType`` (the stable grouping key) and ``summary`` the workflow
-    name (the few-word display label).
+    sidecar ``agent-<id>.meta.json`` ``agentType`` (the stable grouping key) and
+    ``summary`` the workflow name (the few-word display label).
     """
     ts_start, ts_end = _transcript_window(records)
     return Span(
@@ -806,28 +910,72 @@ def _workflow_agent_span(
     )
 
 
-def _workflow_meta(wf_dir: Path) -> tuple[str | None, dict[str, str]]:
-    """The workflow name and a per-agent ``agentType`` map from ``wf_*/meta.json``.
+@dataclass(slots=True)
+class _WorkflowDef:
+    """The pull-relevant slice of a ``<session>/workflows/<runId>.json`` definition.
 
-    Degrades gracefully: a missing or malformed ``meta.json`` yields the directory
-    name as the workflow label and an empty agent-type map (agents fall back to the
-    bare ``agent`` name), so discovery never depends on the sidecar metadata.
+    ``name`` is the display label, ``phase_order`` the declared phase titles in order,
+    and ``agent_phase`` maps each ``agentId`` to its ``phaseTitle`` (absent when the
+    agent has no phase — it then falls directly under the workflow container).
     """
-    meta_path = wf_dir / "meta.json"
-    if not meta_path.is_file():
-        return wf_dir.name, {}
+
+    name: str
+    phase_order: list[str]
+    agent_phase: dict[str, str]
+
+
+def _workflow_def(session_dir: Path, run_id: str) -> _WorkflowDef:
+    """Read ``<session>/workflows/<run_id>.json`` for the workflow name, phase order
+    and per-agent phase map (Issue #58).
+
+    Degrades gracefully: a missing or malformed definition yields the run id as the
+    workflow label, no phases and an empty agent→phase map — so a ``workflow`` container
+    is still emitted (its agents fall directly under it) and grouping never depends on
+    the sidecar metadata.
+    """
+    path = session_dir / "workflows" / f"{run_id}.json"
+    if not path.is_file():
+        return _WorkflowDef(run_id, [], {})
     try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        return wf_dir.name, {}
-    name = meta.get("name") if isinstance(meta, dict) else None
-    agents = meta.get("agents") if isinstance(meta, dict) else None
-    agent_types: dict[str, str] = {}
-    if isinstance(agents, dict):
-        for agent_id, info in agents.items():
-            if isinstance(info, dict) and isinstance(info.get("agentType"), str):
-                agent_types[agent_id] = info["agentType"]
-    return (name if isinstance(name, str) else wf_dir.name), agent_types
+        return _WorkflowDef(run_id, [], {})
+    if not isinstance(data, dict):
+        return _WorkflowDef(run_id, [], {})
+    phases = data.get("phases")
+    phase_order = (
+        [p["title"] for p in phases if isinstance(p, dict) and isinstance(p.get("title"), str)]
+        if isinstance(phases, list)
+        else []
+    )
+    agent_phase: dict[str, str] = {}
+    progress = data.get("workflowProgress")
+    if isinstance(progress, list):
+        for entry in progress:
+            if not isinstance(entry, dict) or entry.get("type") != "workflow_agent":
+                continue
+            agent_id, phase_title = entry.get("agentId"), entry.get("phaseTitle")
+            if isinstance(agent_id, str) and isinstance(phase_title, str):
+                agent_phase[agent_id] = phase_title
+    name = data.get("workflowName")
+    return _WorkflowDef(name if isinstance(name, str) else run_id, phase_order, agent_phase)
+
+
+def _agent_type(wf_dir: Path, agent_id: str) -> str | None:
+    """The ``agentType`` from a workflow agent's sidecar ``agent-<id>.meta.json``.
+
+    ``None`` when the sidecar is missing or malformed, so the span falls back to the
+    bare ``agent`` name.
+    """
+    path = wf_dir / f"agent-{agent_id}.meta.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    agent_type = data.get("agentType") if isinstance(data, dict) else None
+    return agent_type if isinstance(agent_type, str) else None
 
 
 def _transcript_window(records: list[dict]) -> tuple[str | None, str | None]:
