@@ -1,0 +1,250 @@
+"""v3 spoke-trace rendering — columns/labels (Issue #53 track D).
+
+``dashboard/app.py`` is the thin Streamlit presentation layer; the data layer is
+``queries.py`` / ``tree.py``. Streamlit cannot be imported in the base test env,
+so we inject a *recording* ``MagicMock`` streamlit that captures every ``markdown``
+written across columns, then drive the render over contract-shaped forests built
+with the #50 ``synthetic_node`` factory.
+
+This module locks the v3 view spec from ``docs/dashboard-spoke-trace-scope.md``:
+the ``Node · Time · Dur · Cost · Tokens · H · Actor`` columns (Time = start clock,
+no Date column), actor names, date-dividers on day rollover, idle/session-resume
+dividers, badges, and the xN drill to per-item rows.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+from _dashboard_helpers import load_app, load_queries, store_v2
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+
+from telemetry.spans import synthetic_node
+
+
+def _ctx_mock() -> MagicMock:
+    """A MagicMock usable as a ``with`` context manager (expander / tab)."""
+    m = MagicMock()
+    m.__enter__ = MagicMock(return_value=m)
+    m.__exit__ = MagicMock(return_value=False)
+    return m
+
+
+def _recording_streamlit(checkbox_returns: dict[str, bool] | bool | None = None):
+    """A streamlit stub recording markdown rows, flat texts, and captions.
+
+    ``columns()`` returns recorder columns so a rendered row is captured as an
+    ordered ``list[str]`` (one cell per column) in ``rec.rows``; every markdown
+    string (top-level or per-column) also lands flat in ``rec.texts``.
+    ``checkbox_returns`` controls drill toggles: a bool applies to all, a dict
+    keys by label.
+    """
+    rec = SimpleNamespace(rows=[], texts=[], captions=[])
+    checks = checkbox_returns if checkbox_returns is not None else False
+
+    def _columns(spec):
+        n = spec if isinstance(spec, int) else len(spec)
+        row: list[str | None] = [None] * n
+        rec.rows.append(row)
+        cols = []
+        for i in range(n):
+            c = MagicMock()
+
+            def _mk(text, *_a, _row=row, _i=i, **_kw):
+                _row[_i] = str(text)
+                rec.texts.append(str(text))
+
+            c.markdown.side_effect = _mk
+            c.write.side_effect = _mk
+            cols.append(c)
+        return cols
+
+    def _checkbox(label, *_a, **_kw):
+        return checks if isinstance(checks, bool) else checks.get(str(label), False)
+
+    st = MagicMock()
+    st.columns.side_effect = _columns
+    st.markdown.side_effect = lambda text, *_a, **_kw: rec.texts.append(str(text))
+    st.caption.side_effect = lambda text, *_a, **_kw: rec.captions.append(str(text))
+    st.tabs.side_effect = lambda names: [_ctx_mock() for _ in names]
+    st.expander.side_effect = lambda *_a, **_kw: _ctx_mock()
+    st.selectbox.side_effect = lambda _label, options, **_kw: options[0]
+    st.checkbox.side_effect = _checkbox
+    return st, rec
+
+
+def _app(monkeypatch, st):
+    monkeypatch.setitem(sys.modules, "streamlit", st)
+    monkeypatch.setitem(sys.modules, "queries", load_queries())
+    return load_app()
+
+
+def _node(kind: str, name: str, **over):
+    """A real-span-shaped forest node dict with all keys app.py may read."""
+    base = {
+        "span_id": "s",
+        "parent_id": None,
+        "kind": kind,
+        "name": name,
+        "summary": None,
+        "phase": None,
+        "status": "success",
+        "ts_start": None,
+        "ts_end": None,
+        "duration_ms": None,
+        "own_cost_usd": 0.0,
+        "own_tokens_in": 0,
+        "own_tokens_out": 0,
+        "models": [],
+        "agent": "main",
+        "human_count": 0,
+        "children": [],
+    }
+    base.update(over)
+    return base
+
+
+def _row_for(rec, needle: str) -> list[str]:
+    """The captured 7-cell row whose label cell (col 0) contains ``needle``."""
+    return next(r for r in rec.rows if len(r) == 7 and r[0] and needle in r[0])
+
+
+# ── columns ───────────────────────────────────────────────────────────────────
+
+
+def test_spine_header_is_node_time_dur_h_actor(monkeypatch):
+    st, rec = _recording_streamlit()
+    app = _app(monkeypatch, st)
+
+    app.render_spoke_view(store_v2())
+
+    header = next(r for r in rec.rows if r and all(c and c.startswith("**") for c in r))
+    assert header == [
+        "**Node**",
+        "**Time**",
+        "**Dur**",
+        "**Cost**",
+        "**Tokens**",
+        "**H**",
+        "**Actor**",
+    ]
+
+
+def test_time_cell_is_start_clock_and_dur_is_duration(monkeypatch):
+    st, rec = _recording_streamlit()
+    app = _app(monkeypatch, st)
+
+    node = _node("step", "S1·RED", ts_start="2026-06-12T12:01:05Z", duration_ms=2000)
+    app._render_spine([node])
+
+    row = _row_for(rec, "S1·RED")
+    assert row[1] == "12:01:05"  # Time column = start clock, not duration
+    assert row[2] == "2.0s"  # Dur column = wall-clock duration
+
+
+# ── actor ───────────────────────────────────────────────────────────────────
+
+
+def test_actor_label_resolves_name_kind_and_explicit_actor(monkeypatch):
+    st, _ = _recording_streamlit()
+    app = _app(monkeypatch, st)
+
+    assert app._actor_label(_node("agent", "tdd-red")) == "tdd-red"
+    assert app._actor_label(_node("workflow", "wf")) == "workflow"
+    assert app._actor_label(_node("script", "spoke-push.sh")) == "script"
+    assert app._actor_label(synthetic_node(kind="hooks", name="hooks")) == "hooks"
+    assert app._actor_label(_node("tool", "Read", actor="sidecar")) == "sidecar"
+    assert app._actor_label(_node("turn", "turn", agent="main")) == "main"
+
+
+def test_actor_column_shows_subagent_name(monkeypatch):
+    st, rec = _recording_streamlit()
+    app = _app(monkeypatch, st)
+
+    app._render_spine([_node("agent", "code-review", ts_start="2026-06-12T12:00:00Z")])
+
+    assert _row_for(rec, "code-review")[6] == "code-review"
+
+
+# ── dividers + badges ─────────────────────────────────────────────────────────
+
+
+def test_date_divider_renders_only_on_day_rollover(monkeypatch):
+    st, rec = _recording_streamlit()
+    app = _app(monkeypatch, st)
+
+    day1 = _node("interval", "S1", ts_start="2026-06-12T23:59:00Z")
+    day2 = _node("interval", "S2", ts_start="2026-06-13T00:01:00Z")
+    app._render_spine([day1, day2])
+
+    assert any("2026-06-13" in t for t in rec.texts)  # rollover divider
+    assert not any("2026-06-12" in t for t in rec.texts)  # first day → no leading divider
+
+
+def test_gap_node_renders_as_idle_divider_not_metric_row(monkeypatch):
+    st, rec = _recording_streamlit()
+    app = _app(monkeypatch, st)
+
+    gap = synthetic_node(kind="gap", name="idle 5m", duration_ms=300_000)
+    app._render_spine([gap])
+
+    assert any("idle" in t.lower() for t in rec.texts)
+    assert not any(len(r) == 7 and r[0] and "idle" in r[0] for r in rec.rows)
+
+
+def test_session_node_renders_resume_divider_with_cold_cache_note(monkeypatch):
+    st, rec = _recording_streamlit()
+    app = _app(monkeypatch, st)
+
+    sess = synthetic_node(kind="session", name="session resume", own_tokens_in=1200)
+    app._render_spine([sess])
+
+    blob = " ".join(rec.texts).lower()
+    assert "session" in blob
+    assert "cold" in blob or "resume" in blob
+
+
+def test_badges_render_in_node_label(monkeypatch):
+    st, rec = _recording_streamlit()
+    app = _app(monkeypatch, st)
+
+    synth = _node("interval", "S2·GREEN", badges=["⟨from todo — no marker⟩"])
+    bust = _node("interval", "S3", badges=["ctx-bust"])
+    app._render_spine([synth, bust])
+
+    blob = " ".join(rec.texts)
+    assert "⟨from todo — no marker⟩" in blob
+    assert "ctx-bust" in blob
+
+
+# ── xN drill ──────────────────────────────────────────────────────────────────
+
+
+def test_collapsed_group_renders_times_n_label(monkeypatch):
+    st, rec = _recording_streamlit()
+    app = _app(monkeypatch, st)
+
+    # A non-hooks collapsed group (e.g. parallel agents) must also get an xN label,
+    # which the v2 format_step_label only produces for hooks.
+    members = [_node("agent", f"worker-{i}") for i in range(3)]
+    group = _node("agent", "agents", collapsed=True, collapsed_count=3, children=members)
+    app._render_step(_node("interval", "S1", children=[group]))
+
+    assert any("agent x3" in t for t in rec.texts)
+    assert not any("worker-0" in t for t in rec.texts)  # members hidden until drilled
+
+
+def test_collapsed_group_drill_reveals_members_when_toggled(monkeypatch):
+    st, rec = _recording_streamlit(checkbox_returns=True)
+    app = _app(monkeypatch, st)
+
+    members = [_node("tool", f"Read /f{i}") for i in range(3)]
+    group = _node("hooks", "hooks", collapsed=True, collapsed_count=3, children=members)
+    app._render_step(_node("interval", "S1", children=[group]))
+
+    assert any("/f0" in t for t in rec.texts)
+    assert any("/f2" in t for t in rec.texts)
