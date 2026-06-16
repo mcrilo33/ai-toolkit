@@ -375,15 +375,18 @@ class TestTodoLedgerDiff:
         assert [t.summary for t in todos] == ["Add RED test", "Implement GREEN"]
         assert [t.name for t in todos] == ["TodoWrite", "TodoWrite"]
 
-    def test_todo_write_without_in_progress_item_has_no_summary(self, tmp_path: Path) -> None:
-        # A snapshot with nothing in_progress has no item to advance → no summary
-        # is derived; the span keeps its bare tool name (never crashes, never blank).
+    def test_ledger_creation_write_is_summarised_by_its_lead_item(self, tmp_path: Path) -> None:
+        # Issue #51 S3: a pure ledger-creation write (items created, nothing yet in
+        # progress) is no longer a bare `todo` — it carries its lead item as a summary.
         records = [
             _assistant_todo(
                 "w1",
                 "2026-06-15T12:00:01.000Z",
                 "tool_w1",
-                [{"content": "Add RED test", "status": "pending"}],
+                [
+                    {"content": "Seed RED test", "status": "pending"},
+                    {"content": "Implement GREEN", "status": "pending"},
+                ],
             )
         ]
         path = tmp_path / "diff-sess.jsonl"
@@ -392,7 +395,32 @@ class TestTodoLedgerDiff:
         todo = _by_kind(parse_session_file(path), "todo")[0]
 
         assert todo.name == "TodoWrite"
-        assert todo.summary is None
+        assert todo.summary == "Seed RED test"
+
+    def test_redundant_write_with_no_new_item_has_no_summary(self, tmp_path: Path) -> None:
+        # A later snapshot that introduces no new item and has nothing in progress has
+        # nothing to label → no summary (the span keeps its bare tool name).
+        records = [
+            _assistant_todo(
+                "w1",
+                "2026-06-15T12:00:01.000Z",
+                "tool_w1",
+                [{"content": "Seed RED test", "status": "in_progress"}],
+            ),
+            _assistant_todo(
+                "w2",
+                "2026-06-15T12:00:30.000Z",
+                "tool_w2",
+                [{"content": "Seed RED test", "status": "completed"}],
+            ),
+        ]
+        path = tmp_path / "diff-sess.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        todos = sorted(_by_kind(parse_session_file(path), "todo"), key=lambda s: s.ts_start or "")
+
+        assert todos[1].name == "TodoWrite"
+        assert todos[1].summary is None
 
 
 def _assistant_tasks(uuid: str, ts: str, blocks: list[dict]) -> dict:
@@ -763,6 +791,86 @@ class TestRecursiveAgents:
         parsed = parse_session_file(main)  # must return, not hang
 
         assert {"agentX", "agentY"} <= set(parsed.agent_links.values())
+
+
+class TestReasoningRefs:
+    """Issue #51 S3: an extended-thinking block surfaces a privacy-safe reasoning
+    ref — a transcript-link locator + timestamp, never the thinking text itself.
+    """
+
+    def test_main_thinking_emits_a_reasoning_ref(self, parsed: ParsedSession) -> None:
+        # The #22 main session has exactly one assistant turn with a thinking block.
+        refs = parsed.reasoning_refs
+        assert len(refs) == 1
+        assert refs[0].source == "main"
+        assert refs[0].session_id == SESSION_ID
+
+    def test_reasoning_ref_carries_a_locator_and_timestamp(self, parsed: ParsedSession) -> None:
+        ref = parsed.reasoning_refs[0]
+        assert ref.ts == "2026-06-13T12:00:01.000Z"
+        assert SESSION_ID in ref.ref  # transcript-link locator points at the session
+
+    def test_reasoning_ref_never_carries_thinking_text(self, parsed: ParsedSession) -> None:
+        assert "SECRET_THINKING" not in str(parsed.reasoning_refs[0])
+
+    def test_parse_projects_dir_merges_reasoning_refs(self) -> None:
+        merged = parse_projects_dir(FIXTURES)
+        assert any(r.source == "main" for r in merged.reasoning_refs)
+
+
+def _assistant_bash(uuid: str, ts: str, tool_id: str, command: str) -> dict:
+    return {
+        "type": "assistant",
+        "sessionId": "side-sess",
+        "cwd": "/Users/demo/Repos/proj",
+        "gitBranch": "feature/51-demo",
+        "timestamp": ts,
+        "uuid": uuid,
+        "message": {
+            "role": "assistant",
+            "model": "claude-opus-4-8",
+            "content": [
+                {"type": "tool_use", "id": tool_id, "name": "Bash", "input": {"command": command}}
+            ],
+        },
+    }
+
+
+class TestSidecarSeam:
+    """Issue #51 S3: a hook/script that shells out to a separate ``claude -p`` session
+    is linked via ``sidecar_session`` (seam only — none in-repo yet).
+    """
+
+    def _bash(self, tmp_path: Path, command: str) -> Span:
+        path = tmp_path / "side-sess.jsonl"
+        path.write_text(
+            json.dumps(_assistant_bash("w1", "2026-06-15T12:00:01.000Z", "tb", command)),
+            encoding="utf-8",
+        )
+        return next(t for t in _by_kind(parse_session_file(path), "tool") if t.name == "Bash")
+
+    def test_claude_dash_p_invocation_sets_sidecar_session(self, tmp_path: Path) -> None:
+        bash = self._bash(tmp_path, "claude -p --session-id side-abc123 'review the diff'")
+        assert bash.sidecar_session == "side-abc123"
+
+    def test_resume_flag_form_is_recognised(self, tmp_path: Path) -> None:
+        bash = self._bash(tmp_path, "claude --print --resume side-xyz789 'judge this'")
+        assert bash.sidecar_session == "side-xyz789"
+
+    def test_plain_bash_has_no_sidecar_session(self, tmp_path: Path) -> None:
+        bash = self._bash(tmp_path, "pytest tests/unit -q")
+        assert bash.sidecar_session is None
+
+    def test_claude_without_print_flag_is_not_a_sidecar(self, tmp_path: Path) -> None:
+        # An interactive `claude` (no -p/--print) is not a headless sidecar session.
+        bash = self._bash(tmp_path, "claude --session-id side-nope chat")
+        assert bash.sidecar_session is None
+
+    def test_short_r_flag_does_not_match_the_tail_of_another_flag(self, tmp_path: Path) -> None:
+        # `-r` must be left-word-bounded: a trailing `-r` inside `--foo-r` is not the
+        # resume flag, so the real --session-id later in the command wins.
+        bash = self._bash(tmp_path, "claude -p --foo-r bad --session-id side-real go")
+        assert bash.sidecar_session == "side-real"
 
 
 class TestProjectsDirWalk:

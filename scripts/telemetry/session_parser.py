@@ -18,6 +18,7 @@ text, file content) and its output, and human answers — is never copied.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -48,6 +49,14 @@ TOOL_MAIN_PARAM: dict[str, str] = {
 # key. Deliberately excludes free-form content keys (prompt/content/old_string).
 _GENERIC_PARAM_KEYS = ("file_path", "path", "command", "pattern", "query", "url")
 
+# A Bash command that launches a headless ``claude -p`` session, and the session id
+# it targets — the sidecar link (Issue #51 S3). Matched only when the print/``-p``
+# flag is present; an interactive ``claude`` is not a sidecar.
+_SIDECAR_PRINT_RE = re.compile(r"(?:^|\s)(?:-p|--print)(?:\s|=|$)")
+# Both flag and id forms are anchored on a left word-boundary so a short ``-r`` never
+# matches the tail of an unrelated token (``--foo-r``, an earlier ``grep -r``).
+_SIDECAR_ID_RE = re.compile(r"(?:^|\s)(?:--session-id|--resume|-r)[=\s]+([A-Za-z0-9._-]+)")
+
 
 @dataclass(slots=True)
 class UsageEvent:
@@ -65,12 +74,29 @@ class UsageEvent:
 
 
 @dataclass(slots=True)
+class ReasoningRef:
+    """A privacy-safe pointer to an extended-thinking block (Issue #51 S3).
+
+    Carries only a transcript-link locator (``<session-or-agent-id>#<record-uuid>``)
+    and timing — never the thinking text. The dashboard renders a synthetic
+    ``reasoning`` node from these; the body stays in the transcript.
+    """
+
+    session_id: str | None
+    source: str  # "main" | "subagent"
+    agent_id: str | None
+    ts: str | None
+    ref: str
+
+
+@dataclass(slots=True)
 class ParsedSession:
     """Parser output: spans plus the raw material the correlation pass needs."""
 
     spans: list[Span] = field(default_factory=list)
     usage_events: list[UsageEvent] = field(default_factory=list)
     agent_links: dict[str, str] = field(default_factory=dict)  # agent span_id -> agentId
+    reasoning_refs: list[ReasoningRef] = field(default_factory=list)
 
 
 def parse_session_file(path: Path) -> ParsedSession:
@@ -97,6 +123,7 @@ def parse_session_file(path: Path) -> ParsedSession:
             _consume_tool_use(block, rec, results, meta, path, parsed, todo_summaries, seen)
 
     parsed.spans.extend(_human_prompt_spans(records, meta))
+    parsed.reasoning_refs.extend(_reasoning_refs(records, path.stem, "main", None, meta))
 
     events, spans, links = _walk_workflow_agents(path, parent_meta=meta, seen=seen)
     parsed.usage_events.extend(events)
@@ -120,6 +147,7 @@ def parse_projects_dir(root: Path) -> ParsedSession:
         merged.spans.extend(parsed.spans)
         merged.usage_events.extend(parsed.usage_events)
         merged.agent_links.update(parsed.agent_links)
+        merged.reasoning_refs.extend(parsed.reasoning_refs)
     return merged
 
 
@@ -202,10 +230,13 @@ def _span_for_tool_use(
     # Every other tool_use is a leaf span (Issue #47 S2b) summarising what it acted
     # on — the tool's MAIN identifying parameter only (Bash command, file path, Grep
     # pattern). Bulk/secondary input (replacement text, file content) is never read.
+    # A Bash that shells out to a headless ``claude -p`` session is linked via
+    # ``sidecar_session`` (Issue #51 S3) so that session's cost can be attributed here.
     return Span(
         kind="tool",
         name=name if isinstance(name, str) else "tool",
         summary=_tool_param(name, inputs),
+        sidecar_session=_sidecar_session(name, inputs),
         **common,
     )
 
@@ -217,8 +248,10 @@ def _todo_summaries(records: list[dict]) -> dict[str, str]:
 
     - ``TodoWrite`` snapshots: diff each write's in-progress set against the
       previous one to isolate the item that *newly* entered progress — the step's
-      todo. No distinguishable transition falls back to whatever is in progress;
-      nothing in progress yields no summary (the span keeps its bare tool name).
+      todo. With nothing in progress, a *ledger-creation* write (Issue #51 S3) —
+      one that introduces a brand-new item — falls back to its lead new item, so a
+      seed write reads as a real step rather than a bare ``todo``; a write with
+      nothing new and nothing in progress still yields no summary.
     - ``TaskCreate`` / ``TaskUpdate`` (incremental, id-keyed): a ``TaskCreate``
       summarises to its ``subject`` and is assigned the next sequential id (the
       runtime numbers them 1, 2, … in creation order); a later ``TaskUpdate``
@@ -226,6 +259,7 @@ def _todo_summaries(records: list[dict]) -> dict[str, str]:
     """
     summaries: dict[str, str] = {}
     prev: set[str] = set()
+    seen_contents: set[str] = set()
     subject_by_id: dict[str, str] = {}
     created = 0
     for rec in records:
@@ -243,7 +277,7 @@ def _todo_summaries(records: list[dict]) -> dict[str, str]:
             inputs = block.get("input") or {}
             tool_use_id = block.get("id") or ""
             if tool == "TodoWrite":
-                summary, prev = _derive_todo_summary(inputs, prev)
+                summary, prev, seen_contents = _derive_todo_summary(inputs, prev, seen_contents)
             elif tool == "TaskCreate":
                 created += 1
                 summary = _snippet(inputs.get("subject"))
@@ -256,19 +290,33 @@ def _todo_summaries(records: list[dict]) -> dict[str, str]:
     return summaries
 
 
-def _derive_todo_summary(inputs: dict, prev: set[str]) -> tuple[str | None, set[str]]:
-    """The in-progress item for one ``TodoWrite`` snapshot, plus its in-progress set."""
+def _derive_todo_summary(
+    inputs: dict, prev: set[str], seen: set[str]
+) -> tuple[str | None, set[str], set[str]]:
+    """The label for one ``TodoWrite`` snapshot, plus its in-progress + seen sets.
+
+    Prefers the item that newly entered progress (the step's todo), else any
+    in-progress item; with nothing in progress, falls back to the lead item this
+    write *creates* (a ledger-creation label), else no summary.
+    """
     items = inputs.get("todos")
     if not isinstance(items, list):
-        return None, prev
+        return None, prev, seen
+    contents = [item["content"] for item in items if isinstance(item, dict) and item.get("content")]
     in_progress = {
         item["content"]
         for item in items
         if isinstance(item, dict) and item.get("status") == "in_progress" and item.get("content")
     }
     newly = sorted(in_progress - prev)
-    summary = newly[0] if newly else (sorted(in_progress)[0] if in_progress else None)
-    return _snippet(summary), in_progress
+    if newly:
+        summary = newly[0]
+    elif in_progress:
+        summary = sorted(in_progress)[0]
+    else:
+        created = [content for content in contents if content not in seen]
+        summary = created[0] if created else None
+    return _snippet(summary), in_progress, seen | set(contents)
 
 
 def _tool_param(name: object, inputs: dict) -> str | None:
@@ -282,6 +330,24 @@ def _tool_param(name: object, inputs: dict) -> str | None:
     if key is None:
         key = next((k for k in _GENERIC_PARAM_KEYS if inputs.get(k)), None)
     return _snippet(inputs.get(key)) if key else None
+
+
+def _sidecar_session(name: object, inputs: dict) -> str | None:
+    """The session id of a Bash that shells out to ``claude -p`` (else ``None``).
+
+    Only a ``claude`` invocation carrying the print/``-p`` flag counts as a sidecar;
+    the id is read from ``--session-id`` / ``--resume`` / ``-r``. Only this id is
+    extracted — the rest of the command (which may hold a prompt) is not surfaced here.
+    """
+    if name != "Bash":
+        return None
+    command = inputs.get("command")
+    if not isinstance(command, str) or "claude" not in command:
+        return None
+    if not _SIDECAR_PRINT_RE.search(command):
+        return None
+    match = _SIDECAR_ID_RE.search(command)
+    return match.group(1) if match else None
 
 
 def _question_snippet(inputs: dict) -> str | None:
@@ -328,6 +394,40 @@ def _human_prompt_spans(records: list[dict], meta: dict[str, str | None]) -> lis
             )
         )
     return spans
+
+
+def _reasoning_refs(
+    records: list[dict],
+    stem: str,
+    source: str,
+    agent_id: str | None,
+    meta: dict[str, str | None],
+) -> list[ReasoningRef]:
+    """One :class:`ReasoningRef` per assistant turn that carries a thinking block.
+
+    Only a locator (``<stem>#<record-uuid>``) and timing are read — the thinking
+    text itself is never copied, so the body stays private.
+    """
+    refs: list[ReasoningRef] = []
+    for rec in records:
+        if rec.get("type") != "assistant":
+            continue
+        message = rec.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content") or []
+        if not any(isinstance(b, dict) and b.get("type") == "thinking" for b in content):
+            continue
+        refs.append(
+            ReasoningRef(
+                session_id=meta["session_id"],
+                source=source,
+                agent_id=agent_id,
+                ts=rec.get("timestamp"),
+                ref=f"{stem}#{rec.get('uuid') or ''}",
+            )
+        )
+    return refs
 
 
 def _is_human_prompt(rec: dict) -> bool:

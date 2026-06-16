@@ -308,6 +308,42 @@ class TestDiamondAttribution:
         assert next(s for s in c_spans if s.span_id == owner_id).tokens_in == 100
 
 
+class TestSidecarCost:
+    """Issue #51 S3: a span linked to a separate ``claude -p`` session via
+    ``sidecar_session`` is attributed that session's ccusage cost (the seam).
+    """
+
+    def test_sidecar_session_cost_flows_onto_the_linking_span(self) -> None:
+        span = Span(
+            span_id="hook1",
+            kind="hook",
+            name="llm-judge",
+            session_id="main-sess",
+            ts_start="2026-06-15T12:00:00.000Z",
+            ts_end="2026-06-15T12:00:09.000Z",
+            sidecar_session="side-abc123",
+        )
+        parsed = ParsedSession(spans=[span], usage_events=[], agent_links={})
+
+        attribute(parsed, {"side-abc123": 0.42})
+
+        assert span.cost_usd == pytest.approx(0.42)
+
+    def test_no_sidecar_cost_when_session_absent_from_ccusage(self) -> None:
+        span = Span(
+            span_id="hook1",
+            kind="hook",
+            name="llm-judge",
+            session_id="main-sess",
+            sidecar_session="side-missing",
+        )
+        parsed = ParsedSession(spans=[span], usage_events=[], agent_links={})
+
+        attribute(parsed, {})  # sidecar session not in ccusage → no cost added
+
+        assert span.cost_usd is None
+
+
 class TestPerTurnRows:
     def test_rows_sum_to_ccusage_session_total(self) -> None:
         parsed = parse_session_file(SESSION)
