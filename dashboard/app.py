@@ -110,46 +110,140 @@ _STATUS_ICON = {
 }
 
 
-_STEP_COLS = [5, 1, 1, 1, 1, 2, 1]
-_STEP_HEADERS = ("Step", "Time", "Cost", "Tokens", "Human", "Model", "Agent")
+# v3 columns (docs/dashboard-spoke-trace-scope.md): Time is the start clock and a
+# separate Dur holds the wall-clock; there is no Date column (day rollover renders
+# as a divider) and no Model column (model folds into the per-turn panel). Actor is
+# the owner — main, a sub-agent name, workflow, script, hooks, or sidecar.
+_STEP_COLS = [5, 1, 1, 1, 1, 1, 2]
+_STEP_HEADERS = ("Node", "Time", "Dur", "Cost", "Tokens", "H", "Actor")
+
+# Synthetic divider kinds render as a thin full-width row, never a metric row.
+_DIVIDER_KINDS = {"gap", "session"}
+
+# A kind whose Actor is fixed regardless of the v2 ``agent`` field.
+_ACTOR_BY_KIND = {
+    "workflow": "workflow",
+    "workflow_phase": "workflow",
+    "script": "script",
+    "hook": "hooks",
+    "hooks": "hooks",
+}
+
+
+def _actor_label(node: dict) -> str:
+    """The Actor column value: explicit ``actor`` wins, else derived from kind.
+
+    A fixed kind (``hooks``/``workflow``/``script``) is structurally never ``main``,
+    so its kind is authoritative over an unfilled contract default. Otherwise an
+    explicit #50 ``actor`` wins, then a sub-agent span reads as its own name
+    (``Explore``, ``code-review``), and everything else falls back to the v2
+    ``agent`` field (``main`` / ``subagent``).
+    """
+    kind = node["kind"]
+    if kind in _ACTOR_BY_KIND:
+        return _ACTOR_BY_KIND[kind]
+    actor = node.get("actor")
+    if actor:
+        return actor
+    if kind == "agent":
+        return node.get("name") or "subagent"
+    return node.get("agent", "main")
+
+
+def _node_label(node: dict) -> str:
+    """The Node-cell label: an ``xN`` line for a collapsed group, else the step label.
+
+    A collapsed group (``collapsed_count``) reads ``<kind> xN`` for any kind — the
+    query-layer ``format_step_label`` only special-cases ``hooks``. Any ``badges``
+    the tree attached (``ctx-bust``, ``⟨from todo — no marker⟩``) trail as tags.
+    """
+    count = node.get("collapsed_count")
+    label = f"{node['kind']} x{count}" if count else queries.format_step_label(node)
+    badges = node.get("badges")
+    if badges:
+        label += " " + " ".join(f"`{badge}`" for badge in badges)
+    return label
+
+
+def _render_divider(node: dict) -> None:
+    """A gap (idle) or session-resume node as a thin divider, not a metric row."""
+    if node["kind"] == "session":
+        cache = node.get("own_tokens_in") or 0
+        note = f" · cold cache (+{cache:,})" if cache else " · cold cache"
+        st.markdown(f"··· session resume{note} ···")
+        return
+    st.markdown(f"··· idle · {node['name']} ···")
 
 
 def _node_row(node: dict, depth: int) -> None:
-    """One drill-down row: indented label + rolled-up metric columns."""
+    """One trace row: indented label + Time(start clock)·Dur·Cost·Tokens·H·Actor."""
     indent = "&nbsp;&nbsp;&nbsp;&nbsp;" * depth
     icon = _STATUS_ICON.get(node["status"], "•")
     metrics = queries.format_step_metrics(node)
     cols = st.columns(_STEP_COLS)
-    cols[0].markdown(f"{indent}{icon} `{node['kind']}` **{queries.format_step_label(node)}**")
-    cols[1].markdown(metrics["time"])
-    cols[2].markdown(metrics["cost"])
-    cols[3].markdown(metrics["tokens"])
-    cols[4].markdown(metrics["humans"])
-    cols[5].markdown(metrics["model"])
-    cols[6].markdown(metrics["agent"])
+    cols[0].markdown(f"{indent}{icon} `{node['kind']}` **{_node_label(node)}**")
+    cols[1].markdown(queries._clock(node.get("ts_start")))
+    cols[2].markdown(metrics["time"])
+    cols[3].markdown(metrics["cost"])
+    cols[4].markdown(metrics["tokens"])
+    cols[5].markdown(metrics["humans"])
+    cols[6].markdown(_actor_label(node))
 
 
 def _render_descendants(nodes: list[dict], depth: int) -> None:
-    """Render a node's subtree as indented rows; collapsed hooks stay one line."""
+    """Render a subtree as indented rows.
+
+    A divider kind renders inline; a collapsed ``xN`` group gates its members behind
+    a checkbox so drilling toggles already-built rows (never a rebuild). A v2 hooks
+    node carries ``collapsed_count`` and so drills through that same gate.
+    """
     for node in nodes:
+        if node["kind"] in _DIVIDER_KINDS:
+            _render_divider(node)
+            continue
         _node_row(node, depth)
-        # A hooks node is the collapsed line itself — never expand its children.
-        if node["kind"] != "hooks":
-            _render_descendants(node["children"], depth + 1)
+        if node.get("collapsed_count"):
+            if st.checkbox(f"show {_node_label(node)} members", key=f"drill-{id(node)}"):
+                _render_descendants(node["children"], depth + 1)
+            continue
+        _render_descendants(node["children"], depth + 1)
 
 
 def _render_step(root: dict) -> None:
-    """A Level-1 phase-interval bucket row (rolled-up metrics) with a drill expander.
+    """A Level-1 spine row with a drill expander (or a thin divider for idle/resume).
 
     Streamlit forbids nesting expanders, so the whole subtree drills inside one
     expander as indentation depth (Issue #47 S3): marker headers, then the turn
     nodes, with the tools/skills each turn issued nested beneath — and a sub-agent's
-    own turns under its agent node.
+    own turns under its agent node. Wide leaf groups drill through a checkbox toggle.
     """
+    if root["kind"] in _DIVIDER_KINDS:
+        _render_divider(root)
+        return
     _node_row(root, 0)
     if root["children"]:
-        with st.expander(f"↳ drill into {queries.format_step_label(root)}", expanded=False):
+        with st.expander(f"↳ drill into {_node_label(root)}", expanded=False):
             _render_descendants(root["children"], 1)
+
+
+def _date_of(ts: str | None) -> str | None:
+    """The ``YYYY-MM-DD`` of an ISO timestamp, or None when absent/malformed."""
+    return ts.split("T", 1)[0] if ts and "T" in ts else None
+
+
+def _render_spine(forest: list[dict]) -> None:
+    """Render the L1 trace spine: a date-divider on day rollover, then each step.
+
+    No Date column — a thin date-divider row marks the day rollover (the first day
+    gets none). Idle/session-resume roots render as dividers, not metric rows.
+    """
+    prev_date: str | None = None
+    for root in forest:
+        date = _date_of(root.get("ts_start"))
+        if date and prev_date and date != prev_date:
+            st.markdown(f"**📅 {date}**")
+        prev_date = date or prev_date
+        _render_step(root)
 
 
 def _render_meta(store: queries.SpanStore, spoke_id: str) -> None:
@@ -200,8 +294,7 @@ def render_spoke_view(store: queries.SpanStore) -> None:
             head = st.columns(_STEP_COLS)
             for col, name in zip(head, _STEP_HEADERS, strict=True):
                 col.markdown(f"**{name}**")
-            for root in forest:
-                _render_step(root)
+            _render_spine(forest)
 
     with meta_tab:
         _render_meta(store, spoke_id)
