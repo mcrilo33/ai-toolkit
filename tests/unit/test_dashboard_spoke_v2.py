@@ -165,7 +165,9 @@ def test_skill_and_agent_issued_in_one_turn_are_siblings():
     setup = _bucket(store_v2().spoke_steps(RUN), "setup")
     turn = _turn_at(setup, "12:00:10")
 
-    assert _kinds(turn["children"]) == ["agent", "skill"]
+    # The skill renders as a soft scope-band (Issue #52, decision 5), staying a
+    # sibling of the agent issued in the same turn.
+    assert _kinds(turn["children"]) == ["agent", "scope-band"]
 
 
 # --- S3: sub-agent drill (turns + spans under the agent) ------------------------

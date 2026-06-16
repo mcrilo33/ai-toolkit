@@ -61,13 +61,13 @@ def test_spawn_holds_only_precycle_not_red_work() -> None:
     ids = _span_ids(spawn)
     # Loaded context belongs to spawn; the RED-phase work does not.
     assert "g_ctx_q" in ids
-    for red_work in ("g_skill_tddred", "g_tool_edit1", "g_tool_read"):
+    for red_work in ("g_agent_tddred", "g_tool_edit1", "g_tool_read"):
         assert red_work not in ids, f"{red_work} leaked into the spawn bucket"
 
 
 def test_red_phase_splits_off_at_first_in_progress_todo() -> None:
     forest = _forest()
-    red = _root_containing(forest, "g_skill_tddred")
+    red = _root_containing(forest, "g_tool_edit1")
     spawn = _root_containing(forest, "g_life_new")
     assert red is not None and spawn is not None
     assert red is not spawn, "the RED phase must split off from spawn"

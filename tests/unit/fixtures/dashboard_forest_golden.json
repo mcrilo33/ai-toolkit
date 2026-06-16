@@ -76,10 +76,10 @@
           "actor": "main",
           "children": [
             {
-              "actor": "main",
+              "actor": "hooks",
               "children": [
                 {
-                  "actor": "main",
+                  "actor": "hooks",
                   "children": [],
                   "duration_ms": 100,
                   "human_count": 0,
@@ -216,10 +216,10 @@
               "ts_start": "2026-06-10T12:00:00Z"
             },
             {
-              "actor": "main",
+              "actor": "hooks",
               "children": [
                 {
-                  "actor": "main",
+                  "actor": "hooks",
                   "children": [],
                   "duration_ms": 200,
                   "human_count": 0,
@@ -328,10 +328,10 @@
               "ts_start": "2026-06-10T12:00:03Z"
             },
             {
-              "actor": "main",
+              "actor": "hooks",
               "children": [
                 {
-                  "actor": "main",
+                  "actor": "hooks",
                   "children": [],
                   "duration_ms": 500,
                   "human_count": 1,
@@ -1544,10 +1544,10 @@
               "ts_start": "2026-06-12T12:00:05Z"
             },
             {
-              "actor": "main",
+              "actor": "hooks",
               "children": [
                 {
-                  "actor": "main",
+                  "actor": "hooks",
                   "children": [],
                   "duration_ms": 100,
                   "human_count": 0,
@@ -1575,7 +1575,7 @@
                   "ts_start": "2026-06-12T12:00:06Z"
                 },
                 {
-                  "actor": "main",
+                  "actor": "hooks",
                   "children": [],
                   "duration_ms": 80,
                   "human_count": 0,
@@ -1632,7 +1632,7 @@
               "actor": "main",
               "children": [
                 {
-                  "actor": "subagent",
+                  "actor": "tdd-red",
                   "children": [
                     {
                       "actor": "subagent",
@@ -1787,11 +1787,9 @@
                   "children": [],
                   "duration_ms": 12000,
                   "human_count": 0,
-                  "human_type": null,
-                  "human_wait_ms": null,
-                  "kind": "skill",
+                  "kind": "scope-band",
                   "models": [],
-                  "name": "tdd-red",
+                  "name": "[scope] tdd-red",
                   "own_cost_usd": 0.0,
                   "own_tokens_in": 0,
                   "own_tokens_out": 0,
@@ -1804,7 +1802,7 @@
                     "tokens_in": 0,
                     "tokens_out": 0
                   },
-                  "span_id": "v2_skill",
+                  "span_id": null,
                   "status": "success",
                   "summary": null,
                   "ts_end": "2026-06-12T12:00:20Z",
@@ -1996,10 +1994,10 @@
                   "actor": "main",
                   "children": [
                     {
-                      "actor": "main",
+                      "actor": "hooks",
                       "children": [
                         {
-                          "actor": "main",
+                          "actor": "hooks",
                           "children": [],
                           "duration_ms": 500,
                           "human_count": 0,

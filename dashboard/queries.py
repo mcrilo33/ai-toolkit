@@ -67,6 +67,12 @@ _COLUMNS: tuple[tuple[str, str], ...] = (
     ("human_type", "VARCHAR"),
     ("human_wait_ms", "BIGINT"),
     ("summary", "VARCHAR"),
+    # v3 pull-only link fields (Issue #50): a ``script``'s emitted marker, a
+    # ``hook``/``script``'s sidecar session, an ``agent``'s subagent link. Null on
+    # push spans; the tree layer reads them for actor/emission/sidecar attribution.
+    ("emits", "VARCHAR"),
+    ("sidecar_session", "VARCHAR"),
+    ("agent_link", "VARCHAR"),
     ("tokens_in", "BIGINT"),
     ("tokens_out", "BIGINT"),
     ("cost_usd", "DOUBLE"),

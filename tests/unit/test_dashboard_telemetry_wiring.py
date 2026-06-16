@@ -75,7 +75,7 @@ def test_spoke_steps_attributes_model_and_agent_over_real_dataset():
     # proving #22's turns relation flows through from_telemetry.
     agent = _find_kind(forest, "agent")
     assert agent is not None
-    assert agent["actor"] == "subagent"
+    assert agent["actor"] == "Explore"
     # The two sub-agent inferences (s2/s3 carry usage) are sub-turn nodes; the
     # sub-agent's Read tool (its s2b turn had no usage) is an orphan under the agent.
     assert len([c for c in agent["children"] if c["kind"] == "turn"]) == 2

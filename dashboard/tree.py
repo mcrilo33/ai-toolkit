@@ -88,12 +88,29 @@ def _step_node(row: dict[str, Any]) -> dict[str, Any]:
         "own_tokens_in": 0,
         "own_tokens_out": 0,
         "models": [],
-        # The v3 Actor column (Issue #50). UPGRADE: refine the value beyond
-        # main/subagent (workflow / script / hooks / sidecar / sub-agent name)
-        # when the nesting + synthetics subtasks introduce those node kinds.
-        "actor": "subagent" if row["kind"] == "agent" else "main",
+        "actor": _actor_for(row),
         "children": [],
     }
+
+
+def _actor_for(row: dict[str, Any]) -> str:
+    """The v3 Actor column for a real span (Issue #50/#52).
+
+    ``main`` for the primary agent; an ``agent`` span carries its sub-agent name
+    (``Explore``, ``code-review``, …); ``workflow`` brackets a fan-out; a ``hook`` is
+    ``sidecar`` when it shells out to a ``claude -p`` session, else ``hooks``; a
+    ``script`` is ``script``. Everything else is ``main``.
+    """
+    kind = row["kind"]
+    if kind == "agent":
+        return row["name"] or "subagent"
+    if kind in ("workflow", "workflow_phase"):
+        return "workflow"
+    if kind == "script":
+        return "script"
+    if kind == "hook":
+        return "sidecar" if row.get("sidecar_session") else "hooks"
+    return "main"
 
 
 def _sort_key(node: dict[str, Any]) -> tuple[float, str]:
@@ -190,6 +207,7 @@ def _hooks_node(hooks: list[dict[str, Any]]) -> dict[str, Any]:
             ts_start=min(starts, key=lambda s: _parse_ts(s) or 0.0) if starts else None,
             ts_end=max(ends, key=lambda s: _parse_ts(s) or 0.0) if ends else None,
             duration_ms=sum(h["duration_ms"] for h in hooks),
+            actor="hooks",
             # A collapsed node owns no turns itself — its hook children carry any.
             children=list(hooks),
         )
@@ -533,8 +551,40 @@ def _bucket_children(
 
     turn_nodes = [_turn_node(turn) for turn in bucket_turns]
     orphans = _rehome_under_turns(forest, turn_nodes)
-    children = markers + turn_nodes + orphans
+    children = _apply_scope_bands(markers + turn_nodes + orphans)
     return sorted(children, key=_sort_key)
+
+
+def _apply_scope_bands(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Render each ``skill`` span as a soft ``scope-band`` (Issue #52, decision 5).
+
+    A skill loads instructions then guides the turns under it — a causal scope with
+    no hard window — so it renders as a ``[scope]``-tagged band holding the work it
+    influenced. The band carries only the skill's own load cost (``$0`` here — cost
+    lives on the turn/agent leaves it holds), so the subtree rollup is unchanged.
+    Applied post-order so a skill nested under a turn or agent is banded too.
+    """
+    out: list[dict[str, Any]] = []
+    for node in nodes:
+        node["children"] = _apply_scope_bands(node["children"])
+        out.append(_scope_band_node(node) if node["kind"] == "skill" else node)
+    return out
+
+
+def _scope_band_node(skill: dict[str, Any]) -> dict[str, Any]:
+    """A soft ``[scope]`` band standing in for a skill span, holding its influence."""
+    return dict(
+        synthetic_node(
+            kind="scope-band",
+            name=f"[scope] {skill['name']}",
+            summary=skill.get("summary"),
+            status=skill["status"],
+            ts_start=skill["ts_start"],
+            ts_end=skill["ts_end"],
+            duration_ms=skill.get("duration_ms"),
+            children=skill["children"],
+        )
+    )
 
 
 def _install_sub_turns(agent: dict[str, Any], sub_turns: list[dict[str, Any]]) -> None:
@@ -613,13 +663,19 @@ def _turns_by_owner(
     bounds: dict[str, tuple[float | None, float | None]],
 ) -> dict[str, list[dict[str, Any]]]:
     """Group turn rows by owner: a main turn → its phase-interval bucket key; a
-    subagent turn → the tightest enclosing ``agent`` span id (or ``(unresolved)``).
-    Each list is time-ordered, so turn nodes render in inference order.
+    subagent turn → the tightest enclosing ``agent`` span id, else its phase-interval
+    bucket (or ``(unresolved)`` only when truly off-spine). Each list is time-ordered,
+    so turn nodes render in inference order.
+
+    The interval fallback (Issue #52, defect #3) is what keeps a subagent turn whose
+    agent span lives one directory deeper than the parser walked — so no ``agent``
+    span brackets it — attributed to the phase its timestamp sits in, rather than
+    orphaning the whole Workflow fan-out to a bogus ``(unresolved)``.
     """
     owners: dict[str, list[dict[str, Any]]] = {}
     for turn in turns:
         if turn.get("source") == "subagent":
-            owner = _subagent_owner(turn, nodes, bounds) or _UNRESOLVED_KEY
+            owner = _subagent_owner(turn, nodes, bounds) or _main_turn_bucket(turn, intervals)
         else:
             owner = _main_turn_bucket(turn, intervals)
         owners.setdefault(owner, []).append(turn)
