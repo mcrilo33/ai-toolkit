@@ -271,7 +271,27 @@ def _render_meta(store: queries.SpanStore, spoke_id: str) -> None:
     )
 
 
-def render_spoke_view(store: queries.SpanStore) -> None:
+# Per-spoke built-forest cache, keyed on (spoke_id, log-mtime). Module-level so it
+# survives Streamlit reruns within a session; a fresh import (a new session) starts
+# empty. The forest is plain dicts, so a cached entry is reused by reference — a
+# drill toggle re-renders the same objects rather than rebuilding the tree.
+_FOREST_CACHE: dict[tuple[str, float], list[dict]] = {}
+
+
+def _spoke_forest(store: queries.SpanStore, spoke_id: str, log_mtime: float) -> list[dict]:
+    """The selected spoke's drill-down tree, built on demand and memoized.
+
+    Builds only the requested spoke (``store.spoke_steps`` queries just that run),
+    keyed on ``(spoke_id, log_mtime)`` so a re-select or rerun returns the cached
+    forest instantly and a changed span log (new mtime) rebuilds.
+    """
+    key = (spoke_id, log_mtime)
+    if key not in _FOREST_CACHE:
+        _FOREST_CACHE[key] = store.spoke_steps(spoke_id)
+    return _FOREST_CACHE[key]
+
+
+def render_spoke_view(store: queries.SpanStore, log_mtime: float = 0.0) -> None:
     st.header("Spoke view")
     st.caption(
         "Collapse-to-steps drill-down: main steps with rolled-up metrics; expand a "
@@ -287,7 +307,7 @@ def render_spoke_view(store: queries.SpanStore) -> None:
     steps_tab, meta_tab = st.tabs(["Steps", "Meta by kind"])
 
     with steps_tab:
-        forest = store.spoke_steps(spoke_id)
+        forest = _spoke_forest(store, spoke_id, log_mtime)
         if not forest:
             st.info("No spans for this spoke run.")
         else:
@@ -495,15 +515,19 @@ def main() -> None:
     st.caption("100% local · metrics only, never prompt content")
 
     st.sidebar.subheader("Span source")
-    store = _resolve_store(resolve_span_log())
+    span_log = resolve_span_log()
+    store = _resolve_store(span_log)
     if store is None:
         return
+
+    # The span log's mtime keys the per-spoke forest cache: a fresh log rebuilds.
+    log_mtime = span_log.stat().st_mtime if span_log.exists() else 0.0
 
     view = st.sidebar.radio(
         "View", ["Spoke", "Morning", "Aggregate", "A/B compare", "Automatability"]
     )
     if view == "Spoke":
-        render_spoke_view(store)
+        render_spoke_view(store, log_mtime)
     elif view == "Morning":
         render_morning_view(store)
     elif view == "Aggregate":
