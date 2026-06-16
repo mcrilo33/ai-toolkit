@@ -144,13 +144,12 @@ class TestLinkageToGatedTool:
         tool = blocked[0]
         assert tool["status"] == "deny", "a blocked tool renders as never-run (deny)"
 
-    def test_blocked_tool_summary_marks_it_never_ran(self) -> None:
-        # The never-run marker is a materialised data fact (the lean spoke_tree node
-        # projection drops summary); assert it on the spans table directly.
+    def test_blocked_tool_keeps_its_command_summary(self) -> None:
+        # The never-run marker is the render-layer badge (status='deny'), not mangled
+        # summary text — the reparented blocked tool keeps its original command.
         store = _store()
-        rows = store._query("SELECT summary FROM spans WHERE kind = 'tool' AND status = 'deny'")
-        assert rows, "the deny gate must leave a never-run tool"
-        assert all("never ran" in (r["summary"] or "").lower() for r in rows)
+        row = store._query("SELECT summary FROM spans WHERE span_id = 't_deny'")[0]
+        assert row["summary"] == "git push", "the blocked tool's command must be preserved"
 
 
 class TestDenyHeuristicGuards:
@@ -253,6 +252,54 @@ class TestApprovalsInRollups:
         )
         # allow + deny gates → an allow/ask/deny breakdown (warn maps to ask).
         assert approval["decisions"] == {"allow": 1, "ask": 0, "deny": 1}
+
+    def test_warn_gate_folds_into_ask_in_the_breakdown(self) -> None:
+        # The warn→ask fold is the most error-prone mapping — pin it with a gate of
+        # each decision and assert the warn lands in `ask`.
+        queries = load_queries()
+        t = "2026-06-16T12:00:"
+        spans = [
+            _span("life", "lifecycle", "spoke", f"{t}00Z", f"{t}30Z"),
+            _span("ha", "hook", "bash", f"{t}01Z", f"{t}01Z", status="allow", duration_ms=10),
+            _span(
+                "hw",
+                "hook",
+                "console-log-warn.sh",
+                f"{t}05Z",
+                f"{t}05Z",
+                status="warn",
+                duration_ms=10,
+            ),
+            _span(
+                "hd", "hook", "secrets-scan.sh", f"{t}09Z", f"{t}09Z", status="deny", duration_ms=10
+            ),
+        ]
+        store = queries.SpanStore.from_events(spans)
+        approval = next(
+            r for r in store.automatability_candidates() if r["human_type"] == "approval"
+        )
+        assert approval["decisions"] == {"allow": 1, "ask": 1, "deny": 1}
+
+    def test_non_approval_interaction_has_no_decision_breakdown(self) -> None:
+        # A prompt/question is not a gate decision — its breakdown is None (→ em dash).
+        queries = load_queries()
+        t = "2026-06-16T12:00:"
+        spans = [
+            _span("life", "lifecycle", "spoke", f"{t}00Z", f"{t}30Z"),
+            _span(
+                "q",
+                "human",
+                "solo-cycle",
+                f"{t}05Z",
+                f"{t}06Z",
+                human={"type": "question", "wait_ms": 1000},
+            ),
+        ]
+        store = queries.SpanStore.from_events(spans)
+        question = next(
+            r for r in store.automatability_candidates() if r["human_type"] == "question"
+        )
+        assert question["decisions"] is None
 
     def test_meta_by_kind_approval_row_carries_mean_wait(self) -> None:
         rows = _store().spoke_meta_by_kind(RUN)
@@ -373,6 +420,9 @@ class TestAppRender:
         assert all("Mean wait" in row for row in table), "meta table must carry a Mean wait column"
         approval = next(r for r in table if r["Kind"] == "approval")
         assert approval["Mean wait"] == "0.1s"
+        # A kind that never waited on a human renders an em dash, never a bogus 0.0s.
+        tool = next(r for r in table if r["Kind"] == "tool")
+        assert tool["Mean wait"] == "—"
 
     def test_automatability_table_shows_decision_breakdown(self, monkeypatch) -> None:
         st, rec = _recording_st()
@@ -382,3 +432,22 @@ class TestAppRender:
         table = rec.tables[0]
         approval = next(r for r in table if "tool-permission" in r["Interaction"])
         assert "allow" in str(approval["Decisions"]) and "deny" in str(approval["Decisions"])
+
+    def test_non_approval_decisions_cell_is_em_dash(self, monkeypatch) -> None:
+        st, rec = _recording_st()
+        app = _app(monkeypatch, st)
+        t = "2026-06-16T12:00:"
+        spans = [
+            _span("life", "lifecycle", "spoke", f"{t}00Z", f"{t}30Z"),
+            _span(
+                "q",
+                "human",
+                "solo-cycle",
+                f"{t}05Z",
+                f"{t}06Z",
+                human={"type": "question", "wait_ms": 1000},
+            ),
+        ]
+        app.render_automatability_view(load_queries().SpanStore.from_events(spans))
+        question = next(r for r in rec.tables[0] if "question" in r["Interaction"])
+        assert question["Decisions"] == "—"

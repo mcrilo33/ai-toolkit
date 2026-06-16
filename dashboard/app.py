@@ -549,8 +549,9 @@ def _interaction_label(row: dict[str, Any]) -> str:
 def _decisions_label(decisions: dict[str, int] | None) -> str:
     """The allow/ask/deny breakdown for an approval candidate (Issue #60).
 
-    An em dash for an interaction with no decision breakdown (a non-approval
-    human prompt/question, which carries ``decisions=None`` only on legacy rows).
+    An em dash for a non-approval interaction (a human prompt/question), which the
+    query layer leaves ``decisions=None`` because a decision breakdown is meaningless
+    for it.
     """
     if not decisions:
         return "—"

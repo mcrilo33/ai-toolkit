@@ -140,7 +140,6 @@ _APPROVAL_NAME = "tool-permission"
 # guards against a gate with no real tool matching an unrelated far-future one.
 _GATE_WINDOW_S = 120.0
 _DECISION_WORD: dict[str, str] = {"allow": "allowed", "deny": "denied", "warn": "flagged"}
-_NEVER_RAN = "(blocked, never ran)"
 # Fold a gate's raw status into the canonical allow / ask / deny breakdown surfaced
 # in the Automatability view (Issue #60): a ``warn`` is an advisory the human had to
 # act on, so it counts as an ``ask``.
@@ -229,7 +228,7 @@ def _blocked_tool_dict(hook: dict[str, Any], approval_id: str) -> dict:
         "ts_end": hook["ts_end"],
         "duration_ms": 0,
         "status": "deny",
-        "summary": f"blocked by {hook['name']} {_NEVER_RAN}",
+        "summary": f"blocked by {hook['name']}",
     }
 
 
@@ -283,8 +282,10 @@ def _derive_approvals(con: duckdb.DuckDBPyConnection) -> None:
             # already claimed by another deny, or no tool follows), a synthetic stands in.
             if gated and gated["status"] != "success" and gated["span_id"] not in claimed:
                 claimed.add(gated["span_id"])
-                summary = f"{gated['summary']} {_NEVER_RAN}" if gated["summary"] else _NEVER_RAN
-                tool_updates.append((approval_id, "deny", summary, gated["span_id"]))
+                # Reparent + mark deny only; the original command stays the summary.
+                # The never-run marker is the render-layer badge (status='deny'), not
+                # mangled text, so it shows regardless of what the summary says.
+                tool_updates.append((approval_id, "deny", gated["span_id"]))
             else:
                 new_spans.append(_blocked_tool_dict(hook, approval_id))
         else:
@@ -298,10 +299,10 @@ def _derive_approvals(con: duckdb.DuckDBPyConnection) -> None:
             f"INSERT INTO spans VALUES ({placeholders})",
             [_row_tuple(span) for span in new_spans],
         )
-    for parent_id, status, summary, span_id in tool_updates:
+    for parent_id, status, span_id in tool_updates:
         con.execute(
-            "UPDATE spans SET parent_id = ?, status = ?, summary = ? WHERE span_id = ?",
-            [parent_id, status, summary, span_id],
+            "UPDATE spans SET parent_id = ?, status = ? WHERE span_id = ?",
+            [parent_id, status, span_id],
         )
 
 
@@ -883,7 +884,9 @@ class SpanStore:
             consistency = modal[key] / group["frequency"]
             group["consistency"] = consistency
             group["score"] = group["frequency"] * consistency * group["on_critical_path"]
-            group["decisions"] = decisions[key]
+            # The allow/ask/deny breakdown is meaningful only for a gate decision; a
+            # prompt/question interaction carries None so the view shows an em dash.
+            group["decisions"] = decisions[key] if group["human_type"] == "approval" else None
             result.append(group)
         result.sort(key=lambda r: (-r["score"], r["name"], r["phase"] or "", r["human_type"]))
         return result
