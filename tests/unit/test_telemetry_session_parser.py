@@ -873,6 +873,94 @@ class TestSidecarSeam:
         assert bash.sidecar_session == "side-real"
 
 
+class TestRuleAndContextLoads:
+    """Issue #51 S4: the loaded-context injection is extracted — rule files become
+    `rule` spans, CLAUDE.md / memory become ParsedSession.context_loads — names only,
+    never the rule/memory/CLAUDE.md body text.
+    """
+
+    BODY_SECRETS = ("CLAUDEMD_BODY_SECRET", "RULE_BODY_SECRET", "MEMORY_BODY_SECRET")
+
+    def test_emits_a_rule_span_per_loaded_rule(self, wf_parsed: ParsedSession) -> None:
+        names = {s.name for s in wf_parsed.spans if s.kind == "rule"}
+        assert {"python-style", "code-quality"} <= names
+
+    def test_rule_span_window_is_at_load_time(self, wf_parsed: ParsedSession) -> None:
+        rule = next(s for s in wf_parsed.spans if s.kind == "rule" and s.name == "python-style")
+        assert rule.ts_start == "2026-06-14T12:00:59.000Z"
+        assert rule.session_id == WF_SESSION_ID
+        assert rule.repo == "proj"
+
+    def test_claude_md_is_a_context_load(self, wf_parsed: ParsedSession) -> None:
+        loads = {(c.kind, c.name) for c in wf_parsed.context_loads}
+        assert ("claude_md", "CLAUDE.md") in loads
+
+    def test_memory_is_a_context_load(self, wf_parsed: ParsedSession) -> None:
+        assert any(c.kind == "memory" for c in wf_parsed.context_loads)
+
+    def test_rules_are_not_context_loads(self, wf_parsed: ParsedSession) -> None:
+        # Rules are real `rule` spans; only the no-real-kind items go to context_loads.
+        assert all(c.kind != "rule" for c in wf_parsed.context_loads)
+
+    def test_each_rule_loaded_once(self, wf_parsed: ParsedSession) -> None:
+        rules = [s for s in wf_parsed.spans if s.kind == "rule" and s.name == "python-style"]
+        assert len(rules) == 1
+
+    def test_no_rule_or_context_body_text_leaks(self, wf_parsed: ParsedSession) -> None:
+        blob = "".join(str(s.to_dict()) for s in wf_parsed.spans if s.kind == "rule")
+        blob += "".join(str(c) for c in wf_parsed.context_loads)
+        for secret in self.BODY_SECRETS:
+            assert secret not in blob
+
+    def test_parse_projects_dir_merges_context_loads(self) -> None:
+        merged = parse_projects_dir(FIXTURES)
+        assert any(c.kind == "memory" for c in merged.context_loads)
+
+    def test_prose_quoting_a_contents_header_is_not_a_load(self, tmp_path: Path) -> None:
+        # An assistant message (and a plain user message) that merely quotes a
+        # "Contents of …" line must NOT mint a phantom rule span or context load —
+        # only the system-reminder/meta injection carrier is scanned.
+        records = [
+            {
+                "type": "assistant",
+                "sessionId": "prose-sess",
+                "cwd": "/Users/demo/Repos/proj",
+                "gitBranch": "feature/51-demo",
+                "timestamp": "2026-06-15T09:00:01.000Z",
+                "uuid": "p1",
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-opus-4-8",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "I read the Contents of /repo/.claude/rules/ghost.md",
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "user",
+                "sessionId": "prose-sess",
+                "cwd": "/Users/demo/Repos/proj",
+                "gitBranch": "feature/51-demo",
+                "timestamp": "2026-06-15T09:00:02.000Z",
+                "uuid": "p2",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "see Contents of /repo/CLAUDE.md please"}],
+                },
+            },
+        ]
+        path = tmp_path / "prose-sess.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        parsed = parse_session_file(path)
+
+        assert not [s for s in parsed.spans if s.kind == "rule"]
+        assert not parsed.context_loads
+
+
 class TestProjectsDirWalk:
     def test_parse_projects_dir_finds_the_session_spans(self) -> None:
         merged = parse_projects_dir(FIXTURES)

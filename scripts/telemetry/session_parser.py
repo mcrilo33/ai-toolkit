@@ -1,4 +1,4 @@
-"""Parse Claude session-log JSONL into pull spans (skill/agent/todo/human).
+"""Parse Claude session-log JSONL into pull spans (skill/agent/todo/human/rule).
 
 Reads ``~/.claude/projects/<slug>/<session>.jsonl`` transcripts and reconstructs
 the spans the runtime cannot emit at hook time. For ``agent`` spans it walks the
@@ -6,13 +6,22 @@ matching ``<session>/subagents/agent-<id>.jsonl`` transcript so the subagent's
 own token usage can be attributed to the parent agent span by the correlation
 pass.
 
+Issue #51 (track B) extends the pull layer: ``Workflow`` fan-out agents are
+discovered at ``<session>/subagents/workflows/wf_*/agent-<id>.jsonl``; nested
+Task agents recurse so agent→agent chains reconstruct at any depth (walked once
+per agentId via a session-global guard); a ledger-creation ``TodoWrite`` gets a
+lead-item label; extended-thinking blocks surface privacy-safe ``reasoning_refs``;
+a ``claude -p`` Bash links a ``sidecar_session``; and loaded rule files become
+``rule`` spans while CLAUDE.md / memory become name-only ``context_loads``.
+
 Privacy: metadata plus short *intent* labels are read out of a record — tool
 name, skill name, subagent type, timestamps, token counts, the ``agentId`` link,
 and (Issue #47) a few-word ``summary`` per node: the in-progress todo item, an
 agent's task ``description``, a human prompt/question's first line, and a tool's
 single main parameter (Bash command, file path, Grep pattern). Bulk/long-form
 content — thinking, an agent's full prompt, a tool's secondary input (replacement
-text, file content) and its output, and human answers — is never copied.
+text, file content) and its output, human answers, and rule/CLAUDE.md/memory file
+bodies — is never copied.
 """
 
 from __future__ import annotations
@@ -24,6 +33,11 @@ from datetime import datetime
 from pathlib import Path
 
 from telemetry.spans import Span, derive_span_id
+
+# UPGRADE: this module crossed the 800-line file limit at #51 S4 — decompose the
+# sub-agent/workflow walk family (_walk_subagent/_walk_transcript/_link_and_walk_agent/
+# _walk_workflow_agents and the workflow helpers) into a telemetry/agent_walk module
+# once the parser stabilises; deferred here to avoid a cross-module refactor mid-spoke.
 
 AGENT_TOOLS = frozenset({"Task", "Agent"})
 TODO_TOOLS = frozenset({"TodoWrite", "TaskCreate", "TaskUpdate"})
@@ -56,6 +70,10 @@ _SIDECAR_PRINT_RE = re.compile(r"(?:^|\s)(?:-p|--print)(?:\s|=|$)")
 # Both flag and id forms are anchored on a left word-boundary so a short ``-r`` never
 # matches the tail of an unrelated token (``--foo-r``, an earlier ``grep -r``).
 _SIDECAR_ID_RE = re.compile(r"(?:^|\s)(?:--session-id|--resume|-r)[=\s]+([A-Za-z0-9._-]+)")
+
+# Each loaded-context file is injected under a ``Contents of <path>`` header (Issue
+# #51 S4). Only the path is captured — the file body that follows is never read.
+_CONTEXT_HEADER_RE = re.compile(r"Contents of (/[^\s()]+\.md)")
 
 
 @dataclass(slots=True)
@@ -90,6 +108,22 @@ class ReasoningRef:
 
 
 @dataclass(slots=True)
+class ContextLoad:
+    """A loaded-context item with no real span kind (Issue #51 S4).
+
+    Rule files become real ``rule`` spans; the rest of the window's loaded context —
+    ``CLAUDE.md`` and memory recalls — has no span kind, so it is surfaced here as a
+    name-only record (never the file body) for the dashboard to render as synthetic
+    ``context`` nodes.
+    """
+
+    kind: str  # "claude_md" | "memory"
+    name: str
+    ts: str | None
+    session_id: str | None
+
+
+@dataclass(slots=True)
 class ParsedSession:
     """Parser output: spans plus the raw material the correlation pass needs."""
 
@@ -97,6 +131,7 @@ class ParsedSession:
     usage_events: list[UsageEvent] = field(default_factory=list)
     agent_links: dict[str, str] = field(default_factory=dict)  # agent span_id -> agentId
     reasoning_refs: list[ReasoningRef] = field(default_factory=list)
+    context_loads: list[ContextLoad] = field(default_factory=list)
 
 
 def parse_session_file(path: Path) -> ParsedSession:
@@ -124,6 +159,9 @@ def parse_session_file(path: Path) -> ParsedSession:
 
     parsed.spans.extend(_human_prompt_spans(records, meta))
     parsed.reasoning_refs.extend(_reasoning_refs(records, path.stem, "main", None, meta))
+    rule_spans, context_loads = _context_and_rule_loads(records, meta)
+    parsed.spans.extend(rule_spans)
+    parsed.context_loads.extend(context_loads)
 
     events, spans, links = _walk_workflow_agents(path, parent_meta=meta, seen=seen)
     parsed.usage_events.extend(events)
@@ -148,6 +186,7 @@ def parse_projects_dir(root: Path) -> ParsedSession:
         merged.usage_events.extend(parsed.usage_events)
         merged.agent_links.update(parsed.agent_links)
         merged.reasoning_refs.extend(parsed.reasoning_refs)
+        merged.context_loads.extend(parsed.context_loads)
     return merged
 
 
@@ -428,6 +467,93 @@ def _reasoning_refs(
             )
         )
     return refs
+
+
+def _context_and_rule_loads(
+    records: list[dict], meta: dict[str, str | None]
+) -> tuple[list[Span], list[ContextLoad]]:
+    """Extract the window's loaded rule / CLAUDE.md / memory files (Issue #51 S4).
+
+    Each ``Contents of <path>`` header names one loaded file. A rule file becomes a
+    real ``rule`` span (``name`` = its stem); CLAUDE.md and memory have no real span
+    kind, so they become name-only :class:`ContextLoad` records. Only the path is
+    read — never the file body — and each path is recorded once (deduped).
+    """
+    rule_spans: list[Span] = []
+    context_loads: list[ContextLoad] = []
+    seen_paths: set[str] = set()
+    for rec in records:
+        if not _is_context_carrier(rec):
+            continue
+        ts = rec.get("timestamp")
+        for text in _record_texts(rec):
+            for path in _CONTEXT_HEADER_RE.findall(text):
+                if path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                span, load = _classify_context_path(path, ts, meta)
+                if span is not None:
+                    rule_spans.append(span)
+                if load is not None:
+                    context_loads.append(load)
+    return rule_spans, context_loads
+
+
+def _classify_context_path(
+    path: str, ts: str | None, meta: dict[str, str | None]
+) -> tuple[Span | None, ContextLoad | None]:
+    """Map a loaded-context path to a ``rule`` span or a :class:`ContextLoad` (else neither)."""
+    if "/.claude/rules/" in path:
+        span = Span(
+            span_id=derive_span_id(meta["session_id"] or "", "rule", path),
+            kind="rule",
+            name=Path(path).stem,
+            session_id=meta["session_id"],
+            repo=meta["repo"] or "unknown",
+            branch=meta["branch"],
+            ts_start=ts,
+            ts_end=ts,
+            duration_ms=0,
+        )
+        return span, None
+    if path.endswith("/CLAUDE.md"):
+        return None, ContextLoad("claude_md", "CLAUDE.md", ts, meta["session_id"])
+    if path.endswith("MEMORY.md") or "/memory/" in path:
+        return None, ContextLoad("memory", Path(path).name, ts, meta["session_id"])
+    return None, None
+
+
+def _is_context_carrier(rec: dict) -> bool:
+    """Whether a record is a loaded-context injection carrier (Issue #51 S4).
+
+    The runtime delivers loaded context as a system-reminder on a meta user turn, so
+    the scan is restricted to a non-sidechain user record that is ``isMeta`` or carries
+    a ``<system-reminder>`` block. This keeps ordinary prose that merely quotes a
+    ``Contents of …`` line (an assistant message, a pasted log) from minting a phantom
+    rule span or context load.
+    """
+    if rec.get("type") != "user" or rec.get("isSidechain"):
+        return False
+    return bool(rec.get("isMeta")) or any("<system-reminder>" in t for t in _record_texts(rec))
+
+
+def _record_texts(rec: dict) -> list[str]:
+    """The plain-text strings in a record's message content (text blocks / string)."""
+    message = rec.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if isinstance(content, str):
+        return [content]
+    if not isinstance(content, list):
+        return []
+    return [
+        block["text"]
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+    ]
 
 
 def _is_human_prompt(rec: dict) -> bool:
