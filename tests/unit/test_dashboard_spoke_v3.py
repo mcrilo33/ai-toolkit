@@ -203,9 +203,21 @@ def test_session_node_renders_resume_divider_with_cold_cache_note(monkeypatch):
     sess = synthetic_node(kind="session", name="session resume", own_tokens_in=1200)
     app._render_spine([sess])
 
-    blob = " ".join(rec.texts).lower()
-    assert "session" in blob
-    assert "cold" in blob or "resume" in blob
+    blob = " ".join(rec.texts)
+    # The cold-cache note is the point of the divider (scope doc): the surfaced
+    # cache-creation token count must render, not just the word "resume".
+    assert "session resume" in blob
+    assert "cold cache" in blob
+    assert "1,200" in blob
+
+
+def test_status_icon_renders_in_node_cell(monkeypatch):
+    st, rec = _recording_streamlit()
+    app = _app(monkeypatch, st)
+
+    app._render_spine([_node("tool", "rm -rf", status="deny", ts_start="2026-06-12T12:00:00Z")])
+
+    assert "🚫" in _row_for(rec, "rm -rf")[0]  # a denied node carries the deny icon
 
 
 def test_badges_render_in_node_label(monkeypatch):
