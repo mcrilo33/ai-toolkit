@@ -104,8 +104,12 @@ def _events(telemetry_dir: Path) -> list[dict]:
     return [json.loads(line) for line in f.read_text().splitlines()]
 
 
-def _spans(telemetry_dir: Path, *, name: str) -> list[dict]:
-    return [e for e in _events(telemetry_dir) if e.get("name") == name]
+def _spans(telemetry_dir: Path, *, name: str, kind: str | None = None) -> list[dict]:
+    return [
+        e
+        for e in _events(telemetry_dir)
+        if e.get("name") == name and (kind is None or e.get("kind") == kind)
+    ]
 
 
 def _make_spoke(hub: Path, tmp_path: Path, issue: str, slug: str) -> Path:
@@ -172,7 +176,7 @@ class TestWorktreeNewSpoke:
             "--no-terminal",
         )
 
-        spans = _spans(telemetry_dir, name="worktree-new")
+        spans = _spans(telemetry_dir, name="worktree-new", kind="lifecycle")
         assert len(spans) == 1
         span = spans[0]
         assert span["kind"] == "lifecycle"
@@ -193,7 +197,7 @@ class TestWorktreeNewSpoke:
         )
 
         srid = (tmp_path / f"{hub.name}-42" / ".ai-toolkit" / "spoke-run-id").read_text().strip()
-        span = _spans(telemetry_dir, name="worktree-new")[0]
+        span = _spans(telemetry_dir, name="worktree-new", kind="lifecycle")[0]
         assert span["spoke_run_id"] == srid
         assert span["branch"] == "feature/42-alpha"
 
@@ -228,7 +232,7 @@ class TestWorktreeDoneSpoke:
         res = _run(WORKTREE_DONE, hub, _tele_env(telemetry_dir), "7", "--no-code", "--force")
 
         assert res.returncode == 0, res.stderr
-        spans = _spans(telemetry_dir, name="worktree-done")
+        spans = _spans(telemetry_dir, name="worktree-done", kind="lifecycle")
         assert len(spans) == 1
         assert spans[0]["kind"] == "lifecycle"
         assert spans[0]["phase"] == "teardown"
@@ -309,7 +313,72 @@ class TestWorktreeLandSpoke:
         res = _run(WORKTREE_LAND, hub, env, "9", "--skip-tests")
 
         assert res.returncode == 0, res.stderr
-        spans = _spans(telemetry_dir, name="worktree-land")
+        spans = _spans(telemetry_dir, name="worktree-land", kind="lifecycle")
         assert len(spans) == 1
         assert spans[0]["kind"] == "lifecycle"
         assert spans[0]["phase"] == "land"
+
+
+# ── script-kind run-nodes (Issue #54 track E) ──────────────
+# Each control script is a first-class run node: alongside its lifecycle marker it
+# emits a kind=script span sharing the script's name (the emission-link basis the
+# parser later uses to point the marker at the script that produced it). The link
+# field itself stays null on push.
+
+
+class TestWorktreeScriptSpans:
+    def test_worktree_new_emits_script_span(self, hub: Path, telemetry_dir: Path) -> None:
+        _run(
+            WORKTREE_NEW,
+            hub,
+            _tele_env(telemetry_dir),
+            "42",
+            "alpha",
+            "--no-code",
+            "--no-terminal",
+        )
+
+        spans = _spans(telemetry_dir, name="worktree-new", kind="script")
+        assert len(spans) == 1
+        assert spans[0]["kind"] == "script"
+        assert spans[0]["status"] == "success"
+        assert spans[0]["emits"] is None
+
+    def test_worktree_done_emits_script_span(
+        self, hub: Path, tmp_path: Path, telemetry_dir: Path
+    ) -> None:
+        _make_spoke(hub, tmp_path, "7", "beta")
+
+        res = _run(WORKTREE_DONE, hub, _tele_env(telemetry_dir), "7", "--no-code", "--force")
+
+        assert res.returncode == 0, res.stderr
+        spans = _spans(telemetry_dir, name="worktree-done", kind="script")
+        assert len(spans) == 1
+        assert spans[0]["emits"] is None
+
+    def test_worktree_land_emits_script_span(
+        self, hub: Path, tmp_path: Path, telemetry_dir: Path
+    ) -> None:
+        wt = _make_spoke(hub, tmp_path, "9", "gamma")
+        (wt / "f.txt").write_text("work\n")
+        _git(wt, "add", "f.txt")
+        _git(wt, "commit", "-qm", "feat: work", "-m", "Refs #9")
+        _git(wt, "push", "-q", "-u", "origin", "feature/9-gamma")
+        _git(wt, "tag", "ready/9")
+        _git(wt, "push", "-q", "origin", "ready/9")
+
+        bindir = tmp_path / "bin"
+        bindir.mkdir(exist_ok=True)
+        for name in ("gh", "code"):
+            stub = bindir / name
+            stub.write_text("#!/bin/sh\nexit 0\n")
+            stub.chmod(0o755)
+        env = _tele_env(telemetry_dir)
+        env["PATH"] = f"{bindir}:{os.environ['PATH']}"
+
+        res = _run(WORKTREE_LAND, hub, env, "9", "--skip-tests")
+
+        assert res.returncode == 0, res.stderr
+        spans = _spans(telemetry_dir, name="worktree-land", kind="script")
+        assert len(spans) == 1
+        assert spans[0]["emits"] is None
