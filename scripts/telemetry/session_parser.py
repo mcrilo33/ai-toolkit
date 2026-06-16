@@ -81,6 +81,10 @@ def parse_session_file(path: Path) -> ParsedSession:
     todo_summaries = _todo_summaries(records)
 
     parsed = ParsedSession()
+    # One session-global set of every agentId whose transcript has been walked, so a
+    # repeated or cyclic agentId (reachable via the recursion in #51 S2) is walked —
+    # and its usage emitted — at most once across all top-level and workflow agents.
+    seen: set[str] = set()
     for rec in records:
         if rec.get("type") != "assistant":
             continue
@@ -90,11 +94,11 @@ def parse_session_file(path: Path) -> ParsedSession:
         if isinstance(message.get("usage"), dict):
             parsed.usage_events.append(_usage_event(rec, "main", None))
         for block in message.get("content") or []:
-            _consume_tool_use(block, rec, results, meta, path, parsed, todo_summaries)
+            _consume_tool_use(block, rec, results, meta, path, parsed, todo_summaries, seen)
 
     parsed.spans.extend(_human_prompt_spans(records, meta))
 
-    events, spans, links = _walk_workflow_agents(path, parent_meta=meta)
+    events, spans, links = _walk_workflow_agents(path, parent_meta=meta, seen=seen)
     parsed.usage_events.extend(events)
     parsed.spans.extend(spans)
     parsed.agent_links.update(links)
@@ -127,6 +131,7 @@ def _consume_tool_use(
     path: Path,
     parsed: ParsedSession,
     todo_summaries: dict[str, str],
+    seen: set[str],
 ) -> None:
     if not (isinstance(block, dict) and block.get("type") == "tool_use"):
         return
@@ -136,17 +141,12 @@ def _consume_tool_use(
     parsed.spans.append(span)
     if span.kind != "agent":
         return
-    agent_id = results.get(block.get("id") or "", {}).get("agent_id")
-    if agent_id:
-        # The per-span half of agent_links (Issue #50): every agent span carries its
-        # own agentId so agent→agent recursion composes into a chain at any depth.
-        span.agent_link = agent_id
-        parsed.agent_links[span.span_id] = agent_id
-        events, sub_spans = _walk_subagent(
-            path, agent_id, parent_meta=meta, agent_span_id=span.span_id
-        )
-        parsed.usage_events.extend(events)
-        parsed.spans.extend(sub_spans)
+    events, sub_spans, links = _link_and_walk_agent(
+        span, block.get("id") or "", results, path, meta, seen
+    )
+    parsed.usage_events.extend(events)
+    parsed.spans.extend(sub_spans)
+    parsed.agent_links.update(links)
 
 
 def _span_for_tool_use(
@@ -385,9 +385,14 @@ def _tool_results(records: list[dict]) -> dict[str, dict]:
 
 
 def _walk_subagent(
-    main_path: Path, agent_id: str, *, parent_meta: dict[str, str | None], agent_span_id: str
-) -> tuple[list[UsageEvent], list[Span]]:
-    """Walk a sub-agent transcript into usage events and its own step spans.
+    main_path: Path,
+    agent_id: str,
+    *,
+    parent_meta: dict[str, str | None],
+    agent_span_id: str,
+    seen: set[str],
+) -> tuple[list[UsageEvent], list[Span], dict[str, str]]:
+    """Walk a sub-agent transcript into usage events, step spans, and agent links.
 
     The transcript (``<session>/subagents/agent-<id>.jsonl``) is a session-shaped
     log. Its ``tool_use`` blocks become the sub-agent's spans (#47 S3) — but its
@@ -400,9 +405,14 @@ def _walk_subagent(
     """
     sub = main_path.parent / main_path.stem / "subagents" / f"agent-{agent_id}.jsonl"
     if not sub.exists():
-        return [], []
+        return [], [], {}
     return _walk_transcript(
-        _load_jsonl(sub), agent_id, parent_meta=parent_meta, agent_span_id=agent_span_id
+        _load_jsonl(sub),
+        agent_id,
+        main_path=main_path,
+        parent_meta=parent_meta,
+        agent_span_id=agent_span_id,
+        seen=seen,
     )
 
 
@@ -410,23 +420,28 @@ def _walk_transcript(
     records: list[dict],
     agent_id: str,
     *,
+    main_path: Path,
     parent_meta: dict[str, str | None],
     agent_span_id: str,
-) -> tuple[list[UsageEvent], list[Span]]:
-    """Walk one sub-agent transcript's records into usage events and step spans.
+    seen: set[str],
+) -> tuple[list[UsageEvent], list[Span], dict[str, str]]:
+    """Walk one sub-agent transcript's records into usage events, spans, and links.
 
     Shared by the Task-spawned walk (:func:`_walk_subagent`) and the workflow walk
-    (:func:`_walk_workflow_agents`). The leading user record is the orchestrator's
-    task prompt, so human-prompt spans are deliberately NOT emitted (that text stays
-    private). Each span is re-homed onto the spoke: ``session_id`` becomes the
-    parent's and ``parent_id`` the agent span; ``span_id`` stays derived from the
-    transcript, keeping ids idempotent and collision-free.
+    (:func:`_walk_workflow_agents`). A nested Task/Agent ``tool_use`` (Issue #51 S2)
+    recurses into its own transcript so agent→agent→… chains reconstruct at any
+    depth; ``seen`` guards against a cyclic link looping forever. The leading user
+    record is the orchestrator's task prompt, so human-prompt spans are deliberately
+    NOT emitted (that text stays private). Each span is re-homed onto the spoke:
+    ``session_id`` becomes the parent's and ``parent_id`` the agent span; ``span_id``
+    stays derived from the transcript, keeping ids idempotent and collision-free.
     """
     meta = _session_meta(records)
     results = _tool_results(records)
     todo_summaries = _todo_summaries(records)
     events: list[UsageEvent] = []
     spans: list[Span] = []
+    links: dict[str, str] = {}
     for rec in records:
         message = rec.get("message")
         if rec.get("type") != "assistant" or not isinstance(message, dict):
@@ -434,22 +449,60 @@ def _walk_transcript(
         if isinstance(message.get("usage"), dict):
             events.append(_usage_event(rec, "subagent", agent_id))
         for block in message.get("content") or []:
-            span = (
-                _span_for_tool_use(block, rec, results, meta, todo_summaries)
-                if isinstance(block, dict) and block.get("type") == "tool_use"
-                else None
-            )
-            if span is not None:
-                span.session_id = parent_meta["session_id"]
-                span.repo = parent_meta["repo"] or "unknown"
-                span.branch = parent_meta["branch"]
-                span.parent_id = agent_span_id
-                spans.append(span)
-    return events, spans
+            if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+                continue
+            span = _span_for_tool_use(block, rec, results, meta, todo_summaries)
+            if span is None:
+                continue
+            span.session_id = parent_meta["session_id"]
+            span.repo = parent_meta["repo"] or "unknown"
+            span.branch = parent_meta["branch"]
+            span.parent_id = agent_span_id
+            spans.append(span)
+            if span.kind == "agent":
+                ev, sp, lk = _link_and_walk_agent(
+                    span, block.get("id") or "", results, main_path, parent_meta, seen
+                )
+                events.extend(ev)
+                spans.extend(sp)
+                links.update(lk)
+    return events, spans, links
+
+
+def _link_and_walk_agent(
+    span: Span,
+    tool_use_id: str,
+    results: dict[str, dict],
+    main_path: Path,
+    parent_meta: dict[str, str | None],
+    seen: set[str],
+) -> tuple[list[UsageEvent], list[Span], dict[str, str]]:
+    """Link an agent span to its sub-agent transcript and walk that transcript once.
+
+    The ``agent_link`` display field is always set so the chain renders at any depth
+    (Issue #50). The cost-bearing link (``links[span_id] -> agentId``) and the
+    transcript walk happen only the FIRST time an ``agentId`` is seen: a repeated or
+    cyclic ``agentId`` (Issue #51 S2) is therefore walked at most once — no duplicate
+    usage events — and owned by exactly one span, so ``cost.py`` never attributes one
+    transcript's tokens to two spans. Returns the nested transcript's
+    ``(events, spans, links)``; empty when the id is unresolved or already seen.
+    """
+    agent_id = results.get(tool_use_id, {}).get("agent_id")
+    if not agent_id:
+        return [], [], {}
+    span.agent_link = agent_id
+    if agent_id in seen:
+        return [], [], {}
+    seen.add(agent_id)
+    events, spans, links = _walk_subagent(
+        main_path, agent_id, parent_meta=parent_meta, agent_span_id=span.span_id, seen=seen
+    )
+    links[span.span_id] = agent_id
+    return events, spans, links
 
 
 def _walk_workflow_agents(
-    main_path: Path, *, parent_meta: dict[str, str | None]
+    main_path: Path, *, parent_meta: dict[str, str | None], seen: set[str]
 ) -> tuple[list[UsageEvent], list[Span], dict[str, str]]:
     """Discover the agents of every ``Workflow`` fan-out under this session (Issue #51).
 
@@ -459,7 +512,8 @@ def _walk_workflow_agents(
     span (``name`` = the ``meta.json`` ``agentType``, ``summary`` = the workflow name,
     window = the transcript's first/last timestamp), its ``agent_link`` registered for
     cost attribution, and its ``tool_use`` blocks walked as nested spans — so its turns
-    no longer orphan to ``(unresolved)``.
+    no longer orphan to ``(unresolved)``. ``seen`` is the session-global walked-id set,
+    so an agent already reached through a link is not discovered (and walked) again.
     """
     root = main_path.parent / main_path.stem / "subagents" / "workflows"
     if not root.is_dir():
@@ -471,17 +525,29 @@ def _walk_workflow_agents(
         name, agent_types = _workflow_meta(wf_dir)
         for agent_path in sorted(wf_dir.glob("agent-*.jsonl")):
             agent_id = agent_path.stem[len("agent-") :]
+            if agent_id in seen:
+                continue
+            seen.add(agent_id)
             records = _load_jsonl(agent_path)
             span = _workflow_agent_span(
                 agent_id, agent_types.get(agent_id), name, records, parent_meta
             )
             links[span.span_id] = agent_id
             spans.append(span)
-            sub_events, sub_spans = _walk_transcript(
-                records, agent_id, parent_meta=parent_meta, agent_span_id=span.span_id
+            # A workflow agent may itself spawn Task sub-agents — recurse with the
+            # session-global ``seen`` (this agent is already in it) so any nested
+            # agent is walked once across the whole session.
+            sub_events, sub_spans, sub_links = _walk_transcript(
+                records,
+                agent_id,
+                main_path=main_path,
+                parent_meta=parent_meta,
+                agent_span_id=span.span_id,
+                seen=seen,
             )
             events.extend(sub_events)
             spans.extend(sub_spans)
+            links.update(sub_links)
     return events, spans, links
 
 

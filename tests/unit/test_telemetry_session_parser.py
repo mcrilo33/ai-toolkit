@@ -555,7 +555,12 @@ class TestWorkflowAgentDiscovery:
     """
 
     def test_discovers_an_agent_span_per_workflow_agent(self, wf_parsed: ParsedSession) -> None:
-        wf_agents = [s for s in wf_parsed.spans if s.kind == "agent"]
+        # The two workflow agents are identified by their workflow-name summary; the
+        # session also holds a Task-spawned recursion chain (S2), so this scopes to
+        # the workflow fan-out rather than asserting global agent-span exclusivity.
+        wf_agents = [
+            s for s in wf_parsed.spans if s.kind == "agent" and s.summary == "review-changes"
+        ]
         assert {wf_parsed.agent_links[s.span_id] for s in wf_agents} == set(WF_AGENT_IDS)
         assert len(wf_agents) == 2
 
@@ -582,10 +587,10 @@ class TestWorkflowAgentDiscovery:
         # half of agent_links) so agent→agent recursion composes into a chain.
         for span in (s for s in wf_parsed.spans if s.kind == "agent"):
             assert span.agent_link == wf_parsed.agent_links.get(span.span_id)
-            assert span.agent_link in WF_AGENT_IDS
+            assert span.agent_link is not None
 
     def test_links_registered_for_cost_attribution(self, wf_parsed: ParsedSession) -> None:
-        assert set(wf_parsed.agent_links.values()) == set(WF_AGENT_IDS)
+        assert set(WF_AGENT_IDS) <= set(wf_parsed.agent_links.values())
 
     def test_workflow_agent_usage_events_tagged_as_subagent(self, wf_parsed: ParsedSession) -> None:
         events = [e for e in wf_parsed.usage_events if e.agent_id in WF_AGENT_IDS]
@@ -611,7 +616,7 @@ class TestWorkflowAgentDiscovery:
     def test_span_ids_are_idempotent(self) -> None:
         a = {s.span_id for s in parse_session_file(WF_SESSION).spans if s.kind == "agent"}
         b = {s.span_id for s in parse_session_file(WF_SESSION).spans if s.kind == "agent"}
-        assert a == b and len(a) == 2
+        assert a == b and len(a) >= 2
 
     def test_no_task_prompt_or_agent_work_leaks(self, wf_parsed: ParsedSession) -> None:
         blob = "".join(str(s.to_dict()) for s in wf_parsed.spans)
@@ -626,6 +631,140 @@ class TestWorkflowAgentDiscovery:
         assert not leaked
 
 
+CHAIN_IDS = ("a1a1a1a1a1a1a1a1", "b2b2b2b2b2b2b2b2", "c3c3c3c3c3c3c3c3")
+
+
+def _agents_by_link(parsed: ParsedSession) -> dict[str, Span]:
+    return {
+        parsed.agent_links[s.span_id]: s
+        for s in parsed.spans
+        if s.kind == "agent" and s.span_id in parsed.agent_links
+    }
+
+
+class TestRecursiveAgents:
+    """Issue #51 S2: a sub-agent that spawns another sub-agent chains agent_links
+    parent→child so agent→agent→… reconstructs at any depth. Each level's turns are
+    tagged with that level's own agentId, and each agent span's window nests inside
+    its parent's so the tree re-homes them by containment.
+    """
+
+    def test_chains_agent_links_to_unbounded_depth(self, wf_parsed: ParsedSession) -> None:
+        assert set(CHAIN_IDS) <= set(wf_parsed.agent_links.values())
+
+    def test_each_nested_agent_has_its_own_linked_span(self, wf_parsed: ParsedSession) -> None:
+        by_link = _agents_by_link(wf_parsed)
+        for chain_id in CHAIN_IDS:
+            assert chain_id in by_link
+            assert by_link[chain_id].agent_link == chain_id
+
+    def test_nested_agent_names_are_their_subagent_types(self, wf_parsed: ParsedSession) -> None:
+        by_link = _agents_by_link(wf_parsed)
+        assert by_link["a1a1a1a1a1a1a1a1"].name == "general-purpose"
+        assert by_link["b2b2b2b2b2b2b2b2"].name == "Explore"
+        assert by_link["c3c3c3c3c3c3c3c3"].name == "tdd-red"
+
+    def test_windows_nest_by_containment(self, wf_parsed: ParsedSession) -> None:
+        # tree.py homes a subagent turn under the tightest enclosing agent by time
+        # window, so each child's [ts_start, ts_end] must sit inside its parent's.
+        windows = [
+            (a.ts_start, a.ts_end) for a in (_agents_by_link(wf_parsed)[c] for c in CHAIN_IDS)
+        ]
+        assert all(start and end for start, end in windows)
+        (d1s, d1e), (d2s, d2e), (d3s, d3e) = windows
+        assert d1s <= d2s and d2e <= d1e
+        assert d2s <= d3s and d3e <= d2e
+
+    def test_each_level_usage_tagged_with_its_own_agent_id(self, wf_parsed: ParsedSession) -> None:
+        for chain_id in CHAIN_IDS:
+            events = [e for e in wf_parsed.usage_events if e.agent_id == chain_id]
+            assert events
+            assert all(e.source == "subagent" for e in events)
+
+    def test_no_secret_leaks_across_the_chain(self, wf_parsed: ParsedSession) -> None:
+        blob = "".join(str(s.to_dict()) for s in wf_parsed.spans)
+        for secret in SECRETS:
+            assert secret not in blob
+
+    def test_recursion_terminates_on_a_cyclic_link(self, tmp_path: Path) -> None:
+        # Two agents referencing each other must not loop forever — a seen-set guard
+        # stops the walk after each agent id is visited once.
+        session_id = "cycle-sess"
+        main = tmp_path / f"{session_id}.jsonl"
+        subagents = tmp_path / session_id / "subagents"
+        subagents.mkdir(parents=True)
+
+        def task(uuid: str, ts: str, tool_id: str, sub_type: str) -> dict:
+            return {
+                "type": "assistant",
+                "sessionId": session_id,
+                "cwd": "/Users/demo/Repos/proj",
+                "gitBranch": "feature/51-demo",
+                "timestamp": ts,
+                "uuid": uuid,
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-opus-4-8",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": "Task",
+                            "input": {"description": "spawn", "subagent_type": sub_type},
+                        }
+                    ],
+                },
+            }
+
+        def result(uuid: str, ts: str, tool_id: str, agent_id: str) -> dict:
+            return {
+                "type": "user",
+                "sessionId": session_id,
+                "timestamp": ts,
+                "uuid": uuid,
+                "toolUseResult": {"agentId": agent_id},
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": tool_id, "is_error": False}],
+                },
+            }
+
+        main.write_text(
+            "\n".join(
+                json.dumps(r)
+                for r in [
+                    task("m1", "2026-06-14T13:00:00.000Z", "t_x", "Explore"),
+                    result("m2", "2026-06-14T13:00:10.000Z", "t_x", "agentX"),
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (subagents / "agent-agentX.jsonl").write_text(
+            "\n".join(
+                json.dumps(r)
+                for r in [
+                    task("x1", "2026-06-14T13:00:01.000Z", "t_y", "Explore"),
+                    result("x2", "2026-06-14T13:00:05.000Z", "t_y", "agentY"),
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (subagents / "agent-agentY.jsonl").write_text(
+            "\n".join(
+                json.dumps(r)
+                for r in [
+                    task("y1", "2026-06-14T13:00:02.000Z", "t_x2", "Explore"),
+                    result("y2", "2026-06-14T13:00:03.000Z", "t_x2", "agentX"),
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        parsed = parse_session_file(main)  # must return, not hang
+
+        assert {"agentX", "agentY"} <= set(parsed.agent_links.values())
+
+
 class TestProjectsDirWalk:
     def test_parse_projects_dir_finds_the_session_spans(self) -> None:
         merged = parse_projects_dir(FIXTURES)
@@ -636,10 +775,11 @@ class TestProjectsDirWalk:
         # Subagent transcripts (Task at subagents/agent-*.jsonl and workflow agents
         # at subagents/workflows/wf_*/agent-*.jsonl) must be walked for tokens, never
         # parsed as top-level sessions (which would double-count and mis-kind them).
-        # The project holds exactly three agents: one Task agent (#22 session) plus
-        # the two workflow agents (#51 session) — and no more.
+        # The project holds exactly six agents: one Task agent (#22 session), the two
+        # workflow agents and the three-deep recursion chain (#51 session) — and no
+        # more (no subagent transcript re-parsed as a top-level session).
         merged = parse_projects_dir(FIXTURES)
         agents = _by_kind(merged, "agent")
-        assert len(agents) == 3
+        assert len(agents) == 6
         # Every agent span is linked for cost attribution; none is a stray re-parse.
         assert all(merged.agent_links.get(a.span_id) for a in agents)
