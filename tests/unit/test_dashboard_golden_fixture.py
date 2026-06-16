@@ -183,13 +183,17 @@ class TestEmissionRendering:
         # (g_script_red.emits == "g_red"); the rendered node must surface that link
         # so the script→marker chain is drawable.
         raw = _by_id(_spans())
-        script_raw = next(s for s in _spans() if s["kind"] == "script")
+        script_raw = next(
+            s for s in _spans() if s["kind"] == "script" and s["name"] == "commit-gauntlet"
+        )
         marker_id = script_raw["emits"]
         assert marker_id and raw[marker_id]["kind"] in ("step", "lifecycle")
 
         store = store_from(SPANS, TURNS)
         forest = store.spoke_steps(SPOKE_RUN_ID)
-        script_node = next(n for n in _walk(forest) if n["kind"] == "script")
+        script_node = next(
+            n for n in _walk(forest) if n["kind"] == "script" and n["name"] == "commit-gauntlet"
+        )
         assert script_node.get("emits") == marker_id
 
     def test_emits_key_absent_when_link_is_null(self) -> None:

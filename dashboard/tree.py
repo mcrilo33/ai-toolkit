@@ -52,7 +52,7 @@ def _parse_ts(ts: str | None) -> float | None:
 
 
 def _step_node(row: dict[str, Any]) -> dict[str, Any]:
-    return {
+    node = {
         "span_id": row["span_id"],
         "parent_id": row["parent_id"],
         "kind": row["kind"],
@@ -75,6 +75,13 @@ def _step_node(row: dict[str, Any]) -> dict[str, Any]:
         "agent": "subagent" if row["kind"] == "agent" else "main",
         "children": [],
     }
+    # The v3 emission link (Issue #54): surface a script span's `emits` (the
+    # step/lifecycle marker it produced) so the trace can draw the script→marker
+    # chain. Added ONLY when set — a node with no emission keeps no key, so the
+    # frozen v1/v2 golden forest stays byte-identical.
+    if row.get("emits"):
+        node["emits"] = row["emits"]
+    return node
 
 
 def _sort_key(node: dict[str, Any]) -> tuple[float, str]:
