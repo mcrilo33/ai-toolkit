@@ -47,6 +47,10 @@ _STATUS_SEVERITY: dict[str, int] = {
 _SETUP_KEY = "__setup__"
 _UNRESOLVED_KEY = "__unresolved__"
 
+# A phase that ran real work but emitted no ``step`` marker is synthesized from its
+# ``in_progress`` todo transition (Issue #52); the badge marks the label as inferred.
+_NO_MARKER_BADGE = "⟨from todo — no marker⟩"
+
 
 def _parse_ts(ts: str | None) -> float | None:
     """ISO-8601 UTC string to epoch seconds (None if missing/malformed).
@@ -244,9 +248,120 @@ def _build_intervals(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "first": i == 0,
                 "key": _SETUP_KEY if is_setup else marker["span_id"],
                 "label": "setup" if is_setup else (marker["phase"] or marker["name"]),
+                # ``setup`` and the lifecycle (teardown) envelope are honestly
+                # coarse: a todo never renames them (Issue #52, the phantom-first-
+                # step fix). Real per-phase buckets stay nameable by the todo they
+                # advance (Issue #47).
+                "lock_label": is_setup or marker["kind"] == "lifecycle",
             }
         )
+    # Refine the coarse spine with the todo ``in_progress`` transitions (Issue #52):
+    # split the leading setup at the first transition, and synthesize a marker-less
+    # phase wherever a transition runs work inside a lifecycle (teardown) region.
+    todos = sorted(
+        (
+            n
+            for n in nodes
+            if n["kind"] == "todo" and n.get("summary") and _parse_ts(n["ts_start"]) is not None
+        ),
+        key=lambda n: (_parse_ts(n["ts_start"]) or 0.0, n["span_id"] or ""),
+    )
+    intervals = _split_spawn(intervals, markers, first_step, floor_iso, todos)
+    intervals = _synthesize_no_marker(intervals, markers, todos)
+    # Keep ``hi`` monotonic so ``_span_bucket_key`` floors/ceils on the true envelope.
+    intervals.sort(key=lambda iv: (iv["hi"] or 0.0, iv["lo_iso"] or ""))
     return intervals
+
+
+def _split_spawn(
+    intervals: list[dict[str, Any]],
+    markers: list[dict[str, Any]],
+    first_step: int | None,
+    floor_iso: str,
+    todos: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Split the leading ``setup`` block at the first ``in_progress`` todo transition.
+
+    Setup + planning + ledger creation stay in ``spawn``; the first real phase
+    becomes its own step, split at the first summarised todo that lands inside the
+    setup region (Issue #52, decision 2). With no such transition (the v1/v2
+    fixtures) the spine is returned unchanged, so the regression golden holds.
+    """
+    if first_step is None or not todos:
+        return intervals
+    fs = markers[first_step]
+    floor, fs_end = _parse_ts(floor_iso), _parse_ts(fs["ts_end"])
+    if floor is None or fs_end is None:
+        return intervals
+    split = next((t for t in todos if floor < (_parse_ts(t["ts_start"]) or 0.0) <= fs_end), None)
+    if split is None:
+        return intervals
+    split_ts, split_iso = _parse_ts(split["ts_start"]), split["ts_start"]
+    capped = [
+        {**iv, "hi": split_ts, "hi_iso": split_iso} if iv["key"] == _SETUP_KEY else iv
+        for iv in intervals
+    ]
+    red = {
+        "lo": split_ts,
+        "hi": fs_end,
+        "lo_iso": split_iso,
+        "hi_iso": fs["ts_end"],
+        "first": False,
+        "key": fs["span_id"],
+        # The first real phase is named for the todo whose transition split it off
+        # (Issue #47 todo-naming, now on the phase bucket — never on setup). Locked
+        # so the boundary todo landing back in spawn can't strip it to a bare phase.
+        "label": split["summary"],
+        "lock_label": True,
+    }
+    return [*capped, red]
+
+
+def _synthesize_no_marker(
+    intervals: list[dict[str, Any]],
+    markers: list[dict[str, Any]],
+    todos: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Carve a marker-less phase out of a lifecycle region at a todo transition.
+
+    A lifecycle (teardown) interval is coarse — it has no phase-start signal. A
+    summarised todo inside one began a phase that emitted no ``step`` marker; split
+    the region at the transition and give the tail its own ``⟨from todo — no
+    marker⟩``-badged bucket so its work never falls to ``(unresolved)`` (Issue #52).
+    """
+    lifecycle_keys = {m["span_id"] for m in markers if m["kind"] == "lifecycle"}
+    out: list[dict[str, Any]] = []
+    for iv in intervals:
+        inside = (
+            [
+                t
+                for t in todos
+                if iv["lo"] is not None
+                and iv["hi"] is not None
+                and iv["lo"] < (_parse_ts(t["ts_start"]) or 0.0) <= iv["hi"]
+            ]
+            if iv["key"] in lifecycle_keys
+            else []
+        )
+        if not inside:
+            out.append(iv)
+            continue
+        todo = inside[0]
+        ts, iso = _parse_ts(todo["ts_start"]), todo["ts_start"]
+        out.append({**iv, "hi": ts, "hi_iso": iso})
+        out.append(
+            {
+                "lo": ts,
+                "hi": iv["hi"],
+                "lo_iso": iso,
+                "hi_iso": iv["hi_iso"],
+                "first": False,
+                "key": todo["span_id"],
+                "label": f"{todo['summary']} {_NO_MARKER_BADGE}",
+                "lock_label": True,
+            }
+        )
+    return out
 
 
 def _interval_containing(ts: float, intervals: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -372,7 +487,8 @@ def _interval_forest(
     for key, window in windows.items():
         bucket_spans = spans_by_key.get(key, [])
         children = _bucket_children(bucket_spans, turns_by_owner.get(key, []), turns_by_owner)
-        roots.append(_bucket_node(window, children, _bucket_todo_label(bucket_spans)))
+        todo_label = None if window.get("lock_label") else _bucket_todo_label(bucket_spans)
+        roots.append(_bucket_node(window, children, todo_label))
 
     orphan_spans = spans_by_key.get(_UNRESOLVED_KEY, [])
     orphan_turns = turns_by_owner.get(_UNRESOLVED_KEY, [])
@@ -511,6 +627,9 @@ def _bucket_windows(intervals: list[dict[str, Any]]) -> dict[str, dict[str, Any]
                 "label": iv["label"],
                 "lo_iso": iv["lo_iso"],
                 "hi_iso": iv["hi_iso"],
+                # ``setup``/no-marker buckets keep their own label; a stray todo
+                # never renames them (Issue #52).
+                "lock_label": iv.get("lock_label", False),
             }
         else:
             window["hi_iso"] = iv["hi_iso"]  # extend setup over its merged intervals

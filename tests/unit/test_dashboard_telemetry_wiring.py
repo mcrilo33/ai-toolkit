@@ -61,12 +61,13 @@ def _find_kind(nodes, kind):
 def test_spoke_steps_attributes_model_and_agent_over_real_dataset():
     forest = _telemetry_store().spoke_steps(SPOKE_RUN_ID)
 
-    # Level-1 roots are reconstructed phase-interval buckets (#46), time-ordered:
-    # spawn + the first `red` step collapse into the leading bucket; the trailing
-    # lifecycle keeps its `teardown` label. The raw marker spans nest beneath as
-    # children. Issue #47: the leading bucket is named for the in-progress todo it
-    # advances (the retained ledger item), not the bare `setup` fallback.
-    assert [n["name"] for n in forest] == ["Add RED telemetry test", "teardown"]
+    # Level-1 roots are reconstructed phase-interval buckets (#46), time-ordered.
+    # Issue #52 spawn/first-RED split: setup + ledger creation stay in the honest
+    # `setup` bucket (never renamed by a todo — the phantom-first-step fix), and the
+    # first real phase splits off at the in-progress todo transition, named for the
+    # item it advances ("Add RED telemetry test"). The trailing lifecycle keeps
+    # `teardown`.
+    assert [n["name"] for n in forest] == ["setup", "Add RED telemetry test", "teardown"]
     assert all(n["span_id"] is None for n in forest)
 
     # Subagent turns from the walked transcript become sub-turn nodes under the
