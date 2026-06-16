@@ -136,6 +136,33 @@ def _is_real_spoke_repo(repo: str | None, prefix: str = REAL_REPO_PREFIX) -> boo
     return bool(repo) and repo.startswith(prefix)
 
 
+# Per-view handling of the v3 span kinds (Issue #61,
+# ``docs/dashboard-spoke-trace-scope.md`` §Per-view behaviour of new kinds).
+#
+# ``ZERO_COST_ROLLUP_KINDS`` own no cost in any rollup: a ``script`` bills no LLM,
+# and a ``workflow``'s cost lives on its ``agent`` children — summing it on the
+# workflow row too would double-count, breaking the conservation invariant
+# (Σ owned == Σ turns; cost lives only on turn/agent leaves). Their time and
+# frequency still roll up; only cost and tokens are forced to zero.
+ZERO_COST_ROLLUP_KINDS: tuple[str, ...] = ("script", "workflow")
+
+# ``ROLLUP_EXCLUDED_KINDS`` never appear as a rollup row at all: a
+# ``workflow_phase`` is a display-only grouping span (it brackets a fan-out's
+# phase in the Spoke tree) with no own metrics.
+ROLLUP_EXCLUDED_KINDS: tuple[str, ...] = ("workflow_phase",)
+
+
+def _sql_in_list(kinds: tuple[str, ...]) -> str:
+    """Render a fixed tuple of kind literals as a SQL ``IN`` list.
+
+    Inputs are module constants, never user data, so inlining the quoted
+    literals is safe and keeps the SQL readable; the assert pins that contract
+    so a future caller can't smuggle arbitrary text into the SQL.
+    """
+    assert all(kind.isidentifier() for kind in kinds), "kind literals must be identifiers"
+    return ", ".join(f"'{kind}'" for kind in kinds)
+
+
 def _issue_from_spoke_run_id(spoke_run_id: str | None) -> str | None:
     """Parse the issue number out of a ``<type>/<issue>-<slug>+<epoch>`` run id.
 
@@ -511,23 +538,33 @@ class SpanStore:
         Null cost/token values count as zero. Rows are sorted by total time
         spent, descending — the dashboard's "where does time go" ordering.
         """
+        # ``script``/``workflow`` own no cost or tokens in the rollup (see
+        # ZERO_COST_ROLLUP_KINDS); ``workflow_phase`` is dropped entirely.
+        zero_cost = _sql_in_list(ZERO_COST_ROLLUP_KINDS)
+        excluded = _sql_in_list(ROLLUP_EXCLUDED_KINDS)
+        cost = f"CASE WHEN kind IN ({zero_cost}) THEN 0 ELSE COALESCE(cost_usd, 0) END"
+        tokens = (
+            f"CASE WHEN kind IN ({zero_cost}) THEN 0 "
+            "ELSE COALESCE(tokens_in, 0) + COALESCE(tokens_out, 0) END"
+        )
         rows = self._query(
-            """
+            f"""
             SELECT
                 kind, name, phase,
                 COUNT(*) AS invocations,
                 SUM(duration_ms) AS total_duration_ms,
                 AVG(duration_ms) AS mean_duration_ms,
                 MEDIAN(duration_ms) AS median_duration_ms,
-                SUM(COALESCE(cost_usd, 0)) AS total_cost_usd,
-                AVG(COALESCE(cost_usd, 0)) AS mean_cost_usd,
-                MEDIAN(COALESCE(cost_usd, 0)) AS median_cost_usd,
-                SUM(COALESCE(tokens_in, 0) + COALESCE(tokens_out, 0)) AS total_tokens,
-                AVG(COALESCE(tokens_in, 0) + COALESCE(tokens_out, 0)) AS mean_tokens,
+                SUM({cost}) AS total_cost_usd,
+                AVG({cost}) AS mean_cost_usd,
+                MEDIAN({cost}) AS median_cost_usd,
+                SUM({tokens}) AS total_tokens,
+                AVG({tokens}) AS mean_tokens,
                 SUM(CASE WHEN human_type IS NOT NULL THEN 1 ELSE 0 END) AS human_count
             FROM spans
             WHERE (? IS NULL OR ts_start >= ?)
               AND (? IS NULL OR ts_start < ?)
+              AND (kind IS NULL OR kind NOT IN ({excluded}))
             GROUP BY kind, name, phase
             ORDER BY total_duration_ms DESC, kind, name, phase
             """,
@@ -556,17 +593,25 @@ class SpanStore:
         — small spoke counts are noisy and must not imply significance. Rows are
         sorted by the magnitude of the time delta, descending.
         """
+        # Same new-kind handling as ``aggregate``: ``script``/``workflow`` carry no
+        # own cost (so the delta stays honest), ``workflow_phase`` is excluded. The
+        # time deltas for ``script``/``workflow`` still surface — a gate getting
+        # slower is a real regression signal.
+        zero_cost = _sql_in_list(ZERO_COST_ROLLUP_KINDS)
+        excluded = _sql_in_list(ROLLUP_EXCLUDED_KINDS)
+        cost = f"CASE WHEN kind IN ({zero_cost}) THEN 0 ELSE COALESCE(cost_usd, 0) END"
         rows = self._query(
-            """
+            f"""
             SELECT
                 kind, name, phase, workflow_rev,
                 COUNT(*) AS n,
                 AVG(duration_ms) AS mean_duration,
-                AVG(COALESCE(cost_usd, 0)) AS mean_cost,
+                AVG({cost}) AS mean_cost,
                 SUM(CASE WHEN human_type IS NOT NULL THEN 1 ELSE 0 END) * 1.0
                     / COUNT(*) AS human_per_invocation
             FROM spans
             WHERE workflow_rev IN (?, ?)
+              AND (kind IS NULL OR kind NOT IN ({excluded}))
             GROUP BY kind, name, phase, workflow_rev
             """,
             [rev_a, rev_b],
@@ -791,9 +836,17 @@ def _clock(ts: str | None) -> str:
 
 
 def _aggregate_by_kind(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Group attributed span nodes by ``kind`` into meta-view rows."""
+    """Group attributed span nodes by ``kind`` into meta-view rows.
+
+    ``ROLLUP_EXCLUDED_KINDS`` (``workflow_phase``) are display-only grouping
+    spans and never form a meta row. ``script``/``workflow`` nodes already carry
+    ``own_cost_usd == 0`` here — only ``agent`` nodes receive attributed cost —
+    so they surface at $0 without special handling.
+    """
     by_kind: dict[str, list[dict[str, Any]]] = {}
     for node in nodes:
+        if node["kind"] in ROLLUP_EXCLUDED_KINDS:
+            continue
         by_kind.setdefault(node["kind"], []).append(node)
     rows = [_kind_row(kind, group) for kind, group in by_kind.items()]
     rows.sort(key=lambda r: (-r["total_cost_usd"], -r["count"], r["kind"]))
