@@ -326,10 +326,13 @@ if [ "$SPAWN_TERMINAL" -eq 1 ]; then
   fi
 fi
 
-# --- telemetry: lifecycle/spawn span -----------------------------------------
+# --- telemetry: spawn lifecycle marker + script run-node ---------------------
 # Attributed to the new spoke (emitted with the worktree as CWD), carrying the
-# spoke_run_id minted above. No-op unless AI_TOOLKIT_TELEMETRY=1.
+# spoke_run_id minted above. The script span is this control script as a trace
+# node; it shares its name with the lifecycle marker (emission-link basis). No-op
+# unless AI_TOOLKIT_TELEMETRY=1.
 wt_emit_lifecycle "worktree-new" "spawn" "success" "$WT_T0" "$WT_DIR"
+wt_emit_script "worktree-new" "success" "$WT_T0" "$WT_DIR"
 
 echo
 echo "  Then in that session, run:  /source   (anchor to the issue, then /cycle)"

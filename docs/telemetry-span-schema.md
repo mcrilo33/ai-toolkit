@@ -102,7 +102,7 @@ payload leakage, basename-only repo, opt-in no-op, invisibility).
 | `lifecycle` | `worktree-new/land/done` (`spawn/land/teardown`) | — |
 | `step` | cycle gate scripts (`red/green/review/push`) | — |
 | `hook` | every hook invocation (auto, via the hook lib) | — |
-| `script` | reserved for other instrumented scripts | — |
+| `script` | control scripts as run-nodes (Issue #54): `worktree-new/land/done`, `spoke-ready` (`phase`=`ready/gate/accept/blocked`), `spoke-push` | `emits` filled — linked to the `step`/`lifecycle` marker the script produced |
 | `tool` | — | one leaf per `tool_use` (Issue #47): `name` is the tool (`Bash`, `Edit`, `Read`, …), `summary` its main parameter (command / file path / pattern) |
 | `skill`, `agent`, `todo`, `human`, `rule` | — | reconstructed from CC session logs |
 | `workflow`, `workflow_phase` | — | a `Workflow` fan-out (Issue #50): `workflow` brackets the run, `workflow_phase` its phase groups. Cost lives on the `agent`/`turn` leaves; the containers own `$0`. `workflow_phase` is display-only at aggregate time. |

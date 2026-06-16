@@ -67,6 +67,10 @@ _COLUMNS: tuple[tuple[str, str], ...] = (
     ("human_type", "VARCHAR"),
     ("human_wait_ms", "BIGINT"),
     ("summary", "VARCHAR"),
+    # The v3 emission link (Issue #54): a script span's `emits` names the
+    # step/lifecycle marker it produced. Pull-only / null elsewhere; ingested so
+    # the forest can surface the script→marker chain.
+    ("emits", "VARCHAR"),
     ("tokens_in", "BIGINT"),
     ("tokens_out", "BIGINT"),
     ("cost_usd", "DOUBLE"),

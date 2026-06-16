@@ -95,10 +95,12 @@ while IFS=$'\t' read -r wt br; do
   fi
 done < <(wt_task_worktrees "$REPO_ROOT")
 
-# --- telemetry: lifecycle/teardown span --------------------------------------
-# Emit BEFORE removal so the worktree's spoke_run_id file is still readable.
-# No-op unless AI_TOOLKIT_TELEMETRY=1.
+# --- telemetry: teardown lifecycle marker + script run-node ------------------
+# Emit BEFORE removal so the worktree's spoke_run_id file is still readable. The
+# script span is this control script as a trace node, sharing the marker's name
+# (emission-link basis). No-op unless AI_TOOLKIT_TELEMETRY=1.
 wt_emit_lifecycle "worktree-done" "teardown" "success" "$WT_T0" "$WT_DIR"
+wt_emit_script "worktree-done" "success" "$WT_T0" "$WT_DIR"
 
 # --- fold the folder out of the VS Code review window ------------------------
 # The mirror of worktree-new.sh's `code --add`. Run BEFORE the on-disk delete
