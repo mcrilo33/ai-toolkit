@@ -20,7 +20,11 @@ so the derivation is exercised wherever a ``SpanStore`` is constructed.
 
 from __future__ import annotations
 
-from _dashboard_helpers import load_queries
+import sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+from _dashboard_helpers import load_app, load_queries
 
 RUN = "feature/60-approvals+1700000000"
 
@@ -240,3 +244,141 @@ class TestApprovalsInRollups:
         assert approval is not None, "approvals must route into the Automatability view"
         assert approval["frequency"] == 2
         assert approval["mean_wait_ms"] == 75, "mean wait across the 60ms + 90ms gates"
+
+    def test_automatability_row_carries_a_decision_breakdown(self) -> None:
+        approval = next(
+            r
+            for r in _store().automatability_candidates(min_frequency=1)
+            if r["human_type"] == "approval"
+        )
+        # allow + deny gates → an allow/ask/deny breakdown (warn maps to ask).
+        assert approval["decisions"] == {"allow": 1, "ask": 0, "deny": 1}
+
+    def test_meta_by_kind_approval_row_carries_mean_wait(self) -> None:
+        rows = _store().spoke_meta_by_kind(RUN)
+        approval = next(r for r in rows if r["kind"] == "approval")
+        assert approval["mean_wait_ms"] == 75
+        # A kind with no human wait reports None, never a bogus 0.
+        tool = next(r for r in rows if r["kind"] == "tool")
+        assert tool["mean_wait_ms"] is None
+
+
+class TestLabelFormatting:
+    def test_approval_label_shows_lock_and_decision(self) -> None:
+        queries = load_queries()
+        allow = {"kind": "approval", "name": "tool-permission", "status": "allow", "summary": None}
+        deny = {"kind": "approval", "name": "tool-permission", "status": "deny", "summary": None}
+        assert "🔐" in queries.format_step_label(allow)
+        assert "ask→allow" in queries.format_step_label(allow)
+        assert "ask→deny" in queries.format_step_label(deny)
+
+
+# ── app render layer ────────────────────────────────────────────────────────
+
+
+def _ctx() -> MagicMock:
+    m = MagicMock()
+    m.__enter__ = MagicMock(return_value=m)
+    m.__exit__ = MagicMock(return_value=False)
+    return m
+
+
+def _recording_st():
+    """A streamlit stub capturing column markdown (rows/texts) and dataframe tables."""
+    rec = SimpleNamespace(texts=[], rows=[], tables=[])
+
+    def _columns(spec):
+        n = spec if isinstance(spec, int) else len(spec)
+        row: list[str | None] = [None] * n
+        rec.rows.append(row)
+        cols = []
+        for i in range(n):
+            c = MagicMock()
+
+            def _mk(text, *_a, _row=row, _i=i, **_kw):
+                _row[_i] = str(text)
+                rec.texts.append(str(text))
+
+            c.markdown.side_effect = _mk
+            c.write.side_effect = _mk
+            cols.append(c)
+        return cols
+
+    st = MagicMock()
+    st.columns.side_effect = _columns
+    st.markdown.side_effect = lambda text, *_a, **_kw: rec.texts.append(str(text))
+    st.dataframe.side_effect = lambda data, *_a, **_kw: rec.tables.append(data)
+    st.caption.side_effect = lambda *_a, **_kw: None
+    st.header.side_effect = lambda *_a, **_kw: None
+    st.info.side_effect = lambda *_a, **_kw: None
+    st.slider.side_effect = lambda *_a, **_kw: 1
+    st.toggle.side_effect = lambda *_a, **_kw: False
+    st.expander.side_effect = lambda *_a, **_kw: _ctx()
+    return st, rec
+
+
+def _app(monkeypatch, st):
+    monkeypatch.setitem(sys.modules, "streamlit", st)
+    monkeypatch.setitem(sys.modules, "queries", load_queries())
+    return load_app()
+
+
+def _label_node(kind: str, name: str, **over) -> dict:
+    base = {
+        "span_id": "s",
+        "parent_id": None,
+        "kind": kind,
+        "name": name,
+        "summary": None,
+        "phase": None,
+        "status": "success",
+        "ts_start": "2026-06-16T12:00:00Z",
+        "ts_end": "2026-06-16T12:00:00Z",
+        "duration_ms": 0,
+        "own_cost_usd": 0.0,
+        "own_tokens_in": 0,
+        "own_tokens_out": 0,
+        "models": [],
+        "agent": "main",
+        "human_count": 0,
+        "children": [],
+    }
+    base.update(over)
+    return base
+
+
+class TestAppRender:
+    def test_approval_node_row_shows_lock_and_decision(self, monkeypatch) -> None:
+        st, rec = _recording_st()
+        app = _app(monkeypatch, st)
+        app._render_spine([_label_node("approval", "tool-permission", status="allow")])
+        cell = next(r[0] for r in rec.rows if r[0] and "approval" in r[0])
+        assert "🔐" in cell and "ask→allow" in cell
+
+    def test_blocked_tool_renders_as_never_run(self, monkeypatch) -> None:
+        st, rec = _recording_st()
+        app = _app(monkeypatch, st)
+        app._render_spine(
+            [_label_node("tool", "Bash", status="deny", summary="git push (blocked, never ran)")]
+        )
+        cell = next(r[0] for r in rec.rows if r[0] and "Bash" in r[0])
+        assert "never-run" in cell.lower()
+
+    def test_meta_table_has_a_mean_wait_column(self, monkeypatch) -> None:
+        st, rec = _recording_st()
+        app = _app(monkeypatch, st)
+        store = load_queries().SpanStore.from_events(_spans())
+        app._render_meta(store, RUN)
+        table = rec.tables[0]
+        assert all("Mean wait" in row for row in table), "meta table must carry a Mean wait column"
+        approval = next(r for r in table if r["Kind"] == "approval")
+        assert approval["Mean wait"] == "0.1s"
+
+    def test_automatability_table_shows_decision_breakdown(self, monkeypatch) -> None:
+        st, rec = _recording_st()
+        app = _app(monkeypatch, st)
+        store = load_queries().SpanStore.from_events(_spans())
+        app.render_automatability_view(store)
+        table = rec.tables[0]
+        approval = next(r for r in table if "tool-permission" in r["Interaction"])
+        assert "allow" in str(approval["Decisions"]) and "deny" in str(approval["Decisions"])
