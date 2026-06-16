@@ -1,0 +1,2887 @@
+{
+  "v1": {
+    "spoke_meta_by_kind": {
+      "feature/a+1000": [
+        {
+          "count": 4,
+          "kind": "step",
+          "mean_cost_usd": 0.0,
+          "mean_duration_ms": 625,
+          "median_duration_ms": 600.0,
+          "models": [],
+          "total_cost_usd": 0.0,
+          "total_duration_ms": 2500
+        },
+        {
+          "count": 3,
+          "kind": "hook",
+          "mean_cost_usd": 0.0,
+          "mean_duration_ms": 266.6666666666667,
+          "median_duration_ms": 200,
+          "models": [],
+          "total_cost_usd": 0.0,
+          "total_duration_ms": 800
+        },
+        {
+          "count": 1,
+          "kind": "lifecycle",
+          "mean_cost_usd": 0.0,
+          "mean_duration_ms": 3000,
+          "median_duration_ms": 3000,
+          "models": [],
+          "total_cost_usd": 0.0,
+          "total_duration_ms": 3000
+        }
+      ],
+      "feature/b+1100": [
+        {
+          "count": 3,
+          "kind": "step",
+          "mean_cost_usd": 0.0,
+          "mean_duration_ms": 1100,
+          "median_duration_ms": 800,
+          "models": [],
+          "total_cost_usd": 0.0,
+          "total_duration_ms": 3300
+        }
+      ],
+      "feature/c+2000": [
+        {
+          "count": 3,
+          "kind": "step",
+          "mean_cost_usd": 0.0,
+          "mean_duration_ms": 866.6666666666666,
+          "median_duration_ms": 600,
+          "models": [],
+          "total_cost_usd": 0.0,
+          "total_duration_ms": 2600
+        }
+      ],
+      "feature/d+2100": [
+        {
+          "count": 2,
+          "kind": "step",
+          "mean_cost_usd": 0.0,
+          "mean_duration_ms": 650,
+          "median_duration_ms": 650.0,
+          "models": [],
+          "total_cost_usd": 0.0,
+          "total_duration_ms": 1300
+        }
+      ]
+    },
+    "spoke_steps": {
+      "feature/a+1000": [
+        {
+          "agent": "main",
+          "children": [
+            {
+              "agent": "main",
+              "children": [],
+              "duration_ms": 3000,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "lifecycle",
+              "models": [],
+              "name": "worktree-new",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "parent_id": null,
+              "phase": "spawn",
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 0,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": "sa_root",
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-10T12:00:03Z",
+              "ts_start": "2026-06-10T12:00:00Z"
+            },
+            {
+              "agent": "main",
+              "children": [
+                {
+                  "agent": "main",
+                  "children": [],
+                  "duration_ms": 100,
+                  "human_count": 0,
+                  "human_type": null,
+                  "human_wait_ms": null,
+                  "kind": "hook",
+                  "models": [],
+                  "name": "red-proof-verify",
+                  "own_cost_usd": 0.0,
+                  "own_tokens_in": 0,
+                  "own_tokens_out": 0,
+                  "parent_id": "sa_red",
+                  "phase": null,
+                  "rollup": {
+                    "cost_usd": 0.0,
+                    "human_count": 0,
+                    "models": [],
+                    "tokens_in": 0,
+                    "tokens_out": 0
+                  },
+                  "span_id": "sa_red_hook",
+                  "status": "success",
+                  "summary": null,
+                  "ts_end": "2026-06-10T12:00:01Z",
+                  "ts_start": "2026-06-10T12:00:01Z"
+                }
+              ],
+              "collapsed": true,
+              "collapsed_count": 1,
+              "duration_ms": 100,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "hooks",
+              "models": [],
+              "name": "hooks",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "phase": null,
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 0,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": null,
+              "status": "success",
+              "ts_end": "2026-06-10T12:00:01Z",
+              "ts_start": "2026-06-10T12:00:01Z"
+            },
+            {
+              "agent": "main",
+              "children": [],
+              "duration_ms": 500,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "step",
+              "models": [],
+              "name": "solo-cycle",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "parent_id": "sa_root",
+              "phase": "red",
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 0,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": "sa_red",
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-10T12:00:01Z",
+              "ts_start": "2026-06-10T12:00:01Z"
+            }
+          ],
+          "duration_ms": null,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "interval",
+          "models": [],
+          "name": "setup",
+          "own_cost_usd": 0.0,
+          "own_tokens_in": 0,
+          "own_tokens_out": 0,
+          "parent_id": null,
+          "phase": null,
+          "rollup": {
+            "cost_usd": 0.0,
+            "human_count": 0,
+            "models": [],
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "span_id": null,
+          "status": "success",
+          "summary": null,
+          "ts_end": "2026-06-10T12:00:01Z",
+          "ts_start": "2026-06-10T12:00:00Z"
+        },
+        {
+          "agent": "main",
+          "children": [
+            {
+              "agent": "main",
+              "children": [
+                {
+                  "agent": "main",
+                  "children": [],
+                  "duration_ms": 200,
+                  "human_count": 0,
+                  "human_type": null,
+                  "human_wait_ms": null,
+                  "kind": "hook",
+                  "models": [],
+                  "name": "commit-gauntlet",
+                  "own_cost_usd": 0.0,
+                  "own_tokens_in": 0,
+                  "own_tokens_out": 0,
+                  "parent_id": "sa_green",
+                  "phase": null,
+                  "rollup": {
+                    "cost_usd": 0.0,
+                    "human_count": 0,
+                    "models": [],
+                    "tokens_in": 0,
+                    "tokens_out": 0
+                  },
+                  "span_id": "sa_green_hook",
+                  "status": "success",
+                  "summary": null,
+                  "ts_end": "2026-06-10T12:00:03Z",
+                  "ts_start": "2026-06-10T12:00:03Z"
+                }
+              ],
+              "collapsed": true,
+              "collapsed_count": 1,
+              "duration_ms": 200,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "hooks",
+              "models": [],
+              "name": "hooks",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "phase": null,
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 0,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": null,
+              "status": "success",
+              "ts_end": "2026-06-10T12:00:03Z",
+              "ts_start": "2026-06-10T12:00:03Z"
+            },
+            {
+              "agent": "main",
+              "children": [],
+              "duration_ms": 1000,
+              "human_count": 1,
+              "human_type": "approval",
+              "human_wait_ms": 4000,
+              "kind": "step",
+              "models": [],
+              "name": "solo-cycle",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "parent_id": "sa_root",
+              "phase": "green",
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 1,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": "sa_green",
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-10T12:00:04Z",
+              "ts_start": "2026-06-10T12:00:03Z"
+            }
+          ],
+          "duration_ms": null,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "interval",
+          "models": [],
+          "name": "spawn",
+          "own_cost_usd": 0.0,
+          "own_tokens_in": 0,
+          "own_tokens_out": 0,
+          "parent_id": null,
+          "phase": null,
+          "rollup": {
+            "cost_usd": 0.0,
+            "human_count": 1,
+            "models": [],
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "span_id": null,
+          "status": "success",
+          "summary": null,
+          "ts_end": "2026-06-10T12:00:03Z",
+          "ts_start": "2026-06-10T12:00:01Z"
+        },
+        {
+          "agent": "main",
+          "children": [
+            {
+              "agent": "main",
+              "children": [
+                {
+                  "agent": "main",
+                  "children": [],
+                  "duration_ms": 500,
+                  "human_count": 1,
+                  "human_type": "prompt",
+                  "human_wait_ms": 500,
+                  "kind": "hook",
+                  "models": [],
+                  "name": "post-edit-format",
+                  "own_cost_usd": 0.0,
+                  "own_tokens_in": 0,
+                  "own_tokens_out": 0,
+                  "parent_id": "sa_green",
+                  "phase": null,
+                  "rollup": {
+                    "cost_usd": 0.0,
+                    "human_count": 1,
+                    "models": [],
+                    "tokens_in": 0,
+                    "tokens_out": 0
+                  },
+                  "span_id": "sa_hook_human",
+                  "status": "success",
+                  "summary": null,
+                  "ts_end": "2026-06-10T12:00:04Z",
+                  "ts_start": "2026-06-10T12:00:04Z"
+                }
+              ],
+              "collapsed": true,
+              "collapsed_count": 1,
+              "duration_ms": 500,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "hooks",
+              "models": [],
+              "name": "hooks",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "phase": null,
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 1,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": null,
+              "status": "success",
+              "ts_end": "2026-06-10T12:00:04Z",
+              "ts_start": "2026-06-10T12:00:04Z"
+            }
+          ],
+          "duration_ms": null,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "interval",
+          "models": [],
+          "name": "green",
+          "own_cost_usd": 0.0,
+          "own_tokens_in": 0,
+          "own_tokens_out": 0,
+          "parent_id": null,
+          "phase": null,
+          "rollup": {
+            "cost_usd": 0.0,
+            "human_count": 1,
+            "models": [],
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "span_id": null,
+          "status": "success",
+          "summary": null,
+          "ts_end": "2026-06-10T12:00:04Z",
+          "ts_start": "2026-06-10T12:00:03Z"
+        },
+        {
+          "agent": "main",
+          "children": [
+            {
+              "agent": "main",
+              "children": [],
+              "duration_ms": 700,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "step",
+              "models": [],
+              "name": "solo-cycle",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "parent_id": "sa_root",
+              "phase": "review",
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 0,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": "sa_review",
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-10T12:00:10Z",
+              "ts_start": "2026-06-10T12:00:10Z"
+            }
+          ],
+          "duration_ms": null,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "interval",
+          "models": [],
+          "name": "review",
+          "own_cost_usd": 0.0,
+          "own_tokens_in": 0,
+          "own_tokens_out": 0,
+          "parent_id": null,
+          "phase": null,
+          "rollup": {
+            "cost_usd": 0.0,
+            "human_count": 0,
+            "models": [],
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "span_id": null,
+          "status": "success",
+          "summary": null,
+          "ts_end": "2026-06-10T12:00:10Z",
+          "ts_start": "2026-06-10T12:00:04Z"
+        },
+        {
+          "agent": "main",
+          "children": [
+            {
+              "agent": "main",
+              "children": [],
+              "duration_ms": 300,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "step",
+              "models": [],
+              "name": "solo-cycle",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "parent_id": "sa_root",
+              "phase": "push",
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 0,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": "sa_push",
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-10T12:00:20Z",
+              "ts_start": "2026-06-10T12:00:20Z"
+            }
+          ],
+          "duration_ms": null,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "interval",
+          "models": [],
+          "name": "push",
+          "own_cost_usd": 0.0,
+          "own_tokens_in": 0,
+          "own_tokens_out": 0,
+          "parent_id": null,
+          "phase": null,
+          "rollup": {
+            "cost_usd": 0.0,
+            "human_count": 0,
+            "models": [],
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "span_id": null,
+          "status": "success",
+          "summary": null,
+          "ts_end": "2026-06-10T12:00:20Z",
+          "ts_start": "2026-06-10T12:00:10Z"
+        }
+      ],
+      "feature/b+1100": [
+        {
+          "agent": "main",
+          "children": [
+            {
+              "agent": "main",
+              "children": [],
+              "duration_ms": 2000,
+              "human_count": 1,
+              "human_type": "approval",
+              "human_wait_ms": 6000,
+              "kind": "step",
+              "models": [],
+              "name": "solo-cycle",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "parent_id": null,
+              "phase": "green",
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 1,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": "sb_green",
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-10T13:00:02Z",
+              "ts_start": "2026-06-10T13:00:00Z"
+            }
+          ],
+          "duration_ms": null,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "interval",
+          "models": [],
+          "name": "setup",
+          "own_cost_usd": 0.0,
+          "own_tokens_in": 0,
+          "own_tokens_out": 0,
+          "parent_id": null,
+          "phase": null,
+          "rollup": {
+            "cost_usd": 0.0,
+            "human_count": 1,
+            "models": [],
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "span_id": null,
+          "status": "success",
+          "summary": null,
+          "ts_end": "2026-06-10T13:00:02Z",
+          "ts_start": "2026-06-10T13:00:00Z"
+        },
+        {
+          "agent": "main",
+          "children": [
+            {
+              "agent": "main",
+              "children": [],
+              "duration_ms": 500,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "step",
+              "models": [],
+              "name": "solo-cycle",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "parent_id": null,
+              "phase": "red",
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 0,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": "sb_red",
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-10T13:00:05Z",
+              "ts_start": "2026-06-10T13:00:05Z"
+            }
+          ],
+          "duration_ms": null,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "interval",
+          "models": [],
+          "name": "red",
+          "own_cost_usd": 0.0,
+          "own_tokens_in": 0,
+          "own_tokens_out": 0,
+          "parent_id": null,
+          "phase": null,
+          "rollup": {
+            "cost_usd": 0.0,
+            "human_count": 0,
+            "models": [],
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "span_id": null,
+          "status": "success",
+          "summary": null,
+          "ts_end": "2026-06-10T13:00:05Z",
+          "ts_start": "2026-06-10T13:00:02Z"
+        },
+        {
+          "agent": "main",
+          "children": [
+            {
+              "agent": "main",
+              "children": [],
+              "duration_ms": 800,
+              "human_count": 1,
+              "human_type": "question",
+              "human_wait_ms": 2000,
+              "kind": "step",
+              "models": [],
+              "name": "solo-cycle",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "parent_id": null,
+              "phase": "review",
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 1,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": "sb_review",
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-10T13:00:10Z",
+              "ts_start": "2026-06-10T13:00:10Z"
+            }
+          ],
+          "duration_ms": null,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "interval",
+          "models": [],
+          "name": "review",
+          "own_cost_usd": 0.0,
+          "own_tokens_in": 0,
+          "own_tokens_out": 0,
+          "parent_id": null,
+          "phase": null,
+          "rollup": {
+            "cost_usd": 0.0,
+            "human_count": 1,
+            "models": [],
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "span_id": null,
+          "status": "success",
+          "summary": null,
+          "ts_end": "2026-06-10T13:00:10Z",
+          "ts_start": "2026-06-10T13:00:05Z"
+        }
+      ],
+      "feature/c+2000": [
+        {
+          "agent": "main",
+          "children": [
+            {
+              "agent": "main",
+              "children": [],
+              "duration_ms": 500,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "step",
+              "models": [],
+              "name": "solo-cycle",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "parent_id": null,
+              "phase": "red",
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 0,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": "sc_red",
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-11T12:00:05Z",
+              "ts_start": "2026-06-11T12:00:05Z"
+            }
+          ],
+          "duration_ms": null,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "interval",
+          "models": [],
+          "name": "red",
+          "own_cost_usd": 0.0,
+          "own_tokens_in": 0,
+          "own_tokens_out": 0,
+          "parent_id": null,
+          "phase": null,
+          "rollup": {
+            "cost_usd": 0.0,
+            "human_count": 0,
+            "models": [],
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "span_id": null,
+          "status": "success",
+          "summary": null,
+          "ts_end": "2026-06-11T12:00:05Z",
+          "ts_start": "2026-06-11T12:00:00Z"
+        },
+        {
+          "agent": "main",
+          "children": [
+            {
+              "agent": "main",
+              "children": [],
+              "duration_ms": 600,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "step",
+              "models": [],
+              "name": "solo-cycle",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "parent_id": null,
+              "phase": "green",
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 0,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": "sc_green",
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-11T12:00:00Z",
+              "ts_start": "2026-06-11T12:00:00Z"
+            }
+          ],
+          "duration_ms": null,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "interval",
+          "models": [],
+          "name": "setup",
+          "own_cost_usd": 0.0,
+          "own_tokens_in": 0,
+          "own_tokens_out": 0,
+          "parent_id": null,
+          "phase": null,
+          "rollup": {
+            "cost_usd": 0.0,
+            "human_count": 0,
+            "models": [],
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "span_id": null,
+          "status": "success",
+          "summary": null,
+          "ts_end": "2026-06-11T12:00:00Z",
+          "ts_start": "2026-06-11T12:00:00Z"
+        },
+        {
+          "agent": "main",
+          "children": [
+            {
+              "agent": "main",
+              "children": [],
+              "duration_ms": 1500,
+              "human_count": 1,
+              "human_type": "question",
+              "human_wait_ms": 1500,
+              "kind": "step",
+              "models": [],
+              "name": "solo-cycle",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "parent_id": null,
+              "phase": "review",
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 1,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": "sc_review",
+              "status": "warn",
+              "summary": null,
+              "ts_end": "2026-06-11T12:00:11Z",
+              "ts_start": "2026-06-11T12:00:10Z"
+            }
+          ],
+          "duration_ms": null,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "interval",
+          "models": [],
+          "name": "review",
+          "own_cost_usd": 0.0,
+          "own_tokens_in": 0,
+          "own_tokens_out": 0,
+          "parent_id": null,
+          "phase": null,
+          "rollup": {
+            "cost_usd": 0.0,
+            "human_count": 1,
+            "models": [],
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "span_id": null,
+          "status": "warn",
+          "summary": null,
+          "ts_end": "2026-06-11T12:00:11Z",
+          "ts_start": "2026-06-11T12:00:05Z"
+        }
+      ],
+      "feature/d+2100": [
+        {
+          "agent": "main",
+          "children": [
+            {
+              "agent": "main",
+              "children": [],
+              "duration_ms": 500,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "step",
+              "models": [],
+              "name": "solo-cycle",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "parent_id": null,
+              "phase": "red",
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 0,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": "sd_red",
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-11T13:00:05Z",
+              "ts_start": "2026-06-11T13:00:05Z"
+            }
+          ],
+          "duration_ms": null,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "interval",
+          "models": [],
+          "name": "red",
+          "own_cost_usd": 0.0,
+          "own_tokens_in": 0,
+          "own_tokens_out": 0,
+          "parent_id": null,
+          "phase": null,
+          "rollup": {
+            "cost_usd": 0.0,
+            "human_count": 0,
+            "models": [],
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "span_id": null,
+          "status": "success",
+          "summary": null,
+          "ts_end": "2026-06-11T13:00:05Z",
+          "ts_start": "2026-06-11T13:00:00Z"
+        },
+        {
+          "agent": "main",
+          "children": [
+            {
+              "agent": "main",
+              "children": [],
+              "duration_ms": 800,
+              "human_count": 1,
+              "human_type": "approval",
+              "human_wait_ms": 3000,
+              "kind": "step",
+              "models": [],
+              "name": "solo-cycle",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "parent_id": null,
+              "phase": "green",
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 1,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": "sd_green",
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-11T13:00:00Z",
+              "ts_start": "2026-06-11T13:00:00Z"
+            }
+          ],
+          "duration_ms": null,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "interval",
+          "models": [],
+          "name": "setup",
+          "own_cost_usd": 0.0,
+          "own_tokens_in": 0,
+          "own_tokens_out": 0,
+          "parent_id": null,
+          "phase": null,
+          "rollup": {
+            "cost_usd": 0.0,
+            "human_count": 1,
+            "models": [],
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "span_id": null,
+          "status": "success",
+          "summary": null,
+          "ts_end": "2026-06-11T13:00:00Z",
+          "ts_start": "2026-06-11T13:00:00Z"
+        }
+      ]
+    },
+    "spoke_tree": {
+      "feature/a+1000": [
+        {
+          "children": [
+            {
+              "children": [
+                {
+                  "children": [],
+                  "cost_usd": null,
+                  "duration_ms": 100,
+                  "human_count": 0,
+                  "human_type": null,
+                  "human_wait_ms": null,
+                  "kind": "hook",
+                  "name": "red-proof-verify",
+                  "parent_id": "sa_red",
+                  "phase": null,
+                  "span_id": "sa_red_hook",
+                  "status": "success",
+                  "subtree": {
+                    "cost_usd": 0.0,
+                    "duration_ms": 100,
+                    "human_count": 0,
+                    "tokens_in": 0,
+                    "tokens_out": 0
+                  },
+                  "tokens_in": null,
+                  "tokens_out": null,
+                  "ts_start": "2026-06-10T12:00:01Z"
+                }
+              ],
+              "cost_usd": 0.02,
+              "duration_ms": 500,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "step",
+              "name": "solo-cycle",
+              "parent_id": "sa_root",
+              "phase": "red",
+              "span_id": "sa_red",
+              "status": "success",
+              "subtree": {
+                "cost_usd": 0.02,
+                "duration_ms": 600,
+                "human_count": 0,
+                "tokens_in": 50,
+                "tokens_out": 20
+              },
+              "tokens_in": 50,
+              "tokens_out": 20,
+              "ts_start": "2026-06-10T12:00:01Z"
+            },
+            {
+              "children": [
+                {
+                  "children": [],
+                  "cost_usd": null,
+                  "duration_ms": 200,
+                  "human_count": 0,
+                  "human_type": null,
+                  "human_wait_ms": null,
+                  "kind": "hook",
+                  "name": "commit-gauntlet",
+                  "parent_id": "sa_green",
+                  "phase": null,
+                  "span_id": "sa_green_hook",
+                  "status": "success",
+                  "subtree": {
+                    "cost_usd": 0.0,
+                    "duration_ms": 200,
+                    "human_count": 0,
+                    "tokens_in": 0,
+                    "tokens_out": 0
+                  },
+                  "tokens_in": null,
+                  "tokens_out": null,
+                  "ts_start": "2026-06-10T12:00:03Z"
+                },
+                {
+                  "children": [],
+                  "cost_usd": null,
+                  "duration_ms": 500,
+                  "human_count": 1,
+                  "human_type": "prompt",
+                  "human_wait_ms": 500,
+                  "kind": "hook",
+                  "name": "post-edit-format",
+                  "parent_id": "sa_green",
+                  "phase": null,
+                  "span_id": "sa_hook_human",
+                  "status": "success",
+                  "subtree": {
+                    "cost_usd": 0.0,
+                    "duration_ms": 500,
+                    "human_count": 1,
+                    "tokens_in": 0,
+                    "tokens_out": 0
+                  },
+                  "tokens_in": null,
+                  "tokens_out": null,
+                  "ts_start": "2026-06-10T12:00:04Z"
+                }
+              ],
+              "cost_usd": 0.1,
+              "duration_ms": 1000,
+              "human_count": 1,
+              "human_type": "approval",
+              "human_wait_ms": 4000,
+              "kind": "step",
+              "name": "solo-cycle",
+              "parent_id": "sa_root",
+              "phase": "green",
+              "span_id": "sa_green",
+              "status": "success",
+              "subtree": {
+                "cost_usd": 0.1,
+                "duration_ms": 1700,
+                "human_count": 2,
+                "tokens_in": 300,
+                "tokens_out": 150
+              },
+              "tokens_in": 300,
+              "tokens_out": 150,
+              "ts_start": "2026-06-10T12:00:03Z"
+            },
+            {
+              "children": [],
+              "cost_usd": 0.05,
+              "duration_ms": 700,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "step",
+              "name": "solo-cycle",
+              "parent_id": "sa_root",
+              "phase": "review",
+              "span_id": "sa_review",
+              "status": "success",
+              "subtree": {
+                "cost_usd": 0.05,
+                "duration_ms": 700,
+                "human_count": 0,
+                "tokens_in": 100,
+                "tokens_out": 40
+              },
+              "tokens_in": 100,
+              "tokens_out": 40,
+              "ts_start": "2026-06-10T12:00:10Z"
+            },
+            {
+              "children": [],
+              "cost_usd": null,
+              "duration_ms": 300,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "step",
+              "name": "solo-cycle",
+              "parent_id": "sa_root",
+              "phase": "push",
+              "span_id": "sa_push",
+              "status": "success",
+              "subtree": {
+                "cost_usd": 0.0,
+                "duration_ms": 300,
+                "human_count": 0,
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "tokens_in": null,
+              "tokens_out": null,
+              "ts_start": "2026-06-10T12:00:20Z"
+            }
+          ],
+          "cost_usd": null,
+          "duration_ms": 3000,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "lifecycle",
+          "name": "worktree-new",
+          "parent_id": null,
+          "phase": "spawn",
+          "span_id": "sa_root",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.17,
+            "duration_ms": 6300,
+            "human_count": 2,
+            "tokens_in": 450,
+            "tokens_out": 210
+          },
+          "tokens_in": null,
+          "tokens_out": null,
+          "ts_start": "2026-06-10T12:00:00Z"
+        }
+      ],
+      "feature/b+1100": [
+        {
+          "children": [],
+          "cost_usd": 0.3,
+          "duration_ms": 2000,
+          "human_count": 1,
+          "human_type": "approval",
+          "human_wait_ms": 6000,
+          "kind": "step",
+          "name": "solo-cycle",
+          "parent_id": null,
+          "phase": "green",
+          "span_id": "sb_green",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.3,
+            "duration_ms": 2000,
+            "human_count": 1,
+            "tokens_in": 500,
+            "tokens_out": 200
+          },
+          "tokens_in": 500,
+          "tokens_out": 200,
+          "ts_start": "2026-06-10T13:00:00Z"
+        },
+        {
+          "children": [],
+          "cost_usd": 0.02,
+          "duration_ms": 500,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "step",
+          "name": "solo-cycle",
+          "parent_id": null,
+          "phase": "red",
+          "span_id": "sb_red",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.02,
+            "duration_ms": 500,
+            "human_count": 0,
+            "tokens_in": 60,
+            "tokens_out": 25
+          },
+          "tokens_in": 60,
+          "tokens_out": 25,
+          "ts_start": "2026-06-10T13:00:05Z"
+        },
+        {
+          "children": [],
+          "cost_usd": 0.05,
+          "duration_ms": 800,
+          "human_count": 1,
+          "human_type": "question",
+          "human_wait_ms": 2000,
+          "kind": "step",
+          "name": "solo-cycle",
+          "parent_id": null,
+          "phase": "review",
+          "span_id": "sb_review",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.05,
+            "duration_ms": 800,
+            "human_count": 1,
+            "tokens_in": 120,
+            "tokens_out": 45
+          },
+          "tokens_in": 120,
+          "tokens_out": 45,
+          "ts_start": "2026-06-10T13:00:10Z"
+        }
+      ],
+      "feature/c+2000": [
+        {
+          "children": [],
+          "cost_usd": 0.05,
+          "duration_ms": 600,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "step",
+          "name": "solo-cycle",
+          "parent_id": null,
+          "phase": "green",
+          "span_id": "sc_green",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.05,
+            "duration_ms": 600,
+            "human_count": 0,
+            "tokens_in": 280,
+            "tokens_out": 120
+          },
+          "tokens_in": 280,
+          "tokens_out": 120,
+          "ts_start": "2026-06-11T12:00:00Z"
+        },
+        {
+          "children": [],
+          "cost_usd": 0.02,
+          "duration_ms": 500,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "step",
+          "name": "solo-cycle",
+          "parent_id": null,
+          "phase": "red",
+          "span_id": "sc_red",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.02,
+            "duration_ms": 500,
+            "human_count": 0,
+            "tokens_in": 55,
+            "tokens_out": 22
+          },
+          "tokens_in": 55,
+          "tokens_out": 22,
+          "ts_start": "2026-06-11T12:00:05Z"
+        },
+        {
+          "children": [],
+          "cost_usd": 0.05,
+          "duration_ms": 1500,
+          "human_count": 1,
+          "human_type": "question",
+          "human_wait_ms": 1500,
+          "kind": "step",
+          "name": "solo-cycle",
+          "parent_id": null,
+          "phase": "review",
+          "span_id": "sc_review",
+          "status": "warn",
+          "subtree": {
+            "cost_usd": 0.05,
+            "duration_ms": 1500,
+            "human_count": 1,
+            "tokens_in": 130,
+            "tokens_out": 50
+          },
+          "tokens_in": 130,
+          "tokens_out": 50,
+          "ts_start": "2026-06-11T12:00:10Z"
+        }
+      ],
+      "feature/d+2100": [
+        {
+          "children": [],
+          "cost_usd": 0.07,
+          "duration_ms": 800,
+          "human_count": 1,
+          "human_type": "approval",
+          "human_wait_ms": 3000,
+          "kind": "step",
+          "name": "solo-cycle",
+          "parent_id": null,
+          "phase": "green",
+          "span_id": "sd_green",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.07,
+            "duration_ms": 800,
+            "human_count": 1,
+            "tokens_in": 320,
+            "tokens_out": 140
+          },
+          "tokens_in": 320,
+          "tokens_out": 140,
+          "ts_start": "2026-06-11T13:00:00Z"
+        },
+        {
+          "children": [],
+          "cost_usd": 0.02,
+          "duration_ms": 500,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "step",
+          "name": "solo-cycle",
+          "parent_id": null,
+          "phase": "red",
+          "span_id": "sd_red",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.02,
+            "duration_ms": 500,
+            "human_count": 0,
+            "tokens_in": 58,
+            "tokens_out": 24
+          },
+          "tokens_in": 58,
+          "tokens_out": 24,
+          "ts_start": "2026-06-11T13:00:05Z"
+        }
+      ]
+    }
+  },
+  "v2": {
+    "spoke_meta_by_kind": {
+      "feature/v2+1000": [
+        {
+          "count": 1,
+          "kind": "agent",
+          "mean_cost_usd": 0.35,
+          "mean_duration_ms": 9000,
+          "median_duration_ms": 9000,
+          "models": [
+            "claude-haiku-4-5"
+          ],
+          "total_cost_usd": 0.35,
+          "total_duration_ms": 9000
+        },
+        {
+          "count": 4,
+          "kind": "todo",
+          "mean_cost_usd": 0.0,
+          "mean_duration_ms": 1000,
+          "median_duration_ms": 1000.0,
+          "models": [],
+          "total_cost_usd": 0.0,
+          "total_duration_ms": 4000
+        },
+        {
+          "count": 4,
+          "kind": "tool",
+          "mean_cost_usd": 0.0,
+          "mean_duration_ms": 7000,
+          "median_duration_ms": 6000.0,
+          "models": [],
+          "total_cost_usd": 0.0,
+          "total_duration_ms": 28000
+        },
+        {
+          "count": 3,
+          "kind": "hook",
+          "mean_cost_usd": 0.0,
+          "mean_duration_ms": 226.66666666666666,
+          "median_duration_ms": 100,
+          "models": [],
+          "total_cost_usd": 0.0,
+          "total_duration_ms": 680
+        },
+        {
+          "count": 2,
+          "kind": "lifecycle",
+          "mean_cost_usd": 0.0,
+          "mean_duration_ms": 2500,
+          "median_duration_ms": 2500.0,
+          "models": [],
+          "total_cost_usd": 0.0,
+          "total_duration_ms": 5000
+        },
+        {
+          "count": 2,
+          "kind": "step",
+          "mean_cost_usd": 0.0,
+          "mean_duration_ms": 55000,
+          "median_duration_ms": 55000.0,
+          "models": [],
+          "total_cost_usd": 0.0,
+          "total_duration_ms": 110000
+        },
+        {
+          "count": 1,
+          "kind": "human",
+          "mean_cost_usd": 0.0,
+          "mean_duration_ms": 15000,
+          "median_duration_ms": 15000,
+          "models": [],
+          "total_cost_usd": 0.0,
+          "total_duration_ms": 15000
+        },
+        {
+          "count": 1,
+          "kind": "skill",
+          "mean_cost_usd": 0.0,
+          "mean_duration_ms": 12000,
+          "median_duration_ms": 12000,
+          "models": [],
+          "total_cost_usd": 0.0,
+          "total_duration_ms": 12000
+        }
+      ]
+    },
+    "spoke_steps": {
+      "feature/v2+1000": [
+        {
+          "agent": "main",
+          "children": [
+            {
+              "agent": "main",
+              "children": [],
+              "duration_ms": 3000,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "lifecycle",
+              "models": [],
+              "name": "worktree-new",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "parent_id": null,
+              "phase": "spawn",
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 0,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": "v2_life_new",
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-12T12:00:03Z",
+              "ts_start": "2026-06-12T12:00:00Z"
+            },
+            {
+              "agent": "main",
+              "children": [],
+              "duration_ms": null,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "turn",
+              "model": "claude-opus-4-8",
+              "models": [
+                "claude-opus-4-8"
+              ],
+              "name": "turn",
+              "own_cost_usd": 0.01,
+              "own_tokens_in": 10,
+              "own_tokens_out": 5,
+              "parent_id": null,
+              "phase": null,
+              "rollup": {
+                "cost_usd": 0.01,
+                "human_count": 0,
+                "models": [
+                  "claude-opus-4-8"
+                ],
+                "tokens_in": 10,
+                "tokens_out": 5
+              },
+              "span_id": null,
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-12T12:00:01Z",
+              "ts_start": "2026-06-12T12:00:01Z"
+            },
+            {
+              "agent": "main",
+              "children": [],
+              "duration_ms": 50000,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "step",
+              "models": [],
+              "name": "solo-cycle",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "parent_id": null,
+              "phase": "red",
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 0,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": "v2_red",
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-12T12:00:55Z",
+              "ts_start": "2026-06-12T12:00:05Z"
+            },
+            {
+              "agent": "main",
+              "children": [
+                {
+                  "agent": "main",
+                  "children": [],
+                  "duration_ms": 100,
+                  "human_count": 0,
+                  "human_type": null,
+                  "human_wait_ms": null,
+                  "kind": "hook",
+                  "models": [],
+                  "name": "red-proof-verify",
+                  "own_cost_usd": 0.0,
+                  "own_tokens_in": 0,
+                  "own_tokens_out": 0,
+                  "parent_id": null,
+                  "phase": null,
+                  "rollup": {
+                    "cost_usd": 0.0,
+                    "human_count": 0,
+                    "models": [],
+                    "tokens_in": 0,
+                    "tokens_out": 0
+                  },
+                  "span_id": "v2_red_hook1",
+                  "status": "success",
+                  "summary": null,
+                  "ts_end": "2026-06-12T12:00:06Z",
+                  "ts_start": "2026-06-12T12:00:06Z"
+                },
+                {
+                  "agent": "main",
+                  "children": [],
+                  "duration_ms": 80,
+                  "human_count": 0,
+                  "human_type": null,
+                  "human_wait_ms": null,
+                  "kind": "hook",
+                  "models": [],
+                  "name": "secrets-scan",
+                  "own_cost_usd": 0.0,
+                  "own_tokens_in": 0,
+                  "own_tokens_out": 0,
+                  "parent_id": null,
+                  "phase": null,
+                  "rollup": {
+                    "cost_usd": 0.0,
+                    "human_count": 0,
+                    "models": [],
+                    "tokens_in": 0,
+                    "tokens_out": 0
+                  },
+                  "span_id": "v2_red_hook2",
+                  "status": "warn",
+                  "summary": null,
+                  "ts_end": "2026-06-12T12:00:07Z",
+                  "ts_start": "2026-06-12T12:00:07Z"
+                }
+              ],
+              "collapsed": true,
+              "collapsed_count": 2,
+              "duration_ms": 180,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "hooks",
+              "models": [],
+              "name": "hooks",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "phase": null,
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 0,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": null,
+              "status": "warn",
+              "ts_end": "2026-06-12T12:00:07Z",
+              "ts_start": "2026-06-12T12:00:06Z"
+            },
+            {
+              "agent": "main",
+              "children": [
+                {
+                  "agent": "subagent",
+                  "children": [
+                    {
+                      "agent": "subagent",
+                      "children": [
+                        {
+                          "agent": "main",
+                          "children": [],
+                          "duration_ms": 2000,
+                          "human_count": 0,
+                          "human_type": null,
+                          "human_wait_ms": null,
+                          "kind": "tool",
+                          "models": [],
+                          "name": "Read",
+                          "own_cost_usd": 0.0,
+                          "own_tokens_in": 0,
+                          "own_tokens_out": 0,
+                          "parent_id": "v2_agent",
+                          "phase": null,
+                          "rollup": {
+                            "cost_usd": 0.0,
+                            "human_count": 0,
+                            "models": [],
+                            "tokens_in": 0,
+                            "tokens_out": 0
+                          },
+                          "span_id": "v2_sub_read",
+                          "status": "success",
+                          "summary": "/repo/sub/code.py",
+                          "ts_end": "2026-06-12T12:00:13Z",
+                          "ts_start": "2026-06-12T12:00:11Z"
+                        }
+                      ],
+                      "duration_ms": null,
+                      "human_count": 0,
+                      "human_type": null,
+                      "human_wait_ms": null,
+                      "kind": "turn",
+                      "model": "claude-haiku-4-5",
+                      "models": [
+                        "claude-haiku-4-5"
+                      ],
+                      "name": "turn",
+                      "own_cost_usd": 0.2,
+                      "own_tokens_in": 200,
+                      "own_tokens_out": 100,
+                      "parent_id": null,
+                      "phase": null,
+                      "rollup": {
+                        "cost_usd": 0.2,
+                        "human_count": 0,
+                        "models": [
+                          "claude-haiku-4-5"
+                        ],
+                        "tokens_in": 200,
+                        "tokens_out": 100
+                      },
+                      "span_id": null,
+                      "status": "success",
+                      "summary": null,
+                      "ts_end": "2026-06-12T12:00:11Z",
+                      "ts_start": "2026-06-12T12:00:11Z"
+                    },
+                    {
+                      "agent": "subagent",
+                      "children": [
+                        {
+                          "agent": "main",
+                          "children": [],
+                          "duration_ms": 1000,
+                          "human_count": 0,
+                          "human_type": null,
+                          "human_wait_ms": null,
+                          "kind": "tool",
+                          "models": [],
+                          "name": "Grep",
+                          "own_cost_usd": 0.0,
+                          "own_tokens_in": 0,
+                          "own_tokens_out": 0,
+                          "parent_id": "v2_agent",
+                          "phase": null,
+                          "rollup": {
+                            "cost_usd": 0.0,
+                            "human_count": 0,
+                            "models": [],
+                            "tokens_in": 0,
+                            "tokens_out": 0
+                          },
+                          "span_id": "v2_sub_grep",
+                          "status": "success",
+                          "summary": "_build_intervals",
+                          "ts_end": "2026-06-12T12:00:16Z",
+                          "ts_start": "2026-06-12T12:00:15Z"
+                        }
+                      ],
+                      "duration_ms": null,
+                      "human_count": 0,
+                      "human_type": null,
+                      "human_wait_ms": null,
+                      "kind": "turn",
+                      "model": "claude-haiku-4-5",
+                      "models": [
+                        "claude-haiku-4-5"
+                      ],
+                      "name": "turn",
+                      "own_cost_usd": 0.15,
+                      "own_tokens_in": 150,
+                      "own_tokens_out": 80,
+                      "parent_id": null,
+                      "phase": null,
+                      "rollup": {
+                        "cost_usd": 0.15,
+                        "human_count": 0,
+                        "models": [
+                          "claude-haiku-4-5"
+                        ],
+                        "tokens_in": 150,
+                        "tokens_out": 80
+                      },
+                      "span_id": null,
+                      "status": "success",
+                      "summary": null,
+                      "ts_end": "2026-06-12T12:00:15Z",
+                      "ts_start": "2026-06-12T12:00:15Z"
+                    }
+                  ],
+                  "duration_ms": 9000,
+                  "human_count": 0,
+                  "human_type": null,
+                  "human_wait_ms": null,
+                  "kind": "agent",
+                  "models": [],
+                  "name": "tdd-red",
+                  "own_cost_usd": 0.0,
+                  "own_tokens_in": 0,
+                  "own_tokens_out": 0,
+                  "parent_id": null,
+                  "phase": null,
+                  "rollup": {
+                    "cost_usd": 0.35,
+                    "human_count": 0,
+                    "models": [
+                      "claude-haiku-4-5"
+                    ],
+                    "tokens_in": 350,
+                    "tokens_out": 180
+                  },
+                  "span_id": "v2_agent",
+                  "status": "success",
+                  "summary": "write the RED test",
+                  "ts_end": "2026-06-12T12:00:18Z",
+                  "ts_start": "2026-06-12T12:00:10Z"
+                },
+                {
+                  "agent": "main",
+                  "children": [],
+                  "duration_ms": 12000,
+                  "human_count": 0,
+                  "human_type": null,
+                  "human_wait_ms": null,
+                  "kind": "skill",
+                  "models": [],
+                  "name": "tdd-red",
+                  "own_cost_usd": 0.0,
+                  "own_tokens_in": 0,
+                  "own_tokens_out": 0,
+                  "parent_id": null,
+                  "phase": null,
+                  "rollup": {
+                    "cost_usd": 0.0,
+                    "human_count": 0,
+                    "models": [],
+                    "tokens_in": 0,
+                    "tokens_out": 0
+                  },
+                  "span_id": "v2_skill",
+                  "status": "success",
+                  "summary": null,
+                  "ts_end": "2026-06-12T12:00:20Z",
+                  "ts_start": "2026-06-12T12:00:10Z"
+                }
+              ],
+              "duration_ms": null,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "turn",
+              "model": "claude-opus-4-8",
+              "models": [
+                "claude-opus-4-8"
+              ],
+              "name": "turn",
+              "own_cost_usd": 0.05,
+              "own_tokens_in": 100,
+              "own_tokens_out": 40,
+              "parent_id": null,
+              "phase": null,
+              "rollup": {
+                "cost_usd": 0.39999999999999997,
+                "human_count": 0,
+                "models": [
+                  "claude-haiku-4-5",
+                  "claude-opus-4-8"
+                ],
+                "tokens_in": 450,
+                "tokens_out": 220
+              },
+              "span_id": null,
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-12T12:00:10Z",
+              "ts_start": "2026-06-12T12:00:10Z"
+            },
+            {
+              "agent": "main",
+              "children": [],
+              "duration_ms": null,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "turn",
+              "model": "claude-opus-4-8",
+              "models": [
+                "claude-opus-4-8"
+              ],
+              "name": "turn",
+              "own_cost_usd": 0.02,
+              "own_tokens_in": 30,
+              "own_tokens_out": 10,
+              "parent_id": null,
+              "phase": null,
+              "rollup": {
+                "cost_usd": 0.02,
+                "human_count": 0,
+                "models": [
+                  "claude-opus-4-8"
+                ],
+                "tokens_in": 30,
+                "tokens_out": 10
+              },
+              "span_id": null,
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-12T12:00:25Z",
+              "ts_start": "2026-06-12T12:00:25Z"
+            },
+            {
+              "agent": "main",
+              "children": [
+                {
+                  "agent": "main",
+                  "children": [],
+                  "duration_ms": 1000,
+                  "human_count": 0,
+                  "human_type": null,
+                  "human_wait_ms": null,
+                  "kind": "todo",
+                  "models": [],
+                  "name": "TodoWrite",
+                  "own_cost_usd": 0.0,
+                  "own_tokens_in": 0,
+                  "own_tokens_out": 0,
+                  "parent_id": null,
+                  "phase": null,
+                  "rollup": {
+                    "cost_usd": 0.0,
+                    "human_count": 0,
+                    "models": [],
+                    "tokens_in": 0,
+                    "tokens_out": 0
+                  },
+                  "span_id": "v2_todo",
+                  "status": "success",
+                  "summary": null,
+                  "ts_end": "2026-06-12T12:00:31Z",
+                  "ts_start": "2026-06-12T12:00:30Z"
+                }
+              ],
+              "duration_ms": null,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "turn",
+              "model": "claude-opus-4-8",
+              "models": [
+                "claude-opus-4-8"
+              ],
+              "name": "turn",
+              "own_cost_usd": 0.01,
+              "own_tokens_in": 20,
+              "own_tokens_out": 10,
+              "parent_id": null,
+              "phase": null,
+              "rollup": {
+                "cost_usd": 0.01,
+                "human_count": 0,
+                "models": [
+                  "claude-opus-4-8"
+                ],
+                "tokens_in": 20,
+                "tokens_out": 10
+              },
+              "span_id": null,
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-12T12:00:30Z",
+              "ts_start": "2026-06-12T12:00:30Z"
+            }
+          ],
+          "duration_ms": null,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "interval",
+          "models": [],
+          "name": "setup",
+          "own_cost_usd": 0.0,
+          "own_tokens_in": 0,
+          "own_tokens_out": 0,
+          "parent_id": null,
+          "phase": null,
+          "rollup": {
+            "cost_usd": 0.44,
+            "human_count": 0,
+            "models": [
+              "claude-haiku-4-5",
+              "claude-opus-4-8"
+            ],
+            "tokens_in": 510,
+            "tokens_out": 245
+          },
+          "span_id": null,
+          "status": "warn",
+          "summary": null,
+          "ts_end": "2026-06-12T12:00:55Z",
+          "ts_start": "2026-06-12T12:00:00Z"
+        },
+        {
+          "agent": "main",
+          "children": [
+            {
+              "agent": "main",
+              "children": [],
+              "duration_ms": 60000,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "step",
+              "models": [],
+              "name": "solo-cycle",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "parent_id": null,
+              "phase": "green",
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 0,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": "v2_green",
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-12T12:02:00Z",
+              "ts_start": "2026-06-12T12:01:00Z"
+            },
+            {
+              "agent": "main",
+              "children": [
+                {
+                  "agent": "main",
+                  "children": [
+                    {
+                      "agent": "main",
+                      "children": [
+                        {
+                          "agent": "main",
+                          "children": [],
+                          "duration_ms": 500,
+                          "human_count": 0,
+                          "human_type": null,
+                          "human_wait_ms": null,
+                          "kind": "hook",
+                          "models": [],
+                          "name": "format-check",
+                          "own_cost_usd": 0.0,
+                          "own_tokens_in": 0,
+                          "own_tokens_out": 0,
+                          "parent_id": null,
+                          "phase": null,
+                          "rollup": {
+                            "cost_usd": 0.0,
+                            "human_count": 0,
+                            "models": [],
+                            "tokens_in": 0,
+                            "tokens_out": 0
+                          },
+                          "span_id": "v2_bash_hook",
+                          "status": "success",
+                          "summary": null,
+                          "ts_end": "2026-06-12T12:01:09Z",
+                          "ts_start": "2026-06-12T12:01:08Z"
+                        }
+                      ],
+                      "collapsed": true,
+                      "collapsed_count": 1,
+                      "duration_ms": 500,
+                      "human_count": 0,
+                      "human_type": null,
+                      "human_wait_ms": null,
+                      "kind": "hooks",
+                      "models": [],
+                      "name": "hooks",
+                      "own_cost_usd": 0.0,
+                      "own_tokens_in": 0,
+                      "own_tokens_out": 0,
+                      "phase": null,
+                      "rollup": {
+                        "cost_usd": 0.0,
+                        "human_count": 0,
+                        "models": [],
+                        "tokens_in": 0,
+                        "tokens_out": 0
+                      },
+                      "span_id": null,
+                      "status": "success",
+                      "ts_end": "2026-06-12T12:01:09Z",
+                      "ts_start": "2026-06-12T12:01:08Z"
+                    }
+                  ],
+                  "duration_ms": 15000,
+                  "human_count": 0,
+                  "human_type": null,
+                  "human_wait_ms": null,
+                  "kind": "tool",
+                  "models": [],
+                  "name": "Bash",
+                  "own_cost_usd": 0.0,
+                  "own_tokens_in": 0,
+                  "own_tokens_out": 0,
+                  "parent_id": null,
+                  "phase": null,
+                  "rollup": {
+                    "cost_usd": 0.0,
+                    "human_count": 0,
+                    "models": [],
+                    "tokens_in": 0,
+                    "tokens_out": 0
+                  },
+                  "span_id": "v2_bash",
+                  "status": "success",
+                  "summary": "pytest -q",
+                  "ts_end": "2026-06-12T12:01:20Z",
+                  "ts_start": "2026-06-12T12:01:05Z"
+                },
+                {
+                  "agent": "main",
+                  "children": [],
+                  "duration_ms": 1000,
+                  "human_count": 0,
+                  "human_type": null,
+                  "human_wait_ms": null,
+                  "kind": "todo",
+                  "models": [],
+                  "name": "TaskCreate",
+                  "own_cost_usd": 0.0,
+                  "own_tokens_in": 0,
+                  "own_tokens_out": 0,
+                  "parent_id": null,
+                  "phase": null,
+                  "rollup": {
+                    "cost_usd": 0.0,
+                    "human_count": 0,
+                    "models": [],
+                    "tokens_in": 0,
+                    "tokens_out": 0
+                  },
+                  "span_id": "v2_task1",
+                  "status": "success",
+                  "summary": null,
+                  "ts_end": "2026-06-12T12:01:06Z",
+                  "ts_start": "2026-06-12T12:01:05Z"
+                },
+                {
+                  "agent": "main",
+                  "children": [],
+                  "duration_ms": 1000,
+                  "human_count": 0,
+                  "human_type": null,
+                  "human_wait_ms": null,
+                  "kind": "todo",
+                  "models": [],
+                  "name": "TaskCreate",
+                  "own_cost_usd": 0.0,
+                  "own_tokens_in": 0,
+                  "own_tokens_out": 0,
+                  "parent_id": null,
+                  "phase": null,
+                  "rollup": {
+                    "cost_usd": 0.0,
+                    "human_count": 0,
+                    "models": [],
+                    "tokens_in": 0,
+                    "tokens_out": 0
+                  },
+                  "span_id": "v2_task2",
+                  "status": "success",
+                  "summary": null,
+                  "ts_end": "2026-06-12T12:01:06Z",
+                  "ts_start": "2026-06-12T12:01:05Z"
+                },
+                {
+                  "agent": "main",
+                  "children": [],
+                  "duration_ms": 1000,
+                  "human_count": 0,
+                  "human_type": null,
+                  "human_wait_ms": null,
+                  "kind": "todo",
+                  "models": [],
+                  "name": "TaskCreate",
+                  "own_cost_usd": 0.0,
+                  "own_tokens_in": 0,
+                  "own_tokens_out": 0,
+                  "parent_id": null,
+                  "phase": null,
+                  "rollup": {
+                    "cost_usd": 0.0,
+                    "human_count": 0,
+                    "models": [],
+                    "tokens_in": 0,
+                    "tokens_out": 0
+                  },
+                  "span_id": "v2_task3",
+                  "status": "success",
+                  "summary": null,
+                  "ts_end": "2026-06-12T12:01:06Z",
+                  "ts_start": "2026-06-12T12:01:05Z"
+                }
+              ],
+              "duration_ms": null,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "turn",
+              "model": "claude-opus-4-8",
+              "models": [
+                "claude-opus-4-8"
+              ],
+              "name": "turn",
+              "own_cost_usd": 0.03,
+              "own_tokens_in": 60,
+              "own_tokens_out": 20,
+              "parent_id": null,
+              "phase": null,
+              "rollup": {
+                "cost_usd": 0.03,
+                "human_count": 0,
+                "models": [
+                  "claude-opus-4-8"
+                ],
+                "tokens_in": 60,
+                "tokens_out": 20
+              },
+              "span_id": null,
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-12T12:01:05Z",
+              "ts_start": "2026-06-12T12:01:05Z"
+            },
+            {
+              "agent": "main",
+              "children": [
+                {
+                  "agent": "main",
+                  "children": [],
+                  "duration_ms": 15000,
+                  "human_count": 1,
+                  "human_type": "approval",
+                  "human_wait_ms": 15000,
+                  "kind": "human",
+                  "models": [],
+                  "name": "AskUserQuestion",
+                  "own_cost_usd": 0.0,
+                  "own_tokens_in": 0,
+                  "own_tokens_out": 0,
+                  "parent_id": null,
+                  "phase": null,
+                  "rollup": {
+                    "cost_usd": 0.0,
+                    "human_count": 1,
+                    "models": [],
+                    "tokens_in": 0,
+                    "tokens_out": 0
+                  },
+                  "span_id": "v2_ask",
+                  "status": "success",
+                  "summary": "approve the plan?",
+                  "ts_end": "2026-06-12T12:01:50Z",
+                  "ts_start": "2026-06-12T12:01:35Z"
+                },
+                {
+                  "agent": "main",
+                  "children": [],
+                  "duration_ms": 10000,
+                  "human_count": 0,
+                  "human_type": null,
+                  "human_wait_ms": null,
+                  "kind": "tool",
+                  "models": [],
+                  "name": "Read",
+                  "own_cost_usd": 0.0,
+                  "own_tokens_in": 0,
+                  "own_tokens_out": 0,
+                  "parent_id": null,
+                  "phase": null,
+                  "rollup": {
+                    "cost_usd": 0.0,
+                    "human_count": 0,
+                    "models": [],
+                    "tokens_in": 0,
+                    "tokens_out": 0
+                  },
+                  "span_id": "v2_read",
+                  "status": "success",
+                  "summary": "/repo/app.py",
+                  "ts_end": "2026-06-12T12:01:45Z",
+                  "ts_start": "2026-06-12T12:01:35Z"
+                }
+              ],
+              "duration_ms": null,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "turn",
+              "model": "claude-sonnet-4-6",
+              "models": [
+                "claude-sonnet-4-6"
+              ],
+              "name": "turn",
+              "own_cost_usd": 0.02,
+              "own_tokens_in": 40,
+              "own_tokens_out": 15,
+              "parent_id": null,
+              "phase": null,
+              "rollup": {
+                "cost_usd": 0.02,
+                "human_count": 1,
+                "models": [
+                  "claude-sonnet-4-6"
+                ],
+                "tokens_in": 40,
+                "tokens_out": 15
+              },
+              "span_id": null,
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-12T12:01:35Z",
+              "ts_start": "2026-06-12T12:01:35Z"
+            }
+          ],
+          "duration_ms": null,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "interval",
+          "models": [],
+          "name": "green",
+          "own_cost_usd": 0.0,
+          "own_tokens_in": 0,
+          "own_tokens_out": 0,
+          "parent_id": null,
+          "phase": null,
+          "rollup": {
+            "cost_usd": 0.05,
+            "human_count": 1,
+            "models": [
+              "claude-opus-4-8",
+              "claude-sonnet-4-6"
+            ],
+            "tokens_in": 100,
+            "tokens_out": 35
+          },
+          "span_id": null,
+          "status": "success",
+          "summary": null,
+          "ts_end": "2026-06-12T12:02:00Z",
+          "ts_start": "2026-06-12T12:00:55Z"
+        },
+        {
+          "agent": "main",
+          "children": [
+            {
+              "agent": "main",
+              "children": [],
+              "duration_ms": null,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "turn",
+              "model": "claude-opus-4-8",
+              "models": [
+                "claude-opus-4-8"
+              ],
+              "name": "turn",
+              "own_cost_usd": 0.005,
+              "own_tokens_in": 5,
+              "own_tokens_out": 2,
+              "parent_id": null,
+              "phase": null,
+              "rollup": {
+                "cost_usd": 0.005,
+                "human_count": 0,
+                "models": [
+                  "claude-opus-4-8"
+                ],
+                "tokens_in": 5,
+                "tokens_out": 2
+              },
+              "span_id": null,
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-12T12:02:05Z",
+              "ts_start": "2026-06-12T12:02:05Z"
+            },
+            {
+              "agent": "main",
+              "children": [],
+              "duration_ms": 2000,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "lifecycle",
+              "models": [],
+              "name": "worktree-done",
+              "own_cost_usd": 0.0,
+              "own_tokens_in": 0,
+              "own_tokens_out": 0,
+              "parent_id": null,
+              "phase": "teardown",
+              "rollup": {
+                "cost_usd": 0.0,
+                "human_count": 0,
+                "models": [],
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "span_id": "v2_life_done",
+              "status": "success",
+              "summary": null,
+              "ts_end": "2026-06-12T12:02:12Z",
+              "ts_start": "2026-06-12T12:02:10Z"
+            }
+          ],
+          "duration_ms": null,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "interval",
+          "models": [],
+          "name": "teardown",
+          "own_cost_usd": 0.0,
+          "own_tokens_in": 0,
+          "own_tokens_out": 0,
+          "parent_id": null,
+          "phase": null,
+          "rollup": {
+            "cost_usd": 0.005,
+            "human_count": 0,
+            "models": [
+              "claude-opus-4-8"
+            ],
+            "tokens_in": 5,
+            "tokens_out": 2
+          },
+          "span_id": null,
+          "status": "success",
+          "summary": null,
+          "ts_end": "2026-06-12T12:02:12Z",
+          "ts_start": "2026-06-12T12:02:00Z"
+        }
+      ]
+    },
+    "spoke_tree": {
+      "feature/v2+1000": [
+        {
+          "children": [],
+          "cost_usd": null,
+          "duration_ms": 3000,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "lifecycle",
+          "name": "worktree-new",
+          "parent_id": null,
+          "phase": "spawn",
+          "span_id": "v2_life_new",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.0,
+            "duration_ms": 3000,
+            "human_count": 0,
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "tokens_in": null,
+          "tokens_out": null,
+          "ts_start": "2026-06-12T12:00:00Z"
+        },
+        {
+          "children": [],
+          "cost_usd": null,
+          "duration_ms": 50000,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "step",
+          "name": "solo-cycle",
+          "parent_id": null,
+          "phase": "red",
+          "span_id": "v2_red",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.0,
+            "duration_ms": 50000,
+            "human_count": 0,
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "tokens_in": null,
+          "tokens_out": null,
+          "ts_start": "2026-06-12T12:00:05Z"
+        },
+        {
+          "children": [],
+          "cost_usd": null,
+          "duration_ms": 100,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "hook",
+          "name": "red-proof-verify",
+          "parent_id": null,
+          "phase": null,
+          "span_id": "v2_red_hook1",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.0,
+            "duration_ms": 100,
+            "human_count": 0,
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "tokens_in": null,
+          "tokens_out": null,
+          "ts_start": "2026-06-12T12:00:06Z"
+        },
+        {
+          "children": [],
+          "cost_usd": null,
+          "duration_ms": 80,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "hook",
+          "name": "secrets-scan",
+          "parent_id": null,
+          "phase": null,
+          "span_id": "v2_red_hook2",
+          "status": "warn",
+          "subtree": {
+            "cost_usd": 0.0,
+            "duration_ms": 80,
+            "human_count": 0,
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "tokens_in": null,
+          "tokens_out": null,
+          "ts_start": "2026-06-12T12:00:07Z"
+        },
+        {
+          "children": [
+            {
+              "children": [],
+              "cost_usd": null,
+              "duration_ms": 2000,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "tool",
+              "name": "Read",
+              "parent_id": "v2_agent",
+              "phase": null,
+              "span_id": "v2_sub_read",
+              "status": "success",
+              "subtree": {
+                "cost_usd": 0.0,
+                "duration_ms": 2000,
+                "human_count": 0,
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "tokens_in": null,
+              "tokens_out": null,
+              "ts_start": "2026-06-12T12:00:11Z"
+            },
+            {
+              "children": [],
+              "cost_usd": null,
+              "duration_ms": 1000,
+              "human_count": 0,
+              "human_type": null,
+              "human_wait_ms": null,
+              "kind": "tool",
+              "name": "Grep",
+              "parent_id": "v2_agent",
+              "phase": null,
+              "span_id": "v2_sub_grep",
+              "status": "success",
+              "subtree": {
+                "cost_usd": 0.0,
+                "duration_ms": 1000,
+                "human_count": 0,
+                "tokens_in": 0,
+                "tokens_out": 0
+              },
+              "tokens_in": null,
+              "tokens_out": null,
+              "ts_start": "2026-06-12T12:00:15Z"
+            }
+          ],
+          "cost_usd": null,
+          "duration_ms": 9000,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "agent",
+          "name": "tdd-red",
+          "parent_id": null,
+          "phase": null,
+          "span_id": "v2_agent",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.0,
+            "duration_ms": 12000,
+            "human_count": 0,
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "tokens_in": null,
+          "tokens_out": null,
+          "ts_start": "2026-06-12T12:00:10Z"
+        },
+        {
+          "children": [],
+          "cost_usd": null,
+          "duration_ms": 12000,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "skill",
+          "name": "tdd-red",
+          "parent_id": null,
+          "phase": null,
+          "span_id": "v2_skill",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.0,
+            "duration_ms": 12000,
+            "human_count": 0,
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "tokens_in": null,
+          "tokens_out": null,
+          "ts_start": "2026-06-12T12:00:10Z"
+        },
+        {
+          "children": [],
+          "cost_usd": null,
+          "duration_ms": 1000,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "todo",
+          "name": "TodoWrite",
+          "parent_id": null,
+          "phase": null,
+          "span_id": "v2_todo",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.0,
+            "duration_ms": 1000,
+            "human_count": 0,
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "tokens_in": null,
+          "tokens_out": null,
+          "ts_start": "2026-06-12T12:00:30Z"
+        },
+        {
+          "children": [],
+          "cost_usd": null,
+          "duration_ms": 60000,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "step",
+          "name": "solo-cycle",
+          "parent_id": null,
+          "phase": "green",
+          "span_id": "v2_green",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.0,
+            "duration_ms": 60000,
+            "human_count": 0,
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "tokens_in": null,
+          "tokens_out": null,
+          "ts_start": "2026-06-12T12:01:00Z"
+        },
+        {
+          "children": [],
+          "cost_usd": null,
+          "duration_ms": 15000,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "tool",
+          "name": "Bash",
+          "parent_id": null,
+          "phase": null,
+          "span_id": "v2_bash",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.0,
+            "duration_ms": 15000,
+            "human_count": 0,
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "tokens_in": null,
+          "tokens_out": null,
+          "ts_start": "2026-06-12T12:01:05Z"
+        },
+        {
+          "children": [],
+          "cost_usd": null,
+          "duration_ms": 1000,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "todo",
+          "name": "TaskCreate",
+          "parent_id": null,
+          "phase": null,
+          "span_id": "v2_task1",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.0,
+            "duration_ms": 1000,
+            "human_count": 0,
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "tokens_in": null,
+          "tokens_out": null,
+          "ts_start": "2026-06-12T12:01:05Z"
+        },
+        {
+          "children": [],
+          "cost_usd": null,
+          "duration_ms": 1000,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "todo",
+          "name": "TaskCreate",
+          "parent_id": null,
+          "phase": null,
+          "span_id": "v2_task2",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.0,
+            "duration_ms": 1000,
+            "human_count": 0,
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "tokens_in": null,
+          "tokens_out": null,
+          "ts_start": "2026-06-12T12:01:05Z"
+        },
+        {
+          "children": [],
+          "cost_usd": null,
+          "duration_ms": 1000,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "todo",
+          "name": "TaskCreate",
+          "parent_id": null,
+          "phase": null,
+          "span_id": "v2_task3",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.0,
+            "duration_ms": 1000,
+            "human_count": 0,
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "tokens_in": null,
+          "tokens_out": null,
+          "ts_start": "2026-06-12T12:01:05Z"
+        },
+        {
+          "children": [],
+          "cost_usd": null,
+          "duration_ms": 500,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "hook",
+          "name": "format-check",
+          "parent_id": null,
+          "phase": null,
+          "span_id": "v2_bash_hook",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.0,
+            "duration_ms": 500,
+            "human_count": 0,
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "tokens_in": null,
+          "tokens_out": null,
+          "ts_start": "2026-06-12T12:01:08Z"
+        },
+        {
+          "children": [],
+          "cost_usd": null,
+          "duration_ms": 15000,
+          "human_count": 1,
+          "human_type": "approval",
+          "human_wait_ms": 15000,
+          "kind": "human",
+          "name": "AskUserQuestion",
+          "parent_id": null,
+          "phase": null,
+          "span_id": "v2_ask",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.0,
+            "duration_ms": 15000,
+            "human_count": 1,
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "tokens_in": null,
+          "tokens_out": null,
+          "ts_start": "2026-06-12T12:01:35Z"
+        },
+        {
+          "children": [],
+          "cost_usd": null,
+          "duration_ms": 10000,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "tool",
+          "name": "Read",
+          "parent_id": null,
+          "phase": null,
+          "span_id": "v2_read",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.0,
+            "duration_ms": 10000,
+            "human_count": 0,
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "tokens_in": null,
+          "tokens_out": null,
+          "ts_start": "2026-06-12T12:01:35Z"
+        },
+        {
+          "children": [],
+          "cost_usd": null,
+          "duration_ms": 2000,
+          "human_count": 0,
+          "human_type": null,
+          "human_wait_ms": null,
+          "kind": "lifecycle",
+          "name": "worktree-done",
+          "parent_id": null,
+          "phase": "teardown",
+          "span_id": "v2_life_done",
+          "status": "success",
+          "subtree": {
+            "cost_usd": 0.0,
+            "duration_ms": 2000,
+            "human_count": 0,
+            "tokens_in": 0,
+            "tokens_out": 0
+          },
+          "tokens_in": null,
+          "tokens_out": null,
+          "ts_start": "2026-06-12T12:02:10Z"
+        }
+      ]
+    }
+  }
+}

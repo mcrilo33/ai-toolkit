@@ -62,6 +62,9 @@ payload leakage, basename-only repo, opt-in no-op, invisibility).
   "status": "success",            // success|failure|deny|warn|skipped
   "human": null,                  // {type, wait_ms} when a human was waited on
   "summary": null,                // pull-only few-word node label (Issue #47); null on push
+  "emits": null,                  // \  v3 link fields (Issue #50): pull-only,
+  "sidecar_session": null,        //  } null on push — emission / sidecar / agent
+  "agent_link": null,             // /  links the parser fills (see below)
   "tokens_in": null,              // \
   "tokens_out": null,             //  } null at emit — filled by Issue B's
   "cost_usd": null                // /  token/cost correlation pass, not here
@@ -79,7 +82,7 @@ payload leakage, basename-only repo, opt-in no-op, invisibility).
 | `workflow_rev` | string \| null | ai-toolkit short SHA at emit time. Resolution order: `$AI_TOOLKIT_WORKFLOW_REV` → synced-target `.ai-toolkit-manifest.json` `toolkit_rev` → ai-toolkit checkout git SHA → `VERSION`. |
 | `repo` | string | Project-root **basename**. `unknown` if unresolved. |
 | `branch` | string \| null | Current git branch of the project root. |
-| `kind` | string | One of `lifecycle, step, hook, script, tool, skill, agent, todo, human, rule`. |
+| `kind` | string | One of `lifecycle, step, hook, script, tool, skill, agent, todo, human, rule` plus the v3 (Issue #50) `workflow, workflow_phase, approval`. |
 | `name` | string | The toolkit construct: `worktree-new`, `commit-gauntlet`, `solo-cycle`, `tdd-red`, … |
 | `phase` | string \| null | Sub-phase: `spawn, land, teardown` (lifecycle); `red, green, review, push` (step); else `null`. |
 | `ts_start` / `ts_end` | string | ISO-8601 UTC, second precision. |
@@ -87,6 +90,9 @@ payload leakage, basename-only repo, opt-in no-op, invisibility).
 | `status` | string | `success, failure, deny, warn, skipped`. |
 | `human` | object \| null | `{ "type": "prompt\|question\|approval", "wait_ms": <int> }` when a human interaction was timed; else `null`. |
 | `summary` | string \| null | **Additive, pull-only (Issue #47).** A few-word node label the parser derives for display: the todo a step advances, an agent's task `description`, a trimmed prompt/question snippet. `null` on push spans and whenever none resolves; `name` stays the stable grouping key. |
+| `emits` | string \| null | **Additive, pull-only (Issue #50).** On a `script` span, the `span_id` of the `step`/`lifecycle` marker it produced — the **emission** link (structural, not time-containment: a gate script emits a marker). `null` elsewhere. |
+| `sidecar_session` | string \| null | **Additive, pull-only (Issue #50).** On a `hook`/`script` span that shells out to a separate `claude -p` Claude session (e.g. an LLM-judge hook), that session's id — the **sidecar** link. The inline mirror of `agent_links`, keyed off this one span. `null` elsewhere. |
+| `agent_link` | string \| null | **Additive, pull-only (Issue #50).** On an `agent` span, its subagent `agentId`/session — the per-span half of the parser's `agent_links` map. Because every `agent` span at any depth carries its own, the links compose into a chain (agent→agent→…) for recursive workflows. `null` elsewhere. |
 | `tokens_in` / `tokens_out` / `cost_usd` | null | Always `null` at emit. Issue B's correlation pass fills these by joining on `session_id`. |
 
 ### `kind` values
@@ -99,6 +105,35 @@ payload leakage, basename-only repo, opt-in no-op, invisibility).
 | `script` | reserved for other instrumented scripts | — |
 | `tool` | — | one leaf per `tool_use` (Issue #47): `name` is the tool (`Bash`, `Edit`, `Read`, …), `summary` its main parameter (command / file path / pattern) |
 | `skill`, `agent`, `todo`, `human`, `rule` | — | reconstructed from CC session logs |
+| `workflow`, `workflow_phase` | — | a `Workflow` fan-out (Issue #50): `workflow` brackets the run, `workflow_phase` its phase groups. Cost lives on the `agent`/`turn` leaves; the containers own `$0`. `workflow_phase` is display-only at aggregate time. |
+| `approval` | — | a timed allow/ask/deny interaction (Issue #50). The automatability view's primary home; pairs with a `human` block (`{type, wait_ms}`). |
+
+## Synthetic nodes (display-only) — Issue #50
+
+The dashboard's spoke-trace tree mixes real spans with **synthetic nodes**: rows
+built at query time that are **never spans**. They carry no `span_id`, never enter
+the span log or the spans table, and never reach an aggregate/meta rollup. The
+contract — :data:`SYNTHETIC_KINDS`, the `SyntheticNode` TypedDict, and the
+`synthetic_node()` factory — lives in `scripts/telemetry/spans.py` alongside the
+span contract.
+
+| Synthetic kind | What it is |
+|----------------|-----------|
+| `interval` | a phase-interval bucket (the L1 spine row) |
+| `turn` | one assistant inference, owning its once-per-turn cost |
+| `hooks` | a collapsed `hooks ×N` group |
+| `reasoning` | an extended-thinking block |
+| `context` | a loaded-context item (rule / memory / tool-schema) |
+| `gap` | idle time, rendered as a divider |
+| `session` | a session-resume divider (cold cache) |
+| `scope-band` | a soft skill/rule `[scope]` band over the turns it influenced |
+| `unresolved` | turns/spans off the lifecycle spine, kept so totals reconcile |
+
+Each node carries `kind`, `name`, `summary`, `phase`, `status`, `ts_start`/`ts_end`,
+`duration_ms`, `own_cost_usd`, `own_tokens_in`/`own_tokens_out`, `models`, `actor`
+(the v3 `Actor` column — `main`, a sub-agent name, `workflow`, `script`, `hooks`,
+`sidecar`), `human_count`, and `children`. A container owns no metrics — its
+`turn`/`agent` leaves do — so a subtree rollup never double-counts.
 
 ## The three key mechanisms
 

@@ -65,3 +65,18 @@ def store_v2():
     queries = load_queries()
     turns = queries.load_jsonl(FIXTURE_V2_TURNS) if FIXTURE_V2_TURNS.exists() else None
     return queries.SpanStore.from_jsonl(FIXTURE_V2_SPANS, turns=turns)
+
+
+def store_from(spans_path, turns_path=None):
+    """A :class:`SpanStore` over an arbitrary span fixture (+ optional turns).
+
+    Used by the golden-spoke fixture tests (Issue #50). ``turns_path`` is loaded
+    when given and present; absent, the store degrades to no once-per-turn cost.
+    """
+    queries = load_queries()
+    turns = (
+        queries.load_jsonl(turns_path)
+        if turns_path is not None and Path(turns_path).exists()
+        else None
+    )
+    return queries.SpanStore.from_jsonl(spans_path, turns=turns)
