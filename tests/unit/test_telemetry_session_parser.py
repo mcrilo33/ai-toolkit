@@ -45,6 +45,10 @@ SCHEMA_KEYS = {
     "status",
     "human",
     "summary",
+    # v3 link fields (Issue #50) — additive, pull-only; null on push spans.
+    "emits",
+    "sidecar_session",
+    "agent_link",
     "tokens_in",
     "tokens_out",
     "cost_usd",
