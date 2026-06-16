@@ -271,6 +271,79 @@ def _render_meta(store: queries.SpanStore, spoke_id: str) -> None:
     )
 
 
+def _composition_totals(forest: list[dict]) -> dict[str, float]:
+    """Exact usage totals reconciled over the whole forest (each turn counted once).
+
+    Sums the additive root ``rollup`` so the total is the spoke's true usage —
+    main-agent turns (under interval buckets) included, unlike the per-kind meta
+    view which only sees span-bearing kinds.
+    """
+    cost = 0.0
+    tokens_in = 0
+    tokens_out = 0
+    for root in forest:
+        rollup = root.get("rollup") or {}
+        cost += rollup.get("cost_usd", 0.0)
+        tokens_in += rollup.get("tokens_in", 0)
+        tokens_out += rollup.get("tokens_out", 0)
+    return {"cost_usd": cost, "tokens_in": tokens_in, "tokens_out": tokens_out}
+
+
+def _render_composition(forest: list[dict]) -> None:
+    """The context-composition bar: exact usage totals + a modeled split (estimate).
+
+    The totals are exact (reconciled to the once-per-turn rollup); the
+    prefix/skills/memory/history split is modeled from artifact sizes and labelled an
+    estimate (scope doc: only in/out/cost totals are exact).
+    """
+    totals = _composition_totals(forest)
+    cols = st.columns(3)
+    cols[0].metric("Tokens in (exact)", f"{totals['tokens_in']:,}")
+    cols[1].metric("Tokens out (exact)", f"{totals['tokens_out']:,}")
+    cols[2].metric("Cost (exact)", _fmt_cost(totals["cost_usd"]))
+    st.caption(
+        "Usage totals are exact — reconciled to the run's once-per-turn rollup, so "
+        "they include the main-agent cost the per-kind view omits. The prefix / "
+        "skills / memory / history split is a modeled estimate from artifact sizes."
+    )
+
+
+def _subtree_tokens(node: dict) -> int:
+    """Total tokens consumed anywhere in ``node``'s subtree (the 'exercised' signal)."""
+    total = (node.get("own_tokens_in") or 0) + (node.get("own_tokens_out") or 0)
+    for child in node.get("children", []):
+        total += _subtree_tokens(child)
+    return total
+
+
+def _cold_context(forest: list[dict]) -> list[dict]:
+    """Loaded-context items never exercised: ``context`` nodes with zero subtree usage.
+
+    A rule / tool-schema / memory recall loaded but never used (no tokens consumed
+    under it) is a trimming / automation candidate.
+    """
+    cold: list[dict] = []
+
+    def _walk(nodes: list[dict]) -> None:
+        for node in nodes:
+            if node["kind"] == "context" and _subtree_tokens(node) == 0:
+                cold.append(node)
+            _walk(node.get("children", []))
+
+    _walk(forest)
+    return cold
+
+
+def _render_cold_context(forest: list[dict]) -> None:
+    cold = _cold_context(forest)
+    if not cold:
+        st.info("No cold (unexercised) context loaded.")
+        return
+    st.caption("Context loaded but never exercised — trimming / automation candidates.")
+    for node in cold:
+        st.markdown(f"• `{node['kind']}` {node['name']}")
+
+
 # Per-spoke built-forest cache, keyed on (spoke_id, log-mtime). Module-level so it
 # survives Streamlit reruns within a session; a fresh import (a new session) starts
 # empty. The forest is plain dicts, so a cached entry is reused by reference — a
@@ -304,10 +377,10 @@ def render_spoke_view(store: queries.SpanStore, log_mtime: float = 0.0) -> None:
         return
 
     spoke_id = st.selectbox("Spoke run", spoke_ids, format_func=queries.format_spoke_label)
-    steps_tab, meta_tab = st.tabs(["Steps", "Meta by kind"])
+    forest = _spoke_forest(store, spoke_id, log_mtime)
+    steps_tab, meta_tab, comp_tab = st.tabs(["Steps", "Meta by kind", "Composition"])
 
     with steps_tab:
-        forest = _spoke_forest(store, spoke_id, log_mtime)
         if not forest:
             st.info("No spans for this spoke run.")
         else:
@@ -318,6 +391,14 @@ def render_spoke_view(store: queries.SpanStore, log_mtime: float = 0.0) -> None:
 
     with meta_tab:
         _render_meta(store, spoke_id)
+
+    with comp_tab:
+        if not forest:
+            st.info("No spans for this spoke run.")
+        else:
+            _render_composition(forest)
+            st.subheader("Cold-context lens")
+            _render_cold_context(forest)
 
 
 def _step_label(row: dict[str, Any]) -> str:
