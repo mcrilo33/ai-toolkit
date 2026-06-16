@@ -50,7 +50,95 @@ def test_issue_from_spoke_run_id_none_for_unnumbered() -> None:
     assert queries._issue_from_spoke_run_id(None) is None
 
 
+# ── _is_real_spoke_repo: the defense-in-depth fixture-spoke filter (#55) ──────
+
+
+def test_is_real_spoke_repo_accepts_the_toolkit_checkout() -> None:
+    queries = load_queries()
+
+    assert queries._is_real_spoke_repo("ai-toolkit") is True
+    assert queries._is_real_spoke_repo("ai-toolkit-55") is True  # a worktree checkout
+
+
+def test_is_real_spoke_repo_rejects_sandbox_and_missing_repos() -> None:
+    queries = load_queries()
+
+    # The fixture-pollution hub basenames called out in #55, plus a missing repo.
+    for fake in ("hub-8", "proj", "proj-8", "spoke", "work", "test_gauntlet_x"):
+        assert queries._is_real_spoke_repo(fake) is False, fake
+    assert queries._is_real_spoke_repo(None) is False
+
+
+def test_is_real_spoke_repo_honours_an_explicit_prefix() -> None:
+    queries = load_queries()
+
+    assert queries._is_real_spoke_repo("proj", "proj") is True
+    assert queries._is_real_spoke_repo("ai-toolkit", "proj") is False
+
+
+# ── spoke_run_ids: an OPT-IN filter; the bare primitive stays unfiltered ──────
+
+
+def test_spoke_run_ids_unfiltered_by_default_keeps_fixture_runs() -> None:
+    store = store_v2()
+
+    ids = store.spoke_run_ids()
+
+    # The bare primitive is the shared seam — it lists EVERY run (other views and
+    # the parser-pinned telemetry fixture rely on this). No filtering by default.
+    assert "feature/v2+1000" in ids
+    assert "feature/99-pushguard+1000" in ids
+
+
+def test_spoke_run_ids_filters_fixture_runs_when_prefix_given() -> None:
+    queries = load_queries()
+    store = store_v2()
+
+    ids = store.spoke_run_ids(queries.REAL_REPO_PREFIX)
+
+    assert "feature/v2+1000" in ids
+    assert "feature/99-pushguard+1000" not in ids  # repo='hub-8' is not real
+
+
+def test_spoke_run_ids_keeps_run_with_a_mixed_real_and_unknown_repo() -> None:
+    queries = load_queries()
+    # A real run's session spans fall back to repo='unknown' (no cwd); only the
+    # push span carries 'ai-toolkit'. The filter must keep the run on ANY real span,
+    # not be fooled by a single representative repo.
+    spans = [
+        {
+            "span_id": "p",
+            "spoke_run_id": "feature/7-mix+1000",
+            "repo": "ai-toolkit",
+            "ts_start": "2026-01-01T00:00:00Z",
+            "ts_end": "2026-01-01T00:00:01Z",
+        },
+        {
+            "span_id": "s",
+            "spoke_run_id": "feature/7-mix+1000",
+            "repo": "unknown",
+            "ts_start": "2026-01-01T00:00:02Z",
+            "ts_end": "2026-01-01T00:00:03Z",
+        },
+    ]
+    store = queries.SpanStore.from_events(spans)
+
+    ids = store.spoke_run_ids(queries.REAL_REPO_PREFIX)
+
+    assert ids == ["feature/7-mix+1000"]
+
+
 # ── morning_rows: a per-run cost lens reusing spoke_run_summary ───────────────
+
+
+def test_morning_rows_excludes_fixture_repo_spokes() -> None:
+    store = store_v2()
+
+    rows = store.morning_rows()
+
+    run_ids = {row["spoke_run_id"] for row in rows}
+    assert "feature/v2+1000" in run_ids, "the real ai-toolkit spoke surfaces"
+    assert "feature/99-pushguard+1000" not in run_ids, "the hub-8 fixture spoke is filtered"
 
 
 def test_morning_rows_returns_a_row_per_spoke_run_with_cost() -> None:
@@ -74,7 +162,9 @@ def test_morning_rows_annotates_triage_verdict() -> None:
         scripts_dir=SCRIPTS_DIR,
     )
     try:
-        rows = store.morning_rows(triage={"22": "conflict"})
+        # The telemetry fixture's repo is pinned to 'proj' by the session-parser
+        # tests, so opt that prefix in to exercise triage annotation over it.
+        rows = store.morning_rows(triage={"22": "conflict"}, real_repo_prefix="proj")
     finally:
         store.close()
 
