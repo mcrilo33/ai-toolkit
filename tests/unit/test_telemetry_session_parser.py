@@ -28,6 +28,13 @@ PROJECT = FIXTURES / "-Users-demo-Repos-proj"
 SESSION = PROJECT / "11111111-1111-1111-1111-111111111111.jsonl"
 SESSION_ID = "11111111-1111-1111-1111-111111111111"
 
+# Issue #51 (track B) v3 scenarios live in their own session so the frozen #22/#47
+# token math on SESSION stays untouched. Its subagents/workflows/ holds a Workflow
+# fan-out (S1): two agents under one workflow ``wf_review01``.
+WF_SESSION = PROJECT / "22222222-2222-2222-2222-222222222222.jsonl"
+WF_SESSION_ID = "22222222-2222-2222-2222-222222222222"
+WF_AGENT_IDS = frozenset({"cccc3333dddd4444", "eeee5555ffff6666"})
+
 SCHEMA_KEYS = {
     "span_id",
     "parent_id",
@@ -527,6 +534,98 @@ class TestTaskLedgerResolution:
         assert update.summary == "Second task"
 
 
+@pytest.fixture()
+def wf_parsed() -> ParsedSession:
+    return parse_session_file(WF_SESSION)
+
+
+def _wf_agent(parsed: ParsedSession, agent_id: str) -> Span:
+    return next(
+        s
+        for s in parsed.spans
+        if s.kind == "agent" and parsed.agent_links.get(s.span_id) == agent_id
+    )
+
+
+class TestWorkflowAgentDiscovery:
+    """Issue #51 S1: Workflow fan-out agents live one level deeper than today's
+    ``subagents/agent-*.jsonl`` — at ``subagents/workflows/wf_*/agent-*.jsonl`` — so
+    they are discovered by walking that tree (no Task ``tool_use`` links them) and
+    bracketed by their own ``agent`` span. They no longer orphan to ``(unresolved)``.
+    """
+
+    def test_discovers_an_agent_span_per_workflow_agent(self, wf_parsed: ParsedSession) -> None:
+        wf_agents = [s for s in wf_parsed.spans if s.kind == "agent"]
+        assert {wf_parsed.agent_links[s.span_id] for s in wf_agents} == set(WF_AGENT_IDS)
+        assert len(wf_agents) == 2
+
+    def test_workflow_agent_name_is_its_agent_type(self, wf_parsed: ParsedSession) -> None:
+        # ``name`` stays the stable grouping key — the meta.json agentType, mirroring
+        # how a Task agent's name is its subagent_type.
+        assert _wf_agent(wf_parsed, "cccc3333dddd4444").name == "code-review"
+        assert _wf_agent(wf_parsed, "eeee5555ffff6666").name == "Explore"
+
+    def test_workflow_agent_summary_is_the_workflow_name(self, wf_parsed: ParsedSession) -> None:
+        # The few-word display label is the workflow's name (the "+ workflow name"
+        # half of the issue's "agentType + workflow name" label).
+        assert _wf_agent(wf_parsed, "cccc3333dddd4444").summary == "review-changes"
+        assert _wf_agent(wf_parsed, "eeee5555ffff6666").summary == "review-changes"
+
+    def test_window_brackets_transcript_first_and_last_ts(self, wf_parsed: ParsedSession) -> None:
+        agent = _wf_agent(wf_parsed, "cccc3333dddd4444")
+        assert agent.ts_start == "2026-06-14T12:01:10.000Z"
+        assert agent.ts_end == "2026-06-14T12:01:25.000Z"
+        assert agent.duration_ms == 15000
+
+    def test_agent_link_field_mirrors_the_links_map(self, wf_parsed: ParsedSession) -> None:
+        # Issue #50: every agent span carries its own ``agent_link`` (the per-span
+        # half of agent_links) so agent→agent recursion composes into a chain.
+        for span in (s for s in wf_parsed.spans if s.kind == "agent"):
+            assert span.agent_link == wf_parsed.agent_links.get(span.span_id)
+            assert span.agent_link in WF_AGENT_IDS
+
+    def test_links_registered_for_cost_attribution(self, wf_parsed: ParsedSession) -> None:
+        assert set(wf_parsed.agent_links.values()) == set(WF_AGENT_IDS)
+
+    def test_workflow_agent_usage_events_tagged_as_subagent(self, wf_parsed: ParsedSession) -> None:
+        events = [e for e in wf_parsed.usage_events if e.agent_id in WF_AGENT_IDS]
+        assert events
+        assert all(e.source == "subagent" for e in events)
+        # cccc transcript: 400+100 input, 200+50 output across two usage turns.
+        cccc = [e for e in events if e.agent_id == "cccc3333dddd4444"]
+        assert sum(e.input_tokens for e in cccc) == 500
+        assert sum(e.output_tokens for e in cccc) == 250
+
+    def test_span_rehomed_onto_the_spoke_session(self, wf_parsed: ParsedSession) -> None:
+        agent = _wf_agent(wf_parsed, "cccc3333dddd4444")
+        assert agent.session_id == WF_SESSION_ID
+        assert agent.repo == "proj"
+        assert agent.branch == "feature/51-demo"
+
+    def test_workflow_agent_child_tool_spans_nest_under_it(self, wf_parsed: ParsedSession) -> None:
+        agent = _wf_agent(wf_parsed, "cccc3333dddd4444")
+        children = [s for s in wf_parsed.spans if s.parent_id == agent.span_id]
+        grep = next(c for c in children if c.kind == "tool" and c.name == "Grep")
+        assert grep.summary == "_walk_workflow_agents"
+
+    def test_span_ids_are_idempotent(self) -> None:
+        a = {s.span_id for s in parse_session_file(WF_SESSION).spans if s.kind == "agent"}
+        b = {s.span_id for s in parse_session_file(WF_SESSION).spans if s.kind == "agent"}
+        assert a == b and len(a) == 2
+
+    def test_no_task_prompt_or_agent_work_leaks(self, wf_parsed: ParsedSession) -> None:
+        blob = "".join(str(s.to_dict()) for s in wf_parsed.spans)
+        for secret in SECRETS:
+            assert secret not in blob
+
+    def test_no_human_prompt_span_from_a_workflow_agent(self, wf_parsed: ParsedSession) -> None:
+        # The agent transcript's leading user record is the orchestrator's task
+        # prompt — never a human-prompt span (it would leak the prompt).
+        agent_span_ids = {s.span_id for s in wf_parsed.spans if s.kind == "agent"}
+        leaked = [s for s in wf_parsed.spans if s.kind == "human" and s.parent_id in agent_span_ids]
+        assert not leaked
+
+
 class TestProjectsDirWalk:
     def test_parse_projects_dir_finds_the_session_spans(self) -> None:
         merged = parse_projects_dir(FIXTURES)
@@ -534,7 +633,13 @@ class TestProjectsDirWalk:
         assert {"skill", "agent", "todo", "human"} <= kinds
 
     def test_parse_projects_dir_does_not_treat_subagent_file_as_a_session(self) -> None:
-        # The subagent transcript must be walked for tokens, never parsed as a
-        # top-level session (which would double-count and mis-kind its spans).
+        # Subagent transcripts (Task at subagents/agent-*.jsonl and workflow agents
+        # at subagents/workflows/wf_*/agent-*.jsonl) must be walked for tokens, never
+        # parsed as top-level sessions (which would double-count and mis-kind them).
+        # The project holds exactly three agents: one Task agent (#22 session) plus
+        # the two workflow agents (#51 session) — and no more.
         merged = parse_projects_dir(FIXTURES)
-        assert len(_by_kind(merged, "agent")) == 1
+        agents = _by_kind(merged, "agent")
+        assert len(agents) == 3
+        # Every agent span is linked for cost attribution; none is a stray re-parse.
+        assert all(merged.agent_links.get(a.span_id) for a in agents)

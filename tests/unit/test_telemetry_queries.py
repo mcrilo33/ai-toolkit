@@ -189,7 +189,13 @@ class TestTurns:
         assert n == 6
 
     def test_turns_carry_model(self, con) -> None:
-        models = set(_flat(con.execute("SELECT DISTINCT model FROM turns").fetchall()))
+        models = set(
+            _flat(
+                con.execute(
+                    "SELECT DISTINCT model FROM turns WHERE session_id = ?", [SESSION_ID]
+                ).fetchall()
+            )
+        )
         assert models == {"claude-opus-4-8"}
 
     def test_subagent_turns_carry_agent_id(self, con) -> None:

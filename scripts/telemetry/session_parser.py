@@ -93,6 +93,11 @@ def parse_session_file(path: Path) -> ParsedSession:
             _consume_tool_use(block, rec, results, meta, path, parsed, todo_summaries)
 
     parsed.spans.extend(_human_prompt_spans(records, meta))
+
+    events, spans, links = _walk_workflow_agents(path, parent_meta=meta)
+    parsed.usage_events.extend(events)
+    parsed.spans.extend(spans)
+    parsed.agent_links.update(links)
     return parsed
 
 
@@ -133,6 +138,9 @@ def _consume_tool_use(
         return
     agent_id = results.get(block.get("id") or "", {}).get("agent_id")
     if agent_id:
+        # The per-span half of agent_links (Issue #50): every agent span carries its
+        # own agentId so agent→agent recursion composes into a chain at any depth.
+        span.agent_link = agent_id
         parsed.agent_links[span.span_id] = agent_id
         events, sub_spans = _walk_subagent(
             path, agent_id, parent_meta=meta, agent_span_id=span.span_id
@@ -393,7 +401,27 @@ def _walk_subagent(
     sub = main_path.parent / main_path.stem / "subagents" / f"agent-{agent_id}.jsonl"
     if not sub.exists():
         return [], []
-    records = _load_jsonl(sub)
+    return _walk_transcript(
+        _load_jsonl(sub), agent_id, parent_meta=parent_meta, agent_span_id=agent_span_id
+    )
+
+
+def _walk_transcript(
+    records: list[dict],
+    agent_id: str,
+    *,
+    parent_meta: dict[str, str | None],
+    agent_span_id: str,
+) -> tuple[list[UsageEvent], list[Span]]:
+    """Walk one sub-agent transcript's records into usage events and step spans.
+
+    Shared by the Task-spawned walk (:func:`_walk_subagent`) and the workflow walk
+    (:func:`_walk_workflow_agents`). The leading user record is the orchestrator's
+    task prompt, so human-prompt spans are deliberately NOT emitted (that text stays
+    private). Each span is re-homed onto the spoke: ``session_id`` becomes the
+    parent's and ``parent_id`` the agent span; ``span_id`` stays derived from the
+    transcript, keeping ids idempotent and collision-free.
+    """
     meta = _session_meta(records)
     results = _tool_results(records)
     todo_summaries = _todo_summaries(records)
@@ -418,6 +446,102 @@ def _walk_subagent(
                 span.parent_id = agent_span_id
                 spans.append(span)
     return events, spans
+
+
+def _walk_workflow_agents(
+    main_path: Path, *, parent_meta: dict[str, str | None]
+) -> tuple[list[UsageEvent], list[Span], dict[str, str]]:
+    """Discover the agents of every ``Workflow`` fan-out under this session (Issue #51).
+
+    Workflow agents live one level deeper than Task sub-agents — at
+    ``<session>/subagents/workflows/wf_*/agent-<id>.jsonl`` — and no Task ``tool_use``
+    links them, so they are found by walking that tree. Each gets its own ``agent``
+    span (``name`` = the ``meta.json`` ``agentType``, ``summary`` = the workflow name,
+    window = the transcript's first/last timestamp), its ``agent_link`` registered for
+    cost attribution, and its ``tool_use`` blocks walked as nested spans — so its turns
+    no longer orphan to ``(unresolved)``.
+    """
+    root = main_path.parent / main_path.stem / "subagents" / "workflows"
+    if not root.is_dir():
+        return [], [], {}
+    events: list[UsageEvent] = []
+    spans: list[Span] = []
+    links: dict[str, str] = {}
+    for wf_dir in sorted(p for p in root.glob("wf_*") if p.is_dir()):
+        name, agent_types = _workflow_meta(wf_dir)
+        for agent_path in sorted(wf_dir.glob("agent-*.jsonl")):
+            agent_id = agent_path.stem[len("agent-") :]
+            records = _load_jsonl(agent_path)
+            span = _workflow_agent_span(
+                agent_id, agent_types.get(agent_id), name, records, parent_meta
+            )
+            links[span.span_id] = agent_id
+            spans.append(span)
+            sub_events, sub_spans = _walk_transcript(
+                records, agent_id, parent_meta=parent_meta, agent_span_id=span.span_id
+            )
+            events.extend(sub_events)
+            spans.extend(sub_spans)
+    return events, spans, links
+
+
+def _workflow_agent_span(
+    agent_id: str,
+    agent_type: str | None,
+    workflow_name: str | None,
+    records: list[dict],
+    parent_meta: dict[str, str | None],
+) -> Span:
+    """One ``agent`` span for a discovered workflow agent, bracketing its transcript.
+
+    The window is the transcript's first and last record timestamps; ``name`` is the
+    ``meta.json`` ``agentType`` (the stable grouping key) and ``summary`` the workflow
+    name (the few-word display label).
+    """
+    ts_start, ts_end = _transcript_window(records)
+    return Span(
+        span_id=derive_span_id(parent_meta["session_id"] or "", agent_id),
+        kind="agent",
+        name=agent_type or "agent",
+        summary=workflow_name,
+        session_id=parent_meta["session_id"],
+        repo=parent_meta["repo"] or "unknown",
+        branch=parent_meta["branch"],
+        ts_start=ts_start,
+        ts_end=ts_end,
+        duration_ms=_duration_ms(ts_start, ts_end),
+        agent_link=agent_id,
+    )
+
+
+def _workflow_meta(wf_dir: Path) -> tuple[str | None, dict[str, str]]:
+    """The workflow name and a per-agent ``agentType`` map from ``wf_*/meta.json``.
+
+    Degrades gracefully: a missing or malformed ``meta.json`` yields the directory
+    name as the workflow label and an empty agent-type map (agents fall back to the
+    bare ``agent`` name), so discovery never depends on the sidecar metadata.
+    """
+    meta_path = wf_dir / "meta.json"
+    if not meta_path.is_file():
+        return wf_dir.name, {}
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return wf_dir.name, {}
+    name = meta.get("name") if isinstance(meta, dict) else None
+    agents = meta.get("agents") if isinstance(meta, dict) else None
+    agent_types: dict[str, str] = {}
+    if isinstance(agents, dict):
+        for agent_id, info in agents.items():
+            if isinstance(info, dict) and isinstance(info.get("agentType"), str):
+                agent_types[agent_id] = info["agentType"]
+    return (name if isinstance(name, str) else wf_dir.name), agent_types
+
+
+def _transcript_window(records: list[dict]) -> tuple[str | None, str | None]:
+    """The first and last record timestamps in a transcript (its wall-clock window)."""
+    timestamps = sorted(ts for rec in records if (ts := rec.get("timestamp")))
+    return (timestamps[0], timestamps[-1]) if timestamps else (None, None)
 
 
 def _usage_event(rec: dict, source: str, agent_id: str | None) -> UsageEvent:
