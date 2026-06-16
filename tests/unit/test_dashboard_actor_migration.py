@@ -48,7 +48,19 @@ _FACTORY_KEYS = {
     "human_count",
     "children",
 }
-_ALLOWED_EXTRAS = {"model", "collapsed", "collapsed_count", "rollup", "subtree", "source_span_id"}
+_ALLOWED_EXTRAS = {
+    "model",
+    "collapsed",
+    "collapsed_count",
+    "rollup",
+    "subtree",
+    "source_span_id",
+    # Issue #59: a turn node carries its cache breakdown for the composition panel,
+    # and a session-resume divider carries its cold re-read magnitude (rollup-ignored).
+    "cache_read",
+    "cache_creation",
+    "resume_cache_creation",
+}
 
 
 def _walk(nodes: list[dict]):

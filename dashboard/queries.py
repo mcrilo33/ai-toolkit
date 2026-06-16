@@ -94,6 +94,10 @@ _TURN_COLUMNS: tuple[tuple[str, str], ...] = (
     ("tokens_in", "BIGINT"),
     ("tokens_out", "BIGINT"),
     ("tokens_total", "BIGINT"),
+    # Issue #59 budget panel: the per-turn cache breakdown — cheap reuse
+    # (``cache_read``) vs cold writes (``cache_creation``, the resume re-read).
+    ("cache_read", "BIGINT"),
+    ("cache_creation", "BIGINT"),
     ("cost_usd", "DOUBLE"),
     # Issue #59: the turn's privacy-safe reasoning gist, surfaced as a ``reasoning``
     # node and as a phase step's content-derived label when no todo summary resolves.
@@ -428,7 +432,10 @@ class SpanStore:
             "SELECT session_id, ts_start, ts_end FROM spans WHERE spoke_run_id = ?",
             [spoke_run_id],
         )
-        forest = forest + build_dividers(rows)
+        # Pass the spoke's turns so each session-resume divider carries the real
+        # per-resume cache_creation (the cold re-read), not a static note (Issue #59).
+        session_ids = sorted({row["session_id"] for row in rows if row["session_id"]})
+        forest = forest + build_dividers(rows, self._turns_for_sessions(session_ids))
         # Order by start; ``(unresolved)`` stays last by an explicit kind flag (not
         # just its null ts), and ``name`` is the final deterministic tiebreak.
         forest.sort(

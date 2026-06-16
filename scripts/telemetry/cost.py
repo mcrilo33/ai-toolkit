@@ -119,9 +119,11 @@ def per_turn_rows(
     each turn appears exactly once here, so the rows sum to the ccusage session
     total with no double-count. Cost reuses the same blended session rate
     (ccusage total ÷ session tokens); a session absent from ``ccusage_costs``
-    gets ``cost_usd`` None (tokens still counted). When ``reasoning_refs`` are given,
-    each turn's row carries the turn's reasoning ``summary`` gist (matched on
-    session/source/agent/ts) so the tree can render a ``reasoning`` node.
+    gets ``cost_usd`` None (tokens still counted). Each row also carries the turn's
+    ``cache_read`` / ``cache_creation`` breakdown (the budget panel frames cheap reuse
+    against cold writes). When ``reasoning_refs`` are given, each row carries the turn's
+    reasoning ``summary`` gist (matched on session/source/agent/ts) so the tree can
+    render a ``reasoning`` node.
 
     Args:
         usage_events: Per-turn usage from the parsed sessions (main + subagent).
@@ -130,7 +132,7 @@ def per_turn_rows(
 
     Returns:
         One dict per turn: ``session_id, ts, model, source, agent_id, tokens_in,
-        tokens_out, tokens_total, cost_usd, reasoning``.
+        tokens_out, tokens_total, cache_read, cache_creation, cost_usd, reasoning``.
     """
     rate = _session_rates(usage_events, ccusage_costs)
     gists = _reasoning_by_turn(reasoning_refs or [])
@@ -148,6 +150,8 @@ def per_turn_rows(
                 "tokens_in": event.input_tokens,
                 "tokens_out": event.output_tokens,
                 "tokens_total": total,
+                "cache_read": event.cache_read,
+                "cache_creation": event.cache_creation,
                 "cost_usd": session_rate * total if session_rate is not None else None,
                 "reasoning": gists.get(
                     _turn_key(event.session_id, event.source, event.agent_id, event.ts)

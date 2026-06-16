@@ -496,15 +496,18 @@ def _synthesize_no_marker(
     return out
 
 
-def build_dividers(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def build_dividers(
+    rows: list[dict[str, Any]], turns: list[dict[str, Any]] | None = None
+) -> list[dict[str, Any]]:
     """Synthesize the root-level ``session`` and ``gap`` divider rows for a spoke.
 
     A spoke that spans more than one ``session_id`` gets a ``session`` divider at each
-    resume (carrying the cold-cache note — a resume re-reads the prompt cache), and a
-    stretch of idle longer than :data:`_IDLE_GAP_SECONDS` between consecutive activity
-    renders as a ``gap`` divider (Issue #52: idle is a divider, not dead phase time).
-    Built from the raw span ``rows`` (which carry ``session_id``); the dividers are
-    merged into the bucket forest as roots and sort by ``ts_start`` like any row.
+    resume, carrying the **real** cold-cache magnitude — the ``cache_creation`` of that
+    session's first turn, the prompt re-read paid on resume (Issue #59). A stretch of
+    idle longer than :data:`_IDLE_GAP_SECONDS` renders as a ``gap`` divider (Issue #52:
+    idle is a divider, not dead phase time). Built from the raw span ``rows`` (which
+    carry ``session_id``) plus the per-turn ``turns`` (which carry ``cache_creation``);
+    the dividers merge into the bucket forest as roots and sort by ``ts_start``.
     """
     timed: list[tuple[dict[str, Any], float]] = []
     for row in rows:
@@ -514,13 +517,14 @@ def build_dividers(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     timed.sort(key=lambda pair: pair[1])
     dividers: list[dict[str, Any]] = []
 
+    resume_cache = _resume_cache_creation(turns or [])
     first_seen: dict[str, str] = {}
     for row, _ in timed:
         sid = row.get("session_id")
         if sid and sid not in first_seen:
             first_seen[sid] = row["ts_start"]
-    for iso in list(first_seen.values())[1:]:
-        dividers.append(_session_divider(iso))
+    for sid, iso in list(first_seen.items())[1:]:
+        dividers.append(_session_divider(iso, resume_cache.get(sid, 0)))
 
     end_ts: float | None = None
     end_iso: str | None = None
@@ -533,18 +537,44 @@ def build_dividers(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return dividers
 
 
-def _session_divider(iso: str) -> dict[str, Any]:
-    # UPGRADE: surface the real re-read magnitude once the turns schema carries
-    # cache_creation tokens; today the note is static (no per-resume signal).
-    return dict(
+def _resume_cache_creation(turns: list[dict[str, Any]]) -> dict[str, int]:
+    """Each session's first-turn ``cache_creation`` — the cold re-read paid on resume."""
+    earliest: dict[str, tuple[float, int]] = {}
+    for turn in turns:
+        sid = turn.get("session_id")
+        ts = _parse_ts(turn.get("ts"))
+        if not sid or ts is None:
+            continue
+        prior = earliest.get(sid)
+        if prior is None or ts < prior[0]:
+            earliest[sid] = (ts, int(turn.get("cache_creation") or 0))
+    return {sid: cache for sid, (_, cache) in earliest.items()}
+
+
+def _session_divider(iso: str, cache_creation: int) -> dict[str, Any]:
+    """A session-resume divider carrying the real cold-cache (``cache_creation``) re-read.
+
+    The magnitude rides on a dedicated ``resume_cache_creation`` key — NOT
+    ``own_tokens_in`` — so it never folds into the once-per-turn ``rollup`` (cache
+    creation is disjoint from ``input_tokens``, and the synthetic-node contract keeps
+    display nodes out of every rollup). The divider stays a zero-owned display row.
+    """
+    note = (
+        f"cold cache — {cache_creation:,} cache_creation tokens re-read on resume"
+        if cache_creation
+        else "cold cache (cache_creation) — prompt re-read on resume"
+    )
+    node = dict(
         synthetic_node(
             kind="session",
             name="session resume",
-            summary="cold cache (cache_creation) — prompt re-read on resume",
+            summary=note,
             ts_start=iso,
             ts_end=iso,
         )
     )
+    node["resume_cache_creation"] = cache_creation
+    return node
 
 
 def _gap_divider(lo_iso: str | None, hi_iso: str, duration_ms: float) -> dict[str, Any]:
@@ -903,6 +933,10 @@ def _turn_node(turn: dict[str, Any]) -> dict[str, Any]:
         )
     )
     node["model"] = turn.get("model")
+    # The per-turn cache breakdown (Issue #59) rides on the node so the composition
+    # panel can frame cheap reuse (cache_read) against cold writes (cache_creation).
+    node["cache_read"] = turn.get("cache_read") or 0
+    node["cache_creation"] = turn.get("cache_creation") or 0
     return node
 
 

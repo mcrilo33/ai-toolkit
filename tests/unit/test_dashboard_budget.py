@@ -57,7 +57,10 @@ def test_session_divider_carries_real_cache_creation() -> None:
     sessions = [d for d in dividers if d["kind"] == "session"]
 
     assert len(sessions) == 1
-    assert sessions[0]["own_tokens_in"] == 4096  # the real cold re-read, not static
+    assert sessions[0]["resume_cache_creation"] == 4096  # the real cold re-read, not static
+    # The magnitude must NOT ride on own_tokens_in — that would fold into the
+    # once-per-turn rollup and inflate the "Tokens in (exact)" composition metric.
+    assert sessions[0]["own_tokens_in"] == 0
 
 
 def test_session_divider_summary_reflects_the_real_number() -> None:
@@ -67,6 +70,25 @@ def test_session_divider_summary_reflects_the_real_number() -> None:
     sessions = [d for d in tree.build_dividers(rows, turns) if d["kind"] == "session"]
 
     assert "4,096" in (sessions[0]["summary"] or "")
+
+
+def test_resume_cache_does_not_leak_into_exact_tokens_in(monkeypatch) -> None:
+    # Conservation: the resume divider's cache_creation must NOT inflate the panel's
+    # "Tokens in (exact)" metric — cache_creation is disjoint from input_tokens, and
+    # synthetic display nodes never enter the once-per-turn rollup.
+    monkeypatch.setitem(sys.modules, "streamlit", MagicMock())
+    monkeypatch.setitem(sys.modules, "queries", load_queries())
+    app = load_app()
+
+    divider = tree._session_divider("2026-06-13T10:00:00Z", 4096)
+    tree._roll_up_steps(divider)  # the post-order pass spoke_steps applies to every root
+    turn = _node("turn", "turn", own_tokens_in=10, own_tokens_out=5)
+    interval = _node("interval", "S1", children=[turn])
+    tree._roll_up_steps(interval)
+
+    totals = app._composition_totals([interval, divider])
+
+    assert totals["tokens_in"] == 10  # only the turn's input tokens, not the 4096 cache
 
 
 def test_turn_node_carries_cache_breakdown() -> None:

@@ -217,7 +217,10 @@ def test_session_node_renders_resume_divider_with_cold_cache_note(monkeypatch):
     st, rec = _recording_streamlit()
     app = _app(monkeypatch, st)
 
-    sess = synthetic_node(kind="session", name="session resume", own_tokens_in=1200)
+    # The cold-cache magnitude rides on resume_cache_creation (Issue #59) — never
+    # own_tokens_in, which would fold into the exact once-per-turn rollup.
+    sess = dict(synthetic_node(kind="session", name="session resume"))
+    sess["resume_cache_creation"] = 1200
     app._render_spine([sess])
 
     blob = " ".join(rec.texts)

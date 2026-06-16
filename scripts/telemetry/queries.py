@@ -76,6 +76,8 @@ _TURN_COLUMNS = (
     "tokens_in BIGINT",
     "tokens_out BIGINT",
     "tokens_total BIGINT",
+    "cache_read BIGINT",
+    "cache_creation BIGINT",
     "cost_usd DOUBLE",
     "reasoning VARCHAR",
 )
