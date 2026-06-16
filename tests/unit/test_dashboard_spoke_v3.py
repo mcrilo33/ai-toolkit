@@ -74,6 +74,7 @@ def _recording_streamlit(checkbox_returns: dict[str, bool] | bool | None = None)
     st.expander.side_effect = lambda *_a, **_kw: _ctx_mock()
     st.selectbox.side_effect = lambda _label, options, **_kw: options[0]
     st.checkbox.side_effect = _checkbox
+    st.toggle.side_effect = _checkbox
     return st, rec
 
 
@@ -236,27 +237,45 @@ def test_badges_render_in_node_label(monkeypatch):
 # ── xN drill ──────────────────────────────────────────────────────────────────
 
 
-def test_collapsed_group_renders_times_n_label(monkeypatch):
-    st, rec = _recording_streamlit()
+def test_drill_uses_toggle_not_nested_expander(monkeypatch):
+    # Regression (visual gate): a checkbox inside an st.expander never reveals its
+    # members because the expander re-collapses on the rerun. The drill must be a
+    # uniform toggle with NO expander, so the same lazy GUI works at every depth.
+    st, rec = _recording_streamlit(checkbox_returns=False)
+    app = _app(monkeypatch, st)
+
+    step = _node(
+        "interval", "S1", ts_start="2026-06-12T12:00:00Z", children=[_node("tool", "Read /f0")]
+    )
+    app._render_spine([step])
+
+    st.expander.assert_not_called()  # no nested-expander re-collapse trap
+    st.toggle.assert_called()  # uniform drill control
+    assert not any("/f0" in t for t in rec.texts)  # lazy: hidden until drilled
+
+
+def test_drill_reveals_nested_members_when_open(monkeypatch):
+    st, rec = _recording_streamlit(checkbox_returns=True)  # every drill open
+    app = _app(monkeypatch, st)
+
+    members = [_node("tool", f"Read /f{i}") for i in range(3)]
+    group = _node("hooks", "hooks", collapsed=True, collapsed_count=3, children=members)
+    step = _node("interval", "S1", ts_start="2026-06-12T12:00:00Z", children=[group])
+    app._render_spine([step])
+
+    assert any("hooks x3" in t for t in rec.texts)  # group shows when the step is drilled
+    assert any("/f0" in t for t in rec.texts)  # nested members reveal (the bug)
+    assert any("/f2" in t for t in rec.texts)
+
+
+def test_non_hooks_collapsed_group_gets_times_n_label(monkeypatch):
+    st, rec = _recording_streamlit(checkbox_returns=True)
     app = _app(monkeypatch, st)
 
     # A non-hooks collapsed group (e.g. parallel agents) must also get an xN label,
     # which the v2 format_step_label only produces for hooks.
     members = [_node("agent", f"worker-{i}") for i in range(3)]
     group = _node("agent", "agents", collapsed=True, collapsed_count=3, children=members)
-    app._render_step(_node("interval", "S1", children=[group]))
+    app._render_spine([_node("interval", "S1", ts_start="2026-06-12T12:00:00Z", children=[group])])
 
     assert any("agent x3" in t for t in rec.texts)
-    assert not any("worker-0" in t for t in rec.texts)  # members hidden until drilled
-
-
-def test_collapsed_group_drill_reveals_members_when_toggled(monkeypatch):
-    st, rec = _recording_streamlit(checkbox_returns=True)
-    app = _app(monkeypatch, st)
-
-    members = [_node("tool", f"Read /f{i}") for i in range(3)]
-    group = _node("hooks", "hooks", collapsed=True, collapsed_count=3, children=members)
-    app._render_step(_node("interval", "S1", children=[group]))
-
-    assert any("/f0" in t for t in rec.texts)
-    assert any("/f2" in t for t in rec.texts)
