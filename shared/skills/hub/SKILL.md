@@ -76,19 +76,19 @@ loop (`/loop 2m bash .ai-toolkit/scripts/hub-ready-watch.sh`). It is detection o
 - Offline-safe: a finished spoke's tag is locally visible (shared ref store), so a failed
   fetch is non-fatal and local markers still surface.
 
-### Pre-flight batching scout (night mode, optional)
+### Pre-flight batching scout (AFK mode, optional)
 
-Parallel night spokes are blind to each other, so before launching the dispatcher,
-run the **scout** at setup (while you are awake) to avoid collisions:
+Parallel AFK spokes are blind to each other, so before launching the dispatcher,
+run the **scout** at setup (while you are still at the keyboard) to avoid collisions:
 
 ```bash
 bash .ai-toolkit/scripts/hub-scout.sh
 ```
 
-It prints a dossier of facts — each `night` issue's file-scope hints (from its
+It prints a dossier of facts — each `afk` issue's file-scope hints (from its
 `Scope:` line, see `start-task`), the raw file overlap between issues, and a
-critical-path feasibility check (does an all-parallel / all-serial makespan fit
-before `NIGHT_END`?). Then, reading that dossier, classify each overlapping pair and
+critical-path feasibility check (does an all-parallel / all-serial makespan fit the
+away window?). Then, reading that dossier, classify each overlapping pair and
 stamp the verdict into the issues as body lines (an Opus scout agent does this; you
 **approve** the plan before any spoke starts):
 
@@ -103,39 +103,43 @@ stamp the verdict into the issues as body lines (an Opus scout agent does this; 
 The scout only reports facts and the agent only classifies — the mechanical overlap
 and feasibility math stay in the script (`#43`: don't let the LLM narrate mechanical
 work). The supervisor then honors `Serial-after:` / `Merge-into:` from the issue
-bodies; an over-committed night ("these 4 serialize → won't fit before 07:00") is
-caught here, at setup, not wasted overnight.
+bodies; an over-committed window ("these 4 serialize → won't fit before you're back")
+is caught here, at setup, not wasted while you're away.
 
-### Overnight queue dispatcher (optional)
+### AFK queue dispatcher (optional)
 
-To drain a queue of pre-scoped issues overnight without supervision, run the night
-dispatcher on the hub before bed:
+To drain a queue of pre-scoped issues unsupervised while you're away, run the AFK
+dispatcher on the hub before you step away, telling it how long you'll be gone:
 
 ```bash
-bash .ai-toolkit/scripts/hub-night.sh
+AFK_FOR=8h bash .ai-toolkit/scripts/hub-afk.sh
 ```
 
-It reads the `night`-labelled open issues (`gh issue list --label night`) and dispatches
+It reads the `afk`-labelled open issues (`gh issue list --label afk`) and dispatches
 each via `worktree-new.sh`, recomputing an adaptive concurrency target every tick —
-`clamp(ceil(tasks_left × T_task / time_left), 1, NIGHT_MAX_CONCURRENCY)` — so a short queue
-runs sequentially and a long one ramps up to the cap as wake time approaches. It never
-starts a spoke once less than `T_task` of the night remains, reuses a freed slot when a
-spoke finishes (`ready/N`) or goes idle, and is idempotent — re-running skips branches
-already in flight. Knobs (env, defaults): `NIGHT_END=07:00`, `NIGHT_MAX_CONCURRENCY=3`,
-`NIGHT_TASK_MINUTES=90`. Use `--once` for a single tick (e.g. under cron). It dispatches
+`clamp(ceil(tasks_left × T_task / time_left), 1, AFK_MAX_CONCURRENCY)` — so a short queue
+runs sequentially and a long one ramps up to the cap as the deadline approaches. The
+away window is a **duration** (`AFK_FOR=8h` / `480m` / `480`), pinned to a fixed
+deadline on the first launch and persisted, so re-running mid-window resumes the same
+deadline rather than sliding it forward; an absolute end time (`AFK_UNTIL=07:00`) is
+the fallback when no duration is given. It never starts a spoke once less than `T_task`
+of the window remains, reuses a freed slot when a spoke finishes (`ready/N`) or goes
+idle, and is idempotent — re-running skips branches already in flight. Knobs (env,
+defaults): `AFK_FOR` (unset), `AFK_UNTIL=07:00`, `AFK_MAX_CONCURRENCY=3`,
+`AFK_TASK_MINUTES=90`. Use `--once` for a single tick (e.g. under cron). It dispatches
 only — the hub still lands finished spokes on `/land`. The dispatcher also enforces a
-per-spoke wall-clock ceiling (`NIGHT_SPOKE_MAX_MINUTES`, default 180): a hung, idle, or
+per-spoke wall-clock ceiling (`AFK_SPOKE_MAX_MINUTES`, default 180): a hung, idle, or
 runaway spoke is reaped (its window killed and a `blocked/N` emitted on its behalf) so
-the unattended night never runs unbounded. At end of night it pre-computes the
-land-triage for the morning report.
+the unattended run never goes unbounded. At end of the window it pre-computes the
+land-triage for the return report.
 
-### Morning report (night mode)
+### Return report (AFK mode)
 
-On waking, run the morning report on the hub to turn the drained queue into a worklist
-sorted fastest → slowest human effort:
+When you're back, run the return report on the hub to turn the drained queue into a
+worklist sorted fastest → slowest human effort:
 
 ```bash
-bash .ai-toolkit/scripts/hub-morning.sh
+bash .ai-toolkit/scripts/hub-return.sh
 ```
 
 It reads the terminal markers and tiers them — **LAND** (`ready/N`, merges clean,
@@ -145,12 +149,12 @@ re-queue), **CONFLICTS** (`ready/N` whose throwaway merge hit a conflict → han
 — with each row's diff size, trust summary (the marker's annotated-tag body), per-spoke
 cost (reused from the #35 dashboard's pull layer), and the exact next command. A `gate/N`
 still parked at the PLAN gate shows in a footer. The land-triage that decides LAND vs
-CONFLICTS is pre-computed at end of night (`hub-morning.sh --triage`, called by the
+CONFLICTS is pre-computed at end of the window (`hub-return.sh --triage`, called by the
 dispatcher) in a hermetic throwaway worktree — a merge-conflict probe only, never the
 test suite (the real gate fires at `/land`).
 
 The terminal markers are also mirrored to GitHub as issue comments
-(`hub-morning.sh --comments`, also run by the dispatcher at end of night): the spoke
+(`hub-return.sh --comments`, also run by the dispatcher at end of the window): the spoke
 only ever writes the git tag (it stays gh-read-only), and the hub — which has
 gh-write — echoes each ready/accept/blocked marker's reason as a `gh issue comment`,
 idempotently. A marker is thus durable as a git tag and visible on GitHub.

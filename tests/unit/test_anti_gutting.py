@@ -1,12 +1,12 @@
 """Unit tests for shared/hooks/anti-gutting-scan.sh (issue #40 ST3).
 
-The night kickoff's adversarial code-review gate is unenforceable policy (a spoke
+The AFK kickoff's adversarial code-review gate is unenforceable policy (a spoke
 can narrate a review it never ran — the #43 failure mode), and on the native
 Claude pre-push path reviewer-sep is advisory (it does not block). So the one
 MECHANICAL defense against the dangerous unattended cheat — an implementation that
 guts the tests to go green — is a deterministic diff scan wired into the pre-push
-path. Under NIGHT=1 it FAILS CLOSED: any test-gutting signature in the pushed diff
-aborts the push, which forces the spoke to park as blocked/N. Off the night path
+path. Under AFK=1 it FAILS CLOSED: any test-gutting signature in the pushed diff
+aborts the push, which forces the spoke to park as blocked/N. Off the attended path
 it is advisory (prints, never blocks) so a human's ordinary test refactor is not
 gated.
 
@@ -75,13 +75,13 @@ def _commit(repo: Path, files: dict[str, str], msg: str = "feat: change") -> tup
     return base, head
 
 
-def _scan(repo: Path, base: str, head: str, *, night: bool) -> subprocess.CompletedProcess:
+def _scan(repo: Path, base: str, head: str, *, afk: bool) -> subprocess.CompletedProcess:
     """Run the scan with a synthesized pre-push stdin line (range base..head)."""
     env = {**_GIT_ENV}
-    if night:
-        env["NIGHT"] = "1"
+    if afk:
+        env["AFK"] = "1"
     else:
-        env.pop("NIGHT", None)
+        env.pop("AFK", None)
     stdin = f"refs/heads/feature {head} refs/heads/feature {base}\n"
     return subprocess.run(
         ["bash", str(SCAN)],
@@ -93,7 +93,7 @@ def _scan(repo: Path, base: str, head: str, *, night: bool) -> subprocess.Comple
     )
 
 
-# ── gutting signatures block under NIGHT=1 ───────────────────────────────────
+# ── gutting signatures block under AFK=1 ───────────────────────────────────
 
 
 @pytest.mark.parametrize(
@@ -110,47 +110,47 @@ def _scan(repo: Path, base: str, head: str, *, night: bool) -> subprocess.Comple
         ("tests/test_taut.py", "def test_taut():\n    assert True\n"),
     ],
 )
-def test_gutting_signature_blocks_under_night(repo: Path, rel: str, content: str) -> None:
+def test_gutting_signature_blocks_under_afk(repo: Path, rel: str, content: str) -> None:
     base, head = _commit(repo, {rel: content})
 
-    result = _scan(repo, base, head, night=True)
+    result = _scan(repo, base, head, afk=True)
 
-    assert result.returncode != 0, f"NIGHT must block a gutting diff ({rel})"
+    assert result.returncode != 0, f"AFK must block a gutting diff ({rel})"
 
 
-def test_deleted_assertions_block_under_night(repo: Path) -> None:
+def test_deleted_assertions_block_under_afk(repo: Path) -> None:
     # Rewrite the seeded test so its two asserts become one trivial body -> a net
     # decrease in assert statements (deleted/weakened assertions).
     base, head = _commit(repo, {"tests/test_thing.py": "def test_adds_up():\n    x = 2 + 2\n"})
 
-    result = _scan(repo, base, head, night=True)
+    result = _scan(repo, base, head, afk=True)
 
-    assert result.returncode != 0, "NIGHT must block a net decrease in assertions"
-
-
-# ── off the night path it is advisory (never blocks) ─────────────────────────
+    assert result.returncode != 0, "AFK must block a net decrease in assertions"
 
 
-def test_gutting_signature_is_advisory_off_night(repo: Path) -> None:
+# ── off the attended path it is advisory (never blocks) ─────────────────────────
+
+
+def test_gutting_signature_is_advisory_off_afk(repo: Path) -> None:
     base, head = _commit(repo, {"app.py": "import sys\n\n\ndef run():\n    sys.exit(0)\n"})
 
-    result = _scan(repo, base, head, night=False)
+    result = _scan(repo, base, head, afk=False)
 
-    assert result.returncode == 0, "off the night path the scan must not block (advisory)"
+    assert result.returncode == 0, "off the attended path the scan must not block (advisory)"
     assert "weakens tests" in result.stderr, "advisory mode must still warn, not stay silent"
 
 
-# ── a clean diff passes even under NIGHT ─────────────────────────────────────
+# ── a clean diff passes even under AFK ─────────────────────────────────────
 
 
-def test_clean_diff_passes_under_night(repo: Path) -> None:
+def test_clean_diff_passes_under_afk(repo: Path) -> None:
     # Adds a genuine test with real assertions and no gutting signatures.
     base, head = _commit(
         repo,
         {"tests/test_more.py": "def test_more():\n    assert (1 + 1) == 2\n    assert [1] != []\n"},
     )
 
-    result = _scan(repo, base, head, night=True)
+    result = _scan(repo, base, head, afk=True)
 
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -171,7 +171,7 @@ def test_new_branch_zero_remote_sha_uses_merge_base(repo: Path) -> None:
         input=stdin,
         capture_output=True,
         text=True,
-        env={**_GIT_ENV, "NIGHT": "1"},
+        env={**_GIT_ENV, "AFK": "1"},
     )
 
     assert result.returncode != 0, "a new-branch push must still scan the new commits"

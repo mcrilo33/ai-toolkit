@@ -1,6 +1,6 @@
-"""Unit tests for shared/skills/hub/scripts/hub-morning.sh (issue #40 ST6, Phase 4).
+"""Unit tests for shared/skills/hub/scripts/hub-return.sh (issue #40 ST6, Phase 4).
 
-The morning report assembles the three terminal markers + a pre-computed land-triage
+The return report assembles the three terminal markers + a pre-computed land-triage
 into a worklist sorted fastest -> slowest human effort:
   LAND     ready/N, merges clean, agent-approved -> rubber-stamp /land
   EYEBALL  accept/N, built + pushed + agent-reviewed -> glance then land/send back
@@ -22,8 +22,8 @@ from pathlib import Path
 
 import pytest
 
-HUB_MORNING = (
-    Path(__file__).resolve().parents[2] / "shared" / "skills" / "hub" / "scripts" / "hub-morning.sh"
+HUB_RETURN = (
+    Path(__file__).resolve().parents[2] / "shared" / "skills" / "hub" / "scripts" / "hub-return.sh"
 )
 _GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
 
@@ -36,7 +36,7 @@ def _git(repo: Path, *args: str) -> str:
 
 def _call(fn_call: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["bash", "-c", f'source "{HUB_MORNING}"; {fn_call}'],
+        ["bash", "-c", f'source "{HUB_RETURN}"; {fn_call}'],
         capture_output=True,
         text=True,
         env=_GIT_ENV,
@@ -114,13 +114,13 @@ def test_repo_is_real_empty_prefix_disables_the_guard() -> None:
 def _run_report_guarded(hub: Path, tmp_path: Path, prefix: str) -> subprocess.CompletedProcess[str]:
     """Run the report with the #55 repo-real guard active at ``prefix``."""
     return subprocess.run(
-        ["bash", str(HUB_MORNING)],
+        ["bash", str(HUB_RETURN)],
         cwd=str(hub),
         capture_output=True,
         text=True,
         env={
             **_GIT_ENV,
-            "NIGHT_STATE_DIR": str(tmp_path / "night-state"),
+            "AFK_STATE_DIR": str(tmp_path / "afk-state"),
             "HUB_REAL_REPO_PREFIX": prefix,
         },
     )
@@ -228,7 +228,7 @@ def hub(tmp_path: Path) -> Path:
 
 def _run_report(hub: Path, tmp_path: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["bash", str(HUB_MORNING)],
+        ["bash", str(HUB_RETURN)],
         cwd=str(hub),
         capture_output=True,
         text=True,
@@ -236,7 +236,7 @@ def _run_report(hub: Path, tmp_path: Path) -> subprocess.CompletedProcess[str]:
         # the temp sandbox hub; the guard itself is covered by its own tests.
         env={
             **_GIT_ENV,
-            "NIGHT_STATE_DIR": str(tmp_path / "night-state"),
+            "AFK_STATE_DIR": str(tmp_path / "afk-state"),
             "HUB_REAL_REPO_PREFIX": "",
         },
     )
@@ -286,11 +286,11 @@ def test_report_shows_blocker_reason_for_blocked(hub: Path, tmp_path: Path) -> N
 
 def _run_triage(hub: Path, tmp_path: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["bash", str(HUB_MORNING), "--triage"],
+        ["bash", str(HUB_RETURN), "--triage"],
         cwd=str(hub),
         capture_output=True,
         text=True,
-        env={**_GIT_ENV, "NIGHT_STATE_DIR": str(tmp_path / "night-state")},
+        env={**_GIT_ENV, "AFK_STATE_DIR": str(tmp_path / "afk-state")},
     )
 
 
@@ -313,7 +313,7 @@ def test_triage_then_report_routes_a_conflicting_ready_to_conflicts(
 
     triage = _run_triage(hub, tmp_path)
     assert triage.returncode == 0, triage.stderr
-    cache = tmp_path / "night-state" / "land-triage"
+    cache = tmp_path / "afk-state" / "land-triage"
     assert cache.is_file() and "104 conflict" in cache.read_text(), "triage must cache the verdict"
 
     result = _run_report(hub, tmp_path)
@@ -344,7 +344,7 @@ def _seed_marker(hub: Path, tmp_path: Path, issue: int, kind: str, reason: str) 
 
 
 def _run_comments(hub: Path, tmp_path: Path) -> tuple[subprocess.CompletedProcess[str], Path]:
-    """Run `hub-morning.sh --comments` with a gh stub that logs each comment."""
+    """Run `hub-return.sh --comments` with a gh stub that logs each comment."""
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     gh_log = tmp_path / "gh-comments.log"
@@ -358,7 +358,7 @@ def _run_comments(hub: Path, tmp_path: Path) -> tuple[subprocess.CompletedProces
     )
     gh.chmod(0o755)
     proc = subprocess.run(
-        ["bash", str(HUB_MORNING), "--comments"],
+        ["bash", str(HUB_RETURN), "--comments"],
         cwd=str(hub),
         capture_output=True,
         text=True,
@@ -366,7 +366,7 @@ def _run_comments(hub: Path, tmp_path: Path) -> tuple[subprocess.CompletedProces
             **_GIT_ENV,
             "PATH": f"{bindir}:{os.environ['PATH']}",
             "GH_LOG": str(gh_log),
-            "NIGHT_STATE_DIR": str(tmp_path / "night-state"),
+            "AFK_STATE_DIR": str(tmp_path / "afk-state"),
         },
     )
     return proc, gh_log

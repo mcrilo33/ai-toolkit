@@ -1,6 +1,6 @@
-"""Unit tests for scripts/telemetry/morning.py (issue #40 ST6).
+"""Unit tests for scripts/telemetry/return_report.py (issue #40 ST6).
 
-The morning report needs per-spoke cost without re-deriving it. cost_for_issue
+The return report needs per-spoke cost without re-deriving it. cost_for_issue
 REUSES the #35 pull layer's authoritative `spoke_run_summary.total_cost_usd`
 (itself the sum of the run's distinct sessions' ccusage totals), joining a spoke
 run to its issue by the branch-prefix shape of the spoke_run_id
@@ -17,8 +17,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
-from telemetry.morning import cost_for_issue  # noqa: E402
-from telemetry.queries import connect  # noqa: E402
+from telemetry.queries import connect
+from telemetry.return_report import cost_for_issue
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "telemetry"
 EVENTS = FIXTURES / "events.jsonl"

@@ -1,10 +1,10 @@
-"""Tests for the dashboard 'Morning' view (issue #40 ST7, Phase 4).
+"""Tests for the dashboard 'Return' view.
 
-AC#6 asks for a morning view SHARED WITH #35: a filtered lens over the existing
-spoke-run telemetry. ``SpanStore.morning_rows`` reuses ``spoke_run_summary`` (the
+AC#6 asks for a return view SHARED WITH #35: a filtered lens over the existing
+spoke-run telemetry. ``SpanStore.return_rows`` reuses ``spoke_run_summary`` (the
 authoritative ccusage-sourced per-spoke cost), labels each run with its issue from
 the ``spoke_run_id`` shape ``<type>/<issue>-<slug>+<epoch>``, and annotates land
-readiness from the night's land-triage cache (the shell report's CONFLICTS/LAND
+readiness from the away window's land-triage cache (the shell report's CONFLICTS/LAND
 verdict). The render is a thin Streamlit table (smoke-tested with a stub, like the
 other views).
 """
@@ -142,23 +142,23 @@ def test_spoke_run_ids_keeps_run_with_a_mixed_real_and_unknown_repo() -> None:
     assert ids == ["feature/7-mix+1000"]
 
 
-# ── morning_rows: a per-run cost lens reusing spoke_run_summary ───────────────
+# ── return_rows: a per-run cost lens reusing spoke_run_summary ───────────────
 
 
-def test_morning_rows_excludes_fixture_repo_spokes() -> None:
+def test_return_rows_excludes_fixture_repo_spokes() -> None:
     store = _leak_store()
 
-    rows = store.morning_rows()
+    rows = store.return_rows()
 
     run_ids = {row["spoke_run_id"] for row in rows}
     assert REAL_RUN in run_ids, "the real ai-toolkit spoke surfaces"
     assert LEAK_RUN not in run_ids, "the hub-8 fixture spoke is filtered"
 
 
-def test_morning_rows_returns_a_row_per_spoke_run_with_cost() -> None:
+def test_return_rows_returns_a_row_per_spoke_run_with_cost() -> None:
     store = store_v2()
 
-    rows = store.morning_rows()
+    rows = store.return_rows()
 
     assert rows, "expected at least one spoke run"
     for row in rows:
@@ -167,7 +167,7 @@ def test_morning_rows_returns_a_row_per_spoke_run_with_cost() -> None:
         assert "merge" in row  # land-triage annotation slot (None without a cache)
 
 
-def test_morning_rows_annotates_triage_verdict() -> None:
+def test_return_rows_annotates_triage_verdict() -> None:
     queries = load_queries()
     store = queries.SpanStore.from_telemetry(
         events_path=TELEMETRY_FIXTURES / "events.jsonl",
@@ -178,7 +178,7 @@ def test_morning_rows_annotates_triage_verdict() -> None:
     try:
         # The telemetry fixture's repo is pinned to 'proj' by the session-parser
         # tests, so opt that prefix in to exercise triage annotation over it.
-        rows = store.morning_rows(triage={"22": "conflict"}, real_repo_prefix="proj")
+        rows = store.return_rows(triage={"22": "conflict"}, real_repo_prefix="proj")
     finally:
         store.close()
 
@@ -191,18 +191,18 @@ def test_morning_rows_annotates_triage_verdict() -> None:
 # ── render: the thin Streamlit view does not crash ───────────────────────────
 
 
-def test_render_morning_view_does_not_crash(monkeypatch) -> None:
+def test_render_return_view_does_not_crash(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "streamlit", _streamlit_stub())
     monkeypatch.setitem(sys.modules, "queries", load_queries())
     app = load_app()
 
-    app.render_morning_view(store_v2())
+    app.render_return_view(store_v2())
 
 
-def test_render_morning_view_handles_empty_store(monkeypatch) -> None:
+def test_render_return_view_handles_empty_store(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "streamlit", _streamlit_stub())
     queries = load_queries()
     monkeypatch.setitem(sys.modules, "queries", queries)
     app = load_app()
 
-    app.render_morning_view(queries.SpanStore.from_events([]))  # no spokes -> info, no crash
+    app.render_return_view(queries.SpanStore.from_events([]))  # no spokes -> info, no crash

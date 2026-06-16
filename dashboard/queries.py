@@ -305,25 +305,25 @@ class SpanStore:
         )
         return [row["spoke_run_id"] for row in rows]
 
-    def morning_rows(
+    def return_rows(
         self,
         triage: dict[str, str] | None = None,
         *,
         real_repo_prefix: str | None = REAL_REPO_PREFIX,
     ) -> list[dict[str, Any]]:
-        """The night-mode 'morning' lens: one row per spoke run, newest-first.
+        """The AFK-mode 'return' lens: one row per spoke run, newest-first.
 
-        A filtered view over the SAME #35 data (AC#6 "morning view shared with
-        #35"): each spoke run with its issue (parsed from the ``spoke_run_id``),
-        its authoritative per-run cost (reused from the ``spoke_run_summary`` view
-        when this store is the correlated/telemetry one — ``None`` over a raw-JSONL
-        fixture that has no such view), and a land-readiness annotation from the
-        night's land-triage cache. ``triage`` maps issue -> ``clean``/``conflict``
-        (the verdict ``hub-morning.sh --triage`` wrote); it complements the shell
+        A filtered view over the SAME #35 data: each spoke run with its issue
+        (parsed from the ``spoke_run_id``), its authoritative per-run cost (reused
+        from the ``spoke_run_summary`` view when this store is the
+        correlated/telemetry one — ``None`` over a raw-JSONL fixture that has no
+        such view), and a land-readiness annotation from the away window's
+        land-triage cache. ``triage`` maps issue -> ``clean``/``conflict`` (the
+        verdict ``hub-return.sh --triage`` wrote); it complements the shell
         worklist rather than re-deriving the tiers here.
 
         ``real_repo_prefix`` (the #55 fixture-spoke filter) defaults to
-        :data:`REAL_REPO_PREFIX` so the live morning view only ever shows runs from
+        :data:`REAL_REPO_PREFIX` so the live return view only ever shows runs from
         the real toolkit checkout; pass another prefix (or ``None``) to widen it.
         """
         triage = triage or {}

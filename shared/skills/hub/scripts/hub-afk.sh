@@ -1,38 +1,47 @@
 #!/usr/bin/env bash
-# hub-night.sh — adaptive night dispatcher for the planning hub (issue #41).
+# hub-afk.sh — adaptive away-from-keyboard dispatcher for the planning hub.
 #
-# Phase 1 of night mode (epic #40): drain a queue of pre-scoped `night`-labelled
-# issues overnight with a self-tuning concurrency cap, so the subscription pool
-# isn't blown yet the queue still finishes by wake time. Run it on the hub (main
-# checkout) before bed; it loops until the queue is drained or the launch cutoff
-# is reached. Re-running mid-night is safe (idempotent — see inflight_issues).
+# AFK mode: drain a queue of pre-scoped `afk`-labelled issues while you're away,
+# with a self-tuning concurrency cap, so the subscription pool isn't blown yet
+# the queue still finishes by the time you're back. Run it on the hub (main
+# checkout) before you step away; it loops until the queue is drained or the
+# launch cutoff is reached. Re-running mid-window is safe (idempotent — the
+# deadline is pinned on the first launch and the in-flight set is never re-spawned).
 #
-# Scope is the dispatcher mechanics ONLY. The night kickoff + agent gate-review
-# (Phase 2), the pre-flight batching scout (Phase 3) and the morning report
-# (Phase 4) are separate follow-ups on #40 and are not built here.
+# The away window is a DURATION (how long you'll be gone), not a clock time:
+#   AFK_FOR=8h   ->  deadline pinned to launch_time + 8h
+# The deadline is computed ONCE on the first tick and persisted, so a restart
+# resumes the SAME deadline instead of sliding "now + 8h" forward every time.
+# An absolute end time is still accepted as a fallback when no duration is given:
+#   AFK_UNTIL=07:00  ->  the next occurrence of that HH:MM (the old clock-time form)
+#
+# Scope is the dispatcher mechanics. The kickoff prompt + agent gate-review, the
+# pre-flight batching scout (hub-scout.sh) and the return report (hub-return.sh)
+# are companion pieces.
 #
 # Adaptive concurrency, recomputed each supervisor tick:
-#   target = clamp(ceil(tasks_left * T_task / time_left), 1, NIGHT_MAX_CONCURRENCY)
-# Sequential when the queue fits the remaining night, parallel only when it does
-# not, ramping up to the cap as the night burns down. Worked cases (T_task=90,
+#   target = clamp(ceil(tasks_left * T_task / time_left), 1, AFK_MAX_CONCURRENCY)
+# Sequential when the queue fits the remaining window, parallel only when it does
+# not, ramping up to the cap as the window burns down. Worked cases (T_task=90,
 # cap=3):
-#   5 tasks  / 480 min -> 1   (queue fits the night -> sequential)
+#   5 tasks  / 480 min -> 1   (queue fits the window -> sequential)
 #   20 tasks / 480 min -> 3   (ceil 3.75 = 4, clamped to the cap)
-#   5 tasks  / 150 min -> 3   (night burning down -> ramps up to the cap)
+#   5 tasks  / 150 min -> 3   (window burning down -> ramps up to the cap)
 #
 # Knobs (env, with defaults):
-#   NIGHT_END=07:00              wake time; next occurrence of HH:MM at/after now
-#   NIGHT_MAX_CONCURRENCY=3      concurrency cap
-#   NIGHT_TASK_MINUTES=90        T_task — assumed minutes per task
-#   NIGHT_IDLE_MINUTES=15        a spoke idle longer than this frees its slot
-#   NIGHT_TICK_SECONDS=300       supervisor poll interval
-#   NIGHT_NOW                    override "now" (epoch seconds) — testing/cron
+#   AFK_FOR                      how long you'll be away (8h / 480m / 480). Primary.
+#   AFK_UNTIL=07:00              absolute end time (HH:MM) — fallback when AFK_FOR unset
+#   AFK_MAX_CONCURRENCY=3        concurrency cap
+#   AFK_TASK_MINUTES=90          T_task — assumed minutes per task
+#   AFK_IDLE_MINUTES=15          a spoke idle longer than this frees its slot
+#   AFK_TICK_SECONDS=300         supervisor poll interval
+#   AFK_NOW                      override "now" (epoch seconds) — testing/cron
 #   WT_NEW                       path to worktree-new.sh (default: sibling)
 #   CLAUDE_PROJECTS_DIR          transcript root (default: $HOME/.claude/projects)
 #
 # Usage:
-#   hub-night.sh            # supervise until morning
-#   hub-night.sh --once     # run a single tick and exit (tests / external cron)
+#   AFK_FOR=8h hub-afk.sh        # supervise for 8 hours
+#   hub-afk.sh --once            # run a single tick and exit (tests / external cron)
 #
 # Read-only against the work except for dispatching spokes via worktree-new.sh.
 # It never merges, never lands — the hub lands finished spokes on /land.
@@ -40,14 +49,15 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-: "${NIGHT_END:=07:00}"
-: "${NIGHT_MAX_CONCURRENCY:=3}"
-: "${NIGHT_TASK_MINUTES:=90}"
-: "${NIGHT_IDLE_MINUTES:=15}"
-: "${NIGHT_TICK_SECONDS:=300}"
-: "${NIGHT_SPOKE_MAX_MINUTES:=180}"   # wall-clock ceiling per spoke (~2x T_task)
-: "${NIGHT_STATE_DIR:=}"              # where per-spoke dispatch epochs persist
-# NIGHT_MAX_BUDGET_USD (optional)     # best-effort in-process --max-budget-usd cap
+: "${AFK_FOR:=}"                    # away duration (8h/480m/480); empty -> use AFK_UNTIL
+: "${AFK_UNTIL:=07:00}"             # absolute end time fallback when AFK_FOR is unset
+: "${AFK_MAX_CONCURRENCY:=3}"
+: "${AFK_TASK_MINUTES:=90}"
+: "${AFK_IDLE_MINUTES:=15}"
+: "${AFK_TICK_SECONDS:=300}"
+: "${AFK_SPOKE_MAX_MINUTES:=180}"   # wall-clock ceiling per spoke (~2x T_task)
+: "${AFK_STATE_DIR:=}"              # where per-spoke dispatch epochs persist
+# AFK_MAX_BUDGET_USD (optional)     # best-effort in-process --max-budget-usd cap
 
 log() { printf '%s\n' "$*" >&2; }
 
@@ -69,24 +79,24 @@ _epoch_at() {
 
 # --- pure decision layer ------------------------------------------------------
 
-# night_target <tasks_left> <time_left_min> -> concurrency target.
-# clamp(ceil(tasks_left * T_task / time_left), 1, NIGHT_MAX_CONCURRENCY).
-# A non-positive time_left (night already over) pins to the cap rather than
+# afk_target <tasks_left> <time_left_min> -> concurrency target.
+# clamp(ceil(tasks_left * T_task / time_left), 1, AFK_MAX_CONCURRENCY).
+# A non-positive time_left (window already over) pins to the cap rather than
 # dividing by zero; the launch cutoff stops new spokes in that case anyway.
-night_target() {
+afk_target() {
   local tasks_left="$1" time_left="$2" target
   if [ "$time_left" -le 0 ]; then
-    target="$NIGHT_MAX_CONCURRENCY"
+    target="$AFK_MAX_CONCURRENCY"
   else
-    target=$(( (tasks_left * NIGHT_TASK_MINUTES + time_left - 1) / time_left ))
+    target=$(( (tasks_left * AFK_TASK_MINUTES + time_left - 1) / time_left ))
   fi
   [ "$target" -lt 1 ] && target=1
-  [ "$target" -gt "$NIGHT_MAX_CONCURRENCY" ] && target="$NIGHT_MAX_CONCURRENCY"
+  [ "$target" -gt "$AFK_MAX_CONCURRENCY" ] && target="$AFK_MAX_CONCURRENCY"
   printf '%s\n' "$target"
 }
 
 # minutes_until <hh:mm> <now_epoch> -> whole minutes until the next HH:MM.
-# Today's HH:MM if it is still ahead, otherwise tomorrow's.
+# Today's HH:MM if it is still ahead, otherwise tomorrow's. The AFK_UNTIL fallback.
 minutes_until() {
   local hhmm="$1" now="$2" target
   target="$(_epoch_at "$(_date_ymd "$now")" "$hhmm")"
@@ -94,17 +104,75 @@ minutes_until() {
   printf '%s\n' "$(( (target - now) / 60 ))"
 }
 
+# parse_duration <spec> -> whole minutes, or empty (exit 1) when malformed.
+# Accepts "8h" (hours), "480m" (minutes), or a bare "480" (minutes). A leading
+# zero or extra text is rejected rather than silently treated as zero, so a typo
+# never collapses the away window to nothing.
+# UPGRADE: support a compound "1h30m" if mixed specs ever prove useful.
+parse_duration() {
+  local spec="$1"
+  case "$spec" in
+    *[0-9]h) printf '%s\n' "$(( ${spec%h} * 60 ))" ;;
+    *[0-9]m) printf '%s\n' "${spec%m}" ;;
+    *[0-9])  printf '%s\n' "$spec" ;;
+    *)       log "afk: malformed AFK_FOR='$spec' (use 8h / 480m / 480)"; return 1 ;;
+  esac
+}
+
+# afk_window_minutes <now_epoch> -> minutes from now to a FRESHLY-computed deadline:
+# the AFK_FOR duration when set, else the next AFK_UNTIL clock time. Pure (no
+# persistence), so the scout can probe feasibility at setup without pinning anything.
+# The single window definition shared by the supervisor and the scout — their math
+# can never drift.
+afk_window_minutes() {
+  local now="$1" mins
+  if [ -n "$AFK_FOR" ] && mins="$(parse_duration "$AFK_FOR")"; then
+    printf '%s\n' "$mins"
+  else
+    minutes_until "$AFK_UNTIL" "$now"
+  fi
+}
+
+# _deadline_file -> the persisted away-window deadline (epoch). Pinning it on disk
+# is what makes a restart resume the SAME deadline instead of re-anchoring "now +
+# AFK_FOR" forward every time the supervisor is relaunched mid-window.
+_deadline_file() { printf '%s/deadline.epoch\n' "$(_afk_state_dir)"; }
+
+# afk_deadline_epoch <now_epoch> -> the pinned end-of-window epoch. Computed ONCE
+# (from afk_window_minutes) and persisted; every later call returns the persisted
+# value. A non-numeric persisted file is ignored and recomputed (corruption never
+# wedges the window).
+afk_deadline_epoch() {
+  local now="$1" f cached end
+  f="$(_deadline_file)"
+  cached="$([ -f "$f" ] && cat "$f" 2>/dev/null || true)"
+  case "$cached" in '' | *[!0-9]*) ;; *) printf '%s\n' "$cached"; return ;; esac
+  end=$(( now + $(afk_window_minutes "$now") * 60 ))
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  printf '%s\n' "$end" > "$f" 2>/dev/null || true
+  printf '%s\n' "$end"
+}
+
+# minutes_left <now_epoch> -> whole minutes until the pinned deadline (may be
+# negative once the window has closed). The single time-left source for the
+# supervisor and the scout, so their math can never drift.
+minutes_left() {
+  local now="$1" end
+  end="$(afk_deadline_epoch "$now")"
+  printf '%s\n' "$(( (end - now) / 60 ))"
+}
+
 # launch_cutoff_reached <time_left_min> — true (exit 0) when too little of the
-# night remains to start another task: no abandoned half-builds. In-flight
+# window remains to start another task: no abandoned half-builds. In-flight
 # spokes are untouched; this only gates new launches.
 launch_cutoff_reached() {
-  [ "$1" -lt "$NIGHT_TASK_MINUTES" ]
+  [ "$1" -lt "$AFK_TASK_MINUTES" ]
 }
 
 # spoke_over_ceiling <dispatch_epoch> <now> — true (exit 0) when a spoke has run
-# longer than NIGHT_SPOKE_MAX_MINUTES. This is the RELIABLE runtime ceiling: a
+# longer than AFK_SPOKE_MAX_MINUTES. This is the RELIABLE runtime ceiling: a
 # doom-loop or hung spoke that never emits a terminal marker is reaped rather than
-# burning the subscription until 07:00 (launch_cutoff only gates NEW launches; the
+# burning the subscription to the deadline (launch_cutoff only gates NEW launches; the
 # --max-budget-usd backstop may not bind on a subscription). Strict ">", and an
 # empty/unknown epoch is never over the ceiling (can't measure -> don't reap).
 spoke_over_ceiling() {
@@ -114,45 +182,45 @@ spoke_over_ceiling() {
   # is fatal under `set -u` on bash 3.2, and it would exit 0 (a silent death).
   case "$epoch" in '' | *[!0-9]*) return 1 ;; esac
   case "$now" in '' | *[!0-9]*) return 1 ;; esac
-  [ "$(( (now - epoch) / 60 ))" -gt "$NIGHT_SPOKE_MAX_MINUTES" ]
+  [ "$(( (now - epoch) / 60 ))" -gt "$AFK_SPOKE_MAX_MINUTES" ]
 }
 
-# now_epoch -> current time, overridable via NIGHT_NOW for tests/cron.
+# now_epoch -> current time, overridable via AFK_NOW for tests/cron.
 now_epoch() {
-  printf '%s\n' "${NIGHT_NOW:-$(date +%s)}"
+  printf '%s\n' "${AFK_NOW:-$(date +%s)}"
 }
 
-# _night_state_dir -> where per-spoke dispatch epochs persist. NIGHT_STATE_DIR
+# _afk_state_dir -> where per-spoke dispatch epochs persist. AFK_STATE_DIR
 # wins; otherwise a per-repo dir under the git dir (out of the work tree, survives
 # a supervisor restart). The epochs must persist so the wall-clock ceiling is
 # measured from the real launch, not reset to "now" on every crash/restart.
-_night_state_dir() {
-  if [ -n "$NIGHT_STATE_DIR" ]; then printf '%s\n' "$NIGHT_STATE_DIR"; return; fi
+_afk_state_dir() {
+  if [ -n "$AFK_STATE_DIR" ]; then printf '%s\n' "$AFK_STATE_DIR"; return; fi
   local root="${MAIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}"
-  printf '%s\n' "${root}/.git/ai-toolkit-night"
+  printf '%s\n' "${root}/.git/ai-toolkit-afk"
 }
 
 # stamp_dispatch_epoch <issue> — record a spoke's launch time (idempotent: a
 # re-dispatch after a crash overwrites with the new launch).
 stamp_dispatch_epoch() {
-  local dir; dir="$(_night_state_dir)"
+  local dir; dir="$(_afk_state_dir)"
   mkdir -p "$dir" 2>/dev/null || true
   printf '%s\n' "$(now_epoch)" > "$dir/dispatch-$1.epoch" 2>/dev/null || true
 }
 
 # read_dispatch_epoch <issue> -> the persisted launch epoch, or empty if unknown.
 read_dispatch_epoch() {
-  local f; f="$(_night_state_dir)/dispatch-$1.epoch"
+  local f; f="$(_afk_state_dir)/dispatch-$1.epoch"
   [ -f "$f" ] && cat "$f" 2>/dev/null || true
 }
 
 # --- queue + in-flight + dispatch --------------------------------------------
 
-# queue_issues -> the night queue: numbers of open issues labelled `night`, one
+# queue_issues -> the afk queue: numbers of open issues labelled `afk`, one
 # per line. The issue stays the contract; missing/unauthed gh degrades to empty.
 queue_issues() {
-  command -v gh >/dev/null 2>&1 || { log "gh not found — empty night queue"; return 0; }
-  gh issue list --label night --state open --json number -q '.[].number' 2>/dev/null \
+  command -v gh >/dev/null 2>&1 || { log "gh not found — empty afk queue"; return 0; }
+  gh issue list --label afk --state open --json number -q '.[].number' 2>/dev/null \
     | grep -E '^[0-9]+$' || true
 }
 
@@ -200,7 +268,7 @@ parse_directive() {
 # (the directive fields empty when absent). One gh round-trip per issue; a missing/
 # unauthed gh degrades to empty directives (dispatch normally).
 # UPGRADE: one `gh issue view` per issue per tick — batch via a single
-# `gh issue list --json number,body` if the night queue ever grows past ~dozens.
+# `gh issue list --json number,body` if the afk queue ever grows past ~dozens.
 issue_directives() {
   local n body
   while IFS= read -r n; do
@@ -212,7 +280,7 @@ issue_directives() {
 }
 
 # predecessor_landed <pred> <open_queue> <inflight> -> true (exit 0) when <pred> is
-# absent from BOTH the open night queue and the in-flight set — i.e. it has been
+# absent from BOTH the open afk queue and the in-flight set — i.e. it has been
 # closed AND torn down, which is exactly what `worktree-land.sh` does on a land. A
 # predecessor still queued or still in flight is NOT landed, so its successors wait.
 predecessor_landed() {
@@ -241,7 +309,7 @@ _transcript_idle_seconds() {
 
 # slot_state <worktree-path> <issue> -> done|free|busy. A slot is freed when the
 # spoke is done (a TERMINAL marker at the branch tip) or idle longer than
-# NIGHT_IDLE_MINUTES; otherwise it is busy and keeps occupying its slot. A spoke
+# AFK_IDLE_MINUTES; otherwise it is busy and keeps occupying its slot. A spoke
 # with no transcript yet (just spawned) reads as busy so the supervisor never
 # backfills over a starting spoke.
 #
@@ -277,10 +345,10 @@ slot_state() {
   if spoke_over_ceiling "$epoch" "$(now_epoch)"; then
     printf 'reap\n'; return
   fi
-  # Idle past NIGHT_IDLE_MINUTES with no marker -> hung -> reap. (A just-spawned
+  # Idle past AFK_IDLE_MINUTES with no marker -> hung -> reap. (A just-spawned
   # spoke with no transcript yet reads as busy so it is never reaped mid-start.)
   age="$(_transcript_idle_seconds "$wt_path")"
-  if [ -n "$age" ] && [ "$age" -gt $(( NIGHT_IDLE_MINUTES * 60 )) ]; then
+  if [ -n "$age" ] && [ "$age" -gt $(( AFK_IDLE_MINUTES * 60 )) ]; then
     printf 'reap\n'; return
   fi
   printf 'busy\n'
@@ -337,7 +405,7 @@ _kill_spoke_window() {
 # tmux window and emit blocked/<issue> on its behalf (blocked is durability-exempt,
 # so it lands over the spoke's incomplete, possibly un-pushed work). The worktree is
 # LEFT in place so it doubles as the idempotency record (the still-open issue is not
-# re-dispatched) and the morning land-triage can inspect it. All best-effort — a reap
+# re-dispatched) and the return-report land-triage can inspect it. All best-effort — a reap
 # failure logs and never aborts the supervisor.
 reap_spoke() {
   local wt_path="$1" issue="$2" reason="$3" sr
@@ -363,34 +431,34 @@ reap_overrun_spokes() {
     st="$(slot_state "$path" "$issue")"
     [ "$st" = "reap" ] || continue
     if spoke_over_ceiling "$(read_dispatch_epoch "$issue")" "$(now_epoch)"; then
-      reason="time ceiling: ran >${NIGHT_SPOKE_MAX_MINUTES}m without finishing"
+      reason="time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
     else
-      reason="went idle >${NIGHT_IDLE_MINUTES}m with no terminal marker — likely hung"
+      reason="went idle >${AFK_IDLE_MINUTES}m with no terminal marker — likely hung"
     fi
     reap_spoke "$path" "$issue" "$reason"
   done < <(inflight_worktrees)
 }
 
-# kickoff_for <issue> -> the spoke's first prompt: the NIGHT kickoff (Phase 2).
-# The behavioral inversion of the daytime kickoff — judgment gates route to an
+# kickoff_for <issue> -> the spoke's first prompt: the AFK kickoff.
+# The behavioral inversion of the attended kickoff — judgment gates route to an
 # independent adversarial reviewer (gate action = agent-review), and uncertainty
-# escalates to PARK, never to "ask" (which hangs the slot until morning) or "guess".
+# escalates to PARK, never to "ask" (which hangs the slot until you return) or "guess".
 # See solo-cycle's "Gate action — who services a parked gate".
 kickoff_for() {
   local n="$1"
   cat <<EOF
-You're in a dedicated worktree for issue #$n (Gate: plan), running UNATTENDED in night
+You're in a dedicated worktree for issue #$n (Gate: plan), running UNATTENDED in AFK
 mode. Run /source to anchor to issue #$n and read it. Before touching code, break the
 issue body into a task ledger (TaskCreate, or TodoWrite on older runtimes) — one todo
 per subtask × the solo-cycle steps that apply (ANCHOR/RED/GREEN/REVIEW/PUSH), exactly
 one in_progress.
 
-THE NIGHT RULE — park, never ask, never guess. Nobody is awake. Any decision that
-needs human judgment you cannot resolve, you STOP CLEANLY and emit a terminal marker;
-you never block waiting for input (that hangs your slot until morning) and you never
-guess. Keep a STATUS.md heartbeat and /compact when context grows.
+THE AFK RULE — park, never ask, never guess. Nobody is at the keyboard. Any decision
+that needs human judgment you cannot resolve, you STOP CLEANLY and emit a terminal
+marker; you never block waiting for input (that hangs your slot until they return) and
+you never guess. Keep a STATUS.md heartbeat and /compact when context grows.
 
-Night gate action is AGENT-REVIEW, not a human pause. At each JUDGMENT gate, spawn an
+AFK gate action is AGENT-REVIEW, not a human pause. At each JUDGMENT gate, spawn an
 INDEPENDENT adversarial reviewer — a fresh code-review subagent (model: opus), never
 yourself grading your own work — prompted to REFUTE, approving only on strong evidence.
 The revise loop is bounded to TWO ROUNDS; if it still refuses on the 2nd revision, PARK
@@ -405,7 +473,7 @@ non-interactively, PARK rather than wait.
 - RED / REVIEW (code): agent-review the failing test, then the implementation. The
   code review must confirm the impl did NOT gut the tests to go green (no sys.exit(0),
   no deleted or weakened assertions, no added skip/xfail) — the anti-gutting pre-push
-  tripwire enforces this under NIGHT and will refuse such a push.
+  tripwire enforces this under AFK and will refuse such a push.
 - DRAFT / acceptance gate (inherently human): build + push, then ALWAYS park as
   accept/$n — the final sign-off is a person's.
 
@@ -441,16 +509,16 @@ dispatch_issue() {
     return 1
   fi
   log "→ dispatch #$issue"
-  # Best-effort in-process budget cap for the night spoke (subscription may not
-  # meter it; the supervisor reap is the reliable ceiling). NIGHT_MAX_BUDGET_USD
+  # Best-effort in-process budget cap for the afk spoke (subscription may not
+  # meter it; the supervisor reap is the reliable ceiling). AFK_MAX_BUDGET_USD
   # unset -> day-style launch, unchanged. Validate it is a plain number before
   # threading it: WT_AGENT_BUDGET_ARGS is appended UNQUOTED to a shell-eval'd tmux
   # launch, so a non-numeric value must never reach it (it would word-split / inject).
   local budget_args=""
-  if [ -n "${NIGHT_MAX_BUDGET_USD:-}" ]; then
-    case "$NIGHT_MAX_BUDGET_USD" in
-      '' | *[!0-9.]* | *.*.*) log "ignoring non-numeric NIGHT_MAX_BUDGET_USD='$NIGHT_MAX_BUDGET_USD'" ;;
-      *) budget_args="--max-budget-usd $NIGHT_MAX_BUDGET_USD" ;;
+  if [ -n "${AFK_MAX_BUDGET_USD:-}" ]; then
+    case "$AFK_MAX_BUDGET_USD" in
+      '' | *[!0-9.]* | *.*.*) log "ignoring non-numeric AFK_MAX_BUDGET_USD='$AFK_MAX_BUDGET_USD'" ;;
+      *) budget_args="--max-budget-usd $AFK_MAX_BUDGET_USD" ;;
     esac
   fi
   if [ -n "$budget_args" ]; then
@@ -483,10 +551,10 @@ supervise_tick() {
   queue="$(queue_issues)"
   inflight="$(inflight_issues)"
   directives="$(issue_directives)"   # "<n>\t<serial-after>\t<merge-into>" per issue
-  time_left="$(minutes_until "$NIGHT_END" "$now")"
+  time_left="$(minutes_left "$now")"
 
   if launch_cutoff_reached "$time_left"; then
-    log "launch cutoff: ${time_left}m left < T_task ${NIGHT_TASK_MINUTES}m — not starting new spokes"
+    log "launch cutoff: ${time_left}m left < T_task ${AFK_TASK_MINUTES}m — not starting new spokes"
     return 0
   fi
 
@@ -499,7 +567,7 @@ supervise_tick() {
   # spokes await the hub's land.
   tasks_left=$(( queue_count - done_count - merge_children ))
   [ "$tasks_left" -lt 0 ] && tasks_left=0
-  target="$(night_target "$tasks_left" "$time_left")"
+  target="$(afk_target "$tasks_left" "$time_left")"
   # busy + parked spokes hold a slot; done spokes (incl. ones reaped this tick)
   # free theirs for backfill.
   free_slots=$(( target - busy_count ))
@@ -528,7 +596,7 @@ supervise_tick() {
       # the open queue, so its successors stall until the cutoff — correct, but it
       # reads as a never-dispatched issue + a wall of identical skip lines.
       # UPGRADE: distinguish "predecessor parked" from "still working" here; the
-      # morning report (Phase 4) reconciles chains stalled behind a parked predecessor.
+      # return report reconciles chains stalled behind a parked predecessor.
       log "→ skip #$n: Serial-after #$sa not yet landed — deferred to a later tick"
       continue
     fi
@@ -541,32 +609,32 @@ EOF
   log "dispatched $dispatched spoke(s) this tick ($attempts attempted)"
 }
 
-# night_done -> true when the supervisor has nothing left to do: the launch
-# cutoff has passed (no window to start anything tonight), or the queue is fully
+# afk_done -> true when the supervisor has nothing left to do: the launch
+# cutoff has passed (no window to start anything more), or the queue is fully
 # drained with nothing still in flight. Ends the loop instead of spinning.
-night_done() {
+afk_done() {
   local time_left queue_count inflight_count
-  time_left="$(minutes_until "$NIGHT_END" "$(now_epoch)")"
+  time_left="$(minutes_left "$(now_epoch)")"
   launch_cutoff_reached "$time_left" && return 0
   queue_count="$(queue_issues | grep -c '^[0-9]' || true)"
   inflight_count="$(inflight_issues | grep -c '^[0-9]' || true)"
   [ "$queue_count" -eq 0 ] && [ "$inflight_count" -eq 0 ]
 }
 
-# pre_compute_land_triage — at end of night, merge-probe every ready branch so the
-# 07:00 morning report is instant (the throwaway merge is the only slow/risky step,
-# and must not run while a human reads the report). Delegates to hub-morning.sh
-# --triage; best-effort — a missing hub-morning.sh is a no-op.
+# pre_compute_land_triage — at end of the away window, merge-probe every ready branch so the
+# return report is instant (the throwaway merge is the only slow/risky step,
+# and must not run while a human reads the report). Delegates to hub-return.sh
+# --triage; best-effort — a missing hub-return.sh is a no-op.
 pre_compute_land_triage() {
   local main_root="${MAIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}"
-  local hm="${HUB_MORNING:-$SCRIPT_DIR/hub-morning.sh}"
-  if [ ! -x "$hm" ] && [ -x "$main_root/.ai-toolkit/scripts/hub-morning.sh" ]; then
-    hm="$main_root/.ai-toolkit/scripts/hub-morning.sh"
+  local hm="${HUB_RETURN:-$SCRIPT_DIR/hub-return.sh}"
+  if [ ! -x "$hm" ] && [ -x "$main_root/.ai-toolkit/scripts/hub-return.sh" ]; then
+    hm="$main_root/.ai-toolkit/scripts/hub-return.sh"
   fi
-  [ -x "$hm" ] || { log "land-triage: hub-morning.sh not found — skipping pre-compute"; return 0; }
-  log "→ pre-computing land-triage for the morning report"
+  [ -x "$hm" ] || { log "land-triage: hub-return.sh not found — skipping pre-compute"; return 0; }
+  log "→ pre-computing land-triage for the return report"
   "$hm" --triage || log "land-triage: pre-compute failed (non-fatal)"
-  # Mirror the night's terminal markers to gh issue comments (AC#3) from the hub,
+  # Mirror the away window's terminal markers to gh issue comments (AC#3) from the hub,
   # which has gh-write — the spoke only ever wrote the tag. Best-effort.
   "$hm" --comments || log "comment echo: failed (non-fatal)"
 }
@@ -576,7 +644,7 @@ main() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --once)    once=1; shift ;;
-      -h|--help) echo "usage: hub-night.sh [--once]" >&2; return 0 ;;
+      -h|--help) echo "usage: hub-afk.sh [--once]" >&2; return 0 ;;
       *)         log "unknown argument: $1"; return 2 ;;
     esac
   done
@@ -586,18 +654,18 @@ main() {
   }
 
   # The supervisor loop: tick, then (unless --once) sleep and tick again until
-  # the night is over or the queue is drained. The termination check runs before
-  # the sleep so an already-finished night exits immediately.
+  # the window is over or the queue is drained. The termination check runs before
+  # the sleep so an already-finished window exits immediately.
   while :; do
     supervise_tick
     [ "$once" -eq 1 ] && break
-    night_done && { log "night dispatcher done"; break; }
-    sleep "$NIGHT_TICK_SECONDS"
+    afk_done && { log "afk dispatcher done"; break; }
+    sleep "$AFK_TICK_SECONDS"
   done
 
-  # End of the supervising night (both exit paths: queue drained or launch cutoff
-  # past) — pre-compute the land-triage so the morning report is instant. A single
-  # --once tick is not end-of-night, so it skips this.
+  # End of the supervising window (both exit paths: queue drained or launch cutoff
+  # past) — pre-compute the land-triage so the return report is instant. A single
+  # --once tick is not end-of-window, so it skips this.
   [ "$once" -eq 0 ] && pre_compute_land_triage
   return 0
 }

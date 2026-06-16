@@ -2,12 +2,12 @@
 # anti-gutting-scan.sh — mechanical tripwire against an unattended implementation
 # that GUTS the tests to go green (issue #40).
 #
-# The night kickoff's adversarial code-review gate is unenforceable policy (a spoke
+# The AFK kickoff's adversarial code-review gate is unenforceable policy (a spoke
 # can narrate a review it never ran — #43), and on the native Claude pre-push path
 # reviewer-sep is advisory. So this is the one MECHANICAL backstop: a deterministic
-# scan of the pushed diff for test-gutting signatures. Under NIGHT=1 it FAILS CLOSED
+# scan of the pushed diff for test-gutting signatures. Under AFK=1 it FAILS CLOSED
 # (a non-zero exit aborts the push, forcing the spoke to park as blocked/N); off the
-# night path it is ADVISORY (it prints, exits 0) so a human's ordinary test edit is
+# attended path it is ADVISORY (it prints, exits 0) so a human's ordinary test edit is
 # never gated.
 #
 # It reads git's pre-push stdin (`<lref> <lsha> <rref> <rsha>` lines) exactly like
@@ -121,9 +121,9 @@ done
   for f in "${FINDINGS[@]}"; do echo "  • $f"; done
 } >&2
 
-if [ "${NIGHT:-}" = "1" ]; then
-  echo "anti-gutting: NIGHT mode — refusing the push. Park as blocked/N and surface this for review." >&2
+if [ "${AFK:-}" = "1" ]; then
+  echo "anti-gutting: AFK mode — refusing the push. Park as blocked/N and surface this for review." >&2
   exit 1
 fi
-echo "anti-gutting: advisory (not NIGHT) — push allowed; review the above before landing." >&2
+echo "anti-gutting: advisory (not AFK) — push allowed; review the above before landing." >&2
 exit 0

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# hub-morning.sh — the night-mode morning report (issue #40, Phase 4).
+# hub-return.sh — the AFK-mode return report (the worklist you read when you're back).
 #
 # Assembles the three terminal markers + a pre-computed land-triage into a worklist
-# sorted FASTEST -> SLOWEST human effort, so waking up to a drained night queue is a
+# sorted FASTEST -> SLOWEST human effort, so returning to a drained afk queue is a
 # few rubber-stamps and a couple of decisions, not an archaeology dig:
 #   LAND      ready/N, merges clean, agent-approved      -> rubber-stamp /land N
 #   EYEBALL   accept/N, built + pushed + agent-reviewed   -> glance, then land/send back
@@ -12,12 +12,12 @@
 #
 # Each row carries the diff size, the trust summary (the marker's annotated-tag
 # body — e.g. "code-review rejected 2x"), the per-spoke cost (reused from the #35
-# pull layer via telemetry/morning.py, best-effort), and the exact next command.
+# pull layer via telemetry/return_report.py, best-effort), and the exact next command.
 #
 # LAND-TRIAGE (--triage) merges each ready branch onto the default in a HERMETIC
 # detached temp worktree and probes ONLY for a merge conflict — NO pytest (the real
 # test gate fires at /land's push; running pytest here would re-enter the
-# GIT_DIR-leak/tripwire hazard). The supervisor calls it at end-of-night so the
+# GIT_DIR-leak/tripwire hazard). The supervisor calls it at end of the away window so the
 # 07:00 report is instant; the report degrades to "merges unknown" if it is absent.
 #
 # Read-only against the work (the triage temp worktree is created + removed under
@@ -26,21 +26,21 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Source hub-night.sh for inflight_worktrees / _night_state_dir. hub-night's
+# Source hub-afk.sh for inflight_worktrees / _afk_state_dir. hub-afk's
 # source-guard means this only defines functions, never runs its supervisor.
-_hub_night="${HUB_NIGHT:-$SCRIPT_DIR/hub-night.sh}"
-if [ -r "$_hub_night" ]; then
-  # shellcheck source=hub-night.sh
-  . "$_hub_night"
+_hub_afk="${HUB_AFK:-$SCRIPT_DIR/hub-afk.sh}"
+if [ -r "$_hub_afk" ]; then
+  # shellcheck source=hub-afk.sh
+  . "$_hub_afk"
 else
-  echo "hub-morning: cannot source hub-night.sh (set HUB_NIGHT)" >&2
+  echo "hub-return: cannot source hub-afk.sh (set HUB_AFK)" >&2
   exit 1
 fi
 
 MAIN_ROOT="${MAIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}"
 
 # _repo_is_real — the #55 fixture-leak guard, mirroring dashboard/queries.py's
-# real-spoke filter on the marker side: the morning worklist renders only for the
+# real-spoke filter on the marker side: the return worklist renders only for the
 # real toolkit checkout. A stray sandbox/test hub (basename not the toolkit name)
 # must not surface its markers as a fake worklist. The prefix is overridable via
 # HUB_REAL_REPO_PREFIX (default 'ai-toolkit'); an empty prefix disables the guard
@@ -118,7 +118,7 @@ _wt_for_issue() {
   inflight_worktrees | awk -F'\t' -v i="$1" '$2 == i {print $1; exit}'
 }
 
-_triage_cache() { printf '%s/land-triage\n' "$(_night_state_dir)"; }
+_triage_cache() { printf '%s/land-triage\n' "$(_afk_state_dir)"; }
 
 # all terminal + gate markers as "<kind>/<issue>" lines.
 _markers() {
@@ -140,7 +140,7 @@ _at_tip() {
 
 # land_triage_all — pre-compute the merge-conflict verdict for every ready marker
 # and cache it ("<issue> <clean|conflict>" per line). Called by the supervisor at
-# end-of-night so the morning report is instant.
+# end of the away window so the return report is instant.
 land_triage_all() {
   local def cache ref issue mc verdict
   def="$(default_branch)"
@@ -160,17 +160,17 @@ land_triage_all() {
   return 0
 }
 
-# _cost_for <issue> -> the spoke's cost via telemetry/morning.py, or empty
+# _cost_for <issue> -> the spoke's cost via telemetry/return_report.py, or empty
 # (best-effort: a missing telemetry/ccusage must never break the report).
 _cost_for() {
-  local py="${MORNING_PY:-$MAIN_ROOT/scripts/telemetry/morning.py}"
+  local py="${RETURN_PY:-$MAIN_ROOT/scripts/telemetry/return_report.py}"
   [ -r "$py" ] || return 0
   PYTHONPATH="${PYTHONPATH:-}:$MAIN_ROOT/scripts" python3 "$py" --cost-for "$1" 2>/dev/null || true
 }
 
 report() {
   if ! _repo_is_real; then
-    echo "hub-morning: '$(basename "${MAIN_ROOT:-?}")' is not a real toolkit checkout" \
+    echo "hub-return: '$(basename "${MAIN_ROOT:-?}")' is not a real toolkit checkout" \
          "(HUB_REAL_REPO_PREFIX=${HUB_REAL_REPO_PREFIX-ai-toolkit}) — skipping worklist"
     return 0
   fi
@@ -206,20 +206,20 @@ report() {
     esac
   done < <(_markers)
 
-  echo "Night morning report — worklist (fastest → slowest human effort)"
-  [ -f "$cache" ] || echo "  (land-triage not pre-computed — run: hub-morning.sh --triage)"
+  echo "AFK return report — worklist (fastest → slowest human effort)"
+  [ -f "$cache" ] || echo "  (land-triage not pre-computed — run: hub-return.sh --triage)"
   echo
   printf 'LAND — rubber-stamp /land:\n%s\n' "${land:-  (none)}"
   printf 'EYEBALL — glance then land/send back:\n%s\n' "${eyeball:-  (none)}"
   printf 'THINK — answer the blocker + re-queue:\n%s\n' "${think:-  (none)}"
   printf 'CONFLICTS — land needs hand-resolution:\n%s\n' "${conflicts:-  (none)}"
-  [ -n "$footer" ] && printf 'Still parked at PLAN (night reviewer not yet done):\n%s\n' "$footer"
+  [ -n "$footer" ] && printf 'Still parked at PLAN (afk reviewer not yet done):\n%s\n' "$footer"
   return 0
 }
 
 # _echoed_file -> the seen-file recording which markers were mirrored to a gh
 # issue comment (one line per "<kind>/<issue>"), so a re-run never double-comments.
-_echoed_file() { printf '%s/echoed-comments\n' "$(_night_state_dir)"; }
+_echoed_file() { printf '%s/echoed-comments\n' "$(_afk_state_dir)"; }
 
 # echo_marker_comments — AC#3's "+ issue comments": mirror each TERMINAL marker
 # (ready/accept/blocked) at its branch tip to a gh issue comment whose body is the
@@ -227,9 +227,9 @@ _echoed_file() { printf '%s/echoed-comments\n' "$(_night_state_dir)"; }
 # tag); the hub, which has gh-write, echoes the human-facing comment here. The
 # non-terminal gate/<N> PLAN park is deliberately NOT echoed. Idempotent (the
 # seen-file) and best-effort (no gh, or a gh failure, logs and continues — a
-# missing comment must never break the night).
+# missing comment must never break the away run).
 echo_marker_comments() {
-  command -v gh >/dev/null 2>&1 || { echo "hub-morning: gh not found — skipping comment echo" >&2; return 0; }
+  command -v gh >/dev/null 2>&1 || { echo "hub-return: gh not found — skipping comment echo" >&2; return 0; }
   local seen ref kind issue body
   seen="$(_echoed_file)"
   mkdir -p "$(dirname "$seen")" 2>/dev/null || true
@@ -243,10 +243,10 @@ echo_marker_comments() {
     body="$(git -C "$MAIN_ROOT" tag -l --format='%(contents:body)' "$ref" 2>/dev/null \
       | sed '/^[[:space:]]*$/d' | head -5)"
     [ -n "$body" ] || body="$kind"
-    if gh issue comment "$issue" --body "night-mode ${kind}/${issue}: ${body}" >/dev/null 2>&1; then
+    if gh issue comment "$issue" --body "afk-mode ${kind}/${issue}: ${body}" >/dev/null 2>&1; then
       printf '%s\n' "$ref" >> "$seen"
     else
-      echo "hub-morning: gh issue comment $issue failed (non-fatal)" >&2
+      echo "hub-return: gh issue comment $issue failed (non-fatal)" >&2
     fi
   done < <(git -C "$MAIN_ROOT" for-each-ref --format='%(refname:short)' \
              'refs/tags/ready/*' 'refs/tags/accept/*' 'refs/tags/blocked/*')
@@ -258,8 +258,8 @@ main() {
     --triage) land_triage_all ;;
     --comments) echo_marker_comments ;;
     ""|--report) report ;;
-    -h|--help) echo "usage: hub-morning.sh [--report|--triage|--comments]" >&2; return 0 ;;
-    *) echo "hub-morning: unknown argument: $1" >&2; return 2 ;;
+    -h|--help) echo "usage: hub-return.sh [--report|--triage|--comments]" >&2; return 0 ;;
+    *) echo "hub-return: unknown argument: $1" >&2; return 2 ;;
   esac
 }
 

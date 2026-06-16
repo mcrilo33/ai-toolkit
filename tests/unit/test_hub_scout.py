@@ -1,12 +1,12 @@
 """Unit tests for shared/skills/hub/scripts/hub-scout.sh (issue #40 ST5, Phase 3).
 
-Parallel night spokes are blind to each other; collisions waste night work. Before
-any spoke starts, a scout analyzes the whole `night` queue and the USER approves a
+Parallel AFK spokes are blind to each other; collisions waste away-window work. Before
+any spoke starts, a scout analyzes the whole `afk` queue and the USER approves a
 batching plan. The split is deliberate:
   * DETERMINISTIC (this script): gather the queue + per-issue file-scope hints,
     compute the pairwise raw file-overlap matrix (a set intersection — facts, not a
     verdict), and the critical-path feasibility arithmetic (does an all-serial /
-    all-parallel makespan fit before NIGHT_END?). It sources hub-night.sh so there
+    all-parallel makespan fit before AFK_UNTIL?). It sources hub-afk.sh so there
     is ONE clock and ONE T_task across scout and supervisor.
   * JUDGMENT (a documented Opus agent step, not this script): classify each overlap
     as PARALLEL / SERIAL / MERGE and stamp the verdict into the issues as
@@ -94,7 +94,7 @@ def test_overlap_empty_when_disjoint() -> None:
     assert result.stdout.strip() == "", "disjoint scopes have no overlap"
 
 
-# ── feasibility: makespan bounds vs time-to-wake (one clock with hub-night) ───
+# ── feasibility: makespan bounds vs time-to-wake (one clock with hub-afk) ───
 
 
 def test_parallel_makespan_packs_into_the_cap() -> None:
@@ -111,22 +111,22 @@ def test_serial_makespan_is_linear() -> None:
     assert result.stdout.strip() == "540"
 
 
-def test_fits_before_wake_true_when_makespan_under_window() -> None:
+def test_fits_in_window_true_when_makespan_under_window() -> None:
     # 23:00 -> 07:00 is 480 min; a 180-min makespan fits.
     now = _epoch(2026, 6, 15, 23, 0)
 
-    result = _call(f"fits_before_wake 180 {now}")
+    result = _call(f"fits_in_window 180 {now}")
 
     assert result.returncode == 0, result.stderr
 
 
-def test_fits_before_wake_false_when_makespan_overflows() -> None:
+def test_fits_in_window_false_when_makespan_overflows() -> None:
     # 540-min all-serial makespan does NOT fit the 480-min window.
     now = _epoch(2026, 6, 15, 23, 0)
 
-    result = _call(f"fits_before_wake 540 {now}")
+    result = _call(f"fits_in_window 540 {now}")
 
-    assert result.returncode != 0, "an over-committed night must be caught before it is wasted"
+    assert result.returncode != 0, "an over-committed window must be caught before it is wasted"
 
 
 # ── directive validation: a dangling or self-referential predecessor is refused ─
@@ -140,7 +140,7 @@ def test_validate_serial_after_rejects_self_reference() -> None:
 
 
 def test_validate_serial_after_rejects_dangling_predecessor() -> None:
-    # The predecessor must be in the night queue.
+    # The predecessor must be in the afk queue.
     result = _call("validate_serial_after 42 99 '41 42 43'")
 
     assert result.returncode != 0
@@ -164,7 +164,7 @@ def _flat(path: Path) -> str:
 
 def test_start_task_prompts_for_a_scope_line() -> None:
     # start-task asks the author for a Scope: glob list at issue-creation time so
-    # the scout's disjointness filter has a high-quality hint for every night issue.
+    # the scout's disjointness filter has a high-quality hint for every afk issue.
     flat = _flat(SKILLS_DIR / "start-task" / "SKILL.md")
     assert "scope:" in flat, "start-task must record a Scope: line in the issue body"
     assert "glob" in flat or "files" in flat or "paths" in flat
@@ -204,7 +204,7 @@ def test_dossier_renders_pairwise_overlap(tmp_path: Path) -> None:
         "TZ": "UTC",
         "PATH": f"{bindir}:{os.environ['PATH']}",
         "BODIES": str(bodies),
-        "NIGHT_NOW": str(_epoch(2026, 6, 15, 23, 0)),
+        "AFK_NOW": str(_epoch(2026, 6, 15, 23, 0)),
     }
     result = subprocess.run(["bash", str(HUB_SCOUT)], capture_output=True, text=True, env=env)
 

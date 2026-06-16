@@ -235,17 +235,17 @@ def test_gate_does_not_emit_ready(spoke: Path, remote: Path) -> None:
 
 
 # ── accept/N and blocked/N: the terminal markers (issue #40) ─────────────────
-# Night mode adds two more terminal markers beside ready/N, each frees a
+# AFK mode adds two more terminal markers beside ready/N, each frees a
 # supervisor slot:
 #   accept/N  — built + pushed + agent-reviewed, final sign-off inherently human
-#               (the morning EYEBALL tier).
+#               (the return-report EYEBALL tier).
 #   blocked/N — stuck (ambiguity, suspected cheating, budget) → answer + re-queue
-#               (the morning THINK tier).
+#               (the return-report THINK tier).
 # They are annotated, force-moved, pushed tags exactly like ready/N, selected by a
 # NAMED flag mirroring --gate (so they ride the existing `spoke-ready.sh:*`
 # wildcard allowlist with no new spoke permission). Payload schema: the tag
 # SUBJECT is the state word; the tag BODY is the optional -m reason — the trust
-# summary / blocker text the morning report renders.
+# summary / blocker text the return report renders.
 
 
 @pytest.mark.parametrize("flag,kind", [("--accept", "accept"), ("--blocked", "blocked")])
@@ -291,7 +291,7 @@ def test_terminal_marker_does_not_emit_ready(spoke: Path, remote: Path, flag: st
 # ── Durability: a terminal marker must not be emitted over un-pushed work ─────
 # A terminal marker claims the issue's work is finished and landable. If the
 # branch commits never reached origin (the #43 narrated-push failure), the hub
-# would free the slot and the morning report would show a LAND row for work that
+# would free the slot and the return report would show a LAND row for work that
 # is not durable. So spoke-ready.sh refuses a terminal marker when HEAD is not
 # contained in the branch's pushed upstream. The non-terminal gate/N park is
 # EXEMPT — it legitimately precedes any branch push.

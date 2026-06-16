@@ -129,23 +129,23 @@ def test_anti_gutting_copied_into_hooks(repo: Path) -> None:
     assert os.access(scan, os.X_OK)
 
 
-# --- the anti-gutting tripwire blocks a test-gutting push under NIGHT=1 ----------
+# --- the anti-gutting tripwire blocks a test-gutting push under AFK=1 ----------
 
 
-def test_pre_push_blocks_gutting_under_night(repo: Path) -> None:
+def test_pre_push_blocks_gutting_under_afk(repo: Path) -> None:
     seed = _remote_sha(repo)
     _unpushed_gutting_commit(repo)
     hooks = _install(repo)
     _stub_selector(hooks, exit_code=0)  # isolate: only anti-gutting may block
 
-    push = _push(repo, extra_env={"NIGHT": "1"})
+    push = _push(repo, extra_env={"AFK": "1"})
 
-    assert push.returncode != 0, "NIGHT must block a test-gutting push"
+    assert push.returncode != 0, "AFK must block a test-gutting push"
     assert _remote_sha(repo) == seed, "nothing may ship when the tripwire fires"
 
 
-def test_pre_push_allows_gutting_off_night(repo: Path) -> None:
-    # Off the night path the tripwire is advisory — a human's ordinary test edit
+def test_pre_push_allows_gutting_off_afk(repo: Path) -> None:
+    # Off the AFK path the tripwire is advisory — a human's ordinary test edit
     # (which may legitimately remove/weaken an assert) is never gated.
     _unpushed_gutting_commit(repo)
     hooks = _install(repo)

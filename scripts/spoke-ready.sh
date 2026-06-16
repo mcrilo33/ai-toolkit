@@ -54,9 +54,9 @@ usage() {
 # KIND selects the marker namespace and SUBJECT is the annotated tag's subject
 # line (the state word). ready/<N> means the whole issue is done; gate/<N> is the
 # non-terminal PLAN park (subject "plan"); accept/<N> and blocked/<N> are the two
-# extra TERMINAL markers night mode adds (issue #40) — accept = built + pushed +
+# extra TERMINAL markers AFK mode adds — accept = built + pushed +
 # agent-reviewed, final sign-off inherently human; blocked = stuck. A -m <reason>
-# becomes the tag BODY (the trust summary / blocker the morning report renders);
+# becomes the tag BODY (the trust summary / blocker the return report renders);
 # omitted, the body is empty and the subject is the only payload.
 #
 # The state flags are mutually exclusive: passing two is a usage error.
@@ -103,7 +103,7 @@ if ! git rev-parse --verify -q HEAD >/dev/null; then
 fi
 
 # Durability: ready/<N> and accept/<N> CLAIM the work is landable/reviewable, so
-# the hub frees the slot and the morning report shows a LAND/EYEBALL row. If the
+# the hub frees the slot and the return report shows a LAND/EYEBALL row. If the
 # branch commits never reached origin (the #43 narrated-push failure), that claim
 # is over un-pushed work the hub can't see — refuse unless HEAD is contained in the
 # branch's pushed upstream. gate/<N> (PLAN park) and blocked/<N> (stuck) are STOP

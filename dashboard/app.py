@@ -582,13 +582,13 @@ def _resolve_store(span_log: Path, log_mtime: float) -> tuple[queries.SpanStore 
     return load_store(span_log), "raw"
 
 
-def render_morning_view(store: queries.SpanStore) -> None:
-    st.header("Morning")
+def render_return_view(store: queries.SpanStore) -> None:
+    st.header("Return")
     st.caption(
-        "Last night's spoke runs — the cost lens that complements the shell worklist "
-        "(`hub-morning.sh`). Land readiness is the night's land-triage verdict."
+        "The away window's spoke runs — the cost lens that complements the shell worklist "
+        "(`hub-return.sh`). Land readiness is the away window's land-triage verdict."
     )
-    rows = store.morning_rows()
+    rows = store.return_rows()
     if not rows:
         st.info("No spoke runs found.")
         return
@@ -622,12 +622,12 @@ def main() -> None:
     source_key = f"{mode}:{log_mtime}"
 
     view = st.sidebar.radio(
-        "View", ["Spoke", "Morning", "Aggregate", "A/B compare", "Automatability"]
+        "View", ["Spoke", "Return", "Aggregate", "A/B compare", "Automatability"]
     )
     if view == "Spoke":
         render_spoke_view(store, source_key)
-    elif view == "Morning":
-        render_morning_view(store)
+    elif view == "Return":
+        render_return_view(store)
     elif view == "Aggregate":
         render_aggregate_view(store)
     elif view == "A/B compare":
