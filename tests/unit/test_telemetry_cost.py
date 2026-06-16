@@ -358,6 +358,16 @@ class TestPerTurnRows:
         assert all(r["cost_usd"] is None for r in rows)
         assert all(int(r["tokens_total"]) > 0 for r in rows)  # type: ignore[arg-type]
 
+    def test_reasoning_gist_joins_onto_its_turn(self) -> None:
+        # Issue #59: a turn's reasoning summary (matched on session/source/agent/ts)
+        # rides on its per-turn row so the tree can attach it as a `reasoning` node.
+        parsed = parse_session_file(SESSION)
+        rows = per_turn_rows(parsed.usage_events, {}, reasoning_refs=parsed.reasoning_refs)
+        matched = [r for r in rows if r.get("reasoning")]
+        assert any(r["reasoning"] == "Running skill" for r in matched)
+        # A turn with no reasoning ref carries reasoning=None — never a stray gist.
+        assert any(r["reasoning"] is None for r in rows)
+
 
 class TestCcusageLoader:
     def test_maps_claude_session_period_to_total_cost(self) -> None:

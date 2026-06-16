@@ -830,6 +830,12 @@ class TestReasoningRefs:
     def test_reasoning_ref_never_carries_thinking_text(self, parsed: ParsedSession) -> None:
         assert "SECRET_THINKING" not in str(parsed.reasoning_refs[0])
 
+    def test_reasoning_ref_summary_is_the_turn_narration(self, parsed: ParsedSession) -> None:
+        # Issue #59: the per-turn reasoning summary is the turn's *visible* narration
+        # (the user-facing text block), never the redacted thinking — real extended
+        # thinking is signature-only, so the narration is the privacy-safe gist.
+        assert parsed.reasoning_refs[0].summary == "Running skill"
+
     def test_parse_projects_dir_merges_reasoning_refs(self) -> None:
         merged = parse_projects_dir(FIXTURES)
         assert any(r.source == "main" for r in merged.reasoning_refs)
