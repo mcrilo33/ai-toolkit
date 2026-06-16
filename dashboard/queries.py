@@ -141,6 +141,10 @@ _APPROVAL_NAME = "tool-permission"
 _GATE_WINDOW_S = 120.0
 _DECISION_WORD: dict[str, str] = {"allow": "allowed", "deny": "denied", "warn": "flagged"}
 _NEVER_RAN = "(blocked, never ran)"
+# Fold a gate's raw status into the canonical allow / ask / deny breakdown surfaced
+# in the Automatability view (Issue #60): a ``warn`` is an advisory the human had to
+# act on, so it counts as an ``ask``.
+_DECISION_BUCKET: dict[str, str] = {"allow": "allow", "warn": "ask", "deny": "deny"}
 
 
 def _fetch_dicts(
@@ -831,7 +835,9 @@ class SpanStore:
         - ``on_critical_path`` — fraction of the spans that are ``step`` or
           ``lifecycle`` (blocking the workflow's spine) rather than incidental.
 
-        Reports ``mean_wait_ms`` too. This only SURFACES candidates; judging
+        Reports ``mean_wait_ms`` too, plus a canonical ``decisions`` breakdown
+        (allow / ask / deny — ``warn`` folds into ask, Issue #60) so an approval
+        group shows how the gate resolved. This only SURFACES candidates; judging
         whether one is truly automatable is a later LLM-judge step. Groups below
         ``min_frequency`` are dropped; rows sort by score descending.
         """
@@ -848,20 +854,26 @@ class SpanStore:
             GROUP BY name, phase, human_type
             """
         )
-        # Modal-status count per group, computed in Python: a SQL self-join on
+        # Per-status counts per group, computed in Python: a SQL self-join on
         # (name, phase, human_type) would drop null-phase groups (NULL != NULL).
+        # These feed both the modal-status consistency and the decision breakdown.
         status_rows = self._query(
             """
-            SELECT name, phase, human_type, COUNT(*) AS cnt
+            SELECT name, phase, human_type, status, COUNT(*) AS cnt
             FROM spans
             WHERE human_type IS NOT NULL
             GROUP BY name, phase, human_type, status
             """
         )
         modal: dict[tuple[Any, Any, Any], int] = {}
+        decisions: dict[tuple[Any, Any, Any], dict[str, int]] = {}
         for row in status_rows:
             key = (row["name"], row["phase"], row["human_type"])
             modal[key] = max(modal.get(key, 0), row["cnt"])
+            bucket = decisions.setdefault(key, {"allow": 0, "ask": 0, "deny": 0})
+            slot = _DECISION_BUCKET.get(row["status"])
+            if slot is not None:
+                bucket[slot] += row["cnt"]
 
         result: list[dict[str, Any]] = []
         for group in groups:
@@ -871,6 +883,7 @@ class SpanStore:
             consistency = modal[key] / group["frequency"]
             group["consistency"] = consistency
             group["score"] = group["frequency"] * consistency * group["on_critical_path"]
+            group["decisions"] = decisions[key]
             result.append(group)
         result.sort(key=lambda r: (-r["score"], r["name"], r["phase"] or "", r["human_type"]))
         return result
@@ -955,6 +968,12 @@ def format_step_label(node: dict[str, Any]) -> str:
     """
     if node["kind"] == "hooks":
         return f"hooks x{node['collapsed_count']}"
+    # An approval reads as the gate it was: "🔐 ask→allow/deny/warn" (Issue #60),
+    # the decision carried on its own ``status``. The tool it gated is shown by the
+    # tree nesting (the approval sits under an allowed tool; a blocked tool sits
+    # under the approval), so the label stays the decision alone.
+    if node["kind"] == "approval":
+        return f"🔐 ask→{node.get('status') or 'ask'}"
     # A collapsed context group reads "rule x3" / "memory x1" / "tool-schema x2".
     if node["kind"] == "context":
         return f"{node['phase']} x{node['collapsed_count']}"
@@ -1043,6 +1062,10 @@ def _kind_row(kind: str, group: list[dict[str, Any]]) -> dict[str, Any]:
     durations = [node["duration_ms"] for node in group]
     costs = [node["own_cost_usd"] for node in group]
     models = sorted({model for node in group for model in node["models"]})
+    # Mean human wait across the group's timed interactions (Issue #60): the
+    # approval row reports the gate's mean wait; a kind with no human wait reports
+    # None (never a bogus 0) so the meta view shows an em dash for it.
+    waits = [w for node in group if (w := node.get("human_wait_ms")) is not None]
     return {
         "kind": kind,
         "count": len(group),
@@ -1051,5 +1074,6 @@ def _kind_row(kind: str, group: list[dict[str, Any]]) -> dict[str, Any]:
         "median_duration_ms": statistics.median(durations),
         "total_cost_usd": sum(costs),
         "mean_cost_usd": sum(costs) / len(group),
+        "mean_wait_ms": statistics.mean(waits) if waits else None,
         "models": models,
     }

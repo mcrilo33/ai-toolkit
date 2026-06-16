@@ -178,6 +178,10 @@ def _node_label(node: dict) -> str:
     badges = node.get("badges")
     if badges:
         label += " " + " ".join(f"`{badge}`" for badge in badges)
+    # A gate-blocked tool reads as never-run regardless of its summary text — the
+    # tool carries status='deny' only when a deny approval blocked it (Issue #60).
+    if node.get("kind") == "tool" and node.get("status") == "deny":
+        label += " `never-run`"
     return label
 
 
@@ -269,6 +273,9 @@ def _render_meta(store: queries.SpanStore, spoke_id: str) -> None:
             "Median time": _fmt_secs(row["median_duration_ms"]),
             "Total cost": _fmt_cost(row["total_cost_usd"]),
             "Mean cost": _fmt_cost(row["mean_cost_usd"]),
+            # Mean human wait — set only for timed interactions (approvals); an
+            # em dash for kinds that never waited on a human (Issue #60).
+            "Mean wait": _fmt_secs(row.get("mean_wait_ms")),
             "Models": ", ".join(queries._short_model(m) for m in row["models"]) or "—",
         }
         for row in rows
@@ -539,6 +546,17 @@ def _interaction_label(row: dict[str, Any]) -> str:
     return label
 
 
+def _decisions_label(decisions: dict[str, int] | None) -> str:
+    """The allow/ask/deny breakdown for an approval candidate (Issue #60).
+
+    An em dash for an interaction with no decision breakdown (a non-approval
+    human prompt/question, which carries ``decisions=None`` only on legacy rows).
+    """
+    if not decisions:
+        return "—"
+    return " · ".join(f"{slot} {decisions.get(slot, 0)}" for slot in ("allow", "ask", "deny"))
+
+
 def render_automatability_view(store: queries.SpanStore) -> None:
     st.header("Automatability candidates")
     st.caption(
@@ -560,6 +578,7 @@ def render_automatability_view(store: queries.SpanStore) -> None:
             "Freq": row["frequency"],
             "Consistency": f"{row['consistency']:.0%}",
             "On critical path": f"{row['on_critical_path']:.0%}",
+            "Decisions": _decisions_label(row.get("decisions")),
             "Mean wait": _fmt_secs(row["mean_wait_ms"]),
         }
         for row in rows
