@@ -220,10 +220,16 @@ if ! (
   wt_die "landing aborted; nothing was pushed. Fix on the branch (push from the spoke when it has one) and re-run."
 fi
 
-# --- telemetry: lifecycle/land span ----------------------------------------------
+# --- telemetry: land lifecycle marker + script run-node --------------------------
 # Emit AFTER the merge+push succeeds but BEFORE teardown, while the worktree (and
-# its spoke_run_id) still exists. No-op unless AI_TOOLKIT_TELEMETRY=1.
-[ -n "$WT_DIR" ] && wt_emit_lifecycle "worktree-land" "land" "success" "$WT_T0" "$WT_DIR"
+# its spoke_run_id) still exists. The script span is this control script as a trace
+# node, sharing the marker's name (emission-link basis); it is also the node a later
+# subtask uses to anchor the script→script chain to the worktree-done span this
+# script shells out to next. No-op unless AI_TOOLKIT_TELEMETRY=1.
+if [ -n "$WT_DIR" ]; then
+  wt_emit_lifecycle "worktree-land" "land" "success" "$WT_T0" "$WT_DIR"
+  wt_emit_script "worktree-land" "success" "$WT_T0" "$WT_DIR"
+fi
 
 if [ -n "$WT_DIR" ]; then
   bash "$SCRIPT_DIR/worktree-done.sh" "$WT_DIR" ${KEEP_BRANCH:+--keep-branch}
