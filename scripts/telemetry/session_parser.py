@@ -11,8 +11,16 @@ discovered at ``<session>/subagents/workflows/wf_*/agent-<id>.jsonl``; nested
 Task agents recurse so agent→agent chains reconstruct at any depth (walked once
 per agentId via a session-global guard); a ledger-creation ``TodoWrite`` gets a
 lead-item label; extended-thinking blocks surface privacy-safe ``reasoning_refs``;
-a ``claude -p`` Bash links a ``sidecar_session``; and loaded rule files become
-``rule`` spans while CLAUDE.md / memory become name-only ``context_loads``.
+a ``claude -p`` Bash links a ``sidecar_session``; and loaded context becomes
+``rule`` spans tagged by ``phase`` subtype.
+
+Issue #59 fixes the loaded-context source: #51 read it from ``Contents of <path>``
+system-reminder headers that exist only in the hand-built fixture, so the surface
+measured zero on every real spoke. Real transcripts deliver loaded context as
+``attachment`` records — ``nested_memory`` (rules / CLAUDE.md / memory) and
+``deferred_tools_delta`` (tool schemas) — so each item becomes a ``rule``-kind span
+whose ``phase`` names its subtype (``rule`` / ``CLAUDE.md`` / ``memory`` /
+``tool-schema``), carrying a per-item token estimate but never the file body.
 
 Privacy: metadata plus short *intent* labels are read out of a record — tool
 name, skill name, subagent type, timestamps, token counts, the ``agentId`` link,
@@ -71,9 +79,15 @@ _SIDECAR_PRINT_RE = re.compile(r"(?:^|\s)(?:-p|--print)(?:\s|=|$)")
 # matches the tail of an unrelated token (``--foo-r``, an earlier ``grep -r``).
 _SIDECAR_ID_RE = re.compile(r"(?:^|\s)(?:--session-id|--resume|-r)[=\s]+([A-Za-z0-9._-]+)")
 
-# Each loaded-context file is injected under a ``Contents of <path>`` header (Issue
-# #51 S4). Only the path is captured — the file body that follows is never read.
-_CONTEXT_HEADER_RE = re.compile(r"Contents of (/[^\s()]+\.md)")
+# Loaded context arrives as ``attachment`` records (Issue #59). A ``nested_memory``
+# attachment carries one rule / CLAUDE.md / memory file; a ``deferred_tools_delta``
+# the tool schemas made available. Only the path/name and a body-size token estimate
+# are read — never the file body.
+_NESTED_MEMORY = "nested_memory"
+_DEFERRED_TOOLS = "deferred_tools_delta"
+# ~4 characters per token — a rough size estimate so each loaded item is drillable to
+# its per-item context cost without a token-counting API.
+_CHARS_PER_TOKEN = 4
 
 
 @dataclass(slots=True)
@@ -108,22 +122,6 @@ class ReasoningRef:
 
 
 @dataclass(slots=True)
-class ContextLoad:
-    """A loaded-context item with no real span kind (Issue #51 S4).
-
-    Rule files become real ``rule`` spans; the rest of the window's loaded context —
-    ``CLAUDE.md`` and memory recalls — has no span kind, so it is surfaced here as a
-    name-only record (never the file body) for the dashboard to render as synthetic
-    ``context`` nodes.
-    """
-
-    kind: str  # "claude_md" | "memory"
-    name: str
-    ts: str | None
-    session_id: str | None
-
-
-@dataclass(slots=True)
 class ParsedSession:
     """Parser output: spans plus the raw material the correlation pass needs."""
 
@@ -131,7 +129,6 @@ class ParsedSession:
     usage_events: list[UsageEvent] = field(default_factory=list)
     agent_links: dict[str, str] = field(default_factory=dict)  # agent span_id -> agentId
     reasoning_refs: list[ReasoningRef] = field(default_factory=list)
-    context_loads: list[ContextLoad] = field(default_factory=list)
 
 
 def parse_session_file(path: Path) -> ParsedSession:
@@ -159,9 +156,7 @@ def parse_session_file(path: Path) -> ParsedSession:
 
     parsed.spans.extend(_human_prompt_spans(records, meta))
     parsed.reasoning_refs.extend(_reasoning_refs(records, path.stem, "main", None, meta))
-    rule_spans, context_loads = _context_and_rule_loads(records, meta)
-    parsed.spans.extend(rule_spans)
-    parsed.context_loads.extend(context_loads)
+    parsed.spans.extend(_context_and_rule_loads(records, meta))
 
     events, spans, links = _walk_workflow_agents(path, parent_meta=meta, seen=seen)
     parsed.usage_events.extend(events)
@@ -186,7 +181,6 @@ def parse_projects_dir(root: Path) -> ParsedSession:
         merged.usage_events.extend(parsed.usage_events)
         merged.agent_links.update(parsed.agent_links)
         merged.reasoning_refs.extend(parsed.reasoning_refs)
-        merged.context_loads.extend(parsed.context_loads)
     return merged
 
 
@@ -469,91 +463,116 @@ def _reasoning_refs(
     return refs
 
 
-def _context_and_rule_loads(
-    records: list[dict], meta: dict[str, str | None]
-) -> tuple[list[Span], list[ContextLoad]]:
-    """Extract the window's loaded rule / CLAUDE.md / memory files (Issue #51 S4).
+def _context_and_rule_loads(records: list[dict], meta: dict[str, str | None]) -> list[Span]:
+    """Extract the window's loaded context from ``attachment`` records (Issue #59).
 
-    Each ``Contents of <path>`` header names one loaded file. A rule file becomes a
-    real ``rule`` span (``name`` = its stem); CLAUDE.md and memory have no real span
-    kind, so they become name-only :class:`ContextLoad` records. Only the path is
-    read — never the file body — and each path is recorded once (deduped).
+    A ``nested_memory`` attachment carries one rule / CLAUDE.md / memory file (path +
+    body); a ``deferred_tools_delta`` the tool schemas made available. Each item
+    becomes a ``rule``-kind span whose ``phase`` names its subtype (``rule`` /
+    ``CLAUDE.md`` / ``memory`` / ``tool-schema``), so the dashboard groups them into
+    one ``context`` node per subtype. Only the name and a body-size token estimate are
+    read — never the file body — and each item is recorded once (deduped on identity).
     """
-    rule_spans: list[Span] = []
-    context_loads: list[ContextLoad] = []
-    seen_paths: set[str] = set()
+    spans: list[Span] = []
+    seen: set[tuple[str, str]] = set()
     for rec in records:
-        if not _is_context_carrier(rec):
+        attachment = rec.get("attachment")
+        if rec.get("type") != "attachment" or not isinstance(attachment, dict):
             continue
         ts = rec.get("timestamp")
-        for text in _record_texts(rec):
-            for path in _CONTEXT_HEADER_RE.findall(text):
-                if path in seen_paths:
-                    continue
-                seen_paths.add(path)
-                span, load = _classify_context_path(path, ts, meta)
-                if span is not None:
-                    rule_spans.append(span)
-                if load is not None:
-                    context_loads.append(load)
-    return rule_spans, context_loads
+        kind = attachment.get("type")
+        if kind == _NESTED_MEMORY:
+            span = _nested_memory_span(attachment, ts, meta, seen)
+            if span is not None:
+                spans.append(span)
+        elif kind == _DEFERRED_TOOLS:
+            spans.extend(_tool_schema_spans(attachment, ts, meta, seen))
+    return spans
 
 
-def _classify_context_path(
-    path: str, ts: str | None, meta: dict[str, str | None]
-) -> tuple[Span | None, ContextLoad | None]:
-    """Map a loaded-context path to a ``rule`` span or a :class:`ContextLoad` (else neither)."""
-    if "/.claude/rules/" in path:
-        span = Span(
-            span_id=derive_span_id(meta["session_id"] or "", "rule", path),
-            kind="rule",
-            name=Path(path).stem,
-            session_id=meta["session_id"],
-            repo=meta["repo"] or "unknown",
-            branch=meta["branch"],
-            ts_start=ts,
-            ts_end=ts,
-            duration_ms=0,
+def _nested_memory_span(
+    attachment: dict, ts: str | None, meta: dict[str, str | None], seen: set[tuple[str, str]]
+) -> Span | None:
+    """One ``rule`` span for a ``nested_memory`` rule / CLAUDE.md / memory file (else None)."""
+    path = attachment.get("path")
+    if not isinstance(path, str):
+        return None
+    phase, name = _classify_context_path(path)
+    if phase is None or name is None:
+        return None
+    key = (phase, path)
+    if key in seen:
+        return None
+    seen.add(key)
+    content = attachment.get("content")
+    body = content.get("content") if isinstance(content, dict) else None
+    return _context_span(phase, name, path, _size_summary(body), ts, meta)
+
+
+def _tool_schema_spans(
+    attachment: dict, ts: str | None, meta: dict[str, str | None], seen: set[tuple[str, str]]
+) -> list[Span]:
+    """One ``rule`` span (``phase='tool-schema'``) per tool a ``deferred_tools_delta`` adds.
+
+    Each deferred tool is name-only until fetched, so its estimate is the name's size;
+    the value of the surface is the count (``tool-schema xN``) and the cold-context
+    lens — tools made available but never used are trimming candidates.
+    """
+    names = attachment.get("addedNames")
+    if not isinstance(names, list):
+        return []
+    spans: list[Span] = []
+    for name in names:
+        if not isinstance(name, str):
+            continue
+        key = ("tool-schema", name)
+        if key in seen:
+            continue
+        seen.add(key)
+        spans.append(
+            _context_span("tool-schema", name, f"tool:{name}", _size_summary(name), ts, meta)
         )
-        return span, None
-    if path.endswith("/CLAUDE.md"):
-        return None, ContextLoad("claude_md", "CLAUDE.md", ts, meta["session_id"])
+    return spans
+
+
+def _classify_context_path(path: str) -> tuple[str | None, str | None]:
+    """Map a ``nested_memory`` path to its ``(phase, name)`` subtype (else ``(None, None)``)."""
+    if "/.claude/rules/" in path:
+        return "rule", Path(path).stem
+    if path.endswith("CLAUDE.md"):
+        return "CLAUDE.md", "CLAUDE.md"
     if path.endswith("MEMORY.md") or "/memory/" in path:
-        return None, ContextLoad("memory", Path(path).name, ts, meta["session_id"])
+        return "memory", Path(path).name
     return None, None
 
 
-def _is_context_carrier(rec: dict) -> bool:
-    """Whether a record is a loaded-context injection carrier (Issue #51 S4).
+def _size_summary(body: object) -> str:
+    """A per-item token estimate label (``~N tokens``) from a loaded item's body size.
 
-    The runtime delivers loaded context as a system-reminder on a meta user turn, so
-    the scan is restricted to a non-sidechain user record that is ``isMeta`` or carries
-    a ``<system-reminder>`` block. This keeps ordinary prose that merely quotes a
-    ``Contents of …`` line (an assistant message, a pasted log) from minting a phantom
-    rule span or context load.
+    Rough (``~4`` chars/token) and clearly approximate — exact context sizing needs a
+    token-counting API — but enough to weigh each item's context cost in the drill-down.
     """
-    if rec.get("type") != "user" or rec.get("isSidechain"):
-        return False
-    return bool(rec.get("isMeta")) or any("<system-reminder>" in t for t in _record_texts(rec))
+    chars = len(body) if isinstance(body, str) else 0
+    return f"~{max(1, chars // _CHARS_PER_TOKEN):,} tokens"
 
 
-def _record_texts(rec: dict) -> list[str]:
-    """The plain-text strings in a record's message content (text blocks / string)."""
-    message = rec.get("message")
-    if not isinstance(message, dict):
-        return []
-    content = message.get("content")
-    if isinstance(content, str):
-        return [content]
-    if not isinstance(content, list):
-        return []
-    return [
-        block["text"]
-        for block in content
-        if isinstance(block, dict)
-        and block.get("type") == "text"
-        and isinstance(block.get("text"), str)
-    ]
+def _context_span(
+    phase: str, name: str, identity: str, summary: str, ts: str | None, meta: dict[str, str | None]
+) -> Span:
+    """A ``rule``-kind loaded-context span tagged by ``phase`` subtype (Issue #59)."""
+    return Span(
+        span_id=derive_span_id(meta["session_id"] or "", "context", phase, identity),
+        kind="rule",
+        name=name,
+        phase=phase,
+        summary=summary,
+        session_id=meta["session_id"],
+        repo=meta["repo"] or "unknown",
+        branch=meta["branch"],
+        ts_start=ts,
+        ts_end=ts,
+        duration_ms=0,
+    )
 
 
 def _is_human_prompt(rec: dict) -> bool:
