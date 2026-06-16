@@ -76,17 +76,24 @@ park state (`plan` now; `red` / `draft` reserved for the follow-ups), force-move
 as the spoke advances and dropped once it moves past the gate. This is distinct
 from the final-completion marker: **`ready/<issue>`** still means *the whole
 issue is done* and is what `/land` consumes — `gate/<issue>` only means *parked,
-awaiting review*. Emit it when you park through the one allowlistable marker
-process — never a hand-written `git tag … && git push …` chain, which re-prompts
-(the same compound-command gotcha as the push, issues #37/#45):
+awaiting review*. Emit it **only** through the one allowlistable marker process:
 
 ```bash
 bash .ai-toolkit/scripts/spoke-ready.sh --gate <issue>
 ```
 
-It force-moves the annotated `gate/<issue>` tag and pushes it as a tag-only push,
-which the pre-push gate short-circuits (a marker carries no code), so emitting it
-never runs the suite; re-running is idempotent.
+Never hand-roll the tag push in any form — not a `git tag … && git push …` chain,
+not a bare `git push -f origin refs/tags/gate/<issue>`, and **never** piped into a
+filter like `… | grep -v telemetry` to hide noise. Two reasons: the compound form
+re-prompts the push gate (issues #37/#45), and piping a push into `grep`/any filter
+**masks its exit code** — a force-push that dies with SIGPIPE/exit 141 then reads as
+success and the marker silently never lands (see the long-gate SSH-stale footgun).
+If telemetry noise is the problem, fix the leak; do not filter the push output.
+
+The script force-moves the annotated `gate/<issue>` tag and pushes it as a tag-only
+push, which the pre-push gate short-circuits (a marker carries no code), so emitting
+it never runs the suite. To re-emit or move the gate, just **re-run the script** — it
+is idempotent — never a manual re-push of the refspec.
 
 ### Gate action — who services a parked gate (day vs night)
 
