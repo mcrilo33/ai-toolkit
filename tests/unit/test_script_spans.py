@@ -125,13 +125,21 @@ class TestSpokeReadyScriptSpan:
         assert spans[0]["status"] == "success"
         assert spans[0]["emits"] is None
 
-    def test_gate_span_tagged_with_gate_phase(self, spoke: Path, telemetry_dir: Path) -> None:
-        res = _run(SPOKE_READY, spoke, _tele_env(telemetry_dir), "--gate", "54")
+    @pytest.mark.parametrize(
+        "flag,phase",
+        [("--gate", "gate"), ("--accept", "accept"), ("--blocked", "blocked")],
+    )
+    def test_span_tagged_with_marker_namespace(
+        self, spoke: Path, telemetry_dir: Path, flag: str, phase: str
+    ) -> None:
+        # Each marker namespace flows through --phase "$KIND" so the trace
+        # distinguishes a completion marker from a park / terminal marker.
+        res = _run(SPOKE_READY, spoke, _tele_env(telemetry_dir), flag, "54")
 
         assert res.returncode == 0, res.stdout + res.stderr
         spans = _scripts(telemetry_dir, name="spoke-ready")
         assert len(spans) == 1
-        assert spans[0]["phase"] == "gate"
+        assert spans[0]["phase"] == phase
 
     def test_noop_when_disabled(self, spoke: Path, telemetry_dir: Path) -> None:
         res = _run(SPOKE_READY, spoke, _tele_env(telemetry_dir, enabled=False), "54")
