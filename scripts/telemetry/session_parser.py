@@ -6,9 +6,13 @@ matching ``<session>/subagents/agent-<id>.jsonl`` transcript so the subagent's
 own token usage can be attributed to the parent agent span by the correlation
 pass.
 
-Privacy: only metadata is read out of a record — tool name, skill name,
-subagent type, timestamps, token counts, the ``agentId`` link. Prompt text,
-answers, thinking, and tool output are never copied into a span.
+Privacy: metadata plus short *intent* labels are read out of a record — tool
+name, skill name, subagent type, timestamps, token counts, the ``agentId`` link,
+and (Issue #47) a few-word ``summary`` per node: the in-progress todo item, an
+agent's task ``description``, a human prompt/question's first line, and a tool's
+single main parameter (Bash command, file path, Grep pattern). Bulk/long-form
+content — thinking, an agent's full prompt, a tool's secondary input (replacement
+text, file content) and its output, and human answers — is never copied.
 """
 
 from __future__ import annotations
@@ -22,6 +26,27 @@ from telemetry.spans import Span, derive_span_id
 
 AGENT_TOOLS = frozenset({"Task", "Agent"})
 TODO_TOOLS = frozenset({"TodoWrite", "TaskCreate", "TaskUpdate"})
+
+# The one input key naming what a tool acted on — surfaced as the tool leaf's
+# summary so the trace reads "what over what" (Issue #47). Only this main
+# identifying parameter is read; bulk/secondary fields (Edit's replacement text,
+# Write's content, Read's output) are never copied into a span.
+TOOL_MAIN_PARAM: dict[str, str] = {
+    "Bash": "command",
+    "Read": "file_path",
+    "Edit": "file_path",
+    "MultiEdit": "file_path",
+    "Write": "file_path",
+    "NotebookEdit": "notebook_path",
+    "Grep": "pattern",
+    "Glob": "pattern",
+    "LS": "path",
+    "WebFetch": "url",
+    "WebSearch": "query",
+}
+# Conservative fallback for tools absent from the map: the first present target
+# key. Deliberately excludes free-form content keys (prompt/content/old_string).
+_GENERIC_PARAM_KEYS = ("file_path", "path", "command", "pattern", "query", "url")
 
 
 @dataclass(slots=True)
@@ -53,6 +78,7 @@ def parse_session_file(path: Path) -> ParsedSession:
     records = _load_jsonl(path)
     meta = _session_meta(records)
     results = _tool_results(records)
+    todo_summaries = _todo_summaries(records)
 
     parsed = ParsedSession()
     for rec in records:
@@ -64,7 +90,7 @@ def parse_session_file(path: Path) -> ParsedSession:
         if isinstance(message.get("usage"), dict):
             parsed.usage_events.append(_usage_event(rec, "main", None))
         for block in message.get("content") or []:
-            _consume_tool_use(block, rec, results, meta, path, parsed)
+            _consume_tool_use(block, rec, results, meta, path, parsed, todo_summaries)
 
     parsed.spans.extend(_human_prompt_spans(records, meta))
     return parsed
@@ -95,10 +121,11 @@ def _consume_tool_use(
     meta: dict[str, str | None],
     path: Path,
     parsed: ParsedSession,
+    todo_summaries: dict[str, str],
 ) -> None:
     if not (isinstance(block, dict) and block.get("type") == "tool_use"):
         return
-    span = _span_for_tool_use(block, rec, results, meta)
+    span = _span_for_tool_use(block, rec, results, meta, todo_summaries)
     if span is None:
         return
     parsed.spans.append(span)
@@ -107,11 +134,19 @@ def _consume_tool_use(
     agent_id = results.get(block.get("id") or "", {}).get("agent_id")
     if agent_id:
         parsed.agent_links[span.span_id] = agent_id
-        parsed.usage_events.extend(_walk_subagent(path, agent_id))
+        events, sub_spans = _walk_subagent(
+            path, agent_id, parent_meta=meta, agent_span_id=span.span_id
+        )
+        parsed.usage_events.extend(events)
+        parsed.spans.extend(sub_spans)
 
 
 def _span_for_tool_use(
-    block: dict, rec: dict, results: dict[str, dict], meta: dict[str, str | None]
+    block: dict,
+    rec: dict,
+    results: dict[str, dict],
+    meta: dict[str, str | None],
+    todo_summaries: dict[str, str],
 ) -> Span | None:
     name = block.get("name")
     tool_use_id = block.get("id") or ""
@@ -132,13 +167,135 @@ def _span_for_tool_use(
     if name == "Skill":
         return Span(kind="skill", name=inputs.get("skill", "skill"), **common)
     if name in AGENT_TOOLS:
-        return Span(kind="agent", name=inputs.get("subagent_type", "agent"), **common)
+        # summary = the Task tool's short `description`; the long `prompt` is never read.
+        return Span(
+            kind="agent",
+            name=inputs.get("subagent_type", "agent"),
+            summary=_snippet(inputs.get("description")),
+            **common,
+        )
     if name in TODO_TOOLS:
-        return Span(kind="todo", name=name, **common)
+        # name stays the bare tool (grouping key); summary names the ledger item.
+        return Span(
+            kind="todo",
+            name=name if isinstance(name, str) else "todo",
+            summary=todo_summaries.get(tool_use_id),
+            **common,
+        )
     if name == "AskUserQuestion":
         human = {"type": "question", "wait_ms": _duration_ms(ts_start, ts_end)}
-        return Span(kind="human", name="AskUserQuestion", human=human, **common)
-    return None
+        return Span(
+            kind="human",
+            name="AskUserQuestion",
+            summary=_question_snippet(inputs),
+            human=human,
+            **common,
+        )
+    # Every other tool_use is a leaf span (Issue #47 S2b) summarising what it acted
+    # on — the tool's MAIN identifying parameter only (Bash command, file path, Grep
+    # pattern). Bulk/secondary input (replacement text, file content) is never read.
+    return Span(
+        kind="tool",
+        name=name if isinstance(name, str) else "tool",
+        summary=_tool_param(name, inputs),
+        **common,
+    )
+
+
+def _todo_summaries(records: list[dict]) -> dict[str, str]:
+    """Map each todo ``tool_use`` id to the few-word item it advances (Issue #47).
+
+    Two ledger shapes are resolved into one summary per write:
+
+    - ``TodoWrite`` snapshots: diff each write's in-progress set against the
+      previous one to isolate the item that *newly* entered progress — the step's
+      todo. No distinguishable transition falls back to whatever is in progress;
+      nothing in progress yields no summary (the span keeps its bare tool name).
+    - ``TaskCreate`` / ``TaskUpdate`` (incremental, id-keyed): a ``TaskCreate``
+      summarises to its ``subject`` and is assigned the next sequential id (the
+      runtime numbers them 1, 2, … in creation order); a later ``TaskUpdate``
+      resolves its ``taskId`` back to that subject.
+    """
+    summaries: dict[str, str] = {}
+    prev: set[str] = set()
+    subject_by_id: dict[str, str] = {}
+    created = 0
+    for rec in records:
+        if rec.get("type") != "assistant":
+            continue
+        message = rec.get("message")
+        if not isinstance(message, dict):
+            continue
+        for block in message.get("content") or []:
+            if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+                continue
+            tool = block.get("name")
+            if tool not in TODO_TOOLS:
+                continue
+            inputs = block.get("input") or {}
+            tool_use_id = block.get("id") or ""
+            if tool == "TodoWrite":
+                summary, prev = _derive_todo_summary(inputs, prev)
+            elif tool == "TaskCreate":
+                created += 1
+                summary = _snippet(inputs.get("subject"))
+                if summary:
+                    subject_by_id[str(created)] = summary
+            else:  # TaskUpdate
+                summary = subject_by_id.get(str(inputs.get("taskId")))
+            if summary:
+                summaries[tool_use_id] = summary
+    return summaries
+
+
+def _derive_todo_summary(inputs: dict, prev: set[str]) -> tuple[str | None, set[str]]:
+    """The in-progress item for one ``TodoWrite`` snapshot, plus its in-progress set."""
+    items = inputs.get("todos")
+    if not isinstance(items, list):
+        return None, prev
+    in_progress = {
+        item["content"]
+        for item in items
+        if isinstance(item, dict) and item.get("status") == "in_progress" and item.get("content")
+    }
+    newly = sorted(in_progress - prev)
+    summary = newly[0] if newly else (sorted(in_progress)[0] if in_progress else None)
+    return _snippet(summary), in_progress
+
+
+def _tool_param(name: object, inputs: dict) -> str | None:
+    """The main identifying parameter of a tool call, as a node-label summary.
+
+    Uses the per-tool key in :data:`TOOL_MAIN_PARAM`, else the first present
+    generic target key. Only this one key is read — bulk/secondary fields never
+    are — so the trace shows what a tool acted on without leaking its payload.
+    """
+    key = TOOL_MAIN_PARAM.get(name) if isinstance(name, str) else None
+    if key is None:
+        key = next((k for k in _GENERIC_PARAM_KEYS if inputs.get(k)), None)
+    return _snippet(inputs.get(key)) if key else None
+
+
+def _question_snippet(inputs: dict) -> str | None:
+    """A few-word snippet of an ``AskUserQuestion``'s first question."""
+    questions = inputs.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return None
+    first = questions[0]
+    return _snippet(first.get("question")) if isinstance(first, dict) else None
+
+
+def _snippet(text: object) -> str | None:
+    """The full first line of free text as a node label, whitespace-collapsed.
+
+    Returns ``None`` for empty / non-string input. Multi-line text keeps only its
+    first non-empty line (the gist), but the line is never truncated — the label
+    is always readable in full, with no ellipsis.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    first_line = text.strip().splitlines()[0]
+    return " ".join(first_line.split()) or None
 
 
 def _human_prompt_spans(records: list[dict], meta: dict[str, str | None]) -> list[Span]:
@@ -152,6 +309,7 @@ def _human_prompt_spans(records: list[dict], meta: dict[str, str | None]) -> lis
                 span_id=derive_span_id(meta["session_id"] or "", rec.get("uuid") or ts or ""),
                 kind="human",
                 name="prompt",
+                summary=_snippet(_prompt_text(rec)),
                 session_id=meta["session_id"],
                 repo=meta["repo"] or "unknown",
                 branch=meta["branch"],
@@ -180,6 +338,18 @@ def _is_human_prompt(rec: dict) -> bool:
     return has_text and not has_tool_result
 
 
+def _prompt_text(rec: dict) -> str | None:
+    """The human prompt's text — a plain string or the first text block."""
+    content = (rec.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                return block["text"]
+    return None
+
+
 def _tool_results(records: list[dict]) -> dict[str, dict]:
     index: dict[str, dict] = {}
     for rec in records:
@@ -206,18 +376,48 @@ def _tool_results(records: list[dict]) -> dict[str, dict]:
     return index
 
 
-def _walk_subagent(main_path: Path, agent_id: str) -> list[UsageEvent]:
+def _walk_subagent(
+    main_path: Path, agent_id: str, *, parent_meta: dict[str, str | None], agent_span_id: str
+) -> tuple[list[UsageEvent], list[Span]]:
+    """Walk a sub-agent transcript into usage events and its own step spans.
+
+    The transcript (``<session>/subagents/agent-<id>.jsonl``) is a session-shaped
+    log. Its ``tool_use`` blocks become the sub-agent's spans (#47 S3) — but its
+    leading user record is the *orchestrator's task prompt*, so human-prompt spans
+    are deliberately NOT emitted (that text stays private; the agent span already
+    summarises the task via its ``description``). Each emitted span is re-homed
+    onto the spoke: ``session_id`` becomes the parent's (so it joins the run and
+    nests under the agent) and ``parent_id`` the agent span; ``span_id`` stays
+    derived from the sub-agent transcript, keeping ids idempotent and collision-free.
+    """
     sub = main_path.parent / main_path.stem / "subagents" / f"agent-{agent_id}.jsonl"
     if not sub.exists():
-        return []
+        return [], []
+    records = _load_jsonl(sub)
+    meta = _session_meta(records)
+    results = _tool_results(records)
+    todo_summaries = _todo_summaries(records)
     events: list[UsageEvent] = []
-    for rec in _load_jsonl(sub):
+    spans: list[Span] = []
+    for rec in records:
         message = rec.get("message")
         if rec.get("type") != "assistant" or not isinstance(message, dict):
             continue
         if isinstance(message.get("usage"), dict):
             events.append(_usage_event(rec, "subagent", agent_id))
-    return events
+        for block in message.get("content") or []:
+            span = (
+                _span_for_tool_use(block, rec, results, meta, todo_summaries)
+                if isinstance(block, dict) and block.get("type") == "tool_use"
+                else None
+            )
+            if span is not None:
+                span.session_id = parent_meta["session_id"]
+                span.repo = parent_meta["repo"] or "unknown"
+                span.branch = parent_meta["branch"]
+                span.parent_id = agent_span_id
+                spans.append(span)
+    return events, spans
 
 
 def _usage_event(rec: dict, source: str, agent_id: str | None) -> UsageEvent:

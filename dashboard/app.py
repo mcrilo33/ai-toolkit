@@ -139,10 +139,12 @@ def _render_descendants(nodes: list[dict], depth: int) -> None:
 
 
 def _render_step(root: dict) -> None:
-    """A Level-1 step row (rolled-up metrics, collapsed) with a drill expander.
+    """A Level-1 phase-interval bucket row (rolled-up metrics) with a drill expander.
 
     Streamlit forbids nesting expanders, so the whole subtree drills inside one
-    expander as indented rows rather than per-level expanders.
+    expander as indentation depth (Issue #47 S3): marker headers, then the turn
+    nodes, with the tools/skills each turn issued nested beneath — and a sub-agent's
+    own turns under its agent node.
     """
     _node_row(root, 0)
     if root["children"]:

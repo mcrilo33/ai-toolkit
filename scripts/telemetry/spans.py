@@ -1,9 +1,10 @@
 """The unified span — the frozen v1 contract from Issue #21.
 
 This is the Python mirror of ``docs/telemetry-span-schema.md``. The parser emits
-spans of this exact shape (18 fields, in schema order); the correlation pass
-fills ``tokens_in`` / ``tokens_out`` / ``cost_usd``. The shape is reused
-verbatim — no divergent fields are added here.
+spans of this exact shape, in schema order; the correlation pass fills
+``tokens_in`` / ``tokens_out`` / ``cost_usd``. The frozen field set is reused
+verbatim, plus the additive, optional, pull-only ``summary`` field (Issue #47)
+that push emitters never set.
 
 Note: the issue text mentions a ``cache_read`` metric, but the frozen v1 span has
 no such field. Cache-read tokens are tracked internally during correlation (they
@@ -21,6 +22,7 @@ SPAN_KINDS: tuple[str, ...] = (
     "step",
     "hook",
     "script",
+    "tool",
     "skill",
     "agent",
     "todo",
@@ -29,6 +31,9 @@ SPAN_KINDS: tuple[str, ...] = (
 )
 
 # The emitted field order — matches the schema doc's object layout exactly.
+# ``summary`` (Issue #47) is an additive, optional, pull-only display field: the
+# parser fills it with a few-word node label; push emitters never set it (it stays
+# null on push spans). ``name`` remains the stable construct id used for grouping.
 SPAN_FIELDS: tuple[str, ...] = (
     "span_id",
     "parent_id",
@@ -45,6 +50,7 @@ SPAN_FIELDS: tuple[str, ...] = (
     "duration_ms",
     "status",
     "human",
+    "summary",
     "tokens_in",
     "tokens_out",
     "cost_usd",
@@ -70,6 +76,7 @@ class Span:
     duration_ms: int = 0
     status: str = "success"
     human: dict[str, object] | None = None
+    summary: str | None = None
     tokens_in: int | None = None
     tokens_out: int | None = None
     cost_usd: float | None = None

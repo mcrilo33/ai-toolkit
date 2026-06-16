@@ -8,7 +8,15 @@ emitting spans at runtime) and builds against #21's frozen span schema
 
 Everything here is **read-only and 100% local**. Session logs contain prompt
 content, so they are parsed on-machine and only metadata / metrics are surfaced —
-never raw prompt, answer, thinking, or tool-output text.
+never raw prompt, answer, thinking, or tool-output text. **Exception (Issue #47):**
+each node carries a few-word `summary` for display — the todo a step advances
+(`TodoWrite`/`TaskCreate`/`TaskUpdate`), an agent's short task `description`, the
+first line of a human prompt or question, and a tool's single main parameter (the
+`Bash` command, the file path a `Read`/`Edit`/`Write` acted on, a `Grep` pattern).
+This widens the surface to *short intent* metadata only; long-form content —
+extended thinking, an agent's full task prompt, a tool's secondary input
+(replacement text, file content) and its output, and human answers — stays
+filtered.
 
 ## Modules
 
@@ -16,8 +24,8 @@ All live in `scripts/telemetry/`:
 
 | Module | Responsibility |
 |--------|----------------|
-| `spans.py` | The `Span` dataclass — the frozen 18-field schema, verbatim. |
-| `session_parser.py` | Parse `~/.claude/projects/*/*.jsonl` into `skill` / `agent` / `todo` / `human` spans; walk `<session>/subagents/agent-<id>.jsonl` subagent transcripts into `UsageEvent`s. |
+| `spans.py` | The `Span` dataclass — the frozen schema plus the additive, optional, pull-only `summary` field (Issue #47). |
+| `session_parser.py` | Parse `~/.claude/projects/*/*.jsonl` into `skill` / `agent` / `todo` / `human` spans plus a `tool` leaf per `tool_use` (Issue #47). Walk `<session>/subagents/agent-<id>.jsonl` transcripts into `UsageEvent`s **and** the sub-agent's own step spans (#47 S3) — re-homed onto the parent session with `parent_id` = the agent span, so they nest under it. |
 | `cost.py` | Attribute tokens and cost to every span; reuse `ccusage` for cost. |
 | `spoke_runs.py` | Group spans into spoke-run lifetimes; per-invocation normalized metrics. |
 | `queries.py` | Expose the unified push + pull dataset as in-memory DuckDB views. |

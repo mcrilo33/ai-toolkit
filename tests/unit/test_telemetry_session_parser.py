@@ -12,6 +12,7 @@ prompt / answer / tool-output text that the session logs contain.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -43,23 +44,34 @@ SCHEMA_KEYS = {
     "duration_ms",
     "status",
     "human",
+    "summary",
     "tokens_in",
     "tokens_out",
     "cost_usd",
 }
 
-# Every prompt / answer / tool-output string planted in the fixtures. None may
-# appear anywhere in the emitted span data.
+# Strings planted in the fixtures that must NEVER appear in span data. Issue #47
+# lifts the filter for short *intent* metadata only — the todo item, the agent's
+# task description, and a trimmed prompt/question snippet become the node summary.
+# The long-form content stays filtered: extended thinking, the agent's full task
+# prompt, agent output / work, and the human's answer.
 SECRETS = (
-    "SECRET_HUMAN_PROMPT",
     "SECRET_THINKING",
     "SECRET_TASK_PROMPT",
     "SECRET_AGENT_OUTPUT",
     "SECRET_AGENT_WORK",
-    "SECRET_TODO",
-    "SECRET_Q",
     "SECRET_ANSWER",
+    # Tool leaves surface only their MAIN identifying parameter (Bash command,
+    # Read/Edit/Write path, Grep pattern). Bulk/secondary fields stay filtered —
+    # Edit's replacement text, Write's content body, and tool result output must
+    # never appear in a span.
+    "SECRET_EDIT_OLD",
+    "SECRET_WRITE_CONTENT",
+    "SECRET_FILE_CONTENT",
 )
+
+# Tool names planted in the fixture's tool_use blocks (Issue #47 S2b).
+TOOL_NAMES = {"Bash", "Read", "Edit", "Grep", "Write"}
 
 
 @pytest.fixture()
@@ -88,10 +100,40 @@ class TestSpanKinds:
         assert len(agents) == 1
         assert agents[0].name == "Explore"
 
+    def test_agent_summary_is_the_task_description(self, parsed: ParsedSession) -> None:
+        # Issue #47: the agent node's few-word summary is the Task tool's short
+        # `description` (a 3-5 word task summary), NOT the long private `prompt`.
+        # `name` stays the subagent_type so the Aggregate / A-B views still group.
+        agent = _by_kind(parsed, "agent")[0]
+        assert agent.summary == "explore code"
+        assert agent.name == "Explore"
+
     def test_emits_todo_span(self, parsed: ParsedSession) -> None:
         todos = _by_kind(parsed, "todo")
         assert len(todos) == 1
         assert todos[0].kind == "todo"
+
+    def test_todo_summary_is_its_in_progress_item(self, parsed: ParsedSession) -> None:
+        # Issue #47: the todo node's summary is the in-progress ledger item it
+        # advances (the L1 step label); `name` stays the bare tool for grouping.
+        todo = _by_kind(parsed, "todo")[0]
+        assert todo.summary == "Add RED telemetry test"
+        assert todo.name == "TodoWrite"
+
+    def test_human_prompt_summary_is_a_short_snippet(self, parsed: ParsedSession) -> None:
+        # Issue #47: the human-prompt node summarises the prompt in a few words
+        # (a trimmed first-line snippet); `name` stays "prompt" for grouping.
+        prompt = next(
+            s for s in _by_kind(parsed, "human") if s.human and s.human["type"] == "prompt"
+        )
+        assert prompt.summary == "Wire the parser and add tests"
+        assert prompt.name == "prompt"
+
+    def test_question_summary_is_a_short_snippet(self, parsed: ParsedSession) -> None:
+        question = next(
+            s for s in _by_kind(parsed, "human") if s.human and s.human["type"] == "question"
+        )
+        assert question.summary == "Which carrier field should we use"
 
     def test_emits_human_prompt_span(self, parsed: ParsedSession) -> None:
         prompts = [s for s in _by_kind(parsed, "human") if s.human and s.human["type"] == "prompt"]
@@ -106,6 +148,54 @@ class TestSpanKinds:
         assert human is not None
         # AskUserQuestion fired at 12:01:10, answered at 12:01:40 → 30s wait.
         assert human["wait_ms"] == 30000
+
+
+class TestToolSpans:
+    """Issue #47 S2b: every tool_use becomes a name-only `tool` leaf span."""
+
+    def test_every_tool_use_emits_a_leaf_span_named_by_tool(self, parsed: ParsedSession) -> None:
+        tools = _by_kind(parsed, "tool")
+        assert {t.name for t in tools} == TOOL_NAMES
+
+    def test_specific_tools_keep_their_own_kinds(self, parsed: ParsedSession) -> None:
+        # Skill/Agent/Todo/AskUserQuestion are NOT generic `tool` leaves.
+        assert not [t for t in _by_kind(parsed, "tool") if t.name in {"Skill", "Task", "TodoWrite"}]
+        assert len(_by_kind(parsed, "skill")) == 1
+        assert len(_by_kind(parsed, "agent")) == 1
+
+    def test_tool_span_brackets_tool_use_to_tool_result(self, parsed: ParsedSession) -> None:
+        bash = next(t for t in _by_kind(parsed, "tool") if t.name == "Bash")
+        assert bash.ts_start == "2026-06-13T12:02:00.000Z"
+        assert bash.ts_end == "2026-06-13T12:02:05.000Z"
+        assert bash.duration_ms == 5000
+
+    def test_tool_span_summary_is_its_main_parameter(self, parsed: ParsedSession) -> None:
+        # The tool leaf names what it acted on: Bash → command, Read/Edit/Write →
+        # file path, Grep → pattern. So the trace reads "what over what".
+        by_name = {t.name: t for t in _by_kind(parsed, "tool")}
+        assert by_name["Bash"].summary == "pytest tests/unit -q"
+        assert by_name["Read"].summary == "/repo/dashboard/queries.py"
+        assert by_name["Edit"].summary == "/repo/app.py"
+        assert by_name["Grep"].summary == "_bucket_traces"
+        assert by_name["Write"].summary == "/repo/notes.md"
+
+    def test_tool_span_carries_no_cost_at_parse_time(self, parsed: ParsedSession) -> None:
+        for tool in _by_kind(parsed, "tool"):
+            assert tool.tokens_in is None
+            assert tool.tokens_out is None
+            assert tool.cost_usd is None
+
+    def test_only_the_main_parameter_leaks_not_bulk_input_or_output(
+        self, parsed: ParsedSession
+    ) -> None:
+        # Edit's replacement text, Write's content body, and the tool result output
+        # are secondary/bulk fields — surfacing the main param must not drag them in.
+        blob = "".join(str(t.to_dict()) for t in _by_kind(parsed, "tool"))
+        for secret in SECRETS:
+            assert secret not in blob
+
+    def test_tool_kind_is_accepted_by_the_schema(self) -> None:
+        assert Span(span_id="x", kind="tool", name="Bash").kind == "tool"
 
 
 class TestSubagentWalk:
@@ -126,6 +216,67 @@ class TestSubagentWalk:
         # Four assistant turns carry usage in the fixture.
         assert len(main) == 4
         assert all(e.session_id == SESSION_ID for e in main)
+
+
+def _agent_span(parsed: ParsedSession) -> Span:
+    return _by_kind(parsed, "agent")[0]
+
+
+def _subagent_spans(parsed: ParsedSession) -> list[Span]:
+    """Spans the parser reconstructs from the walked sub-agent transcript."""
+    agent_id = _agent_span(parsed).span_id
+    return [s for s in parsed.spans if s.parent_id == agent_id]
+
+
+class TestSubagentSpans:
+    """Issue #47 S3: the sub-agent's own steps become spans under the agent span."""
+
+    def test_subagent_tool_use_emits_a_span(self, parsed: ParsedSession) -> None:
+        reads = [s for s in _subagent_spans(parsed) if s.kind == "tool" and s.name == "Read"]
+        assert len(reads) == 1
+
+    def test_subagent_span_inherits_parent_session_and_repo(self, parsed: ParsedSession) -> None:
+        # The sub-agent span joins the spoke via the PARENT session id, not the
+        # sub-agent transcript's own session metadata.
+        sub = _subagent_spans(parsed)[0]
+        assert sub.session_id == SESSION_ID
+        assert sub.repo == "proj"
+        assert sub.branch == "feature/22-demo"
+
+    def test_subagent_span_parent_id_is_the_agent_span(self, parsed: ParsedSession) -> None:
+        sub = next(s for s in _subagent_spans(parsed) if s.name == "Read")
+        assert sub.parent_id == _agent_span(parsed).span_id
+
+    def test_subagent_span_summary_is_its_main_parameter(self, parsed: ParsedSession) -> None:
+        sub = next(s for s in _subagent_spans(parsed) if s.name == "Read")
+        assert sub.summary == "/repo/sub/code.py"
+
+    def test_subagent_span_ids_are_idempotent(self) -> None:
+        a = {s.span_id for s in _subagent_spans(parse_session_file(SESSION))}
+        b = {s.span_id for s in _subagent_spans(parse_session_file(SESSION))}
+        assert a == b and a
+
+    def test_subagent_spans_carry_no_tokens_or_cost_at_parse_time(
+        self, parsed: ParsedSession
+    ) -> None:
+        for sub in _subagent_spans(parsed):
+            assert sub.tokens_in is None
+            assert sub.tokens_out is None
+            assert sub.cost_usd is None
+
+    def test_subagent_usage_event_totals_unchanged(self, parsed: ParsedSession) -> None:
+        # Emitting sub-agent spans must not add usage events: s2b carries no usage,
+        # so the agent's token pool stays 700/450/1000.
+        sub = [e for e in parsed.usage_events if e.source == "subagent"]
+        assert sum(e.input_tokens for e in sub) == 700
+        assert sum(e.output_tokens for e in sub) == 450
+
+    def test_subagent_emits_no_human_prompt_span(self, parsed: ParsedSession) -> None:
+        # The sub-agent transcript's leading user record is the orchestrator's task
+        # prompt — it must NEVER become a human-prompt span (it would leak the
+        # prompt). Locked structurally, not only via the secret-string scan.
+        agent_id = _agent_span(parsed).span_id
+        assert not [s for s in parsed.spans if s.kind == "human" and s.parent_id == agent_id]
 
 
 class TestSchemaConformance:
@@ -157,6 +308,219 @@ class TestPrivacy:
         blob = "".join(str(s.to_dict()) for s in parsed.spans)
         for secret in SECRETS:
             assert secret not in blob
+
+
+def _assistant_todo(uuid: str, ts: str, tool_id: str, todos: list[dict]) -> dict:
+    return {
+        "type": "assistant",
+        "sessionId": "diff-sess",
+        "cwd": "/Users/demo/Repos/proj",
+        "gitBranch": "feature/47-demo",
+        "timestamp": ts,
+        "uuid": uuid,
+        "message": {
+            "role": "assistant",
+            "model": "claude-opus-4-8",
+            "content": [
+                {"type": "tool_use", "id": tool_id, "name": "TodoWrite", "input": {"todos": todos}}
+            ],
+        },
+    }
+
+
+class TestTodoLedgerDiff:
+    """Issue #47: the in-progress item per ledger write drives the L1 step label."""
+
+    def test_newly_in_progress_item_is_chosen_across_consecutive_writes(
+        self, tmp_path: Path
+    ) -> None:
+        # Two snapshots: write 1 marks A in_progress; write 2 advances to B. The
+        # diff must pick the item that NEWLY entered in_progress on each write.
+        records = [
+            _assistant_todo(
+                "w1",
+                "2026-06-15T12:00:01.000Z",
+                "tool_w1",
+                [
+                    {"content": "Add RED test", "status": "in_progress"},
+                    {"content": "Implement GREEN", "status": "pending"},
+                ],
+            ),
+            _assistant_todo(
+                "w2",
+                "2026-06-15T12:00:30.000Z",
+                "tool_w2",
+                [
+                    {"content": "Add RED test", "status": "completed"},
+                    {"content": "Implement GREEN", "status": "in_progress"},
+                ],
+            ),
+        ]
+        path = tmp_path / "diff-sess.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        todos = sorted(_by_kind(parse_session_file(path), "todo"), key=lambda s: s.ts_start or "")
+
+        assert [t.summary for t in todos] == ["Add RED test", "Implement GREEN"]
+        assert [t.name for t in todos] == ["TodoWrite", "TodoWrite"]
+
+    def test_todo_write_without_in_progress_item_has_no_summary(self, tmp_path: Path) -> None:
+        # A snapshot with nothing in_progress has no item to advance → no summary
+        # is derived; the span keeps its bare tool name (never crashes, never blank).
+        records = [
+            _assistant_todo(
+                "w1",
+                "2026-06-15T12:00:01.000Z",
+                "tool_w1",
+                [{"content": "Add RED test", "status": "pending"}],
+            )
+        ]
+        path = tmp_path / "diff-sess.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        todo = _by_kind(parse_session_file(path), "todo")[0]
+
+        assert todo.name == "TodoWrite"
+        assert todo.summary is None
+
+
+def _assistant_tasks(uuid: str, ts: str, blocks: list[dict]) -> dict:
+    return {
+        "type": "assistant",
+        "sessionId": "task-sess",
+        "cwd": "/Users/demo/Repos/proj",
+        "gitBranch": "feature/47-demo",
+        "timestamp": ts,
+        "uuid": uuid,
+        "message": {"role": "assistant", "model": "claude-opus-4-8", "content": blocks},
+    }
+
+
+class TestSummaryIsFullText:
+    """Issue #47: node labels show the full text — never truncated with an ellipsis."""
+
+    def test_long_subject_is_not_truncated(self, tmp_path: Path) -> None:
+        # A long ledger item must render in full so it is readable in the L1 label;
+        # no word/char cap and no trailing ellipsis.
+        long_subject = (
+            "PLAN gate explore the code and present the full implementation plan then park"
+        )
+        records = [
+            _assistant_tasks(
+                "a1",
+                "2026-06-15T12:00:01.000Z",
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tc1",
+                        "name": "TaskCreate",
+                        "input": {"subject": long_subject},
+                    }
+                ],
+            )
+        ]
+        path = tmp_path / "task-sess.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        todo = _by_kind(parse_session_file(path), "todo")[0]
+
+        assert todo.summary == long_subject
+        assert "…" not in (todo.summary or "")
+
+    def test_multiline_prompt_keeps_its_full_first_line(self, tmp_path: Path) -> None:
+        # A multi-line prompt scopes to its first line (the gist), but that line is
+        # never truncated — internal whitespace is just collapsed.
+        text = "Refactor the parser to retain the   in-progress todo\nplus some more detail below"
+        records = [
+            {
+                "type": "user",
+                "sessionId": "p-sess",
+                "cwd": "/Users/demo/Repos/proj",
+                "gitBranch": "feature/47-demo",
+                "timestamp": "2026-06-15T12:00:00.000Z",
+                "uuid": "u1",
+                "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+            }
+        ]
+        path = tmp_path / "p-sess.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        prompt = _by_kind(parse_session_file(path), "human")[0]
+
+        assert prompt.summary == "Refactor the parser to retain the in-progress todo"
+
+
+class TestTaskLedgerResolution:
+    """Issue #47: TaskCreate/TaskUpdate are id-keyed; resolve to the task subject."""
+
+    def test_task_create_summary_is_its_subject(self, tmp_path: Path) -> None:
+        records = [
+            _assistant_tasks(
+                "a1",
+                "2026-06-15T12:00:01.000Z",
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tc1",
+                        "name": "TaskCreate",
+                        "input": {"subject": "Add RED parser test", "description": "x"},
+                    }
+                ],
+            )
+        ]
+        path = tmp_path / "task-sess.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        todo = _by_kind(parse_session_file(path), "todo")[0]
+
+        assert todo.summary == "Add RED parser test"
+        assert todo.name == "TaskCreate"
+
+    def test_task_update_resolves_to_the_subject_of_the_task_it_updates(
+        self, tmp_path: Path
+    ) -> None:
+        # Two TaskCreates assign ids 1, 2 in creation order; a later TaskUpdate
+        # referencing taskId "2" must name the second task, never a generic label.
+        records = [
+            _assistant_tasks(
+                "a1",
+                "2026-06-15T12:00:01.000Z",
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tc1",
+                        "name": "TaskCreate",
+                        "input": {"subject": "First task"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "tc2",
+                        "name": "TaskCreate",
+                        "input": {"subject": "Second task"},
+                    },
+                ],
+            ),
+            _assistant_tasks(
+                "a2",
+                "2026-06-15T12:01:00.000Z",
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tu1",
+                        "name": "TaskUpdate",
+                        "input": {"taskId": "2", "status": "in_progress"},
+                    }
+                ],
+            ),
+        ]
+        path = tmp_path / "task-sess.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        update = next(
+            s for s in _by_kind(parse_session_file(path), "todo") if s.name == "TaskUpdate"
+        )
+
+        assert update.summary == "Second task"
 
 
 class TestProjectsDirWalk:

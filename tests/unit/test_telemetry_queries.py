@@ -117,6 +117,40 @@ class TestViews:
         ).fetchone()
         assert human_count == 1
 
+    def test_summary_does_not_fragment_step_metrics_grouping(self, con) -> None:
+        # Issue #47: the per-instance `summary` must never enter the step_key /
+        # GROUP BY. Two spans sharing (kind, name, phase) but differing only in
+        # `summary` must collapse to ONE step_metrics row (invocations == 2), or
+        # the Aggregate / A-B views would fragment one step into many.
+        cols = (
+            "span_id, spoke_run_id, kind, name, phase, ts_start, ts_end, "
+            "duration_ms, status, summary"
+        )
+        placeholders = ", ".join("?" for _ in range(10))
+        for span_id, summary in (("b1", "ran the linter"), ("b2", "read a file")):
+            con.execute(
+                f"INSERT INTO spans ({cols}) VALUES ({placeholders})",
+                [
+                    span_id,
+                    "sumrun",
+                    "tool",
+                    "Bash",
+                    None,
+                    "2026-06-12T00:00:00Z",
+                    "2026-06-12T00:00:01Z",
+                    0,
+                    "success",
+                    summary,
+                ],
+            )
+
+        (invocations,) = con.execute(
+            "SELECT invocations FROM step_metrics "
+            "WHERE spoke_run_id = ? AND step_key = 'tool:Bash'",
+            ["sumrun"],
+        ).fetchone()
+        assert invocations == 2
+
 
 class TestRobustness:
     def test_legacy_non_span_lines_in_events_are_skipped(self, con) -> None:

@@ -23,14 +23,17 @@ Everything runs on your machine and nothing is ever exported.
 
 ## The views
 
-1. **Spoke** — pick a `spoke_run_id` and drill down a collapse-to-steps view:
-   the lifecycle/step spine (spawn · RED · GREEN · REVIEW · PUSH · land …) with
-   rolled-up time, tokens, cost, **model(s)**, and **main/subagent** attribution;
-   expand a step to drill into its sub-steps and raw spans. Hooks collapse into
-   one line so the signal spans lead. A **Meta by kind** tab aggregates the
-   spoke's spans per kind (counts + time/cost stats) to spot "launched too much".
-   Nesting is reconstructed by time-bracketing (spans carry no `parent_id`) and
-   cost is counted **once per turn**, so the totals are trustworthy.
+1. **Spoke** — pick a `spoke_run_id` and drill down a **turn-centric** tree
+   (`spoke → step → turn → trace`): Level-1 is the phase-interval bucket, named by
+   the **todo it advances** (spawn · RED · GREEN · … as a fallback). Inside, the
+   marker shows as a thin header, then one **turn node** per assistant inference
+   (its model + token spike), with the **tools/skills it issued nested beneath** —
+   each tool labelled by what it acted on (`Read · /path`, `Bash · pytest -q`),
+   hooks collapsed under their triggering tool, and an agent's **sub-agent turns
+   and tools** under it. A **Meta by kind** tab aggregates the spoke's spans per
+   kind (counts + time/cost stats) to spot "launched too much". Cost is counted
+   **once per turn** (each turn node owns it), so the rolled-up totals are
+   trustworthy. Metadata only — labels are short summaries, never prompt bodies.
 2. **Aggregate** — pick a time window and roll the tree up across all spokes:
    per-step frequency, totals, and per-invocation mean/median for time and cost.
    Shows where time and tokens actually go.
@@ -108,10 +111,10 @@ Environment variables:
 > includes the skill/agent spans nested inside it. The aggregate and A/B views
 > group same-granularity spans, so they never double-count. The v2 Spoke view
 > does **not** use that overlapping per-span cost — it attributes each turn's
-> cost to exactly one node and rolls it up, so its subtree totals are an
-> additive, trustworthy ledger. Main-agent turns attribute to their reconstructed
-> **phase interval** (the `step`/`lifecycle` marker spine), subagent turns to
-> their `agent` span; a main turn off the lifecycle envelope (or with an
+> cost to exactly one **turn node** and rolls it up, so its subtree totals are an
+> additive, trustworthy ledger. A main-agent turn node sits under its reconstructed
+> **phase interval** (the `step`/`lifecycle` marker spine), a subagent turn node
+> under its `agent` span; a main turn off the lifecycle envelope (or with an
 > unparseable timestamp) surfaces in an "(unresolved)" row.
 
 ## Tests

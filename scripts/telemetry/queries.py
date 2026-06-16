@@ -28,7 +28,8 @@ from telemetry.session_parser import ParsedSession, parse_projects_dir
 from telemetry.spans import SPAN_FIELDS, SPAN_KINDS, Span
 from telemetry.spoke_runs import backfill_spoke_run_ids
 
-# Table columns: the 18 frozen span fields with `human` flattened to two columns.
+# Table columns: the frozen span fields (incl. the additive pull-only `summary`,
+# Issue #47) with `human` flattened to `human_type` / `human_wait_ms`.
 _COLUMNS = (
     "span_id VARCHAR",
     "parent_id VARCHAR",
@@ -46,6 +47,7 @@ _COLUMNS = (
     "status VARCHAR",
     "human_type VARCHAR",
     "human_wait_ms BIGINT",
+    "summary VARCHAR",
     "tokens_in BIGINT",
     "tokens_out BIGINT",
     "cost_usd DOUBLE",
@@ -180,6 +182,7 @@ def _row(span: dict[str, object]) -> tuple[object, ...]:
         scalar["status"],
         human_type,
         human_wait_ms,
+        scalar["summary"],
         scalar["tokens_in"],
         scalar["tokens_out"],
         scalar["cost_usd"],
