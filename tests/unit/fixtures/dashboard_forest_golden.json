@@ -97,6 +97,7 @@
                     "cost_usd": 0.0,
                     "human_count": 0,
                     "models": [],
+                    "status": "success",
                     "tokens_in": 0,
                     "tokens_out": 0
                   },
@@ -123,6 +124,7 @@
                 "cost_usd": 0.0,
                 "human_count": 0,
                 "models": [],
+                "status": "success",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -151,6 +153,7 @@
                 "cost_usd": 0.0,
                 "human_count": 0,
                 "models": [],
+                "status": "success",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -175,6 +178,7 @@
             "cost_usd": 0.0,
             "human_count": 0,
             "models": [],
+            "status": "success",
             "tokens_in": 0,
             "tokens_out": 0
           },
@@ -206,6 +210,7 @@
                 "cost_usd": 0.0,
                 "human_count": 0,
                 "models": [],
+                "status": "success",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -237,6 +242,7 @@
                     "cost_usd": 0.0,
                     "human_count": 0,
                     "models": [],
+                    "status": "success",
                     "tokens_in": 0,
                     "tokens_out": 0
                   },
@@ -263,6 +269,7 @@
                 "cost_usd": 0.0,
                 "human_count": 0,
                 "models": [],
+                "status": "success",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -287,6 +294,7 @@
             "cost_usd": 0.0,
             "human_count": 0,
             "models": [],
+            "status": "success",
             "tokens_in": 0,
             "tokens_out": 0
           },
@@ -318,6 +326,7 @@
                 "cost_usd": 0.0,
                 "human_count": 1,
                 "models": [],
+                "status": "success",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -349,6 +358,7 @@
                     "cost_usd": 0.0,
                     "human_count": 1,
                     "models": [],
+                    "status": "success",
                     "tokens_in": 0,
                     "tokens_out": 0
                   },
@@ -375,6 +385,7 @@
                 "cost_usd": 0.0,
                 "human_count": 1,
                 "models": [],
+                "status": "success",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -399,6 +410,7 @@
             "cost_usd": 0.0,
             "human_count": 2,
             "models": [],
+            "status": "success",
             "tokens_in": 0,
             "tokens_out": 0
           },
@@ -430,6 +442,7 @@
                 "cost_usd": 0.0,
                 "human_count": 0,
                 "models": [],
+                "status": "success",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -454,6 +467,7 @@
             "cost_usd": 0.0,
             "human_count": 0,
             "models": [],
+            "status": "success",
             "tokens_in": 0,
             "tokens_out": 0
           },
@@ -485,6 +499,7 @@
                 "cost_usd": 0.0,
                 "human_count": 0,
                 "models": [],
+                "status": "success",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -509,6 +524,7 @@
             "cost_usd": 0.0,
             "human_count": 0,
             "models": [],
+            "status": "success",
             "tokens_in": 0,
             "tokens_out": 0
           },
@@ -542,6 +558,7 @@
                 "cost_usd": 0.0,
                 "human_count": 1,
                 "models": [],
+                "status": "success",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -566,6 +583,7 @@
             "cost_usd": 0.0,
             "human_count": 1,
             "models": [],
+            "status": "success",
             "tokens_in": 0,
             "tokens_out": 0
           },
@@ -597,6 +615,7 @@
                 "cost_usd": 0.0,
                 "human_count": 0,
                 "models": [],
+                "status": "success",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -621,6 +640,7 @@
             "cost_usd": 0.0,
             "human_count": 0,
             "models": [],
+            "status": "success",
             "tokens_in": 0,
             "tokens_out": 0
           },
@@ -652,6 +672,7 @@
                 "cost_usd": 0.0,
                 "human_count": 1,
                 "models": [],
+                "status": "success",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -676,6 +697,7 @@
             "cost_usd": 0.0,
             "human_count": 1,
             "models": [],
+            "status": "success",
             "tokens_in": 0,
             "tokens_out": 0
           },
@@ -709,6 +731,7 @@
                 "cost_usd": 0.0,
                 "human_count": 0,
                 "models": [],
+                "status": "success",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -733,6 +756,7 @@
             "cost_usd": 0.0,
             "human_count": 0,
             "models": [],
+            "status": "success",
             "tokens_in": 0,
             "tokens_out": 0
           },
@@ -764,6 +788,7 @@
                 "cost_usd": 0.0,
                 "human_count": 0,
                 "models": [],
+                "status": "success",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -788,6 +813,7 @@
             "cost_usd": 0.0,
             "human_count": 0,
             "models": [],
+            "status": "success",
             "tokens_in": 0,
             "tokens_out": 0
           },
@@ -819,6 +845,7 @@
                 "cost_usd": 0.0,
                 "human_count": 1,
                 "models": [],
+                "status": "warn",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -843,6 +870,7 @@
             "cost_usd": 0.0,
             "human_count": 1,
             "models": [],
+            "status": "warn",
             "tokens_in": 0,
             "tokens_out": 0
           },
@@ -876,6 +904,7 @@
                 "cost_usd": 0.0,
                 "human_count": 0,
                 "models": [],
+                "status": "success",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -900,6 +929,7 @@
             "cost_usd": 0.0,
             "human_count": 0,
             "models": [],
+            "status": "success",
             "tokens_in": 0,
             "tokens_out": 0
           },
@@ -931,6 +961,7 @@
                 "cost_usd": 0.0,
                 "human_count": 1,
                 "models": [],
+                "status": "success",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -955,6 +986,7 @@
             "cost_usd": 0.0,
             "human_count": 1,
             "models": [],
+            "status": "success",
             "tokens_in": 0,
             "tokens_out": 0
           },
@@ -1475,6 +1507,7 @@
                 "cost_usd": 0.0,
                 "human_count": 0,
                 "models": [],
+                "status": "success",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -1506,6 +1539,7 @@
                 "models": [
                   "claude-opus-4-8"
                 ],
+                "status": "success",
                 "tokens_in": 10,
                 "tokens_out": 5
               },
@@ -1534,6 +1568,7 @@
                 "cost_usd": 0.0,
                 "human_count": 0,
                 "models": [],
+                "status": "success",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -1565,6 +1600,7 @@
                     "cost_usd": 0.0,
                     "human_count": 0,
                     "models": [],
+                    "status": "success",
                     "tokens_in": 0,
                     "tokens_out": 0
                   },
@@ -1593,6 +1629,7 @@
                     "cost_usd": 0.0,
                     "human_count": 0,
                     "models": [],
+                    "status": "warn",
                     "tokens_in": 0,
                     "tokens_out": 0
                   },
@@ -1619,6 +1656,7 @@
                 "cost_usd": 0.0,
                 "human_count": 0,
                 "models": [],
+                "status": "warn",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -1648,6 +1686,7 @@
                     "cost_usd": 0.0,
                     "human_count": 0,
                     "models": [],
+                    "status": "success",
                     "tokens_in": 0,
                     "tokens_out": 0
                   },
@@ -1683,6 +1722,7 @@
                             "cost_usd": 0.0,
                             "human_count": 0,
                             "models": [],
+                            "status": "success",
                             "tokens_in": 0,
                             "tokens_out": 0
                           },
@@ -1712,6 +1752,7 @@
                         "models": [
                           "claude-haiku-4-5"
                         ],
+                        "status": "success",
                         "tokens_in": 200,
                         "tokens_out": 100
                       },
@@ -1743,6 +1784,7 @@
                             "cost_usd": 0.0,
                             "human_count": 0,
                             "models": [],
+                            "status": "success",
                             "tokens_in": 0,
                             "tokens_out": 0
                           },
@@ -1772,6 +1814,7 @@
                         "models": [
                           "claude-haiku-4-5"
                         ],
+                        "status": "success",
                         "tokens_in": 150,
                         "tokens_out": 80
                       },
@@ -1800,6 +1843,7 @@
                     "models": [
                       "claude-haiku-4-5"
                     ],
+                    "status": "success",
                     "tokens_in": 350,
                     "tokens_out": 180
                   },
@@ -1830,6 +1874,7 @@
                   "claude-haiku-4-5",
                   "claude-opus-4-8"
                 ],
+                "status": "success",
                 "tokens_in": 450,
                 "tokens_out": 220
               },
@@ -1861,6 +1906,7 @@
                 "models": [
                   "claude-opus-4-8"
                 ],
+                "status": "success",
                 "tokens_in": 30,
                 "tokens_out": 10
               },
@@ -1892,6 +1938,7 @@
                     "cost_usd": 0.0,
                     "human_count": 0,
                     "models": [],
+                    "status": "success",
                     "tokens_in": 0,
                     "tokens_out": 0
                   },
@@ -1921,6 +1968,7 @@
                 "models": [
                   "claude-opus-4-8"
                 ],
+                "status": "success",
                 "tokens_in": 20,
                 "tokens_out": 10
               },
@@ -1948,6 +1996,7 @@
               "claude-haiku-4-5",
               "claude-opus-4-8"
             ],
+            "status": "warn",
             "tokens_in": 510,
             "tokens_out": 245
           },
@@ -1979,6 +2028,7 @@
                 "cost_usd": 0.0,
                 "human_count": 0,
                 "models": [],
+                "status": "success",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -2016,6 +2066,7 @@
                             "cost_usd": 0.0,
                             "human_count": 0,
                             "models": [],
+                            "status": "success",
                             "tokens_in": 0,
                             "tokens_out": 0
                           },
@@ -2042,6 +2093,7 @@
                         "cost_usd": 0.0,
                         "human_count": 0,
                         "models": [],
+                        "status": "success",
                         "tokens_in": 0,
                         "tokens_out": 0
                       },
@@ -2068,6 +2120,7 @@
                     "cost_usd": 0.0,
                     "human_count": 0,
                     "models": [],
+                    "status": "success",
                     "tokens_in": 0,
                     "tokens_out": 0
                   },
@@ -2096,6 +2149,7 @@
                     "cost_usd": 0.0,
                     "human_count": 0,
                     "models": [],
+                    "status": "success",
                     "tokens_in": 0,
                     "tokens_out": 0
                   },
@@ -2124,6 +2178,7 @@
                     "cost_usd": 0.0,
                     "human_count": 0,
                     "models": [],
+                    "status": "success",
                     "tokens_in": 0,
                     "tokens_out": 0
                   },
@@ -2152,6 +2207,7 @@
                     "cost_usd": 0.0,
                     "human_count": 0,
                     "models": [],
+                    "status": "success",
                     "tokens_in": 0,
                     "tokens_out": 0
                   },
@@ -2181,6 +2237,7 @@
                 "models": [
                   "claude-opus-4-8"
                 ],
+                "status": "success",
                 "tokens_in": 60,
                 "tokens_out": 20
               },
@@ -2212,6 +2269,7 @@
                     "cost_usd": 0.0,
                     "human_count": 1,
                     "models": [],
+                    "status": "success",
                     "tokens_in": 0,
                     "tokens_out": 0
                   },
@@ -2240,6 +2298,7 @@
                     "cost_usd": 0.0,
                     "human_count": 0,
                     "models": [],
+                    "status": "success",
                     "tokens_in": 0,
                     "tokens_out": 0
                   },
@@ -2269,6 +2328,7 @@
                 "models": [
                   "claude-sonnet-4-6"
                 ],
+                "status": "success",
                 "tokens_in": 40,
                 "tokens_out": 15
               },
@@ -2296,6 +2356,7 @@
               "claude-opus-4-8",
               "claude-sonnet-4-6"
             ],
+            "status": "success",
             "tokens_in": 100,
             "tokens_out": 35
           },
@@ -2330,6 +2391,7 @@
                 "models": [
                   "claude-opus-4-8"
                 ],
+                "status": "success",
                 "tokens_in": 5,
                 "tokens_out": 2
               },
@@ -2358,6 +2420,7 @@
                 "cost_usd": 0.0,
                 "human_count": 0,
                 "models": [],
+                "status": "success",
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -2384,6 +2447,7 @@
             "models": [
               "claude-opus-4-8"
             ],
+            "status": "success",
             "tokens_in": 5,
             "tokens_out": 2
           },

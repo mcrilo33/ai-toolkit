@@ -950,12 +950,17 @@ def _roll_up_steps(node: dict[str, Any]) -> dict[str, Any]:
     A collapsed ``hooks`` node owns no metrics itself — its hook children carry
     them — so summing self + children never double-counts. The returned dict
     carries ``models`` as a set for merging; the node stores it sorted.
+
+    Status rolls up worst-child (Issue #52, the single uniform propagation point): a
+    container's ``rollup.status`` is the worst status among itself and its children,
+    so a denied approval or failed hook surfaces all the way up its ancestors.
     """
     models: set[str] = set(node.get("models") or [])
     human = node["human_count"]
     cost = node.get("own_cost_usd", 0.0)
     tokens_in = node.get("own_tokens_in", 0)
     tokens_out = node.get("own_tokens_out", 0)
+    statuses = [node["status"]]
     for child in node["children"]:
         child_rollup = _roll_up_steps(child)
         human += child_rollup["human_count"]
@@ -963,12 +968,15 @@ def _roll_up_steps(node: dict[str, Any]) -> dict[str, Any]:
         tokens_in += child_rollup["tokens_in"]
         tokens_out += child_rollup["tokens_out"]
         models |= child_rollup["models"]
+        statuses.append(child_rollup["status"])
+    status = _worst_status([{"status": s} for s in statuses])
     node["rollup"] = {
         "human_count": human,
         "cost_usd": cost,
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
         "models": sorted(models),
+        "status": status,
     }
     return {
         "human_count": human,
@@ -976,6 +984,7 @@ def _roll_up_steps(node: dict[str, Any]) -> dict[str, Any]:
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
         "models": models,
+        "status": status,
     }
 
 
