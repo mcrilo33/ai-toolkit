@@ -31,16 +31,6 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from telemetry.spans import synthetic_node
 
-# Status severity for collapsing many spans into one line: a collapsed hooks row
-# must surface the worst outcome, never hide a deny/failure/warn behind success.
-_STATUS_SEVERITY: dict[str, int] = {
-    "deny": 4,
-    "failure": 3,
-    "warn": 2,
-    "skipped": 1,
-    "success": 0,
-}
-
 # Synthetic bucket ids for the phase-interval attribution (Issue #46): the leading
 # pre-cycle region and the off-spine catch-all. Real intervals key on their marker's
 # ``span_id``, so these sentinels never collide with a real span.
@@ -215,7 +205,7 @@ def _hooks_node(hooks: list[dict[str, Any]]) -> dict[str, Any]:
         synthetic_node(
             kind="hooks",
             name="hooks",
-            status=_worst_status(hooks),
+            status=_terminal_leaf(hooks)[1],
             ts_start=min(starts, key=lambda s: _parse_ts(s) or 0.0) if starts else None,
             ts_end=max(ends, key=lambda s: _parse_ts(s) or 0.0) if ends else None,
             duration_ms=sum(h["duration_ms"] for h in hooks),
@@ -229,12 +219,26 @@ def _hooks_node(hooks: list[dict[str, Any]]) -> dict[str, Any]:
     return node
 
 
-def _worst_status(nodes: list[dict[str, Any]]) -> str:
-    return max(
-        (n["status"] for n in nodes),
-        key=lambda s: _STATUS_SEVERITY.get(s, 0),
-        default="success",
-    )
+def _terminal_leaf(nodes: list[dict[str, Any]]) -> tuple[float | None, str]:
+    """The ``(ts_start, status)`` of the chronologically last leaf across ``nodes``.
+
+    Last-event-wins (Issue #57): a container shows the terminal outcome of its subtree
+    — the status of the latest leaf by ``ts_start`` (the step's closing marker, emitted
+    last) — never the worst severity, so a recovered deny/failure stays at its leaf. A
+    leaf is its own terminal; ties resolve to the later-listed leaf. Empty input is
+    ``success`` (a container with no leaves has nothing to have failed).
+    """
+    best_ts: float | None = None
+    best_status = "success"
+    for node in nodes:
+        ts, status = (
+            _terminal_leaf(node["children"])
+            if node["children"]
+            else (_parse_ts(node["ts_start"]), node["status"])
+        )
+        if best_ts is None or (ts or 0.0) >= (best_ts or 0.0):
+            best_ts, best_status = ts, status
+    return best_ts, best_status
 
 
 def _build_intervals(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -930,12 +934,16 @@ def _synthetic_root(
     ts_end: str | None,
     children: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """A synthetic bucket root: owns no cost (its turn-node children do), no duration."""
+    """A synthetic bucket root: owns no cost (its turn-node children do), no duration.
+
+    Status is last-event-wins (Issue #57): the terminal leaf of its subtree, never the
+    worst severity — so a recovered deny deep in the bucket does not redden the root.
+    """
     return dict(
         synthetic_node(
             kind=kind,
             name=name,
-            status=_worst_status(list(_flatten(children))),
+            status=_terminal_leaf(children)[1],
             ts_start=ts_start,
             ts_end=ts_end,
             duration_ms=None,  # intervals are attribution-only, never a phase width
@@ -958,16 +966,20 @@ def _roll_up_steps(node: dict[str, Any]) -> dict[str, Any]:
     them — so summing self + children never double-counts. The returned dict
     carries ``models`` as a set for merging; the node stores it sorted.
 
-    Status rolls up worst-child (Issue #52, the single uniform propagation point): a
-    container's ``rollup.status`` is the worst status among itself and its children,
-    so a denied approval or failed hook surfaces all the way up its ancestors.
+    Status is **last-event-wins** (Issue #57): a container's ``rollup.status`` is the
+    status of the chronologically last leaf in its subtree (by ``ts_start`` — in
+    practice the step's closing marker, emitted last), NOT the worst severity. A leaf
+    keeps its own status, so a recovered deny/failure stays at its leaf and never
+    reddens an ancestor that completed. The returned ``terminal_ts`` threads that last
+    leaf up the post-order walk.
     """
     models: set[str] = set(node.get("models") or [])
     human = node["human_count"]
     cost = node.get("own_cost_usd", 0.0)
     tokens_in = node.get("own_tokens_in", 0)
     tokens_out = node.get("own_tokens_out", 0)
-    statuses = [node["status"]]
+    terminal_ts: float | None = None
+    terminal_status: str | None = None
     for child in node["children"]:
         child_rollup = _roll_up_steps(child)
         human += child_rollup["human_count"]
@@ -975,15 +987,19 @@ def _roll_up_steps(node: dict[str, Any]) -> dict[str, Any]:
         tokens_in += child_rollup["tokens_in"]
         tokens_out += child_rollup["tokens_out"]
         models |= child_rollup["models"]
-        statuses.append(child_rollup["status"])
-    status = max(statuses, key=lambda s: _STATUS_SEVERITY.get(s, 0))
+        child_ts = child_rollup["terminal_ts"]
+        if terminal_status is None or (child_ts or 0.0) >= (terminal_ts or 0.0):
+            terminal_ts, terminal_status = child_ts, child_rollup["terminal_status"]
+    if not node["children"]:
+        # A leaf is itself the terminal event; it keeps its own status.
+        terminal_ts, terminal_status = _parse_ts(node["ts_start"]), node["status"]
     node["rollup"] = {
         "human_count": human,
         "cost_usd": cost,
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
         "models": sorted(models),
-        "status": status,
+        "status": terminal_status,
     }
     return {
         "human_count": human,
@@ -991,7 +1007,8 @@ def _roll_up_steps(node: dict[str, Any]) -> dict[str, Any]:
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
         "models": models,
-        "status": status,
+        "terminal_ts": terminal_ts,
+        "terminal_status": terminal_status,
     }
 
 

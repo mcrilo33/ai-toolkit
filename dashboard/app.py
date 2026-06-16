@@ -194,7 +194,11 @@ def _render_divider(node: dict) -> None:
 def _node_row(node: dict, depth: int, inherited_actor: str = "main") -> None:
     """One trace row: indented label + Time(start clock)·Dur·Cost·Tokens·H·Actor."""
     indent = "&nbsp;&nbsp;&nbsp;&nbsp;" * depth
-    icon = _STATUS_ICON.get(node["status"], "•")
+    # Render the rolled-up (terminal) status so a container reads as its last-event
+    # outcome, not a worst-child reddening (Issue #57); a leaf's rollup equals its own
+    # status. Fall back to the raw status for any node built without a rollup.
+    status = (node.get("rollup") or {}).get("status") or node["status"]
+    icon = _STATUS_ICON.get(status, "•")
     metrics = queries.format_step_metrics(node)
     cols = st.columns(_STEP_COLS)
     cols[0].markdown(f"{indent}{icon} `{node['kind']}` **{_node_label(node)}**")

@@ -156,7 +156,8 @@ def test_hooks_outside_any_tool_or_turn_collapse_at_the_bucket():
     hooks = next(c for c in setup["children"] if c["kind"] == "hooks")
 
     # The red-phase hooks fall in no tool window and match no turn → they collapse
-    # into one node directly under the bucket, and surface the worst status.
+    # into one node directly under the bucket, and surface the terminal (last-event)
+    # status — here the later of the two hooks (Issue #57).
     assert hooks["collapsed_count"] == 2
     assert hooks["status"] == "warn"
 
@@ -628,7 +629,9 @@ def test_format_step_metrics_rolls_up_for_an_interval_bucket():
     assert metrics["cost"] == "$0.4400"  # 0.09 main + 0.35 nested agent
     assert metrics["tokens"] == "755"  # main 225 + subagent 530
     assert metrics["model"] == "haiku-4-5, opus-4-8"
-    assert metrics["status"] == "warn"  # a nested hook warned — surfaced, not hidden
+    # last-event-wins (Issue #57): the bucket shows its terminal (closing-marker)
+    # status; the nested hook's warn stays at its own leaf and does not redden it.
+    assert metrics["status"] == "success"
 
 
 def test_format_step_metrics_for_a_turn_node():
