@@ -714,7 +714,7 @@ def format_step_metrics(node: dict[str, Any]) -> dict[str, str]:
         "cost": _format_cost(cost),
         "tokens": f"{tokens:,}" if tokens else "—",
         "model": ", ".join(_short_model(m) for m in models) if models else "—",
-        "agent": node.get("agent", "main"),
+        "actor": node.get("actor", "main"),
         "humans": str(humans) if humans else "—",
         "status": node.get("status", ""),
     }

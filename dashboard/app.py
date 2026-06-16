@@ -111,7 +111,7 @@ _STATUS_ICON = {
 
 
 _STEP_COLS = [5, 1, 1, 1, 1, 2, 1]
-_STEP_HEADERS = ("Step", "Time", "Cost", "Tokens", "Human", "Model", "Agent")
+_STEP_HEADERS = ("Step", "Time", "Cost", "Tokens", "Human", "Model", "Actor")
 
 
 def _node_row(node: dict, depth: int) -> None:
@@ -126,7 +126,7 @@ def _node_row(node: dict, depth: int) -> None:
     cols[3].markdown(metrics["tokens"])
     cols[4].markdown(metrics["humans"])
     cols[5].markdown(metrics["model"])
-    cols[6].markdown(metrics["agent"])
+    cols[6].markdown(metrics["actor"])
 
 
 def _render_descendants(nodes: list[dict], depth: int) -> None:

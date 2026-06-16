@@ -15,9 +15,21 @@ ingestion + SQL, the meta-by-kind / aggregate / A-B rollups, and the formatters.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Iterator
 from datetime import datetime
+from pathlib import Path
 from typing import Any
+
+# The frozen synthetic-node contract (Issue #50) lives in the shared telemetry
+# package under ``scripts/``; the dashboard is otherwise self-contained, so put
+# that dir on the path here rather than relying on the caller's sys.path. The
+# unit harness loads this module by file path and ``streamlit run`` injects only
+# the dashboard dir, so neither would resolve ``telemetry`` without this. Unlike
+# the live-DB-only imports in ``queries.py``/``app.py``, ``synthetic_node`` is
+# core to every forest build, so the dependency is hard and the import eager.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+from telemetry.spans import synthetic_node
 
 # Status severity for collapsing many spans into one line: a collapsed hooks row
 # must surface the worst outcome, never hide a deny/failure/warn behind success.
@@ -72,7 +84,10 @@ def _step_node(row: dict[str, Any]) -> dict[str, Any]:
         "own_tokens_in": 0,
         "own_tokens_out": 0,
         "models": [],
-        "agent": "subagent" if row["kind"] == "agent" else "main",
+        # The v3 Actor column (Issue #50). UPGRADE: refine the value beyond
+        # main/subagent (workflow / script / hooks / sidecar / sub-agent name)
+        # when the nesting + synthetics subtasks introduce those node kinds.
+        "actor": "subagent" if row["kind"] == "agent" else "main",
         "children": [],
     }
 
@@ -163,28 +178,21 @@ def _collapse_hooks(siblings: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _hooks_node(hooks: list[dict[str, Any]]) -> dict[str, Any]:
     starts = [h["ts_start"] for h in hooks if h["ts_start"]]
     ends = [h["ts_end"] for h in hooks if h["ts_end"]]
-    return {
-        "span_id": None,
-        "kind": "hooks",
-        "name": "hooks",
-        "phase": None,
-        "status": _worst_status(hooks),
-        "ts_start": min(starts, key=lambda s: _parse_ts(s) or 0.0) if starts else None,
-        "ts_end": max(ends, key=lambda s: _parse_ts(s) or 0.0) if ends else None,
-        "duration_ms": sum(h["duration_ms"] for h in hooks),
-        "human_type": None,
-        "human_wait_ms": None,
-        "human_count": 0,
-        # A collapsed node owns no turns itself — its hook children carry any.
-        "own_cost_usd": 0.0,
-        "own_tokens_in": 0,
-        "own_tokens_out": 0,
-        "models": [],
-        "agent": "main",
-        "collapsed": True,
-        "collapsed_count": len(hooks),
-        "children": list(hooks),
-    }
+    node: dict[str, Any] = dict(
+        synthetic_node(
+            kind="hooks",
+            name="hooks",
+            status=_worst_status(hooks),
+            ts_start=min(starts, key=lambda s: _parse_ts(s) or 0.0) if starts else None,
+            ts_end=max(ends, key=lambda s: _parse_ts(s) or 0.0) if ends else None,
+            duration_ms=sum(h["duration_ms"] for h in hooks),
+            # A collapsed node owns no turns itself — its hook children carry any.
+            children=list(hooks),
+        )
+    )
+    node["collapsed"] = True
+    node["collapsed_count"] = len(hooks)
+    return node
 
 
 def _worst_status(nodes: list[dict[str, Any]]) -> str:
@@ -449,30 +457,21 @@ def _turn_node(turn: dict[str, Any]) -> dict[str, Any]:
     spans table, the ``turns`` table, or meta-by-kind — it exists only in the
     drill-down tree, like the ``interval`` / ``hooks`` synthetic nodes.
     """
-    tokens_in = turn.get("tokens_in") or 0
-    tokens_out = turn.get("tokens_out") or 0
-    return {
-        "span_id": None,
-        "parent_id": None,
-        "kind": "turn",
-        "name": "turn",
-        "summary": None,
-        "phase": None,
-        "status": "success",
-        "ts_start": turn["ts"],
-        "ts_end": turn["ts"],
-        "duration_ms": None,
-        "human_type": None,
-        "human_wait_ms": None,
-        "human_count": 0,
-        "own_cost_usd": turn.get("cost_usd") or 0.0,
-        "own_tokens_in": tokens_in,
-        "own_tokens_out": tokens_out,
-        "models": [turn["model"]] if turn.get("model") else [],
-        "agent": turn.get("source", "main"),
-        "model": turn.get("model"),
-        "children": [],
-    }
+    node: dict[str, Any] = dict(
+        synthetic_node(
+            kind="turn",
+            name="turn",
+            ts_start=turn["ts"],
+            ts_end=turn["ts"],
+            own_cost_usd=turn.get("cost_usd") or 0.0,
+            own_tokens_in=turn.get("tokens_in") or 0,
+            own_tokens_out=turn.get("tokens_out") or 0,
+            models=[turn["model"]] if turn.get("model") else [],
+            actor=turn.get("source", "main"),
+        )
+    )
+    node["model"] = turn.get("model")
+    return node
 
 
 def _marker_leaf(node: dict[str, Any]) -> dict[str, Any]:
@@ -589,27 +588,17 @@ def _synthetic_root(
     children: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """A synthetic bucket root: owns no cost (its turn-node children do), no duration."""
-    return {
-        "span_id": None,
-        "parent_id": None,
-        "kind": kind,
-        "name": name,
-        "summary": None,
-        "phase": None,
-        "status": _worst_status(list(_flatten(children))),
-        "ts_start": ts_start,
-        "ts_end": ts_end,
-        "duration_ms": None,  # intervals are attribution-only, never a phase width
-        "human_type": None,
-        "human_wait_ms": None,
-        "human_count": 0,
-        "own_cost_usd": 0.0,
-        "own_tokens_in": 0,
-        "own_tokens_out": 0,
-        "models": [],
-        "agent": "main",
-        "children": children,
-    }
+    return dict(
+        synthetic_node(
+            kind=kind,
+            name=name,
+            status=_worst_status(list(_flatten(children))),
+            ts_start=ts_start,
+            ts_end=ts_end,
+            duration_ms=None,  # intervals are attribution-only, never a phase width
+            children=children,
+        )
+    )
 
 
 def _bucket_sort_key(node: dict[str, Any]) -> tuple[float, str]:
