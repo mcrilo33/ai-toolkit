@@ -279,9 +279,32 @@ def test_drill_reveals_nested_members_when_open(monkeypatch):
     step = _node("interval", "S1", ts_start="2026-06-12T12:00:00Z", children=[group])
     app._render_spine([step])
 
+    st.expander.assert_not_called()  # the fix: no expander to re-collapse on rerun
     assert any("hooks x3" in t for t in rec.texts)  # group shows when the step is drilled
-    assert any("/f0" in t for t in rec.texts)  # nested members reveal (the bug)
+    assert any("/f0" in t for t in rec.texts)  # nested members reveal through the toggle
     assert any("/f2" in t for t in rec.texts)
+
+
+def test_drill_toggle_keys_are_unique_and_path_shaped(monkeypatch):
+    # The fix's load-bearing property: a stable, unique per-path toggle key (so it
+    # persists across reruns and never DuplicateWidgetID-collides). Two sibling
+    # groups with the SAME label must still get distinct keys.
+    st, _rec = _recording_streamlit(checkbox_returns=True)
+    app = _app(monkeypatch, st)
+
+    g1 = _node(
+        "hooks", "hooks", collapsed_count=2, children=[_node("hook", "a"), _node("hook", "b")]
+    )
+    g2 = _node(
+        "hooks", "hooks", collapsed_count=2, children=[_node("hook", "c"), _node("hook", "d")]
+    )
+    step = _node("interval", "S1", ts_start="2026-06-12T12:00:00Z", children=[g1, g2])
+    app._render_spine([step])
+
+    keys = [call.kwargs.get("key") for call in st.toggle.call_args_list]
+    assert keys, "expected drill toggles to be rendered"
+    assert all(k and k.startswith("drill::") for k in keys)  # path-shaped
+    assert len(keys) == len(set(keys))  # unique — no DuplicateWidgetID in real Streamlit
 
 
 def test_non_hooks_collapsed_group_gets_times_n_label(monkeypatch):
