@@ -76,6 +76,78 @@ def test_next_command_think_is_answer_and_requeue() -> None:
     assert "re-queue" in out or "requeue" in out or "answer" in out
 
 
+# ── _repo_is_real: the #55 fixture-leak guard (mirror of queries' real-spoke filter) ──
+
+
+def test_repo_is_real_accepts_the_toolkit_checkout() -> None:
+    # The real hub (and its worktrees) basename starts with the toolkit name.
+    real = _call("MAIN_ROOT=/Users/me/ai-toolkit _repo_is_real && echo REAL || echo FAKE")
+    worktree = _call("MAIN_ROOT=/Users/me/ai-toolkit-55 _repo_is_real && echo REAL || echo FAKE")
+
+    assert real.stdout.strip() == "REAL", real.stderr
+    assert worktree.stdout.strip() == "REAL", worktree.stderr
+
+
+def test_repo_is_real_rejects_a_sandbox_basename() -> None:
+    fake = _call("MAIN_ROOT=/tmp/pytest-xyz/proj _repo_is_real && echo REAL || echo FAKE")
+
+    assert fake.stdout.strip() == "FAKE", fake.stderr
+
+
+def test_repo_is_real_honours_an_explicit_prefix() -> None:
+    # The override seam the test harness uses to run report() over a sandbox repo.
+    matched = _call(
+        "HUB_REAL_REPO_PREFIX=proj MAIN_ROOT=/tmp/x/proj-8 _repo_is_real && echo REAL || echo FAKE"
+    )
+
+    assert matched.stdout.strip() == "REAL", matched.stderr
+
+
+def test_repo_is_real_empty_prefix_disables_the_guard() -> None:
+    disabled = _call(
+        "HUB_REAL_REPO_PREFIX= MAIN_ROOT=/tmp/anything _repo_is_real && echo REAL || echo FAKE"
+    )
+
+    assert disabled.stdout.strip() == "REAL", disabled.stderr
+
+
+def _run_report_guarded(hub: Path, tmp_path: Path, prefix: str) -> subprocess.CompletedProcess[str]:
+    """Run the report with the #55 repo-real guard active at ``prefix``."""
+    return subprocess.run(
+        ["bash", str(HUB_MORNING)],
+        cwd=str(hub),
+        capture_output=True,
+        text=True,
+        env={
+            **_GIT_ENV,
+            "NIGHT_STATE_DIR": str(tmp_path / "night-state"),
+            "HUB_REAL_REPO_PREFIX": prefix,
+        },
+    )
+
+
+def test_report_refuses_to_render_when_repo_is_not_real(hub: Path, tmp_path: Path) -> None:
+    # The sandbox hub basename ('hub') is not 'ai-toolkit*': the worklist must not
+    # render markers as a fake worklist; a one-line notice is emitted instead.
+    _seed_spoke(hub, tmp_path, 101, "ready")
+
+    result = _run_report_guarded(hub, tmp_path, prefix="ai-toolkit")
+
+    assert result.returncode == 0, result.stderr
+    assert "/land 101" not in result.stdout
+    assert "LAND — rubber-stamp" not in result.stdout
+    assert "not a real" in result.stdout.lower() or "skipping" in result.stdout.lower()
+
+
+def test_report_renders_when_repo_matches_prefix(hub: Path, tmp_path: Path) -> None:
+    _seed_spoke(hub, tmp_path, 101, "ready")
+
+    result = _run_report_guarded(hub, tmp_path, prefix="hub")  # matches the sandbox basename
+
+    assert result.returncode == 0, result.stderr
+    assert "/land 101" in result.stdout
+
+
 # ── probe_merge: hermetic land-triage (detached temp worktree, conflict-only) ──
 
 
@@ -160,7 +232,13 @@ def _run_report(hub: Path, tmp_path: Path) -> subprocess.CompletedProcess[str]:
         cwd=str(hub),
         capture_output=True,
         text=True,
-        env={**_GIT_ENV, "NIGHT_STATE_DIR": str(tmp_path / "night-state")},
+        # Empty prefix disables the #55 repo-real guard so the worklist renders over
+        # the temp sandbox hub; the guard itself is covered by its own tests.
+        env={
+            **_GIT_ENV,
+            "NIGHT_STATE_DIR": str(tmp_path / "night-state"),
+            "HUB_REAL_REPO_PREFIX": "",
+        },
     )
 
 
