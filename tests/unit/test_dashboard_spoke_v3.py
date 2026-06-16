@@ -162,6 +162,22 @@ def test_actor_label_resolves_name_kind_and_explicit_actor(monkeypatch):
     assert app._actor_label(_node("turn", "turn", agent="main")) == "main"
 
 
+def test_subagent_tool_actor_inherits_agent_name(monkeypatch):
+    # A tool/turn nested under a sub-agent is owned by that sub-agent, not main —
+    # the tree tags the span's own `agent` as "main" (kind-based) and emits no #50
+    # `actor` yet, so the renderer must inherit the enclosing agent's name.
+    st, rec = _recording_streamlit(checkbox_returns=True)  # drill open to render children
+    app = _app(monkeypatch, st)
+
+    tool = _node("tool", "Read /repo/x.py", ts_start="2026-06-12T12:00:11Z", agent="main")
+    agent_node = _node("agent", "tdd-red", ts_start="2026-06-12T12:00:10Z", children=[tool])
+    step = _node("interval", "setup", ts_start="2026-06-12T12:00:00Z", children=[agent_node])
+    app._render_spine([step])
+
+    assert _row_for(rec, "tdd-red")[6] == "tdd-red"  # the agent itself
+    assert _row_for(rec, "Read /repo/x.py")[6] == "tdd-red"  # its tool inherits the actor
+
+
 def test_actor_column_shows_subagent_name(monkeypatch):
     st, rec = _recording_streamlit()
     app = _app(monkeypatch, st)
