@@ -250,6 +250,10 @@ telemetry_emit_span() {
           duration_ms: $duration_ms,
           status: $status,
           human: $human,
+          summary: null,
+          emits: null,
+          sidecar_session: null,
+          agent_link: null,
           tokens_in: null,
           tokens_out: null,
           cost_usd: null
@@ -261,7 +265,7 @@ telemetry_emit_span() {
       _telemetry_or_null() { [ -n "$1" ] && printf '"%s"' "$(_telemetry_json_str "$1")" || printf 'null'; }
       local human_json='null'
       [ -n "$human_type" ] && human_json="{\"type\":\"$(_telemetry_json_str "$human_type")\",\"wait_ms\":${human_wait_ms:-0}}"
-      printf '{"span_id":"%s","parent_id":%s,"spoke_run_id":%s,"session_id":%s,"workflow_rev":%s,"repo":"%s","branch":%s,"kind":"%s","name":"%s","phase":%s,"ts_start":"%s","ts_end":"%s","duration_ms":%d,"status":"%s","human":%s,"tokens_in":null,"tokens_out":null,"cost_usd":null}\n' \
+      printf '{"span_id":"%s","parent_id":%s,"spoke_run_id":%s,"session_id":%s,"workflow_rev":%s,"repo":"%s","branch":%s,"kind":"%s","name":"%s","phase":%s,"ts_start":"%s","ts_end":"%s","duration_ms":%d,"status":"%s","human":%s,"summary":null,"emits":null,"sidecar_session":null,"agent_link":null,"tokens_in":null,"tokens_out":null,"cost_usd":null}\n' \
         "$(_telemetry_json_str "$span_id")" \
         "$(_telemetry_or_null "$parent_id")" \
         "$(_telemetry_or_null "$spoke_run_id")" \

@@ -55,6 +55,11 @@ SCHEMA_KEYS = {
     "duration_ms",
     "status",
     "human",
+    # v3 spoke-trace link fields (#50) — pull-only, null on push (#54 track E).
+    "summary",
+    "emits",
+    "sidecar_session",
+    "agent_link",
     "tokens_in",
     "tokens_out",
     "cost_usd",
