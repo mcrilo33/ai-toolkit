@@ -77,6 +77,7 @@ _TURN_COLUMNS = (
     "tokens_out BIGINT",
     "tokens_total BIGINT",
     "cost_usd DOUBLE",
+    "reasoning VARCHAR",
 )
 _TURN_FIELDS = tuple(col.split(" ", 1)[0] for col in _TURN_COLUMNS)
 
@@ -99,7 +100,7 @@ def connect(
     # joined to push spans) and turns (per-turn usage with model + once-only cost).
     parsed = parse_projects_dir(projects_root)
     spans = _attributed_span_dicts(parsed, events_path, ccusage_costs)
-    turns = per_turn_rows(parsed.usage_events, ccusage_costs)
+    turns = per_turn_rows(parsed.usage_events, ccusage_costs, reasoning_refs=parsed.reasoning_refs)
 
     con = duckdb.connect(":memory:")
     con.execute(f"CREATE TABLE spans ({', '.join(_COLUMNS)})")
@@ -126,7 +127,7 @@ def build_unified_spans(
 def build_turns(*, projects_root: Path, ccusage_costs: dict[str, float]) -> list[dict[str, object]]:
     """Per-turn rows (model + once-only cost) parsed from the session logs."""
     parsed = parse_projects_dir(projects_root)
-    return per_turn_rows(parsed.usage_events, ccusage_costs)
+    return per_turn_rows(parsed.usage_events, ccusage_costs, reasoning_refs=parsed.reasoning_refs)
 
 
 def _attributed_span_dicts(

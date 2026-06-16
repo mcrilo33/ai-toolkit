@@ -681,9 +681,17 @@ def _interval_forest(
     roots: list[dict[str, Any]] = []
     for key, window in windows.items():
         bucket_spans = spans_by_key.get(key, [])
-        children = _bucket_children(bucket_spans, turns_by_owner.get(key, []), turns_by_owner)
-        todo_label = None if window.get("lock_label") else _bucket_todo_label(bucket_spans)
-        roots.append(_bucket_node(window, children, todo_label))
+        bucket_turns = turns_by_owner.get(key, [])
+        children = _bucket_children(bucket_spans, bucket_turns, turns_by_owner)
+        # The bucket label: the todo it advances, else a content-derived gist from its
+        # turns' reasoning (Issue #59 — so a real phase never renders as a bare phase
+        # name when content describes what happened), else the phase label.
+        label = (
+            None
+            if window.get("lock_label")
+            else (_bucket_todo_label(bucket_spans) or _bucket_reasoning_gist(bucket_turns))
+        )
+        roots.append(_bucket_node(window, children, label))
 
     orphan_spans = spans_by_key.get(_UNRESOLVED_KEY, [])
     orphan_turns = turns_by_owner.get(_UNRESOLVED_KEY, [])
@@ -876,6 +884,10 @@ def _turn_node(turn: dict[str, Any]) -> dict[str, Any]:
     spans table, the ``turns`` table, or meta-by-kind — it exists only in the
     drill-down tree, like the ``interval`` / ``hooks`` synthetic nodes.
     """
+    # A turn's reasoning gist (Issue #59) renders as a synthetic ``reasoning`` child so
+    # the drill-down shows what the inference was reasoning about; it owns no cost.
+    gist = turn.get("reasoning")
+    children = [_reasoning_node(gist, turn["ts"])] if gist else None
     node: dict[str, Any] = dict(
         synthetic_node(
             kind="turn",
@@ -887,10 +899,18 @@ def _turn_node(turn: dict[str, Any]) -> dict[str, Any]:
             own_tokens_out=turn.get("tokens_out") or 0,
             models=[turn["model"]] if turn.get("model") else [],
             actor=turn.get("source", "main"),
+            children=children,
         )
     )
     node["model"] = turn.get("model")
     return node
+
+
+def _reasoning_node(gist: str, ts: str | None) -> dict[str, Any]:
+    """A synthetic ``reasoning`` node carrying a turn's privacy-safe narration gist."""
+    return dict(
+        synthetic_node(kind="reasoning", name="reasoning", summary=gist, ts_start=ts, ts_end=ts)
+    )
 
 
 def _marker_leaf(node: dict[str, Any]) -> dict[str, Any]:
@@ -974,16 +994,17 @@ def _flatten(nodes: list[dict[str, Any]]) -> Iterator[dict[str, Any]]:
 def _bucket_node(
     window: dict[str, Any],
     children: list[dict[str, Any]],
-    todo_label: str | None = None,
+    label: str | None = None,
 ) -> dict[str, Any]:
     """A synthetic phase-interval root; owns no cost (its turn nodes do), no duration.
 
-    ``todo_label`` (Issue #47) names the bucket for the in-progress todo it
-    advances, falling back to the phase/``setup`` label when none resolved.
+    ``label`` is the resolved content label for the bucket — the in-progress todo it
+    advances (Issue #47), else a reasoning-derived gist (Issue #59) — falling back to
+    the phase/``setup`` label when neither resolved.
     """
     return _synthetic_root(
         kind="interval",
-        name=todo_label or window["label"],
+        name=label or window["label"],
         ts_start=window["lo_iso"],
         ts_end=window["hi_iso"],
         children=children,
@@ -1001,6 +1022,19 @@ def _bucket_todo_label(bucket_spans: list[dict[str, Any]]) -> str | None:
         key=_sort_key,
     )
     return todos[-1]["summary"] if todos else None
+
+
+def _bucket_reasoning_gist(bucket_turns: list[dict[str, Any]]) -> str | None:
+    """A content-derived bucket label from its turns' reasoning gists (Issue #59).
+
+    The earliest turn that reasoned names the phase — what the step set out to do —
+    so a real phase bucket reads as its work, not a bare phase name, when no todo
+    summary resolved. ``None`` when no turn in the bucket carries a reasoning gist.
+    """
+    for turn in sorted(bucket_turns, key=lambda t: _parse_ts(t.get("ts")) or 0.0):
+        if turn.get("reasoning"):
+            return turn["reasoning"]
+    return None
 
 
 def _unresolved_node(children: list[dict[str, Any]]) -> dict[str, Any]:

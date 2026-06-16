@@ -95,6 +95,9 @@ _TURN_COLUMNS: tuple[tuple[str, str], ...] = (
     ("tokens_out", "BIGINT"),
     ("tokens_total", "BIGINT"),
     ("cost_usd", "DOUBLE"),
+    # Issue #59: the turn's privacy-safe reasoning gist, surfaced as a ``reasoning``
+    # node and as a phase step's content-derived label when no todo summary resolves.
+    ("reasoning", "VARCHAR"),
 )
 _TURN_COLUMN_NAMES: tuple[str, ...] = tuple(name for name, _ in _TURN_COLUMNS)
 

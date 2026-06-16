@@ -107,11 +107,12 @@ class UsageEvent:
 
 @dataclass(slots=True)
 class ReasoningRef:
-    """A privacy-safe pointer to an extended-thinking block (Issue #51 S3).
+    """A privacy-safe per-turn reasoning summary (Issues #51 S3, #59).
 
-    Carries only a transcript-link locator (``<session-or-agent-id>#<record-uuid>``)
-    and timing — never the thinking text. The dashboard renders a synthetic
-    ``reasoning`` node from these; the body stays in the transcript.
+    Carries a transcript-link locator (``<session-or-agent-id>#<record-uuid>``),
+    timing, and a ``summary`` gist — the first line of the turn's *visible* narration
+    text. The redacted extended-thinking body is never read (real thinking is
+    signature-only); the dashboard renders a synthetic ``reasoning`` node from these.
     """
 
     session_id: str | None
@@ -119,6 +120,7 @@ class ReasoningRef:
     agent_id: str | None
     ts: str | None
     ref: str
+    summary: str | None = None
 
 
 @dataclass(slots=True)
@@ -436,10 +438,12 @@ def _reasoning_refs(
     agent_id: str | None,
     meta: dict[str, str | None],
 ) -> list[ReasoningRef]:
-    """One :class:`ReasoningRef` per assistant turn that carries a thinking block.
+    """One :class:`ReasoningRef` per assistant turn that reasoned (Issue #59).
 
-    Only a locator (``<stem>#<record-uuid>``) and timing are read — the thinking
-    text itself is never copied, so the body stays private.
+    A turn reasoned if it carries an extended-thinking block *or* a visible narration
+    text block. The ``summary`` gist is the first line of that narration (never the
+    redacted thinking body, which is signature-only) — only a locator, timing, and the
+    user-visible gist are read, so nothing private leaks.
     """
     refs: list[ReasoningRef] = []
     for rec in records:
@@ -449,7 +453,9 @@ def _reasoning_refs(
         if not isinstance(message, dict):
             continue
         content = message.get("content") or []
-        if not any(isinstance(b, dict) and b.get("type") == "thinking" for b in content):
+        has_thinking = any(isinstance(b, dict) and b.get("type") == "thinking" for b in content)
+        narration = _narration_text(content)
+        if not has_thinking and narration is None:
             continue
         refs.append(
             ReasoningRef(
@@ -458,9 +464,20 @@ def _reasoning_refs(
                 agent_id=agent_id,
                 ts=rec.get("timestamp"),
                 ref=f"{stem}#{rec.get('uuid') or ''}",
+                summary=_snippet(narration),
             )
         )
     return refs
+
+
+def _narration_text(content: list) -> str | None:
+    """The first visible narration text block in an assistant turn (else ``None``)."""
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                return text
+    return None
 
 
 def _context_and_rule_loads(records: list[dict], meta: dict[str, str | None]) -> list[Span]:
