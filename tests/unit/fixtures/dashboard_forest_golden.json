@@ -1463,6 +1463,16 @@
         },
         {
           "count": 1,
+          "kind": "approval",
+          "mean_cost_usd": 0.0,
+          "mean_duration_ms": 80,
+          "median_duration_ms": 80,
+          "models": [],
+          "total_cost_usd": 0.0,
+          "total_duration_ms": 80
+        },
+        {
+          "count": 1,
           "kind": "human",
           "mean_cost_usd": 0.0,
           "mean_duration_ms": 15000,
@@ -1711,7 +1721,37 @@
                       "children": [
                         {
                           "actor": "main",
-                          "children": [],
+                          "children": [
+                            {
+                              "actor": "main",
+                              "children": [],
+                              "duration_ms": 80,
+                              "human_count": 1,
+                              "human_type": "approval",
+                              "human_wait_ms": 80,
+                              "kind": "approval",
+                              "models": [],
+                              "name": "tool-permission",
+                              "own_cost_usd": 0.0,
+                              "own_tokens_in": 0,
+                              "own_tokens_out": 0,
+                              "parent_id": "v2_sub_read",
+                              "phase": null,
+                              "rollup": {
+                                "cost_usd": 0.0,
+                                "human_count": 1,
+                                "models": [],
+                                "status": "warn",
+                                "tokens_in": 0,
+                                "tokens_out": 0
+                              },
+                              "span_id": "approval:v2_red_hook2",
+                              "status": "warn",
+                              "summary": "flagged: Read /repo/sub/code.py",
+                              "ts_end": "2026-06-12T12:00:07Z",
+                              "ts_start": "2026-06-12T12:00:07Z"
+                            }
+                          ],
                           "duration_ms": 2000,
                           "human_count": 0,
                           "human_type": null,
@@ -1726,9 +1766,9 @@
                           "phase": null,
                           "rollup": {
                             "cost_usd": 0.0,
-                            "human_count": 0,
+                            "human_count": 1,
                             "models": [],
-                            "status": "success",
+                            "status": "warn",
                             "tokens_in": 0,
                             "tokens_out": 0
                           },
@@ -1754,11 +1794,11 @@
                       "phase": null,
                       "rollup": {
                         "cost_usd": 0.2,
-                        "human_count": 0,
+                        "human_count": 1,
                         "models": [
                           "claude-haiku-4-5"
                         ],
-                        "status": "success",
+                        "status": "warn",
                         "tokens_in": 200,
                         "tokens_out": 100
                       },
@@ -1847,7 +1887,7 @@
                   "phase": null,
                   "rollup": {
                     "cost_usd": 0.35,
-                    "human_count": 0,
+                    "human_count": 1,
                     "models": [
                       "claude-haiku-4-5"
                     ],
@@ -1877,7 +1917,7 @@
               "phase": null,
               "rollup": {
                 "cost_usd": 0.39999999999999997,
-                "human_count": 0,
+                "human_count": 1,
                 "models": [
                   "claude-haiku-4-5",
                   "claude-opus-4-8"
@@ -2003,7 +2043,7 @@
           "phase": null,
           "rollup": {
             "cost_usd": 0.44,
-            "human_count": 0,
+            "human_count": 1,
             "models": [
               "claude-haiku-4-5",
               "claude-opus-4-8"
@@ -2608,7 +2648,32 @@
         {
           "children": [
             {
-              "children": [],
+              "children": [
+                {
+                  "children": [],
+                  "cost_usd": null,
+                  "duration_ms": 80,
+                  "human_count": 1,
+                  "human_type": "approval",
+                  "human_wait_ms": 80,
+                  "kind": "approval",
+                  "name": "tool-permission",
+                  "parent_id": "v2_sub_read",
+                  "phase": null,
+                  "span_id": "approval:v2_red_hook2",
+                  "status": "warn",
+                  "subtree": {
+                    "cost_usd": 0.0,
+                    "duration_ms": 80,
+                    "human_count": 1,
+                    "tokens_in": 0,
+                    "tokens_out": 0
+                  },
+                  "tokens_in": null,
+                  "tokens_out": null,
+                  "ts_start": "2026-06-12T12:00:07Z"
+                }
+              ],
               "cost_usd": null,
               "duration_ms": 2000,
               "human_count": 0,
@@ -2622,8 +2687,8 @@
               "status": "success",
               "subtree": {
                 "cost_usd": 0.0,
-                "duration_ms": 2000,
-                "human_count": 0,
+                "duration_ms": 2080,
+                "human_count": 1,
                 "tokens_in": 0,
                 "tokens_out": 0
               },
@@ -2669,8 +2734,8 @@
           "status": "success",
           "subtree": {
             "cost_usd": 0.0,
-            "duration_ms": 12000,
-            "human_count": 0,
+            "duration_ms": 12080,
+            "human_count": 1,
             "tokens_in": 0,
             "tokens_out": 0
           },

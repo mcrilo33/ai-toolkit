@@ -508,7 +508,9 @@ def test_meta_by_kind_sorts_by_cost_then_count_then_kind():
     rows = store_v2().spoke_meta_by_kind(RUN)
 
     # agent ($0.35) first; the rest at $0 by count desc then kind asc:
-    # todo(4), tool(4) → todo, tool; hook(3); lifecycle(2), step(2); human(1), skill(1).
+    # todo(4), tool(4) → todo, tool; hook(3); lifecycle(2), step(2);
+    # then the count-1 group by kind asc: approval (derived from the warn gate,
+    # Issue #60), human, skill.
     assert [row["kind"] for row in rows] == [
         "agent",
         "todo",
@@ -516,6 +518,7 @@ def test_meta_by_kind_sorts_by_cost_then_count_then_kind():
         "hook",
         "lifecycle",
         "step",
+        "approval",
         "human",
         "skill",
     ]

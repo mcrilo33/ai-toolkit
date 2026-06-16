@@ -129,6 +129,168 @@ def _row_tuple(span: dict[str, Any]) -> tuple[Any, ...]:
     return tuple(values.get(name) for name in _COLUMN_NAMES)
 
 
+# Approval derivation (Issue #60). A tool-permission decision is never its own
+# span: it lives only in the push-layer PreToolUse ``hook`` span as a ``status`` of
+# ``allow`` / ``deny`` / ``warn``. ``_derive_approvals`` turns each such gating hook
+# into a first-class ``approval`` node and links it to the tool it gated.
+_GATING_STATUSES: tuple[str, ...] = ("allow", "deny", "warn")
+_APPROVAL_NAME = "tool-permission"
+# A gate fires at PreToolUse, immediately before its tool; the gated tool is the
+# nearest tool in the same spoke run that *starts at or after* the gate. The window
+# guards against a gate with no real tool matching an unrelated far-future one.
+_GATE_WINDOW_S = 120.0
+_DECISION_WORD: dict[str, str] = {"allow": "allowed", "deny": "denied", "warn": "flagged"}
+_NEVER_RAN = "(blocked, never ran)"
+
+
+def _fetch_dicts(
+    con: duckdb.DuckDBPyConnection, sql: str, params: list[Any] | None = None
+) -> list[dict[str, Any]]:
+    """Run SQL and return rows as column-keyed dicts (module-level twin of ``_query``)."""
+    cursor = con.execute(sql, params or [])
+    columns = [desc[0] for desc in cursor.description]
+    return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
+
+
+def _gated_tool(
+    hook: dict[str, Any], tools_by_run: dict[Any, list[dict[str, Any]]]
+) -> dict[str, Any] | None:
+    """The tool a gate hook gated: nearest tool starting at/after it, same run.
+
+    A gate with a ``session_id`` prefers a same-session tool; the nearest match by
+    start time wins, tie-broken by ``span_id``. ``None`` when no tool follows the
+    gate within :data:`_GATE_WINDOW_S` (a deny that blocked nothing parsable, or a
+    gate at the very tail of a run).
+    """
+    hook_ts = _parse_ts(hook["ts_start"])
+    if hook_ts is None:
+        return None
+    options: list[tuple[float, dict[str, Any]]] = []
+    for tool in tools_by_run.get(hook["spoke_run_id"], []):
+        tool_ts = _parse_ts(tool["ts_start"])
+        if tool_ts is None or tool_ts < hook_ts or tool_ts - hook_ts > _GATE_WINDOW_S:
+            continue
+        options.append((tool_ts, tool))
+    if hook["session_id"]:
+        same = [o for o in options if o[1]["session_id"] == hook["session_id"]]
+        if same:
+            options = same
+    if not options:
+        return None
+    options.sort(key=lambda o: (o[0], o[1]["span_id"]))
+    return options[0][1]
+
+
+def _approval_dict(hook: dict[str, Any], gated: dict[str, Any] | None, parent_id: Any) -> dict:
+    """Build the ``approval`` span dict derived from one gating ``hook``."""
+    decision = hook["status"]
+    target = gated["name"] if gated else "tool"
+    summary = f"{_DECISION_WORD.get(decision, decision)}: {target}"
+    if gated and gated.get("summary"):
+        summary = f"{summary} {gated['summary']}"
+    return {
+        "span_id": f"approval:{hook['span_id']}",
+        "parent_id": parent_id,
+        "spoke_run_id": hook["spoke_run_id"],
+        "session_id": hook["session_id"],
+        "workflow_rev": hook["workflow_rev"],
+        "repo": hook["repo"],
+        "branch": hook["branch"],
+        "kind": "approval",
+        "name": _APPROVAL_NAME,
+        "phase": hook["phase"],
+        "ts_start": hook["ts_start"],
+        "ts_end": hook["ts_end"],
+        "duration_ms": hook["duration_ms"] or 0,
+        "status": decision,
+        "human": {"type": "approval", "wait_ms": hook["duration_ms"] or 0},
+        "summary": summary,
+    }
+
+
+def _blocked_tool_dict(hook: dict[str, Any], approval_id: str) -> dict:
+    """A synthetic never-run tool under a deny approval (no parsable tool to reparent)."""
+    return {
+        "span_id": f"blocked:{hook['span_id']}",
+        "parent_id": approval_id,
+        "spoke_run_id": hook["spoke_run_id"],
+        "session_id": hook["session_id"],
+        "workflow_rev": hook["workflow_rev"],
+        "repo": hook["repo"],
+        "branch": hook["branch"],
+        "kind": "tool",
+        "name": "(blocked)",
+        "phase": hook["phase"],
+        "ts_start": hook["ts_start"],
+        "ts_end": hook["ts_end"],
+        "duration_ms": 0,
+        "status": "deny",
+        "summary": f"blocked by {hook['name']} {_NEVER_RAN}",
+    }
+
+
+def _derive_approvals(con: duckdb.DuckDBPyConnection) -> None:
+    """Materialize ``approval`` spans from gating hooks, linked to the tool they gated.
+
+    A PreToolUse hook whose ``status`` is ``allow`` / ``deny`` / ``warn`` is a
+    tool-permission gate. Each becomes one ``approval`` span carrying
+    ``human={type:'approval', wait_ms}`` (the wait derives from the gate's own
+    duration) so it routes into the Automatability view and rolls up at ``$0`` cost:
+
+    - **allow / warn** — the gate let the tool through, so the approval nests *under*
+      that tool (it gains an approval child; the tool keeps its place in the tree).
+    - **deny** — the gate blocked the tool, which reparents *under* the approval and
+      is marked never-run (``status='deny'`` + a ``never ran`` summary); when no
+      parsable tool follows, a synthetic never-run tool stands in.
+
+    Idempotent and curated-data-safe: a dataset that already carries ``approval``
+    spans (the golden fixture, or a re-wrapped connection) is left untouched.
+    """
+    if _fetch_dicts(con, "SELECT 1 FROM spans WHERE kind = 'approval' LIMIT 1"):
+        return
+    hooks = _fetch_dicts(
+        con,
+        f"SELECT * FROM spans WHERE kind = 'hook' AND status IN ({_sql_in_list(_GATING_STATUSES)}) "
+        "AND spoke_run_id IS NOT NULL ORDER BY ts_start, span_id",
+    )
+    if not hooks:
+        return
+    tools_by_run: dict[Any, list[dict[str, Any]]] = {}
+    for tool in _fetch_dicts(con, "SELECT * FROM spans WHERE kind = 'tool'"):
+        tools_by_run.setdefault(tool["spoke_run_id"], []).append(tool)
+
+    new_spans: list[dict[str, Any]] = []
+    tool_updates: list[tuple[Any, ...]] = []
+    claimed: set[Any] = set()
+    for hook in hooks:
+        gated = _gated_tool(hook, tools_by_run)
+        approval_id = f"approval:{hook['span_id']}"
+        if hook["status"] == "deny":
+            approval = _approval_dict(hook, gated, hook["parent_id"])
+            if gated and gated["span_id"] not in claimed:
+                claimed.add(gated["span_id"])
+                summary = f"{gated['summary']} {_NEVER_RAN}" if gated["summary"] else _NEVER_RAN
+                tool_updates.append((approval_id, "deny", summary, gated["span_id"]))
+            else:
+                new_spans.append(_blocked_tool_dict(hook, approval_id))
+        else:
+            parent_id = gated["span_id"] if gated else hook["parent_id"]
+            approval = _approval_dict(hook, gated, parent_id)
+        new_spans.append(approval)
+
+    if new_spans:
+        placeholders = ", ".join("?" for _ in _COLUMN_NAMES)
+        con.executemany(
+            f"INSERT INTO spans VALUES ({placeholders})",
+            [_row_tuple(span) for span in new_spans],
+        )
+    for parent_id, status, summary, span_id in tool_updates:
+        con.execute(
+            "UPDATE spans SET parent_id = ?, status = ?, summary = ? WHERE span_id = ?",
+            [parent_id, status, summary, span_id],
+        )
+
+
 _SPOKE_ISSUE_RE = re.compile(r"^(\d+)-")
 
 # A real spoke run's ``repo`` is the toolkit checkout basename (``ai-toolkit`` or a
@@ -195,6 +357,10 @@ class SpanStore:
 
     def __init__(self, con: duckdb.DuckDBPyConnection) -> None:
         self.con = con
+        # Derive approval nodes from the gating hooks once, at construction, so every
+        # path (raw JSONL fixtures, the live #22 correlation) surfaces them uniformly
+        # (Issue #60). No-op when the dataset already carries approvals.
+        _derive_approvals(con)
 
     @classmethod
     def from_events(

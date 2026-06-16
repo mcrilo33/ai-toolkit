@@ -139,7 +139,14 @@ class TestLinkageToGatedTool:
         assert blocked, "the blocked tool must reparent under the deny approval"
         tool = blocked[0]
         assert tool["status"] == "deny", "a blocked tool renders as never-run (deny)"
-        assert "never" in (tool["summary"] or "").lower()
+
+    def test_blocked_tool_summary_marks_it_never_ran(self) -> None:
+        # The never-run marker is a materialised data fact (the lean spoke_tree node
+        # projection drops summary); assert it on the spans table directly.
+        store = _store()
+        rows = store._query("SELECT summary FROM spans WHERE kind = 'tool' AND status = 'deny'")
+        assert rows, "the deny gate must leave a never-run tool"
+        assert all("never ran" in (r["summary"] or "").lower() for r in rows)
 
 
 class TestApprovalsInRollups:
