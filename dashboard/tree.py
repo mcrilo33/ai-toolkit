@@ -29,7 +29,7 @@ from typing import Any
 # the live-DB-only imports in ``queries.py``/``app.py``, ``synthetic_node`` is
 # core to every forest build, so the dependency is hard and the import eager.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-from telemetry.spans import synthetic_node
+from telemetry.spans import derive_span_id, synthetic_node
 
 # Synthetic bucket ids for the phase-interval attribution (Issue #46): the leading
 # pre-cycle region and the off-spine catch-all. Real intervals key on their marker's
@@ -196,6 +196,93 @@ def _collapse_hooks(siblings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if hooks:
         result.append(_hooks_node(hooks))
     return sorted(result, key=_sort_key)
+
+
+# Kinds whose wide identical leaf siblings collapse into one ``<kind> xN`` group
+# (Issue #56), generalizing the hooks collapse. ``hook`` keeps its own unconditional
+# ``_collapse_hooks`` (it groups every hook regardless of label); these kinds group
+# only genuinely duplicate/parallel leaves — see ``_leaf_collapse_key``.
+#
+# ``turn`` is deliberately excluded though the issue lists it: under the strict key
+# below a turn would only ever group with a *same-timestamp* turn, but those are
+# distinct cost-bearing inferences the tree keeps separate on purpose (the per-turn
+# cost/composition panel, and the ``test_same_ts_*_turns_are_both_kept`` guards). A
+# collapsed group also carries its members' kind, so a ``turn`` group would
+# masquerade as a real turn to any kind-based counter. todo/agent leaves own no cost
+# (it lives on turns), so they collapse cleanly.
+_COLLAPSIBLE_LEAF_KINDS = frozenset({"todo", "agent"})
+
+
+def _leaf_collapse_key(node: dict[str, Any]) -> tuple[str, str, str | None, str | None, str | None]:
+    """The identity two leaf siblings must share to collapse into one group.
+
+    Strict by design (Issue #56): identical kind/name/summary at the *same*
+    ``ts_start`` (and model). Only true duplicates (a burst of identical ledger
+    writes) or a same-instant parallel fan-out collapse — never spread-out siblings.
+    """
+    return (node["kind"], node["name"], node.get("summary"), node["ts_start"], node.get("model"))
+
+
+def _collapse_leaves(siblings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse runs of identical childless leaf siblings into ``xN`` groups (recursively).
+
+    Generalizes ``_collapse_hooks`` to the spec's wider ``xN`` groups (``todo x3``,
+    ``agent x3 parallel``, ``turns x7``): childless siblings of a collapsible kind
+    sharing a :func:`_leaf_collapse_key` group into one node carrying
+    ``collapsed_count`` with the members as ``children``. Only a *run* of ≥2 collapses
+    — a lone leaf, or a node that owns sub-work, passes through untouched. Recurses
+    post-order so nested sibling lists (e.g. bare todos rehomed under a turn) collapse
+    too. Members are never omitted; the drill reveals each.
+    """
+    for node in siblings:
+        node["children"] = _collapse_leaves(node["children"])
+    groups: dict[tuple[str, str, str | None, str | None, str | None], list[dict[str, Any]]] = {}
+    for node in siblings:
+        if node["kind"] in _COLLAPSIBLE_LEAF_KINDS and not node["children"]:
+            groups.setdefault(_leaf_collapse_key(node), []).append(node)
+    collapsed_ids = {id(n) for members in groups.values() if len(members) > 1 for n in members}
+    result = [n for n in siblings if id(n) not in collapsed_ids]
+    result.extend(_leaf_group_node(members) for members in groups.values() if len(members) > 1)
+    return sorted(result, key=_sort_key)
+
+
+def _leaf_group_node(members: list[dict[str, Any]]) -> dict[str, Any]:
+    """One collapsed ``<kind> xN`` group for wide identical todo/turn/agent leaves (#56).
+
+    The group renders as ``<kind> xN`` (the app layer, #53), so it carries its
+    members' real span *kind* (``todo`` / ``agent`` / ``turn``). A ``span_id=None``
+    node may only carry a *synthetic* kind (the SyntheticNode contract — ``todo`` and
+    ``agent`` are span kinds), so the group takes a namespaced, clearly-synthetic
+    ``collapse:`` span_id instead. Like every container it owns ``$0`` (its member
+    leaves carry the cost) and its status comes from :func:`_terminal_leaf` — the
+    single shared rollup helper the tree uses (last-event-wins, #57), so the group
+    shows its terminal outcome rather than a hardcoded worst-child.
+    """
+    key = _leaf_collapse_key(members[0])
+    kind, name = key[0], key[1]
+    starts = [m["ts_start"] for m in members if m["ts_start"]]
+    ends = [m["ts_end"] for m in members if m["ts_end"]]
+    # synthetic_node guards its kind against span kinds, so build the canonical node
+    # shape under a placeholder synthetic kind, then stamp the group's display kind.
+    node: dict[str, Any] = dict(
+        synthetic_node(
+            kind="hooks",
+            name=name,
+            status=_terminal_leaf(members)[1],
+            ts_start=min(starts, key=lambda s: _parse_ts(s) or 0.0) if starts else None,
+            ts_end=max(ends, key=lambda s: _parse_ts(s) or 0.0) if ends else None,
+            duration_ms=sum(m["duration_ms"] or 0 for m in members),
+            children=sorted(members, key=_sort_key),
+        )
+    )
+    node["kind"] = kind
+    # Derive the id from the *full* collapse key (incl. summary) so two groups that
+    # differ only by summary never collide on span_id; the ``collapse:`` prefix keeps
+    # it visibly synthetic.
+    node["span_id"] = f"collapse:{kind}:{derive_span_id(*(str(part) for part in key))}"
+    node["collapsed"] = True
+    node["collapsed_count"] = len(members)
+    return node
 
 
 def _hooks_node(hooks: list[dict[str, Any]]) -> dict[str, Any]:
@@ -632,6 +719,7 @@ def _bucket_children(
     orphans = _rehome_under_turns(forest, turn_nodes)
     children = _apply_scope_bands(sorted(markers + turn_nodes + orphans, key=_sort_key))
     children = _collapse_context(children)
+    children = _collapse_leaves(children)
     return sorted(children, key=_sort_key)
 
 

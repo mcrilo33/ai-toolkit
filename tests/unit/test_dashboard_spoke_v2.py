@@ -128,9 +128,13 @@ def test_tools_nest_under_the_turn_that_issued_them():
     first = _turn_at(green, "12:01:05")
     second = _turn_at(green, "12:01:35")
 
-    # turn 12:01:05 issued Bash + three TaskCreate; turn 12:01:35 issued the
-    # question + a Read — each tool sits under the inference that chose it.
-    assert _kinds(first["children"]) == ["todo", "todo", "todo", "tool"]
+    # turn 12:01:05 issued Bash + three identical TaskCreate; the TaskCreate trio
+    # collapses into one ``todo x3`` group beside Bash (Issue #56). turn 12:01:35
+    # issued the question + a Read — each tool sits under the inference that chose it.
+    assert _kinds(first["children"]) == ["todo", "tool"]
+    todo_group = next(c for c in first["children"] if c["kind"] == "todo")
+    assert todo_group["collapsed_count"] == 3
+    assert {m["span_id"] for m in todo_group["children"]} == {"v2_task1", "v2_task2", "v2_task3"}
     assert _kinds(second["children"]) == ["human", "tool"]
 
 
