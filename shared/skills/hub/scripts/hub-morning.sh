@@ -39,6 +39,21 @@ fi
 
 MAIN_ROOT="${MAIN_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}"
 
+# _repo_is_real — the #55 fixture-leak guard, mirroring dashboard/queries.py's
+# real-spoke filter on the marker side: the morning worklist renders only for the
+# real toolkit checkout. A stray sandbox/test hub (basename not the toolkit name)
+# must not surface its markers as a fake worklist. The prefix is overridable via
+# HUB_REAL_REPO_PREFIX (default 'ai-toolkit'); an empty prefix disables the guard
+# (the unit harness uses this to run report() over its temp repo).
+_repo_is_real() {
+  local prefix="${HUB_REAL_REPO_PREFIX-ai-toolkit}"
+  [ -z "$prefix" ] && return 0
+  case "$(basename "${MAIN_ROOT:-}")" in
+    "$prefix"*) return 0 ;;
+    *)          return 1 ;;
+  esac
+}
+
 # default_branch -> origin/HEAD, else main/master, else main.
 default_branch() {
   local def=""
@@ -154,6 +169,11 @@ _cost_for() {
 }
 
 report() {
+  if ! _repo_is_real; then
+    echo "hub-morning: '$(basename "${MAIN_ROOT:-?}")' is not a real toolkit checkout" \
+         "(HUB_REAL_REPO_PREFIX=${HUB_REAL_REPO_PREFIX-ai-toolkit}) — skipping worklist"
+    return 0
+  fi
   local def cache ref kind issue merge tier diff trust cost line wt
   local land="" eyeball="" think="" conflicts="" footer=""
   def="$(default_branch)"
