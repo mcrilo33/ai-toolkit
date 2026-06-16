@@ -969,7 +969,7 @@ def _roll_up_steps(node: dict[str, Any]) -> dict[str, Any]:
         tokens_out += child_rollup["tokens_out"]
         models |= child_rollup["models"]
         statuses.append(child_rollup["status"])
-    status = _worst_status([{"status": s} for s in statuses])
+    status = max(statuses, key=lambda s: _STATUS_SEVERITY.get(s, 0))
     node["rollup"] = {
         "human_count": human,
         "cost_usd": cost,

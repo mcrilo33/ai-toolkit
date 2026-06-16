@@ -89,3 +89,45 @@ def test_denied_approval_propagates_deny_to_its_ancestors() -> None:
 def test_no_unresolved_root_on_the_golden_fixture() -> None:
     forest = _forest()
     assert not any(r["kind"] == "unresolved" for r in forest), "(unresolved) is not empty"
+
+
+def _load_tree():
+    import importlib.util
+
+    from _dashboard_helpers import DASHBOARD_DIR
+
+    spec = importlib.util.spec_from_file_location("tree", DASHBOARD_DIR / "tree.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _raw_node(kind: str, status: str, children: list[dict]) -> dict:
+    return {
+        "kind": kind,
+        "status": status,
+        "human_count": 0,
+        "own_cost_usd": 0.0,
+        "own_tokens_in": 0,
+        "own_tokens_out": 0,
+        "models": [],
+        "children": children,
+    }
+
+
+def test_status_propagates_from_a_deeper_child_not_just_the_seed() -> None:
+    # A real-span container (e.g. an agent) carries its OWN raw status, not a
+    # pre-computed worst-of-descendants; so a success-seed container with a deny
+    # descendant must still roll up to deny. This pins the worst-child propagation
+    # itself — it fails if _roll_up_steps only echoed node["status"].
+    tree = _load_tree()
+    deny_leaf = _raw_node("tool", "deny", [])
+    mid = _raw_node("agent", "success", [deny_leaf])
+    root = _raw_node("agent", "success", [mid])
+    tree._roll_up_steps(root)
+    assert root["rollup"]["status"] == "deny"
+    assert mid["rollup"]["status"] == "deny"
+    # A clean subtree stays success (no spurious escalation).
+    clean = _raw_node("agent", "success", [_raw_node("tool", "success", [])])
+    tree._roll_up_steps(clean)
+    assert clean["rollup"]["status"] == "success"
