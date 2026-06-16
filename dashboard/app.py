@@ -83,8 +83,14 @@ def _ccusage_costs() -> dict[str, float]:
 
 
 @st.cache_resource(show_spinner=True)
-def load_correlated_store(span_log: str, projects_dir: str) -> queries.SpanStore:
-    """Build a store over Issue #22's correlated push+pull span dataset."""
+def load_correlated_store(span_log: str, projects_dir: str, mtime: float) -> queries.SpanStore:
+    """Build a store over Issue #22's correlated push+pull span dataset.
+
+    ``mtime`` is part of the cache key (like :func:`_load_events`) so a changed
+    push log rebuilds the parsed store rather than serving the stale cached one; it
+    is intentionally unused in the body.
+    """
+    _ = mtime
     return queries.SpanStore.from_telemetry(
         events_path=span_log,
         projects_root=projects_dir,
@@ -344,27 +350,29 @@ def _render_cold_context(forest: list[dict]) -> None:
         st.markdown(f"• `{node['kind']}` {node['name']}")
 
 
-# Per-spoke built-forest cache, keyed on (spoke_id, log-mtime). Module-level so it
+# Per-spoke built-forest cache, keyed on (spoke_id, source_key). Module-level so it
 # survives Streamlit reruns within a session; a fresh import (a new session) starts
-# empty. The forest is plain dicts, so a cached entry is reused by reference — a
-# drill toggle re-renders the same objects rather than rebuilding the tree.
-_FOREST_CACHE: dict[tuple[str, float], list[dict]] = {}
+# empty. ``source_key`` encodes the data source — the correlation mode AND the log
+# mtime — so toggling correlation or a changed log rebuilds against the right store
+# (the store caches are keyed on the same mtime). The forest is plain dicts, so a
+# cached entry is reused by reference: a drill toggle re-renders the same objects.
+_FOREST_CACHE: dict[tuple[str, str], list[dict]] = {}
 
 
-def _spoke_forest(store: queries.SpanStore, spoke_id: str, log_mtime: float) -> list[dict]:
+def _spoke_forest(store: queries.SpanStore, spoke_id: str, source_key: str) -> list[dict]:
     """The selected spoke's drill-down tree, built on demand and memoized.
 
     Builds only the requested spoke (``store.spoke_steps`` queries just that run),
-    keyed on ``(spoke_id, log_mtime)`` so a re-select or rerun returns the cached
-    forest instantly and a changed span log (new mtime) rebuilds.
+    keyed on ``(spoke_id, source_key)`` so a re-select or rerun returns the cached
+    forest instantly while a new data source (mode toggle or changed log) rebuilds.
     """
-    key = (spoke_id, log_mtime)
+    key = (spoke_id, source_key)
     if key not in _FOREST_CACHE:
         _FOREST_CACHE[key] = store.spoke_steps(spoke_id)
     return _FOREST_CACHE[key]
 
 
-def render_spoke_view(store: queries.SpanStore, log_mtime: float = 0.0) -> None:
+def render_spoke_view(store: queries.SpanStore, source_key: str = "") -> None:
     st.header("Spoke view")
     st.caption(
         "Collapse-to-steps drill-down: main steps with rolled-up metrics; expand a "
@@ -377,7 +385,7 @@ def render_spoke_view(store: queries.SpanStore, log_mtime: float = 0.0) -> None:
         return
 
     spoke_id = st.selectbox("Spoke run", spoke_ids, format_func=queries.format_spoke_label)
-    forest = _spoke_forest(store, spoke_id, log_mtime)
+    forest = _spoke_forest(store, spoke_id, source_key)
     steps_tab, meta_tab, comp_tab = st.tabs(["Steps", "Meta by kind", "Composition"])
 
     with steps_tab:
@@ -540,18 +548,22 @@ def resolve_mode(correlated_requested: bool, projects_dir: Path) -> str:
     return "correlated" if correlated_requested and projects_dir.exists() else "raw"
 
 
-def _resolve_store(span_log: Path) -> queries.SpanStore | None:
-    """Pick the span source from the sidebar and build the store, or warn.
+def _resolve_store(span_log: Path, log_mtime: float) -> tuple[queries.SpanStore | None, str]:
+    """Pick the span source from the sidebar and build the store, with its mode.
 
     Correlation is on by default; when it's requested but the session-logs dir is
-    missing, the mode falls back to raw (with a note) instead of returning None.
+    missing, the mode falls back to raw (with a note). Returns ``(store, mode)`` —
+    ``mode`` (``"correlated"`` / ``"raw"``) lets the caller key the per-spoke
+    forest cache so toggling correlation never serves the other store's tree. The
+    store is ``None`` only when the raw log is absent. ``log_mtime`` keys both store
+    caches so a changed log rebuilds the parsed data, not just the forest.
     """
     correlated = st.sidebar.toggle("Correlate via Issue #22 (session logs + ccusage)", value=True)
     projects_dir = resolve_projects_dir()
 
     if resolve_mode(correlated, projects_dir) == "correlated":
         st.sidebar.caption(f"Push log:\n`{span_log}`\nSession logs:\n`{projects_dir}`")
-        return load_correlated_store(str(span_log), str(projects_dir))
+        return load_correlated_store(str(span_log), str(projects_dir), log_mtime), "correlated"
 
     if correlated:
         st.sidebar.info(
@@ -564,8 +576,8 @@ def _resolve_store(span_log: Path) -> queries.SpanStore | None:
             f"Span log not found at `{span_log}`. Set `AI_TOOLKIT_TELEMETRY=1` "
             "to record spans, or point `AI_TOOLKIT_SPAN_LOG` at an existing log."
         )
-        return None
-    return load_store(span_log)
+        return None, "raw"
+    return load_store(span_log), "raw"
 
 
 def render_morning_view(store: queries.SpanStore) -> None:
@@ -597,18 +609,21 @@ def main() -> None:
 
     st.sidebar.subheader("Span source")
     span_log = resolve_span_log()
-    store = _resolve_store(span_log)
+    # The log mtime keys both the store caches and the per-spoke forest cache, so a
+    # fresh log rebuilds the parsed data — not just the tree.
+    log_mtime = span_log.stat().st_mtime if span_log.exists() else 0.0
+    store, mode = _resolve_store(span_log, log_mtime)
     if store is None:
         return
 
-    # The span log's mtime keys the per-spoke forest cache: a fresh log rebuilds.
-    log_mtime = span_log.stat().st_mtime if span_log.exists() else 0.0
+    # The forest cache key tracks the data source: mode (correlated/raw) + log mtime.
+    source_key = f"{mode}:{log_mtime}"
 
     view = st.sidebar.radio(
         "View", ["Spoke", "Morning", "Aggregate", "A/B compare", "Automatability"]
     )
     if view == "Spoke":
-        render_spoke_view(store, log_mtime)
+        render_spoke_view(store, source_key)
     elif view == "Morning":
         render_morning_view(store)
     elif view == "Aggregate":

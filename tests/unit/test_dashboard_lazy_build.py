@@ -75,23 +75,23 @@ class _FakeStore:
         return []
 
 
-def test_spoke_forest_builds_once_per_spoke_and_mtime(monkeypatch):
+def test_spoke_forest_builds_once_per_spoke_and_source(monkeypatch):
     app = _app(monkeypatch)
     store = _FakeStore(["feature/x+1"])
 
-    first = app._spoke_forest(store, "feature/x+1", 100.0)
-    again = app._spoke_forest(store, "feature/x+1", 100.0)
+    first = app._spoke_forest(store, "feature/x+1", "correlated:100")
+    again = app._spoke_forest(store, "feature/x+1", "correlated:100")
 
     assert store.built == ["feature/x+1"]  # built once
     assert again is first  # cached object reused — a drill toggle never rebuilds
 
 
-def test_spoke_forest_rebuilds_when_log_mtime_changes(monkeypatch):
+def test_spoke_forest_rebuilds_when_source_key_changes(monkeypatch):
     app = _app(monkeypatch)
     store = _FakeStore(["feature/x+1"])
 
-    app._spoke_forest(store, "feature/x+1", 100.0)
-    app._spoke_forest(store, "feature/x+1", 200.0)  # the log changed under us
+    app._spoke_forest(store, "feature/x+1", "correlated:100")
+    app._spoke_forest(store, "feature/x+1", "correlated:200")  # the log changed under us
 
     assert store.built == ["feature/x+1", "feature/x+1"]
 
@@ -100,8 +100,41 @@ def test_render_reuses_cached_forest_across_reruns(monkeypatch):
     app = _app(monkeypatch)
     store = _FakeStore(["feature/a+1", "feature/b+2"])
 
-    app.render_spoke_view(store, log_mtime=100.0)
-    app.render_spoke_view(store, log_mtime=100.0)  # a Streamlit rerun / re-select
+    app.render_spoke_view(store, source_key="correlated:100")
+    app.render_spoke_view(store, source_key="correlated:100")  # a Streamlit rerun / re-select
 
     # Only the SELECTED spoke is built (not all), and only once across reruns.
     assert store.built == ["feature/a+1"]
+
+
+def test_render_rebuilds_when_correlation_toggled(monkeypatch):
+    app = _app(monkeypatch)
+    store = _FakeStore(["feature/a+1"])
+
+    # Toggling the correlation source swaps the underlying store at the same log
+    # mtime; the source_key must change so the cache does not serve the other tree.
+    app.render_spoke_view(store, source_key="correlated:100")
+    app.render_spoke_view(store, source_key="raw:100")
+
+    assert store.built == ["feature/a+1", "feature/a+1"]
+
+
+def test_resolve_store_keys_correlated_store_on_log_mtime(monkeypatch, tmp_path):
+    app = _app(monkeypatch)
+    calls = []
+    monkeypatch.setattr(app, "resolve_projects_dir", lambda: tmp_path)  # exists → correlated
+    monkeypatch.setattr(
+        app,
+        "load_correlated_store",
+        lambda _span_log, _projects_dir, mtime: calls.append(mtime) or object(),
+    )
+    span_log = tmp_path / "events.jsonl"
+    span_log.write_text("")
+
+    store, mode = app._resolve_store(span_log, 1234.5)
+
+    # The push-log mtime keys the correlated store so a fresh log rebuilds it, not
+    # just the forest — otherwise the (spoke_id, source_key) cache serves stale data.
+    assert mode == "correlated"
+    assert calls == [1234.5]
+    assert store is not None

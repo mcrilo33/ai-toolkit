@@ -85,10 +85,15 @@ def test_composition_totals_reconcile_to_forest_rollup(monkeypatch):
 
     totals = app._composition_totals(forest)
 
-    expected = sum((r.get("rollup") or {}).get("cost_usd", 0.0) for r in forest)
-    assert totals["cost_usd"] == pytest.approx(expected)  # every turn counted once
-    assert totals["tokens_in"] > 0
-    assert totals["tokens_out"] > 0
+    exp_cost = sum((r.get("rollup") or {}).get("cost_usd", 0.0) for r in forest)
+    exp_in = sum((r.get("rollup") or {}).get("tokens_in", 0) for r in forest)
+    exp_out = sum((r.get("rollup") or {}).get("tokens_out", 0) for r in forest)
+    # Reconcile to EXACT in/out/cost — every turn counted once. Pinning all three
+    # (not just cost > 0) catches a wrong-but-nonzero token total.
+    assert totals["cost_usd"] == pytest.approx(exp_cost)
+    assert totals["tokens_in"] == pytest.approx(exp_in)
+    assert totals["tokens_out"] == pytest.approx(exp_out)
+    assert exp_in > 0 and exp_out > 0  # the fixture exercises both directions
 
 
 def test_composition_total_exceeds_per_kind_meta_sum(monkeypatch):
@@ -126,12 +131,16 @@ def test_cold_context_lists_only_unexercised_context(monkeypatch):
     cold = _node("context", "rule: markdown-style")  # loaded, never exercised
     warm_turn = _node("turn", "turn", own_tokens_in=10, own_tokens_out=5)
     warm = _node("context", "skill: solo-cycle", children=[warm_turn])  # exercised
-    forest = [_node("interval", "S1", children=[cold, warm])]
+    # A zero-token NON-context sibling must NOT be flagged — the lens is about
+    # loaded context, not every idle leaf (exercises the kind filter, not just usage).
+    quiet_tool = _node("tool", "Read /etc/hosts")
+    forest = [_node("interval", "S1", children=[cold, warm, quiet_tool])]
 
     names = [n["name"] for n in app._cold_context(forest)]
 
     assert "rule: markdown-style" in names
     assert "skill: solo-cycle" not in names
+    assert "Read /etc/hosts" not in names
 
 
 def test_render_cold_context_lens_lists_candidates(monkeypatch):
