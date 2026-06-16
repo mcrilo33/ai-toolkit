@@ -136,14 +136,17 @@ _ACTOR_BY_KIND = {
 }
 
 
-def _actor_label(node: dict) -> str:
-    """The Actor column value: explicit ``actor`` wins, else derived from kind.
+def _actor_label(node: dict, inherited_actor: str = "main") -> str:
+    """The Actor column value: explicit ``actor`` wins, else derived from kind/context.
 
     A fixed kind (``hooks``/``workflow``/``script``) is structurally never ``main``,
     so its kind is authoritative over an unfilled contract default. Otherwise an
     explicit #50 ``actor`` wins, then a sub-agent span reads as its own name
-    (``Explore``, ``code-review``), and everything else falls back to the v2
-    ``agent`` field (``main`` / ``subagent``).
+    (``Explore``, ``code-review``). For anything else, ``inherited_actor`` — the
+    enclosing sub-agent passed down by the renderer — owns it (a sub-agent's tools
+    and turns are the sub-agent's, even though the tree tags their own ``agent`` as
+    ``main`` by kind); at the top level that inheritance is ``main``, so we fall back
+    to the node's own ``agent`` field to keep an orphaned ``subagent`` honest.
     """
     kind = node["kind"]
     if kind in _ACTOR_BY_KIND:
@@ -153,7 +156,14 @@ def _actor_label(node: dict) -> str:
         return actor
     if kind == "agent":
         return node.get("name") or "subagent"
-    return node.get("agent", "main")
+    return inherited_actor if inherited_actor != "main" else node.get("agent", "main")
+
+
+def _child_actor(node: dict, inherited_actor: str) -> str:
+    """The actor an ``node``'s children inherit: the sub-agent name, else passed through."""
+    if node["kind"] == "agent":
+        return node.get("name") or inherited_actor
+    return node.get("actor") or inherited_actor
 
 
 def _node_label(node: dict) -> str:
@@ -181,7 +191,7 @@ def _render_divider(node: dict) -> None:
     st.markdown(f"··· idle · {node['name']} ···")
 
 
-def _node_row(node: dict, depth: int) -> None:
+def _node_row(node: dict, depth: int, inherited_actor: str = "main") -> None:
     """One trace row: indented label + Time(start clock)·Dur·Cost·Tokens·H·Actor."""
     indent = "&nbsp;&nbsp;&nbsp;&nbsp;" * depth
     icon = _STATUS_ICON.get(node["status"], "•")
@@ -193,28 +203,30 @@ def _node_row(node: dict, depth: int) -> None:
     cols[3].markdown(metrics["cost"])
     cols[4].markdown(metrics["tokens"])
     cols[5].markdown(metrics["humans"])
-    cols[6].markdown(_actor_label(node))
+    cols[6].markdown(_actor_label(node, inherited_actor))
 
 
-def _render_node(node: dict, depth: int, path: str) -> None:
+def _render_node(node: dict, depth: int, path: str, inherited_actor: str = "main") -> None:
     """Render one node and, when drilled open, its children — uniformly at any depth.
 
     Streamlit forbids nested expanders, so drilling uses a ``st.toggle`` per node
     instead: one consistent control for steps, agents, and collapsed ``xN`` groups
     alike. The toggle's state persists across reruns by its ``path`` key (no
     re-collapse trap), and children render only while it is open (lazy). A divider
-    kind (idle gap / session resume) renders inline with no drill.
+    kind (idle gap / session resume) renders inline with no drill. ``inherited_actor``
+    flows the enclosing sub-agent down so its tools/turns read as the sub-agent.
     """
     if node["kind"] in _DIVIDER_KINDS:
         _render_divider(node)
         return
-    _node_row(node, depth)
+    _node_row(node, depth, inherited_actor)
     children = node.get("children") or []
     if not children:
         return
     if st.toggle(f"↳ drill into {_node_label(node)}", key=f"drill::{path}", value=False):
+        child_actor = _child_actor(node, inherited_actor)
         for index, child in enumerate(children):
-            _render_node(child, depth + 1, f"{path}.{index}")
+            _render_node(child, depth + 1, f"{path}.{index}", child_actor)
 
 
 def _date_of(ts: str | None) -> str | None:
