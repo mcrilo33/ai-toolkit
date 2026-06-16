@@ -243,8 +243,13 @@ def _derive_approvals(con: duckdb.DuckDBPyConnection) -> None:
       is marked never-run (``status='deny'`` + a ``never ran`` summary); when no
       parsable tool follows, a synthetic never-run tool stands in.
 
-    Idempotent and curated-data-safe: a dataset that already carries ``approval``
-    spans (the golden fixture, or a re-wrapped connection) is left untouched.
+    Idempotent and curated-data-safe: the guard is all-or-nothing by design — a
+    dataset that already carries *any* ``approval`` span (the golden fixture, a
+    re-wrapped connection) is left wholly untouched. The live #22 correlation never
+    emits approvals, so on real data this always derives. A deny approval's own
+    ``parent_id`` is the gate hook's parent (an ancestor turn/step — a PreToolUse
+    hook always fires before its tool), never the gated tool, so reparenting the
+    blocked tool under the approval cannot form a cycle.
     """
     if _fetch_dicts(con, "SELECT 1 FROM spans WHERE kind = 'approval' LIMIT 1"):
         return
@@ -267,7 +272,12 @@ def _derive_approvals(con: duckdb.DuckDBPyConnection) -> None:
         approval_id = f"approval:{hook['span_id']}"
         if hook["status"] == "deny":
             approval = _approval_dict(hook, gated, hook["parent_id"])
-            if gated and gated["span_id"] not in claimed:
+            # Only a tool that did NOT succeed can be the one this gate blocked: a hook
+            # deny makes the tool_use return an error (parsed as status 'failure'), so a
+            # 'success' tool belongs to a *later* gate and must never be relabeled
+            # never-run. When the real blocked tool isn't matchable (it succeeded, was
+            # already claimed by another deny, or no tool follows), a synthetic stands in.
+            if gated and gated["status"] != "success" and gated["span_id"] not in claimed:
                 claimed.add(gated["span_id"])
                 summary = f"{gated['summary']} {_NEVER_RAN}" if gated["summary"] else _NEVER_RAN
                 tool_updates.append((approval_id, "deny", summary, gated["span_id"]))

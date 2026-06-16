@@ -149,6 +149,83 @@ class TestLinkageToGatedTool:
         assert all("never ran" in (r["summary"] or "").lower() for r in rows)
 
 
+class TestDenyHeuristicGuards:
+    """A deny must never relabel a tool that actually ran (review finding #1)."""
+
+    def _store_with(self, spans):
+        queries = load_queries()
+        return queries.SpanStore.from_events(spans)
+
+    def test_deny_does_not_relabel_a_successful_intervening_tool(self) -> None:
+        # deny gate, then a *different* allow gate, then a tool that SUCCEEDED. A hook
+        # deny forces the blocked tool's result to an error, so a success tool was
+        # never the one blocked — the deny must leave it alone and stand up a
+        # synthetic never-run placeholder instead.
+        t = "2026-06-16T12:00:"
+        spans = [
+            _span("life", "lifecycle", "spoke", f"{t}00Z", f"{t}30Z"),
+            _span(
+                "h_deny",
+                "hook",
+                "push-scope-guard.sh",
+                f"{t}10Z",
+                f"{t}10Z",
+                status="deny",
+                duration_ms=90,
+            ),
+            _span("h_allow", "hook", "bash", f"{t}11Z", f"{t}11Z", status="allow", duration_ms=40),
+            _span("t_ok", "tool", "Bash", f"{t}12Z", f"{t}13Z", status="success", summary="ls"),
+        ]
+        store = self._store_with(spans)
+        ok = store._query("SELECT status, summary FROM spans WHERE span_id = 't_ok'")[0]
+        assert ok["status"] == "success", "a successful tool must not be relabeled never-run"
+        assert "never ran" not in (ok["summary"] or "").lower()
+        # The deny still produces a never-run node — a synthetic one.
+        synth = store._query(
+            "SELECT 1 FROM spans WHERE kind = 'tool' AND status = 'deny' AND span_id != 't_ok'"
+        )
+        assert synth, "the deny must stand up a synthetic never-run tool"
+
+    def test_deny_with_no_following_tool_synthesizes_never_run(self) -> None:
+        t = "2026-06-16T12:00:"
+        spans = [
+            _span("life", "lifecycle", "spoke", f"{t}00Z", f"{t}30Z"),
+            _span(
+                "h_deny",
+                "hook",
+                "secrets-scan.sh",
+                f"{t}10Z",
+                f"{t}10Z",
+                status="deny",
+                duration_ms=70,
+            ),
+        ]
+        forest = self._store_with(spans).spoke_tree(RUN)
+        deny = next(n for n in _walk(forest) if n["kind"] == "approval" and n["status"] == "deny")
+        blocked = [c for c in deny["children"] if c["kind"] == "tool" and c["status"] == "deny"]
+        assert blocked, "a deny with no parsable tool must synthesize a never-run tool"
+
+    def test_warn_gate_nests_under_its_tool(self) -> None:
+        t = "2026-06-16T12:00:"
+        spans = [
+            _span("life", "lifecycle", "spoke", f"{t}00Z", f"{t}30Z"),
+            _span(
+                "h_warn",
+                "hook",
+                "console-log-warn.sh",
+                f"{t}05Z",
+                f"{t}05Z",
+                status="warn",
+                duration_ms=30,
+            ),
+            _span("t_warn", "tool", "Edit", f"{t}06Z", f"{t}07Z", summary="app.py"),
+        ]
+        forest = self._store_with(spans).spoke_tree(RUN)
+        tool = next(n for n in _walk(forest) if n["span_id"] == "t_warn")
+        kinds = [(c["kind"], c["status"]) for c in tool["children"]]
+        assert ("approval", "warn") in kinds, "a warn gate nests under the tool it flagged"
+
+
 class TestApprovalsInRollups:
     def test_meta_by_kind_has_a_zero_cost_approval_row(self) -> None:
         rows = _store().spoke_meta_by_kind(RUN)
