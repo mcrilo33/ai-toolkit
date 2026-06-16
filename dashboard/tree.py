@@ -51,6 +51,11 @@ _UNRESOLVED_KEY = "__unresolved__"
 # ``in_progress`` todo transition (Issue #52); the badge marks the label as inferred.
 _NO_MARKER_BADGE = "⟨from todo — no marker⟩"
 
+# Idle longer than this between consecutive activity renders as a ``gap`` divider
+# rather than dead phase time (Issue #52). Ten minutes: long enough to skip normal
+# inter-turn latency, short enough to surface a real break (a resume, a stall).
+_IDLE_GAP_SECONDS = 600
+
 
 def _parse_ts(ts: str | None) -> float | None:
     """ISO-8601 UTC string to epoch seconds (None if missing/malformed).
@@ -393,6 +398,67 @@ def _synthesize_no_marker(
     return out
 
 
+def build_dividers(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Synthesize the root-level ``session`` and ``gap`` divider rows for a spoke.
+
+    A spoke that spans more than one ``session_id`` gets a ``session`` divider at each
+    resume (carrying the cold-cache note — a resume re-reads the prompt cache), and a
+    stretch of idle longer than :data:`_IDLE_GAP_SECONDS` between consecutive activity
+    renders as a ``gap`` divider (Issue #52: idle is a divider, not dead phase time).
+    Built from the raw span ``rows`` (which carry ``session_id``); the dividers are
+    merged into the bucket forest as roots and sort by ``ts_start`` like any row.
+    """
+    timed: list[tuple[dict[str, Any], float]] = []
+    for row in rows:
+        start = _parse_ts(row["ts_start"])
+        if start is not None:
+            timed.append((row, start))
+    timed.sort(key=lambda pair: pair[1])
+    dividers: list[dict[str, Any]] = []
+
+    first_seen: dict[str, str] = {}
+    for row, _ in timed:
+        sid = row.get("session_id")
+        if sid and sid not in first_seen:
+            first_seen[sid] = row["ts_start"]
+    for iso in list(first_seen.values())[1:]:
+        dividers.append(_session_divider(iso))
+
+    end_ts: float | None = None
+    end_iso: str | None = None
+    for row, start in timed:
+        if end_ts is not None and start - end_ts > _IDLE_GAP_SECONDS:
+            dividers.append(_gap_divider(end_iso, row["ts_start"], (start - end_ts) * 1000.0))
+        row_end = _parse_ts(row["ts_end"]) or start
+        if end_ts is None or row_end > end_ts:
+            end_ts, end_iso = row_end, (row["ts_end"] or row["ts_start"])
+    return dividers
+
+
+def _session_divider(iso: str) -> dict[str, Any]:
+    return dict(
+        synthetic_node(
+            kind="session",
+            name="session resume",
+            summary="cold cache (cache_creation) — prompt re-read on resume",
+            ts_start=iso,
+            ts_end=iso,
+        )
+    )
+
+
+def _gap_divider(lo_iso: str | None, hi_iso: str, duration_ms: float) -> dict[str, Any]:
+    return dict(
+        synthetic_node(
+            kind="gap",
+            name="idle",
+            ts_start=lo_iso,
+            ts_end=hi_iso,
+            duration_ms=int(duration_ms),
+        )
+    )
+
+
 def _interval_containing(ts: float, intervals: list[dict[str, Any]]) -> dict[str, Any] | None:
     """The interval whose window holds ``ts`` (right-closed at each marker boundary).
 
@@ -552,7 +618,49 @@ def _bucket_children(
     turn_nodes = [_turn_node(turn) for turn in bucket_turns]
     orphans = _rehome_under_turns(forest, turn_nodes)
     children = _apply_scope_bands(sorted(markers + turn_nodes + orphans, key=_sort_key))
+    children = _collapse_context(children)
     return sorted(children, key=_sort_key)
+
+
+def _collapse_context(siblings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group ``rule`` loads among ``siblings`` into per-subtype ``context`` nodes.
+
+    Loaded context (``rule`` / ``memory`` / ``tool-schema``, keyed on the span
+    ``phase``) collapses into one ``context`` group per subtype instead of N bare
+    rows (the app renders the ``xN`` from ``collapsed_count``) — once under ``spawn``
+    for the startup batch, and again in any later phase where context re-loads
+    mid-run (the ``ctx-bust`` inline event). Recurses so a rule nested under a turn is
+    grouped too; groups own ``$0`` (rules carry no cost).
+    """
+    others = [n for n in siblings if n["kind"] != "rule"]
+    rules = [n for n in siblings if n["kind"] == "rule"]
+    for node in others:
+        node["children"] = _collapse_context(node["children"])
+    by_subtype: dict[str, list[dict[str, Any]]] = {}
+    for rule in rules:
+        by_subtype.setdefault(rule["phase"] or "rule", []).append(rule)
+    groups = [_context_node(subtype, members) for subtype, members in by_subtype.items()]
+    return sorted(others + groups, key=_sort_key)
+
+
+def _context_node(subtype: str, members: list[dict[str, Any]]) -> dict[str, Any]:
+    """A collapsed context group (rendered ``xN``) for one loaded-context subtype."""
+    starts = [m["ts_start"] for m in members if m["ts_start"]]
+    ends = [m["ts_end"] for m in members if m["ts_end"]]
+    node: dict[str, Any] = dict(
+        synthetic_node(
+            kind="context",
+            name=subtype,
+            phase=subtype,
+            ts_start=min(starts, key=lambda s: _parse_ts(s) or 0.0) if starts else None,
+            ts_end=max(ends, key=lambda s: _parse_ts(s) or 0.0) if ends else None,
+            duration_ms=sum(m["duration_ms"] or 0 for m in members),
+            children=sorted(members, key=_sort_key),
+        )
+    )
+    node["collapsed"] = True
+    node["collapsed_count"] = len(members)
+    return node
 
 
 def _apply_scope_bands(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:

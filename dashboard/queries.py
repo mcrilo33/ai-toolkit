@@ -43,6 +43,7 @@ from tree import (
     _roll_up_steps,
     _step_node,
     _turns_by_owner,
+    build_dividers,
 )
 
 # Column order for the in-memory ``spans`` table. ``human`` is flattened into
@@ -388,6 +389,15 @@ class SpanStore:
         if not nodes:
             return []
         forest = _interval_forest(nodes, intervals, turns_by_owner)
+        # Idle/resume dividers (Issue #52) are root-level rows built from the raw
+        # spans (which carry session_id + timing); they own nothing, so they slot
+        # into the forest by ``ts_start`` without disturbing the cost rollup.
+        rows = self._query(
+            "SELECT session_id, ts_start, ts_end FROM spans WHERE spoke_run_id = ?",
+            [spoke_run_id],
+        )
+        forest = forest + build_dividers(rows)
+        forest.sort(key=lambda n: (_parse_ts(n["ts_start"]) or float("inf"), n["name"]))
         for root in forest:
             _roll_up_steps(root)
         return forest
@@ -406,6 +416,25 @@ class SpanStore:
         """
         nodes, _, _ = self._attributed_nodes(spoke_run_id)
         return _aggregate_by_kind(nodes)
+
+    def cold_context(self, spoke_run_id: str) -> list[dict[str, Any]]:
+        """The cold-context lens: context loaded for one spoke, by subtype (Issue #52).
+
+        A rollup of the ``rule`` / ``memory`` / ``tool-schema`` loads — the
+        trimming/automation candidates the spec calls out: context paid for at
+        startup whose payoff a reader should be able to weigh. Rows carry the subtype
+        ``phase`` and its load ``count``, ordered by count then subtype, descending.
+
+        UPGRADE: surface only context never *exercised* once span→turn reference
+        edges exist; today there is no usage signal, so every load is listed.
+        """
+        rows = self._query(
+            "SELECT phase, COUNT(*) AS count FROM spans "
+            "WHERE spoke_run_id = ? AND kind = 'rule' GROUP BY phase "
+            "ORDER BY count DESC, phase",
+            [spoke_run_id],
+        )
+        return rows
 
     def _attributed_nodes(
         self, spoke_run_id: str
@@ -684,6 +713,9 @@ def format_step_label(node: dict[str, Any]) -> str:
     """
     if node["kind"] == "hooks":
         return f"hooks x{node['collapsed_count']}"
+    # A collapsed context group reads "rule x3" / "memory x1" / "tool-schema x2".
+    if node["kind"] == "context":
+        return f"{node['phase']} x{node['collapsed_count']}"
     # A turn node (one inference) is labelled by its clock time + model, e.g.
     # "turn 12:01:05 · opus-4-8" — the per-turn token spike shows in the metrics.
     if node["kind"] == "turn":
