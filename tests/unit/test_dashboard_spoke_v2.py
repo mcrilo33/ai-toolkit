@@ -156,8 +156,9 @@ def test_hooks_outside_any_tool_or_turn_collapse_at_the_bucket():
     hooks = next(c for c in setup["children"] if c["kind"] == "hooks")
 
     # The red-phase hooks fall in no tool window and match no turn → they collapse
-    # into one node directly under the bucket, and surface the terminal (last-event)
-    # status — here the later of the two hooks (Issue #57).
+    # into one node directly under the bucket. Its status is the terminal (last-event)
+    # hook (Issue #57) — here the later hook is the warn, so worst and last coincide;
+    # the discriminating last-vs-worst cases live in test_dashboard_invariants_v3.
     assert hooks["collapsed_count"] == 2
     assert hooks["status"] == "warn"
 
@@ -632,6 +633,39 @@ def test_format_step_metrics_rolls_up_for_an_interval_bucket():
     # last-event-wins (Issue #57): the bucket shows its terminal (closing-marker)
     # status; the nested hook's warn stays at its own leaf and does not redden it.
     assert metrics["status"] == "success"
+
+
+def test_format_step_metrics_status_is_the_rolled_up_terminal_not_raw():
+    # A real-span container (own status deny) that recovered — its last leaf is a
+    # later success — reports the rolled-up terminal status, matching the row icon,
+    # not its raw own status (Issue #57). Pins format_step_metrics to the rollup.
+    queries = load_queries()
+    base = {
+        "human_count": 0,
+        "own_cost_usd": 0.0,
+        "own_tokens_in": 0,
+        "own_tokens_out": 0,
+        "models": [],
+        "duration_ms": 0,
+    }
+    leaf = {
+        **base,
+        "kind": "tool",
+        "status": "success",
+        "ts_start": "2026-06-12T12:00:09Z",
+        "children": [],
+    }
+    agent = {
+        **base,
+        "kind": "agent",
+        "status": "deny",
+        "ts_start": "2026-06-12T12:00:00Z",
+        "children": [leaf],
+    }
+    queries._roll_up_steps(agent)
+
+    assert agent["status"] == "deny"  # raw own status is untouched
+    assert queries.format_step_metrics(agent)["status"] == "success"
 
 
 def test_format_step_metrics_for_a_turn_node():

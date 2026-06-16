@@ -748,10 +748,11 @@ def format_step_label(node: dict[str, Any]) -> str:
 def format_step_metrics(node: dict[str, Any]) -> dict[str, str]:
     """Display-ready metrics for a v2 spoke node.
 
-    Time is the node's own wall-clock; cost/tokens/models/humans come from the
-    rolled-up once-per-turn subtree totals that ``spoke_steps`` attaches to every
-    node (cost and models fall back to the node's own only for a node built
-    without a rollup). Zero values render as an em dash.
+    Time is the node's own wall-clock; cost/tokens/models/humans/status come from the
+    rolled-up subtree totals that ``spoke_steps`` attaches to every node (each falls
+    back to the node's own only for a node built without a rollup). Status is the
+    rolled-up terminal (last-event) outcome (Issue #57), matching the row icon. Zero
+    values render as an em dash.
     """
     rollup = node.get("rollup") or {}
     cost = rollup.get("cost_usd", node.get("own_cost_usd", 0.0))
@@ -765,7 +766,7 @@ def format_step_metrics(node: dict[str, Any]) -> dict[str, str]:
         "model": ", ".join(_short_model(m) for m in models) if models else "—",
         "actor": node.get("actor", "main"),
         "humans": str(humans) if humans else "—",
-        "status": node.get("status", ""),
+        "status": rollup.get("status") or node.get("status", ""),
     }
 
 
