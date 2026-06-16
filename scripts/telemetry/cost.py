@@ -79,10 +79,32 @@ def attribute_spans(
         span.tokens_in = sum(e.input_tokens for e in events)
         span.tokens_out = sum(e.output_tokens for e in events)
         session_rate = rate.get(span.session_id)
-        if session_rate is None:
-            continue
-        span.cost_usd = session_rate * sum(_event_total(e) for e in events)
+        if session_rate is not None:
+            span.cost_usd = session_rate * sum(_event_total(e) for e in events)
+        _attribute_sidecar(span, ccusage_costs)
     return spans
+
+
+def _attribute_sidecar(span: Span, ccusage_costs: dict[str, float]) -> None:
+    """Add a linked sidecar session's ccusage cost onto the span (Issue #51 S3).
+
+    A ``hook``/``script``/``tool`` that shells out to a separate ``claude -p`` session
+    (named by ``sidecar_session``) carries that session's whole authoritative cost —
+    the sidecar runs in its own transcript, so its tokens are not bracketed here. The
+    seam is a no-op when the span has no sidecar link or that session is absent from
+    ccusage (the cost then stays whatever the in-session bracketing produced).
+
+    UPGRADE: when a real sidecar producer lands, pick one owner for the sidecar
+    session's cost — if its ``<id>.jsonl`` is also parsed as a top-level session it is
+    attributed twice (once on its own spans, once here). Until then no producer exists,
+    so there is nothing to dedupe.
+    """
+    if not span.sidecar_session:
+        return
+    sidecar_cost = ccusage_costs.get(span.sidecar_session)
+    if sidecar_cost is None:
+        return
+    span.cost_usd = (span.cost_usd or 0.0) + sidecar_cost
 
 
 def per_turn_rows(

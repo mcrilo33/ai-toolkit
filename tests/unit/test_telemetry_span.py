@@ -55,6 +55,11 @@ SCHEMA_KEYS = {
     "duration_ms",
     "status",
     "human",
+    # v3 spoke-trace link fields (#50) — pull-only, null on push (#54 track E).
+    "summary",
+    "emits",
+    "sidecar_session",
+    "agent_link",
     "tokens_in",
     "tokens_out",
     "cost_usd",
@@ -238,6 +243,48 @@ class TestSpanSchema:
 
         span = _read_events(telemetry_dir / "events.jsonl")[0]
         assert span["human"] == {"type": "approval", "wait_ms": 4200}
+
+
+# ── v3 spoke-trace additions (Issue #54 track E) ──────────
+
+
+# The pull-only v3 link fields (#50). Push emitters MUST serialize them, always
+# as null — the parser fills them later. ``summary`` is the #47 display field,
+# likewise null on push.
+V3_NULL_ON_PUSH_KEYS = ("summary", "emits", "sidecar_session", "agent_link")
+
+
+class TestScriptKindEmission:
+    def test_script_kind_round_trips(self, project_root: Path, telemetry_dir: Path) -> None:
+        # Track E makes control scripts first-class trace nodes: ``--kind script``
+        # must be accepted and serialized like any other kind.
+        result = _emit(
+            "--kind script --name commit-gauntlet --status success",
+            _env(telemetry_dir),
+            cwd=project_root,
+        )
+
+        assert result.returncode == 0
+        span = _read_events(telemetry_dir / "events.jsonl")[0]
+        assert span["kind"] == "script"
+        assert span["name"] == "commit-gauntlet"
+
+    def test_v3_link_fields_present_and_null_on_push(
+        self, project_root: Path, telemetry_dir: Path
+    ) -> None:
+        # The emission link (``emits``) and its siblings are pull-only: the parser
+        # fills them. Push emitters serialize them, always as null — a script span
+        # never knows the span_id of the marker it produced.
+        _emit(
+            "--kind script --name commit-gauntlet --status success",
+            _env(telemetry_dir),
+            cwd=project_root,
+        )
+
+        span = _read_events(telemetry_dir / "events.jsonl")[0]
+        for key in V3_NULL_ON_PUSH_KEYS:
+            assert key in span, f"push span missing v3 field {key!r}"
+            assert span[key] is None, f"push span must leave {key!r} null"
 
 
 # ── context resolution ────────────────────────────────────

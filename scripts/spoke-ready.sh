@@ -31,6 +31,21 @@
 #
 set -euo pipefail
 
+# --- telemetry (opt-in, optional) ---------------------------------------------
+# Source the shared span emit layer so this control script appears as a kind=script
+# trace node (Issue #54). Self-contained and gated by AI_TOOLKIT_TELEMETRY=1, so
+# sourcing is a no-op when telemetry is off. Located relative to THIS script: in the
+# ai-toolkit checkout under shared/hooks/lib/; in a synced target co-located in
+# .ai-toolkit/scripts/. The start clock is read up front so the span's window spans
+# the whole emission. This script runs IN the spoke, so the span resolves the
+# spoke's own spoke_run_id / branch / repo from CWD — no cd needed.
+_SR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for _c in "$_SR_DIR/telemetry.sh" "$_SR_DIR/../shared/hooks/lib/telemetry.sh"; do
+  if [ -f "$_c" ]; then . "$_c"; break; fi
+done
+unset _c
+_SR_T0="$(command -v _telemetry_now_ms >/dev/null 2>&1 && _telemetry_now_ms || true)"
+
 usage() {
   echo "usage: spoke-ready.sh [--gate|--accept|--blocked] <issue> [-m <reason>]" >&2
   exit 2
@@ -126,3 +141,12 @@ echo "→ git push -f origin $TAG"
 git push -f origin "$TAG"
 
 echo "✓ spoke-ready: emitted $TAG at $(git rev-parse --short HEAD)"
+
+# Trace node: this run as a kind=script span, tagged with the marker namespace it
+# emitted (phase = ready|gate|accept|blocked) so the trace tells a completion
+# marker apart from a PLAN-gate park. emits stays null on push (parser-filled).
+# An `if` (not `&&`) so a missing emit layer leaves the script's exit status 0.
+if command -v telemetry_emit_span >/dev/null 2>&1; then
+  telemetry_emit_span --kind script --name spoke-ready \
+    --phase "$KIND" --status success --start-ms "$_SR_T0"
+fi

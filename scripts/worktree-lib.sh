@@ -38,6 +38,21 @@ wt_emit_lifecycle() {
   return 0
 }
 
+# Emit one kind=script run-node span for a worktree script, attributing it to the
+# SPOKE the same way wt_emit_lifecycle does (worktree as CWD). This is the control
+# script as a first-class trace node (Issue #54); it shares its name with the
+# lifecycle marker so the parser can later link marker→script via `emits`. The
+# `emits` link stays null on push. No-op when the emit layer or telemetry is absent.
+# Usage: wt_emit_script <name> <status> <start_ms> <worktree_dir>
+wt_emit_script() {
+  command -v telemetry_emit_span >/dev/null 2>&1 || return 0
+  local name="$1" status="$2" start_ms="$3" wt="$4"
+  [ -d "$wt" ] || return 0
+  ( cd "$wt" && telemetry_emit_span --kind script --name "$name" \
+      --status "$status" --start-ms "$start_ms" ) || true
+  return 0
+}
+
 # Epoch-ms clock for span start times; empty string when the emit layer is
 # absent (callers pass it through to wt_emit_lifecycle, which then defaults).
 wt_now_ms() {

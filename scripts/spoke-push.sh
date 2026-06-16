@@ -26,6 +26,21 @@
 #
 set -euo pipefail
 
+# --- telemetry (opt-in, optional) ---------------------------------------------
+# Source the shared span emit layer so this control script appears as a kind=script
+# trace node (Issue #54). Self-contained and gated by AI_TOOLKIT_TELEMETRY=1, so
+# sourcing is a no-op when telemetry is off. Located relative to THIS script: in the
+# ai-toolkit checkout under shared/hooks/lib/; in a synced target co-located in
+# .ai-toolkit/scripts/. The start clock is read up front so the span's window covers
+# the whole push. This runs IN the spoke, so the span resolves the spoke's own
+# spoke_run_id / branch / repo from CWD.
+_SP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for _c in "$_SP_DIR/telemetry.sh" "$_SP_DIR/../shared/hooks/lib/telemetry.sh"; do
+  if [ -f "$_c" ]; then . "$_c"; break; fi
+done
+unset _c
+_SP_T0="$(command -v _telemetry_now_ms >/dev/null 2>&1 && _telemetry_now_ms || true)"
+
 usage() {
   echo "usage: spoke-push.sh [--ready <issue>]" >&2
   exit 2
@@ -79,3 +94,13 @@ if [ -n "$READY" ]; then
 fi
 
 echo "✓ spoke-push complete: pushed $BRANCH${READY:+ + marker ready/$READY}"
+
+# Trace node: this push run as a kind=script span. Emitted only on the success
+# path (a rejected push exits earlier under set -e). emits stays null on push.
+# An `if` (not `&&`) so a missing emit layer leaves the script's exit status 0.
+# UPGRADE: emit a status=failure span on a gate-rejected push — wrap the git push
+#   above — once failed-push visibility is wanted in the trace.
+if command -v telemetry_emit_span >/dev/null 2>&1; then
+  telemetry_emit_span --kind script --name spoke-push \
+    --status success --start-ms "$_SP_T0"
+fi

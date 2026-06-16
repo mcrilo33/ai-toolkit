@@ -1,4 +1,4 @@
-"""Parse Claude session-log JSONL into pull spans (skill/agent/todo/human).
+"""Parse Claude session-log JSONL into pull spans (skill/agent/todo/human/rule).
 
 Reads ``~/.claude/projects/<slug>/<session>.jsonl`` transcripts and reconstructs
 the spans the runtime cannot emit at hook time. For ``agent`` spans it walks the
@@ -6,23 +6,38 @@ matching ``<session>/subagents/agent-<id>.jsonl`` transcript so the subagent's
 own token usage can be attributed to the parent agent span by the correlation
 pass.
 
+Issue #51 (track B) extends the pull layer: ``Workflow`` fan-out agents are
+discovered at ``<session>/subagents/workflows/wf_*/agent-<id>.jsonl``; nested
+Task agents recurse so agent→agent chains reconstruct at any depth (walked once
+per agentId via a session-global guard); a ledger-creation ``TodoWrite`` gets a
+lead-item label; extended-thinking blocks surface privacy-safe ``reasoning_refs``;
+a ``claude -p`` Bash links a ``sidecar_session``; and loaded rule files become
+``rule`` spans while CLAUDE.md / memory become name-only ``context_loads``.
+
 Privacy: metadata plus short *intent* labels are read out of a record — tool
 name, skill name, subagent type, timestamps, token counts, the ``agentId`` link,
 and (Issue #47) a few-word ``summary`` per node: the in-progress todo item, an
 agent's task ``description``, a human prompt/question's first line, and a tool's
 single main parameter (Bash command, file path, Grep pattern). Bulk/long-form
 content — thinking, an agent's full prompt, a tool's secondary input (replacement
-text, file content) and its output, and human answers — is never copied.
+text, file content) and its output, human answers, and rule/CLAUDE.md/memory file
+bodies — is never copied.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 from telemetry.spans import Span, derive_span_id
+
+# UPGRADE: this module crossed the 800-line file limit at #51 S4 — decompose the
+# sub-agent/workflow walk family (_walk_subagent/_walk_transcript/_link_and_walk_agent/
+# _walk_workflow_agents and the workflow helpers) into a telemetry/agent_walk module
+# once the parser stabilises; deferred here to avoid a cross-module refactor mid-spoke.
 
 AGENT_TOOLS = frozenset({"Task", "Agent"})
 TODO_TOOLS = frozenset({"TodoWrite", "TaskCreate", "TaskUpdate"})
@@ -48,6 +63,18 @@ TOOL_MAIN_PARAM: dict[str, str] = {
 # key. Deliberately excludes free-form content keys (prompt/content/old_string).
 _GENERIC_PARAM_KEYS = ("file_path", "path", "command", "pattern", "query", "url")
 
+# A Bash command that launches a headless ``claude -p`` session, and the session id
+# it targets — the sidecar link (Issue #51 S3). Matched only when the print/``-p``
+# flag is present; an interactive ``claude`` is not a sidecar.
+_SIDECAR_PRINT_RE = re.compile(r"(?:^|\s)(?:-p|--print)(?:\s|=|$)")
+# Both flag and id forms are anchored on a left word-boundary so a short ``-r`` never
+# matches the tail of an unrelated token (``--foo-r``, an earlier ``grep -r``).
+_SIDECAR_ID_RE = re.compile(r"(?:^|\s)(?:--session-id|--resume|-r)[=\s]+([A-Za-z0-9._-]+)")
+
+# Each loaded-context file is injected under a ``Contents of <path>`` header (Issue
+# #51 S4). Only the path is captured — the file body that follows is never read.
+_CONTEXT_HEADER_RE = re.compile(r"Contents of (/[^\s()]+\.md)")
+
 
 @dataclass(slots=True)
 class UsageEvent:
@@ -65,12 +92,46 @@ class UsageEvent:
 
 
 @dataclass(slots=True)
+class ReasoningRef:
+    """A privacy-safe pointer to an extended-thinking block (Issue #51 S3).
+
+    Carries only a transcript-link locator (``<session-or-agent-id>#<record-uuid>``)
+    and timing — never the thinking text. The dashboard renders a synthetic
+    ``reasoning`` node from these; the body stays in the transcript.
+    """
+
+    session_id: str | None
+    source: str  # "main" | "subagent"
+    agent_id: str | None
+    ts: str | None
+    ref: str
+
+
+@dataclass(slots=True)
+class ContextLoad:
+    """A loaded-context item with no real span kind (Issue #51 S4).
+
+    Rule files become real ``rule`` spans; the rest of the window's loaded context —
+    ``CLAUDE.md`` and memory recalls — has no span kind, so it is surfaced here as a
+    name-only record (never the file body) for the dashboard to render as synthetic
+    ``context`` nodes.
+    """
+
+    kind: str  # "claude_md" | "memory"
+    name: str
+    ts: str | None
+    session_id: str | None
+
+
+@dataclass(slots=True)
 class ParsedSession:
     """Parser output: spans plus the raw material the correlation pass needs."""
 
     spans: list[Span] = field(default_factory=list)
     usage_events: list[UsageEvent] = field(default_factory=list)
     agent_links: dict[str, str] = field(default_factory=dict)  # agent span_id -> agentId
+    reasoning_refs: list[ReasoningRef] = field(default_factory=list)
+    context_loads: list[ContextLoad] = field(default_factory=list)
 
 
 def parse_session_file(path: Path) -> ParsedSession:
@@ -81,6 +142,10 @@ def parse_session_file(path: Path) -> ParsedSession:
     todo_summaries = _todo_summaries(records)
 
     parsed = ParsedSession()
+    # One session-global set of every agentId whose transcript has been walked, so a
+    # repeated or cyclic agentId (reachable via the recursion in #51 S2) is walked —
+    # and its usage emitted — at most once across all top-level and workflow agents.
+    seen: set[str] = set()
     for rec in records:
         if rec.get("type") != "assistant":
             continue
@@ -90,9 +155,18 @@ def parse_session_file(path: Path) -> ParsedSession:
         if isinstance(message.get("usage"), dict):
             parsed.usage_events.append(_usage_event(rec, "main", None))
         for block in message.get("content") or []:
-            _consume_tool_use(block, rec, results, meta, path, parsed, todo_summaries)
+            _consume_tool_use(block, rec, results, meta, path, parsed, todo_summaries, seen)
 
     parsed.spans.extend(_human_prompt_spans(records, meta))
+    parsed.reasoning_refs.extend(_reasoning_refs(records, path.stem, "main", None, meta))
+    rule_spans, context_loads = _context_and_rule_loads(records, meta)
+    parsed.spans.extend(rule_spans)
+    parsed.context_loads.extend(context_loads)
+
+    events, spans, links = _walk_workflow_agents(path, parent_meta=meta, seen=seen)
+    parsed.usage_events.extend(events)
+    parsed.spans.extend(spans)
+    parsed.agent_links.update(links)
     return parsed
 
 
@@ -111,6 +185,8 @@ def parse_projects_dir(root: Path) -> ParsedSession:
         merged.spans.extend(parsed.spans)
         merged.usage_events.extend(parsed.usage_events)
         merged.agent_links.update(parsed.agent_links)
+        merged.reasoning_refs.extend(parsed.reasoning_refs)
+        merged.context_loads.extend(parsed.context_loads)
     return merged
 
 
@@ -122,6 +198,7 @@ def _consume_tool_use(
     path: Path,
     parsed: ParsedSession,
     todo_summaries: dict[str, str],
+    seen: set[str],
 ) -> None:
     if not (isinstance(block, dict) and block.get("type") == "tool_use"):
         return
@@ -131,14 +208,12 @@ def _consume_tool_use(
     parsed.spans.append(span)
     if span.kind != "agent":
         return
-    agent_id = results.get(block.get("id") or "", {}).get("agent_id")
-    if agent_id:
-        parsed.agent_links[span.span_id] = agent_id
-        events, sub_spans = _walk_subagent(
-            path, agent_id, parent_meta=meta, agent_span_id=span.span_id
-        )
-        parsed.usage_events.extend(events)
-        parsed.spans.extend(sub_spans)
+    events, sub_spans, links = _link_and_walk_agent(
+        span, block.get("id") or "", results, path, meta, seen
+    )
+    parsed.usage_events.extend(events)
+    parsed.spans.extend(sub_spans)
+    parsed.agent_links.update(links)
 
 
 def _span_for_tool_use(
@@ -194,10 +269,13 @@ def _span_for_tool_use(
     # Every other tool_use is a leaf span (Issue #47 S2b) summarising what it acted
     # on — the tool's MAIN identifying parameter only (Bash command, file path, Grep
     # pattern). Bulk/secondary input (replacement text, file content) is never read.
+    # A Bash that shells out to a headless ``claude -p`` session is linked via
+    # ``sidecar_session`` (Issue #51 S3) so that session's cost can be attributed here.
     return Span(
         kind="tool",
         name=name if isinstance(name, str) else "tool",
         summary=_tool_param(name, inputs),
+        sidecar_session=_sidecar_session(name, inputs),
         **common,
     )
 
@@ -209,8 +287,10 @@ def _todo_summaries(records: list[dict]) -> dict[str, str]:
 
     - ``TodoWrite`` snapshots: diff each write's in-progress set against the
       previous one to isolate the item that *newly* entered progress — the step's
-      todo. No distinguishable transition falls back to whatever is in progress;
-      nothing in progress yields no summary (the span keeps its bare tool name).
+      todo. With nothing in progress, a *ledger-creation* write (Issue #51 S3) —
+      one that introduces a brand-new item — falls back to its lead new item, so a
+      seed write reads as a real step rather than a bare ``todo``; a write with
+      nothing new and nothing in progress still yields no summary.
     - ``TaskCreate`` / ``TaskUpdate`` (incremental, id-keyed): a ``TaskCreate``
       summarises to its ``subject`` and is assigned the next sequential id (the
       runtime numbers them 1, 2, … in creation order); a later ``TaskUpdate``
@@ -218,6 +298,7 @@ def _todo_summaries(records: list[dict]) -> dict[str, str]:
     """
     summaries: dict[str, str] = {}
     prev: set[str] = set()
+    seen_contents: set[str] = set()
     subject_by_id: dict[str, str] = {}
     created = 0
     for rec in records:
@@ -235,7 +316,7 @@ def _todo_summaries(records: list[dict]) -> dict[str, str]:
             inputs = block.get("input") or {}
             tool_use_id = block.get("id") or ""
             if tool == "TodoWrite":
-                summary, prev = _derive_todo_summary(inputs, prev)
+                summary, prev, seen_contents = _derive_todo_summary(inputs, prev, seen_contents)
             elif tool == "TaskCreate":
                 created += 1
                 summary = _snippet(inputs.get("subject"))
@@ -248,19 +329,33 @@ def _todo_summaries(records: list[dict]) -> dict[str, str]:
     return summaries
 
 
-def _derive_todo_summary(inputs: dict, prev: set[str]) -> tuple[str | None, set[str]]:
-    """The in-progress item for one ``TodoWrite`` snapshot, plus its in-progress set."""
+def _derive_todo_summary(
+    inputs: dict, prev: set[str], seen: set[str]
+) -> tuple[str | None, set[str], set[str]]:
+    """The label for one ``TodoWrite`` snapshot, plus its in-progress + seen sets.
+
+    Prefers the item that newly entered progress (the step's todo), else any
+    in-progress item; with nothing in progress, falls back to the lead item this
+    write *creates* (a ledger-creation label), else no summary.
+    """
     items = inputs.get("todos")
     if not isinstance(items, list):
-        return None, prev
+        return None, prev, seen
+    contents = [item["content"] for item in items if isinstance(item, dict) and item.get("content")]
     in_progress = {
         item["content"]
         for item in items
         if isinstance(item, dict) and item.get("status") == "in_progress" and item.get("content")
     }
     newly = sorted(in_progress - prev)
-    summary = newly[0] if newly else (sorted(in_progress)[0] if in_progress else None)
-    return _snippet(summary), in_progress
+    if newly:
+        summary = newly[0]
+    elif in_progress:
+        summary = sorted(in_progress)[0]
+    else:
+        created = [content for content in contents if content not in seen]
+        summary = created[0] if created else None
+    return _snippet(summary), in_progress, seen | set(contents)
 
 
 def _tool_param(name: object, inputs: dict) -> str | None:
@@ -274,6 +369,24 @@ def _tool_param(name: object, inputs: dict) -> str | None:
     if key is None:
         key = next((k for k in _GENERIC_PARAM_KEYS if inputs.get(k)), None)
     return _snippet(inputs.get(key)) if key else None
+
+
+def _sidecar_session(name: object, inputs: dict) -> str | None:
+    """The session id of a Bash that shells out to ``claude -p`` (else ``None``).
+
+    Only a ``claude`` invocation carrying the print/``-p`` flag counts as a sidecar;
+    the id is read from ``--session-id`` / ``--resume`` / ``-r``. Only this id is
+    extracted — the rest of the command (which may hold a prompt) is not surfaced here.
+    """
+    if name != "Bash":
+        return None
+    command = inputs.get("command")
+    if not isinstance(command, str) or "claude" not in command:
+        return None
+    if not _SIDECAR_PRINT_RE.search(command):
+        return None
+    match = _SIDECAR_ID_RE.search(command)
+    return match.group(1) if match else None
 
 
 def _question_snippet(inputs: dict) -> str | None:
@@ -320,6 +433,127 @@ def _human_prompt_spans(records: list[dict], meta: dict[str, str | None]) -> lis
             )
         )
     return spans
+
+
+def _reasoning_refs(
+    records: list[dict],
+    stem: str,
+    source: str,
+    agent_id: str | None,
+    meta: dict[str, str | None],
+) -> list[ReasoningRef]:
+    """One :class:`ReasoningRef` per assistant turn that carries a thinking block.
+
+    Only a locator (``<stem>#<record-uuid>``) and timing are read — the thinking
+    text itself is never copied, so the body stays private.
+    """
+    refs: list[ReasoningRef] = []
+    for rec in records:
+        if rec.get("type") != "assistant":
+            continue
+        message = rec.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content") or []
+        if not any(isinstance(b, dict) and b.get("type") == "thinking" for b in content):
+            continue
+        refs.append(
+            ReasoningRef(
+                session_id=meta["session_id"],
+                source=source,
+                agent_id=agent_id,
+                ts=rec.get("timestamp"),
+                ref=f"{stem}#{rec.get('uuid') or ''}",
+            )
+        )
+    return refs
+
+
+def _context_and_rule_loads(
+    records: list[dict], meta: dict[str, str | None]
+) -> tuple[list[Span], list[ContextLoad]]:
+    """Extract the window's loaded rule / CLAUDE.md / memory files (Issue #51 S4).
+
+    Each ``Contents of <path>`` header names one loaded file. A rule file becomes a
+    real ``rule`` span (``name`` = its stem); CLAUDE.md and memory have no real span
+    kind, so they become name-only :class:`ContextLoad` records. Only the path is
+    read — never the file body — and each path is recorded once (deduped).
+    """
+    rule_spans: list[Span] = []
+    context_loads: list[ContextLoad] = []
+    seen_paths: set[str] = set()
+    for rec in records:
+        if not _is_context_carrier(rec):
+            continue
+        ts = rec.get("timestamp")
+        for text in _record_texts(rec):
+            for path in _CONTEXT_HEADER_RE.findall(text):
+                if path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                span, load = _classify_context_path(path, ts, meta)
+                if span is not None:
+                    rule_spans.append(span)
+                if load is not None:
+                    context_loads.append(load)
+    return rule_spans, context_loads
+
+
+def _classify_context_path(
+    path: str, ts: str | None, meta: dict[str, str | None]
+) -> tuple[Span | None, ContextLoad | None]:
+    """Map a loaded-context path to a ``rule`` span or a :class:`ContextLoad` (else neither)."""
+    if "/.claude/rules/" in path:
+        span = Span(
+            span_id=derive_span_id(meta["session_id"] or "", "rule", path),
+            kind="rule",
+            name=Path(path).stem,
+            session_id=meta["session_id"],
+            repo=meta["repo"] or "unknown",
+            branch=meta["branch"],
+            ts_start=ts,
+            ts_end=ts,
+            duration_ms=0,
+        )
+        return span, None
+    if path.endswith("/CLAUDE.md"):
+        return None, ContextLoad("claude_md", "CLAUDE.md", ts, meta["session_id"])
+    if path.endswith("MEMORY.md") or "/memory/" in path:
+        return None, ContextLoad("memory", Path(path).name, ts, meta["session_id"])
+    return None, None
+
+
+def _is_context_carrier(rec: dict) -> bool:
+    """Whether a record is a loaded-context injection carrier (Issue #51 S4).
+
+    The runtime delivers loaded context as a system-reminder on a meta user turn, so
+    the scan is restricted to a non-sidechain user record that is ``isMeta`` or carries
+    a ``<system-reminder>`` block. This keeps ordinary prose that merely quotes a
+    ``Contents of …`` line (an assistant message, a pasted log) from minting a phantom
+    rule span or context load.
+    """
+    if rec.get("type") != "user" or rec.get("isSidechain"):
+        return False
+    return bool(rec.get("isMeta")) or any("<system-reminder>" in t for t in _record_texts(rec))
+
+
+def _record_texts(rec: dict) -> list[str]:
+    """The plain-text strings in a record's message content (text blocks / string)."""
+    message = rec.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if isinstance(content, str):
+        return [content]
+    if not isinstance(content, list):
+        return []
+    return [
+        block["text"]
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+    ]
 
 
 def _is_human_prompt(rec: dict) -> bool:
@@ -377,9 +611,14 @@ def _tool_results(records: list[dict]) -> dict[str, dict]:
 
 
 def _walk_subagent(
-    main_path: Path, agent_id: str, *, parent_meta: dict[str, str | None], agent_span_id: str
-) -> tuple[list[UsageEvent], list[Span]]:
-    """Walk a sub-agent transcript into usage events and its own step spans.
+    main_path: Path,
+    agent_id: str,
+    *,
+    parent_meta: dict[str, str | None],
+    agent_span_id: str,
+    seen: set[str],
+) -> tuple[list[UsageEvent], list[Span], dict[str, str]]:
+    """Walk a sub-agent transcript into usage events, step spans, and agent links.
 
     The transcript (``<session>/subagents/agent-<id>.jsonl``) is a session-shaped
     log. Its ``tool_use`` blocks become the sub-agent's spans (#47 S3) — but its
@@ -392,13 +631,43 @@ def _walk_subagent(
     """
     sub = main_path.parent / main_path.stem / "subagents" / f"agent-{agent_id}.jsonl"
     if not sub.exists():
-        return [], []
-    records = _load_jsonl(sub)
+        return [], [], {}
+    return _walk_transcript(
+        _load_jsonl(sub),
+        agent_id,
+        main_path=main_path,
+        parent_meta=parent_meta,
+        agent_span_id=agent_span_id,
+        seen=seen,
+    )
+
+
+def _walk_transcript(
+    records: list[dict],
+    agent_id: str,
+    *,
+    main_path: Path,
+    parent_meta: dict[str, str | None],
+    agent_span_id: str,
+    seen: set[str],
+) -> tuple[list[UsageEvent], list[Span], dict[str, str]]:
+    """Walk one sub-agent transcript's records into usage events, spans, and links.
+
+    Shared by the Task-spawned walk (:func:`_walk_subagent`) and the workflow walk
+    (:func:`_walk_workflow_agents`). A nested Task/Agent ``tool_use`` (Issue #51 S2)
+    recurses into its own transcript so agent→agent→… chains reconstruct at any
+    depth; ``seen`` guards against a cyclic link looping forever. The leading user
+    record is the orchestrator's task prompt, so human-prompt spans are deliberately
+    NOT emitted (that text stays private). Each span is re-homed onto the spoke:
+    ``session_id`` becomes the parent's and ``parent_id`` the agent span; ``span_id``
+    stays derived from the transcript, keeping ids idempotent and collision-free.
+    """
     meta = _session_meta(records)
     results = _tool_results(records)
     todo_summaries = _todo_summaries(records)
     events: list[UsageEvent] = []
     spans: list[Span] = []
+    links: dict[str, str] = {}
     for rec in records:
         message = rec.get("message")
         if rec.get("type") != "assistant" or not isinstance(message, dict):
@@ -406,18 +675,165 @@ def _walk_subagent(
         if isinstance(message.get("usage"), dict):
             events.append(_usage_event(rec, "subagent", agent_id))
         for block in message.get("content") or []:
-            span = (
-                _span_for_tool_use(block, rec, results, meta, todo_summaries)
-                if isinstance(block, dict) and block.get("type") == "tool_use"
-                else None
+            if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+                continue
+            span = _span_for_tool_use(block, rec, results, meta, todo_summaries)
+            if span is None:
+                continue
+            span.session_id = parent_meta["session_id"]
+            span.repo = parent_meta["repo"] or "unknown"
+            span.branch = parent_meta["branch"]
+            span.parent_id = agent_span_id
+            spans.append(span)
+            if span.kind == "agent":
+                ev, sp, lk = _link_and_walk_agent(
+                    span, block.get("id") or "", results, main_path, parent_meta, seen
+                )
+                events.extend(ev)
+                spans.extend(sp)
+                links.update(lk)
+    return events, spans, links
+
+
+def _link_and_walk_agent(
+    span: Span,
+    tool_use_id: str,
+    results: dict[str, dict],
+    main_path: Path,
+    parent_meta: dict[str, str | None],
+    seen: set[str],
+) -> tuple[list[UsageEvent], list[Span], dict[str, str]]:
+    """Link an agent span to its sub-agent transcript and walk that transcript once.
+
+    The ``agent_link`` display field is always set so the chain renders at any depth
+    (Issue #50). The cost-bearing link (``links[span_id] -> agentId``) and the
+    transcript walk happen only the FIRST time an ``agentId`` is seen: a repeated or
+    cyclic ``agentId`` (Issue #51 S2) is therefore walked at most once — no duplicate
+    usage events — and owned by exactly one span, so ``cost.py`` never attributes one
+    transcript's tokens to two spans. Returns the nested transcript's
+    ``(events, spans, links)``; empty when the id is unresolved or already seen.
+    """
+    agent_id = results.get(tool_use_id, {}).get("agent_id")
+    if not agent_id:
+        return [], [], {}
+    span.agent_link = agent_id
+    if agent_id in seen:
+        return [], [], {}
+    seen.add(agent_id)
+    events, spans, links = _walk_subagent(
+        main_path, agent_id, parent_meta=parent_meta, agent_span_id=span.span_id, seen=seen
+    )
+    links[span.span_id] = agent_id
+    return events, spans, links
+
+
+def _walk_workflow_agents(
+    main_path: Path, *, parent_meta: dict[str, str | None], seen: set[str]
+) -> tuple[list[UsageEvent], list[Span], dict[str, str]]:
+    """Discover the agents of every ``Workflow`` fan-out under this session (Issue #51).
+
+    Workflow agents live one level deeper than Task sub-agents — at
+    ``<session>/subagents/workflows/wf_*/agent-<id>.jsonl`` — and no Task ``tool_use``
+    links them, so they are found by walking that tree. Each gets its own ``agent``
+    span (``name`` = the ``meta.json`` ``agentType``, ``summary`` = the workflow name,
+    window = the transcript's first/last timestamp), its ``agent_link`` registered for
+    cost attribution, and its ``tool_use`` blocks walked as nested spans — so its turns
+    no longer orphan to ``(unresolved)``. ``seen`` is the session-global walked-id set,
+    so an agent already reached through a link is not discovered (and walked) again.
+    """
+    root = main_path.parent / main_path.stem / "subagents" / "workflows"
+    if not root.is_dir():
+        return [], [], {}
+    events: list[UsageEvent] = []
+    spans: list[Span] = []
+    links: dict[str, str] = {}
+    for wf_dir in sorted(p for p in root.glob("wf_*") if p.is_dir()):
+        name, agent_types = _workflow_meta(wf_dir)
+        for agent_path in sorted(wf_dir.glob("agent-*.jsonl")):
+            agent_id = agent_path.stem[len("agent-") :]
+            if agent_id in seen:
+                continue
+            seen.add(agent_id)
+            records = _load_jsonl(agent_path)
+            span = _workflow_agent_span(
+                agent_id, agent_types.get(agent_id), name, records, parent_meta
             )
-            if span is not None:
-                span.session_id = parent_meta["session_id"]
-                span.repo = parent_meta["repo"] or "unknown"
-                span.branch = parent_meta["branch"]
-                span.parent_id = agent_span_id
-                spans.append(span)
-    return events, spans
+            links[span.span_id] = agent_id
+            spans.append(span)
+            # A workflow agent may itself spawn Task sub-agents — recurse with the
+            # session-global ``seen`` (this agent is already in it) so any nested
+            # agent is walked once across the whole session.
+            sub_events, sub_spans, sub_links = _walk_transcript(
+                records,
+                agent_id,
+                main_path=main_path,
+                parent_meta=parent_meta,
+                agent_span_id=span.span_id,
+                seen=seen,
+            )
+            events.extend(sub_events)
+            spans.extend(sub_spans)
+            links.update(sub_links)
+    return events, spans, links
+
+
+def _workflow_agent_span(
+    agent_id: str,
+    agent_type: str | None,
+    workflow_name: str | None,
+    records: list[dict],
+    parent_meta: dict[str, str | None],
+) -> Span:
+    """One ``agent`` span for a discovered workflow agent, bracketing its transcript.
+
+    The window is the transcript's first and last record timestamps; ``name`` is the
+    ``meta.json`` ``agentType`` (the stable grouping key) and ``summary`` the workflow
+    name (the few-word display label).
+    """
+    ts_start, ts_end = _transcript_window(records)
+    return Span(
+        span_id=derive_span_id(parent_meta["session_id"] or "", agent_id),
+        kind="agent",
+        name=agent_type or "agent",
+        summary=workflow_name,
+        session_id=parent_meta["session_id"],
+        repo=parent_meta["repo"] or "unknown",
+        branch=parent_meta["branch"],
+        ts_start=ts_start,
+        ts_end=ts_end,
+        duration_ms=_duration_ms(ts_start, ts_end),
+        agent_link=agent_id,
+    )
+
+
+def _workflow_meta(wf_dir: Path) -> tuple[str | None, dict[str, str]]:
+    """The workflow name and a per-agent ``agentType`` map from ``wf_*/meta.json``.
+
+    Degrades gracefully: a missing or malformed ``meta.json`` yields the directory
+    name as the workflow label and an empty agent-type map (agents fall back to the
+    bare ``agent`` name), so discovery never depends on the sidecar metadata.
+    """
+    meta_path = wf_dir / "meta.json"
+    if not meta_path.is_file():
+        return wf_dir.name, {}
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return wf_dir.name, {}
+    name = meta.get("name") if isinstance(meta, dict) else None
+    agents = meta.get("agents") if isinstance(meta, dict) else None
+    agent_types: dict[str, str] = {}
+    if isinstance(agents, dict):
+        for agent_id, info in agents.items():
+            if isinstance(info, dict) and isinstance(info.get("agentType"), str):
+                agent_types[agent_id] = info["agentType"]
+    return (name if isinstance(name, str) else wf_dir.name), agent_types
+
+
+def _transcript_window(records: list[dict]) -> tuple[str | None, str | None]:
+    """The first and last record timestamps in a transcript (its wall-clock window)."""
+    timestamps = sorted(ts for rec in records if (ts := rec.get("timestamp")))
+    return (timestamps[0], timestamps[-1]) if timestamps else (None, None)
 
 
 def _usage_event(rec: dict, source: str, agent_id: str | None) -> UsageEvent:

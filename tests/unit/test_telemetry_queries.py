@@ -15,6 +15,7 @@ inside it — the views aggregate within a granularity, never summing across.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -189,7 +190,13 @@ class TestTurns:
         assert n == 6
 
     def test_turns_carry_model(self, con) -> None:
-        models = set(_flat(con.execute("SELECT DISTINCT model FROM turns").fetchall()))
+        models = set(
+            _flat(
+                con.execute(
+                    "SELECT DISTINCT model FROM turns WHERE session_id = ?", [SESSION_ID]
+                ).fetchall()
+            )
+        )
         assert models == {"claude-opus-4-8"}
 
     def test_subagent_turns_carry_agent_id(self, con) -> None:
@@ -219,3 +226,204 @@ class TestMissingEvents:
         connection.close()
         assert "step" not in kinds and "lifecycle" not in kinds
         assert "skill" in kinds
+
+
+# ── emission link: script → the marker it produced (Issue #54 track E) ───────
+
+
+def _span(**fields: object) -> dict[str, object]:
+    """A push-span dict with the given fields (others default in the parser)."""
+    return fields
+
+
+def _write_events(path: Path, spans: list[dict[str, object]]) -> None:
+    path.write_text("\n".join(json.dumps(s) for s in spans) + "\n")
+
+
+def _by_id(spans: list[dict[str, object]], span_id: str) -> dict[str, object]:
+    return next(s for s in spans if s["span_id"] == span_id)
+
+
+RUN_E = "feature/54-track-e+1700000000"
+
+
+class TestEmissionLink:
+    """``emits`` is pull-only: build_unified_spans correlates each ``script`` span
+    to the ``step``/``lifecycle`` marker it produced (same spoke_run_id, the
+    tightest marker bracketing the script's window — a gate runs at the tail of the
+    phase it closes). It reproduces the golden's frozen ``commit-gauntlet`` →
+    ``red`` link from spans that carry ``emits=null`` on the push side.
+    """
+
+    def test_script_links_to_marker_it_closes(self, tmp_path: Path) -> None:
+        # The golden pattern: a commit-gauntlet script span at the tail of the red
+        # step interval emits that step marker.
+        events = tmp_path / "events.jsonl"
+        _write_events(
+            events,
+            [
+                _span(
+                    span_id="m_red",
+                    spoke_run_id=RUN_E,
+                    kind="step",
+                    name="solo-cycle",
+                    phase="red",
+                    ts_start="2026-06-12T23:00:05Z",
+                    ts_end="2026-06-12T23:00:55Z",
+                ),
+                _span(
+                    span_id="s_cg",
+                    spoke_run_id=RUN_E,
+                    kind="script",
+                    name="commit-gauntlet",
+                    ts_start="2026-06-12T23:00:54Z",
+                    ts_end="2026-06-12T23:00:55Z",
+                ),
+            ],
+        )
+
+        spans = build_unified_spans(
+            events_path=events, projects_root=tmp_path / "no-projects", ccusage_costs={}
+        )
+
+        assert _by_id(spans, "s_cg")["emits"] == "m_red"
+        # The marker itself is never back-stamped; emission lives on the script.
+        assert _by_id(spans, "m_red")["emits"] is None
+
+    def test_script_picks_tightest_enclosing_marker(self, tmp_path: Path) -> None:
+        # A lifecycle envelope and a phase step both bracket the script; the
+        # tightest (latest-starting) wins, so the link is to the phase, not the run.
+        events = tmp_path / "events.jsonl"
+        _write_events(
+            events,
+            [
+                _span(
+                    span_id="m_env",
+                    spoke_run_id=RUN_E,
+                    kind="lifecycle",
+                    name="worktree-new",
+                    phase="spawn",
+                    ts_start="2026-06-12T23:00:00Z",
+                    ts_end="2026-06-12T23:01:00Z",
+                ),
+                _span(
+                    span_id="m_red",
+                    spoke_run_id=RUN_E,
+                    kind="step",
+                    name="solo-cycle",
+                    phase="red",
+                    ts_start="2026-06-12T23:00:05Z",
+                    ts_end="2026-06-12T23:00:55Z",
+                ),
+                _span(
+                    span_id="s_cg",
+                    spoke_run_id=RUN_E,
+                    kind="script",
+                    name="commit-gauntlet",
+                    ts_start="2026-06-12T23:00:54Z",
+                    ts_end="2026-06-12T23:00:55Z",
+                ),
+            ],
+        )
+
+        spans = build_unified_spans(
+            events_path=events, projects_root=tmp_path / "no-projects", ccusage_costs={}
+        )
+
+        assert _by_id(spans, "s_cg")["emits"] == "m_red"
+
+    def test_unbracketed_script_keeps_null_emits(self, tmp_path: Path) -> None:
+        # A script span no marker brackets (it runs after the step ends) stays
+        # unlinked — emission is never guessed.
+        events = tmp_path / "events.jsonl"
+        _write_events(
+            events,
+            [
+                _span(
+                    span_id="m_red",
+                    spoke_run_id=RUN_E,
+                    kind="step",
+                    name="solo-cycle",
+                    phase="red",
+                    ts_start="2026-06-12T23:00:05Z",
+                    ts_end="2026-06-12T23:00:55Z",
+                ),
+                _span(
+                    span_id="s_late",
+                    spoke_run_id=RUN_E,
+                    kind="script",
+                    name="spoke-push",
+                    ts_start="2026-06-12T23:01:10Z",
+                    ts_end="2026-06-12T23:01:12Z",
+                ),
+            ],
+        )
+
+        spans = build_unified_spans(
+            events_path=events, projects_root=tmp_path / "no-projects", ccusage_costs={}
+        )
+
+        assert _by_id(spans, "s_late")["emits"] is None
+
+    def test_ad_hoc_null_run_script_does_not_link(self, tmp_path: Path) -> None:
+        # An ad-hoc script and marker both carry spoke_run_id=null; emission is
+        # scoped to a spoke run, so None==None must NOT be treated as same-run.
+        events = tmp_path / "events.jsonl"
+        _write_events(
+            events,
+            [
+                _span(
+                    span_id="m_adhoc",
+                    kind="step",
+                    name="solo-cycle",
+                    phase="red",
+                    ts_start="2026-06-12T23:00:05Z",
+                    ts_end="2026-06-12T23:00:55Z",
+                ),
+                _span(
+                    span_id="s_adhoc",
+                    kind="script",
+                    name="commit-gauntlet",
+                    ts_start="2026-06-12T23:00:54Z",
+                    ts_end="2026-06-12T23:00:55Z",
+                ),
+            ],
+        )
+
+        spans = build_unified_spans(
+            events_path=events, projects_root=tmp_path / "no-projects", ccusage_costs={}
+        )
+
+        assert _by_id(spans, "s_adhoc")["emits"] is None
+
+    def test_emission_does_not_cross_spoke_runs(self, tmp_path: Path) -> None:
+        # A marker in a different spoke run never claims this script's emission.
+        events = tmp_path / "events.jsonl"
+        _write_events(
+            events,
+            [
+                _span(
+                    span_id="m_other",
+                    spoke_run_id="feature/99-other+1700000000",
+                    kind="step",
+                    name="solo-cycle",
+                    phase="red",
+                    ts_start="2026-06-12T23:00:05Z",
+                    ts_end="2026-06-12T23:00:55Z",
+                ),
+                _span(
+                    span_id="s_cg",
+                    spoke_run_id=RUN_E,
+                    kind="script",
+                    name="commit-gauntlet",
+                    ts_start="2026-06-12T23:00:54Z",
+                    ts_end="2026-06-12T23:00:55Z",
+                ),
+            ],
+        )
+
+        spans = build_unified_spans(
+            events_path=events, projects_root=tmp_path / "no-projects", ccusage_costs={}
+        )
+
+        assert _by_id(spans, "s_cg")["emits"] is None

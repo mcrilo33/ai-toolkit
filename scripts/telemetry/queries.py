@@ -135,8 +135,61 @@ def _attributed_span_dicts(
     push_spans = _load_push_spans(events_path)
     all_spans = parsed.spans + push_spans
     backfill_spoke_run_ids(all_spans)
+    _link_emissions(all_spans)
     attribute_spans(all_spans, parsed.usage_events, ccusage_costs, agent_links=parsed.agent_links)
     return [span.to_dict() for span in all_spans]
+
+
+def _link_emissions(spans: list[Span]) -> None:
+    """Fill each ``script`` span's ``emits`` with the marker it produced.
+
+    Emission is pull-only (the push emitter leaves ``emits`` null — a script
+    cannot know the opaque span_id of the marker it produces). This is the
+    structural twin of the parser's ``agent_links``: a post-hoc correlation. A
+    control script runs at the tail of the phase/lifecycle interval it closes
+    (a gate fires as the last act of RED, ``worktree-new`` brackets its own
+    spawn marker), so the marker is the tightest ``step``/``lifecycle`` span —
+    same ``spoke_run_id`` — whose window brackets the script's. Unbracketed
+    script spans keep ``emits`` null; markers are never back-stamped.
+
+    Timestamps are ISO-8601 UTC strings that compare lexicographically, and all
+    three kinds here are push spans at uniform second precision, so a string
+    bracket test is exact.
+
+    UPGRADE: if a ``step``/``lifecycle`` ever becomes pull-sourced at millisecond
+        precision, the lexical bracket breaks (``"…55Z" >= "…55.5Z"``) — switch to
+        parsed-epoch comparison then.
+    """
+    # (start, end, span) triples with non-null bounds, so the bracket test below
+    # is a plain str comparison the type checker can follow.
+    markers = [
+        (s.ts_start, s.ts_end, s)
+        for s in spans
+        if s.kind in ("step", "lifecycle") and s.ts_start and s.ts_end
+    ]
+    for script in spans:
+        if script.kind != "script" or not script.ts_start or not script.ts_end:
+            continue
+        # Emission is scoped to a spoke run; an ad-hoc script (no spoke_run_id)
+        # links to nothing, so two null-run spans never cross-link via None==None.
+        if script.spoke_run_id is None:
+            continue
+        s_start, s_end = script.ts_start, script.ts_end
+        # "" sorts before any ISO ts, so the first bracketing marker always wins
+        # the tiebreak (best is None short-circuits its first comparison anyway).
+        best_start = best_end = ""
+        best: Span | None = None
+        for m_start, m_end, marker in markers:
+            if marker.spoke_run_id != script.spoke_run_id:
+                continue
+            if not (m_start <= s_start and s_end <= m_end):
+                continue
+            # Tightest bracket: the innermost interval — latest start, then
+            # earliest end — so a phase step wins over the run-long lifecycle.
+            if best is None or m_start > best_start or (m_start == best_start and m_end < best_end):
+                best, best_start, best_end = marker, m_start, m_end
+        if best is not None:
+            script.emits = best.span_id
 
 
 def _load_push_spans(events_path: Path) -> list[Span]:

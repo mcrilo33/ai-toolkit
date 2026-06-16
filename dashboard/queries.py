@@ -68,9 +68,11 @@ _COLUMNS: tuple[tuple[str, str], ...] = (
     ("human_type", "VARCHAR"),
     ("human_wait_ms", "BIGINT"),
     ("summary", "VARCHAR"),
-    # v3 pull-only link fields (Issue #50): a ``script``'s emitted marker, a
-    # ``hook``/``script``'s sidecar session, an ``agent``'s subagent link. Null on
-    # push spans; the tree layer reads them for actor/emission/sidecar attribution.
+    # v3 pull-only link fields (Issues #50/#54): a ``script``'s ``emits`` names the
+    # step/lifecycle marker it produced (the script→marker chain, #54); a
+    # ``hook``/``script``'s ``sidecar_session`` and an ``agent``'s ``agent_link`` feed
+    # the tree's sidecar/actor attribution (#50). Null on push spans, filled by the
+    # parser; ingested so the forest can surface all three links.
     ("emits", "VARCHAR"),
     ("sidecar_session", "VARCHAR"),
     ("agent_link", "VARCHAR"),

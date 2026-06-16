@@ -147,6 +147,203 @@ class TestBoundaryBracketing:
         assert total <= 1.0 + 1e-9
 
 
+class TestRecursiveAgentCost:
+    """Issue #51 S2: each agent in an agent→agent→agent chain is attributed only the
+    tokens of its own transcript — never its children's — so a depth-N chain never
+    double-counts.
+    """
+
+    WF_SESSION = FIXTURES / "-Users-demo-Repos-proj" / "22222222-2222-2222-2222-222222222222.jsonl"
+
+    def test_each_agent_gets_only_its_own_transcript_tokens(self) -> None:
+        parsed = parse_session_file(self.WF_SESSION)
+        attribute(parsed, {})  # tokens are attributed even without ccusage cost data
+        by_link = {
+            parsed.agent_links[s.span_id]: s
+            for s in parsed.spans
+            if s.kind == "agent" and s.span_id in parsed.agent_links
+        }
+        # Each transcript's own usage turns: depth1 200+60/80+25, depth2 150+40/60+15,
+        # depth3 100/40. A child's tokens never roll up into its parent's span.
+        assert (by_link["a1a1a1a1a1a1a1a1"].tokens_in, by_link["a1a1a1a1a1a1a1a1"].tokens_out) == (
+            260,
+            105,
+        )
+        assert (by_link["b2b2b2b2b2b2b2b2"].tokens_in, by_link["b2b2b2b2b2b2b2b2"].tokens_out) == (
+            190,
+            75,
+        )
+        assert (by_link["c3c3c3c3c3c3c3c3"].tokens_in, by_link["c3c3c3c3c3c3c3c3"].tokens_out) == (
+            100,
+            40,
+        )
+
+
+def _diamond_session(root: Path) -> Path:
+    """A session where two top-level agents (A, B) both spawn the same child C.
+
+    The same child ``agentId`` is reachable through two parents — the parser must
+    walk C's transcript once and let exactly one span own its tokens, or C is
+    double-counted. Returns the main session path.
+    """
+    import json
+
+    session_id = "diamond-sess"
+    main = root / f"{session_id}.jsonl"
+    subagents = root / session_id / "subagents"
+    subagents.mkdir(parents=True)
+
+    def assistant(uuid: str, ts: str, content: list[dict], usage: dict | None = None) -> dict:
+        message = {"role": "assistant", "model": "claude-opus-4-8", "content": content}
+        if usage is not None:
+            message["usage"] = usage
+        return {
+            "type": "assistant",
+            "sessionId": session_id,
+            "cwd": "/Users/demo/Repos/proj",
+            "gitBranch": "feature/51-demo",
+            "timestamp": ts,
+            "uuid": uuid,
+            "message": message,
+        }
+
+    def task(uuid: str, ts: str, tool_id: str, sub_type: str) -> dict:
+        return assistant(
+            uuid,
+            ts,
+            [
+                {
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": "Task",
+                    "input": {"subagent_type": sub_type},
+                }
+            ],
+        )
+
+    def result(uuid: str, ts: str, tool_id: str, agent_id: str) -> dict:
+        return {
+            "type": "user",
+            "sessionId": session_id,
+            "timestamp": ts,
+            "uuid": uuid,
+            "toolUseResult": {"agentId": agent_id},
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": tool_id, "is_error": False}],
+            },
+        }
+
+    usage = {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+    child_usage = {
+        "input_tokens": 100,
+        "output_tokens": 40,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+
+    def write(path: Path, records: list[dict]) -> None:
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+    write(
+        main,
+        [
+            task("m1", "2026-06-15T10:00:00.000Z", "t_a", "Explore"),
+            result("m2", "2026-06-15T10:00:30.000Z", "t_a", "agentA"),
+            task("m3", "2026-06-15T10:01:00.000Z", "t_b", "Explore"),
+            result("m4", "2026-06-15T10:01:30.000Z", "t_b", "agentB"),
+        ],
+    )
+    write(
+        subagents / "agent-agentA.jsonl",
+        [
+            assistant("a1", "2026-06-15T10:00:05.000Z", [{"type": "text", "text": "x"}], usage),
+            task("a2", "2026-06-15T10:00:10.000Z", "t_c1", "tdd-red"),
+            result("a3", "2026-06-15T10:00:25.000Z", "t_c1", "agentC"),
+        ],
+    )
+    write(
+        subagents / "agent-agentB.jsonl",
+        [
+            assistant("b1", "2026-06-15T10:01:05.000Z", [{"type": "text", "text": "x"}], usage),
+            task("b2", "2026-06-15T10:01:10.000Z", "t_c2", "tdd-red"),
+            result("b3", "2026-06-15T10:01:25.000Z", "t_c2", "agentC"),
+        ],
+    )
+    write(
+        subagents / "agent-agentC.jsonl",
+        [assistant("c1", "2026-06-15T10:00:15.000Z", [{"type": "text", "text": "x"}], child_usage)],
+    )
+    return main
+
+
+class TestDiamondAttribution:
+    """Issue #51 S2 regression: a repeated child ``agentId`` reached via two parents
+    is walked once and owned by one span, so its tokens are never double-counted.
+    """
+
+    def test_shared_child_usage_emitted_once(self, tmp_path: Path) -> None:
+        parsed = parse_session_file(_diamond_session(tmp_path))
+        child_events = [e for e in parsed.usage_events if e.agent_id == "agentC"]
+        assert len(child_events) == 1  # not two — global seen-set walks C once
+
+    def test_shared_child_has_exactly_one_cost_owner(self, tmp_path: Path) -> None:
+        parsed = parse_session_file(_diamond_session(tmp_path))
+        owners = [sid for sid, aid in parsed.agent_links.items() if aid == "agentC"]
+        assert len(owners) == 1
+
+    def test_child_tokens_attributed_once_across_all_spans(self, tmp_path: Path) -> None:
+        parsed = parse_session_file(_diamond_session(tmp_path))
+        attribute(parsed, {})
+        owner_id = next(sid for sid, aid in parsed.agent_links.items() if aid == "agentC")
+        c_spans = [s for s in parsed.spans if s.agent_link == "agentC"]
+        # Both parents' spans display the link, but only the owner draws C's tokens.
+        assert len(c_spans) == 2
+        assert sum(s.tokens_in or 0 for s in c_spans) == 100
+        assert next(s for s in c_spans if s.span_id == owner_id).tokens_in == 100
+
+
+class TestSidecarCost:
+    """Issue #51 S3: a span linked to a separate ``claude -p`` session via
+    ``sidecar_session`` is attributed that session's ccusage cost (the seam).
+    """
+
+    def test_sidecar_session_cost_flows_onto_the_linking_span(self) -> None:
+        span = Span(
+            span_id="hook1",
+            kind="hook",
+            name="llm-judge",
+            session_id="main-sess",
+            ts_start="2026-06-15T12:00:00.000Z",
+            ts_end="2026-06-15T12:00:09.000Z",
+            sidecar_session="side-abc123",
+        )
+        parsed = ParsedSession(spans=[span], usage_events=[], agent_links={})
+
+        attribute(parsed, {"side-abc123": 0.42})
+
+        assert span.cost_usd == pytest.approx(0.42)
+
+    def test_no_sidecar_cost_when_session_absent_from_ccusage(self) -> None:
+        span = Span(
+            span_id="hook1",
+            kind="hook",
+            name="llm-judge",
+            session_id="main-sess",
+            sidecar_session="side-missing",
+        )
+        parsed = ParsedSession(spans=[span], usage_events=[], agent_links={})
+
+        attribute(parsed, {})  # sidecar session not in ccusage → no cost added
+
+        assert span.cost_usd is None
+
+
 class TestPerTurnRows:
     def test_rows_sum_to_ccusage_session_total(self) -> None:
         parsed = parse_session_file(SESSION)
