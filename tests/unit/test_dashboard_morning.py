@@ -21,6 +21,20 @@ TELEMETRY_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "telemet
 SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
 SESSION_ID = "11111111-1111-1111-1111-111111111111"
 
+# A dedicated #55 fixture: one real (ai-toolkit) spoke + one fixture-leak (hub-8)
+# spoke. Kept separate from the shared v2 fixture so it never perturbs the golden
+# snapshot tests that freeze the v2 fixture's exact tree shape.
+FIXTURE_LEAK_SPANS = (
+    Path(__file__).resolve().parent / "fixtures" / "dashboard_fixture_leak_spans.jsonl"
+)
+REAL_RUN = "feature/2-real+1000"
+LEAK_RUN = "feature/99-pushguard+1000"
+
+
+def _leak_store():
+    queries = load_queries()
+    return queries.SpanStore.from_jsonl(FIXTURE_LEAK_SPANS)
+
 
 def _streamlit_stub() -> MagicMock:
     st = MagicMock()
@@ -80,24 +94,24 @@ def test_is_real_spoke_repo_honours_an_explicit_prefix() -> None:
 
 
 def test_spoke_run_ids_unfiltered_by_default_keeps_fixture_runs() -> None:
-    store = store_v2()
+    store = _leak_store()
 
     ids = store.spoke_run_ids()
 
     # The bare primitive is the shared seam — it lists EVERY run (other views and
     # the parser-pinned telemetry fixture rely on this). No filtering by default.
-    assert "feature/v2+1000" in ids
-    assert "feature/99-pushguard+1000" in ids
+    assert REAL_RUN in ids
+    assert LEAK_RUN in ids
 
 
 def test_spoke_run_ids_filters_fixture_runs_when_prefix_given() -> None:
     queries = load_queries()
-    store = store_v2()
+    store = _leak_store()
 
     ids = store.spoke_run_ids(queries.REAL_REPO_PREFIX)
 
-    assert "feature/v2+1000" in ids
-    assert "feature/99-pushguard+1000" not in ids  # repo='hub-8' is not real
+    assert REAL_RUN in ids
+    assert LEAK_RUN not in ids  # repo='hub-8' is not real
 
 
 def test_spoke_run_ids_keeps_run_with_a_mixed_real_and_unknown_repo() -> None:
@@ -132,13 +146,13 @@ def test_spoke_run_ids_keeps_run_with_a_mixed_real_and_unknown_repo() -> None:
 
 
 def test_morning_rows_excludes_fixture_repo_spokes() -> None:
-    store = store_v2()
+    store = _leak_store()
 
     rows = store.morning_rows()
 
     run_ids = {row["spoke_run_id"] for row in rows}
-    assert "feature/v2+1000" in run_ids, "the real ai-toolkit spoke surfaces"
-    assert "feature/99-pushguard+1000" not in run_ids, "the hub-8 fixture spoke is filtered"
+    assert REAL_RUN in run_ids, "the real ai-toolkit spoke surfaces"
+    assert LEAK_RUN not in run_ids, "the hub-8 fixture spoke is filtered"
 
 
 def test_morning_rows_returns_a_row_per_spoke_run_with_cost() -> None:
