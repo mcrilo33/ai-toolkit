@@ -982,3 +982,145 @@ class TestProjectsDirWalk:
         assert len(agents) == 6
         # Every agent span is linked for cost attribution; none is a stray re-parse.
         assert all(merged.agent_links.get(a.span_id) for a in agents)
+
+
+class TestWorkflowGroupingNodes:
+    """Issue #58: a ``Workflow`` fan-out must render as a ``workflow → workflow_phase
+    → agent`` subtree on REAL data, not just the hand-built golden fixture.
+
+    Real workflow metadata lives at ``<session>/workflows/<runId>.json`` (carrying
+    ``workflowName``, ``phases`` and the ``workflowProgress`` agent→phase map), one
+    directory above the ``subagents/workflows/wf_*/`` agent transcripts; each agent's
+    type is in its sidecar ``agent-<id>.meta.json``. The parser must read that layout
+    and emit the container spans, nesting phases under the workflow and re-homing each
+    workflow agent under its phase. Containers carry no ``agent_link`` (own-cost $0 —
+    cost rolls up from their agent children).
+    """
+
+    RUN_ID = "wf_grp01"
+    SESSION_ID = "33333333-3333-3333-3333-333333333333"
+
+    @pytest.fixture()
+    def grouped(self, tmp_path: Path) -> ParsedSession:
+        session = self.SESSION_ID
+        main = tmp_path / f"{session}.jsonl"
+        wf_dir = tmp_path / session / "subagents" / "workflows" / self.RUN_ID
+        wf_dir.mkdir(parents=True)
+        defs_dir = tmp_path / session / "workflows"
+        defs_dir.mkdir(parents=True)
+
+        main.write_text(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "sessionId": session,
+                    "cwd": "/Users/demo/Repos/proj",
+                    "gitBranch": "feature/58-demo",
+                    "timestamp": "2026-06-15T09:00:00.000Z",
+                    "uuid": "m1",
+                    "message": {"role": "assistant", "model": "claude-opus-4-8", "content": []},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        def agent_transcript(agent_id: str, start: str, end: str) -> None:
+            (wf_dir / f"agent-{agent_id}.jsonl").write_text(
+                "\n".join(
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "agentId": agent_id,
+                            "sessionId": session,
+                            "isSidechain": True,
+                            "timestamp": ts,
+                            "uuid": f"{agent_id}-{ts}",
+                            "message": {
+                                "role": "assistant",
+                                "model": "claude-opus-4-8",
+                                "usage": {"input_tokens": 100, "output_tokens": 40},
+                                "content": [],
+                            },
+                        }
+                    )
+                    for ts in (start, end)
+                ),
+                encoding="utf-8",
+            )
+
+        agents = {
+            "aaa1111111111111": ("code-review", "Review"),
+            "bbb2222222222222": ("code-review", "Review"),
+            "ccc3333333333333": ("general-purpose", "Verify"),
+        }
+        for i, (agent_id, (agent_type, _phase)) in enumerate(agents.items()):
+            agent_transcript(agent_id, f"2026-06-15T09:0{i + 1}:00.000Z", f"2026-06-15T09:0{i + 1}:30.000Z")
+            (wf_dir / f"agent-{agent_id}.meta.json").write_text(
+                json.dumps({"agentType": agent_type}), encoding="utf-8"
+            )
+
+        (defs_dir / f"{self.RUN_ID}.json").write_text(
+            json.dumps(
+                {
+                    "runId": self.RUN_ID,
+                    "workflowName": "design-panel",
+                    "phases": [{"title": "Review"}, {"title": "Verify"}],
+                    "workflowProgress": [
+                        {"type": "workflow_phase", "index": 1, "title": "Review"},
+                        {"type": "workflow_phase", "index": 2, "title": "Verify"},
+                        *[
+                            {
+                                "type": "workflow_agent",
+                                "agentId": agent_id,
+                                "phaseTitle": phase,
+                                "label": f"{phase.lower()}:{agent_id[:3]}",
+                            }
+                            for agent_id, (_t, phase) in agents.items()
+                        ],
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return parse_session_file(main)
+
+    def _workflow(self, parsed: ParsedSession) -> Span:
+        workflows = [s for s in parsed.spans if s.kind == "workflow"]
+        assert len(workflows) == 1, "expected exactly one workflow container span"
+        return workflows[0]
+
+    def test_emits_one_workflow_container_span(self, grouped: ParsedSession) -> None:
+        workflow = self._workflow(grouped)
+        assert workflow.name == "design-panel"
+        assert workflow.parent_id is None
+
+    def test_workflow_container_owns_no_cost(self, grouped: ParsedSession) -> None:
+        # No ``agent_link`` → the correlation pass attributes it nothing; cost rolls up
+        # from its agent children (conservation: Σ owned == Σ turns).
+        workflow = self._workflow(grouped)
+        assert workflow.agent_link is None
+        assert grouped.agent_links.get(workflow.span_id) is None
+
+    def test_each_phase_nests_under_the_workflow(self, grouped: ParsedSession) -> None:
+        workflow = self._workflow(grouped)
+        phases = [s for s in grouped.spans if s.kind == "workflow_phase"]
+        assert {p.name for p in phases} == {"Review", "Verify"}
+        assert all(p.parent_id == workflow.span_id for p in phases)
+        assert all(p.agent_link is None for p in phases)
+
+    def test_each_agent_nests_under_its_phase(self, grouped: ParsedSession) -> None:
+        phase_by_name = {
+            p.name: p.span_id for p in grouped.spans if p.kind == "workflow_phase"
+        }
+        agent_phase = {
+            "aaa1111111111111": "Review",
+            "bbb2222222222222": "Review",
+            "ccc3333333333333": "Verify",
+        }
+        for agent_id, phase in agent_phase.items():
+            span = next(
+                s
+                for s in grouped.spans
+                if s.kind == "agent" and grouped.agent_links.get(s.span_id) == agent_id
+            )
+            assert span.parent_id == phase_by_name[phase]
