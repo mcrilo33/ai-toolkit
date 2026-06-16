@@ -1519,6 +1519,8 @@
             },
             {
               "actor": "main",
+              "cache_creation": 0,
+              "cache_read": 0,
               "children": [],
               "duration_ms": null,
               "human_count": 0,
@@ -1668,6 +1670,8 @@
             },
             {
               "actor": "main",
+              "cache_creation": 0,
+              "cache_read": 0,
               "children": [
                 {
                   "actor": "main",
@@ -1702,6 +1706,8 @@
                   "children": [
                     {
                       "actor": "subagent",
+                      "cache_creation": 0,
+                      "cache_read": 0,
                       "children": [
                         {
                           "actor": "main",
@@ -1764,6 +1770,8 @@
                     },
                     {
                       "actor": "subagent",
+                      "cache_creation": 0,
+                      "cache_read": 0,
                       "children": [
                         {
                           "actor": "main",
@@ -1886,6 +1894,8 @@
             },
             {
               "actor": "main",
+              "cache_creation": 0,
+              "cache_read": 0,
               "children": [],
               "duration_ms": null,
               "human_count": 0,
@@ -1918,6 +1928,8 @@
             },
             {
               "actor": "main",
+              "cache_creation": 0,
+              "cache_read": 0,
               "children": [
                 {
                   "actor": "main",
@@ -2040,6 +2052,8 @@
             },
             {
               "actor": "main",
+              "cache_creation": 0,
+              "cache_read": 0,
               "children": [
                 {
                   "actor": "main",
@@ -2279,6 +2293,8 @@
             },
             {
               "actor": "main",
+              "cache_creation": 0,
+              "cache_read": 0,
               "children": [
                 {
                   "actor": "main",
@@ -2401,6 +2417,8 @@
           "children": [
             {
               "actor": "main",
+              "cache_creation": 0,
+              "cache_read": 0,
               "children": [],
               "duration_ms": null,
               "human_count": 0,

@@ -25,7 +25,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from datetime import datetime
 
-from telemetry.session_parser import ParsedSession, UsageEvent
+from telemetry.session_parser import ParsedSession, ReasoningRef, UsageEvent
 from telemetry.spans import Span
 
 CCUSAGE_CMD = ("ccusage", "session", "--json", "--offline")
@@ -108,25 +108,34 @@ def _attribute_sidecar(span: Span, ccusage_costs: dict[str, float]) -> None:
 
 
 def per_turn_rows(
-    usage_events: list[UsageEvent], ccusage_costs: dict[str, float]
+    usage_events: list[UsageEvent],
+    ccusage_costs: dict[str, float],
+    *,
+    reasoning_refs: list[ReasoningRef] | None = None,
 ) -> list[dict[str, object]]:
-    """One row per usage event, with model and a per-turn cost.
+    """One row per usage event, with model, a per-turn cost, and a reasoning gist.
 
     Unlike span attribution — which brackets a turn onto every overlapping span —
     each turn appears exactly once here, so the rows sum to the ccusage session
     total with no double-count. Cost reuses the same blended session rate
     (ccusage total ÷ session tokens); a session absent from ``ccusage_costs``
-    gets ``cost_usd`` None (tokens still counted).
+    gets ``cost_usd`` None (tokens still counted). Each row also carries the turn's
+    ``cache_read`` / ``cache_creation`` breakdown (the budget panel frames cheap reuse
+    against cold writes). When ``reasoning_refs`` are given, each row carries the turn's
+    reasoning ``summary`` gist (matched on session/source/agent/ts) so the tree can
+    render a ``reasoning`` node.
 
     Args:
         usage_events: Per-turn usage from the parsed sessions (main + subagent).
         ccusage_costs: Map of ``session_id`` to ccusage ``totalCost``.
+        reasoning_refs: Per-turn reasoning summaries to join onto their turn.
 
     Returns:
-        One dict per turn: ``session_id, ts, model, source, agent_id,
-        tokens_in, tokens_out, tokens_total, cost_usd``.
+        One dict per turn: ``session_id, ts, model, source, agent_id, tokens_in,
+        tokens_out, tokens_total, cache_read, cache_creation, cost_usd, reasoning``.
     """
     rate = _session_rates(usage_events, ccusage_costs)
+    gists = _reasoning_by_turn(reasoning_refs or [])
     rows: list[dict[str, object]] = []
     for event in usage_events:
         total = _event_total(event)
@@ -141,10 +150,38 @@ def per_turn_rows(
                 "tokens_in": event.input_tokens,
                 "tokens_out": event.output_tokens,
                 "tokens_total": total,
+                "cache_read": event.cache_read,
+                "cache_creation": event.cache_creation,
                 "cost_usd": session_rate * total if session_rate is not None else None,
+                "reasoning": gists.get(
+                    _turn_key(event.session_id, event.source, event.agent_id, event.ts)
+                ),
             }
         )
     return rows
+
+
+def _turn_key(
+    session_id: str | None, source: str, agent_id: str | None, ts: str | None
+) -> tuple[str | None, str, str | None, str | None]:
+    """The identity a usage event and its reasoning ref share (same assistant record)."""
+    return (session_id, source, agent_id, ts)
+
+
+def _reasoning_by_turn(
+    refs: list[ReasoningRef],
+) -> dict[tuple[str | None, str, str | None, str | None], str]:
+    """Map each turn key to its reasoning gist, keeping only refs that carry one.
+
+    Two inferences can share a millisecond ``ts`` (see ``tree._rehome_under_turns``);
+    on such a collision the last ref's gist wins and both turns display it. The gist
+    is display-only (no cost rides on it), so the cosmetic mislabel is acceptable.
+    """
+    return {
+        _turn_key(ref.session_id, ref.source, ref.agent_id, ref.ts): ref.summary
+        for ref in refs
+        if ref.summary
+    }
 
 
 def load_ccusage_costs(runner: Callable[[], str] | None = None) -> dict[str, float]:

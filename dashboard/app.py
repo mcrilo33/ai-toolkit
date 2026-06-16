@@ -184,7 +184,9 @@ def _node_label(node: dict) -> str:
 def _render_divider(node: dict) -> None:
     """A gap (idle) or session-resume node as a thin divider, not a metric row."""
     if node["kind"] == "session":
-        cache = node.get("own_tokens_in") or 0
+        # The resume cold-cache magnitude rides on resume_cache_creation, never
+        # own_tokens_in — it must not fold into the exact once-per-turn rollup (#59).
+        cache = node.get("resume_cache_creation") or 0
         note = f" · cold cache (+{cache:,})" if cache else " · cold cache"
         st.markdown(f"··· session resume{note} ···")
         return
@@ -297,10 +299,28 @@ def _composition_totals(forest: list[dict]) -> dict[str, float]:
     return {"cost_usd": cost, "tokens_in": tokens_in, "tokens_out": tokens_out}
 
 
-def _render_composition(forest: list[dict]) -> None:
-    """The context-composition bar: exact usage totals + a modeled split (estimate).
+def _composition_cache_totals(forest: list[dict]) -> dict[str, int]:
+    """Spoke cache breakdown — cheap reuse (``cache_read``) vs cold writes
+    (``cache_creation``) — summed across every turn node in the forest (Issue #59)."""
+    read = 0
+    creation = 0
 
-    The totals are exact (reconciled to the once-per-turn rollup); the
+    def _walk(nodes: list[dict]) -> None:
+        nonlocal read, creation
+        for node in nodes:
+            read += node.get("cache_read") or 0
+            creation += node.get("cache_creation") or 0
+            _walk(node.get("children", []))
+
+    _walk(forest)
+    return {"cache_read": read, "cache_creation": creation}
+
+
+def _render_composition(forest: list[dict]) -> None:
+    """The context-composition bar: exact usage totals + cache framing + a modeled split.
+
+    The totals are exact (reconciled to the once-per-turn rollup); the cache breakdown
+    frames cheap reuse (``cache_read``) against cold writes (``cache_creation``); the
     prefix/skills/memory/history split is modeled from artifact sizes and labelled an
     estimate (scope doc: only in/out/cost totals are exact).
     """
@@ -309,10 +329,16 @@ def _render_composition(forest: list[dict]) -> None:
     cols[0].metric("Tokens in (exact)", f"{totals['tokens_in']:,}")
     cols[1].metric("Tokens out (exact)", f"{totals['tokens_out']:,}")
     cols[2].metric("Cost (exact)", _fmt_cost(totals["cost_usd"]))
+    cache = _composition_cache_totals(forest)
+    cache_cols = st.columns(2)
+    cache_cols[0].metric("Cache read (reuse)", f"{cache['cache_read']:,}")
+    cache_cols[1].metric("Cache creation (cold)", f"{cache['cache_creation']:,}")
     st.caption(
         "Usage totals are exact — reconciled to the run's once-per-turn rollup, so "
-        "they include the main-agent cost the per-kind view omits. The prefix / "
-        "skills / memory / history split is a modeled estimate from artifact sizes."
+        "they include the main-agent cost the per-kind view omits. Cache read is cheap "
+        "prompt reuse; cache creation is the expensive cold write (largest on session "
+        "resume). The prefix / skills / memory / history split is a modeled estimate "
+        "from artifact sizes."
     )
 
 
