@@ -157,3 +157,46 @@ class TestFixtureConformsToContract:
         store = store_from(SPANS, TURNS)
         forest = store.spoke_steps(SPOKE_RUN_ID)
         assert forest, "spoke_steps built an empty forest from the fixture"
+
+
+def _walk(nodes: list[dict]):
+    for node in nodes:
+        yield node
+        yield from _walk(node.get("children", []))
+
+
+class TestEmissionRendering:
+    """Track E render layer (Issue #54): a control script is a first-class node in
+    the v3 forest, and the ``emits`` link it carries (the marker it produced) is
+    surfaced on that node so the trace can draw the script→marker chain.
+    """
+
+    def test_script_span_renders_as_a_node(self) -> None:
+        store = store_from(SPANS, TURNS)
+        forest = store.spoke_steps(SPOKE_RUN_ID)
+        scripts = [n for n in _walk(forest) if n["kind"] == "script"]
+        assert scripts, "no kind=script run-node in the v3 forest"
+        assert any(n["name"] == "commit-gauntlet" for n in scripts)
+
+    def test_script_node_carries_its_emission_link(self) -> None:
+        # The golden's commit-gauntlet script span emits the red step marker
+        # (g_script_red.emits == "g_red"); the rendered node must surface that link
+        # so the script→marker chain is drawable.
+        raw = _by_id(_spans())
+        script_raw = next(s for s in _spans() if s["kind"] == "script")
+        marker_id = script_raw["emits"]
+        assert marker_id and raw[marker_id]["kind"] in ("step", "lifecycle")
+
+        store = store_from(SPANS, TURNS)
+        forest = store.spoke_steps(SPOKE_RUN_ID)
+        script_node = next(n for n in _walk(forest) if n["kind"] == "script")
+        assert script_node.get("emits") == marker_id
+
+    def test_emits_key_absent_when_link_is_null(self) -> None:
+        # Conditional surfacing (Hazard B): nodes without an emission link must NOT
+        # gain an `emits` key, so the frozen v1/v2 golden forest stays byte-identical.
+        store = store_from(SPANS, TURNS)
+        forest = store.spoke_steps(SPOKE_RUN_ID)
+        unlinked = [n for n in _walk(forest) if n["kind"] in ("turn", "interval")]
+        assert unlinked, "expected synthetic nodes in the forest"
+        assert all("emits" not in n for n in unlinked)
