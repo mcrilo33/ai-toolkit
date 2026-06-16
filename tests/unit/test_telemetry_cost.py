@@ -368,6 +368,23 @@ class TestPerTurnRows:
         # A turn with no reasoning ref carries reasoning=None — never a stray gist.
         assert any(r["reasoning"] is None for r in rows)
 
+    def test_rows_carry_cache_breakdown(self) -> None:
+        # Issue #59 budget panel: each turn row exposes cache_read vs cache_creation
+        # so the panel can frame cheap reuse against expensive cold-cache writes.
+        event = UsageEvent(
+            session_id="sess-a",
+            ts="2026-06-13T12:00:01.000Z",
+            model="claude-opus-4-8",
+            input_tokens=10,
+            output_tokens=5,
+            cache_read=900,
+            cache_creation=300,
+            source="main",
+        )
+        rows = per_turn_rows([event], {})
+        assert rows[0]["cache_read"] == 900
+        assert rows[0]["cache_creation"] == 300
+
 
 class TestCcusageLoader:
     def test_maps_claude_session_period_to_total_cost(self) -> None:
