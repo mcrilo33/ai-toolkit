@@ -22,11 +22,24 @@ leaked value could still steer a child git process. ``GIT_CONFIG_*`` is a family
 (``COUNT``, ``KEY``/``VALUE`` pairs, ``GLOBAL``, ``SYSTEM``) handled by the prefix
 sweep below. The regression guard is ``tests/unit/test_git_env_isolation.py`` —
 do not drop this strip without removing that test's reason to exist.
+
+Telemetry isolation works the same way and for the same reason (issue #49). The
+span recorder in ``shared/hooks/lib/telemetry.sh`` writes to
+``${AI_TOOLKIT_TELEMETRY_DIR:-$HOME/.ai-toolkit/telemetry}`` whenever
+``AI_TOOLKIT_TELEMETRY=1``. A dev shell (or the pre-push gate) commonly exports
+``=1``, so a test that shells out to a hook — or snapshots ``os.environ`` at
+import, as ``test_worktree_new`` does — leaked fixture spans into the REAL log,
+where they surfaced as fake spokes in the observability dashboard. Neutralize for
+the whole session: drop the opt-in (the recorder no-ops without ``=1``), and
+redirect the dir to a sandbox so even a test that re-enables telemetry without its
+own dir can never hit the real default. The regression guard is
+``tests/unit/test_telemetry_env_isolation.py``.
 """
 
 from __future__ import annotations
 
 import os
+import tempfile
 
 _LEAKED_GIT_HOOK_VARS = (
     "GIT_DIR",
@@ -47,3 +60,10 @@ for _var in _LEAKED_GIT_HOOK_VARS:
 # GIT_CONFIG_VALUE_n, GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM) — sweep by prefix.
 for _var in [_k for _k in os.environ if _k.startswith("GIT_CONFIG_")]:
     os.environ.pop(_var, None)
+
+# Telemetry isolation (issue #49) — see the module docstring. Drop the opt-in so the
+# recorder no-ops, and redirect the dir to a throwaway sandbox as belt-and-suspenders
+# against any test that re-enables telemetry without supplying its own dir.
+for _var in ("AI_TOOLKIT_TELEMETRY", "AI_TOOLKIT_SPAN_LOG"):
+    os.environ.pop(_var, None)
+os.environ["AI_TOOLKIT_TELEMETRY_DIR"] = tempfile.mkdtemp(prefix="ai-toolkit-test-telemetry-")
