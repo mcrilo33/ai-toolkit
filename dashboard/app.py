@@ -196,40 +196,25 @@ def _node_row(node: dict, depth: int) -> None:
     cols[6].markdown(_actor_label(node))
 
 
-def _render_descendants(nodes: list[dict], depth: int) -> None:
-    """Render a subtree as indented rows.
+def _render_node(node: dict, depth: int, path: str) -> None:
+    """Render one node and, when drilled open, its children — uniformly at any depth.
 
-    A divider kind renders inline; a collapsed ``xN`` group gates its members behind
-    a checkbox so drilling toggles already-built rows (never a rebuild). A v2 hooks
-    node carries ``collapsed_count`` and so drills through that same gate.
+    Streamlit forbids nested expanders, so drilling uses a ``st.toggle`` per node
+    instead: one consistent control for steps, agents, and collapsed ``xN`` groups
+    alike. The toggle's state persists across reruns by its ``path`` key (no
+    re-collapse trap), and children render only while it is open (lazy). A divider
+    kind (idle gap / session resume) renders inline with no drill.
     """
-    for node in nodes:
-        if node["kind"] in _DIVIDER_KINDS:
-            _render_divider(node)
-            continue
-        _node_row(node, depth)
-        if node.get("collapsed_count"):
-            if st.checkbox(f"show {_node_label(node)} members", key=f"drill-{id(node)}"):
-                _render_descendants(node["children"], depth + 1)
-            continue
-        _render_descendants(node["children"], depth + 1)
-
-
-def _render_step(root: dict) -> None:
-    """A Level-1 spine row with a drill expander (or a thin divider for idle/resume).
-
-    Streamlit forbids nesting expanders, so the whole subtree drills inside one
-    expander as indentation depth (Issue #47 S3): marker headers, then the turn
-    nodes, with the tools/skills each turn issued nested beneath — and a sub-agent's
-    own turns under its agent node. Wide leaf groups drill through a checkbox toggle.
-    """
-    if root["kind"] in _DIVIDER_KINDS:
-        _render_divider(root)
+    if node["kind"] in _DIVIDER_KINDS:
+        _render_divider(node)
         return
-    _node_row(root, 0)
-    if root["children"]:
-        with st.expander(f"↳ drill into {_node_label(root)}", expanded=False):
-            _render_descendants(root["children"], 1)
+    _node_row(node, depth)
+    children = node.get("children") or []
+    if not children:
+        return
+    if st.toggle(f"↳ drill into {_node_label(node)}", key=f"drill::{path}", value=False):
+        for index, child in enumerate(children):
+            _render_node(child, depth + 1, f"{path}.{index}")
 
 
 def _date_of(ts: str | None) -> str | None:
@@ -241,15 +226,16 @@ def _render_spine(forest: list[dict]) -> None:
     """Render the L1 trace spine: a date-divider on day rollover, then each step.
 
     No Date column — a thin date-divider row marks the day rollover (the first day
-    gets none). Idle/session-resume roots render as dividers, not metric rows.
+    gets none). Idle/session-resume roots render as dividers, not metric rows. Each
+    step drills through the uniform per-node toggle in :func:`_render_node`.
     """
     prev_date: str | None = None
-    for root in forest:
+    for index, root in enumerate(forest):
         date = _date_of(root.get("ts_start"))
         if date and prev_date and date != prev_date:
             st.markdown(f"**📅 {date}**")
         prev_date = date or prev_date
-        _render_step(root)
+        _render_node(root, 0, str(index))
 
 
 def _render_meta(store: queries.SpanStore, spoke_id: str) -> None:
