@@ -359,6 +359,37 @@ class TestEmissionLink:
 
         assert _by_id(spans, "s_late")["emits"] is None
 
+    def test_ad_hoc_null_run_script_does_not_link(self, tmp_path: Path) -> None:
+        # An ad-hoc script and marker both carry spoke_run_id=null; emission is
+        # scoped to a spoke run, so None==None must NOT be treated as same-run.
+        events = tmp_path / "events.jsonl"
+        _write_events(
+            events,
+            [
+                _span(
+                    span_id="m_adhoc",
+                    kind="step",
+                    name="solo-cycle",
+                    phase="red",
+                    ts_start="2026-06-12T23:00:05Z",
+                    ts_end="2026-06-12T23:00:55Z",
+                ),
+                _span(
+                    span_id="s_adhoc",
+                    kind="script",
+                    name="commit-gauntlet",
+                    ts_start="2026-06-12T23:00:54Z",
+                    ts_end="2026-06-12T23:00:55Z",
+                ),
+            ],
+        )
+
+        spans = build_unified_spans(
+            events_path=events, projects_root=tmp_path / "no-projects", ccusage_costs={}
+        )
+
+        assert _by_id(spans, "s_adhoc")["emits"] is None
+
     def test_emission_does_not_cross_spoke_runs(self, tmp_path: Path) -> None:
         # A marker in a different spoke run never claims this script's emission.
         events = tmp_path / "events.jsonl"
