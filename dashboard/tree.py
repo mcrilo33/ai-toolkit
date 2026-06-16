@@ -551,40 +551,70 @@ def _bucket_children(
 
     turn_nodes = [_turn_node(turn) for turn in bucket_turns]
     orphans = _rehome_under_turns(forest, turn_nodes)
-    children = _apply_scope_bands(markers + turn_nodes + orphans)
+    children = _apply_scope_bands(sorted(markers + turn_nodes + orphans, key=_sort_key))
     return sorted(children, key=_sort_key)
 
 
 def _apply_scope_bands(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Render each ``skill`` span as a soft ``scope-band`` (Issue #52, decision 5).
 
-    A skill loads instructions then guides the turns under it — a causal scope with
-    no hard window — so it renders as a ``[scope]``-tagged band holding the work it
-    influenced. The band carries only the skill's own load cost (``$0`` here — cost
-    lives on the turn/agent leaves it holds), so the subtree rollup is unchanged.
-    Applied post-order so a skill nested under a turn or agent is banded too.
+    A skill loads instructions then guides later turns — a causal scope with no hard
+    window — so it renders as a ``[scope]``-tagged band that holds both the work
+    time-bracketed under the skill span and the sibling **turn** nodes it influenced,
+    from its load until the next skill-load (its scope end). The band carries only the
+    skill's own ``$0`` load cost — the turn/agent leaves keep theirs — so the subtree
+    rollup is unchanged. ``nodes`` must be time-sorted; applied post-order so a skill
+    nested under a turn or agent is banded too.
+
+    UPGRADE: the scope end is the next skill-load (or the bucket/step end, since
+    buckets are per-phase); the spec also allows step-end mid-bucket and tagging the
+    inferred boundary — not modeled here. Only sibling ``turn`` nodes are pulled in;
+    bare sibling spans (a tool with no owning turn) stay at bucket level.
     """
-    out: list[dict[str, Any]] = []
     for node in nodes:
         node["children"] = _apply_scope_bands(node["children"])
-        out.append(_scope_band_node(node) if node["kind"] == "skill" else node)
-    return out
+    if not any(n["kind"] == "skill" for n in nodes):
+        return nodes
+    out: list[dict[str, Any]] = []
+    i = 0
+    while i < len(nodes):
+        node = nodes[i]
+        if node["kind"] != "skill":
+            out.append(node)
+            i += 1
+            continue
+        band = _scope_band_node(node)
+        influenced: list[dict[str, Any]] = []
+        j = i + 1
+        while j < len(nodes) and nodes[j]["kind"] != "skill":
+            (influenced if nodes[j]["kind"] == "turn" else out).append(nodes[j])
+            j += 1
+        band["children"] = sorted(band["children"] + influenced, key=_sort_key)
+        out.append(band)
+        i = j
+    return sorted(out, key=_sort_key)
 
 
 def _scope_band_node(skill: dict[str, Any]) -> dict[str, Any]:
     """A soft ``[scope]`` band standing in for a skill span, holding its influence."""
-    return dict(
+    band = dict(
         synthetic_node(
             kind="scope-band",
             name=f"[scope] {skill['name']}",
             summary=skill.get("summary"),
+            phase=skill.get("phase"),
             status=skill["status"],
             ts_start=skill["ts_start"],
             ts_end=skill["ts_end"],
             duration_ms=skill.get("duration_ms"),
+            human_count=skill.get("human_count", 0),
             children=skill["children"],
         )
     )
+    # Synthetic nodes carry no span_id, but keep the skill's so the drill-down can
+    # still link the band back to its source skill span.
+    band["source_span_id"] = skill["span_id"]
+    return band
 
 
 def _install_sub_turns(agent: dict[str, Any], sub_turns: list[dict[str, Any]]) -> None:

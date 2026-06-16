@@ -48,7 +48,7 @@ _FACTORY_KEYS = {
     "human_count",
     "children",
 }
-_ALLOWED_EXTRAS = {"model", "collapsed", "collapsed_count", "rollup", "subtree"}
+_ALLOWED_EXTRAS = {"model", "collapsed", "collapsed_count", "rollup", "subtree", "source_span_id"}
 
 
 def _walk(nodes: list[dict]):

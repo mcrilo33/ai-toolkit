@@ -48,6 +48,12 @@ _COLUMNS = (
     "human_type VARCHAR",
     "human_wait_ms BIGINT",
     "summary VARCHAR",
+    # v3 pull-only link fields (Issue #50): kept in schema parity with the dashboard
+    # store so the live spoke-trace can read actor/sidecar/emission links. Null until
+    # the parser populates them (a separate follow-up to the tree layer).
+    "emits VARCHAR",
+    "sidecar_session VARCHAR",
+    "agent_link VARCHAR",
     "tokens_in BIGINT",
     "tokens_out BIGINT",
     "cost_usd DOUBLE",
@@ -183,6 +189,9 @@ def _row(span: dict[str, object]) -> tuple[object, ...]:
         human_type,
         human_wait_ms,
         scalar["summary"],
+        scalar["emits"],
+        scalar["sidecar_session"],
+        scalar["agent_link"],
         scalar["tokens_in"],
         scalar["tokens_out"],
         scalar["cost_usd"],

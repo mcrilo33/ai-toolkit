@@ -139,5 +139,10 @@ def test_skill_renders_as_a_scope_band() -> None:
     assert "tdd-red" in band["name"]
     # The band carries only its load cost (the agent/turn leaves under it own theirs).
     assert band["own_cost_usd"] == 0.0
-    # It influenced the RED-phase agent that ran under it.
+    # It holds the agent time-bracketed under the skill span...
     assert "g_agent_tddred" in _child_ids(band)
+    # ...and the influenced main turn that loaded after the skill (a direct turn
+    # child, not the agent's nested sub-turn) — decision 5's causal scope.
+    assert any(c["kind"] == "turn" for c in band["children"]), "influenced turn not pulled in"
+    # Keeps a link back to the source skill span though it is now synthetic.
+    assert band["source_span_id"] == "g_skill_tddred"

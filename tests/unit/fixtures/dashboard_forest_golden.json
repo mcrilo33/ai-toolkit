@@ -1632,6 +1632,33 @@
               "actor": "main",
               "children": [
                 {
+                  "actor": "main",
+                  "children": [],
+                  "duration_ms": 12000,
+                  "human_count": 0,
+                  "kind": "scope-band",
+                  "models": [],
+                  "name": "[scope] tdd-red",
+                  "own_cost_usd": 0.0,
+                  "own_tokens_in": 0,
+                  "own_tokens_out": 0,
+                  "parent_id": null,
+                  "phase": null,
+                  "rollup": {
+                    "cost_usd": 0.0,
+                    "human_count": 0,
+                    "models": [],
+                    "tokens_in": 0,
+                    "tokens_out": 0
+                  },
+                  "source_span_id": "v2_skill",
+                  "span_id": null,
+                  "status": "success",
+                  "summary": null,
+                  "ts_end": "2026-06-12T12:00:20Z",
+                  "ts_start": "2026-06-12T12:00:10Z"
+                },
+                {
                   "actor": "tdd-red",
                   "children": [
                     {
@@ -1780,32 +1807,6 @@
                   "status": "success",
                   "summary": "write the RED test",
                   "ts_end": "2026-06-12T12:00:18Z",
-                  "ts_start": "2026-06-12T12:00:10Z"
-                },
-                {
-                  "actor": "main",
-                  "children": [],
-                  "duration_ms": 12000,
-                  "human_count": 0,
-                  "kind": "scope-band",
-                  "models": [],
-                  "name": "[scope] tdd-red",
-                  "own_cost_usd": 0.0,
-                  "own_tokens_in": 0,
-                  "own_tokens_out": 0,
-                  "parent_id": null,
-                  "phase": null,
-                  "rollup": {
-                    "cost_usd": 0.0,
-                    "human_count": 0,
-                    "models": [],
-                    "tokens_in": 0,
-                    "tokens_out": 0
-                  },
-                  "span_id": null,
-                  "status": "success",
-                  "summary": null,
-                  "ts_end": "2026-06-12T12:00:20Z",
                   "ts_start": "2026-06-12T12:00:10Z"
                 }
               ],
