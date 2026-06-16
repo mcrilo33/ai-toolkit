@@ -184,7 +184,7 @@ def render_spoke_view(store: queries.SpanStore) -> None:
         "step to drill into sub-steps and spans. Hooks collapse into one line."
     )
 
-    spoke_ids = store.spoke_run_ids()
+    spoke_ids = store.spoke_run_ids(queries.REAL_REPO_PREFIX)  # #55: hide fixture-leak spokes
     if not spoke_ids:
         st.info("No spoke runs found in the span log.")
         return

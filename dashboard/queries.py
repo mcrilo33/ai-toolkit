@@ -116,6 +116,17 @@ def _row_tuple(span: dict[str, Any]) -> tuple[Any, ...]:
 
 _SPOKE_ISSUE_RE = re.compile(r"^(\d+)-")
 
+# A real spoke run's ``repo`` is the toolkit checkout basename (``ai-toolkit`` or a
+# worktree like ``ai-toolkit-55``). Test-fixture leaks carry sandbox hub basenames
+# (``proj``, ``hub-8``, ``test_gauntlet_*`` …); #55 filters those off the read path
+# so a stray pre-#49 leak never renders as a fake spoke in the spoke-listing views.
+REAL_REPO_PREFIX = "ai-toolkit"
+
+
+def _is_real_spoke_repo(repo: str | None, prefix: str = REAL_REPO_PREFIX) -> bool:
+    """True when a span's ``repo`` names the real toolkit checkout, not a sandbox."""
+    return bool(repo) and repo.startswith(prefix)
+
 
 def _issue_from_spoke_run_id(spoke_run_id: str | None) -> str | None:
     """Parse the issue number out of a ``<type>/<issue>-<slug>+<epoch>`` run id.
@@ -221,7 +232,7 @@ class SpanStore:
         columns = [desc[0] for desc in cursor.description]
         return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
 
-    def spoke_run_ids(self) -> list[str]:
+    def spoke_run_ids(self, real_repo_prefix: str | None = None) -> list[str]:
         """All known ``spoke_run_id``s, newest-first by latest activity.
 
         Ordered by ``max(ts_end)`` descending, tie-broken by ``min(ts_start)``
@@ -229,11 +240,26 @@ class SpanStore:
         alphabetically by branch. Ordering happens in Python via :func:`_parse_ts`
         because push spans carry second precision and pull spans millisecond, so a
         lexical sort on the raw timestamps would misorder them.
+
+        ``real_repo_prefix`` is the #55 defense-in-depth filter: when given, runs
+        whose ``repo`` is not a real toolkit checkout (a fixture-leak sandbox name)
+        are dropped. It defaults to ``None`` — the bare primitive stays unfiltered
+        so other callers and minimal-span fixtures keep listing every run.
         """
         rows = self._query(
-            "SELECT spoke_run_id, MAX(ts_end) AS last_end, MIN(ts_start) AS first_start "
+            "SELECT spoke_run_id, MAX(ts_end) AS last_end, MIN(ts_start) AS first_start, "
+            "array_agg(DISTINCT repo) AS repos "
             "FROM spans WHERE spoke_run_id IS NOT NULL GROUP BY spoke_run_id"
         )
+        if real_repo_prefix is not None:
+            # Keep a run when ANY of its spans names a real repo: a real run's push
+            # span carries the toolkit basename even when its session spans fall back
+            # to ``repo='unknown'`` (no cwd), whereas a fixture-leak run has none.
+            rows = [
+                r
+                for r in rows
+                if any(_is_real_spoke_repo(repo, real_repo_prefix) for repo in r["repos"])
+            ]
         rows.sort(
             key=lambda r: (
                 _parse_ts(r["last_end"]) or 0.0,
@@ -244,7 +270,12 @@ class SpanStore:
         )
         return [row["spoke_run_id"] for row in rows]
 
-    def morning_rows(self, triage: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    def morning_rows(
+        self,
+        triage: dict[str, str] | None = None,
+        *,
+        real_repo_prefix: str | None = REAL_REPO_PREFIX,
+    ) -> list[dict[str, Any]]:
         """The night-mode 'morning' lens: one row per spoke run, newest-first.
 
         A filtered view over the SAME #35 data (AC#6 "morning view shared with
@@ -255,6 +286,10 @@ class SpanStore:
         night's land-triage cache. ``triage`` maps issue -> ``clean``/``conflict``
         (the verdict ``hub-morning.sh --triage`` wrote); it complements the shell
         worklist rather than re-deriving the tiers here.
+
+        ``real_repo_prefix`` (the #55 fixture-spoke filter) defaults to
+        :data:`REAL_REPO_PREFIX` so the live morning view only ever shows runs from
+        the real toolkit checkout; pass another prefix (or ``None``) to widen it.
         """
         triage = triage or {}
         cost_by_run: dict[str, Any] = {}
@@ -262,7 +297,7 @@ class SpanStore:
             for row in self._query("SELECT spoke_run_id, total_cost_usd FROM spoke_run_summary"):
                 cost_by_run[row["spoke_run_id"]] = row["total_cost_usd"]
         out: list[dict[str, Any]] = []
-        for spoke_run_id in self.spoke_run_ids():
+        for spoke_run_id in self.spoke_run_ids(real_repo_prefix):
             issue = _issue_from_spoke_run_id(spoke_run_id)
             out.append(
                 {
