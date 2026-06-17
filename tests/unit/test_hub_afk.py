@@ -608,21 +608,23 @@ def _ssh_recorder(tmp_path: Path, log_name: str = "ssh.log", *, exit_code: int =
 
 
 def test_build_remote_launch_cmd_contains_all_parts() -> None:
-    result = _call("build_remote_launch_cmd '/home/me/ai-toolkit' 'afk' 'claude'")
+    result = _call("build_remote_launch_cmd '/home/me/ai-toolkit' 'afk' 'bash hub-afk.sh drain'")
 
     out = result.stdout
     assert "cd '/home/me/ai-toolkit'" in out
     assert "tmux new -d -s 'afk'" in out
     assert "caffeinate -s" in out
-    assert "/afk drain" in out
+    assert "bash hub-afk.sh drain" in out
 
 
-def test_build_remote_launch_cmd_preserves_claude_flags() -> None:
-    # AFK_REMOTE_CLAUDE may carry flags; they must reach the remote command unquoted so
-    # the remote shell runs `claude --model opus`, not a single mis-quoted argument.
-    result = _call("build_remote_launch_cmd '/repo' 'afk' 'claude --model opus'")
+def test_build_remote_launch_cmd_preserves_drain_args() -> None:
+    # AFK_REMOTE_DRAIN_CMD may carry args/flags; they must reach the remote command
+    # unquoted so the remote shell runs them as separate words, not one mis-quoted arg.
+    result = _call(
+        "build_remote_launch_cmd /repo afk 'claude --dangerously-skip-permissions \"/afk drain\"'"
+    )
 
-    assert 'caffeinate -s claude --model opus "/afk drain"' in result.stdout
+    assert 'caffeinate -s claude --dangerously-skip-permissions "/afk drain"' in result.stdout
 
 
 def test_remote_reattach_cmd() -> None:
@@ -664,8 +666,11 @@ def test_remote_launch_invokes_ssh_and_prints_reattach(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     log = (tmp_path / "ssh.log").read_text()
     assert "mac-home" in log  # launched on the host
-    assert "/afk drain" in log
+    assert "caffeinate -s" in log  # kept awake for the drain
     assert "tmux new -d -s" in log
+    # The default launched command runs the supervisor SCRIPT directly (self-driving,
+    # unattended) — NOT an interactive `claude "/afk drain"` that would stall on a prompt.
+    assert "hub-afk.sh drain" in log
     assert "has-session" in log  # confirmed the session is up
     assert "ssh mac-home -t 'tmux attach -t afk'" in result.stdout  # reattach hint
 

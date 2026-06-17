@@ -36,7 +36,7 @@
 #   WT_NEW / WT_LAND / SPOKE_READY / BATCH_PLAN   override the resolved sibling scripts
 #   AFK_WT_LIB                   override the sourced worktree-lib.sh
 #   CLAUDE_PROJECTS_DIR          transcript root (default: $HOME/.claude/projects)
-#   AFK_REMOTE_HOST / AFK_REMOTE_REPO / AFK_REMOTE_SESSION / AFK_REMOTE_CLAUDE
+#   AFK_REMOTE_HOST / AFK_REMOTE_REPO / AFK_REMOTE_SESSION / AFK_REMOTE_DRAIN_CMD
 #                                --remote target config (or a sourced AFK_REMOTE_CONF file)
 #
 # Usage:
@@ -673,16 +673,24 @@ afk_done() {
 }
 
 # --- remote launch (--remote) -------------------------------------------------
-# Launch a detached, caffeinate-wrapped `/afk drain` on a configured always-on Mac over
-# SSH (issue #73). The home Mac runs the drain unattended on the SAME Claude subscription;
-# this is the cross-network trigger (a Tailscale hostname reachable from any network). The
-# host is configured by env or a sourced conf file:
-#   AFK_REMOTE_HOST     the always-on Mac's (Tailscale) hostname            [required]
-#   AFK_REMOTE_REPO     the repo path on that host                          [required]
-#   AFK_REMOTE_SESSION  the detached tmux session name              [default: afk]
-#   AFK_REMOTE_CLAUDE   the claude invocation on the host (may carry flags) [default: claude]
-#   AFK_REMOTE_CONF     a shell snippet sourced for the above defaults [default: ~/.afk-remote]
-#   AFK_SSH             the ssh binary (override for tests)          [default: ssh]
+# Launch a detached, caffeinate-wrapped backlog drain on a configured always-on Mac over
+# SSH (issue #73). The home Mac runs the drain unattended on the SAME Claude subscription
+# (its spokes and answerers read ~/.claude); this is the cross-network trigger (a Tailscale
+# hostname reachable from any network). Configured by env or a sourced conf file:
+#   AFK_REMOTE_HOST      the always-on Mac's (Tailscale) hostname             [required]
+#   AFK_REMOTE_REPO      the repo path on that host                           [required]
+#   AFK_REMOTE_SESSION   the detached tmux session name               [default: afk]
+#   AFK_REMOTE_DRAIN_CMD the command run under caffeinate on the host  [default: the
+#                        supervisor script itself — see AFK_REMOTE_DEFAULT_DRAIN]
+#   AFK_REMOTE_CONF      a shell snippet sourced for the above defaults [default: ~/.afk-remote]
+#   AFK_SSH              the ssh binary (override for tests)           [default: ssh]
+#
+# The default launched command runs THIS supervisor script directly (hub-afk.sh drain) —
+# NOT `claude "/afk drain"`. A bare `claude <prompt>` opens an interactive session and
+# would stall unattended on a permission prompt before arming the supervisor; running the
+# script is exactly what the /afk skill does locally, and it self-drives to backlog-empty.
+# Override AFK_REMOTE_DRAIN_CMD (e.g. for a synced target's .ai-toolkit/ path) as needed.
+AFK_REMOTE_DEFAULT_DRAIN="bash shared/skills/hub/scripts/hub-afk.sh drain"
 
 # _load_remote_conf -> source the optional conf file for AFK_REMOTE_* defaults, with an
 # explicit env value WINNING over the file (save env, source, restore the saved values).
@@ -690,28 +698,28 @@ _load_remote_conf() {
   local conf="${AFK_REMOTE_CONF:-$HOME/.afk-remote}"
   [ -f "$conf" ] || return 0
   local s_host="${AFK_REMOTE_HOST:-}" s_repo="${AFK_REMOTE_REPO:-}" \
-        s_session="${AFK_REMOTE_SESSION:-}" s_claude="${AFK_REMOTE_CLAUDE:-}"
+        s_session="${AFK_REMOTE_SESSION:-}" s_drain="${AFK_REMOTE_DRAIN_CMD:-}"
   # shellcheck disable=SC1090
   . "$conf" 2>/dev/null || true
   [ -n "$s_host" ] && AFK_REMOTE_HOST="$s_host"
   [ -n "$s_repo" ] && AFK_REMOTE_REPO="$s_repo"
   [ -n "$s_session" ] && AFK_REMOTE_SESSION="$s_session"
-  [ -n "$s_claude" ] && AFK_REMOTE_CLAUDE="$s_claude"
+  [ -n "$s_drain" ] && AFK_REMOTE_DRAIN_CMD="$s_drain"
   return 0
 }
 
-# build_remote_launch_cmd <repo> <session> <claude> -> the command run ON the remote host:
-# cd into the repo and start a DETACHED tmux session that runs `/afk drain` under
-# `caffeinate -s` (keep the Mac awake for the whole drain). repo + session are single-
-# quoted; <claude> is left unquoted so AFK_REMOTE_CLAUDE can carry flags.
+# build_remote_launch_cmd <repo> <session> <drain> -> the command run ON the remote host:
+# cd into the repo and start a DETACHED tmux session that runs <drain> under `caffeinate -s`
+# (keep the Mac awake for the whole drain). repo + session are single-quoted; <drain> is
+# left unquoted so it can carry its own args/flags.
 build_remote_launch_cmd() {
-  local repo="$1" session="$2" claude="$3"
-  printf "cd '%s' && tmux new -d -s '%s' 'caffeinate -s %s \"/afk drain\"'\n" \
-    "$repo" "$session" "$claude"
+  local repo="$1" session="$2" drain="$3"
+  printf "cd '%s' && tmux new -d -s '%s' 'caffeinate -s %s'\n" \
+    "$repo" "$session" "$drain"
 }
 
 # remote_reattach_cmd <host> <session> -> the one-liner the user runs to attach to the
-# unattended session (printed after a successful launch).
+# unattended session (printed after a successful launch). -t forces the tty an attach needs.
 remote_reattach_cmd() {
   printf "ssh %s -t 'tmux attach -t %s'\n" "$1" "$2"
 }
@@ -722,7 +730,7 @@ remote_reattach_cmd() {
 remote_launch() {
   _load_remote_conf
   local host="${AFK_REMOTE_HOST:-}" repo="${AFK_REMOTE_REPO:-}" \
-        session="${AFK_REMOTE_SESSION:-afk}" claude="${AFK_REMOTE_CLAUDE:-claude}" \
+        session="${AFK_REMOTE_SESSION:-afk}" drain="${AFK_REMOTE_DRAIN_CMD:-$AFK_REMOTE_DEFAULT_DRAIN}" \
         ssh="${AFK_SSH:-ssh}" remote_cmd
   if [ -z "$host" ]; then
     log "/afk --remote: set AFK_REMOTE_HOST (the always-on Mac's Tailscale hostname) — see docs/remote-afk.md"
@@ -732,9 +740,11 @@ remote_launch() {
     log "/afk --remote: set AFK_REMOTE_REPO (the repo path on $host) — see docs/remote-afk.md"
     return 2
   fi
-  remote_cmd="$(build_remote_launch_cmd "$repo" "$session" "$claude")"
-  log "→ launching unattended /afk drain on $host (tmux session '$session')"
-  if ! "$ssh" "$host" -t "$remote_cmd"; then
+  remote_cmd="$(build_remote_launch_cmd "$repo" "$session" "$drain")"
+  log "→ launching unattended drain on $host (tmux session '$session')"
+  # No -t here: tmux new -d detaches, so forcing a tty only triggers ssh's
+  # "Pseudo-terminal will not be allocated" warning when the trigger has no tty (cron).
+  if ! "$ssh" "$host" "$remote_cmd"; then
     log "/afk --remote: ssh launch failed — is $host reachable (Tailscale up)?"
     return 1
   fi
@@ -760,13 +770,16 @@ _status() {
 }
 
 main() {
+  # --remote triggers a drain on a DIFFERENT machine and operates only on the remote repo,
+  # so it needs no local checkout — handle it before the git-repo guard.
+  if [ "${1:-}" = "--remote" ]; then remote_launch; return $?; fi
+
   MAIN_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { log "not inside a git repository"; return 1; }
 
   # Subcommands that do not start the LOCAL loop.
   case "${1:-}" in
     --status) _status; return 0 ;;
     --off)    afk_clear_state; echo "/afk: off (state cleared; the supervisor stops on its next tick)"; return 0 ;;
-    --remote) remote_launch; return $? ;;
     -h|--help) sed -n '2,53p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
   esac
 
