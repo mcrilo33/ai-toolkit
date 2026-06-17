@@ -88,6 +88,11 @@ planning-hub:
   description: "Role of a main-checkout session in the parallel-worktrees workflow — hub stays on main, dispatches spokes via start-task, merges and tears down, never writes task code. Surfaced on demand for hub sessions (via the hub skill), not auto-applied to every session."
   alwaysApply: false
 
+issue-hygiene:
+  name: "Issue Hygiene"
+  description: "What a dispatchable issue must contain so the /afk scheduler can batch and order it — a mandatory Scope: line of touched files/globs (missing or '*' means exclusive), with genuine ordering expressed as native GitHub blocked-by dependencies rather than file overlap. Surfaced on demand when authoring issues, not auto-applied to every session."
+  alwaysApply: false
+
 library-research:
   name: "Library Research"
   description: "Library documentation research using Context7 — resolve, fetch, and answer from current docs for any language"

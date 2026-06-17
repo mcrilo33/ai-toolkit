@@ -2,6 +2,10 @@
 
 Copy and customize these templates for issue bodies.
 
+Every dispatchable issue ends with a **`Scope:`** line — a space- or comma-separated list
+of the files/globs it will touch — so the planner can batch it (see the `issue-hygiene`
+rule). A missing line or `Scope: *` marks the issue exclusive (runs alone, the slow path).
+
 ## Bug Report Template
 
 ```markdown
@@ -29,6 +33,8 @@ Copy and customize these templates for issue bodies.
 
 ## Additional Context
 [Any other relevant information]
+
+Scope: [files/globs this fix touches; '*' or omitted ⇒ exclusive]
 ```
 
 ## Feature Request Template
@@ -53,6 +59,8 @@ Copy and customize these templates for issue bodies.
 
 ## Additional Context
 [Mockups, examples, or related issues]
+
+Scope: [files/globs this feature touches; '*' or omitted ⇒ exclusive]
 ```
 
 ## Task Template
@@ -70,10 +78,12 @@ Copy and customize these templates for issue bodies.
 - [ ] [Subtask 3]
 
 ## Dependencies
-[Any blockers or related work]
+[Any blockers or related work — set genuine ordering as native blocked-by, not file overlap]
 
 ## Notes
 [Additional context or considerations]
+
+Scope: [files/globs this task touches; '*' or omitted ⇒ exclusive]
 ```
 
 ## Minimal Template
@@ -87,4 +97,6 @@ For simple issues:
 ## Tasks
 - [ ] [Task 1]
 - [ ] [Task 2]
+
+Scope: [files/globs this issue touches; '*' or omitted ⇒ exclusive]
 ```
