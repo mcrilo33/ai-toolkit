@@ -54,10 +54,10 @@ usage() {
 # KIND selects the marker namespace and SUBJECT is the annotated tag's subject
 # line (the state word). ready/<N> means the whole issue is done; gate/<N> is the
 # non-terminal PLAN park (subject "plan"); accept/<N> and blocked/<N> are the two
-# extra TERMINAL markers night mode adds (issue #40) — accept = built + pushed +
-# agent-reviewed, final sign-off inherently human; blocked = stuck. A -m <reason>
-# becomes the tag BODY (the trust summary / blocker the morning report renders);
-# omitted, the body is empty and the subject is the only payload.
+# extra TERMINAL markers an unattended drain (`/afk`) emits — accept = built +
+# pushed + agent-reviewed, final sign-off inherently human; blocked = stuck. A
+# -m <reason> becomes the tag BODY (the trust summary / blocker the dashboard
+# renders); omitted, the body is empty and the subject is the only payload.
 #
 # The state flags are mutually exclusive: passing two is a usage error.
 KIND="ready"

@@ -95,29 +95,29 @@ push, which the pre-push gate short-circuits (a marker carries no code), so emit
 it never runs the suite. To re-emit or move the gate, just **re-run the script** — it
 is idempotent — never a manual re-push of the refspec.
 
-### Gate action — who services a parked gate (day vs night)
+### Gate action — who services a parked gate (attended vs unattended)
 
 The gate spectrum above says *which* gates a task has; the **gate action** is the
 orthogonal second dimension — *who* services a gate when the spoke reaches it. It
 is one of `{ human-pause | agent-review | none }` and is derived from the **mode**
 the spoke runs in, **not** declared per task (the `Gate:` line is mode-agnostic):
 
-- **Day mode** — every declared gate resolves as **human-pause**: the spoke parks
-  (`gate/<issue>`) and waits for a person. This is the default behavior described
-  above and is unchanged.
-- **Night mode** (the unattended overnight dispatcher, `hub-night.sh`) — the
-  *judgment* gates resolve as **agent-review**, and the inherently-human ones
-  resolve as `none` → **always park**. Uncertainty routes to **park**, never to
-  "ask" (which hangs the slot until morning) or "guess".
+- **Attended mode** — every declared gate resolves as **human-pause**: the spoke
+  parks (`gate/<issue>`) and waits for a person. This is the default behavior
+  described above and is unchanged.
+- **Unattended mode** (the `/afk` supervisor, `hub-afk.sh`) — the *judgment* gates
+  resolve as **agent-review**, and the inherently-human ones resolve as `none` →
+  **always park**. Uncertainty routes to **park**, never to "ask" (which hangs the
+  slot) or "guess".
 - **none** — a very-clear / trivial task has no gate, in either mode.
 
-In night mode each judgment gate is serviced by an **independent adversarial**
+In unattended mode each judgment gate is serviced by an **independent adversarial**
 reviewer — a fresh `code-review` subagent (pinned to Opus), never the implementer
 grading itself, **prompted to refute** the work and to approve only on strong
 evidence. The revise loop is bounded: at most **two rounds** of revision, then the
 spoke **parks** rather than looping forever (the doom-loop guard).
 
-| Declared gate | Night action | On exhaustion |
+| Declared gate | Unattended action | On exhaustion |
 |---------------|--------------|---------------|
 | PLAN | agent-review: is the plan correct, complete, in-scope? | park → `blocked/<issue>` |
 | RED | agent-review: do the tests encode the criteria and fail for the right reason? | park → `blocked/<issue>` |
@@ -132,21 +132,21 @@ assertions, no test marked `skip`/`xfail`.
 signed artifact to, so "an independent adversarial review happened" is
 **policy** (behavioral), not a daemon-enforced gate — an unattended spoke *can*
 narrate a review it never ran. The mechanical backstops that do not depend on the
-model's honesty are the **anti-gutting** pre-push tripwire (it fails the push
-under `NIGHT=1` on a test-gutting diff) and **test-select** (the suite must still
+model's honesty are the **anti-gutting** pre-push tripwire (it flags test-gutting
+signatures in the pushed diff — advisory) and **test-select** (the suite must still
 pass). The dashboard's rubber-stamp/redirect rate is the empirical check over
 time. The docs do not overclaim the agent review as enforced.
 
-Night mode ends a spoke with one of **three terminal markers**, each of which
+Unattended mode ends a spoke with one of **three terminal markers**, each of which
 **frees a supervisor slot**:
 
 - `ready/<issue>` — all gates auto-passed and the work is machine-verifiable
   (tests green) → the hub rubber-stamps `/land`.
 - `accept/<issue>` — built, pushed and agent-reviewed, but the final sign-off is
-  inherently human → the morning EYEBALL tier.
+  inherently human → surfaced on the dashboard for a human glance.
 - `blocked/<issue>` — stuck (ambiguity the spoke can't resolve, a reviewer that
   refused after two rounds, a suspected test-gutting, or a budget/time ceiling) →
-  the morning THINK tier: answer and re-queue.
+  surfaced on the dashboard: answer and re-queue.
 
 Emit them through the one allowlistable marker process — `accept`/`blocked` mirror
 the `gate`/`ready` flags:

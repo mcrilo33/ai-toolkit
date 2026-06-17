@@ -61,9 +61,8 @@ wt_now_ms() {
 
 # --- portable date/time -------------------------------------------------------
 # BSD (macOS) and GNU date differ; try the BSD form first, fall back to GNU.
-# Lifted here from the night dispatcher so the unattended supervisor (hub-afk.sh)
-# and any future caller share one copy and the night helpers can be retired
-# without dragging a private date layer along with them.
+# Kept here so the unattended supervisor (hub-afk.sh) and any future caller share
+# one copy of the date/time helpers.
 
 # wt_date_ymd <epoch> -> YYYY-MM-DD (local time).
 wt_date_ymd() {

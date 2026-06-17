@@ -166,10 +166,10 @@ def test_start_task_kickoff_parks_at_the_plan_gate_git_native() -> None:
 
 # ── Subtask: the gate-ACTION enum {human-pause | agent-review | none} (#40 ST4) ─
 # A second dimension layered onto the gate spectrum: WHO services a parked gate.
-# It is derived from MODE, not declared per task — day mode pauses for a human,
-# night mode routes judgment gates to an independent adversarial reviewer and
-# escalates to PARK. Shared with #34 as documented convention (substring-guarded),
-# not a typed contract.
+# It is derived from MODE, not declared per task — attended mode pauses for a human,
+# unattended mode (`/afk`) routes judgment gates to an independent adversarial
+# reviewer and escalates to PARK. Shared with #34 as documented convention
+# (substring-guarded), not a typed contract.
 
 
 def test_solo_cycle_documents_gate_action_enum() -> None:
@@ -181,16 +181,16 @@ def test_solo_cycle_documents_gate_action_enum() -> None:
 
 def test_solo_cycle_gate_action_is_mode_derived() -> None:
     flat = _flat(SOLO_CYCLE)
-    # Day mode = human-pause (today's behavior); night mode = agent-review.
-    assert "day" in flat and "human-pause" in flat
-    assert "night" in flat and "agent-review" in flat
+    # Attended mode = human-pause (today's behavior); unattended mode = agent-review.
+    assert "attended" in flat and "human-pause" in flat
+    assert "unattended" in flat and "agent-review" in flat
     assert "mode" in flat, "the action is derived from mode, not declared per task"
 
 
-def test_solo_cycle_night_reviewer_is_independent_adversarial_bounded() -> None:
+def test_solo_cycle_unattended_reviewer_is_independent_adversarial_bounded() -> None:
     flat = _flat(SOLO_CYCLE)
     assert "independent" in flat and "adversarial" in flat
-    assert "refute" in flat, "the night reviewer is prompted to refute, not rubber-stamp"
+    assert "refute" in flat, "the unattended reviewer is prompted to refute, not rubber-stamp"
     assert "two round" in flat or "2-round" in flat or "two-round" in flat, (
         "the revise loop is bounded to two rounds"
     )
