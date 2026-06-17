@@ -40,6 +40,11 @@ for _c in "$_SP_DIR/telemetry.sh" "$_SP_DIR/../shared/hooks/lib/telemetry.sh"; d
 done
 unset _c
 _SP_T0="$(command -v _telemetry_now_ms >/dev/null 2>&1 && _telemetry_now_ms || true)"
+# Mint this script's OWN span id up front (Issue #66 — script causality). spoke-push
+# shells out to spoke-ready, so it exports this id as the child's
+# AI_TOOLKIT_PARENT_SPAN to nest the marker emission under this push, and emits its
+# own span with the same id. Empty when the emit layer is absent (telemetry off).
+_SP_SPAN_ID="$(command -v _telemetry_span_id >/dev/null 2>&1 && _telemetry_span_id || true)"
 
 usage() {
   echo "usage: spoke-push.sh [--ready <issue>]" >&2
@@ -78,9 +83,14 @@ else
   echo "→ no .review/*.json artifact found (the pre-push gate blocks if one is required)"
 fi
 
-# The push — pre-push gate hooks fire here. No --no-verify, ever.
+# The push — pre-push gate hooks fire here. No --no-verify, ever. Run it with this
+# push's own span id as AI_TOOLKIT_PARENT_SPAN (Issue #66, leading assignment —
+# scoped to the git process, safe inside a script) so the native gate hooks
+# (test-select, red-proof-warn, …) the push triggers nest under spoke-push rather
+# than the Bash tool call. Empty span id (telemetry off) is harmless — it resolves
+# to the file/spoke-root fallback exactly as an unset var would.
 echo "→ git push -u origin $BRANCH"
-git push -u origin "$BRANCH"
+AI_TOOLKIT_PARENT_SPAN="$_SP_SPAN_ID" git push -u origin "$BRANCH"
 
 # Final subtask: emit the ready/<issue> completion marker via the canonical
 # marker emitter (issue #45) — one annotated, force-moved (idempotent) tag pushed
@@ -90,7 +100,10 @@ git push -u origin "$BRANCH"
 # on /land; a mid-cycle push passes no --ready and so emits nothing.
 if [ -n "$READY" ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  bash "$SCRIPT_DIR/spoke-ready.sh" "$READY"
+  # Run spoke-ready with THIS push's span id as its parent (Issue #66) so the
+  # marker-emission span nests under this push, not our own parent (the Bash tool
+  # call). Leading assignment scopes it to the child; empty is harmless (fallback).
+  AI_TOOLKIT_PARENT_SPAN="$_SP_SPAN_ID" bash "$SCRIPT_DIR/spoke-ready.sh" "$READY"
 fi
 
 echo "✓ spoke-push complete: pushed $BRANCH${READY:+ + marker ready/$READY}"
@@ -102,5 +115,5 @@ echo "✓ spoke-push complete: pushed $BRANCH${READY:+ + marker ready/$READY}"
 #   above — once failed-push visibility is wanted in the trace.
 if command -v telemetry_emit_span >/dev/null 2>&1; then
   telemetry_emit_span --kind script --name spoke-push \
-    --status success --start-ms "$_SP_T0"
+    --span-id "$_SP_SPAN_ID" --status success --start-ms "$_SP_T0"
 fi

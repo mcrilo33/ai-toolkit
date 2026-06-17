@@ -116,6 +116,17 @@ _telemetry_spoke_run_id() {
   head -n1 "$f" 2>/dev/null | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
 
+# parent-span pointer: the tool_use_id of the Bash call currently running, written
+# to <root>/.ai-toolkit/parent-span by the parent-span-export PreToolUse hook
+# (Issue #66). A child script or native git-hook reads it to learn its causal
+# parent when no more specific id was exported into its env. Empty when absent.
+_telemetry_parent_span_file() {
+  local f="$1/.ai-toolkit/parent-span"
+  [ -f "$f" ] || return 0
+  # First line only; trim whitespace. The file holds a metadata id, no content.
+  head -n1 "$f" 2>/dev/null | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
 # workflow_rev: the ai-toolkit short SHA active at emit time (the A/B anchor).
 # Precedence: explicit override → synced-target manifest → ai-toolkit checkout
 # git SHA → VERSION file → empty. The manifest matters because a hook running
@@ -165,7 +176,13 @@ _telemetry_branch() {
 #   --status   success|failure|deny|warn|skipped (default: success)
 #   --start-ms epoch-ms when the span opened; ts_start + duration_ms derive from
 #              it. Omitted → ts_start = now, duration_ms = 0.
-#   --parent-id  nesting parent (default: $TELEMETRY_PARENT_ID, else null)
+#   --parent-id  nesting parent. Resolution order (Issue #66): this flag →
+#              $TELEMETRY_PARENT_ID (in-process override) → $AI_TOOLKIT_PARENT_SPAN
+#              (correlation id a parent shell exports for a child) →
+#              <root>/.ai-toolkit/parent-span (the Bash tool_use_id recorded by the
+#              parent-span-export hook) → the spoke root ($spoke_run_id, so an
+#              in-spoke span hangs off the spoke instead of orphaning) → null when
+#              outside a spoke.
 telemetry_emit_span() {
   [ "${AI_TOOLKIT_TELEMETRY:-}" = "1" ] || return 0
   local kind="" name="" phase="" status="success" start_ms="" span_id="" \
@@ -209,6 +226,20 @@ telemetry_emit_span() {
     session_id=$(_telemetry_session_id)
     spoke_run_id=$(_telemetry_spoke_run_id "$root")
     workflow_rev=$(_telemetry_workflow_rev "$root")
+
+    # parent_id (Issue #66 — script causality). Resolution order:
+    #   1. --parent-id flag / $TELEMETRY_PARENT_ID (set above) — explicit caller.
+    #   2. $AI_TOOLKIT_PARENT_SPAN — the cross-exec id a parent shell exports for a
+    #      child script (and that a native git-hook inherits from its git command).
+    #   3. <root>/.ai-toolkit/parent-span — the current Bash tool_use_id recorded by
+    #      the parent-span-export hook, for an agent-run script / native git-hook
+    #      whose env carries no id (the boundary a hook cannot reach via env).
+    #   4. the spoke root ($spoke_run_id) — so an in-spoke span hangs off the spoke
+    #      rather than orphaning at null. Outside a spoke this is empty, so parent_id
+    #      stays null — the pre-#66 contract.
+    [ -n "$parent_id" ] || parent_id="${AI_TOOLKIT_PARENT_SPAN:-}"
+    [ -n "$parent_id" ] || parent_id="$(_telemetry_parent_span_file "$root")"
+    [ -n "$parent_id" ] || parent_id="$spoke_run_id"
 
     if command -v jq >/dev/null 2>&1; then
       local human='null'
