@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -31,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from telemetry.causal import validate_causal_tree
 from telemetry.causal_tree import build_causal_forest
+from telemetry.spans import derive_span_id
 
 SID = "sess-x"
 
@@ -116,7 +118,7 @@ def _scenario() -> tuple[list[dict], list[dict], dict[str, str]]:
     return turns, spans, tool_parents
 
 
-def _by_id(forest: list[dict]) -> dict[str, dict]:
+def _by_id(forest: list[Any]) -> dict[str, dict]:
     index: dict[str, dict] = {}
 
     def walk(nodes: list[dict]) -> None:
@@ -132,7 +134,7 @@ def _child_kinds(node: dict) -> set[str]:
     return {c["kind"] for c in node["children"]}
 
 
-def _build() -> list[dict]:
+def _build() -> list[Any]:
     turns, spans, tool_parents = _scenario()
     return build_causal_forest(turns, spans, tool_parents)
 
@@ -171,9 +173,13 @@ class TestCausalForest:
         assert "s2" in {c["node_id"] for c in nodes["sp_ag2"]["children"]}
         assert "sp_grep" in {c["node_id"] for c in nodes["s2"]["children"]}
 
-    def test_script_at_spoke_root(self) -> None:
+    def test_parentless_script_buckets_into_its_interval(self) -> None:
+        # #76: a parentless script no longer dumps to the spoke root — it buckets into
+        # its covering phase interval (scr1 at 23:00:29 falls in the red step window).
         forest = _build()
-        assert "scr1" in {n["node_id"] for n in forest if n["kind"] == "script"}
+        assert "scr1" not in {n["node_id"] for n in forest}
+        red = next(iv for iv in forest if iv["kind"] == "interval" and iv["phase"] == "red")
+        assert "scr1" in {c["node_id"] for c in red["children"]}
 
     def test_cost_only_on_turn_and_agent_leaves(self) -> None:
         for node in _by_id(_build()).values():
@@ -225,3 +231,90 @@ class TestActor:
     def test_main_tool_actor_is_main(self) -> None:
         nodes = _by_id(_build())
         assert nodes["sp_read"]["actor"] == "main"
+
+
+# The human prompt record's uuid (a turn's ``parent_uuid`` points at this); the parser
+# derives the human span's id from it, so the builder reconnects turn → prompt by id.
+HREC = "hrec-uuid"
+
+
+def _trigger_scenario() -> tuple[list[dict], list[dict], dict[str, str]]:
+    """A human prompt triggers a turn, a continuation turn follows it (its parent is a
+    tool_result record, not the prompt), and a session-level hook + a ready script carry
+    no ``parent_id`` — the root-dump cases issue #76 must bucket into the phase interval."""
+    human_id = derive_span_id(SID, HREC)
+    turns = [
+        # t1.parent_uuid == the human record uuid ⇒ genuine trigger ⇒ nests under the prompt.
+        _turn("t1", HREC, source="main", agent_id=None, ts="2026-06-12T20:57:52Z", cost=0.10),
+        # t2.parent_uuid is a tool_result record (not in any map) ⇒ continuation ⇒ sibling.
+        _turn("t2", "tr1", source="main", agent_id=None, ts="2026-06-12T20:57:54Z", cost=0.20),
+    ]
+    spans = [
+        _span(
+            human_id,
+            "human",
+            "prompt",
+            ts="2026-06-12T20:57:50Z",
+            human={"type": "prompt", "wait_ms": None},
+        ),
+        _span("hk_sess", "hook", "todo-ledger-nudge", ts="2026-06-12T20:57:11Z"),
+        _span("scr_sess", "script", "spoke-ready", ts="2026-06-12T20:57:58Z"),
+        _span("st_spawn", "step", "solo-cycle", ts="2026-06-12T20:57:05Z", phase="spawn"),
+    ]
+    spans[-1]["ts_end"] = "2026-06-12T20:58:00Z"  # the interval closes after every span above
+    return turns, spans, {}
+
+
+def _build_trigger() -> list[Any]:
+    turns, spans, tool_parents = _trigger_scenario()
+    return build_causal_forest(turns, spans, tool_parents)
+
+
+class TestGenuineTriggerNesting:
+    def test_forest_conforms_to_contract(self) -> None:
+        validate_causal_tree(_build_trigger())
+
+    def test_human_prompt_nests_its_triggered_turn(self) -> None:
+        nodes = _by_id(_build_trigger())
+        human = nodes[derive_span_id(SID, HREC)]
+        assert "t1" in {c["node_id"] for c in human["children"]}
+
+    def test_continuation_turn_is_a_sibling_under_the_prompt(self) -> None:
+        nodes = _by_id(_build_trigger())
+        human = nodes[derive_span_id(SID, HREC)]
+        child_ids = [c["node_id"] for c in human["children"]]
+        assert "t2" in child_ids
+        # Time-ordered siblings, not one nested under the other.
+        assert child_ids.index("t1") < child_ids.index("t2")
+
+    def test_turn_loop_stays_flat(self) -> None:
+        nodes = _by_id(_build_trigger())
+        assert "turn" not in _child_kinds(nodes["t1"])
+
+    def test_parentless_human_buckets_into_interval_not_root(self) -> None:
+        forest = _build_trigger()
+        human_id = derive_span_id(SID, HREC)
+        assert human_id not in {n["node_id"] for n in forest}, "human dumped to root"
+        interval = next(n for n in forest if n["kind"] == "interval")
+        assert human_id in {c["node_id"] for c in interval["children"]}
+
+    def test_parentless_hook_buckets_into_interval_not_root(self) -> None:
+        forest = _build_trigger()
+        assert "hk_sess" not in {n["node_id"] for n in forest}, "hook dumped to root"
+        interval = next(n for n in forest if n["kind"] == "interval")
+        assert "hk_sess" in {c["node_id"] for c in interval["children"]}
+
+    def test_parentless_script_buckets_into_interval_not_root(self) -> None:
+        forest = _build_trigger()
+        assert "scr_sess" not in {n["node_id"] for n in forest}, "script dumped to root"
+        interval = next(n for n in forest if n["kind"] == "interval")
+        assert "scr_sess" in {c["node_id"] for c in interval["children"]}
+
+    def test_no_node_dumps_to_root(self) -> None:
+        # The whole point of #76: top-level holds only the phase spine, nothing orphaned.
+        forest = _build_trigger()
+        assert {n["kind"] for n in forest} == {"interval"}
+
+    def test_cost_conserved(self) -> None:
+        owned = sum(n["own_cost_usd"] for n in _by_id(_build_trigger()).values())
+        assert owned == pytest.approx(0.10 + 0.20)
