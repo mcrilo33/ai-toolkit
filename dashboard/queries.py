@@ -414,6 +414,26 @@ class SpanStore:
         return cls(con)
 
     @classmethod
+    def from_persisted_store(cls, store_path: str | Path) -> SpanStore:
+        """Read the persisted incremental store (Issue #62), scoped to its content.
+
+        Attaches the ``store.duckdb`` materialized by ``telemetry.store.ingest_store``
+        read-only and copies its relations into an in-memory connection — cheap,
+        because the parse already happened at ingest time, so no session log is read
+        here. The copy is then mutable, so :meth:`__init__`'s approval derivation runs
+        exactly as on every other path; every query method is unchanged. The store
+        holds only post-watermark spokes, by design (no historical backfill).
+        """
+        con = duckdb.connect(":memory:")
+        con.execute(f"ATTACH '{store_path}' AS store (READ_ONLY)")
+        # ``spoke_run_summary`` is a view in the store (its cost cross-checks ccusage);
+        # copying ``SELECT *`` materializes its current rows into the working copy.
+        for table in ("spans", "turns", "session_costs", "spoke_run_summary"):
+            con.execute(f"CREATE TABLE {table} AS SELECT * FROM store.{table}")
+        con.execute("DETACH store")
+        return cls(con)
+
+    @classmethod
     def from_telemetry(
         cls,
         *,

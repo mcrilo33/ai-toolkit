@@ -53,6 +53,13 @@ def resolve_span_log() -> Path:
     return directory / "events.jsonl"
 
 
+def resolve_store_path() -> Path:
+    """The persisted DuckDB store path (Issue #62), beside the span-log WAL."""
+    base = os.environ.get("AI_TOOLKIT_TELEMETRY_DIR")
+    directory = Path(base) if base else _DEFAULT_TELEMETRY_DIR
+    return directory / "store.duckdb"
+
+
 @st.cache_data(show_spinner=False)
 def _load_events(path: str, mtime: float) -> list[dict]:
     """Parse the span log. ``mtime`` is part of the cache key so a changed log
@@ -82,21 +89,39 @@ def _ccusage_costs() -> dict[str, float]:
         return {}
 
 
-@st.cache_resource(show_spinner=True)
-def load_correlated_store(span_log: str, projects_dir: str, mtime: float) -> queries.SpanStore:
-    """Build a store over Issue #22's correlated push+pull span dataset.
+@st.cache_resource(show_spinner=False)
+def _materialize_store(store_path: str, version: str) -> queries.SpanStore:
+    """Copy the persisted store into an in-memory read model (Issue #62).
 
-    ``mtime`` is part of the cache key (like :func:`_load_events`) so a changed
-    push log rebuilds the parsed store rather than serving the stale cached one; it
-    is intentionally unused in the body.
+    Cached on the store's content ``version`` so a Streamlit rerun reuses the model
+    and only a real delta rebuilds it; ``version`` keys the cache and is intentionally
+    unused in the body.
     """
-    _ = mtime
-    return queries.SpanStore.from_telemetry(
-        events_path=span_log,
-        projects_root=projects_dir,
+    _ = version
+    return queries.SpanStore.from_persisted_store(store_path)
+
+
+def load_correlated_store(
+    span_log: str, projects_dir: str, store_path: str
+) -> tuple[queries.SpanStore, str]:
+    """Delta-ingest the persisted store on open, then materialize the read model.
+
+    The ingest runs on every open but only parses new/changed *post-watermark*
+    sessions (the historical backlog is never read), so it is fast; it returns a
+    content version on which the in-memory read model is cached. The store is created
+    empty at a watermark on first run, so a cold open is ~instant and spokes appear as
+    they run — pre-watermark spokes are intentionally absent.
+    """
+    sys.path.insert(0, str(_scripts_dir()))
+    from telemetry.store import ingest_store
+
+    version = ingest_store(
+        store_path,
+        events_path=Path(span_log),
+        projects_root=Path(projects_dir),
         ccusage_costs=_ccusage_costs(),
-        scripts_dir=_scripts_dir(),
     )
+    return _materialize_store(store_path, version), version
 
 
 def _fmt_secs(ms: int | float | None) -> str:
@@ -597,21 +622,26 @@ def resolve_mode(correlated_requested: bool, projects_dir: Path) -> str:
 
 
 def _resolve_store(span_log: Path, log_mtime: float) -> tuple[queries.SpanStore | None, str]:
-    """Pick the span source from the sidebar and build the store, with its mode.
+    """Pick the span source from the sidebar and build the store, with its cache key.
 
     Correlation is on by default; when it's requested but the session-logs dir is
-    missing, the mode falls back to raw (with a note). Returns ``(store, mode)`` —
-    ``mode`` (``"correlated"`` / ``"raw"``) lets the caller key the per-spoke
-    forest cache so toggling correlation never serves the other store's tree. The
-    store is ``None`` only when the raw log is absent. ``log_mtime`` keys both store
-    caches so a changed log rebuilds the parsed data, not just the forest.
+    missing, the mode falls back to raw (with a note). Returns ``(store, source_key)``
+    — ``source_key`` keys the per-spoke forest cache so toggling correlation never
+    serves the other store's tree. In correlated mode it is ``correlated:<version>``
+    (the persisted store's content version, so a new spoke's delta rebuilds the
+    forest); in raw mode ``raw:<log_mtime>``. The store is ``None`` only when the raw
+    log is absent.
     """
     correlated = st.sidebar.toggle("Correlate via Issue #22 (session logs + ccusage)", value=True)
     projects_dir = resolve_projects_dir()
 
     if resolve_mode(correlated, projects_dir) == "correlated":
-        st.sidebar.caption(f"Push log:\n`{span_log}`\nSession logs:\n`{projects_dir}`")
-        return load_correlated_store(str(span_log), str(projects_dir), log_mtime), "correlated"
+        store_path = resolve_store_path()
+        st.sidebar.caption(
+            f"Push log:\n`{span_log}`\nSession logs:\n`{projects_dir}`\nStore:\n`{store_path}`"
+        )
+        store, version = load_correlated_store(str(span_log), str(projects_dir), str(store_path))
+        return store, f"correlated:{version}"
 
     if correlated:
         st.sidebar.info(
@@ -625,7 +655,7 @@ def _resolve_store(span_log: Path, log_mtime: float) -> tuple[queries.SpanStore 
             "to record spans, or point `AI_TOOLKIT_SPAN_LOG` at an existing log."
         )
         return None, "raw"
-    return load_store(span_log), "raw"
+    return load_store(span_log), f"raw:{log_mtime}"
 
 
 def render_morning_view(store: queries.SpanStore) -> None:
@@ -657,15 +687,12 @@ def main() -> None:
 
     st.sidebar.subheader("Span source")
     span_log = resolve_span_log()
-    # The log mtime keys both the store caches and the per-spoke forest cache, so a
-    # fresh log rebuilds the parsed data — not just the tree.
+    # The log mtime keys the raw store + forest cache; the correlated source_key is the
+    # persisted store's content version, so a new spoke's delta rebuilds the tree.
     log_mtime = span_log.stat().st_mtime if span_log.exists() else 0.0
-    store, mode = _resolve_store(span_log, log_mtime)
+    store, source_key = _resolve_store(span_log, log_mtime)
     if store is None:
         return
-
-    # The forest cache key tracks the data source: mode (correlated/raw) + log mtime.
-    source_key = f"{mode}:{log_mtime}"
 
     view = st.sidebar.radio(
         "View", ["Spoke", "Morning", "Aggregate", "A/B compare", "Automatability"]
