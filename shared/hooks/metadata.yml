@@ -300,3 +300,20 @@ spoke-main-guard:
   cursor:
     event: beforeShellExecution
     matcher: "git( +-[cC] +[^ ]+| +-[^ ]+)* +(checkout|switch|merge|branch|reset|update-ref|push)( |$)|worktree-land[.]sh"
+
+# parent-span-export (issue #66): telemetry Phase 2 — script causality. On every
+# Bash call, record the tool_use_id to <root>/.ai-toolkit/parent-span; telemetry.sh
+# reads it (after $AI_TOOLKIT_PARENT_SPAN, before the spoke root) so agent-run
+# scripts and the native git-hooks they trigger emit spans with the causal
+# parent_id. It does NOT rewrite the command — prepending a `VAR=value` assignment
+# would break the exact-match Bash allowlist (env-assignment prefixes are not
+# stripped before matching — anthropics/claude-code#15292), re-prompting every
+# allowlisted spoke command. NO `if` — it must see every Bash command (it self-
+# skips when telemetry is off, jq is absent, or there is no clean tool_use_id, and
+# writes nothing to stdout so it composes with the scope-guard hooks). No Cursor/
+# Copilot remap: the tool_use_id lives in the Claude payload; elsewhere it no-ops.
+parent-span-export:
+  event: preToolUse
+  matcher: Bash
+  description: "Record the Bash tool_use_id to .ai-toolkit/parent-span so scripts and native git-hooks emit telemetry spans with the causal parent_id; no command rewrite; no-op when telemetry is off"
+  tier: 2
