@@ -84,6 +84,12 @@ def build_causal_forest(
         parent = nodes.get(agent_by_link.get(agent_id or "") or "")
         if parent is not None:
             node["actor"] = parent["name"]
+            # The agent leaf carried the subagent transcript's pooled cost; now that its
+            # per-sub-turn rows nest under it (each owning its slice), drop the pool so
+            # Σ owned == Σ turns. An agent with no sub-turns parsed keeps it as a leaf.
+            parent["own_cost_usd"] = 0.0
+            parent["own_tokens_in"] = 0
+            parent["own_tokens_out"] = 0
         _attach(parent, node, roots)
     for span in actions:
         node = nodes[span["span_id"]]
