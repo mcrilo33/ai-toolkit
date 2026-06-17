@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -491,6 +492,13 @@ def _spoke_forest(store: queries.SpanStore, spoke_id: str, source_key: str) -> l
     """
     key = (spoke_id, source_key)
     if key not in _FOREST_CACHE:
+        # Live-follow folds the transcript mtime into ``source_key``, so a growing spoke
+        # would otherwise leave one entry per refresh. The UI only ever requests the
+        # current build, so a fresh build supersedes any prior same-spoke entry — evict
+        # them to keep the cache bounded (#67). A static (same-key) refresh hits the
+        # branch below and reuses the cached object by reference, so a drill never rebuilds.
+        for stale in [cached for cached in _FOREST_CACHE if cached[0] == spoke_id]:
+            del _FOREST_CACHE[stale]
         _FOREST_CACHE[key] = _build_spoke_forest(store, spoke_id)
     return _FOREST_CACHE[key]
 
@@ -513,6 +521,67 @@ def _build_spoke_forest(store: queries.SpanStore, spoke_id: str) -> list[dict]:
     return store.spoke_steps(spoke_id)
 
 
+# Live-follow (Issue #67). A spoke whose transcript changed within this window is taken
+# to be still running, so the view offers to auto-refresh the causal tree as the
+# transcript grows — no live-emission hook, no daemon, just a re-read of the file.
+_LIVE_WINDOW_SECS = 120.0
+_LIVE_REFRESH = "8s"  # auto-refresh cadence for a followed spoke (the spec's ~5–10s)
+
+
+def _spoke_is_running(
+    transcript_mtime: float, now: float, window: float = _LIVE_WINDOW_SECS
+) -> bool:
+    """True when the spoke's transcript was written within ``window`` seconds of ``now``.
+
+    The hook-free / daemon-free live signal: recent transcript writes mean the spoke is
+    still producing turns, so the view can auto-refresh to follow it. A ``0.0`` mtime (no
+    transcript on disk — a push-only or fixture spoke) is never running.
+    """
+    return transcript_mtime > 0.0 and (now - transcript_mtime) <= window
+
+
+def _forest_cache_key(source_key: str, live_mtime: float) -> str:
+    """The per-spoke forest cache key: the data source plus the transcript mtime.
+
+    Folding the transcript mtime in means a grown transcript (mtime advanced) rebuilds the
+    cached tree on the next refresh, while a static transcript — an expand/collapse toggle
+    with no new turns — reuses it instantly, so a drill never triggers a rebuild (#67).
+    """
+    return f"{source_key}@{live_mtime}"
+
+
+def _spoke_live_mtime(store: queries.SpanStore, spoke_id: str, projects_dir: Path) -> float:
+    """The spoke's newest transcript mtime, or ``0.0`` when unavailable.
+
+    Guards the live signal: a raw push-only store has no transcript method and a missing
+    session-logs dir has nothing to stat, so both read as 'not running'.
+    """
+    read = getattr(store, "spoke_transcript_mtime", None)
+    if read is None or not projects_dir.exists():
+        return 0.0
+    return read(spoke_id, projects_dir)
+
+
+def _render_steps_body(
+    store: queries.SpanStore, spoke_id: str, projects_dir: Path, source_key: str
+) -> None:
+    """Render the Steps tab: header row + the L1 trace spine, or an empty-state note.
+
+    Re-reads the spoke's transcript mtime so a live refresh rebuilds the tree only on real
+    growth (a new mtime → new cache key); a static transcript reuses the cached forest, so
+    an expand/collapse toggle re-renders the same objects without a rebuild (#67).
+    """
+    mtime = _spoke_live_mtime(store, spoke_id, projects_dir)
+    forest = _spoke_forest(store, spoke_id, _forest_cache_key(source_key, mtime))
+    if not forest:
+        st.info("No spans for this spoke run.")
+        return
+    head = st.columns(_STEP_COLS)
+    for col, name in zip(head, _STEP_HEADERS, strict=True):
+        col.markdown(f"**{name}**")
+    _render_spine(forest)
+
+
 def render_spoke_view(store: queries.SpanStore, source_key: str = "") -> None:
     st.header("Spoke view")
     st.caption(
@@ -526,17 +595,32 @@ def render_spoke_view(store: queries.SpanStore, source_key: str = "") -> None:
         return
 
     spoke_id = st.selectbox("Spoke run", spoke_ids, format_func=queries.format_spoke_label)
-    forest = _spoke_forest(store, spoke_id, source_key)
+    projects_dir = resolve_projects_dir()
+    live_mtime = _spoke_live_mtime(store, spoke_id, projects_dir)
+
+    follow = False
+    if _spoke_is_running(live_mtime, time.time()):
+        follow = st.toggle(
+            f"🔴 Follow live (auto-refresh ~{_LIVE_REFRESH})",
+            value=False,
+            key=f"live_follow::{spoke_id}",
+        )
+
+    # The shared build for the non-live tabs; keyed on the same mtime, so the Steps tab's
+    # re-read returns this exact cached forest when the transcript has not grown.
+    forest = _spoke_forest(store, spoke_id, _forest_cache_key(source_key, live_mtime))
     steps_tab, meta_tab, comp_tab = st.tabs(["Steps", "Meta by kind", "Composition"])
 
     with steps_tab:
-        if not forest:
-            st.info("No spans for this spoke run.")
+        # Only the selected running spoke auto-refreshes, and only its Steps tab — the
+        # st.fragment re-runs just this body on the interval, leaving the rest static.
+        def _steps() -> None:
+            _render_steps_body(store, spoke_id, projects_dir, source_key)
+
+        if follow:
+            st.fragment(run_every=_LIVE_REFRESH)(_steps)()
         else:
-            head = st.columns(_STEP_COLS)
-            for col, name in zip(head, _STEP_HEADERS, strict=True):
-                col.markdown(f"**{name}**")
-            _render_spine(forest)
+            _steps()
 
     with meta_tab:
         _render_meta(store, spoke_id)

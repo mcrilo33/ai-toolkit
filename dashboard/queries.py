@@ -365,6 +365,24 @@ def _parse_spoke_sessions(projects_dir: Path, session_ids: list[str]) -> ParsedS
     return merged
 
 
+def _latest_transcript_mtime(projects_dir: Path, session_ids: list[str]) -> float:
+    """The newest mtime across the given sessions' transcripts under ``projects_dir``.
+
+    Walks each session's ``<slug>/<session>.jsonl`` plus its ``<session>/subagents``
+    subtree (sub-agent turns grow there during a Workflow), so a write anywhere in the
+    spoke's live transcript advances the signal. Returns ``0.0`` when nothing is on disk.
+    """
+    latest = 0.0
+    for session_id in session_ids:
+        for path in sorted(Path(projects_dir).glob(f"*/{session_id}.jsonl")):
+            latest = max(latest, path.stat().st_mtime)
+            subagents = path.parent / path.stem / "subagents"
+            if subagents.is_dir():
+                for agent_file in subagents.rglob("*.jsonl"):
+                    latest = max(latest, agent_file.stat().st_mtime)
+    return latest
+
+
 def _sql_in_list(kinds: tuple[str, ...]) -> str:
     """Render a fixed tuple of kind literals as a SQL ``IN`` list.
 
@@ -696,12 +714,7 @@ class SpanStore:
 
         Returns the causal forest (empty when the spoke has no parseable transcript).
         """
-        rows = self._query(
-            "SELECT DISTINCT session_id FROM spans "
-            "WHERE spoke_run_id = ? AND session_id IS NOT NULL",
-            [spoke_run_id],
-        )
-        session_ids = sorted(row["session_id"] for row in rows)
+        session_ids = self._spoke_session_ids(spoke_run_id)
         if not session_ids:
             return []
         parsed = _parse_spoke_sessions(projects_dir, session_ids)
@@ -717,6 +730,30 @@ class SpanStore:
         for root in forest:
             _roll_up_steps(root)
         return forest
+
+    def _spoke_session_ids(self, spoke_run_id: str) -> list[str]:
+        """The sorted session ids attributed to a spoke by its push spans."""
+        rows = self._query(
+            "SELECT DISTINCT session_id FROM spans "
+            "WHERE spoke_run_id = ? AND session_id IS NOT NULL",
+            [spoke_run_id],
+        )
+        return sorted(row["session_id"] for row in rows)
+
+    def spoke_transcript_mtime(self, spoke_run_id: str, projects_dir: Path) -> float:
+        """The newest mtime across ONLY this spoke's own session transcripts (Issue #67).
+
+        The live-follow "still running" signal: a spoke whose transcript was written
+        recently is still producing turns, so the view can auto-refresh to follow it as
+        the transcript grows — with no live-emission hook and no daemon. Resolves the
+        spoke's sessions from its push spans (the same per-spoke locality as
+        :meth:`spoke_causal_forest`) and reads only those files; ``0.0`` when the spoke
+        has no session or no transcript on disk (a push-only or fixture spoke).
+        """
+        session_ids = self._spoke_session_ids(spoke_run_id)
+        if not session_ids:
+            return 0.0
+        return _latest_transcript_mtime(projects_dir, session_ids)
 
     def spoke_meta_by_kind(self, spoke_run_id: str) -> list[dict[str, Any]]:
         """Aggregate one spoke's spans by ``kind`` to spot "launched too much".
