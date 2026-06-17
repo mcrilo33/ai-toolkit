@@ -34,6 +34,8 @@ PORT_MAX="${AI_TOOLKIT_DASHBOARD_PORT_MAX:-8699}"
 if [ -n "${STREAMLIT_SERVER_PORT:-}" ]; then
   PORT="$STREAMLIT_SERVER_PORT"
 else
+  # A free port is bound then immediately closed before handing it to streamlit,
+  # so there is a tiny TOCTOU race — fine for local dev.
   set +e
   PORT="$(python3 - "$PORT_MIN" "$PORT_MAX" <<'PY'
 import socket
@@ -59,9 +61,16 @@ s.close()
 sys.exit(3)
 PY
 )"
-  range_full=$?
+  picked=$?
   set -e
-  if [ "$range_full" -eq 3 ]; then
+  # Exit 0 = a port in range; 3 = range full (PORT is the ephemeral fallback);
+  # anything else (e.g. a non-integer MIN/MAX) is a hard error — never launch
+  # streamlit with an empty port.
+  if [ "$picked" -ne 0 ] && [ "$picked" -ne 3 ]; then
+    echo "error: could not pick a port; AI_TOOLKIT_DASHBOARD_PORT_MIN/_MAX must be integers" >&2
+    exit 1
+  fi
+  if [ "$picked" -eq 3 ]; then
     echo "note: dashboard port range $PORT_MIN-$PORT_MAX is fully in use; falling back to ephemeral port $PORT" >&2
   fi
 fi
