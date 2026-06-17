@@ -33,7 +33,13 @@ Everything runs on your machine and nothing is ever exported.
    and tools** under it. A **Meta by kind** tab aggregates the spoke's spans per
    kind (counts + time/cost stats) to spot "launched too much". Cost is counted
    **once per turn** (each turn node owns it), so the rolled-up totals are
-   trustworthy. Metadata only — labels are short summaries, never prompt bodies.
+   trustworthy. Each turn carries one **`📐 context`** node — drill it to see the
+   named input state (rules · `CLAUDE.md` · memory · tool-schemas) with per-item
+   tokens and the history remainder, the real cached prefix in the Tokens column.
+   When the selected spoke is **still running**, a **Follow live** toggle appears
+   that auto-refreshes the tree (~8s) as the transcript grows — no daemon, no
+   emission hook; the built tree is cached between refreshes and rebuilt only on
+   real growth. Metadata only — labels are short summaries, never prompt bodies.
 2. **Aggregate** — pick a time window and roll the tree up across all spokes:
    per-step frequency, totals, and per-invocation mean/median for time and cost.
    Shows where time and tokens actually go.
