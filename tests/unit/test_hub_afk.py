@@ -589,3 +589,140 @@ def test_decide_and_act_healthy_answer_mentioning_auth_is_not_a_failure(
     log = Path(env["_READY_LOG"]).read_text()
     assert "could not refresh" not in log
     assert "human" in log  # the ordinary ESCALATE reason
+
+
+# ── the --remote launcher (issue #73) ─────────────────────────────────────────
+# `/afk --remote` launches a detached, caffeinate-wrapped `/afk drain` on a configured
+# always-on Mac over SSH (Tailscale hostname), confirms the tmux session started, and
+# prints the reattach command. The remote command is built purely (build_remote_launch_cmd)
+# and ssh is stubbed via AFK_SSH so the orchestration runs without a real host.
+
+
+def _ssh_recorder(tmp_path: Path, log_name: str = "ssh.log", *, exit_code: int = 0) -> Path:
+    """An ssh stub that appends its args to a log and exits with exit_code."""
+    log = tmp_path / log_name
+    stub = tmp_path / "ssh"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\nexit {exit_code}\n')
+    stub.chmod(0o755)
+    return stub
+
+
+def test_build_remote_launch_cmd_contains_all_parts() -> None:
+    result = _call("build_remote_launch_cmd '/home/me/ai-toolkit' 'afk' 'claude'")
+
+    out = result.stdout
+    assert "cd '/home/me/ai-toolkit'" in out
+    assert "tmux new -d -s 'afk'" in out
+    assert "caffeinate -s" in out
+    assert "/afk drain" in out
+
+
+def test_build_remote_launch_cmd_preserves_claude_flags() -> None:
+    # AFK_REMOTE_CLAUDE may carry flags; they must reach the remote command unquoted so
+    # the remote shell runs `claude --model opus`, not a single mis-quoted argument.
+    result = _call("build_remote_launch_cmd '/repo' 'afk' 'claude --model opus'")
+
+    assert 'caffeinate -s claude --model opus "/afk drain"' in result.stdout
+
+
+def test_remote_reattach_cmd() -> None:
+    result = _call("remote_reattach_cmd mac-home afk")
+
+    assert result.stdout.strip() == "ssh mac-home -t 'tmux attach -t afk'"
+
+
+def test_remote_launch_requires_host() -> None:
+    env = {"AFK_REMOTE_HOST": "", "AFK_REMOTE_REPO": "/repo", "AFK_REMOTE_CONF": "/nonexistent"}
+
+    result = _call("remote_launch", env=env)
+
+    assert result.returncode != 0
+    assert "AFK_REMOTE_HOST" in result.stderr
+
+
+def test_remote_launch_requires_repo() -> None:
+    env = {"AFK_REMOTE_HOST": "mac-home", "AFK_REMOTE_REPO": "", "AFK_REMOTE_CONF": "/nonexistent"}
+
+    result = _call("remote_launch", env=env)
+
+    assert result.returncode != 0
+    assert "AFK_REMOTE_REPO" in result.stderr
+
+
+def test_remote_launch_invokes_ssh_and_prints_reattach(tmp_path: Path) -> None:
+    ssh_stub = _ssh_recorder(tmp_path)
+    env = {
+        "AFK_REMOTE_HOST": "mac-home",
+        "AFK_REMOTE_REPO": "/home/me/ai-toolkit",
+        "AFK_REMOTE_SESSION": "afk",
+        "AFK_SSH": str(ssh_stub),
+        "AFK_REMOTE_CONF": "/nonexistent",
+    }
+
+    result = _call("remote_launch", env=env)
+
+    assert result.returncode == 0, result.stderr
+    log = (tmp_path / "ssh.log").read_text()
+    assert "mac-home" in log  # launched on the host
+    assert "/afk drain" in log
+    assert "tmux new -d -s" in log
+    assert "has-session" in log  # confirmed the session is up
+    assert "ssh mac-home -t 'tmux attach -t afk'" in result.stdout  # reattach hint
+
+
+def test_remote_launch_fails_when_session_absent(tmp_path: Path) -> None:
+    # ssh launch succeeds but the confirm (has-session) fails → non-zero, no false success.
+    ssh_stub = tmp_path / "ssh"
+    ssh_stub.write_text(
+        '#!/usr/bin/env bash\ncase "$*" in *has-session*) exit 1 ;; *) exit 0 ;; esac\n'
+    )
+    ssh_stub.chmod(0o755)
+    env = {
+        "AFK_REMOTE_HOST": "mac-home",
+        "AFK_REMOTE_REPO": "/repo",
+        "AFK_SSH": str(ssh_stub),
+        "AFK_REMOTE_CONF": "/nonexistent",
+    }
+
+    result = _call("remote_launch", env=env)
+
+    assert result.returncode != 0
+    assert "not found" in result.stderr
+
+
+def test_remote_launch_reads_conf_file_when_env_unset(tmp_path: Path) -> None:
+    conf = tmp_path / "afk-remote"
+    conf.write_text("AFK_REMOTE_HOST=mac-home\nAFK_REMOTE_REPO=/srv/ai-toolkit\n")
+    ssh_stub = _ssh_recorder(tmp_path)
+    env = {
+        "AFK_REMOTE_HOST": "",
+        "AFK_REMOTE_REPO": "",
+        "AFK_SSH": str(ssh_stub),
+        "AFK_REMOTE_CONF": str(conf),
+    }
+
+    result = _call("remote_launch", env=env)
+
+    assert result.returncode == 0, result.stderr
+    log = (tmp_path / "ssh.log").read_text()
+    assert "mac-home" in log
+    assert "/srv/ai-toolkit" in log
+
+
+def test_remote_launch_env_overrides_conf_file(tmp_path: Path) -> None:
+    conf = tmp_path / "afk-remote"
+    conf.write_text("AFK_REMOTE_HOST=from-file\nAFK_REMOTE_REPO=/from/file\n")
+    ssh_stub = _ssh_recorder(tmp_path)
+    env = {
+        "AFK_REMOTE_HOST": "from-env",
+        "AFK_REMOTE_REPO": "/from/file",
+        "AFK_SSH": str(ssh_stub),
+        "AFK_REMOTE_CONF": str(conf),
+    }
+
+    result = _call("remote_launch", env=env)
+
+    assert result.returncode == 0, result.stderr
+    log = (tmp_path / "ssh.log").read_text()
+    assert "from-env" in log
+    assert "from-file" not in log
