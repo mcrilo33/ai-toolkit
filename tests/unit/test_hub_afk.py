@@ -519,22 +519,35 @@ def test_is_auth_failure_detects_auth_errors(text: str) -> None:
         "ANSWER: Use Redis for the cache.",
         "ESCALATE: this touches main, a human should decide.",
         "ANSWER: yes, the /login route should require 2FA via OAuth.",
+        "ANSWER: we should run the /login migration before deploy.",
+        "ANSWER: see the docs to run the new /login flow first.",
         "I am still reasoning about the trade-offs and have not concluded.",
         "",
     ],
 )
 def test_is_auth_failure_ignores_normal_output(text: str) -> None:
     # A legitimate answer that merely mentions /login or OAuth must NOT trip detection —
-    # a false positive would block a healthy spoke and halt the whole drain.
+    # a false positive would block a healthy spoke and halt the whole drain. The /login
+    # signature is anchored to the CLI's "run /login" phrasing, so prose like "run the
+    # /login migration" misses.
     result = _call('is_auth_failure "$RAW" && echo yes || echo no', env={"RAW": text})
 
     assert result.stdout.strip() == "no"
 
 
+# The CLI prints credential failures to STDERR and exits NONZERO — the production failure
+# mode. The stubs reproduce that (write the auth string to stderr, exit 1) so the test
+# exercises the real path: run_answerer folds stderr in (2>&1) and decide_and_act gates
+# the auth branch on the nonzero exit.
+
+
 def test_decide_and_act_auth_failure_escalates_with_auth_reason(
     spoke_repo: Path, stub_env: dict[str, str]
 ) -> None:
-    env = {**stub_env, "AFK_ANSWERER_CMD": "printf 'authentication_error: OAuth token expired'"}
+    env = {
+        **stub_env,
+        "AFK_ANSWERER_CMD": "printf 'authentication_error: OAuth token expired' >&2; exit 1",
+    }
 
     result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
@@ -549,8 +562,30 @@ def test_decide_and_act_auth_failure_raises_stop_flag(
 ) -> None:
     # The stop flag is a process global set in decide_and_act (same shell as the loop),
     # so the supervisor can halt rather than spin. Echo it back after the call.
-    env = {**stub_env, "AFK_ANSWERER_CMD": "printf 'authentication_error'"}
+    env = {
+        **stub_env,
+        "AFK_ANSWERER_CMD": "printf 'Invalid API key · Please run /login' >&2; exit 1",
+    }
 
     result = _call(f"decide_and_act '{spoke_repo}' 5; echo \"FLAG=$_AFK_AUTH_FAILED\"", env=env)
 
     assert "FLAG=1" in result.stdout
+
+
+def test_decide_and_act_healthy_answer_mentioning_auth_is_not_a_failure(
+    spoke_repo: Path, stub_env: dict[str, str]
+) -> None:
+    # The answerer SUCCEEDS (exit 0) and its decision merely discusses oauth/login. The
+    # nonzero-exit gate means this is a normal decision, NOT an auth-failure halt: the
+    # stop flag stays 0 and no "could not refresh" auth block is emitted.
+    env = {
+        **stub_env,
+        "AFK_ANSWERER_CMD": "printf 'ESCALATE: the oauth token expired bug needs a human'",
+    }
+
+    result = _call(f"decide_and_act '{spoke_repo}' 5; echo \"FLAG=$_AFK_AUTH_FAILED\"", env=env)
+
+    assert "FLAG=0" in result.stdout
+    log = Path(env["_READY_LOG"]).read_text()
+    assert "could not refresh" not in log
+    assert "human" in log  # the ordinary ESCALATE reason

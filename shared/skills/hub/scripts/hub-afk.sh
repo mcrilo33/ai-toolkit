@@ -361,13 +361,17 @@ Decide per the policy above. End your reply with exactly one line: 'ANSWER: <rep
 EOF
 }
 
-# run_answerer <issue> <question> -> the answerer's raw stdout. The answerer is a headless
-# `claude -p` (overridable via AFK_ANSWERER_CMD for tests), run with a thinking budget.
-# The prompt is passed on stdin so a long contract never hits argv limits.
+# run_answerer <issue> <question> -> the answerer's raw output (stdout AND stderr), and
+# its exit status as the function's return code. The answerer is a headless `claude -p`
+# (overridable via AFK_ANSWERER_CMD for tests), run with a thinking budget; the prompt is
+# passed on stdin so a long contract never hits argv limits. stderr is folded into the
+# captured stream (NOT discarded) because the CLI prints credential failures there and
+# exits nonzero — the auth-failure detector needs both the message and the exit code.
+# parse_decision is line-anchored, so interleaved stderr noise never pollutes a decision.
 run_answerer() {
   local prompt; prompt="$(build_answerer_prompt "$1" "$2")"
   local cmd="${AFK_ANSWERER_CMD:-claude -p --model opus}"
-  CLAUDE_EFFORT="$AFK_ANSWERER_EFFORT" bash -c "$cmd" <<<"$prompt" 2>/dev/null || true
+  CLAUDE_EFFORT="$AFK_ANSWERER_EFFORT" bash -c "$cmd" <<<"$prompt" 2>&1
 }
 
 # parse_decision <raw-answerer-output> -> "ANSWER\t<text>" or "ESCALATE\t<reason>" on
@@ -383,14 +387,16 @@ parse_decision() {
   printf '%s\t%s\n' "$kind" "$rest"
 }
 
-# is_auth_failure <raw-answerer-output> -> true (rc 0) when the answerer's own `claude`
-# reported an auth failure (the subscription token could not refresh) rather than a
-# decision. Matched against MULTI-WORD auth signatures only, case-insensitively: this
-# is high-precision on purpose because a false positive halts the WHOLE drain (a healthy
-# answer that merely mentions "/login" or "OAuth" must not trip it).
+# is_auth_failure <raw-answerer-output> -> true (rc 0) when the text carries a Claude /
+# Anthropic auth-failure signature (dead credentials / token could not refresh). Matched
+# case-insensitively against the known wordings. The CALLER additionally gates on the
+# answerer having EXITED NONZERO (decide_and_act) — auth discussion in a healthy answer
+# exits 0 and is never treated as a failure — so this predicate can favor recall without
+# a false positive halting the whole drain. The /login signature is still anchored to the
+# CLI's "run [`claude `]/login" phrasing so prose like "run the /login migration" misses.
 is_auth_failure() {
   printf '%s' "$1" | grep -Eqi \
-    'authentication_error|invalid (x-)?api[ -]?key|oauth token( has)? expired|run[^[:cntrl:]]{0,12}/login|401 unauthorized|credit balance is too low'
+    'authentication_error|invalid (x-)?api[ -]?key|invalid bearer token|oauth (token|authentication)|run `?(claude )?/login|401|unauthorized|credit balance is too low'
 }
 
 # --- tmux injection + telemetry -----------------------------------------------
@@ -437,16 +443,18 @@ afk_emit_decision() {
 # answer, or escalate to blocked/<issue>. Fail-safe: an answerer that returns no decision
 # (or an answer we cannot inject) escalates rather than guessing.
 decide_and_act() {
-  local wt="$1" issue="$2" question raw decision kind text target
+  local wt="$1" issue="$2" question raw rc decision kind text target
   question="$(extract_pending_question "$wt")"
   [ -n "$question" ] || return 0
   log "→ answering #$issue (parked on input)"
-  raw="$(run_answerer "$issue" "$question")"
+  raw="$(run_answerer "$issue" "$question")"; rc=$?
   # The answerer is the supervisor's own `claude`; if its credentials are dead, every
-  # other `claude` (the spokes, the next tick's answerer) is dead too. Raise the global
-  # stop flag and block THIS spoke so the failure surfaces as blocked/<issue> on the
-  # dashboard rather than spinning the loop. The main loop reads the flag and halts.
-  if is_auth_failure "$raw"; then
+  # other `claude` (the spokes, the next tick's answerer) is dead too. We treat it as an
+  # auth failure only when the answerer EXITED NONZERO and its output carries an auth
+  # signature — a healthy answer that merely discusses auth exits 0 and is unaffected.
+  # Raise the global stop flag and block THIS spoke so the failure surfaces as
+  # blocked/<issue> on the dashboard rather than spinning the loop; the main loop halts.
+  if [ "$rc" -ne 0 ] && is_auth_failure "$raw"; then
     _AFK_AUTH_FAILED=1
     _escalate_blocked "$wt" "$issue" \
       "subscription auth failed — token could not refresh; re-run /login on the host"
@@ -638,6 +646,10 @@ reap_pass() {
 supervise_tick() {
   dispatch_batch
   answer_pass
+  # If the answer pass detected a dead subscription token, skip land + reap this tick:
+  # both would shell out to a `claude`/suite that is just as dead. The main loop blocks
+  # the in-flight spokes and stops.
+  [ "$_AFK_AUTH_FAILED" -eq 1 ] && return 0
   auto_land
   reap_pass
 }
