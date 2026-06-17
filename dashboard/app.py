@@ -644,17 +644,13 @@ def _spoke_live_mtime(store: queries.SpanStore, spoke_id: str, projects_dir: Pat
     return read(spoke_id, projects_dir)
 
 
-def _render_steps_body(
-    store: queries.SpanStore, spoke_id: str, projects_dir: Path, source_key: str
-) -> None:
-    """Render the Steps tab: header row + the L1 trace spine, or an empty-state note.
+def _render_steps_body(forest: list[dict] | None) -> None:
+    """Render the Steps tab from an already-built forest: header row + the L1 trace spine.
 
-    Re-reads the spoke's transcript mtime so a live refresh rebuilds the tree only on real
-    growth (a new mtime → new cache key); a static transcript reuses the cached forest, so
-    an expand/collapse toggle re-renders the same objects without a rebuild (#67).
+    ``None`` means the causal build failed and the error is already surfaced; ``[]`` is a
+    legitimately empty spoke (a note). The caller owns the build so a failure renders one
+    error, not one per tab.
     """
-    mtime = _spoke_live_mtime(store, spoke_id, projects_dir)
-    forest = _build_or_error(store, spoke_id, _forest_cache_key(source_key, mtime))
     if forest is None:
         return  # build failed; the error is already surfaced
     if not forest:
@@ -669,8 +665,8 @@ def _render_steps_body(
 def render_spoke_view(store: queries.SpanStore, source_key: str = "") -> None:
     st.header("Spoke view")
     st.caption(
-        "Collapse-to-steps drill-down: main steps with rolled-up metrics; expand a "
-        "step to drill into sub-steps and spans. Hooks collapse into one line."
+        "Causal spoke trace: main steps with rolled-up metrics; expand a step to drill "
+        "into its turns, tools, hooks, and sub-agents."
     )
 
     spoke_ids = store.spoke_run_ids(queries.REAL_REPO_PREFIX)  # #55: hide fixture-leak spokes
@@ -690,21 +686,25 @@ def render_spoke_view(store: queries.SpanStore, source_key: str = "") -> None:
             key=f"live_follow::{spoke_id}",
         )
 
-    # The shared build for the non-live tabs; keyed on the same mtime, so the Steps tab's
-    # re-read returns this exact cached forest when the transcript has not grown.
+    # One build feeds both the Steps and Composition tabs (same mtime key → a single
+    # build, and at most one error banner on failure). A followed spoke re-reads and
+    # rebuilds inside the fragment so the live view tracks transcript growth.
     forest = _build_or_error(store, spoke_id, _forest_cache_key(source_key, live_mtime))
     steps_tab, meta_tab, comp_tab = st.tabs(["Steps", "Meta by kind", "Composition"])
 
     with steps_tab:
         # Only the selected running spoke auto-refreshes, and only its Steps tab — the
         # st.fragment re-runs just this body on the interval, leaving the rest static.
-        def _steps() -> None:
-            _render_steps_body(store, spoke_id, projects_dir, source_key)
-
         if follow:
+
+            def _steps() -> None:
+                live = _spoke_live_mtime(store, spoke_id, projects_dir)
+                followed = _build_or_error(store, spoke_id, _forest_cache_key(source_key, live))
+                _render_steps_body(followed)
+
             st.fragment(run_every=_LIVE_REFRESH)(_steps)()
         else:
-            _steps()
+            _render_steps_body(forest)
 
     with meta_tab:
         _render_meta(store, spoke_id)

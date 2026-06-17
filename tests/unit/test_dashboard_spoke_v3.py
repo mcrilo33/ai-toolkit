@@ -125,10 +125,11 @@ def test_spine_header_is_node_time_dur_h_actor(monkeypatch):
     monkeypatch.setattr(app, "resolve_projects_dir", lambda: fixtures / "projects")
     monkeypatch.setattr(app, "_ccusage_costs", lambda: {})
 
-    # The causal forest is the sole builder (#80); render its Steps tab directly so the
-    # header row is emitted (render_spoke_view would filter this non-ai-toolkit fixture
-    # spoke out of the selectbox via REAL_REPO_PREFIX).
-    app._render_steps_body(store, "feature/22-demo+1700000000", fixtures / "projects", "")
+    # The causal forest is the sole builder (#80); build it and render the Steps tab body
+    # directly so the header row is emitted (render_spoke_view would filter this
+    # non-ai-toolkit fixture spoke out of the selectbox via REAL_REPO_PREFIX).
+    forest = app._build_or_error(store, "feature/22-demo+1700000000", source_key="")
+    app._render_steps_body(forest)
 
     header = next(r for r in rec.rows if r and all(c and c.startswith("**") for c in r))
     assert header == [

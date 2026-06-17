@@ -39,12 +39,10 @@ from telemetry.causal_tree import causal_forest_from_parsed
 from telemetry.session_parser import ParsedSession, parse_session_file
 from step_nodes import (
     _attribute_turns,
-    _build_intervals,
     _parse_ts,
     _roll_up,
     _roll_up_steps,
     _step_node,
-    _turns_by_owner,
 )
 
 # Push-span kinds the parser does NOT reconstruct from a transcript — the spine markers,
@@ -721,7 +719,7 @@ class SpanStore:
         signal lives in the ``count``/``duration`` columns. Rows sort by total cost
         then count, descending. Unknown → ``[]``.
         """
-        nodes, _, _ = self._attributed_nodes(spoke_run_id)
+        nodes = self._meta_nodes(spoke_run_id)
         return _aggregate_by_kind(nodes)
 
     def cold_context(self, spoke_run_id: str) -> list[dict[str, Any]]:
@@ -744,37 +742,23 @@ class SpanStore:
         )
         return rows
 
-    def _attributed_nodes(
-        self, spoke_run_id: str
-    ) -> tuple[
-        list[dict[str, Any]],
-        list[dict[str, Any]],
-        dict[str, list[dict[str, Any]]],
-    ]:
-        """Load one spoke's spans as nodes with once-per-turn cost attributed.
+    def _meta_nodes(self, spoke_run_id: str) -> list[dict[str, Any]]:
+        """One spoke's spans as flat nodes with once-per-turn cost attributed.
 
-        Returns ``(nodes, intervals, turns_by_owner)`` — the flat real-span nodes
-        (``agent`` nodes carry their subagent ``own_cost_usd`` / ``own_tokens_*`` /
-        ``models`` for the meta-by-kind view; every other node owns nothing), the
-        reconstructed phase ``intervals``, and the turn rows grouped by their owner
-        (a phase-interval bucket key for a main turn, an ``agent`` span id for a
-        subagent turn). The drill-down materialises a turn node per row; meta-by-kind
-        ignores ``turns_by_owner`` and reads the node ``own_cost`` instead.
+        Each ``agent`` node carries its subagent ``own_cost_usd`` / ``own_tokens_*`` /
+        ``models`` for the meta-by-kind view; every other node owns nothing. Cost is
+        attributed per turn so the per-kind aggregate counts each inference exactly once.
         """
         rows = self._query(
             "SELECT * FROM spans WHERE spoke_run_id = ? ORDER BY ts_start, span_id",
             [spoke_run_id],
         )
         nodes = [_step_node(row) for row in rows]
-        intervals = _build_intervals(nodes)
         session_ids = sorted({row["session_id"] for row in rows if row["session_id"]})
         turns = self._turns_for_sessions(session_ids)
-        bounds = {n["span_id"]: (_parse_ts(n["ts_start"]), _parse_ts(n["ts_end"])) for n in nodes}
-        # Fill node own_cost for meta-by-kind (agent nodes get their subagent pool);
-        # the drill-down ignores this and routes the raw turn rows to turn nodes.
+        # Fill node own_cost (agent nodes get their subagent pool) for meta-by-kind.
         _attribute_turns(nodes, turns)
-        turns_by_owner = _turns_by_owner(turns, intervals, nodes, bounds)
-        return nodes, intervals, turns_by_owner
+        return nodes
 
     def _turns_for_sessions(self, session_ids: list[str]) -> list[dict[str, Any]]:
         """Per-turn rows for the spoke's sessions (empty on the raw path).
