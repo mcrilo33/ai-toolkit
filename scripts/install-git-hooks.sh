@@ -152,12 +152,10 @@ for s in red-proof-warn reviewer-sep-warn; do
   fi
 done
 
-# Anti-gutting tripwire (issue #40): scan the pushed diff for test-gutting
-# signatures (added sys.exit(0)/skip/xfail/assert True, or net-deleted assertions).
-# The scan itself decides severity — it exits non-zero ONLY under NIGHT=1 (an
-# unattended spoke that gutted tests to go green is blocked and must park
-# blocked/N); off the night path it prints and exits 0 (advisory, never gates a
-# human's test edit). A missing scan is skipped (defense-in-depth, not the primary
+# Anti-gutting tripwire: scan the pushed diff for test-gutting signatures (added
+# sys.exit(0)/skip/xfail/assert True, or net-deleted assertions). The scan is
+# advisory — it prints findings and exits 0, surfacing the smell without gating a
+# human's test edit. A missing scan is skipped (defense-in-depth, not the primary
 # gate — test-select below is the blocking owner of test execution).
 if [ -x "$SCRIPTS/anti-gutting-scan.sh" ]; then
   printf '%s\n' "$PREPUSH_REFS" | "$SCRIPTS/anti-gutting-scan.sh" || exit $?
