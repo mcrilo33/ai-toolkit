@@ -36,17 +36,21 @@
 #   WT_NEW / WT_LAND / SPOKE_READY / BATCH_PLAN   override the resolved sibling scripts
 #   AFK_WT_LIB                   override the sourced worktree-lib.sh
 #   CLAUDE_PROJECTS_DIR          transcript root (default: $HOME/.claude/projects)
+#   AFK_REMOTE_HOST / AFK_REMOTE_REPO / AFK_REMOTE_SESSION / AFK_REMOTE_CLAUDE
+#                                --remote target config (or a sourced AFK_REMOTE_CONF file)
 #
 # Usage:
 #   hub-afk.sh <duration>        # e.g. 90, 30m, 1h, 1h30m — drain for that long, then stop
 #   hub-afk.sh until <HH:MM>     # drain until the next HH:MM, then stop
 #   hub-afk.sh drain             # drain until the backlog is empty + nothing in flight
+#   hub-afk.sh --remote          # launch a detached `drain` on a configured always-on Mac
 #   hub-afk.sh --status          # report the active window (or "off")
 #   hub-afk.sh --off             # stop the supervisor (clears the state file)
 #   hub-afk.sh --once            # run a single tick and exit (tests / external cron)
 #
 # Run it on the hub (main checkout, on the default branch). Read-only against the work
-# except for dispatching, answering, landing, and reaping spokes.
+# except for dispatching, answering, landing, and reaping spokes. --remote runs the drain
+# on a different machine instead (see docs/remote-afk.md).
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -668,6 +672,81 @@ afk_done() {
   [ -z "$(printf '%s' "$batch" | tr -d '[:space:]')" ]
 }
 
+# --- remote launch (--remote) -------------------------------------------------
+# Launch a detached, caffeinate-wrapped `/afk drain` on a configured always-on Mac over
+# SSH (issue #73). The home Mac runs the drain unattended on the SAME Claude subscription;
+# this is the cross-network trigger (a Tailscale hostname reachable from any network). The
+# host is configured by env or a sourced conf file:
+#   AFK_REMOTE_HOST     the always-on Mac's (Tailscale) hostname            [required]
+#   AFK_REMOTE_REPO     the repo path on that host                          [required]
+#   AFK_REMOTE_SESSION  the detached tmux session name              [default: afk]
+#   AFK_REMOTE_CLAUDE   the claude invocation on the host (may carry flags) [default: claude]
+#   AFK_REMOTE_CONF     a shell snippet sourced for the above defaults [default: ~/.afk-remote]
+#   AFK_SSH             the ssh binary (override for tests)          [default: ssh]
+
+# _load_remote_conf -> source the optional conf file for AFK_REMOTE_* defaults, with an
+# explicit env value WINNING over the file (save env, source, restore the saved values).
+_load_remote_conf() {
+  local conf="${AFK_REMOTE_CONF:-$HOME/.afk-remote}"
+  [ -f "$conf" ] || return 0
+  local s_host="${AFK_REMOTE_HOST:-}" s_repo="${AFK_REMOTE_REPO:-}" \
+        s_session="${AFK_REMOTE_SESSION:-}" s_claude="${AFK_REMOTE_CLAUDE:-}"
+  # shellcheck disable=SC1090
+  . "$conf" 2>/dev/null || true
+  [ -n "$s_host" ] && AFK_REMOTE_HOST="$s_host"
+  [ -n "$s_repo" ] && AFK_REMOTE_REPO="$s_repo"
+  [ -n "$s_session" ] && AFK_REMOTE_SESSION="$s_session"
+  [ -n "$s_claude" ] && AFK_REMOTE_CLAUDE="$s_claude"
+  return 0
+}
+
+# build_remote_launch_cmd <repo> <session> <claude> -> the command run ON the remote host:
+# cd into the repo and start a DETACHED tmux session that runs `/afk drain` under
+# `caffeinate -s` (keep the Mac awake for the whole drain). repo + session are single-
+# quoted; <claude> is left unquoted so AFK_REMOTE_CLAUDE can carry flags.
+build_remote_launch_cmd() {
+  local repo="$1" session="$2" claude="$3"
+  printf "cd '%s' && tmux new -d -s '%s' 'caffeinate -s %s \"/afk drain\"'\n" \
+    "$repo" "$session" "$claude"
+}
+
+# remote_reattach_cmd <host> <session> -> the one-liner the user runs to attach to the
+# unattended session (printed after a successful launch).
+remote_reattach_cmd() {
+  printf "ssh %s -t 'tmux attach -t %s'\n" "$1" "$2"
+}
+
+# remote_launch -> resolve the remote config, SSH-launch the detached drain, CONFIRM the
+# tmux session came up (so we never claim success on a silent failure), and print the
+# reattach command. rc 2 on missing config, rc 1 on an ssh / confirmation failure.
+remote_launch() {
+  _load_remote_conf
+  local host="${AFK_REMOTE_HOST:-}" repo="${AFK_REMOTE_REPO:-}" \
+        session="${AFK_REMOTE_SESSION:-afk}" claude="${AFK_REMOTE_CLAUDE:-claude}" \
+        ssh="${AFK_SSH:-ssh}" remote_cmd
+  if [ -z "$host" ]; then
+    log "/afk --remote: set AFK_REMOTE_HOST (the always-on Mac's Tailscale hostname) — see docs/remote-afk.md"
+    return 2
+  fi
+  if [ -z "$repo" ]; then
+    log "/afk --remote: set AFK_REMOTE_REPO (the repo path on $host) — see docs/remote-afk.md"
+    return 2
+  fi
+  remote_cmd="$(build_remote_launch_cmd "$repo" "$session" "$claude")"
+  log "→ launching unattended /afk drain on $host (tmux session '$session')"
+  if ! "$ssh" "$host" -t "$remote_cmd"; then
+    log "/afk --remote: ssh launch failed — is $host reachable (Tailscale up)?"
+    return 1
+  fi
+  if ! "$ssh" "$host" tmux has-session -t "$session" 2>/dev/null; then
+    log "/afk --remote: launched but tmux session '$session' not found on $host — check the host"
+    return 1
+  fi
+  log "✓ launched on $host — draining unattended until the backlog is empty"
+  remote_reattach_cmd "$host" "$session"
+  return 0
+}
+
 # --- CLI ----------------------------------------------------------------------
 
 _status() {
@@ -683,11 +762,12 @@ _status() {
 main() {
   MAIN_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { log "not inside a git repository"; return 1; }
 
-  # Subcommands that do not start the loop.
+  # Subcommands that do not start the LOCAL loop.
   case "${1:-}" in
     --status) _status; return 0 ;;
     --off)    afk_clear_state; echo "/afk: off (state cleared; the supervisor stops on its next tick)"; return 0 ;;
-    -h|--help) sed -n '2,49p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
+    --remote) remote_launch; return $? ;;
+    -h|--help) sed -n '2,53p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
   esac
 
   local once=0
