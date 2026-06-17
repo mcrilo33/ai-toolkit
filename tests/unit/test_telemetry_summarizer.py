@@ -21,6 +21,8 @@ from telemetry.summarizer import (
     DEFAULT_MODEL,
     SummaryCache,
     content_key,
+    context_summary,
+    resolve_content,
     resolve_model,
     summarize,
 )
@@ -145,3 +147,75 @@ def test_content_key_is_stable_and_model_scoped() -> None:
     assert content_key("body", "model-x") == content_key("body", "model-x")
     assert content_key("body", "model-x") != content_key("body", "model-y")
     assert content_key("body", "model-x") != content_key("other", "model-x")
+
+
+# --- Subtask 2: content resolution for rule / skill / reasoning context items ---
+
+
+def test_resolve_content_reads_the_rule_body(tmp_path: Path) -> None:
+    rules = tmp_path / "rules"
+    rules.mkdir()
+    (rules / "code-quality.md").write_text("# Code Quality\nClarity over cleverness.")
+
+    content = resolve_content("rule", "code-quality", rules_dir=rules)
+
+    assert "Clarity over cleverness" in content
+
+
+def test_resolve_content_reads_the_skill_body(tmp_path: Path) -> None:
+    skills = tmp_path / "skills"
+    (skills / "solo-cycle").mkdir(parents=True)
+    (skills / "solo-cycle" / "SKILL.md").write_text("# Solo Cycle\nPer-subtask cycle.")
+
+    content = resolve_content("skill", "solo-cycle", skills_dir=skills)
+
+    assert "Per-subtask cycle" in content
+
+
+def test_resolve_content_passes_reasoning_gist_through() -> None:
+    # Reasoning has no file — the privacy-safe gist itself is the content.
+    assert resolve_content("reasoning", "Found and fixed the bug") == "Found and fixed the bug"
+
+
+def test_resolve_content_is_blank_for_a_missing_file(tmp_path: Path) -> None:
+    assert resolve_content("rule", "does-not-exist", rules_dir=tmp_path) == ""
+
+
+def test_context_summary_resolves_the_body_then_summarizes(tmp_path: Path) -> None:
+    rules = tmp_path / "rules"
+    rules.mkdir()
+    (rules / "code-quality.md").write_text("Clarity over cleverness; surgical changes only.")
+    cache = SummaryCache(tmp_path / "summaries.json")
+    backend = _CountingComplete("Coding standards: clarity and surgical changes")
+
+    summary = context_summary(
+        "rule", "code-quality", cache=cache, rules_dir=rules, complete=backend
+    )
+
+    assert summary == "Coding standards: clarity and surgical changes"
+    # The backend saw the file body, not the bare rule name.
+    assert backend.calls[0][0].startswith("Clarity over cleverness")
+
+
+def test_context_summary_is_a_cache_hit_on_re_open(tmp_path: Path) -> None:
+    skills = tmp_path / "skills"
+    (skills / "land").mkdir(parents=True)
+    (skills / "land" / "SKILL.md").write_text("Land a finished task from the hub.")
+    cache = SummaryCache(tmp_path / "summaries.json")
+    backend = _CountingComplete()
+
+    first = context_summary("skill", "land", cache=cache, skills_dir=skills, complete=backend)
+    second = context_summary("skill", "land", cache=cache, skills_dir=skills, complete=backend)
+
+    assert first == second
+    assert len(backend.calls) == 1  # re-open served from cache, no second LLM call
+
+
+def test_context_summary_is_blank_when_content_is_missing(tmp_path: Path) -> None:
+    cache = SummaryCache(tmp_path / "summaries.json")
+    backend = _CountingComplete()
+
+    summary = context_summary("skill", "ghost", cache=cache, skills_dir=tmp_path, complete=backend)
+
+    assert summary == ""
+    assert backend.calls == []  # no resolvable content — the model is never called
