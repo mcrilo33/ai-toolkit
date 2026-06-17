@@ -54,6 +54,36 @@ Plus two control subcommands:
   tick).
 - `/afk status` — report the active window and time remaining, or `off`.
 
+## Remote AFK (an always-on Mac)
+
+When you are away from the machine that can run the backlog, `/afk --remote` triggers the
+drain on a configured **always-on second Mac** (e.g. one at home) over SSH and returns. It
+runs unattended there on the **same Claude subscription** — no API key, no proxy.
+
+```bash
+# from anywhere (work, travel) — needs AFK_REMOTE_HOST + AFK_REMOTE_REPO configured
+.ai-toolkit/scripts/hub/hub-afk.sh --remote
+```
+
+It SSHes to the host (a Tailscale hostname reaches it across networks), starts a detached,
+`caffeinate`-wrapped `drain` in a named tmux session, confirms the session came up, and
+prints the reattach command. The host is configured by env or a sourced `~/.afk-remote`:
+
+| Variable | Meaning |
+|----------|---------|
+| `AFK_REMOTE_HOST` | the always-on Mac's (Tailscale) hostname — **required** |
+| `AFK_REMOTE_REPO` | the repo path on that host — **required** |
+| `AFK_REMOTE_SESSION` | the detached tmux session name (default `afk`) |
+| `AFK_REMOTE_DRAIN_CMD` | the command run under `caffeinate` (default: the supervisor itself) |
+
+The one-time host setup (subscription `/login`, auto-login + unlocked Keychain, `caffeinate`,
+the Tailscale trigger, and a GitHub-poll fallback) is the runbook in
+[`docs/remote-afk.md`](../../../docs/remote-afk.md).
+
+If the subscription token cannot refresh mid-run, the supervisor blocks the affected spokes
+(`blocked/<issue>`, visible on the dashboard) and **stops** rather than spinning — you fix
+auth (`/login`) on the host and re-trigger.
+
 ## Workflow
 
 ### 1. Preconditions
