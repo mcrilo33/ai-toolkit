@@ -8,8 +8,9 @@ Design goals (from the issue):
 
 - **Pluggable & cheap** — the LLM backend is a swappable ``complete(content,
   model) -> str`` callable; the default talks to any OpenAI-compatible chat
-  endpoint over stdlib ``urllib`` (no new dependency), and the model is
-  configurable (env ``TELEMETRY_SUMMARY_MODEL``, default ``deepseek-flash``).
+  endpoint over stdlib ``urllib`` (no new dependency), defaulting to DeepSeek so
+  summaries work out of the box, and the model is configurable (env
+  ``TELEMETRY_SUMMARY_MODEL``, default ``deepseek-v4-flash``).
 - **Cache by content hash** — never recompute for the same content.
 - **Fail-soft** — every failure path (backend error, misconfiguration, empty
   content) yields a blank summary; a blank never breaks the view and is never
@@ -21,16 +22,20 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 
 CompleteFn = Callable[[str, str], str]
 
-DEFAULT_MODEL = "deepseek-flash"
+DEFAULT_MODEL = "deepseek-v4-flash"
+DEFAULT_BASE_URL = "https://api.deepseek.com"
 _MODEL_ENV = "TELEMETRY_SUMMARY_MODEL"
 _BASE_URL_ENV = "TELEMETRY_SUMMARY_BASE_URL"
 _API_KEY_ENV = "TELEMETRY_SUMMARY_API_KEY"
+_API_KEY_FALLBACK_ENV = "DEEPSEEK_API_KEY"
+_KEYCHAIN_SERVICE = "DEEPSEEK_API_KEY"
 
 # Keep cost bounded: a one-liner needs the gist, not the whole document.
 _MAX_CONTENT_CHARS = 6000
@@ -192,17 +197,58 @@ def _read_text(path: Path) -> str:
         return ""
 
 
+def _resolve_api_key() -> str:
+    """The DeepSeek API key from env then the macOS Keychain, or ``""`` if absent.
+
+    Resolution order: ``TELEMETRY_SUMMARY_API_KEY`` → ``DEEPSEEK_API_KEY`` →
+    ``security find-generic-password`` (macOS Keychain). Any miss or lookup
+    failure yields ``""`` so the dashboard simply shows no summaries.
+    """
+    for env_name in (_API_KEY_ENV, _API_KEY_FALLBACK_ENV):
+        key = os.environ.get(env_name, "").strip()
+        if key:
+            return key
+    return _keychain_api_key()
+
+
+def _keychain_api_key() -> str:
+    """The key stored under ``DEEPSEEK_API_KEY`` in the macOS Keychain, or ``""``."""
+    try:
+        result = subprocess.run(
+            [
+                "security",
+                "find-generic-password",
+                "-a",
+                os.environ.get("USER", ""),
+                "-s",
+                _KEYCHAIN_SERVICE,
+                "-w",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
 def _default_complete(content: str, model: str) -> str:
     """OpenAI-compatible chat-completion backend over stdlib ``urllib``.
 
-    Reads the endpoint from ``TELEMETRY_SUMMARY_BASE_URL`` (e.g. a local LiteLLM
-    proxy) and an optional ``TELEMETRY_SUMMARY_API_KEY``. Returns ``""`` when no
-    endpoint is configured so an unconfigured dashboard simply shows no summaries
-    rather than erroring.
+    Talks to ``TELEMETRY_SUMMARY_BASE_URL`` (default DeepSeek), authenticating
+    with the key from :func:`_resolve_api_key`. ``thinking`` is disabled so a
+    reasoning model spends its token budget on the answer, not hidden reasoning
+    (which otherwise blanks ``message.content``). Returns ``""`` when no key is
+    available — no key, no summaries, never an error.
     """
-    base_url = os.environ.get(_BASE_URL_ENV, "").strip()
-    if not base_url:
+    api_key = _resolve_api_key()
+    if not api_key:
         return ""
+
+    base_url = os.environ.get(_BASE_URL_ENV, "").strip() or DEFAULT_BASE_URL
 
     payload = json.dumps(
         {
@@ -213,13 +259,14 @@ def _default_complete(content: str, model: str) -> str:
             ],
             "max_tokens": 40,
             "temperature": 0.0,
+            "thinking": {"type": "disabled"},
         }
     ).encode("utf-8")
 
-    headers = {"Content-Type": "application/json"}
-    api_key = os.environ.get(_API_KEY_ENV, "").strip()
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
 
     url = f"{base_url.rstrip('/')}/chat/completions"
     request = urllib.request.Request(url, data=payload, headers=headers, method="POST")
