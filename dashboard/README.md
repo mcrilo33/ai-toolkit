@@ -84,8 +84,12 @@ dashboard/run.sh                 # read the default span log
 dashboard/run.sh path/to/events.jsonl
 ```
 
-`run.sh` binds a free ephemeral port (so it never collides with another
-Streamlit on the default `8501`); set `STREAMLIT_SERVER_PORT` to pin one.
+`run.sh` picks the first free port in a dedicated range (default `8600`-`8699`),
+so it never lands on hex admin's Streamlit on the default `8501` — a collision
+there makes the browser show the wrong app. Override the range with
+`AI_TOOLKIT_DASHBOARD_PORT_MIN` / `AI_TOOLKIT_DASHBOARD_PORT_MAX`, or set
+`STREAMLIT_SERVER_PORT` to pin one port (it wins over the range). If the whole
+range is busy, it falls back to a random free ephemeral port and prints a note.
 
 ### Span source
 
