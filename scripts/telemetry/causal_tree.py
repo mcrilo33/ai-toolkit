@@ -3,14 +3,19 @@
 Assembles one spoke's drillable trace from the causal ids the parser surfaces (S2),
 replacing the timestamp-window correlation in ``dashboard/tree.py``:
 
-- **turn** — a cost-attributed turn row; a main turn buckets into the push-marker
-  **phase spine** (kept), a sub-agent turn nests under its agent (``agent_id`` ==
-  the agent span's ``agent_link``);
+- **human** — a prompt span, bucketed into its covering phase interval; the main turn
+  it triggered (``turn.parent_uuid`` resolves to the prompt record via
+  ``derive_span_id``) NESTS under it, and continuation turns of that agent loop are
+  time-ordered SIBLINGS under the same prompt (the turn->turn loop stays flat);
+- **turn** — a cost-attributed turn row; a main turn nests under its triggering
+  human prompt (or buckets into its covering **phase spine** interval otherwise), a
+  sub-agent turn nests under its agent (``agent_id`` == the agent span's ``agent_link``);
 - **tool / skill / todo / agent** — a pull span, parented under the turn that issued
   it via ``tool_parents[span_id] -> turn uuid`` (else its span ``parent_id``);
 - **tool-scoped hook** — a push span whose ``parent_id`` is the tool's id, nested
   under that tool;
-- **script** — a push span, at the spoke root when it has no in-tree parent.
+- **script / parentless hook** — a push span; nested under its in-tree parent when it
+  has one, else bucketed into its covering phase interval (never dumped to root).
 
 The spine still partitions the run into ``step``/``lifecycle`` intervals, but the
 *internals* of each interval are causal: idle→prompt→turn→tool→hook→sub-agent,
