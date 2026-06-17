@@ -210,6 +210,62 @@ def _node_label(node: dict) -> str:
     return label
 
 
+def _row_glyph(node: dict) -> str:
+    """The row's leading glyph: 📐 for a per-turn context node, else the status icon.
+
+    A causal context node (it carries ``input_context``) is input *state*, not an event
+    with an outcome, so it reads as the spec's ``📐 context`` rather than a ✅ tick. Every
+    other node shows its rolled-up terminal status icon (a leaf's rollup is its own).
+    """
+    if node["kind"] == "context" and node.get("input_context") is not None:
+        return "📐"
+    status = (node.get("rollup") or {}).get("status") or node["status"]
+    return _STATUS_ICON.get(status, "•")
+
+
+def _context_item_rows(ctx: dict) -> list[dict]:
+    """The per-item drill rows of a context node's input state, each with its tokens.
+
+    One row per named load — each rule, ``CLAUDE.md``, each memory, then the tool-schemas
+    as one ``tool-schemas xN`` group — followed by the history remainder, in
+    load-then-history order. Each row carries a ``$0`` cost slot (loaded context bears no
+    inference cost) and the row tokens reconcile to the context total (Issue #67).
+    """
+    rows: list[dict] = []
+    for rule in ctx["rules"]:
+        rows.append({"label": f"rule · {rule['name']}", "tokens": rule["tokens"], "cost": 0.0})
+    if ctx["claude_md"]:
+        rows.append({"label": "CLAUDE.md", "tokens": ctx["claude_md"]["tokens"], "cost": 0.0})
+    for memory in ctx["memory"]:
+        rows.append(
+            {"label": f"memory · {memory['name']}", "tokens": memory["tokens"], "cost": 0.0}
+        )
+    schemas = ctx["schemas"]
+    if schemas["count"]:
+        rows.append(
+            {"label": f"tool-schemas x{schemas['count']}", "tokens": schemas["tokens"], "cost": 0.0}
+        )
+    rows.append({"label": "history", "tokens": ctx["history_tokens"], "cost": 0.0})
+    return rows
+
+
+def _render_context_item(item: dict, depth: int) -> None:
+    """One drilled context-item row: indented name + its tokens in the Tokens column.
+
+    A named load has no clock/duration/actor of its own; the Cost column is its ``$0``
+    slot and the trailing column is left as the summary slot Phase 6 fills.
+    """
+    indent = "&nbsp;&nbsp;&nbsp;&nbsp;" * depth
+    cols = st.columns(_STEP_COLS)
+    cols[0].markdown(f"{indent}↳ {item['label']}")
+    cols[1].markdown("")
+    cols[2].markdown("")
+    cols[3].markdown(_fmt_cost(item["cost"]))
+    cols[4].markdown(f"{item['tokens']:,}")
+    cols[5].markdown("")
+    cols[6].markdown("")
+
+
 def _render_divider(node: dict) -> None:
     """A gap (idle) or session-resume node as a thin divider, not a metric row."""
     if node["kind"] == "session":
@@ -225,11 +281,10 @@ def _render_divider(node: dict) -> None:
 def _node_row(node: dict, depth: int, inherited_actor: str = "main") -> None:
     """One trace row: indented label + Time(start clock)·Dur·Cost·Tokens·H·Actor."""
     indent = "&nbsp;&nbsp;&nbsp;&nbsp;" * depth
-    # Render the rolled-up (terminal) status so a container reads as its last-event
-    # outcome, not a worst-child reddening (Issue #57); a leaf's rollup equals its own
-    # status. Fall back to the raw status for any node built without a rollup.
-    status = (node.get("rollup") or {}).get("status") or node["status"]
-    icon = _STATUS_ICON.get(status, "•")
+    # The leading glyph is the rolled-up (terminal) status — a container reads as its
+    # last-event outcome, not a worst-child reddening (Issue #57), a leaf's rollup
+    # equals its own status — except a per-turn context node, which reads as 📐 (#67).
+    icon = _row_glyph(node)
     metrics = queries.format_step_metrics(node)
     cols = st.columns(_STEP_COLS)
     cols[0].markdown(f"{indent}{icon} `{node['kind']}` **{_node_label(node)}**")
@@ -255,6 +310,14 @@ def _render_node(node: dict, depth: int, path: str, inherited_actor: str = "main
         _render_divider(node)
         return
     _node_row(node, depth, inherited_actor)
+    # A per-turn context node holds its named items in ``input_context`` (not children),
+    # so it drills into those rows — each named load + the history remainder (Issue #67).
+    ctx = node.get("input_context")
+    if ctx is not None:
+        if st.toggle(f"↳ drill into {_node_label(node)}", key=f"drill::{path}", value=False):
+            for item in _context_item_rows(ctx):
+                _render_context_item(item, depth + 1)
+        return
     children = node.get("children") or []
     if not children:
         return

@@ -1065,8 +1065,21 @@ def format_step_label(node: dict[str, Any]) -> str:
     # under the approval), so the label stays the decision alone.
     if node["kind"] == "approval":
         return f"🔐 ask→{node.get('status') or 'ask'}"
-    # A collapsed context group reads "rule x3" / "memory x1" / "tool-schema x2".
+    # A context node has two shapes. The v3 *causal* per-turn node carries
+    # ``input_context`` (the named input state) and reads "context · N loaded" — the
+    # real cached-prefix total rides the Tokens column, the names show on drill. The
+    # v2 collapsed group (``collapsed_count`` + ``phase``, no ``input_context``) keeps
+    # its "rule x3" / "memory x1" / "tool-schema x2" label.
     if node["kind"] == "context":
+        ctx = node.get("input_context")
+        if ctx is not None:
+            loaded = (
+                len(ctx["rules"])
+                + (1 if ctx["claude_md"] else 0)
+                + len(ctx["memory"])
+                + ctx["schemas"]["count"]
+            )
+            return f"context · {loaded} loaded" if loaded else "context"
         return f"{node['phase']} x{node['collapsed_count']}"
     # A turn node (one inference) is labelled by its clock time + model, e.g.
     # "turn 12:01:05 · opus-4-8" — the per-turn token spike shows in the metrics.
@@ -1097,7 +1110,13 @@ def format_step_metrics(node: dict[str, Any]) -> dict[str, str]:
     """
     rollup = node.get("rollup") or {}
     cost = rollup.get("cost_usd", node.get("own_cost_usd", 0.0))
-    tokens = rollup.get("tokens_in", 0) + rollup.get("tokens_out", 0)
+    # A causal context node owns no turn cost, so its rollup tokens are zero; the
+    # Tokens column instead shows its real cached-prefix total (the named items + the
+    # history remainder), the number the per-turn input state is worth (Issue #67).
+    ctx = node.get("input_context")
+    tokens = (
+        ctx["total_tokens"] if ctx else rollup.get("tokens_in", 0) + rollup.get("tokens_out", 0)
+    )
     models = rollup.get("models") or node.get("models") or []
     humans = rollup.get("human_count", node.get("human_count", 0))
     return {
