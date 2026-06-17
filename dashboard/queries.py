@@ -711,7 +711,12 @@ class SpanStore:
             f"SELECT * FROM spans WHERE spoke_run_id = ? AND kind IN ({_sql_in_list(_PUSH_KINDS)})",
             [spoke_run_id],
         )
-        return causal_forest_from_parsed(parsed, push, ccusage_costs or {})
+        forest = causal_forest_from_parsed(parsed, push, ccusage_costs or {})
+        # Attach the additive subtree ``rollup`` the renderer's composition/step metrics
+        # read, exactly as ``spoke_steps`` does — without it the Composition tab is zero.
+        for root in forest:
+            _roll_up_steps(root)
+        return forest
 
     def spoke_meta_by_kind(self, spoke_run_id: str) -> list[dict[str, Any]]:
         """Aggregate one spoke's spans by ``kind`` to spot "launched too much".

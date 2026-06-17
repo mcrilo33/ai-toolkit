@@ -269,7 +269,7 @@ def _estimate_tokens(summary: object) -> int:
 
 def _turn_node(row: dict[str, Any]) -> CausalNode:
     is_sub = row.get("source") == "subagent"
-    return causal_node(
+    node = causal_node(
         node_id=row.get("uuid") or f"turn:{row.get('ts')}",
         kind="turn",
         name="turn",
@@ -280,6 +280,10 @@ def _turn_node(row: dict[str, Any]) -> CausalNode:
         own_tokens_in=int(row.get("tokens_in") or 0),
         own_tokens_out=int(row.get("tokens_out") or 0),
     )
+    # Cache breakdown for the composition lens; display-only, never folded into cost.
+    node["cache_read"] = int(row.get("cache_read") or 0)
+    node["cache_creation"] = int(row.get("cache_creation") or 0)
+    return node
 
 
 def _span_node(span: dict[str, Any]) -> CausalNode:
@@ -357,16 +361,18 @@ def causal_dividers(turns: list[dict[str, Any]]) -> list[CausalNode]:
         anchor = cur.get("uuid") or cur["ts"]
         if cur.get("session_id") != prev.get("session_id"):
             cold = int(cur.get("cache_creation") or 0)
-            dividers.append(
-                causal_node(
-                    node_id=f"session:{anchor}",
-                    kind="session",
-                    name="resume",
-                    summary=f"cold cache re-read +{cold:,} tokens" if cold else "resume",
-                    ts_start=cur["ts"],
-                    ts_end=cur["ts"],
-                )
+            divider = causal_node(
+                node_id=f"session:{anchor}",
+                kind="session",
+                name="resume",
+                summary=f"cold cache re-read +{cold:,} tokens" if cold else "resume",
+                ts_start=cur["ts"],
+                ts_end=cur["ts"],
             )
+            # The renderer reads the cold magnitude from resume_cache_creation; it stays
+            # off own_tokens so it never folds into the once-per-turn rollup (#59).
+            divider["resume_cache_creation"] = cold
+            dividers.append(divider)
         elif _ts(cur["ts"]) - _ts(prev["ts"]) > _IDLE_GAP_SECONDS:
             dividers.append(
                 causal_node(

@@ -24,6 +24,7 @@ _FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "telemetry"
 EVENTS = _FIXTURES / "events.jsonl"
 PROJECTS = _FIXTURES / "projects"
 SPOKE = "feature/22-demo+1700000000"
+SPOKE_SESSION = "11111111-1111-1111-1111-111111111111"
 
 
 def _store():
@@ -58,3 +59,37 @@ class TestSpokeCausalForest:
         nodes = list(_walk(_store().spoke_causal_forest(SPOKE, PROJECTS)))
         agent_summaries = {n.get("summary") for n in nodes if n["kind"] == "agent"}
         assert "3-approach design panel" not in agent_summaries
+
+    def test_roots_carry_a_rollup_for_composition(self) -> None:
+        # The Composition tab sums each root's additive ``rollup``; the causal path must
+        # attach it (as spoke_steps does) or the tab reads all zeros.
+        forest = _store().spoke_causal_forest(SPOKE, PROJECTS)
+        assert all("rollup" in root for root in forest)
+
+    def test_cost_threads_through_the_ccusage_map(self) -> None:
+        # With a ccusage cost for the spoke's session, the per-turn cost attributes and
+        # rolls up — proving the live Cost column is not blank.
+        forest = _store().spoke_causal_forest(SPOKE, PROJECTS, {SPOKE_SESSION: 1.0})
+        assert sum(root["rollup"]["cost_usd"] for root in forest) > 0
+
+    def test_parses_only_the_spokes_own_session_file(self, monkeypatch) -> None:
+        # The headline requirement: a spy on the parser proves it opens ONLY the spoke's
+        # session transcript (11111111…), never the whole projects root (22222222… stays
+        # untouched) — this is what keeps cold open per-spoke.
+        queries = load_queries()
+        opened: list[str] = []
+        real = queries.parse_session_file
+        monkeypatch.setattr(
+            queries, "parse_session_file", lambda path: opened.append(Path(path).name) or real(path)
+        )
+        store = queries.SpanStore.from_jsonl(EVENTS)
+        store.spoke_causal_forest(SPOKE, PROJECTS)
+        assert opened == [f"{SPOKE_SESSION}.jsonl"]
+
+    def test_turn_nodes_carry_the_cache_breakdown(self) -> None:
+        # The composition cache lens sums cache_read/cache_creation per turn node.
+        turns = [
+            n for n in _walk(_store().spoke_causal_forest(SPOKE, PROJECTS)) if n["kind"] == "turn"
+        ]
+        assert turns
+        assert all("cache_read" in t and "cache_creation" in t for t in turns)

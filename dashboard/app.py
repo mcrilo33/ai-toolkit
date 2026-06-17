@@ -444,7 +444,7 @@ def _build_spoke_forest(store: queries.SpanStore, spoke_id: str) -> list[dict]:
     if build_causal is not None:
         projects_dir = resolve_projects_dir()
         if projects_dir.exists():
-            forest = build_causal(spoke_id, projects_dir)
+            forest = build_causal(spoke_id, projects_dir, _ccusage_costs())
             if forest:
                 return forest
     return store.spoke_steps(spoke_id)

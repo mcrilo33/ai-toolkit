@@ -95,6 +95,12 @@ class _CausalNodeOptional(TypedDict, total=False):
     # Present on a ``human``/``approval`` node — the interaction's type + wait.
     human_type: str | None
     human_wait_ms: int | None
+    # Per-turn cache breakdown (on a ``turn`` node) and the resume cold-cache magnitude
+    # (on a ``session`` divider) — display-only, read by the composition/divider renderers;
+    # they never fold into the once-per-turn cost rollup.
+    cache_read: int
+    cache_creation: int
+    resume_cache_creation: int
 
 
 class CausalNode(_CausalNodeRequired, _CausalNodeOptional):

@@ -13,6 +13,7 @@ that counts ``spoke_steps`` calls — the observable proxy for "did it rebuild?"
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock
 
 from _dashboard_helpers import load_app, load_queries
@@ -117,6 +118,32 @@ def test_render_rebuilds_when_correlation_toggled(monkeypatch):
     app.render_spoke_view(store, source_key="raw:100")
 
     assert store.built == ["feature/a+1", "feature/a+1"]
+
+
+def test_build_prefers_causal_when_transcripts_present(monkeypatch, tmp_path):
+    # Issue #65: when the spoke's transcripts are on disk, _build_spoke_forest renders
+    # the causal trace (a forest of node_id-bearing causal nodes), not spoke_steps.
+    app = _app(monkeypatch)
+    fixtures = Path(__file__).resolve().parents[1] / "fixtures" / "telemetry"
+    store = load_queries().SpanStore.from_jsonl(fixtures / "events.jsonl")
+    monkeypatch.setattr(app, "resolve_projects_dir", lambda: fixtures / "projects")
+    monkeypatch.setattr(app, "_ccusage_costs", lambda: {})
+
+    forest = app._build_spoke_forest(store, "feature/22-demo+1700000000")
+
+    assert forest and all("node_id" in root for root in forest)  # causal nodes
+
+
+def test_build_falls_back_to_step_tree_without_transcripts(monkeypatch):
+    # No projects dir on disk → the causal path is skipped and the step tree renders.
+    app = _app(monkeypatch)
+    store = _FakeStore(["feature/x+1"])
+    monkeypatch.setattr(app, "resolve_projects_dir", lambda: Path("/no/such/projects/dir"))
+
+    forest = app._build_spoke_forest(store, "feature/x+1")
+
+    assert store.built == ["feature/x+1"]  # spoke_steps fallback was used
+    assert forest == [_interval("feature/x+1")]
 
 
 def test_resolve_store_keys_correlated_forest_on_store_version(monkeypatch, tmp_path):

@@ -50,6 +50,15 @@ class TestDividers:
         assert [d["kind"] for d in divs] == ["session"]
         assert "5,000" in divs[0]["summary"]
 
+    def test_session_divider_carries_resume_cache_creation(self) -> None:
+        # The renderer reads ``resume_cache_creation`` for the cold-cache magnitude;
+        # it must not ride only on the summary text or own_tokens.
+        turns = [
+            _t("a", "s1", "2026-06-12T23:00:00Z"),
+            _t("b", "s2", "2026-06-13T00:00:00Z", cache_creation=5000),
+        ]
+        assert causal_dividers(turns)[0]["resume_cache_creation"] == 5000
+
     def test_long_idle_emits_a_gap_divider(self) -> None:
         turns = [_t("a", "s1", "2026-06-12T23:00:00Z"), _t("b", "s1", "2026-06-12T23:10:00Z")]
         assert [d["kind"] for d in causal_dividers(turns)] == ["gap"]
