@@ -22,12 +22,14 @@ in S4; idle/resume dividers in S5.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from datetime import datetime
 from itertools import pairwise
 from typing import TYPE_CHECKING, Any
 
-from telemetry.causal import CausalNode, InputContext, causal_node
+from telemetry.causal import CausalNode, InputContext, SchemaSummary, causal_node
 from telemetry.cost import per_turn_rows
+from telemetry.spans import derive_span_id
 
 if TYPE_CHECKING:
     from telemetry.session_parser import ParsedSession
@@ -80,6 +82,7 @@ def build_causal_forest(
     actions: list[dict[str, Any]] = []
     hooks: list[dict[str, Any]] = []
     scripts: list[dict[str, Any]] = []
+    humans: list[dict[str, Any]] = []
     for span in spans:
         kind = span.get("kind")
         if kind in _MARKER_KINDS:
@@ -92,14 +95,34 @@ def build_causal_forest(
         nodes[node["node_id"]] = node
         if kind == "agent" and span.get("agent_link"):
             agent_by_link[span["agent_link"]] = node["node_id"]
-        (hooks if kind == "hook" else scripts if kind == "script" else actions).append(span)
+        bucket = (
+            humans
+            if kind == "human"
+            else hooks
+            if kind == "hook"
+            else scripts
+            if kind == "script"
+            else actions
+        )
+        bucket.append(span)
 
     for node, row in main_turn_rows:
         node["children"].insert(
             0, _context_child(node, row, context_by_session.get(row.get("session_id")))
         )
 
-    roots: list[CausalNode] = list(_build_spine(markers, main_turns))
+    # The phase spine plus a placement fn that buckets any parentless turn/human/hook/
+    # script into its covering interval (the #76 root-dump fix) instead of the root.
+    bucketable = [*main_turns, *(nodes[s["span_id"]] for s in (*humans, *hooks, *scripts))]
+    intervals, place = _build_spine(markers, bucketable)
+    roots: list[CausalNode] = list(intervals)
+
+    for span in humans:
+        node = nodes[span["span_id"]]
+        _attach(place(node["ts_start"]), node, roots)
+
+    _attach_main_turns(main_turn_rows, humans, nodes, place, roots)
+
     for node, agent_id in sub_turns:
         parent = nodes.get(agent_by_link.get(agent_id or "") or "")
         if parent is not None:
@@ -120,10 +143,46 @@ def build_causal_forest(
         _attach(parent, node, roots)
     for span in (*hooks, *scripts):
         node = nodes[span["span_id"]]
-        _attach(nodes.get(span.get("parent_id") or ""), node, roots)
+        # A tool-scoped hook (or emitting script) nests under its parent; a parentless
+        # session-level hook/script buckets into its covering interval, not the root (#76).
+        parent = nodes.get(span.get("parent_id") or "") or place(node["ts_start"])
+        _attach(parent, node, roots)
 
     _sort_tree(roots)
     return roots
+
+
+def _attach_main_turns(
+    main_turn_rows: list[tuple[CausalNode, dict[str, Any]]],
+    humans: list[dict[str, Any]],
+    nodes: dict[str, CausalNode],
+    place: Callable[[str | None], CausalNode | None],
+    roots: list[CausalNode],
+) -> None:
+    """Place each main turn by genuine causal trigger, sibling on continuation (#76).
+
+    Processed per session in start order so a continuation can inherit the prior turn's
+    parent. A turn whose ``parent_uuid`` is a human prompt record NESTS under that prompt
+    (the parser derives the prompt's span id from that uuid); a continuation turn — whose
+    parent is the prior turn's tool_result, not the prompt — is a time-ordered SIBLING
+    under the same prompt; otherwise the turn buckets into its covering phase interval.
+    The turn→turn loop never recurses, so depth stays bounded.
+    """
+    human_nodes = {span["span_id"]: nodes[span["span_id"]] for span in humans}
+    last_parent: dict[str | None, CausalNode | None] = {}
+    ordered = sorted(main_turn_rows, key=lambda nr: (_ts(nr[0]["ts_start"]), nr[0]["node_id"]))
+    for node, row in ordered:
+        session = row.get("session_id")
+        parent_uuid = row.get("parent_uuid")
+        human = human_nodes.get(derive_span_id(session or "", parent_uuid)) if parent_uuid else None
+        if human is not None:
+            parent: CausalNode | None = human
+        elif (prev := last_parent.get(session)) is not None and prev["kind"] == "human":
+            parent = prev  # continuation of the prompt's agent loop ⇒ sibling under it
+        else:
+            parent = place(node["ts_start"])
+        _attach(parent, node, roots)
+        last_parent[session] = parent
 
 
 def _attach(parent: CausalNode | None, node: CausalNode, roots: list[CausalNode]) -> None:
@@ -136,26 +195,27 @@ def _attach(parent: CausalNode | None, node: CausalNode, roots: list[CausalNode]
         parent["children"].append(node)
 
 
-def _build_spine(markers: list[dict[str, Any]], main_turns: list[CausalNode]) -> list[CausalNode]:
-    """The L1 phase-interval spine, with every main turn bucketed into a covering interval.
+def _build_spine(
+    markers: list[dict[str, Any]], bucketable: list[CausalNode]
+) -> tuple[list[CausalNode], Callable[[str | None], CausalNode | None]]:
+    """The L1 phase-interval spine plus a ``place(ts) -> interval`` bucketing function.
 
     Intervals run ``(prev_marker.ts_end, marker.ts_end]`` with the first opening at
-    ``-inf`` and the last closing at ``+inf``, so the bucketing is total — no main turn
-    falls to ``(unresolved)``. With no markers the whole run is one synthetic interval.
+    ``-inf`` and the last closing at ``+inf``, so ``place`` is total — every turn/human/
+    hook/script resolves to a covering interval, none fall to ``(unresolved)``. With no
+    markers the whole run is one synthetic interval spanning ``bucketable``.
     """
     if not markers:
-        if not main_turns:
-            return []
+        if not bucketable:
+            return [], lambda _: None
         run = causal_node(
             node_id="__run__",
             kind="interval",
             name="run",
-            ts_start=min((t["ts_start"] for t in main_turns if t["ts_start"]), default=None),
-            ts_end=max((t["ts_end"] for t in main_turns if t["ts_end"]), default=None),
+            ts_start=min((n["ts_start"] for n in bucketable if n["ts_start"]), default=None),
+            ts_end=max((n["ts_end"] for n in bucketable if n["ts_end"]), default=None),
         )
-        for turn in main_turns:
-            _attach(run, turn, [])
-        return [run]
+        return [run], lambda _: run
 
     ordered = sorted(markers, key=lambda m: _ts(m.get("ts_end")))
     bounds: list[tuple[float, float, CausalNode, bool]] = []
@@ -174,9 +234,7 @@ def _build_spine(markers: list[dict[str, Any]], main_turns: list[CausalNode]) ->
         )
         bounds.append((lo, hi, interval, index == len(ordered) - 1))
 
-    for turn in main_turns:
-        _attach(_interval_for(_ts(turn["ts_start"]), bounds), turn, [])
-    return [interval for _, _, interval, _ in bounds]
+    return [interval for _, _, interval, _ in bounds], lambda ts: _interval_for(_ts(ts), bounds)
 
 
 def _interval_for(ts: float, bounds: list[tuple[float, float, CausalNode, bool]]) -> CausalNode:
@@ -225,7 +283,7 @@ def _context_child(turn: CausalNode, row: dict[str, Any], ctx: dict[str, Any] | 
         "schema_tokens": 0,
     }
     rules, claude_md, memory = ctx["rules"], ctx["claude_md"], ctx["memory"]
-    schemas = {"count": ctx["schema_count"], "tokens": ctx["schema_tokens"]}
+    schemas: SchemaSummary = {"count": ctx["schema_count"], "tokens": ctx["schema_tokens"]}
     named = (
         sum(r["tokens"] for r in rules)
         + (claude_md["tokens"] if claude_md else 0)

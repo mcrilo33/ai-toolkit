@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -117,7 +118,7 @@ def _scenario() -> tuple[list[dict], list[dict], dict[str, str]]:
     return turns, spans, tool_parents
 
 
-def _by_id(forest: list[dict]) -> dict[str, dict]:
+def _by_id(forest: list[Any]) -> dict[str, dict]:
     index: dict[str, dict] = {}
 
     def walk(nodes: list[dict]) -> None:
@@ -133,7 +134,7 @@ def _child_kinds(node: dict) -> set[str]:
     return {c["kind"] for c in node["children"]}
 
 
-def _build() -> list[dict]:
+def _build() -> list[Any]:
     turns, spans, tool_parents = _scenario()
     return build_causal_forest(turns, spans, tool_parents)
 
@@ -172,9 +173,13 @@ class TestCausalForest:
         assert "s2" in {c["node_id"] for c in nodes["sp_ag2"]["children"]}
         assert "sp_grep" in {c["node_id"] for c in nodes["s2"]["children"]}
 
-    def test_script_at_spoke_root(self) -> None:
+    def test_parentless_script_buckets_into_its_interval(self) -> None:
+        # #76: a parentless script no longer dumps to the spoke root — it buckets into
+        # its covering phase interval (scr1 at 23:00:29 falls in the red step window).
         forest = _build()
-        assert "scr1" in {n["node_id"] for n in forest if n["kind"] == "script"}
+        assert "scr1" not in {n["node_id"] for n in forest}
+        red = next(iv for iv in forest if iv["kind"] == "interval" and iv["phase"] == "red")
+        assert "scr1" in {c["node_id"] for c in red["children"]}
 
     def test_cost_only_on_turn_and_agent_leaves(self) -> None:
         for node in _by_id(_build()).values():
@@ -260,7 +265,7 @@ def _trigger_scenario() -> tuple[list[dict], list[dict], dict[str, str]]:
     return turns, spans, {}
 
 
-def _build_trigger() -> list[dict]:
+def _build_trigger() -> list[Any]:
     turns, spans, tool_parents = _trigger_scenario()
     return build_causal_forest(turns, spans, tool_parents)
 
