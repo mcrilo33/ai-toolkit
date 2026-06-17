@@ -110,6 +110,87 @@ class CausalContractError(ValueError):
     """A node violates the frozen causal-node contract."""
 
 
+# Sentinel for optional keys the factory should add only when the caller passes them,
+# so a node never carries a key it has no value for (``emits=None`` means a present
+# null link; an omitted ``emits`` means no link at all — the contract distinguishes them).
+_UNSET: object = object()
+
+# The optional link keys, paired with the sentinel-guarded factory params below.
+_OPTIONAL_LINK_KEYS: tuple[str, ...] = (
+    "emits",
+    "sidecar_session",
+    "agent_link",
+    "human_type",
+    "human_wait_ms",
+)
+
+
+def causal_node(
+    *,
+    node_id: str,
+    kind: str,
+    name: str,
+    parent_id: str | None = None,
+    summary: str | None = None,
+    actor: str = "main",
+    phase: str | None = None,
+    status: str = "success",
+    ts_start: str | None = None,
+    ts_end: str | None = None,
+    duration_ms: int = 0,
+    own_cost_usd: float = 0.0,
+    own_tokens_in: int = 0,
+    own_tokens_out: int = 0,
+    human_count: int = 0,
+    children: list[CausalNode] | None = None,
+    input_context: InputContext | None = None,
+    emits: object = _UNSET,
+    sidecar_session: object = _UNSET,
+    agent_link: object = _UNSET,
+    human_type: object = _UNSET,
+    human_wait_ms: object = _UNSET,
+) -> CausalNode:
+    """Build one :class:`CausalNode` in the canonical shape (``synthetic`` inferred).
+
+    The required keys are always set; ``input_context`` and the link keys are added
+    only when supplied, keeping a node free of keys it has no value for.
+
+    Raises:
+        CausalContractError: When ``kind`` is not a registered causal kind.
+    """
+    if kind not in CAUSAL_KINDS:
+        raise CausalContractError(f"not a causal kind: {kind!r} (expected one of {CAUSAL_KINDS})")
+    node: CausalNode = {
+        "node_id": node_id,
+        "parent_id": parent_id,
+        "kind": kind,
+        "name": name,
+        "summary": summary,
+        "actor": actor,
+        "phase": phase,
+        "status": status,
+        "ts_start": ts_start,
+        "ts_end": ts_end,
+        "duration_ms": duration_ms,
+        "own_cost_usd": own_cost_usd,
+        "own_tokens_in": own_tokens_in,
+        "own_tokens_out": own_tokens_out,
+        "human_count": human_count,
+        "synthetic": kind in SYNTHETIC_KINDS,
+        "children": children if children is not None else [],
+    }
+    if input_context is not None:
+        node["input_context"] = input_context
+    for key, value in zip(
+        _OPTIONAL_LINK_KEYS,
+        (emits, sidecar_session, agent_link, human_type, human_wait_ms),
+        strict=True,
+    ):
+        if value is not _UNSET:
+            node[key] = value  # type: ignore[literal-required]
+    return node
+
+
 def validate_causal_tree(forest: list[object]) -> None:
     """Validate a causal forest against the contract, raising on the first defect.
 

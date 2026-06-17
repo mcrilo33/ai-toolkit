@@ -30,6 +30,7 @@ from telemetry.causal import (
     CAUSAL_KINDS,
     REQUIRED_NODE_KEYS,
     CausalContractError,
+    causal_node,
     validate_causal_tree,
 )
 from telemetry.spans import SPAN_KINDS, SYNTHETIC_KINDS
@@ -248,3 +249,26 @@ class TestValidatorRejects:
         }
         with pytest.raises(CausalContractError, match="schemas"):
             validate_causal_tree([ctx_node])
+
+
+class TestCausalNodeFactory:
+    def test_builds_a_contract_conforming_node(self) -> None:
+        node = causal_node(node_id="t1", kind="turn", name="turn", own_cost_usd=0.5)
+        validate_causal_tree([node])
+        assert node["synthetic"] is True  # turn is a synthetic kind
+        assert node["children"] == []
+
+    def test_synthetic_flag_inferred_from_kind(self) -> None:
+        assert causal_node(node_id="x", kind="tool", name="Read")["synthetic"] is False
+        assert causal_node(node_id="y", kind="interval", name="red")["synthetic"] is True
+
+    def test_optional_keys_absent_unless_supplied(self) -> None:
+        bare = causal_node(node_id="a", kind="hook", name="h")
+        assert "emits" not in bare and "sidecar_session" not in bare
+        linked = causal_node(node_id="b", kind="script", name="s", emits="st_red")
+        assert linked["emits"] == "st_red"
+        assert "sidecar_session" not in linked
+
+    def test_rejects_unknown_kind(self) -> None:
+        with pytest.raises(CausalContractError, match="not a causal kind"):
+            causal_node(node_id="z", kind="bogus", name="x")
