@@ -25,16 +25,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
+import pytest
 from telemetry.causal import (
     CAUSAL_KINDS,
     REQUIRED_NODE_KEYS,
+    CausalContractError,
     validate_causal_tree,
 )
 from telemetry.spans import SPAN_KINDS, SYNTHETIC_KINDS
 
 _FIXTURES = Path(__file__).resolve().parent / "fixtures"
 GOLDEN = _FIXTURES / "causal_tree_golden.json"
-SPOKE_RUN_ID = "feature/47+1700000000"
 
 
 def _golden() -> list[dict]:
@@ -138,7 +139,8 @@ class TestCausalInvariants:
         )
 
     def test_cost_lives_only_on_turn_and_agent_leaves(self) -> None:
-        # Conservation: a container owns nothing; only turn/agent leaves carry cost.
+        # Cost attribution: a container owns nothing; only turn/agent leaves carry it.
+        # (Σ-conservation across the tree is the builder's job, verified in S3/S5.)
         for node in _walk(_golden()):
             if node["own_cost_usd"] > 0:
                 assert node["kind"] in ("turn", "agent"), (
@@ -158,3 +160,91 @@ class TestCausalInvariants:
         # Idle time is a divider row (gap/session), not a phase.
         kinds = {n["kind"] for n in _golden()}
         assert kinds & {"gap", "session"}, "no idle/resume divider at the top level"
+
+
+def _leaf_turn() -> dict:
+    """A minimal conforming ``turn`` node (no children), for mutation tests."""
+    return {
+        "node_id": "t1",
+        "parent_id": None,
+        "kind": "turn",
+        "name": "turn",
+        "summary": None,
+        "actor": "main",
+        "phase": None,
+        "status": "success",
+        "ts_start": None,
+        "ts_end": None,
+        "duration_ms": 0,
+        "own_cost_usd": 0.0,
+        "own_tokens_in": 0,
+        "own_tokens_out": 0,
+        "human_count": 0,
+        "synthetic": True,
+        "children": [],
+    }
+
+
+class TestValidatorRejects:
+    def test_missing_required_key(self) -> None:
+        node = _leaf_turn()
+        del node["actor"]
+        with pytest.raises(CausalContractError, match="missing required keys"):
+            validate_causal_tree([node])
+
+    def test_synthetic_flag_disagrees_with_kind(self) -> None:
+        node = _leaf_turn()
+        node["kind"] = "tool"  # a real kind, but synthetic still True
+        with pytest.raises(CausalContractError, match="synthetic flag disagrees"):
+            validate_causal_tree([node])
+
+    def test_cost_on_a_non_leaf_kind(self) -> None:
+        node = _leaf_turn()
+        node["kind"] = "interval"
+        node["synthetic"] = True
+        node["own_cost_usd"] = 1.0
+        with pytest.raises(CausalContractError, match="owns cost"):
+            validate_causal_tree([node])
+
+    def test_dangling_or_mismatched_parent_id(self) -> None:
+        # A child whose parent_id does not match its structural parent's node_id is
+        # the exact defect the S3 builder is most likely to emit.
+        parent = _leaf_turn()
+        child = _leaf_turn()
+        child["node_id"] = "t2"
+        child["parent_id"] = "nonexistent"
+        parent["children"] = [child]
+        with pytest.raises(CausalContractError, match="parent_id"):
+            validate_causal_tree([parent])
+
+    def test_duplicate_node_id(self) -> None:
+        a, b = _leaf_turn(), _leaf_turn()  # both node_id == "t1"
+        with pytest.raises(CausalContractError, match="duplicate node_id"):
+            validate_causal_tree([a, b])
+
+    def test_input_context_on_a_non_context_node(self) -> None:
+        node = _leaf_turn()  # a turn, not a context node
+        node["input_context"] = {
+            "rules": [{"name": "r", "tokens": 1}],
+            "claude_md": None,
+            "memory": [],
+            "schemas": {"count": 0, "tokens": 0},
+            "history_tokens": 0,
+            "total_tokens": 1,
+        }
+        with pytest.raises(CausalContractError, match="input_context"):
+            validate_causal_tree([node])
+
+    def test_input_context_malformed_schemas(self) -> None:
+        ctx_node = _leaf_turn()
+        ctx_node["kind"] = "context"
+        ctx_node["input_context"] = {
+            "rules": [{"name": "r", "tokens": 1}],
+            "claude_md": None,
+            "memory": [],
+            "schemas": "garbage",  # not a {count, tokens} dict
+            "history_tokens": 0,
+            "total_tokens": 1,
+        }
+        with pytest.raises(CausalContractError, match="schemas"):
+            validate_causal_tree([ctx_node])

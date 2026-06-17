@@ -119,14 +119,16 @@ def validate_causal_tree(forest: list[object]) -> None:
     Raises:
         CausalContractError: When any node is missing a required key, carries an
             unknown ``kind``, has an inconsistent ``synthetic`` flag, owns cost while
-            not a turn/agent leaf, or holds a malformed ``input_context``. The message
-            is qualified with the offending node's id path.
+            not a turn/agent leaf, reuses a ``node_id``, points ``parent_id`` at
+            anything but its structural parent, or holds a malformed ``input_context``.
+            The message is qualified with the offending node's id path.
     """
+    seen: set[str] = set()
     for index, node in enumerate(forest):
-        _validate_node(node, path=f"[{index}]")
+        _validate_node(node, path=f"[{index}]", expected_parent=None, seen=seen)
 
 
-def _validate_node(node: object, *, path: str) -> None:
+def _validate_node(node: object, *, path: str, expected_parent: str | None, seen: set[str]) -> None:
     if not isinstance(node, dict):
         raise CausalContractError(f"{path}: node is {type(node).__name__}, not a dict")
 
@@ -134,32 +136,60 @@ def _validate_node(node: object, *, path: str) -> None:
     if missing:
         raise CausalContractError(f"{path}: missing required keys {sorted(missing)}")
 
-    here = f"{path}({node['node_id']}/{node['kind']})"
+    node_id = node["node_id"]
+    here = f"{path}({node_id}/{node['kind']})"
+    if node_id in seen:
+        raise CausalContractError(f"{here}: duplicate node_id {node_id!r}")
+    seen.add(node_id)
+
     if node["kind"] not in CAUSAL_KINDS:
         raise CausalContractError(f"{here}: unknown kind (expected one of {CAUSAL_KINDS})")
 
     if node["synthetic"] is not (node["kind"] in SYNTHETIC_KINDS):
         raise CausalContractError(f"{here}: synthetic flag disagrees with kind")
 
+    # Referential integrity: a nested node names its structural parent; a top-level
+    # node has no in-tree parent. A dangling/mismatched parent_id is the defect the
+    # causal builder (S3) is most likely to emit, so the contract catches it here.
+    if node["parent_id"] != expected_parent:
+        raise CausalContractError(
+            f"{here}: parent_id {node['parent_id']!r} != structural parent {expected_parent!r}"
+        )
+
     if node["own_cost_usd"] and node["kind"] not in _COST_OWNING_KINDS:
         raise CausalContractError(f"{here}: owns cost but is not a turn/agent leaf")
 
     if "input_context" in node:
+        if node["kind"] != "context":
+            raise CausalContractError(f"{here}: input_context only allowed on a context node")
         _validate_input_context(node["input_context"], path=here)
 
     children = node["children"]
     if not isinstance(children, list):
         raise CausalContractError(f"{here}: children is not a list")
     for index, child in enumerate(children):
-        _validate_node(child, path=f"{here}.children[{index}]")
+        _validate_node(child, path=f"{here}.children[{index}]", expected_parent=node_id, seen=seen)
 
 
 def _validate_input_context(ctx: dict, *, path: str) -> None:
-    missing = {"rules", "claude_md", "memory", "schemas", "history_tokens", "total_tokens"} - (
-        ctx.keys() if isinstance(ctx, dict) else set()
-    )
+    required = {"rules", "claude_md", "memory", "schemas", "history_tokens", "total_tokens"}
+    missing = required - (ctx.keys() if isinstance(ctx, dict) else set())
     if missing:
         raise CausalContractError(f"{path}: input_context missing {sorted(missing)}")
-    for item in (*ctx["rules"], *ctx["memory"]):
+
+    schemas = ctx["schemas"]
+    if not (
+        isinstance(schemas, dict)
+        and isinstance(schemas.get("count"), int)
+        and isinstance(schemas.get("tokens"), int)
+    ):
+        raise CausalContractError(f"{path}: input_context.schemas must hold int count + tokens")
+    if not (isinstance(ctx["history_tokens"], int) and isinstance(ctx["total_tokens"], int)):
+        raise CausalContractError(f"{path}: input_context history/total tokens must be ints")
+
+    items = [*ctx["rules"], *ctx["memory"]]
+    if ctx["claude_md"] is not None:
+        items.append(ctx["claude_md"])
+    for item in items:
         if not item.get("name") or not isinstance(item.get("tokens"), int):
             raise CausalContractError(f"{path}: context item must have a name and int tokens")
