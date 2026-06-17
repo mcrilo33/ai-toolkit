@@ -165,7 +165,11 @@ _telemetry_branch() {
 #   --status   success|failure|deny|warn|skipped (default: success)
 #   --start-ms epoch-ms when the span opened; ts_start + duration_ms derive from
 #              it. Omitted → ts_start = now, duration_ms = 0.
-#   --parent-id  nesting parent (default: $TELEMETRY_PARENT_ID, else null)
+#   --parent-id  nesting parent. Resolution order: this flag → $TELEMETRY_PARENT_ID
+#              (in-process override) → $AI_TOOLKIT_PARENT_SPAN (the correlation id
+#              propagated across exec boundaries — Issue #66) → the spoke root
+#              ($spoke_run_id, so an in-spoke span hangs off the spoke instead of
+#              orphaning at null) → null when outside a spoke.
 telemetry_emit_span() {
   [ "${AI_TOOLKIT_TELEMETRY:-}" = "1" ] || return 0
   local kind="" name="" phase="" status="success" start_ms="" span_id="" \
@@ -209,6 +213,16 @@ telemetry_emit_span() {
     session_id=$(_telemetry_session_id)
     spoke_run_id=$(_telemetry_spoke_run_id "$root")
     workflow_rev=$(_telemetry_workflow_rev "$root")
+
+    # parent_id (Issue #66 — script causality). An explicit --parent-id flag or
+    # $TELEMETRY_PARENT_ID (set above) wins; otherwise read the cross-exec
+    # correlation id $AI_TOOLKIT_PARENT_SPAN (exported for the command by the
+    # PreToolUse(Bash) hook and inherited by every child script and native
+    # git-hook), and finally fall back to the spoke root so an in-spoke span hangs
+    # off the spoke (spoke_run_id) rather than orphaning at null. Outside a spoke
+    # spoke_run_id is empty, so parent_id stays null — the pre-#66 contract.
+    [ -n "$parent_id" ] || parent_id="${AI_TOOLKIT_PARENT_SPAN:-}"
+    [ -n "$parent_id" ] || parent_id="$spoke_run_id"
 
     if command -v jq >/dev/null 2>&1; then
       local human='null'

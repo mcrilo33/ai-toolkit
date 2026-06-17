@@ -300,3 +300,20 @@ spoke-main-guard:
   cursor:
     event: beforeShellExecution
     matcher: "git( +-[cC] +[^ ]+| +-[^ ]+)* +(checkout|switch|merge|branch|reset|update-ref|push)( |$)|worktree-land[.]sh"
+
+# parent-span-export (issue #66): telemetry Phase 2 — script causality. On every
+# Bash call, stamp the tool_use_id onto AI_TOOLKIT_PARENT_SPAN via a leading
+# VAR=value assignment (rewritten through hookSpecificOutput.updatedInput), so
+# agent-run scripts and the native git-hooks they trigger inherit the causal
+# parent_id. NO `if` — it must see every Bash command (it self-skips when
+# telemetry is off, jq is absent, or there is no clean tool_use_id, and never
+# emits a permission decision so it composes with the scope-guard hooks). The
+# leading-assignment form is stripped before Bash permission matching, so it never
+# perturbs the exact-match spoke allowlist. Claude-flow only: there is no Cursor/
+# Copilot remap because the updatedInput command-rewrite is Claude-specific; on
+# those platforms the generic payload carries no tool_use_id, so the hook no-ops.
+parent-span-export:
+  event: preToolUse
+  matcher: Bash
+  description: "Stamp the Bash tool_use_id onto AI_TOOLKIT_PARENT_SPAN (allowlist-safe leading assignment) so scripts and native git-hooks inherit the telemetry causal parent_id; no-op when telemetry is off"
+  tier: 2

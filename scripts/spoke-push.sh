@@ -40,6 +40,11 @@ for _c in "$_SP_DIR/telemetry.sh" "$_SP_DIR/../shared/hooks/lib/telemetry.sh"; d
 done
 unset _c
 _SP_T0="$(command -v _telemetry_now_ms >/dev/null 2>&1 && _telemetry_now_ms || true)"
+# Mint this script's OWN span id up front (Issue #66 — script causality). spoke-push
+# shells out to spoke-ready, so it exports this id as the child's
+# AI_TOOLKIT_PARENT_SPAN to nest the marker emission under this push, and emits its
+# own span with the same id. Empty when the emit layer is absent (telemetry off).
+_SP_SPAN_ID="$(command -v _telemetry_span_id >/dev/null 2>&1 && _telemetry_span_id || true)"
 
 usage() {
   echo "usage: spoke-push.sh [--ready <issue>]" >&2
@@ -90,7 +95,14 @@ git push -u origin "$BRANCH"
 # on /land; a mid-cycle push passes no --ready and so emits nothing.
 if [ -n "$READY" ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  bash "$SCRIPT_DIR/spoke-ready.sh" "$READY"
+  # Export THIS push's span id as the child's parent (Issue #66) so spoke-ready's
+  # marker-emission span nests under this push instead of inheriting our own parent
+  # (the Bash tool call). A bare leading assignment scopes it to the child only.
+  if [ -n "$_SP_SPAN_ID" ]; then
+    AI_TOOLKIT_PARENT_SPAN="$_SP_SPAN_ID" bash "$SCRIPT_DIR/spoke-ready.sh" "$READY"
+  else
+    bash "$SCRIPT_DIR/spoke-ready.sh" "$READY"
+  fi
 fi
 
 echo "✓ spoke-push complete: pushed $BRANCH${READY:+ + marker ready/$READY}"
@@ -102,5 +114,5 @@ echo "✓ spoke-push complete: pushed $BRANCH${READY:+ + marker ready/$READY}"
 #   above — once failed-push visibility is wanted in the trace.
 if command -v telemetry_emit_span >/dev/null 2>&1; then
   telemetry_emit_span --kind script --name spoke-push \
-    --status success --start-ms "$_SP_T0"
+    --span-id "$_SP_SPAN_ID" --status success --start-ms "$_SP_T0"
 fi
