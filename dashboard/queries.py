@@ -34,6 +34,10 @@ import duckdb
 # this directory onto sys.path, but the unit harness loads queries by file path and
 # does not — then import the builders the SQL/aggregate layer calls.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# The v3 causal trace (Issue #65): the per-spoke builder + the parser it re-parses with.
+# ``tree`` already put ``scripts/`` on the path above, so ``telemetry`` resolves here.
+from telemetry.causal_tree import causal_forest_from_parsed
+from telemetry.session_parser import ParsedSession, parse_session_file
 from tree import (
     _attribute_turns,
     _build_intervals,
@@ -45,6 +49,11 @@ from tree import (
     _turns_by_owner,
     build_dividers,
 )
+
+# Push-span kinds the parser does NOT reconstruct from a transcript — the spine markers,
+# hooks and control scripts the causal builder takes from the push side (everything else
+# comes fresh from the per-spoke parse, so passing these alone avoids double-counting).
+_PUSH_KINDS: tuple[str, ...] = ("step", "lifecycle", "hook", "script")
 
 # Column order for the in-memory ``spans`` table. ``human`` is flattened into
 # ``human_type`` / ``human_wait_ms`` so the table is purely scalar (no nested
@@ -334,6 +343,26 @@ ZERO_COST_ROLLUP_KINDS: tuple[str, ...] = ("script", "workflow")
 # ``workflow_phase`` is a display-only grouping span (it brackets a fan-out's
 # phase in the Spoke tree) with no own metrics.
 ROLLUP_EXCLUDED_KINDS: tuple[str, ...] = ("workflow_phase",)
+
+
+def _parse_spoke_sessions(projects_dir: Path, session_ids: list[str]) -> ParsedSession:
+    """Parse ONLY the given sessions' transcripts under ``projects_dir`` and merge them.
+
+    The per-spoke lazy parse (Issue #65): each session id is resolved to its
+    ``<slug>/<session>.jsonl`` transcript by glob — sub-agent transcripts live deeper and
+    are reached through the parent walk, so the ``*/<id>.jsonl`` glob never picks them up
+    as top-level sessions. A session with no transcript on disk is silently skipped.
+    """
+    merged = ParsedSession()
+    for session_id in session_ids:
+        for path in sorted(Path(projects_dir).glob(f"*/{session_id}.jsonl")):
+            parsed = parse_session_file(path)
+            merged.spans.extend(parsed.spans)
+            merged.usage_events.extend(parsed.usage_events)
+            merged.agent_links.update(parsed.agent_links)
+            merged.reasoning_refs.extend(parsed.reasoning_refs)
+            merged.tool_parents.update(parsed.tool_parents)
+    return merged
 
 
 def _sql_in_list(kinds: tuple[str, ...]) -> str:
@@ -649,6 +678,40 @@ class SpanStore:
         for root in forest:
             _roll_up_steps(root)
         return forest
+
+    def spoke_causal_forest(
+        self,
+        spoke_run_id: str,
+        projects_dir: Path,
+        ccusage_costs: dict[str, float] | None = None,
+    ) -> list[dict[str, Any]]:
+        """The v3 **causal** trace for one spoke, parsed per-spoke (Issue #65).
+
+        Replaces the timestamp-correlated :meth:`spoke_steps` with a tree built from the
+        real causal ids. Only this spoke's own session transcripts are parsed (located
+        from its push spans), never the whole projects root — that per-spoke parse is what
+        keeps cold open fast. The fresh pull spans + per-turn rows + ``tool_parents`` feed
+        the builder; the spoke's push markers/hooks/scripts supply the spine; idle/resume
+        dividers are appended.
+
+        Returns the causal forest (empty when the spoke has no parseable transcript).
+        """
+        rows = self._query(
+            "SELECT DISTINCT session_id FROM spans "
+            "WHERE spoke_run_id = ? AND session_id IS NOT NULL",
+            [spoke_run_id],
+        )
+        session_ids = sorted(row["session_id"] for row in rows)
+        if not session_ids:
+            return []
+        parsed = _parse_spoke_sessions(projects_dir, session_ids)
+        if not parsed.usage_events and not parsed.spans:
+            return []
+        push = self._query(
+            f"SELECT * FROM spans WHERE spoke_run_id = ? AND kind IN ({_sql_in_list(_PUSH_KINDS)})",
+            [spoke_run_id],
+        )
+        return causal_forest_from_parsed(parsed, push, ccusage_costs or {})
 
     def spoke_meta_by_kind(self, spoke_run_id: str) -> list[dict[str, Any]]:
         """Aggregate one spoke's spans by ``kind`` to spot "launched too much".

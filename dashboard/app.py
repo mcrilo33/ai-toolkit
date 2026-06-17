@@ -422,14 +422,32 @@ _FOREST_CACHE: dict[tuple[str, str], list[dict]] = {}
 def _spoke_forest(store: queries.SpanStore, spoke_id: str, source_key: str) -> list[dict]:
     """The selected spoke's drill-down tree, built on demand and memoized.
 
-    Builds only the requested spoke (``store.spoke_steps`` queries just that run),
-    keyed on ``(spoke_id, source_key)`` so a re-select or rerun returns the cached
-    forest instantly while a new data source (mode toggle or changed log) rebuilds.
+    Builds only the requested spoke, keyed on ``(spoke_id, source_key)`` so a re-select
+    or rerun returns the cached forest instantly while a new data source (mode toggle or
+    changed log) rebuilds.
     """
     key = (spoke_id, source_key)
     if key not in _FOREST_CACHE:
-        _FOREST_CACHE[key] = store.spoke_steps(spoke_id)
+        _FOREST_CACHE[key] = _build_spoke_forest(store, spoke_id)
     return _FOREST_CACHE[key]
+
+
+def _build_spoke_forest(store: queries.SpanStore, spoke_id: str) -> list[dict]:
+    """The v3 **causal** trace when this spoke's transcripts are on disk (Issue #65),
+    else the timestamp-correlated step tree.
+
+    The causal path parses ONLY this spoke's own sessions; when they are absent (a
+    push-only dataset, or a fixture with no transcript) it yields an empty forest and we
+    fall back to ``spoke_steps`` so the view still renders.
+    """
+    build_causal = getattr(store, "spoke_causal_forest", None)
+    if build_causal is not None:
+        projects_dir = resolve_projects_dir()
+        if projects_dir.exists():
+            forest = build_causal(spoke_id, projects_dir)
+            if forest:
+                return forest
+    return store.spoke_steps(spoke_id)
 
 
 def render_spoke_view(store: queries.SpanStore, source_key: str = "") -> None:
