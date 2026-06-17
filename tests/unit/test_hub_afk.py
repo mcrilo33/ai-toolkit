@@ -417,6 +417,49 @@ def test_decide_and_act_answer_without_pane_escalates(
     assert "pane" in log
 
 
+def test_decide_and_act_injects_and_emits_success_span(spoke_repo: Path, tmp_path: Path) -> None:
+    # The happy path: a waiting spoke, an answerer that decides, a pane that maps to the
+    # worktree (fake tmux), so the answer is injected and a `success` span is emitted —
+    # not an escalation. This exercises the feature's single reasoning step end to end.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
+
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+    # Fake tmux: list-panes maps a pane to this worktree; send-keys succeeds.
+    (fake_bin / "tmux").write_text(
+        f'#!/usr/bin/env bash\ncase "$1" in\n  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\nesac\nexit 0\n'
+    )
+    (fake_bin / "tmux").chmod(0o755)
+
+    tel_dir = tmp_path / "tel"
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "SPOKE_READY": str(ready_stub),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_ANSWERER_CMD": "printf 'ANSWER: use Redis'",
+        "AI_TOOLKIT_TELEMETRY": "1",
+        "AI_TOOLKIT_TELEMETRY_DIR": str(tel_dir),
+    }
+
+    result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    # Answered, not escalated.
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
+    span = json.loads((tel_dir / "events.jsonl").read_text().strip().splitlines()[-1])
+    assert span["kind"] == "agent" and span["name"] == "afk-answer"
+    assert span["status"] == "success"
+
+
 def test_build_answerer_prompt_includes_rule_and_question(
     tmp_path: Path, stub_env: dict[str, str]
 ) -> None:

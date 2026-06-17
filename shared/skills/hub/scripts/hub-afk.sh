@@ -380,11 +380,15 @@ parse_decision() {
 # --- tmux injection + telemetry -----------------------------------------------
 
 # _spoke_pane_target <wt_path> -> "session:window" of the spoke's pane, or empty.
+# Paths are canonicalized on both sides (wt_realpath): a worktree under a symlinked
+# root (/tmp → /private/tmp on macOS) would otherwise miss its pane, drop a valid
+# answer, and silently escalate.
 _spoke_pane_target() {
-  local wt_path="$1" target path
+  local wt_path="$1" target path want
   command -v tmux >/dev/null 2>&1 || return 0
+  want="$(wt_realpath "$wt_path")"; want="${want:-$wt_path}"
   while IFS=$'\t' read -r target path; do
-    [ "$path" = "$wt_path" ] && { printf '%s\n' "$target"; return 0; }
+    [ "$(wt_realpath "$path")" = "$want" ] && { printf '%s\n' "$target"; return 0; }
   done < <(tmux list-panes -a -F '#{session_name}:#{window_index}'$'\t''#{pane_current_path}' 2>/dev/null)
   return 0
 }
@@ -630,7 +634,7 @@ main() {
   case "${1:-}" in
     --status) _status; return 0 ;;
     --off)    afk_clear_state; echo "/afk: off (state cleared; the supervisor stops on its next tick)"; return 0 ;;
-    -h|--help) sed -n '2,46p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
+    -h|--help) sed -n '2,49p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
   esac
 
   local once=0
