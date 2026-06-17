@@ -119,22 +119,25 @@ def test_render_rebuilds_when_correlation_toggled(monkeypatch):
     assert store.built == ["feature/a+1", "feature/a+1"]
 
 
-def test_resolve_store_keys_correlated_store_on_log_mtime(monkeypatch, tmp_path):
+def test_resolve_store_keys_correlated_forest_on_store_version(monkeypatch, tmp_path):
+    # Issue #62: the correlated source is the persisted store, ingested on open; its
+    # content VERSION (not the log mtime) keys the forest cache, so a new spoke's delta
+    # rebuilds the tree while an unchanged store serves the cached one.
     app = _app(monkeypatch)
     calls = []
     monkeypatch.setattr(app, "resolve_projects_dir", lambda: tmp_path)  # exists → correlated
+    monkeypatch.setattr(app, "resolve_store_path", lambda: tmp_path / "store.duckdb")
+    sentinel = object()
     monkeypatch.setattr(
         app,
         "load_correlated_store",
-        lambda _span_log, _projects_dir, mtime: calls.append(mtime) or object(),
+        lambda span_log, projects_dir, store_path: calls.append(store_path) or (sentinel, "v123"),
     )
     span_log = tmp_path / "events.jsonl"
     span_log.write_text("")
 
-    store, mode = app._resolve_store(span_log, 1234.5)
+    store, source_key = app._resolve_store(span_log, 1234.5)
 
-    # The push-log mtime keys the correlated store so a fresh log rebuilds it, not
-    # just the forest — otherwise the (spoke_id, source_key) cache serves stale data.
-    assert mode == "correlated"
-    assert calls == [1234.5]
-    assert store is not None
+    assert store is sentinel
+    assert source_key == "correlated:v123"
+    assert calls == [str(tmp_path / "store.duckdb")]

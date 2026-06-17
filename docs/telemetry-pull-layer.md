@@ -71,6 +71,34 @@ in-memory DuckDB (no separate database to run) with:
 - `step_metrics` — per spoke run and step key (`kind:name[:phase]`): invocation
   count, mean / median duration, total cost, human-interaction count.
 
+## Persisted store (Issue #62, Phase A)
+
+`queries.connect` re-parses every historical session log on each call — ~146s once the
+backlog reached 252 MB / 748 files. `telemetry/store.py` replaces that read-time parse
+with a **persisted, incrementally-materialized DuckDB** at
+`~/.ai-toolkit/telemetry/store.duckdb` (a CQRS read model). `ingest_store` brings it up
+to date on each dashboard open; the dashboard then attaches it read-only
+(`SpanStore.from_persisted_store`) and queries it.
+
+- **No backfill — start fresh.** The store is created **empty at a watermark** (its init
+  timestamp). Only session transcripts modified at/after the watermark are ever parsed;
+  the historical backlog is never read. Consequence (accepted, documented — *not a bug*):
+  spokes that ran **before** the store existed do not appear. The store populates as new
+  spokes run.
+- **Incremental + idempotent.** A per-session cursor (`ingest_cursor`:
+  `session_file → mtime_ns/size`) skips unchanged transcripts. Span ids are deterministic,
+  so re-ingesting a grown transcript replaces that session's rows (delete-then-insert by
+  `session_id`) without double-counting.
+- **WAL unchanged.** `events.jsonl` stays the append-only push-span source; push spans are
+  read from it in full each ingest (cheap) and the script→marker emission link is computed
+  over them globally, so a cross-session emission inside a spoke run stays correct.
+- **Identical semantics.** spoke_run_id backfill, token/cost attribution, and per-turn rows
+  are genuinely per-session, so re-correlating one changed session yields a spoke view
+  **byte-identical** to the old whole-dataset parse (asserted in
+  `tests/unit/test_dashboard_persisted_store.py`).
+- **Rebuild = re-init.** Deleting the `.duckdb` file and re-ingesting re-creates an empty
+  store at a *new* watermark — never a historical re-parse.
+
 ## Verification notes and follow-ups
 
 - **Timestamps** — every `user` and `assistant` record (the ones bracketed)

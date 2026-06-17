@@ -266,13 +266,18 @@ def _create_turns(con: duckdb.DuckDBPyConnection, turns: list[dict[str, object]]
 
 
 def _create_views(con: duckdb.DuckDBPyConnection) -> None:
-    con.execute(f"CREATE VIEW span_steps AS SELECT *, {_STEP_KEY_SQL} AS step_key FROM spans")
+    # ``OR REPLACE`` so a persisted store (Issue #62) can recreate the views on every
+    # incremental ingest; harmless for the in-memory ``connect`` path where they never
+    # pre-exist.
+    con.execute(
+        f"CREATE OR REPLACE VIEW span_steps AS SELECT *, {_STEP_KEY_SQL} AS step_key FROM spans"
+    )
     # total_cost_usd is the sum of the run's distinct sessions' ccusage totals —
     # NOT sum(spans.cost_usd), which would double-count because a step span's
     # cost already includes the pull spans nested inside it. Sourcing from
     # session_costs makes the run total cross-check against ccusage directly.
     con.execute(
-        "CREATE VIEW spoke_run_summary AS "
+        "CREATE OR REPLACE VIEW spoke_run_summary AS "
         "WITH lifetime AS ("
         "  SELECT spoke_run_id, count(*) AS span_count, "
         "         count(DISTINCT session_id) AS session_count, "
@@ -290,7 +295,7 @@ def _create_views(con: duckdb.DuckDBPyConnection) -> None:
         "LEFT JOIN run_cost c ON l.spoke_run_id IS NOT DISTINCT FROM c.spoke_run_id"
     )
     con.execute(
-        "CREATE VIEW step_metrics AS "
+        "CREATE OR REPLACE VIEW step_metrics AS "
         "SELECT spoke_run_id, step_key, count(*) AS invocations, "
         "avg(duration_ms) AS mean_duration_ms, "
         "median(duration_ms) AS median_duration_ms, "

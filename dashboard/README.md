@@ -97,9 +97,20 @@ The sidebar chooses the data source:
 
 - **Raw push-span log** (default) — reads `events.jsonl` directly: lifecycle,
   cycle-step, and hook spans. No session-log pull spans, no cost correlation.
-- **Correlate via Issue #22** — calls `telemetry.queries.connect` to parse
-  Claude session logs, join the push spans, and ccusage-attribute tokens/cost.
-  This adds skill/agent/todo/human spans and per-span cost.
+- **Correlate via Issue #22** — reads the **persisted store** (Issue #62): a
+  `store.duckdb` materialized from the session logs once and updated incrementally,
+  so opens are ~instant instead of re-parsing 252 MB every time. This adds
+  skill/agent/todo/human spans and per-span cost.
+
+> [!NOTE]
+> **No historical backfill (Issue #62).** The persisted store
+> (`~/.ai-toolkit/telemetry/store.duckdb`) is created **empty at a watermark** — its
+> init time — and only ingests sessions that run **after** it. Spokes that ran before
+> the store existed are **intentionally absent**; the dashboard populates as new spokes
+> run. A new spoke appears after it runs and you re-open the dashboard (it ingests only
+> that spoke's delta — seconds). To rebuild, delete `store.duckdb`: it re-initialises
+> empty at a new watermark — it does **not** re-parse history. See
+> [`docs/telemetry-pull-layer.md`](../docs/telemetry-pull-layer.md#persisted-store-issue-62-phase-a).
 
 Environment variables:
 
