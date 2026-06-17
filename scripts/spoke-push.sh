@@ -83,9 +83,14 @@ else
   echo "→ no .review/*.json artifact found (the pre-push gate blocks if one is required)"
 fi
 
-# The push — pre-push gate hooks fire here. No --no-verify, ever.
+# The push — pre-push gate hooks fire here. No --no-verify, ever. Run it with this
+# push's own span id as AI_TOOLKIT_PARENT_SPAN (Issue #66, leading assignment —
+# scoped to the git process, safe inside a script) so the native gate hooks
+# (test-select, red-proof-warn, …) the push triggers nest under spoke-push rather
+# than the Bash tool call. Empty span id (telemetry off) is harmless — it resolves
+# to the file/spoke-root fallback exactly as an unset var would.
 echo "→ git push -u origin $BRANCH"
-git push -u origin "$BRANCH"
+AI_TOOLKIT_PARENT_SPAN="$_SP_SPAN_ID" git push -u origin "$BRANCH"
 
 # Final subtask: emit the ready/<issue> completion marker via the canonical
 # marker emitter (issue #45) — one annotated, force-moved (idempotent) tag pushed
@@ -95,14 +100,10 @@ git push -u origin "$BRANCH"
 # on /land; a mid-cycle push passes no --ready and so emits nothing.
 if [ -n "$READY" ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  # Export THIS push's span id as the child's parent (Issue #66) so spoke-ready's
-  # marker-emission span nests under this push instead of inheriting our own parent
-  # (the Bash tool call). A bare leading assignment scopes it to the child only.
-  if [ -n "$_SP_SPAN_ID" ]; then
-    AI_TOOLKIT_PARENT_SPAN="$_SP_SPAN_ID" bash "$SCRIPT_DIR/spoke-ready.sh" "$READY"
-  else
-    bash "$SCRIPT_DIR/spoke-ready.sh" "$READY"
-  fi
+  # Run spoke-ready with THIS push's span id as its parent (Issue #66) so the
+  # marker-emission span nests under this push, not our own parent (the Bash tool
+  # call). Leading assignment scopes it to the child; empty is harmless (fallback).
+  AI_TOOLKIT_PARENT_SPAN="$_SP_SPAN_ID" bash "$SCRIPT_DIR/spoke-ready.sh" "$READY"
 fi
 
 echo "✓ spoke-push complete: pushed $BRANCH${READY:+ + marker ready/$READY}"
