@@ -74,6 +74,12 @@ next-batch:
   description: "Compute and dispatch the next set of issues that can run concurrently: batch-plan.sh reads the open backlog in one gh api graphql round-trip, ranks ready issues by critical-path depth, greedily packs a disjoint-scope batch (honoring in-flight spoke scopes), then spawns each via worktree-new.sh. Use on the main checkout when the user says /next-batch, 'dispatch the next batch', or 'what can run in parallel right now'. Independent of /afk."
   allowed-tools: "run_in_terminal read_file grep_search"
 
+afk:
+  name: "afk"
+  description: "Drain the backlog unattended: the hub toggle that, for a bounded window or until the backlog is empty, keeps plan→dispatch→auto-answer→auto-land→reap running with zero human input via hub-afk.sh. A parked spoke is answered on the human's behalf by a reasoning answerer (the afk-answering rule) or escalated to blocked. Use on the main checkout when stepping away — '/afk <duration>', '/afk until HH:MM', '/afk drain', plus '/afk off' and '/afk status'. Replaces legacy night mode."
+  allowed-tools: "run_in_terminal read_file grep_search"
+  argument-hint: "[<duration> | until HH:MM | drain | off | status]"
+
 tdd-workflow:
   name: "tdd-workflow"
   description: "Guide through TDD red-green-refactor cycle."

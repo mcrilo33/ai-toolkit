@@ -59,6 +59,25 @@ wt_now_ms() {
   command -v _telemetry_now_ms >/dev/null 2>&1 && _telemetry_now_ms || true
 }
 
+# --- portable date/time -------------------------------------------------------
+# BSD (macOS) and GNU date differ; try the BSD form first, fall back to GNU.
+# Lifted here from the night dispatcher so the unattended supervisor (hub-afk.sh)
+# and any future caller share one copy and the night helpers can be retired
+# without dragging a private date layer along with them.
+
+# wt_date_ymd <epoch> -> YYYY-MM-DD (local time).
+wt_date_ymd() {
+  date -r "$1" +%Y-%m-%d 2>/dev/null || date -d "@$1" +%Y-%m-%d
+}
+
+# wt_epoch_at <yyyy-mm-dd> <hh:mm> -> epoch seconds (local time).
+# Seconds are pinned to :00 explicitly: BSD `date -j -f` fills a missing %S field
+# from the current wall clock, which would leak the invocation second into the
+# result and could flip a one-minute cutoff/window decision.
+wt_epoch_at() {
+  date -j -f "%Y-%m-%d %H:%M:%S" "$1 $2:00" +%s 2>/dev/null || date -d "$1 $2" +%s
+}
+
 # --- paths --------------------------------------------------------------------
 
 # Canonical absolute path (resolves symlinks, e.g. /tmp -> /private/tmp on macOS).
