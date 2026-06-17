@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -210,6 +211,62 @@ def _node_label(node: dict) -> str:
     return label
 
 
+def _row_glyph(node: dict) -> str:
+    """The row's leading glyph: 📐 for a per-turn context node, else the status icon.
+
+    A causal context node (it carries ``input_context``) is input *state*, not an event
+    with an outcome, so it reads as the spec's ``📐 context`` rather than a ✅ tick. Every
+    other node shows its rolled-up terminal status icon (a leaf's rollup is its own).
+    """
+    if node["kind"] == "context" and node.get("input_context") is not None:
+        return "📐"
+    status = (node.get("rollup") or {}).get("status") or node["status"]
+    return _STATUS_ICON.get(status, "•")
+
+
+def _context_item_rows(ctx: dict) -> list[dict]:
+    """The per-item drill rows of a context node's input state, each with its tokens.
+
+    One row per named load — each rule, ``CLAUDE.md``, each memory, then the tool-schemas
+    as one ``tool-schemas xN`` group — followed by the history remainder, in
+    load-then-history order. Each row carries a ``$0`` cost slot (loaded context bears no
+    inference cost) and the row tokens reconcile to the context total (Issue #67).
+    """
+    rows: list[dict] = []
+    for rule in ctx["rules"]:
+        rows.append({"label": f"rule · {rule['name']}", "tokens": rule["tokens"], "cost": 0.0})
+    if ctx["claude_md"]:
+        rows.append({"label": "CLAUDE.md", "tokens": ctx["claude_md"]["tokens"], "cost": 0.0})
+    for memory in ctx["memory"]:
+        rows.append(
+            {"label": f"memory · {memory['name']}", "tokens": memory["tokens"], "cost": 0.0}
+        )
+    schemas = ctx["schemas"]
+    if schemas["count"]:
+        rows.append(
+            {"label": f"tool-schemas x{schemas['count']}", "tokens": schemas["tokens"], "cost": 0.0}
+        )
+    rows.append({"label": "history", "tokens": ctx["history_tokens"], "cost": 0.0})
+    return rows
+
+
+def _render_context_item(item: dict, depth: int) -> None:
+    """One drilled context-item row: indented name + its tokens in the Tokens column.
+
+    A named load has no clock/duration/actor of its own; the Cost column is its ``$0``
+    slot and the trailing column is left as the summary slot Phase 6 fills.
+    """
+    indent = "&nbsp;&nbsp;&nbsp;&nbsp;" * depth
+    cols = st.columns(_STEP_COLS)
+    cols[0].markdown(f"{indent}↳ {item['label']}")
+    cols[1].markdown("")
+    cols[2].markdown("")
+    cols[3].markdown(_fmt_cost(item["cost"]))
+    cols[4].markdown(f"{item['tokens']:,}")
+    cols[5].markdown("")
+    cols[6].markdown("")
+
+
 def _render_divider(node: dict) -> None:
     """A gap (idle) or session-resume node as a thin divider, not a metric row."""
     if node["kind"] == "session":
@@ -225,11 +282,10 @@ def _render_divider(node: dict) -> None:
 def _node_row(node: dict, depth: int, inherited_actor: str = "main") -> None:
     """One trace row: indented label + Time(start clock)·Dur·Cost·Tokens·H·Actor."""
     indent = "&nbsp;&nbsp;&nbsp;&nbsp;" * depth
-    # Render the rolled-up (terminal) status so a container reads as its last-event
-    # outcome, not a worst-child reddening (Issue #57); a leaf's rollup equals its own
-    # status. Fall back to the raw status for any node built without a rollup.
-    status = (node.get("rollup") or {}).get("status") or node["status"]
-    icon = _STATUS_ICON.get(status, "•")
+    # The leading glyph is the rolled-up (terminal) status — a container reads as its
+    # last-event outcome, not a worst-child reddening (Issue #57), a leaf's rollup
+    # equals its own status — except a per-turn context node, which reads as 📐 (#67).
+    icon = _row_glyph(node)
     metrics = queries.format_step_metrics(node)
     cols = st.columns(_STEP_COLS)
     cols[0].markdown(f"{indent}{icon} `{node['kind']}` **{_node_label(node)}**")
@@ -255,6 +311,14 @@ def _render_node(node: dict, depth: int, path: str, inherited_actor: str = "main
         _render_divider(node)
         return
     _node_row(node, depth, inherited_actor)
+    # A per-turn context node holds its named items in ``input_context`` (not children),
+    # so it drills into those rows — each named load + the history remainder (Issue #67).
+    ctx = node.get("input_context")
+    if ctx is not None:
+        if st.toggle(f"↳ drill into {_node_label(node)}", key=f"drill::{path}", value=False):
+            for item in _context_item_rows(ctx):
+                _render_context_item(item, depth + 1)
+        return
     children = node.get("children") or []
     if not children:
         return
@@ -428,6 +492,13 @@ def _spoke_forest(store: queries.SpanStore, spoke_id: str, source_key: str) -> l
     """
     key = (spoke_id, source_key)
     if key not in _FOREST_CACHE:
+        # Live-follow folds the transcript mtime into ``source_key``, so a growing spoke
+        # would otherwise leave one entry per refresh. The UI only ever requests the
+        # current build, so a fresh build supersedes any prior same-spoke entry — evict
+        # them to keep the cache bounded (#67). A static (same-key) refresh hits the
+        # branch below and reuses the cached object by reference, so a drill never rebuilds.
+        for stale in [cached for cached in _FOREST_CACHE if cached[0] == spoke_id]:
+            del _FOREST_CACHE[stale]
         _FOREST_CACHE[key] = _build_spoke_forest(store, spoke_id)
     return _FOREST_CACHE[key]
 
@@ -450,6 +521,67 @@ def _build_spoke_forest(store: queries.SpanStore, spoke_id: str) -> list[dict]:
     return store.spoke_steps(spoke_id)
 
 
+# Live-follow (Issue #67). A spoke whose transcript changed within this window is taken
+# to be still running, so the view offers to auto-refresh the causal tree as the
+# transcript grows — no live-emission hook, no daemon, just a re-read of the file.
+_LIVE_WINDOW_SECS = 120.0
+_LIVE_REFRESH = "8s"  # auto-refresh cadence for a followed spoke (the spec's ~5–10s)
+
+
+def _spoke_is_running(
+    transcript_mtime: float, now: float, window: float = _LIVE_WINDOW_SECS
+) -> bool:
+    """True when the spoke's transcript was written within ``window`` seconds of ``now``.
+
+    The hook-free / daemon-free live signal: recent transcript writes mean the spoke is
+    still producing turns, so the view can auto-refresh to follow it. A ``0.0`` mtime (no
+    transcript on disk — a push-only or fixture spoke) is never running.
+    """
+    return transcript_mtime > 0.0 and (now - transcript_mtime) <= window
+
+
+def _forest_cache_key(source_key: str, live_mtime: float) -> str:
+    """The per-spoke forest cache key: the data source plus the transcript mtime.
+
+    Folding the transcript mtime in means a grown transcript (mtime advanced) rebuilds the
+    cached tree on the next refresh, while a static transcript — an expand/collapse toggle
+    with no new turns — reuses it instantly, so a drill never triggers a rebuild (#67).
+    """
+    return f"{source_key}@{live_mtime}"
+
+
+def _spoke_live_mtime(store: queries.SpanStore, spoke_id: str, projects_dir: Path) -> float:
+    """The spoke's newest transcript mtime, or ``0.0`` when unavailable.
+
+    Guards the live signal: a raw push-only store has no transcript method and a missing
+    session-logs dir has nothing to stat, so both read as 'not running'.
+    """
+    read = getattr(store, "spoke_transcript_mtime", None)
+    if read is None or not projects_dir.exists():
+        return 0.0
+    return read(spoke_id, projects_dir)
+
+
+def _render_steps_body(
+    store: queries.SpanStore, spoke_id: str, projects_dir: Path, source_key: str
+) -> None:
+    """Render the Steps tab: header row + the L1 trace spine, or an empty-state note.
+
+    Re-reads the spoke's transcript mtime so a live refresh rebuilds the tree only on real
+    growth (a new mtime → new cache key); a static transcript reuses the cached forest, so
+    an expand/collapse toggle re-renders the same objects without a rebuild (#67).
+    """
+    mtime = _spoke_live_mtime(store, spoke_id, projects_dir)
+    forest = _spoke_forest(store, spoke_id, _forest_cache_key(source_key, mtime))
+    if not forest:
+        st.info("No spans for this spoke run.")
+        return
+    head = st.columns(_STEP_COLS)
+    for col, name in zip(head, _STEP_HEADERS, strict=True):
+        col.markdown(f"**{name}**")
+    _render_spine(forest)
+
+
 def render_spoke_view(store: queries.SpanStore, source_key: str = "") -> None:
     st.header("Spoke view")
     st.caption(
@@ -463,17 +595,32 @@ def render_spoke_view(store: queries.SpanStore, source_key: str = "") -> None:
         return
 
     spoke_id = st.selectbox("Spoke run", spoke_ids, format_func=queries.format_spoke_label)
-    forest = _spoke_forest(store, spoke_id, source_key)
+    projects_dir = resolve_projects_dir()
+    live_mtime = _spoke_live_mtime(store, spoke_id, projects_dir)
+
+    follow = False
+    if _spoke_is_running(live_mtime, time.time()):
+        follow = st.toggle(
+            f"🔴 Follow live (auto-refresh ~{_LIVE_REFRESH})",
+            value=False,
+            key=f"live_follow::{spoke_id}",
+        )
+
+    # The shared build for the non-live tabs; keyed on the same mtime, so the Steps tab's
+    # re-read returns this exact cached forest when the transcript has not grown.
+    forest = _spoke_forest(store, spoke_id, _forest_cache_key(source_key, live_mtime))
     steps_tab, meta_tab, comp_tab = st.tabs(["Steps", "Meta by kind", "Composition"])
 
     with steps_tab:
-        if not forest:
-            st.info("No spans for this spoke run.")
+        # Only the selected running spoke auto-refreshes, and only its Steps tab — the
+        # st.fragment re-runs just this body on the interval, leaving the rest static.
+        def _steps() -> None:
+            _render_steps_body(store, spoke_id, projects_dir, source_key)
+
+        if follow:
+            st.fragment(run_every=_LIVE_REFRESH)(_steps)()
         else:
-            head = st.columns(_STEP_COLS)
-            for col, name in zip(head, _STEP_HEADERS, strict=True):
-                col.markdown(f"**{name}**")
-            _render_spine(forest)
+            _steps()
 
     with meta_tab:
         _render_meta(store, spoke_id)
