@@ -21,15 +21,21 @@ in S4; idle/resume dividers in S5.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any
 
-from telemetry.causal import CausalNode, causal_node
+from telemetry.causal import CausalNode, InputContext, causal_node
 
 # Push markers that form the L1 phase spine; folded into ``interval`` bucket nodes.
 _MARKER_KINDS = frozenset({"step", "lifecycle"})
 # Actors that are their own owner — a child does not inherit these from its parent.
 _OWN_ACTORS = frozenset({"main", "hooks", "script", "workflow"})
+# The loaded-context subtype each ``rule``-kind span's ``phase`` names.
+_CTX_RULE = "rule"
+_CTX_CLAUDE_MD = "CLAUDE.md"
+_CTX_MEMORY = "memory"
+_CTX_TOOL_SCHEMA = "tool-schema"
 
 
 def build_causal_forest(
@@ -52,6 +58,7 @@ def build_causal_forest(
     """
     nodes: dict[str, CausalNode] = {}
     main_turns: list[CausalNode] = []
+    main_turn_rows: list[tuple[CausalNode, dict[str, Any]]] = []
     sub_turns: list[tuple[CausalNode, str | None]] = []
     for row in turns:
         node = _turn_node(row)
@@ -60,8 +67,10 @@ def build_causal_forest(
             sub_turns.append((node, row.get("agent_id")))
         else:
             main_turns.append(node)
+            main_turn_rows.append((node, row))
 
     agent_by_link: dict[str, str] = {}
+    context_by_session: dict[str | None, dict[str, Any]] = {}
     markers: list[dict[str, Any]] = []
     actions: list[dict[str, Any]] = []
     hooks: list[dict[str, Any]] = []
@@ -72,12 +81,18 @@ def build_causal_forest(
             markers.append(span)
             continue
         if kind == "rule":
-            continue  # loaded context is layered on as per-turn `context` nodes in S4
+            _collect_context(context_by_session, span)  # folded into per-turn context (S4)
+            continue
         node = _span_node(span)
         nodes[node["node_id"]] = node
         if kind == "agent" and span.get("agent_link"):
             agent_by_link[span["agent_link"]] = node["node_id"]
         (hooks if kind == "hook" else scripts if kind == "script" else actions).append(span)
+
+    for node, row in main_turn_rows:
+        node["children"].insert(
+            0, _context_child(node, row, context_by_session.get(row.get("session_id")))
+        )
 
     roots: list[CausalNode] = list(_build_spine(markers, main_turns))
     for node, agent_id in sub_turns:
@@ -165,6 +180,80 @@ def _interval_for(ts: float, bounds: list[tuple[float, float, CausalNode, bool]]
         if lo < ts <= hi or (is_last and ts > hi):
             return interval
     return bounds[0][2]
+
+
+def _collect_context(by_session: dict[str | None, dict[str, Any]], span: dict[str, Any]) -> None:
+    """Fold one loaded-context ``rule`` span into its session's accumulator by subtype."""
+    ctx = by_session.setdefault(
+        span.get("session_id"),
+        {"rules": [], "claude_md": None, "memory": [], "schema_count": 0, "schema_tokens": 0},
+    )
+    item: dict[str, Any] = {
+        "name": span.get("name") or "",
+        "tokens": _estimate_tokens(span.get("summary")),
+    }
+    phase = span.get("phase")
+    if phase == _CTX_RULE:
+        ctx["rules"].append(item)
+    elif phase == _CTX_CLAUDE_MD:
+        ctx["claude_md"] = item
+    elif phase == _CTX_MEMORY:
+        ctx["memory"].append(item)
+    elif phase == _CTX_TOOL_SCHEMA:
+        ctx["schema_count"] += 1
+        ctx["schema_tokens"] += item["tokens"]
+
+
+def _context_child(turn: CausalNode, row: dict[str, Any], ctx: dict[str, Any] | None) -> CausalNode:
+    """The single ``context`` node a main turn carries — its named input state + real tokens.
+
+    The named items keep their byte-size estimates; the cached prefix total is the turn's
+    real ``cache_read + cache_creation`` (never less than the named items), and ``history``
+    is whatever of that prefix the named items do not account for (the modeled split,
+    anchored to the real total per the spec).
+    """
+    ctx = ctx or {
+        "rules": [],
+        "claude_md": None,
+        "memory": [],
+        "schema_count": 0,
+        "schema_tokens": 0,
+    }
+    rules, claude_md, memory = ctx["rules"], ctx["claude_md"], ctx["memory"]
+    schemas = {"count": ctx["schema_count"], "tokens": ctx["schema_tokens"]}
+    named = (
+        sum(r["tokens"] for r in rules)
+        + (claude_md["tokens"] if claude_md else 0)
+        + sum(m["tokens"] for m in memory)
+        + schemas["tokens"]
+    )
+    total = max(int(row.get("cache_read") or 0) + int(row.get("cache_creation") or 0), named)
+    input_context: InputContext = {
+        "rules": rules,
+        "claude_md": claude_md,
+        "memory": memory,
+        "schemas": schemas,
+        "history_tokens": total - named,
+        "total_tokens": total,
+    }
+    return causal_node(
+        node_id=f"ctx:{turn['node_id']}",
+        kind="context",
+        name="context",
+        parent_id=turn["node_id"],
+        actor=turn["actor"],
+        ts_start=turn["ts_start"],
+        ts_end=turn["ts_start"],
+        input_context=input_context,
+    )
+
+
+def _estimate_tokens(summary: object) -> int:
+    """The integer token estimate from a ``~N tokens`` context-load summary (else 0)."""
+    if not isinstance(summary, str):
+        return 0
+    digits = re.sub(r"[^\d]", "", summary)
+    return int(digits) if digits else 0
 
 
 def _turn_node(row: dict[str, Any]) -> CausalNode:
