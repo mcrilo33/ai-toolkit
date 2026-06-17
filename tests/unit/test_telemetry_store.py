@@ -35,6 +35,9 @@ CCUSAGE = {SESSION_ID: 2.80}
 
 # A fixed "old" mtime for copied session files so the watermark math is deterministic.
 _OLD_MTIME = 1_600_000_000.0  # 2020-09-13, far before any plausible watermark
+# A watermark after ALL fixture activity — later than both the old file mtimes and the
+# fixture spans' 2026 ``ts_start`` — so a "nothing post-watermark" run ingests nothing.
+_FUTURE_WATERMARK = 2_000_000_000.0  # 2033-05-18
 
 
 def _projects(tmp_path: Path, *, mtime: float = _OLD_MTIME) -> Path:
@@ -96,7 +99,7 @@ def test_pre_watermark_sessions_are_never_parsed(tmp_path: Path, monkeypatch) ->
         events_path=EVENTS,
         projects_root=projects,
         ccusage_costs=CCUSAGE,
-        watermark=_OLD_MTIME + 10_000,
+        watermark=_FUTURE_WATERMARK,
     )
 
     assert parsed == [], "pre-watermark session logs must not be parsed"
@@ -194,8 +197,117 @@ def test_rebuild_reinits_empty_at_a_new_watermark(tmp_path: Path) -> None:
         events_path=EVENTS,
         projects_root=projects,
         ccusage_costs=CCUSAGE,
-        watermark=_OLD_MTIME + 10_000,
+        watermark=_FUTURE_WATERMARK,
     )
 
     assert _span_count(store) == 0
-    assert store_watermark(store) == _OLD_MTIME + 10_000
+    assert store_watermark(store) == _FUTURE_WATERMARK
+
+
+def _write_events(path: Path, spans: list[dict]) -> None:
+    import json
+
+    path.write_text("\n".join(json.dumps(s) for s in spans) + "\n")
+
+
+def _span_ids(store_path: Path) -> set[str]:
+    import duckdb
+
+    con = duckdb.connect(str(store_path), read_only=True)
+    try:
+        return {row[0] for row in con.execute("SELECT span_id FROM spans").fetchall()}
+    finally:
+        con.close()
+
+
+def test_sessionless_lifecycle_and_script_push_spans_are_ingested(tmp_path: Path) -> None:
+    # Real lifecycle/script emitters (worktree-new/done, spoke-push) run from standalone
+    # scripts with no hook payload, so they emit spans with session_id=null but a valid
+    # spoke_run_id. The store must keep them — they bracket the spoke and carry script
+    # nodes — even though no transcript can be keyed to them.
+    store = tmp_path / "store.duckdb"
+    events = tmp_path / "events.jsonl"
+    _write_events(
+        events,
+        [
+            {
+                "span_id": "lc_spawn",
+                "spoke_run_id": "feature/77-x+1700000000",
+                "kind": "lifecycle",
+                "name": "worktree-new",
+                "phase": "spawn",
+                "ts_start": "2026-06-12T09:00:00Z",
+                "ts_end": "2026-06-12T09:00:02Z",
+            },
+            {
+                "span_id": "sc_push",
+                "spoke_run_id": "feature/77-x+1700000000",
+                "kind": "script",
+                "name": "spoke-push",
+                "ts_start": "2026-06-12T09:30:00Z",
+                "ts_end": "2026-06-12T09:30:01Z",
+            },
+        ],
+    )
+
+    ingest_store(
+        store,
+        events_path=events,
+        projects_root=tmp_path / "no-projects",
+        ccusage_costs={},
+        watermark=0.0,
+    )
+
+    assert {"lc_spawn", "sc_push"} <= _span_ids(store)
+
+
+def test_push_span_appended_after_transcript_settles_is_applied(tmp_path: Path) -> None:
+    # The WAL grows independently of transcripts: a push span (e.g. the push-gate step)
+    # can be appended after the session settled. A cursor keyed only on the transcript
+    # would drop it forever; the wholesale push refresh must re-apply it.
+    store = tmp_path / "store.duckdb"
+    events = tmp_path / "events.jsonl"
+    red = {
+        "span_id": "step_red",
+        "spoke_run_id": "feature/77-x+1700000000",
+        "kind": "step",
+        "name": "solo-cycle",
+        "phase": "red",
+        "ts_start": "2026-06-12T09:05:00Z",
+        "ts_end": "2026-06-12T09:05:10Z",
+    }
+    _write_events(events, [red])
+    ingest_store(
+        store,
+        events_path=events,
+        projects_root=tmp_path / "no-projects",
+        ccusage_costs={},
+        watermark=0.0,
+    )
+    assert _span_ids(store) == {"step_red"}
+
+    # Append the push-gate span; no transcript changed.
+    _write_events(
+        events,
+        [
+            red,
+            {
+                "span_id": "step_push",
+                "spoke_run_id": "feature/77-x+1700000000",
+                "kind": "step",
+                "name": "solo-cycle",
+                "phase": "push",
+                "ts_start": "2026-06-12T10:00:00Z",
+                "ts_end": "2026-06-12T10:00:05Z",
+            },
+        ],
+    )
+    ingest_store(
+        store,
+        events_path=events,
+        projects_root=tmp_path / "no-projects",
+        ccusage_costs={},
+        watermark=0.0,
+    )
+
+    assert _span_ids(store) == {"step_red", "step_push"}

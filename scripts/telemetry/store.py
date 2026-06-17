@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+from datetime import datetime
 from pathlib import Path
 
 import duckdb
@@ -46,7 +47,7 @@ from telemetry.queries import (
     _load_push_spans,
     _row,
 )
-from telemetry.session_parser import parse_session_file
+from telemetry.session_parser import UsageEvent, parse_session_file
 from telemetry.spans import Span
 from telemetry.spoke_runs import backfill_spoke_run_ids
 
@@ -55,8 +56,28 @@ _WATERMARK_KEY = "watermark"
 
 
 def _ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
-    """Create the store's tables if absent (idempotent)."""
-    con.execute(f"CREATE TABLE IF NOT EXISTS spans ({', '.join(_COLUMNS)})")
+    """Create the store's tables + the unified ``spans`` view if absent (idempotent).
+
+    Spans live in two partitions with distinct lifecycles:
+
+    - ``pull_spans`` — parsed from session transcripts, ingested per session on a
+      cursor (a transcript only grows, so a session's pull spans are stable between
+      opens);
+    - ``push_spans`` — read wholesale from the ``events.jsonl`` WAL on every ingest,
+      because the WAL and the transcripts grow independently (a hook can append a push
+      span — e.g. the push-gate ``step`` — long after the transcript settles), and
+      ``lifecycle``/``script`` spans from standalone scripts carry no ``session_id`` at
+      all, so they cannot be keyed to a transcript.
+
+    The ``spans`` view is their union — every query reads it exactly as the old
+    single-table dataset.
+    """
+    con.execute(f"CREATE TABLE IF NOT EXISTS pull_spans ({', '.join(_COLUMNS)})")
+    con.execute(f"CREATE TABLE IF NOT EXISTS push_spans ({', '.join(_COLUMNS)})")
+    con.execute(
+        "CREATE OR REPLACE VIEW spans AS "
+        "SELECT * FROM pull_spans UNION ALL SELECT * FROM push_spans"
+    )
     con.execute(f"CREATE TABLE IF NOT EXISTS turns ({', '.join(_TURN_COLUMNS)})")
     con.execute("CREATE TABLE IF NOT EXISTS session_costs (session_id VARCHAR, cost_usd DOUBLE)")
     con.execute(
@@ -87,22 +108,38 @@ def _session_files(projects_root: str | Path) -> list[Path]:
     return sorted(p for p in Path(projects_root).glob("*/*.jsonl") if "subagents" not in p.parts)
 
 
-def _push_by_session(events_path: Path) -> dict[str, list[Span]]:
-    """Push spans (WAL) with emissions linked, grouped by ``session_id``.
+def _load_linked_push_spans(events_path: Path) -> list[Span]:
+    """All WAL push spans with the script→marker emission link resolved.
 
-    Emission is linked over ALL push spans first (it is per-spoke-run and can cross
-    sessions), then the spans are bucketed by session so each is ingested alongside the
-    session that owns it. Push spans with no ``session_id`` (ad-hoc, sessionless) are
-    dropped — the store holds only post-watermark spoke activity, keyed by session.
+    Emission is per-spoke-run and can cross sessions, so it is linked over the whole
+    push set (read in full from the append-only WAL — cheap) before the spans are used.
     """
     push_spans = _load_push_spans(events_path)
     _link_emissions(push_spans)
+    return push_spans
+
+
+def _push_peers_by_session(push_spans: list[Span]) -> dict[str, list[Span]]:
+    """Session-bearing push spans grouped by ``session_id`` — the backfill peers.
+
+    A pull span recovers its null ``spoke_run_id`` from a push span sharing its
+    ``session_id``; sessionless push spans cannot be a peer, so they are omitted here
+    (they are still persisted by :func:`_refresh_push_spans`).
+    """
     by_session: dict[str, list[Span]] = {}
     for span in push_spans:
-        if span.session_id is None:
-            continue
-        by_session.setdefault(span.session_id, []).append(span)
+        if span.session_id is not None:
+            by_session.setdefault(span.session_id, []).append(span)
     return by_session
+
+
+def _insert_spans(con: duckdb.DuckDBPyConnection, table: str, span_dicts: list[dict]) -> None:
+    if not span_dicts:
+        return
+    placeholders = ", ".join("?" for _ in _COLUMN_NAMES)
+    con.executemany(
+        f"INSERT INTO {table} VALUES ({placeholders})", [_row(span) for span in span_dicts]
+    )
 
 
 def _upsert_session(
@@ -111,15 +148,10 @@ def _upsert_session(
     span_dicts: list[dict[str, object]],
     turn_rows: list[dict[str, object]],
 ) -> None:
-    """Replace one session's spans + turns (delete-then-insert, idempotent by id)."""
-    con.execute("DELETE FROM spans WHERE session_id = ?", [session_id])
+    """Replace one session's PULL spans + turns (delete-then-insert, idempotent by id)."""
+    con.execute("DELETE FROM pull_spans WHERE session_id = ?", [session_id])
     con.execute("DELETE FROM turns WHERE session_id = ?", [session_id])
-    if span_dicts:
-        placeholders = ", ".join("?" for _ in _COLUMN_NAMES)
-        con.executemany(
-            f"INSERT INTO spans VALUES ({placeholders})",
-            [_row(span) for span in span_dicts],
-        )
+    _insert_spans(con, "pull_spans", span_dicts)
     if turn_rows:
         placeholders = ", ".join("?" for _ in _TURN_FIELDS)
         con.executemany(
@@ -130,21 +162,83 @@ def _upsert_session(
 
 def _correlate_session(
     session_file: Path,
-    push_spans: list[Span],
+    push_peers: list[Span],
     ccusage_costs: dict[str, float],
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """Parse + correlate one session into ``(span_dicts, turn_rows)``.
+    """Parse + correlate one session's PULL spans into ``(span_dicts, turn_rows)``.
 
     Per-session correlation is identical to the whole-dataset parse: spoke_run_id is
     backfilled from a same-session push peer, tokens/cost are attributed from this
-    session's own usage + ccusage rate, and turns are the once-per-turn rows.
+    session's own usage + ccusage rate, and turns are the once-per-turn rows. The push
+    peers are used only to backfill the pull spans' run id — they are persisted
+    separately (wholesale), so they are not returned here.
     """
     parsed = parse_session_file(session_file)
-    spans = parsed.spans + push_spans
-    backfill_spoke_run_ids(spans)
-    attribute_spans(spans, parsed.usage_events, ccusage_costs, agent_links=parsed.agent_links)
+    backfill_spoke_run_ids(parsed.spans + push_peers)
+    attribute_spans(
+        parsed.spans, parsed.usage_events, ccusage_costs, agent_links=parsed.agent_links
+    )
     turns = per_turn_rows(parsed.usage_events, ccusage_costs, reasoning_refs=parsed.reasoning_refs)
-    return [span.to_dict() for span in spans], turns
+    return [span.to_dict() for span in parsed.spans], turns
+
+
+def _usage_events_from_turns(con: duckdb.DuckDBPyConnection) -> list[UsageEvent]:
+    """Reconstruct per-turn usage from the persisted ``turns`` table.
+
+    Push-span attribution brackets a session's main turns; the ``turns`` table already
+    carries every turn's tokens + cache breakdown, so it is reused as the usage source
+    rather than re-parsing the transcripts.
+    """
+    rows = con.execute(
+        "SELECT session_id, ts, model, source, agent_id, tokens_in, tokens_out, "
+        "cache_read, cache_creation FROM turns"
+    ).fetchall()
+    return [
+        UsageEvent(
+            session_id=r[0],
+            ts=r[1],
+            model=r[2],
+            source=r[3],
+            agent_id=r[4],
+            input_tokens=r[5] or 0,
+            output_tokens=r[6] or 0,
+            cache_read=r[7] or 0,
+            cache_creation=r[8] or 0,
+        )
+        for r in rows
+    ]
+
+
+def _epoch(ts_iso: str | None) -> float | None:
+    """ISO-8601 timestamp → epoch seconds, or ``None`` when absent/malformed."""
+    if not ts_iso:
+        return None
+    try:
+        return datetime.fromisoformat(ts_iso.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _refresh_push_spans(
+    con: duckdb.DuckDBPyConnection,
+    push_spans: list[Span],
+    ccusage_costs: dict[str, float],
+    watermark: float,
+) -> None:
+    """Replace the whole push partition from the WAL (attributed) on every ingest.
+
+    The WAL grows independently of the transcripts, so push spans are re-applied
+    wholesale rather than gated on a session cursor — this keeps post-settle push spans
+    (e.g. the push gate) and sessionless ``lifecycle``/``script`` spans present. Only
+    spans emitted at/after the watermark are kept, by ``ts_start`` (sessionless spans
+    have no transcript mtime to test), so a pre-watermark spoke never resurfaces as a
+    push-only ghost. Tokens are bracketed from the persisted turns; a sessionless span
+    brackets nothing and so stays at zero tokens, exactly as the old parse produced.
+    """
+    post = [s for s in push_spans if (e := _epoch(s.ts_start)) is not None and e >= watermark]
+    attribute_spans(post, _usage_events_from_turns(con), ccusage_costs)
+    con.execute("DELETE FROM push_spans")
+    _insert_spans(con, "push_spans", [span.to_dict() for span in post])
 
 
 def _version(
@@ -214,7 +308,8 @@ def ingest_store(
         if ccusage_costs:
             con.executemany("INSERT INTO session_costs VALUES (?, ?)", list(ccusage_costs.items()))
 
-        push_by_session = _push_by_session(events_path)
+        push_spans = _load_linked_push_spans(events_path)
+        push_peers = _push_peers_by_session(push_spans)
         cursor = {
             row[0]: (row[1], row[2])
             for row in con.execute(
@@ -222,6 +317,7 @@ def ingest_store(
             ).fetchall()
         }
 
+        # Pull spans: parse + correlate only post-watermark transcripts whose cursor moved.
         for session_file in _session_files(projects_root):
             stat = session_file.stat()
             if stat.st_mtime < wm:  # pre-watermark backlog: never parsed
@@ -231,7 +327,7 @@ def ingest_store(
                 continue  # unchanged since last ingest
             session_id = session_file.stem
             span_dicts, turn_rows = _correlate_session(
-                session_file, push_by_session.get(session_id, []), ccusage_costs
+                session_file, push_peers.get(session_id, []), ccusage_costs
             )
             _upsert_session(con, session_id, span_dicts, turn_rows)
             con.execute("DELETE FROM ingest_cursor WHERE session_file = ?", [key])
@@ -239,6 +335,10 @@ def ingest_store(
                 "INSERT INTO ingest_cursor VALUES (?, ?, ?)",
                 [key, stat.st_mtime_ns, stat.st_size],
             )
+
+        # Push spans: re-applied wholesale from the WAL (attributed off the persisted
+        # turns) every open, independent of the transcript cursor.
+        _refresh_push_spans(con, push_spans, ccusage_costs, wm)
 
         _create_views(con)
         return _version(con, events_path, ccusage_costs)
