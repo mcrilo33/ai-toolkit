@@ -355,9 +355,9 @@ def test_agent_launch_respects_model_and_effort_overrides(hub: Path, tmp_path: P
 
 
 def test_agent_launch_appends_budget_args_when_set(hub: Path, tmp_path: Path) -> None:
-    # A best-effort in-process budget cap for unattended night spokes: hub-night
-    # sets WT_AGENT_BUDGET_ARGS from NIGHT_MAX_BUDGET_USD, appended after the model
-    # (before any seeded prompt). Day spokes leave it unset → launch unchanged.
+    # A best-effort in-process budget cap for unattended spokes: a caller sets
+    # WT_AGENT_BUDGET_ARGS, appended after the model (before any seeded prompt).
+    # Attended spokes leave it unset → launch unchanged.
     overrides = {"WT_AGENT_BUDGET_ARGS": "--max-budget-usd 5"}
 
     proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", extra_env=overrides)

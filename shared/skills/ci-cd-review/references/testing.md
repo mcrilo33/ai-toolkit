@@ -63,7 +63,7 @@ jobs:
 ## Performance and load testing
 
 - Tools: k6, Locust, JMeter, Gatling, Artillery
-- Run less frequently: nightly, weekly, or on significant merges
+- Run less frequently: on a daily schedule, weekly, or on significant merges
 - Define thresholds (response time, throughput, error rates) and fail on breach
 - Compare against established baselines
 

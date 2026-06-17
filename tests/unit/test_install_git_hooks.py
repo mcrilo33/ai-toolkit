@@ -129,32 +129,22 @@ def test_anti_gutting_copied_into_hooks(repo: Path) -> None:
     assert os.access(scan, os.X_OK)
 
 
-# --- the anti-gutting tripwire blocks a test-gutting push under NIGHT=1 ----------
+# --- the anti-gutting tripwire is advisory: it warns but never blocks -----------
 
 
-def test_pre_push_blocks_gutting_under_night(repo: Path) -> None:
-    seed = _remote_sha(repo)
+def test_pre_push_allows_gutting_but_warns(repo: Path) -> None:
+    # The tripwire is advisory — a human's ordinary test edit (which may
+    # legitimately remove/weaken an assert) is never gated, but the smell is
+    # surfaced on stderr so it can be eyeballed before landing.
     _unpushed_gutting_commit(repo)
     hooks = _install(repo)
-    _stub_selector(hooks, exit_code=0)  # isolate: only anti-gutting may block
-
-    push = _push(repo, extra_env={"NIGHT": "1"})
-
-    assert push.returncode != 0, "NIGHT must block a test-gutting push"
-    assert _remote_sha(repo) == seed, "nothing may ship when the tripwire fires"
-
-
-def test_pre_push_allows_gutting_off_night(repo: Path) -> None:
-    # Off the night path the tripwire is advisory — a human's ordinary test edit
-    # (which may legitimately remove/weaken an assert) is never gated.
-    _unpushed_gutting_commit(repo)
-    hooks = _install(repo)
-    _stub_selector(hooks, exit_code=0)
+    _stub_selector(hooks, exit_code=0)  # isolate: only anti-gutting could block
 
     push = _push(repo)
 
     assert push.returncode == 0, push.stderr
     assert _remote_sha(repo) == _git(repo, "rev-parse", "HEAD").strip()
+    assert "weakens tests" in push.stderr, "advisory tripwire must still warn"
 
 
 # --- the blocking contract: a failing selector aborts the push ------------------

@@ -2,9 +2,8 @@
 
 Drain the backlog **unattended**. `/afk` is the single hub toggle that keeps issues
 flowing — plan, dispatch, answer, land, refill — with zero human input for a bounded
-window (or until the backlog is empty). It is the supervisor that ties the
-parallel-worktrees workflow together, and it replaces the legacy night mode
-(`hub-night` / scout / morning).
+window (or until the backlog is empty). It is the single unattended supervisor that
+ties the parallel-worktrees workflow together.
 
 Use it on the **main checkout** (the hub), on the default branch, when you are stepping
 away: "drain the backlog while I'm out", "run AFK for an hour", or `/afk <duration>`.

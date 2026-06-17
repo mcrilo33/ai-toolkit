@@ -35,9 +35,6 @@ SOURCES = {name: REPO_ROOT / "scripts" / name for name in WORKTREE_SCRIPTS}
 HUB_SCRIPTS_DIR = REPO_ROOT / "shared" / "skills" / "hub" / "scripts"
 SOURCES["hub-status.sh"] = HUB_SCRIPTS_DIR / "hub-status.sh"
 SOURCES["hub-ready-watch.sh"] = HUB_SCRIPTS_DIR / "hub-ready-watch.sh"
-SOURCES["hub-night.sh"] = HUB_SCRIPTS_DIR / "hub-night.sh"
-SOURCES["hub-scout.sh"] = HUB_SCRIPTS_DIR / "hub-scout.sh"
-SOURCES["hub-morning.sh"] = HUB_SCRIPTS_DIR / "hub-morning.sh"
 # Co-installed so the worktree scripts can source it as a sibling for lifecycle
 # telemetry (it also lives under .claude/hooks/lib/ for the hooks).
 SOURCES["telemetry.sh"] = REPO_ROOT / "shared" / "hooks" / "lib" / "telemetry.sh"

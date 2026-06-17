@@ -1,15 +1,14 @@
 # Next Batch
 
 Compute and dispatch the next set of issues that can safely run **concurrently**.
-This is the scripted successor to the night scout's PARALLEL/SERIAL/MERGE judgment:
-now that every issue carries a `Scope:` line and native blocked-by edges, the next
-parallel batch is a mechanical graph computation, so it stays scripted — no LLM
-tokens in the control plane.
+The PARALLEL / SERIAL / MERGE batching is a mechanical graph computation, not an LLM
+judgment call: now that every issue carries a `Scope:` line and native blocked-by
+edges, the next parallel batch stays scripted — no LLM tokens in the control plane.
 
 Use it on the **main checkout** (the hub) when you want to fan out the backlog:
 "what can run in parallel right now", "dispatch the next batch", or `/next-batch`. It
-is usable manually and is **independent of `/afk`** — it does not wait for a night
-window.
+is usable manually and is **independent of `/afk`** — it runs on demand, not only
+during an unattended drain.
 
 ## What the planner does
 

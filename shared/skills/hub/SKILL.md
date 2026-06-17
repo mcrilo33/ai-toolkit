@@ -76,84 +76,23 @@ loop (`/loop 2m bash .ai-toolkit/scripts/hub-ready-watch.sh`). It is detection o
 - Offline-safe: a finished spoke's tag is locally visible (shared ref store), so a failed
   fetch is non-fatal and local markers still surface.
 
-### Pre-flight batching scout (night mode, optional)
+### Unattended drain and parallel batching
 
-Parallel night spokes are blind to each other, so before launching the dispatcher,
-run the **scout** at setup (while you are awake) to avoid collisions:
+Two skills move a backlog without hands-on dispatching, with the observability
+dashboard as the single source of truth for what happened during a run:
 
-```bash
-bash .ai-toolkit/scripts/hub-scout.sh
-```
-
-It prints a dossier of facts — each `night` issue's file-scope hints (from its
-`Scope:` line, see `start-task`), the raw file overlap between issues, and a
-critical-path feasibility check (does an all-parallel / all-serial makespan fit
-before `NIGHT_END`?). Then, reading that dossier, classify each overlapping pair and
-stamp the verdict into the issues as body lines (an Opus scout agent does this; you
-**approve** the plan before any spoke starts):
-
-- **PARALLEL** — disjoint (or only incidentally overlapping) → run concurrently; no
-  directive.
-- **SERIAL** — would textually conflict → add `Serial-after: <earlier>` to the later
-  issue so the dispatcher defers it until the earlier one has landed.
-- **MERGE** — logically coupled (one spoke should own both, `Closes #a #b`) → add
-  `Merge-into: <owner>` to the child so it is never dispatched alone. Keep merge
-  clusters small (accept/reject as a unit); a large cluster falls back to SERIAL.
-
-The scout only reports facts and the agent only classifies — the mechanical overlap
-and feasibility math stay in the script (`#43`: don't let the LLM narrate mechanical
-work). The supervisor then honors `Serial-after:` / `Merge-into:` from the issue
-bodies; an over-committed night ("these 4 serialize → won't fit before 07:00") is
-caught here, at setup, not wasted overnight.
-
-### Overnight queue dispatcher (optional)
-
-To drain a queue of pre-scoped issues overnight without supervision, run the night
-dispatcher on the hub before bed:
-
-```bash
-bash .ai-toolkit/scripts/hub-night.sh
-```
-
-It reads the `night`-labelled open issues (`gh issue list --label night`) and dispatches
-each via `worktree-new.sh`, recomputing an adaptive concurrency target every tick —
-`clamp(ceil(tasks_left × T_task / time_left), 1, NIGHT_MAX_CONCURRENCY)` — so a short queue
-runs sequentially and a long one ramps up to the cap as wake time approaches. It never
-starts a spoke once less than `T_task` of the night remains, reuses a freed slot when a
-spoke finishes (`ready/N`) or goes idle, and is idempotent — re-running skips branches
-already in flight. Knobs (env, defaults): `NIGHT_END=07:00`, `NIGHT_MAX_CONCURRENCY=3`,
-`NIGHT_TASK_MINUTES=90`. Use `--once` for a single tick (e.g. under cron). It dispatches
-only — the hub still lands finished spokes on `/land`. The dispatcher also enforces a
-per-spoke wall-clock ceiling (`NIGHT_SPOKE_MAX_MINUTES`, default 180): a hung, idle, or
-runaway spoke is reaped (its window killed and a `blocked/N` emitted on its behalf) so
-the unattended night never runs unbounded. At end of night it pre-computes the
-land-triage for the morning report.
-
-### Morning report (night mode)
-
-On waking, run the morning report on the hub to turn the drained queue into a worklist
-sorted fastest → slowest human effort:
-
-```bash
-bash .ai-toolkit/scripts/hub-morning.sh
-```
-
-It reads the terminal markers and tiers them — **LAND** (`ready/N`, merges clean,
-agent-approved → rubber-stamp `/land N`), **EYEBALL** (`accept/N`, built + reviewed →
-glance then land/send back), **THINK** (`blocked/N` → read the parked blocker, answer +
-re-queue), **CONFLICTS** (`ready/N` whose throwaway merge hit a conflict → hand-resolve)
-— with each row's diff size, trust summary (the marker's annotated-tag body), per-spoke
-cost (reused from the #35 dashboard's pull layer), and the exact next command. A `gate/N`
-still parked at the PLAN gate shows in a footer. The land-triage that decides LAND vs
-CONFLICTS is pre-computed at end of night (`hub-morning.sh --triage`, called by the
-dispatcher) in a hermetic throwaway worktree — a merge-conflict probe only, never the
-test suite (the real gate fires at `/land`).
-
-The terminal markers are also mirrored to GitHub as issue comments
-(`hub-morning.sh --comments`, also run by the dispatcher at end of night): the spoke
-only ever writes the git tag (it stays gh-read-only), and the hub — which has
-gh-write — echoes each ready/accept/blocked marker's reason as a `gh issue comment`,
-idempotently. A marker is thus durable as a git tag and visible on GitHub.
+- **`/next-batch`** — compute and dispatch the largest disjoint-scope set of ready
+  issues that can run concurrently right now. `batch-plan.sh` reads the open backlog
+  in one `gh api graphql` round-trip, ranks ready issues by critical-path depth,
+  greedily packs a batch whose file-scopes don't collide (honoring in-flight spoke
+  scopes), then spawns each via `worktree-new.sh`. Run it whenever you want to fill
+  idle capacity; it is independent of `/afk`.
+- **`/afk`** — drain the backlog unattended for a bounded window or until it is empty.
+  The hub keeps plan → dispatch → auto-answer → auto-land → reap running with zero
+  human input (`hub-afk.sh`); a parked spoke is answered on the human's behalf by a
+  reasoning answerer or escalated to `blocked`. Use it when stepping away:
+  `/afk <duration>`, `/afk until HH:MM`, `/afk drain`, plus `/afk off` and
+  `/afk status`.
 
 ### 3. Propose the next move — act only on confirmation
 

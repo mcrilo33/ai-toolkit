@@ -3,8 +3,8 @@
 #
 # The single toggle that ties the parallel-worktrees workflow together: for a bounded
 # window (or until the backlog is empty), keep the backlog draining as fast as the
-# dependency graph allows, with ZERO human input. It replaces the legacy night dispatcher
-# (hub-night.sh / scout / morning), whose retirement is #72.
+# dependency graph allows, with ZERO human input. It is the sole unattended
+# backlog-drain supervisor.
 #
 # Each supervisor tick does four mechanical things and exactly ONE reasoning thing:
 #   1. PLAN + DISPATCH the next concurrent batch via batch-plan.sh (#70), seeding each
@@ -22,7 +22,7 @@
 #      the whole window.
 # It STOPS at the time bound, or — in drain mode — when the backlog is empty and nothing
 # is in flight. No report artifact is written: the observability dashboard is the single
-# source of truth for what happened (the morning report was night legacy).
+# source of truth for what happened.
 #
 # Knobs (env, with defaults):
 #   AFK_TICK_SECONDS=300         supervisor poll interval

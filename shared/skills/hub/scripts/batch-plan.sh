@@ -3,7 +3,7 @@
 #
 # With `Scope:` + native blocked-by on every issue, the "next concurrent batch" is a
 # MECHANICAL graph computation — so it stays scripted (no LLM tokens in the control
-# plane). This replaces the legacy night scout's PARALLEL/SERIAL/MERGE judgment call.
+# plane), not an LLM PARALLEL/SERIAL/MERGE judgment call.
 #
 # Given the open backlog it prints the next set of issues that can safely run
 # CONCURRENTLY, ordered to minimize total wall-clock:
@@ -115,8 +115,8 @@ def scope_of(body):
 
     The explicit `Scope:` line wins; its tokens are split on whitespace and commas.
     A bare `*` token OR a missing line marks the issue EXCLUSIVE (None) — it runs
-    alone, never batched. Tokens are compared as literals (same set-intersection the
-    night scout used); glob-vs-path resolution is intentionally out of scope.
+    alone, never batched. Tokens are compared as literals (a plain set-intersection);
+    glob-vs-path resolution is intentionally out of scope.
     """
     line = None
     for raw in (body or "").splitlines():

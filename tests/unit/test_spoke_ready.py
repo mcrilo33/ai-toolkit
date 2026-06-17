@@ -234,13 +234,13 @@ def test_gate_does_not_emit_ready(spoke: Path, remote: Path) -> None:
     assert not _remote_has_ref(remote, "refs/tags/ready/45")
 
 
-# ── accept/N and blocked/N: the terminal markers (issue #40) ─────────────────
-# Night mode adds two more terminal markers beside ready/N, each frees a
-# supervisor slot:
+# ── accept/N and blocked/N: the terminal markers ─────────────────────────────
+# An unattended drain (`/afk`) adds two more terminal markers beside ready/N, each
+# frees a supervisor slot:
 #   accept/N  — built + pushed + agent-reviewed, final sign-off inherently human
-#               (the morning EYEBALL tier).
+#               (surfaced on the dashboard for a human glance).
 #   blocked/N — stuck (ambiguity, suspected cheating, budget) → answer + re-queue
-#               (the morning THINK tier).
+#               (surfaced on the dashboard).
 # They are annotated, force-moved, pushed tags exactly like ready/N, selected by a
 # NAMED flag mirroring --gate (so they ride the existing `spoke-ready.sh:*`
 # wildcard allowlist with no new spoke permission). Payload schema: the tag

@@ -1,10 +1,9 @@
 """Unit tests for the portable date/time helpers in scripts/worktree-lib.sh.
 
-``wt_date_ymd`` / ``wt_epoch_at`` were lifted out of the night dispatcher (issue
-#71) so the unattended supervisor and any future caller share one copy and the
-night helpers can be retired (issue #72) without dragging a private date layer
-along. These tests source the lib and call the helpers directly, pinning ``TZ=UTC``
-so the conversion is deterministic regardless of the host timezone.
+``wt_date_ymd`` / ``wt_epoch_at`` live here so the unattended supervisor
+(``hub-afk.sh``) and any future caller share one copy of the portable date/time
+helpers. These tests source the lib and call the helpers directly, pinning
+``TZ=UTC`` so the conversion is deterministic regardless of the host timezone.
 """
 
 from __future__ import annotations
