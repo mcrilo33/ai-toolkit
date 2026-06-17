@@ -30,6 +30,7 @@ PROJECT = FIXTURES / "-Users-demo-Repos-proj"
 SESSION = PROJECT / "11111111-1111-1111-1111-111111111111.jsonl"
 SESSION_ID = "11111111-1111-1111-1111-111111111111"
 WF_SESSION = PROJECT / "22222222-2222-2222-2222-222222222222.jsonl"
+WF_SESSION_ID = "22222222-2222-2222-2222-222222222222"
 WF_AGENT_IDS = frozenset({"cccc3333dddd4444", "eeee5555ffff6666"})
 
 
@@ -86,3 +87,9 @@ class TestWorkflowDiscovery:
         # Already discovered (#51) — guarded here as part of the causal surface S3 needs.
         parsed = parse_session_file(WF_SESSION)
         assert set(parsed.agent_links.values()) >= WF_AGENT_IDS
+
+    def test_workflow_agent_tool_use_links_to_its_subturn(self) -> None:
+        # Pin the workflow-agent tool→turn edge directly: agent cccc3333dddd4444's
+        # Grep (toolu_cgrep) was issued in its sub-turn c2.
+        parents = parse_session_file(WF_SESSION).tool_parents
+        assert parents[derive_span_id(WF_SESSION_ID, "toolu_cgrep")] == "c2"
