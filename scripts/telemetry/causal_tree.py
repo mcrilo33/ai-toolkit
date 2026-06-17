@@ -23,9 +23,14 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Any
+from itertools import pairwise
+from typing import TYPE_CHECKING, Any
 
 from telemetry.causal import CausalNode, InputContext, causal_node
+from telemetry.cost import per_turn_rows
+
+if TYPE_CHECKING:
+    from telemetry.session_parser import ParsedSession
 
 # Push markers that form the L1 phase spine; folded into ``interval`` bucket nodes.
 _MARKER_KINDS = frozenset({"step", "lifecycle"})
@@ -329,3 +334,68 @@ def _ts(value: str | None) -> float:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
     except (ValueError, AttributeError):
         return float("-inf")
+
+
+# Idle longer than this between two main turns renders as a ``gap`` divider, not a phase.
+_IDLE_GAP_SECONDS = 300.0
+
+
+def causal_dividers(turns: list[dict[str, Any]]) -> list[CausalNode]:
+    """Root-level idle/resume dividers for the main timeline (Issue #52 / #65 S5).
+
+    A change of ``session_id`` between adjacent main turns is a **resume** (cold cache),
+    rendered as a ``session`` divider carrying the cold re-read note; a long idle gap is
+    a ``gap`` divider. Dividers own nothing and slot into the forest by start time, so
+    they never disturb the cost rollup.
+    """
+    main = sorted(
+        (t for t in turns if t.get("source") != "subagent" and t.get("ts")),
+        key=lambda t: _ts(t["ts"]),
+    )
+    dividers: list[CausalNode] = []
+    for prev, cur in pairwise(main):
+        anchor = cur.get("uuid") or cur["ts"]
+        if cur.get("session_id") != prev.get("session_id"):
+            cold = int(cur.get("cache_creation") or 0)
+            dividers.append(
+                causal_node(
+                    node_id=f"session:{anchor}",
+                    kind="session",
+                    name="resume",
+                    summary=f"cold cache re-read +{cold:,} tokens" if cold else "resume",
+                    ts_start=cur["ts"],
+                    ts_end=cur["ts"],
+                )
+            )
+        elif _ts(cur["ts"]) - _ts(prev["ts"]) > _IDLE_GAP_SECONDS:
+            dividers.append(
+                causal_node(
+                    node_id=f"gap:{anchor}",
+                    kind="gap",
+                    name="idle",
+                    ts_start=prev["ts"],
+                    ts_end=cur["ts"],
+                    duration_ms=int((_ts(cur["ts"]) - _ts(prev["ts"])) * 1000),
+                )
+            )
+    return dividers
+
+
+def causal_forest_from_parsed(
+    parsed: ParsedSession,
+    push_spans: list[dict[str, Any]],
+    ccusage_costs: dict[str, float],
+) -> list[CausalNode]:
+    """Assemble a spoke's full causal forest from a parsed session + its push spans.
+
+    The per-spoke entry point the dashboard wires in: the parser's pull spans + per-turn
+    rows (cost-attributed, carrying the causal ids) and the parser's ``tool_parents`` edge
+    map feed the builder; the push spans supply the phase-spine markers, hooks and scripts;
+    idle/resume dividers are appended. Returns the start-ordered forest.
+    """
+    turns = per_turn_rows(parsed.usage_events, ccusage_costs, reasoning_refs=parsed.reasoning_refs)
+    pull = [span.to_dict() for span in parsed.spans]
+    forest = build_causal_forest(turns, [*pull, *push_spans], parsed.tool_parents)
+    forest.extend(causal_dividers(turns))
+    _sort_tree(forest)
+    return forest

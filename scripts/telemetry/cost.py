@@ -131,8 +131,9 @@ def per_turn_rows(
         reasoning_refs: Per-turn reasoning summaries to join onto their turn.
 
     Returns:
-        One dict per turn: ``session_id, ts, model, source, agent_id, tokens_in,
-        tokens_out, tokens_total, cache_read, cache_creation, cost_usd, reasoning``.
+        One dict per turn: ``session_id, ts, model, source, agent_id, uuid,
+        parent_uuid, is_sidechain, tokens_in, tokens_out, tokens_total, cache_read,
+        cache_creation, cost_usd, reasoning``.
     """
     rate = _session_rates(usage_events, ccusage_costs)
     gists = _reasoning_by_turn(reasoning_refs or [])
@@ -147,6 +148,11 @@ def per_turn_rows(
                 "model": event.model,
                 "source": event.source,
                 "agent_id": event.agent_id,
+                # Causal ids (Issue #65) — additive keys the v3 builder keys turns on;
+                # the persisted ``turns`` table selects by column name, so it ignores them.
+                "uuid": event.uuid,
+                "parent_uuid": event.parent_uuid,
+                "is_sidechain": event.is_sidechain,
                 "tokens_in": event.input_tokens,
                 "tokens_out": event.output_tokens,
                 "tokens_total": total,

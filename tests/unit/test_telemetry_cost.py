@@ -368,6 +368,29 @@ class TestPerTurnRows:
         # A turn with no reasoning ref carries reasoning=None — never a stray gist.
         assert any(r["reasoning"] is None for r in rows)
 
+    def test_rows_carry_turn_causal_ids(self) -> None:
+        # Issue #65 S5: the per-turn row carries the turn's causal ids (uuid /
+        # parent_uuid / is_sidechain) so the v3 causal builder keys turns by id
+        # without colliding on a shared timestamp.
+        event = UsageEvent(
+            session_id="sess-a",
+            ts="2026-06-13T12:00:01.000Z",
+            model="claude-opus-4-8",
+            input_tokens=10,
+            output_tokens=5,
+            cache_read=0,
+            cache_creation=0,
+            source="subagent",
+            agent_id="AG1",
+            uuid="s2",
+            parent_uuid="s1",
+            is_sidechain=True,
+        )
+        row = per_turn_rows([event], {})[0]
+        assert row["uuid"] == "s2"
+        assert row["parent_uuid"] == "s1"
+        assert row["is_sidechain"] is True
+
     def test_rows_carry_cache_breakdown(self) -> None:
         # Issue #59 budget panel: each turn row exposes cache_read vs cache_creation
         # so the panel can frame cheap reuse against expensive cold-cache writes.
