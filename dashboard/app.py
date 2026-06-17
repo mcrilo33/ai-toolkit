@@ -61,6 +61,47 @@ def resolve_store_path() -> Path:
     return directory / "store.duckdb"
 
 
+# Loaded-context items resolve their bodies from the synced toolkit configs (Issue #68).
+_DEFAULT_RULES_DIR = Path(__file__).resolve().parent.parent / ".claude" / "rules"
+_DEFAULT_SKILLS_DIR = Path(__file__).resolve().parent.parent / ".claude" / "skills"
+
+
+def resolve_summary_cache_path() -> Path:
+    """The JSON sidecar caching one-line context summaries (Issue #68)."""
+    base = os.environ.get("AI_TOOLKIT_TELEMETRY_DIR")
+    directory = Path(base) if base else _DEFAULT_TELEMETRY_DIR
+    return directory / "summaries.json"
+
+
+@st.cache_resource(show_spinner=False)
+def _summary_cache() -> Any:
+    """Process-wide content-hash summary cache, loaded once and reused across reruns."""
+    sys.path.insert(0, str(_scripts_dir()))
+    from telemetry.summarizer import SummaryCache
+
+    return SummaryCache(resolve_summary_cache_path())
+
+
+def _context_summary(kind: str, identifier: str) -> str:
+    """One-line cached LLM "what this is" for a rule/skill/reasoning item.
+
+    Fail-soft and cached by content hash: an unconfigured backend or a missing body
+    yields a blank, and identical content is summarized once across reruns and spokes.
+    """
+    if not identifier:
+        return ""
+    sys.path.insert(0, str(_scripts_dir()))
+    from telemetry.summarizer import context_summary
+
+    return context_summary(
+        kind,
+        identifier,
+        cache=_summary_cache(),
+        rules_dir=_DEFAULT_RULES_DIR,
+        skills_dir=_DEFAULT_SKILLS_DIR,
+    )
+
+
 @st.cache_data(show_spinner=False)
 def _load_events(path: str, mtime: float) -> list[dict]:
     """Parse the span log. ``mtime`` is part of the cache key so a changed log
@@ -234,7 +275,15 @@ def _context_item_rows(ctx: dict) -> list[dict]:
     """
     rows: list[dict] = []
     for rule in ctx["rules"]:
-        rows.append({"label": f"rule · {rule['name']}", "tokens": rule["tokens"], "cost": 0.0})
+        rows.append(
+            {
+                "label": f"rule · {rule['name']}",
+                "tokens": rule["tokens"],
+                "cost": 0.0,
+                "summary_kind": "rule",
+                "summary_id": rule["name"],
+            }
+        )
     if ctx["claude_md"]:
         rows.append({"label": "CLAUDE.md", "tokens": ctx["claude_md"]["tokens"], "cost": 0.0})
     for memory in ctx["memory"]:
@@ -254,7 +303,8 @@ def _render_context_item(item: dict, depth: int) -> None:
     """One drilled context-item row: indented name + its tokens in the Tokens column.
 
     A named load has no clock/duration/actor of its own; the Cost column is its ``$0``
-    slot and the trailing column is left as the summary slot Phase 6 fills.
+    slot and the trailing column holds the cached one-line "what this is" summary
+    (Issue #68) for a rule, blank for loads with no resolvable body.
     """
     indent = "&nbsp;&nbsp;&nbsp;&nbsp;" * depth
     cols = st.columns(_STEP_COLS)
@@ -264,7 +314,12 @@ def _render_context_item(item: dict, depth: int) -> None:
     cols[3].markdown(_fmt_cost(item["cost"]))
     cols[4].markdown(f"{item['tokens']:,}")
     cols[5].markdown("")
-    cols[6].markdown("")
+    summary = (
+        _context_summary(item["summary_kind"], item["summary_id"])
+        if item.get("summary_kind")
+        else ""
+    )
+    cols[6].markdown(f"_{summary}_" if summary else "")
 
 
 def _render_divider(node: dict) -> None:
@@ -279,6 +334,20 @@ def _render_divider(node: dict) -> None:
     st.markdown(f"··· idle · {node['name']} ···")
 
 
+def _inline_node_summary(node: dict) -> str:
+    """The cached one-line "what this is" trailing a skill or reasoning leaf (Issue #68).
+
+    A skill resolves from its ``SKILL.md`` body; a reasoning leaf summarizes its own
+    privacy-safe gist. Any other kind, or an unconfigured backend, yields a blank.
+    """
+    kind = node.get("kind")
+    if kind == "skill":
+        return _context_summary("skill", node.get("name") or "")
+    if kind == "reasoning":
+        return _context_summary("reasoning", node.get("summary") or "")
+    return ""
+
+
 def _node_row(node: dict, depth: int, inherited_actor: str = "main") -> None:
     """One trace row: indented label + Time(start clock)·Dur·Cost·Tokens·H·Actor."""
     indent = "&nbsp;&nbsp;&nbsp;&nbsp;" * depth
@@ -288,7 +357,11 @@ def _node_row(node: dict, depth: int, inherited_actor: str = "main") -> None:
     icon = _row_glyph(node)
     metrics = queries.format_step_metrics(node)
     cols = st.columns(_STEP_COLS)
-    cols[0].markdown(f"{indent}{icon} `{node['kind']}` **{_node_label(node)}**")
+    label = f"**{_node_label(node)}**"
+    inline = _inline_node_summary(node)
+    if inline:
+        label += f" — _{inline}_"
+    cols[0].markdown(f"{indent}{icon} `{node['kind']}` {label}")
     cols[1].markdown(queries._clock(node.get("ts_start")))
     cols[2].markdown(metrics["time"])
     cols[3].markdown(metrics["cost"])
