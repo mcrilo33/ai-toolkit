@@ -159,3 +159,94 @@ class TestContextNode:
         # no context node (rather than mislabelling the main session's items).
         s1 = _by_id(_build())["s1"]
         assert not [c for c in s1["children"] if c["kind"] == "context"]
+
+    def test_context_node_owns_no_cost(self) -> None:
+        ctx = next(c for c in _by_id(_build())["m1"]["children"] if c["kind"] == "context")
+        assert ctx["own_cost_usd"] == 0.0
+        assert ctx["own_tokens_in"] == 0 and ctx["own_tokens_out"] == 0
+
+
+class TestContextEdgeCases:
+    def test_main_turn_with_no_context_items_still_gets_a_node(self) -> None:
+        # A session with no loaded-context spans: the turn still carries a context node
+        # whose real cached prefix is pure history (no named items).
+        turns = [
+            _turn("m", "u", source="main", agent_id=None, ts="2026-06-12T23:00:10Z", cache_read=500)
+        ]
+        spans = [
+            {
+                "span_id": "st",
+                "parent_id": None,
+                "kind": "step",
+                "name": "solo-cycle",
+                "phase": "red",
+                "ts_start": "2026-06-12T23:00:05Z",
+                "ts_end": "2026-06-12T23:00:30Z",
+                "duration_ms": 25000,
+                "status": "success",
+            },
+        ]
+        ctx = next(
+            c
+            for c in _by_id(build_causal_forest(turns, spans, {}))["m"]["children"]
+            if c["kind"] == "context"
+        )["input_context"]
+        assert ctx["rules"] == [] and ctx["claude_md"] is None
+        assert ctx["total_tokens"] == 500 and ctx["history_tokens"] == 500
+
+    def test_per_session_grouping_across_a_resume(self) -> None:
+        # Two main turns in different sessions each name only their own session's items.
+        turns = [
+            {
+                **_turn(
+                    "m1",
+                    "u1",
+                    source="main",
+                    agent_id=None,
+                    ts="2026-06-12T23:00:10Z",
+                    cache_read=9000,
+                ),
+                "session_id": "sess-a",
+            },
+            {
+                **_turn(
+                    "m2",
+                    "m1",
+                    source="main",
+                    agent_id=None,
+                    ts="2026-06-13T00:00:10Z",
+                    cache_read=9000,
+                ),
+                "session_id": "sess-b",
+            },
+        ]
+        spans = [
+            {**_rule("ra", "rule-a", "rule", 100), "session_id": "sess-a"},
+            {**_rule("rb", "rule-b", "rule", 200), "session_id": "sess-b"},
+            {
+                "span_id": "st",
+                "parent_id": None,
+                "kind": "step",
+                "name": "solo-cycle",
+                "phase": "red",
+                "ts_start": "2026-06-12T23:00:05Z",
+                "ts_end": "2026-06-13T00:01:00Z",
+                "duration_ms": 1,
+                "status": "success",
+            },
+        ]
+        nodes = _by_id(build_causal_forest(turns, spans, {}))
+        names1 = {
+            r["name"]
+            for r in next(c for c in nodes["m1"]["children"] if c["kind"] == "context")[
+                "input_context"
+            ]["rules"]
+        }
+        names2 = {
+            r["name"]
+            for r in next(c for c in nodes["m2"]["children"] if c["kind"] == "context")[
+                "input_context"
+            ]["rules"]
+        }
+        assert names1 == {"rule-a"}
+        assert names2 == {"rule-b"}

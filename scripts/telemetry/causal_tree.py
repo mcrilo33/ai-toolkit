@@ -249,11 +249,17 @@ def _context_child(turn: CausalNode, row: dict[str, Any], ctx: dict[str, Any] | 
 
 
 def _estimate_tokens(summary: object) -> int:
-    """The integer token estimate from a ``~N tokens`` context-load summary (else 0)."""
+    """The integer token estimate from a ``~N tokens`` context-load summary (else 0).
+
+    The parser emits ``~{N:,} tokens`` (comma-grouped), so the first ``[\\d,]+`` run is
+    the count; stripping commas yields the int. Anchoring on the leading numeric run
+    keeps an odd format from silently scaling the number — an unparseable label is 0,
+    not a wrong magnitude.
+    """
     if not isinstance(summary, str):
         return 0
-    digits = re.sub(r"[^\d]", "", summary)
-    return int(digits) if digits else 0
+    match = re.search(r"[\d,]+", summary)
+    return int(match.group().replace(",", "")) if match else 0
 
 
 def _turn_node(row: dict[str, Any]) -> CausalNode:
