@@ -20,7 +20,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
-from telemetry.session_parser import ParsedSession, parse_projects_dir, parse_session_file
+from telemetry.session_parser import (
+    ParsedSession,
+    _walk_transcript,
+    parse_projects_dir,
+    parse_session_file,
+)
 from telemetry.spans import Span
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "telemetry" / "projects"
@@ -1152,3 +1157,115 @@ class TestWorkflowGroupingNodes:
                 if s.kind == "agent" and grouped.agent_links.get(s.span_id) == agent_id
             )
             assert span.parent_id == phase_by_name[phase]
+
+
+def _assistant_usage(
+    msg_id: str | None,
+    uuid: str,
+    ts: str,
+    *,
+    output_tokens: int = 308,
+    input_tokens: int = 6556,
+) -> dict:
+    """One assistant transcript record carrying ``message.usage``.
+
+    ``msg_id`` is the assistant ``message.id`` — the identity of the inference. When
+    several records share it (streaming partials / text+tool_use split / re-emit),
+    they describe ONE inference. ``msg_id=None`` omits the id so the parser must fall
+    back to the record ``uuid``.
+    """
+    message: dict = {
+        "role": "assistant",
+        "model": "claude-opus-4-8",
+        "content": [{"type": "text", "text": "..."}],
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_input_tokens": 15750,
+            "cache_creation_input_tokens": 9507,
+        },
+    }
+    if msg_id is not None:
+        message["id"] = msg_id
+    return {
+        "type": "assistant",
+        "sessionId": "dup-sess",
+        "cwd": "/Users/demo/Repos/proj",
+        "gitBranch": "chore/telemetry-smoke",
+        "timestamp": ts,
+        "uuid": uuid,
+        "message": message,
+    }
+
+
+class TestUsageDedupByMessageId:
+    """Issue #78: one inference's ``message.usage``, written across several assistant
+    records, must be counted exactly once — keyed by ``message.id`` (uuid fallback)."""
+
+    def test_one_message_across_three_records_collapses_to_one_event(self, tmp_path: Path) -> None:
+        # The reported triple: 21:32:41/42/42, same message.id + identical usage = ONE
+        # inference re-emitted across three records, not three inferences.
+        records = [
+            _assistant_usage("msg_A", "rec1", "2026-06-16T21:32:41.149Z"),
+            _assistant_usage("msg_A", "rec2", "2026-06-16T21:32:42.089Z"),
+            _assistant_usage("msg_A", "rec3", "2026-06-16T21:32:42.800Z"),
+        ]
+        path = tmp_path / "dup-sess.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        main = [e for e in parse_session_file(path).usage_events if e.source == "main"]
+
+        assert len(main) == 1
+        assert main[0].output_tokens == 308
+        assert main[0].input_tokens == 6556
+
+    def test_dedup_preserves_distinct_inferences(self, tmp_path: Path) -> None:
+        # Two real inferences (distinct message.id) survive; only the duplicate collapses.
+        records = [
+            _assistant_usage("msg_A", "rec1", "2026-06-16T21:32:41.149Z", output_tokens=308),
+            _assistant_usage("msg_A", "rec2", "2026-06-16T21:32:42.089Z", output_tokens=308),
+            _assistant_usage("msg_B", "rec3", "2026-06-16T21:33:10.000Z", output_tokens=512),
+        ]
+        path = tmp_path / "dup-sess.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        main = [e for e in parse_session_file(path).usage_events if e.source == "main"]
+
+        assert len(main) == 2
+        assert sorted(e.output_tokens for e in main) == [308, 512]
+
+    def test_subagent_message_across_records_collapses_to_one_event(self, tmp_path: Path) -> None:
+        # The dedup applies on the subagent walk too: a sub-agent inference re-emitted
+        # across records (same message.id) collapses to one source="subagent" event,
+        # tagged with the agent's id.
+        records = [
+            _assistant_usage("msg_sub", "srec1", "2026-06-16T21:40:01.000Z", output_tokens=120),
+            _assistant_usage("msg_sub", "srec2", "2026-06-16T21:40:01.500Z", output_tokens=120),
+        ]
+        events, _spans, _links = _walk_transcript(
+            records,
+            "agent_xyz",
+            main_path=tmp_path / "sess.jsonl",
+            parent_meta={"session_id": "parent-sess", "repo": "proj", "branch": "b"},
+            agent_span_id="span_agent",
+            seen=set(),
+            tool_parents={},
+        )
+
+        assert len(events) == 1
+        assert events[0].source == "subagent"
+        assert events[0].agent_id == "agent_xyz"
+        assert events[0].output_tokens == 120
+
+    def test_records_without_message_id_fall_back_to_uuid(self, tmp_path: Path) -> None:
+        # No message.id → each distinct record uuid is its own inference (no collapse).
+        records = [
+            _assistant_usage(None, "rec1", "2026-06-16T21:32:41.149Z", output_tokens=308),
+            _assistant_usage(None, "rec2", "2026-06-16T21:33:10.000Z", output_tokens=512),
+        ]
+        path = tmp_path / "noid-sess.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        main = [e for e in parse_session_file(path).usage_events if e.source == "main"]
+
+        assert len(main) == 2

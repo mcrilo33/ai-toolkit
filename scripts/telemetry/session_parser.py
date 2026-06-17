@@ -112,6 +112,12 @@ class UsageEvent:
     uuid: str | None = None
     parent_uuid: str | None = None
     is_sidechain: bool = False
+    # Identity of the inference (Issue #78). One assistant message can be written
+    # across several transcript records (streaming partials / text+tool_use split /
+    # re-emit), each carrying the SAME ``message.usage``. ``message_id`` is the
+    # ``message.id`` shared by those records; usage is deduped on it so one inference
+    # is counted once. Absent ``message.id`` falls back to the record ``uuid``.
+    message_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -159,6 +165,7 @@ def parse_session_file(path: Path) -> ParsedSession:
     # repeated or cyclic agentId (reachable via the recursion in #51 S2) is walked —
     # and its usage emitted — at most once across all top-level and workflow agents.
     seen: set[str] = set()
+    main_usage: list[UsageEvent] = []
     for rec in records:
         if rec.get("type") != "assistant":
             continue
@@ -166,9 +173,11 @@ def parse_session_file(path: Path) -> ParsedSession:
         if not isinstance(message, dict):
             continue
         if isinstance(message.get("usage"), dict):
-            parsed.usage_events.append(_usage_event(rec, "main", None))
+            main_usage.append(_usage_event(rec, "main", None))
         for block in message.get("content") or []:
             _consume_tool_use(block, rec, results, meta, path, parsed, todo_summaries, seen)
+    # One inference per message id (Issue #78): collapse re-emitted usage records.
+    parsed.usage_events.extend(_dedup_usage_events(main_usage))
 
     parsed.spans.extend(_human_prompt_spans(records, meta))
     parsed.reasoning_refs.extend(_reasoning_refs(records, path.stem, "main", None, meta))
@@ -754,7 +763,10 @@ def _walk_transcript(
                 events.extend(ev)
                 spans.extend(sp)
                 links.update(lk)
-    return events, spans, links
+    # Dedup this transcript's own usage by message id (Issue #78). Nested-agent events
+    # appended above are already deduped; the (source, agent_id)-scoped key keeps this
+    # re-run a no-op for them — it can only collapse THIS transcript's duplicates.
+    return _dedup_usage_events(events), spans, links
 
 
 def _link_and_walk_agent(
@@ -1079,7 +1091,41 @@ def _usage_event(rec: dict, source: str, agent_id: str | None) -> UsageEvent:
         uuid=rec.get("uuid"),
         parent_uuid=rec.get("parentUuid"),
         is_sidechain=bool(rec.get("isSidechain")),
+        message_id=message.get("id"),
     )
+
+
+def _dedup_usage_events(events: list[UsageEvent]) -> list[UsageEvent]:
+    """Collapse usage events that describe the same inference (Issue #78).
+
+    One assistant message can span several transcript records (streaming partials,
+    a text+tool_use split, or a re-emit), each carrying an identical ``message.usage``.
+    Counting them all triples that inference's tokens/cost and violates the
+    conservation invariant. Dedupe by ``message_id`` (falling back to the record
+    ``uuid`` when absent), keeping the LAST record per key — the most-complete
+    re-emit, with its timestamp. First-seen order is preserved.
+
+    The key is scoped by ``(source, agent_id)`` so collapse can only ever happen
+    *within* one transcript: an event from the main session can never merge with a
+    sub-agent's, even in the (theoretical) event of a shared ``message_id`` across
+    transcripts. ``_walk_transcript`` runs this over its own usage plus already-
+    deduped nested-agent events; the scoping keeps that re-run a safe no-op for the
+    nested ones rather than relying on global id uniqueness.
+
+    Args:
+        events: Usage events to collapse — typically one transcript's, optionally
+            with already-deduped nested-agent events appended.
+
+    Returns:
+        One event per unique inference.
+    """
+    deduped: dict[tuple[str, str | None, str | int], UsageEvent] = {}
+    for event in events:
+        # No identity at all → ``id(event)`` keeps it verbatim (the live list holds a
+        # reference, so the id can't be reused mid-loop).
+        ident = event.message_id or event.uuid or id(event)
+        deduped[(event.source, event.agent_id, ident)] = event
+    return list(deduped.values())
 
 
 def _session_meta(records: list[dict]) -> dict[str, str | None]:
