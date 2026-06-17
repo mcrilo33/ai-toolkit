@@ -182,3 +182,75 @@ class TestContextDrillRender:
         monkeypatch.setitem(sys.modules, "streamlit", st)
         app = _app_with_stub(monkeypatch)
         app._render_node(_ctx_node(), depth=0, path="0")  # must not raise
+
+
+class TestContextSummaryRendering:
+    """Issue #68 — the cached one-line summary lands inline on rule/skill/reasoning."""
+
+    def test_rule_context_row_renders_its_summary(self, monkeypatch) -> None:
+        st = _recording_streamlit()
+        monkeypatch.setitem(sys.modules, "streamlit", st)
+        app = _app_with_stub(monkeypatch)
+        monkeypatch.setattr(
+            app,
+            "_context_summary",
+            lambda kind, ident: (
+                "Coding standards" if (kind, ident) == ("rule", "code-quality") else ""
+            ),
+        )
+        row = {
+            "label": "rule · code-quality",
+            "tokens": 1800,
+            "cost": 0.0,
+            "summary_kind": "rule",
+            "summary_id": "code-quality",
+        }
+
+        app._render_context_item(row, depth=1)
+
+        assert any("Coding standards" in r for r in st._recorded)
+
+    def test_non_rule_context_row_is_never_summarized(self, monkeypatch) -> None:
+        st = _recording_streamlit()
+        monkeypatch.setitem(sys.modules, "streamlit", st)
+        app = _app_with_stub(monkeypatch)
+        calls: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            app, "_context_summary", lambda kind, ident: calls.append((kind, ident)) or "X"
+        )
+
+        app._render_context_item({"label": "history", "tokens": 500, "cost": 0.0}, depth=1)
+
+        assert calls == []  # no summary_kind on the row → the model is never consulted
+
+    def test_skill_node_row_appends_its_summary(self, monkeypatch) -> None:
+        st = _recording_streamlit()
+        monkeypatch.setitem(sys.modules, "streamlit", st)
+        app = _app_with_stub(monkeypatch)
+        monkeypatch.setattr(
+            app,
+            "_context_summary",
+            lambda kind, ident: "Per-subtask solo flow" if kind == "skill" else "",
+        )
+        node = causal_node(node_id="sk1", kind="skill", name="solo-cycle", parent_id="m1")
+
+        app._node_row(node, depth=0)
+
+        assert any("Per-subtask solo flow" in r for r in st._recorded)
+
+    def test_reasoning_node_row_appends_its_summary(self, monkeypatch) -> None:
+        st = _recording_streamlit()
+        monkeypatch.setitem(sys.modules, "streamlit", st)
+        app = _app_with_stub(monkeypatch)
+        monkeypatch.setattr(
+            app,
+            "_context_summary",
+            lambda kind, ident: "Decided to refactor the parser" if kind == "reasoning" else "",
+        )
+        node = causal_node(
+            node_id="r1", kind="reasoning", name="reasoning", parent_id="m1", summary="refactor"
+        )
+
+        app._node_row(node, depth=0)
+
+        assert any("Decided to refactor the parser" in r for r in st._recorded)

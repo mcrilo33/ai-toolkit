@@ -139,6 +139,59 @@ def summarize(
     return summary
 
 
+def resolve_content(
+    kind: str,
+    identifier: str,
+    *,
+    rules_dir: Path | None = None,
+    skills_dir: Path | None = None,
+) -> str:
+    """The text to summarize for a context item, by kind.
+
+    - ``rule`` → the rule markdown body at ``rules_dir/<identifier>.md``.
+    - ``skill`` → the skill body at ``skills_dir/<identifier>/SKILL.md``.
+    - ``reasoning`` → ``identifier`` *is* the privacy-safe gist (no file to read).
+
+    Returns ``""`` when the kind is unknown, the directory is unset, or the file is
+    missing/unreadable — the summarizer then yields a blank, never an error.
+    """
+    if kind == "reasoning":
+        return identifier or ""
+    if kind == "rule" and rules_dir is not None:
+        return _read_text(Path(rules_dir) / f"{identifier}.md")
+    if kind == "skill" and skills_dir is not None:
+        return _read_text(Path(skills_dir) / identifier / "SKILL.md")
+    return ""
+
+
+def context_summary(
+    kind: str,
+    identifier: str,
+    *,
+    cache: SummaryCache | None = None,
+    rules_dir: Path | None = None,
+    skills_dir: Path | None = None,
+    model: str | None = None,
+    complete: CompleteFn | None = None,
+) -> str:
+    """Resolve a context item's content and return its cached one-line summary.
+
+    The single entry point the dashboard calls per rule/skill/reasoning node: it
+    locates the content (:func:`resolve_content`) then summarizes it
+    (:func:`summarize`). Unresolvable content yields a blank without any LLM call.
+    """
+    content = resolve_content(kind, identifier, rules_dir=rules_dir, skills_dir=skills_dir)
+    return summarize(content, model=model, cache=cache, complete=complete)
+
+
+def _read_text(path: Path) -> str:
+    """The file's text, or ``""`` if it is missing or unreadable (fail-soft)."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
 def _default_complete(content: str, model: str) -> str:
     """OpenAI-compatible chat-completion backend over stdlib ``urllib``.
 
