@@ -56,6 +56,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${AFK_IDLE_MINUTES:=30}"
 : "${AFK_ANSWERER_EFFORT:=high}"
 
+# Raised to 1 when the answerer's own `claude` reports an auth failure (the
+# subscription token could not refresh): a process-global the main loop reads to halt
+# instead of spinning into dead auth. decide_and_act runs in the same shell as the
+# loop, so the assignment propagates up.
+_AFK_AUTH_FAILED=0
+
 log() { printf '%s\n' "$*" >&2; }
 
 # --- source worktree-lib.sh (the shared date/time + worktree helpers) ---------
@@ -377,6 +383,16 @@ parse_decision() {
   printf '%s\t%s\n' "$kind" "$rest"
 }
 
+# is_auth_failure <raw-answerer-output> -> true (rc 0) when the answerer's own `claude`
+# reported an auth failure (the subscription token could not refresh) rather than a
+# decision. Matched against MULTI-WORD auth signatures only, case-insensitively: this
+# is high-precision on purpose because a false positive halts the WHOLE drain (a healthy
+# answer that merely mentions "/login" or "OAuth" must not trip it).
+is_auth_failure() {
+  printf '%s' "$1" | grep -Eqi \
+    'authentication_error|invalid (x-)?api[ -]?key|oauth token( has)? expired|run[^[:cntrl:]]{0,12}/login|401 unauthorized|credit balance is too low'
+}
+
 # --- tmux injection + telemetry -----------------------------------------------
 
 # _spoke_pane_target <wt_path> -> "session:window" of the spoke's pane, or empty.
@@ -421,11 +437,22 @@ afk_emit_decision() {
 # answer, or escalate to blocked/<issue>. Fail-safe: an answerer that returns no decision
 # (or an answer we cannot inject) escalates rather than guessing.
 decide_and_act() {
-  local wt="$1" issue="$2" question decision kind text target
+  local wt="$1" issue="$2" question raw decision kind text target
   question="$(extract_pending_question "$wt")"
   [ -n "$question" ] || return 0
   log "→ answering #$issue (parked on input)"
-  decision="$(parse_decision "$(run_answerer "$issue" "$question")")"
+  raw="$(run_answerer "$issue" "$question")"
+  # The answerer is the supervisor's own `claude`; if its credentials are dead, every
+  # other `claude` (the spokes, the next tick's answerer) is dead too. Raise the global
+  # stop flag and block THIS spoke so the failure surfaces as blocked/<issue> on the
+  # dashboard rather than spinning the loop. The main loop reads the flag and halts.
+  if is_auth_failure "$raw"; then
+    _AFK_AUTH_FAILED=1
+    _escalate_blocked "$wt" "$issue" \
+      "subscription auth failed — token could not refresh; re-run /login on the host"
+    return 0
+  fi
+  decision="$(parse_decision "$raw")"
   kind="${decision%%$'\t'*}"
   text="${decision#*$'\t'}"
   if [ "$kind" = "ANSWER" ] && [ -n "$text" ]; then
@@ -470,6 +497,19 @@ reap_spoke() {
   log "→ reap #$issue: $reason"
   _kill_spoke_window "$issue"
   _escalate_blocked "$wt" "$issue" "$reason"
+}
+
+# _block_all_inflight <reason> -> emit blocked/<issue> for every in-flight spoke not
+# already at a terminal marker. Called on an auth-failure stop so the dashboard shows
+# every affected spoke as blocked (no orphaned window left silently stuck on dead auth)
+# rather than just the one whose answerer surfaced the failure.
+_block_all_inflight() {
+  local reason="$1" path issue
+  while IFS=$'\t' read -r path issue; do
+    [ -n "$issue" ] || continue
+    [ "$(slot_state "$path" "$issue")" = "done" ] && continue
+    _escalate_blocked "$path" "$issue" "$reason"
+  done < <(inflight_worktrees)
 }
 
 # --- dispatch -----------------------------------------------------------------
@@ -520,6 +560,7 @@ _inflight_scope_args() {
 # each issue not already in flight, seeded with the ultra kickoff. A missing planner or
 # dispatcher logs and is a no-op (the next tick retries).
 dispatch_batch() {
+  [ "$_AFK_AUTH_FAILED" -eq 1 ] && return 0   # auth is dead — don't spawn spokes into it
   local bp wt_new inflight args=() batch n
   bp="$(_afk_find_script "${BATCH_PLAN:-}" batch-plan.sh)" || { log "batch-plan.sh not found — skipping dispatch"; return 0; }
   wt_new="$(_afk_find_script "${WT_NEW:-}" worktree-new.sh)" || { log "worktree-new.sh not found — skipping dispatch"; return 0; }
@@ -650,6 +691,11 @@ main() {
 
   while :; do
     supervise_tick
+    if [ "$_AFK_AUTH_FAILED" -eq 1 ]; then
+      log "/afk: subscription auth failed — blocking in-flight spokes and stopping (re-run /login on the host)"
+      _block_all_inflight "subscription auth failed — token could not refresh; re-run /login on the host"
+      afk_clear_state; break
+    fi
     [ "$once" -eq 1 ] && break
     if afk_done "$(afk_read_state)" "$(afk_now)"; then
       log "/afk: done"; afk_clear_state; break
