@@ -486,3 +486,71 @@ def test_afk_emit_decision_writes_dashboard_span(spoke_repo: Path, tmp_path: Pat
     assert span["kind"] == "agent"
     assert span["name"] == "afk-answer"
     assert span["status"] == "success"
+
+
+# ── auth-failure handling (issue #73) ─────────────────────────────────────────
+# The answerer is the supervisor's own headless `claude`. If the subscription token
+# can't refresh mid-run, its output is an auth error rather than a decision. The
+# supervisor must recognize that, escalate the parked spoke to blocked/<issue> with an
+# auth reason, and raise a stop flag so the loop halts instead of spinning into dead
+# auth. `is_auth_failure` is the high-precision predicate (a false positive would halt
+# the whole drain), so it matches multi-word auth signatures only.
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Invalid API key · Please run /login",
+        "authentication_error: OAuth token has expired",
+        "API error: 401 Unauthorized",
+        "Your credit balance is too low to access the Anthropic API.",
+        "Please run `claude /login` to authenticate.",
+    ],
+)
+def test_is_auth_failure_detects_auth_errors(text: str) -> None:
+    result = _call('is_auth_failure "$RAW" && echo yes || echo no', env={"RAW": text})
+
+    assert result.stdout.strip() == "yes"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ANSWER: Use Redis for the cache.",
+        "ESCALATE: this touches main, a human should decide.",
+        "ANSWER: yes, the /login route should require 2FA via OAuth.",
+        "I am still reasoning about the trade-offs and have not concluded.",
+        "",
+    ],
+)
+def test_is_auth_failure_ignores_normal_output(text: str) -> None:
+    # A legitimate answer that merely mentions /login or OAuth must NOT trip detection —
+    # a false positive would block a healthy spoke and halt the whole drain.
+    result = _call('is_auth_failure "$RAW" && echo yes || echo no', env={"RAW": text})
+
+    assert result.stdout.strip() == "no"
+
+
+def test_decide_and_act_auth_failure_escalates_with_auth_reason(
+    spoke_repo: Path, stub_env: dict[str, str]
+) -> None:
+    env = {**stub_env, "AFK_ANSWERER_CMD": "printf 'authentication_error: OAuth token expired'"}
+
+    result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    log = Path(env["_READY_LOG"]).read_text()
+    assert "--blocked 5" in log
+    assert "auth" in log.lower()
+
+
+def test_decide_and_act_auth_failure_raises_stop_flag(
+    spoke_repo: Path, stub_env: dict[str, str]
+) -> None:
+    # The stop flag is a process global set in decide_and_act (same shell as the loop),
+    # so the supervisor can halt rather than spin. Echo it back after the call.
+    env = {**stub_env, "AFK_ANSWERER_CMD": "printf 'authentication_error'"}
+
+    result = _call(f"decide_and_act '{spoke_repo}' 5; echo \"FLAG=$_AFK_AUTH_FAILED\"", env=env)
+
+    assert "FLAG=1" in result.stdout
