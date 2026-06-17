@@ -12,7 +12,10 @@ so no test ever touches the network.
 
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
@@ -20,12 +23,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 from telemetry.summarizer import (
     DEFAULT_MODEL,
     SummaryCache,
+    _default_complete,
     content_key,
     context_summary,
     resolve_content,
     resolve_model,
     summarize,
 )
+
+
+class _FakeResponse:
+    """A urllib-style response context manager wrapping a canned JSON body."""
+
+    def __init__(self, body: dict) -> None:
+        self._body = json.dumps(body).encode("utf-8")
+
+    def __enter__(self) -> _FakeResponse:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._body
 
 
 class _CountingComplete:
@@ -139,8 +159,9 @@ def test_summarize_passes_the_resolved_model_to_the_backend(tmp_path: Path, monk
     assert backend.calls[0][1] == "configured-model"
 
 
-def test_default_model_is_a_cheap_one() -> None:
-    assert DEFAULT_MODEL == "deepseek-flash"
+def test_default_model_is_deepseek_v4_flash() -> None:
+    # `deepseek-flash` was never a valid id; v4-flash is the current cheap model.
+    assert DEFAULT_MODEL == "deepseek-v4-flash"
 
 
 def test_content_key_is_stable_and_model_scoped() -> None:
@@ -219,3 +240,88 @@ def test_context_summary_is_blank_when_content_is_missing(tmp_path: Path) -> Non
 
     assert summary == ""
     assert backend.calls == []  # no resolvable content — the model is never called
+
+
+# --- Subtask 1 (#77): the default OpenAI-compatible backend (the real bug site) ---
+
+
+def test_default_complete_posts_to_deepseek_endpoint_and_returns_content(monkeypatch) -> None:
+    monkeypatch.delenv("TELEMETRY_SUMMARY_BASE_URL", raising=False)
+    monkeypatch.setenv("TELEMETRY_SUMMARY_API_KEY", "secret-key")
+    captured: dict = {}
+
+    def fake_urlopen(request, timeout=None):
+        captured["url"] = request.full_url
+        captured["auth"] = request.headers.get("Authorization")
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _FakeResponse({"choices": [{"message": {"content": "A terse summary"}}]})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    result = _default_complete("rule body text", "deepseek-v4-flash")
+
+    assert result == "A terse summary"
+    # No base-url env set → it defaults to DeepSeek so summaries work out of the box.
+    assert captured["url"] == "https://api.deepseek.com/chat/completions"
+    assert captured["auth"] == "Bearer secret-key"
+
+
+def test_default_complete_disables_thinking_so_content_is_not_blanked(monkeypatch) -> None:
+    # The bug: deepseek-v4-flash is a reasoning model; reasoning ate the token budget
+    # and message.content came back empty. Disabling thinking keeps the content.
+    monkeypatch.delenv("TELEMETRY_SUMMARY_BASE_URL", raising=False)
+    monkeypatch.setenv("TELEMETRY_SUMMARY_API_KEY", "secret-key")
+    captured: dict = {}
+
+    def fake_urlopen(request, timeout=None):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _FakeResponse({"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    _default_complete("content", "deepseek-v4-flash")
+
+    assert captured["body"]["thinking"] == {"type": "disabled"}
+
+
+def test_default_complete_returns_blank_without_a_key(monkeypatch) -> None:
+    monkeypatch.delenv("TELEMETRY_SUMMARY_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    def empty_keychain(*_args, **_kwargs):
+        return subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", empty_keychain)
+
+    called = {"n": 0}
+
+    def fake_urlopen(*_args, **_kwargs):
+        called["n"] += 1
+        return _FakeResponse({"choices": [{"message": {"content": "x"}}]})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    # No key anywhere → no summaries, no network call, never an error.
+    assert _default_complete("content", "deepseek-v4-flash") == ""
+    assert called["n"] == 0
+
+
+def test_resolve_api_key_prefers_env_then_keychain(monkeypatch) -> None:
+    from telemetry.summarizer import _resolve_api_key
+
+    monkeypatch.setenv("TELEMETRY_SUMMARY_API_KEY", "explicit")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fallback")
+    assert _resolve_api_key() == "explicit"
+
+    monkeypatch.delenv("TELEMETRY_SUMMARY_API_KEY", raising=False)
+    assert _resolve_api_key() == "fallback"
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    def keychain_hit(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="from-keychain\n", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", keychain_hit)
+    assert _resolve_api_key() == "from-keychain"
