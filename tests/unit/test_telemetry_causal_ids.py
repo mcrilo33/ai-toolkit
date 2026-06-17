@@ -85,4 +85,4 @@ class TestWorkflowDiscovery:
     def test_workflow_nested_agents_are_surfaced(self) -> None:
         # Already discovered (#51) — guarded here as part of the causal surface S3 needs.
         parsed = parse_session_file(WF_SESSION)
-        assert WF_AGENT_IDS <= set(parsed.agent_links.values())
+        assert set(parsed.agent_links.values()) >= WF_AGENT_IDS

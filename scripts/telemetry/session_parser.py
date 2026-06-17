@@ -92,7 +92,13 @@ _CHARS_PER_TOKEN = 4
 
 @dataclass(slots=True)
 class UsageEvent:
-    """One assistant turn's ``message.usage``, tagged with its source transcript."""
+    """One assistant turn's ``message.usage``, tagged with its source transcript.
+
+    The causal trace (Issue #65) builds the turn spine from the record's own ids:
+    ``uuid`` is the turn, ``parent_uuid`` its parent record (the prior turn / the
+    prompt), and ``is_sidechain`` marks a sub-agent turn. They default empty so the
+    field is additive — push-only and pre-#65 callers are unaffected.
+    """
 
     session_id: str | None
     ts: str | None
@@ -103,6 +109,9 @@ class UsageEvent:
     cache_creation: int
     source: str  # "main" | "subagent"
     agent_id: str | None = None
+    uuid: str | None = None
+    parent_uuid: str | None = None
+    is_sidechain: bool = False
 
 
 @dataclass(slots=True)
@@ -131,6 +140,11 @@ class ParsedSession:
     usage_events: list[UsageEvent] = field(default_factory=list)
     agent_links: dict[str, str] = field(default_factory=dict)  # agent span_id -> agentId
     reasoning_refs: list[ReasoningRef] = field(default_factory=list)
+    # Causal edge (Issue #65): each tool/skill/todo/agent span_id -> the ``uuid`` of
+    # the assistant turn that issued its ``tool_use`` block, for the main session and
+    # recursively inside sub-agent transcripts. Lets the v3 builder parent a tool under
+    # its turn by id rather than by timestamp.
+    tool_parents: dict[str, str] = field(default_factory=dict)  # span_id -> turn uuid
 
 
 def parse_session_file(path: Path) -> ParsedSession:
@@ -160,7 +174,9 @@ def parse_session_file(path: Path) -> ParsedSession:
     parsed.reasoning_refs.extend(_reasoning_refs(records, path.stem, "main", None, meta))
     parsed.spans.extend(_context_and_rule_loads(records, meta))
 
-    events, spans, links = _walk_workflow_agents(path, parent_meta=meta, seen=seen)
+    events, spans, links = _walk_workflow_agents(
+        path, parent_meta=meta, seen=seen, tool_parents=parsed.tool_parents
+    )
     parsed.usage_events.extend(events)
     parsed.spans.extend(spans)
     parsed.agent_links.update(links)
@@ -183,6 +199,7 @@ def parse_projects_dir(root: Path) -> ParsedSession:
         merged.usage_events.extend(parsed.usage_events)
         merged.agent_links.update(parsed.agent_links)
         merged.reasoning_refs.extend(parsed.reasoning_refs)
+        merged.tool_parents.update(parsed.tool_parents)
     return merged
 
 
@@ -202,10 +219,13 @@ def _consume_tool_use(
     if span is None:
         return
     parsed.spans.append(span)
+    turn_uuid = rec.get("uuid")
+    if turn_uuid:
+        parsed.tool_parents[span.span_id] = turn_uuid
     if span.kind != "agent":
         return
     events, sub_spans, links = _link_and_walk_agent(
-        span, block.get("id") or "", results, path, meta, seen
+        span, block.get("id") or "", results, path, meta, seen, parsed.tool_parents
     )
     parsed.usage_events.extend(events)
     parsed.spans.extend(sub_spans)
@@ -653,6 +673,7 @@ def _walk_subagent(
     parent_meta: dict[str, str | None],
     agent_span_id: str,
     seen: set[str],
+    tool_parents: dict[str, str],
 ) -> tuple[list[UsageEvent], list[Span], dict[str, str]]:
     """Walk a sub-agent transcript into usage events, step spans, and agent links.
 
@@ -675,6 +696,7 @@ def _walk_subagent(
         parent_meta=parent_meta,
         agent_span_id=agent_span_id,
         seen=seen,
+        tool_parents=tool_parents,
     )
 
 
@@ -686,6 +708,7 @@ def _walk_transcript(
     parent_meta: dict[str, str | None],
     agent_span_id: str,
     seen: set[str],
+    tool_parents: dict[str, str],
 ) -> tuple[list[UsageEvent], list[Span], dict[str, str]]:
     """Walk one sub-agent transcript's records into usage events, spans, and links.
 
@@ -721,9 +744,12 @@ def _walk_transcript(
             span.branch = parent_meta["branch"]
             span.parent_id = agent_span_id
             spans.append(span)
+            sub_turn_uuid = rec.get("uuid")
+            if sub_turn_uuid:
+                tool_parents[span.span_id] = sub_turn_uuid
             if span.kind == "agent":
                 ev, sp, lk = _link_and_walk_agent(
-                    span, block.get("id") or "", results, main_path, parent_meta, seen
+                    span, block.get("id") or "", results, main_path, parent_meta, seen, tool_parents
                 )
                 events.extend(ev)
                 spans.extend(sp)
@@ -738,6 +764,7 @@ def _link_and_walk_agent(
     main_path: Path,
     parent_meta: dict[str, str | None],
     seen: set[str],
+    tool_parents: dict[str, str],
 ) -> tuple[list[UsageEvent], list[Span], dict[str, str]]:
     """Link an agent span to its sub-agent transcript and walk that transcript once.
 
@@ -757,14 +784,23 @@ def _link_and_walk_agent(
         return [], [], {}
     seen.add(agent_id)
     events, spans, links = _walk_subagent(
-        main_path, agent_id, parent_meta=parent_meta, agent_span_id=span.span_id, seen=seen
+        main_path,
+        agent_id,
+        parent_meta=parent_meta,
+        agent_span_id=span.span_id,
+        seen=seen,
+        tool_parents=tool_parents,
     )
     links[span.span_id] = agent_id
     return events, spans, links
 
 
 def _walk_workflow_agents(
-    main_path: Path, *, parent_meta: dict[str, str | None], seen: set[str]
+    main_path: Path,
+    *,
+    parent_meta: dict[str, str | None],
+    seen: set[str],
+    tool_parents: dict[str, str],
 ) -> tuple[list[UsageEvent], list[Span], dict[str, str]]:
     """Discover every ``Workflow`` fan-out under this session as a drillable subtree.
 
@@ -785,7 +821,12 @@ def _walk_workflow_agents(
     links: dict[str, str] = {}
     for wf_dir in sorted(p for p in root.glob("wf_*") if p.is_dir()):
         wf_events, wf_spans, wf_links = _walk_one_workflow(
-            wf_dir, session_dir, main_path=main_path, parent_meta=parent_meta, seen=seen
+            wf_dir,
+            session_dir,
+            main_path=main_path,
+            parent_meta=parent_meta,
+            seen=seen,
+            tool_parents=tool_parents,
         )
         events.extend(wf_events)
         spans.extend(wf_spans)
@@ -800,6 +841,7 @@ def _walk_one_workflow(
     main_path: Path,
     parent_meta: dict[str, str | None],
     seen: set[str],
+    tool_parents: dict[str, str],
 ) -> tuple[list[UsageEvent], list[Span], dict[str, str]]:
     """Walk one ``wf_*`` fan-out: emit its agent spans (+ nested transcripts) and the
     ``workflow``/``workflow_phase`` containers that group them (Issue #58).
@@ -837,6 +879,7 @@ def _walk_one_workflow(
             parent_meta=parent_meta,
             agent_span_id=span.span_id,
             seen=seen,
+            tool_parents=tool_parents,
         )
         events.extend(sub_events)
         spans.extend(sub_spans)
@@ -1033,6 +1076,9 @@ def _usage_event(rec: dict, source: str, agent_id: str | None) -> UsageEvent:
         cache_creation=int(usage.get("cache_creation_input_tokens") or 0),
         source=source,
         agent_id=agent_id,
+        uuid=rec.get("uuid"),
+        parent_uuid=rec.get("parentUuid"),
+        is_sidechain=bool(rec.get("isSidechain")),
     )
 
 
