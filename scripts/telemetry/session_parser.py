@@ -763,8 +763,9 @@ def _walk_transcript(
                 events.extend(ev)
                 spans.extend(sp)
                 links.update(lk)
-    # Dedup this transcript's own usage by message id (Issue #78); events extended in
-    # from nested agent walks above are already deduped at their own level.
+    # Dedup this transcript's own usage by message id (Issue #78). Nested-agent events
+    # appended above are already deduped; the (source, agent_id)-scoped key keeps this
+    # re-run a no-op for them — it can only collapse THIS transcript's duplicates.
     return _dedup_usage_events(events), spans, links
 
 
@@ -1104,20 +1105,26 @@ def _dedup_usage_events(events: list[UsageEvent]) -> list[UsageEvent]:
     ``uuid`` when absent), keeping the LAST record per key — the most-complete
     re-emit, with its timestamp. First-seen order is preserved.
 
+    The key is scoped by ``(source, agent_id)`` so collapse can only ever happen
+    *within* one transcript: an event from the main session can never merge with a
+    sub-agent's, even in the (theoretical) event of a shared ``message_id`` across
+    transcripts. ``_walk_transcript`` runs this over its own usage plus already-
+    deduped nested-agent events; the scoping keeps that re-run a safe no-op for the
+    nested ones rather than relying on global id uniqueness.
+
     Args:
-        events: Usage events from one transcript, in record order.
+        events: Usage events to collapse — typically one transcript's, optionally
+            with already-deduped nested-agent events appended.
 
     Returns:
         One event per unique inference.
     """
-    deduped: dict[str, UsageEvent] = {}
+    deduped: dict[tuple[str, str | None, str | int], UsageEvent] = {}
     for event in events:
-        key = event.message_id or event.uuid
-        if key is None:
-            # No identity at all — cannot be a known duplicate; keep it verbatim.
-            deduped[str(id(event))] = event
-            continue
-        deduped[key] = event
+        # No identity at all → ``id(event)`` keeps it verbatim (the live list holds a
+        # reference, so the id can't be reused mid-loop).
+        ident = event.message_id or event.uuid or id(event)
+        deduped[(event.source, event.agent_id, ident)] = event
     return list(deduped.values())
 
 

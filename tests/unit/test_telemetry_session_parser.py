@@ -20,7 +20,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
-from telemetry.session_parser import ParsedSession, parse_projects_dir, parse_session_file
+from telemetry.session_parser import (
+    ParsedSession,
+    _walk_transcript,
+    parse_projects_dir,
+    parse_session_file,
+)
 from telemetry.spans import Span
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "telemetry" / "projects"
@@ -1228,6 +1233,29 @@ class TestUsageDedupByMessageId:
 
         assert len(main) == 2
         assert sorted(e.output_tokens for e in main) == [308, 512]
+
+    def test_subagent_message_across_records_collapses_to_one_event(self, tmp_path: Path) -> None:
+        # The dedup applies on the subagent walk too: a sub-agent inference re-emitted
+        # across records (same message.id) collapses to one source="subagent" event,
+        # tagged with the agent's id.
+        records = [
+            _assistant_usage("msg_sub", "srec1", "2026-06-16T21:40:01.000Z", output_tokens=120),
+            _assistant_usage("msg_sub", "srec2", "2026-06-16T21:40:01.500Z", output_tokens=120),
+        ]
+        events, _spans, _links = _walk_transcript(
+            records,
+            "agent_xyz",
+            main_path=tmp_path / "sess.jsonl",
+            parent_meta={"session_id": "parent-sess", "repo": "proj", "branch": "b"},
+            agent_span_id="span_agent",
+            seen=set(),
+            tool_parents={},
+        )
+
+        assert len(events) == 1
+        assert events[0].source == "subagent"
+        assert events[0].agent_id == "agent_xyz"
+        assert events[0].output_tokens == 120
 
     def test_records_without_message_id_fall_back_to_uuid(self, tmp_path: Path) -> None:
         # No message.id → each distinct record uuid is its own inference (no collapse).
