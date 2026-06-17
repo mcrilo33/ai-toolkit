@@ -57,11 +57,13 @@ def test_persisted_store_lists_the_post_watermark_spoke(tmp_path: Path) -> None:
     assert RUN in store.spoke_run_ids()
 
 
-def test_spoke_steps_byte_identical_to_parser(tmp_path: Path) -> None:
+def test_spoke_causal_forest_byte_identical_to_parser(tmp_path: Path) -> None:
     persisted = _persisted_store(tmp_path)
     parsed = _parsed_store()
 
-    assert persisted.spoke_steps(RUN) == parsed.spoke_steps(RUN)
+    assert persisted.spoke_causal_forest(RUN, PROJECTS, CCUSAGE) == parsed.spoke_causal_forest(
+        RUN, PROJECTS, CCUSAGE
+    )
 
 
 def test_spoke_tree_byte_identical_to_parser(tmp_path: Path) -> None:

@@ -1,7 +1,8 @@
 """Causal spoke-tree builder — ids, not timestamps (Issue #65, Phase 1, S3).
 
 Assembles one spoke's drillable trace from the causal ids the parser surfaces (S2),
-replacing the timestamp-window correlation in ``dashboard/tree.py``:
+replacing the timestamp-window correlation the dashboard previously used (the former
+``dashboard/tree.py``, removed in #80):
 
 - **human** — a prompt span, bucketed into its covering phase interval; the main turn
   it triggered (``turn.parent_uuid`` resolves to the prompt record via

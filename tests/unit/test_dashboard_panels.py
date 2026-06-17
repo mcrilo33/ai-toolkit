@@ -13,13 +13,22 @@ docs/dashboard-spoke-trace-scope.md, Drill panels / Loaded context:
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from _dashboard_helpers import load_app, load_queries, store_v2
+from _dashboard_helpers import load_app, load_queries
 
-RUN = "feature/v2+1000"
+_TELEMETRY = Path(__file__).resolve().parents[1] / "fixtures" / "telemetry"
+SPOKE = "feature/22-demo+1700000000"
+CCUSAGE = {"11111111-1111-1111-1111-111111111111": 2.80}
+
+
+def _causal_forest():
+    """A real causal forest over the telemetry fixture — the sole builder (#80)."""
+    store = load_queries().SpanStore.from_jsonl(_TELEMETRY / "events.jsonl")
+    return store, store.spoke_causal_forest(SPOKE, _TELEMETRY / "projects", CCUSAGE)
 
 
 def _recording_streamlit() -> tuple[MagicMock, SimpleNamespace]:
@@ -81,7 +90,7 @@ def _node(kind: str, name: str, **over):
 def test_composition_totals_reconcile_to_forest_rollup(monkeypatch):
     st, _ = _recording_streamlit()
     app = _app(monkeypatch, st)
-    forest = store_v2().spoke_steps(RUN)
+    _, forest = _causal_forest()
 
     totals = app._composition_totals(forest)
 
@@ -99,11 +108,10 @@ def test_composition_totals_reconcile_to_forest_rollup(monkeypatch):
 def test_composition_total_exceeds_per_kind_meta_sum(monkeypatch):
     st, _ = _recording_streamlit()
     app = _app(monkeypatch, st)
-    store = store_v2()
-    forest = store.spoke_steps(RUN)
+    store, forest = _causal_forest()
 
     exact = app._composition_totals(forest)["cost_usd"]
-    per_kind = sum(row["total_cost_usd"] for row in store.spoke_meta_by_kind(RUN))
+    per_kind = sum(row["total_cost_usd"] for row in store.spoke_meta_by_kind(SPOKE))
 
     # The per-kind meta view omits main-agent/interval cost; reconciliation matters.
     assert exact > per_kind
@@ -112,7 +120,7 @@ def test_composition_total_exceeds_per_kind_meta_sum(monkeypatch):
 def test_render_composition_shows_exact_totals_and_estimate_label(monkeypatch):
     st, rec = _recording_streamlit()
     app = _app(monkeypatch, st)
-    forest = store_v2().spoke_steps(RUN)
+    _, forest = _causal_forest()
 
     app._render_composition(forest)
 

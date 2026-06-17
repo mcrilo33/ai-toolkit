@@ -577,21 +577,30 @@ def _spoke_forest(store: queries.SpanStore, spoke_id: str, source_key: str) -> l
 
 
 def _build_spoke_forest(store: queries.SpanStore, spoke_id: str) -> list[dict]:
-    """The v3 **causal** trace when this spoke's transcripts are on disk (Issue #65),
-    else the timestamp-correlated step tree.
+    """The v3 **causal** trace for one spoke — the sole builder (Issues #65/#80).
 
-    The causal path parses ONLY this spoke's own sessions; when they are absent (a
-    push-only dataset, or a fixture with no transcript) it yields an empty forest and we
-    fall back to ``spoke_steps`` so the view still renders.
+    Parses ONLY this spoke's own sessions (located from its push spans); a spoke with no
+    transcript on disk (a push-only dataset or a fixture) yields an empty forest, which
+    the caller renders as an empty state. The legacy timestamp-bucketed ``spoke_steps``
+    builder and its silent fallback are gone (#80): a genuine build failure propagates so
+    the view surfaces it via :func:`_build_or_error`, never silently renders the old
+    broken model.
     """
-    build_causal = getattr(store, "spoke_causal_forest", None)
-    if build_causal is not None:
-        projects_dir = resolve_projects_dir()
-        if projects_dir.exists():
-            forest = build_causal(spoke_id, projects_dir, _ccusage_costs())
-            if forest:
-                return forest
-    return store.spoke_steps(spoke_id)
+    return store.spoke_causal_forest(spoke_id, resolve_projects_dir(), _ccusage_costs())
+
+
+def _build_or_error(store: queries.SpanStore, spoke_id: str, source_key: str) -> list[dict] | None:
+    """The spoke's causal forest, or ``None`` after surfacing an explicit ``st.error``.
+
+    The causal forest is the only builder (#80); a build failure is shown to the user
+    rather than silently falling back to the removed legacy tree. ``None`` (build failed,
+    error shown) is distinct from ``[]`` (a legitimately empty forest).
+    """
+    try:
+        return _spoke_forest(store, spoke_id, source_key)
+    except Exception as exc:  # noqa: BLE001 — any build failure must reach the user
+        st.error(f"Could not build the causal trace for this spoke: {exc}")
+        return None
 
 
 # Live-follow (Issue #67). A spoke whose transcript changed within this window is taken
@@ -645,7 +654,9 @@ def _render_steps_body(
     an expand/collapse toggle re-renders the same objects without a rebuild (#67).
     """
     mtime = _spoke_live_mtime(store, spoke_id, projects_dir)
-    forest = _spoke_forest(store, spoke_id, _forest_cache_key(source_key, mtime))
+    forest = _build_or_error(store, spoke_id, _forest_cache_key(source_key, mtime))
+    if forest is None:
+        return  # build failed; the error is already surfaced
     if not forest:
         st.info("No spans for this spoke run.")
         return
@@ -681,7 +692,7 @@ def render_spoke_view(store: queries.SpanStore, source_key: str = "") -> None:
 
     # The shared build for the non-live tabs; keyed on the same mtime, so the Steps tab's
     # re-read returns this exact cached forest when the transcript has not grown.
-    forest = _spoke_forest(store, spoke_id, _forest_cache_key(source_key, live_mtime))
+    forest = _build_or_error(store, spoke_id, _forest_cache_key(source_key, live_mtime))
     steps_tab, meta_tab, comp_tab = st.tabs(["Steps", "Meta by kind", "Composition"])
 
     with steps_tab:
@@ -699,7 +710,9 @@ def render_spoke_view(store: queries.SpanStore, source_key: str = "") -> None:
         _render_meta(store, spoke_id)
 
     with comp_tab:
-        if not forest:
+        if forest is None:
+            pass  # build failed; the error is already surfaced above
+        elif not forest:
             st.info("No spans for this spoke run.")
         else:
             _render_composition(forest)

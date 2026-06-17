@@ -7,7 +7,7 @@ a drill toggle reuses cached rows rather than rebuilding. A changed log mtime
 invalidates the entry.
 
 These tests drive ``dashboard/app.py`` with a MagicMock streamlit and a fake store
-that counts ``spoke_steps`` calls — the observable proxy for "did it rebuild?".
+that counts ``spoke_causal_forest`` calls — the observable proxy for "did it rebuild?".
 """
 
 from __future__ import annotations
@@ -33,7 +33,9 @@ def _streamlit_stub() -> MagicMock:
 def _app(monkeypatch):
     monkeypatch.setitem(sys.modules, "streamlit", _streamlit_stub())
     monkeypatch.setitem(sys.modules, "queries", load_queries())
-    return load_app()
+    app = load_app()
+    monkeypatch.setattr(app, "_ccusage_costs", lambda: {})  # never shell out to npx in tests
+    return app
 
 
 def _interval(name: str) -> dict:
@@ -59,7 +61,7 @@ def _interval(name: str) -> dict:
 
 
 class _FakeStore:
-    """A store recording each ``spoke_steps`` build, returning a one-node forest."""
+    """A store recording each causal-forest build, returning a one-node forest."""
 
     def __init__(self, spoke_ids: list[str]):
         self._ids = spoke_ids
@@ -68,7 +70,9 @@ class _FakeStore:
     def spoke_run_ids(self, _real_repo_prefix=None) -> list[str]:
         return self._ids
 
-    def spoke_steps(self, spoke_run_id: str) -> list[dict]:
+    def spoke_causal_forest(
+        self, spoke_run_id: str, _projects_dir=None, _ccusage=None
+    ) -> list[dict]:
         self.built.append(spoke_run_id)
         return [_interval(spoke_run_id)]
 
@@ -120,9 +124,9 @@ def test_render_rebuilds_when_correlation_toggled(monkeypatch):
     assert store.built == ["feature/a+1", "feature/a+1"]
 
 
-def test_build_prefers_causal_when_transcripts_present(monkeypatch, tmp_path):
-    # Issue #65: when the spoke's transcripts are on disk, _build_spoke_forest renders
-    # the causal trace (a forest of node_id-bearing causal nodes), not spoke_steps.
+def test_build_uses_causal_trace_when_transcripts_present(monkeypatch):
+    # Issue #65/#80: when the spoke's transcripts are on disk, _build_spoke_forest renders
+    # the causal trace (a forest of node_id-bearing causal nodes) — the sole builder.
     app = _app(monkeypatch)
     fixtures = Path(__file__).resolve().parents[1] / "fixtures" / "telemetry"
     store = load_queries().SpanStore.from_jsonl(fixtures / "events.jsonl")
@@ -132,18 +136,6 @@ def test_build_prefers_causal_when_transcripts_present(monkeypatch, tmp_path):
     forest = app._build_spoke_forest(store, "feature/22-demo+1700000000")
 
     assert forest and all("node_id" in root for root in forest)  # causal nodes
-
-
-def test_build_falls_back_to_step_tree_without_transcripts(monkeypatch):
-    # No projects dir on disk → the causal path is skipped and the step tree renders.
-    app = _app(monkeypatch)
-    store = _FakeStore(["feature/x+1"])
-    monkeypatch.setattr(app, "resolve_projects_dir", lambda: Path("/no/such/projects/dir"))
-
-    forest = app._build_spoke_forest(store, "feature/x+1")
-
-    assert store.built == ["feature/x+1"]  # spoke_steps fallback was used
-    assert forest == [_interval("feature/x+1")]
 
 
 def test_resolve_store_keys_correlated_forest_on_store_version(monkeypatch, tmp_path):

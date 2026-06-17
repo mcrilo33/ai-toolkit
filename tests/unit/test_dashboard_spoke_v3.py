@@ -1,7 +1,7 @@
 """v3 spoke-trace rendering — columns/labels (Issue #53 track D).
 
 ``dashboard/app.py`` is the thin Streamlit presentation layer; the data layer is
-``queries.py`` / ``tree.py``. Streamlit cannot be imported in the base test env,
+``queries.py`` / ``step_nodes.py``. Streamlit cannot be imported in the base test env,
 so we inject a *recording* ``MagicMock`` streamlit that captures every ``markdown``
 written across columns, then drive the render over contract-shaped forests built
 with the #50 ``synthetic_node`` factory.
@@ -19,7 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from _dashboard_helpers import load_app, load_queries, store_v2
+from _dashboard_helpers import load_app, load_queries
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
@@ -120,8 +120,15 @@ def _row_for(rec, needle: str) -> list[str]:
 def test_spine_header_is_node_time_dur_h_actor(monkeypatch):
     st, rec = _recording_streamlit()
     app = _app(monkeypatch, st)
+    fixtures = Path(__file__).resolve().parents[1] / "fixtures" / "telemetry"
+    store = load_queries().SpanStore.from_jsonl(fixtures / "events.jsonl")
+    monkeypatch.setattr(app, "resolve_projects_dir", lambda: fixtures / "projects")
+    monkeypatch.setattr(app, "_ccusage_costs", lambda: {})
 
-    app.render_spoke_view(store_v2())
+    # The causal forest is the sole builder (#80); render its Steps tab directly so the
+    # header row is emitted (render_spoke_view would filter this non-ai-toolkit fixture
+    # spoke out of the selectbox via REAL_REPO_PREFIX).
+    app._render_steps_body(store, "feature/22-demo+1700000000", fixtures / "projects", "")
 
     header = next(r for r in rec.rows if r and all(c and c.startswith("**") for c in r))
     assert header == [

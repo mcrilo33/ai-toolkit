@@ -29,25 +29,22 @@ from typing import Any
 
 import duckdb
 
-# ``tree.py`` is the sibling forest-builder module (Issue #50, Part 3). Make it
-# importable regardless of how this module was loaded — ``streamlit run`` injects
-# this directory onto sys.path, but the unit harness loads queries by file path and
-# does not — then import the builders the SQL/aggregate layer calls.
+# ``step_nodes.py`` is the sibling module holding the span->node / interval / turn
+# attribution + rollup primitives the SQL/aggregate layer reuses. Make it importable
+# regardless of how this module was loaded — ``streamlit run`` injects this directory
+# onto sys.path, but the unit harness loads queries by file path and does not.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # The v3 causal trace (Issue #65): the per-spoke builder + the parser it re-parses with.
-# ``tree`` already put ``scripts/`` on the path above, so ``telemetry`` resolves here.
 from telemetry.causal_tree import causal_forest_from_parsed
 from telemetry.session_parser import ParsedSession, parse_session_file
-from tree import (
+from step_nodes import (
     _attribute_turns,
     _build_intervals,
-    _interval_forest,
     _parse_ts,
     _roll_up,
     _roll_up_steps,
     _step_node,
     _turns_by_owner,
-    build_dividers,
 )
 
 # Push-span kinds the parser does NOT reconstruct from a transcript — the spine markers,
@@ -653,50 +650,6 @@ class SpanStore:
             _roll_up(root)
         return roots
 
-    def spoke_steps(self, spoke_run_id: str) -> list[dict[str, Any]]:
-        """The turn-centric drill-down tree for one spoke (Issues #46/#47 S3).
-
-        Level-1 roots are reconstructed **phase-interval buckets** (#46): the
-        ``step``/``lifecycle`` marker spine partitions the run into intervals, each
-        labelled by the todo it advances. Inside a bucket the marker shows as a thin
-        header (its own wall-clock), then come **turn nodes** — one per assistant
-        inference (a ``turns`` row), time-ordered, each owning its once-per-turn
-        cost. The skill/tool/todo/human spans an inference issued nest *under their
-        turn* (matched by ``ts_start``); hooks nest under the tool whose window
-        contains them; an ``agent`` span holds the sub-agent's own **sub-turn**
-        nodes and spans. Every node carries an additive ``rollup``; the cost rolls
-        up to the same run total as #46 — each turn is counted exactly once.
-
-        Returns a forest ordered by ``ts_start``; an unknown spoke yields ``[]``.
-        """
-        nodes, intervals, turns_by_owner = self._attributed_nodes(spoke_run_id)
-        if not nodes:
-            return []
-        forest = _interval_forest(nodes, intervals, turns_by_owner)
-        # Idle/resume dividers (Issue #52) are root-level rows built from the raw
-        # spans (which carry session_id + timing); they own nothing, so they slot
-        # into the forest by ``ts_start`` without disturbing the cost rollup.
-        rows = self._query(
-            "SELECT session_id, ts_start, ts_end FROM spans WHERE spoke_run_id = ?",
-            [spoke_run_id],
-        )
-        # Pass the spoke's turns so each session-resume divider carries the real
-        # per-resume cache_creation (the cold re-read), not a static note (Issue #59).
-        session_ids = sorted({row["session_id"] for row in rows if row["session_id"]})
-        forest = forest + build_dividers(rows, self._turns_for_sessions(session_ids))
-        # Order by start; ``(unresolved)`` stays last by an explicit kind flag (not
-        # just its null ts), and ``name`` is the final deterministic tiebreak.
-        forest.sort(
-            key=lambda n: (
-                _parse_ts(n["ts_start"]) or float("inf"),
-                n["kind"] == "unresolved",
-                n["name"],
-            )
-        )
-        for root in forest:
-            _roll_up_steps(root)
-        return forest
-
     def spoke_causal_forest(
         self,
         spoke_run_id: str,
@@ -705,10 +658,11 @@ class SpanStore:
     ) -> list[dict[str, Any]]:
         """The v3 **causal** trace for one spoke, parsed per-spoke (Issue #65).
 
-        Replaces the timestamp-correlated :meth:`spoke_steps` with a tree built from the
-        real causal ids. Only this spoke's own session transcripts are parsed (located
-        from its push spans), never the whole projects root — that per-spoke parse is what
-        keeps cold open fast. The fresh pull spans + per-turn rows + ``tool_parents`` feed
+        The sole spoke-tree builder since #80 removed the timestamp-correlated path:
+        the trace is built from the real causal ids. Only this spoke's own session
+        transcripts are parsed (located from its push spans), never the whole projects
+        root — that per-spoke parse is what keeps cold open fast. The fresh pull spans +
+        per-turn rows + ``tool_parents`` feed
         the builder; the spoke's push markers/hooks/scripts supply the spine; idle/resume
         dividers are appended.
 
@@ -726,7 +680,7 @@ class SpanStore:
         )
         forest = causal_forest_from_parsed(parsed, push, ccusage_costs or {})
         # Attach the additive subtree ``rollup`` the renderer's composition/step metrics
-        # read, exactly as ``spoke_steps`` does — without it the Composition tab is zero.
+        # read — without it the Composition tab is zero.
         for root in forest:
             _roll_up_steps(root)
         return forest
@@ -1140,7 +1094,7 @@ def format_step_metrics(node: dict[str, Any]) -> dict[str, str]:
     """Display-ready metrics for a v2 spoke node.
 
     Time is the node's own wall-clock; cost/tokens/models/humans/status come from the
-    rolled-up subtree totals that ``spoke_steps`` attaches to every node (each falls
+    rolled-up subtree totals that the forest builder attaches to every node (each falls
     back to the node's own only for a node built without a rollup). Status is the
     rolled-up terminal (last-event) outcome (Issue #57), matching the row icon. Zero
     values render as an em dash.

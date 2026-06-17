@@ -130,7 +130,7 @@ class Span:
 # ── synthetic-node field contract (Issue #50) ─────────────────────────────────
 # Synthetic nodes are display-only tree rows built at query time by the dashboard.
 # They are NEVER spans: they carry no ``span_id``, never enter the spans table, and
-# never reach an aggregate/meta rollup. The forest in ``dashboard/tree.py`` mixes
+# never reach an aggregate/meta rollup. The dashboard forest builders mix
 # them freely with real-span nodes as children, so they mirror the real-node shape
 # — with ``actor`` (the v3 ``Actor`` column: ``main``, a sub-agent name,
 # ``workflow``, ``script``, ``hooks``, ``sidecar``) as the canonical owner key.

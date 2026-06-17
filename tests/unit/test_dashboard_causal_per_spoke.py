@@ -62,7 +62,7 @@ class TestSpokeCausalForest:
 
     def test_roots_carry_a_rollup_for_composition(self) -> None:
         # The Composition tab sums each root's additive ``rollup``; the causal path must
-        # attach it (as spoke_steps does) or the tab reads all zeros.
+        # attach it via ``_roll_up_steps`` or the tab reads all zeros.
         forest = _store().spoke_causal_forest(SPOKE, PROJECTS)
         assert all("rollup" in root for root in forest)
 

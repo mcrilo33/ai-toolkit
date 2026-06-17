@@ -712,8 +712,8 @@ class TestRecursiveAgents:
         assert by_link["c3c3c3c3c3c3c3c3"].name == "tdd-red"
 
     def test_windows_nest_by_containment(self, wf_parsed: ParsedSession) -> None:
-        # tree.py homes a subagent turn under the tightest enclosing agent by time
-        # window, so each child's [ts_start, ts_end] must sit inside its parent's.
+        # the forest builder homes a subagent turn under the tightest enclosing agent by
+        # time window, so each child's [ts_start, ts_end] must sit inside its parent's.
         windows = [
             (a.ts_start, a.ts_end) for a in (_agents_by_link(wf_parsed)[c] for c in CHAIN_IDS)
         ]
