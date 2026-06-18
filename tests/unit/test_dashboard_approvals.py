@@ -415,7 +415,7 @@ class TestAppRender:
         st, rec = _recording_st()
         app = _app(monkeypatch, st)
         store = load_queries().SpanStore.from_events(_spans())
-        app._render_meta(store, RUN)
+        app._render_meta(store, RUN, None)  # no forest ⇒ only the cost-by-kind table
         table = rec.tables[0]
         assert all("Mean wait" in row for row in table), "meta table must carry a Mean wait column"
         approval = next(r for r in table if r["Kind"] == "approval")

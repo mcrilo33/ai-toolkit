@@ -35,7 +35,7 @@ import duckdb
 # onto sys.path, but the unit harness loads queries by file path and does not.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # The v3 causal trace (Issue #65): the per-spoke builder + the parser it re-parses with.
-from telemetry.causal_tree import causal_forest_from_parsed
+from telemetry.causal_tree import causal_forest_from_parsed, leaf_time_slices
 from telemetry.session_parser import ParsedSession, parse_session_file
 from step_nodes import (
     _attribute_turns,
@@ -722,6 +722,25 @@ class SpanStore:
         nodes = self._meta_nodes(spoke_run_id)
         return _aggregate_by_kind(nodes)
 
+    def spoke_time_by_kind(
+        self,
+        spoke_run_id: str,
+        projects_dir: Path,
+        ccusage_costs: dict[str, float] | None = None,
+    ) -> list[dict[str, Any]]:
+        """The spoke's wall-clock partitioned by kind — the time analog of cost conservation.
+
+        Unlike :meth:`spoke_meta_by_kind` (which sums each span's raw ``duration_ms`` and so
+        double-counts nested hooks/tools and concurrent sub-agents), this attributes every
+        instant to the **deepest-active leaf** of the causal forest — gaps to ``idle`` — so
+        the kinds tile ``[spawn, teardown]`` exactly. **Sub-agent concurrency rule:** while a
+        sub-agent runs, the parent turn is waiting, so that slice is the sub-agent's, not the
+        parent's — the parent does not spend it twice. Rows carry per-kind ``total_duration_ms``
+        and the ``share`` of the spoke total, sorted by share descending. Unknown → ``[]``.
+        """
+        forest = self.spoke_causal_forest(spoke_run_id, projects_dir, ccusage_costs)
+        return time_by_kind_rows(leaf_time_slices(forest))
+
     def cold_context(self, spoke_run_id: str) -> list[dict[str, Any]]:
         """The cold-context lens: context loaded for one spoke, by subtype (Issue #52).
 
@@ -1139,6 +1158,33 @@ def _clock(ts: str | None) -> str:
     if not ts or "T" not in ts:
         return ts or "—"
     return ts.split("T", 1)[1].rstrip("Z")[:8]
+
+
+def forest_time_by_kind(forest: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The time-by-kind rollup for an already-built causal forest (no re-parse).
+
+    The view holds the forest it rendered the Steps tab from, so the Meta tab reuses it
+    here rather than re-parsing the transcript via :meth:`SpanStore.spoke_time_by_kind`.
+    """
+    return time_by_kind_rows(leaf_time_slices(forest))
+
+
+def time_by_kind_rows(slices: dict[str, int]) -> list[dict[str, Any]]:
+    """Turn a leaf-slice ``kind -> ms`` partition into meta-view rows that reconcile.
+
+    Each row carries the kind's ``total_duration_ms`` and its ``share`` of the spoke
+    total; the durations sum to the total and the shares to 1.0 (an empty/zero partition
+    yields no rows). Sorted by share descending, then kind, so the dominant slice — often
+    ``idle`` — leads the rollup.
+    """
+    total = sum(slices.values())
+    if not total:
+        return []
+    rows = [
+        {"kind": kind, "total_duration_ms": ms, "share": ms / total} for kind, ms in slices.items()
+    ]
+    rows.sort(key=lambda row: (-row["total_duration_ms"], row["kind"]))
+    return rows
 
 
 def _aggregate_by_kind(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
