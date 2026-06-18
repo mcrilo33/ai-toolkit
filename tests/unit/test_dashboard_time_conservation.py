@@ -17,7 +17,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from telemetry.causal import CausalNode, causal_node, validate_causal_tree
-from telemetry.causal_tree import leaf_time_slices
+from telemetry.causal_tree import build_causal_forest, leaf_time_slices
+from telemetry.spans import derive_span_id
 
 BASE = "2026-06-12T12:00:00Z"
 
@@ -82,3 +83,99 @@ def test_leaf_slices_conserve_the_total_wall_clock() -> None:
     slices = leaf_time_slices(forest)
 
     assert sum(slices.values()) == 600_000  # spawn (12:00:00) → teardown (12:10:00)
+
+
+SID = "sess-t"
+HREC = "hrec-uuid"
+
+
+def _by_id(forest: list[CausalNode]) -> dict[str, CausalNode]:
+    flat: dict[str, CausalNode] = {}
+
+    def walk(nodes: list[CausalNode]) -> None:
+        for node in nodes:
+            flat[node["node_id"]] = node
+            walk(node["children"])
+
+    walk(forest)
+    return flat
+
+
+def _turn_with_latency_scenario() -> list[CausalNode]:
+    """A prompt at :50 triggers t1 (inference ends :52); a continuation t2 ends :54.
+
+    t1's trigger is the prompt → its inference window is prompt→t1 (2s); t2's trigger
+    is the prior turn's tool_result, proxied by t1's end → its window is t1→t2 (2s).
+    Before #79 both turns are zero-width, so their inference time is lost.
+    """
+    turns = [
+        {
+            "uuid": "t1",
+            "parent_uuid": HREC,
+            "session_id": SID,
+            "ts": "2026-06-12T20:57:52Z",
+            "source": "main",
+            "agent_id": None,
+            "is_sidechain": False,
+            "cost_usd": 0.1,
+            "tokens_in": 100,
+            "tokens_out": 20,
+        },
+        {
+            "uuid": "t2",
+            "parent_uuid": "tr1",
+            "session_id": SID,
+            "ts": "2026-06-12T20:57:54Z",
+            "source": "main",
+            "agent_id": None,
+            "is_sidechain": False,
+            "cost_usd": 0.2,
+            "tokens_in": 100,
+            "tokens_out": 20,
+        },
+    ]
+    spans = [
+        {
+            "span_id": derive_span_id(SID, HREC),
+            "parent_id": None,
+            "kind": "human",
+            "name": "prompt",
+            "phase": None,
+            "ts_start": "2026-06-12T20:57:50Z",
+            "ts_end": "2026-06-12T20:57:50Z",
+            "duration_ms": 0,
+            "status": "success",
+            "human_type": "prompt",
+            "human_wait_ms": None,
+        },
+        {
+            "span_id": "st_spawn",
+            "parent_id": None,
+            "kind": "step",
+            "name": "solo-cycle",
+            "phase": "spawn",
+            "ts_start": "2026-06-12T20:57:05Z",
+            "ts_end": "2026-06-12T20:58:00Z",
+            "duration_ms": 0,
+            "status": "success",
+        },
+    ]
+    return build_causal_forest(turns, spans, {})
+
+
+def test_main_turn_duration_is_inference_latency_from_its_prompt() -> None:
+    nodes = _by_id(_turn_with_latency_scenario())
+
+    t1 = nodes["t1"]
+
+    assert t1["ts_start"] == "2026-06-12T20:57:50Z"
+    assert t1["duration_ms"] == 2000
+
+
+def test_continuation_turn_duration_runs_from_the_prior_turn() -> None:
+    nodes = _by_id(_turn_with_latency_scenario())
+
+    t2 = nodes["t2"]
+
+    assert t2["ts_start"] == "2026-06-12T20:57:52Z"
+    assert t2["duration_ms"] == 2000
