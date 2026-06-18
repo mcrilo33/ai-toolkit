@@ -331,7 +331,9 @@ def _render_divider(node: dict) -> None:
         note = f" · cold cache (+{cache:,})" if cache else " · cold cache"
         st.markdown(f"··· session resume{note} ···")
         return
-    st.markdown(f"··· idle · {node['name']} ···")
+    # The idle gap is a duration-bearing row (Issue #79): show how long the wait was,
+    # so the time it represents is visible and reconciles with the meta-by-kind rollup.
+    st.markdown(f"··· idle {queries.format_duration(node.get('duration_ms'))} ···")
 
 
 def _inline_node_summary(node: dict) -> str:

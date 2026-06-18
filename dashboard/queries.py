@@ -1109,6 +1109,22 @@ def _format_secs(ms: int | float | None) -> str:
     return "—" if not ms else f"{ms / 1000:.1f}s"
 
 
+def format_duration(ms: int | float | None) -> str:
+    """A wall-clock span as a compact ``45s`` / ``7m12s`` / ``1h03m`` label.
+
+    The idle-gap rows (Issue #79) carry minutes-to-hours of waiting, which ``_format_secs``
+    would render as an unreadable ``432.0s``; this collapses to the largest two units.
+    """
+    secs = round((ms or 0) / 1000)
+    if secs < 60:
+        return f"{secs}s"
+    minutes, seconds = divmod(secs, 60)
+    if minutes < 60:
+        return f"{minutes}m{seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
 def _format_cost(usd: float | None) -> str:
     return "—" if not usd else f"${usd:.4f}"
 
