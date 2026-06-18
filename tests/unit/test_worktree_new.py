@@ -155,6 +155,20 @@ def _run_new(
     env.pop("WT_AGENT_MODEL", None)
     env.pop("WT_AGENT_EFFORT", None)
     env.pop("WT_AGENT_BUDGET_ARGS", None)
+    # The native-OTel opt-in (issue #83) and any inherited OTEL_* / telemetry vars
+    # must not leak in either: the gate-off default and the secret-handling are
+    # under test, so the host's own telemetry config must never steer the launch.
+    for _k in (
+        "AI_TOOLKIT_OTEL",
+        "CLAUDE_CODE_ENABLE_TELEMETRY",
+        "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA",
+        "OTEL_TRACES_EXPORTER",
+        "OTEL_EXPORTER_OTLP_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_RESOURCE_ATTRIBUTES",
+    ):
+        env.pop(_k, None)
     if extra_env:
         env.update(extra_env)
     if inside_tmux:
@@ -461,6 +475,107 @@ def test_manual_fallback_advice_carries_wt_spoke_marker(hub: Path, tmp_path: Pat
 
     assert proc.returncode == 0, proc.stderr
     assert "WT_SPOKE=8 CLAUDE_EFFORT=max claude --model opus" in proc.stdout
+
+
+# ── Native-OTel opt-in (issue #83) ───────────────────────────────────────────
+# When AI_TOOLKIT_OTEL=1, the spoke launch is prefixed with Claude Code's native
+# OpenTelemetry trace env so the interactive `claude` streams ONE nested trace per
+# spoke, grouped by the already-minted spoke_run_id (carried as a resource
+# attribute). The prefix is the same WT_SPOKE/CLAUDE_EFFORT command-prefix lever,
+# so it reaches the interactive session AND the manual-fallback advice. It is
+# strictly opt-in (absent when the gate is unset), distinct from the custom push
+# layer's AI_TOOLKIT_TELEMETRY gate. Only the non-secret enabling + identity vars
+# are wired by the script; the connection target (OTEL_EXPORTER_OTLP_ENDPOINT and
+# the auth-bearing OTEL_EXPORTER_OTLP_HEADERS) is operator-provided via the
+# inherited environment and must never be written into the command line (it would
+# leak via `ps`) or printed.
+
+_OTEL_NONSECRET_VARS = (
+    "CLAUDE_CODE_ENABLE_TELEMETRY=1",
+    "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1",
+    "OTEL_TRACES_EXPORTER=otlp",
+    "OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf",
+)
+
+
+def test_agent_launch_omits_otel_env_by_default(hub: Path, tmp_path: Path) -> None:
+    # Gate unset → the launch is byte-for-byte the non-OTel launch: no telemetry
+    # env, no resource attribute. Opt-in must be explicit.
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code")
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    for var in (*_OTEL_NONSECRET_VARS, "OTEL_RESOURCE_ATTRIBUTES="):
+        assert var not in new_window[0], f"{var} must be absent unless opted in"
+
+
+def test_agent_launch_injects_otel_env_when_opted_in(hub: Path, tmp_path: Path) -> None:
+    # AI_TOOLKIT_OTEL=1 → all non-secret enabling vars precede the WT_SPOKE pin,
+    # and the resource attribute carries the minted spoke_run_id (<branch>+<epoch>),
+    # so every span of this spoke groups under it.
+    proc, log = _run_new(
+        hub, tmp_path, "8", "some-slug", "--no-code", extra_env={"AI_TOOLKIT_OTEL": "1"}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    cmd = new_window[0]
+    for var in _OTEL_NONSECRET_VARS:
+        assert var in cmd, f"expected {var} in the opted-in launch"
+    assert "OTEL_RESOURCE_ATTRIBUTES=spoke_run_id=feature/8-some-slug+" in cmd
+    # The OTel prefix precedes the existing WT_SPOKE/CLAUDE_EFFORT pin, so the
+    # launch still pins model+effort+role unchanged.
+    assert "WT_SPOKE=8 CLAUDE_EFFORT=max claude --model opus" in cmd
+    assert cmd.index("CLAUDE_CODE_ENABLE_TELEMETRY=1") < cmd.index("WT_SPOKE=8")
+
+
+def test_agent_launch_never_forwards_otel_secrets(hub: Path, tmp_path: Path) -> None:
+    # Even with the gate on AND connection secrets present in the environment, the
+    # endpoint and auth headers must never reach the command line (ps-visible) or
+    # stdout — the script wires only non-secret vars; the target is inherited env.
+    secret_endpoint = "https://secret.example.invalid/api/public/otel"
+    secret_headers = "Authorization=Basic c2VjcmV0LXRva2VuLXZhbHVl"
+    proc, log = _run_new(
+        hub,
+        tmp_path,
+        "8",
+        "some-slug",
+        "--no-code",
+        extra_env={
+            "AI_TOOLKIT_OTEL": "1",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": secret_endpoint,
+            "OTEL_EXPORTER_OTLP_HEADERS": secret_headers,
+        },
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    for secret in (secret_endpoint, secret_headers):
+        assert secret not in new_window[0], "secret must never be on the command line"
+        assert secret not in proc.stdout, "secret must never be printed"
+
+
+def test_manual_fallback_advice_carries_otel_env(hub: Path, tmp_path: Path) -> None:
+    # No tmux server → the printed manual launch command must carry the OTel prefix
+    # too, so a hand-started spoke still streams its trace.
+    proc, _ = _run_new(
+        hub,
+        tmp_path,
+        "8",
+        "some-slug",
+        "--no-code",
+        inside_tmux=False,
+        has_session_rc=1,
+        new_session_rc=1,
+        extra_env={"AI_TOOLKIT_OTEL": "1"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "CLAUDE_CODE_ENABLE_TELEMETRY=1" in proc.stdout
+    assert "OTEL_RESOURCE_ATTRIBUTES=spoke_run_id=feature/8-some-slug+" in proc.stdout
 
 
 # ── Command-allowlist templating (issues #11, #37) ───────────────────────────
