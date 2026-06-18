@@ -56,6 +56,8 @@ SCHEMA_KEYS = {
     "duration_ms",
     "status",
     "human",
+    # The hook's raising condition (Issue #82) — set on hook spans, null on pull spans.
+    "hook_event",
     "summary",
     # v3 link fields (Issue #50) — additive, pull-only; null on push spans.
     "emits",

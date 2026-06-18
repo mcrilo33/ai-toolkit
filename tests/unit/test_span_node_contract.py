@@ -108,6 +108,25 @@ class TestLinkFields:
             assert fields.index(field) < fields.index("tokens_in")
 
 
+class TestHookEventField:
+    """Issue #82 — the hook's raising condition is a first-class span field."""
+
+    def test_hook_event_in_schema(self) -> None:
+        assert "hook_event" in SPAN_FIELDS
+
+    def test_defaults_to_none(self) -> None:
+        span = Span(span_id="h1", kind="hook", name="secrets-scan.sh")
+        assert span.hook_event is None
+
+    def test_round_trips_in_to_dict(self) -> None:
+        span = Span(span_id="h1", kind="hook", name="secrets-scan.sh", hook_event="PreToolUse")
+        assert span.to_dict()["hook_event"] == "PreToolUse"
+
+    def test_stays_before_token_tail(self) -> None:
+        fields = list(SPAN_FIELDS)
+        assert fields.index("hook_event") < fields.index("tokens_in")
+
+
 class TestSyntheticNodeContract:
     def test_all_synthetic_kinds_registered(self) -> None:
         assert set(_SYNTHETIC_KINDS) == set(SYNTHETIC_KINDS)

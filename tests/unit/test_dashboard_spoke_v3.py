@@ -329,3 +329,21 @@ def test_non_hooks_collapsed_group_gets_times_n_label(monkeypatch):
     app._render_spine([_node("interval", "S1", ts_start="2026-06-12T12:00:00Z", children=[group])])
 
     assert any("agent x3" in t for t in rec.texts)
+
+
+# ── hook line shows its raising event (Issue #82) ─────────────────────────────
+
+
+def test_hook_label_shows_event_and_script():
+    # The hook line reads "<event> · <script>" so the trigger is visible next to the
+    # already-rendered `hook` kind, e.g. "hook PreToolUse · secrets-scan.sh".
+    label = load_queries().format_step_label(
+        _node("hook", "secrets-scan.sh", hook_event="PreToolUse")
+    )
+    assert label == "PreToolUse · secrets-scan.sh"
+
+
+def test_hook_label_without_event_falls_back_to_script():
+    # A legacy hook span with no recorded event keeps the bare script name.
+    label = load_queries().format_step_label(_node("hook", "secrets-scan.sh"))
+    assert label == "secrets-scan.sh"

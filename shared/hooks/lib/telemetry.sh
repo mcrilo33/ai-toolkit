@@ -15,8 +15,9 @@
 #
 # PRIVACY CONTRACT (enforced by tests/unit/test_telemetry_span.py):
 #   Metadata only. `repo` is a basename, NEVER a path. We NEVER log commands,
-#   messages, file paths, or any payload content — only the session_id field is
-#   read out of the hook payload, nothing else.
+#   messages, file paths, or any payload content — only three fixed metadata fields
+#   are read out of the hook payload: `session_id`, `hook_event_name`, and (for a
+#   ToolUse event) the opaque `tool_use_id`. Nothing else.
 #
 # INVISIBILITY CONTRACT:
 #   Zero bytes on stdout/stderr; never changes the caller's exit code. The whole
@@ -107,6 +108,32 @@ _telemetry_session_id() {
   printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null
 }
 
+# hook_event_name: the hook's raising condition (PreToolUse/PostToolUse/SessionStart/
+# Stop/UserPromptSubmit/SubagentStop/Notification/PreCompact). Read out of the payload
+# like session_id — a fixed-enum metadata field, never content (Issue #82). Recorded on
+# kind=hook spans as the trigger. Empty when absent / no payload / no jq.
+_telemetry_hook_event() {
+  local input="${INPUT:-}"
+  [ -n "$input" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  printf '%s' "$input" | jq -r '.hook_event_name // empty' 2>/dev/null
+}
+
+# tool_use_id of the Pre/PostToolUse event a hook is handling — the same opaque id the
+# parser derives the tool node from, so the hook span nests under its triggering tool
+# (Issue #82). Read ONLY for a ToolUse event; other hook events carry no tool to nest
+# under (they keep their turn/session parent). Empty when not a tool event / no jq.
+_telemetry_hook_tool_use_id() {
+  local input="${INPUT:-}"
+  [ -n "$input" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  case "$(printf '%s' "$input" | jq -r '.hook_event_name // empty' 2>/dev/null)" in
+    PreToolUse | PostToolUse) ;;
+    *) return 0 ;;
+  esac
+  printf '%s' "$input" | jq -r '.tool_use_id // empty' 2>/dev/null
+}
+
 # spoke_run_id: minted at worktree-new, written to <root>/.ai-toolkit/spoke-run-id.
 # Every span emitted inside that worktree reads it; empty when not in a spoke.
 _telemetry_spoke_run_id() {
@@ -178,11 +205,12 @@ _telemetry_branch() {
 #              it. Omitted → ts_start = now, duration_ms = 0.
 #   --parent-id  nesting parent. Resolution order (Issue #66): this flag →
 #              $TELEMETRY_PARENT_ID (in-process override) → $AI_TOOLKIT_PARENT_SPAN
-#              (correlation id a parent shell exports for a child) →
-#              <root>/.ai-toolkit/parent-span (the Bash tool_use_id recorded by the
-#              parent-span-export hook) → the spoke root ($spoke_run_id, so an
-#              in-spoke span hangs off the spoke instead of orphaning) → null when
-#              outside a spoke.
+#              (correlation id a parent shell exports for a child) → [hook only,
+#              Issue #82] the payload's .tool_use_id on a Pre/PostToolUse event (so
+#              the hook nests under its triggering tool) → <root>/.ai-toolkit/parent-span
+#              (the Bash tool_use_id recorded by the parent-span-export hook) → the spoke
+#              root ($spoke_run_id, so an in-spoke span hangs off the spoke instead of
+#              orphaning) → null when outside a spoke.
 telemetry_emit_span() {
   [ "${AI_TOOLKIT_TELEMETRY:-}" = "1" ] || return 0
   local kind="" name="" phase="" status="success" start_ms="" span_id="" \
@@ -238,8 +266,22 @@ telemetry_emit_span() {
     #      rather than orphaning at null. Outside a spoke this is empty, so parent_id
     #      stays null — the pre-#66 contract.
     [ -n "$parent_id" ] || parent_id="${AI_TOOLKIT_PARENT_SPAN:-}"
+    #   2.5 (Issue #82, hook-scoped). A hook firing on a Pre/PostToolUse event nests
+    #       under the tool it guards: the payload's .tool_use_id is the same id the
+    #       parser derives the tool node from. More specific than the parent-span file
+    #       (the last Bash tool_use_id, stale for a non-Bash tool), so it outranks it.
+    #       Only a kind=hook span reads it — a step/script/lifecycle span never does.
+    if [ -z "$parent_id" ] && [ "$kind" = "hook" ]; then
+      parent_id="$(_telemetry_hook_tool_use_id)"
+    fi
     [ -n "$parent_id" ] || parent_id="$(_telemetry_parent_span_file "$root")"
     [ -n "$parent_id" ] || parent_id="$spoke_run_id"
+
+    # The hook's raising condition, recorded only on kind=hook spans (Issue #82).
+    local hook_event=""
+    if [ "$kind" = "hook" ]; then
+      hook_event="$(_telemetry_hook_event)"
+    fi
 
     if command -v jq >/dev/null 2>&1; then
       local human='null'
@@ -265,6 +307,7 @@ telemetry_emit_span() {
         --argjson duration_ms "$duration_ms" \
         --arg status "$status" \
         --argjson human "$human" \
+        --arg hook_event "$hook_event" \
         '{
           span_id: $span_id,
           parent_id: (if $parent_id == "" then null else $parent_id end),
@@ -281,6 +324,7 @@ telemetry_emit_span() {
           duration_ms: $duration_ms,
           status: $status,
           human: $human,
+          hook_event: (if $hook_event == "" then null else $hook_event end),
           summary: null,
           emits: null,
           sidecar_session: null,
@@ -296,7 +340,7 @@ telemetry_emit_span() {
       _telemetry_or_null() { [ -n "$1" ] && printf '"%s"' "$(_telemetry_json_str "$1")" || printf 'null'; }
       local human_json='null'
       [ -n "$human_type" ] && human_json="{\"type\":\"$(_telemetry_json_str "$human_type")\",\"wait_ms\":${human_wait_ms:-0}}"
-      printf '{"span_id":"%s","parent_id":%s,"spoke_run_id":%s,"session_id":%s,"workflow_rev":%s,"repo":"%s","branch":%s,"kind":"%s","name":"%s","phase":%s,"ts_start":"%s","ts_end":"%s","duration_ms":%d,"status":"%s","human":%s,"summary":null,"emits":null,"sidecar_session":null,"agent_link":null,"tokens_in":null,"tokens_out":null,"cost_usd":null}\n' \
+      printf '{"span_id":"%s","parent_id":%s,"spoke_run_id":%s,"session_id":%s,"workflow_rev":%s,"repo":"%s","branch":%s,"kind":"%s","name":"%s","phase":%s,"ts_start":"%s","ts_end":"%s","duration_ms":%d,"status":"%s","human":%s,"hook_event":%s,"summary":null,"emits":null,"sidecar_session":null,"agent_link":null,"tokens_in":null,"tokens_out":null,"cost_usd":null}\n' \
         "$(_telemetry_json_str "$span_id")" \
         "$(_telemetry_or_null "$parent_id")" \
         "$(_telemetry_or_null "$spoke_run_id")" \
@@ -309,7 +353,8 @@ telemetry_emit_span() {
         "$(_telemetry_or_null "$phase")" \
         "$ts_start" "$ts_end" "$duration_ms" \
         "$(_telemetry_json_str "$status")" \
-        "$human_json" >> "$dir/events.jsonl"
+        "$human_json" \
+        "$(_telemetry_or_null "$hook_event")" >> "$dir/events.jsonl"
     fi
   } >/dev/null 2>&1 || true
   return 0

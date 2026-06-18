@@ -70,6 +70,12 @@ SPAN_FIELDS: tuple[str, ...] = (
     "duration_ms",
     "status",
     "human",
+    # The hook's raising condition (Issue #82) — ``PreToolUse`` / ``PostToolUse`` /
+    # ``SessionStart`` / ``Stop`` / … Set only on ``hook`` spans (the push emitter reads
+    # it from the payload's ``hook_event_name``); ``null`` on every other span. It is the
+    # trigger the dashboard shows on the hook line and the signal a Pre/PostToolUse hook
+    # nests under its tool.
+    "hook_event",
     "summary",
     # v3 link fields (Issue #50) — additive, optional, pull-only; ``null`` on push
     # spans, filled by the parser. ``emits``: a ``script`` span names the span_id of
@@ -117,6 +123,10 @@ class Span:
     emits: str | None = None
     sidecar_session: str | None = None
     agent_link: str | None = None
+    # The hook's raising condition (Issue #82) — declared after the v1/v3 tail so
+    # positional construction of the frozen fields is unaffected; serialized in
+    # SPAN_FIELDS order (right after ``human``) by ``to_dict``.
+    hook_event: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in SPAN_KINDS:

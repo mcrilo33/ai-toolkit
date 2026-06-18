@@ -55,6 +55,9 @@ SCHEMA_KEYS = {
     "duration_ms",
     "status",
     "human",
+    # The hook's raising condition (#82) — PreToolUse/PostToolUse/SessionStart/…;
+    # set only on kind=hook spans, null on every other span.
+    "hook_event",
     # v3 spoke-trace link fields (#50) — pull-only, null on push (#54 track E).
     "summary",
     "emits",
@@ -82,6 +85,10 @@ def _env(
         "AI_TOOLKIT_WORKFLOW_REV",
         "CURSOR_PROJECT_DIR",
         "TELEMETRY_PARENT_ID",
+        # The pre-push gate runs pytest with AI_TOOLKIT_PARENT_SPAN exported; it outranks
+        # the payload tool_use_id (the #66 precedence), so strip it for a deterministic
+        # parent_id driven only by what each test sets (mirrors test_telemetry_parent_span).
+        "AI_TOOLKIT_PARENT_SPAN",
     ):
         env.pop(var, None)
     if enabled:
@@ -417,3 +424,163 @@ class TestSpanDiscipline:
         assert "SECRETPATH" not in content
         assert "SECRETCWD" not in content
         assert "SECRETCOMMAND123" not in content
+
+
+# ── hook causal parent + event (Issue #82) ────────────────
+
+
+def _tool_payload(event: str, tool: str, tool_use_id: str, root: Path) -> str:
+    """A Claude Pre/PostToolUse payload carrying the triggering tool's id."""
+    return json.dumps(
+        {
+            "session_id": "sess-1",
+            "hook_event_name": event,
+            "tool_name": tool,
+            "tool_input": {"file_path": str(root / "SMOKE.txt")},
+            "tool_use_id": tool_use_id,
+            "workspace_roots": [str(root)],
+        }
+    )
+
+
+def _lifecycle_payload(event: str, root: Path) -> str:
+    """A non-tool hook payload (SessionStart / Stop / …) — no ``tool_use_id``."""
+    return json.dumps(
+        {"session_id": "sess-1", "hook_event_name": event, "workspace_roots": [str(root)]}
+    )
+
+
+def _seed_spoke(root: Path, run_id: str = "feature/82-x+1700000000") -> None:
+    ai_dir = root / ".ai-toolkit"
+    ai_dir.mkdir(exist_ok=True)
+    (ai_dir / "spoke-run-id").write_text(run_id + "\n")
+
+
+class TestHookCausalParent:
+    """A Pre/PostToolUse hook span nests under the tool that triggered it (#82)."""
+
+    @pytest.mark.parametrize("event", ["PreToolUse", "PostToolUse"])
+    def test_tooluse_hook_parents_to_tool_use_id(
+        self, event: str, project_root: Path, telemetry_dir: Path
+    ) -> None:
+        _seed_spoke(project_root)
+        payload = _tool_payload(event, "Write", "toolu_write_1", project_root)
+        _emit(
+            "--kind hook --name secrets-scan.sh --status success",
+            _env(telemetry_dir, payload=payload),
+            cwd=project_root,
+        )
+
+        span = _read_events(telemetry_dir / "events.jsonl")[0]
+        assert span["parent_id"] == "toolu_write_1"
+
+    @pytest.mark.parametrize("event", ["PreToolUse", "PostToolUse"])
+    def test_tooluse_hook_records_event(
+        self, event: str, project_root: Path, telemetry_dir: Path
+    ) -> None:
+        payload = _tool_payload(event, "Write", "toolu_write_1", project_root)
+        _emit(
+            "--kind hook --name secrets-scan.sh --status success",
+            _env(telemetry_dir, payload=payload),
+            cwd=project_root,
+        )
+
+        assert _read_events(telemetry_dir / "events.jsonl")[0]["hook_event"] == event
+
+    def test_tool_use_id_outranks_stale_parent_span_file(
+        self, project_root: Path, telemetry_dir: Path
+    ) -> None:
+        # The parent-span file holds the LAST Bash tool_use_id; for a Write hook it is
+        # stale. The hook's own payload tool_use_id is the correct, more specific parent.
+        ai_dir = project_root / ".ai-toolkit"
+        ai_dir.mkdir()
+        (ai_dir / "parent-span").write_text("toolu_stale_bash\n")
+        payload = _tool_payload("PreToolUse", "Write", "toolu_write_9", project_root)
+        _emit(
+            "--kind hook --name post-edit-format.sh --status success",
+            _env(telemetry_dir, payload=payload),
+            cwd=project_root,
+        )
+
+        assert _read_events(telemetry_dir / "events.jsonl")[0]["parent_id"] == "toolu_write_9"
+
+    def test_explicit_parent_id_still_wins_over_payload(
+        self, project_root: Path, telemetry_dir: Path
+    ) -> None:
+        payload = _tool_payload("PreToolUse", "Write", "toolu_write_1", project_root)
+        env = _env(telemetry_dir, payload=payload)
+        env["TELEMETRY_PARENT_ID"] = "parent-explicit"
+        _emit("--kind hook --name x.sh --status success", env, cwd=project_root)
+
+        assert _read_events(telemetry_dir / "events.jsonl")[0]["parent_id"] == "parent-explicit"
+
+    def test_non_tool_hook_keeps_spoke_root_parent(
+        self, project_root: Path, telemetry_dir: Path
+    ) -> None:
+        # SessionStart carries no tool_use_id, so the span still hangs off the spoke
+        # root — its event is recorded for the hook line, the nesting is unchanged.
+        _seed_spoke(project_root)
+        payload = _lifecycle_payload("SessionStart", project_root)
+        _emit(
+            "--kind hook --name todo-ledger-nudge.sh --status success",
+            _env(telemetry_dir, payload=payload),
+            cwd=project_root,
+        )
+
+        span = _read_events(telemetry_dir / "events.jsonl")[0]
+        assert span["parent_id"] == "feature/82-x+1700000000"
+        assert span["hook_event"] == "SessionStart"
+
+    def test_tool_use_id_is_hook_scoped_not_on_step_span(
+        self, project_root: Path, telemetry_dir: Path
+    ) -> None:
+        # The payload parenting is hook-specific: a step/lifecycle marker emitted on the
+        # same payload must NOT inherit the tool_use_id (markers bucket by interval) and
+        # carries no hook_event.
+        _seed_spoke(project_root)
+        payload = _tool_payload("PreToolUse", "Write", "toolu_write_1", project_root)
+        _emit(
+            "--kind step --name solo-cycle --phase green --status success",
+            _env(telemetry_dir, payload=payload),
+            cwd=project_root,
+        )
+
+        span = _read_events(telemetry_dir / "events.jsonl")[0]
+        assert span["parent_id"] == "feature/82-x+1700000000"
+        assert span["hook_event"] is None
+
+    def test_tool_event_payload_does_not_leak_content(
+        self, project_root: Path, telemetry_dir: Path
+    ) -> None:
+        # The tool-event branch reads only the opaque tool_use_id + event name — never
+        # the tool_input (file paths, commands). Pin that the rest of the payload stays out.
+        payload = json.dumps(
+            {
+                "session_id": "sess-1",
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Write",
+                "tool_input": {"file_path": "/home/u/SECRETPATH/x.py", "content": "SECRETBODY"},
+                "tool_use_id": "toolu_ok",
+                "workspace_roots": [str(project_root)],
+            }
+        )
+        _emit(
+            "--kind hook --name secrets-scan.sh --status success",
+            _env(telemetry_dir, payload=payload),
+            cwd=project_root,
+        )
+
+        content = (telemetry_dir / "events.jsonl").read_text()
+        assert "SECRETPATH" not in content
+        assert "SECRETBODY" not in content
+
+    def test_non_hook_span_leaves_hook_event_null(
+        self, project_root: Path, telemetry_dir: Path
+    ) -> None:
+        _emit(
+            "--kind lifecycle --name worktree-new --phase spawn --status success",
+            _env(telemetry_dir),
+            cwd=project_root,
+        )
+
+        assert _read_events(telemetry_dir / "events.jsonl")[0]["hook_event"] is None

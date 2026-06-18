@@ -318,3 +318,75 @@ class TestGenuineTriggerNesting:
     def test_cost_conserved(self) -> None:
         owned = sum(n["own_cost_usd"] for n in _by_id(_build_trigger()).values())
         assert owned == pytest.approx(0.10 + 0.20)
+
+
+# ── Pre/PostToolUse hook nests under its tool by the real id (Issue #82) ───────
+# The push emitter sets a hook's parent_id to the RAW tool_use_id from the payload,
+# but the parser keys the tool node by derive_span_id(session_id, tool_use_id). The
+# builder must bridge that gap, so a real hook span (raw parent id) still nests under
+# its tool node — and carry the hook's event onto the node for the hook line.
+RAW_TOOL_USE_ID = "toolu_write_82"
+
+
+def _hook_nesting_scenario() -> tuple[list[dict], list[dict], dict[str, str]]:
+    tool_node_id = derive_span_id(SID, RAW_TOOL_USE_ID)
+    turns = [
+        _turn("m1", "u1", source="main", agent_id=None, ts="2026-06-12T23:00:10Z", cost=0.10),
+    ]
+    spans = [
+        _span(
+            tool_node_id, "tool", "Write", ts="2026-06-12T23:00:11Z", summary="x.py", session_id=SID
+        ),
+        _span("st_red", "step", "solo-cycle", ts="2026-06-12T23:00:05Z", phase="red"),
+        # The real-world hook: parent_id is the RAW tool_use_id, not the derived node id.
+        _span(
+            "hk_secrets",
+            "hook",
+            "secrets-scan.sh",
+            ts="2026-06-12T23:00:12Z",
+            parent_id=RAW_TOOL_USE_ID,
+            session_id=SID,
+            hook_event="PreToolUse",
+        ),
+    ]
+    spans[1]["ts_end"] = "2026-06-12T23:00:30Z"
+    return turns, spans, {derive_span_id(SID, RAW_TOOL_USE_ID): "m1"}
+
+
+def _build_hook_nesting() -> list[Any]:
+    turns, spans, tool_parents = _hook_nesting_scenario()
+    return build_causal_forest(turns, spans, tool_parents)
+
+
+class TestHookCausalNesting82:
+    def test_forest_conforms_to_contract(self) -> None:
+        validate_causal_tree(_build_hook_nesting())
+
+    def test_hook_nests_under_its_tool_via_derived_id(self) -> None:
+        nodes = _by_id(_build_hook_nesting())
+        tool = nodes[derive_span_id(SID, RAW_TOOL_USE_ID)]
+        assert "hk_secrets" in {c["node_id"] for c in tool["children"]}
+
+    def test_hook_node_carries_its_event(self) -> None:
+        nodes = _by_id(_build_hook_nesting())
+        assert nodes["hk_secrets"].get("hook_event") == "PreToolUse"
+
+    def test_non_tool_hook_still_buckets_into_interval(self) -> None:
+        # A SessionStart hook carries no resolvable tool id (its parent_id is the spoke
+        # root); the derive bridge must not mis-resolve it — it buckets into its interval.
+        turns, spans, tool_parents = _hook_nesting_scenario()
+        spans.append(
+            _span(
+                "hk_sess",
+                "hook",
+                "todo-ledger-nudge.sh",
+                ts="2026-06-12T23:00:06Z",
+                parent_id="feature/82-x+1700000000",
+                session_id=SID,
+                hook_event="SessionStart",
+            )
+        )
+        forest = build_causal_forest(turns, spans, tool_parents)
+        assert "hk_sess" not in {n["node_id"] for n in forest}, "session hook dumped to root"
+        interval = next(n for n in forest if n["kind"] == "interval")
+        assert "hk_sess" in {c["node_id"] for c in interval["children"]}
