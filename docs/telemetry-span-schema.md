@@ -32,8 +32,11 @@ timings, and statuses — never user content. Concretely:
 - `repo` is a **basename**, never a path.
 - We never log commands, commit messages, file paths, diffs, or any payload
   content.
-- The only field read out of a hook's stdin payload is `session_id`. Nothing
-  else from the payload is ever copied into a span.
+- Only three fixed metadata fields are read out of a hook's stdin payload:
+  `session_id`, `hook_event_name` (recorded as `hook_event`), and — on a
+  `PreToolUse`/`PostToolUse` event — the opaque `tool_use_id` (used as the span's
+  `parent_id` so the hook nests under its tool). Nothing else from the payload is
+  ever copied into a span.
 - `name` / `phase` are toolkit-defined constants supplied by the caller (e.g.
   `worktree-new`, `red`), not values derived from user input.
 
@@ -61,6 +64,7 @@ payload leakage, basename-only repo, opt-in no-op, invisibility).
   "duration_ms": 3000,            // non-negative integer
   "status": "success",            // success|failure|deny|warn|skipped
   "human": null,                  // {type, wait_ms} when a human was waited on
+  "hook_event": null,             // hook's raising condition (Issue #82); set on hook spans, else null
   "summary": null,                // pull-only few-word node label (Issue #47); null on push
   "emits": null,                  // \  v3 link fields (Issue #50): pull-only,
   "sidecar_session": null,        //  } null on push — emission / sidecar / agent
@@ -89,6 +93,7 @@ payload leakage, basename-only repo, opt-in no-op, invisibility).
 | `duration_ms` | integer | `ts_end - ts_start` in ms (≥ 0). `0` when no start clock was supplied. |
 | `status` | string | `success, failure, deny, warn, skipped`. |
 | `human` | object \| null | `{ "type": "prompt\|question\|approval", "wait_ms": <int> }` when a human interaction was timed; else `null`. |
+| `hook_event` | string \| null | **Issue #82.** The hook's raising condition read from the payload's `hook_event_name` (`PreToolUse`, `PostToolUse`, `SessionStart`, `Stop`, `UserPromptSubmit`, `SubagentStop`, `Notification`, `PreCompact`). Set only on `hook` spans — the dashboard shows it on the hook line, and on a `Pre/PostToolUse` event the span's `parent_id` is the triggering `tool_use_id` so the hook nests under its tool. `null` on every other span. |
 | `summary` | string \| null | **Additive, pull-only (Issue #47).** A few-word node label the parser derives for display: the todo a step advances, an agent's task `description`, a trimmed prompt/question snippet. `null` on push spans and whenever none resolves; `name` stays the stable grouping key. |
 | `emits` | string \| null | **Additive, pull-only (Issue #50).** On a `script` span, the `span_id` of the `step`/`lifecycle` marker it produced — the **emission** link (structural, not time-containment: a gate script emits a marker). `null` elsewhere. |
 | `sidecar_session` | string \| null | **Additive, pull-only (Issue #50).** On a `hook`/`script` span that shells out to a separate `claude -p` Claude session (e.g. an LLM-judge hook), that session's id — the **sidecar** link. The inline mirror of `agent_links`, keyed off this one span. `null` elsewhere. |

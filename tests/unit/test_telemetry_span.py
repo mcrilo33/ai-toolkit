@@ -545,6 +545,31 @@ class TestHookCausalParent:
         assert span["parent_id"] == "feature/82-x+1700000000"
         assert span["hook_event"] is None
 
+    def test_tool_event_payload_does_not_leak_content(
+        self, project_root: Path, telemetry_dir: Path
+    ) -> None:
+        # The tool-event branch reads only the opaque tool_use_id + event name — never
+        # the tool_input (file paths, commands). Pin that the rest of the payload stays out.
+        payload = json.dumps(
+            {
+                "session_id": "sess-1",
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Write",
+                "tool_input": {"file_path": "/home/u/SECRETPATH/x.py", "content": "SECRETBODY"},
+                "tool_use_id": "toolu_ok",
+                "workspace_roots": [str(project_root)],
+            }
+        )
+        _emit(
+            "--kind hook --name secrets-scan.sh --status success",
+            _env(telemetry_dir, payload=payload),
+            cwd=project_root,
+        )
+
+        content = (telemetry_dir / "events.jsonl").read_text()
+        assert "SECRETPATH" not in content
+        assert "SECRETBODY" not in content
+
     def test_non_hook_span_leaves_hook_event_null(
         self, project_root: Path, telemetry_dir: Path
     ) -> None:
