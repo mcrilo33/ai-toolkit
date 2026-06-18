@@ -564,7 +564,9 @@ class TestTaskLedgerResolution:
             s for s in _by_kind(parse_session_file(path), "todo") if s.name == "TaskUpdate"
         )
 
-        assert update.summary == "Second task"
+        # The subject anchors the summary (id 2 → "Second task", not "First task");
+        # Issue #81 then appends the status transition.
+        assert update.summary == "Second task: pending → in_progress"
 
     def test_task_update_summary_shows_the_status_transition(self, tmp_path: Path) -> None:
         # Issue #81: a TaskUpdate must read as progress, not just the bare subject —
