@@ -95,6 +95,9 @@ class _CausalNodeOptional(TypedDict, total=False):
     # Present on a ``human``/``approval`` node — the interaction's type + wait.
     human_type: str | None
     human_wait_ms: int | None
+    # Present on a ``hook`` node (Issue #82) — the raising condition (PreToolUse/
+    # PostToolUse/SessionStart/…) the dashboard shows on the hook line.
+    hook_event: str | None
     # Per-turn cache breakdown (on a ``turn`` node) and the resume cold-cache magnitude
     # (on a ``session`` divider) — display-only, read by the composition/divider renderers;
     # they never fold into the once-per-turn cost rollup.
@@ -128,6 +131,7 @@ _OPTIONAL_LINK_KEYS: tuple[str, ...] = (
     "agent_link",
     "human_type",
     "human_wait_ms",
+    "hook_event",
 )
 
 
@@ -155,6 +159,7 @@ def causal_node(
     agent_link: object = _UNSET,
     human_type: object = _UNSET,
     human_wait_ms: object = _UNSET,
+    hook_event: object = _UNSET,
 ) -> CausalNode:
     """Build one :class:`CausalNode` in the canonical shape (``synthetic`` inferred).
 
@@ -189,7 +194,7 @@ def causal_node(
         node["input_context"] = input_context
     for key, value in zip(
         _OPTIONAL_LINK_KEYS,
-        (emits, sidecar_session, agent_link, human_type, human_wait_ms),
+        (emits, sidecar_session, agent_link, human_type, human_wait_ms, hook_event),
         strict=True,
     ):
         if value is not _UNSET:

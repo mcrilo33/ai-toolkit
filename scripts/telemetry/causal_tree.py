@@ -151,7 +151,11 @@ def build_causal_forest(
         node = nodes[span["span_id"]]
         # A tool-scoped hook (or emitting script) nests under its parent; a parentless
         # session-level hook/script buckets into its covering interval, not the root (#76).
-        parent = nodes.get(span.get("parent_id") or "") or place(node["ts_start"])
+        parent = (
+            nodes.get(span.get("parent_id") or "")
+            or _hook_tool_node(span, nodes)
+            or place(node["ts_start"])
+        )
         _attach(parent, node, roots)
 
     _sort_tree(roots)
@@ -353,7 +357,7 @@ def _turn_node(row: dict[str, Any]) -> CausalNode:
 def _span_node(span: dict[str, Any]) -> CausalNode:
     kind = span["kind"]
     links: dict[str, Any] = {}
-    for key in ("emits", "sidecar_session", "agent_link"):
+    for key in ("emits", "sidecar_session", "agent_link", "hook_event"):
         if span.get(key):
             links[key] = span[key]
     if span.get("human_type"):
@@ -374,6 +378,23 @@ def _span_node(span: dict[str, Any]) -> CausalNode:
         human_count=1 if span.get("human_type") else 0,
         **links,
     )
+
+
+def _hook_tool_node(span: dict[str, Any], nodes: dict[str, CausalNode]) -> CausalNode | None:
+    """The tool node a Pre/PostToolUse hook nests under, resolved by the real id (Issue #82).
+
+    The push emitter sets a hook's ``parent_id`` to the RAW ``tool_use_id`` from the
+    payload, but the parser keys the tool node by ``derive_span_id(session_id, tool_use_id)``.
+    Bridge that here: re-derive the tool node's id from the hook's own session + raw parent.
+    Hook-scoped — a script's parent never goes through this. ``None`` when the hook is not a
+    tool event (its parent is the spoke root / a script id, which won't re-derive to a node).
+    """
+    if span.get("kind") != "hook":
+        return None
+    parent_id = span.get("parent_id")
+    if not parent_id:
+        return None
+    return nodes.get(derive_span_id(span.get("session_id") or "", parent_id))
 
 
 def _actor_for(span: dict[str, Any]) -> str:

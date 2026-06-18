@@ -25,7 +25,7 @@ import statistics
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import duckdb
 
@@ -676,7 +676,11 @@ class SpanStore:
             f"SELECT * FROM spans WHERE spoke_run_id = ? AND kind IN ({_sql_in_list(_PUSH_KINDS)})",
             [spoke_run_id],
         )
-        forest = causal_forest_from_parsed(parsed, push, ccusage_costs or {})
+        # The builder returns ``CausalNode`` (a TypedDict); the dashboard consumes every
+        # node as a plain ``dict[str, Any]`` (rollup, labels, metrics), so view it as one.
+        forest = cast(
+            "list[dict[str, Any]]", causal_forest_from_parsed(parsed, push, ccusage_costs or {})
+        )
         # Attach the additive subtree ``rollup`` the renderer's composition/step metrics
         # read — without it the Composition tab is zero.
         for root in forest:
@@ -1062,6 +1066,11 @@ def format_step_label(node: dict[str, Any]) -> str:
         clock = _clock(node.get("ts_start"))
         model = node.get("model")
         return f"turn {clock} · {_short_model(model)}" if model else f"turn {clock}"
+    # A hook reads "<event> · <script>" so its raising condition shows next to the
+    # already-rendered `hook` kind (Issue #82); a legacy span with no event keeps the name.
+    if node["kind"] == "hook":
+        event = node.get("hook_event")
+        return f"{event} · {node['name']}" if event else node["name"]
     summary = node.get("summary")
     # A tool leaf keeps its name visible alongside the parameter it acted on, so
     # the trace reads e.g. "Read · /path"; other kinds show the summary alone.
