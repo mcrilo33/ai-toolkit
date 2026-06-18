@@ -176,6 +176,7 @@ def _attach_main_turns(
     """
     human_nodes = {span["span_id"]: nodes[span["span_id"]] for span in humans}
     last_parent: dict[str | None, CausalNode | None] = {}
+    last_turn: dict[str | None, CausalNode] = {}
     ordered = sorted(main_turn_rows, key=lambda nr: (_ts(nr[0]["ts_start"]), nr[0]["node_id"]))
     for node, row in ordered:
         session = row.get("session_id")
@@ -183,12 +184,17 @@ def _attach_main_turns(
         human = human_nodes.get(derive_span_id(session or "", parent_uuid)) if parent_uuid else None
         if human is not None:
             parent: CausalNode | None = human
+            _open_turn_at(node, human["ts_start"])  # inference latency = turn.ts − prompt.ts
         elif (prev := last_parent.get(session)) is not None and prev["kind"] == "human":
             parent = prev  # continuation of the prompt's agent loop ⇒ sibling under it
+            # The trigger is the prior turn's tool_result; proxy it with that turn's end,
+            # then the leaf partition carves the intervening tool out of this window (#79).
+            _open_turn_at(node, prior["ts_end"] if (prior := last_turn.get(session)) else None)
         else:
             parent = place(node["ts_start"])
         _attach(parent, node, roots)
         last_parent[session] = parent
+        last_turn[session] = node
 
 
 def _attach(parent: CausalNode | None, node: CausalNode, roots: list[CausalNode]) -> None:
@@ -408,6 +414,21 @@ def _ms(value: str | None) -> int | None:
     """The integer-millisecond epoch for an ISO timestamp, or ``None`` if unparseable."""
     ts = _ts(value)
     return None if ts == float("-inf") else round(ts * 1000)
+
+
+def _open_turn_at(turn: CausalNode, trigger_ts: str | None) -> None:
+    """Open a turn's window at its triggering record so its ``duration`` is the latency.
+
+    A turn lands as a point at ``turn.ts`` (the inference's end); its real wall-clock is
+    ``turn.ts − triggering-record.ts`` (Issue #79). Set ``ts_start`` to the trigger and
+    recompute ``duration_ms``; a missing/forward-skewed trigger leaves the turn zero-width
+    rather than inventing a negative span.
+    """
+    start, end = _ms(trigger_ts), _ms(turn["ts_end"])
+    if start is None or end is None or start > end:
+        return
+    turn["ts_start"] = trigger_ts
+    turn["duration_ms"] = end - start
 
 
 # Kinds that occupy wall-clock as a work leaf. Everything else — interval/context/gap/
