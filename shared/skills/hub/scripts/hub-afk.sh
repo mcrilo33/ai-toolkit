@@ -608,14 +608,18 @@ EOF
 
 # _inflight_scope_args -> repeated `--inflight "<scope>"` flags, one per live spoke, so
 # batch-plan holds back a ready issue that collides with work already running. The Scope:
-# line is read from each in-flight issue's body (the same source batch-plan reads).
+# line is read from each in-flight issue's body (the same source batch-plan reads). When a
+# live spoke's scope CANNOT be resolved (gh failed, or the issue has no Scope: line) its
+# footprint is unknown, so we emit `--inflight *` (exclusive) and batch-plan holds back
+# EVERY ready issue until it lands — failing CLOSED under unattended /afk (#74) rather than
+# co-dispatching into an unknown-scope collision.
 _inflight_scope_args() {
   local issue body scope
   while IFS= read -r issue; do
     [ -n "$issue" ] || continue
     body="$(gh issue view "$issue" --json body -q .body 2>/dev/null || true)"
     scope="$(printf '%s\n' "$body" | sed -n 's/^[[:space:]]*[Ss]cope:[[:space:]]*//p' | head -1)"
-    [ -n "$scope" ] && printf -- '--inflight\n%s\n' "$scope"
+    printf -- '--inflight\n%s\n' "${scope:-*}"
   done < <(inflight_issues)
 }
 
