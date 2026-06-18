@@ -73,7 +73,9 @@ def _commit(repo: Path, files: dict[str, str], msg: str = "feat: change") -> tup
     return base, head
 
 
-def _scan(repo: Path, base: str, head: str) -> subprocess.CompletedProcess:
+def _scan(
+    repo: Path, base: str, head: str, *, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
     """Run the scan with a synthesized pre-push stdin line (range base..head)."""
     stdin = f"refs/heads/feature {head} refs/heads/feature {base}\n"
     return subprocess.run(
@@ -82,7 +84,7 @@ def _scan(repo: Path, base: str, head: str) -> subprocess.CompletedProcess:
         input=stdin,
         capture_output=True,
         text=True,
-        env={**_GIT_ENV},
+        env={**_GIT_ENV, **(env or {})},
     )
 
 
@@ -160,3 +162,42 @@ def test_new_branch_zero_remote_sha_uses_merge_base(repo: Path) -> None:
 
     assert result.returncode == 0, "advisory scan must not block a new-branch push"
     assert "weakens tests" in result.stderr, "a new-branch push must still scan the new commits"
+
+
+# ── UNATTENDED fail-closed (issue #74, defect 5) ─────────────────────────────
+# Under unattended /afk no human is watching to catch a test-gutting diff, so the
+# tripwire must fail CLOSED (block the push) instead of merely warning. It is armed
+# either by the UNATTENDED env or by a marker file the supervisor drops under the git
+# common dir; a clean diff still passes.
+
+
+def test_unattended_env_blocks_gutting_diff(repo: Path) -> None:
+    base, head = _commit(repo, {"tests/test_taut.py": "def test_taut():\n    assert True\n"})
+
+    result = _scan(repo, base, head, env={"UNATTENDED": "1"})
+
+    assert result.returncode != 0, "UNATTENDED must fail closed on a gutting diff"
+    assert "weakens tests" in result.stderr
+
+
+def test_unattended_marker_blocks_gutting_diff(repo: Path) -> None:
+    marker_dir = repo / ".git" / "ai-toolkit-afk"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    (marker_dir / "unattended").write_text("")
+    base, head = _commit(repo, {"tests/test_taut.py": "def test_taut():\n    assert True\n"})
+
+    result = _scan(repo, base, head)
+
+    assert result.returncode != 0, "the unattended marker must fail closed on a gutting diff"
+    assert "weakens tests" in result.stderr
+
+
+def test_unattended_clean_diff_still_passes(repo: Path) -> None:
+    base, head = _commit(
+        repo, {"tests/test_more.py": "def test_more():\n    assert (1 + 1) == 2\n"}
+    )
+
+    result = _scan(repo, base, head, env={"UNATTENDED": "1"})
+
+    assert result.returncode == 0, "a clean diff must pass even under UNATTENDED"
+    assert "weakens tests" not in result.stderr

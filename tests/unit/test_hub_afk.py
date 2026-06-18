@@ -1020,3 +1020,28 @@ def test_clear_dispatch_epochs_drops_stale_entries(tmp_path: Path) -> None:
     result = _call(expr, env={"AFK_STATE_DIR": str(statedir)})
 
     assert result.stdout.strip() == "0", "arming a window must clear stale dispatch epochs"
+
+
+# ── UNATTENDED marker wiring (issue #74, defect 5) ────────────────────────────
+# The supervisor drops/removes an `unattended` marker under the state dir while a window
+# is armed; anti-gutting-scan.sh reads it to fail closed on a test-gutting diff.
+
+
+def test_afk_set_unattended_creates_marker(tmp_path: Path) -> None:
+    statedir = tmp_path / "statedir"
+    expr = "_afk_set_unattended; test -f $(_afk_unattended_marker) && echo present || echo absent"
+
+    result = _call(expr, env={"AFK_STATE_DIR": str(statedir)})
+
+    assert result.stdout.strip() == "present"
+
+
+def test_afk_clear_unattended_removes_marker(tmp_path: Path) -> None:
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "unattended").write_text("")
+    expr = "_afk_clear_unattended; test -f $(_afk_unattended_marker) && echo present || echo absent"
+
+    result = _call(expr, env={"AFK_STATE_DIR": str(statedir)})
+
+    assert result.stdout.strip() == "absent"
