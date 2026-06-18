@@ -15,6 +15,7 @@ file is the thin presentation layer.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -22,6 +23,7 @@ from typing import Any
 
 # `queries` is the sibling module in this directory; it resolves because
 # `streamlit run dashboard/app.py` injects the script's directory onto sys.path.
+import duckdb
 import queries
 import streamlit as st
 
@@ -131,16 +133,38 @@ def _ccusage_costs() -> dict[str, float]:
         return {}
 
 
+def _materialize_lock_safe(store_path: str) -> queries.SpanStore:
+    """Read the persisted store, falling back to a snapshot copy if a writer holds it.
+
+    DuckDB is single-writer (Issue #75): while another dashboard instance has the store
+    open read-write, even a read-only ATTACH of the live file raises ``IOException``. On
+    that lock we read a lock-free snapshot copy of the store instead of crashing — the
+    copy carries the committed data and is discarded once materialized.
+    """
+    try:
+        return queries.SpanStore.from_persisted_store(store_path)
+    except duckdb.IOException:
+        sys.path.insert(0, str(_scripts_dir()))
+        from telemetry.store import snapshot_store
+
+        snap = snapshot_store(store_path)
+        try:
+            return queries.SpanStore.from_persisted_store(snap)
+        finally:
+            shutil.rmtree(snap.parent, ignore_errors=True)
+
+
 @st.cache_resource(show_spinner=False)
 def _materialize_store(store_path: str, version: str) -> queries.SpanStore:
     """Copy the persisted store into an in-memory read model (Issue #62).
 
     Cached on the store's content ``version`` so a Streamlit rerun reuses the model
     and only a real delta rebuilds it; ``version`` keys the cache and is intentionally
-    unused in the body.
+    unused in the body. The read is lock-safe (#75): a concurrent writer's lock routes
+    through a snapshot copy rather than crashing the instance.
     """
     _ = version
-    return queries.SpanStore.from_persisted_store(store_path)
+    return _materialize_lock_safe(store_path)
 
 
 def load_correlated_store(

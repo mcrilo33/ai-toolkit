@@ -31,6 +31,8 @@ new watermark — never a historical re-parse.
 from __future__ import annotations
 
 import hashlib
+import shutil
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -53,6 +55,43 @@ from telemetry.spoke_runs import backfill_spoke_run_ids
 
 _COLUMN_NAMES: tuple[str, ...] = tuple(col.split(" ", 1)[0] for col in _COLUMNS)
 _WATERMARK_KEY = "watermark"
+
+
+def _locked_version(store_path: Path) -> str:
+    """A content version for a store we could not open because a writer holds the lock.
+
+    DuckDB is single-writer (#75): when another dashboard instance has ``store.duckdb``
+    open read-write, this instance can neither ingest nor even read it directly. We skip
+    the ingest and key the read model on the store file's filesystem fingerprint instead
+    — ``stat`` needs no lock — so when the writer releases and the file changes, the
+    version moves and the model rebuilds.
+    """
+    stat = store_path.stat()
+    return f"locked:{stat.st_mtime_ns}:{stat.st_size}"
+
+
+def snapshot_store(store_path: str | Path) -> Path:
+    """Copy the store (and its WAL, if any) to a temp file for a lock-free read (#75).
+
+    While another process holds DuckDB's single-writer lock, even a read-only ATTACH of
+    the live file fails. Copying the bytes past the lock and attaching the copy lets a
+    second dashboard instance render the committed data instead of crashing. The copy is
+    a point-in-time snapshot — slightly stale is acceptable for a read model.
+
+    Args:
+        store_path: Path to the live ``store.duckdb``.
+
+    Returns:
+        Path to the copied store inside a fresh temp directory (the caller owns cleanup).
+    """
+    store_path = Path(store_path)
+    snap_dir = Path(tempfile.mkdtemp(prefix="ai-toolkit-store-snap-"))
+    snap = snap_dir / store_path.name
+    shutil.copy2(store_path, snap)
+    wal = Path(f"{store_path}.wal")
+    if wal.exists():
+        shutil.copy2(wal, Path(f"{snap}.wal"))
+    return snap
 
 
 def _ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
@@ -294,7 +333,13 @@ def ingest_store(
     store_path = Path(store_path)
     store_path.parent.mkdir(parents=True, exist_ok=True)
 
-    con = duckdb.connect(str(store_path))
+    try:
+        con = duckdb.connect(str(store_path))
+    except duckdb.IOException:
+        # Another dashboard instance holds the single-writer lock (#75). Skip the ingest
+        # and return a degraded version so the reader materializes the existing store
+        # (from a snapshot copy) instead of hard-crashing the launch.
+        return _locked_version(store_path)
     try:
         _ensure_schema(con)
         if _get_watermark(con) is None:
