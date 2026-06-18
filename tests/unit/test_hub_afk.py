@@ -350,6 +350,37 @@ def test_spoke_over_ceiling(epoch: str, now: str, over: bool) -> None:
     assert result.stdout.strip() == ("yes" if over else "no")
 
 
+# ── the tmux inject: interactive-gate handling (issue #74, defect 1) ──────────
+# A PLAN gate renders as an interactive AskUserQuestion MENU (tab/arrow/enter) that
+# ignores typed free text, so a bare `send-keys -l <text>` never answers it. The fix
+# is to send Esc FIRST — which cancels the menu, surfaces the questions as text, and
+# opens a free-text prompt — then inject the literal answer and submit with Enter.
+
+
+def _recording_tmux(tmp_path: Path) -> tuple[Path, Path]:
+    """A tmux stub that appends each invocation's args to a log and exits 0."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    log = tmp_path / "tmux.log"
+    (fake_bin / "tmux").write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\nexit 0\n')
+    (fake_bin / "tmux").chmod(0o755)
+    return fake_bin, log
+
+
+def test_inject_answer_sends_escape_before_text_then_enter(tmp_path: Path) -> None:
+    fake_bin, log = _recording_tmux(tmp_path)
+    env = {"PATH": f"{fake_bin}:{os.environ['PATH']}", "AFK_INJECT_MENU_PAUSE": "0"}
+
+    result = _call("inject_answer 'afk:1' 'use Redis'", env=env)
+
+    assert result.returncode == 0, result.stderr
+    lines = log.read_text().splitlines()
+    esc_idx = next(i for i, ln in enumerate(lines) if "Escape" in ln)
+    text_idx = next(i for i, ln in enumerate(lines) if "use Redis" in ln)
+    enter_idx = next(i for i, ln in enumerate(lines) if ln.split() and ln.split()[-1] == "Enter")
+    assert esc_idx < text_idx < enter_idx, f"expected Esc → text → Enter, got: {lines}"
+
+
 # ── the ANSWERER orchestration (stubbed answerer + spoke-ready) ───────────────
 
 
