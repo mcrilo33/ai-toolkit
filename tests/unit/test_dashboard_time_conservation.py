@@ -14,8 +14,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
+from _dashboard_helpers import load_queries
 from telemetry.causal import CausalNode, causal_node, validate_causal_tree
 from telemetry.causal_tree import build_causal_forest, leaf_time_slices
 from telemetry.spans import derive_span_id
@@ -179,3 +182,88 @@ def test_continuation_turn_duration_runs_from_the_prior_turn() -> None:
 
     assert t2["ts_start"] == "2026-06-12T20:57:52Z"
     assert t2["duration_ms"] == 2000
+
+
+SPAWN = "2026-06-12T12:00:00Z"
+TEARDOWN = "2026-06-12T12:10:00Z"
+PROMPT = "prec"
+
+
+def _spoke_forest() -> list[CausalNode]:
+    """A 600s spoke: a lifecycle interval spans spawn→teardown; a prompt fires a turn
+    (30s inference) that issues a tool (60s); the rest is idle."""
+    turns = [
+        {
+            "uuid": "tn",
+            "parent_uuid": PROMPT,
+            "session_id": SID,
+            "ts": "2026-06-12T12:00:35Z",
+            "source": "main",
+            "agent_id": None,
+            "is_sidechain": False,
+            "cost_usd": 0.1,
+            "tokens_in": 100,
+            "tokens_out": 20,
+        },
+    ]
+    spans = [
+        {
+            "span_id": "life",
+            "parent_id": None,
+            "kind": "lifecycle",
+            "name": "solo-cycle",
+            "phase": "spawn",
+            "ts_start": SPAWN,
+            "ts_end": TEARDOWN,
+            "duration_ms": 600_000,
+            "status": "success",
+        },
+        {
+            "span_id": derive_span_id(SID, PROMPT),
+            "parent_id": None,
+            "kind": "human",
+            "name": "prompt",
+            "phase": None,
+            "ts_start": "2026-06-12T12:00:05Z",
+            "ts_end": "2026-06-12T12:00:05Z",
+            "duration_ms": 0,
+            "status": "success",
+            "human_type": "prompt",
+            "human_wait_ms": None,
+        },
+        {
+            "span_id": "tool1",
+            "parent_id": None,
+            "kind": "tool",
+            "name": "Read",
+            "phase": None,
+            "ts_start": "2026-06-12T12:00:35Z",
+            "ts_end": "2026-06-12T12:01:35Z",
+            "duration_ms": 60_000,
+            "status": "success",
+        },
+    ]
+    return build_causal_forest(turns, spans, {"tool1": "tn"})
+
+
+def test_leaf_slices_reconcile_to_the_marker_spawn_teardown_total() -> None:
+    forest = _spoke_forest()
+
+    slices = leaf_time_slices(forest)
+
+    total = 600_000  # 12:00:00 → 12:10:00, the lifecycle marker span
+    assert sum(slices.values()) == total
+    assert slices["turn"] == 30_000  # prompt(:05) → turn(:35)
+    assert slices["tool"] == 60_000  # tool [:35, 1:35]
+    assert slices["idle"] == total - 90_000
+
+
+def test_time_by_kind_rows_reconcile_and_carry_shares() -> None:
+    queries = load_queries()
+    slices = leaf_time_slices(_spoke_forest())
+
+    rows = queries.time_by_kind_rows(slices)
+
+    assert sum(r["total_duration_ms"] for r in rows) == 600_000
+    assert sum(r["share"] for r in rows) == pytest.approx(1.0)
+    assert [r["kind"] for r in rows][0] == "idle"  # the dominant slice, sorted first
