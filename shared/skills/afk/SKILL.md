@@ -62,7 +62,7 @@ runs unattended there on the **same Claude subscription** — no API key, no pro
 
 ```bash
 # from anywhere (work, travel) — needs AFK_REMOTE_HOST + AFK_REMOTE_REPO configured
-.ai-toolkit/scripts/hub/hub-afk.sh --remote
+shared/skills/hub/scripts/hub-afk.sh --remote
 ```
 
 It SSHes to the host (a Tailscale hostname reaches it across networks), starts a detached,
@@ -99,11 +99,11 @@ responsive. It self-terminates at the stop condition.
 
 ```bash
 # clock-bound
-.ai-toolkit/scripts/hub/hub-afk.sh 1h
+shared/skills/hub/scripts/hub-afk.sh 1h
 # or until a wall-clock time
-.ai-toolkit/scripts/hub/hub-afk.sh until 07:00
+shared/skills/hub/scripts/hub-afk.sh until 07:00
 # or drain to empty (no clock)
-.ai-toolkit/scripts/hub/hub-afk.sh drain
+shared/skills/hub/scripts/hub-afk.sh drain
 ```
 
 Arming writes the end bound to `<git-common-dir>/.afk-state` (an epoch, or `drain`), so a
@@ -118,8 +118,8 @@ is a lifecycle outcome. The dashboard is where you see what AFK did.
 ### 4. Stop early or check in
 
 ```bash
-.ai-toolkit/scripts/hub/hub-afk.sh --status   # how long is left?
-.ai-toolkit/scripts/hub/hub-afk.sh --off       # stop now
+shared/skills/hub/scripts/hub-afk.sh --status   # how long is left?
+shared/skills/hub/scripts/hub-afk.sh --off       # stop now
 ```
 
 ## Rules of thumb
