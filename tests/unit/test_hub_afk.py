@@ -381,6 +381,61 @@ def test_inject_answer_sends_escape_before_text_then_enter(tmp_path: Path) -> No
     assert esc_idx < text_idx < enter_idx, f"expected Esc → text → Enter, got: {lines}"
 
 
+# ── inject verification: confirm the answer registered (issue #74, defect 2) ──
+# A send-keys that silently no-ops (wrong target, busy pane, an unhandled menu)
+# leaves the spoke parked indefinitely with no signal. inject_and_verify confirms
+# the spoke's transcript advanced after injecting; if it didn't, it re-injects once
+# and then fails so the caller escalates rather than leaving the spoke stuck.
+
+
+def test_inject_and_verify_succeeds_when_transcript_advances(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
+    jsonl = pd / "session.jsonl"
+    old = 1_000_000_000
+    os.utime(jsonl, (old, old))  # backdate so the spoke's reaction is strictly newer
+    # inject_answer is stubbed to advance the transcript (the spoke reacting to input).
+    expr = (
+        f'inject_answer() {{ printf "{{}}\\n" >> "{jsonl}"; return 0; }}; '
+        f"inject_and_verify '{spoke_repo}' 'afk:1' 'use Redis'; echo RC=$?"
+    )
+
+    result = _call(
+        expr, env={"CLAUDE_PROJECTS_DIR": str(projects), "AFK_INJECT_VERIFY_SECONDS": "0"}
+    )
+
+    assert "RC=0" in result.stdout, result.stderr
+
+
+def test_inject_and_verify_reinjects_once_then_fails_when_stuck(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
+    calls = tmp_path / "calls.log"
+    # inject_answer succeeds at the tmux level but the transcript never advances.
+    expr = (
+        f'inject_answer() {{ printf x >> "{calls}"; return 0; }}; '
+        f"inject_and_verify '{spoke_repo}' 'afk:1' 'use Redis'; echo RC=$?"
+    )
+
+    result = _call(
+        expr,
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_INJECT_VERIFY_SECONDS": "0",
+            "AFK_INJECT_POLL_SECONDS": "1",
+        },
+    )
+
+    assert "RC=1" in result.stdout
+    assert calls.read_text() == "xx", "an unregistered answer must be re-injected once (2 attempts)"
+
+
 # ── the ANSWERER orchestration (stubbed answerer + spoke-ready) ───────────────
 
 
@@ -455,6 +510,8 @@ def test_decide_and_act_injects_and_emits_success_span(spoke_repo: Path, tmp_pat
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke_repo)
     _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
+    jsonl = pd / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # backdate so the reaction is newer
 
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
@@ -465,9 +522,15 @@ def test_decide_and_act_injects_and_emits_success_span(spoke_repo: Path, tmp_pat
     fake_bin.mkdir()
     (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
     (fake_bin / "gh").chmod(0o755)
-    # Fake tmux: list-panes maps a pane to this worktree; send-keys succeeds.
+    # Fake tmux: list-panes maps a pane to this worktree; send-keys succeeds and, on the
+    # submitting Enter, advances the spoke's transcript — modelling the spoke reacting so
+    # inject_and_verify confirms the answer registered.
     (fake_bin / "tmux").write_text(
-        f'#!/usr/bin/env bash\ncase "$1" in\n  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\nesac\nexit 0\n'
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        f'  send-keys) case "$*" in *Enter*) printf "{{}}\\n" >> "{jsonl}" ;; esac ;;\n'
+        "esac\nexit 0\n"
     )
     (fake_bin / "tmux").chmod(0o755)
 
@@ -477,6 +540,8 @@ def test_decide_and_act_injects_and_emits_success_span(spoke_repo: Path, tmp_pat
         "SPOKE_READY": str(ready_stub),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "AFK_ANSWERER_CMD": "printf 'ANSWER: use Redis'",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
         "AI_TOOLKIT_TELEMETRY": "1",
         "AI_TOOLKIT_TELEMETRY_DIR": str(tel_dir),
     }
@@ -489,6 +554,48 @@ def test_decide_and_act_injects_and_emits_success_span(spoke_repo: Path, tmp_pat
     span = json.loads((tel_dir / "events.jsonl").read_text().strip().splitlines()[-1])
     assert span["kind"] == "agent" and span["name"] == "afk-answer"
     assert span["status"] == "success"
+
+
+def test_decide_and_act_escalates_when_answer_does_not_register(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The answerer decides and a pane maps, but the inject never registers (the transcript
+    # does not advance). The supervisor must re-inject and then escalate — never leave the
+    # spoke silently parked (issue #74, defect 2).
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
+
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+    # Pane maps, send-keys succeeds, but the transcript is never advanced.
+    (fake_bin / "tmux").write_text(
+        f'#!/usr/bin/env bash\ncase "$1" in\n  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\nesac\nexit 0\n'
+    )
+    (fake_bin / "tmux").chmod(0o755)
+
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "SPOKE_READY": str(ready_stub),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_ANSWERER_CMD": "printf 'ANSWER: use Redis'",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+    }
+
+    result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    log = ready_log.read_text()
+    assert "--blocked 5" in log
+    assert "register" in log
 
 
 def test_build_answerer_prompt_includes_rule_and_question(
