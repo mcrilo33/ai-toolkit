@@ -230,6 +230,14 @@ _transcript_idle_seconds() {
   [ -n "$mtime" ] || return 0
   printf '%s\n' "$(( $(afk_now) - mtime ))"
 }
+# _transcript_mtime <wt_path> -> epoch mtime of the spoke's newest transcript, or empty.
+# The registration signal for inject verification: it bumps when the spoke writes its
+# next turn after an injected answer is submitted.
+_transcript_mtime() {
+  local jsonl; jsonl="$(_spoke_jsonl "$1")"
+  [ -n "$jsonl" ] || return 0
+  stat -f %m "$jsonl" 2>/dev/null || stat -c %Y "$jsonl" 2>/dev/null
+}
 
 # extract_pending_question <wt_path> -> the prompt the spoke is parked on, or empty when
 # it is NOT waiting. The same waiting signal hub-status.sh surfaces (an open
@@ -437,6 +445,39 @@ inject_answer() {
   tmux send-keys -t "$target" Enter 2>/dev/null || return 1
 }
 
+# _transcript_advanced <wt_path> <baseline_mtime> -> true once the spoke's newest
+# transcript mtime exceeds the baseline, polling up to AFK_INJECT_VERIFY_SECONDS in
+# AFK_INJECT_POLL_SECONDS steps. An empty baseline (no prior transcript) means any
+# transcript now is progress. Used to confirm an injected answer actually registered.
+_transcript_advanced() {
+  local wt="$1" before="$2" budget poll waited=0 now
+  budget="${AFK_INJECT_VERIFY_SECONDS:-20}"
+  poll="${AFK_INJECT_POLL_SECONDS:-2}"
+  while : ; do
+    now="$(_transcript_mtime "$wt")"
+    if [ -n "$now" ] && { [ -z "$before" ] || [ "$now" -gt "$before" ]; }; then return 0; fi
+    [ "$waited" -ge "$budget" ] && return 1
+    sleep "$poll" 2>/dev/null || true
+    waited=$(( waited + poll ))
+  done
+}
+
+# inject_and_verify <wt_path> <pane_target> <text> -> inject the answer and CONFIRM it
+# registered (the spoke's transcript advanced), re-injecting once if the first attempt
+# left the spoke untouched. rc 0 when the transcript advanced (the answer took), rc 1
+# when it never did — the caller then escalates. A send-keys that silently no-ops (wrong
+# target, busy pane, an unhandled menu) would otherwise park the spoke forever (#74).
+inject_and_verify() {
+  local wt="$1" target="$2" text="$3" before attempt
+  before="$(_transcript_mtime "$wt")"
+  for attempt in 1 2; do
+    inject_answer "$target" "$text" || return 1
+    if _transcript_advanced "$wt" "$before"; then return 0; fi
+    log "  injected answer did not register (attempt $attempt)"
+  done
+  return 1
+}
+
 # afk_emit_decision <wt_path> <status> -> one kind=agent span per auto-answer decision,
 # attributed to the SPOKE (emit with the worktree as CWD, like worktree-lib does), so the
 # decision surfaces on the observability dashboard. Metadata only — the question→answer
@@ -476,13 +517,16 @@ decide_and_act() {
   text="${decision#*$'\t'}"
   if [ "$kind" = "ANSWER" ] && [ -n "$text" ]; then
     target="$(_spoke_pane_target "$wt")"
-    if inject_answer "$target" "$text"; then
+    if [ -z "$target" ]; then
+      text="could not locate spoke pane to inject the answer"
+    elif inject_and_verify "$wt" "$target" "$text"; then
       log "  injected answer into #$issue"
       afk_emit_decision "$wt" success
       return 0
+    else
+      log "  answer to #$issue did not register — escalating"
+      text="answer did not register in the spoke (inject not confirmed) — needs a human"
     fi
-    log "  could not inject into #$issue — escalating"
-    text="could not locate spoke pane to inject the answer"
   elif [ "$kind" = "ESCALATE" ]; then
     [ -n "$text" ] || text="answerer escalated (no reason given)"
   else
