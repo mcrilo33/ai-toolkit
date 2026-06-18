@@ -120,5 +120,15 @@ done
   for f in "${FINDINGS[@]}"; do echo "  • $f"; done
 } >&2
 
+# Under unattended /afk no human is watching to catch a test-gutting diff, so the
+# tripwire fails CLOSED (blocks the push) instead of merely warning. It is armed by the
+# UNATTENDED env or by an `ai-toolkit-afk/unattended` marker the supervisor drops under
+# the git common dir (visible from every spoke worktree, which shares that dir) (#74).
+if [ -n "${UNATTENDED:-}" ] \
+  || { common="$(git rev-parse --git-common-dir 2>/dev/null)" && [ -f "$common/ai-toolkit-afk/unattended" ]; }; then
+  echo "anti-gutting: UNATTENDED — blocking the push; a human must review the above before it lands." >&2
+  exit 1
+fi
+
 echo "anti-gutting: advisory — push allowed; review the above before landing." >&2
 exit 0

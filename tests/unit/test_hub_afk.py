@@ -350,6 +350,92 @@ def test_spoke_over_ceiling(epoch: str, now: str, over: bool) -> None:
     assert result.stdout.strip() == ("yes" if over else "no")
 
 
+# ── the tmux inject: interactive-gate handling (issue #74, defect 1) ──────────
+# A PLAN gate renders as an interactive AskUserQuestion MENU (tab/arrow/enter) that
+# ignores typed free text, so a bare `send-keys -l <text>` never answers it. The fix
+# is to send Esc FIRST — which cancels the menu, surfaces the questions as text, and
+# opens a free-text prompt — then inject the literal answer and submit with Enter.
+
+
+def _recording_tmux(tmp_path: Path) -> tuple[Path, Path]:
+    """A tmux stub that appends each invocation's args to a log and exits 0."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    log = tmp_path / "tmux.log"
+    (fake_bin / "tmux").write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\nexit 0\n')
+    (fake_bin / "tmux").chmod(0o755)
+    return fake_bin, log
+
+
+def test_inject_answer_sends_escape_before_text_then_enter(tmp_path: Path) -> None:
+    fake_bin, log = _recording_tmux(tmp_path)
+    env = {"PATH": f"{fake_bin}:{os.environ['PATH']}", "AFK_INJECT_MENU_PAUSE": "0"}
+
+    result = _call("inject_answer 'afk:1' 'use Redis'", env=env)
+
+    assert result.returncode == 0, result.stderr
+    lines = log.read_text().splitlines()
+    esc_idx = next(i for i, ln in enumerate(lines) if "Escape" in ln)
+    text_idx = next(i for i, ln in enumerate(lines) if "use Redis" in ln)
+    enter_idx = next(i for i, ln in enumerate(lines) if ln.split() and ln.split()[-1] == "Enter")
+    assert esc_idx < text_idx < enter_idx, f"expected Esc → text → Enter, got: {lines}"
+
+
+# ── inject verification: confirm the answer registered (issue #74, defect 2) ──
+# A send-keys that silently no-ops (wrong target, busy pane, an unhandled menu)
+# leaves the spoke parked indefinitely with no signal. inject_and_verify confirms
+# the spoke's transcript advanced after injecting; if it didn't, it re-injects once
+# and then fails so the caller escalates rather than leaving the spoke stuck.
+
+
+def test_inject_and_verify_succeeds_when_transcript_advances(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
+    jsonl = pd / "session.jsonl"
+    old = 1_000_000_000
+    os.utime(jsonl, (old, old))  # backdate so the spoke's reaction is strictly newer
+    # inject_answer is stubbed to advance the transcript (the spoke reacting to input).
+    expr = (
+        f'inject_answer() {{ printf "{{}}\\n" >> "{jsonl}"; return 0; }}; '
+        f"inject_and_verify '{spoke_repo}' 'afk:1' 'use Redis'; echo RC=$?"
+    )
+
+    result = _call(
+        expr, env={"CLAUDE_PROJECTS_DIR": str(projects), "AFK_INJECT_VERIFY_SECONDS": "0"}
+    )
+
+    assert "RC=0" in result.stdout, result.stderr
+
+
+def test_inject_and_verify_reinjects_once_then_fails_when_stuck(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
+    calls = tmp_path / "calls.log"
+    # inject_answer succeeds at the tmux level but the transcript never advances.
+    expr = (
+        f'inject_answer() {{ printf x >> "{calls}"; return 0; }}; '
+        f"inject_and_verify '{spoke_repo}' 'afk:1' 'use Redis'; echo RC=$?"
+    )
+
+    result = _call(
+        expr,
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_INJECT_VERIFY_SECONDS": "0",
+            "AFK_INJECT_POLL_SECONDS": "1",
+        },
+    )
+
+    assert "RC=1" in result.stdout
+    assert calls.read_text() == "xx", "an unregistered answer must be re-injected once (2 attempts)"
+
+
 # ── the ANSWERER orchestration (stubbed answerer + spoke-ready) ───────────────
 
 
@@ -424,6 +510,8 @@ def test_decide_and_act_injects_and_emits_success_span(spoke_repo: Path, tmp_pat
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke_repo)
     _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
+    jsonl = pd / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # backdate so the reaction is newer
 
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
@@ -434,9 +522,15 @@ def test_decide_and_act_injects_and_emits_success_span(spoke_repo: Path, tmp_pat
     fake_bin.mkdir()
     (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
     (fake_bin / "gh").chmod(0o755)
-    # Fake tmux: list-panes maps a pane to this worktree; send-keys succeeds.
+    # Fake tmux: list-panes maps a pane to this worktree; send-keys succeeds and, on the
+    # submitting Enter, advances the spoke's transcript — modelling the spoke reacting so
+    # inject_and_verify confirms the answer registered.
     (fake_bin / "tmux").write_text(
-        f'#!/usr/bin/env bash\ncase "$1" in\n  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\nesac\nexit 0\n'
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        f'  send-keys) case "$*" in *Enter*) printf "{{}}\\n" >> "{jsonl}" ;; esac ;;\n'
+        "esac\nexit 0\n"
     )
     (fake_bin / "tmux").chmod(0o755)
 
@@ -446,6 +540,8 @@ def test_decide_and_act_injects_and_emits_success_span(spoke_repo: Path, tmp_pat
         "SPOKE_READY": str(ready_stub),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "AFK_ANSWERER_CMD": "printf 'ANSWER: use Redis'",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
         "AI_TOOLKIT_TELEMETRY": "1",
         "AI_TOOLKIT_TELEMETRY_DIR": str(tel_dir),
     }
@@ -458,6 +554,48 @@ def test_decide_and_act_injects_and_emits_success_span(spoke_repo: Path, tmp_pat
     span = json.loads((tel_dir / "events.jsonl").read_text().strip().splitlines()[-1])
     assert span["kind"] == "agent" and span["name"] == "afk-answer"
     assert span["status"] == "success"
+
+
+def test_decide_and_act_escalates_when_answer_does_not_register(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The answerer decides and a pane maps, but the inject never registers (the transcript
+    # does not advance). The supervisor must re-inject and then escalate — never leave the
+    # spoke silently parked (issue #74, defect 2).
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
+
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+    # Pane maps, send-keys succeeds, but the transcript is never advanced.
+    (fake_bin / "tmux").write_text(
+        f'#!/usr/bin/env bash\ncase "$1" in\n  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\nesac\nexit 0\n'
+    )
+    (fake_bin / "tmux").chmod(0o755)
+
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "SPOKE_READY": str(ready_stub),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_ANSWERER_CMD": "printf 'ANSWER: use Redis'",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+    }
+
+    result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    log = ready_log.read_text()
+    assert "--blocked 5" in log
+    assert "register" in log
 
 
 def test_build_answerer_prompt_includes_rule_and_question(
@@ -731,3 +869,179 @@ def test_remote_launch_env_overrides_conf_file(tmp_path: Path) -> None:
     log = (tmp_path / "ssh.log").read_text()
     assert "from-env" in log
     assert "from-file" not in log
+
+
+# ── in-flight scope exclusion (issue #74, defect 3) ───────────────────────────
+# The supervisor must feed every live spoke's Scope into batch-plan so an overlapping
+# ready issue is held back. A regression on the maiden run co-dispatched two spokes
+# whose scopes overlapped. _inflight_scope_args reads each in-flight issue's Scope and
+# emits a --inflight flag; an UNRESOLVABLE scope (gh failure / no Scope line) is treated
+# as exclusive (--inflight *) so an unknown-scope spoke fails CLOSED, never co-dispatched.
+
+
+def _gh_stub(tmp_path: Path, body: str) -> Path:
+    """A fake `gh` whose `issue view` prints <body>; repo/graphql handled by callers.
+
+    `%b` so any `\\n` in <body> expands to a real newline (a Scope: line on its own).
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    (fake_bin / "gh").write_text(f'#!/usr/bin/env bash\nprintf "%b\\n" "{body}"\n')
+    (fake_bin / "gh").chmod(0o755)
+    return fake_bin
+
+
+def test_inflight_scope_args_passes_resolved_scope(tmp_path: Path) -> None:
+    fake_bin = _gh_stub(tmp_path, "intro line\\nScope: a.py b.py")
+    expr = 'inflight_issues() { printf "72\\n"; }; _inflight_scope_args'
+
+    result = _call(expr, env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+
+    assert result.stdout.splitlines() == ["--inflight", "a.py b.py"]
+
+
+def test_inflight_scope_args_marks_unresolved_scope_exclusive(tmp_path: Path) -> None:
+    # No Scope: line in the body ⇒ the live spoke's footprint is unknown ⇒ exclusive,
+    # so batch-plan holds back EVERY ready issue until it lands (fail closed).
+    fake_bin = _gh_stub(tmp_path, "a body with no scope line")
+    expr = 'inflight_issues() { printf "72\\n"; }; _inflight_scope_args'
+
+    result = _call(expr, env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+
+    assert result.stdout.splitlines() == ["--inflight", "*"]
+
+
+def test_dispatch_batch_holds_back_inflight_scope_overlap(tmp_path: Path) -> None:
+    # End to end through the REAL batch-plan.sh: a live spoke (#72, Scope a.py) must
+    # exclude the ready, overlapping #73 (a.py) while the disjoint #5 (d.py) dispatches.
+    backlog = tmp_path / "backlog.json"
+    backlog.write_text(
+        json.dumps(
+            [
+                {"number": 73, "body": "Scope: a.py\n", "blockedBy": {"nodes": []}},
+                {"number": 5, "body": "Scope: d.py\n", "blockedBy": {"nodes": []}},
+            ]
+        )
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1 $2" in\n'
+        '  "issue view") printf "body\\nScope: a.py\\n" ;;\n'
+        '  "repo view") echo "octo ai-toolkit" ;;\n'
+        f'  "api graphql") cat "{backlog}" ;;\n'
+        "esac\n"
+    )
+    (fake_bin / "gh").chmod(0o755)
+    dispatched = tmp_path / "dispatched.log"
+    wt_new = tmp_path / "wtnew.sh"
+    wt_new.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{dispatched}"\n')
+    wt_new.chmod(0o755)
+
+    batch_plan = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "batch-plan.sh"
+    expr = 'inflight_issues() { printf "72\\n"; }; inflight_worktrees() { :; }; dispatch_batch'
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "BATCH_PLAN": str(batch_plan),
+        "WT_NEW": str(wt_new),
+    }
+
+    result = _call(expr, env=env)
+
+    assert result.returncode == 0, result.stderr
+    landed = dispatched.read_text().split() if dispatched.exists() else []
+    assert "5" in landed, "the disjoint ready issue must dispatch"
+    assert "73" not in landed, "#73 overlaps the in-flight #72 (a.py) and must be held back"
+    assert "72" not in landed, "the already-in-flight spoke must not be re-dispatched"
+
+
+# ── auto-land scoping: only this run's dispatches (issue #74, defect 4) ────────
+# auto_land must land only a ready/<issue> that THIS run dispatched (a dispatch epoch
+# was stamped), not a foreign ready/<issue> left by a parallel session — unless
+# AFK_LAND_FOREIGN opts in. The dispatched-set is per-window: arming clears stale epochs.
+
+
+def _land_recorder(tmp_path: Path) -> tuple[Path, Path]:
+    """A land-script stub that records the issue it was asked to land."""
+    land_log = tmp_path / "land.log"
+    stub = tmp_path / "wtland.sh"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{land_log}"\n')
+    stub.chmod(0o755)
+    return stub, land_log
+
+
+def test_auto_land_skips_foreign_ready_spoke(spoke_repo: Path, tmp_path: Path) -> None:
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    wt_land, land_log = _land_recorder(tmp_path)
+    statedir = tmp_path / "statedir"  # empty: no dispatch-5.epoch ⇒ foreign
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(expr, env={"WT_LAND": str(wt_land), "AFK_STATE_DIR": str(statedir)})
+
+    assert not land_log.exists() or land_log.read_text().strip() == "", (
+        "a foreign ready spoke (not dispatched by this run) must not be auto-landed"
+    )
+
+
+def test_auto_land_lands_dispatched_ready_spoke(spoke_repo: Path, tmp_path: Path) -> None:
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    wt_land, land_log = _land_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "dispatch-5.epoch").write_text("1000\n")  # this run dispatched #5
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(expr, env={"WT_LAND": str(wt_land), "AFK_STATE_DIR": str(statedir)})
+
+    assert land_log.read_text().split() == ["5"], "a dispatched ready spoke must be landed"
+
+
+def test_auto_land_lands_foreign_when_opted_in(spoke_repo: Path, tmp_path: Path) -> None:
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    wt_land, land_log = _land_recorder(tmp_path)
+    statedir = tmp_path / "statedir"  # empty, but opt-in is set
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(
+        expr,
+        env={"WT_LAND": str(wt_land), "AFK_STATE_DIR": str(statedir), "AFK_LAND_FOREIGN": "1"},
+    )
+
+    assert land_log.read_text().split() == ["5"], "AFK_LAND_FOREIGN=1 lands a foreign spoke"
+
+
+def test_clear_dispatch_epochs_drops_stale_entries(tmp_path: Path) -> None:
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "dispatch-9.epoch").write_text("1000\n")
+    expr = "_clear_dispatch_epochs; ls $(_afk_state_dir) 2>/dev/null | wc -l"
+
+    result = _call(expr, env={"AFK_STATE_DIR": str(statedir)})
+
+    assert result.stdout.strip() == "0", "arming a window must clear stale dispatch epochs"
+
+
+# ── UNATTENDED marker wiring (issue #74, defect 5) ────────────────────────────
+# The supervisor drops/removes an `unattended` marker under the state dir while a window
+# is armed; anti-gutting-scan.sh reads it to fail closed on a test-gutting diff.
+
+
+def test_afk_set_unattended_creates_marker(tmp_path: Path) -> None:
+    statedir = tmp_path / "statedir"
+    expr = "_afk_set_unattended; test -f $(_afk_unattended_marker) && echo present || echo absent"
+
+    result = _call(expr, env={"AFK_STATE_DIR": str(statedir)})
+
+    assert result.stdout.strip() == "present"
+
+
+def test_afk_clear_unattended_removes_marker(tmp_path: Path) -> None:
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "unattended").write_text("")
+    expr = "_afk_clear_unattended; test -f $(_afk_unattended_marker) && echo present || echo absent"
+
+    result = _call(expr, env={"AFK_STATE_DIR": str(statedir)})
+
+    assert result.stdout.strip() == "absent"

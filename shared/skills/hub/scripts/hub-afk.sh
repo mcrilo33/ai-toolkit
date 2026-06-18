@@ -161,10 +161,26 @@ afk_state_file() {
 
 afk_write_state() { printf '%s\n' "$1" > "$(afk_state_file)"; }
 afk_read_state()  { local f; f="$(afk_state_file)"; [ -f "$f" ] && head -n1 "$f" 2>/dev/null | tr -d '[:space:]' || true; }
-afk_clear_state() { rm -f "$(afk_state_file)" 2>/dev/null || true; }
+afk_clear_state() { rm -f "$(afk_state_file)" 2>/dev/null || true; _afk_clear_unattended; }
+
+# --- unattended marker --------------------------------------------------------
+# While a window is armed the supervisor drops a marker under the git common dir (shared
+# with every spoke worktree). anti-gutting-scan.sh reads it to fail CLOSED on a
+# test-gutting diff for /afk-dispatched spokes — no human is watching to catch it (#74).
+_afk_unattended_marker() { printf '%s\n' "$(_afk_state_dir)/unattended"; }
+_afk_set_unattended() {
+  local m; m="$(_afk_unattended_marker)"
+  mkdir -p "$(dirname "$m")" 2>/dev/null || true
+  : > "$m" 2>/dev/null || true
+}
+_afk_clear_unattended() { rm -f "$(_afk_unattended_marker)" 2>/dev/null || true; }
 
 # --- per-spoke dispatch epochs (the wall-clock reap reference) ----------------
+# Also the record of WHICH issues THIS run dispatched: a dispatch epoch exists only for
+# a spoke this run spawned, so auto_land lands only those (not a foreign ready/<issue>
+# from a parallel session). AFK_STATE_DIR overrides the location for tests.
 _afk_state_dir() {
+  if [ -n "${AFK_STATE_DIR:-}" ]; then printf '%s\n' "$AFK_STATE_DIR"; return; fi
   local common; common="$(git rev-parse --git-common-dir 2>/dev/null)" || common=".git"
   printf '%s\n' "$common/ai-toolkit-afk"
 }
@@ -176,6 +192,13 @@ stamp_dispatch_epoch() {
 read_dispatch_epoch() {
   local f; f="$(_afk_state_dir)/dispatch-$1.epoch"
   [ -f "$f" ] && cat "$f" 2>/dev/null || true
+}
+# _clear_dispatch_epochs -> drop every dispatch epoch so the "dispatched by this run"
+# set starts empty for a freshly-armed window. Without this a stale epoch from a prior
+# window could make a foreign ready/<issue> look like one we dispatched.
+_clear_dispatch_epochs() {
+  local dir; dir="$(_afk_state_dir)"
+  rm -f "$dir"/dispatch-*.epoch 2>/dev/null || true
 }
 
 # --- sibling-script resolution ------------------------------------------------
@@ -229,6 +252,14 @@ _transcript_idle_seconds() {
   mtime="$(stat -f %m "$jsonl" 2>/dev/null || stat -c %Y "$jsonl" 2>/dev/null)"
   [ -n "$mtime" ] || return 0
   printf '%s\n' "$(( $(afk_now) - mtime ))"
+}
+# _transcript_mtime <wt_path> -> epoch mtime of the spoke's newest transcript, or empty.
+# The registration signal for inject verification: it bumps when the spoke writes its
+# next turn after an injected answer is submitted.
+_transcript_mtime() {
+  local jsonl; jsonl="$(_spoke_jsonl "$1")"
+  [ -n "$jsonl" ] || return 0
+  stat -f %m "$jsonl" 2>/dev/null || stat -c %Y "$jsonl" 2>/dev/null
 }
 
 # extract_pending_question <wt_path> -> the prompt the spoke is parked on, or empty when
@@ -420,14 +451,54 @@ _spoke_pane_target() {
 }
 
 # inject_answer <pane_target> <text> -> type the answer into the spoke and submit it.
-# `send-keys -l` sends the text literally (no key-name interpretation), then a separate
-# Enter submits — the gotcha-proof pattern for re-driving an idle spoke.
+# A PLAN gate renders as an interactive AskUserQuestion MENU (tab/arrow/enter) that
+# IGNORES typed free text, so the most common gate is never answered by a bare inject
+# (issue #74). We send Esc FIRST: it cancels the menu, surfaces the questions as text,
+# and opens a free-text prompt — and is a no-op (nothing typed yet to clear) when the
+# spoke is already at a plain text prompt. A short, tunable pause lets that prompt
+# re-render before we type. Then `send-keys -l` sends the text literally (no key-name
+# interpretation) and a separate Enter submits — the gotcha-proof re-drive pattern.
 inject_answer() {
   local target="$1" text="$2"
   command -v tmux >/dev/null 2>&1 || return 1
   [ -n "$target" ] || return 1
+  tmux send-keys -t "$target" Escape 2>/dev/null || return 1
+  sleep "${AFK_INJECT_MENU_PAUSE:-0.3}" 2>/dev/null || true
   tmux send-keys -t "$target" -l -- "$text" 2>/dev/null || return 1
   tmux send-keys -t "$target" Enter 2>/dev/null || return 1
+}
+
+# _transcript_advanced <wt_path> <baseline_mtime> -> true once the spoke's newest
+# transcript mtime exceeds the baseline, polling up to AFK_INJECT_VERIFY_SECONDS in
+# AFK_INJECT_POLL_SECONDS steps. An empty baseline (no prior transcript) means any
+# transcript now is progress. Used to confirm an injected answer actually registered.
+_transcript_advanced() {
+  local wt="$1" before="$2" budget poll waited=0 now
+  budget="${AFK_INJECT_VERIFY_SECONDS:-20}"
+  poll="${AFK_INJECT_POLL_SECONDS:-2}"
+  while : ; do
+    now="$(_transcript_mtime "$wt")"
+    if [ -n "$now" ] && { [ -z "$before" ] || [ "$now" -gt "$before" ]; }; then return 0; fi
+    [ "$waited" -ge "$budget" ] && return 1
+    sleep "$poll" 2>/dev/null || true
+    waited=$(( waited + poll ))
+  done
+}
+
+# inject_and_verify <wt_path> <pane_target> <text> -> inject the answer and CONFIRM it
+# registered (the spoke's transcript advanced), re-injecting once if the first attempt
+# left the spoke untouched. rc 0 when the transcript advanced (the answer took), rc 1
+# when it never did — the caller then escalates. A send-keys that silently no-ops (wrong
+# target, busy pane, an unhandled menu) would otherwise park the spoke forever (#74).
+inject_and_verify() {
+  local wt="$1" target="$2" text="$3" before attempt
+  before="$(_transcript_mtime "$wt")"
+  for attempt in 1 2; do
+    inject_answer "$target" "$text" || return 1
+    if _transcript_advanced "$wt" "$before"; then return 0; fi
+    log "  injected answer did not register (attempt $attempt)"
+  done
+  return 1
 }
 
 # afk_emit_decision <wt_path> <status> -> one kind=agent span per auto-answer decision,
@@ -469,13 +540,16 @@ decide_and_act() {
   text="${decision#*$'\t'}"
   if [ "$kind" = "ANSWER" ] && [ -n "$text" ]; then
     target="$(_spoke_pane_target "$wt")"
-    if inject_answer "$target" "$text"; then
+    if [ -z "$target" ]; then
+      text="could not locate spoke pane to inject the answer"
+    elif inject_and_verify "$wt" "$target" "$text"; then
       log "  injected answer into #$issue"
       afk_emit_decision "$wt" success
       return 0
+    else
+      log "  answer to #$issue did not register — escalating"
+      text="answer did not register in the spoke (inject not confirmed) — needs a human"
     fi
-    log "  could not inject into #$issue — escalating"
-    text="could not locate spoke pane to inject the answer"
   elif [ "$kind" = "ESCALATE" ]; then
     [ -n "$text" ] || text="answerer escalated (no reason given)"
   else
@@ -557,14 +631,18 @@ EOF
 
 # _inflight_scope_args -> repeated `--inflight "<scope>"` flags, one per live spoke, so
 # batch-plan holds back a ready issue that collides with work already running. The Scope:
-# line is read from each in-flight issue's body (the same source batch-plan reads).
+# line is read from each in-flight issue's body (the same source batch-plan reads). When a
+# live spoke's scope CANNOT be resolved (gh failed, or the issue has no Scope: line) its
+# footprint is unknown, so we emit `--inflight *` (exclusive) and batch-plan holds back
+# EVERY ready issue until it lands — failing CLOSED under unattended /afk (#74) rather than
+# co-dispatching into an unknown-scope collision.
 _inflight_scope_args() {
   local issue body scope
   while IFS= read -r issue; do
     [ -n "$issue" ] || continue
     body="$(gh issue view "$issue" --json body -q .body 2>/dev/null || true)"
     scope="$(printf '%s\n' "$body" | sed -n 's/^[[:space:]]*[Ss]cope:[[:space:]]*//p' | head -1)"
-    [ -n "$scope" ] && printf -- '--inflight\n%s\n' "$scope"
+    printf -- '--inflight\n%s\n' "${scope:-*}"
   done < <(inflight_issues)
 }
 
@@ -602,15 +680,22 @@ _ready_at_tip() {
   [ -n "$marker" ] && [ "$marker" = "$tip" ]
 }
 
-# auto_land -> land every ready/<issue> spoke. A failed land (merge conflict / suite fail)
-# emits blocked/<issue> and the drain continues; a landed spoke frees its scope + its
-# dependents' blockers for the next tick's plan.
+# auto_land -> land every ready/<issue> spoke THIS run dispatched. A failed land (merge
+# conflict / suite fail) emits blocked/<issue> and the drain continues; a landed spoke
+# frees its scope + its dependents' blockers for the next tick's plan. A foreign
+# ready/<issue> (no dispatch epoch — left by a parallel session this run never spawned)
+# is skipped unless AFK_LAND_FOREIGN is set, so concurrent sessions don't surprise-land
+# each other's work (#74).
 auto_land() {
   local wt_land path issue
   wt_land="$(_afk_find_script "${WT_LAND:-}" worktree-land.sh)" || { log "worktree-land.sh not found — skipping land"; return 0; }
   while IFS=$'\t' read -r path issue; do
     [ -n "$issue" ] || continue
     _ready_at_tip "$path" "$issue" || continue
+    if [ -z "$(read_dispatch_epoch "$issue")" ] && [ -z "${AFK_LAND_FOREIGN:-}" ]; then
+      log "  skip land #$issue — not dispatched by this run (set AFK_LAND_FOREIGN=1 to land foreign spokes)"
+      continue
+    fi
     log "→ land #$issue"
     if bash "$wt_land" "$issue" >/dev/null 2>&1; then
       log "  landed #$issue"
@@ -791,6 +876,8 @@ main() {
     local end
     end="$(compute_end_epoch "$@" "$(afk_now)")" || { log "unrecognized window: '$*' (use <duration>, 'until HH:MM', or 'drain')"; return 2; }
     afk_write_state "$end"
+    _clear_dispatch_epochs   # fresh window ⇒ empty "dispatched by this run" set
+    _afk_set_unattended      # arm the fail-closed anti-gutting tripwire for spokes
     log "/afk: armed ($([ "$end" = drain ] && echo 'drain — until the backlog is empty' || echo "until $(wt_date_ymd "$end") $(date -r "$end" +%H:%M 2>/dev/null || date -d "@$end" +%H:%M)"))"
   fi
 
