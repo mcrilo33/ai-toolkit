@@ -164,7 +164,11 @@ afk_read_state()  { local f; f="$(afk_state_file)"; [ -f "$f" ] && head -n1 "$f"
 afk_clear_state() { rm -f "$(afk_state_file)" 2>/dev/null || true; }
 
 # --- per-spoke dispatch epochs (the wall-clock reap reference) ----------------
+# Also the record of WHICH issues THIS run dispatched: a dispatch epoch exists only for
+# a spoke this run spawned, so auto_land lands only those (not a foreign ready/<issue>
+# from a parallel session). AFK_STATE_DIR overrides the location for tests.
 _afk_state_dir() {
+  if [ -n "${AFK_STATE_DIR:-}" ]; then printf '%s\n' "$AFK_STATE_DIR"; return; fi
   local common; common="$(git rev-parse --git-common-dir 2>/dev/null)" || common=".git"
   printf '%s\n' "$common/ai-toolkit-afk"
 }
@@ -176,6 +180,13 @@ stamp_dispatch_epoch() {
 read_dispatch_epoch() {
   local f; f="$(_afk_state_dir)/dispatch-$1.epoch"
   [ -f "$f" ] && cat "$f" 2>/dev/null || true
+}
+# _clear_dispatch_epochs -> drop every dispatch epoch so the "dispatched by this run"
+# set starts empty for a freshly-armed window. Without this a stale epoch from a prior
+# window could make a foreign ready/<issue> look like one we dispatched.
+_clear_dispatch_epochs() {
+  local dir; dir="$(_afk_state_dir)"
+  rm -f "$dir"/dispatch-*.epoch 2>/dev/null || true
 }
 
 # --- sibling-script resolution ------------------------------------------------
@@ -657,15 +668,22 @@ _ready_at_tip() {
   [ -n "$marker" ] && [ "$marker" = "$tip" ]
 }
 
-# auto_land -> land every ready/<issue> spoke. A failed land (merge conflict / suite fail)
-# emits blocked/<issue> and the drain continues; a landed spoke frees its scope + its
-# dependents' blockers for the next tick's plan.
+# auto_land -> land every ready/<issue> spoke THIS run dispatched. A failed land (merge
+# conflict / suite fail) emits blocked/<issue> and the drain continues; a landed spoke
+# frees its scope + its dependents' blockers for the next tick's plan. A foreign
+# ready/<issue> (no dispatch epoch — left by a parallel session this run never spawned)
+# is skipped unless AFK_LAND_FOREIGN is set, so concurrent sessions don't surprise-land
+# each other's work (#74).
 auto_land() {
   local wt_land path issue
   wt_land="$(_afk_find_script "${WT_LAND:-}" worktree-land.sh)" || { log "worktree-land.sh not found — skipping land"; return 0; }
   while IFS=$'\t' read -r path issue; do
     [ -n "$issue" ] || continue
     _ready_at_tip "$path" "$issue" || continue
+    if [ -z "$(read_dispatch_epoch "$issue")" ] && [ -z "${AFK_LAND_FOREIGN:-}" ]; then
+      log "  skip land #$issue — not dispatched by this run (set AFK_LAND_FOREIGN=1 to land foreign spokes)"
+      continue
+    fi
     log "→ land #$issue"
     if bash "$wt_land" "$issue" >/dev/null 2>&1; then
       log "  landed #$issue"
@@ -846,6 +864,7 @@ main() {
     local end
     end="$(compute_end_epoch "$@" "$(afk_now)")" || { log "unrecognized window: '$*' (use <duration>, 'until HH:MM', or 'drain')"; return 2; }
     afk_write_state "$end"
+    _clear_dispatch_epochs   # fresh window ⇒ empty "dispatched by this run" set
     log "/afk: armed ($([ "$end" = drain ] && echo 'drain — until the backlog is empty' || echo "until $(wt_date_ymd "$end") $(date -r "$end" +%H:%M 2>/dev/null || date -d "@$end" +%H:%M)"))"
   fi
 
