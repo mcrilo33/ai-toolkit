@@ -275,7 +275,22 @@ fi
 # WT_SPOKE marks the session's ROLE, not its directory (issue #26): every command
 # the spoke runs inherits it, so worktree-land.sh / worktree-done.sh refuse a
 # spoke that cd's to the hub and tries to land or tear down its own worktree.
-AGENT_CMD="WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(printf '%q' "${WT_AGENT_EFFORT:-max}") claude --model $(printf '%q' "${WT_AGENT_MODEL:-opus}")"
+# Native OpenTelemetry trace export (issue #83) — strictly opt-in via
+# AI_TOOLKIT_OTEL=1, a SEPARATE gate from the custom push layer's
+# AI_TOOLKIT_TELEMETRY. When on, prefix the launch with Claude Code's native-OTel
+# trace env so the interactive claude streams ONE nested trace per spoke, grouped
+# by the spoke_run_id minted above (carried as an OTEL_RESOURCE_ATTRIBUTES key, so
+# it tags every span/sub-agent/tool of the run). Only NON-SECRET vars are wired
+# here — the enabling flags, the otlp exporter + http/protobuf protocol, and the
+# spoke identity. The connection TARGET (OTEL_EXPORTER_OTLP_ENDPOINT and the
+# auth-bearing OTEL_EXPORTER_OTLP_HEADERS) is operator-provided through the
+# environment claude inherits; it is deliberately NOT placed on the command line
+# (which is visible in `ps`/tmux) nor printed in the manual-fallback advice.
+OTEL_PREFIX=""
+if [ "${AI_TOOLKIT_OTEL:-}" = "1" ]; then
+  OTEL_PREFIX="CLAUDE_CODE_ENABLE_TELEMETRY=1 CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 OTEL_TRACES_EXPORTER=otlp OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf OTEL_RESOURCE_ATTRIBUTES=$(printf '%q' "spoke_run_id=${SPOKE_RUN_ID}") "
+fi
+AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(printf '%q' "${WT_AGENT_EFFORT:-max}") claude --model $(printf '%q' "${WT_AGENT_MODEL:-opus}")"
 # Best-effort in-process budget cap for unattended spokes. A caller may set
 # WT_AGENT_BUDGET_ARGS (e.g. "--max-budget-usd 5"); it is a pre-formed multi-arg
 # string appended verbatim (NOT %q-quoted), so leave it unset for ordinary attended
