@@ -954,3 +954,69 @@ def test_dispatch_batch_holds_back_inflight_scope_overlap(tmp_path: Path) -> Non
     assert "5" in landed, "the disjoint ready issue must dispatch"
     assert "73" not in landed, "#73 overlaps the in-flight #72 (a.py) and must be held back"
     assert "72" not in landed, "the already-in-flight spoke must not be re-dispatched"
+
+
+# ── auto-land scoping: only this run's dispatches (issue #74, defect 4) ────────
+# auto_land must land only a ready/<issue> that THIS run dispatched (a dispatch epoch
+# was stamped), not a foreign ready/<issue> left by a parallel session — unless
+# AFK_LAND_FOREIGN opts in. The dispatched-set is per-window: arming clears stale epochs.
+
+
+def _land_recorder(tmp_path: Path) -> tuple[Path, Path]:
+    """A land-script stub that records the issue it was asked to land."""
+    land_log = tmp_path / "land.log"
+    stub = tmp_path / "wtland.sh"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{land_log}"\n')
+    stub.chmod(0o755)
+    return stub, land_log
+
+
+def test_auto_land_skips_foreign_ready_spoke(spoke_repo: Path, tmp_path: Path) -> None:
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    wt_land, land_log = _land_recorder(tmp_path)
+    statedir = tmp_path / "statedir"  # empty: no dispatch-5.epoch ⇒ foreign
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(expr, env={"WT_LAND": str(wt_land), "AFK_STATE_DIR": str(statedir)})
+
+    assert not land_log.exists() or land_log.read_text().strip() == "", (
+        "a foreign ready spoke (not dispatched by this run) must not be auto-landed"
+    )
+
+
+def test_auto_land_lands_dispatched_ready_spoke(spoke_repo: Path, tmp_path: Path) -> None:
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    wt_land, land_log = _land_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "dispatch-5.epoch").write_text("1000\n")  # this run dispatched #5
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(expr, env={"WT_LAND": str(wt_land), "AFK_STATE_DIR": str(statedir)})
+
+    assert land_log.read_text().split() == ["5"], "a dispatched ready spoke must be landed"
+
+
+def test_auto_land_lands_foreign_when_opted_in(spoke_repo: Path, tmp_path: Path) -> None:
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    wt_land, land_log = _land_recorder(tmp_path)
+    statedir = tmp_path / "statedir"  # empty, but opt-in is set
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(
+        expr,
+        env={"WT_LAND": str(wt_land), "AFK_STATE_DIR": str(statedir), "AFK_LAND_FOREIGN": "1"},
+    )
+
+    assert land_log.read_text().split() == ["5"], "AFK_LAND_FOREIGN=1 lands a foreign spoke"
+
+
+def test_clear_dispatch_epochs_drops_stale_entries(tmp_path: Path) -> None:
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "dispatch-9.epoch").write_text("1000\n")
+    expr = "_clear_dispatch_epochs; ls $(_afk_state_dir) 2>/dev/null | wc -l"
+
+    result = _call(expr, env={"AFK_STATE_DIR": str(statedir)})
+
+    assert result.stdout.strip() == "0", "arming a window must clear stale dispatch epochs"
