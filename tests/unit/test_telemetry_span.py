@@ -85,6 +85,10 @@ def _env(
         "AI_TOOLKIT_WORKFLOW_REV",
         "CURSOR_PROJECT_DIR",
         "TELEMETRY_PARENT_ID",
+        # The pre-push gate runs pytest with AI_TOOLKIT_PARENT_SPAN exported; it outranks
+        # the payload tool_use_id (the #66 precedence), so strip it for a deterministic
+        # parent_id driven only by what each test sets (mirrors test_telemetry_parent_span).
+        "AI_TOOLKIT_PARENT_SPAN",
     ):
         env.pop(var, None)
     if enabled:
