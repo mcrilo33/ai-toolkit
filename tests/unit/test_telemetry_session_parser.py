@@ -608,6 +608,44 @@ class TestTaskLedgerResolution:
         assert seed.summary == "Add RED test"
         assert update.summary == "Add RED test: pending → in_progress"
 
+    def test_task_update_without_a_status_flip_keeps_the_bare_subject(self, tmp_path: Path) -> None:
+        # Issue #81: an update that carries no status (e.g. an owner/subject edit) has
+        # no transition to show, so it falls back to the bare subject — unchanged.
+        records = [
+            _assistant_tasks(
+                "a1",
+                "2026-06-15T12:00:01.000Z",
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tc1",
+                        "name": "TaskCreate",
+                        "input": {"subject": "Add RED test"},
+                    }
+                ],
+            ),
+            _assistant_tasks(
+                "a2",
+                "2026-06-15T12:01:00.000Z",
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tu1",
+                        "name": "TaskUpdate",
+                        "input": {"taskId": "1", "owner": "alice"},
+                    }
+                ],
+            ),
+        ]
+        path = tmp_path / "task-sess.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        update = next(
+            s for s in _by_kind(parse_session_file(path), "todo") if s.name == "TaskUpdate"
+        )
+
+        assert update.summary == "Add RED test"
+
     def test_seed_then_update_sequence_parses_into_ordered_todo_spans(self, tmp_path: Path) -> None:
         # Issue #81: a create-then-advance sequence yields ordered todo spans whose
         # summaries read as a progression through the lifecycle.
