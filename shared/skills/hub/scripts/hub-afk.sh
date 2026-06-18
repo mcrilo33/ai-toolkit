@@ -420,12 +420,19 @@ _spoke_pane_target() {
 }
 
 # inject_answer <pane_target> <text> -> type the answer into the spoke and submit it.
-# `send-keys -l` sends the text literally (no key-name interpretation), then a separate
-# Enter submits — the gotcha-proof pattern for re-driving an idle spoke.
+# A PLAN gate renders as an interactive AskUserQuestion MENU (tab/arrow/enter) that
+# IGNORES typed free text, so the most common gate is never answered by a bare inject
+# (issue #74). We send Esc FIRST: it cancels the menu, surfaces the questions as text,
+# and opens a free-text prompt — and is a no-op (nothing typed yet to clear) when the
+# spoke is already at a plain text prompt. A short, tunable pause lets that prompt
+# re-render before we type. Then `send-keys -l` sends the text literally (no key-name
+# interpretation) and a separate Enter submits — the gotcha-proof re-drive pattern.
 inject_answer() {
   local target="$1" text="$2"
   command -v tmux >/dev/null 2>&1 || return 1
   [ -n "$target" ] || return 1
+  tmux send-keys -t "$target" Escape 2>/dev/null || return 1
+  sleep "${AFK_INJECT_MENU_PAUSE:-0.3}" 2>/dev/null || true
   tmux send-keys -t "$target" -l -- "$text" 2>/dev/null || return 1
   tmux send-keys -t "$target" Enter 2>/dev/null || return 1
 }
