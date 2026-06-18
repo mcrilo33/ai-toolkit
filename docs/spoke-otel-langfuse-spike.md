@@ -88,6 +88,33 @@ export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic <base64(pk:sk)>"
 Self-hosted Langfuse (≥ v3.22.0) is the same path on the local host
 (`http://localhost:3000/api/public/otel`).
 
+## Validation (observed)
+
+The export path was exercised end to end against a minimal local OTLP/HTTP receiver on
+`:4318` (no Langfuse, no third party). A real headless `claude --model haiku -p …` was
+run with the prefix above and `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318`, plus
+a sentinel `OTEL_RESOURCE_ATTRIBUTES=spoke_run_id=feature/83-otel-validation+SPIKE83PROBE`.
+
+A single trace export (one OTLP/protobuf POST to `/v1/traces`) arrived and contained:
+
+- **Resource**: `service.name=claude-code`, `service.version`, and the sentinel
+  `spoke_run_id` — so the run is queryable by spoke.
+- **Scope**: `com.anthropic.claude_code.tracing`.
+- **Spans**: `claude_code.interaction` (with `interaction.duration_ms`,
+  `interaction.sequence`) and `claude_code.llm_request` (with `gen_ai.request.model`,
+  `gen_ai.request.attempt`, `client_request_id`, `llm_request.context`). The
+  `spoke_run_id` appeared on the resource **and** each span.
+
+This confirms acceptance: native traces export to a local collector and the whole run
+groups under `spoke_run_id`. Two honest caveats on what the *minimal probe* did **not**
+exercise (consistent with the comparison below, not contradicting it):
+
+- A one-shot headless `-p` run emits one `interaction` + one `llm_request`. A real
+  interactive spoke would add **tool**, **sub-agent**, and **workflow** spans nested in
+  the same trace — present in the design, just not surfaced by a trivial prompt.
+- The spans carry **token/latency** attributes but **no dollar cost** — reconfirming that
+  cost reconciliation is not native (see below).
+
 ## Native view vs the custom dashboard
 
 | Capability | Native OTel trace | Custom dashboard |
