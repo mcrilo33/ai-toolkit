@@ -288,6 +288,8 @@ fi
 # (which is visible in `ps`/tmux) nor printed in the manual-fallback advice.
 OTEL_PREFIX=""
 if [ "${AI_TOOLKIT_OTEL:-}" = "1" ]; then
+  # NB: the trailing space is load-bearing — it separates the prefix from the
+  # WT_SPOKE pin that AGENT_CMD appends immediately after it.
   OTEL_PREFIX="CLAUDE_CODE_ENABLE_TELEMETRY=1 CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 OTEL_TRACES_EXPORTER=otlp OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf OTEL_RESOURCE_ATTRIBUTES=$(printf '%q' "spoke_run_id=${SPOKE_RUN_ID}") "
 fi
 AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(printf '%q' "${WT_AGENT_EFFORT:-max}") claude --model $(printf '%q' "${WT_AGENT_MODEL:-opus}")"

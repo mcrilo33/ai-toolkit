@@ -525,10 +525,11 @@ def test_agent_launch_injects_otel_env_when_opted_in(hub: Path, tmp_path: Path) 
     for var in _OTEL_NONSECRET_VARS:
         assert var in cmd, f"expected {var} in the opted-in launch"
     assert "OTEL_RESOURCE_ATTRIBUTES=spoke_run_id=feature/8-some-slug+" in cmd
-    # The OTel prefix precedes the existing WT_SPOKE/CLAUDE_EFFORT pin, so the
-    # launch still pins model+effort+role unchanged.
+    # The whole OTel prefix precedes the existing WT_SPOKE/CLAUDE_EFFORT pin, so
+    # the launch still pins model+effort+role unchanged.
     assert "WT_SPOKE=8 CLAUDE_EFFORT=max claude --model opus" in cmd
     assert cmd.index("CLAUDE_CODE_ENABLE_TELEMETRY=1") < cmd.index("WT_SPOKE=8")
+    assert cmd.index("OTEL_RESOURCE_ATTRIBUTES=") < cmd.index("WT_SPOKE=8")
 
 
 def test_agent_launch_never_forwards_otel_secrets(hub: Path, tmp_path: Path) -> None:
@@ -555,7 +556,34 @@ def test_agent_launch_never_forwards_otel_secrets(hub: Path, tmp_path: Path) -> 
     assert new_window, "expected a new-window invocation"
     for secret in (secret_endpoint, secret_headers):
         assert secret not in new_window[0], "secret must never be on the command line"
-        assert secret not in proc.stdout, "secret must never be printed"
+
+
+def test_manual_fallback_advice_never_prints_otel_secrets(hub: Path, tmp_path: Path) -> None:
+    # The manual-fallback echo is the real stdout-leak vector (the tmux path never
+    # echoes the launch). With the gate on and secrets present, the printed advice
+    # must carry the non-secret prefix yet never reveal the endpoint or headers.
+    secret_endpoint = "https://secret.example.invalid/api/public/otel"
+    secret_headers = "Authorization=Basic c2VjcmV0LXRva2VuLXZhbHVl"
+    proc, _ = _run_new(
+        hub,
+        tmp_path,
+        "8",
+        "some-slug",
+        "--no-code",
+        inside_tmux=False,
+        has_session_rc=1,
+        new_session_rc=1,
+        extra_env={
+            "AI_TOOLKIT_OTEL": "1",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": secret_endpoint,
+            "OTEL_EXPORTER_OTLP_HEADERS": secret_headers,
+        },
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "CLAUDE_CODE_ENABLE_TELEMETRY=1" in proc.stdout, "fallback must carry the prefix"
+    for secret in (secret_endpoint, secret_headers):
+        assert secret not in proc.stdout, "secret must never be printed in the fallback advice"
 
 
 def test_manual_fallback_advice_carries_otel_env(hub: Path, tmp_path: Path) -> None:
