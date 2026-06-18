@@ -10,6 +10,7 @@ This repository contains shared rules, skills, prompts, and agents for AI coding
 - `docs/metadata-and-sync.md` — How `shared/` files are synced to platform-specific configs
 - `docs/parallel-worktrees.md` — Running parallel Claude sessions with one git worktree per task (`worktree-new.sh` / `worktree-done.sh`, review window, merge flow)
 - `docs/telemetry-pull-layer.md` — Telemetry pull layer: how the dashboard attributes tokens and reconciles per-session/run cost via `ccusage` (offline), joined to push spans
+- `docs/spoke-otel-langfuse-spike.md` — Spike (#83): opt-in (`AI_TOOLKIT_OTEL=1`) Claude Code native-OTel trace export per spoke to Langfuse / a local OTLP collector; native-view-vs-dashboard comparison and the hybrid recommendation
 - `dashboard/README.md` — Observability dashboard: correlated push+pull telemetry with `ccusage`-sourced token/cost numbers
 
 ## Repository structure
