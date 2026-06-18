@@ -404,6 +404,80 @@ def _ts(value: str | None) -> float:
         return float("-inf")
 
 
+def _ms(value: str | None) -> int | None:
+    """The integer-millisecond epoch for an ISO timestamp, or ``None`` if unparseable."""
+    ts = _ts(value)
+    return None if ts == float("-inf") else round(ts * 1000)
+
+
+# Kinds that occupy wall-clock as a work leaf. Everything else — interval/context/gap/
+# session/human — is a container or marker that cedes its span to the work inside it,
+# so the time it "spans" is attributed to those leaves (or to ``idle`` when none run).
+_WORK_KINDS = frozenset({"turn", "tool", "skill", "todo", "agent", "hook", "script"})
+_IDLE_KIND = "idle"
+
+
+def leaf_time_slices(forest: list[CausalNode]) -> dict[str, int]:
+    """Partition the spoke wall-clock by deepest-active leaf; return milliseconds per kind.
+
+    Models time as the innermost running span at each instant: a hook nested in a tool
+    beats the tool, a sub-turn beats its agent, and a parent's wait while a sub-agent
+    runs is attributed to the sub-agent's slice — the parent is not "spending" that time
+    twice. Any instant no work span covers is ``idle``. The slices tile ``[spawn,
+    teardown]`` (the earliest start to the latest end across the whole forest) with no
+    overlap, so ``Σ values == total wall-clock`` — the time analog of ``Σ owned == Σ
+    turns``. Computing in integer milliseconds keeps that equality exact.
+
+    Args:
+        forest: The spoke's causal forest (the start-ordered L1 spine + dividers).
+
+    Returns:
+        ``kind -> milliseconds``, including an ``idle`` entry for uncovered gaps. Empty
+        when the forest carries no resolvable timestamps.
+    """
+    work: list[tuple[int, int, int, str]] = []
+    bounds: list[int] = []
+    _collect_slices(forest, depth=0, work=work, bounds=bounds)
+    if not bounds:
+        return {}
+
+    spawn, teardown = min(bounds), max(bounds)
+    cuts = sorted({c for s, e, _d, _k in work for c in (s, e) if spawn <= c <= teardown})
+    cuts = [spawn, *cuts, teardown]
+    totals: dict[str, int] = {}
+    for lo, hi in pairwise(cuts):
+        if hi <= lo:
+            continue
+        kind = _deepest_kind(work, lo, hi)
+        totals[kind] = totals.get(kind, 0) + (hi - lo)
+    return totals
+
+
+def _collect_slices(
+    nodes: list[CausalNode],
+    *,
+    depth: int,
+    work: list[tuple[int, int, int, str]],
+    bounds: list[int],
+) -> None:
+    """Gather (start, end, depth, kind) for every work leaf and bounds for every node."""
+    for node in nodes:
+        start, end = _ms(node["ts_start"]), _ms(node["ts_end"])
+        bounds.extend(b for b in (start, end) if b is not None)
+        if node["kind"] in _WORK_KINDS and start is not None and end is not None and end > start:
+            work.append((start, end, depth, node["kind"]))
+        _collect_slices(node["children"], depth=depth + 1, work=work, bounds=bounds)
+
+
+def _deepest_kind(work: list[tuple[int, int, int, str]], lo: int, hi: int) -> str:
+    """The kind of the deepest work span covering ``[lo, hi]``, else ``idle``."""
+    best_depth, best_kind = -1, _IDLE_KIND
+    for start, end, depth, kind in work:
+        if start <= lo and end >= hi and depth > best_depth:
+            best_depth, best_kind = depth, kind
+    return best_kind
+
+
 # Idle longer than this between two main turns renders as a ``gap`` divider, not a phase.
 _IDLE_GAP_SECONDS = 300.0
 
