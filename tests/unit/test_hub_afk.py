@@ -869,3 +869,88 @@ def test_remote_launch_env_overrides_conf_file(tmp_path: Path) -> None:
     log = (tmp_path / "ssh.log").read_text()
     assert "from-env" in log
     assert "from-file" not in log
+
+
+# ── in-flight scope exclusion (issue #74, defect 3) ───────────────────────────
+# The supervisor must feed every live spoke's Scope into batch-plan so an overlapping
+# ready issue is held back. A regression on the maiden run co-dispatched two spokes
+# whose scopes overlapped. _inflight_scope_args reads each in-flight issue's Scope and
+# emits a --inflight flag; an UNRESOLVABLE scope (gh failure / no Scope line) is treated
+# as exclusive (--inflight *) so an unknown-scope spoke fails CLOSED, never co-dispatched.
+
+
+def _gh_stub(tmp_path: Path, body: str) -> Path:
+    """A fake `gh` whose `issue view` prints <body>; repo/graphql handled by callers.
+
+    `%b` so any `\\n` in <body> expands to a real newline (a Scope: line on its own).
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    (fake_bin / "gh").write_text(f'#!/usr/bin/env bash\nprintf "%b\\n" "{body}"\n')
+    (fake_bin / "gh").chmod(0o755)
+    return fake_bin
+
+
+def test_inflight_scope_args_passes_resolved_scope(tmp_path: Path) -> None:
+    fake_bin = _gh_stub(tmp_path, "intro line\\nScope: a.py b.py")
+    expr = 'inflight_issues() { printf "72\\n"; }; _inflight_scope_args'
+
+    result = _call(expr, env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+
+    assert result.stdout.splitlines() == ["--inflight", "a.py b.py"]
+
+
+def test_inflight_scope_args_marks_unresolved_scope_exclusive(tmp_path: Path) -> None:
+    # No Scope: line in the body ⇒ the live spoke's footprint is unknown ⇒ exclusive,
+    # so batch-plan holds back EVERY ready issue until it lands (fail closed).
+    fake_bin = _gh_stub(tmp_path, "a body with no scope line")
+    expr = 'inflight_issues() { printf "72\\n"; }; _inflight_scope_args'
+
+    result = _call(expr, env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+
+    assert result.stdout.splitlines() == ["--inflight", "*"]
+
+
+def test_dispatch_batch_holds_back_inflight_scope_overlap(tmp_path: Path) -> None:
+    # End to end through the REAL batch-plan.sh: a live spoke (#72, Scope a.py) must
+    # exclude the ready, overlapping #73 (a.py) while the disjoint #5 (d.py) dispatches.
+    backlog = tmp_path / "backlog.json"
+    backlog.write_text(
+        json.dumps(
+            [
+                {"number": 73, "body": "Scope: a.py\n", "blockedBy": {"nodes": []}},
+                {"number": 5, "body": "Scope: d.py\n", "blockedBy": {"nodes": []}},
+            ]
+        )
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1 $2" in\n'
+        '  "issue view") printf "body\\nScope: a.py\\n" ;;\n'
+        '  "repo view") echo "octo ai-toolkit" ;;\n'
+        f'  "api graphql") cat "{backlog}" ;;\n'
+        "esac\n"
+    )
+    (fake_bin / "gh").chmod(0o755)
+    dispatched = tmp_path / "dispatched.log"
+    wt_new = tmp_path / "wtnew.sh"
+    wt_new.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{dispatched}"\n')
+    wt_new.chmod(0o755)
+
+    batch_plan = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "batch-plan.sh"
+    expr = 'inflight_issues() { printf "72\\n"; }; inflight_worktrees() { :; }; dispatch_batch'
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "BATCH_PLAN": str(batch_plan),
+        "WT_NEW": str(wt_new),
+    }
+
+    result = _call(expr, env=env)
+
+    assert result.returncode == 0, result.stderr
+    landed = dispatched.read_text().split() if dispatched.exists() else []
+    assert "5" in landed, "the disjoint ready issue must dispatch"
+    assert "73" not in landed, "#73 overlaps the in-flight #72 (a.py) and must be held back"
+    assert "72" not in landed, "the already-in-flight spoke must not be re-dispatched"
