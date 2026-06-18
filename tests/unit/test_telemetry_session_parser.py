@@ -566,6 +566,99 @@ class TestTaskLedgerResolution:
 
         assert update.summary == "Second task"
 
+    def test_task_update_summary_shows_the_status_transition(self, tmp_path: Path) -> None:
+        # Issue #81: a TaskUpdate must read as progress, not just the bare subject —
+        # else it is indistinguishable from the seed. The summary records the status
+        # flip (prior → new) alongside the subtask label.
+        records = [
+            _assistant_tasks(
+                "a1",
+                "2026-06-15T12:00:01.000Z",
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tc1",
+                        "name": "TaskCreate",
+                        "input": {"subject": "Add RED test"},
+                    }
+                ],
+            ),
+            _assistant_tasks(
+                "a2",
+                "2026-06-15T12:01:00.000Z",
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tu1",
+                        "name": "TaskUpdate",
+                        "input": {"taskId": "1", "status": "in_progress"},
+                    }
+                ],
+            ),
+        ]
+        path = tmp_path / "task-sess.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        spans = _by_kind(parse_session_file(path), "todo")
+        seed = next(s for s in spans if s.name == "TaskCreate")
+        update = next(s for s in spans if s.name == "TaskUpdate")
+
+        assert seed.summary == "Add RED test"
+        assert update.summary == "Add RED test: pending → in_progress"
+
+    def test_seed_then_update_sequence_parses_into_ordered_todo_spans(self, tmp_path: Path) -> None:
+        # Issue #81: a create-then-advance sequence yields ordered todo spans whose
+        # summaries read as a progression through the lifecycle.
+        records = [
+            _assistant_tasks(
+                "a1",
+                "2026-06-15T12:00:01.000Z",
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tc1",
+                        "name": "TaskCreate",
+                        "input": {"subject": "Ship feature"},
+                    }
+                ],
+            ),
+            _assistant_tasks(
+                "a2",
+                "2026-06-15T12:01:00.000Z",
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tu1",
+                        "name": "TaskUpdate",
+                        "input": {"taskId": "1", "status": "in_progress"},
+                    }
+                ],
+            ),
+            _assistant_tasks(
+                "a3",
+                "2026-06-15T12:02:00.000Z",
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tu2",
+                        "name": "TaskUpdate",
+                        "input": {"taskId": "1", "status": "completed"},
+                    }
+                ],
+            ),
+        ]
+        path = tmp_path / "task-sess.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+        spans = sorted(_by_kind(parse_session_file(path), "todo"), key=lambda s: s.ts_start or "")
+
+        assert [s.name for s in spans] == ["TaskCreate", "TaskUpdate", "TaskUpdate"]
+        assert [s.summary for s in spans] == [
+            "Ship feature",
+            "Ship feature: pending → in_progress",
+            "Ship feature: in_progress → completed",
+        ]
+
 
 @pytest.fixture()
 def wf_parsed() -> ParsedSession:
