@@ -21,9 +21,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+import duckdb
+
 # `queries` is the sibling module in this directory; it resolves because
 # `streamlit run dashboard/app.py` injects the script's directory onto sys.path.
-import duckdb
 import queries
 import streamlit as st
 
@@ -143,10 +144,12 @@ def _materialize_lock_safe(store_path: str) -> queries.SpanStore:
     """
     try:
         return queries.SpanStore.from_persisted_store(store_path)
-    except duckdb.IOException:
+    except duckdb.IOException as exc:
         sys.path.insert(0, str(_scripts_dir()))
-        from telemetry.store import snapshot_store
+        from telemetry.store import is_lock_error, snapshot_store
 
+        if not is_lock_error(exc):
+            raise  # corrupt store / disk full / bad perms — surface it, don't mask
         snap = snapshot_store(store_path)
         try:
             return queries.SpanStore.from_persisted_store(snap)

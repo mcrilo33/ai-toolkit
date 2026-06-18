@@ -33,14 +33,13 @@ import duckdb
 # attribution + rollup primitives the SQL/aggregate layer reuses. Make it importable
 # regardless of how this module was loaded — ``streamlit run`` injects this directory
 # onto sys.path, but the unit harness loads queries by file path and does not.
-_THIS_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(_THIS_DIR))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 # The ``telemetry`` package lives in the sibling ``scripts/`` dir, NOT in ``dashboard/``.
 # ``streamlit run dashboard/app.py`` only adds ``dashboard/`` to sys.path, so without
 # this the ``telemetry.*`` imports below crash a real launch (Issue #75, Bug 1). Insert
 # it here — in the module doing the import — so every entrypoint (streamlit, the
 # importlib unit harness) resolves the package, not just one launcher.
-sys.path.insert(0, str(_THIS_DIR.parent / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 # The v3 causal trace (Issue #65): the per-spoke builder + the parser it re-parses with.
 from telemetry.causal_tree import causal_forest_from_parsed
 from telemetry.session_parser import ParsedSession, parse_session_file

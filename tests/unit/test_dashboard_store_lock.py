@@ -21,15 +21,15 @@ from unittest.mock import MagicMock
 
 import duckdb
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+
 from _dashboard_helpers import load_app, load_queries
+from telemetry.store import ingest_store
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "telemetry"
 EVENTS = FIXTURES / "events.jsonl"
 PROJECTS = FIXTURES / "projects"
 CCUSAGE = {"11111111-1111-1111-1111-111111111111": 2.80}
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-from telemetry.store import ingest_store
 
 
 def _build_store(tmp_path: Path) -> Path:

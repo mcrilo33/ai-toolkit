@@ -56,6 +56,21 @@ from telemetry.spoke_runs import backfill_spoke_run_ids
 _COLUMN_NAMES: tuple[str, ...] = tuple(col.split(" ", 1)[0] for col in _COLUMNS)
 _WATERMARK_KEY = "watermark"
 
+# DuckDB raises the same ``IOException`` for the single-writer file lock, a corrupt
+# store, disk-full, and permission errors — only the lock case is safe to degrade past
+# (#75). The lock error alone carries this marker; everything else is a genuine failure
+# that must surface, not be silently mislabelled "locked" and skipped.
+_LOCK_ERROR_MARKER = "Could not set lock"
+
+
+def is_lock_error(exc: BaseException) -> bool:
+    """True iff ``exc`` is DuckDB's single-writer file-lock ``IOException`` (#75).
+
+    Distinguishes the recoverable "another instance holds the store" case from a real
+    I/O failure (corrupt store, disk full, bad permissions) that must not be masked.
+    """
+    return isinstance(exc, duckdb.IOException) and _LOCK_ERROR_MARKER in str(exc)
+
 
 def _locked_version(store_path: Path) -> str:
     """A content version for a store we could not open because a writer holds the lock.
@@ -335,7 +350,9 @@ def ingest_store(
 
     try:
         con = duckdb.connect(str(store_path))
-    except duckdb.IOException:
+    except duckdb.IOException as exc:
+        if not is_lock_error(exc):
+            raise  # corrupt store / disk full / bad perms — surface it, don't mask
         # Another dashboard instance holds the single-writer lock (#75). Skip the ingest
         # and return a degraded version so the reader materializes the existing store
         # (from a snapshot copy) instead of hard-crashing the launch.

@@ -16,7 +16,6 @@ connection, so the lock only bites across processes) and assert:
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import sys
@@ -24,6 +23,7 @@ import time
 from pathlib import Path
 
 import duckdb
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
@@ -100,6 +100,18 @@ def test_ingest_store_degrades_instead_of_crashing_when_locked(tmp_path: Path) -
     assert version, "a locked ingest must still return a (degraded) version token"
 
 
+def test_ingest_store_reraises_a_non_lock_io_error(tmp_path: Path) -> None:
+    # A corrupt store raises the SAME IOException type as the lock, but it is a genuine
+    # data failure — it must surface, never be silently mislabelled "locked" and skipped.
+    store = tmp_path / "store.duckdb"
+    store.write_bytes(b"not a valid duckdb file")
+    projects = tmp_path / "projects"
+    shutil.copytree(PROJECTS, projects)
+
+    with pytest.raises(duckdb.IOException):
+        ingest_store(store, events_path=EVENTS, projects_root=projects, ccusage_costs=CCUSAGE)
+
+
 def test_snapshot_store_reads_past_the_write_lock(tmp_path: Path) -> None:
     store = _build_store(tmp_path)
     expected = _spans_via_snapshot_unlocked(store)
@@ -120,16 +132,16 @@ def _spans_via_snapshot_unlocked(store: Path) -> int:
         con.close()
 
 
-def test_snapshot_includes_the_wal_when_present(tmp_path: Path) -> None:
-    # A snapshot taken mid-write must copy the .wal alongside the .duckdb so the copy
-    # opens cleanly; absent the WAL, DuckDB may refuse the attach.
+def test_snapshot_copies_the_wal_sidecar_when_present(tmp_path: Path) -> None:
+    # A store mid-write can have a committed-but-uncheckpointed WAL beside it; the
+    # snapshot must copy it so the copy opens cleanly. DuckDB checkpoints on close, so a
+    # real WAL is timing-dependent — create the sidecar explicitly to exercise the branch
+    # deterministically.
     store = _build_store(tmp_path)
+    Path(f"{store}.wal").write_bytes(b"wal-sentinel")
 
-    with _WriteLockHolder(store):
-        snap = snapshot_store(store)
+    snap = snapshot_store(store)
 
-    wal = Path(f"{store}.wal")
-    if wal.exists():
-        assert Path(f"{snap}.wal").exists(), "snapshot must copy the WAL when the store has one"
-    # Either way the snapshot must open without error.
-    assert os.path.exists(snap)
+    snap_wal = Path(f"{snap}.wal")
+    assert snap_wal.exists(), "snapshot must copy the .wal sidecar when present"
+    assert snap_wal.read_bytes() == b"wal-sentinel"
