@@ -33,7 +33,11 @@ Everything runs on your machine and nothing is ever exported.
    and tools** under it. A **Meta by kind** tab aggregates the spoke's spans per
    kind (counts + time/cost stats) to spot "launched too much". Cost is counted
    **once per turn** (each turn node owns it), so the rolled-up totals are
-   trustworthy. Each turn carries one **`📐 context`** node — drill it to see the
+   trustworthy. Alongside it a **Time by kind** rollup partitions the whole
+   spoke's wall-clock by the **deepest-active leaf** at each instant (a hook
+   beats its tool, a sub-turn beats its agent; a sub-agent's run is its own time,
+   not the waiting parent turn's) with gaps as **`idle`**, so the kinds sum to the
+   spoke total (spawn→teardown) — the time analog of cost conservation. Each turn carries one **`📐 context`** node — drill it to see the
    named input state (rules · `CLAUDE.md` · memory · tool-schemas) with per-item
    tokens and the history remainder, the real cached prefix in the Tokens column.
    When the selected spoke is **still running**, a **Follow live** toggle appears

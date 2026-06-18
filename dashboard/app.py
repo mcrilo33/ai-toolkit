@@ -358,7 +358,9 @@ def _render_divider(node: dict) -> None:
         note = f" · cold cache (+{cache:,})" if cache else " · cold cache"
         st.markdown(f"··· session resume{note} ···")
         return
-    st.markdown(f"··· idle · {node['name']} ···")
+    # The idle gap is a duration-bearing row (Issue #79): show how long the wait was,
+    # so the time it represents is visible and reconciles with the meta-by-kind rollup.
+    st.markdown(f"··· idle {queries.format_duration(node.get('duration_ms'))} ···")
 
 
 def _inline_node_summary(node: dict) -> str:
@@ -449,7 +451,8 @@ def _render_spine(forest: list[dict]) -> None:
         _render_node(root, 0, str(index))
 
 
-def _render_meta(store: queries.SpanStore, spoke_id: str) -> None:
+def _render_meta(store: queries.SpanStore, spoke_id: str, forest: list[dict] | None) -> None:
+    _render_time_by_kind(forest)
     rows = store.spoke_meta_by_kind(spoke_id)
     if not rows:
         st.info("No spans to aggregate for this spoke.")
@@ -469,11 +472,42 @@ def _render_meta(store: queries.SpanStore, spoke_id: str) -> None:
         }
         for row in rows
     ]
+    st.subheader("Cost by kind")
     st.dataframe(table, use_container_width=True, hide_index=True)
     st.caption(
         "Cost is counted once per turn. Main-agent cost belongs to its phase "
         "interval, so summed across span kinds this is the subagent total — the "
         "run total minus the setup / phase / unresolved (non-span) buckets."
+    )
+
+
+def _render_time_by_kind(forest: list[dict] | None) -> None:
+    """The time-conservation rollup: wall-clock by kind, reconciling to the spoke total.
+
+    Each instant is attributed to the deepest-active leaf (a hook beats its tool, a
+    sub-turn beats its agent), gaps to ``idle``, so the kinds partition the whole spoke
+    (spawn→teardown) with no double-count (Issue #79).
+    """
+    if not forest:
+        return
+    rows = queries.forest_time_by_kind(forest)
+    if not rows:
+        return
+    total = sum(row["total_duration_ms"] for row in rows)
+    table = [
+        {
+            "Kind": row["kind"],
+            "Total time": queries.format_duration(row["total_duration_ms"]),
+            "Share": f"{row['share']:.0%}",
+        }
+        for row in rows
+    ]
+    st.subheader("Time by kind")
+    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.caption(
+        f"Wall-clock partitioned by deepest-active leaf, summing to the spoke total "
+        f"({queries.format_duration(total)}, spawn→teardown). A sub-agent's run is its "
+        f"own time, not the parent turn's — the parent waits, it does not spend it twice."
     )
 
 
@@ -734,7 +768,7 @@ def render_spoke_view(store: queries.SpanStore, source_key: str = "") -> None:
             _render_steps_body(forest)
 
     with meta_tab:
-        _render_meta(store, spoke_id)
+        _render_meta(store, spoke_id, forest)
 
     with comp_tab:
         if forest is None:
