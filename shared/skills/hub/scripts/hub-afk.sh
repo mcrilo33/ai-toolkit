@@ -161,7 +161,19 @@ afk_state_file() {
 
 afk_write_state() { printf '%s\n' "$1" > "$(afk_state_file)"; }
 afk_read_state()  { local f; f="$(afk_state_file)"; [ -f "$f" ] && head -n1 "$f" 2>/dev/null | tr -d '[:space:]' || true; }
-afk_clear_state() { rm -f "$(afk_state_file)" 2>/dev/null || true; }
+afk_clear_state() { rm -f "$(afk_state_file)" 2>/dev/null || true; _afk_clear_unattended; }
+
+# --- unattended marker --------------------------------------------------------
+# While a window is armed the supervisor drops a marker under the git common dir (shared
+# with every spoke worktree). anti-gutting-scan.sh reads it to fail CLOSED on a
+# test-gutting diff for /afk-dispatched spokes — no human is watching to catch it (#74).
+_afk_unattended_marker() { printf '%s\n' "$(_afk_state_dir)/unattended"; }
+_afk_set_unattended() {
+  local m; m="$(_afk_unattended_marker)"
+  mkdir -p "$(dirname "$m")" 2>/dev/null || true
+  : > "$m" 2>/dev/null || true
+}
+_afk_clear_unattended() { rm -f "$(_afk_unattended_marker)" 2>/dev/null || true; }
 
 # --- per-spoke dispatch epochs (the wall-clock reap reference) ----------------
 # Also the record of WHICH issues THIS run dispatched: a dispatch epoch exists only for
@@ -865,6 +877,7 @@ main() {
     end="$(compute_end_epoch "$@" "$(afk_now)")" || { log "unrecognized window: '$*' (use <duration>, 'until HH:MM', or 'drain')"; return 2; }
     afk_write_state "$end"
     _clear_dispatch_epochs   # fresh window ⇒ empty "dispatched by this run" set
+    _afk_set_unattended      # arm the fail-closed anti-gutting tripwire for spokes
     log "/afk: armed ($([ "$end" = drain ] && echo 'drain — until the backlog is empty' || echo "until $(wt_date_ymd "$end") $(date -r "$end" +%H:%M 2>/dev/null || date -d "@$end" +%H:%M)"))"
   fi
 
