@@ -318,13 +318,16 @@ def _todo_summaries(records: list[dict]) -> dict[str, str]:
       nothing new and nothing in progress still yields no summary.
     - ``TaskCreate`` / ``TaskUpdate`` (incremental, id-keyed): a ``TaskCreate``
       summarises to its ``subject`` and is assigned the next sequential id (the
-      runtime numbers them 1, 2, … in creation order); a later ``TaskUpdate``
-      resolves its ``taskId`` back to that subject.
+      runtime numbers them 1, 2, … in creation order), starting at ``pending``. A
+      later ``TaskUpdate`` resolves its ``taskId`` back to that subject and, when it
+      carries a ``status`` flip, reads as a progression — ``subject: prior → new``
+      (Issue #81) — so the trace shows the ledger advancing, not just the seed.
     """
     summaries: dict[str, str] = {}
     prev: set[str] = set()
     seen_contents: set[str] = set()
     subject_by_id: dict[str, str] = {}
+    status_by_id: dict[str, str] = {}
     created = 0
     for rec in records:
         if rec.get("type") != "assistant":
@@ -347,8 +350,15 @@ def _todo_summaries(records: list[dict]) -> dict[str, str]:
                 summary = _snippet(inputs.get("subject"))
                 if summary:
                     subject_by_id[str(created)] = summary
+                    status_by_id[str(created)] = "pending"
             else:  # TaskUpdate
-                summary = subject_by_id.get(str(inputs.get("taskId")))
+                task_id = str(inputs.get("taskId"))
+                summary = subject_by_id.get(task_id)
+                new_status = inputs.get("status")
+                if summary and isinstance(new_status, str):
+                    prior = status_by_id.get(task_id, "pending")
+                    summary = f"{summary}: {prior} → {new_status}"
+                    status_by_id[task_id] = new_status
             if summary:
                 summaries[tool_use_id] = summary
     return summaries
