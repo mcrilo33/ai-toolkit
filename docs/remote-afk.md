@@ -29,6 +29,9 @@ to backlog-empty on the home Mac, dispatching and landing spokes exactly as a lo
 drain` would — the spokes and the answerer authenticate with the subscription credentials
 in the host's `~/.claude/`.
 
+> [!NOTE]
+> Verified (#85, smoke): a spoke parked at its PLAN gate is **auto-answered** by the afk reasoning answerer — not reaped — as of #84.
+
 > [!IMPORTANT]
 > The default launched command runs the supervisor **script** (`hub-afk.sh drain`), not
 > `claude "/afk drain"`. A bare `claude` prompt opens an interactive session that would
