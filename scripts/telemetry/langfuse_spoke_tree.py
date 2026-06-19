@@ -21,9 +21,10 @@ Re-parenting rules for each source observation:
 
 - It had a ``parentObservationId`` -> the copy points at the copy of that parent.
 - It was a trace-root interaction / marker / lifecycle / script -> the synthetic root.
-- It was a trace-root hook (name ends ``.sh`` or ``kind == hook``) -> the copy of the
-  tool whose ``tool_use_id`` matches the hook's ``metadata.tool_use_id``; or the
-  synthetic root when there is no id or no match.
+- It was a trace-root hook (name ends ``.sh`` or ``metadata.attributes.workflow.kind ==
+  hook``) -> the copy of the tool whose ``tool_use_id`` matches the hook's
+  ``metadata.attributes.tool_use_id``; or the synthetic root when there is no id or no
+  match. (Langfuse nests OTel span attributes under ``metadata["attributes"]``.)
 
 All ids derive from the spoke run id and the source ``(trace_id, observation_id)`` pair,
 so a rerun overwrites the same trace/observations instead of appending. This trace
@@ -105,20 +106,36 @@ def _copy_id(orig_trace_id: str, orig_obs_id: str) -> str:
 
 
 def _tool_use_id(observation: Observation) -> str | None:
-    """Return the tool-call id from an observation's metadata, or None if absent."""
+    """Return the tool-call id from an observation's metadata, or None if absent.
+
+    Langfuse stores OTel span attributes nested under ``metadata["attributes"]``, so each
+    candidate key is read from there first and only then from the top level (a fallback for
+    flatter shapes).
+    """
     metadata = observation.get("metadata") or {}
+    attributes = metadata.get("attributes") or {}
     for key in _TOOL_USE_ID_KEYS:
-        value = metadata.get(key)
+        value = attributes.get(key) or metadata.get(key)
         if value:
             return str(value)
     return None
 
 
 def _is_hook(observation: Observation) -> bool:
-    """Whether an observation is a hook emission (a ``*.sh`` trace or ``kind == hook``)."""
+    """Whether an observation is a hook emission.
+
+    Detected by a ``*.sh`` name or a ``workflow.kind == "hook"`` span attribute (nested
+    under ``metadata["attributes"]`` by Langfuse), with a top-level ``kind == "hook"`` kept
+    as a fallback for flatter shapes.
+    """
     name = observation.get("name") or ""
     metadata = observation.get("metadata") or {}
-    return name.endswith(".sh") or metadata.get("kind") == "hook"
+    attributes = metadata.get("attributes") or {}
+    return (
+        name.endswith(".sh")
+        or attributes.get("workflow.kind") == "hook"
+        or metadata.get("kind") == "hook"
+    )
 
 
 def _build_tool_index(traces: list[TraceObservations]) -> dict[str, str]:

@@ -47,7 +47,20 @@ def _obs(
 def _traces() -> list[tuple[str, list[dict]]]:
     """Four source traces: an interaction tree, a marker, a matching hook, a stray hook."""
     interaction = _obs("i1", "claude_code.interaction", parent=None, metadata={"kind": "turn"})
-    tool = _obs("t1", "Bash", parent="i1", metadata={"kind": "tool", "tool_use_id": "tu-1"})
+    # Real Langfuse nests OTel span attributes under metadata["attributes"]; a tool carries
+    # tool_use_id there (== gen_ai.tool.call.id).
+    tool = _obs(
+        "t1",
+        "Bash",
+        parent="i1",
+        metadata={
+            "attributes": {
+                "tool_name": "Bash",
+                "tool_use_id": "tu-1",
+                "gen_ai.tool.call.id": "tu-1",
+            }
+        },
+    )
     generation = _obs(
         "g1",
         "llm_request",
@@ -67,13 +80,26 @@ def _traces() -> list[tuple[str, list[dict]]]:
         metadata={"kind": "turn", "rollup": {"input": 120}},
     )
     marker = _obs("m1", "step:green", parent=None, metadata={"kind": "step"})
+    # A hook's signal is workflow.kind == "hook" and its tool_use_id, both nested under
+    # metadata["attributes"] just like a real Langfuse observation.
     hook_match = _obs(
         "h1",
         "PreToolUse.sh",
         parent=None,
-        metadata={"hook_event": "PreToolUse", "tool_use_id": "tu-1"},
+        metadata={
+            "attributes": {
+                "workflow.kind": "hook",
+                "hook_event": "PreToolUse",
+                "tool_use_id": "tu-1",
+            }
+        },
     )
-    hook_stray = _obs("h2", "Stop.sh", parent=None, metadata={"hook_event": "Stop"})
+    hook_stray = _obs(
+        "h2",
+        "Stop.sh",
+        parent=None,
+        metadata={"attributes": {"workflow.kind": "hook", "hook_event": "Stop"}},
+    )
     return [
         ("trace-int", [interaction, tool, generation]),
         ("trace-marker", [marker]),
@@ -162,6 +188,43 @@ class TestBuildBatch:
 
         stray = _by_orig(batch, "trace-stray", "h2")
         assert stray["body"]["parentObservationId"] == root_id_for(SPOKE)
+
+    def test_hook_matches_tool_via_gen_ai_tool_call_id(self) -> None:
+        # The tool exposes its id only as gen_ai.tool.call.id; the hook references it as
+        # tool_use_id — both nested under metadata["attributes"]. They must still join.
+        tool = _obs(
+            "t9",
+            "Bash",
+            parent=None,
+            metadata={"attributes": {"gen_ai.tool.call.id": "tu-9"}},
+        )
+        hook = _obs(
+            "h9",
+            "PreToolUse.sh",
+            parent=None,
+            metadata={"attributes": {"workflow.kind": "hook", "tool_use_id": "tu-9"}},
+        )
+        traces = [("trace-tool", [tool]), ("trace-hook", [hook])]
+
+        batch = build_batch(traces, SPOKE)
+
+        copy = _by_orig(batch, "trace-hook", "h9")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-tool", "t9")
+
+    def test_hook_detected_by_workflow_kind_without_sh_name(self) -> None:
+        # A hook whose name does not end in ".sh" is still detected via workflow.kind and
+        # collapses to the root when nothing matches its id.
+        hook = _obs(
+            "h8",
+            "hook-emit",
+            parent=None,
+            metadata={"attributes": {"workflow.kind": "hook", "hook_event": "Stop"}},
+        )
+
+        batch = build_batch([("trace-hook", [hook])], SPOKE)
+
+        copy = _by_orig(batch, "trace-hook", "h8")
+        assert copy["body"]["parentObservationId"] == root_id_for(SPOKE)
 
     def test_ids_are_deterministic_across_runs(self) -> None:
         first = {event["id"] for event in build_batch(_traces(), SPOKE)}
