@@ -15,8 +15,12 @@ the matching Langfuse observation's ``input``/``output``::
 The join chain is:
 
 - Step A: fetch the session's traces and observations; map ``tool_use_id -> (observation_id,
-  type)`` for every span carrying a tool-call id in ``metadata["attributes"]`` (Langfuse
-  nests OTel span attributes there) under key ``tool_use_id`` or ``gen_ai.tool.call.id``.
+  type)`` for the VISIBLE tool span only -- an observation whose ``name`` starts with
+  ``tool:`` (e.g. ``tool:TaskCreate``, ``tool:Read``). Many sibling observations share one
+  ``tool_use_id`` -- ``claude_code.tool.execution``, ``claude_code.tool.blocked_on_user``,
+  and the ``*.sh`` hook spans -- so indexing every id-bearing observation would let a hook or
+  execution span shadow the real ``tool:`` span and leave it with ``input=None``. The
+  ``tool:`` name filter keeps exactly one tool span per id as the patch target.
 - Step B: scan the transcripts for ``tool_use`` (id -> input) and ``tool_result``
   (tool_use_id -> content) blocks, keeping only ids present in the Step-A map. Tool-call ids
   are globally unique, so no per-session transcript mapping is needed.
@@ -24,6 +28,11 @@ The join chain is:
   ``span-update``) with ``input`` and, when present, ``output``. The event id is derived from
   the observation id, so a rerun overwrites instead of appending; oversized output is
   truncated with a marker.
+
+Ingestion-event note: ``tool:`` spans are type ``SPAN`` (not ``GENERATION``), and a
+``span-update`` event's body DOES carry ``input``/``output`` (Langfuse's update-span body
+accepts both), so the patch lands on the SPAN observation. ``generation-update`` is reserved
+for the rare GENERATION case; both update-event bodies support ``input``/``output``.
 
 Run BEFORE re-running ``langfuse_spoke_tree.py``: the tree copies ``input``/``output``
 verbatim, so it only picks up the content once these source spans carry it.
@@ -108,11 +117,30 @@ def _tool_use_id(observation: Observation) -> str | None:
     return None
 
 
-def build_span_index(traces: list[TraceObservations]) -> dict[str, ToolSpan]:
-    """Map each tool-call id to the observation that owns it across a session's traces.
+def _is_tool_span(observation: Observation) -> bool:
+    """Whether an observation is the visible ``tool:<Name>`` span (the patch target).
 
-    The first observation seen for a given id wins; later duplicates (e.g. a hook referencing
-    the same id) are ignored so the tool span itself stays the patch target.
+    Many observations share one ``tool_use_id`` -- ``claude_code.tool.execution``,
+    ``claude_code.tool.blocked_on_user``, and ``*.sh`` hook spans -- but only the span whose
+    ``name`` starts with ``tool:`` (e.g. ``tool:TaskCreate``) carries the tool call the user
+    sees; the rest are excluded so they cannot shadow it.
+
+    Args:
+        observation: A Langfuse observation as returned by the public API.
+
+    Returns:
+        True when the observation's name marks it as the visible tool span.
+    """
+    name = observation.get("name") or ""
+    return name.startswith("tool:")
+
+
+def build_span_index(traces: list[TraceObservations]) -> dict[str, ToolSpan]:
+    """Map each tool-call id to the visible ``tool:`` span that owns it across a session.
+
+    Only observations whose name starts with ``tool:`` are indexed (see :func:`_is_tool_span`);
+    sibling hook/execution/blocked spans that share the same ``tool_use_id`` are skipped, so the
+    real tool span stays the patch target. One ``tool_use_id`` maps to exactly one tool span.
 
     Args:
         traces: Each native trace paired with all of its observations.
@@ -123,6 +151,8 @@ def build_span_index(traces: list[TraceObservations]) -> dict[str, ToolSpan]:
     index: dict[str, ToolSpan] = {}
     for _trace_id, observations in traces:
         for observation in observations:
+            if not _is_tool_span(observation):
+                continue
             tuid = _tool_use_id(observation)
             if tuid and tuid not in index:
                 index[tuid] = ToolSpan(observation["id"], observation.get("type") or "SPAN")

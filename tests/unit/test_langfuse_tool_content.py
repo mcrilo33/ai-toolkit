@@ -5,7 +5,9 @@ The filler (:mod:`telemetry.langfuse_tool_content`) joins a session's Langfuse t
 session transcripts, keyed by ``tool_use_id``, and PATCHes ``input``/``output`` back onto the
 matching observation. These tests run with NO network: the index/batch helpers are pure, and
 the transcript scan reads a hand-built ``*.jsonl`` file under ``tmp_path``. They assert the
-input/output join, GENERATION-vs-SPAN event routing, skipping of ids absent from Langfuse,
+input/output join, that only the visible ``tool:`` span is indexed (not the
+``claude_code.tool.execution`` / ``*.sh`` hook siblings that share its ``tool_use_id``),
+GENERATION-vs-SPAN event routing, skipping of ids absent from Langfuse,
 ``metadata["attributes"]`` nesting, deterministic ids, and large-output truncation.
 """
 
@@ -30,12 +32,23 @@ from telemetry.langfuse_tool_content import (
 )
 
 
-def _obs(obs_id: str, *, type_: str = "SPAN", tool_use_id: str | None = None, **attrs) -> dict:
-    """Build a Langfuse observation carrying a tool-call id under metadata["attributes"]."""
+def _obs(
+    obs_id: str,
+    *,
+    type_: str = "SPAN",
+    tool_use_id: str | None = None,
+    name: str = "tool:Generic",
+    **attrs,
+) -> dict:
+    """Build a Langfuse observation carrying a tool-call id under metadata["attributes"].
+
+    ``name`` defaults to a ``tool:`` span (the visible tool observation, which is the patch
+    target); pass an execution/hook name to build a sibling that must be excluded.
+    """
     attributes: dict[str, object] = dict(attrs)
     if tool_use_id is not None:
         attributes["tool_use_id"] = tool_use_id
-    return {"id": obs_id, "type": type_, "metadata": {"attributes": attributes}}
+    return {"id": obs_id, "type": type_, "name": name, "metadata": {"attributes": attributes}}
 
 
 def _write_transcript(root: Path, name: str, records: list[dict]) -> None:
@@ -71,6 +84,7 @@ class TestBuildSpanIndex:
         obs = {
             "id": "o-g",
             "type": "GENERATION",
+            "name": "tool:WebSearch",
             "metadata": {"attributes": {"gen_ai.tool.call.id": "tu-9"}},
         }
 
@@ -79,19 +93,23 @@ class TestBuildSpanIndex:
         assert index == {"tu-9": ToolSpan("o-g", "GENERATION")}
 
     def test_observation_without_tool_use_id_is_skipped(self) -> None:
-        obs = {"id": "o-int", "type": "SPAN", "metadata": {"attributes": {"tool_name": "Bash"}}}
+        obs = {"id": "o-int", "type": "SPAN", "name": "tool:Bash", "metadata": {"attributes": {}}}
 
         index = build_span_index([("trace", [obs])])
 
         assert index == {}
 
-    def test_first_observation_for_an_id_wins_over_a_hook(self) -> None:
-        tool = _obs("o-tool", tool_use_id="tu-1")
-        hook = _obs("o-hook", tool_use_id="tu-1")
+    def test_only_the_tool_span_is_indexed_not_hook_or_execution_siblings(self) -> None:
+        # All four observations share tu-1; the execution/hook/blocked siblings appear BEFORE
+        # the visible tool: span, yet only the tool: span must end up in the index.
+        execution = _obs("o-exec", name="claude_code.tool.execution", tool_use_id="tu-1")
+        hook = _obs("o-hook", name="pre-tool-use.sh", tool_use_id="tu-1")
+        blocked = _obs("o-blocked", name="claude_code.tool.blocked_on_user", tool_use_id="tu-1")
+        tool = _obs("o-tool", name="tool:TaskCreate", tool_use_id="tu-1")
 
-        index = build_span_index([("trace", [tool, hook])])
+        index = build_span_index([("trace", [execution, hook, blocked, tool])])
 
-        assert index["tu-1"] == ToolSpan("o-tool", "SPAN")
+        assert index == {"tu-1": ToolSpan("o-tool", "SPAN")}
 
 
 class TestScanTranscripts:
@@ -229,3 +247,39 @@ class TestBuildBatch:
         by_obs = {event["body"]["id"]: event["body"] for event in batch}
         assert by_obs["o-task"] == {"id": "o-task", "input": {"subject": "S"}, "output": "created"}
         assert by_obs["o-read"] == {"id": "o-read", "input": {"file_path": "/p"}}
+
+    def test_content_patches_the_tool_span_not_its_execution_or_hook_siblings(
+        self, tmp_path: Path
+    ) -> None:
+        # tool:TaskCreate, claude_code.tool.execution, and a *.sh hook all share tu-1.
+        index = build_span_index(
+            [
+                (
+                    "trace",
+                    [
+                        _obs("o-exec", name="claude_code.tool.execution", tool_use_id="tu-1"),
+                        _obs("o-hook", name="post-tool-use.sh", tool_use_id="tu-1"),
+                        _obs("o-task", name="tool:TaskCreate", tool_use_id="tu-1"),
+                    ],
+                )
+            ]
+        )
+        _write_transcript(
+            tmp_path,
+            "s.jsonl",
+            [
+                _tool_use("tu-1", "TaskCreate", {"subject": "ship it"}),
+                _tool_result("tu-1", "Task #1 created"),
+            ],
+        )
+
+        batch = build_batch(index, scan_transcripts(tmp_path, set(index)))
+
+        # Exactly one event, targeting the tool: span -- never the execution/hook siblings.
+        assert [event["body"]["id"] for event in batch] == ["o-task"]
+        assert batch[0]["type"] == "span-update"
+        assert batch[0]["body"] == {
+            "id": "o-task",
+            "input": {"subject": "ship it"},
+            "output": "Task #1 created",
+        }
