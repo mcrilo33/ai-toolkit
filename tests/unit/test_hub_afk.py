@@ -230,6 +230,42 @@ def _ask_record(question: str, options: list[tuple[str, str]]) -> dict:
     }
 
 
+def _gate_park_records(
+    issue: int, plan: str = "Plan: do X then Y. Reply to approve."
+) -> list[dict]:
+    """Transcript of a PLAN-gate park: an assistant turn that prints the plan prose and
+    runs `spoke-ready.sh --gate <issue>` (no AskUserQuestion), then that Bash's tool_result.
+    """
+    return [
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": plan},
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "id": "tu_gate",
+                        "input": {"command": f"bash scripts/spoke-ready.sh --gate {issue}"},
+                    },
+                ]
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu_gate",
+                        "content": f"emitted gate/{issue}",
+                    }
+                ]
+            },
+        },
+    ]
+
+
 def test_extract_pending_question_reads_open_ask(tmp_path: Path) -> None:
     projects = tmp_path / "projects"
     wt = tmp_path / "wt"
@@ -292,6 +328,22 @@ def test_extract_pending_question_empty_when_working(tmp_path: Path) -> None:
     assert result.stdout.strip() == ""
 
 
+def test_extract_pending_question_returns_plan_on_gate_park(tmp_path: Path) -> None:
+    # A PLAN-gate park has no AskUserQuestion (prose plan + a `spoke-ready.sh --gate`
+    # Bash). The answerer still needs the plan to reason about, so extract returns it.
+    projects = tmp_path / "projects"
+    wt = tmp_path / "wt"
+    pd = _project_dir_for(projects, wt)
+    _write_transcript(pd, _gate_park_records(5))
+
+    result = _call(
+        f"extract_pending_question '{wt}'",
+        env={"CLAUDE_PROJECTS_DIR": str(projects)},
+    )
+
+    assert "Plan: do X then Y. Reply to approve." in result.stdout
+
+
 # ── slot_state against a throwaway "spoke" git repo ───────────────────────────
 
 
@@ -332,6 +384,28 @@ def test_slot_state_waiting_when_parked_on_question(spoke_repo: Path, tmp_path: 
     _write_transcript(pd, [_ask_record("Which approach?", [("A", "simple")])])
 
     result = _call(f"slot_state '{spoke_repo}' 5", env={"CLAUDE_PROJECTS_DIR": str(projects)})
+
+    assert result.stdout.strip() == "waiting"
+
+
+def test_slot_state_waiting_on_gate_tag_at_tip(spoke_repo: Path, tmp_path: Path) -> None:
+    # A spoke parked at its PLAN gate pushes gate/<issue> at the tip and prints prose (no
+    # AskUserQuestion). The tag, not a pending question, marks it waiting — and that wins
+    # over the idle-reap check even when the spoke has been idle past AFK_IDLE_MINUTES.
+    subprocess.run(["git", "tag", "gate/5"], cwd=spoke_repo, check=True, capture_output=True)
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    # A plain assistant turn (no question, no notification) so extract_pending_question is
+    # empty — the gate tag is the only waiting signal.
+    _write_transcript(
+        pd, [{"type": "assistant", "message": {"content": [{"type": "text", "text": "parked"}]}}]
+    )
+    os.utime(pd / "session.jsonl", (1_000_000_000, 1_000_000_000))  # idle far past the ceiling
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={"CLAUDE_PROJECTS_DIR": str(projects), "AFK_IDLE_MINUTES": "0"},
+    )
 
     assert result.stdout.strip() == "waiting"
 
@@ -554,6 +628,55 @@ def test_decide_and_act_injects_and_emits_success_span(spoke_repo: Path, tmp_pat
     span = json.loads((tel_dir / "events.jsonl").read_text().strip().splitlines()[-1])
     assert span["kind"] == "agent" and span["name"] == "afk-answer"
     assert span["status"] == "success"
+
+
+def test_decide_and_act_consumes_gate_tag_on_inject(spoke_repo: Path, tmp_path: Path) -> None:
+    # When the answerer approves a PLAN-gate park and the answer injects successfully, the
+    # gate/<issue> tag must be consumed — otherwise the next tick re-reads it at the tip
+    # (the spoke has not committed its first RED/GREEN yet) and re-answers the same gate.
+    subprocess.run(["git", "tag", "gate/5"], cwd=spoke_repo, check=True, capture_output=True)
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _write_transcript(pd, _gate_park_records(5))
+    jsonl = pd / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # backdate so the reaction is newer
+
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+    ready_stub.chmod(0o755)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        f'  send-keys) case "$*" in *Enter*) printf "{{}}\\n" >> "{jsonl}" ;; esac ;;\n'
+        "esac\nexit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "SPOKE_READY": str(ready_stub),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_ANSWERER_CMD": "printf 'ANSWER: approved, proceed'",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+    }
+
+    result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    tag = subprocess.run(
+        ["git", "rev-parse", "-q", "--verify", "refs/tags/gate/5"],
+        cwd=spoke_repo,
+        capture_output=True,
+        text=True,
+    )
+    assert tag.returncode != 0, "the gate/5 tag must be consumed after a successful inject"
 
 
 def test_decide_and_act_escalates_when_answer_does_not_register(
