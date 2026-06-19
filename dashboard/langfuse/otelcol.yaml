@@ -11,6 +11,15 @@
 #   3. Content mapping. user_prompt + tool command/output (opt-in OTEL_LOG_* flags) →
 #      langfuse.observation.input/output so prompts and per-tool I/O render. LLM
 #      assistant text is not in traces (it goes to the OTel logs signal).
+#   4. Message bridge. The LLM request/response bodies (the conversation messages) ride
+#      the OTel *logs* signal (api_request_body / api_response_body) with no trace ids, so
+#      Langfuse can't attach them. This config forks BOTH traces and a new `logs` pipeline
+#      to an out-of-band sidecar — scripts/telemetry/langfuse_message_bridge.py via the
+#      `otlphttp/bridge` exporter (${env:BRIDGE_OTLP_ENDPOINT}) — which joins
+#      prompt.id→request_id→span_id and PATCHes each llm_request observation's input/output.
+#      The spoke must export OTEL_LOGS_EXPORTER=otlp and OTEL_LOG_RAW_API_BODIES=1 to emit
+#      the bodies. Caveat: request bodies over ~60KB are truncated by Claude Code (invalid
+#      JSON → the bridge stores the raw partial as input); thinking blocks arrive <REDACTED>.
 #
 # It also re-homes each span's Langfuse session onto the spoke (`spoke_run_id`), so one
 # spoke — across Claude Code resumes — is one Langfuse session.
@@ -20,15 +29,23 @@
 #
 #   export LANGFUSE_OTLP_ENDPOINT=http://host.docker.internal:3000/api/public/otel
 #   export LANGFUSE_BASIC_AUTH="Basic $(printf 'pk-lf-…:sk-lf-…' | base64)"
+#   export BRIDGE_OTLP_ENDPOINT=http://host.docker.internal:4319   # the message-bridge sidecar
 #   docker run -d --name lf-collector --add-host=host.docker.internal:host-gateway \
-#     -p 4318:4318 -e LANGFUSE_OTLP_ENDPOINT -e LANGFUSE_BASIC_AUTH \
+#     -p 4318:4318 -e LANGFUSE_OTLP_ENDPOINT -e LANGFUSE_BASIC_AUTH -e BRIDGE_OTLP_ENDPOINT \
 #     -v "$PWD/dashboard/langfuse/otelcol.yaml:/etc/otelcol-contrib/config.yaml" \
 #     otel/opentelemetry-collector-contrib:latest
 #
-# Then point a spoke at it (the Issue #83 opt-in gate already wires the rest):
+# Run the message bridge on the host (it receives the forked traces+logs on :4319):
+#   LANGFUSE_BASIC_AUTH="$LANGFUSE_BASIC_AUTH" \
+#     python3 scripts/telemetry/langfuse_message_bridge.py
+#
+# Then point a spoke at it (the Issue #83 opt-in gate already wires the rest). The two
+# OTEL_LOG_RAW_API_BODIES / OTEL_LOGS_EXPORTER vars make Claude Code emit the LLM message
+# bodies on the logs signal the bridge consumes:
 #   AI_TOOLKIT_OTEL=1  OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
 #   ENABLE_BETA_TRACING_DETAILED=1  BETA_TRACING_ENDPOINT=http://localhost:4318 \
 #   OTEL_LOG_USER_PROMPTS=1  OTEL_LOG_TOOL_DETAILS=1  OTEL_LOG_TOOL_CONTENT=1 \
+#   OTEL_LOGS_EXPORTER=otlp  OTEL_LOG_RAW_API_BODIES=1 \
 #     scripts/worktree-new.sh <issue> <slug>
 
 receivers:
@@ -80,10 +97,23 @@ exporters:
     endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
     headers:
       Authorization: ${env:LANGFUSE_BASIC_AUTH}
+  # Forks traces + logs to the host-side message bridge (langfuse_message_bridge.py),
+  # which joins the LLM message bodies onto their llm_request observations. JSON encoding
+  # (the bridge speaks OTLP/HTTP JSON), no compression, plain HTTP to the host sidecar.
+  otlphttp/bridge:
+    endpoint: ${env:BRIDGE_OTLP_ENDPOINT}
+    encoding: json
+    compression: none
+    tls:
+      insecure: true
 
 service:
   pipelines:
     traces:
       receivers: [otlp]
       processors: [transform/langfuse, batch]
-      exporters: [otlphttp/langfuse]
+      exporters: [otlphttp/langfuse, otlphttp/bridge]
+    # Raw API bodies arrive on the logs signal; the bridge is their only consumer.
+    logs:
+      receivers: [otlp]
+      exporters: [otlphttp/bridge]

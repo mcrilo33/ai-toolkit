@@ -115,6 +115,58 @@ exercise (consistent with the comparison below, not contradicting it):
 - The spans carry **token/latency** attributes but **no dollar cost** — reconfirming that
   cost reconciliation is not native (see below).
 
+## LLM messages on spans (message bridge)
+
+The native wiring above renders the span *tree* — turns, tools, sub-agents — but the
+`llm_request` observations come up empty: Claude Code does **not** put the LLM request and
+response bodies (the actual conversation messages) on the trace spans. It emits them on the
+OTel **logs** signal instead, as the events `api_request_body` and `api_response_body`, and
+those log records carry **no** `trace_id`/`span_id`. Langfuse trace ingestion never reads
+the logs signal, so on its own it can't attach the messages to the matching observation.
+
+`scripts/telemetry/langfuse_message_bridge.py` closes that gap. The collector forks both
+signals to it (the `otlphttp/bridge` exporter on the `traces` and a new `logs` pipeline),
+and the bridge joins them by the ids already in the data, then PATCHes each Langfuse
+observation's input/output (Langfuse observation id == OTel `span_id`) via a
+`generation-update` ingestion event. The join chain, derived from the real telemetry:
+
+```text
+api_request_body.prompt.id --(api_request maps prompt.id→request_id)--> request_id
+request_id --(the llm_request span carries request_id)--> span_id
+api_response_body.request_id ----------------------------------------> span_id
+```
+
+Both signals are buffered and re-resolved as each piece arrives, so trace/log ordering is
+irrelevant — a message that lands before its span waits and flushes the moment the span
+shows up.
+
+### Running it
+
+The bridge is stdlib-only and runs on the host beside the collector:
+
+```bash
+# the collector reaches it at ${env:BRIDGE_OTLP_ENDPOINT} (e.g. host.docker.internal:4319)
+LANGFUSE_BASIC_AUTH="Basic $(printf 'pk-lf-…:sk-lf-…' | base64)" \
+  python3 scripts/telemetry/langfuse_message_bridge.py
+```
+
+`LANGFUSE_HOST` (default `http://localhost:3000`) and `BRIDGE_PORT` (default `4319`) are the
+other knobs. The spoke must additionally export `OTEL_LOGS_EXPORTER=otlp` and
+`OTEL_LOG_RAW_API_BODIES=1` so Claude Code actually emits the bodies; the collector and the
+exact `docker run` / spoke-launch lines are documented in the header of
+[`dashboard/langfuse/otelcol.yaml`](../dashboard/langfuse/otelcol.yaml).
+
+### Caveats
+
+- **60KB truncation.** Request bodies over ~60KB hit Claude Code's body cap and arrive as
+  truncated, invalid JSON. The bridge falls back to storing the raw partial text as the
+  observation input, so the request start is still visible rather than dropped.
+- **Redacted thinking.** Extended-thinking blocks come through as `<REDACTED>`; the bridge
+  forwards them verbatim — it does not (and cannot) reconstruct them.
+- **Content leaves the box.** Like the opt-in `OTEL_LOG_*` content flags, raw API bodies
+  ship the full conversation to the collector and Langfuse, so this stays operator opt-in,
+  not part of the `AI_TOOLKIT_OTEL` gate.
+
 ## Native view vs the custom dashboard
 
 | Capability | Native OTel trace | Custom dashboard |
