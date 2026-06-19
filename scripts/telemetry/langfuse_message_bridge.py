@@ -8,22 +8,31 @@ the log records carry no trace_id/span_id. Langfuse therefore cannot attach them
 
 This bridge receives both signals (the collector forwards them here as OTLP/HTTP JSON) and
 joins them to patch the matching Langfuse observation's input/output (Langfuse observation
-id == OTel span_id) via a ``generation-update`` ingestion event. The join chain, derived
-from the actual telemetry, is::
+id == OTel span_id) via a ``generation-update`` ingestion event.
 
-    api_request_body.prompt.id --(api_request)--> request_id --(llm_request span)--> span_id
-    api_response_body.request_id --------------------------------------------------> span_id
+The input join is *per call*. One ``prompt.id`` spans an entire user turn, so it cannot key
+a single API call -- every call of an agent loop shares it. The per-call key is
+``event.sequence`` instead. An ``api_request`` log carries ``request_id`` + ``event.sequence``
+(no body); an ``api_request_body`` log carries the body + ``event.sequence`` but no
+``request_id``. A body is paired with the *next* ``api_request`` -- the one whose recorded
+sequence is the smallest strictly greater than the body's -- to recover its ``request_id``,
+which the ``llm_request`` span then maps to a span_id. The join chain, derived from the
+actual telemetry, is::
+
+    output: api_response_body.request_id ---------------(llm_request span)--> span_id
+    input : api_request_body.event.sequence --(next api_request)--> request_id
+                                             --(llm_request span)--> span_id
+
+The input value is *only the last message* of the request body's ``messages`` array (the new
+user/tool_result turn). Every call resends the whole growing conversation, and Claude Code
+truncates the body at 60KB from the front, so the full request is near-identical noise across
+calls; the last message is the only distinguishing, useful part. :func:`_last_message` is
+tolerant of the truncation: it full-parses the JSON when possible, else scans the array
+bracket-/quote-aware and returns the last element that closed before the cut.
 
 Everything is buffered and re-resolved as the pieces arrive, so signal ordering is
-irrelevant. Stdlib only; runs on the host, reached by the collector at
-``host.docker.internal:4319``.
-
-Caveats preserved from the real telemetry:
-
-* Request bodies over ~60KB hit Claude Code's body cap and are truncated to invalid JSON;
-  the raw partial text is stored as the input so the request start is still visible.
-* Response bodies parse cleanly.
-* ``thinking`` blocks arrive as ``<REDACTED>``.
+irrelevant (an ``api_request_body`` may arrive before its ``api_request`` or its span).
+Stdlib only; runs on the host, reached by the collector at ``host.docker.internal:4319``.
 
 Import-safe: no environment is read at import time, so the resolver can be unit-tested
 without any Langfuse credentials. Configuration is read in :func:`main`.
@@ -32,6 +41,7 @@ without any Langfuse credentials. Configuration is read in :func:`main`.
 from __future__ import annotations
 
 import base64
+import contextlib
 import gzip
 import json
 import logging
@@ -55,18 +65,19 @@ PatchFn = Callable[[str, str, object], None]
 class PendingItem(TypedDict):
     """A buffered input/output patch awaiting its span to resolve."""
 
-    key: str  # join key: a prompt.id (ktype "prompt") or request_id (ktype "req")
-    ktype: str  # "prompt" or "req"
+    key: int | str  # join key: an event.sequence (ktype "seq") or request_id (ktype "req")
+    ktype: str  # "seq" or "req"
     field: str  # Langfuse observation field: "input" or "output"
-    value: object  # the structured messages/content, or raw truncated text
+    value: object  # the last request message, or the response content
 
 
 def _attr(attrs: list[dict[str, Any]], key: str) -> str | None:
     """Return the string value of OTLP attribute ``key``, or None if absent.
 
     OTLP/JSON wraps each value in a typed envelope. Every attribute this bridge reads
-    (``event.name``, ``request_id``, ``prompt.id``, ``body``) is a string; int/bool values
-    are coerced to ``str`` for defensiveness so callers always get a key-usable value.
+    (``event.name``, ``request_id``, ``event.sequence``, ``body``) is read as a string;
+    int/bool values are coerced to ``str`` for defensiveness so callers always get a
+    key-usable value.
 
     Args:
         attrs: The OTLP attribute list from a span or log record.
@@ -108,6 +119,83 @@ def _hexid(raw: str) -> str:
         return s
 
 
+def _last_message(raw: str) -> object | None:
+    """Return the last (complete) element of the request body's ``messages`` array.
+
+    The last message is the new user/tool_result turn -- the only part that distinguishes
+    one API call from the next, since each call resends the whole conversation. Full-parses
+    the JSON when possible; on the 60KB truncation (which yields invalid JSON) it falls back
+    to a tolerant scan of the array.
+
+    Args:
+        raw: The raw ``api_request_body`` text, possibly truncated to invalid JSON.
+
+    Returns:
+        The last complete message object, or None when no complete message is present.
+    """
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError:
+        doc = None
+    if isinstance(doc, dict):
+        msgs = doc.get("messages")
+        if isinstance(msgs, list) and msgs:
+            return msgs[-1]
+    return _scan_last_message(raw)
+
+
+def _scan_last_message(raw: str) -> object | None:
+    """Scan a (possibly truncated) request body for the last complete ``messages`` element.
+
+    The body may be cut mid-element by the 60KB cap, leaving invalid JSON. Walk the
+    ``messages`` array tracking bracket depth and string state, parsing each top-level
+    element as it closes; the last one that closed before the cut is the newest complete
+    message.
+
+    Args:
+        raw: The raw (possibly truncated) ``api_request_body`` text.
+
+    Returns:
+        The last complete message object, or None when none closed before the cut.
+    """
+    marker = raw.find('"messages"')
+    if marker < 0:
+        return None
+    start = raw.find("[", marker)
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    elem_start: int | None = None
+    last: object | None = None
+    for i in range(start, len(raw)):
+        c = raw[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c in "[{":
+            if depth == 1 and c == "{":
+                elem_start = i
+            depth += 1
+        elif c in "]}":
+            depth -= 1
+            if c == "}" and depth == 1 and elem_start is not None:
+                with contextlib.suppress(json.JSONDecodeError):
+                    last = json.loads(raw[elem_start : i + 1])
+                elem_start = None
+            if depth == 0:
+                break
+    return last
+
+
 def make_langfuse_patch(host: str, auth: str) -> PatchFn:
     """Build a patch function that PATCHes a Langfuse observation via ingestion.
 
@@ -145,12 +233,14 @@ def make_langfuse_patch(host: str, auth: str) -> PatchFn:
 
 
 class Bridge:
-    """Order-independent join of LLM message logs onto their ``llm_request`` spans.
+    """Per-call, order-independent join of LLM message logs onto ``llm_request`` spans.
 
     Spans supply ``request_id -> span_id``; ``api_request`` logs supply
-    ``prompt.id -> request_id``; ``api_request_body`` / ``api_response_body`` logs carry the
-    input/output to patch. Items whose span has not arrived yet are buffered and re-resolved
-    on every subsequent span or log batch, so the two signals may arrive in any order.
+    ``event.sequence -> request_id``; ``api_request_body`` carries the input (keyed by its
+    own ``event.sequence``, paired with the next ``api_request``) and ``api_response_body``
+    carries the output (keyed directly by ``request_id``). Items whose span has not arrived
+    yet -- or whose ``api_request`` pairing is not yet known -- are buffered and re-resolved
+    on every subsequent span or log batch, so the signals may arrive in any order.
     """
 
     def __init__(self, patch: PatchFn) -> None:
@@ -163,7 +253,7 @@ class Bridge:
         self._lock = threading.Lock()
         self._patch = patch
         self._span_by_req: dict[str, str] = {}  # request_id -> span_id (hex)
-        self._req_by_prompt: dict[str, str] = {}  # prompt.id -> request_id
+        self._req_seq: list[tuple[int, str]] = []  # (api_request event.sequence, request_id)
         self._pending: list[PendingItem] = []
 
     def pending_count(self) -> int:
@@ -201,29 +291,29 @@ class Bridge:
 
     def _ingest_log(self, attrs: list[dict[str, Any]]) -> None:
         event = _attr(attrs, "event.name")
-        request_id, prompt_id = _attr(attrs, "request_id"), _attr(attrs, "prompt.id")
-        if event == "api_request" and prompt_id and request_id:
-            self._req_by_prompt[prompt_id] = request_id  # link prompt.id <-> request_id
+        if event == "api_request":
+            request_id, seq = _attr(attrs, "request_id"), _attr(attrs, "event.sequence")
+            if request_id and seq is not None:
+                self._req_seq.append((int(seq), request_id))  # pair body -> next request
             return
         raw = _attr(attrs, "body")
         if not raw:
             return
-        try:
-            doc = json.loads(raw)
-        except json.JSONDecodeError:
-            doc = {"raw": raw}
-        if event == "api_request_body" and prompt_id:
-            # Large requests hit Claude Code's 60KB body cap -> truncated, invalid JSON;
-            # fall back to the raw (partial) text so the request start is still visible.
-            value: object = (
-                {"system": doc.get("system"), "messages": doc["messages"]}
-                if "messages" in doc
-                else raw
-            )
+        if event == "api_request_body":
+            seq = _attr(attrs, "event.sequence")
+            if seq is None:
+                return
             self._pending.append(
-                {"key": prompt_id, "ktype": "prompt", "field": "input", "value": value}
+                {"key": int(seq), "ktype": "seq", "field": "input", "value": _last_message(raw)}
             )
-        elif event == "api_response_body" and request_id:
+        elif event == "api_response_body":
+            request_id = _attr(attrs, "request_id")
+            if not request_id:
+                return
+            try:
+                doc = json.loads(raw)
+            except json.JSONDecodeError:
+                doc = {"raw": raw}
             self._pending.append(
                 {
                     "key": request_id,
@@ -233,18 +323,35 @@ class Bridge:
                 }
             )
 
-    def _resolve(self, key: str, ktype: str) -> str | None:
+    def _req_for_body(self, seq: int) -> str | None:
+        """Return the request_id of the api_request that follows this body.
+
+        An ``api_request_body`` has ``event.sequence`` but no ``request_id``; it is paired
+        with the ``api_request`` whose recorded sequence is the smallest strictly greater
+        than the body's (e.g. body seq 30 -> request seq 37).
+
+        Args:
+            seq: The body's ``event.sequence``.
+
+        Returns:
+            The paired request_id, or None when no later api_request has been seen yet.
+        """
+        after = [(s, r) for s, r in self._req_seq if s > seq]
+        return min(after)[1] if after else None
+
+    def _resolve(self, item: PendingItem) -> str | None:
         """Map a pending item's join key to a span_id, following the chain when needed."""
-        if ktype == "req":
-            return self._span_by_req.get(key)
-        request_id = self._req_by_prompt.get(key)
+        key = item["key"]
+        if item["ktype"] == "req":
+            return self._span_by_req.get(key) if isinstance(key, str) else None
+        request_id = self._req_for_body(key) if isinstance(key, int) else None
         return self._span_by_req.get(request_id) if request_id else None
 
     def _try_flush(self) -> None:
         """Patch every pending item whose join key now resolves; drop it once patched."""
         still: list[PendingItem] = []
         for item in self._pending:
-            span_id = self._resolve(item["key"], item["ktype"])
+            span_id = self._resolve(item)
             if span_id:
                 self._patch(span_id, item["field"], item["value"])
             else:
