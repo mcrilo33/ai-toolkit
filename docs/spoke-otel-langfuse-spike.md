@@ -242,6 +242,46 @@ Notes and limits:
 - **Skills are not covered.** A skill's work is not nested under the `Skill` span, so it is
   not attributed to that span's subtree. Covering skills needs a scope rule; deferred.
 
+## Single nested spoke-tree (`langfuse_spoke_tree.py`)
+
+Natively, each turn Claude Code runs lands as its own flat Langfuse trace, so one spoke
+reads as dozens of disconnected traces with no parent-child relationship between them.
+`scripts/telemetry/langfuse_spoke_tree.py` re-assembles the spoke into **one** nested
+trace. It reuses the dashboard's strict causal forest builder
+(`SpanStore.spoke_causal_forest`) — the same tree the dashboard renders — so it does not
+reinvent causality: turns own their cost, with tools, sub-agents, and hooks nested
+underneath and the marker spine (`step:red`, `step:green`, …) threading the lifecycle.
+
+The forest is walked depth-first and shipped to Langfuse via the same ingestion endpoint
+and `LANGFUSE_HOST` / `LANGFUSE_BASIC_AUTH` env vars as the rollup and message bridge:
+
+```bash
+LANGFUSE_HOST=http://localhost:3000 LANGFUSE_BASIC_AUTH="Basic <base64(pk:sk)>" \
+    python3 scripts/telemetry/langfuse_spoke_tree.py <spoke_run_id>
+```
+
+The emission shape:
+
+- One `trace-create` (`sessionId = spoke_run_id`, name `spoke-tree:<spoke_run_id>`), then
+  one observation per node. A token-bearing node (a `turn` or sub-`agent` that carries
+  tokens/cost) becomes a `generation-create` with `usageDetails` (`input`, `output`,
+  `cache_read_input_tokens`, `cache_creation_input_tokens`); every other node becomes a
+  `span-create`. Each node carries `metadata = {kind, status, rollup}` and links to its
+  parent via `parentObservationId` (omitted for roots).
+- Node times use the node's absolute `ts_start`/`ts_end` when present; otherwise sequential
+  windows are synthesized from `duration_ms` so ordering and nesting still render.
+
+Notes and limits:
+
+- **Run it after the per-turn native traces are ingested** — it is a post-run assembled
+  view layered on top of them.
+- **It duplicates the native per-turn traces by design.** The native traces stay; this is
+  the additional, single-tree view of the whole spoke. Filter to `name = spoke-tree:*` (or
+  the `spoketree-` trace-id prefix) to see only the assembled trees.
+- **Idempotent.** The trace id and every observation id derive from the spoke run id and
+  the node's tree path, so a rerun overwrites the same trace/observations rather than
+  appending duplicates.
+
 ## Loaded-context cost baseline (`measure_context_cost.py`)
 
 Claude Code writes a session prefix to the prompt cache on the first call of a session;
