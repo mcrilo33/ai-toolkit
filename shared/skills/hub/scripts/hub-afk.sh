@@ -276,6 +276,7 @@ import json, os
 
 pending = None        # list of formatted AskUserQuestion questions, or None
 last_asst_text = ""   # text of the most recent assistant message
+gate_plan = ""        # plan prose of a PLAN-gate park (spoke-ready.sh --gate), or ""
 last_type = None
 try:
     with open(os.environ["_AFK_JSONL"]) as fh:
@@ -293,7 +294,7 @@ try:
                     pending = None
                 continue
             if last_type == "assistant":
-                asks, texts = [], []
+                asks, texts, gate_here = [], [], False
                 for block in content:
                     if not isinstance(block, dict):
                         continue
@@ -307,11 +308,22 @@ try:
                                 desc = (opt.get("description") or "").strip()
                                 lines.append(f"  - {label}: {desc}" if desc else f"  - {label}")
                             asks.append("\n".join(lines))
+                    elif block.get("type") == "tool_use" and block.get("name") == "Bash":
+                        if "spoke-ready.sh --gate" in ((block.get("input") or {}).get("command") or ""):
+                            gate_here = True
                 if texts:
                     last_asst_text = "\n".join(t for t in texts if t).strip()
                 pending = asks or None
+                # A PLAN-gate park = prose plan + a `spoke-ready.sh --gate` Bash, no
+                # AskUserQuestion. Remember the plan so the answerer has it to reason about.
+                if gate_here:
+                    gate_plan = last_asst_text
             elif last_type == "user":
-                pending = None
+                # A real human reply (a text block) means the spoke is no longer parked;
+                # a tool_result-only user turn (e.g. the gate Bash's result) does NOT.
+                if any(isinstance(b, dict) and b.get("type") == "text" for b in content):
+                    pending = None
+                    gate_plan = ""
 except Exception:
     pass
 
@@ -320,6 +332,8 @@ if pending:
     out = "\n\n".join(pending)
 elif last_type == "notification":
     out = last_asst_text
+elif gate_plan:
+    out = gate_plan
 # Bound the payload so a huge plan message can't blow up the answerer prompt.
 print(out[:4000].strip())
 PYEOF
@@ -339,6 +353,13 @@ slot_state() {
       marker="$(git -C "$wt_path" rev-parse -q --verify "refs/tags/${kind}/${issue}^{commit}" 2>/dev/null)"
       [ "$marker" = "$tip" ] && { printf 'done\n'; return; }
     done
+    # A pushed gate/<issue> at the tip = parked at the PLAN gate → waiting, never reaped.
+    # The gate is a prose plan + this tag (no AskUserQuestion), so extract_pending_question
+    # can't see it. Checking at the tip is self-clearing: once approved and the spoke
+    # commits its first RED/GREEN, the tip moves past the gate commit and it reads busy.
+    if [ "$(git -C "$wt_path" rev-parse -q --verify "refs/tags/gate/${issue}^{commit}" 2>/dev/null)" = "$tip" ]; then
+      printf 'waiting\n'; return
+    fi
   fi
   epoch="$(read_dispatch_epoch "$issue")"
   if spoke_over_ceiling "$epoch" "$(afk_now)"; then printf 'reap\n'; return; fi
@@ -514,6 +535,18 @@ afk_emit_decision() {
   return 0
 }
 
+# _consume_gate_tag <wt_path> <issue> -> drop the gate/<issue> marker once a PLAN-gate
+# answer has been injected. slot_state reads the LOCAL tag at the tip, so deleting the local
+# tag is what closes the window between "answered" and the spoke committing its first code
+# (the tip still equals the gate commit until then, and an untouched tag would re-read as
+# waiting and re-answer the same gate). The remote delete is cosmetic (dashboard /
+# hub-status) and best-effort. Never aborts the loop.
+_consume_gate_tag() {
+  local wt="$1" issue="$2"
+  git -C "$wt" tag -d "gate/$issue" >/dev/null 2>&1 || true
+  git -C "$wt" push origin ":refs/tags/gate/$issue" >/dev/null 2>&1 || true
+}
+
 # decide_and_act <wt_path> <issue> -> reason about a parked spoke and act: inject the
 # answer, or escalate to blocked/<issue>. Fail-safe: an answerer that returns no decision
 # (or an answer we cannot inject) escalates rather than guessing.
@@ -544,6 +577,7 @@ decide_and_act() {
       text="could not locate spoke pane to inject the answer"
     elif inject_and_verify "$wt" "$target" "$text"; then
       log "  injected answer into #$issue"
+      _consume_gate_tag "$wt" "$issue"
       afk_emit_decision "$wt" success
       return 0
     else
