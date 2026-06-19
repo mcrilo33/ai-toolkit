@@ -277,6 +277,9 @@ The assembly shape:
   copy); a trace-root interaction / marker / lifecycle / script collapses to the synthetic
   root; a trace-root hook re-parents under the tool whose `tool_use_id` matches the hook's
   `metadata.tool_use_id`, or the synthetic root when there is no id or no match.
+- Tool content: for a visible `tool:<Name>` span the builder grafts transcript-sourced
+  `input`/`output` into the same create body (see the next section), so the fresh
+  observation carries content the native span lacked.
 
 Notes and limits:
 
@@ -289,7 +292,7 @@ Notes and limits:
   spoke run id and the source `(trace_id, observation_id)` pair, so a rerun overwrites the
   same trace/observations rather than appending duplicates.
 
-## Tool content from the transcript (`langfuse_tool_content.py`)
+## Tool content from the transcript (in the tree builder)
 
 Claude Code's native OTel surfaces the full `full_command` for Bash, but for every *other*
 tool it emits only `tool_name`, `tool_use_id`, and `duration` — the span arrives with
@@ -298,39 +301,33 @@ content never reaches the span; it lives in the session **transcript** (`*.jsonl
 assistant `tool_use` block carries `{id, name, input}` and the matching user `tool_result`
 block carries `{tool_use_id, content}`.
 
-`scripts/telemetry/langfuse_tool_content.py` **fills `input`/`output` onto those tool spans
-from the transcript**, joining by `tool_use_id`. It uses the same ingestion endpoint and
-`LANGFUSE_HOST` / `LANGFUSE_BASIC_AUTH` env vars as the rollup, message bridge, and
-spoke-tree:
+`langfuse_spoke_tree.py` **fills that content as it creates each `tool:` observation**,
+joining by `tool_use_id`. Because the copy step emits a `*-create` event that sets every
+field at once, the content lands in the same event that fixes the observation's `name` and
+`type` — nothing is overwritten or cleared. The work happens during assembly; no extra
+command is needed:
 
-```bash
-LANGFUSE_HOST=http://localhost:3000 LANGFUSE_BASIC_AUTH="Basic <base64(pk:sk)>" \
-    python3 scripts/telemetry/langfuse_tool_content.py <spoke_run_id>
-```
-
-The join, in three steps:
-
-- **A — index the session.** Fetch every trace in the session and its observations, mapping
-  `tool_use_id -> (observation_id, type)` for spans that carry a tool-call id under
-  `metadata["attributes"]` (Langfuse nests OTel span attributes there) at key `tool_use_id`
-  or `gen_ai.tool.call.id`. The synthesizer's own assembled tree is excluded, so it is not
-  double-patched.
-- **B — scan the transcripts.** Walk every `*.jsonl` under `--projects` (default
+- **Scan the transcripts.** Walk every `*.jsonl` under `--projects` (default
   `~/.claude/projects`) for `tool_use` (id → input, including the todo-ledger
   TaskCreate/TaskUpdate subjects + status, Read paths, Edit strings, ...) and `tool_result`
-  (id → content) blocks, keeping only ids present in the Step-A map. Tool-call ids are
-  globally unique, so no per-session transcript mapping is needed.
-- **C — patch.** For each matched id, PATCH the observation (`generation-update` for a
-  GENERATION, else `span-update`) with `input` and, when a result exists, `output`. Output
-  larger than ~20 KB is truncated with a marker. The event id derives from the observation
-  id, so a rerun overwrites instead of appending.
+  (id → content) blocks, keeping only the ids carried by this spoke's `tool:` spans.
+  Tool-call ids are globally unique, so no per-session transcript mapping is needed.
+- **Graft at create time.** For each visible `tool:<Name>` span, if the copied `input` is
+  empty/`None` it is set from the transcript input map keyed by the span's `tool_use_id`
+  (`metadata.attributes.tool_use_id` / `gen_ai.tool.call.id`); likewise `output`. Content the
+  source span already carries — Bash's collector-provided `input` — is **never** overwritten,
+  and non-`tool:` spans are untouched. Input/output larger than ~20 KB is truncated with a
+  marker.
 
-It prints `N tool spans enriched (of M matched / K in session)`.
+The run prints `… , N tool spans filled from transcript` alongside the assembly summary.
 
-**Run it before re-running `langfuse_spoke_tree.py`.** The tree copies `input`/`output`
-verbatim from the source observations, so it only picks the content up once these spans
-carry it. The order is therefore: per-turn native traces ingest → `langfuse_tool_content.py`
-fills the tool spans → `langfuse_spoke_tree.py` assembles the now-complete tree.
+> [!NOTE]
+> A standalone `langfuse_tool_content.py` previously PATCHed content onto the already-ingested
+> spans via the ingestion API's `span-update`/`generation-update`. That was **destructive**:
+> an update body that omits `name`/`type` makes Langfuse *clear* the observation's name and
+> type (a `tool:TaskCreate` became `name="" type=SPAN`), and it fought eventual-consistency
+> timestamp merges. The tree builder's create-time approach has neither problem, so the
+> patcher was retired.
 
 ## Loaded-context cost baseline (`measure_context_cost.py`)
 

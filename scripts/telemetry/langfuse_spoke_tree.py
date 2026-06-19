@@ -30,20 +30,34 @@ All ids derive from the spoke run id and the source ``(trace_id, observation_id)
 so a rerun overwrites the same trace/observations instead of appending. This trace
 DUPLICATES the native per-turn traces by design — it is the assembled, nested view.
 
-Import-safe: no environment is read at import time, so :func:`build_batch` is unit-testable
-with no network. The HTTP I/O happens only in :func:`main`. Stdlib only; reuses the
-fetch/post helpers, env vars, and ingestion endpoint of ``langfuse_rollup``.
+Tool content from the transcript: Claude Code's native OTel surfaces the full
+``full_command`` for Bash, but every other tool (TaskCreate/TaskUpdate, Read, Edit, ...)
+arrives with ``input=None`` — only ``tool_name``/``tool_use_id``/``duration``. The real
+content lives in the session TRANSCRIPT (``*.jsonl``): each assistant ``tool_use`` block
+carries ``{id, name, input}`` and the matching user ``tool_result`` block carries
+``{tool_use_id, content}``. Because the copy step CREATES fresh observations (one
+``*-create`` event setting every field at once), it fills that content into the create
+body at build time, keyed by ``tool_use_id`` — non-destructively, so collector-provided
+input (Bash) is never overwritten. (A standalone UPDATE-based patcher used to do this, but
+an update body that omits ``name``/``type`` makes Langfuse CLEAR them, so it was retired.)
+
+Import-safe: no environment is read at import time, so :func:`build_batch` and
+:func:`scan_transcripts` are unit-testable with no network. The HTTP I/O happens only in
+:func:`main`. Stdlib only; reuses the fetch/post helpers, env vars, and ingestion endpoint
+of ``langfuse_rollup``.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import logging
 import os
 import sys
 import urllib.parse
-from typing import Any
+from pathlib import Path
+from typing import Any, NamedTuple
 
 from telemetry.langfuse_rollup import (
     GetFn,
@@ -80,6 +94,20 @@ _CHUNK_SIZE = 100
 _COPIED_FIELDS = ("input", "output", "usageDetails", "costDetails", "metadata", "model", "level")
 # Metadata keys that may carry a tool-call id, in priority order.
 _TOOL_USE_ID_KEYS = ("tool_use_id", "gen_ai.tool.call.id")
+
+# Tool content (e.g. a large file Read) can be huge; cap the serialized text past this.
+_MAX_CONTENT_CHARS = 20_000
+_TRUNCATION_MARKER = "...[truncated]"
+
+# Default root holding Claude Code session transcripts.
+_DEFAULT_PROJECTS = Path("~/.claude/projects").expanduser()
+
+
+class ToolContent(NamedTuple):
+    """The transcript-sourced content of one tool call (either field may be absent)."""
+
+    input: object | None  # the tool_use input args
+    output: object | None  # the tool_result content
 
 
 def trace_id_for(spoke_run_id: str) -> str:
@@ -185,20 +213,95 @@ def _resolve_parent(
     return root_id
 
 
+def _is_tool_span(observation: Observation) -> bool:
+    """Whether an observation is a visible ``tool:<Name>`` span (e.g. ``tool:TaskCreate``).
+
+    Only these spans carry the tool call the user sees; the ``claude_code.tool.execution``,
+    ``*.blocked_on_user``, and ``*.sh`` hook siblings that share a ``tool_use_id`` are not
+    tool spans and are never filled with transcript content.
+    """
+    return (observation.get("name") or "").startswith("tool:")
+
+
+def _tool_span_ids(traces: list[TraceObservations]) -> set[str]:
+    """Collect the tool-call ids of every visible ``tool:`` span across the source traces."""
+    ids: set[str] = set()
+    for _orig_trace_id, observations in traces:
+        for observation in observations:
+            if not _is_tool_span(observation):
+                continue
+            tuid = _tool_use_id(observation)
+            if tuid:
+                ids.add(tuid)
+    return ids
+
+
+def _capped(value: object) -> object:
+    """Return ``value`` unchanged, or a truncated string when its serialized form is large.
+
+    Small structured values are passed through so Langfuse renders them richly; only content
+    whose serialized text exceeds :data:`_MAX_CONTENT_CHARS` (e.g. a large file Read) is
+    flattened to a truncated string with a marker.
+    """
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    if len(text) > _MAX_CONTENT_CHARS:
+        return text[:_MAX_CONTENT_CHARS] + _TRUNCATION_MARKER
+    return value
+
+
+def _tool_additions(
+    observation: Observation, tool_content: dict[str, ToolContent]
+) -> dict[str, Any]:
+    """Return the input/output to graft onto a tool span's create body, empty when none.
+
+    Only a visible ``tool:`` span with a matching transcript entry contributes, and only for
+    a field the source span does not already carry — so collector-provided content (Bash's
+    ``input``) is never overwritten and non-tool spans are untouched. Oversized values are
+    truncated by :func:`_capped`.
+
+    Args:
+        observation: The source observation being copied.
+        tool_content: Tool-call-id to :class:`ToolContent` from :func:`scan_transcripts`.
+
+    Returns:
+        A mapping with ``input`` and/or ``output`` to merge into the body, or ``{}``.
+    """
+    if not _is_tool_span(observation):
+        return {}
+    content = tool_content.get(_tool_use_id(observation) or "")
+    if content is None:
+        return {}
+    additions: dict[str, Any] = {}
+    if not observation.get("input") and content.input is not None:
+        additions["input"] = _capped(content.input)
+    if not observation.get("output") and content.output is not None:
+        additions["output"] = _capped(content.output)
+    return additions
+
+
 def _copy_event(
-    observation: Observation, *, orig_trace_id: str, trace_id: str, parent_id: str
+    observation: Observation,
+    *,
+    orig_trace_id: str,
+    trace_id: str,
+    parent_id: str,
+    tool_content: dict[str, ToolContent],
 ) -> IngestEvent:
     """Shape one ingestion event copying a source observation into the assembled trace.
 
     The type tracks the source: a ``GENERATION`` becomes a ``generation-create``, anything
     else a ``span-create``. ``usageDetails`` and ``model`` are re-passed so Langfuse
     recomputes ``costDetails`` identically; an explicit ``costDetails`` is forwarded too.
+    For a visible ``tool:`` span, transcript-sourced ``input``/``output`` is grafted into the
+    create body (see :func:`_tool_additions`) so the fresh observation carries content the
+    native span lacked, set in the same create event that fixes its name and type.
 
     Args:
         observation: The source observation to copy.
         orig_trace_id: The id of the trace the observation came from.
         trace_id: The assembled trace id every copy references.
         parent_id: The resolved parent id for this copy.
+        tool_content: Tool-call-id to :class:`ToolContent` from :func:`scan_transcripts`.
 
     Returns:
         A Langfuse ingestion batch event recreating the observation.
@@ -218,6 +321,7 @@ def _copy_event(
     for field in _COPIED_FIELDS:
         if observation.get(field) is not None:
             body[field] = observation[field]
+    body.update(_tool_additions(observation, tool_content))
     return {"id": new_id, "type": event_type, "timestamp": start, "body": body}
 
 
@@ -232,22 +336,31 @@ def _earliest_start(traces: list[TraceObservations]) -> str:
     return min(starts) if starts else _INGEST_TIMESTAMP
 
 
-def build_batch(traces: list[TraceObservations], spoke_run_id: str) -> list[IngestEvent]:
+def build_batch(
+    traces: list[TraceObservations],
+    spoke_run_id: str,
+    tool_content: dict[str, ToolContent] | None = None,
+) -> list[IngestEvent]:
     """Assemble one nested trace from a spoke's source traces and their observations.
 
     Emits a ``trace-create``, a single synthetic root span, and one copy per source
     observation re-parented across the original trace boundaries (see module docstring).
     All ids derive from the spoke run id and the source ``(trace_id, observation_id)``
-    pair, so the batch is idempotent.
+    pair, so the batch is idempotent. Visible ``tool:`` spans additionally have their
+    transcript-sourced ``input``/``output`` grafted into the create body (see
+    :func:`_tool_additions`).
 
     Args:
         traces: Each source trace paired with all of its observations, as fetched from
             Langfuse with full fields.
         spoke_run_id: The spoke run identifier (becomes the trace's ``sessionId``).
+        tool_content: Tool-call-id to :class:`ToolContent` from :func:`scan_transcripts`;
+            defaults to empty (no tool content filled).
 
     Returns:
         The ingestion events: a ``trace-create``, the synthetic root, then the copies.
     """
+    tool_content = tool_content or {}
     trace_id = trace_id_for(spoke_run_id)
     root_id = root_id_for(spoke_run_id)
     base_ts = _earliest_start(traces)
@@ -282,7 +395,11 @@ def build_batch(traces: list[TraceObservations], spoke_run_id: str) -> list[Inge
             )
             copies.append(
                 _copy_event(
-                    observation, orig_trace_id=orig_trace_id, trace_id=trace_id, parent_id=parent_id
+                    observation,
+                    orig_trace_id=orig_trace_id,
+                    trace_id=trace_id,
+                    parent_id=parent_id,
+                    tool_content=tool_content,
                 )
             )
     return [trace_event, root_event, *copies]
@@ -368,12 +485,94 @@ def post_in_chunks(
         post(batch[start : start + chunk_size])
 
 
+def _scan_blocks(content: list[Any], wanted: set[str], found: dict[str, dict[str, object]]) -> None:
+    """Collect ``tool_use`` inputs and ``tool_result`` contents for the wanted ids.
+
+    Args:
+        content: A message's ``content`` block list from one transcript line.
+        wanted: The tool-call ids present on this spoke's tool spans (others are skipped).
+        found: Accumulator mapping a tool-call id to its ``{"input"/"output": value}``.
+    """
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_use" and block.get("id") in wanted:
+            found.setdefault(block["id"], {})["input"] = block.get("input")
+        elif block.get("type") == "tool_result" and block.get("tool_use_id") in wanted:
+            found.setdefault(block["tool_use_id"], {})["output"] = block.get("content")
+
+
+def _scan_file(path: Path, wanted: set[str], found: dict[str, dict[str, object]]) -> None:
+    """Scan one transcript file line by line, ignoring malformed lines.
+
+    Args:
+        path: The transcript ``*.jsonl`` file.
+        wanted: The tool-call ids present on this spoke's tool spans.
+        found: Accumulator passed through to :func:`_scan_blocks`.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning("cannot read transcript %s: %s", path, e)
+        return
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        message = record.get("message") if isinstance(record, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            _scan_blocks(content, wanted, found)
+
+
+def scan_transcripts(root: Path, wanted: set[str]) -> dict[str, ToolContent]:
+    """Scan every transcript under ``root`` for the wanted tool calls' input/output.
+
+    Tool-call ids are globally unique, so no per-session transcript mapping is needed — only
+    the ids on this spoke's tool spans are collected. An id is returned when the transcripts
+    carry an ``input`` block for it, an ``output`` block, or both.
+
+    Args:
+        root: The Claude Code projects root holding session ``*.jsonl`` transcripts.
+        wanted: The tool-call ids present on this spoke's tool spans.
+
+    Returns:
+        A mapping of ``tool_use_id`` to its :class:`ToolContent`.
+    """
+    found: dict[str, dict[str, object]] = {}
+    if not wanted:
+        return {}
+    for path in sorted(root.rglob("*.jsonl")):
+        _scan_file(path, wanted, found)
+    return {
+        tuid: ToolContent(parts.get("input"), parts.get("output")) for tuid, parts in found.items()
+    }
+
+
+def filled_tool_spans(traces: list[TraceObservations], tool_content: dict[str, ToolContent]) -> int:
+    """Count the tool spans whose create body would gain transcript content (see summary)."""
+    return sum(
+        bool(_tool_additions(observation, tool_content))
+        for _orig_trace_id, observations in traces
+        for observation in observations
+    )
+
+
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse the CLI arguments for the spoke-tree assembler."""
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("spoke_run_id", help="The spoke run id (session id) to assemble.")
+    parser.add_argument(
+        "--projects",
+        type=Path,
+        default=_DEFAULT_PROJECTS,
+        help="Root holding Claude Code session transcripts (default: ~/.claude/projects).",
+    )
     return parser.parse_args(argv)
 
 
@@ -396,11 +595,16 @@ def main(argv: list[str] | None = None) -> int:
     get, post = make_get(host, auth), make_post(host, auth)
 
     traces = fetch_session(args.spoke_run_id, get)
-    batch = build_batch(traces, args.spoke_run_id)
+    tool_content = scan_transcripts(args.projects, _tool_span_ids(traces))
+    batch = build_batch(traces, args.spoke_run_id, tool_content)
     post_in_chunks(batch, post)
 
     trace_id = trace_id_for(args.spoke_run_id)
-    print(f"{len(batch) - 2} observations assembled under trace {trace_id}, roots collapsed to 1")
+    filled = filled_tool_spans(traces, tool_content)
+    print(
+        f"{len(batch) - 2} observations assembled under trace {trace_id} "
+        f"(roots collapsed to 1), {filled} tool spans filled from transcript"
+    )
     return 0
 
 

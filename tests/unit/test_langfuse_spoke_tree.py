@@ -12,6 +12,7 @@ determinism.
 
 from __future__ import annotations
 
+import json
 import sys
 import urllib.parse
 from collections.abc import Sequence
@@ -20,10 +21,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from telemetry.langfuse_spoke_tree import (
+    _MAX_CONTENT_CHARS,
+    _TRUNCATION_MARKER,
     _copy_id,
     build_batch,
     fetch_session,
     root_id_for,
+    scan_transcripts,
     trace_id_for,
 )
 
@@ -328,3 +332,125 @@ class TestFetchSession:
         result = fetch_session("sess", lambda path: pages[path])
 
         assert result == [("tr-a", [{"id": "o1"}]), ("tr-b", [{"id": "o2"}])]
+
+
+def _tool_obs(obs_id: str, name: str, tool_use_id: str, **extra) -> dict:
+    """Build a source observation carrying a tool-call id under metadata["attributes"]."""
+    return _obs(
+        obs_id, name, parent="i1", metadata={"attributes": {"tool_use_id": tool_use_id}}, **extra
+    )
+
+
+def _write_transcript(root: Path, records: list[dict]) -> None:
+    """Write a Claude Code transcript (one JSON record per line) under a project subdir."""
+    project = root / "proj"
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "session.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+
+
+def _tool_use(tool_use_id: str, name: str, tool_input: dict) -> dict:
+    """Build an assistant transcript line carrying one tool_use block."""
+    block = {"type": "tool_use", "id": tool_use_id, "name": name, "input": tool_input}
+    return {"type": "assistant", "message": {"content": [block]}}
+
+
+def _tool_result(tool_use_id: str, content: object) -> dict:
+    """Build a user transcript line carrying one tool_result block."""
+    block = {"type": "tool_result", "tool_use_id": tool_use_id, "content": content}
+    return {"type": "user", "message": {"content": [block]}}
+
+
+class TestScanTranscripts:
+    def test_joins_tool_use_input_and_tool_result_output(self, tmp_path: Path) -> None:
+        _write_transcript(
+            tmp_path,
+            [_tool_use("tu-1", "TaskCreate", {"subject": "ship it"}), _tool_result("tu-1", "ok")],
+        )
+
+        contents = scan_transcripts(tmp_path, {"tu-1"})
+
+        assert contents["tu-1"].input == {"subject": "ship it"}
+        assert contents["tu-1"].output == "ok"
+
+    def test_ids_absent_from_session_are_skipped(self, tmp_path: Path) -> None:
+        _write_transcript(tmp_path, [_tool_use("tu-stray", "Read", {"file_path": "/b"})])
+
+        assert scan_transcripts(tmp_path, {"tu-1"}) == {}
+
+    def test_empty_wanted_set_reads_nothing(self, tmp_path: Path) -> None:
+        _write_transcript(tmp_path, [_tool_use("tu-1", "Read", {"file_path": "/a"})])
+
+        assert scan_transcripts(tmp_path, set()) == {}
+
+
+class TestToolContentFilledIntoCreateBody:
+    def test_tool_span_input_and_output_set_from_transcript(self, tmp_path: Path) -> None:
+        # A tool:TaskCreate span arrives with input=None; the transcript supplies both fields.
+        span = _tool_obs("t1", "tool:TaskCreate", "tu-1")
+        _write_transcript(
+            tmp_path,
+            [
+                _tool_use("tu-1", "TaskCreate", {"subject": "ship it"}),
+                _tool_result("tu-1", "Task #1 created"),
+            ],
+        )
+
+        batch = build_batch([("trace", [span])], SPOKE, scan_transcripts(tmp_path, {"tu-1"}))
+
+        body = _by_orig(batch, "trace", "t1")["body"]
+        assert body["input"] == {"subject": "ship it"}
+        assert body["output"] == "Task #1 created"
+
+    def test_existing_bash_input_is_not_overwritten(self, tmp_path: Path) -> None:
+        # Bash's input is collector-provided; the transcript output still fills the gap.
+        span = _tool_obs("t1", "tool:Bash", "tu-1", input="ls -la")
+        _write_transcript(
+            tmp_path,
+            [_tool_use("tu-1", "Bash", {"command": "rm -rf /"}), _tool_result("tu-1", "files")],
+        )
+
+        batch = build_batch([("trace", [span])], SPOKE, scan_transcripts(tmp_path, {"tu-1"}))
+
+        body = _by_orig(batch, "trace", "t1")["body"]
+        assert body["input"] == "ls -la"
+        assert body["output"] == "files"
+
+    def test_non_tool_span_sharing_a_tool_use_id_is_untouched(self, tmp_path: Path) -> None:
+        # An execution sibling shares tu-1 but is not a tool: span, so it gains no content.
+        sibling = _tool_obs("e1", "claude_code.tool.execution", "tu-1")
+        _write_transcript(
+            tmp_path,
+            [_tool_use("tu-1", "Read", {"file_path": "/a"}), _tool_result("tu-1", "data")],
+        )
+
+        batch = build_batch([("trace", [sibling])], SPOKE, scan_transcripts(tmp_path, {"tu-1"}))
+
+        body = _by_orig(batch, "trace", "e1")["body"]
+        assert "input" not in body
+        assert "output" not in body
+
+    def test_large_tool_output_is_truncated_with_marker(self, tmp_path: Path) -> None:
+        span = _tool_obs("t1", "tool:Read", "tu-1")
+        huge = "x" * (_MAX_CONTENT_CHARS + 500)
+        _write_transcript(
+            tmp_path,
+            [_tool_use("tu-1", "Read", {"file_path": "/a"}), _tool_result("tu-1", huge)],
+        )
+
+        batch = build_batch([("trace", [span])], SPOKE, scan_transcripts(tmp_path, {"tu-1"}))
+
+        output = _by_orig(batch, "trace", "t1")["body"]["output"]
+        assert output.endswith(_TRUNCATION_MARKER)
+        assert len(output) == _MAX_CONTENT_CHARS + len(_TRUNCATION_MARKER)
+
+    def test_no_tool_content_leaves_bodies_unchanged(self) -> None:
+        # build_batch without a content map (the default) fills nothing.
+        span = _tool_obs("t1", "tool:TaskCreate", "tu-1")
+
+        batch = build_batch([("trace", [span])], SPOKE)
+
+        body = _by_orig(batch, "trace", "t1")["body"]
+        assert "input" not in body
+        assert "output" not in body
