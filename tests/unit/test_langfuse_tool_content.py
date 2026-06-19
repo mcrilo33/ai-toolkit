@@ -8,7 +8,9 @@ the transcript scan reads a hand-built ``*.jsonl`` file under ``tmp_path``. They
 input/output join, that only the visible ``tool:`` span is indexed (not the
 ``claude_code.tool.execution`` / ``*.sh`` hook siblings that share its ``tool_use_id``),
 GENERATION-vs-SPAN event routing, skipping of ids absent from Langfuse,
-``metadata["attributes"]`` nesting, deterministic ids, and large-output truncation.
+``metadata["attributes"]`` nesting, deterministic ids, large-output truncation, and that the
+session source scan excludes the synthesizer's own ``spoke-tree:`` trace (whose tool-span
+copies share the real ``tool_use_id``) so the patch lands on the real interaction span.
 """
 
 from __future__ import annotations
@@ -19,6 +21,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
+from telemetry.langfuse_spoke_tree import (
+    _TRACE_NAME_PREFIX,
+    fetch_session,
+    trace_id_for,
+)
 from telemetry.langfuse_tool_content import (
     _EVENT_PREFIX,
     _MAX_CONTENT_CHARS,
@@ -210,6 +217,44 @@ class TestContentEvent:
 
         assert event["body"]["input"] == {"a": 1}
         assert event["body"]["output"] == [{"type": "text"}]
+
+
+def _fake_get(traces: list[dict], observations: dict[str, list[dict]]):
+    """Return a Langfuse fetcher serving a fixed session listing and per-trace observations.
+
+    Args:
+        traces: The trace dicts the ``/traces`` listing returns (id + name).
+        observations: Trace id to its observation list, for the ``/observations`` endpoint.
+    """
+
+    def get(path: str) -> dict:
+        if path.startswith("/traces"):
+            return {"data": traces, "meta": {"totalPages": 1}}
+        trace_id = path.split("traceId=", 1)[1].split("&", 1)[0]
+        return {"data": observations.get(trace_id, []), "meta": {"totalPages": 1}}
+
+    return get
+
+
+class TestExcludesSpokeTreeTrace:
+    def test_source_scan_skips_the_synthetic_tree_and_patches_the_real_span(self) -> None:
+        # The synthetic "spoke-tree:" trace re-appears in the session with COPIES of the tool
+        # spans (same tool_use_id). Sourcing it would shadow the real interaction span; the
+        # shared fetch_session must drop it so the index keeps the real tool: span.
+        run = "spoke-run-1"
+        tree_id = trace_id_for(run)
+        traces = [
+            {"id": "trace-int", "name": "interaction"},
+            {"id": tree_id, "name": f"{_TRACE_NAME_PREFIX}{run}"},
+        ]
+        observations = {
+            "trace-int": [_obs("o-real", name="tool:TaskCreate", tool_use_id="tu-1")],
+            tree_id: [_obs("o-tree-copy", name="tool:TaskCreate", tool_use_id="tu-1")],
+        }
+
+        index = build_span_index(fetch_session(run, _fake_get(traces, observations)))
+
+        assert index == {"tu-1": ToolSpan("o-real", "SPAN")}
 
 
 class TestBuildBatch:
