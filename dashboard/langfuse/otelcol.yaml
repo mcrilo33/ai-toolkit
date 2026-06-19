@@ -1,0 +1,67 @@
+# OpenTelemetry Collector — Claude Code spoke telemetry → Langfuse.
+#
+# Claude Code emits native OTLP traces, but two things must be transformed before
+# Langfuse can use them (validated against Claude Code v2.1.183):
+#
+#   1. Token remap. Claude Code emits bare `input_tokens` / `output_tokens`; Langfuse
+#      reads usage only from `gen_ai.usage.*`. Without this remap, cost reads $0.
+#   2. Span-name rewrite. Every tool span is named `claude_code.tool`; rewriting the
+#      name to encode the dimension (`tool:Bash`, `hook:PreToolUse:Bash`, `sub-agent:llm`)
+#      makes Langfuse's "group by name" give cost & latency PER tool / hook / sub-agent.
+#
+# It also re-homes each span's Langfuse session onto the spoke (`spoke_run_id`), so one
+# spoke — across Claude Code resumes — is one Langfuse session.
+#
+# Run (Mac/Docker), with the Langfuse target supplied by the operator (kept off the
+# command line so the auth token never lands in `ps`):
+#
+#   export LANGFUSE_OTLP_ENDPOINT=http://host.docker.internal:3000/api/public/otel
+#   export LANGFUSE_BASIC_AUTH="Basic $(printf 'pk-lf-…:sk-lf-…' | base64)"
+#   docker run -d --name lf-collector --add-host=host.docker.internal:host-gateway \
+#     -p 4318:4318 -e LANGFUSE_OTLP_ENDPOINT -e LANGFUSE_BASIC_AUTH \
+#     -v "$PWD/dashboard/langfuse/otelcol.yaml:/etc/otelcol-contrib/config.yaml" \
+#     otel/opentelemetry-collector-contrib:latest
+#
+# Then point a spoke at it (the Issue #83 opt-in gate already wires the rest):
+#   AI_TOOLKIT_OTEL=1  OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
+#   ENABLE_BETA_TRACING_DETAILED=1  BETA_TRACING_ENDPOINT=http://localhost:4318 \
+#   OTEL_LOG_USER_PROMPTS=1  OTEL_LOG_TOOL_DETAILS=1  OTEL_LOG_TOOL_CONTENT=1 \
+#     scripts/worktree-new.sh <issue> <slug>
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+  transform/langfuse:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          # 1) token remap → Langfuse usage/cost
+          - set(attributes["gen_ai.usage.input_tokens"], attributes["input_tokens"]) where attributes["input_tokens"] != nil
+          - set(attributes["gen_ai.usage.output_tokens"], attributes["output_tokens"]) where attributes["output_tokens"] != nil
+          - set(attributes["gen_ai.usage.cache_read_input_tokens"], attributes["cache_read_tokens"]) where attributes["cache_read_tokens"] != nil
+          - set(attributes["gen_ai.usage.cache_creation_input_tokens"], attributes["cache_creation_tokens"]) where attributes["cache_creation_tokens"] != nil
+          # 2) span-name rewrite → "group by name" = per tool / skill / hook / sub-agent
+          - set(name, Concat(["tool:", attributes["tool_name"]], "")) where name == "claude_code.tool" and attributes["tool_name"] != nil
+          - set(name, Concat(["hook:", attributes["hook_name"]], "")) where name == "claude_code.hook" and attributes["hook_name"] != nil
+          - set(name, "sub-agent:llm") where name == "claude_code.llm_request" and attributes["agent_id"] != nil
+          # 3) spoke grouping → one spoke (across resumes) = one Langfuse session
+          - set(attributes["session.id"], resource.attributes["spoke_run_id"]) where resource.attributes["spoke_run_id"] != nil
+
+exporters:
+  otlphttp/langfuse:
+    endpoint: ${env:LANGFUSE_OTLP_ENDPOINT}
+    headers:
+      Authorization: ${env:LANGFUSE_BASIC_AUTH}
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [transform/langfuse, batch]
+      exporters: [otlphttp/langfuse]
