@@ -19,13 +19,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 from telemetry.measure_context_cost import (
     Category,
     CountTokensError,
+    Item,
     assemble_agents,
     assemble_categories,
+    assemble_items,
     assemble_memory,
     assemble_rules,
     assemble_skills,
     build_manifest,
     measure_categories,
+    measure_items,
     parse_frontmatter,
     write_manifest,
 )
@@ -141,6 +144,91 @@ def test_assemble_memory_empty_when_absent(tmp_path: Path) -> None:
 
     assert category.text == ""
     assert category.source_files == []
+
+
+# --- per-item assembly -------------------------------------------------------
+
+
+def test_assemble_items_yields_one_item_per_rule_file(tmp_path: Path) -> None:
+    _make_worktree(tmp_path)
+
+    items = assemble_items(tmp_path)
+
+    rules = [i for i in items if i.category == "rules"]
+    names = {i.name for i in rules}
+    assert names == {"CLAUDE.md", "python-style.md"}
+    by_name = {i.name: i for i in rules}
+    assert by_name["python-style.md"].source == ".claude/rules/python-style.md"
+    assert "Use type hints." in by_name["python-style.md"].text
+
+
+def test_assemble_items_yields_one_item_per_skill_by_name(tmp_path: Path) -> None:
+    _make_worktree(tmp_path)
+
+    items = assemble_items(tmp_path)
+
+    skills = [i for i in items if i.category == "skills"]
+    assert [i.name for i in skills] == ["afk"]
+    assert skills[0].text == "- afk: Drain the backlog."
+    assert skills[0].source == ".claude/skills/afk/SKILL.md"
+
+
+def test_assemble_items_yields_one_item_per_agent_by_name(tmp_path: Path) -> None:
+    _make_worktree(tmp_path)
+
+    items = assemble_items(tmp_path)
+
+    agents = [i for i in items if i.category == "sub-agents"]
+    assert [i.name for i in agents] == ["architect"]
+
+
+def test_assemble_items_environment_is_single_estimated_item(tmp_path: Path) -> None:
+    _make_worktree(tmp_path)
+
+    items = assemble_items(tmp_path)
+
+    env = [i for i in items if i.category == "environment"]
+    assert len(env) == 1
+    assert env[0].estimated is True
+
+
+def test_assemble_items_skips_skill_without_frontmatter_name(tmp_path: Path) -> None:
+    _make_worktree(tmp_path)
+    broken = tmp_path / ".claude" / "skills" / "broken"
+    broken.mkdir(parents=True)
+    (broken / "SKILL.md").write_text("# no frontmatter\n", encoding="utf-8")
+
+    skills = [i for i in assemble_items(tmp_path) if i.category == "skills"]
+
+    assert [i.name for i in skills] == ["afk"]
+
+
+def test_measure_items_returns_tokens_cost_source_per_item() -> None:
+    items = [
+        Item("rules", "CLAUDE.md", "abcdefgh", ".claude/CLAUDE.md"),
+        Item("environment", "environment", "platform: x", "reconstructed", estimated=True),
+    ]
+
+    rows = measure_items(items, counter=_fixed_counter(40), price=0.001)
+
+    assert rows[0] == {
+        "category": "rules",
+        "name": "CLAUDE.md",
+        "tokens": 40,
+        "cost_usd": 0.04,
+        "source": ".claude/CLAUDE.md",
+        "estimated": False,
+    }
+    assert rows[1]["estimated"] is True
+
+
+def test_measure_items_falls_back_to_char_div_4_when_counter_fails() -> None:
+    items = [Item("rules", "x.md", "12345678", "x.md")]  # 8 chars -> 2 tokens
+
+    rows = measure_items(items, counter=_failing_counter(), price=0.001)
+
+    assert rows[0]["tokens"] == 2
+    assert rows[0]["estimated"] is True
 
 
 # --- token math --------------------------------------------------------------

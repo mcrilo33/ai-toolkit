@@ -91,6 +91,32 @@ class Category:
     estimated: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class Item:
+    """One named, individually-measurable loaded-context entry within a category.
+
+    A category (``rules``) holds many items (``CLAUDE.md``, ``python-style.md``); each
+    item is measured on its own so the assembled spoke tree can show a token size and
+    cost per file / skill / agent rather than only the category total.
+
+    Attributes:
+        category: The owning category key (``rules`` / ``memory`` / ``skills`` /
+            ``sub-agents`` / ``environment``).
+        name: Display name of the item (a file's basename, or a skill/agent name).
+        text: The exact source text whose tokens are measured.
+        source: Where the text came from — a repo-relative path, or ``reconstructed``
+            for the synthesized environment block.
+        estimated: Forced-estimate flag — true for text that never matches the runtime
+            byte-for-byte (the environment block).
+    """
+
+    category: str
+    name: str
+    text: str
+    source: str
+    estimated: bool = False
+
+
 def parse_frontmatter(text: str) -> dict[str, str]:
     """Parse the top-level scalar keys of a YAML frontmatter block.
 
@@ -231,6 +257,59 @@ def assemble_categories(root: Path) -> list[Category]:
     ]
 
 
+def _file_items(category: str, paths: list[Path], root: Path) -> list[Item]:
+    """Build one :class:`Item` per existing file, named by basename, sorted by path."""
+    items: list[Item] = []
+    for path in sorted(paths):
+        if path.is_file():
+            text = path.read_text(encoding="utf-8", errors="replace")
+            items.append(Item(category, path.name, text, str(path.relative_to(root))))
+    return items
+
+
+def _listing_items(category: str, files: list[Path], root: Path) -> list[Item]:
+    """Build one :class:`Item` per file with a frontmatter ``name`` (skills / sub-agents).
+
+    Each item mirrors how Claude Code injects an available-skills / agent-types entry —
+    ``- name: description`` — and is named by the frontmatter ``name``. Files without a
+    parseable ``name`` are skipped.
+    """
+    items: list[Item] = []
+    for path in sorted(files):
+        front = parse_frontmatter(path.read_text(encoding="utf-8", errors="replace"))
+        name = front.get("name")
+        if not name:
+            continue
+        text = f"- {name}: {front.get('description', '')}"
+        items.append(Item(category, name, text, str(path.relative_to(root))))
+    return items
+
+
+def assemble_items(root: Path) -> list[Item]:
+    """Assemble every source-measurable loaded-context entry, one :class:`Item` per name.
+
+    Unlike :func:`assemble_categories` (which concatenates each category to one text), this
+    keeps every file / skill / agent separate so the assembled spoke tree can attribute a
+    token size and cost to each individual entry.
+
+    Args:
+        root: Worktree root to measure.
+
+    Returns:
+        The per-name items across all categories, grouped by category in a stable order.
+    """
+    env = assemble_environment(root)
+    return [
+        *_file_items(
+            "rules", [root / "CLAUDE.md", *(root / ".claude" / "rules").glob("*.md")], root
+        ),
+        *_file_items("memory", [root / "MEMORY.md", *(root / "memory").glob("*.md")], root),
+        *_listing_items("skills", list((root / ".claude" / "skills").glob("*/SKILL.md")), root),
+        *_listing_items("sub-agents", list((root / ".claude" / "agents").glob("*.md")), root),
+        Item("environment", "environment", env.text, "reconstructed", estimated=True),
+    ]
+
+
 def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -278,6 +357,37 @@ def measure_categories(
     return rows
 
 
+def measure_items(
+    items: list[Item], *, counter: TokenCounter, price: float
+) -> list[dict[str, object]]:
+    """Measure tokens and cost for each individual loaded-context item.
+
+    Args:
+        items: Assembled per-name items (see :func:`assemble_items`).
+        counter: Token counter; raises :class:`CountTokensError` when unreachable.
+        price: Cache-creation price in USD per token.
+
+    Returns:
+        One dict per item with keys ``category``, ``name``, ``tokens``, ``cost_usd``,
+        ``source``, ``estimated`` (the last true when the count fell back to the
+        char/4 estimate or the item is inherently estimated).
+    """
+    rows: list[dict[str, object]] = []
+    for item in items:
+        tokens, fell_back = _count(item.text, counter)
+        rows.append(
+            {
+                "category": item.category,
+                "name": item.name,
+                "tokens": tokens,
+                "cost_usd": tokens * price,
+                "source": item.source,
+                "estimated": fell_back or item.estimated,
+            }
+        )
+    return rows
+
+
 def build_manifest(
     categories: list[Category],
     *,
@@ -285,6 +395,7 @@ def build_manifest(
     price: float,
     generated_at: str,
     cc_version: str | None,
+    items: list[Item] | None = None,
 ) -> dict[str, object]:
     """Build the full context-cost manifest from assembled categories.
 
@@ -294,12 +405,14 @@ def build_manifest(
         price: Cache-creation price in USD per token.
         generated_at: ISO timestamp recorded as the manifest's mint time.
         cc_version: Claude Code version string, or None if unavailable.
+        items: Per-name items (see :func:`assemble_items`) to record alongside the
+            category totals; omitted when only category-level numbers are wanted.
 
     Returns:
         The manifest dict ready to serialize to JSON.
     """
     rows = measure_categories(categories, counter=counter, price=price)
-    return {
+    manifest: dict[str, object] = {
         "generated_at": generated_at,
         "cc_version": cc_version,
         "price_per_token": price,
@@ -307,6 +420,9 @@ def build_manifest(
         "measured_total_tokens": sum(cast(int, row["tokens"]) for row in rows),
         "note": NOTE,
     }
+    if items is not None:
+        manifest["items"] = measure_items(items, counter=counter, price=price)
+    return manifest
 
 
 def write_manifest(root: Path, manifest: dict[str, object]) -> Path:
@@ -428,6 +544,7 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
         price=args.price,
         generated_at=_now_iso(),
         cc_version=claude_version(),
+        items=assemble_items(root),
     )
     path = write_manifest(root, manifest)
     print(f"wrote {path} — measured_total_tokens={manifest['measured_total_tokens']}")

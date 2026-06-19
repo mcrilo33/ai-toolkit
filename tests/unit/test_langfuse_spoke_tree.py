@@ -20,12 +20,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
+from telemetry.measure_context_cost import CountTokensError
 from telemetry.langfuse_spoke_tree import (
     _MAX_CONTENT_CHARS,
     _TRUNCATION_MARKER,
     _copy_id,
     build_batch,
+    build_loaded_context_events,
     fetch_session,
+    itemize_tool_schemas,
+    load_tools_from_request,
+    prefix_cache_creation,
     root_id_for,
     scan_transcripts,
     trace_id_for,
@@ -245,6 +250,60 @@ class TestBuildBatch:
         assert [event["type"] for event in batch] == ["trace-create", "span-create"]
 
 
+class TestContainerRollups:
+    """Every container node (and the synthetic root) carries a subtree token rollup."""
+
+    def test_interaction_container_rolls_up_its_subtree(self) -> None:
+        batch = build_batch(_traces(), SPOKE)
+
+        rollup = _by_orig(batch, "trace-int", "i1")["body"]["metadata"]["rollup"]
+        assert rollup == {"reused": 900, "written": 300, "input": 120, "output": 45}
+
+    def test_synthetic_root_rolls_up_the_whole_tree(self) -> None:
+        batch = build_batch(_traces(), SPOKE)
+
+        root = next(event for event in batch if event["id"] == root_id_for(SPOKE))
+        assert root["body"]["metadata"]["rollup"] == {
+            "reused": 900,
+            "written": 300,
+            "input": 120,
+            "output": 45,
+        }
+
+    def test_leaf_generation_keeps_metadata_verbatim_without_rollup(self) -> None:
+        # g1 is a leaf (no children) so it is NOT a container and is left untouched.
+        batch = build_batch(_traces(), SPOKE)
+
+        metadata = _by_orig(batch, "trace-int", "g1")["body"]["metadata"]
+        assert metadata == {"kind": "turn", "rollup": {"input": 120}}
+
+    def test_nested_subagent_container_sums_only_its_descendants(self) -> None:
+        # tool:Agent over a sub-agent interaction holding one generation.
+        agent = _obs("a1", "tool:Agent", parent=None)
+        sub = _obs("s1", "claude_code.interaction", parent="a1")
+        gen = _obs(
+            "sg1",
+            "llm_request",
+            type_="GENERATION",
+            parent="s1",
+            usageDetails={
+                "input": 10,
+                "output": 4,
+                "cache_read_input_tokens": 7,
+                "cache_creation_input_tokens": 2,
+            },
+        )
+
+        batch = build_batch([("trace-a", [agent, sub, gen])], SPOKE)
+
+        assert _by_orig(batch, "trace-a", "a1")["body"]["metadata"]["rollup"] == {
+            "reused": 7,
+            "written": 2,
+            "input": 10,
+            "output": 4,
+        }
+
+
 SESSION = "sess-idem"
 
 
@@ -454,3 +513,236 @@ class TestToolContentFilledIntoCreateBody:
         body = _by_orig(batch, "trace", "t1")["body"]
         assert "input" not in body
         assert "output" not in body
+
+
+def _fixed_counter(value: int):
+    """A token counter returning a constant, ignoring its input text."""
+
+    def counter(_text: str) -> int:
+        return value
+
+    return counter
+
+
+class TestPrefixCacheCreation:
+    def test_picks_earliest_generations_cache_creation(self) -> None:
+        early = _obs(
+            "g1",
+            "llm_request",
+            type_="GENERATION",
+            startTime="2026-01-02T00:00:00Z",
+            usageDetails={"cache_creation_input_tokens": 5000},
+        )
+        late = _obs(
+            "g2",
+            "llm_request",
+            type_="GENERATION",
+            startTime="2026-01-02T00:05:00Z",
+            usageDetails={"cache_creation_input_tokens": 80},
+        )
+
+        assert prefix_cache_creation([("tr", [late, early])]) == 5000
+
+    def test_zero_when_no_usage_present(self) -> None:
+        assert prefix_cache_creation([("tr", [_obs("m1", "step:green")])]) == 0
+
+
+class TestItemizeToolSchemas:
+    def test_splits_mcp_from_builtin_and_counts_each_schema(self) -> None:
+        tools = [
+            {"name": "Read", "description": "read a file", "input_schema": {"a": 1}},
+            {"name": "mcp__notion__search", "description": "search", "input_schema": {"b": 2}},
+        ]
+
+        rows = itemize_tool_schemas(tools, counter=_fixed_counter(30), price=0.001)
+
+        by_name = {row["name"]: row for row in rows}
+        assert by_name["Read"]["category"] == "tools"
+        assert by_name["mcp__notion__search"]["category"] == "mcp"
+        assert by_name["Read"]["tokens"] == 30
+        assert by_name["Read"]["cost_usd"] == 0.03
+        assert by_name["Read"]["source"] == "request_tools_array"
+
+    def test_marks_estimated_when_counter_unreachable(self) -> None:
+        def failing(_text: str) -> int:
+            raise CountTokensError("nope")
+
+        tools = [{"name": "Edit", "description": "x", "input_schema": {}}]
+
+        rows = itemize_tool_schemas(tools, counter=failing, price=0.001)
+
+        assert rows[0]["estimated"] is True
+
+    def test_unnamed_tools_are_skipped(self) -> None:
+        rows = itemize_tool_schemas(
+            [{"description": "no name"}], counter=_fixed_counter(1), price=1
+        )
+
+        assert rows == []
+
+
+class TestLoadToolsFromRequest:
+    def test_reads_tools_array_from_request_body_json(self, tmp_path: Path) -> None:
+        path = tmp_path / "req.json"
+        path.write_text(json.dumps({"tools": [{"name": "Read"}], "model": "x"}), encoding="utf-8")
+
+        assert load_tools_from_request(path) == [{"name": "Read"}]
+
+    def test_missing_or_unreadable_file_yields_empty(self, tmp_path: Path) -> None:
+        assert load_tools_from_request(tmp_path / "nope.json") == []
+
+    def test_malformed_json_yields_empty(self, tmp_path: Path) -> None:
+        path = tmp_path / "bad.json"
+        path.write_text("{ not json", encoding="utf-8")
+
+        assert load_tools_from_request(path) == []
+
+
+def _lc_by_name(events: list[dict]) -> dict[str, dict]:
+    """Index loaded-context event bodies by their node name."""
+    return {event["body"]["name"]: event["body"] for event in events}
+
+
+class TestLoadedContextSubtree:
+    def _rows(self) -> list[dict]:
+        return [
+            {
+                "category": "rules",
+                "name": "CLAUDE.md",
+                "tokens": 100,
+                "cost_usd": 0.1,
+                "source": "CLAUDE.md",
+                "estimated": False,
+            },
+            {
+                "category": "rules",
+                "name": "python-style.md",
+                "tokens": 50,
+                "cost_usd": 0.05,
+                "source": ".claude/rules/python-style.md",
+                "estimated": False,
+            },
+            {
+                "category": "skills",
+                "name": "afk",
+                "tokens": 20,
+                "cost_usd": 0.02,
+                "source": ".claude/skills/afk/SKILL.md",
+                "estimated": True,
+            },
+        ]
+
+    def test_parent_node_sits_under_spoke_root_with_grand_total(self) -> None:
+        events = build_loaded_context_events(
+            SPOKE,
+            self._rows(),
+            prefix_cache_creation=1000,
+            price=0.001,
+            base_ts="2026-01-01T00:00:00Z",
+        )
+
+        parent = _lc_by_name(events)["loaded-context"]
+        assert parent["parentObservationId"] == root_id_for(SPOKE)
+        assert parent["metadata"]["tokens"] == 170
+
+    def test_each_category_node_carries_its_rolled_up_total(self) -> None:
+        events = build_loaded_context_events(
+            SPOKE,
+            self._rows(),
+            prefix_cache_creation=1000,
+            price=0.001,
+            base_ts="2026-01-01T00:00:00Z",
+        )
+
+        index = _lc_by_name(events)
+        assert index["rules"]["metadata"]["tokens"] == 150
+        assert index["skills"]["metadata"]["tokens"] == 20
+
+    def test_one_item_node_per_name_under_its_category(self) -> None:
+        events = build_loaded_context_events(
+            SPOKE,
+            self._rows(),
+            prefix_cache_creation=1000,
+            price=0.001,
+            base_ts="2026-01-01T00:00:00Z",
+        )
+
+        index = _lc_by_name(events)
+        rules_id = index["rules"]["id"]
+        claude = next(b for n, b in index.items() if n.startswith("CLAUDE.md"))
+        assert claude["parentObservationId"] == rules_id
+        assert claude["metadata"]["tokens"] == 100
+        assert claude["metadata"]["source"] == "CLAUDE.md"
+
+    def test_estimated_item_carries_the_flag(self) -> None:
+        events = build_loaded_context_events(
+            SPOKE,
+            self._rows(),
+            prefix_cache_creation=1000,
+            price=0.001,
+            base_ts="2026-01-01T00:00:00Z",
+        )
+
+        afk = next(b for n, b in _lc_by_name(events).items() if n.startswith("afk"))
+        assert afk["metadata"]["estimated"] is True
+
+    def test_remainder_is_prefix_minus_measured(self) -> None:
+        events = build_loaded_context_events(
+            SPOKE,
+            self._rows(),
+            prefix_cache_creation=1000,
+            price=0.001,
+            base_ts="2026-01-01T00:00:00Z",
+        )
+
+        remainder = next(b for n, b in _lc_by_name(events).items() if n.startswith("remainder"))
+        assert remainder["metadata"]["tokens"] == 830
+        assert remainder["parentObservationId"] == _lc_by_name(events)["loaded-context"]["id"]
+
+    def test_remainder_clamped_to_zero_when_measured_exceeds_prefix(self) -> None:
+        events = build_loaded_context_events(
+            SPOKE,
+            self._rows(),
+            prefix_cache_creation=100,
+            price=0.001,
+            base_ts="2026-01-01T00:00:00Z",
+        )
+
+        remainder = next(b for n, b in _lc_by_name(events).items() if n.startswith("remainder"))
+        assert remainder["metadata"]["tokens"] == 0
+
+    def test_ids_are_deterministic_across_runs(self) -> None:
+        first = {
+            e["id"]
+            for e in build_loaded_context_events(
+                SPOKE,
+                self._rows(),
+                prefix_cache_creation=1000,
+                price=0.001,
+                base_ts="2026-01-01T00:00:00Z",
+            )
+        }
+        second = {
+            e["id"]
+            for e in build_loaded_context_events(
+                SPOKE,
+                self._rows(),
+                prefix_cache_creation=1000,
+                price=0.001,
+                base_ts="2026-01-01T00:00:00Z",
+            )
+        }
+
+        assert first == second
+
+    def test_all_nodes_attach_to_the_assembled_trace(self) -> None:
+        events = build_loaded_context_events(
+            SPOKE,
+            self._rows(),
+            prefix_cache_creation=1000,
+            price=0.001,
+            base_ts="2026-01-01T00:00:00Z",
+        )
+
+        assert all(e["body"]["traceId"] == trace_id_for(SPOKE) for e in events)
+        assert all(e["type"] == "span-create" for e in events)

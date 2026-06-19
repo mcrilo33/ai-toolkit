@@ -41,10 +41,24 @@ body at build time, keyed by ``tool_use_id`` — non-destructively, so collector
 input (Bash) is never overwritten. (A standalone UPDATE-based patcher used to do this, but
 an update body that omits ``name``/``type`` makes Langfuse CLEAR them, so it was retired.)
 
-Import-safe: no environment is read at import time, so :func:`build_batch` and
-:func:`scan_transcripts` are unit-testable with no network. The HTTP I/O happens only in
-:func:`main`. Stdlib only; reuses the fetch/post helpers, env vars, and ingestion endpoint
-of ``langfuse_rollup``.
+Beyond copying, the build adds two CREATE-only enrichments (no patches):
+
+- **Per-container token rollups.** Every container node (each interaction, ``tool:Agent``,
+  sub-agent, and the synthetic root) gets ``metadata.rollup = {reused, written, input,
+  output}`` summed over its subtree of the re-parented tree, reusing
+  ``langfuse_rollup``'s sum logic but written into the create body.
+- **An itemized loaded-context subtree.** A ``loaded-context`` node under the root with one
+  category node per group and one item node per name (token size + cost): rules / memory /
+  skills / sub-agents / environment measured per-file from disk (via
+  ``measure_context_cost``), and mcp / built-in tools per-schema from a captured
+  ``api_request_body`` ``tools`` array (``--request-body``). A reconciled ``remainder`` node
+  = first-call ``cache_creation`` − Σ measured (clamped ≥ 0) absorbs the base system prompt
+  and any unavailable/truncated schemas.
+
+Import-safe: no environment is read at import time, so :func:`build_batch`,
+:func:`scan_transcripts`, and :func:`build_loaded_context_events` are unit-testable with no
+network. The HTTP I/O happens only in :func:`main`. Stdlib only; reuses the fetch/post
+helpers, env vars, and ingestion endpoint of ``langfuse_rollup``.
 """
 
 from __future__ import annotations
@@ -57,15 +71,26 @@ import os
 import sys
 import urllib.parse
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 from telemetry.langfuse_rollup import (
     GetFn,
     Observation,
     PostFn,
     all_observations,
+    build_tree,
     make_get,
     make_post,
+    subtree_totals,
+)
+from telemetry.measure_context_cost import (
+    DEFAULT_ENDPOINT,
+    DEFAULT_MODEL,
+    TokenCounter,
+    _count,
+    assemble_items,
+    make_counter,
+    measure_items,
 )
 
 logger = logging.getLogger("langfuse_spoke_tree")
@@ -101,6 +126,19 @@ _TRUNCATION_MARKER = "...[truncated]"
 
 # Default root holding Claude Code session transcripts.
 _DEFAULT_PROJECTS = Path("~/.claude/projects").expanduser()
+
+# Deterministic id prefix for the synthetic loaded-context subtree nodes.
+_LC_PREFIX = "tree-lc-"
+# A tool whose name starts with this came from an MCP connector; the rest are built-in.
+_MCP_PREFIX = "mcp__"
+# Where the MCP / built-in tool schemas were sourced from (the captured request body).
+_TOOLS_SOURCE = "request_tools_array"
+# Source label for the reconciled base-system-prompt / unmeasured remainder node.
+_REMAINDER_SOURCE = "reconciled-remainder"
+# Default cache-creation price (USD per token), Opus tier — mirrors measure_context_cost.
+_DEFAULT_PRICE = 0.00000625
+# Category order for the loaded-context subtree (disk categories first, then request-sourced).
+_LC_CATEGORY_ORDER = ("rules", "memory", "skills", "sub-agents", "environment", "mcp", "tools")
 
 
 class ToolContent(NamedTuple):
@@ -325,6 +363,34 @@ def _copy_event(
     return {"id": new_id, "type": event_type, "timestamp": start, "body": body}
 
 
+def _apply_container_rollups(events: list[IngestEvent]) -> None:
+    """Set ``metadata.rollup`` on every container node of the assembled tree, in place.
+
+    A container is any node with children once the tree is re-parented (the synthetic
+    root, each ``interaction`` / ``tool:Agent`` / sub-agent). Its rollup is the subtree
+    sum of the four usage components over itself and all descendants, computed from the
+    create-body shapes (``id`` / ``parentObservationId`` / ``usageDetails``) — the same
+    sum logic as :mod:`telemetry.langfuse_rollup`, but written into the create body
+    rather than patched. Leaves (tools, single generations) are left untouched.
+
+    Args:
+        events: The assembled ingestion events; only ``*-create`` span/generation bodies
+            participate (the ``trace-create`` is skipped). Mutated in place.
+    """
+    nodes = [event["body"] for event in events if event["type"] != "trace-create"]
+    by_id, children = build_tree(nodes)
+    for body in nodes:
+        if not children.get(body["id"]):
+            continue  # only containers (those with children) carry a rollup
+        totals = subtree_totals(body["id"], by_id, children)
+        body.setdefault("metadata", {})["rollup"] = {
+            "reused": totals["cache_read_input_tokens"],
+            "written": totals["cache_creation_input_tokens"],
+            "input": totals["input"],
+            "output": totals["output"],
+        }
+
+
 def _earliest_start(traces: list[TraceObservations]) -> str:
     """Return the earliest ISO ``startTime`` across all observations, or the fixed base."""
     starts = [
@@ -402,7 +468,9 @@ def build_batch(
                     tool_content=tool_content,
                 )
             )
-    return [trace_event, root_event, *copies]
+    events = [trace_event, root_event, *copies]
+    _apply_container_rollups(events)
+    return events
 
 
 def all_traces(spoke_run_id: str, get: GetFn) -> list[dict[str, Any]]:
@@ -561,8 +629,278 @@ def filled_tool_spans(traces: list[TraceObservations], tool_content: dict[str, T
     )
 
 
+def prefix_cache_creation(traces: list[TraceObservations]) -> int:
+    """Return the ``cache_creation_input_tokens`` of the session's first LLM call.
+
+    Claude Code writes the whole session prefix (rules, skills, tools, base system
+    prompt, ...) to the prompt cache on the first call, counted as ``cache_creation``.
+    That first-call total is the figure the loaded-context items reconcile against, so
+    the earliest observation carrying usage is chosen by ``startTime``.
+
+    Args:
+        traces: The source traces paired with their observations.
+
+    Returns:
+        The first call's cache-creation token count, or 0 when no usage is present.
+    """
+    best_start: str | None = None
+    best_value = 0
+    for _orig_trace_id, observations in traces:
+        for observation in observations:
+            usage = observation.get("usageDetails") or {}
+            written = usage.get("cache_creation_input_tokens")
+            if written is None:
+                continue
+            start = observation.get("startTime") or ""
+            if best_start is None or start < best_start:
+                best_start, best_value = start, int(written)
+    return best_value
+
+
+def itemize_tool_schemas(
+    tools: list[dict[str, Any]], *, counter: TokenCounter, price: float
+) -> list[dict[str, object]]:
+    """Itemize a request's ``tools`` array into per-tool token/cost rows.
+
+    Each tool schema is counted on its own; ``mcp__``-prefixed names are MCP connector
+    tools and the rest are built-in tools. The schema text is the JSON-serialized tool
+    entry, counted via ``counter`` with the char/4 fallback (marking the row estimated).
+
+    Args:
+        tools: The ``tools`` array captured from an ``api_request_body`` (each entry a
+            ``{name, description, input_schema}`` dict).
+        counter: Token counter; raises ``CountTokensError`` when unreachable.
+        price: Cache-creation price in USD per token.
+
+    Returns:
+        One row per named tool with keys ``category`` (``mcp`` / ``tools``), ``name``,
+        ``tokens``, ``cost_usd``, ``source``, ``estimated``.
+    """
+    rows: list[dict[str, object]] = []
+    for tool in tools:
+        name = tool.get("name")
+        if not name:
+            continue
+        tokens, fell_back = _count(json.dumps(tool, ensure_ascii=False, sort_keys=True), counter)
+        rows.append(
+            {
+                "category": "mcp" if str(name).startswith(_MCP_PREFIX) else "tools",
+                "name": str(name),
+                "tokens": tokens,
+                "cost_usd": tokens * price,
+                "source": _TOOLS_SOURCE,
+                "estimated": fell_back,
+            }
+        )
+    return rows
+
+
+def load_tools_from_request(path: Path) -> list[dict[str, Any]]:
+    """Read the ``tools`` array from a captured ``api_request_body`` JSON file.
+
+    The built-in and MCP tool schemas are not on disk; they live only in the request the
+    runtime sends. When the file is missing, unreadable, malformed, or has no ``tools``
+    array (e.g. the 60 KB body cap truncated it), an empty list is returned and those
+    tools fall into the reconciled remainder rather than being fabricated.
+
+    Args:
+        path: Path to a JSON file holding one ``api_request_body``.
+
+    Returns:
+        The captured ``tools`` array, or an empty list when unavailable.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("cannot read request tools from %s: %s", path, e)
+        return []
+    tools = data.get("tools") if isinstance(data, dict) else None
+    return tools if isinstance(tools, list) else []
+
+
+def _lc_id(spoke_run_id: str, key: str) -> str:
+    """Return the deterministic id of one loaded-context node for a spoke."""
+    digest = hashlib.sha1(f"{spoke_run_id}:{key}".encode()).hexdigest()[:24]
+    return _LC_PREFIX + digest
+
+
+def _human_tokens(tokens: int) -> str:
+    """Render a token count compactly for a node label (e.g. ``3.2k``)."""
+    return f"{tokens / 1000:.1f}k" if tokens >= 1000 else str(tokens)
+
+
+def _lc_node(
+    *, node_id: str, parent_id: str, trace_id: str, name: str, base_ts: str, metadata: dict
+) -> IngestEvent:
+    """Shape one loaded-context span-create event."""
+    return {
+        "id": node_id,
+        "type": "span-create",
+        "timestamp": base_ts,
+        "body": {
+            "id": node_id,
+            "traceId": trace_id,
+            "parentObservationId": parent_id,
+            "name": name,
+            "startTime": base_ts,
+            "metadata": metadata,
+        },
+    }
+
+
+def build_loaded_context_events(
+    spoke_run_id: str,
+    item_rows: list[dict[str, object]],
+    *,
+    prefix_cache_creation: int,
+    price: float,
+    base_ts: str,
+) -> list[IngestEvent]:
+    """Build the itemized loaded-context subtree under the spoke root.
+
+    Emits a ``loaded-context`` parent under the synthetic root, one category node per
+    group carrying its rolled-up total, one item node per name (token size + cost +
+    source), and a final ``remainder`` node reconciling the base system prompt and any
+    unmeasured tools: ``prefix_cache_creation − Σ measured``, clamped at zero. All ids
+    derive from the spoke run id so a rerun overwrites the same nodes.
+
+    Args:
+        spoke_run_id: The spoke run identifier.
+        item_rows: Per-name measured rows (from :func:`measure_items` and
+            :func:`itemize_tool_schemas`), each with ``category``, ``name``, ``tokens``,
+            ``cost_usd``, ``source``, ``estimated``.
+        prefix_cache_creation: The session's first-call cache-creation token total.
+        price: Cache-creation price in USD per token (for the remainder's cost).
+        base_ts: ISO timestamp stamped on every synthetic node.
+
+    Returns:
+        The loaded-context ingestion events: parent, categories, items, remainder.
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    root_id = root_id_for(spoke_run_id)
+    lc_id = _lc_id(spoke_run_id, "loaded-context")
+
+    measured_tokens = sum(int(cast(int, row["tokens"])) for row in item_rows)
+    measured_cost = sum(float(cast(float, row["cost_usd"])) for row in item_rows)
+    events = [
+        _lc_node(
+            node_id=lc_id,
+            parent_id=root_id,
+            trace_id=trace_id,
+            name="loaded-context",
+            base_ts=base_ts,
+            metadata={"tokens": measured_tokens, "cost_usd": measured_cost},
+        )
+    ]
+    grouped = _group_rows_by_category(item_rows)
+    for category, rows in grouped:
+        cat_id = _lc_id(spoke_run_id, category)
+        events.append(
+            _lc_node(
+                node_id=cat_id,
+                parent_id=lc_id,
+                trace_id=trace_id,
+                name=category,
+                base_ts=base_ts,
+                metadata={
+                    "tokens": sum(int(cast(int, r["tokens"])) for r in rows),
+                    "cost_usd": sum(float(cast(float, r["cost_usd"])) for r in rows),
+                },
+            )
+        )
+        events.extend(
+            _lc_item_node(spoke_run_id, category, cat_id, trace_id, base_ts, row) for row in rows
+        )
+    events.append(
+        _remainder_node(
+            spoke_run_id, lc_id, trace_id, base_ts, prefix_cache_creation, measured_tokens, price
+        )
+    )
+    return events
+
+
+def _group_rows_by_category(
+    item_rows: list[dict[str, object]],
+) -> list[tuple[str, list[dict[str, object]]]]:
+    """Group item rows by category in the fixed display order, dropping empty groups."""
+    groups: list[tuple[str, list[dict[str, object]]]] = []
+    for category in _LC_CATEGORY_ORDER:
+        rows = [row for row in item_rows if row["category"] == category]
+        if rows:
+            groups.append((category, rows))
+    return groups
+
+
+def _lc_item_node(
+    spoke_run_id: str,
+    category: str,
+    cat_id: str,
+    trace_id: str,
+    base_ts: str,
+    row: dict[str, object],
+) -> IngestEvent:
+    """Shape one per-name item node with its token size, cost, and source."""
+    tokens = int(cast(int, row["tokens"]))
+    metadata: dict[str, object] = {
+        "tokens": tokens,
+        "cost_usd": row["cost_usd"],
+        "source": row["source"],
+    }
+    if row.get("estimated"):
+        metadata["estimated"] = True
+    return _lc_node(
+        node_id=_lc_id(spoke_run_id, f"{category}/{row['name']}"),
+        parent_id=cat_id,
+        trace_id=trace_id,
+        name=f"{row['name']}: {_human_tokens(tokens)}",
+        base_ts=base_ts,
+        metadata=metadata,
+    )
+
+
+def _remainder_node(
+    spoke_run_id: str,
+    lc_id: str,
+    trace_id: str,
+    base_ts: str,
+    prefix: int,
+    measured: int,
+    price: float,
+) -> IngestEvent:
+    """Shape the reconciled remainder node (base system prompt + unmeasured schemas)."""
+    tokens = max(0, prefix - measured)
+    return _lc_node(
+        node_id=_lc_id(spoke_run_id, "remainder"),
+        parent_id=lc_id,
+        trace_id=trace_id,
+        name=f"remainder: {_human_tokens(tokens)}",
+        base_ts=base_ts,
+        metadata={"tokens": tokens, "cost_usd": tokens * price, "source": _REMAINDER_SOURCE},
+    )
+
+
+def loaded_context_rows(
+    root: Path, tools: list[dict[str, Any]], *, counter: TokenCounter, price: float
+) -> list[dict[str, object]]:
+    """Measure every itemized loaded-context entry: disk items plus request tools.
+
+    Args:
+        root: Worktree root for the disk-measurable items.
+        tools: The captured request ``tools`` array (MCP + built-in schemas).
+        counter: Token counter; raises ``CountTokensError`` when unreachable.
+        price: Cache-creation price in USD per token.
+
+    Returns:
+        The combined per-name rows (rules/memory/skills/sub-agents/environment + mcp/tools).
+    """
+    rows = measure_items(assemble_items(root), counter=counter, price=price)
+    rows.extend(itemize_tool_schemas(tools, counter=counter, price=price))
+    return rows
+
+
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse the CLI arguments for the spoke-tree assembler."""
+    env = os.environ
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -572,6 +910,31 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         type=Path,
         default=_DEFAULT_PROJECTS,
         help="Root holding Claude Code session transcripts (default: ~/.claude/projects).",
+    )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path.cwd(),
+        help="Worktree root for the disk-measurable loaded-context items (default: cwd).",
+    )
+    parser.add_argument(
+        "--request-body",
+        type=Path,
+        default=None,
+        help="JSON file holding a captured api_request_body; its 'tools' array sources the "
+        "MCP + built-in tool schemas. Omitted/truncated -> those tools fall into remainder.",
+    )
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Model id for count_tokens.")
+    parser.add_argument(
+        "--endpoint",
+        default=env.get("ANTHROPIC_BASE_URL", DEFAULT_ENDPOINT),
+        help="Anthropic API base URL for count_tokens.",
+    )
+    parser.add_argument(
+        "--api-key", default=env.get("ANTHROPIC_API_KEY"), help="Anthropic API key."
+    )
+    parser.add_argument(
+        "--price", type=float, default=_DEFAULT_PRICE, help="Cache-creation USD per token."
     )
     return parser.parse_args(argv)
 
@@ -597,13 +960,25 @@ def main(argv: list[str] | None = None) -> int:
     traces = fetch_session(args.spoke_run_id, get)
     tool_content = scan_transcripts(args.projects, _tool_span_ids(traces))
     batch = build_batch(traces, args.spoke_run_id, tool_content)
-    post_in_chunks(batch, post)
+
+    counter = make_counter(endpoint=args.endpoint, api_key=args.api_key, model=args.model)
+    tools = load_tools_from_request(args.request_body) if args.request_body else []
+    rows = loaded_context_rows(args.root.resolve(), tools, counter=counter, price=args.price)
+    context_events = build_loaded_context_events(
+        args.spoke_run_id,
+        rows,
+        prefix_cache_creation=prefix_cache_creation(traces),
+        price=args.price,
+        base_ts=_earliest_start(traces),
+    )
+    post_in_chunks(batch + context_events, post)
 
     trace_id = trace_id_for(args.spoke_run_id)
     filled = filled_tool_spans(traces, tool_content)
     print(
         f"{len(batch) - 2} observations assembled under trace {trace_id} "
-        f"(roots collapsed to 1), {filled} tool spans filled from transcript"
+        f"(roots collapsed to 1), {filled} tool spans filled from transcript, "
+        f"{len(rows)} loaded-context items itemized"
     )
     return 0
 

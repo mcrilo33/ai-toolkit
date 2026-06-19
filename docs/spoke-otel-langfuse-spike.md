@@ -280,6 +280,8 @@ The assembly shape:
 - Tool content: for a visible `tool:<Name>` span the builder grafts transcript-sourced
   `input`/`output` into the same create body (see the next section), so the fresh
   observation carries content the native span lacked.
+- Per-container token rollups and a fully-itemized loaded-context subtree, both emitted as
+  CREATE bodies in the same build (see the two sections below).
 
 Notes and limits:
 
@@ -329,6 +331,68 @@ The run prints `… , N tool spans filled from transcript` alongside the assembl
 > timestamp merges. The tree builder's create-time approach has neither problem, so the
 > patcher was retired.
 
+## Per-container token rollups (in the tree builder)
+
+The standalone `langfuse_rollup.py` patches `metadata.rollup` onto the *native* per-turn
+traces after the fact. The assembled tree re-parents observations across trace boundaries,
+so `langfuse_spoke_tree.py` recomputes the rollup over the **assembled** structure and
+writes it into each container's CREATE body — no destructive patch, and it reflects the
+single-tree parentage (sub-agents nested under their `tool:Agent`, every turn under the
+spoke root).
+
+For every container node — any node that has children once re-parented: each
+`interaction`, each `tool:Agent`, each sub-agent, and the synthetic spoke root —
+`metadata.rollup = {reused, written, input, output}` is the subtree sum of the four usage
+components (`cache_read_input_tokens` = reused, `cache_creation_input_tokens` = written,
+`input`, `output`) over itself and all descendants, using the same sum logic as
+`langfuse_rollup.subtree_totals`. Leaves (a single `llm_request`, a `Bash`/`Read` tool)
+are not containers and keep their metadata verbatim.
+
+## Itemized loaded-context subtree (in the tree builder)
+
+Under the spoke root the builder also emits a `loaded-context` subtree that breaks the
+session's cold-cache prefix down to one node **per name**, each with its own token size and
+cost. The shape:
+
+- A `loaded-context` parent under the synthetic root carrying the measured grand total.
+- One **category** node per group (`rules`, `memory`, `skills`, `sub-agents`,
+  `environment`, `mcp`, `tools`) carrying that category's rolled-up total.
+- One **item** node per name under its category — e.g. `code-quality.md: 1.9k` — with
+  `metadata = {tokens, cost_usd, source, estimated?}`.
+- A final `remainder` node = first-call `cache_creation − Σ(measured items)`, clamped at
+  zero, absorbing the base system prompt and anything unmeasured.
+
+Where each category's items come from:
+
+| Category | Source | Per-item granularity |
+|----------|--------|----------------------|
+| `rules` | `CLAUDE.md` + `.claude/rules/*.md` | one node per file (exact, from disk) |
+| `memory` | `MEMORY.md` + a `memory/` dir's `*.md` | one node per file (exact) |
+| `skills` | each `.claude/skills/*/SKILL.md` frontmatter | one node per skill name |
+| `sub-agents` | each `.claude/agents/*.md` frontmatter | one node per agent name |
+| `environment` | reconstructed block | single node, always `estimated` |
+| `mcp` | the request `tools` array, `mcp__`-prefixed names | one node per MCP tool schema |
+| `tools` | the request `tools` array, non-`mcp__` names | one node per built-in tool schema |
+
+The disk categories reuse `measure_context_cost.assemble_items` / `measure_items`; the
+`mcp` + `tools` schemas are not on disk, so they are sourced from a captured
+`api_request_body` `tools` array passed via `--request-body <file.json>`. Each schema's
+tokens come from `count_tokens` (char/4 fallback, marked `estimated`).
+
+```bash
+LANGFUSE_HOST=http://localhost:3000 LANGFUSE_BASIC_AUTH="Basic <base64(pk:sk)>" \
+ANTHROPIC_API_KEY=sk-… \
+    python3 scripts/telemetry/langfuse_spoke_tree.py <spoke_run_id> \
+        --root . --request-body /path/to/api_request_body.json
+```
+
+> [!NOTE]
+> Tool schemas are honestly truncation-aware. Claude Code caps a logged request body at
+> ~60 KB, so a large `tools` array can arrive truncated; and the MCP/OAuth connectors
+> cannot be queried after the run. When `--request-body` is absent, unreadable, or its
+> `tools` array is missing, those tools are **not fabricated** — they fall into the
+> reconciled `remainder` instead. Itemize what is available; reconcile the rest.
+
 ## Loaded-context cost baseline (`measure_context_cost.py`)
 
 Claude Code writes a session prefix to the prompt cache on the first call of a session;
@@ -371,8 +435,11 @@ category `estimated`. It never hard-fails on missing creds. Cost is `tokens × p
 
 `<root>/.ai-toolkit/context-cost.json` — gitignored, since it is a generated per-checkout
 artifact. Each category records `tokens`, `cost_usd`, `source_files`, a `content_hash`
-(sha256 of the concatenated sources), and `estimated`. The manifest is idempotent: the same
-sources (same per-category `content_hash`) yield the same token/cost numbers.
+(sha256 of the concatenated sources), and `estimated`. The manifest also carries an `items`
+array — one entry per file / skill / agent (`category`, `name`, `tokens`, `cost_usd`,
+`source`, `estimated`) — which is what the spoke tree's itemized loaded-context subtree
+reads. The manifest is idempotent: the same sources (same per-category `content_hash`) yield
+the same token/cost numbers.
 
 ```bash
 # count_tokens path — counts match what the runtime caches:
