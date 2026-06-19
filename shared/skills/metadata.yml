@@ -180,3 +180,8 @@ security-review:
   description: "Interactive security audit — 10-point checklist covering secrets, input validation, SQL injection, auth, XSS, CSRF, rate limiting, data exposure, dependencies, and infrastructure. Use when auditing code before shipping."
   allowed-tools: "read_file grep_search semantic_search get_changed_files run_in_terminal"
   argument-hint: "[scope: file path, module, or 'full']"
+
+langfuse:
+  name: "langfuse"
+  description: "Interact with Langfuse and access its documentation: query or modify traces, prompts, datasets, scores, and sessions via the langfuse-cli, look up concepts/integration/SDK guides, instrument apps, migrate prompts, and debug traces. Use when working with Langfuse observability, the OTel collector pipeline, or per-spoke cost/latency analysis."
+  argument-hint: "[topic: instrumentation|cli|error-analysis|prompt-migration|judge-calibration]"
