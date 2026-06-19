@@ -241,3 +241,75 @@ Notes and limits:
   sub-agent) get their real subtree totals.
 - **Skills are not covered.** A skill's work is not nested under the `Skill` span, so it is
   not attributed to that span's subtree. Covering skills needs a scope rule; deferred.
+
+## Loaded-context cost baseline (`measure_context_cost.py`)
+
+Claude Code writes a session prefix to the prompt cache on the first call of a session;
+that prefix shows up as `cache_creation` tokens. The prefix is assembled from several
+categories, and we want to know how much each one costs so the dashboard can attribute the
+cold-cache write rather than treating it as one opaque number.
+
+`scripts/telemetry/measure_context_cost.py` measures the categories that are
+*source-measurable* — reconstructable from on-disk files in the worktree — and stores their
+token count and cost in a reusable manifest. A later decomposition step reads the manifest
+instead of re-deriving the numbers.
+
+### What it measures vs the reconciled remainder
+
+Measured from the worktree (`--root`, default cwd):
+
+| Category | Source |
+|----------|--------|
+| `rules` | `CLAUDE.md` + `.claude/rules/*.md` (concatenated text) |
+| `memory` | `MEMORY.md` + a `memory/` dir's `*.md` if present |
+| `skills` | the injected available-skills list — `name` + `description` parsed from each `.claude/skills/*/SKILL.md` frontmatter, NOT the SKILL bodies |
+| `sub-agents` | the agent-types list — `name` + `description` from each `.claude/agents/*.md` frontmatter |
+| `environment` | a reconstructed block (platform, cwd, a date placeholder, git user email); always flagged `estimated` since it never matches the runtime byte-for-byte |
+
+Three categories are **not** measured here because they are not sourceable from a standalone
+script: MCP connector / OAuth schemas, built-in tool schemas, and the base system prompt.
+They are reconciled later as a single remainder against the real first-call total:
+
+```text
+unmeasured_floor ≈ cache_creation_total − measured_total
+```
+
+Token counting uses the Anthropic `count_tokens` endpoint when reachable
+(`ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY`, or `--endpoint` / `--api-key`); when
+unreachable or uncredentialed it falls back to a `len(text) // 4` estimate and marks that
+category `estimated`. It never hard-fails on missing creds. Cost is `tokens × price`, where
+`--price` defaults to the Opus cache-creation rate (`0.00000625` USD/token).
+
+### Where the manifest lives
+
+`<root>/.ai-toolkit/context-cost.json` — gitignored, since it is a generated per-checkout
+artifact. Each category records `tokens`, `cost_usd`, `source_files`, a `content_hash`
+(sha256 of the concatenated sources), and `estimated`. The manifest is idempotent: the same
+sources (same per-category `content_hash`) yield the same token/cost numbers.
+
+```bash
+# count_tokens path — counts match what the runtime caches:
+ANTHROPIC_API_KEY=sk-… python3 scripts/telemetry/measure_context_cost.py --root .
+
+# offline estimate path — no creds needed; categories flagged estimated:
+python3 scripts/telemetry/measure_context_cost.py --root .
+```
+
+### Validation runbook (operator-run against a live session)
+
+These checks are **not** unit tests — the unit suite stubs `count_tokens` and never touches
+the network. They are run manually by the operator against a real Claude Code session's
+telemetry.
+
+1. **Reconciliation.** Run the script in the spoke's worktree, then read the first LLM
+   call's `cache_creation` from that session's telemetry. `Sum(measured) + framework_floor`
+   should approximate the first call's `cache_creation`, where `framework_floor` is the
+   system-prompt + built-in-tool + MCP remainder from check 3. A large unexplained gap means
+   a measured category drifted from what the runtime actually loaded.
+2. **Differential.** Add one rule (or one skill) to the worktree, re-run the script, and
+   start a fresh session. The measured category's tokens and the real first-call
+   `cache_creation` should both rise by ~the same amount. Divergence means the script is
+   measuring something the runtime does not load, or vice versa.
+3. **Floor calibration.** Start a bare `claude -p` session in a directory with no rules /
+   skills / agents / memory. Its first-call `cache_creation` is the system-prompt +
+   built-in-tool floor — the unmeasured remainder to subtract in check 1.
