@@ -6,7 +6,7 @@
 #   1. Token remap. Claude Code emits bare `input_tokens` / `output_tokens`; Langfuse
 #      reads usage only from `gen_ai.usage.*`. Without this remap, cost reads $0.
 #   2. Span-name rewrite. Every tool span is named `claude_code.tool`; rewriting the
-#      name to encode the dimension (`tool:Bash`, `hook:PreToolUse:Bash`, `sub-agent:llm`)
+#      name to encode the dimension (`tool:Bash`, `hook:PreToolUse:Bash`, `sub-agent:llm`, `sub-agent:Explore`)
 #      makes Langfuse's "group by name" give cost & latency PER tool / hook / sub-agent.
 #   3. Content mapping. user_prompt + tool command/output (opt-in OTEL_LOG_* flags) →
 #      langfuse.observation.input/output so prompts and per-tool I/O render. LLM
@@ -53,6 +53,7 @@ processors:
           - set(name, Concat(["tool:", attributes["tool_name"]], "")) where name == "claude_code.tool" and attributes["tool_name"] != nil
           - set(name, Concat(["hook:", attributes["hook_name"]], "")) where name == "claude_code.hook" and attributes["hook_name"] != nil
           - set(name, "sub-agent:llm") where name == "claude_code.llm_request" and attributes["agent_id"] != nil
+          - set(name, Concat(["sub-agent:", attributes["subagent_type"]], "")) where attributes["tool_name"] == "Agent" and attributes["subagent_type"] != nil
           # 3) spoke grouping → one spoke (across resumes) = one Langfuse session.
           #    Langfuse reads the session from span attributes, precedence
           #    langfuse.session.id > session.id. Claude Code sets session.id to its own
