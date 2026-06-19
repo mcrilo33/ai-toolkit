@@ -8,6 +8,9 @@
 #   2. Span-name rewrite. Every tool span is named `claude_code.tool`; rewriting the
 #      name to encode the dimension (`tool:Bash`, `hook:PreToolUse:Bash`, `sub-agent:llm`)
 #      makes Langfuse's "group by name" give cost & latency PER tool / hook / sub-agent.
+#   3. Content mapping. user_prompt + tool command/output (opt-in OTEL_LOG_* flags) →
+#      langfuse.observation.input/output so prompts and per-tool I/O render. LLM
+#      assistant text is not in traces (it goes to the OTel logs signal).
 #
 # It also re-homes each span's Langfuse session onto the spoke (`spoke_run_id`), so one
 # spoke — across Claude Code resumes — is one Langfuse session.
@@ -57,6 +60,19 @@ processors:
           #    win (verified 2026-06-19: span session.id alone grouped under the UUID).
           - set(attributes["langfuse.session.id"], resource.attributes["spoke_run_id"]) where resource.attributes["spoke_run_id"] != nil
           - set(attributes["session.id"], resource.attributes["spoke_run_id"]) where resource.attributes["spoke_run_id"] != nil
+          # 4) content → Langfuse input/output. Opt-in: needs OTEL_LOG_USER_PROMPTS +
+          #    OTEL_LOG_TOOL_DETAILS + OTEL_LOG_TOOL_CONTENT at spoke launch (these ship
+          #    content off-box, so they are operator opt-in, NOT in the #83 gate). The
+          #    LLM assistant text is NOT available — Claude Code routes raw API bodies to
+          #    the OTel logs signal, which Langfuse trace ingestion does not read.
+          - set(attributes["langfuse.observation.input"], attributes["user_prompt"]) where attributes["user_prompt"] != nil
+          - set(attributes["langfuse.observation.input"], attributes["full_command"]) where attributes["full_command"] != nil
+      - context: spanevent
+        statements:
+          # Tool result/output lives on a span EVENT (TOOL_CONTENT); lift it onto the
+          # parent tool span so Langfuse renders per-tool input/output.
+          - set(span.attributes["langfuse.observation.output"], attributes["output"]) where attributes["output"] != nil
+          - set(span.attributes["langfuse.observation.input"], attributes["bash_command"]) where span.attributes["langfuse.observation.input"] == nil and attributes["bash_command"] != nil
 
 exporters:
   otlphttp/langfuse:
