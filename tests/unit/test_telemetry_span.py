@@ -89,6 +89,9 @@ def _env(
         # the payload tool_use_id (the #66 precedence), so strip it for a deterministic
         # parent_id driven only by what each test sets (mirrors test_telemetry_parent_span).
         "AI_TOOLKIT_PARENT_SPAN",
+        # The OTLP fan-out sink (#83) fires whenever this points at a collector; strip it so
+        # the events.jsonl tests never accidentally attempt a real POST under a live env.
+        "AI_TOOLKIT_OTEL_SPAN_ENDPOINT",
     ):
         env.pop(var, None)
     if enabled:
@@ -584,3 +587,350 @@ class TestHookCausalParent:
         )
 
         assert _read_events(telemetry_dir / "events.jsonl")[0]["hook_event"] is None
+
+
+# ── OTLP / Langfuse fan-out sink (Issue #83) ───────────────
+
+# The endpoint env var that gates the second, INDEPENDENT sink: a single OTLP/HTTP-JSON
+# span POSTed to a local collector (which maps resource ``spoke_run_id`` -> a Langfuse
+# session). Non-empty + curl present fires it; it does NOT depend on AI_TOOLKIT_TELEMETRY.
+OTEL_ENV = "AI_TOOLKIT_OTEL_SPAN_ENDPOINT"
+
+# The forbidden-content needles a payload may carry — the OTLP body is metadata-only.
+_SECRET_PAYLOAD = json.dumps(
+    {
+        "session_id": "sess-1",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "echo SECRETCOMMAND123", "file_path": "/x/SECRETPATH/t"},
+        "transcript_path": "/home/u/SECRETPATH/transcript.jsonl",
+        "tool_use_id": "toolu_ok",
+    }
+)
+
+
+def _stub_curl(tmp_path: Path) -> tuple[Path, Path]:
+    """Write a stub ``curl`` that records its argv + stdin to a capture file.
+
+    Returns ``(bin_dir, capture)``: prepend ``bin_dir`` to PATH and export
+    ``CURL_CAPTURE=capture`` in the child env. The stub redirects nothing of the
+    caller's — it only writes the capture — so it never breaks the invisibility test.
+    """
+    bin_dir = tmp_path / "stubbin"
+    bin_dir.mkdir()
+    capture = tmp_path / "curl_capture.txt"
+    stub = bin_dir / "curl"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        '{ printf "ARGV: %s\\n" "$*"; printf "STDIN_START\\n"; cat; '
+        'printf "\\nSTDIN_END\\n"; } > "$CURL_CAPTURE"\n'
+    )
+    stub.chmod(0o755)
+    return bin_dir, capture
+
+
+def _otel_env(
+    tmp_path: Path,
+    capture_bin: Path,
+    capture: Path,
+    *,
+    endpoint: str | None,
+    telemetry_dir: Path | None = None,
+    enabled: bool = True,
+    payload: str | None = None,
+) -> dict[str, str]:
+    """An env with the stub curl on PATH (so ``command -v curl`` finds it)."""
+    env = _env(telemetry_dir, enabled=enabled, payload=payload)
+    env["PATH"] = f"{capture_bin}{os.pathsep}{env['PATH']}"
+    env["CURL_CAPTURE"] = str(capture)
+    if endpoint is not None:
+        env[OTEL_ENV] = endpoint
+    return env
+
+
+def _wait_for_capture(capture: Path, timeout: float = 5.0) -> bool:
+    """Poll for the backgrounded curl stub to finish writing its capture file."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if capture.exists() and "STDIN_END" in capture.read_text():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _otlp_body(capture: str) -> dict:
+    """Extract + parse the OTLP JSON body the stub captured from curl's stdin."""
+    start = capture.index("STDIN_START") + len("STDIN_START")
+    end = capture.index("STDIN_END")
+    return json.loads(capture[start:end].strip())
+
+
+def _span(body: dict) -> dict:
+    return body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+
+
+def _str_attrs(attributes: list[dict]) -> dict[str, str]:
+    """Flatten an OTLP attribute list to {key: stringValue}."""
+    return {a["key"]: a["value"]["stringValue"] for a in attributes}
+
+
+class TestOtlpSinkGate:
+    """The OTLP sink is opt-in on the endpoint var and independent of the push sink."""
+
+    def test_no_otlp_call_when_endpoint_unset(
+        self, project_root: Path, telemetry_dir: Path, tmp_path: Path
+    ) -> None:
+        bin_dir, capture = _stub_curl(tmp_path)
+        env = _otel_env(tmp_path, bin_dir, capture, endpoint=None, telemetry_dir=telemetry_dir)
+        result = _emit(
+            "--kind step --name solo-cycle --phase green --status success",
+            env,
+            cwd=project_root,
+        )
+
+        assert result.returncode == 0
+        assert not _wait_for_capture(capture, timeout=1.0)
+        assert not capture.exists()
+
+    def test_events_jsonl_schema_unchanged_when_endpoint_unset(
+        self, project_root: Path, telemetry_dir: Path, tmp_path: Path
+    ) -> None:
+        # The push sink keeps its exact schema: no OTLP-only keys leak into events.jsonl.
+        bin_dir, capture = _stub_curl(tmp_path)
+        env = _otel_env(tmp_path, bin_dir, capture, endpoint=None, telemetry_dir=telemetry_dir)
+        _emit(
+            "--kind lifecycle --name worktree-new --phase spawn --status success",
+            env,
+            cwd=project_root,
+        )
+
+        span = _read_events(telemetry_dir / "events.jsonl")[0]
+        assert set(span.keys()) == SCHEMA_KEYS
+
+    def test_otlp_fires_when_push_sink_disabled(
+        self, project_root: Path, telemetry_dir: Path, tmp_path: Path
+    ) -> None:
+        # The key independence guarantee: an AI_TOOLKIT_OTEL spoke gets OTLP spans even
+        # when AI_TOOLKIT_TELEMETRY (events.jsonl) is off.
+        _seed_spoke(project_root)
+        bin_dir, capture = _stub_curl(tmp_path)
+        env = _otel_env(
+            tmp_path,
+            bin_dir,
+            capture,
+            endpoint="http://localhost:4318",
+            telemetry_dir=telemetry_dir,
+            enabled=False,
+        )
+        result = _emit(
+            "--kind step --name solo-cycle --phase green --status success",
+            env,
+            cwd=project_root,
+        )
+
+        assert result.returncode == 0
+        assert _wait_for_capture(capture)
+        assert not (telemetry_dir / "events.jsonl").exists()
+
+
+class TestOtlpSinkPayload:
+    """When fired, the POST carries the proven OTLP shape grouped under the spoke."""
+
+    def test_posts_to_traces_endpoint(
+        self, project_root: Path, telemetry_dir: Path, tmp_path: Path
+    ) -> None:
+        bin_dir, capture = _stub_curl(tmp_path)
+        env = _otel_env(
+            tmp_path,
+            bin_dir,
+            capture,
+            endpoint="http://localhost:4318",
+            telemetry_dir=telemetry_dir,
+        )
+        _emit("--kind step --name solo-cycle --phase green", env, cwd=project_root)
+
+        assert _wait_for_capture(capture)
+        assert "http://localhost:4318/v1/traces" in capture.read_text()
+
+    def test_resource_carries_spoke_run_id_session(
+        self, project_root: Path, telemetry_dir: Path, tmp_path: Path
+    ) -> None:
+        _seed_spoke(project_root, "feature/83-otel+1700000000")
+        bin_dir, capture = _stub_curl(tmp_path)
+        env = _otel_env(
+            tmp_path,
+            bin_dir,
+            capture,
+            endpoint="http://localhost:4318",
+            telemetry_dir=telemetry_dir,
+        )
+        _emit("--kind step --name solo-cycle --phase green", env, cwd=project_root)
+
+        assert _wait_for_capture(capture)
+        body = _otlp_body(capture.read_text())
+        res_attrs = _str_attrs(body["resourceSpans"][0]["resource"]["attributes"])
+        assert res_attrs["service.name"] == "claude-code"
+        assert res_attrs["spoke_run_id"] == "feature/83-otel+1700000000"
+
+    def test_span_name_is_kind_colon_phase(
+        self, project_root: Path, telemetry_dir: Path, tmp_path: Path
+    ) -> None:
+        bin_dir, capture = _stub_curl(tmp_path)
+        env = _otel_env(
+            tmp_path,
+            bin_dir,
+            capture,
+            endpoint="http://localhost:4318",
+            telemetry_dir=telemetry_dir,
+        )
+        _emit("--kind step --name solo-cycle --phase green --status success", env, cwd=project_root)
+
+        assert _wait_for_capture(capture)
+        assert _span(_otlp_body(capture.read_text()))["name"] == "step:green"
+
+    def test_span_name_falls_back_to_name_without_phase(
+        self, project_root: Path, telemetry_dir: Path, tmp_path: Path
+    ) -> None:
+        bin_dir, capture = _stub_curl(tmp_path)
+        env = _otel_env(
+            tmp_path,
+            bin_dir,
+            capture,
+            endpoint="http://localhost:4318",
+            telemetry_dir=telemetry_dir,
+        )
+        _emit("--kind hook --name secrets-scan --status success", env, cwd=project_root)
+
+        assert _wait_for_capture(capture)
+        assert _span(_otlp_body(capture.read_text()))["name"] == "secrets-scan"
+
+    def test_span_attributes_carry_kind_phase_status(
+        self, project_root: Path, telemetry_dir: Path, tmp_path: Path
+    ) -> None:
+        bin_dir, capture = _stub_curl(tmp_path)
+        env = _otel_env(
+            tmp_path,
+            bin_dir,
+            capture,
+            endpoint="http://localhost:4318",
+            telemetry_dir=telemetry_dir,
+        )
+        _emit("--kind step --name solo-cycle --phase green --status failure", env, cwd=project_root)
+
+        assert _wait_for_capture(capture)
+        attrs = _str_attrs(_span(_otlp_body(capture.read_text()))["attributes"])
+        assert attrs["workflow.kind"] == "step"
+        assert attrs["workflow.phase"] == "green"
+        assert attrs["status"] == "failure"
+
+    def test_human_span_carries_decision_and_wait_ms(
+        self, project_root: Path, telemetry_dir: Path, tmp_path: Path
+    ) -> None:
+        # The proven gate:PLAN node landed with its decision + wait. A human span adds a
+        # `decision` attribute (the gate's outcome = status) and `human.wait_ms`.
+        bin_dir, capture = _stub_curl(tmp_path)
+        env = _otel_env(
+            tmp_path,
+            bin_dir,
+            capture,
+            endpoint="http://localhost:4318",
+            telemetry_dir=telemetry_dir,
+        )
+        _emit(
+            "--kind human --name plan-gate --phase gate --status success "
+            "--human-type gate --human-wait-ms 4200",
+            env,
+            cwd=project_root,
+        )
+
+        assert _wait_for_capture(capture)
+        attrs = _str_attrs(_span(_otlp_body(capture.read_text()))["attributes"])
+        assert attrs["decision"] == "success"
+        assert attrs["human.wait_ms"] == "4200"
+
+    def test_start_ms_drives_span_nanos(
+        self, project_root: Path, telemetry_dir: Path, tmp_path: Path
+    ) -> None:
+        # start nanos = start_ms * 1e6. 1_700_000_000_000 ms -> 1_700_000_000_000_000_000 ns.
+        bin_dir, capture = _stub_curl(tmp_path)
+        env = _otel_env(
+            tmp_path,
+            bin_dir,
+            capture,
+            endpoint="http://localhost:4318",
+            telemetry_dir=telemetry_dir,
+        )
+        _emit(
+            "--kind lifecycle --name worktree-new --phase spawn --start-ms 1700000000000",
+            env,
+            cwd=project_root,
+        )
+
+        assert _wait_for_capture(capture)
+        span = _span(_otlp_body(capture.read_text()))
+        assert span["startTimeUnixNano"] == "1700000000000000000"
+        assert int(span["endTimeUnixNano"]) >= int(span["startTimeUnixNano"])
+
+    def test_trace_and_span_ids_are_hex(
+        self, project_root: Path, telemetry_dir: Path, tmp_path: Path
+    ) -> None:
+        bin_dir, capture = _stub_curl(tmp_path)
+        env = _otel_env(
+            tmp_path,
+            bin_dir,
+            capture,
+            endpoint="http://localhost:4318",
+            telemetry_dir=telemetry_dir,
+        )
+        _emit("--kind step --name solo-cycle --phase green", env, cwd=project_root)
+
+        assert _wait_for_capture(capture)
+        span = _span(_otlp_body(capture.read_text()))
+        assert len(span["traceId"]) == 32 and int(span["traceId"], 16) >= 0
+        assert len(span["spanId"]) == 16 and int(span["spanId"], 16) >= 0
+
+
+class TestOtlpSinkDiscipline:
+    """Privacy + invisibility apply to the OTLP body exactly as to events.jsonl."""
+
+    def test_otlp_body_has_no_forbidden_content(
+        self, project_root: Path, telemetry_dir: Path, tmp_path: Path
+    ) -> None:
+        bin_dir, capture = _stub_curl(tmp_path)
+        env = _otel_env(
+            tmp_path,
+            bin_dir,
+            capture,
+            endpoint="http://localhost:4318",
+            telemetry_dir=telemetry_dir,
+            payload=_SECRET_PAYLOAD,
+        )
+        _emit("--kind hook --name secrets-scan.sh --status success", env, cwd=project_root)
+
+        assert _wait_for_capture(capture)
+        content = capture.read_text()
+        assert "SECRETPATH" not in content
+        assert "SECRETCOMMAND123" not in content
+
+    def test_otlp_emit_invisible_and_returns_zero(
+        self, project_root: Path, telemetry_dir: Path, tmp_path: Path
+    ) -> None:
+        bin_dir, capture = _stub_curl(tmp_path)
+        env = _otel_env(
+            tmp_path,
+            bin_dir,
+            capture,
+            endpoint="http://localhost:4318",
+            telemetry_dir=telemetry_dir,
+        )
+        result = _emit(
+            "--kind step --name solo-cycle --phase green --status success",
+            env,
+            cwd=project_root,
+        )
+
+        assert result.returncode == 0
+        assert result.stdout == ""
+        assert result.stderr == ""

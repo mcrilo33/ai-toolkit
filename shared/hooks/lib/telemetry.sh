@@ -9,6 +9,13 @@
 # skills/agents/todos/human). See docs/telemetry-span-schema.md for the frozen
 # contract that downstream issues (parser + dashboard) build against.
 #
+# SECOND SINK (Issue #83): when AI_TOOLKIT_OTEL_SPAN_ENDPOINT names a local OTLP
+# collector, telemetry_emit_span ALSO POSTs the span as OTLP/HTTP-JSON so it
+# surfaces in Langfuse grouped under the spoke's session. This sink is INDEPENDENT
+# of AI_TOOLKIT_TELEMETRY — it fires on the endpoint var alone (so AI_TOOLKIT_OTEL
+# spokes get it even with the events.jsonl push layer off), and is metadata-only +
+# invisible just like the push sink.
+#
 # This file is sourced by BOTH the hook lib (shared/hooks/lib/utils.sh) and the
 # worktree/cycle scripts, so it is intentionally self-contained: it defines its
 # own minimal project-root resolver and never depends on utils.sh.
@@ -73,6 +80,24 @@ _telemetry_span_id() {
     return
   fi
   od -An -N6 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || echo "span"
+}
+
+# N random bytes as lowercase hex (2*N chars) — for the OTLP trace/span ids
+# (trace=16 bytes/32 hex, span=8 bytes/16 hex). Random metadata only, no content.
+# Prefers /dev/urandom; falls back to $RANDOM (≈15 bits each) when it is absent.
+_telemetry_hex() {
+  local bytes="$1" out need
+  out=$(od -An -N"$bytes" -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+  if [ -n "$out" ]; then
+    printf '%s' "$out"
+    return
+  fi
+  need=$(( bytes * 2 ))
+  out=""
+  while [ "${#out}" -lt "$need" ]; do
+    out="$out$(printf '%04x' "$((RANDOM))")"
+  done
+  printf '%s' "${out:0:$need}"
 }
 
 # ── context resolvers ───────────────────────────────────────────────
@@ -186,6 +211,81 @@ _telemetry_branch() {
   git -C "$1" rev-parse --abbrev-ref HEAD 2>/dev/null || true
 }
 
+# ── OTLP / Langfuse fan-out sink (Issue #83) ────────────────────────
+# One OTLP stringValue attribute object, value minimally JSON-escaped. Only
+# caller-constant metadata is ever passed in (kind/phase/status/decision/ids).
+_telemetry_otlp_attr() {
+  local key="$1" val
+  val=$(printf '%s' "$2" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  printf '{"key":"%s","value":{"stringValue":"%s"}}' "$key" "$val"
+}
+
+# Fan one workflow span out to Langfuse: POST a single OTLP/HTTP-JSON span to the
+# local collector at $AI_TOOLKIT_OTEL_SPAN_ENDPOINT, which maps the resource
+# spoke_run_id onto a Langfuse session so the node lands under the spoke. This is
+# the SECOND, INDEPENDENT sink — gated by the endpoint var (checked by the caller),
+# never by AI_TOOLKIT_TELEMETRY.
+#
+# PRIVACY: only the caller-constant metadata the args carry (kind/name/phase/
+# status/decision/human.wait_ms) plus the spoke_run_id reach the body — never a
+# path/command/message/payload field.
+# INVISIBILITY: curl runs detached with all output redirected and every failure
+# swallowed (`( … & ) || true`), so it adds zero bytes and never alters the
+# caller's exit code.
+#
+# Args (positional, from telemetry_emit_span):
+#   kind name phase status start_ms human_type human_wait_ms
+_telemetry_emit_otlp_span() {
+  local kind="$1" name="$2" phase="$3" status="$4" start_ms="$5" \
+        human_type="$6" human_wait_ms="$7"
+  {
+    local endpoint root spoke_run_id label label_esc \
+          now_ms start_ns end_ns trace_id span_id attrs payload
+    endpoint="${AI_TOOLKIT_OTEL_SPAN_ENDPOINT%/}"
+    root=$(_telemetry_project_root)
+    spoke_run_id=$(_telemetry_spoke_run_id "$root")
+
+    # Readable short label: "<kind>:<phase>" when a phase is set (gate:gate,
+    # step:green, lifecycle:spawn); else the caller's name.
+    if [ -n "$phase" ]; then
+      label="${kind}:${phase}"
+    else
+      label="$name"
+    fi
+    label_esc=$(printf '%s' "$label" | sed 's/\\/\\\\/g; s/"/\\"/g')
+
+    # Span nanos from start_ms (ns = ms * 1e6); no start_ms → start = end = now.
+    now_ms=$(_telemetry_now_ms)
+    if [ -n "$start_ms" ]; then
+      start_ns="${start_ms}000000"
+      end_ns="${now_ms}000000"
+    else
+      start_ns="${now_ms}000000"
+      end_ns="$start_ns"
+    fi
+
+    trace_id=$(_telemetry_hex 16)
+    span_id=$(_telemetry_hex 8)
+
+    # Attributes (all stringValue, jq-free): kind always; phase + status; and on a
+    # human span the gate's decision (= status) + its wait.
+    attrs=$(_telemetry_otlp_attr workflow.kind "$kind")
+    [ -n "$phase" ] && attrs="$attrs,$(_telemetry_otlp_attr workflow.phase "$phase")"
+    attrs="$attrs,$(_telemetry_otlp_attr status "$status")"
+    if [ -n "$human_type" ]; then
+      attrs="$attrs,$(_telemetry_otlp_attr decision "$status")"
+      attrs="$attrs,$(_telemetry_otlp_attr human.wait_ms "${human_wait_ms:-0}")"
+    fi
+
+    payload="{\"resourceSpans\":[{\"resource\":{\"attributes\":[$(_telemetry_otlp_attr service.name claude-code),$(_telemetry_otlp_attr spoke_run_id "$spoke_run_id")]},\"scopeSpans\":[{\"scope\":{\"name\":\"ai-toolkit.workflow\"},\"spans\":[{\"traceId\":\"$trace_id\",\"spanId\":\"$span_id\",\"name\":\"$label_esc\",\"kind\":1,\"startTimeUnixNano\":\"$start_ns\",\"endTimeUnixNano\":\"$end_ns\",\"attributes\":[$attrs]}]}]}]}"
+
+    ( printf '%s' "$payload" \
+        | curl -sS -X POST -H 'Content-Type: application/json' \
+            --data @- "$endpoint/v1/traces" >/dev/null 2>&1 & ) || true
+  } >/dev/null 2>&1 || true
+  return 0
+}
+
 # ── the emit helper ─────────────────────────────────────────────────
 # Append one span (schema v1) to events.jsonl. Opt-in + invisible + failure-
 # swallowed. Flag-based so callers pass only what they have; everything else is
@@ -212,7 +312,10 @@ _telemetry_branch() {
 #              root ($spoke_run_id, so an in-spoke span hangs off the spoke instead of
 #              orphaning) → null when outside a spoke.
 telemetry_emit_span() {
-  [ "${AI_TOOLKIT_TELEMETRY:-}" = "1" ] || return 0
+  # Parse args FIRST, so both sinks below can read them. Each sink then fires
+  # under its OWN gate: the events.jsonl push layer on AI_TOOLKIT_TELEMETRY=1, the
+  # OTLP/Langfuse fan-out (Issue #83) on AI_TOOLKIT_OTEL_SPAN_ENDPOINT — independent,
+  # so an AI_TOOLKIT_OTEL spoke gets OTLP spans even with the push layer off.
   local kind="" name="" phase="" status="success" start_ms="" span_id="" \
         parent_id="${TELEMETRY_PARENT_ID:-}" human_type="" human_wait_ms=""
   while [ "$#" -gt 0 ]; do
@@ -229,6 +332,15 @@ telemetry_emit_span() {
       *)               shift ;;   # ignore unknowns; never fail a caller
     esac
   done
+
+  # ── OTLP/Langfuse sink (Issue #83) — independent of the push gate below. ──
+  if [ -n "${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:-}" ] && command -v curl >/dev/null 2>&1; then
+    _telemetry_emit_otlp_span \
+      "$kind" "$name" "$phase" "$status" "$start_ms" "$human_type" "$human_wait_ms"
+  fi
+
+  # ── events.jsonl push sink — the original schema-v1 behavior, unchanged. ──
+  [ "${AI_TOOLKIT_TELEMETRY:-}" = "1" ] || return 0
 
   {
     local dir end_ms ts_start ts_end duration_ms root repo branch \
