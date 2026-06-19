@@ -934,3 +934,158 @@ class TestOtlpSinkDiscipline:
         assert result.returncode == 0
         assert result.stdout == ""
         assert result.stderr == ""
+
+
+# ── hook descriptive OTLP attributes (Issue #82 fan-out) ───────────────
+
+
+def _hook_otlp_env(
+    tmp_path: Path,
+    capture_bin: Path,
+    capture: Path,
+    telemetry_dir: Path,
+    payload: str | None,
+) -> dict[str, str]:
+    """An OTLP-sink env (endpoint set, stub curl on PATH) carrying a hook payload."""
+    return _otel_env(
+        tmp_path,
+        capture_bin,
+        capture,
+        endpoint="http://localhost:4318",
+        telemetry_dir=telemetry_dir,
+        payload=payload,
+    )
+
+
+class TestOtlpHookAttributes:
+    """A kind=hook OTLP span carries hook_event/tool_name/tool_use_id/decision/reason/duration."""
+
+    def test_tooluse_hook_span_carries_descriptive_attrs(
+        self, project_root: Path, telemetry_dir: Path, tmp_path: Path
+    ) -> None:
+        bin_dir, capture = _stub_curl(tmp_path)
+        payload = _tool_payload("PreToolUse", "Bash", "toolu_bash_1", project_root)
+        env = _hook_otlp_env(tmp_path, bin_dir, capture, telemetry_dir, payload)
+        _emit(
+            "--kind hook --name secrets-scan.sh --status success --start-ms 1700000000000",
+            env,
+            cwd=project_root,
+        )
+
+        assert _wait_for_capture(capture)
+        attrs = _str_attrs(_span(_otlp_body(capture.read_text()))["attributes"])
+        assert attrs["hook_event"] == "PreToolUse"
+        assert attrs["tool_name"] == "Bash"
+        assert attrs["tool_use_id"] == "toolu_bash_1"
+        # success -> "allow" derivation; duration explicitly present.
+        assert attrs["decision"] == "allow"
+        assert int(attrs["duration_ms"]) >= 0
+
+    @pytest.mark.parametrize(
+        "status,expected",
+        [("success", "allow"), ("deny", "deny"), ("warn", "warn"), ("failure", "block")],
+    )
+    def test_decision_derived_from_status(
+        self,
+        status: str,
+        expected: str,
+        project_root: Path,
+        telemetry_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        bin_dir, capture = _stub_curl(tmp_path)
+        payload = _tool_payload("PreToolUse", "Write", "toolu_w", project_root)
+        env = _hook_otlp_env(tmp_path, bin_dir, capture, telemetry_dir, payload)
+        _emit(
+            f"--kind hook --name post-edit-format.sh --status {status}",
+            env,
+            cwd=project_root,
+        )
+
+        assert _wait_for_capture(capture)
+        attrs = _str_attrs(_span(_otlp_body(capture.read_text()))["attributes"])
+        assert attrs["decision"] == expected
+
+    def test_decision_and_reason_flags_override(
+        self, project_root: Path, telemetry_dir: Path, tmp_path: Path
+    ) -> None:
+        bin_dir, capture = _stub_curl(tmp_path)
+        payload = _tool_payload("PreToolUse", "Bash", "toolu_b", project_root)
+        env = _hook_otlp_env(tmp_path, bin_dir, capture, telemetry_dir, payload)
+        # --decision overrides the status-derived value; --reason populates a new attr.
+        _emit(
+            "--kind hook --name guard.sh --status success "
+            "--decision deny --reason blocked-by-policy",
+            env,
+            cwd=project_root,
+        )
+
+        assert _wait_for_capture(capture)
+        attrs = _str_attrs(_span(_otlp_body(capture.read_text()))["attributes"])
+        assert attrs["decision"] == "deny"
+        assert attrs["reason"] == "blocked-by-policy"
+
+    def test_reason_attr_omitted_when_empty(
+        self, project_root: Path, telemetry_dir: Path, tmp_path: Path
+    ) -> None:
+        bin_dir, capture = _stub_curl(tmp_path)
+        payload = _tool_payload("PreToolUse", "Bash", "toolu_b", project_root)
+        env = _hook_otlp_env(tmp_path, bin_dir, capture, telemetry_dir, payload)
+        _emit("--kind hook --name guard.sh --status success", env, cwd=project_root)
+
+        assert _wait_for_capture(capture)
+        attrs = _str_attrs(_span(_otlp_body(capture.read_text()))["attributes"])
+        assert "reason" not in attrs
+
+    def test_non_tool_hook_omits_tool_attrs(
+        self, project_root: Path, telemetry_dir: Path, tmp_path: Path
+    ) -> None:
+        # SessionStart carries no tool_name/tool_use_id, so those attrs are omitted; the
+        # hook_event + a derived decision still land.
+        bin_dir, capture = _stub_curl(tmp_path)
+        payload = _lifecycle_payload("SessionStart", project_root)
+        env = _hook_otlp_env(tmp_path, bin_dir, capture, telemetry_dir, payload)
+        _emit("--kind hook --name todo-ledger-nudge.sh --status success", env, cwd=project_root)
+
+        assert _wait_for_capture(capture)
+        attrs = _str_attrs(_span(_otlp_body(capture.read_text()))["attributes"])
+        assert attrs["hook_event"] == "SessionStart"
+        assert "tool_name" not in attrs
+        assert "tool_use_id" not in attrs
+        assert attrs["decision"] == "allow"
+
+    def test_step_span_otlp_attrs_unchanged_by_hook_enrichment(
+        self, project_root: Path, telemetry_dir: Path, tmp_path: Path
+    ) -> None:
+        # A non-hook span keeps the exact proven attribute set even when fired on a tool
+        # payload — none of the hook-only attrs (hook_event/tool_name/tool_use_id/reason/
+        # duration_ms) and no derived decision leak onto it.
+        bin_dir, capture = _stub_curl(tmp_path)
+        payload = _tool_payload("PreToolUse", "Bash", "toolu_b", project_root)
+        env = _hook_otlp_env(tmp_path, bin_dir, capture, telemetry_dir, payload)
+        _emit(
+            "--kind step --name solo-cycle --phase green --status success",
+            env,
+            cwd=project_root,
+        )
+
+        assert _wait_for_capture(capture)
+        attrs = _str_attrs(_span(_otlp_body(capture.read_text()))["attributes"])
+        assert set(attrs.keys()) == {"workflow.kind", "workflow.phase", "status"}
+
+    def test_events_jsonl_schema_unchanged_with_hook_flags(
+        self, project_root: Path, telemetry_dir: Path, tmp_path: Path
+    ) -> None:
+        # The new OTLP-only flags never alter the push schema: events.jsonl keeps SCHEMA_KEYS
+        # exactly, with no decision/reason/tool_name keys.
+        bin_dir, capture = _stub_curl(tmp_path)
+        payload = _tool_payload("PreToolUse", "Bash", "toolu_b", project_root)
+        env = _hook_otlp_env(tmp_path, bin_dir, capture, telemetry_dir, payload)
+        _emit(
+            "--kind hook --name guard.sh --status deny --decision deny --reason policy",
+            env,
+            cwd=project_root,
+        )
+
+        span = _read_events(telemetry_dir / "events.jsonl")[0]
+        assert set(span.keys()) == SCHEMA_KEYS

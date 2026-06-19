@@ -144,6 +144,16 @@ _telemetry_hook_event() {
   printf '%s' "$input" | jq -r '.hook_event_name // empty' 2>/dev/null
 }
 
+# tool_name of the Pre/PostToolUse event a hook is handling (Bash/Write/Read/…) — a fixed
+# metadata field read like hook_event, never content. Recorded on kind=hook OTLP spans so the
+# Langfuse node names the tool it guarded. Empty when absent / no payload / no jq.
+_telemetry_hook_tool_name() {
+  local input="${INPUT:-}"
+  [ -n "$input" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  printf '%s' "$input" | jq -r '.tool_name // empty' 2>/dev/null
+}
+
 # tool_use_id of the Pre/PostToolUse event a hook is handling — the same opaque id the
 # parser derives the tool node from, so the hook span nests under its triggering tool
 # (Issue #82). Read ONLY for a ToolUse event; other hook events carry no tool to nest
@@ -227,20 +237,21 @@ _telemetry_otlp_attr() {
 # never by AI_TOOLKIT_TELEMETRY.
 #
 # PRIVACY: only the caller-constant metadata the args carry (kind/name/phase/
-# status/decision/human.wait_ms) plus the spoke_run_id reach the body — never a
-# path/command/message/payload field.
+# status/decision/reason/human.wait_ms) plus the spoke_run_id and — for a kind=hook
+# span only — three fixed payload metadata fields (hook_event/tool_name/tool_use_id)
+# reach the body; never a path/command/message/tool_input field.
 # INVISIBILITY: curl runs detached with all output redirected and every failure
 # swallowed (`( … & ) || true`), so it adds zero bytes and never alters the
 # caller's exit code.
 #
 # Args (positional, from telemetry_emit_span):
-#   kind name phase status start_ms human_type human_wait_ms
+#   kind name phase status start_ms human_type human_wait_ms decision reason
 _telemetry_emit_otlp_span() {
   local kind="$1" name="$2" phase="$3" status="$4" start_ms="$5" \
-        human_type="$6" human_wait_ms="$7"
+        human_type="$6" human_wait_ms="$7" decision="$8" reason="$9"
   {
     local endpoint root spoke_run_id label label_esc \
-          now_ms start_ns end_ns trace_id span_id attrs payload
+          now_ms start_ns end_ns trace_id span_id attrs payload duration_ms
     endpoint="${AI_TOOLKIT_OTEL_SPAN_ENDPOINT%/}"
     root=$(_telemetry_project_root)
     spoke_run_id=$(_telemetry_spoke_run_id "$root")
@@ -256,9 +267,12 @@ _telemetry_emit_otlp_span() {
 
     # Span nanos from start_ms (ns = ms * 1e6); no start_ms → start = end = now.
     now_ms=$(_telemetry_now_ms)
+    duration_ms=0
     if [ -n "$start_ms" ]; then
       start_ns="${start_ms}000000"
       end_ns="${now_ms}000000"
+      duration_ms=$(( now_ms - start_ms ))
+      [ "$duration_ms" -lt 0 ] && duration_ms=0
     else
       start_ns="${now_ms}000000"
       end_ns="$start_ns"
@@ -275,6 +289,36 @@ _telemetry_emit_otlp_span() {
     if [ -n "$human_type" ]; then
       attrs="$attrs,$(_telemetry_otlp_attr decision "$status")"
       attrs="$attrs,$(_telemetry_otlp_attr human.wait_ms "${human_wait_ms:-0}")"
+    fi
+
+    # Hook descriptive attributes (Issue #82 fan-out). ONLY for kind=hook, each
+    # omitted when empty. The payload reads reuse the captured INPUT (same mechanism
+    # as the push sink) and are guarded to hook spans so a step/lifecycle/script span
+    # is byte-for-byte unchanged. `decision` is the explicit --decision flag when the
+    # caller passed one, else derived from status; `reason` is the optional --reason
+    # flag. `duration_ms` mirrors the push sink's computed span duration.
+    if [ "$kind" = "hook" ]; then
+      local hook_event tool_name tool_use_id hook_decision
+      hook_event=$(_telemetry_hook_event)
+      [ -n "$hook_event" ] && attrs="$attrs,$(_telemetry_otlp_attr hook_event "$hook_event")"
+      tool_name=$(_telemetry_hook_tool_name)
+      [ -n "$tool_name" ] && attrs="$attrs,$(_telemetry_otlp_attr tool_name "$tool_name")"
+      tool_use_id=$(_telemetry_hook_tool_use_id)
+      [ -n "$tool_use_id" ] && attrs="$attrs,$(_telemetry_otlp_attr tool_use_id "$tool_use_id")"
+      if [ -n "$decision" ]; then
+        hook_decision="$decision"
+      else
+        case "$status" in
+          success) hook_decision="allow" ;;
+          deny)    hook_decision="deny" ;;
+          warn)    hook_decision="warn" ;;
+          failure) hook_decision="block" ;;
+          *)       hook_decision="" ;;
+        esac
+      fi
+      [ -n "$hook_decision" ] && attrs="$attrs,$(_telemetry_otlp_attr decision "$hook_decision")"
+      [ -n "$reason" ] && attrs="$attrs,$(_telemetry_otlp_attr reason "$reason")"
+      attrs="$attrs,$(_telemetry_otlp_attr duration_ms "$duration_ms")"
     fi
 
     payload="{\"resourceSpans\":[{\"resource\":{\"attributes\":[$(_telemetry_otlp_attr service.name claude-code),$(_telemetry_otlp_attr spoke_run_id "$spoke_run_id")]},\"scopeSpans\":[{\"scope\":{\"name\":\"ai-toolkit.workflow\"},\"spans\":[{\"traceId\":\"$trace_id\",\"spanId\":\"$span_id\",\"name\":\"$label_esc\",\"kind\":1,\"startTimeUnixNano\":\"$start_ns\",\"endTimeUnixNano\":\"$end_ns\",\"attributes\":[$attrs]}]}]}]}"
@@ -295,6 +339,7 @@ _telemetry_emit_otlp_span() {
 #   telemetry_emit_span --kind <k> --name <n> [--phase <p>] [--status <s>]
 #                       [--start-ms <ms>] [--span-id <id>] [--parent-id <id>]
 #                       [--human-type <t>] [--human-wait-ms <ms>]
+#                       [--decision <d>] [--reason <r>]
 #
 #   --kind     lifecycle|step|hook|script|skill|agent|todo|human|rule (required)
 #   --name     span name, a constant (worktree-new | commit-gauntlet | ...) — a
@@ -303,6 +348,10 @@ _telemetry_emit_otlp_span() {
 #   --status   success|failure|deny|warn|skipped (default: success)
 #   --start-ms epoch-ms when the span opened; ts_start + duration_ms derive from
 #              it. Omitted → ts_start = now, duration_ms = 0.
+#   --decision OTLP-only (kind=hook): the gate's outcome (allow|deny|warn|block|…).
+#              Omitted → derived from status. Not written to events.jsonl.
+#   --reason   OTLP-only (kind=hook): a short caller-supplied reason for the decision
+#              (a constant, never payload content). Omitted/empty → attr omitted.
 #   --parent-id  nesting parent. Resolution order (Issue #66): this flag →
 #              $TELEMETRY_PARENT_ID (in-process override) → $AI_TOOLKIT_PARENT_SPAN
 #              (correlation id a parent shell exports for a child) → [hook only,
@@ -317,7 +366,8 @@ telemetry_emit_span() {
   # OTLP/Langfuse fan-out (Issue #83) on AI_TOOLKIT_OTEL_SPAN_ENDPOINT — independent,
   # so an AI_TOOLKIT_OTEL spoke gets OTLP spans even with the push layer off.
   local kind="" name="" phase="" status="success" start_ms="" span_id="" \
-        parent_id="${TELEMETRY_PARENT_ID:-}" human_type="" human_wait_ms=""
+        parent_id="${TELEMETRY_PARENT_ID:-}" human_type="" human_wait_ms="" \
+        decision="" reason=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --kind)          kind="$2"; shift 2 ;;
@@ -329,6 +379,8 @@ telemetry_emit_span() {
       --parent-id)     parent_id="$2"; shift 2 ;;
       --human-type)    human_type="$2"; shift 2 ;;
       --human-wait-ms) human_wait_ms="$2"; shift 2 ;;
+      --decision)      decision="$2"; shift 2 ;;
+      --reason)        reason="$2"; shift 2 ;;
       *)               shift ;;   # ignore unknowns; never fail a caller
     esac
   done
@@ -336,7 +388,8 @@ telemetry_emit_span() {
   # ── OTLP/Langfuse sink (Issue #83) — independent of the push gate below. ──
   if [ -n "${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:-}" ] && command -v curl >/dev/null 2>&1; then
     _telemetry_emit_otlp_span \
-      "$kind" "$name" "$phase" "$status" "$start_ms" "$human_type" "$human_wait_ms"
+      "$kind" "$name" "$phase" "$status" "$start_ms" "$human_type" "$human_wait_ms" \
+      "$decision" "$reason"
   fi
 
   # ── events.jsonl push sink — the original schema-v1 behavior, unchanged. ──
