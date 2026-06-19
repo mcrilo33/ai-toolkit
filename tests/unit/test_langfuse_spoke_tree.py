@@ -13,6 +13,8 @@ determinism.
 from __future__ import annotations
 
 import sys
+import urllib.parse
+from collections.abc import Sequence
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
@@ -237,6 +239,69 @@ class TestBuildBatch:
         batch = build_batch([], SPOKE)
 
         assert [event["type"] for event in batch] == ["trace-create", "span-create"]
+
+
+SESSION = "sess-idem"
+
+
+def _stub_get(fetched: Sequence[tuple[str, str | None, list[dict]]]):
+    """Stub a Langfuse ``get`` over one page of traces plus each trace's observations.
+
+    Args:
+        fetched: Each session trace as ``(trace_id, name, observations)``.
+
+    Returns:
+        A path-to-JSON callable matching the spoke-tree fetch paths.
+    """
+    session = urllib.parse.quote(SESSION)
+    pages: dict[str, dict] = {
+        f"/traces?sessionId={session}&limit=100&page=1": {
+            "data": [{"id": tid, "name": name} for tid, name, _ in fetched],
+            "meta": {"totalPages": 1},
+        }
+    }
+    for tid, _name, observations in fetched:
+        pages[f"/observations?traceId={tid}&limit=100&page=1"] = {
+            "data": observations,
+            "meta": {"totalPages": 1},
+        }
+    return lambda path: pages[path]
+
+
+class TestExcludesOwnOutput:
+    """A re-run must not re-source the synthesizer's own assembled trace (idempotency)."""
+
+    def test_fetch_session_drops_prior_synthetic_traces(self) -> None:
+        target_id = trace_id_for(SESSION)
+        native = [(tid, None, obs) for tid, obs in _traces()]
+        # The assembled trace reappears in the session: once under the deterministic target
+        # id, and once (defensively) under an older id but the spoke-tree: name.
+        prior_self = (target_id, f"spoke-tree:{SESSION}", [_obs("spokeroot-x", f"spoke:{SESSION}")])
+        prior_old = ("spoketree-legacy", f"spoke-tree:{SESSION}", [_obs("tree-y", "Bash")])
+
+        fetched = fetch_session(SESSION, _stub_get(native + [prior_self, prior_old]))
+
+        # Only the native traces survive; the synthetic observations were never sourced.
+        assert fetched == [(tid, obs) for tid, _name, obs in native]
+
+    def test_rerun_with_prior_output_in_session_is_idempotent(self) -> None:
+        target_id = trace_id_for(SESSION)
+        native = [(tid, None, obs) for tid, obs in _traces()]
+
+        # Run 1: the session holds only the native traces.
+        first = build_batch(fetch_session(SESSION, _stub_get(native)), SESSION)
+
+        # Run 2: the session now ALSO holds run 1's output (same target id) and an older-id
+        # spoke-tree trace whose spans WOULD become extra copies if they were sourced.
+        prior_self = (target_id, f"spoke-tree:{SESSION}", [_obs("spokeroot-x", f"spoke:{SESSION}")])
+        prior_old = ("spoketree-legacy", f"spoke-tree:{SESSION}", [_obs("tree-y", "Bash")])
+        second = build_batch(
+            fetch_session(SESSION, _stub_get(native + [prior_self, prior_old])), SESSION
+        )
+
+        # Same node set and no growth: the tree does not multiply across re-runs.
+        assert {event["id"] for event in second} == {event["id"] for event in first}
+        assert len(second) == len(first)
 
 
 class TestFetchSession:

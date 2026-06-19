@@ -311,17 +311,46 @@ def all_traces(spoke_run_id: str, get: GetFn) -> list[dict[str, Any]]:
     return out
 
 
+def _is_own_output(trace: dict[str, Any], target_trace_id: str) -> bool:
+    """Whether a fetched session trace is this synthesizer's own assembled output.
+
+    The assembled trace carries ``sessionId == spoke_run_id``, so on a re-run it reappears in
+    the session listing; sourcing it would copy its spans again and multiply the tree. It is
+    recognised by its deterministic id or, defensively for older ids, its ``spoke-tree:`` name.
+
+    Args:
+        trace: A trace dict as returned by the Langfuse traces endpoint.
+        target_trace_id: The deterministic id of this spoke's assembled tree.
+
+    Returns:
+        True when the trace is the synthesizer's own output and must be excluded.
+    """
+    if trace.get("id") == target_trace_id:
+        return True
+    name = trace.get("name") or ""
+    return name.startswith(_TRACE_NAME_PREFIX)
+
+
 def fetch_session(spoke_run_id: str, get: GetFn) -> list[TraceObservations]:
-    """Fetch every trace in a session paired with all of its observations.
+    """Fetch every native trace in a session paired with all of its observations.
+
+    The synthesizer's own prior output is excluded so re-runs stay idempotent (see
+    :func:`_is_own_output`); only the real native traces are sourced, and the deterministic
+    ids then overwrite the assembled trace cleanly instead of multiplying it.
 
     Args:
         spoke_run_id: The session id (``langfuse.session.id``) to fetch.
         get: Path-to-JSON fetcher (see :data:`telemetry.langfuse_rollup.GetFn`).
 
     Returns:
-        Each trace id paired with its observations (full fields), in fetch order.
+        Each native trace id paired with its observations (full fields), in fetch order.
     """
-    traces = all_traces(spoke_run_id, get)
+    target_trace_id = trace_id_for(spoke_run_id)
+    traces = [
+        trace
+        for trace in all_traces(spoke_run_id, get)
+        if not _is_own_output(trace, target_trace_id)
+    ]
     return [(trace["id"], all_observations(trace["id"], get)) for trace in traces]
 
 
