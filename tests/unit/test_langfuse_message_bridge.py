@@ -5,13 +5,14 @@ signal, with no trace ids) onto the matching ``llm_request`` span so Langfuse ca
 render the conversation as the observation's input/output.
 
 The input join is *per call*: an ``api_request_body`` is keyed by its
-``event.sequence`` and paired with the next ``api_request`` (smallest sequence
-strictly greater than the body's) to recover the ``request_id`` the span carries.
-The stored input is only the *last* message of the request -- the new turn that
-distinguishes one call from the next. The output join stays direct via
-``request_id``. Everything is order-independent: a log may arrive before its
-``api_request`` or its span. These AAA tests exercise the pure helpers and the
-buffering resolver with a stubbed patch sink -- no network.
+``event.sequence`` and matched one-to-one to its nearest-preceding ``api_request``
+(the largest sequence strictly less than the request's, consuming each body once)
+to recover the ``request_id`` the span carries. The stored input is only the
+*last* message of the request -- the new turn that distinguishes one call from the
+next. The output join stays direct via ``request_id``. Everything is
+order-independent: a log may arrive before its ``api_request`` or its span. These
+AAA tests exercise the pure helpers and the buffering resolver with a stubbed patch
+sink -- no network.
 """
 
 from __future__ import annotations
@@ -162,32 +163,83 @@ def test_response_body_patches_output_when_span_present() -> None:
     assert bridge.pending_count() == 0
 
 
-# --- resolver: per-call input via event.sequence pairing ---------------------
+# --- resolver: per-call input via one-to-one nearest-preceding matching ------
 
 
-def test_request_body_resolves_to_next_api_request_by_sequence() -> None:
-    # Arrange: a body at seq 30 must pair with the next api_request (seq 37), not 46.
-    sink = _Sink()
-    bridge = Bridge(sink)
-    body = (
+def _body(content: str) -> str:
+    return (
         '{"system": "sys", "messages": ['
         '{"role": "user", "content": "old"},'
-        '{"role": "user", "content": "newest turn"}]}'
+        f'{{"role": "user", "content": "{content}"}}]}}'
     )
 
-    # Act: body (seq 30), then two api_requests at seq 37 and 46, then the span.
+
+def test_bodies_match_one_to_one_to_nearest_preceding_request() -> None:
+    # Arrange: bodies at seq 30 and 36 both precede request 37; one-to-one matching must give
+    # the nearer body (36) to req-37 and leave body 30 for the later req-40 -- a plain "next
+    # request" rule would assign BOTH to req-37 and leave req-40 with no input.
+    sink = _Sink()
+    bridge = Bridge(sink)
+
+    # Act: two bodies, then two api_requests, then both spans.
     bridge.on_logs(
         _log_payload(
-            _attrs(**{"event.name": "api_request_body", "event.sequence": "30", "body": body}),
+            _attrs(
+                **{
+                    "event.name": "api_request_body",
+                    "event.sequence": "30",
+                    "body": _body("turn-30"),
+                }
+            ),
+            _attrs(
+                **{
+                    "event.name": "api_request_body",
+                    "event.sequence": "36",
+                    "body": _body("turn-36"),
+                }
+            ),
             _attrs(**{"event.name": "api_request", "event.sequence": "37", "request_id": "req-37"}),
-            _attrs(**{"event.name": "api_request", "event.sequence": "46", "request_id": "req-46"}),
+            _attrs(**{"event.name": "api_request", "event.sequence": "40", "request_id": "req-40"}),
         )
     )
-    assert sink.calls == []  # span for req-37 not seen yet -> buffered
+    assert sink.calls == []  # spans not seen yet -> buffered
     bridge.on_spans(_span_payload(span_id="1122334455667788", request_id="req-37"))
+    bridge.on_spans(_span_payload(span_id="8877665544332211", request_id="req-40"))
 
-    # Assert: input is ONLY the last message, patched onto req-37's span.
-    assert sink.calls == [("1122334455667788", "input", {"role": "user", "content": "newest turn"})]
+    # Assert: nearest-preceding, one-to-one -- body 36 -> req-37 (patched first, once its span
+    # arrives), body 30 -> req-40 (patched after). Neither request double-assigns body 36.
+    assert sink.calls == [
+        ("1122334455667788", "input", {"role": "user", "content": "turn-36"}),
+        ("8877665544332211", "input", {"role": "user", "content": "turn-30"}),
+    ]
+    assert bridge.pending_count() == 0
+
+
+def test_request_with_no_preceding_body_gets_no_input() -> None:
+    # Arrange: a single body at seq 36 precedes only req-37; req-30 (earlier) has no body
+    # before it, so it must stay unmatched rather than steal the later body.
+    sink = _Sink()
+    bridge = Bridge(sink)
+
+    # Act
+    bridge.on_logs(
+        _log_payload(
+            _attrs(**{"event.name": "api_request", "event.sequence": "30", "request_id": "req-30"}),
+            _attrs(
+                **{
+                    "event.name": "api_request_body",
+                    "event.sequence": "36",
+                    "body": _body("turn-36"),
+                }
+            ),
+            _attrs(**{"event.name": "api_request", "event.sequence": "37", "request_id": "req-37"}),
+        )
+    )
+    bridge.on_spans(_span_payload(span_id="1122334455667788", request_id="req-37"))
+    bridge.on_spans(_span_payload(span_id="8877665544332211", request_id="req-30"))
+
+    # Assert: only req-37 (with a preceding body) is patched; req-30 gets nothing.
+    assert sink.calls == [("1122334455667788", "input", {"role": "user", "content": "turn-36"})]
     assert bridge.pending_count() == 0
 
 

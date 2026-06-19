@@ -14,14 +14,27 @@ The input join is *per call*. One ``prompt.id`` spans an entire user turn, so it
 a single API call -- every call of an agent loop shares it. The per-call key is
 ``event.sequence`` instead. An ``api_request`` log carries ``request_id`` + ``event.sequence``
 (no body); an ``api_request_body`` log carries the body + ``event.sequence`` but no
-``request_id``. A body is paired with the *next* ``api_request`` -- the one whose recorded
-sequence is the smallest strictly greater than the body's -- to recover its ``request_id``,
-which the ``llm_request`` span then maps to a span_id. The join chain, derived from the
-actual telemetry, is::
+``request_id``.
+
+The body-to-request pairing is *one-to-one nearest-preceding*. A body is always emitted just
+before its ``api_request``, so each request (taken in ascending sequence) claims its nearest
+PRECEDING still-unused body -- the body whose ``event.sequence`` is the largest strictly less
+than the request's -- and each body is consumed once. A plain "next ``api_request``" rule
+double-assigns when bodies cluster (e.g. bodies at seqs 30 and 36 both precede request 37,
+leaving request 40 with no body); one-to-one consumption removes both the double-assignment
+and the resulting missing input. The recovered ``request_id`` maps to a span_id via the
+``llm_request`` span. The join chain, derived from the actual telemetry, is::
 
     output: api_response_body.request_id ---------------(llm_request span)--> span_id
-    input : api_request_body.event.sequence --(next api_request)--> request_id
-                                             --(llm_request span)--> span_id
+    input : api_request_body.event.sequence --(nearest-preceding api_request, 1:1)-->
+                                             request_id --(llm_request span)--> span_id
+
+HARD LIMIT (attribution is purely temporal): the body carries no per-call and no per-agent
+id -- only ``prompt.id`` (shared by the whole session) and ``event.sequence``. So when
+main-agent and sub-agent API calls INTERLEAVE, an input can still land on an adjacent
+(wrong-agent) span at the boundary. This one-to-one match removes missing inputs and
+double-assignment, but it does NOT fully resolve interleaved-agent swaps; that would require
+a ``request_id`` or ``agent_id`` on the body, which Claude Code does not emit.
 
 The input value is *only the last message* of the request body's ``messages`` array (the new
 user/tool_result turn). Every call resends the whole growing conversation, and Claude Code
@@ -237,10 +250,12 @@ class Bridge:
 
     Spans supply ``request_id -> span_id``; ``api_request`` logs supply
     ``event.sequence -> request_id``; ``api_request_body`` carries the input (keyed by its
-    own ``event.sequence``, paired with the next ``api_request``) and ``api_response_body``
-    carries the output (keyed directly by ``request_id``). Items whose span has not arrived
-    yet -- or whose ``api_request`` pairing is not yet known -- are buffered and re-resolved
-    on every subsequent span or log batch, so the signals may arrive in any order.
+    own ``event.sequence``, matched one-to-one to its nearest-preceding ``api_request``) and
+    ``api_response_body`` carries the output (keyed directly by ``request_id``). Items whose
+    span has not arrived yet -- or whose ``api_request`` pairing is not yet known -- are
+    buffered and re-resolved on every subsequent span or log batch, so the signals may arrive
+    in any order. The body-to-request matching is recomputed from scratch on every flush, so
+    a body and the request that should claim it can arrive in either order.
     """
 
     def __init__(self, patch: PatchFn) -> None:
@@ -254,6 +269,7 @@ class Bridge:
         self._patch = patch
         self._span_by_req: dict[str, str] = {}  # request_id -> span_id (hex)
         self._req_seq: list[tuple[int, str]] = []  # (api_request event.sequence, request_id)
+        self._body_seqs: list[int] = []  # every api_request_body event.sequence ever seen
         self._pending: list[PendingItem] = []
 
     def pending_count(self) -> int:
@@ -294,7 +310,7 @@ class Bridge:
         if event == "api_request":
             request_id, seq = _attr(attrs, "request_id"), _attr(attrs, "event.sequence")
             if request_id and seq is not None:
-                self._req_seq.append((int(seq), request_id))  # pair body -> next request
+                self._req_seq.append((int(seq), request_id))  # matched 1:1 to a body
             return
         raw = _attr(attrs, "body")
         if not raw:
@@ -303,6 +319,7 @@ class Bridge:
             seq = _attr(attrs, "event.sequence")
             if seq is None:
                 return
+            self._body_seqs.append(int(seq))  # kept past flush so the match stays stable
             self._pending.append(
                 {"key": int(seq), "ktype": "seq", "field": "input", "value": _last_message(raw)}
             )
@@ -323,35 +340,63 @@ class Bridge:
                 }
             )
 
-    def _req_for_body(self, seq: int) -> str | None:
-        """Return the request_id of the api_request that follows this body.
+    def _match_bodies(self) -> dict[int, str]:
+        """Match each buffered input body's ``event.sequence`` to a ``request_id``, 1:1.
 
-        An ``api_request_body`` has ``event.sequence`` but no ``request_id``; it is paired
-        with the ``api_request`` whose recorded sequence is the smallest strictly greater
-        than the body's (e.g. body seq 30 -> request seq 37).
+        An ``api_request_body`` carries no per-call id, only ``event.sequence``, and a body
+        is always emitted just before its ``api_request``. So each request (in ascending
+        sequence) claims its nearest PRECEDING still-unused body -- the one whose sequence is
+        the largest strictly less than the request's -- and each body is consumed once.
+        One-to-one consumption avoids the double-assignment a plain "next request" rule causes
+        when bodies cluster (e.g. bodies at seqs 30 and 36 both precede request 37).
 
-        Args:
-            seq: The body's ``event.sequence``.
+        The match runs over *every* body sequence ever seen (``self._body_seqs``), not just
+        the bodies still buffered: a body is dropped from ``self._pending`` once its span
+        arrives and it is patched, so matching off the buffer would let a later flush re-grant
+        its request to a different (older) body. Matching off the full set keeps each
+        assignment stable no matter which spans have arrived.
 
         Returns:
-            The paired request_id, or None when no later api_request has been seen yet.
+            A mapping of body ``event.sequence`` to the ``request_id`` that claimed it.
         """
-        after = [(s, r) for s, r in self._req_seq if s > seq]
-        return min(after)[1] if after else None
+        bodies = sorted(set(self._body_seqs))
+        used: set[int] = set()
+        matched: dict[int, str] = {}
+        for seq, request_id in sorted(self._req_seq):
+            candidates = [b for b in bodies if b < seq and b not in used]
+            if candidates:
+                body_seq = max(candidates)
+                used.add(body_seq)
+                matched[body_seq] = request_id
+        return matched
 
-    def _resolve(self, item: PendingItem) -> str | None:
-        """Map a pending item's join key to a span_id, following the chain when needed."""
+    def _resolve(self, item: PendingItem, matched: dict[int, str]) -> str | None:
+        """Map a pending item's join key to a span_id, following the chain when needed.
+
+        Args:
+            item: The buffered patch awaiting its span.
+            matched: The body-``event.sequence`` -> ``request_id`` map from
+                :meth:`_match_bodies`, used for input items.
+
+        Returns:
+            The resolved span_id, or None when the join cannot complete yet.
+        """
         key = item["key"]
         if item["ktype"] == "req":
             return self._span_by_req.get(key) if isinstance(key, str) else None
-        request_id = self._req_for_body(key) if isinstance(key, int) else None
+        request_id = matched.get(key) if isinstance(key, int) else None
         return self._span_by_req.get(request_id) if request_id else None
 
     def _try_flush(self) -> None:
-        """Patch every pending item whose join key now resolves; drop it once patched."""
+        """Patch every pending item whose join key now resolves; drop it once patched.
+
+        The body-to-request matching is recomputed every flush so arrival order is
+        irrelevant: a body and the request that claims it may arrive in either order.
+        """
+        matched = self._match_bodies()
         still: list[PendingItem] = []
         for item in self._pending:
-            span_id = self._resolve(item)
+            span_id = self._resolve(item, matched)
             if span_id:
                 self._patch(span_id, item["field"], item["value"])
             else:
