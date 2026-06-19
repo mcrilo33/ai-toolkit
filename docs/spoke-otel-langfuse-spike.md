@@ -244,43 +244,50 @@ Notes and limits:
 
 ## Single nested spoke-tree (`langfuse_spoke_tree.py`)
 
-Natively, each turn Claude Code runs lands as its own flat Langfuse trace, so one spoke
-reads as dozens of disconnected traces with no parent-child relationship between them.
-`scripts/telemetry/langfuse_spoke_tree.py` re-assembles the spoke into **one** nested
-trace. It reuses the dashboard's strict causal forest builder
-(`SpanStore.spoke_causal_forest`) — the same tree the dashboard renders — so it does not
-reinvent causality: turns own their cost, with tools, sub-agents, and hooks nested
-underneath and the marker spine (`step:red`, `step:green`, …) threading the lifecycle.
+Natively, each turn Claude Code runs lands as its own flat Langfuse trace, and the marker
+(`step:`/`lifecycle:`/`spoke-push`) and hook (`*.sh`) emissions land as yet more flat
+traces, so one spoke reads as dozens of disconnected traces. But every one of those
+observations *already* carries the rich fields we built — `usageDetails`, `costDetails`,
+`input`/`output` messages, `metadata` (including `rollup` and, on hooks,
+`hook_event`/`tool_name`/`tool_use_id`/`decision`/`duration_ms`), `name`, `type`, and
+`startTime`/`endTime`.
 
-The forest is walked depth-first and shipped to Langfuse via the same ingestion endpoint
-and `LANGFUSE_HOST` / `LANGFUSE_BASIC_AUTH` env vars as the rollup and message bridge:
+`scripts/telemetry/langfuse_spoke_tree.py` **assembles those existing rich observations
+into one nested trace, preserving every field**. It sources from Langfuse, not from the
+causal store: it fetches every trace in the session and every observation in those traces,
+then copies each observation verbatim into one new trace, re-parenting across the original
+trace boundaries. It ships via the same ingestion endpoint and `LANGFUSE_HOST` /
+`LANGFUSE_BASIC_AUTH` env vars as the rollup and message bridge:
 
 ```bash
 LANGFUSE_HOST=http://localhost:3000 LANGFUSE_BASIC_AUTH="Basic <base64(pk:sk)>" \
     python3 scripts/telemetry/langfuse_spoke_tree.py <spoke_run_id>
 ```
 
-The emission shape:
+The assembly shape:
 
-- One `trace-create` (`sessionId = spoke_run_id`, name `spoke-tree:<spoke_run_id>`), then
-  one observation per node. A token-bearing node (a `turn` or sub-`agent` that carries
-  tokens/cost) becomes a `generation-create` with `usageDetails` (`input`, `output`,
-  `cache_read_input_tokens`, `cache_creation_input_tokens`); every other node becomes a
-  `span-create`. Each node carries `metadata = {kind, status, rollup}` and links to its
-  parent via `parentObservationId` (omitted for roots).
-- Node times use the node's absolute `ts_start`/`ts_end` when present; otherwise sequential
-  windows are synthesized from `duration_ms` so ordering and nesting still render.
+- One `trace-create` (`sessionId = spoke_run_id`, name `spoke-tree:<spoke_run_id>`) and one
+  synthetic root span `spoke:<spoke_run_id>` — the single collapsed root.
+- One copy per source observation, fields intact: a `GENERATION` becomes a
+  `generation-create`, anything else a `span-create`; `name`, `startTime`/`endTime`,
+  `input`, `output`, `usageDetails`, `metadata`, `model`, and `level` are copied verbatim.
+  `usageDetails` + `model` are re-passed so Langfuse recomputes `costDetails` identically
+  (an explicit `costDetails` is forwarded too).
+- Re-parenting: an observation with a `parentObservationId` keeps that link (remapped to the
+  copy); a trace-root interaction / marker / lifecycle / script collapses to the synthetic
+  root; a trace-root hook re-parents under the tool whose `tool_use_id` matches the hook's
+  `metadata.tool_use_id`, or the synthetic root when there is no id or no match.
 
 Notes and limits:
 
-- **Run it after the per-turn native traces are ingested** — it is a post-run assembled
-  view layered on top of them.
+- **Run it after the per-turn native traces are ingested** — it reads the observations
+  already in Langfuse; a partially-ingested session yields a partial tree.
 - **It duplicates the native per-turn traces by design.** The native traces stay; this is
   the additional, single-tree view of the whole spoke. Filter to `name = spoke-tree:*` (or
   the `spoketree-` trace-id prefix) to see only the assembled trees.
-- **Idempotent.** The trace id and every observation id derive from the spoke run id and
-  the node's tree path, so a rerun overwrites the same trace/observations rather than
-  appending duplicates.
+- **Idempotent.** The trace id, the synthetic root id, and every copy id derive from the
+  spoke run id and the source `(trace_id, observation_id)` pair, so a rerun overwrites the
+  same trace/observations rather than appending duplicates.
 
 ## Loaded-context cost baseline (`measure_context_cost.py`)
 

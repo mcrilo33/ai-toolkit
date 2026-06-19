@@ -1,64 +1,84 @@
 #!/usr/bin/env python3
-"""Re-emit one spoke's strict causal forest as a single nested Langfuse trace.
+"""Assemble a spoke's existing rich Langfuse observations into one nested trace.
 
-The dashboard already builds the strict nested causal forest for a spoke
-(``SpanStore.spoke_causal_forest``): turns own their cost, tools/sub-agents/hooks
-nest underneath, and a marker spine threads the lifecycle. Natively each turn lands
-as its own flat Langfuse trace, so a spoke reads as dozens of disconnected traces.
-This post-run script rebuilds that one forest and ships it to Langfuse as ONE trace
-via the ingestion API, so the whole spoke renders as a single tree.
+Natively, each turn Claude Code runs lands as its own flat Langfuse trace, and the
+marker (``step:``/``lifecycle:``/``spoke-push``) and hook (``*.sh``) emissions land as
+yet more flat traces. Every one of those observations already carries the rich fields we
+built — ``usageDetails``, ``costDetails``, ``input``/``output`` messages, ``metadata``
+(including ``rollup`` and, on hooks, ``hook_event``/``tool_name``/``tool_use_id``/
+``decision``/``duration_ms``), ``name``, ``type``, and ``startTime``/``endTime``. A spoke
+therefore reads as dozens of disconnected traces.
 
-Run AFTER the native per-turn traces are ingested::
+This post-run script SOURCES FROM LANGFUSE — it does not rebuild from the causal store.
+It fetches every trace in the session and every observation in those traces, then COPIES
+each observation verbatim into ONE new trace, re-parenting across the original trace
+boundaries so the whole spoke renders as a single tree with every field intact::
 
     LANGFUSE_HOST=http://localhost:3000 LANGFUSE_BASIC_AUTH="Basic <base64(pk:sk)>" \\
         python3 scripts/telemetry/langfuse_spoke_tree.py <spoke_run_id>
 
-All ids are derived from the spoke run id and each node's tree path, so a rerun
-overwrites the same trace/observations instead of appending duplicates. This trace
+Re-parenting rules for each source observation:
+
+- It had a ``parentObservationId`` -> the copy points at the copy of that parent.
+- It was a trace-root interaction / marker / lifecycle / script -> the synthetic root.
+- It was a trace-root hook (name ends ``.sh`` or ``kind == hook``) -> the copy of the
+  tool whose ``tool_use_id`` matches the hook's ``metadata.tool_use_id``; or the
+  synthetic root when there is no id or no match.
+
+All ids derive from the spoke run id and the source ``(trace_id, observation_id)`` pair,
+so a rerun overwrites the same trace/observations instead of appending. This trace
 DUPLICATES the native per-turn traces by design — it is the assembled, nested view.
 
-Import-safe: no environment and no dashboard import at module load. The pure builders
-(:func:`build_batch`) are unit-testable with no network and no DuckDB; the heavy
-``SpanStore`` import and Langfuse I/O happen only in :func:`main`. Stdlib only; reuses
-the same env vars and ingestion endpoint as ``langfuse_rollup``.
+Import-safe: no environment is read at import time, so :func:`build_batch` is unit-testable
+with no network. The HTTP I/O happens only in :func:`main`. Stdlib only; reuses the
+fetch/post helpers, env vars, and ingestion endpoint of ``langfuse_rollup``.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
-import json
 import logging
 import os
 import sys
-import urllib.request
-from datetime import UTC, datetime, timedelta
-from pathlib import Path
+import urllib.parse
 from typing import Any
+
+from telemetry.langfuse_rollup import (
+    GetFn,
+    Observation,
+    PostFn,
+    all_observations,
+    make_get,
+    make_post,
+)
 
 logger = logging.getLogger("langfuse_spoke_tree")
 
-CausalNode = dict[str, Any]
 IngestEvent = dict[str, Any]
+# One source trace paired with all of its observations: ``(orig_trace_id, observations)``.
+TraceObservations = tuple[str, list[Observation]]
 
 # Deterministic id prefixes — a rerun resolves to the same trace/observation ids.
 _TRACE_PREFIX = "spoketree-"
-_NODE_PREFIX = "node-"
+_ROOT_PREFIX = "spokeroot-"
+_COPY_PREFIX = "tree-"
 _TRACE_NAME_PREFIX = "spoke-tree:"
+_ROOT_NAME_PREFIX = "spoke:"
 
-# Base instant for synthesizing time windows when a node carries no absolute times;
-# fixed so the emission stays deterministic and idempotent across reruns.
-_SYNTH_BASE = "2026-01-01T00:00:00Z"
+# Langfuse ingestion requires a timestamp on every event; used for the trace/root and as a
+# fallback when a source observation carries no ``startTime``. Fixed so reruns stay stable.
+_INGEST_TIMESTAMP = "2026-01-01T00:00:00Z"
 
-# Readable label prefixes by node kind (e.g. ``tool:Bash``, ``sub-agent:Explore``).
-_LABEL_PREFIX: dict[str, str] = {
-    "tool": "tool",
-    "agent": "sub-agent",
-    "step": "step",
-    "hook": "hook",
-    "script": "marker",
-}
+# Max page size the Langfuse traces endpoint accepts.
+_PAGE_LIMIT = 100
+# Max ingestion events per POST, to keep each request small.
+_CHUNK_SIZE = 100
+
+# Observation fields copied verbatim into the assembled trace when present.
+_COPIED_FIELDS = ("input", "output", "usageDetails", "costDetails", "metadata", "model", "level")
+# Metadata keys that may carry a tool-call id, in priority order.
+_TOOL_USE_ID_KEYS = ("tool_use_id", "gen_ai.tool.call.id")
 
 
 def trace_id_for(spoke_run_id: str) -> str:
@@ -73,255 +93,268 @@ def trace_id_for(spoke_run_id: str) -> str:
     return _TRACE_PREFIX + hashlib.sha1(spoke_run_id.encode()).hexdigest()[:16]
 
 
-def _node_id(trace_id: str, node_path: str) -> str:
-    """Return the deterministic observation id for a node at ``node_path`` in the tree."""
-    digest = hashlib.sha1(f"{trace_id}:{node_path}".encode()).hexdigest()[:16]
-    return _NODE_PREFIX + digest
+def root_id_for(spoke_run_id: str) -> str:
+    """Return the deterministic id of the synthetic root span for a spoke."""
+    return _ROOT_PREFIX + hashlib.sha1(spoke_run_id.encode()).hexdigest()[:16]
 
 
-def _is_token_bearing(node: CausalNode) -> bool:
-    """Whether a node carries any tokens/cost — i.e. should map to a generation."""
-    return bool(
-        node.get("own_tokens_in")
-        or node.get("own_tokens_out")
-        or node.get("own_cost_usd")
-        or node.get("cache_read")
-        or node.get("cache_creation")
-    )
+def _copy_id(orig_trace_id: str, orig_obs_id: str) -> str:
+    """Return the deterministic copy id for a source observation in the assembled trace."""
+    digest = hashlib.sha1(f"{orig_trace_id}:{orig_obs_id}".encode()).hexdigest()[:24]
+    return _COPY_PREFIX + digest
 
 
-def _label(node: CausalNode) -> str:
-    """Build a readable observation name from the node's kind and summary."""
-    kind = node["kind"]
-    detail = node.get("summary") or node.get("name") or ""
-    prefix = _LABEL_PREFIX.get(kind)
-    if prefix and detail:
-        return f"{prefix}:{detail}"
-    return node.get("name") or kind
+def _tool_use_id(observation: Observation) -> str | None:
+    """Return the tool-call id from an observation's metadata, or None if absent."""
+    metadata = observation.get("metadata") or {}
+    for key in _TOOL_USE_ID_KEYS:
+        value = metadata.get(key)
+        if value:
+            return str(value)
+    return None
 
 
-def _parse_iso(value: str) -> datetime | None:
-    """Parse an ISO-8601 timestamp (tolerating a trailing ``Z``); None if unparseable."""
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
+def _is_hook(observation: Observation) -> bool:
+    """Whether an observation is a hook emission (a ``*.sh`` trace or ``kind == hook``)."""
+    name = observation.get("name") or ""
+    metadata = observation.get("metadata") or {}
+    return name.endswith(".sh") or metadata.get("kind") == "hook"
 
 
-def _to_iso(moment: datetime) -> str:
-    """Render a datetime as a millisecond-precision ISO-8601 string with a ``Z`` suffix."""
-    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+def _build_tool_index(traces: list[TraceObservations]) -> dict[str, str]:
+    """Map each tool-call id to the copy id of the (non-hook) observation that owns it.
 
-
-class _Clock:
-    """A monotonic cursor that fills in time windows for nodes lacking absolute times.
-
-    Real ``ts_start``/``ts_end`` pass through unchanged; otherwise sequential windows are
-    synthesized from ``duration_ms`` (a minimum 1ms step) so ordering still renders.
-    """
-
-    def __init__(self, base_iso: str) -> None:
-        self.cursor: datetime = _parse_iso(base_iso) or datetime(2026, 1, 1, tzinfo=UTC)
-
-    def window(self, node: CausalNode) -> tuple[str, str]:
-        """Return the ``(startTime, endTime)`` ISO strings for one node, advancing the cursor."""
-        start_dt = _parse_iso(node.get("ts_start") or "")
-        start_iso = node["ts_start"] if start_dt else _to_iso(self.cursor)
-        start = start_dt or self.cursor
-        duration = timedelta(milliseconds=int(node.get("duration_ms") or 0))
-        end_dt = _parse_iso(node.get("ts_end") or "")
-        if end_dt:
-            end_iso, end = node["ts_end"], end_dt
-        else:
-            end = start + (duration or timedelta(milliseconds=1))
-            end_iso = _to_iso(end)
-        self.cursor = max(self.cursor + timedelta(milliseconds=1), end)
-        return start_iso, end_iso
-
-
-def _observation_event(
-    node: CausalNode, *, obs_id: str, trace_id: str, parent_id: str | None, window: tuple[str, str]
-) -> IngestEvent:
-    """Shape one ingestion event for a node: a generation if token-bearing, else a span."""
-    start, end = window
-    token_bearing = _is_token_bearing(node)
-    body: dict[str, Any] = {
-        "id": obs_id,
-        "traceId": trace_id,
-        "name": _label(node),
-        "startTime": start,
-        "endTime": end,
-        "metadata": {
-            "kind": node["kind"],
-            "status": node.get("status"),
-            "rollup": node.get("rollup"),
-        },
-    }
-    if parent_id is not None:
-        body["parentObservationId"] = parent_id
-    if token_bearing:
-        body["usageDetails"] = {
-            "input": int(node.get("own_tokens_in") or 0),
-            "output": int(node.get("own_tokens_out") or 0),
-            "cache_read_input_tokens": int(node.get("cache_read") or 0),
-            "cache_creation_input_tokens": int(node.get("cache_creation") or 0),
-        }
-    event_type = "generation-create" if token_bearing else "span-create"
-    return {"id": obs_id, "type": event_type, "timestamp": start, "body": body}
-
-
-def _emit_node(
-    node: CausalNode,
-    *,
-    trace_id: str,
-    parent_id: str | None,
-    path: str,
-    clock: _Clock,
-    out: list[IngestEvent],
-) -> None:
-    """Depth-first: append this node's event, then recurse into its children."""
-    obs_id = _node_id(trace_id, path)
-    out.append(
-        _observation_event(
-            node, obs_id=obs_id, trace_id=trace_id, parent_id=parent_id, window=clock.window(node)
-        )
-    )
-    for index, child in enumerate(node["children"]):
-        _emit_node(
-            child,
-            trace_id=trace_id,
-            parent_id=obs_id,
-            path=f"{path}/{index}",
-            clock=clock,
-            out=out,
-        )
-
-
-def build_batch(forest: list[CausalNode], spoke_run_id: str) -> list[IngestEvent]:
-    """Build the full ingestion batch for a spoke: one trace plus one event per node.
-
-    Walks the forest depth-first so observations are emitted parent-before-child, each
-    linked to its parent via ``parentObservationId``. All ids derive from the spoke run
-    id and tree path, so the batch is idempotent.
+    Hooks are skipped so a hook never indexes its own ``tool_use_id``; the surviving owner
+    is the tool observation, which is the re-parent target for matching hooks.
 
     Args:
-        forest: The strict causal forest from ``SpanStore.spoke_causal_forest``.
+        traces: The source traces paired with their observations.
+
+    Returns:
+        A mapping of ``tool_use_id`` to the assembled-trace copy id of its tool.
+    """
+    index: dict[str, str] = {}
+    for orig_trace_id, observations in traces:
+        for observation in observations:
+            if _is_hook(observation):
+                continue
+            tuid = _tool_use_id(observation)
+            if tuid:
+                index[tuid] = _copy_id(orig_trace_id, observation["id"])
+    return index
+
+
+def _resolve_parent(
+    observation: Observation, *, orig_trace_id: str, root_id: str, tool_index: dict[str, str]
+) -> str:
+    """Resolve the assembled-trace parent id for one source observation.
+
+    Args:
+        observation: The source observation.
+        orig_trace_id: The id of the trace the observation came from.
+        root_id: The synthetic root span id (the single collapsed root).
+        tool_index: Tool-call-id to tool-copy-id map from :func:`_build_tool_index`.
+
+    Returns:
+        The copy id of the intra-trace parent, the matching tool, or the synthetic root.
+    """
+    parent = observation.get("parentObservationId")
+    if parent:
+        return _copy_id(orig_trace_id, parent)
+    if _is_hook(observation):
+        tuid = _tool_use_id(observation)
+        if tuid and tuid in tool_index:
+            return tool_index[tuid]
+    return root_id
+
+
+def _copy_event(
+    observation: Observation, *, orig_trace_id: str, trace_id: str, parent_id: str
+) -> IngestEvent:
+    """Shape one ingestion event copying a source observation into the assembled trace.
+
+    The type tracks the source: a ``GENERATION`` becomes a ``generation-create``, anything
+    else a ``span-create``. ``usageDetails`` and ``model`` are re-passed so Langfuse
+    recomputes ``costDetails`` identically; an explicit ``costDetails`` is forwarded too.
+
+    Args:
+        observation: The source observation to copy.
+        orig_trace_id: The id of the trace the observation came from.
+        trace_id: The assembled trace id every copy references.
+        parent_id: The resolved parent id for this copy.
+
+    Returns:
+        A Langfuse ingestion batch event recreating the observation.
+    """
+    new_id = _copy_id(orig_trace_id, observation["id"])
+    obs_type = observation.get("type") or "SPAN"
+    event_type = "generation-create" if obs_type == "GENERATION" else "span-create"
+    start = observation.get("startTime") or _INGEST_TIMESTAMP
+    body: dict[str, Any] = {
+        "id": new_id,
+        "traceId": trace_id,
+        "parentObservationId": parent_id,
+        "name": observation.get("name"),
+        "startTime": observation.get("startTime"),
+        "endTime": observation.get("endTime"),
+    }
+    for field in _COPIED_FIELDS:
+        if observation.get(field) is not None:
+            body[field] = observation[field]
+    return {"id": new_id, "type": event_type, "timestamp": start, "body": body}
+
+
+def _earliest_start(traces: list[TraceObservations]) -> str:
+    """Return the earliest ISO ``startTime`` across all observations, or the fixed base."""
+    starts = [
+        observation["startTime"]
+        for _, observations in traces
+        for observation in observations
+        if observation.get("startTime")
+    ]
+    return min(starts) if starts else _INGEST_TIMESTAMP
+
+
+def build_batch(traces: list[TraceObservations], spoke_run_id: str) -> list[IngestEvent]:
+    """Assemble one nested trace from a spoke's source traces and their observations.
+
+    Emits a ``trace-create``, a single synthetic root span, and one copy per source
+    observation re-parented across the original trace boundaries (see module docstring).
+    All ids derive from the spoke run id and the source ``(trace_id, observation_id)``
+    pair, so the batch is idempotent.
+
+    Args:
+        traces: Each source trace paired with all of its observations, as fetched from
+            Langfuse with full fields.
         spoke_run_id: The spoke run identifier (becomes the trace's ``sessionId``).
 
     Returns:
-        The ingestion events: a leading ``trace-create`` followed by the DFS node events.
+        The ingestion events: a ``trace-create``, the synthetic root, then the copies.
     """
     trace_id = trace_id_for(spoke_run_id)
-    root_ts = (forest[0].get("ts_start") if forest else None) or _SYNTH_BASE
+    root_id = root_id_for(spoke_run_id)
+    base_ts = _earliest_start(traces)
     trace_event: IngestEvent = {
         "id": trace_id,
         "type": "trace-create",
-        "timestamp": root_ts,
+        "timestamp": base_ts,
         "body": {
             "id": trace_id,
             "name": _TRACE_NAME_PREFIX + spoke_run_id,
             "sessionId": spoke_run_id,
-            "timestamp": root_ts,
+            "timestamp": base_ts,
         },
     }
-    clock = _Clock(_SYNTH_BASE)
-    nodes: list[IngestEvent] = []
-    for index, root in enumerate(forest):
-        _emit_node(root, trace_id=trace_id, parent_id=None, path=str(index), clock=clock, out=nodes)
-    return [trace_event, *nodes]
+    root_event: IngestEvent = {
+        "id": root_id,
+        "type": "span-create",
+        "timestamp": base_ts,
+        "body": {
+            "id": root_id,
+            "traceId": trace_id,
+            "name": _ROOT_NAME_PREFIX + spoke_run_id,
+            "startTime": base_ts,
+        },
+    }
+    tool_index = _build_tool_index(traces)
+    copies: list[IngestEvent] = []
+    for orig_trace_id, observations in traces:
+        for observation in observations:
+            parent_id = _resolve_parent(
+                observation, orig_trace_id=orig_trace_id, root_id=root_id, tool_index=tool_index
+            )
+            copies.append(
+                _copy_event(
+                    observation, orig_trace_id=orig_trace_id, trace_id=trace_id, parent_id=parent_id
+                )
+            )
+    return [trace_event, root_event, *copies]
 
 
-def _load_span_store(events_path: Path) -> Any:
-    """Import ``dashboard/queries.py`` by file path and build a SpanStore from the WAL.
-
-    The dashboard is deliberately off the Python package path (its own
-    ``requirements.txt``), so it is loaded by file path here exactly as the test
-    harness does — keeping this script import-safe and DuckDB-free until run.
+def all_traces(spoke_run_id: str, get: GetFn) -> list[dict[str, Any]]:
+    """Fetch every trace in a session, walking all pages.
 
     Args:
-        events_path: The telemetry ``events.jsonl`` push-span WAL.
+        spoke_run_id: The session id (``langfuse.session.id``) to fetch.
+        get: Path-to-JSON fetcher (see :data:`telemetry.langfuse_rollup.GetFn`).
 
     Returns:
-        A ``SpanStore`` over the WAL.
-
-    Raises:
-        ImportError: When ``dashboard/queries.py`` cannot be loaded.
+        The session's traces across all pages, in fetch order.
     """
-    queries_path = Path(__file__).resolve().parents[2] / "dashboard" / "queries.py"
-    spec = importlib.util.spec_from_file_location("dashboard_queries", queries_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load queries module from {queries_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.SpanStore.from_jsonl(events_path)
+    session = urllib.parse.quote(spoke_run_id)
+    out: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        resp = get(f"/traces?sessionId={session}&limit={_PAGE_LIMIT}&page={page}")
+        out.extend(resp.get("data") or [])
+        total_pages = (resp.get("meta") or {}).get("totalPages") or 1
+        if page >= total_pages:
+            break
+        page += 1
+    return out
 
 
-def _post(batch: list[IngestEvent], *, host: str, auth: str) -> None:
-    """POST an ingestion batch to the Langfuse ingestion endpoint."""
-    data = json.dumps({"batch": batch}).encode()
-    request = urllib.request.Request(
-        f"{host}/api/public/ingestion",
-        data=data,
-        headers={"Authorization": auth, "Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(request, timeout=30) as resp:
-        resp.read()
+def fetch_session(spoke_run_id: str, get: GetFn) -> list[TraceObservations]:
+    """Fetch every trace in a session paired with all of its observations.
+
+    Args:
+        spoke_run_id: The session id (``langfuse.session.id``) to fetch.
+        get: Path-to-JSON fetcher (see :data:`telemetry.langfuse_rollup.GetFn`).
+
+    Returns:
+        Each trace id paired with its observations (full fields), in fetch order.
+    """
+    traces = all_traces(spoke_run_id, get)
+    return [(trace["id"], all_observations(trace["id"], get)) for trace in traces]
 
 
-def _default_events_path() -> Path:
-    """The default telemetry WAL path, honoring ``AI_TOOLKIT_TELEMETRY_DIR``."""
-    base = os.environ.get("AI_TOOLKIT_TELEMETRY_DIR") or str(
-        Path.home() / ".ai-toolkit" / "telemetry"
-    )
-    return Path(base) / "events.jsonl"
+def post_in_chunks(
+    batch: list[IngestEvent], post: PostFn, *, chunk_size: int = _CHUNK_SIZE
+) -> None:
+    """POST an ingestion batch in fixed-size chunks.
+
+    Args:
+        batch: The full ingestion batch.
+        post: Ingestion batch sink (see :data:`telemetry.langfuse_rollup.PostFn`).
+        chunk_size: Maximum events per request.
+    """
+    for start in range(0, len(batch), chunk_size):
+        post(batch[start : start + chunk_size])
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
-    """Parse the CLI arguments for the spoke-tree emitter."""
+    """Parse the CLI arguments for the spoke-tree assembler."""
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("spoke_run_id", help="The spoke run id to assemble and emit.")
-    parser.add_argument(
-        "--events", type=Path, default=None, help="Telemetry events.jsonl (default: telemetry dir)."
-    )
-    parser.add_argument(
-        "--projects",
-        type=Path,
-        default=Path.home() / ".claude" / "projects",
-        help="Claude projects root holding the spoke's session transcripts.",
-    )
+    parser.add_argument("spoke_run_id", help="The spoke run id (session id) to assemble.")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Assemble a spoke's causal forest and emit it as one nested Langfuse trace.
+    """Assemble a spoke's rich Langfuse observations into one nested trace.
 
     Args:
         argv: CLI arguments excluding the program name; defaults to ``sys.argv[1:]``.
 
     Returns:
-        Process exit code: 0 on success, 1 when the spoke has no parseable forest.
+        Process exit code: 0 on success.
 
     Raises:
         KeyError: When ``LANGFUSE_BASIC_AUTH`` is not set.
     """
     logging.basicConfig(level=logging.INFO, format="[spoke-tree] %(message)s")
     args = _parse_args(sys.argv[1:] if argv is None else argv)
-    events_path = args.events or _default_events_path()
-    store = _load_span_store(events_path)
-    forest = store.spoke_causal_forest(args.spoke_run_id, args.projects)
-    if not forest:
-        logger.error("no causal forest for spoke %s (no parseable transcript)", args.spoke_run_id)
-        return 1
-
-    batch = build_batch(forest, args.spoke_run_id)
     host = os.environ.get("LANGFUSE_HOST", "http://localhost:3000")
     auth = os.environ["LANGFUSE_BASIC_AUTH"]  # "Basic <base64(pk:sk)>"
-    _post(batch, host=host, auth=auth)
+    get, post = make_get(host, auth), make_post(host, auth)
 
-    trace_id = batch[0]["id"]
-    print(f"{len(batch) - 1} nodes emitted under trace {trace_id}")
+    traces = fetch_session(args.spoke_run_id, get)
+    batch = build_batch(traces, args.spoke_run_id)
+    post_in_chunks(batch, post)
+
+    trace_id = trace_id_for(args.spoke_run_id)
+    print(f"{len(batch) - 2} observations assembled under trace {trace_id}, roots collapsed to 1")
     return 0
 
 
