@@ -50,7 +50,12 @@ processors:
           - set(name, Concat(["tool:", attributes["tool_name"]], "")) where name == "claude_code.tool" and attributes["tool_name"] != nil
           - set(name, Concat(["hook:", attributes["hook_name"]], "")) where name == "claude_code.hook" and attributes["hook_name"] != nil
           - set(name, "sub-agent:llm") where name == "claude_code.llm_request" and attributes["agent_id"] != nil
-          # 3) spoke grouping → one spoke (across resumes) = one Langfuse session
+          # 3) spoke grouping → one spoke (across resumes) = one Langfuse session.
+          #    Langfuse reads the session from span attributes, precedence
+          #    langfuse.session.id > session.id. Claude Code sets session.id to its own
+          #    per-session UUID, so we set the higher-precedence langfuse.session.id to
+          #    win (verified 2026-06-19: span session.id alone grouped under the UUID).
+          - set(attributes["langfuse.session.id"], resource.attributes["spoke_run_id"]) where resource.attributes["spoke_run_id"] != nil
           - set(attributes["session.id"], resource.attributes["spoke_run_id"]) where resource.attributes["spoke_run_id"] != nil
 
 exporters:
