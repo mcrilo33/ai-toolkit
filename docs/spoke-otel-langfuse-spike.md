@@ -210,3 +210,34 @@ are independent gates.
 
 Do **not** retire the dashboard on the strength of native traces alone — the cost
 reconciliation and conservation guarantees have no native equivalent.
+
+## Per-container token rollup (post-run)
+
+Langfuse rolls *cost* and *latency* up onto container spans at render time, but it does
+**not** roll up the token breakdown. `scripts/telemetry/langfuse_rollup.py` fills that gap.
+For one session it walks each trace, rebuilds the observation tree from
+`parentObservationId`, and for every container observation (one that *has* children) sums
+the four token components — `input`, `output`, `cache_read_input_tokens`,
+`cache_creation_input_tokens` — over its whole subtree (itself plus all descendants). The
+sum is patched back as `metadata.rollup = {reused, written, input, output}` (`reused` is
+the cache-read total, `written` the cache-creation total) via the same ingestion endpoint
+and `LANGFUSE_HOST` / `LANGFUSE_BASIC_AUTH` env vars as the message bridge.
+
+```bash
+LANGFUSE_HOST=http://localhost:3000 LANGFUSE_BASIC_AUTH="Basic <base64(pk:sk)>" \
+    python3 scripts/telemetry/langfuse_rollup.py <spoke_run_id>
+```
+
+Notes and limits:
+
+- **Run it after the trace is fully ingested.** It reads the observations already in
+  Langfuse; a partially-ingested trace yields partial sums. Re-running is idempotent (the
+  ingestion event id derives from the observation id, so a rerun overwrites
+  `metadata.rollup` rather than appending).
+- **It shows in the span's metadata panel, not a native ∑ column.** Langfuse has no UI
+  surface for a custom per-span token total, so the rollup lives under `metadata.rollup`.
+- **Leaf tools roll up to zero.** `Bash`, `Read`, and other leaf tools make no API call,
+  so their subtree sums to zero — correct. Containers (`interaction`, `tool:Workflow`,
+  sub-agent) get their real subtree totals.
+- **Skills are not covered.** A skill's work is not nested under the `Skill` span, so it is
+  not attributed to that span's subtree. Covering skills needs a scope rule; deferred.
