@@ -472,9 +472,12 @@ sync_mcp_servers() {
 # spoke-push.sh ships here too so the spoke's PUSH step runs as one
 # allowlistable process (issue #37); spoke-ready.sh likewise, so marker emission
 # (ready/N, gate/N) is one allowlistable command (issue #45).
-# Sources: worktree-*.sh, spoke-push.sh and spoke-ready.sh at the toolkit root
-# scripts/, hub-status.sh and hub-ready-watch.sh under the hub skill
-# (shared/skills/hub/scripts/).
+# telemetry-ingest-spoke.sh ships so the synced land script can call it at
+# teardown for the #87/#92 post-run Langfuse ingestion; worktree-quick.sh ships
+# so the /quick express lane resolves in a synced target.
+# Sources: worktree-*.sh, spoke-push.sh, spoke-ready.sh and
+# telemetry-ingest-spoke.sh at the toolkit root scripts/, hub-status.sh and
+# hub-ready-watch.sh under the hub skill (shared/skills/hub/scripts/).
 sync_workflow_scripts() {
     section "Workflow scripts (hub/spoke/land)"
     local dst_dir="$TARGET/.ai-toolkit/scripts"
@@ -484,7 +487,7 @@ sync_workflow_scripts() {
     # scripts can source it as a sibling to emit lifecycle spans — see
     # worktree-lib.sh's telemetry block.
     local name src
-    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh spoke-push.sh spoke-ready.sh hub-status.sh hub-ready-watch.sh telemetry.sh; do
+    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh worktree-quick.sh spoke-push.sh spoke-ready.sh telemetry-ingest-spoke.sh hub-status.sh hub-ready-watch.sh telemetry.sh; do
         case "$name" in
             hub-status.sh|hub-ready-watch.sh) src="$SHARED_DIR/skills/hub/scripts/$name" ;;
             telemetry.sh)                     src="$SHARED_DIR/hooks/lib/$name" ;;
