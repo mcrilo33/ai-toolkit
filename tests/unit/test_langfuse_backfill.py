@@ -22,10 +22,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from telemetry.causal_tree import build_causal_forest
 from telemetry.langfuse_backfill import (
+    backfill_events,
     backfill_node_id,
     backfill_root_id,
     backfill_trace_id,
     forest_to_events,
+    is_native_trace,
+    session_is_covered,
 )
 
 SPOKE = "feature/92-demo+1700000000"
@@ -170,3 +173,68 @@ class TestDeterminism:
         assert backfill_node_id(SPOKE, "m1") == backfill_node_id(SPOKE, "m1")
         assert backfill_node_id(SPOKE, "m1") != backfill_node_id("other", "m1")
         assert backfill_node_id(SPOKE, "m1") != backfill_node_id(SPOKE, "m2")
+
+
+def _stub_get(traces: list[dict]) -> Any:
+    def get(_path: str) -> dict:
+        return {"data": traces, "meta": {"totalPages": 1}}
+
+    return get
+
+
+class TestCoverageDetection:
+    """Issue #92 dedup vs the live push: a session the live OTel push already covered
+    has native (non-synthetic) traces; the backfill detects them and does not re-emit a
+    competing full tree. The backfill's own trace and langfuse_spoke_tree's assembled
+    tree are NOT native — they are synthetic views, recognised by their id/name prefixes.
+    """
+
+    def test_live_push_native_trace_is_native(self) -> None:
+        assert is_native_trace({"id": "abc123", "name": "claude_code.interaction"})
+
+    def test_backfill_own_trace_is_not_native(self) -> None:
+        trace = {"id": backfill_trace_id("s"), "name": "spoke-backfill:s"}
+        assert not is_native_trace(trace)
+
+    def test_spoke_tree_assembled_trace_is_not_native(self) -> None:
+        assert not is_native_trace({"id": "spoketree-deadbeef", "name": "spoke-tree:s"})
+
+    def test_session_is_covered_when_a_native_trace_exists(self) -> None:
+        get = _stub_get([{"id": "abc", "name": "claude_code.interaction"}])
+        assert session_is_covered("s", get) is True
+
+    def test_session_not_covered_when_only_synthetic_traces(self) -> None:
+        get = _stub_get([{"id": backfill_trace_id("s"), "name": "spoke-backfill:s"}])
+        assert session_is_covered("s", get) is False
+
+    def test_session_not_covered_when_no_traces(self) -> None:
+        assert session_is_covered("s", _stub_get([])) is False
+
+
+class TestBackfillDecision:
+    """The three-branch dedup guard: uncovered → full forest; covered + thinking →
+    reasoning-only (the gap the live push lacks); covered + no thinking → no-op.
+    """
+
+    def test_uncovered_emits_the_full_forest(self) -> None:
+        events = backfill_events(_forest(), SPOKE, {"m1": "BODY_THINK"}, covered=False)
+        assert any(e["type"] == "generation-create" for e in events)
+        kinds = {e["body"].get("metadata", {}).get("kind") for e in events if "metadata" in e["body"]}
+        assert {"turn", "tool", "reasoning"} <= kinds
+
+    def test_covered_with_thinking_emits_reasoning_only(self) -> None:
+        events = backfill_events(_forest(), SPOKE, {"m1": "BODY_THINK"}, covered=True)
+        kinds = {e["body"].get("metadata", {}).get("kind") for e in events if "metadata" in e["body"]}
+        assert "turn" not in kinds and "tool" not in kinds
+        assert any(e["body"].get("output") == "BODY_THINK" for e in events)
+        assert any(e["type"] == "trace-create" for e in events)
+
+    def test_covered_reasoning_nodes_parent_under_the_root(self) -> None:
+        events = backfill_events(_forest(), SPOKE, {"m1": "BODY_THINK"}, covered=True)
+        reasoning = next(
+            e["body"] for e in events if e["body"].get("metadata", {}).get("kind") == "reasoning"
+        )
+        assert reasoning["parentObservationId"] == backfill_root_id(SPOKE)
+
+    def test_covered_without_thinking_is_a_noop(self) -> None:
+        assert backfill_events(_forest(), SPOKE, {}, covered=True) == []
