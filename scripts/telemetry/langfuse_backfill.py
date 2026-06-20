@@ -110,8 +110,8 @@ def _usage_details(node: dict[str, Any]) -> dict[str, int]:
 
 def _metadata(node: dict[str, Any]) -> dict[str, Any]:
     """The node's display metadata: kind plus any present phase/summary/status/actor/context."""
-    metadata: dict[str, Any] = {"kind": node.get("kind"), "actor": node.get("actor")}
-    for key in ("phase", "summary", "status"):
+    metadata: dict[str, Any] = {"kind": node.get("kind")}
+    for key in ("actor", "phase", "summary", "status"):
         if node.get(key) is not None:
             metadata[key] = node[key]
     if "input_context" in node:
@@ -140,8 +140,8 @@ def _node_event(
         "traceId": trace_id,
         "parentObservationId": parent_id,
         "name": node.get("name") or node.get("kind"),
-        "startTime": node.get("ts_start") or _INGEST_TIMESTAMP,
-        "endTime": node.get("ts_end") or node.get("ts_start") or _INGEST_TIMESTAMP,
+        "startTime": start,
+        "endTime": node.get("ts_end") or start,
         "metadata": _metadata(node),
     }
     if _is_generation(node):
