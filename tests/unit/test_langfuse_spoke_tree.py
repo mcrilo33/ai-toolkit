@@ -708,6 +708,43 @@ class TestBuildStepWindows:
     def test_non_ledger_spoke_yields_no_windows(self) -> None:
         assert build_step_windows(_traces(), {}) == []
 
+    def test_task_id_parsed_from_block_list_output(self) -> None:
+        # A TaskCreate result can arrive as a list of content blocks, not a bare string.
+        content = {
+            "tu-c1": ToolContent(
+                {"subject": "S1 RED: blocks"},
+                [{"type": "text", "text": "Task #1 created successfully: S1 RED: blocks"}],
+            ),
+            "tu-u1": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
+            "tu-u2": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
+        }
+        create = _ledger_obs(
+            "tc1",
+            "tool:TaskCreate",
+            "tu-c1",
+            start="2026-01-02T00:00:00Z",
+            end="2026-01-02T00:00:00Z",
+        )
+        started = _ledger_obs(
+            "tu1",
+            "tool:TaskUpdate",
+            "tu-u1",
+            start="2026-01-02T00:00:01Z",
+            end="2026-01-02T00:00:01Z",
+        )
+        done = _ledger_obs(
+            "tu2",
+            "tool:TaskUpdate",
+            "tu-u2",
+            start="2026-01-02T00:00:09Z",
+            end="2026-01-02T00:00:10Z",
+        )
+
+        windows = build_step_windows([("tr", [create, started, done])], content)
+
+        assert len(windows) == 1
+        assert windows[0].subject == "S1 RED: blocks"
+
     def test_create_without_an_in_progress_update_is_skipped(self) -> None:
         # A task that was created but never started has no window to draw.
         content = {

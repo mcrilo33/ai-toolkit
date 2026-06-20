@@ -508,10 +508,16 @@ def _step_id(spoke_run_id: str, task_id: str) -> str:
 
 
 def _task_id_from_create(output: object | None) -> str | None:
-    """Extract the created task id from a ``TaskCreate`` result string, or None."""
-    if not isinstance(output, str):
+    """Extract the created task id from a ``TaskCreate`` result, or None.
+
+    The transcript ``tool_result`` content is usually the ``"Task #N created…"`` string but can
+    arrive as a list of content blocks (``[{"type": "text", "text": …}]``); both are searched by
+    serializing non-string output, since the only ``#N`` in the result is the task id.
+    """
+    if output is None:
         return None
-    match = _TASK_ID_RE.search(output)
+    text = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
+    match = _TASK_ID_RE.search(text)
     return match.group(1) if match else None
 
 
