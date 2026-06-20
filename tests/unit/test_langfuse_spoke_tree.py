@@ -537,6 +537,62 @@ class TestToolSubspanFolding:
             "trace-tool", "tb"
         )
 
+    def test_mixed_naive_aware_timestamps_do_not_crash_the_build(self) -> None:
+        # One end aware (Z), the other naive: the duration is omitted, not raised; other attrs fold.
+        tool = _obs(
+            "tb", "tool:Bash", parent=None, metadata={"attributes": {"tool_use_id": "tu-1"}}
+        )
+        execu = _obs(
+            "ex",
+            "claude_code.tool.execution",
+            parent="tb",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:01",
+            metadata={"attributes": {"tool_use_id": "tu-1", "success": True}},
+        )
+
+        batch = build_batch([("tr", [tool, execu])], SPOKE)
+
+        meta = _by_orig(batch, "tr", "tb")["body"]["metadata"]
+        assert "execution_ms" not in meta
+        assert meta["success"] is True
+        assert self._dropped(batch, "tr", "ex")
+
+    def test_subspan_whose_parent_is_not_a_tool_is_not_folded(self) -> None:
+        # An execution span with no tool_use_id, nested under an interaction (not a tool), must NOT
+        # fold onto that non-tool node — it keeps its node nested under the interaction.
+        interaction = _obs("i1", "claude_code.interaction", parent=None)
+        execu = _obs(
+            "ex",
+            "claude_code.tool.execution",
+            parent="i1",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:01Z",
+            metadata={"attributes": {"success": True}},
+        )
+
+        batch = build_batch([("tr", [interaction, execu])], SPOKE)
+
+        assert not self._dropped(batch, "tr", "ex")
+        assert _by_orig(batch, "tr", "ex")["body"]["parentObservationId"] == _copy_id("tr", "i1")
+        assert "success" not in _by_orig(batch, "tr", "i1")["body"].get("metadata", {})
+
+    def test_unmatched_tool_decision_keeps_its_node(self) -> None:
+        decision = _obs(
+            "d0",
+            "tool_decision:reject",
+            type_="EVENT",
+            parent=None,
+            metadata={"tool_use_id": "tu-absent", "decision": "reject"},
+        )
+
+        batch = build_batch([("trace-audit", [decision])], SPOKE)
+
+        assert not self._dropped(batch, "trace-audit", "d0")
+        assert _by_orig(batch, "trace-audit", "d0")["body"]["parentObservationId"] == root_id_for(
+            SPOKE
+        )
+
 
 class TestContainerRollups:
     """Every container node (and the synthetic root) carries a subtree token rollup."""

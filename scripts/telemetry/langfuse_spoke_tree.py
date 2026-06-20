@@ -336,13 +336,18 @@ def _is_fold_subspan(observation: Observation) -> bool:
 
 
 def _duration_ms(observation: Observation) -> int | None:
-    """Return a span's wall-clock duration in ms from its ISO start/end, or None."""
+    """Return a span's wall-clock duration in ms from its ISO start/end, or None.
+
+    Catches both a malformed timestamp (``ValueError``) and a mixed naive/aware pair
+    (``TypeError`` — subtracting an offset-aware from an offset-naive datetime), so one odd
+    span never aborts the whole assembly; the ms is simply omitted.
+    """
     start, end = observation.get("startTime"), observation.get("endTime")
     if not start or not end:
         return None
     try:
         delta = datetime.fromisoformat(end) - datetime.fromisoformat(start)
-    except ValueError:
+    except (ValueError, TypeError):
         return None
     return int(delta.total_seconds() * 1000)
 
@@ -361,52 +366,77 @@ def _attr(observation: Observation, *keys: str) -> object | None:
 
 
 def _fold_attrs(observation: Observation) -> dict[str, Any]:
-    """Return the metadata a fold sub-span contributes to its tool node (see :func:`_is_fold_subspan`)."""
+    """Return the metadata a fold sub-span contributes to its tool node (see :func:`_is_fold_subspan`).
+
+    The ``*_ms`` values derive from the span's own duration and are robust; the ``success`` /
+    ``error`` / ``decision`` / ``decision_source`` reads probe several candidate attribute keys
+    (bare and ``claude_code.tool.*``-namespaced) since the exact native OTel names vary. When a
+    tool has both a blocked-on-user and a tool_decision sub-span they both write ``decision``;
+    last-writer-wins, and the two are expected to agree.
+
+    UPGRADE: pin the success/error/decision/source attribute keys once confirmed against a real
+    Claude Code OTel trace — the duration-derived ``*_ms`` already fold reliably regardless.
+    """
     name = observation.get("name") or ""
     out: dict[str, Any] = {}
     if name == _FOLD_EXECUTION_NAME:
         ms = _duration_ms(observation)
         if ms is not None:
             out["execution_ms"] = ms
-        success = _attr(observation, "success")
+        success = _attr(observation, "success", "claude_code.tool.success", "gen_ai.tool.success")
         if success is not None:
             out["success"] = bool(success)
-        error = _attr(observation, "error")
+        error = _attr(observation, "error", "error.message", "claude_code.tool.error")
         if error:
             out["error"] = error
     elif name == _FOLD_BLOCKED_NAME:
         ms = _duration_ms(observation)
         if ms is not None:
             out["blocked_on_user_ms"] = ms
-        decision = _attr(observation, "decision")
-        if decision:
-            out["decision"] = decision
-        source = _attr(observation, "decision_source", "source")
-        if source:
-            out["decision_source"] = source
+        out.update(_decision_attrs(observation))
     elif name.startswith(_FOLD_DECISION_PREFIX):
-        decision = name.split(":", 1)[1] if ":" in name else _attr(observation, "decision")
-        if decision:
-            out["decision"] = decision
-        source = _attr(observation, "decision_source", "source")
-        if source:
-            out["decision_source"] = source
+        suffix = name.split(":", 1)[1] if ":" in name else None
+        out.update(_decision_attrs(observation, default_decision=suffix))
+    return out
+
+
+def _decision_attrs(
+    observation: Observation, *, default_decision: str | None = None
+) -> dict[str, Any]:
+    """Return the ``decision`` / ``decision_source`` a blocked/decision sub-span contributes."""
+    out: dict[str, Any] = {}
+    decision = _attr(observation, "decision", "claude_code.tool.decision") or default_decision
+    if decision:
+        out["decision"] = decision
+    source = _attr(observation, "decision_source", "source", "claude_code.tool.decision_source")
+    if source:
+        out["decision_source"] = source
     return out
 
 
 def _fold_owner(
-    observation: Observation, orig_trace_id: str, tool_index: dict[str, str]
+    observation: Observation,
+    orig_trace_id: str,
+    tool_index: dict[str, str],
+    tool_span_ids: set[str],
 ) -> str | None:
     """Return the copy id of the tool a fold sub-span belongs to, or None.
 
     The audit ``tool_decision`` joins by ``tool_use_id``; the native execution / blocked spans
-    are children of their tool, so they also fall back to the copy of their ``parentObservationId``.
+    are children of their tool, so they also fall back to the copy of their
+    ``parentObservationId`` — but ONLY when that parent is itself a ``tool:`` span, so a sub-span
+    whose parent is an interaction (or another sub-span, e.g. a resume nested under a
+    ``tool.execution``) is never folded onto a non-tool node.
     """
     tuid = _tool_use_id(observation)
     if tuid and tuid in tool_index:
         return tool_index[tuid]
     parent = observation.get("parentObservationId")
-    return _copy_id(orig_trace_id, parent) if parent else None
+    if parent:
+        parent_copy = _copy_id(orig_trace_id, parent)
+        if parent_copy in tool_span_ids:
+            return parent_copy
+    return None
 
 
 def _fold_tool_subspans(
@@ -427,12 +457,18 @@ def _fold_tool_subspans(
         The copies with the folded sub-spans removed.
     """
     by_id = {event["body"]["id"]: event for event in copies}
+    tool_span_ids = {
+        _copy_id(orig_trace_id, observation["id"])
+        for orig_trace_id, observations in traces
+        for observation in observations
+        if _is_tool_span(observation)
+    }
     folded: set[str] = set()
     for orig_trace_id, observations in traces:
         for observation in observations:
             if not _is_fold_subspan(observation):
                 continue
-            owner = _fold_owner(observation, orig_trace_id, tool_index)
+            owner = _fold_owner(observation, orig_trace_id, tool_index, tool_span_ids)
             if owner is None or owner not in by_id:
                 continue  # no tool to fold into — leave the sub-span as a node
             attrs = _fold_attrs(observation)
