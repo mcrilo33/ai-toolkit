@@ -29,9 +29,27 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 
 WORKTREE_NEW = Path(__file__).resolve().parents[2] / "scripts" / "worktree-new.sh"
+TELEMETRY_LIB = Path(__file__).resolve().parents[2] / "shared" / "hooks" / "lib" / "telemetry.sh"
+
+# The OTLP/Langfuse fan-out sink in telemetry.sh (Issue #83) is a SECOND, INDEPENDENT
+# sink: telemetry_emit_span curl-POSTs a span to AI_TOOLKIT_OTEL_SPAN_ENDPOINT gated on
+# that var ALONE — not on AI_TOOLKIT_TELEMETRY. The events.jsonl strip (#49) never
+# covered it, so a test inheriting a spoke/dev shell's exported endpoint POSTed fixture
+# spans straight to the live collector -> Langfuse (the recurring fake-spoke leak). These
+# are the vars whose presence opens a real export channel; the conftest must drop the lot.
+_OTLP_EXPORT_VARS = (
+    "AI_TOOLKIT_OTEL_SPAN_ENDPOINT",
+    "AI_TOOLKIT_OTEL",
+    "AI_TOOLKIT_OTEL_BODY_DIR",
+    "BRIDGE_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+)
 
 # Pin git config to nothing so a host's global/system config never reaches the
 # commits the harness drives (this repo itself ships installable git hooks), and
@@ -116,3 +134,73 @@ def test_worktree_new_with_telemetry_on_never_writes_real_default(tmp_path: Path
         "worktree-new.sh leaked telemetry into the real-default $HOME/.ai-toolkit log — "
         "the conftest AI_TOOLKIT_TELEMETRY_DIR redirect is missing or ineffective"
     )
+
+
+# ── OTLP / Langfuse fan-out sink isolation (the recurring fake-spoke leak) ──
+
+
+def test_conftest_strips_otlp_export_endpoints() -> None:
+    # In-process guard: after the conftest import, NO var that opens a live OTLP export
+    # channel survives in os.environ. AI_TOOLKIT_OTEL_SPAN_ENDPOINT is the one the shell
+    # sink reads; the rest are the native-OTel family a spoke may also export. Any of
+    # them present means a test that inherits os.environ can POST to the real collector.
+    for var in _OTLP_EXPORT_VARS:
+        assert not os.environ.get(var), (
+            f"conftest must strip {var} so no test inherits a live OTLP export channel; "
+            f"it is still set to {os.environ.get(var)!r}"
+        )
+
+
+def _stub_curl(bin_dir: Path) -> Path:
+    """A fake ``curl`` on PATH that records each invocation to a sentinel file.
+
+    The real sink runs ``curl`` backgrounded + output-redirected; the stub only
+    touches the sentinel so it stays invisible. Presence of the sentinel == the OTLP
+    sink fired a network POST.
+    """
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    sentinel = bin_dir / "curl_invoked"
+    stub = bin_dir / "curl"
+    stub.write_text(f'#!/usr/bin/env bash\necho called >> "{sentinel}"\ncat >/dev/null 2>&1\n')
+    stub.chmod(0o755)
+    return sentinel
+
+
+def _emit_with_stub_curl(env: dict[str, str], bin_dir: Path, sentinel: Path) -> bool:
+    """Source telemetry.sh, emit one span under ``env``, return whether curl was hit."""
+    env = {**env, "PATH": f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"}
+    subprocess.run(
+        ["bash", "-c", f'source "{TELEMETRY_LIB}"; telemetry_emit_span --kind step --name t'],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    # The sink backgrounds curl; poll briefly for the sentinel to appear.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if sentinel.exists():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_emit_inheriting_test_env_opens_no_network_connection(tmp_path: Path) -> None:
+    # The cure: a test that inherits the (conftest-neutralized) os.environ and shells out
+    # to telemetry_emit_span must NOT reach a collector — the OTLP endpoint was stripped,
+    # so the sink no-ops and curl is never invoked.
+    sentinel = _stub_curl(tmp_path / "bin")
+    fired = _emit_with_stub_curl(dict(os.environ), tmp_path / "bin", sentinel)
+    assert not fired, (
+        "telemetry_emit_span opened a network connection under the inherited test env — "
+        "AI_TOOLKIT_OTEL_SPAN_ENDPOINT leaked through the conftest sanitizer"
+    )
+
+
+def test_emit_does_fire_when_endpoint_explicitly_set(tmp_path: Path) -> None:
+    # Positive control: with the endpoint explicitly present, the OTLP sink DOES curl.
+    # Proves the no-network assertion above is real (stripping is what suppresses it),
+    # not a stub/path artifact that would pass regardless.
+    sentinel = _stub_curl(tmp_path / "bin")
+    env = {**os.environ, "AI_TOOLKIT_OTEL_SPAN_ENDPOINT": "http://127.0.0.1:4318"}
+    fired = _emit_with_stub_curl(env, tmp_path / "bin", sentinel)
+    assert fired, "OTLP sink did not fire even with AI_TOOLKIT_OTEL_SPAN_ENDPOINT set"
