@@ -200,6 +200,24 @@ class TestContainerRollups:
             "output": 200,
         }
 
+    def test_container_rollup_written_includes_the_1h_tier(self) -> None:
+        # Issue #97 regression: the container rollup's ``written`` totals BOTH cache-write
+        # TTL tiers, not just the 5m tier (the default fixture pins 1h to 0, which would
+        # mask a 5m-only sum).
+        forest = build_causal_forest(
+            [_turn(cache_creation=300, cache_creation_5m=120, cache_creation_1h=180)],
+            [],
+            {},
+            thinking={},
+        )
+        run = next(
+            e["body"]
+            for e in forest_to_events(forest, SPOKE, thinking={})
+            if e["type"] == "span-create" and e["body"].get("name") == "run"
+        )
+
+        assert run["metadata"]["rollup"]["written"] == 300
+
 
 class TestDeterminism:
     def test_ids_are_stable_across_runs(self) -> None:

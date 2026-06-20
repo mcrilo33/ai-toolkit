@@ -48,6 +48,7 @@ from telemetry.langfuse_rollup import (
     build_tree,
     make_get,
     make_post,
+    rollup_metadata,
     subtree_totals,
 )
 from telemetry.langfuse_spoke_tree import all_traces, post_in_chunks
@@ -268,12 +269,7 @@ def _apply_rollups(events: list[IngestEvent]) -> None:
         if not children.get(body["id"]):
             continue
         totals = subtree_totals(body["id"], by_id, children)
-        body.setdefault("metadata", {})["rollup"] = {
-            "reused": totals["cache_read_input_tokens"],
-            "written": totals["cache_creation_input_tokens"],
-            "input": totals["input"],
-            "output": totals["output"],
-        }
+        body.setdefault("metadata", {})["rollup"] = rollup_metadata(totals)
 
 
 def forest_to_events(

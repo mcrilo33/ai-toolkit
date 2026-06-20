@@ -112,6 +112,25 @@ def subtree_totals(
     return totals
 
 
+def rollup_metadata(totals: TokenTotals) -> dict[str, int]:
+    """The ``{reused, written, input, output}`` rollup summary for a subtree.
+
+    ``written`` totals cache writes across both ephemeral TTL tiers — the 5m
+    ``cache_creation_input_tokens`` plus the 1h ``input_cache_creation_1h`` (Issue #97).
+    The single source of truth for the three rollup writers (this module's update events,
+    plus the backfill and spoke-tree create-body rollups) so they cannot drift.
+
+    Args:
+        totals: Subtree token totals from :func:`subtree_totals`.
+    """
+    return {
+        "reused": totals["cache_read_input_tokens"],
+        "written": totals["cache_creation_input_tokens"] + totals.get("input_cache_creation_1h", 0),
+        "input": totals["input"],
+        "output": totals["output"],
+    }
+
+
 def rollup_event(observation: Observation, totals: TokenTotals) -> dict[str, Any]:
     """Shape a single ingestion event patching ``metadata.rollup`` onto an observation.
 
@@ -134,16 +153,7 @@ def rollup_event(observation: Observation, totals: TokenTotals) -> dict[str, Any
         "timestamp": _INGEST_TIMESTAMP,
         "body": {
             "id": observation["id"],
-            "metadata": {
-                "rollup": {
-                    "reused": totals["cache_read_input_tokens"],
-                    # Total cache writes across both TTL tiers (Issue #97).
-                    "written": totals["cache_creation_input_tokens"]
-                    + totals.get("input_cache_creation_1h", 0),
-                    "input": totals["input"],
-                    "output": totals["output"],
-                }
-            },
+            "metadata": {"rollup": rollup_metadata(totals)},
         },
     }
 
