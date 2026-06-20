@@ -343,6 +343,169 @@ def test_buffered_output_flushes_once_regardless_of_arrival_order() -> None:
     assert len(sink.calls) == 1
 
 
+# --- file mode: body_ref fallback when no inline body ------------------------
+
+
+def test_request_body_ref_attaches_input_from_file(tmp_path: Path) -> None:
+    # Arrange: file mode (OTEL_LOG_RAW_API_BODIES=file:<dir>) emits no inline `body`, only a
+    # `body_ref` absolute path to the untruncated request JSON on disk.
+    sink = _Sink()
+    bridge = Bridge(sink)
+    ref = tmp_path / "abc.request.json"
+    ref.write_text(_body("turn-file"))
+
+    # Act
+    bridge.on_logs(
+        _log_payload(
+            _attrs(
+                **{
+                    "event.name": "api_request_body",
+                    "event.sequence": "30",
+                    "body_ref": str(ref),
+                }
+            ),
+            _attrs(**{"event.name": "api_request", "event.sequence": "37", "request_id": "req-f"}),
+        )
+    )
+    bridge.on_spans(_span_payload(span_id="1122334455667788", request_id="req-f"))
+
+    # Assert: the input is read from the file and patched as the last message.
+    assert sink.calls == [("1122334455667788", "input", {"role": "user", "content": "turn-file"})]
+    assert bridge.pending_count() == 0
+
+
+def test_response_body_ref_attaches_output_from_file(tmp_path: Path) -> None:
+    # Arrange: file mode for the response body too -- a body_ref instead of inline `body`.
+    sink = _Sink()
+    bridge = Bridge(sink)
+    bridge.on_spans(_span_payload(span_id="aabbccddeeff0011", request_id="req-r"))
+    ref = tmp_path / "abc.response.json"
+    ref.write_text('{"content": [{"type": "text", "text": "from file"}]}')
+
+    # Act
+    bridge.on_logs(
+        _log_payload(
+            _attrs(
+                **{
+                    "event.name": "api_response_body",
+                    "request_id": "req-r",
+                    "body_ref": str(ref),
+                }
+            )
+        )
+    )
+
+    # Assert: output read from the file and patched onto the span.
+    assert sink.calls == [("aabbccddeeff0011", "output", [{"type": "text", "text": "from file"}])]
+    assert bridge.pending_count() == 0
+
+
+def test_inline_body_preferred_over_body_ref(tmp_path: Path) -> None:
+    # Arrange: both attributes present -- inline `body` must win, body_ref ignored.
+    sink = _Sink()
+    bridge = Bridge(sink)
+    ref = tmp_path / "ignored.request.json"
+    ref.write_text(_body("from-file"))
+
+    # Act
+    bridge.on_logs(
+        _log_payload(
+            _attrs(
+                **{
+                    "event.name": "api_request_body",
+                    "event.sequence": "30",
+                    "body": _body("inline"),
+                    "body_ref": str(ref),
+                }
+            ),
+            _attrs(**{"event.name": "api_request", "event.sequence": "37", "request_id": "req-i"}),
+        )
+    )
+    bridge.on_spans(_span_payload(span_id="1122334455667788", request_id="req-i"))
+
+    # Assert: the inline body is used, not the file.
+    assert sink.calls == [("1122334455667788", "input", {"role": "user", "content": "inline"})]
+
+
+def test_missing_body_ref_skips_without_crashing(tmp_path: Path) -> None:
+    # Arrange: a body_ref pointing at a nonexistent path (stale/hostile log event).
+    sink = _Sink()
+    bridge = Bridge(sink)
+    missing = tmp_path / "does-not-exist.request.json"
+
+    # Act: must not raise.
+    bridge.on_logs(
+        _log_payload(
+            _attrs(
+                **{
+                    "event.name": "api_request_body",
+                    "event.sequence": "30",
+                    "body_ref": str(missing),
+                }
+            ),
+            _attrs(**{"event.name": "api_request", "event.sequence": "37", "request_id": "req-x"}),
+        )
+    )
+    bridge.on_spans(_span_payload(span_id="1122334455667788", request_id="req-x"))
+
+    # Assert: nothing patched, nothing buffered, no crash.
+    assert sink.calls == []
+    assert bridge.pending_count() == 0
+
+
+def test_body_ref_pointing_at_directory_skips_without_crashing(tmp_path: Path) -> None:
+    # Arrange: body_ref points at a directory, not a regular file.
+    sink = _Sink()
+    bridge = Bridge(sink)
+
+    # Act: must not raise.
+    bridge.on_logs(
+        _log_payload(
+            _attrs(
+                **{
+                    "event.name": "api_response_body",
+                    "request_id": "req-d",
+                    "body_ref": str(tmp_path),
+                }
+            )
+        )
+    )
+    bridge.on_spans(_span_payload(span_id="aabbccddeeff0011", request_id="req-d"))
+
+    # Assert: a non-file path is skipped gracefully.
+    assert sink.calls == []
+    assert bridge.pending_count() == 0
+
+
+def test_oversized_body_ref_skips_without_crashing(tmp_path: Path) -> None:
+    # Arrange: a body_ref file beyond the read cap must be skipped, not loaded into memory.
+    from telemetry.langfuse_message_bridge import _MAX_BODY_REF_BYTES
+
+    sink = _Sink()
+    bridge = Bridge(sink)
+    ref = tmp_path / "huge.request.json"
+    ref.write_bytes(b"x" * (_MAX_BODY_REF_BYTES + 1))
+
+    # Act
+    bridge.on_logs(
+        _log_payload(
+            _attrs(
+                **{
+                    "event.name": "api_request_body",
+                    "event.sequence": "30",
+                    "body_ref": str(ref),
+                }
+            ),
+            _attrs(**{"event.name": "api_request", "event.sequence": "37", "request_id": "req-o"}),
+        )
+    )
+    bridge.on_spans(_span_payload(span_id="1122334455667788", request_id="req-o"))
+
+    # Assert: skipped, nothing patched.
+    assert sink.calls == []
+    assert bridge.pending_count() == 0
+
+
 # --- audit/event layer: CREATE observations onto the spoke audit trace -------
 
 
