@@ -50,10 +50,13 @@ Beyond copying, the build adds two CREATE-only enrichments (no patches):
 - **An itemized loaded-context subtree.** A ``loaded-context`` node under the root with one
   category node per group and one item node per name (token size + cost): rules / memory /
   skills / sub-agents / environment measured per-file from disk (via
-  ``measure_context_cost``), and mcp / built-in tools per-schema from a captured
-  ``api_request_body`` ``tools`` array (``--request-body``). A reconciled ``remainder`` node
-  = first-call ``cache_creation`` − Σ measured (clamped ≥ 0) absorbs the base system prompt
-  and any unavailable/truncated schemas.
+  ``measure_context_cost``). The rest of the first-call prefix — full prefix =
+  ``cache_read + cache_creation`` of the first LLM call — is reconciled into a
+  ``built-in + system`` node (the empirically-measured framework floor from a bare
+  ``claude`` session) and a derived ``mcp`` node (``prefix - floor - Σ measured disk``,
+  clamped ≥ 0). The built-in tool and MCP schemas are not exposed, so per-individual-tool
+  and per-MCP-server sizes are not obtainable; MCP is an aggregate. When the floor cannot be
+  calibrated, the two collapse to one reconciled ``remainder`` node instead.
 
 Import-safe: no environment is read at import time, so :func:`build_batch`,
 :func:`scan_transcripts`, and :func:`build_loaded_context_events` are unit-testable with no
@@ -87,9 +90,9 @@ from telemetry.measure_context_cost import (
     DEFAULT_ENDPOINT,
     DEFAULT_MODEL,
     TokenCounter,
-    _count,
     assemble_items,
     make_counter,
+    measure_framework_floor,
     measure_items,
 )
 
@@ -129,16 +132,20 @@ _DEFAULT_PROJECTS = Path("~/.claude/projects").expanduser()
 
 # Deterministic id prefix for the synthetic loaded-context subtree nodes.
 _LC_PREFIX = "tree-lc-"
-# A tool whose name starts with this came from an MCP connector; the rest are built-in.
-_MCP_PREFIX = "mcp__"
-# Where the MCP / built-in tool schemas were sourced from (the captured request body).
-_TOOLS_SOURCE = "request_tools_array"
-# Source label for the reconciled base-system-prompt / unmeasured remainder node.
+# Source label for the empirically-measured built-in-tools + base-system-prompt floor.
+_FLOOR_SOURCE = "bare-session calibration"
+# Source label for the derived MCP aggregate (prefix - floor - measured disk).
+_MCP_SOURCE = "derived"
+# Note recorded on the derived MCP node: it is an aggregate, not per-server/per-tool.
+_MCP_NOTE = "derived = prefix - floor - measured; per-server/per-tool not separable"
+# Source label for the single reconciled remainder used when no floor is available.
 _REMAINDER_SOURCE = "reconciled-remainder"
+# Note recorded on the fallback remainder node, explaining why floor + mcp were not split.
+_REMAINDER_NOTE = "floor calibration unavailable; base system + tools reconciled as one"
 # Default cache-creation price (USD per token), Opus tier — mirrors measure_context_cost.
 _DEFAULT_PRICE = 0.00000625
-# Category order for the loaded-context subtree (disk categories first, then request-sourced).
-_LC_CATEGORY_ORDER = ("rules", "memory", "skills", "sub-agents", "environment", "mcp", "tools")
+# Category order for the disk-measurable loaded-context items.
+_LC_CATEGORY_ORDER = ("rules", "memory", "skills", "sub-agents", "environment")
 
 
 class ToolContent(NamedTuple):
@@ -629,93 +636,37 @@ def filled_tool_spans(traces: list[TraceObservations], tool_content: dict[str, T
     )
 
 
-def prefix_cache_creation(traces: list[TraceObservations]) -> int:
-    """Return the ``cache_creation_input_tokens`` of the session's first LLM call.
+def prefix_total(traces: list[TraceObservations]) -> int:
+    """Return the full session prefix size from the first LLM call's token usage.
 
     Claude Code writes the whole session prefix (rules, skills, tools, base system
-    prompt, ...) to the prompt cache on the first call, counted as ``cache_creation``.
-    That first-call total is the figure the loaded-context items reconcile against, so
-    the earliest observation carrying usage is chosen by ``startTime``.
+    prompt, ...) to the prompt cache on the first call. A cold cache writes it all as
+    ``cache_creation``; a warm one splits it into ``cache_read`` + ``cache_creation``.
+    The prefix total is therefore their SUM on the earliest observation carrying usage
+    (chosen by ``startTime``) — ``cache_creation`` alone undercounts a warm session to
+    near zero. That total is the figure the loaded-context items reconcile against.
 
     Args:
         traces: The source traces paired with their observations.
 
     Returns:
-        The first call's cache-creation token count, or 0 when no usage is present.
+        The first call's ``cache_read + cache_creation`` token total, or 0 when no usage
+        is present.
     """
     best_start: str | None = None
     best_value = 0
     for _orig_trace_id, observations in traces:
         for observation in observations:
             usage = observation.get("usageDetails") or {}
+            read = usage.get("cache_read_input_tokens")
             written = usage.get("cache_creation_input_tokens")
-            if written is None:
+            if read is None and written is None:
                 continue
             start = observation.get("startTime") or ""
             if best_start is None or start < best_start:
-                best_start, best_value = start, int(written)
+                best_start = start
+                best_value = int(read or 0) + int(written or 0)
     return best_value
-
-
-def itemize_tool_schemas(
-    tools: list[dict[str, Any]], *, counter: TokenCounter, price: float
-) -> list[dict[str, object]]:
-    """Itemize a request's ``tools`` array into per-tool token/cost rows.
-
-    Each tool schema is counted on its own; ``mcp__``-prefixed names are MCP connector
-    tools and the rest are built-in tools. The schema text is the JSON-serialized tool
-    entry, counted via ``counter`` with the char/4 fallback (marking the row estimated).
-
-    Args:
-        tools: The ``tools`` array captured from an ``api_request_body`` (each entry a
-            ``{name, description, input_schema}`` dict).
-        counter: Token counter; raises ``CountTokensError`` when unreachable.
-        price: Cache-creation price in USD per token.
-
-    Returns:
-        One row per named tool with keys ``category`` (``mcp`` / ``tools``), ``name``,
-        ``tokens``, ``cost_usd``, ``source``, ``estimated``.
-    """
-    rows: list[dict[str, object]] = []
-    for tool in tools:
-        name = tool.get("name")
-        if not name:
-            continue
-        tokens, fell_back = _count(json.dumps(tool, ensure_ascii=False, sort_keys=True), counter)
-        rows.append(
-            {
-                "category": "mcp" if str(name).startswith(_MCP_PREFIX) else "tools",
-                "name": str(name),
-                "tokens": tokens,
-                "cost_usd": tokens * price,
-                "source": _TOOLS_SOURCE,
-                "estimated": fell_back,
-            }
-        )
-    return rows
-
-
-def load_tools_from_request(path: Path) -> list[dict[str, Any]]:
-    """Read the ``tools`` array from a captured ``api_request_body`` JSON file.
-
-    The built-in and MCP tool schemas are not on disk; they live only in the request the
-    runtime sends. When the file is missing, unreadable, malformed, or has no ``tools``
-    array (e.g. the 60 KB body cap truncated it), an empty list is returned and those
-    tools fall into the reconciled remainder rather than being fabricated.
-
-    Args:
-        path: Path to a JSON file holding one ``api_request_body``.
-
-    Returns:
-        The captured ``tools`` array, or an empty list when unavailable.
-    """
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        logger.warning("cannot read request tools from %s: %s", path, e)
-        return []
-    tools = data.get("tools") if isinstance(data, dict) else None
-    return tools if isinstance(tools, list) else []
 
 
 def _lc_id(spoke_run_id: str, key: str) -> str:
@@ -752,29 +703,37 @@ def build_loaded_context_events(
     spoke_run_id: str,
     item_rows: list[dict[str, object]],
     *,
-    prefix_cache_creation: int,
+    prefix_total: int,
+    floor: dict[str, object] | None = None,
     price: float,
     base_ts: str,
 ) -> list[IngestEvent]:
     """Build the itemized loaded-context subtree under the spoke root.
 
     Emits a ``loaded-context`` parent under the synthetic root, one category node per
-    group carrying its rolled-up total, one item node per name (token size + cost +
-    source), and a final ``remainder`` node reconciling the base system prompt and any
-    unmeasured tools: ``prefix_cache_creation − Σ measured``, clamped at zero. All ids
-    derive from the spoke run id so a rerun overwrites the same nodes.
+    disk group carrying its rolled-up total, one item node per name (token size + cost +
+    source), and the reconciliation of the rest of the first-call prefix:
+
+    - With a measured ``floor``: a ``built-in + system`` node (tokens = floor) and a
+      derived ``mcp`` node (tokens = ``prefix_total - floor - Σ measured disk``, clamped
+      ≥ 0). The MCP figure is an aggregate; per-server/per-tool sizes are not separable.
+    - Without a floor: a single ``remainder`` node = ``prefix_total - Σ measured``, clamped
+      ≥ 0, absorbing the base system prompt and all tool schemas together.
+
+    All ids derive from the spoke run id so a rerun overwrites the same nodes.
 
     Args:
         spoke_run_id: The spoke run identifier.
-        item_rows: Per-name measured rows (from :func:`measure_items` and
-            :func:`itemize_tool_schemas`), each with ``category``, ``name``, ``tokens``,
-            ``cost_usd``, ``source``, ``estimated``.
-        prefix_cache_creation: The session's first-call cache-creation token total.
-        price: Cache-creation price in USD per token (for the remainder's cost).
+        item_rows: Per-name measured disk rows (from :func:`measure_items`), each with
+            ``category``, ``name``, ``tokens``, ``cost_usd``, ``source``, ``estimated``.
+        prefix_total: The session's first-call ``cache_read + cache_creation`` token total.
+        floor: The measured built-in/system floor (``{"tokens", "estimated", "source"}``)
+            from :func:`measure_framework_floor`, or None to fall back to one remainder.
+        price: Cache-creation price in USD per token (for the reconciliation nodes' cost).
         base_ts: ISO timestamp stamped on every synthetic node.
 
     Returns:
-        The loaded-context ingestion events: parent, categories, items, remainder.
+        The loaded-context ingestion events: parent, categories, items, reconciliation.
     """
     trace_id = trace_id_for(spoke_run_id)
     root_id = root_id_for(spoke_run_id)
@@ -811,9 +770,9 @@ def build_loaded_context_events(
         events.extend(
             _lc_item_node(spoke_run_id, category, cat_id, trace_id, base_ts, row) for row in rows
         )
-    events.append(
-        _remainder_node(
-            spoke_run_id, lc_id, trace_id, base_ts, prefix_cache_creation, measured_tokens, price
+    events.extend(
+        _reconciliation_nodes(
+            spoke_run_id, lc_id, trace_id, base_ts, prefix_total, measured_tokens, floor, price
         )
     )
     return events
@@ -858,6 +817,55 @@ def _lc_item_node(
     )
 
 
+def _reconciliation_nodes(
+    spoke_run_id: str,
+    lc_id: str,
+    trace_id: str,
+    base_ts: str,
+    prefix: int,
+    measured: int,
+    floor: dict[str, object] | None,
+    price: float,
+) -> list[IngestEvent]:
+    """Build the nodes reconciling the prefix not covered by the measured disk items.
+
+    With a measured ``floor`` the unmeasured remainder splits into the empirically-measured
+    built-in/system floor and the derived MCP aggregate; without one it stays a single
+    reconciled remainder. All values are clamped at zero so a measurement gap never shows a
+    negative size.
+    """
+    if floor is None:
+        return [_remainder_node(spoke_run_id, lc_id, trace_id, base_ts, prefix, measured, price)]
+    floor_tokens = int(cast(int, floor.get("tokens", 0)))
+    builtin = _lc_node(
+        node_id=_lc_id(spoke_run_id, "built-in + system"),
+        parent_id=lc_id,
+        trace_id=trace_id,
+        name=f"built-in + system: {_human_tokens(floor_tokens)}",
+        base_ts=base_ts,
+        metadata={
+            "tokens": floor_tokens,
+            "cost_usd": floor_tokens * price,
+            "source": _FLOOR_SOURCE,
+        },
+    )
+    mcp_tokens = max(0, prefix - floor_tokens - measured)
+    mcp = _lc_node(
+        node_id=_lc_id(spoke_run_id, "mcp"),
+        parent_id=lc_id,
+        trace_id=trace_id,
+        name=f"mcp: {_human_tokens(mcp_tokens)}",
+        base_ts=base_ts,
+        metadata={
+            "tokens": mcp_tokens,
+            "cost_usd": mcp_tokens * price,
+            "source": _MCP_SOURCE,
+            "note": _MCP_NOTE,
+        },
+    )
+    return [builtin, mcp]
+
+
 def _remainder_node(
     spoke_run_id: str,
     lc_id: str,
@@ -867,7 +875,7 @@ def _remainder_node(
     measured: int,
     price: float,
 ) -> IngestEvent:
-    """Shape the reconciled remainder node (base system prompt + unmeasured schemas)."""
+    """Shape the single fallback remainder node used when no floor was calibrated."""
     tokens = max(0, prefix - measured)
     return _lc_node(
         node_id=_lc_id(spoke_run_id, "remainder"),
@@ -875,27 +883,33 @@ def _remainder_node(
         trace_id=trace_id,
         name=f"remainder: {_human_tokens(tokens)}",
         base_ts=base_ts,
-        metadata={"tokens": tokens, "cost_usd": tokens * price, "source": _REMAINDER_SOURCE},
+        metadata={
+            "tokens": tokens,
+            "cost_usd": tokens * price,
+            "source": _REMAINDER_SOURCE,
+            "note": _REMAINDER_NOTE,
+        },
     )
 
 
 def loaded_context_rows(
-    root: Path, tools: list[dict[str, Any]], *, counter: TokenCounter, price: float
+    root: Path, *, counter: TokenCounter, price: float
 ) -> list[dict[str, object]]:
-    """Measure every itemized loaded-context entry: disk items plus request tools.
+    """Measure the disk-sourceable loaded-context entries, one row per name.
+
+    Only the on-disk categories (rules / memory / skills / sub-agents / environment) are
+    itemized; the built-in tool and MCP schemas are NOT on disk and are not obtainable
+    per-tool, so they are reconciled in aggregate by :func:`build_loaded_context_events`.
 
     Args:
         root: Worktree root for the disk-measurable items.
-        tools: The captured request ``tools`` array (MCP + built-in schemas).
         counter: Token counter; raises ``CountTokensError`` when unreachable.
         price: Cache-creation price in USD per token.
 
     Returns:
-        The combined per-name rows (rules/memory/skills/sub-agents/environment + mcp/tools).
+        The per-name rows for rules / memory / skills / sub-agents / environment.
     """
-    rows = measure_items(assemble_items(root), counter=counter, price=price)
-    rows.extend(itemize_tool_schemas(tools, counter=counter, price=price))
-    return rows
+    return measure_items(assemble_items(root), counter=counter, price=price)
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -917,14 +931,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=Path.cwd(),
         help="Worktree root for the disk-measurable loaded-context items (default: cwd).",
     )
-    parser.add_argument(
-        "--request-body",
-        type=Path,
-        default=None,
-        help="JSON file holding a captured api_request_body; its 'tools' array sources the "
-        "MCP + built-in tool schemas. Omitted/truncated -> those tools fall into remainder.",
-    )
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Model id for count_tokens.")
+    parser.add_argument(
+        "--recalibrate-floor",
+        action="store_true",
+        help="Force a fresh built-in/system floor calibration, ignoring the cached value.",
+    )
     parser.add_argument(
         "--endpoint",
         default=env.get("ANTHROPIC_BASE_URL", DEFAULT_ENDPOINT),
@@ -962,12 +974,13 @@ def main(argv: list[str] | None = None) -> int:
     batch = build_batch(traces, args.spoke_run_id, tool_content)
 
     counter = make_counter(endpoint=args.endpoint, api_key=args.api_key, model=args.model)
-    tools = load_tools_from_request(args.request_body) if args.request_body else []
-    rows = loaded_context_rows(args.root.resolve(), tools, counter=counter, price=args.price)
+    rows = loaded_context_rows(args.root.resolve(), counter=counter, price=args.price)
+    floor = measure_framework_floor(force=args.recalibrate_floor)
     context_events = build_loaded_context_events(
         args.spoke_run_id,
         rows,
-        prefix_cache_creation=prefix_cache_creation(traces),
+        prefix_total=prefix_total(traces),
+        floor=floor,
         price=args.price,
         base_ts=_earliest_start(traces),
     )

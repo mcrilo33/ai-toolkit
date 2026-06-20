@@ -17,6 +17,7 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from telemetry.measure_context_cost import (
+    FLOOR_SOURCE,
     Category,
     CountTokensError,
     Item,
@@ -28,6 +29,7 @@ from telemetry.measure_context_cost import (
     assemble_skills,
     build_manifest,
     measure_categories,
+    measure_framework_floor,
     measure_items,
     parse_frontmatter,
     write_manifest,
@@ -325,6 +327,108 @@ def test_write_manifest_round_trips_to_expected_path(tmp_path: Path) -> None:
 
     assert path == tmp_path / ".ai-toolkit" / "context-cost.json"
     assert json.loads(path.read_text(encoding="utf-8"))["note"] == manifest["note"]
+
+
+# --- framework-floor calibration ---------------------------------------------
+
+
+def test_measure_framework_floor_sums_cached_and_uncached_input(tmp_path: Path) -> None:
+    payload: dict[str, object] = {
+        "usage": {
+            "cache_read_input_tokens": 24000,
+            "cache_creation_input_tokens": 600,
+            "input_tokens": 5,
+        }
+    }
+
+    floor = measure_framework_floor(
+        cache_path=tmp_path / "floor.json",
+        runner=lambda _model: payload,
+        version_fn=lambda: "1.2.3",
+    )
+
+    assert floor is not None
+    assert floor["tokens"] == 24604  # 24000 + 600 + 5 - 1 ("ping")
+    assert floor["estimated"] is False
+    assert floor["source"] == FLOOR_SOURCE
+
+
+def test_measure_framework_floor_reads_usage_nested_under_result(tmp_path: Path) -> None:
+    payload: dict[str, object] = {
+        "result": {"usage": {"cache_read_input_tokens": 100, "input_tokens": 3}}
+    }
+
+    floor = measure_framework_floor(
+        cache_path=tmp_path / "floor.json",
+        runner=lambda _model: payload,
+        version_fn=lambda: "v",
+    )
+
+    assert floor is not None
+    assert floor["tokens"] == 102  # 100 + 0 + 3 - 1
+
+
+def test_measure_framework_floor_caches_by_version(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def runner(model: str) -> dict[str, object]:
+        calls.append(model)
+        return {"usage": {"input_tokens": 101}}
+
+    cache = tmp_path / "floor.json"
+    first = measure_framework_floor(cache_path=cache, runner=runner, version_fn=lambda: "v1")
+    second = measure_framework_floor(cache_path=cache, runner=runner, version_fn=lambda: "v1")
+
+    assert len(calls) == 1  # second call served from the cache
+    assert first == second
+
+
+def test_measure_framework_floor_recalibrates_when_version_changes(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def runner(model: str) -> dict[str, object]:
+        calls.append(model)
+        return {"usage": {"input_tokens": 101}}
+
+    cache = tmp_path / "floor.json"
+    measure_framework_floor(cache_path=cache, runner=runner, version_fn=lambda: "v1")
+    measure_framework_floor(cache_path=cache, runner=runner, version_fn=lambda: "v2")
+
+    assert len(calls) == 2  # a new version invalidates the cached floor
+
+
+def test_measure_framework_floor_force_ignores_cache(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def runner(model: str) -> dict[str, object]:
+        calls.append(model)
+        return {"usage": {"input_tokens": 101}}
+
+    cache = tmp_path / "floor.json"
+    measure_framework_floor(cache_path=cache, runner=runner, version_fn=lambda: "v1")
+    measure_framework_floor(cache_path=cache, runner=runner, version_fn=lambda: "v1", force=True)
+
+    assert len(calls) == 2
+
+
+def test_measure_framework_floor_none_when_runner_fails(tmp_path: Path) -> None:
+    floor = measure_framework_floor(
+        cache_path=tmp_path / "floor.json",
+        runner=lambda _model: None,
+        version_fn=lambda: "v1",
+    )
+
+    assert floor is None
+
+
+def test_measure_framework_floor_none_when_no_usage(tmp_path: Path) -> None:
+    floor = measure_framework_floor(
+        cache_path=tmp_path / "floor.json",
+        runner=lambda _model: {"type": "result"},
+        version_fn=lambda: "v1",
+    )
+
+    assert floor is None
 
 
 def test_manifest_idempotent_for_same_sources(tmp_path: Path) -> None:

@@ -31,6 +31,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -51,6 +52,23 @@ COUNT_TOKENS_PATH = "/v1/messages/count_tokens"
 ANTHROPIC_VERSION = "2023-06-01"
 
 MANIFEST_REL = Path(".ai-toolkit/context-cost.json")
+
+# --- framework-floor calibration ---------------------------------------------
+
+# Source label for the empirically-measured built-in-tools + base-system-prompt floor.
+FLOOR_SOURCE = "bare-session calibration"
+
+# Cheap model for the bare calibration run — token counts are family-stable, so the
+# floor the runtime caches is the same regardless of which model serves the ping.
+_FLOOR_MODEL = "haiku"
+
+# The trivial prompt the bare session sends; one token, subtracted so the floor reflects
+# only the framework (built-in tools + base system prompt), not this message.
+_FLOOR_PROMPT = "ping"
+_PING_TOKENS = 1
+
+# Where the calibrated floor is cached, keyed by ``claude --version``.
+_FLOOR_CACHE = Path("~/.claude/ai-toolkit/framework-floor.json").expanduser()
 
 # A fixed placeholder for the environment block's date line: the real date is
 # injected per-session by the runtime, so a literal keeps the block deterministic.
@@ -498,6 +516,140 @@ def claude_version() -> str | None:
     if result.returncode != 0:
         return None
     return result.stdout.strip() or None
+
+
+def _run_bare_session(model: str) -> dict[str, object] | None:
+    """Run a bare ``claude -p`` session in an isolated temp dir and return its JSON payload.
+
+    The temp cwd carries no project ``.claude`` config and no repo, so only the built-in
+    tool schemas and the base system prompt load — the framework floor. The session is
+    run with ``--output-format json`` and the parsed payload returned.
+
+    Args:
+        model: Model id passed to ``claude --model``.
+
+    Returns:
+        The parsed JSON payload dict, or None when ``claude`` is missing, errors, or emits
+        output that is not a JSON object.
+    """
+    with tempfile.TemporaryDirectory(prefix="ai-toolkit-floor-") as tmp:
+        try:
+            result = subprocess.run(
+                ["claude", "-p", _FLOOR_PROMPT, "--model", model, "--output-format", "json"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                cwd=tmp,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _as_int(value: object) -> int:
+    """Coerce a usage value to a non-negative int, treating absent/non-int as zero."""
+    return value if isinstance(value, int) and value > 0 else 0
+
+
+def _extract_usage(payload: dict[str, object]) -> dict[str, object] | None:
+    """Return the token-usage mapping from a result payload, however it is nested.
+
+    The ``claude -p --output-format json`` shape varies: ``usage`` may sit at the top
+    level or under a ``result`` / ``message`` key. The first dict-typed ``usage`` found in
+    that priority order is returned.
+    """
+    for container in (payload, payload.get("result"), payload.get("message")):
+        if isinstance(container, dict):
+            usage = container.get("usage")
+            if isinstance(usage, dict):
+                return cast(dict[str, object], usage)
+    return None
+
+
+def _floor_tokens_from_usage(usage: dict[str, object]) -> int:
+    """Sum the bare request's cached + uncached input tokens, less the ``ping`` prompt.
+
+    A warm cache splits the framework prefix into ``cache_read`` + ``cache_creation``; a
+    cold one writes it all as ``cache_creation``. Either way their sum plus the uncached
+    ``input``/``prompt`` tokens is the floor. The one-token ``ping`` message is subtracted
+    so only the framework remains (a few tokens of slop are acceptable).
+    """
+    read = _as_int(usage.get("cache_read_input_tokens"))
+    written = _as_int(usage.get("cache_creation_input_tokens"))
+    inp = _as_int(usage.get("input_tokens")) or _as_int(usage.get("prompt_tokens"))
+    return read + written + inp - _PING_TOKENS
+
+
+def _read_floor_cache(path: Path, version: str | None) -> dict[str, object] | None:
+    """Return the cached floor when it matches ``version``, else None (miss or stale)."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or data.get("version") != version:
+        return None
+    floor = data.get("floor")
+    return cast(dict[str, object], floor) if isinstance(floor, dict) else None
+
+
+def _write_floor_cache(path: Path, version: str | None, floor: dict[str, object]) -> None:
+    """Persist ``floor`` keyed by ``version`` to ``path`` (creating parent dirs)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"version": version, "floor": floor}
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def measure_framework_floor(
+    *,
+    model: str = _FLOOR_MODEL,
+    cache_path: Path = _FLOOR_CACHE,
+    force: bool = False,
+    runner: Callable[[str], dict[str, object] | None] = _run_bare_session,
+    version_fn: Callable[[], str | None] = claude_version,
+) -> dict[str, object] | None:
+    """Measure (or recall) the built-in-tools + base-system-prompt token floor.
+
+    Runs a bare ``claude`` session whose cwd holds no rules / skills / agents / memory and
+    no MCP config, so the only loaded context is the framework itself, and reads the first
+    request's token usage. The result is cached keyed by ``claude --version`` and reused
+    until the version changes or ``force`` is set.
+
+    Args:
+        model: Model id passed to ``claude --model`` (a cheap model suffices).
+        cache_path: JSON file the calibrated floor is cached in.
+        force: Recalibrate even when a cached value for this version exists.
+        runner: Bare-session runner returning the parsed JSON payload, or None on failure.
+        version_fn: Returns the ``claude --version`` string used as the cache key.
+
+    Returns:
+        ``{"tokens", "estimated": False, "source"}`` for the floor, or None when ``claude``
+        is unavailable or the run yields no usable usage — the caller then falls back to a
+        single reconciled remainder.
+    """
+    version = version_fn()
+    if not force:
+        cached = _read_floor_cache(cache_path, version)
+        if cached is not None:
+            return cached
+    payload = runner(model)
+    if payload is None:
+        return None
+    usage = _extract_usage(payload)
+    if usage is None:
+        return None
+    tokens = _floor_tokens_from_usage(usage)
+    if tokens <= 0:
+        return None
+    floor: dict[str, object] = {"tokens": tokens, "estimated": False, "source": FLOOR_SOURCE}
+    _write_floor_cache(cache_path, version, floor)
+    return floor
 
 
 def _now_iso() -> str:

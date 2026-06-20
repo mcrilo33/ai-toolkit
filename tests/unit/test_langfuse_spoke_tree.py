@@ -20,7 +20,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
-from telemetry.measure_context_cost import CountTokensError
 from telemetry.langfuse_spoke_tree import (
     _MAX_CONTENT_CHARS,
     _TRUNCATION_MARKER,
@@ -28,9 +27,7 @@ from telemetry.langfuse_spoke_tree import (
     build_batch,
     build_loaded_context_events,
     fetch_session,
-    itemize_tool_schemas,
-    load_tools_from_request,
-    prefix_cache_creation,
+    prefix_total,
     root_id_for,
     scan_transcripts,
     trace_id_for,
@@ -515,23 +512,14 @@ class TestToolContentFilledIntoCreateBody:
         assert "output" not in body
 
 
-def _fixed_counter(value: int):
-    """A token counter returning a constant, ignoring its input text."""
-
-    def counter(_text: str) -> int:
-        return value
-
-    return counter
-
-
-class TestPrefixCacheCreation:
-    def test_picks_earliest_generations_cache_creation(self) -> None:
+class TestPrefixTotal:
+    def test_sums_cache_read_and_creation_of_earliest_call(self) -> None:
         early = _obs(
             "g1",
             "llm_request",
             type_="GENERATION",
             startTime="2026-01-02T00:00:00Z",
-            usageDetails={"cache_creation_input_tokens": 5000},
+            usageDetails={"cache_read_input_tokens": 4000, "cache_creation_input_tokens": 1000},
         )
         late = _obs(
             "g2",
@@ -541,61 +529,21 @@ class TestPrefixCacheCreation:
             usageDetails={"cache_creation_input_tokens": 80},
         )
 
-        assert prefix_cache_creation([("tr", [late, early])]) == 5000
+        assert prefix_total([("tr", [late, early])]) == 5000
 
-    def test_zero_when_no_usage_present(self) -> None:
-        assert prefix_cache_creation([("tr", [_obs("m1", "step:green")])]) == 0
-
-
-class TestItemizeToolSchemas:
-    def test_splits_mcp_from_builtin_and_counts_each_schema(self) -> None:
-        tools = [
-            {"name": "Read", "description": "read a file", "input_schema": {"a": 1}},
-            {"name": "mcp__notion__search", "description": "search", "input_schema": {"b": 2}},
-        ]
-
-        rows = itemize_tool_schemas(tools, counter=_fixed_counter(30), price=0.001)
-
-        by_name = {row["name"]: row for row in rows}
-        assert by_name["Read"]["category"] == "tools"
-        assert by_name["mcp__notion__search"]["category"] == "mcp"
-        assert by_name["Read"]["tokens"] == 30
-        assert by_name["Read"]["cost_usd"] == 0.03
-        assert by_name["Read"]["source"] == "request_tools_array"
-
-    def test_marks_estimated_when_counter_unreachable(self) -> None:
-        def failing(_text: str) -> int:
-            raise CountTokensError("nope")
-
-        tools = [{"name": "Edit", "description": "x", "input_schema": {}}]
-
-        rows = itemize_tool_schemas(tools, counter=failing, price=0.001)
-
-        assert rows[0]["estimated"] is True
-
-    def test_unnamed_tools_are_skipped(self) -> None:
-        rows = itemize_tool_schemas(
-            [{"description": "no name"}], counter=_fixed_counter(1), price=1
+    def test_counts_creation_only_when_read_absent(self) -> None:
+        cold = _obs(
+            "g1",
+            "llm_request",
+            type_="GENERATION",
+            startTime="2026-01-02T00:00:00Z",
+            usageDetails={"cache_creation_input_tokens": 5000},
         )
 
-        assert rows == []
+        assert prefix_total([("tr", [cold])]) == 5000
 
-
-class TestLoadToolsFromRequest:
-    def test_reads_tools_array_from_request_body_json(self, tmp_path: Path) -> None:
-        path = tmp_path / "req.json"
-        path.write_text(json.dumps({"tools": [{"name": "Read"}], "model": "x"}), encoding="utf-8")
-
-        assert load_tools_from_request(path) == [{"name": "Read"}]
-
-    def test_missing_or_unreadable_file_yields_empty(self, tmp_path: Path) -> None:
-        assert load_tools_from_request(tmp_path / "nope.json") == []
-
-    def test_malformed_json_yields_empty(self, tmp_path: Path) -> None:
-        path = tmp_path / "bad.json"
-        path.write_text("{ not json", encoding="utf-8")
-
-        assert load_tools_from_request(path) == []
+    def test_zero_when_no_usage_present(self) -> None:
+        assert prefix_total([("tr", [_obs("m1", "step:green")])]) == 0
 
 
 def _lc_by_name(events: list[dict]) -> dict[str, dict]:
@@ -636,7 +584,7 @@ class TestLoadedContextSubtree:
         events = build_loaded_context_events(
             SPOKE,
             self._rows(),
-            prefix_cache_creation=1000,
+            prefix_total=1000,
             price=0.001,
             base_ts="2026-01-01T00:00:00Z",
         )
@@ -649,7 +597,7 @@ class TestLoadedContextSubtree:
         events = build_loaded_context_events(
             SPOKE,
             self._rows(),
-            prefix_cache_creation=1000,
+            prefix_total=1000,
             price=0.001,
             base_ts="2026-01-01T00:00:00Z",
         )
@@ -662,7 +610,7 @@ class TestLoadedContextSubtree:
         events = build_loaded_context_events(
             SPOKE,
             self._rows(),
-            prefix_cache_creation=1000,
+            prefix_total=1000,
             price=0.001,
             base_ts="2026-01-01T00:00:00Z",
         )
@@ -678,7 +626,7 @@ class TestLoadedContextSubtree:
         events = build_loaded_context_events(
             SPOKE,
             self._rows(),
-            prefix_cache_creation=1000,
+            prefix_total=1000,
             price=0.001,
             base_ts="2026-01-01T00:00:00Z",
         )
@@ -690,7 +638,7 @@ class TestLoadedContextSubtree:
         events = build_loaded_context_events(
             SPOKE,
             self._rows(),
-            prefix_cache_creation=1000,
+            prefix_total=1000,
             price=0.001,
             base_ts="2026-01-01T00:00:00Z",
         )
@@ -703,7 +651,7 @@ class TestLoadedContextSubtree:
         events = build_loaded_context_events(
             SPOKE,
             self._rows(),
-            prefix_cache_creation=100,
+            prefix_total=100,
             price=0.001,
             base_ts="2026-01-01T00:00:00Z",
         )
@@ -717,7 +665,7 @@ class TestLoadedContextSubtree:
             for e in build_loaded_context_events(
                 SPOKE,
                 self._rows(),
-                prefix_cache_creation=1000,
+                prefix_total=1000,
                 price=0.001,
                 base_ts="2026-01-01T00:00:00Z",
             )
@@ -727,7 +675,7 @@ class TestLoadedContextSubtree:
             for e in build_loaded_context_events(
                 SPOKE,
                 self._rows(),
-                prefix_cache_creation=1000,
+                prefix_total=1000,
                 price=0.001,
                 base_ts="2026-01-01T00:00:00Z",
             )
@@ -739,10 +687,107 @@ class TestLoadedContextSubtree:
         events = build_loaded_context_events(
             SPOKE,
             self._rows(),
-            prefix_cache_creation=1000,
+            prefix_total=1000,
             price=0.001,
             base_ts="2026-01-01T00:00:00Z",
         )
 
         assert all(e["body"]["traceId"] == trace_id_for(SPOKE) for e in events)
         assert all(e["type"] == "span-create" for e in events)
+
+    def test_fallback_remainder_when_floor_is_none(self) -> None:
+        events = build_loaded_context_events(
+            SPOKE,
+            self._rows(),
+            prefix_total=1000,
+            floor=None,
+            price=0.001,
+            base_ts="2026-01-01T00:00:00Z",
+        )
+
+        names = list(_lc_by_name(events))
+        assert any(n.startswith("remainder") for n in names)
+        assert not any(n.startswith("built-in") or n.startswith("mcp") for n in names)
+
+
+class TestLoadedContextFloorSplit:
+    """With a measured floor the remainder splits into built-in/system + derived mcp."""
+
+    def _rows(self) -> list[dict]:
+        return [
+            {
+                "category": "rules",
+                "name": "CLAUDE.md",
+                "tokens": 100,
+                "cost_usd": 0.1,
+                "source": "CLAUDE.md",
+                "estimated": False,
+            },
+            {
+                "category": "skills",
+                "name": "afk",
+                "tokens": 70,
+                "cost_usd": 0.07,
+                "source": ".claude/skills/afk/SKILL.md",
+                "estimated": False,
+            },
+        ]
+
+    def _floor(self) -> dict:
+        return {"tokens": 500, "estimated": False, "source": "bare-session calibration"}
+
+    def test_built_in_system_node_carries_the_floor(self) -> None:
+        events = build_loaded_context_events(
+            SPOKE,
+            self._rows(),
+            prefix_total=1000,
+            floor=self._floor(),
+            price=0.001,
+            base_ts="2026-01-01T00:00:00Z",
+        )
+
+        index = _lc_by_name(events)
+        builtin = next(b for n, b in index.items() if n.startswith("built-in"))
+        assert builtin["metadata"]["tokens"] == 500
+        assert builtin["metadata"]["source"] == "bare-session calibration"
+        assert builtin["parentObservationId"] == index["loaded-context"]["id"]
+
+    def test_mcp_node_is_prefix_minus_floor_minus_disk(self) -> None:
+        events = build_loaded_context_events(
+            SPOKE,
+            self._rows(),  # measured disk = 170
+            prefix_total=1000,
+            floor=self._floor(),  # floor = 500
+            price=0.001,
+            base_ts="2026-01-01T00:00:00Z",
+        )
+
+        mcp = next(b for n, b in _lc_by_name(events).items() if n.startswith("mcp"))
+        assert mcp["metadata"]["tokens"] == 330  # 1000 - 500 - 170
+        assert mcp["metadata"]["source"] == "derived"
+        assert "per-server/per-tool not separable" in mcp["metadata"]["note"]
+
+    def test_mcp_clamped_to_zero_when_floor_plus_disk_exceeds_prefix(self) -> None:
+        events = build_loaded_context_events(
+            SPOKE,
+            self._rows(),  # measured disk = 170
+            prefix_total=600,
+            floor=self._floor(),  # floor = 500 -> 600 - 500 - 170 < 0
+            price=0.001,
+            base_ts="2026-01-01T00:00:00Z",
+        )
+
+        mcp = next(b for n, b in _lc_by_name(events).items() if n.startswith("mcp"))
+        assert mcp["metadata"]["tokens"] == 0
+
+    def test_no_remainder_node_when_floor_present(self) -> None:
+        events = build_loaded_context_events(
+            SPOKE,
+            self._rows(),
+            prefix_total=1000,
+            floor=self._floor(),
+            price=0.001,
+            base_ts="2026-01-01T00:00:00Z",
+        )
+
+        assert not any(n.startswith("remainder") for n in _lc_by_name(events))
