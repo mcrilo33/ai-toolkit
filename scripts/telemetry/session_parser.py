@@ -120,6 +120,13 @@ class UsageEvent:
     # ``message.id`` shared by those records; usage is deduped on it so one inference
     # is counted once. Absent ``message.id`` falls back to the record ``uuid``.
     message_id: str | None = None
+    # Cache-creation tokens split by ephemeral TTL (Issue #97). Anthropic bills a
+    # 1-hour cache write at 2x input and a 5-minute write at 1.25x; the transcript
+    # carries the breakdown in a nested ``cache_creation`` object. The two always
+    # sum to ``cache_creation``; when the nested object is absent (older / push-only
+    # records) the whole flat total is attributed to 5m — the conservative default.
+    cache_creation_5m: int = 0
+    cache_creation_1h: int = 0
 
 
 @dataclass(slots=True)
@@ -1184,6 +1191,8 @@ def _transcript_window(records: list[dict]) -> tuple[str | None, str | None]:
 def _usage_event(rec: dict, source: str, agent_id: str | None) -> UsageEvent:
     message = rec.get("message") or {}
     usage = message.get("usage") or {}
+    cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
+    cache_5m, cache_1h = _cache_creation_ttl_split(usage, cache_creation)
     return UsageEvent(
         session_id=rec.get("sessionId"),
         ts=rec.get("timestamp"),
@@ -1191,13 +1200,31 @@ def _usage_event(rec: dict, source: str, agent_id: str | None) -> UsageEvent:
         input_tokens=int(usage.get("input_tokens") or 0),
         output_tokens=int(usage.get("output_tokens") or 0),
         cache_read=int(usage.get("cache_read_input_tokens") or 0),
-        cache_creation=int(usage.get("cache_creation_input_tokens") or 0),
+        cache_creation=cache_creation,
         source=source,
         agent_id=agent_id,
         uuid=rec.get("uuid"),
         parent_uuid=rec.get("parentUuid"),
         is_sidechain=bool(rec.get("isSidechain")),
         message_id=message.get("id"),
+        cache_creation_5m=cache_5m,
+        cache_creation_1h=cache_1h,
+    )
+
+
+def _cache_creation_ttl_split(usage: dict, cache_creation: int) -> tuple[int, int]:
+    """Split cache-creation tokens into (5-minute, 1-hour) TTL buckets (Issue #97).
+
+    Reads the nested ``cache_creation`` object's ``ephemeral_5m_input_tokens`` /
+    ``ephemeral_1h_input_tokens``. When that object is absent the whole flat total is
+    attributed to 5m, preserving the pre-#97 single-rate behavior.
+    """
+    nested = usage.get("cache_creation")
+    if not isinstance(nested, dict):
+        return cache_creation, 0
+    return (
+        int(nested.get("ephemeral_5m_input_tokens") or 0),
+        int(nested.get("ephemeral_1h_input_tokens") or 0),
     )
 
 
