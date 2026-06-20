@@ -34,10 +34,26 @@ tree/sum helpers.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
+import logging
+import os
+import sys
+from pathlib import Path
 from typing import Any
 
-from telemetry.langfuse_rollup import build_tree, subtree_totals
+from telemetry.causal_tree import causal_forest_from_parsed
+from telemetry.langfuse_rollup import (
+    GetFn,
+    build_tree,
+    make_get,
+    make_post,
+    subtree_totals,
+)
+from telemetry.langfuse_spoke_tree import all_traces, post_in_chunks
+from telemetry.session_parser import parse_projects_dir, parse_session_file, thinking_by_turn
+
+logger = logging.getLogger("langfuse_backfill")
 
 IngestEvent = dict[str, Any]
 
@@ -60,6 +76,16 @@ _MAX_OUTPUT_CHARS = 20_000
 _TRUNCATION_MARKER = "...[truncated]"
 # Node-id prefix marking a reasoning node, ``reasoning:<turn uuid>``.
 _REASONING_PREFIX = "reasoning:"
+
+# langfuse_spoke_tree's assembled-trace id/name prefixes — its output, like the backfill's
+# own, is a synthetic view, NOT a native live-push trace.
+_SPOKE_TREE_TRACE_PREFIX = "spoketree-"
+_SPOKE_TREE_NAME_PREFIX = "spoke-tree:"
+
+# Opt-in flag (env) for emitting the extended-thinking body (volume / privacy).
+_THINKING_ENV = "AI_TOOLKIT_BACKFILL_THINKING"
+# Default root holding Claude Code session transcripts.
+_DEFAULT_PROJECTS = Path("~/.claude/projects").expanduser()
 
 
 def _sha16(value: str) -> str:
@@ -255,29 +281,7 @@ def forest_to_events(
     trace_id = backfill_trace_id(spoke_run_id)
     root_id = backfill_root_id(spoke_run_id)
     base_ts = _earliest_ts(forest)
-    trace_event: IngestEvent = {
-        "id": trace_id,
-        "type": "trace-create",
-        "timestamp": base_ts,
-        "body": {
-            "id": trace_id,
-            "name": _TRACE_NAME_PREFIX + spoke_run_id,
-            "sessionId": spoke_run_id,
-            "timestamp": base_ts,
-        },
-    }
-    root_event: IngestEvent = {
-        "id": root_id,
-        "type": "span-create",
-        "timestamp": base_ts,
-        "body": {
-            "id": root_id,
-            "traceId": trace_id,
-            "name": _ROOT_NAME_PREFIX + spoke_run_id,
-            "startTime": base_ts,
-        },
-    }
-    events: list[IngestEvent] = [trace_event, root_event]
+    events: list[IngestEvent] = _trace_and_root(spoke_run_id, base_ts)
     _walk(
         forest,
         spoke_run_id=spoke_run_id,
@@ -288,3 +292,244 @@ def forest_to_events(
     )
     _apply_rollups(events)
     return events
+
+
+def _trace_and_root(spoke_run_id: str, base_ts: str) -> list[IngestEvent]:
+    """The ``trace-create`` + synthetic-root span both emit paths share."""
+    trace_id = backfill_trace_id(spoke_run_id)
+    root_id = backfill_root_id(spoke_run_id)
+    return [
+        {
+            "id": trace_id,
+            "type": "trace-create",
+            "timestamp": base_ts,
+            "body": {
+                "id": trace_id,
+                "name": _TRACE_NAME_PREFIX + spoke_run_id,
+                "sessionId": spoke_run_id,
+                "timestamp": base_ts,
+            },
+        },
+        {
+            "id": root_id,
+            "type": "span-create",
+            "timestamp": base_ts,
+            "body": {
+                "id": root_id,
+                "traceId": trace_id,
+                "name": _ROOT_NAME_PREFIX + spoke_run_id,
+                "startTime": base_ts,
+            },
+        },
+    ]
+
+
+def is_native_trace(trace: dict[str, Any]) -> bool:
+    """Whether a fetched session trace is a native live-push trace (not a synthetic view).
+
+    The live OTel push lands native per-turn / marker / hook traces with arbitrary ids and
+    names. The backfill's own trace (``spokefill-`` / ``spoke-backfill:``) and
+    ``langfuse_spoke_tree``'s assembled tree (``spoketree-`` / ``spoke-tree:``) are synthetic
+    views, recognised by their id/name prefixes; everything else is native.
+
+    Args:
+        trace: A trace dict as returned by the Langfuse traces endpoint.
+
+    Returns:
+        True when the trace is a native live-push trace.
+    """
+    trace_id = trace.get("id") or ""
+    name = trace.get("name") or ""
+    synthetic = (
+        trace_id.startswith(_TRACE_PREFIX)
+        or name.startswith(_TRACE_NAME_PREFIX)
+        or trace_id.startswith(_SPOKE_TREE_TRACE_PREFIX)
+        or name.startswith(_SPOKE_TREE_NAME_PREFIX)
+    )
+    return not synthetic
+
+
+def session_is_covered(spoke_run_id: str, get: GetFn) -> bool:
+    """Whether the live push already covered this session (a native trace exists).
+
+    Args:
+        spoke_run_id: The session id (``langfuse.session.id``) to check.
+        get: Path-to-JSON fetcher (see :data:`telemetry.langfuse_rollup.GetFn`).
+
+    Returns:
+        True when at least one native (non-synthetic) trace exists for the session, so a
+        full backfill tree would duplicate what the live push already wrote.
+    """
+    return any(is_native_trace(trace) for trace in all_traces(spoke_run_id, get))
+
+
+def _reasoning_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collect every ``reasoning`` node across the forest, depth-first."""
+    found: list[dict[str, Any]] = []
+    for node in nodes:
+        if node.get("kind") == "reasoning":
+            found.append(node)
+        found.extend(_reasoning_nodes(node["children"]))
+    return found
+
+
+def reasoning_only_events(
+    forest: list[dict[str, Any]], spoke_run_id: str, thinking: dict[str, str]
+) -> list[IngestEvent]:
+    """Emit ONLY the reasoning nodes (the gap the live push lacks), under the spoke root.
+
+    For a session the live push already covered, the assembled view exists already; the one
+    thing the transcript adds is the extended-thinking body (redacted in every raw API body).
+    Each reasoning node is emitted under the backfill root as a standalone thinking subtree —
+    new observations the live push never had, so no double-write — with deterministic ids so
+    a rerun overwrites. Returns an empty batch when no reasoning node is present.
+
+    Args:
+        forest: The spoke's causal forest, built WITH the thinking map (so reasoning exists).
+        spoke_run_id: The spoke run id; the trace's ``sessionId``.
+        thinking: ``turn uuid -> extended-thinking body`` supplying each node's body.
+
+    Returns:
+        A ``trace-create`` + root + one span per reasoning node, or ``[]`` when none.
+    """
+    reasoning = _reasoning_nodes(forest)
+    if not reasoning:
+        return []
+    trace_id = backfill_trace_id(spoke_run_id)
+    root_id = backfill_root_id(spoke_run_id)
+    base_ts = _earliest_ts(forest)
+    events = _trace_and_root(spoke_run_id, base_ts)
+    for node in reasoning:
+        events.append(
+            _node_event(
+                node,
+                spoke_run_id=spoke_run_id,
+                trace_id=trace_id,
+                parent_id=root_id,
+                thinking=thinking,
+            )
+        )
+    return events
+
+
+def backfill_events(
+    forest: list[dict[str, Any]],
+    spoke_run_id: str,
+    thinking: dict[str, str],
+    *,
+    covered: bool,
+) -> list[IngestEvent]:
+    """The dedup decision: what to ingest given live-push coverage and the thinking opt-in.
+
+    - **uncovered** (OTel off / collector down / historical) -> the full forest, the only
+      complete trace for that session;
+    - **covered + thinking** -> reasoning-only, the body the live push could not capture;
+    - **covered + no thinking** -> nothing (the live push already covers everything else).
+
+    Args:
+        forest: The spoke's causal forest.
+        spoke_run_id: The spoke run id.
+        thinking: ``turn uuid -> extended-thinking body`` (empty unless the opt-in is set).
+        covered: Whether the live push already covered this session.
+
+    Returns:
+        The ingestion events to post (possibly empty).
+    """
+    if not covered:
+        return forest_to_events(forest, spoke_run_id, thinking)
+    if thinking:
+        return reasoning_only_events(forest, spoke_run_id, thinking)
+    return []
+
+
+def _gather_thinking(session: Path | None, projects: Path) -> dict[str, str]:
+    """The opt-in ``turn uuid -> thinking body`` map for one session or a whole projects root.
+
+    A single ``--session`` transcript is read directly; otherwise every top-level session
+    under ``projects`` is scanned and merged (uuids are globally unique, so a flat merge is
+    safe). Called only when the opt-in flag is set, so the body is never read otherwise.
+    """
+    if session is not None:
+        return thinking_by_turn(session)
+    merged: dict[str, str] = {}
+    for path in sorted(projects.glob("*/*.jsonl")):
+        if "subagents" in path.parts:
+            continue
+        merged.update(thinking_by_turn(path))
+    return merged
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    """Parse the CLI arguments for the transcript→Langfuse backfill."""
+    env = os.environ
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("spoke_run_id", help="The spoke run id (session id) to backfill.")
+    parser.add_argument(
+        "--projects",
+        type=Path,
+        default=_DEFAULT_PROJECTS,
+        help="Root holding Claude Code session transcripts (default: ~/.claude/projects).",
+    )
+    parser.add_argument(
+        "--session",
+        type=Path,
+        default=None,
+        help="A single session transcript to backfill (default: scan --projects).",
+    )
+    parser.add_argument(
+        "--thinking",
+        action="store_true",
+        default=env.get(_THINKING_ENV) == "1",
+        help=f"Emit the extended-thinking body (opt-in; or ${_THINKING_ENV}=1).",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Backfill one spoke's transcript into Langfuse, deduped against the live push.
+
+    Parses the transcript, builds the causal forest (reusing ``causal_forest_from_parsed``),
+    queries Langfuse for live-push coverage, and posts the dedup decision's events. Thinking
+    bodies are read only under the opt-in flag.
+
+    Args:
+        argv: CLI arguments excluding the program name; defaults to ``sys.argv[1:]``.
+
+    Returns:
+        Process exit code: 0 on success.
+
+    Raises:
+        KeyError: When ``LANGFUSE_BASIC_AUTH`` is not set.
+    """
+    logging.basicConfig(level=logging.INFO, format="[backfill] %(message)s")
+    args = _parse_args(sys.argv[1:] if argv is None else argv)
+    parsed = parse_session_file(args.session) if args.session else parse_projects_dir(args.projects)
+    thinking = _gather_thinking(args.session, args.projects) if args.thinking else {}
+    # UPGRADE: join ccusage session costs here so backfilled turns carry real cost; tokens
+    # are exact, cost is omitted for now (the ccusage pull is out of this subtask's scope).
+    forest: list[Any] = causal_forest_from_parsed(parsed, [], {}, thinking)
+
+    host = os.environ.get("LANGFUSE_HOST", "http://localhost:3000")
+    auth = os.environ["LANGFUSE_BASIC_AUTH"]  # "Basic <base64(pk:sk)>"
+    get, post = make_get(host, auth), make_post(host, auth)
+
+    covered = session_is_covered(args.spoke_run_id, get)
+    events = backfill_events(forest, args.spoke_run_id, thinking, covered=covered)
+    if events:
+        post_in_chunks(events, post)
+
+    mode = (
+        "covered→reasoning-only" if covered and thinking else "covered→noop" if covered else "full"
+    )
+    print(
+        f"{max(len(events) - 2, 0)} observations backfilled under trace "
+        f"{backfill_trace_id(args.spoke_run_id)} (mode: {mode}, "
+        f"{len(thinking)} thinking bodies)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
