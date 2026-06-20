@@ -1472,6 +1472,23 @@ def _changed_row(category: str, name: str, tokens: int, delta: int) -> dict:
     return row
 
 
+class TestContextEvolutionRemoved:
+    """#100 part 4: the #98 context-evolution subtree is deleted (subsumed by #99's per-turn
+    cache_creation now carried as llm_request metadata). Its builders no longer exist.
+    """
+
+    def test_evolution_builders_are_gone(self) -> None:
+        import telemetry.langfuse_spoke_tree as module
+
+        for symbol in (
+            "build_context_evolution_events",
+            "context_evolution_deltas",
+            "_reconciliation_map",
+            "per_turn_cache_creation",
+        ):
+            assert not hasattr(module, symbol), symbol
+
+
 class TestContextEvolutionSubtree:
     """The #98 per-turn context-evolution subtree: one node per evolving turn."""
 
