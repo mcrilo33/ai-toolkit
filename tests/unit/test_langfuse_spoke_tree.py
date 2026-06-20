@@ -33,6 +33,7 @@ from telemetry.langfuse_spoke_tree import (
     apply_llm_decomposition,
     build_batch,
     build_loaded_context_events,
+    build_score_events,
     build_step_windows,
     fetch_session,
     find_request_files,
@@ -621,6 +622,108 @@ class TestToolSubspanFolding:
         assert _by_orig(batch, "tr", "g1")["body"]["parentObservationId"] == tool_copy["id"]
         # ...so its tokens still roll up under the tool container.
         assert tool_copy["body"]["metadata"]["rollup"]["reused"] == 100
+
+
+class TestScoreEvents:
+    """#100 amendment: two numeric Langfuse SCORES make time-budget chartable —
+    permission_wait_ms (per blocked tool observation) and gate_park_ms (trace-level PLAN park).
+    """
+
+    def _scores(self, traces: list[tuple[str, list[dict]]]) -> list[dict]:
+        batch = build_batch(traces, SPOKE)
+        return build_score_events(SPOKE, traces, batch, base_ts="2026-01-01T00:00:00Z")
+
+    def _by_name(self, scores: list[dict], name: str) -> list[dict]:
+        return [s for s in scores if s["body"]["name"] == name]
+
+    def _blocked_tool_traces(self) -> list[tuple[str, list[dict]]]:
+        tool = _obs(
+            "tb", "tool:Bash", parent=None, metadata={"attributes": {"tool_use_id": "tu-1"}}
+        )
+        blocked = _obs(
+            "bl",
+            "claude_code.tool.blocked_on_user",
+            parent="tb",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:03Z",
+            metadata={"attributes": {"tool_use_id": "tu-1"}},
+        )
+        return [("tr", [tool, blocked])]
+
+    def _gate(self, start: str, end: str) -> dict:
+        return _obs(
+            "gt",
+            "script:gate",
+            parent=None,
+            startTime=start,
+            endTime=end,
+            metadata={"attributes": {"workflow.kind": "script", "workflow.phase": "gate"}},
+        )
+
+    def test_permission_wait_score_on_the_tool_observation(self) -> None:
+        scores = self._scores(self._blocked_tool_traces())
+
+        perm = self._by_name(scores, "permission_wait_ms")
+        assert len(perm) == 1
+        assert perm[0]["type"] == "score-create"
+        body = perm[0]["body"]
+        assert body["dataType"] == "NUMERIC"
+        assert body["value"] == 3000
+        assert body["observationId"] == _copy_id("tr", "tb")
+        assert body["traceId"] == trace_id_for(SPOKE)
+
+    def test_no_permission_score_without_a_blocked_subspan(self) -> None:
+        tool = _obs(
+            "tb", "tool:Bash", parent=None, metadata={"attributes": {"tool_use_id": "tu-1"}}
+        )
+
+        scores = self._scores([("tr", [tool])])
+
+        assert self._by_name(scores, "permission_wait_ms") == []
+
+    def test_gate_park_score_is_trace_level_gap_to_first_activity(self) -> None:
+        gate = self._gate("2026-01-02T00:00:00Z", "2026-01-02T00:00:10Z")
+        turn = _obs("i1", "claude_code.interaction", parent=None, startTime="2026-01-02T00:01:10Z")
+
+        scores = self._scores([("tr", [gate, turn])])
+
+        park = self._by_name(scores, "gate_park_ms")
+        assert len(park) == 1
+        body = park[0]["body"]
+        assert body["dataType"] == "NUMERIC"
+        assert body["value"] == 60000  # 00:00:10 -> 00:01:10
+        assert body["traceId"] == trace_id_for(SPOKE)
+        assert "observationId" not in body  # trace-level
+
+    def test_gate_park_uses_first_genuine_activity_not_a_marker(self) -> None:
+        gate = self._gate("2026-01-02T00:00:00Z", "2026-01-02T00:00:10Z")
+        marker = _obs("sp", "spoke-push", parent=None, startTime="2026-01-02T00:00:20Z")
+        turn = _obs(
+            "g1",
+            "llm_request",
+            type_="GENERATION",
+            parent=None,
+            startTime="2026-01-02T00:01:10Z",
+            usageDetails={"cache_read_input_tokens": 1},
+        )
+
+        scores = self._scores([("tr", [gate, marker, turn])])
+
+        # gap is measured to the llm_request, not the spoke-push marker that fired earlier.
+        assert self._by_name(scores, "gate_park_ms")[0]["body"]["value"] == 60000
+
+    def test_no_gate_park_score_without_a_gate(self) -> None:
+        turn = _obs("i1", "claude_code.interaction", parent=None, startTime="2026-01-02T00:01:10Z")
+
+        scores = self._scores([("tr", [turn])])
+
+        assert self._by_name(scores, "gate_park_ms") == []
+
+    def test_score_ids_are_deterministic(self) -> None:
+        first = {s["id"] for s in self._scores(self._blocked_tool_traces())}
+        second = {s["id"] for s in self._scores(self._blocked_tool_traces())}
+
+        assert first == second and first
 
 
 class TestContainerRollups:
