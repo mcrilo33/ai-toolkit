@@ -297,9 +297,11 @@ Every task is classified on the hub (~10 seconds) before any worktree or issue i
 | 1 — Micro-spoke | Subagent in a temp worktree (no issue, no tmux window, no session) | The prompt | Hub diff-review before merge |
 | 2 — Express spoke | Full spoke via `worktree-new.sh <slug>` (ad-hoc, no issue) | Kickoff prompt | All push gates, single cycle, no ledger |
 | 3 — Full | Full spoke from a GitHub issue | The issue | Everything (current flow) |
+| Express-interactive (`/quick`) | The hub session itself, in a `worktree-quick.sh` worktree — no separate session | The conversation | All push gates; no issue, ledger, PLAN, RED, or review artifact |
 
-**Triage heuristic:** Does the change touch executable behavior? No → Lane 1. One subtask,
-obvious approach, small diff? → Lane 2. Otherwise → Lane 3.
+**Triage heuristic:** Does the change touch executable behavior? No → Lane 1. A small fix to
+drive interactively from the hub session right now? → `/quick` (express-interactive). One
+subtask, obvious approach, small diff, worth its own spoke session? → Lane 2. Otherwise → Lane 3.
 
 ### Micro-spoke lifecycle (lane 1)
 
@@ -338,8 +340,33 @@ outside `scripts/`, `shared/hooks/`, `tests/`, and any `*/scripts/` dir) pass th
 `commit-quality` gate without an issue anchor — see that hook for the exact file-set
 rules. This is the sanctioned path for lanes 1 and 2.
 
+### Express-interactive lifecycle (`/quick`)
+
+The express-interactive lane builds a small fix *conversationally from the hub session*
+on its own branch/worktree — keeping the push gates, dropping the spoke process ceremony
+(no issue, no `source-task`, no tmux session, no PLAN gate, no RED-first, no review
+artifact). `main` is never edited directly.
+
+1. From the hub: `scripts/worktree-quick.sh <slug>` (or `-t chore`). It creates a worktree
+   on `quick/<slug>` (or `chore/<slug>`), copies `.claude/`, mints the `spoke_run_id`, sets
+   the `.ai-toolkit/` exclude, and drops a `hub-guard-allow` marker in the common git-dir —
+   then prints the worktree path. No issue, prompt, tmux window, or separate agent.
+2. The **current session** `cd`s into the printed path and iterates: edit, run
+   lint/typecheck/tests, commit. The marker lets the hub session commit into the worktree
+   (hub-guard otherwise denies a commit run with the hub's cwd on the default branch).
+3. Land from the hub: `scripts/worktree-land.sh <slug> --local` (unpushed) or
+   `scripts/worktree-land.sh <slug>` (if pushed). A non-numbered branch needs no
+   `ready/<issue>` marker and no `--force-land`. Teardown **revokes** the `hub-guard-allow`
+   marker.
+
+**Hub-guard note.** The `hub-guard-allow` marker bypasses *every* hub-guard check while
+present (incl. on `main`) — the conscious escape hatch. It is a single global toggle, so a
+teardown of one `/quick` lane revokes the bypass for any other concurrent lane until
+re-granted; quick lanes are short interactive one-offs, so this is rarely a problem.
+
 ## Related
 
+- `shared/skills/quick/SKILL.md` — the `/quick` express-interactive lane (above)
 - `shared/skills/source-task/SKILL.md` — anchors a task to an issue; warns when you run
   `/source` on the shared main checkout instead of a worktree
 - `shared/skills/solo-cycle/SKILL.md` — the per-subtask RED / GREEN / REVIEW / PUSH cycle

@@ -33,13 +33,18 @@ Before starting any task, the hub classifies it into one of three lanes (~10 sec
 | 1 — Micro-spoke | Subagent in a temp worktree (no issue, no tmux window, no session) | The prompt | Hub diff-review before merge |
 | 2 — Express spoke | Full spoke via `worktree-new.sh <slug>` (ad-hoc, no issue) | Kickoff prompt | All push gates, single cycle, no ledger |
 | 3 — Full | Full spoke from a GitHub issue | The issue | Everything (current flow) |
+| Express-interactive (`/quick`) | The hub session itself, in a `worktree-quick.sh` worktree — no separate session | The conversation | All push gates (lint/typecheck/test); no issue, ledger, PLAN, RED, or review artifact |
 
 **Triage heuristic:**
 
 - Does the change touch executable behavior? **No** → Lane 1 — restricted to non-executable
   paths only: docs, comments, wording. Lane 1 must never touch `scripts/`, `shared/hooks/`,
   `tests/`, or skill scripts.
-- One subtask, obvious approach, small diff? → Lane 2.
+- A small fix you want to drive interactively from the hub session right now? → the
+  express-interactive lane (`/quick`): a branch/worktree the current session enters,
+  keeping the push gates but dropping the spoke process ceremony. `main` is never dirtied
+  directly — the `hub-guard-allow` marker lets the hub session commit into the worktree.
+- One subtask, obvious approach, small diff, but worth its own spoke session? → Lane 2.
 - Otherwise, when in doubt, or when the "why" should be findable later → Lane 3.
 
 The Task Lifecycle diagram above describes **Lane 3** — the full flow for anything
@@ -56,6 +61,7 @@ for lanes 1 and 2. See the `commit-quality` hook for the exact file-set rules.
 | Command | Skill | Purpose |
 |---------|-------|---------|
 | `/hub` | `hub` | Survey what is in flight, propose the next move (hub) |
+| `/quick <slug>` | `quick` | Express-interactive lane: build a small fix conversationally from the hub session in a `quick/`/`chore/` worktree, keeping push gates, dropping spoke ceremony |
 | `/source` | `source-task` | Anchor to the issue; branch creation only as non-hub fallback |
 | `/cycle` | `solo-cycle` | Solo per-subtask cycle: anchor, RED, GREEN, review, push |
 | `/land <id>` | `land` | Land a finished task from the hub: merge, suite, push, teardown |
