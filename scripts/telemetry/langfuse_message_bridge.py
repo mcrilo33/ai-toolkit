@@ -50,6 +50,14 @@ calls; the last message is the only distinguishing, useful part. :func:`_last_me
 tolerant of the truncation: it full-parses the JSON when possible, else scans the array
 bracket-/quote-aware and returns the last element that closed before the cut.
 
+The body itself arrives one of two ways depending on ``OTEL_LOG_RAW_API_BODIES``. Inline mode
+(``=1``) puts the (60KB-truncated) body on the ``body`` attribute. File mode
+(``=file:<dir>``, what the auto-wired worktree uses so #87 gets UNTRUNCATED bodies) emits no
+inline ``body`` and instead a ``body_ref`` absolute path to the body on disk.
+:func:`_read_body` prefers inline ``body`` and falls back to reading ``body_ref`` (defensively
+-- regular file only, size-capped, never raising), so file-mode spokes get fuller input/output
+than the old inline cap allowed.
+
 Everything is buffered and re-resolved as the pieces arrive, so signal ordering is
 irrelevant (an ``api_request_body`` may arrive before its ``api_request`` or its span).
 Stdlib only; runs on the host, reached by the collector at ``host.docker.internal:4319``.
@@ -85,6 +93,10 @@ logger = logging.getLogger("langfuse_message_bridge")
 # Langfuse ingestion requires a timestamp on every event; the value is not meaningful for
 # a generation-update (it only patches an existing observation), so a fixed stamp is fine.
 _INGEST_TIMESTAMP = "2026-01-01T00:00:00Z"
+
+# Cap a body_ref file read so a stale/hostile log event can never make the bridge load an
+# unbounded file into memory; the largest legitimate untruncated body is well under this.
+_MAX_BODY_REF_BYTES = 8 * 1024 * 1024
 
 # Patches a single Langfuse observation field: (span_id, field, value) -> None.
 PatchFn = Callable[[str, str, object], None]
@@ -160,6 +172,42 @@ def _attrs_dict(attrs: list[dict[str, Any]]) -> dict[str, str]:
                 out[key] = str(value[alt])
                 break
     return out
+
+
+def _read_body(record_attrs: list[dict[str, Any]]) -> str | None:
+    """Return the raw API body for a body log, inline when present else read from ``body_ref``.
+
+    In inline mode (``OTEL_LOG_RAW_API_BODIES=1``) Claude Code emits the body on the ``body``
+    attribute. In file mode (``=file:<dir>``, required so #87 captures UNTRUNCATED bodies) it
+    emits no inline ``body`` and instead a ``body_ref`` absolute path to the body on disk. This
+    prefers the inline value and falls back to reading the file only when inline is absent.
+
+    The bridge is a long-running server and ``body_ref`` arrives on an untrusted log event, so
+    the file read is defensive: it reads only an existing regular file under
+    :data:`_MAX_BODY_REF_BYTES`, and returns None (never raises) on any missing, non-file,
+    oversized, or unreadable path so a bad event cannot crash the bridge.
+
+    Args:
+        record_attrs: The OTLP log-record attributes carrying ``body`` and/or ``body_ref``.
+
+    Returns:
+        The raw body text, or None when neither an inline body nor a readable file is present.
+    """
+    inline = _attr(record_attrs, "body")
+    if inline:
+        return inline
+    ref = _attr(record_attrs, "body_ref")
+    if not ref:
+        return None
+    try:
+        if not os.path.isfile(ref) or os.path.getsize(ref) > _MAX_BODY_REF_BYTES:
+            logger.warning("skipping body_ref (missing, non-file, or too large): %s", ref)
+            return None
+        with open(ref, encoding="utf-8") as f:
+            return f.read()
+    except OSError as e:
+        logger.warning("body_ref read failed %s: %s", ref, e)
+        return None
 
 
 def _hexid(raw: str) -> str:
@@ -405,7 +453,7 @@ class Bridge:
         if event not in ("api_request_body", "api_response_body"):
             self._ingest_audit(resource_attrs, record_attrs)  # the audit/lifecycle layer
             return
-        raw = _attr(record_attrs, "body")
+        raw = _read_body(record_attrs)
         if not raw:
             return
         if event == "api_request_body":
