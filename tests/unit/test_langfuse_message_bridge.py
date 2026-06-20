@@ -60,6 +60,18 @@ def _attrs(**pairs: str) -> list[dict]:
     return [{"key": k, "value": {"stringValue": v}} for k, v in pairs.items()]
 
 
+def _audit_log_payload(resource: dict[str, str], *records: list[dict]) -> dict:
+    """An OTLP/HTTP logs batch with resource-level attributes (e.g. spoke_run_id)."""
+    return {
+        "resourceLogs": [
+            {
+                "resource": {"attributes": _attrs(**resource)},
+                "scopeLogs": [{"logRecords": [{"attributes": attrs} for attrs in records]}],
+            }
+        ]
+    }
+
+
 class _Sink:
     """Records every patch the bridge would send to Langfuse, in order."""
 
@@ -68,6 +80,16 @@ class _Sink:
 
     def __call__(self, span_id: str, field: str, value: object) -> None:
         self.calls.append((span_id, field, value))
+
+
+class _CreateSink:
+    """Records every ingestion batch the bridge would CREATE in Langfuse, in order."""
+
+    def __init__(self) -> None:
+        self.batches: list[list[dict]] = []
+
+    def __call__(self, batch: list[dict]) -> None:
+        self.batches.append(batch)
 
 
 # --- _attr -------------------------------------------------------------------
@@ -319,3 +341,127 @@ def test_buffered_output_flushes_once_regardless_of_arrival_order() -> None:
     assert bridge.pending_count() == 0
     bridge.on_spans(_span_payload(span_id="ffeeddccbbaa9988", request_id="req-3"))
     assert len(sink.calls) == 1
+
+
+# --- audit/event layer: CREATE observations onto the spoke audit trace -------
+
+
+def _audit_record(**pairs: str) -> list[dict]:
+    return _attrs(**pairs)
+
+
+def test_audit_event_creates_trace_then_event_keyed_by_spoke_run_id() -> None:
+    # Arrange: a rejected tool_decision with spoke_run_id at the resource level.
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+
+    # Act
+    bridge.on_logs(
+        _audit_log_payload(
+            {"spoke_run_id": "spoke-1", "session.id": "sess-1"},
+            _audit_record(
+                **{
+                    "event.name": "tool_decision",
+                    "event.sequence": "42",
+                    "decision": "reject",
+                    "tool_name": "Bash",
+                }
+            ),
+        )
+    )
+
+    # Assert: one batch = [trace-create, event-create]; the patch sink is untouched.
+    assert patch.calls == []
+    assert len(create.batches) == 1
+    types = [event["type"] for event in create.batches[0]]
+    assert types == ["trace-create", "event-create"]
+    event_body = create.batches[0][1]["body"]
+    assert event_body["name"] == "tool_decision:reject"
+    assert event_body["level"] == "WARNING"
+
+
+def test_audit_trace_create_emitted_once_per_spoke() -> None:
+    # Arrange: two audit events for the SAME spoke.
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+    resource = {"spoke_run_id": "spoke-1"}
+
+    # Act
+    bridge.on_logs(
+        _audit_log_payload(
+            resource,
+            _audit_record(**{"event.name": "compaction", "event.sequence": "1"}),
+        )
+    )
+    bridge.on_logs(
+        _audit_log_payload(
+            resource,
+            _audit_record(
+                **{"event.name": "mcp_server_connection", "event.sequence": "2", "status": "failed"}
+            ),
+        )
+    )
+
+    # Assert: the trace-create lands only on the first batch; the second is event-only.
+    assert [event["type"] for event in create.batches[0]] == ["trace-create", "event-create"]
+    assert [event["type"] for event in create.batches[1]] == ["event-create"]
+
+
+def test_audit_event_falls_back_to_session_id_when_no_spoke_run_id() -> None:
+    # Arrange: no spoke_run_id; session.id is the only spoke key available.
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+
+    # Act
+    bridge.on_logs(
+        _audit_log_payload(
+            {"session.id": "sess-9"},
+            _audit_record(**{"event.name": "compaction", "event.sequence": "1"}),
+        )
+    )
+
+    # Assert: the trace is keyed by session.id.
+    assert create.batches[0][0]["body"]["sessionId"] == "sess-9"
+
+
+def test_audit_event_without_a_spoke_key_is_dropped() -> None:
+    # Arrange: no spoke_run_id and no session.id — there is no trace to attach to.
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+
+    # Act
+    bridge.on_logs(
+        _audit_log_payload(
+            {},
+            _audit_record(**{"event.name": "compaction", "event.sequence": "1"}),
+        )
+    )
+
+    # Assert: nothing created (and nothing patched).
+    assert create.batches == []
+    assert patch.calls == []
+
+
+def test_response_body_does_not_reach_the_create_sink() -> None:
+    # Arrange: an api_response_body (existing patch path) must not create observations.
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+    bridge.on_spans(_span_payload(span_id="aabbccddeeff0011", request_id="req-9"))
+
+    # Act
+    bridge.on_logs(
+        _audit_log_payload(
+            {"spoke_run_id": "spoke-1"},
+            _audit_record(
+                **{
+                    "event.name": "api_response_body",
+                    "request_id": "req-9",
+                    "body": '{"content": "hi"}',
+                }
+            ),
+        )
+    )
+
+    # Assert: patched as output, nothing created.
+    assert patch.calls == [("aabbccddeeff0011", "output", "hi")]
+    assert create.batches == []

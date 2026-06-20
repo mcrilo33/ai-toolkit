@@ -125,6 +125,22 @@ def test_metrics_pipeline_routes_to_a_non_langfuse_sink() -> None:
     assert "prometheus" in metrics["exporters"], "metrics route to the Prometheus sink"
 
 
+def test_logs_pipeline_routes_to_the_message_bridge() -> None:
+    # The audit/lifecycle event layer (tool_decision, mcp_server_connection, compaction, ...)
+    # rides the logs signal, and the bridge is its only consumer (issue #93): it maps each
+    # event onto a per-spoke Langfuse trace. Guard the logs->bridge route from drift — if it
+    # broke, the whole audit layer would silently stop reaching Langfuse.
+    config = _load_config()
+
+    logs = config["service"]["pipelines"]["logs"]
+
+    assert logs["receivers"] == ["otlp"], "audit/body log events arrive on the otlp receiver"
+    assert "otlphttp/bridge" in logs["exporters"], "the bridge is the logs signal's consumer"
+    assert "otlphttp/langfuse" not in logs["exporters"], (
+        "Langfuse trace ingestion does not read the logs signal; the bridge bridges it"
+    )
+
+
 def test_prometheus_sink_listens_on_a_port_distinct_from_the_receivers() -> None:
     # The metrics sink's scrape endpoint must not collide with any OTLP receiver port,
     # or the collector fails to bind — exactly the kind of drift these checks guard.

@@ -10,6 +10,13 @@ This bridge receives both signals (the collector forwards them here as OTLP/HTTP
 joins them to patch the matching Langfuse observation's input/output (Langfuse observation
 id == OTel span_id) via a ``generation-update`` ingestion event.
 
+The same logs signal also carries Claude Code's audit/lifecycle layer (``tool_decision``
+incl. rejections, ``mcp_server_connection``, ``compaction``, and the rest -- see
+:mod:`telemetry.langfuse_audit_events`). Those events have no pre-existing span to patch, so
+the bridge CREATES them as ``event-create`` observations on a per-spoke synthetic audit
+trace keyed by ``spoke_run_id`` (issue #93). That path needs no buffering -- the trace is
+minted here -- and is independent of the message join below.
+
 The input join is *per call*. One ``prompt.id`` spans an entire user turn, so it cannot key
 a single API call -- every call of an agent loop shares it. The per-call key is
 ``event.sequence`` instead. An ``api_request`` log carries ``request_id`` + ``event.sequence``
@@ -65,6 +72,14 @@ from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, TypedDict
 
+try:
+    from telemetry.langfuse_audit_events import build_audit_event, trace_create
+except ModuleNotFoundError:  # direct `python3 scripts/telemetry/...` run: add the package root
+    import sys
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from telemetry.langfuse_audit_events import build_audit_event, trace_create
+
 logger = logging.getLogger("langfuse_message_bridge")
 
 # Langfuse ingestion requires a timestamp on every event; the value is not meaningful for
@@ -73,6 +88,13 @@ _INGEST_TIMESTAMP = "2026-01-01T00:00:00Z"
 
 # Patches a single Langfuse observation field: (span_id, field, value) -> None.
 PatchFn = Callable[[str, str, object], None]
+
+# Creates Langfuse observations from an ingestion batch (audit/event layer): batch -> None.
+CreateFn = Callable[[list[dict[str, Any]]], None]
+
+
+def _noop_create(batch: list[dict[str, Any]]) -> None:
+    """Default create sink: drop the batch (used when no audit ingestion is wired)."""
 
 
 class PendingItem(TypedDict):
@@ -109,6 +131,35 @@ def _attr(attrs: list[dict[str, Any]], key: str) -> str | None:
             if alt in value:
                 return str(value[alt])
     return None
+
+
+def _attrs_dict(attrs: list[dict[str, Any]]) -> dict[str, str]:
+    """Flatten an OTLP attribute list to a plain ``key -> string`` dict.
+
+    The audit mapper works on a merged resource+record attribute dict rather than the OTLP
+    envelope, so the bridge flattens both here (string/int/bool coerced to ``str`` like
+    :func:`_attr`).
+
+    Args:
+        attrs: The OTLP attribute list from a log record's resource or its attributes.
+
+    Returns:
+        A mapping of every attribute key to its string value.
+    """
+    out: dict[str, str] = {}
+    for a in attrs or []:
+        key = a.get("key")
+        if key is None:
+            continue
+        value = a.get("value") or {}
+        if "stringValue" in value:
+            out[key] = value["stringValue"]
+            continue
+        for alt in ("intValue", "boolValue"):
+            if alt in value:
+                out[key] = str(value[alt])
+                break
+    return out
 
 
 def _hexid(raw: str) -> str:
@@ -245,6 +296,35 @@ def make_langfuse_patch(host: str, auth: str) -> PatchFn:
     return patch
 
 
+def make_langfuse_create(host: str, auth: str) -> CreateFn:
+    """Build a create function that POSTs an ingestion batch of CREATE events to Langfuse.
+
+    Unlike :func:`make_langfuse_patch` (which updates an existing observation), this posts
+    ``trace-create``/``event-create`` bodies that materialize new audit observations.
+
+    Args:
+        host: Base Langfuse URL, e.g. ``http://localhost:3000``.
+        auth: The ``Authorization`` header value, ``Basic <base64(pk:sk)>``.
+
+    Returns:
+        A callable ``(batch) -> None`` posting the batch to the ingestion endpoint.
+    """
+
+    def create(batch: list[dict[str, Any]]) -> None:
+        request = urllib.request.Request(
+            f"{host}/api/public/ingestion",
+            data=json.dumps({"batch": batch}).encode(),
+            headers={"Authorization": auth, "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as resp:
+                resp.read()
+        except OSError as e:
+            logger.warning("create failed (%d events): %s", len(batch), e)
+
+    return create
+
+
 class Bridge:
     """Per-call, order-independent join of LLM message logs onto ``llm_request`` spans.
 
@@ -258,19 +338,23 @@ class Bridge:
     a body and the request that should claim it can arrive in either order.
     """
 
-    def __init__(self, patch: PatchFn) -> None:
+    def __init__(self, patch: PatchFn, create: CreateFn = _noop_create) -> None:
         """Initialize the bridge.
 
         Args:
-            patch: Sink applied to each resolved patch; the production sink posts to
+            patch: Sink applied to each resolved message patch; the production sink posts to
                 Langfuse, tests pass a recording stub so no network is touched.
+            create: Sink applied to each audit ingestion batch; defaults to a no-op so the
+                message join works unchanged when the audit layer is not wired.
         """
         self._lock = threading.Lock()
         self._patch = patch
+        self._create = create
         self._span_by_req: dict[str, str] = {}  # request_id -> span_id (hex)
         self._req_seq: list[tuple[int, str]] = []  # (api_request event.sequence, request_id)
         self._body_seqs: list[int] = []  # every api_request_body event.sequence ever seen
         self._pending: list[PendingItem] = []
+        self._audit_traces: set[str] = set()  # spoke keys whose audit trace-create was sent
 
     def pending_count(self) -> int:
         """Return the number of items still buffered awaiting their span."""
@@ -300,31 +384,40 @@ class Bridge:
         """
         with self._lock:
             for rl in payload.get("resourceLogs", []):
+                resource_attrs = (rl.get("resource") or {}).get("attributes", [])
                 for sl in rl.get("scopeLogs", []):
                     for lr in sl.get("logRecords", []):
-                        self._ingest_log(lr.get("attributes", []))
+                        self._ingest_log(resource_attrs, lr.get("attributes", []))
             self._try_flush()
 
-    def _ingest_log(self, attrs: list[dict[str, Any]]) -> None:
-        event = _attr(attrs, "event.name")
+    def _ingest_log(
+        self, resource_attrs: list[dict[str, Any]], record_attrs: list[dict[str, Any]]
+    ) -> None:
+        event = _attr(record_attrs, "event.name")
         if event == "api_request":
-            request_id, seq = _attr(attrs, "request_id"), _attr(attrs, "event.sequence")
+            request_id, seq = (
+                _attr(record_attrs, "request_id"),
+                _attr(record_attrs, "event.sequence"),
+            )
             if request_id and seq is not None:
                 self._req_seq.append((int(seq), request_id))  # matched 1:1 to a body
             return
-        raw = _attr(attrs, "body")
+        if event not in ("api_request_body", "api_response_body"):
+            self._ingest_audit(resource_attrs, record_attrs)  # the audit/lifecycle layer
+            return
+        raw = _attr(record_attrs, "body")
         if not raw:
             return
         if event == "api_request_body":
-            seq = _attr(attrs, "event.sequence")
+            seq = _attr(record_attrs, "event.sequence")
             if seq is None:
                 return
             self._body_seqs.append(int(seq))  # kept past flush so the match stays stable
             self._pending.append(
                 {"key": int(seq), "ktype": "seq", "field": "input", "value": _last_message(raw)}
             )
-        elif event == "api_response_body":
-            request_id = _attr(attrs, "request_id")
+        else:  # api_response_body
+            request_id = _attr(record_attrs, "request_id")
             if not request_id:
                 return
             try:
@@ -339,6 +432,34 @@ class Bridge:
                     "value": doc.get("content", doc),
                 }
             )
+
+    def _ingest_audit(
+        self, resource_attrs: list[dict[str, Any]], record_attrs: list[dict[str, Any]]
+    ) -> None:
+        """Create a Langfuse observation for one audit/lifecycle event, or drop it.
+
+        The event is keyed onto a per-spoke synthetic audit trace by ``spoke_run_id``
+        (resource attr, fallback ``session.id``); the trace's ``trace-create`` is emitted once
+        per spoke, then the ``event-create`` for this event. Events with no audit mapping or
+        no spoke key are dropped.
+
+        Args:
+            resource_attrs: The OTLP resource attributes (carry ``spoke_run_id``/``session.id``).
+            record_attrs: The OTLP log-record attributes (carry ``event.name`` and the payload).
+        """
+        attrs = {**_attrs_dict(resource_attrs), **_attrs_dict(record_attrs)}
+        trace_key = attrs.get("spoke_run_id") or attrs.get("session.id")
+        if not trace_key:
+            return
+        event = build_audit_event(attrs, trace_key=trace_key)
+        if event is None:
+            return
+        batch: list[dict[str, Any]] = []
+        if trace_key not in self._audit_traces:
+            self._audit_traces.add(trace_key)
+            batch.append(trace_create(trace_key, event["timestamp"]))
+        batch.append(event)
+        self._create(batch)
 
     def _match_bodies(self) -> dict[int, str]:
         """Match each buffered input body's ``event.sequence`` to a ``request_id``, 1:1.
@@ -452,7 +573,7 @@ def main() -> None:
     auth = os.environ["LANGFUSE_BASIC_AUTH"]  # "Basic <base64(pk:sk)>"
     port = int(os.environ.get("BRIDGE_PORT", "4319"))
 
-    bridge = Bridge(make_langfuse_patch(host, auth))
+    bridge = Bridge(make_langfuse_patch(host, auth), make_langfuse_create(host, auth))
     logger.info("listening on :%d -> %s", port, host)
     ThreadingHTTPServer(("0.0.0.0", port), make_handler(bridge)).serve_forever()
 

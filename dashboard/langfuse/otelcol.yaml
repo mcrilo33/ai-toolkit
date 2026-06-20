@@ -159,7 +159,12 @@ service:
       receivers: [otlp, otlp/beta]
       processors: [transform/langfuse, batch]
       exporters: [otlphttp/langfuse, otlphttp/bridge]
-    # Raw API bodies arrive on the logs signal; the bridge is their only consumer.
+    # Raw API bodies AND the audit/lifecycle event layer (tool_decision incl. rejections,
+    # mcp_server_connection, compaction, permission_mode_changed, plugin_loaded,
+    # skill_activated, hook_execution_complete, api_error/api_refusal) arrive on the logs
+    # signal; the bridge is their only consumer. It joins the bodies onto llm_request spans
+    # and maps each audit event onto a per-spoke synthetic Langfuse trace (issue #93). No
+    # OTTL transform is needed — the bridge keys events by the spoke_run_id resource attr.
     logs:
       receivers: [otlp]
       exporters: [otlphttp/bridge]
