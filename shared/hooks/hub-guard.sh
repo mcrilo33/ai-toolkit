@@ -77,6 +77,13 @@ for marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply;
   [ -e "$GIT_DIR/$marker" ] && exit 0
 done
 
+# A `hub-guard-allow` file in the git-dir is the explicit, user-granted escape
+# hatch (issue #89): while present it bypasses EVERY guard check, so the hub
+# session can drive commits into a /quick worktree. Granting creates the file
+# (worktree-quick.sh drops it); revoking removes it (worktree-done.sh on
+# teardown). With no marker the default deny below is unchanged.
+[ -e "$GIT_DIR/hub-guard-allow" ] && exit 0
+
 # ── We are on the main checkout, on the default branch: the planning hub. ──
 DENY_MSG="The main checkout on '$DEFAULT_BRANCH' is the planning hub — it never holds task work.
 Dispatch this task into its own worktree instead of editing or committing here:
