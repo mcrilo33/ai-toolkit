@@ -1,10 +1,10 @@
 """The causal tree builder: ids not timestamps (Issue #65, S3 — RED).
 
-Builds one spoke's causal forest from cost-attributed **turn rows** (carrying the
-``uuid``/``parent_uuid``/``is_sidechain`` the parser now surfaces, plus the attributed
-``cost_usd``), the unified spoke **spans** (pull tool/skill/agent + push hook/script/
-step), and the parser's ``tool_parents`` edge map — using the real causal ids rather
-than timestamp windows:
+Builds one spoke's causal forest from **turn rows** (carrying the
+``uuid``/``parent_uuid``/``is_sidechain`` the parser surfaces, plus token counts),
+the unified spoke **spans** (pull tool/skill/agent + push hook/script/step), and the
+parser's ``tool_parents`` edge map — using the real causal ids rather than timestamp
+windows:
 
 - a main turn = a turn row, bucketed by time into the push-marker phase spine (kept);
 - a tool/skill/todo = a pull span, parented under the turn that issued it
@@ -16,8 +16,9 @@ than timestamp windows:
   agent→sub-turn→agent→sub-turn→tool reconstructs at any depth;
 - a script = a push span, at the spoke root when it has no parent.
 
-The acceptance bars: idle→prompt→turn→tool→hook→sub-agent (recursive), cost only on
-turn/agent leaves, and NO ``(unresolved)`` — every node resolves by id.
+The acceptance bars: idle→prompt→turn→tool→hook→sub-agent (recursive), no cost rolled
+up here (Langfuse computes it, Issue #91), and NO ``(unresolved)`` — every node resolves
+by id.
 """
 
 from __future__ import annotations
@@ -25,8 +26,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from typing import Any
-
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
@@ -83,9 +82,9 @@ def _scenario() -> tuple[list[dict], list[dict], dict[str, str]]:
         _turn("s2", "s1", source="subagent", agent_id="AG2", ts="2026-06-12T23:00:24Z", cost=0.15),
     ]
     spans = [
-        # pull spans. The agent spans carry the subagent transcript's *pooled* cost
-        # (cost.py attributes it); the builder must drop it once the per-sub-turn rows
-        # (which carry the same spend) nest under the agent, else Σ owned double-counts.
+        # pull spans. The agent spans still carry a ``cost_usd``, but the builder ignores
+        # it now that cost is retired from this layer (Issue #91) — see
+        # ``test_forest_attributes_no_cost``.
         _span("sp_read", "tool", "Read", ts="2026-06-12T23:00:11Z", summary="queries.py"),
         _span(
             "sp_ag1", "agent", "Explore", ts="2026-06-12T23:00:21Z", agent_link="AG1", cost_usd=0.45
@@ -181,40 +180,11 @@ class TestCausalForest:
         red = next(iv for iv in forest if iv["kind"] == "interval" and iv["phase"] == "red")
         assert "scr1" in {c["node_id"] for c in red["children"]}
 
-    def test_cost_only_on_turn_and_agent_leaves(self) -> None:
-        for node in _by_id(_build()).values():
-            if node["own_cost_usd"] > 0:
-                assert node["kind"] in ("turn", "agent")
-
-    def test_subturn_and_main_turn_own_their_cost(self) -> None:
-        nodes = _by_id(_build())
-        assert nodes["s1"]["own_cost_usd"] > 0
-        assert nodes["m1"]["own_cost_usd"] > 0
-
-    def test_agent_with_subturns_owns_no_cost(self) -> None:
-        # The agent's pooled cost moves onto its sub-turns; the container owns nothing.
-        nodes = _by_id(_build())
-        assert nodes["sp_ag1"]["own_cost_usd"] == 0.0
-        assert nodes["sp_ag2"]["own_cost_usd"] == 0.0
-
-    def test_cost_is_conserved(self) -> None:
-        # Σ owned across the whole tree equals Σ of the turn-row costs — no double count
-        # despite the agent spans carrying the same pooled spend.
-        owned = sum(n["own_cost_usd"] for n in _by_id(_build()).values())
-        assert owned == pytest.approx(0.10 + 0.20 + 0.30 + 0.15)
-
-    def test_agent_without_subturns_keeps_its_pooled_cost(self) -> None:
-        # An agent whose sub-agent transcript was not parsed (no sub-turn rows) stays a
-        # leaf and keeps its attributed cost, so the spend is not lost.
-        turns = [_turn("m", "u", source="main", agent_id=None, ts="2026-06-12T23:00:10Z", cost=0.1)]
-        spans = [
-            _span(
-                "ag", "agent", "Explore", ts="2026-06-12T23:00:11Z", agent_link="AGX", cost_usd=0.4
-            ),
-            _span("mk", "step", "solo-cycle", ts="2026-06-12T23:00:05Z", phase="red"),
-        ]
-        nodes = _by_id(build_causal_forest(turns, spans, {"ag": "m"}))
-        assert nodes["ag"]["own_cost_usd"] == pytest.approx(0.4)
+    def test_forest_attributes_no_cost(self) -> None:
+        # Issue #91: cost is retired from this layer — the otelcol remaps tokens and
+        # Langfuse computes cost. Every node owns 0.0 even though the scenario's turn rows
+        # and agent spans still carry a ``cost_usd`` the builder now ignores.
+        assert all(n["own_cost_usd"] == 0.0 for n in _by_id(_build()).values())
 
 
 class TestActor:
@@ -315,9 +285,10 @@ class TestGenuineTriggerNesting:
         forest = _build_trigger()
         assert {n["kind"] for n in forest} == {"interval"}
 
-    def test_cost_conserved(self) -> None:
+    def test_no_cost_attributed(self) -> None:
+        # Issue #91: cost is computed by Langfuse, not rolled up in the forest.
         owned = sum(n["own_cost_usd"] for n in _by_id(_build_trigger()).values())
-        assert owned == pytest.approx(0.10 + 0.20)
+        assert owned == 0.0
 
 
 # ── Pre/PostToolUse hook nests under its tool by the real id (Issue #82) ───────

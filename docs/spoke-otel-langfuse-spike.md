@@ -11,6 +11,12 @@ cost-reconciliation, cross-session spoke lifetime, or conservation invariants. T
 answer different questions.
 
 > [!NOTE]
+> Historical artifact. Since this spike, #90 removed the Streamlit dashboard + DuckDB
+> store and #91 retired `ccusage` and the pull-cost layer — Langfuse is now the single
+> observability surface and computes cost itself from token usage. The `ccusage`
+> "authoritative cost" framing below reflects the state at spike time, not today.
+
+> [!NOTE]
 > The dashboard and `telemetry.causal_strict` are deliberately untouched by this spike.
 > The only code change is an **opt-in** env prefix on the spoke launch
 > (`scripts/worktree-new.sh`), gated on `AI_TOOLKIT_OTEL=1`. With the gate off, the

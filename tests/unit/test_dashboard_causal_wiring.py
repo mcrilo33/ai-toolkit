@@ -81,7 +81,7 @@ class TestDividers:
 class TestForestFromParsedSession:
     def test_task_session_builds_a_conformant_resolved_forest(self) -> None:
         parsed = parse_session_file(TASK_SESSION)
-        forest = causal_forest_from_parsed(parsed, [], {})
+        forest = causal_forest_from_parsed(parsed, [])
         validate_causal_tree(forest)
         kinds = {n["kind"] for n in _walk(forest)}
         assert "unresolved" not in kinds  # AC: every node resolves by id
@@ -89,14 +89,14 @@ class TestForestFromParsedSession:
 
     def test_task_subagent_recurses_under_its_issuing_turn(self) -> None:
         parsed = parse_session_file(TASK_SESSION)
-        forest = causal_forest_from_parsed(parsed, [], {})
+        forest = causal_forest_from_parsed(parsed, [])
         agents = [n for n in _walk(forest) if n["kind"] == "agent"]
         # The Task agent carries the sub-agent's own sub-turns (recursion), not a flat leaf.
         assert any(any(c["kind"] == "turn" for c in a["children"]) for a in agents)
 
     def test_workflow_session_has_context_and_workflow_agents(self) -> None:
         parsed = parse_session_file(WF_SESSION)
-        forest = causal_forest_from_parsed(parsed, [], {})
+        forest = causal_forest_from_parsed(parsed, [])
         validate_causal_tree(forest)
         nodes = list(_walk(forest))
         assert any(n["kind"] == "context" for n in nodes)  # loaded context folded per turn

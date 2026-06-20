@@ -8,7 +8,7 @@ replacing the timestamp-window correlation the dashboard previously used (the fo
   it triggered (``turn.parent_uuid`` resolves to the prompt record via
   ``derive_span_id``) NESTS under it, and continuation turns of that agent loop are
   time-ordered SIBLINGS under the same prompt (the turn->turn loop stays flat);
-- **turn** — a cost-attributed turn row; a main turn nests under its triggering
+- **turn** — a turn row; a main turn nests under its triggering
   human prompt (or buckets into its covering **phase spine** interval otherwise), a
   sub-agent turn nests under its agent (``agent_id`` == the agent span's ``agent_link``);
 - **tool / skill / todo / agent** — a pull span, parented under the turn that issued
@@ -20,9 +20,10 @@ replacing the timestamp-window correlation the dashboard previously used (the fo
 
 The spine still partitions the run into ``step``/``lifecycle`` intervals, but the
 *internals* of each interval are causal: idle→prompt→turn→tool→hook→sub-agent,
-recursive to any depth. Cost lives only on the turn/agent leaves it was spent in, so
-``Σ owned == Σ turns``. Loaded context (the per-turn ``context`` node) is layered on
-in S4; idle/resume dividers in S5.
+recursive to any depth. Cost is no longer attributed here — the otelcol remaps tokens
+to ``gen_ai.usage.*`` and Langfuse computes cost from its model-pricing config (Issue
+#91). Loaded context (the per-turn ``context`` node) is layered on in S4; idle/resume
+dividers in S5.
 """
 
 from __future__ import annotations
@@ -34,11 +35,10 @@ from itertools import pairwise
 from typing import TYPE_CHECKING, Any
 
 from telemetry.causal import CausalNode, InputContext, SchemaSummary, causal_node
-from telemetry.cost import per_turn_rows
 from telemetry.spans import derive_span_id
 
 if TYPE_CHECKING:
-    from telemetry.session_parser import ParsedSession
+    from telemetry.session_parser import ParsedSession, ReasoningRef, UsageEvent
 
 # Push markers that form the L1 phase spine; folded into ``interval`` bucket nodes.
 _MARKER_KINDS = frozenset({"step", "lifecycle"})
@@ -60,8 +60,8 @@ def build_causal_forest(
     """Build the causal forest for one spoke.
 
     Args:
-        turns: Cost-attributed turn rows, each carrying ``uuid``/``parent_uuid``/
-            ``source``/``agent_id``/``is_sidechain`` plus ``cost_usd``/``tokens_*``.
+        turns: Turn rows, each carrying ``uuid``/``parent_uuid``/``source``/
+            ``agent_id``/``is_sidechain`` plus ``tokens_*`` (cost is Langfuse's job).
         spans: The spoke's unified spans (pull tool/skill/agent + push hook/script/
             step/lifecycle) as dicts.
         tool_parents: ``span_id -> issuing turn uuid`` (the parser's causal edge map).
@@ -142,12 +142,6 @@ def build_causal_forest(
         parent = nodes.get(agent_by_link.get(agent_id or "") or "")
         if parent is not None:
             node["actor"] = parent["name"]
-            # The agent leaf carried the subagent transcript's pooled cost; now that its
-            # per-sub-turn rows nest under it (each owning its slice), drop the pool so
-            # Σ owned == Σ turns. An agent with no sub-turns parsed keeps it as a leaf.
-            parent["own_cost_usd"] = 0.0
-            parent["own_tokens_in"] = 0
-            parent["own_tokens_out"] = 0
         _attach(parent, node, roots)
     for span in actions:
         node = nodes[span["span_id"]]
@@ -359,7 +353,7 @@ def _turn_node(row: dict[str, Any]) -> CausalNode:
         actor="subagent" if is_sub else "main",
         ts_start=row.get("ts"),
         ts_end=row.get("ts"),
-        own_cost_usd=float(row.get("cost_usd") or 0.0),
+        own_cost_usd=0.0,  # cost is computed downstream by Langfuse (Issue #91)
         own_tokens_in=int(row.get("tokens_in") or 0),
         own_tokens_out=int(row.get("tokens_out") or 0),
     )
@@ -372,9 +366,9 @@ def _turn_node(row: dict[str, Any]) -> CausalNode:
 def _reasoning_child(turn: CausalNode, gist: str | None) -> CausalNode:
     """The ``reasoning`` node a turn carries when its thinking body was extracted (#92).
 
-    Owns nothing — cost stays on the turn, so ``Σ owned == Σ turns`` is preserved. Its
-    ``summary`` is the turn's privacy-safe narration gist; the thinking BODY is not held
-    here (the backfill joins it by the turn uuid at Langfuse-translation time).
+    Owns no tokens — usage stays on the turn. Its ``summary`` is the turn's privacy-safe
+    narration gist; the thinking BODY is not held here (the backfill joins it by the turn
+    uuid at Langfuse-translation time).
     """
     return causal_node(
         node_id=f"reasoning:{turn['node_id']}",
@@ -408,7 +402,7 @@ def _span_node(span: dict[str, Any]) -> CausalNode:
         ts_start=span.get("ts_start"),
         ts_end=span.get("ts_end"),
         duration_ms=int(span.get("duration_ms") or 0),
-        own_cost_usd=float(span.get("cost_usd") or 0.0) if kind == "agent" else 0.0,
+        own_cost_usd=0.0,  # cost is computed downstream by Langfuse (Issue #91)
         human_count=1 if span.get("human_type") else 0,
         **links,
     )
@@ -558,7 +552,7 @@ def causal_dividers(turns: list[dict[str, Any]]) -> list[CausalNode]:
     A change of ``session_id`` between adjacent main turns is a **resume** (cold cache),
     rendered as a ``session`` divider carrying the cold re-read note; a long idle gap is
     a ``gap`` divider. Dividers own nothing and slot into the forest by start time, so
-    they never disturb the cost rollup.
+    they never disturb the token rollup.
     """
     main = sorted(
         (t for t in turns if t.get("source") != "subagent" and t.get("ts")),
@@ -595,23 +589,102 @@ def causal_dividers(turns: list[dict[str, Any]]) -> list[CausalNode]:
     return dividers
 
 
+def per_turn_rows(
+    usage_events: list[UsageEvent],
+    *,
+    reasoning_refs: list[ReasoningRef] | None = None,
+) -> list[dict[str, object]]:
+    """One row per usage event, with model, token counts, and a reasoning gist.
+
+    Each turn appears exactly once. Cost is no longer attributed here — the otelcol
+    remaps tokens to ``gen_ai.usage.*`` and Langfuse computes cost from its model-pricing
+    config (Issue #91). Each row carries the turn's ``cache_read`` / ``cache_creation``
+    breakdown (the renderer frames cheap reuse against cold writes). When ``reasoning_refs``
+    are given, each row carries the turn's reasoning ``summary`` gist (matched on
+    session/source/agent/ts) so the tree can render a ``reasoning`` node.
+
+    Args:
+        usage_events: Per-turn usage from the parsed sessions (main + subagent).
+        reasoning_refs: Per-turn reasoning summaries to join onto their turn.
+
+    Returns:
+        One dict per turn: ``session_id, ts, model, source, agent_id, uuid,
+        parent_uuid, is_sidechain, tokens_in, tokens_out, tokens_total, cache_read,
+        cache_creation, reasoning``.
+    """
+    gists = _reasoning_by_turn(reasoning_refs or [])
+    rows: list[dict[str, object]] = []
+    for event in usage_events:
+        rows.append(
+            {
+                "session_id": event.session_id,
+                "ts": event.ts,
+                "model": event.model,
+                "source": event.source,
+                "agent_id": event.agent_id,
+                # Causal ids (Issue #65) — the keys the v3 builder keys turns on.
+                "uuid": event.uuid,
+                "parent_uuid": event.parent_uuid,
+                "is_sidechain": event.is_sidechain,
+                "tokens_in": event.input_tokens,
+                "tokens_out": event.output_tokens,
+                "tokens_total": _event_total(event),
+                "cache_read": event.cache_read,
+                "cache_creation": event.cache_creation,
+                "reasoning": gists.get(
+                    _turn_key(event.session_id, event.source, event.agent_id, event.ts)
+                ),
+            }
+        )
+    return rows
+
+
+def _turn_key(
+    session_id: str | None, source: str, agent_id: str | None, ts: str | None
+) -> tuple[str | None, str, str | None, str | None]:
+    """The identity a usage event and its reasoning ref share (same assistant record)."""
+    return (session_id, source, agent_id, ts)
+
+
+def _reasoning_by_turn(
+    refs: list[ReasoningRef],
+) -> dict[tuple[str | None, str, str | None, str | None], str]:
+    """Map each turn key to its reasoning gist, keeping only refs that carry one.
+
+    Two inferences can share a millisecond ``ts``; on such a collision the last ref's
+    gist wins and both turns display it. The gist is display-only, so the cosmetic
+    mislabel is acceptable.
+    """
+    return {
+        _turn_key(ref.session_id, ref.source, ref.agent_id, ref.ts): ref.summary
+        for ref in refs
+        if ref.summary
+    }
+
+
+def _event_total(event: UsageEvent) -> int:
+    return event.input_tokens + event.output_tokens + event.cache_read + event.cache_creation
+
+
 def causal_forest_from_parsed(
     parsed: ParsedSession,
     push_spans: list[dict[str, Any]],
-    ccusage_costs: dict[str, float],
     thinking: dict[str, str] | None = None,
 ) -> list[CausalNode]:
     """Assemble a spoke's full causal forest from a parsed session + its push spans.
 
     The per-spoke entry point the dashboard wires in: the parser's pull spans + per-turn
-    rows (cost-attributed, carrying the causal ids) and the parser's ``tool_parents`` edge
-    map feed the builder; the push spans supply the phase-spine markers, hooks and scripts;
-    idle/resume dividers are appended. Returns the start-ordered forest.
+    rows (carrying the causal ids) and the parser's ``tool_parents`` edge map feed the
+    builder; the push spans supply the phase-spine markers, hooks and scripts; idle/resume
+    dividers are appended. Returns the start-ordered forest.
+
+    Cost is not attributed here — the otelcol remaps tokens to ``gen_ai.usage.*`` and
+    Langfuse computes cost from its model-pricing config (Issue #91).
 
     ``thinking`` (Issue #92) is the optional ``turn uuid -> extended-thinking body`` map
     the backfill passes under its opt-in; it threads through to attach ``reasoning`` nodes.
     """
-    turns = per_turn_rows(parsed.usage_events, ccusage_costs, reasoning_refs=parsed.reasoning_refs)
+    turns = per_turn_rows(parsed.usage_events, reasoning_refs=parsed.reasoning_refs)
     pull = [span.to_dict() for span in parsed.spans]
     forest = build_causal_forest(turns, [*pull, *push_spans], parsed.tool_parents, thinking)
     forest.extend(causal_dividers(turns))
