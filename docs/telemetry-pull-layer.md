@@ -1,10 +1,17 @@
 # Telemetry pull layer (Issue #22)
 
 The pull layer reconstructs spans from Claude session logs and attributes token
-cost to every span, then exposes the unified push + pull dataset to the Issue #23
-dashboard. It is the counterpart to Issue #21's push layer (hooks and scripts
-emitting spans at runtime) and builds against #21's frozen span schema
+cost to every span. It is the counterpart to Issue #21's push layer (hooks and
+scripts emitting spans at runtime) and builds against #21's frozen span schema
 (`docs/telemetry-span-schema.md`) verbatim.
+
+> [!NOTE]
+> Issue #90 retired the Streamlit dashboard and its pull-only DuckDB store
+> (`telemetry/store.py` + the DuckDB query layer `telemetry/queries.py`).
+> Observability now lives on **Langfuse** (the push path under
+> `dashboard/langfuse/otelcol.yaml` + `langfuse_*.py`). The transcript parsers
+> documented here are retained as the always-on, on-machine **backfill source**
+> for that pipeline — they are no longer wired to a renderer.
 
 Everything here is **read-only and 100% local**. Session logs contain prompt
 content, so they are parsed on-machine and only metadata / metrics are surfaced —
@@ -28,7 +35,7 @@ All live in `scripts/telemetry/`:
 | `session_parser.py` | Parse `~/.claude/projects/*/*.jsonl` into `skill` / `agent` / `todo` / `human` spans plus a `tool` leaf per `tool_use` (Issue #47). Walk `<session>/subagents/agent-<id>.jsonl` transcripts into `UsageEvent`s **and** the sub-agent's own step spans (#47 S3) — re-homed onto the parent session with `parent_id` = the agent span, so they nest under it. |
 | `cost.py` | Attribute tokens and cost to every span; reuse `ccusage` for cost. |
 | `spoke_runs.py` | Group spans into spoke-run lifetimes; per-invocation normalized metrics. |
-| `queries.py` | Expose the unified push + pull dataset as in-memory DuckDB views. |
+| `causal.py` / `causal_tree.py` | Build the strict, id-based causal forest over a parsed session (Issue #65). |
 
 ## How attribution works
 
@@ -46,7 +53,7 @@ All live in `scripts/telemetry/`:
 
 Spans are **hierarchical** (a `step` span encloses the skill/agent spans that ran
 during it), so a wide span's tokens include the narrower spans nested inside it.
-The views aggregate within one granularity; callers must not sum a step's cost
+Consumers aggregate within one granularity; callers must not sum a step's cost
 together with the nested spans it already contains.
 
 ## Spoke-run join
@@ -55,49 +62,6 @@ Pull spans parsed from session logs carry a null `spoke_run_id` (session logs do
 not record it). They are backfilled from a session-peer push span — within one
 session every span belongs to the same spoke run. Spans with no `spoke_run_id`
 and no session match are ad-hoc and group under `None`.
-
-## DuckDB dataset
-
-`queries.connect(events_path=…, projects_root=…, ccusage_costs=…)` returns an
-in-memory DuckDB (no separate database to run) with:
-
-- `spans` — the unified table (the 18 schema fields, with `human` flattened to
-  `human_type` / `human_wait_ms` for SQL ergonomics).
-- `spoke_run_summary` — per spoke run: span count, distinct sessions, total cost,
-  lifetime. `total_cost_usd` is the sum of the run's distinct sessions' ccusage
-  totals — not a sum over `spans.cost_usd`, which would double-count because a
-  step span's cost already includes the spans nested inside it. This makes the
-  run total cross-check against ccusage directly.
-- `step_metrics` — per spoke run and step key (`kind:name[:phase]`): invocation
-  count, mean / median duration, total cost, human-interaction count.
-
-## Persisted store (Issue #62, Phase A)
-
-`queries.connect` re-parses every historical session log on each call — ~146s once the
-backlog reached 252 MB / 748 files. `telemetry/store.py` replaces that read-time parse
-with a **persisted, incrementally-materialized DuckDB** at
-`~/.ai-toolkit/telemetry/store.duckdb` (a CQRS read model). `ingest_store` brings it up
-to date on each dashboard open; the dashboard then attaches it read-only
-(`SpanStore.from_persisted_store`) and queries it.
-
-- **No backfill — start fresh.** The store is created **empty at a watermark** (its init
-  timestamp). Only session transcripts modified at/after the watermark are ever parsed;
-  the historical backlog is never read. Consequence (accepted, documented — *not a bug*):
-  spokes that ran **before** the store existed do not appear. The store populates as new
-  spokes run.
-- **Incremental + idempotent.** A per-session cursor (`ingest_cursor`:
-  `session_file → mtime_ns/size`) skips unchanged transcripts. Span ids are deterministic,
-  so re-ingesting a grown transcript replaces that session's rows (delete-then-insert by
-  `session_id`) without double-counting.
-- **WAL unchanged.** `events.jsonl` stays the append-only push-span source; push spans are
-  read from it in full each ingest (cheap) and the script→marker emission link is computed
-  over them globally, so a cross-session emission inside a spoke run stays correct.
-- **Identical semantics.** spoke_run_id backfill, token/cost attribution, and per-turn rows
-  are genuinely per-session, so re-correlating one changed session yields a spoke view
-  **byte-identical** to the old whole-dataset parse (asserted in
-  `tests/unit/test_dashboard_persisted_store.py`).
-- **Rebuild = re-init.** Deleting the `.duckdb` file and re-ingesting re-creates an empty
-  store at a *new* watermark — never a historical re-parse.
 
 ## Verification notes and follow-ups
 
