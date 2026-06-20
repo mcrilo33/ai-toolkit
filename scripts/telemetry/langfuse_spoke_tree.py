@@ -1559,7 +1559,9 @@ def main(argv: list[str] | None = None) -> int:
 
     trace_id = trace_id_for(args.spoke_run_id)
     filled = filled_tool_spans(traces, tool_content)
-    decomposed = len(_llm_requests_in_order(traces)) if decomposition_events else 0
+    decomposed = sum(
+        1 for event in decomposition_events if event["body"]["name"].startswith("cache_read ")
+    )
     print(
         f"{len(batch) - 2} observations assembled under trace {trace_id} "
         f"(roots collapsed to 1), {filled} tool spans filled from transcript, "

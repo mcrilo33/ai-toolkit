@@ -78,9 +78,13 @@ _REMINDER_RE = re.compile(r"<system-reminder>(.*?)</system-reminder>", re.DOTALL
 # A bare identifier — a stripped reminder line that is exactly one tool name.
 _TOOL_NAME_LINE_RE = re.compile(r"[A-Za-z_]\w*")
 
-# A section boundary inside the rules+memory+env block (#99): either a ``Contents of <path>``
-# file header or a ``# Header`` line (Memory Index / currentDate / userEmail / claudeMd).
-_RULES_BOUNDARY_RE = re.compile(r"^(?:Contents of \S+.*|#[ ].*)$", re.MULTILINE)
+# A section boundary inside the rules+memory+env block (#99): a ``Contents of <path>`` file
+# header or one of the runtime's own env-section headers. Only these literal headers end a
+# section — a generic ``# Heading`` is NOT a boundary, so a rule file's own markdown headings
+# (e.g. ``# Code Quality``) stay inside that file's item instead of splitting it.
+_RULES_BOUNDARY_RE = re.compile(
+    r"^(?:Contents of \S+.*|# (?:claudeMd|currentDate|userEmail)\b.*)$", re.MULTILINE
+)
 # The path on a ``Contents of <path> …:`` header line — basenamed to name the rule item.
 # The path stops at the first space or trailing colon (``file.md:`` and ``file.md (desc):``).
 _CONTENTS_PATH_RE = re.compile(r"^Contents of (\S+?):?(?:\s|$)")
@@ -430,8 +434,10 @@ def decompose_request_obj(obj: dict[str, object]) -> list[ContextItem]:
     messages = messages if isinstance(messages, list) else []
     last_marker_msg = _last_marker_message_index(messages)
     any_msg_marker = last_marker_msg >= 0
-    tool_items = _tool_items(obj.get("tools"), cached=any_msg_marker)
-    system_items, _ = _system_items(obj.get("system"), any_later_boundary=any_msg_marker)
+    system_items, system_boundaries = _system_items(
+        obj.get("system"), any_later_boundary=any_msg_marker
+    )
+    tool_items = _tool_items(obj.get("tools"), cached=bool(system_boundaries) or any_msg_marker)
     first_items = (
         _decompose_first_message(messages[0], any_later_marker=last_marker_msg > 0)
         if messages

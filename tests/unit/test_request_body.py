@@ -455,6 +455,29 @@ def test_decompose_splits_rules_block_per_rule_file() -> None:
     assert rule_names == {"code-quality.md", "python-style.md"}
 
 
+def test_decompose_keeps_markdown_headings_inside_the_rule_file_item() -> None:
+    # Arrange: a rule file whose body has its own ``#``/``##`` headings (the real files do).
+    block = _reminder(
+        "# claudeMd",
+        "Contents of /repo/.claude/rules/code-quality.md:",
+        "# Code Quality",
+        "## Clarity Over Cleverness",
+        "Write code that reads like prose.",
+        "# currentDate",
+        "Today's date is 2026-06-20.",
+    )
+    obj = _body([], [], [_msg("user", block)])
+
+    # Act
+    items = decompose_request_obj(obj)
+
+    # Assert: the file's own headings stay in its rules item, not split into env (#99 review).
+    rule = next(item for item in items if item.category == "rules")
+    assert rule.name == "code-quality.md"
+    assert "## Clarity Over Cleverness" in rule.text
+    assert "Write code that reads like prose." in rule.text
+
+
 def test_decompose_splits_skills_block_per_skill() -> None:
     # Arrange: a skills reminder listing two skills.
     block = _reminder(
