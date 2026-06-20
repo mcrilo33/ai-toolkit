@@ -634,6 +634,210 @@ def test_audit_event_without_a_spoke_key_is_dropped() -> None:
     assert patch.calls == []
 
 
+# --- hook-event nesting: resolve a tool_use_id for Pre/PostToolUse hooks --------
+
+
+def _hook_events(create: _CreateSink) -> list[dict]:
+    """Every hook_execution_complete event-create the bridge emitted, in order."""
+    return [
+        event
+        for batch in create.batches
+        for event in batch
+        if event["type"] == "event-create"
+        and event["body"]["name"].startswith("hook_execution_complete")
+    ]
+
+
+def test_pretooluse_hook_gets_tool_use_id_from_following_decision() -> None:
+    # Arrange: a PreToolUse:Edit hook (seq 10) arrives BEFORE its tool_decision (seq 15), as
+    # Claude Code emits them. The bridge emits the hook immediately at root (never dropped),
+    # then re-emits it with the resolved tool_use_id once the decision is seen.
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+
+    # Act
+    bridge.on_logs(
+        _audit_log_payload(
+            {"spoke_run_id": "spoke-1"},
+            _audit_record(
+                **{
+                    "event.name": "hook_execution_complete",
+                    "event.sequence": "10",
+                    "hook_event": "PreToolUse",
+                    "hook_name": "PreToolUse:Edit",
+                }
+            ),
+            _audit_record(
+                **{
+                    "event.name": "tool_decision",
+                    "event.sequence": "15",
+                    "tool_name": "Edit",
+                    "tool_use_id": "toolu_1",
+                    "decision": "accept",
+                }
+            ),
+        )
+    )
+
+    # Assert: two emits of the SAME observation id -- first at root (no id), then enriched.
+    hooks = _hook_events(create)
+    assert len(hooks) == 2
+    assert "tool_use_id" not in hooks[0]["body"]["metadata"]
+    assert hooks[-1]["body"]["metadata"]["tool_use_id"] == "toolu_1"
+    assert hooks[0]["id"] == hooks[-1]["id"]
+
+
+def test_posttooluse_hook_gets_tool_use_id_from_preceding_decision() -> None:
+    # Arrange: a PostToolUse:Read hook (seq 20) is preceded by its tool_decision (seq 15).
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+
+    # Act
+    bridge.on_logs(
+        _audit_log_payload(
+            {"spoke_run_id": "spoke-1"},
+            _audit_record(
+                **{
+                    "event.name": "tool_decision",
+                    "event.sequence": "15",
+                    "tool_name": "Read",
+                    "tool_use_id": "toolu_2",
+                    "decision": "accept",
+                }
+            ),
+            _audit_record(
+                **{
+                    "event.name": "hook_execution_complete",
+                    "event.sequence": "20",
+                    "hook_event": "PostToolUse",
+                    "hook_name": "PostToolUse:Read",
+                }
+            ),
+        )
+    )
+
+    # Assert: the hook nests under the preceding Read decision's tool_use_id.
+    hooks = _hook_events(create)
+    assert hooks[-1]["body"]["metadata"]["tool_use_id"] == "toolu_2"
+
+
+def test_hook_with_no_matching_decision_stays_at_root_once() -> None:
+    # Arrange: a PreToolUse:Edit hook with only a Bash decision present. The tool_name must
+    # match, so the hook never binds to Bash -- it is emitted once at root with no id.
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+
+    # Act
+    bridge.on_logs(
+        _audit_log_payload(
+            {"spoke_run_id": "spoke-1"},
+            _audit_record(
+                **{
+                    "event.name": "hook_execution_complete",
+                    "event.sequence": "10",
+                    "hook_event": "PreToolUse",
+                    "hook_name": "PreToolUse:Edit",
+                }
+            ),
+            _audit_record(
+                **{
+                    "event.name": "tool_decision",
+                    "event.sequence": "15",
+                    "tool_name": "Bash",
+                    "tool_use_id": "toolu_x",
+                    "decision": "accept",
+                }
+            ),
+        )
+    )
+
+    # Assert: emitted exactly once, never bound to the wrong tool.
+    hooks = _hook_events(create)
+    assert len(hooks) == 1
+    assert "tool_use_id" not in hooks[0]["body"]["metadata"]
+
+
+def test_sessionstart_hook_is_emitted_once_and_never_buffered() -> None:
+    # Arrange: a SessionStart hook has no tool; it must stay at root, emitted once, even with
+    # a following decision present (it is never a Pre/PostToolUse, so never buffered).
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+
+    # Act
+    bridge.on_logs(
+        _audit_log_payload(
+            {"spoke_run_id": "spoke-1"},
+            _audit_record(
+                **{
+                    "event.name": "hook_execution_complete",
+                    "event.sequence": "5",
+                    "hook_event": "SessionStart",
+                    "hook_name": "SessionStart",
+                }
+            ),
+            _audit_record(
+                **{
+                    "event.name": "tool_decision",
+                    "event.sequence": "8",
+                    "tool_name": "Edit",
+                    "tool_use_id": "toolu_3",
+                    "decision": "accept",
+                }
+            ),
+        )
+    )
+
+    # Assert
+    hooks = _hook_events(create)
+    assert len(hooks) == 1
+    assert "tool_use_id" not in hooks[0]["body"]["metadata"]
+
+
+def test_pretooluse_hook_matches_decision_arriving_in_later_batch() -> None:
+    # Arrange: the matching decision arrives in a SEPARATE later batch -- the buffered hook
+    # must resolve across batches (order-independent, like the message join).
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+
+    # Act: hook first; only the immediate at-root emit exists so far.
+    bridge.on_logs(
+        _audit_log_payload(
+            {"spoke_run_id": "spoke-1"},
+            _audit_record(
+                **{
+                    "event.name": "hook_execution_complete",
+                    "event.sequence": "10",
+                    "hook_event": "PreToolUse",
+                    "hook_name": "PreToolUse:Edit",
+                }
+            ),
+        )
+    )
+    assert len(_hook_events(create)) == 1
+    assert "tool_use_id" not in _hook_events(create)[0]["body"]["metadata"]
+
+    # The decision lands later and resolves the buffered hook.
+    bridge.on_logs(
+        _audit_log_payload(
+            {"spoke_run_id": "spoke-1"},
+            _audit_record(
+                **{
+                    "event.name": "tool_decision",
+                    "event.sequence": "15",
+                    "tool_name": "Edit",
+                    "tool_use_id": "toolu_1",
+                    "decision": "accept",
+                }
+            ),
+        )
+    )
+
+    # Assert: re-emitted exactly once with the id; not re-emitted again on later flushes.
+    hooks = _hook_events(create)
+    assert len(hooks) == 2
+    assert hooks[-1]["body"]["metadata"]["tool_use_id"] == "toolu_1"
+
+
 def test_response_body_does_not_reach_the_create_sink() -> None:
     # Arrange: an api_response_body (existing patch path) must not create observations.
     patch, create = _Sink(), _CreateSink()

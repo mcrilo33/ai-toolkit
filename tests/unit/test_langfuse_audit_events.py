@@ -255,6 +255,48 @@ def test_unrecognized_event_returns_none() -> None:
     assert build_audit_event({"event.name": "definitely_not_an_event"}, trace_key="s") is None
 
 
+def test_hook_execution_complete_carries_injected_tool_use_id() -> None:
+    # Arrange: a Pre/PostToolUse hook event the bridge has resolved a tool_use_id for and
+    # injected into the attrs. The id must land in metadata so the assembler can nest the
+    # hook under its tool (issue: hook-event-nest).
+    attrs = _merged(
+        **{
+            "event.name": "hook_execution_complete",
+            "event.sequence": "11",
+            "hook_event": "PreToolUse",
+            "hook_name": "PreToolUse:Edit",
+            "tool_use_id": "toolu_9",
+        }
+    )
+
+    # Act
+    event = build_audit_event(attrs, trace_key="spoke-abc")
+
+    # Assert
+    assert event is not None
+    assert event["body"]["name"] == "hook_execution_complete:PreToolUse"
+    assert event["body"]["metadata"]["tool_use_id"] == "toolu_9"
+    assert event["body"]["metadata"]["hook_name"] == "PreToolUse:Edit"
+
+
+def test_hook_execution_complete_without_tool_use_id_omits_it() -> None:
+    # Arrange / Act: a hook event with no injected id (e.g. SessionStart, or an as-yet
+    # unmatched Pre/PostToolUse) must not carry a tool_use_id key.
+    attrs = _merged(
+        **{
+            "event.name": "hook_execution_complete",
+            "event.sequence": "5",
+            "hook_event": "SessionStart",
+            "hook_name": "SessionStart",
+        }
+    )
+    event = build_audit_event(attrs, trace_key="spoke-abc")
+
+    # Assert
+    assert event is not None
+    assert "tool_use_id" not in event["body"]["metadata"]
+
+
 def test_api_error_and_refusal_are_mapped() -> None:
     # Arrange / Act: the error-shaped events map to ERROR / WARNING observations.
     err = build_audit_event(

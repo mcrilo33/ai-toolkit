@@ -324,6 +324,98 @@ class TestBuildBatch:
         hook_copy = _by_orig(batch, "trace-hook", "h5")
         assert hook_copy["body"]["parentObservationId"] == _copy_id("trace-tool", "t5")
 
+    def test_hook_execution_complete_event_nests_under_its_tool(self) -> None:
+        # A hook_execution_complete:PreToolUse audit observation now carries the tool_use_id
+        # the bridge stamped (flat metadata, no parentObservationId). It must nest under the
+        # tool sharing that id, exactly like a gate hook / tool_decision (issue hook-event-nest).
+        tool = _obs("t8", "Edit", parent=None, metadata={"attributes": {"tool_use_id": "tu-8"}})
+        hook = _obs(
+            "h8a",
+            "hook_execution_complete:PreToolUse",
+            type_="EVENT",
+            parent=None,
+            metadata={
+                "hook_event": "PreToolUse",
+                "hook_name": "PreToolUse:Edit",
+                "tool_use_id": "tu-8",
+            },
+        )
+        traces = [("trace-tool", [tool]), ("trace-audit", [hook])]
+
+        batch = build_batch(traces, SPOKE)
+
+        copy = _by_orig(batch, "trace-audit", "h8a")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-tool", "t8")
+
+    def test_hook_execution_complete_session_event_collapses_to_root(self) -> None:
+        # A SessionStart hook event carries no tool_use_id (no tool triggered it) and must
+        # stay at the synthetic root, never nested under a tool.
+        hook = _obs(
+            "h9a",
+            "hook_execution_complete:SessionStart",
+            type_="EVENT",
+            parent=None,
+            metadata={"hook_event": "SessionStart", "hook_name": "SessionStart"},
+        )
+
+        batch = build_batch([("trace-audit", [hook])], SPOKE)
+
+        copy = _by_orig(batch, "trace-audit", "h9a")
+        assert copy["body"]["parentObservationId"] == root_id_for(SPOKE)
+
+    def test_unmatched_hook_execution_complete_event_collapses_to_root(self) -> None:
+        # A Pre/PostToolUse hook whose tool_use_id matches no tool span is never dropped --
+        # it falls through to the synthetic root.
+        hook = _obs(
+            "h10",
+            "hook_execution_complete:PostToolUse",
+            type_="EVENT",
+            parent=None,
+            metadata={
+                "hook_event": "PostToolUse",
+                "hook_name": "PostToolUse:Edit",
+                "tool_use_id": "tu-absent",
+            },
+        )
+
+        batch = build_batch([("trace-audit", [hook])], SPOKE)
+
+        copy = _by_orig(batch, "trace-audit", "h10")
+        assert copy["body"]["parentObservationId"] == root_id_for(SPOKE)
+
+    def test_hook_execution_complete_event_is_not_a_tool_index_owner(self) -> None:
+        # A hook_execution_complete event shares the tool_use_id but must NOT become the
+        # re-parent target: it is skipped as an index owner, so a gate hook sharing the id
+        # still nests under the genuine tool span even when fetched after the audit event.
+        tool = _obs("t11", "Edit", parent=None, metadata={"attributes": {"tool_use_id": "tu-11"}})
+        gate_hook = _obs(
+            "h11",
+            "PreToolUse.sh",
+            parent=None,
+            metadata={"attributes": {"workflow.kind": "hook", "tool_use_id": "tu-11"}},
+        )
+        audit_hook = _obs(
+            "h11a",
+            "hook_execution_complete:PreToolUse",
+            type_="EVENT",
+            parent=None,
+            metadata={
+                "hook_event": "PreToolUse",
+                "hook_name": "PreToolUse:Edit",
+                "tool_use_id": "tu-11",
+            },
+        )
+        traces = [
+            ("trace-tool", [tool]),
+            ("trace-hook", [gate_hook]),
+            ("trace-audit", [audit_hook]),
+        ]
+
+        batch = build_batch(traces, SPOKE)
+
+        gate_copy = _by_orig(batch, "trace-hook", "h11")
+        assert gate_copy["body"]["parentObservationId"] == _copy_id("trace-tool", "t11")
+
     def test_ids_are_deterministic_across_runs(self) -> None:
         first = {event["id"] for event in build_batch(_traces(), SPOKE)}
 
