@@ -31,28 +31,54 @@
 #   export LANGFUSE_BASIC_AUTH="Basic $(printf 'pk-lf-…:sk-lf-…' | base64)"
 #   export BRIDGE_OTLP_ENDPOINT=http://host.docker.internal:4319   # the message-bridge sidecar
 #   docker run -d --name lf-collector --add-host=host.docker.internal:host-gateway \
-#     -p 4318:4318 -e LANGFUSE_OTLP_ENDPOINT -e LANGFUSE_BASIC_AUTH -e BRIDGE_OTLP_ENDPOINT \
+#     -p 4317:4317 -p 4318:4318 -p 4418:4418 -p 8889:8889 \
+#     -e LANGFUSE_OTLP_ENDPOINT -e LANGFUSE_BASIC_AUTH -e BRIDGE_OTLP_ENDPOINT \
 #     -v "$PWD/dashboard/langfuse/otelcol.yaml:/etc/otelcol-contrib/config.yaml" \
 #     otel/opentelemetry-collector-contrib:latest
+#   # 4317 normal OTLP gRPC (spoke traces+logs+metrics) · 4318 OTLP HTTP (compat +
+#   # bridge fork) · 4418 beta detailed-tracing HTTP · 8889 Prometheus scrape.
+#   # Metrics route to Prometheus, NOT Langfuse (issue #88).
 #
 # Run the message bridge on the host (it receives the forked traces+logs on :4319):
 #   LANGFUSE_BASIC_AUTH="$LANGFUSE_BASIC_AUTH" \
 #     python3 scripts/telemetry/langfuse_message_bridge.py
 #
-# Then point a spoke at it (the Issue #83 opt-in gate already wires the rest). The two
-# OTEL_LOG_RAW_API_BODIES / OTEL_LOGS_EXPORTER vars make Claude Code emit the LLM message
-# bodies on the logs signal the bridge consumes:
-#   AI_TOOLKIT_OTEL=1  OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
-#   ENABLE_BETA_TRACING_DETAILED=1  BETA_TRACING_ENDPOINT=http://localhost:4318 \
+# Then point a spoke at it (the Issue #83 opt-in gate already wires the rest, incl.
+# OTEL_EXPORTER_OTLP_PROTOCOL=grpc for the normal stream). The two OTEL_LOG_RAW_API_BODIES
+# / OTEL_LOGS_EXPORTER vars make Claude Code emit the LLM message bodies on the logs
+# signal the bridge consumes. The normal endpoint is the gRPC :4317; BETA_TRACING_ENDPOINT
+# is the separate beta HTTP port (:4418) — pointed at the normal endpoint it SILENTLY
+# kills all trace+log export (issue #88 footgun):
+#   AI_TOOLKIT_OTEL=1  OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+#   ENABLE_BETA_TRACING_DETAILED=1  BETA_TRACING_ENDPOINT=http://localhost:4418 \
 #   OTEL_LOG_USER_PROMPTS=1  OTEL_LOG_TOOL_DETAILS=1  OTEL_LOG_TOOL_CONTENT=1 \
 #   OTEL_LOGS_EXPORTER=otlp  OTEL_LOG_RAW_API_BODIES=1 \
 #     scripts/worktree-new.sh <issue> <slug>
 
 receivers:
+  # Normal OTLP stream — traces + logs + metrics. The spoke exports these over gRPC
+  # (:4317) because the beta detailed exporter is HTTP-only (see otlp/beta below):
+  # normal takes gRPC, beta takes HTTP — the arrangement proven to land
+  # response.model_output end-to-end in Langfuse (issue #88). The http :4318 listener
+  # is kept for backward compat — pre-#88 spokes export there and their logs feed the
+  # message-bridge fork. Downstream transforms are protocol-agnostic, so both land in
+  # the same pipeline.
   otlp:
     protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
       http:
         endpoint: 0.0.0.0:4318
+  # Beta detailed-tracing stream (ENABLE_BETA_TRACING_DETAILED, issue #88). Claude
+  # Code exports the detailed spans (response.model_output, system_reminders,
+  # new_context, per-tool hash) to BETA_TRACING_ENDPOINT over HTTP. It MUST hit a
+  # different host:port than the normal OTLP endpoint above, or it SILENTLY kills ALL
+  # trace+log export (metrics still flow). A dedicated HTTP port keeps it disjoint;
+  # it feeds the one Langfuse traces pipeline.
+  otlp/beta:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4418
 
 processors:
   batch: {}
@@ -85,6 +111,17 @@ processors:
           #    the OTel logs signal, which Langfuse trace ingestion does not read.
           - set(attributes["langfuse.observation.input"], attributes["user_prompt"]) where attributes["user_prompt"] != nil
           - set(attributes["langfuse.observation.input"], attributes["full_command"]) where attributes["full_command"] != nil
+          # 5) detailed tracing (ENABLE_BETA_TRACING_DETAILED, issue #88). The beta
+          #    stream carries the assistant output and per-turn context on span attrs:
+          #    response.model_output → the observation output (the LLM text the trace
+          #    signal otherwise lacks); new_context / system_reminders → metadata. The
+          #    langfuse.observation.metadata.* prefix surfaces them as filterable
+          #    top-level keys (a bare attr nests under metadata.attributes instead).
+          #    PII (user.email/id, account_uuid) rides these spans, so the detailed
+          #    stream stays operator opt-in, same as the content flags above.
+          - set(attributes["langfuse.observation.output"], attributes["response.model_output"]) where attributes["response.model_output"] != nil
+          - set(attributes["langfuse.observation.metadata.new_context"], attributes["new_context"]) where attributes["new_context"] != nil
+          - set(attributes["langfuse.observation.metadata.system_reminders"], attributes["system_reminders"]) where attributes["system_reminders"] != nil
       - context: spanevent
         statements:
           # Tool result/output lives on a span EVENT (TOOL_CONTENT); lift it onto the
@@ -106,14 +143,28 @@ exporters:
     compression: none
     tls:
       insecure: true
+  # Metrics sink (issue #88). The spoke's claude_code.token.usage (token-by-type,
+  # split by skill.name / agent.name / plugin.name) + cost.usage + active_time
+  # metrics flush here — Langfuse is NOT a metrics store, so they route to Prometheus
+  # (scrape http://localhost:8889/metrics), never to the Langfuse exporter. For a
+  # quick "are metrics flowing?" check, swap this for the `debug` exporter (console).
+  # PII (user.email/id) rides every datapoint; account_uuid is already forced off at
+  # the spoke (OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false).
+  prometheus:
+    endpoint: 0.0.0.0:8889
 
 service:
   pipelines:
     traces:
-      receivers: [otlp]
+      receivers: [otlp, otlp/beta]
       processors: [transform/langfuse, batch]
       exporters: [otlphttp/langfuse, otlphttp/bridge]
     # Raw API bodies arrive on the logs signal; the bridge is their only consumer.
     logs:
       receivers: [otlp]
       exporters: [otlphttp/bridge]
+    # Metrics arrive on the otlp receiver and route to the metrics sink, NOT Langfuse.
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]
