@@ -4,10 +4,12 @@
 Langfuse rolls *cost* and *latency* up onto container spans at render time, but it does NOT
 roll up the token breakdown. This standalone post-run script fills that gap: for one session
 (spoke run id) it walks every trace, builds the observation tree from ``parentObservationId``,
-and for each container observation (one that HAS children) sums the four token components over
+and for each container observation (one that HAS children) sums the token components over
 its whole subtree (itself + all descendants). The sum is patched back as
 ``metadata.rollup = {reused, written, input, output}`` via the Langfuse ingestion API, where
-``reused`` is ``cache_read_input_tokens`` and ``written`` is ``cache_creation_input_tokens``.
+``reused`` is ``cache_read_input_tokens`` and ``written`` is the total cache writes across
+both ephemeral TTL tiers (``cache_creation_input_tokens`` 5m + ``input_cache_creation_1h`` 1h,
+Issue #97).
 
 Leaf tools (Bash, Read, ...) make no API call, so their subtree sums to zero -- correct.
 Containers (``interaction`` / ``tool:Workflow`` / sub-agent) get their subtree totals. The
@@ -46,8 +48,16 @@ _INGEST_TIMESTAMP = "2026-01-01T00:00:00Z"
 # Max page size the Langfuse observations endpoint accepts.
 _PAGE_LIMIT = 100
 
-# The four token components Claude Code reports per ``llm_request`` generation, summed bottom-up.
-_COMPONENTS = ("input", "output", "cache_read_input_tokens", "cache_creation_input_tokens")
+# The token components summed bottom-up per ``llm_request`` generation. Cache writes split
+# by ephemeral TTL (Issue #97): ``cache_creation_input_tokens`` is the 5m tier (1.25x input)
+# and ``input_cache_creation_1h`` the 1h tier (2x); ``written`` below totals both.
+_COMPONENTS = (
+    "input",
+    "output",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "input_cache_creation_1h",
+)
 
 Observation = dict[str, Any]
 TokenTotals = dict[str, int]
@@ -127,7 +137,9 @@ def rollup_event(observation: Observation, totals: TokenTotals) -> dict[str, Any
             "metadata": {
                 "rollup": {
                     "reused": totals["cache_read_input_tokens"],
-                    "written": totals["cache_creation_input_tokens"],
+                    # Total cache writes across both TTL tiers (Issue #97).
+                    "written": totals["cache_creation_input_tokens"]
+                    + totals.get("input_cache_creation_1h", 0),
                     "input": totals["input"],
                     "output": totals["output"],
                 }

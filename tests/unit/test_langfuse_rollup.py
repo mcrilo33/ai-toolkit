@@ -125,6 +125,7 @@ def test_subtree_of_leaf_generation_is_its_own_usage() -> None:
         "output": 2,
         "cache_read_input_tokens": 1,
         "cache_creation_input_tokens": 5,
+        "input_cache_creation_1h": 0,
     }
 
 

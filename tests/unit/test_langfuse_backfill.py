@@ -56,6 +56,10 @@ def _turn(**kw: Any) -> dict:
         "tokens_out": 200,
         "cache_read": 500,
         "cache_creation": 300,
+        # Consistent split (Issue #97): 5m + 1h == cache_creation, as session_parser
+        # guarantees. Default to all-5m; the TTL-split test overrides both tiers.
+        "cache_creation_5m": 300,
+        "cache_creation_1h": 0,
         "cost_usd": 0.10,
         "reasoning": "weighing the reuse",
     }
