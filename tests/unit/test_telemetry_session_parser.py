@@ -1009,6 +1009,33 @@ class TestThinkingExtraction:
         assert "SECRET_THINKING" not in str(parsed.spans)
         assert "SECRET_THINKING" not in str(parsed.reasoning_refs)
 
+    def test_walks_thinking_from_a_subagent_transcript(self, tmp_path: Path) -> None:
+        # The walk reaches sub-agent transcripts under ``<stem>/``: a thinking body in a
+        # sub-agent turn is keyed by that turn's (globally unique) uuid, not the main one.
+        main = tmp_path / "s.jsonl"
+        main.write_text(json.dumps(_assistant_thinking("m1", "MAIN_THINK")), encoding="utf-8")
+        sub = tmp_path / "s" / "subagents" / "agent-x.jsonl"
+        sub.parent.mkdir(parents=True)
+        sub.write_text(json.dumps(_assistant_thinking("s1", "SUB_THINK")), encoding="utf-8")
+
+        thinking = thinking_by_turn(main)
+
+        assert thinking == {"m1": "MAIN_THINK", "s1": "SUB_THINK"}
+
+
+def _assistant_thinking(uuid: str, thinking: str) -> dict:
+    return {
+        "type": "assistant",
+        "sessionId": "think-sess",
+        "timestamp": "2026-06-15T12:00:01.000Z",
+        "uuid": uuid,
+        "message": {
+            "role": "assistant",
+            "model": "claude-opus-4-8",
+            "content": [{"type": "thinking", "thinking": thinking}],
+        },
+    }
+
 
 def _assistant_bash(uuid: str, ts: str, tool_id: str, command: str) -> dict:
     return {
