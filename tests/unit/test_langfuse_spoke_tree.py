@@ -41,7 +41,11 @@ from telemetry.langfuse_spoke_tree import (
     trace_id_for,
     transcript_scan_root,
 )
-from telemetry.request_body import ContextDelta
+from telemetry.request_body import (
+    ContextDelta,
+    decompose_request_body,
+    measure_request_items,
+)
 from telemetry.session_parser import project_dir_for_worktree
 
 SPOKE = "feature/22-demo+1700000000"
@@ -1217,32 +1221,28 @@ class TestLlmDecompositionEvents:
 
     def test_warm_turn_puts_newest_message_in_cache_creation(self, tmp_path: Path) -> None:
         # Arrange: a warm call — the stable prefix is read, only the newest message is written.
-        # read covers tools+system+messages[0]; creation is just the newest message's tokens.
-        obj = self._obj()
-        bodies = self._bodies_dir(tmp_path, obj)
-        items_len_newest = len(
-            json.dumps(
-                {"role": "assistant", "content": obj["messages"][1]["content"]},
-                ensure_ascii=False,
-                sort_keys=True,
-            )
+        # Size read to cover every item except the newest (the last in request order), and
+        # creation to exactly that newest message, so cumulative-fit routes it to cache_creation.
+        bodies = self._bodies_dir(tmp_path, self._obj())
+        rows = measure_request_items(
+            decompose_request_body(bodies / "00-body.request.json"), counter=len, price=1.0
         )
-        # read = everything except the newest message; creation = the newest message.
-        read = sum(len(x) for x in ("sys",)) + 999  # generous read budget for the prefix
-        gen = self._gen("g1", "2026-01-02T00:00:00Z", read=read, creation=items_len_newest)
+        newest = next(r for r in rows if r["name"] == "msg[1]:assistant")
+        read = sum(int(r["tokens"]) for r in rows) - int(newest["tokens"])
+        gen = self._gen("g1", "2026-01-02T00:00:00Z", read=read, creation=int(newest["tokens"]))
 
         # Act
         events = self._build([("tr", [gen])], bodies)
 
-        # Assert: the newest message item lands under cache_creation -> messages.
+        # Assert: the newest message item lands under the cache_creation -> messages subtree.
         creation = self._bucket(events, "cache_creation")
-        creation_subtree_names = {
+        component_ids = {c["body"]["id"] for c in self._children(events, creation["body"]["id"])}
+        creation_item_names = {
             e["body"]["name"]
             for e in events
-            if e["body"].get("parentObservationId")
-            in {c["body"]["id"] for c in self._children(events, creation["body"]["id"])}
+            if e["body"].get("parentObservationId") in component_ids
         }
-        assert any("msg[1]:assistant" in name for name in creation_subtree_names)
+        assert any("msg[1]:assistant" in name for name in creation_item_names)
 
     def test_each_bucket_items_plus_remainder_sum_to_the_observed_counter(
         self, tmp_path: Path
