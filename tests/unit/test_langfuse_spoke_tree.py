@@ -29,9 +29,9 @@ from telemetry.langfuse_spoke_tree import (
     _TRUNCATION_MARKER,
     ToolContent,
     _copy_id,
+    apply_llm_decomposition,
     build_batch,
     build_context_evolution_events,
-    build_llm_decomposition_events,
     build_loaded_context_events,
     build_step_windows,
     context_evolution_deltas,
@@ -1624,8 +1624,10 @@ class TestContextEvolutionDeltas:
         assert [turn for turn, _delta in deltas] == [2]
 
 
-class TestLlmDecompositionEvents:
-    """#99: per-llm_request cache_read/cache_creation decomposition attached to each call."""
+class TestLlmDecompositionMetadata:
+    """#100 part 3: the #99 cache_read/cache_creation decomposition is folded onto each
+    llm_request copy as metadata (per-component -> per-item, reconciled), NOT nested nodes.
+    """
 
     _TOOL = {"name": "Bash", "description": "d" * 40, "input_schema": {"type": "object"}}
 
@@ -1661,56 +1663,39 @@ class TestLlmDecompositionEvents:
             },
         )
 
-    def _build(self, traces, bodies: Path) -> list[dict]:
-        return build_llm_decomposition_events(
-            traces, bodies, SPOKE, counter=len, price=1.0, base_ts="2026-01-01T00:00:00Z"
-        )
+    def _decompose(self, traces, bodies: Path) -> tuple[list[dict], int]:
+        batch = build_batch(traces, SPOKE)
+        count = apply_llm_decomposition(batch, traces, bodies, counter=len, price=1.0)
+        return batch, count
 
-    def _bucket(self, events: list[dict], prefix: str) -> dict:
-        return next(e for e in events if e["body"]["name"].startswith(prefix))
+    def _meta(self, batch: list[dict], orig_trace: str, obs_id: str) -> dict:
+        return _by_orig(batch, orig_trace, obs_id)["body"].get("metadata", {})
 
-    def _children(self, events: list[dict], parent_id: str) -> list[dict]:
-        return [e for e in events if e["body"].get("parentObservationId") == parent_id]
-
-    def test_buckets_parent_under_the_llm_request_copy(self, tmp_path: Path) -> None:
-        # Arrange: one llm_request and its aligned request body.
+    def test_decomposition_is_metadata_not_nodes(self, tmp_path: Path) -> None:
         bodies = self._bodies_dir(tmp_path, self._obj())
         gen = self._gen("g1", "2026-01-02T00:00:00Z", read=30, creation=10)
 
-        # Act
-        events = self._build([("tr", [gen])], bodies)
+        batch, count = self._decompose([("tr", [gen])], bodies)
 
-        # Assert: both cache buckets hang under the copy of the llm_request observation.
-        copy_id = _copy_id("tr", "g1")
-        parents = {
-            e["body"]["parentObservationId"]
-            for e in events
-            if e["body"]["name"].startswith(("cache_read", "cache_creation"))
-        }
-        assert parents == {copy_id}
+        # No decomposition NODES are added — only the trace, root, and the single llm_request copy.
+        assert count == 1
+        assert len(batch) == 3
+        meta = self._meta(batch, "tr", "g1")
+        assert set(meta) >= {"cache_read", "cache_creation"}
+        assert isinstance(meta["cache_read"]["components"], dict)
 
     def test_cold_turn_puts_everything_in_cache_creation(self, tmp_path: Path) -> None:
-        # Arrange: a cold call (read=0) — nothing was reused, the whole prefix is written.
         bodies = self._bodies_dir(tmp_path, self._obj())
         gen = self._gen("g1", "2026-01-02T00:00:00Z", read=0, creation=5000)
 
-        # Act
-        events = self._build([("tr", [gen])], bodies)
+        batch, _ = self._decompose([("tr", [gen])], bodies)
 
-        # Assert: cache_read holds only its remainder; cache_creation carries the components.
-        read = self._bucket(events, "cache_read")
-        read_children = self._children(events, read["body"]["id"])
-        assert all("remainder" in c["body"]["name"] for c in read_children)
-        creation = self._bucket(events, "cache_creation")
-        creation_children = {
-            c["body"]["name"] for c in self._children(events, creation["body"]["id"])
-        }
-        assert "tools" in creation_children
+        meta = self._meta(batch, "tr", "g1")
+        assert meta["cache_read"]["components"] == {}  # nothing reused
+        assert "tools" in meta["cache_creation"]["components"]
 
     def test_warm_turn_puts_newest_message_in_cache_creation(self, tmp_path: Path) -> None:
-        # Arrange: a warm call — the stable prefix is read, only the newest message is written.
-        # Size read to cover every item except the newest (the last in request order), and
-        # creation to exactly that newest message, so cumulative-fit routes it to cache_creation.
+        # Size read to cover every item except the newest message; creation takes exactly it.
         bodies = self._bodies_dir(tmp_path, self._obj())
         rows = measure_request_items(
             decompose_request_body(bodies / "00-body.request.json"), counter=len, price=1.0
@@ -1719,44 +1704,31 @@ class TestLlmDecompositionEvents:
         read = sum(int(r["tokens"]) for r in rows) - int(newest["tokens"])  # type: ignore[arg-type, call-overload]
         gen = self._gen("g1", "2026-01-02T00:00:00Z", read=read, creation=int(newest["tokens"]))  # type: ignore[arg-type]
 
-        # Act
-        events = self._build([("tr", [gen])], bodies)
+        batch, _ = self._decompose([("tr", [gen])], bodies)
 
-        # Assert: the newest message item lands under the cache_creation -> messages subtree.
-        creation = self._bucket(events, "cache_creation")
-        component_ids = {c["body"]["id"] for c in self._children(events, creation["body"]["id"])}
-        creation_item_names = {
-            e["body"]["name"]
-            for e in events
-            if e["body"].get("parentObservationId") in component_ids
-        }
-        assert any("msg[1]:assistant" in name for name in creation_item_names)
+        creation = self._meta(batch, "tr", "g1")["cache_creation"]
+        assert "msg[1]:assistant" in creation["components"].get("messages", {})
 
-    def test_each_bucket_items_plus_remainder_sum_to_the_observed_counter(
-        self, tmp_path: Path
-    ) -> None:
-        # Arrange: generous read budget so all items fall in cache_read; creation gets none.
+    def test_each_bucket_reconciles_observed_measured_remainder(self, tmp_path: Path) -> None:
         bodies = self._bodies_dir(tmp_path, self._obj())
         gen = self._gen("g1", "2026-01-02T00:00:00Z", read=100000, creation=7)
 
-        # Act
-        events = self._build([("tr", [gen])], bodies)
+        batch, _ = self._decompose([("tr", [gen])], bodies)
 
-        # Assert: measured + remainder == observed for the cache_read bucket.
-        read = self._bucket(events, "cache_read")
-        remainder = next(
-            e
-            for e in self._children(events, read["body"]["id"])
-            if "remainder" in e["body"]["name"]
-        )
-        measured = int(read["body"]["metadata"]["measured_tokens"])
-        assert measured + int(remainder["body"]["metadata"]["tokens"]) == 100000
+        read = self._meta(batch, "tr", "g1")["cache_read"]
+        assert read["observed"] == 100000
+        assert read["measured"] + read["remainder"] == read["observed"]
+        # per-item token counts live under components[category][name]
+        item_sum = sum(tok for comp in read["components"].values() for tok in comp.values())
+        assert item_sum == read["measured"]
 
     def test_count_mismatch_skips_decomposition(self, tmp_path: Path) -> None:
-        # Arrange: two bodies but a single llm_request — positional alignment is unsafe.
+        # Two bodies but a single llm_request — positional alignment is unsafe → no metadata.
         bodies = self._bodies_dir(tmp_path, self._obj())
         self._write(bodies, 1, self._obj())
         gen = self._gen("g1", "2026-01-02T00:00:00Z", read=30, creation=10)
 
-        # Act / Assert: no decomposition emitted rather than a misaligned one.
-        assert self._build([("tr", [gen])], bodies) == []
+        batch, count = self._decompose([("tr", [gen])], bodies)
+
+        assert count == 0
+        assert "cache_read" not in self._meta(batch, "tr", "g1")
