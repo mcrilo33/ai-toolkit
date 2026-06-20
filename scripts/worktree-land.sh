@@ -167,6 +167,13 @@ ISSUE="${BSLUG%%-*}"
 # between hub and spoke worktrees, so a marker the spoke set is visible here.
 # Exempt: --local micro-spokes (never push, no marker), ad-hoc/non-numbered
 # branches (their one push IS completion), and --force-land (explicit override).
+#
+# GATED_TREE records that we can PROVE the branch tip was already test-gated: the
+# marker sits at the tip (==this verified completion) and the upstream guards above
+# confirmed tip == pushed upstream (ahead==0 && behind==0), so the spoke's push ran
+# the gate on exactly this tree. It licenses the clean-FF gate skip below (#96);
+# without a marker (--local/--force-land/ad-hoc) we make no such claim.
+GATED_TREE=""
 if [ -z "$LOCAL" ] && [ -z "$FORCE_LAND" ] && [ -n "$ISSUE" ]; then
   MARKER="ready/${ISSUE}"
   MARKER_SHA="$(git rev-parse -q --verify "refs/tags/${MARKER}^{commit}" 2>/dev/null || true)"
@@ -176,6 +183,7 @@ if [ -z "$LOCAL" ] && [ -z "$FORCE_LAND" ] && [ -n "$ISSUE" ]; then
   elif [ "$MARKER_SHA" != "$TIP_SHA" ]; then
     wt_die "${MARKER} marker is stale (points at ${MARKER_SHA:0:9}, branch tip is ${TIP_SHA:0:9}) — the spoke pushed more work after signalling complete. Re-tag at the tip on the spoke (git tag -f ${MARKER} && git push -f origin ${MARKER}), or pass --force-land."
   fi
+  GATED_TREE=1
 fi
 
 # --- merge ----------------------------------------------------------------------
@@ -187,12 +195,28 @@ if ! git merge --no-edit "$WT_BRANCH"; then
 fi
 MERGED_SHA="$(git rev-parse HEAD)"
 
+# --- skip the redundant gate on a clean fast-forward land (issue #96) -------------
+# A clean fast-forward leaves HEAD identical to the branch tip the spoke already
+# gated on its push (GATED_TREE: marker == tip == upstream), so re-running the
+# pre-push suite re-tests an identical tree — the dominant cost of a land whenever
+# the diff escalates test-select to the full suite. A diverged merge instead builds
+# a NEW merge commit (HEAD != branch tip) whose combined tree was never tested as a
+# unit, so its gate must still run. Explicit --skip-tests / --test-cmd already own
+# the gate decision; LAND_FORCE_GATE=1 is the escape hatch to force it back on.
+AUTO_SKIP=""
+if [ -z "$SKIP_TESTS" ] && [ -z "$TEST_CMD" ] && [ -z "${LAND_FORCE_GATE:-}" ] \
+   && [ -n "$GATED_TREE" ] && [ "$MERGED_SHA" = "$(git rev-parse "refs/heads/$WT_BRANCH")" ]; then
+  AUTO_SKIP=1
+fi
+
 # --- ship: push main; the pre-push hook is the single test gate (issue #19) -------
 # --skip-tests / --test-cmd are threaded to the hook via TEST_SELECT_*, so the
 # hook stays the single executor. A rejected push — the gate failing, or a remote
 # refusal — rolls the merge back, so a failed land always leaves a clean hub.
 if [ -n "$SKIP_TESTS" ]; then
   SUITE_RESULT="skipped (--skip-tests)"
+elif [ -n "$AUTO_SKIP" ]; then
+  SUITE_RESULT="skipped (clean fast-forward of an already-gated tree, issue #96)"
 elif [ -n "$TEST_CMD" ]; then
   SUITE_RESULT="via pre-push hook (--test-cmd: $TEST_CMD)"
 else
@@ -201,7 +225,7 @@ fi
 # The pre-push hook IS the test gate (issue #19). If it is not installed here,
 # the push runs NOTHING — warn so a green land is never mistaken for a tested
 # one, and report it honestly rather than claiming the gate ran.
-if [ -z "$SKIP_TESTS" ]; then
+if [ -z "$SKIP_TESTS" ] && [ -z "$AUTO_SKIP" ]; then
   PREPUSH_HOOK="$(git rev-parse --git-path hooks/pre-push 2>/dev/null || true)"
   if [ -z "$PREPUSH_HOOK" ] || [ ! -x "$PREPUSH_HOOK" ]; then
     wt_warn "no executable pre-push hook here — the test gate will NOT run on this push; install it with scripts/install-git-hooks.sh"
@@ -210,7 +234,7 @@ if [ -z "$SKIP_TESTS" ]; then
 fi
 echo "→ pushing $DEFAULT to origin (the pre-push hook runs the test gate)"
 if ! (
-  if [ -n "$SKIP_TESTS" ]; then export TEST_SELECT_SKIP=1; fi
+  if [ -n "$SKIP_TESTS" ] || [ -n "$AUTO_SKIP" ]; then export TEST_SELECT_SKIP=1; fi
   if [ -n "$TEST_CMD" ]; then export TEST_SELECT_CMD="$TEST_CMD"; fi
   git push origin "$DEFAULT"
 ); then
