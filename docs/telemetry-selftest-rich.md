@@ -1,0 +1,1 @@
+- rich telemetry self-test 2026-06-20
