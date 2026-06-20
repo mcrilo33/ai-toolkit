@@ -94,6 +94,7 @@ def _run_land(
     gh_exit: int = 0,
     tmux_windows: str = "",
     spoke_marker: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess, dict[str, Path]]:
     """Run worktree-land.sh from the hub with logging stubs on PATH.
 
@@ -125,6 +126,8 @@ def _run_land(
     env.pop("WT_SPOKE", None)
     if spoke_marker is not None:
         env["WT_SPOKE"] = spoke_marker
+    if extra_env:
+        env.update(extra_env)
     proc = subprocess.run(
         ["bash", str(WORKTREE_LAND), *args],
         cwd=str(hub),
@@ -466,8 +469,13 @@ def test_local_micro_spoke_exempt_from_marker(hub: Path, tmp_path: Path) -> None
 
 def test_default_land_runs_no_land_side_pytest(hub: Path, tmp_path: Path) -> None:
     # Landing no longer runs the suite itself; the pre-push hook tests once on the
-    # main push. With no hook installed here, the push just succeeds.
+    # main push. A diverged merge takes the gate path (a clean-FF land instead
+    # auto-skips it — see test_clean_ff_land_skips_redundant_gate), and with no
+    # hook installed here the land honestly warns that the gate did not run.
     _make_spoke(hub, tmp_path, "feature/1-nopytest", push=True)
+    (hub / "hub-only.txt").write_text("hub moved on\n")
+    _git(hub, "add", "hub-only.txt")
+    _git(hub, "commit", "-qm", "chore: hub work", "-m", "Refs #0")
 
     proc, logs = _run_land(hub, tmp_path, "1")
 
@@ -475,6 +483,71 @@ def test_default_land_runs_no_land_side_pytest(hub: Path, tmp_path: Path) -> Non
     assert _log_text(logs["pytest"]) == ""  # land never invoked pytest itself
     assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
     assert "test gate will NOT run" in proc.stderr  # honest about the absent hook
+
+
+# --- skip the redundant gate on a clean fast-forward land (issue #96) ------------
+# A clean-FF land of an already-gated branch re-tests an identical tree: the spoke
+# already ran the gate on its push (ready/N marker == tip == upstream). Thread
+# TEST_SELECT_SKIP=1 in that case only; any diverged/merge-commit land — whose
+# combined tree was never tested as a unit — still runs the full gate.
+
+
+def test_clean_ff_land_skips_redundant_gate(hub: Path, tmp_path: Path) -> None:
+    # Clean fast-forward (nothing landed since the branch's base) of a branch whose
+    # ready/1 marker sits at the tip → the merged tree is identical to the already-
+    # gated tip, so the gate is skipped by threading TEST_SELECT_SKIP=1 to the push.
+    _make_spoke(hub, tmp_path, "feature/1-ffskip", push=True, ready=True)
+    env_log = tmp_path / "prepush-env.log"
+    _install_prepush_stub(hub, exit_code=0, env_log=env_log)
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "TEST_SELECT_SKIP=1" in _log_text(env_log)
+    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
+
+
+def test_diverged_merge_still_runs_gate(hub: Path, tmp_path: Path) -> None:
+    # main gained a commit since the branch's base, so landing creates a merge
+    # commit whose combined tree was never tested as a unit — the gate MUST still
+    # run (no TEST_SELECT_SKIP threaded), even though the branch carries a marker.
+    _make_spoke(hub, tmp_path, "feature/1-divgate", push=True, ready=True)
+    (hub / "hub-only.txt").write_text("hub moved on\n")
+    _git(hub, "add", "hub-only.txt")
+    _git(hub, "commit", "-qm", "chore: hub work", "-m", "Refs #0")
+    env_log = tmp_path / "prepush-env.log"
+    _install_prepush_stub(hub, exit_code=0, env_log=env_log)
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "TEST_SELECT_SKIP" not in _log_text(env_log)
+
+
+def test_force_gate_env_overrides_ff_skip(hub: Path, tmp_path: Path) -> None:
+    # LAND_FORCE_GATE=1 is the escape hatch: run the full gate even on a clean-FF
+    # already-gated land, for when the redundant run is wanted anyway.
+    _make_spoke(hub, tmp_path, "feature/1-forcegate", push=True, ready=True)
+    env_log = tmp_path / "prepush-env.log"
+    _install_prepush_stub(hub, exit_code=0, env_log=env_log)
+
+    proc, _ = _run_land(hub, tmp_path, "1", extra_env={"LAND_FORCE_GATE": "1"})
+
+    assert proc.returncode == 0, proc.stderr
+    assert "TEST_SELECT_SKIP" not in _log_text(env_log)
+
+
+def test_force_land_without_marker_still_runs_ff_gate(hub: Path, tmp_path: Path) -> None:
+    # --force-land lands a markerless branch: without a marker we cannot prove the
+    # tip was gated, so even a clean FF must still run the gate (no auto-skip).
+    _make_spoke(hub, tmp_path, "feature/1-forcedff", push=True, ready=False)
+    env_log = tmp_path / "prepush-env.log"
+    _install_prepush_stub(hub, exit_code=0, env_log=env_log)
+
+    proc, _ = _run_land(hub, tmp_path, "1", "--force-land")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "TEST_SELECT_SKIP" not in _log_text(env_log)
 
 
 def test_push_gate_failure_rolls_back(hub: Path, tmp_path: Path) -> None:
