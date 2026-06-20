@@ -506,6 +506,35 @@ def test_oversized_body_ref_skips_without_crashing(tmp_path: Path) -> None:
     assert bridge.pending_count() == 0
 
 
+def test_non_utf8_body_ref_does_not_crash_the_batch(tmp_path: Path) -> None:
+    # Arrange: a body_ref with invalid UTF-8 bytes must not raise (UnicodeDecodeError is a
+    # ValueError, not OSError) and abort the rest of the batch -- the record is skipped, the
+    # following audit record in the same batch still processes.
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+    ref = tmp_path / "binary.request.json"
+    ref.write_bytes(b"\xff\xfe\x00 not valid utf-8")
+
+    # Act: must not raise.
+    bridge.on_logs(
+        _audit_log_payload(
+            {"spoke_run_id": "spoke-1"},
+            _attrs(
+                **{
+                    "event.name": "api_request_body",
+                    "event.sequence": "30",
+                    "body_ref": str(ref),
+                }
+            ),
+            _attrs(**{"event.name": "compaction", "event.sequence": "31"}),
+        )
+    )
+
+    # Assert: the binary body produced no input patch, but the audit event still went through.
+    assert patch.calls == []
+    assert [event["type"] for event in create.batches[0]] == ["trace-create", "event-create"]
+
+
 # --- audit/event layer: CREATE observations onto the spoke audit trace -------
 
 

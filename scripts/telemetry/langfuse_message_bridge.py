@@ -203,7 +203,9 @@ def _read_body(record_attrs: list[dict[str, Any]]) -> str | None:
         if not os.path.isfile(ref) or os.path.getsize(ref) > _MAX_BODY_REF_BYTES:
             logger.warning("skipping body_ref (missing, non-file, or too large): %s", ref)
             return None
-        with open(ref, encoding="utf-8") as f:
+        # errors="replace": a non-UTF-8 byte must not raise UnicodeDecodeError (a ValueError,
+        # not OSError) and abort the whole log batch; downstream JSON parsing is already tolerant.
+        with open(ref, encoding="utf-8", errors="replace") as f:
             return f.read()
     except OSError as e:
         logger.warning("body_ref read failed %s: %s", ref, e)
