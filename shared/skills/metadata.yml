@@ -14,6 +14,12 @@ solo-cycle:
   allowed-tools: "run_in_terminal get_changed_files read_file grep_search get_errors"
   argument-hint: "[subtask description or issue number]"
 
+quick:
+  name: "quick"
+  description: "Express-interactive lane: build a small fix conversationally from the hub session on its own branch/worktree, keeping push-time gates (lint/typecheck/tests) but dropping spoke ceremony — no issue, no source-task, no tmux session, no PLAN gate, no RED-first, no review artifact. Use when the user says /quick <slug> or wants a quick interactive fix without a full cycle."
+  allowed-tools: "run_in_terminal get_changed_files read_file grep_search get_errors"
+  argument-hint: "[slug]"
+
 brainstorming:
   name: "brainstorming"
   description: "Refine a rough idea into an agreed spec before any code is written — Socratic clarification, alternatives, and sign-off. Use at the start of DEFINE when a request is ambiguous or open-ended, or when the user says 'brainstorm', 'help me design', or 'I'm thinking about'."
