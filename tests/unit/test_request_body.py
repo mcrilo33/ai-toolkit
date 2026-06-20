@@ -27,6 +27,7 @@ from telemetry.request_body import (
     CacheBoundary,
     ContextDelta,
     ContextItem,
+    decompose_request_obj,
     diff_snapshots,
     first_real_request,
     measure_request_items,
@@ -423,3 +424,89 @@ def test_context_delta_is_frozen_dataclass() -> None:
     # Assert: the contract is an immutable container.
     with pytest.raises(AttributeError):
         delta.net_tokens = 5  # type: ignore[misc]
+
+
+# --- full-body decomposition itemizer (Issue #99) -----------------------------
+
+
+def _reminder(*lines: str) -> str:
+    """Wrap lines in a single ``<system-reminder>`` block."""
+    return "<system-reminder>\n" + "\n".join(lines) + "\n</system-reminder>"
+
+
+def test_decompose_splits_rules_block_per_rule_file() -> None:
+    # Arrange: a rules+memory+env reminder carrying two rule files plus env headers.
+    block = _reminder(
+        "# claudeMd",
+        "Contents of /repo/.claude/rules/code-quality.md:",
+        "quality body",
+        "Contents of /repo/.claude/rules/python-style.md:",
+        "style body",
+        "# currentDate",
+        "Today's date is 2026-06-20.",
+    )
+    obj = _body([], [], [_msg("user", block)])
+
+    # Act
+    items = decompose_request_obj(obj)
+
+    # Assert: one ``rules`` item per file, named by basename.
+    rule_names = {item.name for item in items if item.category == "rules"}
+    assert rule_names == {"code-quality.md", "python-style.md"}
+
+
+def test_decompose_splits_skills_block_per_skill() -> None:
+    # Arrange: a skills reminder listing two skills.
+    block = _reminder(
+        "The following skills are available for use with the Skill tool:",
+        "- afk: Drain the backlog unattended.",
+        "- hub: Orient a fresh planning-hub session.",
+    )
+    obj = _body([], [], [_msg("user", block)])
+
+    # Act
+    items = decompose_request_obj(obj)
+
+    # Assert: one ``skills`` item per skill, named by the skill name.
+    skill_names = {item.name for item in items if item.category == "skills"}
+    assert skill_names == {"afk", "hub"}
+
+
+def test_decompose_itemizes_every_message_not_just_the_first() -> None:
+    # Arrange: a multi-message conversation (the #87 parser only reads messages[0]).
+    obj = _body(
+        [_tool("Bash")],
+        ["sys"],
+        [_msg("user", "hi"), _msg("assistant", "reply"), _msg("user", "newest")],
+    )
+
+    # Act
+    items = decompose_request_obj(obj)
+
+    # Assert: messages[1:] each become their own ``messages`` item, named by index.
+    message_names = [item.name for item in items if item.category == "messages"]
+    assert message_names == ["msg[1]:assistant", "msg[2]:user"]
+
+
+def test_decompose_marks_messages_after_last_marker_uncached() -> None:
+    # Arrange: the cache_control marker sits on messages[1]; the newest message follows it.
+    m0 = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": _reminder("# claudeMd", "Contents of /r/CLAUDE.md:", "x")}
+        ],
+    }
+    m1 = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "reply", "cache_control": {"type": "ephemeral"}}],
+    }
+    m2 = {"role": "user", "content": [{"type": "text", "text": "newest"}]}
+    obj = {"tools": [], "system": [], "messages": [m0, m1, m2]}
+
+    # Act
+    items = decompose_request_obj(obj)
+    by_name = {item.name: item for item in items}
+
+    # Assert: the message at the marker is cached; the one after it is not (cache_creation).
+    assert by_name["msg[1]:assistant"].cached is True
+    assert by_name["msg[2]:user"].cached is False
