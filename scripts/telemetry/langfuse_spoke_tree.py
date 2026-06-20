@@ -2,8 +2,9 @@
 """Assemble a spoke's existing rich Langfuse observations into one nested trace.
 
 Natively, each turn Claude Code runs lands as its own flat Langfuse trace, and the
-marker (``step:``/``lifecycle:``/``spoke-push``) and hook (``*.sh``) emissions land as
-yet more flat traces. Every one of those observations already carries the rich fields we
+marker (``lifecycle:``/``spoke-push``) and hook (``*.sh``) emissions land as
+yet more flat traces (cycle ``step:`` nodes are no longer emitted — they are synthesized from
+the todo ledger, see :func:`build_step_windows`). Every one of those observations already carries the rich fields we
 built — ``usageDetails``, ``costDetails``, ``input``/``output`` messages, ``metadata``
 (including ``rollup`` and, on hooks, ``hook_event``/``tool_name``/``tool_use_id``/
 ``decision``/``duration_ms``), ``name``, ``type``, and ``startTime``/``endTime``. A spoke
@@ -436,8 +437,14 @@ def _fold_tool_subspans(
     owning ``tool:`` node's metadata and the sub-span copy is removed. A sub-span whose tool is
     absent (an unmatched audit event) is left as-is — it keeps its node and collapses to the root.
 
+    A folded sub-span can itself have children — a resume ``claude_code.interaction`` nests under
+    the push command's ``tool.execution`` via TRACEPARENT — so any node parented on a folded
+    sub-span is re-homed onto the fold owner (the tool) before the sub-span is dropped, so its
+    subtree (and its tokens in the container rollups) survives rather than dangling on a deleted id.
+
     Args:
-        copies: The source observation copies; owner tool bodies are mutated in place.
+        copies: The source observation copies; owner tool bodies and orphaned children's parents
+            are mutated in place.
         traces: The source traces (to walk every sub-span and resolve its owner).
         tool_index: Tool-call-id to tool-copy-id map from :func:`_build_tool_index`.
 
@@ -451,7 +458,7 @@ def _fold_tool_subspans(
         for observation in observations
         if _is_tool_span(observation)
     }
-    folded: set[str] = set()
+    reparent: dict[str, str] = {}  # folded sub-span copy id -> its fold owner (the tool)
     for orig_trace_id, observations in traces:
         for observation in observations:
             if not _is_fold_subspan(observation):
@@ -462,8 +469,16 @@ def _fold_tool_subspans(
             attrs = _fold_attrs(observation)
             if attrs:
                 by_id[owner]["body"].setdefault("metadata", {}).update(attrs)
-            folded.add(_copy_id(orig_trace_id, observation["id"]))
-    return [event for event in copies if event["body"]["id"] not in folded]
+            reparent[_copy_id(orig_trace_id, observation["id"])] = owner
+    for event in copies:
+        if event["body"]["id"] in reparent:
+            continue  # this node is itself being dropped
+        parent = event["body"].get("parentObservationId")
+        if parent in reparent:
+            while parent in reparent:  # resolve through any chain of folded ancestors
+                parent = reparent[parent]
+            event["body"]["parentObservationId"] = parent
+    return [event for event in copies if event["body"]["id"] not in reparent]
 
 
 def _build_tool_index(traces: list[TraceObservations]) -> dict[str, str]:

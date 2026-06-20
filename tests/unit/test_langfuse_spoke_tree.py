@@ -591,6 +591,37 @@ class TestToolSubspanFolding:
             SPOKE
         )
 
+    def test_child_of_a_folded_subspan_is_rehomed_onto_the_tool(self) -> None:
+        # A resume interaction nests under the tool.execution via TRACEPARENT; when the execution
+        # folds away, the resume (and its tokens) must re-home onto the tool, not dangle.
+        tool = _obs(
+            "tb", "tool:Bash", parent=None, metadata={"attributes": {"tool_use_id": "tu-1"}}
+        )
+        execu = _obs(
+            "ex",
+            "claude_code.tool.execution",
+            parent="tb",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:01Z",
+            metadata={"attributes": {"tool_use_id": "tu-1", "success": True}},
+        )
+        resume = _obs(
+            "g1",
+            "llm_request",
+            type_="GENERATION",
+            parent="ex",
+            usageDetails={"cache_read_input_tokens": 100, "cache_creation_input_tokens": 20},
+        )
+
+        batch = build_batch([("tr", [tool, execu, resume])], SPOKE)
+
+        assert self._dropped(batch, "tr", "ex")  # the execution sub-span folded away
+        tool_copy = _by_orig(batch, "tr", "tb")
+        # the resume re-homes onto the tool (not the deleted execution id)...
+        assert _by_orig(batch, "tr", "g1")["body"]["parentObservationId"] == tool_copy["id"]
+        # ...so its tokens still roll up under the tool container.
+        assert tool_copy["body"]["metadata"]["rollup"]["reused"] == 100
+
 
 class TestContainerRollups:
     """Every container node (and the synthetic root) carries a subtree token rollup."""
