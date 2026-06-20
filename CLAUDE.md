@@ -9,7 +9,7 @@ This repository contains shared rules, skills, prompts, and agents for AI coding
 - `docs/skills-frontmatter.md` — Skills frontmatter field reference per platform
 - `docs/metadata-and-sync.md` — How `shared/` files are synced to platform-specific configs
 - `docs/parallel-worktrees.md` — Running parallel Claude sessions with one git worktree per task (`worktree-new.sh` / `worktree-done.sh`, review window, merge flow)
-- `docs/telemetry-pull-layer.md` — Telemetry pull layer: on-machine transcript parsers that attribute tokens and reconcile per-session/run cost via `ccusage` (offline); retained as the Langfuse backfill source (the Streamlit dashboard + DuckDB store were removed in #90)
+- `docs/telemetry-pull-layer.md` — Telemetry pull layer: on-machine transcript parsers that attribute tokens to every span; retained as the Langfuse backfill source (the Streamlit dashboard + DuckDB store were removed in #90; `ccusage` + the pull-cost layer were retired in #91 — Langfuse computes cost from token usage)
 - `docs/spoke-otel-langfuse-spike.md` — Spike (#83): opt-in (`AI_TOOLKIT_OTEL=1`) Claude Code native-OTel trace export per spoke to Langfuse / a local OTLP collector; native-view-vs-dashboard comparison and the hybrid recommendation
 - `dashboard/langfuse/otelcol.yaml` — OTel collector config for the Langfuse push path (the single observability surface since #90)
 

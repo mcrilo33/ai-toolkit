@@ -118,8 +118,9 @@ Give the user a short read: how many spokes are running, which issues are unstar
 branches are ready to merge, and your single recommended next action.
 
 `hub-status.sh` does not surface cost. For per-spoke token/cost attribution across runs,
-point the user at the observability dashboard (`dashboard/README.md`) — cost is reconciled
-from `ccusage` offline; see `docs/telemetry-pull-layer.md` for the pull layer.
+point the user at Langfuse (the observability surface since #90) — cost is computed by
+Langfuse from token usage (`ccusage` was retired in #91); see
+`docs/telemetry-pull-layer.md` for the on-machine backfill source.
 
 ### Micro-spoke dispatch (lane 1)
 
