@@ -135,10 +135,13 @@ _CHUNK_SIZE = 100
 _COPIED_FIELDS = ("input", "output", "usageDetails", "costDetails", "metadata", "model", "level")
 # Metadata keys that may carry a tool-call id, in priority order.
 _TOOL_USE_ID_KEYS = ("tool_use_id", "gen_ai.tool.call.id")
-# Name prefixes of the #93 audit observations that are scoped to a single tool call and
-# carry its ``tool_use_id`` (``tool_decision:<decision>``, ``tool_result``). Like gate
-# hooks, they nest under the tool sharing that id rather than at the synthetic root.
-_TOOL_AUDIT_EVENT_PREFIXES = ("tool_decision", "tool_result")
+# Name prefixes of the audit observations that are scoped to a single tool call and carry its
+# ``tool_use_id`` (``tool_decision:<decision>``, ``tool_result`` from #93;
+# ``hook_execution_complete:<PreToolUse|PostToolUse>`` from hook-event-nest, whose id the
+# bridge resolves by event.sequence). Like gate hooks, they nest under the tool sharing that
+# id rather than at the synthetic root. A ``hook_execution_complete`` with no tool (e.g.
+# ``:SessionStart``) carries no id and so collapses to the root, unchanged.
+_TOOL_AUDIT_EVENT_PREFIXES = ("tool_decision", "tool_result", "hook_execution_complete")
 
 # Tool content (e.g. a large file Read) can be huge; cap the serialized text past this.
 _MAX_CONTENT_CHARS = 20_000
@@ -235,12 +238,13 @@ def _is_hook(observation: Observation) -> bool:
 
 
 def _is_tool_audit_event(observation: Observation) -> bool:
-    """Whether an observation is a #93 audit event scoped to a single tool call.
+    """Whether an observation is an audit event scoped to a single tool call.
 
-    These (``tool_decision:<decision>``, ``tool_result``) are minted on the per-spoke audit
-    trace and carry their ``tool_use_id`` in flat metadata; they are recognised by name
-    prefix (:data:`_TOOL_AUDIT_EVENT_PREFIXES`). The ``tool_*`` prefix never collides with a
-    visible ``tool:<Name>`` span or a bare tool name like ``Bash``.
+    These (``tool_decision:<decision>``, ``tool_result``, and a Pre/PostToolUse
+    ``hook_execution_complete``) are minted on the per-spoke audit trace and carry their
+    ``tool_use_id`` in flat metadata; they are recognised by name prefix
+    (:data:`_TOOL_AUDIT_EVENT_PREFIXES`). None of these prefixes collides with a visible
+    ``tool:<Name>`` span or a bare tool name like ``Bash``.
     """
     name = observation.get("name") or ""
     return name.startswith(_TOOL_AUDIT_EVENT_PREFIXES)

@@ -112,6 +112,10 @@ AUDIT_SPECS: dict[str, AuditSpec] = {
         metadata=(
             "hook_event",
             "hook_name",
+            # Absent on the raw event; the message bridge resolves it for a Pre/PostToolUse
+            # hook (joining by event.sequence to the triggering tool_decision) and injects it
+            # here so the assembler can nest the hook under its tool (issue hook-event-nest).
+            "tool_use_id",
             "num_hooks",
             "num_success",
             "num_blocking",

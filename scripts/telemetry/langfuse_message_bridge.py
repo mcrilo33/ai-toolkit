@@ -17,6 +17,19 @@ the bridge CREATES them as ``event-create`` observations on a per-spoke syntheti
 trace keyed by ``spoke_run_id`` (issue #93). That path needs no buffering -- the trace is
 minted here -- and is independent of the message join below.
 
+One audit sub-case DOES buffer: a ``PreToolUse``/``PostToolUse`` ``hook_execution_complete``
+event carries no ``tool_use_id`` (only ``hook_name``/``hook_event``/``event.sequence``), so
+the assembler cannot nest it under the tool that triggered it. The bridge recovers the id by
+joining on ``event.sequence`` to the triggering ``tool_decision`` (nearest-FOLLOWING for a
+Pre hook, nearest-PRECEDING for a Post hook, requiring a ``tool_name`` match), reusing the
+same kept-across-flushes nearest-by-sequence machinery as the body join -- decisions are
+retained in ``self._tool_decisions`` like body sequences are in ``self._body_seqs``. The
+match is *deferred*, not the creation: the hook is emitted immediately at the root (so it is
+never dropped) and, once its decision is seen, RE-EMITTED with the same observation id and
+the ``tool_use_id`` stamped into metadata (Langfuse upserts by id). A hook with no matching
+decision (e.g. a ``SessionStart`` hook, or a tool that emits no decision) keeps no id and
+stays at the root.
+
 The input join is *per call*. One ``prompt.id`` spans an entire user turn, so it cannot key
 a single API call -- every call of an agent loop shares it. The per-call key is
 ``event.sequence`` instead. An ``api_request`` log carries ``request_id`` + ``event.sequence``
@@ -116,6 +129,45 @@ class PendingItem(TypedDict):
     ktype: str  # "seq" or "req"
     field: str  # Langfuse observation field: "input" or "output"
     value: object  # the last request message, or the response content
+
+
+# Maps a hook_execution_complete's hook_event to the join direction against tool_decision.
+# Only Pre/PostToolUse hooks name a tool; the rest (SessionStart, Stop, PreCompact, ...) have
+# none and stay at the synthetic root.
+_TOOLUSE_HOOK_DIRECTIONS = {"PreToolUse": "pre", "PostToolUse": "post"}
+
+
+class BufferedHook(TypedDict):
+    """A Pre/PostToolUse hook event awaiting its tool_use_id from a tool_decision."""
+
+    attrs: dict[str, str]  # the merged event attrs, re-rendered with the id once resolved
+    trace_key: str  # the spoke audit trace the hook was emitted on
+    seq: int  # the hook's event.sequence, the join key against tool_decision
+    tool: str  # the tool named by hook_name, matched against the decision's tool_name
+    direction: str  # "pre" (nearest-following decision) or "post" (nearest-preceding)
+
+
+def _tooluse_hook(attrs: dict[str, str]) -> tuple[str, str] | None:
+    """Return ``(tool_name, direction)`` for a Pre/PostToolUse hook event, else None.
+
+    The tool is the suffix of ``hook_name`` (``"PreToolUse:Edit"`` -> ``"Edit"``) and the
+    direction is keyed off ``hook_event``. Returns None for any non-hook event, a non-Pre/Post
+    hook, or a ``hook_name`` with no tool suffix -- those keep no ``tool_use_id`` and stay at
+    the synthetic root.
+
+    Args:
+        attrs: The merged OTLP resource + log-record attributes.
+
+    Returns:
+        The matched tool name and join direction, or None when the event names no tool.
+    """
+    if attrs.get("event.name") != "hook_execution_complete":
+        return None
+    direction = _TOOLUSE_HOOK_DIRECTIONS.get(attrs.get("hook_event", ""))
+    if direction is None:
+        return None
+    tool = attrs.get("hook_name", "").partition(":")[2]
+    return (tool, direction) if tool else None
 
 
 def _attr(attrs: list[dict[str, Any]], key: str) -> str | None:
@@ -405,6 +457,10 @@ class Bridge:
         self._body_seqs: list[int] = []  # every api_request_body event.sequence ever seen
         self._pending: list[PendingItem] = []
         self._audit_traces: set[str] = set()  # spoke keys whose audit trace-create was sent
+        # (event.sequence, tool_name, tool_use_id) of every tool_decision seen; kept across
+        # flushes (like _body_seqs) as the shared join references for Pre/PostToolUse hooks.
+        self._tool_decisions: list[tuple[int, str, str]] = []
+        self._pending_hooks: list[BufferedHook] = []  # hooks awaiting their tool_use_id
 
     def pending_count(self) -> int:
         """Return the number of items still buffered awaiting their span."""
@@ -438,6 +494,7 @@ class Bridge:
                 for sl in rl.get("scopeLogs", []):
                     for lr in sl.get("logRecords", []):
                         self._ingest_log(resource_attrs, lr.get("attributes", []))
+            self._flush_hooks()
             self._try_flush()
 
     def _ingest_log(
@@ -501,15 +558,98 @@ class Bridge:
         trace_key = attrs.get("spoke_run_id") or attrs.get("session.id")
         if not trace_key:
             return
+        self._note_tool_decision(attrs)
         event = build_audit_event(attrs, trace_key=trace_key)
         if event is None:
             return
+        self._emit_audit(event, trace_key)
+        self._buffer_hook(attrs, trace_key)
+
+    def _emit_audit(self, event: dict[str, Any], trace_key: str) -> None:
+        """Emit one audit ``event-create``, prefixed once per spoke by its ``trace-create``."""
         batch: list[dict[str, Any]] = []
         if trace_key not in self._audit_traces:
             self._audit_traces.add(trace_key)
             batch.append(trace_create(trace_key, event["timestamp"]))
         batch.append(event)
         self._create(batch)
+
+    def _note_tool_decision(self, attrs: dict[str, str]) -> None:
+        """Record a ``tool_decision``'s ``(sequence, tool_name, tool_use_id)`` join reference.
+
+        Kept across flushes (like :attr:`_body_seqs` for the message join) so a Pre hook
+        buffered before its decision still resolves once the decision arrives. A decision is a
+        SHARED reference -- the same one anchors the PreToolUse hook before it and the
+        PostToolUse hook after it -- so it is never consumed.
+        """
+        if attrs.get("event.name") != "tool_decision":
+            return
+        seq, tool, tuid = (
+            attrs.get("event.sequence"),
+            attrs.get("tool_name"),
+            attrs.get("tool_use_id"),
+        )
+        if seq is not None and tool and tuid:
+            self._tool_decisions.append((int(seq), tool, tuid))
+
+    def _buffer_hook(self, attrs: dict[str, str], trace_key: str) -> None:
+        """Buffer a Pre/PostToolUse hook so its tool_use_id resolves on a later flush.
+
+        The hook has already been emitted at the root by the caller; buffering only defers the
+        ``tool_use_id`` match. A hook naming no tool, or carrying no ``event.sequence`` to join
+        on, is left at the root and not buffered.
+        """
+        hook = _tooluse_hook(attrs)
+        seq = attrs.get("event.sequence")
+        if hook is None or seq is None:
+            return
+        tool, direction = hook
+        self._pending_hooks.append(
+            {
+                "attrs": attrs,
+                "trace_key": trace_key,
+                "seq": int(seq),
+                "tool": tool,
+                "direction": direction,
+            }
+        )
+
+    def _resolve_hook_tuid(self, seq: int, tool: str, direction: str) -> str | None:
+        """Return the ``tool_use_id`` of the nearest matching ``tool_decision``, or None.
+
+        A Pre hook takes the nearest-FOLLOWING decision (smallest sequence greater than the
+        hook's), a Post hook the nearest-PRECEDING (largest sequence less than the hook's);
+        both require an exact ``tool_name`` match so a hook never binds to the wrong tool.
+        """
+        matches = [(s, tuid) for (s, t, tuid) in self._tool_decisions if t == tool]
+        if direction == "pre":
+            following = [m for m in matches if m[0] > seq]
+            return min(following)[1] if following else None
+        preceding = [m for m in matches if m[0] < seq]
+        return max(preceding)[1] if preceding else None
+
+    def _flush_hooks(self) -> None:
+        """Re-emit each buffered hook whose ``tool_use_id`` now resolves; drop it once enriched.
+
+        Recomputed every flush so a decision and the hook it anchors may arrive in either
+        order. An unresolved hook stays buffered -- it was already emitted once at the root, so
+        it is never dropped.
+        """
+        batch: list[dict[str, Any]] = []
+        still: list[BufferedHook] = []
+        for hook in self._pending_hooks:
+            tuid = self._resolve_hook_tuid(hook["seq"], hook["tool"], hook["direction"])
+            if tuid is None:
+                still.append(hook)
+                continue
+            enriched = build_audit_event(
+                {**hook["attrs"], "tool_use_id": tuid}, trace_key=hook["trace_key"]
+            )
+            if enriched is not None:
+                batch.append(enriched)
+        self._pending_hooks[:] = still
+        if batch:
+            self._create(batch)
 
     def _match_bodies(self) -> dict[int, str]:
         """Match each buffered input body's ``event.sequence`` to a ``request_id``, 1:1.
