@@ -311,6 +311,50 @@ Notes and limits:
   spoke run id and the source `(trace_id, observation_id)` pair, so a rerun overwrites the
   same trace/observations rather than appending duplicates.
 
+## Transcript → Langfuse backfill (`langfuse_backfill.py`)
+
+`langfuse_spoke_tree.py` assembles a tree from observations the live push **already**
+wrote, so it only works for fully-instrumented spokes. The session transcript uniquely
+owns three things the live push cannot reconstruct: **extended-thinking bodies** (redacted
+in every raw API body), **true causal edges** (`uuid`/`parentUuid`), and **coverage of
+sessions that ran un-instrumented, while the collector was down, or historically**.
+
+`scripts/telemetry/langfuse_backfill.py` is the keystone that makes Langfuse the single
+complete source. It **sources from the transcript**: it reuses `session_parser.py` plus
+`causal_tree.py` to assemble one spoke's causal forest from the local `~/.claude`
+transcript, then translates that forest into Langfuse ingestion events — the second sink
+for the same forest the dashboard renders.
+
+```bash
+LANGFUSE_HOST=http://localhost:3000 LANGFUSE_BASIC_AUTH="Basic <base64(pk:sk)>" \
+    python3 scripts/telemetry/langfuse_backfill.py <spoke_run_id> [--thinking]
+```
+
+The translation:
+
+- One `trace-create` (`sessionId = spoke_run_id`, name `spoke-backfill:<spoke_run_id>`) and
+  a synthetic root, in a **backfill-owned id namespace** (`spokefill-`/`fillroot-`/`fill-`)
+  distinct from the spoke-tree's (`spoketree-`/`spoke-tree:`), so the two views never
+  collide.
+- One event per causal node: a cost-bearing `turn`/`agent` leaf becomes a
+  `generation-create` with four-component `usageDetails` (the ccusage cost join is a
+  deferred upgrade); every other node a `span-create`; containers get `metadata.rollup`
+  summed over the subtree.
+- A `reasoning` node carries the **extended-thinking body** as its `output`, read only when
+  the opt-in is set (`--thinking` or `AI_TOOLKIT_BACKFILL_THINKING=1`) — never otherwise
+  (volume / privacy).
+
+Idempotency and dedup are two separate mechanisms:
+
+- **Re-running the backfill** is idempotent: every id derives from `(spoke_run_id,
+  node_id)` — and a causal `node_id` is the transcript `uuid` — so a rerun overwrites the
+  same observations rather than appending.
+- **Backfill vs the live push** is deduped by a coverage query (`/traces?sessionId=...`):
+  when the live push already covered the session (a native, non-synthetic trace exists),
+  the backfill emits only the thinking bodies (covered + opt-in) or **nothing** (covered,
+  no opt-in) — never a competing full tree. An un-instrumented session (no native trace)
+  gets the full forest.
+
 ## Tool content from the transcript (in the tree builder)
 
 Claude Code's native OTel surfaces the full `full_command` for Bash, but for every *other*
