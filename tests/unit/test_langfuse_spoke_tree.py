@@ -650,6 +650,13 @@ def _step_node(batch: list[dict]) -> dict | None:
     return next((e for e in batch if e["id"].startswith(_STEP_PREFIX)), None)
 
 
+def _only_step(batch: list[dict]) -> dict:
+    """Return the single synthetic step node, asserting it exists."""
+    step = _step_node(batch)
+    assert step is not None
+    return step
+
+
 class TestBuildStepWindows:
     """#100: derive cycle-step windows from the TaskCreate/TaskUpdate ledger."""
 
@@ -717,15 +724,16 @@ class TestBuildStepWindows:
         assert build_step_windows([("tr", [create])], content) == []
 
 
-def _turn(obs_id: str, start: str, *, parent: str | None) -> dict:
-    """An llm_request turn (the chronological content unit nested under a step)."""
-    return _obs(obs_id, "llm_request", type_="GENERATION", parent=parent, startTime=start)
+def _root_marker(obs_id: str, name: str, start: str) -> dict:
+    """A synthetic-root-level satellite span (marker / lifecycle / script / unmatched hook)."""
+    return _obs(obs_id, name, parent=None, startTime=start)
 
 
 class TestStepGrouping:
-    """#100: every timeline node nests under the step whose window contains its startTime,
-    regardless of its current parent — root, a dissolved interaction, or a resume buried under
-    a tool.execution. Nodes that ride with a tool (parent is a ``tool:`` span) are left nested.
+    """#100: ONLY the synthetic-root's flat satellites (markers / lifecycle / script / hooks at
+    root) re-home under the step whose window contains them. The claude_code.interaction
+    subtrees — and their W3C-TRACEPARENT nesting (a resume can nest under an earlier command's
+    tool.execution) — are LEFT UNTOUCHED, reflecting causal reality.
     """
 
     def _content(self) -> dict[str, ToolContent]:
@@ -737,8 +745,9 @@ class TestStepGrouping:
             "tu-u2": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
         }
 
-    def _traces(self, turn_start: str = "2026-01-02T00:00:05Z") -> list[tuple[str, list[dict]]]:
-        # An interaction container holds the ledger ops + a turn; the interaction is dissolved.
+    def _traces(self, marker_start: str = "2026-01-02T00:00:05Z") -> list[tuple[str, list[dict]]]:
+        # The ledger ops live under an interaction (left untouched); a root-level script span
+        # within the window is the thing that re-homes.
         interaction = _obs(
             "i1", "claude_code.interaction", parent=None, startTime="2026-01-02T00:00:00Z"
         )
@@ -766,47 +775,43 @@ class TestStepGrouping:
             endTime="2026-01-02T00:00:21Z",
             metadata={"attributes": {"tool_use_id": "tu-u2"}},
         )
-        turn = _turn("turnA", turn_start, parent="i1")
-        return [("tr", [interaction, create, started, done, turn])]
+        marker = _root_marker("m1", "spoke-push", marker_start)
+        return [("tr", [interaction, create, started, done, marker])]
 
-    def test_turn_within_window_nests_under_a_step_node(self) -> None:
+    def test_root_marker_within_window_nests_under_a_step_node(self) -> None:
         batch = build_batch(self._traces(), SPOKE, self._content())
 
         step = _step_node(batch)
         assert step is not None
         assert step["body"]["name"] == "step:S1 RED: x"
         assert step["body"]["parentObservationId"] == root_id_for(SPOKE)
-        turn = _by_orig(batch, "tr", "turnA")
-        assert turn["body"]["parentObservationId"] == step["id"]
+        marker = _by_orig(batch, "tr", "m1")
+        assert marker["body"]["parentObservationId"] == step["id"]
 
-    def test_ledger_ops_nest_under_their_step(self) -> None:
-        # The TaskUpdate spans themselves (in_progress and completed) join the step timeline.
+    def test_interaction_subtree_is_left_untouched(self) -> None:
+        # The interaction stays at the root and its ledger-op children keep their nesting —
+        # the TRACEPARENT structure is causal reality, never flattened into the step.
         batch = build_batch(self._traces(), SPOKE, self._content())
 
-        step_id = _step_node(batch)["id"]
-        assert _by_orig(batch, "tr", "tu1")["body"]["parentObservationId"] == step_id
-        assert _by_orig(batch, "tr", "tu2")["body"]["parentObservationId"] == step_id
-
-    def test_interaction_container_is_dissolved(self) -> None:
-        # When grouping is active the claude_code.interaction node is dropped entirely.
-        batch = build_batch(self._traces(), SPOKE, self._content())
-
-        assert all(e["id"] != _copy_id("tr", "i1") for e in batch)
+        interaction = _by_orig(batch, "tr", "i1")
+        assert interaction["body"]["parentObservationId"] == root_id_for(SPOKE)
+        assert _by_orig(batch, "tr", "tu1")["body"]["parentObservationId"] == interaction["id"]
+        assert _by_orig(batch, "tr", "tu2")["body"]["parentObservationId"] == interaction["id"]
 
     def test_step_node_carries_window_metadata(self) -> None:
         batch = build_batch(self._traces(), SPOKE, self._content())
 
-        meta = _step_node(batch)["body"]["metadata"]
+        meta = _only_step(batch)["body"]["metadata"]
         assert meta["subject"] == "S1 RED: x"
         assert meta["status"] == "completed"
 
-    def test_turn_outside_every_window_falls_back_to_root(self) -> None:
-        # A turn well after the only step's window re-homes to the synthetic root (its interaction
-        # parent is dissolved), never left dangling.
-        batch = build_batch(self._traces(turn_start="2026-01-02T01:00:00Z"), SPOKE, self._content())
+    def test_root_marker_outside_every_window_stays_at_root(self) -> None:
+        batch = build_batch(
+            self._traces(marker_start="2026-01-02T01:00:00Z"), SPOKE, self._content()
+        )
 
-        turn = _by_orig(batch, "tr", "turnA")
-        assert turn["body"]["parentObservationId"] == root_id_for(SPOKE)
+        marker = _by_orig(batch, "tr", "m1")
+        assert marker["body"]["parentObservationId"] == root_id_for(SPOKE)
 
     def test_non_ledger_spoke_emits_no_step_nodes(self) -> None:
         batch = build_batch(_traces(), SPOKE)
@@ -817,134 +822,25 @@ class TestStepGrouping:
             SPOKE
         )
 
-    def test_hook_under_a_tool_rides_with_its_tool_into_the_step(self) -> None:
-        # A gate hook nested under a tool stays under that tool (Part 2); the tool re-homes
-        # into the step, so the hook ends up under tool-under-step, not a direct step child.
-        content = {
-            "tu-c1": ToolContent({"subject": "S1 GREEN"}, "Task #1 created successfully: S1 GREEN"),
-            "tu-u1": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
-            "tu-u2": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
-        }
-        create = _obs(
-            "tc1",
-            "tool:TaskCreate",
-            parent=None,
-            startTime="2026-01-02T00:00:00Z",
-            endTime="2026-01-02T00:00:00Z",
-            metadata={"attributes": {"tool_use_id": "tu-c1"}},
-        )
-        started = _obs(
-            "tu1",
-            "tool:TaskUpdate",
-            parent=None,
-            startTime="2026-01-02T00:00:01Z",
-            endTime="2026-01-02T00:00:01Z",
-            metadata={"attributes": {"tool_use_id": "tu-u1"}},
-        )
-        done = _obs(
-            "tu2",
-            "tool:TaskUpdate",
-            parent=None,
-            startTime="2026-01-02T00:00:30Z",
-            endTime="2026-01-02T00:00:30Z",
-            metadata={"attributes": {"tool_use_id": "tu-u2"}},
-        )
-        tool = _obs(
-            "tb",
-            "tool:Bash",
-            parent=None,
-            startTime="2026-01-02T00:00:10Z",
-            metadata={"attributes": {"tool_use_id": "tu-b"}},
-        )
+    def test_root_hook_not_matching_a_tool_groups_into_its_step(self) -> None:
+        # A gate hook at the root (no matching tool) is a satellite and re-homes by its window;
+        # a hook that DOES match a tool stays under that tool (covered elsewhere).
         hook = _obs(
-            "hb",
-            "PreToolUse.sh",
+            "hk",
+            "commit-gauntlet.sh",
             parent=None,
-            startTime="2026-01-02T00:00:10Z",
-            metadata={"attributes": {"workflow.kind": "hook", "tool_use_id": "tu-b"}},
-        )
-
-        batch = build_batch([("tr", [create, started, done, tool, hook])], SPOKE, content)
-
-        step_id = _step_node(batch)["id"]
-        tool_copy = _by_orig(batch, "tr", "tb")
-        assert tool_copy["body"]["parentObservationId"] == step_id  # tool re-homed into step
-        # the hook still rides under its tool, NOT directly under the step.
-        assert _by_orig(batch, "tr", "hb")["body"]["parentObservationId"] == tool_copy["id"]
-
-    def test_resume_interactions_flatten_into_step_chronologically(self) -> None:
-        # Two interactions (a resume); interaction-2 is buried under a tool.execution sub-span,
-        # which natively breaks chronology. Every turn/TaskUpdate across BOTH interactions must
-        # sort into the one step window as direct children, ordered by startTime.
-        content = {
-            "tu-c1": ToolContent({"subject": "S1 PUSH"}, "Task #3 created successfully: S1 PUSH"),
-            "tu-u1": ToolContent({"taskId": "3", "status": "in_progress"}, "ok"),
-            "tu-u2": ToolContent({"taskId": "3", "status": "completed"}, "ok"),
-        }
-        # interaction-1 (root): create, in_progress(T10), push turn (T12)
-        i1 = _obs("i1", "claude_code.interaction", parent=None, startTime="2026-01-02T00:00:05Z")
-        create = _obs(
-            "tc1",
-            "tool:TaskCreate",
-            parent="i1",
             startTime="2026-01-02T00:00:05Z",
-            endTime="2026-01-02T00:00:05Z",
-            metadata={"attributes": {"tool_use_id": "tu-c1"}},
+            metadata={"attributes": {"workflow.kind": "hook"}},
         )
-        started = _obs(
-            "tu1",
-            "tool:TaskUpdate",
-            parent="i1",
-            startTime="2026-01-02T00:00:10Z",
-            endTime="2026-01-02T00:00:10Z",
-            metadata={"attributes": {"tool_use_id": "tu-u1"}},
-        )
-        push_turn1 = _turn("p1", "2026-01-02T00:00:12Z", parent="i1")
-        # a real tool with a tool.execution sub-span; the resume interaction-2 hangs off it.
-        tool = _obs(
-            "tp",
-            "tool:Bash",
-            parent="i1",
-            startTime="2026-01-02T00:00:15Z",
-            metadata={"attributes": {"tool_use_id": "tu-p"}},
-        )
-        execu = _obs(
-            "exec1", "claude_code.tool.execution", parent="tp", startTime="2026-01-02T00:00:15Z"
-        )
-        # interaction-2 (resume) nested under the tool.execution — out of chronological place.
-        i2 = _obs("i2", "claude_code.interaction", parent="exec1", startTime="2026-01-02T00:00:18Z")
-        push_turn2 = _turn("p2", "2026-01-02T00:00:22Z", parent="i2")
-        done = _obs(
-            "tu2",
-            "tool:TaskUpdate",
-            parent="i2",
-            startTime="2026-01-02T00:00:30Z",
-            endTime="2026-01-02T00:00:31Z",
-            metadata={"attributes": {"tool_use_id": "tu-u2"}},
-        )
+        traces = self._traces()
+        traces[0][1].append(hook)
 
-        batch = build_batch(
-            [("tr", [i1, create, started, push_turn1, tool, execu, i2, push_turn2, done])],
-            SPOKE,
-            content,
-        )
+        batch = build_batch(traces, SPOKE, self._content())
 
-        step_id = _step_node(batch)["id"]
-        # both interactions are dissolved.
-        assert all(e["id"] not in {_copy_id("tr", "i1"), _copy_id("tr", "i2")} for e in batch)
-        # the direct children of the step, in startTime order.
-        children = sorted(
-            (e for e in batch if e["body"].get("parentObservationId") == step_id),
-            key=lambda e: e["body"]["startTime"],
-        )
-        names = [e["body"]["name"] for e in children]
-        # task3 in_progress -> push turn 1 -> push turn 2 -> task3 completed.
-        assert names == ["tool:TaskUpdate", "llm_request", "llm_request", "tool:TaskUpdate"]
-        # the tool itself also re-homes into the step (its execution sub-span rides with it).
-        assert _by_orig(batch, "tr", "tp")["body"]["parentObservationId"] == step_id
+        assert _by_orig(batch, "tr", "hk")["body"]["parentObservationId"] == _only_step(batch)["id"]
 
     def test_innermost_window_wins_on_overlap(self) -> None:
-        # Two overlapping steps; a turn inside both nests under the later-starting (inner) one.
+        # Two overlapping steps; a root marker inside both nests under the later-starting (inner).
         content = {
             "tu-ca": ToolContent({"subject": "outer"}, "Task #1 created successfully: outer"),
             "tu-ua1": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
@@ -999,12 +895,12 @@ class TestStepGrouping:
                 end="2026-01-02T00:00:20Z",
             ),
         ]
-        turn = _turn("turnB", "2026-01-02T00:00:10Z", parent=None)
+        marker = _root_marker("mk", "spoke-push", "2026-01-02T00:00:10Z")
 
-        batch = build_batch([("tr", [*outer, *inner, turn])], SPOKE, content)
+        batch = build_batch([("tr", [*outer, *inner, marker])], SPOKE, content)
 
         steps = {e["body"]["name"]: e["id"] for e in batch if e["id"].startswith(_STEP_PREFIX)}
-        assert _by_orig(batch, "tr", "turnB")["body"]["parentObservationId"] == steps["step:inner"]
+        assert _by_orig(batch, "tr", "mk")["body"]["parentObservationId"] == steps["step:inner"]
 
 
 class TestScanTranscripts:
@@ -1628,8 +1524,8 @@ class TestLlmDecompositionEvents:
             decompose_request_body(bodies / "00-body.request.json"), counter=len, price=1.0
         )
         newest = next(r for r in rows if r["name"] == "msg[1]:assistant")
-        read = sum(int(r["tokens"]) for r in rows) - int(newest["tokens"])
-        gen = self._gen("g1", "2026-01-02T00:00:00Z", read=read, creation=int(newest["tokens"]))
+        read = sum(int(r["tokens"]) for r in rows) - int(newest["tokens"])  # type: ignore[arg-type, call-overload]
+        gen = self._gen("g1", "2026-01-02T00:00:00Z", read=read, creation=int(newest["tokens"]))  # type: ignore[arg-type]
 
         # Act
         events = self._build([("tr", [gen])], bodies)

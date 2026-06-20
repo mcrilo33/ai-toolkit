@@ -47,9 +47,6 @@ is_git_commit "$COMMAND" || exit 0
 NODES=$(extract_tested_red_nodes "$COMMAND")
 [ -z "$NODES" ] && exit 0
 
-# Cycle step: a declared Tested-RED commit IS the solo-cycle RED gate.
-telemetry_mark_step red
-
 PROJECT_ROOT=$(project_root_from_payload "$INPUT")
 
 PASSERS=""

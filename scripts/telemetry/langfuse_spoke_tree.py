@@ -76,6 +76,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import urllib.parse
 from pathlib import Path
@@ -122,6 +123,8 @@ TraceObservations = tuple[str, list[Observation]]
 _TRACE_PREFIX = "spoketree-"
 _ROOT_PREFIX = "spokeroot-"
 _COPY_PREFIX = "tree-"
+# Deterministic id prefix for the synthetic cycle-step nodes (#100, derived from the ledger).
+_STEP_PREFIX = "tree-step-"
 _TRACE_NAME_PREFIX = "spoke-tree:"
 _ROOT_NAME_PREFIX = "spoke:"
 
@@ -196,6 +199,28 @@ class ToolContent(NamedTuple):
 
     input: object | None  # the tool_use input args
     output: object | None  # the tool_result content
+
+
+class StepWindow(NamedTuple):
+    """One solo-cycle step derived from the todo ledger (#100).
+
+    The ``subject`` is the ``TaskCreate`` title (``S1 RED: …``); the window spans the task's
+    ``in_progress`` ``TaskUpdate`` start to its ``completed`` ``TaskUpdate`` end. Every timeline
+    node whose ``startTime`` falls in ``[start, end]`` is re-homed under the step node.
+    """
+
+    task_id: str
+    subject: str
+    start: str
+    end: str
+    status: str
+
+
+# Matches the numeric task id in a TaskCreate result ("Task #1 created successfully: …"); the
+# matching TaskUpdate carries the same id (bare digits) in its ``taskId`` input.
+_TASK_ID_RE = re.compile(r"#(\d+)")
+# The native per-turn container span; dissolved into the step timeline when grouping is active.
+_INTERACTION_NAME = "claude_code.interaction"
 
 
 def trace_id_for(spoke_run_id: str) -> str:
@@ -471,6 +496,218 @@ def _earliest_start(traces: list[TraceObservations]) -> str:
     return min(starts) if starts else _INGEST_TIMESTAMP
 
 
+def _is_interaction(observation: Observation) -> bool:
+    """Whether an observation is a native per-turn ``claude_code.interaction`` container."""
+    return (observation.get("name") or "") == _INTERACTION_NAME
+
+
+def _step_id(spoke_run_id: str, task_id: str) -> str:
+    """Return the deterministic id of one cycle-step node for a spoke."""
+    digest = hashlib.sha1(f"{spoke_run_id}:step:{task_id}".encode()).hexdigest()[:24]
+    return _STEP_PREFIX + digest
+
+
+def _task_id_from_create(output: object | None) -> str | None:
+    """Extract the created task id from a ``TaskCreate`` result string, or None."""
+    if not isinstance(output, str):
+        return None
+    match = _TASK_ID_RE.search(output)
+    return match.group(1) if match else None
+
+
+def _ledger_subjects(
+    traces: list[TraceObservations], tool_content: dict[str, ToolContent]
+) -> dict[str, str]:
+    """Map each created task id to its ``TaskCreate`` subject (the step title)."""
+    subjects: dict[str, str] = {}
+    for _orig_trace_id, observations in traces:
+        for observation in observations:
+            if (observation.get("name") or "") != "tool:TaskCreate":
+                continue
+            content = tool_content.get(_tool_use_id(observation) or "")
+            if content is None or not isinstance(content.input, dict):
+                continue
+            subject = content.input.get("subject")
+            task_id = _task_id_from_create(content.output)
+            if subject and task_id:
+                subjects[task_id] = str(subject)
+    return subjects
+
+
+def _ledger_bounds(
+    traces: list[TraceObservations], tool_content: dict[str, ToolContent]
+) -> dict[str, dict[str, str]]:
+    """Map each task id to its window bounds from ``TaskUpdate`` status transitions.
+
+    ``start`` is the earliest ``in_progress`` update's ``startTime``; ``end`` is the latest
+    ``completed`` update's ``endTime`` (resumes can re-mark a task, so the extremes win).
+    """
+    bounds: dict[str, dict[str, str]] = {}
+    for _orig_trace_id, observations in traces:
+        for observation in observations:
+            if (observation.get("name") or "") != "tool:TaskUpdate":
+                continue
+            content = tool_content.get(_tool_use_id(observation) or "")
+            if content is None or not isinstance(content.input, dict):
+                continue
+            task_id = str(content.input.get("taskId") or "")
+            if not task_id:
+                continue
+            entry = bounds.setdefault(task_id, {})
+            status = content.input.get("status")
+            start = observation.get("startTime")
+            if status == "in_progress" and start:
+                entry["start"] = start if "start" not in entry else min(entry["start"], start)
+            if status == "completed":
+                end = observation.get("endTime") or observation.get("startTime") or ""
+                if end:
+                    entry["end"] = end if "end" not in entry else max(entry["end"], end)
+                entry["status"] = "completed"
+    return bounds
+
+
+def _latest_time(traces: list[TraceObservations]) -> str:
+    """Return the latest ISO ``endTime``/``startTime`` across all observations, or the base."""
+    times = [
+        observation.get("endTime") or observation.get("startTime") or ""
+        for _orig_trace_id, observations in traces
+        for observation in observations
+        if observation.get("endTime") or observation.get("startTime")
+    ]
+    return max(times) if times else _INGEST_TIMESTAMP
+
+
+def build_step_windows(
+    traces: list[TraceObservations], tool_content: dict[str, ToolContent]
+) -> list[StepWindow]:
+    """Derive the solo-cycle step windows from the todo ledger (#100).
+
+    Each ``TaskCreate`` subject is a step; its ``in_progress`` → ``completed`` ``TaskUpdate``
+    timestamps bound the window. A task created but never started (no ``in_progress``) has no
+    window and is skipped. An in-flight task (no ``completed``) clamps its end to the spoke's
+    last observation. Non-ledger spokes (no ``TaskCreate``) yield ``[]`` — no step grouping.
+
+    Args:
+        traces: The source traces paired with their observations.
+        tool_content: Tool-call-id to :class:`ToolContent` (the ledger ops' input/output).
+
+    Returns:
+        The step windows in chronological start order.
+    """
+    subjects = _ledger_subjects(traces, tool_content)
+    if not subjects:
+        return []
+    bounds = _ledger_bounds(traces, tool_content)
+    fallback_end = _latest_time(traces)
+    windows: list[StepWindow] = []
+    for task_id, subject in subjects.items():
+        bound = bounds.get(task_id)
+        if not bound or "start" not in bound:
+            continue
+        windows.append(
+            StepWindow(
+                task_id=task_id,
+                subject=subject,
+                start=bound["start"],
+                end=bound.get("end") or fallback_end,
+                status=bound.get("status", "in_progress"),
+            )
+        )
+    windows.sort(key=lambda window: window.start)
+    return windows
+
+
+def _containing_window(start: str, windows: list[StepWindow]) -> StepWindow | None:
+    """Return the innermost step window containing ``start`` (latest start wins), or None.
+
+    ``windows`` is ordered by start, so iterating and overwriting yields the latest-starting
+    window that contains the timestamp — the innermost on an overlap.
+    """
+    chosen: StepWindow | None = None
+    for window in windows:
+        if window.start <= start <= window.end:
+            chosen = window
+    return chosen
+
+
+def _step_event(window: StepWindow, step_id: str, root_id: str, trace_id: str) -> IngestEvent:
+    """Shape one cycle-step span-create event under the synthetic root."""
+    return {
+        "id": step_id,
+        "type": "span-create",
+        "timestamp": window.start,
+        "body": {
+            "id": step_id,
+            "traceId": trace_id,
+            "parentObservationId": root_id,
+            "name": f"step:{window.subject}",
+            "startTime": window.start,
+            "endTime": window.end,
+            "metadata": {
+                "subject": window.subject,
+                "status": window.status,
+                "started": window.start,
+                "completed": window.end,
+            },
+        },
+    }
+
+
+def _apply_step_grouping(
+    copies: list[IngestEvent],
+    traces: list[TraceObservations],
+    tool_content: dict[str, ToolContent],
+    *,
+    root_id: str,
+    spoke_run_id: str,
+    trace_id: str,
+) -> list[IngestEvent]:
+    """Group the flat root-level satellites under their cycle step (#100), in place.
+
+    Only the synthetic-root's OWN satellite children move: the ``step:*`` / ``lifecycle:*``
+    markers, the ``mcp`` / ``spoke-push`` / ``script:ready`` script spans, and the gate hooks
+    that did not match a tool. When such a root child's ``startTime`` falls in a step window it is
+    re-parented under that step node (innermost wins on overlap).
+
+    The ``claude_code.interaction`` subtrees are LEFT UNTOUCHED at the root — their per-turn
+    structure and W3C-TRACEPARENT nesting (a resume can legitimately nest under an earlier
+    command's ``tool.execution``) reflect causal reality and are never flattened. Because tools
+    and turns live under those interactions (not at the root), they are naturally excluded.
+
+    Args:
+        copies: The re-parented source observation copies; root-level satellites are mutated
+            in place.
+        traces: The source traces (for ledger windows + interaction detection).
+        tool_content: Tool-call-id to :class:`ToolContent` (the ledger ops' input/output).
+        root_id: The synthetic root span id.
+        spoke_run_id: The spoke run identifier (for deterministic step ids).
+        trace_id: The assembled trace id every step node references.
+
+    Returns:
+        The new step span events (empty when the spoke has no ledger windows).
+    """
+    windows = build_step_windows(traces, tool_content)
+    if not windows:
+        return []
+    interaction_ids = {
+        _copy_id(orig_trace_id, observation["id"])
+        for orig_trace_id, observations in traces
+        for observation in observations
+        if _is_interaction(observation)
+    }
+    step_ids = {window.task_id: _step_id(spoke_run_id, window.task_id) for window in windows}
+    step_events = [_step_event(w, step_ids[w.task_id], root_id, trace_id) for w in windows]
+    for event in copies:
+        body = event["body"]
+        if body.get("parentObservationId") != root_id or body["id"] in interaction_ids:
+            continue  # only the root's own non-interaction satellites move
+        start = body.get("startTime")
+        window = _containing_window(start, windows) if start else None
+        if window is not None:
+            body["parentObservationId"] = step_ids[window.task_id]
+    return step_events
+
+
 def build_batch(
     traces: list[TraceObservations],
     spoke_run_id: str,
@@ -485,6 +722,12 @@ def build_batch(
     transcript-sourced ``input``/``output`` grafted into the create body (see
     :func:`_tool_additions`).
 
+    When the spoke ran a solo cycle, the todo ledger yields per-phase step nodes
+    (:func:`build_step_windows`) under the root, and the root's own flat satellites (markers,
+    lifecycle, script, and unmatched hook spans) re-home under the step whose window contains
+    them (:func:`_apply_step_grouping`); the ``claude_code.interaction`` subtrees are left
+    untouched. A non-ledger spoke emits no step nodes.
+
     Args:
         traces: Each source trace paired with all of its observations, as fetched from
             Langfuse with full fields.
@@ -493,7 +736,8 @@ def build_batch(
             defaults to empty (no tool content filled).
 
     Returns:
-        The ingestion events: a ``trace-create``, the synthetic root, then the copies.
+        The ingestion events: a ``trace-create``, the synthetic root, the cycle-step nodes,
+        then the copies.
     """
     tool_content = tool_content or {}
     trace_id = trace_id_for(spoke_run_id)
@@ -537,7 +781,10 @@ def build_batch(
                     tool_content=tool_content,
                 )
             )
-    events = [trace_event, root_event, *copies]
+    step_events = _apply_step_grouping(
+        copies, traces, tool_content, root_id=root_id, spoke_run_id=spoke_run_id, trace_id=trace_id
+    )
+    events = [trace_event, root_event, *step_events, *copies]
     _apply_container_rollups(events)
     return events
 
