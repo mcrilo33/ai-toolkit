@@ -102,6 +102,7 @@ from telemetry.measure_context_cost import (
 from telemetry.request_body import (
     ContextDelta,
     ContextItem,
+    decompose_request_body,
     diff_snapshots,
     first_real_request,
     measure_request_items,
@@ -167,6 +168,20 @@ _DEFAULT_PRICE = 0.00000625
 _RECONCILE_TOLERANCE = 2_000
 # Category order for the request-body itemization (the primary, fully-itemized path).
 _REQUEST_CATEGORY_ORDER = ("tools", "mcp", "system", "context")
+# Component order for the per-llm_request cache decomposition (#99), in request order so the
+# stable prefix (tools/system/rules/skills) groups ahead of the volatile messages.
+_DECOMP_CATEGORY_ORDER = (
+    "tools",
+    "mcp",
+    "system",
+    "rules",
+    "skills",
+    "environment",
+    "context",
+    "messages",
+)
+# Deterministic id prefix for the per-llm_request cache-decomposition nodes.
+_DECOMP_PREFIX = "tree-dc-"
 # Category order for the disk fallback used when no request body is available.
 _DISK_CATEGORY_ORDER = ("rules", "memory", "skills", "sub-agents", "environment")
 # Env var naming the per-spoke dir of OTEL_LOG_RAW_API_BODIES=file:<dir> dumps.
@@ -1201,6 +1216,246 @@ def context_evolution_deltas(
     return deltas
 
 
+def _decomp_id(spoke_run_id: str, key: str) -> str:
+    """Return the deterministic id of one cache-decomposition node for a spoke."""
+    digest = hashlib.sha1(f"{spoke_run_id}:{key}".encode()).hexdigest()[:24]
+    return _DECOMP_PREFIX + digest
+
+
+def _llm_requests_in_order(traces: list[TraceObservations]) -> list[tuple[str, Observation]]:
+    """Return ``(orig_trace_id, observation)`` for each LLM call, oldest first by ``startTime``.
+
+    An LLM call is any observation carrying ``cache_read_input_tokens`` or
+    ``cache_creation_input_tokens`` usage — the same set the request-body dumps correspond to,
+    so the two align positionally (the basis of the count gate in
+    :func:`build_llm_decomposition_events`).
+    """
+    calls: list[tuple[str, str, Observation]] = []
+    for orig_trace_id, observations in traces:
+        for observation in observations:
+            usage = observation.get("usageDetails") or {}
+            if (
+                usage.get("cache_read_input_tokens") is None
+                and usage.get("cache_creation_input_tokens") is None
+            ):
+                continue
+            calls.append((observation.get("startTime") or "", orig_trace_id, observation))
+    calls.sort(key=lambda call: call[0])
+    return [(orig_trace_id, observation) for _start, orig_trace_id, observation in calls]
+
+
+def _split_rows_by_cache(
+    rows: list[dict[str, object]], *, cache_read: int, cache_creation: int
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Partition itemized rows into the cache_read / cache_creation budgets by cumulative fit.
+
+    Walking the items in request order, the first ``cache_read`` tokens fall in the reused
+    prefix, the next ``cache_creation`` tokens are the portion written this turn, and anything
+    beyond is fresh input (not shown). Each item is assigned WHOLE by its cumulative start
+    offset, so the split reconciles to the observed counters with a per-bucket remainder rather
+    than the ``cached`` flag, which mislabels both cold calls (whole prefix written, not read)
+    and the freshly-written delta of warm calls.
+    """
+    read: list[dict[str, object]] = []
+    creation: list[dict[str, object]] = []
+    offset = 0
+    for row in rows:
+        start = offset
+        offset += int(cast(int, row["tokens"]))
+        if start < cache_read:
+            read.append(row)
+        elif start < cache_read + cache_creation:
+            creation.append(row)
+    return read, creation
+
+
+def _decomp_item_node(
+    spoke_run_id: str,
+    ns: str,
+    bucket: str,
+    category: str,
+    cat_id: str,
+    trace_id: str,
+    base_ts: str,
+    row: dict[str, object],
+) -> IngestEvent:
+    """Shape one per-item leaf under a decomposition component, carrying tokens/cost/cache flag."""
+    tokens = int(cast(int, row["tokens"]))
+    metadata: dict[str, object] = {
+        "tokens": tokens,
+        "cost_usd": row["cost_usd"],
+        "source": row["source"],
+    }
+    if row.get("estimated"):
+        metadata["estimated"] = True
+    if "cached" in row:
+        metadata["cached"] = bool(row["cached"])
+    return _lc_node(
+        node_id=_decomp_id(spoke_run_id, f"{ns}/{bucket}/{category}/{row['name']}"),
+        parent_id=cat_id,
+        trace_id=trace_id,
+        name=f"{row['name']}: {_human_tokens(tokens)}",
+        base_ts=base_ts,
+        metadata=metadata,
+    )
+
+
+def _decomp_bucket_events(
+    spoke_run_id: str,
+    ns: str,
+    *,
+    parent_id: str,
+    trace_id: str,
+    base_ts: str,
+    bucket: str,
+    rows: list[dict[str, object]],
+    observed: int,
+    price: float,
+) -> list[IngestEvent]:
+    """Build one cache bucket (``cache_read`` / ``cache_creation``) and its component subtree.
+
+    The bucket node parents under the llm_request copy; under it sit one component node per
+    category (in :data:`_DECOMP_CATEGORY_ORDER`) with one item leaf each, plus a ``remainder``
+    node = ``observed - Σ measured`` so the children reconcile (≈) to the billed counter.
+    """
+    bucket_id = _decomp_id(spoke_run_id, f"{ns}/{bucket}")
+    measured = sum(int(cast(int, row["tokens"])) for row in rows)
+    events = [
+        _lc_node(
+            node_id=bucket_id,
+            parent_id=parent_id,
+            trace_id=trace_id,
+            name=f"{bucket} {observed}",
+            base_ts=base_ts,
+            metadata={"tokens": observed, "measured_tokens": measured},
+        )
+    ]
+    for category, crows in _group_rows_by_category(rows, _DECOMP_CATEGORY_ORDER):
+        cat_id = _decomp_id(spoke_run_id, f"{ns}/{bucket}/{category}")
+        events.append(
+            _lc_node(
+                node_id=cat_id,
+                parent_id=bucket_id,
+                trace_id=trace_id,
+                name=category,
+                base_ts=base_ts,
+                metadata={
+                    "tokens": sum(int(cast(int, r["tokens"])) for r in crows),
+                    "cost_usd": sum(float(cast(float, r["cost_usd"])) for r in crows),
+                },
+            )
+        )
+        events.extend(
+            _decomp_item_node(spoke_run_id, ns, bucket, category, cat_id, trace_id, base_ts, row)
+            for row in crows
+        )
+    remainder = observed - measured
+    events.append(
+        _lc_node(
+            node_id=_decomp_id(spoke_run_id, f"{ns}/{bucket}/remainder"),
+            parent_id=bucket_id,
+            trace_id=trace_id,
+            name=f"remainder: {_human_tokens(abs(remainder))}",
+            base_ts=base_ts,
+            metadata={
+                "tokens": remainder,
+                "cost_usd": max(0, remainder) * price,
+                "source": _REMAINDER_SOURCE,
+            },
+        )
+    )
+    return events
+
+
+def build_llm_decomposition_events(
+    traces: list[TraceObservations],
+    bodies_dir: Path,
+    spoke_run_id: str,
+    *,
+    counter: TokenCounter,
+    price: float,
+    base_ts: str,
+) -> list[IngestEvent]:
+    """Build the per-``llm_request`` cache_read/cache_creation decomposition subtrees (#99).
+
+    For each LLM call (aligned positionally with its raw request body) the body is itemized by
+    :func:`telemetry.request_body.decompose_request_body` — rules per file, skills per skill,
+    every message — and the items are split into the observed ``cache_read`` / ``cache_creation``
+    token budgets by cumulative fit (see :func:`_split_rows_by_cache`). Each split is attached as
+    a two-bucket subtree (component -> item, with a reconciling remainder) directly under the
+    llm_request's copy node, so the operator sees the decomposition on the call itself.
+
+    The alignment is positional (LLM calls by ``startTime`` ↔ bodies by mtime) and is only built
+    when the counts match — otherwise an aux/degenerate call has skewed the alignment and the
+    decomposition is skipped entirely, mirroring :func:`_reconciliation_map`.
+
+    All ids derive from the spoke run id and the source ``(trace_id, observation_id)`` pair, so a
+    rerun overwrites the same nodes.
+
+    UPGRADE: collapse the stable cache_read prefix (near-identical every turn) into a shared
+    reference if the per-call repetition makes the ingestion batch too large on long spokes.
+
+    Args:
+        traces: The source traces paired with their observations.
+        bodies_dir: The per-spoke ``OTEL_LOG_RAW_API_BODIES=file:<dir>`` dump directory.
+        spoke_run_id: The spoke run identifier.
+        counter: Token counter; raises ``CountTokensError`` to trigger the char/4 fallback.
+        price: Cache-creation price in USD per token.
+        base_ts: ISO timestamp stamped on every synthetic node.
+
+    Returns:
+        The decomposition ingestion events, or ``[]`` when no call/body pair aligns safely.
+    """
+    calls = _llm_requests_in_order(traces)
+    bodies = find_request_files(bodies_dir)
+    if not calls or len(calls) != len(bodies):
+        return []
+    trace_id = trace_id_for(spoke_run_id)
+    events: list[IngestEvent] = []
+    for (orig_trace_id, observation), body_path in zip(calls, bodies):
+        try:
+            items = decompose_request_body(body_path)
+        except (OSError, json.JSONDecodeError):
+            logger.warning("cannot decompose request body %s", body_path)
+            continue
+        rows = measure_request_items(items, counter=counter, price=price)
+        usage = observation.get("usageDetails") or {}
+        read_tokens = int(usage.get("cache_read_input_tokens") or 0)
+        creation_tokens = int(usage.get("cache_creation_input_tokens") or 0)
+        read_rows, creation_rows = _split_rows_by_cache(
+            rows, cache_read=read_tokens, cache_creation=creation_tokens
+        )
+        copy_id = _copy_id(orig_trace_id, observation["id"])
+        ns = f"llm/{orig_trace_id}/{observation['id']}"
+        events.extend(
+            _decomp_bucket_events(
+                spoke_run_id,
+                ns,
+                parent_id=copy_id,
+                trace_id=trace_id,
+                base_ts=base_ts,
+                bucket="cache_read",
+                rows=read_rows,
+                observed=read_tokens,
+                price=price,
+            )
+        )
+        events.extend(
+            _decomp_bucket_events(
+                spoke_run_id,
+                ns,
+                parent_id=copy_id,
+                trace_id=trace_id,
+                base_ts=base_ts,
+                bucket="cache_creation",
+                rows=creation_rows,
+                observed=creation_tokens,
+                price=price,
+            )
+        )
+    return events
+
+
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse the CLI arguments for the spoke-tree assembler."""
     env = os.environ
@@ -1297,15 +1552,22 @@ def main(argv: list[str] | None = None) -> int:
         base_ts=base_ts,
         cache_creation_by_turn=_reconciliation_map(traces, bodies_dir),
     )
-    post_in_chunks(batch + context_events + evolution_events, post)
+    decomposition_events = build_llm_decomposition_events(
+        traces, bodies_dir, args.spoke_run_id, counter=counter, price=args.price, base_ts=base_ts
+    )
+    post_in_chunks(batch + context_events + evolution_events + decomposition_events, post)
 
     trace_id = trace_id_for(args.spoke_run_id)
     filled = filled_tool_spans(traces, tool_content)
+    decomposed = sum(
+        1 for event in decomposition_events if event["body"]["name"].startswith("cache_read ")
+    )
     print(
         f"{len(batch) - 2} observations assembled under trace {trace_id} "
         f"(roots collapsed to 1), {filled} tool spans filled from transcript, "
         f"{len(rows)} loaded-context items itemized (source: {source}), "
-        f"{len(deltas)} evolving turns diffed"
+        f"{len(deltas)} evolving turns diffed, "
+        f"{decomposed} llm_requests cache-decomposed"
     )
     return 0
 

@@ -29,6 +29,7 @@ from telemetry.langfuse_spoke_tree import (
     _copy_id,
     build_batch,
     build_context_evolution_events,
+    build_llm_decomposition_events,
     build_loaded_context_events,
     context_evolution_deltas,
     fetch_session,
@@ -40,7 +41,11 @@ from telemetry.langfuse_spoke_tree import (
     trace_id_for,
     transcript_scan_root,
 )
-from telemetry.request_body import ContextDelta
+from telemetry.request_body import (
+    ContextDelta,
+    decompose_request_body,
+    measure_request_items,
+)
 from telemetry.session_parser import project_dir_for_worktree
 
 SPOKE = "feature/22-demo+1700000000"
@@ -1129,3 +1134,141 @@ class TestContextEvolutionDeltas:
 
         # Assert: one diff (positions 1->2), indexed at raw position 2, not compacted 1.
         assert [turn for turn, _delta in deltas] == [2]
+
+
+class TestLlmDecompositionEvents:
+    """#99: per-llm_request cache_read/cache_creation decomposition attached to each call."""
+
+    _TOOL = {"name": "Bash", "description": "d" * 40, "input_schema": {"type": "object"}}
+
+    def _write(self, bodies: Path, index: int, obj: dict) -> None:
+        (bodies / f"{index:02d}-body.request.json").write_text(json.dumps(obj), encoding="utf-8")
+
+    def _bodies_dir(self, tmp_path: Path, obj: dict) -> Path:
+        bodies = tmp_path / "bodies"
+        bodies.mkdir()
+        self._write(bodies, 0, obj)
+        return bodies
+
+    def _obj(self) -> dict:
+        return {
+            "tools": [self._TOOL],
+            "system": [{"type": "text", "text": "sys"}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "the newest message"}]},
+            ],
+        }
+
+    def _gen(self, obs_id: str, start: str, *, read: int, creation: int) -> dict:
+        return _obs(
+            obs_id,
+            "llm_request",
+            type_="GENERATION",
+            parent="i1",
+            startTime=start,
+            usageDetails={
+                "cache_read_input_tokens": read,
+                "cache_creation_input_tokens": creation,
+            },
+        )
+
+    def _build(self, traces, bodies: Path) -> list[dict]:
+        return build_llm_decomposition_events(
+            traces, bodies, SPOKE, counter=len, price=1.0, base_ts="2026-01-01T00:00:00Z"
+        )
+
+    def _bucket(self, events: list[dict], prefix: str) -> dict:
+        return next(e for e in events if e["body"]["name"].startswith(prefix))
+
+    def _children(self, events: list[dict], parent_id: str) -> list[dict]:
+        return [e for e in events if e["body"].get("parentObservationId") == parent_id]
+
+    def test_buckets_parent_under_the_llm_request_copy(self, tmp_path: Path) -> None:
+        # Arrange: one llm_request and its aligned request body.
+        bodies = self._bodies_dir(tmp_path, self._obj())
+        gen = self._gen("g1", "2026-01-02T00:00:00Z", read=30, creation=10)
+
+        # Act
+        events = self._build([("tr", [gen])], bodies)
+
+        # Assert: both cache buckets hang under the copy of the llm_request observation.
+        copy_id = _copy_id("tr", "g1")
+        parents = {
+            e["body"]["parentObservationId"]
+            for e in events
+            if e["body"]["name"].startswith(("cache_read", "cache_creation"))
+        }
+        assert parents == {copy_id}
+
+    def test_cold_turn_puts_everything_in_cache_creation(self, tmp_path: Path) -> None:
+        # Arrange: a cold call (read=0) — nothing was reused, the whole prefix is written.
+        bodies = self._bodies_dir(tmp_path, self._obj())
+        gen = self._gen("g1", "2026-01-02T00:00:00Z", read=0, creation=5000)
+
+        # Act
+        events = self._build([("tr", [gen])], bodies)
+
+        # Assert: cache_read holds only its remainder; cache_creation carries the components.
+        read = self._bucket(events, "cache_read")
+        read_children = self._children(events, read["body"]["id"])
+        assert all("remainder" in c["body"]["name"] for c in read_children)
+        creation = self._bucket(events, "cache_creation")
+        creation_children = {
+            c["body"]["name"] for c in self._children(events, creation["body"]["id"])
+        }
+        assert "tools" in creation_children
+
+    def test_warm_turn_puts_newest_message_in_cache_creation(self, tmp_path: Path) -> None:
+        # Arrange: a warm call — the stable prefix is read, only the newest message is written.
+        # Size read to cover every item except the newest (the last in request order), and
+        # creation to exactly that newest message, so cumulative-fit routes it to cache_creation.
+        bodies = self._bodies_dir(tmp_path, self._obj())
+        rows = measure_request_items(
+            decompose_request_body(bodies / "00-body.request.json"), counter=len, price=1.0
+        )
+        newest = next(r for r in rows if r["name"] == "msg[1]:assistant")
+        read = sum(int(r["tokens"]) for r in rows) - int(newest["tokens"])
+        gen = self._gen("g1", "2026-01-02T00:00:00Z", read=read, creation=int(newest["tokens"]))
+
+        # Act
+        events = self._build([("tr", [gen])], bodies)
+
+        # Assert: the newest message item lands under the cache_creation -> messages subtree.
+        creation = self._bucket(events, "cache_creation")
+        component_ids = {c["body"]["id"] for c in self._children(events, creation["body"]["id"])}
+        creation_item_names = {
+            e["body"]["name"]
+            for e in events
+            if e["body"].get("parentObservationId") in component_ids
+        }
+        assert any("msg[1]:assistant" in name for name in creation_item_names)
+
+    def test_each_bucket_items_plus_remainder_sum_to_the_observed_counter(
+        self, tmp_path: Path
+    ) -> None:
+        # Arrange: generous read budget so all items fall in cache_read; creation gets none.
+        bodies = self._bodies_dir(tmp_path, self._obj())
+        gen = self._gen("g1", "2026-01-02T00:00:00Z", read=100000, creation=7)
+
+        # Act
+        events = self._build([("tr", [gen])], bodies)
+
+        # Assert: measured + remainder == observed for the cache_read bucket.
+        read = self._bucket(events, "cache_read")
+        remainder = next(
+            e
+            for e in self._children(events, read["body"]["id"])
+            if "remainder" in e["body"]["name"]
+        )
+        measured = int(read["body"]["metadata"]["measured_tokens"])
+        assert measured + int(remainder["body"]["metadata"]["tokens"]) == 100000
+
+    def test_count_mismatch_skips_decomposition(self, tmp_path: Path) -> None:
+        # Arrange: two bodies but a single llm_request — positional alignment is unsafe.
+        bodies = self._bodies_dir(tmp_path, self._obj())
+        self._write(bodies, 1, self._obj())
+        gen = self._gen("g1", "2026-01-02T00:00:00Z", read=30, creation=10)
+
+        # Act / Assert: no decomposition emitted rather than a misaligned one.
+        assert self._build([("tr", [gen])], bodies) == []
