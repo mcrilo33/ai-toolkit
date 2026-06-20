@@ -85,7 +85,11 @@ run_step() {
 run_step "loaded-context itemization (#87)" \
   "$SCRIPT_DIR/telemetry/langfuse_spoke_tree.py" "$SPOKE_RUN_ID" \
   --request-bodies "$BODY_DIR" --root "$WT_DIR"
+# --worktree scopes the transcript backfill to THIS spoke's own Claude Code project dir
+# (derived from WT_DIR), so it reads only the spoke's sessions/resumes — never the hub or
+# sibling worktrees. Without it the backfill scans every session on the machine and
+# cross-attaches unrelated reasoning/content (Issues #92/#98).
 run_step "transcript backfill (#92)" \
-  "$SCRIPT_DIR/telemetry/langfuse_backfill.py" "$SPOKE_RUN_ID" --thinking
+  "$SCRIPT_DIR/telemetry/langfuse_backfill.py" "$SPOKE_RUN_ID" --thinking --worktree "$WT_DIR"
 
 exit 0

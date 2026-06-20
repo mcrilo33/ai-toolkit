@@ -51,7 +51,13 @@ from telemetry.langfuse_rollup import (
     subtree_totals,
 )
 from telemetry.langfuse_spoke_tree import all_traces, post_in_chunks
-from telemetry.session_parser import parse_projects_dir, parse_session_file, thinking_by_turn
+from telemetry.session_parser import (
+    parse_project_dir,
+    parse_projects_dir,
+    parse_session_file,
+    project_dir_for_worktree,
+    thinking_by_turn,
+)
 
 logger = logging.getLogger("langfuse_backfill")
 
@@ -453,17 +459,23 @@ def backfill_events(
     return []
 
 
-def _gather_thinking(session: Path | None, projects: Path) -> dict[str, str]:
-    """The opt-in ``turn uuid -> thinking body`` map for one session or a whole projects root.
+def _gather_thinking(
+    session: Path | None, projects: Path, project_dir: Path | None = None
+) -> dict[str, str]:
+    """The opt-in ``turn uuid -> thinking body`` map for one session, one project, or all.
 
-    A single ``--session`` transcript is read directly; otherwise every top-level session
-    under ``projects`` is scanned and merged (uuids are globally unique, so a flat merge is
-    safe). Called only when the opt-in flag is set, so the body is never read otherwise.
+    A single ``--session`` transcript is read directly; a ``project_dir`` (the spoke's own,
+    via ``--worktree``) scans only that dir's sessions (``*.jsonl``); otherwise every
+    top-level session under ``projects`` (``*/*.jsonl``) is scanned. Results merge (uuids are
+    globally unique, so a flat merge is safe). Scoping to ``project_dir`` is what keeps an
+    unrelated session's reasoning out of this spoke's backfill (Issues #92/#98). Called only
+    when the opt-in flag is set, so the body is never read otherwise.
     """
     if session is not None:
         return thinking_by_turn(session)
+    paths = project_dir.glob("*.jsonl") if project_dir is not None else projects.glob("*/*.jsonl")
     merged: dict[str, str] = {}
-    for path in sorted(projects.glob("*/*.jsonl")):
+    for path in sorted(paths):
         if "subagents" in path.parts:
             continue
         merged.update(thinking_by_turn(path))
@@ -488,6 +500,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         type=Path,
         default=None,
         help="A single session transcript to backfill (default: scan --projects).",
+    )
+    parser.add_argument(
+        "--worktree",
+        type=Path,
+        default=None,
+        help=(
+            "Scope the backfill to the spoke's own worktree: only the sessions under that "
+            "worktree's Claude Code project dir are read (resumes included), never the hub "
+            "or sibling worktrees (Issues #92/#98). Overrides --projects' broad scan."
+        ),
     )
     parser.add_argument(
         "--thinking",
@@ -516,8 +538,19 @@ def main(argv: list[str] | None = None) -> int:
     """
     logging.basicConfig(level=logging.INFO, format="[backfill] %(message)s")
     args = _parse_args(argv if argv is not None else sys.argv[1:])
-    parsed = parse_session_file(args.session) if args.session else parse_projects_dir(args.projects)
-    thinking = _gather_thinking(args.session, args.projects) if args.thinking else {}
+    # --worktree binds the backfill to the spoke's own project dir with NO fallback to the
+    # broad scan: a missing dir yields an empty backfill, never another spoke's transcripts.
+    # That strictness is the fix — do NOT add a whole-root fallback here the way
+    # langfuse_spoke_tree.transcript_scan_root does (its unique-id match makes a broad scan
+    # contamination-safe; this reasoning/content path is not). See Issues #92/#98.
+    project_dir = project_dir_for_worktree(args.worktree, args.projects) if args.worktree else None
+    if args.session:
+        parsed = parse_session_file(args.session)
+    elif project_dir is not None:
+        parsed = parse_project_dir(project_dir)
+    else:
+        parsed = parse_projects_dir(args.projects)
+    thinking = _gather_thinking(args.session, args.projects, project_dir) if args.thinking else {}
     # Tokens are exact; Langfuse computes cost from the gen_ai.usage remap (Issue #91).
     forest: list[Any] = causal_forest_from_parsed(parsed, [], thinking)
 
