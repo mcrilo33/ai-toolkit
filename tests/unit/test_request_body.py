@@ -18,16 +18,21 @@ import sys
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from telemetry.measure_context_cost import CountTokensError
 from telemetry.request_body import (
     CacheBoundary,
+    ContextDelta,
     ContextItem,
+    diff_snapshots,
     first_real_request,
     measure_request_items,
     parse_request_body,
     parse_request_obj,
+    snapshot_items,
 )
 
 _FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
@@ -245,3 +250,161 @@ def test_deferred_count_ignores_lowercase_prose_lines() -> None:
 
     # Assert: only the two identifier-shaped names count, not the prose words.
     assert parsed.deferred_tool_count == 2
+
+
+# --- per-turn diff: snapshot itemization (full messages, Issue #98) -----------
+
+
+def _tool(name: str, size: int = 1) -> dict[str, object]:
+    """A minimal tool schema whose serialized size scales with ``size``."""
+    return {"name": name, "description": "d" * size, "input_schema": {"type": "object"}}
+
+
+def _msg(role: str, text: str) -> dict[str, object]:
+    """A minimal Messages-API message with a single text content block."""
+    return {"role": role, "content": [{"type": "text", "text": text}]}
+
+
+def _body(
+    tools: list[dict[str, object]], system: list[str], messages: list[dict[str, object]]
+) -> dict[str, object]:
+    """Assemble a synthetic request body from tool, system, and message parts."""
+    return {
+        "tools": tools,
+        "system": [{"type": "text", "text": block} for block in system],
+        "messages": messages,
+    }
+
+
+def _by_cat(rows: list[dict[str, object]], category: str) -> list[dict[str, object]]:
+    return [row for row in rows if row["category"] == category]
+
+
+def test_snapshot_items_itemizes_every_message_not_just_the_first() -> None:
+    # Arrange: a multi-message conversation (the #87 parser only reads messages[0]).
+    obj = _body(
+        [_tool("Bash")],
+        ["billing header"],
+        [_msg("user", "hello"), _msg("assistant", "hi there"), _msg("user", "more")],
+    )
+
+    # Act
+    items = snapshot_items(obj)
+
+    # Assert: one item per message under the ``messages`` category, in order.
+    message_names = [item.name for item in items if item.category == "messages"]
+    assert message_names == ["msg[0]:user", "msg[1]:assistant", "msg[2]:user"]
+
+
+# --- per-turn diff: classification --------------------------------------------
+
+
+def test_diff_detects_a_toolsearch_loaded_schema_as_added_by_name() -> None:
+    # Arrange: turn N loads a deferred tool into the real ``tools`` array.
+    prev = snapshot_items(_body([_tool("Bash")], ["sys"], [_msg("user", "hi")]))
+    curr = snapshot_items(_body([_tool("Bash"), _tool("WebSearch")], ["sys"], [_msg("user", "hi")]))
+
+    # Act
+    delta = diff_snapshots(prev, curr, counter=len, price=1.0)
+
+    # Assert: the new schema is an ADDED tools item, named by the tool name.
+    added_tools = {row["name"] for row in _by_cat(delta.added, "tools")}
+    assert "WebSearch" in added_tools
+
+
+def test_diff_detects_appended_message_as_added() -> None:
+    # Arrange: a new assistant turn is appended.
+    prev = snapshot_items(_body([_tool("Bash")], ["sys"], [_msg("user", "hi")]))
+    curr = snapshot_items(
+        _body([_tool("Bash")], ["sys"], [_msg("user", "hi"), _msg("assistant", "reply")])
+    )
+
+    # Act
+    delta = diff_snapshots(prev, curr, counter=len, price=1.0)
+
+    # Assert: exactly the appended message is ADDED; nothing removed.
+    added_messages = [row["name"] for row in _by_cat(delta.added, "messages")]
+    assert added_messages == ["msg[1]:assistant"]
+    assert delta.removed == []
+
+
+def test_diff_detects_grown_system_block_as_size_changed() -> None:
+    # Arrange: a system block's text grows between turns (same positional label).
+    prev = snapshot_items(_body([_tool("Bash")], ["short"], [_msg("user", "hi")]))
+    curr = snapshot_items(_body([_tool("Bash")], ["short" * 20], [_msg("user", "hi")]))
+
+    # Act
+    delta = diff_snapshots(prev, curr, counter=len, price=1.0)
+
+    # Assert: the block is a CHANGED item with a positive token delta, not add+remove.
+    changed = _by_cat(delta.changed, "system")
+    assert len(changed) == 1
+    assert cast(int, changed[0]["delta_tokens"]) > 0
+    assert delta.added == [] and delta.removed == []
+
+
+def test_unchanged_snapshot_yields_empty_delta() -> None:
+    # Arrange: two identical snapshots — there must be zero churn.
+    obj = _body([_tool("Bash")], ["sys"], [_msg("user", "hi"), _msg("assistant", "yo")])
+    items = snapshot_items(obj)
+
+    # Act
+    delta = diff_snapshots(items, snapshot_items(obj), counter=len, price=1.0)
+
+    # Assert: nothing added/removed/changed, zero net, no compaction label.
+    assert delta.added == [] and delta.removed == [] and delta.changed == []
+    assert delta.net_tokens == 0
+    assert delta.label is None
+
+
+def test_compaction_drops_early_messages_without_false_churn_on_survivors() -> None:
+    # Arrange: a big early message is dropped; a later message survives at a shifted index.
+    big = "x" * 12000  # exceeds the compaction drop threshold under the len() counter
+    prev = snapshot_items(
+        _body(
+            [_tool("Bash")],
+            ["sys"],
+            [_msg("user", big), _msg("assistant", "kept"), _msg("user", "kept2")],
+        )
+    )
+    curr = snapshot_items(
+        _body([_tool("Bash")], ["sys"], [_msg("assistant", "kept"), _msg("user", "kept2")])
+    )
+
+    # Act
+    delta = diff_snapshots(prev, curr, counter=len, price=1.0)
+
+    # Assert: only the big message is REMOVED; the surviving messages are not re-churned,
+    # the net is strongly negative, and the turn is labeled a compaction.
+    removed_messages = _by_cat(delta.removed, "messages")
+    assert len(removed_messages) == 1
+    assert cast(int, removed_messages[0]["tokens"]) >= 12000
+    assert delta.added == []
+    assert delta.net_tokens < 0
+    assert delta.label == "compaction"
+
+
+def test_diff_net_reconciles_added_removed_and_changed_deltas() -> None:
+    # Arrange: a turn that simultaneously adds a tool and grows a system block.
+    prev = snapshot_items(_body([_tool("Bash")], ["short"], [_msg("user", "hi")]))
+    curr = snapshot_items(
+        _body([_tool("Bash"), _tool("WebSearch")], ["short" * 10], [_msg("user", "hi")])
+    )
+
+    # Act
+    delta = diff_snapshots(prev, curr, counter=len, price=1.0)
+
+    # Assert: net == sum(added) - sum(removed) + sum(changed deltas).
+    added = sum(cast(int, row["tokens"]) for row in delta.added)
+    removed = sum(cast(int, row["tokens"]) for row in delta.removed)
+    changed = sum(cast(int, row["delta_tokens"]) for row in delta.changed)
+    assert delta.net_tokens == added - removed + changed
+
+
+def test_context_delta_is_frozen_dataclass() -> None:
+    # Arrange / Act
+    delta = ContextDelta(added=[], removed=[], changed=[], net_tokens=0, label=None)
+
+    # Assert: the contract is an immutable container.
+    with pytest.raises(AttributeError):
+        delta.net_tokens = 5  # type: ignore[misc]
