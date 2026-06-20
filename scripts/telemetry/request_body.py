@@ -31,8 +31,10 @@ Privacy: ``metadata.user_id`` is PII and is never read or logged.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -60,6 +62,17 @@ _REMINDER_SIGNATURES: tuple[tuple[str, tuple[str, ...]], ...] = (
 # Source label stamped on every measured row (distinguishes from the disk fallback).
 _SOURCE = "request-body"
 
+# Categories matched by a stable name/label key across turns (one entry per name within a
+# snapshot). Messages are matched separately, by content hash, since their position shifts.
+_NAMED_CATEGORIES = ("tools", "mcp", "system")
+
+# A turn that drops at least this many message tokens is labeled a compaction (the large
+# REMOVED the AC calls for). Tuned for real sessions, where compaction sheds tens of
+# thousands of tokens at once.
+# UPGRADE: switch to a ratio of the prior snapshot total if a small session ever compacts
+# below this floor — when per-spoke prefix sizes vary enough that a flat floor mislabels.
+COMPACTION_DROP_TOKENS = 10_000
+
 # One ``<system-reminder>…</system-reminder>`` block (DOTALL: spans newlines).
 _REMINDER_RE = re.compile(r"<system-reminder>(.*?)</system-reminder>", re.DOTALL)
 # A bare identifier — a stripped reminder line that is exactly one tool name.
@@ -83,6 +96,30 @@ class ContextItem:
     name: str
     text: str
     cached: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ContextDelta:
+    """The per-component change in loaded context between two consecutive snapshots.
+
+    Attributes:
+        added: Measured rows for items present only in the newer snapshot (a tool schema
+            loaded via ToolSearch, a new message, ...). Each row carries positive ``tokens``.
+        removed: Measured rows for items present only in the older snapshot (messages dropped
+            by compaction, a tool unloaded). Each row's ``tokens`` is the size that left.
+        changed: Measured rows for named items present in both whose text resized, each with
+            extra ``prev_tokens`` and signed ``delta_tokens`` keys.
+        net_tokens: ``sum(added) - sum(removed) + sum(changed deltas)`` -- the net token change,
+            reconciled (approximately) against that turn's observed ``cache_creation``.
+        label: ``"compaction"`` when the dropped message tokens cross
+            :data:`COMPACTION_DROP_TOKENS`, else None.
+    """
+
+    added: list[dict[str, object]]
+    removed: list[dict[str, object]]
+    changed: list[dict[str, object]]
+    net_tokens: int
+    label: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,6 +339,175 @@ def measure_request_items(
             }
         )
     return rows
+
+
+def _full_message_items(messages: object) -> list[ContextItem]:
+    """Itemize the WHOLE ``messages`` array, one :class:`ContextItem` per message.
+
+    Unlike :func:`_message_items` (which only splits ``messages[0]`` into reminder kinds for
+    the #87 turn-0 baseline), this captures every turn so the differ can see messages added
+    and dropped. Each item's ``text`` is the canonical ``{role, content}`` JSON — its content
+    hash, not its position, is the matching identity (so a compaction that shifts indices does
+    not churn the survivors). The name carries the index purely for display.
+    """
+    if not isinstance(messages, list):
+        return []
+    items: list[ContextItem] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", "?"))
+        text = json.dumps(
+            {"role": role, "content": message.get("content")}, ensure_ascii=False, sort_keys=True
+        )
+        items.append(ContextItem("messages", f"msg[{index}]:{role}", text))
+    return items
+
+
+def snapshot_items(obj: dict[str, object]) -> list[ContextItem]:
+    """Itemize one request body for diffing: tools + system + every message.
+
+    Reuses the #87 :func:`_tool_items` / :func:`_system_items` itemizers and adds full
+    per-message items (see :func:`_full_message_items`). The cached-prefix flags are
+    irrelevant to a diff, so they are left False; :func:`parse_request_obj` (the #87 turn-0
+    baseline path) is untouched.
+    """
+    tools = _tool_items(obj.get("tools"), cached=False)
+    system, _ = _system_items(obj.get("system"), any_later_boundary=False)
+    return [*tools, *system, *_full_message_items(obj.get("messages"))]
+
+
+def _content_hash(text: str) -> str:
+    """Return a stable hash of an item's text — the content identity used to match messages."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _measure_one(item: ContextItem, *, counter: TokenCounter, price: float) -> dict[str, object]:
+    """Measure one item into a row, reusing :func:`measure_request_items`'s row shape."""
+    return measure_request_items([item], counter=counter, price=price)[0]
+
+
+def _named_index(items: list[ContextItem]) -> dict[tuple[str, str], ContextItem]:
+    """Index the name-matched categories (tools / mcp / system) by ``(category, name)``."""
+    return {
+        (item.category, item.name): item for item in items if item.category in _NAMED_CATEGORIES
+    }
+
+
+def _changed_row(
+    prev: ContextItem, curr: ContextItem, *, counter: TokenCounter, price: float
+) -> dict[str, object]:
+    """Build a size-change row for a named item, adding its prior size and signed delta."""
+    row = _measure_one(curr, counter=counter, price=price)
+    prev_tokens, _ = _count(prev.text, counter)
+    row["prev_tokens"] = prev_tokens
+    row["delta_tokens"] = int(row["tokens"]) - prev_tokens  # type: ignore[arg-type]
+    return row
+
+
+def _diff_named(
+    prev_items: list[ContextItem],
+    curr_items: list[ContextItem],
+    *,
+    counter: TokenCounter,
+    price: float,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+    """Diff the name-matched categories into ``(added, removed, changed)`` rows."""
+    prev, curr = _named_index(prev_items), _named_index(curr_items)
+    added = [
+        _measure_one(item, counter=counter, price=price)
+        for key, item in curr.items()
+        if key not in prev
+    ]
+    removed = [
+        _measure_one(item, counter=counter, price=price)
+        for key, item in prev.items()
+        if key not in curr
+    ]
+    changed = [
+        _changed_row(prev[key], item, counter=counter, price=price)
+        for key, item in curr.items()
+        if key in prev and prev[key].text != item.text
+    ]
+    return added, removed, changed
+
+
+def _group_messages_by_hash(items: list[ContextItem]) -> dict[str, list[ContextItem]]:
+    """Group message items by content hash, preserving order within each hash bucket."""
+    groups: dict[str, list[ContextItem]] = defaultdict(list)
+    for item in items:
+        if item.category == "messages":
+            groups[_content_hash(item.text)].append(item)
+    return groups
+
+
+def _diff_messages(
+    prev_items: list[ContextItem],
+    curr_items: list[ContextItem],
+    *,
+    counter: TokenCounter,
+    price: float,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Diff messages by content-hash multiset into ``(added, removed)`` rows.
+
+    A message is matched by the hash of its ``{role, content}`` text, not its index, so the
+    survivors of a compaction (now at shifted positions) are not re-churned. Surplus copies on
+    the newer side are ADDED; surplus on the older side are REMOVED. Messages never size-change
+    (the API conversation is append-only bar compaction), so there is no changed bucket.
+    """
+    prev = _group_messages_by_hash(prev_items)
+    curr = _group_messages_by_hash(curr_items)
+    added: list[dict[str, object]] = []
+    for digest, items in curr.items():
+        surplus = len(items) - len(prev.get(digest, []))
+        added.extend(_measure_one(item, counter=counter, price=price) for item in items[:surplus])
+    removed: list[dict[str, object]] = []
+    for digest, items in prev.items():
+        surplus = len(items) - len(curr.get(digest, []))
+        removed.extend(_measure_one(item, counter=counter, price=price) for item in items[:surplus])
+    return added, removed
+
+
+def _turn_label(removed: list[dict[str, object]]) -> str | None:
+    """Label a turn ``"compaction"`` when its dropped message tokens cross the threshold."""
+    dropped = sum(int(row["tokens"]) for row in removed if row["category"] == "messages")  # type: ignore[arg-type]
+    return "compaction" if dropped >= COMPACTION_DROP_TOKENS else None
+
+
+def diff_snapshots(
+    prev_items: list[ContextItem],
+    curr_items: list[ContextItem],
+    *,
+    counter: TokenCounter,
+    price: float,
+) -> ContextDelta:
+    """Diff two consecutive snapshots into per-component added / removed / size-changed rows.
+
+    Named items (tools / mcp / system) are matched by ``(category, name)`` — appearing only in
+    the newer snapshot is ADDED, only in the older is REMOVED, and a text resize at the same
+    key is SIZE-CHANGED with a signed ``delta_tokens``. Messages are matched by content hash
+    (see :func:`_diff_messages`). ``net_tokens`` sums the three buckets and the turn is labeled
+    a compaction when the dropped message tokens cross :data:`COMPACTION_DROP_TOKENS`.
+
+    Args:
+        prev_items: The older snapshot's items (see :func:`snapshot_items`).
+        curr_items: The newer snapshot's items.
+        counter: Token counter; raises ``CountTokensError`` to trigger the char/4 fallback.
+        price: Cache-creation price in USD per token.
+
+    Returns:
+        The :class:`ContextDelta` for the transition.
+    """
+    added, removed, changed = _diff_named(prev_items, curr_items, counter=counter, price=price)
+    msg_added, msg_removed = _diff_messages(prev_items, curr_items, counter=counter, price=price)
+    added.extend(msg_added)
+    removed.extend(msg_removed)
+    net = (
+        sum(int(row["tokens"]) for row in added)  # type: ignore[arg-type]
+        - sum(int(row["tokens"]) for row in removed)  # type: ignore[arg-type]
+        + sum(int(row["delta_tokens"]) for row in changed)  # type: ignore[arg-type]
+    )
+    return ContextDelta(added, removed, changed, net, _turn_label(removed))
 
 
 def first_real_request(paths: list[Path]) -> Path | None:
