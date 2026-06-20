@@ -1,0 +1,7 @@
+{
+  "model": "claude-haiku-4-5",
+  "max_tokens": 512,
+  "tools": [],
+  "system": [{"type": "text", "text": "tiny aux prefix"}],
+  "messages": [{"role": "user", "content": "classify this in one word"}]
+}

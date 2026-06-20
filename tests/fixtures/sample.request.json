@@ -1,0 +1,56 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 32000,
+  "betas": ["context-management-2025-06-27"],
+  "thinking": {"type": "enabled", "budget_tokens": 10000},
+  "metadata": {"user_id": "REDACTED-PII-DO-NOT-LOG"},
+  "context_management": {"edits": [{"type": "clear_tool_uses_20250919"}]},
+  "tools": [
+    {
+      "name": "Bash",
+      "description": "Run a shell command.",
+      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}
+    },
+    {
+      "name": "Workflow",
+      "description": "Run a multi-agent workflow script. This schema is intentionally the largest resident tool so per-tool size ordering is testable against Bash.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "script": {"type": "string", "description": "Self-contained workflow script body."},
+          "name": {"type": "string"},
+          "args": {"type": "object"},
+          "scriptPath": {"type": "string"},
+          "resumeFromRunId": {"type": "string"}
+        }
+      }
+    },
+    {
+      "name": "mcp__claude_ai_Notion__notion-fetch",
+      "description": "Fetch a Notion page.",
+      "input_schema": {"type": "object", "properties": {"id": {"type": "string"}}}
+    }
+  ],
+  "system": [
+    {"type": "text", "text": "Billing header: org and workspace routing line."},
+    {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+    {"type": "text", "text": "Base system prompt with the bulk of the standing instructions for the session, cached as a prefix.", "cache_control": {"type": "ephemeral"}},
+    {"type": "text", "text": "Tool-use and tool-output formatting system prompt, also cached.", "cache_control": {"type": "ephemeral"}}
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "<system-reminder>\nSessionStart hook additional context: seed a task ledger before your first commit.\n</system-reminder>\n<system-reminder>\nThe following deferred tools are now available via ToolSearch. Their schemas are NOT loaded:\nCronCreate\nWebFetch\nWebSearch\nmcp__claude_ai_Slack__authenticate\n</system-reminder>\n<system-reminder>\nAvailable agent types for the Agent tool:\n- architect: System design and architecture decisions.\n- code-review: Review code changes.\n</system-reminder>\n<system-reminder>\nThe following skills are available for use with the Skill tool:\n- afk: Drain the backlog unattended.\n- hub: Orient a fresh planning-hub session.\n</system-reminder>\n<system-reminder>\n# claudeMd\nContents of CLAUDE.md (project instructions).\n# Memory Index\n- a recalled memory line.\n# currentDate\nToday's date is 2026-06-20.\n</system-reminder>"
+        },
+        {
+          "type": "text",
+          "text": "Source the spoke's loaded-context itemization from the raw request body.",
+          "cache_control": {"type": "ephemeral"}
+        }
+      ]
+    }
+  ]
+}
