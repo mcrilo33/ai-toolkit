@@ -231,6 +231,19 @@ if [ -n "$WT_DIR" ]; then
   wt_emit_script "worktree-land" "success" "$WT_T0" "$WT_DIR"
 fi
 
+# --- telemetry: automated post-run Langfuse ingestion ----------------------------
+# An OTel spoke (AI_TOOLKIT_OTEL=1) only streams native traces live; the loaded-
+# context itemization (#87) and transcript backfill (#92) are post-run steps that
+# must read a SETTLED state, so run them now — after the push lands but BEFORE the
+# tmux/worktree teardown SIGKILLs the spoke (dropping in-flight spans) and removes
+# the worktree (taking its spoke-run-id + raw request bodies with it). The helper
+# self-gates (not-an-OTel spoke, no LANGFUSE_BASIC_AUTH) and is best-effort: it
+# never fails the land, so it never blocks shipping. No worktree (--local) → no-op.
+if [ -n "$WT_DIR" ]; then
+  bash "$SCRIPT_DIR/telemetry-ingest-spoke.sh" "$WT_DIR" \
+    || wt_warn "post-run Langfuse ingestion errored — landing continues"
+fi
+
 if [ -n "$WT_DIR" ]; then
   bash "$SCRIPT_DIR/worktree-done.sh" "$WT_DIR" ${KEEP_BRANCH:+--keep-branch}
 elif [ -z "$KEEP_BRANCH" ]; then
