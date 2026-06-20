@@ -79,6 +79,12 @@ def _tele_env(telemetry_dir: Path | None, *, enabled: bool = True) -> dict[str, 
     # #26) and the scripts refuse under it, so drop any inherited marker — e.g.
     # when the suite runs from a spoke's pre-push gate.
     env.pop("WT_SPOKE", None)
+    # These lifecycle/script-span tests are orthogonal to native OTel, which now
+    # defaults ON (issue: otel-default). Opt out explicitly so the launch builds no
+    # OTel prefix and — critically — never reaches the bridge preflight, which would
+    # spawn a real python3 bridge if a host LANGFUSE_BASIC_AUTH were set, breaking
+    # hermeticity. AI_TOOLKIT_OTEL=0 is the clean full opt-out.
+    env["AI_TOOLKIT_OTEL"] = "0"
     if enabled:
         env["AI_TOOLKIT_TELEMETRY"] = "1"
     if telemetry_dir is not None:
