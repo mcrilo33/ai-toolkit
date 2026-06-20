@@ -1,6 +1,11 @@
 """Unit tests for the is_blank text helper."""
 
-from scripts.telemetry._textutil import is_blank
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+
+from telemetry._textutil import is_blank
 
 
 def test_is_blank_none():
