@@ -98,6 +98,7 @@ from telemetry.measure_context_cost import (
 )
 from telemetry.request_body import (
     ContextDelta,
+    ContextItem,
     diff_snapshots,
     first_real_request,
     measure_request_items,
@@ -1104,9 +1105,19 @@ def context_evolution_deltas(
     """Diff every consecutive raw request body in ``bodies_dir`` into per-turn deltas.
 
     The bodies are itemized in chronological order (``find_request_files`` sorts by mtime)
-    and each consecutive pair is diffed; turn 0 is the baseline (the #87 ``loaded-context``),
-    so a delta's turn index is the newer body's position. Turns whose context did not change
-    are dropped, so only evolving turns are returned.
+    and each consecutive pair is diffed; turn 0 is the baseline, so a delta's turn index is
+    the newer body's position. Turns whose context did not change are dropped, so only evolving
+    turns are returned.
+
+    The turn index is the RAW file position, NOT a position in the parsed-only list: an
+    unparseable body becomes a ``None`` hole that drops the two transitions touching it but
+    leaves every other turn index intact, so the indices keep aligning with
+    :func:`_reconciliation_map` (which keys off the full file list).
+
+    Note the turn-0 baseline here is the first dumped body, which may be a degenerate aux call
+    (empty ``tools``) that the #87 ``loaded-context`` path skips via ``first_real_request``; the
+    first evolving turn then surfaces the real prefix load as a large ADD. The #87 baseline
+    itself is unaffected.
 
     Args:
         bodies_dir: The per-spoke ``OTEL_LOG_RAW_API_BODIES=file:<dir>`` dump directory.
@@ -1116,15 +1127,19 @@ def context_evolution_deltas(
     Returns:
         ``(turn_index, ContextDelta)`` pairs for the evolving turns, in turn order.
     """
-    snapshots = []
+    snapshots: list[list[ContextItem] | None] = []
     for path in find_request_files(bodies_dir):
         try:
             snapshots.append(snapshot_items_from_path(path))
         except (OSError, json.JSONDecodeError):
             logger.warning("cannot itemize request body %s", path)
+            snapshots.append(None)  # a hole: preserve raw positions, never bridge across it
     deltas: list[tuple[int, ContextDelta]] = []
     for index in range(1, len(snapshots)):
-        delta = diff_snapshots(snapshots[index - 1], snapshots[index], counter=counter, price=price)
+        prev, curr = snapshots[index - 1], snapshots[index]
+        if prev is None or curr is None:
+            continue
+        delta = diff_snapshots(prev, curr, counter=counter, price=price)
         if delta.added or delta.removed or delta.changed:
             deltas.append((index, delta))
     return deltas
@@ -1244,6 +1259,12 @@ def _reconciliation_map(traces: list[TraceObservations], bodies_dir: Path) -> di
     Aligns the LLM calls (by ``startTime``) with the request bodies (by mtime) positionally.
     The mapping is returned ONLY when the two counts match — otherwise an aux/degenerate call
     has skewed the alignment and a wrong cross-check would mislead, so it is omitted entirely.
+    This is why the cross-check is advisory (``≈``): the count gate catches a missing call but
+    not a reordering, since the two orderings come from independent clocks.
+
+    UPGRADE: join LLM calls to bodies by a shared key (``prompt.id`` / request id) instead of
+    positional order — when near-simultaneous requests can flush spans and dump files in
+    different orders and the positional alignment silently mismatches.
     """
     writes = per_turn_cache_creation(traces)
     bodies = find_request_files(bodies_dir)

@@ -835,6 +835,19 @@ class TestContextEvolutionSubtree:
         assert len(events) == 1
         assert events[0]["body"]["name"] == "context-evolution"
 
+    def test_observed_cache_creation_is_stamped_for_reconciliation(self) -> None:
+        # Arrange: turn 1 net is 370; pass the turn's observed cache_creation as ~390.
+        events = build_context_evolution_events(
+            SPOKE,
+            self._deltas(),
+            base_ts="2026-01-01T00:00:00Z",
+            cache_creation_by_turn={1: 390},
+        )
+        turn1 = next(b for n, b in _lc_by_name(events).items() if n.startswith("turn 1"))
+
+        # Assert: the observed value is recorded so net can be cross-checked against it.
+        assert turn1["metadata"]["cache_creation_observed"] == 390
+
 
 class TestContextEvolutionDeltas:
     """Wiring: diff every consecutive raw request body, ordered, skipping unchanged turns."""
@@ -873,3 +886,24 @@ class TestContextEvolutionDeltas:
         empty = tmp_path / "empty"
         empty.mkdir()
         assert context_evolution_deltas(empty, counter=len, price=1.0) == []
+
+    def test_turn_index_tracks_raw_file_position_across_an_unparseable_body(
+        self, tmp_path: Path
+    ) -> None:
+        # Arrange: a corrupt body at position 0 precedes two valid turns. The turn index must
+        # stay the RAW file position (so it aligns with the reconciliation map, which keys off
+        # the full file list), NOT the compacted parsed-only position.
+        bodies = tmp_path / "bodies"
+        bodies.mkdir()
+        bash = {"name": "Bash", "description": "d", "input_schema": {"type": "object"}}
+        web = {"name": "WebSearch", "description": "d", "input_schema": {"type": "object"}}
+        body = {"system": [{"type": "text", "text": "sys"}], "messages": []}
+        (bodies / "00-body.request.json").write_text("{ not json", encoding="utf-8")
+        self._write(bodies, 1, {**body, "tools": [bash]})
+        self._write(bodies, 2, {**body, "tools": [bash, web]})
+
+        # Act
+        deltas = context_evolution_deltas(bodies, counter=len, price=1.0)
+
+        # Assert: one diff (positions 1->2), indexed at raw position 2, not compacted 1.
+        assert [turn for turn, _delta in deltas] == [2]
