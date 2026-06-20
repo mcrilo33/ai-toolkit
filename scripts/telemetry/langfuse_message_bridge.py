@@ -619,7 +619,12 @@ class Bridge:
 
         A Pre hook takes the nearest-FOLLOWING decision (smallest sequence greater than the
         hook's), a Post hook the nearest-PRECEDING (largest sequence less than the hook's);
-        both require an exact ``tool_name`` match so a hook never binds to the wrong tool.
+        both require an exact ``tool_name`` match, so a hook never binds to a different tool
+        *type*. Like the body join, the attribution is purely temporal: two calls of the SAME
+        tool are told apart only by sequence, so if one of them emits no ``tool_decision``
+        (e.g. an aborted call) the surviving decision is the nearest match for both hooks and
+        one can bind to the adjacent same-tool call. There is no per-call id on the hook event
+        to resolve this, exactly as for the interleaved-agent body case.
         """
         matches = [(s, tuid) for (s, t, tuid) in self._tool_decisions if t == tool]
         if direction == "pre":
