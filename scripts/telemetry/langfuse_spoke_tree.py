@@ -130,6 +130,13 @@ _ROOT_PREFIX = "spokeroot-"
 _COPY_PREFIX = "tree-"
 # Deterministic id prefix for the synthetic cycle-step nodes (#100, derived from the ledger).
 _STEP_PREFIX = "tree-step-"
+# Deterministic id prefix for the numeric Langfuse scores (#100 amendment: chartable time budget).
+_SCORE_PREFIX = "tree-score-"
+# Score names — Langfuse sums/charts numeric scores (it cannot chart arbitrary metadata).
+_PERMISSION_WAIT_SCORE = "permission_wait_ms"  # per blocked tool observation
+_GATE_PARK_SCORE = "gate_park_ms"  # trace-level PLAN-gate park wait
+# The spoke-ready --gate emission: a kind=script span labelled ``<kind>:<phase>`` in OTel.
+_GATE_OBSERVATION_NAME = "script:gate"
 _TRACE_NAME_PREFIX = "spoke-tree:"
 _ROOT_NAME_PREFIX = "spoke:"
 
@@ -324,21 +331,26 @@ def _is_fold_subspan(observation: Observation) -> bool:
     )
 
 
-def _duration_ms(observation: Observation) -> int | None:
-    """Return a span's wall-clock duration in ms from its ISO start/end, or None.
+def _elapsed_ms(start: str, end: str) -> int | None:
+    """Return ``end - start`` in ms from two ISO timestamps, or None when uncomputable.
 
     Catches both a malformed timestamp (``ValueError``) and a mixed naive/aware pair
     (``TypeError`` — subtracting an offset-aware from an offset-naive datetime), so one odd
-    span never aborts the whole assembly; the ms is simply omitted.
+    pair never aborts the whole assembly; the value is simply omitted.
     """
-    start, end = observation.get("startTime"), observation.get("endTime")
-    if not start or not end:
-        return None
     try:
         delta = datetime.fromisoformat(end) - datetime.fromisoformat(start)
     except (ValueError, TypeError):
         return None
     return int(delta.total_seconds() * 1000)
+
+
+def _duration_ms(observation: Observation) -> int | None:
+    """Return a span's wall-clock duration in ms from its ISO start/end, or None."""
+    start, end = observation.get("startTime"), observation.get("endTime")
+    if not start or not end:
+        return None
+    return _elapsed_ms(start, end)
 
 
 def _attr(observation: Observation, *keys: str) -> object | None:
@@ -1556,6 +1568,136 @@ def apply_llm_decomposition(
     return decomposed
 
 
+def _score_id(spoke_run_id: str, name: str, target: str) -> str:
+    """Return the deterministic id of one score for a spoke (idempotent across reruns)."""
+    digest = hashlib.sha1(f"{spoke_run_id}:score:{name}:{target}".encode()).hexdigest()[:24]
+    return _SCORE_PREFIX + digest
+
+
+def _score_event(
+    spoke_run_id: str,
+    *,
+    name: str,
+    value: int,
+    trace_id: str,
+    base_ts: str,
+    observation_id: str | None = None,
+) -> IngestEvent:
+    """Shape one numeric ``score-create`` ingestion event (trace- or observation-level)."""
+    target = observation_id or "trace"
+    score_id = _score_id(spoke_run_id, name, target)
+    body: dict[str, Any] = {
+        "id": score_id,
+        "traceId": trace_id,
+        "name": name,
+        "value": value,
+        "dataType": "NUMERIC",
+    }
+    if observation_id is not None:
+        body["observationId"] = observation_id
+    return {"id": score_id, "type": "score-create", "timestamp": base_ts, "body": body}
+
+
+def _is_activity_observation(observation: Observation) -> bool:
+    """Whether an observation is genuine spoke activity (a turn, an LLM call, or a tool call).
+
+    Used to find where the spoke resumed after a PLAN-gate park — the markers, hooks, and
+    script spans that may fire right after the gate are NOT activity and are skipped.
+    """
+    if observation.get("type") == "GENERATION":
+        return True
+    name = observation.get("name") or ""
+    return name == _INTERACTION_NAME or name.startswith("tool:")
+
+
+def _gate_park_ms(traces: list[TraceObservations]) -> int | None:
+    """Return the PLAN-gate park wait in ms, or None when the spoke never parked at a gate.
+
+    The park starts at the end of the earliest ``script:gate`` observation (the
+    ``spoke-ready.sh --gate`` emission) and ends at the first genuine spoke activity
+    (:func:`_is_activity_observation`) that starts after it — the resumption once the plan was
+    approved. None when there is no gate observation or nothing resumed after it.
+    """
+    gate_ends: list[str] = []
+    for _orig_trace_id, observations in traces:
+        for observation in observations:
+            if (observation.get("name") or "") != _GATE_OBSERVATION_NAME:
+                continue
+            end = observation.get("endTime") or observation.get("startTime")
+            if end:
+                gate_ends.append(end)
+    if not gate_ends:
+        return None
+    gate_end = min(gate_ends)
+    resumes: list[str] = []
+    for _orig_trace_id, observations in traces:
+        for observation in observations:
+            start = observation.get("startTime")
+            if _is_activity_observation(observation) and start and start > gate_end:
+                resumes.append(start)
+    if not resumes:
+        return None
+    return _elapsed_ms(gate_end, min(resumes))
+
+
+def build_score_events(
+    spoke_run_id: str,
+    traces: list[TraceObservations],
+    batch: list[IngestEvent],
+    *,
+    base_ts: str,
+) -> list[IngestEvent]:
+    """Build the numeric Langfuse scores that make the spoke's time budget chartable (#100).
+
+    Langfuse dashboards can sum/aggregate numeric SCORES but not arbitrary observation metadata,
+    so two time-budget signals already present as metadata are ALSO emitted as scores:
+
+    - ``permission_wait_ms`` — an observation-level score on every ``tool:`` node carrying a
+      folded ``blocked_on_user_ms`` (Part 2), so permission-prompt wait sums across spokes.
+    - ``gate_park_ms`` — a trace-level score for the PLAN-gate park (:func:`_gate_park_ms`),
+      emitted only when the spoke parked at a gate.
+
+    All ids derive from the spoke run id so a rerun overwrites the same scores.
+
+    Args:
+        spoke_run_id: The spoke run identifier.
+        traces: The source traces (for the gate-park gap).
+        batch: The assembled events (read for the folded ``blocked_on_user_ms`` tool metadata).
+        base_ts: ISO timestamp stamped on every score event.
+
+    Returns:
+        The ``score-create`` ingestion events (empty when neither signal is present).
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    events: list[IngestEvent] = []
+    for event in batch:
+        body = event["body"]
+        wait = (body.get("metadata") or {}).get("blocked_on_user_ms")
+        if wait is not None:
+            events.append(
+                _score_event(
+                    spoke_run_id,
+                    name=_PERMISSION_WAIT_SCORE,
+                    value=int(wait),
+                    trace_id=trace_id,
+                    base_ts=base_ts,
+                    observation_id=body["id"],
+                )
+            )
+    park = _gate_park_ms(traces)
+    if park is not None:
+        events.append(
+            _score_event(
+                spoke_run_id,
+                name=_GATE_PARK_SCORE,
+                value=park,
+                trace_id=trace_id,
+                base_ts=base_ts,
+            )
+        )
+    return events
+
+
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse the CLI arguments for the spoke-tree assembler."""
     env = os.environ
@@ -1648,7 +1790,8 @@ def main(argv: list[str] | None = None) -> int:
     decomposed = apply_llm_decomposition(
         batch, traces, bodies_dir, counter=counter, price=args.price
     )
-    post_in_chunks(batch + context_events, post)
+    score_events = build_score_events(args.spoke_run_id, traces, batch, base_ts=base_ts)
+    post_in_chunks(batch + context_events + score_events, post)
 
     trace_id = trace_id_for(args.spoke_run_id)
     filled = filled_tool_spans(traces, tool_content)
@@ -1656,7 +1799,8 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(batch) - 2} observations assembled under trace {trace_id} "
         f"(roots collapsed to 1), {filled} tool spans filled from transcript, "
         f"{len(rows)} loaded-context items itemized (source: {source}), "
-        f"{decomposed} llm_requests cache-decomposed"
+        f"{decomposed} llm_requests cache-decomposed, "
+        f"{len(score_events)} numeric scores emitted"
     )
     return 0
 
