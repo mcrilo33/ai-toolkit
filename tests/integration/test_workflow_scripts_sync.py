@@ -23,6 +23,9 @@ SYNC_SCRIPT = REPO_ROOT / "scripts" / "sync-to-repo.sh"
 # spoke-push.sh ships alongside the worktree scripts so the spoke's PUSH step
 # runs as one allowlistable process (issue #37); spoke-ready.sh ships too so
 # marker emission (ready/N, gate/N) is one allowlistable command (issue #45).
+# telemetry-ingest-spoke.sh ships so the synced worktree-land.sh can call it at
+# teardown for the #87/#92 post-run Langfuse ingestion; worktree-quick.sh ships
+# so the /quick express lane resolves in a synced target.
 WORKTREE_SCRIPTS = (
     "worktree-new.sh",
     "worktree-land.sh",
@@ -30,6 +33,8 @@ WORKTREE_SCRIPTS = (
     "worktree-lib.sh",
     "spoke-push.sh",
     "spoke-ready.sh",
+    "telemetry-ingest-spoke.sh",
+    "worktree-quick.sh",
 )
 SOURCES = {name: REPO_ROOT / "scripts" / name for name in WORKTREE_SCRIPTS}
 HUB_SCRIPTS_DIR = REPO_ROOT / "shared" / "skills" / "hub" / "scripts"
