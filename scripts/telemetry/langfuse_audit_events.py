@@ -193,6 +193,34 @@ def _build_metadata(spec: AuditSpec, attrs: dict[str, str]) -> dict[str, str]:
     return {key: attrs[key] for key in keys if attrs.get(key) is not None}
 
 
+def _observation_id(attrs: dict[str, str], trace_key: str) -> str:
+    """Return a deterministic, collision-free id for one audit observation.
+
+    Keyed on ``(trace_key, session.id, sequence)`` so it is idempotent on re-ingest yet
+    unique across a spoke's resumed sessions: ``event.sequence`` is monotonic only *within*
+    a session, so two resumes under one ``spoke_run_id`` can repeat a sequence number, and
+    ``session.id`` disambiguates them. When ``event.sequence`` is absent the discriminator
+    falls back to ``event.timestamp`` then a content fingerprint, so distinct same-named
+    events never silently overwrite one another. Hashed for a stable id like the sibling
+    :func:`telemetry.langfuse_spoke_tree._copy_id`.
+
+    Args:
+        attrs: The merged OTLP resource + log-record attributes.
+        trace_key: The spoke run id (or ``session.id`` fallback) selecting the audit trace.
+
+    Returns:
+        A stable ``audit-<sha1[:24]>`` observation id.
+    """
+    session = attrs.get("session.id", "")
+    discriminator = (
+        attrs.get("event.sequence")
+        or attrs.get("event.timestamp")
+        or hashlib.sha1(repr(sorted(attrs.items())).encode()).hexdigest()[:16]
+    )
+    digest = hashlib.sha1(f"{trace_key}\x1f{session}\x1f{discriminator}".encode()).hexdigest()
+    return f"{_TRACE_PREFIX}{digest[:24]}"
+
+
 def build_audit_event(attrs: dict[str, str], *, trace_key: str) -> dict[str, Any] | None:
     """Map one merged log-event attribute dict to a Langfuse ``event-create``, or None.
 
@@ -207,9 +235,8 @@ def build_audit_event(attrs: dict[str, str], *, trace_key: str) -> dict[str, Any
     spec = AUDIT_SPECS.get(attrs.get("event.name", ""))
     if spec is None:
         return None
-    sequence = attrs.get("event.sequence") or attrs.get("event.name", "event")
     timestamp = attrs.get("event.timestamp") or _INGEST_TIMESTAMP
-    event_id = f"{_TRACE_PREFIX}{trace_key}-{sequence}"
+    event_id = _observation_id(attrs, trace_key)
     name = attrs["event.name"]
     if spec.discriminator and attrs.get(spec.discriminator):
         name = f"{name}:{attrs[spec.discriminator]}"

@@ -424,6 +424,24 @@ def test_audit_event_falls_back_to_session_id_when_no_spoke_run_id() -> None:
     assert create.batches[0][0]["body"]["sessionId"] == "sess-9"
 
 
+def test_audit_event_without_a_spoke_key_is_dropped() -> None:
+    # Arrange: no spoke_run_id and no session.id — there is no trace to attach to.
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+
+    # Act
+    bridge.on_logs(
+        _audit_log_payload(
+            {},
+            _audit_record(**{"event.name": "compaction", "event.sequence": "1"}),
+        )
+    )
+
+    # Assert: nothing created (and nothing patched).
+    assert create.batches == []
+    assert patch.calls == []
+
+
 def test_response_body_does_not_reach_the_create_sink() -> None:
     # Arrange: an api_response_body (existing patch path) must not create observations.
     patch, create = _Sink(), _CreateSink()

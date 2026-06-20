@@ -83,9 +83,9 @@ def test_tool_decision_reject_creates_a_warning_event() -> None:
     # Assert: an event-create on the spoke audit trace, WARNING, full metadata.
     assert event is not None
     assert event["type"] == "event-create"
-    assert event["id"] == "audit-spoke-abc-42"
     body = event["body"]
-    assert body["id"] == "audit-spoke-abc-42"
+    assert event["id"] == body["id"]
+    assert body["id"].startswith("audit-")
     assert body["traceId"] == audit_trace_id("spoke-abc")
     assert body["name"] == "tool_decision:reject"
     assert body["level"] == "WARNING"
@@ -176,6 +176,53 @@ def test_compaction_carries_pre_and_post_tokens() -> None:
     assert event["body"]["metadata"]["pre_tokens"] == "150000"
     assert event["body"]["metadata"]["post_tokens"] == "42000"
     assert event["body"]["metadata"]["trigger"] == "auto"
+
+
+# --- build_audit_event: observation-id idempotency + collision safety --------
+
+
+def _id(attrs: dict[str, str], trace_key: str = "spoke-abc") -> str:
+    event = build_audit_event(attrs, trace_key=trace_key)
+    assert event is not None
+    return event["body"]["id"]
+
+
+def test_observation_id_is_idempotent() -> None:
+    # Arrange / Act: the same event twice (a re-ingest) must produce the same id.
+    attrs = _merged(
+        **{
+            "event.name": "compaction",
+            "event.sequence": "5",
+            "session.id": "sess-1",
+        }
+    )
+
+    # Assert
+    assert _id(attrs) == _id(attrs)
+
+
+def test_observation_id_disambiguates_resumed_sessions_with_same_sequence() -> None:
+    # Arrange: event.sequence is monotonic only WITHIN a session, so a resumed spoke
+    # (same spoke_run_id / trace_key) can repeat a sequence number across sessions. The id
+    # must not collide, or the second event would silently overwrite the first.
+    base = {"event.name": "compaction", "event.sequence": "5"}
+
+    # Act
+    first = _id(_merged(**base, **{"session.id": "sess-1"}))
+    second = _id(_merged(**base, **{"session.id": "sess-2"}))
+
+    # Assert
+    assert first != second
+
+
+def test_observation_id_disambiguates_missing_sequence_by_timestamp() -> None:
+    # Arrange: with no event.sequence, two distinct same-named events must still differ —
+    # the fallback keys on event.timestamp rather than the (shared) event.name.
+    first = _id(_merged(**{"event.name": "compaction", "event.timestamp": "2026-06-20T00:00:01Z"}))
+    second = _id(_merged(**{"event.name": "compaction", "event.timestamp": "2026-06-20T00:00:02Z"}))
+
+    # Assert
+    assert first != second
 
 
 # --- build_audit_event: discrimination + skipping ----------------------------
