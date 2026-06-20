@@ -302,6 +302,11 @@ def parse_request_body(path: Path) -> RequestBody:
     return parse_request_obj(_load(path))
 
 
+def snapshot_items_from_path(path: Path) -> list[ContextItem]:
+    """Itemize a ``.request.json`` dump at ``path`` for diffing (see :func:`snapshot_items`)."""
+    return snapshot_items(_load(path))
+
+
 def _load(path: Path) -> dict[str, object]:
     """Load and return the JSON object at ``path``."""
     with Path(path).open(encoding="utf-8") as handle:
