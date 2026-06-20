@@ -242,6 +242,88 @@ class TestBuildBatch:
         copy = _by_orig(batch, "trace-hook", "h8")
         assert copy["body"]["parentObservationId"] == root_id_for(SPOKE)
 
+    def test_tool_decision_audit_event_nests_under_its_tool(self) -> None:
+        # A #93 tool_decision audit observation (event-create, type EVENT) carries its
+        # tool_use_id in FLAT metadata and no parentObservationId. It must nest under the
+        # tool sharing that id, exactly like a gate hook.
+        tool = _obs(
+            "t7",
+            "Bash",
+            parent=None,
+            metadata={"attributes": {"gen_ai.tool.call.id": "tu-7"}},
+        )
+        decision = _obs(
+            "d7",
+            "tool_decision:allow",
+            type_="EVENT",
+            parent=None,
+            metadata={"tool_name": "Bash", "tool_use_id": "tu-7", "decision": "allow"},
+        )
+        traces = [("trace-tool", [tool]), ("trace-audit", [decision])]
+
+        batch = build_batch(traces, SPOKE)
+
+        copy = _by_orig(batch, "trace-audit", "d7")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-tool", "t7")
+
+    def test_tool_result_audit_event_nests_under_its_tool(self) -> None:
+        # tool_result audit observations join by the same rule (forward-compat with the
+        # task contract; matched by the tool_* audit-name prefix).
+        tool = _obs("t6", "Read", parent=None, metadata={"attributes": {"tool_use_id": "tu-6"}})
+        result = _obs(
+            "r6",
+            "tool_result",
+            type_="EVENT",
+            parent=None,
+            metadata={"tool_use_id": "tu-6"},
+        )
+        traces = [("trace-tool", [tool]), ("trace-audit", [result])]
+
+        batch = build_batch(traces, SPOKE)
+
+        copy = _by_orig(batch, "trace-audit", "r6")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-tool", "t6")
+
+    def test_audit_event_without_a_match_collapses_to_spoke_root(self) -> None:
+        # An unmatched tool_use_id is never dropped — it falls through to the synthetic root.
+        decision = _obs(
+            "d0",
+            "tool_decision:reject",
+            type_="EVENT",
+            parent=None,
+            metadata={"tool_use_id": "tu-absent", "decision": "reject"},
+        )
+
+        batch = build_batch([("trace-audit", [decision])], SPOKE)
+
+        copy = _by_orig(batch, "trace-audit", "d0")
+        assert copy["body"]["parentObservationId"] == root_id_for(SPOKE)
+
+    def test_hook_nests_under_tool_not_a_sibling_audit_event(self) -> None:
+        # A tool_decision audit event shares the tool_use_id but must NOT become the
+        # re-parent target: an audit event is skipped as an index owner, so the hook still
+        # nests under the genuine tool span even when the audit event is fetched last.
+        tool = _obs("t5", "Bash", parent=None, metadata={"attributes": {"tool_use_id": "tu-5"}})
+        hook = _obs(
+            "h5",
+            "PreToolUse.sh",
+            parent=None,
+            metadata={"attributes": {"workflow.kind": "hook", "tool_use_id": "tu-5"}},
+        )
+        decision = _obs(
+            "d5",
+            "tool_decision:allow",
+            type_="EVENT",
+            parent=None,
+            metadata={"tool_use_id": "tu-5", "decision": "allow"},
+        )
+        traces = [("trace-tool", [tool]), ("trace-hook", [hook]), ("trace-audit", [decision])]
+
+        batch = build_batch(traces, SPOKE)
+
+        hook_copy = _by_orig(batch, "trace-hook", "h5")
+        assert hook_copy["body"]["parentObservationId"] == _copy_id("trace-tool", "t5")
+
     def test_ids_are_deterministic_across_runs(self) -> None:
         first = {event["id"] for event in build_batch(_traces(), SPOKE)}
 
