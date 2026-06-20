@@ -494,6 +494,7 @@ _OTEL_NONSECRET_VARS = (
     "CLAUDE_CODE_ENABLE_TELEMETRY=1",
     "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1",
     "OTEL_TRACES_EXPORTER=otlp",
+    "OTEL_LOGS_EXPORTER=otlp",
     "OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf",
 )
 
@@ -530,6 +531,36 @@ def test_agent_launch_injects_otel_env_when_opted_in(hub: Path, tmp_path: Path) 
     assert "WT_SPOKE=8 CLAUDE_EFFORT=max claude --model opus" in cmd
     assert cmd.index("CLAUDE_CODE_ENABLE_TELEMETRY=1") < cmd.index("WT_SPOKE=8")
     assert cmd.index("OTEL_RESOURCE_ATTRIBUTES=") < cmd.index("WT_SPOKE=8")
+
+
+def test_agent_launch_wires_raw_request_body_file_mode(hub: Path, tmp_path: Path) -> None:
+    # AI_TOOLKIT_OTEL=1 → Claude Code dumps each untruncated request to a per-spoke
+    # dir under the gitignored .ai-toolkit/ (file mode, not the 60KB inline cap), and
+    # that dir is exported as AI_TOOLKIT_OTEL_BODY_DIR so the post-run spoke-tree
+    # builder can itemize loaded context from it (#87). The logs exporter is wired
+    # too, since the raw-body path rides the logs signal.
+    proc, log = _run_new(
+        hub, tmp_path, "8", "some-slug", "--no-code", extra_env={"AI_TOOLKIT_OTEL": "1"}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    cmd = _calls(log.read_text(), "new-window")[0]
+    assert "OTEL_LOGS_EXPORTER=otlp" in cmd
+    assert "OTEL_LOG_RAW_API_BODIES=file:" in cmd
+    assert ".ai-toolkit/raw-bodies" in cmd
+    assert "AI_TOOLKIT_OTEL_BODY_DIR=" in cmd
+
+
+def test_agent_launch_defers_metrics_privacy_flag_to_88(hub: Path, tmp_path: Path) -> None:
+    # #87 wires only the raw-body + logs-exporter path; the metrics account-uuid
+    # privacy default belongs to #88 and must NOT appear here (scope lock).
+    proc, log = _run_new(
+        hub, tmp_path, "8", "some-slug", "--no-code", extra_env={"AI_TOOLKIT_OTEL": "1"}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    cmd = _calls(log.read_text(), "new-window")[0]
+    assert "OTEL_METRICS_INCLUDE_ACCOUNT_UUID" not in cmd
 
 
 def test_agent_launch_never_forwards_otel_secrets(hub: Path, tmp_path: Path) -> None:

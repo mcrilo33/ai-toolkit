@@ -156,11 +156,28 @@ other knobs. The spoke must additionally export `OTEL_LOGS_EXPORTER=otlp` and
 exact `docker run` / spoke-launch lines are documented in the header of
 [`dashboard/langfuse/otelcol.yaml`](../dashboard/langfuse/otelcol.yaml).
 
+### File mode and the per-spoke body dir (issue #87)
+
+`OTEL_LOG_RAW_API_BODIES` also accepts `file:<dir>`, which dumps each request **untruncated**
+(no 60KB cap) to `<dir>/<uuid>.request.json` (and responses to `<request_id>.response.json`)
+and emits a `body_ref` path attr on the log event instead of the inline `body`. The heavy
+conversation content therefore stays on local disk; only the path rides the logs signal.
+This is what the loaded-context itemization consumes.
+
+`worktree-new.sh` wires this under the `AI_TOOLKIT_OTEL=1` gate: it creates
+`<worktree>/.ai-toolkit/raw-bodies/` (gitignored, per-spoke), sets
+`OTEL_LOG_RAW_API_BODIES=file:<that dir>`, and exports `AI_TOOLKIT_OTEL_BODY_DIR=<that dir>`.
+The post-run spoke-tree builder finds the dumps via `--request-bodies`, defaulting to
+`$AI_TOOLKIT_OTEL_BODY_DIR` and then to `<root>/.ai-toolkit/raw-bodies`. The FIRST
+`llm_request` can be a degenerate aux call (tiny prefix, empty `tools`); the builder skips it
+and itemizes the first request whose `tools` array is non-empty.
+
 ### Caveats
 
-- **60KB truncation.** Request bodies over ~60KB hit Claude Code's body cap and arrive as
-  truncated, invalid JSON. The bridge falls back to storing the raw partial text as the
-  observation input, so the request start is still visible rather than dropped.
+- **60KB truncation (inline mode only).** In the legacy inline mode (`=1`), request bodies
+  over ~60KB hit Claude Code's body cap and arrive as truncated, invalid JSON; the bridge
+  falls back to storing the raw partial text so the request start is still visible. File mode
+  (`=file:<dir>`, above) has no such cap — prefer it when itemization needs the full body.
 - **Redacted thinking.** Extended-thinking blocks come through as `<REDACTED>`; the bridge
   forwards them verbatim — it does not (and cannot) reconstruct them.
 - **Content leaves the box.** Like the opt-in `OTEL_LOG_*` content flags, raw API bodies

@@ -286,11 +286,24 @@ fi
 # auth-bearing OTEL_EXPORTER_OTLP_HEADERS) is operator-provided through the
 # environment claude inherits; it is deliberately NOT placed on the command line
 # (which is visible in `ps`/tmux) nor printed in the manual-fallback advice.
+#
+# Raw request bodies in FILE mode (issue #87): OTEL_LOG_RAW_API_BODIES=file:<dir>
+# makes Claude Code dump each outgoing request, untruncated (no 60KB inline cap),
+# to <dir>/<uuid>.request.json — the full tools array + system/messages prefix —
+# so the post-run spoke-tree builder can itemize loaded context by name + exact
+# size. The dir lives under the gitignored .ai-toolkit/ (bodies hold conversation
+# content and stay local — only a body_ref path rides the OTLP logs signal) and is
+# exported as AI_TOOLKIT_OTEL_BODY_DIR for the builder to find. OTEL_LOGS_EXPORTER
+# =otlp is wired explicitly because the api_request_body log event rides the logs
+# signal; without it the request log events (and their body_refs) are lost. The
+# metrics account-uuid privacy default is out of scope here (issue #88).
 OTEL_PREFIX=""
 if [ "${AI_TOOLKIT_OTEL:-}" = "1" ]; then
+  OTEL_BODY_DIR="$WT_DIR/.ai-toolkit/raw-bodies"
+  mkdir -p "$OTEL_BODY_DIR"
   # NB: the trailing space is load-bearing — it separates the prefix from the
   # WT_SPOKE pin that AGENT_CMD appends immediately after it.
-  OTEL_PREFIX="CLAUDE_CODE_ENABLE_TELEMETRY=1 CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 OTEL_TRACES_EXPORTER=otlp OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf OTEL_RESOURCE_ATTRIBUTES=$(printf '%q' "spoke_run_id=${SPOKE_RUN_ID}") "
+  OTEL_PREFIX="CLAUDE_CODE_ENABLE_TELEMETRY=1 CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 OTEL_TRACES_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf OTEL_LOG_RAW_API_BODIES=$(printf '%q' "file:${OTEL_BODY_DIR}") AI_TOOLKIT_OTEL_BODY_DIR=$(printf '%q' "$OTEL_BODY_DIR") OTEL_RESOURCE_ATTRIBUTES=$(printf '%q' "spoke_run_id=${SPOKE_RUN_ID}") "
 fi
 AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(printf '%q' "${WT_AGENT_EFFORT:-max}") claude --model $(printf '%q' "${WT_AGENT_MODEL:-opus}")"
 # Best-effort in-process budget cap for unattended spokes. A caller may set

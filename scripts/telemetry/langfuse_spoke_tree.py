@@ -150,6 +150,8 @@ _REQUEST_CATEGORY_ORDER = ("tools", "mcp", "system", "context")
 _DISK_CATEGORY_ORDER = ("rules", "memory", "skills", "sub-agents", "environment")
 # Env var naming the per-spoke dir of OTEL_LOG_RAW_API_BODIES=file:<dir> dumps.
 _BODY_DIR_ENV = "AI_TOOLKIT_OTEL_BODY_DIR"
+# Conventional per-spoke body dir under a worktree root (worktree-new.sh writes here).
+_BODY_DIR_CONVENTION = Path(".ai-toolkit/raw-bodies")
 
 
 class ToolContent(NamedTuple):
@@ -928,7 +930,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=Path(env[_BODY_DIR_ENV]) if env.get(_BODY_DIR_ENV) else None,
         help=(
             "Dir of OTEL_LOG_RAW_API_BODIES=file:<dir> request dumps to itemize the loaded "
-            f"context from (default: ${_BODY_DIR_ENV}). Falls back to disk when absent."
+            f"context from (default: ${_BODY_DIR_ENV}, else <root>/{_BODY_DIR_CONVENTION}). "
+            "Falls back to disk measurement when no real request body is found."
         ),
     )
     parser.add_argument(
@@ -969,11 +972,8 @@ def main(argv: list[str] | None = None) -> int:
 
     counter = make_counter(endpoint=args.endpoint, api_key=args.api_key, model=args.model)
     base_ts = _earliest_start(traces)
-    request_rows = (
-        request_context_rows(args.request_bodies, counter=counter, price=args.price)
-        if args.request_bodies is not None
-        else None
-    )
+    bodies_dir = args.request_bodies or (args.root.resolve() / _BODY_DIR_CONVENTION)
+    request_rows = request_context_rows(bodies_dir, counter=counter, price=args.price)
     if request_rows is not None:
         rows, source = request_rows, "request body"
         context_events = build_loaded_context_events(
