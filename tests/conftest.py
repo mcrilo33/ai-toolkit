@@ -34,6 +34,13 @@ the whole session: drop the opt-in (the recorder no-ops without ``=1``), and
 redirect the dir to a sandbox so even a test that re-enables telemetry without its
 own dir can never hit the real default. The regression guard is
 ``tests/unit/test_telemetry_env_isolation.py``.
+
+That recorder has a SECOND, INDEPENDENT sink — the OTLP/Langfuse fan-out (issue #83) —
+gated solely on ``AI_TOOLKIT_OTEL_SPAN_ENDPOINT`` (NOT on ``AI_TOOLKIT_TELEMETRY``), which
+``curl``-POSTs the span to a live collector. The ``=1`` strip never covered it, so a test
+inheriting a spoke's exported endpoint leaked fixture spans straight to Langfuse. A network
+endpoint has no sandbox to redirect to, so the cure is to strip the whole export family —
+done below, same import-time mechanism, same regression guard.
 """
 
 from __future__ import annotations
@@ -67,3 +74,22 @@ for _var in [_k for _k in os.environ if _k.startswith("GIT_CONFIG_")]:
 for _var in ("AI_TOOLKIT_TELEMETRY", "AI_TOOLKIT_SPAN_LOG"):
     os.environ.pop(_var, None)
 os.environ["AI_TOOLKIT_TELEMETRY_DIR"] = tempfile.mkdtemp(prefix="ai-toolkit-test-telemetry-")
+
+# The OTLP/Langfuse fan-out sink (issue #83) is a SECOND, INDEPENDENT sink:
+# telemetry.sh curl-POSTs a span whenever AI_TOOLKIT_OTEL_SPAN_ENDPOINT is set — gated on
+# that var ALONE, NOT on AI_TOOLKIT_TELEMETRY. The strip above never covered it, so a test
+# that inherits a spoke/dev shell's exported endpoint and shells out to telemetry.sh POSTed
+# fixture spans straight to the live collector -> Langfuse (recurring fake spokes). There is
+# no sandbox to redirect a network endpoint to, so stripping the whole export family IS the
+# cure: drop AI_TOOLKIT_OTEL_SPAN_ENDPOINT (the shell sink's gate), the AI_TOOLKIT_OTEL
+# native-OTel opt-in family, BRIDGE_OTLP_ENDPOINT, and the OTEL_EXPORTER_OTLP_* family (swept
+# by prefix). The regression guard is tests/unit/test_telemetry_env_isolation.py.
+for _var in (
+    "AI_TOOLKIT_OTEL_SPAN_ENDPOINT",
+    "AI_TOOLKIT_OTEL",
+    "AI_TOOLKIT_OTEL_BODY_DIR",
+    "BRIDGE_OTLP_ENDPOINT",
+):
+    os.environ.pop(_var, None)
+for _var in [_k for _k in os.environ if _k.startswith("OTEL_EXPORTER_OTLP_")]:
+    os.environ.pop(_var, None)
