@@ -252,30 +252,6 @@ class TestBuildBatch:
         copy = _by_orig(batch, "trace-hook", "h8")
         assert copy["body"]["parentObservationId"] == root_id_for(SPOKE)
 
-    def test_tool_decision_audit_event_nests_under_its_tool(self) -> None:
-        # A #93 tool_decision audit observation (event-create, type EVENT) carries its
-        # tool_use_id in FLAT metadata and no parentObservationId. It must nest under the
-        # tool sharing that id, exactly like a gate hook.
-        tool = _obs(
-            "t7",
-            "Bash",
-            parent=None,
-            metadata={"attributes": {"gen_ai.tool.call.id": "tu-7"}},
-        )
-        decision = _obs(
-            "d7",
-            "tool_decision:allow",
-            type_="EVENT",
-            parent=None,
-            metadata={"tool_name": "Bash", "tool_use_id": "tu-7", "decision": "allow"},
-        )
-        traces = [("trace-tool", [tool]), ("trace-audit", [decision])]
-
-        batch = build_batch(traces, SPOKE)
-
-        copy = _by_orig(batch, "trace-audit", "d7")
-        assert copy["body"]["parentObservationId"] == _copy_id("trace-tool", "t7")
-
     def test_tool_result_audit_event_nests_under_its_tool(self) -> None:
         # tool_result audit observations join by the same rule (forward-compat with the
         # task contract; matched by the tool_* audit-name prefix).
@@ -437,6 +413,129 @@ class TestBuildBatch:
         batch = build_batch([], SPOKE)
 
         assert [event["type"] for event in batch] == ["trace-create", "span-create"]
+
+
+class TestToolSubspanFolding:
+    """#100 part 2: the three 1:1 native sub-spans fold into their tool's metadata instead of
+    nesting as child nodes — claude_code.tool.execution -> execution_ms/success/error,
+    claude_code.tool.blocked_on_user -> blocked_on_user_ms (+decision/source), tool_decision:*
+    -> decision/decision_source. Gate hooks, tool_result, and hook_execution_complete stay
+    nested under their tool.
+    """
+
+    def _dropped(self, batch: list[dict], orig_trace_id: str, orig_obs_id: str) -> bool:
+        copy_id = _copy_id(orig_trace_id, orig_obs_id)
+        return all(event["id"] != copy_id for event in batch)
+
+    def test_execution_folds_ms_and_success_into_tool(self) -> None:
+        tool = _obs(
+            "tb", "tool:Bash", parent=None, metadata={"attributes": {"tool_use_id": "tu-1"}}
+        )
+        execu = _obs(
+            "ex",
+            "claude_code.tool.execution",
+            parent="tb",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:01Z",
+            metadata={"attributes": {"tool_use_id": "tu-1", "success": True}},
+        )
+
+        batch = build_batch([("tr", [tool, execu])], SPOKE)
+
+        assert self._dropped(batch, "tr", "ex")  # the sub-span is no longer a node
+        meta = _by_orig(batch, "tr", "tb")["body"]["metadata"]
+        assert meta["execution_ms"] == 1000
+        assert meta["success"] is True
+
+    def test_execution_error_folds_into_tool(self) -> None:
+        tool = _obs(
+            "tb", "tool:Bash", parent=None, metadata={"attributes": {"tool_use_id": "tu-1"}}
+        )
+        execu = _obs(
+            "ex",
+            "claude_code.tool.execution",
+            parent="tb",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:00Z",
+            metadata={"attributes": {"tool_use_id": "tu-1", "success": False, "error": "boom"}},
+        )
+
+        batch = build_batch([("tr", [tool, execu])], SPOKE)
+
+        meta = _by_orig(batch, "tr", "tb")["body"]["metadata"]
+        assert meta["success"] is False
+        assert meta["error"] == "boom"
+
+    def test_blocked_on_user_folds_ms_and_decision(self) -> None:
+        tool = _obs(
+            "tb", "tool:Bash", parent=None, metadata={"attributes": {"tool_use_id": "tu-1"}}
+        )
+        blocked = _obs(
+            "bl",
+            "claude_code.tool.blocked_on_user",
+            parent="tb",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:03Z",
+            metadata={
+                "attributes": {"tool_use_id": "tu-1", "decision": "accept", "source": "user"}
+            },
+        )
+
+        batch = build_batch([("tr", [tool, blocked])], SPOKE)
+
+        assert self._dropped(batch, "tr", "bl")
+        meta = _by_orig(batch, "tr", "tb")["body"]["metadata"]
+        assert meta["blocked_on_user_ms"] == 3000
+        assert meta["decision"] == "accept"
+        assert meta["decision_source"] == "user"
+
+    def test_tool_decision_audit_event_folds_into_tool(self) -> None:
+        # A #93 tool_decision audit event now folds (decision/decision_source) instead of nesting.
+        tool = _obs("t7", "Bash", parent=None, metadata={"attributes": {"tool_use_id": "tu-7"}})
+        decision = _obs(
+            "d7",
+            "tool_decision:reject",
+            type_="EVENT",
+            parent=None,
+            metadata={"tool_use_id": "tu-7", "decision": "reject", "decision_source": "rule"},
+        )
+
+        batch = build_batch([("trace-tool", [tool]), ("trace-audit", [decision])], SPOKE)
+
+        assert self._dropped(batch, "trace-audit", "d7")
+        meta = _by_orig(batch, "trace-tool", "t7")["body"]["metadata"]
+        assert meta["decision"] == "reject"
+        assert meta["decision_source"] == "rule"
+
+    def test_gate_hook_under_tool_is_not_folded(self) -> None:
+        tool = _obs(
+            "tb", "tool:Bash", parent=None, metadata={"attributes": {"tool_use_id": "tu-1"}}
+        )
+        hook = _obs(
+            "hk",
+            "PreToolUse.sh",
+            parent=None,
+            metadata={"attributes": {"workflow.kind": "hook", "tool_use_id": "tu-1"}},
+        )
+
+        batch = build_batch([("tr", [tool, hook])], SPOKE)
+
+        # the hook survives as a node nested under its tool — only the 3 sub-spans fold.
+        assert not self._dropped(batch, "tr", "hk")
+        assert _by_orig(batch, "tr", "hk")["body"]["parentObservationId"] == _copy_id("tr", "tb")
+
+    def test_tool_result_event_is_not_folded(self) -> None:
+        tool = _obs("tb", "Read", parent=None, metadata={"attributes": {"tool_use_id": "tu-1"}})
+        result = _obs(
+            "r1", "tool_result", type_="EVENT", parent=None, metadata={"tool_use_id": "tu-1"}
+        )
+
+        batch = build_batch([("trace-tool", [tool]), ("trace-audit", [result])], SPOKE)
+
+        assert not self._dropped(batch, "trace-audit", "r1")
+        assert _by_orig(batch, "trace-audit", "r1")["body"]["parentObservationId"] == _copy_id(
+            "trace-tool", "tb"
+        )
 
 
 class TestContainerRollups:
