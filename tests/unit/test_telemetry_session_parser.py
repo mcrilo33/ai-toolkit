@@ -25,6 +25,7 @@ from telemetry.session_parser import (
     _walk_transcript,
     parse_projects_dir,
     parse_session_file,
+    thinking_by_turn,
 )
 from telemetry.spans import Span
 
@@ -979,6 +980,34 @@ class TestReasoningRefs:
     def test_parse_projects_dir_merges_reasoning_refs(self) -> None:
         merged = parse_projects_dir(FIXTURES)
         assert any(r.source == "main" for r in merged.reasoning_refs)
+
+
+class TestThinkingExtraction:
+    """Issue #92: the transcript→Langfuse backfill needs the extended-thinking BODY
+    (redacted in every OTel raw API body) keyed by turn ``uuid`` — the causal node id.
+
+    It is read ONLY by this opt-in extractor; the default parse (spans + reasoning
+    refs) never surfaces a thinking body (privacy / volume), so the backfill's caller
+    gates the call behind its flag. Only turns whose thinking block carries real text
+    are keyed — signature-only extended thinking and narration-only turns are absent.
+    """
+
+    def test_thinking_body_keyed_by_turn_uuid(self) -> None:
+        thinking = thinking_by_turn(SESSION)
+        assert thinking["a1"] == "SECRET_THINKING"
+
+    def test_only_turns_that_carry_thinking_are_keyed(self) -> None:
+        thinking = thinking_by_turn(SESSION)
+        # The #22 main session has exactly one assistant turn with a thinking block;
+        # narration-only turns are never keyed, and every value is non-empty text.
+        assert set(thinking) == {"a1"}
+        assert all(isinstance(text, str) and text for text in thinking.values())
+
+    def test_default_parse_never_surfaces_the_thinking_body(self, parsed: ParsedSession) -> None:
+        # The opt-in extractor is the ONLY reader of the thinking body: the default
+        # parser output stays byte-for-byte free of it (reasoning refs are gist-only).
+        assert "SECRET_THINKING" not in str(parsed.spans)
+        assert "SECRET_THINKING" not in str(parsed.reasoning_refs)
 
 
 def _assistant_bash(uuid: str, ts: str, tool_id: str, command: str) -> dict:
