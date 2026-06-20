@@ -504,7 +504,7 @@ def main(argv: list[str] | None = None) -> int:
         KeyError: When ``LANGFUSE_BASIC_AUTH`` is not set.
     """
     logging.basicConfig(level=logging.INFO, format="[backfill] %(message)s")
-    args = _parse_args(sys.argv[1:] if argv is None else argv)
+    args = _parse_args(argv if argv is not None else sys.argv[1:])
     parsed = parse_session_file(args.session) if args.session else parse_projects_dir(args.projects)
     thinking = _gather_thinking(args.session, args.projects) if args.thinking else {}
     # UPGRADE: join ccusage session costs here so backfilled turns carry real cost; tokens
@@ -523,10 +523,12 @@ def main(argv: list[str] | None = None) -> int:
     mode = (
         "covered→reasoning-only" if covered and thinking else "covered→noop" if covered else "full"
     )
-    print(
-        f"{max(len(events) - 2, 0)} observations backfilled under trace "
-        f"{backfill_trace_id(args.spoke_run_id)} (mode: {mode}, "
-        f"{len(thinking)} thinking bodies)"
+    logger.info(
+        "%d observations backfilled under trace %s (mode: %s, %d thinking bodies)",
+        max(len(events) - 2, 0),
+        backfill_trace_id(args.spoke_run_id),
+        mode,
+        len(thinking),
     )
     return 0
 
