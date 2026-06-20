@@ -25,6 +25,11 @@
 # diff-aware suite — "one push = one run". Landing no longer runs pytest itself;
 # --skip-tests/--test-cmd are threaded to the hook via TEST_SELECT_*.
 #
+# A clean fast-forward land of an already-gated branch (ready/<issue> marker at
+# the tip) re-tests an identical tree, so the gate is auto-skipped there (issue
+# #96); diverged/merge-commit lands still run it. Set LAND_FORCE_GATE=1 to force
+# the gate back on even for a clean-FF land.
+#
 # Sequence, each step aborting safely on failure:
 #   guards  hub on default branch + clean; worktree resolved, clean, fully pushed;
 #           numbered branches carry a ready/<issue> marker at their tip (issue #16)
