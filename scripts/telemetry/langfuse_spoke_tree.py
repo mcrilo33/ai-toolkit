@@ -48,15 +48,17 @@ Beyond copying, the build adds two CREATE-only enrichments (no patches):
   output}`` summed over its subtree of the re-parented tree, reusing
   ``langfuse_rollup``'s sum logic but written into the create body.
 - **An itemized loaded-context subtree.** A ``loaded-context`` node under the root with one
-  category node per group and one item node per name (token size + cost): rules / memory /
-  skills / sub-agents / environment measured per-file from disk (via
-  ``measure_context_cost``). The rest of the first-call prefix — full prefix =
-  ``cache_read + cache_creation`` of the first LLM call — is reconciled into a
-  ``built-in + system`` node (the empirically-measured framework floor from a bare
-  ``claude`` session) and a derived ``mcp`` node (``prefix - floor - Σ measured disk``,
-  clamped ≥ 0). The built-in tool and MCP schemas are not exposed, so per-individual-tool
-  and per-MCP-server sizes are not obtainable; MCP is an aggregate. When the floor cannot be
-  calibrated, the two collapse to one reconciled ``remainder`` node instead.
+  category node per group and one item node per name (token size + cost). The primary
+  source is the spoke's untruncated raw request body
+  (``OTEL_LOG_RAW_API_BODIES=file:<dir>``, located via ``--request-bodies`` /
+  ``$AI_TOOLKIT_OTEL_BODY_DIR``): ``request_body`` itemizes the WHOLE first-call prefix —
+  every tool and MCP tool by name + exact size, each system block, and each
+  ``messages[0]`` ``<system-reminder>`` by kind — so no reconciliation is needed. When no
+  request body is available, it falls back to disk measurement of rules / memory / skills /
+  sub-agents / environment (via ``measure_context_cost``) plus a single reconciled
+  ``remainder`` node (``prefix - Σ measured disk``, clamped ≥ 0) absorbing the base system
+  prompt, tool schemas, and MCP together — the full prefix being
+  ``cache_read + cache_creation`` of the first LLM call.
 
 Import-safe: no environment is read at import time, so :func:`build_batch`,
 :func:`scan_transcripts`, and :func:`build_loaded_context_events` are unit-testable with no
@@ -92,8 +94,12 @@ from telemetry.measure_context_cost import (
     TokenCounter,
     assemble_items,
     make_counter,
-    measure_framework_floor,
     measure_items,
+)
+from telemetry.request_body import (
+    first_real_request,
+    measure_request_items,
+    parse_request_body,
 )
 
 logger = logging.getLogger("langfuse_spoke_tree")
@@ -132,20 +138,18 @@ _DEFAULT_PROJECTS = Path("~/.claude/projects").expanduser()
 
 # Deterministic id prefix for the synthetic loaded-context subtree nodes.
 _LC_PREFIX = "tree-lc-"
-# Source label for the empirically-measured built-in-tools + base-system-prompt floor.
-_FLOOR_SOURCE = "bare-session calibration"
-# Source label for the derived MCP aggregate (prefix - floor - measured disk).
-_MCP_SOURCE = "derived"
-# Note recorded on the derived MCP node: it is an aggregate, not per-server/per-tool.
-_MCP_NOTE = "derived = prefix - floor - measured; per-server/per-tool not separable"
-# Source label for the single reconciled remainder used when no floor is available.
+# Source label for the single reconciled remainder used in the disk fallback path.
 _REMAINDER_SOURCE = "reconciled-remainder"
-# Note recorded on the fallback remainder node, explaining why floor + mcp were not split.
-_REMAINDER_NOTE = "floor calibration unavailable; base system + tools reconciled as one"
+# Note recorded on the disk-fallback remainder node, naming what it absorbs.
+_REMAINDER_NOTE = "no request body; base system + tools + mcp reconciled as one"
 # Default cache-creation price (USD per token), Opus tier — mirrors measure_context_cost.
 _DEFAULT_PRICE = 0.00000625
-# Category order for the disk-measurable loaded-context items.
-_LC_CATEGORY_ORDER = ("rules", "memory", "skills", "sub-agents", "environment")
+# Category order for the request-body itemization (the primary, fully-itemized path).
+_REQUEST_CATEGORY_ORDER = ("tools", "mcp", "system", "context")
+# Category order for the disk fallback used when no request body is available.
+_DISK_CATEGORY_ORDER = ("rules", "memory", "skills", "sub-agents", "environment")
+# Env var naming the per-spoke dir of OTEL_LOG_RAW_API_BODIES=file:<dir> dumps.
+_BODY_DIR_ENV = "AI_TOOLKIT_OTEL_BODY_DIR"
 
 
 class ToolContent(NamedTuple):
@@ -703,37 +707,40 @@ def build_loaded_context_events(
     spoke_run_id: str,
     item_rows: list[dict[str, object]],
     *,
-    prefix_total: int,
-    floor: dict[str, object] | None = None,
-    price: float,
+    category_order: tuple[str, ...],
     base_ts: str,
+    prefix_total: int | None = None,
+    price: float | None = None,
 ) -> list[IngestEvent]:
     """Build the itemized loaded-context subtree under the spoke root.
 
     Emits a ``loaded-context`` parent under the synthetic root, one category node per
-    disk group carrying its rolled-up total, one item node per name (token size + cost +
-    source), and the reconciliation of the rest of the first-call prefix:
+    group (in ``category_order``) carrying its rolled-up total, and one item node per name
+    (token size + cost + source, plus a ``cached`` flag when the row carries one).
 
-    - With a measured ``floor``: a ``built-in + system`` node (tokens = floor) and a
-      derived ``mcp`` node (tokens = ``prefix_total - floor - Σ measured disk``, clamped
-      ≥ 0). The MCP figure is an aggregate; per-server/per-tool sizes are not separable.
-    - Without a floor: a single ``remainder`` node = ``prefix_total - Σ measured``, clamped
-      ≥ 0, absorbing the base system prompt and all tool schemas together.
+    The primary, request-body path itemizes the WHOLE first-call prefix — every tool / MCP
+    tool / system block / reminder by name and exact size — so it needs no reconciliation;
+    ``prefix_total`` is then left None. The disk fallback (no request body) can only measure
+    the on-disk categories, so it passes ``prefix_total`` and ``price`` to append a single
+    ``remainder`` node = ``prefix_total - Σ measured`` (clamped ≥ 0) absorbing the base
+    system prompt, all tool schemas, and MCP together.
 
     All ids derive from the spoke run id so a rerun overwrites the same nodes.
 
     Args:
         spoke_run_id: The spoke run identifier.
-        item_rows: Per-name measured disk rows (from :func:`measure_items`), each with
-            ``category``, ``name``, ``tokens``, ``cost_usd``, ``source``, ``estimated``.
-        prefix_total: The session's first-call ``cache_read + cache_creation`` token total.
-        floor: The measured built-in/system floor (``{"tokens", "estimated", "source"}``)
-            from :func:`measure_framework_floor`, or None to fall back to one remainder.
-        price: Cache-creation price in USD per token (for the reconciliation nodes' cost).
+        item_rows: Per-name measured rows (from :func:`measure_request_items` or
+            :func:`measure_items`), each with ``category``, ``name``, ``tokens``,
+            ``cost_usd``, ``source``, ``estimated`` (and optionally ``cached``).
+        category_order: The category keys to render, in display order; empties are dropped.
         base_ts: ISO timestamp stamped on every synthetic node.
+        prefix_total: The first-call ``cache_read + cache_creation`` total; pass it (with
+            ``price``) only on the disk fallback to append the reconciled remainder node.
+        price: Cache-creation price in USD per token, for the remainder node's cost.
 
     Returns:
-        The loaded-context ingestion events: parent, categories, items, reconciliation.
+        The loaded-context ingestion events: parent, categories, items, and — on the disk
+        fallback only — the reconciled remainder.
     """
     trace_id = trace_id_for(spoke_run_id)
     root_id = root_id_for(spoke_run_id)
@@ -751,8 +758,7 @@ def build_loaded_context_events(
             metadata={"tokens": measured_tokens, "cost_usd": measured_cost},
         )
     ]
-    grouped = _group_rows_by_category(item_rows)
-    for category, rows in grouped:
+    for category, rows in _group_rows_by_category(item_rows, category_order):
         cat_id = _lc_id(spoke_run_id, category)
         events.append(
             _lc_node(
@@ -770,20 +776,21 @@ def build_loaded_context_events(
         events.extend(
             _lc_item_node(spoke_run_id, category, cat_id, trace_id, base_ts, row) for row in rows
         )
-    events.extend(
-        _reconciliation_nodes(
-            spoke_run_id, lc_id, trace_id, base_ts, prefix_total, measured_tokens, floor, price
+    if prefix_total is not None and price is not None:
+        events.append(
+            _remainder_node(
+                spoke_run_id, lc_id, trace_id, base_ts, prefix_total, measured_tokens, price
+            )
         )
-    )
     return events
 
 
 def _group_rows_by_category(
-    item_rows: list[dict[str, object]],
+    item_rows: list[dict[str, object]], category_order: tuple[str, ...]
 ) -> list[tuple[str, list[dict[str, object]]]]:
-    """Group item rows by category in the fixed display order, dropping empty groups."""
+    """Group item rows by category in ``category_order``, dropping empty groups."""
     groups: list[tuple[str, list[dict[str, object]]]] = []
-    for category in _LC_CATEGORY_ORDER:
+    for category in category_order:
         rows = [row for row in item_rows if row["category"] == category]
         if rows:
             groups.append((category, rows))
@@ -798,7 +805,7 @@ def _lc_item_node(
     base_ts: str,
     row: dict[str, object],
 ) -> IngestEvent:
-    """Shape one per-name item node with its token size, cost, and source."""
+    """Shape one per-name item node with its token size, cost, source, and cache flag."""
     tokens = int(cast(int, row["tokens"]))
     metadata: dict[str, object] = {
         "tokens": tokens,
@@ -807,6 +814,8 @@ def _lc_item_node(
     }
     if row.get("estimated"):
         metadata["estimated"] = True
+    if "cached" in row:
+        metadata["cached"] = bool(row["cached"])
     return _lc_node(
         node_id=_lc_id(spoke_run_id, f"{category}/{row['name']}"),
         parent_id=cat_id,
@@ -815,55 +824,6 @@ def _lc_item_node(
         base_ts=base_ts,
         metadata=metadata,
     )
-
-
-def _reconciliation_nodes(
-    spoke_run_id: str,
-    lc_id: str,
-    trace_id: str,
-    base_ts: str,
-    prefix: int,
-    measured: int,
-    floor: dict[str, object] | None,
-    price: float,
-) -> list[IngestEvent]:
-    """Build the nodes reconciling the prefix not covered by the measured disk items.
-
-    With a measured ``floor`` the unmeasured remainder splits into the empirically-measured
-    built-in/system floor and the derived MCP aggregate; without one it stays a single
-    reconciled remainder. All values are clamped at zero so a measurement gap never shows a
-    negative size.
-    """
-    if floor is None:
-        return [_remainder_node(spoke_run_id, lc_id, trace_id, base_ts, prefix, measured, price)]
-    floor_tokens = int(cast(int, floor.get("tokens", 0)))
-    builtin = _lc_node(
-        node_id=_lc_id(spoke_run_id, "built-in + system"),
-        parent_id=lc_id,
-        trace_id=trace_id,
-        name=f"built-in + system: {_human_tokens(floor_tokens)}",
-        base_ts=base_ts,
-        metadata={
-            "tokens": floor_tokens,
-            "cost_usd": floor_tokens * price,
-            "source": _FLOOR_SOURCE,
-        },
-    )
-    mcp_tokens = max(0, prefix - floor_tokens - measured)
-    mcp = _lc_node(
-        node_id=_lc_id(spoke_run_id, "mcp"),
-        parent_id=lc_id,
-        trace_id=trace_id,
-        name=f"mcp: {_human_tokens(mcp_tokens)}",
-        base_ts=base_ts,
-        metadata={
-            "tokens": mcp_tokens,
-            "cost_usd": mcp_tokens * price,
-            "source": _MCP_SOURCE,
-            "note": _MCP_NOTE,
-        },
-    )
-    return [builtin, mcp]
 
 
 def _remainder_node(
@@ -912,6 +872,36 @@ def loaded_context_rows(
     return measure_items(assemble_items(root), counter=counter, price=price)
 
 
+def find_request_files(bodies_dir: Path) -> list[Path]:
+    """Return the ``*.request.json`` dumps in ``bodies_dir``, sorted by name (emission order)."""
+    return sorted(bodies_dir.glob("*.request.json")) if bodies_dir.is_dir() else []
+
+
+def request_context_rows(
+    bodies_dir: Path, *, counter: TokenCounter, price: float
+) -> list[dict[str, object]] | None:
+    """Itemize the loaded context from the first real raw request body in ``bodies_dir``.
+
+    Picks the first ``.request.json`` whose ``tools`` array is non-empty (skipping any
+    degenerate aux call), parses it, and measures every tool / MCP tool / system block /
+    reminder by name and exact size. This is the primary, fully-itemized path.
+
+    Args:
+        bodies_dir: The per-spoke ``OTEL_LOG_RAW_API_BODIES=file:<dir>`` dump directory.
+        counter: Token counter; raises ``CountTokensError`` when unreachable.
+        price: Cache-creation price in USD per token.
+
+    Returns:
+        The per-name request-body rows, or None when no real request body is found (the
+        caller then falls back to disk measurement).
+    """
+    path = first_real_request(find_request_files(bodies_dir))
+    if path is None:
+        return None
+    parsed = parse_request_body(path)
+    return measure_request_items(parsed.items, counter=counter, price=price)
+
+
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse the CLI arguments for the spoke-tree assembler."""
     env = os.environ
@@ -933,9 +923,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Model id for count_tokens.")
     parser.add_argument(
-        "--recalibrate-floor",
-        action="store_true",
-        help="Force a fresh built-in/system floor calibration, ignoring the cached value.",
+        "--request-bodies",
+        type=Path,
+        default=Path(env[_BODY_DIR_ENV]) if env.get(_BODY_DIR_ENV) else None,
+        help=(
+            "Dir of OTEL_LOG_RAW_API_BODIES=file:<dir> request dumps to itemize the loaded "
+            f"context from (default: ${_BODY_DIR_ENV}). Falls back to disk when absent."
+        ),
     )
     parser.add_argument(
         "--endpoint",
@@ -974,16 +968,30 @@ def main(argv: list[str] | None = None) -> int:
     batch = build_batch(traces, args.spoke_run_id, tool_content)
 
     counter = make_counter(endpoint=args.endpoint, api_key=args.api_key, model=args.model)
-    rows = loaded_context_rows(args.root.resolve(), counter=counter, price=args.price)
-    floor = measure_framework_floor(force=args.recalibrate_floor)
-    context_events = build_loaded_context_events(
-        args.spoke_run_id,
-        rows,
-        prefix_total=prefix_total(traces),
-        floor=floor,
-        price=args.price,
-        base_ts=_earliest_start(traces),
+    base_ts = _earliest_start(traces)
+    request_rows = (
+        request_context_rows(args.request_bodies, counter=counter, price=args.price)
+        if args.request_bodies is not None
+        else None
     )
+    if request_rows is not None:
+        rows, source = request_rows, "request body"
+        context_events = build_loaded_context_events(
+            args.spoke_run_id, rows, category_order=_REQUEST_CATEGORY_ORDER, base_ts=base_ts
+        )
+    else:
+        rows, source = (
+            loaded_context_rows(args.root.resolve(), counter=counter, price=args.price),
+            "disk",
+        )
+        context_events = build_loaded_context_events(
+            args.spoke_run_id,
+            rows,
+            category_order=_DISK_CATEGORY_ORDER,
+            base_ts=base_ts,
+            prefix_total=prefix_total(traces),
+            price=args.price,
+        )
     post_in_chunks(batch + context_events, post)
 
     trace_id = trace_id_for(args.spoke_run_id)
@@ -991,7 +999,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"{len(batch) - 2} observations assembled under trace {trace_id} "
         f"(roots collapsed to 1), {filled} tool spans filled from transcript, "
-        f"{len(rows)} loaded-context items itemized"
+        f"{len(rows)} loaded-context items itemized (source: {source})"
     )
     return 0
 

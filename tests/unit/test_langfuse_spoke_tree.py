@@ -13,6 +13,7 @@ determinism.
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import urllib.parse
 from collections.abc import Sequence
@@ -21,13 +22,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from telemetry.langfuse_spoke_tree import (
+    _DISK_CATEGORY_ORDER,
     _MAX_CONTENT_CHARS,
+    _REQUEST_CATEGORY_ORDER,
     _TRUNCATION_MARKER,
     _copy_id,
     build_batch,
     build_loaded_context_events,
     fetch_session,
+    find_request_files,
     prefix_total,
+    request_context_rows,
     root_id_for,
     scan_transcripts,
     trace_id_for,
@@ -551,7 +556,12 @@ def _lc_by_name(events: list[dict]) -> dict[str, dict]:
     return {event["body"]["name"]: event["body"] for event in events}
 
 
-class TestLoadedContextSubtree:
+_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
+
+
+class TestLoadedContextDiskFallback:
+    """The disk-fallback path: measured on-disk items + a single reconciled remainder."""
+
     def _rows(self) -> list[dict]:
         return [
             {
@@ -580,42 +590,28 @@ class TestLoadedContextSubtree:
             },
         ]
 
-    def test_parent_node_sits_under_spoke_root_with_grand_total(self) -> None:
-        events = build_loaded_context_events(
+    def _build(self, prefix_total: int = 1000) -> list[dict]:
+        return build_loaded_context_events(
             SPOKE,
             self._rows(),
-            prefix_total=1000,
-            price=0.001,
+            category_order=_DISK_CATEGORY_ORDER,
             base_ts="2026-01-01T00:00:00Z",
+            prefix_total=prefix_total,
+            price=0.001,
         )
 
-        parent = _lc_by_name(events)["loaded-context"]
+    def test_parent_node_sits_under_spoke_root_with_grand_total(self) -> None:
+        parent = _lc_by_name(self._build())["loaded-context"]
         assert parent["parentObservationId"] == root_id_for(SPOKE)
         assert parent["metadata"]["tokens"] == 170
 
     def test_each_category_node_carries_its_rolled_up_total(self) -> None:
-        events = build_loaded_context_events(
-            SPOKE,
-            self._rows(),
-            prefix_total=1000,
-            price=0.001,
-            base_ts="2026-01-01T00:00:00Z",
-        )
-
-        index = _lc_by_name(events)
+        index = _lc_by_name(self._build())
         assert index["rules"]["metadata"]["tokens"] == 150
         assert index["skills"]["metadata"]["tokens"] == 20
 
     def test_one_item_node_per_name_under_its_category(self) -> None:
-        events = build_loaded_context_events(
-            SPOKE,
-            self._rows(),
-            prefix_total=1000,
-            price=0.001,
-            base_ts="2026-01-01T00:00:00Z",
-        )
-
-        index = _lc_by_name(events)
+        index = _lc_by_name(self._build())
         rules_id = index["rules"]["id"]
         claude = next(b for n, b in index.items() if n.startswith("CLAUDE.md"))
         assert claude["parentObservationId"] == rules_id
@@ -623,171 +619,124 @@ class TestLoadedContextSubtree:
         assert claude["metadata"]["source"] == "CLAUDE.md"
 
     def test_estimated_item_carries_the_flag(self) -> None:
-        events = build_loaded_context_events(
-            SPOKE,
-            self._rows(),
-            prefix_total=1000,
-            price=0.001,
-            base_ts="2026-01-01T00:00:00Z",
-        )
-
-        afk = next(b for n, b in _lc_by_name(events).items() if n.startswith("afk"))
+        afk = next(b for n, b in _lc_by_name(self._build()).items() if n.startswith("afk"))
         assert afk["metadata"]["estimated"] is True
 
     def test_remainder_is_prefix_minus_measured(self) -> None:
-        events = build_loaded_context_events(
-            SPOKE,
-            self._rows(),
-            prefix_total=1000,
-            price=0.001,
-            base_ts="2026-01-01T00:00:00Z",
-        )
-
+        events = self._build()
         remainder = next(b for n, b in _lc_by_name(events).items() if n.startswith("remainder"))
         assert remainder["metadata"]["tokens"] == 830
         assert remainder["parentObservationId"] == _lc_by_name(events)["loaded-context"]["id"]
 
     def test_remainder_clamped_to_zero_when_measured_exceeds_prefix(self) -> None:
-        events = build_loaded_context_events(
-            SPOKE,
-            self._rows(),
-            prefix_total=100,
-            price=0.001,
-            base_ts="2026-01-01T00:00:00Z",
-        )
-
+        events = self._build(prefix_total=100)
         remainder = next(b for n, b in _lc_by_name(events).items() if n.startswith("remainder"))
         assert remainder["metadata"]["tokens"] == 0
 
-    def test_ids_are_deterministic_across_runs(self) -> None:
-        first = {
-            e["id"]
-            for e in build_loaded_context_events(
-                SPOKE,
-                self._rows(),
-                prefix_total=1000,
-                price=0.001,
-                base_ts="2026-01-01T00:00:00Z",
-            )
-        }
-        second = {
-            e["id"]
-            for e in build_loaded_context_events(
-                SPOKE,
-                self._rows(),
-                prefix_total=1000,
-                price=0.001,
-                base_ts="2026-01-01T00:00:00Z",
-            )
-        }
+    def test_no_floor_or_mcp_nodes_remain(self) -> None:
+        names = list(_lc_by_name(self._build()))
+        assert not any(n.startswith("built-in") or n.startswith("mcp") for n in names)
 
+    def test_ids_are_deterministic_across_runs(self) -> None:
+        first = {e["id"] for e in self._build()}
+        second = {e["id"] for e in self._build()}
         assert first == second
 
     def test_all_nodes_attach_to_the_assembled_trace(self) -> None:
-        events = build_loaded_context_events(
-            SPOKE,
-            self._rows(),
-            prefix_total=1000,
-            price=0.001,
-            base_ts="2026-01-01T00:00:00Z",
-        )
-
+        events = self._build()
         assert all(e["body"]["traceId"] == trace_id_for(SPOKE) for e in events)
         assert all(e["type"] == "span-create" for e in events)
 
-    def test_fallback_remainder_when_floor_is_none(self) -> None:
-        events = build_loaded_context_events(
-            SPOKE,
-            self._rows(),
-            prefix_total=1000,
-            floor=None,
-            price=0.001,
-            base_ts="2026-01-01T00:00:00Z",
-        )
 
-        names = list(_lc_by_name(events))
-        assert any(n.startswith("remainder") for n in names)
-        assert not any(n.startswith("built-in") or n.startswith("mcp") for n in names)
-
-
-class TestLoadedContextFloorSplit:
-    """With a measured floor the remainder splits into built-in/system + derived mcp."""
+class TestRequestContextSubtree:
+    """The primary path: the whole prefix itemized from the raw request body, no remainder."""
 
     def _rows(self) -> list[dict]:
         return [
             {
-                "category": "rules",
-                "name": "CLAUDE.md",
-                "tokens": 100,
-                "cost_usd": 0.1,
-                "source": "CLAUDE.md",
+                "category": "tools",
+                "name": "Bash",
+                "tokens": 120,
+                "cost_usd": 0.12,
+                "source": "request-body",
+                "cached": False,
                 "estimated": False,
             },
             {
-                "category": "skills",
-                "name": "afk",
-                "tokens": 70,
-                "cost_usd": 0.07,
-                "source": ".claude/skills/afk/SKILL.md",
+                "category": "mcp",
+                "name": "mcp__x__y",
+                "tokens": 40,
+                "cost_usd": 0.04,
+                "source": "request-body",
+                "cached": False,
+                "estimated": False,
+            },
+            {
+                "category": "system",
+                "name": "base system prompt",
+                "tokens": 200,
+                "cost_usd": 0.2,
+                "source": "request-body",
+                "cached": True,
+                "estimated": False,
+            },
+            {
+                "category": "context",
+                "name": "skills",
+                "tokens": 80,
+                "cost_usd": 0.08,
+                "source": "request-body",
+                "cached": False,
                 "estimated": False,
             },
         ]
 
-    def _floor(self) -> dict:
-        return {"tokens": 500, "estimated": False, "source": "bare-session calibration"}
-
-    def test_built_in_system_node_carries_the_floor(self) -> None:
-        events = build_loaded_context_events(
+    def _build(self) -> list[dict]:
+        return build_loaded_context_events(
             SPOKE,
             self._rows(),
-            prefix_total=1000,
-            floor=self._floor(),
-            price=0.001,
+            category_order=_REQUEST_CATEGORY_ORDER,
             base_ts="2026-01-01T00:00:00Z",
         )
 
-        index = _lc_by_name(events)
-        builtin = next(b for n, b in index.items() if n.startswith("built-in"))
-        assert builtin["metadata"]["tokens"] == 500
-        assert builtin["metadata"]["source"] == "bare-session calibration"
-        assert builtin["parentObservationId"] == index["loaded-context"]["id"]
+    def test_all_request_categories_rendered(self) -> None:
+        names = set(_lc_by_name(self._build()))
+        assert {"tools", "mcp", "system", "context"} <= names
 
-    def test_mcp_node_is_prefix_minus_floor_minus_disk(self) -> None:
-        events = build_loaded_context_events(
-            SPOKE,
-            self._rows(),  # measured disk = 170
-            prefix_total=1000,
-            floor=self._floor(),  # floor = 500
-            price=0.001,
-            base_ts="2026-01-01T00:00:00Z",
-        )
+    def test_no_remainder_node_on_the_request_path(self) -> None:
+        assert not any(n.startswith("remainder") for n in _lc_by_name(self._build()))
 
-        mcp = next(b for n, b in _lc_by_name(events).items() if n.startswith("mcp"))
-        assert mcp["metadata"]["tokens"] == 330  # 1000 - 500 - 170
-        assert mcp["metadata"]["source"] == "derived"
-        assert "per-server/per-tool not separable" in mcp["metadata"]["note"]
+    def test_cached_flag_carried_into_item_metadata(self) -> None:
+        index = _lc_by_name(self._build())
+        base = next(b for n, b in index.items() if n.startswith("base system prompt"))
+        assert base["metadata"]["cached"] is True
 
-    def test_mcp_clamped_to_zero_when_floor_plus_disk_exceeds_prefix(self) -> None:
-        events = build_loaded_context_events(
-            SPOKE,
-            self._rows(),  # measured disk = 170
-            prefix_total=600,
-            floor=self._floor(),  # floor = 500 -> 600 - 500 - 170 < 0
-            price=0.001,
-            base_ts="2026-01-01T00:00:00Z",
-        )
+    def test_parent_total_is_full_itemized_prefix(self) -> None:
+        parent = _lc_by_name(self._build())["loaded-context"]
+        assert parent["metadata"]["tokens"] == 440  # 120 + 40 + 200 + 80
 
-        mcp = next(b for n, b in _lc_by_name(events).items() if n.startswith("mcp"))
-        assert mcp["metadata"]["tokens"] == 0
 
-    def test_no_remainder_node_when_floor_present(self) -> None:
-        events = build_loaded_context_events(
-            SPOKE,
-            self._rows(),
-            prefix_total=1000,
-            floor=self._floor(),
-            price=0.001,
-            base_ts="2026-01-01T00:00:00Z",
-        )
+class TestRequestContextRows:
+    """Sourcing rows from a per-spoke dir of raw request bodies."""
 
-        assert not any(n.startswith("remainder") for n in _lc_by_name(events))
+    def _bodies_dir(self, tmp_path: Path) -> Path:
+        bodies = tmp_path / "bodies"
+        bodies.mkdir()
+        shutil.copy(_FIXTURES / "sample.request.json", bodies)
+        shutil.copy(_FIXTURES / "degenerate.request.json", bodies)
+        return bodies
+
+    def test_find_request_files_globs_request_dumps(self, tmp_path: Path) -> None:
+        files = find_request_files(self._bodies_dir(tmp_path))
+        assert {p.name for p in files} == {"sample.request.json", "degenerate.request.json"}
+
+    def test_rows_sourced_from_first_real_request(self, tmp_path: Path) -> None:
+        rows = request_context_rows(self._bodies_dir(tmp_path), counter=len, price=1.0)
+        assert rows is not None
+        names = {row["name"] for row in rows}
+        assert "Bash" in names and "Workflow" in names
+
+    def test_none_when_no_request_bodies_present(self, tmp_path: Path) -> None:
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        assert request_context_rows(empty, counter=len, price=1.0) is None

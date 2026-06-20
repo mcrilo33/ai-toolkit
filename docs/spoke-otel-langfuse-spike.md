@@ -350,24 +350,48 @@ are not containers and keep their metadata verbatim.
 
 ## Itemized loaded-context subtree (in the tree builder)
 
-Under the spoke root the builder also emits a `loaded-context` subtree that reconciles the
-session's full cold-cache prefix into per-name disk items plus a measured framework floor
-and a derived MCP aggregate. The prefix it reconciles against is the **full** first-call
-prefix — `cache_read_input_tokens + cache_creation_input_tokens` of the first `llm_request`,
-not `cache_creation` alone (a warm cache splits the prefix across both, so `cache_creation`
-alone collapses the remainder to near zero). The shape:
+Under the spoke root the builder also emits a `loaded-context` subtree that itemizes the
+session's full first-call prefix. Its **primary source is the untruncated raw request body**
+(`OTEL_LOG_RAW_API_BODIES=file:<dir>`, see below): `request_body` parses the first real
+`.request.json` and every loaded-context section becomes a named item with its exact size.
+The shape:
 
-- A `loaded-context` parent under the synthetic root carrying the measured disk total.
-- One **category** node per disk group (`rules`, `memory`, `skills`, `sub-agents`,
-  `environment`) carrying that category's rolled-up total.
-- One **item** node per name under its category — e.g. `code-quality.md: 1.9k` — with
-  `metadata = {tokens, cost_usd, source, estimated?}`.
-- A `built-in + system` node = the empirically-measured framework floor (see below),
-  `source = "bare-session calibration"`.
-- A derived `mcp` node = `prefix_total - floor - Σ(measured disk)`, clamped at zero, with
-  `note = "derived = prefix - floor - measured; per-server/per-tool not separable"`.
+- A `loaded-context` parent under the synthetic root carrying the itemized total.
+- One **category** node per group (`tools`, `mcp`, `system`, `context`) with its rolled-up
+  total.
+- One **item** node per name under its category, `metadata = {tokens, cost_usd, source,
+  cached, estimated?}`:
 
-Where each disk category's items come from:
+| Category | Items |
+|----------|-------|
+| `tools` | one node per resident tool schema, by name (`Workflow: 20.9k`, `Bash: 11.9k`, …) |
+| `mcp` | one node per connected `mcp__server__tool` schema, by name |
+| `system` | one node per system block (billing header / identity preamble / base system prompt / tool-use + output prompt) |
+| `context` | one node per `messages[0]` `<system-reminder>` by kind (session-start-hook / deferred-tools / agent-types / skills / rules+memory+env) plus the residual prompt |
+
+Because the request body IS the complete prefix, the primary path needs **no
+reconciliation** — there is no floor and no derived `mcp` aggregate. Deferred tools are
+named-only in a reminder (their schemas are not in `tools`), so they are counted, not sized.
+The real `cache_control` prefix boundaries are read directly from the body.
+
+```bash
+LANGFUSE_HOST=http://localhost:3000 LANGFUSE_BASIC_AUTH="Basic <base64(pk:sk)>" \
+ANTHROPIC_API_KEY=sk-… \
+    python3 scripts/telemetry/langfuse_spoke_tree.py <spoke_run_id> \
+        --request-bodies "$AI_TOOLKIT_OTEL_BODY_DIR"   # the spoke's file-mode dump dir
+```
+
+#### Disk fallback (no request body)
+
+When no request body is available (`--request-bodies` / `$AI_TOOLKIT_OTEL_BODY_DIR` unset or
+the dir holds no real request), the builder falls back to disk measurement of the
+source-measurable categories (`rules`, `memory`, `skills`, `sub-agents`, `environment` — via
+`measure_context_cost.assemble_items` / `measure_items`) plus a **single** reconciled
+`remainder` node = `prefix_total − Σ(measured disk)`, clamped at zero, absorbing the base
+system prompt, all tool schemas, and MCP together. The prefix it reconciles against is the
+**full** first-call prefix — `cache_read_input_tokens + cache_creation_input_tokens` of the
+first `llm_request`, not `cache_creation` alone (a warm cache splits the prefix across both,
+so `cache_creation` alone collapses the remainder to near zero).
 
 | Category | Source | Per-item granularity |
 |----------|--------|----------------------|
@@ -376,41 +400,6 @@ Where each disk category's items come from:
 | `skills` | each `.claude/skills/*/SKILL.md` frontmatter | one node per skill name |
 | `sub-agents` | each `.claude/agents/*.md` frontmatter | one node per agent name |
 | `environment` | reconstructed block | single node, always `estimated` |
-
-The disk categories reuse `measure_context_cost.assemble_items` / `measure_items`. The
-built-in tool and MCP schemas are **not on disk and not otherwise obtainable** — Claude Code
-hooks do not expose them and a logged `api_request_body` is truncated — so
-per-individual-tool and per-MCP-server sizes cannot be measured. Instead the built-in +
-base-system floor is measured empirically once (a bare `claude` session, cached), and MCP is
-left as the single derived aggregate above.
-
-```bash
-LANGFUSE_HOST=http://localhost:3000 LANGFUSE_BASIC_AUTH="Basic <base64(pk:sk)>" \
-ANTHROPIC_API_KEY=sk-… \
-    python3 scripts/telemetry/langfuse_spoke_tree.py <spoke_run_id> \
-        --root .            # add --recalibrate-floor to refresh the cached floor
-```
-
-> [!NOTE]
-> Per-tool and per-MCP-server schemas are not fabricated. They cannot be sourced after a
-> run (hooks don't surface them; the logged request body is truncated), so the builder
-> measures only the framework floor and reconciles everything else — base system prompt,
-> built-in tool schemas beyond the floor, and all MCP/OAuth connector schemas — into the one
-> derived `mcp` node. If the floor cannot be calibrated (no `claude` on PATH, or the bare
-> run fails), the `built-in + system` and `mcp` nodes collapse to a single reconciled
-> `remainder` node instead. Measure what is measurable; reconcile the rest honestly.
-
-### Framework-floor calibration
-
-`measure_context_cost.measure_framework_floor()` measures the built-in-tools + base-system
-token floor by running a bare `claude -p "ping"` session in a throwaway temp dir that holds
-no project `.claude` config and no repo. The only context that loads is the framework
-itself, so the first request's `cache_read_input_tokens + cache_creation_input_tokens +
-input_tokens` (less the one-token `ping`) is the floor — empirically ~24.7k tokens. The
-result is cached under `~/.claude/ai-toolkit/framework-floor.json`, keyed by
-`claude --version`, and reused until the version changes or `--recalibrate-floor` forces a
-refresh. When `claude` is unavailable or the run yields no usage, calibration returns `None`
-and the spoke tree falls back to the single reconciled `remainder`.
 
 ## Loaded-context cost baseline (`measure_context_cost.py`)
 
@@ -438,13 +427,13 @@ Measured from the worktree (`--root`, default cwd):
 
 Three categories are **not** measured from disk here because they are not sourceable from a
 standalone script: MCP connector / OAuth schemas, built-in tool schemas, and the base system
-prompt. The built-in-tool + base-system portion IS measurable empirically, though, via
-`measure_framework_floor()` (a bare `claude` session — see the spoke-tree section); the MCP
-connector schemas remain a derived aggregate. They are reconciled against the real first-call
-prefix (`cache_read + cache_creation`, not `cache_creation` alone):
+prompt. This disk path is the **fallback** the spoke tree uses only when no raw request body
+is available; when one is (the primary path), `request_body` itemizes all three directly
+from the body. In the disk fallback they are reconciled together against the real first-call
+prefix (`cache_read + cache_creation`, not `cache_creation` alone) as a single remainder:
 
 ```text
-mcp_aggregate ≈ prefix_total − framework_floor − measured_disk_total
+remainder ≈ prefix_total − measured_disk_total
 ```
 
 Token counting uses the Anthropic `count_tokens` endpoint when reachable
@@ -478,14 +467,16 @@ the network. They are run manually by the operator against a real Claude Code se
 telemetry.
 
 1. **Reconciliation.** Run the script in the spoke's worktree, then read the first LLM
-   call's `cache_creation` from that session's telemetry. `Sum(measured) + framework_floor`
-   should approximate the first call's `cache_creation`, where `framework_floor` is the
-   system-prompt + built-in-tool + MCP remainder from check 3. A large unexplained gap means
-   a measured category drifted from what the runtime actually loaded.
+   call's `cache_creation` from that session's telemetry. `Sum(measured) + remainder`
+   should approximate the first call's `cache_creation`, where `remainder` is the
+   system-prompt + built-in-tool + MCP portion from check 3. A large unexplained gap means
+   a measured category drifted from what the runtime actually loaded. (This validates the
+   disk fallback; when a raw request body is present the spoke tree itemizes all of it
+   directly and no remainder is needed.)
 2. **Differential.** Add one rule (or one skill) to the worktree, re-run the script, and
    start a fresh session. The measured category's tokens and the real first-call
    `cache_creation` should both rise by ~the same amount. Divergence means the script is
    measuring something the runtime does not load, or vice versa.
-3. **Floor calibration.** Start a bare `claude -p` session in a directory with no rules /
-   skills / agents / memory. Its first-call `cache_creation` is the system-prompt +
-   built-in-tool floor — the unmeasured remainder to subtract in check 1.
+3. **Remainder.** Start a bare `claude -p` session in a directory with no rules / skills /
+   agents / memory. Its first-call `cache_creation` is the system-prompt + built-in-tool
+   portion — the unmeasured remainder to subtract in check 1.
