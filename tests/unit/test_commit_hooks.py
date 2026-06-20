@@ -1405,6 +1405,33 @@ class TestHubGuard:
         (git_repo / ".git" / "MERGE_HEAD").write_text(f"{'0' * 40}\n")
         assert hub_guard_edit_rc(git_repo / "notes.md", cwd=git_repo) == ALLOW
 
+    # ── The hub-guard-allow escape-hatch marker (issue #89) ───────────
+    # A `hub-guard-allow` file in the git-dir is the conscious, user-granted
+    # override the /quick lane uses to let the hub session commit into a
+    # worktree. While present it bypasses EVERY guard check (incl. on the hub's
+    # default branch); removing it restores the default deny — nothing else
+    # changes.
+
+    def test_marker_allows_commit_on_hub(self, git_repo: Path) -> None:
+        (git_repo / ".git" / "hub-guard-allow").write_text("")
+        assert hub_guard_cmd_rc('git commit -m "feat: x"', cwd=git_repo) == ALLOW
+
+    def test_marker_allows_branch_create_on_hub(self, git_repo: Path) -> None:
+        (git_repo / ".git" / "hub-guard-allow").write_text("")
+        assert hub_guard_cmd_rc("git checkout -b feature/1-x", cwd=git_repo) == ALLOW
+
+    def test_marker_allows_edit_on_hub(self, git_repo: Path) -> None:
+        (git_repo / ".git" / "hub-guard-allow").write_text("")
+        assert hub_guard_edit_rc(git_repo / "notes.md", cwd=git_repo) == ALLOW
+
+    def test_absent_marker_still_blocks_commit(self, git_repo: Path) -> None:
+        # Create then remove the marker: the default deny must be restored, with
+        # no residual exemption — the marker is the only thing that grants.
+        marker = git_repo / ".git" / "hub-guard-allow"
+        marker.write_text("")
+        marker.unlink()
+        assert hub_guard_cmd_rc('git commit -m "feat: x"', cwd=git_repo) == BLOCK
+
     # ── On a task branch in the main checkout: no-op ──────────────────
 
     def test_allows_edit_on_task_branch(self, on_branch: Callable[[str], Path]) -> None:
