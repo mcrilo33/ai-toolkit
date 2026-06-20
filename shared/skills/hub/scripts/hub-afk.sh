@@ -714,20 +714,21 @@ _ready_at_tip() {
   [ -n "$marker" ] && [ "$marker" = "$tip" ]
 }
 
-# auto_land -> land every ready/<issue> spoke THIS run dispatched. A failed land (merge
-# conflict / suite fail) emits blocked/<issue> and the drain continues; a landed spoke
-# frees its scope + its dependents' blockers for the next tick's plan. A foreign
-# ready/<issue> (no dispatch epoch — left by a parallel session this run never spawned)
-# is skipped unless AFK_LAND_FOREIGN is set, so concurrent sessions don't surprise-land
-# each other's work (#74).
+# auto_land -> land every ready/<issue> spoke. The ready/<issue> marker is the readiness
+# contract (enforced by _ready_at_tip above), so a foreign ready/<issue> left by a parallel
+# session is adopted and landed by default (#95). A failed land (merge conflict / suite
+# fail) emits blocked/<issue> and the drain continues; a landed spoke frees its scope + its
+# dependents' blockers for the next tick's plan. Set AFK_LAND_FOREIGN=0 to restore the
+# dispatched-only isolation (skip any ready/<issue> with no dispatch epoch) so concurrent
+# sessions don't surprise-land each other's work (#74).
 auto_land() {
   local wt_land path issue
   wt_land="$(_afk_find_script "${WT_LAND:-}" worktree-land.sh)" || { log "worktree-land.sh not found — skipping land"; return 0; }
   while IFS=$'\t' read -r path issue; do
     [ -n "$issue" ] || continue
     _ready_at_tip "$path" "$issue" || continue
-    if [ -z "$(read_dispatch_epoch "$issue")" ] && [ -z "${AFK_LAND_FOREIGN:-}" ]; then
-      log "  skip land #$issue — not dispatched by this run (set AFK_LAND_FOREIGN=1 to land foreign spokes)"
+    if [ "${AFK_LAND_FOREIGN:-1}" = "0" ] && [ -z "$(read_dispatch_epoch "$issue")" ]; then
+      log "  skip land #$issue — foreign (no dispatch epoch) and AFK_LAND_FOREIGN=0"
       continue
     fi
     log "→ land #$issue"
