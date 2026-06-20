@@ -363,46 +363,57 @@ def session_is_covered(spoke_run_id: str, get: GetFn) -> bool:
     return any(is_native_trace(trace) for trace in all_traces(spoke_run_id, get))
 
 
-def _reasoning_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Collect every ``reasoning`` node across the forest, depth-first."""
-    found: list[dict[str, Any]] = []
-    for node in nodes:
-        if node.get("kind") == "reasoning":
-            found.append(node)
-        found.extend(_reasoning_nodes(node["children"]))
-    return found
+def _reasoning_node(turn_uuid: str, base_ts: str) -> dict[str, Any]:
+    """A synthetic ``reasoning`` node for one thinking body, keyed by its turn uuid.
+
+    Sourced from the ``thinking`` map directly, not from the forest: the dedup that keeps
+    one usage event per inference (Issue #78) keeps a DIFFERENT transcript record than the
+    one carrying the thinking block, so the surviving turn's ``uuid`` rarely matches the
+    thinking key and the forest's attached ``reasoning`` children are usually absent. The
+    node id stays ``reasoning:<turn uuid>`` so ``_add_reasoning_body`` joins the body and the
+    id matches the full-backfill path's, keeping a rerun idempotent.
+    """
+    return {
+        "node_id": f"{_REASONING_PREFIX}{turn_uuid}",
+        "kind": "reasoning",
+        "name": "reasoning",
+        "ts_start": base_ts,
+        "ts_end": base_ts,
+        "children": [],
+    }
 
 
 def reasoning_only_events(
     forest: list[dict[str, Any]], spoke_run_id: str, thinking: dict[str, str]
 ) -> list[IngestEvent]:
-    """Emit ONLY the reasoning nodes (the gap the live push lacks), under the spoke root.
+    """Emit ONLY the reasoning bodies (the gap the live push lacks), under the spoke root.
 
     For a session the live push already covered, the assembled view exists already; the one
     thing the transcript adds is the extended-thinking body (redacted in every raw API body).
-    Each reasoning node is emitted under the backfill root as a standalone thinking subtree —
-    new observations the live push never had, so no double-write — with deterministic ids so
-    a rerun overwrites. Returns an empty batch when no reasoning node is present.
+    One reasoning observation is emitted per ``thinking`` entry — sourced from the map, NOT
+    from the forest's ``reasoning`` children, which the usage dedup (Issue #78) usually
+    strips by keeping a turn whose ``uuid`` differs from the thinking record's. Each is a new
+    observation the live push never had (no double-write), parented under the backfill root,
+    with deterministic ids so a rerun overwrites. Returns ``[]`` when no thinking is present.
 
     Args:
-        forest: The spoke's causal forest, built WITH the thinking map (so reasoning exists).
+        forest: The spoke's causal forest — used only for its earliest timestamp.
         spoke_run_id: The spoke run id; the trace's ``sessionId``.
-        thinking: ``turn uuid -> extended-thinking body`` supplying each node's body.
+        thinking: ``turn uuid -> extended-thinking body``; one observation per entry.
 
     Returns:
-        A ``trace-create`` + root + one span per reasoning node, or ``[]`` when none.
+        A ``trace-create`` + root + one span per thinking body, or ``[]`` when none.
     """
-    reasoning = _reasoning_nodes(forest)
-    if not reasoning:
+    if not thinking:
         return []
     trace_id = backfill_trace_id(spoke_run_id)
     root_id = backfill_root_id(spoke_run_id)
     base_ts = _earliest_ts(forest)
     events = _trace_and_root(spoke_run_id, base_ts)
-    for node in reasoning:
+    for turn_uuid in thinking:
         events.append(
             _node_event(
-                node,
+                _reasoning_node(turn_uuid, base_ts),
                 spoke_run_id=spoke_run_id,
                 trace_id=trace_id,
                 parent_id=root_id,

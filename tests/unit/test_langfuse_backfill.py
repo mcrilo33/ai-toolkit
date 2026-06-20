@@ -244,3 +244,26 @@ class TestBackfillDecision:
 
     def test_covered_without_thinking_is_a_noop(self) -> None:
         assert backfill_events(_forest(), SPOKE, {}, covered=True) == []
+
+    def test_covered_emits_one_reasoning_per_thinking_body_when_forest_lacks_reasoning(
+        self,
+    ) -> None:
+        # Real-world: the dedup uuid split means the surviving turn uuid differs from the
+        # thinking-record uuid, so the forest carries NO reasoning node. Reasoning-only must
+        # still emit one observation per thinking body — sourced from the thinking map, not
+        # from forest reasoning nodes (the production "86 bodies → 0 observations" bug).
+        forest = build_causal_forest([_turn(uuid="survivor")], [], {}, thinking={})
+        thinking = {"think_a": "BODY_A", "think_b": "BODY_B"}
+        events = backfill_events(forest, SPOKE, thinking, covered=True)
+        reasoning = [e for e in events if e["body"].get("metadata", {}).get("kind") == "reasoning"]
+        assert len(reasoning) == 2
+        assert {e["body"]["output"] for e in reasoning} == {"BODY_A", "BODY_B"}
+
+    def test_covered_reasoning_ids_are_stable_across_reruns(self) -> None:
+        forest = build_causal_forest([_turn(uuid="survivor")], [], {}, thinking={})
+        thinking = {"think_a": "BODY_A", "think_b": "BODY_B"}
+        first = backfill_events(forest, SPOKE, thinking, covered=True)
+        second = backfill_events(forest, SPOKE, thinking, covered=True)
+        ids = lambda evs: sorted(e["body"]["id"] for e in evs)  # noqa: E731
+        assert ids(first) == ids(second)
+        assert backfill_node_id(SPOKE, "reasoning:think_a") in ids(first)
