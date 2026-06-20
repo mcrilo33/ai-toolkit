@@ -390,3 +390,70 @@ class TestHookCausalNesting82:
         assert "hk_sess" not in {n["node_id"] for n in forest}, "session hook dumped to root"
         interval = next(n for n in forest if n["kind"] == "interval")
         assert "hk_sess" in {c["node_id"] for c in interval["children"]}
+
+
+class TestReasoningNodes:
+    """Issue #92: under the backfill's thinking opt-in, a turn whose extended-thinking
+    body was extracted carries a ``reasoning`` child — gist as summary, owns no cost so
+    ``Σ owned == Σ turns`` holds. The default forest (no thinking map) is unchanged: no
+    reasoning nodes, so the dashboard path is untouched.
+    """
+
+    def _reasoning_turn(self) -> list[dict]:
+        turn = _turn("m1", "u1", source="main", agent_id=None, ts="2026-06-12T23:00:10Z", cost=0.10)
+        turn["reasoning"] = "Weighing the parser reuse"
+        return [turn]
+
+    def test_reasoning_child_attached_when_thinking_present(self) -> None:
+        forest = build_causal_forest(self._reasoning_turn(), [], {}, thinking={"m1": "BODY"})
+        nodes = _by_id(forest)
+        assert "reasoning:m1" in {c["node_id"] for c in nodes["m1"]["children"]}
+        assert nodes["reasoning:m1"]["kind"] == "reasoning"
+
+    def test_reasoning_summary_is_the_turn_gist(self) -> None:
+        forest = build_causal_forest(self._reasoning_turn(), [], {}, thinking={"m1": "BODY"})
+        assert _by_id(forest)["reasoning:m1"]["summary"] == "Weighing the parser reuse"
+
+    def test_no_reasoning_node_without_a_thinking_map(self) -> None:
+        forest = build_causal_forest(self._reasoning_turn(), [], {})
+        assert "reasoning" not in {n["kind"] for n in _by_id(forest).values()}
+
+    def test_reasoning_node_owns_no_cost(self) -> None:
+        forest = build_causal_forest(self._reasoning_turn(), [], {}, thinking={"m1": "BODY"})
+        assert _by_id(forest)["reasoning:m1"]["own_cost_usd"] == 0.0
+
+    def test_forest_with_reasoning_conforms_to_contract(self) -> None:
+        forest: list[Any] = build_causal_forest(
+            self._reasoning_turn(), [], {}, thinking={"m1": "BODY"}
+        )
+        validate_causal_tree(forest)
+
+    def test_only_turns_in_the_thinking_map_get_a_reasoning_child(self) -> None:
+        turns = [
+            _turn("m1", "u1", source="main", agent_id=None, ts="2026-06-12T23:00:10Z", cost=0.1),
+            _turn("m2", "m1", source="main", agent_id=None, ts="2026-06-12T23:00:20Z", cost=0.2),
+        ]
+        forest = build_causal_forest(turns, [], {}, thinking={"m1": "BODY"})
+        nodes = _by_id(forest)
+        assert "reasoning:m1" in {c["node_id"] for c in nodes["m1"]["children"]}
+        assert "reasoning:m2" not in {n["node_id"] for n in nodes.values()}
+
+    def test_subagent_turn_also_gets_a_reasoning_child(self) -> None:
+        turns = [
+            _turn("m1", "u1", source="main", agent_id=None, ts="2026-06-12T23:00:10Z", cost=0.1),
+            _turn(
+                "s1", None, source="subagent", agent_id="AG1", ts="2026-06-12T23:00:12Z", cost=0.2
+            ),
+        ]
+        spans = [
+            _span(
+                "sp_ag1",
+                "agent",
+                "Explore",
+                ts="2026-06-12T23:00:11Z",
+                agent_link="AG1",
+                cost_usd=0.2,
+            )
+        ]
+        forest = build_causal_forest(turns, spans, {}, thinking={"s1": "SUBBODY"})
+        assert "reasoning:s1" in {c["node_id"] for c in _by_id(forest)["s1"]["children"]}

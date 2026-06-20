@@ -25,6 +25,7 @@ from telemetry.session_parser import (
     _walk_transcript,
     parse_projects_dir,
     parse_session_file,
+    thinking_by_turn,
 )
 from telemetry.spans import Span
 
@@ -979,6 +980,61 @@ class TestReasoningRefs:
     def test_parse_projects_dir_merges_reasoning_refs(self) -> None:
         merged = parse_projects_dir(FIXTURES)
         assert any(r.source == "main" for r in merged.reasoning_refs)
+
+
+class TestThinkingExtraction:
+    """Issue #92: the transcript→Langfuse backfill needs the extended-thinking BODY
+    (redacted in every OTel raw API body) keyed by turn ``uuid`` — the causal node id.
+
+    It is read ONLY by this opt-in extractor; the default parse (spans + reasoning
+    refs) never surfaces a thinking body (privacy / volume), so the backfill's caller
+    gates the call behind its flag. Only turns whose thinking block carries real text
+    are keyed — signature-only extended thinking and narration-only turns are absent.
+    """
+
+    def test_thinking_body_keyed_by_turn_uuid(self) -> None:
+        thinking = thinking_by_turn(SESSION)
+        assert thinking["a1"] == "SECRET_THINKING"
+
+    def test_only_turns_that_carry_thinking_are_keyed(self) -> None:
+        thinking = thinking_by_turn(SESSION)
+        # The #22 main session has exactly one assistant turn with a thinking block;
+        # narration-only turns are never keyed, and every value is non-empty text.
+        assert set(thinking) == {"a1"}
+        assert all(isinstance(text, str) and text for text in thinking.values())
+
+    def test_default_parse_never_surfaces_the_thinking_body(self, parsed: ParsedSession) -> None:
+        # The opt-in extractor is the ONLY reader of the thinking body: the default
+        # parser output stays byte-for-byte free of it (reasoning refs are gist-only).
+        assert "SECRET_THINKING" not in str(parsed.spans)
+        assert "SECRET_THINKING" not in str(parsed.reasoning_refs)
+
+    def test_walks_thinking_from_a_subagent_transcript(self, tmp_path: Path) -> None:
+        # The walk reaches sub-agent transcripts under ``<stem>/``: a thinking body in a
+        # sub-agent turn is keyed by that turn's (globally unique) uuid, not the main one.
+        main = tmp_path / "s.jsonl"
+        main.write_text(json.dumps(_assistant_thinking("m1", "MAIN_THINK")), encoding="utf-8")
+        sub = tmp_path / "s" / "subagents" / "agent-x.jsonl"
+        sub.parent.mkdir(parents=True)
+        sub.write_text(json.dumps(_assistant_thinking("s1", "SUB_THINK")), encoding="utf-8")
+
+        thinking = thinking_by_turn(main)
+
+        assert thinking == {"m1": "MAIN_THINK", "s1": "SUB_THINK"}
+
+
+def _assistant_thinking(uuid: str, thinking: str) -> dict:
+    return {
+        "type": "assistant",
+        "sessionId": "think-sess",
+        "timestamp": "2026-06-15T12:00:01.000Z",
+        "uuid": uuid,
+        "message": {
+            "role": "assistant",
+            "model": "claude-opus-4-8",
+            "content": [{"type": "thinking", "thinking": thinking}],
+        },
+    }
 
 
 def _assistant_bash(uuid: str, ts: str, tool_id: str, command: str) -> dict:

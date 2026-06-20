@@ -108,6 +108,27 @@ def test_detailed_context_attrs_map_to_metadata() -> None:
     ), "system_reminders must map to langfuse.observation.metadata.system_reminders"
 
 
+def test_beta_tools_and_system_prompt_preview_map_to_metadata() -> None:
+    # The beta detailed stream carries `tools` (name + hash per available tool, for
+    # schema-drift detection) and `system_prompt_preview` (first ~500 chars). The
+    # span-name rewrite keeps only the tool name, so the hash must be preserved onto a
+    # metadata attribute; both map under langfuse.observation.metadata.* so they surface
+    # as filterable top-level keys (a bare attribute would nest under metadata.attributes).
+    config = _load_config()
+
+    statements = _span_statements(config)
+
+    assert any(
+        'set(attributes["langfuse.observation.metadata.tools"], attributes["tools"])' in stmt
+        for stmt in statements
+    ), "beta tools (name+hash) must map to langfuse.observation.metadata.tools"
+    assert any(
+        'set(attributes["langfuse.observation.metadata.system_prompt_preview"], '
+        'attributes["system_prompt_preview"])' in stmt
+        for stmt in statements
+    ), "system_prompt_preview must map to langfuse.observation.metadata.system_prompt_preview"
+
+
 def test_metrics_pipeline_routes_to_a_non_langfuse_sink() -> None:
     # Claude Code's claude_code.token.usage / cost.usage metrics flush to the
     # collector, but Langfuse is NOT a metrics store — they must route to a
@@ -123,6 +144,22 @@ def test_metrics_pipeline_routes_to_a_non_langfuse_sink() -> None:
         "metrics must not reach the message bridge"
     )
     assert "prometheus" in metrics["exporters"], "metrics route to the Prometheus sink"
+
+
+def test_logs_pipeline_routes_to_the_message_bridge() -> None:
+    # The audit/lifecycle event layer (tool_decision, mcp_server_connection, compaction, ...)
+    # rides the logs signal, and the bridge is its only consumer (issue #93): it maps each
+    # event onto a per-spoke Langfuse trace. Guard the logs->bridge route from drift — if it
+    # broke, the whole audit layer would silently stop reaching Langfuse.
+    config = _load_config()
+
+    logs = config["service"]["pipelines"]["logs"]
+
+    assert logs["receivers"] == ["otlp"], "audit/body log events arrive on the otlp receiver"
+    assert "otlphttp/bridge" in logs["exporters"], "the bridge is the logs signal's consumer"
+    assert "otlphttp/langfuse" not in logs["exporters"], (
+        "Langfuse trace ingestion does not read the logs signal; the bridge bridges it"
+    )
 
 
 def test_prometheus_sink_listens_on_a_port_distinct_from_the_receivers() -> None:

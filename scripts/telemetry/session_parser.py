@@ -519,6 +519,52 @@ def _narration_text(content: list) -> str | None:
     return None
 
 
+def thinking_by_turn(path: Path) -> dict[str, str]:
+    """Map each assistant turn's ``uuid`` to its extended-thinking body (Issue #92).
+
+    The thinking body is redacted in every OTel raw API body, so the transcript is its
+    only source. This opt-in extractor reads it — for the main transcript and every
+    sub-agent transcript beneath it — keyed by the turn ``uuid`` (the causal node id the
+    backfill nests a ``reasoning`` node under). The default parse never surfaces it; the
+    backfill's caller gates this behind its flag (volume / privacy).
+
+    Only turns whose thinking block carries real text are keyed — signature-only extended
+    thinking and narration-only turns are absent, so the map holds genuine bodies alone.
+
+    Args:
+        path: The main session transcript; its sub-agent transcripts (``<stem>/``) are
+            walked too, the ``uuid`` being globally unique across them.
+
+    Returns:
+        A mapping of turn ``uuid`` to its concatenated thinking body.
+    """
+    files = [path, *sorted((path.parent / path.stem).rglob("*.jsonl"))]
+    found: dict[str, str] = {}
+    for file in files:
+        for rec in _load_jsonl(file):
+            uuid = rec.get("uuid")
+            message = rec.get("message")
+            if rec.get("type") != "assistant" or not uuid or not isinstance(message, dict):
+                continue
+            text = _thinking_text(message.get("content") or [])
+            if text:
+                found[uuid] = text
+    return found
+
+
+def _thinking_text(content: list) -> str | None:
+    """The concatenated non-empty ``thinking`` block bodies of a turn (else ``None``)."""
+    parts = [
+        block["thinking"]
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "thinking"
+        and isinstance(block.get("thinking"), str)
+        and block["thinking"].strip()
+    ]
+    return "\n".join(parts) if parts else None
+
+
 def _context_and_rule_loads(records: list[dict], meta: dict[str, str | None]) -> list[Span]:
     """Extract the window's loaded context from ``attachment`` records (Issue #59).
 

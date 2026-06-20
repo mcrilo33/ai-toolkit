@@ -122,6 +122,15 @@ processors:
           - set(attributes["langfuse.observation.output"], attributes["response.model_output"]) where attributes["response.model_output"] != nil
           - set(attributes["langfuse.observation.metadata.new_context"], attributes["new_context"]) where attributes["new_context"] != nil
           - set(attributes["langfuse.observation.metadata.system_reminders"], attributes["system_reminders"]) where attributes["system_reminders"] != nil
+          # 6) tool inventory + system-prompt preview (ENABLE_BETA_TRACING_DETAILED,
+          #    issue #94). `tools` carries name + HASH per available tool; the span-name
+          #    rewrite above keeps only the tool name, so map the whole attribute to
+          #    metadata to preserve the hash (schema-drift detection). system_prompt_preview
+          #    is the first ~500 chars of the system prompt. Same metadata.* prefix as
+          #    section 5 so both surface as filterable top-level keys, queryable on the
+          #    observation; same operator opt-in (the beta detailed stream).
+          - set(attributes["langfuse.observation.metadata.tools"], attributes["tools"]) where attributes["tools"] != nil
+          - set(attributes["langfuse.observation.metadata.system_prompt_preview"], attributes["system_prompt_preview"]) where attributes["system_prompt_preview"] != nil
       - context: spanevent
         statements:
           # Tool result/output lives on a span EVENT (TOOL_CONTENT); lift it onto the
@@ -159,7 +168,12 @@ service:
       receivers: [otlp, otlp/beta]
       processors: [transform/langfuse, batch]
       exporters: [otlphttp/langfuse, otlphttp/bridge]
-    # Raw API bodies arrive on the logs signal; the bridge is their only consumer.
+    # Raw API bodies AND the audit/lifecycle event layer (tool_decision incl. rejections,
+    # mcp_server_connection, compaction, permission_mode_changed, plugin_loaded,
+    # skill_activated, hook_execution_complete, api_error/api_refusal) arrive on the logs
+    # signal; the bridge is their only consumer. It joins the bodies onto llm_request spans
+    # and maps each audit event onto a per-spoke synthetic Langfuse trace (issue #93). No
+    # OTTL transform is needed — the bridge keys events by the spoke_run_id resource attr.
     logs:
       receivers: [otlp]
       exporters: [otlphttp/bridge]
