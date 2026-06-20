@@ -103,6 +103,11 @@ class _CausalNodeOptional(TypedDict, total=False):
     # they never fold into the once-per-turn cost rollup.
     cache_read: int
     cache_creation: int
+    # Cache-write TTL split (Issue #97): 5m + 1h sum to ``cache_creation``. The backfill
+    # maps 5m to Langfuse's ``cache_creation_input_tokens`` (1.25x) and 1h to its
+    # ``input_cache_creation_1h`` usage type (2x) so cost matches ccusage.
+    cache_creation_5m: int
+    cache_creation_1h: int
     resume_cache_creation: int
 
 

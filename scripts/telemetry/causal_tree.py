@@ -360,6 +360,10 @@ def _turn_node(row: dict[str, Any]) -> CausalNode:
     # Cache breakdown for the composition lens; display-only, never folded into cost.
     node["cache_read"] = int(row.get("cache_read") or 0)
     node["cache_creation"] = int(row.get("cache_creation") or 0)
+    # Cache-write TTL split (Issue #97): the backfill maps each tier to its Langfuse
+    # usage type so cost reflects the 2x (1h) / 1.25x (5m) price difference.
+    node["cache_creation_5m"] = int(row.get("cache_creation_5m") or 0)
+    node["cache_creation_1h"] = int(row.get("cache_creation_1h") or 0)
     return node
 
 
@@ -610,7 +614,7 @@ def per_turn_rows(
     Returns:
         One dict per turn: ``session_id, ts, model, source, agent_id, uuid,
         parent_uuid, is_sidechain, tokens_in, tokens_out, tokens_total, cache_read,
-        cache_creation, reasoning``.
+        cache_creation, cache_creation_5m, cache_creation_1h, reasoning``.
     """
     gists = _reasoning_by_turn(reasoning_refs or [])
     rows: list[dict[str, object]] = []
@@ -631,6 +635,9 @@ def per_turn_rows(
                 "tokens_total": _event_total(event),
                 "cache_read": event.cache_read,
                 "cache_creation": event.cache_creation,
+                # Cache-write TTL split (Issue #97): 1h writes bill 2x input, 5m 1.25x.
+                "cache_creation_5m": event.cache_creation_5m,
+                "cache_creation_1h": event.cache_creation_1h,
                 "reasoning": gists.get(
                     _turn_key(event.session_id, event.source, event.agent_id, event.ts)
                 ),
