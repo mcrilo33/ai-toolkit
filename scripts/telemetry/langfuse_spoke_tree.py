@@ -1610,34 +1610,78 @@ def _is_activity_observation(observation: Observation) -> bool:
     return name == _INTERACTION_NAME or name.startswith("tool:")
 
 
+def _is_gate_observation(observation: Observation) -> bool:
+    """Whether an observation is the ``spoke-ready --gate`` (PLAN-gate park) span.
+
+    Matched by the OTel span label ``script:gate`` OR, robustly, by the workflow attributes
+    (``workflow.kind == script`` and ``workflow.phase == gate``) so a label-format change does
+    not silently drop the gate-park score.
+    """
+    if (observation.get("name") or "") == _GATE_OBSERVATION_NAME:
+        return True
+    attributes = (observation.get("metadata") or {}).get("attributes") or {}
+    return (
+        attributes.get("workflow.kind") == "script" and attributes.get("workflow.phase") == "gate"
+    )
+
+
+def _parse_ts(value: str) -> datetime | None:
+    """Parse an ISO timestamp to a datetime, or None when malformed."""
+    try:
+        return datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _earliest_after(candidates: list[str], floor: datetime) -> str | None:
+    """Return the chronologically-earliest ISO ``candidates`` value parsed strictly after ``floor``.
+
+    Compares PARSED datetimes (not raw strings), so mixed ISO forms (``Z`` vs ``+00:00``,
+    fractional seconds) order correctly. A candidate whose parse fails or whose tz-awareness
+    differs from ``floor`` (an uncomparable pair) is skipped rather than crashing.
+    """
+    best_dt: datetime | None = None
+    best_str: str | None = None
+    for value in candidates:
+        parsed = _parse_ts(value)
+        if parsed is None:
+            continue
+        try:
+            after = parsed > floor
+        except TypeError:
+            continue  # naive vs aware — uncomparable, skip
+        if after and (best_dt is None or parsed < best_dt):
+            best_dt, best_str = parsed, value
+    return best_str
+
+
 def _gate_park_ms(traces: list[TraceObservations]) -> int | None:
     """Return the PLAN-gate park wait in ms, or None when the spoke never parked at a gate.
 
-    The park starts at the end of the earliest ``script:gate`` observation (the
-    ``spoke-ready.sh --gate`` emission) and ends at the first genuine spoke activity
+    The park starts at the end of the earliest gate observation (:func:`_is_gate_observation`,
+    the ``spoke-ready.sh --gate`` emission) and ends at the first genuine spoke activity
     (:func:`_is_activity_observation`) that starts after it — the resumption once the plan was
-    approved. None when there is no gate observation or nothing resumed after it.
+    approved. All comparisons parse the ISO timestamps. None when there is no gate observation or
+    nothing resumed after it.
     """
     gate_ends: list[str] = []
+    activity_starts: list[str] = []
     for _orig_trace_id, observations in traces:
         for observation in observations:
-            if (observation.get("name") or "") != _GATE_OBSERVATION_NAME:
-                continue
-            end = observation.get("endTime") or observation.get("startTime")
-            if end:
-                gate_ends.append(end)
-    if not gate_ends:
+            if _is_gate_observation(observation):
+                end = observation.get("endTime") or observation.get("startTime")
+                if end:
+                    gate_ends.append(end)
+            elif _is_activity_observation(observation) and observation.get("startTime"):
+                activity_starts.append(observation["startTime"])
+    parsed_gates = [(dt, end) for end in gate_ends if (dt := _parse_ts(end)) is not None]
+    if not parsed_gates:
         return None
-    gate_end = min(gate_ends)
-    resumes: list[str] = []
-    for _orig_trace_id, observations in traces:
-        for observation in observations:
-            start = observation.get("startTime")
-            if _is_activity_observation(observation) and start and start > gate_end:
-                resumes.append(start)
-    if not resumes:
+    gate_floor, gate_end = min(parsed_gates, key=lambda pair: pair[0])
+    resume = _earliest_after(activity_starts, gate_floor)
+    if resume is None:
         return None
-    return _elapsed_ms(gate_end, min(resumes))
+    return _elapsed_ms(gate_end, resume)
 
 
 def build_score_events(

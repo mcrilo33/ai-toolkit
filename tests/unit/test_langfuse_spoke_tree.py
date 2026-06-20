@@ -725,6 +725,67 @@ class TestScoreEvents:
 
         assert first == second and first
 
+    def test_two_blocked_tools_get_distinct_permission_scores(self) -> None:
+        tool_a = _obs("ta", "tool:Bash", parent=None, metadata={"attributes": {"tool_use_id": "a"}})
+        block_a = _obs(
+            "ba",
+            "claude_code.tool.blocked_on_user",
+            parent="ta",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:01Z",
+            metadata={"attributes": {"tool_use_id": "a"}},
+        )
+        tool_b = _obs(
+            "tbb", "tool:Read", parent=None, metadata={"attributes": {"tool_use_id": "b"}}
+        )
+        block_b = _obs(
+            "bb",
+            "claude_code.tool.blocked_on_user",
+            parent="tbb",
+            startTime="2026-01-02T00:00:05Z",
+            endTime="2026-01-02T00:00:07Z",
+            metadata={"attributes": {"tool_use_id": "b"}},
+        )
+
+        scores = self._scores([("tr", [tool_a, block_a, tool_b, block_b])])
+
+        perm = self._by_name(scores, "permission_wait_ms")
+        assert {s["body"]["value"] for s in perm} == {1000, 2000}
+        assert len({s["id"] for s in perm}) == 2  # distinct ids, no collision
+
+    def test_gate_detected_by_workflow_attributes_without_the_name(self) -> None:
+        # Robust to a label-format change: kind=script + phase=gate is enough, no "script:gate".
+        gate = _obs(
+            "gt",
+            "some-other-name",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+            metadata={"attributes": {"workflow.kind": "script", "workflow.phase": "gate"}},
+        )
+        turn = _obs("i1", "claude_code.interaction", parent=None, startTime="2026-01-02T00:01:10Z")
+
+        scores = self._scores([("tr", [gate, turn])])
+
+        assert self._by_name(scores, "gate_park_ms")[0]["body"]["value"] == 60000
+
+    def test_no_gate_park_when_activity_only_precedes_the_gate(self) -> None:
+        early = _obs("i0", "claude_code.interaction", parent=None, startTime="2026-01-02T00:00:00Z")
+        gate = self._gate("2026-01-02T00:05:00Z", "2026-01-02T00:05:10Z")
+
+        scores = self._scores([("tr", [early, gate])])
+
+        assert self._by_name(scores, "gate_park_ms") == []
+
+    def test_gate_park_orders_by_parsed_time_not_string(self) -> None:
+        # Fractional seconds + Z: a naive string sort would mis-order; parsing keeps it correct.
+        gate = self._gate("2026-01-02T00:00:00Z", "2026-01-02T00:00:09.500Z")
+        turn = _obs("i1", "claude_code.interaction", parent=None, startTime="2026-01-02T00:00:10Z")
+
+        scores = self._scores([("tr", [gate, turn])])
+
+        assert self._by_name(scores, "gate_park_ms")[0]["body"]["value"] == 500
+
 
 class TestContainerRollups:
     """Every container node (and the synthetic root) carries a subtree token rollup."""
