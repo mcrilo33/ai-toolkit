@@ -65,10 +65,11 @@ def build_causal_forest(
         spans: The spoke's unified spans (pull tool/skill/agent + push hook/script/
             step/lifecycle) as dicts.
         tool_parents: ``span_id -> issuing turn uuid`` (the parser's causal edge map).
-        thinking: Optional ``turn uuid -> extended-thinking body`` map (Issue #92). When
-            given (only the backfill's opt-in supplies it), each turn whose uuid is a key
-            gains a ``reasoning`` child — gist as summary, owning no cost. Omitted by the
-            dashboard path, so the default forest carries no reasoning node.
+        thinking: Optional ``turn node id -> extended-thinking body`` map (Issue #92),
+            keyed by the turn's ``uuid`` (which is its node id). When given (only the
+            backfill's opt-in supplies it), each turn whose node id is a key gains a
+            ``reasoning`` child — gist as summary, owning no cost. Omitted by the dashboard
+            path, so the default forest carries no reasoning node.
 
     Returns:
         The top-level causal nodes (the phase-interval spine + any root-level script),
