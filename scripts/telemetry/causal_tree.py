@@ -55,6 +55,7 @@ def build_causal_forest(
     turns: list[dict[str, Any]],
     spans: list[dict[str, Any]],
     tool_parents: dict[str, str],
+    thinking: dict[str, str] | None = None,
 ) -> list[CausalNode]:
     """Build the causal forest for one spoke.
 
@@ -64,11 +65,16 @@ def build_causal_forest(
         spans: The spoke's unified spans (pull tool/skill/agent + push hook/script/
             step/lifecycle) as dicts.
         tool_parents: ``span_id -> issuing turn uuid`` (the parser's causal edge map).
+        thinking: Optional ``turn uuid -> extended-thinking body`` map (Issue #92). When
+            given (only the backfill's opt-in supplies it), each turn whose uuid is a key
+            gains a ``reasoning`` child — gist as summary, owning no cost. Omitted by the
+            dashboard path, so the default forest carries no reasoning node.
 
     Returns:
         The top-level causal nodes (the phase-interval spine + any root-level script),
         ordered by start time. Every node satisfies the :mod:`telemetry.causal` contract.
     """
+    thinking = thinking or {}
     nodes: dict[str, CausalNode] = {}
     main_turns: list[CausalNode] = []
     main_turn_rows: list[tuple[CausalNode, dict[str, Any]]] = []
@@ -76,6 +82,8 @@ def build_causal_forest(
     for row in turns:
         node = _turn_node(row)
         nodes[node["node_id"]] = node
+        if node["node_id"] in thinking:
+            node["children"].append(_reasoning_child(node, row.get("reasoning")))
         if row.get("source") == "subagent":
             sub_turns.append((node, row.get("agent_id")))
         else:
@@ -360,6 +368,25 @@ def _turn_node(row: dict[str, Any]) -> CausalNode:
     return node
 
 
+def _reasoning_child(turn: CausalNode, gist: str | None) -> CausalNode:
+    """The ``reasoning`` node a turn carries when its thinking body was extracted (#92).
+
+    Owns nothing — cost stays on the turn, so ``Σ owned == Σ turns`` is preserved. Its
+    ``summary`` is the turn's privacy-safe narration gist; the thinking BODY is not held
+    here (the backfill joins it by the turn uuid at Langfuse-translation time).
+    """
+    return causal_node(
+        node_id=f"reasoning:{turn['node_id']}",
+        kind="reasoning",
+        name="reasoning",
+        parent_id=turn["node_id"],
+        summary=gist,
+        actor=turn["actor"],
+        ts_start=turn["ts_start"],
+        ts_end=turn["ts_start"],
+    )
+
+
 def _span_node(span: dict[str, Any]) -> CausalNode:
     kind = span["kind"]
     links: dict[str, Any] = {}
@@ -571,6 +598,7 @@ def causal_forest_from_parsed(
     parsed: ParsedSession,
     push_spans: list[dict[str, Any]],
     ccusage_costs: dict[str, float],
+    thinking: dict[str, str] | None = None,
 ) -> list[CausalNode]:
     """Assemble a spoke's full causal forest from a parsed session + its push spans.
 
@@ -578,10 +606,13 @@ def causal_forest_from_parsed(
     rows (cost-attributed, carrying the causal ids) and the parser's ``tool_parents`` edge
     map feed the builder; the push spans supply the phase-spine markers, hooks and scripts;
     idle/resume dividers are appended. Returns the start-ordered forest.
+
+    ``thinking`` (Issue #92) is the optional ``turn uuid -> extended-thinking body`` map
+    the backfill passes under its opt-in; it threads through to attach ``reasoning`` nodes.
     """
     turns = per_turn_rows(parsed.usage_events, ccusage_costs, reasoning_refs=parsed.reasoning_refs)
     pull = [span.to_dict() for span in parsed.spans]
-    forest = build_causal_forest(turns, [*pull, *push_spans], parsed.tool_parents)
+    forest = build_causal_forest(turns, [*pull, *push_spans], parsed.tool_parents, thinking)
     forest.extend(causal_dividers(turns))
     _sort_tree(forest)
     return forest

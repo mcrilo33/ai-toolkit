@@ -400,9 +400,7 @@ class TestReasoningNodes:
     """
 
     def _reasoning_turn(self) -> list[dict]:
-        turn = _turn(
-            "m1", "u1", source="main", agent_id=None, ts="2026-06-12T23:00:10Z", cost=0.10
-        )
+        turn = _turn("m1", "u1", source="main", agent_id=None, ts="2026-06-12T23:00:10Z", cost=0.10)
         turn["reasoning"] = "Weighing the parser reuse"
         return [turn]
 
@@ -425,9 +423,10 @@ class TestReasoningNodes:
         assert _by_id(forest)["reasoning:m1"]["own_cost_usd"] == 0.0
 
     def test_forest_with_reasoning_conforms_to_contract(self) -> None:
-        validate_causal_tree(
-            build_causal_forest(self._reasoning_turn(), [], {}, thinking={"m1": "BODY"})
+        forest: list[Any] = build_causal_forest(
+            self._reasoning_turn(), [], {}, thinking={"m1": "BODY"}
         )
+        validate_causal_tree(forest)
 
     def test_only_turns_in_the_thinking_map_get_a_reasoning_child(self) -> None:
         turns = [
@@ -442,10 +441,19 @@ class TestReasoningNodes:
     def test_subagent_turn_also_gets_a_reasoning_child(self) -> None:
         turns = [
             _turn("m1", "u1", source="main", agent_id=None, ts="2026-06-12T23:00:10Z", cost=0.1),
-            _turn("s1", None, source="subagent", agent_id="AG1", ts="2026-06-12T23:00:12Z", cost=0.2),
+            _turn(
+                "s1", None, source="subagent", agent_id="AG1", ts="2026-06-12T23:00:12Z", cost=0.2
+            ),
         ]
         spans = [
-            _span("sp_ag1", "agent", "Explore", ts="2026-06-12T23:00:11Z", agent_link="AG1", cost_usd=0.2)
+            _span(
+                "sp_ag1",
+                "agent",
+                "Explore",
+                ts="2026-06-12T23:00:11Z",
+                agent_link="AG1",
+                cost_usd=0.2,
+            )
         ]
         forest = build_causal_forest(turns, spans, {}, thinking={"s1": "SUBBODY"})
         assert "reasoning:s1" in {c["node_id"] for c in _by_id(forest)["s1"]["children"]}
