@@ -25,12 +25,15 @@ from telemetry.langfuse_spoke_tree import (
     _DISK_CATEGORY_ORDER,
     _MAX_CONTENT_CHARS,
     _REQUEST_CATEGORY_ORDER,
+    _STEP_PREFIX,
     _TRUNCATION_MARKER,
+    ToolContent,
     _copy_id,
     build_batch,
     build_context_evolution_events,
     build_llm_decomposition_events,
     build_loaded_context_events,
+    build_step_windows,
     context_evolution_deltas,
     fetch_session,
     find_request_files,
@@ -628,6 +631,232 @@ def _tool_result(tool_use_id: str, content: object) -> dict:
     """Build a user transcript line carrying one tool_result block."""
     block = {"type": "tool_result", "tool_use_id": tool_use_id, "content": content}
     return {"type": "user", "message": {"content": [block]}}
+
+
+def _ledger_obs(obs_id: str, name: str, tool_use_id: str, *, start: str, end: str) -> dict:
+    """A root-level tool:Task* span carrying its tool_use_id and a time window."""
+    return _obs(
+        obs_id,
+        name,
+        parent=None,
+        startTime=start,
+        endTime=end,
+        metadata={"attributes": {"tool_use_id": tool_use_id}},
+    )
+
+
+def _step_node(batch: list[dict]) -> dict | None:
+    """Return the first synthetic step node in a batch, or None when there is none."""
+    return next((e for e in batch if e["id"].startswith(_STEP_PREFIX)), None)
+
+
+class TestBuildStepWindows:
+    """#100: derive cycle-step windows from the TaskCreate/TaskUpdate ledger."""
+
+    def _content(self) -> dict[str, ToolContent]:
+        return {
+            "tu-c1": ToolContent(
+                {"subject": "S1 RED: failing test", "description": "x"},
+                "Task #1 created successfully: S1 RED: failing test",
+            ),
+            "tu-u1": ToolContent({"taskId": "1", "status": "in_progress"}, "Updated task #1"),
+            "tu-u2": ToolContent({"taskId": "1", "status": "completed"}, "Updated task #1"),
+        }
+
+    def _traces(self) -> list[tuple[str, list[dict]]]:
+        create = _ledger_obs(
+            "tc1",
+            "tool:TaskCreate",
+            "tu-c1",
+            start="2026-01-02T00:00:00Z",
+            end="2026-01-02T00:00:00Z",
+        )
+        started = _ledger_obs(
+            "tu1",
+            "tool:TaskUpdate",
+            "tu-u1",
+            start="2026-01-02T00:00:01Z",
+            end="2026-01-02T00:00:01Z",
+        )
+        done = _ledger_obs(
+            "tu2",
+            "tool:TaskUpdate",
+            "tu-u2",
+            start="2026-01-02T00:00:09Z",
+            end="2026-01-02T00:00:10Z",
+        )
+        return [("tr", [create, started, done])]
+
+    def test_pairs_create_subject_with_update_window(self) -> None:
+        windows = build_step_windows(self._traces(), self._content())
+
+        assert len(windows) == 1
+        win = windows[0]
+        assert win.subject == "S1 RED: failing test"
+        # window = in_progress start → completed end.
+        assert win.start == "2026-01-02T00:00:01Z"
+        assert win.end == "2026-01-02T00:00:10Z"
+        assert win.status == "completed"
+
+    def test_non_ledger_spoke_yields_no_windows(self) -> None:
+        assert build_step_windows(_traces(), {}) == []
+
+    def test_create_without_an_in_progress_update_is_skipped(self) -> None:
+        # A task that was created but never started has no window to draw.
+        content = {
+            "tu-c1": ToolContent({"subject": "S2 GREEN"}, "Task #2 created successfully: S2 GREEN")
+        }
+        create = _ledger_obs(
+            "tc1",
+            "tool:TaskCreate",
+            "tu-c1",
+            start="2026-01-02T00:00:00Z",
+            end="2026-01-02T00:00:00Z",
+        )
+
+        assert build_step_windows([("tr", [create])], content) == []
+
+
+class TestStepGrouping:
+    """#100: turns/tools at the root nest under the step whose window contains them."""
+
+    def _content(self) -> dict[str, ToolContent]:
+        return {
+            "tu-c1": ToolContent(
+                {"subject": "S1 RED: x"}, "Task #1 created successfully: S1 RED: x"
+            ),
+            "tu-u1": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
+            "tu-u2": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
+        }
+
+    def _traces(self, turn_start: str = "2026-01-02T00:00:05Z") -> list[tuple[str, list[dict]]]:
+        create = _ledger_obs(
+            "tc1",
+            "tool:TaskCreate",
+            "tu-c1",
+            start="2026-01-02T00:00:00Z",
+            end="2026-01-02T00:00:00Z",
+        )
+        started = _ledger_obs(
+            "tu1",
+            "tool:TaskUpdate",
+            "tu-u1",
+            start="2026-01-02T00:00:01Z",
+            end="2026-01-02T00:00:01Z",
+        )
+        done = _ledger_obs(
+            "tu2",
+            "tool:TaskUpdate",
+            "tu-u2",
+            start="2026-01-02T00:00:20Z",
+            end="2026-01-02T00:00:21Z",
+        )
+        turn = _obs(
+            "turnA",
+            "claude_code.interaction",
+            parent=None,
+            startTime=turn_start,
+            metadata={"kind": "turn"},
+        )
+        return [("tr", [create, started, done, turn])]
+
+    def test_turn_within_window_nests_under_a_step_node(self) -> None:
+        batch = build_batch(self._traces(), SPOKE, self._content())
+
+        step = _step_node(batch)
+        assert step is not None
+        assert step["body"]["name"] == "step:S1 RED: x"
+        assert step["body"]["parentObservationId"] == root_id_for(SPOKE)
+        turn = _by_orig(batch, "tr", "turnA")
+        assert turn["body"]["parentObservationId"] == step["id"]
+
+    def test_step_node_carries_window_metadata(self) -> None:
+        batch = build_batch(self._traces(), SPOKE, self._content())
+
+        meta = _step_node(batch)["body"]["metadata"]
+        assert meta["subject"] == "S1 RED: x"
+        assert meta["status"] == "completed"
+
+    def test_turn_outside_every_window_stays_at_root(self) -> None:
+        # A turn well after the only step's window keeps its synthetic-root parent.
+        batch = build_batch(self._traces(turn_start="2026-01-02T01:00:00Z"), SPOKE, self._content())
+
+        turn = _by_orig(batch, "tr", "turnA")
+        assert turn["body"]["parentObservationId"] == root_id_for(SPOKE)
+
+    def test_non_ledger_spoke_emits_no_step_nodes(self) -> None:
+        batch = build_batch(_traces(), SPOKE)
+
+        assert _step_node(batch) is None
+        # the interaction turn still collapses to the synthetic root.
+        assert _by_orig(batch, "trace-int", "i1")["body"]["parentObservationId"] == root_id_for(
+            SPOKE
+        )
+
+    def test_innermost_window_wins_on_overlap(self) -> None:
+        # Two overlapping steps; a turn inside both nests under the later-starting (inner) one.
+        content = {
+            "tu-ca": ToolContent({"subject": "outer"}, "Task #1 created successfully: outer"),
+            "tu-ua1": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
+            "tu-ua2": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
+            "tu-cb": ToolContent({"subject": "inner"}, "Task #2 created successfully: inner"),
+            "tu-ub1": ToolContent({"taskId": "2", "status": "in_progress"}, "ok"),
+            "tu-ub2": ToolContent({"taskId": "2", "status": "completed"}, "ok"),
+        }
+        outer = [
+            _ledger_obs(
+                "ca",
+                "tool:TaskCreate",
+                "tu-ca",
+                start="2026-01-02T00:00:00Z",
+                end="2026-01-02T00:00:00Z",
+            ),
+            _ledger_obs(
+                "ua1",
+                "tool:TaskUpdate",
+                "tu-ua1",
+                start="2026-01-02T00:00:01Z",
+                end="2026-01-02T00:00:01Z",
+            ),
+            _ledger_obs(
+                "ua2",
+                "tool:TaskUpdate",
+                "tu-ua2",
+                start="2026-01-02T00:00:30Z",
+                end="2026-01-02T00:00:30Z",
+            ),
+        ]
+        inner = [
+            _ledger_obs(
+                "cb",
+                "tool:TaskCreate",
+                "tu-cb",
+                start="2026-01-02T00:00:05Z",
+                end="2026-01-02T00:00:05Z",
+            ),
+            _ledger_obs(
+                "ub1",
+                "tool:TaskUpdate",
+                "tu-ub1",
+                start="2026-01-02T00:00:06Z",
+                end="2026-01-02T00:00:06Z",
+            ),
+            _ledger_obs(
+                "ub2",
+                "tool:TaskUpdate",
+                "tu-ub2",
+                start="2026-01-02T00:00:20Z",
+                end="2026-01-02T00:00:20Z",
+            ),
+        ]
+        turn = _obs(
+            "turnB", "claude_code.interaction", parent=None, startTime="2026-01-02T00:00:10Z"
+        )
+
+        batch = build_batch([("tr", [*outer, *inner, turn])], SPOKE, content)
+
+        steps = {e["body"]["name"]: e["id"] for e in batch if e["id"].startswith(_STEP_PREFIX)}
+        assert _by_orig(batch, "tr", "turnB")["body"]["parentObservationId"] == steps["step:inner"]
 
 
 class TestScanTranscripts:
