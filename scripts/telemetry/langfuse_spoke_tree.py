@@ -1692,14 +1692,21 @@ def _decomp_metadata(rows: list[dict[str, object]], observed: int) -> dict[str, 
     """Shape one cache bucket's decomposition metadata: per-component -> per-item, reconciled.
 
     ``components`` maps each category (in :data:`_DECOMP_CATEGORY_ORDER`) to ``{name: tokens}``
-    for the items the split routed into this bucket; ``measured`` is their sum and ``remainder``
+    for the items the split routed into this bucket — items that share a name within a category
+    are SUMMED, so ``Σ components == measured`` holds; ``measured`` is their sum and ``remainder``
     is ``observed - measured`` so the itemization reconciles (≈) to the billed counter (the
     remainder absorbs the base system prompt / tool schemas not itemized per-name).
     """
     measured = sum(int(cast(int, row["tokens"])) for row in rows)
     components: dict[str, dict[str, int]] = {}
     for category, crows in _group_rows_by_category(rows, _DECOMP_CATEGORY_ORDER):
-        components[category] = {str(row["name"]): int(cast(int, row["tokens"])) for row in crows}
+        # SUM on a name collision (rules share a basename, reminders a kind, skills a line) so the
+        # itemization still reconciles (Σ items == measured); a plain dict would drop all but one.
+        bucket: dict[str, int] = {}
+        for row in crows:
+            name = str(row["name"])
+            bucket[name] = bucket.get(name, 0) + int(cast(int, row["tokens"]))
+        components[category] = bucket
     return {
         "observed": observed,
         "measured": measured,

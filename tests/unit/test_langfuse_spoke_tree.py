@@ -29,6 +29,7 @@ from telemetry.langfuse_spoke_tree import (
     _TRUNCATION_MARKER,
     ToolContent,
     _copy_id,
+    _decomp_metadata,
     apply_llm_decomposition,
     build_batch,
     build_context_evolution_events,
@@ -1732,3 +1733,24 @@ class TestLlmDecompositionMetadata:
 
         assert count == 0
         assert "cache_read" not in self._meta(batch, "tr", "g1")
+
+    def test_duplicate_named_items_are_summed_not_clobbered(self) -> None:
+        # Two rules with the same basename (e.g. nested CLAUDE.md) must SUM, so the per-item
+        # itemization still reconciles to measured (a plain {name: tokens} dict would drop one).
+        rows = [
+            {
+                "category": "rules",
+                "name": "CLAUDE.md",
+                "tokens": 10,
+                "cost_usd": 0.0,
+                "source": "s",
+            },
+            {"category": "rules", "name": "CLAUDE.md", "tokens": 7, "cost_usd": 0.0, "source": "s"},
+        ]
+
+        meta = _decomp_metadata(rows, observed=20)
+
+        assert meta["components"]["rules"]["CLAUDE.md"] == 17
+        assert meta["measured"] == 17
+        item_sum = sum(tok for comp in meta["components"].values() for tok in comp.values())
+        assert item_sum == meta["measured"]
