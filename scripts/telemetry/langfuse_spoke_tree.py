@@ -97,9 +97,13 @@ from telemetry.measure_context_cost import (
     measure_items,
 )
 from telemetry.request_body import (
+    ContextDelta,
+    ContextItem,
+    diff_snapshots,
     first_real_request,
     measure_request_items,
     parse_request_body,
+    snapshot_items_from_path,
 )
 
 logger = logging.getLogger("langfuse_spoke_tree")
@@ -144,6 +148,12 @@ _REMAINDER_SOURCE = "reconciled-remainder"
 _REMAINDER_NOTE = "no request body; base system + tools + mcp reconciled as one"
 # Default cache-creation price (USD per token), Opus tier — mirrors measure_context_cost.
 _DEFAULT_PRICE = 0.00000625
+# Token slack for the advisory net-vs-cache_creation reconciliation cross-check (#98). The
+# count_tokens tokenizer and the billed cache_creation never agree exactly (thinking blocks,
+# tool-use framing), so a turn "reconciles" when the two are within this many tokens.
+# UPGRADE: scale the tolerance with the turn's net magnitude if large turns drift past a flat
+# slack — when absolute-token slack proves too tight on big context loads.
+_RECONCILE_TOLERANCE = 2_000
 # Category order for the request-body itemization (the primary, fully-itemized path).
 _REQUEST_CATEGORY_ORDER = ("tools", "mcp", "system", "context")
 # Category order for the disk fallback used when no request body is available.
@@ -675,6 +685,31 @@ def prefix_total(traces: list[TraceObservations]) -> int:
     return best_value
 
 
+def per_turn_cache_creation(traces: list[TraceObservations]) -> list[int]:
+    """Return each LLM call's ``cache_creation`` token count, ordered by ``startTime``.
+
+    Used for the advisory per-turn reconciliation: aligned by chronological position with the
+    diffed request bodies, each value is the billed cache write the turn's net is checked
+    against. Only observations carrying ``cache_creation_input_tokens`` usage are counted, so
+    non-LLM spans do not shift the alignment.
+
+    Args:
+        traces: The source traces paired with their observations.
+
+    Returns:
+        The ``cache_creation`` token counts of the LLM calls, oldest first.
+    """
+    calls: list[tuple[str, int]] = []
+    for _orig_trace_id, observations in traces:
+        for observation in observations:
+            usage = observation.get("usageDetails") or {}
+            written = usage.get("cache_creation_input_tokens")
+            if written is None:
+                continue
+            calls.append((observation.get("startTime") or "", int(written)))
+    return [written for _start, written in sorted(calls)]
+
+
 def _lc_id(spoke_run_id: str, key: str) -> str:
     """Return the deterministic id of one loaded-context node for a spoke."""
     digest = hashlib.sha1(f"{spoke_run_id}:{key}".encode()).hexdigest()[:24]
@@ -910,6 +945,206 @@ def request_context_rows(
     return measure_request_items(parsed.items, counter=counter, price=price)
 
 
+# The diff buckets rendered as child nodes under each evolving turn, in display order.
+_EVO_BUCKETS = ("added", "removed", "changed")
+
+
+def _signed(tokens: int) -> str:
+    """Render a signed token count for a turn-node label (e.g. ``+370`` / ``-15000``)."""
+    return f"+{tokens}" if tokens >= 0 else str(tokens)
+
+
+def _evo_summary(row: dict[str, object]) -> dict[str, object]:
+    """Compact a measured diff row to the fields shown in a turn's added/removed/changed list."""
+    summary: dict[str, object] = {
+        "category": row["category"],
+        "name": row["name"],
+        "tokens": row["tokens"],
+    }
+    if "delta_tokens" in row:
+        summary["delta_tokens"] = row["delta_tokens"]
+    return summary
+
+
+def _evo_item_node(
+    spoke_run_id: str,
+    turn_index: int,
+    bucket: str,
+    parent_id: str,
+    trace_id: str,
+    base_ts: str,
+    row: dict[str, object],
+) -> IngestEvent:
+    """Shape one added/removed/changed component node under an evolving turn.
+
+    The id is namespaced by turn and bucket so the same component name recurring across turns
+    (a tool re-loaded, a message kind re-added) does not collide.
+    """
+    tokens = int(cast(int, row["tokens"]))
+    metadata: dict[str, object] = {
+        "change": bucket,
+        "category": row["category"],
+        "tokens": tokens,
+        "cost_usd": row["cost_usd"],
+    }
+    if "delta_tokens" in row:
+        metadata["delta_tokens"] = row["delta_tokens"]
+    return _lc_node(
+        node_id=_lc_id(spoke_run_id, f"evo/{turn_index}/{bucket}/{row['category']}/{row['name']}"),
+        parent_id=parent_id,
+        trace_id=trace_id,
+        name=f"{row['name']}: {_human_tokens(tokens)}",
+        base_ts=base_ts,
+        metadata=metadata,
+    )
+
+
+def _evo_turn_events(
+    spoke_run_id: str,
+    turn_index: int,
+    delta: ContextDelta,
+    *,
+    evo_id: str,
+    trace_id: str,
+    base_ts: str,
+    cache_creation: int | None,
+) -> list[IngestEvent]:
+    """Build one evolving-turn node and its per-component child nodes."""
+    turn_id = _lc_id(spoke_run_id, f"evo/turn-{turn_index}")
+    suffix = f" [{delta.label}]" if delta.label else ""
+    metadata: dict[str, object] = {
+        "turn": turn_index,
+        "net_tokens": delta.net_tokens,
+        "label": delta.label,
+        "added": [_evo_summary(row) for row in delta.added],
+        "removed": [_evo_summary(row) for row in delta.removed],
+        "changed": [_evo_summary(row) for row in delta.changed],
+    }
+    if cache_creation is not None:
+        metadata["cache_creation_observed"] = cache_creation
+        metadata["reconciles"] = abs(delta.net_tokens - cache_creation) <= _RECONCILE_TOLERANCE
+    turn_node = _lc_node(
+        node_id=turn_id,
+        parent_id=evo_id,
+        trace_id=trace_id,
+        name=f"turn {turn_index}: net {_signed(delta.net_tokens)}{suffix}",
+        base_ts=base_ts,
+        metadata=metadata,
+    )
+    buckets = {"added": delta.added, "removed": delta.removed, "changed": delta.changed}
+    children = [
+        _evo_item_node(spoke_run_id, turn_index, bucket, turn_id, trace_id, base_ts, row)
+        for bucket in _EVO_BUCKETS
+        for row in buckets[bucket]
+    ]
+    return [turn_node, *children]
+
+
+def build_context_evolution_events(
+    spoke_run_id: str,
+    deltas: list[tuple[int, ContextDelta]],
+    *,
+    base_ts: str,
+    cache_creation_by_turn: dict[int, int] | None = None,
+) -> list[IngestEvent]:
+    """Build the per-turn context-evolution subtree under the spoke root.
+
+    Emits a ``context-evolution`` parent under the synthetic root (a sibling of the #87
+    ``loaded-context`` baseline), then one node per evolving turn carrying its ``added`` /
+    ``removed`` / ``changed`` component lists, ``net_tokens``, and compaction ``label`` in
+    metadata, with one child node per added / removed / changed component (so a ToolSearch
+    turn decomposes into the loaded schemas by name and a compaction shows the dropped
+    messages). Turns with no change are not passed in (the caller filters them).
+
+    When ``cache_creation_by_turn`` maps a turn to that turn's observed ``cache_creation``,
+    the turn node records it as ``cache_creation_observed`` plus a ``reconciles`` flag — the
+    advisory (≈) cross-check of the net against the billed delta. All ids derive from the
+    spoke run id so a rerun overwrites the same nodes.
+
+    Args:
+        spoke_run_id: The spoke run identifier.
+        deltas: ``(turn_index, ContextDelta)`` pairs for the evolving turns, in turn order.
+        base_ts: ISO timestamp stamped on every synthetic node.
+        cache_creation_by_turn: Optional per-turn observed ``cache_creation`` for the
+            reconciliation cross-check; absent turns simply omit the cross-check metadata.
+
+    Returns:
+        The context-evolution ingestion events: the parent, then each turn with its children.
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    evo_id = _lc_id(spoke_run_id, "context-evolution")
+    cache_creation_by_turn = cache_creation_by_turn or {}
+    events = [
+        _lc_node(
+            node_id=evo_id,
+            parent_id=root_id_for(spoke_run_id),
+            trace_id=trace_id,
+            name="context-evolution",
+            base_ts=base_ts,
+            metadata={"turns": len(deltas)},
+        )
+    ]
+    for turn_index, delta in deltas:
+        events.extend(
+            _evo_turn_events(
+                spoke_run_id,
+                turn_index,
+                delta,
+                evo_id=evo_id,
+                trace_id=trace_id,
+                base_ts=base_ts,
+                cache_creation=cache_creation_by_turn.get(turn_index),
+            )
+        )
+    return events
+
+
+def context_evolution_deltas(
+    bodies_dir: Path, *, counter: TokenCounter, price: float
+) -> list[tuple[int, ContextDelta]]:
+    """Diff every consecutive raw request body in ``bodies_dir`` into per-turn deltas.
+
+    The bodies are itemized in chronological order (``find_request_files`` sorts by mtime)
+    and each consecutive pair is diffed; turn 0 is the baseline, so a delta's turn index is
+    the newer body's position. Turns whose context did not change are dropped, so only evolving
+    turns are returned.
+
+    The turn index is the RAW file position, NOT a position in the parsed-only list: an
+    unparseable body becomes a ``None`` hole that drops the two transitions touching it but
+    leaves every other turn index intact, so the indices keep aligning with
+    :func:`_reconciliation_map` (which keys off the full file list).
+
+    Note the turn-0 baseline here is the first dumped body, which may be a degenerate aux call
+    (empty ``tools``) that the #87 ``loaded-context`` path skips via ``first_real_request``; the
+    first evolving turn then surfaces the real prefix load as a large ADD. The #87 baseline
+    itself is unaffected.
+
+    Args:
+        bodies_dir: The per-spoke ``OTEL_LOG_RAW_API_BODIES=file:<dir>`` dump directory.
+        counter: Token counter; raises ``CountTokensError`` to trigger the char/4 fallback.
+        price: Cache-creation price in USD per token.
+
+    Returns:
+        ``(turn_index, ContextDelta)`` pairs for the evolving turns, in turn order.
+    """
+    snapshots: list[list[ContextItem] | None] = []
+    for path in find_request_files(bodies_dir):
+        try:
+            snapshots.append(snapshot_items_from_path(path))
+        except (OSError, json.JSONDecodeError):
+            logger.warning("cannot itemize request body %s", path)
+            snapshots.append(None)  # a hole: preserve raw positions, never bridge across it
+    deltas: list[tuple[int, ContextDelta]] = []
+    for index in range(1, len(snapshots)):
+        prev, curr = snapshots[index - 1], snapshots[index]
+        if prev is None or curr is None:
+            continue
+        delta = diff_snapshots(prev, curr, counter=counter, price=price)
+        if delta.added or delta.removed or delta.changed:
+            deltas.append((index, delta))
+    return deltas
+
+
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse the CLI arguments for the spoke-tree assembler."""
     env = os.environ
@@ -998,16 +1233,44 @@ def main(argv: list[str] | None = None) -> int:
             prefix_total=prefix_total(traces),
             price=args.price,
         )
-    post_in_chunks(batch + context_events, post)
+    deltas = context_evolution_deltas(bodies_dir, counter=counter, price=args.price)
+    evolution_events = build_context_evolution_events(
+        args.spoke_run_id,
+        deltas,
+        base_ts=base_ts,
+        cache_creation_by_turn=_reconciliation_map(traces, bodies_dir),
+    )
+    post_in_chunks(batch + context_events + evolution_events, post)
 
     trace_id = trace_id_for(args.spoke_run_id)
     filled = filled_tool_spans(traces, tool_content)
     print(
         f"{len(batch) - 2} observations assembled under trace {trace_id} "
         f"(roots collapsed to 1), {filled} tool spans filled from transcript, "
-        f"{len(rows)} loaded-context items itemized (source: {source})"
+        f"{len(rows)} loaded-context items itemized (source: {source}), "
+        f"{len(deltas)} evolving turns diffed"
     )
     return 0
+
+
+def _reconciliation_map(traces: list[TraceObservations], bodies_dir: Path) -> dict[int, int] | None:
+    """Map each turn index to its observed ``cache_creation`` for the advisory cross-check.
+
+    Aligns the LLM calls (by ``startTime``) with the request bodies (by mtime) positionally.
+    The mapping is returned ONLY when the two counts match — otherwise an aux/degenerate call
+    has skewed the alignment and a wrong cross-check would mislead, so it is omitted entirely.
+    This is why the cross-check is advisory (``≈``): the count gate catches a missing call but
+    not a reordering, since the two orderings come from independent clocks.
+
+    UPGRADE: join LLM calls to bodies by a shared key (``prompt.id`` / request id) instead of
+    positional order — when near-simultaneous requests can flush spans and dump files in
+    different orders and the positional alignment silently mismatches.
+    """
+    writes = per_turn_cache_creation(traces)
+    bodies = find_request_files(bodies_dir)
+    if not writes or len(writes) != len(bodies):
+        return None
+    return dict(enumerate(writes))
 
 
 if __name__ == "__main__":
