@@ -172,6 +172,17 @@ def _run_new(
         "ENABLE_BETA_TRACING_DETAILED",
         "OTEL_METRICS_INCLUDE_ACCOUNT_UUID",
         "BETA_TRACING_ENDPOINT",
+        # The off-box content flags (auto-populate) and the message-bridge preflight
+        # config: the host's own values must not steer the gate-off default, the
+        # endpoint defaulting, or — critically — spawn a real bridge during the
+        # hermetic launch tests (LANGFUSE_BASIC_AUTH set on the host would do exactly
+        # that, since the preflight launches python3 when auth is present).
+        "OTEL_LOG_USER_PROMPTS",
+        "OTEL_LOG_TOOL_DETAILS",
+        "OTEL_LOG_TOOL_CONTENT",
+        "LANGFUSE_BASIC_AUTH",
+        "LANGFUSE_HOST",
+        "BRIDGE_PORT",
     ):
         env.pop(_k, None)
     if extra_env:
@@ -512,6 +523,25 @@ _OTEL_NONSECRET_VARS = (
     "OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false",
 )
 
+# Auto-populate (this issue): with the gate on, the spoke also ships its prompts +
+# tool I/O off-box so Langfuse renders conversation + per-tool content. These flags
+# send content off the machine, so they are consciously gated by AI_TOOLKIT_OTEL.
+_OTEL_CONTENT_FLAGS = (
+    "OTEL_LOG_USER_PROMPTS=1",
+    "OTEL_LOG_TOOL_DETAILS=1",
+    "OTEL_LOG_TOOL_CONTENT=1",
+)
+
+# The connection endpoints are non-secret URLs (auth rides the OTEL_EXPORTER_OTLP_HEADERS
+# secret, never wired). Auto-populate defaults them to the local collector when the
+# operator left them unset — the normal stream over gRPC (4317), the beta detailed
+# stream over HTTP (4418). They MUST differ in host:port, or beta silently kills all
+# trace+log export. Both are wired onto the command line (unlike the auth header).
+_OTEL_ENDPOINT_DEFAULTS = (
+    "OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317",
+    "BETA_TRACING_ENDPOINT=http://localhost:4418",
+)
+
 
 def test_agent_launch_omits_otel_env_by_default(hub: Path, tmp_path: Path) -> None:
     # Gate unset → the launch is byte-for-byte the non-OTel launch: no telemetry
@@ -521,7 +551,14 @@ def test_agent_launch_omits_otel_env_by_default(hub: Path, tmp_path: Path) -> No
     assert proc.returncode == 0, proc.stderr
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation"
-    for var in (*_OTEL_NONSECRET_VARS, "OTEL_RESOURCE_ATTRIBUTES="):
+    absent = (
+        *_OTEL_NONSECRET_VARS,
+        *_OTEL_CONTENT_FLAGS,
+        "OTEL_RESOURCE_ATTRIBUTES=",
+        "OTEL_EXPORTER_OTLP_ENDPOINT=",
+        "BETA_TRACING_ENDPOINT=",
+    )
+    for var in absent:
         assert var not in new_window[0], f"{var} must be absent unless opted in"
 
 
@@ -537,8 +574,12 @@ def test_agent_launch_injects_otel_env_when_opted_in(hub: Path, tmp_path: Path) 
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation"
     cmd = new_window[0]
-    for var in _OTEL_NONSECRET_VARS:
+    for var in (*_OTEL_NONSECRET_VARS, *_OTEL_CONTENT_FLAGS, *_OTEL_ENDPOINT_DEFAULTS):
         assert var in cmd, f"expected {var} in the opted-in launch"
+    # The footgun: the beta detailed endpoint MUST be a different host:port than the
+    # normal OTLP endpoint, or it silently kills ALL trace+log export. The defaults
+    # honour the split (gRPC :4317 vs HTTP :4418).
+    assert ":4317" in cmd and ":4418" in cmd
     assert "OTEL_RESOURCE_ATTRIBUTES=spoke_run_id=feature/8-some-slug+" in cmd
     # The whole OTel prefix precedes the existing WT_SPOKE/CLAUDE_EFFORT pin, so
     # the launch still pins model+effort+role unchanged.
@@ -565,11 +606,13 @@ def test_agent_launch_wires_raw_request_body_file_mode(hub: Path, tmp_path: Path
     assert "AI_TOOLKIT_OTEL_BODY_DIR=" in cmd
 
 
-def test_agent_launch_never_forwards_otel_secrets(hub: Path, tmp_path: Path) -> None:
-    # Even with the gate on AND connection secrets present in the environment, the
-    # endpoint and auth headers must never reach the command line (ps-visible) or
-    # stdout — the script wires only non-secret vars; the target is inherited env.
-    secret_endpoint = "https://secret.example.invalid/api/public/otel"
+def test_agent_launch_wires_endpoint_but_never_auth_header(hub: Path, tmp_path: Path) -> None:
+    # Auto-populate reclassifies the OTLP endpoint as a non-secret URL: with the gate
+    # on, an operator override is PRESERVED and wired onto the command line (only
+    # defaulted when unset). The auth-bearing header (OTEL_EXPORTER_OTLP_HEADERS) is
+    # the real secret — it is never wired and must NEVER reach the command line
+    # (ps-visible); it stays inherited env for `claude` to read.
+    operator_endpoint = "http://collector.internal:4317"
     secret_headers = "Authorization=Basic c2VjcmV0LXRva2VuLXZhbHVl"
     proc, log = _run_new(
         hub,
@@ -579,7 +622,7 @@ def test_agent_launch_never_forwards_otel_secrets(hub: Path, tmp_path: Path) -> 
         "--no-code",
         extra_env={
             "AI_TOOLKIT_OTEL": "1",
-            "OTEL_EXPORTER_OTLP_ENDPOINT": secret_endpoint,
+            "OTEL_EXPORTER_OTLP_ENDPOINT": operator_endpoint,
             "OTEL_EXPORTER_OTLP_HEADERS": secret_headers,
         },
     )
@@ -587,18 +630,21 @@ def test_agent_launch_never_forwards_otel_secrets(hub: Path, tmp_path: Path) -> 
     assert proc.returncode == 0, proc.stderr
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation"
-    for secret in (secret_endpoint, secret_headers):
-        assert secret not in new_window[0], "secret must never be on the command line"
+    cmd = new_window[0]
+    assert f"OTEL_EXPORTER_OTLP_ENDPOINT={operator_endpoint}" in cmd, (
+        "operator override must be wired"
+    )
+    assert secret_headers not in cmd, "auth header value must never be on the command line"
+    assert "OTEL_EXPORTER_OTLP_HEADERS=" not in cmd, "auth header var must never be wired"
 
 
-def test_agent_launch_never_forwards_beta_tracing_endpoint(hub: Path, tmp_path: Path) -> None:
-    # BETA_TRACING_ENDPOINT is the detailed-tracing target (a secret-ish off-box
-    # destination), and — per the probe footgun — it MUST point at a different
-    # port than the normal OTLP endpoint or it silently kills all trace+log export.
-    # Like the OTLP endpoint/headers, it is operator-provided via inherited env and
-    # must never land on the command line (ps-visible). The enabling flag
-    # (ENABLE_BETA_TRACING_DETAILED=1) is wired; the target is not.
-    beta_endpoint = "https://beta.example.invalid:4319"
+def test_agent_launch_wires_beta_tracing_endpoint(hub: Path, tmp_path: Path) -> None:
+    # BETA_TRACING_ENDPOINT is the detailed-tracing target — a non-secret URL that —
+    # per the probe footgun — MUST point at a different host:port than the normal
+    # OTLP endpoint or it silently kills all trace+log export. Auto-populate preserves
+    # an operator override (and defaults it to the HTTP beta port when unset), wiring
+    # it onto the command line alongside the enabling flag.
+    beta_endpoint = "http://collector.internal:4418"
     proc, log = _run_new(
         hub,
         tmp_path,
@@ -612,15 +658,17 @@ def test_agent_launch_never_forwards_beta_tracing_endpoint(hub: Path, tmp_path: 
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation"
     assert "ENABLE_BETA_TRACING_DETAILED=1" in new_window[0], "detailed flag must be wired"
-    assert beta_endpoint not in new_window[0], "BETA endpoint must never be on the command line"
-    assert "BETA_TRACING_ENDPOINT=" not in new_window[0], "BETA endpoint var must not be wired"
+    assert f"BETA_TRACING_ENDPOINT={beta_endpoint}" in new_window[0], (
+        "operator override must be wired"
+    )
 
 
 def test_manual_fallback_advice_never_prints_otel_secrets(hub: Path, tmp_path: Path) -> None:
     # The manual-fallback echo is the real stdout-leak vector (the tmux path never
-    # echoes the launch). With the gate on and secrets present, the printed advice
-    # must carry the non-secret prefix yet never reveal the endpoint or headers.
-    secret_endpoint = "https://secret.example.invalid/api/public/otel"
+    # echoes the launch). With the gate on and an auth header present, the printed
+    # advice must carry the non-secret prefix (including the endpoint URL) yet never
+    # reveal the auth header — the one secret that must stay off both cmdline and stdout.
+    operator_endpoint = "http://collector.internal:4317"
     secret_headers = "Authorization=Basic c2VjcmV0LXRva2VuLXZhbHVl"
     proc, _ = _run_new(
         hub,
@@ -633,15 +681,16 @@ def test_manual_fallback_advice_never_prints_otel_secrets(hub: Path, tmp_path: P
         new_session_rc=1,
         extra_env={
             "AI_TOOLKIT_OTEL": "1",
-            "OTEL_EXPORTER_OTLP_ENDPOINT": secret_endpoint,
+            "OTEL_EXPORTER_OTLP_ENDPOINT": operator_endpoint,
             "OTEL_EXPORTER_OTLP_HEADERS": secret_headers,
         },
     )
 
     assert proc.returncode == 0, proc.stderr
     assert "CLAUDE_CODE_ENABLE_TELEMETRY=1" in proc.stdout, "fallback must carry the prefix"
-    for secret in (secret_endpoint, secret_headers):
-        assert secret not in proc.stdout, "secret must never be printed in the fallback advice"
+    assert operator_endpoint in proc.stdout, "non-secret endpoint URL may (and does) appear"
+    assert secret_headers not in proc.stdout, "auth header must never be printed in the fallback"
+    assert "OTEL_EXPORTER_OTLP_HEADERS=" not in proc.stdout, "auth header var must never be printed"
 
 
 def test_manual_fallback_advice_carries_otel_env(hub: Path, tmp_path: Path) -> None:

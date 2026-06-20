@@ -199,3 +199,62 @@ wt_resolve() {
   fi
   return 1
 }
+
+# --- native-OTel message-bridge preflight (auto-populate) --------------------
+# A spoke that opted into native OTel (AI_TOOLKIT_OTEL=1) needs the Langfuse
+# message bridge (scripts/telemetry/langfuse_message_bridge.py, port :4319) up, or
+# the audit events (#93) and LLM request/response I/O the otelcol forks to it never
+# reach Langfuse. These helpers bring it up idempotently at spawn so the operator
+# runs no manual step; they are best-effort and never fail the spawn.
+
+# True when something is LISTENing on the given localhost TCP port. Split out so
+# the preflight decision is unit-testable by overriding it (no live socket). Uses
+# lsof when present, else nc; when neither exists, reports "down" so the caller
+# attempts a start (a duplicate would simply fail to bind — never two servers).
+wt_port_listening() {
+  local port="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+  elif command -v nc >/dev/null 2>&1; then
+    nc -z localhost "$port" >/dev/null 2>&1
+  else
+    return 1
+  fi
+}
+
+# Start the message bridge in the background, detached, logging to a temp file.
+# Split from the preflight so the decision logic can be tested without spawning a
+# real server. PYTHONPATH=scripts lets the script import its sibling telemetry
+# package; LANGFUSE_HOST defaults to the local Langfuse. The child reads its
+# REQUIRED config from the environment — LANGFUSE_BASIC_AUTH (KeyErrors without it)
+# and BRIDGE_PORT — so re-export them inside a subshell: a non-exported operator
+# value still reaches the child (it passed the preflight as a shell-internal read),
+# and the credential never lands on the python argv. Args: $1 = repo root.
+wt_bridge_launch() {
+  local repo_root="$1" log
+  log="$(mktemp -t lf-bridge.XXXXXX 2>/dev/null)" || log="/tmp/lf-bridge.log"
+  (
+    export PYTHONPATH="$repo_root/scripts"
+    export LANGFUSE_HOST="${LANGFUSE_HOST:-http://localhost:3000}"
+    export LANGFUSE_BASIC_AUTH BRIDGE_PORT
+    nohup python3 "$repo_root/scripts/telemetry/langfuse_message_bridge.py" \
+      >"$log" 2>&1 &
+  )
+  echo "→ started Langfuse message bridge on :${BRIDGE_PORT:-4319} (log: $log)"
+}
+
+# Idempotently ensure the message bridge is up for an opted-in spoke. A no-op
+# unless AI_TOOLKIT_OTEL=1. Never starts a second bridge (skips when :4319 already
+# listens). When LANGFUSE_BASIC_AUTH is unset the bridge can't authenticate to
+# Langfuse, so warn (audit events + LLM I/O won't land) but DO NOT fail the spawn.
+# Args: $1 = repo root.
+wt_otel_bridge_preflight() {
+  local repo_root="$1" port="${BRIDGE_PORT:-4319}"
+  [ "${AI_TOOLKIT_OTEL:-}" = "1" ] || return 0
+  wt_port_listening "$port" && return 0
+  if [ -z "${LANGFUSE_BASIC_AUTH:-}" ]; then
+    wt_warn "OTel bridge down on :$port and LANGFUSE_BASIC_AUTH unset — audit events (#93) + LLM I/O won't reach Langfuse; spoke still launches"
+    return 0
+  fi
+  wt_bridge_launch "$repo_root"
+}

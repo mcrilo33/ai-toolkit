@@ -280,12 +280,18 @@ fi
 # AI_TOOLKIT_TELEMETRY. When on, prefix the launch with Claude Code's native-OTel
 # trace env so the interactive claude streams ONE nested trace per spoke, grouped
 # by the spoke_run_id minted above (carried as an OTEL_RESOURCE_ATTRIBUTES key, so
-# it tags every span/sub-agent/tool of the run). Only NON-SECRET vars are wired
-# here — the enabling flags, the otlp exporter + gRPC protocol, and the spoke
-# identity. The connection TARGET (OTEL_EXPORTER_OTLP_ENDPOINT and the
-# auth-bearing OTEL_EXPORTER_OTLP_HEADERS) is operator-provided through the
-# environment claude inherits; it is deliberately NOT placed on the command line
-# (which is visible in `ps`/tmux) nor printed in the manual-fallback advice.
+# it tags every span/sub-agent/tool of the run). The secret boundary is the AUTH
+# HEADER, not the endpoint: OTEL_EXPORTER_OTLP_HEADERS carries the Langfuse
+# credential and is NEVER wired — it stays in the environment claude inherits, kept
+# off the command line (visible in `ps`/tmux) and out of the manual-fallback advice.
+# The connection ENDPOINTS are non-secret URLs, so to auto-populate Langfuse with no
+# manual step they ARE wired: defaulted to the local collector when the operator
+# left them unset, and an operator override is preserved verbatim (see below).
+#
+# Off-box CONTENT (auto-populate): OTEL_LOG_USER_PROMPTS / OTEL_LOG_TOOL_DETAILS /
+# OTEL_LOG_TOOL_CONTENT ship the user prompts and per-tool input/output off the
+# machine so Langfuse renders conversation + per-tool I/O. They send content off-box,
+# so they ride strictly behind this same AI_TOOLKIT_OTEL opt-in.
 #
 # Beyond traces, the same gate lights up two probe-proven signals (issue #88):
 #   - METRICS (OTEL_METRICS_EXPORTER) — token-by-type/skill/agent + cost_usd; they
@@ -294,10 +300,11 @@ fi
 #     dashboard/langfuse/otelcol.yaml. account_uuid is forced OFF for metrics
 #     (OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false) since PII rides every datapoint.
 #   - DETAILED TRACING (ENABLE_BETA_TRACING_DETAILED) — adds response.model_output
-#     and system_reminders span attrs. Its destination, BETA_TRACING_ENDPOINT, is
-#     operator env (like the OTLP target — kept off the command line). FOOTGUN: it
-#     MUST hit a different host:port than the normal OTLP endpoint, or it silently
-#     kills ALL trace+log export (metrics still flow).
+#     and system_reminders span attrs. Its destination, BETA_TRACING_ENDPOINT, is a
+#     non-secret URL wired like the OTLP endpoint (defaulted, override preserved).
+#     FOOTGUN: it MUST hit a different host:port than the normal OTLP endpoint, or it
+#     silently kills ALL trace+log export (metrics still flow) — the defaults honour
+#     the split: normal gRPC on :4317, beta HTTP on :4418.
 # The normal stream exports over gRPC (OTEL_EXPORTER_OTLP_PROTOCOL=grpc): the beta
 # detailed exporter is HTTP-only, so normal takes gRPC and beta takes HTTP — the
 # arrangement proven to land response.model_output end-to-end in Langfuse (final
@@ -319,9 +326,16 @@ OTEL_PREFIX=""
 if [ "${AI_TOOLKIT_OTEL:-}" = "1" ]; then
   OTEL_BODY_DIR="$WT_DIR/.ai-toolkit/raw-bodies"
   mkdir -p "$OTEL_BODY_DIR"
+  # Default the non-secret connection endpoints to the local collector when the
+  # operator left them unset; an explicit override is preserved (`:=` only assigns
+  # when empty). The split is load-bearing — normal gRPC :4317, beta HTTP :4418 —
+  # since a beta endpoint sharing the normal host:port silently kills trace+log export.
+  : "${OTEL_EXPORTER_OTLP_ENDPOINT:=http://localhost:4317}"
+  : "${BETA_TRACING_ENDPOINT:=http://localhost:4418}"
   # NB: the trailing space is load-bearing — it separates the prefix from the
-  # WT_SPOKE pin that AGENT_CMD appends immediately after it.
-  OTEL_PREFIX="CLAUDE_CODE_ENABLE_TELEMETRY=1 CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 OTEL_TRACES_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp ENABLE_BETA_TRACING_DETAILED=1 OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false OTEL_EXPORTER_OTLP_PROTOCOL=grpc OTEL_LOG_RAW_API_BODIES=$(printf '%q' "file:${OTEL_BODY_DIR}") AI_TOOLKIT_OTEL_BODY_DIR=$(printf '%q' "$OTEL_BODY_DIR") OTEL_RESOURCE_ATTRIBUTES=$(printf '%q' "spoke_run_id=${SPOKE_RUN_ID}") "
+  # WT_SPOKE pin that AGENT_CMD appends immediately after it. The auth header
+  # (OTEL_EXPORTER_OTLP_HEADERS) is deliberately NOT here — it stays inherited env.
+  OTEL_PREFIX="CLAUDE_CODE_ENABLE_TELEMETRY=1 CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 OTEL_TRACES_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp ENABLE_BETA_TRACING_DETAILED=1 OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false OTEL_EXPORTER_OTLP_PROTOCOL=grpc OTEL_EXPORTER_OTLP_ENDPOINT=$(printf '%q' "$OTEL_EXPORTER_OTLP_ENDPOINT") BETA_TRACING_ENDPOINT=$(printf '%q' "$BETA_TRACING_ENDPOINT") OTEL_LOG_USER_PROMPTS=1 OTEL_LOG_TOOL_DETAILS=1 OTEL_LOG_TOOL_CONTENT=1 OTEL_LOG_RAW_API_BODIES=$(printf '%q' "file:${OTEL_BODY_DIR}") AI_TOOLKIT_OTEL_BODY_DIR=$(printf '%q' "$OTEL_BODY_DIR") OTEL_RESOURCE_ATTRIBUTES=$(printf '%q' "spoke_run_id=${SPOKE_RUN_ID}") "
 fi
 AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(printf '%q' "${WT_AGENT_EFFORT:-max}") claude --model $(printf '%q' "${WT_AGENT_MODEL:-opus}")"
 # Best-effort in-process budget cap for unattended spokes. A caller may set
@@ -331,6 +345,11 @@ AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(print
 # reliable ceiling; this is a backstop.
 [ -n "${WT_AGENT_BUDGET_ARGS:-}" ] && AGENT_CMD="$AGENT_CMD ${WT_AGENT_BUDGET_ARGS}"
 [ -n "$PROMPT" ] && AGENT_CMD="$AGENT_CMD $(printf '%q' "$PROMPT")"
+
+# Bring up the Langfuse message bridge before the spoke starts streaming, so an
+# opted-in (AI_TOOLKIT_OTEL=1) spoke auto-populates Langfuse with no manual step.
+# Idempotent (never a second bridge) and best-effort (warns, never fails the spawn).
+wt_otel_bridge_preflight "$REPO_ROOT"
 
 if [ "$SPAWN_TERMINAL" -eq 1 ]; then
   SPAWNED=0
