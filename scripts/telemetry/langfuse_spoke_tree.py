@@ -21,10 +21,13 @@ Re-parenting rules for each source observation:
 
 - It had a ``parentObservationId`` -> the copy points at the copy of that parent.
 - It was a trace-root interaction / marker / lifecycle / script -> the synthetic root.
-- It was a trace-root hook (name ends ``.sh`` or ``metadata.attributes.workflow.kind ==
-  hook``) -> the copy of the tool whose ``tool_use_id`` matches the hook's
-  ``metadata.attributes.tool_use_id``; or the synthetic root when there is no id or no
-  match. (Langfuse nests OTel span attributes under ``metadata["attributes"]``.)
+- It was a trace-root satellite of a tool call -> the copy of the tool whose
+  ``tool_use_id`` matches the satellite's; or the synthetic root when there is no id or no
+  match. A satellite is a gate hook (name ends ``.sh`` or
+  ``metadata.attributes.workflow.kind == hook``) or a #93 tool-scoped audit event
+  (``tool_decision``/``tool_result``, minted on the per-spoke audit trace with its
+  ``tool_use_id`` in flat metadata). (Langfuse nests OTel span attributes under
+  ``metadata["attributes"]``; the audit events carry their id at the metadata top level.)
 
 All ids derive from the spoke run id and the source ``(trace_id, observation_id)`` pair,
 so a rerun overwrites the same trace/observations instead of appending. This trace
@@ -132,6 +135,10 @@ _CHUNK_SIZE = 100
 _COPIED_FIELDS = ("input", "output", "usageDetails", "costDetails", "metadata", "model", "level")
 # Metadata keys that may carry a tool-call id, in priority order.
 _TOOL_USE_ID_KEYS = ("tool_use_id", "gen_ai.tool.call.id")
+# Name prefixes of the #93 audit observations that are scoped to a single tool call and
+# carry its ``tool_use_id`` (``tool_decision:<decision>``, ``tool_result``). Like gate
+# hooks, they nest under the tool sharing that id rather than at the synthetic root.
+_TOOL_AUDIT_EVENT_PREFIXES = ("tool_decision", "tool_result")
 
 # Tool content (e.g. a large file Read) can be huge; cap the serialized text past this.
 _MAX_CONTENT_CHARS = 20_000
@@ -227,11 +234,34 @@ def _is_hook(observation: Observation) -> bool:
     )
 
 
-def _build_tool_index(traces: list[TraceObservations]) -> dict[str, str]:
-    """Map each tool-call id to the copy id of the (non-hook) observation that owns it.
+def _is_tool_audit_event(observation: Observation) -> bool:
+    """Whether an observation is a #93 audit event scoped to a single tool call.
 
-    Hooks are skipped so a hook never indexes its own ``tool_use_id``; the surviving owner
-    is the tool observation, which is the re-parent target for matching hooks.
+    These (``tool_decision:<decision>``, ``tool_result``) are minted on the per-spoke audit
+    trace and carry their ``tool_use_id`` in flat metadata; they are recognised by name
+    prefix (:data:`_TOOL_AUDIT_EVENT_PREFIXES`). The ``tool_*`` prefix never collides with a
+    visible ``tool:<Name>`` span or a bare tool name like ``Bash``.
+    """
+    name = observation.get("name") or ""
+    return name.startswith(_TOOL_AUDIT_EVENT_PREFIXES)
+
+
+def _joins_under_tool(observation: Observation) -> bool:
+    """Whether an observation nests under the tool sharing its ``tool_use_id``.
+
+    True for a gate hook or a tool-scoped audit event — the satellites of a tool call.
+    Both are skipped as index owners (so the genuine tool span stays the re-parent target)
+    and both join by ``tool_use_id`` in :func:`_resolve_parent`.
+    """
+    return _is_hook(observation) or _is_tool_audit_event(observation)
+
+
+def _build_tool_index(traces: list[TraceObservations]) -> dict[str, str]:
+    """Map each tool-call id to the copy id of the tool observation that owns it.
+
+    A tool's satellites (gate hooks and tool-scoped audit events) are skipped so none indexes
+    its own ``tool_use_id``; the surviving owner is the tool observation, which is the
+    re-parent target for the matching satellites.
 
     Args:
         traces: The source traces paired with their observations.
@@ -242,7 +272,7 @@ def _build_tool_index(traces: list[TraceObservations]) -> dict[str, str]:
     index: dict[str, str] = {}
     for orig_trace_id, observations in traces:
         for observation in observations:
-            if _is_hook(observation):
+            if _joins_under_tool(observation):
                 continue
             tuid = _tool_use_id(observation)
             if tuid:
@@ -267,7 +297,7 @@ def _resolve_parent(
     parent = observation.get("parentObservationId")
     if parent:
         return _copy_id(orig_trace_id, parent)
-    if _is_hook(observation):
+    if _joins_under_tool(observation):
         tuid = _tool_use_id(observation)
         if tuid and tuid in tool_index:
             return tool_index[tuid]
