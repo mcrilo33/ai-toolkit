@@ -125,6 +125,30 @@ class TestNodeTranslation:
             "cache_creation_input_tokens": 300,
         }
 
+    def test_turn_splits_cache_creation_by_ttl(self) -> None:
+        # Issue #97: a turn with both 5m and 1h cache writes maps 5m to the existing
+        # cache_creation_input_tokens key (1.25x) and 1h to input_cache_creation_1h (2x).
+        forest = build_causal_forest(
+            [_turn(cache_creation=300, cache_creation_5m=120, cache_creation_1h=180)],
+            [],
+            {},
+            thinking={},
+        )
+        gen = next(
+            e["body"]
+            for e in forest_to_events(forest, SPOKE, thinking={})
+            if e["type"] == "generation-create" and e["body"]["id"] == backfill_node_id(SPOKE, "m1")
+        )
+        assert gen["usageDetails"]["cache_creation_input_tokens"] == 120
+        assert gen["usageDetails"]["input_cache_creation_1h"] == 180
+
+    def test_turn_without_1h_writes_omits_the_1h_usage_type(self) -> None:
+        # No 1h cache writes -> usageDetails stays in the pre-#97 four-component shape
+        # (the whole flat total prices at the 5m rate).
+        body = _body_by_id(_events())[backfill_node_id(SPOKE, "m1")]
+        assert body["usageDetails"]["cache_creation_input_tokens"] == 300
+        assert "input_cache_creation_1h" not in body["usageDetails"]
+
     def test_turn_carries_no_cost_details(self) -> None:
         # Issue #91: cost is retired from the forest; the generation carries only
         # usageDetails and Langfuse computes costDetails from its model-pricing config.
