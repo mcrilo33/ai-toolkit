@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from telemetry.session_parser import (
     ParsedSession,
+    _usage_event,
     _walk_transcript,
     parse_project_dir,
     parse_projects_dir,
@@ -1558,3 +1559,69 @@ class TestSignatureOnlyThinkingYieldsNothing:
         path.write_text(json.dumps(_assistant_thinking("a1", "   \n")), encoding="utf-8")
 
         assert thinking_by_turn(path) == {}
+
+
+def _usage_record(usage: dict) -> dict:
+    """A minimal assistant record carrying one ``message.usage`` block."""
+    return {"message": {"model": "claude-opus-4-8", "usage": usage}}
+
+
+class TestCacheCreationTTLSplit:
+    """Issue #97: ``_usage_event`` splits cache-creation tokens by ephemeral TTL.
+
+    Anthropic prices a 1-hour cache write at 2x input and a 5-minute write at 1.25x;
+    the transcript carries the per-TTL breakdown in a nested ``cache_creation`` object.
+    """
+
+    def test_nested_object_splits_into_5m_and_1h(self) -> None:
+        event = _usage_event(
+            _usage_record(
+                {
+                    "cache_creation_input_tokens": 12000,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 5000,
+                        "ephemeral_1h_input_tokens": 7000,
+                    },
+                }
+            ),
+            "main",
+            None,
+        )
+
+        assert event.cache_creation_5m == 5000
+        assert event.cache_creation_1h == 7000
+
+    def test_split_sums_to_the_flat_total(self) -> None:
+        event = _usage_event(
+            _usage_record(
+                {
+                    "cache_creation_input_tokens": 12000,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 5000,
+                        "ephemeral_1h_input_tokens": 7000,
+                    },
+                }
+            ),
+            "main",
+            None,
+        )
+
+        assert event.cache_creation_5m + event.cache_creation_1h == event.cache_creation
+
+    def test_absent_nested_object_attributes_all_to_5m(self) -> None:
+        # Older transcripts / push-only records carry only the flat aggregate. The
+        # conservative fallback prices it all at the 5m rate (today's behavior).
+        event = _usage_event(
+            _usage_record({"cache_creation_input_tokens": 9000}),
+            "main",
+            None,
+        )
+
+        assert event.cache_creation_5m == 9000
+        assert event.cache_creation_1h == 0
+
+    def test_no_cache_creation_yields_zero_split(self) -> None:
+        event = _usage_event(_usage_record({"input_tokens": 5}), "main", None)
+
+        assert event.cache_creation_5m == 0
+        assert event.cache_creation_1h == 0

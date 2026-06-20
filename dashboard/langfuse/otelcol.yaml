@@ -87,7 +87,16 @@ processors:
     trace_statements:
       - context: span
         statements:
-          # 1) token remap → Langfuse usage/cost
+          # 1) token remap → Langfuse usage/cost.
+          #    Cache-write TTL split (Issue #97): Anthropic bills a 1h cache write at 2x
+          #    input and a 5m write at 1.25x. Claude Code's native span carries only the
+          #    flat `cache_creation_tokens` aggregate — no per-TTL attribute — so this
+          #    remap prices ALL cache writes at the 5m rate and the live push cost runs
+          #    ~10% low on 1h-cache workloads. The split is recovered only in the
+          #    transcript backfill path (scripts/telemetry: session_parser → causal_tree →
+          #    langfuse_backfill maps the 1h tier to the `input_cache_creation_1h` usage
+          #    type); the collector cannot split a single aggregate. Splitting the live
+          #    push path is blocked on Claude Code emitting a per-TTL span attribute.
           - set(attributes["gen_ai.usage.input_tokens"], attributes["input_tokens"]) where attributes["input_tokens"] != nil
           - set(attributes["gen_ai.usage.output_tokens"], attributes["output_tokens"]) where attributes["output_tokens"] != nil
           - set(attributes["gen_ai.usage.cache_read_input_tokens"], attributes["cache_read_tokens"]) where attributes["cache_read_tokens"] != nil

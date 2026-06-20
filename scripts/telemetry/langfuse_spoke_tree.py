@@ -89,6 +89,7 @@ from telemetry.langfuse_rollup import (
     build_tree,
     make_get,
     make_post,
+    rollup_metadata,
     subtree_totals,
 )
 from telemetry.measure_context_cost import (
@@ -456,12 +457,7 @@ def _apply_container_rollups(events: list[IngestEvent]) -> None:
         if not children.get(body["id"]):
             continue  # only containers (those with children) carry a rollup
         totals = subtree_totals(body["id"], by_id, children)
-        body.setdefault("metadata", {})["rollup"] = {
-            "reused": totals["cache_read_input_tokens"],
-            "written": totals["cache_creation_input_tokens"],
-            "input": totals["input"],
-            "output": totals["output"],
-        }
+        body.setdefault("metadata", {})["rollup"] = rollup_metadata(totals)
 
 
 def _earliest_start(traces: list[TraceObservations]) -> str:

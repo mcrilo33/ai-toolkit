@@ -42,14 +42,20 @@ def _obs(
     }
 
 
-def _usage(*, inp: int = 0, out: int = 0, reused: int = 0, written: int = 0) -> dict[str, int]:
-    """Build a ``usageDetails`` dict in Claude Code's four-component shape."""
-    return {
+def _usage(
+    *, inp: int = 0, out: int = 0, reused: int = 0, written: int = 0, written_1h: int = 0
+) -> dict[str, int]:
+    """Build a ``usageDetails`` dict. ``written`` is the 5m cache-write tier; ``written_1h``
+    the 1h tier (Issue #97), added only when nonzero so the pre-#97 shape is unchanged."""
+    usage = {
         "input": inp,
         "output": out,
         "cache_read_input_tokens": reused,
         "cache_creation_input_tokens": written,
     }
+    if written_1h:
+        usage["input_cache_creation_1h"] = written_1h
+    return usage
 
 
 class _GetStub:
@@ -119,7 +125,34 @@ def test_subtree_of_leaf_generation_is_its_own_usage() -> None:
         "output": 2,
         "cache_read_input_tokens": 1,
         "cache_creation_input_tokens": 5,
+        "input_cache_creation_1h": 0,
     }
+
+
+def test_subtree_sums_the_1h_cache_write_tier() -> None:
+    # Issue #97: subtree_totals tracks the 1h cache-write tier alongside the 5m tier.
+    observations = [_obs("gen", obs_type="GENERATION", usage=_usage(written=120, written_1h=180))]
+    by_id, children = build_tree(observations)
+
+    totals = subtree_totals("gen", by_id, children)
+
+    assert totals["cache_creation_input_tokens"] == 120
+    assert totals["input_cache_creation_1h"] == 180
+
+
+def test_rollup_written_sums_both_cache_write_tiers() -> None:
+    # Issue #97: the rollup's ``written`` is the total cache writes across both TTL tiers.
+    totals = {
+        "input": 0,
+        "output": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 120,
+        "input_cache_creation_1h": 180,
+    }
+
+    event = rollup_event(_obs("gen", obs_type="GENERATION"), totals)
+
+    assert event["body"]["metadata"]["rollup"]["written"] == 300
 
 
 def test_container_without_generation_descendants_rolls_up_to_zero() -> None:

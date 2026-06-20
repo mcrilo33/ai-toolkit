@@ -463,6 +463,29 @@ class TestContainerRollups:
         metadata = _by_orig(batch, "trace-int", "g1")["body"]["metadata"]
         assert metadata == {"kind": "turn", "rollup": {"input": 120}}
 
+    def test_container_written_includes_the_1h_cache_write_tier(self) -> None:
+        # Issue #97 regression: a generation whose usageDetails split cache writes across
+        # the 5m (cache_creation_input_tokens) and 1h (input_cache_creation_1h) tiers must
+        # roll up into a ``written`` that totals both, not just the 5m tier.
+        interaction = _obs("i1", "claude_code.interaction", parent=None)
+        gen = _obs(
+            "g1",
+            "llm_request",
+            type_="GENERATION",
+            parent="i1",
+            usageDetails={
+                "input": 10,
+                "output": 4,
+                "cache_read_input_tokens": 7,
+                "cache_creation_input_tokens": 120,
+                "input_cache_creation_1h": 180,
+            },
+        )
+
+        batch = build_batch([("trace-int", [interaction, gen])], SPOKE)
+
+        assert _by_orig(batch, "trace-int", "i1")["body"]["metadata"]["rollup"]["written"] == 300
+
     def test_nested_subagent_container_sums_only_its_descendants(self) -> None:
         # tool:Agent over a sub-agent interaction holding one generation.
         agent = _obs("a1", "tool:Agent", parent=None)

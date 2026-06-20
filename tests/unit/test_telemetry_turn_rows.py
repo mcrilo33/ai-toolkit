@@ -19,7 +19,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
-from telemetry.causal_tree import causal_forest_from_parsed, per_turn_rows
+from telemetry.causal_tree import _turn_node, causal_forest_from_parsed, per_turn_rows
 from telemetry.session_parser import UsageEvent, parse_session_file
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "telemetry" / "projects"
@@ -54,6 +54,50 @@ def test_rows_carry_cache_breakdown() -> None:
 
     assert rows[0]["cache_read"] == 900
     assert rows[0]["cache_creation"] == 300
+
+
+def test_rows_carry_cache_creation_ttl_split() -> None:
+    # Issue #97: the row threads the 5m/1h cache-write split so the backfill can map
+    # each TTL tier to its Langfuse usage type (1h billed 2x, 5m 1.25x).
+    event = UsageEvent(
+        session_id="sess-a",
+        ts="2026-06-13T12:00:01.000Z",
+        model="claude-opus-4-8",
+        input_tokens=10,
+        output_tokens=5,
+        cache_read=900,
+        cache_creation=300,
+        source="main",
+        cache_creation_5m=120,
+        cache_creation_1h=180,
+    )
+
+    row = per_turn_rows([event])[0]
+
+    assert row["cache_creation_5m"] == 120
+    assert row["cache_creation_1h"] == 180
+
+
+def test_turn_node_carries_cache_creation_ttl_split() -> None:
+    # The composition-lens turn node exposes the split alongside the flat total.
+    event = UsageEvent(
+        session_id="sess-a",
+        ts="2026-06-13T12:00:01.000Z",
+        model="claude-opus-4-8",
+        input_tokens=10,
+        output_tokens=5,
+        cache_read=900,
+        cache_creation=300,
+        source="main",
+        uuid="t1",
+        cache_creation_5m=120,
+        cache_creation_1h=180,
+    )
+
+    node = _turn_node(per_turn_rows([event])[0])
+
+    assert node["cache_creation_5m"] == 120
+    assert node["cache_creation_1h"] == 180
 
 
 def test_rows_carry_turn_causal_ids() -> None:

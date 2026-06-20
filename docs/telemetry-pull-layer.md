@@ -54,6 +54,19 @@ All live in `scripts/telemetry/`:
 - **Cost** is not derived here. The otelcol remaps the four token types to
   `gen_ai.usage.*` and Langfuse computes cost from its model-pricing config
   (Issue #91).
+- **Cache-write TTL split (Issue #97).** Anthropic bills a 1-hour cache write at
+  2× input and a 5-minute write at 1.25×. The transcript's `message.usage`
+  carries the per-TTL breakdown (`cache_creation.ephemeral_5m_input_tokens` /
+  `ephemeral_1h_input_tokens`); `session_parser` reads it onto `UsageEvent`
+  (`cache_creation_5m` / `cache_creation_1h`, summing to the flat
+  `cache_creation`; the flat total falls into the 5m tier when the nested object
+  is absent). The backfill maps the 5m tier to Langfuse's
+  `cache_creation_input_tokens` (1.25×) and the 1h tier to its
+  `input_cache_creation_1h` usage type (2×) so backfilled cost matches ccusage
+  on 1h-cache workloads. The live **push** path stays single-rate: Claude Code's
+  native OTel span carries only the flat `cache_creation_tokens` aggregate
+  (no per-TTL attribute), so the otelcol cannot recover the ratio — that side is
+  blocked on an upstream Claude Code change, not fixable in the collector.
 
 Spans are **hierarchical** (a `step` span encloses the skill/agent spans that ran
 during it), so a wide span's tokens include the narrower spans nested inside it.

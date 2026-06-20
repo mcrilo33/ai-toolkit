@@ -48,6 +48,7 @@ from telemetry.langfuse_rollup import (
     build_tree,
     make_get,
     make_post,
+    rollup_metadata,
     subtree_totals,
 )
 from telemetry.langfuse_spoke_tree import all_traces, post_in_chunks
@@ -131,13 +132,26 @@ def _is_generation(node: dict[str, Any]) -> bool:
 
 
 def _usage_details(node: dict[str, Any]) -> dict[str, int]:
-    """The four-component token usage of an inference node (zeros when a field is absent)."""
-    return {
+    """Token usage of an inference node (zeros when a field is absent).
+
+    Cache writes are split by ephemeral TTL (Issue #97): the 5m tier maps to Langfuse's
+    ``cache_creation_input_tokens`` (priced 1.25x input) and the 1h tier to its
+    ``input_cache_creation_1h`` usage type (2x). The 1h key is emitted only when nonzero,
+    so a turn with no 1h writes keeps the pre-#97 four-component shape. When the split is
+    absent (older nodes) the whole flat total falls into the 5m tier.
+    """
+    flat_creation = int(node.get("cache_creation") or 0)
+    creation_5m = int(node["cache_creation_5m"]) if "cache_creation_5m" in node else flat_creation
+    creation_1h = int(node.get("cache_creation_1h") or 0)
+    usage = {
         "input": int(node.get("own_tokens_in") or 0),
         "output": int(node.get("own_tokens_out") or 0),
         "cache_read_input_tokens": int(node.get("cache_read") or 0),
-        "cache_creation_input_tokens": int(node.get("cache_creation") or 0),
+        "cache_creation_input_tokens": creation_5m,
     }
+    if creation_1h:
+        usage["input_cache_creation_1h"] = creation_1h
+    return usage
 
 
 def _metadata(node: dict[str, Any]) -> dict[str, Any]:
@@ -255,12 +269,7 @@ def _apply_rollups(events: list[IngestEvent]) -> None:
         if not children.get(body["id"]):
             continue
         totals = subtree_totals(body["id"], by_id, children)
-        body.setdefault("metadata", {})["rollup"] = {
-            "reused": totals["cache_read_input_tokens"],
-            "written": totals["cache_creation_input_tokens"],
-            "input": totals["input"],
-            "output": totals["output"],
-        }
+        body.setdefault("metadata", {})["rollup"] = rollup_metadata(totals)
 
 
 def forest_to_events(
