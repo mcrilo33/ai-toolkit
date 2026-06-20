@@ -837,11 +837,11 @@ def _link_and_walk_agent(
     """Link an agent span to its sub-agent transcript and walk that transcript once.
 
     The ``agent_link`` display field is always set so the chain renders at any depth
-    (Issue #50). The cost-bearing link (``links[span_id] -> agentId``) and the
+    (Issue #50). The token-bearing link (``links[span_id] -> agentId``) and the
     transcript walk happen only the FIRST time an ``agentId`` is seen: a repeated or
     cyclic ``agentId`` (Issue #51 S2) is therefore walked at most once — no duplicate
-    usage events — and owned by exactly one span, so ``cost.py`` never attributes one
-    transcript's tokens to two spans. Returns the nested transcript's
+    usage events — and owned by exactly one span, so one transcript's tokens are never
+    attributed to two spans. Returns the nested transcript's
     ``(events, spans, links)``; empty when the id is unresolved or already seen.
     """
     agent_id = results.get(tool_use_id, {}).get("agent_id")

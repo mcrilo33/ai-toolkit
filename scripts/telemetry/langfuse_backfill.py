@@ -14,8 +14,8 @@ The translator here is pure and network-free (:func:`forest_to_events`); the cov
 query and HTTP ingestion live in the CLI wiring (added alongside). Each causal node becomes
 one ingestion event under a backfill-owned trace:
 
-- a cost-bearing ``turn``/``agent`` leaf -> a ``generation-create`` carrying the turn's
-  four-component ``usageDetails`` and its ccusage ``costDetails``;
+- a ``turn``/``agent`` leaf -> a ``generation-create`` carrying the turn's four-component
+  ``usageDetails`` (Langfuse computes ``costDetails`` from its model-pricing config);
 - every other node (interval / tool / context / reasoning / hook / ...) -> a
   ``span-create``; a ``reasoning`` node additionally carries the extended-thinking body as
   its ``output`` (joined by turn uuid from the opt-in ``thinking`` map);
@@ -507,9 +507,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     parsed = parse_session_file(args.session) if args.session else parse_projects_dir(args.projects)
     thinking = _gather_thinking(args.session, args.projects) if args.thinking else {}
-    # UPGRADE: join ccusage session costs here so backfilled turns carry real cost; tokens
-    # are exact, cost is omitted for now (the ccusage pull is out of this subtask's scope).
-    forest: list[Any] = causal_forest_from_parsed(parsed, [], {}, thinking)
+    # Tokens are exact; Langfuse computes cost from the gen_ai.usage remap (Issue #91).
+    forest: list[Any] = causal_forest_from_parsed(parsed, [], thinking)
 
     host = os.environ.get("LANGFUSE_HOST", "http://localhost:3000")
     auth = os.environ["LANGFUSE_BASIC_AUTH"]  # "Basic <base64(pk:sk)>"

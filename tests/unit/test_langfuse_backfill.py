@@ -117,9 +117,11 @@ class TestNodeTranslation:
             "cache_creation_input_tokens": 300,
         }
 
-    def test_turn_cost_is_preserved(self) -> None:
+    def test_turn_carries_no_cost_details(self) -> None:
+        # Issue #91: cost is retired from the forest; the generation carries only
+        # usageDetails and Langfuse computes costDetails from its model-pricing config.
         body = _body_by_id(_events())[backfill_node_id(SPOKE, "m1")]
-        assert body["costDetails"]["total"] == 0.10
+        assert "costDetails" not in body
 
     def test_tool_becomes_a_span_under_its_turn(self) -> None:
         body = _body_by_id(_events())[backfill_node_id(SPOKE, "sp_read")]
@@ -219,12 +221,16 @@ class TestBackfillDecision:
     def test_uncovered_emits_the_full_forest(self) -> None:
         events = backfill_events(_forest(), SPOKE, {"m1": "BODY_THINK"}, covered=False)
         assert any(e["type"] == "generation-create" for e in events)
-        kinds = {e["body"].get("metadata", {}).get("kind") for e in events if "metadata" in e["body"]}
+        kinds = {
+            e["body"].get("metadata", {}).get("kind") for e in events if "metadata" in e["body"]
+        }
         assert {"turn", "tool", "reasoning"} <= kinds
 
     def test_covered_with_thinking_emits_reasoning_only(self) -> None:
         events = backfill_events(_forest(), SPOKE, {"m1": "BODY_THINK"}, covered=True)
-        kinds = {e["body"].get("metadata", {}).get("kind") for e in events if "metadata" in e["body"]}
+        kinds = {
+            e["body"].get("metadata", {}).get("kind") for e in events if "metadata" in e["body"]
+        }
         assert "turn" not in kinds and "tool" not in kinds
         assert any(e["body"].get("output") == "BODY_THINK" for e in events)
         assert any(e["type"] == "trace-create" for e in events)
