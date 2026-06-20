@@ -155,9 +155,11 @@ def _run_new(
     env.pop("WT_AGENT_MODEL", None)
     env.pop("WT_AGENT_EFFORT", None)
     env.pop("WT_AGENT_BUDGET_ARGS", None)
-    # The native-OTel opt-in (issue #83) and any inherited OTEL_* / telemetry vars
-    # must not leak in either: the gate-off default and the secret-handling are
-    # under test, so the host's own telemetry config must never steer the launch.
+    # The native-OTel gate (issue #83; default-on per otel-default) and any inherited
+    # OTEL_* / telemetry vars must not leak in either: the default-on/opt-out behaviour
+    # and the secret-handling are under test, so popping AI_TOOLKIT_OTEL lets a test
+    # exercise the genuine unset→default path; the host's own telemetry config (and the
+    # secret vars) must never steer the launch.
     for _k in (
         "AI_TOOLKIT_OTEL",
         "CLAUDE_CODE_ENABLE_TELEMETRY",
