@@ -62,8 +62,8 @@ _SOURCE = "request-body"
 
 # One ``<system-reminder>…</system-reminder>`` block (DOTALL: spans newlines).
 _REMINDER_RE = re.compile(r"<system-reminder>(.*?)</system-reminder>", re.DOTALL)
-# A line that is exactly one tool name (deferred tools are listed one per line).
-_TOOL_NAME_LINE_RE = re.compile(r"^[A-Za-z_]\w*$", re.MULTILINE)
+# A bare identifier — a stripped reminder line that is exactly one tool name.
+_TOOL_NAME_LINE_RE = re.compile(r"[A-Za-z_]\w*")
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +74,9 @@ class ContextItem:
         category: Section key — ``tools`` / ``mcp`` / ``system`` / ``context``.
         name: Display name (tool name, system block label, or reminder kind).
         text: The exact source text whose tokens are measured.
-        cached: Whether the entry sits inside a ``cache_control`` prefix boundary.
+        cached: Whether the entry lies within the cached prefix — at or before the last
+            ``cache_control`` breakpoint, which is what the prompt cache actually reuses
+            (the marker closes a prefix segment; everything ahead of it is cached too).
     """
 
     category: str
@@ -108,8 +110,12 @@ class RequestBody:
     model: str | None
 
 
-def _tool_items(tools: object) -> list[ContextItem]:
-    """Itemize the ``tools`` array, splitting ``mcp__`` tools into the ``mcp`` category."""
+def _tool_items(tools: object, *, cached: bool) -> list[ContextItem]:
+    """Itemize the ``tools`` array, splitting ``mcp__`` tools into the ``mcp`` category.
+
+    Tools precede ``system`` and ``messages`` in the request, so they are inside the cached
+    prefix whenever any ``cache_control`` breakpoint exists at all (``cached``).
+    """
     items: list[ContextItem] = []
     for tool in tools if isinstance(tools, list) else []:
         if not isinstance(tool, dict):
@@ -118,7 +124,7 @@ def _tool_items(tools: object) -> list[ContextItem]:
         if not name:
             continue
         category = "mcp" if str(name).startswith("mcp__") else "tools"
-        items.append(ContextItem(category, str(name), json.dumps(tool, ensure_ascii=False)))
+        items.append(ContextItem(category, str(name), json.dumps(tool, ensure_ascii=False), cached))
     return items
 
 
@@ -137,9 +143,25 @@ def _is_cached(block: object) -> bool:
     return isinstance(block, dict) and "cache_control" in block
 
 
-def _system_items(system: object) -> tuple[list[ContextItem], list[CacheBoundary]]:
-    """Itemize ``system`` blocks by positional label and collect their cache boundaries."""
+def _last_marker_index(blocks: list[object]) -> int:
+    """Return the index of the last ``cache_control``-marked block, or -1 if none."""
+    return max((i for i, block in enumerate(blocks) if _is_cached(block)), default=-1)
+
+
+def _system_items(
+    system: object, *, any_later_boundary: bool
+) -> tuple[list[ContextItem], list[CacheBoundary]]:
+    """Itemize ``system`` blocks by positional label and collect their cache boundaries.
+
+    A block is in the cached prefix when a later section (``messages``) holds a breakpoint
+    (``any_later_boundary``) or it sits at/before this section's own last breakpoint.
+
+    UPGRADE: labels are positional (the verified 4-block anatomy: billing header / identity
+    preamble / base system prompt / tool-use + output prompt). If Claude Code reorders or
+    drops a system block, every label shifts — switch to content-based detection then.
+    """
     blocks = system if isinstance(system, list) else [system]
+    last_marker = _last_marker_index(blocks)
     items: list[ContextItem] = []
     boundaries: list[CacheBoundary] = []
     for index, block in enumerate(blocks):
@@ -147,9 +169,9 @@ def _system_items(system: object) -> tuple[list[ContextItem], list[CacheBoundary
         if text is None:
             continue
         name = _SYSTEM_LABELS[index] if index < len(_SYSTEM_LABELS) else f"system[{index}]"
-        cached = _is_cached(block)
-        if cached:
+        if _is_cached(block):
             boundaries.append(CacheBoundary("system", index))
+        cached = any_later_boundary or index <= last_marker
         items.append(ContextItem("system", name, text, cached))
     return items, boundaries
 
@@ -162,9 +184,22 @@ def _classify_reminder(text: str) -> str:
     return "other-reminder"
 
 
+def _is_deferred_tool_line(line: str) -> bool:
+    """Whether a reminder line is a deferred-tool name rather than prose.
+
+    Deferred-tool names are bare identifiers that carry an uppercase letter or an ``mcp__``
+    separator (``CronCreate``, ``WebFetch``, ``mcp__srv__tool``); requiring one excludes the
+    lowercase single-word prose lines that can otherwise share the reminder's tail.
+    """
+    stripped = line.strip()
+    if not _TOOL_NAME_LINE_RE.fullmatch(stripped):
+        return False
+    return any(char.isupper() for char in stripped) or "__" in stripped
+
+
 def _count_deferred(text: str) -> int:
-    """Count the deferred-tool names (one per line) listed in a deferred-tools reminder."""
-    return len(_TOOL_NAME_LINE_RE.findall(text))
+    """Count the deferred-tool name lines (one per line) listed in a deferred-tools reminder."""
+    return sum(_is_deferred_tool_line(line) for line in text.splitlines())
 
 
 def _message_items(
@@ -173,14 +208,16 @@ def _message_items(
     """Itemize ``messages[0]`` into reminder blocks + the residual prompt.
 
     Each ``<system-reminder>`` is split out and classified; whatever text remains in a
-    block after the reminders are removed is the user prompt. Cache boundaries are read
-    from the block-level ``cache_control`` markers, and deferred tools named in a
-    deferred-tools reminder are tallied (their schemas are absent, so never sized).
+    block after the reminders are removed is the user prompt. A block (and every reminder /
+    prompt within it) is in the cached prefix when it sits at/before the last ``messages``
+    breakpoint. Deferred tools named in a deferred-tools reminder are tallied (their schemas
+    are absent, so never sized).
     """
     if not isinstance(messages, list) or not messages:
         return [], [], 0
     content = messages[0].get("content") if isinstance(messages[0], dict) else None
-    blocks = content if isinstance(content, list) else [content]
+    blocks: list[object] = content if isinstance(content, list) else [content]
+    last_marker = _last_marker_index(blocks)
     items: list[ContextItem] = []
     boundaries: list[CacheBoundary] = []
     deferred = 0
@@ -188,9 +225,9 @@ def _message_items(
         text = _block_text(block)
         if text is None:
             continue
-        cached = _is_cached(block)
-        if cached:
+        if _is_cached(block):
             boundaries.append(CacheBoundary("messages", index))
+        cached = index <= last_marker
         for full, inner in ((m.group(0), m.group(1)) for m in _REMINDER_RE.finditer(text)):
             kind = _classify_reminder(inner)
             items.append(ContextItem("context", kind, full, cached))
@@ -203,10 +240,17 @@ def _message_items(
 
 
 def parse_request_obj(obj: dict[str, object]) -> RequestBody:
-    """Parse an already-loaded request-body dict into its itemized loaded context."""
-    tool_items = _tool_items(obj.get("tools"))
-    system_items, system_boundaries = _system_items(obj.get("system"))
+    """Parse an already-loaded request-body dict into its itemized loaded context.
+
+    The cached-prefix flags are resolved across sections in request order (tools → system →
+    messages): messages are parsed first to learn whether a later breakpoint exists, so the
+    system and tool sections ahead of it inherit the cached flag correctly.
+    """
     message_items, message_boundaries, deferred = _message_items(obj.get("messages"))
+    system_items, system_boundaries = _system_items(
+        obj.get("system"), any_later_boundary=bool(message_boundaries)
+    )
+    tool_items = _tool_items(obj.get("tools"), cached=bool(system_boundaries or message_boundaries))
     model = obj.get("model")
     return RequestBody(
         items=[*tool_items, *system_items, *message_items],
@@ -267,7 +311,7 @@ def first_real_request(paths: list[Path]) -> Path | None:
     prefix and no tools; it is skipped so the itemization reflects the full prefix.
 
     Args:
-        paths: Candidate ``.request.json`` paths, in emission order.
+        paths: Candidate ``.request.json`` paths, oldest first (the caller sorts by mtime).
 
     Returns:
         The first path whose body has a non-empty ``tools`` array, or None when none do

@@ -27,6 +27,7 @@ from telemetry.request_body import (
     first_real_request,
     measure_request_items,
     parse_request_body,
+    parse_request_obj,
 )
 
 _FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
@@ -76,19 +77,28 @@ def test_per_tool_size_ordering_workflow_larger_than_bash() -> None:
 # --- system blocks -----------------------------------------------------------
 
 
-def test_system_blocks_labeled_and_cache_flagged() -> None:
+def test_system_blocks_labeled_in_order() -> None:
     # Arrange / Act
     parsed = parse_request_body(_SAMPLE)
     system = _by_category(parsed.items, "system")
 
-    # Assert: four labeled blocks; the last two are cache-marked, the first two not.
+    # Assert: four positional labels in order.
     assert [item.name for item in system] == [
         "billing header",
         "identity preamble",
         "base system prompt",
         "tool-use + output prompt",
     ]
-    assert [item.cached for item in system] == [False, False, True, True]
+
+
+def test_whole_system_cached_when_a_later_messages_breakpoint_exists() -> None:
+    # Arrange / Act: the sample's prompt block carries a cache_control marker, so the
+    # entire system array sits inside the cached prefix — even the un-marked early blocks.
+    parsed = parse_request_body(_SAMPLE)
+    system = _by_category(parsed.items, "system")
+
+    # Assert: all four system blocks are flagged cached (prefix semantics, not per-marker).
+    assert all(item.cached for item in system)
 
 
 # --- reminder classification -------------------------------------------------
@@ -187,3 +197,51 @@ def test_first_real_request_none_when_all_degenerate() -> None:
 
     # Assert: no real request found yields None for the caller's disk fallback.
     assert chosen is None
+
+
+# --- cached-prefix semantics -------------------------------------------------
+
+
+def test_block_after_last_breakpoint_is_uncached() -> None:
+    # Arrange: a system block carries the only marker; a trailing block follows it and no
+    # later messages breakpoint exists, so that trailing block is OUTSIDE the cached prefix.
+    obj: dict[str, object] = {
+        "system": [
+            {"type": "text", "text": "cached one", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "trailing, uncached"},
+        ],
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+
+    # Act
+    parsed = parse_request_obj(obj)
+
+    # Assert: block at the marker is cached, the block after it is not.
+    system = _by_category(parsed.items, "system")
+    assert [item.cached for item in system] == [True, False]
+
+
+# --- deferred-tool counting robustness ---------------------------------------
+
+
+def test_deferred_count_ignores_lowercase_prose_lines() -> None:
+    # Arrange: a deferred-tools reminder whose tail has bare single-word prose lines that
+    # are NOT tool names (lowercase, no mcp__ separator) — they must not be counted.
+    reminder = (
+        "<system-reminder>\n"
+        "The following deferred tools are now available via ToolSearch:\n"
+        "CronCreate\n"
+        "mcp__srv__do\n"
+        "keyword\n"  # prose, lowercase — not a tool
+        "search\n"  # prose, lowercase — not a tool
+        "</system-reminder>"
+    )
+    obj: dict[str, object] = {
+        "messages": [{"role": "user", "content": [{"type": "text", "text": reminder}]}]
+    }
+
+    # Act
+    parsed = parse_request_obj(obj)
+
+    # Assert: only the two identifier-shaped names count, not the prose words.
+    assert parsed.deferred_tool_count == 2

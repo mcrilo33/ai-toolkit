@@ -875,8 +875,14 @@ def loaded_context_rows(
 
 
 def find_request_files(bodies_dir: Path) -> list[Path]:
-    """Return the ``*.request.json`` dumps in ``bodies_dir``, sorted by name (emission order)."""
-    return sorted(bodies_dir.glob("*.request.json")) if bodies_dir.is_dir() else []
+    """Return the ``*.request.json`` dumps in ``bodies_dir``, oldest first.
+
+    Sorted by modification time, not name: the dumps are ``<uuid>.request.json`` and random
+    UUIDs are not chronological, so a name sort would not yield emission order.
+    """
+    if not bodies_dir.is_dir():
+        return []
+    return sorted(bodies_dir.glob("*.request.json"), key=lambda path: path.stat().st_mtime)
 
 
 def request_context_rows(
