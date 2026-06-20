@@ -459,11 +459,11 @@ def _diff_messages(
     curr = _group_messages_by_hash(curr_items)
     added: list[dict[str, object]] = []
     for digest, items in curr.items():
-        surplus = len(items) - len(prev.get(digest, []))
+        surplus = max(0, len(items) - len(prev.get(digest, [])))
         added.extend(_measure_one(item, counter=counter, price=price) for item in items[:surplus])
     removed: list[dict[str, object]] = []
     for digest, items in prev.items():
-        surplus = len(items) - len(curr.get(digest, []))
+        surplus = max(0, len(items) - len(curr.get(digest, [])))
         removed.extend(_measure_one(item, counter=counter, price=price) for item in items[:surplus])
     return added, removed
 

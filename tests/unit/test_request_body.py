@@ -401,6 +401,21 @@ def test_diff_net_reconciles_added_removed_and_changed_deltas() -> None:
     assert delta.net_tokens == added - removed + changed
 
 
+def test_duplicate_message_bucket_grows_without_phantom_removed_row() -> None:
+    # Arrange: a message appears twice in the older snapshot and three times in the newer
+    # (identical content) — a partially-overlapping multiset bucket. Only one copy is added.
+    dup = _msg("user", "ping")
+    prev = snapshot_items(_body([_tool("Bash")], ["sys"], [dup, dup]))
+    curr = snapshot_items(_body([_tool("Bash")], ["sys"], [dup, dup, dup]))
+
+    # Act
+    delta = diff_snapshots(prev, curr, counter=len, price=1.0)
+
+    # Assert: exactly one copy ADDED, and NO phantom REMOVED row from a negative slice.
+    assert len(_by_cat(delta.added, "messages")) == 1
+    assert delta.removed == []
+
+
 def test_context_delta_is_frozen_dataclass() -> None:
     # Arrange / Act
     delta = ContextDelta(added=[], removed=[], changed=[], net_tokens=0, label=None)
