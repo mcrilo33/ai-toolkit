@@ -78,6 +78,15 @@ _REMINDER_RE = re.compile(r"<system-reminder>(.*?)</system-reminder>", re.DOTALL
 # A bare identifier — a stripped reminder line that is exactly one tool name.
 _TOOL_NAME_LINE_RE = re.compile(r"[A-Za-z_]\w*")
 
+# A section boundary inside the rules+memory+env block (#99): either a ``Contents of <path>``
+# file header or a ``# Header`` line (Memory Index / currentDate / userEmail / claudeMd).
+_RULES_BOUNDARY_RE = re.compile(r"^(?:Contents of \S+.*|#[ ].*)$", re.MULTILINE)
+# The path on a ``Contents of <path> …:`` header line — basenamed to name the rule item.
+# The path stops at the first space or trailing colon (``file.md:`` and ``file.md (desc):``).
+_CONTENTS_PATH_RE = re.compile(r"^Contents of (\S+?):?(?:\s|$)")
+# One ``- <name>: …`` listing line inside the skills reminder (#99), name captured.
+_SKILL_LINE_RE = re.compile(r"^- ([A-Za-z][\w:-]*):", re.MULTILINE)
+
 
 @dataclass(frozen=True, slots=True)
 class ContextItem:
@@ -300,6 +309,162 @@ def parse_request_obj(obj: dict[str, object]) -> RequestBody:
 def parse_request_body(path: Path) -> RequestBody:
     """Parse a ``.request.json`` dump at ``path`` into its itemized loaded context."""
     return parse_request_obj(_load(path))
+
+
+def _split_rules_items(text: str, *, cached: bool) -> list[ContextItem]:
+    """Split a rules+memory+env block into one ``rules`` item per file plus an env item (#99).
+
+    The block interleaves ``Contents of <path>`` file sections with ``# Header`` lines
+    (claudeMd intro / Memory Index / currentDate / userEmail). Each file section becomes a
+    ``rules`` item named by the path's basename; every non-file segment is concatenated into a
+    single ``environment`` item. With no boundary at all the whole text is one ``environment``
+    item, so no tokens are dropped.
+    """
+    boundaries = list(_RULES_BOUNDARY_RE.finditer(text))
+    if not boundaries:
+        return [ContextItem("environment", "environment", text, cached)] if text.strip() else []
+    items: list[ContextItem] = []
+    env_parts: list[str] = [text[: boundaries[0].start()]]
+    for index, boundary in enumerate(boundaries):
+        end = boundaries[index + 1].start() if index + 1 < len(boundaries) else len(text)
+        segment = text[boundary.start() : end]
+        match = _CONTENTS_PATH_RE.match(segment.lstrip())
+        if match:
+            items.append(ContextItem("rules", Path(match.group(1)).name, segment, cached))
+        else:
+            env_parts.append(segment)
+    if any(part.strip() for part in env_parts):
+        items.append(ContextItem("environment", "environment", "".join(env_parts), cached))
+    return items
+
+
+def _split_skill_items(text: str, *, cached: bool) -> list[ContextItem]:
+    """Split a skills reminder into one ``skills`` item per ``- <name>: …`` line (#99).
+
+    Each skill's item text runs from its listing line up to the next skill (the leading prose
+    header before the first skill is left out and falls into the reconciled remainder). With no
+    listing line the whole text is one ``skills`` item, so nothing is dropped.
+    """
+    matches = list(_SKILL_LINE_RE.finditer(text))
+    if not matches:
+        return [ContextItem("skills", "skills", text, cached)] if text.strip() else []
+    items: list[ContextItem] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        items.append(ContextItem("skills", match.group(1), text[match.start() : end], cached))
+    return items
+
+
+def _last_marker_message_index(messages: list[object]) -> int:
+    """Return the highest message index carrying any ``cache_control`` block, or -1 if none."""
+    last = -1
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        blocks: list[object] = content if isinstance(content, list) else [content]
+        if any(_is_cached(block) for block in blocks):
+            last = index
+    return last
+
+
+def _decompose_first_message(first: object, *, any_later_marker: bool) -> list[ContextItem]:
+    """Itemize ``messages[0]`` for the decomposition: sub-split reminders + residual prompt.
+
+    Reuses the #87 reminder classification but routes the rules+memory+env and skills kinds
+    through the per-file / per-skill splitters; any ``Contents of <path>`` text outside a
+    recognized reminder (rules injected as bare blocks) is split too.
+    """
+    content = first.get("content") if isinstance(first, dict) else None
+    blocks: list[object] = content if isinstance(content, list) else [content]
+    last_marker = _last_marker_index(blocks)
+    items: list[ContextItem] = []
+    for index, block in enumerate(blocks):
+        text = _block_text(block)
+        if text is None:
+            continue
+        cached = any_later_marker or index <= last_marker
+        for full, inner in ((m.group(0), m.group(1)) for m in _REMINDER_RE.finditer(text)):
+            items.extend(_decompose_reminder(full, inner, cached=cached))
+        residual = _REMINDER_RE.sub("", text).strip()
+        if residual:
+            items.extend(_decompose_residual(residual, cached=cached))
+    return items
+
+
+def _decompose_reminder(full: str, inner: str, *, cached: bool) -> list[ContextItem]:
+    """Route one reminder to the per-file / per-skill splitter or keep it as a context item."""
+    kind = _classify_reminder(inner)
+    if kind == "rules+memory+env":
+        return _split_rules_items(inner, cached=cached)
+    if kind == "skills":
+        return _split_skill_items(inner, cached=cached)
+    return [ContextItem("context", kind, full, cached)]
+
+
+def _decompose_residual(residual: str, *, cached: bool) -> list[ContextItem]:
+    """Itemize non-reminder text: split any ``Contents of`` rule blocks, else the prompt."""
+    if _CONTENTS_PATH_RE.search(residual) or _RULES_BOUNDARY_RE.search(residual):
+        return _split_rules_items(residual, cached=cached)
+    return [ContextItem("context", "prompt", residual, cached)]
+
+
+def decompose_request_obj(obj: dict[str, object]) -> list[ContextItem]:
+    """Itemize a whole request body for the per-``llm_request`` cache decomposition (#99).
+
+    Unlike :func:`parse_request_obj` (the #87 turn-0 baseline, ``messages[0]`` only) this
+    itemizes the ENTIRE body in request order — tools, system, ``messages[0]`` with the
+    rules+memory+env block split per rule file and the skills block split per skill, then every
+    later message whole — each :class:`ContextItem` carrying a ``cached`` flag. A message at or
+    before the last ``cache_control`` marker is cached (read from cache); a message after it is
+    new (written this turn). The caller splits these items into the observed ``cache_read`` /
+    ``cache_creation`` token budgets.
+
+    Args:
+        obj: An already-loaded request-body dict.
+
+    Returns:
+        The itemized loaded context, in request order, with per-item cached flags.
+    """
+    messages = obj.get("messages")
+    messages = messages if isinstance(messages, list) else []
+    last_marker_msg = _last_marker_message_index(messages)
+    any_msg_marker = last_marker_msg >= 0
+    tool_items = _tool_items(obj.get("tools"), cached=any_msg_marker)
+    system_items, _ = _system_items(obj.get("system"), any_later_boundary=any_msg_marker)
+    first_items = (
+        _decompose_first_message(messages[0], any_later_marker=last_marker_msg > 0)
+        if messages
+        else []
+    )
+    return [
+        *tool_items,
+        *system_items,
+        *first_items,
+        *_later_message_items(messages, last_marker_msg),
+    ]
+
+
+def _later_message_items(messages: list[object], last_marker_msg: int) -> list[ContextItem]:
+    """Itemize ``messages[1:]`` whole, cached iff at or before the last marker message."""
+    items: list[ContextItem] = []
+    for index in range(1, len(messages)):
+        message = messages[index]
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", "?"))
+        text = json.dumps(
+            {"role": role, "content": message.get("content")}, ensure_ascii=False, sort_keys=True
+        )
+        items.append(
+            ContextItem("messages", f"msg[{index}]:{role}", text, index <= last_marker_msg)
+        )
+    return items
+
+
+def decompose_request_body(path: Path) -> list[ContextItem]:
+    """Itemize a ``.request.json`` dump at ``path`` for the cache decomposition (see above)."""
+    return decompose_request_obj(_load(path))
 
 
 def snapshot_items_from_path(path: Path) -> list[ContextItem]:
