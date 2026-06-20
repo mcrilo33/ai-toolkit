@@ -28,7 +28,9 @@ from telemetry.langfuse_spoke_tree import (
     _TRUNCATION_MARKER,
     _copy_id,
     build_batch,
+    build_context_evolution_events,
     build_loaded_context_events,
+    context_evolution_deltas,
     fetch_session,
     find_request_files,
     prefix_total,
@@ -37,6 +39,7 @@ from telemetry.langfuse_spoke_tree import (
     scan_transcripts,
     trace_id_for,
 )
+from telemetry.request_body import ContextDelta
 
 SPOKE = "feature/22-demo+1700000000"
 
@@ -740,3 +743,133 @@ class TestRequestContextRows:
         empty = tmp_path / "empty"
         empty.mkdir()
         assert request_context_rows(empty, counter=len, price=1.0) is None
+
+
+def _added_row(category: str, name: str, tokens: int) -> dict:
+    return {"category": category, "name": name, "tokens": tokens, "cost_usd": tokens * 0.1}
+
+
+def _changed_row(category: str, name: str, tokens: int, delta: int) -> dict:
+    row = _added_row(category, name, tokens)
+    row["prev_tokens"] = tokens - delta
+    row["delta_tokens"] = delta
+    return row
+
+
+class TestContextEvolutionSubtree:
+    """The #98 per-turn context-evolution subtree: one node per evolving turn."""
+
+    def _deltas(self) -> list[tuple[int, ContextDelta]]:
+        turn1 = ContextDelta(
+            added=[
+                _added_row("tools", "WebSearch", 300),
+                _added_row("messages", "msg[3]:user", 50),
+            ],
+            removed=[],
+            changed=[_changed_row("system", "base system prompt", 220, 20)],
+            net_tokens=370,
+            label=None,
+        )
+        turn2 = ContextDelta(
+            added=[],
+            removed=[_added_row("messages", "msg[1]:user", 15000)],
+            changed=[],
+            net_tokens=-15000,
+            label="compaction",
+        )
+        return [(1, turn1), (2, turn2)]
+
+    def _build(self) -> list[dict]:
+        return build_context_evolution_events(SPOKE, self._deltas(), base_ts="2026-01-01T00:00:00Z")
+
+    def test_parent_sits_under_spoke_root(self) -> None:
+        parent = _lc_by_name(self._build())["context-evolution"]
+        assert parent["parentObservationId"] == root_id_for(SPOKE)
+
+    def test_one_turn_node_per_evolving_turn_under_the_parent(self) -> None:
+        events = self._build()
+        parent_id = _lc_by_name(events)["context-evolution"]["id"]
+        turn_nodes = [
+            e["body"] for e in events if e["body"].get("parentObservationId") == parent_id
+        ]
+        assert len(turn_nodes) == 2
+
+    def test_turn_node_metadata_carries_added_removed_and_net(self) -> None:
+        turn = next(b for n, b in _lc_by_name(self._build()).items() if n.startswith("turn 1"))
+        assert turn["metadata"]["net_tokens"] == 370
+        added_names = {row["name"] for row in turn["metadata"]["added"]}
+        assert "WebSearch" in added_names
+        assert turn["metadata"]["removed"] == []
+
+    def test_toolsearch_added_schema_is_a_named_child_node(self) -> None:
+        events = self._build()
+        turn1 = next(b for n, b in _lc_by_name(events).items() if n.startswith("turn 1"))
+        children = [
+            e["body"] for e in events if e["body"].get("parentObservationId") == turn1["id"]
+        ]
+        assert any(c["name"].startswith("WebSearch") for c in children)
+
+    def test_compaction_turn_is_labeled_and_net_negative(self) -> None:
+        turn2 = next(b for n, b in _lc_by_name(self._build()).items() if n.startswith("turn 2"))
+        assert turn2["metadata"]["label"] == "compaction"
+        assert turn2["metadata"]["net_tokens"] < 0
+
+    def test_compaction_removed_message_is_a_child_node(self) -> None:
+        events = self._build()
+        turn2 = next(b for n, b in _lc_by_name(events).items() if n.startswith("turn 2"))
+        children = [
+            e["body"] for e in events if e["body"].get("parentObservationId") == turn2["id"]
+        ]
+        assert any(c["name"].startswith("msg[1]:user") for c in children)
+
+    def test_all_nodes_attach_to_the_assembled_trace_as_spans(self) -> None:
+        events = self._build()
+        assert all(e["body"]["traceId"] == trace_id_for(SPOKE) for e in events)
+        assert all(e["type"] == "span-create" for e in events)
+
+    def test_ids_are_deterministic_across_runs(self) -> None:
+        assert {e["id"] for e in self._build()} == {e["id"] for e in self._build()}
+
+    def test_empty_deltas_emit_only_the_parent(self) -> None:
+        events = build_context_evolution_events(SPOKE, [], base_ts="2026-01-01T00:00:00Z")
+        assert len(events) == 1
+        assert events[0]["body"]["name"] == "context-evolution"
+
+
+class TestContextEvolutionDeltas:
+    """Wiring: diff every consecutive raw request body, ordered, skipping unchanged turns."""
+
+    def _write(self, bodies: Path, index: int, obj: dict) -> None:
+        # Names are random UUIDs in practice; ordering is by mtime, so write in turn order.
+        (bodies / f"{index:02d}-body.request.json").write_text(json.dumps(obj), encoding="utf-8")
+
+    def _bodies(self, tmp_path: Path) -> Path:
+        bodies = tmp_path / "bodies"
+        bodies.mkdir()
+        bash = {"name": "Bash", "description": "d", "input_schema": {"type": "object"}}
+        web = {"name": "WebSearch", "description": "d", "input_schema": {"type": "object"}}
+        turn0 = {
+            "tools": [bash],
+            "system": [{"type": "text", "text": "sys"}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        }
+        turn1 = {
+            "tools": [bash, web],
+            "system": [{"type": "text", "text": "sys"}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        }
+        self._write(bodies, 0, turn0)
+        self._write(bodies, 1, turn1)
+        return bodies
+
+    def test_returns_one_delta_per_evolving_transition(self, tmp_path: Path) -> None:
+        deltas = context_evolution_deltas(self._bodies(tmp_path), counter=len, price=1.0)
+        assert len(deltas) == 1
+        turn_index, delta = deltas[0]
+        assert turn_index == 1
+        assert any(row["name"] == "WebSearch" for row in delta.added)
+
+    def test_empty_when_no_bodies(self, tmp_path: Path) -> None:
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        assert context_evolution_deltas(empty, counter=len, price=1.0) == []
