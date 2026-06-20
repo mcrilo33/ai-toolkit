@@ -322,6 +322,21 @@ fi
 # OTEL_LOGS_EXPORTER=otlp is wired explicitly (not left to inheritance): the logs
 # signal carries both the message bridge's source and the api_request_body log
 # events whose body_refs point at the FILE-mode dumps — without it they are lost.
+# DEFAULT-ON (issue: otel-default): native OTel is enabled unless the operator
+# explicitly opts out with AI_TOOLKIT_OTEL=0. Setting it once here covers BOTH the
+# prefix gate below AND wt_otel_bridge_preflight (worktree-lib.sh) — they read the
+# same variable, and the lib is sourced into this shell, so the default propagates.
+# AI_TOOLKIT_OTEL=0 is a clean, full opt-out: the prefix collapses, no body dir is
+# created, and the preflight returns early (no bridge) — there is no half-on state.
+#
+# !!! PRIVACY — LOUD NOTE !!!  Default-on means EVERY spoke now ships CONTENT off-box
+# by default: OTEL_LOG_USER_PROMPTS + OTEL_LOG_TOOL_DETAILS + OTEL_LOG_TOOL_CONTENT
+# send the user's prompts and per-tool input/output to the collector/Langfuse, and
+# OTEL_LOG_RAW_API_BODIES=file:<dir> dumps each FULL, untruncated outgoing request
+# (system prompt + entire conversation + tools array) to disk under .ai-toolkit/.
+# This is conversation content leaving the box for every run, not just metadata.
+# To opt out entirely, launch the spoke with AI_TOOLKIT_OTEL=0.
+AI_TOOLKIT_OTEL="${AI_TOOLKIT_OTEL:-1}"
 OTEL_PREFIX=""
 if [ "${AI_TOOLKIT_OTEL:-}" = "1" ]; then
   OTEL_BODY_DIR="$WT_DIR/.ai-toolkit/raw-bodies"
