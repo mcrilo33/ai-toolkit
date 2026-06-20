@@ -717,8 +717,16 @@ class TestBuildStepWindows:
         assert build_step_windows([("tr", [create])], content) == []
 
 
+def _turn(obs_id: str, start: str, *, parent: str | None) -> dict:
+    """An llm_request turn (the chronological content unit nested under a step)."""
+    return _obs(obs_id, "llm_request", type_="GENERATION", parent=parent, startTime=start)
+
+
 class TestStepGrouping:
-    """#100: turns/tools at the root nest under the step whose window contains them."""
+    """#100: every timeline node nests under the step whose window contains its startTime,
+    regardless of its current parent — root, a dissolved interaction, or a resume buried under
+    a tool.execution. Nodes that ride with a tool (parent is a ``tool:`` span) are left nested.
+    """
 
     def _content(self) -> dict[str, ToolContent]:
         return {
@@ -730,35 +738,36 @@ class TestStepGrouping:
         }
 
     def _traces(self, turn_start: str = "2026-01-02T00:00:05Z") -> list[tuple[str, list[dict]]]:
-        create = _ledger_obs(
+        # An interaction container holds the ledger ops + a turn; the interaction is dissolved.
+        interaction = _obs(
+            "i1", "claude_code.interaction", parent=None, startTime="2026-01-02T00:00:00Z"
+        )
+        create = _obs(
             "tc1",
             "tool:TaskCreate",
-            "tu-c1",
-            start="2026-01-02T00:00:00Z",
-            end="2026-01-02T00:00:00Z",
+            parent="i1",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:00Z",
+            metadata={"attributes": {"tool_use_id": "tu-c1"}},
         )
-        started = _ledger_obs(
+        started = _obs(
             "tu1",
             "tool:TaskUpdate",
-            "tu-u1",
-            start="2026-01-02T00:00:01Z",
-            end="2026-01-02T00:00:01Z",
+            parent="i1",
+            startTime="2026-01-02T00:00:01Z",
+            endTime="2026-01-02T00:00:01Z",
+            metadata={"attributes": {"tool_use_id": "tu-u1"}},
         )
-        done = _ledger_obs(
+        done = _obs(
             "tu2",
             "tool:TaskUpdate",
-            "tu-u2",
-            start="2026-01-02T00:00:20Z",
-            end="2026-01-02T00:00:21Z",
+            parent="i1",
+            startTime="2026-01-02T00:00:20Z",
+            endTime="2026-01-02T00:00:21Z",
+            metadata={"attributes": {"tool_use_id": "tu-u2"}},
         )
-        turn = _obs(
-            "turnA",
-            "claude_code.interaction",
-            parent=None,
-            startTime=turn_start,
-            metadata={"kind": "turn"},
-        )
-        return [("tr", [create, started, done, turn])]
+        turn = _turn("turnA", turn_start, parent="i1")
+        return [("tr", [interaction, create, started, done, turn])]
 
     def test_turn_within_window_nests_under_a_step_node(self) -> None:
         batch = build_batch(self._traces(), SPOKE, self._content())
@@ -770,6 +779,20 @@ class TestStepGrouping:
         turn = _by_orig(batch, "tr", "turnA")
         assert turn["body"]["parentObservationId"] == step["id"]
 
+    def test_ledger_ops_nest_under_their_step(self) -> None:
+        # The TaskUpdate spans themselves (in_progress and completed) join the step timeline.
+        batch = build_batch(self._traces(), SPOKE, self._content())
+
+        step_id = _step_node(batch)["id"]
+        assert _by_orig(batch, "tr", "tu1")["body"]["parentObservationId"] == step_id
+        assert _by_orig(batch, "tr", "tu2")["body"]["parentObservationId"] == step_id
+
+    def test_interaction_container_is_dissolved(self) -> None:
+        # When grouping is active the claude_code.interaction node is dropped entirely.
+        batch = build_batch(self._traces(), SPOKE, self._content())
+
+        assert all(e["id"] != _copy_id("tr", "i1") for e in batch)
+
     def test_step_node_carries_window_metadata(self) -> None:
         batch = build_batch(self._traces(), SPOKE, self._content())
 
@@ -777,8 +800,9 @@ class TestStepGrouping:
         assert meta["subject"] == "S1 RED: x"
         assert meta["status"] == "completed"
 
-    def test_turn_outside_every_window_stays_at_root(self) -> None:
-        # A turn well after the only step's window keeps its synthetic-root parent.
+    def test_turn_outside_every_window_falls_back_to_root(self) -> None:
+        # A turn well after the only step's window re-homes to the synthetic root (its interaction
+        # parent is dissolved), never left dangling.
         batch = build_batch(self._traces(turn_start="2026-01-02T01:00:00Z"), SPOKE, self._content())
 
         turn = _by_orig(batch, "tr", "turnA")
@@ -788,10 +812,136 @@ class TestStepGrouping:
         batch = build_batch(_traces(), SPOKE)
 
         assert _step_node(batch) is None
-        # the interaction turn still collapses to the synthetic root.
+        # the interaction turn still collapses to the synthetic root (interactions untouched).
         assert _by_orig(batch, "trace-int", "i1")["body"]["parentObservationId"] == root_id_for(
             SPOKE
         )
+
+    def test_hook_under_a_tool_rides_with_its_tool_into_the_step(self) -> None:
+        # A gate hook nested under a tool stays under that tool (Part 2); the tool re-homes
+        # into the step, so the hook ends up under tool-under-step, not a direct step child.
+        content = {
+            "tu-c1": ToolContent({"subject": "S1 GREEN"}, "Task #1 created successfully: S1 GREEN"),
+            "tu-u1": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
+            "tu-u2": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
+        }
+        create = _obs(
+            "tc1",
+            "tool:TaskCreate",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:00Z",
+            metadata={"attributes": {"tool_use_id": "tu-c1"}},
+        )
+        started = _obs(
+            "tu1",
+            "tool:TaskUpdate",
+            parent=None,
+            startTime="2026-01-02T00:00:01Z",
+            endTime="2026-01-02T00:00:01Z",
+            metadata={"attributes": {"tool_use_id": "tu-u1"}},
+        )
+        done = _obs(
+            "tu2",
+            "tool:TaskUpdate",
+            parent=None,
+            startTime="2026-01-02T00:00:30Z",
+            endTime="2026-01-02T00:00:30Z",
+            metadata={"attributes": {"tool_use_id": "tu-u2"}},
+        )
+        tool = _obs(
+            "tb",
+            "tool:Bash",
+            parent=None,
+            startTime="2026-01-02T00:00:10Z",
+            metadata={"attributes": {"tool_use_id": "tu-b"}},
+        )
+        hook = _obs(
+            "hb",
+            "PreToolUse.sh",
+            parent=None,
+            startTime="2026-01-02T00:00:10Z",
+            metadata={"attributes": {"workflow.kind": "hook", "tool_use_id": "tu-b"}},
+        )
+
+        batch = build_batch([("tr", [create, started, done, tool, hook])], SPOKE, content)
+
+        step_id = _step_node(batch)["id"]
+        tool_copy = _by_orig(batch, "tr", "tb")
+        assert tool_copy["body"]["parentObservationId"] == step_id  # tool re-homed into step
+        # the hook still rides under its tool, NOT directly under the step.
+        assert _by_orig(batch, "tr", "hb")["body"]["parentObservationId"] == tool_copy["id"]
+
+    def test_resume_interactions_flatten_into_step_chronologically(self) -> None:
+        # Two interactions (a resume); interaction-2 is buried under a tool.execution sub-span,
+        # which natively breaks chronology. Every turn/TaskUpdate across BOTH interactions must
+        # sort into the one step window as direct children, ordered by startTime.
+        content = {
+            "tu-c1": ToolContent({"subject": "S1 PUSH"}, "Task #3 created successfully: S1 PUSH"),
+            "tu-u1": ToolContent({"taskId": "3", "status": "in_progress"}, "ok"),
+            "tu-u2": ToolContent({"taskId": "3", "status": "completed"}, "ok"),
+        }
+        # interaction-1 (root): create, in_progress(T10), push turn (T12)
+        i1 = _obs("i1", "claude_code.interaction", parent=None, startTime="2026-01-02T00:00:05Z")
+        create = _obs(
+            "tc1",
+            "tool:TaskCreate",
+            parent="i1",
+            startTime="2026-01-02T00:00:05Z",
+            endTime="2026-01-02T00:00:05Z",
+            metadata={"attributes": {"tool_use_id": "tu-c1"}},
+        )
+        started = _obs(
+            "tu1",
+            "tool:TaskUpdate",
+            parent="i1",
+            startTime="2026-01-02T00:00:10Z",
+            endTime="2026-01-02T00:00:10Z",
+            metadata={"attributes": {"tool_use_id": "tu-u1"}},
+        )
+        push_turn1 = _turn("p1", "2026-01-02T00:00:12Z", parent="i1")
+        # a real tool with a tool.execution sub-span; the resume interaction-2 hangs off it.
+        tool = _obs(
+            "tp",
+            "tool:Bash",
+            parent="i1",
+            startTime="2026-01-02T00:00:15Z",
+            metadata={"attributes": {"tool_use_id": "tu-p"}},
+        )
+        execu = _obs(
+            "exec1", "claude_code.tool.execution", parent="tp", startTime="2026-01-02T00:00:15Z"
+        )
+        # interaction-2 (resume) nested under the tool.execution — out of chronological place.
+        i2 = _obs("i2", "claude_code.interaction", parent="exec1", startTime="2026-01-02T00:00:18Z")
+        push_turn2 = _turn("p2", "2026-01-02T00:00:22Z", parent="i2")
+        done = _obs(
+            "tu2",
+            "tool:TaskUpdate",
+            parent="i2",
+            startTime="2026-01-02T00:00:30Z",
+            endTime="2026-01-02T00:00:31Z",
+            metadata={"attributes": {"tool_use_id": "tu-u2"}},
+        )
+
+        batch = build_batch(
+            [("tr", [i1, create, started, push_turn1, tool, execu, i2, push_turn2, done])],
+            SPOKE,
+            content,
+        )
+
+        step_id = _step_node(batch)["id"]
+        # both interactions are dissolved.
+        assert all(e["id"] not in {_copy_id("tr", "i1"), _copy_id("tr", "i2")} for e in batch)
+        # the direct children of the step, in startTime order.
+        children = sorted(
+            (e for e in batch if e["body"].get("parentObservationId") == step_id),
+            key=lambda e: e["body"]["startTime"],
+        )
+        names = [e["body"]["name"] for e in children]
+        # task3 in_progress -> push turn 1 -> push turn 2 -> task3 completed.
+        assert names == ["tool:TaskUpdate", "llm_request", "llm_request", "tool:TaskUpdate"]
+        # the tool itself also re-homes into the step (its execution sub-span rides with it).
+        assert _by_orig(batch, "tr", "tp")["body"]["parentObservationId"] == step_id
 
     def test_innermost_window_wins_on_overlap(self) -> None:
         # Two overlapping steps; a turn inside both nests under the later-starting (inner) one.
@@ -849,9 +999,7 @@ class TestStepGrouping:
                 end="2026-01-02T00:00:20Z",
             ),
         ]
-        turn = _obs(
-            "turnB", "claude_code.interaction", parent=None, startTime="2026-01-02T00:00:10Z"
-        )
+        turn = _turn("turnB", "2026-01-02T00:00:10Z", parent=None)
 
         batch = build_batch([("tr", [*outer, *inner, turn])], SPOKE, content)
 
