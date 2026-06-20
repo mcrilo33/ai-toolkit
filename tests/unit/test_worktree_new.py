@@ -167,6 +167,11 @@ def _run_new(
         "OTEL_EXPORTER_OTLP_ENDPOINT",
         "OTEL_EXPORTER_OTLP_HEADERS",
         "OTEL_RESOURCE_ATTRIBUTES",
+        "OTEL_METRICS_EXPORTER",
+        "OTEL_LOGS_EXPORTER",
+        "ENABLE_BETA_TRACING_DETAILED",
+        "OTEL_METRICS_INCLUDE_ACCOUNT_UUID",
+        "BETA_TRACING_ENDPOINT",
     ):
         env.pop(_k, None)
     if extra_env:
@@ -494,7 +499,17 @@ _OTEL_NONSECRET_VARS = (
     "CLAUDE_CODE_ENABLE_TELEMETRY=1",
     "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1",
     "OTEL_TRACES_EXPORTER=otlp",
-    "OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf",
+    # gRPC for the normal stream: the beta detailed exporter is HTTP-only, so normal
+    # takes gRPC and beta takes HTTP — the arrangement proven to land in Langfuse.
+    "OTEL_EXPORTER_OTLP_PROTOCOL=grpc",
+    # Metrics + detailed-tracing signals (issue #88): metrics carry token-by-type/
+    # skill/agent + cost_usd, detailed tracing adds response.model_output /
+    # system_reminders. Logs export is made explicit (not inherited). account_uuid
+    # is forced off for metrics — PII rides every datapoint otherwise.
+    "OTEL_METRICS_EXPORTER=otlp",
+    "OTEL_LOGS_EXPORTER=otlp",
+    "ENABLE_BETA_TRACING_DETAILED=1",
+    "OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false",
 )
 
 
@@ -556,6 +571,31 @@ def test_agent_launch_never_forwards_otel_secrets(hub: Path, tmp_path: Path) -> 
     assert new_window, "expected a new-window invocation"
     for secret in (secret_endpoint, secret_headers):
         assert secret not in new_window[0], "secret must never be on the command line"
+
+
+def test_agent_launch_never_forwards_beta_tracing_endpoint(hub: Path, tmp_path: Path) -> None:
+    # BETA_TRACING_ENDPOINT is the detailed-tracing target (a secret-ish off-box
+    # destination), and — per the probe footgun — it MUST point at a different
+    # port than the normal OTLP endpoint or it silently kills all trace+log export.
+    # Like the OTLP endpoint/headers, it is operator-provided via inherited env and
+    # must never land on the command line (ps-visible). The enabling flag
+    # (ENABLE_BETA_TRACING_DETAILED=1) is wired; the target is not.
+    beta_endpoint = "https://beta.example.invalid:4319"
+    proc, log = _run_new(
+        hub,
+        tmp_path,
+        "8",
+        "some-slug",
+        "--no-code",
+        extra_env={"AI_TOOLKIT_OTEL": "1", "BETA_TRACING_ENDPOINT": beta_endpoint},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    assert "ENABLE_BETA_TRACING_DETAILED=1" in new_window[0], "detailed flag must be wired"
+    assert beta_endpoint not in new_window[0], "BETA endpoint must never be on the command line"
+    assert "BETA_TRACING_ENDPOINT=" not in new_window[0], "BETA endpoint var must not be wired"
 
 
 def test_manual_fallback_advice_never_prints_otel_secrets(hub: Path, tmp_path: Path) -> None:

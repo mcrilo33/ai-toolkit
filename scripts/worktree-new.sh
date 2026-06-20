@@ -281,16 +281,35 @@ fi
 # trace env so the interactive claude streams ONE nested trace per spoke, grouped
 # by the spoke_run_id minted above (carried as an OTEL_RESOURCE_ATTRIBUTES key, so
 # it tags every span/sub-agent/tool of the run). Only NON-SECRET vars are wired
-# here — the enabling flags, the otlp exporter + http/protobuf protocol, and the
-# spoke identity. The connection TARGET (OTEL_EXPORTER_OTLP_ENDPOINT and the
+# here — the enabling flags, the otlp exporter + gRPC protocol, and the spoke
+# identity. The connection TARGET (OTEL_EXPORTER_OTLP_ENDPOINT and the
 # auth-bearing OTEL_EXPORTER_OTLP_HEADERS) is operator-provided through the
 # environment claude inherits; it is deliberately NOT placed on the command line
 # (which is visible in `ps`/tmux) nor printed in the manual-fallback advice.
+#
+# Beyond traces, the same gate lights up two probe-proven signals (issue #88):
+#   - METRICS (OTEL_METRICS_EXPORTER) — token-by-type/skill/agent + cost_usd; they
+#     flush reliably and carry no content. Langfuse is NOT a metrics store, so the
+#     operator routes them to a metrics sink (Prometheus/console) — see
+#     dashboard/langfuse/otelcol.yaml. account_uuid is forced OFF for metrics
+#     (OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false) since PII rides every datapoint.
+#   - DETAILED TRACING (ENABLE_BETA_TRACING_DETAILED) — adds response.model_output
+#     and system_reminders span attrs. Its destination, BETA_TRACING_ENDPOINT, is
+#     operator env (like the OTLP target — kept off the command line). FOOTGUN: it
+#     MUST hit a different host:port than the normal OTLP endpoint, or it silently
+#     kills ALL trace+log export (metrics still flow).
+# The normal stream exports over gRPC (OTEL_EXPORTER_OTLP_PROTOCOL=grpc): the beta
+# detailed exporter is HTTP-only, so normal takes gRPC and beta takes HTTP — the
+# arrangement proven to land response.model_output end-to-end in Langfuse (final
+# verification pending on a live interactive spoke, free of the `-p` flush confound
+# the probe ran under). OTEL_LOGS_EXPORTER is made explicit (not left to
+# inheritance) so the logs signal — the message bridge's source — flows whenever
+# the gate is on.
 OTEL_PREFIX=""
 if [ "${AI_TOOLKIT_OTEL:-}" = "1" ]; then
   # NB: the trailing space is load-bearing — it separates the prefix from the
   # WT_SPOKE pin that AGENT_CMD appends immediately after it.
-  OTEL_PREFIX="CLAUDE_CODE_ENABLE_TELEMETRY=1 CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 OTEL_TRACES_EXPORTER=otlp OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf OTEL_RESOURCE_ATTRIBUTES=$(printf '%q' "spoke_run_id=${SPOKE_RUN_ID}") "
+  OTEL_PREFIX="CLAUDE_CODE_ENABLE_TELEMETRY=1 CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 OTEL_TRACES_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp ENABLE_BETA_TRACING_DETAILED=1 OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false OTEL_EXPORTER_OTLP_PROTOCOL=grpc OTEL_RESOURCE_ATTRIBUTES=$(printf '%q' "spoke_run_id=${SPOKE_RUN_ID}") "
 fi
 AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(printf '%q' "${WT_AGENT_EFFORT:-max}") claude --model $(printf '%q' "${WT_AGENT_MODEL:-opus}")"
 # Best-effort in-process budget cap for unattended spokes. A caller may set
