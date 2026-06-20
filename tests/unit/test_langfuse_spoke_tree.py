@@ -38,8 +38,10 @@ from telemetry.langfuse_spoke_tree import (
     root_id_for,
     scan_transcripts,
     trace_id_for,
+    transcript_scan_root,
 )
 from telemetry.request_body import ContextDelta
+from telemetry.session_parser import project_dir_for_worktree
 
 SPOKE = "feature/22-demo+1700000000"
 
@@ -621,6 +623,52 @@ class TestScanTranscripts:
         _write_transcript(tmp_path, [_tool_use("tu-1", "Read", {"file_path": "/a"})])
 
         assert scan_transcripts(tmp_path, set()) == {}
+
+
+class TestTranscriptScanRoot:
+    """Issue #98: scope the transcript scan to the spoke's own CC project dir.
+
+    The default rglobbed EVERY session under ~/.claude/projects on each land. Matching is by
+    globally-unique tool_use_id so it never cross-attached (unlike #92's reasoning bug), but
+    scoping it to the worktree's project dir avoids the all-projects rglob. Falls back to the
+    full root when that dir is absent (a standalone run from a non-worktree cwd).
+    """
+
+    def _seed(self, tmp_path: Path) -> tuple[Path, Path]:
+        projects = tmp_path / "projects"
+        worktree = tmp_path / "Repos" / "ai-toolkit-cycle-demo"
+        worktree.mkdir(parents=True)
+        wt_proj = project_dir_for_worktree(worktree, projects)
+        wt_proj.mkdir(parents=True)
+        (wt_proj / "s.jsonl").write_text(
+            json.dumps(_tool_use("tu-wt", "Read", {"file_path": "/a"})) + "\n", encoding="utf-8"
+        )
+        sibling = projects / "-hub-driver"
+        sibling.mkdir(parents=True)
+        (sibling / "s.jsonl").write_text(
+            json.dumps(_tool_use("tu-hub", "Read", {"file_path": "/b"})) + "\n", encoding="utf-8"
+        )
+        return projects, worktree
+
+    def test_returns_the_worktree_project_dir_when_present(self, tmp_path: Path) -> None:
+        projects, worktree = self._seed(tmp_path)
+        assert transcript_scan_root(projects, worktree) == project_dir_for_worktree(
+            worktree, projects
+        )
+
+    def test_scoped_scan_excludes_sibling_project_tool_ids(self, tmp_path: Path) -> None:
+        projects, worktree = self._seed(tmp_path)
+        root = transcript_scan_root(projects, worktree)
+
+        found = scan_transcripts(root, {"tu-wt", "tu-hub"})
+
+        assert set(found) == {"tu-wt"}
+
+    def test_falls_back_to_full_root_when_project_dir_absent(self, tmp_path: Path) -> None:
+        projects, _ = self._seed(tmp_path)
+        absent = tmp_path / "Repos" / "never-ran-here"
+
+        assert transcript_scan_root(projects, absent) == projects
 
 
 class TestToolContentFilledIntoCreateBody:

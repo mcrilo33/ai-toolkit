@@ -108,6 +108,7 @@ from telemetry.request_body import (
     parse_request_body,
     snapshot_items_from_path,
 )
+from telemetry.session_parser import project_dir_for_worktree
 
 logger = logging.getLogger("langfuse_spoke_tree")
 
@@ -677,6 +678,27 @@ def scan_transcripts(root: Path, wanted: set[str]) -> dict[str, ToolContent]:
     }
 
 
+def transcript_scan_root(projects_root: Path, worktree: Path) -> Path:
+    """Scope the transcript scan to the spoke's own Claude Code project dir when present.
+
+    The default scan rglobbed EVERY session under ``projects_root`` on each land. Matching is
+    by globally-unique ``tool_use_id``, so it never cross-attached another spoke's content
+    (unlike #92's reasoning backfill) — but scoping to the worktree's project dir
+    (:func:`telemetry.session_parser.project_dir_for_worktree`) avoids the all-projects rglob.
+    Falls back to the full root when that dir is absent (a standalone run from a non-worktree
+    cwd), preserving the prior behavior.
+
+    Args:
+        projects_root: The Claude Code projects root (``--projects``).
+        worktree: The spoke's worktree dir (``--root``).
+
+    Returns:
+        The worktree's project dir when it exists, else ``projects_root``.
+    """
+    project_dir = project_dir_for_worktree(worktree, projects_root)
+    return project_dir if project_dir.is_dir() else projects_root
+
+
 def filled_tool_spans(traces: list[TraceObservations], tool_content: dict[str, ToolContent]) -> int:
     """Count the tool spans whose create body would gain transcript content (see summary)."""
     return sum(
@@ -1242,7 +1264,8 @@ def main(argv: list[str] | None = None) -> int:
     get, post = make_get(host, auth), make_post(host, auth)
 
     traces = fetch_session(args.spoke_run_id, get)
-    tool_content = scan_transcripts(args.projects, _tool_span_ids(traces))
+    scan_root = transcript_scan_root(args.projects, args.root.resolve())
+    tool_content = scan_transcripts(scan_root, _tool_span_ids(traces))
     batch = build_batch(traces, args.spoke_run_id, tool_content)
 
     counter = make_counter(endpoint=args.endpoint, api_key=args.api_key, model=args.model)

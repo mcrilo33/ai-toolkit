@@ -14,22 +14,30 @@ onto reasoning nodes.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
+from telemetry import langfuse_backfill
 from telemetry.causal_tree import build_causal_forest
 from telemetry.langfuse_backfill import (
+    _gather_thinking,
     backfill_events,
     backfill_node_id,
     backfill_root_id,
     backfill_trace_id,
     forest_to_events,
     is_native_trace,
+    main,
+    reasoning_only_events,
     session_is_covered,
 )
+from telemetry.session_parser import project_dir_for_worktree
 
 SPOKE = "feature/92-demo+1700000000"
 
@@ -182,6 +190,94 @@ def _stub_get(traces: list[dict]) -> Any:
         return {"data": traces, "meta": {"totalPages": 1}}
 
     return get
+
+
+def _thinking_record(uuid: str, thinking: str) -> dict:
+    """One assistant transcript record carrying an extended-thinking block."""
+    return {
+        "type": "assistant",
+        "sessionId": "sess",
+        "timestamp": "2026-06-15T12:00:01.000Z",
+        "uuid": uuid,
+        "message": {
+            "role": "assistant",
+            "model": "claude-opus-4-8",
+            "content": [{"type": "thinking", "thinking": thinking}],
+        },
+    }
+
+
+def _write_session(project_dir: Path, name: str, records: list[dict]) -> None:
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / name).write_text(
+        "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8"
+    )
+
+
+class TestGatherThinkingScoping:
+    """Issue #98 fix (a): with a project_dir, thinking is read from ONLY that dir."""
+
+    def test_project_dir_reads_only_its_own_sessions(self, tmp_path: Path) -> None:
+        projects = tmp_path / "projects"
+        wt = projects / "-wt"
+        hub = projects / "-hub"
+        _write_session(wt, "s1.jsonl", [_thinking_record("w1", "WT_THINK")])
+        _write_session(hub, "s1.jsonl", [_thinking_record("h1", "HUB_THINK")])
+
+        thinking = _gather_thinking(None, projects, project_dir=wt)
+
+        assert set(thinking.values()) == {"WT_THINK"}
+
+    def test_without_project_dir_scans_the_whole_root(self, tmp_path: Path) -> None:
+        projects = tmp_path / "projects"
+        _write_session(projects / "-wt", "s1.jsonl", [_thinking_record("w1", "WT_THINK")])
+        _write_session(projects / "-hub", "s1.jsonl", [_thinking_record("h1", "HUB_THINK")])
+
+        thinking = _gather_thinking(None, projects, project_dir=None)
+
+        assert set(thinking.values()) == {"WT_THINK", "HUB_THINK"}
+
+
+class TestReasoningOnlyEmptyThinking:
+    """Issue #98 fix (b): no thinking bodies -> zero reasoning observations (no placeholders)."""
+
+    def test_empty_thinking_emits_no_events(self) -> None:
+        assert reasoning_only_events(_forest(), SPOKE, {}) == []
+
+
+class TestMainScopesToTheWorktree:
+    """Issue #98 fix (a), end-to-end: --worktree confines the backfill to the spoke's own
+    project dir, so a sibling/hub session's reasoning never bleeds in (the confirmed bug).
+    """
+
+    def test_only_the_worktree_thinking_is_ingested(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        projects = tmp_path / "projects"
+        worktree = tmp_path / "Repos" / "ai-toolkit-cycle-demo"
+        worktree.mkdir(parents=True)
+        wt_proj = project_dir_for_worktree(worktree, projects)
+        _write_session(wt_proj, "s1.jsonl", [_thinking_record("w1", "WT_THINK")])
+        _write_session(projects / "-hub-driver", "s1.jsonl", [_thinking_record("h1", "HUB_THINK")])
+
+        posted: list[dict] = []
+        monkeypatch.setenv("LANGFUSE_BASIC_AUTH", "Basic x")
+        monkeypatch.setattr(langfuse_backfill, "make_get", lambda *a, **k: _stub_get([]))
+        monkeypatch.setattr(langfuse_backfill, "make_post", lambda *a, **k: None)
+        # Covered → reasoning-only path, sourced straight from the (scoped) thinking map.
+        monkeypatch.setattr(langfuse_backfill, "session_is_covered", lambda *a, **k: True)
+        monkeypatch.setattr(
+            langfuse_backfill, "post_in_chunks", lambda events, _post: posted.extend(events)
+        )
+
+        rc = main(
+            ["spoke-id", "--worktree", str(worktree), "--projects", str(projects), "--thinking"]
+        )
+
+        assert rc == 0
+        outputs = {e["body"].get("output") for e in posted if "body" in e}
+        assert "WT_THINK" in outputs
+        assert "HUB_THINK" not in outputs
 
 
 class TestCoverageDetection:

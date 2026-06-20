@@ -23,8 +23,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 from telemetry.session_parser import (
     ParsedSession,
     _walk_transcript,
+    parse_project_dir,
     parse_projects_dir,
     parse_session_file,
+    project_dir_for_worktree,
     thinking_by_turn,
 )
 from telemetry.spans import Span
@@ -1460,3 +1462,99 @@ class TestUsageDedupByMessageId:
         main = [e for e in parse_session_file(path).usage_events if e.source == "main"]
 
         assert len(main) == 2
+
+
+class TestProjectDirForWorktree:
+    """Issue #98: map a spoke's worktree to the single CC project dir holding its sessions.
+
+    Claude Code names ``~/.claude/projects/<encoded>`` by replacing every non-alphanumeric
+    character of the worktree's *resolved* absolute path with ``-`` (verified against every
+    local project dir). Scoping the #92 backfill to this dir is what stops it ingesting other
+    sessions' reasoning/content.
+    """
+
+    def test_encodes_every_non_alphanumeric_char_to_dash(self) -> None:
+        root = Path("/tmp/projects")
+        out = project_dir_for_worktree(Path("/Users/x/Repos/ai-toolkit-cycle-demo"), root)
+        assert out == root / "-Users-x-Repos-ai-toolkit-cycle-demo"
+
+    def test_resolves_symlinks_before_encoding(self, tmp_path: Path) -> None:
+        # CC encodes the realpath (e.g. /tmp -> /private/tmp), so a symlinked worktree must
+        # map to the SAME project dir as its target — else the scoped scan misses everything.
+        real = tmp_path / "real-wt"
+        real.mkdir()
+        link = tmp_path / "link-wt"
+        link.symlink_to(real)
+        root = tmp_path / "projects"
+        assert project_dir_for_worktree(link, root) == project_dir_for_worktree(real, root)
+
+
+class TestParseProjectDir:
+    """Issue #98: parse only ONE project dir's sessions (one level), resumes included."""
+
+    def test_reads_sessions_directly_under_the_project_dir(self, tmp_path: Path) -> None:
+        proj = tmp_path / "-Users-x-Repos-wt"
+        proj.mkdir()
+        (proj / "s1.jsonl").write_text(
+            json.dumps(_assistant_usage("m1", "u1", "2026-06-16T21:32:41Z", output_tokens=111)),
+            encoding="utf-8",
+        )
+
+        merged = parse_project_dir(proj)
+
+        main = [e for e in merged.usage_events if e.source == "main"]
+        assert [e.output_tokens for e in main] == [111]
+
+    def test_merges_multiple_resume_sessions(self, tmp_path: Path) -> None:
+        proj = tmp_path / "-Users-x-Repos-wt"
+        proj.mkdir()
+        (proj / "s1.jsonl").write_text(
+            json.dumps(_assistant_usage("m1", "u1", "2026-06-16T21:32:41Z", output_tokens=111)),
+            encoding="utf-8",
+        )
+        (proj / "s2.jsonl").write_text(
+            json.dumps(_assistant_usage("m2", "u2", "2026-06-16T21:33:41Z", output_tokens=222)),
+            encoding="utf-8",
+        )
+
+        merged = parse_project_dir(proj)
+
+        tokens = {e.output_tokens for e in merged.usage_events if e.source == "main"}
+        assert {111, 222} <= tokens
+
+    def test_does_not_treat_subagent_file_as_a_top_level_session(self, tmp_path: Path) -> None:
+        proj = tmp_path / "-Users-x-Repos-wt"
+        sub = proj / "s1" / "subagents"
+        sub.mkdir(parents=True)
+        (proj / "s1.jsonl").write_text(
+            json.dumps(_assistant_usage("m1", "u1", "2026-06-16T21:32:41Z", output_tokens=111)),
+            encoding="utf-8",
+        )
+        (sub / "agent-x.jsonl").write_text(
+            json.dumps(_assistant_usage("m9", "u9", "2026-06-16T21:34:41Z", output_tokens=999)),
+            encoding="utf-8",
+        )
+
+        merged = parse_project_dir(proj)
+
+        # The subagent file is never re-parsed as a top-level (main) session.
+        tokens = {e.output_tokens for e in merged.usage_events if e.source == "main"}
+        assert 999 not in tokens
+
+
+class TestSignatureOnlyThinkingYieldsNothing:
+    """Issue #98 fix (b): signature-only / empty extended thinking -> no reasoning body."""
+
+    def test_signature_only_thinking_is_absent_from_the_map(self, tmp_path: Path) -> None:
+        rec = _assistant_thinking("a1", "")
+        rec["message"]["content"][0]["signature"] = "SIG=="
+        path = tmp_path / "sig.jsonl"
+        path.write_text(json.dumps(rec), encoding="utf-8")
+
+        assert thinking_by_turn(path) == {}
+
+    def test_whitespace_only_thinking_is_absent_from_the_map(self, tmp_path: Path) -> None:
+        path = tmp_path / "ws.jsonl"
+        path.write_text(json.dumps(_assistant_thinking("a1", "   \n")), encoding="utf-8")
+
+        assert thinking_by_turn(path) == {}

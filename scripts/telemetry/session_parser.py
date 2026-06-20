@@ -88,6 +88,8 @@ _DEFERRED_TOOLS = "deferred_tools_delta"
 # ~4 characters per token — a rough size estimate so each loaded item is drillable to
 # its per-item context cost without a token-counting API.
 _CHARS_PER_TOKEN = 4
+# Default root holding Claude Code session transcripts (``project_dir_for_worktree``).
+_DEFAULT_PROJECTS_ROOT = Path("~/.claude/projects").expanduser()
 
 
 @dataclass(slots=True)
@@ -192,15 +194,15 @@ def parse_session_file(path: Path) -> ParsedSession:
     return parsed
 
 
-def parse_projects_dir(root: Path) -> ParsedSession:
-    """Parse every ``<slug>/<session>.jsonl`` under a projects root and merge.
+def _merge_sessions(paths: list[Path]) -> ParsedSession:
+    """Parse each top-level session transcript and merge into one :class:`ParsedSession`.
 
-    Subagent transcripts live one level deeper (``<session>/subagents/``), so the
-    ``*/*.jsonl`` glob never picks them up as top-level sessions — they are only
-    reached via the parent agent span's walk.
+    Subagent transcripts (``<session>/subagents/``) are skipped — they are reached only via
+    the parent agent span's walk, never parsed as top-level sessions (which would double-count
+    and mis-kind them).
     """
     merged = ParsedSession()
-    for path in sorted(Path(root).glob("*/*.jsonl")):
+    for path in paths:
         if "subagents" in path.parts:
             continue
         parsed = parse_session_file(path)
@@ -210,6 +212,54 @@ def parse_projects_dir(root: Path) -> ParsedSession:
         merged.reasoning_refs.extend(parsed.reasoning_refs)
         merged.tool_parents.update(parsed.tool_parents)
     return merged
+
+
+def parse_projects_dir(root: Path) -> ParsedSession:
+    """Parse every ``<slug>/<session>.jsonl`` under a projects root and merge.
+
+    Subagent transcripts live one level deeper (``<session>/subagents/``), so the
+    ``*/*.jsonl`` glob never picks them up as top-level sessions — they are only
+    reached via the parent agent span's walk.
+    """
+    return _merge_sessions(sorted(Path(root).glob("*/*.jsonl")))
+
+
+def parse_project_dir(project_dir: Path) -> ParsedSession:
+    """Parse only the sessions directly under ONE Claude Code project dir and merge.
+
+    A project dir is ``~/.claude/projects/<encoded-worktree-path>`` (see
+    :func:`project_dir_for_worktree`); its sessions — the spoke's original plus every resume —
+    sit one level in as ``<session>.jsonl``, so the glob is ``*.jsonl`` (one shallower than
+    :func:`parse_projects_dir`'s ``*/*.jsonl``). Scoping the #92 transcript backfill here is
+    what confines it to the spoke's own sessions instead of every session on the machine.
+
+    Args:
+        project_dir: One Claude Code project dir holding ``<session>.jsonl`` transcripts.
+
+    Returns:
+        The merged :class:`ParsedSession` for that dir's sessions (resumes included).
+    """
+    return _merge_sessions(sorted(Path(project_dir).glob("*.jsonl")))
+
+
+def project_dir_for_worktree(worktree: Path, projects_root: Path = _DEFAULT_PROJECTS_ROOT) -> Path:
+    """Return the Claude Code project dir holding a worktree's session transcripts.
+
+    Claude Code names ``~/.claude/projects/<encoded>`` after the worktree's *resolved*
+    absolute path, replacing every non-alphanumeric character with ``-`` (verified against
+    every local project dir; the resolve matters because CC stores the realpath, e.g.
+    ``/tmp`` → ``/private/tmp``). Scoping the transcript backfill (Issues #92/#98) to this
+    dir is what stops it ingesting unrelated sessions' reasoning and content.
+
+    Args:
+        worktree: The spoke's worktree directory (any path; resolved before encoding).
+        projects_root: The Claude Code projects root (default ``~/.claude/projects``).
+
+    Returns:
+        The project dir under ``projects_root`` for this worktree's sessions.
+    """
+    encoded = re.sub(r"[^A-Za-z0-9]", "-", str(Path(worktree).resolve()))
+    return projects_root / encoded
 
 
 def _consume_tool_use(
