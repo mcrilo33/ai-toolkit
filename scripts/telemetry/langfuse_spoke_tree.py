@@ -25,9 +25,16 @@ Re-parenting rules for each source observation:
   ``tool_use_id`` matches the satellite's; or the synthetic root when there is no id or no
   match. A satellite is a gate hook (name ends ``.sh`` or
   ``metadata.attributes.workflow.kind == hook``) or a #93 tool-scoped audit event
-  (``tool_decision``/``tool_result``, minted on the per-spoke audit trace with its
-  ``tool_use_id`` in flat metadata). (Langfuse nests OTel span attributes under
-  ``metadata["attributes"]``; the audit events carry their id at the metadata top level.)
+  (``tool_result``, minted on the per-spoke audit trace with its ``tool_use_id`` in flat
+  metadata). (Langfuse nests OTel span attributes under ``metadata["attributes"]``; the audit
+  events carry their id at the metadata top level.)
+
+Three native 1:1 sub-spans do NOT nest — they FOLD into their tool's metadata and their nodes
+are dropped (#100, :func:`_fold_tool_subspans`): ``claude_code.tool.execution`` ->
+``execution_ms``/``success``/``error``, ``claude_code.tool.blocked_on_user`` ->
+``blocked_on_user_ms``/``decision``/``decision_source``, and the ``tool_decision:<d>`` audit
+event -> ``decision``/``decision_source``. An unmatched ``tool_decision`` (no tool) keeps its
+node and collapses to the root.
 
 All ids derive from the spoke run id and the source ``(trace_id, observation_id)`` pair,
 so a rerun overwrites the same trace/observations instead of appending. This trace
@@ -79,6 +86,7 @@ import os
 import re
 import sys
 import urllib.parse
+from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
@@ -144,10 +152,22 @@ _TOOL_USE_ID_KEYS = ("tool_use_id", "gen_ai.tool.call.id")
 # Name prefixes of the audit observations that are scoped to a single tool call and carry its
 # ``tool_use_id`` (``tool_decision:<decision>``, ``tool_result`` from #93;
 # ``hook_execution_complete:<PreToolUse|PostToolUse>`` from hook-event-nest, whose id the
-# bridge resolves by event.sequence). Like gate hooks, they nest under the tool sharing that
-# id rather than at the synthetic root. A ``hook_execution_complete`` with no tool (e.g.
-# ``:SessionStart``) carries no id and so collapses to the root, unchanged.
+# bridge resolves by event.sequence). Like gate hooks, they join the tool sharing that id
+# rather than the synthetic root. ``tool_result`` / ``hook_execution_complete`` nest as nodes;
+# ``tool_decision`` instead FOLDS into the tool's metadata (#100, see _is_fold_subspan) when
+# matched, and only an UNMATCHED ``tool_decision`` (or a ``hook_execution_complete`` with no
+# tool, e.g. ``:SessionStart``) collapses to the root, unchanged.
 _TOOL_AUDIT_EVENT_PREFIXES = ("tool_decision", "tool_result", "hook_execution_complete")
+
+# The three native 1:1 sub-spans of a tool call that FOLD into their ``tool:`` node's metadata
+# (#100 part 2) instead of nesting as child nodes: the execution span (-> ``execution_ms`` /
+# ``success`` / ``error``), the human-block span (-> ``blocked_on_user_ms`` / ``decision`` /
+# ``decision_source``), and the #93 ``tool_decision:<d>`` audit event (-> ``decision`` /
+# ``decision_source``). Gate hooks, ``tool_result``, and ``hook_execution_complete`` are NOT
+# folded — they stay nested under their tool.
+_FOLD_EXECUTION_NAME = "claude_code.tool.execution"
+_FOLD_BLOCKED_NAME = "claude_code.tool.blocked_on_user"
+_FOLD_DECISION_PREFIX = "tool_decision"
 
 # Tool content (e.g. a large file Read) can be huge; cap the serialized text past this.
 _MAX_CONTENT_CHARS = 20_000
@@ -302,12 +322,133 @@ def _joins_under_tool(observation: Observation) -> bool:
     return _is_hook(observation) or _is_tool_audit_event(observation)
 
 
+def _is_fold_subspan(observation: Observation) -> bool:
+    """Whether an observation is one of the three 1:1 sub-spans that fold into their tool.
+
+    The execution / blocked-on-user spans and the ``tool_decision:<d>`` audit event fold into
+    the ``tool:`` node's metadata (:func:`_fold_attrs`); they are never re-parent targets, so
+    they are also skipped as tool-index owners in :func:`_build_tool_index`.
+    """
+    name = observation.get("name") or ""
+    return name in (_FOLD_EXECUTION_NAME, _FOLD_BLOCKED_NAME) or name.startswith(
+        _FOLD_DECISION_PREFIX
+    )
+
+
+def _duration_ms(observation: Observation) -> int | None:
+    """Return a span's wall-clock duration in ms from its ISO start/end, or None."""
+    start, end = observation.get("startTime"), observation.get("endTime")
+    if not start or not end:
+        return None
+    try:
+        delta = datetime.fromisoformat(end) - datetime.fromisoformat(start)
+    except ValueError:
+        return None
+    return int(delta.total_seconds() * 1000)
+
+
+def _attr(observation: Observation, *keys: str) -> object | None:
+    """Read the first present key from the span attributes, then flat metadata."""
+    metadata = observation.get("metadata") or {}
+    attributes = metadata.get("attributes") or {}
+    for key in keys:
+        value = attributes.get(key)
+        if value is None:
+            value = metadata.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _fold_attrs(observation: Observation) -> dict[str, Any]:
+    """Return the metadata a fold sub-span contributes to its tool node (see :func:`_is_fold_subspan`)."""
+    name = observation.get("name") or ""
+    out: dict[str, Any] = {}
+    if name == _FOLD_EXECUTION_NAME:
+        ms = _duration_ms(observation)
+        if ms is not None:
+            out["execution_ms"] = ms
+        success = _attr(observation, "success")
+        if success is not None:
+            out["success"] = bool(success)
+        error = _attr(observation, "error")
+        if error:
+            out["error"] = error
+    elif name == _FOLD_BLOCKED_NAME:
+        ms = _duration_ms(observation)
+        if ms is not None:
+            out["blocked_on_user_ms"] = ms
+        decision = _attr(observation, "decision")
+        if decision:
+            out["decision"] = decision
+        source = _attr(observation, "decision_source", "source")
+        if source:
+            out["decision_source"] = source
+    elif name.startswith(_FOLD_DECISION_PREFIX):
+        decision = name.split(":", 1)[1] if ":" in name else _attr(observation, "decision")
+        if decision:
+            out["decision"] = decision
+        source = _attr(observation, "decision_source", "source")
+        if source:
+            out["decision_source"] = source
+    return out
+
+
+def _fold_owner(
+    observation: Observation, orig_trace_id: str, tool_index: dict[str, str]
+) -> str | None:
+    """Return the copy id of the tool a fold sub-span belongs to, or None.
+
+    The audit ``tool_decision`` joins by ``tool_use_id``; the native execution / blocked spans
+    are children of their tool, so they also fall back to the copy of their ``parentObservationId``.
+    """
+    tuid = _tool_use_id(observation)
+    if tuid and tuid in tool_index:
+        return tool_index[tuid]
+    parent = observation.get("parentObservationId")
+    return _copy_id(orig_trace_id, parent) if parent else None
+
+
+def _fold_tool_subspans(
+    copies: list[IngestEvent], traces: list[TraceObservations], tool_index: dict[str, str]
+) -> list[IngestEvent]:
+    """Fold the three 1:1 tool sub-spans into their tool's metadata, dropping their nodes (#100).
+
+    Each execution / blocked-on-user / ``tool_decision`` sub-span's fields are merged onto the
+    owning ``tool:`` node's metadata and the sub-span copy is removed. A sub-span whose tool is
+    absent (an unmatched audit event) is left as-is — it keeps its node and collapses to the root.
+
+    Args:
+        copies: The source observation copies; owner tool bodies are mutated in place.
+        traces: The source traces (to walk every sub-span and resolve its owner).
+        tool_index: Tool-call-id to tool-copy-id map from :func:`_build_tool_index`.
+
+    Returns:
+        The copies with the folded sub-spans removed.
+    """
+    by_id = {event["body"]["id"]: event for event in copies}
+    folded: set[str] = set()
+    for orig_trace_id, observations in traces:
+        for observation in observations:
+            if not _is_fold_subspan(observation):
+                continue
+            owner = _fold_owner(observation, orig_trace_id, tool_index)
+            if owner is None or owner not in by_id:
+                continue  # no tool to fold into — leave the sub-span as a node
+            attrs = _fold_attrs(observation)
+            if attrs:
+                by_id[owner]["body"].setdefault("metadata", {}).update(attrs)
+            folded.add(_copy_id(orig_trace_id, observation["id"]))
+    return [event for event in copies if event["body"]["id"] not in folded]
+
+
 def _build_tool_index(traces: list[TraceObservations]) -> dict[str, str]:
     """Map each tool-call id to the copy id of the tool observation that owns it.
 
-    A tool's satellites (gate hooks and tool-scoped audit events) are skipped so none indexes
-    its own ``tool_use_id``; the surviving owner is the tool observation, which is the
-    re-parent target for the matching satellites.
+    A tool's satellites (gate hooks, tool-scoped audit events, and the three folding sub-spans)
+    are skipped so none indexes its own ``tool_use_id``; the surviving owner is the tool
+    observation, which is the re-parent target for the satellites and the fold target for the
+    sub-spans.
 
     Args:
         traces: The source traces paired with their observations.
@@ -318,7 +459,7 @@ def _build_tool_index(traces: list[TraceObservations]) -> dict[str, str]:
     index: dict[str, str] = {}
     for orig_trace_id, observations in traces:
         for observation in observations:
-            if _joins_under_tool(observation):
+            if _joins_under_tool(observation) or _is_fold_subspan(observation):
                 continue
             tuid = _tool_use_id(observation)
             if tuid:
@@ -787,6 +928,7 @@ def build_batch(
                     tool_content=tool_content,
                 )
             )
+    copies = _fold_tool_subspans(copies, traces, tool_index)
     step_events = _apply_step_grouping(
         copies, traces, tool_content, root_id=root_id, spoke_run_id=spoke_run_id, trace_id=trace_id
     )
