@@ -114,6 +114,20 @@ if [ -z "$NO_CODE" ] && command -v code >/dev/null 2>&1; then
     || wt_warn "couldn't remove the folder from VS Code — right-click it → Remove Folder from Workspace."
 fi
 
+# --- revoke the /quick hub-guard escape hatch (issue #89) --------------------
+# worktree-quick.sh drops a `hub-guard-allow` marker in the common git-dir to let
+# the hub session commit into the worktree; teardown is its cleanup, so clear it
+# here. A no-op for a normal spoke (the marker only exists for a /quick lane).
+# Revoke BEFORE the removal below: a failed `git worktree remove` aborts via
+# wt_die, and a marker left behind would silently disable hub-guard on `main`.
+# Warn-only — a stray marker must never block teardown.
+COMMON_GIT_DIR="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir 2>/dev/null || true)"
+if [ -n "$COMMON_GIT_DIR" ] && [ -e "$COMMON_GIT_DIR/hub-guard-allow" ]; then
+  rm -f "$COMMON_GIT_DIR/hub-guard-allow" \
+    && echo "  revoked hub-guard bypass (hub-guard-allow)." \
+    || wt_warn "couldn't remove hub-guard-allow — delete it by hand: rm \"$COMMON_GIT_DIR/hub-guard-allow\""
+fi
+
 echo "→ removing worktree: $WT_DIR"
 if ! git worktree remove $FORCE "$WT_DIR"; then
   if [ -z "$FORCE" ]; then
@@ -162,18 +176,6 @@ prune_branch() {
   fi
 }
 prune_branch
-
-# --- revoke the /quick hub-guard escape hatch (issue #89) --------------------
-# worktree-quick.sh drops a `hub-guard-allow` marker in the common git-dir to let
-# the hub session commit into the worktree; teardown is its cleanup, so clear it
-# here. A no-op for a normal spoke (the marker only exists for a /quick lane).
-# Warn-only — a stray marker must never block teardown.
-COMMON_GIT_DIR="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir 2>/dev/null || true)"
-if [ -n "$COMMON_GIT_DIR" ] && [ -e "$COMMON_GIT_DIR/hub-guard-allow" ]; then
-  rm -f "$COMMON_GIT_DIR/hub-guard-allow" \
-    && echo "  revoked hub-guard bypass (hub-guard-allow)." \
-    || wt_warn "couldn't remove hub-guard-allow — delete it by hand: rm \"$COMMON_GIT_DIR/hub-guard-allow\""
-fi
 
 [ -n "$STANDING_INSIDE" ] && wt_warn "your shell is inside the removed worktree; run: cd \"$REPO_ROOT\""
 exit 0

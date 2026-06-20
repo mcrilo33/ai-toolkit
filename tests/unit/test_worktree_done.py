@@ -239,6 +239,23 @@ def test_teardown_clears_hub_guard_allow_marker(hub: Path, tmp_path: Path) -> No
     assert not marker.exists()
 
 
+def test_marker_revoked_even_when_removal_aborts(hub: Path, tmp_path: Path) -> None:
+    # The bypass marker disables hub-guard on `main` while present, so teardown
+    # must revoke it BEFORE the worktree removal — otherwise a removal that aborts
+    # (dirty tree, no --force) would strand the marker and silently leave the guard
+    # open. An untracked file makes `git worktree remove` refuse without --force.
+    wt = _make_spoke(hub, tmp_path, "quick/fix-typo", push=False, merge=True)
+    (wt / "scratch.txt").write_text("uncommitted\n")
+    marker = Path(_git(hub, "rev-parse", "--absolute-git-dir").strip()) / "hub-guard-allow"
+    marker.write_text("")
+
+    proc, _ = _run_done(hub, tmp_path, "fix-typo")
+
+    assert proc.returncode != 0, "removal should abort on a dirty worktree without --force"
+    assert wt.exists()  # worktree untouched
+    assert not marker.exists()  # ...but the bypass is revoked regardless
+
+
 def test_teardown_without_marker_is_a_noop(hub: Path, tmp_path: Path) -> None:
     # A normal (non-/quick) teardown has no marker to clear — it must not fail.
     _make_spoke(hub, tmp_path, "feature/3-plain", push=False, merge=True)
