@@ -1080,9 +1080,11 @@ def test_dispatch_batch_holds_back_inflight_scope_overlap(tmp_path: Path) -> Non
 
 
 # ── auto-land scoping: only this run's dispatches (issue #74, defect 4) ────────
-# auto_land must land only a ready/<issue> that THIS run dispatched (a dispatch epoch
-# was stamped), not a foreign ready/<issue> left by a parallel session — unless
-# AFK_LAND_FOREIGN opts in. The dispatched-set is per-window: arming clears stale epochs.
+# auto_land gates on the ready/<issue> marker (the readiness contract), not on which run
+# dispatched the spoke: a foreign ready/<issue> left by a parallel session is adopted and
+# landed by default (#95). AFK_LAND_FOREIGN=0 restores the dispatched-only isolation for
+# concurrent sessions (#74). A foreign spoke with NO ready/<issue> is still left alone —
+# _ready_at_tip filters it out upstream of the foreign check.
 
 
 def _land_recorder(tmp_path: Path) -> tuple[Path, Path]:
@@ -1094,8 +1096,41 @@ def _land_recorder(tmp_path: Path) -> tuple[Path, Path]:
     return stub, land_log
 
 
-def test_auto_land_skips_foreign_ready_spoke(spoke_repo: Path, tmp_path: Path) -> None:
+def test_auto_land_lands_foreign_ready_spoke_by_default(spoke_repo: Path, tmp_path: Path) -> None:
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    wt_land, land_log = _land_recorder(tmp_path)
+    statedir = tmp_path / "statedir"  # empty: no dispatch-5.epoch ⇒ foreign
+
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+    _call(expr, env={"WT_LAND": str(wt_land), "AFK_STATE_DIR": str(statedir)})
+
+    assert land_log.read_text().split() == ["5"], (
+        "a foreign ready spoke must be adopted and landed by default (the ready/N marker is "
+        "the contract, not which run dispatched it)"
+    )
+
+
+def test_auto_land_skips_foreign_ready_spoke_when_opted_out(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    wt_land, land_log = _land_recorder(tmp_path)
+    statedir = tmp_path / "statedir"  # empty: no dispatch-5.epoch ⇒ foreign
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(
+        expr,
+        env={"WT_LAND": str(wt_land), "AFK_STATE_DIR": str(statedir), "AFK_LAND_FOREIGN": "0"},
+    )
+
+    assert not land_log.exists() or land_log.read_text().strip() == "", (
+        "AFK_LAND_FOREIGN=0 restores the dispatched-only isolation: a foreign ready spoke "
+        "must not be auto-landed"
+    )
+
+
+def test_auto_land_skips_foreign_without_ready_marker(spoke_repo: Path, tmp_path: Path) -> None:
+    # No ready/5 tag at the tip: foreign and not ready ⇒ left alone even under the new default.
     wt_land, land_log = _land_recorder(tmp_path)
     statedir = tmp_path / "statedir"  # empty: no dispatch-5.epoch ⇒ foreign
     expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
@@ -1103,7 +1138,7 @@ def test_auto_land_skips_foreign_ready_spoke(spoke_repo: Path, tmp_path: Path) -
     _call(expr, env={"WT_LAND": str(wt_land), "AFK_STATE_DIR": str(statedir)})
 
     assert not land_log.exists() or land_log.read_text().strip() == "", (
-        "a foreign ready spoke (not dispatched by this run) must not be auto-landed"
+        "a foreign spoke with no ready/N marker must be left alone (the marker is required)"
     )
 
 
