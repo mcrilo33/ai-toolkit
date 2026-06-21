@@ -31,7 +31,7 @@ from telemetry.langfuse_spoke_tree import (
     _copy_id,
     _decomp_metadata,
     apply_llm_decomposition,
-    apply_request_effort,
+    apply_request_body_metadata,
     build_batch,
     build_loaded_context_events,
     build_score_events,
@@ -1852,7 +1852,7 @@ class TestRequestEffort:
         traces = [("tr", [gen])]
         batch = build_batch(traces, SPOKE)
 
-        count = apply_request_effort(batch, traces, bodies)
+        count = apply_request_body_metadata(batch, traces, bodies)
 
         assert count == 1
         assert self._meta(batch, "tr", "g1")["effort"] == "high"
@@ -1864,7 +1864,7 @@ class TestRequestEffort:
         traces = [("tr", [gen])]
         batch = build_batch(traces, SPOKE)
 
-        apply_request_effort(batch, traces, bodies)
+        apply_request_body_metadata(batch, traces, bodies)
 
         # ultra never lands on effort metadata nor as an effort:* tag.
         assert "effort" not in self._meta(batch, "tr", "g1")
@@ -1878,7 +1878,7 @@ class TestRequestEffort:
         traces = [("tr", [gen])]
         batch = build_batch(traces, SPOKE)
 
-        count = apply_request_effort(batch, traces, bodies)
+        count = apply_request_body_metadata(batch, traces, bodies)
 
         assert count == 0
         assert "effort" not in self._meta(batch, "tr", "g1")
@@ -1891,7 +1891,7 @@ class TestRequestEffort:
         traces = [("tr", [gen])]
         batch = build_batch(traces, SPOKE)
 
-        count = apply_request_effort(batch, traces, bodies)
+        count = apply_request_body_metadata(batch, traces, bodies)
 
         assert count == 0
         assert "effort" not in self._meta(batch, "tr", "g1")
@@ -1912,7 +1912,7 @@ class TestRequestEffort:
         traces = [("tr", [gen])]
         batch = build_batch(traces, SPOKE)
 
-        apply_request_effort(batch, traces, bodies)
+        apply_request_body_metadata(batch, traces, bodies)
 
         assert self._meta(batch, "tr", "g1")["cache_breakpoints"] == [
             {"location": "system", "index": 0}
@@ -1926,6 +1926,6 @@ class TestRequestEffort:
         traces = [("tr", [gen])]
         batch = build_batch(traces, SPOKE)
 
-        apply_request_effort(batch, traces, bodies)
+        apply_request_body_metadata(batch, traces, bodies)
 
         assert self._meta(batch, "tr", "g1")["cache_breakpoints"] == []

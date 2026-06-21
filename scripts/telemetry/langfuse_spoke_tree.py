@@ -1586,19 +1586,25 @@ def _merge_trace_tags(batch: list[IngestEvent], tags: list[str]) -> None:
             existing.append(tag)
 
 
-def apply_request_effort(
+def apply_request_body_metadata(
     batch: list[IngestEvent],
     traces: list[TraceObservations],
     bodies_dir: Path,
 ) -> int:
-    """Fold each request body's ``output_config.effort`` onto its llm_request copy (#101).
+    """Fold each request body's ``output_config.effort`` + cache breakpoints onto its copy (#101).
 
     For each LLM call (aligned positionally with its raw request body, the same alignment and
-    count gate as :func:`apply_llm_decomposition`) the body's ``effort`` is read and, when it is
-    a genuine effort level, written as ``metadata.effort`` on the call's copy and promoted to a
-    trace-level ``effort:<value>`` tag (Langfuse can group/filter/chart traces by tag). ``ultra``
-    is the ultracode/harness mode, not an effort: it is diverted to a single ``ultracode`` trace
-    tag and never recorded as an effort.
+    count gate as :func:`apply_llm_decomposition`) the body is parsed once and two request-derived
+    signals are surfaced on the call's llm_request copy:
+
+    - ``metadata.cache_breakpoints`` — the ``cache_control`` prefix boundary positions
+      (``{location, index}``, in order), surfaced on EVERY aligned call as a list (empty when the
+      body has no marker) so "no breakpoints" reads distinctly from "not measured". This diagnoses
+      a moved breakpoint that busted the cache.
+    - ``metadata.effort`` + a trace-level ``effort:<value>`` tag — the ``output_config.effort``
+      reasoning level, when it is a genuine effort (Langfuse can group/filter/chart traces by tag).
+      ``ultra`` is the ultracode/harness mode, not an effort: it is diverted to a single
+      ``ultracode`` trace tag and never recorded as an effort.
 
     Args:
         batch: The assembled ingestion events; the llm_request copies + trace are mutated in place.
@@ -1607,7 +1613,7 @@ def apply_request_effort(
 
     Returns:
         The number of llm_request copies that received an ``effort`` (0 when none align or only
-        ultracode was seen).
+        ultracode was seen); cache breakpoints are surfaced independently of this count.
     """
     calls = _llm_requests_in_order(traces)
     bodies = find_request_files(bodies_dir)
@@ -1622,16 +1628,22 @@ def apply_request_effort(
         if event is None:
             continue  # the call's copy is not in the batch (defensive; should not happen)
         try:
-            effort = parse_request_body(body_path).effort
+            body = parse_request_body(body_path)
         except (OSError, json.JSONDecodeError):
-            logger.warning("cannot read effort from request body %s", body_path)
+            logger.warning("cannot read request body %s", body_path)
             continue
+        metadata = event["body"].setdefault("metadata", {})
+        metadata["cache_breakpoints"] = [
+            {"location": boundary.location, "index": boundary.index}
+            for boundary in body.cache_boundaries
+        ]
+        effort = body.effort
         if effort is None:
             continue
         if effort == _ULTRA_MODE:
             ultracode = True
             continue
-        event["body"].setdefault("metadata", {})["effort"] = effort
+        metadata["effort"] = effort
         if effort not in efforts:
             efforts.append(effort)
         attached += 1
@@ -1908,10 +1920,10 @@ def main(argv: list[str] | None = None) -> int:
     decomposed = apply_llm_decomposition(
         batch, traces, bodies_dir, counter=counter, price=args.price
     )
-    # UPGRADE: apply_llm_decomposition + apply_request_effort each re-walk _llm_requests_in_order
-    # and re-stat find_request_files over the same inputs — compute the calls↔bodies pairing once
-    # in main and pass it in if the body count ever makes the double scan measurable.
-    efforts = apply_request_effort(batch, traces, bodies_dir)
+    # UPGRADE: apply_llm_decomposition + apply_request_body_metadata each re-walk
+    # _llm_requests_in_order and re-stat find_request_files over the same inputs — compute the
+    # calls↔bodies pairing once in main and pass it in if the body count ever makes it measurable.
+    efforts = apply_request_body_metadata(batch, traces, bodies_dir)
     score_events = build_score_events(args.spoke_run_id, traces, batch, base_ts=base_ts)
     post_in_chunks(batch + context_events + score_events, post)
 
