@@ -19,6 +19,8 @@
 #                    positional [type] slot
 #   --prompt <text>  seed the spawned claude with this first message (e.g. /source
 #                    or a task kickoff) — used by the start-task skill to dispatch
+#   --mode <m>       execution mode stamped on the trace (attended|afk; default
+#                    attended) — hub-afk.sh passes `afk` for drain-driven spokes (#102)
 #   --new-window     open a SEPARATE VS Code window instead of code --add
 #   --no-code        don't touch VS Code
 #   --no-terminal    don't spawn a tmux/terminal window
@@ -50,6 +52,7 @@ SPAWN_TERMINAL=1
 LAUNCH_AGENT=1
 PROMPT=""              # seed the spawned claude with this first message
 TYPE_FLAG=""           # --type overrides the positional type (no footgun)
+MODE="attended"        # execution mode stamped on the trace (attended | afk); #102
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --new-window)  OPEN_MODE="new-window"; shift ;;
@@ -60,6 +63,8 @@ while [ "$#" -gt 0 ]; do
     --type=*)      TYPE_FLAG="${1#--type=}"; shift ;;
     --prompt)      [ "$#" -ge 2 ] || wt_die "--prompt needs a value"; PROMPT="$2"; shift 2 ;;
     --prompt=*)    PROMPT="${1#--prompt=}"; shift ;;
+    --mode)        [ "$#" -ge 2 ] || wt_die "--mode needs a value"; MODE="$2"; shift 2 ;;
+    --mode=*)      MODE="${1#--mode=}"; shift ;;
     -*)            wt_die "unknown option: $1" ;;
     *)             POSITIONAL+=("$1"); shift ;;
   esac
@@ -112,9 +117,11 @@ fi
 if [[ "$ISSUE" =~ ^[0-9]+$ ]]; then
   BRANCH="${TYPE}/${ISSUE}-${SLUG}"
   WT_TAG="$ISSUE"
+  LANE="spoke"            # issue-backed full solo-cycle (#102)
 else
   BRANCH="${TYPE}/${SLUG}"
   WT_TAG="$SLUG"
+  LANE="express"          # ad-hoc, no-issue express spoke (#102)
 fi
 
 WT_DIR="$(dirname "$REPO_ROOT")/$(basename "$REPO_ROOT")-${WT_TAG}"
@@ -158,6 +165,14 @@ SPOKE_RUN_ID="${BRANCH}+$(date +%s)"
 mkdir -p "$WT_DIR/.ai-toolkit"
 printf '%s\n' "$SPOKE_RUN_ID" > "$WT_DIR/.ai-toolkit/spoke-run-id"
 echo "→ spoke_run_id       $SPOKE_RUN_ID"
+
+# Execution mode + lane pointers (#102): stamped alongside spoke-run-id so
+# langfuse_spoke_tree.py can tag the reconstructed trace (groupable in Langfuse).
+# `lane` is derived above (issue-backed → spoke, ad-hoc slug → express); `mode`
+# is `attended` unless a supervisor (hub-afk.sh) passed `--mode afk`.
+printf '%s\n' "$LANE" > "$WT_DIR/.ai-toolkit/lane"
+printf '%s\n' "$MODE" > "$WT_DIR/.ai-toolkit/mode"
+echo "→ lane / mode        $LANE / $MODE"
 
 # .claude/ is gitignored runtime config (skills, hooks, settings) synced from
 # shared/. `git worktree add` checks out only TRACKED files, so without this copy

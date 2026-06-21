@@ -94,6 +94,12 @@ mkdir -p "$WT_DIR/.ai-toolkit"
 printf '%s\n' "$SPOKE_RUN_ID" > "$WT_DIR/.ai-toolkit/spoke-run-id"
 echo "→ spoke_run_id       $SPOKE_RUN_ID"
 
+# Lane + mode pointers (#102): the /quick lane is always a human-driven
+# interactive fix, so it is `lane=quick`, `mode=attended`. langfuse_spoke_tree.py
+# reads these to tag the reconstructed trace.
+printf '%s\n' "quick" > "$WT_DIR/.ai-toolkit/lane"
+printf '%s\n' "attended" > "$WT_DIR/.ai-toolkit/mode"
+
 # --- copy the gitignored .claude/ runtime config -----------------------------
 # `git worktree add` checks out only TRACKED files, so without this copy the
 # worktree has no active skills/hooks. .review/ is per-checkout approval state

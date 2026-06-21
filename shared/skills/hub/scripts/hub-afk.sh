@@ -694,7 +694,9 @@ dispatch_batch() {
   for n in $batch; do
     printf '%s\n' "$inflight" | grep -qxF "$n" && continue   # already in flight (idempotent)
     log "→ dispatch #$n"
-    if bash "$wt_new" "$n" --type feature --prompt "$(kickoff_for "$n")"; then
+    # --mode afk stamps the spoke's trace as drain-driven (#102); a hand-dispatched
+    # spoke defaults to attended in worktree-new.sh.
+    if bash "$wt_new" "$n" --type feature --mode afk --prompt "$(kickoff_for "$n")"; then
       stamp_dispatch_epoch "$n"
     else
       log "  dispatch of #$n failed — will retry next tick"
