@@ -682,6 +682,38 @@ class TestScoreEvents:
 
         assert self._by_name(scores, "permission_wait_ms") == []
 
+    def test_tool_result_size_score_on_the_tool_observation(self, tmp_path: Path) -> None:
+        # #101 part 4: a numeric tool_result_size (bytes of the reconstructed tool_result)
+        # is emitted as a Langfuse score on the tool node, so "which outputs bloat context"
+        # is a one-click chart.
+        span = _tool_obs("t1", "tool:Read", "tu-1")
+        _write_transcript(
+            tmp_path,
+            [_tool_use("tu-1", "Read", {"file_path": "/a"}), _tool_result("tu-1", "hello")],
+        )
+        traces = [("trace", [span])]
+        batch = build_batch(traces, SPOKE, scan_transcripts(tmp_path, {"tu-1"}))
+
+        scores = build_score_events(SPOKE, traces, batch, base_ts="2026-01-01T00:00:00Z")
+
+        sized = self._by_name(scores, "tool_result_size")
+        assert len(sized) == 1
+        body = sized[0]["body"]
+        assert body["dataType"] == "NUMERIC"
+        assert body["value"] == 5  # len(b"hello")
+        assert body["observationId"] == _copy_id("trace", "t1")
+        assert body["traceId"] == trace_id_for(SPOKE)
+
+    def test_no_tool_result_size_score_without_reconstructed_output(self) -> None:
+        # A tool span with no transcript output carries no size, so no score is emitted.
+        span = _tool_obs("t1", "tool:Read", "tu-1")
+        traces = [("trace", [span])]
+        batch = build_batch(traces, SPOKE)
+
+        scores = build_score_events(SPOKE, traces, batch, base_ts="2026-01-01T00:00:00Z")
+
+        assert self._by_name(scores, "tool_result_size") == []
+
     def test_gate_park_score_is_trace_level_gap_to_first_activity(self) -> None:
         gate = self._gate("2026-01-02T00:00:00Z", "2026-01-02T00:00:10Z")
         turn = _obs("i1", "claude_code.interaction", parent=None, startTime="2026-01-02T00:01:10Z")
