@@ -152,12 +152,17 @@ class RequestBody:
         cache_boundaries: The ``cache_control`` prefix breakpoints, in order.
         deferred_tool_count: Deferred tools named-only in a reminder (counted, not sized).
         model: The request's model id, when present.
+        effort: The ``output_config.effort`` reasoning level (``low``/``medium``/``high``/
+            ``xhigh``/``max``), read verbatim, when present (Issue #101). The semantic that
+            ``ultra`` is the harness mode rather than an effort level is enforced downstream,
+            not here — this is a pure parser.
     """
 
     items: list[ContextItem]
     cache_boundaries: list[CacheBoundary]
     deferred_tool_count: int
     model: str | None
+    effort: str | None = None
 
 
 def _tool_items(tools: object, *, cached: bool) -> list[ContextItem]:
@@ -307,7 +312,16 @@ def parse_request_obj(obj: dict[str, object]) -> RequestBody:
         cache_boundaries=[*system_boundaries, *message_boundaries],
         deferred_tool_count=deferred,
         model=model if isinstance(model, str) else None,
+        effort=_output_effort(obj.get("output_config")),
     )
+
+
+def _output_effort(output_config: object) -> str | None:
+    """Return ``output_config.effort`` verbatim when it is a string, else None (Issue #101)."""
+    if not isinstance(output_config, dict):
+        return None
+    effort = output_config.get("effort")
+    return effort if isinstance(effort, str) else None
 
 
 def parse_request_body(path: Path) -> RequestBody:

@@ -135,6 +135,11 @@ _SCORE_PREFIX = "tree-score-"
 # Score names — Langfuse sums/charts numeric scores (it cannot chart arbitrary metadata).
 _PERMISSION_WAIT_SCORE = "permission_wait_ms"  # per blocked tool observation
 _GATE_PARK_SCORE = "gate_park_ms"  # trace-level PLAN-gate park wait
+# output_config.effort handling (#101). ``ultra`` is the ultracode/harness mode, NOT an
+# effort level: it is diverted to a spoke-level ``ultracode`` trace tag, never recorded as
+# an ``effort:<value>`` tag or on llm_request metadata.
+_ULTRA_MODE = "ultra"
+_ULTRACODE_TAG = "ultracode"
 # The spoke-ready --gate emission: a kind=script span labelled ``<kind>:<phase>`` in OTel.
 _GATE_OBSERVATION_NAME = "script:gate"
 _TRACE_NAME_PREFIX = "spoke-tree:"
@@ -1568,6 +1573,75 @@ def apply_llm_decomposition(
     return decomposed
 
 
+def _merge_trace_tags(batch: list[IngestEvent], tags: list[str]) -> None:
+    """Merge ``tags`` into the batch's ``trace-create`` event, de-duplicated, order-stable."""
+    if not tags:
+        return
+    trace = next((event for event in batch if event.get("type") == "trace-create"), None)
+    if trace is None:
+        return  # defensive: build_batch always emits one
+    existing: list[str] = trace["body"].setdefault("tags", [])
+    for tag in tags:
+        if tag not in existing:
+            existing.append(tag)
+
+
+def apply_request_effort(
+    batch: list[IngestEvent],
+    traces: list[TraceObservations],
+    bodies_dir: Path,
+) -> int:
+    """Fold each request body's ``output_config.effort`` onto its llm_request copy (#101).
+
+    For each LLM call (aligned positionally with its raw request body, the same alignment and
+    count gate as :func:`apply_llm_decomposition`) the body's ``effort`` is read and, when it is
+    a genuine effort level, written as ``metadata.effort`` on the call's copy and promoted to a
+    trace-level ``effort:<value>`` tag (Langfuse can group/filter/chart traces by tag). ``ultra``
+    is the ultracode/harness mode, not an effort: it is diverted to a single ``ultracode`` trace
+    tag and never recorded as an effort.
+
+    Args:
+        batch: The assembled ingestion events; the llm_request copies + trace are mutated in place.
+        traces: The source traces paired with their observations.
+        bodies_dir: The per-spoke ``OTEL_LOG_RAW_API_BODIES=file:<dir>`` dump directory.
+
+    Returns:
+        The number of llm_request copies that received an ``effort`` (0 when none align or only
+        ultracode was seen).
+    """
+    calls = _llm_requests_in_order(traces)
+    bodies = find_request_files(bodies_dir)
+    if not calls or len(calls) != len(bodies):
+        return 0
+    by_id = {event["body"]["id"]: event for event in batch}
+    efforts: list[str] = []
+    ultracode = False
+    attached = 0
+    for (orig_trace_id, observation), body_path in zip(calls, bodies):
+        event = by_id.get(_copy_id(orig_trace_id, observation["id"]))
+        if event is None:
+            continue  # the call's copy is not in the batch (defensive; should not happen)
+        try:
+            effort = parse_request_body(body_path).effort
+        except (OSError, json.JSONDecodeError):
+            logger.warning("cannot read effort from request body %s", body_path)
+            continue
+        if effort is None:
+            continue
+        if effort == _ULTRA_MODE:
+            ultracode = True
+            continue
+        event["body"].setdefault("metadata", {})["effort"] = effort
+        if effort not in efforts:
+            efforts.append(effort)
+        attached += 1
+    tags = [f"effort:{effort}" for effort in efforts]
+    if ultracode:
+        tags.append(_ULTRACODE_TAG)
+    _merge_trace_tags(batch, tags)
+    return attached
+
+
 def _score_id(spoke_run_id: str, name: str, target: str) -> str:
     """Return the deterministic id of one score for a spoke (idempotent across reruns)."""
     digest = hashlib.sha1(f"{spoke_run_id}:score:{name}:{target}".encode()).hexdigest()[:24]
@@ -1834,6 +1908,7 @@ def main(argv: list[str] | None = None) -> int:
     decomposed = apply_llm_decomposition(
         batch, traces, bodies_dir, counter=counter, price=args.price
     )
+    efforts = apply_request_effort(batch, traces, bodies_dir)
     score_events = build_score_events(args.spoke_run_id, traces, batch, base_ts=base_ts)
     post_in_chunks(batch + context_events + score_events, post)
 
@@ -1844,6 +1919,7 @@ def main(argv: list[str] | None = None) -> int:
         f"(roots collapsed to 1), {filled} tool spans filled from transcript, "
         f"{len(rows)} loaded-context items itemized (source: {source}), "
         f"{decomposed} llm_requests cache-decomposed, "
+        f"{efforts} llm_requests effort-tagged, "
         f"{len(score_events)} numeric scores emitted"
     )
     return 0
