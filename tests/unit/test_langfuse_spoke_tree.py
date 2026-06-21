@@ -1895,3 +1895,37 @@ class TestRequestEffort:
 
         assert count == 0
         assert "effort" not in self._meta(batch, "tr", "g1")
+
+    def _obj_with_breakpoint(self) -> dict:
+        # A body whose system block carries a cache_control marker → one CacheBoundary.
+        return {
+            "tools": [self._TOOL],
+            "system": [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        }
+
+    def test_cache_breakpoints_surfaced_on_llm_request_metadata(self, tmp_path: Path) -> None:
+        # #101 part 3: the cache_control breakpoint positions are surfaced on the
+        # llm_request node metadata (diagnoses "a moved breakpoint busted cache").
+        bodies = self._bodies_dir(tmp_path, self._obj_with_breakpoint())
+        gen = self._gen("g1", "2026-01-02T00:00:00Z")
+        traces = [("tr", [gen])]
+        batch = build_batch(traces, SPOKE)
+
+        apply_request_effort(batch, traces, bodies)
+
+        assert self._meta(batch, "tr", "g1")["cache_breakpoints"] == [
+            {"location": "system", "index": 0}
+        ]
+
+    def test_no_breakpoints_attaches_empty_list(self, tmp_path: Path) -> None:
+        # A body with no cache_control marker still gets the key, as an empty list — so the
+        # llm_request unambiguously records "no breakpoints" rather than "not measured".
+        bodies = self._bodies_dir(tmp_path, self._obj())
+        gen = self._gen("g1", "2026-01-02T00:00:00Z")
+        traces = [("tr", [gen])]
+        batch = build_batch(traces, SPOKE)
+
+        apply_request_effort(batch, traces, bodies)
+
+        assert self._meta(batch, "tr", "g1")["cache_breakpoints"] == []
