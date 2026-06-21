@@ -1908,6 +1908,9 @@ def main(argv: list[str] | None = None) -> int:
     decomposed = apply_llm_decomposition(
         batch, traces, bodies_dir, counter=counter, price=args.price
     )
+    # UPGRADE: apply_llm_decomposition + apply_request_effort each re-walk _llm_requests_in_order
+    # and re-stat find_request_files over the same inputs — compute the calls↔bodies pairing once
+    # in main and pass it in if the body count ever makes the double scan measurable.
     efforts = apply_request_effort(batch, traces, bodies_dir)
     score_events = build_score_events(args.spoke_run_id, traces, batch, base_ts=base_ts)
     post_in_chunks(batch + context_events + score_events, post)
