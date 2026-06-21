@@ -214,6 +214,14 @@ _DISK_CATEGORY_ORDER = ("rules", "memory", "skills", "sub-agents", "environment"
 _BODY_DIR_ENV = "AI_TOOLKIT_OTEL_BODY_DIR"
 # Conventional per-spoke body dir under a worktree root (worktree-new.sh writes here).
 _BODY_DIR_CONVENTION = Path(".ai-toolkit/raw-bodies")
+# Execution mode + lane pointer files under a worktree root, stamped at launch by
+# worktree-new.sh / worktree-quick.sh (#102). Surfaced as trace tags + metadata.
+_MODE_POINTER = Path(".ai-toolkit/mode")
+_LANE_POINTER = Path(".ai-toolkit/lane")
+_VALID_MODES = ("afk", "attended")
+_VALID_LANES = ("micro", "express", "quick", "spoke")
+_DEFAULT_MODE = "attended"
+_DEFAULT_LANE = "spoke"
 
 
 class ToolContent(NamedTuple):
@@ -1613,6 +1621,56 @@ def _merge_trace_tags(batch: list[IngestEvent], tags: list[str]) -> None:
             existing.append(tag)
 
 
+def _read_pointer(path: Path, valid: tuple[str, ...], default: str) -> str:
+    """Read a one-line ``.ai-toolkit`` pointer, falling back to ``default`` safely.
+
+    A missing file, an unreadable file, a blank value, or a value outside ``valid`` all
+    resolve to ``default`` — a legacy or corrupt pointer must never crash the assembler or
+    mislabel the trace.
+    """
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return default
+    return value if value in valid else default
+
+
+def read_mode_lane(root: Path) -> tuple[str, str]:
+    """Return the spoke's ``(mode, lane)`` from its launch pointer files under ``root``.
+
+    Args:
+        root: The worktree root holding ``.ai-toolkit/mode`` and ``.ai-toolkit/lane``.
+
+    Returns:
+        The validated ``(mode, lane)`` pair, defaulting to ``("attended", "spoke")`` for a
+        missing, blank, or unrecognized pointer (#102).
+    """
+    mode = _read_pointer(root / _MODE_POINTER, _VALID_MODES, _DEFAULT_MODE)
+    lane = _read_pointer(root / _LANE_POINTER, _VALID_LANES, _DEFAULT_LANE)
+    return mode, lane
+
+
+def apply_mode_lane_tags(batch: list[IngestEvent], mode: str, lane: str) -> None:
+    """Attach the spoke's execution ``mode`` + ``lane`` to its trace (#102).
+
+    Both surface as trace-level ``mode:<value>`` / ``lane:<value>`` tags (so a Langfuse
+    dashboard can group/filter/chart spokes by how they were run) and are mirrored, bare,
+    into trace metadata for direct lookup.
+
+    Args:
+        batch: The assembled ingestion events; the ``trace-create`` event is mutated in place.
+        mode: The execution mode (``afk`` | ``attended``).
+        lane: The spoke's lane (``micro`` | ``express`` | ``quick`` | ``spoke``).
+    """
+    _merge_trace_tags(batch, [f"mode:{mode}", f"lane:{lane}"])
+    trace = next((event for event in batch if event.get("type") == "trace-create"), None)
+    if trace is None:
+        return  # defensive: build_batch always emits one
+    metadata = trace["body"].setdefault("metadata", {})
+    metadata["mode"] = mode
+    metadata["lane"] = lane
+
+
 def apply_request_body_metadata(
     batch: list[IngestEvent],
     traces: list[TraceObservations],
@@ -1938,6 +1996,8 @@ def main(argv: list[str] | None = None) -> int:
     scan_root = transcript_scan_root(args.projects, args.root.resolve())
     tool_content = scan_transcripts(scan_root, _tool_span_ids(traces))
     batch = build_batch(traces, args.spoke_run_id, tool_content)
+    mode, lane = read_mode_lane(args.root.resolve())
+    apply_mode_lane_tags(batch, mode, lane)
 
     counter = make_counter(endpoint=args.endpoint, api_key=args.api_key, model=args.model)
     base_ts = _earliest_start(traces)
@@ -1979,7 +2039,8 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(rows)} loaded-context items itemized (source: {source}), "
         f"{decomposed} llm_requests cache-decomposed, "
         f"{efforts} llm_requests effort-tagged, "
-        f"{len(score_events)} numeric scores emitted"
+        f"{len(score_events)} numeric scores emitted, "
+        f"tagged mode={mode} lane={lane}"
     )
     return 0
 
