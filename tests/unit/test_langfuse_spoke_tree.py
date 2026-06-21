@@ -714,6 +714,37 @@ class TestScoreEvents:
 
         assert self._by_name(scores, "tool_result_size") == []
 
+    def test_tool_result_size_counts_utf8_bytes_not_characters(self, tmp_path: Path) -> None:
+        # A multi-byte glyph ("é" = 2 UTF-8 bytes) is measured by byte length, not char count.
+        span = _tool_obs("t1", "tool:Read", "tu-1")
+        _write_transcript(
+            tmp_path,
+            [_tool_use("tu-1", "Read", {"file_path": "/a"}), _tool_result("tu-1", "café")],
+        )
+        traces = [("trace", [span])]
+        batch = build_batch(traces, SPOKE, scan_transcripts(tmp_path, {"tu-1"}))
+
+        scores = build_score_events(SPOKE, traces, batch, base_ts="2026-01-01T00:00:00Z")
+
+        assert self._by_name(scores, "tool_result_size")[0]["body"]["value"] == 5  # c-a-f-é(2)
+
+    def test_empty_reconstructed_output_scores_zero(self, tmp_path: Path) -> None:
+        # An empty (but present) tool_result is a real 0-byte measurement — distinct from a
+        # tool with no reconstructed output (which carries no score at all).
+        span = _tool_obs("t1", "tool:Read", "tu-1")
+        _write_transcript(
+            tmp_path,
+            [_tool_use("tu-1", "Read", {"file_path": "/a"}), _tool_result("tu-1", "")],
+        )
+        traces = [("trace", [span])]
+        batch = build_batch(traces, SPOKE, scan_transcripts(tmp_path, {"tu-1"}))
+
+        scores = build_score_events(SPOKE, traces, batch, base_ts="2026-01-01T00:00:00Z")
+
+        sized = self._by_name(scores, "tool_result_size")
+        assert len(sized) == 1
+        assert sized[0]["body"]["value"] == 0
+
     def test_gate_park_score_is_trace_level_gap_to_first_activity(self) -> None:
         gate = self._gate("2026-01-02T00:00:00Z", "2026-01-02T00:00:10Z")
         turn = _obs("i1", "claude_code.interaction", parent=None, startTime="2026-01-02T00:01:10Z")

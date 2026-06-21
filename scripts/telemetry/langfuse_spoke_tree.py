@@ -626,6 +626,9 @@ def _tool_result_size(observation: Observation, tool_content: dict[str, ToolCont
     content = tool_content.get(_tool_use_id(observation) or "")
     if content is None or content.output is None:
         return None
+    # UPGRADE: structured output is sized by its json.dumps envelope (keys/braces/quotes), a
+    # slight over-count vs the rendered text — switch to summing the content blocks' text if the
+    # bloat chart ever needs to compare structured and plain-string results apples-to-apples.
     text = (
         content.output
         if isinstance(content.output, str)
