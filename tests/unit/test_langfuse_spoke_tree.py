@@ -31,6 +31,7 @@ from telemetry.langfuse_spoke_tree import (
     _copy_id,
     _decomp_metadata,
     apply_llm_decomposition,
+    apply_request_effort,
     build_batch,
     build_loaded_context_events,
     build_score_events,
@@ -1799,3 +1800,98 @@ class TestLlmDecompositionMetadata:
         assert meta["measured"] == 17
         item_sum = sum(tok for comp in meta["components"].values() for tok in comp.values())
         assert item_sum == meta["measured"]
+
+
+class TestRequestEffort:
+    """#101 part 1: output_config.effort is folded onto each llm_request copy as metadata and
+    promoted to a trace-level ``effort:<value>`` tag; ``ultra`` is the harness mode (ultracode),
+    never an effort value, so it becomes a separate ``ultracode`` trace tag.
+    """
+
+    _TOOL = {"name": "Bash", "description": "d" * 40, "input_schema": {"type": "object"}}
+
+    def _bodies_dir(self, tmp_path: Path, *objs: dict) -> Path:
+        bodies = tmp_path / "bodies"
+        bodies.mkdir()
+        for index, obj in enumerate(objs):
+            (bodies / f"{index:02d}-body.request.json").write_text(
+                json.dumps(obj), encoding="utf-8"
+            )
+        return bodies
+
+    def _obj(self, effort: str | None = None) -> dict:
+        obj: dict = {
+            "tools": [self._TOOL],
+            "system": [{"type": "text", "text": "sys"}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        }
+        if effort is not None:
+            obj["output_config"] = {"effort": effort}
+        return obj
+
+    def _gen(self, obs_id: str, start: str) -> dict:
+        return _obs(
+            obs_id,
+            "llm_request",
+            type_="GENERATION",
+            parent="i1",
+            startTime=start,
+            usageDetails={"cache_read_input_tokens": 30, "cache_creation_input_tokens": 10},
+        )
+
+    def _meta(self, batch: list[dict], orig_trace: str, obs_id: str) -> dict:
+        return _by_orig(batch, orig_trace, obs_id)["body"].get("metadata", {})
+
+    def _trace_tags(self, batch: list[dict]) -> list[str]:
+        trace = next(event for event in batch if event["type"] == "trace-create")
+        return trace["body"].get("tags", [])
+
+    def test_effort_attached_as_metadata_and_trace_tag(self, tmp_path: Path) -> None:
+        bodies = self._bodies_dir(tmp_path, self._obj("high"))
+        gen = self._gen("g1", "2026-01-02T00:00:00Z")
+        traces = [("tr", [gen])]
+        batch = build_batch(traces, SPOKE)
+
+        count = apply_request_effort(batch, traces, bodies)
+
+        assert count == 1
+        assert self._meta(batch, "tr", "g1")["effort"] == "high"
+        assert "effort:high" in self._trace_tags(batch)
+
+    def test_ultra_is_ultracode_tag_never_an_effort(self, tmp_path: Path) -> None:
+        bodies = self._bodies_dir(tmp_path, self._obj("ultra"))
+        gen = self._gen("g1", "2026-01-02T00:00:00Z")
+        traces = [("tr", [gen])]
+        batch = build_batch(traces, SPOKE)
+
+        apply_request_effort(batch, traces, bodies)
+
+        # ultra never lands on effort metadata nor as an effort:* tag.
+        assert "effort" not in self._meta(batch, "tr", "g1")
+        tags = self._trace_tags(batch)
+        assert "ultracode" in tags
+        assert "effort:ultra" not in tags
+
+    def test_absent_output_config_attaches_nothing(self, tmp_path: Path) -> None:
+        bodies = self._bodies_dir(tmp_path, self._obj())
+        gen = self._gen("g1", "2026-01-02T00:00:00Z")
+        traces = [("tr", [gen])]
+        batch = build_batch(traces, SPOKE)
+
+        count = apply_request_effort(batch, traces, bodies)
+
+        assert count == 0
+        assert "effort" not in self._meta(batch, "tr", "g1")
+        assert self._trace_tags(batch) == []
+
+    def test_count_mismatch_skips_effort(self, tmp_path: Path) -> None:
+        # Two bodies but a single llm_request — positional alignment is unsafe → nothing attached.
+        bodies = self._bodies_dir(tmp_path, self._obj("high"), self._obj("high"))
+        gen = self._gen("g1", "2026-01-02T00:00:00Z")
+        traces = [("tr", [gen])]
+        batch = build_batch(traces, SPOKE)
+
+        count = apply_request_effort(batch, traces, bodies)
+
+        assert count == 0
+        assert "effort" not in self._meta(batch, "tr", "g1")

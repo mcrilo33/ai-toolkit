@@ -147,6 +147,43 @@ def test_cache_boundaries_extracted() -> None:
     ]
 
 
+# --- output_config.effort (Issue #101) ---------------------------------------
+
+
+def test_effort_parsed_from_output_config() -> None:
+    # Arrange: a request body carrying a reasoning effort in output_config.
+    obj = {"output_config": {"effort": "high"}, "tools": [], "system": [], "messages": []}
+
+    # Act
+    parsed = parse_request_obj(obj)
+
+    # Assert: the effort is read verbatim onto the RequestBody.
+    assert parsed.effort == "high"
+
+
+def test_effort_absent_is_none() -> None:
+    # Arrange: a body with no output_config block at all.
+    obj = {"tools": [], "system": [], "messages": []}
+
+    # Act
+    parsed = parse_request_obj(obj)
+
+    # Assert: absent effort surfaces as None, not a crash.
+    assert parsed.effort is None
+
+
+def test_effort_read_verbatim_even_when_ultra() -> None:
+    # Arrange: the parser does not editorialize — "ultra" (the harness mode, not a real
+    # effort) is read through; the semantic split (tag vs ultracode) is enforced downstream.
+    obj = {"output_config": {"effort": "ultra"}, "tools": [], "system": [], "messages": []}
+
+    # Act
+    parsed = parse_request_obj(obj)
+
+    # Assert
+    assert parsed.effort == "ultra"
+
+
 # --- deferred tools (named-only, counted not sized) --------------------------
 
 
