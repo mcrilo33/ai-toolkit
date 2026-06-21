@@ -127,6 +127,10 @@ class UsageEvent:
     # records) the whole flat total is attributed to 5m — the conservative default.
     cache_creation_5m: int = 0
     cache_creation_1h: int = 0
+    # The response ``usage.service_tier`` (Issue #101): ``standard`` / ``priority`` /
+    # ``batch`` / ``scale``, the other half of the cache item. Absent on older / push-only
+    # records, so it defaults to None and is additive.
+    service_tier: str | None = None
 
 
 @dataclass(slots=True)
@@ -1209,6 +1213,9 @@ def _usage_event(rec: dict, source: str, agent_id: str | None) -> UsageEvent:
         message_id=message.get("id"),
         cache_creation_5m=cache_5m,
         cache_creation_1h=cache_1h,
+        service_tier=usage.get("service_tier")
+        if isinstance(usage.get("service_tier"), str)
+        else None,
     )
 
 

@@ -364,6 +364,11 @@ def _turn_node(row: dict[str, Any]) -> CausalNode:
     # usage type so cost reflects the 2x (1h) / 1.25x (5m) price difference.
     node["cache_creation_5m"] = int(row.get("cache_creation_5m") or 0)
     node["cache_creation_1h"] = int(row.get("cache_creation_1h") or 0)
+    # Response service tier (Issue #101): surfaced only when present, so a turn without it
+    # (older / push-only records) carries no key rather than a null.
+    service_tier = row.get("service_tier")
+    if service_tier:
+        node["service_tier"] = str(service_tier)
     return node
 
 
@@ -638,6 +643,8 @@ def per_turn_rows(
                 # Cache-write TTL split (Issue #97): 1h writes bill 2x input, 5m 1.25x.
                 "cache_creation_5m": event.cache_creation_5m,
                 "cache_creation_1h": event.cache_creation_1h,
+                # Response service tier (Issue #101): the other half of the cache item.
+                "service_tier": event.service_tier,
                 "reasoning": gists.get(
                     _turn_key(event.session_id, event.source, event.agent_id, event.ts)
                 ),

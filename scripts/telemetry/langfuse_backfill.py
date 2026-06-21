@@ -157,7 +157,7 @@ def _usage_details(node: dict[str, Any]) -> dict[str, int]:
 def _metadata(node: dict[str, Any]) -> dict[str, Any]:
     """The node's display metadata: kind plus any present phase/summary/status/actor/context."""
     metadata: dict[str, Any] = {"kind": node.get("kind")}
-    for key in ("actor", "phase", "summary", "status"):
+    for key in ("actor", "phase", "summary", "status", "service_tier"):
         if node.get(key) is not None:
             metadata[key] = node[key]
     if "input_context" in node:

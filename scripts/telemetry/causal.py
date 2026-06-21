@@ -109,6 +109,9 @@ class _CausalNodeOptional(TypedDict, total=False):
     cache_creation_5m: int
     cache_creation_1h: int
     resume_cache_creation: int
+    # The response ``usage.service_tier`` (Issue #101), surfaced on a ``turn``
+    # (llm_request) node's metadata by the backfill. Display-only; never folded into cost.
+    service_tier: str
 
 
 class CausalNode(_CausalNodeRequired, _CausalNodeOptional):
