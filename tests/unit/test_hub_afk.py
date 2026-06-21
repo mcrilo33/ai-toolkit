@@ -1079,6 +1079,44 @@ def test_dispatch_batch_holds_back_inflight_scope_overlap(tmp_path: Path) -> Non
     assert "72" not in landed, "the already-in-flight spoke must not be re-dispatched"
 
 
+def test_dispatch_batch_stamps_mode_afk(tmp_path: Path) -> None:
+    # An afk-supervised dispatch tags the spoke `mode=afk` by passing `--mode afk`
+    # to worktree-new.sh, so langfuse_spoke_tree.py can distinguish drain-driven
+    # spokes from hand-dispatched (attended) ones (issue #102).
+    backlog = tmp_path / "backlog.json"
+    backlog.write_text(
+        json.dumps([{"number": 5, "body": "Scope: d.py\n", "blockedBy": {"nodes": []}}])
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1 $2" in\n'
+        '  "issue view") printf "body\\nScope: d.py\\n" ;;\n'
+        '  "repo view") echo "octo ai-toolkit" ;;\n'
+        f'  "api graphql") cat "{backlog}" ;;\n'
+        "esac\n"
+    )
+    (fake_bin / "gh").chmod(0o755)
+    dispatched = tmp_path / "dispatched.log"
+    wt_new = tmp_path / "wtnew.sh"
+    wt_new.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{dispatched}"\n')
+    wt_new.chmod(0o755)
+
+    batch_plan = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "batch-plan.sh"
+    expr = "inflight_issues() { :; }; inflight_worktrees() { :; }; dispatch_batch"
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "BATCH_PLAN": str(batch_plan),
+        "WT_NEW": str(wt_new),
+    }
+
+    result = _call(expr, env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "--mode afk" in dispatched.read_text(), "afk dispatch must stamp mode=afk"
+
+
 # ── auto-land scoping: only this run's dispatches (issue #74, defect 4) ────────
 # auto_land gates on the ready/<issue> marker (the readiness contract), not on which run
 # dispatched the spoke: a foreign ready/<issue> left by a parallel session is adopted and

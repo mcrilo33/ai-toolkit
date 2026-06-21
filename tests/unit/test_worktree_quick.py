@@ -129,6 +129,24 @@ def test_mints_spoke_run_id(hub: Path, tmp_path: Path) -> None:
     assert run_id.startswith("quick/fix-typo+")
 
 
+def test_stamps_lane_quick(hub: Path, tmp_path: Path) -> None:
+    # The /quick express lane tags its trace `lane=quick` (issue #102).
+    proc, _ = _run_quick(hub, tmp_path, "fix-typo")
+
+    assert proc.returncode == 0, proc.stderr
+    lane = (_worktree_dir(hub, "fix-typo") / ".ai-toolkit" / "lane").read_text().strip()
+    assert lane == "quick"
+
+
+def test_stamps_mode_attended(hub: Path, tmp_path: Path) -> None:
+    # /quick is always human-driven, so its mode is `attended` (issue #102).
+    proc, _ = _run_quick(hub, tmp_path, "fix-typo")
+
+    assert proc.returncode == 0, proc.stderr
+    mode = (_worktree_dir(hub, "fix-typo") / ".ai-toolkit" / "mode").read_text().strip()
+    assert mode == "attended"
+
+
 def test_sets_ai_toolkit_exclude(hub: Path, tmp_path: Path) -> None:
     proc, _ = _run_quick(hub, tmp_path, "fix-typo")
 

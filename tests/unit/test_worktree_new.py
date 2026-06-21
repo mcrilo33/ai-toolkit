@@ -1004,3 +1004,46 @@ def test_no_duplicate_rules_when_rerun_source_present(hub: Path) -> None:
     assert allow.count(SCRIPT_RULE) == 1
     for rule in SEEDED_RULES:
         assert rule in allow, f"missing seeded rule: {rule}"
+
+
+# --- mode/lane pointer files (issue #102) ------------------------------------
+# worktree-new.sh stamps the spoke's execution `lane` and `mode` into the same
+# gitignored `.ai-toolkit/` dir as `spoke-run-id`, so langfuse_spoke_tree.py can
+# tag the reconstructed trace. `lane` is derived (issue-backed → spoke, ad-hoc
+# slug → express); `mode` defaults to `attended`, overridden to `afk` by the
+# afk supervisor via `--mode afk`.
+
+
+def _pointer(hub: Path, tag: str, name: str) -> str:
+    """Read a `.ai-toolkit/<name>` pointer file the script wrote for a worktree."""
+    pointer = _worktree_dir(hub, tag) / ".ai-toolkit" / name
+    assert pointer.is_file(), f"missing pointer {pointer}"
+    return pointer.read_text().strip()
+
+
+def test_issue_backed_spoke_tagged_lane_spoke(hub: Path) -> None:
+    proc = _run_new_quiet(hub, "8", "some-slug")
+
+    assert proc.returncode == 0, proc.stderr
+    assert _pointer(hub, "8", "lane") == "spoke"
+
+
+def test_adhoc_slug_tagged_lane_express(hub: Path) -> None:
+    proc = _run_new_quiet(hub, "refactor-sync")
+
+    assert proc.returncode == 0, proc.stderr
+    assert _pointer(hub, "refactor-sync", "lane") == "express"
+
+
+def test_mode_defaults_to_attended(hub: Path) -> None:
+    proc = _run_new_quiet(hub, "8", "some-slug")
+
+    assert proc.returncode == 0, proc.stderr
+    assert _pointer(hub, "8", "mode") == "attended"
+
+
+def test_mode_flag_stamps_afk(hub: Path) -> None:
+    proc = _run_new_quiet(hub, "8", "some-slug", "--mode", "afk")
+
+    assert proc.returncode == 0, proc.stderr
+    assert _pointer(hub, "8", "mode") == "afk"
