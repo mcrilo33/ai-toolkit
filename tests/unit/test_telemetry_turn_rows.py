@@ -100,6 +100,64 @@ def test_turn_node_carries_cache_creation_ttl_split() -> None:
     assert node["cache_creation_1h"] == 180
 
 
+def test_rows_carry_service_tier() -> None:
+    # Issue #101: the row threads usage.service_tier so the backfill can surface it.
+    event = UsageEvent(
+        session_id="sess-a",
+        ts="2026-06-13T12:00:01.000Z",
+        model="claude-opus-4-8",
+        input_tokens=10,
+        output_tokens=5,
+        cache_read=900,
+        cache_creation=300,
+        source="main",
+        service_tier="standard",
+    )
+
+    row = per_turn_rows([event])[0]
+
+    assert row["service_tier"] == "standard"
+
+
+def test_turn_node_carries_service_tier() -> None:
+    # The llm_request (turn) node surfaces the service tier for the cost/tier lens.
+    event = UsageEvent(
+        session_id="sess-a",
+        ts="2026-06-13T12:00:01.000Z",
+        model="claude-opus-4-8",
+        input_tokens=10,
+        output_tokens=5,
+        cache_read=900,
+        cache_creation=300,
+        source="main",
+        uuid="t1",
+        service_tier="standard",
+    )
+
+    node = _turn_node(per_turn_rows([event])[0])
+
+    assert node["service_tier"] == "standard"
+
+
+def test_turn_node_omits_service_tier_when_absent() -> None:
+    # No service_tier on the usage event → the key is not invented on the node.
+    event = UsageEvent(
+        session_id="sess-a",
+        ts="2026-06-13T12:00:01.000Z",
+        model="claude-opus-4-8",
+        input_tokens=10,
+        output_tokens=5,
+        cache_read=900,
+        cache_creation=300,
+        source="main",
+        uuid="t1",
+    )
+
+    node = _turn_node(per_turn_rows([event])[0])
+
+    assert "service_tier" not in node
+
+
 def test_rows_carry_turn_causal_ids() -> None:
     # The per-turn row carries the turn's causal ids (uuid / parent_uuid /
     # is_sidechain) so the causal builder keys turns by id, never a shared timestamp.

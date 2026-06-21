@@ -153,6 +153,22 @@ class TestNodeTranslation:
         assert body["usageDetails"]["cache_creation_input_tokens"] == 300
         assert "input_cache_creation_1h" not in body["usageDetails"]
 
+    def test_turn_metadata_carries_service_tier(self) -> None:
+        # Issue #101: the response usage.service_tier threaded onto the turn surfaces on
+        # the llm_request (generation) node metadata.
+        forest = build_causal_forest([_turn(service_tier="standard")], [], {}, thinking={})
+        gen = next(
+            e["body"]
+            for e in forest_to_events(forest, SPOKE, thinking={})
+            if e["type"] == "generation-create" and e["body"]["id"] == backfill_node_id(SPOKE, "m1")
+        )
+        assert gen["metadata"]["service_tier"] == "standard"
+
+    def test_turn_without_service_tier_omits_it(self) -> None:
+        # The default fixture carries no service_tier → the key is not invented in metadata.
+        body = _body_by_id(_events())[backfill_node_id(SPOKE, "m1")]
+        assert "service_tier" not in body["metadata"]
+
     def test_turn_carries_no_cost_details(self) -> None:
         # Issue #91: cost is retired from the forest; the generation carries only
         # usageDetails and Langfuse computes costDetails from its model-pricing config.

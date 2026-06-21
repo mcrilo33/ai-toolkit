@@ -1625,3 +1625,19 @@ class TestCacheCreationTTLSplit:
 
         assert event.cache_creation_5m == 0
         assert event.cache_creation_1h == 0
+
+
+class TestServiceTier:
+    """Issue #101: ``_usage_event`` captures the response ``usage.service_tier``."""
+
+    def test_service_tier_read_from_usage(self) -> None:
+        event = _usage_event(
+            _usage_record({"input_tokens": 5, "service_tier": "standard"}), "main", None
+        )
+
+        assert event.service_tier == "standard"
+
+    def test_absent_service_tier_is_none(self) -> None:
+        event = _usage_event(_usage_record({"input_tokens": 5}), "main", None)
+
+        assert event.service_tier is None
