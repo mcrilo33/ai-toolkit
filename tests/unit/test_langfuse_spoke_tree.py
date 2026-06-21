@@ -31,6 +31,7 @@ from telemetry.langfuse_spoke_tree import (
     _copy_id,
     _decomp_metadata,
     apply_llm_decomposition,
+    apply_mode_lane_tags,
     apply_request_body_metadata,
     build_batch,
     build_loaded_context_events,
@@ -39,6 +40,7 @@ from telemetry.langfuse_spoke_tree import (
     fetch_session,
     find_request_files,
     prefix_total,
+    read_mode_lane,
     request_context_rows,
     root_id_for,
     scan_transcripts,
@@ -1994,3 +1996,63 @@ class TestRequestBodyMetadata:
         apply_request_body_metadata(batch, traces, bodies)
 
         assert self._meta(batch, "tr", "g1")["cache_breakpoints"] == []
+
+
+class TestModeLaneTags:
+    """#102: stamp a spoke's execution mode + lane on its reconstructed trace.
+
+    ``read_mode_lane`` reads the ``.ai-toolkit/mode`` / ``.ai-toolkit/lane`` pointer files
+    written at launch, defaulting safely (``attended`` / ``spoke``) when a pointer is missing,
+    blank, or carries an unknown value. ``apply_mode_lane_tags`` attaches ``mode:<v>`` and
+    ``lane:<v>`` as trace-level tags (groupable in Langfuse) and mirrors the bare values into
+    trace metadata.
+    """
+
+    def _write_pointers(self, root: Path, *, mode: str | None, lane: str | None) -> Path:
+        (root / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
+        if mode is not None:
+            (root / ".ai-toolkit" / "mode").write_text(mode, encoding="utf-8")
+        if lane is not None:
+            (root / ".ai-toolkit" / "lane").write_text(lane, encoding="utf-8")
+        return root
+
+    def _trace(self, batch: list[dict]) -> dict:
+        return next(event for event in batch if event["type"] == "trace-create")
+
+    def test_reads_mode_and_lane_from_pointers(self, tmp_path: Path) -> None:
+        root = self._write_pointers(tmp_path, mode="afk\n", lane="express\n")
+
+        assert read_mode_lane(root) == ("afk", "express")
+
+    def test_missing_pointers_default_to_attended_spoke(self, tmp_path: Path) -> None:
+        # A legacy worktree with no pointer files must not crash — safe defaults.
+        assert read_mode_lane(tmp_path) == ("attended", "spoke")
+
+    def test_unknown_pointer_value_falls_back_to_default(self, tmp_path: Path) -> None:
+        # A garbage/legacy value is not propagated as a mislabel — it defaults.
+        root = self._write_pointers(tmp_path, mode="bogus", lane="micro")
+
+        assert read_mode_lane(root) == ("attended", "micro")
+
+    def test_blank_pointer_defaults(self, tmp_path: Path) -> None:
+        root = self._write_pointers(tmp_path, mode="", lane="   ")
+
+        assert read_mode_lane(root) == ("attended", "spoke")
+
+    def test_apply_adds_mode_and_lane_trace_tags(self) -> None:
+        batch = build_batch([], SPOKE)
+
+        apply_mode_lane_tags(batch, "afk", "quick")
+
+        tags = self._trace(batch)["body"]["tags"]
+        assert "mode:afk" in tags
+        assert "lane:quick" in tags
+
+    def test_apply_mirrors_bare_values_into_trace_metadata(self) -> None:
+        batch = build_batch([], SPOKE)
+
+        apply_mode_lane_tags(batch, "attended", "spoke")
+
+        metadata = self._trace(batch)["body"]["metadata"]
+        assert metadata["mode"] == "attended"
+        assert metadata["lane"] == "spoke"
