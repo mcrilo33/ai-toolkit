@@ -1197,6 +1197,7 @@ def _usage_event(rec: dict, source: str, agent_id: str | None) -> UsageEvent:
     usage = message.get("usage") or {}
     cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
     cache_5m, cache_1h = _cache_creation_ttl_split(usage, cache_creation)
+    service_tier = usage.get("service_tier")
     return UsageEvent(
         session_id=rec.get("sessionId"),
         ts=rec.get("timestamp"),
@@ -1213,9 +1214,7 @@ def _usage_event(rec: dict, source: str, agent_id: str | None) -> UsageEvent:
         message_id=message.get("id"),
         cache_creation_5m=cache_5m,
         cache_creation_1h=cache_1h,
-        service_tier=usage.get("service_tier")
-        if isinstance(usage.get("service_tier"), str)
-        else None,
+        service_tier=service_tier if isinstance(service_tier, str) else None,
     )
 
 

@@ -619,7 +619,7 @@ def per_turn_rows(
     Returns:
         One dict per turn: ``session_id, ts, model, source, agent_id, uuid,
         parent_uuid, is_sidechain, tokens_in, tokens_out, tokens_total, cache_read,
-        cache_creation, cache_creation_5m, cache_creation_1h, reasoning``.
+        cache_creation, cache_creation_5m, cache_creation_1h, service_tier, reasoning``.
     """
     gists = _reasoning_by_turn(reasoning_refs or [])
     rows: list[dict[str, object]] = []
