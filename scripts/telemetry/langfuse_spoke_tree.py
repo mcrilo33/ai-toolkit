@@ -135,6 +135,7 @@ _SCORE_PREFIX = "tree-score-"
 # Score names — Langfuse sums/charts numeric scores (it cannot chart arbitrary metadata).
 _PERMISSION_WAIT_SCORE = "permission_wait_ms"  # per blocked tool observation
 _GATE_PARK_SCORE = "gate_park_ms"  # trace-level PLAN-gate park wait
+_TOOL_RESULT_SIZE_SCORE = "tool_result_size"  # bytes of a tool node's reconstructed tool_result
 # output_config.effort handling (#101). ``ultra`` is the ultracode/harness mode, NOT an
 # effort level: it is diverted to a spoke-level ``ultracode`` trace tag, never recorded as
 # an ``effort:<value>`` tag or on llm_request metadata.
@@ -613,6 +614,26 @@ def _tool_additions(
     return additions
 
 
+def _tool_result_size(observation: Observation, tool_content: dict[str, ToolContent]) -> int | None:
+    """Return the byte size of a tool span's reconstructed ``tool_result``, or None (#101).
+
+    Measures the RAW transcript output (before :func:`_capped` truncates the display copy), so a
+    large tool result reports its true size. None for a non-tool span or one with no reconstructed
+    output, so the caller emits no score for it.
+    """
+    if not _is_tool_span(observation):
+        return None
+    content = tool_content.get(_tool_use_id(observation) or "")
+    if content is None or content.output is None:
+        return None
+    text = (
+        content.output
+        if isinstance(content.output, str)
+        else json.dumps(content.output, ensure_ascii=False)
+    )
+    return len(text.encode("utf-8"))
+
+
 def _copy_event(
     observation: Observation,
     *,
@@ -656,6 +677,9 @@ def _copy_event(
         if observation.get(field) is not None:
             body[field] = observation[field]
     body.update(_tool_additions(observation, tool_content))
+    size = _tool_result_size(observation, tool_content)
+    if size is not None:
+        body.setdefault("metadata", {})["tool_result_size"] = size
     return {"id": new_id, "type": event_type, "timestamp": start, "body": body}
 
 
@@ -1777,13 +1801,16 @@ def build_score_events(
     *,
     base_ts: str,
 ) -> list[IngestEvent]:
-    """Build the numeric Langfuse scores that make the spoke's time budget chartable (#100).
+    """Build the numeric Langfuse scores that make a spoke's metadata chartable (#100, #101).
 
     Langfuse dashboards can sum/aggregate numeric SCORES but not arbitrary observation metadata,
-    so two time-budget signals already present as metadata are ALSO emitted as scores:
+    so three signals already present as metadata are ALSO emitted as scores:
 
     - ``permission_wait_ms`` — an observation-level score on every ``tool:`` node carrying a
       folded ``blocked_on_user_ms`` (Part 2), so permission-prompt wait sums across spokes.
+    - ``tool_result_size`` — an observation-level score on every ``tool:`` node carrying a
+      reconstructed ``tool_result_size`` (#101 part 4), so "which tool outputs bloat context"
+      is a one-click chart.
     - ``gate_park_ms`` — a trace-level score for the PLAN-gate park (:func:`_gate_park_ms`),
       emitted only when the spoke parked at a gate.
 
@@ -1792,23 +1819,37 @@ def build_score_events(
     Args:
         spoke_run_id: The spoke run identifier.
         traces: The source traces (for the gate-park gap).
-        batch: The assembled events (read for the folded ``blocked_on_user_ms`` tool metadata).
+        batch: The assembled events (read for the folded ``blocked_on_user_ms`` /
+            ``tool_result_size`` tool metadata).
         base_ts: ISO timestamp stamped on every score event.
 
     Returns:
-        The ``score-create`` ingestion events (empty when neither signal is present).
+        The ``score-create`` ingestion events (empty when no signal is present).
     """
     trace_id = trace_id_for(spoke_run_id)
     events: list[IngestEvent] = []
     for event in batch:
         body = event["body"]
-        wait = (body.get("metadata") or {}).get("blocked_on_user_ms")
+        metadata = body.get("metadata") or {}
+        wait = metadata.get("blocked_on_user_ms")
         if wait is not None:
             events.append(
                 _score_event(
                     spoke_run_id,
                     name=_PERMISSION_WAIT_SCORE,
                     value=int(wait),
+                    trace_id=trace_id,
+                    base_ts=base_ts,
+                    observation_id=body["id"],
+                )
+            )
+        size = metadata.get("tool_result_size")
+        if size is not None:
+            events.append(
+                _score_event(
+                    spoke_run_id,
+                    name=_TOOL_RESULT_SIZE_SCORE,
+                    value=int(size),
                     trace_id=trace_id,
                     base_ts=base_ts,
                     observation_id=body["id"],
