@@ -1802,10 +1802,12 @@ class TestLlmDecompositionMetadata:
         assert item_sum == meta["measured"]
 
 
-class TestRequestEffort:
-    """#101 part 1: output_config.effort is folded onto each llm_request copy as metadata and
-    promoted to a trace-level ``effort:<value>`` tag; ``ultra`` is the harness mode (ultracode),
-    never an effort value, so it becomes a separate ``ultracode`` trace tag.
+class TestRequestBodyMetadata:
+    """#101 parts 1 + 3: request-body-derived signals folded onto each llm_request copy.
+
+    output_config.effort becomes ``metadata.effort`` + a trace-level ``effort:<value>`` tag
+    (``ultra`` is the harness mode, diverted to a separate ``ultracode`` tag, never an effort),
+    and the ``cache_control`` breakpoint positions become ``metadata.cache_breakpoints``.
     """
 
     _TOOL = {"name": "Bash", "description": "d" * 40, "input_schema": {"type": "object"}}
