@@ -1354,6 +1354,92 @@ class TestStepGrouping:
         assert _by_orig(batch, "tr", "mk")["body"]["parentObservationId"] == steps["step:inner"]
 
 
+def _audit_event(obs_id: str, name: str, *, start: str | None = None, **metadata) -> dict:
+    """Build a span-less audit observation (EVENT type, flat metadata, no parent).
+
+    Mirrors how :mod:`telemetry.langfuse_audit_events` mints lifecycle events on the per-spoke
+    ``spoke-audit:`` trace — a startTime carries the LAGGING OTel-logs flush time, never used
+    for placement.
+    """
+    return _obs(obs_id, name, type_="EVENT", parent=None, startTime=start, metadata=metadata)
+
+
+def _root_meta(batch: list[dict]) -> dict:
+    """Return the synthetic root span's metadata (empty dict when absent)."""
+    root = next(e for e in batch if e["id"] == root_id_for(SPOKE))
+    return root["body"].get("metadata") or {}
+
+
+def _has_copy(batch: list[dict], orig_trace_id: str, orig_obs_id: str) -> bool:
+    """Whether a copy node exists for one source observation."""
+    copy_id = _copy_id(orig_trace_id, orig_obs_id)
+    return any(event["id"] == copy_id for event in batch)
+
+
+class TestStartupInstantCollapse:
+    """#104: session-startup lifecycle instants (mcp_server_connection, plugin_loaded) are
+    DEMOTED to the synthetic root's ``session_init`` metadata instead of standing as N sibling
+    span nodes placed by their lagging log timestamp.
+    """
+
+    def test_mcp_connection_collapses_to_root_metadata(self) -> None:
+        mcp = _audit_event(
+            "mc1",
+            "mcp_server_connection:connected",
+            start="2026-01-02T00:00:09Z",
+            status="connected",
+            server_name="langfuse",
+        )
+
+        batch = build_batch([("trace-audit", [mcp])], SPOKE)
+
+        init = _root_meta(batch)["session_init"]
+        assert init == [
+            {
+                "name": "mcp_server_connection:connected",
+                "status": "connected",
+                "server_name": "langfuse",
+            }
+        ]
+
+    def test_collapsed_startup_instant_emits_no_node(self) -> None:
+        mcp = _audit_event("mc2", "mcp_server_connection:connected", status="connected")
+
+        batch = build_batch([("trace-audit", [mcp])], SPOKE)
+
+        assert not _has_copy(batch, "trace-audit", "mc2")
+
+    def test_plugin_loaded_collapses_to_root_metadata(self) -> None:
+        plugin = _audit_event(
+            "pl1", "plugin_loaded", start="2026-01-02T00:00:02Z", **{"plugin.name": "claude-hud"}
+        )
+
+        batch = build_batch([("trace-audit", [plugin])], SPOKE)
+
+        assert _root_meta(batch)["session_init"] == [
+            {"name": "plugin_loaded", "plugin.name": "claude-hud"}
+        ]
+        assert not _has_copy(batch, "trace-audit", "pl1")
+
+    def test_multiple_startup_instants_list_under_one_field(self) -> None:
+        # Two startup instants collapse into ONE metadata list, not two sibling nodes.
+        events = [
+            _audit_event("mc3", "mcp_server_connection:connected", status="connected"),
+            _audit_event("mc4", "mcp_server_connection:failed", status="failed"),
+        ]
+
+        batch = build_batch([("trace-audit", events)], SPOKE)
+
+        names = [entry["name"] for entry in _root_meta(batch)["session_init"]]
+        assert names == ["mcp_server_connection:connected", "mcp_server_connection:failed"]
+
+    def test_no_session_init_field_without_startup_instants(self) -> None:
+        # A spoke with no startup instants carries no session_init key on the root.
+        batch = build_batch(_traces(), SPOKE)
+
+        assert "session_init" not in _root_meta(batch)
+
+
 class TestScanTranscripts:
     def test_joins_tool_use_input_and_tool_result_output(self, tmp_path: Path) -> None:
         _write_transcript(
