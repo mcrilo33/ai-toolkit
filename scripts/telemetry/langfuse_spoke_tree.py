@@ -179,6 +179,17 @@ _FOLD_EXECUTION_NAME = "claude_code.tool.execution"
 _FOLD_BLOCKED_NAME = "claude_code.tool.blocked_on_user"
 _FOLD_DECISION_PREFIX = "tool_decision"
 
+# Span-less session-startup audit instants (#104). They ride the OTel logs signal, so their
+# observation ``startTime`` is the LAGGING flush time, never the true event time; placing them
+# on the timeline by it renders them misleadingly late. They carry no causal id-join to a tool
+# or turn, so they are DEMOTED to the synthetic root's ``session_init`` metadata list rather
+# than standing as N sibling span nodes. Recognised by name prefix (``mcp_server_connection``
+# carries a ``:<status>`` discriminator; ``plugin_loaded`` is bare); neither collides with a
+# visible ``tool:<Name>`` span or a bare tool name.
+_STARTUP_INSTANT_PREFIXES = ("mcp_server_connection", "plugin_loaded")
+# Root metadata field collecting the demoted startup instants.
+_SESSION_INIT_FIELD = "session_init"
+
 # Tool content (e.g. a large file Read) can be huge; cap the serialized text past this.
 _MAX_CONTENT_CHARS = 20_000
 _TRUNCATION_MARKER = "...[truncated]"
@@ -343,6 +354,11 @@ def _is_fold_subspan(observation: Observation) -> bool:
     return name in (_FOLD_EXECUTION_NAME, _FOLD_BLOCKED_NAME) or name.startswith(
         _FOLD_DECISION_PREFIX
     )
+
+
+def _is_startup_instant(observation: Observation) -> bool:
+    """Whether an observation is a session-startup audit instant demoted to root metadata (#104)."""
+    return (observation.get("name") or "").startswith(_STARTUP_INSTANT_PREFIXES)
 
 
 def _elapsed_ms(start: str, end: str) -> int | None:
@@ -891,6 +907,36 @@ def _step_event(window: StepWindow, step_id: str, root_id: str, trace_id: str) -
     }
 
 
+def _collapse_startup_instants(
+    copies: list[IngestEvent], root_event: IngestEvent
+) -> list[IngestEvent]:
+    """Demote session-startup instants to the root's ``session_init`` metadata, dropping nodes (#104).
+
+    Each ``mcp_server_connection`` / ``plugin_loaded`` copy is summarised as ``{"name", …metadata}``
+    onto the synthetic root's ``session_init`` list (preserving fetch order) and its node is removed,
+    so a spoke's startup events read as one metadata field instead of N sibling spans placed by the
+    lagging log timestamp. No ``session_init`` key is written when the spoke has no startup instants.
+
+    Args:
+        copies: The source observation copies; startup-instant copies are removed.
+        root_event: The synthetic root event; its metadata is mutated in place.
+
+    Returns:
+        The copies with the startup-instant nodes removed.
+    """
+    init: list[dict[str, Any]] = []
+    kept: list[IngestEvent] = []
+    for event in copies:
+        body = event["body"]
+        if not _is_startup_instant(body):
+            kept.append(event)
+            continue
+        init.append({"name": body.get("name"), **(body.get("metadata") or {})})
+    if init:
+        root_event["body"].setdefault("metadata", {})[_SESSION_INIT_FIELD] = init
+    return kept
+
+
 def _apply_step_grouping(
     copies: list[IngestEvent],
     traces: list[TraceObservations],
@@ -1020,6 +1066,7 @@ def build_batch(
                 )
             )
     copies = _fold_tool_subspans(copies, traces, tool_index)
+    copies = _collapse_startup_instants(copies, root_event)
     step_events = _apply_step_grouping(
         copies, traces, tool_content, root_id=root_id, spoke_run_id=spoke_run_id, trace_id=trace_id
     )
