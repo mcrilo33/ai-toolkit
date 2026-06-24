@@ -295,7 +295,8 @@ wt_collector_launch() {
 # Idempotently ensure the otelcol collector is up for an opted-in spoke. A no-op
 # unless AI_TOOLKIT_OTEL=1 (AI_TOOLKIT_OTEL=0 is a clean full opt-out). Never
 # starts a second collector (skips when :4317 already listens — a duplicate would
-# fail to bind anyway). When LANGFUSE_BASIC_AUTH is unset the collector can't
+# fail anyway: a port-bind clash, or a --name conflict against a stopped
+# lf-collector, both swallowed best-effort). When LANGFUSE_BASIC_AUTH is unset the collector can't
 # authenticate to Langfuse, so warn (telemetry won't land) but DO NOT fail the
 # spawn — same posture as wt_otel_bridge_preflight. Run BEFORE the bridge
 # preflight: the collector forks to the bridge, so both must be up before the
