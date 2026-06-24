@@ -140,6 +140,35 @@ fi
 git worktree prune
 echo "✓ removed: $WT_DIR"
 
+# --- scrub the removed path from VS Code's "Open Recent" list (issue #103) ---
+# `code --remove` folds the folder out of the live window, but VS Code keeps the
+# path in its global recent-folders history forever — one stale entry per spoke.
+# The CLI exposes no way to drop a single recent entry, so vscode-prune-recent.py
+# edits the state store directly. Run AFTER the on-disk removal (an aborted
+# removal keeps the worktree, so its recent entry should stay). Skip when VS Code
+# is live: it rewrites storage.json on flush, so our edit would be lost or race.
+# Gated on --no-code with the rest of the VS Code teardown.
+prune_vscode_recent() {
+  local wt_path="$1"
+  local vscode_dir="${AI_TOOLKIT_VSCODE_DIR:-$HOME/Library/Application Support/Code}"
+  local storage="$vscode_dir/User/globalStorage/storage.json"
+  [ -f "$storage" ] || return 0   # no state store (CLI-only host) — nothing to scrub
+  local lock="$vscode_dir/code.lock"
+  if [ -f "$lock" ]; then
+    local pid
+    pid="$(cat "$lock" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      echo "  VS Code is running — left its Open Recent list untouched (close it to scrub the entry)."
+      return 0
+    fi
+  fi
+  python3 "$SCRIPT_DIR/vscode-prune-recent.py" "$storage" "$wt_path" \
+    || wt_warn "couldn't scrub $wt_path from VS Code's Open Recent list."
+}
+if [ -z "$NO_CODE" ]; then
+  prune_vscode_recent "$WT_DIR"
+fi
+
 # --- prune the branch, but only when it is fully merged ----------------------
 # We removed the worktree from the hub (now cwd), so HEAD here is the hub's
 # current branch — the integration target. A branch that is its ancestor is
