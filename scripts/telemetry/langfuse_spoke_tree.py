@@ -71,18 +71,20 @@ Beyond copying, the build adds two CREATE-only enrichments (no patches):
   sub-agent, and the synthetic root) gets ``metadata.rollup = {reused, written, input,
   output}`` summed over its subtree of the re-parented tree, reusing
   ``langfuse_rollup``'s sum logic but written into the create body.
-- **An itemized loaded-context subtree.** A ``loaded-context`` node under the root with one
-  category node per group and one item node per name (token size + cost). The primary
-  source is the spoke's untruncated raw request body
-  (``OTEL_LOG_RAW_API_BODIES=file:<dir>``, located via ``--request-bodies`` /
-  ``$AI_TOOLKIT_OTEL_BODY_DIR``): ``request_body`` itemizes the WHOLE first-call prefix —
-  every tool and MCP tool by name + exact size, each system block, and each
-  ``messages[0]`` ``<system-reminder>`` by kind — so no reconciliation is needed. When no
-  request body is available, it falls back to disk measurement of rules / memory / skills /
-  sub-agents / environment (via ``measure_context_cost``) plus a single reconciled
-  ``remainder`` node (``prefix - Σ measured disk``, clamped ≥ 0) absorbing the base system
-  prompt, tool schemas, and MCP together — the full prefix being
-  ``cache_read + cache_creation`` of the first LLM call.
+- **A collapsed loaded-context node.** A SINGLE ``loaded-context`` node under the root —
+  static startup inventory is not work, so it does not earn a ~60-leaf timeline subtree.
+  Its headline ``metadata.tokens`` is the total startup context tokens (the one number
+  worth aggregating across spokes); ``metadata.breakdown`` carries the full itemization
+  grouped by category (``{category: {name: tokens}}``). The primary source is the spoke's
+  untruncated raw request body (``OTEL_LOG_RAW_API_BODIES=file:<dir>``, located via
+  ``--request-bodies`` / ``$AI_TOOLKIT_OTEL_BODY_DIR``): ``request_body`` itemizes the WHOLE
+  first-call prefix — every tool and MCP tool by name + exact size, each system block, and
+  each ``messages[0]`` ``<system-reminder>`` by kind — so no reconciliation is needed. When
+  no request body is available, it falls back to disk measurement of rules / memory /
+  skills / sub-agents / environment (via ``measure_context_cost``) plus a single reconciled
+  ``remainder`` (``prefix - Σ measured disk``, clamped ≥ 0) folded into ``metadata.remainder``
+  and the total — absorbing the base system prompt, tool schemas, and MCP together, the
+  full prefix being ``cache_read + cache_creation`` of the first LLM call.
 
 Import-safe: no environment is read at import time, so :func:`build_batch`,
 :func:`scan_transcripts`, and :func:`build_loaded_context_events` are unit-testable with no
@@ -234,12 +236,8 @@ _TRUNCATION_MARKER = "...[truncated]"
 # Default root holding Claude Code session transcripts.
 _DEFAULT_PROJECTS = Path("~/.claude/projects").expanduser()
 
-# Deterministic id prefix for the synthetic loaded-context subtree nodes.
+# Deterministic id prefix for the synthetic loaded-context node.
 _LC_PREFIX = "tree-lc-"
-# Source label for the single reconciled remainder used in the disk fallback path.
-_REMAINDER_SOURCE = "reconciled-remainder"
-# Note recorded on the disk-fallback remainder node, naming what it absorbs.
-_REMAINDER_NOTE = "no request body; base system + tools + mcp reconciled as one"
 # Default cache-creation price (USD per token), Opus tier — mirrors measure_context_cost.
 _DEFAULT_PRICE = 0.00000625
 # Category order for the request-body itemization (the primary, fully-itemized path).
@@ -1424,144 +1422,86 @@ def build_loaded_context_events(
     prefix_total: int | None = None,
     price: float | None = None,
 ) -> list[IngestEvent]:
-    """Build the itemized loaded-context subtree under the spoke root.
+    """Build the single collapsed loaded-context observation under the spoke root.
 
-    Emits a ``loaded-context`` parent under the synthetic root, one category node per
-    group (in ``category_order``) carrying its rolled-up total, and one item node per name
-    (token size + cost + source, plus a ``cached`` flag when the row carries one).
+    The loaded-context items are static startup inventory with token weights, not work —
+    they share one timestamp and carry no causal order — so they collapse into ONE
+    ``loaded-context`` span under the synthetic root instead of a ~60-leaf subtree. Its
+    headline ``metadata.tokens`` is the total startup context tokens (the one number worth
+    aggregating across spokes); ``metadata.breakdown`` carries the full itemization grouped
+    by category (``{category: {name: tokens}}``, in ``category_order``, duplicate names
+    summed); ``metadata.cost_usd`` is the aggregate cost.
 
     The primary, request-body path itemizes the WHOLE first-call prefix — every tool / MCP
     tool / system block / reminder by name and exact size — so it needs no reconciliation;
     ``prefix_total`` is then left None. The disk fallback (no request body) can only measure
-    the on-disk categories, so it passes ``prefix_total`` and ``price`` to append a single
-    ``remainder`` node = ``prefix_total - Σ measured`` (clamped ≥ 0) absorbing the base
-    system prompt, all tool schemas, and MCP together.
+    the on-disk categories, so it passes ``prefix_total`` and ``price`` to fold a single
+    reconciled ``remainder`` = ``prefix_total - Σ measured`` (clamped ≥ 0) into both
+    ``metadata.remainder`` and the headline total/cost — absorbing the base system prompt,
+    all tool schemas, and MCP together, without a separate node.
 
-    All ids derive from the spoke run id so a rerun overwrites the same nodes.
+    The id derives from the spoke run id so a rerun overwrites the same node.
 
     Args:
         spoke_run_id: The spoke run identifier.
         item_rows: Per-name measured rows (from :func:`measure_request_items` or
             :func:`measure_items`), each with ``category``, ``name``, ``tokens``,
-            ``cost_usd``, ``source``, ``estimated`` (and optionally ``cached``).
+            ``cost_usd`` (other per-row fields are ignored at this rendering layer).
         category_order: The category keys to render, in display order; empties are dropped.
-        base_ts: ISO timestamp stamped on every synthetic node.
+        base_ts: ISO timestamp stamped on the synthetic node.
         prefix_total: The first-call ``cache_read + cache_creation`` total; pass it (with
-            ``price``) only on the disk fallback to append the reconciled remainder node.
-        price: Cache-creation price in USD per token, for the remainder node's cost.
+            ``price``) only on the disk fallback to fold in the reconciled remainder.
+        price: Cache-creation price in USD per token, for the folded remainder's cost.
 
     Returns:
-        The loaded-context ingestion events: parent, categories, items, and — on the disk
-        fallback only — the reconciled remainder.
+        A single-element list: the collapsed loaded-context ingestion event.
     """
-    trace_id = trace_id_for(spoke_run_id)
-    root_id = root_id_for(spoke_run_id)
-    lc_id = _lc_id(spoke_run_id, "loaded-context")
-
     measured_tokens = sum(int(cast(int, row["tokens"])) for row in item_rows)
     measured_cost = sum(float(cast(float, row["cost_usd"])) for row in item_rows)
-    events = [
+
+    metadata: dict[str, object] = {
+        "tokens": measured_tokens,
+        "cost_usd": measured_cost,
+        "breakdown": _breakdown_by_category(item_rows, category_order),
+    }
+    if prefix_total is not None and price is not None:
+        remainder = max(0, prefix_total - measured_tokens)
+        metadata["remainder"] = remainder
+        metadata["tokens"] = measured_tokens + remainder
+        metadata["cost_usd"] = measured_cost + remainder * price
+
+    total = cast(int, metadata["tokens"])
+    return [
         _lc_node(
-            node_id=lc_id,
-            parent_id=root_id,
-            trace_id=trace_id,
-            name="loaded-context",
+            node_id=_lc_id(spoke_run_id, "loaded-context"),
+            parent_id=root_id_for(spoke_run_id),
+            trace_id=trace_id_for(spoke_run_id),
+            name=f"loaded-context: {_human_tokens(total)}",
             base_ts=base_ts,
-            metadata={"tokens": measured_tokens, "cost_usd": measured_cost},
+            metadata=metadata,
         )
     ]
-    for category, rows in _group_rows_by_category(item_rows, category_order):
-        cat_id = _lc_id(spoke_run_id, category)
-        events.append(
-            _lc_node(
-                node_id=cat_id,
-                parent_id=lc_id,
-                trace_id=trace_id,
-                name=category,
-                base_ts=base_ts,
-                metadata={
-                    "tokens": sum(int(cast(int, r["tokens"])) for r in rows),
-                    "cost_usd": sum(float(cast(float, r["cost_usd"])) for r in rows),
-                },
-            )
-        )
-        events.extend(
-            _lc_item_node(spoke_run_id, category, cat_id, trace_id, base_ts, row) for row in rows
-        )
-    if prefix_total is not None and price is not None:
-        events.append(
-            _remainder_node(
-                spoke_run_id, lc_id, trace_id, base_ts, prefix_total, measured_tokens, price
-            )
-        )
-    return events
 
 
-def _group_rows_by_category(
+def _breakdown_by_category(
     item_rows: list[dict[str, object]], category_order: tuple[str, ...]
-) -> list[tuple[str, list[dict[str, object]]]]:
-    """Group item rows by category in ``category_order``, dropping empty groups."""
-    groups: list[tuple[str, list[dict[str, object]]]] = []
+) -> dict[str, dict[str, int]]:
+    """Group per-name token counts by category in ``category_order``, summing duplicate names.
+
+    Drops empty categories. Duplicate ``(category, name)`` rows (e.g. a nested ``CLAUDE.md``)
+    are summed so each name appears once with its combined weight.
+    """
+    breakdown: dict[str, dict[str, int]] = {}
     for category in category_order:
-        rows = [row for row in item_rows if row["category"] == category]
-        if rows:
-            groups.append((category, rows))
-    return groups
-
-
-def _lc_item_node(
-    spoke_run_id: str,
-    category: str,
-    cat_id: str,
-    trace_id: str,
-    base_ts: str,
-    row: dict[str, object],
-) -> IngestEvent:
-    """Shape one per-name item node with its token size, cost, source, and cache flag."""
-    tokens = int(cast(int, row["tokens"]))
-    metadata: dict[str, object] = {
-        "tokens": tokens,
-        "cost_usd": row["cost_usd"],
-        "source": row["source"],
-    }
-    if row.get("estimated"):
-        metadata["estimated"] = True
-    if "cached" in row:
-        metadata["cached"] = bool(row["cached"])
-    return _lc_node(
-        node_id=_lc_id(spoke_run_id, f"{category}/{row['name']}"),
-        parent_id=cat_id,
-        trace_id=trace_id,
-        name=f"{row['name']}: {_human_tokens(tokens)}",
-        base_ts=base_ts,
-        metadata=metadata,
-    )
-
-
-def _remainder_node(
-    spoke_run_id: str,
-    lc_id: str,
-    trace_id: str,
-    base_ts: str,
-    prefix: int,
-    measured: int,
-    price: float,
-) -> IngestEvent:
-    """Shape the single fallback remainder node used when no floor was calibrated."""
-    tokens = max(0, prefix - measured)
-    return _lc_node(
-        node_id=_lc_id(spoke_run_id, "remainder"),
-        parent_id=lc_id,
-        trace_id=trace_id,
-        name=f"remainder: {_human_tokens(tokens)}",
-        base_ts=base_ts,
-        metadata={
-            "tokens": tokens,
-            "cost_usd": tokens * price,
-            "source": _REMAINDER_SOURCE,
-            "note": _REMAINDER_NOTE,
-        },
-    )
+        names: dict[str, int] = {}
+        for row in item_rows:
+            if row["category"] != category:
+                continue
+            name = cast(str, row["name"])
+            names[name] = names.get(name, 0) + int(cast(int, row["tokens"]))
+        if names:
+            breakdown[category] = names
+    return breakdown
 
 
 def loaded_context_rows(
@@ -1672,25 +1612,17 @@ def _decomp_metadata(rows: list[dict[str, object]], observed: int) -> dict[str, 
 
     ``components`` maps each category (in :data:`_DECOMP_CATEGORY_ORDER`) to ``{name: tokens}``
     for the items the split routed into this bucket — items that share a name within a category
-    are SUMMED, so ``Σ components == measured`` holds; ``measured`` is their sum and ``remainder``
-    is ``observed - measured`` so the itemization reconciles (≈) to the billed counter (the
-    remainder absorbs the base system prompt / tool schemas not itemized per-name).
+    are SUMMED (by :func:`_breakdown_by_category`), so ``Σ components == measured`` holds;
+    ``measured`` is their sum and ``remainder`` is ``observed - measured`` so the itemization
+    reconciles (≈) to the billed counter (the remainder absorbs the base system prompt / tool
+    schemas not itemized per-name).
     """
     measured = sum(int(cast(int, row["tokens"])) for row in rows)
-    components: dict[str, dict[str, int]] = {}
-    for category, crows in _group_rows_by_category(rows, _DECOMP_CATEGORY_ORDER):
-        # SUM on a name collision (rules share a basename, reminders a kind, skills a line) so the
-        # itemization still reconciles (Σ items == measured); a plain dict would drop all but one.
-        bucket: dict[str, int] = {}
-        for row in crows:
-            name = str(row["name"])
-            bucket[name] = bucket.get(name, 0) + int(cast(int, row["tokens"]))
-        components[category] = bucket
     return {
         "observed": observed,
         "measured": measured,
         "remainder": observed - measured,
-        "components": components,
+        "components": _breakdown_by_category(rows, _DECOMP_CATEGORY_ORDER),
     }
 
 
@@ -2183,7 +2115,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"{len(batch) - 2} observations assembled under trace {trace_id} "
         f"(roots collapsed to 1), {filled} tool spans filled from transcript, "
-        f"{len(rows)} loaded-context items itemized (source: {source}), "
+        f"{len(rows)} loaded-context items collapsed into 1 node (source: {source}), "
         f"{decomposed} llm_requests cache-decomposed, "
         f"{efforts} llm_requests effort-tagged, "
         f"{len(score_events)} numeric scores emitted, "
