@@ -43,6 +43,46 @@ def process(data: list[dict], strict: bool = False) -> Result:
 - Prefix unused variables with `_` (e.g., `for _ in range(n)`)
 - Allowed single letters: `i`, `j`, `k` (indices), `x`, `y` (coords), `e` (exceptions), `f` (files), `n` (counts)
 
+### Functions Lead With a Verb
+
+A function *does* something — name it after the action so call sites read as
+statements. Lead with a verb that names the effect:
+
+- `build_`/`create_`/`make_` — construct and return a new object
+- `save_`/`write_`/`store_` — persist (prefer `save_` for "persist"; reserve `write_`
+  for raw byte/stream writes)
+- `extract_`/`parse_`/`compute_`/`derive_` — produce a value from an input
+- `load_`/`fetch_`/`get_` — retrieve existing data
+- `record_`/`log_`/`emit_` — register an event or side effect
+
+```python
+# Avoid: noun-only or trailing-preposition names hide the action
+def new_run_record(...): ...        # is this a constructor? a getter?
+def write_run_record(...): ...      # "write" reads as raw I/O, not "persist + log"
+def finish_reason_of(response): ... # reads as an attribute, not a call
+
+# Prefer: the verb names what happens
+def build_run_record(...): ...
+def save_run_record(...): ...
+def extract_finish_reason(response): ...
+```
+
+**Exceptions — these legitimately do *not* lead with an action verb; don't
+"verb-ify" them:**
+
+- Predicates returning `bool`: `is_ready`, `has_input`, `can_retry`
+- Alternative constructors / converters: `from_dict`, `to_json`
+- `@property` computed attributes: name them as the noun they expose (`display_name`),
+  never `get_display_name`
+
+| Avoid | Prefer |
+|-------|--------|
+| `new_run_record(...)` | `build_run_record(...)` |
+| `write_run_record(...)` | `save_run_record(...)` |
+| `finish_reason_of(resp)` | `extract_finish_reason(resp)` |
+| `record_started(...)` | `record_run_started(...)` (verb + the noun it acts on) |
+| `get_is_valid()` | `is_valid` (predicate / property — no verb) |
+
 ## Imports
 
 ```python

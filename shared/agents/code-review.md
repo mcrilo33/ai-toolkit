@@ -58,11 +58,11 @@ Check each item:
 
 Apply project rules (`code-quality`, `python-style`, `pytest-conventions`):
 
-- Naming — do names reveal intent?
+- Naming — do names reveal intent? Functions/methods lead with a verb (per `python-style`); flag noun-only or trailing-preposition names (`new_x`, `write_x` for "persist", `x_of`) and over-verbed predicates/properties (`get_is_valid`).
 - Complexity — can anything be simplified?
 - Duplication — is logic repeated that should be extracted?
 - Consistency — does it match surrounding code patterns?
-- Documentation — are public APIs documented? Are "why" comments present for non-obvious decisions?
+- Documentation — are public APIs documented? Are "why" comments present for non-obvious decisions? Does a new stateful/lifecycle object (state machine, context-manager owner, cross-module behavior) have a process-level doc, not just per-function docstrings?
 
 ## Stage 2, Pass 3: Security
 
