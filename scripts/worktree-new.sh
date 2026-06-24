@@ -376,9 +376,12 @@ AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(print
 [ -n "${WT_AGENT_BUDGET_ARGS:-}" ] && AGENT_CMD="$AGENT_CMD ${WT_AGENT_BUDGET_ARGS}"
 [ -n "$PROMPT" ] && AGENT_CMD="$AGENT_CMD $(printf '%q' "$PROMPT")"
 
-# Bring up the Langfuse message bridge before the spoke starts streaming, so an
-# opted-in (AI_TOOLKIT_OTEL=1) spoke auto-populates Langfuse with no manual step.
-# Idempotent (never a second bridge) and best-effort (warns, never fails the spawn).
+# Bring up the otelcol collector, then the Langfuse message bridge, before the
+# spoke starts streaming, so an opted-in (AI_TOOLKIT_OTEL=1) spoke auto-populates
+# Langfuse with no manual step. Order matters: the collector (:4317, what CC
+# exports to) forks to the bridge (:4319), so it must be up first. Both are
+# idempotent (never a second instance) and best-effort (warn, never fail the spawn).
+wt_otel_collector_preflight "$REPO_ROOT"
 wt_otel_bridge_preflight "$REPO_ROOT"
 
 if [ "$SPAWN_TERMINAL" -eq 1 ]; then
