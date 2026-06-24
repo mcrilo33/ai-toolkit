@@ -37,6 +37,19 @@ are dropped (#100, :func:`_fold_tool_subspans`): ``claude_code.tool.execution`` 
 event -> ``decision``/``decision_source``. An unmatched ``tool_decision`` (no tool) keeps its
 node and collapses to the root.
 
+The same session also carries the ``spoke-audit:`` trace's span-less audit/lifecycle events
+(#93). They are folded in here too (#104), placed by CAUSAL id-join — never by their lagging
+OTel-logs ``startTime`` (the logs signal is batched and exported after the spans it interleaves
+with, so the timestamp lags the event). Tool-scoped events (``hook_execution_complete``,
+``tool_result``, ``tool_decision``) nest/fold under their tool by ``tool_use_id`` as above;
+``api_error``/``api_refusal`` nest under their ``llm_request`` by ``request_id``; the
+session-startup instants (``mcp_server_connection``, ``plugin_loaded``) are DEMOTED to the
+synthetic root's ``session_init`` metadata list (:func:`_collapse_startup_instants`) instead of
+standing as sibling nodes; and the genuinely unresolvable instants (``skill_activated``,
+``permission_mode_changed``, ``compaction``) fall to the root as a last resort. Every audit
+instant is excluded from the cycle-step window placement (:func:`_apply_step_grouping`), which
+keys off ``startTime``. The standalone ``spoke-audit:`` trace is read-only here — additive only.
+
 All ids derive from the spoke run id and the source ``(trace_id, observation_id)`` pair,
 so a rerun overwrites the same trace/observations instead of appending. This trace
 DUPLICATES the native per-turn traces by design — it is the assembled, nested view.
@@ -189,6 +202,30 @@ _FOLD_DECISION_PREFIX = "tool_decision"
 _STARTUP_INSTANT_PREFIXES = ("mcp_server_connection", "plugin_loaded")
 # Root metadata field collecting the demoted startup instants.
 _SESSION_INIT_FIELD = "session_init"
+
+# Span-less audit/lifecycle instants that reach the step-grouping pass (#104). Every one rides
+# the OTel logs signal, so its observation ``startTime`` is the LAGGING flush time and is NEVER
+# used to place it on the timeline: the tool-scoped events nest under their tool by
+# ``tool_use_id`` (see :func:`_resolve_parent`); ``api_error`` / ``api_refusal`` nest under their
+# ``llm_request`` by ``request_id``; the remaining genuinely unresolvable instants
+# (``skill_activated``, ``permission_mode_changed``, ``compaction``) fall to the synthetic root
+# as a last resort. They are excluded from :func:`_apply_step_grouping`'s ``startTime`` window
+# placement. Startup instants are collapsed to metadata earlier and never reach here.
+# UPGRADE: nest skill_activated / permission_mode_changed / compaction into the cycle-step
+# window they sequence into — needs ``event.sequence`` carried onto the observation, which is an
+# emission-path change (langfuse_audit_events.py) deliberately out of scope for this pull-layer
+# work; the issue's caveat warns against harder step-attribution heuristics here.
+_REQUEST_AUDIT_PREFIXES = ("api_error", "api_refusal")
+_AUDIT_INSTANT_PREFIXES = (
+    *_TOOL_AUDIT_EVENT_PREFIXES,
+    *_REQUEST_AUDIT_PREFIXES,
+    "skill_activated",
+    "permission_mode_changed",
+    "compaction",
+)
+# Metadata keys that may carry an LLM request id, in priority order: the audit event uses
+# ``request_id``; the native ``llm_request`` span carries the same value as ``client_request_id``.
+_REQUEST_ID_KEYS = ("request_id", "client_request_id")
 
 # Tool content (e.g. a large file Read) can be huge; cap the serialized text past this.
 _MAX_CONTENT_CHARS = 20_000
@@ -359,6 +396,27 @@ def _is_fold_subspan(observation: Observation) -> bool:
 def _is_startup_instant(observation: Observation) -> bool:
     """Whether an observation is a session-startup audit instant demoted to root metadata (#104)."""
     return (observation.get("name") or "").startswith(_STARTUP_INSTANT_PREFIXES)
+
+
+def _is_audit_instant(observation: Observation) -> bool:
+    """Whether an observation is a span-less audit instant never placed by its lagging time (#104)."""
+    return (observation.get("name") or "").startswith(_AUDIT_INSTANT_PREFIXES)
+
+
+def _is_request_audit_event(observation: Observation) -> bool:
+    """Whether an observation is an ``api_error`` / ``api_refusal`` joining its llm_request (#104)."""
+    return (observation.get("name") or "").startswith(_REQUEST_AUDIT_PREFIXES)
+
+
+def _request_id(observation: Observation) -> str | None:
+    """Return the LLM request id from an observation's attributes/flat metadata, or None."""
+    metadata = observation.get("metadata") or {}
+    attributes = metadata.get("attributes") or {}
+    for key in _REQUEST_ID_KEYS:
+        value = attributes.get(key) or metadata.get(key)
+        if value:
+            return str(value)
+    return None
 
 
 def _elapsed_ms(start: str, end: str) -> int | None:
@@ -548,8 +606,37 @@ def _build_tool_index(traces: list[TraceObservations]) -> dict[str, str]:
     return index
 
 
+def _build_request_index(traces: list[TraceObservations]) -> dict[str, str]:
+    """Map each LLM ``request_id`` to the copy id of its ``llm_request`` generation (#104).
+
+    Only ``GENERATION`` observations (the native ``llm_request`` spans) own the index; the
+    ``api_error`` / ``api_refusal`` audit events that share the id are skipped so they remain the
+    re-parent satellites, never the target.
+
+    Args:
+        traces: The source traces paired with their observations.
+
+    Returns:
+        A mapping of ``request_id`` to the assembled-trace copy id of its ``llm_request``.
+    """
+    index: dict[str, str] = {}
+    for orig_trace_id, observations in traces:
+        for observation in observations:
+            if (observation.get("type") or "") != "GENERATION":
+                continue
+            rid = _request_id(observation)
+            if rid:
+                index[rid] = _copy_id(orig_trace_id, observation["id"])
+    return index
+
+
 def _resolve_parent(
-    observation: Observation, *, orig_trace_id: str, root_id: str, tool_index: dict[str, str]
+    observation: Observation,
+    *,
+    orig_trace_id: str,
+    root_id: str,
+    tool_index: dict[str, str],
+    request_index: dict[str, str],
 ) -> str:
     """Resolve the assembled-trace parent id for one source observation.
 
@@ -558,9 +645,11 @@ def _resolve_parent(
         orig_trace_id: The id of the trace the observation came from.
         root_id: The synthetic root span id (the single collapsed root).
         tool_index: Tool-call-id to tool-copy-id map from :func:`_build_tool_index`.
+        request_index: Request-id to llm_request-copy-id map from :func:`_build_request_index`.
 
     Returns:
-        The copy id of the intra-trace parent, the matching tool, or the synthetic root.
+        The copy id of the intra-trace parent, the matching tool / llm_request, or the
+        synthetic root.
     """
     parent = observation.get("parentObservationId")
     if parent:
@@ -569,6 +658,10 @@ def _resolve_parent(
         tuid = _tool_use_id(observation)
         if tuid and tuid in tool_index:
             return tool_index[tuid]
+    if _is_request_audit_event(observation):
+        rid = _request_id(observation)
+        if rid and rid in request_index:
+            return request_index[rid]
     return root_id
 
 
@@ -985,6 +1078,8 @@ def _apply_step_grouping(
         body = event["body"]
         if body.get("parentObservationId") != root_id or body["id"] in interaction_ids:
             continue  # only the root's own non-interaction satellites move
+        if _is_audit_instant(body):
+            continue  # #104: a lagging-timestamped audit instant is never window-placed by it
         start = body.get("startTime")
         window = _containing_window(start, windows) if start else None
         if window is not None:
@@ -1050,11 +1145,16 @@ def build_batch(
         },
     }
     tool_index = _build_tool_index(traces)
+    request_index = _build_request_index(traces)
     copies: list[IngestEvent] = []
     for orig_trace_id, observations in traces:
         for observation in observations:
             parent_id = _resolve_parent(
-                observation, orig_trace_id=orig_trace_id, root_id=root_id, tool_index=tool_index
+                observation,
+                orig_trace_id=orig_trace_id,
+                root_id=root_id,
+                tool_index=tool_index,
+                request_index=request_index,
             )
             copies.append(
                 _copy_event(
