@@ -258,3 +258,56 @@ wt_otel_bridge_preflight() {
   fi
   wt_bridge_launch "$repo_root"
 }
+
+# --- native-OTel collector preflight (auto-ensure) ---------------------------
+# A spoke that opted into native OTel (AI_TOOLKIT_OTEL=1) exports its
+# traces/logs/metrics to the otelcol collector on :4317; the collector in turn
+# forks the LLM I/O + audit events to the message bridge (:4319). If the
+# collector is down (fresh boot, crashed container, never started) every spoke
+# exports into a dead port and nothing reaches Langfuse. This helper brings the
+# collector up idempotently at spawn — mirroring wt_otel_bridge_preflight — so
+# the operator runs no manual step. Best-effort: it never fails the spawn.
+
+# Start the otelcol collector (lf-collector) in a detached Docker container.
+# Split from the preflight so the decision logic stays unit-testable (override
+# wt_port_listening, no real `docker run`). The non-secret connection endpoints
+# default to the local stack when the operator left them unset; the `docker -e
+# VAR` (valueless) form forwards them — and LANGFUSE_BASIC_AUTH — from this
+# shell, so re-export them in a subshell. LANGFUSE_BASIC_AUTH is forwarded
+# VERBATIM: wrapping it in extra quotes makes the collector's Authorization
+# header 401 while metrics still flow (looks like a pipeline bug but is auth).
+# Args: $1 = repo root (holds dashboard/langfuse/otelcol.yaml).
+wt_collector_launch() {
+  local repo_root="$1"
+  (
+    export LANGFUSE_OTLP_ENDPOINT="${LANGFUSE_OTLP_ENDPOINT:-http://host.docker.internal:3000/api/public/otel}"
+    export BRIDGE_OTLP_ENDPOINT="${BRIDGE_OTLP_ENDPOINT:-http://host.docker.internal:4319}"
+    export LANGFUSE_BASIC_AUTH
+    docker run -d --name lf-collector --add-host=host.docker.internal:host-gateway \
+      -p 4317:4317 -p 4318:4318 -p 4418:4418 -p 8889:8889 \
+      -e LANGFUSE_OTLP_ENDPOINT -e LANGFUSE_BASIC_AUTH -e BRIDGE_OTLP_ENDPOINT \
+      -v "$repo_root/dashboard/langfuse/otelcol.yaml:/etc/otelcol-contrib/config.yaml" \
+      otel/opentelemetry-collector-contrib:latest >/dev/null 2>&1
+  )
+  echo "→ started lf-collector (otelcol) on :4317/:4318/:4418/:8889"
+}
+
+# Idempotently ensure the otelcol collector is up for an opted-in spoke. A no-op
+# unless AI_TOOLKIT_OTEL=1 (AI_TOOLKIT_OTEL=0 is a clean full opt-out). Never
+# starts a second collector (skips when :4317 already listens — a duplicate would
+# fail anyway: a port-bind clash, or a --name conflict against a stopped
+# lf-collector, both swallowed best-effort). When LANGFUSE_BASIC_AUTH is unset the collector can't
+# authenticate to Langfuse, so warn (telemetry won't land) but DO NOT fail the
+# spawn — same posture as wt_otel_bridge_preflight. Run BEFORE the bridge
+# preflight: the collector forks to the bridge, so both must be up before the
+# spoke's first export. Args: $1 = repo root.
+wt_otel_collector_preflight() {
+  local repo_root="$1" port=4317
+  [ "${AI_TOOLKIT_OTEL:-}" = "1" ] || return 0
+  wt_port_listening "$port" && return 0
+  if [ -z "${LANGFUSE_BASIC_AUTH:-}" ]; then
+    wt_warn "OTel collector down on :$port and LANGFUSE_BASIC_AUTH unset — telemetry won't reach Langfuse; spoke still launches"
+    return 0
+  fi
+  wt_collector_launch "$repo_root"
+}
