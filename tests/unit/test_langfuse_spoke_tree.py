@@ -1354,6 +1354,270 @@ class TestStepGrouping:
         assert _by_orig(batch, "tr", "mk")["body"]["parentObservationId"] == steps["step:inner"]
 
 
+def _audit_event(obs_id: str, name: str, *, start: str | None = None, **metadata) -> dict:
+    """Build a span-less audit observation (EVENT type, flat metadata, no parent).
+
+    Mirrors how :mod:`telemetry.langfuse_audit_events` mints lifecycle events on the per-spoke
+    ``spoke-audit:`` trace — a startTime carries the LAGGING OTel-logs flush time, never used
+    for placement.
+    """
+    return _obs(obs_id, name, type_="EVENT", parent=None, startTime=start, metadata=metadata)
+
+
+def _root_meta(batch: list[dict]) -> dict:
+    """Return the synthetic root span's metadata (empty dict when absent)."""
+    root = next(e for e in batch if e["id"] == root_id_for(SPOKE))
+    return root["body"].get("metadata") or {}
+
+
+def _has_copy(batch: list[dict], orig_trace_id: str, orig_obs_id: str) -> bool:
+    """Whether a copy node exists for one source observation."""
+    copy_id = _copy_id(orig_trace_id, orig_obs_id)
+    return any(event["id"] == copy_id for event in batch)
+
+
+class TestStartupInstantCollapse:
+    """#104: session-startup lifecycle instants (mcp_server_connection, plugin_loaded) are
+    DEMOTED to the synthetic root's ``session_init`` metadata instead of standing as N sibling
+    span nodes placed by their lagging log timestamp.
+    """
+
+    def test_mcp_connection_collapses_to_root_metadata(self) -> None:
+        mcp = _audit_event(
+            "mc1",
+            "mcp_server_connection:connected",
+            start="2026-01-02T00:00:09Z",
+            status="connected",
+            server_name="langfuse",
+        )
+
+        batch = build_batch([("trace-audit", [mcp])], SPOKE)
+
+        init = _root_meta(batch)["session_init"]
+        assert init == [
+            {
+                "name": "mcp_server_connection:connected",
+                "status": "connected",
+                "server_name": "langfuse",
+            }
+        ]
+
+    def test_collapsed_startup_instant_emits_no_node(self) -> None:
+        mcp = _audit_event("mc2", "mcp_server_connection:connected", status="connected")
+
+        batch = build_batch([("trace-audit", [mcp])], SPOKE)
+
+        assert not _has_copy(batch, "trace-audit", "mc2")
+
+    def test_plugin_loaded_collapses_to_root_metadata(self) -> None:
+        plugin = _audit_event(
+            "pl1", "plugin_loaded", start="2026-01-02T00:00:02Z", **{"plugin.name": "claude-hud"}
+        )
+
+        batch = build_batch([("trace-audit", [plugin])], SPOKE)
+
+        assert _root_meta(batch)["session_init"] == [
+            {"name": "plugin_loaded", "plugin.name": "claude-hud"}
+        ]
+        assert not _has_copy(batch, "trace-audit", "pl1")
+
+    def test_multiple_startup_instants_list_under_one_field(self) -> None:
+        # Two startup instants collapse into ONE metadata list, not two sibling nodes.
+        events = [
+            _audit_event("mc3", "mcp_server_connection:connected", status="connected"),
+            _audit_event("mc4", "mcp_server_connection:failed", status="failed"),
+        ]
+
+        batch = build_batch([("trace-audit", events)], SPOKE)
+
+        names = [entry["name"] for entry in _root_meta(batch)["session_init"]]
+        assert names == ["mcp_server_connection:connected", "mcp_server_connection:failed"]
+
+    def test_no_session_init_field_without_startup_instants(self) -> None:
+        # A spoke with no startup instants carries no session_init key on the root.
+        batch = build_batch(_traces(), SPOKE)
+
+        assert "session_init" not in _root_meta(batch)
+
+
+class TestAuditInstantPlacement:
+    """#104: span-less audit/lifecycle instants are placed by CAUSAL id-joins, never by their
+    lagging OTel-logs ``startTime``. Tool-scoped events nest under their tool (tool_use_id);
+    api_error / api_refusal nest under their llm_request (request_id); the genuinely
+    unresolvable instants (skill_activated, permission_mode_changed, compaction) fall to the
+    synthetic root as a last resort — never re-homed into a step window by the lagging time.
+    """
+
+    def _content(self) -> dict[str, ToolContent]:
+        return {
+            "tu-c1": ToolContent(
+                {"subject": "S1 RED: x"}, "Task #1 created successfully: S1 RED: x"
+            ),
+            "tu-u1": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
+            "tu-u2": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
+        }
+
+    def _ledger_traces(self) -> list[tuple[str, list[dict]]]:
+        # A solo-cycle ledger window spanning 00:00..00:20 under one interaction.
+        interaction = _obs(
+            "i1", "claude_code.interaction", parent=None, startTime="2026-01-02T00:00:00Z"
+        )
+        create = _obs(
+            "tc1",
+            "tool:TaskCreate",
+            parent="i1",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:00Z",
+            metadata={"attributes": {"tool_use_id": "tu-c1"}},
+        )
+        started = _obs(
+            "tu1",
+            "tool:TaskUpdate",
+            parent="i1",
+            startTime="2026-01-02T00:00:01Z",
+            endTime="2026-01-02T00:00:01Z",
+            metadata={"attributes": {"tool_use_id": "tu-u1"}},
+        )
+        done = _obs(
+            "tu2",
+            "tool:TaskUpdate",
+            parent="i1",
+            startTime="2026-01-02T00:00:20Z",
+            endTime="2026-01-02T00:00:20Z",
+            metadata={"attributes": {"tool_use_id": "tu-u2"}},
+        )
+        return [("tr", [interaction, create, started, done])]
+
+    def test_skill_activated_inside_a_window_stays_at_root(self) -> None:
+        # The anti-lag guarantee: a skill_activated whose LAGGING startTime falls inside the
+        # ledger window must NOT be re-homed under the step node — it stays at the root.
+        traces = self._ledger_traces()
+        skill = _audit_event(
+            "sk1", "skill_activated", start="2026-01-02T00:00:05Z", **{"skill.name": "source-task"}
+        )
+        traces[0][1].append(skill)
+
+        batch = build_batch(traces, SPOKE, self._content())
+
+        assert _by_orig(batch, "tr", "sk1")["body"]["parentObservationId"] == root_id_for(SPOKE)
+
+    def test_compaction_falls_to_root(self) -> None:
+        compaction = _audit_event("cp1", "compaction", trigger="auto", pre_tokens="9000")
+
+        batch = build_batch([("trace-audit", [compaction])], SPOKE)
+
+        assert _by_orig(batch, "trace-audit", "cp1")["body"]["parentObservationId"] == root_id_for(
+            SPOKE
+        )
+
+    def test_permission_mode_change_falls_to_root(self) -> None:
+        mode = _audit_event("pm1", "permission_mode_changed:plan", to_mode="plan")
+
+        batch = build_batch([("trace-audit", [mode])], SPOKE)
+
+        assert _by_orig(batch, "trace-audit", "pm1")["body"]["parentObservationId"] == root_id_for(
+            SPOKE
+        )
+
+    def test_api_error_nests_under_llm_request_via_request_id(self) -> None:
+        gen = _obs(
+            "g1",
+            "llm_request",
+            type_="GENERATION",
+            parent="i1",
+            metadata={"attributes": {"client_request_id": "req-1"}},
+        )
+        interaction = _obs("i1", "claude_code.interaction", parent=None)
+        err = _audit_event("e1", "api_error", request_id="req-1", status_code="500")
+        traces = [("trace-int", [interaction, gen]), ("trace-audit", [err])]
+
+        batch = build_batch(traces, SPOKE)
+
+        assert _by_orig(batch, "trace-audit", "e1")["body"]["parentObservationId"] == _copy_id(
+            "trace-int", "g1"
+        )
+
+    def test_api_refusal_nests_under_llm_request_via_request_id(self) -> None:
+        gen = _obs(
+            "g2",
+            "llm_request",
+            type_="GENERATION",
+            parent=None,
+            metadata={"attributes": {"client_request_id": "req-2"}},
+        )
+        refusal = _audit_event("rf1", "api_refusal", request_id="req-2", category="value")
+        traces = [("trace-int", [gen]), ("trace-audit", [refusal])]
+
+        batch = build_batch(traces, SPOKE)
+
+        assert _by_orig(batch, "trace-audit", "rf1")["body"]["parentObservationId"] == _copy_id(
+            "trace-int", "g2"
+        )
+
+    def test_api_error_without_a_matching_request_falls_to_root(self) -> None:
+        err = _audit_event("e9", "api_error", request_id="req-absent", status_code="500")
+
+        batch = build_batch([("trace-audit", [err])], SPOKE)
+
+        assert _by_orig(batch, "trace-audit", "e9")["body"]["parentObservationId"] == root_id_for(
+            SPOKE
+        )
+
+    def test_tool_decision_still_folds_under_tool_with_a_ledger_present(self) -> None:
+        # Regression: a tool-scoped audit event must keep nesting/folding under its tool even
+        # when step windows exist — it is never pulled into a step by its lagging time.
+        traces = self._ledger_traces()
+        tool = _obs(
+            "tb",
+            "tool:Bash",
+            parent="i1",
+            startTime="2026-01-02T00:00:03Z",
+            endTime="2026-01-02T00:00:03Z",
+            metadata={"attributes": {"tool_use_id": "tu-b"}},
+        )
+        decision = _audit_event(
+            "db",
+            "tool_decision:reject",
+            start="2026-01-02T00:00:30Z",
+            tool_use_id="tu-b",
+            decision="reject",
+        )
+        traces[0][1].extend([tool, decision])
+
+        batch = build_batch(traces, SPOKE, self._content())
+
+        # The decision folds into the tool's metadata and its own node is dropped.
+        assert not _has_copy(batch, "tr", "db")
+        assert _by_orig(batch, "tr", "tb")["body"]["metadata"]["decision"] == "reject"
+
+    def test_real_marker_inside_a_window_is_still_grouped(self) -> None:
+        # The exclusion must not over-capture: a genuine duration marker still re-homes by window.
+        traces = self._ledger_traces()
+        marker = _obs("m1", "spoke-push", parent=None, startTime="2026-01-02T00:00:05Z")
+        traces[0][1].append(marker)
+
+        batch = build_batch(traces, SPOKE, self._content())
+
+        step = _step_node(batch)
+        assert _by_orig(batch, "tr", "m1")["body"]["parentObservationId"] == step["id"]
+
+    def test_audit_events_are_idempotent_across_reruns(self) -> None:
+        traces = [
+            (
+                "trace-audit",
+                [
+                    _audit_event("sk2", "skill_activated", **{"skill.name": "hub"}),
+                    _audit_event("cp2", "compaction", trigger="manual"),
+                ],
+            )
+        ]
+
+        first = build_batch(traces, SPOKE)
+        second = build_batch(traces, SPOKE)
+
+        assert [e["id"] for e in first] == [e["id"] for e in second]
+
+
 class TestScanTranscripts:
     def test_joins_tool_use_input_and_tool_result_output(self, tmp_path: Path) -> None:
         _write_transcript(
