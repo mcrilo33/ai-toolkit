@@ -1792,16 +1792,17 @@ class TestPrefixTotal:
         assert prefix_total([("tr", [_obs("m1", "step:green")])]) == 0
 
 
-def _lc_by_name(events: list[dict]) -> dict[str, dict]:
-    """Index loaded-context event bodies by their node name."""
-    return {event["body"]["name"]: event["body"] for event in events}
+def _only_node(events: list[dict]) -> dict:
+    """Return the body of the single loaded-context event, asserting there is exactly one."""
+    assert len(events) == 1
+    return events[0]["body"]
 
 
 _FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
 
 class TestLoadedContextDiskFallback:
-    """The disk-fallback path: measured on-disk items + a single reconciled remainder."""
+    """The disk-fallback path: one collapsed node whose metadata folds in the remainder."""
 
     def _rows(self) -> list[dict]:
         return [
@@ -1841,52 +1842,42 @@ class TestLoadedContextDiskFallback:
             price=0.001,
         )
 
-    def test_parent_node_sits_under_spoke_root_with_grand_total(self) -> None:
-        parent = _lc_by_name(self._build())["loaded-context"]
-        assert parent["parentObservationId"] == root_id_for(SPOKE)
-        assert parent["metadata"]["tokens"] == 170
+    def test_emits_exactly_one_node_under_spoke_root(self) -> None:
+        node = _only_node(self._build())
+        assert node["parentObservationId"] == root_id_for(SPOKE)
 
-    def test_each_category_node_carries_its_rolled_up_total(self) -> None:
-        index = _lc_by_name(self._build())
-        assert index["rules"]["metadata"]["tokens"] == 150
-        assert index["skills"]["metadata"]["tokens"] == 20
+    def test_headline_tokens_fold_in_the_remainder(self) -> None:
+        # measured 170 + reconciled remainder 830 == prefix 1000
+        assert _only_node(self._build())["metadata"]["tokens"] == 1000
 
-    def test_one_item_node_per_name_under_its_category(self) -> None:
-        index = _lc_by_name(self._build())
-        rules_id = index["rules"]["id"]
-        claude = next(b for n, b in index.items() if n.startswith("CLAUDE.md"))
-        assert claude["parentObservationId"] == rules_id
-        assert claude["metadata"]["tokens"] == 100
-        assert claude["metadata"]["source"] == "CLAUDE.md"
+    def test_breakdown_groups_item_tokens_by_category(self) -> None:
+        breakdown = _only_node(self._build())["metadata"]["breakdown"]
+        assert breakdown["rules"] == {"CLAUDE.md": 100, "python-style.md": 50}
+        assert breakdown["skills"] == {"afk": 20}
 
-    def test_estimated_item_carries_the_flag(self) -> None:
-        afk = next(b for n, b in _lc_by_name(self._build()).items() if n.startswith("afk"))
-        assert afk["metadata"]["estimated"] is True
-
-    def test_remainder_is_prefix_minus_measured(self) -> None:
-        events = self._build()
-        remainder = next(b for n, b in _lc_by_name(events).items() if n.startswith("remainder"))
-        assert remainder["metadata"]["tokens"] == 830
-        assert remainder["parentObservationId"] == _lc_by_name(events)["loaded-context"]["id"]
+    def test_remainder_preserved_in_metadata_not_as_a_node(self) -> None:
+        assert _only_node(self._build())["metadata"]["remainder"] == 830
 
     def test_remainder_clamped_to_zero_when_measured_exceeds_prefix(self) -> None:
-        events = self._build(prefix_total=100)
-        remainder = next(b for n, b in _lc_by_name(events).items() if n.startswith("remainder"))
-        assert remainder["metadata"]["tokens"] == 0
+        node = _only_node(self._build(prefix_total=100))
+        assert node["metadata"]["remainder"] == 0
+        assert node["metadata"]["tokens"] == 170
 
-    def test_no_floor_or_mcp_nodes_remain(self) -> None:
-        names = list(_lc_by_name(self._build()))
-        assert not any(n.startswith("built-in") or n.startswith("mcp") for n in names)
+    def test_aggregate_cost_includes_the_remainder_cost(self) -> None:
+        # measured 0.17 + remainder 830 * 0.001 == 1.0
+        assert abs(_only_node(self._build())["metadata"]["cost_usd"] - 1.0) < 1e-9
 
-    def test_ids_are_deterministic_across_runs(self) -> None:
-        first = {e["id"] for e in self._build()}
-        second = {e["id"] for e in self._build()}
-        assert first == second
+    def test_breakdown_omits_floor_and_mcp_categories(self) -> None:
+        breakdown = _only_node(self._build())["metadata"]["breakdown"]
+        assert not any(c.startswith("built-in") or c.startswith("mcp") for c in breakdown)
 
-    def test_all_nodes_attach_to_the_assembled_trace(self) -> None:
-        events = self._build()
-        assert all(e["body"]["traceId"] == trace_id_for(SPOKE) for e in events)
-        assert all(e["type"] == "span-create" for e in events)
+    def test_node_id_is_deterministic_across_runs(self) -> None:
+        assert self._build()[0]["id"] == self._build()[0]["id"]
+
+    def test_node_attaches_to_the_assembled_trace_as_span_create(self) -> None:
+        event = self._build()[0]
+        assert event["body"]["traceId"] == trace_id_for(SPOKE)
+        assert event["type"] == "span-create"
 
 
 class TestRequestContextSubtree:
@@ -1940,21 +1931,17 @@ class TestRequestContextSubtree:
             base_ts="2026-01-01T00:00:00Z",
         )
 
-    def test_all_request_categories_rendered(self) -> None:
-        names = set(_lc_by_name(self._build()))
-        assert {"tools", "mcp", "system", "context"} <= names
+    def test_breakdown_covers_all_request_categories(self) -> None:
+        breakdown = _only_node(self._build())["metadata"]["breakdown"]
+        assert set(breakdown) == {"tools", "mcp", "system", "context"}
+        assert breakdown["tools"] == {"Bash": 120}
+        assert breakdown["system"] == {"base system prompt": 200}
 
-    def test_no_remainder_node_on_the_request_path(self) -> None:
-        assert not any(n.startswith("remainder") for n in _lc_by_name(self._build()))
+    def test_no_remainder_key_on_the_request_path(self) -> None:
+        assert "remainder" not in _only_node(self._build())["metadata"]
 
-    def test_cached_flag_carried_into_item_metadata(self) -> None:
-        index = _lc_by_name(self._build())
-        base = next(b for n, b in index.items() if n.startswith("base system prompt"))
-        assert base["metadata"]["cached"] is True
-
-    def test_parent_total_is_full_itemized_prefix(self) -> None:
-        parent = _lc_by_name(self._build())["loaded-context"]
-        assert parent["metadata"]["tokens"] == 440  # 120 + 40 + 200 + 80
+    def test_node_total_is_full_itemized_prefix(self) -> None:
+        assert _only_node(self._build())["metadata"]["tokens"] == 440  # 120 + 40 + 200 + 80
 
 
 class TestRequestContextRows:
