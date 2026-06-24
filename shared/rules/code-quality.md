@@ -164,6 +164,11 @@ Minimize everything *except* the following — never trade these away for brevit
 - New function/class/module → add docstrings (parameters, return, exceptions)
 - Changed behavior → update affected docstrings and any user-facing docs (README, API docs)
 - New CLI command/flag/config option → update usage docs
+- New stateful object with a lifecycle (state machine, context-manager owner, or
+  behavior split across modules) → document the **process**, not just per-function
+  docstrings: the states/phases, who drives each transition, and where its inputs
+  come from. Per-function docs alone leave the reader asking "is this field ever
+  populated?" or "who calls this?" — answer it once at the object/module level.
 - The only exceptions: pure refactors with no behavior change, internal-only helpers with self-documenting names
 - If unsure whether docs need updating, they do
 
