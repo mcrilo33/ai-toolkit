@@ -9,6 +9,7 @@ keeps the VS Code calls hermetic (the host really has `code` installed).
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -93,6 +94,12 @@ def _run_done(
     )
     code.chmod(0o755)
     env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    # Point the VS Code Open Recent cleanup (issue #103) at a per-test Code dir so
+    # it never touches the host's real state store. Tests that exercise the prune
+    # pre-populate <vscode>/User/globalStorage/storage.json under this same dir.
+    vscode_dir = tmp_path / "vscode"
+    vscode_dir.mkdir(exist_ok=True)
+    env["AI_TOOLKIT_VSCODE_DIR"] = str(vscode_dir)
     env.pop("TMUX", None)
     # The host's own spoke marker must never steer the guard; set it explicitly
     # only when a test means to model a spoke session (issue #26).
@@ -116,6 +123,62 @@ def _local_branches(hub: Path) -> list[str]:
 
 def _remote_has(hub: Path, branch: str) -> bool:
     return bool(_git(hub, "ls-remote", "--heads", "origin", branch).strip())
+
+
+# --- VS Code "Open Recent" cleanup helpers (issue #103) ----------------------
+def _write_recent(
+    tmp_path: Path, paths: list[str], *, history: bool = False, running_pid: int | None = None
+) -> Path:
+    """Seed a fake VS Code state store under the per-test Code dir.
+
+    Mirrors the real layout: the recent folders live in `storage.json` under
+    `lastKnownMenubarData` (File → Open Recent submenu). When `history=True`, also
+    seed the older `history.recentlyOpenedPathsList` key. When `running_pid` is
+    given, drop a `code.lock` holding that PID so the teardown's running-check
+    sees VS Code as live (and must skip the scrub). Returns the storage.json path.
+    """
+    base = tmp_path / "vscode"
+    gs = base / "User" / "globalStorage"
+    gs.mkdir(parents=True, exist_ok=True)
+    submenu = [
+        {"id": "openRecentFolder", "label": p, "uri": {"$mid": 1, "path": p, "scheme": "file"}}
+        for p in paths
+    ]
+    data: dict = {
+        "lastKnownMenubarData": {
+            "menus": {
+                "File": {
+                    "items": [
+                        {
+                            "id": "submenuitem.MenubarRecentMenu",
+                            "label": "Open &&Recent",
+                            "submenu": {"items": submenu},
+                        }
+                    ]
+                }
+            }
+        }
+    }
+    if history:
+        data["history.recentlyOpenedPathsList"] = {
+            "entries": [{"folderUri": f"file://{p}"} for p in paths]
+        }
+    storage = gs / "storage.json"
+    storage.write_text(json.dumps(data))
+    if running_pid is not None:
+        (base / "code.lock").write_text(str(running_pid))
+    return storage
+
+
+def _recent_paths(storage: Path) -> list[str]:
+    d = json.loads(storage.read_text())
+    items = d["lastKnownMenubarData"]["menus"]["File"]["items"][0]["submenu"]["items"]
+    return [it["uri"]["path"] for it in items]
+
+
+def _history_uris(storage: Path) -> list[str]:
+    d = json.loads(storage.read_text())
+    return [e.get("folderUri") for e in d["history.recentlyOpenedPathsList"]["entries"]]
 
 
 def test_merged_branch_is_pruned_locally(hub: Path, tmp_path: Path) -> None:
@@ -263,3 +326,65 @@ def test_teardown_without_marker_is_a_noop(hub: Path, tmp_path: Path) -> None:
     proc, _ = _run_done(hub, tmp_path, "3")
 
     assert proc.returncode == 0, proc.stderr
+
+
+def test_recent_entry_pruned_when_vscode_not_running(hub: Path, tmp_path: Path) -> None:
+    # Issue #103: teardown must drop the just-removed worktree from VS Code's Open
+    # Recent list. With no `code.lock` (VS Code closed), the scrub runs and removes
+    # only the matching path — sibling recent entries are left untouched.
+    wt = _make_spoke(hub, tmp_path, "feature/4-recent", push=False, merge=True)
+    sibling = str(tmp_path / "ai-toolkit-other")
+    storage = _write_recent(tmp_path, [str(wt), sibling])
+
+    proc, _ = _run_done(hub, tmp_path, "4")
+
+    assert proc.returncode == 0, proc.stderr
+    remaining = _recent_paths(storage)
+    assert str(wt) not in remaining
+    assert sibling in remaining
+
+
+def test_recent_cleanup_skipped_when_vscode_running(hub: Path, tmp_path: Path) -> None:
+    # A live VS Code instance overwrites storage.json on flush, so editing it would
+    # be lost (or race). When `code.lock` holds a live PID, the scrub is a no-op and
+    # the entry stays — the documented safe behavior.
+    wt = _make_spoke(hub, tmp_path, "feature/4-running", push=False, merge=True)
+    storage = _write_recent(tmp_path, [str(wt)], running_pid=os.getpid())
+
+    proc, _ = _run_done(hub, tmp_path, "4")
+
+    assert proc.returncode == 0, proc.stderr
+    assert str(wt) in _recent_paths(storage)
+
+
+def test_no_code_flag_skips_recent_cleanup(hub: Path, tmp_path: Path) -> None:
+    # `--no-code` opts out of every VS Code touch, including the recent-list scrub.
+    wt = _make_spoke(hub, tmp_path, "feature/5-nocode", push=False, merge=True)
+    storage = _write_recent(tmp_path, [str(wt)])
+
+    proc, _ = _run_done(hub, tmp_path, "5", "--no-code")
+
+    assert proc.returncode == 0, proc.stderr
+    assert str(wt) in _recent_paths(storage)
+
+
+def test_recent_cleanup_noop_when_storage_absent(hub: Path, tmp_path: Path) -> None:
+    # No state store on disk (CLI-only host) — the scrub is a silent no-op and
+    # teardown still succeeds.
+    _make_spoke(hub, tmp_path, "feature/4-nostore", push=False, merge=True)
+
+    proc, _ = _run_done(hub, tmp_path, "4")
+
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_recent_cleanup_removes_history_list_entry(hub: Path, tmp_path: Path) -> None:
+    # Older VS Code versions keep the recent paths in `history.recentlyOpenedPathsList`;
+    # the scrub removes the matching entry there too (forward/backward compat).
+    wt = _make_spoke(hub, tmp_path, "feature/4-history", push=False, merge=True)
+    storage = _write_recent(tmp_path, [str(wt)], history=True)
+
+    proc, _ = _run_done(hub, tmp_path, "4")
+
+    assert proc.returncode == 0, proc.stderr
+    assert f"file://{wt}" not in _history_uris(storage)
