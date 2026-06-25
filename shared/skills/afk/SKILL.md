@@ -50,9 +50,29 @@ Use **`drain`** for a trip: it has no clock and stops only when the work is genu
 
 Plus two control subcommands:
 
-- `/afk off` — stop the supervisor (clears the state file; the loop exits on its next
-  tick).
-- `/afk status` — report the active window and time remaining, or `off`.
+- `/afk off` — stop the supervisor **and its watchdog** (clears the state file; both
+  loops exit on their next tick).
+- `/afk status` — report the active window and time remaining, `off`, or **`STALE`** when
+  the window is armed but the supervisor process has died (see below).
+
+## Staying alive: heartbeat + watchdog
+
+The supervisor is a long-running loop, and a silent crash (it once exited `0`
+mid-dispatch) used to strand the whole run: `.afk-state` still read `draining`, so
+`status` reported a healthy run that no longer existed, and an in-flight spoke kept
+running with no answerer. Two mechanisms close that gap (issue #107):
+
+- **Heartbeat.** Each tick the supervisor stamps `<pid> <last_tick_epoch>` to
+  `<git-common-dir>/.afk-heartbeat`. `status` cross-checks it against pid liveness, so a
+  crashed supervisor is reported as `STALE — last tick <N>m ago, supervisor process not
+  found` instead of echoing the stale state file.
+- **Watchdog.** A thin keeper loop, auto-armed alongside the supervisor (and re-checked
+  every tick, so the two keep each other alive), respawns the supervisor whenever the
+  window is armed but no live process is stamping the heartbeat. The respawn is a no-arg
+  resume: it reads the persisted window and **re-adopts** in-flight worktrees
+  idempotently rather than re-dispatching. Exactly one watchdog runs per checkout; `off`
+  clears the state, so it exits within one watchdog interval (`AFK_WATCHDOG_SECONDS`,
+  default 60).
 
 ## Remote AFK (an always-on Mac)
 

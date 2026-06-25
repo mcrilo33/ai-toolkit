@@ -117,14 +117,19 @@ Then, from anywhere:
 # Reattach with: ssh mac-home -t 'tmux attach -t afk'
 ```
 
-To check on it (optional — monitoring is not the goal). Attaching to the tmux session is
-the real liveness check; `--status` only reports the window *bound* (and must run from the
-repo dir, since it reads the checkout's state file):
+To check on it (optional — monitoring is not the goal). `--status` is now a real liveness
+check: it cross-checks the supervisor's heartbeat against pid liveness and reports `STALE`
+when the window is armed but the process has died (issue #107), so you no longer need to
+attach to the tmux session to tell a live drain from a crashed one. It must still run from
+the repo dir, since it reads the checkout's state file:
 
 ```bash
-ssh mac-home -t 'tmux attach -t afk'   # is it alive? attach; detach again with Ctrl-b d
 ssh mac-home "cd '/Users/me/ai-toolkit' && bash shared/skills/hub/scripts/hub-afk.sh --status"
+ssh mac-home -t 'tmux attach -t afk'   # or attach to watch it live; detach with Ctrl-b d
 ```
+
+A crashed supervisor is also auto-restarted by the watchdog within one watchdog interval,
+so a transient crash on the remote host recovers without intervention.
 
 ### Fallback: GitHub-poll (when the work network blocks Tailscale)
 
