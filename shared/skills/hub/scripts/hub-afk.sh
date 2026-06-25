@@ -1096,13 +1096,19 @@ afk_telemetry_preflight() {
   return 0
 }
 
-# afk_have_telemetry_auth -> true when LANGFUSE_BASIC_AUTH is resolvable (env or named in
-# the conf file) WITHOUT mutating the environment — the READ-ONLY check --status uses (it
-# greps the conf for the var rather than sourcing it, so a status read has no side effect).
+# afk_have_telemetry_auth -> true when LANGFUSE_BASIC_AUTH is resolvable (env, or a
+# non-empty value from the conf file) WITHOUT mutating the caller's environment — the
+# READ-ONLY check --status uses. It resolves the conf in a SUBSHELL so a status read has
+# no side effect on the parent env, yet agrees EXACTLY with the preflight's
+# afk_resolve_telemetry_auth (which sources + requires a non-empty value) — a commented-out
+# or empty assignment reports missing in both, so --status never claims OK for a conf the
+# supervisor would have refused to arm on.
 afk_have_telemetry_auth() {
   [ -n "${LANGFUSE_BASIC_AUTH:-}" ] && return 0
   local conf="${AFK_TELEMETRY_CONF:-$HOME/.afk-telemetry}"
-  [ -f "$conf" ] && grep -q 'LANGFUSE_BASIC_AUTH' "$conf" 2>/dev/null
+  [ -f "$conf" ] || return 1
+  # shellcheck disable=SC1090
+  ( . "$conf" 2>/dev/null; [ -n "${LANGFUSE_BASIC_AUTH:-}" ] )
 }
 
 # afk_telemetry_status -> a one-line, READ-ONLY telemetry health summary for --status: the

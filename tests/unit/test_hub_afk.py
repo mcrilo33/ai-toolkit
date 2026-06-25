@@ -1405,7 +1405,12 @@ def test_status_reports_stale_when_supervisor_dead(tmp_path: Path) -> None:
 
     result = _call(
         expr,
-        env={"AFK_STATE": str(state), "AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000600"},
+        env={
+            "AFK_STATE": str(state),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_NOW": "1700000600",
+            "AI_TOOLKIT_OTEL": "0",  # #107 tests assert only the state line — opt out of the probe
+        },
     )
 
     assert "STALE" in result.stdout
@@ -1420,7 +1425,12 @@ def test_status_reports_stale_when_no_heartbeat(tmp_path: Path) -> None:
 
     result = _call(
         "_status",
-        env={"AFK_STATE": str(state), "AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000600"},
+        env={
+            "AFK_STATE": str(state),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_NOW": "1700000600",
+            "AI_TOOLKIT_OTEL": "0",  # #107 tests assert only the state line — opt out of the probe
+        },
     )
 
     assert "STALE" in result.stdout
@@ -1436,7 +1446,12 @@ def test_status_reports_stale_for_dead_clock_bound_window(tmp_path: Path) -> Non
 
     result = _call(
         expr,
-        env={"AFK_STATE": str(state), "AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000600"},
+        env={
+            "AFK_STATE": str(state),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_NOW": "1700000600",
+            "AI_TOOLKIT_OTEL": "0",  # #107 tests assert only the state line — opt out of the probe
+        },
     )
 
     assert "STALE" in result.stdout
@@ -1451,7 +1466,12 @@ def test_status_still_draining_when_supervisor_live(tmp_path: Path) -> None:
 
     result = _call(
         expr,
-        env={"AFK_STATE": str(state), "AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000600"},
+        env={
+            "AFK_STATE": str(state),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_NOW": "1700000600",
+            "AI_TOOLKIT_OTEL": "0",  # #107 tests assert only the state line — opt out of the probe
+        },
     )
 
     assert "STALE" not in result.stdout
@@ -1944,3 +1964,49 @@ def test_status_off_has_no_telemetry_line(tmp_path: Path) -> None:
     )
 
     assert result.stdout.strip() == "/afk: off"
+
+
+def _run_status_with_conf_auth(tmp_path: Path, conf_body: str) -> subprocess.CompletedProcess[str]:
+    """Run _status with env auth UNSET so the auth verdict comes from the conf file."""
+    conf = tmp_path / "afk-telemetry"
+    conf.write_text(conf_body)
+    statef = tmp_path / "state"
+    statef.write_text("drain\n")
+    hb = tmp_path / "heartbeat"
+    up_dir = tmp_path / "ports"
+    up_dir.mkdir(exist_ok=True)
+    prelude = _telemetry_prelude(up_dir, collector_up=True, bridge_up=True)
+    expr = (
+        f"unset AI_TOOLKIT_OTEL; unset LANGFUSE_BASIC_AUTH; {prelude}; "
+        f'printf "%s 1700000000\\n" "$$" > "{hb}"; _status'
+    )
+    return _call(
+        expr,
+        env={
+            "AFK_STATE": str(statef),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_NOW": "1700000600",
+            "AFK_TELEMETRY_CONF": str(conf),
+        },
+    )
+
+
+def test_status_auth_present_when_conf_supplies_value(tmp_path: Path) -> None:
+    # A conf with a real LANGFUSE_BASIC_AUTH value ⇒ auth present (the status auth check
+    # agrees with the preflight, which would arm on this conf).
+    result = _run_status_with_conf_auth(tmp_path, 'LANGFUSE_BASIC_AUTH="Basic-from-conf"\n')
+
+    assert "auth present" in result.stdout
+    assert "OK" in result.stdout
+
+
+def test_status_auth_missing_when_conf_value_is_commented_or_empty(tmp_path: Path) -> None:
+    # A commented-out / empty assignment is NOT a usable credential — the preflight (which
+    # sources + requires non-empty) would refuse to arm, so --status must not claim OK. The
+    # read-only check resolves the conf in a subshell to agree exactly.
+    result = _run_status_with_conf_auth(
+        tmp_path, "# LANGFUSE_BASIC_AUTH=disabled\nLANGFUSE_BASIC_AUTH=\n"
+    )
+
+    assert "auth missing" in result.stdout
+    assert "DOWN" in result.stdout
