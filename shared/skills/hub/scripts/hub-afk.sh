@@ -908,6 +908,9 @@ _afk_spawn_watchdog() {
   _afk_watchdog_alive && return 0
   if [ -n "${AFK_WATCHDOG_SPAWN_CMD:-}" ]; then bash -c "$AFK_WATCHDOG_SPAWN_CMD"; return 0; fi
   nohup bash "$(_afk_self)" --watchdog >/dev/null 2>&1 &
+  # Record the child pid immediately so the next tick's dedup check sees it alive before
+  # the watchdog itself writes the pidfile (closes the launch→pidfile startup race).
+  printf '%s\n' "$!" > "$(_afk_watchdog_file)" 2>/dev/null || true
   return 0
 }
 
@@ -1057,12 +1060,16 @@ main() {
     afk_write_state "$end"
     _clear_dispatch_epochs   # fresh window ⇒ empty "dispatched by this run" set
     _afk_set_unattended      # arm the fail-closed anti-gutting tripwire for spokes
-    _afk_spawn_watchdog      # keep a watchdog alive so a silent crash auto-restarts (#107)
     log "/afk: armed ($([ "$end" = drain ] && echo 'drain — until the backlog is empty' || echo "until $(wt_date_ymd "$end") $(date -r "$end" +%H:%M 2>/dev/null || date -d "@$end" +%H:%M)"))"
   fi
 
   while :; do
     afk_write_heartbeat   # stamp this tick before working, so a crash mid-tick is visible
+    # Keep exactly one watchdog alive (idempotent: a no-op while one runs, respawns it if
+    # it died). Doing this each tick — not just at arm — means the supervisor and watchdog
+    # heal each other: neither is a single silent point of failure (#107). Skipped for
+    # --once (a one-shot cron tick must not leave a background keeper behind).
+    [ "$once" -eq 0 ] && _afk_spawn_watchdog
     supervise_tick
     if [ "$_AFK_AUTH_FAILED" -eq 1 ]; then
       log "/afk: subscription auth failed — blocking in-flight spokes and stopping (re-run /login on the host)"
