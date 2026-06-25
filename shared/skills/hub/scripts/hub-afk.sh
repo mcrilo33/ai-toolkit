@@ -45,7 +45,7 @@
 #   hub-afk.sh until <HH:MM>     # drain until the next HH:MM, then stop
 #   hub-afk.sh drain             # drain until the backlog is empty + nothing in flight
 #   hub-afk.sh --remote          # launch a detached `drain` on a configured always-on Mac
-#   hub-afk.sh --status          # report the active window (or "off")
+#   hub-afk.sh --status          # report the active window, "off", or "STALE" (crashed)
 #   hub-afk.sh --off             # stop the supervisor (clears the state file)
 #   hub-afk.sh --once            # run a single tick and exit (tests / external cron)
 #
@@ -929,9 +929,21 @@ remote_launch() {
 # --- CLI ----------------------------------------------------------------------
 
 _status() {
-  local state now rem
+  local state now rem age
   state="$(afk_read_state)"; now="$(afk_now)"
   if [ -z "$state" ]; then echo "/afk: off"; return 0; fi
+  # Cross-check the heartbeat before trusting the state file: a window armed in
+  # .afk-state but no live supervisor pid means the process crashed and the state file
+  # is lying (#107). Report STALE rather than echoing `draining` / `Nm remaining`.
+  if [ "$(afk_supervisor_state)" = "stale" ]; then
+    age="$(_afk_heartbeat_age_minutes)"
+    if [ -n "$age" ]; then
+      echo "/afk: STALE — last tick ${age}m ago, supervisor process not found (run /afk --off to clear, or the watchdog will respawn it)"
+    else
+      echo "/afk: STALE — no heartbeat, supervisor process not found (run /afk --off to clear, or the watchdog will respawn it)"
+    fi
+    return 0
+  fi
   if [ "$state" = "drain" ]; then echo "/afk: draining (no clock bound — stops when the backlog is empty)"; return 0; fi
   if window_expired "$state" "$now"; then echo "/afk: window elapsed (supervisor will stop on its next tick)"; return 0; fi
   rem="$(minutes_remaining "$state" "$now")"
