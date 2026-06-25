@@ -830,7 +830,7 @@ def _build_skill_index(
 def _match_skill_tool(
     observation: Observation, skill_index: dict[str, list[SkillCandidate]]
 ) -> str | None:
-    """Return the ``tool:Skill`` copy id a ``skill_activated`` event nests under, or None (#110 AC2).
+    """Return the ``tool:Skill`` copy id a ``skill_activated`` event nests under, else None (#110).
 
     Matches within the event's turn (``prompt.id``): when the turn ran exactly one skill that is
     it; otherwise the candidates whose ``skill.name`` matches are preferred, and ties (the same
@@ -861,7 +861,10 @@ def _nearest_skill(event_start: str | None, pool: list[SkillCandidate]) -> str:
         cand_ts = _parse_ts(candidate.start or "")
         if event_ts is None or cand_ts is None:
             return (1, 0.0)
-        return (0, abs((cand_ts - event_ts).total_seconds()))
+        try:
+            return (0, abs((cand_ts - event_ts).total_seconds()))
+        except TypeError:  # one side tz-aware, the other naive — sort last, never crash
+            return (1, 0.0)
 
     return min(pool, key=distance).copy_id
 

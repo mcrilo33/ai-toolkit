@@ -1960,6 +1960,72 @@ class TestSkillActivatedNesting:
         copy = _by_orig(batch, "trace-audit", "act5")
         assert copy["body"]["parentObservationId"] == root_id_for(SPOKE)
 
+    def test_skill_activated_never_crosses_into_another_turn(self) -> None:
+        # A tool:Skill in turn A must never adopt a skill_activated emitted in turn B.
+        turn_a = _obs(
+            "ia",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "pa"}},
+        )
+        turn_b = _obs(
+            "ib",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "pb"}},
+        )
+        tool = self._skill_tool("sk_a", "tu-a", parent="ia")
+        skill = _audit_event("act6", "skill_activated", **{"skill.name": "hub", "prompt.id": "pb"})
+        traces = [("trace-a", [turn_a, tool]), ("trace-b", [turn_b]), ("trace-audit", [skill])]
+        content = {"tu-a": ToolContent({"skill": "hub"}, "ok")}
+
+        batch = build_batch(traces, SPOKE, content)
+
+        # Turn B holds no tool:Skill, so the event homes to turn B itself, not turn A's skill.
+        copy = _by_orig(batch, "trace-audit", "act6")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-b", "ib")
+
+    def test_lone_skill_tool_adopts_event_even_without_transcript_content(self) -> None:
+        # No tool_content (skill name unknown): the turn's single tool:Skill still adopts it.
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "p1"}},
+        )
+        tool = self._skill_tool("sk_tool", "tu-sk1")
+        skill = _audit_event("act7", "skill_activated", **{"skill.name": "hub", "prompt.id": "p1"})
+        traces = [("trace-int", [interaction, tool]), ("trace-audit", [skill])]
+
+        batch = build_batch(traces, SPOKE)
+
+        copy = _by_orig(batch, "trace-audit", "act7")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "sk_tool")
+
+    def test_event_without_skill_name_nearest_of_two_candidates(self) -> None:
+        # No skill.name on the event: it falls straight to the nearest-timestamp tiebreak.
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "p1"}},
+        )
+        early = self._skill_tool("sk_a", "tu-a", start="2026-01-02T00:00:00Z")
+        late = self._skill_tool("sk_b", "tu-b", start="2026-01-02T00:00:20Z")
+        skill = _audit_event(
+            "act8", "skill_activated", start="2026-01-02T00:00:01Z", **{"prompt.id": "p1"}
+        )
+        traces = [("trace-int", [interaction, early, late]), ("trace-audit", [skill])]
+        content = {
+            "tu-a": ToolContent({"skill": "hub"}, "ok"),
+            "tu-b": ToolContent({"skill": "land"}, "ok"),
+        }
+
+        batch = build_batch(traces, SPOKE, content)
+
+        copy = _by_orig(batch, "trace-audit", "act8")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "sk_a")
+
 
 class TestScanTranscripts:
     def test_joins_tool_use_input_and_tool_result_output(self, tmp_path: Path) -> None:
