@@ -46,12 +46,15 @@ The same session also carries the ``spoke-audit:`` trace's span-less audit/lifec
 OTel-logs ``startTime`` (the logs signal is batched and exported after the spans it interleaves
 with, so the timestamp lags the event). Tool-scoped events (``hook_execution_complete``,
 ``tool_result``, ``tool_decision``) nest/fold under their tool by ``tool_use_id`` as above;
-``api_error``/``api_refusal`` nest under their ``llm_request`` by ``request_id``; the
-session-startup instants (``mcp_server_connection``, ``plugin_loaded``) are DEMOTED to the
-synthetic root's ``session_init`` metadata list (:func:`_collapse_startup_instants`) instead of
-standing as sibling nodes; and the genuinely unresolvable instants (``skill_activated``,
-``permission_mode_changed``, ``compaction``) fall to the root as a last resort. Every audit
-instant is excluded from the cycle-step window placement (:func:`_apply_step_grouping`), which
+``api_error``/``api_refusal`` nest under their ``llm_request`` by ``request_id``;
+``skill_activated`` nests under the ``tool:Skill`` that activated it — matched by ``prompt.id``
++ ``skill.name`` (+ nearest timestamp), falling back to its enclosing turn (#110 AC2,
+:func:`_match_skill_tool`); the session-startup instants (``mcp_server_connection``,
+``plugin_loaded``) are DEMOTED to the synthetic root's ``session_init`` metadata list
+(:func:`_collapse_startup_instants`) instead of standing as sibling nodes; and the remaining
+unresolvable instants (``permission_mode_changed``, ``compaction``) fall to the root as a last
+resort. Every audit instant is excluded from the cycle-step window placement
+(:func:`_apply_step_grouping`), which
 keys off ``startTime``. The standalone ``spoke-audit:`` trace is read-only here — additive only.
 
 All ids derive from the spoke run id and the source ``(trace_id, observation_id)`` pair,
@@ -218,14 +221,15 @@ _SESSION_INIT_FIELD = "session_init"
 # the OTel logs signal, so its observation ``startTime`` is the LAGGING flush time and is NEVER
 # used to place it on the timeline: the tool-scoped events nest under their tool by
 # ``tool_use_id`` (see :func:`_resolve_parent`); ``api_error`` / ``api_refusal`` nest under their
-# ``llm_request`` by ``request_id``; the remaining genuinely unresolvable instants
-# (``skill_activated``, ``permission_mode_changed``, ``compaction``) fall to the synthetic root
-# as a last resort. They are excluded from :func:`_apply_step_grouping`'s ``startTime`` window
-# placement. Startup instants are collapsed to metadata earlier and never reach here.
-# UPGRADE: nest skill_activated / permission_mode_changed / compaction into the cycle-step
-# window they sequence into — needs ``event.sequence`` carried onto the observation, which is an
-# emission-path change (langfuse_audit_events.py) deliberately out of scope for this pull-layer
-# work; the issue's caveat warns against harder step-attribution heuristics here.
+# ``llm_request`` by ``request_id``; ``skill_activated`` nests under its ``tool:Skill`` by
+# ``prompt.id`` + ``skill.name`` (#110, :func:`_match_skill_tool`); the remaining unresolvable
+# instants (``permission_mode_changed``, ``compaction``) fall to the synthetic root as a last
+# resort. They are excluded from :func:`_apply_step_grouping`'s ``startTime`` window placement.
+# Startup instants are collapsed to metadata earlier and never reach here.
+# UPGRADE: nest permission_mode_changed / compaction into the cycle-step window they sequence
+# into — needs ``event.sequence`` carried onto the observation, which is an emission-path change
+# (langfuse_audit_events.py) deliberately out of scope for this pull-layer work; the issue's
+# caveat warns against harder step-attribution heuristics here.
 _REQUEST_AUDIT_PREFIXES = ("api_error", "api_refusal")
 _AUDIT_INSTANT_PREFIXES = (
     *_TOOL_AUDIT_EVENT_PREFIXES,
@@ -306,6 +310,14 @@ class StepWindow(NamedTuple):
 _TASK_ID_RE = re.compile(r"#(\d+)")
 # The native per-turn container span; dissolved into the step timeline when grouping is active.
 _INTERACTION_NAME = "claude_code.interaction"
+# The visible Skill tool span and the span-less lifecycle event it activates (#110 AC2). The
+# event carries no ``tool_use_id``, so it is matched to its tool by ``prompt.id`` + ``skill.name``
+# (+ nearest timestamp), see :func:`_build_skill_index` / :func:`_match_skill_tool`.
+_SKILL_TOOL_NAME = "tool:Skill"
+_SKILL_ACTIVATED_NAME = "skill_activated"
+_SKILL_NAME_KEY = "skill.name"
+# The Skill tool's input key naming the activated skill, read from the transcript content.
+_SKILL_INPUT_KEY = "skill"
 
 
 def trace_id_for(spoke_run_id: str) -> str:
@@ -726,6 +738,134 @@ def _enclosing_turn(observation: Observation, index: InteractionIndex) -> str | 
     return chosen[2] if chosen else None
 
 
+class SkillCandidate(NamedTuple):
+    """One ``tool:Skill`` span a ``skill_activated`` event may belong to (#110 AC2).
+
+    ``skill_name`` is the activated skill read from the tool's transcript input (None when the
+    content is unavailable); ``start`` is the span's true start, used as the nearest-timestamp
+    tiebreak when a turn ran the same skill more than once.
+    """
+
+    start: str | None
+    copy_id: str
+    skill_name: str | None
+
+
+def _is_skill_activated(observation: Observation) -> bool:
+    """Whether an observation is a span-less ``skill_activated`` lifecycle event (#110 AC2)."""
+    return (observation.get("name") or "") == _SKILL_ACTIVATED_NAME
+
+
+def _skill_name(observation: Observation) -> str | None:
+    """Return the ``skill.name`` carried by a ``skill_activated`` event, or None."""
+    metadata = observation.get("metadata") or {}
+    attributes = metadata.get("attributes") or {}
+    value = attributes.get(_SKILL_NAME_KEY) or metadata.get(_SKILL_NAME_KEY)
+    return str(value) if value else None
+
+
+def _activated_skill_name(tuid: str | None, tool_content: dict[str, ToolContent]) -> str | None:
+    """Return the skill named by a ``tool:Skill`` span's transcript input, or None."""
+    content = tool_content.get(tuid or "")
+    if content is None or not isinstance(content.input, dict):
+        return None
+    value = content.input.get(_SKILL_INPUT_KEY)
+    return str(value) if value else None
+
+
+def _enclosing_prompt_id(observation: Observation, by_id: dict[str, Observation]) -> str | None:
+    """Return the ``prompt.id`` of the nearest ancestor interaction within a trace, or None.
+
+    Walks ``parentObservationId`` up the trace-local node map until an ancestor carries a
+    ``prompt.id`` (normally the enclosing ``claude_code.interaction``); a tool span rarely
+    carries its own, so this recovers the turn id a ``tool:Skill`` belongs to.
+    """
+    seen: set[str] = set()
+    parent = observation.get("parentObservationId")
+    while parent and parent in by_id and parent not in seen:
+        seen.add(parent)
+        node = by_id[parent]
+        pid = _prompt_id(node)
+        if pid:
+            return pid
+        parent = node.get("parentObservationId")
+    return None
+
+
+def _build_skill_index(
+    traces: list[TraceObservations], tool_content: dict[str, ToolContent]
+) -> dict[str, list[SkillCandidate]]:
+    """Index every ``tool:Skill`` span by its turn's ``prompt.id`` (#110 AC2).
+
+    A ``tool:Skill``'s ``prompt.id`` is its own when present, else the enclosing interaction's
+    (:func:`_enclosing_prompt_id`); spans whose turn cannot be determined are skipped (the event
+    then has no key to match and falls back to the enclosing turn / root).
+
+    Args:
+        traces: Each source trace paired with all of its observations.
+        tool_content: Tool-call-id to :class:`ToolContent`, the source of each skill's name.
+
+    Returns:
+        A mapping of ``prompt.id`` to the candidate ``tool:Skill`` spans of that turn.
+    """
+    index: dict[str, list[SkillCandidate]] = {}
+    for orig_trace_id, observations in traces:
+        by_id = {observation["id"]: observation for observation in observations}
+        for observation in observations:
+            if (observation.get("name") or "") != _SKILL_TOOL_NAME:
+                continue
+            pid = _prompt_id(observation) or _enclosing_prompt_id(observation, by_id)
+            if not pid:
+                continue
+            tuid = _tool_use_id(observation)
+            candidate = SkillCandidate(
+                observation.get("startTime"),
+                _copy_id(orig_trace_id, observation["id"]),
+                _activated_skill_name(tuid, tool_content),
+            )
+            index.setdefault(pid, []).append(candidate)
+    return index
+
+
+def _match_skill_tool(
+    observation: Observation, skill_index: dict[str, list[SkillCandidate]]
+) -> str | None:
+    """Return the ``tool:Skill`` copy id a ``skill_activated`` event nests under, or None (#110 AC2).
+
+    Matches within the event's turn (``prompt.id``): when the turn ran exactly one skill that is
+    it; otherwise the candidates whose ``skill.name`` matches are preferred, and ties (the same
+    skill activated twice in one turn) are broken by the nearest span start to the event's
+    lagging time. None when the event has no ``prompt.id`` or its turn ran no skill.
+    """
+    pid = _prompt_id(observation)
+    if not pid or pid not in skill_index:
+        return None
+    candidates = skill_index[pid]
+    name = _skill_name(observation)
+    pool = [candidate for candidate in candidates if candidate.skill_name == name] if name else []
+    pool = pool or candidates
+    if len(pool) == 1:
+        return pool[0].copy_id
+    return _nearest_skill(observation.get("startTime"), pool)
+
+
+def _nearest_skill(event_start: str | None, pool: list[SkillCandidate]) -> str:
+    """Return the copy id of the candidate whose start is nearest the event's time.
+
+    Candidates with an unparseable or absent start sort last; on a full tie the first in fetch
+    order wins, so the choice is deterministic across reruns.
+    """
+    event_ts = _parse_ts(event_start or "")
+
+    def distance(candidate: SkillCandidate) -> tuple[int, float]:
+        cand_ts = _parse_ts(candidate.start or "")
+        if event_ts is None or cand_ts is None:
+            return (1, 0.0)
+        return (0, abs((cand_ts - event_ts).total_seconds()))
+
+    return min(pool, key=distance).copy_id
+
+
 def _resolve_parent(
     observation: Observation,
     *,
@@ -734,6 +874,7 @@ def _resolve_parent(
     tool_index: dict[str, str],
     request_index: dict[str, str],
     interaction_index: InteractionIndex,
+    skill_index: dict[str, list[SkillCandidate]],
 ) -> str:
     """Resolve the assembled-trace parent id for one source observation.
 
@@ -744,10 +885,11 @@ def _resolve_parent(
         tool_index: Tool-call-id to tool-copy-id map from :func:`_build_tool_index`.
         request_index: Request-id to llm_request-copy-id map from :func:`_build_request_index`.
         interaction_index: Enclosing-turn lookup from :func:`_build_interaction_index`.
+        skill_index: Prompt-id to ``tool:Skill`` candidates from :func:`_build_skill_index`.
 
     Returns:
-        The copy id of the intra-trace parent, the matching tool / llm_request, the enclosing
-        turn (for an unmatched-tool satellite), or the synthetic root.
+        The copy id of the intra-trace parent, the matching tool / llm_request / ``tool:Skill``,
+        the enclosing turn (for an unmatched-tool satellite), or the synthetic root.
     """
     parent = observation.get("parentObservationId")
     if parent:
@@ -763,6 +905,14 @@ def _resolve_parent(
             turn = _enclosing_turn(observation, interaction_index)
             if turn is not None:
                 return turn
+    if _is_skill_activated(observation):
+        # #110 AC2: nest under the tool:Skill that activated it, else its enclosing turn.
+        skill_tool = _match_skill_tool(observation, skill_index)
+        if skill_tool is not None:
+            return skill_tool
+        turn = _enclosing_turn(observation, interaction_index)
+        if turn is not None:
+            return turn
     if _is_request_audit_event(observation):
         rid = _request_id(observation)
         if rid and rid in request_index:
@@ -1254,6 +1404,7 @@ def build_batch(
     tool_index = _build_tool_index(traces)
     request_index = _build_request_index(traces)
     interaction_index = _build_interaction_index(traces)
+    skill_index = _build_skill_index(traces, tool_content)
     copies: list[IngestEvent] = []
     for orig_trace_id, observations in traces:
         for observation in observations:
@@ -1264,6 +1415,7 @@ def build_batch(
                 tool_index=tool_index,
                 request_index=request_index,
                 interaction_index=interaction_index,
+                skill_index=skill_index,
             )
             copies.append(
                 _copy_event(
