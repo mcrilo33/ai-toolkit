@@ -2295,6 +2295,68 @@ def test_arm_clears_stale_blocked_records(tmp_path: Path) -> None:
     assert result.stdout.strip() == "0", "arming a fresh window clears prior-run blocked records"
 
 
+# ── marker reconciliation each tick (issue #109, AC3) ──────────────────────────
+# Live state wins over a stale marker. A blocked/<issue> left on a branch that then took
+# fresh commits (the spoke resumed and is committing) is auto-cleared within one tick — the
+# #103 coexistence of a stale blocked/103 with an actively-committing spoke. A ready/<issue>
+# behind the tip is ignored (slot_state never reads a behind-tip marker as done).
+
+
+def _spoke_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, env=env, capture_output=True, text=True
+    )
+
+
+def test_reconcile_clears_stale_blocked_when_branch_advanced(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    _spoke_git(spoke_repo, "tag", "blocked/5")  # blocked at the (then) tip
+    _spoke_git(spoke_repo, "commit", "-q", "--allow-empty", "-m", "resumed work")  # tip advances
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "blocked-5.txt").write_text("1\tstuck\n")
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; reconcile_markers'
+
+    _call(expr, env={"AFK_STATE_DIR": str(statedir)})
+
+    tags = _spoke_git(spoke_repo, "tag", "-l", "blocked/5").stdout.strip()
+    assert tags == "", "a blocked marker on an actively-committing branch is auto-cleared"
+    assert not (statedir / "blocked-5.txt").exists(), "the durable record clears with the marker"
+
+
+def test_reconcile_keeps_blocked_when_at_tip(spoke_repo: Path, tmp_path: Path) -> None:
+    _spoke_git(spoke_repo, "tag", "blocked/5")  # blocked AT the tip — still the live state
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "blocked-5.txt").write_text("1\tstuck\n")  # its durable record
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; reconcile_markers'
+
+    _call(expr, env={"AFK_STATE_DIR": str(statedir)})
+
+    tags = _spoke_git(spoke_repo, "tag", "-l", "blocked/5").stdout.strip()
+    assert tags == "blocked/5", "a blocked marker still at the tip reflects live state — keep it"
+    assert (statedir / "blocked-5.txt").exists(), "an at-tip block keeps its durable record too"
+
+
+def test_slot_state_ignores_ready_behind_tip(spoke_repo: Path) -> None:
+    _spoke_git(spoke_repo, "tag", "ready/5")  # ready at the (then) tip
+    _spoke_git(spoke_repo, "commit", "-q", "--allow-empty", "-m", "more work")  # tip moves past it
+
+    result = _call(f"slot_state '{spoke_repo}' 5", env={"CLAUDE_PROJECTS_DIR": "/nonexistent"})
+
+    assert result.stdout.strip() == "busy", (
+        "a ready/<issue> behind the tip is ignored — live state wins, the spoke reads busy not done"
+    )
+
+
 def test_reap_pass_blocks_pane_alive_idle_spoke(tmp_path: Path) -> None:
     spoke = _branched_spoke(tmp_path, ahead=True)
     fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane ALIVE
