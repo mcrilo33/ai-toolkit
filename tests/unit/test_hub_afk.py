@@ -1666,7 +1666,16 @@ def _run_preflight(
         up_dir, collector_up=collector_up, bridge_up=bridge_up, launch_binds=launch_binds
     )
     expr = f'{otel_line}; {auth_line}; {prelude}; afk_telemetry_preflight /repo; echo "RC=$?"{tail}'
-    return _call(expr, env={"AFK_TELEMETRY_CONF": str(tmp_path / "no-conf")})
+    # Fast re-probe knobs so a "won't bind" launch gives up instantly instead of the
+    # production 10×1s wait.
+    return _call(
+        expr,
+        env={
+            "AFK_TELEMETRY_CONF": str(tmp_path / "no-conf"),
+            "AFK_PORT_WAIT_TRIES": "2",
+            "AFK_PORT_WAIT_SLEEP": "0",
+        },
+    )
 
 
 def test_preflight_launches_collector_and_bridge_when_down_and_authed(tmp_path: Path) -> None:
@@ -1796,6 +1805,8 @@ def test_arm_refuses_when_telemetry_cannot_be_wired(tmp_path: Path) -> None:
     up_dir = tmp_path / "ports"
     up_dir.mkdir(exist_ok=True)
     prelude = _telemetry_prelude(up_dir, collector_up=False, bridge_up=False, launch_binds=False)
+    # AFK_PORT_WAIT_TRIES=0 ⇒ afk_ensure_port does launch + one immediate probe and never
+    # sleeps, so the loop-safety `sleep` stub below can't short-circuit the preflight.
     neuter = (
         "supervise_tick() { return 0; }; dispatch_batch() { :; }; "
         "_afk_spawn_watchdog() { :; }; afk_done() { return 1; }; sleep() { exit 0; }"
@@ -1807,7 +1818,11 @@ def test_arm_refuses_when_telemetry_cannot_be_wired(tmp_path: Path) -> None:
 
     result = _call(
         expr,
-        env={"AFK_STATE": str(state), "AFK_TELEMETRY_CONF": str(tmp_path / "no-conf")},
+        env={
+            "AFK_STATE": str(state),
+            "AFK_TELEMETRY_CONF": str(tmp_path / "no-conf"),
+            "AFK_PORT_WAIT_TRIES": "0",
+        },
     )
 
     assert result.returncode != 0, "arming with telemetry down must refuse (non-zero)"

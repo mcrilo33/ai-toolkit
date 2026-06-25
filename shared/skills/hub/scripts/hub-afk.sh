@@ -37,6 +37,11 @@
 #   AFK_RULE_FILE                path to the afk-answering rule (auto-resolved otherwise)
 #   WT_NEW / WT_LAND / SPOKE_READY / BATCH_PLAN   override the resolved sibling scripts
 #   AFK_WT_LIB                   override the sourced worktree-lib.sh
+#   AI_TOOLKIT_OTEL              telemetry opt-out: =0 disables the preflight (#108);
+#                                unset/anything else ⇒ enabled (the SSOT-for-unattended default)
+#   AFK_TELEMETRY_CONF           optional conf file for LANGFUSE_BASIC_AUTH / LANGFUSE_HOST
+#                                when env leaves auth unset (env wins) [default: ~/.afk-telemetry]
+#   AFK_PORT_WAIT_TRIES/SLEEP    collector/bridge re-probe attempts + interval after a launch
 #   CLAUDE_PROJECTS_DIR          transcript root (default: $HOME/.claude/projects)
 #   AFK_REMOTE_HOST / AFK_REMOTE_REPO / AFK_REMOTE_SESSION / AFK_REMOTE_DRAIN_CMD
 #                                --remote target config (or a sourced AFK_REMOTE_CONF file)
@@ -1011,6 +1016,82 @@ remote_launch() {
   return 0
 }
 
+# --- telemetry preflight (issue #108) -----------------------------------------
+# AFK's contract is that the dashboard is the single source of truth for an unattended
+# run: a spoke spawned while the otelcol collector (:4317) / Langfuse bridge (:4319) are
+# down, or LANGFUSE_BASIC_AUTH is unset, silently loses its telemetry — and #106's
+# spoke-side wt_otel_*_preflight only WARNS and launches anyway, a per-spawn line that
+# scrolls past with no human watching. So the SUPERVISOR runs ONE loud preflight before
+# the first dispatch: resolve + export auth (so every spoke inherits working
+# credentials), bring the collector and bridge up idempotently (reusing worktree-lib's
+# launchers), and REFUSE TO ARM if any of the three can't be wired. AI_TOOLKIT_OTEL=0 is
+# the sole opt-out — unset is treated as enabled, the SSOT-for-unattended default.
+#
+#   AFK_TELEMETRY_CONF   optional conf file sourced for LANGFUSE_BASIC_AUTH / LANGFUSE_HOST
+#                        when the env leaves auth unset (env wins) [default: ~/.afk-telemetry]
+#   AFK_PORT_WAIT_TRIES  re-probe attempts after a launch before declaring a port DOWN [10]
+#   AFK_PORT_WAIT_SLEEP  seconds between those re-probes (a slow container start)        [1]
+
+# afk_telemetry_enabled -> true unless AI_TOOLKIT_OTEL=0 (the sole opt-out; unset ⇒ on).
+afk_telemetry_enabled() { [ "${AI_TOOLKIT_OTEL:-}" != "0" ]; }
+
+# afk_resolve_telemetry_auth -> resolve LANGFUSE_BASIC_AUTH (env first, then the optional
+# conf file — env wins, mirroring _load_remote_conf) and EXPORT it + LANGFUSE_HOST so
+# every dispatched spoke inherits working credentials. Also exports AI_TOOLKIT_OTEL=1 so
+# spokes opt in to native OTel. rc 1 when no auth can be resolved (caller refuses to arm).
+afk_resolve_telemetry_auth() {
+  local conf="${AFK_TELEMETRY_CONF:-$HOME/.afk-telemetry}"
+  if [ -z "${LANGFUSE_BASIC_AUTH:-}" ] && [ -f "$conf" ]; then
+    local s_host="${LANGFUSE_HOST:-}"
+    # shellcheck disable=SC1090
+    . "$conf" 2>/dev/null || true
+    [ -n "$s_host" ] && LANGFUSE_HOST="$s_host"   # an env host still outranks the file
+  fi
+  [ -n "${LANGFUSE_BASIC_AUTH:-}" ] || return 1
+  export LANGFUSE_BASIC_AUTH
+  export LANGFUSE_HOST="${LANGFUSE_HOST:-http://localhost:3000}"
+  export AI_TOOLKIT_OTEL=1
+}
+
+# afk_ensure_port <port> <launch-fn> <repo_root> -> ensure something LISTENs on <port>:
+# a no-op when already up; otherwise run <launch-fn> <repo_root> and re-probe up to
+# AFK_PORT_WAIT_TRIES times (so a slow container start isn't a false DOWN). rc 1 when the
+# port is still down after the launch — the caller turns that into a refuse-to-arm.
+afk_ensure_port() {
+  local port="$1" launch="$2" repo_root="$3" tries="${AFK_PORT_WAIT_TRIES:-10}" i=0
+  wt_port_listening "$port" && return 0
+  "$launch" "$repo_root"
+  while [ "$i" -lt "$tries" ]; do
+    wt_port_listening "$port" && return 0
+    i=$((i + 1))
+    sleep "${AFK_PORT_WAIT_SLEEP:-1}"
+  done
+  wt_port_listening "$port"
+}
+
+# afk_telemetry_preflight <repo_root> -> the one loud preflight the supervisor runs before
+# the first dispatch. A no-op (rc 0) when telemetry is opted out. Otherwise resolve+export
+# auth (refuse if none), then bring the collector up BEFORE the bridge (the collector forks
+# to the bridge), refusing if either won't come up. rc 0 ⇒ wired; rc 1 ⇒ refuse to arm.
+afk_telemetry_preflight() {
+  local repo_root="$1"
+  afk_telemetry_enabled || return 0
+  if ! afk_resolve_telemetry_auth; then
+    log "/afk: telemetry preflight FAILED — LANGFUSE_BASIC_AUTH unset and no conf to resolve it; refusing to arm (set it, or AI_TOOLKIT_OTEL=0 to run without telemetry)"
+    return 1
+  fi
+  if ! afk_ensure_port 4317 wt_collector_launch "$repo_root"; then
+    log "/afk: telemetry preflight FAILED — otelcol collector down on :4317 and won't come up; refusing to arm (set AI_TOOLKIT_OTEL=0 to run without telemetry)"
+    return 1
+  fi
+  if ! afk_ensure_port 4319 wt_bridge_launch "$repo_root"; then
+    log "/afk: telemetry preflight FAILED — Langfuse bridge down on :4319 and won't come up; refusing to arm (set AI_TOOLKIT_OTEL=0 to run without telemetry)"
+    return 1
+  fi
+  log "/afk: telemetry preflight OK — collector :4317, bridge :4319, auth present"
+  return 0
+}
+
 # --- CLI ----------------------------------------------------------------------
 
 _status() {
@@ -1057,6 +1138,10 @@ main() {
     # A window spec: compute + persist the end bound before the first tick.
     local end
     end="$(compute_end_epoch "$@" "$(afk_now)")" || { log "unrecognized window: '$*' (use <duration>, 'until HH:MM', or 'drain')"; return 2; }
+    # Telemetry preflight BEFORE arming: an unattended drain must not dispatch spokes into
+    # a dead telemetry pipeline (the dashboard is the SSOT). Refuse to arm — write no state,
+    # never reach the loop — when collector/bridge/auth can't be wired (#108).
+    afk_telemetry_preflight "$MAIN_ROOT" || return 2
     afk_write_state "$end"
     _clear_dispatch_epochs   # fresh window ⇒ empty "dispatched by this run" set
     _afk_set_unattended      # arm the fail-closed anti-gutting tripwire for spokes
