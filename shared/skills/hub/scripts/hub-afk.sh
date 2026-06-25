@@ -26,6 +26,7 @@
 #
 # Knobs (env, with defaults):
 #   AFK_TICK_SECONDS=300         supervisor poll interval
+#   AFK_WATCHDOG_SECONDS=60      watchdog poll interval (respawn a crashed supervisor)
 #   AFK_SPOKE_MAX_MINUTES=180    wall-clock ceiling per spoke before a reap
 #   AFK_IDLE_MINUTES=30          a spoke idle this long with no marker AND not waiting → reap
 #   AFK_ANSWERER_CMD             the answerer command (default: claude -p --model opus)
@@ -46,8 +47,10 @@
 #   hub-afk.sh drain             # drain until the backlog is empty + nothing in flight
 #   hub-afk.sh --remote          # launch a detached `drain` on a configured always-on Mac
 #   hub-afk.sh --status          # report the active window, "off", or "STALE" (crashed)
-#   hub-afk.sh --off             # stop the supervisor (clears the state file)
+#   hub-afk.sh --off             # stop the supervisor + watchdog (clears the state file)
 #   hub-afk.sh --once            # run a single tick and exit (tests / external cron)
+#   hub-afk.sh --watchdog        # the keeper loop: respawn the supervisor if it crashes
+#                                #   (auto-spawned on arm; rarely run by hand)
 #
 # Run it on the hub (main checkout, on the default branch). Read-only against the work
 # except for dispatching, answering, landing, and reaping spokes. --remote runs the drain
@@ -841,6 +844,85 @@ afk_done() {
   [ -z "$(printf '%s' "$batch" | tr -d '[:space:]')" ]
 }
 
+# --- watchdog (auto-restart a crashed supervisor, issue #107) ------------------
+# A silent supervisor crash (exit 0 mid-tick) leaves .afk-state armed with no process
+# draining — an in-flight spoke runs on with no answerer. The watchdog is a thin outer
+# keeper that, every AFK_WATCHDOG_SECONDS, respawns the supervisor whenever a window is
+# armed (afk_supervisor_state == stale) but no live pid is stamping the heartbeat. The
+# respawn is a NO-ARG resume: it reads the persisted .afk-state and re-adopts in-flight
+# spokes idempotently (dispatch_batch skips already-in-flight issues), so a restart
+# recovers orphans without re-dispatching or re-arming. Exactly one watchdog runs per
+# checkout (a pidfile dedups), and it exits when --off clears the state.
+: "${AFK_WATCHDOG_SECONDS:=60}"
+
+# _afk_self -> the path to THIS script, so the watchdog respawns the same supervisor.
+_afk_self() { printf '%s\n' "${BASH_SOURCE[0]}"; }
+
+# _afk_resume_launch -> the shell command the watchdog runs to respawn a crashed
+# supervisor: a detached, NO-ARG launch of this script. No window spec ⇒ it resumes the
+# persisted window (re-adopting spokes) rather than arming a fresh one. Pure (returns the
+# string) so it is inspectable in a test without launching a real supervisor.
+_afk_resume_launch() { printf 'nohup bash %s >/dev/null 2>&1 &' "$(_afk_self)"; }
+
+# _afk_watchdog_respawn -> respawn the supervisor. AFK_RESPAWN_CMD overrides the launch
+# for tests; otherwise the no-arg resume above. Best-effort; never aborts the watchdog.
+_afk_watchdog_respawn() {
+  if [ -n "${AFK_RESPAWN_CMD:-}" ]; then bash -c "$AFK_RESPAWN_CMD"; return 0; fi
+  bash -c "$(_afk_resume_launch)"
+  return 0
+}
+
+# watchdog_tick -> one watchdog check, printing the observed supervisor state:
+#   off       — no window armed; the watchdog should stop.
+#   live      — a supervisor is alive and stamping the heartbeat; nothing to do.
+#   respawned — the window is armed but the supervisor is gone; respawn it.
+watchdog_tick() {
+  case "$(afk_supervisor_state)" in
+    off)  printf 'off\n' ;;
+    live) printf 'live\n' ;;
+    stale)
+      log "/afk watchdog: supervisor gone but window still armed — respawning"
+      _afk_watchdog_respawn
+      printf 'respawned\n' ;;
+  esac
+}
+
+# _afk_watchdog_file -> the watchdog pidfile (under the git common dir), recording the
+# live watchdog's pid so only one runs. AFK_WATCHDOG_FILE overrides it for tests.
+_afk_watchdog_file() {
+  if [ -n "${AFK_WATCHDOG_FILE:-}" ]; then printf '%s\n' "$AFK_WATCHDOG_FILE"; return; fi
+  local common; common="$(git rev-parse --git-common-dir 2>/dev/null)" || common=".git"
+  printf '%s\n' "$common/.afk-watchdog"
+}
+# _afk_watchdog_alive -> true when the recorded watchdog pid is a live process.
+_afk_watchdog_alive() {
+  local f pid; f="$(_afk_watchdog_file)"; [ -f "$f" ] || return 1
+  pid="$(head -n1 "$f" 2>/dev/null | tr -d '[:space:]')"
+  _afk_pid_alive "$pid"
+}
+
+# _afk_spawn_watchdog -> launch a background watchdog UNLESS one is already alive (so a
+# re-arm, or a no-arg resume, never stacks keepers). AFK_WATCHDOG_SPAWN_CMD overrides the
+# launch for tests. Best-effort; never aborts the caller.
+_afk_spawn_watchdog() {
+  _afk_watchdog_alive && return 0
+  if [ -n "${AFK_WATCHDOG_SPAWN_CMD:-}" ]; then bash -c "$AFK_WATCHDOG_SPAWN_CMD"; return 0; fi
+  nohup bash "$(_afk_self)" --watchdog >/dev/null 2>&1 &
+  return 0
+}
+
+# watchdog_loop -> the --watchdog keeper: record this pid, then each interval respawn the
+# supervisor if it has crashed, until the window is turned off (--off). Cooperative: it
+# exits on the first `off` it observes, so --off stops it within one watchdog interval.
+watchdog_loop() {
+  printf '%s\n' "$$" > "$(_afk_watchdog_file)" 2>/dev/null || true
+  trap 'rm -f "$(_afk_watchdog_file)" 2>/dev/null || true' EXIT
+  while :; do
+    [ "$(watchdog_tick)" = "off" ] && { log "/afk watchdog: window off — exiting"; break; }
+    sleep "$AFK_WATCHDOG_SECONDS"
+  done
+}
+
 # --- remote launch (--remote) -------------------------------------------------
 # Launch a detached, caffeinate-wrapped backlog drain on a configured always-on Mac over
 # SSH (issue #73). The home Mac runs the drain unattended on the SAME Claude subscription
@@ -957,11 +1039,12 @@ main() {
 
   MAIN_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { log "not inside a git repository"; return 1; }
 
-  # Subcommands that do not start the LOCAL loop.
+  # Subcommands that do not start the LOCAL supervisor loop.
   case "${1:-}" in
-    --status) _status; return 0 ;;
-    --off)    afk_clear_state; echo "/afk: off (state cleared; the supervisor stops on its next tick)"; return 0 ;;
-    -h|--help) sed -n '2,53p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
+    --status)   _status; return 0 ;;
+    --off)      afk_clear_state; echo "/afk: off (state cleared; the supervisor + watchdog stop on their next tick)"; return 0 ;;
+    --watchdog) watchdog_loop; return $? ;;
+    -h|--help)  sed -n '2,57p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
   esac
 
   local once=0
@@ -974,6 +1057,7 @@ main() {
     afk_write_state "$end"
     _clear_dispatch_epochs   # fresh window ⇒ empty "dispatched by this run" set
     _afk_set_unattended      # arm the fail-closed anti-gutting tripwire for spokes
+    _afk_spawn_watchdog      # keep a watchdog alive so a silent crash auto-restarts (#107)
     log "/afk: armed ($([ "$end" = drain ] && echo 'drain — until the backlog is empty' || echo "until $(wt_date_ymd "$end") $(date -r "$end" +%H:%M 2>/dev/null || date -d "@$end" +%H:%M)"))"
   fi
 
