@@ -32,6 +32,7 @@
 #   AFK_ANSWERER_EFFORT=high     thinking budget for the answerer (exported as CLAUDE_EFFORT)
 #   AFK_NOW                      override "now" (epoch seconds) — testing/cron
 #   AFK_STATE                    state-file path (default: <git-common-dir>/.afk-state)
+#   AFK_HEARTBEAT                heartbeat-file path (default: <git-common-dir>/.afk-heartbeat)
 #   AFK_RULE_FILE                path to the afk-answering rule (auto-resolved otherwise)
 #   WT_NEW / WT_LAND / SPOKE_READY / BATCH_PLAN   override the resolved sibling scripts
 #   AFK_WT_LIB                   override the sourced worktree-lib.sh
@@ -161,7 +162,50 @@ afk_state_file() {
 
 afk_write_state() { printf '%s\n' "$1" > "$(afk_state_file)"; }
 afk_read_state()  { local f; f="$(afk_state_file)"; [ -f "$f" ] && head -n1 "$f" 2>/dev/null | tr -d '[:space:]' || true; }
-afk_clear_state() { rm -f "$(afk_state_file)" 2>/dev/null || true; _afk_clear_unattended; }
+afk_clear_state() { rm -f "$(afk_state_file)" 2>/dev/null || true; afk_clear_heartbeat; _afk_clear_unattended; }
+
+# --- heartbeat (issue #107) ---------------------------------------------------
+# Each supervisor tick stamps "<pid> <last_tick_epoch>" here so a second shell (and the
+# watchdog) can tell a LIVE supervisor from a stale state file. A silent crash (the
+# supervisor exited 0 mid-tick) leaves .afk-state armed with no process behind it, and
+# without this --status would echo a `draining` run that is gone (#107). The pid is THIS
+# supervisor's; cross-checking its liveness (kill -0) is the truth .afk-state cannot give.
+afk_heartbeat_file() {
+  if [ -n "${AFK_HEARTBEAT:-}" ]; then printf '%s\n' "$AFK_HEARTBEAT"; return; fi
+  local common; common="$(git rev-parse --git-common-dir 2>/dev/null)" || common=".git"
+  printf '%s\n' "$common/.afk-heartbeat"
+}
+afk_write_heartbeat() { printf '%s %s\n' "$$" "$(afk_now)" > "$(afk_heartbeat_file)" 2>/dev/null || true; }
+afk_read_heartbeat()  { local f; f="$(afk_heartbeat_file)"; [ -f "$f" ] && head -n1 "$f" 2>/dev/null || true; }
+afk_clear_heartbeat() { rm -f "$(afk_heartbeat_file)" 2>/dev/null || true; }
+
+# _afk_pid_alive <pid> -> true when <pid> is a live process. An empty / non-numeric pid is
+# never alive (guards `kill` against a bareword and a truncated partial heartbeat).
+_afk_pid_alive() {
+  case "${1:-}" in '' | *[!0-9]*) return 1 ;; esac
+  kill -0 "$1" 2>/dev/null
+}
+
+# afk_supervisor_state -> off | live | stale: the GROUND TRUTH of whether a supervisor is
+# actually running, cross-checking .afk-state against the heartbeat pid (#107):
+#   off   — no window armed (.afk-state empty).
+#   live  — a window is armed AND the heartbeat pid is a live process.
+#   stale — a window is armed but the heartbeat pid is gone, or there is no heartbeat —
+#           the supervisor crashed and the state file is lying.
+afk_supervisor_state() {
+  [ -n "$(afk_read_state)" ] || { printf 'off\n'; return; }
+  local hb pid; hb="$(afk_read_heartbeat)"; pid="${hb%% *}"
+  if _afk_pid_alive "$pid"; then printf 'live\n'; else printf 'stale\n'; fi
+}
+
+# _afk_heartbeat_age_minutes -> whole minutes since the last tick stamp, or empty when
+# there is no heartbeat. Used by --status to report how long ago the supervisor ticked.
+_afk_heartbeat_age_minutes() {
+  local hb tick; hb="$(afk_read_heartbeat)"; [ -n "$hb" ] || return 0
+  tick="${hb##* }"
+  case "$tick" in '' | *[!0-9]*) return 0 ;; esac
+  printf '%s\n' "$(( ($(afk_now) - tick) / 60 ))"
+}
 
 # --- unattended marker --------------------------------------------------------
 # While a window is armed the supervisor drops a marker under the git common dir (shared
@@ -919,6 +963,7 @@ main() {
   fi
 
   while :; do
+    afk_write_heartbeat   # stamp this tick before working, so a crash mid-tick is visible
     supervise_tick
     if [ "$_AFK_AUTH_FAILED" -eq 1 ]; then
       log "/afk: subscription auth failed — blocking in-flight spokes and stopping (re-run /login on the host)"
