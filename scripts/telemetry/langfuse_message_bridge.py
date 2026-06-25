@@ -30,6 +30,15 @@ the ``tool_use_id`` stamped into metadata (Langfuse upserts by id). A hook with 
 decision (e.g. a ``SessionStart`` hook, or a tool that emits no decision) keeps no id and
 stays at the root.
 
+MERGED HOOKS / per-script latency is BLOCKED UPSTREAM (#110 AC3). Claude Code emits ONE
+``hook_execution_complete`` per (event x tool) with ``hook_source=merged``; its
+``total_duration_ms`` is the BATCH sum across every ``.sh`` that fired for that event, with no
+per-script split (no ``hook_name`` -> individual ``.sh`` -> duration breakdown). The bridge
+forwards exactly what CC sends, so a Langfuse "Time per script" widget grouping on per-``.sh``
+granularity finds zero rows. The achievable fix is a WIDGET REGROUP (Langfuse-saved config, not
+a repo file): group the view by ``hook_name`` so it is populated with per-event totals. True
+per-script timing needs an upstream CC change that splits ``total_duration_ms`` per ``.sh``.
+
 The input join is *per call*. One ``prompt.id`` spans an entire user turn, so it cannot key
 a single API call -- every call of an agent loop shares it. The per-call key is
 ``event.sequence`` instead. An ``api_request`` log carries ``request_id`` + ``event.sequence``
