@@ -1241,3 +1241,143 @@ def test_afk_clear_unattended_removes_marker(tmp_path: Path) -> None:
     result = _call(expr, env={"AFK_STATE_DIR": str(statedir)})
 
     assert result.stdout.strip() == "absent"
+
+
+# ── the HEARTBEAT layer (issue #107) ──────────────────────────────────────────
+# A silent supervisor crash (exit 0 mid-tick) left .afk-state reading `draining` with no
+# process behind it: --status echoed a healthy run that was gone (#107). The fix is a
+# heartbeat the supervisor stamps each tick — "<pid> <last_tick_epoch>" under the git
+# common dir — so a second shell (and the watchdog) can tell a LIVE supervisor from a
+# stale state file by cross-checking pid liveness.
+
+
+def test_afk_write_heartbeat_records_pid_and_epoch(tmp_path: Path) -> None:
+    hb = tmp_path / "heartbeat"
+    # afk_write_heartbeat stamps THIS process's pid and AFK_NOW; echo $$ to compare.
+    expr = f'afk_write_heartbeat; printf "PID=%s\\n" "$$"; cat "{hb}"'
+
+    result = _call(expr, env={"AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000000"})
+
+    assert result.returncode == 0, result.stderr
+    pid = next(ln[4:] for ln in result.stdout.splitlines() if ln.startswith("PID="))
+    written = hb.read_text().strip()
+    assert written == f"{pid} 1700000000", f"heartbeat must be '<pid> <epoch>', got {written!r}"
+
+
+def test_afk_read_heartbeat_round_trips(tmp_path: Path) -> None:
+    hb = tmp_path / "heartbeat"
+    hb.write_text("4242 1700000000\n")
+
+    result = _call("afk_read_heartbeat", env={"AFK_HEARTBEAT": str(hb)})
+
+    assert result.stdout.strip() == "4242 1700000000"
+
+
+def test_afk_read_heartbeat_empty_when_absent(tmp_path: Path) -> None:
+    hb = tmp_path / "nope"
+
+    result = _call("afk_read_heartbeat", env={"AFK_HEARTBEAT": str(hb)})
+
+    assert result.stdout.strip() == ""
+
+
+def test_afk_clear_heartbeat_removes_file(tmp_path: Path) -> None:
+    hb = tmp_path / "heartbeat"
+    hb.write_text("4242 1700000000\n")
+    expr = f'afk_clear_heartbeat; test -f "{hb}" && echo present || echo absent'
+
+    result = _call(expr, env={"AFK_HEARTBEAT": str(hb)})
+
+    assert result.stdout.strip() == "absent"
+
+
+def test_afk_pid_alive_true_for_running_process() -> None:
+    # $$ is the sourcing shell — guaranteed alive while the expression runs.
+    result = _call("_afk_pid_alive $$ && echo yes || echo no")
+
+    assert result.stdout.strip() == "yes"
+
+
+def test_afk_pid_alive_false_for_dead_process() -> None:
+    # A subshell's pid is reaped by the time the outer shell checks it → not alive.
+    result = _call('dead=$(sh -c "echo \\$$"); _afk_pid_alive "$dead" && echo yes || echo no')
+
+    assert result.stdout.strip() == "no"
+
+
+@pytest.mark.parametrize("pid", ["", "abc", "12x"])
+def test_afk_pid_alive_false_for_empty_or_garbage(pid: str) -> None:
+    result = _call(f"_afk_pid_alive '{pid}' && echo yes || echo no")
+
+    assert result.stdout.strip() == "no"
+
+
+def test_afk_supervisor_state_off_when_no_window(tmp_path: Path) -> None:
+    # No .afk-state armed ⇒ off, regardless of any heartbeat.
+    state = tmp_path / "state"  # absent
+    hb = tmp_path / "heartbeat"  # absent
+
+    result = _call("afk_supervisor_state", env={"AFK_STATE": str(state), "AFK_HEARTBEAT": str(hb)})
+
+    assert result.stdout.strip() == "off"
+
+
+def test_afk_supervisor_state_live_when_pid_alive(tmp_path: Path) -> None:
+    # Window armed AND the heartbeat pid ($$, alive) ⇒ live.
+    state = tmp_path / "state"
+    state.write_text("drain\n")
+    hb = tmp_path / "heartbeat"
+    expr = f'printf "%s 1700000000\\n" "$$" > "{hb}"; afk_supervisor_state'
+
+    result = _call(expr, env={"AFK_STATE": str(state), "AFK_HEARTBEAT": str(hb)})
+
+    assert result.stdout.strip() == "live"
+
+
+def test_afk_supervisor_state_stale_when_pid_dead(tmp_path: Path) -> None:
+    # Window armed but the heartbeat pid is gone (a reaped subshell pid) ⇒ stale.
+    state = tmp_path / "state"
+    state.write_text("drain\n")
+    hb = tmp_path / "heartbeat"
+    expr = (
+        f'dead=$(sh -c "echo \\$$"); printf "%s 1700000000\\n" "$dead" > "{hb}"; '
+        "afk_supervisor_state"
+    )
+
+    result = _call(expr, env={"AFK_STATE": str(state), "AFK_HEARTBEAT": str(hb)})
+
+    assert result.stdout.strip() == "stale"
+
+
+def test_afk_supervisor_state_stale_when_no_heartbeat(tmp_path: Path) -> None:
+    # Window armed but the supervisor never wrote (or cleared) its heartbeat ⇒ stale,
+    # not live — a missing heartbeat is the absence of a live process, not proof of one.
+    state = tmp_path / "state"
+    state.write_text("drain\n")
+    hb = tmp_path / "heartbeat"  # absent
+
+    result = _call("afk_supervisor_state", env={"AFK_STATE": str(state), "AFK_HEARTBEAT": str(hb)})
+
+    assert result.stdout.strip() == "stale"
+
+
+def test_heartbeat_age_minutes_counts_up(tmp_path: Path) -> None:
+    hb = tmp_path / "heartbeat"
+    hb.write_text("4242 1700000000\n")  # 600s = 10 min before AFK_NOW
+
+    result = _call(
+        "_afk_heartbeat_age_minutes",
+        env={"AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000600"},
+    )
+
+    assert result.stdout.strip() == "10"
+
+
+def test_heartbeat_age_minutes_empty_when_absent(tmp_path: Path) -> None:
+    hb = tmp_path / "nope"
+
+    result = _call(
+        "_afk_heartbeat_age_minutes", env={"AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000600"}
+    )
+
+    assert result.stdout.strip() == ""
