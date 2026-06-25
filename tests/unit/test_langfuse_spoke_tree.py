@@ -417,6 +417,185 @@ class TestBuildBatch:
         assert [event["type"] for event in batch] == ["trace-create", "span-create"]
 
 
+class TestEnclosingTurnFallback:
+    """#110 AC1: a satellite carrying a tool_use_id whose tool was denied/cancelled (so no
+    tool span exists to attach to) nests under its enclosing claude_code.interaction — by
+    prompt.id first, then by [start,end] window containment for a real-timing gate hook —
+    instead of dropping to the synthetic root. A lagging-timestamp audit instant is never
+    window-placed (anti-lag), and a satellite with no enclosing turn at all stays at the root.
+    """
+
+    def test_unmatched_gate_hook_nests_under_turn_by_prompt_id(self) -> None:
+        # A PreToolUse gate hook whose tool was denied carries a tool_use_id matching no tool
+        # span, but shares its turn's prompt.id — it nests under that interaction, not the root.
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "p1"}},
+        )
+        hook = _obs(
+            "h1",
+            "PreToolUse.sh",
+            parent=None,
+            metadata={
+                "attributes": {
+                    "workflow.kind": "hook",
+                    "tool_use_id": "tu-denied",
+                    "prompt.id": "p1",
+                }
+            },
+        )
+        traces = [("trace-int", [interaction]), ("trace-hook", [hook])]
+
+        batch = build_batch(traces, SPOKE)
+
+        copy = _by_orig(batch, "trace-hook", "h1")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+
+    def test_unmatched_hook_execution_complete_nests_under_turn_by_prompt_id(self) -> None:
+        # A hook_execution_complete audit instant (lagging time) with an unmatched tool_use_id
+        # joins its turn by prompt.id — never window-placed by its lagging startTime.
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "p7"}},
+        )
+        hook = _obs(
+            "h7",
+            "hook_execution_complete:PostToolUse",
+            type_="EVENT",
+            parent=None,
+            metadata={
+                "hook_event": "PostToolUse",
+                "hook_name": "PostToolUse:Edit",
+                "tool_use_id": "tu-denied",
+                "prompt.id": "p7",
+            },
+        )
+        traces = [("trace-int", [interaction]), ("trace-audit", [hook])]
+
+        batch = build_batch(traces, SPOKE)
+
+        copy = _by_orig(batch, "trace-audit", "h7")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+
+    def test_unmatched_gate_hook_nests_by_time_window_without_prompt_id(self) -> None:
+        # A real-timing gate hook with no prompt.id falls back to [start,end] containment: its
+        # true startTime sits inside exactly one interaction window.
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+        )
+        hook = _obs(
+            "h2",
+            "PreToolUse.sh",
+            parent=None,
+            startTime="2026-01-02T00:00:05Z",
+            metadata={"attributes": {"workflow.kind": "hook", "tool_use_id": "tu-denied"}},
+        )
+        traces = [("trace-int", [interaction]), ("trace-hook", [hook])]
+
+        batch = build_batch(traces, SPOKE)
+
+        copy = _by_orig(batch, "trace-hook", "h2")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+
+    def test_innermost_turn_wins_on_overlapping_windows(self) -> None:
+        # When a resume interaction nests inside an outer one, a window-matched hook homes to
+        # the innermost (narrowest) containing turn.
+        outer = _obs(
+            "i_out",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:30Z",
+        )
+        inner = _obs(
+            "i_in",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:05Z",
+            endTime="2026-01-02T00:00:15Z",
+        )
+        hook = _obs(
+            "h3",
+            "PreToolUse.sh",
+            parent=None,
+            startTime="2026-01-02T00:00:10Z",
+            metadata={"attributes": {"workflow.kind": "hook", "tool_use_id": "tu-denied"}},
+        )
+        traces = [("trace-int", [outer, inner]), ("trace-hook", [hook])]
+
+        batch = build_batch(traces, SPOKE)
+
+        copy = _by_orig(batch, "trace-hook", "h3")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i_in")
+
+    def test_audit_instant_hook_without_prompt_id_is_not_window_placed(self) -> None:
+        # The anti-lag guard: a hook_execution_complete carries a LAGGING startTime, so without
+        # a prompt.id it is NOT placed by window containment — it stays at the root.
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+        )
+        hook = _obs(
+            "h4",
+            "hook_execution_complete:PostToolUse",
+            type_="EVENT",
+            parent=None,
+            startTime="2026-01-02T00:00:05Z",
+            metadata={
+                "hook_event": "PostToolUse",
+                "hook_name": "PostToolUse:Edit",
+                "tool_use_id": "tu-denied",
+            },
+        )
+        traces = [("trace-int", [interaction]), ("trace-audit", [hook])]
+
+        batch = build_batch(traces, SPOKE)
+
+        copy = _by_orig(batch, "trace-audit", "h4")
+        assert copy["body"]["parentObservationId"] == root_id_for(SPOKE)
+
+    def test_matched_tool_still_wins_over_enclosing_turn(self) -> None:
+        # The fallback never overrides a real match: a hook whose tool_use_id DOES resolve to a
+        # tool span nests under the tool, even when an enclosing turn shares its prompt.id.
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "p1"}},
+        )
+        tool = _obs(
+            "t1",
+            "Bash",
+            parent="i1",
+            metadata={"attributes": {"tool_use_id": "tu-1"}},
+        )
+        hook = _obs(
+            "h5",
+            "PreToolUse.sh",
+            parent=None,
+            metadata={
+                "attributes": {"workflow.kind": "hook", "tool_use_id": "tu-1", "prompt.id": "p1"}
+            },
+        )
+        traces = [("trace-int", [interaction, tool]), ("trace-hook", [hook])]
+
+        batch = build_batch(traces, SPOKE)
+
+        copy = _by_orig(batch, "trace-hook", "h5")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "t1")
+
+
 class TestToolSubspanFolding:
     """#100 part 2: the three 1:1 native sub-spans fold into their tool's metadata instead of
     nesting as child nodes — claude_code.tool.execution -> execution_ms/success/error,
