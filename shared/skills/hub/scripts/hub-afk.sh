@@ -582,13 +582,16 @@ inject_and_verify() {
 # decision surfaces on the observability dashboard. Metadata only — the question→answer
 # text rides the answerer's own sidecar session (the dashboard's node summary), never the
 # span (the telemetry privacy contract logs no payload). No-op when telemetry is off.
-afk_emit_decision() {
+# _afk_emit_span <wt> <name> <status> -> the shared one-span emitter (kind=agent, phase
+# review), attributed to the spoke. No-op when telemetry is off or the worktree is gone.
+_afk_emit_span() {
   command -v telemetry_emit_span >/dev/null 2>&1 || return 0
-  local wt="$1" status="$2"
+  local wt="$1" name="$2" status="$3"
   [ -d "$wt" ] || return 0
-  ( cd "$wt" && telemetry_emit_span --kind agent --name afk-answer --phase review --status "$status" ) || true
+  ( cd "$wt" && telemetry_emit_span --kind agent --name "$name" --phase review --status "$status" ) || true
   return 0
 }
+afk_emit_decision() { _afk_emit_span "$1" afk-answer "$2"; }
 
 # _consume_gate_tag <wt_path> <issue> -> drop the gate/<issue> marker once a PLAN-gate
 # answer has been injected. slot_state reads the LOCAL tag at the tip, so deleting the local
@@ -672,6 +675,141 @@ reap_spoke() {
   log "→ reap #$issue: $reason"
   _kill_spoke_window "$issue"
   _escalate_blocked "$wt" "$issue" "$reason"
+}
+
+# --- crash ≠ hang: auto-resume-once a pane-dead spoke (issue #109) -------------
+# A reaped spoke is not always hung. The reaper abandoned #103 as "idle, likely hung"
+# when its tmux PANE had crashed but its committed work was intact. So before declaring
+# blocked we distinguish a DEAD pane (session crashed → re-adopt the worktree ONCE,
+# reusing the spoke_run_id) from a LIVE-but-idle pane (truly hung → block).
+
+# _spoke_pane_alive <wt> -> true when a live tmux pane maps to the worktree. Empty target
+# (the spoke's pane crashed / its window is gone) ⇒ dead.
+_spoke_pane_alive() { [ -n "$(_spoke_pane_target "$1")" ]; }
+
+# _afk_default_ref <wt> -> the ref the spoke branched from, so "has commits" measures work
+# ABOVE the branch point. AFK_DEFAULT_BRANCH wins (tests); else origin/HEAD's target; else
+# the conventional `main`.
+_afk_default_ref() {
+  local wt="$1" ref
+  [ -n "${AFK_DEFAULT_BRANCH:-}" ] && { printf '%s\n' "$AFK_DEFAULT_BRANCH"; return; }
+  ref="$(git -C "$wt" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)"
+  printf '%s\n' "${ref:-main}"
+}
+
+# _spoke_has_commits <wt> -> true when HEAD carries work to preserve: a commit ABOVE the
+# branch point (merge-base HEAD <default> != HEAD). A worktree is cut from the default
+# branch, so a bare "HEAD exists" is always true and would be meaningless; this is the AC1
+# "with commits" test. If the base can't be resolved we can't measure it, so we favor
+# preserving work (true) — the resume is bounded to once regardless.
+_spoke_has_commits() {
+  local wt="$1" ref base tip
+  tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)" || return 1
+  ref="$(_afk_default_ref "$wt")"
+  base="$(git -C "$wt" merge-base HEAD "$ref" 2>/dev/null)" || return 0
+  [ -n "$base" ] || return 0
+  [ "$base" != "$tip" ]
+}
+
+# the once-per-window resume stamp: a spoke is auto-resumed at most ONCE per armed window
+# (a second crash escalates to a human). Cleared on a fresh arm (_clear_resume_markers).
+_afk_resumed_marker()  { printf '%s\n' "$(_afk_state_dir)/resumed-$1"; }
+_afk_already_resumed() { [ -f "$(_afk_resumed_marker "$1")" ]; }
+_afk_mark_resumed() {
+  local m; m="$(_afk_resumed_marker "$1")"
+  mkdir -p "$(dirname "$m")" 2>/dev/null || true
+  printf '%s\n' "$(afk_now)" > "$m" 2>/dev/null || true
+}
+_clear_resume_markers() { rm -f "$(_afk_state_dir)"/resumed-* 2>/dev/null || true; }
+
+# _afk_spoke_run_id <wt> -> the spoke's persisted spoke_run_id (worktree-new.sh stamps it
+# at .ai-toolkit/spoke-run-id), so a resumed run groups under the SAME spoke in Langfuse.
+# Synthesized from the branch + now-clock if the file is missing.
+_afk_spoke_run_id() {
+  local wt="$1" f id branch
+  f="$wt/.ai-toolkit/spoke-run-id"
+  [ -f "$f" ] && id="$(head -n1 "$f" 2>/dev/null | tr -d '[:space:]')"
+  if [ -z "${id:-}" ]; then
+    branch="$(git -C "$wt" branch --show-current 2>/dev/null)"
+    id="${branch:-spoke}+$(afk_now)"
+  fi
+  printf '%s\n' "$id"
+}
+
+# _afk_resume_prompt <issue> -> the plain-English first message for the resumed session.
+# Deliberately NOT a slash command: `/cycle` is not a real command (the skill is
+# solo-cycle), so a seeded `/cycle` would fail and re-strand the spoke.
+_afk_resume_prompt() {
+  local issue="$1"
+  cat <<EOF
+Your session crashed and the AFK supervisor restored this window. Your committed work is
+intact -- do NOT start over. Run /source-task $issue to re-anchor, re-read your task ledger
+and the working tree to see where you left off, then continue the solo flow (RED -> GREEN ->
+REVIEW -> PUSH) from there. Push each subtask and emit the ready marker when the issue's
+acceptance criteria are all met. Do NOT self-land -- the hub lands #$issue.
+EOF
+}
+
+# _afk_resume_command <wt> <issue> -> the launch command for the resumed tmux window. Pure
+# (returns the string) so it is inspectable in a test. It inline-exports the telemetry the
+# resumed window needs to keep reaching the collector — recovery must not fly blind (#108):
+# AI_TOOLKIT_OTEL=1, the supervisor's OTLP endpoint, and the re-pinned spoke_run_id. The
+# auth header stays in the inherited env (never on the command line), exactly as
+# worktree-new.sh does. `claude --continue` resumes the crashed session in the worktree.
+# UPGRADE: replicate worktree-new.sh's full beta-tracing/raw-body env for per-tool parity.
+_afk_resume_command() {
+  local wt="$1" issue="$2" run_id endpoint prompt
+  run_id="$(_afk_spoke_run_id "$wt")"
+  endpoint="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}"
+  prompt="$(_afk_resume_prompt "$issue")"
+  printf 'AI_TOOLKIT_OTEL=1 OTEL_EXPORTER_OTLP_ENDPOINT=%s OTEL_RESOURCE_ATTRIBUTES=%s claude --continue %s\n' \
+    "$(printf '%q' "$endpoint")" "$(printf '%q' "spoke_run_id=$run_id")" "$(printf '%q' "$prompt")"
+}
+
+# resume_spoke <wt> <issue> -> open a fresh tmux window in the project session, cd'd into
+# the (intact) worktree, running the resume command; stamp the once-per-window marker and
+# a success span. rc 1 when tmux is unavailable or the window can't be opened (the caller
+# then falls back to blocking). Mirrors worktree-new.sh's project-session window layout.
+resume_spoke() {
+  local wt="$1" issue="$2" sess win cmd
+  command -v tmux >/dev/null 2>&1 || { log "  tmux unavailable — cannot resume #$issue"; return 1; }
+  log "→ resume #$issue: pane crashed with work intact — re-adopting once"
+  sess="$(wt_tmux_session "${MAIN_ROOT:-$(wt_main_root 2>/dev/null)}")"
+  # Name the window with the branch SLUG (the "<issue>-<slug>" worktree-new.sh convention),
+  # NOT the full "feature/<issue>-…" branch: _kill_spoke_window only matches "<issue>-"* /
+  # "<issue>", so a full-branch name would orphan the resumed window on a later reap.
+  win="$(git -C "$wt" branch --show-current 2>/dev/null)"; win="${win##*/}"; win="${win:-$issue}"
+  cmd="$(_afk_resume_command "$wt" "$issue")"
+  tmux has-session -t "=$sess" 2>/dev/null || tmux new-session -d -s "$sess" -c "$wt" 2>/dev/null
+  if ! tmux new-window -t "=$sess:" -n "$win" -c "$wt" "$cmd; exec ${SHELL:-zsh}" 2>/dev/null; then
+    log "  could not open a resume window for #$issue"
+    return 1
+  fi
+  # Pin the name so the running claude/zsh can't rename the window out of the kill match.
+  tmux set-window-option -t "=$sess:$win" automatic-rename off 2>/dev/null || true
+  _afk_mark_resumed "$issue"
+  _afk_emit_span "$wt" afk-resume success
+  return 0
+}
+
+# _reap_or_resume <wt> <issue> -> decide a reaped spoke's fate. An over-ceiling runaway
+# always blocks (resume never applies). Otherwise it went idle: crash ≠ hang — a LIVE pane
+# is truly hung (block); a DEAD pane with commits is auto-resumed ONCE in place; a dead
+# pane with nothing to preserve, or one already resumed this window, is blocked.
+_reap_or_resume() {
+  local wt="$1" issue="$2"
+  if spoke_over_ceiling "$(read_dispatch_epoch "$issue")" "$(afk_now)"; then
+    reap_spoke "$wt" "$issue" "time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
+  elif _spoke_pane_alive "$wt"; then
+    reap_spoke "$wt" "$issue" "went idle >${AFK_IDLE_MINUTES}m with a live pane and no marker — likely hung"
+  elif ! _spoke_has_commits "$wt"; then
+    reap_spoke "$wt" "$issue" "pane crashed with no committed work to preserve — needs a human"
+  elif _afk_already_resumed "$issue"; then
+    reap_spoke "$wt" "$issue" "pane crashed again after an auto-resume — needs a human"
+  else
+    resume_spoke "$wt" "$issue" \
+      || reap_spoke "$wt" "$issue" "pane crashed and the auto-resume could not be launched — needs a human"
+  fi
 }
 
 # _block_all_inflight <reason> -> emit blocked/<issue> for every in-flight spoke not
@@ -806,16 +944,11 @@ answer_pass() {
   done < <(inflight_worktrees)
 }
 reap_pass() {
-  local path issue reason
+  local path issue
   while IFS=$'\t' read -r path issue; do
     [ -n "$issue" ] || continue
     [ "$(slot_state "$path" "$issue")" = "reap" ] || continue
-    if spoke_over_ceiling "$(read_dispatch_epoch "$issue")" "$(afk_now)"; then
-      reason="time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
-    else
-      reason="went idle >${AFK_IDLE_MINUTES}m with no marker and not waiting — likely hung"
-    fi
-    reap_spoke "$path" "$issue" "$reason"
+    _reap_or_resume "$path" "$issue"
   done < <(inflight_worktrees)
 }
 
@@ -1190,6 +1323,7 @@ main() {
     afk_telemetry_preflight "$MAIN_ROOT" || return 2
     afk_write_state "$end"
     _clear_dispatch_epochs   # fresh window ⇒ empty "dispatched by this run" set
+    _clear_resume_markers    # fresh window ⇒ every spoke gets its one auto-resume again
     _afk_set_unattended      # arm the fail-closed anti-gutting tripwire for spokes
     log "/afk: armed ($([ "$end" = drain ] && echo 'drain — until the backlog is empty' || echo "until $(wt_date_ymd "$end") $(date -r "$end" +%H:%M 2>/dev/null || date -d "@$end" +%H:%M)"))"
   fi
