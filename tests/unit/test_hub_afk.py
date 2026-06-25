@@ -1383,3 +1383,87 @@ def test_heartbeat_age_minutes_empty_when_absent(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr  # the function ran (not command-not-found)
     assert result.stdout.strip() == ""
+
+
+# ── truthful --status (issue #107) ────────────────────────────────────────────
+# The #107 symptom: a crashed supervisor (exited 0 mid-tick) left .afk-state reading
+# `draining`, so --status echoed a healthy run that was gone. _status now cross-checks
+# the heartbeat pid and reports STALE instead of the state file's lie.
+
+
+def _armed_state(tmp_path: Path, value: str) -> Path:
+    state = tmp_path / "state"
+    state.write_text(f"{value}\n")
+    return state
+
+
+def test_status_reports_stale_when_supervisor_dead(tmp_path: Path) -> None:
+    # Window armed (drain) but the heartbeat pid is gone ⇒ STALE, never `draining`.
+    state = _armed_state(tmp_path, "drain")
+    hb = tmp_path / "heartbeat"
+    expr = f'dead=$(sh -c "echo \\$$"); printf "%s 1700000000\\n" "$dead" > "{hb}"; _status'
+
+    result = _call(
+        expr,
+        env={"AFK_STATE": str(state), "AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000600"},
+    )
+
+    assert "STALE" in result.stdout
+    assert "10m ago" in result.stdout  # 600s since the last tick
+    assert "draining" not in result.stdout, "a dead supervisor must not report `draining` (#107)"
+
+
+def test_status_reports_stale_when_no_heartbeat(tmp_path: Path) -> None:
+    # Window armed but the supervisor never wrote a heartbeat ⇒ STALE, not `on`/`draining`.
+    state = _armed_state(tmp_path, "drain")
+    hb = tmp_path / "nope"
+
+    result = _call(
+        "_status",
+        env={"AFK_STATE": str(state), "AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000600"},
+    )
+
+    assert "STALE" in result.stdout
+    assert "draining" not in result.stdout
+
+
+def test_status_reports_stale_for_dead_clock_bound_window(tmp_path: Path) -> None:
+    # A clock-bound window still ahead, but the supervisor pid is gone ⇒ STALE, not the
+    # "Nm remaining" line the state file alone would print.
+    state = _armed_state(tmp_path, "1700003600")  # 1h after AFK_NOW
+    hb = tmp_path / "heartbeat"
+    expr = f'dead=$(sh -c "echo \\$$"); printf "%s 1700000000\\n" "$dead" > "{hb}"; _status'
+
+    result = _call(
+        expr,
+        env={"AFK_STATE": str(state), "AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000600"},
+    )
+
+    assert "STALE" in result.stdout
+    assert "remaining" not in result.stdout
+
+
+def test_status_still_draining_when_supervisor_live(tmp_path: Path) -> None:
+    # Window armed AND a live heartbeat pid ($$) ⇒ the normal `draining` line, no STALE.
+    state = _armed_state(tmp_path, "drain")
+    hb = tmp_path / "heartbeat"
+    expr = f'printf "%s 1700000000\\n" "$$" > "{hb}"; _status'
+
+    result = _call(
+        expr,
+        env={"AFK_STATE": str(state), "AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000600"},
+    )
+
+    assert "STALE" not in result.stdout
+    assert "draining" in result.stdout
+
+
+def test_status_off_unaffected_by_heartbeat(tmp_path: Path) -> None:
+    # No window armed ⇒ off, even if a stale heartbeat file lingers from a prior run.
+    state = tmp_path / "state"  # absent
+    hb = tmp_path / "heartbeat"
+    hb.write_text("4242 1700000000\n")
+
+    result = _call("_status", env={"AFK_STATE": str(state), "AFK_HEARTBEAT": str(hb)})
+
+    assert result.stdout.strip() == "/afk: off"
