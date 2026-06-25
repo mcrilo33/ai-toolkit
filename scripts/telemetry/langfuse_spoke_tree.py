@@ -23,9 +23,12 @@ Re-parenting rules for each source observation:
 - It had a ``parentObservationId`` -> the copy points at the copy of that parent.
 - It was a trace-root interaction / marker / lifecycle / script -> the synthetic root.
 - It was a trace-root satellite of a tool call -> the copy of the tool whose
-  ``tool_use_id`` matches the satellite's; or the synthetic root when there is no id or no
-  match. A satellite is a gate hook (name ends ``.sh`` or
-  ``metadata.attributes.workflow.kind == hook``) or a #93 tool-scoped audit event
+  ``tool_use_id`` matches the satellite's; or, when the satellite names a tool that produced
+  no span (the tool was denied/cancelled), its enclosing ``claude_code.interaction`` —
+  by ``prompt.id``, falling back to ``[start,end]`` window containment (#110,
+  :func:`_enclosing_turn`); only a satellite naming no tool (no ``tool_use_id``) or one with
+  no enclosing turn at all reaches the synthetic root. A satellite is a gate hook (name ends
+  ``.sh`` or ``metadata.attributes.workflow.kind == hook``) or a #93 tool-scoped audit event
   (``tool_result``, minted on the per-spoke audit trace with its ``tool_use_id`` in flat
   metadata). (Langfuse nests OTel span attributes under ``metadata["attributes"]``; the audit
   events carry their id at the metadata top level.)
@@ -34,8 +37,9 @@ Three native 1:1 sub-spans do NOT nest — they FOLD into their tool's metadata 
 are dropped (#100, :func:`_fold_tool_subspans`): ``claude_code.tool.execution`` ->
 ``execution_ms``/``success``/``error``, ``claude_code.tool.blocked_on_user`` ->
 ``blocked_on_user_ms``/``decision``/``decision_source``, and the ``tool_decision:<d>`` audit
-event -> ``decision``/``decision_source``. An unmatched ``tool_decision`` (no tool) keeps its
-node and collapses to the root.
+event -> ``decision``/``decision_source``. An unmatched ``tool_decision`` (the tool was
+denied/cancelled, so no span) keeps its node and re-homes to its enclosing turn by ``prompt.id``
+(#110), reaching the root only when no turn encloses it.
 
 The same session also carries the ``spoke-audit:`` trace's span-less audit/lifecycle events
 (#93). They are folded in here too (#104), placed by CAUSAL id-join — never by their lagging
@@ -184,8 +188,9 @@ _PROMPT_ID_KEY = "prompt.id"
 # bridge resolves by event.sequence). Like gate hooks, they join the tool sharing that id
 # rather than the synthetic root. ``tool_result`` / ``hook_execution_complete`` nest as nodes;
 # ``tool_decision`` instead FOLDS into the tool's metadata (#100, see _is_fold_subspan) when
-# matched, and only an UNMATCHED ``tool_decision`` (or a ``hook_execution_complete`` with no
-# tool, e.g. ``:SessionStart``) collapses to the root, unchanged.
+# matched. An UNMATCHED tool-scoped event (the tool was denied/cancelled) re-homes to its
+# enclosing turn by ``prompt.id`` (#110); a ``hook_execution_complete`` naming no tool (e.g.
+# ``:SessionStart``) has no ``tool_use_id`` and stays at the synthetic root.
 _TOOL_AUDIT_EVENT_PREFIXES = ("tool_decision", "tool_result", "hook_execution_complete")
 
 # The three native 1:1 sub-spans of a tool call that FOLD into their ``tool:`` node's metadata
@@ -705,11 +710,20 @@ def _enclosing_turn(observation: Observation, index: InteractionIndex) -> str | 
     start = observation.get("startTime")
     if not start:
         return None
-    chosen: str | None = None
-    for win_start, win_end, copy in index.windows:
-        if win_start <= start <= win_end:
-            chosen = copy
-    return chosen
+    chosen: tuple[str, str, str] | None = None
+    for window in index.windows:
+        win_start, win_end, _copy = window
+        if not win_start <= start <= win_end:
+            continue
+        # Innermost wins: the latest-starting containing turn, and on an equal start the one
+        # that ends earliest (the narrower, more-nested window).
+        if (
+            chosen is None
+            or win_start > chosen[0]
+            or (win_start == chosen[0] and win_end < chosen[1])
+        ):
+            chosen = window
+    return chosen[2] if chosen else None
 
 
 def _resolve_parent(
@@ -1135,7 +1149,9 @@ def _apply_step_grouping(
     Only the synthetic-root's OWN satellite children move: the ``step:*`` / ``lifecycle:*``
     markers, the ``mcp`` / ``spoke-push`` / ``script:ready`` script spans, and the gate hooks
     that did not match a tool. When such a root child's ``startTime`` falls in a step window it is
-    re-parented under that step node (innermost wins on overlap).
+    re-parented under that step node (innermost wins on overlap). A denied gate hook that
+    :func:`_enclosing_turn` already re-homed to its interaction (#110) is no longer a root child,
+    so it lands under the turn — the truer causal parent — and is correctly skipped here.
 
     The ``claude_code.interaction`` subtrees are LEFT UNTOUCHED at the root — their per-turn
     structure and W3C-TRACEPARENT nesting (a resume can legitimately nest under an earlier

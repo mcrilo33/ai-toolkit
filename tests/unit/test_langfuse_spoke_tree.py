@@ -536,6 +536,59 @@ class TestEnclosingTurnFallback:
         copy = _by_orig(batch, "trace-hook", "h3")
         assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i_in")
 
+    def test_innermost_turn_wins_on_equal_start_windows(self) -> None:
+        # Two turns sharing a start: the narrower (earlier end) is the innermost and wins.
+        outer = _obs(
+            "i_out",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:30Z",
+        )
+        inner = _obs(
+            "i_in",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+        )
+        hook = _obs(
+            "h6",
+            "PreToolUse.sh",
+            parent=None,
+            startTime="2026-01-02T00:00:05Z",
+            metadata={"attributes": {"workflow.kind": "hook", "tool_use_id": "tu-denied"}},
+        )
+        traces = [("trace-int", [outer, inner]), ("trace-hook", [hook])]
+
+        batch = build_batch(traces, SPOKE)
+
+        copy = _by_orig(batch, "trace-hook", "h6")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i_in")
+
+    def test_unmatched_tool_decision_nests_under_turn_by_prompt_id(self) -> None:
+        # The canonical denied-tool case: a tool_decision:reject for a tool that produced no
+        # span carries the turn's prompt.id and re-homes under that interaction, not the root.
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "p9"}},
+        )
+        decision = _obs(
+            "d9",
+            "tool_decision:reject",
+            type_="EVENT",
+            parent=None,
+            metadata={"tool_use_id": "tu-denied", "decision": "reject", "prompt.id": "p9"},
+        )
+        traces = [("trace-int", [interaction]), ("trace-audit", [decision])]
+
+        batch = build_batch(traces, SPOKE)
+
+        copy = _by_orig(batch, "trace-audit", "d9")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+
     def test_audit_instant_hook_without_prompt_id_is_not_window_placed(self) -> None:
         # The anti-lag guard: a hook_execution_complete carries a LAGGING startTime, so without
         # a prompt.id it is NOT placed by window containment — it stays at the root.
