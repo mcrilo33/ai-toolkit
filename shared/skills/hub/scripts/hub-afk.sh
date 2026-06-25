@@ -650,14 +650,44 @@ decide_and_act() {
   _escalate_blocked "$wt" "$issue" "$text"
 }
 
+# --- durable local block record (issue #109, AC2) -----------------------------
+# spoke-ready.sh emits blocked/<issue> by `git tag` + `git push -f origin blocked/<issue>`;
+# that push can fail for any reason (no/unreachable remote, a transient network drop, a
+# push-hook error) — and in the #103 incident the reap logged `could not emit blocked/103`
+# and dropped it. When the tag can't be pushed after retries, a blocked state is recorded
+# LOCALLY instead, so it is NEVER silently dropped: --status surfaces this record for the
+# operator returning from AFK. Cleared on a fresh arm (a current-window view).
+_afk_blocked_record() { printf '%s\n' "$(_afk_state_dir)/blocked-$1.txt"; }
+_afk_record_blocked_locally() {
+  local issue="$1" reason="$2" f
+  f="$(_afk_blocked_record "$issue")"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  printf '%s\t%s\n' "$(afk_now)" "$reason" > "$f" 2>/dev/null \
+    || log "  WARNING: could not write a durable block record for #$issue at $f"
+}
+_clear_blocked_records() { rm -f "$(_afk_state_dir)"/blocked-*.txt 2>/dev/null || true; }
+
 # _escalate_blocked <wt_path> <issue> <reason> -> emit blocked/<issue> on the spoke's
-# behalf via spoke-ready.sh, and a deny decision span. Best-effort; never aborts the loop.
+# behalf via spoke-ready.sh, RETRYING the push, and falling back to a durable local record
+# when it still can't be emitted — escalation never fails silently (#109). Always emits a
+# deny decision span. Best-effort; never aborts the loop.
 _escalate_blocked() {
-  local wt="$1" issue="$2" reason="$3" sr
+  local wt="$1" issue="$2" reason="$3" sr tries i=0 ok=0
   log "  escalate #$issue: $reason"
-  sr="$(_afk_find_script "${SPOKE_READY:-}" spoke-ready.sh)" \
-    && ( cd "$wt" && "$sr" --blocked "$issue" -m "$reason" ) >/dev/null 2>&1 \
-    || log "  could not emit blocked/$issue"
+  tries="${AFK_ESCALATE_TRIES:-3}"
+  case "$tries" in '' | *[!0-9]*) tries=3 ;; esac   # guard the loop arithmetic
+  sr="$(_afk_find_script "${SPOKE_READY:-}" spoke-ready.sh)" || sr=""
+  if [ -n "$sr" ]; then
+    while [ "$i" -lt "$tries" ]; do
+      if ( cd "$wt" && "$sr" --blocked "$issue" -m "$reason" ) >/dev/null 2>&1; then ok=1; break; fi
+      i=$(( i + 1 ))
+      [ "$i" -lt "$tries" ] && sleep "${AFK_ESCALATE_SLEEP:-1}" 2>/dev/null || true
+    done
+  fi
+  if [ "$ok" -ne 1 ]; then
+    log "  could not push blocked/$issue after $tries tries — recording it durably (see --status)"
+    _afk_record_blocked_locally "$issue" "$reason"
+  fi
   afk_emit_decision "$wt" deny
 }
 
@@ -1284,15 +1314,40 @@ _afk_status_state_line() {
   echo "/afk: on — ${rem}m remaining (until $(wt_date_ymd "$state") $(date -r "$state" +%H:%M 2>/dev/null || date -d "@$state" +%H:%M))"
 }
 
+# afk_blocked_locally_status -> a one-line summary of issues with a DURABLE local block
+# record (escalation could not push the tag, #109), or nothing when there are none. The
+# operator returning from AFK reads --status, so a block that never reached the dashboard
+# must still surface here — never silently dropped.
+afk_blocked_locally_status() {
+  local dir f issue list=""
+  dir="$(_afk_state_dir)"
+  [ -d "$dir" ] || return 0
+  for f in "$dir"/blocked-*.txt; do
+    [ -e "$f" ] || continue
+    issue="${f##*/blocked-}"; issue="${issue%.txt}"
+    list="${list:+$list, }#$issue"
+  done
+  [ -n "$list" ] || return 0
+  printf '/afk: locally blocked (escalation could not push the tag — needs a human): %s [%s]\n' \
+    "$list" "$dir"
+}
+
 _status() {
   local state now
   state="$(afk_read_state)"; now="$(afk_now)"
-  if [ -z "$state" ]; then echo "/afk: off"; return 0; fi
+  if [ -z "$state" ]; then
+    echo "/afk: off"
+    # A durable escalation outlives the drain — surface it even when off, so the operator
+    # returning from AFK sees a block that never reached the dashboard (#109).
+    afk_blocked_locally_status
+    return 0
+  fi
   _afk_status_state_line "$state" "$now"
   # For a live (or stale) drain, surface telemetry health too: the dashboard is the SSOT,
   # so the operator must be able to see whether it's actually receiving data (#108). A
   # no-op line when telemetry is opted out (AI_TOOLKIT_OTEL=0).
   afk_telemetry_status
+  afk_blocked_locally_status
 }
 
 main() {
@@ -1324,6 +1379,7 @@ main() {
     afk_write_state "$end"
     _clear_dispatch_epochs   # fresh window ⇒ empty "dispatched by this run" set
     _clear_resume_markers    # fresh window ⇒ every spoke gets its one auto-resume again
+    _clear_blocked_records   # fresh window ⇒ --status shows only THIS run's durable blocks
     _afk_set_unattended      # arm the fail-closed anti-gutting tripwire for spokes
     log "/afk: armed ($([ "$end" = drain ] && echo 'drain — until the backlog is empty' || echo "until $(wt_date_ymd "$end") $(date -r "$end" +%H:%M 2>/dev/null || date -d "@$end" +%H:%M)"))"
   fi
