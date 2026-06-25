@@ -1853,3 +1853,94 @@ def test_arm_refuses_when_telemetry_cannot_be_wired(tmp_path: Path) -> None:
     assert result.returncode != 0, "arming with telemetry down must refuse (non-zero)"
     assert not state.exists(), "a refused arm must not write the state file (no blind dispatch)"
     assert "telemetry" in result.stderr.lower()
+
+
+# ── --status telemetry health line (issue #108) ───────────────────────────────
+# Beyond refusing to arm, --status must SURFACE telemetry health for a live drain so the
+# operator can tell at a glance whether the dashboard (the SSOT) is actually receiving
+# data: a one-line read-only summary of the collector (:4317), bridge (:4319), and auth.
+# It probes (never launches), so the tests stub wt_port_listening via _telemetry_prelude
+# and set auth/AI_TOOLKIT_OTEL explicitly. Omitted entirely under AI_TOOLKIT_OTEL=0.
+
+
+def _run_status_with_telemetry(
+    tmp_path: Path,
+    *,
+    state_value: str = "drain",
+    otel: str | None = None,
+    auth: bool = True,
+    collector_up: bool = True,
+    bridge_up: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Run _status against an armed window with a LIVE heartbeat and stubbed port probes."""
+    statef = tmp_path / "state"
+    statef.write_text(f"{state_value}\n")
+    hb = tmp_path / "heartbeat"
+    up_dir = tmp_path / "ports"
+    up_dir.mkdir(exist_ok=True)
+    otel_line = "unset AI_TOOLKIT_OTEL" if otel is None else f"export AI_TOOLKIT_OTEL={otel}"
+    auth_line = "export LANGFUSE_BASIC_AUTH=Basic-xyz" if auth else "unset LANGFUSE_BASIC_AUTH"
+    prelude = _telemetry_prelude(up_dir, collector_up=collector_up, bridge_up=bridge_up)
+    # A live heartbeat pid ($$) keeps the window out of the STALE branch.
+    expr = f'{otel_line}; {auth_line}; {prelude}; printf "%s 1700000000\\n" "$$" > "{hb}"; _status'
+    return _call(
+        expr,
+        env={
+            "AFK_STATE": str(statef),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_NOW": "1700000600",
+            "AFK_TELEMETRY_CONF": str(tmp_path / "no-conf"),
+        },
+    )
+
+
+def test_status_shows_telemetry_ok_when_all_wired(tmp_path: Path) -> None:
+    # Collector + bridge up, auth present ⇒ a telemetry OK line ALONGSIDE the drain line.
+    result = _run_status_with_telemetry(tmp_path, collector_up=True, bridge_up=True, auth=True)
+
+    assert "draining" in result.stdout, "the existing state line is preserved"
+    assert "telemetry" in result.stdout.lower()
+    assert "OK" in result.stdout
+    assert "collector up" in result.stdout
+    assert "bridge up" in result.stdout
+    assert "auth present" in result.stdout
+
+
+def test_status_shows_telemetry_down_when_collector_down(tmp_path: Path) -> None:
+    # Collector down ⇒ DOWN, naming the collector so the operator knows what to fix.
+    result = _run_status_with_telemetry(tmp_path, collector_up=False, bridge_up=True, auth=True)
+
+    assert "DOWN" in result.stdout
+    assert "collector down" in result.stdout
+    assert "bridge up" in result.stdout
+
+
+def test_status_shows_telemetry_down_when_auth_missing(tmp_path: Path) -> None:
+    # No resolvable auth ⇒ DOWN with auth missing, even when both ports listen.
+    result = _run_status_with_telemetry(tmp_path, collector_up=True, bridge_up=True, auth=False)
+
+    assert "DOWN" in result.stdout
+    assert "auth missing" in result.stdout
+
+
+def test_status_omits_telemetry_line_when_otel_disabled(tmp_path: Path) -> None:
+    # AI_TOOLKIT_OTEL=0 is the opt-out: no telemetry line at all, just the state line.
+    result = _run_status_with_telemetry(
+        tmp_path, otel="0", collector_up=False, bridge_up=False, auth=False
+    )
+
+    assert "draining" in result.stdout
+    assert "telemetry" not in result.stdout.lower()
+
+
+def test_status_off_has_no_telemetry_line(tmp_path: Path) -> None:
+    # No window armed ⇒ off, with NO telemetry line (nothing is running to monitor).
+    statef = tmp_path / "state"  # absent ⇒ off
+    hb = tmp_path / "heartbeat"
+
+    result = _call(
+        "unset AI_TOOLKIT_OTEL; _status",
+        env={"AFK_STATE": str(statef), "AFK_HEARTBEAT": str(hb)},
+    )
+
+    assert result.stdout.strip() == "/afk: off"
