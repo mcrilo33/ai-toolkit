@@ -1602,3 +1602,214 @@ def test_watchdog_loop_exits_when_window_off(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert not marker.exists(), "with the window off the watchdog must exit without respawning"
+
+
+# ── telemetry preflight (issue #108) ──────────────────────────────────────────
+# The hub's posture is the INVERSE of the spoke's (#106 wt_otel_*_preflight, which
+# warn-and-continue): for an unattended drain the dashboard is the single source of
+# truth, so afk_telemetry_preflight ensures collector(:4317) + bridge(:4319) + auth are
+# wired BEFORE the first dispatch and REFUSES to arm (non-zero, loud) when it can't —
+# never a per-spawn warning that scrolls past unattended. It REUSES worktree-lib's
+# launchers (wt_collector_launch / wt_bridge_launch) and probe (wt_port_listening), so
+# the tests stub those three: each launcher echoes a marker and (faithfully) marks its
+# port "up" via a tmp file the probe reads, so a successful launch flips the post-launch
+# re-probe to up. AI_TOOLKIT_OTEL=0 is the sole opt-out (unset ⇒ enabled — the
+# SSOT-for-unattended default), and a successful preflight EXPORTS the resolved auth so
+# every dispatched spoke inherits working credentials.
+
+
+def _telemetry_prelude(
+    up_dir: Path, *, collector_up: bool, bridge_up: bool, launch_binds: bool = True
+) -> str:
+    """Shell overriding the three worktree-lib collaborators with file-backed stubs.
+
+    wt_port_listening reports a port "up" iff a marker file named for it exists under
+    up_dir, so a launcher that touches that file flips the post-launch re-probe to up.
+    When launch_binds is False the launchers only echo (no touch), modelling a server
+    that never binds — so the preflight observes it still down and must refuse.
+    """
+    bind_c = f'touch "{up_dir}/4317"' if launch_binds else ":"
+    bind_b = f'touch "{up_dir}/4319"' if launch_binds else ":"
+    lines = [
+        f'wt_port_listening() {{ [ -e "{up_dir}/$1" ]; }}',
+        f'wt_collector_launch() {{ echo "LAUNCHED-COLLECTOR $1"; {bind_c}; }}',
+        f'wt_bridge_launch() {{ echo "LAUNCHED-BRIDGE $1"; {bind_b}; }}',
+    ]
+    if collector_up:
+        lines.append(f'touch "{up_dir}/4317"')
+    if bridge_up:
+        lines.append(f'touch "{up_dir}/4319"')
+    return "; ".join(lines)
+
+
+def _run_preflight(
+    tmp_path: Path,
+    *,
+    otel: str | None = None,
+    auth: bool = True,
+    collector_up: bool = False,
+    bridge_up: bool = False,
+    launch_binds: bool = True,
+    tail: str = "",
+) -> subprocess.CompletedProcess[str]:
+    """Source hub-afk.sh, stub the launchers, and run afk_telemetry_preflight /repo.
+
+    otel / auth are set in the shell (not the env dict) so the host environment never
+    leaks in: otel=None unsets AI_TOOLKIT_OTEL (the enabled-by-default case). A fresh
+    AFK_TELEMETRY_CONF path keeps the optional conf file out of the picture.
+    """
+    up_dir = tmp_path / "ports"
+    up_dir.mkdir(exist_ok=True)
+    otel_line = "unset AI_TOOLKIT_OTEL" if otel is None else f"export AI_TOOLKIT_OTEL={otel}"
+    auth_line = "export LANGFUSE_BASIC_AUTH=Basic-xyz" if auth else "unset LANGFUSE_BASIC_AUTH"
+    prelude = _telemetry_prelude(
+        up_dir, collector_up=collector_up, bridge_up=bridge_up, launch_binds=launch_binds
+    )
+    expr = f'{otel_line}; {auth_line}; {prelude}; afk_telemetry_preflight /repo; echo "RC=$?"{tail}'
+    return _call(expr, env={"AFK_TELEMETRY_CONF": str(tmp_path / "no-conf")})
+
+
+def test_preflight_launches_collector_and_bridge_when_down_and_authed(tmp_path: Path) -> None:
+    # Enabled (otel unset), auth present, both ports down ⇒ bring both up, arm (RC 0).
+    result = _run_preflight(tmp_path, auth=True, collector_up=False, bridge_up=False)
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    assert "LAUNCHED-COLLECTOR /repo" in result.stdout
+    assert "LAUNCHED-BRIDGE /repo" in result.stdout
+
+
+def test_preflight_idempotent_when_both_already_up(tmp_path: Path) -> None:
+    # Both already listening ⇒ never a second collector/bridge, still arm (RC 0).
+    result = _run_preflight(tmp_path, auth=True, collector_up=True, bridge_up=True)
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    assert "LAUNCHED" not in result.stdout, "a live collector/bridge must not be relaunched"
+
+
+def test_preflight_refuses_when_auth_missing(tmp_path: Path) -> None:
+    # No resolvable auth ⇒ collector/bridge would 401 silently, so REFUSE loudly and
+    # never launch anything (the loud, SSOT-for-unattended behavior the issue wants).
+    result = _run_preflight(tmp_path, auth=False, collector_up=False, bridge_up=False)
+
+    assert "RC=0" not in result.stdout, "missing auth must refuse to arm, not pass"
+    assert "LANGFUSE_BASIC_AUTH" in result.stderr
+    assert "LAUNCHED" not in result.stdout, (
+        "without auth the preflight must not launch a 401 server"
+    )
+
+
+def test_preflight_refuses_when_collector_wont_come_up(tmp_path: Path) -> None:
+    # Authed, collector down, but its launch never binds :4317 ⇒ refuse to arm.
+    result = _run_preflight(
+        tmp_path, auth=True, collector_up=False, bridge_up=False, launch_binds=False
+    )
+
+    assert "RC=0" not in result.stdout, "a collector that won't come up must refuse to arm"
+    assert "4317" in result.stderr or "collector" in result.stderr.lower()
+
+
+def test_preflight_refuses_when_bridge_wont_come_up(tmp_path: Path) -> None:
+    # Collector already up, bridge down and its launch never binds :4319 ⇒ refuse.
+    result = _run_preflight(
+        tmp_path, auth=True, collector_up=True, bridge_up=False, launch_binds=False
+    )
+
+    assert "RC=0" not in result.stdout, "a bridge that won't come up must refuse to arm"
+    assert "4319" in result.stderr or "bridge" in result.stderr.lower()
+
+
+def test_preflight_noop_when_otel_disabled(tmp_path: Path) -> None:
+    # AI_TOOLKIT_OTEL=0 is the sole opt-out: a clean no-op even with no auth + ports down
+    # — never launches, never refuses (so arming proceeds normally).
+    result = _run_preflight(tmp_path, otel="0", auth=False, collector_up=False, bridge_up=False)
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    assert "LAUNCHED" not in result.stdout
+    assert "LANGFUSE_BASIC_AUTH" not in result.stderr
+
+
+def test_preflight_exports_resolved_auth_for_spoke_inheritance(tmp_path: Path) -> None:
+    # A successful preflight must EXPORT the wired config so every spoke dispatch_batch
+    # spawns inherits it — proven by a child shell that sees only exported vars.
+    child = (
+        "; bash -c 'echo \"C_OTEL=$AI_TOOLKIT_OTEL C_AUTH=$LANGFUSE_BASIC_AUTH "
+        "C_HOST=$LANGFUSE_HOST\"'"
+    )
+    result = _run_preflight(tmp_path, auth=True, collector_up=True, bridge_up=True, tail=child)
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    assert "C_OTEL=1" in result.stdout, "spokes must inherit AI_TOOLKIT_OTEL=1 (the opt-in)"
+    assert "C_AUTH=Basic-xyz" in result.stdout, "spokes must inherit working LANGFUSE_BASIC_AUTH"
+    assert "C_HOST=" in result.stdout and "C_HOST= " not in result.stdout, "LANGFUSE_HOST exported"
+
+
+def test_preflight_resolves_auth_from_conf_file(tmp_path: Path) -> None:
+    # Env auth absent but the optional conf file (mirroring ~/.afk-remote) supplies it ⇒
+    # resolve from the file, export it, and arm.
+    conf = tmp_path / "afk-telemetry"
+    conf.write_text('LANGFUSE_BASIC_AUTH="Basic-from-file"\n')
+    up_dir = tmp_path / "ports"
+    up_dir.mkdir(exist_ok=True)
+    prelude = _telemetry_prelude(up_dir, collector_up=True, bridge_up=True)
+    expr = (
+        "unset AI_TOOLKIT_OTEL; unset LANGFUSE_BASIC_AUTH; "
+        f'{prelude}; afk_telemetry_preflight /repo; echo "RC=$?"; '
+        "bash -c 'echo \"C_AUTH=$LANGFUSE_BASIC_AUTH\"'"
+    )
+
+    result = _call(expr, env={"AFK_TELEMETRY_CONF": str(conf)})
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    assert "C_AUTH=Basic-from-file" in result.stdout, "auth resolved + exported from the conf file"
+
+
+def test_preflight_env_auth_wins_over_conf_file(tmp_path: Path) -> None:
+    # An explicit env LANGFUSE_BASIC_AUTH outranks the conf file (same precedence as
+    # _load_remote_conf): the env value is what spokes inherit.
+    conf = tmp_path / "afk-telemetry"
+    conf.write_text('LANGFUSE_BASIC_AUTH="Basic-from-file"\n')
+    up_dir = tmp_path / "ports"
+    up_dir.mkdir(exist_ok=True)
+    prelude = _telemetry_prelude(up_dir, collector_up=True, bridge_up=True)
+    expr = (
+        "unset AI_TOOLKIT_OTEL; export LANGFUSE_BASIC_AUTH=Basic-from-env; "
+        f'{prelude}; afk_telemetry_preflight /repo; echo "RC=$?"; '
+        "bash -c 'echo \"C_AUTH=$LANGFUSE_BASIC_AUTH\"'"
+    )
+
+    result = _call(expr, env={"AFK_TELEMETRY_CONF": str(conf)})
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    assert "C_AUTH=Basic-from-env" in result.stdout, "env auth must win over the conf file"
+
+
+def test_arm_refuses_when_telemetry_cannot_be_wired(tmp_path: Path) -> None:
+    # main()-level: arming a window when telemetry can't be wired must REFUSE — return
+    # non-zero, write NO state file, and never reach the supervisor loop (so no spoke is
+    # ever dispatched blind). Authed but the collector launch never binds :4317.
+    #
+    # The supervisor loop is fully neutered (supervise_tick / dispatch_batch / the
+    # watchdog stubbed, and `sleep` made to exit) so EVEN A REGRESSION that armed anyway
+    # cannot dispatch a real spoke or hang: it would just write state and exit, which the
+    # assertions below flag as a failure.
+    state = tmp_path / "state"
+    up_dir = tmp_path / "ports"
+    up_dir.mkdir(exist_ok=True)
+    prelude = _telemetry_prelude(up_dir, collector_up=False, bridge_up=False, launch_binds=False)
+    neuter = (
+        "supervise_tick() { return 0; }; dispatch_batch() { :; }; "
+        "_afk_spawn_watchdog() { :; }; afk_done() { return 1; }; sleep() { exit 0; }"
+    )
+    expr = (
+        "unset AI_TOOLKIT_OTEL; export LANGFUSE_BASIC_AUTH=Basic-xyz; "
+        f"{prelude}; {neuter}; main 30m"
+    )
+
+    result = _call(
+        expr,
+        env={"AFK_STATE": str(state), "AFK_TELEMETRY_CONF": str(tmp_path / "no-conf")},
+    )
+
+    assert result.returncode != 0, "arming with telemetry down must refuse (non-zero)"
+    assert not state.exists(), "a refused arm must not write the state file (no blind dispatch)"
+    assert "telemetry" in result.stderr.lower()
