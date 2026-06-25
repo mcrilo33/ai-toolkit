@@ -1467,3 +1467,138 @@ def test_status_off_unaffected_by_heartbeat(tmp_path: Path) -> None:
     result = _call("_status", env={"AFK_STATE": str(state), "AFK_HEARTBEAT": str(hb)})
 
     assert result.stdout.strip() == "/afk: off"
+
+
+# ── the WATCHDOG: auto-restart a crashed supervisor (issue #107) ───────────────
+# A silent supervisor crash leaves .afk-state armed with no process draining. The
+# watchdog is a thin outer loop that, each interval, respawns the supervisor when the
+# window is armed (afk_supervisor_state == stale) but no live pid is stamping the
+# heartbeat. The respawn is a NO-ARG resume: it reads the persisted window and re-adopts
+# in-flight spokes idempotently rather than re-dispatching. --off clears the state, so the
+# watchdog observes `off` and exits without respawning.
+
+
+def test_watchdog_tick_off_when_no_window(tmp_path: Path) -> None:
+    state = tmp_path / "state"  # absent ⇒ off
+    hb = tmp_path / "heartbeat"
+    marker = tmp_path / "respawned"
+    env = {
+        "AFK_STATE": str(state),
+        "AFK_HEARTBEAT": str(hb),
+        "AFK_RESPAWN_CMD": f"touch {marker}",
+    }
+
+    result = _call("watchdog_tick", env=env)
+
+    assert result.stdout.strip() == "off"
+    assert not marker.exists(), "no window ⇒ the watchdog must not respawn"
+
+
+def test_watchdog_tick_live_does_not_respawn(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.write_text("drain\n")
+    hb = tmp_path / "heartbeat"
+    marker = tmp_path / "respawned"
+    # $$ (the sourcing shell) is a live pid ⇒ the supervisor is live ⇒ no respawn.
+    expr = f'printf "%s 1700000000\\n" "$$" > "{hb}"; watchdog_tick'
+    env = {
+        "AFK_STATE": str(state),
+        "AFK_HEARTBEAT": str(hb),
+        "AFK_RESPAWN_CMD": f"touch {marker}",
+    }
+
+    result = _call(expr, env=env)
+
+    assert result.stdout.strip() == "live"
+    assert not marker.exists(), "a live supervisor must not be respawned"
+
+
+def test_watchdog_tick_respawns_when_stale(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.write_text("drain\n")
+    hb = tmp_path / "heartbeat"
+    marker = tmp_path / "respawned"
+    # A reaped subshell pid ⇒ stale ⇒ the watchdog respawns the supervisor.
+    expr = f'dead=$(sh -c "echo \\$$"); printf "%s 1700000000\\n" "$dead" > "{hb}"; watchdog_tick'
+    env = {
+        "AFK_STATE": str(state),
+        "AFK_HEARTBEAT": str(hb),
+        "AFK_RESPAWN_CMD": f"touch {marker}",
+    }
+
+    result = _call(expr, env=env)
+
+    assert result.stdout.strip() == "respawned"
+    assert marker.exists(), "a crashed supervisor (armed window, dead pid) must be respawned"
+
+
+def test_afk_self_points_at_hub_afk_script() -> None:
+    result = _call("_afk_self")
+
+    assert result.stdout.strip().endswith("hub-afk.sh")
+
+
+def test_resume_launch_is_no_arg_resume() -> None:
+    # The respawn must NOT carry a window spec — a no-arg launch resumes the persisted
+    # .afk-state (re-adopting spokes), never re-arming a fresh window.
+    result = _call("_afk_resume_launch")
+
+    out = result.stdout
+    assert "hub-afk.sh" in out
+    for window_spec in ("drain", "until", "--once", "--watchdog"):
+        assert window_spec not in out, f"resume must be bare (no '{window_spec}'): {out!r}"
+
+
+def test_spawn_watchdog_skips_when_one_alive(tmp_path: Path) -> None:
+    wf = tmp_path / "watchdog"
+    marker = tmp_path / "spawned"
+    # A live watchdog pid ($$) already recorded ⇒ no second watchdog is spawned.
+    expr = f'printf "%s\\n" "$$" > "{wf}"; _afk_spawn_watchdog'
+    env = {"AFK_WATCHDOG_FILE": str(wf), "AFK_WATCHDOG_SPAWN_CMD": f"touch {marker}"}
+
+    _call(expr, env=env)
+
+    assert not marker.exists(), "exactly one watchdog — a live one must not be duplicated"
+
+
+def test_spawn_watchdog_spawns_when_none_alive(tmp_path: Path) -> None:
+    wf = tmp_path / "watchdog"  # absent ⇒ no live watchdog
+    marker = tmp_path / "spawned"
+    env = {"AFK_WATCHDOG_FILE": str(wf), "AFK_WATCHDOG_SPAWN_CMD": f"touch {marker}"}
+
+    _call("_afk_spawn_watchdog", env=env)
+
+    assert marker.exists(), "no live watchdog ⇒ one must be spawned"
+
+
+def test_spawn_watchdog_spawns_when_recorded_pid_dead(tmp_path: Path) -> None:
+    wf = tmp_path / "watchdog"
+    marker = tmp_path / "spawned"
+    # A recorded but reaped pid ⇒ the prior watchdog is gone ⇒ respawn a fresh one.
+    expr = f'dead=$(sh -c "echo \\$$"); printf "%s\\n" "$dead" > "{wf}"; _afk_spawn_watchdog'
+    env = {"AFK_WATCHDOG_FILE": str(wf), "AFK_WATCHDOG_SPAWN_CMD": f"touch {marker}"}
+
+    _call(expr, env=env)
+
+    assert marker.exists(), "a dead recorded watchdog pid ⇒ a fresh watchdog must be spawned"
+
+
+def test_watchdog_loop_exits_when_window_off(tmp_path: Path) -> None:
+    # --off clears .afk-state; the watchdog's next pass sees `off`, exits, and never
+    # respawns (AC: --off stops the watchdog). State is absent ⇒ the loop breaks at once.
+    state = tmp_path / "state"  # absent ⇒ off
+    hb = tmp_path / "heartbeat"
+    wf = tmp_path / "watchdog"
+    marker = tmp_path / "respawned"
+    env = {
+        "AFK_STATE": str(state),
+        "AFK_HEARTBEAT": str(hb),
+        "AFK_WATCHDOG_FILE": str(wf),
+        "AFK_RESPAWN_CMD": f"touch {marker}",
+        "AFK_WATCHDOG_SECONDS": "0",
+    }
+
+    result = _call("watchdog_loop", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists(), "with the window off the watchdog must exit without respawning"
