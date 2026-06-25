@@ -1850,6 +1850,117 @@ class TestAuditInstantPlacement:
         assert [e["id"] for e in first] == [e["id"] for e in second]
 
 
+class TestSkillActivatedNesting:
+    """#110 AC2: a span-less ``skill_activated`` event nests under the ``tool:Skill`` span that
+    activated it — matched by the turn's ``prompt.id``, disambiguated by ``skill.name`` then the
+    nearest timestamp when a turn ran more than one skill. With no ``tool:Skill`` in the turn it
+    falls back to the enclosing turn (#110 AC1); with no turn at all it stays at the root.
+    """
+
+    def _skill_tool(self, obs_id: str, tuid: str, parent: str = "i1", start: str | None = None):
+        return _obs(
+            obs_id,
+            "tool:Skill",
+            parent=parent,
+            startTime=start,
+            metadata={"attributes": {"tool_use_id": tuid}},
+        )
+
+    def test_skill_activated_nests_under_its_tool_skill_by_prompt_id(self) -> None:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "p1"}},
+        )
+        tool = self._skill_tool("sk_tool", "tu-sk1")
+        skill = _audit_event(
+            "act1", "skill_activated", **{"skill.name": "source-task", "prompt.id": "p1"}
+        )
+        traces = [("trace-int", [interaction, tool]), ("trace-audit", [skill])]
+        content = {"tu-sk1": ToolContent({"skill": "source-task"}, "ok")}
+
+        batch = build_batch(traces, SPOKE, content)
+
+        copy = _by_orig(batch, "trace-audit", "act1")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "sk_tool")
+
+    def test_two_skills_in_one_turn_disambiguated_by_skill_name(self) -> None:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "p1"}},
+        )
+        hub = self._skill_tool("sk_hub", "tu-hub")
+        source = self._skill_tool("sk_src", "tu-src")
+        skill = _audit_event(
+            "act2", "skill_activated", **{"skill.name": "source-task", "prompt.id": "p1"}
+        )
+        traces = [("trace-int", [interaction, hub, source]), ("trace-audit", [skill])]
+        content = {
+            "tu-hub": ToolContent({"skill": "hub"}, "ok"),
+            "tu-src": ToolContent({"skill": "source-task"}, "ok"),
+        }
+
+        batch = build_batch(traces, SPOKE, content)
+
+        copy = _by_orig(batch, "trace-audit", "act2")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "sk_src")
+
+    def test_same_skill_twice_disambiguated_by_nearest_timestamp(self) -> None:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "p1"}},
+        )
+        early = self._skill_tool("sk_a", "tu-a", start="2026-01-02T00:00:00Z")
+        late = self._skill_tool("sk_b", "tu-b", start="2026-01-02T00:00:20Z")
+        # The activation's lagging time sits closest to the second call.
+        skill = _audit_event(
+            "act3",
+            "skill_activated",
+            start="2026-01-02T00:00:21Z",
+            **{"skill.name": "hub", "prompt.id": "p1"},
+        )
+        traces = [("trace-int", [interaction, early, late]), ("trace-audit", [skill])]
+        content = {
+            "tu-a": ToolContent({"skill": "hub"}, "ok"),
+            "tu-b": ToolContent({"skill": "hub"}, "ok"),
+        }
+
+        batch = build_batch(traces, SPOKE, content)
+
+        copy = _by_orig(batch, "trace-audit", "act3")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "sk_b")
+
+    def test_skill_activated_without_a_tool_skill_falls_back_to_turn(self) -> None:
+        # No tool:Skill in the turn (e.g. the skill content was unavailable): the event still
+        # attaches to its enclosing turn by prompt.id, never the synthetic root (#110 invariant).
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "p1"}},
+        )
+        skill = _audit_event("act4", "skill_activated", **{"skill.name": "hub", "prompt.id": "p1"})
+        traces = [("trace-int", [interaction]), ("trace-audit", [skill])]
+
+        batch = build_batch(traces, SPOKE)
+
+        copy = _by_orig(batch, "trace-audit", "act4")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+
+    def test_skill_activated_with_no_turn_stays_at_root(self) -> None:
+        skill = _audit_event("act5", "skill_activated", **{"skill.name": "hub"})
+
+        batch = build_batch([("trace-audit", [skill])], SPOKE)
+
+        copy = _by_orig(batch, "trace-audit", "act5")
+        assert copy["body"]["parentObservationId"] == root_id_for(SPOKE)
+
+
 class TestScanTranscripts:
     def test_joins_tool_use_input_and_tool_result_output(self, tmp_path: Path) -> None:
         _write_transcript(
