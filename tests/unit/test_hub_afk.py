@@ -1749,7 +1749,9 @@ def test_preflight_exports_resolved_auth_for_spoke_inheritance(tmp_path: Path) -
     assert "RC=0" in result.stdout, result.stderr + result.stdout
     assert "C_OTEL=1" in result.stdout, "spokes must inherit AI_TOOLKIT_OTEL=1 (the opt-in)"
     assert "C_AUTH=Basic-xyz" in result.stdout, "spokes must inherit working LANGFUSE_BASIC_AUTH"
-    assert "C_HOST=" in result.stdout and "C_HOST= " not in result.stdout, "LANGFUSE_HOST exported"
+    assert "C_HOST=http://localhost:3000" in result.stdout, (
+        "LANGFUSE_HOST defaults to the local stack"
+    )
 
 
 def test_preflight_resolves_auth_from_conf_file(tmp_path: Path) -> None:
@@ -1790,6 +1792,29 @@ def test_preflight_env_auth_wins_over_conf_file(tmp_path: Path) -> None:
 
     assert "RC=0" in result.stdout, result.stderr + result.stdout
     assert "C_AUTH=Basic-from-env" in result.stdout, "env auth must win over the conf file"
+
+
+def test_preflight_conf_host_used_when_env_supplies_only_auth(tmp_path: Path) -> None:
+    # Env supplies auth but not host; the conf file supplies host ⇒ resolve each field
+    # independently (env auth + conf host), so spokes inherit the configured host — not
+    # the localhost default. Guards against the asymmetric "conf only read when auth
+    # unset" precedence.
+    conf = tmp_path / "afk-telemetry"
+    conf.write_text('LANGFUSE_HOST="http://lf.example:3000"\n')
+    up_dir = tmp_path / "ports"
+    up_dir.mkdir(exist_ok=True)
+    prelude = _telemetry_prelude(up_dir, collector_up=True, bridge_up=True)
+    expr = (
+        "unset AI_TOOLKIT_OTEL; unset LANGFUSE_HOST; export LANGFUSE_BASIC_AUTH=Basic-env; "
+        f'{prelude}; afk_telemetry_preflight /repo; echo "RC=$?"; '
+        "bash -c 'echo \"C_AUTH=$LANGFUSE_BASIC_AUTH C_HOST=$LANGFUSE_HOST\"'"
+    )
+
+    result = _call(expr, env={"AFK_TELEMETRY_CONF": str(conf)})
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    assert "C_AUTH=Basic-env" in result.stdout, "env auth is kept"
+    assert "C_HOST=http://lf.example:3000" in result.stdout, "host resolves from the conf file"
 
 
 def test_arm_refuses_when_telemetry_cannot_be_wired(tmp_path: Path) -> None:

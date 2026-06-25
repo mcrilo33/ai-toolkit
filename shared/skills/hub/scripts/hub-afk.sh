@@ -1028,7 +1028,7 @@ remote_launch() {
 # the sole opt-out — unset is treated as enabled, the SSOT-for-unattended default.
 #
 #   AFK_TELEMETRY_CONF   optional conf file sourced for LANGFUSE_BASIC_AUTH / LANGFUSE_HOST
-#                        when the env leaves auth unset (env wins) [default: ~/.afk-telemetry]
+#                        (env wins each field independently) [default: ~/.afk-telemetry]
 #   AFK_PORT_WAIT_TRIES  re-probe attempts after a launch before declaring a port DOWN [10]
 #   AFK_PORT_WAIT_SLEEP  seconds between those re-probes (a slow container start)        [1]
 
@@ -1041,11 +1041,15 @@ afk_telemetry_enabled() { [ "${AI_TOOLKIT_OTEL:-}" != "0" ]; }
 # spokes opt in to native OTel. rc 1 when no auth can be resolved (caller refuses to arm).
 afk_resolve_telemetry_auth() {
   local conf="${AFK_TELEMETRY_CONF:-$HOME/.afk-telemetry}"
-  if [ -z "${LANGFUSE_BASIC_AUTH:-}" ] && [ -f "$conf" ]; then
-    local s_host="${LANGFUSE_HOST:-}"
+  # Source the conf for BOTH fields (auth and host) with env winning each independently —
+  # the same save-source-restore precedence as _load_remote_conf — so an operator can set
+  # auth in the env and still pick host up from the file (and vice versa).
+  if [ -f "$conf" ]; then
+    local s_auth="${LANGFUSE_BASIC_AUTH:-}" s_host="${LANGFUSE_HOST:-}"
     # shellcheck disable=SC1090
     . "$conf" 2>/dev/null || true
-    [ -n "$s_host" ] && LANGFUSE_HOST="$s_host"   # an env host still outranks the file
+    [ -n "$s_auth" ] && LANGFUSE_BASIC_AUTH="$s_auth"
+    [ -n "$s_host" ] && LANGFUSE_HOST="$s_host"
   fi
   [ -n "${LANGFUSE_BASIC_AUTH:-}" ] || return 1
   export LANGFUSE_BASIC_AUTH
