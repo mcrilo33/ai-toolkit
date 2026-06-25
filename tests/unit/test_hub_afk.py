@@ -2174,6 +2174,127 @@ def test_resume_window_name_is_reapable_by_kill_pattern(tmp_path: Path) -> None:
     )
 
 
+# ── reliable escalation: retry + durable local fallback (issue #109, AC2) ──────
+# Escalation MUST never fail silently. spoke-ready.sh emits blocked/<issue> with a
+# `git push -f origin blocked/<issue>` that can fail for any reason (no/unreachable remote,
+# a transient network drop, a push-hook error); in the #103 incident the reap logged
+# `could not emit blocked/103` and dropped it. Now _escalate_blocked retries the spoke-ready
+# call and, if it still can't push the tag, writes a DURABLE local record under the state
+# dir — a blocked state is always recorded — which --status then surfaces.
+
+
+def _failing_ready_stub(tmp_path: Path) -> tuple[Path, Path]:
+    """A spoke-ready.sh stub that records each call and exits NONZERO (push refused)."""
+    log = tmp_path / "ready.log"
+    stub = tmp_path / "spoke-ready.sh"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\nexit 1\n')
+    stub.chmod(0o755)
+    return stub, log
+
+
+def test_escalate_records_locally_when_push_fails(spoke_repo: Path, tmp_path: Path) -> None:
+    stub, _log = _failing_ready_stub(tmp_path)
+    statedir = tmp_path / "statedir"
+    env = {
+        "SPOKE_READY": str(stub),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_ESCALATE_TRIES": "3",
+        "AFK_ESCALATE_SLEEP": "0",
+    }
+
+    result = _call(f"_escalate_blocked '{spoke_repo}' 103 'HEAD ahead of pushed branch'", env=env)
+
+    assert result.returncode == 0, result.stderr
+    record = statedir / "blocked-103.txt"
+    assert record.exists(), "a blocked state that could not be pushed must be recorded durably"
+    assert "HEAD ahead of pushed branch" in record.read_text(), "the record carries the reason"
+
+
+def test_escalate_retries_the_spoke_ready_call(spoke_repo: Path, tmp_path: Path) -> None:
+    stub, log = _failing_ready_stub(tmp_path)
+    statedir = tmp_path / "statedir"
+    env = {
+        "SPOKE_READY": str(stub),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_ESCALATE_TRIES": "3",
+        "AFK_ESCALATE_SLEEP": "0",
+    }
+
+    _call(f"_escalate_blocked '{spoke_repo}' 103 'stuck'", env=env)
+
+    assert len(log.read_text().splitlines()) == 3, (
+        "a failed escalation must retry up to AFK_ESCALATE_TRIES"
+    )
+
+
+def test_escalate_no_local_record_when_push_succeeds(spoke_repo: Path, tmp_path: Path) -> None:
+    # A succeeding spoke-ready stub (exit 0) ⇒ the tag is the durable record; no local file.
+    log = tmp_path / "ready.log"
+    stub = tmp_path / "spoke-ready.sh"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\n')  # exit 0
+    stub.chmod(0o755)
+    statedir = tmp_path / "statedir"
+    env = {"SPOKE_READY": str(stub), "AFK_STATE_DIR": str(statedir), "AFK_ESCALATE_SLEEP": "0"}
+
+    _call(f"_escalate_blocked '{spoke_repo}' 103 'stuck'", env=env)
+
+    assert len(log.read_text().splitlines()) == 1, "a successful escalation must not retry"
+    assert not (statedir / "blocked-103.txt").exists(), (
+        "a pushed tag needs no local fallback record"
+    )
+
+
+def test_status_surfaces_locally_blocked_issues(tmp_path: Path) -> None:
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "blocked-103.txt").write_text("1700000000\tcould not push the tag\n")
+    statef = tmp_path / "state"
+    statef.write_text("drain\n")
+    hb = tmp_path / "heartbeat"
+    hb.write_text(f"{os.getpid()} 1700000000\n")  # a live pid ⇒ not STALE
+
+    result = _call(
+        "_status",
+        env={
+            "AFK_STATE": str(statef),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(hb),
+            "AI_TOOLKIT_OTEL": "0",
+        },
+    )
+
+    assert "#103" in result.stdout, (
+        "a durable local block must be visible on --status (never silently dropped)"
+    )
+
+
+def test_status_off_still_surfaces_locally_blocked(tmp_path: Path) -> None:
+    # The operator returning from AFK reads --status; a durable escalation must show even
+    # after the drain ended (state cleared ⇒ off).
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "blocked-88.txt").write_text("1700000000\tauth failed\n")
+    statef = tmp_path / "state"  # absent ⇒ off
+
+    result = _call("_status", env={"AFK_STATE": str(statef), "AFK_STATE_DIR": str(statedir)})
+
+    assert "/afk: off" in result.stdout
+    assert "#88" in result.stdout, (
+        "a durable block survives the drain and stays visible on --status"
+    )
+
+
+def test_arm_clears_stale_blocked_records(tmp_path: Path) -> None:
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "blocked-99.txt").write_text("1\told run\n")
+    expr = "_clear_blocked_records; ls $(_afk_state_dir)/blocked-*.txt 2>/dev/null | wc -l"
+
+    result = _call(expr, env={"AFK_STATE_DIR": str(statedir)})
+
+    assert result.stdout.strip() == "0", "arming a fresh window clears prior-run blocked records"
+
+
 def test_reap_pass_blocks_pane_alive_idle_spoke(tmp_path: Path) -> None:
     spoke = _branched_spoke(tmp_path, ahead=True)
     fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane ALIVE
