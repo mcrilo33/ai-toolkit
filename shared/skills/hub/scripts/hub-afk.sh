@@ -982,12 +982,60 @@ reap_pass() {
   done < <(inflight_worktrees)
 }
 
+# --- marker reconciliation (issue #109, AC3) ----------------------------------
+# Live state wins over a stale marker. When the reaper blocked a spoke whose pane had only
+# crashed, the spoke could be auto-resumed and resume committing — leaving blocked/<issue>
+# stranded BEHIND the tip, falsely flagging an actively-working spoke (the #103 coexistence).
+# Each tick reconciles: a blocked/<issue> tag with fresh commits on top of it is cleared
+# (local + best-effort remote) and its durable record dropped. A ready/<issue> behind the
+# tip needs no action — slot_state and _ready_at_tip already require a marker AT the tip, so
+# a behind-tip ready is already ignored (live state wins).
+
+# _afk_clear_blocked_record <issue> -> drop one issue's durable local block record once its
+# branch advances past the stale marker (paired with _afk_record_blocked_locally).
+_afk_clear_blocked_record() { rm -f "$(_afk_blocked_record "$1")" 2>/dev/null || true; }
+
+# _blocked_tag_is_stale <wt> <issue> -> true when a local blocked/<issue> tag exists and the
+# tip has fresh commits ON TOP of it (the tag is an ancestor of, but not equal to, the tip):
+# the spoke resumed and is committing, so the blocked marker no longer reflects live state.
+_blocked_tag_is_stale() {
+  local wt="$1" issue="$2" tag tip
+  tag="$(git -C "$wt" rev-parse -q --verify "refs/tags/blocked/${issue}^{commit}" 2>/dev/null)" || return 1
+  [ -n "$tag" ] || return 1
+  tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)" || return 1
+  [ "$tag" != "$tip" ] || return 1
+  git -C "$wt" merge-base --is-ancestor "$tag" "$tip" 2>/dev/null
+}
+
+# _clear_stale_blocked_marker <wt> <issue> -> delete a stale blocked/<issue> (local + remote)
+# and drop its durable record. Best-effort; never aborts the loop.
+_clear_stale_blocked_marker() {
+  local wt="$1" issue="$2"
+  log "→ reconcile #$issue: branch advanced past blocked/$issue — clearing the stale marker"
+  git -C "$wt" tag -d "blocked/$issue" >/dev/null 2>&1 || true
+  git -C "$wt" push origin ":refs/tags/blocked/$issue" >/dev/null 2>&1 || true
+  _afk_clear_blocked_record "$issue"
+}
+
+# reconcile_markers -> clear every stale blocked/<issue> across the in-flight set so the
+# dashboard, hub-status and the durable record reflect live state, not a marker the spoke
+# has since moved past. Run first each tick: slot_state never reads a behind-tip marker as
+# done anyway, so this is for the external view + durable record, not the passes' own reads.
+reconcile_markers() {
+  local path issue
+  while IFS=$'\t' read -r path issue; do
+    [ -n "$issue" ] || continue
+    _blocked_tag_is_stale "$path" "$issue" && _clear_stale_blocked_marker "$path" "$issue"
+  done < <(inflight_worktrees)
+}
+
 # --- the supervisor tick + stop condition -------------------------------------
 
-# supervise_tick -> one full pass: dispatch the next batch, answer parked spokes, land the
-# ready ones, reap the hung ones. Each pass re-surveys the in-flight set, so a spoke that
-# changed state earlier in the tick is seen fresh.
+# supervise_tick -> one full pass: reconcile stale markers, dispatch the next batch, answer
+# parked spokes, land the ready ones, reap the hung ones. Each pass re-surveys the in-flight
+# set, so a spoke that changed state earlier in the tick is seen fresh.
 supervise_tick() {
+  reconcile_markers
   dispatch_batch
   answer_pass
   # If the answer pass detected a dead subscription token, skip land + reap this tick:
