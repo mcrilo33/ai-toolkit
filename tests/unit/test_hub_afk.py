@@ -2010,3 +2010,215 @@ def test_status_auth_missing_when_conf_value_is_commented_or_empty(tmp_path: Pat
 
     assert "auth missing" in result.stdout
     assert "DOWN" in result.stdout
+
+
+# ── reaper hardening: crash ≠ hang, auto-resume-once (issue #109, AC1) ─────────
+# The reaper abandoned a spoke (#103) as "idle >30m, likely hung" — but its tmux pane
+# had CRASHED while its committed work was intact, not stuck. crash ≠ hang: a pane-DEAD
+# spoke with commits is auto-resumed ONCE in place (re-adopt the worktree, reusing its
+# spoke_run_id) before any blocked is emitted; a pane-ALIVE-but-idle spoke is truly hung
+# and is blocked; an over-ceiling runaway always blocks (resume never applies).
+
+
+def _branched_spoke(
+    tmp_path: Path, *, ahead: bool, name: str = "spoke", branch: str = "feature"
+) -> Path:
+    """A spoke worktree branched off `main`, with (ahead) or without a commit on top.
+
+    `ahead=True` ⇒ HEAD has real work to preserve (merge-base HEAD main != HEAD);
+    `ahead=False` ⇒ the branch sits exactly at the branch point (no commits to preserve).
+    """
+    wt = tmp_path / name
+    wt.mkdir()
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    cmds = [
+        ["git", "init", "-q", "-b", "main"],
+        ["git", "commit", "-q", "--allow-empty", "-m", "base"],
+        ["git", "checkout", "-q", "-b", branch],
+    ]
+    if ahead:
+        cmds.append(["git", "commit", "-q", "--allow-empty", "-m", "work"])
+    for cmd in cmds:
+        subprocess.run(cmd, cwd=wt, check=True, env=env, capture_output=True)
+    return wt
+
+
+def _reaper_tmux(tmp_path: Path, *, pane_path: Path | None) -> tuple[Path, Path]:
+    """A tmux stub that records every call and answers `list-panes` with one line
+    pointing at `pane_path` (pane alive) or nothing (pane dead). Everything else exits 0.
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    log = tmp_path / "tmux.log"
+    panes = tmp_path / "panes.txt"
+    panes.write_text(f"afk:1\t{pane_path}\n" if pane_path is not None else "")
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> "{log}"\n'
+        f'if [ "$1" = "list-panes" ]; then cat "{panes}"; fi\n'
+        "exit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    return fake_bin, log
+
+
+def _reaper_env(
+    spoke: Path, tmp_path: Path, fake_bin: Path, *, idle: bool
+) -> tuple[str, dict[str, str], Path, Path]:
+    """Drive reap_pass against one in-flight spoke. Returns (expr, env, ready_log, statedir).
+
+    A spoke-ready stub records `--blocked` calls; a plain idle transcript (when idle=True)
+    plus AFK_IDLE_MINUTES=0 makes slot_state read `reap`.
+    """
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke)
+    _write_transcript(
+        pd, [{"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}}]
+    )
+    if idle:
+        os.utime(pd / "session.jsonl", (1_000_000, 1_000_000))  # far in the past
+
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
+    (spoke / ".ai-toolkit" / "spoke-run-id").write_text("feature/5-x+1700000000\n")
+
+    expr = f'inflight_worktrees() {{ printf "{spoke}\\t5\\n"; }}; reap_pass'
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "SPOKE_READY": str(ready_stub),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_DEFAULT_BRANCH": "main",
+        "AFK_IDLE_MINUTES": "0",
+        "AFK_NOW": "1700000000",
+    }
+    return expr, env, ready_log, statedir
+
+
+def test_afk_resume_command_reuses_run_id_and_plain_prompt(tmp_path: Path) -> None:
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
+    (spoke / ".ai-toolkit" / "spoke-run-id").write_text("feature/5-x+1700000000\n")
+
+    result = _call(f"_afk_resume_command '{spoke}' 5")
+
+    assert result.returncode == 0, result.stderr
+    cmd = result.stdout
+    assert "feature/5-x+1700000000" in cmd, "the resume must reuse the persisted spoke_run_id"
+    assert "claude" in cmd and "--continue" in cmd, "resume in place: continue the crashed session"
+    assert "/cycle" not in cmd, (
+        "a plain-English continuation prompt, never the unknown /cycle command"
+    )
+
+
+def test_afk_resume_command_inline_exports_otel_for_collector(tmp_path: Path) -> None:
+    # Q1: the resumed window must still reach the collector or recovery flies blind and
+    # defeats #108 — inline-export AI_TOOLKIT_OTEL=1 + the OTLP endpoint + the run id.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
+    (spoke / ".ai-toolkit" / "spoke-run-id").write_text("feature/5-x+1700000000\n")
+
+    result = _call(
+        f"_afk_resume_command '{spoke}' 5",
+        env={"OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4317"},
+    )
+
+    cmd = result.stdout
+    assert "AI_TOOLKIT_OTEL=1" in cmd
+    assert "OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317" in cmd
+    assert "spoke_run_id=feature/5-x+1700000000" in cmd
+
+
+def test_reap_pass_resumes_pane_dead_spoke_with_commits(tmp_path: Path) -> None:
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+
+    result = _call(expr, env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "new-window" in tmux_log.read_text(), (
+        "a crashed-pane spoke with commits is resumed in place"
+    )
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
+        "resume must happen BEFORE any blocked is emitted"
+    )
+    assert (statedir / "resumed-5").exists(), "the once-per-window resume must be recorded"
+
+
+def test_resume_window_name_is_reapable_by_kill_pattern(tmp_path: Path) -> None:
+    # The resumed window must follow the "<issue>-<slug>" convention so a LATER reap's
+    # _kill_spoke_window (which matches "<issue>-"* / "<issue>") can find it — a full
+    # "feature/5-…" branch name would orphan the resumed window.
+    spoke = _branched_spoke(tmp_path, ahead=True, branch="feature/5-fix")
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+
+    _call(expr, env=env)
+
+    new_window_line = next(ln for ln in tmux_log.read_text().splitlines() if "new-window" in ln)
+    assert "-n 5-fix " in new_window_line, (
+        f"resumed window must be named with the <issue>-<slug> tail, got: {new_window_line}"
+    )
+
+
+def test_reap_pass_blocks_pane_alive_idle_spoke(tmp_path: Path) -> None:
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane ALIVE
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+
+    _call(expr, env=env)
+
+    assert "--blocked 5" in ready_log.read_text(), "a pane-alive idle spoke is truly hung → block"
+    assert "new-window" not in tmux_log.read_text(), "a live (hung) pane is never resumed"
+
+
+def test_reap_pass_blocks_pane_dead_spoke_after_one_resume(tmp_path: Path) -> None:
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD again
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    (statedir / "resumed-5").write_text("1700000000\n")  # already resumed once this window
+
+    _call(expr, env=env)
+
+    assert "--blocked 5" in ready_log.read_text(), (
+        "a second crash after a resume escalates to a human"
+    )
+    assert "new-window" not in tmux_log.read_text(), "resume is bounded to once per window"
+
+
+def test_reap_pass_blocks_pane_dead_spoke_without_commits(tmp_path: Path) -> None:
+    spoke = _branched_spoke(tmp_path, ahead=False)  # nothing to preserve
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+
+    _call(expr, env=env)
+
+    assert "--blocked 5" in ready_log.read_text(), "no commits to preserve → block, don't resume"
+    assert "new-window" not in tmux_log.read_text()
+
+
+def test_reap_pass_over_ceiling_always_blocks(tmp_path: Path) -> None:
+    # A runaway over the wall-clock ceiling always blocks — resume never applies, even if
+    # the pane is dead with commits.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=False)
+    (statedir / "dispatch-5.epoch").write_text("1000\n")  # dispatched long ago ⇒ over ceiling
+
+    _call(expr, env=env)
+
+    assert "--blocked 5" in ready_log.read_text(), "an over-ceiling runaway always blocks"
+    assert "new-window" not in tmux_log.read_text(), "a runaway is never resumed"
