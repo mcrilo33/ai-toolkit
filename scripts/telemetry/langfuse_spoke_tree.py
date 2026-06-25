@@ -174,6 +174,10 @@ _CHUNK_SIZE = 100
 _COPIED_FIELDS = ("input", "output", "usageDetails", "costDetails", "metadata", "model", "level")
 # Metadata keys that may carry a tool-call id, in priority order.
 _TOOL_USE_ID_KEYS = ("tool_use_id", "gen_ai.tool.call.id")
+# The per-turn id Claude Code stamps on a ``claude_code.interaction`` and every event-layer
+# satellite emitted inside that turn; the join key for re-homing an unmatched-tool satellite to
+# its enclosing turn (#110, see :func:`_enclosing_turn`).
+_PROMPT_ID_KEY = "prompt.id"
 # Name prefixes of the audit observations that are scoped to a single tool call and carry its
 # ``tool_use_id`` (``tool_decision:<decision>``, ``tool_result`` from #93;
 # ``hook_execution_complete:<PreToolUse|PostToolUse>`` from hook-event-nest, whose id the
@@ -336,6 +340,19 @@ def _tool_use_id(observation: Observation) -> str | None:
         if value:
             return str(value)
     return None
+
+
+def _prompt_id(observation: Observation) -> str | None:
+    """Return the ``prompt.id`` (the per-turn id shared by a turn and its satellites), or None.
+
+    Read from ``metadata["attributes"]`` first (where Langfuse nests OTel span attributes,
+    e.g. on a ``claude_code.interaction``) and then from flat metadata (where the audit layer
+    copies it as a cross-reference key, e.g. on a ``hook_execution_complete``).
+    """
+    metadata = observation.get("metadata") or {}
+    attributes = metadata.get("attributes") or {}
+    value = attributes.get(_PROMPT_ID_KEY) or metadata.get(_PROMPT_ID_KEY)
+    return str(value) if value else None
 
 
 def _is_hook(observation: Observation) -> bool:
@@ -628,6 +645,73 @@ def _build_request_index(traces: list[TraceObservations]) -> dict[str, str]:
     return index
 
 
+class InteractionIndex(NamedTuple):
+    """Enclosing-turn lookup for re-homing an unmatched-tool satellite (#110 AC1).
+
+    ``by_prompt`` maps each turn's ``prompt.id`` to its interaction copy id (the primary,
+    causal join). ``windows`` lists ``(start, end, copy_id)`` for every interaction that has
+    both bounds, sorted ascending, for the ``[start,end]`` containment fallback used when a
+    satellite carries no ``prompt.id``.
+    """
+
+    by_prompt: dict[str, str]
+    windows: list[tuple[str, str, str]]
+
+
+def _build_interaction_index(traces: list[TraceObservations]) -> InteractionIndex:
+    """Index every ``claude_code.interaction`` by ``prompt.id`` and by its time window.
+
+    The first interaction seen for a ``prompt.id`` wins (a resume shares the original turn's
+    id; either copy is the same turn). Only interactions carrying both bounds contribute a
+    window, kept sorted so :func:`_enclosing_turn` picks the innermost on an overlap.
+
+    Args:
+        traces: Each source trace paired with all of its observations.
+
+    Returns:
+        The prompt-id map and sorted window list (see :class:`InteractionIndex`).
+    """
+    by_prompt: dict[str, str] = {}
+    windows: list[tuple[str, str, str]] = []
+    for orig_trace_id, observations in traces:
+        for observation in observations:
+            if not _is_interaction(observation):
+                continue
+            copy = _copy_id(orig_trace_id, observation["id"])
+            pid = _prompt_id(observation)
+            if pid:
+                by_prompt.setdefault(pid, copy)
+            start, end = observation.get("startTime"), observation.get("endTime")
+            if start and end:
+                windows.append((start, end, copy))
+    windows.sort()
+    return InteractionIndex(by_prompt, windows)
+
+
+def _enclosing_turn(observation: Observation, index: InteractionIndex) -> str | None:
+    """Return the copy id of the interaction enclosing ``observation``, or None (#110 AC1).
+
+    Resolves by ``prompt.id`` first — the reliable causal join. Falls back to ``[start,end]``
+    containment (innermost turn wins) only for an event whose ``startTime`` is its true event
+    time; a lagging-timestamp audit instant (:func:`_is_audit_instant`, on the batched logs
+    signal) is never window-placed, so it resolves by ``prompt.id`` alone and otherwise stays
+    at the root.
+    """
+    pid = _prompt_id(observation)
+    if pid and pid in index.by_prompt:
+        return index.by_prompt[pid]
+    if _is_audit_instant(observation):
+        return None
+    start = observation.get("startTime")
+    if not start:
+        return None
+    chosen: str | None = None
+    for win_start, win_end, copy in index.windows:
+        if win_start <= start <= win_end:
+            chosen = copy
+    return chosen
+
+
 def _resolve_parent(
     observation: Observation,
     *,
@@ -635,6 +719,7 @@ def _resolve_parent(
     root_id: str,
     tool_index: dict[str, str],
     request_index: dict[str, str],
+    interaction_index: InteractionIndex,
 ) -> str:
     """Resolve the assembled-trace parent id for one source observation.
 
@@ -644,10 +729,11 @@ def _resolve_parent(
         root_id: The synthetic root span id (the single collapsed root).
         tool_index: Tool-call-id to tool-copy-id map from :func:`_build_tool_index`.
         request_index: Request-id to llm_request-copy-id map from :func:`_build_request_index`.
+        interaction_index: Enclosing-turn lookup from :func:`_build_interaction_index`.
 
     Returns:
-        The copy id of the intra-trace parent, the matching tool / llm_request, or the
-        synthetic root.
+        The copy id of the intra-trace parent, the matching tool / llm_request, the enclosing
+        turn (for an unmatched-tool satellite), or the synthetic root.
     """
     parent = observation.get("parentObservationId")
     if parent:
@@ -656,6 +742,13 @@ def _resolve_parent(
         tuid = _tool_use_id(observation)
         if tuid and tuid in tool_index:
             return tool_index[tuid]
+        # #110 AC1: the satellite named a tool that produced no span (denied/cancelled before
+        # execution). Re-home it to its enclosing turn rather than the synthetic root; a hook
+        # naming no tool (SessionStart/Stop) has no tuid and still falls through to the root.
+        if tuid:
+            turn = _enclosing_turn(observation, interaction_index)
+            if turn is not None:
+                return turn
     if _is_request_audit_event(observation):
         rid = _request_id(observation)
         if rid and rid in request_index:
@@ -1144,6 +1237,7 @@ def build_batch(
     }
     tool_index = _build_tool_index(traces)
     request_index = _build_request_index(traces)
+    interaction_index = _build_interaction_index(traces)
     copies: list[IngestEvent] = []
     for orig_trace_id, observations in traces:
         for observation in observations:
@@ -1153,6 +1247,7 @@ def build_batch(
                 root_id=root_id,
                 tool_index=tool_index,
                 request_index=request_index,
+                interaction_index=interaction_index,
             )
             copies.append(
                 _copy_event(
