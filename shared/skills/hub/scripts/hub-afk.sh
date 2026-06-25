@@ -192,6 +192,9 @@ _afk_pid_alive() {
 #   live  — a window is armed AND the heartbeat pid is a live process.
 #   stale — a window is armed but the heartbeat pid is gone, or there is no heartbeat —
 #           the supervisor crashed and the state file is lying.
+# UPGRADE: also require a recent tick (afk_now - heartbeat epoch < a few tick intervals)
+# if pid reuse — the OS recycling a crashed supervisor's pid onto an unrelated process —
+# ever produces a false `live`. kill -0 alone is the issue's spec and reuse is rare here.
 afk_supervisor_state() {
   [ -n "$(afk_read_state)" ] || { printf 'off\n'; return; }
   local hb pid; hb="$(afk_read_heartbeat)"; pid="${hb%% *}"

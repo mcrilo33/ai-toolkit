@@ -1278,6 +1278,7 @@ def test_afk_read_heartbeat_empty_when_absent(tmp_path: Path) -> None:
 
     result = _call("afk_read_heartbeat", env={"AFK_HEARTBEAT": str(hb)})
 
+    assert result.returncode == 0, result.stderr  # the function ran (not command-not-found)
     assert result.stdout.strip() == ""
 
 
@@ -1380,4 +1381,5 @@ def test_heartbeat_age_minutes_empty_when_absent(tmp_path: Path) -> None:
         "_afk_heartbeat_age_minutes", env={"AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000600"}
     )
 
+    assert result.returncode == 0, result.stderr  # the function ran (not command-not-found)
     assert result.stdout.strip() == ""
