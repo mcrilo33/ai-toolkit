@@ -1096,12 +1096,37 @@ afk_telemetry_preflight() {
   return 0
 }
 
+# afk_have_telemetry_auth -> true when LANGFUSE_BASIC_AUTH is resolvable (env or named in
+# the conf file) WITHOUT mutating the environment — the READ-ONLY check --status uses (it
+# greps the conf for the var rather than sourcing it, so a status read has no side effect).
+afk_have_telemetry_auth() {
+  [ -n "${LANGFUSE_BASIC_AUTH:-}" ] && return 0
+  local conf="${AFK_TELEMETRY_CONF:-$HOME/.afk-telemetry}"
+  [ -f "$conf" ] && grep -q 'LANGFUSE_BASIC_AUTH' "$conf" 2>/dev/null
+}
+
+# afk_telemetry_status -> a one-line, READ-ONLY telemetry health summary for --status: the
+# up/down of the collector (:4317) and bridge (:4319) and whether auth is resolvable, e.g.
+#   /afk: telemetry OK (collector up, bridge up, auth present)
+#   /afk: telemetry DOWN (collector down, bridge up, auth missing)
+# Prints nothing when telemetry is opted out (AI_TOOLKIT_OTEL=0). Probes only — never
+# launches anything (unlike the preflight), so a status read is free of side effects.
+afk_telemetry_status() {
+  afk_telemetry_enabled || return 0
+  local c b a overall
+  wt_port_listening 4317 && c=up || c=down
+  wt_port_listening 4319 && b=up || b=down
+  afk_have_telemetry_auth && a=present || a=missing
+  if [ "$c" = up ] && [ "$b" = up ] && [ "$a" = present ]; then overall=OK; else overall=DOWN; fi
+  printf '/afk: telemetry %s (collector %s, bridge %s, auth %s)\n' "$overall" "$c" "$b" "$a"
+}
+
 # --- CLI ----------------------------------------------------------------------
 
-_status() {
-  local state now rem age
-  state="$(afk_read_state)"; now="$(afk_now)"
-  if [ -z "$state" ]; then echo "/afk: off"; return 0; fi
+# _afk_status_state_line <state> <now> -> echo the window's state line: STALE (#107) when
+# the supervisor pid is gone, else draining / window-elapsed / "Nm remaining".
+_afk_status_state_line() {
+  local state="$1" now="$2" rem age
   # Cross-check the heartbeat before trusting the state file: a window armed in
   # .afk-state but no live supervisor pid means the process crashed and the state file
   # is lying (#107). Report STALE rather than echoing `draining` / `Nm remaining`.
@@ -1118,6 +1143,17 @@ _status() {
   if window_expired "$state" "$now"; then echo "/afk: window elapsed (supervisor will stop on its next tick)"; return 0; fi
   rem="$(minutes_remaining "$state" "$now")"
   echo "/afk: on — ${rem}m remaining (until $(wt_date_ymd "$state") $(date -r "$state" +%H:%M 2>/dev/null || date -d "@$state" +%H:%M))"
+}
+
+_status() {
+  local state now
+  state="$(afk_read_state)"; now="$(afk_now)"
+  if [ -z "$state" ]; then echo "/afk: off"; return 0; fi
+  _afk_status_state_line "$state" "$now"
+  # For a live (or stale) drain, surface telemetry health too: the dashboard is the SSOT,
+  # so the operator must be able to see whether it's actually receiving data (#108). A
+  # no-op line when telemetry is opted out (AI_TOOLKIT_OTEL=0).
+  afk_telemetry_status
 }
 
 main() {
