@@ -1915,6 +1915,30 @@ class TestSkillActivatedNesting:
         copy = _by_orig(batch, "trace-audit", "act1")
         assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "sk_tool")
 
+    def test_skill_activated_recovers_via_bridge_stamped_interaction(self) -> None:
+        # #111 end-to-end: the real production shape. The tool:Skill span carries NO prompt.id
+        # of its own, and the interaction carries prompt.id only as a FLAT metadata key (the
+        # message bridge's span-update output, not nested under "attributes"). _build_skill_index
+        # must still recover the turn key by walking tool:Skill -> enclosing interaction, so the
+        # span-less skill_activated nests under its tool:Skill instead of floating to the root.
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"prompt.id": "p1", "attributes": {"interaction.sequence": "3"}},
+        )
+        tool = self._skill_tool("sk_tool", "tu-sk1")  # no prompt.id on the tool span
+        skill = _audit_event(
+            "act_e2e", "skill_activated", **{"skill.name": "source-task", "prompt.id": "p1"}
+        )
+        traces = [("trace-int", [interaction, tool]), ("trace-audit", [skill])]
+        content = {"tu-sk1": ToolContent({"skill": "source-task"}, "ok")}
+
+        batch = build_batch(traces, SPOKE, content)
+
+        copy = _by_orig(batch, "trace-audit", "act_e2e")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "sk_tool")
+
     def test_two_skills_in_one_turn_disambiguated_by_skill_name(self) -> None:
         interaction = _obs(
             "i1",
