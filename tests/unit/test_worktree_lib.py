@@ -177,12 +177,42 @@ def _collector_preflight(
     wt_collector_launch is replaced with a marker echo, so a started collector
     prints ``LAUNCHED <repo>`` and nothing real is spawned. The gate
     (AI_TOOLKIT_OTEL) and LANGFUSE_BASIC_AUTH are set/unset explicitly so a host
-    value can never steer the decision.
+    value can never steer the decision. The staleness collaborators are stubbed
+    to a benign "no running container" verdict so the already-up path is a clean
+    no-op here (its restart behaviour is covered by the dedicated tests below) and
+    never probes real docker.
     """
     parts = [
         f"wt_port_listening() {{ return {0 if port_up else 1}; }}",
         'wt_collector_launch() { echo "LAUNCHED $1"; }',
+        'wt_collector_running_version() { printf ""; }',
+        'wt_collector_remove() { echo "REMOVED"; }',
         "export AI_TOOLKIT_OTEL=1" if gate else "unset AI_TOOLKIT_OTEL",
+        "export LANGFUSE_BASIC_AUTH=Basic-xyz" if auth else "unset LANGFUSE_BASIC_AUTH",
+        "wt_otel_collector_preflight /repo",
+    ]
+    return _call("; ".join(parts))
+
+
+def _collector_preflight_up(
+    *, running_version: str, current_version: str, auth: bool = True
+) -> subprocess.CompletedProcess[str]:
+    """Run wt_otel_collector_preflight with the collector UP and staleness stubbed.
+
+    The port probe is forced up and the staleness signal is driven directly:
+    wt_collector_config_version (the CURRENT signature from on-disk config + the
+    expected port/image set) and wt_collector_running_version (the signature the
+    running container was stamped with). wt_collector_remove / wt_collector_launch
+    are marker echoes, so a recycle prints ``REMOVED`` then ``LAUNCHED <repo>`` and
+    nothing real is torn down or spawned.
+    """
+    parts = [
+        "wt_port_listening() { return 0; }",
+        f'wt_collector_config_version() {{ printf "%s" "{current_version}"; }}',
+        f'wt_collector_running_version() {{ printf "%s" "{running_version}"; }}',
+        'wt_collector_remove() { echo "REMOVED"; }',
+        'wt_collector_launch() { echo "LAUNCHED $1"; }',
+        "export AI_TOOLKIT_OTEL=1",
         "export LANGFUSE_BASIC_AUTH=Basic-xyz" if auth else "unset LANGFUSE_BASIC_AUTH",
         "wt_otel_collector_preflight /repo",
     ]
@@ -222,6 +252,49 @@ def test_collector_preflight_noop_without_gate() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "LAUNCHED" not in result.stdout
+
+
+def test_collector_preflight_recycles_stale_config() -> None:
+    # Up, gate on, auth present, but the running container's stamped config-version
+    # no longer matches the current one (an otelcol.yaml / port / image change
+    # landed) → tear it down and relaunch through the current code.
+    result = _collector_preflight_up(running_version="oldsha", current_version="newsha")
+
+    assert result.returncode == 0, result.stderr
+    assert "REMOVED" in result.stdout
+    assert "LAUNCHED /repo" in result.stdout
+
+
+def test_collector_preflight_leaves_current_instance() -> None:
+    # Up and the stamped config-version equals the current one → no churn: never
+    # rm/relaunch an up-to-date collector (no restart loop).
+    result = _collector_preflight_up(running_version="samesha", current_version="samesha")
+
+    assert result.returncode == 0, result.stderr
+    assert "REMOVED" not in result.stdout
+    assert "LAUNCHED" not in result.stdout
+
+
+def test_collector_preflight_leaves_unlabeled_instance() -> None:
+    # Up but the running container carries no config-version label (started by
+    # pre-feature code, or docker inspect unreadable) → staleness can't be PROVEN,
+    # so leave it untouched (conservative; fire only on a genuine, detected change).
+    result = _collector_preflight_up(running_version="", current_version="newsha")
+
+    assert result.returncode == 0, result.stderr
+    assert "REMOVED" not in result.stdout
+    assert "LAUNCHED" not in result.stdout
+
+
+def test_collector_preflight_stale_but_auth_missing_leaves_instance() -> None:
+    # Stale config but LANGFUSE_BASIC_AUTH unset → don't tear down a working
+    # instance for an un-authable replacement; warn and leave it running.
+    result = _collector_preflight_up(running_version="oldsha", current_version="newsha", auth=False)
+
+    assert result.returncode == 0, result.stderr
+    assert "REMOVED" not in result.stdout
+    assert "LAUNCHED" not in result.stdout
+    assert "LANGFUSE_BASIC_AUTH" in result.stderr
 
 
 def test_collector_launch_publishes_four_ports_and_unquoted_auth(tmp_path: Path) -> None:
@@ -265,6 +338,9 @@ def test_collector_launch_publishes_four_ports_and_unquoted_auth(tmp_path: Path)
     for port in ("4317:4317", "4318:4318", "4418:4418", "8889:8889"):
         assert f"-p {port}" in argv, f"missing published port {port} in: {argv}"
     assert "--name lf-collector" in argv
+    # Stamp the config-version label so a later spawn can detect a stale container
+    # and recycle it (the staleness signal is content+port+image, not just mtime).
+    assert "--label ai-toolkit.config-version=" in argv
     assert "/repo/dashboard/langfuse/otelcol.yaml:/etc/otelcol-contrib/config.yaml" in argv
     # Forwarded verbatim — no surrounding quotes baked into the value.
     assert "LANGFUSE_BASIC_AUTH=[Basic dG9rOnNlYw==]" in recorded
