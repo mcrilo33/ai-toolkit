@@ -481,6 +481,36 @@ class TestEnclosingTurnFallback:
         copy = _by_orig(batch, "trace-audit", "h7")
         assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
 
+    def test_interaction_prompt_id_in_flat_metadata_rehomes_event(self) -> None:
+        # #111: the message bridge stamps prompt.id onto the interaction as a FLAT metadata key
+        # (metadata["prompt.id"], the same shape the audit layer uses), NOT nested under
+        # metadata["attributes"]. This locks that bridge output shape to the reader: a turn whose
+        # prompt.id lives only in flat metadata still anchors a floating hook_execution_complete.
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"prompt.id": "p-flat", "attributes": {"interaction.sequence": "3"}},
+        )
+        hook = _obs(
+            "h8",
+            "hook_execution_complete:PreToolUse",
+            type_="EVENT",
+            parent=None,
+            metadata={
+                "hook_event": "PreToolUse",
+                "hook_name": "PreToolUse:Bash",
+                "tool_use_id": "tu-denied",
+                "prompt.id": "p-flat",
+            },
+        )
+        traces = [("trace-int", [interaction]), ("trace-audit", [hook])]
+
+        batch = build_batch(traces, SPOKE)
+
+        copy = _by_orig(batch, "trace-audit", "h8")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+
     def test_unmatched_gate_hook_nests_by_time_window_without_prompt_id(self) -> None:
         # A real-timing gate hook with no prompt.id falls back to [start,end] containment: its
         # true startTime sits inside exactly one interaction window.

@@ -861,3 +861,223 @@ def test_response_body_does_not_reach_the_create_sink() -> None:
     # Assert: patched as output, nothing created.
     assert patch.calls == [("aabbccddeeff0011", "output", "hi")]
     assert create.batches == []
+
+
+# --- prompt.id stamping: recover the span-side causal key (#111) --------------
+#
+# Claude Code never emits prompt.id on the claude_code.interaction span (verified against
+# real Langfuse data) -- it rides the logs signal only (api_request[_body].prompt.id). The
+# bridge reconstructs it: prompt.id --(event.sequence / request_id)--> request_id
+# --(llm_request span)--> span_id --(parentSpanId, up to the enclosing interaction)-->
+# interaction span_id, then stamps flat metadata["prompt.id"] via a span-update so the
+# spoke-tree's _build_interaction_index / _build_skill_index have a key to match.
+
+
+def _tree_span(
+    *,
+    span_id: str,
+    name: str | None = None,
+    parent: str | None = None,
+    request_id: str | None = None,
+) -> dict:
+    """A single OTLP span with optional name / parentSpanId / request_id attribute."""
+    attrs = (
+        [{"key": "request_id", "value": {"stringValue": request_id}}]
+        if request_id is not None
+        else []
+    )
+    span: dict = {"spanId": span_id, "attributes": attrs}
+    if name is not None:
+        span["name"] = name
+    if parent is not None:
+        span["parentSpanId"] = parent
+    return span
+
+
+def _spans(*spans: dict) -> dict:
+    """An OTLP/HTTP traces batch carrying several spans (interaction + llm_request)."""
+    return {"resourceSpans": [{"scopeSpans": [{"spans": list(spans)}]}]}
+
+
+def _prompt_stamps(create: _CreateSink) -> list[dict]:
+    """Every span-update event the bridge emitted to stamp prompt.id, in order."""
+    return [event for batch in create.batches for event in batch if event["type"] == "span-update"]
+
+
+def test_interaction_stamped_with_prompt_id_from_request_body() -> None:
+    # Arrange: an interaction with one child llm_request (request_id req-1); a request body
+    # carries prompt.id p-1 keyed by its event.sequence, matched to the request by sequence.
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+    bridge.on_spans(
+        _spans(
+            _tree_span(span_id="00000000000000a1", name="claude_code.interaction"),
+            _tree_span(span_id="00000000000000b1", parent="00000000000000a1", request_id="req-1"),
+        )
+    )
+
+    # Act
+    bridge.on_logs(
+        _log_payload(
+            _attrs(
+                **{
+                    "event.name": "api_request_body",
+                    "event.sequence": "30",
+                    "prompt.id": "p-1",
+                    "body": _body("turn-30"),
+                }
+            ),
+            _attrs(**{"event.name": "api_request", "event.sequence": "37", "request_id": "req-1"}),
+        )
+    )
+
+    # Assert: the interaction (not the llm_request) is stamped with flat metadata["prompt.id"].
+    stamps = _prompt_stamps(create)
+    assert len(stamps) == 1
+    assert stamps[0]["body"] == {"id": "00000000000000a1", "metadata": {"prompt.id": "p-1"}}
+
+
+def test_prompt_id_read_directly_from_api_request() -> None:
+    # Arrange: when api_request itself carries request_id AND prompt.id, no body is needed.
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+    bridge.on_spans(
+        _spans(
+            _tree_span(span_id="00000000000000a1", name="claude_code.interaction"),
+            _tree_span(span_id="00000000000000b1", parent="00000000000000a1", request_id="req-1"),
+        )
+    )
+
+    # Act
+    bridge.on_logs(
+        _log_payload(
+            _attrs(**{"event.name": "api_request", "request_id": "req-1", "prompt.id": "p-9"})
+        )
+    )
+
+    # Assert
+    stamps = _prompt_stamps(create)
+    assert stamps == [
+        {
+            "id": "00000000000000a1-prompt-id",
+            "type": "span-update",
+            "timestamp": stamps[0]["timestamp"],
+            "body": {"id": "00000000000000a1", "metadata": {"prompt.id": "p-9"}},
+        }
+    ]
+
+
+def test_prompt_id_stamp_flushes_regardless_of_arrival_order() -> None:
+    # Arrange: the logs arrive BEFORE the spans -- the stamp must still resolve on the later
+    # on_spans flush (same order-independence as the message join).
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+
+    # Act: logs first (no spans yet -> nothing stamped), then the spans.
+    bridge.on_logs(
+        _log_payload(
+            _attrs(
+                **{
+                    "event.name": "api_request_body",
+                    "event.sequence": "30",
+                    "prompt.id": "p-1",
+                    "body": _body("turn-30"),
+                }
+            ),
+            _attrs(**{"event.name": "api_request", "event.sequence": "37", "request_id": "req-1"}),
+        )
+    )
+    assert _prompt_stamps(create) == []  # interaction not seen yet -> buffered
+    bridge.on_spans(
+        _spans(
+            _tree_span(span_id="00000000000000a1", name="claude_code.interaction"),
+            _tree_span(span_id="00000000000000b1", parent="00000000000000a1", request_id="req-1"),
+        )
+    )
+
+    # Assert
+    stamps = _prompt_stamps(create)
+    assert len(stamps) == 1
+    assert stamps[0]["body"]["id"] == "00000000000000a1"
+
+
+def test_interaction_stamped_once_when_turn_has_two_llm_requests() -> None:
+    # Arrange: two llm_requests under the SAME interaction, both tied to prompt.id p-1 (one
+    # turn). The interaction must be stamped exactly once, not per request.
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+    bridge.on_spans(
+        _spans(
+            _tree_span(span_id="00000000000000a1", name="claude_code.interaction"),
+            _tree_span(span_id="00000000000000b1", parent="00000000000000a1", request_id="req-1"),
+            _tree_span(span_id="00000000000000b2", parent="00000000000000a1", request_id="req-2"),
+        )
+    )
+
+    # Act
+    bridge.on_logs(
+        _log_payload(
+            _attrs(**{"event.name": "api_request", "request_id": "req-1", "prompt.id": "p-1"}),
+            _attrs(**{"event.name": "api_request", "request_id": "req-2", "prompt.id": "p-1"}),
+        )
+    )
+
+    # Assert: a single span-update for the lone interaction.
+    stamps = _prompt_stamps(create)
+    assert len(stamps) == 1
+    assert stamps[0]["body"]["id"] == "00000000000000a1"
+
+
+def test_prompt_id_walks_up_to_nearest_interaction_ancestor() -> None:
+    # Arrange: a sub-agent shape -- the llm_request's parent is a tool:Agent span whose parent
+    # is the interaction. The walk must climb to the nearest interaction ancestor.
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+    bridge.on_spans(
+        _spans(
+            _tree_span(span_id="00000000000000a1", name="claude_code.interaction"),
+            _tree_span(span_id="00000000000000c1", name="tool:Agent", parent="00000000000000a1"),
+            _tree_span(span_id="00000000000000b1", parent="00000000000000c1", request_id="req-1"),
+        )
+    )
+
+    # Act
+    bridge.on_logs(
+        _log_payload(
+            _attrs(**{"event.name": "api_request", "request_id": "req-1", "prompt.id": "p-1"})
+        )
+    )
+
+    # Assert: stamped onto the interaction, not the intermediate tool:Agent span.
+    stamps = _prompt_stamps(create)
+    assert [s["body"]["id"] for s in stamps] == ["00000000000000a1"]
+
+
+def test_request_body_without_prompt_id_produces_no_stamp() -> None:
+    # Arrange: a normal message-join body with no prompt.id attribute must not stamp anything.
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+    bridge.on_spans(
+        _spans(
+            _tree_span(span_id="00000000000000a1", name="claude_code.interaction"),
+            _tree_span(span_id="00000000000000b1", parent="00000000000000a1", request_id="req-1"),
+        )
+    )
+
+    # Act
+    bridge.on_logs(
+        _log_payload(
+            _attrs(
+                **{
+                    "event.name": "api_request_body",
+                    "event.sequence": "30",
+                    "body": _body("turn-30"),
+                }
+            ),
+            _attrs(**{"event.name": "api_request", "event.sequence": "37", "request_id": "req-1"}),
+        )
+    )
+
+    # Assert: input still patched (message join), but no prompt.id stamp.
+    assert _prompt_stamps(create) == []
+    assert patch.calls == [("00000000000000b1", "input", {"role": "user", "content": "turn-30"})]
