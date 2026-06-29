@@ -495,9 +495,16 @@ class Bridge:
         # prompt.id sources from the logs signal, kept across flushes so a span arriving later
         # still resolves: request_id -> prompt.id (when api_request carries both), and
         # (api_request_body event.sequence) -> prompt.id (matched to a request via _match_bodies).
+        # UPGRADE: these (like _body_seqs / _req_seq / _tool_decisions) are never pruned, so they
+        # grow with the spoke's request count -- bound them if the host bridge serves a very long
+        # session, e.g. drop a (seq, prompt.id) once its interaction is stamped with that value.
         self._prompt_by_req: dict[str, str] = {}
         self._prompt_by_seq: list[tuple[int, str]] = []
-        self._stamped_interactions: set[str] = set()  # interaction span_ids already stamped (dedup)
+        # interaction span_id -> the prompt.id last stamped onto it. A DICT, not a set, so a later
+        # flush whose body->request match has settled differently RE-STAMPS the corrected value
+        # (Langfuse upserts the deterministic span-update id) instead of being locked to a possibly
+        # premature first guess -- mirroring the message join's re-resolve-every-flush semantics.
+        self._stamped_prompt: dict[str, str] = {}
 
     def pending_count(self) -> int:
         """Return the number of items still buffered awaiting their span."""
@@ -568,14 +575,16 @@ class Bridge:
             seq = _attr(record_attrs, "event.sequence")
             if seq is None:
                 return
-            # prompt.id rides the body record (keyed by its event.sequence); capture it even when
-            # the body itself is unreadable (file-mode body_ref absent), so the stamp survives.
-            if prompt_id:
-                self._prompt_by_seq.append((int(seq), prompt_id))
             raw = _read_body(record_attrs)
             if not raw:
                 return
             self._body_seqs.append(int(seq))  # kept past flush so the match stays stable
+            # prompt.id rides the body record (keyed by its event.sequence). Capture it only after
+            # the seq is in _body_seqs: _match_bodies (and therefore the stamp join) resolves a seq
+            # only when it is a known body, so an unreadable body's prompt.id could never resolve.
+            # That call's turn is still stamped by any other readable body sharing its prompt.id.
+            if prompt_id:
+                self._prompt_by_seq.append((int(seq), prompt_id))
             self._pending.append(
                 {"key": int(seq), "ktype": "seq", "field": "input", "value": _last_message(raw)}
             )
@@ -785,9 +794,14 @@ class Bridge:
         spoke-tree causal join is empty. This reconstructs it from the logs signal:
         ``prompt.id`` --(request_id, direct or via :meth:`_match_bodies`)--> ``llm_request``
         span --(parent chain up to the enclosing interaction)--> interaction span, then emits a
-        single ``span-update`` writing flat ``metadata["prompt.id"]``. Each interaction is stamped
-        once (dedup via :attr:`_stamped_interactions`); an unresolved prompt id stays in its source
-        buffer and re-resolves on a later flush, so trace/log arrival order is irrelevant.
+        ``span-update`` writing flat ``metadata["prompt.id"]``.
+
+        A stamp is (re)emitted only when an interaction's resolved ``prompt.id`` differs from what
+        was last sent (:attr:`_stamped_prompt`), so a stable turn is stamped once yet a premature
+        match (a body claimed by an out-of-order ``api_request``) self-corrects on the later flush
+        that settles it. The ``prompt.id`` direct path (``api_request``) is order-immune and takes
+        precedence over the temporal body->request path. Stamping is best-effort, like the message
+        :attr:`_patch`: a transient Langfuse failure inside :attr:`_create` is logged, not retried.
         """
         matched = self._match_bodies()
         req_to_prompt: dict[str, str] = dict(self._prompt_by_req)
@@ -801,9 +815,9 @@ class Bridge:
             if span_id is None:
                 continue
             interaction = self._enclosing_interaction(span_id)
-            if interaction is None or interaction in self._stamped_interactions:
+            if interaction is None or self._stamped_prompt.get(interaction) == prompt_id:
                 continue
-            self._stamped_interactions.add(interaction)
+            self._stamped_prompt[interaction] = prompt_id
             batch.append(_prompt_span_update(interaction, prompt_id))
         if batch:
             self._create(batch)

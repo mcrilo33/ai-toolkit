@@ -1053,6 +1053,62 @@ def test_prompt_id_walks_up_to_nearest_interaction_ancestor() -> None:
     assert [s["body"]["id"] for s in stamps] == ["00000000000000a1"]
 
 
+def test_prompt_id_stamp_self_corrects_after_out_of_order_request() -> None:
+    # Arrange: two turns. Turn A = interaction a1 + llm_request req-37; turn B = interaction a2 +
+    # llm_request req-50. Body seq 30 carries turn A's prompt (p-a), body seq 45 carries turn B's
+    # (p-b). The api_request for req-50 arrives BEFORE req-37 and BEFORE body 45 -- so on the first
+    # flush body 30 is mis-matched (nearest-preceding) to req-50 and turn B is stamped p-a. The
+    # later flush, once req-37 and body 45 settle, must RE-STAMP turn B with the correct p-b.
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+    bridge.on_spans(
+        _spans(
+            _tree_span(span_id="000000000000000a", name="claude_code.interaction"),
+            _tree_span(span_id="000000000000000b", parent="000000000000000a", request_id="req-37"),
+            _tree_span(span_id="000000000000000c", name="claude_code.interaction"),
+            _tree_span(span_id="000000000000000d", parent="000000000000000c", request_id="req-50"),
+        )
+    )
+
+    # Act 1: only body 30 and req-50 so far -> body 30 mis-binds to req-50 (turn B stamped p-a).
+    bridge.on_logs(
+        _log_payload(
+            _attrs(
+                **{
+                    "event.name": "api_request_body",
+                    "event.sequence": "30",
+                    "prompt.id": "p-a",
+                    "body": _body("turn-a"),
+                }
+            ),
+            _attrs(**{"event.name": "api_request", "event.sequence": "50", "request_id": "req-50"}),
+        )
+    )
+    assert _prompt_stamps(create)[-1]["body"] == {
+        "id": "000000000000000c",
+        "metadata": {"prompt.id": "p-a"},
+    }
+
+    # Act 2: req-37 and body 45 settle the matching -> body 30 -> req-37, body 45 -> req-50.
+    bridge.on_logs(
+        _log_payload(
+            _attrs(
+                **{
+                    "event.name": "api_request_body",
+                    "event.sequence": "45",
+                    "prompt.id": "p-b",
+                    "body": _body("turn-b"),
+                }
+            ),
+            _attrs(**{"event.name": "api_request", "event.sequence": "37", "request_id": "req-37"}),
+        )
+    )
+
+    # Assert: turn A stamped p-a, and turn B CORRECTED from p-a to p-b (idempotent upsert id).
+    final = {s["body"]["id"]: s["body"]["metadata"]["prompt.id"] for s in _prompt_stamps(create)}
+    assert final == {"000000000000000a": "p-a", "000000000000000c": "p-b"}
+
+
 def test_request_body_without_prompt_id_produces_no_stamp() -> None:
     # Arrange: a normal message-join body with no prompt.id attribute must not stamp anything.
     patch, create = _Sink(), _CreateSink()
