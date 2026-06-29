@@ -297,7 +297,10 @@ wt_bridge_kill() { kill "$1" 2>/dev/null || true; }
 # resolvable start time, or source not strictly newer leaves the process untouched,
 # so the restart fires only on a PROVEN change and never loops. A stale process with
 # LANGFUSE_BASIC_AUTH unset is also left running (warn instead of killing a working
-# bridge for an un-authable one). Args: $1 = repo root, $2 = bridge port.
+# bridge for an un-authable one). The `-gt` is strict at second granularity, so a
+# land landing in the very second the bridge (re)started is not seen as stale —
+# erring toward no over-fire, an acceptable miss given lands are minutes apart.
+# Args: $1 = repo root, $2 = bridge port.
 wt_bridge_restart_if_stale() {
   local repo_root="$1" port="$2" pid start src
   pid="$(wt_bridge_pid "$port")"
