@@ -268,6 +268,29 @@ wt_otel_bridge_preflight() {
 # collector up idempotently at spawn — mirroring wt_otel_bridge_preflight — so
 # the operator runs no manual step. Best-effort: it never fails the spawn.
 
+# The collector image and published-port set, as single sources of truth shared
+# by the launch and by the staleness signature below — so a future bump to either
+# flows into the config-version label and a container stamped with the old value
+# is detected stale. The port flags are intentionally word-split at the `docker
+# run` call site.
+WT_COLLECTOR_IMAGE="otel/opentelemetry-collector-contrib:latest"
+WT_COLLECTOR_PORT_FLAGS="-p 4317:4317 -p 4318:4318 -p 4418:4418 -p 8889:8889"
+
+# Combined staleness signature for the collector: a hash over the otelcol.yaml
+# CONTENT plus the expected port set + image. A content hash (not the file's
+# mtime) is the right signal because the config is bind-mounted — the running
+# container's mounted file already equals on-disk, and a per-worktree checkout
+# rewrites mtimes without changing content. Any real change to config, ports, or
+# image bumps the signature. Empty when the config is unreadable (caller then
+# leaves the running instance untouched). Split out so it is overridable in tests.
+# Args: $1 = repo root (holds dashboard/langfuse/otelcol.yaml).
+wt_collector_config_version() {
+  local cfg="$1/dashboard/langfuse/otelcol.yaml"
+  [ -f "$cfg" ] || return 0
+  { cat "$cfg"; printf '%s\n%s\n' "$WT_COLLECTOR_PORT_FLAGS" "$WT_COLLECTOR_IMAGE"; } \
+    | { shasum -a 256 2>/dev/null || sha256sum 2>/dev/null; } | awk '{print $1}'
+}
+
 # Start the otelcol collector (lf-collector) in a detached Docker container.
 # Split from the preflight so the decision logic stays unit-testable (override
 # wt_port_listening, no real `docker run`). The non-secret connection endpoints
@@ -276,35 +299,81 @@ wt_otel_bridge_preflight() {
 # shell, so re-export them in a subshell. LANGFUSE_BASIC_AUTH is forwarded
 # VERBATIM: wrapping it in extra quotes makes the collector's Authorization
 # header 401 while metrics still flow (looks like a pipeline bug but is auth).
+# Stamps the config-version label so a later spawn can detect a stale container.
 # Args: $1 = repo root (holds dashboard/langfuse/otelcol.yaml).
 wt_collector_launch() {
-  local repo_root="$1"
+  local repo_root="$1" version
+  version="$(wt_collector_config_version "$repo_root")"
   (
     export LANGFUSE_OTLP_ENDPOINT="${LANGFUSE_OTLP_ENDPOINT:-http://host.docker.internal:3000/api/public/otel}"
     export BRIDGE_OTLP_ENDPOINT="${BRIDGE_OTLP_ENDPOINT:-http://host.docker.internal:4319}"
     export LANGFUSE_BASIC_AUTH
+    # shellcheck disable=SC2086  # WT_COLLECTOR_PORT_FLAGS is meant to word-split.
     docker run -d --name lf-collector --add-host=host.docker.internal:host-gateway \
-      -p 4317:4317 -p 4318:4318 -p 4418:4418 -p 8889:8889 \
+      --label "ai-toolkit.config-version=$version" \
+      $WT_COLLECTOR_PORT_FLAGS \
       -e LANGFUSE_OTLP_ENDPOINT -e LANGFUSE_BASIC_AUTH -e BRIDGE_OTLP_ENDPOINT \
       -v "$repo_root/dashboard/langfuse/otelcol.yaml:/etc/otelcol-contrib/config.yaml" \
-      otel/opentelemetry-collector-contrib:latest >/dev/null 2>&1
+      "$WT_COLLECTOR_IMAGE" >/dev/null 2>&1
   )
   echo "→ started lf-collector (otelcol) on :4317/:4318/:4418/:8889"
 }
 
-# Idempotently ensure the otelcol collector is up for an opted-in spoke. A no-op
-# unless AI_TOOLKIT_OTEL=1 (AI_TOOLKIT_OTEL=0 is a clean full opt-out). Never
-# starts a second collector (skips when :4317 already listens — a duplicate would
-# fail anyway: a port-bind clash, or a --name conflict against a stopped
-# lf-collector, both swallowed best-effort). When LANGFUSE_BASIC_AUTH is unset the collector can't
-# authenticate to Langfuse, so warn (telemetry won't land) but DO NOT fail the
-# spawn — same posture as wt_otel_bridge_preflight. Run BEFORE the bridge
-# preflight: the collector forks to the bridge, so both must be up before the
-# spoke's first export. Args: $1 = repo root.
+# The config-version label of the running lf-collector, or '' on any failure (no
+# such container, unlabeled pre-feature container, docker unreachable). Split out
+# so the staleness decision is overridable in tests with no real `docker inspect`.
+wt_collector_running_version() {
+  docker inspect -f '{{ index .Config.Labels "ai-toolkit.config-version" }}' \
+    lf-collector 2>/dev/null || true
+}
+
+# Tear down the running collector (best-effort). Split out so the staleness
+# decision is overridable in tests with no real `docker rm`.
+wt_collector_remove() {
+  docker rm -f lf-collector >/dev/null 2>&1 || true
+}
+
+# Recycle the running collector IFF its stamped config-version differs from the
+# current one (an otelcol.yaml / port / image change landed). Best-effort and
+# idempotent: an unhashable config or a missing/unreadable label leaves the
+# instance untouched, so the restart fires only on a PROVEN change and never
+# loops. A stale instance with LANGFUSE_BASIC_AUTH unset is also left running
+# (warn instead of tearing a working instance down for an un-authable one).
+# Args: $1 = repo root.
+wt_collector_restart_if_stale() {
+  local repo_root="$1" cur run
+  cur="$(wt_collector_config_version "$repo_root")"
+  [ -n "$cur" ] || return 0
+  run="$(wt_collector_running_version)"
+  [ -n "$run" ] || return 0
+  [ "$run" != "$cur" ] || return 0
+  if [ -z "${LANGFUSE_BASIC_AUTH:-}" ]; then
+    wt_warn "OTel collector config changed but LANGFUSE_BASIC_AUTH unset — leaving the running (stale) lf-collector; restart manually after exporting auth"
+    return 0
+  fi
+  wt_collector_remove
+  wt_collector_launch "$repo_root"
+}
+
+# Idempotently ensure the otelcol collector is up AND current for an opted-in
+# spoke. A no-op unless AI_TOOLKIT_OTEL=1 (AI_TOOLKIT_OTEL=0 is a clean full
+# opt-out). When :4317 already listens, delegate to wt_collector_restart_if_stale
+# — which recycles the container only when its stamped config-version proves it is
+# running stale code/config, and otherwise leaves it untouched (no second
+# collector, no needless churn). When down: never starts a second collector (a
+# duplicate would fail anyway — a port-bind clash, or a --name conflict against a
+# stopped lf-collector, both swallowed best-effort). When LANGFUSE_BASIC_AUTH is
+# unset the collector can't authenticate to Langfuse, so warn (telemetry won't
+# land) but DO NOT fail the spawn — same posture as wt_otel_bridge_preflight. Run
+# BEFORE the bridge preflight: the collector forks to the bridge, so both must be
+# up before the spoke's first export. Args: $1 = repo root.
 wt_otel_collector_preflight() {
   local repo_root="$1" port=4317
   [ "${AI_TOOLKIT_OTEL:-}" = "1" ] || return 0
-  wt_port_listening "$port" && return 0
+  if wt_port_listening "$port"; then
+    wt_collector_restart_if_stale "$repo_root"
+    return 0
+  fi
   if [ -z "${LANGFUSE_BASIC_AUTH:-}" ]; then
     wt_warn "OTel collector down on :$port and LANGFUSE_BASIC_AUTH unset — telemetry won't reach Langfuse; spoke still launches"
     return 0
