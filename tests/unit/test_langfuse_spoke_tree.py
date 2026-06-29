@@ -1442,11 +1442,34 @@ def _root_marker(obs_id: str, name: str, start: str) -> dict:
     return _obs(obs_id, name, parent=None, startTime=start)
 
 
+def _ledger_child(
+    obs_id: str, name: str, tool_use_id: str, *, parent: str, start: str, end: str
+) -> dict:
+    """A tool:Task* span nested under an interaction, carrying its tool_use_id and time window."""
+    return _obs(
+        obs_id,
+        name,
+        parent=parent,
+        startTime=start,
+        endTime=end,
+        metadata={"attributes": {"tool_use_id": tool_use_id}},
+    )
+
+
+def _steps_by_parent(batch: list[dict]) -> dict[str, str]:
+    """Map each step node's parent copy id to the step node's own id."""
+    return {
+        e["body"]["parentObservationId"]: e["id"] for e in batch if e["id"].startswith(_STEP_PREFIX)
+    }
+
+
 class TestStepGrouping:
-    """#100: ONLY the synthetic-root's flat satellites (markers / lifecycle / script / hooks at
-    root) re-home under the step whose window contains them. The claude_code.interaction
-    subtrees — and their W3C-TRACEPARENT nesting (a resume can nest under an earlier command's
-    tool.execution) — are LEFT UNTOUCHED, reflecting causal reality.
+    """#113 View A: a ``step:<subject>`` node is inserted INSIDE the interaction, wrapping the
+    contiguous run of same-parent siblings between the task's ``in_progress`` and ``completed``
+    ``TaskUpdate`` markers (absorbing those two markers and the ``TaskCreate``). The wrap never
+    crosses an interaction boundary; a cross-turn task produces one partial wrap per
+    anchor-holding interaction; a wrap with zero non-marker siblings is suppressed. Root-level
+    satellites are no longer grouped here (View B is the cycle lens).
     """
 
     def _content(self) -> dict[str, ToolContent]:
@@ -1458,58 +1481,82 @@ class TestStepGrouping:
             "tu-u2": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
         }
 
-    def _traces(self, marker_start: str = "2026-01-02T00:00:05Z") -> list[tuple[str, list[dict]]]:
-        # The ledger ops live under an interaction (left untouched); a root-level script span
-        # within the window is the thing that re-homes.
+    def _traces(self) -> list[tuple[str, list[dict]]]:
+        # One interaction holding the full ledger cycle plus two work spans between the markers.
         interaction = _obs(
-            "i1", "claude_code.interaction", parent=None, startTime="2026-01-02T00:00:00Z"
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:30Z",
         )
-        create = _obs(
+        create = _ledger_child(
             "tc1",
             "tool:TaskCreate",
+            "tu-c1",
             parent="i1",
-            startTime="2026-01-02T00:00:00Z",
-            endTime="2026-01-02T00:00:00Z",
-            metadata={"attributes": {"tool_use_id": "tu-c1"}},
+            start="2026-01-02T00:00:00Z",
+            end="2026-01-02T00:00:00Z",
         )
-        started = _obs(
+        started = _ledger_child(
             "tu1",
             "tool:TaskUpdate",
+            "tu-u1",
             parent="i1",
-            startTime="2026-01-02T00:00:01Z",
-            endTime="2026-01-02T00:00:01Z",
-            metadata={"attributes": {"tool_use_id": "tu-u1"}},
+            start="2026-01-02T00:00:01Z",
+            end="2026-01-02T00:00:01Z",
         )
-        done = _obs(
+        work_tool = _ledger_child(
+            "wt",
+            "tool:Edit",
+            "tu-w",
+            parent="i1",
+            start="2026-01-02T00:00:05Z",
+            end="2026-01-02T00:00:06Z",
+        )
+        work_gen = _obs(
+            "wg",
+            "claude_code.llm_request",
+            type_="GENERATION",
+            parent="i1",
+            startTime="2026-01-02T00:00:07Z",
+            endTime="2026-01-02T00:00:08Z",
+        )
+        done = _ledger_child(
             "tu2",
             "tool:TaskUpdate",
+            "tu-u2",
             parent="i1",
-            startTime="2026-01-02T00:00:20Z",
-            endTime="2026-01-02T00:00:21Z",
-            metadata={"attributes": {"tool_use_id": "tu-u2"}},
+            start="2026-01-02T00:00:20Z",
+            end="2026-01-02T00:00:21Z",
         )
-        marker = _root_marker("m1", "spoke-push", marker_start)
-        return [("tr", [interaction, create, started, done, marker])]
+        return [("tr", [interaction, create, started, work_tool, work_gen, done])]
 
-    def test_root_marker_within_window_nests_under_a_step_node(self) -> None:
+    def test_step_node_parented_under_the_interaction_not_root(self) -> None:
         batch = build_batch(self._traces(), SPOKE, self._content())
 
-        step = _step_node(batch)
-        assert step is not None
+        step = _only_step(batch)
         assert step["body"]["name"] == "step:S1 RED: x"
-        assert step["body"]["parentObservationId"] == root_id_for(SPOKE)
-        marker = _by_orig(batch, "tr", "m1")
-        assert marker["body"]["parentObservationId"] == step["id"]
+        assert step["body"]["parentObservationId"] == _by_orig(batch, "tr", "i1")["id"]
 
-    def test_interaction_subtree_is_left_untouched(self) -> None:
-        # The interaction stays at the root and its ledger-op children keep their nesting —
-        # the TRACEPARENT structure is causal reality, never flattened into the step.
+    def test_in_window_siblings_rehome_under_the_step(self) -> None:
         batch = build_batch(self._traces(), SPOKE, self._content())
 
-        interaction = _by_orig(batch, "tr", "i1")
-        assert interaction["body"]["parentObservationId"] == root_id_for(SPOKE)
-        assert _by_orig(batch, "tr", "tu1")["body"]["parentObservationId"] == interaction["id"]
-        assert _by_orig(batch, "tr", "tu2")["body"]["parentObservationId"] == interaction["id"]
+        step = _only_step(batch)
+        assert _by_orig(batch, "tr", "wt")["body"]["parentObservationId"] == step["id"]
+        assert _by_orig(batch, "tr", "wg")["body"]["parentObservationId"] == step["id"]
+
+    def test_ledger_markers_are_absorbed_under_the_step(self) -> None:
+        batch = build_batch(self._traces(), SPOKE, self._content())
+
+        step = _only_step(batch)
+        for oid in ("tc1", "tu1", "tu2"):
+            assert _by_orig(batch, "tr", oid)["body"]["parentObservationId"] == step["id"]
+
+    def test_interaction_remains_under_the_synthetic_root(self) -> None:
+        batch = build_batch(self._traces(), SPOKE, self._content())
+
+        assert _by_orig(batch, "tr", "i1")["body"]["parentObservationId"] == root_id_for(SPOKE)
 
     def test_step_node_carries_window_metadata(self) -> None:
         batch = build_batch(self._traces(), SPOKE, self._content())
@@ -1518,102 +1565,275 @@ class TestStepGrouping:
         assert meta["subject"] == "S1 RED: x"
         assert meta["status"] == "completed"
 
-    def test_root_marker_outside_every_window_stays_at_root(self) -> None:
-        batch = build_batch(
-            self._traces(marker_start="2026-01-02T01:00:00Z"), SPOKE, self._content()
+    def test_step_with_only_ledger_markers_is_suppressed(self) -> None:
+        # An interaction holding just the 3 markers (no work spans between) wraps zero siblings.
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:30Z",
+        )
+        create = _ledger_child(
+            "tc1",
+            "tool:TaskCreate",
+            "tu-c1",
+            parent="i1",
+            start="2026-01-02T00:00:00Z",
+            end="2026-01-02T00:00:00Z",
+        )
+        started = _ledger_child(
+            "tu1",
+            "tool:TaskUpdate",
+            "tu-u1",
+            parent="i1",
+            start="2026-01-02T00:00:01Z",
+            end="2026-01-02T00:00:01Z",
+        )
+        done = _ledger_child(
+            "tu2",
+            "tool:TaskUpdate",
+            "tu-u2",
+            parent="i1",
+            start="2026-01-02T00:00:20Z",
+            end="2026-01-02T00:00:21Z",
         )
 
-        marker = _by_orig(batch, "tr", "m1")
-        assert marker["body"]["parentObservationId"] == root_id_for(SPOKE)
+        batch = build_batch([("tr", [interaction, create, started, done])], SPOKE, self._content())
+
+        assert _step_node(batch) is None
 
     def test_non_ledger_spoke_emits_no_step_nodes(self) -> None:
         batch = build_batch(_traces(), SPOKE)
 
         assert _step_node(batch) is None
-        # the interaction turn still collapses to the synthetic root (interactions untouched).
         assert _by_orig(batch, "trace-int", "i1")["body"]["parentObservationId"] == root_id_for(
             SPOKE
         )
 
-    def test_root_hook_not_matching_a_tool_groups_into_its_step(self) -> None:
-        # A gate hook at the root (no matching tool) is a satellite and re-homes by its window;
-        # a hook that DOES match a tool stays under that tool (covered elsewhere).
-        hook = _obs(
-            "hk",
-            "commit-gauntlet.sh",
-            parent=None,
-            startTime="2026-01-02T00:00:05Z",
-            metadata={"attributes": {"workflow.kind": "hook"}},
-        )
+    def test_root_level_satellite_is_not_wrapped(self) -> None:
+        # A root-level marker (parent=None) is not an interaction-internal sibling, so View A
+        # leaves it at the synthetic root — the cycle lens (View B) is what places it by time.
         traces = self._traces()
-        traces[0][1].append(hook)
+        traces[0][1].append(_root_marker("m1", "spoke-push", "2026-01-02T00:00:10Z"))
 
         batch = build_batch(traces, SPOKE, self._content())
 
-        assert _by_orig(batch, "tr", "hk")["body"]["parentObservationId"] == _only_step(batch)["id"]
+        assert _by_orig(batch, "tr", "m1")["body"]["parentObservationId"] == root_id_for(SPOKE)
 
-    def test_innermost_window_wins_on_overlap(self) -> None:
-        # Two overlapping steps; a root marker inside both nests under the later-starting (inner).
-        content = {
-            "tu-ca": ToolContent({"subject": "outer"}, "Task #1 created successfully: outer"),
-            "tu-ua1": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
-            "tu-ua2": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
-            "tu-cb": ToolContent({"subject": "inner"}, "Task #2 created successfully: inner"),
-            "tu-ub1": ToolContent({"taskId": "2", "status": "in_progress"}, "ok"),
-            "tu-ub2": ToolContent({"taskId": "2", "status": "completed"}, "ok"),
+    def test_sibling_in_a_non_anchor_interaction_is_not_wrapped(self) -> None:
+        # The wrap never crosses an interaction boundary: a work span living in a different
+        # interaction (which holds no anchor marker) keeps its own interaction parent.
+        traces = self._traces()
+        other = _obs(
+            "iX",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:09Z",
+            endTime="2026-01-02T00:00:11Z",
+        )
+        stray = _ledger_child(
+            "wx",
+            "tool:Read",
+            "tu-x",
+            parent="iX",
+            start="2026-01-02T00:00:10Z",
+            end="2026-01-02T00:00:10Z",
+        )
+        traces[0][1].extend([other, stray])
+
+        batch = build_batch(traces, SPOKE, self._content())
+
+        assert (
+            _by_orig(batch, "tr", "wx")["body"]["parentObservationId"]
+            == _by_orig(batch, "tr", "iX")["id"]
+        )
+
+    def _cross_turn_content(self) -> dict[str, ToolContent]:
+        return {
+            "tu-c1": ToolContent({"subject": "S4 GREEN"}, "Task #4 created successfully: S4 GREEN"),
+            "tu-u1": ToolContent({"taskId": "4", "status": "in_progress"}, "ok"),
+            "tu-u2": ToolContent({"taskId": "4", "status": "completed"}, "ok"),
         }
-        outer = [
-            _ledger_obs(
-                "ca",
+
+    def _cross_turn_traces(self, *, with_b_work: bool = True) -> list[tuple[str, list[dict]]]:
+        # Turn A: create + in_progress + a work span. Turn B: (a work span +) completed.
+        turn_a = _obs(
+            "iA",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+        )
+        create = _ledger_child(
+            "tc1",
+            "tool:TaskCreate",
+            "tu-c1",
+            parent="iA",
+            start="2026-01-02T00:00:00Z",
+            end="2026-01-02T00:00:00Z",
+        )
+        started = _ledger_child(
+            "tu1",
+            "tool:TaskUpdate",
+            "tu-u1",
+            parent="iA",
+            start="2026-01-02T00:00:01Z",
+            end="2026-01-02T00:00:01Z",
+        )
+        work_a = _ledger_child(
+            "wa",
+            "tool:Edit",
+            "tu-wa",
+            parent="iA",
+            start="2026-01-02T00:00:05Z",
+            end="2026-01-02T00:00:06Z",
+        )
+        turn_b = _obs(
+            "iB",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:12Z",
+            endTime="2026-01-02T00:00:25Z",
+        )
+        done = _ledger_child(
+            "tu2",
+            "tool:TaskUpdate",
+            "tu-u2",
+            parent="iB",
+            start="2026-01-02T00:00:20Z",
+            end="2026-01-02T00:00:21Z",
+        )
+        objs = [turn_a, create, started, work_a, turn_b]
+        if with_b_work:
+            objs.append(
+                _ledger_child(
+                    "wb",
+                    "tool:Edit",
+                    "tu-wb",
+                    parent="iB",
+                    start="2026-01-02T00:00:15Z",
+                    end="2026-01-02T00:00:16Z",
+                )
+            )
+        objs.append(done)
+        return [("tr", objs)]
+
+    def test_cross_turn_task_wraps_in_each_anchor_interaction(self) -> None:
+        batch = build_batch(self._cross_turn_traces(), SPOKE, self._cross_turn_content())
+
+        steps = [e for e in batch if e["id"].startswith(_STEP_PREFIX)]
+        assert len(steps) == 2
+        assert {e["body"]["parentObservationId"] for e in steps} == {
+            _by_orig(batch, "tr", "iA")["id"],
+            _by_orig(batch, "tr", "iB")["id"],
+        }
+
+    def test_cross_turn_wraps_only_local_siblings(self) -> None:
+        batch = build_batch(self._cross_turn_traces(), SPOKE, self._cross_turn_content())
+
+        by_parent = _steps_by_parent(batch)
+        assert (
+            _by_orig(batch, "tr", "wa")["body"]["parentObservationId"]
+            == by_parent[_by_orig(batch, "tr", "iA")["id"]]
+        )
+        assert (
+            _by_orig(batch, "tr", "wb")["body"]["parentObservationId"]
+            == by_parent[_by_orig(batch, "tr", "iB")["id"]]
+        )
+
+    def test_cross_turn_interaction_without_local_siblings_is_suppressed(self) -> None:
+        # Turn B holds only the completed marker (no work span), so it gets no step node.
+        batch = build_batch(
+            self._cross_turn_traces(with_b_work=False), SPOKE, self._cross_turn_content()
+        )
+
+        steps = [e for e in batch if e["id"].startswith(_STEP_PREFIX)]
+        assert len(steps) == 1
+        assert steps[0]["body"]["parentObservationId"] == _by_orig(batch, "tr", "iA")["id"]
+
+    def test_innermost_window_wins_within_one_interaction(self) -> None:
+        # Two ledger windows overlap inside ONE interaction; a work span inside both nests under
+        # the inner (later-starting) step.
+        content = {
+            "tu-co": ToolContent({"subject": "outer"}, "Task #1 created successfully: outer"),
+            "tu-os": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
+            "tu-oe": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
+            "tu-ci": ToolContent({"subject": "inner"}, "Task #2 created successfully: inner"),
+            "tu-is": ToolContent({"taskId": "2", "status": "in_progress"}, "ok"),
+            "tu-ie": ToolContent({"taskId": "2", "status": "completed"}, "ok"),
+        }
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:35Z",
+        )
+        spans = [
+            interaction,
+            _ledger_child(
+                "co",
                 "tool:TaskCreate",
-                "tu-ca",
+                "tu-co",
+                parent="i1",
                 start="2026-01-02T00:00:00Z",
                 end="2026-01-02T00:00:00Z",
             ),
-            _ledger_obs(
-                "ua1",
+            _ledger_child(
+                "os",
                 "tool:TaskUpdate",
-                "tu-ua1",
+                "tu-os",
+                parent="i1",
                 start="2026-01-02T00:00:01Z",
                 end="2026-01-02T00:00:01Z",
             ),
-            _ledger_obs(
-                "ua2",
+            _ledger_child(
+                "ci",
+                "tool:TaskCreate",
+                "tu-ci",
+                parent="i1",
+                start="2026-01-02T00:00:04Z",
+                end="2026-01-02T00:00:04Z",
+            ),
+            _ledger_child(
+                "is",
                 "tool:TaskUpdate",
-                "tu-ua2",
+                "tu-is",
+                parent="i1",
+                start="2026-01-02T00:00:05Z",
+                end="2026-01-02T00:00:05Z",
+            ),
+            _ledger_child(
+                "wk",
+                "tool:Edit",
+                "tu-wk",
+                parent="i1",
+                start="2026-01-02T00:00:10Z",
+                end="2026-01-02T00:00:11Z",
+            ),
+            _ledger_child(
+                "ie",
+                "tool:TaskUpdate",
+                "tu-ie",
+                parent="i1",
+                start="2026-01-02T00:00:20Z",
+                end="2026-01-02T00:00:20Z",
+            ),
+            _ledger_child(
+                "oe",
+                "tool:TaskUpdate",
+                "tu-oe",
+                parent="i1",
                 start="2026-01-02T00:00:30Z",
                 end="2026-01-02T00:00:30Z",
             ),
         ]
-        inner = [
-            _ledger_obs(
-                "cb",
-                "tool:TaskCreate",
-                "tu-cb",
-                start="2026-01-02T00:00:05Z",
-                end="2026-01-02T00:00:05Z",
-            ),
-            _ledger_obs(
-                "ub1",
-                "tool:TaskUpdate",
-                "tu-ub1",
-                start="2026-01-02T00:00:06Z",
-                end="2026-01-02T00:00:06Z",
-            ),
-            _ledger_obs(
-                "ub2",
-                "tool:TaskUpdate",
-                "tu-ub2",
-                start="2026-01-02T00:00:20Z",
-                end="2026-01-02T00:00:20Z",
-            ),
-        ]
-        marker = _root_marker("mk", "spoke-push", "2026-01-02T00:00:10Z")
 
-        batch = build_batch([("tr", [*outer, *inner, marker])], SPOKE, content)
+        batch = build_batch([("tr", spans)], SPOKE, content)
 
         steps = {e["body"]["name"]: e["id"] for e in batch if e["id"].startswith(_STEP_PREFIX)}
-        assert _by_orig(batch, "tr", "mk")["body"]["parentObservationId"] == steps["step:inner"]
+        assert _by_orig(batch, "tr", "wk")["body"]["parentObservationId"] == steps["step:inner"]
 
 
 def _audit_event(obs_id: str, name: str, *, start: str | None = None, **metadata) -> dict:
@@ -1853,14 +2073,16 @@ class TestAuditInstantPlacement:
         assert _by_orig(batch, "tr", "tb")["body"]["metadata"]["decision"] == "reject"
 
     def test_real_marker_inside_a_window_is_still_grouped(self) -> None:
-        # The exclusion must not over-capture: a genuine duration marker still re-homes by window.
+        # The exclusion must not over-capture: a genuine duration marker that is an
+        # interaction-internal sibling within the window still re-homes under its step (#113).
         traces = self._ledger_traces()
-        marker = _obs("m1", "spoke-push", parent=None, startTime="2026-01-02T00:00:05Z")
+        marker = _obs("m1", "spoke-push", parent="i1", startTime="2026-01-02T00:00:05Z")
         traces[0][1].append(marker)
 
         batch = build_batch(traces, SPOKE, self._content())
 
         step = _step_node(batch)
+        assert step is not None
         assert _by_orig(batch, "tr", "m1")["body"]["parentObservationId"] == step["id"]
 
     def test_audit_events_are_idempotent_across_reruns(self) -> None:
