@@ -281,8 +281,8 @@ WT_COLLECTOR_PORT_FLAGS="-p 4317:4317 -p 4318:4318 -p 4418:4418 -p 8889:8889"
 # mtime) is the right signal because the config is bind-mounted — the running
 # container's mounted file already equals on-disk, and a per-worktree checkout
 # rewrites mtimes without changing content. Any real change to config, ports, or
-# image bumps the signature. Empty when the config is unreadable (caller then
-# leaves the running instance untouched). Split out so it is overridable in tests.
+# image bumps the signature. Empty when the config is missing (caller then leaves
+# the running instance untouched). Split out so it is overridable in tests.
 # Args: $1 = repo root (holds dashboard/langfuse/otelcol.yaml).
 wt_collector_config_version() {
   local cfg="$1/dashboard/langfuse/otelcol.yaml"
