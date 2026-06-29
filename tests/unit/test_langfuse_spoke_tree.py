@@ -1742,6 +1742,38 @@ class TestStepGrouping:
             == by_parent[_by_orig(batch, "tr", "iB")["id"]]
         )
 
+    def test_cross_turn_markers_absorbed_into_their_local_step(self) -> None:
+        # Each partial wrap absorbs only the ledger markers physically under it: TaskCreate +
+        # in_progress land under turn A's step, completed under turn B's step.
+        batch = build_batch(self._cross_turn_traces(), SPOKE, self._cross_turn_content())
+
+        by_parent = _steps_by_parent(batch)
+        step_a = by_parent[_by_orig(batch, "tr", "iA")["id"]]
+        step_b = by_parent[_by_orig(batch, "tr", "iB")["id"]]
+        assert _by_orig(batch, "tr", "tc1")["body"]["parentObservationId"] == step_a
+        assert _by_orig(batch, "tr", "tu1")["body"]["parentObservationId"] == step_a
+        assert _by_orig(batch, "tr", "tu2")["body"]["parentObservationId"] == step_b
+
+    def test_audit_instant_under_the_interaction_is_not_window_placed(self) -> None:
+        # A skill_activated that resolves to the anchor interaction (shared prompt.id) must NOT be
+        # pulled into the step by its lagging startTime — it stays directly under the interaction.
+        traces = self._traces()
+        traces[0][1][0]["metadata"] = {"attributes": {"prompt.id": "p1"}}  # interaction i1
+        skill = _audit_event(
+            "sk1",
+            "skill_activated",
+            start="2026-01-02T00:00:06Z",
+            **{"prompt.id": "p1", "skill.name": "source-task"},
+        )
+        traces[0][1].append(skill)
+
+        batch = build_batch(traces, SPOKE, self._content())
+
+        assert (
+            _by_orig(batch, "tr", "sk1")["body"]["parentObservationId"]
+            == _by_orig(batch, "tr", "i1")["id"]
+        )
+
     def test_cross_turn_interaction_without_local_siblings_is_suppressed(self) -> None:
         # Turn B holds only the completed marker (no work span), so it gets no step node.
         batch = build_batch(

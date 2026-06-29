@@ -294,8 +294,10 @@ class StepWindow(NamedTuple):
     """One solo-cycle step derived from the todo ledger (#100).
 
     The ``subject`` is the ``TaskCreate`` title (``S1 RED: …``); the window spans the task's
-    ``in_progress`` ``TaskUpdate`` start to its ``completed`` ``TaskUpdate`` end. Every timeline
-    node whose ``startTime`` falls in ``[start, end]`` is re-homed under the step node.
+    ``in_progress`` ``TaskUpdate`` start to its ``completed`` ``TaskUpdate`` end. In View A the
+    same-parent interaction siblings whose ``startTime`` falls in ``[start, end]`` re-home under a
+    local step node (:func:`_apply_step_grouping`); in View B every reliably-timestamped span in
+    the window re-homes under the cycle step.
     """
 
     task_id: str
@@ -1393,7 +1395,6 @@ def _apply_step_grouping(
     traces: list[TraceObservations],
     tool_content: dict[str, ToolContent],
     *,
-    root_id: str,
     spoke_run_id: str,
     trace_id: str,
 ) -> list[IngestEvent]:
@@ -1413,14 +1414,12 @@ def _apply_step_grouping(
         copies: The re-parented source observation copies; wrapped children are mutated in place.
         traces: The source traces (for ledger windows + marker copy ids).
         tool_content: Tool-call-id to :class:`ToolContent` (the ledger ops' input/output).
-        root_id: The synthetic root span id (unused now; kept for the assembler's call site).
         spoke_run_id: The spoke run identifier (for deterministic step ids).
         trace_id: The assembled trace id every step node references.
 
     Returns:
         The new step span events (empty when the spoke has no ledger windows).
     """
-    del root_id  # the wrap parents are the interactions, not the synthetic root
     windows = build_step_windows(traces, tool_content)
     if not windows:
         return []
@@ -1433,7 +1432,7 @@ def _apply_step_grouping(
     windows_by_parent, parents_by_task = _anchor_parents(windows, markers, by_id)
     step_events: list[IngestEvent] = []
     for window in windows:
-        for parent in parents_by_task.get(window.task_id, set()):
+        for parent in sorted(parents_by_task.get(window.task_id, set())):
             members = _wrap_members(
                 parent, window, children, by_id, windows_by_parent, all_marker_ids
             )
@@ -1536,7 +1535,7 @@ def build_batch(
     copies = _fold_tool_subspans(copies, traces, tool_index)
     copies = _collapse_startup_instants(copies, root_event)
     step_events = _apply_step_grouping(
-        copies, traces, tool_content, root_id=root_id, spoke_run_id=spoke_run_id, trace_id=trace_id
+        copies, traces, tool_content, spoke_run_id=spoke_run_id, trace_id=trace_id
     )
     events = [trace_event, root_event, *step_events, *copies]
     _apply_container_rollups(events)
