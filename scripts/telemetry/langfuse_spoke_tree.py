@@ -1100,9 +1100,13 @@ def _is_interaction(observation: Observation) -> bool:
     return (observation.get("name") or "") == _INTERACTION_NAME
 
 
-def _step_id(spoke_run_id: str, task_id: str) -> str:
-    """Return the deterministic id of one cycle-step node for a spoke."""
-    digest = hashlib.sha1(f"{spoke_run_id}:step:{task_id}".encode()).hexdigest()[:24]
+def _step_id(spoke_run_id: str, task_id: str, parent_id: str) -> str:
+    """Return the deterministic id of one cycle-step node for a spoke.
+
+    Keyed by the wrap's parent as well as the task, so a cross-turn task that produces a
+    partial wrap in more than one interaction gets a distinct, stable id per interaction (#113).
+    """
+    digest = hashlib.sha1(f"{spoke_run_id}:step:{task_id}:{parent_id}".encode()).hexdigest()[:24]
     return _STEP_PREFIX + digest
 
 
@@ -1235,8 +1239,8 @@ def _containing_window(start: str, windows: list[StepWindow]) -> StepWindow | No
     return chosen
 
 
-def _step_event(window: StepWindow, step_id: str, root_id: str, trace_id: str) -> IngestEvent:
-    """Shape one cycle-step span-create event under the synthetic root."""
+def _step_event(window: StepWindow, step_id: str, parent_id: str, trace_id: str) -> IngestEvent:
+    """Shape one cycle-step span-create event nested under ``parent_id`` (the local wrap parent)."""
     return {
         "id": step_id,
         "type": "span-create",
@@ -1244,7 +1248,7 @@ def _step_event(window: StepWindow, step_id: str, root_id: str, trace_id: str) -
         "body": {
             "id": step_id,
             "traceId": trace_id,
-            "parentObservationId": root_id,
+            "parentObservationId": parent_id,
             "name": f"step:{window.subject}",
             "startTime": window.start,
             "endTime": window.end,
@@ -1288,6 +1292,102 @@ def _collapse_startup_instants(
     return kept
 
 
+class _LedgerMarkers(NamedTuple):
+    """Copy ids of one task's ledger markers (#113).
+
+    ``create`` is the ``TaskCreate`` copy id(s); ``anchors`` is the ``in_progress`` / ``completed``
+    ``TaskUpdate`` copy ids whose parent locates the local wrap. Both are absorbed under the step.
+    """
+
+    create: set[str]
+    anchors: set[str]
+
+
+def _ledger_marker_ids(
+    traces: list[TraceObservations], tool_content: dict[str, ToolContent]
+) -> dict[str, _LedgerMarkers]:
+    """Map each task id to the copy ids of its ``TaskCreate`` + ``in_progress``/``completed`` markers."""
+    markers: dict[str, _LedgerMarkers] = {}
+    for orig_trace_id, observations in traces:
+        for observation in observations:
+            name = observation.get("name") or ""
+            content = tool_content.get(_tool_use_id(observation) or "")
+            if content is None or not isinstance(content.input, dict):
+                continue
+            copy_id = _copy_id(orig_trace_id, observation["id"])
+            if name == "tool:TaskCreate":
+                task_id = _task_id_from_create(content.output)
+                if task_id:
+                    markers.setdefault(task_id, _LedgerMarkers(set(), set())).create.add(copy_id)
+            elif name == "tool:TaskUpdate" and content.input.get("status") in (
+                "in_progress",
+                "completed",
+            ):
+                task_id = str(content.input.get("taskId") or "")
+                if task_id:
+                    markers.setdefault(task_id, _LedgerMarkers(set(), set())).anchors.add(copy_id)
+    return markers
+
+
+def _anchor_parents(
+    windows: list[StepWindow],
+    markers: dict[str, _LedgerMarkers],
+    by_id: dict[str, dict[str, Any]],
+) -> tuple[dict[str, list[StepWindow]], dict[str, set[str]]]:
+    """Resolve each task's anchor parents (where its anchor markers sit) and group windows by them.
+
+    Returns ``(windows_by_parent, parents_by_task)``: the first maps a parent copy id to the
+    windows anchored under it (in start order, for the innermost-wins tie-break); the second maps
+    a task id to the set of parents that hold its ``in_progress`` / ``completed`` markers.
+    """
+    windows_by_parent: dict[str, list[StepWindow]] = {}
+    parents_by_task: dict[str, set[str]] = {}
+    for window in windows:
+        slots = markers.get(window.task_id)
+        if slots is None:
+            continue
+        parents = {by_id[c]["parentObservationId"] for c in slots.anchors if c in by_id}
+        parents_by_task[window.task_id] = parents
+        for parent in parents:
+            windows_by_parent.setdefault(parent, []).append(window)
+    return windows_by_parent, parents_by_task
+
+
+def _wrap_members(
+    parent: str,
+    window: StepWindow,
+    children: dict[str, list[str]],
+    by_id: dict[str, dict[str, Any]],
+    windows_by_parent: dict[str, list[StepWindow]],
+    all_marker_ids: set[str],
+) -> list[str]:
+    """Return ``parent``'s non-marker children whose innermost in-window step is ``window``.
+
+    A child qualifies when it is not a ledger marker, not a lagging-timestamped audit instant
+    (#104), and its ``startTime`` falls in ``window`` — with the innermost (latest-starting)
+    window among those anchored at ``parent`` deciding ties on overlap.
+    """
+    members: list[str] = []
+    for child in children.get(parent, []):
+        if child in all_marker_ids:
+            continue
+        body = by_id[child]
+        if _is_audit_instant(body):
+            continue
+        start = body.get("startTime")
+        if not start or not (window.start <= start <= window.end):
+            continue
+        if _containing_window(start, windows_by_parent[parent]) is window:
+            members.append(child)
+    return members
+
+
+def _task_marker_ids(task_id: str, markers: dict[str, _LedgerMarkers]) -> set[str]:
+    """Return the task's ledger marker copy ids (``TaskCreate`` + the two ``TaskUpdate`` anchors)."""
+    slots = markers[task_id]
+    return slots.create | slots.anchors
+
+
 def _apply_step_grouping(
     copies: list[IngestEvent],
     traces: list[TraceObservations],
@@ -1297,53 +1397,57 @@ def _apply_step_grouping(
     spoke_run_id: str,
     trace_id: str,
 ) -> list[IngestEvent]:
-    """Group the flat root-level satellites under their cycle step (#100), in place.
+    """Wrap each ledger step's local same-parent siblings in a ``step:`` node, in place (#113).
 
-    Only the synthetic-root's OWN satellite children move: the ``step:*`` / ``lifecycle:*``
-    markers, the ``mcp`` / ``spoke-push`` / ``script:ready`` script spans, and the gate hooks
-    that did not match a tool. When such a root child's ``startTime`` falls in a step window it is
-    re-parented under that step node (innermost wins on overlap). A denied gate hook that
-    :func:`_enclosing_turn` already re-homed to its interaction (#110) is no longer a root child,
-    so it lands under the turn — the truer causal parent — and is correctly skipped here.
-
-    The ``claude_code.interaction`` subtrees are LEFT UNTOUCHED at the root — their per-turn
-    structure and W3C-TRACEPARENT nesting (a resume can legitimately nest under an earlier
-    command's ``tool.execution``) reflect causal reality and are never flattened. Because tools
-    and turns live under those interactions (not at the root), they are naturally excluded.
+    For every step window, a ``step:<subject>`` node is inserted INSIDE the interaction(s) that
+    hold the task's ``in_progress`` / ``completed`` markers, wrapping the contiguous run of
+    same-parent siblings whose ``startTime`` falls in the window and absorbing the task's three
+    ledger markers (``TaskCreate`` + the two ``TaskUpdate`` anchors). The wrap never crosses an
+    interaction boundary, so a cross-turn task yields one partial wrap per anchor-holding
+    interaction; a wrap with zero non-marker siblings is suppressed (no empty steps). Audit
+    instants are excluded — their lagging timestamp must never window-place them (#104). The
+    ``claude_code.interaction`` subtrees and their W3C-TRACEPARENT nesting are otherwise left
+    untouched; root-level satellites are no longer grouped here (View B is the cycle lens).
 
     Args:
-        copies: The re-parented source observation copies; root-level satellites are mutated
-            in place.
-        traces: The source traces (for ledger windows + interaction detection).
+        copies: The re-parented source observation copies; wrapped children are mutated in place.
+        traces: The source traces (for ledger windows + marker copy ids).
         tool_content: Tool-call-id to :class:`ToolContent` (the ledger ops' input/output).
-        root_id: The synthetic root span id.
+        root_id: The synthetic root span id (unused now; kept for the assembler's call site).
         spoke_run_id: The spoke run identifier (for deterministic step ids).
         trace_id: The assembled trace id every step node references.
 
     Returns:
         The new step span events (empty when the spoke has no ledger windows).
     """
+    del root_id  # the wrap parents are the interactions, not the synthetic root
     windows = build_step_windows(traces, tool_content)
     if not windows:
         return []
-    interaction_ids = {
-        _copy_id(orig_trace_id, observation["id"])
-        for orig_trace_id, observations in traces
-        for observation in observations
-        if _is_interaction(observation)
-    }
-    step_ids = {window.task_id: _step_id(spoke_run_id, window.task_id) for window in windows}
-    step_events = [_step_event(w, step_ids[w.task_id], root_id, trace_id) for w in windows]
-    for event in copies:
-        body = event["body"]
-        if body.get("parentObservationId") != root_id or body["id"] in interaction_ids:
-            continue  # only the root's own non-interaction satellites move
-        if _is_audit_instant(body):
-            continue  # #104: a lagging-timestamped audit instant is never window-placed by it
-        start = body.get("startTime")
-        window = _containing_window(start, windows) if start else None
-        if window is not None:
-            body["parentObservationId"] = step_ids[window.task_id]
+    by_id = {event["body"]["id"]: event["body"] for event in copies}
+    markers = _ledger_marker_ids(traces, tool_content)
+    all_marker_ids = {c for m in markers.values() for c in (m.create | m.anchors)}
+    children: dict[str, list[str]] = {}
+    for body in by_id.values():
+        children.setdefault(body.get("parentObservationId"), []).append(body["id"])
+    windows_by_parent, parents_by_task = _anchor_parents(windows, markers, by_id)
+    step_events: list[IngestEvent] = []
+    for window in windows:
+        for parent in parents_by_task.get(window.task_id, set()):
+            members = _wrap_members(
+                parent, window, children, by_id, windows_by_parent, all_marker_ids
+            )
+            if not members:
+                continue  # suppress a wrap with zero non-marker siblings
+            step_id = _step_id(spoke_run_id, window.task_id, parent)
+            step_events.append(_step_event(window, step_id, parent, trace_id))
+            absorbed = members + [
+                c
+                for c in _task_marker_ids(window.task_id, markers)
+                if c in by_id and by_id[c]["parentObservationId"] == parent
+            ]
+            for cid in absorbed:
+                by_id[cid]["parentObservationId"] = step_id
     return step_events
 
 
@@ -1362,10 +1466,10 @@ def build_batch(
     :func:`_tool_additions`).
 
     When the spoke ran a solo cycle, the todo ledger yields per-phase step nodes
-    (:func:`build_step_windows`) under the root, and the root's own flat satellites (markers,
-    lifecycle, script, and unmatched hook spans) re-home under the step whose window contains
-    them (:func:`_apply_step_grouping`); the ``claude_code.interaction`` subtrees are left
-    untouched. A non-ledger spoke emits no step nodes.
+    (:func:`build_step_windows`) inserted INSIDE each interaction, wrapping the contiguous run of
+    same-parent siblings between the task's ``in_progress`` / ``completed`` markers
+    (:func:`_apply_step_grouping`, View A); the rest of the ``claude_code.interaction`` subtrees
+    are left untouched. A non-ledger spoke emits no step nodes.
 
     Args:
         traces: Each source trace paired with all of its observations, as fetched from
