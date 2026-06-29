@@ -152,6 +152,20 @@ _ROOT_PREFIX = "spokeroot-"
 _COPY_PREFIX = "tree-"
 # Deterministic id prefix for the synthetic cycle-step nodes (#100, derived from the ledger).
 _STEP_PREFIX = "tree-step-"
+# View B (#113) — the second "steps -> work" trace assembled from the same observation copies,
+# re-homed onto a pure cycle axis (preStep / step:N / postStep). Its ids live in a separate
+# namespace so its copies never collide with View A's in the local Langfuse store.
+_CYCLE_TRACE_PREFIX = "spokecycle-"
+_CYCLE_ROOT_PREFIX = "spokecycleroot-"
+_CYCLE_COPY_PREFIX = "cyc-"
+_CYCLE_STEP_PREFIX = "cycstep-"
+_CYCLE_TRACE_NAME_PREFIX = "spoke-cycle:"
+_CYCLE_ROOT_NAME_PREFIX = "cycle:"
+# The cycle-axis bookend node names + the keys that map to their synthetic ids.
+_PRE_STEP_KEY = "pre"
+_POST_STEP_KEY = "post"
+_PRE_STEP_NAME = "preStep"
+_POST_STEP_NAME = "postStep"
 # Deterministic id prefix for the numeric Langfuse scores (#100 amendment: chartable time budget).
 _SCORE_PREFIX = "tree-score-"
 # Score names — Langfuse sums/charts numeric scores (it cannot chart arbitrary metadata).
@@ -343,6 +357,32 @@ def _copy_id(orig_trace_id: str, orig_obs_id: str) -> str:
     """Return the deterministic copy id for a source observation in the assembled trace."""
     digest = hashlib.sha1(f"{orig_trace_id}:{orig_obs_id}".encode()).hexdigest()[:24]
     return _COPY_PREFIX + digest
+
+
+def cycle_trace_id_for(spoke_run_id: str) -> str:
+    """Return the deterministic trace id for a spoke's View B (steps -> work) trace."""
+    return _CYCLE_TRACE_PREFIX + hashlib.sha1(spoke_run_id.encode()).hexdigest()[:16]
+
+
+def cycle_root_id_for(spoke_run_id: str) -> str:
+    """Return the deterministic id of the View B synthetic root span for a spoke."""
+    return _CYCLE_ROOT_PREFIX + hashlib.sha1(spoke_run_id.encode()).hexdigest()[:16]
+
+
+def _cycle_copy_id(view_a_copy_id: str) -> str:
+    """Map a View A copy id into the View B namespace, preserving its stable digest."""
+    return _CYCLE_COPY_PREFIX + view_a_copy_id[len(_COPY_PREFIX) :]
+
+
+def cycle_copy_id_for(orig_trace_id: str, orig_obs_id: str) -> str:
+    """Return the deterministic View B copy id for a source observation."""
+    return _cycle_copy_id(_copy_id(orig_trace_id, orig_obs_id))
+
+
+def _cycle_step_id(spoke_run_id: str, key: str) -> str:
+    """Return the deterministic id of one View B cycle-axis node (``pre`` / ``post`` / a task id)."""
+    digest = hashlib.sha1(f"{spoke_run_id}:cycle:{key}".encode()).hexdigest()[:24]
+    return _CYCLE_STEP_PREFIX + digest
 
 
 def _tool_use_id(observation: Observation) -> str | None:
@@ -1540,6 +1580,15 @@ def build_batch(
     events = [trace_event, root_event, *step_events, *copies]
     _apply_container_rollups(events)
     return events
+
+
+def build_cycle_batch(
+    traces: list[TraceObservations],
+    spoke_run_id: str,
+    tool_content: dict[str, ToolContent] | None = None,
+) -> list[IngestEvent]:
+    """Assemble the View B (steps -> work) ``spokecycle-<spoke>`` trace (#113)."""
+    raise NotImplementedError  # GREEN fills this in
 
 
 def all_traces(spoke_run_id: str, get: GetFn) -> list[dict[str, Any]]:
