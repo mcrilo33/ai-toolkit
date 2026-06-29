@@ -77,11 +77,41 @@ def _preflight(*, gate: bool, auth: bool, port_up: bool) -> subprocess.Completed
     is replaced with a marker echo, so a started bridge prints ``LAUNCHED <repo>``
     and nothing real is spawned. The gate (AI_TOOLKIT_OTEL) and LANGFUSE_BASIC_AUTH
     are set/unset explicitly so a host value can never steer the decision.
+    wt_bridge_pid is stubbed to "no running bridge" so the already-up path is a
+    clean no-op here (its restart behaviour is covered by the dedicated tests
+    below) and never probes the real :4319 socket.
     """
     parts = [
         f"wt_port_listening() {{ return {0 if port_up else 1}; }}",
         'wt_bridge_launch() { echo "LAUNCHED $1"; }',
+        'wt_bridge_pid() { printf ""; }',
         "export AI_TOOLKIT_OTEL=1" if gate else "unset AI_TOOLKIT_OTEL",
+        "export LANGFUSE_BASIC_AUTH=Basic-xyz" if auth else "unset LANGFUSE_BASIC_AUTH",
+        "wt_otel_bridge_preflight /repo",
+    ]
+    return _call("; ".join(parts))
+
+
+def _bridge_preflight_up(
+    *, proc_start: int, source_mtime: int, pid: str = "4242", auth: bool = True
+) -> subprocess.CompletedProcess[str]:
+    """Run wt_otel_bridge_preflight with the bridge UP and staleness stubbed.
+
+    The port probe is forced up and the staleness signal is driven directly:
+    wt_bridge_pid (the :4319 listener pid), wt_proc_start_epoch (when it started),
+    and wt_bridge_source_mtime (newest mtime of the bridge's source bundle).
+    wt_bridge_kill / wt_bridge_launch are marker echoes, so a recycle prints
+    ``KILLED <pid>`` then ``LAUNCHED <repo>`` and nothing real is signalled or
+    spawned.
+    """
+    parts = [
+        "wt_port_listening() { return 0; }",
+        f'wt_bridge_pid() {{ printf "%s" "{pid}"; }}',
+        f'wt_proc_start_epoch() {{ printf "%s" "{proc_start}"; }}',
+        f'wt_bridge_source_mtime() {{ printf "%s" "{source_mtime}"; }}',
+        'wt_bridge_kill() { echo "KILLED $1"; }',
+        'wt_bridge_launch() { echo "LAUNCHED $1"; }',
+        "export AI_TOOLKIT_OTEL=1",
         "export LANGFUSE_BASIC_AUTH=Basic-xyz" if auth else "unset LANGFUSE_BASIC_AUTH",
         "wt_otel_bridge_preflight /repo",
     ]
@@ -155,6 +185,73 @@ def test_bridge_launch_forwards_required_env_to_child(tmp_path: Path) -> None:
     recorded = dump.read_text()
     assert "LANGFUSE_BASIC_AUTH=tok-xyz" in recorded
     assert "BRIDGE_PORT=4321" in recorded
+
+
+def test_bridge_preflight_recycles_stale_source() -> None:
+    # Up, gate on, auth present, but the bridge's source bundle was modified after
+    # the running process started (a bridge-code change landed) → kill + relaunch.
+    result = _bridge_preflight_up(proc_start=1000, source_mtime=2000, pid="4242")
+
+    assert result.returncode == 0, result.stderr
+    assert "KILLED 4242" in result.stdout
+    assert "LAUNCHED /repo" in result.stdout
+
+
+def test_bridge_preflight_leaves_current_process() -> None:
+    # Up and the process started AFTER its newest source mtime → no churn: never
+    # kill/relaunch an up-to-date bridge (no restart loop).
+    result = _bridge_preflight_up(proc_start=2000, source_mtime=1000, pid="4242")
+
+    assert result.returncode == 0, result.stderr
+    assert "KILLED" not in result.stdout
+    assert "LAUNCHED" not in result.stdout
+
+
+def test_bridge_preflight_noop_when_no_pid() -> None:
+    # Up but no listener pid resolves (lsof found nothing / unavailable) → can't
+    # prove staleness, so leave it untouched (best-effort).
+    result = _bridge_preflight_up(proc_start=1000, source_mtime=2000, pid="")
+
+    assert result.returncode == 0, result.stderr
+    assert "KILLED" not in result.stdout
+    assert "LAUNCHED" not in result.stdout
+
+
+def test_bridge_preflight_stale_but_auth_missing_leaves_process() -> None:
+    # Stale source but LANGFUSE_BASIC_AUTH unset → don't kill a working bridge for
+    # an un-authable replacement; warn and leave it running.
+    result = _bridge_preflight_up(proc_start=1000, source_mtime=2000, pid="4242", auth=False)
+
+    assert result.returncode == 0, result.stderr
+    assert "KILLED" not in result.stdout
+    assert "LAUNCHED" not in result.stdout
+    assert "LANGFUSE_BASIC_AUTH" in result.stderr
+
+
+def test_bridge_pid_resolves_via_lsof_not_pgrep(tmp_path: Path) -> None:
+    # The bridge pid MUST be found via lsof on :4319, never pgrep -f — pgrep
+    # false-negatives on non-ASCII argv under a non-UTF8 locale. Stub both on PATH:
+    # lsof yields a pid; pgrep records if it was (wrongly) consulted.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    pgrep_marker = tmp_path / "pgrep-called.txt"
+    lsof = bindir / "lsof"
+    lsof.write_text("#!/bin/sh\necho 9999\n")
+    lsof.chmod(0o755)
+    pgrep = bindir / "pgrep"
+    pgrep.write_text(f'#!/bin/sh\necho called > "{pgrep_marker}"\n')
+    pgrep.chmod(0o755)
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
+
+    result = subprocess.run(
+        ["bash", "-c", f'source "{WT_LIB}"; wt_bridge_pid 4319'],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == "9999", result.stderr
+    assert not pgrep_marker.exists(), "wt_bridge_pid must not consult pgrep"
 
 
 # --- native-OTel collector preflight (auto-ensure) ----------------------------
