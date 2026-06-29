@@ -3046,9 +3046,7 @@ def _has_cycle_copy(batch: list[dict], orig_trace_id: str, orig_obs_id: str) -> 
 def _cycle_step(batch: list[dict], name: str) -> dict:
     """Return the View B cycle-axis node (preStep / step:N / postStep) with the given name."""
     return next(
-        e
-        for e in batch
-        if e["id"].startswith(_CYCLE_STEP_PREFIX) and e["body"]["name"] == name
+        e for e in batch if e["id"].startswith(_CYCLE_STEP_PREFIX) and e["body"]["name"] == name
     )
 
 
@@ -3071,45 +3069,91 @@ class TestCycleView:
 
     def _traces(self) -> list[tuple[str, list[dict]]]:
         interaction = _obs(
-            "i1", "claude_code.interaction", parent=None,
-            startTime="2026-01-02T00:00:00Z", endTime="2026-01-02T00:00:40Z",
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:40Z",
         )
         pre_tool = _ledger_child(
-            "pt", "tool:Read", "tu-pt", parent="i1",
-            start="2026-01-02T00:00:00Z", end="2026-01-02T00:00:01Z",
+            "pt",
+            "tool:Read",
+            "tu-pt",
+            parent="i1",
+            start="2026-01-02T00:00:00Z",
+            end="2026-01-02T00:00:01Z",
         )
         create = _ledger_child(
-            "tc1", "tool:TaskCreate", "tu-c1", parent="i1",
-            start="2026-01-02T00:00:02Z", end="2026-01-02T00:00:02Z",
+            "tc1",
+            "tool:TaskCreate",
+            "tu-c1",
+            parent="i1",
+            start="2026-01-02T00:00:02Z",
+            end="2026-01-02T00:00:02Z",
         )
         started = _ledger_child(
-            "tu1", "tool:TaskUpdate", "tu-u1", parent="i1",
-            start="2026-01-02T00:00:05Z", end="2026-01-02T00:00:05Z",
+            "tu1",
+            "tool:TaskUpdate",
+            "tu-u1",
+            parent="i1",
+            start="2026-01-02T00:00:05Z",
+            end="2026-01-02T00:00:05Z",
         )
         work_tool = _ledger_child(
-            "wt", "tool:Edit", "tu-w", parent="i1",
-            start="2026-01-02T00:00:10Z", end="2026-01-02T00:00:11Z",
+            "wt",
+            "tool:Edit",
+            "tu-w",
+            parent="i1",
+            start="2026-01-02T00:00:10Z",
+            end="2026-01-02T00:00:11Z",
         )
         work_gen = _obs(
-            "wg", "claude_code.llm_request", type_="GENERATION", parent="i1",
-            startTime="2026-01-02T00:00:12Z", endTime="2026-01-02T00:00:13Z",
+            "wg",
+            "claude_code.llm_request",
+            type_="GENERATION",
+            parent="i1",
+            startTime="2026-01-02T00:00:12Z",
+            endTime="2026-01-02T00:00:13Z",
         )
         done = _ledger_child(
-            "tu2", "tool:TaskUpdate", "tu-u2", parent="i1",
-            start="2026-01-02T00:00:20Z", end="2026-01-02T00:00:21Z",
+            "tu2",
+            "tool:TaskUpdate",
+            "tu-u2",
+            parent="i1",
+            start="2026-01-02T00:00:20Z",
+            end="2026-01-02T00:00:21Z",
         )
         post_tool = _ledger_child(
-            "post", "tool:Bash", "tu-post", parent="i1",
-            start="2026-01-02T00:00:30Z", end="2026-01-02T00:00:31Z",
+            "post",
+            "tool:Bash",
+            "tu-post",
+            parent="i1",
+            start="2026-01-02T00:00:30Z",
+            end="2026-01-02T00:00:31Z",
         )
         # An audit instant (PostToolUse hook) joined to the work tool by tool_use_id; its own
         # startTime (00:35) lags far past the tool, so it must ride the tool, not be placed late.
         hook = _audit_event(
-            "hk", "hook_execution_complete:PostToolUse",
-            start="2026-01-02T00:00:35Z", tool_use_id="tu-w",
+            "hk",
+            "hook_execution_complete:PostToolUse",
+            start="2026-01-02T00:00:35Z",
+            tool_use_id="tu-w",
         )
         return [
-            ("tr", [interaction, pre_tool, create, started, work_tool, work_gen, done, post_tool, hook])
+            (
+                "tr",
+                [
+                    interaction,
+                    pre_tool,
+                    create,
+                    started,
+                    work_tool,
+                    work_gen,
+                    done,
+                    post_tool,
+                    hook,
+                ],
+            )
         ]
 
     def test_emits_a_distinct_cycle_trace_and_root(self) -> None:
@@ -3143,16 +3187,18 @@ class TestCycleView:
     def test_pre_step_span_lands_in_pre_step(self) -> None:
         batch = build_cycle_batch(self._traces(), SPOKE, self._content())
 
-        assert _by_cycle(batch, "tr", "pt")["body"]["parentObservationId"] == _cycle_step(
-            batch, "preStep"
-        )["id"]
+        assert (
+            _by_cycle(batch, "tr", "pt")["body"]["parentObservationId"]
+            == _cycle_step(batch, "preStep")["id"]
+        )
 
     def test_post_step_span_lands_in_post_step(self) -> None:
         batch = build_cycle_batch(self._traces(), SPOKE, self._content())
 
-        assert _by_cycle(batch, "tr", "post")["body"]["parentObservationId"] == _cycle_step(
-            batch, "postStep"
-        )["id"]
+        assert (
+            _by_cycle(batch, "tr", "post")["body"]["parentObservationId"]
+            == _cycle_step(batch, "postStep")["id"]
+        )
 
     def test_audit_instant_rides_its_tool_not_a_step(self) -> None:
         batch = build_cycle_batch(self._traces(), SPOKE, self._content())
@@ -3184,31 +3230,171 @@ class TestCycleView:
     def _gap_traces(self) -> list[tuple[str, list[dict]]]:
         # Step one: [00:01, 00:10]; step two: [00:30, 00:40]. A span at 00:20 lands in the gap.
         interaction = _obs(
-            "i1", "claude_code.interaction", parent=None,
-            startTime="2026-01-02T00:00:00Z", endTime="2026-01-02T00:00:45Z",
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:45Z",
         )
         spans = [
             interaction,
-            _ledger_child("c1", "tool:TaskCreate", "tu-c1", parent="i1",
-                          start="2026-01-02T00:00:00Z", end="2026-01-02T00:00:00Z"),
-            _ledger_child("s1", "tool:TaskUpdate", "tu-s1", parent="i1",
-                          start="2026-01-02T00:00:01Z", end="2026-01-02T00:00:01Z"),
-            _ledger_child("e1", "tool:TaskUpdate", "tu-e1", parent="i1",
-                          start="2026-01-02T00:00:10Z", end="2026-01-02T00:00:10Z"),
-            _ledger_child("gap", "tool:Edit", "tu-gap", parent="i1",
-                          start="2026-01-02T00:00:20Z", end="2026-01-02T00:00:20Z"),
-            _ledger_child("c2", "tool:TaskCreate", "tu-c2", parent="i1",
-                          start="2026-01-02T00:00:29Z", end="2026-01-02T00:00:29Z"),
-            _ledger_child("s2", "tool:TaskUpdate", "tu-s2", parent="i1",
-                          start="2026-01-02T00:00:30Z", end="2026-01-02T00:00:30Z"),
-            _ledger_child("e2", "tool:TaskUpdate", "tu-e2", parent="i1",
-                          start="2026-01-02T00:00:40Z", end="2026-01-02T00:00:40Z"),
+            _ledger_child(
+                "c1",
+                "tool:TaskCreate",
+                "tu-c1",
+                parent="i1",
+                start="2026-01-02T00:00:00Z",
+                end="2026-01-02T00:00:00Z",
+            ),
+            _ledger_child(
+                "s1",
+                "tool:TaskUpdate",
+                "tu-s1",
+                parent="i1",
+                start="2026-01-02T00:00:01Z",
+                end="2026-01-02T00:00:01Z",
+            ),
+            _ledger_child(
+                "e1",
+                "tool:TaskUpdate",
+                "tu-e1",
+                parent="i1",
+                start="2026-01-02T00:00:10Z",
+                end="2026-01-02T00:00:10Z",
+            ),
+            _ledger_child(
+                "gap",
+                "tool:Edit",
+                "tu-gap",
+                parent="i1",
+                start="2026-01-02T00:00:20Z",
+                end="2026-01-02T00:00:20Z",
+            ),
+            _ledger_child(
+                "c2",
+                "tool:TaskCreate",
+                "tu-c2",
+                parent="i1",
+                start="2026-01-02T00:00:29Z",
+                end="2026-01-02T00:00:29Z",
+            ),
+            _ledger_child(
+                "s2",
+                "tool:TaskUpdate",
+                "tu-s2",
+                parent="i1",
+                start="2026-01-02T00:00:30Z",
+                end="2026-01-02T00:00:30Z",
+            ),
+            _ledger_child(
+                "e2",
+                "tool:TaskUpdate",
+                "tu-e2",
+                parent="i1",
+                start="2026-01-02T00:00:40Z",
+                end="2026-01-02T00:00:40Z",
+            ),
         ]
         return [("tr", spans)]
 
     def test_gap_span_attaches_to_the_preceding_step(self) -> None:
         batch = build_cycle_batch(self._gap_traces(), SPOKE, self._gap_content())
 
-        assert _by_cycle(batch, "tr", "gap")["body"]["parentObservationId"] == _cycle_step(
-            batch, "step:one"
-        )["id"]
+        assert (
+            _by_cycle(batch, "tr", "gap")["body"]["parentObservationId"]
+            == _cycle_step(batch, "step:one")["id"]
+        )
+
+    def _subagent_traces(self) -> list[tuple[str, list[dict]]]:
+        # A tool:Agent (in-window) owns a nested sub-agent interaction + sub-tool via parent links.
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:30Z",
+        )
+        create = _ledger_child(
+            "tc1",
+            "tool:TaskCreate",
+            "tu-c1",
+            parent="i1",
+            start="2026-01-02T00:00:02Z",
+            end="2026-01-02T00:00:02Z",
+        )
+        started = _ledger_child(
+            "tu1",
+            "tool:TaskUpdate",
+            "tu-u1",
+            parent="i1",
+            start="2026-01-02T00:00:05Z",
+            end="2026-01-02T00:00:05Z",
+        )
+        agent = _ledger_child(
+            "wa",
+            "tool:Agent",
+            "tu-wa",
+            parent="i1",
+            start="2026-01-02T00:00:08Z",
+            end="2026-01-02T00:00:18Z",
+        )
+        sub_i = _obs(
+            "subi",
+            "claude_code.interaction",
+            parent="wa",
+            startTime="2026-01-02T00:00:09Z",
+            endTime="2026-01-02T00:00:17Z",
+        )
+        sub_tool = _ledger_child(
+            "st",
+            "tool:Read",
+            "tu-st",
+            parent="subi",
+            start="2026-01-02T00:00:10Z",
+            end="2026-01-02T00:00:11Z",
+        )
+        done = _ledger_child(
+            "tu2",
+            "tool:TaskUpdate",
+            "tu-u2",
+            parent="i1",
+            start="2026-01-02T00:00:20Z",
+            end="2026-01-02T00:00:21Z",
+        )
+        return [("tr", [interaction, create, started, agent, sub_i, sub_tool, done])]
+
+    def test_nested_interaction_survives_and_rides_its_agent_tool(self) -> None:
+        # Only TOP-LEVEL interactions dissolve: a sub-agent interaction nested under a tool:Agent
+        # survives and rides the (timestamp-placed) agent tool, and its sub-tool rides it in turn.
+        batch = build_cycle_batch(self._subagent_traces(), SPOKE, self._content())
+
+        step = _cycle_step(batch, "step:S1 RED: x")["id"]
+        assert _by_cycle(batch, "tr", "wa")["body"]["parentObservationId"] == step
+        assert _has_cycle_copy(batch, "tr", "subi")
+        assert _by_cycle(batch, "tr", "subi")["body"]["parentObservationId"] == cycle_copy_id_for(
+            "tr", "wa"
+        )
+        assert _by_cycle(batch, "tr", "st")["body"]["parentObservationId"] == cycle_copy_id_for(
+            "tr", "subi"
+        )
+
+    def test_audit_instant_on_dissolved_turn_anchored_by_turn_start(self) -> None:
+        # A skill_activated that resolves to a dissolved top-level interaction (shared prompt.id) is
+        # anchored by the TURN's start (here -> preStep), never by its own lagging timestamp (00:38,
+        # which would land it in postStep). Exercises _resolve_cycle_parent's anchor branch.
+        traces = self._traces()
+        traces[0][1][0]["metadata"] = {"attributes": {"prompt.id": "p1"}}  # interaction i1
+        skill = _audit_event(
+            "sk1",
+            "skill_activated",
+            start="2026-01-02T00:00:38Z",
+            **{"prompt.id": "p1", "skill.name": "source-task"},
+        )
+        traces[0][1].append(skill)
+
+        batch = build_cycle_batch(traces, SPOKE, self._content())
+
+        assert (
+            _by_cycle(batch, "tr", "sk1")["body"]["parentObservationId"]
+            == _cycle_step(batch, "preStep")["id"]
+        )

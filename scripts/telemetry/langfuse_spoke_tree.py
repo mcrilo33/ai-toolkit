@@ -1294,6 +1294,21 @@ def _containing_window(start: str, windows: list[StepWindow]) -> StepWindow | No
     return chosen
 
 
+def _step_node_name(window: StepWindow) -> str:
+    """Return the shared ``step:<subject>`` node name for a ledger window (both views)."""
+    return f"step:{window.subject}"
+
+
+def _step_node_metadata(window: StepWindow) -> dict[str, Any]:
+    """Return the shared step-node metadata for a ledger window (both views)."""
+    return {
+        "subject": window.subject,
+        "status": window.status,
+        "started": window.start,
+        "completed": window.end,
+    }
+
+
 def _step_event(window: StepWindow, step_id: str, parent_id: str, trace_id: str) -> IngestEvent:
     """Shape one cycle-step span-create event nested under ``parent_id`` (the local wrap parent)."""
     return {
@@ -1304,15 +1319,10 @@ def _step_event(window: StepWindow, step_id: str, parent_id: str, trace_id: str)
             "id": step_id,
             "traceId": trace_id,
             "parentObservationId": parent_id,
-            "name": f"step:{window.subject}",
+            "name": _step_node_name(window),
             "startTime": window.start,
             "endTime": window.end,
-            "metadata": {
-                "subject": window.subject,
-                "status": window.status,
-                "started": window.start,
-                "completed": window.end,
-            },
+            "metadata": _step_node_metadata(window),
         },
     }
 
@@ -1691,17 +1701,12 @@ def _cycle_step_events(
         events.append(
             _cycle_axis_event(
                 step_id_for[window.task_id],
-                f"step:{window.subject}",
+                _step_node_name(window),
                 window.start,
                 window.end,
                 root_id,
                 trace_id,
-                metadata={
-                    "subject": window.subject,
-                    "status": window.status,
-                    "started": window.start,
-                    "completed": window.end,
-                },
+                metadata=_step_node_metadata(window),
             )
         )
     events.append(
@@ -1712,7 +1717,7 @@ def _cycle_step_events(
     return events
 
 
-def _cycle_parent(
+def _resolve_cycle_parent(
     body: dict[str, Any],
     parent_a: str,
     *,
@@ -1759,7 +1764,7 @@ def _apply_cycle_axis(
     """Re-home the copies onto the cycle axis and build its nodes (#113 View B).
 
     Remaps every surviving copy into the cycle id namespace, dissolves the top-level interactions
-    (their children land on the axis), and parents each copy via :func:`_cycle_parent`. Returns
+    (their children land on the axis), and parents each copy via :func:`_resolve_cycle_parent`. Returns
     ``(cycle_copies, step_events)``; the copies are mutated in place.
     """
     interaction_start: dict[str, str | None] = {
@@ -1792,7 +1797,7 @@ def _apply_cycle_axis(
         body["id"] = new_id
         event["id"] = new_id
         body["traceId"] = trace_id
-        body["parentObservationId"] = _cycle_parent(
+        body["parentObservationId"] = _resolve_cycle_parent(
             body,
             parent_a,
             dissolved=dissolved,
@@ -1822,6 +1827,12 @@ def build_cycle_batch(
     under their tool / llm_request by causal key, never their lagging timestamp
     (:func:`_apply_cycle_axis`). The copies live in a separate id namespace so they never collide
     with View A's in the local Langfuse store. A non-ledger spoke emits no cycle-axis nodes.
+
+    View B carries the copies' assembly-time rich fields (``input``/``output``, ``usageDetails``,
+    ``costDetails``, ``metadata``) and per-container ``rollup`` only. The heavier per-call
+    enrichments :func:`main` layers onto View A — the cache decomposition, ``output_config.effort``
+    tags, numeric scores, and the collapsed ``loaded-context`` node — stay single-emitted on View A
+    by design (this is the cycle/phase lens, not a duplicate of the full nested view).
 
     Args:
         traces: Each source trace paired with all of its observations.
