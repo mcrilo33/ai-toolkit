@@ -243,15 +243,91 @@ wt_bridge_launch() {
   echo "→ started Langfuse message bridge on :${BRIDGE_PORT:-4319} (log: $log)"
 }
 
-# Idempotently ensure the message bridge is up for an opted-in spoke. A no-op
-# unless AI_TOOLKIT_OTEL=1. Never starts a second bridge (skips when :4319 already
-# listens). When LANGFUSE_BASIC_AUTH is unset the bridge can't authenticate to
-# Langfuse, so warn (audit events + LLM I/O won't land) but DO NOT fail the spawn.
-# Args: $1 = repo root.
+# PID LISTENing on the bridge port (default :4319), via `lsof -t` — NOT `pgrep -f`,
+# which false-negatives on non-ASCII argv under a non-UTF8 locale and would report a
+# live bridge as down. '' when nothing listens or lsof is unavailable. Split out so
+# the staleness decision is overridable in tests with no real socket probe.
+wt_bridge_pid() {
+  local port="${1:-4319}"
+  command -v lsof >/dev/null 2>&1 || return 0
+  lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -n1
+}
+
+# Epoch seconds at which the given pid started. Reads `ps -o lstart=` and converts
+# with the portable BSD-then-GNU `date` pattern (mirroring wt_epoch_at). Both ps and
+# date run under LC_ALL=C: `ps lstart` is locale-formatted (e.g. fr_FR emits "lun.
+# 29 juin"), which `date -f "%a %b %e %T %Y"` cannot parse — the same locale trap
+# the issue flags for pgrep, which would silently strand the epoch empty and stop
+# staleness from ever firing. '' on any failure. Split out so the staleness decision
+# is overridable in tests with no real process. Args: $1 = pid.
+wt_proc_start_epoch() {
+  local pid="$1" lstart
+  lstart="$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null)" || return 0
+  lstart="${lstart#"${lstart%%[![:space:]]*}"}"   # strip leading padding
+  lstart="${lstart%"${lstart##*[![:space:]]}"}"   # strip trailing padding
+  [ -n "$lstart" ] || return 0
+  LC_ALL=C date -j -f "%a %b %e %T %Y" "$lstart" +%s 2>/dev/null \
+    || LC_ALL=C date -d "$lstart" +%s 2>/dev/null || true
+}
+
+# Newest mtime (epoch seconds) among the bridge's source bundle: the bridge itself
+# plus its only telemetry sibling import, langfuse_audit_events. Reading from the
+# MAIN checkout (the preflight's repo_root) makes mtime a reliable change signal —
+# a land rewrites the touched files, an untouched land leaves them old — so it does
+# not over-fire the way a per-worktree checkout's fresh mtimes would. Portable stat
+# (BSD -f %m / GNU -c %Y); 0 when none found. Overridable in tests.
+# UPGRADE: extend this list if the bridge grows new telemetry.* imports.
+wt_bridge_source_mtime() {
+  local repo_root="$1" newest=0 f m
+  for f in "$repo_root/scripts/telemetry/langfuse_message_bridge.py" \
+           "$repo_root/scripts/telemetry/langfuse_audit_events.py"; do
+    [ -f "$f" ] || continue
+    m="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)" || continue
+    [ "$m" -gt "$newest" ] && newest="$m"
+  done
+  printf '%s' "$newest"
+}
+
+# Stop the running bridge (best-effort). Split out so the staleness decision is
+# overridable in tests with no real signal sent. Args: $1 = pid.
+wt_bridge_kill() { kill "$1" 2>/dev/null || true; }
+
+# Recycle the running bridge IFF its source bundle was modified after the process
+# started (a land rewrote the bridge code). Best-effort and idempotent: no pid, no
+# resolvable start time, or source not strictly newer leaves the process untouched,
+# so the restart fires only on a PROVEN change and never loops. A stale process with
+# LANGFUSE_BASIC_AUTH unset is also left running (warn instead of killing a working
+# bridge for an un-authable one). Args: $1 = repo root, $2 = bridge port.
+wt_bridge_restart_if_stale() {
+  local repo_root="$1" port="$2" pid start src
+  pid="$(wt_bridge_pid "$port")"
+  [ -n "$pid" ] || return 0
+  start="$(wt_proc_start_epoch "$pid")"
+  [ -n "$start" ] || return 0
+  src="$(wt_bridge_source_mtime "$repo_root")"
+  [ "$src" -gt "$start" ] 2>/dev/null || return 0
+  if [ -z "${LANGFUSE_BASIC_AUTH:-}" ]; then
+    wt_warn "Langfuse bridge source changed but LANGFUSE_BASIC_AUTH unset — leaving the running (stale) bridge; restart manually after exporting auth"
+    return 0
+  fi
+  wt_bridge_kill "$pid"
+  wt_bridge_launch "$repo_root"
+}
+
+# Idempotently ensure the message bridge is up AND current for an opted-in spoke. A
+# no-op unless AI_TOOLKIT_OTEL=1. When :4319 already listens, delegate to
+# wt_bridge_restart_if_stale — which recycles the process only when its source
+# bundle proves it is running stale code, and otherwise leaves it untouched (no
+# second bridge, no needless churn). When down: never starts a second bridge. When
+# LANGFUSE_BASIC_AUTH is unset the bridge can't authenticate to Langfuse, so warn
+# (audit events + LLM I/O won't land) but DO NOT fail the spawn. Args: $1 = repo root.
 wt_otel_bridge_preflight() {
   local repo_root="$1" port="${BRIDGE_PORT:-4319}"
   [ "${AI_TOOLKIT_OTEL:-}" = "1" ] || return 0
-  wt_port_listening "$port" && return 0
+  if wt_port_listening "$port"; then
+    wt_bridge_restart_if_stale "$repo_root" "$port"
+    return 0
+  fi
   if [ -z "${LANGFUSE_BASIC_AUTH:-}" ]; then
     wt_warn "OTel bridge down on :$port and LANGFUSE_BASIC_AUTH unset — audit events (#93) + LLM I/O won't reach Langfuse; spoke still launches"
     return 0

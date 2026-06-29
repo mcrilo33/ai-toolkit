@@ -254,6 +254,25 @@ def test_bridge_pid_resolves_via_lsof_not_pgrep(tmp_path: Path) -> None:
     assert not pgrep_marker.exists(), "wt_bridge_pid must not consult pgrep"
 
 
+def test_proc_start_epoch_is_locale_independent() -> None:
+    # `ps -o lstart=` is locale-formatted (fr_FR emits "lun. 29 juin"), which
+    # `date -f "%a %b %e %T %Y"` cannot parse — that would strand the epoch empty
+    # and stop the bridge staleness check from ever firing. The helper must force
+    # LC_ALL=C internally. Run the REAL helper against this test's own shell pid
+    # (read-only — never kills) under a deliberately non-C inherited locale.
+    env = {**os.environ, "LC_ALL": "fr_FR.UTF-8", "LANG": "fr_FR.UTF-8"}
+    result = subprocess.run(
+        ["bash", "-c", f'source "{WT_LIB}"; wt_proc_start_epoch $$'],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    out = result.stdout.strip()
+    assert out.isdigit() and int(out) > 0, f"expected an epoch, got {out!r} ({result.stderr!r})"
+
+
 # --- native-OTel collector preflight (auto-ensure) ----------------------------
 # wt_otel_collector_preflight brings the otelcol collector (:4317, the port CC
 # exports to and that forks to the bridge) up idempotently for an opted-in spoke.
