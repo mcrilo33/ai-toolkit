@@ -12,11 +12,24 @@ therefore reads as dozens of disconnected traces.
 
 This post-run script SOURCES FROM LANGFUSE — it does not rebuild from the causal store.
 It fetches every trace in the session and every observation in those traces, then COPIES
-each observation verbatim into ONE new trace, re-parenting across the original trace
-boundaries so the whole spoke renders as a single tree with every field intact::
+each observation verbatim into TWO complementary nested traces, re-parenting across the
+original trace boundaries so the whole spoke renders as a single tree with every field intact::
 
     LANGFUSE_HOST=http://localhost:3000 LANGFUSE_BASIC_AUTH="Basic <base64(pk:sk)>" \\
         python3 scripts/telemetry/langfuse_spoke_tree.py <spoke_run_id>
+
+Two views over the SAME observation copies (#113), differing only in the top-level parent:
+
+- **View A — the nested/interaction lens** (``spoketree-<spoke>``, :func:`build_batch`). Keeps
+  the per-turn ``claude_code.interaction`` nesting; each ledger step wraps its contiguous run of
+  same-parent siblings in a ``step:<subject>`` node inserted INSIDE the interaction
+  (:func:`_apply_step_grouping`).
+- **View B — the cycle/phase lens** (``spokecycle-<spoke>``, :func:`build_cycle_batch`). Dissolves
+  the interaction layer and re-homes the copies onto a pure cycle axis — ``preStep`` + one
+  ``step:<subject>`` per ledger task + ``postStep`` — placing each real span by its timestamp and
+  letting audit instants ride their tool/llm_request by causal key (:func:`_apply_cycle_axis`).
+  Its copies live in a separate id namespace, so the two traces never collide (~2x copies per
+  spoke in the local store, a conscious choice).
 
 Re-parenting rules for each source observation:
 
@@ -1547,6 +1560,35 @@ def build_batch(
             "startTime": base_ts,
         },
     }
+    copies = _assemble_copies(
+        traces, trace_id=trace_id, root_id=root_id, tool_content=tool_content, root_event=root_event
+    )
+    step_events = _apply_step_grouping(
+        copies, traces, tool_content, spoke_run_id=spoke_run_id, trace_id=trace_id
+    )
+    events = [trace_event, root_event, *step_events, *copies]
+    _apply_container_rollups(events)
+    return events
+
+
+def _assemble_copies(
+    traces: list[TraceObservations],
+    *,
+    trace_id: str,
+    root_id: str,
+    tool_content: dict[str, ToolContent],
+    root_event: IngestEvent,
+) -> list[IngestEvent]:
+    """Build the re-parented, folded, startup-collapsed observation copies both views share.
+
+    Re-parents every source observation across the original trace boundaries
+    (:func:`_resolve_parent`), grafts transcript content into the create body
+    (:func:`_copy_event`), folds the three 1:1 tool sub-spans (:func:`_fold_tool_subspans`), and
+    demotes session-startup instants onto ``root_event``'s metadata
+    (:func:`_collapse_startup_instants`). View A wraps these in local step nodes; View B re-homes
+    them onto the cycle axis. ``root_event`` is the view's own synthetic root (its metadata is
+    mutated in place).
+    """
     tool_index = _build_tool_index(traces)
     request_index = _build_request_index(traces)
     interaction_index = _build_interaction_index(traces)
@@ -1573,13 +1615,196 @@ def build_batch(
                 )
             )
     copies = _fold_tool_subspans(copies, traces, tool_index)
-    copies = _collapse_startup_instants(copies, root_event)
-    step_events = _apply_step_grouping(
-        copies, traces, tool_content, spoke_run_id=spoke_run_id, trace_id=trace_id
+    return _collapse_startup_instants(copies, root_event)
+
+
+def _cycle_step_for(start: str, windows: list[StepWindow]) -> str:
+    """Return the cycle-axis key for a span starting at ``start`` (``pre`` / ``post`` / a task id).
+
+    Before the first window's start -> ``preStep``; after the last ``completed`` -> ``postStep``;
+    otherwise the latest-starting window at or before ``start`` (so an inter-step gap span attaches
+    to its preceding step). ``windows`` is non-empty and ordered by start.
+    """
+    if start < windows[0].start:
+        return _PRE_STEP_KEY
+    if start > max(window.end for window in windows):
+        return _POST_STEP_KEY
+    chosen = windows[0]
+    for window in windows:
+        if window.start <= start:
+            chosen = window
+    return chosen.task_id
+
+
+def _cycle_axis_event(
+    node_id: str,
+    name: str,
+    start: str,
+    end: str,
+    parent_id: str,
+    trace_id: str,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> IngestEvent:
+    """Shape one View B cycle-axis span-create event (preStep / step:N / postStep)."""
+    body: dict[str, Any] = {
+        "id": node_id,
+        "traceId": trace_id,
+        "parentObservationId": parent_id,
+        "name": name,
+        "startTime": start,
+        "endTime": end,
+    }
+    if metadata:
+        body["metadata"] = metadata
+    return {"id": node_id, "type": "span-create", "timestamp": start, "body": body}
+
+
+def _cycle_step_ids(spoke_run_id: str, windows: list[StepWindow]) -> dict[str, str]:
+    """Map each cycle-axis key (``pre`` / ``post`` / a task id) to its deterministic node id."""
+    ids = {
+        _PRE_STEP_KEY: _cycle_step_id(spoke_run_id, _PRE_STEP_KEY),
+        _POST_STEP_KEY: _cycle_step_id(spoke_run_id, _POST_STEP_KEY),
+    }
+    for window in windows:
+        ids[window.task_id] = _cycle_step_id(spoke_run_id, window.task_id)
+    return ids
+
+
+def _cycle_step_events(
+    windows: list[StepWindow],
+    step_id_for: dict[str, str],
+    *,
+    root_id: str,
+    trace_id: str,
+    base_ts: str,
+    latest: str,
+) -> list[IngestEvent]:
+    """Build the preStep + step:N + postStep nodes that partition the cycle timeline under the root."""
+    last_completed = max(window.end for window in windows)
+    events = [
+        _cycle_axis_event(
+            step_id_for[_PRE_STEP_KEY], _PRE_STEP_NAME, base_ts, windows[0].start, root_id, trace_id
+        )
+    ]
+    for window in windows:
+        events.append(
+            _cycle_axis_event(
+                step_id_for[window.task_id],
+                f"step:{window.subject}",
+                window.start,
+                window.end,
+                root_id,
+                trace_id,
+                metadata={
+                    "subject": window.subject,
+                    "status": window.status,
+                    "started": window.start,
+                    "completed": window.end,
+                },
+            )
+        )
+    events.append(
+        _cycle_axis_event(
+            step_id_for[_POST_STEP_KEY], _POST_STEP_NAME, last_completed, latest, root_id, trace_id
+        )
     )
-    events = [trace_event, root_event, *step_events, *copies]
-    _apply_container_rollups(events)
     return events
+
+
+def _cycle_parent(
+    body: dict[str, Any],
+    parent_a: str,
+    *,
+    dissolved: set[str],
+    by_id_a: dict[str, dict[str, Any]],
+    a_root_id: str,
+    interaction_start: dict[str, str | None],
+    windows: list[StepWindow],
+    step_id_for: dict[str, str],
+    root_id: str,
+) -> str:
+    """Resolve one copy's View B parent: ride a surviving span, else land on the cycle axis.
+
+    A copy whose View A parent is a surviving span (a tool, llm_request, sub-agent, or nested
+    interaction) keeps that parent (rides along by causal key). A copy left at the synthetic root
+    or under a dissolved top-level interaction lands on the cycle axis: a reliably-timestamped span
+    by its own ``startTime``, an audit instant by its dissolved turn's start (never its lagging
+    own time), falling back to ``preStep``.
+    """
+    if parent_a != a_root_id and parent_a not in dissolved and parent_a in by_id_a:
+        return _cycle_copy_id(parent_a)
+    if not windows:
+        return root_id  # no ledger -> no cycle axis; copies hang flat under the cycle root
+    if _is_audit_instant(body) or not body.get("startTime"):
+        anchor = interaction_start.get(parent_a)
+        key = _cycle_step_for(anchor, windows) if anchor else _PRE_STEP_KEY
+    else:
+        key = _cycle_step_for(body["startTime"], windows)
+    return step_id_for[key]
+
+
+def _apply_cycle_axis(
+    copies: list[IngestEvent],
+    traces: list[TraceObservations],
+    windows: list[StepWindow],
+    *,
+    spoke_run_id: str,
+    a_root_id: str,
+    root_id: str,
+    trace_id: str,
+    base_ts: str,
+    latest: str,
+) -> tuple[list[IngestEvent], list[IngestEvent]]:
+    """Re-home the copies onto the cycle axis and build its nodes (#113 View B).
+
+    Remaps every surviving copy into the cycle id namespace, dissolves the top-level interactions
+    (their children land on the axis), and parents each copy via :func:`_cycle_parent`. Returns
+    ``(cycle_copies, step_events)``; the copies are mutated in place.
+    """
+    interaction_start: dict[str, str | None] = {
+        _copy_id(orig_trace_id, observation["id"]): observation.get("startTime")
+        for orig_trace_id, observations in traces
+        for observation in observations
+        if _is_interaction(observation)
+    }
+    by_id_a = {event["body"]["id"]: event["body"] for event in copies}
+    dissolved = {
+        iid
+        for iid in interaction_start
+        if iid in by_id_a and by_id_a[iid]["parentObservationId"] == a_root_id
+    }
+    step_id_for = _cycle_step_ids(spoke_run_id, windows)
+    step_events = (
+        _cycle_step_events(
+            windows, step_id_for, root_id=root_id, trace_id=trace_id, base_ts=base_ts, latest=latest
+        )
+        if windows
+        else []
+    )
+    kept: list[IngestEvent] = []
+    for event in copies:
+        body = event["body"]
+        if body["id"] in dissolved:
+            continue  # drop the top-level interaction node — View B has no interaction layer
+        parent_a = body["parentObservationId"]
+        new_id = _cycle_copy_id(body["id"])
+        body["id"] = new_id
+        event["id"] = new_id
+        body["traceId"] = trace_id
+        body["parentObservationId"] = _cycle_parent(
+            body,
+            parent_a,
+            dissolved=dissolved,
+            by_id_a=by_id_a,
+            a_root_id=a_root_id,
+            interaction_start=interaction_start,
+            windows=windows,
+            step_id_for=step_id_for,
+            root_id=root_id,
+        )
+        kept.append(event)
+    return kept, step_events
 
 
 def build_cycle_batch(
@@ -1587,8 +1812,77 @@ def build_cycle_batch(
     spoke_run_id: str,
     tool_content: dict[str, ToolContent] | None = None,
 ) -> list[IngestEvent]:
-    """Assemble the View B (steps -> work) ``spokecycle-<spoke>`` trace (#113)."""
-    raise NotImplementedError  # GREEN fills this in
+    """Assemble the View B (steps -> work) ``spokecycle-<spoke>`` trace (#113).
+
+    Built from the SAME observation copies as :func:`build_batch` (same rich input/output,
+    usageDetails, costDetails, metadata) but re-homed onto a pure cycle axis: the top level is
+    ``preStep`` + one ``step:<subject>`` per ledger task + ``postStep``, totally partitioning the
+    timeline. Real spans (``tool:*`` / ``claude_code.llm_request``) are placed under the step
+    whose window contains their ``startTime`` (gap -> preceding step); audit instants ride along
+    under their tool / llm_request by causal key, never their lagging timestamp
+    (:func:`_apply_cycle_axis`). The copies live in a separate id namespace so they never collide
+    with View A's in the local Langfuse store. A non-ledger spoke emits no cycle-axis nodes.
+
+    Args:
+        traces: Each source trace paired with all of its observations.
+        spoke_run_id: The spoke run identifier (becomes the trace's ``sessionId``).
+        tool_content: Tool-call-id to :class:`ToolContent` from :func:`scan_transcripts`;
+            defaults to empty.
+
+    Returns:
+        The ingestion events: a ``trace-create``, the synthetic cycle root, the cycle-axis nodes,
+        then the re-homed copies.
+    """
+    tool_content = tool_content or {}
+    a_trace_id = trace_id_for(spoke_run_id)
+    a_root_id = root_id_for(spoke_run_id)
+    trace_id = cycle_trace_id_for(spoke_run_id)
+    root_id = cycle_root_id_for(spoke_run_id)
+    base_ts = _earliest_start(traces)
+    trace_event: IngestEvent = {
+        "id": trace_id,
+        "type": "trace-create",
+        "timestamp": base_ts,
+        "body": {
+            "id": trace_id,
+            "name": _CYCLE_TRACE_NAME_PREFIX + spoke_run_id,
+            "sessionId": spoke_run_id,
+            "timestamp": base_ts,
+        },
+    }
+    root_event: IngestEvent = {
+        "id": root_id,
+        "type": "span-create",
+        "timestamp": base_ts,
+        "body": {
+            "id": root_id,
+            "traceId": trace_id,
+            "name": _CYCLE_ROOT_NAME_PREFIX + spoke_run_id,
+            "startTime": base_ts,
+        },
+    }
+    copies = _assemble_copies(
+        traces,
+        trace_id=a_trace_id,
+        root_id=a_root_id,
+        tool_content=tool_content,
+        root_event=root_event,
+    )
+    windows = build_step_windows(traces, tool_content)
+    copies, step_events = _apply_cycle_axis(
+        copies,
+        traces,
+        windows,
+        spoke_run_id=spoke_run_id,
+        a_root_id=a_root_id,
+        root_id=root_id,
+        trace_id=trace_id,
+        base_ts=base_ts,
+        latest=_latest_time(traces),
+    )
+    events = [trace_event, root_event, *step_events, *copies]
+    _apply_container_rollups(events)
+    return events
 
 
 def all_traces(spoke_run_id: str, get: GetFn) -> list[dict[str, Any]]:
@@ -2493,8 +2787,10 @@ def main(argv: list[str] | None = None) -> int:
     scan_root = transcript_scan_root(args.projects, args.root.resolve())
     tool_content = scan_transcripts(scan_root, _tool_span_ids(traces))
     batch = build_batch(traces, args.spoke_run_id, tool_content)
+    cycle_batch = build_cycle_batch(traces, args.spoke_run_id, tool_content)
     mode, lane = read_mode_lane(args.root.resolve())
     apply_mode_lane_tags(batch, mode, lane)
+    apply_mode_lane_tags(cycle_batch, mode, lane)
 
     counter = make_counter(endpoint=args.endpoint, api_key=args.api_key, model=args.model)
     base_ts = _earliest_start(traces)
@@ -2526,9 +2822,10 @@ def main(argv: list[str] | None = None) -> int:
     # calls↔bodies pairing once in main and pass it in if the body count ever makes it measurable.
     efforts = apply_request_body_metadata(batch, traces, bodies_dir)
     score_events = build_score_events(args.spoke_run_id, traces, batch, base_ts=base_ts)
-    post_in_chunks(batch + context_events + score_events, post)
+    post_in_chunks(batch + context_events + score_events + cycle_batch, post)
 
     trace_id = trace_id_for(args.spoke_run_id)
+    cycle_trace_id = cycle_trace_id_for(args.spoke_run_id)
     filled = filled_tool_spans(traces, tool_content)
     print(
         f"{len(batch) - 2} observations assembled under trace {trace_id} "
@@ -2537,7 +2834,8 @@ def main(argv: list[str] | None = None) -> int:
         f"{decomposed} llm_requests cache-decomposed, "
         f"{efforts} llm_requests effort-tagged, "
         f"{len(score_events)} numeric scores emitted, "
-        f"tagged mode={mode} lane={lane}"
+        f"tagged mode={mode} lane={lane}; "
+        f"{len(cycle_batch) - 2} observations assembled under cycle trace {cycle_trace_id}"
     )
     return 0
 
