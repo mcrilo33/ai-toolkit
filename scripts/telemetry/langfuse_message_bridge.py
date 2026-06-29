@@ -17,6 +17,20 @@ the bridge CREATES them as ``event-create`` observations on a per-spoke syntheti
 trace keyed by ``spoke_run_id`` (issue #93). That path needs no buffering -- the trace is
 minted here -- and is independent of the message join below.
 
+The bridge also STAMPS ``prompt.id`` onto each ``claude_code.interaction`` span (issue #111).
+Claude Code emits ``prompt.id`` only on the logs signal (``api_request`` carries it alongside
+``request_id``; ``api_request_body`` carries it keyed by ``event.sequence``), never on the
+interaction span -- so the spoke-tree's causal join (``_build_interaction_index`` /
+``_build_skill_index``, which key turn-scoped event-layer signals onto their enclosing turn by
+``prompt.id``) finds nothing on the span side and those signals float to the root. The bridge
+recovers the span-side key by reusing the message-join chain: ``prompt.id`` -> ``request_id``
+(direct, or via the body ``event.sequence`` 1:1 match) -> the ``llm_request`` span -> the
+nearest enclosing ``claude_code.interaction`` (walking ``parentSpanId``), then emits a
+``span-update`` writing flat ``metadata["prompt.id"]`` (Langfuse merges metadata on update, so
+the interaction's existing attributes survive). Each interaction is stamped once; an unresolved
+id stays buffered and re-resolves on a later flush, so trace/log ordering is irrelevant. This
+is a logs->traces join the otelcol OTTL cannot express, which is why it lives here.
+
 One audit sub-case DOES buffer: a ``PreToolUse``/``PostToolUse`` ``hook_execution_complete``
 event carries no ``tool_use_id`` (only ``hook_name``/``hook_event``/``event.sequence``), so
 the assembler cannot nest it under the tool that triggered it. The bridge recovers the id by
@@ -119,6 +133,11 @@ _INGEST_TIMESTAMP = "2026-01-01T00:00:00Z"
 # Cap a body_ref file read so a stale/hostile log event can never make the bridge load an
 # unbounded file into memory; the largest legitimate untruncated body is well under this.
 _MAX_BODY_REF_BYTES = 8 * 1024 * 1024
+
+# The native per-turn container span. Claude Code never stamps ``prompt.id`` onto it (the id
+# rides the logs signal only), so the bridge reconstructs and stamps it (#111) — the spoke-tree
+# causal join (_build_interaction_index / _build_skill_index) keys on this span's ``prompt.id``.
+_INTERACTION_SPAN_NAME = "claude_code.interaction"
 
 # Patches a single Langfuse observation field: (span_id, field, value) -> None.
 PatchFn = Callable[[str, str, object], None]
@@ -470,6 +489,15 @@ class Bridge:
         # flushes (like _body_seqs) as the shared join references for Pre/PostToolUse hooks.
         self._tool_decisions: list[tuple[int, str, str]] = []
         self._pending_hooks: list[BufferedHook] = []  # hooks awaiting their tool_use_id
+        # prompt.id stamping (#111). Span structure from the forked traces:
+        self._parent_of: dict[str, str] = {}  # span_id -> parentSpanId (hex), all spans
+        self._interaction_spans: set[str] = set()  # span_ids (hex) named claude_code.interaction
+        # prompt.id sources from the logs signal, kept across flushes so a span arriving later
+        # still resolves: request_id -> prompt.id (when api_request carries both), and
+        # (api_request_body event.sequence) -> prompt.id (matched to a request via _match_bodies).
+        self._prompt_by_req: dict[str, str] = {}
+        self._prompt_by_seq: list[tuple[int, str]] = []
+        self._stamped_interactions: set[str] = set()  # interaction span_ids already stamped (dedup)
 
     def pending_count(self) -> int:
         """Return the number of items still buffered awaiting their span."""
@@ -477,7 +505,11 @@ class Bridge:
             return len(self._pending)
 
     def on_spans(self, payload: dict[str, Any]) -> None:
-        """Record ``request_id -> span_id`` from a traces batch, then flush.
+        """Record span structure from a traces batch (request ids, parents, interactions), flush.
+
+        Beyond the ``request_id -> span_id`` map the message join needs, this records every span's
+        parent and the set of ``claude_code.interaction`` spans so :meth:`_flush_prompt_ids` can
+        climb from an ``llm_request`` to its enclosing turn and stamp ``prompt.id`` there (#111).
 
         Args:
             payload: A decoded OTLP/HTTP JSON ``ExportTraceServiceRequest``.
@@ -486,10 +518,17 @@ class Bridge:
             for rs in payload.get("resourceSpans", []):
                 for ss in rs.get("scopeSpans", []):
                     for sp in ss.get("spans", []):
+                        span_id = _hexid(sp.get("spanId", ""))
                         request_id = _attr(sp.get("attributes", []), "request_id")
                         if request_id:
-                            self._span_by_req[request_id] = _hexid(sp.get("spanId", ""))
+                            self._span_by_req[request_id] = span_id
+                        parent = sp.get("parentSpanId")
+                        if parent:
+                            self._parent_of[span_id] = _hexid(parent)
+                        if sp.get("name") == _INTERACTION_SPAN_NAME:
+                            self._interaction_spans.add(span_id)
             self._try_flush()
+            self._flush_prompt_ids()
 
     def on_logs(self, payload: dict[str, Any]) -> None:
         """Ingest message-body log records from a logs batch, then flush.
@@ -505,11 +544,13 @@ class Bridge:
                         self._ingest_log(resource_attrs, lr.get("attributes", []))
             self._flush_hooks()
             self._try_flush()
+            self._flush_prompt_ids()
 
     def _ingest_log(
         self, resource_attrs: list[dict[str, Any]], record_attrs: list[dict[str, Any]]
     ) -> None:
         event = _attr(record_attrs, "event.name")
+        prompt_id = _attr(record_attrs, "prompt.id")  # #111: the span-side causal key, logs-only
         if event == "api_request":
             request_id, seq = (
                 _attr(record_attrs, "request_id"),
@@ -517,16 +558,22 @@ class Bridge:
             )
             if request_id and seq is not None:
                 self._req_seq.append((int(seq), request_id))  # matched 1:1 to a body
+            if request_id and prompt_id:  # direct prompt.id -> request_id, no body needed
+                self._prompt_by_req.setdefault(request_id, prompt_id)
             return
         if event not in ("api_request_body", "api_response_body"):
             self._ingest_audit(resource_attrs, record_attrs)  # the audit/lifecycle layer
             return
-        raw = _read_body(record_attrs)
-        if not raw:
-            return
         if event == "api_request_body":
             seq = _attr(record_attrs, "event.sequence")
             if seq is None:
+                return
+            # prompt.id rides the body record (keyed by its event.sequence); capture it even when
+            # the body itself is unreadable (file-mode body_ref absent), so the stamp survives.
+            if prompt_id:
+                self._prompt_by_seq.append((int(seq), prompt_id))
+            raw = _read_body(record_attrs)
+            if not raw:
                 return
             self._body_seqs.append(int(seq))  # kept past flush so the match stays stable
             self._pending.append(
@@ -535,6 +582,9 @@ class Bridge:
         else:  # api_response_body
             request_id = _attr(record_attrs, "request_id")
             if not request_id:
+                return
+            raw = _read_body(record_attrs)
+            if not raw:
                 return
             try:
                 doc = json.loads(raw)
@@ -727,6 +777,67 @@ class Bridge:
             else:
                 still.append(item)
         self._pending[:] = still
+
+    def _flush_prompt_ids(self) -> None:
+        """Stamp ``prompt.id`` onto each interaction whose chain now resolves (#111).
+
+        Claude Code never emits ``prompt.id`` on the ``claude_code.interaction`` span, so the
+        spoke-tree causal join is empty. This reconstructs it from the logs signal:
+        ``prompt.id`` --(request_id, direct or via :meth:`_match_bodies`)--> ``llm_request``
+        span --(parent chain up to the enclosing interaction)--> interaction span, then emits a
+        single ``span-update`` writing flat ``metadata["prompt.id"]``. Each interaction is stamped
+        once (dedup via :attr:`_stamped_interactions`); an unresolved prompt id stays in its source
+        buffer and re-resolves on a later flush, so trace/log arrival order is irrelevant.
+        """
+        matched = self._match_bodies()
+        req_to_prompt: dict[str, str] = dict(self._prompt_by_req)
+        for seq, prompt_id in self._prompt_by_seq:
+            request_id = matched.get(seq)
+            if request_id:
+                req_to_prompt.setdefault(request_id, prompt_id)
+        batch: list[dict[str, Any]] = []
+        for request_id, prompt_id in req_to_prompt.items():
+            span_id = self._span_by_req.get(request_id)
+            if span_id is None:
+                continue
+            interaction = self._enclosing_interaction(span_id)
+            if interaction is None or interaction in self._stamped_interactions:
+                continue
+            self._stamped_interactions.add(interaction)
+            batch.append(_prompt_span_update(interaction, prompt_id))
+        if batch:
+            self._create(batch)
+
+    def _enclosing_interaction(self, span_id: str) -> str | None:
+        """Climb ``parentSpanId`` from ``span_id`` to the nearest interaction span, or None.
+
+        Returns None when no interaction ancestor has been seen yet (its span may arrive in a
+        later batch — the caller leaves the prompt id buffered and retries). A ``seen`` set guards
+        against a malformed parent cycle.
+        """
+        seen: set[str] = set()
+        current: str | None = span_id
+        while current and current not in seen:
+            if current in self._interaction_spans:
+                return current
+            seen.add(current)
+            current = self._parent_of.get(current)
+        return None
+
+
+def _prompt_span_update(interaction_span_id: str, prompt_id: str) -> dict[str, Any]:
+    """Build a Langfuse ``span-update`` stamping flat ``metadata["prompt.id"]`` on an interaction.
+
+    A flat metadata key (not nested under ``attributes``) matches the audit layer's shape and the
+    spoke-tree reader's ``_prompt_id`` fallback. Langfuse merges metadata on update, so the
+    interaction's existing attributes are preserved.
+    """
+    return {
+        "id": f"{interaction_span_id}-prompt-id",
+        "type": "span-update",
+        "timestamp": _INGEST_TIMESTAMP,
+        "body": {"id": interaction_span_id, "metadata": {"prompt.id": prompt_id}},
+    }
 
 
 def make_handler(bridge: Bridge) -> type[BaseHTTPRequestHandler]:

@@ -20,6 +20,11 @@
 #      The spoke must export OTEL_LOGS_EXPORTER=otlp and OTEL_LOG_RAW_API_BODIES=1 to emit
 #      the bodies. Caveat: request bodies over ~60KB are truncated by Claude Code (invalid
 #      JSON → the bridge stores the raw partial as input); thinking blocks arrive <REDACTED>.
+#      The same bridge also stamps prompt.id onto each claude_code.interaction span (#111):
+#      Claude Code emits prompt.id only on the logs signal (api_request[_body]), never on the
+#      span, so the bridge walks llm_request→enclosing interaction and span-updates flat
+#      metadata["prompt.id"] — the causal key the spoke-tree join needs. This is a logs→traces
+#      join the OTTL below cannot express, so it lives in the bridge, not this config.
 #
 # It also re-homes each span's Langfuse session onto the spoke (`spoke_run_id`), so one
 # spoke — across Claude Code resumes — is one Langfuse session.
