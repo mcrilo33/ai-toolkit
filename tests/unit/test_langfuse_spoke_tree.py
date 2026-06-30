@@ -3055,7 +3055,8 @@ class TestCycleView:
     ``preStep`` + ``step:<subject>`` + ``postStep``. Real spans (``tool:*`` /
     ``claude_code.llm_request``) are placed under the step window containing their startTime; an
     audit instant rides along under its tool / llm_request by causal key (never its lagging
-    timestamp); top-level interactions are dissolved. The copies carry distinct ids from View A.
+    timestamp); top-level interactions are flattened to childless leaf turn-markers. The copies
+    carry distinct ids from View A.
     """
 
     def _content(self) -> dict[str, ToolContent]:
@@ -3227,19 +3228,42 @@ class TestCycleView:
             == _cycle_step(batch, "preStep")["id"]
         )
 
-    def test_interaction_leaf_carries_turn_token_cost_aggregate(self) -> None:
-        # #114: the leaf preserves the interaction's native rich fields (per-turn tokens/cost/
-        # metadata), recovering per-turn cost reading; being childless it gets no synthesized rollup.
+    def test_interaction_leaf_carries_turn_rollup_aggregate(self) -> None:
+        # #114: a native interaction span carries no usageDetails — the tokens live on its
+        # llm_request descendants (here `wg`). Once flattened to a childless leaf it would lose the
+        # per-turn total, so the marker is stamped with metadata.rollup computed from its pre-flatten
+        # View A subtree, recovering per-turn cost reading.
         traces = self._traces()
-        traces[0][1][0]["usageDetails"] = {"input": 1200, "output": 340}
-        traces[0][1][0]["metadata"] = {"kind": "turn"}
+        work_gen = next(o for o in traces[0][1] if o["id"] == "wg")
+        work_gen["usageDetails"] = {"input": 1200, "output": 340}
 
         batch = build_cycle_batch(traces, SPOKE, self._content())
 
         leaf = _by_cycle(batch, "tr", "i1")["body"]
-        assert leaf["usageDetails"] == {"input": 1200, "output": 340}
-        assert leaf["metadata"]["kind"] == "turn"
-        assert "rollup" not in leaf.get("metadata", {})
+        assert leaf["metadata"]["rollup"] == {
+            "reused": 0,
+            "written": 0,
+            "input": 1200,
+            "output": 340,
+        }
+
+    def test_interaction_leaf_rollup_is_not_double_counted_in_root(self) -> None:
+        # #114: the marker carries the aggregate as metadata.rollup (not usageDetails), and its
+        # generation re-homes onto a step as a sibling — so the cycle root counts the turn's tokens
+        # exactly once, never the marker's aggregate plus the descendant again.
+        traces = self._traces()
+        work_gen = next(o for o in traces[0][1] if o["id"] == "wg")
+        work_gen["usageDetails"] = {"input": 1200, "output": 340}
+
+        batch = build_cycle_batch(traces, SPOKE, self._content())
+
+        root = next(e for e in batch if e["id"] == cycle_root_id_for(SPOKE))
+        assert root["body"]["metadata"]["rollup"] == {
+            "reused": 0,
+            "written": 0,
+            "input": 1200,
+            "output": 340,
+        }
 
     def _straddle_content(self) -> dict[str, ToolContent]:
         return {
@@ -3511,8 +3535,9 @@ class TestCycleView:
         return [("tr", [interaction, create, started, agent, sub_i, sub_tool, done])]
 
     def test_nested_interaction_survives_and_rides_its_agent_tool(self) -> None:
-        # Only TOP-LEVEL interactions dissolve: a sub-agent interaction nested under a tool:Agent
-        # survives and rides the (timestamp-placed) agent tool, and its sub-tool rides it in turn.
+        # Only TOP-LEVEL interactions flatten to leaf markers: a sub-agent interaction nested under a
+        # tool:Agent survives as a container and rides the (timestamp-placed) agent tool, and its
+        # sub-tool rides it in turn.
         batch = build_cycle_batch(self._subagent_traces(), SPOKE, self._content())
 
         step = _cycle_step(batch, "step:S1 RED: x")["id"]
@@ -3525,8 +3550,8 @@ class TestCycleView:
             "tr", "subi"
         )
 
-    def test_audit_instant_on_dissolved_turn_anchored_by_turn_start(self) -> None:
-        # A skill_activated that resolves to a dissolved top-level interaction (shared prompt.id) is
+    def test_audit_instant_on_flattened_turn_anchored_by_turn_start(self) -> None:
+        # A skill_activated that resolves to a flattened top-level interaction (shared prompt.id) is
         # anchored by the TURN's start (here -> preStep), never by its own lagging timestamp (00:38,
         # which would land it in postStep). Exercises _resolve_cycle_parent's anchor branch.
         traces = self._traces()
