@@ -24,10 +24,13 @@ Two views over the SAME observation copies (#113), differing only in the top-lev
   the per-turn ``claude_code.interaction`` nesting; each ledger step wraps its contiguous run of
   same-parent siblings in a ``step:<subject>`` node inserted INSIDE the interaction
   (:func:`_apply_step_grouping`).
-- **View B — the cycle/phase lens** (``spokecycle-<spoke>``, :func:`build_cycle_batch`). Dissolves
-  the interaction layer and re-homes the copies onto a pure cycle axis — ``preStep`` + one
-  ``step:<subject>`` per ledger task + ``postStep`` — placing each real span by its timestamp and
-  letting audit instants ride their tool/llm_request by causal key (:func:`_apply_cycle_axis`).
+- **View B — the cycle/phase lens** (``spokecycle-<spoke>``, :func:`build_cycle_batch`). Flattens
+  each top-level ``claude_code.interaction`` from a container to a childless leaf turn-marker and
+  re-homes the copies onto a pure cycle axis — ``preStep`` + one ``step:<subject>`` per ledger task
+  + ``postStep`` — placing each real span (and each turn-marker) by its timestamp and letting audit
+  instants ride their tool/llm_request by causal key (:func:`_apply_cycle_axis`). The childless
+  marker is stamped with its turn's ``metadata.rollup`` (the sum of its pre-flatten subtree, whose
+  generations re-home onto the steps), recovering per-turn cost reading (#114).
   Its copies live in a separate id namespace, so the two traces never collide (~2x copies per
   spoke in the local store, a conscious choice).
 
@@ -337,7 +340,8 @@ class StepWindow(NamedTuple):
 # Matches the numeric task id in a TaskCreate result ("Task #1 created successfully: …"); the
 # matching TaskUpdate carries the same id (bare digits) in its ``taskId`` input.
 _TASK_ID_RE = re.compile(r"#(\d+)")
-# The native per-turn container span; dissolved into the step timeline when grouping is active.
+# The native per-turn container span; kept nested in View A, flattened to a childless leaf
+# turn-marker on the cycle axis in View B (#114).
 _INTERACTION_NAME = "claude_code.interaction"
 # The visible Skill tool span and the span-less lifecycle event it activates (#110 AC2). The
 # event carries no ``tool_use_id``, so it is matched to its tool by ``prompt.id`` + ``skill.name``
@@ -1721,7 +1725,7 @@ def _resolve_cycle_parent(
     body: dict[str, Any],
     parent_a: str,
     *,
-    dissolved: set[str],
+    flattened: set[str],
     by_id_a: dict[str, dict[str, Any]],
     a_root_id: str,
     interaction_start: dict[str, str | None],
@@ -1733,11 +1737,12 @@ def _resolve_cycle_parent(
 
     A copy whose View A parent is a surviving span (a tool, llm_request, sub-agent, or nested
     interaction) keeps that parent (rides along by causal key). A copy left at the synthetic root
-    or under a dissolved top-level interaction lands on the cycle axis: a reliably-timestamped span
-    by its own ``startTime``, an audit instant by its dissolved turn's start (never its lagging
-    own time), falling back to ``preStep``.
+    or under a flattened top-level interaction lands on the cycle axis: a reliably-timestamped span
+    by its own ``startTime``, an audit instant by its turn's start (never its lagging own time),
+    falling back to ``preStep``. The flattened top-level interaction marker itself is just such a
+    reliably-timestamped span (parent is the root), so it lands in the step window of its own start.
     """
-    if parent_a != a_root_id and parent_a not in dissolved and parent_a in by_id_a:
+    if parent_a != a_root_id and parent_a not in flattened and parent_a in by_id_a:
         return _cycle_copy_id(parent_a)
     if not windows:
         return root_id  # no ledger -> no cycle axis; copies hang flat under the cycle root
@@ -1761,10 +1766,14 @@ def _apply_cycle_axis(
     base_ts: str,
     latest: str,
 ) -> tuple[list[IngestEvent], list[IngestEvent]]:
-    """Re-home the copies onto the cycle axis and build its nodes (#113 View B).
+    """Re-home the copies onto the cycle axis and build its nodes (#113 View B, #114 turn markers).
 
-    Remaps every surviving copy into the cycle id namespace, dissolves the top-level interactions
-    (their children land on the axis), and parents each copy via :func:`_resolve_cycle_parent`. Returns
+    Remaps every copy into the cycle id namespace, flattens the top-level interactions from
+    containers to childless leaf markers (their children land on the axis by their own time; the
+    marker itself lands in the step window of its own start), and parents each copy via
+    :func:`_resolve_cycle_parent`. Each flattened marker is stamped with its turn's
+    ``metadata.rollup`` — the sum of its pre-flatten View A subtree — so the per-turn token/cost
+    total stays readable even though the marker is now childless (#114). Returns
     ``(cycle_copies, step_events)``; the copies are mutated in place.
     """
     interaction_start: dict[str, str | None] = {
@@ -1774,7 +1783,7 @@ def _apply_cycle_axis(
         if _is_interaction(observation)
     }
     by_id_a = {event["body"]["id"]: event["body"] for event in copies}
-    dissolved = {
+    flattened = {
         iid
         for iid in interaction_start
         if iid in by_id_a and by_id_a[iid]["parentObservationId"] == a_root_id
@@ -1787,20 +1796,29 @@ def _apply_cycle_axis(
         if windows
         else []
     )
+    # Each flattened marker becomes childless on the cycle axis, so neither _apply_container_rollups
+    # (which skips childless nodes) nor Langfuse's descendant aggregation can recover the turn's
+    # token/cost total once its generations re-home onto the steps. Precompute it from the still-
+    # intact View A subtree and stamp it onto the marker so per-turn cost stays readable (#114). It
+    # is kept as metadata.rollup, not usageDetails, so the marker's former children — now its step
+    # siblings — are not double-counted in the step/root rollups (subtree_totals sums usageDetails).
+    a_by_id, a_children = build_tree([event["body"] for event in copies])
+    turn_rollup = {
+        iid: rollup_metadata(subtree_totals(iid, a_by_id, a_children)) for iid in flattened
+    }
     kept: list[IngestEvent] = []
     for event in copies:
         body = event["body"]
-        if body["id"] in dissolved:
-            continue  # drop the top-level interaction node — View B has no interaction layer
+        orig_id = body["id"]
         parent_a = body["parentObservationId"]
-        new_id = _cycle_copy_id(body["id"])
+        new_id = _cycle_copy_id(orig_id)
         body["id"] = new_id
         event["id"] = new_id
         body["traceId"] = trace_id
         body["parentObservationId"] = _resolve_cycle_parent(
             body,
             parent_a,
-            dissolved=dissolved,
+            flattened=flattened,
             by_id_a=by_id_a,
             a_root_id=a_root_id,
             interaction_start=interaction_start,
@@ -1808,6 +1826,8 @@ def _apply_cycle_axis(
             step_id_for=step_id_for,
             root_id=root_id,
         )
+        if orig_id in flattened:
+            body.setdefault("metadata", {})["rollup"] = turn_rollup[orig_id]
         kept.append(event)
     return kept, step_events
 
@@ -1825,8 +1845,12 @@ def build_cycle_batch(
     timeline. Real spans (``tool:*`` / ``claude_code.llm_request``) are placed under the step
     whose window contains their ``startTime`` (gap -> preceding step); audit instants ride along
     under their tool / llm_request by causal key, never their lagging timestamp
-    (:func:`_apply_cycle_axis`). The copies live in a separate id namespace so they never collide
-    with View A's in the local Langfuse store. A non-ledger spoke emits no cycle-axis nodes.
+    (:func:`_apply_cycle_axis`). Each top-level ``claude_code.interaction`` is flattened from a
+    container to a childless leaf turn-marker, placed in the step window of its own ``startTime`` as
+    a sibling of its former children and stamped with its turn's ``metadata.rollup`` aggregate
+    (#114); nested sub-agent interactions keep riding their invoking tool. The copies live in a
+    separate id namespace so they never collide with View A's in the local Langfuse store. A
+    non-ledger spoke emits no cycle-axis nodes.
 
     View B carries the copies' assembly-time rich fields (``input``/``output``, ``usageDetails``,
     ``costDetails``, ``metadata``) and per-container ``rollup`` only. The heavier per-call
