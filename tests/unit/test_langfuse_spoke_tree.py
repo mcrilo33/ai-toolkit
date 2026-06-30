@@ -3207,15 +3207,162 @@ class TestCycleView:
             "tr", "wt"
         )
 
-    def test_top_level_interaction_is_dissolved(self) -> None:
+    def test_top_level_interaction_kept_as_childless_leaf(self) -> None:
+        # #114: the top-level turn is no longer dropped — it survives as a flat marker with no
+        # children (its former children re-home onto their own steps, becoming its siblings).
         batch = build_cycle_batch(self._traces(), SPOKE, self._content())
 
-        assert not _has_cycle_copy(batch, "tr", "i1")
+        assert _has_cycle_copy(batch, "tr", "i1")
+        leaf_id = cycle_copy_id_for("tr", "i1")
+        children = [e for e in batch if e.get("body", {}).get("parentObservationId") == leaf_id]
+        assert children == []
+
+    def test_interaction_leaf_lands_in_step_window_of_its_own_start(self) -> None:
+        # #114: the marker's own start (00:00:00) precedes the task window (in_progress at 00:05),
+        # so it lands in preStep — the cycle-axis window containing its start.
+        batch = build_cycle_batch(self._traces(), SPOKE, self._content())
+
+        assert (
+            _by_cycle(batch, "tr", "i1")["body"]["parentObservationId"]
+            == _cycle_step(batch, "preStep")["id"]
+        )
+
+    def test_interaction_leaf_carries_turn_token_cost_aggregate(self) -> None:
+        # #114: the leaf preserves the interaction's native rich fields (per-turn tokens/cost/
+        # metadata), recovering per-turn cost reading; being childless it gets no synthesized rollup.
+        traces = self._traces()
+        traces[0][1][0]["usageDetails"] = {"input": 1200, "output": 340}
+        traces[0][1][0]["metadata"] = {"kind": "turn"}
+
+        batch = build_cycle_batch(traces, SPOKE, self._content())
+
+        leaf = _by_cycle(batch, "tr", "i1")["body"]
+        assert leaf["usageDetails"] == {"input": 1200, "output": 340}
+        assert leaf["metadata"]["kind"] == "turn"
+        assert "rollup" not in leaf.get("metadata", {})
+
+    def _straddle_content(self) -> dict[str, ToolContent]:
+        return {
+            "tu-c1": ToolContent({"subject": "one"}, "Task #1 created successfully: one"),
+            "tu-s1": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
+            "tu-e1": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
+            "tu-c2": ToolContent({"subject": "two"}, "Task #2 created successfully: two"),
+            "tu-s2": ToolContent({"taskId": "2", "status": "in_progress"}, "ok"),
+            "tu-e2": ToolContent({"taskId": "2", "status": "completed"}, "ok"),
+        }
+
+    def _straddle_traces(self) -> list[tuple[str, list[dict]]]:
+        # Step one: [00:05, 00:15]; step two: [00:25, 00:35]. One interaction whose own start
+        # (00:00:10) sits inside step one, but whose work spans straddle BOTH steps.
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:10Z",
+            endTime="2026-01-02T00:00:40Z",
+        )
+        spans = [
+            interaction,
+            _ledger_child(
+                "c1",
+                "tool:TaskCreate",
+                "tu-c1",
+                parent="i1",
+                start="2026-01-02T00:00:01Z",
+                end="2026-01-02T00:00:01Z",
+            ),
+            _ledger_child(
+                "s1",
+                "tool:TaskUpdate",
+                "tu-s1",
+                parent="i1",
+                start="2026-01-02T00:00:05Z",
+                end="2026-01-02T00:00:05Z",
+            ),
+            _ledger_child(
+                "wa",
+                "tool:Edit",
+                "tu-wa",
+                parent="i1",
+                start="2026-01-02T00:00:12Z",
+                end="2026-01-02T00:00:13Z",
+            ),
+            _ledger_child(
+                "e1",
+                "tool:TaskUpdate",
+                "tu-e1",
+                parent="i1",
+                start="2026-01-02T00:00:15Z",
+                end="2026-01-02T00:00:15Z",
+            ),
+            _ledger_child(
+                "c2",
+                "tool:TaskCreate",
+                "tu-c2",
+                parent="i1",
+                start="2026-01-02T00:00:20Z",
+                end="2026-01-02T00:00:20Z",
+            ),
+            _ledger_child(
+                "s2",
+                "tool:TaskUpdate",
+                "tu-s2",
+                parent="i1",
+                start="2026-01-02T00:00:25Z",
+                end="2026-01-02T00:00:25Z",
+            ),
+            _ledger_child(
+                "wb",
+                "tool:Bash",
+                "tu-wb",
+                parent="i1",
+                start="2026-01-02T00:00:30Z",
+                end="2026-01-02T00:00:31Z",
+            ),
+            _ledger_child(
+                "e2",
+                "tool:TaskUpdate",
+                "tu-e2",
+                parent="i1",
+                start="2026-01-02T00:00:35Z",
+                end="2026-01-02T00:00:35Z",
+            ),
+        ]
+        return [("tr", spans)]
+
+    def test_straddle_marker_in_start_step_children_stay_distributed(self) -> None:
+        # #114 straddle: the interaction marker lands in its START step (step:one), while its
+        # former work spans stay distributed across their own steps (wa->one, wb->two).
+        batch = build_cycle_batch(self._straddle_traces(), SPOKE, self._straddle_content())
+
+        assert (
+            _by_cycle(batch, "tr", "i1")["body"]["parentObservationId"]
+            == _cycle_step(batch, "step:one")["id"]
+        )
+        assert (
+            _by_cycle(batch, "tr", "wa")["body"]["parentObservationId"]
+            == _cycle_step(batch, "step:one")["id"]
+        )
+        assert (
+            _by_cycle(batch, "tr", "wb")["body"]["parentObservationId"]
+            == _cycle_step(batch, "step:two")["id"]
+        )
 
     def test_non_ledger_spoke_emits_no_cycle_step_nodes(self) -> None:
         batch = build_cycle_batch(_traces(), SPOKE)
 
         assert not any(e["id"].startswith(_CYCLE_STEP_PREFIX) for e in batch)
+
+    def test_non_ledger_spoke_keeps_interaction_as_leaf_under_root(self) -> None:
+        # #114: even without a ledger (no cycle axis), the top-level turn survives as a childless
+        # leaf hanging under the cycle root rather than being dropped.
+        batch = build_cycle_batch(_traces(), SPOKE)
+
+        assert _has_cycle_copy(batch, "trace-int", "i1")
+        leaf = _by_cycle(batch, "trace-int", "i1")["body"]
+        assert leaf["parentObservationId"] == cycle_root_id_for(SPOKE)
+        leaf_id = cycle_copy_id_for("trace-int", "i1")
+        assert not [e for e in batch if e.get("body", {}).get("parentObservationId") == leaf_id]
 
     def _gap_content(self) -> dict[str, ToolContent]:
         return {
