@@ -697,3 +697,16 @@ def test_base_start_point_fails_when_base_missing(tmp_path: Path) -> None:
     # Exactly 1: a deliberate refusal, not bash's 127 command-not-found.
     assert result.returncode == 1
     assert result.stdout.strip() == ""
+
+
+def test_base_branch_skips_init_default_branch_without_ref(tmp_path: Path) -> None:
+    # Tier 4's existence guard, negative side: an init.defaultBranch naming a
+    # branch that does NOT exist locally is skipped (tier 5 fires) — dropping
+    # the guard would make every spoke branch from a nonexistent ref.
+    repo = _make_base_repo(tmp_path, branch="main")
+    _git_in(repo, "config", "init.defaultBranch", "ghost")
+
+    result = _resolve_base(repo)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "main"

@@ -58,6 +58,8 @@ WORKTREE_NEW = Path(__file__).resolve().parents[2] / "scripts" / "worktree-new.s
 # init.templateDir, protocol settings) must not reach the commits/pushes the
 # tests drive — this repo itself ships installable git hooks.
 _GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+# The host's base-branch override (#117) must never steer the script under test.
+_GIT_ENV.pop("AI_TOOLKIT_BASE_BRANCH", None)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -474,7 +476,10 @@ def test_agent_launch_injects_wt_spoke_marker_for_adhoc_slug(hub: Path, tmp_path
     assert proc.returncode == 0, proc.stderr
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation"
-    assert "WT_SPOKE=fix-parser CLAUDE_EFFORT=max claude --model claude-fable-5\\[1m\\]" in new_window[0]
+    assert (
+        "WT_SPOKE=fix-parser CLAUDE_EFFORT=max claude --model claude-fable-5\\[1m\\]"
+        in new_window[0]
+    )
 
 
 def test_manual_fallback_advice_carries_wt_spoke_marker(hub: Path, tmp_path: Path) -> None:
@@ -1047,3 +1052,64 @@ def test_mode_flag_stamps_afk(hub: Path) -> None:
 
     assert proc.returncode == 0, proc.stderr
     assert _pointer(hub, "8", "mode") == "afk"
+
+
+# --- configurable base branch (issue #117) --------------------------------------
+# New spokes branch from the RESOLVED base (origin/<base> when the remote ref
+# exists, else local <base>) — never implicitly from whatever the hub's HEAD
+# happens to be. `git config ai-toolkit.base-branch` is the per-clone knob.
+
+
+def _add_develop(hub: Path) -> str:
+    """Create `develop` one commit ahead of main, push it, return its tip sha.
+
+    Leaves the hub checked out back on main so the old branch-from-HEAD
+    behavior and the new branch-from-base behavior produce DIFFERENT commits.
+    """
+    _git(hub, "checkout", "-q", "-b", "develop")
+    (hub / "develop.txt").write_text("develop\n")
+    _git(hub, "add", "develop.txt")
+    _git(hub, "commit", "-qm", "feat: develop seed", "-m", "Refs #0")
+    _git(hub, "push", "-q", "-u", "origin", "develop")
+    tip = _git(hub, "rev-parse", "HEAD").strip()
+    _git(hub, "checkout", "-q", "main")
+    return tip
+
+
+def test_new_branches_from_configured_base(hub: Path, tmp_path: Path) -> None:
+    develop_tip = _add_develop(hub)
+    _git(hub, "config", "ai-toolkit.base-branch", "develop")
+
+    proc, _ = _run_new(hub, tmp_path, "9", "cfg-base", "--no-code", "--no-terminal")
+
+    assert proc.returncode == 0, proc.stderr
+    wt = hub.parent / f"{hub.name}-9"
+    assert _git(wt, "rev-parse", "HEAD").strip() == develop_tip
+
+
+def test_new_unset_config_branches_from_origin_base(hub: Path, tmp_path: Path) -> None:
+    # Nothing configured: the resolved base is main, and the spoke starts at
+    # origin/main — an unpushed hub-local commit is deliberately NOT inherited
+    # (#117: spokes start from the shared integration state, not hub drift).
+    origin_tip = _git(hub, "rev-parse", "origin/main").strip()
+    (hub / "unpushed.txt").write_text("local only\n")
+    _git(hub, "add", "unpushed.txt")
+    _git(hub, "commit", "-qm", "chore: unpushed hub drift", "-m", "Refs #0")
+
+    proc, _ = _run_new(hub, tmp_path, "9", "cfg-base", "--no-code", "--no-terminal")
+
+    assert proc.returncode == 0, proc.stderr
+    wt = hub.parent / f"{hub.name}-9"
+    assert _git(wt, "rev-parse", "HEAD").strip() == origin_tip
+
+
+def test_new_dies_when_configured_base_missing(hub: Path, tmp_path: Path) -> None:
+    # A config typo must die loudly BEFORE creating anything — never silently
+    # branch from some other ref.
+    _git(hub, "config", "ai-toolkit.base-branch", "ghost")
+
+    proc, _ = _run_new(hub, tmp_path, "9", "cfg-base", "--no-code", "--no-terminal")
+
+    assert proc.returncode != 0
+    assert "ghost" in proc.stderr
+    assert not (hub.parent / f"{hub.name}-9").exists()

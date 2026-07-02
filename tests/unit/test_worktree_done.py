@@ -388,3 +388,25 @@ def test_recent_cleanup_removes_history_list_entry(hub: Path, tmp_path: Path) ->
 
     assert proc.returncode == 0, proc.stderr
     assert f"file://{wt}" not in _history_uris(storage)
+
+
+# --- configurable base branch (issue #117) --------------------------------------
+
+
+def test_done_prunes_branch_merged_into_configured_base(hub: Path, tmp_path: Path) -> None:
+    # The merged-ness prune check measures against the RESOLVED base branch,
+    # not whatever branch the hub's HEAD happens to be on: a branch merged into
+    # the configured develop is pruned even while the hub sits on main.
+    _git(hub, "checkout", "-q", "-b", "develop")
+    _git(hub, "checkout", "-q", "main")
+    wt = _make_spoke(hub, tmp_path, "feature/7-base", push=False, merge=False)
+    assert wt.exists()
+    _git(hub, "checkout", "-q", "develop")
+    _git(hub, "merge", "-q", "--no-ff", "feature/7-base", "-m", "merge")
+    _git(hub, "checkout", "-q", "main")
+    _git(hub, "config", "ai-toolkit.base-branch", "develop")
+
+    proc, _ = _run_done(hub, tmp_path, "7")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "feature/7-base" not in _local_branches(hub)

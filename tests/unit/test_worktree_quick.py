@@ -198,3 +198,25 @@ def test_rejects_unknown_type(hub: Path, tmp_path: Path) -> None:
 
     assert proc.returncode != 0
     assert "type" in proc.stderr.lower()
+
+
+# --- configurable base branch (issue #117) --------------------------------------
+
+
+def test_quick_branches_from_configured_base(hub: Path, tmp_path: Path) -> None:
+    # The quick lane branches from the resolved base too (origin/<base> when
+    # pushed), not from the hub's current HEAD.
+    _git(hub, "checkout", "-q", "-b", "develop")
+    (hub / "develop.txt").write_text("develop\n")
+    _git(hub, "add", "develop.txt")
+    _git(hub, "commit", "-qm", "feat: develop seed", "-m", "Refs #0")
+    _git(hub, "push", "-q", "-u", "origin", "develop")
+    develop_tip = _git(hub, "rev-parse", "HEAD").strip()
+    _git(hub, "checkout", "-q", "main")
+    _git(hub, "config", "ai-toolkit.base-branch", "develop")
+
+    proc, _ = _run_quick(hub, tmp_path, "cfg-base")
+
+    assert proc.returncode == 0, proc.stderr
+    wt = hub.parent / f"{hub.name}-cfg-base"
+    assert _git(wt, "rev-parse", "HEAD").strip() == develop_tip

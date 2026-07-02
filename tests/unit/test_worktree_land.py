@@ -815,3 +815,52 @@ def test_local_refuses_bare_branch_with_upstream(hub: Path, tmp_path: Path) -> N
     assert proc.returncode != 0
     assert "upstream" in proc.stderr.lower()
     assert not (hub / "feature-9-bare-pushed.txt").exists()  # nothing was merged
+
+
+# --- configurable base branch (issue #117) --------------------------------------
+# Landing merges into the RESOLVED base branch (git config ai-toolkit.base-branch
+# > AI_TOOLKIT_BASE_BRANCH > origin/HEAD > main/master), not literal main.
+
+
+def _add_develop(hub: Path) -> str:
+    """Create `develop` one commit ahead of main, push it, return its tip sha.
+
+    Leaves the hub checked out on develop (the configured integration branch).
+    """
+    _git(hub, "checkout", "-q", "-b", "develop")
+    (hub / "develop.txt").write_text("develop\n")
+    _git(hub, "add", "develop.txt")
+    _git(hub, "commit", "-qm", "feat: develop seed", "-m", "Refs #0")
+    _git(hub, "push", "-q", "-u", "origin", "develop")
+    return _git(hub, "rev-parse", "HEAD").strip()
+
+
+def test_land_refuses_hub_not_on_configured_base(hub: Path, tmp_path: Path) -> None:
+    # config says develop; the hub sits on main → refuse BEFORE any merge,
+    # naming the configured base (proves resolution honors the config tier).
+    _add_develop(hub)
+    _git(hub, "checkout", "-q", "main")
+    _git(hub, "config", "ai-toolkit.base-branch", "develop")
+    main_before = _git(hub, "rev-parse", "main").strip()
+    _make_spoke(hub, tmp_path, "feature/1-work", push=True)
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode != 0
+    assert "develop" in proc.stderr
+    assert _git(hub, "rev-parse", "main").strip() == main_before
+
+
+def test_land_merges_into_configured_base(hub: Path, tmp_path: Path) -> None:
+    # hub on develop (the configured base): landing merges the spoke into
+    # develop and leaves main untouched.
+    _add_develop(hub)
+    _git(hub, "config", "ai-toolkit.base-branch", "develop")
+    main_before = _git(hub, "rev-parse", "main").strip()
+    _make_spoke(hub, tmp_path, "feature/1-work", push=True)
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "feat: work" in _git(hub, "log", "--oneline", "develop")
+    assert _git(hub, "rev-parse", "main").strip() == main_before
