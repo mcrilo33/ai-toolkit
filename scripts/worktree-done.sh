@@ -170,9 +170,9 @@ if [ -z "$NO_CODE" ]; then
 fi
 
 # --- prune the branch, but only when it is fully merged ----------------------
-# We removed the worktree from the hub (now cwd), so HEAD here is the hub's
-# current branch — the integration target. A branch that is its ancestor is
-# fully merged and safe to delete; otherwise keep it and print the hint.
+# The integration target is the resolved base branch (wt_base_branch, issue
+# #117). A branch that is its ancestor is fully merged and safe to delete;
+# otherwise keep it and print the hint.
 prune_branch() {
   if [ -z "$WT_BRANCH" ]; then
     return                       # detached worktree — no branch to prune
@@ -181,17 +181,22 @@ prune_branch() {
     echo "  branch $WT_BRANCH kept (--keep-branch)."
     return
   fi
-  local hub_branch
-  hub_branch="$(git symbolic-ref --short -q HEAD || true)"
-  if [ -z "$hub_branch" ] || ! git merge-base --is-ancestor "$WT_BRANCH" "$hub_branch"; then
-    echo "  branch $WT_BRANCH is not merged into ${hub_branch:-HEAD} — kept."
+  # Merged-ness is measured against the RESOLVED base branch (issue #117), not
+  # whatever branch the hub's HEAD happens to be on.
+  local base_branch
+  base_branch="$(wt_base_branch "$REPO_ROOT")"
+  if ! git merge-base --is-ancestor "$WT_BRANCH" "$base_branch" 2>/dev/null; then
+    echo "  branch $WT_BRANCH is not merged into ${base_branch} — kept."
     echo "  Push and merge it first, then re-run; or abandon it with: git branch -D \"$WT_BRANCH\""
     return
   fi
-  # Local first: if `git branch -d` (the safe form, a second net under the
-  # merge-base gate) refuses, leave origin/<branch> alone too rather than delete
-  # a remote whose local counterpart we couldn't remove.
-  if ! git branch -d "$WT_BRANCH"; then
+  # Local first. `git branch -d`'s own merged check considers only HEAD (or an
+  # upstream), so with the hub parked off the base it would refuse a branch the
+  # gate above already PROVED merged into the base (issue #117); -D is safe
+  # here because that ancestor proof is the authority. If even -D refuses,
+  # leave origin/<branch> alone too rather than delete a remote whose local
+  # counterpart we couldn't remove.
+  if ! git branch -D "$WT_BRANCH"; then
     wt_warn "couldn't delete local branch $WT_BRANCH — see git's message above; leaving origin/$WT_BRANCH (if any) in place."
     return
   fi

@@ -88,18 +88,12 @@ REPO_ROOT="$(wt_main_root)" || wt_die "could not locate the main worktree"
   || wt_die "landing is hub-side — run from the main checkout ($REPO_ROOT), not a worktree"
 cd "$REPO_ROOT"
 
-# Default branch: origin/HEAD when set, else the conventional main/master.
-DEFAULT="$(git symbolic-ref -q --short refs/remotes/origin/HEAD || true)"
-DEFAULT="${DEFAULT#origin/}"
-if [ -z "$DEFAULT" ]; then
-  if git show-ref --verify --quiet refs/heads/main; then DEFAULT="main"
-  elif git show-ref --verify --quiet refs/heads/master; then DEFAULT="master"
-  else wt_die "could not determine the default branch"
-  fi
-fi
+# Base (integration) branch: the canonical resolver (issue #117) —
+# config ai-toolkit.base-branch > AI_TOOLKIT_BASE_BRANCH > origin/HEAD > main/master.
+DEFAULT="$(wt_base_branch "$REPO_ROOT")"
 HUB_BRANCH="$(git symbolic-ref --short -q HEAD || true)"
 [ "$HUB_BRANCH" = "$DEFAULT" ] \
-  || wt_die "hub is on '${HUB_BRANCH:-detached HEAD}' — land from the default branch '$DEFAULT'"
+  || wt_die "hub is on '${HUB_BRANCH:-detached HEAD}' — land from the base branch '$DEFAULT'"
 [ -z "$(git status --porcelain -uno)" ] \
   || wt_die "hub checkout is dirty — commit or stash before landing"
 

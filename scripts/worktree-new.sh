@@ -138,9 +138,17 @@ if git show-ref --verify --quiet "refs/remotes/origin/${BRANCH}"; then
   wt_warn "branch ${BRANCH} already exists on origin; the new worktree starts a fresh local branch."
 fi
 
+# Branch from the RESOLVED base (issue #117) — origin/<base> when the remote
+# ref exists, else the local <base> — never implicitly from the hub's HEAD, so
+# a repo integrating on develop (git config ai-toolkit.base-branch) cuts spokes
+# from the right place and hub-local drift is not inherited.
+BASE_BRANCH="$(wt_base_branch "$REPO_ROOT")"
+BASE_START="$(wt_base_start_point "$REPO_ROOT")" \
+  || wt_die "base branch '$BASE_BRANCH' has no ref (neither origin/$BASE_BRANCH nor local) — fix git config ai-toolkit.base-branch / AI_TOOLKIT_BASE_BRANCH"
+
 echo "→ creating worktree  $WT_DIR"
-echo "→ new branch         $BRANCH"
-git worktree add "$WT_DIR" -b "$BRANCH"
+echo "→ new branch         $BRANCH (from $BASE_START)"
+git worktree add "$WT_DIR" -b "$BRANCH" "$BASE_START"
 
 # --- mint the spoke_run_id ---------------------------------------------------
 # Every hook/script emitting telemetry inside this worktree reads this id, so

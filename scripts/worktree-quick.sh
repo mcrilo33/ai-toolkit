@@ -72,9 +72,15 @@ if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
   wt_die "branch already exists locally: ${BRANCH} — check it out, or pass a different slug"
 fi
 
+# Branch from the resolved base (issue #117), mirroring worktree-new.sh —
+# origin/<base> when the remote ref exists, else the local <base>.
+BASE_BRANCH="$(wt_base_branch "$REPO_ROOT")"
+BASE_START="$(wt_base_start_point "$REPO_ROOT")" \
+  || wt_die "base branch '$BASE_BRANCH' has no ref (neither origin/$BASE_BRANCH nor local) — fix git config ai-toolkit.base-branch / AI_TOOLKIT_BASE_BRANCH"
+
 echo "→ creating worktree  $WT_DIR"
-echo "→ new branch         $BRANCH"
-git worktree add "$WT_DIR" -b "$BRANCH"
+echo "→ new branch         $BRANCH (from $BASE_START)"
+git worktree add "$WT_DIR" -b "$BRANCH" "$BASE_START"
 
 # --- set the .ai-toolkit/ exclude (resolved for this worktree) ---------------
 # Make .ai-toolkit/ ignored via the repo's git exclude rather than trusting a
