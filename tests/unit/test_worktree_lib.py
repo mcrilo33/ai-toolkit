@@ -285,7 +285,7 @@ def test_proc_start_epoch_is_locale_independent() -> None:
 
 
 def _collector_preflight(
-    *, gate: bool, auth: bool, port_up: bool
+    *, gate: bool, auth: bool, port_up: bool, container_status: str = ""
 ) -> subprocess.CompletedProcess[str]:
     """Run wt_otel_collector_preflight with the two collaborators stubbed.
 
@@ -297,12 +297,19 @@ def _collector_preflight(
     to a benign "no running container" verdict so the already-up path is a clean
     no-op here (its restart behaviour is covered by the dedicated tests below) and
     never probes real docker.
+
+    ``container_status`` drives the down-path recover decision: the docker
+    inspect probe (wt_collector_container_status) is stubbed to this value, so a
+    dead/exited container ("exited"/"created"/"dead") must be REMOVED before the
+    LAUNCH, while an absent one ("") launches with no REMOVE. Default "" keeps the
+    absent case (no stopped container in the way) for the pre-recover tests.
     """
     parts = [
         f"wt_port_listening() {{ return {0 if port_up else 1}; }}",
         'wt_collector_launch() { echo "LAUNCHED $1"; }',
         'wt_collector_running_version() { printf ""; }',
         'wt_collector_remove() { echo "REMOVED"; }',
+        f'wt_collector_container_status() {{ printf "%s" "{container_status}"; }}',
         "export AI_TOOLKIT_OTEL=1" if gate else "unset AI_TOOLKIT_OTEL",
         "export LANGFUSE_BASIC_AUTH=Basic-xyz" if auth else "unset LANGFUSE_BASIC_AUTH",
         "wt_otel_collector_preflight /repo",
@@ -341,6 +348,42 @@ def test_collector_preflight_launches_when_down_and_authed() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "LAUNCHED /repo" in result.stdout
+
+
+def test_collector_preflight_recovers_dead_container() -> None:
+    # Gate on, auth present, :4317 not listening BUT a stopped lf-collector
+    # container still exists (Exited/Created/Dead). A bare `docker run --name
+    # lf-collector` would hit a name conflict (swallowed) and never recover, so the
+    # ensure path must REMOVE the dead container first, then LAUNCH a fresh one.
+    result = _collector_preflight(gate=True, auth=True, port_up=False, container_status="exited")
+
+    assert result.returncode == 0, result.stderr
+    assert "REMOVED" in result.stdout
+    assert "LAUNCHED /repo" in result.stdout
+    # Order matters: remove must precede the relaunch or the --name still clashes.
+    assert result.stdout.index("REMOVED") < result.stdout.index("LAUNCHED")
+
+
+def test_collector_preflight_launches_when_absent_without_recover() -> None:
+    # Gate on, auth present, down, and NO container in the way ("" = absent) →
+    # start exactly one collector and never rm (nothing to recover, no churn).
+    result = _collector_preflight(gate=True, auth=True, port_up=False, container_status="")
+
+    assert result.returncode == 0, result.stderr
+    assert "LAUNCHED /repo" in result.stdout
+    assert "REMOVED" not in result.stdout
+
+
+def test_collector_preflight_dead_but_auth_missing_leaves_container() -> None:
+    # Down with a dead container present but LANGFUSE_BASIC_AUTH unset → warn and
+    # leave it: recovering (rm) without being able to relaunch an authed collector
+    # only strands the port. No REMOVE, no LAUNCH, spawn not failed.
+    result = _collector_preflight(gate=True, auth=False, port_up=False, container_status="exited")
+
+    assert result.returncode == 0, result.stderr
+    assert "REMOVED" not in result.stdout
+    assert "LAUNCHED" not in result.stdout
+    assert "LANGFUSE_BASIC_AUTH" in result.stderr
 
 
 def test_collector_preflight_warns_when_auth_missing() -> None:
