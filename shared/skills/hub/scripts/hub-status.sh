@@ -16,8 +16,22 @@ main_root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
   echo "Not inside a git repository." >&2
   exit 1
 }
-default_branch="$(git -C "$main_root" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')"
-default_branch="${default_branch:-main}"
+
+# The integration base comes from the ONE canonical resolver (issue #117):
+# config ai-toolkit.base-branch > AI_TOOLKIT_BASE_BRANCH > origin/HEAD > … .
+# Two-layout candidates, mirroring hub-afk.sh: co-located sibling in a synced
+# target (.ai-toolkit/scripts/), shared/hooks/lib/ in the ai-toolkit checkout.
+_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for _cand in "$_script_dir/base-branch.sh" "$_script_dir/../../../hooks/lib/base-branch.sh"; do
+  if [ -f "$_cand" ]; then . "$_cand"; break; fi
+done
+unset _cand
+if command -v wt_base_branch >/dev/null 2>&1; then
+  default_branch="$(wt_base_branch "$main_root")"
+else
+  default_branch="$(git -C "$main_root" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')"
+  default_branch="${default_branch:-main}"
+fi
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 

@@ -718,11 +718,18 @@ reap_spoke() {
 _spoke_pane_alive() { [ -n "$(_spoke_pane_target "$1")" ]; }
 
 # _afk_default_ref <wt> -> the ref the spoke branched from, so "has commits" measures work
-# ABOVE the branch point. AFK_DEFAULT_BRANCH wins (tests); else origin/HEAD's target; else
-# the conventional `main`.
+# ABOVE the branch point. AFK_DEFAULT_BRANCH wins (historical top precedence, kept for
+# back-compat — it predates and now aliases AI_TOOLKIT_BASE_BRANCH, which the canonical
+# resolver honors); else wt_base_branch (issue #117: config ai-toolkit.base-branch >
+# AI_TOOLKIT_BASE_BRANCH > origin/HEAD > … > `main`), sourced via worktree-lib.sh above.
 _afk_default_ref() {
   local wt="$1" ref
   [ -n "${AFK_DEFAULT_BRANCH:-}" ] && { printf '%s\n' "$AFK_DEFAULT_BRANCH"; return; }
+  if command -v wt_base_branch >/dev/null 2>&1; then
+    wt_base_branch "$wt"
+    printf '\n'
+    return
+  fi
   ref="$(git -C "$wt" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)"
   printf '%s\n' "${ref:-main}"
 }
