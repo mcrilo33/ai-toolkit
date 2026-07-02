@@ -81,7 +81,7 @@ spoke_pane_live() {
   while IFS= read -r pane; do
     [ -n "$pane" ] || continue
     rp="$(wt_realpath "$pane")"; rp="${rp:-$pane}"
-    printf '%s\n' "$canon" | grep -qxF "$rp" && return 0
+    grep -qxF "$rp" <<<"$canon" && return 0
   done < <(_pane_paths)
   return 1
 }
@@ -97,9 +97,19 @@ ensure_otel_stack() {
 }
 
 # main -> ensure the stack exactly when a spoke is live; a silent no-op otherwise.
+# When a spoke IS live but native OTel is opted out (AI_TOOLKIT_OTEL != 1) the
+# preflights would silently no-op and that spoke's traces are lost — the exact
+# footgun #115 exists to prevent — so surface a one-line stderr notice in that case
+# (it is NOT the "no spoke / already healthy" silent path). Always returns 0: the
+# watchdog must never error out the /loop that drives it.
 main() {
   spoke_pane_live || return 0
+  if [ "${AI_TOOLKIT_OTEL:-}" != "1" ]; then
+    printf '%s\n' "hub-otel-watch: a spoke is live but AI_TOOLKIT_OTEL!=1 — collector/bridge not ensured; that spoke's traces are lost (export AI_TOOLKIT_OTEL=1 to enable)" >&2
+    return 0
+  fi
   ensure_otel_stack
+  return 0
 }
 
 [[ "${BASH_SOURCE[0]}" == "${0}" ]] && main "$@"
