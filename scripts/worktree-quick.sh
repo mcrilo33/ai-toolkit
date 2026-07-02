@@ -73,7 +73,10 @@ if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
 fi
 
 # Branch from the resolved base (issue #117), mirroring worktree-new.sh —
-# origin/<base> when the remote ref exists, else the local <base>.
+# origin/<base> when the remote ref exists, else the local <base>. Fetch first
+# (best-effort, as in worktree-new.sh) so the start point is fresh, not the
+# last-known remote state.
+git fetch origin --quiet 2>/dev/null || true
 BASE_BRANCH="$(wt_base_branch "$REPO_ROOT")"
 BASE_START="$(wt_base_start_point "$REPO_ROOT")" \
   || wt_die "base branch '$BASE_BRANCH' has no ref (neither origin/$BASE_BRANCH nor local) — fix git config ai-toolkit.base-branch / AI_TOOLKIT_BASE_BRANCH"

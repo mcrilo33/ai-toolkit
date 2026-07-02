@@ -29,6 +29,8 @@ WORKTREE_QUICK = Path(__file__).resolve().parents[2] / "scripts" / "worktree-qui
 # Pin git config to nothing so a host's global config never reaches the commits
 # the tests drive (this repo itself ships installable git hooks).
 _GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+# The host's base-branch override (#117) must never steer the script under test.
+_GIT_ENV.pop("AI_TOOLKIT_BASE_BRANCH", None)
 
 
 def _git(repo: Path, *args: str) -> str:

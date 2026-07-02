@@ -28,6 +28,8 @@ WORKTREE_LAND = Path(__file__).resolve().parents[2] / "scripts" / "worktree-land
 # init.templateDir, protocol settings) must not reach the commits/pushes the
 # tests drive — this repo itself ships installable git hooks.
 _GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+# The host's base-branch override (#117) must never steer the script under test.
+_GIT_ENV.pop("AI_TOOLKIT_BASE_BRANCH", None)
 
 
 def _git(repo: Path, *args: str) -> str:
