@@ -29,7 +29,7 @@
 #   AFK_WATCHDOG_SECONDS=60      watchdog poll interval (respawn a crashed supervisor)
 #   AFK_SPOKE_MAX_MINUTES=180    wall-clock ceiling per spoke before a reap
 #   AFK_IDLE_MINUTES=30          a spoke idle this long with no marker AND not waiting → reap
-#   AFK_ANSWERER_CMD             the answerer command (default: claude -p --model opus)
+#   AFK_ANSWERER_CMD             the answerer command (default: claude -p --model claude-fable-5)
 #   AFK_ANSWERER_EFFORT=high     thinking budget for the answerer (exported as CLAUDE_EFFORT)
 #   AFK_NOW                      override "now" (epoch seconds) — testing/cron
 #   AFK_STATE                    state-file path (default: <git-common-dir>/.afk-state)
@@ -481,7 +481,7 @@ EOF
 # parse_decision is line-anchored, so interleaved stderr noise never pollutes a decision.
 run_answerer() {
   local prompt; prompt="$(build_answerer_prompt "$1" "$2")"
-  local cmd="${AFK_ANSWERER_CMD:-claude -p --model opus}"
+  local cmd="${AFK_ANSWERER_CMD:-claude -p --model claude-fable-5}"
   CLAUDE_EFFORT="$AFK_ANSWERER_EFFORT" bash -c "$cmd" <<<"$prompt" 2>&1
 }
 

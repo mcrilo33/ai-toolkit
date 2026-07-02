@@ -198,7 +198,7 @@ scripts/worktree-new.sh <issue> [slug] [type] [flags]
 | `--no-agent` | spawn the terminal but do not launch `claude` |
 
 The spawned agent's model and effort are pinned at dispatch time
-(`CLAUDE_EFFORT=max claude --model fable` by default) so a spoke stays
+(`CLAUDE_EFFORT=max claude --model 'claude-fable-5[1m]'` by default) so a spoke stays
 deterministic even when user-global settings change; override with the
 `WT_AGENT_MODEL` / `WT_AGENT_EFFORT` env vars.
 

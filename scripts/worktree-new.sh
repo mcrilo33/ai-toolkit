@@ -367,7 +367,7 @@ if [ "${AI_TOOLKIT_OTEL:-}" = "1" ]; then
   # (OTEL_EXPORTER_OTLP_HEADERS) is deliberately NOT here — it stays inherited env.
   OTEL_PREFIX="CLAUDE_CODE_ENABLE_TELEMETRY=1 CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 OTEL_TRACES_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp ENABLE_BETA_TRACING_DETAILED=1 OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false OTEL_EXPORTER_OTLP_PROTOCOL=grpc OTEL_EXPORTER_OTLP_ENDPOINT=$(printf '%q' "$OTEL_EXPORTER_OTLP_ENDPOINT") BETA_TRACING_ENDPOINT=$(printf '%q' "$BETA_TRACING_ENDPOINT") OTEL_LOG_USER_PROMPTS=1 OTEL_LOG_TOOL_DETAILS=1 OTEL_LOG_TOOL_CONTENT=1 OTEL_LOG_RAW_API_BODIES=$(printf '%q' "file:${OTEL_BODY_DIR}") AI_TOOLKIT_OTEL_BODY_DIR=$(printf '%q' "$OTEL_BODY_DIR") OTEL_RESOURCE_ATTRIBUTES=$(printf '%q' "spoke_run_id=${SPOKE_RUN_ID}") "
 fi
-AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(printf '%q' "${WT_AGENT_EFFORT:-max}") claude --model $(printf '%q' "${WT_AGENT_MODEL:-opus}")"
+AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(printf '%q' "${WT_AGENT_EFFORT:-max}") claude --model $(printf '%q' "${WT_AGENT_MODEL:-claude-fable-5[1m]}")"
 # Best-effort in-process budget cap for unattended spokes. A caller may set
 # WT_AGENT_BUDGET_ARGS (e.g. "--max-budget-usd 5"); it is a pre-formed multi-arg
 # string appended verbatim (NOT %q-quoted), so leave it unset for ordinary attended
