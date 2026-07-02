@@ -47,6 +47,8 @@ OTHER = "feature/22-other"
 # Pin git config to nothing: a host's global/system config (core.hooksPath,
 # protocol settings, signing) must not reach the fixture repos or the hook.
 _GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+# The host's base-branch override (#117) must never steer the guard under test.
+_GIT_ENV.pop("AI_TOOLKIT_BASE_BRANCH", None)
 
 
 def _payload(command: str) -> str:
@@ -691,3 +693,34 @@ def test_spoke_silent_without_jq(spoke: Path, no_jq_path: str) -> None:
     env["PATH"] = no_jq_path
 
     assert allow_decision(_payload(f"git push -u origin {OWN}"), spoke, env=env) is None
+
+
+# ── Configurable base branch (issue #117) ─────────────────
+
+
+def test_spoke_configured_base_push_denied_as_base_publish(spoke: Path) -> None:
+    # git config ai-toolkit.base-branch develop: pushing develop from a spoke
+    # is the BASE-publish violation (the hub's land step owns it) — not merely
+    # an out-of-scope foreign branch. The distinguishing OWN_MSG names the land
+    # step; the scope message does not. Cursor payload shape: the hard-deny
+    # path (the Claude shape warns instead of blocking).
+    _git(spoke, "config", "ai-toolkit.base-branch", "develop")
+
+    payload = _cursor_shell_payload("git push origin develop", root=spoke)
+
+    result = run_guard(payload, cwd=spoke)
+
+    assert result.returncode == BLOCK
+    assert "land step" in (result.stderr + result.stdout)
+
+
+def test_spoke_main_push_still_denied_when_base_configured(spoke: Path) -> None:
+    # Re-pointing the base at develop must not open a hole for main: a main
+    # push from a spoke stays denied (as an out-of-scope foreign branch).
+    _git(spoke, "config", "ai-toolkit.base-branch", "develop")
+
+    payload = _cursor_shell_payload("git push origin main", root=spoke)
+
+    result = run_guard(payload, cwd=spoke)
+
+    assert result.returncode == BLOCK

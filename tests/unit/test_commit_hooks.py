@@ -1262,7 +1262,13 @@ def _hub_env() -> dict[str, str]:
     falls to the payload/cwd. Without this, a Cursor-driven test run would point
     every hub-guard probe at the IDE's project dir and flip the verdict (cf.
     _no_stamp_key_env)."""
-    return {k: v for k, v in os.environ.items() if k != "CURSOR_PROJECT_DIR"}
+    # AI_TOOLKIT_BASE_BRANCH is also stripped: the host's base-branch override
+    # (#117) must never steer the guard under test.
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("CURSOR_PROJECT_DIR", "AI_TOOLKIT_BASE_BRANCH")
+    }
 
 
 def run_hub_guard(payload: str, *, cwd: Path) -> subprocess.CompletedProcess:
@@ -1682,3 +1688,43 @@ def test_todo_ledger_chained_push_not_bypassed(repo_with_upstream: Path, tmp_pat
     assert (
         run_todo_ledger("cd /tmp && git push", repo_with_upstream, transcript).returncode == BLOCK
     )
+
+
+class TestHubGuardConfigurableBase:
+    """hub-guard follows the resolved base branch (issue #117)."""
+
+    def test_commit_on_configured_base_is_denied(self, git_repo: Path) -> None:
+        # git config ai-toolkit.base-branch develop: the hub invariant guards
+        # the RESOLVED base, so a main checkout parked on develop is the hub.
+        subprocess.run(
+            ["git", "checkout", "-q", "-b", "develop"],
+            cwd=str(git_repo),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "ai-toolkit.base-branch", "develop"],
+            cwd=str(git_repo),
+            check=True,
+            capture_output=True,
+        )
+
+        assert hub_guard_cmd_rc('git commit -m "feat: x"', cwd=git_repo) == BLOCK
+
+    def test_commit_on_main_allowed_when_base_configured(self, git_repo: Path) -> None:
+        # With develop as the configured base, literal main is an ordinary
+        # (spoke-able) branch — the guard must not deny it out of habit.
+        subprocess.run(
+            ["git", "branch", "develop"],
+            cwd=str(git_repo),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "ai-toolkit.base-branch", "develop"],
+            cwd=str(git_repo),
+            check=True,
+            capture_output=True,
+        )
+
+        assert hub_guard_cmd_rc('git commit -m "feat: x"', cwd=git_repo) == ALLOW

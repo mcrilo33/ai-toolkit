@@ -52,6 +52,8 @@ OTHER = "feature/22-other"
 # Pin git config to nothing: a host's global/system config must not reach the
 # fixture repos or the hook.
 _GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+# The host's base-branch override (#117) must never steer the guard under test.
+_GIT_ENV.pop("AI_TOOLKIT_BASE_BRANCH", None)
 
 
 def _payload(command: str) -> str:
@@ -282,3 +284,27 @@ def test_hub_is_noop(hub: Path, command: str) -> None:
     result = run_guard(_payload(command), hub, spoke=False)
 
     assert result.returncode == ALLOW, result.stdout + result.stderr
+
+
+# ── Configurable base branch (issue #117) ─────────────────
+
+
+def test_denies_checkout_of_configured_base(spoke: Path) -> None:
+    # git config ai-toolkit.base-branch develop: the guard protects the
+    # RESOLVED base ref, so a spoke switching to develop is denied exactly
+    # like main is today. (Worktrees share the clone's config.)
+    _git(spoke, "config", "ai-toolkit.base-branch", "develop")
+
+    result = run_guard(_payload("git checkout develop"), spoke, spoke=True)
+
+    assert result.returncode == BLOCK
+
+
+def test_allows_checkout_of_main_when_base_configured(spoke: Path) -> None:
+    # With develop configured as the base, literal main is an ordinary branch —
+    # the guard must not keep denying it out of habit.
+    _git(spoke, "config", "ai-toolkit.base-branch", "develop")
+
+    result = run_guard(_payload("git checkout main"), spoke, spoke=True)
+
+    assert result.returncode == ALLOW
