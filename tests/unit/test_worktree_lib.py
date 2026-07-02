@@ -463,3 +463,237 @@ def test_collector_launch_publishes_four_ports_and_unquoted_auth(tmp_path: Path)
     # Non-secret endpoints defaulted to the local stack.
     assert "LANGFUSE_OTLP_ENDPOINT=http://host.docker.internal:3000/api/public/otel" in recorded
     assert "BRIDGE_OTLP_ENDPOINT=http://host.docker.internal:4319" in recorded
+
+
+# --- wt_base_branch / wt_base_start_point (issue #117) --------------------------
+# One canonical resolver for the integration ("base") branch, shared by the
+# worktree scripts AND the guard hooks: it is DEFINED in
+# shared/hooks/lib/base-branch.sh (so hooks can source it standalone) and
+# worktree-lib.sh sources it the same way it sources telemetry.sh. Precedence:
+#   git config ai-toolkit.base-branch  >  AI_TOOLKIT_BASE_BRANCH env
+#   >  origin/HEAD  >  init.defaultBranch (existing local ref)
+#   >  local main  >  local master  >  literal "main".
+
+BASE_BRANCH_LIB = (
+    Path(__file__).resolve().parents[2] / "shared" / "hooks" / "lib" / "base-branch.sh"
+)
+
+
+def _base_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Env for base-branch tests: host git config + resolver env pinned out."""
+    env = {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "TZ": "UTC",
+    }
+    env.pop("AI_TOOLKIT_BASE_BRANCH", None)
+    env.pop("AFK_DEFAULT_BRANCH", None)
+    if extra:
+        env.update(extra)
+    return env
+
+
+def _git_in(repo: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=str(repo), check=True, capture_output=True, env=_base_env())
+
+
+def _make_base_repo(
+    base: Path, *, branch: str = "main", with_remote: bool = False, origin_head: bool = False
+) -> Path:
+    """A one-commit repo on `branch`; optionally with a pushed origin remote.
+
+    origin_head additionally points refs/remotes/origin/HEAD at `branch`
+    (implies with_remote), mirroring what a clone gets for free.
+    """
+    repo = base / "repo"
+    subprocess.run(
+        ["git", "init", "-q", "-b", branch, str(repo)],
+        check=True,
+        capture_output=True,
+        env=_base_env(),
+    )
+    for k, v in (("user.email", "t@t.t"), ("user.name", "t"), ("commit.gpgsign", "false")):
+        _git_in(repo, "config", k, v)
+    (repo / "seed.txt").write_text("seed\n")
+    _git_in(repo, "add", "seed.txt")
+    _git_in(repo, "commit", "-qm", "seed")
+    if with_remote or origin_head:
+        bare = base / "remote.git"
+        subprocess.run(
+            ["git", "init", "-q", "--bare", str(bare)],
+            check=True,
+            capture_output=True,
+            env=_base_env(),
+        )
+        _git_in(repo, "remote", "add", "origin", str(bare))
+        _git_in(repo, "push", "-q", "-u", "origin", branch)
+        if origin_head:
+            _git_in(
+                repo,
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                f"refs/remotes/origin/{branch}",
+            )
+    return repo
+
+
+def _resolve_base(
+    repo: Path, *, env_extra: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Source worktree-lib.sh and run wt_base_branch against `repo`."""
+    return subprocess.run(
+        ["bash", "-c", f'source "{WT_LIB}"; wt_base_branch "$1"', "bash", str(repo)],
+        capture_output=True,
+        text=True,
+        env=_base_env(env_extra),
+    )
+
+
+def test_base_branch_config_beats_origin_head(tmp_path: Path) -> None:
+    # git config ai-toolkit.base-branch is tier 1: it wins even when origin/HEAD
+    # points elsewhere, and is honored without the branch existing yet (explicit
+    # operator intent; existence checks belong to the call sites).
+    repo = _make_base_repo(tmp_path, origin_head=True)
+    _git_in(repo, "config", "ai-toolkit.base-branch", "develop")
+
+    result = _resolve_base(repo)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "develop"
+
+
+def test_base_branch_config_beats_env(tmp_path: Path) -> None:
+    # The issue's numbered precedence: per-clone config (tier 1) over the
+    # one-shot env override (tier 2).
+    repo = _make_base_repo(tmp_path, origin_head=True)
+    _git_in(repo, "config", "ai-toolkit.base-branch", "develop")
+
+    result = _resolve_base(repo, env_extra={"AI_TOOLKIT_BASE_BRANCH": "release/1.0"})
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "develop"
+
+
+def test_base_branch_env_beats_origin_head(tmp_path: Path) -> None:
+    repo = _make_base_repo(tmp_path, origin_head=True)
+
+    result = _resolve_base(repo, env_extra={"AI_TOOLKIT_BASE_BRANCH": "release/1.0"})
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "release/1.0"
+
+
+def test_base_branch_uses_origin_head(tmp_path: Path) -> None:
+    # Nothing configured: origin/HEAD names the base — today's behavior, which
+    # an unset config must preserve exactly (AC).
+    repo = _make_base_repo(tmp_path, branch="develop", origin_head=True)
+
+    result = _resolve_base(repo)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "develop"
+
+
+def test_base_branch_uses_init_default_branch_ref(tmp_path: Path) -> None:
+    # No config/env/origin-HEAD: an init.defaultBranch whose local ref exists is
+    # honored — the tier the guard hooks always had, kept so pointing them at
+    # this shared resolver changes nothing for them.
+    repo = _make_base_repo(tmp_path, branch="trunk")
+    _git_in(repo, "config", "init.defaultBranch", "trunk")
+
+    result = _resolve_base(repo)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "trunk"
+
+
+def test_base_branch_falls_back_to_local_main(tmp_path: Path) -> None:
+    repo = _make_base_repo(tmp_path, branch="main")
+
+    result = _resolve_base(repo)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "main"
+
+
+def test_base_branch_falls_back_to_local_master(tmp_path: Path) -> None:
+    repo = _make_base_repo(tmp_path, branch="master")
+
+    result = _resolve_base(repo)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "master"
+
+
+def test_base_branch_last_resort_is_main(tmp_path: Path) -> None:
+    # No signal at all (repo on an unrelated branch, no remote, no config):
+    # print "main" rather than fail — the guards' historical last resort.
+    repo = _make_base_repo(tmp_path, branch="scratch")
+
+    result = _resolve_base(repo)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "main"
+
+
+def test_base_branch_lib_sources_standalone(tmp_path: Path) -> None:
+    # The guards source shared/hooks/lib/base-branch.sh directly (no
+    # worktree-lib.sh in hook context) — the file must be self-contained.
+    repo = _make_base_repo(tmp_path, origin_head=True)
+    _git_in(repo, "config", "ai-toolkit.base-branch", "develop")
+
+    result = subprocess.run(
+        ["bash", "-c", f'source "{BASE_BRANCH_LIB}"; wt_base_branch "$1"', "bash", str(repo)],
+        capture_output=True,
+        text=True,
+        env=_base_env(),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "develop"
+
+
+def _resolve_start_point(
+    repo: Path, *, env_extra: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Source worktree-lib.sh and run wt_base_start_point against `repo`."""
+    return subprocess.run(
+        ["bash", "-c", f'source "{WT_LIB}"; wt_base_start_point "$1"', "bash", str(repo)],
+        capture_output=True,
+        text=True,
+        env=_base_env(env_extra),
+    )
+
+
+def test_base_start_point_prefers_origin_ref(tmp_path: Path) -> None:
+    # New spokes branch from origin/<base> when the remote ref exists — the
+    # hub's local base may lag or carry unpushed commits.
+    repo = _make_base_repo(tmp_path, origin_head=True)
+
+    result = _resolve_start_point(repo)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "origin/main"
+
+
+def test_base_start_point_uses_local_when_no_remote_ref(tmp_path: Path) -> None:
+    repo = _make_base_repo(tmp_path)
+
+    result = _resolve_start_point(repo)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "main"
+
+
+def test_base_start_point_fails_when_base_missing(tmp_path: Path) -> None:
+    # A configured base that exists nowhere (config typo) must FAIL, not
+    # silently branch from something else — the caller dies with its own message.
+    repo = _make_base_repo(tmp_path)
+    _git_in(repo, "config", "ai-toolkit.base-branch", "develop")
+
+    result = _resolve_start_point(repo)
+
+    # Exactly 1: a deliberate refusal, not bash's 127 command-not-found.
+    assert result.returncode == 1
+    assert result.stdout.strip() == ""
