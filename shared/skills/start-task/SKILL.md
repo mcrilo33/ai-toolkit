@@ -10,7 +10,8 @@ and lifecycle see `docs/parallel-worktrees.md`.
 
 ## Preconditions
 
-- Run from the **main checkout** (the hub), which stays on `main`.
+- Run from the **main checkout** (the hub), which stays on the base branch
+  (`main` by default; `git config ai-toolkit.base-branch` overrides, issue #117).
 - `gh` is authenticated and `.ai-toolkit/scripts/worktree-new.sh` is installed
   (every synced repo has it; `sync-to-repo.sh` puts it there).
 - The scope has been discussed enough to write a clear issue.
@@ -163,8 +164,9 @@ Tell the user: the issue URL, the branch, the worktree path, and the tmux window
 
 ## Rules of thumb
 
-- The **hub stays on `main` and read-only** — it decides *what*; the spoke does the
-  *how*. The `source-task` guard nudges you here if you start coding on the hub.
+- The **hub stays on the base branch and read-only** (`main` by default) — it decides
+  *what*; the spoke does the *how*. The `source-task` guard nudges you here if you
+  start coding on the hub.
 - The **issue is the contract** between hub and spoke. The spoke begins with a fresh,
   focused context containing just that issue — planning noise doesn't leak in. The
   spoke's task ledger is ephemeral session scratch; the issue stays the durable

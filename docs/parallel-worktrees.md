@@ -110,6 +110,40 @@ The scripts locate the main checkout by git introspection (`wt_main_root` via
 unmodified from `.ai-toolkit/scripts/` in a foreign repo. After a sync, run `/hub` in
 `my-project` and the dashboard, dispatch, and land commands work there directly.
 
+## Configurable base branch
+
+By default the workflow integrates on the repo's default branch (`origin/HEAD`,
+falling back to `main`/`master`). A repo that integrates on `develop` or a release
+branch sets it once, per clone:
+
+```bash
+git config ai-toolkit.base-branch develop
+```
+
+That single setting makes `worktree-new.sh` branch new spokes from the base
+(`origin/develop` when it exists, else the local branch), `worktree-land.sh` merge
+into it, `worktree-done.sh` measure merged-ness against it, `hub-status.sh` /
+`hub-ready-watch.sh` / `hub-afk.sh` compare against it, and the guard hooks
+(`hub-guard`, `spoke-main-guard`, `push-scope-guard`) protect it instead of literal
+`main` — no other setup.
+
+All of them resolve the base through one canonical resolver, `wt_base_branch`
+(defined in `shared/hooks/lib/base-branch.sh`, re-exported by `worktree-lib.sh`),
+with this precedence:
+
+1. `git config ai-toolkit.base-branch` — per-clone, survives sync, no tracked file.
+2. `AI_TOOLKIT_BASE_BRANCH` env — one-shot override. `hub-afk.sh` keeps its
+   historical `AFK_DEFAULT_BRANCH` as a deprecated top-precedence alias.
+3. `origin/HEAD` — what a clone gets for free (today's behavior when nothing is
+   configured).
+4. `init.defaultBranch`, only when that local ref exists.
+5. Local `main`, then `master`; finally the literal `main`.
+
+The configured value is trusted without an existence check (it is explicit operator
+intent); the call sites that need a real ref fail loudly on a typo —
+`worktree-new.sh` refuses to create a spoke when neither `origin/<base>` nor a local
+`<base>` exists.
+
 ## The daily loop
 
 ### 1. Start a task

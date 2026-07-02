@@ -10,7 +10,8 @@ status", or starts a fresh main-checkout session and wants to get oriented.
 
 ## Preconditions
 
-- Run from the **main checkout** (the hub), which stays on `main`.
+- Run from the **main checkout** (the hub), which stays on the base branch
+  (`main` by default; `git config ai-toolkit.base-branch` overrides, issue #117).
 - `gh` authenticated (issue survey degrades gracefully without it).
 - The worktree scripts are installed at `.ai-toolkit/scripts/` (`worktree-new.sh`,
   `worktree-done.sh`) — `sync-to-repo.sh` puts them there in any synced repo.
@@ -19,7 +20,7 @@ status", or starts a fresh main-checkout session and wants to get oriented.
 
 ### 1. Confirm you are on the hub
 
-You are the hub only on the main checkout, on the default branch. If `git branch --show-current`
+You are the hub only on the main checkout, on the base branch. If `git branch --show-current`
 is a task branch or you are inside a worktree, you are a **spoke** — stop and follow
 `source-task` / `solo-cycle` instead. The hub never writes task code (see `planning-hub`).
 
@@ -158,6 +159,7 @@ For the triage heuristic and lane definitions see `shared/rules/workflow.md`.
 ## Rules of thumb
 
 - One survey per sit-down — re-run after a merge or a dispatch to refresh the picture.
-- Keep the hub on `main`. If a survey shows the hub checkout dirty or off `main`, flag it.
+- Keep the hub on the base branch (`main` unless `ai-toolkit.base-branch` is set).
+  If a survey shows the hub checkout dirty or off the base, flag it.
 - The issue is the contract — dispatch with a kickoff that lets the spoke run on its own
   (`/source` then `/cycle`).
