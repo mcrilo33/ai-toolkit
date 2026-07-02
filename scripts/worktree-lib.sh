@@ -412,9 +412,11 @@ wt_collector_remove() {
   docker rm -f lf-collector >/dev/null 2>&1 || true
 }
 
-# The lifecycle status of the lf-collector container — running/exited/created/dead
-# — or '' when the container is absent or docker is unreachable. Split out so the
-# recover-when-dead decision is overridable in tests with no real `docker inspect`.
+# The lifecycle status of the lf-collector container — e.g. running/exited/created/
+# dead (also restarting/paused/removing) — or '' when the container is absent or
+# docker is unreachable. The list is illustrative, not exhaustive: the caller
+# treats ANY non-running state as recoverable. Split out so the recover-when-dead
+# decision is overridable in tests with no real `docker inspect`.
 wt_collector_container_status() {
   docker inspect -f '{{ .State.Status }}' lf-collector 2>/dev/null || true
 }
@@ -425,9 +427,16 @@ wt_collector_container_status() {
 # run --name lf-collector` then fails the name check (swallowed best-effort) and
 # never recovers: start-if-absent, not restart-if-dead (#115). So when a
 # non-running container exists, tear it down here; the caller relaunches a fresh
-# one. Absent (or docker unreachable → '') means nothing to recover. A running
-# container is left untouched — it never reaches here anyway, since :4317 would be
-# listening. Split out so the decision is unit-testable with docker overridden.
+# one. Absent (or docker unreachable → '') means nothing to recover. A container
+# reporting `running` is left untouched ON PURPOSE — never tear down a possibly
+# healthy or still-starting collector. The running guard is NOT dead code: the
+# down path can be entered with a running container (a startup race before :4317
+# binds, a bind to the wrong interface), and in that corner recovery is
+# deliberately skipped. Split out so the decision is unit-testable with docker
+# overridden.
+# UPGRADE: a running-but-wedged collector (up, not serving :4317) is not
+# auto-healed — out of #115's Exited/Created/Dead scope; add a liveness probe if it
+# recurs.
 wt_collector_recover_dead() {
   local status
   status="$(wt_collector_container_status)"

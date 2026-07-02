@@ -374,6 +374,18 @@ def test_collector_preflight_launches_when_absent_without_recover() -> None:
     assert "REMOVED" not in result.stdout
 
 
+def test_collector_preflight_running_container_not_removed() -> None:
+    # Down path entered while docker still reports the container `running` (a
+    # startup race before :4317 binds, or a wrong-interface bind). The running
+    # guard in wt_collector_recover_dead must decline to rm — never tear down a
+    # possibly-healthy collector — even though it then relaunches. Pins the guard
+    # so a "rm whenever a container exists" refactor can't slip through.
+    result = _collector_preflight(gate=True, auth=True, port_up=False, container_status="running")
+
+    assert result.returncode == 0, result.stderr
+    assert "REMOVED" not in result.stdout
+
+
 def test_collector_preflight_dead_but_auth_missing_leaves_container() -> None:
     # Down with a dead container present but LANGFUSE_BASIC_AUTH unset → warn and
     # leave it: recovering (rm) without being able to relaunch an authed collector
