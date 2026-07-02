@@ -483,14 +483,14 @@ sync_workflow_scripts() {
     local dst_dir="$TARGET/.ai-toolkit/scripts"
     make_dir "$dst_dir"
 
-    # telemetry.sh is co-located here (not only under hooks/lib/) so the worktree
-    # scripts can source it as a sibling to emit lifecycle spans — see
-    # worktree-lib.sh's telemetry block.
+    # telemetry.sh and base-branch.sh are co-located here (not only under
+    # hooks/lib/) so the worktree scripts can source them as siblings — see
+    # worktree-lib.sh's telemetry and base-branch blocks.
     local name src
-    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh worktree-quick.sh spoke-push.sh spoke-ready.sh telemetry-ingest-spoke.sh hub-status.sh hub-ready-watch.sh telemetry.sh; do
+    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh worktree-quick.sh spoke-push.sh spoke-ready.sh telemetry-ingest-spoke.sh hub-status.sh hub-ready-watch.sh telemetry.sh base-branch.sh; do
         case "$name" in
             hub-status.sh|hub-ready-watch.sh) src="$SHARED_DIR/skills/hub/scripts/$name" ;;
-            telemetry.sh)                     src="$SHARED_DIR/hooks/lib/$name" ;;
+            telemetry.sh|base-branch.sh)      src="$SHARED_DIR/hooks/lib/$name" ;;
             *)                                src="$SCRIPT_DIR/$name" ;;
         esac
         [ -f "$src" ] || continue

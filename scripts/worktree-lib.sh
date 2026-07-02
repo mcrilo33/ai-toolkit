@@ -25,6 +25,36 @@ for _c in "$_WT_LIB_DIR/telemetry.sh" "$_WT_LIB_DIR/../shared/hooks/lib/telemetr
 done
 unset _c
 
+# --- base branch (issue #117) ---------------------------------------------------
+# The canonical wt_base_branch resolver is defined ONCE in
+# shared/hooks/lib/base-branch.sh (the guard hooks source it from their lib/),
+# and re-exported here for every worktree/hub script. Same two-layout candidate
+# resolution as telemetry.sh above: co-located in a synced target, under
+# shared/hooks/lib/ in the ai-toolkit checkout.
+for _c in "$_WT_LIB_DIR/base-branch.sh" "$_WT_LIB_DIR/../shared/hooks/lib/base-branch.sh"; do
+  if [ -f "$_c" ]; then . "$_c"; break; fi
+done
+unset _c
+
+# The ref new spokes branch FROM for the repo at $1 (default "."): origin/<base>
+# when the remote ref exists (the hub's local base may lag or carry unpushed
+# work), else the local <base>. Fails (rc 1, no output) when the resolved base
+# exists nowhere — a config typo must die at the call site, never silently
+# branch from something else.
+wt_base_start_point() {
+  local root="${1:-.}" base
+  base="$(wt_base_branch "$root")"
+  if git -C "$root" show-ref --verify --quiet "refs/remotes/origin/$base" 2>/dev/null; then
+    printf 'origin/%s' "$base"
+    return 0
+  fi
+  if git -C "$root" show-ref --verify --quiet "refs/heads/$base" 2>/dev/null; then
+    printf '%s' "$base"
+    return 0
+  fi
+  return 1
+}
+
 # Emit one lifecycle span for a worktree action, attributing it to the SPOKE:
 # run the emit with the worktree as CWD so the span resolves that worktree's
 # spoke_run_id / branch / repo. No-op when the emit layer or telemetry is absent.
