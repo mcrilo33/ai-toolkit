@@ -135,6 +135,8 @@ def _run_hub_status_proc(
     tmux.chmod(0o755)
     env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
     env.pop("TMUX", None)  # hermetic by default; faked only when inside_tmux
+    # The host's base-branch override (#117) must never steer the script under test.
+    env.pop("AI_TOOLKIT_BASE_BRANCH", None)
     if inside_tmux:
         env["TMUX"] = "/tmp/tmux-test/default,1234,0"
     env["HUB_STATUS_TEST_PANES"] = panes
@@ -814,3 +816,33 @@ def test_degrades_when_tmux_unavailable(hub_with_spokes: Path, tmp_path: Path) -
     line = next(ln for ln in result.stdout.splitlines() if "feature/1-pushed" in ln)
     assert result.returncode == 0
     assert "pushed (in progress)" in line
+
+
+# --- configurable base branch (issue #117) --------------------------------------
+
+
+def _add_develop_base(hub: Path) -> None:
+    """Configure `develop` (one commit ahead of main) as the integration base.
+
+    Leaves the hub checked out back on main, so a dashboard still keyed to
+    literal main would report different ahead/behind counts.
+    """
+    _git(hub, "checkout", "-q", "-b", "develop")
+    (hub / "develop.txt").write_text("develop\n")
+    _git(hub, "add", "develop.txt")
+    _git(hub, "commit", "-qm", "feat: develop seed", "-m", "Refs #0")
+    _git(hub, "checkout", "-q", "main")
+    _git(hub, "config", "ai-toolkit.base-branch", "develop")
+
+
+def test_status_measures_against_configured_base(hub_with_spokes: Path, tmp_path: Path) -> None:
+    # feature/1-pushed is 1 ahead of main; with develop (main+1) configured as
+    # the base it reads ↑1 ↓1 — the counts must be measured vs the RESOLVED
+    # base, not literal main.
+    _add_develop_base(hub_with_spokes)
+
+    out = _run_hub_status(hub_with_spokes, tmp_path)
+
+    row = next(ln for ln in out.splitlines() if "feature/1-pushed" in ln)
+    assert "↑1" in row
+    assert "↓1" in row

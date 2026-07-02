@@ -86,6 +86,8 @@ def _run(
     import os
 
     env = {**os.environ, "HUB_READY_SEEN_FILE": env_seen}
+    # The host's base-branch override (#117) must never steer the script under test.
+    env.pop("AI_TOOLKIT_BASE_BRANCH", None)
     return subprocess.run(
         ["bash", str(WATCH)],
         cwd=str(hub),
@@ -238,3 +240,26 @@ def test_run_never_merges_to_main(hub: Path, tmp_path: Path) -> None:
         capture_output=True,
     )
     assert merged.returncode != 0  # not merged
+
+
+# --- configurable base branch (issue #117) --------------------------------------
+
+
+def test_counts_measured_against_configured_base(hub: Path, tmp_path: Path) -> None:
+    # The surfaced ↑/↓ counts must be measured against the RESOLVED base
+    # (config ai-toolkit.base-branch), not literal main: with develop = main+1
+    # configured, the 1-ahead-of-main spoke reads ↑1 ↓1.
+    _git(hub, "checkout", "-q", "-b", "develop")
+    (hub / "develop.txt").write_text("develop\n")
+    _git(hub, "add", "develop.txt")
+    _git(hub, "commit", "-qm", "feat: develop seed", "-m", "Refs #0")
+    _git(hub, "checkout", "-q", "main")
+    _git(hub, "config", "ai-toolkit.base-branch", "develop")
+    _git(hub, "tag", "ready/1", "feature/1-pushed")
+
+    result = _run(hub, tmp_path)
+
+    assert result.returncode == 0
+    line = next(ln for ln in result.stdout.splitlines() if "#1" in ln)
+    assert "↑1" in line
+    assert "↓1" in line

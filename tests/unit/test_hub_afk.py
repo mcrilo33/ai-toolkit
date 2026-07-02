@@ -2405,3 +2405,47 @@ def test_reap_pass_over_ceiling_always_blocks(tmp_path: Path) -> None:
 
     assert "--blocked 5" in ready_log.read_text(), "an over-ceiling runaway always blocks"
     assert "new-window" not in tmux_log.read_text(), "a runaway is never resumed"
+
+
+# ── configurable base branch (issue #117) ────────────────────────────────────
+
+
+def test_afk_default_ref_uses_configured_base(tmp_path: Path) -> None:
+    # With no AFK_DEFAULT_BRANCH, _afk_default_ref delegates to the canonical
+    # resolver: git config ai-toolkit.base-branch wins over the main fallback.
+    # Empty-string env vars read as unset to the resolver, pinning the host out.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    subprocess.run(
+        ["git", "config", "ai-toolkit.base-branch", "develop"],
+        cwd=spoke,
+        check=True,
+        capture_output=True,
+    )
+
+    result = _call(
+        f"_afk_default_ref '{spoke}'",
+        env={"AFK_DEFAULT_BRANCH": "", "AI_TOOLKIT_BASE_BRANCH": ""},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "develop"
+
+
+def test_afk_default_ref_env_alias_still_wins(tmp_path: Path) -> None:
+    # Back-compat: AFK_DEFAULT_BRANCH keeps its historical top precedence in
+    # hub-afk (tests set it), beating even the per-clone config.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    subprocess.run(
+        ["git", "config", "ai-toolkit.base-branch", "develop"],
+        cwd=spoke,
+        check=True,
+        capture_output=True,
+    )
+
+    result = _call(
+        f"_afk_default_ref '{spoke}'",
+        env={"AFK_DEFAULT_BRANCH": "release/2.0", "AI_TOOLKIT_BASE_BRANCH": ""},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "release/2.0"
