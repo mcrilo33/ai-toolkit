@@ -105,9 +105,18 @@ case "$GIT_DIR" in
   */.git/worktrees/*) IS_SPOKE=1 ;;
 esac
 
-# ── Resolve default branch (same chain as hub-guard) ────────────────────────
+# ── Resolve the guarded base branch (the ONE canonical resolver, issue #117) ─
+# wt_base_branch: config ai-toolkit.base-branch > AI_TOOLKIT_BASE_BRANCH >
+# origin/HEAD > init.defaultBranch (existing ref) > main/master > "main".
+# The inline chain below is the degraded fallback for a stale synced layout
+# whose lib/ predates base-branch.sh — the same chain the guard always had.
+[ -f "$HOOK_DIR/lib/base-branch.sh" ] && source "$HOOK_DIR/lib/base-branch.sh"
 hub_default_branch() {
   local root="$1" def
+  if command -v wt_base_branch >/dev/null 2>&1; then
+    wt_base_branch "$root"
+    return 0
+  fi
   def=$(git -C "$root" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||') || true
   [ -n "$def" ] && { printf '%s' "$def"; return 0; }
   def=$(git -C "$root" config --get init.defaultBranch 2>/dev/null || true)

@@ -28,14 +28,22 @@ set -euo pipefail
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/lib/utils.sh"
 
-# Resolve the repository's default branch — the branch the hub stays on. Tries,
-# in order: origin/HEAD; the configured init.defaultBranch (only if that branch
-# exists); then whichever of main/master exists; finally "main". The existence
-# checks matter because a bare `git init` lands on master on some platforms and
-# main on others, with init.defaultBranch frequently unset — a fixed "main"
-# fallback would silently disable the guard on a master-default hub.
+# Resolve the base branch the hub stays on — the ONE canonical resolver
+# (issue #117): config ai-toolkit.base-branch > AI_TOOLKIT_BASE_BRANCH >
+# origin/HEAD > init.defaultBranch (existing ref) > main/master > "main".
+# The inline chain below is the degraded fallback for a stale synced layout
+# whose lib/ predates base-branch.sh — the same chain the guard always had.
+# Its existence checks matter because a bare `git init` lands on master on
+# some platforms and main on others, with init.defaultBranch frequently unset
+# — a fixed "main" fallback would silently disable the guard on a
+# master-default hub.
+[ -f "$HOOK_DIR/lib/base-branch.sh" ] && source "$HOOK_DIR/lib/base-branch.sh"
 hub_default_branch() {
   local root="$1" def
+  if command -v wt_base_branch >/dev/null 2>&1; then
+    wt_base_branch "$root"
+    return 0
+  fi
   def=$(git -C "$root" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
   [ -n "$def" ] && { printf '%s' "$def"; return 0; }
   def=$(git -C "$root" config --get init.defaultBranch 2>/dev/null || true)
