@@ -442,6 +442,39 @@ wt_collector_remove() {
   docker rm -f lf-collector >/dev/null 2>&1 || true
 }
 
+# The lifecycle status of the lf-collector container — e.g. running/exited/created/
+# dead (also restarting/paused/removing) — or '' when the container is absent or
+# docker is unreachable. The list is illustrative, not exhaustive: the caller
+# treats ANY non-running state as recoverable. Split out so the recover-when-dead
+# decision is overridable in tests with no real `docker inspect`.
+wt_collector_container_status() {
+  docker inspect -f '{{ .State.Status }}' lf-collector 2>/dev/null || true
+}
+
+# Recover a stopped lf-collector so a subsequent launch's --name can't clash. The
+# spawn preflight starts the collector only when :4317 is DOWN, but an
+# Exited/Created/Dead container still owns the `lf-collector` name — a bare `docker
+# run --name lf-collector` then fails the name check (swallowed best-effort) and
+# never recovers: start-if-absent, not restart-if-dead (#115). So when a
+# non-running container exists, tear it down here; the caller relaunches a fresh
+# one. Absent (or docker unreachable → '') means nothing to recover. A container
+# reporting `running` is left untouched ON PURPOSE — never tear down a possibly
+# healthy or still-starting collector. The running guard is NOT dead code: the
+# down path can be entered with a running container (a startup race before :4317
+# binds, a bind to the wrong interface), and in that corner recovery is
+# deliberately skipped. Split out so the decision is unit-testable with docker
+# overridden.
+# UPGRADE: a running-but-wedged collector (up, not serving :4317) is not
+# auto-healed — out of #115's Exited/Created/Dead scope; add a liveness probe if it
+# recurs.
+wt_collector_recover_dead() {
+  local status
+  status="$(wt_collector_container_status)"
+  [ -n "$status" ] || return 0
+  [ "$status" = "running" ] && return 0
+  wt_collector_remove
+}
+
 # Recycle the running collector IFF its stamped config-version differs from the
 # current one (an otelcol.yaml / port / image change landed). Best-effort and
 # idempotent: an unhashable config or a missing/unreadable label leaves the
@@ -469,13 +502,15 @@ wt_collector_restart_if_stale() {
 # opt-out). When :4317 already listens, delegate to wt_collector_restart_if_stale
 # — which recycles the container only when its stamped config-version proves it is
 # running stale code/config, and otherwise leaves it untouched (no second
-# collector, no needless churn). When down: never starts a second collector (a
-# duplicate would fail anyway — a port-bind clash, or a --name conflict against a
-# stopped lf-collector, both swallowed best-effort). When LANGFUSE_BASIC_AUTH is
-# unset the collector can't authenticate to Langfuse, so warn (telemetry won't
-# land) but DO NOT fail the spawn — same posture as wt_otel_bridge_preflight. Run
-# BEFORE the bridge preflight: the collector forks to the bridge, so both must be
-# up before the spoke's first export. Args: $1 = repo root.
+# collector, no needless churn). When down: first recover a stopped lf-collector
+# (wt_collector_recover_dead removes an Exited/Created/Dead container that would
+# otherwise fail a fresh launch's --name check, swallowed best-effort, #115), then
+# start exactly one collector. When LANGFUSE_BASIC_AUTH is unset the collector
+# can't authenticate to Langfuse, so warn (telemetry won't land) and leave any
+# stopped container in place — recovering without an authed relaunch only strands
+# the port — but DO NOT fail the spawn (same posture as wt_otel_bridge_preflight).
+# Run BEFORE the bridge preflight: the collector forks to the bridge, so both must
+# be up before the spoke's first export. Args: $1 = repo root.
 wt_otel_collector_preflight() {
   local repo_root="$1" port=4317
   [ "${AI_TOOLKIT_OTEL:-}" = "1" ] || return 0
@@ -487,5 +522,6 @@ wt_otel_collector_preflight() {
     wt_warn "OTel collector down on :$port and LANGFUSE_BASIC_AUTH unset — telemetry won't reach Langfuse; spoke still launches"
     return 0
   fi
+  wt_collector_recover_dead
   wt_collector_launch "$repo_root"
 }
