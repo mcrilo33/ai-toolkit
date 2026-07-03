@@ -83,7 +83,10 @@ BASE_START="$(wt_base_start_point "$REPO_ROOT")" \
 
 echo "→ creating worktree  $WT_DIR"
 echo "→ new branch         $BRANCH (from $BASE_START)"
-git worktree add "$WT_DIR" -b "$BRANCH" "$BASE_START"
+# --no-track: a quick branch is never pushed, so it must not inherit
+# origin/<base> as upstream — an inherited upstream trips the local-land
+# micro-spoke guard (issue #120).
+git worktree add "$WT_DIR" --no-track -b "$BRANCH" "$BASE_START"
 
 # --- set the .ai-toolkit/ exclude (resolved for this worktree) ---------------
 # Make .ai-toolkit/ ignored via the repo's git exclude rather than trusting a
