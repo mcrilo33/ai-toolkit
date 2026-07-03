@@ -25,7 +25,7 @@
 # source of truth for what happened.
 #
 # Knobs (env, with defaults):
-#   AFK_TICK_SECONDS=300         supervisor poll interval
+#   AFK_TICK_SECONDS=120         supervisor poll interval
 #   AFK_WATCHDOG_SECONDS=60      watchdog poll interval (respawn a crashed supervisor)
 #   AFK_SPOKE_MAX_MINUTES=180    wall-clock ceiling per spoke before a reap
 #   AFK_IDLE_MINUTES=30          a spoke idle this long with no marker AND not waiting → reap
@@ -64,7 +64,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-: "${AFK_TICK_SECONDS:=300}"
+: "${AFK_TICK_SECONDS:=120}"
 : "${AFK_SPOKE_MAX_MINUTES:=180}"
 : "${AFK_IDLE_MINUTES:=30}"
 : "${AFK_ANSWERER_EFFORT:=high}"
