@@ -149,6 +149,7 @@ is_exempt() {
   while IFS= read -r entry || [ -n "$entry" ]; do
     entry="${entry%%#*}"
     entry="${entry%"${entry##*[![:space:]]}"}"   # strip trailing whitespace/CR
+    entry="${entry#"${entry%%[![:space:]]*}"}"   # strip leading whitespace
     [ -n "$entry" ] || continue
     entry="${entry%/}"
     [ "$f" = "$entry" ] && return 0
@@ -230,22 +231,27 @@ has_other=0
 UNMAPPED=0
 UNMAPPED_FILE=""
 MAPPED_TESTS=""
+EXEMPT_SKIPPED=0
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   if is_py "$f"; then has_py=1; continue; fi
   if is_doc "$f"; then continue; fi
-  if is_exempt "$f"; then continue; fi
-  has_other=1
-  # Reverse-index lookup (issue #123): every mapped non-python file adds its
-  # referencing test files to the selection; a single unmapped file escalates
-  # the whole push to the full suite (default-to-full preserved).
+  # Reverse-index lookup FIRST, exemption second (B-review hardening): an
+  # exempt entry can only mute the escalation of a file the index cannot map —
+  # it can never hide existing mapped coverage. Every mapped non-python file
+  # adds its referencing tests to the selection; a single unmapped, non-exempt
+  # file escalates the whole push to the full suite (default-to-full).
   mapped=""
   if [ "$RINDEX" = "1" ]; then
     mapped="$(reverse_index_tests_for "$f")"
   fi
   if [ -n "$mapped" ]; then
+    has_other=1
     MAPPED_TESTS="$MAPPED_TESTS$mapped"$'\n'
+  elif is_exempt "$f"; then
+    EXEMPT_SKIPPED=$((EXEMPT_SKIPPED + 1))
   else
+    has_other=1
     UNMAPPED=1
     [ -n "$UNMAPPED_FILE" ] || UNMAPPED_FILE="$f"
   fi
@@ -278,7 +284,11 @@ else
 fi
 
 if [ "$DECISION" = "NOTHING" ]; then
-  note "docs-only (or empty) diff — no tests to run"
+  if [ "$EXEMPT_SKIPPED" -gt 0 ]; then
+    note "docs/exempt-only diff ($EXEMPT_SKIPPED exempt file(s), .test-select-exempt) — no tests to run"
+  else
+    note "docs-only (or empty) diff — no tests to run"
+  fi
   exit 0
 fi
 
@@ -310,11 +320,18 @@ if [ "$DECISION" = "SELECTED" ] && [ "$has_py" = "1" ] && ! runner_has_testmon; 
   DECISION=FULL
 fi
 
-# ── Green-tree stamp consult (issue #122) ───────────────────────────────────────
+# ── Green-tree stamp consult (issue #122; set-aware selected tier #123-D) ───────
 # TIER_TO_RUN names the suite this gate is about to execute — that is both the
 # demand a stamp must cover and the tier a passing run proves. A python diff
-# without testmon runs (and therefore proves) the FULL suite.
-if [ "$DECISION" = "PYTHON" ] && runner_has_testmon; then
+# without testmon runs (and therefore proves) the FULL suite. A SELECTED run's
+# proof is the exact set that ran (comma-joined), plus testmon for a mixed
+# diff — both travel with the demand and the mint.
+SET_CSV=""
+if [ "$DECISION" = "SELECTED" ]; then
+  TIER_TO_RUN=selected
+  SET_CSV="$(printf '%s' "$SELECTED_TESTS" | tr '\n' ',')"
+  SET_CSV="${SET_CSV%,}"
+elif [ "$DECISION" = "PYTHON" ] && runner_has_testmon; then
   TIER_TO_RUN=testmon
 else
   TIER_TO_RUN=full
@@ -332,19 +349,18 @@ runner_fingerprint() { "${RUNNER_ARR[@]}" --version 2>/dev/null | head -n 1 || t
 # tree yields no key (the suite would run against a tree other than HEAD's), so
 # it neither consumes here nor mints below — logged distinctly, exactly like
 # the stamp skip itself is distinct from the TEST_SELECT_SKIP hatch.
-# The SELECTED tier neither consumes nor mints (subtask D of #123 makes
-# stamps set-aware): a bare `selected` stamp cannot say WHICH set it proved,
-# so it would unsoundly cover a different selection — or a testmon demand —
-# on the same tree. STAMP_TREE stays empty, which also disables the mint.
 STAMP_TREE=""
 STAMP_ENV=""
 STAMP_ENV_PROBED=0
-if [ "$STAMPS" = "1" ] && [ "$DECISION" != "SELECTED" ]; then
+if [ "$STAMPS" = "1" ]; then
   if STAMP_TREE="$(gate_stamp_tree)"; then
     if gate_stamp_has "$STAMP_TREE"; then
       STAMP_ENV="$(runner_fingerprint)"
       STAMP_ENV_PROBED=1
-      if gate_stamp_check "$STAMP_TREE" "$TIER_TO_RUN" "$STAMP_ENV"; then
+      # The two trailing args matter only for a selected demand (the set and
+      # whether the diff is mixed); full/testmon demands ignore them. An
+      # installed stamp lib predating #123-D also just ignores them.
+      if gate_stamp_check "$STAMP_TREE" "$TIER_TO_RUN" "$STAMP_ENV" "$SET_CSV" "$has_py"; then
         note "green-tree stamp covers tree $STAMP_TREE (proven ≥ $TIER_TO_RUN for this env) — skipping suite"
         exit 0
       fi
@@ -413,7 +429,13 @@ if [ "$rc" -eq 0 ] && [ "$STAMPS" = "1" ] && [ -n "$STAMP_TREE" ]; then
   if [ "$STAMP_ENV_PROBED" = "0" ]; then
     STAMP_ENV="$(runner_fingerprint)"
   fi
-  gate_stamp_mint "$STAMP_TREE" "$TIER_TO_RUN" "$STAMP_ENV" \
+  # A selected mint records the set that ran; MINT_TESTMON=1 marks a mixed
+  # green run whose --testmon leg also passed (both legs share rc).
+  MINT_TESTMON=""
+  if [ "$DECISION" = "SELECTED" ] && [ "$has_py" = "1" ]; then
+    MINT_TESTMON=1
+  fi
+  gate_stamp_mint "$STAMP_TREE" "$TIER_TO_RUN" "$STAMP_ENV" "$SET_CSV" "$MINT_TESTMON" \
     || note "green-tree stamp: mint failed (non-fatal — next gate re-runs the suite)"
 fi
 exit "$rc"

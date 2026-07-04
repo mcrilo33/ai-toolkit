@@ -13,9 +13,13 @@ Contract under test:
   * `gate_stamp_mint <tree> <tier> <env>` — writes the stamp file atomically,
     overwrites unconditionally (a mint always follows a real run), and prunes
     stamps older than ~14 days.
-  * `gate_stamp_check <tree> <tier> <env>` — succeeds iff a stamp exists for
-    the tree, its env matches exactly, and its tier ranks at least as strong
-    as the demanded one (full > selected > testmon).
+  * `gate_stamp_check <tree> <tier> <env> [<set-csv> [<mixed>]]` — succeeds
+    iff a stamp exists for the tree, its env matches exactly, and coverage
+    holds: full covers everything; testmon is covered by full or testmon; a
+    selected demand (set S, possibly mixed) is covered by full, or by a
+    selected stamp whose recorded set ⊇ S (with testmon=1 when mixed). A
+    selection never covers testmon/full, and a set-less selected stamp
+    covers nothing (#123-D).
 
 Hermetic like test_test_select.py: a throwaway git repo per test; the lib is
 driven via `bash -c 'source …; <fn>'` (same pattern as test_hub_otel_watch.py).
