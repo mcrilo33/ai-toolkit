@@ -32,6 +32,14 @@
 #   • TEST_SELECT_SKIP non-empty → run nothing (the --skip-tests path)
 #   • TEST_SELECT_CMD  non-empty → run that command verbatim (the --test-cmd path)
 #
+# GREEN-TREE STAMPS (issue #122): a gate pass stamps the tier that ran, keyed by
+# `git rev-parse HEAD^{tree}` under <git-common-dir>/.gate-stamps/ (see
+# lib/gate-stamp.sh). A later gate on the SAME clean tree with an equal-or-weaker
+# demand skips the suite with a loud note — distinct from TEST_SELECT_SKIP; a
+# stronger demand runs and upgrades the stamp. A dirty working tree, either
+# escape hatch above, a failing run, or a runner-fingerprint mismatch never
+# consumes or mints.
+#
 # EXIT: the selected suite's exit code IS this script's exit code, so a failing
 # suite returns non-zero and aborts the push (the blocking ship gate).
 set -euo pipefail
@@ -39,6 +47,16 @@ set -euo pipefail
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/utils.sh
 source "$HOOK_DIR/lib/utils.sh"
+
+# Green-tree stamps (issue #122): skip a suite already proven on this exact
+# tree. The lib may be absent in an installed hook copy that predates it (the
+# #45 stale-hook trap) — degrade to no stamps rather than breaking the gate.
+STAMPS=0
+if [ -f "$HOOK_DIR/lib/gate-stamp.sh" ]; then
+  # shellcheck source=lib/gate-stamp.sh
+  source "$HOOK_DIR/lib/gate-stamp.sh"
+  STAMPS=1
+fi
 
 note() { echo "test-select: $*" >&2; }
 
@@ -199,6 +217,47 @@ runner_has_testmon() {
   esac
 }
 
+# ── Green-tree stamp consult (issue #122) ───────────────────────────────────────
+# TIER_TO_RUN names the suite this gate is about to execute — that is both the
+# demand a stamp must cover and the tier a passing run proves. A python diff
+# without testmon runs (and therefore proves) the FULL suite.
+if [ "$DECISION" = "PYTHON" ] && runner_has_testmon; then
+  TIER_TO_RUN=testmon
+else
+  TIER_TO_RUN=full
+fi
+
+# The stamp env fingerprint is the resolved runner's own --version line (this
+# repo has been bitten by `pytest`-on-PATH and `python3.12 -m pytest` being
+# different interpreters). Probing INVOKES the runner outside the tripwire
+# bracket below, so it is deferred to the two spots that truly need it: a
+# candidate stamp to consume (pre-run) or a green run to mint (post-run).
+runner_fingerprint() { "${RUNNER_ARR[@]}" --version 2>/dev/null | head -n 1 || true; }
+
+# Consume: skip only when a stamp at least as strong as TIER_TO_RUN exists for
+# the CURRENT clean tree under the SAME runner fingerprint. A dirty working
+# tree yields no key (the suite would run against a tree other than HEAD's), so
+# it neither consumes here nor mints below — logged distinctly, exactly like
+# the stamp skip itself is distinct from the TEST_SELECT_SKIP hatch.
+STAMP_TREE=""
+STAMP_ENV=""
+STAMP_ENV_PROBED=0
+if [ "$STAMPS" = "1" ]; then
+  if STAMP_TREE="$(gate_stamp_tree)"; then
+    if gate_stamp_has "$STAMP_TREE"; then
+      STAMP_ENV="$(runner_fingerprint)"
+      STAMP_ENV_PROBED=1
+      if gate_stamp_check "$STAMP_TREE" "$TIER_TO_RUN" "$STAMP_ENV"; then
+        note "green-tree stamp covers tree $STAMP_TREE (proven ≥ $TIER_TO_RUN for this env) — skipping suite"
+        exit 0
+      fi
+    fi
+  else
+    STAMP_TREE=""
+    note "green-tree stamp: working tree dirty — no stamp consult or mint this run (suite runs as usual)"
+  fi
+fi
+
 # Every tier runs pytest under the repo-integrity tripwire (issue #31): the run
 # is bracketed by a snapshot/verify of HEAD + ref tips + core.bare/worktree, so a
 # test that escapes isolation and mutates THIS repo aborts the push (and the
@@ -207,7 +266,7 @@ runner_has_testmon() {
 rc=0
 case "$DECISION" in
   PYTHON)
-    if runner_has_testmon; then
+    if [ "$TIER_TO_RUN" = "testmon" ]; then
       note "python-only diff — pytest --testmon"
       run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" --testmon || rc=$?
     else
@@ -220,4 +279,15 @@ case "$DECISION" in
     run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" || rc=$?
     ;;
 esac
+
+# Mint: record only what a green run just proved (only the gate mints — the
+# scripted control plane). The stamp is a cache, never a gate: a failed write
+# must not block a legitimately green push.
+if [ "$rc" -eq 0 ] && [ "$STAMPS" = "1" ] && [ -n "$STAMP_TREE" ]; then
+  if [ "$STAMP_ENV_PROBED" = "0" ]; then
+    STAMP_ENV="$(runner_fingerprint)"
+  fi
+  gate_stamp_mint "$STAMP_TREE" "$TIER_TO_RUN" "$STAMP_ENV" \
+    || note "green-tree stamp: mint failed (non-fatal — next gate re-runs the suite)"
+fi
 exit "$rc"

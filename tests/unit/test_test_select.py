@@ -25,6 +25,10 @@ import pytest
 TEST_SELECT = Path(__file__).resolve().parents[2] / "shared" / "hooks" / "test-select.sh"
 ZERO_SHA = "0" * 40
 
+# What the pytest stubs answer to `--version` — the gate records it as the
+# green-tree stamp's env fingerprint (issue #122).
+STUB_ENV_FINGERPRINT = "pytest 9.9-stub"
+
 # Pin git config to nothing so a host's global config (core.hooksPath, gpg,
 # templateDir) can't reach the commits these tests drive.
 _GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
@@ -89,6 +93,9 @@ def _make_pytest_stub(bindir: Path, runlog: Path, *, testmon: bool, exit_code: i
         '    echo "usage: pytest [options]"\n'
         f"    {testmon_line}\n"
         "    exit 0 ;;\n"
+        "  --version)\n"
+        f'    echo "{STUB_ENV_FINGERPRINT}"\n'
+        "    exit 0 ;;\n"
         "esac\n"
         f'printf "RUN %s\\n" "$*" >> "{runlog}"\n'
         f'printf "GITDIR=[%s]\\n" "${{GIT_DIR-UNSET}}" >> "{runlog}"\n'
@@ -114,6 +121,7 @@ def _make_python_module_stub(bindir: Path, runlog: Path, *, testmon: bool) -> No
         "  shift 2\n"
         '  case "$1" in\n'
         f'    --help|-h) echo "usage: pytest"; {testmon_line}; exit 0 ;;\n'
+        f'    --version) echo "{STUB_ENV_FINGERPRINT}"; exit 0 ;;\n'
         "  esac\n"
         f'  printf "RUN %s\\n" "$*" >> "{runlog}"\n'
         "  exit 0\n"
@@ -535,3 +543,239 @@ def test_failing_suite_blocks_with_nonzero_exit(repo: Path, tmp_path: Path) -> N
 
     assert proc.returncode == 1  # non-zero exit is what aborts the pre-push
     assert "--testmon" in _runlog(runlog)
+
+
+# --- green-tree stamps: never re-run a suite already proven on this tree (#122) ---
+
+
+def _stamp_path(repo: Path) -> Path:
+    """The stamp file the gate would mint for the repo's current HEAD tree."""
+    tree = _git(repo, "rev-parse", "HEAD^{tree}").strip()
+    return repo / ".git" / ".gate-stamps" / tree
+
+
+def test_gate_pass_mints_stamp_with_tier_and_env(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    content = _stamp_path(repo).read_text()
+    assert "tier=testmon\n" in content
+    assert f"env={STUB_ENV_FINGERPRINT}\n" in content
+
+
+def test_python_without_testmon_mints_full_stamp(repo: Path, tmp_path: Path) -> None:
+    # The tier stamped is the tier that RAN: a python diff without testmon falls
+    # back to the full suite, so its stamp records the stronger proof.
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=False)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "tier=full\n" in _stamp_path(repo).read_text()
+
+
+def test_second_run_same_tree_equal_demand_skips_without_pytest(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    _run_select(repo, _stdin(tip, base), tmp_path / "bin")  # first run mints
+    after_first = _runlog(runlog)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert _runlog(runlog) == after_first  # pytest was NOT invoked again
+    assert "green-tree stamp" in proc.stderr  # loud, distinct skip note …
+    assert "TEST_SELECT_SKIP" not in proc.stderr  # … never mistakable for the hatch
+
+
+def test_stronger_stamp_covers_weaker_demand(repo: Path, tmp_path: Path) -> None:
+    # A full-tier stamp (from a .sh-bearing push) covers a later testmon-tier
+    # demand on the very same tree.
+    base = _rev(repo)
+    py_tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    sh_tip = _commit(repo, {"scripts/do.sh": "#!/bin/sh\necho hi\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    _run_select(repo, _stdin(sh_tip, base), tmp_path / "bin")  # FULL run mints full
+    after_first = _runlog(runlog)
+
+    # Same working tree (HEAD = sh_tip), but this push's range is python-only,
+    # so the gate demands only testmon — the full stamp is at least as strong.
+    proc = _run_select(repo, _stdin(py_tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert _runlog(runlog) == after_first
+    assert "green-tree stamp" in proc.stderr
+
+
+def test_weaker_stamp_stronger_demand_runs_and_upgrades(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    _run_select(repo, _stdin(tip, base), tmp_path / "bin")  # testmon run mints testmon
+    after_first = _runlog(runlog)
+
+    # An unresolvable remote sha forces the FULL tier (cannot prove safe) — a
+    # stronger demand than the testmon stamp, so the suite must run …
+    proc = _run_select(repo, _stdin(tip, "deadbeef" * 5), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert len(_runlog(runlog)) > len(after_first)  # … and it did
+    assert "tier=full\n" in _stamp_path(repo).read_text()  # … and upgraded the stamp
+
+
+def test_changed_tracked_file_yields_new_key_and_no_skip(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    _run_select(repo, _stdin(tip, base), tmp_path / "bin")  # mints for this tree
+    after_first = _runlog(runlog)
+
+    tip2 = _commit(repo, {"tests/test_mod.py": "def test_x(): pass\n"})
+    proc = _run_select(repo, _stdin(tip2, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert len(_runlog(runlog)) > len(after_first)  # new tree ⇒ no skip
+    assert _stamp_path(repo).is_file()  # and the new tree got its own stamp
+
+
+def test_env_fingerprint_mismatch_never_skips(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    _run_select(repo, _stdin(tip, base), tmp_path / "bin")  # mints with the stub env
+    stamp = _stamp_path(repo)
+    stamp.write_text(
+        stamp.read_text().replace(f"env={STUB_ENV_FINGERPRINT}", "env=py3.9-elsewhere")
+    )
+    after_first = _runlog(runlog)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert len(_runlog(runlog)) > len(after_first)  # a wrong env re-proves, never skips
+
+
+def test_skip_env_does_not_mint(repo: Path, tmp_path: Path) -> None:
+    # TEST_SELECT_SKIP behaves exactly as today: nothing runs, nothing is proven,
+    # so no stamp may appear.
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(
+        repo, _stdin(tip, base), tmp_path / "bin", env_extra={"TEST_SELECT_SKIP": "1"}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert not _stamp_path(repo).exists()
+
+
+def test_cmd_env_neither_consumes_nor_mints(repo: Path, tmp_path: Path) -> None:
+    # TEST_SELECT_CMD behaves exactly as today: the custom command runs even when
+    # a covering stamp exists (no consume), and its pass proves an unknown tier
+    # (no mint/upgrade).
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    _run_select(repo, _stdin(tip, base), tmp_path / "bin")  # mints testmon
+    custom = tmp_path / "custom.log"
+
+    proc = _run_select(
+        repo,
+        _stdin(tip, base),
+        tmp_path / "bin",
+        env_extra={"TEST_SELECT_CMD": f"echo ran >> {custom}"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert custom.exists() and "ran" in custom.read_text()  # ran despite the stamp
+    assert "tier=testmon\n" in _stamp_path(repo).read_text()  # and did not upgrade it
+
+
+def test_dirty_tree_does_not_consume_stamp(repo: Path, tmp_path: Path) -> None:
+    # Deviation-1 soundness guard: the suite runs against the working tree, so a
+    # dirty checkout must not be covered by a stamp for HEAD's (different) tree.
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    _run_select(repo, _stdin(tip, base), tmp_path / "bin")  # clean run mints
+    after_first = _runlog(runlog)
+    (repo / "pkg" / "mod.py").write_text("x = 2  # uncommitted\n")
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert len(_runlog(runlog)) > len(after_first)  # the suite ran
+    assert "working tree dirty" in proc.stderr  # logged distinctly
+
+
+def test_dirty_tree_does_not_mint(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    (repo / "pkg" / "mod.py").write_text("x = 2  # uncommitted\n")
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN" in _runlog(runlog)  # the suite still ran normally
+    assert not _stamp_path(repo).exists()  # but proved nothing about HEAD's tree
+    assert "working tree dirty" in proc.stderr
+
+
+def test_failing_suite_does_not_mint(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, exit_code=1)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 1
+    assert not _stamp_path(repo).exists()  # only a green run mints
+
+
+def test_missing_stamp_lib_degrades_to_running_the_suite(repo: Path, tmp_path: Path) -> None:
+    # An installed hook copy that predates gate-stamp.sh (the #45 stale-hook trap)
+    # must behave exactly as today: run the suite, mint nothing, crash nothing.
+    hookdir = tmp_path / "installed"
+    (hookdir / "lib").mkdir(parents=True)
+    src = TEST_SELECT.parent
+    shutil.copy(TEST_SELECT, hookdir / "test-select.sh")
+    shutil.copy(src / "lib" / "utils.sh", hookdir / "lib" / "utils.sh")
+    shutil.copy(src / "lib" / "telemetry.sh", hookdir / "lib" / "telemetry.sh")
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = subprocess.run(
+        ["bash", str(hookdir / "test-select.sh")],
+        cwd=str(repo),
+        input=_stdin(tip, base),
+        capture_output=True,
+        text=True,
+        env={**_GIT_ENV, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "--testmon" in _runlog(runlog)  # today's behavior, unchanged
+    assert not _stamp_path(repo).exists()  # stamps silently disabled
