@@ -1398,6 +1398,135 @@ class TestDurationRollups:
         duration = _by_orig(batch, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
         assert duration == _dur(5_000, {"llm_request": 8_000})
 
+    def test_parallel_children_keep_the_gap_and_book_full_span_time(self) -> None:
+        # Two tools run CONCURRENTLY (00:00-00:06) inside a 10s turn. The union of the
+        # children covers 6s, so the turn's own gap stays 4s — never erased by summing the
+        # overlap twice. Class buckets are span-time: under concurrency they may sum past
+        # the wall-clock (12s of tool time in a 10s turn), while gap buckets stay true.
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+        )
+        tool_a = _obs(
+            "t1",
+            "tool:Bash",
+            parent="i1",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:06Z",
+        )
+        tool_b = _obs(
+            "t2",
+            "tool:Read",
+            parent="i1",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:06Z",
+        )
+
+        batch = build_batch([("tr", [interaction, tool_a, tool_b])], SPOKE)
+
+        duration = _by_orig(batch, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
+        assert duration == _dur(10_000, {"tool": 12_000, "self": 4_000})
+
+    def test_mixed_timestamp_formats_compare_parsed_not_lexicographic(self) -> None:
+        # turn_a is stamped in +02:00 (06:00Z-06:30Z, the true earliest); turn_b in Z
+        # (07:00Z-07:30Z). A lexicographic min would pick turn_b's "07:..." string as the
+        # earliest start and undercount the root span by an hour.
+        turn_a = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T08:00:00+02:00",
+            endTime="2026-01-02T08:30:00+02:00",
+        )
+        turn_b = _obs(
+            "i2",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T07:00:00Z",
+            endTime="2026-01-02T07:30:00Z",
+        )
+
+        batch = build_batch([("tr-a", [turn_a]), ("tr-b", [turn_b])], SPOKE)
+
+        root = next(event for event in batch if event["id"] == root_id_for(SPOKE))
+        assert root["body"]["metadata"]["rollup"]["duration"] == _dur(
+            5_400_000, {"turn": 3_600_000, "self": 1_800_000}
+        )
+
+    def test_unmatched_blocked_on_user_span_counts_as_wait(self) -> None:
+        # A blocked-on-user span whose tool never materialized (denied/cancelled) keeps its
+        # node (#110) instead of folding; its time is human wait, not "other".
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+        )
+        blocked = _obs(
+            "b1",
+            "claude_code.tool.blocked_on_user",
+            parent="i1",
+            startTime="2026-01-02T00:00:02Z",
+            endTime="2026-01-02T00:00:08Z",
+        )
+
+        batch = build_batch([("tr", [interaction, blocked])], SPOKE)
+
+        duration = _by_orig(batch, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
+        assert duration == _dur(10_000, {"wait": 6_000, "self": 4_000})
+
+    def test_flat_kind_hook_counts_as_hook(self) -> None:
+        # Hook detection reuses _is_hook, including its flat top-level kind == "hook"
+        # fallback (no .sh name, no workflow.kind attribute).
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+        )
+        hook = _obs(
+            "h1",
+            "guard",
+            parent="i1",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:03Z",
+            metadata={"kind": "hook"},
+        )
+
+        batch = build_batch([("tr", [interaction, hook])], SPOKE)
+
+        duration = _by_orig(batch, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
+        assert duration == _dur(10_000, {"hook": 3_000, "self": 7_000})
+
+    def test_non_numeric_blocked_on_user_ms_is_ignored_not_fatal(self) -> None:
+        # A verbatim-copied tool span may carry blocked_on_user_ms in a shape the #100 fold
+        # never writes (e.g. a string); the carve-out must degrade to 0, not crash the build.
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+        )
+        tool = _obs(
+            "t1",
+            "tool:Bash",
+            parent="i1",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+            metadata={"blocked_on_user_ms": "6000.0"},
+        )
+
+        batch = build_batch([("tr", [interaction, tool])], SPOKE)
+
+        duration = _by_orig(batch, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
+        assert duration == _dur(10_000, {"tool": 10_000})
+
     def test_token_rollup_keys_unchanged_alongside_duration(self) -> None:
         # The duration extends the existing token rollup in place — same metadata.rollup
         # object, token keys untouched.

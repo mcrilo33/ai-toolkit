@@ -86,9 +86,13 @@ and no session match are ad-hoc and group under `None`.
 `metadata.rollup.duration = {total_ms, components}` alongside the token rollup.
 `total_ms` is the observed subtree wall-clock (the container's own `start → end`, or
 its subtree span when untimed — which is how the synthetic root covers the whole
-spoke). `components` attributes every millisecond to exactly one class bucket via
-exclusive time (a node's duration minus its direct children's, clamped ≥ 0), so on
-well-formed spans the components sum to `total_ms`:
+spoke; timestamps are parsed, never string-compared). `components` books each node's
+exclusive time — its duration minus the *union* of its children's intervals, clamped
+≥ 0 — into one class bucket. On serial spans the components sum to `total_ms`;
+concurrent siblings (parallel tool calls, background sub-agents) each book their full
+span time, so class buckets are span-time and may sum past the wall-clock (CPU-time
+vs wall-time), while the gap buckets (`self`/`turn`/`step`) stay true — union-based
+subtraction never erases them:
 
 | Bucket | What lands in it |
 |--------|------------------|
@@ -107,6 +111,15 @@ carry a `duration` computed from their pre-flatten View A subtree and are exclud
 from the cycle-axis sums (their span overlaps their re-homed former children).
 Rebuilds are idempotent — `fetch_session` excludes the synthesizer's own prior
 output, so durations never double-count.
+
+> [!WARNING]
+> `duration` is written only by the spoke-tree assembly. The other two rollup
+> writers still emit the token-only shape: `langfuse_backfill.py` (historical
+> spokes lack `rollup.duration` — treat the key as optional in consumers), and the
+> standalone `langfuse_rollup.py` patcher, whose `span-update` replaces the
+> `rollup` metadata key wholesale — running it over a session that already holds
+> assembled `spoketree-`/`spokecycle-` traces strips their `duration`. Re-run
+> `langfuse_spoke_tree.py` to restore it; aligning the two writers is a follow-up.
 
 ## Verification notes and follow-ups
 
