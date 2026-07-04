@@ -32,9 +32,20 @@
 #                   pytest (the stubbed runner used by tests; mirrors
 #                   TEST_SELECT_CMD's role for the gate).
 #
+# Accepted asymmetry: only a GREEN sweep mints the `full` stamp, so a red tree
+# keeps its pruned stamp and a re-land of the same red content sweeps (and
+# files) again. Reds are rare and the duplicate issue is a louder signal, not
+# data loss — revisit with a per-tree red marker only if it becomes noisy.
+#
 # Worker output (notes + suite log) lands in <git-common-dir>/.gate-sweep/
 # sweep.log, so the detached run stays observable after the land returned.
 set -euo pipefail
+
+# Best-effort contract, self-enforced: this runs on the land's tail, so NO
+# internal failure (disk full, read-only .git, EPIPE on a closed pipe) may
+# ever surface as a non-zero exit to the caller. The EXIT trap makes every
+# set -e abort exit 0; do_run swaps in its own trap that adds lock release.
+trap 'exit 0' EXIT
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -275,7 +286,7 @@ do_run() {
     log "sweep already running — queued follow-up for ${SHA:0:9}"
     return 0
   fi
-  trap release_lock EXIT
+  trap 'release_lock; exit 0' EXIT
   while :; do
     process_request
     [ -f "$SWEEP_DIR/queue" ] || break

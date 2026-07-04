@@ -266,7 +266,7 @@ def test_run_red_files_issue_with_failing_ids_and_commit(repo: Path, tmp_path: P
     assert "tests/unit/test_alpha.py::test_beta" in text  # the failing ids
     assert head[:7] in text  # the landing commit
     assert "feature/9-widget" in text  # the branch that landed
-    assert "9" in text  # the source issue
+    assert "#9" in text  # the source issue, as a real reference
 
 
 def test_run_red_keeps_the_pruned_stamp(repo: Path, tmp_path: Path) -> None:
