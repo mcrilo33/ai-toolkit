@@ -284,6 +284,15 @@ if [ "$PUSH_RC" -ne 0 ]; then
 fi
 rm -f "$PUSH_LOG"
 
+# --- telemetry: hub-side Langfuse auth resolution (issue #127) --------------------
+# Hub sessions don't hand-export LANGFUSE_BASIC_AUTH, which silently skipped the
+# post-run ingest below and left the span sink dark. Resolve it here — env first,
+# then the shared ~/.afk-telemetry conf — exporting auth + host for the ingesters
+# and the OTLP span endpoint for the emits below. Best-effort by contract: an
+# unresolvable auth returns 1 and exports nothing, keeping the ingest's existing
+# skip-WARN; the land NEVER fails on telemetry.
+wt_resolve_langfuse_auth || true
+
 # --- telemetry: land lifecycle marker + script run-node --------------------------
 # Emit AFTER the merge+push succeeds but BEFORE teardown, while the worktree (and
 # its spoke_run_id) still exists. The script span is this control script as a trace

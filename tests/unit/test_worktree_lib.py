@@ -916,3 +916,118 @@ def test_transport_not_died_on_clean_remote_rejection(tmp_path: Path) -> None:
         "error: failed to push some refs to 'github.com:o/r.git'\n"
     )
     assert _transport_died(1, rejection, tmp_path) == 1
+
+
+# --- hub-side Langfuse auth resolution (issue #127) ----------------------------
+# wt_resolve_langfuse_auth generalizes hub-afk.sh's afk_resolve_telemetry_auth so
+# ANY hub script (worktree-land.sh, worktree-quick.sh) can resolve Langfuse auth
+# without the operator hand-exporting it: env wins each field independently, then
+# the ~/.afk-telemetry conf fills the gaps. On success it exports the auth, the
+# host, and the OTLP span endpoint (so telemetry.sh's script-span fan-out fires);
+# on failure it exports nothing and returns 1 so callers keep their skip-WARN path.
+
+
+def _resolve_auth(
+    tmp_path: Path, *, conf: str | None, pre: str = ""
+) -> subprocess.CompletedProcess[str]:
+    """Run wt_resolve_langfuse_auth hermetically and prove what it EXPORTED.
+
+    AFK_TELEMETRY_CONF is always pinned — to a tmp conf when `conf` is given,
+    else to a nonexistent path — and the LANGFUSE_* / span-endpoint env is
+    cleared first, so a host shell's real credentials can never steer the
+    resolution. `pre` re-exports the fields a test wants preset. A child bash
+    echoes the three fields, so only values the resolver *exported* (not merely
+    set) are visible in C_AUTH / C_HOST / C_EP.
+    """
+    conf_path = tmp_path / "afk-telemetry"
+    if conf is not None:
+        conf_path.write_text(conf)
+    parts = [
+        f'export AFK_TELEMETRY_CONF="{conf_path}"',
+        "unset LANGFUSE_BASIC_AUTH LANGFUSE_HOST AI_TOOLKIT_OTEL_SPAN_ENDPOINT",
+        pre,
+        'wt_resolve_langfuse_auth; echo "RC=$?"',
+        "bash -c 'echo \"C_AUTH=$LANGFUSE_BASIC_AUTH C_HOST=$LANGFUSE_HOST"
+        " C_EP=$AI_TOOLKIT_OTEL_SPAN_ENDPOINT\"'",
+    ]
+    return _call("; ".join(p for p in parts if p))
+
+
+def test_resolve_langfuse_auth_from_conf_when_env_unset(tmp_path: Path) -> None:
+    # Env auth absent but the conf supplies it ⇒ resolve + EXPORT it, defaulting
+    # the host and the OTLP span endpoint to the local stack.
+    result = _resolve_auth(tmp_path, conf='LANGFUSE_BASIC_AUTH="Basic-from-file"\n')
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    assert "C_AUTH=Basic-from-file" in result.stdout, "auth resolved + exported from the conf"
+    assert "C_HOST=http://localhost:3000" in result.stdout, "host defaults to the local stack"
+    assert "C_EP=http://localhost:4318" in result.stdout, (
+        "span endpoint defaults to the local collector's OTLP-HTTP port"
+    )
+
+
+def test_resolve_langfuse_auth_env_wins_over_conf(tmp_path: Path) -> None:
+    # An explicit env LANGFUSE_BASIC_AUTH outranks the conf file — the same
+    # precedence as afk_resolve_telemetry_auth.
+    result = _resolve_auth(
+        tmp_path,
+        conf='LANGFUSE_BASIC_AUTH="Basic-from-file"\n',
+        pre="export LANGFUSE_BASIC_AUTH=Basic-from-env",
+    )
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    assert "C_AUTH=Basic-from-env" in result.stdout, "env auth must win over the conf"
+
+
+def test_resolve_langfuse_auth_conf_host_used_when_env_supplies_only_auth(
+    tmp_path: Path,
+) -> None:
+    # Env supplies auth only; the conf supplies host ⇒ each field resolves
+    # independently (env auth + conf host), never "conf only read when auth unset".
+    result = _resolve_auth(
+        tmp_path,
+        conf='LANGFUSE_HOST="http://lf.example:3000"\n',
+        pre="export LANGFUSE_BASIC_AUTH=Basic-env",
+    )
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    assert "C_AUTH=Basic-env" in result.stdout, "env auth is kept"
+    assert "C_HOST=http://lf.example:3000" in result.stdout, "host resolves from the conf"
+
+
+def test_resolve_langfuse_auth_rc1_and_no_exports_when_unresolvable(tmp_path: Path) -> None:
+    # Conf absent + env absent ⇒ rc 1 and NOTHING exported — callers (the land
+    # ingest, the span emits) keep their existing skip paths untouched.
+    result = _resolve_auth(tmp_path, conf=None)
+
+    assert "RC=1" in result.stdout, result.stderr + result.stdout
+    assert "C_AUTH= " in result.stdout, "no auth may be invented"
+    assert "C_EP=\n" in result.stdout or result.stdout.rstrip().endswith("C_EP="), (
+        "the span endpoint must not be wired when auth is unresolvable"
+    )
+
+
+def test_resolve_langfuse_auth_span_endpoint_override_preserved(tmp_path: Path) -> None:
+    # An operator's explicit span endpoint (env) outranks the default.
+    result = _resolve_auth(
+        tmp_path,
+        conf='LANGFUSE_BASIC_AUTH="Basic-from-file"\n',
+        pre="export AI_TOOLKIT_OTEL_SPAN_ENDPOINT=http://otel.example:9999",
+    )
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    assert "C_EP=http://otel.example:9999" in result.stdout, "env endpoint override is preserved"
+
+
+def test_resolve_langfuse_auth_conf_may_supply_span_endpoint(tmp_path: Path) -> None:
+    # The conf may pin the span endpoint too (same env-wins-per-field contract).
+    result = _resolve_auth(
+        tmp_path,
+        conf=(
+            'LANGFUSE_BASIC_AUTH="Basic-from-file"\n'
+            'AI_TOOLKIT_OTEL_SPAN_ENDPOINT="http://conf.example:4318"\n'
+        ),
+    )
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    assert "C_EP=http://conf.example:4318" in result.stdout, "conf endpoint is honored"

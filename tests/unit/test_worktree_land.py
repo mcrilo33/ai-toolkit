@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -100,6 +101,8 @@ def _run_land(
     tmux_windows: str = "",
     spoke_marker: str | None = None,
     extra_env: dict[str, str] | None = None,
+    stub_python312: bool = False,
+    stub_curl: bool = False,
 ) -> tuple[subprocess.CompletedProcess, dict[str, Path]]:
     """Run worktree-land.sh from the hub with logging stubs on PATH.
 
@@ -107,10 +110,23 @@ def _run_land(
     `pytest` stub logging every call — landing must NOT run pytest itself anymore
     (issue #19): the suite runs once via the pre-push hook on the main push.
     `tmux_windows` is the line(s) the tmux stub prints for `list-windows`.
-    Returns the completed process and the stub logs by name."""
+    Returns the completed process and the stub logs by name.
+
+    Telemetry isolation (issue #127): the land script now resolves Langfuse auth
+    ITSELF from ${AFK_TELEMETRY_CONF:-~/.afk-telemetry}, so the harness always
+    pins AFK_TELEMETRY_CONF to a nonexistent sandbox path and strips the
+    LANGFUSE_* / span-endpoint env — otherwise every test here would read the
+    operator's REAL conf and POST fixture spans to a live collector (the #49
+    fixture-leak class). A test that wants auth opts in via `extra_env` with its
+    own tmp conf. `stub_python312` stubs the ingest interpreter (logging its
+    LANGFUSE_* env per call); `stub_curl` stubs curl (logging argv, then stdin —
+    the OTLP span payload) so span POSTs are captured, never sent."""
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
-    logs = {name: tmp_path / f"{name}-calls.log" for name in ("gh", "tmux", "code", "pytest")}
+    logs = {
+        name: tmp_path / f"{name}-calls.log"
+        for name in ("gh", "tmux", "code", "pytest", "python3.12", "curl")
+    }
     for name, exit_code in (("gh", gh_exit), ("code", 0)):
         stub = bindir / name
         stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{logs[name]}"\nexit {exit_code}\n')
@@ -124,8 +140,29 @@ def _run_land(
     pytest_stub = bindir / "pytest"
     pytest_stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{logs["pytest"]}"\nexit 0\n')
     pytest_stub.chmod(0o755)
+    if stub_python312:
+        py_stub = bindir / "python3.12"
+        py_stub.write_text(
+            "#!/bin/sh\n"
+            f'printf "CALL %s\\n" "$*" >> "{logs["python3.12"]}"\n'
+            f'env | grep -E "^LANGFUSE_" >> "{logs["python3.12"]}" || true\n'
+            "exit 0\n"
+        )
+        py_stub.chmod(0o755)
+    if stub_curl:
+        curl_stub = bindir / "curl"
+        curl_stub.write_text(
+            "#!/bin/sh\n"
+            f'printf "ARGV %s\\n" "$*" >> "{logs["curl"]}"\n'
+            f'cat >> "{logs["curl"]}"\nprintf "\\n" >> "{logs["curl"]}"\n'
+            "exit 0\n"
+        )
+        curl_stub.chmod(0o755)
     env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
     env.pop("TMUX", None)
+    for var in ("LANGFUSE_BASIC_AUTH", "LANGFUSE_HOST", "AI_TOOLKIT_OTEL_SPAN_ENDPOINT"):
+        env.pop(var, None)
+    env["AFK_TELEMETRY_CONF"] = str(tmp_path / "no-such-conf")
     # The host's own spoke marker must never steer the guard; set it explicitly
     # only when a test means to model a spoke session (issue #26).
     env.pop("WT_SPOKE", None)
@@ -1074,3 +1111,130 @@ def test_land_merges_into_configured_base(hub: Path, tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "feat: work" in _git(hub, "log", "--oneline", "develop")
     assert _git(hub, "rev-parse", "main").strip() == main_before
+
+
+# --- hub-side Langfuse auth resolution (issue #127) ------------------------------
+# The land script resolves Langfuse auth itself (wt_resolve_langfuse_auth: env
+# wins, then ${AFK_TELEMETRY_CONF:-~/.afk-telemetry}) just before its telemetry
+# section, so (a) telemetry-ingest-spoke.sh inherits working credentials from a
+# fresh hub shell and builds the spoke tree + backfill, and (b) the existing
+# lifecycle/script spans get AI_TOOLKIT_OTEL_SPAN_ENDPOINT and fan out to the
+# collector. Resolution is best-effort: no conf + no env keeps the existing
+# skip-WARN and the land still succeeds. No credential ever reaches an argv.
+
+
+def _seed_otel_spoke(hub: Path, wt: Path, *, raw_bodies: bool) -> None:
+    """Give a fixture worktree the durable OTel-spoke state a real spawn mints.
+
+    .ai-toolkit/ is git-excluded exactly as worktree-new.sh does it — without the
+    exclude the seeded files count as dirty and the land refuses before merge.
+    """
+    exclude = Path(_git(wt, "rev-parse", "--git-path", "info/exclude").strip())
+    if not exclude.is_absolute():
+        exclude = wt / exclude
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    with exclude.open("a") as f:
+        f.write(".ai-toolkit/\n")
+    ait = wt / ".ai-toolkit"
+    ait.mkdir()
+    (ait / "spoke-run-id").write_text("feature/1-otel+1234\n")
+    if raw_bodies:
+        (ait / "raw-bodies").mkdir()
+
+
+def _wait_for_content(log: Path, needle: str, tries: int = 40) -> str:
+    """Poll a detached-writer log until `needle` appears (or ~4s elapse).
+
+    The OTLP span sink runs curl backgrounded and disowned, so its stub may
+    still be writing when the land process has already exited.
+    """
+    for _ in range(tries):
+        text = _log_text(log)
+        if needle in text:
+            return text
+        time.sleep(0.1)
+    return _log_text(log)
+
+
+def test_land_resolves_auth_from_conf_for_ingest(hub: Path, tmp_path: Path) -> None:
+    # Fresh hub shell (no LANGFUSE_* in env) + conf present ⇒ the ingest step's
+    # interpreter must inherit the resolved auth + defaulted host, so the spoke
+    # tree (#87) and backfill (#92) actually build. Both steps run.
+    wt = _make_spoke(hub, tmp_path, "feature/1-otel", push=True)
+    _seed_otel_spoke(hub, wt, raw_bodies=True)
+    conf = tmp_path / "afk-telemetry"
+    conf.write_text('LANGFUSE_BASIC_AUTH="Basic-test-127"\n')
+
+    proc, logs = _run_land(
+        hub,
+        tmp_path,
+        "1",
+        stub_python312=True,
+        stub_curl=True,  # auth resolves here, so the span sink fires — capture, never send
+        extra_env={
+            "AFK_TELEMETRY_CONF": str(conf),
+            "AI_TOOLKIT_INGEST_FLUSH_WAIT": "0",
+        },
+    )
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    ingest_log = _log_text(logs["python3.12"])
+    assert "langfuse_spoke_tree.py" in ingest_log, "loaded-context itemization must run"
+    assert "langfuse_backfill.py" in ingest_log, "transcript backfill must run"
+    assert "LANGFUSE_BASIC_AUTH=Basic-test-127" in ingest_log, (
+        "ingest must inherit the conf-resolved auth without operator hand-export"
+    )
+    assert "LANGFUSE_HOST=http://localhost:3000" in ingest_log, "host defaults to the local stack"
+
+
+def test_land_ingest_skips_with_warn_when_no_conf_no_env(hub: Path, tmp_path: Path) -> None:
+    # Conf absent + env absent ⇒ the existing auth-gate skip notice fires and the
+    # land still succeeds — resolution must stay best-effort, never a guard.
+    wt = _make_spoke(hub, tmp_path, "feature/1-noauth", push=True)
+    _seed_otel_spoke(hub, wt, raw_bodies=True)
+
+    proc, logs = _run_land(hub, tmp_path, "1", stub_python312=True)
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "LANGFUSE_BASIC_AUTH unset — skipping post-run Langfuse ingestion" in (
+        proc.stdout + proc.stderr
+    )
+    assert _log_text(logs["python3.12"]) == "", "no ingester may run without auth"
+
+
+def test_land_script_span_posted_when_conf_present(hub: Path, tmp_path: Path) -> None:
+    # With auth resolvable, the land's existing lifecycle/script span emission
+    # must reach the OTLP span endpoint (defaulted to the local collector) — the
+    # land-duration signal for #122/#123/#124. The credential itself must never
+    # appear on the curl argv (the collector holds auth).
+    wt = _make_spoke(hub, tmp_path, "feature/1-span", push=True)
+    _seed_otel_spoke(hub, wt, raw_bodies=False)
+    conf = tmp_path / "afk-telemetry"
+    conf.write_text('LANGFUSE_BASIC_AUTH="Basic-test-127"\n')
+
+    proc, logs = _run_land(
+        hub,
+        tmp_path,
+        "1",
+        stub_curl=True,
+        extra_env={"AFK_TELEMETRY_CONF": str(conf)},
+    )
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    curl_log = _wait_for_content(logs["curl"], "worktree-land")
+    assert "/v1/traces" in curl_log, "span must POST to the OTLP traces endpoint"
+    assert "http://localhost:4318" in curl_log, "endpoint defaults to the local collector"
+    assert "worktree-land" in curl_log, "the land script span carries its script name"
+    assert "Basic-test-127" not in curl_log, "credential must never reach the curl argv/payload"
+
+
+def test_land_emits_no_span_when_auth_unresolvable(hub: Path, tmp_path: Path) -> None:
+    # No conf + no env ⇒ the resolver exports nothing, so the span sink stays
+    # dark (no endpoint) — no blind POSTs from an unconfigured hub.
+    wt = _make_spoke(hub, tmp_path, "feature/1-dark", push=True)
+    _seed_otel_spoke(hub, wt, raw_bodies=False)
+
+    proc, logs = _run_land(hub, tmp_path, "1", stub_curl=True)
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert _log_text(logs["curl"]) == "", "no span POST may fire without resolved auth"

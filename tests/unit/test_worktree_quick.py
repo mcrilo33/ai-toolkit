@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -65,11 +66,24 @@ def hub(tmp_path: Path) -> Path:
     return hub
 
 
-def _run_quick(hub: Path, tmp_path: Path, *args: str) -> tuple[subprocess.CompletedProcess, Path]:
+def _run_quick(
+    hub: Path,
+    tmp_path: Path,
+    *args: str,
+    extra_env: dict[str, str] | None = None,
+    stub_curl: bool = False,
+) -> tuple[subprocess.CompletedProcess, Path]:
     """Run worktree-quick.sh from the hub with a logging `tmux` stub on PATH.
 
     The stub records every invocation so a test can assert the script NEVER
     drives tmux. Returns the completed process and the tmux call-log path.
+
+    Telemetry isolation (issue #127): the script resolves Langfuse auth itself,
+    so the harness pins AFK_TELEMETRY_CONF to a nonexistent sandbox path and
+    strips the LANGFUSE_* / span-endpoint env (belt to the conftest pin); a test
+    that wants auth opts in via `extra_env` with its own tmp conf. `stub_curl`
+    captures OTLP span POSTs (argv, then the stdin payload) into
+    ``tmp_path / "curl-calls.log"`` so nothing is ever sent.
     """
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
@@ -83,9 +97,24 @@ def _run_quick(hub: Path, tmp_path: Path, *args: str) -> tuple[subprocess.Comple
         "exit 0\n"
     )
     tmux.chmod(0o755)
+    if stub_curl:
+        curl_log = tmp_path / "curl-calls.log"
+        curl = bindir / "curl"
+        curl.write_text(
+            "#!/bin/sh\n"
+            f'printf "ARGV %s\\n" "$*" >> "{curl_log}"\n'
+            f'cat >> "{curl_log}"\nprintf "\\n" >> "{curl_log}"\n'
+            "exit 0\n"
+        )
+        curl.chmod(0o755)
     env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
     env.pop("TMUX", None)
     env.pop("WT_SPOKE", None)
+    for var in ("LANGFUSE_BASIC_AUTH", "LANGFUSE_HOST", "AI_TOOLKIT_OTEL_SPAN_ENDPOINT"):
+        env.pop(var, None)
+    env["AFK_TELEMETRY_CONF"] = str(tmp_path / "no-such-conf")
+    if extra_env:
+        env.update(extra_env)
     proc = subprocess.run(
         ["bash", str(WORKTREE_QUICK), *args],
         cwd=str(hub),
@@ -242,3 +271,64 @@ def test_quick_branches_from_configured_base(hub: Path, tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     wt = hub.parent / f"{hub.name}-cfg-base"
     assert _git(wt, "rev-parse", "HEAD").strip() == develop_tip
+
+
+# --- hub-side Langfuse auth resolution (issue #127) ------------------------------
+# The quick lane never launches an OTel'd claude, so its only Langfuse footprint
+# is the spawn lifecycle/script span pair emitted at the end of the script. The
+# script resolves auth itself (wt_resolve_langfuse_auth: env wins, then
+# ${AFK_TELEMETRY_CONF:-~/.afk-telemetry}) so those spans get
+# AI_TOOLKIT_OTEL_SPAN_ENDPOINT and reach the collector from any hub session;
+# unresolvable auth leaves the sink dark and the spawn untouched.
+
+
+def _wait_for_content(log: Path, needle: str, tries: int = 40) -> str:
+    """Poll a detached-writer log until `needle` appears (or ~4s elapse).
+
+    The OTLP span sink runs curl backgrounded and disowned, so its stub may
+    still be writing after the quick script has exited.
+    """
+    for _ in range(tries):
+        text = log.read_text() if log.exists() else ""
+        if needle in text:
+            return text
+        time.sleep(0.1)
+    return log.read_text() if log.exists() else ""
+
+
+def test_quick_spawn_span_posted_when_conf_present(hub: Path, tmp_path: Path) -> None:
+    # Conf present + fresh hub env ⇒ the spawn span pair must POST to the
+    # defaulted OTLP endpoint, and the credential must never surface — not on
+    # the curl argv/payload, not in the script's own output.
+    conf = tmp_path / "afk-telemetry"
+    conf.write_text('LANGFUSE_BASIC_AUTH="Basic-test-127"\n')
+
+    proc, _ = _run_quick(
+        hub,
+        tmp_path,
+        "fix-typo",
+        stub_curl=True,
+        extra_env={"AFK_TELEMETRY_CONF": str(conf)},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    curl_log = _wait_for_content(tmp_path / "curl-calls.log", "worktree-quick")
+    assert "/v1/traces" in curl_log, "spawn span must POST to the OTLP traces endpoint"
+    assert "http://localhost:4318" in curl_log, "endpoint defaults to the local collector"
+    assert "worktree-quick" in curl_log, "the quick script span carries its script name"
+    assert "Basic-test-127" not in curl_log, "credential must never reach the curl argv/payload"
+    assert "Basic-test-127" not in proc.stdout + proc.stderr, (
+        "credential must never surface in the script output"
+    )
+
+
+def test_quick_emits_no_span_when_auth_unresolvable(hub: Path, tmp_path: Path) -> None:
+    # No conf + no env ⇒ nothing exported, the sink stays dark, and the spawn
+    # still succeeds — resolution is best-effort, never a spawn guard.
+    proc, _ = _run_quick(hub, tmp_path, "fix-typo", stub_curl=True)
+
+    assert proc.returncode == 0, proc.stderr
+    curl_log = tmp_path / "curl-calls.log"
+    assert not curl_log.exists() or curl_log.read_text() == "", (
+        "no span POST may fire without resolved auth"
+    )

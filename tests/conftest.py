@@ -93,3 +93,17 @@ for _var in (
     os.environ.pop(_var, None)
 for _var in [_k for _k in os.environ if _k.startswith("OTEL_EXPORTER_OTLP_")]:
     os.environ.pop(_var, None)
+
+# Hub-side Langfuse auth resolution (issue #127): wt_resolve_langfuse_auth
+# (worktree-lib.sh, called by worktree-land.sh / worktree-quick.sh) resolves auth from
+# the env OR ${AFK_TELEMETRY_CONF:-~/.afk-telemetry} and then RE-DEFAULTS the OTLP span
+# endpoint — so the endpoint strip above is not enough: a test shelling out to a land
+# would read the operator's REAL conf and re-open the export channel to a live
+# collector. Strip the auth pair and pin the conf var at a nonexistent sandbox path so
+# the resolver can never resolve inside the suite; a test that wants auth opts in with
+# its own tmp conf. Same regression guard file as the strips above.
+for _var in ("LANGFUSE_BASIC_AUTH", "LANGFUSE_HOST"):
+    os.environ.pop(_var, None)
+os.environ["AFK_TELEMETRY_CONF"] = os.path.join(
+    tempfile.mkdtemp(prefix="ai-toolkit-test-afk-"), "no-such-conf"
+)
