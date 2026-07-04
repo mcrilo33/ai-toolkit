@@ -219,17 +219,28 @@ wt_workspace_file() {
 
 # Shared driver for the two editors below. Entries resolve against the
 # workspace file's directory (relative paths are relative to it); the rewrite
-# is atomic (tmp + rename), tab-indented like VS Code's own writes, and skipped
-# entirely when nothing changed.
+# is atomic (unique tmp + rename), serialized across concurrent worktree ops by
+# an flock on a sidecar .lock (spawns/teardowns overlap under /next-batch and
+# /afk — a bare read-modify-write loses entries), tab-indented like VS Code's
+# own writes, and skipped entirely when nothing changed.
 wt_workspace_edit() {
   python3 - "$1" "$2" "$3" <<'PY'
+import fcntl
 import json
 import os
 import sys
+import tempfile
 
 op, ws_file, wt_dir = sys.argv[1], sys.argv[2], sys.argv[3]
 if not os.path.isfile(ws_file):
     sys.exit(1)
+
+# One lock for every editor of this workspace file. A sidecar (never replaced)
+# rather than the file itself: os.replace swaps the inode, so a waiter holding
+# the old fd would lock an orphan and read stale content.
+lock_fd = os.open(ws_file + ".lock", os.O_CREAT | os.O_RDWR, 0o644)
+fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
 text = open(ws_file).read()
 try:
     doc = json.loads(text)
@@ -241,7 +252,11 @@ except (ValueError, KeyError, TypeError) as e:
           "falling back to the `code` CLI, file left untouched", file=sys.stderr)
     sys.exit(1)
 
-ws_dir = os.path.dirname(os.path.abspath(ws_file))
+# Canonicalize BOTH ends before relpath: with only the target realpath'd, a
+# symlinked ancestor of the workspace file (NFS/corp homes) yields a lexical
+# `..`-chain that resolves to a nonexistent physical path — VS Code shows a
+# broken folder and the next sweep would drop the live entry.
+ws_dir = os.path.dirname(os.path.realpath(ws_file))
 target = os.path.realpath(wt_dir)
 
 
@@ -276,20 +291,28 @@ else:  # remove — and sweep ghosts of past misses in the same pass
         sys.exit(0)  # nothing to drop — don't churn the file
     doc["folders"] = kept
 
-tmp = ws_file + ".tmp"
-with open(tmp, "w") as f:
-    json.dump(doc, f, indent="\t")
-    f.write("\n")
-os.replace(tmp, ws_file)
+fd, tmp = tempfile.mkstemp(prefix=os.path.basename(ws_file) + ".", dir=ws_dir)
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(doc, f, indent="\t", ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, ws_file)
+except BaseException:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+    raise
 PY
 }
 
 # wt_workspace_add <ws_file> <wt_dir> -> 0 entry present (appended or already
 # there); 1 missing/unparseable file (caller falls back to `code --add`).
+# Call in a conditional (`if`/`||`) — a bare call aborts a `set -e` caller
+# before the fallback can run.
 wt_workspace_add() { wt_workspace_edit add "$1" "$2"; }
 
 # wt_workspace_remove <ws_file> <wt_dir> -> 0 entry absent (removed, swept, or
 # never there); 1 missing/unparseable file (caller falls back to `code --remove`).
+# Same `set -e` caveat as wt_workspace_add: only call in a conditional.
 wt_workspace_remove() { wt_workspace_edit remove "$1" "$2"; }
 
 # --- slug ---------------------------------------------------------------------

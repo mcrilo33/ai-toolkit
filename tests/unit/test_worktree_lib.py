@@ -1050,7 +1050,13 @@ def _ws_env_call(fn_call: str, *, home: Path) -> subprocess.CompletedProcess[str
         ["bash", "-c", f'source "{WT_LIB}"; {fn_call}'],
         capture_output=True,
         text=True,
-        env={**os.environ, "TZ": "UTC", "HOME": str(home), "GIT_CONFIG_GLOBAL": "/dev/null"},
+        env={
+            **os.environ,
+            "TZ": "UTC",
+            "HOME": str(home),
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        },
     )
 
 
@@ -1163,6 +1169,32 @@ def test_workspace_add_appends_relative_entry(tmp_path: Path) -> None:
     ]
     assert doc["settings"] == {"files.exclude": {"**/.git": True}}
     assert '\t"folders"' in text, "tab indentation (VS Code's own format) must be kept"
+
+
+def test_workspace_add_stores_resolvable_path_under_symlinked_ancestor(
+    tmp_path: Path,
+) -> None:
+    # The workspace file addressed THROUGH a symlinked ancestor (NFS/corp homes):
+    # the stored relative path must round-trip to the worktree via the physical
+    # layout — a lexical relpath against the unresolved dir produces a `..`-chain
+    # that resolves nowhere (and the next sweep would drop the live entry).
+    # The link is SHALLOWER than the physical tree: a lexical `..`-count computed
+    # from the unresolved side overshoots after the symlink is followed.
+    phys = tmp_path / "a" / "b" / "phys"
+    (phys / "claude").mkdir(parents=True)
+    repos = phys / "Repos"
+    _make_dirs(repos, "ai-toolkit-42")
+    link = tmp_path / "link"
+    link.symlink_to(phys)
+    ws = link / "claude" / "review.code-workspace"
+    _write_workspace(ws, [])
+
+    result = _call(f'wt_workspace_add "{ws}" "{link / "Repos" / "ai-toolkit-42"}"')
+
+    assert result.returncode == 0, result.stderr
+    (entry,) = json.loads(ws.read_text())["folders"]
+    resolved = (ws.parent / entry["path"]).resolve()
+    assert resolved == (repos / "ai-toolkit-42").resolve()
 
 
 def test_workspace_add_is_noop_when_entry_already_present(tmp_path: Path) -> None:
