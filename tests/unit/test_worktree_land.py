@@ -605,8 +605,15 @@ def test_green_gate_transport_death_retries_once_with_skip(hub: Path, tmp_path: 
 
     assert proc.returncode == 0, proc.stderr
     assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
+    # Ship attempts: gated first try, then exactly one skip-retry. Later entries
+    # are the post-land maintenance pushes (ready-tag delete, branch delete),
+    # which fire the same hub hook gate-free — pre-existing behavior.
     gate_calls = _log_text(gate_log).splitlines()
-    assert gate_calls == ["INVOKED skip=[]", "INVOKED skip=[1]"], gate_calls
+    assert gate_calls[:2] == ["INVOKED skip=[]", "INVOKED skip=[1]"], gate_calls
+    assert gate_calls.count("INVOKED skip=[1]") == 1, gate_calls
+    # Exactly two transfers reached the remote for main: the dying one + the retry.
+    main_refs = [ln for ln in _log_text(ref_log).splitlines() if ln == "refs/heads/main"]
+    assert len(main_refs) == 2, _log_text(ref_log)
     # The retry is loud about what it is doing and why it may skip the gate.
     assert "retry" in proc.stderr.lower()
     assert "TEST_SELECT_SKIP" in proc.stderr
