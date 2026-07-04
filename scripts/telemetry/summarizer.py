@@ -65,8 +65,8 @@ def content_key(content: str, model: str) -> str:
 class SummaryCache:
     """A content-hash → summary cache persisted as a JSON sidecar.
 
-    Decoupled from the DuckDB store so summaries survive store rebuilds and are
-    shared across spokes that point at the same telemetry dir. Reads are lazy and
+    A standalone sidecar so summaries survive re-ingestion of the span data and
+    are shared across spokes that point at the same telemetry dir. Reads are lazy and
     writes are immediate (write-through), so a crash never loses a computed line.
     """
 

@@ -241,7 +241,8 @@ def derive_span_id(*parts: str) -> str:
     """Deterministic 12-hex span id from stable identifiers.
 
     Re-parsing the same session yields the same ids, so the dataset is
-    idempotent across runs (no duplicate spans when DuckDB re-reads the source).
+    idempotent across runs (re-ingestion overwrites the same spans instead of
+    duplicating them).
     """
     digest = hashlib.sha1(":".join(parts).encode("utf-8")).hexdigest()
     return digest[:12]
