@@ -411,6 +411,22 @@ def test_next_batch_skill_registered_in_metadata() -> None:
     assert "next-batch:" in meta, "/next-batch must be registered in metadata.yml"
 
 
+def test_start_task_skill_documents_merge_heuristic() -> None:
+    # Filing time is the decision point: start-task must carry the heuristic + escape hatch.
+    skill = (SKILLS_DIR / "start-task" / "SKILL.md").read_text()
+
+    assert "one issue with subtasks" in skill, "start-task must teach the merge heuristic"
+    assert "Split: intentional" in skill, "start-task must document the escape hatch"
+
+
+def test_workflow_rule_documents_merge_heuristic() -> None:
+    # The workflow rule feeds /afk's answerer and DEFINE sessions the same convention.
+    rule = (REPO_ROOT / "shared" / "rules" / "workflow.md").read_text()
+
+    assert "one issue with subtasks" in rule, "workflow.md must carry the filing heuristic"
+    assert "Split: intentional" in rule, "workflow.md must document the escape hatch"
+
+
 def test_next_batch_skill_documents_dispatch() -> None:
     skill = (SKILLS_DIR / "next-batch" / "SKILL.md").read_text().lower()
 
