@@ -22,7 +22,9 @@
 #   * MERGE-CANDIDATE LINT (issue #125) — when a blocked-by chain of OPEN issues has
 #     colliding scopes it can never parallelize, so splitting bought nothing; print a
 #     `⚠ merge candidates` proposal per chain on STDERR. Detection-only: the batch on
-#     stdout, the exit code, and dispatch behavior are untouched.
+#     stdout, the exit code, and dispatch behavior are untouched. A
+#     `Split: intentional — <why>` body line in ANY issue of the chain records the
+#     deliberate split and silences the lint for that chain only.
 #
 # Read-only. Run on the hub (main checkout). Functions are source-guarded so the unit
 # tests can drive `plan_from_json` with a fixture graph without any network round-trip.
@@ -136,6 +138,22 @@ def scope_of(body):
     return set(tokens)
 
 
+def has_split_marker(body):
+    """True when the body carries a `Split: intentional — <why>` line.
+
+    Mirrors the `Scope:`/`Gate:` line conventions (issue #125): the first line
+    starting `split:` (case-insensitive) whose value begins with `intentional`
+    records that the chain's serialization is deliberate, silencing the
+    merge-candidate lint for the chain containing this issue. Any other value
+    (`Split: maybe`) does NOT suppress.
+    """
+    for raw in (body or "").splitlines():
+        stripped = raw.strip()
+        if stripped.lower().startswith("split:"):
+            return stripped[len("split:"):].strip().lower().startswith("intentional")
+    return False
+
+
 def conflict(a, b):
     """Two scopes conflict when either is exclusive (None) or their tokens overlap."""
     if a is None or b is None:
@@ -186,7 +204,8 @@ def print_merge_candidates(issues, children):
     Such a chain is strictly serialized AND scope-colliding — the planner can never
     batch its members, so filing them separately bought zero throughput (issue #125).
     Detection-only: prints proposals on stderr, never touches the batch on stdout,
-    the exit code, or which issues get dispatched.
+    the exit code, or which issues get dispatched. A `Split: intentional` marker in
+    any member suppresses the proposal for that chain only.
     """
     edges = [
         (parent, child)
@@ -211,6 +230,8 @@ def print_merge_candidates(issues, children):
             comp.add(n)
             stack.extend(adj[n] - comp)
         seen |= comp
+        if any(issues[n]["split"] for n in comp):
+            continue  # deliberate split — the chain opted out of the proposal
         comp_edges = [(a, b) for a, b in edges if a in comp and b in comp]
         shared = set()
         for a, b in comp_edges:
@@ -249,6 +270,7 @@ def main():
         issues[num] = {
             "number": num,
             "scope": scope_of(node.get("body")),
+            "split": has_split_marker(node.get("body")),
             "blockers": blockers,
         }
 

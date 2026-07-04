@@ -307,7 +307,7 @@ def test_split_marker_suppresses_only_its_own_chain() -> None:
     warnings = [line for line in proc.stderr.splitlines() if "merge candidates" in line]
     assert len(warnings) == 1
     assert "#11 → #12" in warnings[0]
-    assert "#1" not in warnings[0]
+    assert "#2" not in warnings[0]
 
 
 def test_split_marker_requires_intentional_value() -> None:
