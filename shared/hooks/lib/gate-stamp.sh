@@ -64,6 +64,16 @@ gate_stamp_mint() {
   find "$dir" -type f -mtime +14 -delete 2>/dev/null || true
 }
 
+# gate_stamp_has <tree> — a stamp file exists for the tree (any tier/env).
+# Lets the gate defer its runner `--version` fingerprint probe until a stamp
+# could actually be consumed: probing invokes the runner, which must stay off
+# the common no-stamp path (it runs before the repo-integrity tripwire).
+gate_stamp_has() {
+  local dir
+  dir="$(gate_stamp_dir)" || return 1
+  [ -f "$dir/$1" ]
+}
+
 # gate_stamp_check <tree> <demanded-tier> <env> — succeed iff a stamp covers
 # the demand: same tree, exact env-fingerprint match, stamped tier at least as
 # strong as the demanded one.

@@ -88,7 +88,7 @@ cp "$SHARED_HOOKS/commit-quality.sh" \
    "$SHARED_HOOKS/reviewer-sep-warn.sh" \
    "$SHARED_HOOKS/anti-gutting-scan.sh" \
    "$SHARED_HOOKS/test-select.sh" "$SCRIPTS_DST/"
-cp "$SHARED_HOOKS/lib/utils.sh" "$SCRIPTS_DST/lib/"
+cp "$SHARED_HOOKS/lib/utils.sh" "$SHARED_HOOKS/lib/gate-stamp.sh" "$SCRIPTS_DST/lib/"
 chmod +x "$SCRIPTS_DST"/*.sh
 info "Copied cage scripts → $SCRIPTS_DST"
 

@@ -214,6 +214,21 @@ def test_check_refuses_env_fingerprint_mismatch(repo: Path) -> None:
     assert proc.returncode not in (0, _LIB_LOAD_FAILED)  # strong tier ≠ wrong env
 
 
+def test_has_refuses_when_no_stamp_exists(repo: Path) -> None:
+    proc = _lib(repo, f'gate_stamp_has "{_tree(repo)}"')
+
+    assert proc.returncode not in (0, _LIB_LOAD_FAILED)
+
+
+def test_has_finds_a_minted_stamp(repo: Path) -> None:
+    tree = _tree(repo)
+    _lib(repo, f'gate_stamp_mint "{tree}" testmon "py3.12"')
+
+    proc = _lib(repo, f'gate_stamp_has "{tree}"')
+
+    assert proc.returncode == 0, proc.stderr
+
+
 def test_check_refuses_missing_stamp(repo: Path) -> None:
     proc = _lib(repo, f'gate_stamp_check "{_tree(repo)}" testmon "py3.12"')
 
