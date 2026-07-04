@@ -40,19 +40,26 @@ def _node(number: int, scope: str | None, blocked_by: list[tuple[int, str]] | No
     return {"number": number, "body": body, "blockedBy": {"nodes": nodes}}
 
 
-def _plan(nodes: list[dict], *, inflight: list[str] | None = None) -> list[int]:
-    """Pipe a fixture graph into plan_from_json and return the batch as issue numbers."""
+def _run_plan(
+    nodes: list[dict], *, inflight: list[str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Pipe a fixture graph into plan_from_json and return the completed process."""
     env = {**os.environ}
     args = ""
     for spoke in inflight or []:
         args += f" --inflight {json_quote(spoke)}"
-    proc = subprocess.run(
+    return subprocess.run(
         ["bash", "-c", f'source "{BATCH_PLAN}"; plan_from_json{args}'],
         input=json.dumps(nodes),
         capture_output=True,
         text=True,
         env=env,
     )
+
+
+def _plan(nodes: list[dict], *, inflight: list[str] | None = None) -> list[int]:
+    """Pipe a fixture graph into plan_from_json and return the batch as issue numbers."""
+    proc = _run_plan(nodes, inflight=inflight)
     assert proc.returncode == 0, proc.stderr
     return [int(tok) for tok in proc.stdout.split()]
 
@@ -148,6 +155,62 @@ def test_inflight_exclusive_spoke_blocks_the_whole_batch() -> None:
     batch = _plan([_node(1, "a.py"), _node(5, "d.py")], inflight=["*"])
 
     assert batch == []
+
+
+# ── merge-candidate lint: colliding-scope serialized chains warn (issue #125) ─
+
+
+def test_merge_candidates_warn_for_colliding_open_chain() -> None:
+    # #2 is blockedBy #1 and both touch a.py — strictly serialized, zero parallelism.
+    nodes = [_node(1, "a.py"), _node(2, "a.py", blocked_by=[(1, "OPEN")])]
+
+    proc = _run_plan(nodes)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "merge candidates: #1 → #2" in proc.stderr
+    assert "a.py" in proc.stderr
+
+
+def test_merge_candidates_silent_for_disjoint_chain() -> None:
+    # The acceptance chain #1 → #2 → #3 has disjoint scopes (a.py, b.py, c.py).
+    proc = _run_plan(_acceptance_graph())
+
+    assert proc.returncode == 0, proc.stderr
+    assert "merge candidates" not in proc.stderr
+
+
+def test_merge_candidates_chain_coalesces_into_one_line() -> None:
+    # A three-issue colliding chain prints ONE proposal line, not one per edge.
+    nodes = [
+        _node(1, "a.py"),
+        _node(2, "a.py", blocked_by=[(1, "OPEN")]),
+        _node(3, "a.py", blocked_by=[(2, "OPEN")]),
+    ]
+
+    proc = _run_plan(nodes)
+
+    warnings = [line for line in proc.stderr.splitlines() if "merge candidates" in line]
+    assert len(warnings) == 1
+    assert "#1 → #2 → #3" in warnings[0]
+
+
+def test_merge_candidates_never_alter_batch_or_exit_code() -> None:
+    # The lint is detection-only: same batch and exit code as the silent case.
+    nodes = [_node(1, "a.py"), _node(2, "a.py", blocked_by=[(1, "OPEN")])]
+
+    proc = _run_plan(nodes)
+
+    assert proc.returncode == 0
+    assert [int(tok) for tok in proc.stdout.split()] == [1]
+
+
+def test_merge_candidates_ignore_closed_blockers() -> None:
+    # A closed blocker is already satisfied — no serialized chain left to merge.
+    nodes = [_node(7, "x.py", blocked_by=[(100, "CLOSED")])]
+
+    proc = _run_plan(nodes)
+
+    assert "merge candidates" not in proc.stderr
 
 
 # ── tie-break: equal depth ⇒ more direct dependents wins ──────────────────────
