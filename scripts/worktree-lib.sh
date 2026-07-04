@@ -191,6 +191,107 @@ wt_main_root() {
   wt_realpath "$p"
 }
 
+# --- review workspace file (issue #134) ----------------------------------------
+# The VS Code review "window" is a saved .code-workspace file. `code --add` /
+# `code --remove` target the *last-focused* window and routinely miss (landed
+# spokes ghosting in the Explorer, live spokes never added), so creation and
+# teardown edit the file's `folders` array directly — VS Code hot-reloads it.
+# The editors return 1 on a missing or unparseable file (e.g. hand-edited JSONC:
+# strict JSON is the price of a safe rewrite) so callers fall back to the legacy
+# `code` CLI path; in that case the file is never rewritten or truncated.
+
+# wt_workspace_file <repo_root> -> path of the review workspace file.
+# `git config ai-toolkit.workspace-file` wins (leading ~ expanded — git stores
+# the value verbatim); default ~/.claude/<repo-basename>.code-workspace so
+# synced target repos each get their own review workspace.
+wt_workspace_file() {
+  local cfg
+  cfg="$(git -C "$1" config ai-toolkit.workspace-file 2>/dev/null || true)"
+  if [ -z "$cfg" ]; then
+    printf '%s/.claude/%s.code-workspace\n' "$HOME" "$(basename "$1")"
+  else
+    case "$cfg" in
+      "~/"*) printf '%s/%s\n' "$HOME" "${cfg#\~/}" ;;
+      *)     printf '%s\n' "$cfg" ;;
+    esac
+  fi
+}
+
+# Shared driver for the two editors below. Entries resolve against the
+# workspace file's directory (relative paths are relative to it); the rewrite
+# is atomic (tmp + rename), tab-indented like VS Code's own writes, and skipped
+# entirely when nothing changed.
+wt_workspace_edit() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import json
+import os
+import sys
+
+op, ws_file, wt_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+if not os.path.isfile(ws_file):
+    sys.exit(1)
+text = open(ws_file).read()
+try:
+    doc = json.loads(text)
+    folders = doc["folders"]
+    if not isinstance(folders, list):
+        raise ValueError("'folders' is not a list")
+except (ValueError, KeyError, TypeError) as e:
+    print(f"worktree: unparseable workspace file {ws_file} ({e}) — "
+          "falling back to the `code` CLI, file left untouched", file=sys.stderr)
+    sys.exit(1)
+
+ws_dir = os.path.dirname(os.path.abspath(ws_file))
+target = os.path.realpath(wt_dir)
+
+
+def resolve(entry):
+    """Absolute, canonical path of a folder entry; None when it has no path."""
+    p = entry.get("path") if isinstance(entry, dict) else None
+    if not isinstance(p, str) or not p:
+        return None
+    p = os.path.expanduser(p)
+    if not os.path.isabs(p):
+        p = os.path.join(ws_dir, p)
+    return os.path.realpath(p)
+
+
+if op == "add":
+    if any(resolve(e) == target for e in folders):
+        sys.exit(0)  # already present — never duplicate, never rewrite
+    folders.append(
+        {"name": os.path.basename(target), "path": os.path.relpath(target, ws_dir)}
+    )
+else:  # remove — and sweep ghosts of past misses in the same pass
+    kept = []
+    for e in folders:
+        resolved = resolve(e)
+        if resolved is None:
+            kept.append(e)  # path-less entry — cannot judge, conservatively kept
+        elif resolved == target or not os.path.exists(resolved):
+            continue
+        else:
+            kept.append(e)
+    if kept == folders:
+        sys.exit(0)  # nothing to drop — don't churn the file
+    doc["folders"] = kept
+
+tmp = ws_file + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(doc, f, indent="\t")
+    f.write("\n")
+os.replace(tmp, ws_file)
+PY
+}
+
+# wt_workspace_add <ws_file> <wt_dir> -> 0 entry present (appended or already
+# there); 1 missing/unparseable file (caller falls back to `code --add`).
+wt_workspace_add() { wt_workspace_edit add "$1" "$2"; }
+
+# wt_workspace_remove <ws_file> <wt_dir> -> 0 entry absent (removed, swept, or
+# never there); 1 missing/unparseable file (caller falls back to `code --remove`).
+wt_workspace_remove() { wt_workspace_edit remove "$1" "$2"; }
+
 # --- slug ---------------------------------------------------------------------
 
 # Lowercase, collapse non-alphanumeric runs to '-', strip edges, keep <=4 segments.
