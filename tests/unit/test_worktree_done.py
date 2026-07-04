@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -24,6 +25,8 @@ WORKTREE_DONE = Path(__file__).resolve().parents[2] / "scripts" / "worktree-done
 _GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
 # The host's base-branch override (#117) must never steer the script under test.
 _GIT_ENV.pop("AI_TOOLKIT_BASE_BRANCH", None)
+# A host GIT_SSH_COMMAND must not prefix the keepalive assertion (#119).
+_GIT_ENV.pop("GIT_SSH_COMMAND", None)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -195,6 +198,36 @@ def test_merged_branch_is_pruned_on_remote(hub: Path, tmp_path: Path) -> None:
     proc, _ = _run_done(hub, tmp_path, "1")
     assert proc.returncode == 0, proc.stderr
     assert not _remote_has(hub, "feature/1-merged")
+
+
+def test_remote_branch_delete_carries_keepalive(hub: Path, tmp_path: Path) -> None:
+    # The remote branch-delete push must route through wt_git_push (issue #119)
+    # so every push the worktree scripts perform carries the SSH keepalive
+    # options. A `git` shim in the same PATH-front bindir _run_done uses records
+    # the env each `git push` runs with, then delegates to the real git.
+    real_git = shutil.which("git")
+    assert real_git is not None
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    log = tmp_path / "push-invocations.log"
+    shim = bindir / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'if [ "$1" = push ]; then echo "GIT_SSH_COMMAND=[$GIT_SSH_COMMAND] $*" >> "{log}"; fi\n'
+        f'exec "{real_git}" "$@"\n'
+    )
+    shim.chmod(0o755)
+    _make_spoke(hub, tmp_path, "feature/8-keepalive", push=True, merge=True)
+
+    proc, _ = _run_done(hub, tmp_path, "8")
+
+    assert proc.returncode == 0, proc.stderr
+    assert not _remote_has(hub, "feature/8-keepalive")
+    recorded = log.read_text()
+    keepalive = "-o ServerAliveInterval=15 -o ServerAliveCountMax=40"
+    delete_lines = [ln for ln in recorded.splitlines() if "--delete" in ln]
+    assert delete_lines, f"no branch-delete push recorded: {recorded!r}"
+    assert f"GIT_SSH_COMMAND=[ssh {keepalive}]" in delete_lines[0]
 
 
 def test_unmerged_branch_is_kept(hub: Path, tmp_path: Path) -> None:

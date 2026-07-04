@@ -197,7 +197,13 @@ one. A successful land consumes the marker (deletes the local + remote tag).
 
 One command runs the whole landing: it refuses with a precise reason unless the hub is
 clean on `main` and the spoke is clean, fully pushed, and marked ready; a failing suite
-rolls `main` back (`git reset --keep`) with nothing pushed. On success it calls
+rolls `main` back (`git reset --keep`) with nothing pushed. Every gate-bearing push
+the worktree scripts perform carries SSH keepalive options (`ServerAliveInterval`,
+issue #119) so the multi-minute in-push gate can't stale the connection (the
+completion-marker tag push stays plain — tag-only pushes skip the gate on a fresh
+connection); if the gate ran green and the transfer still died, the land retries once
+with `TEST_SELECT_SKIP=1` — loudly — and a failed gate never retries. On success it
+calls
 `worktree-done.sh` for the teardown mirror of creation — `code --remove` drops the
 folder from the review window, and the now-merged branch is pruned local + origin
 (`--keep-branch` to keep it). An unmerged branch is never pruned. It then closes the

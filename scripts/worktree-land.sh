@@ -232,16 +232,57 @@ if [ -z "$SKIP_TESTS" ] && [ -z "$AUTO_SKIP" ]; then
   fi
 fi
 echo "→ pushing $DEFAULT to origin (the pre-push hook runs the test gate)"
-if ! (
-  if [ -n "$SKIP_TESTS" ] || [ -n "$AUTO_SKIP" ]; then export TEST_SELECT_SKIP=1; fi
-  if [ -n "$TEST_CMD" ]; then export TEST_SELECT_CMD="$TEST_CMD"; fi
-  git push origin "$DEFAULT"
-); then
-  wt_warn "push rejected (pre-push test gate or remote) — rolling back: git reset --keep $PRE_SHA"
+
+# One ship attempt; a non-empty $1 forces TEST_SELECT_SKIP=1 (the retry lane).
+# The subshell scopes the exports; the push routes through wt_git_push so the
+# SSH connection is kept alive across the multi-minute in-push gate (issue #119).
+land_push() {
+  (
+    if [ -n "$SKIP_TESTS" ] || [ -n "$AUTO_SKIP" ] || [ -n "${1:-}" ]; then
+      export TEST_SELECT_SKIP=1
+    fi
+    if [ -n "$TEST_CMD" ]; then export TEST_SELECT_CMD="$TEST_CMD"; fi
+    wt_git_push origin "$DEFAULT"
+  )
+}
+
+land_rollback() {
+  rm -f "$PUSH_LOG"
+  wt_warn "$1 — rolling back: git reset --keep $PRE_SHA"
   git reset --keep "$PRE_SHA" \
     || wt_die "rollback failed — hub is still on the merged commit; reset by hand: git reset --keep $PRE_SHA"
   wt_die "landing aborted; nothing was pushed. Fix on the branch (push from the spoke when it has one) and re-run."
+}
+
+# Capture the push's combined output while streaming it live: tee exits 0 and
+# pipefail is on, so PUSH_RC is git's own exit code (a 141 SIGPIPE survives) and
+# the capture file is complete when the pipeline returns.
+PUSH_LOG="$(mktemp "${TMPDIR:-/tmp}/wt-land-push.XXXXXX")"
+PUSH_RC=0
+land_push "" 2>&1 | tee "$PUSH_LOG" || PUSH_RC=$?
+if [ "$PUSH_RC" -ne 0 ]; then
+  # Second line of defense (issue #119): retry EXACTLY once with the suite
+  # skipped when the failure is demonstrably POST-green — (a) a transport-death
+  # signature (git only enters the transfer phase after the pre-push hook exited
+  # 0) AND (b) no pytest failure shape in the capture: a FAILING gate whose
+  # output merely quotes a transport phrase (this repo's own tests embed those
+  # literals) must still read as a failed gate. The filter covers all of
+  # pytest's red summaries — "N failed", "N error(s)" (collection/internal),
+  # and the "Interrupted:" banner — none of which a green run prints ("N
+  # xfailed" has no digit before "failed" and never matches). Anything else —
+  # failed gate, policy rejection — rolls back exactly as before, and a failed
+  # retry does too.
+  if wt_push_transport_died "$PUSH_RC" "$PUSH_LOG" \
+     && ! grep -qE '[0-9]+ (failed|error)|Interrupted' "$PUSH_LOG"; then
+    wt_warn "gate ran green but the push transport died (SSH staleness, issue #119) — retrying ONCE with TEST_SELECT_SKIP=1"
+    if ! land_push retry; then
+      land_rollback "retry push failed too"
+    fi
+  else
+    land_rollback "push rejected (pre-push test gate or remote)"
+  fi
 fi
+rm -f "$PUSH_LOG"
 
 # --- telemetry: land lifecycle marker + script run-node --------------------------
 # Emit AFTER the merge+push succeeds but BEFORE teardown, while the worktree (and
@@ -285,7 +326,7 @@ if [ -n "$ISSUE" ] && [ -z "$LOCAL" ]; then
   if git rev-parse -q --verify "refs/tags/${MARKER}" >/dev/null 2>&1; then
     git tag -d "$MARKER" >/dev/null 2>&1 \
       || wt_warn "couldn't delete local tag $MARKER — delete it by hand: git tag -d $MARKER"
-    git push origin ":refs/tags/${MARKER}" >/dev/null 2>&1 \
+    wt_git_push origin ":refs/tags/${MARKER}" >/dev/null 2>&1 \
       || wt_warn "couldn't delete remote tag $MARKER — delete it by hand: git push origin :refs/tags/$MARKER"
   fi
 fi

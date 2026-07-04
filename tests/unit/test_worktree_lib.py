@@ -14,6 +14,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 WT_LIB = Path(__file__).resolve().parents[2] / "scripts" / "worktree-lib.sh"
 
 
@@ -765,3 +767,152 @@ def test_base_branch_skips_init_default_branch_without_ref(tmp_path: Path) -> No
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "main"
+
+
+# --- SSH-keepalive push (issue #119) --------------------------------------------
+# The ~6-minute pre-push suite runs INSIDE `git push`, between the SSH connection
+# opening and the pack transfer; GitHub reaps the idle connection mid-gate, so a
+# fully green push dies in the transfer phase. wt_git_push wraps `git push` with
+# GIT_SSH_COMMAND keepalive options so the connection survives the gate, and
+# wt_push_transport_died is the retry predicate worktree-land consults to tell
+# that post-green transport death apart from a failed gate (which must never be
+# retried with the suite skipped).
+
+KEEPALIVE_OPTS = "-o ServerAliveInterval=15 -o ServerAliveCountMax=40"
+
+
+def test_git_ssh_command_defaults_to_ssh_with_keepalive() -> None:
+    # No pre-existing GIT_SSH_COMMAND → plain ssh plus the keepalive options.
+    result = _call("unset GIT_SSH_COMMAND; wt_git_ssh_command")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == f"ssh {KEEPALIVE_OPTS}"
+
+
+def test_git_ssh_command_appends_to_existing_command() -> None:
+    # A caller's GIT_SSH_COMMAND (custom binary, -i identity, its own -o options)
+    # must be preserved verbatim as the PREFIX, with the keepalive options
+    # appended — OpenSSH honors the FIRST occurrence of an option, so appending
+    # also means a caller's own ServerAlive* settings keep winning.
+    result = _call(
+        'export GIT_SSH_COMMAND="ssh -i /tmp/key -o ConnectTimeout=5"; wt_git_ssh_command'
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == f"ssh -i /tmp/key -o ConnectTimeout=5 {KEEPALIVE_OPTS}"
+
+
+def test_git_push_injects_keepalive_and_passes_args_through(tmp_path: Path) -> None:
+    # wt_git_push must exec `git push <args…>` with the keepalive GIT_SSH_COMMAND
+    # in the child's env — proven with a `git` stub on PATH that records both.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    dump = tmp_path / "git-invocation.txt"
+    stub = bindir / "git"
+    stub.write_text(
+        "#!/bin/sh\n"
+        '{ echo "ARGV=$*"; echo "GIT_SSH_COMMAND=$GIT_SSH_COMMAND"; } > "$STUB_GIT_DUMP"\n'
+    )
+    stub.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "STUB_GIT_DUMP": str(dump),
+        "TZ": "UTC",
+    }
+    env.pop("GIT_SSH_COMMAND", None)
+
+    result = subprocess.run(
+        ["bash", "-c", f'source "{WT_LIB}"; wt_git_push -u origin fix/119-branch'],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    recorded = dump.read_text()
+    assert "ARGV=push -u origin fix/119-branch" in recorded
+    assert f"GIT_SSH_COMMAND=ssh {KEEPALIVE_OPTS}" in recorded
+
+
+def test_git_push_keepalive_does_not_leak_into_caller_env(tmp_path: Path) -> None:
+    # The injection is scoped to the one git process — the caller's shell must
+    # not end up with a mutated/exported GIT_SSH_COMMAND after the call.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    stub = bindir / "git"
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "TZ": "UTC"}
+    env.pop("GIT_SSH_COMMAND", None)
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{WT_LIB}"; wt_git_push origin main; printf "AFTER=[%s]" "${{GIT_SSH_COMMAND:-}}"',
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.endswith("AFTER=[]")
+
+
+def _transport_died(rc: int, stderr_text: str, tmp_path: Path) -> int:
+    """Return wt_push_transport_died's exit code for a push rc + captured output."""
+    capture = tmp_path / "push-output.txt"
+    capture.write_text(stderr_text)
+    result = _call(f'wt_push_transport_died {rc} "{capture}"')
+    return result.returncode
+
+
+def test_transport_died_on_sigpipe_exit(tmp_path: Path) -> None:
+    # Exit 141 (SIGPIPE) is the spoke-side symptom — transport death regardless
+    # of what the output says.
+    assert _transport_died(141, "", tmp_path) == 0
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Connection to ssh.github.com closed by remote host.",
+        "packet_write_wait: Connection to 140.82.121.36 port 22: Broken pipe",
+        "client_loop: send disconnect: Broken pipe",
+        "fatal: the remote end hung up unexpectedly",
+        "send-pack: unexpected disconnect while reading sideband packet",
+    ],
+    ids=["closed-by-remote", "packet-write-wait", "client-loop", "hung-up", "send-pack"],
+)
+def test_transport_died_on_ssh_disconnect_output(line: str, tmp_path: Path) -> None:
+    # Each transport-death signature git/ssh emits when the connection dies
+    # mid-transfer — a phase git only reaches AFTER the pre-push hook exited 0,
+    # so any of these is proof the gate ran green.
+    assert (
+        _transport_died(1, f"some output\n{line}\nerror: failed to push some refs\n", tmp_path) == 0
+    )
+
+
+def test_transport_not_died_on_failed_gate(tmp_path: Path) -> None:
+    # A failed pre-push gate (pytest failures + git's local refusal) must NOT
+    # read as transport death — retrying it with TEST_SELECT_SKIP=1 would ship
+    # a red tree. Includes a BrokenPipeError traceback line: pytest output
+    # containing "Broken pipe" prose must not fool the predicate.
+    gate_failure = (
+        "FAILED tests/unit/test_x.py::test_y - BrokenPipeError: [Errno 32] Broken pipe\n"
+        "=== 1 failed, 12 passed in 340.12s ===\n"
+        "error: failed to push some refs to 'github.com:o/r.git'\n"
+    )
+    assert _transport_died(1, gate_failure, tmp_path) == 1
+
+
+def test_transport_not_died_on_clean_remote_rejection(tmp_path: Path) -> None:
+    # A remote policy rejection (branch protection etc.) is not transport death:
+    # a retry would just fail again — roll back as today.
+    rejection = (
+        " ! [remote rejected] main -> main (protected branch hook declined)\n"
+        "error: failed to push some refs to 'github.com:o/r.git'\n"
+    )
+    assert _transport_died(1, rejection, tmp_path) == 1
