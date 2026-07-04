@@ -310,6 +310,9 @@ fi
 # The connection ENDPOINTS are non-secret URLs, so to auto-populate Langfuse with no
 # manual step they ARE wired: defaulted to the local collector when the operator
 # left them unset, and an operator override is preserved verbatim (see below).
+# The same treatment covers AI_TOOLKIT_OTEL_SPAN_ENDPOINT (#126): telemetry.sh's
+# workflow-span fan-out (cycle step:/script/hook spans) POSTs to it over OTLP-HTTP,
+# so it defaults to the collector's :4318 listener and rides the same gate.
 #
 # Off-box CONTENT (auto-populate): OTEL_LOG_USER_PROMPTS / OTEL_LOG_TOOL_DETAILS /
 # OTEL_LOG_TOOL_CONTENT ship the user prompts and per-tool input/output off the
