@@ -779,3 +779,187 @@ def test_missing_stamp_lib_degrades_to_running_the_suite(repo: Path, tmp_path: P
     assert proc.returncode == 0, proc.stderr
     assert "--testmon" in _runlog(runlog)  # today's behavior, unchanged
     assert not _stamp_path(repo).exists()  # stamps silently disabled
+
+
+
+
+def _write_ref_test(repo: Path, test_rel: str, script_basename: str) -> None:
+    """A minimal tests/**/test_*.py referencing `script_basename` as a token."""
+    path = repo / test_rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f'"""Covers {script_basename} behavior."""\n')
+
+
+def test_mapped_shell_change_runs_only_mapped_tests(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    tip = _commit(repo, {"scripts/do.sh": "#!/bin/sh\necho hi\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    log = _runlog(runlog)
+    assert "RUN tests/unit/test_do.py\n" in log  # exactly the mapped set
+    assert "--testmon" not in log
+    assert "RUN \n" not in log  # never the bare full suite
+
+
+def test_two_mapped_files_run_deduped_sorted_union(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    _write_ref_test(repo, "tests/unit/test_a.py", "one.sh")
+    (repo / "tests/unit/test_b.py").write_text('"""one.sh and two.sh together."""\n')
+    tip = _commit(repo, {"scripts/one.sh": "echo 1\n", "scripts/two.sh": "echo 2\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN tests/unit/test_a.py tests/unit/test_b.py\n" in _runlog(runlog)
+
+
+def test_mixed_py_and_mapped_shell_runs_mapped_plus_testmon(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    tip = _commit(repo, {"scripts/do.sh": "echo hi\n", "pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    log = _runlog(runlog)
+    assert "RUN tests/unit/test_do.py\n" in log  # the mapped set …
+    assert "RUN --testmon\n" in log  # … plus testmon for the python part
+    assert "RUN \n" not in log
+
+
+def test_unmapped_shell_change_escalates_to_full(repo: Path, tmp_path: Path) -> None:
+    # A tests/ dir exists but nothing references new.sh: conservative fallback.
+    base = _rev(repo)
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    tip = _commit(repo, {"scripts/new.sh": "echo new\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN \n" in _runlog(runlog)  # the full suite, not a selection
+
+
+def test_mixed_mapped_and_unmapped_escalates_to_full(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    tip = _commit(repo, {"scripts/do.sh": "echo hi\n", "scripts/new.sh": "echo new\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    log = _runlog(runlog)
+    assert "RUN \n" in log
+    assert "RUN tests/unit/test_do.py\n" not in log  # full subsumes the selection
+
+
+def test_exempt_file_change_runs_nothing(repo: Path, tmp_path: Path) -> None:
+    _commit(repo, {".test-select-exempt": "notes.txt\n"})
+    base = _rev(repo)
+    tip = _commit(repo, {"notes.txt": "unrecognized but exempt\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN" not in _runlog(runlog)
+
+
+def test_exempt_directory_prefix_covers_children(repo: Path, tmp_path: Path) -> None:
+    _commit(repo, {".test-select-exempt": "settings/\n"})
+    base = _rev(repo)
+    tip = _commit(repo, {"settings/editor.json": "{}\n", "pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    log = _runlog(runlog)
+    assert "--testmon" in log  # python tier preserved for the py part
+    assert "RUN \n" not in log  # the exempt settings/ file never escalates
+
+
+def test_exempt_list_change_itself_escalates_to_full(repo: Path, tmp_path: Path) -> None:
+    # Editing the exempt list is high-stakes: its basename can never be a
+    # filename-shaped token, so it is unmapped by construction → full suite.
+    _commit(repo, {".test-select-exempt": "notes.txt\n"})
+    base = _rev(repo)
+    tip = _commit(repo, {".test-select-exempt": "notes.txt\nLICENSE\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN \n" in _runlog(runlog)
+
+
+def test_selected_failing_suite_blocks_push(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, exit_code=7)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 7  # a red selection aborts the push
+
+
+def test_selected_pass_does_not_mint_stamp_yet(repo: Path, tmp_path: Path) -> None:
+    # Stamp mint/consume for the SELECTED tier is subtask D: until the stamp
+    # can record the set that ran, minting bare `selected` would unsoundly
+    # cover a different selection (or a testmon demand) on the same tree.
+    base = _rev(repo)
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert not _stamp_path(repo).exists()
+
+
+def test_missing_reverse_index_lib_degrades_to_full(repo: Path, tmp_path: Path) -> None:
+    # An installed hook copy predating lib/test-reverse-index.sh (the #45
+    # stale-hook trap) must behave exactly as today: mapped or not, a shell
+    # change runs the full suite.
+    hookdir = tmp_path / "installed"
+    (hookdir / "lib").mkdir(parents=True)
+    src = TEST_SELECT.parent
+    shutil.copy(TEST_SELECT, hookdir / "test-select.sh")
+    for lib in ("utils.sh", "telemetry.sh", "gate-stamp.sh"):
+        shutil.copy(src / "lib" / lib, hookdir / "lib" / lib)
+    base = _rev(repo)
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = subprocess.run(
+        ["bash", str(hookdir / "test-select.sh")],
+        cwd=str(repo),
+        input=_stdin(tip, base),
+        capture_output=True,
+        text=True,
+        env={**_GIT_ENV, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN \n" in _runlog(runlog)  # today's behavior, unchanged
