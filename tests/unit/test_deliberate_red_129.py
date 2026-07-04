@@ -8,3 +8,6 @@ second red run). Never lands on main.
 
 def test_deliberate_red_for_129_verification() -> None:
     assert False, "deliberate red: exercising report-red issue automation (#129)"
+
+
+# second red run marker for dedup verification (#129)
