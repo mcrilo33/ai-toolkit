@@ -141,11 +141,12 @@ def scope_of(body):
 def has_split_marker(body):
     """True when the body carries a `Split: intentional — <why>` line.
 
-    Mirrors the `Scope:`/`Gate:` line conventions (issue #125): the first line
-    starting `split:` (case-insensitive) whose value begins with `intentional`
-    records that the chain's serialization is deliberate, silencing the
-    merge-candidate lint for the chain containing this issue. Any other value
-    (`Split: maybe`) does NOT suppress.
+    Mirrors the `Scope:`/`Gate:` line conventions (issue #125): the first
+    `split:` line (case-insensitive) wins, and suppression applies only when
+    ITS value begins with `intentional` — recording that the chain's
+    serialization is deliberate and silencing the merge-candidate lint for the
+    chain containing this issue. Any other value (`Split: maybe`) does NOT
+    suppress, even if a later line says `intentional`.
     """
     for raw in (body or "").splitlines():
         stripped = raw.strip()

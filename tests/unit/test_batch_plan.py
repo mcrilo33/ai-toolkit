@@ -26,6 +26,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BATCH_PLAN = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "batch-plan.sh"
 SKILLS_DIR = REPO_ROOT / "shared" / "skills"
@@ -279,6 +281,7 @@ def test_split_marker_suppresses_the_chain_warning() -> None:
 
     assert proc.returncode == 0, proc.stderr
     assert "merge candidates" not in proc.stderr
+    assert [int(tok) for tok in proc.stdout.split()] == [1], "suppression must not touch the batch"
 
 
 def test_split_marker_in_any_chain_member_suppresses() -> None:
@@ -294,20 +297,46 @@ def test_split_marker_in_any_chain_member_suppresses() -> None:
 
 
 def test_split_marker_suppresses_only_its_own_chain() -> None:
-    # Two colliding chains, one marked: the other must still warn.
+    # Two colliding chains, one marked: the other must still warn. (Chain numbers
+    # share no prefix so the absence asserts can't substring-match, e.g. #1 in #11.)
     nodes = [
         _node(1, "a.py", split="intentional — shelf-life"),
         _node(2, "a.py", blocked_by=[(1, "OPEN")]),
-        _node(11, "b.py"),
-        _node(12, "b.py", blocked_by=[(11, "OPEN")]),
+        _node(31, "b.py"),
+        _node(32, "b.py", blocked_by=[(31, "OPEN")]),
     ]
 
     proc = _run_plan(nodes)
 
     warnings = [line for line in proc.stderr.splitlines() if "merge candidates" in line]
     assert len(warnings) == 1
-    assert "#11 → #12" in warnings[0]
+    assert "#31 → #32" in warnings[0]
+    assert "#1" not in warnings[0]
     assert "#2" not in warnings[0]
+
+
+@pytest.mark.parametrize("marker", ["INTENTIONAL — caps", "intentional"])
+def test_split_marker_parses_leniently(marker: str) -> None:
+    # Casing is normalized and the `— <why>` tail is optional; both forms suppress.
+    nodes = [
+        _node(1, "a.py", split=marker),
+        _node(2, "a.py", blocked_by=[(1, "OPEN")]),
+    ]
+
+    proc = _run_plan(nodes)
+
+    assert "merge candidates" not in proc.stderr
+
+
+def test_split_marker_without_space_after_colon_suppresses() -> None:
+    # `Split:intentional` (no space) still parses — the value is stripped first.
+    node = _node(1, "a.py")
+    node["body"] += "Split:intentional\n"
+    nodes = [node, _node(2, "a.py", blocked_by=[(1, "OPEN")])]
+
+    proc = _run_plan(nodes)
+
+    assert "merge candidates" not in proc.stderr
 
 
 def test_split_marker_requires_intentional_value() -> None:
