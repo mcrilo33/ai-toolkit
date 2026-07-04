@@ -1,0 +1,84 @@
+{
+  "name": "spoke latency",
+  "description": "Where does a spoke's time go? Cycle-step durations, script/gate costs, LLM latency by model, and human-wait totals. Saved once via the Langfuse UI (v3.192.x has no public dashboards API); each widget's metricsQuery is the exact /api/public/v2/metrics query that backs it — add fromTimestamp/toTimestamp when running one. See docs/telemetry-pull-layer.md.",
+  "widgets": [
+    {
+      "title": "Cycle-step duration by step name (p50/p95)",
+      "chart": "horizontal-bar",
+      "metricsQuery": {
+        "view": "observations",
+        "dimensions": [{ "field": "name" }],
+        "metrics": [
+          { "measure": "latency", "aggregation": "p50" },
+          { "measure": "latency", "aggregation": "p95" }
+        ],
+        "filters": [
+          { "column": "name", "operator": "starts with", "value": "step:", "type": "string" }
+        ]
+      }
+    },
+    {
+      "title": "Script spans p50/p95 (land, push incl. test gate, markers)",
+      "chart": "horizontal-bar",
+      "metricsQuery": {
+        "view": "observations",
+        "dimensions": [{ "field": "name" }],
+        "metrics": [
+          { "measure": "latency", "aggregation": "p50" },
+          { "measure": "latency", "aggregation": "p95" }
+        ],
+        "filters": [
+          {
+            "column": "name",
+            "operator": "any of",
+            "type": "stringOptions",
+            "value": [
+              "worktree-new",
+              "worktree-land",
+              "worktree-done",
+              "spoke-push",
+              "script:ready",
+              "script:gate"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "title": "LLM request latency by model (p50/p95)",
+      "chart": "horizontal-bar",
+      "metricsQuery": {
+        "view": "observations",
+        "dimensions": [{ "field": "providedModelName" }],
+        "metrics": [
+          { "measure": "latency", "aggregation": "p50" },
+          { "measure": "latency", "aggregation": "p95" }
+        ],
+        "filters": [
+          { "column": "type", "operator": "=", "value": "GENERATION", "type": "string" }
+        ]
+      }
+    },
+    {
+      "title": "Gate park + permission wait (daily totals)",
+      "chart": "stacked-bar-time-series",
+      "metricsQuery": {
+        "view": "scores-numeric",
+        "dimensions": [{ "field": "name" }],
+        "metrics": [
+          { "measure": "value", "aggregation": "sum" },
+          { "measure": "count", "aggregation": "count" }
+        ],
+        "filters": [
+          {
+            "column": "name",
+            "operator": "any of",
+            "type": "stringOptions",
+            "value": ["gate_park_ms", "permission_wait_ms"]
+          }
+        ],
+        "timeDimension": { "granularity": "day" }
+      }
+    }
+  ]
+}

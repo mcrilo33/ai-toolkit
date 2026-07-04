@@ -121,6 +121,93 @@ output, so durations never double-count.
 > assembled `spoketree-`/`spokecycle-` traces strips their `duration`. Re-run
 > `langfuse_spoke_tree.py` to restore it; aligning the two writers is a follow-up.
 
+## Spoke-latency dashboard (Issue #128)
+
+One saved Langfuse dashboard — **"spoke latency"** — answers, at a glance: which
+cycle step dominates a spoke, what the gate costs, and how LLM latency compares
+across models. Its reproducible source of truth is
+**`dashboard/langfuse/spoke-latency-dashboard.json`**: four widget definitions, each
+carrying the exact `/api/public/v2/metrics` query that backs it, pinned to the v2
+metrics contract by `tests/unit/test_spoke_latency_dashboard.py` (views, measures,
+aggregations, filter operators, the high-cardinality dimension ban, and the emitted
+span/score names).
+
+Langfuse v3.192.x has **no public dashboards API** — verified against the local
+instance's OpenAPI spec and `langfuse-cli api __schema`, neither of which lists a
+`dashboards` resource — so the dashboard is saved once via the UI (*Dashboards → New
+dashboard → "spoke latency"*, one *New widget* form per entry in the JSON file). The
+widget numbers are verifiable headlessly by running each `metricsQuery` (plus a
+`fromTimestamp`/`toTimestamp` window) through the Metrics API. Auth resolves like the
+rest of the push stack (see `wt_bridge_launch` in `scripts/worktree-lib.sh`): the
+operator-exported `LANGFUSE_BASIC_AUTH` (`Basic <base64(pk:sk)>`), sent verbatim as
+the `Authorization` header against `LANGFUSE_HOST` (default
+`http://localhost:3000`).
+
+```bash
+curl -s -H "Authorization: $LANGFUSE_BASIC_AUTH" \
+  "$LANGFUSE_HOST/api/public/v2/metrics" --get \
+  --data-urlencode 'query=<widget metricsQuery + time range>'
+```
+
+Span-name inventory the widgets key on (all emitted by this repo): cycle-step nodes
+`step:<subject>` / `preStep` / `postStep` (assembled views) and `step:<phase>`
+markers; script spans `worktree-new` / `worktree-land` / `worktree-done` /
+`spoke-push` (the push span's window covers the pre-push test gate) and
+`script:ready` / `script:gate` / `script:accept` / `script:blocked`; native
+`claude_code.llm_request` generations; numeric scores `gate_park_ms` (trace-level
+PLAN-gate park) and `permission_wait_ms` (per blocked tool).
+
+### Widget 1 — cycle-step duration by step name
+
+| Field | Value |
+|-------|-------|
+| View | Observations |
+| Filters | `name` *starts with* `step:` |
+| Metrics | `latency` — `p50` and `p95` |
+| Breakdown dimension | `name` |
+| Chart | Horizontal bar (or table) |
+
+### Widget 2 — script spans p50/p95 (land, push, gate)
+
+| Field | Value |
+|-------|-------|
+| View | Observations |
+| Filters | `name` *any of* `worktree-land`, `worktree-new`, `worktree-done`, `spoke-push`, `script:ready`, `script:gate` |
+| Metrics | `latency` — `p50` and `p95` |
+| Breakdown dimension | `name` |
+| Chart | Horizontal bar |
+
+The `spoke-push` span's window covers the pre-push test gate; `script:gate` is the
+PLAN-gate park emission.
+
+### Widget 3 — LLM request latency by model
+
+| Field | Value |
+|-------|-------|
+| View | Observations |
+| Filters | `type` = `GENERATION` |
+| Metrics | `latency` — `p50` and `p95` |
+| Breakdown dimension | `providedModelName` |
+| Chart | Horizontal bar (add a second time-series copy with `timeDimension` for trends) |
+
+### Widget 4 — gate park + permission wait totals
+
+| Field | Value |
+|-------|-------|
+| View | Scores (numeric) |
+| Filters | `name` *any of* `gate_park_ms`, `permission_wait_ms` |
+| Metrics | `value` — `sum` (add `count` for how often) |
+| Breakdown dimension | `name`, over time (`timeDimension` day) |
+| Chart | Stacked bar over time |
+
+> [!NOTE]
+> Per-**session** wait totals are not groupable here: `sessionId` is a
+> high-cardinality dimension the Metrics API only accepts as a *filter*. To read
+> one spoke's wait, add
+> `{"column": "sessionId", "operator": "=", "value": "<spoke_run_id>", "type": "string"}`
+> to the filters — or read `rollup.duration.components.wait` off the spoke's
+> assembled root span, which carries the same answer per spoke.
+
 ## Verification notes and follow-ups
 
 - **Timestamps** — every `user` and `assistant` record (the ones bracketed)
