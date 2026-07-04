@@ -154,7 +154,7 @@ def parse_inflight(blob):
     return scopes
 
 
-def chain_order(comp, comp_edges):
+def order_chain(comp, comp_edges):
     """Members of one merge-candidate component in topological order.
 
     Kahn over the component's blocked-by edges, ties broken by issue number; a
@@ -220,7 +220,7 @@ def print_merge_candidates(issues, children):
         detail = (
             "scope collides on " + ", ".join(sorted(shared)) if shared else "exclusive scope"
         )
-        chain = " → ".join(f"#{n}" for n in chain_order(comp, comp_edges))
+        chain = " → ".join(f"#{n}" for n in order_chain(comp, comp_edges))
         print(
             f"⚠ merge candidates: {chain} ({detail}, strictly serialized)"
             " — consider one issue with subtasks",

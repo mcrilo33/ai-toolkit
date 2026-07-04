@@ -206,11 +206,55 @@ def test_merge_candidates_never_alter_batch_or_exit_code() -> None:
 
 def test_merge_candidates_ignore_closed_blockers() -> None:
     # A closed blocker is already satisfied — no serialized chain left to merge.
+    # (The OPEN-only fetch never carries closed issues, so the blocker is absent
+    # from the payload by construction — exactly the shape production sees.)
     nodes = [_node(7, "x.py", blocked_by=[(100, "CLOSED")])]
 
     proc = _run_plan(nodes)
 
     assert "merge candidates" not in proc.stderr
+
+
+def test_merge_candidates_report_disjoint_chains_separately_and_ordered() -> None:
+    # Two unrelated colliding chains ⇒ two lines, lowest component member first
+    # regardless of input order (deterministic content-based ordering).
+    nodes = [
+        _node(11, "b.py"),
+        _node(12, "b.py", blocked_by=[(11, "OPEN")]),
+        _node(2, "a.py"),
+        _node(3, "a.py", blocked_by=[(2, "OPEN")]),
+    ]
+
+    proc = _run_plan(nodes)
+
+    warnings = [line for line in proc.stderr.splitlines() if "merge candidates" in line]
+    assert len(warnings) == 2
+    assert "#2 → #3" in warnings[0]
+    assert "#11 → #12" in warnings[1]
+
+
+def test_merge_candidates_terminate_on_blockedby_cycle() -> None:
+    # A malformed mutual blocked-by must not hang or crash the lint.
+    nodes = [
+        _node(1, "a.py", blocked_by=[(2, "OPEN")]),
+        _node(2, "a.py", blocked_by=[(1, "OPEN")]),
+    ]
+
+    proc = _run_plan(nodes)
+
+    assert proc.returncode == 0, proc.stderr
+    warnings = [line for line in proc.stderr.splitlines() if "merge candidates" in line]
+    assert len(warnings) == 1
+
+
+def test_merge_candidates_label_exclusive_scope_chains() -> None:
+    # `Scope: *` collides with everything but has no named tokens to report.
+    nodes = [_node(1, "*"), _node(2, "*", blocked_by=[(1, "OPEN")])]
+
+    proc = _run_plan(nodes)
+
+    assert "merge candidates: #1 → #2" in proc.stderr
+    assert "exclusive scope" in proc.stderr
 
 
 # ── tie-break: equal depth ⇒ more direct dependents wins ──────────────────────
