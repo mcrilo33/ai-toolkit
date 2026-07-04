@@ -26,6 +26,8 @@ GATE_JOBS = {"test", "shellcheck", "sync-idempotency"}
 
 @pytest.fixture(scope="module")
 def workflow() -> dict[str, Any]:
+    # YAML 1.1 trap: safe_load parses the workflow's `on:` key as boolean
+    # True, so triggers live under workflow[True], not workflow["on"].
     return yaml.safe_load(CI_YML.read_text())
 
 
@@ -44,7 +46,8 @@ def test_report_red_needs_every_gate_job(report_red: dict[str, Any]) -> None:
 
 
 def test_report_red_runs_only_on_failure(report_red: dict[str, Any]) -> None:
-    assert "failure()" in report_red["if"]
+    # Exact match: "success() || failure()" etc. would also contain failure().
+    assert report_red["if"] == "failure()"
 
 
 def test_report_red_issues_write_is_job_scoped(
