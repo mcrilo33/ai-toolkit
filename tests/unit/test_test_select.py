@@ -781,8 +781,6 @@ def test_missing_stamp_lib_degrades_to_running_the_suite(repo: Path, tmp_path: P
     assert not _stamp_path(repo).exists()  # stamps silently disabled
 
 
-
-
 def _write_ref_test(repo: Path, test_rel: str, script_basename: str) -> None:
     """A minimal tests/**/test_*.py referencing `script_basename` as a token."""
     path = repo / test_rel
@@ -920,10 +918,10 @@ def test_selected_failing_suite_blocks_push(repo: Path, tmp_path: Path) -> None:
     assert proc.returncode == 7  # a red selection aborts the push
 
 
-def test_selected_pass_does_not_mint_stamp_yet(repo: Path, tmp_path: Path) -> None:
-    # Stamp mint/consume for the SELECTED tier is subtask D: until the stamp
-    # can record the set that ran, minting bare `selected` would unsoundly
-    # cover a different selection (or a testmon demand) on the same tree.
+def test_selected_pass_mints_selected_stamp_with_set(repo: Path, tmp_path: Path) -> None:
+    # #123-D: a green SELECTED run is a durable proof of exactly the set that
+    # ran — the stamp records tier AND set so it can never cover a different
+    # selection (or a testmon demand) on the same tree.
     _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
     base = _commit(repo, {}, "test: seed referencing tests")
     tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})
@@ -933,7 +931,9 @@ def test_selected_pass_does_not_mint_stamp_yet(repo: Path, tmp_path: Path) -> No
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert not _stamp_path(repo).exists()
+    content = _stamp_path(repo).read_text()
+    assert "tier=selected\n" in content
+    assert "set=tests/unit/test_do.py\n" in content
 
 
 def test_missing_reverse_index_lib_degrades_to_full(repo: Path, tmp_path: Path) -> None:
@@ -1049,3 +1049,172 @@ def test_script_under_docs_dir_is_never_a_doc(repo: Path, tmp_path: Path) -> Non
 
     assert proc.returncode == 0, proc.stderr
     assert "RUN \n" in _runlog(runlog)  # unmapped script → FULL, never NOTHING
+
+
+# --- selected-tier stamps: consume and mint with the set that ran (#123-D) --------
+
+
+def test_identical_selected_repush_consumes_stamp(repo: Path, tmp_path: Path) -> None:
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
+    tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    _run_select(repo, _stdin(tip, base), tmp_path / "bin")  # mints selected+set
+    after_first = _runlog(runlog)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert _runlog(runlog) == after_first  # pytest not invoked again
+    assert "green-tree stamp" in proc.stderr
+
+
+def test_different_selection_same_tree_runs(repo: Path, tmp_path: Path) -> None:
+    # Two pushes with different diffs against the SAME working tree: the stamp
+    # from the first selection must not cover the second (different set).
+    _commit(
+        repo,
+        {
+            "tests/unit/test_one.py": '"""Covers one.sh."""\n',
+            "tests/unit/test_two.py": '"""Covers two.sh."""\n',
+        },
+        "test: seed referencing tests",
+    )
+    base = _rev(repo)
+    c1 = _commit(repo, {"scripts/one.sh": "echo 1\n"})
+    c2 = _commit(repo, {"scripts/two.sh": "echo 2\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    _run_select(repo, _stdin(c2, c1), tmp_path / "bin")  # mints set={test_two}
+    after_first = _runlog(runlog)
+
+    proc = _run_select(repo, _stdin(c1, base), tmp_path / "bin")  # demands {test_one}
+
+    assert proc.returncode == 0, proc.stderr
+    assert len(_runlog(runlog)) > len(after_first)  # no unsound cover: it ran
+    assert "RUN tests/unit/test_one.py" in _runlog(runlog)
+
+
+def test_python_push_after_selected_stamp_still_runs_testmon(repo: Path, tmp_path: Path) -> None:
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
+    c1 = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    c2 = _commit(repo, {"scripts/do.sh": "echo hi\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    _run_select(repo, _stdin(c2, c1), tmp_path / "bin")  # selected stamp for tree(c2)
+    after_first = _runlog(runlog)
+
+    proc = _run_select(repo, _stdin(c1, base), tmp_path / "bin")  # py-only: testmon
+
+    assert proc.returncode == 0, proc.stderr
+    assert len(_runlog(runlog)) > len(after_first)  # selected never covers testmon
+    assert "--testmon" in _runlog(runlog)
+
+
+def test_full_stamp_covers_selected_demand_and_skips(repo: Path, tmp_path: Path) -> None:
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
+    c1 = _commit(repo, {"scripts/do.sh": "echo hi\n"})
+    c2 = _commit(repo, {"scripts/unmapped.sh": "echo new\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    _run_select(repo, _stdin(c2, c1), tmp_path / "bin")  # unmapped → FULL mints full
+    after_first = _runlog(runlog)
+
+    proc = _run_select(repo, _stdin(c1, base), tmp_path / "bin")  # selected demand
+
+    assert proc.returncode == 0, proc.stderr
+    assert _runlog(runlog) == after_first  # full proof covers any selection
+    assert "green-tree stamp" in proc.stderr
+
+
+def test_mixed_selected_green_mints_testmon_flag_and_repush_skips(
+    repo: Path, tmp_path: Path
+) -> None:
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
+    tip = _commit(repo, {"scripts/do.sh": "echo hi\n", "pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+    after_first = _runlog(runlog)
+
+    content = _stamp_path(repo).read_text()
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert "tier=selected\n" in content
+    assert "testmon=1\n" in content  # the mixed run proved testmon too
+    assert proc.returncode == 0, proc.stderr
+    assert _runlog(runlog) == after_first  # identical mixed re-push skips
+
+
+# --- review-carryover pins from subtask B (verified by probe, now pinned) ---------
+
+
+def test_mixed_diff_without_testmon_falls_back_to_full(repo: Path, tmp_path: Path) -> None:
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
+    tip = _commit(repo, {"scripts/do.sh": "echo hi\n", "pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=False)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    log = _runlog(runlog)
+    assert "RUN \n" in log  # the python part demands the full suite
+    assert "--testmon" not in log
+    assert "RUN tests/unit/test_do.py" not in log  # full subsumes the selection
+
+
+def test_mapping_to_vanished_test_escalates_full(repo: Path, tmp_path: Path) -> None:
+    # A poisoned cache (clean tests/, mapping names a nonexistent test) must
+    # escalate, not run a selection that proves nothing.
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
+    tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    _run_select(repo, _stdin(tip, base), tmp_path / "bin")  # builds the cache
+    key = _git(repo, "rev-parse", "HEAD:tests").strip()
+    cache = repo / ".git" / ".test-reverse-index" / key
+    cache.write_text("do.sh\ttests/unit/test_gone.py\n")
+    _stamp_path(repo).unlink(missing_ok=True)  # drop any stamp so the tier re-decides
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN \n" in _runlog(runlog)  # escalated to full
+    assert "mapped test missing" in proc.stderr
+
+
+def test_exempt_entry_cannot_hide_mapped_coverage(repo: Path, tmp_path: Path) -> None:
+    # Lookup-first hardening (B review): an exempt entry only mutes escalation
+    # for UNMAPPED files; a file the index maps still runs its tests.
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    _commit(repo, {".test-select-exempt": "scripts/\n"}, "chore: exempt scripts/")
+    base = _rev(repo)
+    tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN tests/unit/test_do.py" in _runlog(runlog)  # mapped coverage ran
+
+
+def test_exempt_only_diff_notes_exemption(repo: Path, tmp_path: Path) -> None:
+    _commit(repo, {".test-select-exempt": "notes.txt\n"}, "chore: exempt notes")
+    base = _rev(repo)
+    tip = _commit(repo, {"notes.txt": "exempt change\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN" not in _runlog(runlog)
+    assert "exempt" in proc.stderr  # the audit trail names the real reason

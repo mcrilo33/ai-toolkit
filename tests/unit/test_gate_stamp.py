@@ -174,8 +174,6 @@ def test_mint_overwrites_with_the_latest_run(repo: Path) -> None:
         ("full", "full"),
         ("full", "selected"),
         ("full", "testmon"),
-        ("selected", "selected"),
-        ("selected", "testmon"),
         ("testmon", "testmon"),
     ],
 )
@@ -194,6 +192,10 @@ def test_check_covers_equal_or_weaker_demand(repo: Path, stamped: str, demanded:
         ("selected", "full"),
         ("testmon", "selected"),
         ("testmon", "full"),
+        # #123-D: a selection proves only the set it names — never testmon's
+        # impact analysis, and never another (unknown) selection.
+        ("selected", "testmon"),
+        ("selected", "selected"),
     ],
 )
 def test_check_refuses_stronger_demand(repo: Path, stamped: str, demanded: str) -> None:
@@ -264,3 +266,79 @@ def test_mint_prunes_stamps_older_than_fourteen_days(repo: Path) -> None:
     assert not stale.exists()  # pruned
     assert fresh.exists()  # recent stamps survive
     assert (_stamps_dir(repo) / tree).is_file()
+
+
+# --- selected stamps are set-aware (#123): a selection proves only its own set ----
+
+SET_AB = "tests/unit/test_a.py,tests/unit/test_b.py"
+
+
+def test_mint_selected_records_set_and_testmon_flag(repo: Path) -> None:
+    tree = _tree(repo)
+
+    proc = _lib(repo, f'gate_stamp_mint "{tree}" selected "py3.12" "{SET_AB}" 1')
+
+    assert proc.returncode == 0, proc.stderr
+    content = (_stamps_dir(repo) / tree).read_text()
+    assert "tier=selected\n" in content
+    assert f"set={SET_AB}\n" in content
+    assert "testmon=1\n" in content
+
+
+def test_mint_selected_without_flag_records_no_testmon_line(repo: Path) -> None:
+    tree = _tree(repo)
+    _lib(repo, f'gate_stamp_mint "{tree}" selected "py3.12" "{SET_AB}"')
+
+    assert "testmon=" not in (_stamps_dir(repo) / tree).read_text()
+
+
+def test_selected_stamp_covers_equal_and_subset_demand(repo: Path) -> None:
+    tree = _tree(repo)
+    _lib(repo, f'gate_stamp_mint "{tree}" selected "py3.12" "{SET_AB}"')
+
+    equal = _lib(repo, f'gate_stamp_check "{tree}" selected "py3.12" "{SET_AB}"')
+    subset = _lib(repo, f'gate_stamp_check "{tree}" selected "py3.12" "tests/unit/test_a.py"')
+
+    assert equal.returncode == 0, equal.stderr
+    assert subset.returncode == 0, subset.stderr
+
+
+def test_selected_stamp_refuses_superset_and_disjoint_demand(repo: Path) -> None:
+    tree = _tree(repo)
+    _lib(repo, f'gate_stamp_mint "{tree}" selected "py3.12" "tests/unit/test_a.py"')
+
+    superset = _lib(repo, f'gate_stamp_check "{tree}" selected "py3.12" "{SET_AB}"')
+    disjoint = _lib(repo, f'gate_stamp_check "{tree}" selected "py3.12" "tests/unit/test_c.py"')
+
+    assert superset.returncode not in (0, _LIB_LOAD_FAILED)
+    assert disjoint.returncode not in (0, _LIB_LOAD_FAILED)
+
+
+def test_selected_stamp_without_set_covers_no_selection(repo: Path) -> None:
+    tree = _tree(repo)
+    _lib(repo, f'gate_stamp_mint "{tree}" selected "py3.12"')  # legacy bare mint
+
+    proc = _lib(repo, f'gate_stamp_check "{tree}" selected "py3.12" "tests/unit/test_a.py"')
+
+    assert proc.returncode not in (0, _LIB_LOAD_FAILED)
+
+
+def test_full_stamp_covers_any_selected_set_demand(repo: Path) -> None:
+    tree = _tree(repo)
+    _lib(repo, f'gate_stamp_mint "{tree}" full "py3.12"')
+
+    proc = _lib(repo, f'gate_stamp_check "{tree}" selected "py3.12" "{SET_AB}" 1')
+
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_mixed_selected_demand_requires_testmon_flag(repo: Path) -> None:
+    tree = _tree(repo)
+    _lib(repo, f'gate_stamp_mint "{tree}" selected "py3.12" "{SET_AB}"')  # no flag
+
+    refused = _lib(repo, f'gate_stamp_check "{tree}" selected "py3.12" "{SET_AB}" 1')
+    _lib(repo, f'gate_stamp_mint "{tree}" selected "py3.12" "{SET_AB}" 1')
+    covered = _lib(repo, f'gate_stamp_check "{tree}" selected "py3.12" "{SET_AB}" 1')
+
+    assert refused.returncode not in (0, _LIB_LOAD_FAILED)
+    assert covered.returncode == 0, covered.stderr
