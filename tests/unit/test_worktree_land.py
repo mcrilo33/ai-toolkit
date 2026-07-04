@@ -17,6 +17,7 @@ when a test needs to assert env threading or rollback.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -30,6 +31,8 @@ WORKTREE_LAND = Path(__file__).resolve().parents[2] / "scripts" / "worktree-land
 _GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
 # The host's base-branch override (#117) must never steer the script under test.
 _GIT_ENV.pop("AI_TOOLKIT_BASE_BRANCH", None)
+# A host GIT_SSH_COMMAND must not prefix the keepalive assertion (#119).
+_GIT_ENV.pop("GIT_SSH_COMMAND", None)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -524,6 +527,182 @@ def test_diverged_merge_still_runs_gate(hub: Path, tmp_path: Path) -> None:
 
     assert proc.returncode == 0, proc.stderr
     assert "TEST_SELECT_SKIP" not in _log_text(env_log)
+
+
+# --- SSH keepalive + retry-once-after-green on the ship push (issue #119) --------
+# The ship push runs the ~6-minute gate INSIDE `git push`; GitHub reaps the idle
+# SSH connection mid-gate and the post-gate transfer dies on a fully green tree.
+# Two lines of defense: the push routes through wt_git_push (keepalive), and when
+# the gate demonstrably passed but the transport still died, worktree-land retries
+# exactly once with TEST_SELECT_SKIP=1 — loudly, and never after a failed gate.
+
+
+def _install_counting_gate(hub: Path, log: Path, *, exit_code: int = 0, stderr: str = "") -> None:
+    """A hub pre-push hook logging one `INVOKED skip=[…]` line per invocation.
+
+    `stderr` simulates gate (pytest) output; `exit_code` non-zero models a
+    failing gate. The skip value records the threaded TEST_SELECT_SKIP so a
+    test can tell a first attempt from a skip-retry.
+    """
+    hook = hub / ".git" / "hooks" / "pre-push"
+    body = f'#!/bin/sh\necho "INVOKED skip=[${{TEST_SELECT_SKIP:-}}]" >> "{log}"\n'
+    if stderr:
+        body += f"cat >&2 <<'GATEEOF'\n{stderr}\nGATEEOF\n"
+    body += f"exit {exit_code}\n"
+    hook.write_text(body)
+    hook.chmod(0o755)
+
+
+def _install_pre_receive(
+    tmp_path: Path, log: Path, *, fail_first: bool = False, stderr_line: str = ""
+) -> None:
+    """A pre-receive hook on the bare origin logging each pushed ref.
+
+    With `fail_first`, the FIRST invocation emits `stderr_line` and rejects —
+    modeling a transport-death/rejection after the local gate ran — and every
+    later one succeeds, so a retry can land.
+    """
+    marker = tmp_path / "pre-receive-failed-once"
+    hook = tmp_path / "remote.git" / "hooks" / "pre-receive"
+    body = f'#!/bin/sh\nwhile read -r _o _n ref; do echo "$ref" >> "{log}"; done\n'
+    if fail_first:
+        body += (
+            f'if [ ! -e "{marker}" ]; then\n'
+            f'  touch "{marker}"\n'
+            f'  echo "{stderr_line}" >&2\n'
+            "  exit 1\n"
+            "fi\n"
+        )
+    body += "exit 0\n"
+    hook.write_text(body)
+    hook.chmod(0o755)
+
+
+def _diverge_hub(hub: Path) -> None:
+    """Advance the hub's main so the land is a real merge and the gate runs."""
+    (hub / "hub-only.txt").write_text("hub moved on\n")
+    _git(hub, "add", "hub-only.txt")
+    _git(hub, "commit", "-qm", "chore: hub work", "-m", "Refs #0")
+
+
+def test_green_gate_transport_death_retries_once_with_skip(hub: Path, tmp_path: Path) -> None:
+    # Gate green, then the transfer dies with a transport signature → retry
+    # EXACTLY once with TEST_SELECT_SKIP=1 (the gate already ran green), loudly,
+    # and the land completes.
+    _make_spoke(hub, tmp_path, "feature/1-transport", push=True, ready=True)
+    _diverge_hub(hub)
+    gate_log = tmp_path / "gate-calls.log"
+    _install_counting_gate(hub, gate_log)
+    ref_log = tmp_path / "pre-receive-refs.log"
+    _install_pre_receive(
+        tmp_path,
+        ref_log,
+        fail_first=True,
+        stderr_line="Connection to ssh.github.com closed by remote host.",
+    )
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode == 0, proc.stderr
+    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
+    gate_calls = _log_text(gate_log).splitlines()
+    assert gate_calls == ["INVOKED skip=[]", "INVOKED skip=[1]"], gate_calls
+    # The retry is loud about what it is doing and why it may skip the gate.
+    assert "retry" in proc.stderr.lower()
+    assert "TEST_SELECT_SKIP" in proc.stderr
+
+
+def test_failed_gate_rolls_back_without_retry(hub: Path, tmp_path: Path) -> None:
+    # The gate itself fails → exactly ONE attempt, rollback as today, no retry.
+    _make_spoke(hub, tmp_path, "feature/1-redgate", push=True, ready=True)
+    _diverge_hub(hub)
+    pre_sha = _git(hub, "rev-parse", "HEAD").strip()
+    gate_log = tmp_path / "gate-calls.log"
+    _install_counting_gate(hub, gate_log, exit_code=1)
+    ref_log = tmp_path / "pre-receive-refs.log"
+    _install_pre_receive(tmp_path, ref_log)
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode != 0
+    assert _log_text(gate_log).splitlines() == ["INVOKED skip=[]"]
+    assert "refs/heads/main" not in _log_text(ref_log)  # push aborted locally
+    assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha  # rolled back
+    assert _remote_sha(hub, "main") != ""  # origin/main untouched
+
+
+def test_failed_gate_with_transport_prose_never_retries(hub: Path, tmp_path: Path) -> None:
+    # A FAILING gate whose pytest output quotes a transport signature (this very
+    # repo's tests embed those literals) must still read as a failed gate: the
+    # pytest failure summary is the tiebreaker, and no skip-retry may ship the
+    # red tree.
+    _make_spoke(hub, tmp_path, "feature/1-prose", push=True, ready=True)
+    _diverge_hub(hub)
+    gate_log = tmp_path / "gate-calls.log"
+    gate_output = (
+        "FAILED tests/unit/test_x.py::test_y - assert 'Connection to "
+        "ssh.github.com closed by remote host.' in caplog.text\n"
+        "=== 1 failed, 12 passed in 340.12s ==="
+    )
+    _install_counting_gate(hub, gate_log, exit_code=1, stderr=gate_output)
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode != 0
+    assert _log_text(gate_log).splitlines() == ["INVOKED skip=[]"]
+
+
+def test_remote_rejection_after_green_gate_rolls_back_without_retry(
+    hub: Path, tmp_path: Path
+) -> None:
+    # Green gate but the remote rejects for a POLICY reason (no transport
+    # signature) → a retry would just fail again: roll back exactly as today.
+    _make_spoke(hub, tmp_path, "feature/1-policy", push=True, ready=True)
+    _diverge_hub(hub)
+    pre_sha = _git(hub, "rev-parse", "HEAD").strip()
+    gate_log = tmp_path / "gate-calls.log"
+    _install_counting_gate(hub, gate_log)
+    ref_log = tmp_path / "pre-receive-refs.log"
+    hook = tmp_path / "remote.git" / "hooks" / "pre-receive"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f'while read -r _o _n ref; do echo "$ref" >> "{ref_log}"; done\n'
+        'echo "protected branch hook declined" >&2\n'
+        "exit 1\n"
+    )
+    hook.chmod(0o755)
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode != 0
+    assert _log_text(gate_log).splitlines() == ["INVOKED skip=[]"]
+    assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha  # rolled back
+
+
+def test_ship_push_carries_keepalive(hub: Path, tmp_path: Path) -> None:
+    # The ship push routes through wt_git_push: a PATH-front git shim (in the
+    # same bindir _run_land populates) records GIT_SSH_COMMAND per push.
+    real_git = shutil.which("git")
+    assert real_git is not None
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    push_log = tmp_path / "push-invocations.log"
+    shim = bindir / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'if [ "$1" = push ]; then echo "GIT_SSH_COMMAND=[$GIT_SSH_COMMAND] $*" >> "{push_log}"; fi\n'
+        f'exec "{real_git}" "$@"\n'
+    )
+    shim.chmod(0o755)
+    _make_spoke(hub, tmp_path, "feature/1-shipkeep", push=True, ready=True)
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode == 0, proc.stderr
+    keepalive = "-o ServerAliveInterval=15 -o ServerAliveCountMax=40"
+    main_pushes = [ln for ln in _log_text(push_log).splitlines() if ln.endswith("push origin main")]
+    assert main_pushes, f"no ship push recorded: {_log_text(push_log)!r}"
+    assert f"GIT_SSH_COMMAND=[ssh {keepalive}]" in main_pushes[0]
 
 
 def test_force_gate_env_overrides_ff_skip(hub: Path, tmp_path: Path) -> None:
