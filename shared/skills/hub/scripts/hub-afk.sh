@@ -544,6 +544,19 @@ inject_answer() {
   tmux send-keys -t "$target" Enter 2>/dev/null || return 1
 }
 
+# _composer_shows_text <pane_target> <text> -> true when the pane still displays the
+# answer — its needle: the first ~40 chars of the first line — i.e. the paste is
+# buffered in the composer, not submitted (#133). Fail-OPEN: an unreadable pane
+# (capture error, no tmux) reads as "not shown", so the caller escalates instead of
+# wedge-respawning a pane it cannot observe.
+_composer_shows_text() {
+  local target="$1" text="$2" needle
+  needle="${text%%$'\n'*}"
+  needle="${needle:0:40}"
+  [ -n "$needle" ] || return 1
+  tmux capture-pane -p -t "$target" 2>/dev/null | grep -qF -- "$needle"
+}
+
 # _transcript_advanced <wt_path> <baseline_mtime> -> true once the spoke's newest
 # transcript mtime exceeds the baseline, polling up to AFK_INJECT_VERIFY_SECONDS in
 # AFK_INJECT_POLL_SECONDS steps. An empty baseline (no prior transcript) means any
@@ -561,19 +574,23 @@ _transcript_advanced() {
   done
 }
 
-# inject_and_verify <wt_path> <pane_target> <text> -> inject the answer and CONFIRM it
-# registered (the spoke's transcript advanced), re-injecting once if the first attempt
-# left the spoke untouched. rc 0 when the transcript advanced (the answer took), rc 1
-# when it never did — the caller then escalates. A send-keys that silently no-ops (wrong
-# target, busy pane, an unhandled menu) would otherwise park the spoke forever (#74).
+# inject_and_verify <wt_path> <pane_target> <text> -> deliver the answer and CONFIRM
+# it registered (the spoke's transcript advanced). The retry is a bare Enter, NEVER a
+# re-paste: the common failure is a buffered paste whose submitting Enter was lost, and
+# the old full re-inject duplicated the answer on top of it (#133, from #123/#124).
+#   rc 0 — registered (the transcript advanced; the answer took).
+#   rc 2 — WEDGED: the text survived the Enter-only retry (an unterminated paste no
+#          keystroke can submit or clear) — the caller respawns the pane.
+#   rc 1 — not registered and no text observable in the composer — the caller escalates.
 inject_and_verify() {
-  local wt="$1" target="$2" text="$3" before attempt
+  local wt="$1" target="$2" text="$3" before
   before="$(_transcript_mtime "$wt")"
-  for attempt in 1 2; do
-    inject_answer "$target" "$text" || return 1
-    if _transcript_advanced "$wt" "$before"; then return 0; fi
-    log "  injected answer did not register (attempt $attempt)"
-  done
+  inject_answer "$target" "$text" || return 1
+  _transcript_advanced "$wt" "$before" && return 0
+  log "  injected answer did not register — retrying with a bare Enter (never a re-paste)"
+  tmux send-keys -t "$target" Enter 2>/dev/null || true
+  _transcript_advanced "$wt" "$before" && return 0
+  _composer_shows_text "$target" "$text" && return 2
   return 1
 }
 
@@ -633,14 +650,25 @@ decide_and_act() {
     target="$(_spoke_pane_target "$wt")"
     if [ -z "$target" ]; then
       text="could not locate spoke pane to inject the answer"
-    elif inject_and_verify "$wt" "$target" "$text"; then
-      log "  injected answer into #$issue"
-      _consume_gate_tag "$wt" "$issue"
-      afk_emit_decision "$wt" success
-      return 0
     else
-      log "  answer to #$issue did not register — escalating"
-      text="answer did not register in the spoke (inject not confirmed) — needs a human"
+      inject_and_verify "$wt" "$target" "$text"; rc=$?
+      if [ "$rc" -eq 0 ]; then
+        log "  injected answer into #$issue"
+        _consume_gate_tag "$wt" "$issue"
+        afk_emit_decision "$wt" success
+        return 0
+      elif [ "$rc" -eq 2 ] && respawn_wedged_spoke "$wt" "$issue" "$text"; then
+        # The wedged composer was recovered by a pane respawn that carries the answer
+        # as its --continue prompt — delivered, same success contract as an inject.
+        _consume_gate_tag "$wt" "$issue"
+        afk_emit_decision "$wt" success
+        return 0
+      elif [ "$rc" -eq 2 ]; then
+        text="composer wedged and the pane respawn could not be launched — needs a human"
+      else
+        log "  answer to #$issue did not register — escalating"
+        text="answer did not register in the spoke (inject not confirmed) — needs a human"
+      fi
     fi
   elif [ "$kind" = "ESCALATE" ]; then
     [ -n "$text" ] || text="answerer escalated (no reason given)"
@@ -787,51 +815,87 @@ acceptance criteria are all met. Do NOT self-land -- the hub lands #$issue.
 EOF
 }
 
-# _afk_resume_command <wt> <issue> -> the launch command for the resumed tmux window. Pure
-# (returns the string) so it is inspectable in a test. It inline-exports the telemetry the
-# resumed window needs to keep reaching the collector — recovery must not fly blind (#108):
+# _afk_continue_command <wt> <prompt> -> the `claude --continue '<prompt>'` launch
+# command for a re-opened spoke window (crash resume, wedge respawn). Pure (returns the
+# string) so it is inspectable in a test. It inline-exports the telemetry the window
+# needs to keep reaching the collector — recovery must not fly blind (#108):
 # AI_TOOLKIT_OTEL=1, the supervisor's OTLP endpoint, the workflow-span sink
 # (AI_TOOLKIT_OTEL_SPAN_ENDPOINT, #126), and the re-pinned spoke_run_id. The
 # auth header stays in the inherited env (never on the command line), exactly as
 # worktree-new.sh does. `claude --continue` resumes the crashed session in the worktree.
 # UPGRADE: replicate worktree-new.sh's full beta-tracing/raw-body env for per-tool parity.
-_afk_resume_command() {
-  local wt="$1" issue="$2" run_id endpoint span_endpoint prompt
+_afk_continue_command() {
+  local wt="$1" prompt="$2" run_id endpoint span_endpoint
   run_id="$(_afk_spoke_run_id "$wt")"
   endpoint="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}"
   # Workflow-span sink (#126), resume parity with worktree-new.sh: telemetry.sh's
   # cycle step:/script/hook spans are gated on this var and POST over OTLP-HTTP,
   # so it targets the collector's :4318 listener, not the gRPC endpoint above.
   span_endpoint="${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:-http://localhost:4318}"
-  prompt="$(_afk_resume_prompt "$issue")"
   printf 'AI_TOOLKIT_OTEL=1 OTEL_EXPORTER_OTLP_ENDPOINT=%s AI_TOOLKIT_OTEL_SPAN_ENDPOINT=%s OTEL_RESOURCE_ATTRIBUTES=%s claude --continue %s\n' \
     "$(printf '%q' "$endpoint")" "$(printf '%q' "$span_endpoint")" \
     "$(printf '%q' "spoke_run_id=$run_id")" "$(printf '%q' "$prompt")"
 }
 
-# resume_spoke <wt> <issue> -> open a fresh tmux window in the project session, cd'd into
-# the (intact) worktree, running the resume command; stamp the once-per-window marker and
-# a success span. rc 1 when tmux is unavailable or the window can't be opened (the caller
-# then falls back to blocking). Mirrors worktree-new.sh's project-session window layout.
-resume_spoke() {
-  local wt="$1" issue="$2" sess win cmd
-  command -v tmux >/dev/null 2>&1 || { log "  tmux unavailable — cannot resume #$issue"; return 1; }
-  log "→ resume #$issue: pane crashed with work intact — re-adopting once"
+# _afk_resume_command <wt> <issue> -> the launch command for a crash-resumed window:
+# a continue with the plain-English re-anchor prompt.
+_afk_resume_command() { _afk_continue_command "$1" "$(_afk_resume_prompt "$2")"; }
+
+# _afk_wedge_respawn_command <wt> <issue> <answer> -> the launch command for a pane
+# respawned out of a wedged composer (#133): the ANSWER rides verbatim as the
+# continuation prompt — the proven manual recovery, no supervisor preamble — so the
+# respawn itself delivers what the inject could not. <issue> is unused but keeps the
+# (wt, issue, ...) call-site symmetry with _afk_resume_command.
+_afk_wedge_respawn_command() { _afk_continue_command "$1" "$3"; }
+
+# _afk_open_spoke_window <wt> <issue> <cmd> -> open a fresh tmux window in the project
+# session, cd'd into the worktree, running <cmd>. Mirrors worktree-new.sh's
+# project-session window layout. rc 1 when tmux is unavailable or the window can't be
+# opened. Shared by the crash resume and the wedge respawn (#133).
+_afk_open_spoke_window() {
+  local wt="$1" issue="$2" cmd="$3" sess win
+  command -v tmux >/dev/null 2>&1 || return 1
   sess="$(wt_tmux_session "${MAIN_ROOT:-$(wt_main_root 2>/dev/null)}")"
   # Name the window with the branch SLUG (the "<issue>-<slug>" worktree-new.sh convention),
   # NOT the full "feature/<issue>-…" branch: _kill_spoke_window only matches "<issue>-"* /
-  # "<issue>", so a full-branch name would orphan the resumed window on a later reap.
+  # "<issue>", so a full-branch name would orphan the reopened window on a later reap.
   win="$(git -C "$wt" branch --show-current 2>/dev/null)"; win="${win##*/}"; win="${win:-$issue}"
-  cmd="$(_afk_resume_command "$wt" "$issue")"
   tmux has-session -t "=$sess" 2>/dev/null || tmux new-session -d -s "$sess" -c "$wt" 2>/dev/null
-  if ! tmux new-window -t "=$sess:" -n "$win" -c "$wt" "$cmd; exec ${SHELL:-zsh}" 2>/dev/null; then
+  tmux new-window -t "=$sess:" -n "$win" -c "$wt" "$cmd; exec ${SHELL:-zsh}" 2>/dev/null || return 1
+  # Pin the name so the running claude/zsh can't rename the window out of the kill match.
+  tmux set-window-option -t "=$sess:$win" automatic-rename off 2>/dev/null || true
+  return 0
+}
+
+# resume_spoke <wt> <issue> -> re-open the crashed spoke's window running the resume
+# command; stamp the once-per-window marker and a success span. rc 1 when the window
+# can't be opened (the caller then falls back to blocking).
+resume_spoke() {
+  local wt="$1" issue="$2"
+  log "→ resume #$issue: pane crashed with work intact — re-adopting once"
+  if ! _afk_open_spoke_window "$wt" "$issue" "$(_afk_resume_command "$wt" "$issue")"; then
     log "  could not open a resume window for #$issue"
     return 1
   fi
-  # Pin the name so the running claude/zsh can't rename the window out of the kill match.
-  tmux set-window-option -t "=$sess:$win" automatic-rename off 2>/dev/null || true
   _afk_mark_resumed "$issue"
   _afk_emit_span "$wt" afk-resume success
+  return 0
+}
+
+# respawn_wedged_spoke <wt> <issue> <answer> -> recover a wedged composer (an
+# unterminated paste no keystroke can submit or clear, #123/#124): kill the spoke's
+# window and reopen it running `claude --continue '<answer>'` under the same
+# spoke_run_id — the respawn itself delivers the answer, so the park is resolved.
+# rc 1 when the window can't be reopened (the caller escalates).
+respawn_wedged_spoke() {
+  local wt="$1" issue="$2" answer="$3"
+  log "→ respawn #$issue: composer wedged (unterminated paste) — respawning the pane with the answer"
+  _kill_spoke_window "$issue"
+  if ! _afk_open_spoke_window "$wt" "$issue" "$(_afk_wedge_respawn_command "$wt" "$issue" "$answer")"; then
+    log "  could not open a respawn window for #$issue"
+    return 1
+  fi
+  _afk_emit_span "$wt" afk-wedge-respawn success
   return 0
 }
 
