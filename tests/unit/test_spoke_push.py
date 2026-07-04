@@ -23,6 +23,7 @@ nothing so a host's global/system config never reaches the fixture repo.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -166,3 +167,72 @@ def test_ready_is_idempotent(spoke: Path, remote: Path) -> None:
     assert first.returncode == 0, first.stdout + first.stderr
     assert second.returncode == 0, "re-running the ready push must be idempotent"
     assert _remote_has_ref(remote, "refs/tags/ready/37")
+
+
+# ── The push carries the SSH keepalive options (issue #119) ──────────────────
+# The spoke's per-subtask push runs the ~6-minute pre-push suite INSIDE
+# `git push`; GitHub reaps the idle SSH connection mid-gate and the post-gate
+# transfer dies (exit 141). The push must route through wt_git_push so
+# GIT_SSH_COMMAND carries ServerAlive* keepalive options across the gate. A
+# `git` shim on PATH records the env each `git push` runs with, then delegates
+# to the real git so the hermetic push still lands on the bare origin.
+
+KEEPALIVE_OPTS = "-o ServerAliveInterval=15 -o ServerAliveCountMax=40"
+
+
+def _install_git_shim(tmp_path: Path) -> tuple[Path, Path]:
+    """A PATH-front `git` logging GIT_SSH_COMMAND + argv per push, then delegating."""
+    real_git = shutil.which("git")
+    assert real_git is not None
+    bindir = tmp_path / "shim-bin"
+    bindir.mkdir()
+    log = tmp_path / "push-invocations.log"
+    shim = bindir / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'if [ "$1" = push ]; then echo "GIT_SSH_COMMAND=[$GIT_SSH_COMMAND] $*" >> "{log}"; fi\n'
+        f'exec "{real_git}" "$@"\n'
+    )
+    shim.chmod(0o755)
+    return log, bindir
+
+
+def _run_with_shim(
+    repo: Path, bindir: Path, *, git_ssh_command: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    env.pop("GIT_SSH_COMMAND", None)
+    if git_ssh_command is not None:
+        env["GIT_SSH_COMMAND"] = git_ssh_command
+    return subprocess.run(
+        ["bash", str(SPOKE_PUSH)],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def test_push_carries_keepalive_ssh_command(spoke: Path, remote: Path, tmp_path: Path) -> None:
+    log, bindir = _install_git_shim(tmp_path)
+
+    result = _run_with_shim(spoke, bindir)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remote_has_ref(remote, f"refs/heads/{OWN}"), "branch not pushed to origin"
+    recorded = log.read_text()
+    assert f"GIT_SSH_COMMAND=[ssh {KEEPALIVE_OPTS}] push -u origin {OWN}" in recorded
+
+
+def test_push_preserves_existing_git_ssh_command(spoke: Path, remote: Path, tmp_path: Path) -> None:
+    # An operator's GIT_SSH_COMMAND (identity, options) must survive as the
+    # prefix — appended-to, never clobbered.
+    log, bindir = _install_git_shim(tmp_path)
+
+    result = _run_with_shim(spoke, bindir, git_ssh_command="ssh -o ConnectTimeout=7")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    recorded = log.read_text()
+    assert f"GIT_SSH_COMMAND=[ssh -o ConnectTimeout=7 {KEEPALIVE_OPTS}] push -u origin {OWN}" in (
+        recorded
+    )
