@@ -89,6 +89,37 @@ wt_now_ms() {
   command -v _telemetry_now_ms >/dev/null 2>&1 && _telemetry_now_ms || true
 }
 
+# --- hub-side Langfuse auth resolution (issue #127) -----------------------------
+# wt_resolve_langfuse_auth -> resolve LANGFUSE_BASIC_AUTH the way hub-afk.sh's
+# afk_resolve_telemetry_auth does — env first, then the SAME optional conf file
+# (${AFK_TELEMETRY_CONF:-~/.afk-telemetry}), each field independently (the
+# save-source-restore precedence) — so a land or /quick from ANY hub session can
+# reach Langfuse without the operator hand-exporting credentials. On success,
+# EXPORT the auth + host (for the post-run ingesters) and default + export
+# AI_TOOLKIT_OTEL_SPAN_ENDPOINT to the local collector's OTLP-HTTP port, which is
+# what lets telemetry.sh's script-span fan-out fire for hub-side scripts; the
+# span POST itself carries no credential (the collector holds auth), and its curl
+# is detached + swallowed, so a down collector costs nothing. rc 1 and NO exports
+# when no auth resolves — callers stay on their existing skip-WARN paths. The afk
+# resolver stays as-is (its arming semantics differ: it also exports
+# AI_TOOLKIT_OTEL=1); deduplicating the two is a follow-up once both land.
+wt_resolve_langfuse_auth() {
+  local conf="${AFK_TELEMETRY_CONF:-$HOME/.afk-telemetry}"
+  if [ -f "$conf" ]; then
+    local s_auth="${LANGFUSE_BASIC_AUTH:-}" s_host="${LANGFUSE_HOST:-}" \
+          s_ep="${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:-}"
+    # shellcheck disable=SC1090
+    . "$conf" 2>/dev/null || true
+    [ -n "$s_auth" ] && LANGFUSE_BASIC_AUTH="$s_auth"
+    [ -n "$s_host" ] && LANGFUSE_HOST="$s_host"
+    [ -n "$s_ep" ] && AI_TOOLKIT_OTEL_SPAN_ENDPOINT="$s_ep"
+  fi
+  [ -n "${LANGFUSE_BASIC_AUTH:-}" ] || return 1
+  export LANGFUSE_BASIC_AUTH
+  export LANGFUSE_HOST="${LANGFUSE_HOST:-http://localhost:3000}"
+  export AI_TOOLKIT_OTEL_SPAN_ENDPOINT="${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:-http://localhost:4318}"
+}
+
 # --- SSH-keepalive push (issue #119) --------------------------------------------
 # The pre-push suite (~6 min) runs INSIDE `git push`, between the SSH connection
 # opening and the pack transfer. GitHub reaps the idle connection mid-gate, so a
