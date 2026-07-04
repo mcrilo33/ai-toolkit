@@ -791,8 +791,8 @@ def _write_ref_test(repo: Path, test_rel: str, script_basename: str) -> None:
 
 
 def test_mapped_shell_change_runs_only_mapped_tests(repo: Path, tmp_path: Path) -> None:
-    base = _rev(repo)
     _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
     tip = _commit(repo, {"scripts/do.sh": "#!/bin/sh\necho hi\n"})
     runlog = tmp_path / "run.log"
     _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
@@ -807,9 +807,9 @@ def test_mapped_shell_change_runs_only_mapped_tests(repo: Path, tmp_path: Path) 
 
 
 def test_two_mapped_files_run_deduped_sorted_union(repo: Path, tmp_path: Path) -> None:
-    base = _rev(repo)
     _write_ref_test(repo, "tests/unit/test_a.py", "one.sh")
     (repo / "tests/unit/test_b.py").write_text('"""one.sh and two.sh together."""\n')
+    base = _commit(repo, {}, "test: seed referencing tests")
     tip = _commit(repo, {"scripts/one.sh": "echo 1\n", "scripts/two.sh": "echo 2\n"})
     runlog = tmp_path / "run.log"
     _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
@@ -821,8 +821,8 @@ def test_two_mapped_files_run_deduped_sorted_union(repo: Path, tmp_path: Path) -
 
 
 def test_mixed_py_and_mapped_shell_runs_mapped_plus_testmon(repo: Path, tmp_path: Path) -> None:
-    base = _rev(repo)
     _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
     tip = _commit(repo, {"scripts/do.sh": "echo hi\n", "pkg/mod.py": "x = 1\n"})
     runlog = tmp_path / "run.log"
     _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
@@ -838,8 +838,8 @@ def test_mixed_py_and_mapped_shell_runs_mapped_plus_testmon(repo: Path, tmp_path
 
 def test_unmapped_shell_change_escalates_to_full(repo: Path, tmp_path: Path) -> None:
     # A tests/ dir exists but nothing references new.sh: conservative fallback.
-    base = _rev(repo)
     _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
     tip = _commit(repo, {"scripts/new.sh": "echo new\n"})
     runlog = tmp_path / "run.log"
     _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
@@ -851,8 +851,8 @@ def test_unmapped_shell_change_escalates_to_full(repo: Path, tmp_path: Path) -> 
 
 
 def test_mixed_mapped_and_unmapped_escalates_to_full(repo: Path, tmp_path: Path) -> None:
-    base = _rev(repo)
     _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
     tip = _commit(repo, {"scripts/do.sh": "echo hi\n", "scripts/new.sh": "echo new\n"})
     runlog = tmp_path / "run.log"
     _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
@@ -909,8 +909,8 @@ def test_exempt_list_change_itself_escalates_to_full(repo: Path, tmp_path: Path)
 
 
 def test_selected_failing_suite_blocks_push(repo: Path, tmp_path: Path) -> None:
-    base = _rev(repo)
     _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
     tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})
     runlog = tmp_path / "run.log"
     _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, exit_code=7)
@@ -924,8 +924,8 @@ def test_selected_pass_does_not_mint_stamp_yet(repo: Path, tmp_path: Path) -> No
     # Stamp mint/consume for the SELECTED tier is subtask D: until the stamp
     # can record the set that ran, minting bare `selected` would unsoundly
     # cover a different selection (or a testmon demand) on the same tree.
-    base = _rev(repo)
     _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
     tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})
     runlog = tmp_path / "run.log"
     _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
@@ -946,8 +946,8 @@ def test_missing_reverse_index_lib_degrades_to_full(repo: Path, tmp_path: Path) 
     shutil.copy(TEST_SELECT, hookdir / "test-select.sh")
     for lib in ("utils.sh", "telemetry.sh", "gate-stamp.sh"):
         shutil.copy(src / "lib" / lib, hookdir / "lib" / lib)
-    base = _rev(repo)
     _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
     tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})
     runlog = tmp_path / "run.log"
     _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
