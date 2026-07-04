@@ -790,17 +790,23 @@ EOF
 # _afk_resume_command <wt> <issue> -> the launch command for the resumed tmux window. Pure
 # (returns the string) so it is inspectable in a test. It inline-exports the telemetry the
 # resumed window needs to keep reaching the collector — recovery must not fly blind (#108):
-# AI_TOOLKIT_OTEL=1, the supervisor's OTLP endpoint, and the re-pinned spoke_run_id. The
+# AI_TOOLKIT_OTEL=1, the supervisor's OTLP endpoint, the workflow-span sink
+# (AI_TOOLKIT_OTEL_SPAN_ENDPOINT, #126), and the re-pinned spoke_run_id. The
 # auth header stays in the inherited env (never on the command line), exactly as
 # worktree-new.sh does. `claude --continue` resumes the crashed session in the worktree.
 # UPGRADE: replicate worktree-new.sh's full beta-tracing/raw-body env for per-tool parity.
 _afk_resume_command() {
-  local wt="$1" issue="$2" run_id endpoint prompt
+  local wt="$1" issue="$2" run_id endpoint span_endpoint prompt
   run_id="$(_afk_spoke_run_id "$wt")"
   endpoint="${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}"
+  # Workflow-span sink (#126), resume parity with worktree-new.sh: telemetry.sh's
+  # cycle step:/script/hook spans are gated on this var and POST over OTLP-HTTP,
+  # so it targets the collector's :4318 listener, not the gRPC endpoint above.
+  span_endpoint="${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:-http://localhost:4318}"
   prompt="$(_afk_resume_prompt "$issue")"
-  printf 'AI_TOOLKIT_OTEL=1 OTEL_EXPORTER_OTLP_ENDPOINT=%s OTEL_RESOURCE_ATTRIBUTES=%s claude --continue %s\n' \
-    "$(printf '%q' "$endpoint")" "$(printf '%q' "spoke_run_id=$run_id")" "$(printf '%q' "$prompt")"
+  printf 'AI_TOOLKIT_OTEL=1 OTEL_EXPORTER_OTLP_ENDPOINT=%s AI_TOOLKIT_OTEL_SPAN_ENDPOINT=%s OTEL_RESOURCE_ATTRIBUTES=%s claude --continue %s\n' \
+    "$(printf '%q' "$endpoint")" "$(printf '%q' "$span_endpoint")" \
+    "$(printf '%q' "spoke_run_id=$run_id")" "$(printf '%q' "$prompt")"
 }
 
 # resume_spoke <wt> <issue> -> open a fresh tmux window in the project session, cd'd into
