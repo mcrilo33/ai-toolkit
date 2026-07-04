@@ -89,3 +89,59 @@ jobs:
             exit 1
           fi
           echo "Sync is idempotent (no drift beyond reconciler .bak backups)."
+
+  # A permanently red check is noise that hides the day it fails for a real
+  # reason (#129): on any red gate job, land the failure in the backlog as a
+  # GitHub issue instead of an unread checks tab. Dedup contract: one open
+  # issue per failing job, keyed on the stable "CI red: <job>" title marker —
+  # consecutive red runs add a comment referencing the new run + commit
+  # rather than filing duplicates.
+  report-red:
+    name: File issue on red
+    runs-on: ubuntu-latest
+    needs: [test, shellcheck, sync-idempotency]
+    if: failure()
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: File or update a "CI red" issue per failed job
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # On pull_request, GITHUB_SHA is the throwaway merge commit; prefer
+          # the PR head SHA the developer actually pushed (empty on push runs).
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RESULT_TEST: ${{ needs.test.result }}
+          RESULT_SHELLCHECK: ${{ needs.shellcheck.result }}
+          RESULT_SYNC: ${{ needs['sync-idempotency'].result }}
+        run: |
+          set -euo pipefail
+          # Default runner env only ($GITHUB_*): no user-controlled values are
+          # interpolated into this script's text.
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          branch="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          sha="${PR_HEAD_SHA:-$GITHUB_SHA}"
+          short_sha="${sha:0:7}"
+          report() {
+            local job="$1" marker existing body
+            marker="CI red: $1"
+            body="$(printf 'CI is red for job **%s** on `%s`.\n\n- Run: %s\n- Commit: %s (%s)\n' \
+              "$job" "$branch" "$run_url" "$sha" "$short_sha")"
+            # List API + client-side title match, not --search: the Search
+            # index is eventually consistent and can miss a just-filed issue,
+            # double-filing on near-simultaneous red runs.
+            existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 200 \
+              --json number,title \
+              | jq -r --arg m "$marker" 'map(select(.title | startswith($m)))[0].number // empty')"
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+            else
+              gh issue create --repo "$GITHUB_REPOSITORY" \
+                --title "$marker @ $short_sha" --body "$body"
+            fi
+          }
+          [ "$RESULT_TEST" = "failure" ] && report "Pytest suite"
+          [ "$RESULT_SHELLCHECK" = "failure" ] && report "ShellCheck"
+          [ "$RESULT_SYNC" = "failure" ] && report "Sync idempotency"
+          exit 0

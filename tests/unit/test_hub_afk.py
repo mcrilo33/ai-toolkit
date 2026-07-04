@@ -20,9 +20,21 @@ import datetime
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+# hub-afk.sh targets the macOS control plane: it reads transcript mtimes with BSD
+# `stat -f %m`. GNU stat treats `-f` as *filesystem* stat, so on Linux the call
+# "succeeds" with `File: ...` prose, the `|| stat -c %Y` fallback never fires, and
+# every integer comparison downstream corrupts (issue #129). The tmux pane
+# machinery it drives is likewise mac-hub-only, so the whole module is
+# platform-gated rather than shimmed.
+pytestmark = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="hub-afk.sh requires BSD stat (-f %m) and the macOS tmux hub (#129)",
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HUB_AFK = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "hub-afk.sh"
@@ -2497,3 +2509,50 @@ def test_afk_default_ref_env_alias_still_wins(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "release/2.0"
+
+
+# ── CI platform gate (issue #129) ────────────────────────────────────────────
+
+
+def test_module_skips_on_non_darwin(tmp_path: Path) -> None:
+    # hub-afk.sh depends on BSD stat: on GNU stat `-f` means *filesystem* stat,
+    # so `stat -f %m` "succeeds" with `File: ...` garbage, the `|| stat -c %Y`
+    # fallback never fires, and the integer comparisons downstream blow up
+    # (issue #129). This whole module must therefore skip on non-Darwin.
+    # Simulate Linux with a plugin that rewrites sys.platform once collection
+    # starts — after interpreter startup (sysconfig keys module names on the
+    # real platform) but before this module is imported and the skipif
+    # evaluated — then require one fast TIME-layer test to be reported as
+    # skipped rather than run.
+    (tmp_path / "fake_linux_platform.py").write_text(
+        "import sys\n\n\ndef pytest_collection(session):\n    sys.platform = 'linux'\n"
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            str(Path(__file__)),
+            "-k",
+            # Coupled to that test's name: if it is renamed, -k selects nothing
+            # and pytest exits 5, failing the returncode assertion below.
+            "test_compute_end_epoch_drain_is_sentinel",
+            "-q",
+            "-p",
+            "fake_linux_platform",
+            "-p",
+            "no:cacheprovider",
+        ],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(tmp_path) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+        },
+        cwd=REPO_ROOT,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 skipped" in result.stdout, result.stdout
+    assert "passed" not in result.stdout, result.stdout
