@@ -89,6 +89,43 @@ wt_now_ms() {
   command -v _telemetry_now_ms >/dev/null 2>&1 && _telemetry_now_ms || true
 }
 
+# --- SSH-keepalive push (issue #119) --------------------------------------------
+# The pre-push suite (~6 min) runs INSIDE `git push`, between the SSH connection
+# opening and the pack transfer. GitHub reaps the idle connection mid-gate, so a
+# fully green push dies in the transfer phase (exit 141 / "closed by remote
+# host"). Every worktree/spoke push routes through wt_git_push so the connection
+# is kept alive across the gate.
+
+WT_SSH_KEEPALIVE_OPTS="-o ServerAliveInterval=15 -o ServerAliveCountMax=40"
+
+# The ssh command for keepalive pushes: a pre-existing GIT_SSH_COMMAND (custom
+# binary, -i identity, -o options) is preserved verbatim as the prefix and the
+# keepalive options are APPENDED — OpenSSH honors the first occurrence of an
+# option, so a caller's own ServerAlive* settings keep winning.
+wt_git_ssh_command() {
+  printf '%s %s' "${GIT_SSH_COMMAND:-ssh}" "$WT_SSH_KEEPALIVE_OPTS"
+}
+
+# `git push "$@"` with the keepalive GIT_SSH_COMMAND, scoped to the one git
+# process (a leading assignment — the caller's env is untouched).
+wt_git_push() {
+  GIT_SSH_COMMAND="$(wt_git_ssh_command)" git push "$@"
+}
+
+# wt_push_transport_died <push-exit-code> <captured-output-file> — did a failed
+# push die at the TRANSPORT layer? git only enters the transfer phase after the
+# pre-push hook exits 0, so any of these signatures is proof the gate ran green:
+# worktree-land uses that to retry once with the suite skipped. A failed gate
+# (pytest output + git's local refusal) matches nothing here — deliberately no
+# bare "broken pipe" pattern, which a BrokenPipeError traceback in pytest output
+# would fake.
+wt_push_transport_died() {
+  [ "${1:-0}" -eq 141 ] && return 0
+  grep -qiE \
+    'closed by remote host|packet_write_wait|client_loop: send disconnect|remote end hung up unexpectedly|send-pack: unexpected disconnect' \
+    "$2" 2>/dev/null
+}
+
 # --- portable date/time -------------------------------------------------------
 # BSD (macOS) and GNU date differ; try the BSD form first, fall back to GNU.
 # Kept here so the unattended supervisor (hub-afk.sh) and any future caller share
