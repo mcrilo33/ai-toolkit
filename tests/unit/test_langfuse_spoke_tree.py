@@ -147,6 +147,14 @@ def _by_orig(batch: list[dict], orig_trace_id: str, orig_obs_id: str) -> dict:
     return next(event for event in batch if event["id"] == copy_id)
 
 
+def _dur(total_ms: int, components: dict[str, int] | None = None) -> dict:
+    """The expected ``rollup.duration`` object: every class key present, zeros filled in."""
+    classes = ("llm_request", "tool", "hook", "script", "step", "wait", "turn", "self", "other")
+    filled = {key: 0 for key in classes}
+    filled.update(components or {})
+    return {"total_ms": total_ms, "components": filled}
+
+
 class TestBuildBatch:
     def test_emits_trace_create_then_one_synthetic_root(self) -> None:
         batch = build_batch(_traces(), SPOKE)
@@ -1197,6 +1205,206 @@ class TestContainerRollups:
         }
 
 
+def _timed_traces() -> list[tuple[str, list[dict]]]:
+    """One fully-timed turn: a 4s LLM call, a 3s tool, a 2s hook, and a 1s unattributed gap."""
+    interaction = _obs(
+        "i1",
+        "claude_code.interaction",
+        parent=None,
+        startTime="2026-01-02T00:00:00Z",
+        endTime="2026-01-02T00:00:10Z",
+    )
+    gen = _obs(
+        "g1",
+        "claude_code.llm_request",
+        type_="GENERATION",
+        parent="i1",
+        startTime="2026-01-02T00:00:00Z",
+        endTime="2026-01-02T00:00:04Z",
+    )
+    tool = _obs(
+        "t1",
+        "tool:Bash",
+        parent="i1",
+        startTime="2026-01-02T00:00:04Z",
+        endTime="2026-01-02T00:00:07Z",
+        metadata={"attributes": {"tool_use_id": "tu-1"}},
+    )
+    hook = _obs(
+        "h1",
+        "post-tool.sh",
+        parent="i1",
+        startTime="2026-01-02T00:00:07Z",
+        endTime="2026-01-02T00:00:09Z",
+    )
+    return [("tr", [interaction, gen, tool, hook])]
+
+
+class TestDurationRollups:
+    """#128: every container's ``metadata.rollup`` also carries a ``duration`` whose
+    exclusive-time components (each node's own duration minus its direct children's,
+    clamped >= 0, attributed to exactly one class bucket) sum to the observed subtree
+    wall-clock. Mirrors the token-rollup subtree-sum pattern."""
+
+    def test_interaction_components_sum_to_wall_clock(self) -> None:
+        batch = build_batch(_timed_traces(), SPOKE)
+
+        duration = _by_orig(batch, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
+        assert duration == _dur(
+            10_000, {"llm_request": 4_000, "tool": 3_000, "hook": 2_000, "self": 1_000}
+        )
+        assert sum(duration["components"].values()) == duration["total_ms"]
+
+    def test_root_spans_whole_spoke_and_inter_turn_idle_is_self(self) -> None:
+        # Two childless turns with a 10s gap between them: the synthetic root (no endTime of
+        # its own) spans min start -> max end, and the un-attributed inter-turn idle — the
+        # human-wait between turns — lands in its own ``self`` bucket.
+        turn_a = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+        )
+        turn_b = _obs(
+            "i2",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:20Z",
+            endTime="2026-01-02T00:00:30Z",
+        )
+
+        batch = build_batch([("tr-a", [turn_a]), ("tr-b", [turn_b])], SPOKE)
+
+        root = next(event for event in batch if event["id"] == root_id_for(SPOKE))
+        assert root["body"]["metadata"]["rollup"]["duration"] == _dur(
+            30_000, {"turn": 20_000, "self": 10_000}
+        )
+
+    def test_blocked_on_user_time_counts_as_wait_not_tool(self) -> None:
+        # The blocked_on_user sub-span folds onto its tool (#100) as blocked_on_user_ms; the
+        # duration rollup carves that human-wait out of the tool bucket into ``wait``.
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+        )
+        tool = _obs(
+            "t1",
+            "tool:Bash",
+            parent="i1",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+            metadata={"attributes": {"tool_use_id": "tu-1"}},
+        )
+        blocked = _obs(
+            "b1",
+            "claude_code.tool.blocked_on_user",
+            parent="t1",
+            startTime="2026-01-02T00:00:02Z",
+            endTime="2026-01-02T00:00:08Z",
+        )
+
+        batch = build_batch([("tr", [interaction, tool, blocked])], SPOKE)
+
+        duration = _by_orig(batch, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
+        assert duration == _dur(10_000, {"tool": 4_000, "wait": 6_000})
+
+    def test_gate_script_counts_as_wait(self) -> None:
+        turn = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+        )
+        gate = _obs(
+            "gt",
+            "script:gate",
+            parent=None,
+            startTime="2026-01-02T00:00:10Z",
+            endTime="2026-01-02T00:00:20Z",
+        )
+
+        batch = build_batch([("tr-int", [turn]), ("tr-gate", [gate])], SPOKE)
+
+        root = next(event for event in batch if event["id"] == root_id_for(SPOKE))
+        assert root["body"]["metadata"]["rollup"]["duration"] == _dur(
+            20_000, {"turn": 10_000, "wait": 10_000}
+        )
+
+    def test_non_gate_script_counts_as_script(self) -> None:
+        script = _obs(
+            "sc",
+            "script:worktree-land",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:05Z",
+            metadata={"attributes": {"workflow.kind": "script", "workflow.phase": "land"}},
+        )
+
+        batch = build_batch([("tr", [script])], SPOKE)
+
+        root = next(event for event in batch if event["id"] == root_id_for(SPOKE))
+        assert root["body"]["metadata"]["rollup"]["duration"] == _dur(5_000, {"script": 5_000})
+
+    def test_leaf_nodes_carry_no_duration(self) -> None:
+        batch = build_batch(_timed_traces(), SPOKE)
+
+        metadata = _by_orig(batch, "tr", "g1")["body"].get("metadata") or {}
+        assert "rollup" not in metadata
+
+    def test_untimed_tree_yields_zero_duration(self) -> None:
+        interaction = _obs("i1", "claude_code.interaction", parent=None)
+        tool = _obs("t1", "tool:Bash", parent="i1")
+
+        batch = build_batch([("tr", [interaction, tool])], SPOKE)
+
+        duration = _by_orig(batch, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
+        assert duration == _dur(0)
+
+    def test_child_exceeding_parent_clamps_self_to_zero(self) -> None:
+        # Malformed timing (child outlives its parent): total stays the observed container
+        # wall-clock, the child's full time is still attributed, and self clamps to 0 rather
+        # than going negative.
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:05Z",
+        )
+        gen = _obs(
+            "g1",
+            "claude_code.llm_request",
+            type_="GENERATION",
+            parent="i1",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:08Z",
+        )
+
+        batch = build_batch([("tr", [interaction, gen])], SPOKE)
+
+        duration = _by_orig(batch, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
+        assert duration == _dur(5_000, {"llm_request": 8_000})
+
+    def test_token_rollup_keys_unchanged_alongside_duration(self) -> None:
+        # The duration extends the existing token rollup in place — same metadata.rollup
+        # object, token keys untouched.
+        batch = build_batch(_traces(), SPOKE)
+
+        rollup = _by_orig(batch, "trace-int", "i1")["body"]["metadata"]["rollup"]
+        assert rollup == {
+            "reused": 900,
+            "written": 300,
+            "input": 120,
+            "output": 45,
+            "duration": _dur(1_000, {"llm_request": 1_000}),
+        }
+
+
 SESSION = "sess-idem"
 
 
@@ -1258,6 +1466,35 @@ class TestExcludesOwnOutput:
         # Same node set and no growth: the tree does not multiply across re-runs.
         assert {event["id"] for event in second} == {event["id"] for event in first}
         assert len(second) == len(first)
+
+    def test_rerun_with_prior_output_does_not_double_count_durations(self) -> None:
+        # #128: run 2's session also holds run 1's assembled output, whose synthetic root span
+        # covers the whole spoke — sourcing it would double every duration component. The
+        # rebuild must yield the exact same duration rollup as the first build.
+        target_id = trace_id_for(SESSION)
+        native = [(tid, None, obs) for tid, obs in _timed_traces()]
+        first = build_batch(fetch_session(SESSION, _stub_get(native)), SESSION)
+        prior_self = (
+            target_id,
+            f"spoke-tree:{SESSION}",
+            [
+                _obs(
+                    "spokeroot-x",
+                    f"spoke:{SESSION}",
+                    startTime="2026-01-02T00:00:00Z",
+                    endTime="2026-01-02T01:00:00Z",
+                )
+            ],
+        )
+
+        second = build_batch(fetch_session(SESSION, _stub_get(native + [prior_self])), SESSION)
+
+        root_first = next(e for e in first if e["id"] == root_id_for(SESSION))
+        root_second = next(e for e in second if e["id"] == root_id_for(SESSION))
+        assert (
+            root_second["body"]["metadata"]["rollup"]["duration"]
+            == root_first["body"]["metadata"]["rollup"]["duration"]
+        )
 
 
 class TestFetchSession:
@@ -3264,6 +3501,28 @@ class TestCycleView:
             "input": 1200,
             "output": 340,
         }
+
+    def test_interaction_leaf_carries_turn_duration_rollup(self) -> None:
+        # #128, same rule as tokens: the childless marker's duration is computed from its
+        # pre-flatten View A subtree — the turn's own 40s wall-clock split over its former
+        # children (5 timed tools = 4s, one 1s llm_request) with the rest as its own gap.
+        batch = build_cycle_batch(self._traces(), SPOKE, self._content())
+
+        leaf = _by_cycle(batch, "tr", "i1")["body"]
+        assert leaf["metadata"]["rollup"]["duration"] == _dur(
+            40_000, {"tool": 4_000, "llm_request": 1_000, "self": 35_000}
+        )
+
+    def test_cycle_root_duration_counts_each_span_once(self) -> None:
+        # #128: on the cycle axis the marker's span overlaps its former children (now its step
+        # siblings), so the marker is excluded from duration attribution — the root counts each
+        # real span exactly once, and the steps' own gap time carries the remainder.
+        batch = build_cycle_batch(self._traces(), SPOKE, self._content())
+
+        root = next(e for e in batch if e["id"] == cycle_root_id_for(SPOKE))
+        duration = root["body"]["metadata"]["rollup"]["duration"]
+        assert duration == _dur(40_000, {"tool": 4_000, "llm_request": 1_000, "step": 35_000})
+        assert sum(duration["components"].values()) == duration["total_ms"]
 
     def _straddle_content(self) -> dict[str, ToolContent]:
         return {
