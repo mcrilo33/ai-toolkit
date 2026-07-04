@@ -1,0 +1,8 @@
+# .test-select-exempt — paths the pre-push test gate (test-select.sh) ignores
+# and the control-plane coverage meta-test accepts without a referencing test
+# (issue #123). One path per line; a trailing / marks a directory subtree.
+# Every entry must exist on disk — the meta-test fails red on a stale entry.
+# Editing THIS file always escalates the push to the full suite (its dotted
+# basename can never be a filename-shaped token, so it is unmapped by
+# construction).
+.gitignore

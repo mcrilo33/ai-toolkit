@@ -9,11 +9,16 @@
 #
 # TIERS (over the set of changed files):
 #   • every changed file is docs-only (*.md, docs/, LICENSE, *.rst, images)
+#     or exempt (repo-root .test-select-exempt)
 #       → run NOTHING
-#   • every non-doc changed file is *.py
-#       → pytest --testmon   (coverage-based test-impact analysis)
-#   • anything else (.sh, Dockerfile, *.yml, Makefile, unrecognized)
-#       → the FULL suite
+#   • every non-doc/non-exempt changed file is *.py
+#       → pytest --testmon (+ the control-plane coverage meta-test, #123)
+#   • every non-python changed file maps to referencing tests (reverse index,
+#     issue #123)
+#       → run exactly the mapped test files (+ meta-test; + --testmon when
+#         the diff also touches python)
+#   • anything else (an unmapped, non-exempt file)
+#       → the FULL suite (which contains the meta-test natively)
 #
 # SAFE FALLBACKS:
 #   • testmon not installed  → full suite (never silently skip python tests)
@@ -106,6 +111,9 @@ fi
 # ── Classification helpers ──────────────────────────────────────────────────────
 is_doc() {
   case "$1" in
+    # A script/config suffix is never docs, wherever it lives: */docs/* must
+    # not swallow a control-plane script the coverage meta-test claims (#123).
+    *.sh|*.yml|*.yaml) return 1 ;;
     *.md|*.rst) return 0 ;;
     docs/*|*/docs/*) return 0 ;;
     LICENSE|*/LICENSE) return 0 ;;
@@ -125,6 +133,16 @@ is_py() { case "$1" in *.py) return 0 ;; *) return 1 ;; esac; }
 # unmapped by construction and escalates to the full suite: high-stakes
 # changes to what the gate ignores always pay the maximum price.
 EXEMPT_LIST=".test-select-exempt"
+
+# The control-plane coverage meta-test (issue #123): a milliseconds static
+# scan asserting every control-plane script has a referencing test or an
+# exemption. It rides every tier that runs pytest — SELECTED appends it to
+# the selection, the testmon tier adds a separate invocation, and the full
+# suite contains it natively — so an unmapped script can never land: its push
+# escalates to FULL and the meta-test there is red until a test references
+# it. Guarded on file existence: synced repos without the file are unaffected.
+META_TEST_FILE="tests/unit/test_test_reverse_index.py"
+META_TEST_NODE="$META_TEST_FILE::TestControlPlaneCoverage"
 is_exempt() {
   local f="$1" entry
   [ -f "$EXEMPT_LIST" ] || return 1
@@ -348,6 +366,14 @@ case "$DECISION" in
     if [ "$TIER_TO_RUN" = "testmon" ]; then
       note "python-only diff — pytest --testmon"
       run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" --testmon || rc=$?
+      # The meta-test rides along as its own invocation: mixing an explicit
+      # node id into --testmon would let testmon deselect it.
+      if [ -f "$META_TEST_FILE" ]; then
+        note "control-plane coverage meta-test"
+        rc2=0
+        run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" "$META_TEST_NODE" || rc2=$?
+        [ "$rc" -ne 0 ] || rc=$rc2
+      fi
     else
       note "python-only diff but testmon not installed — full suite"
       run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" || rc=$?
@@ -358,6 +384,9 @@ case "$DECISION" in
     while IFS= read -r t; do
       [ -n "$t" ] && SEL_ARR+=("$t")
     done <<< "$SELECTED_TESTS"
+    if [ -f "$META_TEST_FILE" ]; then
+      SEL_ARR+=("$META_TEST_NODE")
+    fi
     note "mapped diff — selected test files: ${SEL_ARR[*]}"
     run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" "${SEL_ARR[@]}" || rc=$?
     if [ "$has_py" = "1" ]; then

@@ -1033,3 +1033,19 @@ def test_full_tier_does_not_append_meta_test(repo: Path, tmp_path: Path) -> None
     log = _runlog(runlog)
     assert "RUN \n" in log
     assert "TestControlPlaneCoverage" not in log
+
+
+def test_script_under_docs_dir_is_never_a_doc(repo: Path, tmp_path: Path) -> None:
+    # C-review finding: shared/hooks/docs/helper.sh matched is_doc's */docs/*
+    # before mapping, landing an unreferenced control-plane script with a green
+    # gate while the meta-test claims the path — red for the NEXT pusher. A
+    # script suffix is never docs, wherever it lives.
+    base = _rev(repo)
+    tip = _commit(repo, {"shared/hooks/docs/helper.sh": "#!/bin/sh\necho hi\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN \n" in _runlog(runlog)  # unmapped script → FULL, never NOTHING

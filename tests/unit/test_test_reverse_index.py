@@ -268,11 +268,15 @@ def test_repo_without_tests_dir_degrades_to_empty(repo: Path) -> None:
     assert _lookup(repo, "scripts/tool.sh") == []
 
 
-# --- the enforcement meta-test: every control-plane script has a test (#123) ------
+# --- the enforcement meta-test: every control-plane script is referenced (#123) ---
 # These run against the REAL repo tree — they ARE the enforcement loop: an
 # unmapped control-plane script escalates the push to the full suite, the full
 # suite contains this class, and this class stays red until a referencing test
 # exists. Unmapped can exist locally but can never land.
+#
+# Ceiling, stated honestly: "referenced" means the basename appears as a token
+# in some test_*.py — including a fixture-data mention that never executes the
+# script. The gate enforces reference, not exercise; review still owns quality.
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONTROL_PLANE_DIRS = ("scripts", "shared/hooks", "dashboard/langfuse")
@@ -329,8 +333,7 @@ class TestControlPlaneCoverage:
         unmapped = [
             str(f.relative_to(REPO_ROOT))
             for f in _control_plane_files()
-            if f.name not in tokens
-            and not _is_exempt(str(f.relative_to(REPO_ROOT)), entries)
+            if f.name not in tokens and not _is_exempt(str(f.relative_to(REPO_ROOT)), entries)
         ]
         assert unmapped == [], (
             "control-plane files with no referencing test: "
@@ -342,3 +345,21 @@ class TestControlPlaneCoverage:
     def test_exempt_entries_exist_on_disk(self) -> None:
         stale = [e for e in _exempt_entries() if not (REPO_ROOT / e).exists()]
         assert stale == [], f".test-select-exempt names missing paths: {stale}"
+
+
+# --- straggler smoke tests: the scripts the #123 survey found unreferenced -------
+# Their literal paths here are themselves the references that satisfy the
+# coverage meta-test — the smoke is minimal but real (the script must parse).
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "scripts/install.sh",
+        "scripts/list-cursor-rules.sh",
+        "shared/hooks/lib/scope-guard.sh",
+    ],
+)
+def test_straggler_script_parses(script: str) -> None:
+    proc = subprocess.run(["bash", "-n", str(REPO_ROOT / script)], capture_output=True, text=True)
+    assert proc.returncode == 0, f"{script} does not parse: {proc.stderr}"
