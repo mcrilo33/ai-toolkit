@@ -264,12 +264,16 @@ if [ "$PUSH_RC" -ne 0 ]; then
   # Second line of defense (issue #119): retry EXACTLY once with the suite
   # skipped when the failure is demonstrably POST-green — (a) a transport-death
   # signature (git only enters the transfer phase after the pre-push hook exited
-  # 0) AND (b) no pytest failure summary in the capture: a FAILING gate whose
+  # 0) AND (b) no pytest failure shape in the capture: a FAILING gate whose
   # output merely quotes a transport phrase (this repo's own tests embed those
-  # literals) must still read as a failed gate. Anything else — failed gate,
-  # policy rejection — rolls back exactly as before, and a failed retry does too.
+  # literals) must still read as a failed gate. The filter covers all of
+  # pytest's red summaries — "N failed", "N error(s)" (collection/internal),
+  # and the "Interrupted:" banner — none of which a green run prints ("N
+  # xfailed" has no digit before "failed" and never matches). Anything else —
+  # failed gate, policy rejection — rolls back exactly as before, and a failed
+  # retry does too.
   if wt_push_transport_died "$PUSH_RC" "$PUSH_LOG" \
-     && ! grep -qE '[0-9]+ failed' "$PUSH_LOG"; then
+     && ! grep -qE '[0-9]+ (failed|error)|Interrupted' "$PUSH_LOG"; then
     wt_warn "gate ran green but the push transport died (SSH staleness, issue #119) — retrying ONCE with TEST_SELECT_SKIP=1"
     if ! land_push retry; then
       land_rollback "retry push failed too"

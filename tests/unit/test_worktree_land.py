@@ -659,6 +659,28 @@ def test_failed_gate_with_transport_prose_never_retries(hub: Path, tmp_path: Pat
     assert _log_text(gate_log).splitlines() == ["INVOKED skip=[]"]
 
 
+def test_failed_collection_with_transport_prose_never_retries(hub: Path, tmp_path: Path) -> None:
+    # A gate failing at COLLECTION time prints "Interrupted: N errors during
+    # collection" and never a "N failed" summary — with a transport literal in
+    # the traceback (importing a literal-bearing test file that broke) it must
+    # STILL read as a failed gate: no skip-retry may ship a non-importing tree.
+    _make_spoke(hub, tmp_path, "feature/1-collect", push=True, ready=True)
+    _diverge_hub(hub)
+    gate_log = tmp_path / "gate-calls.log"
+    gate_output = (
+        "ERROR tests/unit/test_worktree_lib.py - ImportError while importing; source "
+        "quotes 'Connection to ssh.github.com closed by remote host.'\n"
+        "!!!!!!!! Interrupted: 1 error during collection !!!!!!!!\n"
+        "=== 1 error in 2.31s ==="
+    )
+    _install_counting_gate(hub, gate_log, exit_code=1, stderr=gate_output)
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode != 0
+    assert _log_text(gate_log).splitlines() == ["INVOKED skip=[]"]
+
+
 def test_remote_rejection_after_green_gate_rolls_back_without_retry(
     hub: Path, tmp_path: Path
 ) -> None:
