@@ -127,7 +127,9 @@ One saved Langfuse dashboard — **"spoke latency"** — answers, at a glance: w
 cycle step dominates a spoke, what the gate costs, and how LLM latency compares
 across models. Its reproducible source of truth is
 **`dashboard/langfuse/spoke-latency-dashboard.json`**: four widget definitions, each
-carrying the exact `/api/public/v2/metrics` query that backs it, pinned to the v2
+carrying the exact `/api/public/metrics` query that backs it (the deployed v3.192.2
+routes this query shape at the v1 path — `/api/public/v2/metrics` 404s there, newer
+builds add it; all four queries verified live, HTTP 200 with data), pinned to the
 metrics contract by `tests/unit/test_spoke_latency_dashboard.py` (views, measures,
 aggregations, filter operators, the high-cardinality dimension ban, and the emitted
 span/score names).
@@ -145,7 +147,7 @@ the `Authorization` header against `LANGFUSE_HOST` (default
 
 ```bash
 curl -s -H "Authorization: $LANGFUSE_BASIC_AUTH" \
-  "$LANGFUSE_HOST/api/public/v2/metrics" --get \
+  "$LANGFUSE_HOST/api/public/metrics" --get \
   --data-urlencode 'query=<widget metricsQuery + time range>'
 ```
 

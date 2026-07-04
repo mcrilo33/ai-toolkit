@@ -4,7 +4,7 @@ Langfuse v3.192.x exposes NO public dashboards API (no ``dashboards`` resource i
 local instance's OpenAPI spec nor in langfuse-cli's schema), so the checked-in
 definitions file ``dashboard/langfuse/spoke-latency-dashboard.json`` is the
 reproducible source of truth: the dashboard is saved once via the UI from these
-definitions, and each widget carries the exact ``/api/public/v2/metrics`` query that
+definitions, and each widget carries the exact ``/api/public/metrics`` query that
 backs it. These tests pin the file to the v2 metrics schema — views, measures,
 aggregations, filter operators, the high-cardinality dimension ban — so a typo cannot
 silently produce an empty widget, and to the span/score names this repo actually
@@ -20,7 +20,8 @@ _DEFINITIONS_PATH = (
     Path(__file__).resolve().parents[2] / "dashboard" / "langfuse" / "spoke-latency-dashboard.json"
 )
 
-# The /api/public/v2/metrics contract (from the endpoint's OpenAPI description).
+# The metrics-API query contract (from the endpoint's OpenAPI description; the same
+# query object is served at /api/public/metrics on v3.192.x and /v2/ on newer builds).
 _VIEWS = {"observations", "scores-numeric", "scores-categorical"}
 _AGGREGATIONS = {
     "sum",
