@@ -206,3 +206,21 @@ def test_emit_does_fire_when_endpoint_explicitly_set(tmp_path: Path) -> None:
     env = {**os.environ, "AI_TOOLKIT_OTEL_SPAN_ENDPOINT": "http://127.0.0.1:4318"}
     fired = _emit_with_stub_curl(env, tmp_path / "bin", sentinel)
     assert fired, "OTLP sink did not fire even with AI_TOOLKIT_OTEL_SPAN_ENDPOINT set"
+
+
+def test_conftest_pins_langfuse_auth_resolution() -> None:
+    # In-process guard for the issue #127 resolver: wt_resolve_langfuse_auth
+    # (worktree-lib.sh) re-defaults AI_TOOLKIT_OTEL_SPAN_ENDPOINT once auth resolves,
+    # so the endpoint strip above is NOT enough — a test shelling out to
+    # worktree-land/worktree-quick would read the operator's real ~/.afk-telemetry
+    # and re-open the live export channel. conftest must strip the auth pair AND pin
+    # AFK_TELEMETRY_CONF at a path that cannot exist.
+    assert not os.environ.get("LANGFUSE_BASIC_AUTH"), (
+        "conftest must strip LANGFUSE_BASIC_AUTH so the resolver can't resolve from env"
+    )
+    assert not os.environ.get("LANGFUSE_HOST"), "conftest must strip LANGFUSE_HOST"
+    conf = os.environ.get("AFK_TELEMETRY_CONF")
+    assert conf, (
+        "conftest must pin AFK_TELEMETRY_CONF so the resolver never reads ~/.afk-telemetry"
+    )
+    assert not Path(conf).exists(), "the pinned conf must not exist (sandbox no-such-conf)"

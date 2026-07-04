@@ -1170,6 +1170,7 @@ def test_land_resolves_auth_from_conf_for_ingest(hub: Path, tmp_path: Path) -> N
         tmp_path,
         "1",
         stub_python312=True,
+        stub_curl=True,  # auth resolves here, so the span sink fires — capture, never send
         extra_env={
             "AFK_TELEMETRY_CONF": str(conf),
             "AI_TOOLKIT_INGEST_FLUSH_WAIT": "0",
