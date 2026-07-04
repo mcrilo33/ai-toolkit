@@ -39,6 +39,11 @@ for _c in "$_SP_DIR/telemetry.sh" "$_SP_DIR/../shared/hooks/lib/telemetry.sh"; d
   if [ -f "$_c" ]; then . "$_c"; break; fi
 done
 unset _c
+# The SSH-keepalive push wrapper wt_git_push (issue #119) lives in
+# worktree-lib.sh, co-located with this script in both layouts (toolkit
+# scripts/, synced .ai-toolkit/scripts/). A missing sibling is a broken
+# sync — fail loudly rather than fall back to a keepalive-less push.
+. "$_SP_DIR/worktree-lib.sh"
 _SP_T0="$(command -v _telemetry_now_ms >/dev/null 2>&1 && _telemetry_now_ms || true)"
 # Mint this script's OWN span id up front (Issue #66 — script causality). spoke-push
 # shells out to spoke-ready, so it exports this id as the child's
@@ -83,14 +88,16 @@ else
   echo "→ no .review/*.json artifact found (the pre-push gate blocks if one is required)"
 fi
 
-# The push — pre-push gate hooks fire here. No --no-verify, ever. Run it with this
-# push's own span id as AI_TOOLKIT_PARENT_SPAN (Issue #66, leading assignment —
-# scoped to the git process, safe inside a script) so the native gate hooks
-# (test-select, red-proof-warn, …) the push triggers nest under spoke-push rather
-# than the Bash tool call. Empty span id (telemetry off) is harmless — it resolves
-# to the file/spoke-root fallback exactly as an unset var would.
+# The push — pre-push gate hooks fire here. No --no-verify, ever. It routes
+# through wt_git_push (issue #119) so the SSH connection is kept alive across the
+# ~6-minute gate the hook runs mid-push. Run it with this push's own span id as
+# AI_TOOLKIT_PARENT_SPAN (Issue #66, leading assignment — scoped to the call,
+# safe inside a script) so the native gate hooks (test-select, red-proof-warn, …)
+# the push triggers nest under spoke-push rather than the Bash tool call. Empty
+# span id (telemetry off) is harmless — it resolves to the file/spoke-root
+# fallback exactly as an unset var would.
 echo "→ git push -u origin $BRANCH"
-AI_TOOLKIT_PARENT_SPAN="$_SP_SPAN_ID" git push -u origin "$BRANCH"
+AI_TOOLKIT_PARENT_SPAN="$_SP_SPAN_ID" wt_git_push -u origin "$BRANCH"
 
 # Final subtask: emit the ready/<issue> completion marker via the canonical
 # marker emitter (issue #45) — one annotated, force-moved (idempotent) tag pushed

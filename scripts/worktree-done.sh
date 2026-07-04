@@ -202,7 +202,7 @@ prune_branch() {
   fi
   echo "  pruned merged branch $WT_BRANCH."
   if git show-ref --verify --quiet "refs/remotes/origin/$WT_BRANCH"; then
-    if git push origin --delete "$WT_BRANCH" >/dev/null 2>&1; then
+    if wt_git_push origin --delete "$WT_BRANCH" >/dev/null 2>&1; then
       echo "  deleted origin/$WT_BRANCH."
     else
       wt_warn "couldn't delete origin/$WT_BRANCH — delete by hand: git push origin --delete \"$WT_BRANCH\""
