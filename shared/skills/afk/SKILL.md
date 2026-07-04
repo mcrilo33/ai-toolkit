@@ -10,7 +10,7 @@ away: "drain the backlog while I'm out", "run AFK for an hour", or `/afk <durati
 
 ## What it does each tick
 
-`hub-afk.sh` (`shared/skills/hub/scripts/hub-afk.sh`) runs a continuous supervisor loop.
+`hub-afk.sh` (`.ai-toolkit/scripts/hub-afk.sh`) runs a continuous supervisor loop.
 Every tick it:
 
 1. **Plans + dispatches** the next concurrent batch via `batch-plan.sh` (`/next-batch`'s
@@ -82,7 +82,7 @@ runs unattended there on the **same Claude subscription** — no API key, no pro
 
 ```bash
 # from anywhere (work, travel) — needs AFK_REMOTE_HOST + AFK_REMOTE_REPO configured
-shared/skills/hub/scripts/hub-afk.sh --remote
+.ai-toolkit/scripts/hub-afk.sh --remote
 ```
 
 It SSHes to the host (a Tailscale hostname reaches it across networks), starts a detached,
@@ -119,11 +119,11 @@ responsive. It self-terminates at the stop condition.
 
 ```bash
 # clock-bound
-shared/skills/hub/scripts/hub-afk.sh 1h
+.ai-toolkit/scripts/hub-afk.sh 1h
 # or until a wall-clock time
-shared/skills/hub/scripts/hub-afk.sh until 07:00
+.ai-toolkit/scripts/hub-afk.sh until 07:00
 # or drain to empty (no clock)
-shared/skills/hub/scripts/hub-afk.sh drain
+.ai-toolkit/scripts/hub-afk.sh drain
 ```
 
 Arming writes the end bound to `<git-common-dir>/.afk-state` (an epoch, or `drain`), so a
@@ -138,8 +138,8 @@ is a lifecycle outcome. The dashboard is where you see what AFK did.
 ### 4. Stop early or check in
 
 ```bash
-shared/skills/hub/scripts/hub-afk.sh --status   # how long is left?
-shared/skills/hub/scripts/hub-afk.sh --off       # stop now
+.ai-toolkit/scripts/hub-afk.sh --status   # how long is left?
+.ai-toolkit/scripts/hub-afk.sh --off       # stop now
 ```
 
 ## Rules of thumb

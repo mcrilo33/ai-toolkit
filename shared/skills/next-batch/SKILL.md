@@ -12,8 +12,8 @@ during an unattended drain.
 
 ## What the planner does
 
-`batch-plan.sh` (`.ai-toolkit/scripts/hub/batch-plan.sh`, synced from
-`shared/skills/hub/scripts/`) reads the open backlog in one `gh api graphql`
+`batch-plan.sh` (`.ai-toolkit/scripts/batch-plan.sh`, synced from
+the hub skill's `scripts/` directory) reads the open backlog in one `gh api graphql`
 round-trip and prints the issue numbers of the next concurrent batch:
 
 - **Eligibility** — an issue is *ready* only when all its blocked-by issues are
@@ -42,7 +42,7 @@ body (`gh issue view <n> --json body`).
 Pass one `--inflight` flag per live spoke:
 
 ```bash
-.ai-toolkit/scripts/hub/batch-plan.sh \
+.ai-toolkit/scripts/batch-plan.sh \
   --inflight "shared/hooks/foo.sh tests/unit/test_foo.py" \
   --inflight "dashboard/app.py"
 ```
@@ -50,7 +50,7 @@ Pass one `--inflight` flag per live spoke:
 With no spokes running, call it bare:
 
 ```bash
-.ai-toolkit/scripts/hub/batch-plan.sh
+.ai-toolkit/scripts/batch-plan.sh
 ```
 
 ### 2. Show the proposed batch

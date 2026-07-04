@@ -77,6 +77,18 @@ loop (`/loop 2m bash .ai-toolkit/scripts/hub-ready-watch.sh`). It is detection o
 - Offline-safe: a finished spoke's tag is locally visible (shared ref store), so a failed
   fetch is non-fatal and local markers still surface.
 
+### Telemetry watchdog (when spokes export OTel)
+
+`worktree-new.sh` ensures the OTel collector + Langfuse bridge once at spawn, but nothing
+restarts them if they die mid-run — a crash silently drops every span until the next
+spawn (issue #115). The watchdog companion closes that gap: while at least one spoke
+pane is live it re-ensures both (recycling a dead or stale one), and it is quiet when
+there is nothing to do, so loop it alongside the ready watch:
+
+```bash
+/loop 2m bash .ai-toolkit/scripts/hub-otel-watch.sh
+```
+
 ### Unattended drain and parallel batching
 
 Two skills move a backlog without hands-on dispatching, with the observability

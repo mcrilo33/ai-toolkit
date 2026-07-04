@@ -43,6 +43,10 @@ SOURCES["hub-ready-watch.sh"] = HUB_SCRIPTS_DIR / "hub-ready-watch.sh"
 # The hub-side OTel watchdog (issue #115) ships alongside its siblings so a synced
 # target can /loop it to keep the collector+bridge up for the whole spoke lifetime.
 SOURCES["hub-otel-watch.sh"] = HUB_SCRIPTS_DIR / "hub-otel-watch.sh"
+# The unattended-drain supervisor (issue #71) and the batch planner (issue #70)
+# ship so /afk and /next-batch resolve in a synced target like their siblings.
+SOURCES["hub-afk.sh"] = HUB_SCRIPTS_DIR / "hub-afk.sh"
+SOURCES["batch-plan.sh"] = HUB_SCRIPTS_DIR / "batch-plan.sh"
 # Co-installed so the worktree scripts can source it as a sibling for lifecycle
 # telemetry (it also lives under .claude/hooks/lib/ for the hooks).
 SOURCES["telemetry.sh"] = REPO_ROOT / "shared" / "hooks" / "lib" / "telemetry.sh"

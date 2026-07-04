@@ -1,11 +1,11 @@
-"""afk/SKILL.md must launch hub-afk.sh via a path that resolves (issue #74, defect 6).
+"""afk/SKILL.md must launch hub-afk.sh via the canonical path (issues #74, #18).
 
-The maiden run exposed a packaging/doc mismatch: the skill launched
-``.ai-toolkit/scripts/hub/hub-afk.sh`` — a path that exists in NEITHER the ai-toolkit
-checkout (where the supervisor lives at ``shared/skills/hub/scripts/hub-afk.sh``) nor a
-synced target. The launch examples must point at the real script location, so every
-``…/hub-afk.sh`` path the doc shows resolves to a file in the repo, and the broken
-``hub/`` subdir form is gone.
+The maiden run exposed a packaging/doc mismatch (issue #74, defect 6): the skill
+launched ``.ai-toolkit/scripts/hub/hub-afk.sh`` — a ``hub/`` subdir form that exists
+in NEITHER the ai-toolkit checkout nor a synced target. The lasting contract is the
+issue #18 convention the other workflow skills follow: every launch example points at
+``.ai-toolkit/scripts/hub-afk.sh``, the canonical location ``sync-to-repo.sh``
+installs from the skill source ``shared/skills/hub/scripts/hub-afk.sh``.
 """
 
 from __future__ import annotations
@@ -15,6 +15,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILL = REPO_ROOT / "shared" / "skills" / "afk" / "SKILL.md"
+
+CANONICAL = ".ai-toolkit/scripts/hub-afk.sh"
+SOURCE = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "hub-afk.sh"
 
 # A hub-afk.sh reference WITH a path (a leading directory) — bare `hub-afk.sh` mentions
 # in prose are not launch commands and are excluded.
@@ -29,9 +32,19 @@ def test_no_broken_hub_subdir_launch_path() -> None:
     )
 
 
-def test_every_hub_afk_path_resolves() -> None:
+def test_every_hub_afk_path_is_canonical() -> None:
+    """Every pathed hub-afk.sh reference is the one canonical installed location."""
     text = SKILL.read_text()
     paths = set(_HUB_AFK_PATH.findall(text))
     assert paths, "afk/SKILL.md must reference the hub-afk.sh launch path"
-    for p in paths:
-        assert (REPO_ROOT / p).is_file(), f"afk/SKILL.md references non-existent path: {p}"
+    assert paths == {CANONICAL}, (
+        f"afk/SKILL.md must launch hub-afk.sh only via {CANONICAL}, found: {sorted(paths)}"
+    )
+
+
+def test_canonical_path_has_a_sync_source() -> None:
+    """The canonical path is backed by a real skill-source file sync installs from."""
+    assert SOURCE.is_file(), (
+        "shared/skills/hub/scripts/hub-afk.sh missing — the canonical "
+        f"{CANONICAL} would sync from nowhere"
+    )

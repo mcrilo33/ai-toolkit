@@ -475,10 +475,12 @@ sync_mcp_servers() {
 # telemetry-ingest-spoke.sh ships so the synced land script can call it at
 # teardown for the #87/#92 post-run Langfuse ingestion; worktree-quick.sh ships
 # so the /quick express lane resolves in a synced target.
+# hub-afk.sh and batch-plan.sh ship so /afk (issue #71) and /next-batch
+# (issue #70) resolve in a synced target like their hub-status.sh siblings.
 # Sources: worktree-*.sh, spoke-push.sh, spoke-ready.sh and
 # telemetry-ingest-spoke.sh at the toolkit root scripts/, hub-status.sh,
-# hub-ready-watch.sh and hub-otel-watch.sh under the hub skill
-# (shared/skills/hub/scripts/).
+# hub-ready-watch.sh, hub-otel-watch.sh, hub-afk.sh and batch-plan.sh under
+# the hub skill (shared/skills/hub/scripts/).
 sync_workflow_scripts() {
     section "Workflow scripts (hub/spoke/land)"
     local dst_dir="$TARGET/.ai-toolkit/scripts"
@@ -488,9 +490,9 @@ sync_workflow_scripts() {
     # hooks/lib/) so the worktree scripts can source them as siblings — see
     # worktree-lib.sh's telemetry and base-branch blocks.
     local name src
-    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh worktree-quick.sh spoke-push.sh spoke-ready.sh telemetry-ingest-spoke.sh hub-status.sh hub-ready-watch.sh hub-otel-watch.sh telemetry.sh base-branch.sh; do
+    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh worktree-quick.sh spoke-push.sh spoke-ready.sh telemetry-ingest-spoke.sh hub-status.sh hub-ready-watch.sh hub-otel-watch.sh hub-afk.sh batch-plan.sh telemetry.sh base-branch.sh; do
         case "$name" in
-            hub-status.sh|hub-ready-watch.sh|hub-otel-watch.sh) src="$SHARED_DIR/skills/hub/scripts/$name" ;;
+            hub-status.sh|hub-ready-watch.sh|hub-otel-watch.sh|hub-afk.sh|batch-plan.sh) src="$SHARED_DIR/skills/hub/scripts/$name" ;;
             telemetry.sh|base-branch.sh)      src="$SHARED_DIR/hooks/lib/$name" ;;
             *)                                src="$SCRIPT_DIR/$name" ;;
         esac

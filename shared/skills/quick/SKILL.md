@@ -24,8 +24,8 @@ or when the "why" should be findable later from an issue.
 From the hub (the main checkout), run:
 
 ```bash
-scripts/worktree-quick.sh <slug>          # branch quick/<slug>
-scripts/worktree-quick.sh <slug> -t chore # branch chore/<slug>
+.ai-toolkit/scripts/worktree-quick.sh <slug>          # branch quick/<slug>
+.ai-toolkit/scripts/worktree-quick.sh <slug> -t chore # branch chore/<slug>
 ```
 
 This creates a worktree + branch, copies the gitignored `.claude/` runtime config,
@@ -66,10 +66,10 @@ From the **hub** (not the worktree):
 
 ```bash
 # unpushed local branch (never sent to origin):
-scripts/worktree-land.sh <slug> --local
+.ai-toolkit/scripts/worktree-land.sh <slug> --local
 
 # or, if you pushed the branch first:
-scripts/worktree-land.sh <slug>
+.ai-toolkit/scripts/worktree-land.sh <slug>
 ```
 
 A non-numbered `quick/`/`chore/` branch carries no `ready/<issue>` marker, so it needs

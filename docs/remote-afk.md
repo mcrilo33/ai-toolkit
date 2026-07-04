@@ -40,7 +40,7 @@ in the host's `~/.claude/`.
 
 > [!NOTE]
 > Two script paths appear below, by design. The **trigger machine** is a synced consumer
-> repo, so it invokes `.ai-toolkit/scripts/hub/hub-afk.sh`. The **drain host** set up below
+> repo, so it invokes `.ai-toolkit/scripts/hub-afk.sh`. The **drain host** set up below
 > is a raw `ai-toolkit` checkout, so its default drain command uses
 > `shared/skills/hub/scripts/hub-afk.sh`. The launcher resolves both layouts.
 
@@ -111,7 +111,7 @@ AFK_REMOTE_SESSION=afk            # optional (default: afk)
 Then, from anywhere:
 
 ```bash
-.ai-toolkit/scripts/hub/hub-afk.sh --remote
+.ai-toolkit/scripts/hub-afk.sh --remote
 # → launching unattended drain on mac-home (tmux session 'afk')
 # ✓ launched on mac-home — draining unattended until the backlog is empty
 # Reattach with: ssh mac-home -t 'tmux attach -t afk'

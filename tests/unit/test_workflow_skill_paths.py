@@ -1,11 +1,13 @@
-"""The hub/start-task/land skills must reference workflow scripts canonically.
+"""The workflow skills must reference the workflow scripts canonically.
 
 The decision for issue #18 is a single canonical ``.ai-toolkit/scripts/``
 location used in both the ai-toolkit checkout and a synced target — no
 sync-time path rewrite. So the source SKILL.md files must already point every
-worktree-script and hub-status.sh invocation at ``.ai-toolkit/scripts/<name>``;
+worktree-script and hub-script invocation at ``.ai-toolkit/scripts/<name>``;
 the repo-root ``scripts/worktree-*.sh`` and ``shared/skills/hub/scripts/``
-forms (which only resolve in this checkout) must be gone.
+forms (which only resolve in this checkout) must be gone. Covers every skill
+that invokes a workflow script: hub/start-task/land plus quick, next-batch
+and afk (whose path drift shipped a /next-batch that resolved nowhere).
 """
 
 from __future__ import annotations
@@ -18,10 +20,10 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILLS_DIR = REPO_ROOT / "shared" / "skills"
 
-WORKFLOW_SKILLS = ("hub", "start-task", "land")
+WORKFLOW_SKILLS = ("hub", "start-task", "land", "quick", "next-batch", "afk")
 
 # Markdown files that drive the hub/spoke/land workflow and must invoke the
-# worktree scripts via the canonical .ai-toolkit/scripts/ path: the three skills
+# worktree scripts via the canonical .ai-toolkit/scripts/ path: the skills
 # plus the planning-hub rule, which the hub skill loads.
 WORKFLOW_DOCS = (
     *(SKILLS_DIR / name / "SKILL.md" for name in WORKFLOW_SKILLS),
