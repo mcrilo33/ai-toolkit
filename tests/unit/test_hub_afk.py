@@ -25,6 +25,17 @@ from pathlib import Path
 
 import pytest
 
+# hub-afk.sh targets the macOS control plane: it reads transcript mtimes with BSD
+# `stat -f %m`. GNU stat treats `-f` as *filesystem* stat, so on Linux the call
+# "succeeds" with `File: ...` prose, the `|| stat -c %Y` fallback never fires, and
+# every integer comparison downstream corrupts (issue #129). The tmux pane
+# machinery it drives is likewise mac-hub-only, so the whole module is
+# platform-gated rather than shimmed.
+pytestmark = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="hub-afk.sh requires BSD stat (-f %m) and the macOS tmux hub (#129)",
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HUB_AFK = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "hub-afk.sh"
 SPOKE_READY = REPO_ROOT / "scripts" / "spoke-ready.sh"
