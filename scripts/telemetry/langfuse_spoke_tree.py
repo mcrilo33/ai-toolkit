@@ -90,10 +90,18 @@ an update body that omits ``name``/``type`` makes Langfuse CLEAR them, so it was
 
 Beyond copying, the build adds two CREATE-only enrichments (no patches):
 
-- **Per-container token rollups.** Every container node (each interaction, ``tool:Agent``,
-  sub-agent, and the synthetic root) gets ``metadata.rollup = {reused, written, input,
-  output}`` summed over its subtree of the re-parented tree, reusing
-  ``langfuse_rollup``'s sum logic but written into the create body.
+- **Per-container token + duration rollups.** Every container node (each interaction,
+  ``tool:Agent``, sub-agent, and the synthetic root) gets ``metadata.rollup = {reused,
+  written, input, output}`` summed over its subtree of the re-parented tree, reusing
+  ``langfuse_rollup``'s sum logic but written into the create body — plus
+  ``rollup.duration = {total_ms, components}`` (#128): the subtree wall-clock split by
+  class (``llm_request`` / ``tool`` / ``hook`` / ``script`` / ``step`` / ``wait`` /
+  ``turn`` / ``self`` / ``other``) via exclusive-time attribution, so the components sum
+  to the observed wall-clock. Folded ``blocked_on_user_ms`` and the gate script count as
+  ``wait``; a container's own unattributed gap is ``self`` (inter-turn idle on the root).
+  View B's childless turn-markers are stamped from their pre-flatten View A subtree and
+  excluded from the cycle-axis duration sums — same no-double-count rule as the #114
+  token stamping.
 - **A collapsed loaded-context node.** A SINGLE ``loaded-context`` node under the root —
   static startup inventory is not work, so it does not earn a ~60-leaf timeline subtree.
   Its headline ``metadata.tokens`` is the total startup context tokens (the one number
@@ -1120,7 +1128,166 @@ def _copy_event(
     return {"id": new_id, "type": event_type, "timestamp": start, "body": body}
 
 
-def _apply_container_rollups(events: list[IngestEvent]) -> None:
+_DURATION_CLASSES: tuple[str, ...] = (
+    "llm_request",
+    "tool",
+    "hook",
+    "script",
+    "step",
+    "wait",
+    "turn",
+    "self",
+    "other",
+)
+
+
+def _duration_class(event: IngestEvent) -> str:
+    """Return the duration-attribution class of one assembled node (#128).
+
+    The buckets mirror the issue's split — LLM calls, tool calls, hooks, scripts, cycle
+    steps, human/gate wait, turns — plus ``other`` for anything unclassified. The gate
+    script (``spoke-ready --gate``) is human wait, not script work; the tool-side share of
+    ``wait`` (folded ``blocked_on_user_ms``) is carved out in :func:`_add_duration_components`.
+    """
+    body = event["body"]
+    if event["type"] == "generation-create":
+        return "llm_request"
+    if _is_gate_observation(body):
+        return "wait"
+    name = body.get("name") or ""
+    if name.startswith("step:") or name in (_PRE_STEP_NAME, _POST_STEP_NAME):
+        return "step"
+    if name == _INTERACTION_NAME:
+        return "turn"
+    if name.endswith(".sh") or _attr(body, "workflow.kind") == "hook":
+        return "hook"
+    if name.startswith("script:") or _attr(body, "workflow.kind") == "script":
+        return "script"
+    if _is_tool_span(body):
+        return "tool"
+    return "other"
+
+
+def _subtree_span_ms(
+    node_id: str,
+    by_id: dict[str, Observation],
+    children: dict[str | None, list[str]],
+    exclude: frozenset[str] | set[str],
+) -> int:
+    """Wall-clock span (min start -> max end, ms) over a subtree's timed nodes, 0 when none."""
+    starts: list[str] = []
+    ends: list[str] = []
+    stack = [node_id]
+    while stack:
+        current = stack.pop()
+        if current in exclude:
+            continue
+        body = by_id[current]
+        if body.get("startTime"):
+            starts.append(body["startTime"])
+        if body.get("endTime"):
+            ends.append(body["endTime"])
+        stack.extend(children.get(current, []))
+    if not starts or not ends:
+        return 0
+    return max(0, _elapsed_ms(min(starts), max(ends)) or 0)
+
+
+def _effective_ms(
+    node_id: str,
+    by_id: dict[str, Observation],
+    children: dict[str | None, list[str]],
+    exclude: frozenset[str] | set[str],
+) -> int:
+    """A node's duration for attribution: its own start->end, or its subtree span when untimed.
+
+    The subtree-span fallback lets an untimed container (the synthetic root, an interaction
+    the collector closed without an endTime) still cover its children, so the gap between
+    them surfaces as that container's own time instead of vanishing.
+    """
+    body = by_id[node_id]
+    if body.get("startTime") and body.get("endTime"):
+        return max(0, _elapsed_ms(body["startTime"], body["endTime"]) or 0)
+    return _subtree_span_ms(node_id, by_id, children, exclude)
+
+
+def _add_duration_components(
+    node_id: str,
+    *,
+    root_id: str,
+    by_id: dict[str, Observation],
+    children: dict[str | None, list[str]],
+    class_of: dict[str, str],
+    exclude: frozenset[str] | set[str],
+    components: dict[str, int],
+) -> None:
+    """Add one subtree node's exclusive time to its class bucket, then recurse.
+
+    Exclusive time is the node's effective duration minus its direct children's, clamped
+    >= 0, so every millisecond is attributed to exactly one bucket and the components sum
+    to the subtree wall-clock. The container being rolled up books its own gap under
+    ``self``; a tool's folded ``blocked_on_user_ms`` (#100) is carved out of its exclusive
+    time into ``wait``. Nodes in ``exclude`` (View B turn-markers, whose spans overlap
+    their re-homed former children) contribute nothing and are not subtracted.
+    """
+    if node_id in exclude:
+        return
+    kids = [kid for kid in children.get(node_id, []) if kid not in exclude]
+    own = _effective_ms(node_id, by_id, children, exclude)
+    kids_ms = sum(_effective_ms(kid, by_id, children, exclude) for kid in kids)
+    exclusive = max(0, own - kids_ms)
+    bucket = "self" if node_id == root_id else class_of.get(node_id, "other")
+    if bucket == "tool":
+        blocked = int((by_id[node_id].get("metadata") or {}).get("blocked_on_user_ms") or 0)
+        wait = min(exclusive, max(0, blocked))
+        components["wait"] += wait
+        components["tool"] += exclusive - wait
+    else:
+        components[bucket] += exclusive
+    for kid in kids:
+        _add_duration_components(
+            kid,
+            root_id=root_id,
+            by_id=by_id,
+            children=children,
+            class_of=class_of,
+            exclude=exclude,
+            components=components,
+        )
+
+
+def _duration_rollup(
+    root_id: str,
+    by_id: dict[str, Observation],
+    children: dict[str | None, list[str]],
+    class_of: dict[str, str],
+    exclude: frozenset[str] | set[str],
+) -> dict[str, Any]:
+    """The ``rollup.duration`` object for one container: subtree wall-clock split by class (#128).
+
+    ``total_ms`` is the observed subtree wall-clock; ``components`` attributes every
+    millisecond of it to exactly one class bucket via exclusive time, so on well-formed
+    (nested, non-overlapping) spans ``sum(components.values()) == total_ms``. Malformed
+    timing (a child outliving its parent) can push a bucket past the total but never
+    below zero.
+    """
+    components = dict.fromkeys(_DURATION_CLASSES, 0)
+    _add_duration_components(
+        root_id,
+        root_id=root_id,
+        by_id=by_id,
+        children=children,
+        class_of=class_of,
+        exclude=exclude,
+        components=components,
+    )
+    total = _effective_ms(root_id, by_id, children, exclude)
+    return {"total_ms": total, "components": components}
+
+
+def _apply_container_rollups(
+    events: list[IngestEvent], *, duration_exclude: frozenset[str] | set[str] = frozenset()
+) -> None:
     """Set ``metadata.rollup`` on every container node of the assembled tree, in place.
 
     A container is any node with children once the tree is re-parented (the synthetic
@@ -1128,19 +1295,28 @@ def _apply_container_rollups(events: list[IngestEvent]) -> None:
     sum of the four usage components over itself and all descendants, computed from the
     create-body shapes (``id`` / ``parentObservationId`` / ``usageDetails``) — the same
     sum logic as :mod:`telemetry.langfuse_rollup`, but written into the create body
-    rather than patched. Leaves (tools, single generations) are left untouched.
+    rather than patched — plus the ``duration`` wall-clock split (#128,
+    :func:`_duration_rollup`). Leaves (tools, single generations) are left untouched.
 
     Args:
         events: The assembled ingestion events; only ``*-create`` span/generation bodies
             participate (the ``trace-create`` is skipped). Mutated in place.
+        duration_exclude: Node ids that must not contribute duration (View B's flattened
+            turn-markers — their spans overlap their re-homed former children).
     """
-    nodes = [event["body"] for event in events if event["type"] != "trace-create"]
-    by_id, children = build_tree(nodes)
-    for body in nodes:
+    nodes = [event for event in events if event["type"] != "trace-create"]
+    bodies = [event["body"] for event in nodes]
+    by_id, children = build_tree(bodies)
+    class_of = {event["body"]["id"]: _duration_class(event) for event in nodes}
+    for body in bodies:
         if not children.get(body["id"]):
             continue  # only containers (those with children) carry a rollup
         totals = subtree_totals(body["id"], by_id, children)
-        body.setdefault("metadata", {})["rollup"] = rollup_metadata(totals)
+        rollup: dict[str, Any] = dict(rollup_metadata(totals))
+        rollup["duration"] = _duration_rollup(
+            body["id"], by_id, children, class_of, duration_exclude
+        )
+        body.setdefault("metadata", {})["rollup"] = rollup
 
 
 def _earliest_start(traces: list[TraceObservations]) -> str:
@@ -1765,16 +1941,19 @@ def _apply_cycle_axis(
     trace_id: str,
     base_ts: str,
     latest: str,
-) -> tuple[list[IngestEvent], list[IngestEvent]]:
+) -> tuple[list[IngestEvent], list[IngestEvent], set[str]]:
     """Re-home the copies onto the cycle axis and build its nodes (#113 View B, #114 turn markers).
 
     Remaps every copy into the cycle id namespace, flattens the top-level interactions from
     containers to childless leaf markers (their children land on the axis by their own time; the
     marker itself lands in the step window of its own start), and parents each copy via
     :func:`_resolve_cycle_parent`. Each flattened marker is stamped with its turn's
-    ``metadata.rollup`` — the sum of its pre-flatten View A subtree — so the per-turn token/cost
-    total stays readable even though the marker is now childless (#114). Returns
-    ``(cycle_copies, step_events)``; the copies are mutated in place.
+    ``metadata.rollup`` — the token sum AND ``duration`` split of its pre-flatten View A subtree
+    (#114, #128) — so the per-turn cost/latency total stays readable even though the marker is
+    now childless. Returns ``(cycle_copies, step_events, marker_ids)``; the copies are mutated
+    in place, and ``marker_ids`` (the flattened markers' cycle-namespace ids) must be excluded
+    from the cycle-axis duration attribution — a marker's span overlaps its former children,
+    now its step siblings.
     """
     interaction_start: dict[str, str | None] = {
         _copy_id(orig_trace_id, observation["id"]): observation.get("startTime")
@@ -1803,9 +1982,12 @@ def _apply_cycle_axis(
     # is kept as metadata.rollup, not usageDetails, so the marker's former children — now its step
     # siblings — are not double-counted in the step/root rollups (subtree_totals sums usageDetails).
     a_by_id, a_children = build_tree([event["body"] for event in copies])
-    turn_rollup = {
-        iid: rollup_metadata(subtree_totals(iid, a_by_id, a_children)) for iid in flattened
-    }
+    a_class = {event["body"]["id"]: _duration_class(event) for event in copies}
+    turn_rollup: dict[str, dict[str, Any]] = {}
+    for iid in flattened:
+        rollup: dict[str, Any] = dict(rollup_metadata(subtree_totals(iid, a_by_id, a_children)))
+        rollup["duration"] = _duration_rollup(iid, a_by_id, a_children, a_class, frozenset())
+        turn_rollup[iid] = rollup
     kept: list[IngestEvent] = []
     for event in copies:
         body = event["body"]
@@ -1829,7 +2011,7 @@ def _apply_cycle_axis(
         if orig_id in flattened:
             body.setdefault("metadata", {})["rollup"] = turn_rollup[orig_id]
         kept.append(event)
-    return kept, step_events
+    return kept, step_events, {_cycle_copy_id(iid) for iid in flattened}
 
 
 def build_cycle_batch(
@@ -1904,7 +2086,7 @@ def build_cycle_batch(
         root_event=root_event,
     )
     windows = build_step_windows(traces, tool_content)
-    copies, step_events = _apply_cycle_axis(
+    copies, step_events, marker_ids = _apply_cycle_axis(
         copies,
         traces,
         windows,
@@ -1916,7 +2098,7 @@ def build_cycle_batch(
         latest=_latest_time(traces),
     )
     events = [trace_event, root_event, *step_events, *copies]
-    _apply_container_rollups(events)
+    _apply_container_rollups(events, duration_exclude=marker_ids)
     return events
 
 

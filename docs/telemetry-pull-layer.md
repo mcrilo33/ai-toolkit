@@ -80,6 +80,34 @@ not record it). They are backfilled from a session-peer push span — within one
 session every span belongs to the same spoke run. Spans with no `spoke_run_id`
 and no session match are ad-hoc and group under `None`.
 
+## Duration rollup in the assembled spoke tree (Issue #128)
+
+`langfuse_spoke_tree.py` stamps every container node of both assembled views with
+`metadata.rollup.duration = {total_ms, components}` alongside the token rollup.
+`total_ms` is the observed subtree wall-clock (the container's own `start → end`, or
+its subtree span when untimed — which is how the synthetic root covers the whole
+spoke). `components` attributes every millisecond to exactly one class bucket via
+exclusive time (a node's duration minus its direct children's, clamped ≥ 0), so on
+well-formed spans the components sum to `total_ms`:
+
+| Bucket | What lands in it |
+|--------|------------------|
+| `llm_request` | Generations (`claude_code.llm_request`). |
+| `tool` | `tool:*` spans, minus their folded `blocked_on_user_ms`. |
+| `hook` | `*.sh` spans / `workflow.kind == hook`. |
+| `script` | `workflow.kind == script` spans (`script:worktree-land`, `script:spoke-push`, …). |
+| `step` | Cycle-step nodes' own gap time (step overhead not covered by real spans). |
+| `wait` | Human/gate wait: folded `blocked_on_user_ms` + the gate script (`script:gate`). |
+| `turn` | Interactions' own gap (thinking/streaming outside child spans). |
+| `self` | The container's own unattributed gap — inter-turn idle on the root. |
+| `other` | Anything unclassified; untimed nodes contribute 0. |
+
+Same leaf-marker rule as the #114 token stamping: View B's childless turn-markers
+carry a `duration` computed from their pre-flatten View A subtree and are excluded
+from the cycle-axis sums (their span overlaps their re-homed former children).
+Rebuilds are idempotent — `fetch_session` excludes the synthesizer's own prior
+output, so durations never double-count.
+
 ## Verification notes and follow-ups
 
 - **Timestamps** — every `user` and `assistant` record (the ones bracketed)

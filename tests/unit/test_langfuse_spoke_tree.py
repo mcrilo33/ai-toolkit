@@ -1135,7 +1135,13 @@ class TestContainerRollups:
         batch = build_batch(_traces(), SPOKE)
 
         rollup = _by_orig(batch, "trace-int", "i1")["body"]["metadata"]["rollup"]
-        assert rollup == {"reused": 900, "written": 300, "input": 120, "output": 45}
+        assert rollup == {
+            "reused": 900,
+            "written": 300,
+            "input": 120,
+            "output": 45,
+            "duration": _dur(1_000, {"llm_request": 1_000}),
+        }
 
     def test_synthetic_root_rolls_up_the_whole_tree(self) -> None:
         batch = build_batch(_traces(), SPOKE)
@@ -1146,6 +1152,7 @@ class TestContainerRollups:
             "written": 300,
             "input": 120,
             "output": 45,
+            "duration": _dur(1_000, {"llm_request": 1_000}),
         }
 
     def test_leaf_generation_keeps_metadata_verbatim_without_rollup(self) -> None:
@@ -1202,6 +1209,7 @@ class TestContainerRollups:
             "written": 2,
             "input": 10,
             "output": 4,
+            "duration": _dur(0),
         }
 
 
@@ -3482,6 +3490,7 @@ class TestCycleView:
             "written": 0,
             "input": 1200,
             "output": 340,
+            "duration": _dur(40_000, {"tool": 4_000, "llm_request": 1_000, "self": 35_000}),
         }
 
     def test_interaction_leaf_rollup_is_not_double_counted_in_root(self) -> None:
@@ -3500,6 +3509,7 @@ class TestCycleView:
             "written": 0,
             "input": 1200,
             "output": 340,
+            "duration": _dur(40_000, {"tool": 4_000, "llm_request": 1_000, "step": 35_000}),
         }
 
     def test_interaction_leaf_carries_turn_duration_rollup(self) -> None:
