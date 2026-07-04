@@ -18,6 +18,12 @@
 # test is visible to the commit-time nudge before it is committed; the cache is
 # neither consulted nor overwritten then.
 #
+# Known assumption: the scan reads the WORKING TREE while the key names the
+# HEAD:tests tree, and a gitignored test_*.py is invisible to the clean check —
+# such a file could leak into a cache shared across worktrees. The direction is
+# over-mapping (extra tests selected), never skipping, so it is accepted rather
+# than paying `git check-ignore` on every scan.
+#
 # Functions operate on the repo at $PWD (test-select.sh runs at the repo root;
 # other callers cd in a subshell first). Lookups never fail the caller: any
 # git trouble degrades to a fresh scan, and a missing tests/ yields an empty
@@ -33,7 +39,11 @@ _reverse_index_scan() {
   [ -d tests ] || return 0
   local f
   while IFS= read -r f; do
-    grep -ohE '[A-Za-z0-9_][A-Za-z0-9_.-]*\.[A-Za-z0-9]+|Dockerfile|Makefile' "$f" 2>/dev/null \
+    # `|| true`: a token-less test file makes grep exit 1, which under a
+    # caller's `set -euo pipefail` would abort the scan at that file and
+    # silently truncate the map — the one direction this lib must never fail.
+    { grep -ohE '[A-Za-z0-9_][A-Za-z0-9_.-]*\.[A-Za-z0-9]+|Dockerfile|Makefile' "$f" 2>/dev/null \
+      || true; } \
       | sort -u \
       | while IFS= read -r tok; do printf '%s\t%s\n' "$tok" "$f"; done
   done < <(find tests -type f -name 'test_*.py' 2>/dev/null | sort)

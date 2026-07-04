@@ -176,6 +176,39 @@ def test_reference_in_non_test_file_does_not_count(repo: Path) -> None:
     assert _lookup(repo, "scripts/tool.sh") == []
 
 
+def test_lookup_survives_tokenless_test_file_under_pipefail(repo: Path) -> None:
+    # A test file containing no filename-shaped token makes the scanner's grep
+    # exit 1; under test-select.sh's `set -euo pipefail` that must neither abort
+    # the lookup nor truncate the map at that file (subtask A review finding).
+    _write(repo, "tests/unit/test_aaa.py", 'S = SCRIPTS / "shared.sh"\n')
+    _write(repo, "tests/unit/test_mmm.py", "def test_it():\n    assert 1 + 1 == 2\n")
+    _write(repo, "tests/unit/test_zzz.py", '"""Covers scripts/shared.sh too."""\n')
+    _write(repo, "scripts/shared.sh", "#!/bin/sh\n")
+    _commit_all(repo)
+    # Dirty tests/ forces the inline fresh-scan path — the exposed one.
+    _write(repo, "tests/unit/test_new.py", "def test_more():\n    pass\n")
+
+    proc = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'set -euo pipefail; source "{LIB}" && reverse_index_tests_for "$1"',
+            "_",
+            "scripts/shared.sh",
+        ],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env=_GIT_ENV,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert [line for line in proc.stdout.splitlines() if line] == [
+        "tests/unit/test_aaa.py",
+        "tests/unit/test_zzz.py",
+    ]
+
+
 # --- the cache: keyed on the tree hash of tests/, shared via git-common-dir ------
 
 
