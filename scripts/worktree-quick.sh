@@ -142,7 +142,12 @@ echo "→ granted hub-guard bypass (hub-guard-allow) for hub-session commits"
 
 # --- telemetry: spawn lifecycle marker + script run-node ---------------------
 # Attributed to the new worktree (emitted with it as CWD), carrying the
-# spoke_run_id minted above. No-op unless AI_TOOLKIT_TELEMETRY=1.
+# spoke_run_id minted above. No-op unless AI_TOOLKIT_TELEMETRY=1 — except the
+# OTLP fan-out: resolving Langfuse auth here (issue #127; env first, then the
+# shared ~/.afk-telemetry conf) exports the span endpoint, so the pair below
+# reaches the collector from any hub session. Best-effort by contract: an
+# unresolvable auth exports nothing and never fails the spawn.
+wt_resolve_langfuse_auth || true
 wt_emit_lifecycle "worktree-quick" "spawn" "success" "$WT_T0" "$WT_DIR"
 wt_emit_script "worktree-quick" "success" "$WT_T0" "$WT_DIR"
 
