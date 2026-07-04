@@ -547,6 +547,10 @@ _OTEL_CONTENT_FLAGS = (
 _OTEL_ENDPOINT_DEFAULTS = (
     "OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317",
     "BETA_TRACING_ENDPOINT=http://localhost:4418",
+    # Workflow-span sink (#126): telemetry.sh's second OTLP fan-out posts HTTP-JSON
+    # to $AI_TOOLKIT_OTEL_SPAN_ENDPOINT/v1/traces, so its default is the collector's
+    # OTLP-HTTP listener — not the gRPC :4317 the native stream uses.
+    "AI_TOOLKIT_OTEL_SPAN_ENDPOINT=http://localhost:4318",
 )
 
 
@@ -584,6 +588,7 @@ def test_agent_launch_omits_otel_env_when_disabled(hub: Path, tmp_path: Path) ->
         "OTEL_RESOURCE_ATTRIBUTES=",
         "OTEL_EXPORTER_OTLP_ENDPOINT=",
         "BETA_TRACING_ENDPOINT=",
+        "AI_TOOLKIT_OTEL_SPAN_ENDPOINT=",
     )
     for var in absent:
         assert var not in new_window[0], f"{var} must be absent when AI_TOOLKIT_OTEL=0"
@@ -686,6 +691,33 @@ def test_agent_launch_wires_beta_tracing_endpoint(hub: Path, tmp_path: Path) -> 
     assert new_window, "expected a new-window invocation"
     assert "ENABLE_BETA_TRACING_DETAILED=1" in new_window[0], "detailed flag must be wired"
     assert f"BETA_TRACING_ENDPOINT={beta_endpoint}" in new_window[0], (
+        "operator override must be wired"
+    )
+
+
+def test_agent_launch_wires_workflow_span_endpoint_override(hub: Path, tmp_path: Path) -> None:
+    # AI_TOOLKIT_OTEL_SPAN_ENDPOINT is the workflow-span family's sink (#126): the
+    # cycle step:/script/hook spans telemetry.sh emits are gated on it, and no launch
+    # path exported it — the family was built but unplugged. Like the sibling
+    # endpoints it is a non-secret URL: defaulted when unset (asserted via
+    # _OTEL_ENDPOINT_DEFAULTS in the launch tests), operator override preserved here.
+    operator_span_endpoint = "http://collector.internal:4318"
+    proc, log = _run_new(
+        hub,
+        tmp_path,
+        "8",
+        "some-slug",
+        "--no-code",
+        extra_env={
+            "AI_TOOLKIT_OTEL": "1",
+            "AI_TOOLKIT_OTEL_SPAN_ENDPOINT": operator_span_endpoint,
+        },
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    assert f"AI_TOOLKIT_OTEL_SPAN_ENDPOINT={operator_span_endpoint}" in new_window[0], (
         "operator override must be wired"
     )
 

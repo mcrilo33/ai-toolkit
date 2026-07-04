@@ -310,6 +310,9 @@ fi
 # The connection ENDPOINTS are non-secret URLs, so to auto-populate Langfuse with no
 # manual step they ARE wired: defaulted to the local collector when the operator
 # left them unset, and an operator override is preserved verbatim (see below).
+# The same treatment covers AI_TOOLKIT_OTEL_SPAN_ENDPOINT (#126): telemetry.sh's
+# workflow-span fan-out (cycle step:/script/hook spans) POSTs to it over OTLP-HTTP,
+# so it defaults to the collector's :4318 listener and rides the same gate.
 #
 # Off-box CONTENT (auto-populate): OTEL_LOG_USER_PROMPTS / OTEL_LOG_TOOL_DETAILS /
 # OTEL_LOG_TOOL_CONTENT ship the user prompts and per-tool input/output off the
@@ -370,10 +373,14 @@ if [ "${AI_TOOLKIT_OTEL:-}" = "1" ]; then
   # since a beta endpoint sharing the normal host:port silently kills trace+log export.
   : "${OTEL_EXPORTER_OTLP_ENDPOINT:=http://localhost:4317}"
   : "${BETA_TRACING_ENDPOINT:=http://localhost:4418}"
+  # Workflow-span sink (#126): telemetry.sh's cycle step:/script/hook spans POST
+  # OTLP HTTP-JSON to $AI_TOOLKIT_OTEL_SPAN_ENDPOINT/v1/traces, so this one targets
+  # the collector's OTLP-HTTP listener (:4318), not the gRPC :4317 above.
+  : "${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:=http://localhost:4318}"
   # NB: the trailing space is load-bearing — it separates the prefix from the
   # WT_SPOKE pin that AGENT_CMD appends immediately after it. The auth header
   # (OTEL_EXPORTER_OTLP_HEADERS) is deliberately NOT here — it stays inherited env.
-  OTEL_PREFIX="CLAUDE_CODE_ENABLE_TELEMETRY=1 CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 OTEL_TRACES_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp ENABLE_BETA_TRACING_DETAILED=1 OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false OTEL_EXPORTER_OTLP_PROTOCOL=grpc OTEL_EXPORTER_OTLP_ENDPOINT=$(printf '%q' "$OTEL_EXPORTER_OTLP_ENDPOINT") BETA_TRACING_ENDPOINT=$(printf '%q' "$BETA_TRACING_ENDPOINT") OTEL_LOG_USER_PROMPTS=1 OTEL_LOG_TOOL_DETAILS=1 OTEL_LOG_TOOL_CONTENT=1 OTEL_LOG_RAW_API_BODIES=$(printf '%q' "file:${OTEL_BODY_DIR}") AI_TOOLKIT_OTEL_BODY_DIR=$(printf '%q' "$OTEL_BODY_DIR") OTEL_RESOURCE_ATTRIBUTES=$(printf '%q' "spoke_run_id=${SPOKE_RUN_ID}") "
+  OTEL_PREFIX="CLAUDE_CODE_ENABLE_TELEMETRY=1 CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 OTEL_TRACES_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp ENABLE_BETA_TRACING_DETAILED=1 OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false OTEL_EXPORTER_OTLP_PROTOCOL=grpc OTEL_EXPORTER_OTLP_ENDPOINT=$(printf '%q' "$OTEL_EXPORTER_OTLP_ENDPOINT") BETA_TRACING_ENDPOINT=$(printf '%q' "$BETA_TRACING_ENDPOINT") AI_TOOLKIT_OTEL_SPAN_ENDPOINT=$(printf '%q' "$AI_TOOLKIT_OTEL_SPAN_ENDPOINT") OTEL_LOG_USER_PROMPTS=1 OTEL_LOG_TOOL_DETAILS=1 OTEL_LOG_TOOL_CONTENT=1 OTEL_LOG_RAW_API_BODIES=$(printf '%q' "file:${OTEL_BODY_DIR}") AI_TOOLKIT_OTEL_BODY_DIR=$(printf '%q' "$OTEL_BODY_DIR") OTEL_RESOURCE_ATTRIBUTES=$(printf '%q' "spoke_run_id=${SPOKE_RUN_ID}") "
 fi
 AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(printf '%q' "${WT_AGENT_EFFORT:-max}") claude --model $(printf '%q' "${WT_AGENT_MODEL:-claude-fable-5[1m]}")"
 # Best-effort in-process budget cap for unattended spokes. A caller may set

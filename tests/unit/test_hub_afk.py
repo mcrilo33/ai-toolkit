@@ -2156,6 +2156,39 @@ def test_afk_resume_command_inline_exports_otel_for_collector(tmp_path: Path) ->
     assert "spoke_run_id=feature/5-x+1700000000" in cmd
 
 
+def test_afk_resume_command_inline_exports_workflow_span_endpoint(tmp_path: Path) -> None:
+    # #126 resume parity: telemetry.sh's workflow-span family (cycle step:/script/
+    # hook spans) is gated on AI_TOOLKIT_OTEL_SPAN_ENDPOINT, which worktree-new.sh
+    # exports at spawn — but a resumed window rebuilds its env from scratch, so the
+    # resume command must re-export it too or the revived spoke's workflow spans
+    # silently stop. Default: the collector's OTLP-HTTP listener (:4318, not the
+    # gRPC :4317 the native stream uses).
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
+    (spoke / ".ai-toolkit" / "spoke-run-id").write_text("feature/5-x+1700000000\n")
+
+    result = _call(f"_afk_resume_command '{spoke}' 5")
+
+    assert result.returncode == 0, result.stderr
+    assert "AI_TOOLKIT_OTEL_SPAN_ENDPOINT=http://localhost:4318" in result.stdout
+
+
+def test_afk_resume_command_preserves_span_endpoint_override(tmp_path: Path) -> None:
+    # An operator-set AI_TOOLKIT_OTEL_SPAN_ENDPOINT rides through verbatim, same
+    # override-preserved contract as the sibling OTLP endpoint above.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
+    (spoke / ".ai-toolkit" / "spoke-run-id").write_text("feature/5-x+1700000000\n")
+
+    result = _call(
+        f"_afk_resume_command '{spoke}' 5",
+        env={"AI_TOOLKIT_OTEL_SPAN_ENDPOINT": "http://collector.internal:4318"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "AI_TOOLKIT_OTEL_SPAN_ENDPOINT=http://collector.internal:4318" in result.stdout
+
+
 def test_reap_pass_resumes_pane_dead_spoke_with_commits(tmp_path: Path) -> None:
     spoke = _branched_spoke(tmp_path, ahead=True)
     fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
