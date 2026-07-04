@@ -963,3 +963,73 @@ def test_missing_reverse_index_lib_degrades_to_full(repo: Path, tmp_path: Path) 
 
     assert proc.returncode == 0, proc.stderr
     assert "RUN \n" in _runlog(runlog)  # today's behavior, unchanged
+
+
+# --- the enforcement meta-test rides every pytest-running tier (#123) ------------
+
+META_NODE = "tests/unit/test_test_reverse_index.py::TestControlPlaneCoverage"
+
+
+def _write_meta_stub(repo: Path) -> None:
+    """The meta-test file existing is what arms the append in fixture repos."""
+    path = repo / "tests/unit/test_test_reverse_index.py"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("class TestControlPlaneCoverage:\n    def test_ok(self):\n        pass\n")
+
+
+def test_selected_tier_appends_meta_test(repo: Path, tmp_path: Path) -> None:
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    _write_meta_stub(repo)
+    base = _commit(repo, {}, "test: seed referencing tests")
+    tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert f"RUN tests/unit/test_do.py {META_NODE}\n" in _runlog(runlog)
+
+
+def test_python_tier_appends_meta_test_invocation(repo: Path, tmp_path: Path) -> None:
+    _write_meta_stub(repo)
+    base = _commit(repo, {}, "test: seed meta test")
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    log = _runlog(runlog)
+    assert "RUN --testmon\n" in log
+    assert f"RUN {META_NODE}\n" in log  # separate invocation, never inside --testmon
+
+
+def test_python_tier_without_meta_file_appends_nothing(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "TestControlPlaneCoverage" not in _runlog(runlog)  # synced repos unaffected
+
+
+def test_full_tier_does_not_append_meta_test(repo: Path, tmp_path: Path) -> None:
+    # The full suite already contains the meta-test; a second invocation would
+    # double-run it.
+    _write_meta_stub(repo)
+    base = _commit(repo, {}, "test: seed meta test")
+    tip = _commit(repo, {"scripts/unmapped.sh": "echo hi\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    log = _runlog(runlog)
+    assert "RUN \n" in log
+    assert "TestControlPlaneCoverage" not in log

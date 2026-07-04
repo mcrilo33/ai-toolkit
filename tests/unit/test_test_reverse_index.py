@@ -266,3 +266,79 @@ def test_repo_without_tests_dir_degrades_to_empty(repo: Path) -> None:
     _commit_all(repo)
 
     assert _lookup(repo, "scripts/tool.sh") == []
+
+
+# --- the enforcement meta-test: every control-plane script has a test (#123) ------
+# These run against the REAL repo tree — they ARE the enforcement loop: an
+# unmapped control-plane script escalates the push to the full suite, the full
+# suite contains this class, and this class stays red until a referencing test
+# exists. Unmapped can exist locally but can never land.
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CONTROL_PLANE_DIRS = ("scripts", "shared/hooks", "dashboard/langfuse")
+CONTROL_PLANE_GLOB_DIRS = ("shared/skills/*/scripts",)
+CONTROL_PLANE_SUFFIXES = (".sh", ".yml", ".yaml")
+EXEMPT_LIST = REPO_ROOT / ".test-select-exempt"
+
+
+def _control_plane_files() -> list[Path]:
+    dirs = [REPO_ROOT / d for d in CONTROL_PLANE_DIRS]
+    for pattern in CONTROL_PLANE_GLOB_DIRS:
+        dirs.extend(REPO_ROOT.glob(pattern))
+    return sorted(
+        f
+        for d in dirs
+        if d.is_dir()
+        for f in d.rglob("*")
+        if f.is_file() and f.suffix in CONTROL_PLANE_SUFFIXES
+    )
+
+
+def _exempt_entries() -> list[str]:
+    if not EXEMPT_LIST.is_file():
+        return []
+    entries = []
+    for raw in EXEMPT_LIST.read_text().splitlines():
+        entry = raw.split("#", 1)[0].strip().rstrip("/")
+        if entry:
+            entries.append(entry)
+    return entries
+
+
+def _is_exempt(rel: str, entries: list[str]) -> bool:
+    return any(rel == e or rel.startswith(e + "/") for e in entries)
+
+
+def _scan_real_map_tokens() -> set[str]:
+    """Dump the real tree's map via the SAME lib the selector uses."""
+    proc = subprocess.run(
+        ["bash", "-c", f'source "{LIB}" && _reverse_index_scan'],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        env=_GIT_ENV,
+        check=True,
+    )
+    return {line.split("\t", 1)[0] for line in proc.stdout.splitlines() if "\t" in line}
+
+
+class TestControlPlaneCoverage:
+    def test_every_control_plane_script_is_referenced_or_exempt(self) -> None:
+        tokens = _scan_real_map_tokens()
+        entries = _exempt_entries()
+        unmapped = [
+            str(f.relative_to(REPO_ROOT))
+            for f in _control_plane_files()
+            if f.name not in tokens
+            and not _is_exempt(str(f.relative_to(REPO_ROOT)), entries)
+        ]
+        assert unmapped == [], (
+            "control-plane files with no referencing test: "
+            + ", ".join(unmapped)
+            + " — add a tests/**/test_*.py referencing each (or, only for a file "
+            "with legitimately no test surface, a .test-select-exempt entry)"
+        )
+
+    def test_exempt_entries_exist_on_disk(self) -> None:
+        stale = [e for e in _exempt_entries() if not (REPO_ROOT / e).exists()]
+        assert stale == [], f".test-select-exempt names missing paths: {stale}"
