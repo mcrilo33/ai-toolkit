@@ -202,6 +202,26 @@ def test_rejects_unknown_type(hub: Path, tmp_path: Path) -> None:
     assert "type" in proc.stderr.lower()
 
 
+# --- no inherited upstream (issue #120) ------------------------------------------
+
+
+def test_quick_branch_has_no_upstream(hub: Path, tmp_path: Path) -> None:
+    # Branching from origin/<base> must not auto-set it as upstream: a quick
+    # branch is never pushed, and an inherited upstream trips the
+    # worktree-land.sh --local micro-spoke guard (issue #120).
+    proc, _ = _run_quick(hub, tmp_path, "fix-typo")
+
+    assert proc.returncode == 0, proc.stderr
+    upstream = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "@{upstream}"],
+        cwd=str(_worktree_dir(hub, "fix-typo")),
+        capture_output=True,
+        text=True,
+        env=_GIT_ENV,
+    )
+    assert upstream.returncode != 0, f"expected no upstream, got: {upstream.stdout.strip()}"
+
+
 # --- configurable base branch (issue #117) --------------------------------------
 
 
