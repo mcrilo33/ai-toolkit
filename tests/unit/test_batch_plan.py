@@ -31,11 +31,19 @@ BATCH_PLAN = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "batch-plan.s
 SKILLS_DIR = REPO_ROOT / "shared" / "skills"
 
 
-def _node(number: int, scope: str | None, blocked_by: list[tuple[int, str]] | None = None) -> dict:
+def _node(
+    number: int,
+    scope: str | None,
+    blocked_by: list[tuple[int, str]] | None = None,
+    *,
+    split: str | None = None,
+) -> dict:
     """Build one graphql issue node: a Scope: body + blockedBy nodes (number, state)."""
     body = "Some description.\n"
     if scope is not None:
         body += f"Scope: {scope}\n"
+    if split is not None:
+        body += f"Split: {split}\n"
     nodes = [{"number": n, "state": s} for n, s in (blocked_by or [])]
     return {"number": number, "body": body, "blockedBy": {"nodes": nodes}}
 
@@ -255,6 +263,63 @@ def test_merge_candidates_label_exclusive_scope_chains() -> None:
 
     assert "merge candidates: #1 → #2" in proc.stderr
     assert "exclusive scope" in proc.stderr
+
+
+# ── Split: intentional — the reviewable escape hatch silences the lint ────────
+
+
+def test_split_marker_suppresses_the_chain_warning() -> None:
+    # A deliberate split records its reasoning in the issue body and is not nagged.
+    nodes = [
+        _node(1, "a.py", split="intentional — mid-chain rollback line"),
+        _node(2, "a.py", blocked_by=[(1, "OPEN")]),
+    ]
+
+    proc = _run_plan(nodes)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "merge candidates" not in proc.stderr
+
+
+def test_split_marker_in_any_chain_member_suppresses() -> None:
+    # The marker works from ANY issue of the chain, not just the head.
+    nodes = [
+        _node(1, "a.py"),
+        _node(2, "a.py", blocked_by=[(1, "OPEN")], split="intentional — standalone value"),
+    ]
+
+    proc = _run_plan(nodes)
+
+    assert "merge candidates" not in proc.stderr
+
+
+def test_split_marker_suppresses_only_its_own_chain() -> None:
+    # Two colliding chains, one marked: the other must still warn.
+    nodes = [
+        _node(1, "a.py", split="intentional — shelf-life"),
+        _node(2, "a.py", blocked_by=[(1, "OPEN")]),
+        _node(11, "b.py"),
+        _node(12, "b.py", blocked_by=[(11, "OPEN")]),
+    ]
+
+    proc = _run_plan(nodes)
+
+    warnings = [line for line in proc.stderr.splitlines() if "merge candidates" in line]
+    assert len(warnings) == 1
+    assert "#11 → #12" in warnings[0]
+    assert "#1" not in warnings[0]
+
+
+def test_split_marker_requires_intentional_value() -> None:
+    # Only the documented `Split: intentional` form suppresses — not any Split: line.
+    nodes = [
+        _node(1, "a.py", split="maybe"),
+        _node(2, "a.py", blocked_by=[(1, "OPEN")]),
+    ]
+
+    proc = _run_plan(nodes)
+
+    assert "merge candidates: #1 → #2" in proc.stderr
 
 
 # ── tie-break: equal depth ⇒ more direct dependents wins ──────────────────────
