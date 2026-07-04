@@ -26,33 +26,50 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BATCH_PLAN = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "batch-plan.sh"
 SKILLS_DIR = REPO_ROOT / "shared" / "skills"
 
 
-def _node(number: int, scope: str | None, blocked_by: list[tuple[int, str]] | None = None) -> dict:
+def _node(
+    number: int,
+    scope: str | None,
+    blocked_by: list[tuple[int, str]] | None = None,
+    *,
+    split: str | None = None,
+) -> dict:
     """Build one graphql issue node: a Scope: body + blockedBy nodes (number, state)."""
     body = "Some description.\n"
     if scope is not None:
         body += f"Scope: {scope}\n"
+    if split is not None:
+        body += f"Split: {split}\n"
     nodes = [{"number": n, "state": s} for n, s in (blocked_by or [])]
     return {"number": number, "body": body, "blockedBy": {"nodes": nodes}}
 
 
-def _plan(nodes: list[dict], *, inflight: list[str] | None = None) -> list[int]:
-    """Pipe a fixture graph into plan_from_json and return the batch as issue numbers."""
+def _run_plan(
+    nodes: list[dict], *, inflight: list[str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Pipe a fixture graph into plan_from_json and return the completed process."""
     env = {**os.environ}
     args = ""
     for spoke in inflight or []:
         args += f" --inflight {json_quote(spoke)}"
-    proc = subprocess.run(
+    return subprocess.run(
         ["bash", "-c", f'source "{BATCH_PLAN}"; plan_from_json{args}'],
         input=json.dumps(nodes),
         capture_output=True,
         text=True,
         env=env,
     )
+
+
+def _plan(nodes: list[dict], *, inflight: list[str] | None = None) -> list[int]:
+    """Pipe a fixture graph into plan_from_json and return the batch as issue numbers."""
+    proc = _run_plan(nodes, inflight=inflight)
     assert proc.returncode == 0, proc.stderr
     return [int(tok) for tok in proc.stdout.split()]
 
@@ -150,6 +167,190 @@ def test_inflight_exclusive_spoke_blocks_the_whole_batch() -> None:
     assert batch == []
 
 
+# ── merge-candidate lint: colliding-scope serialized chains warn (issue #125) ─
+
+
+def test_merge_candidates_warn_for_colliding_open_chain() -> None:
+    # #2 is blockedBy #1 and both touch a.py — strictly serialized, zero parallelism.
+    nodes = [_node(1, "a.py"), _node(2, "a.py", blocked_by=[(1, "OPEN")])]
+
+    proc = _run_plan(nodes)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "merge candidates: #1 → #2" in proc.stderr
+    assert "a.py" in proc.stderr
+
+
+def test_merge_candidates_silent_for_disjoint_chain() -> None:
+    # The acceptance chain #1 → #2 → #3 has disjoint scopes (a.py, b.py, c.py).
+    proc = _run_plan(_acceptance_graph())
+
+    assert proc.returncode == 0, proc.stderr
+    assert "merge candidates" not in proc.stderr
+
+
+def test_merge_candidates_chain_coalesces_into_one_line() -> None:
+    # A three-issue colliding chain prints ONE proposal line, not one per edge.
+    nodes = [
+        _node(1, "a.py"),
+        _node(2, "a.py", blocked_by=[(1, "OPEN")]),
+        _node(3, "a.py", blocked_by=[(2, "OPEN")]),
+    ]
+
+    proc = _run_plan(nodes)
+
+    warnings = [line for line in proc.stderr.splitlines() if "merge candidates" in line]
+    assert len(warnings) == 1
+    assert "#1 → #2 → #3" in warnings[0]
+
+
+def test_merge_candidates_never_alter_batch_or_exit_code() -> None:
+    # The lint is detection-only: same batch and exit code as the silent case.
+    nodes = [_node(1, "a.py"), _node(2, "a.py", blocked_by=[(1, "OPEN")])]
+
+    proc = _run_plan(nodes)
+
+    assert proc.returncode == 0
+    assert [int(tok) for tok in proc.stdout.split()] == [1]
+
+
+def test_merge_candidates_ignore_closed_blockers() -> None:
+    # A closed blocker is already satisfied — no serialized chain left to merge.
+    # (The OPEN-only fetch never carries closed issues, so the blocker is absent
+    # from the payload by construction — exactly the shape production sees.)
+    nodes = [_node(7, "x.py", blocked_by=[(100, "CLOSED")])]
+
+    proc = _run_plan(nodes)
+
+    assert "merge candidates" not in proc.stderr
+
+
+def test_merge_candidates_report_disjoint_chains_separately_and_ordered() -> None:
+    # Two unrelated colliding chains ⇒ two lines, lowest component member first
+    # regardless of input order (deterministic content-based ordering).
+    nodes = [
+        _node(11, "b.py"),
+        _node(12, "b.py", blocked_by=[(11, "OPEN")]),
+        _node(2, "a.py"),
+        _node(3, "a.py", blocked_by=[(2, "OPEN")]),
+    ]
+
+    proc = _run_plan(nodes)
+
+    warnings = [line for line in proc.stderr.splitlines() if "merge candidates" in line]
+    assert len(warnings) == 2
+    assert "#2 → #3" in warnings[0]
+    assert "#11 → #12" in warnings[1]
+
+
+def test_merge_candidates_terminate_on_blockedby_cycle() -> None:
+    # A malformed mutual blocked-by must not hang or crash the lint.
+    nodes = [
+        _node(1, "a.py", blocked_by=[(2, "OPEN")]),
+        _node(2, "a.py", blocked_by=[(1, "OPEN")]),
+    ]
+
+    proc = _run_plan(nodes)
+
+    assert proc.returncode == 0, proc.stderr
+    warnings = [line for line in proc.stderr.splitlines() if "merge candidates" in line]
+    assert len(warnings) == 1
+
+
+def test_merge_candidates_label_exclusive_scope_chains() -> None:
+    # `Scope: *` collides with everything but has no named tokens to report.
+    nodes = [_node(1, "*"), _node(2, "*", blocked_by=[(1, "OPEN")])]
+
+    proc = _run_plan(nodes)
+
+    assert "merge candidates: #1 → #2" in proc.stderr
+    assert "exclusive scope" in proc.stderr
+
+
+# ── Split: intentional — the reviewable escape hatch silences the lint ────────
+
+
+def test_split_marker_suppresses_the_chain_warning() -> None:
+    # A deliberate split records its reasoning in the issue body and is not nagged.
+    nodes = [
+        _node(1, "a.py", split="intentional — mid-chain rollback line"),
+        _node(2, "a.py", blocked_by=[(1, "OPEN")]),
+    ]
+
+    proc = _run_plan(nodes)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "merge candidates" not in proc.stderr
+    assert [int(tok) for tok in proc.stdout.split()] == [1], "suppression must not touch the batch"
+
+
+def test_split_marker_in_any_chain_member_suppresses() -> None:
+    # The marker works from ANY issue of the chain, not just the head.
+    nodes = [
+        _node(1, "a.py"),
+        _node(2, "a.py", blocked_by=[(1, "OPEN")], split="intentional — standalone value"),
+    ]
+
+    proc = _run_plan(nodes)
+
+    assert "merge candidates" not in proc.stderr
+
+
+def test_split_marker_suppresses_only_its_own_chain() -> None:
+    # Two colliding chains, one marked: the other must still warn. (Chain numbers
+    # share no prefix so the absence asserts can't substring-match, e.g. #1 in #11.)
+    nodes = [
+        _node(1, "a.py", split="intentional — shelf-life"),
+        _node(2, "a.py", blocked_by=[(1, "OPEN")]),
+        _node(31, "b.py"),
+        _node(32, "b.py", blocked_by=[(31, "OPEN")]),
+    ]
+
+    proc = _run_plan(nodes)
+
+    warnings = [line for line in proc.stderr.splitlines() if "merge candidates" in line]
+    assert len(warnings) == 1
+    assert "#31 → #32" in warnings[0]
+    assert "#1" not in warnings[0]
+    assert "#2" not in warnings[0]
+
+
+@pytest.mark.parametrize("marker", ["INTENTIONAL — caps", "intentional"])
+def test_split_marker_parses_leniently(marker: str) -> None:
+    # Casing is normalized and the `— <why>` tail is optional; both forms suppress.
+    nodes = [
+        _node(1, "a.py", split=marker),
+        _node(2, "a.py", blocked_by=[(1, "OPEN")]),
+    ]
+
+    proc = _run_plan(nodes)
+
+    assert "merge candidates" not in proc.stderr
+
+
+def test_split_marker_without_space_after_colon_suppresses() -> None:
+    # `Split:intentional` (no space) still parses — the value is stripped first.
+    node = _node(1, "a.py")
+    node["body"] += "Split:intentional\n"
+    nodes = [node, _node(2, "a.py", blocked_by=[(1, "OPEN")])]
+
+    proc = _run_plan(nodes)
+
+    assert "merge candidates" not in proc.stderr
+
+
+def test_split_marker_requires_intentional_value() -> None:
+    # Only the documented `Split: intentional` form suppresses — not any Split: line.
+    nodes = [
+        _node(1, "a.py", split="maybe"),
+        _node(2, "a.py", blocked_by=[(1, "OPEN")]),
+    ]
+
+    proc = _run_plan(nodes)
+
+    assert "merge candidates: #1 → #2" in proc.stderr
+
+
 # ── tie-break: equal depth ⇒ more direct dependents wins ──────────────────────
 
 
@@ -208,6 +409,22 @@ def test_next_batch_skill_registered_in_metadata() -> None:
     meta = (SKILLS_DIR / "metadata.yml").read_text()
 
     assert "next-batch:" in meta, "/next-batch must be registered in metadata.yml"
+
+
+def test_start_task_skill_documents_merge_heuristic() -> None:
+    # Filing time is the decision point: start-task must carry the heuristic + escape hatch.
+    skill = (SKILLS_DIR / "start-task" / "SKILL.md").read_text()
+
+    assert "one issue with subtasks" in skill, "start-task must teach the merge heuristic"
+    assert "Split: intentional" in skill, "start-task must document the escape hatch"
+
+
+def test_workflow_rule_documents_merge_heuristic() -> None:
+    # The workflow rule feeds /afk's answerer and DEFINE sessions the same convention.
+    rule = (REPO_ROOT / "shared" / "rules" / "workflow.md").read_text()
+
+    assert "one issue with subtasks" in rule, "workflow.md must carry the filing heuristic"
+    assert "Split: intentional" in rule, "workflow.md must document the escape hatch"
 
 
 def test_next_batch_skill_documents_dispatch() -> None:

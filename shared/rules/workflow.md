@@ -47,6 +47,14 @@ Before starting any task, the hub classifies it into one of three lanes (~10 sec
 - One subtask, obvious approach, small diff, but worth its own spoke session? → Lane 2.
 - Otherwise, when in doubt, or when the "why" should be findable later → Lane 3.
 
+**Filing-time merge heuristic:** a blocked-by chain of issues whose `Scope:` lines
+collide can never run in parallel — splitting buys zero throughput and multiplies
+cold-start, land, and merge-main costs. File it as **one issue with subtasks** unless
+an intermediate has standalone shelf-life (independent value if the rest stalls, its
+own rollback line, or a scope that could parallelize with other work). Record a
+deliberate split with a `Split: intentional — <why>` body line in any issue of the
+chain; it silences `batch-plan.sh`'s `merge candidates` lint for that chain only.
+
 The Task Lifecycle diagram above describes **Lane 3** — the full flow for anything
 substantial. Lanes 1 and 2 shed orchestration overhead (no issue, no ledger for lane 2; no
 worktree, no issue, no tmux for lane 1), but **never shed gates**: lane 2 runs all push

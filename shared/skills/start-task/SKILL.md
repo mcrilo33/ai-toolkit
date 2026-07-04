@@ -112,6 +112,18 @@ touch the same file" — file overlap is a scheduling concern the planner alread
 from `Scope:`, not an ordering constraint. A spurious blocked-by edge stalls work that
 could have proceeded.
 
+**Chain + colliding scopes ⇒ file one issue with subtasks.** Before creating a
+blocked-by chain, compare the `Scope:` lines of the issues about to be filed. When
+consecutive issues in the chain collide on scope, the planner can never parallelize
+them — the split buys zero throughput and costs N cold starts (worktree spawn, testmon
+rebuild, context re-read), N lands, and N merge-main churns. File such a chain as
+**one issue with subtasks**, unless an intermediate has standalone shelf-life:
+independent value if the rest stalls, its own rollback line, or a non-overlapping
+scope that could parallelize with other work. When you split deliberately, record the
+reasoning with a `Split: intentional — <why>` body line in any issue of the chain — it
+silences `batch-plan.sh`'s `merge candidates` lint for that chain only and keeps the
+rationale where the spoke will read it.
+
 ### 4. Dispatch the worktree + seed the spoke
 
 ```bash

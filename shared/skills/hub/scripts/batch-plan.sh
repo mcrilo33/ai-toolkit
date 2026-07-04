@@ -19,6 +19,12 @@
 #     line ⇒ exclusive (runs alone, never batched). No concurrency cap.
 #   * OUTPUT — issue numbers only (space-separated). It never dispatches; `/next-batch`
 #     does that.
+#   * MERGE-CANDIDATE LINT (issue #125) — when a blocked-by chain of OPEN issues has
+#     colliding scopes it can never parallelize, so splitting bought nothing; print a
+#     `⚠ merge candidates` proposal per chain on STDERR. Detection-only: the batch on
+#     stdout, the exit code, and dispatch behavior are untouched. A
+#     `Split: intentional — <why>` body line in ANY issue of the chain records the
+#     deliberate split and silences the lint for that chain only.
 #
 # Read-only. Run on the hub (main checkout). Functions are source-guarded so the unit
 # tests can drive `plan_from_json` with a fixture graph without any network round-trip.
@@ -132,6 +138,23 @@ def scope_of(body):
     return set(tokens)
 
 
+def has_split_marker(body):
+    """True when the body carries a `Split: intentional — <why>` line.
+
+    Mirrors the `Scope:`/`Gate:` line conventions (issue #125): the first
+    `split:` line (case-insensitive) wins, and suppression applies only when
+    ITS value begins with `intentional` — recording that the chain's
+    serialization is deliberate and silencing the merge-candidate lint for the
+    chain containing this issue. Any other value (`Split: maybe`) does NOT
+    suppress, even if a later line says `intentional`.
+    """
+    for raw in (body or "").splitlines():
+        stripped = raw.strip()
+        if stripped.lower().startswith("split:"):
+            return stripped[len("split:"):].strip().lower().startswith("intentional")
+    return False
+
+
 def conflict(a, b):
     """Two scopes conflict when either is exclusive (None) or their tokens overlap."""
     if a is None or b is None:
@@ -148,6 +171,83 @@ def parse_inflight(blob):
         tokens = [t for t in line.replace(",", " ").split() if t]
         scopes.append(None if (not tokens or "*" in tokens) else set(tokens))
     return scopes
+
+
+def order_chain(comp, comp_edges):
+    """Members of one merge-candidate component in topological order.
+
+    Kahn over the component's blocked-by edges, ties broken by issue number; a
+    malformed cycle falls back to appending the leftovers by number so the lint
+    still terminates and names every member.
+    """
+    indeg = {n: 0 for n in comp}
+    out = {n: [] for n in comp}
+    for a, b in comp_edges:
+        indeg[b] += 1
+        out[a].append(b)
+    frontier = sorted(n for n in comp if indeg[n] == 0)
+    order = []
+    while frontier:
+        n = frontier.pop(0)
+        order.append(n)
+        for m in out[n]:
+            indeg[m] -= 1
+            if indeg[m] == 0:
+                frontier.append(m)
+        frontier.sort()
+    order.extend(sorted(n for n in comp if n not in set(order)))
+    return order
+
+
+def print_merge_candidates(issues, children):
+    """Warn on stderr about blocked-by chains of open issues with colliding scopes.
+
+    Such a chain is strictly serialized AND scope-colliding — the planner can never
+    batch its members, so filing them separately bought zero throughput (issue #125).
+    Detection-only: prints proposals on stderr, never touches the batch on stdout,
+    the exit code, or which issues get dispatched. A `Split: intentional` marker in
+    any member suppresses the proposal for that chain only.
+    """
+    edges = [
+        (parent, child)
+        for parent, kids in children.items()
+        for child in kids
+        if conflict(issues[parent]["scope"], issues[child]["scope"])
+    ]
+    adj = {}
+    for a, b in edges:
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+    seen = set()
+    for start in sorted(adj):
+        if start in seen:
+            continue
+        comp = set()
+        stack = [start]
+        while stack:
+            n = stack.pop()
+            if n in comp:
+                continue
+            comp.add(n)
+            stack.extend(adj[n] - comp)
+        seen |= comp
+        if any(issues[n]["split"] for n in comp):
+            continue  # deliberate split — the chain opted out of the proposal
+        comp_edges = [(a, b) for a, b in edges if a in comp and b in comp]
+        shared = set()
+        for a, b in comp_edges:
+            sa, sb = issues[a]["scope"], issues[b]["scope"]
+            if sa is not None and sb is not None:
+                shared |= sa & sb
+        detail = (
+            "scope collides on " + ", ".join(sorted(shared)) if shared else "exclusive scope"
+        )
+        chain = " → ".join(f"#{n}" for n in order_chain(comp, comp_edges))
+        print(
+            f"⚠ merge candidates: {chain} ({detail}, strictly serialized)"
+            " — consider one issue with subtasks",
+            file=sys.stderr,
+        )
 
 
 def main():
@@ -171,6 +271,7 @@ def main():
         issues[num] = {
             "number": num,
             "scope": scope_of(node.get("body")),
+            "split": has_split_marker(node.get("body")),
             "blockers": blockers,
         }
 
@@ -230,6 +331,8 @@ def main():
 
     if batch:
         print(" ".join(str(n) for n in batch))
+
+    print_merge_candidates(issues, children)
 
 
 main()
