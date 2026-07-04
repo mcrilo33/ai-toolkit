@@ -2535,6 +2535,8 @@ def test_module_skips_on_non_darwin(tmp_path: Path) -> None:
             "pytest",
             str(Path(__file__)),
             "-k",
+            # Coupled to that test's name: if it is renamed, -k selects nothing
+            # and pytest exits 5, failing the returncode assertion below.
             "test_compute_end_epoch_drain_is_sentinel",
             "-q",
             "-p",
@@ -2553,3 +2555,4 @@ def test_module_skips_on_non_darwin(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "1 skipped" in result.stdout, result.stdout
+    assert "passed" not in result.stdout, result.stdout
