@@ -29,6 +29,21 @@ HUB_AFK = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "hub-afk.sh"
 SPOKE_READY = REPO_ROOT / "scripts" / "spoke-ready.sh"
 
 
+@pytest.fixture(autouse=True)
+def _isolated_afk_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin AFK_STATE_DIR to a per-test dir so no test touches the REAL hub state.
+
+    Without this, any test driving a stamping path (the dispatch_batch tests
+    dispatch issue #5) writes dispatch-5.epoch under the real
+    <git-common-dir>/ai-toolkit-afk, and hours later the slot_state tests read
+    that stale epoch through the wall-clock ceiling check and flip to `reap`
+    (issue #121). _call spreads os.environ, so this reaches every sourced
+    hub-afk.sh; tests that need a specific statedir still override it via
+    _call(env={"AFK_STATE_DIR": ...}).
+    """
+    monkeypatch.setenv("AFK_STATE_DIR", str(tmp_path / "afk-state"))
+
+
 def _call(fn_call: str, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     """Source hub-afk.sh and invoke a shell expression against its functions.
 
