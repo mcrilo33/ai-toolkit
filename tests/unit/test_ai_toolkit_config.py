@@ -252,6 +252,69 @@ def test_model_for_label_is_none_when_unmatched(tmp_path: Path) -> None:
     assert cfg.model_for_label(config, "enhancement") is None
 
 
+# ─── batch settings: concurrency cap + stagger (issue #151) ───
+
+
+def test_batch_concurrency_cap_returns_int(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, "batch:\n  concurrency_cap: 3\n").as_posix())
+
+    assert cfg.batch_concurrency_cap(config) == 3
+
+
+def test_batch_concurrency_cap_none_when_blank(tmp_path: Path) -> None:
+    # A blank value ⇒ auto-derivation (min(2, cores/4)) at the consumer, not a cap.
+    config = cfg.load_config(_write(tmp_path, "batch:\n  concurrency_cap:\n").as_posix())
+
+    assert cfg.batch_concurrency_cap(config) is None
+
+
+def test_batch_concurrency_cap_none_when_section_absent(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, "base_branch: main\n").as_posix())
+
+    assert cfg.batch_concurrency_cap(config) is None
+
+
+def test_batch_concurrency_cap_none_when_non_positive(tmp_path: Path) -> None:
+    # A zero / negative / non-numeric override is not a valid ceiling ⇒ auto-derive.
+    config = cfg.load_config(_write(tmp_path, "batch:\n  concurrency_cap: 0\n").as_posix())
+
+    assert cfg.batch_concurrency_cap(config) is None
+
+
+def test_batch_stagger_seconds_returns_int(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, "batch:\n  stagger_seconds: 30\n").as_posix())
+
+    assert cfg.batch_stagger_seconds(config) == 30
+
+
+def test_batch_stagger_seconds_none_when_blank(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, "batch:\n  stagger_seconds:\n").as_posix())
+
+    assert cfg.batch_stagger_seconds(config) is None
+
+
+def test_batch_env_cli_emits_set_values(tmp_path: Path) -> None:
+    path = _write(tmp_path, "batch:\n  concurrency_cap: 3\n  stagger_seconds: 20\n")
+
+    out = cfg._cli(["ai_toolkit_config.py", "batch-env", str(path)])
+
+    assert "AI_TOOLKIT_BATCH_CAP=3" in out
+    assert "AI_TOOLKIT_BATCH_STAGGER=20" in out
+
+
+def test_batch_env_cli_empty_when_unset(tmp_path: Path) -> None:
+    # Blank config ⇒ no exports, so the bash consumer falls back to its own default.
+    path = _write(tmp_path, "batch:\n  concurrency_cap:\n  stagger_seconds:\n")
+
+    assert cfg._cli(["ai_toolkit_config.py", "batch-env", str(path)]) == ""
+
+
+def test_real_config_batch_defaults_to_autoderive(real_config: dict) -> None:
+    # The seed leaves both blank ⇒ the consumer auto-derives the cap and default stagger.
+    assert cfg.batch_concurrency_cap(real_config) is None
+    assert cfg.batch_stagger_seconds(real_config) is None
+
+
 # ─── real config: seed routing completeness ───
 
 

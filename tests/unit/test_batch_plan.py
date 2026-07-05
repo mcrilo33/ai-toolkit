@@ -62,13 +62,15 @@ def _node(
 
 
 def _run_plan(
-    nodes: list[dict], *, inflight: list[str] | None = None
+    nodes: list[dict], *, inflight: list[str] | None = None, cap: int | None = None
 ) -> subprocess.CompletedProcess[str]:
     """Pipe a fixture graph into plan_from_json and return the completed process."""
     env = {**os.environ}
     args = ""
     for spoke in inflight or []:
         args += f" --inflight {json_quote(spoke)}"
+    if cap is not None:
+        args += f" --cap {cap}"
     return subprocess.run(
         ["bash", "-c", f'source "{BATCH_PLAN}"; plan_from_json{args}'],
         input=json.dumps(nodes),
@@ -78,9 +80,11 @@ def _run_plan(
     )
 
 
-def _plan(nodes: list[dict], *, inflight: list[str] | None = None) -> list[int]:
+def _plan(
+    nodes: list[dict], *, inflight: list[str] | None = None, cap: int | None = None
+) -> list[int]:
     """Pipe a fixture graph into plan_from_json and return the batch as issue numbers."""
-    proc = _run_plan(nodes, inflight=inflight)
+    proc = _run_plan(nodes, inflight=inflight, cap=cap)
     assert proc.returncode == 0, proc.stderr
     return [int(tok) for tok in proc.stdout.split()]
 
@@ -465,6 +469,70 @@ def test_tiebreak_prefers_more_direct_dependents() -> None:
 
     assert batch[0] == 10, "equal depth ⇒ the issue with more direct dependents ranks first"
     assert 20 not in batch, "#20 collides on shared.py with the higher-priority #10"
+
+
+# ── concurrency cap: bound live spokes across dispatch (issue #151) ───────────
+# The hub batch/dispatch path had no ceiling, so a wide batch could starve the box
+# and the co-located Langfuse. `--cap N` truncates the batch so the total concurrent
+# spokes (already in-flight + newly batched) never exceeds N. It is a pure output
+# truncation layered on top of the greedy pack — priority order is preserved and no
+# extra issues are ever added. Absent / `--cap 0` keeps the historical unlimited batch.
+
+
+def _disjoint_ready(*nums: int) -> list[dict]:
+    # One ready, no-dependency issue per number, each on its own file so they pack
+    # together — the cap, not scope-disjointness, is what bounds the batch here.
+    return [_node(n, f"f{n}.py") for n in nums]
+
+
+def test_cap_truncates_batch_to_the_configured_ceiling() -> None:
+    # Three disjoint ready issues would all batch; --cap 2 keeps only the top two
+    # in priority order (equal depth ⇒ issue-number asc).
+    batch = _plan(_disjoint_ready(1, 2, 3), cap=2)
+
+    assert batch == [1, 2], "the cap keeps the two highest-priority ready issues"
+
+
+def test_cap_accounts_for_inflight_spokes() -> None:
+    # One spoke already running (f9.py) consumes a slot: with --cap 2 only ONE more
+    # of the two disjoint ready issues may dispatch, not two.
+    batch = _plan(_disjoint_ready(1, 2), inflight=["f9.py"], cap=2)
+
+    assert batch == [1], "cap counts in-flight spokes, leaving a single free slot"
+
+
+def test_cap_full_from_inflight_yields_empty_batch() -> None:
+    # The cap is already saturated by live spokes ⇒ dispatch nothing this round.
+    batch = _plan(_disjoint_ready(1), inflight=["f8.py", "f9.py"], cap=2)
+
+    assert batch == [], "no free slots ⇒ empty batch"
+
+
+def test_cap_larger_than_batch_is_a_noop() -> None:
+    batch = _plan(_disjoint_ready(1, 2), cap=10)
+
+    assert batch == [1, 2], "a cap above the batch size changes nothing"
+
+
+def test_cap_zero_is_unlimited() -> None:
+    # `--cap 0` is the explicit "no ceiling" value (the dispatch default when unset).
+    batch = _plan(_disjoint_ready(1, 2, 3), cap=0)
+
+    assert batch == [1, 2, 3]
+
+
+def test_absent_cap_preserves_unlimited_batch() -> None:
+    batch = _plan(_disjoint_ready(1, 2, 3))
+
+    assert batch == [1, 2, 3], "no --cap flag keeps the historical unbounded batch"
+
+
+def test_cap_does_not_reorder_or_add_issues() -> None:
+    # The cap only removes from the tail of the priority-ordered batch; a scope
+    # collision still excludes #4 and exclusivity still bars #6 even under a cap.
+    batch = _plan(_acceptance_graph(), cap=5)
+
+    assert batch == [1, 5], "cap ≥ batch leaves the greedy pack untouched"
 
 
 # ── end-to-end: mock gh through main (fetch → plan) ───────────────────────────
