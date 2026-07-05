@@ -456,3 +456,171 @@ class TestSpokePushEmitsStepPush:
 
         assert result.returncode != 0
         assert _steps(telemetry_dir) == []
+
+
+# ── #139 ST3: review-stamp-guard emits step:review once per approved review ──
+#
+# In Claude Code the reviewer gate is the approve_review MCP call (tool name
+# mcp__review-stamp__approve_review, PreToolUse). Nothing opens a review window
+# there — enforcement is the positive per-agent MCP wiring — so the guard
+# allows and only contributes the marker. On Cursor (beforeMCPExecution) the
+# fail-closed window check is unchanged and a denied approve emits nothing.
+
+REVIEW_STAMP_GUARD = HOOKS_DIR / "review-stamp-guard.sh"
+
+
+def _claude_approve_payload(tool: str = "mcp__review-stamp__approve_review") -> str:
+    # A Claude Code PreToolUse payload has no workspace_roots — root resolution
+    # falls back to the hook's cwd, which the harness sets to the fixture repo.
+    return json.dumps(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool,
+            "tool_input": {"verdict": "APPROVE", "summary": "ok"},
+        }
+    )
+
+
+def _cursor_approve_payload(root: Path) -> str:
+    return json.dumps(
+        {
+            "hook_event_name": "beforeMCPExecution",
+            "tool_name": "approve_review",
+            "workspace_roots": [str(root)],
+        }
+    )
+
+
+@pytest.fixture()
+def guard_repo(tmp_path: Path, telemetry_dir: Path) -> Path:
+    """A real git repo so the marker's default HEAD key resolves."""
+    repo = tmp_path / "guard-repo"
+    repo.mkdir()
+    env = _push_env(telemetry_dir)
+    subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True, capture_output=True, env=env)
+    for k, v in (("user.email", "t@t.t"), ("user.name", "t"), ("commit.gpgsign", "false")):
+        subprocess.run(
+            ["git", "config", k, v], cwd=str(repo), check=True, capture_output=True, env=env
+        )
+    (repo / "f.txt").write_text("seed\n")
+    subprocess.run(["git", "add", "f.txt"], cwd=str(repo), check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-qm", "chore: seed"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    return repo
+
+
+def _commit_guard_repo(repo: Path, telemetry_dir: Path) -> None:
+    env = _push_env(telemetry_dir)
+    (repo / "f.txt").write_text("more\n")
+    subprocess.run(
+        ["git", "commit", "-aqm", "feat: more"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+
+class TestReviewStampGuardEmitsStepReview:
+    def test_claude_approve_allows_and_emits_step_review(
+        self, guard_repo: Path, telemetry_dir: Path
+    ) -> None:
+        result = _run(
+            REVIEW_STAMP_GUARD, _claude_approve_payload(), _env(telemetry_dir), guard_repo
+        )
+
+        assert result.returncode == 0, result.stderr
+        steps = _steps(telemetry_dir)
+        assert len(steps) == 1
+        assert steps[0]["phase"] == "review"
+        assert steps[0]["name"] == "solo-cycle"
+
+    def test_claude_approve_rerun_same_head_is_idempotent(
+        self, guard_repo: Path, telemetry_dir: Path
+    ) -> None:
+        env = _env(telemetry_dir)
+
+        _run(REVIEW_STAMP_GUARD, _claude_approve_payload(), env, guard_repo)
+        _run(REVIEW_STAMP_GUARD, _claude_approve_payload(), env, guard_repo)
+
+        assert len(_steps(telemetry_dir)) == 1
+
+    def test_claude_approve_new_head_emits_again(
+        self, guard_repo: Path, telemetry_dir: Path
+    ) -> None:
+        # A re-review after REQUEST_CHANGES + fix commits is a NEW review — the
+        # next subtask (or fixed diff) sits on a new HEAD and earns its marker.
+        env = _env(telemetry_dir)
+
+        _run(REVIEW_STAMP_GUARD, _claude_approve_payload(), env, guard_repo)
+        _commit_guard_repo(guard_repo, telemetry_dir)
+        _run(REVIEW_STAMP_GUARD, _claude_approve_payload(), env, guard_repo)
+
+        assert len(_steps(telemetry_dir)) == 2
+
+    def test_cursor_no_window_denies_and_emits_no_step(
+        self, guard_repo: Path, telemetry_dir: Path
+    ) -> None:
+        result = _run(
+            REVIEW_STAMP_GUARD,
+            _cursor_approve_payload(guard_repo),
+            _env(telemetry_dir),
+            guard_repo,
+        )
+
+        assert result.returncode == 2
+        assert _steps(telemetry_dir) == []
+        assert not _sentinel(guard_repo, "review").exists()
+
+    def test_cursor_fresh_window_allows_and_emits_step_review(
+        self, guard_repo: Path, telemetry_dir: Path
+    ) -> None:
+        (guard_repo / ".review").mkdir()
+        (guard_repo / ".review" / ".window").write_text("now\n")
+
+        result = _run(
+            REVIEW_STAMP_GUARD,
+            _cursor_approve_payload(guard_repo),
+            _env(telemetry_dir),
+            guard_repo,
+        )
+
+        assert result.returncode == 0, result.stderr
+        steps = _steps(telemetry_dir)
+        assert len(steps) == 1
+        assert steps[0]["phase"] == "review"
+
+    def test_other_tool_is_untouched(self, guard_repo: Path, telemetry_dir: Path) -> None:
+        result = _run(
+            REVIEW_STAMP_GUARD,
+            _claude_approve_payload(tool="mcp__review-stamp__some_other_tool"),
+            _env(telemetry_dir),
+            guard_repo,
+        )
+
+        assert result.returncode == 0
+        assert _steps(telemetry_dir) == []
+
+    def test_guard_is_wired_for_claude_pretooluse(self) -> None:
+        # Auto-fire needs the Claude wiring: the generated settings must gate
+        # the approve_review MCP tool with this guard on PreToolUse.
+        import sys
+
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from hooks_generator import generate_claude, parse_hooks_metadata
+
+        hooks = parse_hooks_metadata(str(HOOKS_DIR / "metadata.yml"))
+        config = generate_claude(hooks)
+        groups = [
+            g
+            for g in config.get("PreToolUse", [])
+            if g.get("matcher") == "mcp__review-stamp__approve_review"
+        ]
+        assert groups, "no PreToolUse group matches the approve_review MCP tool"
+        commands = [h["command"] for g in groups for h in g["hooks"]]
+        assert any("review-stamp-guard" in c for c in commands)
