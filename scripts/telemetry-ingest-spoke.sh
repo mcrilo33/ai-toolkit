@@ -3,7 +3,8 @@
 # telemetry-ingest-spoke.sh — automated post-run Langfuse ingestion for one spoke.
 #
 # Usage:
-#   scripts/telemetry-ingest-spoke.sh <worktree-dir>
+#   scripts/telemetry-ingest-spoke.sh <worktree-dir>       # land-time (raw bodies)
+#   scripts/telemetry-ingest-spoke.sh --spoke-run-id <id>  # degraded re-run, id only
 #
 # worktree-land.sh calls this once, best-effort, AFTER the spoke's work has merged
 # and pushed but BEFORE the tmux/worktree teardown — while the worktree (and its
@@ -28,6 +29,9 @@
 #   flush wait    a brief settle so the live native-trace push lands before we read
 #                 it — the teardown SIGKILL would otherwise drop in-flight spans.
 #                 Override with AI_TOOLKIT_INGEST_FLUSH_WAIT (seconds; 0 in tests).
+#   retry         the view builder is retried up to AI_TOOLKIT_INGEST_RETRIES (default
+#                 3) with an AI_TOOLKIT_INGEST_BACKOFF-based linear wait (default 5s),
+#                 so a transient Langfuse hiccup mid-land is survived, not fatal (#151).
 #
 # Env for the step: LANGFUSE_HOST defaults to http://localhost:3000; the view builder
 # runs under PYTHONPATH=<repo>/scripts with python3.12 (matching the telemetry
@@ -42,23 +46,49 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
 info() { printf '%s: %s\n' "$PROG" "$*"; }
 
-WT_DIR="${1:-}"
-[ -n "$WT_DIR" ] || { warn "usage: telemetry-ingest-spoke.sh <worktree-dir>"; exit 0; }
+# Two invocation modes (issue #151):
+#   <worktree-dir>          land-time: read the worktree's spoke-run-id + raw-bodies
+#                           and itemize the full loaded context (the OTel gate applies).
+#   --spoke-run-id <id>     DEGRADED re-run after teardown: the worktree (and its
+#                           raw-bodies) is gone, so rebuild from the id alone on the
+#                           disk fallback — the recovery path when a land-time ingest
+#                           was lost to a transient Langfuse outage.
+WT_DIR=""
+ARG_SPOKE_ID=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --spoke-run-id)   [ "$#" -ge 2 ] || { warn "--spoke-run-id needs a value"; exit 0; }
+                      ARG_SPOKE_ID="$2"; shift 2 ;;
+    --spoke-run-id=*) ARG_SPOKE_ID="${1#--spoke-run-id=}"; shift ;;
+    --)               shift; break ;;
+    -*)               warn "unknown option: $1 — skipping Langfuse ingestion"; exit 0 ;;
+    *)                [ -z "$WT_DIR" ] || { warn "unexpected extra argument: $1"; exit 0; }
+                      WT_DIR="$1"; shift ;;
+  esac
+done
 
-AIT_DIR="$WT_DIR/.ai-toolkit"
-ID_FILE="$AIT_DIR/spoke-run-id"
-BODY_DIR="$AIT_DIR/raw-bodies"
+# BODY_DIR non-empty ⇒ land-time mode (itemize raw bodies + pin --root); empty ⇒
+# degraded id-only mode (disk fallback). Resolve the spoke_run_id per mode.
+if [ -n "$ARG_SPOKE_ID" ]; then
+  SPOKE_RUN_ID="$ARG_SPOKE_ID"
+  BODY_DIR=""
+else
+  [ -n "$WT_DIR" ] || { warn "usage: telemetry-ingest-spoke.sh <worktree-dir> | --spoke-run-id <id>"; exit 0; }
+  AIT_DIR="$WT_DIR/.ai-toolkit"
+  ID_FILE="$AIT_DIR/spoke-run-id"
+  BODY_DIR="$AIT_DIR/raw-bodies"
 
-# OTel gate: no raw-bodies dir → not an AI_TOOLKIT_OTEL spoke; nothing to ingest.
-[ -d "$BODY_DIR" ] || exit 0
+  # OTel gate: no raw-bodies dir → not an AI_TOOLKIT_OTEL spoke; nothing to ingest.
+  [ -d "$BODY_DIR" ] || exit 0
 
-# The id every ingester keys on; without it there is nothing to assemble.
-if [ ! -r "$ID_FILE" ]; then
-  warn "no spoke-run-id under $AIT_DIR — skipping Langfuse ingestion"
-  exit 0
+  # The id every ingester keys on; without it there is nothing to assemble.
+  if [ ! -r "$ID_FILE" ]; then
+    warn "no spoke-run-id under $AIT_DIR — skipping Langfuse ingestion"
+    exit 0
+  fi
+  SPOKE_RUN_ID="$(head -n1 "$ID_FILE" | tr -d '[:space:]')"
+  [ -n "$SPOKE_RUN_ID" ] || { warn "spoke-run-id file is empty — skipping Langfuse ingestion"; exit 0; }
 fi
-SPOKE_RUN_ID="$(head -n1 "$ID_FILE" | tr -d '[:space:]')"
-[ -n "$SPOKE_RUN_ID" ] || { warn "spoke-run-id file is empty — skipping Langfuse ingestion"; exit 0; }
 
 # Auth gate: warn-and-continue, never fail the land. A manual re-run has no
 # hand-exported credentials, so resolve them here the way the land does (#127):
@@ -99,20 +129,42 @@ FLUSH_WAIT="${AI_TOOLKIT_INGEST_FLUSH_WAIT:-3}"
 export LANGFUSE_HOST="${LANGFUSE_HOST:-http://localhost:3000}"
 export PYTHONPATH="$(dirname "$TELEMETRY_DIR")${PYTHONPATH:+:$PYTHONPATH}"
 
-# The step is best-effort: warn on failure, return 0.
+# Retry budget (issue #151): a co-located Langfuse starved by concurrent spokes can
+# drop the request mid-HTTP, losing the trace for good once teardown removes the raw
+# bodies. Retry the builder a few times with a linear backoff so a transient hiccup is
+# survived. Best-effort throughout — every path still returns 0, never failing the land.
+INGEST_RETRIES="${AI_TOOLKIT_INGEST_RETRIES:-3}"
+INGEST_BACKOFF="${AI_TOOLKIT_INGEST_BACKOFF:-5}"
+case "$INGEST_RETRIES" in '' | *[!0-9]* | 0) INGEST_RETRIES=1 ;; esac
+case "$INGEST_BACKOFF" in '' | *[!0-9]*) INGEST_BACKOFF=5 ;; esac
+
+# The step is best-effort: retry on failure, warn and return 0 once the budget is spent.
 # UPGRADE: wrap the step in `timeout` (when available — macOS has none by default)
 # if a slow/unreachable LANGFUSE_HOST ever stalls a land between push and teardown.
 run_step() {
   local label="$1"; shift
+  local attempt=1
   info "→ $label for $SPOKE_RUN_ID"
-  python3.12 "$@" || warn "$label failed (continuing) — re-run by hand: python3.12 $*"
+  while :; do
+    python3.12 "$@" && return 0
+    if [ "$attempt" -ge "$INGEST_RETRIES" ]; then
+      warn "$label failed after ${attempt} attempt(s) (continuing) — re-run from the id alone: telemetry-ingest-spoke.sh --spoke-run-id $SPOKE_RUN_ID"
+      return 0
+    fi
+    warn "$label attempt ${attempt}/${INGEST_RETRIES} failed — retrying in $(( INGEST_BACKOFF * attempt ))s (transient Langfuse/load?)"
+    sleep "$(( INGEST_BACKOFF * attempt ))" 2>/dev/null || true
+    attempt=$(( attempt + 1 ))
+  done
 }
 
-# --root pins the spoke checkout: the land script runs from the hub root, so without
-# it langfuse_spoke_tree's disk fallback (when no usable request body is found) would
-# itemize the HUB's rules/skills/memory instead of the spoke's.
-run_step "loaded-context itemization (#87)" \
-  "$TELEMETRY_DIR/langfuse_spoke_tree.py" "$SPOKE_RUN_ID" \
-  --request-bodies "$BODY_DIR" --root "$WT_DIR"
+# Land-time mode itemizes the dumped request bodies and pins --root to the spoke
+# checkout (the land runs from the hub root, so without --root the disk fallback would
+# itemize the HUB's rules/skills/memory). The degraded id-only re-run has neither, so
+# it runs on the bare id and langfuse_spoke_tree's disk fallback (cwd root).
+BUILD_ARGS=("$TELEMETRY_DIR/langfuse_spoke_tree.py" "$SPOKE_RUN_ID")
+if [ -n "$BODY_DIR" ]; then
+  BUILD_ARGS+=(--request-bodies "$BODY_DIR" --root "$WT_DIR")
+fi
+run_step "loaded-context itemization (#87)" "${BUILD_ARGS[@]}"
 
 exit 0
