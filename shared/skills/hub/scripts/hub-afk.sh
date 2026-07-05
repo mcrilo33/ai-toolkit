@@ -799,6 +799,9 @@ _consume_gate_tag() {
 # (or an answer we cannot inject) escalates rather than guessing.
 decide_and_act() {
   local wt="$1" issue="$2" question orig_question raw rc decision kind text target was_gate=0
+  # Snapshot the transcript clock BEFORE the park checks: a write landing between
+  # this and the pre-inject re-check must count as movement (review nit, ST2).
+  local parked_mtime; parked_mtime="$(_transcript_mtime "$wt")"
   _gate_parked "$wt" "$issue" && was_gate=1
   orig_question="$(extract_pending_question "$wt")"
   question="$orig_question"
@@ -813,7 +816,6 @@ ${orig_question:-(the plan prose could not be extracted from the transcript — 
   elif [ -z "$question" ]; then
     return 0
   fi
-  local parked_mtime; parked_mtime="$(_transcript_mtime "$wt")"
   log "→ answering #$issue (parked on input)"
   raw="$(run_answerer "$issue" "$question")"; rc=$?
   # The answerer is the supervisor's own `claude`; if its credentials are dead, every
