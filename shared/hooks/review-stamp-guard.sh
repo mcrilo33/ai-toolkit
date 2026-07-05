@@ -21,8 +21,10 @@
 # absent/unknown event keeps the fail-closed Cursor behavior.
 #
 # Both allow paths emit the marker (idempotent on HEAD via
-# telemetry_mark_cycle_step); a denied approve emits nothing — a refused
-# review must not mark REVIEW as happened.
+# telemetry_mark_cycle_step); a GUARD-denied call (no/stale window) emits
+# nothing. The reviewer's verdict is not inspected: a REQUEST_CHANGES call on
+# an allowed path still emits — the review gate did fire on that HEAD, and the
+# fix round lands on a new HEAD and earns its own marker.
 #
 # Exit 2 = deny (Cursor: no window / stale window)
 # Exit 0 = allow (other tools, a fresh window, or the Claude Code path)
