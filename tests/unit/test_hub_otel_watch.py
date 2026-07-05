@@ -209,3 +209,168 @@ def test_spoke_pane_live_resolves_symlinked_pane_path(
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "LIVE"
+
+
+# ── daemon mode (#138): _watch_loop ticks + --daemon pidfile singleton ───────
+#
+# The watchdog must survive a machine sleep with no human in the loop: worktree-
+# new.sh arms `hub-otel-watch.sh --daemon`, which re-runs the ensure path every
+# HUB_OTEL_WATCH_INTERVAL seconds while ≥1 spoke pane is live and exits itself
+# after HUB_OTEL_WATCH_IDLE_TICKS consecutive idle ticks. These tests drive
+# _watch_loop/_daemon with the pane probe and preflights stubbed (interval 0),
+# so no real tmux/docker/sleep-wake is needed.
+
+_LOOP_ENV = "; ".join(
+    [
+        "MAIN_ROOT=/repo",
+        "export AI_TOOLKIT_OTEL=1",
+        "export HUB_OTEL_WATCH_INTERVAL=0",
+        "export HUB_OTEL_WATCH_IDLE_TICKS=3",
+        'wt_otel_collector_preflight() { echo "COLLECTOR $1"; }',
+        'wt_otel_bridge_preflight() { echo "BRIDGE $1"; }',
+    ]
+)
+
+
+def _pane_pattern_stub(tmp_path: Path, pattern: str) -> str:
+    """A spoke_pane_live stub scripted per tick: 'L' = live, anything else = idle.
+
+    Ticks beyond the pattern read as idle, so every loop terminates. The tick
+    count persists in a file the test can assert on.
+    """
+    ticks = tmp_path / "ticks"
+    return (
+        f'TICKS="{ticks}"; PATTERN="{pattern}"; '
+        "spoke_pane_live() { "
+        'n=$(( $(cat "$TICKS" 2>/dev/null || echo 0) + 1 )); printf "%s" "$n" > "$TICKS"; '
+        'c="${PATTERN:$((n-1)):1}"; [ "$c" = "L" ]; }'
+    )
+
+
+def test_watch_loop_ensures_stack_on_each_live_tick(tmp_path: Path) -> None:
+    # Two live ticks → the ensure pair runs twice, collector before bridge each
+    # time (the one-shot ordering contract holds in daemon mode too).
+    result = _call(f"{_pane_pattern_stub(tmp_path, 'LL')}; {_LOOP_ENV}; _watch_loop")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count("COLLECTOR /repo") == 2
+    assert result.stdout.count("BRIDGE /repo") == 2
+    assert result.stdout.index("COLLECTOR") < result.stdout.index("BRIDGE")
+
+
+def test_watch_loop_exits_after_consecutive_idle_ticks(tmp_path: Path) -> None:
+    # No spoke ever live → the loop tears itself down after exactly the idle
+    # grace (3 ticks), never having ensured anything.
+    result = _call(f"{_pane_pattern_stub(tmp_path, '')}; {_LOOP_ENV}; _watch_loop")
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "ticks").read_text() == "3"
+    assert "COLLECTOR" not in result.stdout
+
+
+def test_watch_loop_live_tick_resets_idle_counter(tmp_path: Path) -> None:
+    # live, idle, idle, live, then idle to exhaustion → the mid-pattern live tick resets the idle
+    # counter, so the loop survives to tick 7 and ensured twice. Would exit at
+    # tick 4 if the counter never reset.
+    result = _call(f"{_pane_pattern_stub(tmp_path, 'LIIL')}; {_LOOP_ENV}; _watch_loop")
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "ticks").read_text() == "7"
+    assert result.stdout.count("COLLECTOR /repo") == 2
+
+
+def test_watch_loop_surfaces_preflight_recovery_output(tmp_path: Path) -> None:
+    # AC (#138): the recovery is observable. When a tick's preflight recycles a
+    # dead collector its "→ started lf-collector" line must pass through the
+    # loop untouched (it lands in the daemon logfile).
+    parts = [
+        _pane_pattern_stub(tmp_path, "L"),
+        "MAIN_ROOT=/repo",
+        "export AI_TOOLKIT_OTEL=1",
+        "export HUB_OTEL_WATCH_INTERVAL=0",
+        "export HUB_OTEL_WATCH_IDLE_TICKS=1",
+        'wt_otel_collector_preflight() { echo "→ started lf-collector (otelcol) on :4317/:4318/:4418/:8889"; }',
+        "wt_otel_bridge_preflight() { :; }",
+        "_watch_loop",
+    ]
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "→ started lf-collector" in result.stdout
+
+
+def test_daemon_refuses_second_start_while_pid_alive(tmp_path: Path) -> None:
+    # A pidfile naming a LIVE pid (the test shell's own $$) → the second --daemon
+    # start must refuse: no loop tick, the other daemon's pidfile left intact.
+    # Liveness must come from `kill -0`, not pgrep (locale trap).
+    pidfile = tmp_path / "watch.pid"
+    parts = [
+        _pane_pattern_stub(tmp_path, "L"),
+        _LOOP_ENV,
+        f'export HUB_OTEL_WATCH_PIDFILE="{pidfile}"',
+        f'export HUB_OTEL_WATCH_LOG="{tmp_path / "watch.log"}"',
+        f'printf "%s" "$$" > "{pidfile}"',
+        "_daemon",
+    ]
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "already running" in result.stdout + result.stderr
+    assert not (tmp_path / "ticks").exists()
+    assert pidfile.exists()
+
+
+def test_daemon_ignores_stale_pidfile_and_removes_own_on_exit(tmp_path: Path) -> None:
+    # A pidfile naming a DEAD pid (reaped background child) must not block a new
+    # daemon: the loop runs (all-idle → 3 ticks) and the pidfile is gone on exit.
+    pidfile = tmp_path / "watch.pid"
+    parts = [
+        _pane_pattern_stub(tmp_path, ""),
+        _LOOP_ENV,
+        f'export HUB_OTEL_WATCH_PIDFILE="{pidfile}"',
+        f'export HUB_OTEL_WATCH_LOG="{tmp_path / "watch.log"}"',
+        f'sleep 0.01 & _dead=$!; wait "$_dead"; printf "%s" "$_dead" > "{pidfile}"',
+        "_daemon",
+    ]
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "ticks").read_text() == "3"
+    assert not pidfile.exists()
+
+
+def test_daemon_appends_loop_output_to_logfile(tmp_path: Path) -> None:
+    # The loop's output (ensure markers, recovery lines) belongs in the logfile,
+    # not on the daemon's stdout — that's what makes a recovery observable after
+    # the fact.
+    logfile = tmp_path / "watch.log"
+    parts = [
+        _pane_pattern_stub(tmp_path, "L"),
+        _LOOP_ENV,
+        f'export HUB_OTEL_WATCH_PIDFILE="{tmp_path / "watch.pid"}"',
+        f'export HUB_OTEL_WATCH_LOG="{logfile}"',
+        "_daemon",
+    ]
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "COLLECTOR /repo" in logfile.read_text()
+    assert "COLLECTOR /repo" not in result.stdout
+
+
+def test_daemon_cli_dispatch_reports_already_running(tmp_path: Path) -> None:
+    # `hub-otel-watch.sh --daemon` (real script, no sourcing) must reach the
+    # pidfile singleton guard: with a live-pid pidfile it reports and exits 0
+    # before touching tmux/docker.
+    pidfile = tmp_path / "watch.pid"
+    pidfile.write_text(str(os.getpid()))
+    result = subprocess.run(
+        ["bash", str(HUB_OTEL_WATCH), "--daemon"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env={**os.environ, "HUB_OTEL_WATCH_PIDFILE": str(pidfile), "AI_TOOLKIT_OTEL": "1"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "already running" in result.stdout + result.stderr
