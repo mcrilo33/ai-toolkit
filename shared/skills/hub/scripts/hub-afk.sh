@@ -1335,6 +1335,10 @@ _ready_at_tip() {
 # ISO-8601 `timestamp` wins, so a spoke that earned a REQUEST_CHANGES and then fixed it (a
 # newer APPROVE) reads clean. Pure bash + grep (no jq dependency); ISO-8601 Z timestamps
 # sort chronologically as plain strings.
+# Same-second tie-break (#152): review-stamp's timestamp has 1-second resolution and a review
+# can finish in <1s, so an APPROVE and a REQUEST_CHANGES can share the latest second. Such a
+# tie resolves CONSERVATIVELY to REQUEST_CHANGES — the gate never lands on an ambiguous
+# second — and the outcome does not depend on `.review/*.json` glob order.
 # UPGRADE: this trusts an artifact's verdict field WITHOUT checking its HMAC signature (the
 #   advisory reviewer-sep push gate is the authenticity layer today) and picks by timestamp,
 #   not by binding to the pushed diff. Binding to the tip diff hash (utils.sh review_diff_hash
@@ -1351,7 +1355,11 @@ _afk_review_verdict() {
     [ -n "$v" ] || continue
     ts="$(grep -oE '"timestamp"[[:space:]]*:[[:space:]]*"[^"]*"' "$f" | head -1 | sed 's/.*: *"//;s/"$//')"
     ts="${ts:-0000}"   # a timestamp-less artifact sorts lowest — never wins over a stamped one
-    if [ -z "$latest" ] || [[ "$ts" > "$latest" ]]; then latest="$ts"; verdict="$v"; fi
+    if [ -z "$latest" ] || [[ "$ts" > "$latest" ]]; then
+      latest="$ts"; verdict="$v"
+    elif [ "$ts" = "$latest" ] && [ "$v" = "REQUEST_CHANGES" ]; then
+      verdict="$v"   # conservative tie-break: a same-second REQUEST_CHANGES blocks the land
+    fi
   done
   printf '%s' "$verdict"
 }
