@@ -1404,8 +1404,31 @@ afk_done() {
 # checkout (a pidfile dedups), and it exits when --off clears the state.
 : "${AFK_WATCHDOG_SECONDS:=60}"
 
-# _afk_self -> the path to THIS script, so the watchdog respawns the same supervisor.
-_afk_self() { printf '%s\n' "${BASH_SOURCE[0]}"; }
+# _afk_self -> the path the watchdog respawns. When running from an exec'd tmp copy
+# (#133), AFK_ORIG_SCRIPT carries the checkout's real path: a respawn deliberately
+# relaunches the ORIGINAL — picking up any newer code — and re-copies itself fresh.
+_afk_self() { printf '%s\n' "${AFK_ORIG_SCRIPT:-${BASH_SOURCE[0]}}"; }
+
+# _afk_exec_self_copy <argv...> -> re-exec THIS script from a private tmp COPY, so a
+# hub sync/land rewriting hub-afk.sh mid-run cannot corrupt the running interpreter
+# — bash lazily re-reads the script file past main() on the exit path, and the
+# 2026-07-04 drain died there with `line 1465: unexpected token` (#133). Called at
+# every loop-entering start (arm, no-arg resume, --watchdog); short-lived
+# subcommands skip it. No-op when already running from a copy (AFK_RUNNING_COPY=1)
+# or opted out (AFK_SELF_COPY=0); fail-OPEN on a copy failure (run from the
+# original rather than refuse to arm). On success the exec never returns.
+_afk_exec_self_copy() {
+  [ "${AFK_SELF_COPY:-1}" = "0" ] && return 0
+  [ "${AFK_RUNNING_COPY:-}" = "1" ] && return 0
+  local src dir copy
+  src="${BASH_SOURCE[0]}"
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/hub-afk-self.XXXXXX" 2>/dev/null)" || return 0
+  copy="$dir/hub-afk.sh"
+  cp "$src" "$copy" 2>/dev/null || return 0
+  export AFK_RUNNING_COPY=1
+  export AFK_ORIG_SCRIPT="$src"
+  exec bash "$copy" "$@"
+}
 
 # _afk_resume_launch -> the shell command the watchdog runs to respawn a crashed
 # supervisor: a detached, NO-ARG launch of this script. No window spec ⇒ it resumes the
@@ -1737,6 +1760,16 @@ main() {
   if [ "${1:-}" = "--remote" ]; then remote_launch; return $?; fi
 
   MAIN_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { log "not inside a git repository"; return 1; }
+
+  # Long-running entries (arm, no-arg resume, --watchdog) re-exec from a private tmp
+  # copy so a mid-run rewrite of this file cannot corrupt the interpreter (#133).
+  # Short-lived subcommands (--status/--off/--once/help) run in place, and a SOURCED
+  # main (the test harness drives it with stubbed shell functions) never execs — an
+  # exec would silently drop every stub defined in the sourcing shell.
+  case "${1:-}" in
+    --status | --off | --once | -h | --help) ;;
+    *) [[ "${BASH_SOURCE[0]}" == "${0}" ]] && _afk_exec_self_copy "$@" ;;
+  esac
 
   # Subcommands that do not start the LOCAL supervisor loop.
   case "${1:-}" in
