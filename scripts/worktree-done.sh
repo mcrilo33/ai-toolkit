@@ -103,15 +103,23 @@ wt_emit_lifecycle "worktree-done" "teardown" "success" "$WT_T0" "$WT_DIR"
 wt_emit_script "worktree-done" "success" "$WT_T0" "$WT_DIR"
 
 # --- fold the folder out of the VS Code review window ------------------------
-# The mirror of worktree-new.sh's `code --add`. Run BEFORE the on-disk delete
-# below, while $WT_DIR still exists, so VS Code resolves the path, drops the
-# folder from the workspace, and stops watching it — otherwise it leaves an
-# empty ghost pane (issue #43). Gated on `--no-code` and the presence of the
-# `code` CLI; a failed call warns, never aborts teardown.
-if [ -z "$NO_CODE" ] && command -v code >/dev/null 2>&1; then
-  echo "→ removing folder from your VS Code review window (code --remove)"
-  code --remove "$WT_DIR" \
-    || wt_warn "couldn't remove the folder from VS Code — right-click it → Remove Folder from Workspace."
+# The mirror of worktree-new.sh's direct append (issue #134): edit the review
+# workspace file's `folders` array — dropping this worktree's entry and sweeping
+# any entry whose path is gone from disk (self-healing for past `code --remove`
+# misses). The CLI call survives strictly as the missing/unparseable-file
+# fallback. Still runs BEFORE the on-disk delete below, while $WT_DIR exists, so
+# the target entry matches by path and the fallback's `code --remove` resolves
+# it (issue #43). Gated on `--no-code`; the helper is called in a conditional
+# (set -e) and every failure warns, never aborts teardown.
+if [ -z "$NO_CODE" ]; then
+  WS_FILE="$(wt_workspace_file "$REPO_ROOT")"
+  if wt_workspace_remove "$WS_FILE" "$WT_DIR"; then
+    echo "→ removed folder from your review workspace file: $WS_FILE (dead entries swept)"
+  elif command -v code >/dev/null 2>&1; then
+    echo "→ removing folder from your VS Code review window (code --remove)"
+    code --remove "$WT_DIR" \
+      || wt_warn "couldn't remove the folder from VS Code — right-click it → Remove Folder from Workspace."
+  fi
 fi
 
 # --- revoke the /quick hub-guard escape hatch (issue #89) --------------------
