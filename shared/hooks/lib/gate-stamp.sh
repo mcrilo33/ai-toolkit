@@ -9,9 +9,13 @@
 #   • PLACE: <git-common-dir>/.gate-stamps/<tree> — shared by the hub and every
 #     spoke worktree, never in-tree, never pushed (same placement rationale as
 #     hub-ready-watch's last-seen set).
-#   • CONTENT: tier=<full|selected|testmon>, env=<runner fingerprint>, and for
-#     the selected tier (issue #123) set=<comma-joined sorted test files that
+#   • CONTENT: tier=<full|selected-set|testmon>, env=<runner fingerprint>, and
+#     for a selection (issue #123) set=<comma-joined sorted test files that
 #     ran> plus testmon=1 when the green run also proved testmon (mixed diff).
+#     The stored token for a selection is `selected-set` — deliberately
+#     unknown to pre-#123-D rank-based readers, which rank it 0 and fail
+#     closed instead of treating a selection as ≥ testmon. Callers still say
+#     `selected`; mint renames on write.
 # Only the gate script mints stamps (scripted control plane). Coverage rules
 # (issue #123 replaced the pure rank order — a selection proves ONLY the set
 # it names):
@@ -27,13 +31,17 @@
 # unconditionally).
 
 # _gate_stamp_csv_subset <want-csv> <have-csv> — every comma-separated item of
-# `want` appears in `have`. Items are repo-relative test paths, which contain
-# neither commas nor spaces (the same assumption their argv hand-off to pytest
-# already makes).
+# `want` appears in `have`. Items split via parameter expansion, never word
+# splitting, so a glob metacharacter in a name stays literal on both sides (the
+# `case` section is quoted); a malformed empty item refuses. Items are
+# repo-relative test paths, which contain neither commas nor spaces (the same
+# assumption their argv hand-off to pytest already makes).
 _gate_stamp_csv_subset() {
-  local want="$1" have="$2" item
-  local IFS=','
-  for item in $want; do
+  local want="$1," have="$2" item
+  while [ -n "$want" ]; do
+    item="${want%%,*}"
+    want="${want#*,}"
+    [ -n "$item" ] || return 1
     case ",$have," in
       *",$item,"*) ;;
       *) return 1 ;;
@@ -73,6 +81,14 @@ gate_stamp_tree() {
 # sweeps any orphaned temp files.
 gate_stamp_mint() {
   local tree="$1" tier="$2" env_fp="$3" set_csv="${4:-}" testmon_flag="${5:-}" dir tmp
+  # STORED-TOKEN RENAME (D-review): a set-bearing selection is stored as
+  # `selected-set`, a token every pre-#123-D reader ranks as unknown (0) and
+  # therefore never consumes — reusing `selected` would let an old rank-based
+  # reader in a sibling worktree treat it as ≥ testmon and silently skip. The
+  # caller-facing tier vocabulary stays {full, testmon, selected}.
+  if [ "$tier" = "selected" ]; then
+    tier="selected-set"
+  fi
   dir="$(gate_stamp_dir)" || return 1
   mkdir -p "$dir"
   tmp="$(mktemp "$dir/.mint.XXXXXX")" || return 1
@@ -119,10 +135,13 @@ gate_stamp_check() {
       ;;
     selected)
       if [ "$stamped_tier" = "full" ]; then return 0; fi
-      [ "$stamped_tier" = "selected" ] || return 1
+      # Only the set-bearing token counts: a legacy `tier=selected` stamp
+      # (whatever it carries) was minted by a writer without set semantics
+      # and covers nothing.
+      [ "$stamped_tier" = "selected-set" ] || return 1
       [ -n "$dset" ] || return 1   # a set-less demand names nothing provable
       stamped_set="$(sed -n 's/^set=//p' "$stamp" | head -1)"
-      [ -n "$stamped_set" ] || return 1   # legacy bare stamp covers nothing
+      [ -n "$stamped_set" ] || return 1
       _gate_stamp_csv_subset "$dset" "$stamped_set" || return 1
       if [ "$dmixed" = "1" ]; then
         stamped_testmon="$(sed -n 's/^testmon=//p' "$stamp" | head -1)"

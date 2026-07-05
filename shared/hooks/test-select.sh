@@ -361,7 +361,11 @@ if [ "$STAMPS" = "1" ]; then
       # whether the diff is mixed); full/testmon demands ignore them. An
       # installed stamp lib predating #123-D also just ignores them.
       if gate_stamp_check "$STAMP_TREE" "$TIER_TO_RUN" "$STAMP_ENV" "$SET_CSV" "$has_py"; then
-        note "green-tree stamp covers tree $STAMP_TREE (proven ≥ $TIER_TO_RUN for this env) — skipping suite"
+        if [ "$TIER_TO_RUN" = "selected" ]; then
+          note "green-tree stamp covers tree $STAMP_TREE (this selection already proven for this env) — skipping suite"
+        else
+          note "green-tree stamp covers tree $STAMP_TREE (proven ≥ $TIER_TO_RUN for this env) — skipping suite"
+        fi
         exit 0
       fi
     fi

@@ -284,7 +284,7 @@ def test_mint_selected_records_set_and_testmon_flag(repo: Path) -> None:
 
     assert proc.returncode == 0, proc.stderr
     content = (_stamps_dir(repo) / tree).read_text()
-    assert "tier=selected\n" in content
+    assert "tier=selected-set\n" in content
     assert f"set={SET_AB}\n" in content
     assert "testmon=1\n" in content
 
@@ -346,3 +346,31 @@ def test_mixed_selected_demand_requires_testmon_flag(repo: Path) -> None:
 
     assert refused.returncode not in (0, _LIB_LOAD_FAILED)
     assert covered.returncode == 0, covered.stderr
+
+
+def test_legacy_selected_token_covers_nothing_even_with_set(repo: Path) -> None:
+    # D-review compat pin: a stamp carrying the OLD `selected` token — whatever
+    # else it carries — was minted by a writer without set semantics; the new
+    # reader must refuse it rather than trust a set= line it can't attribute.
+    tree = _tree(repo)
+    stamps = _stamps_dir(repo)
+    stamps.mkdir(parents=True, exist_ok=True)
+    (stamps / tree).write_text("tier=selected\nenv=py3.12\nset=tests/unit/test_a.py\n")
+
+    proc = _lib(repo, f'gate_stamp_check "{tree}" selected "py3.12" "tests/unit/test_a.py"')
+
+    assert proc.returncode not in (0, _LIB_LOAD_FAILED)
+
+
+def test_glob_demand_item_matches_literally_not_by_expansion(repo: Path) -> None:
+    # D-review: an unquoted word-split expanded demand items against the cwd,
+    # so `test_*.py` could cover from a stamp that never named it. Items must
+    # compare literally.
+    tree = _tree(repo)
+    (repo / "tests" / "unit").mkdir(parents=True)
+    (repo / "tests" / "unit" / "test_a.py").write_text("x = 1\n")  # a glob target
+    _lib(repo, f'gate_stamp_mint "{tree}" selected "py3.12" "tests/unit/test_a.py"')
+
+    proc = _lib(repo, f'gate_stamp_check "{tree}" selected "py3.12" "tests/unit/test_*.py"')
+
+    assert proc.returncode not in (0, _LIB_LOAD_FAILED)  # never covered via expansion

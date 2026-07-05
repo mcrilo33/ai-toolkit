@@ -932,7 +932,7 @@ def test_selected_pass_mints_selected_stamp_with_set(repo: Path, tmp_path: Path)
 
     assert proc.returncode == 0, proc.stderr
     content = _stamp_path(repo).read_text()
-    assert "tier=selected\n" in content
+    assert "tier=selected-set\n" in content
     assert "set=tests/unit/test_do.py\n" in content
 
 
@@ -1144,7 +1144,7 @@ def test_mixed_selected_green_mints_testmon_flag_and_repush_skips(
     content = _stamp_path(repo).read_text()
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
-    assert "tier=selected\n" in content
+    assert "tier=selected-set\n" in content
     assert "testmon=1\n" in content  # the mixed run proved testmon too
     assert proc.returncode == 0, proc.stderr
     assert _runlog(runlog) == after_first  # identical mixed re-push skips
