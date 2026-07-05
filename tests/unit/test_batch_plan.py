@@ -219,6 +219,37 @@ def test_hold_label_is_case_insensitive_among_other_labels() -> None:
     assert batch == [2], "a HOLD-labelled issue is excluded even alongside other labels"
 
 
+# ── priority label: dispatched ahead of equally-eligible peers (issue #147) ───
+
+
+def test_priority_label_outranks_higher_criticalpath_depth() -> None:
+    # #20 has the deeper critical-path tail (it blocks #21), so by depth alone it
+    # ranks first — but #10 carries `priority` and they collide on shared.py, so
+    # only one is picked. Priority must win the seat.
+    nodes = [
+        _node(10, "shared.py", labels=["priority"]),
+        _node(20, "shared.py"),
+        _node(21, "a.py", blocked_by=[(20, "OPEN")]),
+    ]
+
+    batch = _plan(nodes)
+
+    assert batch[0] == 10, "a priority issue outranks a deeper-critical-path peer"
+    assert 20 not in batch, "#20 collides on shared.py with the higher-priority #10"
+
+
+def test_priority_issue_still_batches_with_disjoint_peer() -> None:
+    # Priority reorders but does not serialize: a priority issue and a disjoint
+    # non-priority peer are BOTH dispatched, the priority one ordered first even
+    # though its higher number would otherwise put it last.
+    nodes = [_node(2, "a.py"), _node(9, "b.py", labels=["priority"])]
+
+    batch = _plan(nodes)
+
+    assert set(batch) == {2, 9}, "disjoint concurrency is preserved"
+    assert batch[0] == 9, "the priority issue is ordered first despite the higher number"
+
+
 # ── merge-candidate lint: colliding-scope serialized chains warn (issue #125) ─
 
 
