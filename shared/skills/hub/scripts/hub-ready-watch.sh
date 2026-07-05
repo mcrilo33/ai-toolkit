@@ -146,7 +146,9 @@ fi
 # tags but with its own independent seen-set. Best-effort: a missing script or a
 # notifier failure must never abort the ready watch.
 if [ -x "$_script_dir/hub-notify.sh" ]; then
-  bash "$_script_dir/hub-notify.sh" || true
+  # This run already fetched tags above; tell hub-notify to reuse them rather
+  # than fire a second identical fetch on the same poll.
+  HUB_NOTIFY_SKIP_FETCH=1 bash "$_script_dir/hub-notify.sh" || true
 fi
 
 exit 0

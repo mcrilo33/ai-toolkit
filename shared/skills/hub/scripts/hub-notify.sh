@@ -115,8 +115,12 @@ message_for() {
 
 # Best-effort fetch: a finished spoke's marker is already locally visible
 # (shared ref store), so detection works offline; the fetch only catches tags
-# pushed from elsewhere. Never let its failure abort the watcher.
-git -C "$main_root" fetch --tags --quiet origin >/dev/null 2>&1 || true
+# pushed from elsewhere. Never let its failure abort the watcher. Skipped when
+# HUB_NOTIFY_SKIP_FETCH=1 — hub-ready-watch already fetched tags this poll, so
+# re-fetching would double the network round-trip (and the stall on a slow SSH).
+if [ "${HUB_NOTIFY_SKIP_FETCH:-0}" != "1" ]; then
+  git -C "$main_root" fetch --tags --quiet origin >/dev/null 2>&1 || true
+fi
 
 # Current marker set across the three watched namespaces: "<tag> <sha>" per tag.
 current="$(
