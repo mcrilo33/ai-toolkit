@@ -954,7 +954,9 @@ class TestHookIdempotency:
     def test_claude_counts_match_metadata(self, target_repo: Path) -> None:
         _run_sync(target_repo, "all")
         settings = json.loads((target_repo / ".claude" / "settings.json").read_text())
-        assert self._owned_claude_handlers(settings) == _hook_event_counts(_CLAUDE_EVENT_MAP)
+        assert self._owned_claude_handlers(settings) == _hook_event_counts(
+            _CLAUDE_EVENT_MAP, tool="claude"
+        )
 
     def test_counts_stable_after_repeated_runs(self, target_repo: Path) -> None:
         """Five syncs yield exactly one entry per shared hook per event."""
@@ -965,7 +967,9 @@ class TestHookIdempotency:
         assert self._owned_cursor_entries(hooks_json) == _hook_event_counts(
             _CURSOR_EVENT_MAP, tool="cursor"
         )
-        assert self._owned_claude_handlers(settings) == _hook_event_counts(_CLAUDE_EVENT_MAP)
+        assert self._owned_claude_handlers(settings) == _hook_event_counts(
+            _CLAUDE_EVENT_MAP, tool="claude"
+        )
 
     def test_self_heals_bloated_cursor_file(self, target_repo: Path) -> None:
         """A pre-bloated hooks.json shrinks to the canonical set on next sync."""

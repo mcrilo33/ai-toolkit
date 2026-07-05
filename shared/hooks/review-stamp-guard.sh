@@ -1,17 +1,31 @@
 #!/usr/bin/env bash
-# review-stamp-guard — beforeMCPExecution hook (Cursor, failClosed).
+# review-stamp-guard — beforeMCPExecution hook (Cursor, failClosed) and
+# PreToolUse hook (Claude Code, telemetry-only).
 #
-# Gates the review-stamp MCP tool `approve_review` behind a review window:
-# the call is allowed ONLY while `.review/.window` exists and is younger than
-# the TTL. The window is opened by review-window-open.sh when a code-review
-# subagent starts and closed by review-window-close.sh when it stops, so the
-# implementing agent cannot mint its own approval outside a live review.
+# Cursor: gates the review-stamp MCP tool `approve_review` behind a review
+# window: the call is allowed ONLY while `.review/.window` exists and is
+# younger than the TTL. The window is opened by review-window-open.sh when a
+# code-review subagent starts and closed by review-window-close.sh when it
+# stops, so the implementing agent cannot mint its own approval outside a live
+# review.
 #
 # beforeMCPExecution carries tool identity and workspace roots but NO agent
 # identity — the decision is tool_name + window state only.
 #
-# Exit 2 = deny (no window / stale window)
-# Exit 0 = allow (other tools, or a fresh window)
+# Claude Code (#139): fires as PreToolUse on mcp__review-stamp__approve_review.
+# There is NO window check on this path — nothing opens a window in Claude
+# Code; enforcement there is (and remains) the positive per-agent MCP wiring
+# in the code-review agent frontmatter. The hook only contributes the
+# step:review cycle marker, so the REVIEW step auto-populates the spokecycle-
+# trace. Only an explicit hook_event_name=PreToolUse takes this path — an
+# absent/unknown event keeps the fail-closed Cursor behavior.
+#
+# Both allow paths emit the marker (idempotent on HEAD via
+# telemetry_mark_cycle_step); a denied approve emits nothing — a refused
+# review must not mark REVIEW as happened.
+#
+# Exit 2 = deny (Cursor: no window / stale window)
+# Exit 0 = allow (other tools, a fresh window, or the Claude Code path)
 set -euo pipefail
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,8 +36,28 @@ WINDOW_TTL_SECONDS=1800
 INPUT=$(read_stdin)
 TOOL_NAME=$(get_tool_name "$INPUT")
 
-# Only the approve_review tool is gated.
-[ "$TOOL_NAME" = "approve_review" ] || exit 0
+# Only the approve_review tool is gated — bare (Cursor) or MCP-prefixed
+# (Claude Code names the tool mcp__<server>__approve_review).
+case "$TOOL_NAME" in
+  approve_review | mcp__*__approve_review) ;;
+  *) exit 0 ;;
+esac
+
+# The step:review cycle marker (#139), shared by both allow paths below.
+# Idempotent on the project root's HEAD (the helper's default key): an
+# approve retried on the same diff emits nothing; a re-review after fix
+# commits sits on a new HEAD and earns a fresh marker.
+mark_step_review() {
+  if command -v telemetry_mark_cycle_step >/dev/null 2>&1; then
+    telemetry_mark_cycle_step review
+  fi
+}
+
+# Claude Code path: allow + marker, no window semantics (see header).
+if [ "$(get_hook_event "$INPUT")" = "PreToolUse" ]; then
+  mark_step_review
+  exit 0
+fi
 
 PROJECT_ROOT=$(project_root_from_payload "$INPUT")
 WINDOW="$PROJECT_ROOT/.review/.window"
@@ -55,4 +89,5 @@ else
   deny "review-stamp-guard: approve_review denied — cannot stat the review window."
 fi
 
+mark_step_review
 exit 0

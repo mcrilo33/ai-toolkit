@@ -221,6 +221,13 @@ delegation-gate-warn:
 review-stamp-guard:
   description: "Gate the review-stamp approve_review MCP tool behind a fresh code-review window"
   tier: 1
+  # Claude wiring (#139): telemetry-only — the guard emits the step:review
+  # cycle marker and allows (enforcement in Claude Code is the per-agent MCP
+  # wiring). The event lives in the claude block, NOT top-level, so Copilot
+  # (which has no per-tool block here) stays unwired.
+  claude:
+    event: preToolUse
+    matcher: "mcp__review-stamp__approve_review"
   cursor:
     event: beforeMCPExecution
     matcher: "approve_review"
