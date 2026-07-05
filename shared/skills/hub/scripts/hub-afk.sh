@@ -1237,9 +1237,13 @@ dispatch_batch() {
 # --- auto-land + reap passes --------------------------------------------------
 
 # _afk_run_with_heartbeat <cmd...> -> run <cmd...> while stamping the heartbeat every
-# AFK_LAND_HEARTBEAT_SECONDS (default 30). A long tick phase (auto-land's 6-10min
-# suite) otherwise leaves the tick-top stamp to go stale mid-land: --status reports
-# STALE and the watchdog could respawn a second supervisor into a live drain (#133).
+# AFK_LAND_HEARTBEAT_SECONDS (default 30), so the heartbeat EPOCH stays honest through
+# the longest tick phase (auto-land's 6-10min suite) instead of freezing at tick top
+# (#133 item 4). Honest scope (ST4 review): afk_supervisor_state is currently
+# pid-based, so a stale epoch alone cannot flip --status to STALE or trigger a
+# watchdog respawn today — this keeps the epoch trustworthy for the operator-facing
+# age display and for the #107 UPGRADE (a tick-recency check), which must not
+# misread a live land as a dead supervisor when it lands.
 # Returns the command's exit code (a failed land must still escalate).
 _afk_run_with_heartbeat() {
   local child rc slept interval="${AFK_LAND_HEARTBEAT_SECONDS:-30}"

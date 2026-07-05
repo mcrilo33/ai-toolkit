@@ -2081,24 +2081,63 @@ def test_auto_land_lands_foreign_ready_spoke_by_default(spoke_repo: Path, tmp_pa
 
 
 # ── heartbeat freshness through long tick phases (issue #133, subtask 4) ──────
-# The 2026-07-04 drain: the heartbeat is stamped once at tick top, and auto_land then
-# runs a 6-10min worktree-land suite synchronously — --status read STALE (and the
-# watchdog could respawn a second supervisor) mid-land.
+# The heartbeat is stamped once at tick top, and auto_land then runs a 6-10min land
+# suite synchronously, freezing the epoch mid-land. Honest scope (ST4 review):
+# afk_supervisor_state is pid-based today, so the frozen epoch alone cannot flip
+# --status to STALE — these tests pin the epoch staying honest for the age display
+# and for the #107 UPGRADE (tick-recency), which must not misread a live land.
 
 
-def test_run_with_heartbeat_stamps_during_slow_command(tmp_path: Path) -> None:
+def test_run_with_heartbeat_stamps_periodically_during_slow_command(tmp_path: Path) -> None:
+    # Counts stamps via a stub: a mutant that runs the command synchronously and
+    # stamps once at the end must FAIL here — the periodic loop is the feature.
+    stamps = tmp_path / "stamps"
+
+    result = _call(
+        f'afk_write_heartbeat() {{ printf x >> "{stamps}"; }}; '
+        "_afk_run_with_heartbeat sleep 3; echo RC=$?",
+        env={"AFK_LAND_HEARTBEAT_SECONDS": "1"},
+    )
+
+    assert "RC=0" in result.stdout, result.stdout + result.stderr
+    count = len(stamps.read_text())
+    assert count >= 3, f"expected periodic stamps during a 3s command at 1s interval, got {count}"
+
+
+def test_run_with_heartbeat_stamps_supervisor_pid_and_fresh_epoch(tmp_path: Path) -> None:
+    # The stamped pid must be the SUPERVISOR's ($$ of the sourcing shell), not a
+    # child's or a subshell's — afk_supervisor_state trusts it for live/stale.
     hb = tmp_path / "heartbeat"
     hb.write_text("999 1000\n")  # stale: pid 999, epoch 1000
     start = int(time.time())
 
     result = _call(
-        "_afk_run_with_heartbeat sleep 3; echo RC=$?",
+        'echo "SHELL_PID=$$"; _afk_run_with_heartbeat sleep 2; echo RC=$?',
         env={"AFK_HEARTBEAT": str(hb), "AFK_LAND_HEARTBEAT_SECONDS": "1"},
     )
 
     assert "RC=0" in result.stdout, result.stdout + result.stderr
-    epoch = int(hb.read_text().split()[1])
-    assert epoch >= start, f"heartbeat must be stamped while the command runs, got {hb.read_text()}"
+    shell_pid = next(
+        ln.split("=")[1] for ln in result.stdout.splitlines() if ln.startswith("SHELL_PID=")
+    )
+    pid, epoch = hb.read_text().split()
+    assert pid == shell_pid, f"heartbeat pid must be the supervisor's, got {pid} != {shell_pid}"
+    assert int(epoch) >= start, f"epoch must be fresh, got {hb.read_text()}"
+
+
+def test_run_with_heartbeat_returns_promptly_for_fast_command(tmp_path: Path) -> None:
+    # The 1-second child re-check: a fast command under the default-scale interval
+    # must not hold the tick for the full interval.
+    hb = tmp_path / "heartbeat"
+    start = time.time()
+
+    result = _call(
+        "_afk_run_with_heartbeat true; echo RC=$?",
+        env={"AFK_HEARTBEAT": str(hb), "AFK_LAND_HEARTBEAT_SECONDS": "30"},
+    )
+
+    assert "RC=0" in result.stdout, result.stdout + result.stderr
+    assert time.time() - start < 10, "a fast command must return well before the 30s interval"
 
 
 def test_run_with_heartbeat_propagates_exit_code(tmp_path: Path) -> None:
@@ -2142,6 +2181,37 @@ def test_auto_land_keeps_heartbeat_fresh_during_slow_land(spoke_repo: Path, tmp_
     assert land_log.read_text().split() == ["5"], "the land itself must still happen"
     epoch = int(hb.read_text().split()[1])
     assert epoch >= start, f"the heartbeat must stay fresh THROUGH the land, got {hb.read_text()}"
+
+
+def test_auto_land_failing_land_still_escalates_through_wrapper(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # End to end through the real call site: a land that fails under the heartbeat
+    # wrapper must still emit blocked/<issue>.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    wt_land = tmp_path / "wtland.sh"
+    wt_land.write_text("#!/usr/bin/env bash\nexit 1\n")
+    wt_land.chmod(0o755)
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+    statedir = tmp_path / "statedir"
+
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+    result = _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "SPOKE_READY": str(ready_stub),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_LAND_HEARTBEAT_SECONDS": "1",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--blocked 5" in ready_log.read_text(), "a failed land must still escalate"
 
 
 def test_auto_land_skips_foreign_ready_spoke_when_opted_out(
