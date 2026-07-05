@@ -1204,7 +1204,8 @@ class TestConfigDrivenSync:
         env = target_repo / ".ai-toolkit" / "scripts" / "spoke-model.env"
         assert env.exists()
         text = env.read_text()
-        assert "WT_AGENT_MODEL_DEFAULT=claude-opus-4-8[1m]" in text
+        # Values are shell-quoted so the consumer can source/eval them safely.
+        assert "WT_AGENT_MODEL_DEFAULT='claude-opus-4-8[1m]'" in text
         assert "WT_AGENT_EFFORT_DEFAULT=max" in text
 
     def test_base_branch_set_from_config(self, target_repo: Path, tmp_path: Path) -> None:
