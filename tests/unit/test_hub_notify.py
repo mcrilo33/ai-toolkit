@@ -135,7 +135,7 @@ def test_seen_marker_is_not_refired(hub: Path, tmp_path: Path) -> None:
 def test_retagged_marker_refires(hub: Path, tmp_path: Path) -> None:
     seen = tmp_path / "seen"
     _git(hub, "tag", "ready/1", "feature/1-work")
-    _run(hub, tmp_path, seen_file=seen)
+    _proc, before = _run(hub, tmp_path, seen_file=seen)
 
     # Spoke pushes more and re-tags at the new tip (git tag -f) → fresh sha.
     (hub / "b.txt").write_text("b\n")
@@ -145,9 +145,12 @@ def test_retagged_marker_refires(hub: Path, tmp_path: Path) -> None:
     _git(hub, "tag", "-f", "ready/1", "feature/1-work")
     _git(hub, "checkout", "-q", "main")
 
-    _proc, messages = _run(hub, tmp_path, seen_file=seen)
+    # The captured log accumulates across runs (shared tmp_path notifier), so the
+    # moved marker being a fresh transition means exactly one NEW notification.
+    _proc2, after = _run(hub, tmp_path, seen_file=seen)
 
-    assert len(messages) == 1  # the moved marker is a fresh transition
+    assert len(after) == len(before) + 1
+    assert "#1" in after[-1]
 
 
 def test_each_marker_class_fires_once(hub: Path, tmp_path: Path) -> None:
