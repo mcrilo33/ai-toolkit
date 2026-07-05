@@ -952,7 +952,8 @@ def test_decide_and_act_suppresses_seed_replay_answer(tmp_path: Path) -> None:
     result = _call(f"decide_and_act '{spoke}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    assert " -l " not in f" {tmux_log.read_text()} ", "a seed replay must never be pasted"
+    tmux_calls = tmux_log.read_text() if tmux_log.exists() else ""
+    assert " -l " not in f" {tmux_calls} ", "a seed replay must never be pasted"
     log = ready_log.read_text()
     assert "--blocked 5" in log
     assert "seed" in log, f"the reason must name the seed replay, got: {log}"
@@ -1035,7 +1036,8 @@ def test_decide_and_act_aborts_when_no_longer_parked(tmp_path: Path) -> None:
     result = _call(f"decide_and_act '{spoke}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    assert " -l " not in f" {tmux_log.read_text()} ", "a stale answer must never be injected"
+    tmux_calls = tmux_log.read_text() if tmux_log.exists() else ""
+    assert " -l " not in f" {tmux_calls} ", "a stale answer must never be injected"
     assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
         "no longer parked is not an escalation — the next tick re-evaluates"
     )
@@ -1062,7 +1064,8 @@ def test_decide_and_act_aborts_when_question_changed(tmp_path: Path) -> None:
     result = _call(f"decide_and_act '{spoke}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    assert " -l " not in f" {tmux_log.read_text()} ", "an answer to a superseded question is stale"
+    tmux_calls = tmux_log.read_text() if tmux_log.exists() else ""
+    assert " -l " not in f" {tmux_calls} ", "an answer to a superseded question is stale"
     assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
 
 

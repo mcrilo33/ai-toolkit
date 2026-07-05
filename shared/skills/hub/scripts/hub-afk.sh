@@ -394,6 +394,58 @@ print(out[:4000].strip())
 PYEOF
 }
 
+# _is_seed_replay <wt_path> <text> -> true when <text> substantially replays the
+# spoke's SEED prompt (the first user message in its transcript): normalized-whitespace,
+# case-folded containment of the answer's first 200 chars in the seed, or of the whole
+# seed in the answer. Short answers (< AFK_SEED_REPLAY_MIN_CHARS, default 80) are
+# exempt — option labels legitimately appear inside a long kickoff. #124: the answerer
+# echoed the kickoff back into a parked spoke six ticks in a row; a replay is never
+# injected. Unreadable transcript / no python ⇒ not a replay (fail-open to answering).
+_is_seed_replay() {
+  local wt="$1" text="$2" jsonl
+  jsonl="$(_spoke_jsonl "$wt")"
+  [ -n "$jsonl" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  _AFK_JSONL="$jsonl" _AFK_TEXT="$text" python3 2>/dev/null <<'PYEOF'
+import json, os, re, sys
+
+def norm(s):
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+seed = ""
+try:
+    with open(os.environ["_AFK_JSONL"]) as fh:
+        for raw in fh:
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(obj, dict) or obj.get("type") != "user":
+                continue
+            content = (obj.get("message") or {}).get("content") or []
+            if isinstance(content, str) and content.strip():
+                seed = content
+                break
+            if isinstance(content, list):
+                texts = [b.get("text") or "" for b in content
+                         if isinstance(b, dict) and b.get("type") == "text"]
+                if any(t.strip() for t in texts):
+                    seed = "\n".join(texts)
+                    break
+except Exception:
+    sys.exit(1)
+
+ans = norm(os.environ.get("_AFK_TEXT", ""))
+seed = norm(seed)
+try:
+    floor = int(os.environ.get("AFK_SEED_REPLAY_MIN_CHARS", "80"))
+except ValueError:
+    floor = 80
+replay = bool(seed) and len(ans) >= floor and (ans[:200] in seed or seed in ans)
+sys.exit(0 if replay else 1)
+PYEOF
+}
+
 # --- slot state ---------------------------------------------------------------
 # slot_state <wt_path> <issue> -> done|waiting|reap|busy.
 #   done    — a TERMINAL marker (ready/accept/blocked) at the branch tip.
@@ -432,6 +484,30 @@ spoke_over_ceiling() {
   case "$epoch" in '' | *[!0-9]*) return 1 ;; esac
   case "$now" in '' | *[!0-9]*) return 1 ;; esac
   [ "$(( (now - epoch) / 60 ))" -gt "$AFK_SPOKE_MAX_MINUTES" ]
+}
+
+# _gate_parked <wt> <issue> -> true when a gate/<issue> tag sits AT the branch tip:
+# the spoke is parked at its PLAN gate. The same check slot_state does inline; here
+# for the answerer's gate routing and its pre-inject re-check (#133).
+_gate_parked() {
+  local wt="$1" issue="$2" tip
+  tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)" || return 1
+  [ -n "$tip" ] || return 1
+  [ "$(git -C "$wt" rev-parse -q --verify "refs/tags/gate/${issue}^{commit}" 2>/dev/null)" = "$tip" ]
+}
+
+# _still_parked_same <wt> <issue> <was_gate> <question> -> true when the spoke is still
+# parked on the SAME prompt the answerer reasoned about. The answerer takes minutes; a
+# spoke that moved on meanwhile (a human replied, the turn resumed) must not receive
+# the stale answer mid-turn (#129/#89), and a spoke now parked on a DIFFERENT question
+# needs a fresh answer, not this one.
+_still_parked_same() {
+  local wt="$1" issue="$2" was_gate="$3" question="$4"
+  if [ "$was_gate" -eq 1 ]; then
+    _gate_parked "$wt" "$issue"
+    return $?
+  fi
+  [ "$(extract_pending_question "$wt")" = "$question" ]
 }
 
 # --- the answerer (the one reasoning step) ------------------------------------
@@ -634,9 +710,21 @@ _consume_gate_tag() {
 # answer, or escalate to blocked/<issue>. Fail-safe: an answerer that returns no decision
 # (or an answer we cannot inject) escalates rather than guessing.
 decide_and_act() {
-  local wt="$1" issue="$2" question raw rc decision kind text target
-  question="$(extract_pending_question "$wt")"
-  [ -n "$question" ] || return 0
+  local wt="$1" issue="$2" question orig_question raw rc decision kind text target was_gate=0
+  _gate_parked "$wt" "$issue" && was_gate=1
+  orig_question="$(extract_pending_question "$wt")"
+  question="$orig_question"
+  if [ "$was_gate" -eq 1 ]; then
+    # Route a PLAN-gate park to approve/amend-the-POSTED-PLAN — generic transcript
+    # re-extraction is what replayed the seed six times in #124. The fallback keeps an
+    # unextractable gate park (rotated transcript, no gate Bash record) answerable
+    # instead of silently stranded.
+    question="The spoke is parked at its PLAN gate; below is the plan it posted. Approve it or state precise amendments to it. Do NOT restate or re-issue the task itself.
+
+${orig_question:-(the plan prose could not be extracted from the transcript — approve or amend from the issue contract above)}"
+  elif [ -z "$question" ]; then
+    return 0
+  fi
   log "→ answering #$issue (parked on input)"
   raw="$(run_answerer "$issue" "$question")"; rc=$?
   # The answerer is the supervisor's own `claude`; if its credentials are dead, every
@@ -655,29 +743,39 @@ decide_and_act() {
   kind="${decision%%$'\t'*}"
   text="${decision#*$'\t'}"
   if [ "$kind" = "ANSWER" ] && [ -n "$text" ]; then
-    target="$(_spoke_pane_target "$wt")"
-    if [ -z "$target" ]; then
-      text="could not locate spoke pane to inject the answer"
+    if _is_seed_replay "$wt" "$text"; then
+      log "  answer to #$issue replays the spoke's own seed prompt — suppressing (#124)"
+      text="answerer replayed the spoke's seed prompt — suppressed; needs a human"
+    elif ! _still_parked_same "$wt" "$issue" "$was_gate" "$orig_question"; then
+      # The spoke moved on while the answerer reasoned — injecting now would land
+      # mid-turn (#129/#89). Drop the stale answer; the next tick re-evaluates.
+      log "  #$issue is no longer parked on that prompt — dropping the stale answer"
+      return 0
     else
-      inject_and_verify "$wt" "$target" "$text"; rc=$?
-      if [ "$rc" -eq 0 ]; then
-        log "  injected answer into #$issue"
-        _consume_gate_tag "$wt" "$issue"
-        afk_emit_decision "$wt" success
-        return 0
-      elif [ "$rc" -eq 2 ] && respawn_wedged_spoke "$wt" "$issue" "$text"; then
-        # The wedged composer was recovered by a pane respawn that carries the answer
-        # as its --continue prompt — delivered, same success contract as an inject.
-        _consume_gate_tag "$wt" "$issue"
-        afk_emit_decision "$wt" success
-        return 0
-      elif [ "$rc" -eq 2 ]; then
-        # The old window is dead and the answer text lives nowhere else — carry its
-        # head in the blocked reason so the returning human need not re-derive it.
-        text="composer wedged and the pane respawn could not be confirmed — needs a human; the undelivered answer began: $(printf '%.120s' "${text%%$'\n'*}")"
+      target="$(_spoke_pane_target "$wt")"
+      if [ -z "$target" ]; then
+        text="could not locate spoke pane to inject the answer"
       else
-        log "  answer to #$issue did not register — escalating"
-        text="answer did not register in the spoke (inject not confirmed) — needs a human"
+        inject_and_verify "$wt" "$target" "$text"; rc=$?
+        if [ "$rc" -eq 0 ]; then
+          log "  injected answer into #$issue"
+          _consume_gate_tag "$wt" "$issue"
+          afk_emit_decision "$wt" success
+          return 0
+        elif [ "$rc" -eq 2 ] && respawn_wedged_spoke "$wt" "$issue" "$text"; then
+          # The wedged composer was recovered by a pane respawn that carries the answer
+          # as its --continue prompt — delivered, same success contract as an inject.
+          _consume_gate_tag "$wt" "$issue"
+          afk_emit_decision "$wt" success
+          return 0
+        elif [ "$rc" -eq 2 ]; then
+          # The old window is dead and the answer text lives nowhere else — carry its
+          # head in the blocked reason so the returning human need not re-derive it.
+          text="composer wedged and the pane respawn could not be confirmed — needs a human; the undelivered answer began: $(printf '%.120s' "${text%%$'\n'*}")"
+        else
+          log "  answer to #$issue did not register — escalating"
+          text="answer did not register in the spoke (inject not confirmed) — needs a human"
+        fi
       fi
     fi
   elif [ "$kind" = "ESCALATE" ]; then
