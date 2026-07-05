@@ -1348,3 +1348,53 @@ def test_land_warns_but_succeeds_when_sweep_launch_fails(hub: Path, tmp_path: Pa
     assert proc.returncode == 0, proc.stderr
     assert "post-land sweep failed to launch" in proc.stderr
     assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()  # still landed
+
+
+def test_land_spawns_sweep_only_after_main_is_pushed(hub: Path, tmp_path: Path) -> None:
+    # Placement guard: the sweep must fire AFTER the ship push — a spawn before
+    # a rejected push would sweep (and possibly file an issue for) a tree that
+    # rolls back. The stub records origin/main at spawn time; it must already
+    # equal the merged commit.
+    _make_spoke(hub, tmp_path, "feature/1-ordswp", push=True)
+    _mint_stamp(hub, "feature/1-ordswp", "testmon")
+    spawn_log = tmp_path / "sweep-spawn.log"
+    stub = tmp_path / "sweep-stub.sh"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f'printf "ARGS %s\\nORIGIN %s\\n" "$*" "$(git rev-parse origin/main)" >> "{spawn_log}"\n'
+    )
+    stub.chmod(0o755)
+
+    proc, _ = _run_land(hub, tmp_path, "1", extra_env={"GATE_SWEEP_BIN": str(stub)})
+
+    assert proc.returncode == 0, proc.stderr
+    merged = _git(hub, "rev-parse", "HEAD").strip()
+    text = spawn_log.read_text()
+    assert f"--spawn {merged}" in text  # spawned for the merged commit…
+    assert f"ORIGIN {merged}" in text  # …and only after main reached origin
+
+
+def test_diverged_merge_land_sweeps_from_gate_minted_stamp(hub: Path, tmp_path: Path) -> None:
+    # A diverged land builds a NEW merge tree that only the land's own push
+    # gate stamps; the spawn decision must see that stamp — pinning both the
+    # after-the-push ordering and the merge-commit path in one scenario.
+    _make_spoke(hub, tmp_path, "feature/1-divswp", push=True)
+    _diverge_hub(hub)
+    runner_log = tmp_path / "sweep-runner.log"
+    stamps = hub / ".git" / ".gate-stamps"
+    hook = hub / ".git" / "hooks" / "pre-push"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f'mkdir -p "{stamps}"\n'
+        f'printf "tier=testmon\\nenv=test\\n" > "{stamps}/$(git rev-parse "HEAD^{{tree}}")"\n'
+        "exit 0\n"
+    )
+    hook.chmod(0o755)
+
+    proc, _ = _run_land(
+        hub, tmp_path, "1", extra_env={"GATE_SWEEP_CMD": f'echo RUN >> "{runner_log}"'}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "launching background full-suite sweep" in proc.stdout
+    assert _wait_for_file(runner_log), "diverged-merge land never swept its gate-stamped tree"
