@@ -107,15 +107,52 @@ def test_check_detects_ref_move(repo: Path) -> None:
     assert "refs/heads/main" in proc.stdout
 
 
-def test_restore_resets_moved_ref(repo: Path) -> None:
-    before = _rev(repo, "main")
+def test_restore_refuses_rewind_to_strict_ancestor(repo: Path) -> None:
+    # A ref that only GAINED commits (snapshot tip is a strict ancestor of the
+    # current tip) must not be rewound — that orphans commits (issue #135's
+    # data loss). Restore warns and leaves the ref alone; the abort, not the
+    # rewind, is the protection.
     proc = _lib(
         repo,
         'b="$(tripwire_capture)"\ngit commit --allow-empty -q -m sneak\ntripwire_restore "$b"',
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert _rev(repo, "main") == before  # the moved ref is back
+    tip = _rev(repo, "main")
+    assert _git(repo, "log", "-1", "--format=%s", "main").strip() == "sneak"  # not rewound
+    assert "NOT rewinding" in proc.stderr
+    assert "refs/heads/main" in proc.stderr
+    assert tip == _rev(repo, "main")
+
+
+def test_restore_still_recovers_rewound_ref(repo: Path) -> None:
+    # The inverse move — the ref LOST commits during the run (snapshot tip is
+    # ahead of the current tip) — is genuine corruption; restore must still
+    # bring the ref forward to the snapshot.
+    tip = _commit(repo, {"src/a.py": "x = 1\n"})
+    proc = _lib(
+        repo,
+        'b="$(tripwire_capture)"\ngit reset -q --hard HEAD~1\ntripwire_restore "$b"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert _rev(repo, "main") == tip  # the lost commit is back
+
+
+def test_restore_skips_deleting_ref_checked_out_in_worktree(repo: Path, tmp_path: Path) -> None:
+    # A ref that appeared during the run but is checked out in a registered
+    # worktree is a live spoke's branch — deleting it destroys the spoke's
+    # anchor. Restore must leave it in place.
+    wt = tmp_path / "spawned"
+    proc = _lib(
+        repo,
+        'b="$(tripwire_capture)"\n'
+        f'git worktree add -q -b feature/spawned "{wt}"\n'
+        'tripwire_restore "$b"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert _rev(repo, "refs/heads/feature/spawned")  # still exists
 
 
 def test_check_detects_bare_flip(repo: Path) -> None:
@@ -277,7 +314,11 @@ def test_breach_ref_move_aborts_and_restores(repo: Path, tmp_path: Path) -> None
 
     assert proc.returncode == BREACH_RC, proc.stderr  # push aborted, not 0
     assert "refs/heads/main" in proc.stderr  # names the changed marker
-    assert _rev(repo, "main") == before  # repo restored
+    # The sneak commit FF-advanced main, so restore refuses the rewind (data
+    # loss) and warns — the abort above is the protection (issue #135).
+    assert "NOT rewinding" in proc.stderr
+    assert _git(repo, "log", "-1", "--format=%s", "main").strip() == "sneak"
+    assert before in _git(repo, "log", "--format=%H", "main")  # ancestor intact
 
 
 def test_breach_bare_flip_aborts_and_restores(repo: Path, tmp_path: Path) -> None:
@@ -374,11 +415,12 @@ def test_backstop_node_bare_flip_breaches_and_restores(repo: Path, tmp_path: Pat
     assert _git(repo, "config", "--get", "core.bare").strip() == "false"  # restored
 
 
-def test_backstop_node_ref_move_breaches_and_restores(repo: Path, tmp_path: Path) -> None:
-    before = _rev(repo, "main")
+def test_backstop_node_ref_move_breaches_and_refuses_rewind(repo: Path, tmp_path: Path) -> None:
     _make_pytest_stub(tmp_path / "bin", "git commit --allow-empty -q -m sneak")
 
     proc = _run_node(repo, tmp_path / "bin")
 
-    assert "VERDICT=BREACH" in proc.stdout, proc.stderr
-    assert _rev(repo, "main") == before  # the moved ref is back
+    assert "VERDICT=BREACH" in proc.stdout, proc.stderr  # the block still fires
+    # FF advance → restore refuses the rewind and warns (issue #135).
+    assert "NOT rewinding" in proc.stderr
+    assert _git(repo, "log", "-1", "--format=%s", "main").strip() == "sneak"
