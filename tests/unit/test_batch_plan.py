@@ -746,3 +746,48 @@ def test_issue_hygiene_documents_blocked_by_creation_step() -> None:
     assert "never dispatches an issue while" in rule, (
         "the rule must state the never-before-a-blocker guarantee"
     )
+
+
+# ── ordering guarantee: AC #3 — both directions, explicitly (issue #148) ──────
+# The scheduler already enforces ordering off native blocked-by; these lock the
+# acceptance criterion in place: (1) a declared OPEN blocker holds its dependent
+# out of every batch, and closing it releases the dependent; (2) independent
+# disjoint-scope issues still batch and run concurrently.
+
+
+def test_never_dispatches_before_a_declared_blocker_closes() -> None:
+    # #2 declares blocked-by #1 (OPEN) — #2 must never be dispatched while #1 is open.
+    held = _plan([_node(1, "a.py"), _node(2, "b.py", blocked_by=[(1, "OPEN")])])
+
+    assert 2 not in held, "a dependent must not dispatch while its blocker is open"
+    assert held == [1], "only the unblocked blocker is dispatched"
+
+    # When #1 closes it leaves the OPEN backlog; #2 now sees only a CLOSED blocker
+    # and is released into the batch — the close is what unblocks it.
+    released = _plan([_node(2, "b.py", blocked_by=[(1, "CLOSED")])])
+
+    assert released == [2], "closing the declared blocker releases the dependent"
+
+
+def test_independent_disjoint_issues_batch_concurrently() -> None:
+    # Three ready issues, no blocked-by edges, disjoint scopes ⇒ all run at once.
+    batch = _plan([_node(1, "a.py"), _node(2, "b.py"), _node(3, "c.py")])
+
+    assert batch == [1, 2, 3], "independent disjoint-scope issues batch concurrently"
+
+
+def test_declared_blocker_holds_dependent_while_disjoint_peers_still_batch() -> None:
+    # Both guarantees at once: #2 (blocked-by #1 OPEN) is held, while the blocker #1
+    # and two disjoint independent peers #3/#4 all batch together — ordering serializes
+    # only the declared pair, never the independent work around it.
+    nodes = [
+        _node(1, "a.py"),
+        _node(2, "b.py", blocked_by=[(1, "OPEN")]),
+        _node(3, "c.py"),
+        _node(4, "d.py"),
+    ]
+
+    batch = _plan(nodes)
+
+    assert batch == [1, 3, 4], "the blocked dependent is held; disjoint peers still batch"
+    assert 2 not in batch
