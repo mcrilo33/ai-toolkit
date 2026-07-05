@@ -117,8 +117,8 @@ def rollup_metadata(totals: TokenTotals) -> dict[str, int]:
 
     ``written`` totals cache writes across both ephemeral TTL tiers — the 5m
     ``cache_creation_input_tokens`` plus the 1h ``input_cache_creation_1h`` (Issue #97).
-    The single source of truth for the three rollup writers (this module's update events,
-    plus the backfill and spoke-tree create-body rollups) so they cannot drift.
+    The single source of truth for both rollup writers (this module's update events
+    plus the spoke-tree create-body rollups) so they cannot drift.
 
     Args:
         totals: Subtree token totals from :func:`subtree_totals`.

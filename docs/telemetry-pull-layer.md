@@ -1,17 +1,21 @@
 # Telemetry pull layer (Issue #22)
 
-The pull layer reconstructs spans from Claude session logs and attributes tokens
-to every span. It is the counterpart to Issue #21's push layer (hooks and
-scripts emitting spans at runtime) and builds against #21's frozen span schema
-(`docs/telemetry-span-schema.md`) verbatim.
+The pull layer is the **land-time view builder**: `langfuse_spoke_tree.py`, run
+once per land by `scripts/telemetry-ingest-spoke.sh`, parses the spoke's session
+logs and raw request bodies on-machine and assembles the `spoketree-` nested
+view and the `spokecycle-` todo view in Langfuse. It is the counterpart to
+Issue #21's push layer (hooks and scripts emitting spans at runtime) and builds
+against #21's frozen span schema (`docs/telemetry-span-schema.md`) verbatim.
 
 > [!NOTE]
 > Issue #90 retired the Streamlit dashboard and its pull-only DuckDB store
 > (`telemetry/store.py` + the DuckDB query layer `telemetry/queries.py`).
 > Observability now lives on **Langfuse** (the push path under
-> `dashboard/langfuse/otelcol.yaml` + `langfuse_*.py`). The transcript parsers
-> documented here are retained as the always-on, on-machine **backfill source**
-> for that pipeline — they are no longer wired to a renderer.
+> `dashboard/langfuse/otelcol.yaml` + `langfuse_*.py`). Issue #140 then retired
+> the transcript backfill (`langfuse_backfill.py` + `causal_tree.py`, #92) —
+> live capture is complete by construction, so no after-the-fact healing path
+> exists. The transcript parsers documented here survive solely as the view
+> builder's input layer.
 
 > [!NOTE]
 > Issue #91 retired `ccusage` and the pull-cost layer (`telemetry/cost.py`). The
@@ -40,7 +44,8 @@ All live in `scripts/telemetry/`:
 | `spans.py` | The `Span` dataclass — the frozen schema plus the additive, optional, pull-only `summary` field (Issue #47). |
 | `session_parser.py` | Parse `~/.claude/projects/*/*.jsonl` into `skill` / `agent` / `todo` / `human` spans plus a `tool` leaf per `tool_use` (Issue #47). Walk `<session>/subagents/agent-<id>.jsonl` transcripts into `UsageEvent`s **and** the sub-agent's own step spans (#47 S3) — re-homed onto the parent session with `parent_id` = the agent span, so they nest under it. |
 | `spoke_runs.py` | Group spans into spoke-run lifetimes; per-invocation normalized metrics. |
-| `causal.py` / `causal_tree.py` | Build the strict, id-based causal forest over a parsed session (Issue #65). |
+| `langfuse_spoke_tree.py` | The land-time view builder — assemble the `spoketree-` nested view and `spokecycle-` todo view for one spoke (Issues #87/#100/#114/#128). |
+| `langfuse_rollup.py` | Shared token-rollup sum logic + the standalone `rollup` patcher the view builder reuses. |
 
 ## How attribution works
 
@@ -60,10 +65,10 @@ All live in `scripts/telemetry/`:
   `ephemeral_1h_input_tokens`); `session_parser` reads it onto `UsageEvent`
   (`cache_creation_5m` / `cache_creation_1h`, summing to the flat
   `cache_creation`; the flat total falls into the 5m tier when the nested object
-  is absent). The backfill maps the 5m tier to Langfuse's
-  `cache_creation_input_tokens` (1.25×) and the 1h tier to its
-  `input_cache_creation_1h` usage type (2×) so backfilled cost matches ccusage
-  on 1h-cache workloads. The live **push** path stays single-rate: Claude Code's
+  is absent). In Langfuse the 5m tier is the `cache_creation_input_tokens`
+  usage type (1.25×) and the 1h tier is `input_cache_creation_1h` (2×);
+  `langfuse_rollup`'s totals count both when a span carries them. The live
+  **push** path stays single-rate: Claude Code's
   native OTel span carries only the flat `cache_creation_tokens` aggregate
   (no per-TTL attribute), so the otelcol cannot recover the ratio — that side is
   blocked on an upstream Claude Code change, not fixable in the collector.
@@ -76,7 +81,7 @@ together with the nested spans it already contains.
 ## Spoke-run join
 
 Pull spans parsed from session logs carry a null `spoke_run_id` (session logs do
-not record it). They are backfilled from a session-peer push span — within one
+not record it). They inherit it from a session-peer push span — within one
 session every span belongs to the same spoke run. Spans with no `spoke_run_id`
 and no session match are ad-hoc and group under `None`.
 
@@ -113,12 +118,12 @@ Rebuilds are idempotent — `fetch_session` excludes the synthesizer's own prior
 output, so durations never double-count.
 
 > [!WARNING]
-> `duration` is written only by the spoke-tree assembly. The other two rollup
-> writers still emit the token-only shape: `langfuse_backfill.py` (historical
-> spokes lack `rollup.duration` — treat the key as optional in consumers), and the
-> standalone `langfuse_rollup.py` patcher, whose `span-update` replaces the
-> `rollup` metadata key wholesale — running it over a session that already holds
-> assembled `spoketree-`/`spokecycle-` traces strips their `duration`. Re-run
+> `duration` is written only by the spoke-tree assembly, and historical spokes
+> (ingested before #128) lack `rollup.duration` — treat the key as optional in
+> consumers. The standalone `langfuse_rollup.py` patcher still emits the
+> token-only shape, and its `span-update` replaces the `rollup` metadata key
+> wholesale — running it over a session that already holds assembled
+> `spoketree-`/`spokecycle-` traces strips their `duration`. Re-run
 > `langfuse_spoke_tree.py` to restore it; aligning the two writers is a follow-up.
 
 ## Spoke-latency dashboard (Issue #128)
@@ -223,6 +228,6 @@ PLAN-gate park emission.
   machine; skill spans are reconstructed from `Skill` tool_use blocks alone. The
   analytics file remains an optional enrichment if present.
 - **`cache_read`** — the issue text mentions a cache-read metric, but the frozen
-  v1 span has no such field. Cache-read tokens are carried on the per-turn rows
-  (the cache breakdown the causal tree renders); surfacing them as a span field is
-  a schema v2 follow-up, not an in-place change to the frozen contract.
+  v1 span has no such field. Cache-read tokens are carried on the parsed
+  per-turn `UsageEvent`s; surfacing them as a span field is a schema v2
+  follow-up, not an in-place change to the frozen contract.

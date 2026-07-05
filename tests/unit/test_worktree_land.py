@@ -1117,7 +1117,8 @@ def test_land_merges_into_configured_base(hub: Path, tmp_path: Path) -> None:
 # The land script resolves Langfuse auth itself (wt_resolve_langfuse_auth: env
 # wins, then ${AFK_TELEMETRY_CONF:-~/.afk-telemetry}) just before its telemetry
 # section, so (a) telemetry-ingest-spoke.sh inherits working credentials from a
-# fresh hub shell and builds the spoke tree + backfill, and (b) the existing
+# fresh hub shell and builds the spoke tree (#140 retired the transcript
+# backfill), and (b) the existing
 # lifecycle/script spans get AI_TOOLKIT_OTEL_SPAN_ENDPOINT and fan out to the
 # collector. Resolution is best-effort: no conf + no env keeps the existing
 # skip-WARN and the land still succeeds. No credential ever reaches an argv.
@@ -1159,7 +1160,8 @@ def _wait_for_content(log: Path, needle: str, tries: int = 40) -> str:
 def test_land_resolves_auth_from_conf_for_ingest(hub: Path, tmp_path: Path) -> None:
     # Fresh hub shell (no LANGFUSE_* in env) + conf present ⇒ the ingest step's
     # interpreter must inherit the resolved auth + defaulted host, so the spoke
-    # tree (#87) and backfill (#92) actually build. Both steps run.
+    # tree (#87) actually builds — the only telemetry step since #140 retired
+    # the transcript backfill.
     wt = _make_spoke(hub, tmp_path, "feature/1-otel", push=True)
     _seed_otel_spoke(hub, wt, raw_bodies=True)
     conf = tmp_path / "afk-telemetry"
@@ -1180,7 +1182,7 @@ def test_land_resolves_auth_from_conf_for_ingest(hub: Path, tmp_path: Path) -> N
     assert proc.returncode == 0, proc.stderr + proc.stdout
     ingest_log = _log_text(logs["python3.12"])
     assert "langfuse_spoke_tree.py" in ingest_log, "loaded-context itemization must run"
-    assert "langfuse_backfill.py" in ingest_log, "transcript backfill must run"
+    assert "langfuse_backfill" not in ingest_log, "retired transcript backfill must NOT run (#140)"
     assert "LANGFUSE_BASIC_AUTH=Basic-test-127" in ingest_log, (
         "ingest must inherit the conf-resolved auth without operator hand-export"
     )
