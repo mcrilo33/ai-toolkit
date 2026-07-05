@@ -99,6 +99,11 @@ def _run_done(
     )
     code.chmod(0o755)
     env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    # HOME is sandboxed so the workspace-file default ($HOME/.claude/….code-workspace,
+    # issue #134) can never resolve to — let alone rewrite — the host's real file.
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    env["HOME"] = str(home)
     # Point the VS Code Open Recent cleanup (issue #103) at a per-test Code dir so
     # it never touches the host's real state store. Tests that exercise the prune
     # pre-populate <vscode>/User/globalStorage/storage.json under this same dir.
@@ -445,3 +450,83 @@ def test_done_prunes_branch_merged_into_configured_base(hub: Path, tmp_path: Pat
 
     assert proc.returncode == 0, proc.stderr
     assert "feature/7-base" not in _local_branches(hub)
+
+
+# --- review workspace file: direct remove + ghost sweep (issue #134) ----------
+# Teardown edits the review workspace file's `folders` array directly (the
+# mirror of worktree-new's direct append): drop the target's entry, sweep any
+# entry whose path is gone from disk (self-healing for past `code --remove`
+# misses), and never also call `code --remove`. The CLI call survives strictly
+# as the missing-file fallback. `git config ai-toolkit.workspace-file` is
+# pinned per-test so the host's real review workspace is never touched.
+
+
+def _write_workspace(ws: Path, folders: list[dict]) -> str:
+    """Write a VS Code-shaped workspace file (tab indent) and return its text."""
+    ws.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps({"folders": folders, "settings": {}}, indent="\t") + "\n"
+    ws.write_text(text)
+    return text
+
+
+def test_done_removes_entry_and_sweeps_ghosts_not_code_remove(hub: Path, tmp_path: Path) -> None:
+    # Target entry dropped, dead-path ghost swept in the same pass, live sibling
+    # and main-checkout entries preserved verbatim — and no `code` call at all.
+    wt = _make_spoke(hub, tmp_path, "feature/9-ws", push=True, merge=True)
+    live = _make_spoke(hub, tmp_path, "feature/7-live", push=False, merge=False)
+    ws = tmp_path / "claude" / "review.code-workspace"
+    main_entry = {"name": "hub", "path": os.path.relpath(hub, ws.parent)}
+    live_entry = {"path": os.path.relpath(live, ws.parent)}
+    _write_workspace(
+        ws,
+        [
+            main_entry,
+            {"name": wt.name, "path": os.path.relpath(wt, ws.parent)},
+            {"path": "../gone-99"},
+            live_entry,
+        ],
+    )
+    _git(hub, "config", "ai-toolkit.workspace-file", str(ws))
+
+    proc, log = _run_done(hub, tmp_path, "9")
+
+    assert proc.returncode == 0, proc.stderr
+    doc = json.loads(ws.read_text())
+    assert doc["folders"] == [main_entry, live_entry]
+    calls = log.read_text() if log.exists() else ""
+    assert calls == "", f"direct file edit and the `code` CLI must never both fire: {calls!r}"
+
+
+def test_done_falls_back_to_code_remove_when_workspace_file_missing(
+    hub: Path, tmp_path: Path
+) -> None:
+    # No workspace file at the configured location → the legacy `code --remove`
+    # fallback fires exactly as before (still while the path exists on disk).
+    wt = _make_spoke(hub, tmp_path, "feature/9-fb", push=True, merge=True)
+    _git(
+        hub,
+        "config",
+        "ai-toolkit.workspace-file",
+        str(tmp_path / "claude" / "absent.code-workspace"),
+    )
+
+    proc, log = _run_done(hub, tmp_path, "9")
+
+    assert proc.returncode == 0, proc.stderr
+    calls = log.read_text() if log.exists() else ""
+    assert f"--remove {wt}" in calls
+    assert "present" in calls and "absent" not in calls
+
+
+def test_done_no_code_leaves_workspace_file_untouched(hub: Path, tmp_path: Path) -> None:
+    # --no-code opts out of the whole VS Code fold: no file edit, no CLI call.
+    wt = _make_spoke(hub, tmp_path, "feature/9-nc", push=True, merge=True)
+    ws = tmp_path / "claude" / "review.code-workspace"
+    before = _write_workspace(ws, [{"name": wt.name, "path": os.path.relpath(wt, ws.parent)}])
+    _git(hub, "config", "ai-toolkit.workspace-file", str(ws))
+
+    proc, log = _run_done(hub, tmp_path, "9", "--no-code")
+
+    assert proc.returncode == 0, proc.stderr
+    assert ws.read_text() == before
+    assert not log.exists() or log.read_text().strip() == ""
