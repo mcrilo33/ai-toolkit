@@ -5,11 +5,13 @@ that can safely run *concurrently* is a mechanical graph computation — so it s
 SCRIPTED (no LLM in the control plane). batch-plan.sh:
 
   * READ — one `gh api graphql` round-trip for every open issue's `body` (the
-    `Scope:` line) and its `blockedBy` connection.
-  * ELIGIBILITY — an issue is *ready* when all its blockers are closed.
-  * PRIORITY — critical-path depth: rank each ready issue by the longest blocked-by
-    chain rooted at it, so the longest serial tail is unblocked earliest (minimizes
-    makespan). Ties break on direct-dependent count, then issue number.
+    `Scope:` line), its `labels`, and its `blockedBy` connection.
+  * ELIGIBILITY — an issue is *ready* when all its blockers are closed and it does
+    not carry the `hold` label (a held issue is staged out of every batch).
+  * PRIORITY — a `priority`-labelled ready issue sorts ahead of non-priority ones,
+    then by critical-path depth: the longest blocked-by chain rooted at the issue, so
+    the longest serial tail is unblocked earliest (minimizes makespan). Ties break on
+    direct-dependent count, then issue number.
   * GREEDY DISJOINT-SCOPE PACK — walk ready issues in priority order; add to the
     batch only when its `Scope:` is disjoint from every batch member AND every
     in-flight spoke. `Scope: *` / a missing line ⇒ exclusive (never batched).
@@ -39,15 +41,24 @@ def _node(
     blocked_by: list[tuple[int, str]] | None = None,
     *,
     split: str | None = None,
+    labels: list[str] | None = None,
 ) -> dict:
-    """Build one graphql issue node: a Scope: body + blockedBy nodes (number, state)."""
+    """Build one graphql issue node: a Scope: body + blockedBy nodes (number, state).
+
+    When `labels` is given, a `labels.nodes` array of `{name}` objects is attached,
+    mirroring the graphql shape. Omitting it leaves the key absent, exactly as a
+    node with no labels arrives — so unlabelled fixtures stay byte-identical.
+    """
     body = "Some description.\n"
     if scope is not None:
         body += f"Scope: {scope}\n"
     if split is not None:
         body += f"Split: {split}\n"
     nodes = [{"number": n, "state": s} for n, s in (blocked_by or [])]
-    return {"number": number, "body": body, "blockedBy": {"nodes": nodes}}
+    node = {"number": number, "body": body, "blockedBy": {"nodes": nodes}}
+    if labels is not None:
+        node["labels"] = {"nodes": [{"name": name} for name in labels]}
+    return node
 
 
 def _run_plan(
@@ -165,6 +176,90 @@ def test_inflight_exclusive_spoke_blocks_the_whole_batch() -> None:
     batch = _plan([_node(1, "a.py"), _node(5, "d.py")], inflight=["*"])
 
     assert batch == []
+
+
+# ── hold label: staged issues are never dispatched (issue #147) ───────────────
+
+
+def test_hold_label_excludes_issue_from_batch() -> None:
+    # A ready, disjoint issue carrying `hold` is staged, never dispatched — even
+    # though nothing blocks it and its scope collides with no live work.
+    nodes = [_node(1, "a.py", labels=["hold"]), _node(2, "b.py")]
+
+    batch = _plan(nodes)
+
+    assert 1 not in batch, "a hold-labelled issue must never be dispatched"
+    assert batch == [2]
+
+
+def test_hold_excluded_but_disjoint_peers_still_batch() -> None:
+    # The held issue drops out; its disjoint non-held peers still pack together,
+    # proving hold removes only the held issue, not the concurrency around it.
+    nodes = [_node(1, "a.py", labels=["hold"]), _node(2, "b.py"), _node(3, "c.py")]
+
+    batch = _plan(nodes)
+
+    assert 1 not in batch
+    assert batch == [2, 3]
+
+
+def test_unrelated_label_does_not_change_dispatch() -> None:
+    # A label other than hold/priority leaves eligibility and ordering untouched.
+    nodes = [_node(1, "a.py", labels=["enhancement"])]
+
+    batch = _plan(nodes)
+
+    assert batch == [1]
+
+
+def test_hold_label_is_case_insensitive_among_other_labels() -> None:
+    # The label match is case-folded and holds regardless of sibling labels.
+    nodes = [_node(1, "a.py", labels=["enhancement", "HOLD"]), _node(2, "b.py")]
+
+    batch = _plan(nodes)
+
+    assert batch == [2], "a HOLD-labelled issue is excluded even alongside other labels"
+
+
+# ── priority label: dispatched ahead of equally-eligible peers (issue #147) ───
+
+
+def test_priority_label_outranks_higher_criticalpath_depth() -> None:
+    # #20 has the deeper critical-path tail (it blocks #21), so by depth alone it
+    # ranks first — but #10 carries `priority` and they collide on shared.py, so
+    # only one is picked. Priority must win the seat.
+    nodes = [
+        _node(10, "shared.py", labels=["priority"]),
+        _node(20, "shared.py"),
+        _node(21, "a.py", blocked_by=[(20, "OPEN")]),
+    ]
+
+    batch = _plan(nodes)
+
+    assert batch[0] == 10, "a priority issue outranks a deeper-critical-path peer"
+    assert 20 not in batch, "#20 collides on shared.py with the higher-priority #10"
+
+
+def test_priority_issue_still_batches_with_disjoint_peer() -> None:
+    # Priority reorders but does not serialize: a priority issue and a disjoint
+    # non-priority peer are BOTH dispatched, the priority one ordered first even
+    # though its higher number would otherwise put it last.
+    nodes = [_node(2, "a.py"), _node(9, "b.py", labels=["priority"])]
+
+    batch = _plan(nodes)
+
+    assert set(batch) == {2, 9}, "disjoint concurrency is preserved"
+    assert batch[0] == 9, "the priority issue is ordered first despite the higher number"
+
+
+def test_priority_does_not_resurrect_a_held_issue() -> None:
+    # hold is a pre-sort eligibility filter; priority only reorders the survivors,
+    # so a held+priority issue stays excluded rather than jumping to the front.
+    nodes = [_node(1, "a.py", labels=["hold", "priority"]), _node(2, "b.py")]
+
+    batch = _plan(nodes)
+
+    assert batch == [2], "a held issue is not dispatched even when also labelled priority"
 
 
 # ── merge-candidate lint: colliding-scope serialized chains warn (issue #125) ─

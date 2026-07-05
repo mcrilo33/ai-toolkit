@@ -9,10 +9,14 @@
 # CONCURRENTLY, ordered to minimize total wall-clock:
 #   * READ — one `gh api graphql` round-trip for every open issue's `body` (for its
 #     `Scope:` line) and its `blockedBy` connection (number + state).
-#   * ELIGIBILITY — an issue is *ready* when all its blockers are closed.
-#   * PRIORITY = critical-path depth — rank each ready issue by the longest blocked-by
-#     chain rooted at it (one topo pass). Unblocking the longest serial tail earliest
-#     minimizes makespan. Ties: direct-dependent count, then issue number.
+#   * ELIGIBILITY — an issue is *ready* when all its blockers are closed. A
+#     `hold`-labelled issue is never ready: it is staged out of every batch until
+#     the label is removed (it still blocks its dependents while open).
+#   * PRIORITY — a `priority`-labelled issue sorts ahead of non-priority ready issues
+#     (a manual "first among independents" override), then by critical-path depth: the
+#     longest blocked-by chain rooted at the issue (one topo pass). Unblocking the
+#     longest serial tail earliest minimizes makespan. Ties: direct-dependent count,
+#     then issue number.
 #   * GREEDY DISJOINT-SCOPE PACK — walk ready issues in priority order; add to the
 #     batch only when its `Scope:` is disjoint from every issue already in the batch
 #     AND every in-flight spoke (passed in via --inflight). `Scope: *` / a missing
@@ -52,7 +56,8 @@ repo_slug() {
 }
 
 # fetch_issues -> the JSON array of open-issue nodes, each:
-#   { number, body, blockedBy: { nodes: [ { number, state } ] } }
+#   { number, body, labels: { nodes: [ { name } ] },
+#     blockedBy: { nodes: [ { number, state } ] } }
 # ONE `gh api graphql` round-trip. `--jq` extracts the nodes array so plan_from_json
 # reads exactly the shape the tests build by hand.
 fetch_issues() {
@@ -75,6 +80,7 @@ fetch_issues() {
             nodes {
               number
               body
+              labels(first: 20) { nodes { name } }
               blockedBy(first: 50) { nodes { number state } }
             }
           }
@@ -268,11 +274,18 @@ def main():
             for b in ((node.get("blockedBy") or {}).get("nodes") or [])
             if b.get("number") is not None
         ]
+        labels = {
+            (lbl.get("name") or "").lower()
+            for lbl in ((node.get("labels") or {}).get("nodes") or [])
+            if lbl.get("name")
+        }
         issues[num] = {
             "number": num,
             "scope": scope_of(node.get("body")),
             "split": has_split_marker(node.get("body")),
             "blockers": blockers,
+            "hold": "hold" in labels,
+            "priority": "priority" in labels,
         }
 
     open_nums = set(issues)
@@ -307,12 +320,18 @@ def main():
         # Ready when every blocker is closed (no blocker still open).
         return all(state == "CLOSED" for _num, state in info["blockers"])
 
-    ready = [info for info in issues.values() if is_ready(info)]
+    # A `hold`-labelled issue is staged, not dispatchable: excluded from every
+    # batch until the label is removed. It stays open, so it still blocks its
+    # dependents and still contributes to their critical-path depth.
+    ready = [info for info in issues.values() if is_ready(info) and not info["hold"]]
 
-    # Priority: critical-path depth desc, then direct-dependent count desc, then
-    # issue number asc.
+    # Rank: `priority`-labelled first, then critical-path depth desc, then
+    # direct-dependent count desc, then issue number asc. The `priority` label is a
+    # manual "first among independents" override sorted ahead of the depth tiebreak;
+    # it reorders only — the greedy disjoint-scope pack below is unchanged.
     ready.sort(
         key=lambda info: (
+            0 if info["priority"] else 1,
             -depth(info["number"], set()),
             -len(children.get(info["number"], ())),
             info["number"],
