@@ -550,6 +550,47 @@ telemetry_set_status() {
 # the assembler derives them from the todo ledger (TaskCreate subject +
 # TaskUpdate in_progress/completed window). Gate hooks emit only their kind=hook
 # span; the step-semantic view is reconstructed downstream from the ledger.
+#
+# EXCEPTION (#139): the REVIEW and PUSH ledger windows have no automatic
+# in-window emission in Claude Code (RED/GREEN get their commit-gate hook spans
+# for free), so their step containers render near-empty. The two gates that
+# anchor those steps — the review-stamp gate and spoke-push.sh — emit ONE
+# gate-time marker span each through the idempotent helper below.
+
+# telemetry_mark_cycle_step <phase> [key] [start_ms]
+#
+# Emit the gate-time cycle-step marker span — kind=step, name=solo-cycle,
+# phase=<phase> (OTLP label "step:<phase>") — ONCE per (phase, key). The
+# sentinel file <root>/.ai-toolkit/cycle-step-<phase> records the last emitted
+# key; an equal key skips the emission, so a gate retry or a re-push never
+# duplicates the marker. <key> defaults to the project root's HEAD sha; an
+# unresolvable key emits unconditionally (telemetry over dedup) and writes no
+# sentinel. Fires only when a sink is active (AI_TOOLKIT_TELEMETRY=1 or
+# AI_TOOLKIT_OTEL_SPAN_ENDPOINT); an inactive run also writes NO sentinel, so
+# enabling telemetry later still emits for the same key. Same invisibility
+# contract as the rest of this lib: zero output, never changes the caller's
+# exit code.
+telemetry_mark_cycle_step() {
+  {
+    [ "${AI_TOOLKIT_TELEMETRY:-}" = "1" ] || [ -n "${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:-}" ] \
+      || return 0
+    local phase="${1:-}" key="${2:-}" start_ms="${3:-}" root sentinel
+    [ -n "$phase" ] || return 0
+    root=$(_telemetry_project_root)
+    [ -n "$key" ] || key=$(git -C "$root" rev-parse HEAD 2>/dev/null) || key=""
+    sentinel="$root/.ai-toolkit/cycle-step-$phase"
+    if [ -n "$key" ] && [ "$(head -n1 "$sentinel" 2>/dev/null)" = "$key" ]; then
+      return 0
+    fi
+    telemetry_emit_span --kind step --name solo-cycle --phase "$phase" \
+      --start-ms "$start_ms"
+    if [ -n "$key" ]; then
+      mkdir -p "$root/.ai-toolkit"
+      printf '%s\n' "$key" > "$sentinel"
+    fi
+  } >/dev/null 2>&1 || true
+  return 0
+}
 
 # EXIT-trap handler: run registered cleanups, then emit the single hook span.
 # Never changes the hook's exit status — it does not call `exit`, and the span
