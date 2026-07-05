@@ -232,9 +232,12 @@ fi
 #
 # `git branch --show-current` is seeded EXACT — never `git branch:*`, which would
 # hand over `git branch -D`. The runner tier (#38) is scoped to the pytest verbs
-# and `chmod +x` only. Nothing destructive or arbitrary-exec is seeded: no
-# `python:*` / `python -c:*` / `chmod:*` / `git tag:*` / `git push:*` /
-# `git checkout|reset|clean:*` / `rm` / `mv`.
+# and `chmod +x` only. The staging tier (#149) seeds `git add:*` (worktree-confined)
+# and the non-destructive `git reset` unstage shapes ONLY — never the broad
+# `git reset:*`, which would hand over `git reset --hard` (a working-tree wipe).
+# Nothing else destructive or arbitrary-exec is seeded: no `python:*` / `python -c:*`
+# / `chmod:*` / `git tag:*` / `git push:*` / `git checkout|clean:*` /
+# `git reset --hard` / `rm` / `mv`.
 ALLOW_RULES=(
   "Bash(bash .ai-toolkit/scripts/spoke-push.sh:*)"
   "Bash(bash .ai-toolkit/scripts/spoke-ready.sh:*)"
@@ -250,6 +253,12 @@ ALLOW_RULES=(
   # python/chmod verbs stay gated (arbitrary exec / unrestricted mode bits).
   "Bash(python -m pytest:*)" "Bash(.venv/bin/python -m pytest:*)" "Bash(pytest:*)"
   "Bash(chmod +x:*)"
+  # Staging (#149) — the RED-commit selective stage `git reset -q; git add <file>`
+  # runs unattended without a prompt. `git add` is worktree-confined; the reset
+  # shapes exclude `--hard`, so no destructive working-tree wipe is ever handed over.
+  "Bash(git add:*)"
+  "Bash(git reset)" "Bash(git reset -q)"
+  "Bash(git reset HEAD:*)" "Bash(git reset -q HEAD:*)"
 )
 SETTINGS_LOCAL="$WT_DIR/.claude/settings.local.json"
 mkdir -p "$WT_DIR/.claude"
