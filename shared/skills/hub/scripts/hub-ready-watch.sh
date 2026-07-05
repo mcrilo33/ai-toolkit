@@ -140,4 +140,13 @@ else
   : >"$seen_file" 2>/dev/null || true
 fi
 
+# The single hub loop drives both surfaces (issue #146): this watcher PRINTS the
+# ready-to-land proposals above; hub-notify (co-located) fires the ONE OS
+# notification per new gate/ready/blocked transition, keyed on the same marker
+# tags but with its own independent seen-set. Best-effort: a missing script or a
+# notifier failure must never abort the ready watch.
+if [ -x "$_script_dir/hub-notify.sh" ]; then
+  bash "$_script_dir/hub-notify.sh" || true
+fi
+
 exit 0
