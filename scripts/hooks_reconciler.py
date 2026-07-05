@@ -41,6 +41,18 @@ import sys
 # "$CLAUDE_PROJECT_DIR"/.claude/hooks/scripts/).
 OWNED_MARKER = "hooks/scripts/"
 
+# Notification silence (issue #146): Claude Code fires a default "waiting for
+# your input" OS notification every time a session goes idle between turns.
+# Across concurrent spokes that is near-constant noise, so every synced checkout
+# — hub and spoke alike — silences Claude Code's own channel and lets the hub be
+# the single notifier (hub-notify.sh). ``notifications_disabled`` is the only
+# setting that suppresses the default ping; a Notification hook fires additively
+# and cannot. The reconciler owns this key like it owns the hooks: it is forced
+# on every sync (a prior explicit channel is overridden, mirroring how owned
+# hooks are replaced).
+NOTIF_CHANNEL_KEY = "preferredNotifChannel"
+NOTIF_CHANNEL_SILENT = "notifications_disabled"
+
 
 def _canonical_key(entry: dict) -> str:
     """Stable identity for an entry, used for dedup."""
@@ -92,9 +104,7 @@ def reconcile_bucket(existing: list[dict], generated: list[dict]) -> list[dict]:
     return deduped
 
 
-def _purge_owned_from_unemitted(
-    existing_hooks: dict, emitted_events: set[str]
-) -> None:
+def _purge_owned_from_unemitted(existing_hooks: dict, emitted_events: set[str]) -> None:
     """Drop ai-toolkit-owned entries from buckets we no longer emit into.
 
     When a hook migrates to a different event (e.g. preToolUse ->
@@ -124,9 +134,7 @@ def reconcile_cursor(existing: dict, generated: dict) -> dict:
     generated_hooks: dict = generated.get("hooks", {}) or {}
 
     for event, gen_entries in generated_hooks.items():
-        existing_hooks[event] = reconcile_bucket(
-            existing_hooks.get(event, []) or [], gen_entries
-        )
+        existing_hooks[event] = reconcile_bucket(existing_hooks.get(event, []) or [], gen_entries)
 
     # Migration cleanup: an owned hook that moved events leaves a stale entry in
     # its old bucket. Remove owned entries from any bucket we did not just emit.
@@ -142,14 +150,15 @@ def reconcile_claude(existing: dict, generated: dict) -> dict:
 
     The generated payload is the bare ``{EVENT: [group, ...]}`` fragment
     (Claude uses capitalized event names: PreToolUse/PostToolUse/...).
+
+    Also enforces the silent notification channel (issue #146) so every synced
+    checkout suppresses Claude Code's default idle ping — see ``NOTIF_CHANNEL_*``.
     """
     result = dict(existing)
     existing_hooks: dict = dict(existing.get("hooks", {}) or {})
 
     for event, gen_groups in generated.items():
-        existing_hooks[event] = reconcile_bucket(
-            existing_hooks.get(event, []) or [], gen_groups
-        )
+        existing_hooks[event] = reconcile_bucket(existing_hooks.get(event, []) or [], gen_groups)
 
     # Migration cleanup: purge owned entries from buckets we no longer emit into
     # (mirrors reconcile_cursor). Claude wiring is unchanged today, so this is a
@@ -157,6 +166,7 @@ def reconcile_claude(existing: dict, generated: dict) -> dict:
     _purge_owned_from_unemitted(existing_hooks, set(generated.keys()))
 
     result["hooks"] = existing_hooks
+    result[NOTIF_CHANNEL_KEY] = NOTIF_CHANNEL_SILENT
     return result
 
 

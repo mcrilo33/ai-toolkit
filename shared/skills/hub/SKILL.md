@@ -77,6 +77,17 @@ loop (`/loop 2m bash .ai-toolkit/scripts/hub-ready-watch.sh`). It is detection o
 - Offline-safe: a finished spoke's tag is locally visible (shared ref store), so a failed
   fetch is non-fatal and local markers still surface.
 
+The same loop is also the hub's **single OS-notifier** (issue #146). Spokes silence
+their own per-turn idle notifications (the synced config sets
+`preferredNotifChannel: notifications_disabled`), and each `hub-ready-watch.sh` run
+invokes the co-located `hub-notify.sh`, which fires exactly one desktop notification
+(`osascript`) per NEW lifecycle transition — `gate/<N>` "parked — reply to approve",
+`ready/<N>` "done → /land N", `blocked/<N>` "BLOCKED — needs a human" — deduped on its
+own last-seen set. It is **mode-aware**: under an `/afk` drain it suppresses the
+`gate`/`ready` pings (the answerer services parks; the drain auto-lands ready spokes)
+and notifies only on `blocked/<N>` escalation. So the one loop you already run both
+prints the land proposals and pings you the moment a spoke needs you.
+
 ### Telemetry watchdog (when spokes export OTel)
 
 `worktree-new.sh` ensures the OTel collector + Langfuse bridge once at spawn, but nothing

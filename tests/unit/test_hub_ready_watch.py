@@ -88,6 +88,16 @@ def _run(
     env = {**os.environ, "HUB_READY_SEEN_FILE": env_seen}
     # The host's base-branch override (#117) must never steer the script under test.
     env.pop("AI_TOOLKIT_BASE_BRANCH", None)
+    # Isolate the merged-in hub-notify (#146): capture its notifications to a log
+    # via HUB_NOTIFY_CMD (never fire real osascript during the suite), keep its
+    # seen-set under tmp_path, and strip any inherited drain state so mode-gating
+    # is deterministic. Notifications are readable at _notify_log(tmp_path).
+    notifier = tmp_path / "notifier.sh"
+    notifier.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{_notify_log(tmp_path)}"\n')
+    notifier.chmod(0o755)
+    env["HUB_NOTIFY_CMD"] = str(notifier)
+    env["HUB_NOTIFY_SEEN_FILE"] = str(tmp_path / "hub-notify-seen")
+    env.pop("AFK_STATE", None)
     return subprocess.run(
         ["bash", str(WATCH)],
         cwd=str(hub),
@@ -95,6 +105,17 @@ def _run(
         text=True,
         env=env,
     )
+
+
+def _notify_log(tmp_path: Path) -> Path:
+    """Path the injected hub-notify notifier appends each fired message to."""
+    return tmp_path / "hub-notify.log"
+
+
+def _notifications(tmp_path: Path) -> list[str]:
+    """The messages hub-notify fired during _run (empty when none)."""
+    log = _notify_log(tmp_path)
+    return log.read_text().splitlines() if log.exists() else []
 
 
 def test_new_ready_tag_is_surfaced_with_land_command(hub: Path, tmp_path: Path) -> None:
@@ -263,3 +284,18 @@ def test_counts_measured_against_configured_base(hub: Path, tmp_path: Path) -> N
     line = next(ln for ln in result.stdout.splitlines() if "#1" in ln)
     assert "↑1" in line
     assert "↓1" in line
+
+
+def test_ready_watch_loop_also_fires_hub_notify(hub: Path, tmp_path: Path) -> None:
+    # #146: the single hub loop drives BOTH surfaces — hub-ready-watch invokes
+    # the co-located hub-notify each poll, so a new blocked/<N> marker (which the
+    # ready watch itself never surfaces) still produces one OS notification.
+    _git(hub, "tag", "-a", "-m", "blocked", "-m", "merge conflict", "blocked/1", "feature/1-pushed")
+
+    result = _run(hub, tmp_path)
+
+    assert result.returncode == 0
+    notes = _notifications(tmp_path)
+    assert len(notes) == 1
+    assert "#1" in notes[0]
+    assert "BLOCKED" in notes[0]

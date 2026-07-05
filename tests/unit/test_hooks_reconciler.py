@@ -184,9 +184,7 @@ class TestReconcileClaude:
 
     def test_replaces_owned_groups_not_user(self) -> None:
         existing = {
-            "hooks": {
-                "PreToolUse": [OWNED_CLAUDE_GROUP, OWNED_CLAUDE_GROUP, USER_CLAUDE_GROUP]
-            }
+            "hooks": {"PreToolUse": [OWNED_CLAUDE_GROUP, OWNED_CLAUDE_GROUP, USER_CLAUDE_GROUP]}
         }
         generated = {"PreToolUse": [OWNED_CLAUDE_GROUP]}
         result = reconcile_claude(existing, generated)
@@ -204,4 +202,24 @@ class TestReconcileClaude:
     def test_creates_hooks_key_from_empty(self) -> None:
         generated = {"PreToolUse": [OWNED_CLAUDE_GROUP]}
         result = reconcile_claude({}, generated)
+        assert result["hooks"]["PreToolUse"] == [OWNED_CLAUDE_GROUP]
+
+    # Notification silence (issue #146): every synced checkout — hub and spoke
+    # alike — silences Claude Code's own idle/turn notification channel so the
+    # hub is the single notifier (hub-notify.sh). notifications_disabled is the
+    # only setting that suppresses the default ping (a Notification hook fires
+    # additively and cannot).
+    def test_disables_notifications_from_empty(self) -> None:
+        result = reconcile_claude({}, {})
+        assert result["preferredNotifChannel"] == "notifications_disabled"
+
+    def test_forces_silence_over_existing_channel(self) -> None:
+        result = reconcile_claude({"preferredNotifChannel": "iterm2"}, {})
+        assert result["preferredNotifChannel"] == "notifications_disabled"
+
+    def test_silence_added_alongside_reconciled_hooks(self) -> None:
+        generated = {"PreToolUse": [OWNED_CLAUDE_GROUP]}
+        result = reconcile_claude({"model": "x"}, generated)
+        assert result["preferredNotifChannel"] == "notifications_disabled"
+        assert result["model"] == "x"
         assert result["hooks"]["PreToolUse"] == [OWNED_CLAUDE_GROUP]
