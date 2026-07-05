@@ -97,6 +97,61 @@ HUB_BRANCH="$(git symbolic-ref --short -q HEAD || true)"
 [ -z "$(git status --porcelain -uno)" ] \
   || wt_die "hub checkout is dirty — commit or stash before landing"
 
+# land_resume_finalize <target> -> finish a spoke whose land was killed AFTER the
+# worktree was removed but BEFORE its branch/tag/issue were cleaned up (issue #151):
+# a caller-timeout mid-teardown. Engages ONLY when <target> is a bare issue number
+# carrying a ready/<issue> marker whose commit is already merged into $DEFAULT —
+# positive proof the work shipped — so it can never close an unshipped issue. It then
+# idempotently prunes the merged branch, consumes the marker, closes the issue, and
+# kills the stranded tmux window, and NEVER re-merges or re-pushes. Returns 1 (no-op)
+# when no such resume signal exists, so the caller aborts exactly as before.
+land_resume_finalize() {
+  local target="$1" issue marker_sha br sess win name path
+  [[ "$target" =~ ^[0-9]+$ ]] || return 1
+  issue="$target"
+  marker_sha="$(git rev-parse -q --verify "refs/tags/ready/${issue}^{commit}" 2>/dev/null || true)"
+  [ -n "$marker_sha" ] || return 1
+  git merge-base --is-ancestor "$marker_sha" "$DEFAULT" 2>/dev/null || return 1
+
+  wt_warn "issue #$issue already landed (ready/$issue at ${marker_sha:0:9} is merged into $DEFAULT) but its teardown was interrupted — finishing it (issue #151)"
+
+  # Prune this issue's branch(es), but ONLY those already merged into the base.
+  while IFS= read -r br; do
+    [ -n "$br" ] || continue
+    case "${br##*/}" in "$issue" | "$issue"-*) ;; *) continue ;; esac
+    git merge-base --is-ancestor "$br" "$DEFAULT" 2>/dev/null || continue
+    if git branch -d "$br" >/dev/null 2>&1; then
+      echo "✓ pruned merged branch $br"
+      wt_git_push origin --delete "$br" >/dev/null 2>&1 || true
+    fi
+  done < <(git for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null || true)
+
+  # Consume the completion marker (local + remote), best-effort.
+  git tag -d "ready/${issue}" >/dev/null 2>&1 || true
+  wt_git_push origin ":refs/tags/ready/${issue}" >/dev/null 2>&1 || true
+
+  if command -v gh >/dev/null 2>&1; then
+    if gh issue close "$issue" --comment "Landed on $DEFAULT; teardown finalized by a resumed land (issue #151)."; then
+      echo "✓ closed issue #$issue"
+    else
+      wt_warn "couldn't close issue #$issue — close it by hand: gh issue close $issue"
+    fi
+  fi
+
+  # Kill the stranded tmux window (its pane cwd vanished with the worktree).
+  if command -v tmux >/dev/null 2>&1; then
+    sess="$(wt_tmux_session "$REPO_ROOT")"
+    while IFS=$'\t' read -r win name path; do
+      [ -n "$win" ] || continue
+      case "$name" in "$issue" | "$issue"-*) ;; *) continue ;; esac
+      [ -d "$path" ] || tmux kill-window -t "$win" 2>/dev/null || true
+    done < <(tmux list-windows -t "=$sess" -F $'#{window_id}\t#{window_name}\t#{pane_current_path}' 2>/dev/null || true)
+  fi
+
+  echo "✓ finalized partially-landed issue #$issue (resumed teardown)"
+  return 0
+}
+
 # --- guards: the spoke ----------------------------------------------------------
 WT_DIR=""
 WT_BRANCH=""
@@ -123,6 +178,10 @@ else
     [ "$TARGET" != "$DEFAULT" ] || wt_die "refusing to land the default branch '$DEFAULT' into itself"
     WT_BRANCH="$TARGET"
     WT_DIR=""
+  elif land_resume_finalize "$TARGET"; then
+    # A land whose teardown was killed after the worktree was removed — finished
+    # from the surviving merged ready/<issue> marker (issue #151). Terminal path.
+    exit 0
   else
     HINT="pass one of the paths above, or its issue number / slug / branch."
     [ -n "$LOCAL" ] && HINT="$HINT (--local also accepts a full local branch name)"
