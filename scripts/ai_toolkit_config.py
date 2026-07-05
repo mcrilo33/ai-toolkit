@@ -22,6 +22,7 @@ Effort defaults to ``max`` wherever it is omitted.
 
 from __future__ import annotations
 
+import shlex
 import sys
 from pathlib import Path
 
@@ -153,7 +154,13 @@ def _cli(argv: list[str]) -> str:
         return base_branch(config)
     if command == "spoke-env":
         spec = spoke_model(config) or ("claude-opus-4-8[1m]", DEFAULT_EFFORT)
-        return f"WT_AGENT_MODEL_DEFAULT={spec[0]}\nWT_AGENT_EFFORT_DEFAULT={spec[1]}"
+        # shell-quote the values: worktree-new.sh sources / evals this output, so
+        # an unquoted space or metacharacter would corrupt the assignment (silently
+        # unset the default) or execute — even though real model IDs are safe today.
+        return (
+            f"WT_AGENT_MODEL_DEFAULT={shlex.quote(spec[0])}\n"
+            f"WT_AGENT_EFFORT_DEFAULT={shlex.quote(spec[1])}"
+        )
     raise SystemExit(f"ai_toolkit_config: unknown command {command!r} (base-branch|spoke-env)")
 
 

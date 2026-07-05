@@ -120,6 +120,11 @@ branch sets it once, per clone:
 git config ai-toolkit.base-branch develop
 ```
 
+Or set it declaratively in `settings/ai-toolkit.yml` (`base_branch: develop`) and
+re-sync — sync writes it to the same `git config ai-toolkit.base-branch`, so it is
+version-pinnable alongside the model config. An empty/absent `base_branch` clears the
+setting on the next sync, restoring the auto-detection below.
+
 That single setting makes `worktree-new.sh` branch new spokes from the base
 (`origin/develop` when it exists, else the local branch), `worktree-land.sh` merge
 into it, `worktree-done.sh` measure merged-ness against it, `hub-status.sh` /
@@ -239,8 +244,20 @@ scripts/worktree-new.sh <issue> [slug] [type] [flags]
 
 The spawned agent's model and effort are pinned at dispatch time
 (`CLAUDE_EFFORT=max claude --model 'claude-opus-4-8[1m]'` by default) so a spoke stays
-deterministic even when user-global settings change; override with the
-`WT_AGENT_MODEL` / `WT_AGENT_EFFORT` env vars.
+deterministic even when user-global settings change. The default comes from the
+declarative config (`settings/ai-toolkit.yml`, key `model.spoke`): sync emits it into
+`.ai-toolkit/scripts/spoke-model.env`, which `worktree-new.sh` sources, falling back to
+reading the config directly in the hub, then to the literal above. Override precedence,
+highest first:
+
+1. `WT_AGENT_MODEL` / `WT_AGENT_EFFORT` env vars — one-shot override at dispatch.
+2. A `Model: <id>` line in the issue body — pins that spoke's driver model, parsed
+   from the numbered issue like the `Scope:` / `Gate:` lines (first match,
+   case-insensitive).
+3. The config default (`model.spoke`) via the emitted env file or the hub config.
+4. The literal `claude-opus-4-8[1m]` / `max`.
+
+See [metadata and sync](./metadata-and-sync.md) for the config schema.
 
 Branch naming: `feature/<id>-<slug>` for numeric issues, `<type>/<slug>` for ad-hoc.
 This convention matches the `source-task` and `solo-cycle` skills and the
