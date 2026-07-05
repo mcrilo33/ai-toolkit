@@ -1,9 +1,0 @@
-{"session_id": "sess-v2", "ts": "2026-06-12T12:00:01Z", "model": "claude-opus-4-8", "source": "main", "agent_id": null, "tokens_in": 10, "tokens_out": 5, "tokens_total": 15, "cost_usd": 0.01}
-{"session_id": "sess-v2", "ts": "2026-06-12T12:00:10Z", "model": "claude-opus-4-8", "source": "main", "agent_id": null, "tokens_in": 100, "tokens_out": 40, "tokens_total": 140, "cost_usd": 0.05}
-{"session_id": "sess-v2", "ts": "2026-06-12T12:00:11Z", "model": "claude-haiku-4-5", "source": "subagent", "agent_id": "ag1", "tokens_in": 200, "tokens_out": 100, "tokens_total": 300, "cost_usd": 0.20}
-{"session_id": "sess-v2", "ts": "2026-06-12T12:00:15Z", "model": "claude-haiku-4-5", "source": "subagent", "agent_id": "ag1", "tokens_in": 150, "tokens_out": 80, "tokens_total": 230, "cost_usd": 0.15}
-{"session_id": "sess-v2", "ts": "2026-06-12T12:00:25Z", "model": "claude-opus-4-8", "source": "main", "agent_id": null, "tokens_in": 30, "tokens_out": 10, "tokens_total": 40, "cost_usd": 0.02}
-{"session_id": "sess-v2", "ts": "2026-06-12T12:00:30Z", "model": "claude-opus-4-8", "source": "main", "agent_id": null, "tokens_in": 20, "tokens_out": 10, "tokens_total": 30, "cost_usd": 0.01}
-{"session_id": "sess-v2", "ts": "2026-06-12T12:01:05Z", "model": "claude-opus-4-8", "source": "main", "agent_id": null, "tokens_in": 60, "tokens_out": 20, "tokens_total": 80, "cost_usd": 0.03}
-{"session_id": "sess-v2", "ts": "2026-06-12T12:01:35Z", "model": "claude-sonnet-4-6", "source": "main", "agent_id": null, "tokens_in": 40, "tokens_out": 15, "tokens_total": 55, "cost_usd": 0.02}
-{"session_id": "sess-v2", "ts": "2026-06-12T12:02:05Z", "model": "claude-opus-4-8", "source": "main", "agent_id": null, "tokens_in": 5, "tokens_out": 2, "tokens_total": 7, "cost_usd": 0.005}
