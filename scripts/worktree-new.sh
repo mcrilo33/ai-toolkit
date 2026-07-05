@@ -156,17 +156,22 @@ git worktree add "$WT_DIR" -b "$BRANCH" "$BASE_START"
 # <branch>+<spawn-epoch>. Minting is INDEPENDENT of AI_TOOLKIT_TELEMETRY — the
 # spoke's identity must exist even if telemetry is enabled later mid-run.
 #
-# Make .ai-toolkit/ ignored via the repo's git exclude (resolved for this
-# worktree) rather than trusting the consuming repo's committed .gitignore: a
-# synced target may ship its own .gitignore without .ai-toolkit/, and then the
-# minted file would land UNTRACKED and break worktree-done (git worktree remove)
-# and worktree-land (untracked-as-dirty guard). The exclude entry is local to
-# the repo's git dir, never committed, and appended at most once.
+# Make .ai-toolkit/ and .claude/ ignored via the repo's git exclude (resolved
+# for this worktree) rather than trusting the consuming repo's committed
+# .gitignore: a synced target may ship its own .gitignore without them, and
+# then the minted spoke-run-id and the seeded/copied .claude/ runtime config
+# (settings.local.json below) would land UNTRACKED and break worktree-done
+# (git worktree remove) and worktree-land (untracked-as-dirty guard) — masked
+# on dev machines whose personal global git ignore covers .claude/ (#132).
+# The exclude entries are local to the repo's git dir, never committed, and
+# appended at most once each.
 EXCLUDE_FILE="$(git -C "$WT_DIR" rev-parse --git-path info/exclude 2>/dev/null || true)"
 if [ -n "$EXCLUDE_FILE" ]; then
   mkdir -p "$(dirname "$EXCLUDE_FILE")"
-  grep -qxF '.ai-toolkit/' "$EXCLUDE_FILE" 2>/dev/null \
-    || printf '%s\n' '.ai-toolkit/' >> "$EXCLUDE_FILE"
+  for entry in '.ai-toolkit/' '.claude/'; do
+    grep -qxF "$entry" "$EXCLUDE_FILE" 2>/dev/null \
+      || printf '%s\n' "$entry" >> "$EXCLUDE_FILE"
+  done
 fi
 
 SPOKE_RUN_ID="${BRANCH}+$(date +%s)"
