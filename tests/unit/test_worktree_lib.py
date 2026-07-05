@@ -190,6 +190,103 @@ def test_bridge_launch_forwards_required_env_to_child(tmp_path: Path) -> None:
     assert "BRIDGE_PORT=4321" in recorded
 
 
+# --- wt_bridge_source_mtime portable stat (issue #132) -------------------------
+# The helper reads real file mtimes behind a stat fallback. The GNU-first order
+# (`stat -c %Y || stat -f %m`) is load-bearing: BSD-first breaks on GNU stat,
+# where `-f` means "filesystem status" — it prints a multi-line fs block for the
+# file (treating %m as a missing operand), exits nonzero, and the fallback then
+# APPENDS the real epoch to that captured garbage, so the helper silently
+# returned 0 on Linux and the stale-bridge restart never fired. GNU-first fails
+# cleanly on BSD (usage error, empty stdout) before the `-f %m` fallback answers.
+
+
+def _source_bundle(tmp_path: Path, *, bridge_mtime: int, audit_mtime: int) -> Path:
+    """A fake repo root holding the bridge source bundle with pinned mtimes."""
+    root = tmp_path / "repo"
+    tele = root / "scripts" / "telemetry"
+    tele.mkdir(parents=True)
+    for name, mtime in (
+        ("langfuse_message_bridge.py", bridge_mtime),
+        ("langfuse_audit_events.py", audit_mtime),
+    ):
+        f = tele / name
+        f.write_text("# src\n")
+        os.utime(f, (mtime, mtime))
+    return root
+
+
+def _call_with_stat_stub(
+    tmp_path: Path, root: Path, stub_body: str
+) -> subprocess.CompletedProcess[str]:
+    """Invoke wt_bridge_source_mtime with a PATH-prepended `stat` stub."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    stub = bindir / "stat"
+    stub.write_text(stub_body)
+    stub.chmod(0o755)
+    return subprocess.run(
+        ["bash", "-c", f'source "{WT_LIB}"; wt_bridge_source_mtime "{root}"'],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"},
+    )
+
+
+def test_bridge_source_mtime_returns_newest_epoch(tmp_path: Path) -> None:
+    # The platform's native stat (BSD on macOS, GNU on Linux) must yield the
+    # newest mtime of the bundle as a bare integer.
+    root = _source_bundle(tmp_path, bridge_mtime=1_700_000_100, audit_mtime=1_700_000_500)
+
+    result = _call(f'wt_bridge_source_mtime "{root}"')
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1700000500"
+
+
+def test_bridge_source_mtime_bsd_stat_answers_when_gnu_flag_unsupported(tmp_path: Path) -> None:
+    # Pin the macOS path: a stat rejecting the GNU `-c` spelling (exit nonzero,
+    # EMPTY stdout — BSD behavior) must fall through to `-f %m`, whose answer
+    # comes through unpolluted.
+    root = _source_bundle(tmp_path, bridge_mtime=1, audit_mtime=1)
+
+    result = _call_with_stat_stub(
+        tmp_path,
+        root,
+        "#!/bin/sh\n"
+        'if [ "$1" = "-c" ]; then echo "stat: illegal option -- c" >&2; exit 1; fi\n'
+        'if [ "$1" = "-f" ] && [ "$2" = "%m" ]; then echo 1700000750; exit 0; fi\n'
+        "exit 1\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1700000750"
+
+
+def test_bridge_source_mtime_gnu_stat_filesystem_mode_never_pollutes(tmp_path: Path) -> None:
+    # Regression for the Linux breakage: a GNU-behaving stat, where `-f %m FILE`
+    # prints a filesystem-status block for FILE (with %m taken as a missing
+    # operand) and exits nonzero, must never leak that block into the captured
+    # value — the `-c %Y` answer alone must come through.
+    root = _source_bundle(tmp_path, bridge_mtime=1, audit_mtime=1)
+
+    result = _call_with_stat_stub(
+        tmp_path,
+        root,
+        "#!/bin/sh\n"
+        'if [ "$1" = "-c" ] && [ "$2" = "%Y" ]; then echo 1700000900; exit 0; fi\n'
+        'if [ "$1" = "-f" ]; then\n'
+        '  echo "  File: \\"$3\\""\n'
+        '  echo "    ID: 100 Namelen: 255 Type: apfs"\n'
+        '  echo "stat: cannot read file system information for %m" >&2\n'
+        "  exit 1\n"
+        "fi\n"
+        "exit 1\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1700000900"
+
+
 def test_bridge_preflight_recycles_stale_source() -> None:
     # Up, gate on, auth present, but the bridge's source bundle was modified after
     # the running process started (a bridge-code change landed) → kill + relaunch.
