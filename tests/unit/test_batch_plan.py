@@ -5,11 +5,13 @@ that can safely run *concurrently* is a mechanical graph computation — so it s
 SCRIPTED (no LLM in the control plane). batch-plan.sh:
 
   * READ — one `gh api graphql` round-trip for every open issue's `body` (the
-    `Scope:` line) and its `blockedBy` connection.
-  * ELIGIBILITY — an issue is *ready* when all its blockers are closed.
-  * PRIORITY — critical-path depth: rank each ready issue by the longest blocked-by
-    chain rooted at it, so the longest serial tail is unblocked earliest (minimizes
-    makespan). Ties break on direct-dependent count, then issue number.
+    `Scope:` line), its `labels`, and its `blockedBy` connection.
+  * ELIGIBILITY — an issue is *ready* when all its blockers are closed and it does
+    not carry the `hold` label (a held issue is staged out of every batch).
+  * PRIORITY — a `priority`-labelled ready issue sorts ahead of non-priority ones,
+    then by critical-path depth: the longest blocked-by chain rooted at the issue, so
+    the longest serial tail is unblocked earliest (minimizes makespan). Ties break on
+    direct-dependent count, then issue number.
   * GREEDY DISJOINT-SCOPE PACK — walk ready issues in priority order; add to the
     batch only when its `Scope:` is disjoint from every batch member AND every
     in-flight spoke. `Scope: *` / a missing line ⇒ exclusive (never batched).
@@ -248,6 +250,16 @@ def test_priority_issue_still_batches_with_disjoint_peer() -> None:
 
     assert set(batch) == {2, 9}, "disjoint concurrency is preserved"
     assert batch[0] == 9, "the priority issue is ordered first despite the higher number"
+
+
+def test_priority_does_not_resurrect_a_held_issue() -> None:
+    # hold is a pre-sort eligibility filter; priority only reorders the survivors,
+    # so a held+priority issue stays excluded rather than jumping to the front.
+    nodes = [_node(1, "a.py", labels=["hold", "priority"]), _node(2, "b.py")]
+
+    batch = _plan(nodes)
+
+    assert batch == [2], "a held issue is not dispatched even when also labelled priority"
 
 
 # ── merge-candidate lint: colliding-scope serialized chains warn (issue #125) ─
