@@ -496,15 +496,20 @@ wt_proc_start_epoch() {
 # plus its only telemetry sibling import, langfuse_audit_events. Reading from the
 # MAIN checkout (the preflight's repo_root) makes mtime a reliable change signal —
 # a land rewrites the touched files, an untouched land leaves them old — so it does
-# not over-fire the way a per-worktree checkout's fresh mtimes would. Portable stat
-# (BSD -f %m / GNU -c %Y); 0 when none found. Overridable in tests.
+# not over-fire the way a per-worktree checkout's fresh mtimes would. Portable stat,
+# GNU-first (GNU -c %Y, then BSD -f %m): the order is load-bearing, because on GNU
+# stat `-f` means "filesystem status" — `stat -f %m FILE` prints a multi-line fs
+# block for FILE (taking %m as a missing operand) and exits nonzero, so a BSD-first
+# fallback APPENDS the real epoch to that captured garbage and the helper silently
+# yielded 0 on Linux (#132). GNU-first fails cleanly on BSD (usage error, empty
+# stdout). 0 when none found. Overridable in tests.
 # UPGRADE: extend this list if the bridge grows new telemetry.* imports.
 wt_bridge_source_mtime() {
   local repo_root="$1" newest=0 f m
   for f in "$repo_root/scripts/telemetry/langfuse_message_bridge.py" \
            "$repo_root/scripts/telemetry/langfuse_audit_events.py"; do
     [ -f "$f" ] || continue
-    m="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)" || continue
+    m="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null)" || continue
     [ "$m" -gt "$newest" ] && newest="$m"
   done
   printf '%s' "$newest"

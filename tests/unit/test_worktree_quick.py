@@ -184,7 +184,11 @@ def test_sets_ai_toolkit_exclude(hub: Path, tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     wt = _worktree_dir(hub, "fix-typo")
     exclude = Path(_git(wt, "rev-parse", "--git-path", "info/exclude").strip())
-    assert ".ai-toolkit/" in exclude.read_text()
+    content = exclude.read_text()
+    assert ".ai-toolkit/" in content
+    # .claude/ rides the same exclude: the copied runtime config must never
+    # count as untracked dirt at teardown/land (issue #132).
+    assert ".claude/" in content
 
 
 def test_copies_claude_runtime_config(hub: Path, tmp_path: Path) -> None:
