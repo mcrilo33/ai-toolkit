@@ -1728,3 +1728,104 @@ class TestHubGuardConfigurableBase:
         )
 
         assert hub_guard_cmd_rc('git commit -m "feat: x"', cwd=git_repo) == ALLOW
+
+
+# --- commit-gauntlet advisory coverage nudge (#123) --------------------------------
+
+
+_NUDGE_GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+
+
+def _nudge_git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", *args],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+        env=_NUDGE_GIT_ENV,
+    )
+
+
+@pytest.fixture()
+def nudge_repo(tmp_path: Path) -> Path:
+    """A git repo with a seed commit — no linter/typechecker configured, so the
+    gauntlet's only possible output is the #123 coverage nudge."""
+    r = tmp_path / "repo"
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(r)],
+        check=True,
+        capture_output=True,
+        env=_NUDGE_GIT_ENV,
+    )
+    for k, v in (("user.email", "t@t.t"), ("user.name", "t"), ("commit.gpgsign", "false")):
+        _nudge_git(r, "config", k, v)
+    (r / "README.md").write_text("seed\n")
+    _nudge_git(r, "add", "README.md")
+    _nudge_git(r, "commit", "-qm", "chore: seed")
+    return r
+
+
+def _stage(repo: Path, rel: str, body: str) -> None:
+    path = repo / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+    _nudge_git(repo, "add", rel)
+
+
+def _run_gauntlet(repo: Path) -> subprocess.CompletedProcess:
+    return _run(COMMIT_GAUNTLET, _payload("git commit -m 'x'"), cwd=repo)
+
+
+class TestGauntletCoverageNudge:
+    def test_new_unreferenced_control_plane_script_warns_and_allows(
+        self, nudge_repo: Path
+    ) -> None:
+        _stage(nudge_repo, "scripts/new-tool.sh", "#!/bin/sh\necho hi\n")
+
+        proc = _run_gauntlet(nudge_repo)
+
+        assert proc.returncode == ALLOW  # advisory: never blocks
+        assert "new-tool.sh" in proc.stderr
+        assert "referencing" in proc.stderr
+
+    def test_new_script_with_staged_referencing_test_stays_silent(
+        self, nudge_repo: Path
+    ) -> None:
+        _stage(nudge_repo, "scripts/new-tool.sh", "#!/bin/sh\necho hi\n")
+        _stage(nudge_repo, "tests/unit/test_new_tool.py", '"""Covers new-tool.sh."""\n')
+
+        proc = _run_gauntlet(nudge_repo)
+
+        assert proc.returncode == ALLOW
+        assert "new-tool.sh" not in proc.stderr  # the staged test satisfies it
+
+    def test_exempt_new_script_stays_silent(self, nudge_repo: Path) -> None:
+        (nudge_repo / ".test-select-exempt").write_text("scripts/vendored.sh\n")
+        _nudge_git(nudge_repo, "add", ".test-select-exempt")
+        _nudge_git(nudge_repo, "commit", "-qm", "chore: exempt")
+        _stage(nudge_repo, "scripts/vendored.sh", "#!/bin/sh\necho hi\n")
+
+        proc = _run_gauntlet(nudge_repo)
+
+        assert proc.returncode == ALLOW
+        assert "vendored.sh" not in proc.stderr
+
+    def test_modified_unreferenced_script_stays_silent(self, nudge_repo: Path) -> None:
+        # The nudge is for NEW scripts only: modifying an existing unreferenced
+        # one nags at push time (escalation), not on every commit.
+        _stage(nudge_repo, "scripts/old.sh", "#!/bin/sh\necho v1\n")
+        _nudge_git(nudge_repo, "commit", "-qm", "chore: add old.sh")
+        _stage(nudge_repo, "scripts/old.sh", "#!/bin/sh\necho v2\n")
+
+        proc = _run_gauntlet(nudge_repo)
+
+        assert proc.returncode == ALLOW
+        assert "old.sh" not in proc.stderr
+
+    def test_new_script_outside_control_plane_stays_silent(self, nudge_repo: Path) -> None:
+        _stage(nudge_repo, "tools/helper.sh", "#!/bin/sh\necho hi\n")
+
+        proc = _run_gauntlet(nudge_repo)
+
+        assert proc.returncode == ALLOW
+        assert "helper.sh" not in proc.stderr
