@@ -43,6 +43,10 @@ SOURCES = {name: REPO_ROOT / "scripts" / name for name in WORKTREE_SCRIPTS}
 HUB_SCRIPTS_DIR = REPO_ROOT / "shared" / "skills" / "hub" / "scripts"
 SOURCES["hub-status.sh"] = HUB_SCRIPTS_DIR / "hub-status.sh"
 SOURCES["hub-ready-watch.sh"] = HUB_SCRIPTS_DIR / "hub-ready-watch.sh"
+# The hub OS-notifier (issue #146) MUST install alongside hub-ready-watch.sh:
+# the ready-watch loop invokes it as a co-located sibling ($_script_dir), so if
+# it is absent from .ai-toolkit/scripts/ the notifier is silently inert.
+SOURCES["hub-notify.sh"] = HUB_SCRIPTS_DIR / "hub-notify.sh"
 # The hub-side OTel watchdog (issue #115) ships alongside its siblings so a synced
 # target can /loop it to keep the collector+bridge up for the whole spoke lifetime.
 SOURCES["hub-otel-watch.sh"] = HUB_SCRIPTS_DIR / "hub-otel-watch.sh"
