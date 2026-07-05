@@ -118,6 +118,23 @@ def model_for_label(config: dict, label: str) -> ModelSpec | None:
     return _spec(by_label.get(label))
 
 
+def agent_model_overrides(config: dict) -> dict[str, dict[str, str]]:
+    """Per-agent ``{model, effort}`` overlay for sync frontmatter stamping.
+
+    Returns ``{agent_name: {"model": …, "effort": …}}`` for every routed
+    sub-agent — the shape :func:`metadata_parser.apply_overrides` consumes.
+    """
+    subagents = _model_section(config).get("subagents")
+    if not isinstance(subagents, dict):
+        return {}
+    overrides: dict[str, dict[str, str]] = {}
+    for name in subagents:
+        spec = agent_model(config, name)
+        if spec is not None:
+            overrides[name] = {"model": spec[0], "effort": spec[1]}
+    return overrides
+
+
 def base_branch(config: dict) -> str:
     """The configured integration branch, or "" for auto-detection.
 
@@ -126,3 +143,28 @@ def base_branch(config: dict) -> str:
     """
     value = config.get("base_branch")
     return value.strip() if isinstance(value, str) else ""
+
+
+def _cli(argv: list[str]) -> str:
+    """Emit a config value for sync-to-repo.sh to consume (see :func:`main`)."""
+    command = argv[1] if len(argv) > 1 else ""
+    config = load_config(argv[2] if len(argv) > 2 else None)
+    if command == "base-branch":
+        return base_branch(config)
+    if command == "spoke-env":
+        spec = spoke_model(config) or ("claude-opus-4-8[1m]", DEFAULT_EFFORT)
+        return f"WT_AGENT_MODEL_DEFAULT={spec[0]}\nWT_AGENT_EFFORT_DEFAULT={spec[1]}"
+    raise SystemExit(f"ai_toolkit_config: unknown command {command!r} (base-branch|spoke-env)")
+
+
+def main() -> None:
+    """CLI: ``ai_toolkit_config.py <base-branch|spoke-env> [config-path]``.
+
+    A thin bash-facing seam so sync-to-repo.sh can set ``ai-toolkit.base-branch``
+    and emit the spoke-default env file without a YAML parser of its own.
+    """
+    print(_cli(sys.argv))
+
+
+if __name__ == "__main__":
+    main()
