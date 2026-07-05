@@ -2,16 +2,21 @@
 # anti-gutting-scan.sh — mechanical tripwire against an implementation that GUTS
 # the tests to go green.
 #
-# The adversarial code-review gate is unenforceable policy (a spoke can narrate a
-# review it never ran — #43), and on the native Claude pre-push path reviewer-sep
-# is advisory. So this is the one MECHANICAL backstop: a deterministic scan of the
-# pushed diff for test-gutting signatures. It is ADVISORY (it prints findings to
-# stderr and exits 0) so a human's ordinary test edit is never gated, while still
-# surfacing the smell before landing.
+# A deterministic scan of the pushed diff for test-gutting signatures. It is ADVISORY
+# in EVERY context — it prints findings to stderr and always exits 0 — so a human's
+# ordinary test edit is never gated, while still surfacing the smell before landing.
+#
+# Enforcement lives elsewhere: under unattended /afk the REASONING code-review verdict
+# is the gate (hub-afk.sh auto_land escalates a spoke to blocked/<issue> on a non-clean
+# verdict — #143), replacing the brittle line-count fail-closed this scan used to arm.
+# A clean RED->GREEN diff only ADDS real assertions, so the signatures below still stand
+# out as a useful hint, but they never block.
 #
 # It reads git's pre-push stdin (`<lref> <lsha> <rref> <rsha>` lines) exactly like
 # test-select.sh, resolving the range `rsha..lsha` (a new branch with an all-zero
-# remote sha falls back to the merge-base with the default branch).
+# remote sha falls back to the merge-base with the default branch). Tag-only / marker
+# pushes (`refs/tags/*`) carry no reviewable code and are skipped entirely, so a spoke
+# escalating its state can always push its blocked/<issue> marker (#143).
 #
 # Signatures (a clean RED->GREEN diff only ADDS real assertions, so these stand out):
 #   * any *.py: an added `sys.exit(0)` / `sys.exit()` / `os._exit(...)` — a hard
@@ -58,6 +63,7 @@ DEFAULT="$(default_branch)"
 RANGES=()
 while read -r _lref lsha _rref rsha; do
   [ -n "${lsha:-}" ] || continue
+  case "$_lref" in refs/tags/*) continue ;; esac   # tag/marker push — no reviewable code
   is_zero_sha "$lsha" && continue   # deleting a ref — nothing added
   if is_zero_sha "${rsha:-0}"; then
     base="$(git merge-base "$DEFAULT" "$lsha" 2>/dev/null || true)"
@@ -120,15 +126,7 @@ done
   for f in "${FINDINGS[@]}"; do echo "  • $f"; done
 } >&2
 
-# Under unattended /afk no human is watching to catch a test-gutting diff, so the
-# tripwire fails CLOSED (blocks the push) instead of merely warning. It is armed by the
-# UNATTENDED env or by an `ai-toolkit-afk/unattended` marker the supervisor drops under
-# the git common dir (visible from every spoke worktree, which shares that dir) (#74).
-if [ -n "${UNATTENDED:-}" ] \
-  || { common="$(git rev-parse --git-common-dir 2>/dev/null)" && [ -f "$common/ai-toolkit-afk/unattended" ]; }; then
-  echo "anti-gutting: UNATTENDED — blocking the push; a human must review the above before it lands." >&2
-  exit 1
-fi
-
+# Advisory in every context (#143): the reasoning code-review verdict is the /afk gate,
+# so this scan warns but never blocks — a human's ordinary test edit is never gated.
 echo "anti-gutting: advisory — push allowed; review the above before landing." >&2
 exit 0
