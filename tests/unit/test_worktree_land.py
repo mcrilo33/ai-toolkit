@@ -1117,7 +1117,8 @@ def test_land_merges_into_configured_base(hub: Path, tmp_path: Path) -> None:
 # The land script resolves Langfuse auth itself (wt_resolve_langfuse_auth: env
 # wins, then ${AFK_TELEMETRY_CONF:-~/.afk-telemetry}) just before its telemetry
 # section, so (a) telemetry-ingest-spoke.sh inherits working credentials from a
-# fresh hub shell and builds the spoke tree + backfill, and (b) the existing
+# fresh hub shell and builds the spoke tree (#140 retired the transcript
+# backfill), and (b) the existing
 # lifecycle/script spans get AI_TOOLKIT_OTEL_SPAN_ENDPOINT and fan out to the
 # collector. Resolution is best-effort: no conf + no env keeps the existing
 # skip-WARN and the land still succeeds. No credential ever reaches an argv.

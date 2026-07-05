@@ -50,7 +50,7 @@ def _make_repo(tmp_path: Path, *, script_dir: str, git: bool = True) -> Path:
 
     Issue #136: `sync_workflow_scripts` ships the .sh files to
     `.ai-toolkit/scripts/` but never the python package, so the script must
-    resolve the ingesters relative to the repo checkout, not to itself. With
+    resolve the view builder relative to the repo checkout, not to itself. With
     `git=False` the layout is a bare non-git install, exercising the
     SCRIPT_DIR-sibling fallback.
     """
@@ -259,7 +259,7 @@ def test_skips_when_telemetry_package_missing(worktree: Path, tmp_path: Path) ->
 
 
 def test_skips_when_spoke_run_id_missing(worktree: Path, tmp_path: Path) -> None:
-    # Arrange: the id file the ingesters key on is gone
+    # Arrange: the id file the view builder keys on is gone
     (worktree / ".ai-toolkit" / "spoke-run-id").unlink()
     bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
     _make_python_stub(bindir, runlog)

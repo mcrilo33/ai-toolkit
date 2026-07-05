@@ -24,13 +24,13 @@
 #                 presence is the durable "this was an OTel spoke" signal at land
 #                 time. Absent → quiet skip (an ordinary spoke has nothing to push).
 #   auth gate     LANGFUSE_BASIC_AUTH unset → one-line skip notice, return 0. The
-#                 ingesters need it to reach Langfuse; its absence is not an error.
+#                 view builder needs it to reach Langfuse; its absence is not an error.
 #   flush wait    a brief settle so the live native-trace push lands before we read
 #                 it — the teardown SIGKILL would otherwise drop in-flight spans.
 #                 Override with AI_TOOLKIT_INGEST_FLUSH_WAIT (seconds; 0 in tests).
 #
-# Env for the steps: LANGFUSE_HOST defaults to http://localhost:3000; the ingesters
-# run under PYTHONPATH=<repo>/scripts with python3.12 (matching the telemetry
+# Env for the step: LANGFUSE_HOST defaults to http://localhost:3000; the view builder
+# runs under PYTHONPATH=<repo>/scripts with python3.12 (matching the telemetry
 # package). The package is resolved relative to the repo checkout holding this
 # script — NOT relative to the script itself: the synced copy lives at
 # <target>/.ai-toolkit/scripts/ with no telemetry/ subpackage (issue #136).
