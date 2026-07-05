@@ -60,7 +60,16 @@ fi
 SPOKE_RUN_ID="$(head -n1 "$ID_FILE" | tr -d '[:space:]')"
 [ -n "$SPOKE_RUN_ID" ] || { warn "spoke-run-id file is empty — skipping Langfuse ingestion"; exit 0; }
 
-# Auth gate: warn-and-continue, never fail the land.
+# Auth gate: warn-and-continue, never fail the land. A manual re-run has no
+# hand-exported credentials, so resolve them here the way the land does (#127):
+# env first, then the shared ~/.afk-telemetry conf, via worktree-lib.sh's
+# resolver — a synced sibling in every layout. Absent lib or unresolvable auth
+# falls through to the existing skip notice.
+if [ -f "$SCRIPT_DIR/worktree-lib.sh" ]; then
+  # shellcheck source=worktree-lib.sh
+  . "$SCRIPT_DIR/worktree-lib.sh"
+  wt_resolve_langfuse_auth || true
+fi
 if [ -z "${LANGFUSE_BASIC_AUTH:-}" ]; then
   info "LANGFUSE_BASIC_AUTH unset — skipping post-run Langfuse ingestion for $SPOKE_RUN_ID"
   exit 0
