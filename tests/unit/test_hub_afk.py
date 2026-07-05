@@ -676,6 +676,91 @@ def test_decide_and_act_stamps_answer_attempt(spoke_repo: Path, tmp_path: Path) 
     assert (statedir / "answer-attempt-5.epoch").exists()
 
 
+def test_slot_state_reaps_when_progress_also_stale(spoke_repo: Path, tmp_path: Path) -> None:
+    # Progress DEFERS the ceiling, it never cancels it: once the last progress stamp
+    # is itself older than the ceiling, the spoke is reaped.
+    now = int(time.time())
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _write_transcript(
+        pd, [{"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}}]
+    )
+    os.utime(pd / "session.jsonl", (now - 60, now - 60))
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "dispatch-5.epoch").write_text(f"{now - 300 * 60}\n")
+    (statedir / "progress-5.epoch").write_text(f"{now - 200 * 60}\n")  # also > 180m
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_NOW": str(now),
+        },
+    )
+
+    assert result.stdout.strip() == "reap", result.stderr
+
+
+def test_slot_state_hard_ceiling_reaps_despite_fresh_progress(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The absolute backstop: a doom-loop that keeps committing (progress always
+    # fresh) is still reaped once dispatch age exceeds
+    # AFK_SPOKE_HARD_CEILING_MULT x AFK_SPOKE_MAX_MINUTES — it must not be able to
+    # burn a whole drain window (ST3 review).
+    now = int(time.time())
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _write_transcript(
+        pd, [{"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}}]
+    )
+    os.utime(pd / "session.jsonl", (now - 60, now - 60))
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "dispatch-5.epoch").write_text(f"{now - 600 * 60}\n")  # 10h > 3x180m
+    (statedir / "progress-5.epoch").write_text(f"{now - 10 * 60}\n")  # still committing
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_NOW": str(now),
+        },
+    )
+
+    assert result.stdout.strip() == "reap", result.stderr
+
+
+def test_spoke_idle_seconds_prefers_fresher_transcript(spoke_repo: Path, tmp_path: Path) -> None:
+    # max() picks the transcript when it is fresher than the attempt; a garbage
+    # attempt file is ignored without tripping the set -u arithmetic.
+    now = int(time.time())
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _write_transcript(
+        pd, [{"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}}]
+    )
+    os.utime(pd / "session.jsonl", (now - 120, now - 120))
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "answer-attempt-5.epoch").write_text(f"{now - 7200}\n")  # older attempt
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_NOW": str(now),
+    }
+
+    result = _call(f"_spoke_idle_seconds '{spoke_repo}' 5", env=env)
+    assert result.stdout.strip() == "120", result.stdout + result.stderr
+
+    (statedir / "answer-attempt-5.epoch").write_text("garbage\n")
+    result = _call(f"_spoke_idle_seconds '{spoke_repo}' 5; echo RC=$?", env=env)
+    assert "RC=0" in result.stdout and "120" in result.stdout, result.stdout + result.stderr
+
+
 # ── the tmux inject: interactive-gate handling (issue #74, defect 1) ──────────
 # A PLAN gate renders as an interactive AskUserQuestion MENU (tab/arrow/enter) that
 # ignores typed free text, so a bare `send-keys -l <text>` never answers it. The fix

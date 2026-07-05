@@ -318,6 +318,23 @@ _afk_ceiling_epoch() {
   return 0
 }
 
+# _spoke_over_any_ceiling <issue> <now> -> the reaper's full ceiling test. Progress
+# DEFERS the soft ceiling (a revived / committing spoke gets fresh AFK_SPOKE_MAX_MINUTES
+# from its last progress), but the dispatch epoch keeps an ABSOLUTE backstop at
+# AFK_SPOKE_HARD_CEILING_MULT (default 3) x AFK_SPOKE_MAX_MINUTES — without it a
+# doom-loop that commits every <180m would evade the reaper for the whole drain
+# window, the exact outcome the reaper exists to prevent (ST3 review).
+_spoke_over_any_ceiling() {
+  local issue="$1" now="$2" d mult
+  spoke_over_ceiling "$(_afk_ceiling_epoch "$issue")" "$now" && return 0
+  d="$(read_dispatch_epoch "$issue")"
+  case "$d" in '' | *[!0-9]*) return 1 ;; esac
+  case "$now" in '' | *[!0-9]*) return 1 ;; esac
+  mult="${AFK_SPOKE_HARD_CEILING_MULT:-3}"
+  case "$mult" in '' | *[!0-9]*) mult=3 ;; esac
+  [ "$(( (now - d) / 60 ))" -gt "$(( AFK_SPOKE_MAX_MINUTES * mult ))" ]
+}
+
 # --- sibling-script resolution ------------------------------------------------
 # Find a workflow script across the checkout + synced layouts; the first existing
 # candidate wins. An explicit override (passed as $1) short-circuits.
@@ -531,7 +548,7 @@ PYEOF
 #   reap    — over the wall-clock ceiling, or idle past AFK_IDLE_MINUTES with no marker.
 #   busy    — actively working (or just spawned, no transcript yet).
 slot_state() {
-  local wt_path="$1" issue="$2" tip marker kind epoch age
+  local wt_path="$1" issue="$2" tip marker kind age
   tip="$(git -C "$wt_path" rev-parse HEAD 2>/dev/null)"
   if [ -n "$tip" ]; then
     for kind in ready accept blocked; do
@@ -549,8 +566,7 @@ slot_state() {
   # Ledger progress (a tip advance since the last tick) refreshes the ceiling before
   # it is measured — a revived spoke is not re-reaped off its stale dispatch epoch.
   _afk_note_tip_progress "$wt_path" "$issue"
-  epoch="$(_afk_ceiling_epoch "$issue")"
-  if spoke_over_ceiling "$epoch" "$(afk_now)"; then printf 'reap\n'; return; fi
+  if _spoke_over_any_ceiling "$issue" "$(afk_now)"; then printf 'reap\n'; return; fi
   if [ -n "$(extract_pending_question "$wt_path")" ]; then printf 'waiting\n'; return; fi
   age="$(_spoke_idle_seconds "$wt_path" "$issue")"
   if [ -n "$age" ] && [ "$age" -gt $(( AFK_IDLE_MINUTES * 60 )) ]; then printf 'reap\n'; return; fi
@@ -1119,7 +1135,7 @@ respawn_wedged_spoke() {
 # pane with nothing to preserve, or one already resumed this window, is blocked.
 _reap_or_resume() {
   local wt="$1" issue="$2"
-  if spoke_over_ceiling "$(_afk_ceiling_epoch "$issue")" "$(afk_now)"; then
+  if _spoke_over_any_ceiling "$issue" "$(afk_now)"; then
     reap_spoke "$wt" "$issue" "time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
   elif _spoke_pane_alive "$wt"; then
     reap_spoke "$wt" "$issue" "went idle >${AFK_IDLE_MINUTES}m with a live pane and no marker — likely hung"
