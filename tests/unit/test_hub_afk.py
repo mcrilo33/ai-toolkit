@@ -3525,3 +3525,111 @@ def test_module_skips_on_non_darwin(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     assert "1 skipped" in result.stdout, result.stdout
     assert "passed" not in result.stdout, result.stdout
+
+
+# ── self-copy exec: a rewritten hub-afk.sh cannot corrupt a live drain
+# (issue #133, subtask 5). The 2026-07-04 drain: re-syncing the hub mid-drain
+# rewrote the running script; bash's lazy read produced a syntax error on the exit
+# path (`line 1465: unexpected token`). At loop entry the supervisor now execs a
+# private tmp COPY of itself; the on-disk original can be rewritten freely.
+
+
+def test_afk_self_prefers_orig_script() -> None:
+    # The watchdog's respawn must relaunch the ORIGINAL path (deliberately picking up
+    # new code and re-copying), not the tmp copy it is currently running from.
+    result = _call("_afk_self", env={"AFK_ORIG_SCRIPT": "/x/orig-hub-afk.sh"})
+
+    assert result.stdout.strip() == "/x/orig-hub-afk.sh", result.stdout + result.stderr
+
+
+def test_exec_self_copy_noop_when_already_running_copy(tmp_path: Path) -> None:
+    result = _call(
+        "_afk_exec_self_copy drain; echo SURVIVED",
+        env={"AFK_RUNNING_COPY": "1", "TMPDIR": str(tmp_path)},
+    )
+
+    assert "SURVIVED" in result.stdout, result.stdout + result.stderr
+    assert "command not found" not in result.stderr, result.stderr
+
+
+def test_exec_self_copy_opt_out(tmp_path: Path) -> None:
+    result = _call(
+        "_afk_exec_self_copy drain; echo SURVIVED",
+        env={"AFK_SELF_COPY": "0", "TMPDIR": str(tmp_path)},
+    )
+
+    assert "SURVIVED" in result.stdout, result.stdout + result.stderr
+    assert "command not found" not in result.stderr, result.stderr
+
+
+def test_exec_self_copy_execs_from_private_copy(tmp_path: Path) -> None:
+    # The exec replaces the shell (the trailing echo never runs) and the re-exec'd
+    # copy handles the argv — --status prints the off line from the isolated state.
+    result = _call(
+        "_afk_exec_self_copy --status; echo NOT_REACHED",
+        env={"TMPDIR": str(tmp_path), "AFK_STATE": str(tmp_path / "state")},
+    )
+
+    assert "/afk: off" in result.stdout, result.stdout + result.stderr
+    assert "NOT_REACHED" not in result.stdout, "exec must replace the shell"
+    copies = list(tmp_path.glob("hub-afk-self.*/hub-afk.sh"))
+    assert copies, "the copy must live under a private TMPDIR path"
+    assert copies[0].read_text() == HUB_AFK.read_text(), "the copy is byte-identical"
+
+
+def _wait_for_file(path: Path, timeout: float = 15.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_drain_survives_source_rewrite_mid_run(spoke_repo: Path, tmp_path: Path) -> None:
+    # The issue's acceptance criterion: a drain armed from a checkout whose
+    # hub-afk.sh is then rewritten on disk finishes its window without reading the
+    # modified file. The original lives in tmp (never touch the repo's copy); the
+    # batch-plan stub sleeps so the rewrite deterministically lands mid-tick, and
+    # the rewritten content is LONGER pure garbage so a lazy re-read of the
+    # original past main() hits an unparseable token (the #133 failure shape).
+    orig_dir = tmp_path / "orig"
+    orig_dir.mkdir()
+    script = orig_dir / "hub-afk.sh"
+    script.write_text(HUB_AFK.read_text())
+    script.chmod(0o755)
+    bp = tmp_path / "batch-plan.sh"
+    bp.write_text("#!/usr/bin/env bash\nsleep 3\n")
+    bp.chmod(0o755)
+    state = tmp_path / "state"
+    env = {
+        **os.environ,
+        "TZ": "UTC",
+        "TMPDIR": str(tmp_path),
+        "AFK_STATE": str(state),
+        "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+        "AFK_STATE_DIR": str(tmp_path / "statedir"),
+        "AFK_TICK_SECONDS": "1",
+        "AI_TOOLKIT_OTEL": "0",
+        "BATCH_PLAN": str(bp),
+        "AFK_WATCHDOG_SPAWN_CMD": ":",
+        "AFK_WT_LIB": str(REPO_ROOT / "scripts" / "worktree-lib.sh"),
+        "CLAUDE_PROJECTS_DIR": "/nonexistent",
+    }
+
+    proc = subprocess.Popen(
+        ["bash", str(script), "drain"],
+        cwd=spoke_repo,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    armed = _wait_for_file(state)
+    script.write_text("esac\n" * 30000)  # longer than the original, unparseable
+    stdout, stderr = proc.communicate(timeout=60)
+
+    assert armed, "the drain must have armed (state file written) before the rewrite"
+    assert proc.returncode == 0, f"rc={proc.returncode}\nstdout={stdout}\nstderr={stderr}"
+    assert "/afk: done" in stderr, stderr
+    assert "syntax error" not in stderr, f"the rewritten original was read: {stderr}"
