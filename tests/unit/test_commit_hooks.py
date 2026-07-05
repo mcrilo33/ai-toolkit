@@ -1765,7 +1765,7 @@ def nudge_repo(tmp_path: Path) -> Path:
     return r
 
 
-def _stage(repo: Path, rel: str, body: str) -> None:
+def _stage_nudge(repo: Path, rel: str, body: str) -> None:
     path = repo / rel
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body)
@@ -1780,7 +1780,7 @@ class TestGauntletCoverageNudge:
     def test_new_unreferenced_control_plane_script_warns_and_allows(
         self, nudge_repo: Path
     ) -> None:
-        _stage(nudge_repo, "scripts/new-tool.sh", "#!/bin/sh\necho hi\n")
+        _stage_nudge(nudge_repo, "scripts/new-tool.sh", "#!/bin/sh\necho hi\n")
 
         proc = _run_gauntlet(nudge_repo)
 
@@ -1791,8 +1791,8 @@ class TestGauntletCoverageNudge:
     def test_new_script_with_staged_referencing_test_stays_silent(
         self, nudge_repo: Path
     ) -> None:
-        _stage(nudge_repo, "scripts/new-tool.sh", "#!/bin/sh\necho hi\n")
-        _stage(nudge_repo, "tests/unit/test_new_tool.py", '"""Covers new-tool.sh."""\n')
+        _stage_nudge(nudge_repo, "scripts/new-tool.sh", "#!/bin/sh\necho hi\n")
+        _stage_nudge(nudge_repo, "tests/unit/test_new_tool.py", '"""Covers new-tool.sh."""\n')
 
         proc = _run_gauntlet(nudge_repo)
 
@@ -1803,7 +1803,7 @@ class TestGauntletCoverageNudge:
         (nudge_repo / ".test-select-exempt").write_text("scripts/vendored.sh\n")
         _nudge_git(nudge_repo, "add", ".test-select-exempt")
         _nudge_git(nudge_repo, "commit", "-qm", "chore: exempt")
-        _stage(nudge_repo, "scripts/vendored.sh", "#!/bin/sh\necho hi\n")
+        _stage_nudge(nudge_repo, "scripts/vendored.sh", "#!/bin/sh\necho hi\n")
 
         proc = _run_gauntlet(nudge_repo)
 
@@ -1813,9 +1813,9 @@ class TestGauntletCoverageNudge:
     def test_modified_unreferenced_script_stays_silent(self, nudge_repo: Path) -> None:
         # The nudge is for NEW scripts only: modifying an existing unreferenced
         # one nags at push time (escalation), not on every commit.
-        _stage(nudge_repo, "scripts/old.sh", "#!/bin/sh\necho v1\n")
+        _stage_nudge(nudge_repo, "scripts/old.sh", "#!/bin/sh\necho v1\n")
         _nudge_git(nudge_repo, "commit", "-qm", "chore: add old.sh")
-        _stage(nudge_repo, "scripts/old.sh", "#!/bin/sh\necho v2\n")
+        _stage_nudge(nudge_repo, "scripts/old.sh", "#!/bin/sh\necho v2\n")
 
         proc = _run_gauntlet(nudge_repo)
 
@@ -1823,7 +1823,7 @@ class TestGauntletCoverageNudge:
         assert "old.sh" not in proc.stderr
 
     def test_new_script_outside_control_plane_stays_silent(self, nudge_repo: Path) -> None:
-        _stage(nudge_repo, "tools/helper.sh", "#!/bin/sh\necho hi\n")
+        _stage_nudge(nudge_repo, "tools/helper.sh", "#!/bin/sh\necho hi\n")
 
         proc = _run_gauntlet(nudge_repo)
 

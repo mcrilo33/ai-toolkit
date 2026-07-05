@@ -87,6 +87,29 @@ _reverse_index_build_cache() {
   find "$dir" -type f -mtime +14 -delete 2>/dev/null || true
 }
 
+# Exempt list (issue #123): repo-root .test-select-exempt names paths with
+# legitimately no test surface (LICENSE, .gitignore, editor config). One path
+# per line; `#` starts a comment; an entry matches exactly or as a directory
+# prefix ("settings/" covers its children); surrounding whitespace/CR is
+# stripped. An absent file means no exemptions. Lives here so the selector
+# (test-select.sh) and the commit-time nudge (commit-gauntlet.sh) share ONE
+# parser and can never drift on what "exempt" means.
+REVERSE_INDEX_EXEMPT_LIST=".test-select-exempt"
+reverse_index_is_exempt() {
+  local f="$1" entry
+  [ -f "$REVERSE_INDEX_EXEMPT_LIST" ] || return 1
+  while IFS= read -r entry || [ -n "$entry" ]; do
+    entry="${entry%%#*}"
+    entry="${entry%"${entry##*[![:space:]]}"}"   # strip trailing whitespace/CR
+    entry="${entry#"${entry%%[![:space:]]*}"}"   # strip leading whitespace
+    [ -n "$entry" ] || continue
+    entry="${entry%/}"
+    [ "$f" = "$entry" ] && return 0
+    case "$f" in "$entry"/*) return 0 ;; esac
+  done < "$REVERSE_INDEX_EXEMPT_LIST"
+  return 1
+}
+
 # reverse_index_tests_for <changed-file> — print the sorted unique test files
 # referencing the changed file's basename as an exact token; empty when none.
 # Always returns 0: "no mapping" is an answer, not an error.

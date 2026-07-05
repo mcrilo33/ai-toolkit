@@ -124,15 +124,18 @@ is_doc() {
 
 is_py() { case "$1" in *.py) return 0 ;; *) return 1 ;; esac; }
 
-# Exempt list (issue #123): repo-root .test-select-exempt names paths with
-# legitimately no test surface (LICENSE, .gitignore, settings/, editor
-# config). One path per line; `#` starts a comment; an entry matches exactly
-# or as a directory prefix ("settings/" covers its children). An absent file
-# means no exemptions — synced repos keep today's behavior. Note the list's
-# own basename can never be a filename-shaped token, so editing it is
-# unmapped by construction and escalates to the full suite: high-stakes
-# changes to what the gate ignores always pay the maximum price.
-EXEMPT_LIST=".test-select-exempt"
+# Exempt handling (issue #123): the parser lives in lib/test-reverse-index.sh
+# (reverse_index_is_exempt) so this gate and the commit-time nudge share one
+# definition of "exempt". Note the list's own basename (.test-select-exempt)
+# can never be a filename-shaped token, so editing it is unmapped by
+# construction and escalates to the full suite: high-stakes changes to what
+# the gate ignores always pay the maximum price. Without the lib (a stale
+# installed hook) there are no exemptions — conservative, like the index.
+if [ "$RINDEX" = "1" ]; then
+  is_exempt() { reverse_index_is_exempt "$1"; }
+else
+  is_exempt() { return 1; }
+fi
 
 # The control-plane coverage meta-test (issue #123): a milliseconds static
 # scan asserting every control-plane script has a referencing test or an
@@ -143,20 +146,6 @@ EXEMPT_LIST=".test-select-exempt"
 # it. Guarded on file existence: synced repos without the file are unaffected.
 META_TEST_FILE="tests/unit/test_test_reverse_index.py"
 META_TEST_NODE="$META_TEST_FILE::TestControlPlaneCoverage"
-is_exempt() {
-  local f="$1" entry
-  [ -f "$EXEMPT_LIST" ] || return 1
-  while IFS= read -r entry || [ -n "$entry" ]; do
-    entry="${entry%%#*}"
-    entry="${entry%"${entry##*[![:space:]]}"}"   # strip trailing whitespace/CR
-    entry="${entry#"${entry%%[![:space:]]*}"}"   # strip leading whitespace
-    [ -n "$entry" ] || continue
-    entry="${entry%/}"
-    [ "$f" = "$entry" ] && return 0
-    case "$f" in "$entry"/*) return 0 ;; esac
-  done < "$EXEMPT_LIST"
-  return 1
-}
 
 is_zero_sha() {
   local sha="$1"
