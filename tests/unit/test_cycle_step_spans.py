@@ -1,4 +1,4 @@
-"""Regression guard: cycle gates no longer emit ``kind: step`` spans (Issue #100).
+"""Cycle-step span contract: no per-commit step spans (#100), gate-time markers (#139).
 
 Originally (Issue #21) each solo-cycle gate emitted a ``kind: step`` span tagged with
 its phase, on top of the automatic ``kind: hook`` span. Issue #100 DROPS that emission:
@@ -6,9 +6,18 @@ cycle steps are now derived in the assembler from the todo ledger (``TaskCreate`
 + ``TaskUpdate`` ``in_progress``/``completed`` windows), so the flat per-commit ``step:*``
 markers are pure noise in the spoke-tree.
 
-These tests pin the new contract: the gate hooks still emit their single ``kind: hook``
-span, but never a ``kind: step`` span, and ``telemetry_mark_step`` no longer exists in the
-telemetry lib.
+Issue #139 adds back exactly TWO gate-time markers — ``step:review`` from the
+review-stamp gate and ``step:push`` from ``spoke-push.sh`` — because those two ledger
+step containers otherwise stay near-empty on a healthy Claude Code run (nothing else
+emits during their windows). The markers go through one idempotent helper,
+``telemetry_mark_cycle_step``: it emits a single ``kind: step`` span per (phase, key)
+and records the key in a sentinel file (``.ai-toolkit/cycle-step-<phase>``), so a gate
+retry or a re-push never duplicates the span.
+
+These tests pin both contracts: the per-commit gate hooks (#100 set) still emit their
+single ``kind: hook`` span and never a ``kind: step`` span; ``telemetry_mark_step`` (the
+#21 helper) no longer exists; and the #139 marker helper + its two gate entry points
+fire once per step, idempotently.
 """
 
 from __future__ import annotations
@@ -31,7 +40,17 @@ RED_PROOF_VERIFY = HOOKS_DIR / "red-proof-verify.sh"
 
 def _env(telemetry_dir: Path, *, enabled: bool = True) -> dict[str, str]:
     env = os.environ.copy()
-    for var in ("AI_TOOLKIT_TELEMETRY", "AI_TOOLKIT_TELEMETRY_DIR", "CURSOR_PROJECT_DIR"):
+    # AI_TOOLKIT_PARENT_SPAN / TELEMETRY_PARENT_ID outrank the payload-derived
+    # parent and the push gate exports them — strip so a run under a live gate
+    # behaves like a clean shell. The OTLP endpoint would add a second sink.
+    for var in (
+        "AI_TOOLKIT_TELEMETRY",
+        "AI_TOOLKIT_TELEMETRY_DIR",
+        "CURSOR_PROJECT_DIR",
+        "AI_TOOLKIT_PARENT_SPAN",
+        "TELEMETRY_PARENT_ID",
+        "AI_TOOLKIT_OTEL_SPAN_ENDPOINT",
+    ):
         env.pop(var, None)
     if enabled:
         env["AI_TOOLKIT_TELEMETRY"] = "1"
@@ -88,12 +107,15 @@ def telemetry_dir(tmp_path: Path) -> Path:
 class TestStepEmissionRemoved:
     def test_telemetry_lib_no_longer_defines_mark_step(self) -> None:
         text = TELEMETRY_LIB.read_text()
-        assert "telemetry_mark_step" not in text
-        assert "kind step" not in text  # the `--kind step` emission is gone
+        assert "telemetry_mark_step()" not in text  # the #21 helper stays gone
 
     def test_no_gate_hook_calls_mark_step(self) -> None:
+        # The #100 set never regains a step emission — neither the old helper
+        # nor the #139 marker helper belongs in the per-commit gate hooks.
         for hook in (GIT_PUSH_REVIEW, REVIEW_WINDOW_OPEN, COMMIT_GAUNTLET, RED_PROOF_VERIFY):
-            assert "telemetry_mark_step" not in hook.read_text(), hook.name
+            text = hook.read_text()
+            assert "telemetry_mark_step" not in text, hook.name
+            assert "telemetry_mark_cycle_step" not in text, hook.name
 
 
 class TestGatesEmitNoStepSpan:
@@ -133,3 +155,87 @@ class TestGatesEmitNoStepSpan:
         _run(RED_PROOF_VERIFY, payload, _env(telemetry_dir), project_root)
 
         assert _steps(telemetry_dir) == []
+
+
+# ── #139: the idempotent gate-time cycle-step marker ─────────────────────────
+
+
+def _mark(phase: str, key: str, env: dict, cwd: Path) -> subprocess.CompletedProcess:
+    """Source the telemetry lib and invoke ``telemetry_mark_cycle_step``."""
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'. "{TELEMETRY_LIB}" && telemetry_mark_cycle_step "$1" "$2"',
+            "bash",
+            phase,
+            key,
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(cwd),
+    )
+
+
+def _sentinel(project_root: Path, phase: str) -> Path:
+    return project_root / ".ai-toolkit" / f"cycle-step-{phase}"
+
+
+class TestCycleStepMarkerHelper:
+    def test_helper_is_defined_in_lib(self) -> None:
+        assert "telemetry_mark_cycle_step()" in TELEMETRY_LIB.read_text()
+
+    def test_emits_step_span_with_phase(self, project_root: Path, telemetry_dir: Path) -> None:
+        result = _mark("review", "key1", _env(telemetry_dir), project_root)
+
+        assert result.returncode == 0, result.stderr
+        steps = _steps(telemetry_dir)
+        assert len(steps) == 1
+        assert steps[0]["phase"] == "review"
+        assert steps[0]["name"] == "solo-cycle"
+        assert steps[0]["status"] == "success"
+
+    def test_is_silent(self, project_root: Path, telemetry_dir: Path) -> None:
+        result = _mark("review", "key1", _env(telemetry_dir), project_root)
+
+        assert result.stdout == ""
+        assert result.stderr == ""
+
+    def test_same_key_reemit_is_skipped(self, project_root: Path, telemetry_dir: Path) -> None:
+        env = _env(telemetry_dir)
+
+        _mark("push", "key1", env, project_root)
+        _mark("push", "key1", env, project_root)
+
+        assert len(_steps(telemetry_dir)) == 1
+
+    def test_new_key_emits_again(self, project_root: Path, telemetry_dir: Path) -> None:
+        env = _env(telemetry_dir)
+
+        _mark("push", "key1", env, project_root)
+        _mark("push", "key2", env, project_root)
+
+        assert len(_steps(telemetry_dir)) == 2
+
+    def test_phases_track_separate_sentinels(self, project_root: Path, telemetry_dir: Path) -> None:
+        env = _env(telemetry_dir)
+
+        _mark("review", "key1", env, project_root)
+        _mark("push", "key1", env, project_root)
+
+        assert sorted(e["phase"] for e in _steps(telemetry_dir)) == ["push", "review"]
+
+    def test_disabled_run_emits_nothing_and_leaves_no_sentinel(
+        self, project_root: Path, telemetry_dir: Path
+    ) -> None:
+        # A telemetry-off run must not poison the sentinel: turning telemetry on
+        # later must still emit the marker for the same key.
+        _mark("push", "key1", _env(telemetry_dir, enabled=False), project_root)
+
+        assert _events(telemetry_dir) == []
+        assert not _sentinel(project_root, "push").exists()
+
+        _mark("push", "key1", _env(telemetry_dir), project_root)
+
+        assert len(_steps(telemetry_dir)) == 1
