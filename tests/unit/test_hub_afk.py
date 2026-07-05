@@ -55,6 +55,10 @@ def _isolated_afk_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     _call(env={"AFK_STATE_DIR": ...}).
     """
     monkeypatch.setenv("AFK_STATE_DIR", str(tmp_path / "afk-state"))
+    # Same isolation for the heartbeat: auto_land now stamps it during a land
+    # (_afk_run_with_heartbeat, #133 ST4), and without this pin any test driving a
+    # land path writes .afk-heartbeat into the REAL <git-common-dir>.
+    monkeypatch.setenv("AFK_HEARTBEAT", str(tmp_path / "afk-heartbeat"))
 
 
 def _call(fn_call: str, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:

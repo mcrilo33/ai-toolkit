@@ -1236,6 +1236,31 @@ dispatch_batch() {
 
 # --- auto-land + reap passes --------------------------------------------------
 
+# _afk_run_with_heartbeat <cmd...> -> run <cmd...> while stamping the heartbeat every
+# AFK_LAND_HEARTBEAT_SECONDS (default 30). A long tick phase (auto-land's 6-10min
+# suite) otherwise leaves the tick-top stamp to go stale mid-land: --status reports
+# STALE and the watchdog could respawn a second supervisor into a live drain (#133).
+# Returns the command's exit code (a failed land must still escalate).
+_afk_run_with_heartbeat() {
+  local child rc slept interval="${AFK_LAND_HEARTBEAT_SECONDS:-30}"
+  case "$interval" in '' | *[!0-9]* | 0) interval=30 ;; esac
+  "$@" &
+  child=$!
+  while kill -0 "$child" 2>/dev/null; do
+    afk_write_heartbeat
+    # Re-check the child every second within the stamp interval — a full-interval
+    # sleep would hold the tick up to AFK_LAND_HEARTBEAT_SECONDS after a fast land.
+    slept=0
+    while [ "$slept" -lt "$interval" ] && kill -0 "$child" 2>/dev/null; do
+      sleep 1 2>/dev/null || true
+      slept=$(( slept + 1 ))
+    done
+  done
+  wait "$child"; rc=$?
+  afk_write_heartbeat
+  return "$rc"
+}
+
 # _ready_at_tip <wt_path> <issue> -> true when ready/<issue> points at the branch tip.
 # Only a ready/ marker is auto-landed: accept/ awaits a human sign-off and blocked/ is
 # already a parked terminal state.
@@ -1264,7 +1289,7 @@ auto_land() {
       continue
     fi
     log "→ land #$issue"
-    if bash "$wt_land" "$issue" >/dev/null 2>&1; then
+    if _afk_run_with_heartbeat bash "$wt_land" "$issue" >/dev/null 2>&1; then
       log "  landed #$issue"
     else
       _escalate_blocked "$path" "$issue" "auto-land failed (merge conflict or suite failure) — needs a human"
