@@ -367,8 +367,11 @@ fi
 # Every tier runs pytest under the repo-integrity tripwire (issue #31): the run
 # is bracketed by a snapshot/verify of HEAD + ref tips + core.bare/worktree, so a
 # test that escapes isolation and mutates THIS repo aborts the push (and the
-# snapshot is restored) instead of corrupting it silently. Only TEST_SELECT_SKIP
-# (handled above) bypasses the gate.
+# snapshot is restored — without ever rewinding a ref that only gained commits;
+# issue #135) instead of corrupting it silently. Fast-forward advances of
+# branches checked out in live sibling worktrees are legitimate concurrent work,
+# not escapes, and do not trip it (#135). Only TEST_SELECT_SKIP (handled above)
+# bypasses the gate.
 rc=0
 case "$DECISION" in
   PYTHON)
