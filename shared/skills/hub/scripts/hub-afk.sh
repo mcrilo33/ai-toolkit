@@ -487,7 +487,10 @@ run_answerer() {
 
 # parse_decision <raw-answerer-output> -> "ANSWER\t<text>" or "ESCALATE\t<reason>" on
 # stdout, or empty when the answerer emitted no decision line. The LAST matching line
-# wins (the answerer reasons first, then concludes).
+# wins (the answerer reasons first, then concludes). Decisions are SINGLE-LINE by
+# construction (the grep is line-anchored) — inject_answer and _afk_continue_command
+# rely on this; supporting multi-line answers would re-trigger the bracketed-paste
+# hazard (#123/#124) and the quoting hazard on the respawn command line.
 parse_decision() {
   local line kind rest
   line="$(printf '%s\n' "$1" | grep -E '^(ANSWER|ESCALATE):' | tail -1)"
@@ -583,14 +586,19 @@ _transcript_advanced() {
 #          keystroke can submit or clear) — the caller respawns the pane.
 #   rc 1 — not registered and no text observable in the composer — the caller escalates.
 inject_and_verify() {
-  local wt="$1" target="$2" text="$3" before
+  local wt="$1" target="$2" text="$3" before baseline_shows=0
   before="$(_transcript_mtime "$wt")"
+  # Baseline BEFORE pasting: a short answer often also appears in the rendered
+  # question above the composer. If the needle was already visible pre-inject,
+  # post-retry presence proves nothing — never classify wedged off a pre-existing
+  # match (a false wedge would kill a live pane where rc 1 safely escalates).
+  _composer_shows_text "$target" "$text" && baseline_shows=1
   inject_answer "$target" "$text" || return 1
   _transcript_advanced "$wt" "$before" && return 0
   log "  injected answer did not register — retrying with a bare Enter (never a re-paste)"
   tmux send-keys -t "$target" Enter 2>/dev/null || true
   _transcript_advanced "$wt" "$before" && return 0
-  _composer_shows_text "$target" "$text" && return 2
+  [ "$baseline_shows" -eq 0 ] && _composer_shows_text "$target" "$text" && return 2
   return 1
 }
 
@@ -664,7 +672,9 @@ decide_and_act() {
         afk_emit_decision "$wt" success
         return 0
       elif [ "$rc" -eq 2 ]; then
-        text="composer wedged and the pane respawn could not be launched — needs a human"
+        # The old window is dead and the answer text lives nowhere else — carry its
+        # head in the blocked reason so the returning human need not re-derive it.
+        text="composer wedged and the pane respawn could not be confirmed — needs a human; the undelivered answer began: $(printf '%.120s' "${text%%$'\n'*}")"
       else
         log "  answer to #$issue did not register — escalating"
         text="answer did not register in the spoke (inject not confirmed) — needs a human"
@@ -886,13 +896,21 @@ resume_spoke() {
 # unterminated paste no keystroke can submit or clear, #123/#124): kill the spoke's
 # window and reopen it running `claude --continue '<answer>'` under the same
 # spoke_run_id — the respawn itself delivers the answer, so the park is resolved.
-# rc 1 when the window can't be reopened (the caller escalates).
+# Delivery is CONFIRMED like an inject: the continued session must start writing its
+# transcript, else a window whose `claude` died instantly (dead auth, PATH) would be
+# scored success and the answer silently lost. rc 1 when the window can't be
+# reopened or never starts writing (the caller escalates).
 respawn_wedged_spoke() {
-  local wt="$1" issue="$2" answer="$3"
+  local wt="$1" issue="$2" answer="$3" before
   log "→ respawn #$issue: composer wedged (unterminated paste) — respawning the pane with the answer"
+  before="$(_transcript_mtime "$wt")"
   _kill_spoke_window "$issue"
   if ! _afk_open_spoke_window "$wt" "$issue" "$(_afk_wedge_respawn_command "$wt" "$issue" "$answer")"; then
     log "  could not open a respawn window for #$issue"
+    return 1
+  fi
+  if ! _transcript_advanced "$wt" "$before"; then
+    log "  respawned window never started writing its transcript — escalating"
     return 1
   fi
   _afk_emit_span "$wt" afk-wedge-respawn success

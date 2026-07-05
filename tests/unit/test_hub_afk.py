@@ -564,11 +564,14 @@ def _injector_tmux(
 ) -> tuple[Path, Path]:
     """A programmable tmux stub for the injector paths.
 
-    Logs every call; `capture-pane` serves a mutable capture file (the composer
-    content); on the `clear_on_enter`-th Enter it clears that file and appends to
-    `touch` (the spoke's transcript) — modelling a submit finally landing.
-    `list-panes` / `list-windows` answer from fixture lines so decide_and_act can
-    map the pane and a respawn can find the window to kill.
+    Logs every call. `capture-pane` serves a mutable capture file seeded with
+    `capture` (the pane BEFORE any paste — chrome, rendered question); a `-l` paste
+    appends its text there, modelling the composer buffering it. On the
+    `clear_on_enter`-th Enter the capture is cleared and `touch` (the spoke's
+    transcript) appended — a submit finally landing. `new-window` also appends to
+    `touch` (the respawned `claude --continue` session writing its first message)
+    unless `fail_new_window`. `list-panes` / `list-windows` answer from fixture
+    lines so decide_and_act can map the pane and a respawn can find its window.
     """
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
@@ -588,13 +591,19 @@ def _injector_tmux(
         f'  capture-pane) cat "{capture_file}" 2>/dev/null ;;\n'
         f'  list-panes) cat "{panes}" 2>/dev/null ;;\n'
         f'  list-windows) cat "{windows}" 2>/dev/null ;;\n'
-        f"  new-window) exit {1 if fail_new_window else 0} ;;\n"
-        "esac\n"
-        'if [ "$1" = "send-keys" ] && [ "${@: -1}" = "Enter" ]; then\n'
-        f'  n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n+1)); printf "%s\\n" "$n" > "{counter}"\n'
-        f'  if [ {clear_on_enter} -gt 0 ] && [ "$n" -ge {clear_on_enter} ]; then\n'
-        f'    : > "{capture_file}"\n'
+        "  new-window)\n"
+        f"    [ {1 if fail_new_window else 0} -eq 1 ] && exit 1\n"
         f"    {touch_cmd}\n"
+        "    exit 0 ;;\n"
+        "esac\n"
+        'if [ "$1" = "send-keys" ]; then\n'
+        f'  case " $* " in *" -l "*) printf "%s\\n" "${{@: -1}}" >> "{capture_file}" ;; esac\n'
+        '  if [ "${@: -1}" = "Enter" ]; then\n'
+        f'    n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n+1)); printf "%s\\n" "$n" > "{counter}"\n'
+        f'    if [ {clear_on_enter} -gt 0 ] && [ "$n" -ge {clear_on_enter} ]; then\n'
+        f'      : > "{capture_file}"\n'
+        f"      {touch_cmd}\n"
+        "    fi\n"
         "  fi\n"
         "fi\n"
         "exit 0\n"
@@ -657,9 +666,7 @@ def test_inject_and_verify_enter_retry_submits_buffered_answer(
     _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
     jsonl = pd / "session.jsonl"
     os.utime(jsonl, (1_000_000_000, 1_000_000_000))
-    fake_bin, tmux_log = _injector_tmux(
-        tmp_path, capture="│ > use Redis │\n", clear_on_enter=2, touch=jsonl
-    )
+    fake_bin, tmux_log = _injector_tmux(tmp_path, capture="│ > │\n", clear_on_enter=2, touch=jsonl)
 
     result = _call(
         f"inject_and_verify '{spoke_repo}' 'afk:1' 'use Redis'; echo RC=$?",
@@ -679,13 +686,13 @@ def test_inject_and_verify_enter_retry_submits_buffered_answer(
 def test_inject_and_verify_wedged_paste_returns_respawn_code(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
-    # The unterminated-paste state: the text survives the Enter-only retry (capture
-    # never clears, transcript never advances) ⇒ rc 2, the caller's respawn signal —
-    # distinct from rc 1 (escalate).
+    # The unterminated-paste state: the pane was clean pre-inject, the pasted text
+    # survives the Enter-only retry (capture never clears, transcript never advances)
+    # ⇒ rc 2, the caller's respawn signal — distinct from rc 1 (escalate).
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke_repo)
     _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
-    fake_bin, tmux_log = _injector_tmux(tmp_path, capture="│ > use Redis │\n")
+    fake_bin, tmux_log = _injector_tmux(tmp_path, capture="│ > │\n")
 
     result = _call(
         f"inject_and_verify '{spoke_repo}' 'afk:1' 'use Redis'; echo RC=$?",
@@ -700,6 +707,31 @@ def test_inject_and_verify_wedged_paste_returns_respawn_code(
     assert "RC=2" in result.stdout, result.stderr
     pastes = [ln for ln in tmux_log.read_text().splitlines() if " -l " in f" {ln} "]
     assert len(pastes) == 1, f"a wedged composer must never be re-pasted into, got: {pastes}"
+
+
+def test_inject_and_verify_preexisting_needle_never_wedges(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # Precision guard for the wedge classifier: a short answer that ALREADY shows in
+    # the pane pre-inject (the rendered question/options usually contain the chosen
+    # label) proves nothing post-retry — it must classify rc 1 (safe escalate), never
+    # rc 2 (destructive kill-window of a possibly live pane).
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
+    fake_bin, _ = _injector_tmux(tmp_path, capture="Q: Which store?\n  1. use Redis — fast\n")
+
+    result = _call(
+        f"inject_and_verify '{spoke_repo}' 'afk:1' 'use Redis'; echo RC=$?",
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "AFK_INJECT_MENU_PAUSE": "0",
+            "AFK_INJECT_VERIFY_SECONDS": "0",
+        },
+    )
+
+    assert result.stdout.strip() == "RC=1", result.stdout + result.stderr
 
 
 def test_afk_wedge_respawn_command_reuses_run_id_and_plain_answer(tmp_path: Path) -> None:
@@ -721,22 +753,15 @@ def test_afk_wedge_respawn_command_reuses_run_id_and_plain_answer(tmp_path: Path
     assert "supervisor" not in cmd, "plain answer, no supervisor preamble (approved default)"
 
 
-def test_decide_and_act_wedged_paste_respawns_pane(tmp_path: Path) -> None:
-    # End to end: answerer decides, paste wedges (survives the Enter retry) — the
-    # supervisor respawns the pane (kill-window + new-window --continue) instead of
-    # escalating, the proven manual recovery for #123/#124.
-    spoke = _branched_spoke(tmp_path, ahead=True, name="wedge-spoke", branch="feature/5-fix")
-    (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
-    (spoke / ".ai-toolkit" / "spoke-run-id").write_text("feature/5-x+1700000000\n")
+def _wedge_env(spoke: Path, tmp_path: Path, fake_bin: Path) -> tuple[dict[str, str], Path]:
+    """Common env for the decide_and_act wedge tests: waiting transcript (backdated so
+    only a stub touch reads as an advance), recording spoke-ready, fake gh, ANSWER
+    answerer. Returns (env, ready_log).
+    """
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke)
     _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
-    fake_bin, tmux_log = _injector_tmux(
-        tmp_path,
-        capture="│ > use Redis │\n",
-        pane_path=spoke,
-        window_line="afk:1 5-fix\n",
-    )
+    os.utime(pd / "session.jsonl", (1_000_000_000, 1_000_000_000))
     ready_log = tmp_path / "ready.log"
     ready_stub = tmp_path / "spoke-ready.sh"
     ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
@@ -751,6 +776,29 @@ def test_decide_and_act_wedged_paste_respawns_pane(tmp_path: Path) -> None:
         "AFK_INJECT_MENU_PAUSE": "0",
         "AFK_INJECT_VERIFY_SECONDS": "0",
     }
+    return env, ready_log
+
+
+def test_decide_and_act_wedged_paste_respawns_pane(tmp_path: Path) -> None:
+    # End to end: answerer decides, paste wedges (survives the Enter retry) — the
+    # supervisor respawns the pane (kill-window + new-window --continue) instead of
+    # escalating, the proven manual recovery for #123/#124. The respawned session
+    # writes its transcript (the stub touches it on new-window), so the delivery is
+    # confirmed and the gate tag consumed.
+    spoke = _branched_spoke(tmp_path, ahead=True, name="wedge-spoke", branch="feature/5-fix")
+    (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
+    (spoke / ".ai-toolkit" / "spoke-run-id").write_text("feature/5-x+1700000000\n")
+    subprocess.run(["git", "tag", "gate/5"], cwd=spoke, check=True, capture_output=True)
+    projects = tmp_path / "projects"
+    jsonl = _project_dir_for(projects, spoke) / "session.jsonl"
+    fake_bin, tmux_log = _injector_tmux(
+        tmp_path,
+        capture="│ > │\n",
+        touch=jsonl,
+        pane_path=spoke,
+        window_line="afk:1 5-fix\n",
+    )
+    env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
 
     result = _call(f"decide_and_act '{spoke}' 5", env=env)
 
@@ -763,38 +811,30 @@ def test_decide_and_act_wedged_paste_respawns_pane(tmp_path: Path) -> None:
     assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
         "a wedged paste is recovered by respawn, not escalated"
     )
+    tag = subprocess.run(
+        ["git", "rev-parse", "-q", "--verify", "refs/tags/gate/5"],
+        cwd=spoke,
+        capture_output=True,
+        text=True,
+    )
+    assert tag.returncode != 0, "a confirmed respawn delivers the answer — gate/5 is consumed"
 
 
 def test_decide_and_act_wedge_respawn_failure_escalates(tmp_path: Path) -> None:
     # If the respawn itself cannot be launched, the spoke must still surface as
-    # blocked/<issue> — a wedge never fails silently.
+    # blocked/<issue> — a wedge never fails silently — and the blocked reason carries
+    # the head of the undelivered answer (it is persisted nowhere else).
     spoke = _branched_spoke(tmp_path, ahead=True, name="wedge-spoke", branch="feature/5-fix")
     (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
     (spoke / ".ai-toolkit" / "spoke-run-id").write_text("feature/5-x+1700000000\n")
-    projects = tmp_path / "projects"
-    pd = _project_dir_for(projects, spoke)
-    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
     fake_bin, _ = _injector_tmux(
         tmp_path,
-        capture="│ > use Redis │\n",
+        capture="│ > │\n",
         pane_path=spoke,
         window_line="afk:1 5-fix\n",
         fail_new_window=True,
     )
-    ready_log = tmp_path / "ready.log"
-    ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
-    ready_stub.chmod(0o755)
-    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
-    (fake_bin / "gh").chmod(0o755)
-    env = {
-        "CLAUDE_PROJECTS_DIR": str(projects),
-        "SPOKE_READY": str(ready_stub),
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
-        "AFK_ANSWERER_CMD": "printf 'ANSWER: use Redis'",
-        "AFK_INJECT_MENU_PAUSE": "0",
-        "AFK_INJECT_VERIFY_SECONDS": "0",
-    }
+    env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
 
     result = _call(f"decide_and_act '{spoke}' 5", env=env)
 
@@ -802,6 +842,30 @@ def test_decide_and_act_wedge_respawn_failure_escalates(tmp_path: Path) -> None:
     log = ready_log.read_text()
     assert "--blocked 5" in log
     assert "respawn" in log, f"the reason must name the failed wedge respawn, got: {log}"
+    assert "use Redis" in log, f"the reason must carry the undelivered answer's head, got: {log}"
+
+
+def test_decide_and_act_wedge_respawn_unverified_escalates(tmp_path: Path) -> None:
+    # The respawn window opened but the continued session never wrote its transcript
+    # (claude died instantly: dead auth, missing PATH). Scoring that success would
+    # consume the gate tag and lose the answer — it must escalate instead.
+    spoke = _branched_spoke(tmp_path, ahead=True, name="wedge-spoke", branch="feature/5-fix")
+    (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
+    (spoke / ".ai-toolkit" / "spoke-run-id").write_text("feature/5-x+1700000000\n")
+    fake_bin, tmux_log = _injector_tmux(
+        tmp_path,
+        capture="│ > │\n",
+        pane_path=spoke,
+        window_line="afk:1 5-fix\n",
+    )
+    env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
+
+    result = _call(f"decide_and_act '{spoke}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "new-window" in tmux_log.read_text(), "the respawn was attempted"
+    log = ready_log.read_text()
+    assert "--blocked 5" in log, "an unconfirmed respawn must escalate, not report success"
 
 
 # ── the ANSWERER orchestration (stubbed answerer + spoke-ready) ───────────────
