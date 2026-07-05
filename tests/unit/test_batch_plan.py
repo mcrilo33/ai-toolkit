@@ -39,15 +39,24 @@ def _node(
     blocked_by: list[tuple[int, str]] | None = None,
     *,
     split: str | None = None,
+    labels: list[str] | None = None,
 ) -> dict:
-    """Build one graphql issue node: a Scope: body + blockedBy nodes (number, state)."""
+    """Build one graphql issue node: a Scope: body + blockedBy nodes (number, state).
+
+    When `labels` is given, a `labels.nodes` array of `{name}` objects is attached,
+    mirroring the graphql shape. Omitting it leaves the key absent, exactly as a
+    node with no labels arrives — so unlabelled fixtures stay byte-identical.
+    """
     body = "Some description.\n"
     if scope is not None:
         body += f"Scope: {scope}\n"
     if split is not None:
         body += f"Split: {split}\n"
     nodes = [{"number": n, "state": s} for n, s in (blocked_by or [])]
-    return {"number": number, "body": body, "blockedBy": {"nodes": nodes}}
+    node = {"number": number, "body": body, "blockedBy": {"nodes": nodes}}
+    if labels is not None:
+        node["labels"] = {"nodes": [{"name": name} for name in labels]}
+    return node
 
 
 def _run_plan(
@@ -165,6 +174,40 @@ def test_inflight_exclusive_spoke_blocks_the_whole_batch() -> None:
     batch = _plan([_node(1, "a.py"), _node(5, "d.py")], inflight=["*"])
 
     assert batch == []
+
+
+# ── hold label: staged issues are never dispatched (issue #147) ───────────────
+
+
+def test_hold_label_excludes_issue_from_batch() -> None:
+    # A ready, disjoint issue carrying `hold` is staged, never dispatched — even
+    # though nothing blocks it and its scope collides with no live work.
+    nodes = [_node(1, "a.py", labels=["hold"]), _node(2, "b.py")]
+
+    batch = _plan(nodes)
+
+    assert 1 not in batch, "a hold-labelled issue must never be dispatched"
+    assert batch == [2]
+
+
+def test_hold_excluded_but_disjoint_peers_still_batch() -> None:
+    # The held issue drops out; its disjoint non-held peers still pack together,
+    # proving hold removes only the held issue, not the concurrency around it.
+    nodes = [_node(1, "a.py", labels=["hold"]), _node(2, "b.py"), _node(3, "c.py")]
+
+    batch = _plan(nodes)
+
+    assert 1 not in batch
+    assert batch == [2, 3]
+
+
+def test_unrelated_label_does_not_change_dispatch() -> None:
+    # A label other than hold/priority leaves eligibility and ordering untouched.
+    nodes = [_node(1, "a.py", labels=["enhancement"])]
+
+    batch = _plan(nodes)
+
+    assert batch == [1]
 
 
 # ── merge-candidate lint: colliding-scope serialized chains warn (issue #125) ─
