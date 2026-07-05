@@ -108,16 +108,63 @@ def test_new_gate_marker_fires_with_approve_action(hub: Path, tmp_path: Path) ->
     assert "#1" in messages[0]
     assert "parked" in messages[0].lower()
     assert "approve" in messages[0].lower()
+    # Bind the subject read: the gate word ("plan") comes from %(contents:subject),
+    # not the "gate" fallback — asserting it keeps the derivation honest.
+    assert "plan" in messages[0]
 
 
-def test_new_blocked_marker_fires_needs_human(hub: Path, tmp_path: Path) -> None:
-    _git(hub, "tag", "-a", "-m", "merge conflict", "blocked/1", "feature/1-work")
+def test_blocked_marker_surfaces_reason_from_body(hub: Path, tmp_path: Path) -> None:
+    # Real spoke-ready.sh format: subject "blocked", reason in the tag BODY.
+    _git(
+        hub,
+        "tag",
+        "-a",
+        "-m",
+        "blocked",
+        "-m",
+        "merge conflict in foo.py",
+        "blocked/1",
+        "feature/1-work",
+    )
 
     _proc, messages = _run(hub, tmp_path)
 
     assert len(messages) == 1
     assert "#1" in messages[0]
     assert "BLOCKED" in messages[0]
+    assert "merge conflict in foo.py" in messages[0]
+
+
+def test_blocked_marker_without_reason_says_needs_human(hub: Path, tmp_path: Path) -> None:
+    # Subject "blocked", empty body → the "needs a human" fallback (and the
+    # subject-is-"blocked" suppression that stops it leaking into the message).
+    _git(hub, "tag", "-a", "-m", "blocked", "blocked/1", "feature/1-work")
+
+    _proc, messages = _run(hub, tmp_path)
+
+    assert len(messages) == 1
+    assert messages[0] == "#1 BLOCKED — needs a human"
+
+
+def test_accept_marker_is_not_watched(hub: Path, tmp_path: Path) -> None:
+    # accept/<N> is a real sibling marker (human sign-off) spoke-ready.sh emits,
+    # deliberately NOT one of the three notified classes.
+    _git(hub, "tag", "-a", "-m", "accept", "accept/1", "feature/1-work")
+
+    proc, messages = _run(hub, tmp_path)
+
+    assert proc.returncode == 0
+    assert messages == []
+
+
+def test_malformed_tag_is_skipped(hub: Path, tmp_path: Path) -> None:
+    # A non-numeric issue in a watched namespace is ignored by the numeric guard.
+    _git(hub, "tag", "ready/abc", "feature/1-work")
+
+    proc, messages = _run(hub, tmp_path)
+
+    assert proc.returncode == 0
+    assert messages == []
 
 
 def test_seen_marker_is_not_refired(hub: Path, tmp_path: Path) -> None:

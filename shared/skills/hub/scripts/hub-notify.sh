@@ -5,9 +5,11 @@
 # preferredNotifChannel=notifications_disabled), so per-turn spoke noise is
 # gone. This watcher restores the ONE channel that matters: it fires a single OS
 # notification per NEW lifecycle transition the hub already tracks —
-#   gate/<N>    → "#N parked at <gate> — reply to approve"   (attended only)
+#   gate/<N>    → "#N parked at <gate> — reply to approve"
 #   ready/<N>   → "#N done → /land N"
 #   blocked/<N> → "#N BLOCKED — <reason>"
+# (mode-gating — silencing gate/ready under a live /afk drain — lands in the
+# next subtask; this layer fires every class unconditionally.)
 # keyed on the same git-native marker tags the spoke pushes (issue #16). Run it
 # on the hub (main checkout), ideally on the existing hub loop next to
 # hub-ready-watch.sh; quiet when there is no new transition.
@@ -49,7 +51,14 @@ notify() {
     "$HUB_NOTIFY_CMD" "$msg" || true
     return
   fi
-  osascript -e "display notification \"${msg//\"/\\\"}\" with title \"ai-toolkit hub\"" \
+  # Escape for the AppleScript string literal: backslashes FIRST (else the next
+  # step's inserted backslashes get doubled), then double-quotes. A raw
+  # backslash in a blocked reason (a Windows path, a regex) would otherwise make
+  # osascript fail to compile and — because of the trailing `|| true` — silently
+  # drop the very ping that matters most.
+  local esc="${msg//\\/\\\\}"
+  esc="${esc//\"/\\\"}"
+  osascript -e "display notification \"$esc\" with title \"ai-toolkit hub\"" \
     >/dev/null 2>&1 || true
 }
 
@@ -61,6 +70,9 @@ tag_field() {
 
 # message_for <kind> <issue> <tag> — the notification text for a marker class.
 # The class comes from the tag namespace (robust); subject/body only enrich.
+# Assumes the ANNOTATED markers spoke-ready.sh emits (gate subject "plan";
+# blocked subject "blocked" + reason in the body). On a lightweight tag,
+# %(contents:*) returns the pointed-to COMMIT's message — degraded input only.
 message_for() {
   local kind="$1" issue="$2" tag="$3" gate reason subject
   case "$kind" in
