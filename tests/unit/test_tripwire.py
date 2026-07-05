@@ -7,9 +7,17 @@ tripwire is the safety net for the whole CLASS of isolation breaches.
 
 Before the gate runs pytest it snapshots the real repo's integrity markers —
 ``HEAD`` + every local ref tip, ``core.bare``, ``core.worktree`` — and re-reads
-them after. Any change means a test escaped isolation and mutated THIS repo: the
-push is aborted (non-zero), the snapshot restored, and the changed marker named.
-A hermetic test that creates/deletes its OWN tmpdir repo must NOT trip it.
+them after. A genuine change means a test escaped isolation and mutated THIS
+repo: the push is aborted (non-zero), the snapshot restored, and the changed
+marker named. A hermetic test that creates/deletes its OWN tmpdir repo must NOT
+trip it.
+
+Two #135 refinements: worktrees share one ref store, so a fast-forward advance
+(or creation) of a branch checked out in a live sibling worktree is legitimate
+concurrent spoke work, not an escape — it neither trips the check nor gets
+rewound. And restore never orphans commits: a ref is never rewound to a strict
+ancestor of its current tip (warn + abort instead), and an appeared ref checked
+out in a registered worktree is never deleted.
 
 Two layers are covered:
 

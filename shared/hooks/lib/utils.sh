@@ -709,7 +709,15 @@ review_artifact_signature() {
 #   • core.worktree
 # The pytest child runs with GIT_* unset (#30), so a hermetic test that
 # creates/deletes its OWN tmpdir repo never touches these markers — only a real
-# escape into THIS repo trips it (no false positives).
+# escape into THIS repo trips it.
+#
+# Live siblings (issue #135): worktrees share this ref store, so a live sibling
+# spoke committing during a long gate moves a `refs/heads/*` marker without any
+# escape. tripwire_check treats a fast-forward advance (or creation) of a branch
+# checked out in another registered worktree as benign, and tripwire_restore
+# never orphans commits — it refuses to rewind any ref to a strict ancestor of
+# its current tip and never deletes a ref a registered worktree has checked out
+# (the abort, not the rewind, is the protection).
 #
 # Snapshot format (one marker per line, parseable by check/restore):
 #   ref <sha> <refname>        # HEAD line included via --head
