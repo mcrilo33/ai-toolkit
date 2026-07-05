@@ -868,6 +868,204 @@ def test_decide_and_act_wedge_respawn_unverified_escalates(tmp_path: Path) -> No
     assert "--blocked 5" in log, "an unconfirmed respawn must escalate, not report success"
 
 
+# ── answerer discipline: seed-replay suppression, gate routing, parked re-check
+# (issue #133, subtask 2). The 2026-07-04 drain: a parked spoke was "answered" with a
+# replay of its own seed prompt six times in a row (#124); a PLAN gate was answered
+# long after it had passed, interrupting the spoke mid-tool-call (#129/#89).
+
+# NOTE: apostrophe-free on purpose — tests interpolate it into single-quoted bash.
+_SEED_PROMPT = (
+    "You are in a dedicated worktree for issue #5. Run /source to anchor to issue #5 and "
+    "read it. Before touching code, break the issue body into a task ledger, one todo per "
+    "subtask x the solo-cycle steps that apply, exactly one in_progress. Honor the issue "
+    "Gate line and wait for approval before writing code. Then implement following the "
+    "solo-cycle and push your own branch on every subtask without asking."
+)
+
+
+def _seed_record(text: str = _SEED_PROMPT) -> dict:
+    return {"type": "user", "message": {"content": [{"type": "text", "text": text}]}}
+
+
+def test_is_seed_replay_true_for_replayed_seed(tmp_path: Path) -> None:
+    projects = tmp_path / "projects"
+    wt = tmp_path / "wt"
+    pd = _project_dir_for(projects, wt)
+    _write_transcript(pd, [_seed_record(), _ask_record("Which store?", [("Redis", "fast")])])
+
+    result = _call(
+        f"_is_seed_replay '{wt}' '{_SEED_PROMPT[:300]}'; echo RC=$?",
+        env={"CLAUDE_PROJECTS_DIR": str(projects)},
+    )
+
+    assert result.stdout.strip() == "RC=0", result.stdout + result.stderr
+
+
+def test_is_seed_replay_false_for_short_legit_answer(tmp_path: Path) -> None:
+    # A short answer must never be suppressed by containment: "use Redis"-sized replies
+    # are the norm and would trivially appear inside a long seed that mentions the label.
+    projects = tmp_path / "projects"
+    wt = tmp_path / "wt"
+    pd = _project_dir_for(projects, wt)
+    seed = _SEED_PROMPT + " Prefer Redis over Postgres if asked."
+    _write_transcript(pd, [_seed_record(seed), _ask_record("Which store?", [("Redis", "fast")])])
+
+    result = _call(
+        f"_is_seed_replay '{wt}' 'Redis'; echo RC=$?",
+        env={"CLAUDE_PROJECTS_DIR": str(projects)},
+    )
+
+    assert result.stdout.strip() == "RC=1", result.stdout + result.stderr
+
+
+def test_is_seed_replay_false_for_novel_long_answer(tmp_path: Path) -> None:
+    projects = tmp_path / "projects"
+    wt = tmp_path / "wt"
+    pd = _project_dir_for(projects, wt)
+    _write_transcript(pd, [_seed_record(), _ask_record("Which store?", [("Redis", "fast")])])
+    novel = (
+        "Approved with amendments: use Redis for the hot path but keep the durable "
+        "ledger in Postgres; add a regression test for the eviction race before GREEN."
+    )
+
+    result = _call(
+        f"_is_seed_replay '{wt}' '{novel}'; echo RC=$?",
+        env={"CLAUDE_PROJECTS_DIR": str(projects)},
+    )
+
+    assert result.stdout.strip() == "RC=1", result.stdout + result.stderr
+
+
+def test_decide_and_act_suppresses_seed_replay_answer(tmp_path: Path) -> None:
+    # #124: the answerer echoed the spoke's own kickoff back at it, six ticks in a row.
+    # A replayed seed must never be injected — escalate with a reason naming the replay.
+    spoke = _branched_spoke(tmp_path, ahead=True, name="replay-spoke", branch="feature/5-fix")
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke)
+    fake_bin, tmux_log = _injector_tmux(tmp_path, capture="│ > │\n", pane_path=spoke)
+    env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
+    # Re-write over _wedge_env's transcript so the FIRST user message is the seed.
+    _write_transcript(pd, [_seed_record(), _ask_record("Which store?", [("Redis", "fast")])])
+    env["AFK_ANSWERER_CMD"] = 'printf "ANSWER: %s" "$_AFK_SEED"'
+    env["_AFK_SEED"] = _SEED_PROMPT[:300]
+
+    result = _call(f"decide_and_act '{spoke}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert " -l " not in f" {tmux_log.read_text()} ", "a seed replay must never be pasted"
+    log = ready_log.read_text()
+    assert "--blocked 5" in log
+    assert "seed" in log, f"the reason must name the seed replay, got: {log}"
+
+
+def test_decide_and_act_gate_park_routes_plan_to_answerer(tmp_path: Path) -> None:
+    # #124's root: a gate park was answered from generic transcript re-extraction. When
+    # the park is an emitted gate/<issue>, the answerer must be asked to approve/amend
+    # the POSTED PLAN, and the plan prose must ride in its prompt.
+    spoke = _branched_spoke(tmp_path, ahead=True, name="gate-spoke", branch="feature/5-fix")
+    subprocess.run(["git", "tag", "gate/5"], cwd=spoke, check=True, capture_output=True)
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke)
+    fake_bin, _ = _injector_tmux(tmp_path, capture="│ > │\n")
+    env, _ready_log = _wedge_env(spoke, tmp_path, fake_bin)
+    # Re-write over _wedge_env's ask transcript: the park here is a gate, not an ask.
+    plan = "Plan: refactor the reaper idle clock, then add the ceiling reset. Reply to approve."
+    _write_transcript(pd, _gate_park_records(5, plan))
+    prompt_dump = tmp_path / "prompt.txt"
+    env["AFK_ANSWERER_CMD"] = f"cat > \"{prompt_dump}\"; printf 'ANSWER: Approved — proceed.'"
+
+    result = _call(f"decide_and_act '{spoke}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    dumped = prompt_dump.read_text()
+    assert plan in dumped, "the posted plan must ride in the answerer prompt"
+    # The gate-framing instruction — asserted on wording DISTINCT from the
+    # afk-answering rule text (which also contains "PLAN gate").
+    assert "Approve it or state precise amendments" in dumped, (
+        "the prompt must route to approve/amend-the-posted-plan"
+    )
+    assert "restate" in dumped, (
+        "the prompt must forbid re-issuing the task (the #124 seed-replay shape)"
+    )
+
+
+def test_decide_and_act_gate_park_without_plan_text_still_answers(tmp_path: Path) -> None:
+    # A gate/<issue> tag at the tip whose plan prose cannot be extracted (transcript
+    # rotated, no gate Bash record) must still reach the answerer with the gate framing
+    # — the old code returned silently and left the spoke parked forever.
+    spoke = _branched_spoke(tmp_path, ahead=True, name="gate-spoke", branch="feature/5-fix")
+    subprocess.run(["git", "tag", "gate/5"], cwd=spoke, check=True, capture_output=True)
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke)
+    fake_bin, _ = _injector_tmux(tmp_path, capture="│ > │\n")
+    env, _ready_log = _wedge_env(spoke, tmp_path, fake_bin)
+    # Re-write over _wedge_env's ask transcript: no ask, no gate Bash record — the
+    # gate/5 tag at the tip is the only park signal.
+    _write_transcript(
+        pd, [{"type": "assistant", "message": {"content": [{"type": "text", "text": "working"}]}}]
+    )
+    prompt_dump = tmp_path / "prompt.txt"
+    env["AFK_ANSWERER_CMD"] = f"cat > \"{prompt_dump}\"; printf 'ANSWER: Approved — proceed.'"
+
+    result = _call(f"decide_and_act '{spoke}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert prompt_dump.exists(), "the answerer must still be invoked on an unextractable gate park"
+    assert "Approve it or state precise amendments" in prompt_dump.read_text()
+
+
+def test_decide_and_act_aborts_when_no_longer_parked(tmp_path: Path) -> None:
+    # #129/#89: the answerer is slow; if the spoke moved on meanwhile (a human replied,
+    # the turn resumed), injecting the stale answer interrupts it mid-tool-call. The
+    # supervisor must re-check the park right before injecting and drop the answer.
+    spoke = _branched_spoke(tmp_path, ahead=True, name="moved-spoke", branch="feature/5-fix")
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke)
+    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
+    fake_bin, tmux_log = _injector_tmux(tmp_path, capture="│ > │\n", pane_path=spoke)
+    env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
+    # The answerer's side effect: a human answered while it reasoned.
+    human_reply = json.dumps(
+        {"type": "user", "message": {"content": [{"type": "text", "text": "use Redis"}]}}
+    )
+    env["AFK_ANSWERER_CMD"] = (
+        f"printf '%s\\n' '{human_reply}' >> \"{pd / 'session.jsonl'}\"; printf 'ANSWER: use Redis'"
+    )
+
+    result = _call(f"decide_and_act '{spoke}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert " -l " not in f" {tmux_log.read_text()} ", "a stale answer must never be injected"
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
+        "no longer parked is not an escalation — the next tick re-evaluates"
+    )
+
+
+def test_decide_and_act_aborts_when_question_changed(tmp_path: Path) -> None:
+    # The spoke is still parked, but on a DIFFERENT question than the one the answerer
+    # reasoned about — the computed answer is stale; drop it and let the next tick
+    # answer the new question.
+    spoke = _branched_spoke(tmp_path, ahead=True, name="moved-spoke", branch="feature/5-fix")
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke)
+    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
+    fake_bin, tmux_log = _injector_tmux(tmp_path, capture="│ > │\n", pane_path=spoke)
+    env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
+    extra = tmp_path / "extra.jsonl"
+    extra.write_text(
+        json.dumps(_ask_record("Which cache TTL?", [("60s", "short"), ("1h", "long")])) + "\n"
+    )
+    env["AFK_ANSWERER_CMD"] = (
+        f'cat "{extra}" >> "{pd / "session.jsonl"}"; printf \'ANSWER: use Redis\''
+    )
+
+    result = _call(f"decide_and_act '{spoke}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert " -l " not in f" {tmux_log.read_text()} ", "an answer to a superseded question is stale"
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
+
+
 # ── the ANSWERER orchestration (stubbed answerer + spoke-ready) ───────────────
 
 
