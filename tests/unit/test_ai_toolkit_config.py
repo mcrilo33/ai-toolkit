@@ -293,6 +293,19 @@ def test_batch_stagger_seconds_none_when_blank(tmp_path: Path) -> None:
     assert cfg.batch_stagger_seconds(config) is None
 
 
+def test_batch_stagger_seconds_zero_is_honored_as_disabled(tmp_path: Path) -> None:
+    # Unlike the cap (where 0 ⇒ auto-derive), stagger 0 is a meaningful "off".
+    config = cfg.load_config(_write(tmp_path, "batch:\n  stagger_seconds: 0\n").as_posix())
+
+    assert cfg.batch_stagger_seconds(config) == 0
+
+
+def test_batch_stagger_seconds_none_when_negative(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, "batch:\n  stagger_seconds: -5\n").as_posix())
+
+    assert cfg.batch_stagger_seconds(config) is None
+
+
 def test_batch_env_cli_emits_set_values(tmp_path: Path) -> None:
     path = _write(tmp_path, "batch:\n  concurrency_cap: 3\n  stagger_seconds: 20\n")
 
