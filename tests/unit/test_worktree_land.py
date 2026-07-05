@@ -103,6 +103,7 @@ def _run_land(
     extra_env: dict[str, str] | None = None,
     stub_python312: bool = False,
     stub_curl: bool = False,
+    issue_state: str = "OPEN",
 ) -> tuple[subprocess.CompletedProcess, dict[str, Path]]:
     """Run worktree-land.sh from the hub with logging stubs on PATH.
 
@@ -127,10 +128,19 @@ def _run_land(
         name: tmp_path / f"{name}-calls.log"
         for name in ("gh", "tmux", "code", "pytest", "python3.12", "curl")
     }
-    for name, exit_code in (("gh", gh_exit), ("code", 0)):
-        stub = bindir / name
-        stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{logs[name]}"\nexit {exit_code}\n')
-        stub.chmod(0o755)
+    code_stub = bindir / "code"
+    code_stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{logs["code"]}"\nexit 0\n')
+    code_stub.chmod(0o755)
+    # `gh` logs every call AND answers `issue view --json state` with `issue_state`,
+    # so the resume finalize's OPEN-check (issue #151) can be steered per test.
+    gh_stub = bindir / "gh"
+    gh_stub.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$*" >> "{logs["gh"]}"\n'
+        f'case "$*" in *"issue view"*state*) printf "%s\\n" "{issue_state}" ;; esac\n'
+        f"exit {gh_exit}\n"
+    )
+    gh_stub.chmod(0o755)
     tmux = bindir / "tmux"
     tmux.write_text(
         f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{logs["tmux"]}"\n'
@@ -1419,9 +1429,10 @@ def _complete_ship(hub: Path, branch: str) -> None:
 
 
 def test_reland_stranded_worktree_completes_idempotently(hub: Path, tmp_path: Path) -> None:
-    # State (a): the ship succeeded but the worktree was left stranded. Re-running the
-    # land re-merges as a no-op and finishes the teardown — no second commit, worktree
-    # gone, issue closed.
+    # State (a): the ship succeeded but the worktree was left stranded. The worktree
+    # still resolves, so this exercises the NORMAL land path's already-merged
+    # idempotency (a no-op re-merge), NOT land_resume_finalize — re-running finishes
+    # the teardown: no second commit, worktree gone, issue closed.
     wt = _make_spoke(hub, tmp_path, "feature/1-stranded-land", push=True, ready=True)
     _complete_ship(hub, "feature/1-stranded-land")
     pre_main = _git(hub, "rev-parse", "HEAD").strip()
@@ -1472,3 +1483,22 @@ def test_reland_refuses_unmerged_ready_marker(hub: Path, tmp_path: Path) -> None
 
     assert proc.returncode != 0
     assert "issue close" not in _log_text(logs["gh"])
+
+
+def test_reland_does_not_reclose_done_issue_with_lingering_marker(
+    hub: Path, tmp_path: Path
+) -> None:
+    # A merged ready/1 tag can linger after an otherwise-complete land. Re-running must
+    # still clean up the stale marker but must NOT re-close / re-comment the already-
+    # closed issue — the finalize keys the destructive close off the issue's OPEN state,
+    # not the mere presence of the merged tag.
+    wt = _make_spoke(hub, tmp_path, "feature/1-done", push=True, ready=True)
+    _complete_ship(hub, "feature/1-done")
+    _git(hub, "worktree", "remove", str(wt))
+    _git(hub, "branch", "-D", "feature/1-done")  # branch already pruned by prior teardown
+
+    proc, logs = _run_land(hub, tmp_path, "1", issue_state="CLOSED")
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "issue close 1" not in _log_text(logs["gh"]), "a CLOSED issue must not be re-closed"
+    assert "ready/1" not in _local_tags(hub), "the stale marker is still cleaned up"

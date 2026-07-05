@@ -97,44 +97,65 @@ HUB_BRANCH="$(git symbolic-ref --short -q HEAD || true)"
 [ -z "$(git status --porcelain -uno)" ] \
   || wt_die "hub checkout is dirty — commit or stash before landing"
 
-# land_resume_finalize <target> -> finish a spoke whose land was killed AFTER the
-# worktree was removed but BEFORE its branch/tag/issue were cleaned up (issue #151):
-# a caller-timeout mid-teardown. Engages ONLY when <target> is a bare issue number
-# carrying a ready/<issue> marker whose commit is already merged into $DEFAULT —
-# positive proof the work shipped — so it can never close an unshipped issue. It then
-# idempotently prunes the merged branch, consumes the marker, closes the issue, and
-# kills the stranded tmux window, and NEVER re-merges or re-pushes. Returns 1 (no-op)
-# when no such resume signal exists, so the caller aborts exactly as before.
+# land_resume_finalize <target> -> clean up the residue of a spoke whose land was
+# killed AFTER the worktree was removed but BEFORE its branch/tag/issue were cleaned up
+# (issue #151): a caller-timeout mid-teardown. Engages ONLY when <target> is a bare
+# issue number carrying a ready/<issue> marker whose commit is already merged into
+# $DEFAULT — positive proof the work shipped — so it can never touch an unshipped issue.
+# Each destructive step is guarded to fire only when its residue actually remains:
+#   * branch prune — ONLY the exact branch whose tip IS the merged marker (never a
+#     same-numbered sibling), and its remote is deleted only when the remote ref is
+#     itself merged into the base (the reduce-and-prune data-loss guard the normal
+#     land treats as fatal, issues #10/#16).
+#   * issue close — ONLY when the issue is still OPEN, so a done issue whose merged tag
+#     merely lingered is never re-closed / re-commented.
+# It NEVER re-merges or re-pushes. Returns 1 (no-op) when no resume signal exists, so
+# the caller aborts exactly as before.
 land_resume_finalize() {
-  local target="$1" issue marker_sha br sess win name path
+  local target="$1" issue marker_sha br br_tip state sess win name path
   [[ "$target" =~ ^[0-9]+$ ]] || return 1
   issue="$target"
   marker_sha="$(git rev-parse -q --verify "refs/tags/ready/${issue}^{commit}" 2>/dev/null || true)"
   [ -n "$marker_sha" ] || return 1
   git merge-base --is-ancestor "$marker_sha" "$DEFAULT" 2>/dev/null || return 1
 
-  wt_warn "issue #$issue already landed (ready/$issue at ${marker_sha:0:9} is merged into $DEFAULT) but its teardown was interrupted — finishing it (issue #151)"
+  wt_warn "issue #$issue shipped (ready/$issue at ${marker_sha:0:9} is merged into $DEFAULT) but its teardown left residue — cleaning it up (issue #151)"
 
-  # Prune this issue's branch(es), but ONLY those already merged into the base.
+  # Refresh remote state so the merged-remote guard below is honest (best-effort).
+  git fetch origin --quiet 2>/dev/null || true
+
+  # Prune ONLY the exact branch that shipped: its tip IS the merged marker commit, so a
+  # same-numbered but unrelated branch is never touched. `git branch -d` is merged-only;
+  # the remote delete then fires only when the remote ref is merged into the base too, so
+  # a branch whose remote is strictly ahead can never lose its remote-only commits.
   while IFS= read -r br; do
     [ -n "$br" ] || continue
-    case "${br##*/}" in "$issue" | "$issue"-*) ;; *) continue ;; esac
-    git merge-base --is-ancestor "$br" "$DEFAULT" 2>/dev/null || continue
+    br_tip="$(git rev-parse -q --verify "refs/heads/$br" 2>/dev/null || true)"
+    [ "$br_tip" = "$marker_sha" ] || continue
     if git branch -d "$br" >/dev/null 2>&1; then
       echo "✓ pruned merged branch $br"
-      wt_git_push origin --delete "$br" >/dev/null 2>&1 || true
+      if git merge-base --is-ancestor "refs/remotes/origin/$br" "$DEFAULT" 2>/dev/null; then
+        wt_git_push origin --delete "$br" >/dev/null 2>&1 || true
+      else
+        wt_warn "kept remote origin/$br — it has commits not in $DEFAULT; reconcile it by hand"
+      fi
     fi
   done < <(git for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null || true)
 
-  # Consume the completion marker (local + remote), best-effort.
+  # Consume the lingering completion marker (local + remote), best-effort.
   git tag -d "ready/${issue}" >/dev/null 2>&1 || true
   wt_git_push origin ":refs/tags/ready/${issue}" >/dev/null 2>&1 || true
 
+  # Close the issue ONLY when it is still OPEN — never re-close / re-comment a done
+  # issue whose merged tag merely lingered.
   if command -v gh >/dev/null 2>&1; then
-    if gh issue close "$issue" --comment "Landed on $DEFAULT; teardown finalized by a resumed land (issue #151)."; then
-      echo "✓ closed issue #$issue"
-    else
-      wt_warn "couldn't close issue #$issue — close it by hand: gh issue close $issue"
+    state="$(gh issue view "$issue" --json state -q .state 2>/dev/null || true)"
+    if [ "$state" = "OPEN" ]; then
+      if gh issue close "$issue" --comment "Landed on $DEFAULT; teardown finalized by a resumed land (issue #151)."; then
+        echo "✓ closed issue #$issue"
+      else
+        wt_warn "couldn't close issue #$issue — close it by hand: gh issue close $issue"
+      fi
     fi
   fi
 
