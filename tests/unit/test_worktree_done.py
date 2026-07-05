@@ -99,6 +99,11 @@ def _run_done(
     )
     code.chmod(0o755)
     env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    # HOME is sandboxed so the workspace-file default ($HOME/.claude/….code-workspace,
+    # issue #134) can never resolve to — let alone rewrite — the host's real file.
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    env["HOME"] = str(home)
     # Point the VS Code Open Recent cleanup (issue #103) at a per-test Code dir so
     # it never touches the host's real state store. Tests that exercise the prune
     # pre-populate <vscode>/User/globalStorage/storage.json under this same dir.
@@ -445,3 +450,157 @@ def test_done_prunes_branch_merged_into_configured_base(hub: Path, tmp_path: Pat
 
     assert proc.returncode == 0, proc.stderr
     assert "feature/7-base" not in _local_branches(hub)
+
+
+# --- review workspace file: direct remove + ghost sweep (issue #134) ----------
+# Teardown edits the review workspace file's `folders` array directly (the
+# mirror of worktree-new's direct append): drop the target's entry, sweep any
+# entry whose path is gone from disk (self-healing for past `code --remove`
+# misses), and never also call `code --remove`. The CLI call survives strictly
+# as the missing-file fallback. `git config ai-toolkit.workspace-file` is
+# pinned per-test so the host's real review workspace is never touched.
+
+
+def _write_workspace(ws: Path, folders: list[dict]) -> str:
+    """Write a VS Code-shaped workspace file (tab indent) and return its text."""
+    ws.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps({"folders": folders, "settings": {}}, indent="\t") + "\n"
+    ws.write_text(text)
+    return text
+
+
+def test_done_removes_entry_and_sweeps_ghosts_not_code_remove(hub: Path, tmp_path: Path) -> None:
+    # Target entry dropped, dead-path ghost swept in the same pass, live sibling
+    # and main-checkout entries preserved verbatim — and no `code` call at all.
+    wt = _make_spoke(hub, tmp_path, "feature/9-ws", push=True, merge=True)
+    live = _make_spoke(hub, tmp_path, "feature/7-live", push=False, merge=False)
+    ws = tmp_path / "claude" / "review.code-workspace"
+    main_entry = {"name": "hub", "path": os.path.relpath(hub, ws.parent)}
+    live_entry = {"path": os.path.relpath(live, ws.parent)}
+    _write_workspace(
+        ws,
+        [
+            main_entry,
+            {"name": wt.name, "path": os.path.relpath(wt, ws.parent)},
+            {"path": "../gone-99"},
+            live_entry,
+        ],
+    )
+    _git(hub, "config", "ai-toolkit.workspace-file", str(ws))
+
+    proc, log = _run_done(hub, tmp_path, "9")
+
+    assert proc.returncode == 0, proc.stderr
+    doc = json.loads(ws.read_text())
+    assert doc["folders"] == [main_entry, live_entry]
+    calls = log.read_text() if log.exists() else ""
+    assert calls == "", f"direct file edit and the `code` CLI must never both fire: {calls!r}"
+
+
+def test_done_falls_back_to_code_remove_when_workspace_file_missing(
+    hub: Path, tmp_path: Path
+) -> None:
+    # No workspace file at the configured location → the legacy `code --remove`
+    # fallback fires exactly as before (still while the path exists on disk).
+    wt = _make_spoke(hub, tmp_path, "feature/9-fb", push=True, merge=True)
+    _git(
+        hub,
+        "config",
+        "ai-toolkit.workspace-file",
+        str(tmp_path / "claude" / "absent.code-workspace"),
+    )
+
+    proc, log = _run_done(hub, tmp_path, "9")
+
+    assert proc.returncode == 0, proc.stderr
+    calls = log.read_text() if log.exists() else ""
+    assert f"--remove {wt}" in calls
+    assert "present" in calls and "absent" not in calls
+
+
+def test_done_no_code_leaves_workspace_file_untouched(hub: Path, tmp_path: Path) -> None:
+    # --no-code opts out of the whole VS Code fold: no file edit, no CLI call.
+    wt = _make_spoke(hub, tmp_path, "feature/9-nc", push=True, merge=True)
+    ws = tmp_path / "claude" / "review.code-workspace"
+    before = _write_workspace(ws, [{"name": wt.name, "path": os.path.relpath(wt, ws.parent)}])
+    _git(hub, "config", "ai-toolkit.workspace-file", str(ws))
+
+    proc, log = _run_done(hub, tmp_path, "9", "--no-code")
+
+    assert proc.returncode == 0, proc.stderr
+    assert ws.read_text() == before
+    assert not log.exists() or log.read_text().strip() == ""
+
+
+# --- leftover-dir sweep after `git worktree remove` (issue #134) ---------------
+# A lingering shell cwd or gitignored runtime files can leave the directory on
+# disk even when git deregistered the worktree (#122 left ai-toolkit-122
+# behind). After a successful `git worktree remove`, teardown must retry with an
+# rm -rf of the leftover — and warn LOUDLY, still exiting 0, if even that fails.
+# Simulated with a `git` shim whose `worktree remove` delegates to the real git
+# and then recreates the directory holding an untracked file.
+
+
+def _leftover_git_shim(tmp_path: Path, leftover_dir: Path) -> None:
+    """PATH `git` shim: real `worktree remove`, then resurrect the directory."""
+    real_git = shutil.which("git")
+    assert real_git is not None
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    shim = bindir / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = worktree ] && [ "$2" = remove ]; then\n'
+        f'  "{real_git}" "$@"; rc=$?\n'
+        f'  mkdir -p "{leftover_dir}"\n'
+        f'  echo runtime-junk > "{leftover_dir}/leftover.txt"\n'
+        '  exit "$rc"\n'
+        "fi\n"
+        f'exec "{real_git}" "$@"\n'
+    )
+    shim.chmod(0o755)
+
+
+def test_done_sweeps_leftover_dir_after_worktree_remove(hub: Path, tmp_path: Path) -> None:
+    # git deregistered the worktree but the directory survived (untracked file)
+    # → teardown rm -rf's the leftover and still succeeds.
+    wt = _make_spoke(hub, tmp_path, "feature/9-leftover", push=True, merge=True)
+    _leftover_git_shim(tmp_path, wt)
+
+    proc, _ = _run_done(hub, tmp_path, "9")
+
+    assert proc.returncode == 0, proc.stderr
+    assert not wt.exists(), "the resurrected leftover directory must be swept"
+
+
+def test_done_warns_loudly_when_leftover_dir_survives_rm(hub: Path, tmp_path: Path) -> None:
+    # Even the rm -rf retry fails (stubbed rm exits 1 without removing) → the
+    # teardown must warn loudly, naming the path and the manual command, and
+    # still exit 0 — a stuck directory must never abort branch pruning.
+    wt = _make_spoke(hub, tmp_path, "feature/9-stuck", push=True, merge=True)
+    _leftover_git_shim(tmp_path, wt)
+    # The stub fails ONLY for the sweep's own target and delegates every other
+    # rm to the real binary, so it can never alter unrelated rm uses in the
+    # script (e.g. the hub-guard-allow revoke).
+    real_rm = shutil.which("rm")
+    assert real_rm is not None
+    bindir = tmp_path / "bin"
+    rm_stub = bindir / "rm"
+    rm_stub.write_text(
+        "#!/bin/sh\n"
+        'for a in "$@"; do\n'
+        f'  [ "$a" = "{wt}" ] && exit 1\n'
+        "done\n"
+        f'exec "{real_rm}" "$@"\n'
+    )
+    rm_stub.chmod(0o755)
+
+    proc, _ = _run_done(hub, tmp_path, "9")
+
+    assert proc.returncode == 0, proc.stderr
+    assert wt.exists()
+    assert str(wt) in proc.stderr
+    assert "rm -rf" in proc.stderr
+    assert "feature/9-stuck" not in _local_branches(hub), (
+        "branch pruning must still run after a failed leftover sweep"
+    )

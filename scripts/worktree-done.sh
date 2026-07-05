@@ -103,15 +103,23 @@ wt_emit_lifecycle "worktree-done" "teardown" "success" "$WT_T0" "$WT_DIR"
 wt_emit_script "worktree-done" "success" "$WT_T0" "$WT_DIR"
 
 # --- fold the folder out of the VS Code review window ------------------------
-# The mirror of worktree-new.sh's `code --add`. Run BEFORE the on-disk delete
-# below, while $WT_DIR still exists, so VS Code resolves the path, drops the
-# folder from the workspace, and stops watching it — otherwise it leaves an
-# empty ghost pane (issue #43). Gated on `--no-code` and the presence of the
-# `code` CLI; a failed call warns, never aborts teardown.
-if [ -z "$NO_CODE" ] && command -v code >/dev/null 2>&1; then
-  echo "→ removing folder from your VS Code review window (code --remove)"
-  code --remove "$WT_DIR" \
-    || wt_warn "couldn't remove the folder from VS Code — right-click it → Remove Folder from Workspace."
+# The mirror of worktree-new.sh's direct append (issue #134): edit the review
+# workspace file's `folders` array — dropping this worktree's entry and sweeping
+# any entry whose path is gone from disk (self-healing for past `code --remove`
+# misses). The CLI call survives strictly as the missing/unparseable-file
+# fallback. Still runs BEFORE the on-disk delete below, while $WT_DIR exists, so
+# the target entry matches by path and the fallback's `code --remove` resolves
+# it (issue #43). Gated on `--no-code`; the helper is called in a conditional
+# (set -e) and every failure warns, never aborts teardown.
+if [ -z "$NO_CODE" ]; then
+  WS_FILE="$(wt_workspace_file "$REPO_ROOT")"
+  if wt_workspace_remove "$WS_FILE" "$WT_DIR"; then
+    echo "→ reconciled your review workspace file: $WS_FILE (entry dropped if present, dead entries swept)"
+  elif command -v code >/dev/null 2>&1; then
+    echo "→ removing folder from your VS Code review window (code --remove)"
+    code --remove "$WT_DIR" \
+      || wt_warn "couldn't remove the folder from VS Code — right-click it → Remove Folder from Workspace."
+  fi
 fi
 
 # --- revoke the /quick hub-guard escape hatch (issue #89) --------------------
@@ -138,7 +146,25 @@ if ! git worktree remove $FORCE "$WT_DIR"; then
 fi
 
 git worktree prune
-echo "✓ removed: $WT_DIR"
+
+# --- leftover-dir sweep (issue #134) ------------------------------------------
+# A lingering shell cwd or gitignored runtime files can leave the directory on
+# disk even when git deregistered the worktree (#122 left ai-toolkit-122
+# behind). Any telemetry ingest has already completed by now (worktree-land
+# ingests before invoking this script), so a raw rm -rf of the leftover is
+# safe. If even that fails, warn LOUDLY but keep going — a stuck directory
+# must never abort the branch pruning below.
+if [ -e "$WT_DIR" ]; then
+  wt_warn "git deregistered the worktree but the directory survived — sweeping it (rm -rf)."
+  rm -rf "$WT_DIR" || true
+fi
+if [ -e "$WT_DIR" ]; then
+  wt_warn "✗ LEFTOVER DIRECTORY SURVIVED: $WT_DIR"
+  wt_warn "  a process is probably holding a cwd inside it — close it, then remove it by hand: rm -rf \"$WT_DIR\""
+  echo "✓ deregistered: $WT_DIR (directory still on disk — see the warning above)"
+else
+  echo "✓ removed: $WT_DIR"
+fi
 
 # --- scrub the removed path from VS Code's "Open Recent" list (issue #103) ---
 # `code --remove` folds the folder out of the live window, but VS Code keeps the

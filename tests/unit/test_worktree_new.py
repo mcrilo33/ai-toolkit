@@ -146,9 +146,14 @@ def _run_new(
         "exit 0\n"
     )
     tmux.chmod(0o755)
+    # HOME is sandboxed so the workspace-file default ($HOME/.claude/….code-workspace,
+    # issue #134) can never resolve to — let alone rewrite — the host's real file.
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
     env = {
         **_GIT_ENV,
         "PATH": f"{bindir}:{os.environ['PATH']}",
+        "HOME": str(home),
         "STUB_HAS_SESSION": str(has_session_rc),
         "STUB_NEW_SESSION": str(new_session_rc),
     }
@@ -1145,3 +1150,76 @@ def test_new_dies_when_configured_base_missing(hub: Path, tmp_path: Path) -> Non
     assert proc.returncode != 0
     assert "ghost" in proc.stderr
     assert not (hub.parent / f"{hub.name}-9").exists()
+
+
+# --- review workspace file: direct append over `code --add` (issue #134) ------
+# `code --add` targets the last-focused VS Code window and routinely misses, so
+# when the review workspace file exists the script appends the folder entry to
+# it directly (VS Code hot-reloads the file) and must NOT also call `code --add`.
+# The legacy `code --add` remains strictly the missing-file fallback. Tests pin
+# `git config ai-toolkit.workspace-file` to a per-test path so the host's real
+# review workspace is never touched.
+
+
+def _code_stub(tmp_path: Path) -> Path:
+    """Drop a logging `code` stub into _run_new's bin dir; return the log path."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    log = tmp_path / "code-calls.log"
+    log.touch()
+    stub = bindir / "code"
+    stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{log}"\nexit 0\n')
+    stub.chmod(0o755)
+    return log
+
+
+def test_new_appends_entry_to_workspace_file_not_code_add(hub: Path, tmp_path: Path) -> None:
+    # Workspace file present → one appended {"name","path"} entry (path relative
+    # to the workspace file's dir) and no `code --add` call at all.
+    code_log = _code_stub(tmp_path)
+    ws = tmp_path / "claude" / "review.code-workspace"
+    ws.parent.mkdir()
+    ws.write_text(json.dumps({"folders": [], "settings": {}}, indent="\t") + "\n")
+    _git(hub, "config", "ai-toolkit.workspace-file", str(ws))
+
+    proc, _ = _run_new(hub, tmp_path, "8", "some-slug", "--no-terminal")
+
+    assert proc.returncode == 0, proc.stderr
+    doc = json.loads(ws.read_text())
+    assert doc["folders"] == [{"name": f"{hub.name}-8", "path": f"../{hub.name}-8"}]
+    assert code_log.read_text() == "", (
+        "direct append and the `code` CLI must never both fire (double-add)"
+    )
+
+
+def test_new_falls_back_to_code_add_when_workspace_file_missing(hub: Path, tmp_path: Path) -> None:
+    # No workspace file at the configured location → the legacy `code --add`
+    # fallback fires exactly as before.
+    code_log = _code_stub(tmp_path)
+    _git(
+        hub,
+        "config",
+        "ai-toolkit.workspace-file",
+        str(tmp_path / "claude" / "absent.code-workspace"),
+    )
+
+    proc, _ = _run_new(hub, tmp_path, "8", "some-slug", "--no-terminal")
+
+    assert proc.returncode == 0, proc.stderr
+    assert f"--add {hub.parent / f'{hub.name}-8'}" in code_log.read_text()
+
+
+def test_new_no_code_touches_neither_workspace_file_nor_code(hub: Path, tmp_path: Path) -> None:
+    # --no-code opts out of the whole VS Code fold: no file edit, no CLI call.
+    code_log = _code_stub(tmp_path)
+    ws = tmp_path / "claude" / "review.code-workspace"
+    ws.parent.mkdir()
+    before = json.dumps({"folders": [], "settings": {}}, indent="\t") + "\n"
+    ws.write_text(before)
+    _git(hub, "config", "ai-toolkit.workspace-file", str(ws))
+
+    proc, _ = _run_new(hub, tmp_path, "8", "some-slug", "--no-terminal", "--no-code")
+
+    assert proc.returncode == 0, proc.stderr
+    assert ws.read_text() == before
+    assert code_log.read_text() == ""

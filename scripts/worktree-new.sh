@@ -272,22 +272,35 @@ echo "✓ worktree ready: $WT_DIR"
 echo "  branch:         $BRANCH"
 
 # --- 1. fold into the single VS Code review window ---------------------------
+# The review window is a saved workspace file, so `add` edits its `folders`
+# array directly (issue #134): `code --add` targets the *last-focused* window
+# and routinely never lands the folder. VS Code hot-reloads the file. The CLI
+# call survives strictly as the fallback when the file is missing or
+# unparseable (wt_workspace_add returns 1 — call kept in a conditional, a bare
+# call would abort this set -e script before the fallback).
 if [ "$OPEN_MODE" != none ]; then
-  if command -v code >/dev/null 2>&1; then
-    case "$OPEN_MODE" in
-      add)
+  case "$OPEN_MODE" in
+    add)
+      WS_FILE="$(wt_workspace_file "$REPO_ROOT")"
+      if wt_workspace_add "$WS_FILE" "$WT_DIR"; then
+        echo "→ added to your review workspace file: $WS_FILE (VS Code hot-reloads it)"
+      elif command -v code >/dev/null 2>&1; then
         echo "→ adding to your VS Code review window (code --add)"
         code --add "$WT_DIR" \
           || wt_warn "no VS Code window to add to — open one, then run: code --add \"$WT_DIR\""
-        ;;
-      new-window)
+      else
+        wt_warn "'code' CLI not found — in VS Code run: Shell Command: Install 'code' in PATH"
+      fi
+      ;;
+    new-window)
+      if command -v code >/dev/null 2>&1; then
         echo "→ opening a separate VS Code window"
         code "$WT_DIR"
-        ;;
-    esac
-  else
-    wt_warn "'code' CLI not found — in VS Code run: Shell Command: Install 'code' in PATH"
-  fi
+      else
+        wt_warn "'code' CLI not found — in VS Code run: Shell Command: Install 'code' in PATH"
+      fi
+      ;;
+  esac
 fi
 
 # --- 2. spawn a terminal/tmux window for the agent ---------------------------
