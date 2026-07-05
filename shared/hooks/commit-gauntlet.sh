@@ -67,8 +67,12 @@ STAGED=$(git -C "$PROJECT_ROOT" diff --cached --name-only --diff-filter=ACMR 2>/
 # before the push gate blocks. Advisory only: never denies, and it runs
 # before the lint/typecheck flow (and its time budget) so it fires even in
 # repos with no linter configured. A stale installed hook without the lib
-# simply skips the nudge.
-if [ -f "$HOOK_DIR/lib/test-reverse-index.sh" ]; then
+# simply skips the nudge — and so does a CORRUPT lib copy: sourcing is gated
+# on a child-process `bash -n`, because a syntax error inside a bare `source`
+# would kill this hook at exit 0, silently fail-opening the blocking lint
+# gate below (E-review finding).
+if [ -f "$HOOK_DIR/lib/test-reverse-index.sh" ] \
+   && bash -n "$HOOK_DIR/lib/test-reverse-index.sh" 2>/dev/null; then
   # shellcheck source=lib/test-reverse-index.sh
   source "$HOOK_DIR/lib/test-reverse-index.sh"
   NUDGE_ADDED=$(git -C "$PROJECT_ROOT" diff --cached --name-only --diff-filter=A 2>/dev/null || true)

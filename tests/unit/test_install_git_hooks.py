@@ -230,3 +230,20 @@ def test_reverse_index_lib_copied_into_hooks(repo: Path) -> None:
 
     lib = _scripts_dir(hooks) / "lib" / "test-reverse-index.sh"
     assert lib.is_file()
+
+
+def test_telemetry_lib_copied_and_utils_sources_clean(repo: Path) -> None:
+    # utils.sh sources lib/telemetry.sh unconditionally; an install without it
+    # ships hooks that die at source-time with every push blocked (the
+    # 2026-07-04 hub outage). The installed utils must source successfully.
+    hooks = _install(repo)
+    lib_dir = _scripts_dir(hooks) / "lib"
+
+    assert (lib_dir / "telemetry.sh").is_file()
+    proc = subprocess.run(
+        ["bash", "-c", f'source "{lib_dir / "utils.sh"}" && echo OK'],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "OK" in proc.stdout

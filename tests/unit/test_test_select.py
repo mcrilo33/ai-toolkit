@@ -1218,3 +1218,33 @@ def test_exempt_only_diff_notes_exemption(repo: Path, tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     assert "RUN" not in _runlog(runlog)
     assert "exempt" in proc.stderr  # the audit trail names the real reason
+
+
+def test_missing_lib_ignores_exempt_entries_and_runs_full(repo: Path, tmp_path: Path) -> None:
+    # E relocation pin: the exempt parser lives in lib/test-reverse-index.sh;
+    # without the lib (a stale installed hook) there are no exemptions — an
+    # exempt-only diff escalates to FULL instead of skipping. Conservative,
+    # like the index degradation.
+    hookdir = tmp_path / "installed"
+    (hookdir / "lib").mkdir(parents=True)
+    src = TEST_SELECT.parent
+    shutil.copy(TEST_SELECT, hookdir / "test-select.sh")
+    for lib in ("utils.sh", "telemetry.sh", "gate-stamp.sh"):
+        shutil.copy(src / "lib" / lib, hookdir / "lib" / lib)
+    _commit(repo, {".test-select-exempt": "notes.txt\n"}, "chore: exempt notes")
+    base = _rev(repo)
+    tip = _commit(repo, {"notes.txt": "exempt change\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = subprocess.run(
+        ["bash", str(hookdir / "test-select.sh")],
+        cwd=str(repo),
+        input=_stdin(tip, base),
+        capture_output=True,
+        text=True,
+        env={**_GIT_ENV, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN \n" in _runlog(runlog)  # FULL, never a silent exempt skip

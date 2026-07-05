@@ -1829,3 +1829,23 @@ class TestGauntletCoverageNudge:
 
         assert proc.returncode == ALLOW
         assert "helper.sh" not in proc.stderr
+
+
+@ruff
+def test_corrupt_reverse_index_lib_does_not_fail_open(nudge_repo: Path, tmp_path: Path) -> None:
+    # E-review finding: a syntax-corrupt lib killed the gauntlet at `source`
+    # with exit 0 — silently disabling the blocking lint gate. Sourcing is now
+    # gated on a child-process `bash -n`: corruption skips the nudge, and the
+    # deny path below still fires.
+    hookdir = tmp_path / "installed"
+    (hookdir / "lib").mkdir(parents=True)
+    (hookdir / "commit-gauntlet.sh").write_text(COMMIT_GAUNTLET.read_text())
+    (hookdir / "lib" / "utils.sh").write_text(UTILS.read_text())
+    (hookdir / "lib" / "telemetry.sh").write_text((UTILS.parent / "telemetry.sh").read_text())
+    (hookdir / "lib" / "test-reverse-index.sh").write_text("if [ broken\n")  # syntax error
+    (nudge_repo / "ruff.toml").write_text('[lint]\nselect = ["F"]\n')
+    _stage_nudge(nudge_repo, "pkg/bad.py", "import os\n")  # F401 on a new line
+
+    proc = _run(hookdir / "commit-gauntlet.sh", _payload("git commit -m 'x'"), cwd=nudge_repo)
+
+    assert proc.returncode == BLOCK, proc.stderr  # the lint gate still fired
