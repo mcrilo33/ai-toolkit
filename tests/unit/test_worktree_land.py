@@ -1400,3 +1400,75 @@ def test_diverged_merge_land_sweeps_from_gate_minted_stamp(hub: Path, tmp_path: 
     assert proc.returncode == 0, proc.stderr
     assert "launching background full-suite sweep" in proc.stdout
     assert _wait_for_file(runner_log), "diverged-merge land never swept its gate-stamped tree"
+
+
+# --- resilient / idempotent re-land (issue #151) --------------------------------
+# A land can be killed by a caller timeout AFTER the push succeeded but mid-teardown.
+# Re-invoking the land on that partially-landed spoke must COMPLETE it, not abort.
+# Two partial states: (a) the worktree is still stranded — the merge is a no-op and
+# teardown finishes; (b) the worktree was already removed but the branch/tag/issue
+# survive — the land finalizes from the ready/<issue> marker that proves it shipped.
+# The finalize is gated on positive proof (a ready marker merged into the base), so it
+# can never close an unshipped issue.
+
+
+def _complete_ship(hub: Path, branch: str) -> None:
+    """FF-merge `branch` into main and push — the ship half of a land that then died."""
+    _git(hub, "merge", "--ff-only", branch)
+    _git(hub, "push", "-q", "origin", "main")
+
+
+def test_reland_stranded_worktree_completes_idempotently(hub: Path, tmp_path: Path) -> None:
+    # State (a): the ship succeeded but the worktree was left stranded. Re-running the
+    # land re-merges as a no-op and finishes the teardown — no second commit, worktree
+    # gone, issue closed.
+    wt = _make_spoke(hub, tmp_path, "feature/1-stranded-land", push=True, ready=True)
+    _complete_ship(hub, "feature/1-stranded-land")
+    pre_main = _git(hub, "rev-parse", "HEAD").strip()
+
+    proc, logs = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert _git(hub, "rev-parse", "HEAD").strip() == pre_main, "no second merge commit"
+    assert not wt.exists(), "the stranded worktree is torn down on re-land"
+    assert "issue close 1" in _log_text(logs["gh"])
+
+
+def test_reland_after_worktree_removed_finalizes_from_marker(hub: Path, tmp_path: Path) -> None:
+    # State (b): teardown removed the worktree but died before pruning the branch,
+    # deleting the ready/1 tag, or closing the issue. Re-running must finalize from the
+    # surviving merged marker rather than aborting with "no worktree matches".
+    wt = _make_spoke(hub, tmp_path, "feature/1-wtgone", push=True, ready=True)
+    _complete_ship(hub, "feature/1-wtgone")
+    _git(hub, "worktree", "remove", str(wt))
+    pre_main = _git(hub, "rev-parse", "HEAD").strip()
+
+    proc, logs = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert _git(hub, "rev-parse", "HEAD").strip() == pre_main, "finalize must not re-merge"
+    assert "issue close 1" in _log_text(logs["gh"]), "the open issue is finally closed"
+    assert "feature/1-wtgone" not in _local_branches(hub), "the merged branch is pruned"
+    assert "ready/1" not in _local_tags(hub), "the completion marker is consumed"
+
+
+def test_reland_refuses_issue_without_ready_marker(hub: Path, tmp_path: Path) -> None:
+    # Safety: no resume signal at all (no worktree, no ready tag) ⇒ still abort. The
+    # finalize must never close an issue it cannot prove shipped.
+    proc, logs = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode != 0
+    assert "issue close" not in _log_text(logs["gh"])
+
+
+def test_reland_refuses_unmerged_ready_marker(hub: Path, tmp_path: Path) -> None:
+    # Safety: a ready/1 marker exists but its commit was NEVER merged into main (the
+    # spoke tagged + pushed but never landed, and its worktree is gone). Nothing
+    # shipped, so the finalize must NOT fire — the land aborts and closes no issue.
+    wt = _make_spoke(hub, tmp_path, "feature/1-unmerged", push=True, ready=True)
+    _git(hub, "worktree", "remove", str(wt))  # worktree gone, but NOT merged into main
+
+    proc, logs = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode != 0
+    assert "issue close" not in _log_text(logs["gh"])
