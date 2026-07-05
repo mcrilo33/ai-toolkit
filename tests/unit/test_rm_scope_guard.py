@@ -131,7 +131,6 @@ class TestFallThrough:
             # Out of scope.
             "rm -rf ~/x",
             "rm /etc/hosts",
-            "rm ../other-repo/file",
             "rm -rf /",
             # Protected patterns inside the repo.
             "rm .env",
@@ -171,6 +170,15 @@ class TestFallThrough:
     def test_falls_through(self, repo: Path, command: str) -> None:
         assert decision(command, repo) is None
 
+    def test_relative_traversal_escaping_all_scopes_falls_through(self, repo: Path) -> None:
+        """A `..` chain that leaves BOTH the repo and /tmp must stay silent.
+        The climb goes all the way to the filesystem root because on Linux
+        runners tmp_path itself lives under /tmp — a scope the guard
+        deliberately auto-allows — so a one-level sibling escape like
+        `../other-repo/file` is (correctly) allowed there."""
+        ups = "/".join([".."] * len(repo.parts))
+        assert decision(f"rm {ups}/other-repo/file", repo) is None
+
     def test_falls_through_on_repo_root_absolute(self, repo: Path) -> None:
         assert decision(f"rm -rf {repo}", repo) is None
 
@@ -193,21 +201,22 @@ class TestFallThrough:
         assert decision("rm escape/hosts", repo) is None
         assert decision("rm -rf escape", repo) is None
 
-    def test_cwdless_payload_never_anchors_to_process_cwd(self, tmp_path: Path) -> None:
+    def test_cwdless_payload_never_anchors_to_process_cwd(self) -> None:
         """With no payload cwd, ROOT must come only from explicit anchors
         (workspace_roots / CURSOR_PROJECT_DIR) — never from walking up the
-        hook process's own working directory into an unrelated repo."""
-        other = tmp_path.resolve() / "other"
-        other.mkdir()
-        subprocess.run(["git", "init", "-q"], cwd=other, check=True)
-        (other / "f.txt").write_text("x\n")
+        hook process's own working directory into an unrelated repo. The
+        anchor repo must live OUTSIDE /tmp — the guard's always-allow scope,
+        where Linux runners put tmp_path — or the /tmp rule would allow the
+        target and mask the anchoring bug; this checkout (a git repo outside
+        /tmp on every platform CI runs) is the process cwd instead."""
+        project = HOOKS_DIR.parents[1]
         env = {k: v for k, v in os.environ.items() if k != "CURSOR_PROJECT_DIR"}
         proc = subprocess.run(
             ["bash", str(RM_SCOPE_GUARD)],
-            input=_cursor_payload(f"rm {other}/f.txt"),
+            input=_cursor_payload(f"rm {project}/wouldbe-scoped-scratch.txt"),
             capture_output=True,
             text=True,
-            cwd=str(other),
+            cwd=str(project),
             env=env,
         )
         assert proc.returncode == 0
