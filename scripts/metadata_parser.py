@@ -129,6 +129,27 @@ def parse(path: str) -> dict[str, dict]:
     return items
 
 
+def read_mapping(path: str) -> dict[str, Value]:
+    """Parse a whole file as one nested block-style YAML mapping.
+
+    Unlike :func:`parse` (which treats each top-level key as a named item split
+    into defaults/overrides), this returns the document as a plain nested dict —
+    for config files such as ``settings/ai-toolkit.yml``. Flow-style collections
+    (``{a: b}``) are not supported; use block style.
+
+    Args:
+        path: Path to a block-style YAML mapping file.
+
+    Returns:
+        The parsed mapping (empty dict for an empty/comment-only file).
+    """
+    lines = _read_lines(path)
+    if not lines:
+        return {}
+    result, _ = _parse_map(lines, 0, 0)
+    return result
+
+
 # Characters that may not start a YAML plain scalar (c-indicators).
 _UNSAFE_LEAD_CHARS = frozenset("!&*|>%@`\"'#,]}")
 
@@ -193,7 +214,7 @@ def _item_lines(item: Value, indent: int) -> list[str]:
     lines: list[str] = []
     for k, v in item.items():
         lines.extend(_to_yaml_lines(k, v, indent + 2))
-    lines[0] = f"{pad}- {lines[0][indent + 2:]}"
+    lines[0] = f"{pad}- {lines[0][indent + 2 :]}"
     return lines
 
 

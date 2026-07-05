@@ -1,0 +1,100 @@
+# ai-toolkit — declarative behavior config (issue #142)
+#
+# The SINGLE source of truth for two families of "how the toolkit behaves"
+# settings that used to be scattered across shell defaults and per-agent
+# frontmatter:
+#
+#   - model + effort routing (spoke driver, sub-agents, cycle steps, AFK
+#     answerer, per-label overrides), and
+#   - the integration `base_branch` the hub operates on and that spokes start
+#     from and land to.
+#
+# The sync pipeline (scripts/sync-to-repo.sh + scripts/metadata_parser.py)
+# reads this file to stamp each agent's `model:` frontmatter, emit the
+# spoke-default env file that worktree-new.sh sources, and set
+# `git config ai-toolkit.base-branch`. Change a value here + re-sync to change
+# the corresponding behavior — no other edits.
+#
+# Effort defaults to `max` everywhere it is omitted.
+
+# The integration branch the hub operates on and that spokes branch from and
+# land to. Empty ⇒ today's auto-detection (origin/HEAD → main); see the
+# wt_base_branch resolver in shared/hooks/lib/base-branch.sh (issue #117).
+base_branch:
+
+model:
+  # The interactive spoke driver launched by worktree-new.sh. `[1m]` selects
+  # the 1M-token context tier.
+  spoke:
+    model: claude-opus-4-8[1m]
+    effort: max
+
+  # Model per solo-cycle step. SCHEMA ONLY for now — no consumer selects a
+  # model per cycle step yet; wiring lands in a follow-up (see issue #142).
+  cycle_steps:
+    anchor:
+      model: claude-opus-4-8
+      effort: max
+    red:
+      model: claude-opus-4-8
+      effort: max
+    green:
+      model: claude-sonnet-5
+      effort: max
+    review:
+      model: claude-opus-4-8
+      effort: max
+    push:
+      model: claude-sonnet-5
+      effort: max
+
+  # Per sub-agent model routing (issue #141): Fable is scarce, so it is reserved
+  # for the design/plan agents; Opus 4.8 for the reasoning-heavy ones; Sonnet 5
+  # for the capable-but-routine ones; Haiku for none. Sync stamps these into
+  # each agent's claude `model:`/`effort:` frontmatter.
+  subagents:
+    architect:
+      model: claude-fable-5
+      effort: max
+    planner:
+      model: claude-fable-5
+      effort: max
+    debug:
+      model: claude-opus-4-8
+      effort: max
+    security-reviewer:
+      model: claude-opus-4-8
+      effort: max
+    code-review:
+      model: claude-opus-4-8
+      effort: max
+    tdd-red:
+      model: claude-opus-4-8
+      effort: max
+    devops:
+      model: claude-opus-4-8
+      effort: max
+    tdd-green:
+      model: claude-sonnet-5
+      effort: max
+    tdd-refactor:
+      model: claude-sonnet-5
+      effort: max
+    refactor:
+      model: claude-sonnet-5
+      effort: max
+    documentation:
+      model: claude-sonnet-5
+      effort: max
+
+  # The reasoning answerer that resolves parked spokes under /afk. SCHEMA ONLY
+  # for now — the AFK answerer wiring lands in a follow-up (see issue #142).
+  afk:
+    answerer:
+      model: claude-opus-4-8
+      effort: max
+
+  # Per-issue-label model overrides. An issue carrying a listed label spawns its
+  # spoke on the override model. Empty by default.
+  overrides:
+    by_label:

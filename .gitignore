@@ -40,5 +40,9 @@ Thumbs.db
 *.pem
 *.key
 
-# Local placeholders (not yet handled by sync-to-repo.sh)
-settings/
+# Local placeholders (not yet handled by sync-to-repo.sh) — except the
+# declarative toolkit config, which IS a tracked source of truth read by the
+# sync pipeline (issue #142). Ignore settings/* (not settings/) so a specific
+# file can be re-included: git cannot un-ignore a file under an ignored dir.
+settings/*
+!settings/ai-toolkit.yml
