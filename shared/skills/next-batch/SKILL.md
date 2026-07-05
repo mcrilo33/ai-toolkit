@@ -39,15 +39,23 @@ back. Read the in-flight worktrees and their issues' scopes — `hub-status.sh` 
 the active worktrees and their issue numbers; the `Scope:` line is in each issue
 body (`gh issue view <n> --json body`).
 
-Pass one `--inflight` flag per live spoke:
+Pass one `--inflight` flag per live spoke, and `--cap N` to bound the total live
+spokes (issue #151 — a wide fan-out can starve the box and the co-located Langfuse):
 
 ```bash
 .ai-toolkit/scripts/batch-plan.sh \
+  --cap "$cap" \
   --inflight "shared/hooks/foo.sh tests/unit/test_foo.py" \
   --inflight "dashboard/app.py"
 ```
 
-With no spokes running, call it bare:
+Resolve `$cap` the same way `/afk` does: the configured `batch.concurrency_cap`
+(`python3 scripts/ai_toolkit_config.py batch-env settings/ai-toolkit.yml` emits
+`AI_TOOLKIT_BATCH_CAP=<n>` when set), else auto `min(2, cores/4)` from the core count.
+`batch-plan.sh` truncates the batch so `in-flight + newly-dispatched ≤ cap`; pass
+`--cap 0` (or omit it) only when you deliberately want the historical unbounded batch.
+
+With no spokes running and no cap, call it bare:
 
 ```bash
 .ai-toolkit/scripts/batch-plan.sh
@@ -90,8 +98,10 @@ reaches `ready/N`.
   unblock its dependents and free its scope for a colliding peer.
 - Keep `Scope:` lines tight and honest. An over-broad scope (or `*`) needlessly
   serializes work that could have run in parallel.
-- It honors **no concurrency cap** — the batch is whatever the dependency graph and
-  scope-disjointness allow. Dispatch a subset by hand if you want fewer live spokes.
+- It honors the **`batch.concurrency_cap`** ceiling (issue #151): pass `--cap` so the
+  batch (plus in-flight spokes) never exceeds the cap. Beyond that, the batch is
+  whatever the dependency graph and scope-disjointness allow; dispatch a subset by hand
+  if you want fewer live spokes than the cap permits.
 
 ## Related skills
 

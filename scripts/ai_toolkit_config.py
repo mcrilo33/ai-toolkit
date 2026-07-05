@@ -136,22 +136,24 @@ def agent_model_overrides(config: dict) -> dict[str, dict[str, str]]:
     return overrides
 
 
-def _positive_int(value: object) -> int | None:
-    """Parse a positive integer, or None when unset/blank/non-numeric/non-positive.
+def _bounded_int(value: object, *, minimum: int) -> int | None:
+    """Parse an integer ≥ ``minimum``, or None when unset/blank/non-numeric/too-small.
 
-    The one numeric family of config values (issue #151 batch settings) is
-    hand-edited, so a blank, zero, or malformed entry must fall back to the
-    consumer's own default rather than silently becoming a real ceiling.
+    The batch settings (issue #151) are hand-edited, so a blank or malformed entry
+    must fall back to the consumer's own default rather than silently becoming a real
+    value. ``minimum`` distinguishes the cap (≥1: 0 is not a valid ceiling ⇒ auto-derive)
+    from the stagger (≥0: 0 is a meaningful "disable the stagger").
     """
     if isinstance(value, bool):  # bool is an int subclass — reject it explicitly
         return None
     if isinstance(value, int):
-        return value if value > 0 else None
+        return value if value >= minimum else None
     if isinstance(value, str):
         text = value.strip()
+        # `.isdigit()` is non-negative-only, so a leading '-' already yields None.
         if text.isdigit():
             n = int(text)
-            return n if n > 0 else None
+            return n if n >= minimum else None
     return None
 
 
@@ -166,12 +168,16 @@ def batch_concurrency_cap(config: dict) -> int | None:
     Blank/absent/non-positive ⇒ None, so the dispatch consumer falls back to
     ``min(2, cores/4)`` rather than treating a mis-edit as an unlimited or zero cap.
     """
-    return _positive_int(_batch_section(config).get("concurrency_cap"))
+    return _bounded_int(_batch_section(config).get("concurrency_cap"), minimum=1)
 
 
 def batch_stagger_seconds(config: dict) -> int | None:
-    """Seconds between consecutive spawns in one batch, or None for the default."""
-    return _positive_int(_batch_section(config).get("stagger_seconds"))
+    """Seconds between consecutive spawns in one batch, or None for the default.
+
+    ``0`` is honored (disable the stagger); blank/absent/negative ⇒ None, so the
+    consumer falls back to its own default (45s).
+    """
+    return _bounded_int(_batch_section(config).get("stagger_seconds"), minimum=0)
 
 
 def base_branch(config: dict) -> str:

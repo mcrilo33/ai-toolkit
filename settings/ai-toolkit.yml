@@ -31,7 +31,7 @@ batch:
   # newly-dispatched) never exceeds this.
   concurrency_cap:
   # Seconds to wait between consecutive spawns in one batch, so first-push full
-  # suites don't all hit at once. Empty ⇒ 45.
+  # suites don't all hit at once. Empty ⇒ 45; 0 disables the stagger.
   stagger_seconds:
 
 model:
