@@ -1151,3 +1151,108 @@ class TestMcpServerSync:
         assert result.returncode == 0
         assert not (target_repo / ".ai-toolkit").exists()
         assert f"[dry-run] would write {self.RUN_SH}" in result.stdout
+
+
+# ── Config-driven behavior (issue #142) ───────────────────
+
+
+BASE_BRANCH_LIB = REPO_ROOT / "shared" / "hooks" / "lib" / "base-branch.sh"
+
+
+def _run_sync_with_config(target: Path, config: Path, tool: str = "claude") -> None:
+    """Run sync with AI_TOOLKIT_CONFIG pointed at a specific config file."""
+    subprocess.run(
+        ["bash", str(SYNC_SCRIPT), str(target), tool],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, "AI_TOOLKIT_CONFIG": str(config)},
+    )
+
+
+def _git_config(repo: Path, key: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo), "config", "--get", key], capture_output=True, text=True
+    )
+
+
+class TestConfigDrivenSync:
+    """settings/ai-toolkit.yml is the source of truth for model + base_branch."""
+
+    def test_claude_agent_model_stamped_from_config(self, target_repo: Path) -> None:
+        # The real seed config routes architect→fable, debug→opus, tdd-green→sonnet.
+        _run_sync(target_repo, "claude")
+
+        agents = target_repo / ".claude" / "agents"
+        assert (
+            _parse_frontmatter((agents / "architect.md").read_text())["model"] == "claude-fable-5"
+        )
+        assert _parse_frontmatter((agents / "debug.md").read_text())["model"] == "claude-opus-4-8"
+        assert (
+            _parse_frontmatter((agents / "tdd-green.md").read_text())["model"] == "claude-sonnet-5"
+        )
+
+    def test_claude_agent_effort_stamped_from_config(self, target_repo: Path) -> None:
+        _run_sync(target_repo, "claude")
+
+        agents = target_repo / ".claude" / "agents"
+        assert _parse_frontmatter((agents / "architect.md").read_text())["effort"] == "max"
+
+    def test_spoke_env_emitted_with_spoke_model(self, target_repo: Path) -> None:
+        _run_sync(target_repo, "claude")
+
+        env = target_repo / ".ai-toolkit" / "scripts" / "spoke-model.env"
+        assert env.exists()
+        text = env.read_text()
+        assert "WT_AGENT_MODEL_DEFAULT=claude-opus-4-8[1m]" in text
+        assert "WT_AGENT_EFFORT_DEFAULT=max" in text
+
+    def test_base_branch_set_from_config(self, target_repo: Path, tmp_path: Path) -> None:
+        config = tmp_path / "cfg.yml"
+        config.write_text(
+            "base_branch: develop\nmodel:\n  spoke:\n    model: claude-opus-4-8[1m]\n"
+        )
+
+        _run_sync_with_config(target_repo, config)
+
+        assert _git_config(target_repo, "ai-toolkit.base-branch").stdout.strip() == "develop"
+
+    def test_absent_base_branch_leaves_config_unset(self, target_repo: Path) -> None:
+        # The real seed config has an empty base_branch ⇒ auto-detection preserved.
+        _run_sync(target_repo, "claude")
+
+        assert _git_config(target_repo, "ai-toolkit.base-branch").returncode != 0
+
+    def test_empty_base_branch_unsets_a_prior_value(
+        self, target_repo: Path, tmp_path: Path
+    ) -> None:
+        # A previously-configured base branch is cleared when the config goes empty,
+        # restoring auto-detection (the config owns the value).
+        subprocess.run(
+            ["git", "-C", str(target_repo), "config", "ai-toolkit.base-branch", "stale"],
+            check=True,
+            capture_output=True,
+        )
+        config = tmp_path / "cfg.yml"
+        config.write_text("base_branch:\nmodel:\n  spoke:\n    model: claude-opus-4-8[1m]\n")
+
+        _run_sync_with_config(target_repo, config)
+
+        assert _git_config(target_repo, "ai-toolkit.base-branch").returncode != 0
+
+    def test_base_branch_resolves_via_wt_base_branch(
+        self, target_repo: Path, tmp_path: Path
+    ) -> None:
+        config = tmp_path / "cfg.yml"
+        config.write_text(
+            "base_branch: develop\nmodel:\n  spoke:\n    model: claude-opus-4-8[1m]\n"
+        )
+
+        _run_sync_with_config(target_repo, config)
+
+        got = subprocess.run(
+            ["bash", "-c", f'source "{BASE_BRANCH_LIB}"; wt_base_branch "{target_repo}"'],
+            capture_output=True,
+            text=True,
+        )
+        assert got.stdout.strip() == "develop"

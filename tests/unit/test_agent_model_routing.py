@@ -1,13 +1,16 @@
-"""Unit tests for the agent model routing in shared/agents/metadata.yml (issue #141).
+"""Unit tests for the agent model routing POLICY (issues #141, #142).
 
-Fable credit is scarce; Opus 4.8 is plentiful. The per-agent `claude.model`
-frontmatter must therefore route by role: Fable only for the design/plan agents
-(`architect`, `planner`), Opus 4.8 for the reasoning-heavy ones, Sonnet 5 for the
+Fable credit is scarce; Opus 4.8 is plentiful. The per-agent model must
+therefore route by role: Fable only for the design/plan agents (`architect`,
+`planner`), Opus 4.8 for the reasoning-heavy ones, Sonnet 5 for the
 capable-but-routine ones, and Haiku for none. Effort stays `max` everywhere.
 
-The tests parse the real metadata file, so any future agent added without an
-explicit routing decision fails the completeness check instead of silently
-defaulting to a scarce model.
+Since #142 the routing lives in `settings/ai-toolkit.yml` (the single source of
+truth), NOT in `shared/agents/metadata.yml` frontmatter — sync stamps it into
+each agent's frontmatter from the config. These tests therefore read the config;
+the completeness check cross-references the live agent roster so any future agent
+added without a routing decision fails here instead of silently defaulting to a
+scarce model. Config parse mechanics live in test_ai_toolkit_config.py.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
+import ai_toolkit_config as cfg  # noqa: E402
 from metadata_parser import parse  # noqa: E402
 
 AGENTS_METADATA = REPO_ROOT / "shared" / "agents" / "metadata.yml"
@@ -44,30 +48,27 @@ EXPECTED_ROUTING = {
 
 
 @pytest.fixture(scope="module")
-def agents() -> dict[str, dict]:
-    return parse(str(AGENTS_METADATA))
+def config() -> dict:
+    return cfg.load_config()
 
 
-def _claude_block(agents: dict[str, dict], name: str) -> dict:
-    return agents[name]["__overrides"]["claude"]
-
-
-def test_every_agent_has_an_explicit_routing_decision(agents: dict[str, dict]) -> None:
-    assert set(agents) == set(EXPECTED_ROUTING)
+def test_every_agent_has_an_explicit_routing_decision(config: dict) -> None:
+    # Cross-reference the live agent roster, not a frozen copy.
+    assert set(cfg.agent_model_overrides(config)) == set(parse(str(AGENTS_METADATA)))
 
 
 @pytest.mark.parametrize(("name", "model"), sorted(EXPECTED_ROUTING.items()))
-def test_agent_model_matches_routing(agents: dict[str, dict], name: str, model: str) -> None:
-    assert _claude_block(agents, name)["model"] == model
+def test_agent_model_matches_routing(config: dict, name: str, model: str) -> None:
+    assert cfg.agent_model(config, name) == (model, "max")
 
 
 @pytest.mark.parametrize("name", sorted(EXPECTED_ROUTING))
-def test_agent_effort_stays_max(agents: dict[str, dict], name: str) -> None:
-    assert _claude_block(agents, name)["effort"] == "max"
+def test_agent_effort_stays_max(config: dict, name: str) -> None:
+    assert cfg.agent_model(config, name)[1] == "max"
 
 
 @pytest.mark.parametrize(
     "name", sorted(n for n in EXPECTED_ROUTING if n not in ("architect", "planner"))
 )
-def test_fable_reserved_for_design_and_plan(agents: dict[str, dict], name: str) -> None:
-    assert _claude_block(agents, name)["model"] != FABLE
+def test_fable_reserved_for_design_and_plan(config: dict, name: str) -> None:
+    assert cfg.agent_model(config, name)[0] != FABLE

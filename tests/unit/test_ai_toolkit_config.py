@@ -285,3 +285,36 @@ def test_seed_routing_matches_the_agent_roster(real_config: dict) -> None:
 @pytest.mark.parametrize(("name", "model"), sorted(EXPECTED_AGENT_ROUTING.items()))
 def test_real_config_agent_routing_matches_seed(real_config: dict, name: str, model: str) -> None:
     assert cfg.agent_model(real_config, name) == (model, "max")
+
+
+# ─── agent_model_overrides (the sync-stamping overlay source) ───
+
+
+def test_agent_model_overrides_maps_every_subagent(tmp_path: Path) -> None:
+    config = cfg.load_config(
+        _write(
+            tmp_path,
+            "model:\n"
+            "  subagents:\n"
+            "    architect:\n"
+            "      model: claude-fable-5\n"
+            "      effort: max\n"
+            "    debug:\n"
+            "      model: claude-opus-4-8\n",
+        ).as_posix()
+    )
+
+    assert cfg.agent_model_overrides(config) == {
+        "architect": {"model": "claude-fable-5", "effort": "max"},
+        "debug": {"model": "claude-opus-4-8", "effort": "max"},
+    }
+
+
+def test_agent_model_overrides_empty_without_subagents(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, "model:\n  spoke:\n    model: x\n").as_posix())
+
+    assert cfg.agent_model_overrides(config) == {}
+
+
+def test_real_config_overrides_cover_the_roster(real_config: dict) -> None:
+    assert set(cfg.agent_model_overrides(real_config)) == set(parse(str(AGENTS_METADATA)))

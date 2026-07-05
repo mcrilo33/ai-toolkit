@@ -886,18 +886,23 @@ class TestAgentsMetadata:
     # ── Per-agent model / effort assignment (Claude-scoped) ──
 
     def test_model_and_effort_emitted_for_claude(self) -> None:
-        """Agents declaring a claude model/effort override emit both fields.
+        """Config-stamped agents emit both model and effort for Claude.
 
-        The values are a tunable policy choice; this test asserts the
-        *mechanism* (Claude receives a model and effort) rather than any
-        specific alias, so re-tuning a model never breaks the suite.
+        Since #142 the model/effort come from settings/ai-toolkit.yml (not the
+        metadata.yml frontmatter); this asserts the sync overlay *mechanism*
+        stamps both fields, rather than any specific alias, so re-tuning a model
+        never breaks the suite.
         """
+        import ai_toolkit_config as cfg
+        from metadata_parser import apply_overrides
+
         items = self._metadata_entries()
+        apply_overrides(items, "claude", cfg.agent_model_overrides(cfg.load_config()))
 
         results = dict(query(items, "claude", ["name", "model", "effort"]))
 
-        assigned = {name: fm for name, fm in results.items() if "model:" in fm}
-        assert assigned, "Expected at least one agent with a Claude model override"
+        assigned = {n: fm for n, fm in results.items() if "model:" in fm and "effort:" in fm}
+        assert assigned, "Expected config to stamp Claude model+effort for agents"
         for name, fm in assigned.items():
             assert "effort:" in fm, f"Agent '{name}' has model but no effort"
 
@@ -971,3 +976,53 @@ class TestAgentsMetadata:
         for name in with_hooks:
             fm = results[name]
             assert "hooks:" in fm, f"hooks block lost for '{name}'"
+
+
+class TestApplyOverrides:
+    """The generic per-tool override overlay used by config-driven stamping."""
+
+    def _items(self) -> dict[str, dict]:
+        return {
+            "architect": {"__defaults": {"name": "architect"}, "__overrides": {}},
+            "debug": {
+                "__defaults": {"name": "debug"},
+                "__overrides": {"claude": {"effort": "max"}},
+            },
+        }
+
+    def test_overlays_fields_into_the_tool_block(self) -> None:
+        from metadata_parser import apply_overrides
+
+        items = self._items()
+        apply_overrides(items, "claude", {"architect": {"model": "claude-fable-5"}})
+
+        assert items["architect"]["__overrides"]["claude"]["model"] == "claude-fable-5"
+
+    def test_merges_without_dropping_existing_keys(self) -> None:
+        from metadata_parser import apply_overrides
+
+        items = self._items()
+        apply_overrides(items, "claude", {"debug": {"model": "claude-opus-4-8"}})
+
+        claude = items["debug"]["__overrides"]["claude"]
+        assert claude == {"effort": "max", "model": "claude-opus-4-8"}
+
+    def test_ignores_names_absent_from_items(self) -> None:
+        from metadata_parser import apply_overrides
+
+        items = self._items()
+        apply_overrides(items, "claude", {"ghost": {"model": "x"}})
+
+        assert "ghost" not in items
+
+    def test_query_emits_overlaid_model(self) -> None:
+        from metadata_parser import apply_overrides
+
+        items = self._items()
+        apply_overrides(
+            items, "claude", {"architect": {"model": "claude-fable-5", "effort": "max"}}
+        )
+
+        fm = dict(query(items, "claude", ["name", "model", "effort"]))["architect"]
+        assert "model: claude-fable-5" in fm
+        assert "effort: max" in fm
