@@ -43,13 +43,15 @@ def _make_python_stub(bindir: Path, runlog: Path, *, exit_code: int = 0) -> None
     stub.chmod(0o755)
 
 
-def _make_repo(tmp_path: Path, *, script_dir: str) -> Path:
-    """A git checkout carrying the ingest script at `script_dir` plus the
+def _make_repo(tmp_path: Path, *, script_dir: str, git: bool = True) -> Path:
+    """A checkout carrying the ingest script at `script_dir` plus the
     telemetry python package at scripts/telemetry/ — the ONLY place it exists.
 
     Issue #136: `sync_workflow_scripts` ships the .sh files to
     `.ai-toolkit/scripts/` but never the python package, so the script must
-    resolve the ingesters relative to the repo checkout, not to itself.
+    resolve the ingesters relative to the repo checkout, not to itself. With
+    `git=False` the layout is a bare non-git install, exercising the
+    SCRIPT_DIR-sibling fallback.
     """
     repo = tmp_path / "repo"
     sdir = repo / script_dir
@@ -59,7 +61,8 @@ def _make_repo(tmp_path: Path, *, script_dir: str) -> Path:
     pkg.mkdir(parents=True, exist_ok=True)
     (pkg / "langfuse_spoke_tree.py").touch()
     (pkg / "langfuse_backfill.py").touch()
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    if git:
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
     return repo
 
 
@@ -196,6 +199,23 @@ def test_synced_layout_resolves_package_at_repo_scripts(worktree: Path, tmp_path
     assert str(repo / "scripts" / "telemetry" / "langfuse_spoke_tree.py") in tree
     assert str(repo / "scripts" / "telemetry" / "langfuse_backfill.py") in backfill
     assert ".ai-toolkit/scripts/telemetry/" not in tree
+    assert f"PYTHONPATH={repo / 'scripts'} " in tree
+
+
+def test_non_git_install_falls_back_to_script_sibling(worktree: Path, tmp_path: Path) -> None:
+    # Arrange: no git checkout anywhere — the package co-located beside the script
+    repo = _make_repo(tmp_path, script_dir="scripts", git=False)
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+
+    # Act
+    result = _run(worktree, bindir, script=repo / "scripts" / "telemetry-ingest-spoke.sh")
+
+    # Assert: the SCRIPT_DIR-sibling candidate resolves when git introspection can't
+    assert result.returncode == 0, result.stderr
+    tree, backfill = runlog.read_text().splitlines()
+    assert str(repo / "scripts" / "telemetry" / "langfuse_spoke_tree.py") in tree
+    assert str(repo / "scripts" / "telemetry" / "langfuse_backfill.py") in backfill
     assert f"PYTHONPATH={repo / 'scripts'} " in tree
 
 

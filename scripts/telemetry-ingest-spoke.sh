@@ -70,13 +70,16 @@ fi
 # to <target>/.ai-toolkit/scripts/ but never the package (issue #136), so the
 # repo checkout's scripts/telemetry is the canonical home; the SCRIPT_DIR
 # sibling stays as a fallback for a non-git install that co-locates it.
-REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)"
+# env -u: an inherited git-hook GIT_DIR/GIT_WORK_TREE would override -C
+# discovery and resolve a different checkout's package (this repo's documented
+# hook-env leak class) — strip both so the answer is always THIS script's repo.
+REPO_ROOT="$(env -u GIT_DIR -u GIT_WORK_TREE git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)"
 TELEMETRY_DIR=""
 for _cand in ${REPO_ROOT:+"$REPO_ROOT/scripts/telemetry"} "$SCRIPT_DIR/telemetry"; do
   if [ -f "$_cand/langfuse_spoke_tree.py" ]; then TELEMETRY_DIR="$_cand"; break; fi
 done
 if [ -z "$TELEMETRY_DIR" ]; then
-  warn "telemetry python package not found under ${REPO_ROOT:-$SCRIPT_DIR} — skipping post-run Langfuse ingestion for $SPOKE_RUN_ID"
+  warn "telemetry python package not found (probed ${REPO_ROOT:+$REPO_ROOT/scripts/telemetry and }$SCRIPT_DIR/telemetry) — skipping post-run Langfuse ingestion for $SPOKE_RUN_ID"
   exit 0
 fi
 
