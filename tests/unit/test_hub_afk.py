@@ -2538,6 +2538,59 @@ def test_auto_land_lands_foreign_when_opted_in(spoke_repo: Path, tmp_path: Path)
     assert land_log.read_text().split() == ["5"], "AFK_LAND_FOREIGN=1 lands a foreign spoke"
 
 
+# ── auto_land trusts the ready-marker green + never loops (issue #144) ─────────
+# The ready/<issue> marker IS the green contract: the spoke's own ship gate already ran
+# the full suite on this exact tree before emitting it (and _ready_at_tip proves marker ==
+# tip). So auto_land lands with --skip-tests — it must not re-run the redundant full suite,
+# which self-flakes under a live drain when the land builds a diverged merge commit (#140).
+# And a deterministic land failure (a genuine merge conflict) escalates blocked/<issue> ONCE:
+# once that tag sits at the tip, auto_land skips the issue instead of re-attempting the same
+# failure every tick (the merge→fail→reset→merge loop, #140).
+
+
+def _land_argv_recorder(tmp_path: Path) -> tuple[Path, Path]:
+    """A land-script stub recording its FULL argv (not just $1), to assert threaded flags."""
+    land_log = tmp_path / "land.log"
+    stub = tmp_path / "wtland.sh"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{land_log}"\n')
+    stub.chmod(0o755)
+    return stub, land_log
+
+
+def test_auto_land_trusts_ready_marker_and_skips_suite(spoke_repo: Path, tmp_path: Path) -> None:
+    # AC1: land with --skip-tests, trusting the ready-marker green — no redundant full-suite
+    # re-run (the source of the #140 self-flake).
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    wt_land, land_log = _land_argv_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(expr, env={"WT_LAND": str(wt_land), "AFK_STATE_DIR": str(statedir)})
+
+    argv = land_log.read_text().strip()
+    assert argv == "5 --skip-tests", (
+        "auto_land must trust the ready-marker green and land with --skip-tests "
+        f"(no redundant full-suite re-run), got {argv!r}"
+    )
+
+
+def test_auto_land_skips_issue_already_blocked_at_tip(spoke_repo: Path, tmp_path: Path) -> None:
+    # AC2: a prior deterministic land failure left blocked/5 at the tip (alongside ready/5).
+    # auto_land must NOT re-invoke the land — escalate once, never loop merge→fail→reset→merge.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    subprocess.run(["git", "tag", "blocked/5"], cwd=spoke_repo, check=True, capture_output=True)
+    wt_land, land_log = _land_argv_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(expr, env={"WT_LAND": str(wt_land), "AFK_STATE_DIR": str(statedir)})
+
+    assert not land_log.exists() or land_log.read_text().strip() == "", (
+        "an issue already carrying blocked/<issue> at its tip must not be re-landed "
+        "(escalate once, no retry loop)"
+    )
+
+
 def test_clear_dispatch_epochs_drops_stale_entries(tmp_path: Path) -> None:
     statedir = tmp_path / "statedir"
     statedir.mkdir()

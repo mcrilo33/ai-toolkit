@@ -1329,6 +1329,19 @@ _ready_at_tip() {
   [ -n "$marker" ] && [ "$marker" = "$tip" ]
 }
 
+# _blocked_at_tip <wt_path> <issue> -> true when blocked/<issue> points at the branch tip.
+# A deterministic land failure (a genuine merge conflict) escalates blocked/<issue> at the
+# tip, right where ready/<issue> still sits — so auto_land skips a blocked-at-tip issue to
+# escalate ONCE instead of re-attempting the same failure every tick (the merge→fail→reset→
+# merge loop, #144). reconcile_markers clears the tag once the spoke commits fresh work on
+# top (it falls behind the tip), so the issue becomes landable again after a real fix.
+_blocked_at_tip() {
+  local wt="$1" issue="$2" tip marker
+  tip="$(git -C "$wt" rev-parse HEAD 2>/dev/null)" || return 1
+  marker="$(git -C "$wt" rev-parse -q --verify "refs/tags/blocked/${issue}^{commit}" 2>/dev/null)"
+  [ -n "$marker" ] && [ "$marker" = "$tip" ]
+}
+
 # _afk_review_verdict <wt> -> the verdict of the spoke's most-recent code-review artifact
 # (APPROVE | REQUEST_CHANGES), or empty when no `.review/*.json` exists. Review evidence is
 # written per reviewed diff as `.review/<hash>.json` by the review-stamp MCP; the LATEST by
@@ -1366,11 +1379,27 @@ _afk_review_verdict() {
 
 # auto_land -> land every ready/<issue> spoke. The ready/<issue> marker is the readiness
 # contract (enforced by _ready_at_tip above), so a foreign ready/<issue> left by a parallel
-# session is adopted and landed by default (#95). A failed land (merge conflict / suite
-# fail) emits blocked/<issue> and the drain continues; a landed spoke frees its scope + its
-# dependents' blockers for the next tick's plan. Set AFK_LAND_FOREIGN=0 to restore the
-# dispatched-only isolation (skip any ready/<issue> with no dispatch epoch) so concurrent
-# sessions don't surprise-land each other's work (#74).
+# session is adopted and landed by default (#95). A failed land (merge conflict) emits
+# blocked/<issue> and the drain continues; a landed spoke frees its scope + its dependents'
+# blockers for the next tick's plan. Set AFK_LAND_FOREIGN=0 to restore the dispatched-only
+# isolation (skip any ready/<issue> with no dispatch epoch) so concurrent sessions don't
+# surprise-land each other's work (#74).
+#
+# Trust the ready-marker green (#144): the ready/<issue> marker IS the green contract — the
+# spoke's own ship gate already ran the full suite on this exact tree before emitting it (and
+# _ready_at_tip proved marker == tip). So the land runs with --skip-tests: re-running the
+# suite at land time is redundant AND self-flakes under a live drain, because a diverged land
+# builds a merge commit whose gate re-runs the whole suite and the tripwire / worktree-land /
+# test-select tests collide with the concurrent land moving refs (#140). Manual `/land` keeps
+# its diverged-merge gate — the trust is applied by this caller, not baked into worktree-land.
+# UPGRADE: if trusting a merge commit's untested combined tree ever proves too loose, swap
+#   --skip-tests here for a fast merge-sanity check (pytest --collect-only + changed-file
+#   tests) on diverged lands only — cheap, and it never runs the ref-colliding suites.
+#
+# Escalate ONCE, never loop (#144): a deterministic land failure escalates blocked/<issue> at
+# the tip, but ready/<issue> still sits there too, so a naive re-survey would re-land → fail →
+# reset → re-land forever (#140). auto_land skips any issue already carrying blocked/<issue>
+# at its tip (_blocked_at_tip); reconcile_markers revives it once the spoke commits a real fix.
 #
 # The reasoning code-review verdict is the /afk test-gutting gate (#143), but it is OFF by
 # default (#152): the #143 default-on gate false-positive-escalated clean lands whose spokes
@@ -1385,6 +1414,10 @@ auto_land() {
   while IFS=$'\t' read -r path issue; do
     [ -n "$issue" ] || continue
     _ready_at_tip "$path" "$issue" || continue
+    if _blocked_at_tip "$path" "$issue"; then
+      log "  skip land #$issue — already escalated blocked/$issue at the tip (escalate once, no retry loop)"
+      continue
+    fi
     if [ "${AFK_LAND_FOREIGN:-1}" = "0" ] && [ -z "$(read_dispatch_epoch "$issue")" ]; then
       log "  skip land #$issue — foreign (no dispatch epoch) and AFK_LAND_FOREIGN=0"
       continue
@@ -1398,10 +1431,10 @@ auto_land() {
       fi
     fi
     log "→ land #$issue"
-    if _afk_run_with_heartbeat bash "$wt_land" "$issue" >/dev/null 2>&1; then
+    if _afk_run_with_heartbeat bash "$wt_land" "$issue" --skip-tests >/dev/null 2>&1; then
       log "  landed #$issue"
     else
-      _escalate_blocked "$path" "$issue" "auto-land failed (merge conflict or suite failure) — needs a human"
+      _escalate_blocked "$path" "$issue" "auto-land failed (merge conflict or push rejection) — needs a human"
     fi
   done < <(inflight_worktrees)
 }
