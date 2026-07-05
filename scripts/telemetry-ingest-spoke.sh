@@ -151,8 +151,10 @@ run_step() {
       warn "$label failed after ${attempt} attempt(s) (continuing) — re-run from the id alone: telemetry-ingest-spoke.sh --spoke-run-id $SPOKE_RUN_ID"
       return 0
     fi
-    warn "$label attempt ${attempt}/${INGEST_RETRIES} failed — retrying in $(( INGEST_BACKOFF * attempt ))s (transient Langfuse/load?)"
-    sleep "$(( INGEST_BACKOFF * attempt ))" 2>/dev/null || true
+    # 10# forces base-10: the digits-only guard still admits a leading-zero value
+    # (08/09), which bare $(( )) would misread as invalid octal and abort the loop.
+    warn "$label attempt ${attempt}/${INGEST_RETRIES} failed — retrying in $(( 10#$INGEST_BACKOFF * attempt ))s (transient Langfuse/load?)"
+    sleep "$(( 10#$INGEST_BACKOFF * attempt ))" 2>/dev/null || true
     attempt=$(( attempt + 1 ))
   done
 }
