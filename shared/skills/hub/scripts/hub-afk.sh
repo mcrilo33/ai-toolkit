@@ -1269,9 +1269,12 @@ _ready_at_tip() {
 # ISO-8601 `timestamp` wins, so a spoke that earned a REQUEST_CHANGES and then fixed it (a
 # newer APPROVE) reads clean. Pure bash + grep (no jq dependency); ISO-8601 Z timestamps
 # sort chronologically as plain strings.
-# UPGRADE: bind to the tip diff hash (utils.sh review_diff_hash <wt> <base> range) instead
-#   of newest-timestamp — closes the "APPROVE then gut before ready" ordering — once hub-afk
-#   can share that hash recipe without utils.sh's source-time side effects (set -e + span arm).
+# UPGRADE: this trusts an artifact's verdict field WITHOUT checking its HMAC signature (the
+#   advisory reviewer-sep push gate is the authenticity layer today) and picks by timestamp,
+#   not by binding to the pushed diff. Binding to the tip diff hash (utils.sh review_diff_hash
+#   <wt> <base> range) AND verifying the signature would close both the "APPROVE then gut
+#   before ready" ordering and the forge-an-APPROVE axis — once hub-afk can share utils.sh's
+#   hash + verify recipe without its source-time side effects (set -e + per-hook span arm).
 _afk_review_verdict() {
   local wt="$1"
   local dir="$wt/.review" f ts v latest="" verdict=""
@@ -1281,6 +1284,7 @@ _afk_review_verdict() {
     v="$(grep -oE '"verdict"[[:space:]]*:[[:space:]]*"[^"]*"' "$f" | head -1 | sed 's/.*: *"//;s/"$//')"
     [ -n "$v" ] || continue
     ts="$(grep -oE '"timestamp"[[:space:]]*:[[:space:]]*"[^"]*"' "$f" | head -1 | sed 's/.*: *"//;s/"$//')"
+    ts="${ts:-0000}"   # a timestamp-less artifact sorts lowest — never wins over a stamped one
     if [ -z "$latest" ] || [[ "$ts" > "$latest" ]]; then latest="$ts"; verdict="$v"; fi
   done
   printf '%s' "$verdict"

@@ -2163,6 +2163,29 @@ def test_auto_land_escalates_when_no_review(spoke_repo: Path, tmp_path: Path) ->
     assert "--blocked 5" in ready_log.read_text(), "no review ⇒ escalate to blocked"
 
 
+def test_auto_land_escalates_when_review_dir_empty(spoke_repo: Path, tmp_path: Path) -> None:
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    (spoke_repo / ".review").mkdir()  # present but no artifacts ⇒ no verdict ⇒ escalate
+    wt_land, land_log = _land_recorder(tmp_path)
+    ready_stub, ready_log = _escalation_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "SPOKE_READY": str(ready_stub),
+            "AFK_STATE_DIR": str(statedir),
+        },
+    )
+
+    assert not land_log.exists() or land_log.read_text().strip() == "", (
+        "an empty .review dir must NOT land"
+    )
+    assert "--blocked 5" in ready_log.read_text(), "an empty .review dir ⇒ escalate to blocked"
+
+
 def test_auto_land_lands_after_fix_supersedes_changes(spoke_repo: Path, tmp_path: Path) -> None:
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
     # A REQUEST_CHANGES later fixed: the newer APPROVE wins (latest timestamp), so the
