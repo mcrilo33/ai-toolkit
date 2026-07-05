@@ -47,6 +47,14 @@ seen_file="${HUB_NOTIFY_SEEN_FILE:-$common_dir/hub-notify-seen}"
 # first line, whitespace-trimmed, non-empty ⇒ armed. Under a drain the answerer
 # services gate parks and the drain auto-lands ready spokes, so only blocked/<N>
 # (the escalation a human must act on) should ping; attended, every class pings.
+#
+# UPGRADE: this uses afk_read_state semantics (state non-empty), NOT
+# afk_supervisor_state (live vs stale via the heartbeat pid). A crashed/stale
+# drain — window still armed, supervisor gone — therefore keeps suppressing
+# gate/ready with no answerer actually running. Bounded: the hub-afk watchdog
+# normally respawns a crashed supervisor and --status surfaces STALE. Add a
+# heartbeat-pid liveness check (see hub-afk.sh afk_supervisor_state) here if
+# stale-drain over-suppression ever bites.
 afk_state_file="${AFK_STATE:-$common_dir/.afk-state}"
 afk_active=0
 if [ -f "$afk_state_file" ] \
@@ -134,7 +142,9 @@ while IFS=' ' read -r tag sha; do
     continue
   fi
   # Under a live drain, suppress everything but blocked/<N>. The marker is still
-  # persisted as seen below, so it never re-pings once attended resumes.
+  # persisted as seen below, so it never re-pings once attended resumes — this
+  # assumes a live drain services (answers) or escalates (blocked/<N>) every
+  # suppressed park before its window ends (see the UPGRADE note above).
   if [ "$afk_active" -eq 1 ] && [ "$kind" != "blocked" ]; then
     continue
   fi

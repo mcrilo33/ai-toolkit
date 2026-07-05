@@ -266,3 +266,29 @@ def test_attended_fires_gate_when_no_afk_window(hub: Path, tmp_path: Path) -> No
 
     assert len(messages) == 1
     assert "parked" in messages[0].lower()
+
+
+def test_afk_suppressed_gate_is_recorded_as_seen(hub: Path, tmp_path: Path) -> None:
+    # A marker suppressed under a drain is still persisted into the seen-set, so
+    # it must NOT belatedly ping when the window ends and attended resumes.
+    seen = tmp_path / "seen"
+    _git(hub, "tag", "-a", "-m", "plan", "gate/1", "feature/1-work")
+
+    _proc1, first = _run(hub, tmp_path, seen_file=seen, afk=True)
+    _proc2, second = _run(hub, tmp_path, seen_file=seen, afk=False)
+
+    assert first == []
+    assert second == []
+
+
+def test_whitespace_only_afk_state_does_not_suppress(hub: Path, tmp_path: Path) -> None:
+    # Parity with afk_read_state: a whitespace-only .afk-state is NOT armed, so
+    # a gate marker still fires (guards against dropping the non-empty trim).
+    state = tmp_path / "blank-afk-state"
+    state.write_text("   \n")
+    _git(hub, "tag", "-a", "-m", "plan", "gate/1", "feature/1-work")
+
+    _proc, messages = _run(hub, tmp_path, env_extra={"AFK_STATE": str(state)})
+
+    assert len(messages) == 1
+    assert "parked" in messages[0].lower()
