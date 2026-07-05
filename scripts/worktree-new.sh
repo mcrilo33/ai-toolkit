@@ -459,6 +459,13 @@ if [ "$SPAWN_TERMINAL" -eq 1 ]; then
   fi
 fi
 
+# The one-shot preflights above only cover the spawn instant; the watchdog
+# daemon keeps the collector+bridge alive for the whole spoke lifetime (machine
+# sleep/wake, #138) and exits itself when the last spoke pane closes. Armed
+# AFTER the tmux spawn so its first tick can already see the new pane;
+# best-effort and self-gating (no-op unless AI_TOOLKIT_OTEL=1, singleton).
+wt_otel_watch_arm "$REPO_ROOT"
+
 # --- telemetry: spawn lifecycle marker + script run-node ---------------------
 # Attributed to the new spoke (emitted with the worktree as CWD), carrying the
 # spoke_run_id minted above. The script span is this control script as a trace
