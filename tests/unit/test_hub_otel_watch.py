@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -356,6 +357,44 @@ def test_daemon_appends_loop_output_to_logfile(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "COLLECTOR /repo" in logfile.read_text()
     assert "COLLECTOR /repo" not in result.stdout
+
+
+def test_daemon_removes_pidfile_on_sigterm(tmp_path: Path) -> None:
+    # `kill <daemon>` is the normal teardown, and bash does NOT run the EXIT trap
+    # on an untrapped fatal signal — without TERM/INT traps the pidfile survives,
+    # and after OS pid reuse every future arm would refuse to start (the silent
+    # no-watchdog failure #138 exists to kill).
+    pidfile = tmp_path / "watch.pid"
+    parts = [
+        "spoke_pane_live() { return 0; }",
+        _LOOP_ENV,
+        "export HUB_OTEL_WATCH_INTERVAL=0.05",
+        f'export HUB_OTEL_WATCH_PIDFILE="{pidfile}"',
+        f'export HUB_OTEL_WATCH_LOG="{tmp_path / "watch.log"}"',
+        "_daemon",
+    ]
+    proc = subprocess.Popen(
+        ["bash", "-c", f'source "{HUB_OTEL_WATCH}"; {"; ".join(parts)}'],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**os.environ},
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not pidfile.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert pidfile.exists(), "daemon never wrote its pidfile"
+
+        proc.terminate()
+        proc.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while pidfile.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not pidfile.exists()
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
 
 
 def test_daemon_cli_dispatch_reports_already_running(tmp_path: Path) -> None:
