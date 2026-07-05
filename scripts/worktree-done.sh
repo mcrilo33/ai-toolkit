@@ -146,6 +146,22 @@ if ! git worktree remove $FORCE "$WT_DIR"; then
 fi
 
 git worktree prune
+
+# --- leftover-dir sweep (issue #134) ------------------------------------------
+# A lingering shell cwd or gitignored runtime files can leave the directory on
+# disk even when git deregistered the worktree (#122 left ai-toolkit-122
+# behind). Any telemetry ingest has already completed by now (worktree-land
+# ingests before invoking this script), so a raw rm -rf of the leftover is
+# safe. If even that fails, warn LOUDLY but keep going — a stuck directory
+# must never abort the branch pruning below.
+if [ -e "$WT_DIR" ]; then
+  wt_warn "git deregistered the worktree but the directory survived — sweeping it (rm -rf)."
+  rm -rf "$WT_DIR" || true
+  if [ -e "$WT_DIR" ]; then
+    wt_warn "✗ LEFTOVER DIRECTORY SURVIVED: $WT_DIR"
+    wt_warn "  a process is probably holding a cwd inside it — close it, then remove it by hand: rm -rf \"$WT_DIR\""
+  fi
+fi
 echo "✓ removed: $WT_DIR"
 
 # --- scrub the removed path from VS Code's "Open Recent" list (issue #103) ---
