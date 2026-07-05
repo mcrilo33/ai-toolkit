@@ -158,6 +158,85 @@ def test_restore_preserves_worktree_path_with_spaces(repo: Path, tmp_path: Path)
     assert _git(repo, "config", "--get", "core.worktree").strip() == str(spaced_dir)
 
 
+# --- live sibling worktrees (issue #135) ------------------------------------------
+# Worktrees share one ref store: a live sibling spoke committing during a long
+# gate advances its own branch by fast-forward. That is legitimate concurrent
+# work, not a test escape — the tripwire must not trip on it (and must not
+# rewind it). Genuine escapes still trip: any move of the CURRENT branch, a
+# non-FF move/rewind of a sibling ref, and moves of refs no worktree has
+# checked out.
+
+
+@pytest.fixture()
+def spoke(repo: Path, tmp_path: Path) -> Path:
+    """A linked worktree of `repo` on its own branch — a live sibling spoke."""
+    wt = tmp_path / "spoke"
+    _git(repo, "worktree", "add", "-q", "-b", "feature/spoke", str(wt))
+    return wt
+
+
+def test_check_ignores_sibling_worktree_ff_advance(repo: Path, spoke: Path) -> None:
+    # A live spoke committing mid-gate fast-forwards its checked-out branch;
+    # the check must stay CLEAN (issue #135's false breach).
+    proc = _lib(
+        repo,
+        'b="$(tripwire_capture)"\n'
+        f'git -C "{spoke}" commit --allow-empty -q -m spoke-work\n'
+        'out="$(tripwire_check "$b")" && echo CLEAN || echo "CHANGED $out"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "CLEAN" in proc.stdout
+
+
+def test_check_ignores_branch_created_with_new_worktree(repo: Path, tmp_path: Path) -> None:
+    # The hub spawning a new spoke mid-gate creates a branch + worktree; the
+    # new ref belongs to a registered worktree and must not trip the check.
+    wt = tmp_path / "spawned"
+    proc = _lib(
+        repo,
+        'b="$(tripwire_capture)"\n'
+        f'git worktree add -q -b feature/spawned "{wt}"\n'
+        'out="$(tripwire_check "$b")" && echo CLEAN || echo "CHANGED $out"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "CLEAN" in proc.stdout
+
+
+def test_check_trips_on_sibling_worktree_rewind(repo: Path, spoke: Path) -> None:
+    # A sibling ref moving BACKWARD is not spoke work — something destroyed
+    # commits in the shared ref store. Must still trip.
+    _git(spoke, "commit", "--allow-empty", "-qm", "spoke-work")
+    proc = _lib(
+        repo,
+        'b="$(tripwire_capture)"\n'
+        f'git -C "{spoke}" reset -q --hard HEAD~1\n'
+        'out="$(tripwire_check "$b")" && echo CLEAN || echo "CHANGED $out"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "CHANGED" in proc.stdout
+    assert "refs/heads/feature/spoke" in proc.stdout
+
+
+def test_check_trips_on_ff_advance_of_unregistered_branch(repo: Path) -> None:
+    # An FF advance of a branch NO worktree has checked out has no live-spoke
+    # explanation — that is exactly what an escaped test looks like. Must trip.
+    _git(repo, "branch", "side")
+    proc = _lib(
+        repo,
+        'b="$(tripwire_capture)"\n'
+        'sha="$(git commit-tree -m sneak -p refs/heads/side "$(git rev-parse side^{tree})")"\n'
+        'git update-ref refs/heads/side "$sha"\n'
+        'out="$(tripwire_check "$b")" && echo CLEAN || echo "CHANGED $out"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "CHANGED" in proc.stdout
+    assert "refs/heads/side" in proc.stdout
+
+
 # --- integration: the test-select.sh pre-push gate -------------------------------
 
 
