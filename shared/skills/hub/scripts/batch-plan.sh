@@ -9,7 +9,9 @@
 # CONCURRENTLY, ordered to minimize total wall-clock:
 #   * READ — one `gh api graphql` round-trip for every open issue's `body` (for its
 #     `Scope:` line) and its `blockedBy` connection (number + state).
-#   * ELIGIBILITY — an issue is *ready* when all its blockers are closed.
+#   * ELIGIBILITY — an issue is *ready* when all its blockers are closed. A
+#     `hold`-labelled issue is never ready: it is staged out of every batch until
+#     the label is removed (it still blocks its dependents while open).
 #   * PRIORITY = critical-path depth — rank each ready issue by the longest blocked-by
 #     chain rooted at it (one topo pass). Unblocking the longest serial tail earliest
 #     minimizes makespan. Ties: direct-dependent count, then issue number.
@@ -75,6 +77,7 @@ fetch_issues() {
             nodes {
               number
               body
+              labels(first: 20) { nodes { name } }
               blockedBy(first: 50) { nodes { number state } }
             }
           }
@@ -268,11 +271,17 @@ def main():
             for b in ((node.get("blockedBy") or {}).get("nodes") or [])
             if b.get("number") is not None
         ]
+        labels = {
+            (lbl.get("name") or "").lower()
+            for lbl in ((node.get("labels") or {}).get("nodes") or [])
+            if lbl.get("name")
+        }
         issues[num] = {
             "number": num,
             "scope": scope_of(node.get("body")),
             "split": has_split_marker(node.get("body")),
             "blockers": blockers,
+            "hold": "hold" in labels,
         }
 
     open_nums = set(issues)
@@ -307,7 +316,10 @@ def main():
         # Ready when every blocker is closed (no blocker still open).
         return all(state == "CLOSED" for _num, state in info["blockers"])
 
-    ready = [info for info in issues.values() if is_ready(info)]
+    # A `hold`-labelled issue is staged, not dispatchable: excluded from every
+    # batch until the label is removed. It stays open, so it still blocks its
+    # dependents and still contributes to their critical-path depth.
+    ready = [info for info in issues.values() if is_ready(info) and not info["hold"]]
 
     # Priority: critical-path depth desc, then direct-dependent count desc, then
     # issue number asc.
