@@ -3703,3 +3703,68 @@ def test_drain_survives_source_rewrite_mid_run(spoke_repo: Path, tmp_path: Path)
     assert proc.returncode == 0, f"rc={proc.returncode}\nstdout={stdout}\nstderr={stderr}"
     assert "/afk: done" in stderr, stderr
     assert "syntax error" not in stderr, f"the rewritten original was read: {stderr}"
+
+
+def _wait_for_glob(root: Path, pattern: str, timeout: float = 10.0) -> list[Path]:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        hits = list(root.glob(pattern))
+        if hits:
+            return hits
+        time.sleep(0.05)
+    return []
+
+
+def test_afk_resume_launch_strips_copy_guard() -> None:
+    # The respawn command must strip the running copy's exported AFK_RUNNING_COPY —
+    # otherwise the respawned supervisor inherits the guard, skips its own self-copy,
+    # and runs unprotected from the rewritable original (ST5 review).
+    result = _call("_afk_resume_launch", env={"AFK_ORIG_SCRIPT": "/x/orig.sh"})
+
+    assert "env -u AFK_RUNNING_COPY" in result.stdout, result.stdout + result.stderr
+    assert "/x/orig.sh" in result.stdout, "the respawn relaunches the ORIGINAL path"
+
+
+def test_watchdog_entry_execs_from_private_copy(tmp_path: Path) -> None:
+    # --watchdog is long-lived and must run from a copy too. With no armed state the
+    # loop exits on its first `off` tick, leaving the copy dir as the evidence.
+    result = subprocess.run(
+        ["bash", str(HUB_AFK), "--watchdog"],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "TMPDIR": str(tmp_path),
+            "AFK_STATE": str(tmp_path / "state"),
+            "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_WATCHDOG_FILE": str(tmp_path / "watchdog.pid"),
+            "AFK_WATCHDOG_SECONDS": "1",
+        },
+        cwd=REPO_ROOT,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert list(tmp_path.glob("hub-afk-self.*/hub-afk.sh")), (
+        "a --watchdog entry must exec from a private copy"
+    )
+
+
+def test_spawn_watchdog_strips_copy_guard(tmp_path: Path) -> None:
+    # The auto-spawned watchdog inherits the running copy's env; the spawn must strip
+    # AFK_RUNNING_COPY so the child still execs its own fresh copy.
+    result = _call(
+        "export AFK_RUNNING_COPY=1; _afk_spawn_watchdog; echo RC=$?",
+        env={
+            "TMPDIR": str(tmp_path),
+            "AFK_STATE": str(tmp_path / "state"),
+            "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_WATCHDOG_FILE": str(tmp_path / "watchdog.pid"),
+            "AFK_WATCHDOG_SECONDS": "1",
+        },
+    )
+
+    assert "RC=0" in result.stdout, result.stdout + result.stderr
+    assert _wait_for_glob(tmp_path, "hub-afk-self.*/hub-afk.sh"), (
+        "the spawned watchdog must exec from a copy despite the inherited guard"
+    )

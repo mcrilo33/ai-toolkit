@@ -1438,7 +1438,10 @@ _afk_exec_self_copy() {
 # supervisor: a detached, NO-ARG launch of this script. No window spec ⇒ it resumes the
 # persisted window (re-adopting spokes) rather than arming a fresh one. Pure (returns the
 # string) so it is inspectable in a test without launching a real supervisor.
-_afk_resume_launch() { printf 'nohup bash %s >/dev/null 2>&1 &' "$(_afk_self)"; }
+# `env -u AFK_RUNNING_COPY` strips the exported recursion guard the running copy would
+# otherwise pass down — the respawned supervisor must make its OWN fresh copy of the
+# original, not run unprotected from the rewritable file (ST5 review).
+_afk_resume_launch() { printf 'nohup env -u AFK_RUNNING_COPY bash %s >/dev/null 2>&1 &' "$(_afk_self)"; }
 
 # _afk_watchdog_respawn -> respawn the supervisor. AFK_RESPAWN_CMD overrides the launch
 # for tests; otherwise the no-arg resume above. Best-effort; never aborts the watchdog.
@@ -1483,7 +1486,9 @@ _afk_watchdog_alive() {
 _afk_spawn_watchdog() {
   _afk_watchdog_alive && return 0
   if [ -n "${AFK_WATCHDOG_SPAWN_CMD:-}" ]; then bash -c "$AFK_WATCHDOG_SPAWN_CMD"; return 0; fi
-  nohup bash "$(_afk_self)" --watchdog >/dev/null 2>&1 &
+  # env -u strips the running copy's exported recursion guard: the watchdog is
+  # long-lived and must exec its OWN fresh copy of the original (ST5 review).
+  nohup env -u AFK_RUNNING_COPY bash "$(_afk_self)" --watchdog >/dev/null 2>&1 &
   # Record the child pid immediately so the next tick's dedup check sees it alive before
   # the watchdog itself writes the pidfile (closes the launch→pidfile startup race).
   printf '%s\n' "$!" > "$(_afk_watchdog_file)" 2>/dev/null || true
