@@ -80,6 +80,136 @@ not record it). They are backfilled from a session-peer push span — within one
 session every span belongs to the same spoke run. Spans with no `spoke_run_id`
 and no session match are ad-hoc and group under `None`.
 
+## Duration rollup in the assembled spoke tree (Issue #128)
+
+`langfuse_spoke_tree.py` stamps every container node of both assembled views with
+`metadata.rollup.duration = {total_ms, components}` alongside the token rollup.
+`total_ms` is the observed subtree wall-clock (the container's own `start → end`, or
+its subtree span when untimed — which is how the synthetic root covers the whole
+spoke; timestamps are parsed, never string-compared). `components` books each node's
+exclusive time — its duration minus the *union* of its children's intervals, clamped
+≥ 0 — into one class bucket. On serial spans the components sum to `total_ms`;
+concurrent siblings (parallel tool calls, background sub-agents) each book their full
+span time, so class buckets are span-time and may sum past the wall-clock (CPU-time
+vs wall-time), while the gap buckets (`self`/`turn`/`step`) stay true — union-based
+subtraction never erases them:
+
+| Bucket | What lands in it |
+|--------|------------------|
+| `llm_request` | Generations (`claude_code.llm_request`). |
+| `tool` | `tool:*` spans, minus their folded `blocked_on_user_ms`. |
+| `hook` | `*.sh` spans / `workflow.kind == hook`. |
+| `script` | `workflow.kind == script` spans (`script:worktree-land`, `script:spoke-push`, …). |
+| `step` | Cycle-step nodes' own gap time (step overhead not covered by real spans). |
+| `wait` | Human/gate wait: folded `blocked_on_user_ms` + the gate script (`script:gate`). |
+| `turn` | Interactions' own gap (thinking/streaming outside child spans). |
+| `self` | The container's own unattributed gap — inter-turn idle on the root. |
+| `other` | Anything unclassified; untimed nodes contribute 0. |
+
+Same leaf-marker rule as the #114 token stamping: View B's childless turn-markers
+carry a `duration` computed from their pre-flatten View A subtree and are excluded
+from the cycle-axis sums (their span overlaps their re-homed former children).
+Rebuilds are idempotent — `fetch_session` excludes the synthesizer's own prior
+output, so durations never double-count.
+
+> [!WARNING]
+> `duration` is written only by the spoke-tree assembly. The other two rollup
+> writers still emit the token-only shape: `langfuse_backfill.py` (historical
+> spokes lack `rollup.duration` — treat the key as optional in consumers), and the
+> standalone `langfuse_rollup.py` patcher, whose `span-update` replaces the
+> `rollup` metadata key wholesale — running it over a session that already holds
+> assembled `spoketree-`/`spokecycle-` traces strips their `duration`. Re-run
+> `langfuse_spoke_tree.py` to restore it; aligning the two writers is a follow-up.
+
+## Spoke-latency dashboard (Issue #128)
+
+One saved Langfuse dashboard — **"spoke latency"** — answers, at a glance: which
+cycle step dominates a spoke, what the gate costs, and how LLM latency compares
+across models. Its reproducible source of truth is
+**`dashboard/langfuse/spoke-latency-dashboard.json`**: four widget definitions, each
+carrying the exact `/api/public/metrics` query that backs it (the deployed v3.192.2
+routes this query shape at the v1 path — `/api/public/v2/metrics` 404s there, newer
+builds add it; all four queries verified live, HTTP 200 with data), pinned to the
+metrics contract by `tests/unit/test_spoke_latency_dashboard.py` (views, measures,
+aggregations, filter operators, the high-cardinality dimension ban, and the emitted
+span/score names).
+
+Langfuse v3.192.x has **no public dashboards API** — verified against the local
+instance's OpenAPI spec and `langfuse-cli api __schema`, neither of which lists a
+`dashboards` resource — so the dashboard is saved once via the UI (*Dashboards → New
+dashboard → "spoke latency"*, one *New widget* form per entry in the JSON file). The
+widget numbers are verifiable headlessly by running each `metricsQuery` (plus a
+`fromTimestamp`/`toTimestamp` window) through the Metrics API. Auth resolves like the
+rest of the push stack (see `wt_bridge_launch` in `scripts/worktree-lib.sh`): the
+operator-exported `LANGFUSE_BASIC_AUTH` (`Basic <base64(pk:sk)>`), sent verbatim as
+the `Authorization` header against `LANGFUSE_HOST` (default
+`http://localhost:3000`).
+
+```bash
+curl -s -H "Authorization: $LANGFUSE_BASIC_AUTH" \
+  "$LANGFUSE_HOST/api/public/metrics" --get \
+  --data-urlencode 'query=<widget metricsQuery + time range>'
+```
+
+Span-name inventory the widgets key on (all emitted by this repo): cycle-step nodes
+`step:<subject>` / `preStep` / `postStep` (assembled views) and `step:<phase>`
+markers; script spans `worktree-new` / `worktree-land` / `worktree-done` /
+`spoke-push` (the push span's window covers the pre-push test gate) and
+`script:ready` / `script:gate` / `script:accept` / `script:blocked`; native
+`claude_code.llm_request` generations; numeric scores `gate_park_ms` (trace-level
+PLAN-gate park) and `permission_wait_ms` (per blocked tool).
+
+### Widget 1 — cycle-step duration by step name
+
+| Field | Value |
+|-------|-------|
+| View | Observations |
+| Filters | `name` *starts with* `step:` |
+| Metrics | `latency` — `p50` and `p95` |
+| Breakdown dimension | `name` |
+| Chart | Horizontal bar (or table) |
+
+### Widget 2 — script spans p50/p95 (land, push, gate)
+
+| Field | Value |
+|-------|-------|
+| View | Observations |
+| Filters | `name` *any of* `worktree-land`, `worktree-new`, `worktree-done`, `spoke-push`, `script:ready`, `script:gate` |
+| Metrics | `latency` — `p50` and `p95` |
+| Breakdown dimension | `name` |
+| Chart | Horizontal bar |
+
+The `spoke-push` span's window covers the pre-push test gate; `script:gate` is the
+PLAN-gate park emission.
+
+### Widget 3 — LLM request latency by model
+
+| Field | Value |
+|-------|-------|
+| View | Observations |
+| Filters | `type` = `GENERATION` |
+| Metrics | `latency` — `p50` and `p95` |
+| Breakdown dimension | `providedModelName` |
+| Chart | Horizontal bar (add a second time-series copy with `timeDimension` for trends) |
+
+### Widget 4 — gate park + permission wait totals
+
+| Field | Value |
+|-------|-------|
+| View | Scores (numeric) |
+| Filters | `name` *any of* `gate_park_ms`, `permission_wait_ms` |
+| Metrics | `value` — `sum` (add `count` for how often) |
+| Breakdown dimension | `name`, over time (`timeDimension` day) |
+| Chart | Stacked bar over time |
+
+> [!NOTE]
+> Per-**session** wait totals are not groupable here: `sessionId` is a
+> high-cardinality dimension the Metrics API only accepts as a *filter*. To read
+> one spoke's wait, add
+> `{"column": "sessionId", "operator": "=", "value": "<spoke_run_id>", "type": "string"}`
+> to the filters — or read `rollup.duration.components.wait` off the spoke's
+> assembled root span, which carries the same answer per spoke.
+
 ## Verification notes and follow-ups
 
 - **Timestamps** — every `user` and `assistant` record (the ones bracketed)
