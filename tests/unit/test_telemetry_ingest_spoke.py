@@ -158,7 +158,10 @@ def test_resolves_auth_from_conf_when_env_unset(worktree: Path, tmp_path: Path) 
 
     # Assert: the script resolves auth itself and runs both ingesters
     assert result.returncode == 0, result.stderr
-    assert len(runlog.read_text().splitlines()) == 2
+    tree, backfill = runlog.read_text().splitlines()
+    assert "langfuse_spoke_tree.py" in tree
+    assert SPOKE_RUN_ID in tree
+    assert "langfuse_backfill.py" in backfill
 
 
 def test_best_effort_when_a_step_fails(worktree: Path, tmp_path: Path) -> None:
