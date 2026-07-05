@@ -81,8 +81,10 @@ def _run_hub_status_proc(
     issue_state: str = "",
     tmux_fail: bool = False,
     projects_dir: Path | None = None,
+    listening: str = "4317 4318",
+    otel: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run hub-status.sh from the hub with `gh` and `tmux` stubs on PATH.
+    """Run hub-status.sh from the hub with `gh`, `tmux` and `lsof` stubs on PATH.
 
     Args:
         hub: Main checkout to run the script from.
@@ -99,6 +101,13 @@ def _run_hub_status_proc(
         projects_dir: Claude projects root exported as CLAUDE_PROJECTS_DIR.
             When None, a nonexistent dir under tmp_path is exported so the
             host's real ~/.claude/projects can never leak into a test.
+        listening: Space-separated ports the ``lsof`` stub reports as LISTEN
+            (#138 collector-down warning). Defaults to the collector pair being
+            up so unrelated tests never trip the warning; the stub makes the
+            probe hermetic both ways — a really-running host collector must
+            never steer the matrix.
+        otel: Value for AI_TOOLKIT_OTEL; None leaves it unset (the host's own
+            opt-in/out is always popped first).
 
     Returns:
         The CompletedProcess with captured stdout/stderr.
@@ -133,10 +142,24 @@ def _run_hub_status_proc(
         "exit 0\n"
     )
     tmux.chmod(0o755)
+    lsof = bindir / "lsof"
+    lsof.write_text(
+        "#!/bin/sh\n"
+        'p=""\n'
+        'for a in "$@"; do case "$a" in -iTCP:*) p="${a#-iTCP:}";; esac; done\n'
+        'case " ${HUB_STATUS_TEST_LISTENING:-} " in *" $p "*) exit 0;; esac\n'
+        "exit 1\n"
+    )
+    lsof.chmod(0o755)
     env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
     env.pop("TMUX", None)  # hermetic by default; faked only when inside_tmux
     # The host's base-branch override (#117) must never steer the script under test.
     env.pop("AI_TOOLKIT_BASE_BRANCH", None)
+    # The host's OTel opt-in must never gate the collector-down warning (#138).
+    env.pop("AI_TOOLKIT_OTEL", None)
+    if otel is not None:
+        env["AI_TOOLKIT_OTEL"] = otel
+    env["HUB_STATUS_TEST_LISTENING"] = listening
     if inside_tmux:
         env["TMUX"] = "/tmp/tmux-test/default,1234,0"
     env["HUB_STATUS_TEST_PANES"] = panes
@@ -166,6 +189,8 @@ def _run_hub_status(
     issue_state: str = "",
     tmux_fail: bool = False,
     projects_dir: Path | None = None,
+    listening: str = "4317 4318",
+    otel: str | None = None,
 ) -> str:
     """Run hub-status.sh and return its stdout (see _run_hub_status_proc)."""
     return _run_hub_status_proc(
@@ -177,6 +202,8 @@ def _run_hub_status(
         issue_state=issue_state,
         tmux_fail=tmux_fail,
         projects_dir=projects_dir,
+        listening=listening,
+        otel=otel,
     ).stdout
 
 
@@ -846,3 +873,79 @@ def test_status_measures_against_configured_base(hub_with_spokes: Path, tmp_path
     row = next(ln for ln in out.splitlines() if "feature/1-pushed" in ln)
     assert "↑1" in row
     assert "↓1" in row
+
+
+# --- Collector-down warning (#138) -------------------------------------------
+# A pull survey must also surface a dark capture stack: when ≥1 spoke pane is
+# live and the collector ports (4317 gRPC / 4318 OTLP-HTTP) are not listening,
+# every span those spokes emit is dropped at source — hub-status must scream.
+# Silent when no spoke is live, when the collector is up, or on an explicit
+# operator opt-out (AI_TOOLKIT_OTEL=0; unset still warns — spokes are
+# default-on).
+
+
+def test_collector_warning_when_spoke_live_and_ports_down(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    panes = f"0:3\t{tmp_path / 'pushed'}"
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, panes=panes, listening="")
+
+    assert "COLLECTOR DOWN" in out
+    assert "4317" in out
+    assert "4318" in out
+    assert "hub-otel-watch" in out  # the re-arm command
+    # Prominent: the warning leads the dashboard, before the Worktrees survey.
+    assert out.index("COLLECTOR DOWN") < out.index("Worktrees")
+
+
+def test_collector_warning_silent_when_collector_up(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    panes = f"0:3\t{tmp_path / 'pushed'}"
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, panes=panes, listening="4317 4318")
+
+    assert "COLLECTOR DOWN" not in out
+
+
+def test_collector_warning_silent_when_no_spoke_pane(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    out = _run_hub_status(hub_with_spokes, tmp_path, panes="", listening="")
+
+    assert "COLLECTOR DOWN" not in out
+
+
+def test_collector_warning_silent_when_only_hub_pane(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    # A pane sitting in the hub main checkout is not a live spoke.
+    panes = f"0:1\t{hub_with_spokes}"
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, panes=panes, listening="")
+
+    assert "COLLECTOR DOWN" not in out
+
+
+def test_collector_warning_fires_when_one_port_dark(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    # Both ports are load-bearing (gRPC traces + OTLP-HTTP cycle spans): 4317
+    # up with 4318 dark must still warn, naming the dark port.
+    panes = f"0:3\t{tmp_path / 'pushed'}"
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, panes=panes, listening="4317")
+
+    assert "COLLECTOR DOWN" in out
+    assert "4318" in out
+
+
+def test_collector_warning_respects_explicit_optout(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    panes = f"0:3\t{tmp_path / 'pushed'}"
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, panes=panes, listening="", otel="0")
+
+    assert "COLLECTOR DOWN" not in out
