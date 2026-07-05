@@ -1364,10 +1364,13 @@ _afk_review_verdict() {
 # dispatched-only isolation (skip any ready/<issue> with no dispatch epoch) so concurrent
 # sessions don't surprise-land each other's work (#74).
 #
-# The reasoning code-review verdict is the /afk test-gutting gate (#143): the mechanical
-# anti-gutting scan is advisory now, so auto_land lands ONLY on a clean APPROVE verdict —
-# a REQUEST_CHANGES (the reviewer flagged gutting) or no review at all escalates to
-# blocked/<issue> instead. Set AFK_REVIEW_GATE=0 to restore the pre-#143 land-without-review.
+# The reasoning code-review verdict is the /afk test-gutting gate (#143), but it is OFF by
+# default (#152): the #143 default-on gate false-positive-escalated clean lands whose spokes
+# left no verdict artifact in the format the reader wants (reviews that finished in <1s),
+# bricking the whole drain (#151). The mechanical anti-gutting scan stays the advisory
+# residual signal. Set AFK_REVIEW_GATE=1 to opt back in: auto_land then lands ONLY on a clean
+# APPROVE verdict — a REQUEST_CHANGES (the reviewer flagged gutting) or no review at all
+# escalates to blocked/<issue> instead.
 auto_land() {
   local wt_land path issue verdict
   wt_land="$(_afk_find_script "${WT_LAND:-}" worktree-land.sh)" || { log "worktree-land.sh not found — skipping land"; return 0; }
@@ -1378,7 +1381,7 @@ auto_land() {
       log "  skip land #$issue — foreign (no dispatch epoch) and AFK_LAND_FOREIGN=0"
       continue
     fi
-    if [ "${AFK_REVIEW_GATE:-1}" != "0" ]; then
+    if [ "${AFK_REVIEW_GATE:-0}" != "0" ]; then
       verdict="$(_afk_review_verdict "$path")"
       if [ "$verdict" != "APPROVE" ]; then
         _escalate_blocked "$path" "$issue" \

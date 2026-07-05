@@ -2107,7 +2107,10 @@ def test_auto_land_lands_on_clean_approve(spoke_repo: Path, tmp_path: Path) -> N
     statedir = tmp_path / "statedir"
     expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
 
-    _call(expr, env={"WT_LAND": str(wt_land), "AFK_STATE_DIR": str(statedir)})
+    # AFK_REVIEW_GATE=1 opts into the gate (OFF by default since #152).
+    _call(
+        expr, env={"WT_LAND": str(wt_land), "AFK_STATE_DIR": str(statedir), "AFK_REVIEW_GATE": "1"}
+    )
 
     assert land_log.read_text().split() == ["5"], "a clean APPROVE verdict must land"
 
@@ -2129,6 +2132,7 @@ def test_auto_land_escalates_on_request_changes(spoke_repo: Path, tmp_path: Path
             "WT_LAND": str(wt_land),
             "SPOKE_READY": str(ready_stub),
             "AFK_STATE_DIR": str(statedir),
+            "AFK_REVIEW_GATE": "1",
         },
     )
 
@@ -2154,6 +2158,7 @@ def test_auto_land_escalates_when_no_review(spoke_repo: Path, tmp_path: Path) ->
             "WT_LAND": str(wt_land),
             "SPOKE_READY": str(ready_stub),
             "AFK_STATE_DIR": str(statedir),
+            "AFK_REVIEW_GATE": "1",
         },
     )
 
@@ -2177,6 +2182,7 @@ def test_auto_land_escalates_when_review_dir_empty(spoke_repo: Path, tmp_path: P
             "WT_LAND": str(wt_land),
             "SPOKE_READY": str(ready_stub),
             "AFK_STATE_DIR": str(statedir),
+            "AFK_REVIEW_GATE": "1",
         },
     )
 
@@ -2196,7 +2202,9 @@ def test_auto_land_lands_after_fix_supersedes_changes(spoke_repo: Path, tmp_path
     statedir = tmp_path / "statedir"
     expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
 
-    _call(expr, env={"WT_LAND": str(wt_land), "AFK_STATE_DIR": str(statedir)})
+    _call(
+        expr, env={"WT_LAND": str(wt_land), "AFK_STATE_DIR": str(statedir), "AFK_REVIEW_GATE": "1"}
+    )
 
     assert land_log.read_text().split() == ["5"], (
         "a newer APPROVE must supersede an older REQUEST_CHANGES"
