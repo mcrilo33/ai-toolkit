@@ -409,6 +409,37 @@ class TestSpokePushEmitsStepPush:
 
         assert len(_steps(telemetry_dir)) == 2
 
+    def test_rejected_push_emits_no_marker(
+        self, push_repo: Path, tmp_path: Path, telemetry_dir: Path
+    ) -> None:
+        # A push that is ATTEMPTED and then rejected (non-fast-forward) must not
+        # emit either: the marker sits below the bare wt_git_push under `set -e`,
+        # and this pins that placement. Advance the remote branch from a second
+        # checkout so the spoke's tip is behind.
+        env = _push_env(telemetry_dir)
+        other = tmp_path / "other"
+        subprocess.run(
+            ["git", "clone", "-q", str(push_repo), str(other)],
+            check=True,
+            capture_output=True,
+            env=env,
+        )
+        for args in (
+            ("config", "user.email", "t@t.t"),
+            ("config", "user.name", "t"),
+            ("config", "commit.gpgsign", "false"),
+            ("remote", "set-url", "origin", str(tmp_path / "remote.git")),
+            ("commit", "-qm", "feat: remote moved", "--allow-empty"),
+            ("push", "-q", "origin", "feature/139-step-push"),
+        ):
+            subprocess.run(["git", *args], cwd=str(other), check=True, capture_output=True, env=env)
+
+        result = _spoke_push(push_repo, telemetry_dir)
+
+        assert result.returncode != 0
+        assert _steps(telemetry_dir) == []
+        assert not _sentinel(push_repo, "push").exists()
+
     def test_refused_push_emits_no_marker(self, push_repo: Path, telemetry_dir: Path) -> None:
         # On the default branch the script refuses before pushing — no PUSH
         # step happened, so no marker may be emitted.
