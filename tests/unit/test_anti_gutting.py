@@ -215,3 +215,26 @@ def test_tag_only_push_is_exempt(repo: Path) -> None:
 
     assert result.returncode == 0, "a tag-only push must never be blocked"
     assert "weakens tests" not in result.stderr, "a tag-only push must not even be scanned"
+
+
+def test_mixed_branch_and_tag_push_still_scans_the_branch(repo: Path) -> None:
+    # A push carrying BOTH a branch ref and a tag ref (separate stdin lines) must still
+    # scan the branch range — the exemption is per-ref, not "any tag ⇒ skip the push"
+    # (which would let anyone bypass the scan by tacking a tag onto a branch push).
+    base, head = _commit(repo, {"tests/test_taut.py": "def test_taut():\n    assert True\n"})
+    stdin = (
+        f"refs/heads/feature {head} refs/heads/feature {base}\n"
+        f"refs/tags/blocked/5 {head} refs/tags/blocked/5 {base}\n"
+    )
+
+    result = subprocess.run(
+        ["bash", str(SCAN)],
+        cwd=str(repo),
+        input=stdin,
+        capture_output=True,
+        text=True,
+        env={**_GIT_ENV},
+    )
+
+    assert result.returncode == 0, "advisory scan never blocks"
+    assert "weakens tests" in result.stderr, "the branch ref in a mixed push must still be scanned"
