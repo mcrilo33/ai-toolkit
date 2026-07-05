@@ -304,6 +304,162 @@ def test_classify_permission_escalate_carries_reason() -> None:
     assert "git push origin main" in reason
 
 
+# ── permission-dialog detection + handling (issue #149) ───────────────────────
+# A Claude Code PERMISSION dialog is a pane-only surface (no transcript entry); the
+# supervisor detects it from the pane + the trailing tool_use command, classifies it,
+# and either injects "Yes" (safe self-op) or escalates to blocked/<issue> (risky).
+
+
+def _bash_tool_record(command: str) -> dict:
+    return {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {"type": "tool_use", "name": "Bash", "id": "tu_1", "input": {"command": command}}
+            ]
+        },
+    }
+
+
+def _tool_record(name: str) -> dict:
+    return {
+        "type": "assistant",
+        "message": {"content": [{"type": "tool_use", "name": name, "id": "tu_1", "input": {}}]},
+    }
+
+
+_PROMPT = "Bash command\n  git reset -q\nDo you want to proceed?\n❯ 1. Yes\n  2. No"
+
+
+def test_extract_pending_command_reads_trailing_bash(tmp_path: Path) -> None:
+    projects = tmp_path / "projects"
+    wt = tmp_path / "spoke"
+    pd = _project_dir_for(projects, wt)
+    _write_transcript(pd, [_bash_tool_record("git reset -q; git add tests/x.py")])
+
+    result = _call(f"extract_pending_command '{wt}'", env={"CLAUDE_PROJECTS_DIR": str(projects)})
+
+    assert result.stdout.strip() == "git reset -q; git add tests/x.py"
+
+
+def test_extract_pending_command_returns_tool_name_for_non_bash(tmp_path: Path) -> None:
+    # A non-Bash tool (browser/computer/mcp) yields its NAME, so the classifier escalates it.
+    projects = tmp_path / "projects"
+    wt = tmp_path / "spoke"
+    pd = _project_dir_for(projects, wt)
+    _write_transcript(pd, [_tool_record("mcp__claude-in-chrome__navigate")])
+
+    result = _call(f"extract_pending_command '{wt}'", env={"CLAUDE_PROJECTS_DIR": str(projects)})
+
+    assert result.stdout.strip() == "mcp__claude-in-chrome__navigate"
+
+
+def test_pane_shows_permission_prompt_true(spoke_repo: Path, tmp_path: Path) -> None:
+    fake_bin, _ = _injector_tmux(tmp_path, capture=_PROMPT, pane_path=spoke_repo)
+
+    result = _call(
+        f"_pane_shows_permission_prompt '{spoke_repo}'; echo RC=$?",
+        env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+
+    assert result.stdout.strip().splitlines()[-1] == "RC=0", result.stdout + result.stderr
+
+
+def test_pane_shows_permission_prompt_false_without_signature(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    fake_bin, _ = _injector_tmux(tmp_path, capture="just working, no dialog", pane_path=spoke_repo)
+
+    result = _call(
+        f"_pane_shows_permission_prompt '{spoke_repo}'; echo RC=$?",
+        env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+
+    assert result.stdout.strip().splitlines()[-1] == "RC=1", result.stdout + result.stderr
+
+
+def test_slot_state_waiting_on_permission_dialog(spoke_repo: Path, tmp_path: Path) -> None:
+    # A spoke parked on a permission dialog is 'waiting' (answerable), never reaped as idle.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _write_transcript(pd, [_bash_tool_record("git reset -q")])
+    fake_bin, _ = _injector_tmux(tmp_path, capture=_PROMPT, pane_path=spoke_repo)
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "AFK_IDLE_MINUTES": "0",  # would reap on idle if not caught as waiting
+        },
+    )
+
+    assert result.stdout.strip() == "waiting", result.stdout + result.stderr
+
+
+def _blocked_recording_ready(tmp_path: Path) -> tuple[Path, Path]:
+    """A spoke-ready.sh stub that records its args — so escalation (--blocked) is observable."""
+    log = tmp_path / "ready.log"
+    stub = tmp_path / "spoke-ready.sh"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\nexit 0\n')
+    stub.chmod(0o755)
+    return stub, log
+
+
+def test_decide_and_act_approves_safe_permission(spoke_repo: Path, tmp_path: Path) -> None:
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _write_transcript(pd, [_bash_tool_record("git reset -q; git add tests/x.py")])
+    jsonl = pd / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+    ready_stub, ready_log = _blocked_recording_ready(tmp_path)
+    # capture-pane shows the prompt; the first Enter clears it and touches the transcript
+    # (the spoke resuming), so approve_permission's _transcript_advanced confirms.
+    fake_bin, tmux_log = _injector_tmux(
+        tmp_path, capture=_PROMPT, pane_path=spoke_repo, clear_on_enter=1, touch=jsonl
+    )
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "SPOKE_READY": str(ready_stub),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_STATE_DIR": str(statedir),
+    }
+
+    result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    calls = tmux_log.read_text()
+    assert "send-keys -t afk:1 1" in calls, calls  # selected option 1 (Yes), not 2
+    assert not ready_log.exists(), f"safe permission must NOT escalate: {ready_log.read_text()}"
+
+
+def test_decide_and_act_escalates_risky_permission(spoke_repo: Path, tmp_path: Path) -> None:
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _write_transcript(pd, [_bash_tool_record("git push origin main")])
+    ready_stub, ready_log = _blocked_recording_ready(tmp_path)
+    fake_bin, tmux_log = _injector_tmux(tmp_path, capture=_PROMPT, pane_path=spoke_repo)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "SPOKE_READY": str(ready_stub),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE_DIR": str(statedir),
+    }
+
+    result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert ready_log.exists(), "risky permission must escalate to blocked/<issue>"
+    assert "--blocked 5" in ready_log.read_text()
+    # Must NOT have injected an approval keystroke for a risky command.
+    assert "send-keys -t afk:1 1" not in tmux_log.read_text()
+
+
 # ── the TRANSCRIPT layer ──────────────────────────────────────────────────────
 
 

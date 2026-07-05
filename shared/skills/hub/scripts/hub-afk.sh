@@ -556,6 +556,9 @@ slot_state() {
   _afk_note_tip_progress "$wt_path" "$issue"
   if _spoke_over_any_ceiling "$issue" "$(afk_now)"; then printf 'reap\n'; return; fi
   if [ -n "$(extract_pending_question "$wt_path")" ]; then printf 'waiting\n'; return; fi
+  # A pending permission dialog (a CC confirmation prompt, no transcript entry) is decided by
+  # the supervisor's classifier, so it waits — never reaped as idle (#149).
+  if _permission_pending "$wt_path"; then printf 'waiting\n'; return; fi
   age="$(_spoke_idle_seconds "$wt_path" "$issue")"
   if [ -n "$age" ] && [ "$age" -gt $(( AFK_IDLE_MINUTES * 60 )) ]; then printf 'reap\n'; return; fi
   printf 'busy\n'
@@ -753,6 +756,118 @@ classify_permission() {
   printf 'APPROVE\n'
 }
 
+# --- permission-dialog detection + handling (issue #149) ----------------------
+# A permission dialog is a pane-only surface — a Claude Code confirmation prompt with no
+# transcript entry — so it is detected from the pane (the only signal) plus the command the
+# spoke is trying to run (its trailing transcript tool_use). classify_permission decides it;
+# these helpers see it and deliver the decision. _decide_permission is reached from
+# decide_and_act, which routes a permission-pending spoke here instead of to the answerer.
+
+# extract_pending_command <wt_path> -> the command of the spoke's trailing assistant
+# tool_use (Bash -> its command string; any other tool -> the tool name, so the classifier
+# escalates non-Bash tools like browser/computer/mcp). Empty when unreadable. Mirrors
+# extract_pending_question's transcript walk.
+extract_pending_command() {
+  local jsonl; jsonl="$(_spoke_jsonl "$1")"
+  [ -n "$jsonl" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  _AFK_JSONL="$jsonl" python3 2>/dev/null <<'PYEOF'
+import json, os
+
+cmd = ""
+try:
+    with open(os.environ["_AFK_JSONL"]) as fh:
+        for raw in fh:
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(obj, dict) or obj.get("type") != "assistant":
+                continue
+            content = (obj.get("message") or {}).get("content") or []
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                name = (block.get("name") or "").strip()
+                if name == "Bash":
+                    c = ((block.get("input") or {}).get("command") or "").strip()
+                    if c:
+                        cmd = c
+                elif name:
+                    cmd = name
+except Exception:
+    pass
+print(cmd[:2000].strip())
+PYEOF
+}
+
+# _pane_shows_permission_prompt <wt_path> -> true when the spoke's pane shows a Claude Code
+# permission dialog. The signature regex is tunable via AFK_PERMISSION_PROMPT_RE. Fail-CLOSED
+# (return 1) when tmux or the pane is unavailable: an unobservable pane is never treated as a
+# pending permission, so slot_state's read of a no-tmux spoke is unchanged.
+_pane_shows_permission_prompt() {
+  local wt="$1" target re
+  re="${AFK_PERMISSION_PROMPT_RE:-Do you want to proceed\?}"
+  command -v tmux >/dev/null 2>&1 || return 1
+  target="$(_spoke_pane_target "$wt")"
+  [ -n "$target" ] || return 1
+  tmux capture-pane -p -t "$target" 2>/dev/null | grep -Eq -- "$re"
+}
+
+# _permission_pending <wt_path> -> true when the spoke is parked on a permission dialog we can
+# act on: the pane shows the prompt AND the command it is trying to run is readable. The single
+# gate slot_state and decide_and_act share.
+_permission_pending() {
+  local wt="$1"
+  _pane_shows_permission_prompt "$wt" || return 1
+  [ -n "$(extract_pending_command "$wt")" ]
+}
+
+# approve_permission <wt_path> -> select "Yes" on the pending permission dialog and confirm the
+# spoke resumed. Sends "1" then a SEPARATE Enter — option 1 is "Yes" (this once), NEVER option 2
+# ("Yes, don't ask again"), so nothing is silently broadened — then verifies the transcript
+# advanced. rc 0 approved; rc 1 no pane / not confirmed (the caller escalates).
+approve_permission() {
+  local wt="$1" target before
+  command -v tmux >/dev/null 2>&1 || return 1
+  target="$(_spoke_pane_target "$wt")"
+  [ -n "$target" ] || return 1
+  before="$(_transcript_mtime "$wt")"
+  tmux send-keys -t "$target" 1 2>/dev/null || return 1
+  tmux send-keys -t "$target" Enter 2>/dev/null || return 1
+  _transcript_advanced "$wt" "$before"
+}
+
+# _decide_permission <wt_path> <issue> -> classify the spoke's pending permission dialog and
+# act: AUTO-APPROVE a safe scoped self-op (inject "Yes"), or ESCALATE a risky/unreadable one to
+# blocked/<issue>. classify_permission is the policy; this is the tmux delivery around it.
+_decide_permission() {
+  local wt="$1" issue="$2" cmd decision kind reason
+  cmd="$(extract_pending_command "$wt")"
+  if [ -z "$cmd" ]; then
+    _escalate_blocked "$wt" "$issue" "permission dialog with an unreadable command — needs a human"
+    return 0
+  fi
+  decision="$(classify_permission "$cmd")"
+  kind="${decision%%$'\t'*}"
+  reason="${decision#*$'\t'}"
+  if [ "$kind" = "APPROVE" ]; then
+    log "→ auto-approving safe permission for #$issue: $cmd"
+    # Stamp the delivery attempt FIRST: the approve→resume window must not read as idle.
+    stamp_answer_attempt "$issue"
+    if approve_permission "$wt"; then
+      log "  approved permission for #$issue"
+      afk_emit_decision "$wt" success
+      return 0
+    fi
+    _escalate_blocked "$wt" "$issue" "could not deliver permission approval to the spoke — needs a human"
+    return 0
+  fi
+  _escalate_blocked "$wt" "$issue" "$reason — needs a human"
+}
+
 # --- tmux injection + telemetry -----------------------------------------------
 
 # _spoke_pane_target <wt_path> -> "session:window" of the spoke's pane, or empty.
@@ -875,6 +990,8 @@ _consume_gate_tag() {
 # (or an answer we cannot inject) escalates rather than guessing.
 decide_and_act() {
   local wt="$1" issue="$2" question orig_question raw rc decision kind text target was_gate=0
+  # A pending permission dialog is decided by the rules classifier, not the answerer (#149).
+  if _permission_pending "$wt"; then _decide_permission "$wt" "$issue"; return; fi
   # Snapshot the transcript clock BEFORE the park checks: a write landing between
   # this and the pre-inject re-check must count as movement (review nit, ST2).
   local parked_mtime; parked_mtime="$(_transcript_mtime "$wt")"
