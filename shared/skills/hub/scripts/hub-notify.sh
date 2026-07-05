@@ -42,6 +42,18 @@ case "$common_dir" in
 esac
 seen_file="${HUB_NOTIFY_SEEN_FILE:-$common_dir/hub-notify-seen}"
 
+# afk-mode (issue #146): hub-afk arms a drain window by writing its end bound to
+# .afk-state (AFK_STATE overrides), read here exactly as afk_read_state does —
+# first line, whitespace-trimmed, non-empty ⇒ armed. Under a drain the answerer
+# services gate parks and the drain auto-lands ready spokes, so only blocked/<N>
+# (the escalation a human must act on) should ping; attended, every class pings.
+afk_state_file="${AFK_STATE:-$common_dir/.afk-state}"
+afk_active=0
+if [ -f "$afk_state_file" ] \
+  && [ -n "$(head -n1 "$afk_state_file" 2>/dev/null | tr -d '[:space:]')" ]; then
+  afk_active=1
+fi
+
 # notify <message> — fire exactly one OS notification. HUB_NOTIFY_CMD (an
 # executable receiving the message as $1) overrides the default osascript for
 # tests and non-macOS hosts. Never let a notifier failure abort the watcher.
@@ -119,6 +131,11 @@ while IFS=' ' read -r tag sha; do
   # Already seen at this exact sha → steady state, not a new transition. A
   # force-moved marker has a fresh sha and falls through as newly fired.
   if printf '%s\n' "$seen" | grep -qxF "$tag $sha"; then
+    continue
+  fi
+  # Under a live drain, suppress everything but blocked/<N>. The marker is still
+  # persisted as seen below, so it never re-pings once attended resumes.
+  if [ "$afk_active" -eq 1 ] && [ "$kind" != "blocked" ]; then
     continue
   fi
   msg="$(message_for "$kind" "$issue" "$tag")"
