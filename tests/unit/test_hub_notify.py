@@ -60,6 +60,7 @@ def _run(
     tmp_path: Path,
     *,
     seen_file: Path | None = None,
+    afk: bool = False,
     env_extra: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     """Run hub-notify.sh, capturing each fired notification's message.
@@ -78,6 +79,14 @@ def _run(
         "HUB_NOTIFY_CMD": str(notifier),
     }
     env.pop("AI_TOOLKIT_BASE_BRANCH", None)
+    # Control afk-mode deterministically: pop any inherited state, then arm a
+    # drain window (a non-empty .afk-state, matching hub-afk's convention) only
+    # when the test asks for it.
+    env.pop("AFK_STATE", None)
+    if afk:
+        afk_state = tmp_path / "afk-state"
+        afk_state.write_text("drain\n")
+        env["AFK_STATE"] = str(afk_state)
     if env_extra:
         env.update(env_extra)
 
@@ -219,3 +228,41 @@ def test_no_markers_fires_nothing(hub: Path, tmp_path: Path) -> None:
 
     assert proc.returncode == 0
     assert messages == []
+
+
+# Mode-aware gating (issue #146): under a live /afk drain the answerer services
+# gate parks and the drain auto-lands ready spokes, so only blocked/<N> (the
+# escalation a human must act on) pings. Attended, every class pings.
+def test_afk_suppresses_gate_ping(hub: Path, tmp_path: Path) -> None:
+    _git(hub, "tag", "-a", "-m", "plan", "gate/1", "feature/1-work")
+
+    _proc, messages = _run(hub, tmp_path, afk=True)
+
+    assert messages == []
+
+
+def test_afk_suppresses_ready_ping(hub: Path, tmp_path: Path) -> None:
+    _git(hub, "tag", "ready/1", "feature/1-work")
+
+    _proc, messages = _run(hub, tmp_path, afk=True)
+
+    assert messages == []
+
+
+def test_afk_still_fires_blocked(hub: Path, tmp_path: Path) -> None:
+    _git(hub, "tag", "-a", "-m", "blocked", "-m", "stuck", "blocked/1", "feature/1-work")
+
+    _proc, messages = _run(hub, tmp_path, afk=True)
+
+    assert len(messages) == 1
+    assert "#1" in messages[0]
+    assert "BLOCKED" in messages[0]
+
+
+def test_attended_fires_gate_when_no_afk_window(hub: Path, tmp_path: Path) -> None:
+    _git(hub, "tag", "-a", "-m", "plan", "gate/1", "feature/1-work")
+
+    _proc, messages = _run(hub, tmp_path, afk=False)
+
+    assert len(messages) == 1
+    assert "parked" in messages[0].lower()
