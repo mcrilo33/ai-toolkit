@@ -595,3 +595,27 @@ def test_next_batch_skill_documents_dispatch() -> None:
 
     assert "batch-plan.sh" in skill, "the skill must run batch-plan.sh"
     assert "worktree-new.sh" in skill, "the skill must dispatch via worktree-new.sh"
+
+
+# ── doc guards: blocked-by is a checked step at creation (issue #148) ──────────
+
+
+def test_start_task_requires_blocked_by_question() -> None:
+    # Filing must ASK the ordering question, the same status as the mandatory Scope:.
+    skill = (SKILLS_DIR / "start-task" / "SKILL.md").read_text()
+
+    assert "Does this depend on open work" in skill, (
+        "start-task must pose the blocked-by question as a required step"
+    )
+    assert "required step" in skill, "the blocked-by step must be labelled required"
+
+
+def test_issue_hygiene_documents_blocked_by_creation_step() -> None:
+    # The rule must record blocked-by as a checked step and state the planner guarantee.
+    rule = (REPO_ROOT / "shared" / "rules" / "issue-hygiene.md").read_text()
+
+    assert "checked step" in rule, "blocked-by must be documented as a checked step"
+    assert "What the planner guarantees" in rule, "the ordering guarantee must be documented"
+    assert "never dispatches an issue while" in rule, (
+        "the rule must state the never-before-a-blocker guarantee"
+    )
