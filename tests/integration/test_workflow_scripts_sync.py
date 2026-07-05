@@ -35,6 +35,9 @@ WORKTREE_SCRIPTS = (
     "spoke-ready.sh",
     "telemetry-ingest-spoke.sh",
     "worktree-quick.sh",
+    # The land tail's conditional post-land sweep worker (issue #124) — must
+    # resolve at .ai-toolkit/scripts/ or every land logs "sweep failed to launch".
+    "gate-sweep.sh",
 )
 SOURCES = {name: REPO_ROOT / "scripts" / name for name in WORKTREE_SCRIPTS}
 HUB_SCRIPTS_DIR = REPO_ROOT / "shared" / "skills" / "hub" / "scripts"
