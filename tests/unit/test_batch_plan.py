@@ -210,6 +210,15 @@ def test_unrelated_label_does_not_change_dispatch() -> None:
     assert batch == [1]
 
 
+def test_hold_label_is_case_insensitive_among_other_labels() -> None:
+    # The label match is case-folded and holds regardless of sibling labels.
+    nodes = [_node(1, "a.py", labels=["enhancement", "HOLD"]), _node(2, "b.py")]
+
+    batch = _plan(nodes)
+
+    assert batch == [2], "a HOLD-labelled issue is excluded even alongside other labels"
+
+
 # ── merge-candidate lint: colliding-scope serialized chains warn (issue #125) ─
 
 

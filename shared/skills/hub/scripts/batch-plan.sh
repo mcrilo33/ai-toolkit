@@ -54,7 +54,8 @@ repo_slug() {
 }
 
 # fetch_issues -> the JSON array of open-issue nodes, each:
-#   { number, body, blockedBy: { nodes: [ { number, state } ] } }
+#   { number, body, labels: { nodes: [ { name } ] },
+#     blockedBy: { nodes: [ { number, state } ] } }
 # ONE `gh api graphql` round-trip. `--jq` extracts the nodes array so plan_from_json
 # reads exactly the shape the tests build by hand.
 fetch_issues() {
