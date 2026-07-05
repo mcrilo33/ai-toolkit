@@ -36,6 +36,7 @@ GIT_PUSH_REVIEW = HOOKS_DIR / "git-push-review.sh"
 REVIEW_WINDOW_OPEN = HOOKS_DIR / "review-window-open.sh"
 COMMIT_GAUNTLET = HOOKS_DIR / "commit-gauntlet.sh"
 RED_PROOF_VERIFY = HOOKS_DIR / "red-proof-verify.sh"
+SPOKE_PUSH = ROOT / "scripts" / "spoke-push.sh"
 
 
 def _env(telemetry_dir: Path, *, enabled: bool = True) -> dict[str, str]:
@@ -298,3 +299,129 @@ class TestCycleStepMarkerHelper:
         _mark("push", "", git_env, repo)
 
         assert len(_steps(telemetry_dir)) == 2
+
+
+# ── #139 ST2: spoke-push.sh emits step:push once per pushed HEAD ─────────────
+#
+# Hermetic setup mirrors test_spoke_push.py: a local bare ``origin`` (no
+# network) and a feature-branch checkout, git config pinned to nothing so a
+# host's global/system config never reaches the fixture repo.
+
+
+def _push_env(telemetry_dir: Path) -> dict[str, str]:
+    return {
+        **_env(telemetry_dir),
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+    }
+
+
+@pytest.fixture()
+def push_repo(tmp_path: Path, telemetry_dir: Path) -> Path:
+    """A feature-branch checkout with a local bare ``origin``."""
+    env = _push_env(telemetry_dir)
+    remote = tmp_path / "remote.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", str(remote)], check=True, capture_output=True, env=env
+    )
+    repo = tmp_path / "spoke"
+
+    def _git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=str(repo), check=True, capture_output=True, env=env)
+
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)], check=True, capture_output=True, env=env
+    )
+    for k, v in (("user.email", "t@t.t"), ("user.name", "t"), ("commit.gpgsign", "false")):
+        _git("config", k, v)
+    (repo / "README.md").write_text("seed\n")
+    _git("add", "README.md")
+    _git("commit", "-qm", "chore: seed")
+    _git("remote", "add", "origin", str(remote))
+    _git("checkout", "-q", "-b", "feature/139-step-push")
+    (repo / "work.txt").write_text("work\n")
+    _git("add", "work.txt")
+    _git("commit", "-qm", "feat: work")
+    return repo
+
+
+def _spoke_push(repo: Path, telemetry_dir: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", str(SPOKE_PUSH)],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env=_push_env(telemetry_dir),
+    )
+
+
+def _commit_more(repo: Path, telemetry_dir: Path, content: str) -> None:
+    env = _push_env(telemetry_dir)
+    (repo / "work.txt").write_text(content)
+    subprocess.run(
+        ["git", "add", "work.txt"], cwd=str(repo), check=True, capture_output=True, env=env
+    )
+    subprocess.run(
+        ["git", "commit", "-qm", "feat: more"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+
+class TestSpokePushEmitsStepPush:
+    def test_successful_push_emits_step_push_once(
+        self, push_repo: Path, telemetry_dir: Path
+    ) -> None:
+        result = _spoke_push(push_repo, telemetry_dir)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        steps = _steps(telemetry_dir)
+        assert len(steps) == 1
+        assert steps[0]["phase"] == "push"
+        assert steps[0]["name"] == "solo-cycle"
+
+    def test_sentinel_records_pushed_head(self, push_repo: Path, telemetry_dir: Path) -> None:
+        _spoke_push(push_repo, telemetry_dir)
+
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(push_repo),
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert _sentinel(push_repo, "push").read_text().strip() == head
+
+    def test_repush_same_head_emits_no_duplicate(
+        self, push_repo: Path, telemetry_dir: Path
+    ) -> None:
+        _spoke_push(push_repo, telemetry_dir)
+        result = _spoke_push(push_repo, telemetry_dir)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert len(_steps(telemetry_dir)) == 1
+
+    def test_new_commit_push_emits_again(self, push_repo: Path, telemetry_dir: Path) -> None:
+        _spoke_push(push_repo, telemetry_dir)
+        _commit_more(push_repo, telemetry_dir, "more\n")
+        _spoke_push(push_repo, telemetry_dir)
+
+        assert len(_steps(telemetry_dir)) == 2
+
+    def test_refused_push_emits_no_marker(self, push_repo: Path, telemetry_dir: Path) -> None:
+        # On the default branch the script refuses before pushing — no PUSH
+        # step happened, so no marker may be emitted.
+        env = _push_env(telemetry_dir)
+        subprocess.run(
+            ["git", "checkout", "-q", "main"],
+            cwd=str(push_repo),
+            check=True,
+            capture_output=True,
+            env=env,
+        )
+
+        result = _spoke_push(push_repo, telemetry_dir)
+
+        assert result.returncode != 0
+        assert _steps(telemetry_dir) == []
