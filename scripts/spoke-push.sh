@@ -99,6 +99,16 @@ fi
 echo "→ git push -u origin $BRANCH"
 AI_TOOLKIT_PARENT_SPAN="$_SP_SPAN_ID" wt_git_push -u origin "$BRANCH"
 
+# Cycle-step marker (#139): a successful ship push IS the solo-cycle PUSH step,
+# so its container in the spokecycle- trace is populated with no manual marker
+# call. Idempotent on the pushed HEAD (the helper's default key): a retry or a
+# --ready re-run at the same tip emits nothing. Before the spoke-ready block so
+# the step is recorded even when the marker emission then fails. Guarded like
+# the script span below — a missing emit layer must not fail the push.
+if command -v telemetry_mark_cycle_step >/dev/null 2>&1; then
+  telemetry_mark_cycle_step push "" "$_SP_T0"
+fi
+
 # Final subtask: emit the ready/<issue> completion marker via the canonical
 # marker emitter (issue #45) — one annotated, force-moved (idempotent) tag pushed
 # as a tag-only push the pre-push gate short-circuits. spoke-ready.sh is
