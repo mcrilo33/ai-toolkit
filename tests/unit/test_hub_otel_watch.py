@@ -413,3 +413,175 @@ def test_daemon_cli_dispatch_reports_already_running(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "already running" in result.stdout + result.stderr
+
+
+# ── spawn-time auto-arm (#138 ST2): wt_otel_watch_arm in worktree-lib.sh ─────
+#
+# worktree-new.sh arms `hub-otel-watch.sh --daemon` at every spoke spawn via
+# wt_otel_watch_arm, so the watchdog exists whenever a spoke does — no human,
+# no /loop. The arm is best-effort (never fails the spawn), a no-op unless
+# AI_TOOLKIT_OTEL=1 or while a live daemon already holds the pidfile, and must
+# forward AI_TOOLKIT_OTEL + LANGFUSE_BASIC_AUTH to the detached child even when
+# the caller never exported them (worktree-new.sh's assignment is unexported).
+# Tests live here (not test_worktree_lib.py) per the issue #138 scope list.
+
+WORKTREE_LIB = REPO_ROOT / "scripts" / "worktree-lib.sh"
+WORKTREE_NEW = REPO_ROOT / "scripts" / "worktree-new.sh"
+
+# Env vars that would let the HOST steer an arm test (a real daemon's pidfile,
+# the operator's OTel opt-in/secret) — always popped, then set per test.
+_ARM_HOST_VARS = (
+    "AI_TOOLKIT_OTEL",
+    "LANGFUSE_BASIC_AUTH",
+    "HUB_OTEL_WATCH_BIN",
+    "HUB_OTEL_WATCH_PIDFILE",
+    "HUB_OTEL_WATCH_LOG",
+)
+
+
+def _write_arm_stub(path: Path, record: Path) -> None:
+    """A hub-otel-watch.sh stand-in that records its argv and the env it saw."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s|%s|%s\\n" "$*" "${{AI_TOOLKIT_OTEL:-}}" "${{LANGFUSE_BASIC_AUTH:-}}" > "{record}"\n'
+    )
+    path.chmod(0o755)
+
+
+def _call_arm(body: str) -> subprocess.CompletedProcess[str]:
+    """Source worktree-lib.sh and run a shell body with host arm-vars stripped."""
+    env = {**os.environ}
+    for k in _ARM_HOST_VARS:
+        env.pop(k, None)
+    return subprocess.run(
+        ["bash", "-c", f'source "{WORKTREE_LIB}"; {body}'],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=15,
+    )
+
+
+def _wait_for(path: Path, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.02)
+    return path.exists()
+
+
+def test_watch_arm_launches_daemon_with_env_forwarded(tmp_path: Path) -> None:
+    # Opted in, no live daemon → launch `<bin> --daemon` detached, and the child
+    # sees AI_TOOLKIT_OTEL + LANGFUSE_BASIC_AUTH even though the caller never
+    # exported them (plain shell assignments, as in worktree-new.sh).
+    record = tmp_path / "record"
+    stub = tmp_path / "hub-otel-watch.sh"
+    _write_arm_stub(stub, record)
+    parts = [
+        "AI_TOOLKIT_OTEL=1",
+        "LANGFUSE_BASIC_AUTH=sekret",
+        f'HUB_OTEL_WATCH_BIN="{stub}"',
+        f'HUB_OTEL_WATCH_PIDFILE="{tmp_path / "watch.pid"}"',
+        f'wt_otel_watch_arm "{tmp_path}"',
+    ]
+    result = _call_arm("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert _wait_for(record), "arm never invoked the watch script"
+    argv, otel, auth = record.read_text().strip().split("|")
+    assert "--daemon" in argv.split()
+    assert otel == "1"
+    assert auth == "sekret"
+
+
+@pytest.mark.parametrize("optout", ["", "0"])
+def test_watch_arm_noop_unless_opted_in(tmp_path: Path, optout: str) -> None:
+    # AI_TOOLKIT_OTEL unset or an explicit 0 → never launch anything, still rc 0
+    # (the arm must not fail the spawn).
+    record = tmp_path / "record"
+    stub = tmp_path / "hub-otel-watch.sh"
+    _write_arm_stub(stub, record)
+    setter = f"AI_TOOLKIT_OTEL={optout}" if optout else "unset AI_TOOLKIT_OTEL"
+    parts = [
+        setter,
+        f'HUB_OTEL_WATCH_BIN="{stub}"',
+        f'HUB_OTEL_WATCH_PIDFILE="{tmp_path / "watch.pid"}"',
+        f'wt_otel_watch_arm "{tmp_path}"',
+    ]
+    result = _call_arm("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    time.sleep(0.5)
+    assert not record.exists()
+
+
+def test_watch_arm_skips_when_daemon_already_live(tmp_path: Path) -> None:
+    # The pidfile names a live pid → an armed watchdog already runs; N spoke
+    # spawns must not stack N daemons (nor even fork a doomed child).
+    record = tmp_path / "record"
+    stub = tmp_path / "hub-otel-watch.sh"
+    _write_arm_stub(stub, record)
+    pidfile = tmp_path / "watch.pid"
+    parts = [
+        "AI_TOOLKIT_OTEL=1",
+        f'HUB_OTEL_WATCH_BIN="{stub}"',
+        f'HUB_OTEL_WATCH_PIDFILE="{pidfile}"',
+        f'printf "%s" "$$" > "{pidfile}"',
+        f'wt_otel_watch_arm "{tmp_path}"',
+    ]
+    result = _call_arm("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    time.sleep(0.5)
+    assert not record.exists()
+
+
+def test_watch_arm_warns_but_never_fails_when_script_missing(tmp_path: Path) -> None:
+    # No resolvable hub-otel-watch.sh under the repo root (and no override) →
+    # warn on stderr, return 0: capture degrades loudly, the spawn proceeds.
+    parts = [
+        "AI_TOOLKIT_OTEL=1",
+        f'HUB_OTEL_WATCH_PIDFILE="{tmp_path / "watch.pid"}"',
+        f'wt_otel_watch_arm "{tmp_path}"',
+    ]
+    result = _call_arm("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "hub-otel-watch" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [
+        "shared/skills/hub/scripts",
+        ".ai-toolkit/scripts",
+        ".claude/skills/hub/scripts",
+    ],
+)
+def test_watch_arm_resolves_repo_layouts(tmp_path: Path, layout: str) -> None:
+    # Without an override the arm finds the watch script in the ai-toolkit
+    # checkout AND in synced-target layouts (hub-*.sh live in .ai-toolkit/scripts
+    # and .claude/skills/hub/scripts there).
+    record = tmp_path / "record"
+    _write_arm_stub(tmp_path / layout / "hub-otel-watch.sh", record)
+    parts = [
+        "AI_TOOLKIT_OTEL=1",
+        f'HUB_OTEL_WATCH_PIDFILE="{tmp_path / "watch.pid"}"',
+        f'wt_otel_watch_arm "{tmp_path}"',
+    ]
+    result = _call_arm("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert _wait_for(record), f"arm did not resolve {layout}"
+
+
+def test_worktree_new_arms_watchdog_after_preflights() -> None:
+    # The spawn path must arm the daemon (unconditionally at top level — the
+    # function self-gates on AI_TOOLKIT_OTEL), and must do so AFTER the one-shot
+    # preflight pair / the tmux spawn so the daemon's first tick can already see
+    # the new spoke pane.
+    text = WORKTREE_NEW.read_text()
+    assert 'wt_otel_watch_arm "$REPO_ROOT"' in text
+    assert text.index("wt_otel_watch_arm") > text.index('wt_otel_bridge_preflight "$REPO_ROOT"')
