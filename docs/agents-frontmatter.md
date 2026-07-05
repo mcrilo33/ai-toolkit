@@ -131,29 +131,30 @@ security-reviewer → debug → code-review
 
 ## Model and effort assignment
 
-Each agent is matched to a model and effort level by **role type**, following the
-"strong models for leads/reviewers, cheaper models for mechanical builders"
-pattern. Reasoning-heavy roles whose output gates everything downstream get
-`opus` + `high`; deliberately minimal or mechanical roles get `sonnet`/`haiku` at
-a lower effort.
+Each agent is matched to a model by **role type**, treating Fable as the scarce
+currency (issue #141): only the design/plan roles whose output gates everything
+downstream get `claude-fable-5`; reasoning-heavy execution roles get
+`claude-opus-4-8` (plentiful); capable-but-routine roles get `claude-sonnet-5`;
+Haiku is reserved — no current role is provably trivial. Effort is `max`
+everywhere.
 
 | Agent | Model | Effort | Rationale |
 | ----- | ----- | ------ | --------- |
-| `architect` | `claude-fable-5` | `xhigh` | System design needs the strongest reasoning |
-| `planner` | `claude-fable-5` | `xhigh` | Decomposition quality gates all downstream work |
-| `code-review` | `claude-fable-5` | `xhigh` | Catching subtle bugs needs strong reasoning |
-| `security-reviewer` | `claude-fable-5` | `xhigh` | Highest stakes; assumes hostile code |
-| `debug` | `claude-fable-5` | `xhigh` | Root-cause investigation is hard |
-| `refactor` | `claude-fable-5` | `high` | Wide but mechanical; needs care, not genius |
-| `tdd-red` | `claude-fable-5` | `high` | Behaviour specification, moderate reasoning |
-| `tdd-green` | `claude-sonnet-4-6` | `low` | Deliberately minimal — over-thinking is a bug |
-| `tdd-refactor` | `claude-fable-5` | `high` | Quality pass with tests already green |
-| `devops` | `claude-fable-5` | `high` | Careful but bounded |
-| `documentation` | `claude-sonnet-4-6` | `low` | Cheapest; reads code, writes prose |
+| `architect` | `claude-fable-5` | `max` | System design needs the strongest reasoning |
+| `planner` | `claude-fable-5` | `max` | Decomposition quality gates all downstream work |
+| `code-review` | `claude-opus-4-8` | `max` | Catching subtle bugs needs strong reasoning |
+| `security-reviewer` | `claude-opus-4-8` | `max` | Highest stakes; assumes hostile code |
+| `debug` | `claude-opus-4-8` | `max` | Root-cause investigation is hard |
+| `tdd-red` | `claude-opus-4-8` | `max` | Behaviour specification gates the implementation |
+| `devops` | `claude-opus-4-8` | `max` | Careful but bounded |
+| `refactor` | `claude-sonnet-5` | `max` | Wide but mechanical; needs care, not genius |
+| `tdd-green` | `claude-sonnet-5` | `max` | Deliberately minimal — over-thinking is a bug |
+| `tdd-refactor` | `claude-sonnet-5` | `max` | Quality pass with tests already green |
+| `documentation` | `claude-sonnet-5` | `max` | Reads code, writes prose |
 
 These are declared **only under the `claude:` override block** in
 `shared/agents/metadata.yml`. Full model IDs (`claude-fable-5`,
-`claude-sonnet-4-6`) and the `effort` field are Claude-specific — Cursor's
+`claude-sonnet-5`) and the `effort` field are Claude-specific — Cursor's
 `model` accepts only `inherit`/`fast`/model-id, and `effort` is not a Cursor or
 Copilot field. Scoping them to `claude:` keeps invalid values out of the other
 platforms' frontmatter. The values are a tunable policy choice; adjust them per
