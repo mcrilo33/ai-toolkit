@@ -8,14 +8,14 @@
 # worktree-land.sh calls this once, best-effort, AFTER the spoke's work has merged
 # and pushed but BEFORE the tmux/worktree teardown — while the worktree (and its
 # minted spoke identity + raw request bodies) still exists. The live OTel push
-# (worktree-new.sh, AI_TOOLKIT_OTEL=1) only streams native traces; two post-run
-# steps complete the picture, so no operator ever has to hand-run them:
+# (worktree-new.sh, AI_TOOLKIT_OTEL=1) only streams native traces; one post-run
+# step completes the picture, so no operator ever has to hand-run it:
 #
 #   (#87) langfuse_spoke_tree.py — itemizes the loaded context (per tool/rule/skill
-#         SCHEMA token sizes) from the raw request bodies the spoke dumped on disk.
-#   (#92) langfuse_backfill.py --thinking — adds extended-thinking, true causal
-#         uuid/parentUuid edges, and coverage of un-instrumented sessions from the
-#         transcript.
+#         SCHEMA token sizes) from the raw request bodies the spoke dumped on disk,
+#         and builds the spoketree-/spokecycle- views. The transcript backfill
+#         (#92, langfuse_backfill.py) was retired in #140 — live capture is
+#         complete by construction, so there is nothing left to heal.
 #
 # Contract: this NEVER fails the land. It gates, warns, and returns 0 on every
 # path — a missing id, a not-an-OTel spoke, no Langfuse auth, or a failing step.
@@ -99,8 +99,8 @@ FLUSH_WAIT="${AI_TOOLKIT_INGEST_FLUSH_WAIT:-3}"
 export LANGFUSE_HOST="${LANGFUSE_HOST:-http://localhost:3000}"
 export PYTHONPATH="$(dirname "$TELEMETRY_DIR")${PYTHONPATH:+:$PYTHONPATH}"
 
-# Each step is best-effort: warn on failure, press on to the next, return 0.
-# UPGRADE: wrap each step in `timeout` (when available — macOS has none by default)
+# The step is best-effort: warn on failure, return 0.
+# UPGRADE: wrap the step in `timeout` (when available — macOS has none by default)
 # if a slow/unreachable LANGFUSE_HOST ever stalls a land between push and teardown.
 run_step() {
   local label="$1"; shift
@@ -114,11 +114,5 @@ run_step() {
 run_step "loaded-context itemization (#87)" \
   "$TELEMETRY_DIR/langfuse_spoke_tree.py" "$SPOKE_RUN_ID" \
   --request-bodies "$BODY_DIR" --root "$WT_DIR"
-# --worktree scopes the transcript backfill to THIS spoke's own Claude Code project dir
-# (derived from WT_DIR), so it reads only the spoke's sessions/resumes — never the hub or
-# sibling worktrees. Without it the backfill scans every session on the machine and
-# cross-attaches unrelated reasoning/content (Issues #92/#98).
-run_step "transcript backfill (#92)" \
-  "$TELEMETRY_DIR/langfuse_backfill.py" "$SPOKE_RUN_ID" --thinking --worktree "$WT_DIR"
 
 exit 0
