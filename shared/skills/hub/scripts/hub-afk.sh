@@ -170,7 +170,7 @@ afk_state_file() {
 
 afk_write_state() { printf '%s\n' "$1" > "$(afk_state_file)"; }
 afk_read_state()  { local f; f="$(afk_state_file)"; [ -f "$f" ] && head -n1 "$f" 2>/dev/null | tr -d '[:space:]' || true; }
-afk_clear_state() { rm -f "$(afk_state_file)" 2>/dev/null || true; afk_clear_heartbeat; _afk_clear_unattended; }
+afk_clear_state() { rm -f "$(afk_state_file)" 2>/dev/null || true; afk_clear_heartbeat; }
 
 # --- heartbeat (issue #107) ---------------------------------------------------
 # Each supervisor tick stamps "<pid> <last_tick_epoch>" here so a second shell (and the
@@ -217,18 +217,6 @@ _afk_heartbeat_age_minutes() {
   case "$tick" in '' | *[!0-9]*) return 0 ;; esac
   printf '%s\n' "$(( ($(afk_now) - tick) / 60 ))"
 }
-
-# --- unattended marker --------------------------------------------------------
-# While a window is armed the supervisor drops a marker under the git common dir (shared
-# with every spoke worktree). anti-gutting-scan.sh reads it to fail CLOSED on a
-# test-gutting diff for /afk-dispatched spokes — no human is watching to catch it (#74).
-_afk_unattended_marker() { printf '%s\n' "$(_afk_state_dir)/unattended"; }
-_afk_set_unattended() {
-  local m; m="$(_afk_unattended_marker)"
-  mkdir -p "$(dirname "$m")" 2>/dev/null || true
-  : > "$m" 2>/dev/null || true
-}
-_afk_clear_unattended() { rm -f "$(_afk_unattended_marker)" 2>/dev/null || true; }
 
 # --- per-spoke dispatch epochs (the wall-clock reap reference) ----------------
 # Also the record of WHICH issues THIS run dispatched: a dispatch epoch exists only for
@@ -1275,6 +1263,33 @@ _ready_at_tip() {
   [ -n "$marker" ] && [ "$marker" = "$tip" ]
 }
 
+# _afk_review_verdict <wt> -> the verdict of the spoke's most-recent code-review artifact
+# (APPROVE | REQUEST_CHANGES), or empty when no `.review/*.json` exists. Review evidence is
+# written per reviewed diff as `.review/<hash>.json` by the review-stamp MCP; the LATEST by
+# ISO-8601 `timestamp` wins, so a spoke that earned a REQUEST_CHANGES and then fixed it (a
+# newer APPROVE) reads clean. Pure bash + grep (no jq dependency); ISO-8601 Z timestamps
+# sort chronologically as plain strings.
+# UPGRADE: this trusts an artifact's verdict field WITHOUT checking its HMAC signature (the
+#   advisory reviewer-sep push gate is the authenticity layer today) and picks by timestamp,
+#   not by binding to the pushed diff. Binding to the tip diff hash (utils.sh review_diff_hash
+#   <wt> <base> range) AND verifying the signature would close both the "APPROVE then gut
+#   before ready" ordering and the forge-an-APPROVE axis — once hub-afk can share utils.sh's
+#   hash + verify recipe without its source-time side effects (set -e + per-hook span arm).
+_afk_review_verdict() {
+  local wt="$1"
+  local dir="$wt/.review" f ts v latest="" verdict=""
+  [ -d "$dir" ] || { printf '%s' ""; return 0; }
+  for f in "$dir"/*.json; do
+    [ -f "$f" ] || continue
+    v="$(grep -oE '"verdict"[[:space:]]*:[[:space:]]*"[^"]*"' "$f" | head -1 | sed 's/.*: *"//;s/"$//')"
+    [ -n "$v" ] || continue
+    ts="$(grep -oE '"timestamp"[[:space:]]*:[[:space:]]*"[^"]*"' "$f" | head -1 | sed 's/.*: *"//;s/"$//')"
+    ts="${ts:-0000}"   # a timestamp-less artifact sorts lowest — never wins over a stamped one
+    if [ -z "$latest" ] || [[ "$ts" > "$latest" ]]; then latest="$ts"; verdict="$v"; fi
+  done
+  printf '%s' "$verdict"
+}
+
 # auto_land -> land every ready/<issue> spoke. The ready/<issue> marker is the readiness
 # contract (enforced by _ready_at_tip above), so a foreign ready/<issue> left by a parallel
 # session is adopted and landed by default (#95). A failed land (merge conflict / suite
@@ -1282,8 +1297,13 @@ _ready_at_tip() {
 # dependents' blockers for the next tick's plan. Set AFK_LAND_FOREIGN=0 to restore the
 # dispatched-only isolation (skip any ready/<issue> with no dispatch epoch) so concurrent
 # sessions don't surprise-land each other's work (#74).
+#
+# The reasoning code-review verdict is the /afk test-gutting gate (#143): the mechanical
+# anti-gutting scan is advisory now, so auto_land lands ONLY on a clean APPROVE verdict —
+# a REQUEST_CHANGES (the reviewer flagged gutting) or no review at all escalates to
+# blocked/<issue> instead. Set AFK_REVIEW_GATE=0 to restore the pre-#143 land-without-review.
 auto_land() {
-  local wt_land path issue
+  local wt_land path issue verdict
   wt_land="$(_afk_find_script "${WT_LAND:-}" worktree-land.sh)" || { log "worktree-land.sh not found — skipping land"; return 0; }
   while IFS=$'\t' read -r path issue; do
     [ -n "$issue" ] || continue
@@ -1291,6 +1311,14 @@ auto_land() {
     if [ "${AFK_LAND_FOREIGN:-1}" = "0" ] && [ -z "$(read_dispatch_epoch "$issue")" ]; then
       log "  skip land #$issue — foreign (no dispatch epoch) and AFK_LAND_FOREIGN=0"
       continue
+    fi
+    if [ "${AFK_REVIEW_GATE:-1}" != "0" ]; then
+      verdict="$(_afk_review_verdict "$path")"
+      if [ "$verdict" != "APPROVE" ]; then
+        _escalate_blocked "$path" "$issue" \
+          "code-review verdict not clean (${verdict:-no review}) — possible test-gutting, needs a human"
+        continue
+      fi
     fi
     log "→ land #$issue"
     if _afk_run_with_heartbeat bash "$wt_land" "$issue" >/dev/null 2>&1; then
@@ -1804,7 +1832,6 @@ main() {
     _clear_progress_state    # fresh window ⇒ no stale progress / answer-attempt epochs
     _clear_resume_markers    # fresh window ⇒ every spoke gets its one auto-resume again
     _clear_blocked_records   # fresh window ⇒ --status shows only THIS run's durable blocks
-    _afk_set_unattended      # arm the fail-closed anti-gutting tripwire for spokes
     log "/afk: armed ($([ "$end" = drain ] && echo 'drain — until the backlog is empty' || echo "until $(wt_date_ymd "$end") $(date -r "$end" +%H:%M 2>/dev/null || date -d "@$end" +%H:%M)"))"
   fi
 

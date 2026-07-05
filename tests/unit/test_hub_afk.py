@@ -2066,8 +2066,163 @@ def _land_recorder(tmp_path: Path) -> tuple[Path, Path]:
     return stub, land_log
 
 
+def _write_review(wt: Path, name: str, verdict: str, ts: str) -> None:
+    """Write a code-review evidence artifact (.review/<name>.json) for auto_land's gate."""
+    review = wt / ".review"
+    review.mkdir(exist_ok=True)
+    (review / f"{name}.json").write_text(
+        json.dumps(
+            {"verdict": verdict, "timestamp": ts, "summary": "review", "reviewer": "code-review"}
+        )
+        + "\n"
+    )
+
+
+def _seed_clean_review(wt: Path) -> None:
+    """The common case: a single clean APPROVE artifact so the review gate lets a land through."""
+    _write_review(wt, "approve", "APPROVE", "2026-07-05T00:00:00Z")
+
+
+def _escalation_recorder(tmp_path: Path) -> tuple[Path, Path]:
+    """A spoke-ready.sh stub recording its args, to assert a blocked/<issue> escalation."""
+    ready_log = tmp_path / "ready.log"
+    stub = tmp_path / "spoke-ready.sh"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    stub.chmod(0o755)
+    return stub, ready_log
+
+
+# ── auto_land gates on the code-review verdict (issue #143) ───────────────────
+# The mechanical anti-gutting scan is advisory now, so the reasoning code-review verdict
+# is the /afk test-gutting gate: auto_land reads the spoke's most-recent .review/<hash>.json
+# and lands ONLY on a clean APPROVE. A REQUEST_CHANGES (the reviewer flagged gutting) or no
+# review at all escalates to blocked/<issue> instead of landing. The verdict is latest-wins
+# by ISO-8601 timestamp, so a REQUEST_CHANGES later fixed (a newer APPROVE) still lands.
+
+
+def test_auto_land_lands_on_clean_approve(spoke_repo: Path, tmp_path: Path) -> None:
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
+    wt_land, land_log = _land_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(expr, env={"WT_LAND": str(wt_land), "AFK_STATE_DIR": str(statedir)})
+
+    assert land_log.read_text().split() == ["5"], "a clean APPROVE verdict must land"
+
+
+def test_auto_land_escalates_on_request_changes(spoke_repo: Path, tmp_path: Path) -> None:
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    # Latest-wins: an older APPROVE then a newer REQUEST_CHANGES ⇒ the reviewer's FINAL
+    # verdict is REQUEST_CHANGES, so the spoke must be escalated, not landed.
+    _write_review(spoke_repo, "old", "APPROVE", "2026-07-05T00:00:00Z")
+    _write_review(spoke_repo, "new", "REQUEST_CHANGES", "2026-07-05T01:00:00Z")
+    wt_land, land_log = _land_recorder(tmp_path)
+    ready_stub, ready_log = _escalation_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "SPOKE_READY": str(ready_stub),
+            "AFK_STATE_DIR": str(statedir),
+        },
+    )
+
+    assert not land_log.exists() or land_log.read_text().strip() == "", (
+        "a REQUEST_CHANGES verdict must NOT land"
+    )
+    assert "--blocked 5" in ready_log.read_text(), (
+        "a REQUEST_CHANGES verdict must escalate to blocked"
+    )
+
+
+def test_auto_land_escalates_when_no_review(spoke_repo: Path, tmp_path: Path) -> None:
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    # No .review artifact at all ⇒ no clean review exists ⇒ escalate, never land.
+    wt_land, land_log = _land_recorder(tmp_path)
+    ready_stub, ready_log = _escalation_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "SPOKE_READY": str(ready_stub),
+            "AFK_STATE_DIR": str(statedir),
+        },
+    )
+
+    assert not land_log.exists() or land_log.read_text().strip() == "", (
+        "a spoke with no code-review artifact must NOT land"
+    )
+    assert "--blocked 5" in ready_log.read_text(), "no review ⇒ escalate to blocked"
+
+
+def test_auto_land_escalates_when_review_dir_empty(spoke_repo: Path, tmp_path: Path) -> None:
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    (spoke_repo / ".review").mkdir()  # present but no artifacts ⇒ no verdict ⇒ escalate
+    wt_land, land_log = _land_recorder(tmp_path)
+    ready_stub, ready_log = _escalation_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "SPOKE_READY": str(ready_stub),
+            "AFK_STATE_DIR": str(statedir),
+        },
+    )
+
+    assert not land_log.exists() or land_log.read_text().strip() == "", (
+        "an empty .review dir must NOT land"
+    )
+    assert "--blocked 5" in ready_log.read_text(), "an empty .review dir ⇒ escalate to blocked"
+
+
+def test_auto_land_lands_after_fix_supersedes_changes(spoke_repo: Path, tmp_path: Path) -> None:
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    # A REQUEST_CHANGES later fixed: the newer APPROVE wins (latest timestamp), so the
+    # spoke lands — a fixed spoke is not stranded on a superseded change-request.
+    _write_review(spoke_repo, "old", "REQUEST_CHANGES", "2026-07-05T00:00:00Z")
+    _write_review(spoke_repo, "new", "APPROVE", "2026-07-05T02:00:00Z")
+    wt_land, land_log = _land_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(expr, env={"WT_LAND": str(wt_land), "AFK_STATE_DIR": str(statedir)})
+
+    assert land_log.read_text().split() == ["5"], (
+        "a newer APPROVE must supersede an older REQUEST_CHANGES"
+    )
+
+
+def test_auto_land_review_gate_opt_out_lands_without_review(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # AFK_REVIEW_GATE=0 restores the pre-#143 behavior: land without consulting a review.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    wt_land, land_log = _land_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(
+        expr,
+        env={"WT_LAND": str(wt_land), "AFK_STATE_DIR": str(statedir), "AFK_REVIEW_GATE": "0"},
+    )
+
+    assert land_log.read_text().split() == ["5"], "AFK_REVIEW_GATE=0 lands without a review"
+
+
 def test_auto_land_lands_foreign_ready_spoke_by_default(spoke_repo: Path, tmp_path: Path) -> None:
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
     wt_land, land_log = _land_recorder(tmp_path)
     statedir = tmp_path / "statedir"  # empty: no dispatch-5.epoch ⇒ foreign
 
@@ -2157,6 +2312,7 @@ def test_run_with_heartbeat_propagates_exit_code(tmp_path: Path) -> None:
 
 def test_auto_land_keeps_heartbeat_fresh_during_slow_land(spoke_repo: Path, tmp_path: Path) -> None:
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
     land_log = tmp_path / "land.log"
     wt_land = tmp_path / "wtland.sh"
     wt_land.write_text(f'#!/usr/bin/env bash\nsleep 3\nprintf "%s\\n" "$1" >> "{land_log}"\n')
@@ -2187,8 +2343,10 @@ def test_auto_land_failing_land_still_escalates_through_wrapper(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
     # End to end through the real call site: a land that fails under the heartbeat
-    # wrapper must still emit blocked/<issue>.
+    # wrapper must still emit blocked/<issue>. A clean review is seeded so the escalation
+    # here is driven by the LAND failure, not the review gate.
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
     wt_land = tmp_path / "wtland.sh"
     wt_land.write_text("#!/usr/bin/env bash\nexit 1\n")
     wt_land.chmod(0o755)
@@ -2248,6 +2406,7 @@ def test_auto_land_skips_foreign_without_ready_marker(spoke_repo: Path, tmp_path
 
 def test_auto_land_lands_dispatched_ready_spoke(spoke_repo: Path, tmp_path: Path) -> None:
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
     wt_land, land_log = _land_recorder(tmp_path)
     statedir = tmp_path / "statedir"
     statedir.mkdir()
@@ -2261,6 +2420,7 @@ def test_auto_land_lands_dispatched_ready_spoke(spoke_repo: Path, tmp_path: Path
 
 def test_auto_land_lands_foreign_when_opted_in(spoke_repo: Path, tmp_path: Path) -> None:
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
     wt_land, land_log = _land_recorder(tmp_path)
     statedir = tmp_path / "statedir"  # empty, but opt-in is set
     expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
@@ -2282,31 +2442,6 @@ def test_clear_dispatch_epochs_drops_stale_entries(tmp_path: Path) -> None:
     result = _call(expr, env={"AFK_STATE_DIR": str(statedir)})
 
     assert result.stdout.strip() == "0", "arming a window must clear stale dispatch epochs"
-
-
-# ── UNATTENDED marker wiring (issue #74, defect 5) ────────────────────────────
-# The supervisor drops/removes an `unattended` marker under the state dir while a window
-# is armed; anti-gutting-scan.sh reads it to fail closed on a test-gutting diff.
-
-
-def test_afk_set_unattended_creates_marker(tmp_path: Path) -> None:
-    statedir = tmp_path / "statedir"
-    expr = "_afk_set_unattended; test -f $(_afk_unattended_marker) && echo present || echo absent"
-
-    result = _call(expr, env={"AFK_STATE_DIR": str(statedir)})
-
-    assert result.stdout.strip() == "present"
-
-
-def test_afk_clear_unattended_removes_marker(tmp_path: Path) -> None:
-    statedir = tmp_path / "statedir"
-    statedir.mkdir()
-    (statedir / "unattended").write_text("")
-    expr = "_afk_clear_unattended; test -f $(_afk_unattended_marker) && echo present || echo absent"
-
-    result = _call(expr, env={"AFK_STATE_DIR": str(statedir)})
-
-    assert result.stdout.strip() == "absent"
 
 
 # ── the HEARTBEAT layer (issue #107) ──────────────────────────────────────────
