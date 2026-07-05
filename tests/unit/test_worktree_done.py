@@ -579,9 +579,20 @@ def test_done_warns_loudly_when_leftover_dir_survives_rm(hub: Path, tmp_path: Pa
     # still exit 0 — a stuck directory must never abort branch pruning.
     wt = _make_spoke(hub, tmp_path, "feature/9-stuck", push=True, merge=True)
     _leftover_git_shim(tmp_path, wt)
+    # The stub fails ONLY for the sweep's own target and delegates every other
+    # rm to the real binary, so it can never alter unrelated rm uses in the
+    # script (e.g. the hub-guard-allow revoke).
+    real_rm = shutil.which("rm")
+    assert real_rm is not None
     bindir = tmp_path / "bin"
     rm_stub = bindir / "rm"
-    rm_stub.write_text("#!/bin/sh\nexit 1\n")
+    rm_stub.write_text(
+        "#!/bin/sh\n"
+        'for a in "$@"; do\n'
+        f'  [ "$a" = "{wt}" ] && exit 1\n'
+        "done\n"
+        f'exec "{real_rm}" "$@"\n'
+    )
     rm_stub.chmod(0o755)
 
     proc, _ = _run_done(hub, tmp_path, "9")

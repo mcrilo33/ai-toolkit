@@ -114,7 +114,7 @@ wt_emit_script "worktree-done" "success" "$WT_T0" "$WT_DIR"
 if [ -z "$NO_CODE" ]; then
   WS_FILE="$(wt_workspace_file "$REPO_ROOT")"
   if wt_workspace_remove "$WS_FILE" "$WT_DIR"; then
-    echo "→ removed folder from your review workspace file: $WS_FILE (dead entries swept)"
+    echo "→ reconciled your review workspace file: $WS_FILE (entry dropped if present, dead entries swept)"
   elif command -v code >/dev/null 2>&1; then
     echo "→ removing folder from your VS Code review window (code --remove)"
     code --remove "$WT_DIR" \
@@ -157,12 +157,14 @@ git worktree prune
 if [ -e "$WT_DIR" ]; then
   wt_warn "git deregistered the worktree but the directory survived — sweeping it (rm -rf)."
   rm -rf "$WT_DIR" || true
-  if [ -e "$WT_DIR" ]; then
-    wt_warn "✗ LEFTOVER DIRECTORY SURVIVED: $WT_DIR"
-    wt_warn "  a process is probably holding a cwd inside it — close it, then remove it by hand: rm -rf \"$WT_DIR\""
-  fi
 fi
-echo "✓ removed: $WT_DIR"
+if [ -e "$WT_DIR" ]; then
+  wt_warn "✗ LEFTOVER DIRECTORY SURVIVED: $WT_DIR"
+  wt_warn "  a process is probably holding a cwd inside it — close it, then remove it by hand: rm -rf \"$WT_DIR\""
+  echo "✓ deregistered: $WT_DIR (directory still on disk — see the warning above)"
+else
+  echo "✓ removed: $WT_DIR"
+fi
 
 # --- scrub the removed path from VS Code's "Open Recent" list (issue #103) ---
 # `code --remove` folds the folder out of the live window, but VS Code keeps the
