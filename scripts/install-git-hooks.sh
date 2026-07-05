@@ -88,7 +88,12 @@ cp "$SHARED_HOOKS/commit-quality.sh" \
    "$SHARED_HOOKS/reviewer-sep-warn.sh" \
    "$SHARED_HOOKS/anti-gutting-scan.sh" \
    "$SHARED_HOOKS/test-select.sh" "$SCRIPTS_DST/"
-cp "$SHARED_HOOKS/lib/utils.sh" "$SHARED_HOOKS/lib/gate-stamp.sh" "$SCRIPTS_DST/lib/"
+# telemetry.sh is not optional: utils.sh sources it unconditionally, so an
+# install without it ships hooks that die at source-time (the 2026-07-04 hub
+# outage — every push from every worktree failed on the missing file).
+cp "$SHARED_HOOKS/lib/utils.sh" "$SHARED_HOOKS/lib/telemetry.sh" \
+   "$SHARED_HOOKS/lib/gate-stamp.sh" \
+   "$SHARED_HOOKS/lib/test-reverse-index.sh" "$SCRIPTS_DST/lib/"
 chmod +x "$SCRIPTS_DST"/*.sh
 info "Copied cage scripts → $SCRIPTS_DST"
 

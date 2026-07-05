@@ -380,6 +380,19 @@ cleanup_tmux() {
 }
 cleanup_tmux
 
+# --- conditional post-land background sweep (issue #124) --------------------------
+# If the gate that certified the landed tree ran a PRUNED set (a testmon/selected
+# green-tree stamp, issue #122), launch the full suite in the background as the
+# selection-miss safety net — detached, so the land's exit code and duration stay
+# untouched; gate-sweep.sh owns dedupe (a full-stamped tree is never swept), the
+# one-sweep-at-a-time lock, the stamp upgrade on green, and the issue filing on
+# red. A `full` stamp or no stamp (docs-only skip, --skip-tests) launches
+# nothing. Best-effort like the rest of the tail: a sweep that fails to launch
+# warns and never fails the land. GATE_SWEEP_BIN is the test seam.
+bash "${GATE_SWEEP_BIN:-$SCRIPT_DIR/gate-sweep.sh}" --spawn "$MERGED_SHA" \
+  --branch "$WT_BRANCH" ${ISSUE:+--issue} ${ISSUE:+"$ISSUE"} \
+  || wt_warn "post-land sweep failed to launch — landing is unaffected"
+
 # --- report -------------------------------------------------------------------------
 echo
 echo "✓ landed $WT_BRANCH"

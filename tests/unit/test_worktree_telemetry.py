@@ -96,6 +96,15 @@ def _tele_env(telemetry_dir: Path | None, *, enabled: bool = True) -> dict[str, 
 
 
 def _run(script: Path, hub: Path, env: dict[str, str], *args: str) -> subprocess.CompletedProcess:
+    # Sandbox HOME and XDG_CONFIG_HOME per test: git's DEFAULT excludes file
+    # ($XDG_CONFIG_HOME/git/ignore, falling back to ~/.config/git/ignore) is NOT
+    # disabled by GIT_CONFIG_GLOBAL=/dev/null, so a host file ignoring .claude/
+    # would hide spoke dirtiness that a bare runner sees (issue #132). A sandboxed
+    # HOME also keeps the workspace-file reconcile (issue #134) off the host's
+    # real ~/.claude/<repo>.code-workspace.
+    home = hub.parent / "home"
+    home.mkdir(exist_ok=True)
+    env = {**env, "HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config")}
     return subprocess.run(
         ["bash", str(script), *args],
         cwd=str(hub),

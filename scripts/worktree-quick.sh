@@ -88,16 +88,18 @@ echo "→ new branch         $BRANCH (from $BASE_START)"
 # micro-spoke guard (issue #120).
 git worktree add "$WT_DIR" --no-track -b "$BRANCH" "$BASE_START"
 
-# --- set the .ai-toolkit/ exclude (resolved for this worktree) ---------------
-# Make .ai-toolkit/ ignored via the repo's git exclude rather than trusting a
-# committed .gitignore, so the minted run-id never lands untracked (which would
-# break worktree-done's `git worktree remove`). See worktree-new.sh for the
-# full rationale.
+# --- set the .ai-toolkit/ + .claude/ excludes (resolved for this worktree) ---
+# Make .ai-toolkit/ and .claude/ ignored via the repo's git exclude rather than
+# trusting a committed .gitignore, so the minted run-id and the copied .claude/
+# runtime config never land untracked (which would break worktree-done's
+# `git worktree remove`). See worktree-new.sh for the full rationale (#132).
 EXCLUDE_FILE="$(git -C "$WT_DIR" rev-parse --git-path info/exclude 2>/dev/null || true)"
 if [ -n "$EXCLUDE_FILE" ]; then
   mkdir -p "$(dirname "$EXCLUDE_FILE")"
-  grep -qxF '.ai-toolkit/' "$EXCLUDE_FILE" 2>/dev/null \
-    || printf '%s\n' '.ai-toolkit/' >> "$EXCLUDE_FILE"
+  for entry in '.ai-toolkit/' '.claude/'; do
+    grep -qxF "$entry" "$EXCLUDE_FILE" 2>/dev/null \
+      || printf '%s\n' "$entry" >> "$EXCLUDE_FILE"
+  done
 fi
 
 # --- mint the spoke_run_id ---------------------------------------------------

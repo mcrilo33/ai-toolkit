@@ -30,7 +30,10 @@
 #                 Override with AI_TOOLKIT_INGEST_FLUSH_WAIT (seconds; 0 in tests).
 #
 # Env for the steps: LANGFUSE_HOST defaults to http://localhost:3000; the ingesters
-# run under PYTHONPATH=<scripts> with python3.12 (matching the telemetry package).
+# run under PYTHONPATH=<repo>/scripts with python3.12 (matching the telemetry
+# package). The package is resolved relative to the repo checkout holding this
+# script — NOT relative to the script itself: the synced copy lives at
+# <target>/.ai-toolkit/scripts/ with no telemetry/ subpackage (issue #136).
 set -uo pipefail
 
 PROG="telemetry-ingest-spoke"
@@ -57,9 +60,35 @@ fi
 SPOKE_RUN_ID="$(head -n1 "$ID_FILE" | tr -d '[:space:]')"
 [ -n "$SPOKE_RUN_ID" ] || { warn "spoke-run-id file is empty — skipping Langfuse ingestion"; exit 0; }
 
-# Auth gate: warn-and-continue, never fail the land.
+# Auth gate: warn-and-continue, never fail the land. A manual re-run has no
+# hand-exported credentials, so resolve them here the way the land does (#127):
+# env first, then the shared ~/.afk-telemetry conf, via worktree-lib.sh's
+# resolver — a synced sibling in every layout. Absent lib or unresolvable auth
+# falls through to the existing skip notice.
+if [ -f "$SCRIPT_DIR/worktree-lib.sh" ]; then
+  # shellcheck source=worktree-lib.sh
+  . "$SCRIPT_DIR/worktree-lib.sh"
+  wt_resolve_langfuse_auth || true
+fi
 if [ -z "${LANGFUSE_BASIC_AUTH:-}" ]; then
   info "LANGFUSE_BASIC_AUTH unset — skipping post-run Langfuse ingestion for $SPOKE_RUN_ID"
+  exit 0
+fi
+
+# Resolve the telemetry python package: sync_workflow_scripts ships this script
+# to <target>/.ai-toolkit/scripts/ but never the package (issue #136), so the
+# repo checkout's scripts/telemetry is the canonical home; the SCRIPT_DIR
+# sibling stays as a fallback for a non-git install that co-locates it.
+# env -u: an inherited git-hook GIT_DIR/GIT_WORK_TREE would override -C
+# discovery and resolve a different checkout's package (this repo's documented
+# hook-env leak class) — strip both so the answer is always THIS script's repo.
+REPO_ROOT="$(env -u GIT_DIR -u GIT_WORK_TREE git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)"
+TELEMETRY_DIR=""
+for _cand in ${REPO_ROOT:+"$REPO_ROOT/scripts/telemetry"} "$SCRIPT_DIR/telemetry"; do
+  if [ -f "$_cand/langfuse_spoke_tree.py" ]; then TELEMETRY_DIR="$_cand"; break; fi
+done
+if [ -z "$TELEMETRY_DIR" ]; then
+  warn "telemetry python package not found (probed ${REPO_ROOT:+$REPO_ROOT/scripts/telemetry and }$SCRIPT_DIR/telemetry) — skipping post-run Langfuse ingestion for $SPOKE_RUN_ID"
   exit 0
 fi
 
@@ -68,7 +97,7 @@ FLUSH_WAIT="${AI_TOOLKIT_INGEST_FLUSH_WAIT:-3}"
 [ "$FLUSH_WAIT" = "0" ] || sleep "$FLUSH_WAIT" 2>/dev/null || true
 
 export LANGFUSE_HOST="${LANGFUSE_HOST:-http://localhost:3000}"
-export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$(dirname "$TELEMETRY_DIR")${PYTHONPATH:+:$PYTHONPATH}"
 
 # Each step is best-effort: warn on failure, press on to the next, return 0.
 # UPGRADE: wrap each step in `timeout` (when available — macOS has none by default)
@@ -83,13 +112,13 @@ run_step() {
 # it langfuse_spoke_tree's disk fallback (when no usable request body is found) would
 # itemize the HUB's rules/skills/memory instead of the spoke's.
 run_step "loaded-context itemization (#87)" \
-  "$SCRIPT_DIR/telemetry/langfuse_spoke_tree.py" "$SPOKE_RUN_ID" \
+  "$TELEMETRY_DIR/langfuse_spoke_tree.py" "$SPOKE_RUN_ID" \
   --request-bodies "$BODY_DIR" --root "$WT_DIR"
 # --worktree scopes the transcript backfill to THIS spoke's own Claude Code project dir
 # (derived from WT_DIR), so it reads only the spoke's sessions/resumes — never the hub or
 # sibling worktrees. Without it the backfill scans every session on the machine and
 # cross-attaches unrelated reasoning/content (Issues #92/#98).
 run_step "transcript backfill (#92)" \
-  "$SCRIPT_DIR/telemetry/langfuse_backfill.py" "$SPOKE_RUN_ID" --thinking --worktree "$WT_DIR"
+  "$TELEMETRY_DIR/langfuse_backfill.py" "$SPOKE_RUN_ID" --thinking --worktree "$WT_DIR"
 
 exit 0
