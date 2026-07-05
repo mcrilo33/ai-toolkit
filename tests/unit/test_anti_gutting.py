@@ -164,23 +164,24 @@ def test_new_branch_zero_remote_sha_uses_merge_base(repo: Path) -> None:
     assert "weakens tests" in result.stderr, "a new-branch push must still scan the new commits"
 
 
-# ── UNATTENDED fail-closed (issue #74, defect 5) ─────────────────────────────
-# Under unattended /afk no human is watching to catch a test-gutting diff, so the
-# tripwire must fail CLOSED (block the push) instead of merely warning. It is armed
-# either by the UNATTENDED env or by a marker file the supervisor drops under the git
-# common dir; a clean diff still passes.
+# ── advisory everywhere: UNATTENDED no longer fails closed (issue #143) ───────
+# The reasoning code-review verdict is now the /afk gatekeeper (hub-afk.sh auto_land
+# escalates to blocked on a non-clean verdict), so the mechanical scan is advisory in
+# EVERY context — including under an unattended drain. The old fail-closed path (armed by
+# the UNATTENDED env or the supervisor's `unattended` marker) is gone: a gutting diff
+# still warns, but never blocks, regardless of the marker.
 
 
-def test_unattended_env_blocks_gutting_diff(repo: Path) -> None:
+def test_unattended_env_is_now_advisory(repo: Path) -> None:
     base, head = _commit(repo, {"tests/test_taut.py": "def test_taut():\n    assert True\n"})
 
     result = _scan(repo, base, head, env={"UNATTENDED": "1"})
 
-    assert result.returncode != 0, "UNATTENDED must fail closed on a gutting diff"
-    assert "weakens tests" in result.stderr
+    assert result.returncode == 0, "UNATTENDED must no longer block — the scan is advisory"
+    assert "weakens tests" in result.stderr, "advisory mode must still warn under UNATTENDED"
 
 
-def test_unattended_marker_blocks_gutting_diff(repo: Path) -> None:
+def test_unattended_marker_is_now_advisory(repo: Path) -> None:
     marker_dir = repo / ".git" / "ai-toolkit-afk"
     marker_dir.mkdir(parents=True, exist_ok=True)
     (marker_dir / "unattended").write_text("")
@@ -188,16 +189,29 @@ def test_unattended_marker_blocks_gutting_diff(repo: Path) -> None:
 
     result = _scan(repo, base, head)
 
-    assert result.returncode != 0, "the unattended marker must fail closed on a gutting diff"
-    assert "weakens tests" in result.stderr
+    assert result.returncode == 0, "the unattended marker must no longer block — advisory only"
+    assert "weakens tests" in result.stderr, "advisory mode must still warn with the marker present"
 
 
-def test_unattended_clean_diff_still_passes(repo: Path) -> None:
-    base, head = _commit(
-        repo, {"tests/test_more.py": "def test_more():\n    assert (1 + 1) == 2\n"}
+# ── tag-only / marker pushes are exempt (issue #143, false positive 2) ────────
+# A blocked/<issue> (or any tag) push carries no reviewable code, so anti-gutting must
+# not scan it at all — a spoke escalating its state must always be able to push its
+# marker. A push whose refs are ALL tags contributes no range: nothing is scanned and
+# nothing is warned, even when the underlying commit range has a gutting signature.
+
+
+def test_tag_only_push_is_exempt(repo: Path) -> None:
+    base, head = _commit(repo, {"tests/test_taut.py": "def test_taut():\n    assert True\n"})
+    stdin = f"refs/tags/blocked/5 {head} refs/tags/blocked/5 {base}\n"
+
+    result = subprocess.run(
+        ["bash", str(SCAN)],
+        cwd=str(repo),
+        input=stdin,
+        capture_output=True,
+        text=True,
+        env={**_GIT_ENV},
     )
 
-    result = _scan(repo, base, head, env={"UNATTENDED": "1"})
-
-    assert result.returncode == 0, "a clean diff must pass even under UNATTENDED"
-    assert "weakens tests" not in result.stderr
+    assert result.returncode == 0, "a tag-only push must never be blocked"
+    assert "weakens tests" not in result.stderr, "a tag-only push must not even be scanned"
