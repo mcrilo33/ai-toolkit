@@ -530,3 +530,66 @@ def test_done_no_code_leaves_workspace_file_untouched(hub: Path, tmp_path: Path)
     assert proc.returncode == 0, proc.stderr
     assert ws.read_text() == before
     assert not log.exists() or log.read_text().strip() == ""
+
+
+# --- leftover-dir sweep after `git worktree remove` (issue #134) ---------------
+# A lingering shell cwd or gitignored runtime files can leave the directory on
+# disk even when git deregistered the worktree (#122 left ai-toolkit-122
+# behind). After a successful `git worktree remove`, teardown must retry with an
+# rm -rf of the leftover — and warn LOUDLY, still exiting 0, if even that fails.
+# Simulated with a `git` shim whose `worktree remove` delegates to the real git
+# and then recreates the directory holding an untracked file.
+
+
+def _leftover_git_shim(tmp_path: Path, leftover_dir: Path) -> None:
+    """PATH `git` shim: real `worktree remove`, then resurrect the directory."""
+    real_git = shutil.which("git")
+    assert real_git is not None
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    shim = bindir / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = worktree ] && [ "$2" = remove ]; then\n'
+        f'  "{real_git}" "$@"; rc=$?\n'
+        f'  mkdir -p "{leftover_dir}"\n'
+        f'  echo runtime-junk > "{leftover_dir}/leftover.txt"\n'
+        '  exit "$rc"\n'
+        "fi\n"
+        f'exec "{real_git}" "$@"\n'
+    )
+    shim.chmod(0o755)
+
+
+def test_done_sweeps_leftover_dir_after_worktree_remove(hub: Path, tmp_path: Path) -> None:
+    # git deregistered the worktree but the directory survived (untracked file)
+    # → teardown rm -rf's the leftover and still succeeds.
+    wt = _make_spoke(hub, tmp_path, "feature/9-leftover", push=True, merge=True)
+    _leftover_git_shim(tmp_path, wt)
+
+    proc, _ = _run_done(hub, tmp_path, "9")
+
+    assert proc.returncode == 0, proc.stderr
+    assert not wt.exists(), "the resurrected leftover directory must be swept"
+
+
+def test_done_warns_loudly_when_leftover_dir_survives_rm(hub: Path, tmp_path: Path) -> None:
+    # Even the rm -rf retry fails (stubbed rm exits 1 without removing) → the
+    # teardown must warn loudly, naming the path and the manual command, and
+    # still exit 0 — a stuck directory must never abort branch pruning.
+    wt = _make_spoke(hub, tmp_path, "feature/9-stuck", push=True, merge=True)
+    _leftover_git_shim(tmp_path, wt)
+    bindir = tmp_path / "bin"
+    rm_stub = bindir / "rm"
+    rm_stub.write_text("#!/bin/sh\nexit 1\n")
+    rm_stub.chmod(0o755)
+
+    proc, _ = _run_done(hub, tmp_path, "9")
+
+    assert proc.returncode == 0, proc.stderr
+    assert wt.exists()
+    assert str(wt) in proc.stderr
+    assert "rm -rf" in proc.stderr
+    assert "feature/9-stuck" not in _local_branches(hub), (
+        "branch pruning must still run after a failed leftover sweep"
+    )
