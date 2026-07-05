@@ -102,6 +102,7 @@ fetch_issues() {
 plan_from_json() {
   local inflight=()
   local cap=0
+  local repo_root=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --inflight) [ "$#" -ge 2 ] || { echo "batch-plan: --inflight needs a value" >&2; return 2; }
@@ -110,6 +111,12 @@ plan_from_json() {
       --cap) [ "$#" -ge 2 ] || { echo "batch-plan: --cap needs a value" >&2; return 2; }
              cap="$2"; shift 2 ;;
       --cap=*) cap="${1#--cap=}"; shift ;;
+      # --repo-root DIR enables the undeclared-dependency lint's create-detection
+      # (a scope path absent under DIR is a to-be-created file). OMITTED ⇒ the lint's
+      # filesystem probe is off and the planner's output stays byte-identical.
+      --repo-root) [ "$#" -ge 2 ] || { echo "batch-plan: --repo-root needs a value" >&2; return 2; }
+                   repo_root="$2"; shift 2 ;;
+      --repo-root=*) repo_root="${1#--repo-root=}"; shift ;;
       *) echo "batch-plan: unknown plan_from_json arg: $1" >&2; return 2 ;;
     esac
   done
@@ -126,7 +133,7 @@ plan_from_json() {
   command -v python3 >/dev/null 2>&1 || { echo "batch-plan: python3 required" >&2; return 1; }
   # The program is read from fd 3 (the heredoc), leaving python's stdin free to
   # carry the issue-node JSON piped in from fetch_issues / the tests.
-  _BATCH_INFLIGHT="$joined" _BATCH_CAP="$cap" python3 /dev/fd/3 3<<'PYEOF'
+  _BATCH_INFLIGHT="$joined" _BATCH_CAP="$cap" _BATCH_REPO_ROOT="$repo_root" python3 /dev/fd/3 3<<'PYEOF'
 import json
 import os
 import sys
@@ -266,6 +273,87 @@ def print_merge_candidates(issues, children):
         )
 
 
+def is_glob(token):
+    """True when a scope token carries glob metacharacters (not a concrete path)."""
+    return any(ch in token for ch in "*?[")
+
+
+def print_undeclared_dependencies(issues, children, repo_root):
+    """Warn on stderr about a probable undeclared blocked-by edge between open issues.
+
+    Signal (issue #148): two open issues both list a scope path that does NOT yet
+    exist under `repo_root` — a file one of them will CREATE — with no blocked-by
+    edge (direct or transitive) ordering them. That is a producer→consumer pair
+    whose ordering is undeclared, so the scheduler would run them in arbitrary order.
+
+    Scope: this fires on the CREATE direction only — the "reads a file another
+    creates" half of the issue's "creates/deletes" wording. A shared path that
+    already EXISTS is mere file overlap the planner serializes on its own (and
+    flagging it would nudge authors toward the fake edges `issue-hygiene` forbids),
+    so it stays silent. The DELETE direction (a shared path a sibling removes) is
+    deliberately out of scope: a to-be-deleted file still exists at plan time, so
+    existence alone cannot detect it.
+
+    Detection-only: prints to stderr, never touches the batch, the exit code, or
+    which issues dispatch. Disabled entirely when `repo_root` is falsy (the pure
+    planner default, `--repo-root` omitted) so existing output stays byte-identical.
+    A `Split: intentional` marker on either issue suppresses that pair.
+    """
+    if not repo_root:
+        return
+
+    # Transitive blocked-by reachability over open issues: `b in reach[a]` ⇒ a must
+    # close before b, so the pair is already ordered (directly or through a chain).
+    reach = {n: set() for n in issues}
+    for n in issues:
+        stack = list(children.get(n, ()))
+        while stack:
+            m = stack.pop()
+            if m in reach[n]:
+                continue
+            reach[n].add(m)
+            stack.extend(children.get(m, ()))
+
+    def ordered(a, b):
+        return b in reach.get(a, ()) or a in reach.get(b, ())
+
+    # Group open issues by each concrete, not-yet-created scope path they list.
+    # UPGRADE: covers CREATE only (an absent path). To also catch a shared to-be-
+    # DELETED file, teach `Scope:` an explicit create/delete annotation (e.g.
+    # `+new.py` / `-old.py`) and key this lint off it — worth it once delete-ordering
+    # bugs actually surface in practice.
+    producers = {}
+    for num, info in issues.items():
+        scope = info["scope"]
+        if scope is None:
+            continue
+        for token in scope:
+            if is_glob(token) or os.path.exists(os.path.join(repo_root, token)):
+                continue  # a glob, or an existing file (mere overlap) — not a create
+            producers.setdefault(token, set()).add(num)
+
+    # Collect the shared not-yet-created paths per issue pair, then warn once each.
+    pair_tokens = {}
+    for token, members in producers.items():
+        ordered_members = sorted(members)
+        for i in range(len(ordered_members)):
+            for j in range(i + 1, len(ordered_members)):
+                pair_tokens.setdefault((ordered_members[i], ordered_members[j]), []).append(token)
+
+    for (a, b) in sorted(pair_tokens):
+        if ordered(a, b):
+            continue  # ordering already declared (directly or transitively)
+        if issues[a]["split"] or issues[b]["split"]:
+            continue  # a deliberate split opted out
+        toks = ", ".join(f"`{t}`" for t in sorted(pair_tokens[(a, b)]))
+        print(
+            f"⚠ possible undeclared dependency: #{a} / #{b} both list {toks} "
+            "(not yet in tree — one creates it) — declare blocked-by if one is "
+            "based on the other",
+            file=sys.stderr,
+        )
+
+
 def main():
     # Tolerate an empty / `null` / non-array payload (e.g. a graphql round-trip
     # that succeeded against a null `repository` — repo not found or a token-scope
@@ -373,6 +461,7 @@ def main():
         print(" ".join(str(n) for n in batch))
 
     print_merge_candidates(issues, children)
+    print_undeclared_dependencies(issues, children, os.environ.get("_BATCH_REPO_ROOT", ""))
 
 
 main()
@@ -380,9 +469,14 @@ PYEOF
 }
 
 # main — fetch the open backlog and print the next concurrent batch. Pass through any
-# --inflight flags so the hub/skill can feed in the scopes of live spokes.
+# --inflight flags so the hub/skill can feed in the scopes of live spokes, and seed
+# --repo-root with the hub checkout so the undeclared-dependency lint can tell a
+# to-be-created scope path from an existing file. An explicit --repo-root in "$@"
+# (last-wins in the arg loop) still overrides this default.
 main() {
-  fetch_issues | plan_from_json "$@"
+  local root
+  root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  fetch_issues | plan_from_json --repo-root "$root" "$@"
 }
 
 [[ "${BASH_SOURCE[0]}" == "${0}" ]] && main "$@"
