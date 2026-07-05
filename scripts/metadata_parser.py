@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import sys
+from collections.abc import Mapping
 
 TOOL_NAMES = {"copilot", "cursor", "claude"}
 
@@ -129,6 +130,27 @@ def parse(path: str) -> dict[str, dict]:
     return items
 
 
+def read_mapping(path: str) -> dict[str, Value]:
+    """Parse a whole file as one nested block-style YAML mapping.
+
+    Unlike :func:`parse` (which treats each top-level key as a named item split
+    into defaults/overrides), this returns the document as a plain nested dict —
+    for config files such as ``settings/ai-toolkit.yml``. Flow-style collections
+    (``{a: b}``) are not supported; use block style.
+
+    Args:
+        path: Path to a block-style YAML mapping file.
+
+    Returns:
+        The parsed mapping (empty dict for an empty/comment-only file).
+    """
+    lines = _read_lines(path)
+    if not lines:
+        return {}
+    result, _ = _parse_map(lines, 0, 0)
+    return result
+
+
 # Characters that may not start a YAML plain scalar (c-indicators).
 _UNSAFE_LEAD_CHARS = frozenset("!&*|>%@`\"'#,]}")
 
@@ -193,7 +215,7 @@ def _item_lines(item: Value, indent: int) -> list[str]:
     lines: list[str] = []
     for k, v in item.items():
         lines.extend(_to_yaml_lines(k, v, indent + 2))
-    lines[0] = f"{pad}- {lines[0][indent + 2:]}"
+    lines[0] = f"{pad}- {lines[0][indent + 2 :]}"
     return lines
 
 
@@ -232,11 +254,48 @@ def query(items: dict[str, dict], tool: str, fields: list[str]) -> list[tuple[st
     return results
 
 
+def apply_overrides(
+    items: dict[str, dict], tool: str, overrides: Mapping[str, Mapping[str, Value]]
+) -> dict[str, dict]:
+    """Overlay per-item field overrides into ``tool``'s override block.
+
+    Used to stamp config-sourced values (e.g. an agent's ``model``/``effort``
+    from settings/ai-toolkit.yml) onto items parsed from a metadata.yml, so
+    :func:`query` emits them for that tool. Names absent from ``items`` are
+    ignored; existing keys in the block are preserved (merge, not replace).
+
+    Args:
+        items: Output of :func:`parse` (mutated in place).
+        tool: Tool whose override block receives the fields.
+        overrides: ``{item_name: {field: value}}`` to overlay.
+
+    Returns:
+        The same ``items`` dict, for chaining.
+    """
+    for name, fields in overrides.items():
+        if name in items:
+            items[name]["__overrides"].setdefault(tool, {}).update(fields)
+    return items
+
+
 def main() -> None:
-    """CLI entry point — drop-in replacement for the heredoc in sync-to-repo.sh."""
+    """CLI entry point — drop-in replacement for the heredoc in sync-to-repo.sh.
+
+    Usage: ``metadata_parser.py <meta_file> <tool> <fields> [config_file]``.
+    When ``config_file`` is given, each agent's ``model``/``effort`` from the
+    ai-toolkit config is overlaid onto ``tool``'s block before querying, so the
+    config — not the metadata.yml — is the source of truth for model routing.
+    """
     meta_file, tool, fields_str = sys.argv[1], sys.argv[2], sys.argv[3]
     wanted = [f.strip() for f in fields_str.split(",")]
     items = parse(meta_file)
+    if len(sys.argv) > 4:
+        # Lazy on purpose: ai_toolkit_config imports metadata_parser at module
+        # load, so a top-level import here would be circular. Keep it local.
+        import ai_toolkit_config as cfg
+
+        config = cfg.load_config(sys.argv[4])
+        apply_overrides(items, tool, cfg.agent_model_overrides(config))
     for name, fm in query(items, tool, wanted):
         print(f"{name}\t{fm}")
 

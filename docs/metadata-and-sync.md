@@ -94,6 +94,28 @@ shared/<category>/*.md           ─┤  ─────────────
                                  └─
 ```
 
+## Declarative config (`settings/ai-toolkit.yml`)
+
+`settings/ai-toolkit.yml` is the single source of truth for two families of toolkit
+behavior; sync applies both on every run (parsed by `scripts/ai_toolkit_config.py`,
+stdlib only):
+
+- **Model routing** — `model.spoke` (the spoke driver), `model.subagents.<type>`
+  (each sub-agent), plus `model.cycle_steps`, `model.afk.answerer`, and
+  `model.overrides.by_label` (schema present; consumers land in follow-ups). Each
+  entry is `{model, effort}`; effort defaults to `max`. Sync stamps each agent's
+  `model`/`effort` frontmatter from `model.subagents` (so `shared/agents/metadata.yml`
+  carries no model literals) and emits `.ai-toolkit/scripts/spoke-model.env` for
+  `worktree-new.sh` to source.
+- **Base branch** — `base_branch:` is written to `git config ai-toolkit.base-branch`
+  on the target, feeding the canonical `wt_base_branch` resolver. Empty/absent clears
+  it (auto-detection). See [parallel worktrees](./parallel-worktrees.md).
+
+Change one value, re-sync, and the corresponding behavior changes with no other edits.
+A per-issue `Model: <id>` body line overrides the spoke model for that one spoke.
+
+Override the config path for a run with the `AI_TOOLKIT_CONFIG` env var (used by tests).
+
 ## Usage
 
 ```bash

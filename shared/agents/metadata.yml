@@ -8,8 +8,6 @@ code-review:
   argument-hint: "Describe the changes to review or provide a PR link"
   disallowedTools: [replace_string_in_file, multi_replace_string_in_file, create_file, edit_notebook_file, run_in_terminal, send_to_terminal]
   claude:
-    model: claude-opus-4-8
-    effort: max
     skills:
       - verification-loop
       - security-review
@@ -40,8 +38,6 @@ debug:
   description: "Systematically identify, analyze, and resolve bugs using a structured triage-reproduce-investigate-fix cycle."
   argument-hint: "Describe the bug, error message, or paste a stack trace"
   claude:
-    model: claude-opus-4-8
-    effort: max
   hooks:
     PostToolUse:
       - type: command
@@ -64,8 +60,6 @@ tdd-red:
   description: "Write failing pytest tests one at a time that describe desired behavior before implementation exists."
   argument-hint: "Describe the behavior to test"
   claude:
-    model: claude-opus-4-8
-    effort: max
     skills:
       - tdd-workflow
       - generate-tests
@@ -80,8 +74,6 @@ tdd-green:
   description: "Write minimal Python code to make failing tests pass without over-engineering."
   argument-hint: "Point to the failing tests to implement against"
   claude:
-    model: claude-sonnet-5
-    effort: max
     skills:
       - tdd-workflow
   hooks:
@@ -101,8 +93,6 @@ devops:
   description: "Guide teams through CI/CD, infrastructure, deployment, and operational concerns following the DevOps lifecycle."
   argument-hint: "Describe the CI/CD, infrastructure, or deployment task"
   claude:
-    model: claude-opus-4-8
-    effort: max
     skills:
       - ci-cd-review
       - docker-patterns
@@ -123,16 +113,12 @@ documentation:
   description: "Write or update project documentation as an isolated task — read code, produce docs, never modify source."
   argument-hint: "Specify what to document — module, API, or feature"
   claude:
-    model: claude-sonnet-5
-    effort: max
 
 refactor:
   name: "refactor"
   description: "Apply systematic cross-cutting changes across multiple files while keeping all tests green."
   argument-hint: "Describe the refactor — rename, move, or pattern change"
   claude:
-    model: claude-sonnet-5
-    effort: max
   hooks:
     PostToolUse:
       - type: command
@@ -150,8 +136,6 @@ tdd-refactor:
   description: "Improve code quality, readability, and design while keeping all tests green."
   argument-hint: "Point to the code to refactor (tests must already pass)"
   claude:
-    model: claude-sonnet-5
-    effort: max
     skills:
       - tdd-workflow
   hooks:
@@ -172,8 +156,6 @@ security-reviewer:
   argument-hint: "Describe what to audit — file, module, PR, or area (auth, API, data)"
   disallowedTools: [replace_string_in_file, multi_replace_string_in_file, create_file, edit_notebook_file, run_in_terminal, send_to_terminal]
   claude:
-    model: claude-opus-4-8
-    effort: max
   handoffs:
     - label: "Fix vulnerabilities"
       agent: debug
@@ -185,8 +167,6 @@ architect:
   argument-hint: "Describe what to design — new service, module split, data model, or scaling decision"
   disallowedTools: [replace_string_in_file, multi_replace_string_in_file, create_file, edit_notebook_file, run_in_terminal, send_to_terminal]
   claude:
-    model: claude-fable-5
-    effort: max
   handoffs:
     - label: "Plan implementation"
       agent: planner
@@ -199,8 +179,6 @@ planner:
   argument-hint: "Describe the feature or task to plan"
   disallowedTools: [replace_string_in_file, multi_replace_string_in_file, create_file, edit_notebook_file, run_in_terminal, send_to_terminal]
   claude:
-    model: claude-fable-5
-    effort: max
     skills:
       - context-map
       - brainstorming

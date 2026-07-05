@@ -7,6 +7,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 SHARED_DIR="$REPO_DIR/shared"
 
+# Declarative toolkit config (issue #142): the single source of truth for model
+# routing + base_branch. Overridable via AI_TOOLKIT_CONFIG (used by tests).
+AI_TOOLKIT_CONFIG="${AI_TOOLKIT_CONFIG:-$REPO_DIR/settings/ai-toolkit.yml}"
+
 GREEN='\033[0;32m'  YELLOW='\033[1;33m'  RED='\033[0;31m'  BLUE='\033[0;34m'  NC='\033[0m'
 info()    { echo -e "${GREEN}✓${NC} $1"; }
 warn()    { echo -e "${YELLOW}⚠${NC} $1"; }
@@ -72,9 +76,15 @@ fi
 # Args: $1=metadata.yml  $2=tool  $3=comma-separated fields
 # Output: "name<TAB>field1: val\nfield2: val" per item
 query_metadata() {
-    local meta_file="$1" tool="$2" fields="$3"
+    local meta_file="$1" tool="$2" fields="$3" config="${4:-}"
     [ -f "$meta_file" ] || return 0
-    python3 "$SCRIPT_DIR/metadata_parser.py" "$meta_file" "$tool" "$fields"
+    # A 4th arg passes the ai-toolkit config so the parser overlays each agent's
+    # model/effort from it (issue #142) — the config, not metadata.yml, routes.
+    if [ -n "$config" ] && [ -f "$config" ]; then
+        python3 "$SCRIPT_DIR/metadata_parser.py" "$meta_file" "$tool" "$fields" "$config"
+    else
+        python3 "$SCRIPT_DIR/metadata_parser.py" "$meta_file" "$tool" "$fields"
+    fi
 }
 
 # ─── File recording for the sync manifest ───
@@ -305,8 +315,8 @@ sync_claude() {
         copy_skill_subdirs "$d" "$cl/skills/$s"
     done
 
-    # agents/*.md
-    query_metadata "$SHARED_DIR/agents/metadata.yml" claude "$CLAUDE_AGENT_FIELDS" | while IFS=$'\t' read -r name fm; do
+    # agents/*.md — the ai-toolkit config stamps each agent's model/effort (#142)
+    query_metadata "$SHARED_DIR/agents/metadata.yml" claude "$CLAUDE_AGENT_FIELDS" "$AI_TOOLKIT_CONFIG" | while IFS=$'\t' read -r name fm; do
         [ -f "$SHARED_DIR/agents/${name}.md" ] || continue
         add_frontmatter "$SHARED_DIR/agents/${name}.md" "$cl/agents/${name}.md" "$fm"
         info "agents/${name}.md"
@@ -505,6 +515,27 @@ sync_workflow_scripts() {
             info "scripts/$name"
         fi
     done
+
+    # Spoke-default model env (issue #142), derived from the config's
+    # `model.spoke`: emits WT_AGENT_MODEL_DEFAULT / WT_AGENT_EFFORT_DEFAULT. The
+    # consumer — worktree-new.sh sourcing this to pin the spoke driver's model
+    # off the config instead of a hardcoded literal — is wired in the same
+    # issue's worktree-new change; this is the producer half.
+    record_file ".ai-toolkit/scripts/spoke-model.env"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "[dry-run] would write .ai-toolkit/scripts/spoke-model.env"
+    else
+        # Render into a var first so a config-read failure surfaces without
+        # truncating the target file to 0 bytes mid-sync (matches the
+        # graceful degradation of apply_base_branch_config below).
+        local spoke_env
+        if spoke_env="$(python3 "$SCRIPT_DIR/ai_toolkit_config.py" spoke-env "$AI_TOOLKIT_CONFIG")"; then
+            printf '%s\n' "$spoke_env" > "$dst_dir/spoke-model.env"
+            info "scripts/spoke-model.env"
+        else
+            warn "could not render spoke-model.env from $AI_TOOLKIT_CONFIG — skipped"
+        fi
+    fi
 }
 
 # ═══════════════════════════════════════════
@@ -534,6 +565,34 @@ sync_config_files() {
     _sync_config ".gitignore"
     _sync_config ".editorconfig"
     _sync_config ".python-version"
+}
+
+# ═══════════════════════════════════════════
+#  BASE BRANCH (issue #142)
+# ═══════════════════════════════════════════
+# Apply the config's `base_branch` to `git config ai-toolkit.base-branch` on the
+# target, so the canonical wt_base_branch resolver (issue #117) — consumed by
+# worktree-new/land/done/quick, the hub scripts and every guard — picks it up
+# unchanged. The config OWNS the value: an empty/absent base_branch clears any
+# prior setting, restoring today's origin/HEAD→main auto-detection.
+apply_base_branch_config() {
+    [ -e "$TARGET/.git" ] || return 0   # only a git repo carries config
+    local bb
+    bb="$(python3 "$SCRIPT_DIR/ai_toolkit_config.py" base-branch "$AI_TOOLKIT_CONFIG" 2>/dev/null || true)"
+    section "Base branch (ai-toolkit.base-branch)"
+    if [ -n "$bb" ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "[dry-run] would set git config ai-toolkit.base-branch=$bb"
+        else
+            git -C "$TARGET" config ai-toolkit.base-branch "$bb"
+            info "base-branch → $bb"
+        fi
+    elif [ "$DRY_RUN" -eq 1 ]; then
+        echo "[dry-run] would clear git config ai-toolkit.base-branch (auto-detect)"
+    else
+        git -C "$TARGET" config --unset ai-toolkit.base-branch 2>/dev/null || true
+        info "base-branch → auto-detect (unset)"
+    fi
 }
 
 # ═══════════════════════════════════════════
@@ -613,6 +672,8 @@ case "$TOOL" in
     all)     sync_tool copilot; sync_tool cursor; sync_tool claude; sync_config_files ;;
     *)       error "Unknown tool: $TOOL"; usage ;;
 esac
+
+apply_base_branch_config
 
 if [ "$WITH_GIT_HOOKS" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
     sync_git_hooks

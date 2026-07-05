@@ -124,6 +124,21 @@ else
   LANE="express"          # ad-hoc, no-issue express spoke (#102)
 fi
 
+# --- per-issue Model: override (issue #142) ----------------------------------
+# A `Model: <id>` line in a numbered issue's body pins THIS spoke's driver model
+# (same first-match, case-insensitive convention as Scope:/Gate:). An explicit
+# WT_AGENT_MODEL from the environment always wins, so this only runs when unset.
+if [ -z "${WT_AGENT_MODEL:-}" ] && [[ "$ISSUE" =~ ^[0-9]+$ ]] && command -v gh >/dev/null 2>&1; then
+  ISSUE_BODY="$(gh issue view "$ISSUE" --json body -q .body 2>/dev/null || true)"
+  MODEL_LINE="$(printf '%s\n' "$ISSUE_BODY" \
+    | grep -iE '^[[:space:]]*model:[[:space:]]*[^[:space:]]' | head -1 || true)"
+  if [ -n "$MODEL_LINE" ]; then
+    WT_AGENT_MODEL="$(printf '%s' "$MODEL_LINE" \
+      | sed -E 's/^[[:space:]]*[Mm][Oo][Dd][Ee][Ll]:[[:space:]]*//; s/[[:space:]]+$//')"
+    echo "→ per-issue model  $WT_AGENT_MODEL (from issue #$ISSUE Model: line)"
+  fi
+fi
+
 WT_DIR="$(dirname "$REPO_ROOT")/$(basename "$REPO_ROOT")-${WT_TAG}"
 
 # --- create the worktree -----------------------------------------------------
@@ -400,7 +415,26 @@ if [ "${AI_TOOLKIT_OTEL:-}" = "1" ]; then
   # (OTEL_EXPORTER_OTLP_HEADERS) is deliberately NOT here — it stays inherited env.
   OTEL_PREFIX="CLAUDE_CODE_ENABLE_TELEMETRY=1 CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 OTEL_TRACES_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp ENABLE_BETA_TRACING_DETAILED=1 OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false OTEL_EXPORTER_OTLP_PROTOCOL=grpc OTEL_EXPORTER_OTLP_ENDPOINT=$(printf '%q' "$OTEL_EXPORTER_OTLP_ENDPOINT") BETA_TRACING_ENDPOINT=$(printf '%q' "$BETA_TRACING_ENDPOINT") AI_TOOLKIT_OTEL_SPAN_ENDPOINT=$(printf '%q' "$AI_TOOLKIT_OTEL_SPAN_ENDPOINT") OTEL_LOG_USER_PROMPTS=1 OTEL_LOG_TOOL_DETAILS=1 OTEL_LOG_TOOL_CONTENT=1 OTEL_LOG_RAW_API_BODIES=$(printf '%q' "file:${OTEL_BODY_DIR}") AI_TOOLKIT_OTEL_BODY_DIR=$(printf '%q' "$OTEL_BODY_DIR") OTEL_RESOURCE_ATTRIBUTES=$(printf '%q' "spoke_run_id=${SPOKE_RUN_ID}") "
 fi
-AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(printf '%q' "${WT_AGENT_EFFORT:-max}") claude --model $(printf '%q' "${WT_AGENT_MODEL:-claude-opus-4-8[1m]}")"
+
+# Resolve the spoke driver's default model/effort from the declarative config
+# (issue #142), layered so it works both in a synced target AND in the hub:
+#   1. the sync-emitted spoke-model.env co-located with this script, else
+#   2. the hub's settings/ai-toolkit.yml via the config parser, else
+#   3. the historical literal defaults.
+# An explicit WT_AGENT_MODEL / WT_AGENT_EFFORT (env, or the Model: line above)
+# always wins — the defaults only fill an unset value below.
+# The hub-side config path honors AI_TOOLKIT_CONFIG like sync-to-repo.sh does.
+WT_CONFIG="${AI_TOOLKIT_CONFIG:-$REPO_ROOT/settings/ai-toolkit.yml}"
+if [ -f "$SCRIPT_DIR/spoke-model.env" ]; then
+  # shellcheck disable=SC1091
+  . "$SCRIPT_DIR/spoke-model.env"
+elif [ -f "$SCRIPT_DIR/ai_toolkit_config.py" ] && [ -f "$WT_CONFIG" ]; then
+  eval "$(python3 "$SCRIPT_DIR/ai_toolkit_config.py" spoke-env "$WT_CONFIG" 2>/dev/null || true)"
+fi
+WT_AGENT_MODEL="${WT_AGENT_MODEL:-${WT_AGENT_MODEL_DEFAULT:-claude-opus-4-8[1m]}}"
+WT_AGENT_EFFORT="${WT_AGENT_EFFORT:-${WT_AGENT_EFFORT_DEFAULT:-max}}"
+
+AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(printf '%q' "$WT_AGENT_EFFORT") claude --model $(printf '%q' "$WT_AGENT_MODEL")"
 # Best-effort in-process budget cap for unattended spokes. A caller may set
 # WT_AGENT_BUDGET_ARGS (e.g. "--max-budget-usd 5"); it is a pre-formed multi-arg
 # string appended verbatim (NOT %q-quoted), so leave it unset for ordinary attended

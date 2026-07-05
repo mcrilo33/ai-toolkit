@@ -146,6 +146,21 @@ def _run_new(
         "exit 0\n"
     )
     tmux.chmod(0o755)
+    # A logging `gh` stub so the issue fetch (title/body) is hermetic. It answers
+    # `gh issue view N --json title …` with $GH_ISSUE_TITLE and `--json body …`
+    # with $GH_ISSUE_BODY, so a test can seed a `Model:` line into the body
+    # (issue #142). The title fetch runs on the no-slug numeric path; the body
+    # fetch (Model: override) runs for ANY numbered issue, so the stub keeps both
+    # off the network regardless of whether a slug was passed.
+    gh = bindir / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        '  *"--json title"*) printf "%s\\n" "${GH_ISSUE_TITLE:-Some Issue Title}" ;;\n'
+        '  *"--json body"*)  printf "%s\\n" "$GH_ISSUE_BODY" ;;\n'
+        "esac\n"
+    )
+    gh.chmod(0o755)
     # HOME is sandboxed so the workspace-file default ($HOME/.claude/….code-workspace,
     # issue #134) can never resolve to — let alone rewrite — the host's real file.
     home = tmp_path / "home"
@@ -162,6 +177,12 @@ def _run_new(
     env.pop("WT_AGENT_MODEL", None)
     env.pop("WT_AGENT_EFFORT", None)
     env.pop("WT_AGENT_BUDGET_ARGS", None)
+    # The config-sourced spoke defaults (issue #142) and the gh-stub seeds must
+    # not leak from the host either — each test sets what it needs via extra_env.
+    env.pop("WT_AGENT_MODEL_DEFAULT", None)
+    env.pop("WT_AGENT_EFFORT_DEFAULT", None)
+    env.pop("GH_ISSUE_TITLE", None)
+    env.pop("GH_ISSUE_BODY", None)
     # The native-OTel gate (issue #83; default-on per otel-default) and any inherited
     # OTEL_* / telemetry vars must not leak in either: the default-on/opt-out behaviour
     # and the secret-handling are under test, so popping AI_TOOLKIT_OTEL lets a test
@@ -416,6 +437,65 @@ def test_agent_launch_keeps_seeded_prompt_after_pinning(hub: Path, tmp_path: Pat
     assert (
         "CLAUDE_EFFORT=max claude --model claude-opus-4-8\\[1m\\] /source; exec " in new_window[0]
     )
+
+
+# ── Per-issue Model: override + config spoke default (issue #142) ──
+
+
+def test_issue_model_line_pins_spoke_model(hub: Path, tmp_path: Path) -> None:
+    # A numeric issue (hub flow, no slug) whose body carries a `Model:` line
+    # spawns its spoke on that model. A leading lowercase `model:` proves
+    # case-insensitivity; the second `Model:` proves first-match-wins.
+    body = "Some description.\n\nmodel: claude-sonnet-5\nModel: claude-opus-4-8\n"
+
+    proc, log = _run_new(hub, tmp_path, "8", "--no-code", extra_env={"GH_ISSUE_BODY": body})
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    assert "claude --model claude-sonnet-5; exec " in new_window[0]
+
+
+def test_env_model_overrides_issue_model_line(hub: Path, tmp_path: Path) -> None:
+    # An explicit WT_AGENT_MODEL always wins over a body `Model:` line.
+    env = {"GH_ISSUE_BODY": "Model: claude-sonnet-5\n", "WT_AGENT_MODEL": "opus-pinned"}
+
+    proc, log = _run_new(hub, tmp_path, "8", "--no-code", extra_env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    assert "claude --model opus-pinned; exec " in new_window[0]
+
+
+def test_spoke_default_sourced_from_config_env(hub: Path, tmp_path: Path) -> None:
+    # Absent an explicit model / Model: line, the spoke driver takes the
+    # config-sourced default (WT_AGENT_MODEL_DEFAULT / WT_AGENT_EFFORT_DEFAULT,
+    # emitted into spoke-model.env by sync), not a hardcoded literal.
+    env = {"WT_AGENT_MODEL_DEFAULT": "team-opus", "WT_AGENT_EFFORT_DEFAULT": "high"}
+
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", extra_env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    assert "CLAUDE_EFFORT=high claude --model team-opus; exec " in new_window[0]
+
+
+def test_spoke_default_resolved_from_config_file(hub: Path, tmp_path: Path) -> None:
+    # The hub fallback reads the config directly (via the parser) and evals its
+    # spoke-env output — driving the real load path, not just the env fallback.
+    cfg = tmp_path / "ai-toolkit.yml"
+    cfg.write_text("model:\n  spoke:\n    model: config-file-model\n    effort: low\n")
+
+    proc, log = _run_new(
+        hub, tmp_path, "8", "some-slug", "--no-code", extra_env={"AI_TOOLKIT_CONFIG": str(cfg)}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    assert "CLAUDE_EFFORT=low claude --model config-file-model; exec " in new_window[0]
 
 
 def test_agent_launch_shell_quotes_metacharacter_overrides(hub: Path, tmp_path: Path) -> None:
@@ -857,9 +937,21 @@ def _bare_push_rules(branch: str) -> list[str]:
 
 
 def _run_new_quiet(hub: Path, *args: str) -> subprocess.CompletedProcess:
-    """Run worktree-new.sh from the hub, hermetically (no VS Code, no tmux)."""
-    env = {**_GIT_ENV}
+    """Run worktree-new.sh from the hub, hermetically (no VS Code, tmux, or gh).
+
+    The per-issue Model: fetch (issue #142) calls `gh issue view` for any numbered
+    issue, so a no-output `gh` stub on PATH (plus stripped GH_* auth) keeps these
+    runs off the network — the issue body is empty, so no Model: override applies.
+    """
+    bindir = hub.parent / f"{hub.name}-quiet-bin"
+    bindir.mkdir(exist_ok=True)
+    gh = bindir / "gh"
+    gh.write_text("#!/bin/sh\nexit 0\n")
+    gh.chmod(0o755)
+    env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
     env.pop("TMUX", None)
+    for _k in ("GH_TOKEN", "GITHUB_TOKEN", "GH_REPO", "GH_HOST"):
+        env.pop(_k, None)
     return subprocess.run(
         ["bash", str(WORKTREE_NEW), *args, "--no-code", "--no-terminal"],
         cwd=str(hub),
