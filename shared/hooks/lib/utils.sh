@@ -844,7 +844,7 @@ _tripwire_cfg_value() {
 # flipped core.bare, both fully restored.
 tripwire_restore() {
   local before="$1" kind sha name snap_refs wt_refs cur_sha cur_ref
-  wt_refs="$(git worktree list --porcelain 2>/dev/null | awk '$1=="branch" {print $2}')"
+  wt_refs="$(git worktree list --porcelain 2>/dev/null | awk '$1=="branch" {print $2}' || true)"
   # Reset every snapshot ref to its captured tip (HEAD is symbolic — it follows
   # its branch, so resetting the branch ref restores it) — unless that would
   # rewind the ref to a strict ancestor of where it is now.

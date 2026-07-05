@@ -153,6 +153,7 @@ def test_restore_skips_deleting_ref_checked_out_in_worktree(repo: Path, tmp_path
 
     assert proc.returncode == 0, proc.stderr
     assert _rev(repo, "refs/heads/feature/spawned")  # still exists
+    assert "NOT deleting" in proc.stderr  # and the skip is named
 
 
 def test_check_detects_bare_flip(repo: Path) -> None:
