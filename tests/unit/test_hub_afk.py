@@ -1069,6 +1069,65 @@ def test_decide_and_act_aborts_when_question_changed(tmp_path: Path) -> None:
     assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
 
 
+def test_decide_and_act_gate_park_moved_on_aborts(tmp_path: Path) -> None:
+    # The gate tag stays at the tip until the spoke's FIRST COMMIT, so a spoke that
+    # resumed inside that window (a human approved in-pane, or it self-approved and
+    # kept coding, #117) still reads "parked" by the tag alone. The re-check must see
+    # the transcript movement and drop the stale gate answer — the #129 shape.
+    spoke = _branched_spoke(tmp_path, ahead=True, name="gate-spoke", branch="feature/5-fix")
+    subprocess.run(["git", "tag", "gate/5"], cwd=spoke, check=True, capture_output=True)
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke)
+    fake_bin, tmux_log = _injector_tmux(tmp_path, capture="│ > │\n", pane_path=spoke)
+    env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
+    _write_transcript(pd, _gate_park_records(5))
+    # The answerer's side effect: a human approved in-pane while it reasoned (a user
+    # text turn lands; no commit, so gate/5 is still at the tip).
+    human_reply = json.dumps(
+        {"type": "user", "message": {"content": [{"type": "text", "text": "approved, go ahead"}]}}
+    )
+    env["AFK_ANSWERER_CMD"] = (
+        f"printf '%s\\n' '{human_reply}' >> \"{pd / 'session.jsonl'}\"; "
+        "printf 'ANSWER: Approved, proceed with the plan.'"
+    )
+
+    result = _call(f"decide_and_act '{spoke}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    tmux_calls = tmux_log.read_text() if tmux_log.exists() else ""
+    assert " -l " not in f" {tmux_calls} ", "a stale gate answer must never land mid-turn"
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
+
+
+def test_decide_and_act_moved_on_seed_replay_drops_not_blocks(tmp_path: Path) -> None:
+    # Park freshness gates everything: a spoke that moved on while the answerer
+    # reasoned gets a silent drop even when the stale answer is ALSO a seed replay —
+    # escalating would stamp a spurious blocked/<issue> on an actively-working spoke.
+    spoke = _branched_spoke(tmp_path, ahead=True, name="replay-spoke", branch="feature/5-fix")
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke)
+    fake_bin, tmux_log = _injector_tmux(tmp_path, capture="│ > │\n", pane_path=spoke)
+    env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
+    _write_transcript(pd, [_seed_record(), _ask_record("Which store?", [("Redis", "fast")])])
+    human_reply = json.dumps(
+        {"type": "user", "message": {"content": [{"type": "text", "text": "use Redis"}]}}
+    )
+    env["AFK_ANSWERER_CMD"] = (
+        f"printf '%s\\n' '{human_reply}' >> \"{pd / 'session.jsonl'}\"; "
+        'printf "ANSWER: %s" "$_AFK_SEED"'
+    )
+    env["_AFK_SEED"] = _SEED_PROMPT[:300]
+
+    result = _call(f"decide_and_act '{spoke}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    tmux_calls = tmux_log.read_text() if tmux_log.exists() else ""
+    assert " -l " not in f" {tmux_calls} "
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
+        "moved-on wins over seed-replay: drop, never a spurious blocked marker"
+    )
+
+
 # ── the ANSWERER orchestration (stubbed answerer + spoke-ready) ───────────────
 
 

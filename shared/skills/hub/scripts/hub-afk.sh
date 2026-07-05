@@ -496,16 +496,23 @@ _gate_parked() {
   [ "$(git -C "$wt" rev-parse -q --verify "refs/tags/gate/${issue}^{commit}" 2>/dev/null)" = "$tip" ]
 }
 
-# _still_parked_same <wt> <issue> <was_gate> <question> -> true when the spoke is still
-# parked on the SAME prompt the answerer reasoned about. The answerer takes minutes; a
-# spoke that moved on meanwhile (a human replied, the turn resumed) must not receive
-# the stale answer mid-turn (#129/#89), and a spoke now parked on a DIFFERENT question
-# needs a fresh answer, not this one.
+# _still_parked_same <wt> <issue> <was_gate> <question> <before_mtime> -> true when the
+# spoke is still parked on the SAME prompt the answerer reasoned about. The answerer
+# takes minutes; a spoke that moved on meanwhile (a human replied, the turn resumed)
+# must not receive the stale answer mid-turn (#129/#89), and a spoke now parked on a
+# DIFFERENT question needs a fresh answer, not this one. Three signals, ALL required:
+#   - the transcript has not moved since the answerer started (<before_mtime>) — any
+#     write means activity, and a gate tag alone can't be trusted: it stays at the tip
+#     until the FIRST COMMIT, so a spoke that self-approved and kept coding (#117), or
+#     a human approving in-pane, still reads "parked" by the tag;
+#   - for a gate park, the gate/<issue> tag is still at the tip;
+#   - the extraction is unchanged (catches a same-second write mtime can't see; for an
+#     unextractable gate park this is the vacuous "" = "").
 _still_parked_same() {
-  local wt="$1" issue="$2" was_gate="$3" question="$4"
+  local wt="$1" issue="$2" was_gate="$3" question="$4" before="$5"
+  [ "$(_transcript_mtime "$wt")" = "$before" ] || return 1
   if [ "$was_gate" -eq 1 ]; then
-    _gate_parked "$wt" "$issue"
-    return $?
+    _gate_parked "$wt" "$issue" || return 1
   fi
   [ "$(extract_pending_question "$wt")" = "$question" ]
 }
@@ -725,6 +732,7 @@ ${orig_question:-(the plan prose could not be extracted from the transcript — 
   elif [ -z "$question" ]; then
     return 0
   fi
+  local parked_mtime; parked_mtime="$(_transcript_mtime "$wt")"
   log "→ answering #$issue (parked on input)"
   raw="$(run_answerer "$issue" "$question")"; rc=$?
   # The answerer is the supervisor's own `claude`; if its credentials are dead, every
@@ -743,14 +751,16 @@ ${orig_question:-(the plan prose could not be extracted from the transcript — 
   kind="${decision%%$'\t'*}"
   text="${decision#*$'\t'}"
   if [ "$kind" = "ANSWER" ] && [ -n "$text" ]; then
-    if _is_seed_replay "$wt" "$text"; then
-      log "  answer to #$issue replays the spoke's own seed prompt — suppressing (#124)"
-      text="answerer replayed the spoke's seed prompt — suppressed; needs a human"
-    elif ! _still_parked_same "$wt" "$issue" "$was_gate" "$orig_question"; then
-      # The spoke moved on while the answerer reasoned — injecting now would land
-      # mid-turn (#129/#89). Drop the stale answer; the next tick re-evaluates.
+    # Park freshness gates EVERYTHING: if the spoke moved on while the answerer
+    # reasoned, nothing happens regardless of the answer's content — injecting would
+    # land mid-turn (#129/#89) and even a seed-replay escalation would stamp a
+    # spurious blocked/<issue> on an actively-working spoke.
+    if ! _still_parked_same "$wt" "$issue" "$was_gate" "$orig_question" "$parked_mtime"; then
       log "  #$issue is no longer parked on that prompt — dropping the stale answer"
       return 0
+    elif _is_seed_replay "$wt" "$text"; then
+      log "  answer to #$issue replays the spoke's own seed prompt — suppressing (#124)"
+      text="answerer replayed the spoke's seed prompt — suppressed; needs a human"
     else
       target="$(_spoke_pane_target "$wt")"
       if [ -z "$target" ]; then
