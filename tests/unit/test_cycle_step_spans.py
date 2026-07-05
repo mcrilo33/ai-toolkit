@@ -239,3 +239,62 @@ class TestCycleStepMarkerHelper:
         _mark("push", "key1", _env(telemetry_dir), project_root)
 
         assert len(_steps(telemetry_dir)) == 1
+
+    def test_survives_set_e_caller(self, project_root: Path, telemetry_dir: Path) -> None:
+        # The gates that call the helper run under `set -euo pipefail` — no
+        # failure inside the helper may abort them. The skipped-reemit path is
+        # the riskiest (early return from the redirected group), so exercise it
+        # twice and require the caller to reach its final echo both times.
+        script = (
+            f'set -euo pipefail; . "{TELEMETRY_LIB}"; '
+            "telemetry_mark_cycle_step push key1; "
+            "telemetry_mark_cycle_step push key1; "
+            "echo reached"
+        )
+        result = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env=_env(telemetry_dir),
+            cwd=str(project_root),
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "reached\n"
+        assert len(_steps(telemetry_dir)) == 1
+
+    def test_default_key_is_head_sha(self, tmp_path: Path, telemetry_dir: Path) -> None:
+        # No explicit key → the sentinel records the project root's HEAD sha,
+        # so a re-run at the same tip is deduped and a new commit emits again.
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        git_env = {**_env(telemetry_dir), "GIT_CONFIG_GLOBAL": "/dev/null"}
+
+        def _git(*args: str) -> None:
+            subprocess.run(
+                ["git", *args], cwd=str(repo), check=True, capture_output=True, env=git_env
+            )
+
+        _git("init", "-q")
+        _git("config", "user.email", "t@t.t")
+        _git("config", "user.name", "t")
+        _git("config", "commit.gpgsign", "false")
+        (repo / "f.txt").write_text("one\n")
+        _git("add", "f.txt")
+        _git("commit", "-qm", "one")
+
+        _mark("push", "", git_env, repo)
+        _mark("push", "", git_env, repo)
+
+        assert len(_steps(telemetry_dir)) == 1
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=str(repo), capture_output=True, text=True
+        ).stdout.strip()
+        assert (repo / ".ai-toolkit" / "cycle-step-push").read_text().strip() == head
+
+        (repo / "f.txt").write_text("two\n")
+        _git("add", "f.txt")
+        _git("commit", "-qm", "two")
+        _mark("push", "", git_env, repo)
+
+        assert len(_steps(telemetry_dir)) == 2
