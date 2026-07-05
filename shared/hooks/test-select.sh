@@ -9,11 +9,16 @@
 #
 # TIERS (over the set of changed files):
 #   • every changed file is docs-only (*.md, docs/, LICENSE, *.rst, images)
+#     or exempt (repo-root .test-select-exempt)
 #       → run NOTHING
-#   • every non-doc changed file is *.py
-#       → pytest --testmon   (coverage-based test-impact analysis)
-#   • anything else (.sh, Dockerfile, *.yml, Makefile, unrecognized)
-#       → the FULL suite
+#   • every non-doc/non-exempt changed file is *.py
+#       → pytest --testmon (+ the control-plane coverage meta-test, #123)
+#   • every non-python changed file maps to referencing tests (reverse index,
+#     issue #123)
+#       → run exactly the mapped test files (+ meta-test; + --testmon when
+#         the diff also touches python)
+#   • anything else (an unmapped, non-exempt file)
+#       → the FULL suite (which contains the meta-test natively)
 #
 # SAFE FALLBACKS:
 #   • testmon not installed  → full suite (never silently skip python tests)
@@ -58,6 +63,18 @@ if [ -f "$HOOK_DIR/lib/gate-stamp.sh" ]; then
   STAMPS=1
 fi
 
+# Reverse index (issue #123): map changed non-python files to the test files
+# that reference them, so a shell/config diff runs its mapped tests instead of
+# the full suite. Absent in a stale installed hook copy (the same #45 trap as
+# above) — degrade to no index, which the tier logic below treats as "nothing
+# mapped", i.e. today's full-suite escalation.
+RINDEX=0
+if [ -f "$HOOK_DIR/lib/test-reverse-index.sh" ]; then
+  # shellcheck source=lib/test-reverse-index.sh
+  source "$HOOK_DIR/lib/test-reverse-index.sh"
+  RINDEX=1
+fi
+
 note() { echo "test-select: $*" >&2; }
 
 # Defense-in-depth for issue #30: git exports GIT_DIR/GIT_WORK_TREE/etc. into this
@@ -94,6 +111,9 @@ fi
 # ── Classification helpers ──────────────────────────────────────────────────────
 is_doc() {
   case "$1" in
+    # A script/config suffix is never docs, wherever it lives: */docs/* must
+    # not swallow a control-plane script the coverage meta-test claims (#123).
+    *.sh|*.yml|*.yaml) return 1 ;;
     *.md|*.rst) return 0 ;;
     docs/*|*/docs/*) return 0 ;;
     LICENSE|*/LICENSE) return 0 ;;
@@ -103,6 +123,29 @@ is_doc() {
 }
 
 is_py() { case "$1" in *.py) return 0 ;; *) return 1 ;; esac; }
+
+# Exempt handling (issue #123): the parser lives in lib/test-reverse-index.sh
+# (reverse_index_is_exempt) so this gate and the commit-time nudge share one
+# definition of "exempt". Note the list's own basename (.test-select-exempt)
+# can never be a filename-shaped token, so editing it is unmapped by
+# construction and escalates to the full suite: high-stakes changes to what
+# the gate ignores always pay the maximum price. Without the lib (a stale
+# installed hook) there are no exemptions — conservative, like the index.
+if [ "$RINDEX" = "1" ]; then
+  is_exempt() { reverse_index_is_exempt "$1"; }
+else
+  is_exempt() { return 1; }
+fi
+
+# The control-plane coverage meta-test (issue #123): a milliseconds static
+# scan asserting every control-plane script has a referencing test or an
+# exemption. It rides every tier that runs pytest — SELECTED appends it to
+# the selection, the testmon tier adds a separate invocation, and the full
+# suite contains it natively — so an unmapped script can never land: its push
+# escalates to FULL and the meta-test there is red until a test references
+# it. Guarded on file existence: synced repos without the file are unaffected.
+META_TEST_FILE="tests/unit/test_test_reverse_index.py"
+META_TEST_NODE="$META_TEST_FILE::TestControlPlaneCoverage"
 
 is_zero_sha() {
   local sha="$1"
@@ -174,17 +217,55 @@ fi
 # it python so testmon can judge its impact, rather than skipping it as a doc.
 has_py=0
 has_other=0
+UNMAPPED=0
+UNMAPPED_FILE=""
+MAPPED_TESTS=""
+EXEMPT_SKIPPED=0
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   if is_py "$f"; then has_py=1; continue; fi
   if is_doc "$f"; then continue; fi
-  has_other=1
+  # Reverse-index lookup FIRST, exemption second (B-review hardening): an
+  # exempt entry can only mute the escalation of a file the index cannot map —
+  # it can never hide existing mapped coverage. Every mapped non-python file
+  # adds its referencing tests to the selection; a single unmapped, non-exempt
+  # file escalates the whole push to the full suite (default-to-full).
+  mapped=""
+  if [ "$RINDEX" = "1" ]; then
+    mapped="$(reverse_index_tests_for "$f")"
+  fi
+  if [ -n "$mapped" ]; then
+    has_other=1
+    MAPPED_TESTS="$MAPPED_TESTS$mapped"$'\n'
+  elif is_exempt "$f"; then
+    EXEMPT_SKIPPED=$((EXEMPT_SKIPPED + 1))
+  else
+    has_other=1
+    UNMAPPED=1
+    [ -n "$UNMAPPED_FILE" ] || UNMAPPED_FILE="$f"
+  fi
 done <<< "$FILES"
+
+# The selection: deduped, and every entry must still exist — a mapping to a
+# vanished test proves nothing, so it escalates instead.
+SELECTED_TESTS=""
+if [ "$has_other" = "1" ] && [ "$UNMAPPED" = "0" ]; then
+  SELECTED_TESTS="$(printf '%s' "$MAPPED_TESTS" | sort -u)"
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    if [ ! -f "$t" ]; then
+      UNMAPPED=1
+      UNMAPPED_FILE="$t (mapped test missing)"
+    fi
+  done <<< "$SELECTED_TESTS"
+fi
 
 if [ "$CANNOT_PROVE" = "1" ]; then
   DECISION=FULL
-elif [ "$has_other" = "1" ]; then
+elif [ "$has_other" = "1" ] && [ "$UNMAPPED" = "1" ]; then
   DECISION=FULL
+elif [ "$has_other" = "1" ]; then
+  DECISION=SELECTED
 elif [ "$has_py" = "1" ]; then
   DECISION=PYTHON
 else
@@ -192,7 +273,11 @@ else
 fi
 
 if [ "$DECISION" = "NOTHING" ]; then
-  note "docs-only (or empty) diff — no tests to run"
+  if [ "$EXEMPT_SKIPPED" -gt 0 ]; then
+    note "docs/exempt-only diff ($EXEMPT_SKIPPED exempt file(s), .test-select-exempt) — no tests to run"
+  else
+    note "docs-only (or empty) diff — no tests to run"
+  fi
   exit 0
 fi
 
@@ -217,11 +302,25 @@ runner_has_testmon() {
   esac
 }
 
-# ── Green-tree stamp consult (issue #122) ───────────────────────────────────────
+# A mixed SELECTED diff needs testmon for its python part; without testmon the
+# python part demands the full suite (the same fallback as the PYTHON tier).
+if [ "$DECISION" = "SELECTED" ] && [ "$has_py" = "1" ] && ! runner_has_testmon; then
+  note "mixed diff but testmon not installed — full suite"
+  DECISION=FULL
+fi
+
+# ── Green-tree stamp consult (issue #122; set-aware selected tier #123-D) ───────
 # TIER_TO_RUN names the suite this gate is about to execute — that is both the
 # demand a stamp must cover and the tier a passing run proves. A python diff
-# without testmon runs (and therefore proves) the FULL suite.
-if [ "$DECISION" = "PYTHON" ] && runner_has_testmon; then
+# without testmon runs (and therefore proves) the FULL suite. A SELECTED run's
+# proof is the exact set that ran (comma-joined), plus testmon for a mixed
+# diff — both travel with the demand and the mint.
+SET_CSV=""
+if [ "$DECISION" = "SELECTED" ]; then
+  TIER_TO_RUN=selected
+  SET_CSV="$(printf '%s' "$SELECTED_TESTS" | tr '\n' ',')"
+  SET_CSV="${SET_CSV%,}"
+elif [ "$DECISION" = "PYTHON" ] && runner_has_testmon; then
   TIER_TO_RUN=testmon
 else
   TIER_TO_RUN=full
@@ -247,8 +346,15 @@ if [ "$STAMPS" = "1" ]; then
     if gate_stamp_has "$STAMP_TREE"; then
       STAMP_ENV="$(runner_fingerprint)"
       STAMP_ENV_PROBED=1
-      if gate_stamp_check "$STAMP_TREE" "$TIER_TO_RUN" "$STAMP_ENV"; then
-        note "green-tree stamp covers tree $STAMP_TREE (proven ≥ $TIER_TO_RUN for this env) — skipping suite"
+      # The two trailing args matter only for a selected demand (the set and
+      # whether the diff is mixed); full/testmon demands ignore them. An
+      # installed stamp lib predating #123-D also just ignores them.
+      if gate_stamp_check "$STAMP_TREE" "$TIER_TO_RUN" "$STAMP_ENV" "$SET_CSV" "$has_py"; then
+        if [ "$TIER_TO_RUN" = "selected" ]; then
+          note "green-tree stamp covers tree $STAMP_TREE (this selection already proven for this env) — skipping suite"
+        else
+          note "green-tree stamp covers tree $STAMP_TREE (proven ≥ $TIER_TO_RUN for this env) — skipping suite"
+        fi
         exit 0
       fi
     fi
@@ -269,13 +375,42 @@ case "$DECISION" in
     if [ "$TIER_TO_RUN" = "testmon" ]; then
       note "python-only diff — pytest --testmon"
       run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" --testmon || rc=$?
+      # The meta-test rides along as its own invocation: mixing an explicit
+      # node id into --testmon would let testmon deselect it.
+      if [ -f "$META_TEST_FILE" ]; then
+        note "control-plane coverage meta-test"
+        rc2=0
+        run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" "$META_TEST_NODE" || rc2=$?
+        [ "$rc" -ne 0 ] || rc=$rc2
+      fi
     else
       note "python-only diff but testmon not installed — full suite"
       run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" || rc=$?
     fi
     ;;
+  SELECTED)
+    SEL_ARR=()
+    while IFS= read -r t; do
+      [ -n "$t" ] && SEL_ARR+=("$t")
+    done <<< "$SELECTED_TESTS"
+    if [ -f "$META_TEST_FILE" ]; then
+      SEL_ARR+=("$META_TEST_NODE")
+    fi
+    note "mapped diff — selected test files: ${SEL_ARR[*]}"
+    run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" "${SEL_ARR[@]}" || rc=$?
+    if [ "$has_py" = "1" ]; then
+      note "mixed diff — pytest --testmon for the python part"
+      rc2=0
+      run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" --testmon || rc2=$?
+      [ "$rc" -ne 0 ] || rc=$rc2
+    fi
+    ;;
   FULL)
-    note "non-python or unrecognized changes — full suite"
+    if [ -n "$UNMAPPED_FILE" ]; then
+      note "unmapped non-exempt change ($UNMAPPED_FILE) — full suite; add a test referencing it or a .test-select-exempt entry"
+    else
+      note "non-python or unrecognized changes — full suite"
+    fi
     run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" || rc=$?
     ;;
 esac
@@ -287,7 +422,13 @@ if [ "$rc" -eq 0 ] && [ "$STAMPS" = "1" ] && [ -n "$STAMP_TREE" ]; then
   if [ "$STAMP_ENV_PROBED" = "0" ]; then
     STAMP_ENV="$(runner_fingerprint)"
   fi
-  gate_stamp_mint "$STAMP_TREE" "$TIER_TO_RUN" "$STAMP_ENV" \
+  # A selected mint records the set that ran; MINT_TESTMON=1 marks a mixed
+  # green run whose --testmon leg also passed (both legs share rc).
+  MINT_TESTMON=""
+  if [ "$DECISION" = "SELECTED" ] && [ "$has_py" = "1" ]; then
+    MINT_TESTMON=1
+  fi
+  gate_stamp_mint "$STAMP_TREE" "$TIER_TO_RUN" "$STAMP_ENV" "$SET_CSV" "$MINT_TESTMON" \
     || note "green-tree stamp: mint failed (non-fatal — next gate re-runs the suite)"
 fi
 exit "$rc"

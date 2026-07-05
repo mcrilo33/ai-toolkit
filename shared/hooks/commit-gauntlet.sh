@@ -58,6 +58,44 @@ PROJECT_ROOT=$(project_root_from_payload "$INPUT")
 STAGED=$(git -C "$PROJECT_ROOT" diff --cached --name-only --diff-filter=ACMR 2>/dev/null || true)
 [ -z "$STAGED" ] && exit 0
 
+# ── Advisory coverage nudge (issue #123) ──────────────────────────────────────
+# A staged NEW control-plane script (*.sh/*.yml/*.yaml under scripts/,
+# shared/hooks/, shared/skills/*/scripts/, dashboard/langfuse/ — the same
+# paths the coverage meta-test enforces) with no referencing test and no
+# .test-select-exempt entry will escalate its push to the full suite, where
+# the meta-test stays red until a test references it. Say so NOW, minutes
+# before the push gate blocks. Advisory only: never denies, and it runs
+# before the lint/typecheck flow (and its time budget) so it fires even in
+# repos with no linter configured. A stale installed hook without the lib
+# simply skips the nudge — and so does a CORRUPT lib copy: sourcing is gated
+# on a child-process `bash -n`, because a syntax error inside a bare `source`
+# would kill this hook at exit 0, silently fail-opening the blocking lint
+# gate below (E-review finding).
+if [ -f "$HOOK_DIR/lib/test-reverse-index.sh" ] \
+   && bash -n "$HOOK_DIR/lib/test-reverse-index.sh" 2>/dev/null; then
+  # shellcheck source=lib/test-reverse-index.sh
+  source "$HOOK_DIR/lib/test-reverse-index.sh"
+  NUDGE_ADDED=$(git -C "$PROJECT_ROOT" diff --cached --name-only --diff-filter=A 2>/dev/null || true)
+  while IFS= read -r nf; do
+    [ -n "$nf" ] || continue
+    case "$nf" in
+      scripts/*|shared/hooks/*|shared/skills/*/scripts/*|dashboard/langfuse/*) ;;
+      *) continue ;;
+    esac
+    case "$nf" in
+      *.sh|*.yml|*.yaml) ;;
+      *) continue ;;
+    esac
+    # The lib operates on $PWD: run both probes from the repo root. A dirty
+    # tests/ scans the working tree, so a referencing test staged in this
+    # same commit already satisfies the nudge.
+    nudge_mapped="$(cd "$PROJECT_ROOT" 2>/dev/null && reverse_index_tests_for "$nf")" || nudge_mapped=""
+    [ -z "$nudge_mapped" ] || continue
+    if (cd "$PROJECT_ROOT" 2>/dev/null && reverse_index_is_exempt "$nf"); then continue; fi
+    warn "commit-gauntlet: '$nf' is a new control-plane script with no referencing test — its push will escalate to the full suite and the coverage meta-test will stay red until a tests/**/test_*.py references it (or a .test-select-exempt entry exempts it). Advisory only: this commit proceeds."
+  done <<< "$NUDGE_ADDED"
+fi
+
 LINTER=$(detect_linter "$PROJECT_ROOT")
 TYPECHECKER=$(detect_typechecker "$PROJECT_ROOT")
 

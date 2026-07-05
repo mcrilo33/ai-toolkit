@@ -220,3 +220,30 @@ def test_pre_push_blocks_when_selector_missing(repo: Path) -> None:
 
     assert push.returncode != 0  # no gate, no ship
     assert _remote_sha(repo) == seed
+
+
+def test_reverse_index_lib_copied_into_hooks(repo: Path) -> None:
+    # #123-D review: the installed pre-push cage is the actual ship gate; if
+    # lib/test-reverse-index.sh is missing from the copy list the selector
+    # runs with RINDEX=0 forever and the SELECTED tier never activates.
+    hooks = _install(repo)
+
+    lib = _scripts_dir(hooks) / "lib" / "test-reverse-index.sh"
+    assert lib.is_file()
+
+
+def test_telemetry_lib_copied_and_utils_sources_clean(repo: Path) -> None:
+    # utils.sh sources lib/telemetry.sh unconditionally; an install without it
+    # ships hooks that die at source-time with every push blocked (the
+    # 2026-07-04 hub outage). The installed utils must source successfully.
+    hooks = _install(repo)
+    lib_dir = _scripts_dir(hooks) / "lib"
+
+    assert (lib_dir / "telemetry.sh").is_file()
+    proc = subprocess.run(
+        ["bash", "-c", f'source "{lib_dir / "utils.sh"}" && echo OK'],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "OK" in proc.stdout

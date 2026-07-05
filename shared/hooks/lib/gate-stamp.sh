@@ -9,22 +9,45 @@
 #   • PLACE: <git-common-dir>/.gate-stamps/<tree> — shared by the hub and every
 #     spoke worktree, never in-tree, never pushed (same placement rationale as
 #     hub-ready-watch's last-seen set).
-#   • CONTENT: tier=<full|selected|testmon> and env=<runner fingerprint>.
-# Only the gate script mints stamps (scripted control plane). A consumer skips
-# only when the stamped tier is at least as strong as the demanded one AND the
-# env fingerprint matches exactly; a weaker stamp does not skip, and the
-# passing run that follows upgrades it (mint overwrites unconditionally).
+#   • CONTENT: tier=<full|selected-set|testmon>, env=<runner fingerprint>, and
+#     for a selection (issue #123) set=<comma-joined sorted test files that
+#     ran> plus testmon=1 when the green run also proved testmon (mixed diff).
+#     The stored token for a selection is `selected-set` — deliberately
+#     unknown to pre-#123-D rank-based readers, which rank it 0 and fail
+#     closed instead of treating a selection as ≥ testmon. Callers still say
+#     `selected`; mint renames on write.
+# Only the gate script mints stamps (scripted control plane). Coverage rules
+# (issue #123 replaced the pure rank order — a selection proves ONLY the set
+# it names):
+#   • a full stamp covers every demand;
+#   • a testmon demand is covered by a full or testmon stamp — never by a
+#     selection, which ran only its named files, not testmon's impact set;
+#   • a selected demand (set S, possibly mixed) is covered by a full stamp,
+#     or by a selected stamp whose recorded set ⊇ S (and which also carries
+#     testmon=1 when the demand is mixed). A legacy set-less selected stamp
+#     covers nothing.
+# The env fingerprint must always match exactly; a weaker stamp does not
+# skip, and the passing run that follows upgrades it (mint overwrites
+# unconditionally).
 
-# Rank a tier on the strength order full(3) > selected(2) > testmon(1).
-# Unknown tiers rank 0: an unknown stamp never covers, an unknown demand is
-# never satisfied.
-_gate_stamp_tier_rank() {
-  case "$1" in
-    full)     echo 3 ;;
-    selected) echo 2 ;;
-    testmon)  echo 1 ;;
-    *)        echo 0 ;;
-  esac
+# _gate_stamp_csv_subset <want-csv> <have-csv> — every comma-separated item of
+# `want` appears in `have`. Items split via parameter expansion, never word
+# splitting, so a glob metacharacter in a name stays literal on both sides (the
+# `case` section is quoted); a malformed empty item refuses. Items are
+# repo-relative test paths, which contain neither commas nor spaces (the same
+# assumption their argv hand-off to pytest already makes).
+_gate_stamp_csv_subset() {
+  local want="$1," have="$2" item
+  while [ -n "$want" ]; do
+    item="${want%%,*}"
+    want="${want#*,}"
+    [ -n "$item" ] || return 1
+    case ",$have," in
+      *",$item,"*) ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
 }
 
 # Print the absolute stamp directory <git-common-dir>/.gate-stamps. The main
@@ -50,16 +73,32 @@ gate_stamp_tree() {
   git rev-parse 'HEAD^{tree}' 2>/dev/null
 }
 
-# gate_stamp_mint <tree> <tier> <env> — record a passing run, then GC stamps
-# older than ~14 days. Temp-file + mv keeps concurrent gates atomic; two gates
-# racing on the same tree write identical content, so last-write-wins is
-# harmless. The GC also sweeps any orphaned temp files.
+# gate_stamp_mint <tree> <tier> <env> [<set-csv> [<testmon-flag>]] — record a
+# passing run, then GC stamps older than ~14 days. A selected mint passes the
+# set that ran (and testmon-flag=1 when the mixed run proved testmon too).
+# Temp-file + mv keeps concurrent gates atomic; two gates racing on the same
+# tree write identical content, so last-write-wins is harmless. The GC also
+# sweeps any orphaned temp files.
 gate_stamp_mint() {
-  local tree="$1" tier="$2" env_fp="$3" dir tmp
+  local tree="$1" tier="$2" env_fp="$3" set_csv="${4:-}" testmon_flag="${5:-}" dir tmp
+  # STORED-TOKEN RENAME (D-review): a set-bearing selection is stored as
+  # `selected-set`, a token every pre-#123-D reader ranks as unknown (0) and
+  # therefore never consumes — reusing `selected` would let an old rank-based
+  # reader in a sibling worktree treat it as ≥ testmon and silently skip. The
+  # caller-facing tier vocabulary stays {full, testmon, selected}.
+  if [ "$tier" = "selected" ]; then
+    tier="selected-set"
+  fi
   dir="$(gate_stamp_dir)" || return 1
   mkdir -p "$dir"
   tmp="$(mktemp "$dir/.mint.XXXXXX")" || return 1
   printf 'tier=%s\nenv=%s\n' "$tier" "$env_fp" > "$tmp"
+  if [ -n "$set_csv" ]; then
+    printf 'set=%s\n' "$set_csv" >> "$tmp"
+  fi
+  if [ "$testmon_flag" = "1" ]; then
+    printf 'testmon=1\n' >> "$tmp"
+  fi
   mv -f "$tmp" "$dir/$tree"
   find "$dir" -type f -mtime +14 -delete 2>/dev/null || true
 }
@@ -74,19 +113,44 @@ gate_stamp_has() {
   [ -f "$dir/$1" ]
 }
 
-# gate_stamp_check <tree> <demanded-tier> <env> — succeed iff a stamp covers
-# the demand: same tree, exact env-fingerprint match, stamped tier at least as
-# strong as the demanded one.
+# gate_stamp_check <tree> <demanded-tier> <env> [<demand-set-csv> [<mixed>]] —
+# succeed iff a stamp covers the demand: same tree, exact env-fingerprint
+# match, and the coverage rules from the header (a selection proves only the
+# set it names). The two optional args matter only for a selected demand.
 gate_stamp_check() {
-  local tree="$1" demanded="$2" env_fp="$3" dir stamp stamped_tier stamped_env
+  local tree="$1" demanded="$2" env_fp="$3" dset="${4:-}" dmixed="${5:-}"
+  local dir stamp stamped_tier stamped_env stamped_set stamped_testmon
   dir="$(gate_stamp_dir)" || return 1
   stamp="$dir/$tree"
   [ -f "$stamp" ] || return 1
   stamped_tier="$(sed -n 's/^tier=//p' "$stamp" | head -1)"
   stamped_env="$(sed -n 's/^env=//p' "$stamp" | head -1)"
   [ "$stamped_env" = "$env_fp" ] || return 1
-  local have want
-  have="$(_gate_stamp_tier_rank "$stamped_tier")"
-  want="$(_gate_stamp_tier_rank "$demanded")"
-  [ "$want" -gt 0 ] && [ "$have" -ge "$want" ]
+  case "$demanded" in
+    full)
+      [ "$stamped_tier" = "full" ]
+      ;;
+    testmon)
+      [ "$stamped_tier" = "full" ] || [ "$stamped_tier" = "testmon" ]
+      ;;
+    selected)
+      if [ "$stamped_tier" = "full" ]; then return 0; fi
+      # Only the set-bearing token counts: a legacy `tier=selected` stamp
+      # (whatever it carries) was minted by a writer without set semantics
+      # and covers nothing.
+      [ "$stamped_tier" = "selected-set" ] || return 1
+      [ -n "$dset" ] || return 1   # a set-less demand names nothing provable
+      stamped_set="$(sed -n 's/^set=//p' "$stamp" | head -1)"
+      [ -n "$stamped_set" ] || return 1
+      _gate_stamp_csv_subset "$dset" "$stamped_set" || return 1
+      if [ "$dmixed" = "1" ]; then
+        stamped_testmon="$(sed -n 's/^testmon=//p' "$stamp" | head -1)"
+        [ "$stamped_testmon" = "1" ] || return 1
+      fi
+      return 0
+      ;;
+    *)
+      return 1   # an unknown demand is never satisfied
+      ;;
+  esac
 }
