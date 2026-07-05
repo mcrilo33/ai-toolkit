@@ -256,6 +256,68 @@ _clear_dispatch_epochs() {
   rm -f "$dir"/dispatch-*.epoch 2>/dev/null || true
 }
 
+# --- per-spoke progress + answer-attempt epochs (issue #133, subtask 3) --------
+# progress-<issue>.epoch — the reap ceiling's reference alongside the dispatch epoch:
+# stamped when the branch tip advances between ticks, on a resume/respawn, and when a
+# stale blocked marker is cleared, so a deliberately revived spoke gets a fresh
+# ceiling instead of an instant re-reap (#123/#128).
+# answer-attempt-<issue>.epoch — the idle clock's exclusion: stamped when the
+# supervisor attempts an answer delivery, so time spent with a buffered/undelivered
+# answer never reads as idle (the reaper killed #125 mid-delivery).
+_stamp_issue_epoch() {
+  local name="$1" issue="$2" dir
+  dir="$(_afk_state_dir)"
+  mkdir -p "$dir" 2>/dev/null || true
+  printf '%s\n' "$(afk_now)" > "$dir/$name-$issue.epoch" 2>/dev/null || true
+}
+_read_issue_epoch() {
+  local f; f="$(_afk_state_dir)/$1-$2.epoch"
+  [ -f "$f" ] && cat "$f" 2>/dev/null || true
+}
+stamp_progress_epoch()  { _stamp_issue_epoch progress "$1"; }
+read_progress_epoch()   { _read_issue_epoch progress "$1"; }
+stamp_answer_attempt()  { _stamp_issue_epoch answer-attempt "$1"; }
+read_answer_attempt()   { _read_issue_epoch answer-attempt "$1"; }
+# Fresh window ⇒ no stale progress/attempt state: a leftover answer-attempt epoch
+# would suppress a legitimate idle reap in the next window.
+_clear_progress_state() {
+  local dir; dir="$(_afk_state_dir)"
+  rm -f "$dir"/progress-*.epoch "$dir"/answer-attempt-*.epoch "$dir"/tip-* 2>/dev/null || true
+}
+
+# _afk_note_tip_progress <wt> <issue> -> observe ledger progress as branch-tip
+# advance: the first sighting records the tip WITHOUT stamping; a differing tip on a
+# later tick stamps progress and re-records. Best-effort; never aborts the caller.
+_afk_note_tip_progress() {
+  local wt="$1" issue="$2" tip dir f last
+  tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)" || return 0
+  [ -n "$tip" ] || return 0
+  dir="$(_afk_state_dir)"; f="$dir/tip-$issue"
+  last="$( [ -f "$f" ] && cat "$f" 2>/dev/null )"
+  if [ -z "$last" ]; then
+    mkdir -p "$dir" 2>/dev/null || true
+    printf '%s\n' "$tip" > "$f" 2>/dev/null || true
+  elif [ "$last" != "$tip" ]; then
+    printf '%s\n' "$tip" > "$f" 2>/dev/null || true
+    stamp_progress_epoch "$issue"
+  fi
+  return 0
+}
+
+# _afk_ceiling_epoch <issue> -> the wall-clock ceiling's reference epoch:
+# max(dispatch, progress). Empty when neither exists (spoke_over_ceiling reads that
+# as "can't measure → never reap").
+_afk_ceiling_epoch() {
+  local issue="$1" d p
+  d="$(read_dispatch_epoch "$issue")"
+  p="$(read_progress_epoch "$issue")"
+  case "$d" in '' | *[!0-9]*) d=0 ;; esac
+  case "$p" in '' | *[!0-9]*) p=0 ;; esac
+  [ "$p" -gt "$d" ] && d="$p"
+  [ "$d" -gt 0 ] && printf '%s\n' "$d"
+  return 0
+}
+
 # --- sibling-script resolution ------------------------------------------------
 # Find a workflow script across the checkout + synced layouts; the first existing
 # candidate wins. An explicit override (passed as $1) short-circuits.
@@ -307,6 +369,22 @@ _transcript_idle_seconds() {
   mtime="$(stat -f %m "$jsonl" 2>/dev/null || stat -c %Y "$jsonl" 2>/dev/null)"
   [ -n "$mtime" ] || return 0
   printf '%s\n' "$(( $(afk_now) - mtime ))"
+}
+# _spoke_idle_seconds <wt_path> <issue> -> idle seconds for the REAPER's clock: since
+# the transcript's last write OR the supervisor's last answer-delivery attempt,
+# whichever is later — time with a buffered/undelivered answer is not idle (#133;
+# the reaper killed #125 right as its answer was delivered). Empty when neither
+# reference exists (same "can't measure" contract as _transcript_idle_seconds).
+_spoke_idle_seconds() {
+  local wt="$1" issue="$2" ref attempt
+  ref="$(_transcript_mtime "$wt")"
+  attempt="$(read_answer_attempt "$issue")"
+  case "$attempt" in
+    '' | *[!0-9]*) : ;;
+    *) if [ -z "$ref" ] || [ "$attempt" -gt "$ref" ]; then ref="$attempt"; fi ;;
+  esac
+  [ -n "$ref" ] || return 0
+  printf '%s\n' "$(( $(afk_now) - ref ))"
 }
 # _transcript_mtime <wt_path> -> epoch mtime of the spoke's newest transcript, or empty.
 # The registration signal for inject verification: it bumps when the spoke writes its
@@ -468,10 +546,13 @@ slot_state() {
       printf 'waiting\n'; return
     fi
   fi
-  epoch="$(read_dispatch_epoch "$issue")"
+  # Ledger progress (a tip advance since the last tick) refreshes the ceiling before
+  # it is measured — a revived spoke is not re-reaped off its stale dispatch epoch.
+  _afk_note_tip_progress "$wt_path" "$issue"
+  epoch="$(_afk_ceiling_epoch "$issue")"
   if spoke_over_ceiling "$epoch" "$(afk_now)"; then printf 'reap\n'; return; fi
   if [ -n "$(extract_pending_question "$wt_path")" ]; then printf 'waiting\n'; return; fi
-  age="$(_transcript_idle_seconds "$wt_path")"
+  age="$(_spoke_idle_seconds "$wt_path" "$issue")"
   if [ -n "$age" ] && [ "$age" -gt $(( AFK_IDLE_MINUTES * 60 )) ]; then printf 'reap\n'; return; fi
   printf 'busy\n'
 }
@@ -766,6 +847,9 @@ ${orig_question:-(the plan prose could not be extracted from the transcript — 
       if [ -z "$target" ]; then
         text="could not locate spoke pane to inject the answer"
       else
+        # Stamp the delivery attempt FIRST: from here until the answer registers the
+        # spoke may sit on a buffered answer, and that window must not read as idle.
+        stamp_answer_attempt "$issue"
         inject_and_verify "$wt" "$target" "$text"; rc=$?
         if [ "$rc" -eq 0 ]; then
           log "  injected answer into #$issue"
@@ -996,6 +1080,7 @@ resume_spoke() {
     return 1
   fi
   _afk_mark_resumed "$issue"
+  stamp_progress_epoch "$issue"   # a deliberate revival resets the reap ceiling (#133)
   _afk_emit_span "$wt" afk-resume success
   return 0
 }
@@ -1021,6 +1106,7 @@ respawn_wedged_spoke() {
     log "  respawned window never started writing its transcript — escalating"
     return 1
   fi
+  stamp_progress_epoch "$issue"   # a deliberate revival resets the reap ceiling (#133)
   _afk_emit_span "$wt" afk-wedge-respawn success
   return 0
 }
@@ -1031,7 +1117,7 @@ respawn_wedged_spoke() {
 # pane with nothing to preserve, or one already resumed this window, is blocked.
 _reap_or_resume() {
   local wt="$1" issue="$2"
-  if spoke_over_ceiling "$(read_dispatch_epoch "$issue")" "$(afk_now)"; then
+  if spoke_over_ceiling "$(_afk_ceiling_epoch "$issue")" "$(afk_now)"; then
     reap_spoke "$wt" "$issue" "time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
   elif _spoke_pane_alive "$wt"; then
     reap_spoke "$wt" "$issue" "went idle >${AFK_IDLE_MINUTES}m with a live pane and no marker — likely hung"
@@ -1218,6 +1304,7 @@ _clear_stale_blocked_marker() {
   git -C "$wt" tag -d "blocked/$issue" >/dev/null 2>&1 || true
   git -C "$wt" push origin ":refs/tags/blocked/$issue" >/dev/null 2>&1 || true
   _afk_clear_blocked_record "$issue"
+  stamp_progress_epoch "$issue"   # the reconciled spoke is deliberately revived (#133)
 }
 
 # reconcile_markers -> clear every stale blocked/<issue> across the in-flight set so the
@@ -1629,6 +1716,7 @@ main() {
     afk_telemetry_preflight "$MAIN_ROOT" || return 2
     afk_write_state "$end"
     _clear_dispatch_epochs   # fresh window ⇒ empty "dispatched by this run" set
+    _clear_progress_state    # fresh window ⇒ no stale progress / answer-attempt epochs
     _clear_resume_markers    # fresh window ⇒ every spoke gets its one auto-resume again
     _clear_blocked_records   # fresh window ⇒ --status shows only THIS run's durable blocks
     _afk_set_unattended      # arm the fail-closed anti-gutting tripwire for spokes
