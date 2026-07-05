@@ -2076,6 +2076,70 @@ def test_auto_land_lands_foreign_ready_spoke_by_default(spoke_repo: Path, tmp_pa
     )
 
 
+# ── heartbeat freshness through long tick phases (issue #133, subtask 4) ──────
+# The 2026-07-04 drain: the heartbeat is stamped once at tick top, and auto_land then
+# runs a 6-10min worktree-land suite synchronously — --status read STALE (and the
+# watchdog could respawn a second supervisor) mid-land.
+
+
+def test_run_with_heartbeat_stamps_during_slow_command(tmp_path: Path) -> None:
+    hb = tmp_path / "heartbeat"
+    hb.write_text("999 1000\n")  # stale: pid 999, epoch 1000
+    start = int(time.time())
+
+    result = _call(
+        "_afk_run_with_heartbeat sleep 3; echo RC=$?",
+        env={"AFK_HEARTBEAT": str(hb), "AFK_LAND_HEARTBEAT_SECONDS": "1"},
+    )
+
+    assert "RC=0" in result.stdout, result.stdout + result.stderr
+    epoch = int(hb.read_text().split()[1])
+    assert epoch >= start, f"heartbeat must be stamped while the command runs, got {hb.read_text()}"
+
+
+def test_run_with_heartbeat_propagates_exit_code(tmp_path: Path) -> None:
+    hb = tmp_path / "heartbeat"
+
+    result = _call(
+        '_afk_run_with_heartbeat bash -c "exit 7"; echo RC=$?',
+        env={"AFK_HEARTBEAT": str(hb), "AFK_LAND_HEARTBEAT_SECONDS": "1"},
+    )
+
+    assert "RC=7" in result.stdout, (
+        "the command's failure rc must ride through (a failed land still escalates): "
+        + result.stdout
+        + result.stderr
+    )
+
+
+def test_auto_land_keeps_heartbeat_fresh_during_slow_land(spoke_repo: Path, tmp_path: Path) -> None:
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    land_log = tmp_path / "land.log"
+    wt_land = tmp_path / "wtland.sh"
+    wt_land.write_text(f'#!/usr/bin/env bash\nsleep 3\nprintf "%s\\n" "$1" >> "{land_log}"\n')
+    wt_land.chmod(0o755)
+    hb = tmp_path / "heartbeat"
+    hb.write_text("999 1000\n")
+    statedir = tmp_path / "statedir"
+    start = int(time.time())
+
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+    result = _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_LAND_HEARTBEAT_SECONDS": "1",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert land_log.read_text().split() == ["5"], "the land itself must still happen"
+    epoch = int(hb.read_text().split()[1])
+    assert epoch >= start, f"the heartbeat must stay fresh THROUGH the land, got {hb.read_text()}"
+
+
 def test_auto_land_skips_foreign_ready_spoke_when_opted_out(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
