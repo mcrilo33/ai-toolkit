@@ -722,3 +722,55 @@ wt_otel_collector_preflight() {
   wt_collector_recover_dead
   wt_collector_launch "$repo_root"
 }
+
+# --- watchdog auto-arm (#138) -------------------------------------------------
+# The preflights above cover the spawn INSTANT; nothing re-ensures a collector
+# that dies mid-run (a machine sleep left lf-collector Exited for ~24 min while
+# a live spoke dropped every span at source). Arm the hub-side watchdog at every
+# spawn: hub-otel-watch.sh --daemon re-runs the same ensure paths each tick
+# while ≥1 spoke pane is live and exits itself when the last pane closes, so
+# capture self-heals across sleep/wake with no human in the loop.
+#
+# Best-effort and idempotent, same posture as the preflights: a no-op unless
+# AI_TOOLKIT_OTEL=1, a no-op while a live daemon already holds the pidfile (the
+# daemon's own singleton guard stays authoritative — this pre-check only avoids
+# forking a doomed child per spawn), a warning (never a spawn failure) when the
+# watch script is unresolvable. The subshell exports what the detached child
+# needs: the OTel opt-in and Langfuse auth are plain (unexported) assignments in
+# worktree-new.sh, and MAIN_ROOT pins the daemon's ensure target to this hub.
+# Args: $1 = repo root.
+wt_otel_watch_arm() {
+  local repo_root="$1" bin="" pidfile pid cand common
+  [ "${AI_TOOLKIT_OTEL:-}" = "1" ] || return 0
+  for cand in \
+    "${HUB_OTEL_WATCH_BIN:-}" \
+    "$repo_root/shared/skills/hub/scripts/hub-otel-watch.sh" \
+    "$repo_root/.ai-toolkit/scripts/hub-otel-watch.sh" \
+    "$repo_root/.claude/skills/hub/scripts/hub-otel-watch.sh"; do
+    if [ -n "$cand" ] && [ -f "$cand" ]; then bin="$cand"; break; fi
+  done
+  if [ -z "$bin" ]; then
+    wt_warn "hub-otel-watch.sh not found under $repo_root — watchdog not armed; a mid-run collector death won't self-heal (run hub-otel-watch.sh --daemon manually)"
+    return 0
+  fi
+  pidfile="${HUB_OTEL_WATCH_PIDFILE:-}"
+  if [ -z "$pidfile" ]; then
+    common="$(git -C "$repo_root" rev-parse --git-common-dir 2>/dev/null)" || common=""
+    case "$common" in
+      "" | /*) ;;
+      *) common="$repo_root/$common" ;;
+    esac
+    [ -n "$common" ] && pidfile="$common/hub-otel-watch.pid"
+  fi
+  if [ -n "$pidfile" ] && [ -f "$pidfile" ]; then
+    pid="$(cat "$pidfile" 2>/dev/null)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then return 0; fi
+  fi
+  (
+    export AI_TOOLKIT_OTEL LANGFUSE_BASIC_AUTH
+    export MAIN_ROOT="$repo_root"
+    export HUB_OTEL_WATCH_PIDFILE HUB_OTEL_WATCH_LOG HUB_OTEL_WATCH_INTERVAL HUB_OTEL_WATCH_IDLE_TICKS
+    nohup bash "$bin" --daemon >/dev/null 2>&1 &
+  )
+  echo "→ armed hub-otel-watch daemon (collector/bridge self-heal across sleep/wake)"
+}
