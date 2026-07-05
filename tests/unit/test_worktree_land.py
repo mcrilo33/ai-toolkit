@@ -1238,3 +1238,113 @@ def test_land_emits_no_span_when_auth_unresolvable(hub: Path, tmp_path: Path) ->
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert _log_text(logs["curl"]) == "", "no span POST may fire without resolved auth"
+
+
+# --- conditional post-land background sweep (issue #124) --------------------------
+# After a successful land + teardown, the land script calls gate-sweep.sh --spawn
+# with the merged commit: a PRUNED green-tree stamp (testmon/selected, issue #122)
+# on the landed tree launches exactly one detached full-suite sweep; a `full`
+# stamp or no stamp launches none. Best-effort like the rest of the land tail:
+# the land's exit code and duration are unaffected in all cases, and a sweep
+# that fails to launch warns without failing the land.
+
+
+def _mint_stamp(hub: Path, ref: str, tier: str) -> None:
+    """Write a #122 green-tree stamp for `ref`'s tree into the hub's stamp store."""
+    tree = _git(hub, "rev-parse", f"{ref}^{{tree}}").strip()
+    stamps = hub / ".git" / ".gate-stamps"
+    stamps.mkdir(parents=True, exist_ok=True)
+    (stamps / tree).write_text(f"tier={tier}\nenv=test\n")
+
+
+def _wait_for_file(path: Path, timeout: float = 10.0) -> bool:
+    """Poll for a file the detached sweep worker writes; True when it appears."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_land_launches_one_sweep_for_pruned_gated_tree(hub: Path, tmp_path: Path) -> None:
+    _make_spoke(hub, tmp_path, "feature/1-sweep", push=True)
+    _mint_stamp(hub, "feature/1-sweep", "testmon")
+    runner_log = tmp_path / "sweep-runner.log"
+
+    proc, _ = _run_land(
+        hub, tmp_path, "1", extra_env={"GATE_SWEEP_CMD": f'echo RUN >> "{runner_log}"'}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "launching background full-suite sweep" in proc.stdout
+    assert _wait_for_file(runner_log), "the detached sweep worker never ran"
+    time.sleep(0.5)  # grace: a wrongly-spawned second worker would land by now
+    assert runner_log.read_text().count("RUN") == 1  # exactly one sweep
+
+
+def test_land_launches_no_sweep_for_full_gated_tree(hub: Path, tmp_path: Path) -> None:
+    _make_spoke(hub, tmp_path, "feature/1-fullswp", push=True)
+    _mint_stamp(hub, "feature/1-fullswp", "full")
+    runner_log = tmp_path / "sweep-runner.log"
+
+    proc, _ = _run_land(
+        hub, tmp_path, "1", extra_env={"GATE_SWEEP_CMD": f'echo RUN >> "{runner_log}"'}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "no sweep needed" in proc.stdout  # a full pass needs no safety net
+    time.sleep(0.8)  # grace: a wrongly-spawned worker would have written by now
+    assert not runner_log.exists()
+
+
+def test_land_launches_no_sweep_without_stamp(hub: Path, tmp_path: Path) -> None:
+    # No stamp: docs-only skip or --skip-tests — the gate certified nothing
+    # pruned, so there is no selection miss to backstop.
+    _make_spoke(hub, tmp_path, "feature/1-nostamp", push=True)
+    runner_log = tmp_path / "sweep-runner.log"
+
+    proc, _ = _run_land(
+        hub, tmp_path, "1", extra_env={"GATE_SWEEP_CMD": f'echo RUN >> "{runner_log}"'}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "no gate stamp" in proc.stdout
+    time.sleep(0.8)
+    assert not runner_log.exists()
+
+
+def test_land_returns_while_slow_sweep_still_runs(hub: Path, tmp_path: Path) -> None:
+    # The land's duration is unaffected: it returns while the (slow) suite is
+    # still running in the detached worker.
+    _make_spoke(hub, tmp_path, "feature/1-slowswp", push=True)
+    _mint_stamp(hub, "feature/1-slowswp", "testmon")
+    start_log = tmp_path / "sweep-start.log"
+
+    t0 = time.monotonic()
+    proc, _ = _run_land(
+        hub,
+        tmp_path,
+        "1",
+        extra_env={"GATE_SWEEP_CMD": f'echo START >> "{start_log}"; sleep 30'},
+    )
+    elapsed = time.monotonic() - t0
+
+    assert proc.returncode == 0, proc.stderr
+    assert elapsed < 20, f"land blocked on the sweep ({elapsed:.1f}s)"
+    assert _wait_for_file(start_log)  # the worker is alive past the land's return
+
+
+def test_land_warns_but_succeeds_when_sweep_launch_fails(hub: Path, tmp_path: Path) -> None:
+    # Best-effort like the rest of the land tail: an unlaunchable sweep script
+    # (e.g. a synced repo missing it) warns and never fails the land.
+    _make_spoke(hub, tmp_path, "feature/1-noswp", push=True)
+    _mint_stamp(hub, "feature/1-noswp", "testmon")
+
+    proc, _ = _run_land(
+        hub, tmp_path, "1", extra_env={"GATE_SWEEP_BIN": str(tmp_path / "no-such-sweep.sh")}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "post-land sweep failed to launch" in proc.stderr
+    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()  # still landed
