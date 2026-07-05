@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -449,6 +450,230 @@ def test_spoke_over_ceiling(epoch: str, now: str, over: bool) -> None:
     result = _call(f"spoke_over_ceiling '{epoch}' '{now}' && echo yes || echo no")
 
     assert result.stdout.strip() == ("yes" if over else "no")
+
+
+# ── reaper sanity: buffered-answer idle exclusion + progress-keyed ceiling
+# (issue #133, subtask 3). The 2026-07-04 drain: the reaper counted
+# time-with-a-buffered-undelivered-answer as idle and killed #125 right as the answer
+# was delivered; the flat >180m ceiling (keyed on the dispatch epoch alone) then
+# re-reaped every deliberately revived spoke within one tick.
+
+
+def test_slot_state_busy_when_answer_attempt_fresh(spoke_repo: Path, tmp_path: Path) -> None:
+    # An idle-looking transcript with a FRESH answer-delivery attempt is not idle:
+    # the spoke is waiting on the buffered answer to land, not hung.
+    now = int(time.time())
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _write_transcript(
+        pd, [{"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}}]
+    )
+    os.utime(pd / "session.jsonl", (now - 7200, now - 7200))  # 2h idle by mtime
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "answer-attempt-5.epoch").write_text(f"{now - 60}\n")  # attempted 1m ago
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_NOW": str(now),
+            "AFK_IDLE_MINUTES": "30",
+        },
+    )
+
+    assert result.stdout.strip() == "busy", result.stderr
+
+
+def test_slot_state_reaps_idle_without_answer_attempt(spoke_repo: Path, tmp_path: Path) -> None:
+    # Control for the exclusion above: same 2h-idle transcript, no delivery attempt.
+    now = int(time.time())
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _write_transcript(
+        pd, [{"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}}]
+    )
+    os.utime(pd / "session.jsonl", (now - 7200, now - 7200))
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_NOW": str(now),
+            "AFK_IDLE_MINUTES": "30",
+        },
+    )
+
+    assert result.stdout.strip() == "reap", result.stderr
+
+
+def test_slot_state_no_reap_when_progress_fresh(spoke_repo: Path, tmp_path: Path) -> None:
+    # The ceiling keys on time-since-last-progress, not the flat dispatch epoch: a
+    # revived spoke (fresh progress stamp) is NOT re-reaped even when its dispatch
+    # epoch is far past AFK_SPOKE_MAX_MINUTES (#123/#128).
+    now = int(time.time())
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _write_transcript(
+        pd, [{"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}}]
+    )
+    os.utime(pd / "session.jsonl", (now - 60, now - 60))  # actively writing
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "dispatch-5.epoch").write_text(f"{now - 200 * 60}\n")  # 200m > 180m ceiling
+    (statedir / "progress-5.epoch").write_text(f"{now - 10 * 60}\n")  # revived 10m ago
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_NOW": str(now),
+        },
+    )
+
+    assert result.stdout.strip() == "busy", result.stderr
+
+
+def test_slot_state_stamps_progress_on_tip_advance(spoke_repo: Path, tmp_path: Path) -> None:
+    # Ledger progress is observed as branch-tip advance: the first sighting records
+    # the tip without stamping; a commit between ticks stamps progress-<issue>.epoch.
+    now = int(time.time())
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    env = {
+        "CLAUDE_PROJECTS_DIR": "/nonexistent",
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_NOW": str(now),
+    }
+
+    _call(f"slot_state '{spoke_repo}' 5", env=env)
+    assert not (statedir / "progress-5.epoch").exists(), "first sighting only records the tip"
+
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "work",
+        ],
+        cwd=spoke_repo,
+        check=True,
+        capture_output=True,
+    )
+    _call(f"slot_state '{spoke_repo}' 5", env=env)
+
+    assert (statedir / "progress-5.epoch").exists(), "a tip advance between ticks is progress"
+
+
+def test_resume_spoke_stamps_progress(tmp_path: Path) -> None:
+    # A deliberate revival resets the progress clock — otherwise the >180m ceiling
+    # re-reaps the resumed spoke on the very next tick (#123/#128).
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, _ = _recording_tmux(tmp_path)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+
+    result = _call(
+        f"resume_spoke '{spoke}' 5",
+        env={"PATH": f"{fake_bin}:{os.environ['PATH']}", "AFK_STATE_DIR": str(statedir)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (statedir / "progress-5.epoch").exists()
+
+
+def test_respawn_wedged_spoke_stamps_progress(tmp_path: Path) -> None:
+    spoke = _branched_spoke(tmp_path, ahead=True, name="wedge-spoke", branch="feature/5-fix")
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke)
+    _write_transcript(
+        pd, [{"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}}]
+    )
+    jsonl = pd / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+    fake_bin, _ = _injector_tmux(tmp_path, touch=jsonl, window_line="afk:1 5-fix\n")
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+
+    result = _call(
+        f"respawn_wedged_spoke '{spoke}' 5 'use Redis'",
+        env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "AFK_STATE_DIR": str(statedir),
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_INJECT_VERIFY_SECONDS": "0",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (statedir / "progress-5.epoch").exists()
+
+
+def test_clear_stale_blocked_marker_stamps_progress(spoke_repo: Path, tmp_path: Path) -> None:
+    # Clearing a stale blocked/<issue> IS the "deliberately revived" signal the issue
+    # names — the reconciled spoke gets a fresh ceiling.
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+
+    result = _call(
+        f"_clear_stale_blocked_marker '{spoke_repo}' 5",
+        env={"AFK_STATE_DIR": str(statedir)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (statedir / "progress-5.epoch").exists()
+
+
+def test_decide_and_act_stamps_answer_attempt(spoke_repo: Path, tmp_path: Path) -> None:
+    # The delivery attempt must be stamped so the idle clock excludes the window in
+    # which the answer sits buffered/undelivered (#125 was reaped mid-delivery).
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
+    jsonl = pd / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+    ready_stub.chmod(0o755)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        f'  send-keys) case "$*" in *Enter*) printf "{{}}\\n" >> "{jsonl}" ;; esac ;;\n'
+        "esac\nexit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "SPOKE_READY": str(ready_stub),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_ANSWERER_CMD": "printf 'ANSWER: use Redis'",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_STATE_DIR": str(statedir),
+    }
+
+    result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert (statedir / "answer-attempt-5.epoch").exists()
 
 
 # ── the tmux inject: interactive-gate handling (issue #74, defect 1) ──────────
