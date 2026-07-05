@@ -828,6 +828,14 @@ _tripwire_cfg_value() {
 # snapshot tip, delete refs that appeared during the run, and restore
 # core.bare/core.worktree. Best-effort — leaves the repo as the snapshot found it.
 #
+# No-data-loss rule (issue #135): restore never ORPHANS commits. A ref whose
+# snapshot tip is a strict ancestor of its current tip only gained commits —
+# rewinding it destroys them (four live spokes were rewound this way), so it is
+# left in place with a warning; the caller's abort is the protection. A ref
+# that LOST commits (snapshot ahead of, or diverged from, the tip) is genuine
+# corruption and is still restored. An appeared ref checked out in a registered
+# worktree is a live spoke's anchor and is never deleted.
+#
 # HEAD scope: a moved BRANCH ref is restored directly, and HEAD (symbolic) then
 # follows its branch. A breach that re-points HEAD's own symbolic target (a stray
 # `git checkout`/detach) is still DETECTED — the HEAD line in the snapshot differs,
@@ -835,21 +843,35 @@ _tripwire_cfg_value() {
 # not the rewind, is the protection. The #29/#30 incident moved a branch ref and
 # flipped core.bare, both fully restored.
 tripwire_restore() {
-  local before="$1" kind sha name snap_refs cur_sha cur_ref
+  local before="$1" kind sha name snap_refs wt_refs cur_sha cur_ref
+  wt_refs="$(git worktree list --porcelain 2>/dev/null | awk '$1=="branch" {print $2}')"
   # Reset every snapshot ref to its captured tip (HEAD is symbolic — it follows
-  # its branch, so resetting the branch ref restores it).
+  # its branch, so resetting the branch ref restores it) — unless that would
+  # rewind the ref to a strict ancestor of where it is now.
   while read -r kind sha name; do
     [ "$kind" = "ref" ] || continue
     [ "$name" = "HEAD" ] && continue
+    cur_sha="$(git rev-parse -q --verify "$name" 2>/dev/null || true)"
+    if [ -n "$cur_sha" ] && [ "$cur_sha" != "$sha" ] \
+       && git merge-base --is-ancestor "$sha" "$cur_sha" 2>/dev/null; then
+      echo "tripwire: NOT rewinding $name to $sha — strict ancestor of its tip $cur_sha (would orphan commits); the abort is the protection." >&2
+      continue
+    fi
     git update-ref "$name" "$sha" 2>/dev/null || true
   done <<< "$before"
-  # Drop refs that appeared during the run (present now, absent in the snapshot).
+  # Drop refs that appeared during the run (present now, absent in the snapshot),
+  # except a branch checked out in a registered worktree — a live spoke's anchor.
   snap_refs="$(printf '%s\n' "$before" | awk '$1=="ref" && $3!="HEAD" {print $3}')"
   while read -r cur_sha cur_ref; do
     [ -n "$cur_ref" ] || continue
-    if ! printf '%s\n' "$snap_refs" | grep -qxF "$cur_ref"; then
-      git update-ref -d "$cur_ref" 2>/dev/null || true
+    if printf '%s\n' "$snap_refs" | grep -qxF "$cur_ref"; then
+      continue
     fi
+    if printf '%s\n' "$wt_refs" | grep -qxF "$cur_ref"; then
+      echo "tripwire: NOT deleting $cur_ref — checked out in a registered worktree." >&2
+      continue
+    fi
+    git update-ref -d "$cur_ref" 2>/dev/null || true
   done < <(git show-ref 2>/dev/null || true)
   # Restore the config markers (whitespace-preserving extraction).
   _tripwire_restore_cfg core.bare "$(_tripwire_cfg_value "$before" core.bare)"
