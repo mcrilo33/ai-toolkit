@@ -195,6 +195,53 @@ if [ -n "${TMUX:-}" ]; then
   current_session="$(tmux display-message -p '#{session_name}' 2>/dev/null || true)"
 fi
 
+# --- Collector-down warning (#138) -------------------------------------------
+# While ≥1 spoke pane is live, the OTel collector ports (4317 gRPC traces /
+# 4318 OTLP-HTTP cycle spans) MUST be listening or every span those spokes emit
+# is dropped at source with no alert — a machine sleep does exactly this. Lead
+# the dashboard with a loud warning in that state; stay silent when no spoke is
+# live, when the collector is up, or on an explicit operator opt-out
+# (AI_TOOLKIT_OTEL=0 — unset still warns: spokes are default-on). The port
+# probe comes from worktree-lib.sh (same dual-layout ladder as hub-otel-watch);
+# a partially-synced target without the lib skips the check silently.
+for _cand in \
+  "$_script_dir/worktree-lib.sh" \
+  "$_script_dir/../../../../scripts/worktree-lib.sh" \
+  "$main_root/scripts/worktree-lib.sh" \
+  "$main_root/.ai-toolkit/scripts/worktree-lib.sh"; do
+  if [ -f "$_cand" ]; then . "$_cand"; break; fi
+done
+unset _cand
+
+spoke_pane_live=0
+if [ -n "$all_panes" ]; then
+  wt_paths="$(git -C "$main_root" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}')"
+  while IFS='	' read -r _sess_win pane_path; do
+    [ -n "$pane_path" ] || continue
+    while IFS= read -r wt_path; do
+      [ -n "$wt_path" ] || continue
+      [ "$wt_path" = "$main_root" ] && continue
+      if [ "$pane_path" = "$wt_path" ]; then
+        spoke_pane_live=1
+        break 2
+      fi
+    done <<<"$wt_paths"
+  done <<<"$all_panes"
+fi
+
+if [ "$spoke_pane_live" -eq 1 ] && [ "${AI_TOOLKIT_OTEL:-}" != "0" ] \
+  && command -v wt_port_listening >/dev/null 2>&1; then
+  dark_ports=""
+  wt_port_listening 4317 || dark_ports="4317"
+  wt_port_listening 4318 || dark_ports="${dark_ports:+$dark_ports }4318"
+  if [ -n "$dark_ports" ]; then
+    printf '\033[1;31m⚠ COLLECTOR DOWN\033[0m — spoke pane(s) live but OTel collector port(s) %s not listening.\n' "$dark_ports"
+    echo "  Spans from running spokes are being dropped at source RIGHT NOW."
+    echo "  Re-arm: bash shared/skills/hub/scripts/hub-otel-watch.sh --daemon  (with AI_TOOLKIT_OTEL=1 + LANGFUSE_BASIC_AUTH)"
+    echo
+  fi
+fi
+
 # --- Worktrees -------------------------------------------------------------
 bold "Worktrees"
 # Collect branches that have a worktree so we can cross-reference issues later.
