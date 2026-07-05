@@ -17,6 +17,7 @@ from running on import) and drive its layers directly:
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import os
 import subprocess
@@ -2067,15 +2068,28 @@ def _land_recorder(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def _write_review(wt: Path, name: str, verdict: str, ts: str) -> None:
-    """Write a code-review evidence artifact (.review/<name>.json) for auto_land's gate."""
+    """Write a code-review evidence artifact the way review-stamp really does.
+
+    Mirrors mcp/review-stamp/server.py: a `.review/<name>.json` file whose body is
+    ``json.dumps(indent=2)`` (multi-line) carrying the full artifact schema —
+    verdict / summary / reviewer / timestamp / diff_hash / signature / sig_alg — so
+    the reader is exercised against the genuine on-disk format, not a compact fake
+    (issue #152 "real artifact fixtures, not a format miss"). ``name`` stands in for
+    the real ``<diff_hash>.json`` filename; the reader globs ``*.json`` regardless.
+    """
     review = wt / ".review"
     review.mkdir(exist_ok=True)
-    (review / f"{name}.json").write_text(
-        json.dumps(
-            {"verdict": verdict, "timestamp": ts, "summary": "review", "reviewer": "code-review"}
-        )
-        + "\n"
-    )
+    diff_hash = hashlib.sha256(f"{name}:{verdict}:{ts}".encode()).hexdigest()
+    artifact = {
+        "verdict": verdict,
+        "summary": "0 blockers, 0 warnings — none",
+        "reviewer": "code-review",
+        "timestamp": ts,
+        "diff_hash": diff_hash,
+        "signature": hashlib.sha256(f"{diff_hash}:{verdict}".encode()).hexdigest(),
+        "sig_alg": "HMAC-SHA256",
+    }
+    (review / f"{name}.json").write_text(json.dumps(artifact, indent=2) + "\n")
 
 
 def _seed_clean_review(wt: Path) -> None:
@@ -2090,6 +2104,59 @@ def _escalation_recorder(tmp_path: Path) -> tuple[Path, Path]:
     stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
     stub.chmod(0o755)
     return stub, ready_log
+
+
+# ── _afk_review_verdict — the three-case classifier (issue #152) ──────────────
+# The reader locates a spoke's most-recent code-review verdict from real
+# review-stamp artifacts (multi-line signed JSON) and must classify three cases
+# the gate acts on: clean APPROVE (land), flagged REQUEST_CHANGES (escalate), and
+# genuinely-no-review (escalate). Same-second collisions are real (a review
+# finishes in <1s, so an APPROVE and a REQUEST_CHANGES can share the 1-second
+# timestamp): the tie must resolve conservatively to REQUEST_CHANGES — never land
+# on an ambiguous second.
+
+
+def _read_verdict(wt: Path) -> str:
+    """Invoke _afk_review_verdict against a spoke worktree; return its stdout verdict."""
+    result = _call(f"_afk_review_verdict '{wt}'")
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def test_review_verdict_reads_clean_approve(spoke_repo: Path) -> None:
+    _write_review(spoke_repo, "approve", "APPROVE", "2026-07-05T12:00:00Z")
+
+    assert _read_verdict(spoke_repo) == "APPROVE"
+
+
+def test_review_verdict_reads_flagged_request_changes(spoke_repo: Path) -> None:
+    _write_review(spoke_repo, "changes", "REQUEST_CHANGES", "2026-07-05T12:00:00Z")
+
+    assert _read_verdict(spoke_repo) == "REQUEST_CHANGES"
+
+
+def test_review_verdict_empty_when_no_review(spoke_repo: Path) -> None:
+    # No .review dir at all ⇒ genuinely-no-review ⇒ empty (the caller escalates).
+    assert _read_verdict(spoke_repo) == ""
+
+
+def test_review_verdict_same_second_tie_favors_request_changes(spoke_repo: Path) -> None:
+    # A REQUEST_CHANGES sharing the latest second with an APPROVE must win: the reader
+    # never lands on an ambiguous same-timestamp tie. "a_" sorts before "z_" so the glob
+    # yields APPROVE first — the pre-#152 first-wins reader returned APPROVE here.
+    _write_review(spoke_repo, "a_approve", "APPROVE", "2026-07-05T12:00:00Z")
+    _write_review(spoke_repo, "z_changes", "REQUEST_CHANGES", "2026-07-05T12:00:00Z")
+
+    assert _read_verdict(spoke_repo) == "REQUEST_CHANGES"
+
+
+def test_review_verdict_same_second_tie_order_independent(spoke_repo: Path) -> None:
+    # Reverse the glob order (REQUEST_CHANGES first): the conservative tie-break must
+    # still block, proving it does not depend on filesystem/glob ordering.
+    _write_review(spoke_repo, "a_changes", "REQUEST_CHANGES", "2026-07-05T12:00:00Z")
+    _write_review(spoke_repo, "z_approve", "APPROVE", "2026-07-05T12:00:00Z")
+
+    assert _read_verdict(spoke_repo) == "REQUEST_CHANGES"
 
 
 # ── auto_land gates on the code-review verdict (issue #143) ───────────────────
