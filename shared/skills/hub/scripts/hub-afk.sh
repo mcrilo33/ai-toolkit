@@ -681,6 +681,78 @@ is_auth_failure() {
     'authentication_error|invalid (x-)?api[ -]?key|invalid bearer token|oauth (token|authentication)|run `?(claude )?/login|401|unauthorized|credit balance is too low'
 }
 
+# --- the permission classifier (issue #149) -----------------------------------
+# A spoke under /afk stalls on Claude Code PERMISSION dialogs (distinct from the
+# question/gate parks the answerer handles): the FIRST RED-commit selective stage
+# `git reset -q; git add <own file>` prompts and, unanswered, the spoke idles until
+# reaped. classify_permission decides such a dialog the way a human would — but by a
+# fixed rules table, not the reasoning answerer, since the decision is mechanical and
+# must be conservative. It is the unit-tested heart of the supervisor's permission
+# handling (the tmux detection + injection that drives it lives in decide_and_act).
+
+# _permission_seg_safe <segment> -> true when ONE command segment is a safe scoped
+# self-op the spoke legitimately runs on its OWN worktree: the same vetted class
+# worktree-new.sh seeds into the spoke allowlist (unstage/stage, own-file pytest,
+# read-only helpers). A segment carrying command substitution, backticks, or a
+# redirection is never safe — those could smuggle a destructive op behind a safe
+# prefix. `git reset`'s working-tree-mutating modes (`--hard`/`--merge`/`--keep`) are
+# rejected before the safe `git reset` prefix matches — only unstage/uncommit is safe.
+# Everything unrecognised is unsafe (default-deny).
+_permission_seg_safe() {
+  local seg="$1"
+  case "$seg" in
+    *'$('* | *'`'* | *'>'* | *'<'*) return 1 ;;   # substitution / redirection smuggling
+  esac
+  case "$seg" in
+    *'--hard'* | *'--merge'* | *'--keep'*) return 1 ;;  # reset modes that touch the worktree
+    'git reset' | 'git reset '* ) return 0 ;;      # unstage/uncommit only — worktree-local
+    'git add' | 'git add '* ) return 0 ;;          # stage — worktree-confined
+    'git status' | 'git status '* | 'git diff' | 'git diff '* ) return 0 ;;
+    'git log' | 'git log '* | 'git show' | 'git show '* ) return 0 ;;
+    'git rev-parse' | 'git rev-parse '* | 'git branch --show-current' ) return 0 ;;
+    'git fetch' | 'git fetch '* | 'git stash list' ) return 0 ;;
+    'pytest' | 'pytest '* ) return 0 ;;
+    'python -m pytest' | 'python -m pytest '* ) return 0 ;;
+    'python3 -m pytest' | 'python3 -m pytest '* ) return 0 ;;
+    '.venv/bin/python -m pytest' | '.venv/bin/python -m pytest '* ) return 0 ;;
+    'ls' | 'ls '* | 'cat '* | 'head '* | 'tail '* | 'wc' | 'wc '* ) return 0 ;;
+    'grep '* | 'rg '* | 'find '* | 'echo' | 'echo '* | 'tree' | 'tree '* ) return 0 ;;
+    'chmod +x '* ) return 0 ;;
+    * ) return 1 ;;
+  esac
+}
+
+# classify_permission <command> -> "APPROVE" or "ESCALATE<TAB><reason>". DEFAULT-DENY:
+# the command is APPROVEd only when EVERY segment (split on ; && || |) is a safe scoped
+# self-op, so a single risky segment in a chain escalates the whole. Anything unrecognised
+# — main-touching, force-push, history rewrite, deletion, network fetch, browser/computer/
+# mcp tool, or a bare non-Bash tool name — ESCALATEs, naming the offending command so the
+# block record is actionable.
+classify_permission() {
+  local cmd="$1" norm seg saw_seg=0
+  # Normalise the shell operators to newlines, longest first so `||` is not split by `|`
+  # and `&&` is not split by a single `&`. The single `&` (background) MUST also split, or
+  # `echo x & rm -rf /` would match the safe `echo ` prefix and never inspect the tail.
+  norm="${cmd//&&/$'\n'}"
+  norm="${norm//&/$'\n'}"
+  norm="${norm//||/$'\n'}"
+  norm="${norm//|/$'\n'}"
+  norm="${norm//;/$'\n'}"
+  while IFS= read -r seg; do
+    seg="${seg#"${seg%%[![:space:]]*}"}"           # ltrim
+    seg="${seg%"${seg##*[![:space:]]}"}"           # rtrim
+    [ -n "$seg" ] || continue
+    saw_seg=1
+    if ! _permission_seg_safe "$seg"; then
+      printf 'ESCALATE\t%s\n' "risky or unrecognised command: $cmd"
+      return 0
+    fi
+  done <<< "$norm"
+  # An empty / all-whitespace command has no segment to vouch for — never approve nothing.
+  [ "$saw_seg" -eq 1 ] || { printf 'ESCALATE\t%s\n' "empty or unreadable command"; return 0; }
+  printf 'APPROVE\n'
+}
+
 # --- tmux injection + telemetry -----------------------------------------------
 
 # _spoke_pane_target <wt_path> -> "session:window" of the spoke's pane, or empty.
