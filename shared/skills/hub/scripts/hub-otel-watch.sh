@@ -11,7 +11,10 @@
 # spoke pane is live, it ensures both are up — RECYCLING a dead/stale one via
 # worktree-lib's ensure paths (wt_otel_collector_preflight now removes an
 # Exited/Created/Dead lf-collector before relaunching, #115) — and otherwise does
-# nothing. Run it on the hub (main checkout), ideally on a /loop.
+# nothing. One-shot by default (run it on the hub, e.g. on a /loop); with
+# `--daemon` it self-loops for the spoke lifetime and exits when the last spoke
+# pane closes — worktree-new.sh arms that mode automatically at spawn (#138), so
+# a machine sleep/wake no longer needs a human to re-arm capture.
 #
 # Best-effort and idempotent: it reuses the SAME ensure paths as worktree-new.sh, so
 # it never starts a second collector/bridge and never errors out the loop. A quiet
@@ -96,20 +99,112 @@ ensure_otel_stack() {
   wt_otel_bridge_preflight "$MAIN_ROOT"
 }
 
-# main -> ensure the stack exactly when a spoke is live; a silent no-op otherwise.
-# When a spoke IS live but native OTel is opted out (AI_TOOLKIT_OTEL != 1) the
-# preflights would silently no-op and that spoke's traces are lost — the exact
-# footgun #115 exists to prevent — so surface a one-line stderr notice in that case
-# (it is NOT the "no spoke / already healthy" silent path). Always returns 0: the
-# watchdog must never error out the /loop that drives it.
-main() {
-  spoke_pane_live || return 0
+# _ensure_or_notice -> the live-tick action, shared by the one-shot main and the
+# daemon loop. When native OTel is opted out (AI_TOOLKIT_OTEL != 1) the preflights
+# would silently no-op and the live spoke's traces are lost — the exact footgun
+# #115 exists to prevent — so surface a one-line stderr notice in that case (it is
+# NOT the "no spoke / already healthy" silent path). Otherwise ensure the stack.
+_ensure_or_notice() {
   if [ "${AI_TOOLKIT_OTEL:-}" != "1" ]; then
     printf '%s\n' "hub-otel-watch: a spoke is live but AI_TOOLKIT_OTEL!=1 — collector/bridge not ensured; that spoke's traces are lost (export AI_TOOLKIT_OTEL=1 to enable)" >&2
     return 0
   fi
   ensure_otel_stack
+}
+
+# main -> one-shot: ensure the stack exactly when a spoke is live; a silent no-op
+# otherwise. Always returns 0: the watchdog must never error out the /loop that
+# drives it.
+main() {
+  spoke_pane_live || return 0
+  _ensure_or_notice
   return 0
 }
 
-[[ "${BASH_SOURCE[0]}" == "${0}" ]] && main "$@"
+# --- daemon mode (#138) -------------------------------------------------------
+# Machine sleep kills the collector out from under live spokes and nothing
+# re-arms on wake unless a human remembers to /loop this script. `--daemon` makes
+# the loop self-driving: worktree-new.sh arms it at every spoke spawn
+# (wt_otel_watch_arm), it re-ensures the stack each tick while ≥1 spoke pane is
+# live, and it tears itself down once the last spoke pane has been gone for the
+# idle grace. A nohup-detached loop is suspended across sleep and resumes on
+# wake, so the first post-wake tick recycles a dead collector with no human in
+# the loop.
+
+# The git common dir of the hub — shared across worktrees, per-repo — where the
+# daemon's pidfile and logfile default to (same home as hub-ready-watch's seen
+# file). Falls back to /tmp when MAIN_ROOT is not a repo (never fails the arm).
+_watch_common_dir() {
+  local d
+  d="$(git -C "$MAIN_ROOT" rev-parse --git-common-dir 2>/dev/null)" || { echo /tmp; return; }
+  case "$d" in
+    /*) ;;
+    *) d="$MAIN_ROOT/$d" ;;
+  esac
+  printf '%s\n' "$d"
+}
+
+# Timestamped log line (LC_ALL=C: locale-formatted dates have burned us before).
+_watch_log() { printf 'hub-otel-watch: [%s] %s\n' "$(LC_ALL=C date '+%F %T')" "$*"; }
+
+# _watch_loop -> tick every HUB_OTEL_WATCH_INTERVAL seconds (default 30): on a
+# live tick run the same ensure path as the one-shot main (recovery output —
+# "→ started lf-collector…" — flows through to the caller/logfile, which is what
+# makes a recovery observable); on an idle tick count toward the exit grace.
+# Exits 0 after HUB_OTEL_WATCH_IDLE_TICKS consecutive idle ticks (default 3 —
+# grace for transient tmux blips and the spawn race); a live tick resets the
+# counter. Never fatal: ensure failures are best-effort and the loop keeps going.
+_watch_loop() {
+  local interval="${HUB_OTEL_WATCH_INTERVAL:-30}" max_idle="${HUB_OTEL_WATCH_IDLE_TICKS:-3}" idle=0
+  _watch_log "watch loop started (pid $$, interval ${interval}s, idle grace ${max_idle} ticks)"
+  while :; do
+    if spoke_pane_live; then
+      idle=0
+      _ensure_or_notice
+    else
+      idle=$((idle + 1))
+      if [ "$idle" -ge "$max_idle" ]; then
+        _watch_log "no spoke pane live for ${max_idle} ticks — exiting"
+        return 0
+      fi
+    fi
+    sleep "$interval"
+  done
+}
+
+# _daemon -> singleton wrapper around _watch_loop. The pidfile (default
+# <git-common-dir>/hub-otel-watch.pid, HUB_OTEL_WATCH_PIDFILE override) makes N
+# spoke spawns arm exactly one watchdog: when it names a still-live pid (kill -0
+# — NOT pgrep, whose locale failure reads as "not running") refuse to start and
+# leave the other daemon's pidfile alone; a stale pidfile (dead pid) is
+# reclaimed. The loop's output appends to the logfile (default
+# <git-common-dir>/hub-otel-watch.log, HUB_OTEL_WATCH_LOG override) so a
+# recovery is auditable after the fact. Always returns 0.
+_daemon() {
+  local common pidfile logfile pid
+  common="$(_watch_common_dir)"
+  pidfile="${HUB_OTEL_WATCH_PIDFILE:-$common/hub-otel-watch.pid}"
+  logfile="${HUB_OTEL_WATCH_LOG:-$common/hub-otel-watch.log}"
+  if [ -f "$pidfile" ]; then
+    pid="$(cat "$pidfile" 2>/dev/null)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      printf '%s\n' "hub-otel-watch: already running (pid $pid, pidfile $pidfile)"
+      return 0
+    fi
+  fi
+  printf '%s' "$$" >"$pidfile"
+  # Claimed: from here on this shell owns the pidfile, so remove it on exit. The
+  # path rides a global — a function-local is out of scope when the trap fires.
+  _WATCH_PIDFILE="$pidfile"
+  trap 'rm -f "$_WATCH_PIDFILE"' EXIT
+  printf '%s\n' "hub-otel-watch: daemon armed (pid $$, log $logfile)"
+  _watch_loop >>"$logfile" 2>&1
+  return 0
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  case "${1:-}" in
+    --daemon) _daemon ;;
+    *) main "$@" ;;
+  esac
+fi
