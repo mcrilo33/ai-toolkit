@@ -379,6 +379,43 @@ def test_known_gitdir_scenario_passes_through(repo: Path, tmp_path: Path) -> Non
     assert proc.returncode == 0, proc.stderr
 
 
+def test_live_spoke_commit_mid_gate_passes_and_survives(
+    repo: Path, spoke: Path, tmp_path: Path
+) -> None:
+    # THE #135 regression, end to end: a stub "spoke" advances its own branch
+    # while the gate runs. The push must NOT abort and the spoke's commit must
+    # NOT be rewound.
+    base = _rev(repo)
+    tip = _commit(repo, {"ci/build.yml": "on: push\n"})
+    _make_pytest_stub(tmp_path / "bin", f'git -C "{spoke}" commit --allow-empty -q -m spoke-work')
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr  # push not aborted
+    assert (
+        _git(repo, "log", "-1", "--format=%s", "refs/heads/feature/spoke").strip() == "spoke-work"
+    )  # the spoke's commit survives
+
+
+def test_sibling_rewind_mid_gate_still_aborts_and_recovers(
+    repo: Path, spoke: Path, tmp_path: Path
+) -> None:
+    # Counter-case: a sibling ref moving BACKWARD mid-gate is genuine
+    # corruption — abort, and restore brings the lost commit back (forward
+    # moves are not the strict-ancestor rewind restore refuses).
+    _git(spoke, "commit", "--allow-empty", "-qm", "spoke-work")
+    spoke_tip = _rev(repo, "refs/heads/feature/spoke")
+    base = _rev(repo)
+    tip = _commit(repo, {"ci/build.yml": "on: push\n"})
+    _make_pytest_stub(tmp_path / "bin", f'git -C "{spoke}" reset -q --hard HEAD~1')
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == BREACH_RC, proc.stderr  # still a breach
+    assert "refs/heads/feature/spoke" in proc.stderr  # named
+    assert _rev(repo, "refs/heads/feature/spoke") == spoke_tip  # recovered
+
+
 # --- the backstop: run_pytest_node under the tripwire (issue #31) -----------------
 # The red-proof hooks run individual Tested-RED nodes through run_pytest_node,
 # which shells out to pytest just like the gate. The tripwire wraps that run too:
