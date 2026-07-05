@@ -146,9 +146,14 @@ def _run_new(
         "exit 0\n"
     )
     tmux.chmod(0o755)
+    # HOME is sandboxed so the workspace-file default ($HOME/.claude/….code-workspace,
+    # issue #134) can never resolve to — let alone rewrite — the host's real file.
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
     env = {
         **_GIT_ENV,
         "PATH": f"{bindir}:{os.environ['PATH']}",
+        "HOME": str(home),
         "STUB_HAS_SESSION": str(has_session_rc),
         "STUB_NEW_SESSION": str(new_session_rc),
     }
@@ -1182,8 +1187,8 @@ def test_new_appends_entry_to_workspace_file_not_code_add(hub: Path, tmp_path: P
     assert proc.returncode == 0, proc.stderr
     doc = json.loads(ws.read_text())
     assert doc["folders"] == [{"name": f"{hub.name}-8", "path": f"../{hub.name}-8"}]
-    assert "--add" not in code_log.read_text(), (
-        "direct append and `code --add` must never both fire (double-add)"
+    assert code_log.read_text() == "", (
+        "direct append and the `code` CLI must never both fire (double-add)"
     )
 
 
