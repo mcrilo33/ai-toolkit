@@ -78,12 +78,20 @@ def worktree(tmp_path: Path) -> Path:
 
 
 def _run(
-    worktree: Path, bindir: Path, *, auth: str | None = AUTH, script: Path = INGEST
+    worktree: Path,
+    bindir: Path,
+    *,
+    auth: str | None = AUTH,
+    script: Path = INGEST,
+    conf: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = {
         **os.environ,
         "PATH": f"{bindir}:{os.environ['PATH']}",
         "AI_TOOLKIT_INGEST_FLUSH_WAIT": "0",
+        # Pin the auth-resolver conf: a developer's real ~/.afk-telemetry must
+        # never leak credentials into the auth-unset tests.
+        "AFK_TELEMETRY_CONF": str(conf) if conf else "/nonexistent/afk-telemetry",
     }
     # A caller PYTHONPATH would suffix the exported one — drop it so the layout
     # tests can assert the resolved import path exactly.
@@ -135,6 +143,22 @@ def test_skips_when_auth_unset(worktree: Path, tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert not runlog.exists()
     assert "LANGFUSE_BASIC_AUTH" in (result.stdout + result.stderr)
+
+
+def test_resolves_auth_from_conf_when_env_unset(worktree: Path, tmp_path: Path) -> None:
+    # Arrange: no env credential — the shared ~/.afk-telemetry conf carries it,
+    # the way a manual re-run (or a hub session) encounters the script (#136)
+    conf = tmp_path / "afk-telemetry"
+    conf.write_text(f'LANGFUSE_BASIC_AUTH="{AUTH}"\n')
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+
+    # Act
+    result = _run(worktree, bindir, auth=None, conf=conf)
+
+    # Assert: the script resolves auth itself and runs both ingesters
+    assert result.returncode == 0, result.stderr
+    assert len(runlog.read_text().splitlines()) == 2
 
 
 def test_best_effort_when_a_step_fails(worktree: Path, tmp_path: Path) -> None:
