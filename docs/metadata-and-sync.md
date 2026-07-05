@@ -119,7 +119,9 @@ Safety guarantees:
   eligible for deletion; anything else in `.cursor/`, `.github/`, or `.claude/`
   is left alone.
 - **Protected paths** — `.cursor/hooks.json`, `.claude/settings.json` (owned by
-  the hook reconciler), and `*.bak` backups are never deleted.
+  the hook reconciler — which also forces `preferredNotifChannel:
+  notifications_disabled` to silence Claude Code's idle notifications, issue
+  #146), and `*.bak` backups are never deleted.
 - **Path validation** — absolute paths and `..` traversal segments are rejected,
   both in recorded paths and in old manifest entries.
 - A corrupt or missing manifest is treated as a first run: nothing is deleted.
