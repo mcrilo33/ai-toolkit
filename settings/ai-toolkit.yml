@@ -22,6 +22,18 @@
 # wt_base_branch resolver in shared/hooks/lib/base-branch.sh (issue #117).
 base_branch:
 
+# Hub batch/dispatch hardening (issue #151). Caps how many spokes the hub runs
+# concurrently across /next-batch and /afk, so wide parallelism can't drive load
+# high enough to starve the co-located Langfuse (the #151 telemetry-loss trigger).
+batch:
+  # Max spokes running at once. Empty ⇒ auto min(2, cores/4); set a positive
+  # integer to override. batch-plan.sh truncates the batch so (in-flight +
+  # newly-dispatched) never exceeds this.
+  concurrency_cap:
+  # Seconds to wait between consecutive spawns in one batch, so first-push full
+  # suites don't all hit at once. Empty ⇒ 45.
+  stagger_seconds:
+
 model:
   # The interactive spoke driver launched by worktree-new.sh. `[1m]` selects
   # the 1M-token context tier.

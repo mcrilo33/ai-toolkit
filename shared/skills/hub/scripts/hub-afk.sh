@@ -1198,24 +1198,90 @@ _inflight_scope_args() {
   done < <(inflight_issues)
 }
 
-# dispatch_batch -> plan the next concurrent batch (batch-plan.sh) and spawn a spoke for
-# each issue not already in flight, seeded with the ultra kickoff. A missing planner or
-# dispatcher logs and is a no-op (the next tick retries).
+# --- concurrency cap + dispatch stagger (issue #151) --------------------------
+# The hub had no ceiling on live spokes, so a wide batch drove load high enough to
+# starve the co-located Langfuse (permanent trace loss). Cap the batch and stagger
+# spawns so first-push full suites don't all land on the box at once.
+
+# _afk_cores -> logical CPU count (nproc → sysctl → 1). LC_ALL=C guards the
+# locale-formatted-number class this repo has been bitten by (ps/date).
+_afk_cores() {
+  local n
+  n="$(LC_ALL=C nproc 2>/dev/null || LC_ALL=C sysctl -n hw.ncpu 2>/dev/null || printf '1')"
+  case "$n" in '' | *[!0-9]*) n=1 ;; esac
+  [ "$n" -ge 1 ] || n=1
+  printf '%s\n' "$n"
+}
+
+# _afk_batch_config_env -> the AI_TOOLKIT_BATCH_* lines the config parser emits for
+# settings/ai-toolkit.yml, or nothing when the parser/config can't be resolved (a
+# synced target ships neither). Best-effort: the caller falls back to its own default.
+_afk_batch_config_env() {
+  local cfg_py cfg_yml
+  cfg_py="$(_afk_find_script "${AFK_CONFIG_PY:-}" ai_toolkit_config.py)" || return 0
+  cfg_yml="${AI_TOOLKIT_CONFIG:-${MAIN_ROOT:-$_AFK_TOPLEVEL}/settings/ai-toolkit.yml}"
+  [ -f "$cfg_yml" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 "$cfg_py" batch-env "$cfg_yml" 2>/dev/null || true
+}
+
+# _afk_dispatch_cap -> the max concurrent spokes. AFK_SPOKE_CAP wins (operator/test
+# seam), else the config's concurrency_cap, else auto min(2, cores/4) — always ≥1.
+_afk_dispatch_cap() {
+  local cap="${AFK_SPOKE_CAP:-}" cores AI_TOOLKIT_BATCH_CAP=""
+  if [ -z "$cap" ]; then
+    eval "$(_afk_batch_config_env)" 2>/dev/null || true
+    cap="${AI_TOOLKIT_BATCH_CAP:-}"
+  fi
+  if [ -z "$cap" ]; then
+    cores="$(_afk_cores)"
+    cap=$(( cores / 4 )); [ "$cap" -gt 2 ] && cap=2
+  fi
+  case "$cap" in '' | *[!0-9]*) cap=1 ;; esac
+  [ "$cap" -ge 1 ] || cap=1
+  printf '%s\n' "$cap"
+}
+
+# _afk_dispatch_stagger -> seconds between consecutive spawns in one batch.
+# AFK_DISPATCH_STAGGER wins (0 disables; the test seam), else the config, else 45.
+_afk_dispatch_stagger() {
+  local s="${AFK_DISPATCH_STAGGER:-}" AI_TOOLKIT_BATCH_STAGGER=""
+  if [ -z "$s" ]; then
+    eval "$(_afk_batch_config_env)" 2>/dev/null || true
+    s="${AI_TOOLKIT_BATCH_STAGGER:-}"
+  fi
+  [ -n "$s" ] || s=45
+  case "$s" in *[!0-9]*) s=45 ;; esac
+  printf '%s\n' "$s"
+}
+
+# dispatch_batch -> plan the next concurrent batch (batch-plan.sh, capped) and spawn a
+# spoke for each issue not already in flight, seeded with the ultra kickoff and staggered
+# so first-push suites don't all hit at once. A missing planner or dispatcher logs and is
+# a no-op (the next tick retries).
 dispatch_batch() {
   [ "$_AFK_AUTH_FAILED" -eq 1 ] && return 0   # auth is dead — don't spawn spokes into it
-  local bp wt_new inflight args=() batch n
+  local bp wt_new inflight args=() batch n cap stagger spawned=0
   bp="$(_afk_find_script "${BATCH_PLAN:-}" batch-plan.sh)" || { log "batch-plan.sh not found — skipping dispatch"; return 0; }
   wt_new="$(_afk_find_script "${WT_NEW:-}" worktree-new.sh)" || { log "worktree-new.sh not found — skipping dispatch"; return 0; }
   inflight="$(inflight_issues)"
   while IFS= read -r line; do args+=("$line"); done < <(_inflight_scope_args)
+  # Bound total live spokes: batch-plan truncates so (in-flight + dispatched) ≤ cap.
+  cap="$(_afk_dispatch_cap)"
+  stagger="$(_afk_dispatch_stagger)"
+  args+=("--cap" "$cap")
   batch="$(bash "$bp" "${args[@]+"${args[@]}"}" 2>/dev/null || true)"
   for n in $batch; do
     printf '%s\n' "$inflight" | grep -qxF "$n" && continue   # already in flight (idempotent)
+    # Stagger consecutive spawns (before the 2nd onward), so the co-located Langfuse
+    # isn't hit by several first-push full suites at the same instant.
+    [ "$spawned" -gt 0 ] && [ "$stagger" -gt 0 ] && sleep "$stagger" 2>/dev/null || true
     log "→ dispatch #$n"
     # --mode afk stamps the spoke's trace as drain-driven (#102); a hand-dispatched
     # spoke defaults to attended in worktree-new.sh.
     if bash "$wt_new" "$n" --type feature --mode afk --prompt "$(kickoff_for "$n")"; then
       stamp_dispatch_epoch "$n"
+      spawned=$(( spawned + 1 ))
     else
       log "  dispatch of #$n failed — will retry next tick"
     fi

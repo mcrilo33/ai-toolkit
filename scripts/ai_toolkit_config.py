@@ -136,6 +136,44 @@ def agent_model_overrides(config: dict) -> dict[str, dict[str, str]]:
     return overrides
 
 
+def _positive_int(value: object) -> int | None:
+    """Parse a positive integer, or None when unset/blank/non-numeric/non-positive.
+
+    The one numeric family of config values (issue #151 batch settings) is
+    hand-edited, so a blank, zero, or malformed entry must fall back to the
+    consumer's own default rather than silently becoming a real ceiling.
+    """
+    if isinstance(value, bool):  # bool is an int subclass — reject it explicitly
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            n = int(text)
+            return n if n > 0 else None
+    return None
+
+
+def _batch_section(config: dict) -> dict:
+    section = config.get("batch")
+    return section if isinstance(section, dict) else {}
+
+
+def batch_concurrency_cap(config: dict) -> int | None:
+    """The configured max concurrent spokes, or None to auto-derive (issue #151).
+
+    Blank/absent/non-positive ⇒ None, so the dispatch consumer falls back to
+    ``min(2, cores/4)`` rather than treating a mis-edit as an unlimited or zero cap.
+    """
+    return _positive_int(_batch_section(config).get("concurrency_cap"))
+
+
+def batch_stagger_seconds(config: dict) -> int | None:
+    """Seconds between consecutive spawns in one batch, or None for the default."""
+    return _positive_int(_batch_section(config).get("stagger_seconds"))
+
+
 def base_branch(config: dict) -> str:
     """The configured integration branch, or "" for auto-detection.
 
@@ -161,14 +199,29 @@ def _cli(argv: list[str]) -> str:
             f"WT_AGENT_MODEL_DEFAULT={shlex.quote(spec[0])}\n"
             f"WT_AGENT_EFFORT_DEFAULT={shlex.quote(spec[1])}"
         )
-    raise SystemExit(f"ai_toolkit_config: unknown command {command!r} (base-branch|spoke-env)")
+    if command == "batch-env":
+        # Emit ONLY the values the operator explicitly set (issue #151); a blank
+        # entry yields no line so the bash consumer keeps its own default (auto
+        # cap, 45s stagger). Values are plain integers, but shell-quote anyway.
+        lines = []
+        cap = batch_concurrency_cap(config)
+        if cap is not None:
+            lines.append(f"AI_TOOLKIT_BATCH_CAP={shlex.quote(str(cap))}")
+        stagger = batch_stagger_seconds(config)
+        if stagger is not None:
+            lines.append(f"AI_TOOLKIT_BATCH_STAGGER={shlex.quote(str(stagger))}")
+        return "\n".join(lines)
+    raise SystemExit(
+        f"ai_toolkit_config: unknown command {command!r} (base-branch|spoke-env|batch-env)"
+    )
 
 
 def main() -> None:
-    """CLI: ``ai_toolkit_config.py <base-branch|spoke-env> [config-path]``.
+    """CLI: ``ai_toolkit_config.py <base-branch|spoke-env|batch-env> [config-path]``.
 
     A thin bash-facing seam so sync-to-repo.sh can set ``ai-toolkit.base-branch``
-    and emit the spoke-default env file without a YAML parser of its own.
+    and emit the spoke-default env file, and the hub dispatch path can read the
+    batch concurrency cap / stagger, without a YAML parser of their own.
     """
     print(_cli(sys.argv))
 

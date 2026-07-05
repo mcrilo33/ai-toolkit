@@ -20,7 +20,11 @@
 #   * GREEDY DISJOINT-SCOPE PACK — walk ready issues in priority order; add to the
 #     batch only when its `Scope:` is disjoint from every issue already in the batch
 #     AND every in-flight spoke (passed in via --inflight). `Scope: *` / a missing
-#     line ⇒ exclusive (runs alone, never batched). No concurrency cap.
+#     line ⇒ exclusive (runs alone, never batched).
+#   * CONCURRENCY CAP (issue #151) — `--cap N` bounds the TOTAL live spokes: the batch
+#     is truncated so (in-flight count + batched count) never exceeds N, so a wide
+#     batch can't starve the box or the co-located Langfuse. Pure tail truncation of
+#     the priority-ordered pack. `--cap 0` / omitted ⇒ the historical unbounded batch.
 #   * OUTPUT — issue numbers only (space-separated). It never dispatches; `/next-batch`
 #     does that.
 #   * MERGE-CANDIDATE LINT (issue #125) — when a blocked-by chain of OPEN issues has
@@ -34,7 +38,8 @@
 # tests can drive `plan_from_json` with a fixture graph without any network round-trip.
 #
 # Usage:
-#   batch-plan.sh [--inflight "<scope tokens>"]...   # one --inflight per in-flight spoke
+#   batch-plan.sh [--inflight "<scope tokens>"]... [--cap N]
+#     one --inflight per in-flight spoke; --cap N bounds total concurrent spokes (0=off)
 #
 # Env:
 #   BATCH_PLAN_OWNER / BATCH_PLAN_REPO   override the gh-resolved owner/repo (tests)
@@ -96,14 +101,19 @@ fetch_issues() {
 # python3 pass; bash only marshals the in-flight scopes in via the environment.
 plan_from_json() {
   local inflight=()
+  local cap=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --inflight) [ "$#" -ge 2 ] || { echo "batch-plan: --inflight needs a value" >&2; return 2; }
                   inflight+=("$2"); shift 2 ;;
       --inflight=*) inflight+=("${1#--inflight=}"); shift ;;
+      --cap) [ "$#" -ge 2 ] || { echo "batch-plan: --cap needs a value" >&2; return 2; }
+             cap="$2"; shift 2 ;;
+      --cap=*) cap="${1#--cap=}"; shift ;;
       *) echo "batch-plan: unknown plan_from_json arg: $1" >&2; return 2 ;;
     esac
   done
+  case "$cap" in ''|*[!0-9]*) echo "batch-plan: --cap needs a non-negative integer (got '$cap')" >&2; return 2 ;; esac
   # Marshal the in-flight scopes to python via the environment (one newline-
   # separated line per --inflight value), kept out of argv. python then splits each
   # line into scope tokens, so a multi-file spoke scope and a single one converge to
@@ -116,7 +126,7 @@ plan_from_json() {
   command -v python3 >/dev/null 2>&1 || { echo "batch-plan: python3 required" >&2; return 1; }
   # The program is read from fd 3 (the heredoc), leaving python's stdin free to
   # carry the issue-node JSON piped in from fetch_issues / the tests.
-  _BATCH_INFLIGHT="$joined" python3 /dev/fd/3 3<<'PYEOF'
+  _BATCH_INFLIGHT="$joined" _BATCH_CAP="$cap" python3 /dev/fd/3 3<<'PYEOF'
 import json
 import os
 import sys
@@ -339,14 +349,25 @@ def main():
     )
 
     # Greedy disjoint-scope pack, seeded with the in-flight spoke scopes so a ready
-    # issue colliding with live work is held back. No concurrency cap.
-    chosen_scopes = parse_inflight(os.environ.get("_BATCH_INFLIGHT", ""))
+    # issue colliding with live work is held back.
+    inflight_scopes = parse_inflight(os.environ.get("_BATCH_INFLIGHT", ""))
+    chosen_scopes = list(inflight_scopes)
     batch = []
     for info in ready:
         scope = info["scope"]
         if all(not conflict(scope, existing) for existing in chosen_scopes):
             batch.append(info["number"])
             chosen_scopes.append(scope)
+
+    # Concurrency cap (issue #151): bound the total live spokes so a wide batch can't
+    # starve the box / the co-located Langfuse. `_BATCH_CAP` (>0) is the ceiling on
+    # (in-flight + newly-dispatched); the free slots are what remain after the spokes
+    # already running. Cap 0 / unset ⇒ the historical unbounded batch. Pure tail
+    # truncation of the priority-ordered pack — never reorders, never adds.
+    cap = int(os.environ.get("_BATCH_CAP", "0") or "0")
+    if cap > 0:
+        slots = max(0, cap - len(inflight_scopes))
+        batch = batch[:slots]
 
     if batch:
         print(" ".join(str(n) for n in batch))
