@@ -281,6 +281,76 @@ def test_afk_suppressed_gate_is_recorded_as_seen(hub: Path, tmp_path: Path) -> N
     assert second == []
 
 
+# /afk drain-complete (issue #150): hub-afk writes <git-common-dir>/.afk-drain-complete
+# with the landed count when a drain finishes. hub-notify fires ONE "/afk drain
+# complete — <k> landed" ping and consumes (removes) the file, so a completed drain
+# notifies exactly once and the steady post-drain state never repeats it. This is
+# independent of the marker seen-set and of afk-mode (the drain already cleared
+# .afk-state before this runs).
+def test_drain_complete_fires_once_naming_count(hub: Path, tmp_path: Path) -> None:
+    done = tmp_path / "drain-complete"
+    done.write_text("3\n")
+
+    proc, messages = _run(hub, tmp_path, env_extra={"AFK_DRAIN_COMPLETE": str(done)})
+
+    assert proc.returncode == 0
+    assert messages == ["/afk drain complete — 3 landed"]
+    assert not done.exists(), "the completion file is consumed (removed) after firing"
+
+
+def test_drain_complete_consumed_not_refired(hub: Path, tmp_path: Path) -> None:
+    done = tmp_path / "drain-complete"
+    done.write_text("2\n")
+
+    _proc1, first = _run(hub, tmp_path, env_extra={"AFK_DRAIN_COMPLETE": str(done)})
+    proc2, second = _run(hub, tmp_path, env_extra={"AFK_DRAIN_COMPLETE": str(done)})
+
+    assert first == ["/afk drain complete — 2 landed"]
+    assert proc2.returncode == 0
+    assert second == first, "consumed → the steady post-drain state fires nothing more"
+
+
+def test_drain_complete_zero_landed_still_fires(hub: Path, tmp_path: Path) -> None:
+    # A drain that landed nothing still fires exactly one "0 landed" signal.
+    done = tmp_path / "drain-complete"
+    done.write_text("0\n")
+
+    _proc, messages = _run(hub, tmp_path, env_extra={"AFK_DRAIN_COMPLETE": str(done)})
+
+    assert messages == ["/afk drain complete — 0 landed"]
+
+
+def test_drain_complete_malformed_count_defaults_zero(hub: Path, tmp_path: Path) -> None:
+    # A partially-written / corrupt count reads as 0 rather than leaking garbage.
+    done = tmp_path / "drain-complete"
+    done.write_text("garbage\n")
+
+    _proc, messages = _run(hub, tmp_path, env_extra={"AFK_DRAIN_COMPLETE": str(done)})
+
+    assert messages == ["/afk drain complete — 0 landed"]
+    assert not done.exists()
+
+
+def test_drain_complete_fires_regardless_of_afk_mode(hub: Path, tmp_path: Path) -> None:
+    # The drain-complete ping is not gated by afk-mode: even if a stale .afk-state
+    # is still armed, a finished drain's completion must still notify.
+    done = tmp_path / "drain-complete"
+    done.write_text("1\n")
+
+    _proc, messages = _run(hub, tmp_path, afk=True, env_extra={"AFK_DRAIN_COMPLETE": str(done)})
+
+    assert messages == ["/afk drain complete — 1 landed"]
+
+
+def test_no_drain_complete_file_fires_nothing(hub: Path, tmp_path: Path) -> None:
+    # Absent completion file (the common steady state) ⇒ no drain-complete ping.
+    done = tmp_path / "drain-complete"  # never created
+
+    _proc, messages = _run(hub, tmp_path, env_extra={"AFK_DRAIN_COMPLETE": str(done)})
+
+    assert messages == []
+
+
 def test_whitespace_only_afk_state_does_not_suppress(hub: Path, tmp_path: Path) -> None:
     # Parity with afk_read_state: a whitespace-only .afk-state is NOT armed, so
     # a gate marker still fires (guards against dropping the non-empty trim).
