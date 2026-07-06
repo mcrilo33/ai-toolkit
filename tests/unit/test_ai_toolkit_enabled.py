@@ -214,3 +214,185 @@ def test_ai_toolkit_shim_toggles(repo: Path) -> None:
     assert _check(repo) != 0
     assert _cli(repo, "on", cmd=AI_TOOLKIT_CMD).returncode == 0
     assert _check(repo) == 0
+
+
+# ── Subtask B: hook pass-through when disabled ──────────────────────
+#
+# The correctness bar: when DISABLED every hook must FULLY pass through — a
+# commit/push that would normally be gated succeeds untouched; when ENABLED
+# nothing changes vs today. Covered on both surfaces: the native git hooks
+# (commit-msg + pre-push, emitted by install-git-hooks.sh) and the Claude Code
+# hooks (which source lib/utils.sh, the telemetry-arming choke point).
+
+INSTALL = _REPO_ROOT / "scripts" / "install-git-hooks.sh"
+SHARED_HOOKS = _REPO_ROOT / "shared" / "hooks"
+UTILS = SHARED_HOOKS / "lib" / "utils.sh"
+BLOCK_NO_VERIFY = SHARED_HOOKS / "block-no-verify.sh"
+
+# Cage scripts the native hooks invoke — replaced by always-blocking stubs so a
+# hook's outcome is driven by the on/off guard, not the scripts' real logic.
+_CAGE_STUBS = (
+    "commit-quality",
+    "commit-gauntlet",
+    "test-select",
+    "anti-gutting-scan",
+    "red-proof-warn",
+    "reviewer-sep-warn",
+)
+
+
+@pytest.fixture()
+def installed_repo(tmp_path: Path) -> Path:
+    """A repo tracking a bare origin with the native cage hooks installed and
+    every copied cage script replaced by an always-blocking stub."""
+    home = tmp_path / "home"
+    home.mkdir()
+    remote = tmp_path / "remote.git"
+    r = tmp_path / "repo"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", str(remote)], check=True, capture_output=True, env=_GIT_ENV
+    )
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(r)], check=True, capture_output=True, env=_GIT_ENV
+    )
+    for k, v in (("user.email", "t@t.t"), ("user.name", "t"), ("commit.gpgsign", "false")):
+        _git(r, "config", k, v)
+    (r / "README.md").write_text("seed\n")
+    _git(r, "add", "README.md")
+    _git(r, "commit", "-qm", "chore: seed", "-m", "Refs #0")
+    _git(r, "remote", "add", "origin", str(remote))
+    _git(r, "push", "-q", "-u", "origin", "main")
+    subprocess.run([str(INSTALL), str(r)], check=True, capture_output=True, text=True, env=_env(r))
+    scripts = _common_dir(r) / "hooks" / "ai-toolkit-scripts"
+    for name in _CAGE_STUBS:
+        stub = scripts / f"{name}.sh"
+        stub.write_text(
+            "#!/usr/bin/env bash\ncat >/dev/null 2>&1 || true\n"
+            f"echo BLOCKED-BY-{name} >&2\nexit 1\n"
+        )
+        stub.chmod(0o755)
+    return r
+
+
+def _disable(repo: Path) -> None:
+    """Drop the sync-safe off marker at the repo's git-common-dir."""
+    (_common_dir(repo) / "ai-toolkit-off").write_text("")
+
+
+def _commit_attempt(repo: Path) -> subprocess.CompletedProcess[str]:
+    (repo / "f.txt").write_text("change\n")
+    _git(repo, "add", "f.txt")
+    return subprocess.run(
+        ["git", "commit", "-m", "feat: x", "-m", "Refs #1"],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env=_env(repo),
+    )
+
+
+def _make_pushable_commit(repo: Path) -> None:
+    """A commit that bypasses the native commit-msg hook (via --no-verify), so a
+    pre-push test can push it without the commit-msg stub interfering."""
+    (repo / "p.txt").write_text("push me\n")
+    _git(repo, "add", "p.txt")
+    _git(repo, "commit", "--no-verify", "-qm", "chore: pushable", "-m", "Refs #1")
+
+
+def _push(repo: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "push"], cwd=str(repo), capture_output=True, text=True, env=_env(repo)
+    )
+
+
+# native commit-msg hook
+
+
+def test_native_commit_msg_enforces_when_enabled(installed_repo: Path) -> None:
+    """Baseline: with the toolkit ON, the commit-msg cage stub blocks the commit."""
+    assert _commit_attempt(installed_repo).returncode != 0
+
+
+def test_native_commit_msg_passthrough_when_disabled(installed_repo: Path) -> None:
+    """With the toolkit OFF, the commit-msg hook passes through — commit succeeds."""
+    _disable(installed_repo)
+    result = _commit_attempt(installed_repo)
+    assert result.returncode == 0, result.stderr
+
+
+# native pre-push hook
+
+
+def test_native_pre_push_enforces_when_enabled(installed_repo: Path) -> None:
+    """Baseline: with the toolkit ON, the pre-push test gate stub blocks the push."""
+    _make_pushable_commit(installed_repo)
+    assert _push(installed_repo).returncode != 0
+
+
+def test_native_pre_push_passthrough_when_disabled(installed_repo: Path) -> None:
+    """With the toolkit OFF, the pre-push hook passes through — push succeeds."""
+    _make_pushable_commit(installed_repo)
+    _disable(installed_repo)
+    result = _push(installed_repo)
+    assert result.returncode == 0, result.stderr
+
+
+def test_install_copies_enabled_lib(installed_repo: Path) -> None:
+    """install-git-hooks.sh copies enabled.sh into the hooks lib dir, so the
+    wrapper guard (and utils.sh, which now sources it) can resolve it."""
+    lib = _common_dir(installed_repo) / "hooks" / "ai-toolkit-scripts" / "lib" / "enabled.sh"
+    assert lib.exists()
+
+
+# CC hooks (utils.sh choke point)
+
+
+def _run_utils_probe(repo: Path) -> subprocess.CompletedProcess[str]:
+    """Source utils.sh then echo a sentinel. When disabled, utils.sh must pass
+    through (exit 0 at source-time) BEFORE arming telemetry, so the sentinel
+    never prints — locking both the guard and the telemetry-off implication."""
+    probe = repo / "probe.sh"
+    probe.write_text(f'#!/usr/bin/env bash\nsource "{UTILS}"\necho REACHED_BODY\n')
+    probe.chmod(0o755)
+    return subprocess.run(
+        ["bash", str(probe)], cwd=str(repo), capture_output=True, text=True, env=_env(repo)
+    )
+
+
+def test_cc_hook_runs_when_enabled(repo: Path) -> None:
+    """Baseline: with the toolkit ON, utils.sh sources through to the hook body."""
+    result = _run_utils_probe(repo)
+    assert result.returncode == 0, result.stderr
+    assert "REACHED_BODY" in result.stdout
+
+
+def test_cc_hook_passthrough_when_disabled(repo: Path) -> None:
+    """With the toolkit OFF, utils.sh exits 0 during source — the hook body and
+    telemetry arming never run."""
+    _disable(repo)
+    result = _run_utils_probe(repo)
+    assert result.returncode == 0
+    assert "REACHED_BODY" not in result.stdout
+
+
+def _run_block_no_verify(repo: Path) -> subprocess.CompletedProcess[str]:
+    payload = '{"tool_name":"Bash","tool_input":{"command":"git commit --no-verify -m x"}}'
+    return subprocess.run(
+        [str(BLOCK_NO_VERIFY)],
+        input=payload,
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env=_env(repo),
+    )
+
+
+def test_block_no_verify_denies_when_enabled(repo: Path) -> None:
+    """Baseline: with the toolkit ON, block-no-verify denies a --no-verify commit."""
+    assert _run_block_no_verify(repo).returncode != 0
+
+
+def test_block_no_verify_passthrough_when_disabled(repo: Path) -> None:
+    """With the toolkit OFF, block-no-verify (a utils.sh-sourcing guard) no-ops."""
+    _disable(repo)
+    assert _run_block_no_verify(repo).returncode == 0
