@@ -550,6 +550,76 @@ read_decisions_digest() {
   awk -F'\t' -v issue="$issue" '$2 == issue { printf "- %s: %s (%s)\n", $3, $5, $4 }' "$log" 2>/dev/null || true
 }
 
+# --- automatable-decisions log + codification (issue #155, subtask D) ----------
+# Every auto-answer is recorded with a normalized SIGNATURE so recurrences of the same
+# gate shape collide; a periodic codification pass then proposes deterministic rules for
+# signatures that recur unanimously — graduating common gates out of the LLM in BOTH
+# modes (the "scripted control plane, not LLM" payoff, generalizing #149's git-reset
+# self-stage rule into a learning pipeline). Proposal-only: a human reviews before any
+# rule is appended to the classifier table.
+
+# _normalize_command_shape <command> -> the command's verb skeleton: each ;/&&/||/|
+# segment reduced to "<verb>-<subcommand>" (flags/args/paths dropped), joined by '+'. So
+# `git reset -q; git add tests/x.py` and `git reset HEAD; git add a.py` both normalize to
+# `git-reset+git-add`. Parses tokens by hand (no word-splitting) so a glob never expands.
+_normalize_command_shape() {
+  local cmd="$1" norm seg out="" verb rest sub part
+  norm="${cmd//&&/$'\n'}"; norm="${norm//||/$'\n'}"; norm="${norm//|/$'\n'}"; norm="${norm//;/$'\n'}"
+  while IFS= read -r seg; do
+    seg="${seg#"${seg%%[![:space:]]*}"}"; seg="${seg%"${seg##*[![:space:]]}"}"
+    [ -n "$seg" ] || continue
+    verb="${seg%% *}"
+    rest="${seg#"$verb"}"; rest="${rest#"${rest%%[![:space:]]*}"}"
+    sub="${rest%% *}"
+    case "$sub" in '' | -*) sub="" ;; esac        # a flag / nothing isn't a subcommand
+    part="$verb"; [ -n "$sub" ] && part="$verb-$sub"
+    out="${out:+$out+}$part"
+  done <<<"$norm"
+  printf '%s\n' "$out"
+}
+
+# _broker_decision_signature <gate_type> <shape> -> a stable signature for the decision.
+# A permission gate's shape is its command (normalized to the verb skeleton); other gate
+# types sign as the gate type itself (a plan gate is a judgment call, not codifiable).
+_broker_decision_signature() {
+  local gate_type="$1" shape="$2"
+  case "$gate_type" in
+    permission) _normalize_command_shape "$shape" ;;
+    *) printf '%s\n' "$gate_type" ;;
+  esac
+}
+
+# log_decision <issue> <gate_type> <shape> <decision> -> append one automatable-decisions
+# record: <ts>\t<issue>\t<gate_type>\t<signature>\t<decision>. Exactly the format
+# read_decisions_digest (subtask B) consumes. Best-effort; never aborts the caller.
+log_decision() {
+  local issue="$1" gate_type="$2" shape="$3" decision="$4" sig log
+  sig="$(_broker_decision_signature "$gate_type" "$shape")"
+  log="$(_afk_state_dir)/decisions.log"
+  mkdir -p "$(dirname "$log")" 2>/dev/null || true
+  printf '%s\t%s\t%s\t%s\t%s\n' "$(afk_now)" "$issue" "$gate_type" "$sig" "$decision" \
+    >>"$log" 2>/dev/null || true
+}
+
+# codify_decisions [min_count] -> propose a deterministic rule for every signature that
+# recurs at least <min_count> times (default 2) with a UNANIMOUS decision. Output is a
+# PROPOSAL a human reviews before it is codified into classify_permission — never an
+# auto-applied rule. A single-occurrence or a conflicting signature proposes nothing.
+codify_decisions() {
+  local min="${1:-2}" log
+  log="$(_afk_state_dir)/decisions.log"
+  [ -f "$log" ] || return 0
+  awk -F'\t' -v min="$min" '
+    { sig=$4; dec=$5; count[sig]++
+      if (!(sig in decision)) decision[sig]=dec
+      else if (decision[sig]!=dec) conflict[sig]=1 }
+    END {
+      for (s in count)
+        if (count[s] >= min && !(s in conflict))
+          printf "RULE: %s -> %s (%d occurrences, unanimous)\n", s, decision[s], count[s]
+    }' "$log" 2>/dev/null | sort || true
+}
+
 # _rule_file -> the afk-answering rule path, across both layouts; empty if unfound.
 _rule_file() {
   local cand
@@ -828,6 +898,7 @@ _decide_permission() {
     if approve_permission "$wt"; then
       log "  approved permission for #$issue"
       afk_emit_decision "$wt" success
+      log_decision "$issue" permission "$cmd" APPROVE   # record for the codification pass (#155 D)
       return 0
     fi
     _escalate_blocked "$wt" "$issue" "could not deliver permission approval to the spoke — needs a human"
