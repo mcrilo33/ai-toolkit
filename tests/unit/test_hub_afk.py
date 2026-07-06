@@ -2680,6 +2680,17 @@ def test_emit_drain_complete_writes_count_and_clears_counter(tmp_path: Path) -> 
     assert not countfile.exists(), "the counter is reset after the emit"
 
 
+def test_clear_drain_complete_drops_stale_signal(tmp_path: Path) -> None:
+    # A fresh arm clears any un-consumed .afk-drain-complete so a prior drain's
+    # completion can't bleed a late ping into the newly-armed window.
+    donefile = tmp_path / "drain-complete"
+    donefile.write_text("3\n")
+
+    _call("_afk_clear_drain_complete", env={"AFK_DRAIN_COMPLETE": str(donefile)})
+
+    assert not donefile.exists()
+
+
 def test_emit_drain_complete_writes_zero_when_none_landed(tmp_path: Path) -> None:
     # A drain that landed nothing still emits exactly one signal, "0 landed".
     countfile = tmp_path / "landed-count"

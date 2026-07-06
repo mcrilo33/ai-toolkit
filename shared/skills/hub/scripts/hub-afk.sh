@@ -205,6 +205,7 @@ _afk_incr_landed() {
   printf '%s\n' "$(( $(afk_read_landed_count) + 1 ))" > "$(afk_landed_count_file)" 2>/dev/null || true
 }
 _afk_clear_landed_count() { rm -f "$(afk_landed_count_file)" 2>/dev/null || true; }
+_afk_clear_drain_complete() { rm -f "$(afk_drain_complete_file)" 2>/dev/null || true; }
 # _afk_emit_drain_complete -> hand the final tally to hub-notify at drain-stop:
 # write the count to .afk-drain-complete, then reset the counter so the next
 # window starts fresh. Best-effort; a write failure never aborts the stop path.
@@ -2173,6 +2174,7 @@ main() {
     _clear_progress_state    # fresh window ⇒ no stale progress / answer-attempt epochs
     _clear_resume_markers    # fresh window ⇒ every spoke gets its one auto-resume again
     _afk_clear_landed_count  # fresh window ⇒ the landed tally starts at zero (#150)
+    _afk_clear_drain_complete # ...and drop any un-consumed completion signal from a prior drain
     _clear_blocked_records   # fresh window ⇒ --status shows only THIS run's durable blocks
     log "/afk: armed ($([ "$end" = drain ] && echo 'drain — until the backlog is empty' || echo "until $(wt_date_ymd "$end") $(date -r "$end" +%H:%M 2>/dev/null || date -d "@$end" +%H:%M)"))"
   fi
