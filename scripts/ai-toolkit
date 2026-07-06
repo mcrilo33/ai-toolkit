@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# ai-toolkit — the one-word toggle for the toolkit's global on/off switch (#154).
+#
+#   ai-toolkit off      # bypass every gate/guard/telemetry hook on this clone
+#   ai-toolkit on        # restore enforcement
+#   ai-toolkit status    # show the effective state and where it comes from
+#   ai-toolkit check     # exit 0 when enabled, non-zero when disabled (for scripts)
+#
+# A thin PATH-facing shim over shared/hooks/lib/enabled.sh — the single source of
+# truth for the resolver + toggle. It operates on the git repo containing the
+# current directory, so the marker lands at that clone's shared git-common-dir.
+set -euo pipefail
+
+_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# enabled.sh lives under shared/hooks/lib/ in the toolkit checkout, or — in a
+# synced target — as a co-located sibling in .ai-toolkit/scripts/. Try both.
+for _cand in "$_DIR/../shared/hooks/lib/enabled.sh" "$_DIR/enabled.sh"; do
+  if [ -f "$_cand" ]; then
+    exec bash "$_cand" "$@"
+  fi
+done
+
+echo "ai-toolkit: cannot locate enabled.sh (looked next to $_DIR)" >&2
+exit 1
