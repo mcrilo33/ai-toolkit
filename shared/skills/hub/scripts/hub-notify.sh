@@ -94,14 +94,22 @@ tag_field() {
 # blocked subject "blocked" + reason in the body). On a lightweight tag,
 # %(contents:*) returns the pointed-to COMMIT's message — degraded input only.
 message_for() {
-  local kind="$1" issue="$2" tag="$3" gate reason subject
+  local kind="$1" issue="$2" tag="$3" gate reason subject qcm
   case "$kind" in
     ready)
       printf '#%s done → /land %s' "$issue" "$issue" ;;
     gate)
       gate="$(tag_field "$tag" contents:subject)"
       [ -n "$gate" ] || gate="gate"
-      printf '#%s parked at %s gate — reply to approve' "$issue" "$gate" ;;
+      # When the gate-broker attended adapter (#155) has written a QCM surface for this
+      # gate, point the human at it; otherwise the plain approve ping. The surface path
+      # mirrors gate-broker.sh's _broker_qcm_dir; GATE_BROKER_QCM_DIR overrides both.
+      qcm="${GATE_BROKER_QCM_DIR:-$common_dir/ai-toolkit-afk/gate-broker}/qcm-$issue.md"
+      if [ -f "$qcm" ]; then
+        printf '#%s parked at %s gate — resolve via the gate-broker QCM' "$issue" "$gate"
+      else
+        printf '#%s parked at %s gate — reply to approve' "$issue" "$gate"
+      fi ;;
     blocked)
       reason="$(tag_field "$tag" contents:body)"
       if [ -z "$reason" ]; then

@@ -953,6 +953,87 @@ _consume_gate_tag() {
   git -C "$wt" push origin ":refs/tags/gate/$issue" >/dev/null 2>&1 || true
 }
 
+# --- attended QCM surface (issue #155, subtask C) -----------------------------
+# In attended mode a human-decision gate is serviced by an INTERACTIVE per-gate context
+# that owns present + capture + inject (NOT the hub, which is only NOTIFIED via hub-notify
+# #146). The upstream reasoning stays one-shot (run_answerer); when it returns a
+# human-decision, _broker_present_qcm renders a structured QCM (summary + reviewer advice
+# + freeform escape) on a dedicated per-gate surface, waits for the reviewer's reply HERE,
+# and injects it into the spoke via the shared injector — off the pane, off the hub chat.
+# One interactive context per gate; it closes after.
+
+# _broker_qcm_dir -> the directory holding per-gate QCM surfaces. GATE_BROKER_QCM_DIR
+# overrides (shared with hub-notify.sh, whose gate ping points the human at the surface).
+_broker_qcm_dir() { printf '%s\n' "${GATE_BROKER_QCM_DIR:-$(_afk_state_dir)/gate-broker}"; }
+
+# _broker_qcm_surface <issue> -> the per-gate QCM surface path.
+_broker_qcm_surface() { printf '%s\n' "$(_broker_qcm_dir)/qcm-$1.md"; }
+
+# _broker_qcm_clear <issue> -> drop a resolved gate's surface.
+_broker_qcm_clear() { rm -f "$(_broker_qcm_surface "$1")" 2>/dev/null || true; }
+
+# build_qcm <issue> <summary> <advice> -> write the structured QCM surface: the parked
+# prompt (summary — the spoke's own options recommended-first, as it posted them), the
+# reviewer's advice, and the freeform-escape instruction. Human-readable + a record, and
+# its existence is the flag hub-notify keys the "resolve via QCM" ping on.
+build_qcm() {
+  local issue="$1" summary="$2" advice="$3" surface
+  surface="$(_broker_qcm_surface "$issue")"
+  mkdir -p "$(dirname "$surface")" 2>/dev/null || true
+  cat > "$surface" <<EOF
+# Gate broker · QCM for #$issue
+
+## Summary — what the spoke is parked on
+
+$summary
+
+## Reviewer advice
+
+$advice
+
+## Your decision
+
+Reply with the option you want (the spoke listed its own options above, recommended
+first), or type any freeform instruction — it is injected verbatim into the spoke. An
+empty reply defers the gate (escalated as blocked/$issue for later).
+EOF
+}
+
+# _broker_present_qcm <wt> <issue> <advice> -> the ATTENDED human-decision route AND the
+# interactive per-gate context: render the QCM, present it, read the reviewer's reply from
+# THIS context's stdin, and inject it into the spoke via the shared injector. Empty reply
+# -> defer (escalate). The hub only ever gets the hub-notify ping; the resolution happens
+# here. UPGRADE: offer the spoke's discrete options as numbered one-key picks (parse them
+# out of the summary) once the extract carries structured option labels.
+_broker_present_qcm() {
+  local wt="$1" issue="$2" advice="$3" summary reply target
+  summary="$(extract_pending_question "$wt")"
+  [ -n "$summary" ] || summary="(the spoke's parked prompt could not be extracted; decide from the advice + the issue contract)"
+  build_qcm "$issue" "$summary" "$advice"
+  {
+    printf '\n=== Gate broker · #%s — resolve this gate ===\n\n' "$issue"
+    printf '## Summary\n%s\n\n' "$summary"
+    printf '## Reviewer advice\n%s\n\n' "$advice"
+    printf 'Your reply (injected into the spoke; an empty reply defers the gate): '
+  } >&2
+  IFS= read -r reply || reply=""
+  if [ -z "$reply" ]; then
+    _escalate_blocked "$wt" "$issue" "attended reviewer deferred the gate — $advice"
+    _broker_qcm_clear "$issue"
+    return 0
+  fi
+  target="$(_spoke_pane_target "$wt")"
+  if [ -n "$target" ] && inject_and_verify "$wt" "$target" "$reply"; then
+    log "  injected the reviewer's reply into #$issue"
+    _consume_gate_tag "$wt" "$issue"
+    afk_emit_decision "$wt" success
+    _broker_qcm_clear "$issue"
+  else
+    _escalate_blocked "$wt" "$issue" "attended QCM: could not inject the reviewer's reply into the spoke — needs a human"
+  fi
+  return 0
+}
+
 # decide_and_act <wt_path> <issue> -> reason about a parked spoke and act: inject the
 # answer, or escalate to blocked/<issue>. Fail-safe: an answerer that returns no decision
 # (or an answer we cannot inject) escalates rather than guessing.
