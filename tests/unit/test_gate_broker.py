@@ -696,3 +696,49 @@ def test_decide_permission_logs_auto_approve(spoke_repo: Path, tmp_path: Path) -
     assert log.exists(), "a safe auto-approve must be logged"
     fields = log.read_text().strip().split("\t")
     assert fields[2] == "permission" and fields[3] == "git-reset+git-add" and fields[4] == "APPROVE"
+
+
+def test_decide_permission_logs_escalate_verdict(spoke_repo: Path, tmp_path: Path) -> None:
+    # BOTH classifier verdicts are logged, not just APPROVE: a risky `git reset --hard`
+    # (which shares the signature git-reset+git-add with the safe `git reset -q`) is
+    # recorded as ESCALATE, so codify sees the conflict and never proposes it as unanimous.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    jsonl.write_text(json.dumps(_bash_tool_record("git reset --hard; git add tests/x.py")) + "\n")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        "esac\nexit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE_DIR": str(statedir),
+        "SPOKE_READY": str(ready_stub),
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    fields = (statedir / "decisions.log").read_text().strip().split("\t")
+    assert fields[3] == "git-reset+git-add" and fields[4] == "ESCALATE", fields
+    # The safe + destructive variants now conflict → codify proposes no rule for it.
+    (statedir / "decisions.log").write_text(
+        "1\t5\tpermission\tgit-reset+git-add\tAPPROVE\n"
+        "2\t7\tpermission\tgit-reset+git-add\tESCALATE\n"
+    )
+    codify = _call("codify_decisions 2", env={"AFK_STATE_DIR": str(statedir)})
+    assert "git-reset+git-add" not in codify.stdout, "a flag-dependent conflict must not codify"

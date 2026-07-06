@@ -551,9 +551,11 @@ read_decisions_digest() {
 }
 
 # --- automatable-decisions log + codification (issue #155, subtask D) ----------
-# Every auto-answer is recorded with a normalized SIGNATURE so recurrences of the same
-# gate shape collide; a periodic codification pass then proposes deterministic rules for
-# signatures that recur unanimously — graduating common gates out of the LLM in BOTH
+# Every automatable PERMISSION decision (the mechanical classify_permission verdict — the
+# codifiable class; a reasoner ANSWER is free text and a plan gate is a judgment call, so
+# neither is logged) is recorded with a normalized SIGNATURE so recurrences of the same
+# command shape collide; an on-demand codification pass then proposes deterministic rules
+# for signatures that recur unanimously — graduating common gates out of the LLM in BOTH
 # modes (the "scripted control plane, not LLM" payoff, generalizing #149's git-reset
 # self-stage rule into a learning pipeline). Proposal-only: a human reviews before any
 # rule is appended to the classifier table.
@@ -564,7 +566,11 @@ read_decisions_digest() {
 # `git-reset+git-add`. Parses tokens by hand (no word-splitting) so a glob never expands.
 _normalize_command_shape() {
   local cmd="$1" norm seg out="" verb rest sub part
-  norm="${cmd//&&/$'\n'}"; norm="${norm//||/$'\n'}"; norm="${norm//|/$'\n'}"; norm="${norm//;/$'\n'}"
+  # Split on the same operators classify_permission does (&& and || before the single &
+  # and | so they are not pre-split); the single & must split too, or `git status & rm`
+  # would sign as only `git-status`.
+  norm="${cmd//&&/$'\n'}"; norm="${norm//||/$'\n'}"
+  norm="${norm//&/$'\n'}"; norm="${norm//|/$'\n'}"; norm="${norm//;/$'\n'}"
   while IFS= read -r seg; do
     seg="${seg#"${seg%%[![:space:]]*}"}"; seg="${seg%"${seg##*[![:space:]]}"}"
     [ -n "$seg" ] || continue
@@ -604,19 +610,23 @@ log_decision() {
 # codify_decisions [min_count] -> propose a deterministic rule for every signature that
 # recurs at least <min_count> times (default 2) with a UNANIMOUS decision. Output is a
 # PROPOSAL a human reviews before it is codified into classify_permission — never an
-# auto-applied rule. A single-occurrence or a conflicting signature proposes nothing.
+# auto-applied rule. A single-occurrence or a conflicting signature proposes nothing. The
+# signature drops flags/args, so the proposal carries a "verify destructive flag variants"
+# caveat: the human must confirm the shape is safe across the flags classify_permission
+# distinguishes before codifying. Malformed lines (missing signature/decision) are skipped.
 codify_decisions() {
   local min="${1:-2}" log
   log="$(_afk_state_dir)/decisions.log"
   [ -f "$log" ] || return 0
   awk -F'\t' -v min="$min" '
-    { sig=$4; dec=$5; count[sig]++
+    $4 != "" && $5 != "" {
+      sig=$4; dec=$5; count[sig]++
       if (!(sig in decision)) decision[sig]=dec
       else if (decision[sig]!=dec) conflict[sig]=1 }
     END {
       for (s in count)
         if (count[s] >= min && !(s in conflict))
-          printf "RULE: %s -> %s (%d occurrences, unanimous)\n", s, decision[s], count[s]
+          printf "RULE: %s -> %s (%d occurrences, unanimous; verify destructive flag variants)\n", s, decision[s], count[s]
     }' "$log" 2>/dev/null | sort || true
 }
 
@@ -891,6 +901,12 @@ _decide_permission() {
   decision="$(classify_permission "$cmd")"
   kind="${decision%%$'\t'*}"
   reason="${decision#*$'\t'}"
+  # Record the classifier's VERDICT (both APPROVE and ESCALATE) for the codification pass,
+  # not just successful approvals — otherwise every logged line is APPROVE and codify's
+  # unanimity check is vacuous. Logging both makes a flag-dependent signature (`git reset
+  # -q` APPROVE vs `git reset --hard` ESCALATE, which share the signature git-reset+git-add)
+  # correctly read as a CONFLICT, so codify never proposes it as a safe unanimous rule (#155 D).
+  log_decision "$issue" permission "$cmd" "$kind"
   if [ "$kind" = "APPROVE" ]; then
     log "→ auto-approving safe permission for #$issue: $cmd"
     # Stamp the delivery attempt FIRST: the approve→resume window must not read as idle.
@@ -898,7 +914,6 @@ _decide_permission() {
     if approve_permission "$wt"; then
       log "  approved permission for #$issue"
       afk_emit_decision "$wt" success
-      log_decision "$issue" permission "$cmd" APPROVE   # record for the codification pass (#155 D)
       return 0
     fi
     _escalate_blocked "$wt" "$issue" "could not deliver permission approval to the spoke — needs a human"

@@ -38,8 +38,9 @@ interest of finishing the issue well, and within the conventions the repo alread
   decision against the code as it *actually* is — confirm a `git reset` stages only the
   spoke's own files, that a posted plan matches real state, and so on. You must **not**
   edit, stage, commit, or push: the tree is read-only and any write voids your answer.
-- **A decisions-digest** — a compact record of this spoke's prior gate outcomes, for
-  cross-gate consistency (not the old transcript, which caused seed-replay in #124).
+- **A decisions-digest** — a compact record of this spoke's prior automatable
+  (permission-classifier) decisions, for cross-gate consistency (not the old transcript,
+  which caused seed-replay in #124).
 
 ## How to decide
 
