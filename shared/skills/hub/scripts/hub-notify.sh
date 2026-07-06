@@ -166,4 +166,21 @@ else
   : >"$seen_file" 2>/dev/null || true
 fi
 
+# /afk drain-complete (issue #150): hub-afk writes <git-common-dir>/.afk-drain-complete
+# with the landed count when a drain finishes (see hub-afk.sh _afk_emit_drain_complete).
+# Fire ONE "/afk drain complete — <k> landed" ping and consume the file, so a completed
+# drain notifies exactly once and the steady post-drain state never repeats it. Removed
+# BEFORE the notify so a consume happens even if the notifier fails (fire-at-most-once).
+# Independent of the marker seen-set and of afk-mode: the drain already cleared .afk-state
+# before this runs, and a stale-armed window must not suppress a finished drain's summary.
+# AFK_DRAIN_COMPLETE overrides the path (shared with hub-afk.sh); a non-numeric/empty
+# count degrades to 0 rather than leaking a partial read into the message.
+drain_complete_file="${AFK_DRAIN_COMPLETE:-$common_dir/.afk-drain-complete}"
+if [ -f "$drain_complete_file" ]; then
+  landed="$(head -n1 "$drain_complete_file" 2>/dev/null | tr -d '[:space:]')"
+  case "$landed" in '' | *[!0-9]*) landed=0 ;; esac
+  rm -f "$drain_complete_file" 2>/dev/null || true
+  notify "/afk drain complete — $landed landed"
+fi
+
 exit 0
