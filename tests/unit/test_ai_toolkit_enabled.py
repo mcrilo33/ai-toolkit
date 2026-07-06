@@ -495,6 +495,34 @@ def test_enabled_accessor_false_when_false(tmp_path: Path) -> None:
     assert cfg.enabled(config) is False
 
 
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        # false-y token set (case/whitespace-insensitive), string form (custom parser)
+        ("false", False),
+        ("FALSE", False),
+        (" off ", False),
+        ("0", False),
+        ("no", False),
+        ("disabled", False),
+        # YAML-bool form (real PyYAML / coercing parser)
+        (False, False),
+        (True, True),
+        # everything else defaults to ENABLED
+        ("true", True),
+        ("on", True),
+        ("1", True),
+        ("maybe", True),
+        ("", True),  # blank value
+        (None, True),  # key absent
+    ],
+)
+def test_enabled_accessor_truthiness(value: object, expected: bool) -> None:
+    """Only an explicit false-y value disables; anything else (incl. blank/absent/
+    unexpected) defaults to ENABLED, for both string and YAML-bool inputs."""
+    assert cfg.enabled({"enabled": value}) is expected
+
+
 def test_enabled_cli_emits_true_by_default(tmp_path: Path) -> None:
     path = _write_cfg(tmp_path, "base_branch:\n")
     assert cfg._cli(["ai_toolkit_config.py", "enabled", str(path)]) == "true"
@@ -569,3 +597,25 @@ def test_sync_registers_enabled_in_workflow_scripts(sync_target: Path, tmp_path:
     hub-status) can source it as a sibling."""
     _sync(sync_target, "enabled: true\n", tmp_path)
     assert (sync_target / ".ai-toolkit" / "scripts" / "enabled.sh").exists()
+
+
+def test_sync_defaults_on_when_config_unreadable(sync_target: Path, tmp_path: Path) -> None:
+    """An unreadable/missing config must degrade to ENABLED (clear the key) — the
+    safe direction, never leaving a stale disabled state."""
+    _git(sync_target, "config", "--local", "ai-toolkit.enabled", "false")
+    missing = tmp_path / "does-not-exist.yml"
+    subprocess.run(
+        [str(SYNC), str(sync_target), "claude"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**_GIT_ENV, "AI_TOOLKIT_CONFIG": str(missing)},
+    )
+    result = subprocess.run(
+        ["git", "config", "--local", "--get", "ai-toolkit.enabled"],
+        cwd=str(sync_target),
+        capture_output=True,
+        text=True,
+        env=_GIT_ENV,
+    )
+    assert result.returncode != 0  # unset → resolver defaults to ENABLED
