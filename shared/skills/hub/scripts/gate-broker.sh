@@ -446,6 +446,88 @@ _still_parked_same() {
 
 # --- the answerer (the one reasoning step) ------------------------------------
 
+# --- read-only worktree reasoner (issue #155, subtask B) ----------------------
+# The gate reasoner gets READ-ONLY access to the spoke's LIVE worktree (cwd) so it can
+# verify a decision against real state — uncommitted/staged included — before auto-
+# answering: evidence, not a pattern-guess. Two enforcement layers:
+#   1. PREVENTION — run with a read-only tool allowlist (the code-review/Explore
+#      posture: Read/Grep/Glob + a narrow read-only git helper; never Edit/Write).
+#   2. DETECTION — a content fingerprint of the worktree taken before and after the
+#      reason step; ANY change is a read-only BREACH, so the answer is voided and the
+#      gate routes to a human. Detection is the HARD guarantee: it does not depend on
+#      the LLM honoring the allowlist.
+
+# reasoner_allowed_tools -> the read-only allowlist passed to the headless reasoner
+# (comma-joined for `claude --allowedTools`). Read/Grep/Glob plus narrow read-only git
+# verbs via scoped Bash patterns — enough to inspect the tree and run status/diff to
+# verify a plan, nothing that can mutate it. AFK_REASONER_TOOLS overrides.
+# UPGRADE: confirm the exact `claude --allowedTools` list/pattern syntax against the
+# installed CLI version if the reasoner ever reports a read tool it should have.
+reasoner_allowed_tools() {
+  printf '%s\n' "${AFK_REASONER_TOOLS:-Read,Grep,Glob,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git rev-parse:*)}"
+}
+
+# assert_readonly_tools <comma-list> -> rc 0 when every tool is read-only, rc 1 when any
+# is a mutating tool (Edit/Write/MultiEdit/NotebookEdit) or a bare unrestricted Bash. A
+# scoped Bash(...) read verb is allowed; anything unrecognised is denied (default-deny).
+# Parses by hand (no word-splitting) so a glob in a Bash(...) pattern never expands.
+assert_readonly_tools() {
+  local rest="$1" tok
+  while [ -n "$rest" ]; do
+    tok="${rest%%,*}"
+    if [ "$tok" = "$rest" ]; then rest=""; else rest="${rest#*,}"; fi
+    tok="${tok#"${tok%%[![:space:]]*}"}"; tok="${tok%"${tok##*[![:space:]]}"}"   # trim
+    [ -n "$tok" ] || continue
+    case "$tok" in
+      Read | Grep | Glob | LS | WebFetch | WebSearch | TodoRead) ;;
+      'Bash('*')') ;;                                  # a scoped Bash read verb
+      Edit | Write | MultiEdit | NotebookEdit | Bash) return 1 ;;   # mutating / unrestricted
+      *) return 1 ;;                                    # unknown -> deny
+    esac
+  done
+  return 0
+}
+
+# _broker_worktree_fingerprint <wt> -> a content hash of the LIVE worktree: each
+# tracked-or-untracked (non-ignored) file's path + its CURRENT working-tree content. A
+# new file, a deletion, or a content edit all change it. Empty (stable) for a non-git or
+# missing path, so a non-worktree reasoner never trips a false breach.
+_broker_worktree_fingerprint() {
+  local wt="$1"
+  [ -d "$wt" ] || return 0
+  (
+    cd "$wt" 2>/dev/null || exit 0
+    git rev-parse --git-dir >/dev/null 2>&1 || exit 0
+    git ls-files -z --cached --others --exclude-standard 2>/dev/null |
+      while IFS= read -r -d '' f; do
+        printf '%s\0' "$f"
+        if [ -f "$f" ]; then git hash-object "$f" 2>/dev/null || printf 'ERR'; else printf 'GONE'; fi
+        printf '\0'
+      done |
+      shasum -a 256 2>/dev/null | awk '{print $1}'
+  )
+}
+
+# _broker_worktree_unchanged <wt> <before_fingerprint> -> rc 0 when the worktree is
+# byte-for-byte what it was at <before_fingerprint>, rc 1 when the reasoner mutated it.
+_broker_worktree_unchanged() {
+  local wt="$1" before="$2" after
+  after="$(_broker_worktree_fingerprint "$wt")"
+  [ "$before" = "$after" ]
+}
+
+# read_decisions_digest <issue> -> a compact digest of THIS spoke's prior gate outcomes,
+# seeded into the reasoner for cross-gate consistency (NOT the old transcript, which
+# replayed the seed in #124). Reads the automatable-decisions log (subtask D's writer),
+# filtered to this issue; empty when the log is absent. Shared line format (with #155
+# subtask D): <ts>\t<issue>\t<gate_type>\t<signature>\t<decision>.
+read_decisions_digest() {
+  local issue="$1" log
+  log="$(_afk_state_dir)/decisions.log"
+  [ -f "$log" ] || return 0
+  awk -F'\t' -v issue="$issue" '$2 == issue { printf "- %s: %s (%s)\n", $3, $5, $4 }' "$log" 2>/dev/null || true
+}
+
 # _rule_file -> the afk-answering rule path, across both layouts; empty if unfound.
 _rule_file() {
   local cand
@@ -459,20 +541,36 @@ _rule_file() {
   return 1
 }
 
-# build_answerer_prompt <issue> <question> -> the full prompt for the answerer: the
-# governing rule, the issue contract, and the parked prompt. Self-contained so the
-# headless answerer needs no project context loaded.
+# build_answerer_prompt <issue> <question> [wt] -> the full prompt for the reasoner: the
+# governing rule, the issue contract, the read-only-worktree posture + evidence contract,
+# a decisions-digest of this spoke's prior gate outcomes, and the parked prompt.
+# Self-contained so the headless reasoner needs no project context loaded.
 build_answerer_prompt() {
-  local issue="$1" question="$2" rule body
+  local issue="$1" question="$2" wt="${3:-}" rule body digest at=""
   rule="$(_rule_file)" && rule="$(cat "$rule")" \
     || rule="Answer in the interest of the issue contract and repo conventions; prefer the spoke's own recommended option; escalate (output 'ESCALATE: <reason>') only when the decision is irreversible, outward-facing, or scope-changing. Otherwise output 'ANSWER: <reply>'."
   body="$(gh issue view "$issue" --json title,body -q '.title + "\n\n" + .body' 2>/dev/null || echo "(issue #$issue body unavailable)")"
+  digest="$(read_decisions_digest "$issue")"
+  [ -n "$wt" ] && at=" at $wt"
   cat <<EOF
 $rule
 
 ## Issue contract (#$issue)
 
 $body
+
+## Read-only worktree access
+
+You have READ-ONLY access to the spoke's worktree$at (your cwd). Use your read/search
+tools to verify the decision against the code as it ACTUALLY is — confirm a command
+touches only the spoke's own files, that a posted plan matches real state, and so on.
+You must NOT edit, stage, commit, or push anything: the tree is read-only and any write
+voids your answer. When you auto-answer, cite the worktree EVIDENCE you checked on an
+'EVIDENCE:' line before your final decision line.
+
+## Prior gate decisions for this spoke (decisions-digest)
+
+${digest:-(none recorded yet)}
 
 ## The spoke's parked prompt
 
@@ -482,17 +580,26 @@ Decide per the policy above. End your reply with exactly one line: 'ANSWER: <rep
 EOF
 }
 
-# run_answerer <issue> <question> -> the answerer's raw output (stdout AND stderr), and
-# its exit status as the function's return code. The answerer is a headless `claude -p`
-# (overridable via AFK_ANSWERER_CMD for tests), run with a thinking budget; the prompt is
-# passed on stdin so a long contract never hits argv limits. stderr is folded into the
-# captured stream (NOT discarded) because the CLI prints credential failures there and
-# exits nonzero — the auth-failure detector needs both the message and the exit code.
-# parse_decision is line-anchored, so interleaved stderr noise never pollutes a decision.
+# run_answerer <issue> <question> [wt] -> the reasoner's raw output (stdout AND stderr),
+# and its exit status as the function's return code. The reasoner is a headless `claude
+# -p` (overridable via AFK_ANSWERER_CMD for tests), run with a thinking budget and a
+# READ-ONLY tool allowlist; the prompt is passed on stdin so a long contract never hits
+# argv limits. When <wt> is a directory it becomes the reasoner's cwd, so its read-only
+# tools verify against the spoke's live state (the mutation guard in broker_service_gate
+# is what makes that safe). stderr is folded into the captured stream (NOT discarded)
+# because the CLI prints credential failures there and exits nonzero — the auth-failure
+# detector needs both the message and the exit code. parse_decision is line-anchored, so
+# interleaved stderr noise never pollutes a decision.
 run_answerer() {
-  local prompt; prompt="$(build_answerer_prompt "$1" "$2")"
-  local cmd="${AFK_ANSWERER_CMD:-claude -p --model claude-fable-5}"
-  CLAUDE_EFFORT="$AFK_ANSWERER_EFFORT" bash -c "$cmd" <<<"$prompt" 2>&1
+  local issue="$1" question="$2" wt="${3:-}"
+  local prompt; prompt="$(build_answerer_prompt "$issue" "$question" "$wt")"
+  local tools; tools="$(reasoner_allowed_tools)"
+  local cmd="${AFK_ANSWERER_CMD:-claude -p --model claude-fable-5 --allowedTools '$tools'}"
+  if [ -n "$wt" ] && [ -d "$wt" ]; then
+    ( cd "$wt" && CLAUDE_EFFORT="$AFK_ANSWERER_EFFORT" bash -c "$cmd" <<<"$prompt" 2>&1 )
+  else
+    CLAUDE_EFFORT="$AFK_ANSWERER_EFFORT" bash -c "$cmd" <<<"$prompt" 2>&1
+  fi
 }
 
 # parse_decision <raw-answerer-output> -> "ANSWER\t<text>" or "ESCALATE\t<reason>" on
@@ -849,7 +956,19 @@ ${orig_question:-(the plan prose could not be extracted from the transcript — 
     return 0
   fi
   log "→ answering #$issue (parked on input)"
-  raw="$(run_answerer "$issue" "$question")"; rc=$?
+  # Read-only guard (subtask B): fingerprint the LIVE worktree around the reason step.
+  # The reasoner gets read-only access (cwd=wt) to verify against real state; if the tree
+  # changed across the step it MUTATED a read-only worktree, so its answer is untrustworthy
+  # — void it and route to a human (escalate unattended / QCM attended), regardless of
+  # content. Detection is the hard guarantee independent of the LLM's tool-allowlist.
+  local fp_before; fp_before="$(_broker_worktree_fingerprint "$wt")"
+  raw="$(run_answerer "$issue" "$question" "$wt")"; rc=$?
+  if ! _broker_worktree_unchanged "$wt" "$fp_before"; then
+    log "  reasoner mutated the read-only worktree of #$issue — voiding its answer"
+    _broker_on_human_decision "$mode" "$wt" "$issue" \
+      "the gate reasoner mutated the read-only worktree — its answer is voided; needs a human"
+    return 0
+  fi
   # The answerer is the supervisor's own `claude`; if its credentials are dead, every
   # other `claude` (the spokes, the next tick's answerer) is dead too. We treat it as an
   # auth failure only when the answerer EXITED NONZERO and its output carries an auth
