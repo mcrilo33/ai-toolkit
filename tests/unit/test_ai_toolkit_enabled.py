@@ -228,17 +228,15 @@ INSTALL = _REPO_ROOT / "scripts" / "install-git-hooks.sh"
 SHARED_HOOKS = _REPO_ROOT / "shared" / "hooks"
 UTILS = SHARED_HOOKS / "lib" / "utils.sh"
 BLOCK_NO_VERIFY = SHARED_HOOKS / "block-no-verify.sh"
+PARENT_SPAN = SHARED_HOOKS / "parent-span-export.sh"
 
-# Cage scripts the native hooks invoke — replaced by always-blocking stubs so a
-# hook's outcome is driven by the on/off guard, not the scripts' real logic.
-_CAGE_STUBS = (
-    "commit-quality",
-    "commit-gauntlet",
-    "test-select",
-    "anti-gutting-scan",
-    "red-proof-warn",
-    "reviewer-sep-warn",
-)
+# Cage scripts the native hooks invoke, replaced by stubs so a hook's outcome is
+# driven by the on/off guard, not the scripts' real logic. The split mirrors the
+# wrappers: the blocking gates exit 1 (abort), the advisory ones exit 0 (their
+# real behavior) — so an ENABLED pre-push is genuinely gated by test-select, not
+# by an advisory stub that happens to run first.
+_BLOCKING_STUBS = ("commit-quality", "commit-gauntlet", "test-select")
+_ADVISORY_STUBS = ("red-proof-warn", "reviewer-sep-warn", "anti-gutting-scan")
 
 
 @pytest.fixture()
@@ -264,11 +262,10 @@ def installed_repo(tmp_path: Path) -> Path:
     _git(r, "push", "-q", "-u", "origin", "main")
     subprocess.run([str(INSTALL), str(r)], check=True, capture_output=True, text=True, env=_env(r))
     scripts = _common_dir(r) / "hooks" / "ai-toolkit-scripts"
-    for name in _CAGE_STUBS:
+    for name, code in [(n, 1) for n in _BLOCKING_STUBS] + [(n, 0) for n in _ADVISORY_STUBS]:
         stub = scripts / f"{name}.sh"
         stub.write_text(
-            "#!/usr/bin/env bash\ncat >/dev/null 2>&1 || true\n"
-            f"echo BLOCKED-BY-{name} >&2\nexit 1\n"
+            f"#!/usr/bin/env bash\ncat >/dev/null 2>&1 || true\necho RAN-{name} >&2\nexit {code}\n"
         )
         stub.chmod(0o755)
     return r
@@ -324,9 +321,19 @@ def test_native_commit_msg_passthrough_when_disabled(installed_repo: Path) -> No
 
 
 def test_native_pre_push_enforces_when_enabled(installed_repo: Path) -> None:
-    """Baseline: with the toolkit ON, the pre-push test gate stub blocks the push."""
+    """Baseline: with the toolkit ON, the advisory stubs pass (exit 0) and the
+    blocking test-select stub aborts the push — the gate is genuinely reached."""
     _make_pushable_commit(installed_repo)
     assert _push(installed_repo).returncode != 0
+
+
+def test_native_hook_degrades_to_enabled_when_switch_absent(installed_repo: Path) -> None:
+    """Native wrapper: a stale install missing enabled.sh degrades to ENABLED —
+    the [ -f ] guard skips, so the cage gate still fires (never crashes) even
+    with the off marker present."""
+    (_common_dir(installed_repo) / "hooks" / "ai-toolkit-scripts" / "lib" / "enabled.sh").unlink()
+    _disable(installed_repo)  # marker present, but the switch file is gone
+    assert _commit_attempt(installed_repo).returncode != 0
 
 
 def test_native_pre_push_passthrough_when_disabled(installed_repo: Path) -> None:
@@ -416,3 +423,35 @@ def test_block_no_verify_passthrough_when_disabled(repo: Path) -> None:
     """With the toolkit OFF, block-no-verify (a utils.sh-sourcing guard) no-ops."""
     _disable(repo)
     assert _run_block_no_verify(repo).returncode == 0
+
+
+# parent-span-export (telemetry hook that does NOT source utils.sh)
+
+
+def _run_parent_span(repo: Path, tool_id: str) -> Path:
+    payload = f'{{"tool_use_id":"{tool_id}"}}'
+    subprocess.run(
+        [str(PARENT_SPAN)],
+        input=payload,
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env={**_env(repo), "AI_TOOLKIT_TELEMETRY": "1"},
+    )
+    return repo / ".ai-toolkit" / "parent-span"
+
+
+def test_parent_span_writes_when_enabled(repo: Path) -> None:
+    """Baseline: with telemetry opted in and the toolkit ON, the parent-span file
+    is written."""
+    marker_file = _run_parent_span(repo, "toolu_enabled")
+    assert marker_file.exists()
+    assert marker_file.read_text().strip() == "toolu_enabled"
+
+
+def test_parent_span_passthrough_when_disabled(repo: Path) -> None:
+    """OFF implies telemetry-off even for parent-span-export (which does not
+    source utils.sh) — with the marker present it writes nothing."""
+    _disable(repo)
+    marker_file = _run_parent_span(repo, "toolu_disabled")
+    assert not marker_file.exists()
