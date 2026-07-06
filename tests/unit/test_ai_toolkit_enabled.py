@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,10 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 ENABLED_SH = _REPO_ROOT / "shared" / "hooks" / "lib" / "enabled.sh"
 AI_TOOLKIT_CMD = _REPO_ROOT / "scripts" / "ai-toolkit"
+SYNC = _REPO_ROOT / "scripts" / "sync-to-repo.sh"
+
+sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+import ai_toolkit_config as cfg  # noqa: E402
 
 _GIT_ENV = {
     **os.environ,
@@ -455,3 +460,112 @@ def test_parent_span_passthrough_when_disabled(repo: Path) -> None:
     _disable(repo)
     marker_file = _run_parent_span(repo, "toolu_disabled")
     assert not marker_file.exists()
+
+
+# ── Subtask C: config default (settings/ai-toolkit.yml) + sync materialization ──
+#
+# `enabled: true` (or absent) keeps today's full enforcement; `enabled: false` +
+# a sync sets the disabled state as the DEFAULT. The config owns the value the way
+# base_branch does: sync writes `git config ai-toolkit.enabled` (the durable
+# default tier) and never touches the <git-common-dir> marker — so a manual
+# `ai-toolkit off` (the sync-safe marker) survives a re-sync.
+
+
+def _write_cfg(tmp_path: Path, text: str) -> Path:
+    p = tmp_path / "ai-toolkit.yml"
+    p.write_text(text)
+    return p
+
+
+# config accessor + CLI
+
+
+def test_enabled_accessor_defaults_true_when_absent(tmp_path: Path) -> None:
+    config = cfg.load_config(_write_cfg(tmp_path, "base_branch:\n").as_posix())
+    assert cfg.enabled(config) is True
+
+
+def test_enabled_accessor_true_when_true(tmp_path: Path) -> None:
+    config = cfg.load_config(_write_cfg(tmp_path, "enabled: true\n").as_posix())
+    assert cfg.enabled(config) is True
+
+
+def test_enabled_accessor_false_when_false(tmp_path: Path) -> None:
+    config = cfg.load_config(_write_cfg(tmp_path, "enabled: false\n").as_posix())
+    assert cfg.enabled(config) is False
+
+
+def test_enabled_cli_emits_true_by_default(tmp_path: Path) -> None:
+    path = _write_cfg(tmp_path, "base_branch:\n")
+    assert cfg._cli(["ai_toolkit_config.py", "enabled", str(path)]) == "true"
+
+
+def test_enabled_cli_emits_false_when_disabled(tmp_path: Path) -> None:
+    path = _write_cfg(tmp_path, "enabled: false\n")
+    assert cfg._cli(["ai_toolkit_config.py", "enabled", str(path)]) == "false"
+
+
+# sync materialization
+
+
+@pytest.fixture()
+def sync_target(tmp_path: Path) -> Path:
+    """A minimal git repo to receive a sync."""
+    t = tmp_path / "target"
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(t)], check=True, capture_output=True, env=_GIT_ENV
+    )
+    for k, v in (("user.email", "t@t.t"), ("user.name", "t")):
+        _git(t, "config", k, v)
+    (t / "README.md").write_text("seed\n")
+    _git(t, "add", "README.md")
+    _git(t, "commit", "-qm", "chore: seed")
+    return t
+
+
+def _sync(target: Path, cfg_text: str, tmp_path: Path) -> None:
+    cfg_path = _write_cfg(tmp_path, cfg_text)
+    subprocess.run(
+        [str(SYNC), str(target), "claude"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**_GIT_ENV, "AI_TOOLKIT_CONFIG": str(cfg_path)},
+    )
+
+
+def test_sync_sets_disabled_when_config_false(sync_target: Path, tmp_path: Path) -> None:
+    """enabled: false → sync writes git config ai-toolkit.enabled=false (default off)."""
+    _sync(sync_target, "enabled: false\n", tmp_path)
+    assert _git(sync_target, "config", "--local", "--get", "ai-toolkit.enabled").strip() == "false"
+
+
+def test_sync_clears_when_config_true(sync_target: Path, tmp_path: Path) -> None:
+    """enabled: true → sync clears the key (unset ⇒ resolver default ENABLED),
+    even over a pre-existing false — the config owns the value."""
+    _git(sync_target, "config", "--local", "ai-toolkit.enabled", "false")
+    _sync(sync_target, "enabled: true\n", tmp_path)
+    result = subprocess.run(
+        ["git", "config", "--local", "--get", "ai-toolkit.enabled"],
+        cwd=str(sync_target),
+        capture_output=True,
+        text=True,
+        env=_GIT_ENV,
+    )
+    assert result.returncode != 0  # unset
+
+
+def test_sync_does_not_touch_marker(sync_target: Path, tmp_path: Path) -> None:
+    """A manual `ai-toolkit off` marker survives a re-sync: sync owns git config,
+    NOT the marker (the #154 correction — a manual off is sync-safe)."""
+    marker = _common_dir(sync_target) / "ai-toolkit-off"
+    marker.write_text("")
+    _sync(sync_target, "enabled: true\n", tmp_path)
+    assert marker.exists()
+
+
+def test_sync_registers_enabled_in_workflow_scripts(sync_target: Path, tmp_path: Path) -> None:
+    """enabled.sh is co-located in .ai-toolkit/scripts/ so the hub scripts (e.g.
+    hub-status) can source it as a sibling."""
+    _sync(sync_target, "enabled: true\n", tmp_path)
+    assert (sync_target / ".ai-toolkit" / "scripts" / "enabled.sh").exists()
