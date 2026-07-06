@@ -692,6 +692,52 @@ class TestEnclosingTurnFallback:
         assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "t1")
 
 
+class TestSessionScopedHookNoDangle:
+    """#153: with the bridge's hook->decision join scoped to session.id, every
+    hook_execution_complete a spoke emits now carries a SAME-session tool_use_id that
+    resolves to one of the spoke's own tool spans. So the audit hook nests under its tool
+    rather than dangling on claude_code.interaction for lack of a matching tool -- the
+    contamination symptom the fix removes upstream. This locks that assembled-tree invariant.
+    """
+
+    def test_same_session_hook_nests_under_its_tool_not_the_interaction(self) -> None:
+        # Repro shape (spoke #149): a PreToolUse hook_execution_complete instant referencing
+        # its Edit call. Pre-fix the bridge bound a FOREIGN session's tool_use_id (matching no
+        # own tool), so this re-homed to the enclosing turn (dangled). Post-fix it carries the
+        # own tu-own and must nest under the Edit tool span.
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "p1"}},
+        )
+        tool = _obs(
+            "t1",
+            "Edit",
+            parent="i1",
+            metadata={"attributes": {"tool_name": "Edit", "tool_use_id": "tu-own"}},
+        )
+        hook = _obs(
+            "h1",
+            "hook_execution_complete:PreToolUse",
+            type_="EVENT",
+            parent=None,
+            metadata={
+                "hook_event": "PreToolUse",
+                "hook_name": "PreToolUse:Edit",
+                "tool_use_id": "tu-own",
+                "prompt.id": "p1",
+            },
+        )
+        traces = [("trace-int", [interaction, tool]), ("trace-audit", [hook])]
+
+        batch = build_batch(traces, SPOKE)
+
+        copy = _by_orig(batch, "trace-audit", "h1")
+        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "t1")
+        assert copy["body"]["parentObservationId"] != _copy_id("trace-int", "i1")
+
+
 class TestToolSubspanFolding:
     """#100 part 2: the three 1:1 native sub-spans fold into their tool's metadata instead of
     nesting as child nodes — claude_code.tool.execution -> execution_ms/success/error,
