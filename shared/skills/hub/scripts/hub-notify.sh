@@ -103,8 +103,10 @@ message_for() {
       [ -n "$gate" ] || gate="gate"
       # When the gate-broker attended adapter (#155) has written a QCM surface for this
       # gate, point the human at it; otherwise the plain approve ping. The surface path
-      # mirrors gate-broker.sh's _broker_qcm_dir; GATE_BROKER_QCM_DIR overrides both.
-      qcm="${GATE_BROKER_QCM_DIR:-$common_dir/ai-toolkit-afk/gate-broker}/qcm-$issue.md"
+      # mirrors gate-broker.sh's _broker_qcm_dir exactly — GATE_BROKER_QCM_DIR wins, then
+      # AFK_STATE_DIR (the state-dir override _afk_state_dir honors), then the git-common
+      # -dir default — so a surface written by the broker is always found here.
+      qcm="${GATE_BROKER_QCM_DIR:-${AFK_STATE_DIR:-$common_dir/ai-toolkit-afk}/gate-broker}/qcm-$issue.md"
       if [ -f "$qcm" ]; then
         printf '#%s parked at %s gate — resolve via the gate-broker QCM' "$issue" "$gate"
       else

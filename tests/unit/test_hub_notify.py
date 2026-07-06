@@ -138,6 +138,21 @@ def test_gate_marker_points_to_qcm_surface_when_present(hub: Path, tmp_path: Pat
     assert "qcm" in messages[0].lower(), f"the ping must point at the QCM surface: {messages[0]}"
 
 
+def test_gate_marker_finds_qcm_surface_via_afk_state_dir(hub: Path, tmp_path: Path) -> None:
+    # hub-notify must find a surface written by the broker under AFK_STATE_DIR (the same
+    # override _afk_state_dir/_broker_qcm_dir honor) — the two paths must coincide, or the
+    # ping silently degrades. This locks the default-path contract via the shared knob.
+    _git(hub, "tag", "-a", "-m", "plan", "gate/1", "feature/1-work")
+    statedir = tmp_path / "sd"
+    (statedir / "gate-broker").mkdir(parents=True)
+    (statedir / "gate-broker" / "qcm-1.md").write_text("# Gate 1 QCM\n")
+
+    _proc, messages = _run(hub, tmp_path, env_extra={"AFK_STATE_DIR": str(statedir)})
+
+    assert len(messages) == 1
+    assert "qcm" in messages[0].lower(), messages[0]
+
+
 def test_gate_marker_without_qcm_surface_says_approve(hub: Path, tmp_path: Path) -> None:
     # No QCM surface yet ⇒ the plain "reply to approve" ping (attended default / PLAN park).
     _git(hub, "tag", "-a", "-m", "plan", "gate/1", "feature/1-work")

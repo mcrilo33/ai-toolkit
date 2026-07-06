@@ -476,6 +476,41 @@ def test_present_qcm_injects_reviewer_reply(spoke_repo: Path, tmp_path: Path) ->
     assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), "must not escalate"
 
 
+def test_present_qcm_injects_reply_without_trailing_newline(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A reply typed then Ctrl-D (no trailing newline) is a genuine approval, not a defer:
+    # `read` returns non-zero with $reply populated, and it must still be injected.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    jsonl.write_text(json.dumps(_ask_record("Which store?", [("Redis", "fast")])) + "\n")
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    tmux_log = _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "SPOKE_READY": str(ready_stub),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+    }
+
+    result = _call(f"_broker_present_qcm '{spoke_repo}' 5 'advice'", env=env, stdin="Go with Redis")
+
+    assert result.returncode == 0, result.stderr
+    assert "Go with Redis" in tmux_log.read_text(), "a newline-less reply must still inject"
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
+
+
 def test_present_qcm_empty_reply_defers_to_block(spoke_repo: Path, tmp_path: Path) -> None:
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke_repo)

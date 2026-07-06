@@ -1016,7 +1016,11 @@ _broker_present_qcm() {
     printf '## Reviewer advice\n%s\n\n' "$advice"
     printf 'Your reply (injected into the spoke; an empty reply defers the gate): '
   } >&2
-  IFS= read -r reply || reply=""
+  # `|| true`, NOT `|| reply=""`: an EOF that arrives right after a newline-less reply
+  # returns non-zero with $reply already populated — clobbering it would turn a genuine
+  # approval (typed then Ctrl-D) into a spurious block. The [ -z ] below still defers on a
+  # truly empty/EOF reply.
+  IFS= read -r reply || true
   if [ -z "$reply" ]; then
     _escalate_blocked "$wt" "$issue" "attended reviewer deferred the gate — $advice"
     _broker_qcm_clear "$issue"
@@ -1030,6 +1034,7 @@ _broker_present_qcm() {
     _broker_qcm_clear "$issue"
   else
     _escalate_blocked "$wt" "$issue" "attended QCM: could not inject the reviewer's reply into the spoke — needs a human"
+    _broker_qcm_clear "$issue"
   fi
   return 0
 }
