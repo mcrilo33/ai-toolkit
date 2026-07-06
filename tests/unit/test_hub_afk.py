@@ -4341,6 +4341,12 @@ def test_drain_survives_source_rewrite_mid_run(spoke_repo: Path, tmp_path: Path)
         "BATCH_PLAN": str(bp),
         "AFK_WATCHDOG_SPAWN_CMD": ":",
         "AFK_WT_LIB": str(REPO_ROOT / "scripts" / "worktree-lib.sh"),
+        # Point the isolated copy at the real gate-broker.sh, mirroring AFK_WT_LIB:
+        # the copy lives alone in orig_dir, so its shared core (sourced once at
+        # startup) must be located explicitly (#155 split it out of hub-afk.sh).
+        "AFK_GATE_BROKER": str(
+            REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "gate-broker.sh"
+        ),
         "CLAUDE_PROJECTS_DIR": "/nonexistent",
     }
 
