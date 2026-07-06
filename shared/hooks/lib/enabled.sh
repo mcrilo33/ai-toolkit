@@ -89,7 +89,7 @@ _ai_toolkit_cli() {
   local root="${1:-$PWD}"
   case "$cmd" in
     check)  ai_toolkit_enabled "$root" ;;
-    on)     ai_toolkit_on "$root" && echo "AI-TOOLKIT: ON" ;;
+    on)     ai_toolkit_on "$root" && ai_toolkit_status "$root" ;;
     off)    ai_toolkit_off "$root" && ai_toolkit_status "$root" ;;
     status) ai_toolkit_status "$root" ;;
     -h|--help|help)

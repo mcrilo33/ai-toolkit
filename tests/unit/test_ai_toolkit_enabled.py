@@ -153,6 +153,28 @@ def test_on_removes_marker_and_enables(repo: Path) -> None:
     assert _check(repo) == 0
 
 
+def test_on_with_config_false_reports_off(repo: Path) -> None:
+    """``on`` removes the marker but must report the TRUE effective state: when
+    git config still disables (a first-class precedence tier), it stays OFF —
+    never a false "ON" that misleads an operator into thinking gates are back.
+    """
+    _git(repo, "config", "--local", "ai-toolkit.enabled", "false")
+    result = _cli(repo, "on")
+    assert result.returncode == 0, result.stderr
+    assert "OFF" in result.stdout
+    assert _check(repo) != 0
+
+
+def test_resolver_from_subdirectory(repo: Path) -> None:
+    """The resolver composes the relative git-common-dir from a nested subdir
+    (the multi-``..`` path branch), so a marker still disables from deep in the tree.
+    """
+    sub = repo / "a" / "b"
+    sub.mkdir(parents=True)
+    (_common_dir(repo) / "ai-toolkit-off").write_text("")
+    assert _check(repo, cwd=sub) != 0
+
+
 def test_status_reports_off(repo: Path) -> None:
     """``status`` reports the effective OFF state when disabled."""
     _cli(repo, "off")
