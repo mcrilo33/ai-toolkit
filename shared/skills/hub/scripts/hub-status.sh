@@ -47,7 +47,7 @@ bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 if command -v ai_toolkit_enabled >/dev/null 2>&1 && ! ai_toolkit_enabled "$main_root"; then
   printf '\033[1;31m⚠ AI-TOOLKIT OFF — gates/guards/telemetry bypassed\033[0m\n'
   printf '\033[1;31m  Commits/pushes on every worktree of this clone are UNGATED. Re-enable: ai-toolkit on\033[0m\n'
-  echo ""
+  echo
 fi
 
 # todos_for_path <worktree-path>

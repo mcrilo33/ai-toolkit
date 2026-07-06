@@ -960,6 +960,8 @@ def test_off_banner_shown_when_disabled(hub_with_spokes: Path, tmp_path: Path) -
     out = _run_hub_status(hub_with_spokes, tmp_path)
 
     assert "AI-TOOLKIT OFF" in out
+    # It must LEAD — before the worktree survey (mirrors the collector-down test).
+    assert out.index("AI-TOOLKIT OFF") < out.index("Worktrees")
 
 
 def test_no_off_banner_when_enabled(hub_with_spokes: Path, tmp_path: Path) -> None:
