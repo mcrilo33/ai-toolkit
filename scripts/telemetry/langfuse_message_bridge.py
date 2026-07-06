@@ -173,6 +173,24 @@ class BufferedHook(TypedDict):
     seq: int  # the hook's event.sequence, the join key against tool_decision
     tool: str  # the tool named by hook_name, matched against the decision's tool_name
     direction: str  # "pre" (nearest-following decision) or "post" (nearest-preceding)
+    scope: str  # the hook's session namespace; only same-scope decisions may resolve it (#153)
+
+
+def _join_scope(attrs: dict[str, str]) -> str:
+    """Return the session namespace a sequence-based hook/decision join must stay within.
+
+    ``event.sequence`` is monotonic only *within* a Claude Code session, yet the single host
+    bridge pools events from every concurrent session and project. Scoping the hook->decision
+    join to ``session.id`` (falling back to ``spoke_run_id`` when a record predates the
+    session attr) keeps a nearer foreign-session decision from ever binding a hook (#153).
+
+    Args:
+        attrs: The merged OTLP resource + log-record attributes.
+
+    Returns:
+        The ``session.id`` (or ``spoke_run_id`` fallback, else ``""``) scoping the join.
+    """
+    return attrs.get("session.id") or attrs.get("spoke_run_id") or ""
 
 
 def _tooluse_hook(attrs: dict[str, str]) -> tuple[str, str] | None:
@@ -485,9 +503,11 @@ class Bridge:
         self._body_seqs: list[int] = []  # every api_request_body event.sequence ever seen
         self._pending: list[PendingItem] = []
         self._audit_traces: set[str] = set()  # spoke keys whose audit trace-create was sent
-        # (event.sequence, tool_name, tool_use_id) of every tool_decision seen; kept across
-        # flushes (like _body_seqs) as the shared join references for Pre/PostToolUse hooks.
-        self._tool_decisions: list[tuple[int, str, str]] = []
+        # (event.sequence, tool_name, tool_use_id, scope) of every tool_decision seen; kept
+        # across flushes (like _body_seqs) as the shared join references for Pre/PostToolUse
+        # hooks. ``scope`` (session.id) namespaces the sequence so a hook binds only a
+        # same-session decision (#153).
+        self._tool_decisions: list[tuple[int, str, str, str]] = []
         self._pending_hooks: list[BufferedHook] = []  # hooks awaiting their tool_use_id
         # prompt.id stamping (#111). Span structure from the forked traces:
         self._parent_of: dict[str, str] = {}  # span_id -> parentSpanId (hex), all spans
@@ -648,7 +668,8 @@ class Bridge:
         Kept across flushes (like :attr:`_body_seqs` for the message join) so a Pre hook
         buffered before its decision still resolves once the decision arrives. A decision is a
         SHARED reference -- the same one anchors the PreToolUse hook before it and the
-        PostToolUse hook after it -- so it is never consumed.
+        PostToolUse hook after it -- so it is never consumed. The decision's ``scope``
+        (session.id) is recorded so only a same-session hook can match it (#153).
         """
         if attrs.get("event.name") != "tool_decision":
             return
@@ -658,7 +679,7 @@ class Bridge:
             attrs.get("tool_use_id"),
         )
         if seq is not None and tool and tuid:
-            self._tool_decisions.append((int(seq), tool, tuid))
+            self._tool_decisions.append((int(seq), tool, tuid, _join_scope(attrs)))
 
     def _buffer_hook(self, attrs: dict[str, str], trace_key: str) -> None:
         """Buffer a Pre/PostToolUse hook so its tool_use_id resolves on a later flush.
@@ -679,22 +700,27 @@ class Bridge:
                 "seq": int(seq),
                 "tool": tool,
                 "direction": direction,
+                "scope": _join_scope(attrs),
             }
         )
 
-    def _resolve_hook_tuid(self, seq: int, tool: str, direction: str) -> str | None:
+    def _resolve_hook_tuid(self, seq: int, tool: str, direction: str, scope: str) -> str | None:
         """Return the ``tool_use_id`` of the nearest matching ``tool_decision``, or None.
 
         A Pre hook takes the nearest-FOLLOWING decision (smallest sequence greater than the
         hook's), a Post hook the nearest-PRECEDING (largest sequence less than the hook's);
-        both require an exact ``tool_name`` match, so a hook never binds to a different tool
-        *type*. Like the body join, the attribution is purely temporal: two calls of the SAME
-        tool are told apart only by sequence, so if one of them emits no ``tool_decision``
-        (e.g. an aborted call) the surviving decision is the nearest match for both hooks and
-        one can bind to the adjacent same-tool call. There is no per-call id on the hook event
-        to resolve this, exactly as for the interleaved-agent body case.
+        both require an exact ``tool_name`` match AND the same ``scope`` (session.id), so a
+        hook never binds to a different tool *type* nor to a foreign session's decision whose
+        pooled ``event.sequence`` merely happens to sit nearer (#153). Within one session the
+        attribution stays purely temporal: two calls of the SAME tool are told apart only by
+        sequence, so if one emits no ``tool_decision`` (e.g. an aborted call) the surviving
+        decision is the nearest match for both hooks and one can bind to the adjacent same-tool
+        call -- there is no per-call id on the hook event to resolve this, exactly as for the
+        interleaved-agent body case.
         """
-        matches = [(s, tuid) for (s, t, tuid) in self._tool_decisions if t == tool]
+        matches = [
+            (s, tuid) for (s, t, tuid, sc) in self._tool_decisions if t == tool and sc == scope
+        ]
         if direction == "pre":
             following = [m for m in matches if m[0] > seq]
             return min(following)[1] if following else None
@@ -711,7 +737,9 @@ class Bridge:
         batch: list[dict[str, Any]] = []
         still: list[BufferedHook] = []
         for hook in self._pending_hooks:
-            tuid = self._resolve_hook_tuid(hook["seq"], hook["tool"], hook["direction"])
+            tuid = self._resolve_hook_tuid(
+                hook["seq"], hook["tool"], hook["direction"], hook["scope"]
+            )
             if tuid is None:
                 still.append(hook)
                 continue
