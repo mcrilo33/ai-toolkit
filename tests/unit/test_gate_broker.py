@@ -583,3 +583,116 @@ def test_broker_service_gate_attended_presents_qcm_on_human_decision(
     assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
         "attended mode must present a QCM, not block like unattended"
     )
+
+
+# ── subtask D: automatable-decisions log + codification pass ───────────────────
+
+
+def _bash_tool_record(command: str) -> dict:
+    return {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {"type": "tool_use", "name": "Bash", "id": "tu_1", "input": {"command": command}}
+            ]
+        },
+    }
+
+
+_PERMISSION_PROMPT = "Bash command\n  git reset -q\nDo you want to proceed?\n❯ 1. Yes\n  2. No"
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git reset -q; git add tests/x.py",
+        "git reset HEAD -- tests/other.py; git add tests/other.py",
+        "git reset;   git add a/b/c.py",
+    ],
+)
+def test_decision_signature_collides_across_arg_variation(cmd: str) -> None:
+    # The signature normalises a command to its verb skeleton so recurrences of the SAME
+    # shape (different files/flags) collide into one automatable signature.
+    result = _call(f"_broker_decision_signature permission \"$CMD\"", env={"CMD": cmd})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "git-reset+git-add", result.stdout
+
+
+def test_log_decision_appends_tsv_and_digest_reflects(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1700000000"}
+
+    r = _call('log_decision 5 permission "git reset -q; git add tests/x.py" APPROVE', env=env)
+    assert r.returncode == 0, r.stderr
+
+    line = (statedir / "decisions.log").read_text().strip()
+    fields = line.split("\t")
+    assert fields[1] == "5" and fields[2] == "permission"
+    assert fields[3] == "git-reset+git-add" and fields[4] == "APPROVE"
+
+    # The B-subtask reader consumes exactly this format.
+    digest = _call("read_decisions_digest 5", env={"AFK_STATE_DIR": str(statedir)})
+    assert "git-reset+git-add" in digest.stdout and "APPROVE" in digest.stdout
+
+
+def test_codify_proposes_rule_for_recurring_unanimous_signature(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    log = statedir / "decisions.log"
+    # The #149 git-reset self-stage case: the same signature auto-approved twice.
+    log.write_text(
+        "1\t5\tpermission\tgit-reset+git-add\tAPPROVE\n"
+        "2\t7\tpermission\tgit-reset+git-add\tAPPROVE\n"
+        "3\t9\tpermission\tgit-push+origin\tESCALATE\n"  # single occurrence → no rule
+        "4\t11\tpermission\tgit-clean\tAPPROVE\n"  # conflicting decisions → no rule
+        "5\t12\tpermission\tgit-clean\tESCALATE\n"
+    )
+    env = {"AFK_STATE_DIR": str(statedir)}
+
+    result = _call("codify_decisions 2", env=env)
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+    assert "git-reset+git-add" in out and "APPROVE" in out, out
+    assert "git-push+origin" not in out, "a single occurrence must not become a rule"
+    assert "git-clean" not in out, "a conflicting signature must not become a rule"
+
+
+def test_decide_permission_logs_auto_approve(spoke_repo: Path, tmp_path: Path) -> None:
+    # Integration: the #149 git-reset self-stage auto-approve is recorded to the
+    # automatable-decisions log with its signature, so codify can later graduate it.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    jsonl.write_text(json.dumps(_bash_tool_record("git reset -q; git add tests/x.py")) + "\n")
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    tmux_log = fake_bin / "tmux.log"
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> "{tmux_log}"\n'
+        'case "$1" in\n'
+        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        f'  send-keys) case "$*" in *Enter*) printf "{{}}\\n" >> "{jsonl}" ;; esac ;;\n'
+        "esac\nexit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    log = statedir / "decisions.log"
+    assert log.exists(), "a safe auto-approve must be logged"
+    fields = log.read_text().strip().split("\t")
+    assert fields[2] == "permission" and fields[3] == "git-reset+git-add" and fields[4] == "APPROVE"
