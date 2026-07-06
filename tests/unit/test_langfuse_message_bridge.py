@@ -838,6 +838,134 @@ def test_pretooluse_hook_matches_decision_arriving_in_later_batch() -> None:
     assert hooks[-1]["body"]["metadata"]["tool_use_id"] == "toolu_1"
 
 
+def _multi_session_log_payload(*sessions: tuple[dict[str, str], list[list[dict]]]) -> dict:
+    """An OTLP/HTTP logs batch carrying several sessions, each its own resource + records.
+
+    Mirrors the single bridge fanning in concurrent sessions (each ``resourceLogs`` entry is a
+    distinct Claude Code process, keyed by its own ``session.id``). All records are ingested
+    before the single end-of-batch hook flush, so a cross-session sequence collision is
+    exercised deterministically.
+    """
+    return {
+        "resourceLogs": [
+            {
+                "resource": {"attributes": _attrs(**resource)},
+                "scopeLogs": [{"logRecords": [{"attributes": attrs} for attrs in records]}],
+            }
+            for resource, records in sessions
+        ]
+    }
+
+
+def test_pretooluse_hook_binds_only_a_same_session_decision() -> None:
+    # Arrange: session A's PreToolUse:Edit hook (seq 10) precedes A's own Edit decision (seq
+    # 20). A DIFFERENT session B emits an Edit decision at seq 12 -- nearer in the global
+    # sequence namespace. event.sequence is per-session, so the join must be scoped to
+    # session.id: A's hook must bind A's toolu_A, never B's nearer-but-foreign toolu_B.
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+
+    # Act
+    bridge.on_logs(
+        _multi_session_log_payload(
+            (
+                {"spoke_run_id": "spoke-A", "session.id": "sess-A"},
+                [
+                    _audit_record(
+                        **{
+                            "event.name": "hook_execution_complete",
+                            "event.sequence": "10",
+                            "hook_event": "PreToolUse",
+                            "hook_name": "PreToolUse:Edit",
+                        }
+                    ),
+                    _audit_record(
+                        **{
+                            "event.name": "tool_decision",
+                            "event.sequence": "20",
+                            "tool_name": "Edit",
+                            "tool_use_id": "toolu_A",
+                            "decision": "accept",
+                        }
+                    ),
+                ],
+            ),
+            (
+                {"spoke_run_id": "spoke-B", "session.id": "sess-B"},
+                [
+                    _audit_record(
+                        **{
+                            "event.name": "tool_decision",
+                            "event.sequence": "12",
+                            "tool_name": "Edit",
+                            "tool_use_id": "toolu_B",
+                            "decision": "accept",
+                        }
+                    ),
+                ],
+            ),
+        )
+    )
+
+    # Assert: session A's hook resolves to A's own tool, not B's nearer foreign decision.
+    a_hooks = [
+        event
+        for event in _hook_events(create)
+        if event["body"]["metadata"].get("session.id") == "sess-A"
+    ]
+    assert a_hooks[-1]["body"]["metadata"]["tool_use_id"] == "toolu_A"
+
+
+def test_hook_with_only_a_foreign_session_decision_stays_unresolved() -> None:
+    # Arrange: session A's PreToolUse:Edit hook has NO same-session Edit decision; only session
+    # B offers one. A foreign decision must never resolve the hook -- it stays at root, emitted
+    # once with no tool_use_id, rather than dangling on a foreign id in the assembled tree.
+    patch, create = _Sink(), _CreateSink()
+    bridge = Bridge(patch, create=create)
+
+    # Act
+    bridge.on_logs(
+        _multi_session_log_payload(
+            (
+                {"spoke_run_id": "spoke-A", "session.id": "sess-A"},
+                [
+                    _audit_record(
+                        **{
+                            "event.name": "hook_execution_complete",
+                            "event.sequence": "10",
+                            "hook_event": "PreToolUse",
+                            "hook_name": "PreToolUse:Edit",
+                        }
+                    ),
+                ],
+            ),
+            (
+                {"spoke_run_id": "spoke-B", "session.id": "sess-B"},
+                [
+                    _audit_record(
+                        **{
+                            "event.name": "tool_decision",
+                            "event.sequence": "15",
+                            "tool_name": "Edit",
+                            "tool_use_id": "toolu_B",
+                            "decision": "accept",
+                        }
+                    ),
+                ],
+            ),
+        )
+    )
+
+    # Assert: session A's hook is emitted once, never bound to B's foreign tool_use_id.
+    a_hooks = [
+        event
+        for event in _hook_events(create)
+        if event["body"]["metadata"].get("session.id") == "sess-A"
+    ]
+    assert len(a_hooks) == 1
+    assert "tool_use_id" not in a_hooks[0]["body"]["metadata"]
+
+
 def test_response_body_does_not_reach_the_create_sink() -> None:
     # Arrange: an api_response_body (existing patch path) must not create observations.
     patch, create = _Sink(), _CreateSink()
