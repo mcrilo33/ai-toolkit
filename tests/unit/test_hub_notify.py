@@ -122,6 +122,33 @@ def test_new_gate_marker_fires_with_approve_action(hub: Path, tmp_path: Path) ->
     assert "plan" in messages[0]
 
 
+def test_gate_marker_points_to_qcm_surface_when_present(hub: Path, tmp_path: Path) -> None:
+    # When the gate-broker attended adapter (#155) has written a QCM surface for the
+    # parked gate, the hub-notify ping points the human at it — the announce channel is
+    # hub-notify (NOT hub-status.sh, kept disjoint from #154).
+    _git(hub, "tag", "-a", "-m", "plan", "gate/1", "feature/1-work")
+    qcm_dir = tmp_path / "qcm"
+    qcm_dir.mkdir()
+    (qcm_dir / "qcm-1.md").write_text("# Gate 1 QCM\nsummary\n")
+
+    _proc, messages = _run(hub, tmp_path, env_extra={"GATE_BROKER_QCM_DIR": str(qcm_dir)})
+
+    assert len(messages) == 1
+    assert "#1" in messages[0]
+    assert "qcm" in messages[0].lower(), f"the ping must point at the QCM surface: {messages[0]}"
+
+
+def test_gate_marker_without_qcm_surface_says_approve(hub: Path, tmp_path: Path) -> None:
+    # No QCM surface yet ⇒ the plain "reply to approve" ping (attended default / PLAN park).
+    _git(hub, "tag", "-a", "-m", "plan", "gate/1", "feature/1-work")
+
+    _proc, messages = _run(hub, tmp_path, env_extra={"GATE_BROKER_QCM_DIR": str(tmp_path / "none")})
+
+    assert len(messages) == 1
+    assert "approve" in messages[0].lower()
+    assert "qcm" not in messages[0].lower()
+
+
 def test_blocked_marker_surfaces_reason_from_body(hub: Path, tmp_path: Path) -> None:
     # Real spoke-ready.sh format: subject "blocked", reason in the tag BODY.
     _git(

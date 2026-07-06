@@ -34,7 +34,9 @@ def _isolated_afk_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("AFK_HEARTBEAT", str(tmp_path / "afk-heartbeat"))
 
 
-def _call(fn_call: str, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def _call(
+    fn_call: str, *, env: dict[str, str] | None = None, stdin: str | None = None
+) -> subprocess.CompletedProcess[str]:
     """Source gate-broker.sh directly and invoke a shell expression against its functions."""
     full_env = {**os.environ, "TZ": "UTC"}
     if env:
@@ -44,6 +46,7 @@ def _call(fn_call: str, *, env: dict[str, str] | None = None) -> subprocess.Comp
         capture_output=True,
         text=True,
         env=full_env,
+        input=stdin,
     )
 
 
@@ -394,3 +397,154 @@ def test_read_decisions_digest_reflects_prior_outcomes(spoke_repo: Path, tmp_pat
     miss = _call("read_decisions_digest 5", env={"AFK_STATE_DIR": str(tmp_path / "empty")})
     assert miss.returncode == 0, miss.stderr
     assert miss.stdout.strip() == "", "no log ⇒ empty digest (D populates it)"
+
+
+# ── subtask C: attended QCM surface + interactive per-gate resolver ────────────
+
+
+def _fake_tmux_pane(fake_bin: Path, wt: Path, jsonl: Path) -> Path:
+    """A tmux stub: list-panes maps a pane to <wt>; the submitting Enter advances the
+    spoke transcript so inject_and_verify confirms; every send-keys is logged."""
+    log = fake_bin / "tmux.log"
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> "{log}"\n'
+        'case "$1" in\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{wt}" ;;\n'
+        f'  send-keys) case "$*" in *Enter*) printf "{{}}\\n" >> "{jsonl}" ;; esac ;;\n'
+        "esac\nexit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    return log
+
+
+def test_build_qcm_writes_structured_surface(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {"AFK_STATE_DIR": str(statedir)}
+
+    r = _call(
+        "build_qcm 7 'PLAN: extract the core then wire it' 'This is a scope call — your decision'",
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+
+    surface = _call("_broker_qcm_surface 7", env=env).stdout.strip()
+    txt = Path(surface).read_text()
+    assert "PLAN: extract the core then wire it" in txt, txt
+    assert "scope call" in txt, "the reviewer advice must appear in the surface"
+    assert "reply" in txt.lower(), "the freeform-escape instruction must appear"
+
+
+def test_present_qcm_injects_reviewer_reply(spoke_repo: Path, tmp_path: Path) -> None:
+    # The interactive per-gate context owns present+capture+inject: it presents the QCM,
+    # reads the human's reply HERE (stdin), and injects it into the spoke via the shared
+    # injector — off the hub, off the pane. The hub is only NOTIFIED (hub-notify).
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    jsonl.write_text(json.dumps(_ask_record("Which store?", [("Redis", "fast")])) + "\n")
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    tmux_log = _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "SPOKE_READY": str(ready_stub),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+    }
+
+    result = _call(
+        f"_broker_present_qcm '{spoke_repo}' 5 'This changes scope — your call'",
+        env=env,
+        stdin="Approved — proceed with option A.\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = tmux_log.read_text()
+    assert "Approved — proceed with option A." in calls, f"the reply must be injected: {calls}"
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), "must not escalate"
+
+
+def test_present_qcm_empty_reply_defers_to_block(spoke_repo: Path, tmp_path: Path) -> None:
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    (pd / "session.jsonl").write_text(
+        json.dumps(_ask_record("Which store?", [("Redis", "fast")])) + "\n"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _fake_tmux_pane(fake_bin, spoke_repo, pd / "session.jsonl")
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "SPOKE_READY": str(ready_stub),
+        "AFK_STATE_DIR": str(statedir),
+    }
+
+    result = _call(f"_broker_present_qcm '{spoke_repo}' 5 'your call'", env=env, stdin="\n")
+
+    assert result.returncode == 0, result.stderr
+    assert "--blocked 5" in ready_log.read_text(), "an empty reply defers the gate (escalate)"
+
+
+def test_broker_service_gate_attended_presents_qcm_on_human_decision(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # End to end: the shared core reasons (one-shot), the reasoner escalates (human call),
+    # and ATTENDED mode routes to the interactive QCM instead of blocking — the human's
+    # reply is injected and the spoke proceeds. Unattended would have blocked/<issue>.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    jsonl.write_text(json.dumps(_ask_record("Which store?", [("Redis", "fast")])) + "\n")
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+    tmux_log = _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "SPOKE_READY": str(ready_stub),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_ANSWERER_CMD": "printf 'reasoning\\nESCALATE: this is genuinely your call'",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+    }
+
+    result = _call(
+        f"broker_service_gate '{spoke_repo}' 5 attended",
+        env=env,
+        stdin="Use Redis.\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Use Redis." in tmux_log.read_text(), "attended human-decision must inject the reply"
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
+        "attended mode must present a QCM, not block like unattended"
+    )
