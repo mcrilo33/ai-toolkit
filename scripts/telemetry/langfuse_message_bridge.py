@@ -184,11 +184,21 @@ def _join_scope(attrs: dict[str, str]) -> str:
     join to ``session.id`` (falling back to ``spoke_run_id`` when a record predates the
     session attr) keeps a nearer foreign-session decision from ever binding a hook (#153).
 
+    Note the precedence is DELIBERATELY the reverse of ``trace_key``
+    (``spoke_run_id or session.id``): the audit *trace* groups per spoke so a spoke's resumed
+    sessions share one trace, whereas this *join* must separate those sessions -- their
+    ``event.sequence`` counters restart independently. Do not "reconcile" the two orderings;
+    aligning this to ``spoke_run_id``-first would re-collide cross-session sequences and
+    reintroduce the #153 contamination. The ``spoke_run_id`` fallback is a coarser, per-spoke
+    (not per-session) namespace, so on that path -- reached only when ``session.id`` is absent,
+    which the rest of the module assumes never happens on live traffic -- two resumes under one
+    ``spoke_run_id`` could still collide; ``session.id`` is the only true sequence namespace.
+
     Args:
         attrs: The merged OTLP resource + log-record attributes.
 
     Returns:
-        The ``session.id`` (or ``spoke_run_id`` fallback, else ``""``) scoping the join.
+        The ``session.id`` (or coarser ``spoke_run_id`` fallback, else ``""``) scoping the join.
     """
     return attrs.get("session.id") or attrs.get("spoke_run_id") or ""
 
@@ -704,7 +714,7 @@ class Bridge:
             }
         )
 
-    def _resolve_hook_tuid(self, seq: int, tool: str, direction: str, scope: str) -> str | None:
+    def _resolve_hook_tuid(self, *, seq: int, tool: str, direction: str, scope: str) -> str | None:
         """Return the ``tool_use_id`` of the nearest matching ``tool_decision``, or None.
 
         A Pre hook takes the nearest-FOLLOWING decision (smallest sequence greater than the
@@ -738,7 +748,7 @@ class Bridge:
         still: list[BufferedHook] = []
         for hook in self._pending_hooks:
             tuid = self._resolve_hook_tuid(
-                hook["seq"], hook["tool"], hook["direction"], hook["scope"]
+                seq=hook["seq"], tool=hook["tool"], direction=hook["direction"], scope=hook["scope"]
             )
             if tuid is None:
                 still.append(hook)
