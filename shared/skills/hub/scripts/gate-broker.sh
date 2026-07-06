@@ -467,12 +467,25 @@ reasoner_allowed_tools() {
   printf '%s\n' "${AFK_REASONER_TOOLS:-Read,Grep,Glob,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git rev-parse:*)}"
 }
 
+# _reasoner_bash_readonly <inner> -> rc 0 when a scoped Bash allow pattern's inner
+# command is a read-only git verb (git status/diff/log/show/rev-parse/branch/ls-files/
+# cat-file), rc 1 otherwise. Keeps a `Bash(...)` allow from smuggling a mutating verb
+# (git push/commit/reset, rm, chmod, …) past assert_readonly_tools.
+_reasoner_bash_readonly() {
+  case "$1" in
+    'git status'* | 'git diff'* | 'git log'* | 'git show'* | 'git rev-parse'* \
+      | 'git branch'* | 'git ls-files'* | 'git cat-file'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # assert_readonly_tools <comma-list> -> rc 0 when every tool is read-only, rc 1 when any
-# is a mutating tool (Edit/Write/MultiEdit/NotebookEdit) or a bare unrestricted Bash. A
-# scoped Bash(...) read verb is allowed; anything unrecognised is denied (default-deny).
-# Parses by hand (no word-splitting) so a glob in a Bash(...) pattern never expands.
+# is a mutating tool (Edit/Write/MultiEdit/NotebookEdit), a bare unrestricted Bash, or a
+# scoped Bash(...) whose inner verb is NOT a read-only git verb. Anything unrecognised is
+# denied (default-deny). Parses by hand (no word-splitting) so a glob in a Bash(...)
+# pattern never expands.
 assert_readonly_tools() {
-  local rest="$1" tok
+  local rest="$1" tok inner
   while [ -n "$rest" ]; do
     tok="${rest%%,*}"
     if [ "$tok" = "$rest" ]; then rest=""; else rest="${rest#*,}"; fi
@@ -480,9 +493,10 @@ assert_readonly_tools() {
     [ -n "$tok" ] || continue
     case "$tok" in
       Read | Grep | Glob | LS | WebFetch | WebSearch | TodoRead) ;;
-      'Bash('*')') ;;                                  # a scoped Bash read verb
-      Edit | Write | MultiEdit | NotebookEdit | Bash) return 1 ;;   # mutating / unrestricted
-      *) return 1 ;;                                    # unknown -> deny
+      'Bash('*')')                                     # a scoped Bash verb: vet it
+        inner="${tok#Bash(}"; inner="${inner%)}"
+        _reasoner_bash_readonly "$inner" || return 1 ;;
+      *) return 1 ;;                                    # mutating / bare Bash / unknown -> deny
     esac
   done
   return 0
@@ -514,6 +528,14 @@ _broker_worktree_unchanged() {
   local wt="$1" before="$2" after
   after="$(_broker_worktree_fingerprint "$wt")"
   [ "$before" = "$after" ]
+}
+
+# _broker_is_git_worktree <wt> -> rc 0 when <wt> is a real git worktree (so a NON-empty
+# fingerprint is expected). Used to fail SAFE: an empty fingerprint for a git worktree
+# means the fingerprint tooling (shasum/git) is missing and the read-only guard can't
+# verify — which must escalate, not silently pass.
+_broker_is_git_worktree() {
+  [ -d "$1" ] && git -C "$1" rev-parse --git-dir >/dev/null 2>&1
 }
 
 # read_decisions_digest <issue> -> a compact digest of THIS spoke's prior gate outcomes,
@@ -963,6 +985,15 @@ ${orig_question:-(the plan prose could not be extracted from the transcript — 
   # content. Detection is the hard guarantee independent of the LLM's tool-allowlist.
   local fp_before; fp_before="$(_broker_worktree_fingerprint "$wt")"
   raw="$(run_answerer "$issue" "$question" "$wt")"; rc=$?
+  if _broker_is_git_worktree "$wt" && [ -z "$fp_before" ]; then
+    # Fail SAFE: a git worktree with an empty fingerprint means the fingerprint tooling
+    # is unavailable, so we cannot verify the reasoner stayed read-only. Never trust an
+    # unverifiable answer — escalate rather than pass.
+    log "  could not fingerprint #$issue's worktree to verify read-only — escalating"
+    _broker_on_human_decision "$mode" "$wt" "$issue" \
+      "could not fingerprint the worktree to verify the reasoner stayed read-only — needs a human"
+    return 0
+  fi
   if ! _broker_worktree_unchanged "$wt" "$fp_before"; then
     log "  reasoner mutated the read-only worktree of #$issue — voiding its answer"
     _broker_on_human_decision "$mode" "$wt" "$issue" \

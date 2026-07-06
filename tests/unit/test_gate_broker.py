@@ -255,6 +255,53 @@ def test_reasoner_allowed_tools_are_read_only() -> None:
         assert rej.stdout.strip().splitlines()[-1] == "RC=1", f"{bad} must be rejected"
 
 
+@pytest.mark.parametrize(
+    "spec,rc",
+    [
+        ("Bash(git status:*)", "0"),  # a read-only git verb is allowed
+        ("Bash(git diff)", "0"),
+        ("Bash(git push:*)", "1"),  # a scoped-but-MUTATING git verb must be rejected
+        ("Bash(git commit:*)", "1"),
+        ("Bash(git reset:*)", "1"),
+        ("Bash(rm -rf /)", "1"),  # a scoped Bash must not smuggle arbitrary commands
+    ],
+)
+def test_assert_readonly_tools_vets_scoped_bash_verb(spec: str, rc: str) -> None:
+    result = _call(f'assert_readonly_tools "{spec}"; echo RC=$?', env={})
+    assert result.stdout.strip().splitlines()[-1] == f"RC={rc}", f"{spec}: {result.stdout}"
+
+
+def test_worktree_fingerprint_detects_deletion(spoke_repo: Path) -> None:
+    (spoke_repo / "keep.txt").write_text("data")
+    subprocess.run(["git", "add", "keep.txt"], cwd=spoke_repo, check=True, capture_output=True)
+    fp1 = _call(f"_broker_worktree_fingerprint '{spoke_repo}'").stdout.strip()
+
+    (spoke_repo / "keep.txt").unlink()
+    fp2 = _call(f"_broker_worktree_fingerprint '{spoke_repo}'").stdout.strip()
+
+    assert fp1 and fp2 != fp1, "deleting a tracked file must change the fingerprint"
+
+
+def test_broker_service_gate_escalates_when_fingerprint_unavailable(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str]
+) -> None:
+    # Fail-safe: a git worktree whose fingerprint comes back empty (tooling absent) can't
+    # be verified read-only, so the gate escalates rather than trusting the answer. Force
+    # the empty fingerprint by overriding the fingerprint fn after sourcing.
+    env = {**waiting_spoke_env, "AFK_ANSWERER_CMD": "printf 'ANSWER: go ahead'"}
+
+    result = _call(
+        "_broker_worktree_fingerprint() { printf ''; }; "
+        f"broker_service_gate '{spoke_repo}' 5 unattended",
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    log = Path(env["_READY_LOG"]).read_text()
+    assert "--blocked 5" in log, f"unverifiable read-only must escalate: {log}"
+    assert "fingerprint" in log.lower(), log
+
+
 def test_worktree_fingerprint_detects_mutation(spoke_repo: Path) -> None:
     # A content fingerprint of the LIVE worktree (tracked + untracked, not just HEAD):
     # stable across a no-op, changes on a new file AND on a content edit of a file.
