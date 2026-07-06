@@ -2579,6 +2579,120 @@ def test_auto_land_lands_foreign_ready_spoke_by_default(spoke_repo: Path, tmp_pa
     )
 
 
+# ── landed tally + drain-complete emit (issue #150) ───────────────────────────
+# A completed /afk drain must fire ONE "drain complete — <k> landed" ping, but the
+# count is not externally derivable: log() writes to stderr (redirected to
+# /dev/null on most launch paths) and .afk-state is cleared on stop. So hub-afk
+# keeps its own tally in a FILE under <git-common-dir> — a file, not an in-process
+# var, so it survives the watchdog's no-arg supervisor respawn mid-window — and
+# hands the final count to hub-notify at drain-stop via .afk-drain-complete. These
+# drive the tally helpers, auto_land's increment, and the emit directly.
+
+
+def test_landed_count_defaults_zero_when_absent(tmp_path: Path) -> None:
+    # No counter file yet ⇒ zero landed (the emit still fires "0 landed").
+    countfile = tmp_path / "landed-count"
+
+    result = _call("afk_read_landed_count", env={"AFK_LANDED_COUNT": str(countfile)})
+
+    assert result.stdout.strip() == "0"
+
+
+def test_read_landed_count_ignores_malformed(tmp_path: Path) -> None:
+    # A partially-written / corrupt counter must read as zero, never crash the emit.
+    countfile = tmp_path / "landed-count"
+    countfile.write_text("garbage\n")
+
+    result = _call("afk_read_landed_count", env={"AFK_LANDED_COUNT": str(countfile)})
+
+    assert result.stdout.strip() == "0"
+
+
+def test_incr_landed_counts_up(tmp_path: Path) -> None:
+    countfile = tmp_path / "landed-count"
+
+    result = _call(
+        "_afk_incr_landed; _afk_incr_landed; _afk_incr_landed; afk_read_landed_count",
+        env={"AFK_LANDED_COUNT": str(countfile)},
+    )
+
+    assert result.stdout.strip() == "3"
+
+
+def test_auto_land_increments_landed_tally(spoke_repo: Path, tmp_path: Path) -> None:
+    # A successful land bumps the tally by one (the count hub-notify surfaces).
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    wt_land, land_log = _land_recorder(tmp_path)
+    countfile = tmp_path / "landed-count"
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_LANDED_COUNT": str(countfile),
+        },
+    )
+
+    assert land_log.read_text().split() == ["5"]
+    assert countfile.read_text().strip() == "1"
+
+
+def test_auto_land_failure_does_not_increment_tally(spoke_repo: Path, tmp_path: Path) -> None:
+    # A failed land escalates blocked/<issue> and must NOT count toward "landed".
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    wt_land = tmp_path / "wtland.sh"
+    wt_land.write_text("#!/usr/bin/env bash\nexit 1\n")
+    wt_land.chmod(0o755)
+    ready_stub, _ready_log = _escalation_recorder(tmp_path)
+    countfile = tmp_path / "landed-count"
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "SPOKE_READY": str(ready_stub),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_LANDED_COUNT": str(countfile),
+        },
+    )
+
+    assert not countfile.exists() or countfile.read_text().strip() == "0"
+
+
+def test_emit_drain_complete_writes_count_and_clears_counter(tmp_path: Path) -> None:
+    # At drain-stop the tally is written to .afk-drain-complete for hub-notify, then
+    # the counter is reset so a later window starts fresh.
+    countfile = tmp_path / "landed-count"
+    donefile = tmp_path / "drain-complete"
+
+    result = _call(
+        "_afk_incr_landed; _afk_incr_landed; _afk_emit_drain_complete",
+        env={"AFK_LANDED_COUNT": str(countfile), "AFK_DRAIN_COMPLETE": str(donefile)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert donefile.read_text().strip() == "2"
+    assert not countfile.exists(), "the counter is reset after the emit"
+
+
+def test_emit_drain_complete_writes_zero_when_none_landed(tmp_path: Path) -> None:
+    # A drain that landed nothing still emits exactly one signal, "0 landed".
+    countfile = tmp_path / "landed-count"
+    donefile = tmp_path / "drain-complete"
+
+    _call(
+        "_afk_emit_drain_complete",
+        env={"AFK_LANDED_COUNT": str(countfile), "AFK_DRAIN_COMPLETE": str(donefile)},
+    )
+
+    assert donefile.read_text().strip() == "0"
+
+
 # ── heartbeat freshness through long tick phases (issue #133, subtask 4) ──────
 # The heartbeat is stamped once at tick top, and auto_land then runs a 6-10min land
 # suite synchronously, freezing the epoch mid-land. Honest scope (ST4 review):
