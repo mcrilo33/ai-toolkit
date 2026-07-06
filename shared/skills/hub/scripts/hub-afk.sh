@@ -172,6 +172,47 @@ afk_write_state() { printf '%s\n' "$1" > "$(afk_state_file)"; }
 afk_read_state()  { local f; f="$(afk_state_file)"; [ -f "$f" ] && head -n1 "$f" 2>/dev/null | tr -d '[:space:]' || true; }
 afk_clear_state() { rm -f "$(afk_state_file)" 2>/dev/null || true; afk_clear_heartbeat; }
 
+# --- landed tally + drain-complete hand-off (issue #150) ----------------------
+# A completed drain fires ONE "drain complete — <k> landed" notification, but <k>
+# is not externally derivable: log() writes to stderr (redirected to /dev/null on
+# most launch paths), there is no persisted tally, and .afk-state is cleared on
+# stop. So the supervisor keeps its own landed counter HERE, in a file under the
+# git common dir — a file, not an in-process var, so it survives the watchdog's
+# no-arg supervisor respawn mid-window (#107) — incremented once per successful
+# auto_land and reset on a fresh arm. At the clean drain-stop the count is handed
+# to hub-notify.sh by writing <git-common-dir>/.afk-drain-complete, which
+# hub-notify consumes-and-clears (fires once). AFK_LANDED_COUNT / AFK_DRAIN_COMPLETE
+# override the two paths for tests.
+afk_landed_count_file() {
+  if [ -n "${AFK_LANDED_COUNT:-}" ]; then printf '%s\n' "$AFK_LANDED_COUNT"; return; fi
+  local common; common="$(git rev-parse --git-common-dir 2>/dev/null)" || common=".git"
+  printf '%s\n' "$common/.afk-landed-count"
+}
+afk_drain_complete_file() {
+  if [ -n "${AFK_DRAIN_COMPLETE:-}" ]; then printf '%s\n' "$AFK_DRAIN_COMPLETE"; return; fi
+  local common; common="$(git rev-parse --git-common-dir 2>/dev/null)" || common=".git"
+  printf '%s\n' "$common/.afk-drain-complete"
+}
+# afk_read_landed_count -> the tally, defaulting to 0 for an absent, empty, or
+# partially-written (non-numeric) file so the emit never crashes on a corrupt read.
+afk_read_landed_count() {
+  local f n; f="$(afk_landed_count_file)"
+  n="$( [ -f "$f" ] && head -n1 "$f" 2>/dev/null | tr -d '[:space:]' )"
+  case "$n" in '' | *[!0-9]*) n=0 ;; esac
+  printf '%s\n' "$n"
+}
+_afk_incr_landed() {
+  printf '%s\n' "$(( $(afk_read_landed_count) + 1 ))" > "$(afk_landed_count_file)" 2>/dev/null || true
+}
+_afk_clear_landed_count() { rm -f "$(afk_landed_count_file)" 2>/dev/null || true; }
+# _afk_emit_drain_complete -> hand the final tally to hub-notify at drain-stop:
+# write the count to .afk-drain-complete, then reset the counter so the next
+# window starts fresh. Best-effort; a write failure never aborts the stop path.
+_afk_emit_drain_complete() {
+  printf '%s\n' "$(afk_read_landed_count)" > "$(afk_drain_complete_file)" 2>/dev/null || true
+  _afk_clear_landed_count
+}
+
 # --- heartbeat (issue #107) ---------------------------------------------------
 # Each supervisor tick stamps "<pid> <last_tick_epoch>" here so a second shell (and the
 # watchdog) can tell a LIVE supervisor from a stale state file. A silent crash (the
@@ -1622,6 +1663,7 @@ auto_land() {
     log "→ land #$issue"
     if _afk_run_with_heartbeat bash "$wt_land" "$issue" --skip-tests >/dev/null 2>&1; then
       log "  landed #$issue"
+      _afk_incr_landed   # tally for the drain-complete notification (#150)
     else
       _escalate_blocked "$path" "$issue" "auto-land failed (merge conflict or push rejection) — needs a human"
     fi
@@ -2130,6 +2172,7 @@ main() {
     _clear_dispatch_epochs   # fresh window ⇒ empty "dispatched by this run" set
     _clear_progress_state    # fresh window ⇒ no stale progress / answer-attempt epochs
     _clear_resume_markers    # fresh window ⇒ every spoke gets its one auto-resume again
+    _afk_clear_landed_count  # fresh window ⇒ the landed tally starts at zero (#150)
     _clear_blocked_records   # fresh window ⇒ --status shows only THIS run's durable blocks
     log "/afk: armed ($([ "$end" = drain ] && echo 'drain — until the backlog is empty' || echo "until $(wt_date_ymd "$end") $(date -r "$end" +%H:%M 2>/dev/null || date -d "@$end" +%H:%M)"))"
   fi
@@ -2149,7 +2192,7 @@ main() {
     fi
     [ "$once" -eq 1 ] && break
     if afk_done "$(afk_read_state)" "$(afk_now)"; then
-      log "/afk: done"; afk_clear_state; break
+      log "/afk: done"; _afk_emit_drain_complete; afk_clear_state; break
     fi
     sleep "$AFK_TICK_SECONDS"
   done
