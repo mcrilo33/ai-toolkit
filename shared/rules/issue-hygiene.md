@@ -50,6 +50,27 @@ differently:
 State ordering only when it is real. A spurious blocked-by edge stalls work that could
 have proceeded; a missing one lets a spoke start against an unfinished prerequisite.
 
+## Declared as a checked step at creation
+
+Answering "does this depend on open work?" is a **checked step** of issue creation — the
+same status as `Scope:`, not an afterthought. Before filing, state the answer explicitly:
+either record the real blocked-by edge (see
+`github-issues/references/dependencies.md`), or note that the issue has no open
+dependency. The `start-task` skill carries this as a required question. Declaring is
+mandatory; only the *answer* varies — and, per the caveat above, you declare the
+**genuine** edges, never fabricate one to serialize or scope a run.
+
+## What the planner guarantees
+
+- **Ordering** — the planner never dispatches an issue while any of its blockers is still
+  open; a blocker *closing* is what releases the dependent into the next batch.
+- **Concurrency** — independent issues with disjoint `Scope:` still batch and run at the
+  same time. A declared edge serializes *only* the pair it names.
+- **Lint** — `batch-plan.sh` prints a stderr-only `possible undeclared dependency`
+  warning when two open issues share a not-yet-created scope path with no edge between
+  them, so a likely-missing edge surfaces at plan time. Detection-only: it never changes
+  the batch, the exit code, or which issues dispatch.
+
 ## Related
 
 - `workflow` rule — the task lifecycle these issues feed into

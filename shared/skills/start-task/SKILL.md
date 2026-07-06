@@ -100,12 +100,16 @@ Scope: <files/globs the task touches>   # mandatory; '*' or omitted ⇒ exclusiv
 
 Capture the issue number `N` from the returned URL.
 
-### 3b. Wire blocked-by dependencies
+### 3b. Declare blocked-by dependencies (required step)
 
-If this task is genuinely **based on** other work — it cannot start until another issue
-closes — record that as a native GitHub **blocked-by** dependency at creation, using the
-REST/GraphQL calls in `github-issues/references/dependencies.md`. The planner holds a
-blocked issue until its blockers close.
+**Answer this for every issue, the same status as the mandatory `Scope:` line:
+"Does this depend on open work that must land first?"** Declaring is not optional — only
+the *answer* is. If **yes**, record the native GitHub **blocked-by** dependency now, at
+creation, using the REST/GraphQL calls in `github-issues/references/dependencies.md`; the
+planner holds a blocked issue until its blockers close. If **no**, the answer is simply
+"no open dependency" and you file with no edge. Skipping the question is the failure mode
+this step exists to prevent — a genuinely dependent issue that ships with no edge lets a
+spoke start against an unfinished prerequisite.
 
 Express ordering *only* when it is real. Do **not** use a dependency to encode "these
 touch the same file" — file overlap is a scheduling concern the planner already derives

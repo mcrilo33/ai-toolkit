@@ -62,7 +62,11 @@ def _node(
 
 
 def _run_plan(
-    nodes: list[dict], *, inflight: list[str] | None = None, cap: int | None = None
+    nodes: list[dict],
+    *,
+    inflight: list[str] | None = None,
+    cap: int | None = None,
+    repo_root: Path | str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Pipe a fixture graph into plan_from_json and return the completed process."""
     env = {**os.environ}
@@ -71,6 +75,8 @@ def _run_plan(
         args += f" --inflight {json_quote(spoke)}"
     if cap is not None:
         args += f" --cap {cap}"
+    if repo_root is not None:
+        args += f" --repo-root {json_quote(str(repo_root))}"
     return subprocess.run(
         ["bash", "-c", f'source "{BATCH_PLAN}"; plan_from_json{args}'],
         input=json.dumps(nodes),
@@ -81,10 +87,14 @@ def _run_plan(
 
 
 def _plan(
-    nodes: list[dict], *, inflight: list[str] | None = None, cap: int | None = None
+    nodes: list[dict],
+    *,
+    inflight: list[str] | None = None,
+    cap: int | None = None,
+    repo_root: Path | str | None = None,
 ) -> list[int]:
     """Pipe a fixture graph into plan_from_json and return the batch as issue numbers."""
-    proc = _run_plan(nodes, inflight=inflight, cap=cap)
+    proc = _run_plan(nodes, inflight=inflight, cap=cap, repo_root=repo_root)
     assert proc.returncode == 0, proc.stderr
     return [int(tok) for tok in proc.stdout.split()]
 
@@ -450,6 +460,123 @@ def test_split_marker_requires_intentional_value() -> None:
     assert "merge candidates: #1 → #2" in proc.stderr
 
 
+# ── undeclared-dependency lint: shared not-yet-created scope path (issue #148) ─
+# A scope token naming a path ABSENT under --repo-root is a file an issue will
+# CREATE; two open issues both listing it, with no blocked-by edge, is a probable
+# undeclared producer→consumer dependency (one creates, the other consumes). The
+# lint fires ONLY on the create direction (an absent path); a shared EXISTING file
+# is mere overlap the scheduler already serializes and must stay silent, else the
+# lint would nudge authors toward the fake edges issue-hygiene forbids. Detection-
+# only, stderr, and OFF (byte-identical) whenever --repo-root is omitted.
+
+
+def _UNDECLARED() -> str:
+    return "possible undeclared dependency"
+
+
+def test_undeclared_dependency_warns_for_shared_missing_scope(tmp_path: Path) -> None:
+    # newmod.py exists nowhere under root ⇒ #1 creates it, #2 also lists it, no edge.
+    nodes = [_node(1, "newmod.py"), _node(2, "newmod.py a.py")]
+
+    proc = _run_plan(nodes, repo_root=tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    assert f"⚠ {_UNDECLARED()}: #1 / #2" in proc.stderr
+    assert "newmod.py" in proc.stderr
+
+
+def test_undeclared_dependency_silent_when_file_exists(tmp_path: Path) -> None:
+    # Same shape, but the shared path EXISTS under root ⇒ mere overlap of an existing
+    # file, not a producer→consumer edge. Must stay silent (overlap ≠ dependency).
+    (tmp_path / "newmod.py").write_text("x")
+    nodes = [_node(1, "newmod.py"), _node(2, "newmod.py")]
+
+    proc = _run_plan(nodes, repo_root=tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    assert _UNDECLARED() not in proc.stderr
+
+
+def test_undeclared_dependency_silent_when_edge_declared(tmp_path: Path) -> None:
+    # #2 is blocked-by #1 on the shared missing path — the ordering is already declared.
+    nodes = [_node(1, "newmod.py"), _node(2, "newmod.py", blocked_by=[(1, "OPEN")])]
+
+    proc = _run_plan(nodes, repo_root=tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    assert _UNDECLARED() not in proc.stderr
+
+
+def test_undeclared_dependency_silent_for_transitive_edge(tmp_path: Path) -> None:
+    # #3 is transitively blocked by #1 (#3→#2→#1); the create/consume pair #1/#3 is
+    # already ordered, so no warning despite sharing the missing z.py.
+    nodes = [
+        _node(1, "z.py"),
+        _node(2, "b.py", blocked_by=[(1, "OPEN")]),
+        _node(3, "z.py", blocked_by=[(2, "OPEN")]),
+    ]
+
+    proc = _run_plan(nodes, repo_root=tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    assert _UNDECLARED() not in proc.stderr
+
+
+def test_undeclared_dependency_suppressed_by_split_intentional(tmp_path: Path) -> None:
+    nodes = [
+        _node(1, "newmod.py", split="intentional — staged rollout"),
+        _node(2, "newmod.py"),
+    ]
+
+    proc = _run_plan(nodes, repo_root=tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    assert _UNDECLARED() not in proc.stderr
+
+
+def test_undeclared_dependency_off_without_repo_root() -> None:
+    # No --repo-root ⇒ create-detection disabled; the pure planner path is unchanged.
+    nodes = [_node(1, "newmod.py"), _node(2, "newmod.py")]
+
+    proc = _run_plan(nodes)
+
+    assert _UNDECLARED() not in proc.stderr
+
+
+def test_undeclared_dependency_is_detection_only(tmp_path: Path) -> None:
+    # A warning fires, but the batch on stdout and the exit code are byte-identical to
+    # the --repo-root-omitted run — the lint never touches dispatch.
+    nodes = [_node(1, "newmod.py"), _node(2, "newmod.py")]
+
+    warned = _run_plan(nodes, repo_root=tmp_path)
+    silent = _run_plan(nodes)
+
+    assert f"⚠ {_UNDECLARED()}" in warned.stderr
+    assert _UNDECLARED() not in silent.stderr
+    assert warned.returncode == silent.returncode == 0
+    assert warned.stdout == silent.stdout
+
+
+def test_undeclared_dependency_ignores_glob_tokens(tmp_path: Path) -> None:
+    # A glob scope token is not a concrete path — never treated as a to-be-created file.
+    nodes = [_node(1, "src/*.py"), _node(2, "src/*.py")]
+
+    proc = _run_plan(nodes, repo_root=tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    assert _UNDECLARED() not in proc.stderr
+
+
+def test_undeclared_dependency_needs_two_issues(tmp_path: Path) -> None:
+    # A single issue creating a new file is normal — no consumer, no warning.
+    nodes = [_node(1, "newmod.py"), _node(2, "other.py")]
+
+    proc = _run_plan(nodes, repo_root=tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    assert _UNDECLARED() not in proc.stderr
+
+
 # ── tie-break: equal depth ⇒ more direct dependents wins ──────────────────────
 
 
@@ -595,3 +722,72 @@ def test_next_batch_skill_documents_dispatch() -> None:
 
     assert "batch-plan.sh" in skill, "the skill must run batch-plan.sh"
     assert "worktree-new.sh" in skill, "the skill must dispatch via worktree-new.sh"
+
+
+# ── doc guards: blocked-by is a checked step at creation (issue #148) ──────────
+
+
+def test_start_task_requires_blocked_by_question() -> None:
+    # Filing must ASK the ordering question, the same status as the mandatory Scope:.
+    skill = (SKILLS_DIR / "start-task" / "SKILL.md").read_text()
+
+    assert "Does this depend on open work" in skill, (
+        "start-task must pose the blocked-by question as a required step"
+    )
+    assert "required step" in skill, "the blocked-by step must be labelled required"
+
+
+def test_issue_hygiene_documents_blocked_by_creation_step() -> None:
+    # The rule must record blocked-by as a checked step and state the planner guarantee.
+    rule = (REPO_ROOT / "shared" / "rules" / "issue-hygiene.md").read_text()
+
+    assert "checked step" in rule, "blocked-by must be documented as a checked step"
+    assert "What the planner guarantees" in rule, "the ordering guarantee must be documented"
+    assert "never dispatches an issue while" in rule, (
+        "the rule must state the never-before-a-blocker guarantee"
+    )
+
+
+# ── ordering guarantee: AC #3 — both directions, explicitly (issue #148) ──────
+# The scheduler already enforces ordering off native blocked-by; these lock the
+# acceptance criterion in place: (1) a declared OPEN blocker holds its dependent
+# out of every batch, and closing it releases the dependent; (2) independent
+# disjoint-scope issues still batch and run concurrently.
+
+
+def test_never_dispatches_before_a_declared_blocker_closes() -> None:
+    # #2 declares blocked-by #1 (OPEN) — #2 must never be dispatched while #1 is open.
+    held = _plan([_node(1, "a.py"), _node(2, "b.py", blocked_by=[(1, "OPEN")])])
+
+    assert 2 not in held, "a dependent must not dispatch while its blocker is open"
+    assert held == [1], "only the unblocked blocker is dispatched"
+
+    # When #1 closes it leaves the OPEN backlog; #2 now sees only a CLOSED blocker
+    # and is released into the batch — the close is what unblocks it.
+    released = _plan([_node(2, "b.py", blocked_by=[(1, "CLOSED")])])
+
+    assert released == [2], "closing the declared blocker releases the dependent"
+
+
+def test_independent_disjoint_issues_batch_concurrently() -> None:
+    # Three ready issues, no blocked-by edges, disjoint scopes ⇒ all run at once.
+    batch = _plan([_node(1, "a.py"), _node(2, "b.py"), _node(3, "c.py")])
+
+    assert batch == [1, 2, 3], "independent disjoint-scope issues batch concurrently"
+
+
+def test_declared_blocker_holds_dependent_while_disjoint_peers_still_batch() -> None:
+    # Both guarantees at once: #2 (blocked-by #1 OPEN) is held, while the blocker #1
+    # and two disjoint independent peers #3/#4 all batch together — ordering serializes
+    # only the declared pair, never the independent work around it.
+    nodes = [
+        _node(1, "a.py"),
+        _node(2, "b.py", blocked_by=[(1, "OPEN")]),
+        _node(3, "c.py"),
+        _node(4, "d.py"),
+    ]
+
+    batch = _plan(nodes)
+
+    assert batch == [1, 3, 4], "the blocked dependent is held; disjoint peers still batch"
+    assert 2 not in batch
