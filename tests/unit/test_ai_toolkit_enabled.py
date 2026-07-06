@@ -375,6 +375,26 @@ def test_cc_hook_passthrough_when_disabled(repo: Path) -> None:
     assert "REACHED_BODY" not in result.stdout
 
 
+def test_cc_hook_degrades_to_enabled_when_switch_absent(repo: Path, tmp_path: Path) -> None:
+    """A stale install lacking enabled.sh must NOT crash: utils.sh sources the
+    switch defensively and degrades to ENABLED (hook body runs). An absent switch
+    cannot disable — even with the off marker present, enforcement stays on."""
+    libdir = tmp_path / "stale_lib"
+    libdir.mkdir()
+    (libdir / "utils.sh").write_text(UTILS.read_text())
+    (libdir / "telemetry.sh").write_text((UTILS.parent / "telemetry.sh").read_text())
+    # deliberately NO enabled.sh — a pre-#154 install.
+    probe = tmp_path / "probe.sh"
+    probe.write_text(f'#!/usr/bin/env bash\nsource "{libdir}/utils.sh"\necho REACHED_BODY\n')
+    probe.chmod(0o755)
+    _disable(repo)  # marker present, but the switch file is absent, so it can't disable
+    result = subprocess.run(
+        ["bash", str(probe)], cwd=str(repo), capture_output=True, text=True, env=_env(repo)
+    )
+    assert result.returncode == 0, result.stderr
+    assert "REACHED_BODY" in result.stdout
+
+
 def _run_block_no_verify(repo: Path) -> subprocess.CompletedProcess[str]:
     payload = '{"tool_name":"Bash","tool_input":{"command":"git commit --no-verify -m x"}}'
     return subprocess.run(
