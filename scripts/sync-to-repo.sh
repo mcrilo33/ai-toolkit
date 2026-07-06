@@ -502,10 +502,10 @@ sync_workflow_scripts() {
     # hooks/lib/) so the worktree scripts can source them as siblings — see
     # worktree-lib.sh's telemetry and base-branch blocks.
     local name src
-    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh worktree-quick.sh spoke-push.sh spoke-ready.sh gate-sweep.sh telemetry-ingest-spoke.sh hub-status.sh hub-ready-watch.sh hub-notify.sh hub-otel-watch.sh hub-afk.sh batch-plan.sh telemetry.sh base-branch.sh; do
+    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh worktree-quick.sh spoke-push.sh spoke-ready.sh gate-sweep.sh telemetry-ingest-spoke.sh hub-status.sh hub-ready-watch.sh hub-notify.sh hub-otel-watch.sh hub-afk.sh batch-plan.sh telemetry.sh base-branch.sh enabled.sh; do
         case "$name" in
             hub-status.sh|hub-ready-watch.sh|hub-notify.sh|hub-otel-watch.sh|hub-afk.sh|batch-plan.sh) src="$SHARED_DIR/skills/hub/scripts/$name" ;;
-            telemetry.sh|base-branch.sh)      src="$SHARED_DIR/hooks/lib/$name" ;;
+            telemetry.sh|base-branch.sh|enabled.sh)      src="$SHARED_DIR/hooks/lib/$name" ;;
             *)                                src="$SCRIPT_DIR/$name" ;;
         esac
         [ -f "$src" ] || continue
@@ -595,6 +595,34 @@ apply_base_branch_config() {
     fi
 }
 
+# Apply the config's `enabled` to `git config ai-toolkit.enabled` on the target —
+# the DURABLE default tier the ai_toolkit_enabled resolver reads (issue #154). The
+# config OWNS this value: `false` sets the disabled default, `true`/absent clears
+# the key so the resolver defaults to ENABLED. It deliberately does NOT touch the
+# <git-common-dir>/ai-toolkit-off marker (the sync-safe quick flip that WINS over
+# this default) so a manual `ai-toolkit off` survives a re-sync.
+apply_enabled_config() {
+    [ -e "$TARGET/.git" ] || return 0   # only a git repo carries config
+    local en
+    en="$(python3 "$SCRIPT_DIR/ai_toolkit_config.py" enabled "$AI_TOOLKIT_CONFIG" 2>/dev/null || true)"
+    section "Global on/off switch (ai-toolkit.enabled)"
+    if [ "$en" = "false" ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "[dry-run] would set git config ai-toolkit.enabled=false (toolkit OFF by default)"
+        else
+            git -C "$TARGET" config ai-toolkit.enabled false
+            warn "enabled → false — toolkit OFF by default (gates/guards/telemetry bypassed)"
+        fi
+    elif [ "$DRY_RUN" -eq 1 ]; then
+        echo "[dry-run] would clear git config ai-toolkit.enabled (default ON)"
+    else
+        # true / absent / unreadable ⇒ clear, so the resolver defaults to ENABLED
+        # (the safe direction — a broken config never silently disables the cage).
+        git -C "$TARGET" config --unset ai-toolkit.enabled 2>/dev/null || true
+        info "enabled → on (unset; full enforcement)"
+    fi
+}
+
 # ═══════════════════════════════════════════
 #  SYNC MANIFEST + STALE-FILE GC
 # ═══════════════════════════════════════════
@@ -674,6 +702,7 @@ case "$TOOL" in
 esac
 
 apply_base_branch_config
+apply_enabled_config
 
 if [ "$WITH_GIT_HOOKS" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
     sync_git_hooks
