@@ -91,9 +91,13 @@ cp "$SHARED_HOOKS/commit-quality.sh" \
 # telemetry.sh is not optional: utils.sh sources it unconditionally, so an
 # install without it ships hooks that die at source-time (the 2026-07-04 hub
 # outage — every push from every worktree failed on the missing file).
+# enabled.sh (the #154 on/off switch) ships here too so a fresh install carries
+# the switch; utils.sh and the hook wrappers source it defensively, so a stale
+# install lacking it degrades to ENABLED rather than crashing.
 cp "$SHARED_HOOKS/lib/utils.sh" "$SHARED_HOOKS/lib/telemetry.sh" \
    "$SHARED_HOOKS/lib/gate-stamp.sh" \
-   "$SHARED_HOOKS/lib/test-reverse-index.sh" "$SCRIPTS_DST/lib/"
+   "$SHARED_HOOKS/lib/test-reverse-index.sh" \
+   "$SHARED_HOOKS/lib/enabled.sh" "$SCRIPTS_DST/lib/"
 chmod +x "$SCRIPTS_DST"/*.sh
 info "Copied cage scripts → $SCRIPTS_DST"
 
@@ -108,6 +112,16 @@ emit_commit_msg_hook() {
 set -euo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS="$SELF_DIR/ai-toolkit-scripts"
+
+# Global on/off switch (#154): when the toolkit is disabled, pass through —
+# the commit proceeds ungated. This guards the whole native hook regardless of
+# the cage scripts below (which also self-skip via utils.sh).
+if [ -f "$SCRIPTS/lib/enabled.sh" ]; then
+  # shellcheck source=/dev/null
+  source "$SCRIPTS/lib/enabled.sh"
+  ai_toolkit_enabled || exit 0
+fi
+
 MSG_FILE="$1"
 
 # Build a representative `git commit` command containing the message as a -m
@@ -144,6 +158,15 @@ emit_pre_push_hook() {
 set -uo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS="$SELF_DIR/ai-toolkit-scripts"
+
+# Global on/off switch (#154): when the toolkit is disabled, pass through — the
+# push proceeds ungated. Exit BEFORE draining stdin (git does not require the
+# hook to consume it) so a disabled toolkit runs zero gate logic.
+if [ -f "$SCRIPTS/lib/enabled.sh" ]; then
+  # shellcheck source=/dev/null
+  source "$SCRIPTS/lib/enabled.sh"
+  ai_toolkit_enabled || exit 0
+fi
 
 # Drain git's pre-push stdin (the pushed "<local ref> <local sha> <remote ref>
 # <remote sha>" lines) once: the test gate needs the SHA range, while the

@@ -32,6 +32,16 @@
 # Telemetry opt-in gate. When off, touch nothing.
 [ "${AI_TOOLKIT_TELEMETRY:-}" = "1" ] || exit 0
 
+# Global on/off switch (#154): a disabled toolkit implies telemetry-off. This hook
+# deliberately does not source utils.sh (see header), so it checks the resolver
+# directly. When disabled, touch nothing.
+_PSE_ENABLED="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/enabled.sh"
+if [ -f "$_PSE_ENABLED" ]; then
+  # shellcheck source=/dev/null
+  . "$_PSE_ENABLED"
+  ai_toolkit_enabled || exit 0
+fi
+
 # Without jq we cannot safely read the payload; degrade to a no-op.
 command -v jq >/dev/null 2>&1 || exit 0
 

@@ -190,12 +190,31 @@ def base_branch(config: dict) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def enabled(config: dict) -> bool:
+    """Whether toolkit enforcement is on by default (issue #154).
+
+    Defaults to True when the key is absent or blank, so an un-migrated config
+    keeps today's full enforcement. Accepts a YAML bool or a string; only an
+    explicit false-y value (false/0/off/no/disabled, case-insensitive) disables.
+    This is the durable DEFAULT the sync writes to ``git config
+    ai-toolkit.enabled``; the sync-safe quick flip is the git-common-dir marker.
+    """
+    value = config.get("enabled")
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in {"false", "0", "off", "no", "disabled"}
+
+
 def _cli(argv: list[str]) -> str:
     """Emit a config value for sync-to-repo.sh to consume (see :func:`main`)."""
     command = argv[1] if len(argv) > 1 else ""
     config = load_config(argv[2] if len(argv) > 2 else None)
     if command == "base-branch":
         return base_branch(config)
+    if command == "enabled":
+        return "true" if enabled(config) else "false"
     if command == "spoke-env":
         spec = spoke_model(config) or ("claude-opus-4-8[1m]", DEFAULT_EFFORT)
         # shell-quote the values: worktree-new.sh sources / evals this output, so
@@ -218,16 +237,17 @@ def _cli(argv: list[str]) -> str:
             lines.append(f"AI_TOOLKIT_BATCH_STAGGER={shlex.quote(str(stagger))}")
         return "\n".join(lines)
     raise SystemExit(
-        f"ai_toolkit_config: unknown command {command!r} (base-branch|spoke-env|batch-env)"
+        f"ai_toolkit_config: unknown command {command!r} (base-branch|enabled|spoke-env|batch-env)"
     )
 
 
 def main() -> None:
-    """CLI: ``ai_toolkit_config.py <base-branch|spoke-env|batch-env> [config-path]``.
+    """CLI: ``ai_toolkit_config.py <base-branch|enabled|spoke-env|batch-env> [config-path]``.
 
     A thin bash-facing seam so sync-to-repo.sh can set ``ai-toolkit.base-branch``
-    and emit the spoke-default env file, and the hub dispatch path can read the
-    batch concurrency cap / stagger, without a YAML parser of their own.
+    and ``ai-toolkit.enabled``, emit the spoke-default env file, and the hub
+    dispatch path can read the batch concurrency cap / stagger, without a YAML
+    parser of their own.
     """
     print(_cli(sys.argv))
 

@@ -899,9 +899,7 @@ def test_collector_warning_when_spoke_live_and_ports_down(
     assert out.index("COLLECTOR DOWN") < out.index("Worktrees")
 
 
-def test_collector_warning_silent_when_collector_up(
-    hub_with_spokes: Path, tmp_path: Path
-) -> None:
+def test_collector_warning_silent_when_collector_up(hub_with_spokes: Path, tmp_path: Path) -> None:
     panes = f"0:3\t{tmp_path / 'pushed'}"
 
     out = _run_hub_status(hub_with_spokes, tmp_path, panes=panes, listening="4317 4318")
@@ -909,17 +907,13 @@ def test_collector_warning_silent_when_collector_up(
     assert "COLLECTOR DOWN" not in out
 
 
-def test_collector_warning_silent_when_no_spoke_pane(
-    hub_with_spokes: Path, tmp_path: Path
-) -> None:
+def test_collector_warning_silent_when_no_spoke_pane(hub_with_spokes: Path, tmp_path: Path) -> None:
     out = _run_hub_status(hub_with_spokes, tmp_path, panes="", listening="")
 
     assert "COLLECTOR DOWN" not in out
 
 
-def test_collector_warning_silent_when_only_hub_pane(
-    hub_with_spokes: Path, tmp_path: Path
-) -> None:
+def test_collector_warning_silent_when_only_hub_pane(hub_with_spokes: Path, tmp_path: Path) -> None:
     # A pane sitting in the hub main checkout is not a live spoke.
     panes = f"0:1\t{hub_with_spokes}"
 
@@ -928,9 +922,7 @@ def test_collector_warning_silent_when_only_hub_pane(
     assert "COLLECTOR DOWN" not in out
 
 
-def test_collector_warning_fires_when_one_port_dark(
-    hub_with_spokes: Path, tmp_path: Path
-) -> None:
+def test_collector_warning_fires_when_one_port_dark(hub_with_spokes: Path, tmp_path: Path) -> None:
     # Both ports are load-bearing (gRPC traces + OTLP-HTTP cycle spans): 4317
     # up with 4318 dark must still warn, naming the dark port.
     panes = f"0:3\t{tmp_path / 'pushed'}"
@@ -941,11 +933,39 @@ def test_collector_warning_fires_when_one_port_dark(
     assert "4318" in out
 
 
-def test_collector_warning_respects_explicit_optout(
-    hub_with_spokes: Path, tmp_path: Path
-) -> None:
+def test_collector_warning_respects_explicit_optout(hub_with_spokes: Path, tmp_path: Path) -> None:
     panes = f"0:3\t{tmp_path / 'pushed'}"
 
     out = _run_hub_status(hub_with_spokes, tmp_path, panes=panes, listening="", otel="0")
 
     assert "COLLECTOR DOWN" not in out
+
+
+# ── Global on/off switch banner (issue #154) ────────────────────────
+
+
+def _disable_toolkit(hub: Path) -> None:
+    """Drop the off marker at the hub's git-common-dir (disables the toolkit)."""
+    common = Path(_git(hub, "rev-parse", "--git-common-dir").strip())
+    if not common.is_absolute():
+        common = (hub / common).resolve()
+    (common / "ai-toolkit-off").write_text("")
+
+
+def test_off_banner_shown_when_disabled(hub_with_spokes: Path, tmp_path: Path) -> None:
+    """When the toolkit is disabled, hub-status leads with a loud AI-TOOLKIT OFF
+    banner so a forgotten `off` can't silently ship gutted code to main (#154)."""
+    _disable_toolkit(hub_with_spokes)
+
+    out = _run_hub_status(hub_with_spokes, tmp_path)
+
+    assert "AI-TOOLKIT OFF" in out
+    # It must LEAD — before the worktree survey (mirrors the collector-down test).
+    assert out.index("AI-TOOLKIT OFF") < out.index("Worktrees")
+
+
+def test_no_off_banner_when_enabled(hub_with_spokes: Path, tmp_path: Path) -> None:
+    """Nothing about the switch is shown when the toolkit is enabled (the default)."""
+    out = _run_hub_status(hub_with_spokes, tmp_path)
+
+    assert "AI-TOOLKIT OFF" not in out

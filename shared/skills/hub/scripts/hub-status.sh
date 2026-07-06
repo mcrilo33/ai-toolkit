@@ -33,7 +33,22 @@ else
   default_branch="${default_branch:-main}"
 fi
 
+# Global on/off switch (#154): source the canonical resolver from the same two
+# layouts, so hub-status can flag a disabled toolkit.
+for _cand in "$_script_dir/enabled.sh" "$_script_dir/../../../hooks/lib/enabled.sh"; do
+  if [ -f "$_cand" ]; then . "$_cand"; break; fi
+done
+unset _cand
+
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
+
+# Lead with a LOUD banner when the toolkit is disabled, so a forgotten `off`
+# can't silently ship ungated/gutted code to the default branch (#154).
+if command -v ai_toolkit_enabled >/dev/null 2>&1 && ! ai_toolkit_enabled "$main_root"; then
+  printf '\033[1;31m⚠ AI-TOOLKIT OFF — gates/guards/telemetry bypassed\033[0m\n'
+  printf '\033[1;31m  Commits/pushes on every worktree of this clone are UNGATED. Re-enable: ai-toolkit on\033[0m\n'
+  echo
+fi
 
 # todos_for_path <worktree-path>
 # Reads the newest .jsonl from the spoke's Claude project dir and returns

@@ -22,6 +22,18 @@
 # wt_base_branch resolver in shared/hooks/lib/base-branch.sh (issue #117).
 base_branch:
 
+# Global on/off switch (issue #154). The master toggle for ALL toolkit
+# enforcement + capture: the pre-push/commit-msg git gates, the CC scope guards,
+# marker emission, and telemetry. `true` (default, or absent) keeps today's full
+# enforcement; `false` makes every git + CC hook pass through so you can commit/
+# push freely on your own branch. Sync materializes this into
+# `git config ai-toolkit.enabled` (the durable, version-pinnable DEFAULT). For a
+# quick, sync-safe flip that survives re-syncs, use `ai-toolkit off` / `ai-toolkit
+# on` (drops/removes a <git-common-dir> marker that WINS over this default).
+# Keep the value on its own line — an inline `# comment` after it is NOT stripped
+# by the sync parser and would be read as part of the value.
+enabled: true
+
 # Hub batch/dispatch hardening (issue #151). Caps how many spokes the hub runs
 # concurrently across /next-batch and /afk, so wide parallelism can't drive load
 # high enough to starve the co-located Langfuse (the #151 telemetry-loss trigger).

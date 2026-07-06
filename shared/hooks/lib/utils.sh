@@ -11,6 +11,18 @@ set -euo pipefail
 # files are synced together into the same hooks/lib/ dir — and arm the per-hook
 # span so every hook that sources utils.sh emits one kind=hook span at exit.
 _UTILS_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Global on/off switch (issue #154): source the canonical resolver FIRST and, when
+# the toolkit is disabled, pass through — exit 0 before ANY enforcement runs and,
+# critically, before telemetry_arm_hook_span, so "off" also means telemetry-off.
+# Every CC guard/marker hook sources utils.sh, so this one check no-ops them all.
+# Sourced defensively (like the native hook wrapper): a stale install predating
+# #154 lacks enabled.sh, and a missing switch must degrade to ENABLED (enforcement
+# stays on — the safe direction), never crash every git op on a missing file.
+if [ -f "$_UTILS_LIB_DIR/enabled.sh" ]; then
+  # shellcheck source=enabled.sh
+  source "$_UTILS_LIB_DIR/enabled.sh"
+  ai_toolkit_enabled || exit 0
+fi
 # shellcheck source=telemetry.sh
 source "$_UTILS_LIB_DIR/telemetry.sh"
 telemetry_arm_hook_span
