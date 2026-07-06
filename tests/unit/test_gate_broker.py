@@ -231,3 +231,119 @@ def test_inject_and_verify_registers_when_transcript_advances(
     )
 
     assert result.stdout.strip().splitlines()[-1] == "RC=0", result.stdout + result.stderr
+
+
+# ── subtask B: read-only-worktree reasoner + evidence + mutation guard ─────────
+
+
+def test_reasoner_allowed_tools_are_read_only() -> None:
+    # The reasoner runs the code-review/Explore posture: Read/Grep/Glob (+ a narrow
+    # read-only git helper), NEVER Edit/Write/NotebookEdit. The guard rejects any
+    # mutating tool or a bare unrestricted Bash.
+    tools = _call("reasoner_allowed_tools")
+    assert tools.returncode == 0, tools.stderr
+    listed = tools.stdout.strip()
+    assert "Read" in listed and "Grep" in listed and "Glob" in listed
+    for banned in ("Edit", "Write", "NotebookEdit", "MultiEdit"):
+        assert banned not in listed, f"{banned} must not be in the reasoner allowlist: {listed}"
+
+    ok = _call('assert_readonly_tools "$(reasoner_allowed_tools)"; echo RC=$?')
+    assert ok.stdout.strip().splitlines()[-1] == "RC=0", ok.stdout + ok.stderr
+
+    for bad in ("Read,Write", "Read,Bash", "Edit"):
+        rej = _call(f'assert_readonly_tools "{bad}"; echo RC=$?', env={})
+        assert rej.stdout.strip().splitlines()[-1] == "RC=1", f"{bad} must be rejected"
+
+
+def test_worktree_fingerprint_detects_mutation(spoke_repo: Path) -> None:
+    # A content fingerprint of the LIVE worktree (tracked + untracked, not just HEAD):
+    # stable across a no-op, changes on a new file AND on a content edit of a file.
+    (spoke_repo / "a.txt").write_text("one")
+    fp1 = _call(f"_broker_worktree_fingerprint '{spoke_repo}'").stdout.strip()
+    fp1b = _call(f"_broker_worktree_fingerprint '{spoke_repo}'").stdout.strip()
+    assert fp1 and fp1 == fp1b, "fingerprint must be deterministic"
+
+    (spoke_repo / "b.txt").write_text("two")
+    fp2 = _call(f"_broker_worktree_fingerprint '{spoke_repo}'").stdout.strip()
+    assert fp2 != fp1, "a new untracked file must change the fingerprint"
+
+    (spoke_repo / "a.txt").write_text("one-edited")
+    fp3 = _call(f"_broker_worktree_fingerprint '{spoke_repo}'").stdout.strip()
+    assert fp3 != fp2, "a content edit of an existing file must change the fingerprint"
+
+
+def test_reasoner_runs_in_worktree_cwd(spoke_repo: Path, tmp_path: Path) -> None:
+    # The reasoner is seeded with cwd = the spoke's worktree so its read-only tools
+    # verify against real state. A `pwd` answerer proves the cwd.
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+    real = subprocess.run(
+        ["bash", "-c", "cd '%s' && pwd -P" % spoke_repo], capture_output=True, text=True
+    ).stdout.strip()
+
+    result = _call(
+        f"run_answerer 5 'q' '{spoke_repo}'",
+        env={"AFK_ANSWERER_CMD": "pwd -P", "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+
+    assert real in result.stdout, f"reasoner cwd should be the worktree: {result.stdout}"
+
+
+def test_broker_service_gate_voids_answer_when_reasoner_mutates_worktree(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str]
+) -> None:
+    # The read-only guard: a reasoner that mutates the live worktree has its answer
+    # VOIDED and the gate escalated (unattended) — a mutation is never trusted, even
+    # when the reasoner also emitted a plausible ANSWER.
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": "touch pwned-by-reasoner; printf 'ANSWER: go ahead'",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    log = Path(env["_READY_LOG"]).read_text()
+    assert "--blocked 5" in log, f"a worktree mutation must escalate, not inject: {log}"
+    assert "worktree" in log.lower() or "mutat" in log.lower(), log
+
+
+def test_reasoner_prompt_has_readonly_posture_and_evidence(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+
+    result = _call(
+        "build_answerer_prompt 5 'Which store?' '/some/worktree'",
+        env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    low = result.stdout.lower()
+    assert "read-only" in low, "the prompt must state the reasoner has read-only worktree access"
+    assert "evidence" in low, "the prompt must ask the reasoner to cite worktree evidence"
+    assert "prior gate decisions" in low or "decisions-digest" in low, "digest section missing"
+
+
+def test_read_decisions_digest_reflects_prior_outcomes(spoke_repo: Path, tmp_path: Path) -> None:
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    # The decisions log line format shared with subtask D's writer:
+    # <ts>\t<issue>\t<gate_type>\t<signature>\t<decision>
+    (statedir / "decisions.log").write_text(
+        "1700000000\t5\tpermission\tgit-reset-self-stage\tAPPROVE\n"
+        "1700000001\t9\tplan\tsome-other\tANSWER\n"
+    )
+    env = {"AFK_STATE_DIR": str(statedir)}
+
+    hit = _call("read_decisions_digest 5", env=env)
+    assert hit.returncode == 0, hit.stderr
+    assert "git-reset-self-stage" in hit.stdout, hit.stdout
+    assert "some-other" not in hit.stdout, "digest must be scoped to this spoke's issue"
+
+    miss = _call("read_decisions_digest 5", env={"AFK_STATE_DIR": str(tmp_path / "empty")})
+    assert miss.returncode == 0, miss.stderr
+    assert miss.stdout.strip() == "", "no log ⇒ empty digest (D populates it)"
