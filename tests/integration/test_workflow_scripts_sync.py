@@ -53,6 +53,11 @@ SOURCES["hub-otel-watch.sh"] = HUB_SCRIPTS_DIR / "hub-otel-watch.sh"
 # The unattended-drain supervisor (issue #71) and the batch planner (issue #70)
 # ship so /afk and /next-batch resolve in a synced target like their siblings.
 SOURCES["hub-afk.sh"] = HUB_SCRIPTS_DIR / "hub-afk.sh"
+# The shared gate-broker core (issue #155) MUST install alongside hub-afk.sh: the
+# supervisor hard-depends on sourcing it as a co-located sibling ($SCRIPT_DIR) — if it
+# is absent from .ai-toolkit/scripts/ every synced /afk drain fails at startup, unable
+# to resolve log()/afk_now()/broker_service_gate.
+SOURCES["gate-broker.sh"] = HUB_SCRIPTS_DIR / "gate-broker.sh"
 SOURCES["batch-plan.sh"] = HUB_SCRIPTS_DIR / "batch-plan.sh"
 # Co-installed so the worktree scripts can source it as a sibling for lifecycle
 # telemetry (it also lives under .claude/hooks/lib/ for the hooks).
