@@ -5052,3 +5052,21 @@ def test_reap_pass_halts_on_dead_auth_instead_of_reaping(tmp_path: Path) -> None
     assert "--blocked" not in blocked, (
         "a dead-auth reap must NOT block the spoke — the halt-all path owns it"
     )
+
+
+# ── issue #175: the kickoff instructs the spoke to hand its plan to --gate ─────
+# The gate-broker now reads the plan from a scripted artifact (spoke-ready.sh --gate
+# writes <wt>/.ai-toolkit/gate-<N>.md) instead of the transcript. For that channel to
+# carry anything, the spoke must PASS its plan when it emits the gate marker, so the
+# afk kickoff spells that out.
+
+
+def test_kickoff_instructs_gate_plan_passthrough() -> None:
+    result = _call("kickoff_for 42")
+
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+    assert "spoke-ready.sh --gate 42" in out, "the kickoff still names the gate marker command"
+    assert "--plan-file" in out or "-m " in out, (
+        "the kickoff must instruct passing the plan to --gate (--plan-file or -m)"
+    )
