@@ -19,6 +19,8 @@ import urllib.parse
 from collections.abc import Sequence
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from telemetry.langfuse_spoke_tree import (
@@ -31,6 +33,7 @@ from telemetry.langfuse_spoke_tree import (
     ToolContent,
     _copy_id,
     _decomp_metadata,
+    _is_own_output,
     apply_llm_decomposition,
     apply_mode_lane_tags,
     apply_request_body_metadata,
@@ -45,6 +48,7 @@ from telemetry.langfuse_spoke_tree import (
     fetch_session,
     find_request_files,
     prefix_total,
+    purge_own_views,
     read_mode_lane,
     request_context_rows,
     root_id_for,
@@ -1631,6 +1635,37 @@ class TestExcludesOwnOutput:
         # Only the native traces survive; the synthetic observations were never sourced.
         assert fetched == [(tid, obs) for tid, _name, obs in native]
 
+    def test_fetch_session_drops_prior_view_b_trace(self) -> None:
+        # #156: View B (spokecycle-<id>, name spoke-cycle:<id>) also carries
+        # sessionId == spoke_run_id, so a rebuild would source its ~2,100 copies as if
+        # native and multiply them. It must be self-excluded exactly like View A.
+        native = [(tid, None, obs) for tid, obs in _traces()]
+        prior_b = (
+            cycle_trace_id_for(SESSION),
+            f"spoke-cycle:{SESSION}",
+            [_obs("cyc-y", "Bash")],
+        )
+        prior_b_old = ("spokecycle-legacy", f"spoke-cycle:{SESSION}", [_obs("cyc-z", "Bash")])
+
+        fetched = fetch_session(SESSION, _stub_get([*native, prior_b, prior_b_old]))
+
+        assert fetched == [(tid, obs) for tid, _name, obs in native]
+
+    def test_is_own_output_excludes_view_b_by_id(self) -> None:
+        trace = {"id": cycle_trace_id_for(SESSION), "name": None}
+
+        assert _is_own_output(trace, SESSION) is True
+
+    def test_is_own_output_excludes_view_b_by_name(self) -> None:
+        trace = {"id": "spokecycle-legacy", "name": f"spoke-cycle:{SESSION}"}
+
+        assert _is_own_output(trace, SESSION) is True
+
+    def test_is_own_output_keeps_a_native_trace(self) -> None:
+        trace = {"id": "trace-native", "name": "claude_code.interaction"}
+
+        assert _is_own_output(trace, SESSION) is False
+
     def test_rerun_with_prior_output_in_session_is_idempotent(self) -> None:
         target_id = trace_id_for(SESSION)
         native = [(tid, None, obs) for tid, obs in _traces()]
@@ -1704,6 +1739,122 @@ class TestFetchSession:
         result = fetch_session("sess", lambda path: pages[path])
 
         assert result == [("tr-a", [{"id": "o1"}]), ("tr-b", [{"id": "o2"}])]
+
+
+def _traces_page(*ids: str) -> dict:
+    """A single-page /traces response listing the given trace ids."""
+    return {"data": [{"id": tid} for tid in ids], "meta": {"totalPages": 1}}
+
+
+class TestPurgeOwnViews:
+    """#156: --rebuild deletes the two deterministic view traces, then polls them gone."""
+
+    def test_deletes_both_view_ids_then_polls_until_gone(self) -> None:
+        a_id, b_id = trace_id_for(SESSION), cycle_trace_id_for(SESSION)
+        deleted: list[list[str]] = []
+        sleeps: list[float] = []
+        # First poll still lists both views (async delete not yet applied); second is clean.
+        responses = iter([_traces_page(a_id, b_id, "native"), _traces_page("native")])
+
+        purge_own_views(
+            SESSION,
+            lambda _path: next(responses),
+            deleted.append,
+            sleep=sleeps.append,
+        )
+
+        assert deleted == [[a_id, b_id]]
+        assert len(sleeps) == 1  # slept once between the present→gone polls
+
+    def test_returns_immediately_when_views_already_absent(self) -> None:
+        deleted: list[list[str]] = []
+        sleeps: list[float] = []
+
+        purge_own_views(
+            SESSION,
+            lambda _path: _traces_page("native"),
+            deleted.append,
+            sleep=sleeps.append,
+        )
+
+        assert len(deleted) == 1  # delete is always issued (idempotent no-op server-side)
+        assert sleeps == []  # already gone → no polling wait
+
+    def test_raises_when_views_never_disappear(self) -> None:
+        a_id = trace_id_for(SESSION)
+
+        with pytest.raises(RuntimeError, match="not deleted"):
+            purge_own_views(
+                SESSION,
+                lambda _path: _traces_page(a_id),
+                lambda _ids: None,
+                sleep=lambda _s: None,
+                attempts=3,
+            )
+
+
+class TestRebuildIdempotency:
+    """#156: a rebuild with prior views in the store is byte-identical to a fresh build."""
+
+    def test_build_batch_byte_identical_with_prior_views_present(self) -> None:
+        native = [(tid, None, obs) for tid, obs in _traces()]
+        prior_a = (trace_id_for(SESSION), f"spoke-tree:{SESSION}", [_obs("spokeroot-x", "spoke:x")])
+        prior_b = (cycle_trace_id_for(SESSION), f"spoke-cycle:{SESSION}", [_obs("cyc-y", "Bash")])
+
+        fresh = build_batch(fetch_session(SESSION, _stub_get(native)), SESSION)
+        rebuilt = build_batch(
+            fetch_session(SESSION, _stub_get([*native, prior_a, prior_b])), SESSION
+        )
+
+        assert json.dumps(rebuilt) == json.dumps(fresh)
+
+    def test_build_cycle_batch_byte_identical_with_prior_views_present(self) -> None:
+        native = [(tid, None, obs) for tid, obs in _traces()]
+        prior_a = (trace_id_for(SESSION), f"spoke-tree:{SESSION}", [_obs("spokeroot-x", "spoke:x")])
+        prior_b = (cycle_trace_id_for(SESSION), f"spoke-cycle:{SESSION}", [_obs("cyc-y", "Bash")])
+
+        fresh = build_cycle_batch(fetch_session(SESSION, _stub_get(native)), SESSION)
+        rebuilt = build_cycle_batch(
+            fetch_session(SESSION, _stub_get([*native, prior_a, prior_b])), SESSION
+        )
+
+        assert json.dumps(rebuilt) == json.dumps(fresh)
+
+
+class TestSchemaRev:
+    """#156: both view trace-create bodies stamp a schema_rev so a consumer can tell
+    which builder generation produced a stored view."""
+
+    def test_view_a_trace_create_carries_schema_rev(self) -> None:
+        batch = build_batch(_traces(), SPOKE)
+
+        assert isinstance(batch[0]["body"]["metadata"]["schema_rev"], int)
+
+    def test_view_b_trace_create_carries_schema_rev(self) -> None:
+        batch = build_cycle_batch(_traces(), SPOKE)
+
+        assert isinstance(batch[0]["body"]["metadata"]["schema_rev"], int)
+
+    def test_both_views_stamp_the_same_schema_rev(self) -> None:
+        a_batch = build_batch(_traces(), SPOKE)
+        b_batch = build_cycle_batch(_traces(), SPOKE)
+
+        assert (
+            a_batch[0]["body"]["metadata"]["schema_rev"]
+            == b_batch[0]["body"]["metadata"]["schema_rev"]
+        )
+
+    def test_schema_rev_survives_mode_lane_tagging(self) -> None:
+        # apply_mode_lane_tags merges mode/lane into the same body.metadata via setdefault;
+        # schema_rev must coexist, not be clobbered.
+        batch = build_batch(_traces(), SPOKE)
+
+        apply_mode_lane_tags(batch, "afk", "spoke")
+
+        metadata = batch[0]["body"]["metadata"]
+        assert isinstance(metadata["schema_rev"], int)
+        assert metadata["mode"] == "afk"
+        assert metadata["lane"] == "spoke"
 
 
 def _tool_obs(obs_id: str, name: str, tool_use_id: str, **extra) -> dict:

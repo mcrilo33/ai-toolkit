@@ -55,11 +55,16 @@ info() { printf '%s: %s\n' "$PROG" "$*"; }
 #                           was lost to a transient Langfuse outage.
 WT_DIR=""
 ARG_SPOKE_ID=""
+# --rebuild (issue #156): purge the two prior view traces and wait until they are gone
+# before re-posting, so a view-shape change fully replaces stale span bodies. Threaded
+# straight through to the view builder.
+REBUILD=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --spoke-run-id)   [ "$#" -ge 2 ] || { warn "--spoke-run-id needs a value"; exit 0; }
                       ARG_SPOKE_ID="$2"; shift 2 ;;
     --spoke-run-id=*) ARG_SPOKE_ID="${1#--spoke-run-id=}"; shift ;;
+    --rebuild)        REBUILD="--rebuild"; shift ;;
     --)               shift; break ;;
     -*)               warn "unknown option: $1 — skipping Langfuse ingestion"; exit 0 ;;
     *)                [ -z "$WT_DIR" ] || { warn "unexpected extra argument: $1"; exit 0; }
@@ -167,6 +172,7 @@ BUILD_ARGS=("$TELEMETRY_DIR/langfuse_spoke_tree.py" "$SPOKE_RUN_ID")
 if [ -n "$BODY_DIR" ]; then
   BUILD_ARGS+=(--request-bodies "$BODY_DIR" --root "$WT_DIR")
 fi
+[ -n "$REBUILD" ] && BUILD_ARGS+=("$REBUILD")
 run_step "loaded-context itemization (#87)" "${BUILD_ARGS[@]}"
 
 exit 0

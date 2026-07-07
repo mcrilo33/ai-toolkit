@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from telemetry.langfuse_rollup import (
     build_tree,
+    make_delete,
     rollup_event,
     rollup_session,
     rollup_trace,
@@ -286,3 +287,43 @@ def test_rollup_session_patches_only_containers() -> None:
     assert patched == 1
     assert get.paths[0].startswith("/traces?sessionId=spoke-123")
     assert [e["body"]["id"] for e in post.batches[0]] == ["interaction"]
+
+
+# --- bulk trace delete (issue #156) ------------------------------------------
+
+
+def test_make_delete_issues_bulk_delete_with_trace_ids(monkeypatch: Any) -> None:
+    # Arrange: capture the urllib Request the delete builds instead of hitting the network.
+    import json
+    import urllib.request
+
+    captured: dict[str, Any] = {}
+
+    class _Resp:
+        def __enter__(self) -> _Resp:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b""
+
+    def fake_urlopen(request: urllib.request.Request, timeout: int = 0) -> _Resp:
+        captured["method"] = request.get_method()
+        captured["url"] = request.full_url
+        captured["auth"] = request.headers.get("Authorization")
+        captured["body"] = json.loads(request.data.decode())
+        return _Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    delete = make_delete("http://localhost:3000", "Basic abc")
+
+    # Act
+    delete(["spoketree-1", "spokecycle-1"])
+
+    # Assert: a DELETE to the bulk traces endpoint carrying the ids under "traceIds".
+    assert captured["method"] == "DELETE"
+    assert captured["url"] == "http://localhost:3000/api/public/traces"
+    assert captured["auth"] == "Basic abc"
+    assert captured["body"] == {"traceIds": ["spoketree-1", "spokecycle-1"]}

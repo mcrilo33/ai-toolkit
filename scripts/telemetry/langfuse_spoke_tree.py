@@ -135,17 +135,21 @@ import logging
 import os
 import re
 import sys
+import time
 import urllib.parse
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
 from telemetry.langfuse_rollup import (
+    DeleteFn,
     GetFn,
     Observation,
     PostFn,
     all_observations,
     build_tree,
+    make_delete,
     make_get,
     make_post,
     rollup_metadata,
@@ -217,6 +221,16 @@ _INGEST_TIMESTAMP = "2026-01-01T00:00:00Z"
 _PAGE_LIMIT = 100
 # Max ingestion events per POST, to keep each request small.
 _CHUNK_SIZE = 100
+
+# Builder generation stamped into both trace-create bodies (#156) so a consumer can tell
+# which builder produced a stored view. Bump on any change to the assembled view shape.
+_SCHEMA_REV = 1
+
+# --rebuild purge poll (#156): a bulk trace delete is asynchronous on the Langfuse server,
+# so after issuing it we poll the session listing until both view traces are gone before
+# re-posting. Give up (raise) after the budget rather than re-post over a half-deleted trace.
+_PURGE_POLL_ATTEMPTS = 30
+_PURGE_POLL_INTERVAL = 1.0
 
 # Observation fields copied verbatim into the assembled trace when present.
 _COPIED_FIELDS = ("input", "output", "usageDetails", "costDetails", "metadata", "model", "level")
@@ -1787,6 +1801,7 @@ def build_batch(
             "name": _TRACE_NAME_PREFIX + spoke_run_id,
             "sessionId": spoke_run_id,
             "timestamp": base_ts,
+            "metadata": {"schema_rev": _SCHEMA_REV},
         },
     }
     root_event: IngestEvent = {
@@ -2123,6 +2138,7 @@ def build_cycle_batch(
             "name": _CYCLE_TRACE_NAME_PREFIX + spoke_run_id,
             "sessionId": spoke_run_id,
             "timestamp": base_ts,
+            "metadata": {"schema_rev": _SCHEMA_REV},
         },
     }
     root_event: IngestEvent = {
@@ -2183,24 +2199,26 @@ def all_traces(spoke_run_id: str, get: GetFn) -> list[dict[str, Any]]:
     return out
 
 
-def _is_own_output(trace: dict[str, Any], target_trace_id: str) -> bool:
+def _is_own_output(trace: dict[str, Any], spoke_run_id: str) -> bool:
     """Whether a fetched session trace is this synthesizer's own assembled output.
 
-    The assembled trace carries ``sessionId == spoke_run_id``, so on a re-run it reappears in
-    the session listing; sourcing it would copy its spans again and multiply the tree. It is
-    recognised by its deterministic id or, defensively for older ids, its ``spoke-tree:`` name.
+    Both assembled views — View A (``spoketree-``, ``spoke-tree:``) and View B
+    (``spokecycle-``, ``spoke-cycle:``) — carry ``sessionId == spoke_run_id``, so on a
+    re-run they reappear in the session listing; sourcing either would copy its spans again
+    and multiply the tree (#156). Each is recognised by its deterministic id or, defensively
+    for older ids, its ``spoke-tree:`` / ``spoke-cycle:`` name prefix.
 
     Args:
         trace: A trace dict as returned by the Langfuse traces endpoint.
-        target_trace_id: The deterministic id of this spoke's assembled tree.
+        spoke_run_id: The spoke run id whose assembled views must be excluded.
 
     Returns:
         True when the trace is the synthesizer's own output and must be excluded.
     """
-    if trace.get("id") == target_trace_id:
+    if trace.get("id") in {trace_id_for(spoke_run_id), cycle_trace_id_for(spoke_run_id)}:
         return True
     name = trace.get("name") or ""
-    return name.startswith(_TRACE_NAME_PREFIX)
+    return name.startswith((_TRACE_NAME_PREFIX, _CYCLE_TRACE_NAME_PREFIX))
 
 
 def fetch_session(spoke_run_id: str, get: GetFn) -> list[TraceObservations]:
@@ -2217,13 +2235,52 @@ def fetch_session(spoke_run_id: str, get: GetFn) -> list[TraceObservations]:
     Returns:
         Each native trace id paired with its observations (full fields), in fetch order.
     """
-    target_trace_id = trace_id_for(spoke_run_id)
     traces = [
-        trace
-        for trace in all_traces(spoke_run_id, get)
-        if not _is_own_output(trace, target_trace_id)
+        trace for trace in all_traces(spoke_run_id, get) if not _is_own_output(trace, spoke_run_id)
     ]
     return [(trace["id"], all_observations(trace["id"], get)) for trace in traces]
+
+
+def purge_own_views(
+    spoke_run_id: str,
+    get: GetFn,
+    delete: DeleteFn,
+    *,
+    attempts: int = _PURGE_POLL_ATTEMPTS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Bulk-delete this spoke's two assembled view traces and wait until they are gone (#156).
+
+    Builder output is first-write-wins on the deterministic observation ids, so a re-post
+    never refreshes stale span bodies — the two view traces must be purged first. The delete
+    is asynchronous on the Langfuse server, so this polls the session listing until neither
+    View A (``spoketree-``) nor View B (``spokecycle-``) trace is present before returning,
+    letting the caller re-post onto a clean slate.
+
+    Args:
+        spoke_run_id: The spoke run id whose two view traces are purged.
+        get: Path-to-JSON fetcher (see :data:`telemetry.langfuse_rollup.GetFn`).
+        delete: Bulk trace-deleter (see :data:`telemetry.langfuse_rollup.DeleteFn`).
+        attempts: Max listing polls before giving up.
+        sleep: Wait between polls; injectable for tests.
+
+    Raises:
+        RuntimeError: When the view traces are still listed after ``attempts`` polls — the
+            caller must not re-post over a half-deleted trace.
+    """
+    view_ids = [trace_id_for(spoke_run_id), cycle_trace_id_for(spoke_run_id)]
+    delete(view_ids)
+    view_set = set(view_ids)
+    present: set[str] = view_set
+    for _ in range(attempts):
+        present = {trace["id"] for trace in all_traces(spoke_run_id, get)}
+        if not (view_set & present):
+            return
+        sleep(_PURGE_POLL_INTERVAL)
+    raise RuntimeError(
+        f"view traces for {spoke_run_id} not deleted after {attempts} polls: "
+        f"{sorted(view_set & present)}"
+    )
 
 
 def post_in_chunks(
@@ -3037,6 +3094,14 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--price", type=float, default=_DEFAULT_PRICE, help="Cache-creation USD per token."
     )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help=(
+            "Bulk-delete this spoke's two view traces and wait until they are gone before "
+            "re-posting, so a view-shape change fully replaces stale span bodies (#156)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -3057,6 +3122,10 @@ def main(argv: list[str] | None = None) -> int:
     host = os.environ.get("LANGFUSE_HOST", "http://localhost:3000")
     auth = os.environ["LANGFUSE_BASIC_AUTH"]  # "Basic <base64(pk:sk)>"
     get, post = make_get(host, auth), make_post(host, auth)
+
+    if args.rebuild:
+        logger.info("--rebuild: purging prior views for %s before re-posting", args.spoke_run_id)
+        purge_own_views(args.spoke_run_id, get, make_delete(host, auth))
 
     traces = fetch_session(args.spoke_run_id, get)
     scan_root = transcript_scan_root(args.projects, args.root.resolve())

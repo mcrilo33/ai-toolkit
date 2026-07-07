@@ -383,6 +383,64 @@ def test_degraded_rerun_skips_without_auth(tmp_path: Path) -> None:
     assert "LANGFUSE_BASIC_AUTH" in (result.stdout + result.stderr)
 
 
+# ── --rebuild: purge-then-rebuild is one supported command (issue #156) ───────
+# --rebuild threads through to the view builder, which bulk-deletes the two
+# deterministic view traces and polls them gone before re-posting, so a
+# view-shape change can be applied to an already-ingested spoke.
+
+
+def test_rebuild_flag_passed_to_view_builder(worktree: Path, tmp_path: Path) -> None:
+    # Arrange
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+
+    # Act: --rebuild alongside the land-time worktree invocation
+    result = _run(worktree, bindir, argv=["--rebuild", str(worktree)])
+
+    # Assert: the builder is invoked with --rebuild plus the usual land-time args
+    assert result.returncode == 0, result.stderr
+    (tree,) = runlog.read_text().splitlines()
+    assert "langfuse_spoke_tree.py" in tree
+    assert "--rebuild" in tree
+    assert "--request-bodies" in tree
+
+
+def test_rebuild_flag_passed_in_degraded_rerun(tmp_path: Path) -> None:
+    # Arrange: degraded id-only re-run also honors --rebuild
+    repo = _make_repo(tmp_path, script_dir="scripts")
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+
+    # Act
+    result = _run(
+        tmp_path / "unused-wt",
+        bindir,
+        script=repo / "scripts" / "telemetry-ingest-spoke.sh",
+        argv=["--spoke-run-id", SPOKE_RUN_ID, "--rebuild"],
+    )
+
+    # Assert
+    assert result.returncode == 0, result.stderr
+    (tree,) = runlog.read_text().splitlines()
+    assert "--rebuild" in tree
+    assert SPOKE_RUN_ID in tree
+    assert "--request-bodies" not in tree, "degraded re-run has no raw-bodies to itemize"
+
+
+def test_no_rebuild_flag_by_default(worktree: Path, tmp_path: Path) -> None:
+    # Arrange
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+
+    # Act: the ordinary land-time invocation never passes --rebuild
+    result = _run(worktree, bindir)
+
+    # Assert
+    assert result.returncode == 0, result.stderr
+    (tree,) = runlog.read_text().splitlines()
+    assert "--rebuild" not in tree
+
+
 def test_skips_when_spoke_run_id_missing(worktree: Path, tmp_path: Path) -> None:
     # Arrange: the id file the view builder keys on is gone
     (worktree / ".ai-toolkit" / "spoke-run-id").unlink()
