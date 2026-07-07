@@ -104,12 +104,15 @@ def _run_land(
     stub_python312: bool = False,
     stub_curl: bool = False,
     issue_state: str = "OPEN",
+    pytest_exit: int = 0,
 ) -> tuple[subprocess.CompletedProcess, dict[str, Path]]:
     """Run worktree-land.sh from the hub with logging stubs on PATH.
 
     Stubs `gh`, `tmux`, and `code` (one log line per invocation each), plus a
-    `pytest` stub logging every call — landing must NOT run pytest itself anymore
-    (issue #19): the suite runs once via the pre-push hook on the main push.
+    `pytest` stub logging every call (exiting `pytest_exit`, default 0) — landing
+    runs pytest itself ONLY for the diverged --skip-tests merge-sanity check
+    (issue #174); otherwise the suite runs once via the pre-push hook on the main
+    push (issue #19). `pytest_exit` non-zero models a failing merge-sanity run.
     `tmux_windows` is the line(s) the tmux stub prints for `list-windows`.
     Returns the completed process and the stub logs by name.
 
@@ -148,7 +151,9 @@ def _run_land(
     )
     tmux.chmod(0o755)
     pytest_stub = bindir / "pytest"
-    pytest_stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{logs["pytest"]}"\nexit 0\n')
+    pytest_stub.write_text(
+        f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{logs["pytest"]}"\nexit {pytest_exit}\n'
+    )
     pytest_stub.chmod(0o755)
     if stub_python312:
         py_stub = bindir / "python3.12"
@@ -574,6 +579,67 @@ def test_diverged_merge_still_runs_gate(hub: Path, tmp_path: Path) -> None:
 
     assert proc.returncode == 0, proc.stderr
     assert "TEST_SELECT_SKIP" not in _log_text(env_log)
+
+
+# --- merge-sanity on a diverged --skip-tests land (issue #174) --------------------
+# auto_land trusts the ready-marker green and lands with --skip-tests — correct
+# per-branch, but a DIVERGED land builds a merge commit whose combined tree nobody
+# ever tested. For that one case (--skip-tests AND not a fast-forward) landing runs
+# a bounded merge-sanity check on the merged tree BEFORE pushing: pytest
+# --collect-only (import/collection health) plus the test-select-mapped tests for
+# the merged diff — NEVER the full suite. A failure aborts the land (rolls the merge
+# back); a fast-forward --skip-tests land and manual (no --skip-tests) lands are
+# unchanged.
+
+
+def test_ff_skip_tests_land_runs_no_merge_sanity(hub: Path, tmp_path: Path) -> None:
+    # Fast-forward + --skip-tests: the merged tree IS the already-gated branch tip,
+    # so no merge-sanity check runs — landing invokes no land-side pytest.
+    _make_spoke(hub, tmp_path, "feature/1-ffsane", push=True, ready=True)
+    _install_prepush_stub(hub, exit_code=0)
+
+    proc, logs = _run_land(hub, tmp_path, "1", "--skip-tests")
+
+    assert proc.returncode == 0, proc.stderr
+    assert _log_text(logs["pytest"]) == ""  # no merge-sanity on a fast-forward
+    assert "merge-sanity" not in proc.stdout
+
+
+def test_diverged_skip_tests_land_runs_merge_sanity_and_lands(hub: Path, tmp_path: Path) -> None:
+    # main advanced since the branch's base, so --skip-tests lands a merge commit
+    # whose combined tree was never tested — the bounded merge-sanity check MUST run
+    # (pytest --collect-only) and, on success, the land completes and pushes main.
+    _make_spoke(hub, tmp_path, "feature/1-divsane", push=True, ready=True)
+    _diverge_hub(hub)
+    env_log = tmp_path / "prepush-env.log"
+    _install_prepush_stub(hub, exit_code=0, env_log=env_log)
+
+    proc, logs = _run_land(hub, tmp_path, "1", "--skip-tests")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "--collect-only" in _log_text(logs["pytest"])  # import/collection health ran
+    # The sanity check is land-side and separate from the hook: --skip-tests still
+    # threads TEST_SELECT_SKIP=1 to the push (the hook stays skipped).
+    assert "TEST_SELECT_SKIP=1" in _log_text(env_log)
+    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
+
+
+def test_diverged_skip_tests_merge_sanity_failure_aborts(hub: Path, tmp_path: Path) -> None:
+    # A red merge-sanity run (pytest exits non-zero) aborts the land: the merge is
+    # rolled back, nothing is pushed, and the worktree survives for a re-run.
+    wt = _make_spoke(hub, tmp_path, "feature/1-divred", push=True, ready=True)
+    _diverge_hub(hub)
+    pre_sha = _git(hub, "rev-parse", "HEAD").strip()  # hub tip the land starts from
+    pre_main = _remote_sha(hub, "main")
+    _install_prepush_stub(hub, exit_code=0)
+
+    proc, logs = _run_land(hub, tmp_path, "1", "--skip-tests", pytest_exit=1)
+
+    assert proc.returncode != 0
+    assert "--collect-only" in _log_text(logs["pytest"])  # the sanity check ran
+    assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha  # merge rolled back
+    assert _remote_sha(hub, "main") == pre_main  # nothing pushed
+    assert wt.exists()  # teardown never ran
 
 
 # --- SSH keepalive + retry-once-after-green on the ship push (issue #119) --------
