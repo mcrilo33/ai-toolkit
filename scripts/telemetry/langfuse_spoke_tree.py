@@ -2313,21 +2313,23 @@ def build_batch(
         copies, traces, tool_content, spoke_run_id=spoke_run_id, trace_id=trace_id
     )
     events = [trace_event, root_event, *step_events, *copies]
-    events.extend(
-        _commit_events(
-            commits or [],
-            spoke_run_id=spoke_run_id,
-            trace_id=trace_id,
-            cycle=False,
-            parent_for=lambda _at: root_id,
-        )
+    commit_events = _commit_events(
+        commits or [],
+        spoke_run_id=spoke_run_id,
+        trace_id=trace_id,
+        cycle=False,
+        parent_for=lambda _at: root_id,
     )
+    events.extend(commit_events)
     gate_park = _gate_park_event(
         traces, spoke_run_id=spoke_run_id, trace_id=trace_id, cycle=False, parent_id=root_id
     )
     if gate_park is not None:
         events.append(gate_park)
-    _apply_container_rollups(events, duration_exclude=_hook_event_exclude(events))
+    # Commit instants are excluded from duration: an author time outside the captured span would
+    # otherwise stretch the end-time-less root's subtree interval and inflate total_ms/self.
+    commit_ids = {event["id"] for event in commit_events}
+    _apply_container_rollups(events, duration_exclude=_hook_event_exclude(events) | commit_ids)
     return events
 
 
@@ -2720,27 +2722,25 @@ def build_cycle_batch(
             return root_id
         return step_id_for.get(_cycle_step_for(authored_at, windows), root_id)
 
-    events.extend(
-        _commit_events(
-            commits or [],
-            spoke_run_id=spoke_run_id,
-            trace_id=trace_id,
-            cycle=True,
-            parent_for=_cycle_commit_parent,
-        )
+    commit_events = _commit_events(
+        commits or [],
+        spoke_run_id=spoke_run_id,
+        trace_id=trace_id,
+        cycle=True,
+        parent_for=_cycle_commit_parent,
     )
+    events.extend(commit_events)
     # The park node is a visible block on the axis, but it overlaps the step partition it falls in,
     # so it is EXCLUDED from View B's duration attribution (the axis already partitions the time).
-    gate_exclude: set[str] = set()
+    # Commit instants are likewise excluded so an out-of-window author time cannot stretch the root.
+    duration_exclude = marker_ids | _hook_event_exclude(events) | {e["id"] for e in commit_events}
     gate_park = _gate_park_event(
         traces, spoke_run_id=spoke_run_id, trace_id=trace_id, cycle=True, parent_id=root_id
     )
     if gate_park is not None:
         events.append(gate_park)
-        gate_exclude = {gate_park["id"]}
-    _apply_container_rollups(
-        events, duration_exclude=marker_ids | _hook_event_exclude(events) | gate_exclude
-    )
+        duration_exclude = duration_exclude | {gate_park["id"]}
+    _apply_container_rollups(events, duration_exclude=duration_exclude)
     return events
 
 
@@ -3811,7 +3811,9 @@ def _load_commits(path: Path | None) -> list[dict[str, Any]]:
     if path is None:
         return []
     try:
-        return _parse_commits(path.read_text(encoding="utf-8"))
+        # errors="replace": a commit subject in a non-UTF-8 locale must degrade a glyph, never
+        # crash the land-time view build (the whole ingest step is best-effort).
+        return _parse_commits(path.read_text(encoding="utf-8", errors="replace"))
     except OSError:
         logger.warning("cannot read commits dump %s", path)
         return []
@@ -3888,6 +3890,10 @@ def _gate_park_event(
     The block spans the gate's end to the resumption after approval (:func:`_gate_park_bounds`);
     its ``wait:`` name routes it into the duration ``wait`` bucket, so in View A the park time
     moves out of the root's ``self`` gap without changing ``total_ms``.
+
+    UPGRADE: in the rare case a non-activity span (a second gate, a hook) falls inside the park
+    window, both it and this node book the overlap into ``wait`` (span-time, not wall-time) — carve
+    the node's interval around such spans if the wait bucket ever needs to be exact.
     """
     bounds = _gate_park_bounds(traces)
     if bounds is None:

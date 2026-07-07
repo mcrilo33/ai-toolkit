@@ -4957,6 +4957,26 @@ class TestCommitNodes:
 
         assert first == second
 
+    def test_cycle_double_build_is_byte_identical(self) -> None:
+        first = build_cycle_batch(self._traces(), SPOKE, self._content(), commits=[self._COMMIT])
+        second = build_cycle_batch(self._traces(), SPOKE, self._content(), commits=[self._COMMIT])
+
+        assert first == second
+
+    def test_out_of_window_commit_does_not_inflate_root_duration(self) -> None:
+        # A commit authored long after the last captured span must not stretch the end-time-less
+        # root's subtree interval — commit instants are excluded from duration attribution.
+        far = _commit("f" * 12, "chore: late", "2026-01-02T00:59:00Z", ["z.py"], 1, 0)
+
+        without = build_batch(self._traces(), SPOKE, self._content())
+        withcommit = build_batch(self._traces(), SPOKE, self._content(), commits=[far])
+
+        def _root_total(batch: list[dict]) -> int:
+            root = next(e for e in batch if e["id"] == root_id_for(SPOKE))
+            return root["body"]["metadata"]["rollup"]["duration"]["total_ms"]
+
+        assert _root_total(withcommit) == _root_total(without)
+
 
 class TestGateParkNode:
     """#162: synthesize a wait:gate-park timeline block from the gate-park bounds."""
