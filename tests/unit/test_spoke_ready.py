@@ -56,18 +56,21 @@ def _run(repo: Path, *args: str, env: dict[str, str] | None = None) -> subproces
     )
 
 
-def _stamp_review(repo: Path, *, age_offset: int = 0) -> Path:
+def _stamp_review(
+    repo: Path, *, age_offset: int = 0, verdict: str = "APPROVE", name: str = "review.json"
+) -> Path:
     """Write a ``.review/*.json`` artifact and set its mtime relative to the tip.
 
-    The ready gate's precondition 3 (issue #172, timestamp fallback) accepts a
-    review only when the newest ``.review/*.json`` is at least as new as the tip
+    The ready gate's precondition 3 (issue #172) accepts a review only when a
+    ``.review/*.json`` with an ``APPROVE`` verdict is at least as new as the tip
     commit. ``age_offset`` shifts the artifact's mtime off the HEAD commit time:
     ``0`` sits it exactly on the ``>=`` boundary, a negative value makes it stale.
+    ``verdict`` and ``name`` let a test forge a non-approving or extra artifact.
     """
     review_dir = repo / ".review"
     review_dir.mkdir(exist_ok=True)
-    artifact = review_dir / "review.json"
-    artifact.write_text('{"verdict": "APPROVE"}\n')
+    artifact = review_dir / name
+    artifact.write_text(f'{{"verdict": "{verdict}"}}\n')
     tip = int(_git(repo, "log", "-1", "--format=%ct", "HEAD").strip())
     stamp = tip + age_offset
     os.utime(artifact, (stamp, stamp))
@@ -492,6 +495,45 @@ def test_ready_refused_stale_review_artifact(spoke: Path, remote: Path) -> None:
 
     assert result.returncode != 0, "a stale review artifact must block ready/N"
     assert "review" in (result.stdout + result.stderr).lower()
+
+
+def test_ready_refused_on_request_changes_review(spoke: Path, remote: Path) -> None:
+    # A review artifact is trusted only when it APPROVES. ready/<N> is auto_land's
+    # basis (--skip-tests), so a fresh REQUEST_CHANGES must not satisfy the gate.
+    shutil.rmtree(spoke / ".review")
+    _stamp_review(spoke, verdict="REQUEST_CHANGES")
+
+    result = _run(spoke, "45")
+
+    assert result.returncode != 0, "a REQUEST_CHANGES review must block ready/N"
+    assert "review" in (result.stdout + result.stderr).lower()
+    assert not _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+def test_ready_emitted_when_a_fresh_approve_exists_beside_request_changes(
+    spoke: Path, remote: Path
+) -> None:
+    # A stale/other REQUEST_CHANGES must not veto a fresh APPROVE of the tip.
+    _stamp_review(spoke, verdict="REQUEST_CHANGES", name="old.json", age_offset=-100)
+    _stamp_review(spoke, verdict="APPROVE", name="new.json")
+
+    result = _run(spoke, "45")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+def test_ready_refusal_reports_the_first_unmet_precondition(spoke: Path) -> None:
+    # Dirty tree AND no review: the clean-tree precondition is checked first, so
+    # its message is the one surfaced.
+    shutil.rmtree(spoke / ".review")
+    (spoke / "work.txt").write_text("dirty\n")
+
+    result = _run(spoke, "45")
+
+    assert result.returncode != 0
+    combined = (result.stdout + result.stderr).lower()
+    assert "working tree" in combined and "review" not in combined
 
 
 def test_ready_accepts_review_artifact_on_tip_boundary(spoke: Path, remote: Path) -> None:
