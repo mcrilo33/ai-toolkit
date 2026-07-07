@@ -4185,3 +4185,211 @@ class TestCycleView:
             _by_cycle(batch, "tr", "sk1")["body"]["parentObservationId"]
             == _cycle_step(batch, "preStep")["id"]
         )
+
+
+def _guard(
+    obs_id: str,
+    name: str,
+    *,
+    tool_use_id: str | None = None,
+    start: str,
+    end: str,
+    decision: str = "allow",
+    status: str = "success",
+    **attrs: object,
+) -> dict:
+    """Build a ``.sh`` guard-hook source span with decision/status under metadata['attributes']."""
+    attributes: dict[str, object] = {
+        "workflow.kind": "hook",
+        "decision": decision,
+        "status": status,
+    }
+    if tool_use_id:
+        attributes["tool_use_id"] = tool_use_id
+    attributes.update(attrs)
+    return _obs(
+        obs_id, name, parent=None, startTime=start, endTime=end, metadata={"attributes": attributes}
+    )
+
+
+def _guards_group(batch: list[dict]) -> dict:
+    """Return the single per-tool ``guards`` group node, asserting exactly one exists."""
+    groups = [event for event in batch if event["body"].get("name") == "guards"]
+    assert len(groups) == 1
+    return groups[0]
+
+
+def _session_guards(batch: list[dict]) -> dict:
+    """Return the single root ``guards:session`` group node, asserting exactly one exists."""
+    groups = [event for event in batch if event["body"].get("name") == "guards:session"]
+    assert len(groups) == 1
+    return groups[0]
+
+
+def _guarded_tool_traces() -> list[tuple[str, list[dict]]]:
+    """One turn: a 5s tool with two no-op (allow/success, <1s) ``.sh`` guards sharing its id."""
+    interaction = _obs(
+        "i1",
+        "claude_code.interaction",
+        parent=None,
+        startTime="2026-01-02T00:00:00Z",
+        endTime="2026-01-02T00:00:10Z",
+    )
+    tool = _obs(
+        "t1",
+        "tool:Bash",
+        parent="i1",
+        startTime="2026-01-02T00:00:00Z",
+        endTime="2026-01-02T00:00:05Z",
+        metadata={"attributes": {"tool_use_id": "tu-1"}},
+    )
+    pre = _guard(
+        "h1",
+        "PreToolUse.sh",
+        tool_use_id="tu-1",
+        start="2026-01-02T00:00:00Z",
+        end="2026-01-02T00:00:00.400Z",  # 400ms noop
+    )
+    post = _guard(
+        "h2",
+        "PostToolUse.sh",
+        tool_use_id="tu-1",
+        start="2026-01-02T00:00:04Z",
+        end="2026-01-02T00:00:04.500Z",  # 500ms noop
+    )
+    return [("tr", [interaction, tool, pre, post])]
+
+
+class TestGuardGroups:
+    """#157: `.sh` guard spans join a per-tool ``guards`` group (and a root ``guards:session``);
+    no-op raw spans drop by default but their stats survive in the group's ``by_hook`` rollup."""
+
+    def test_guards_group_created_under_the_tool(self) -> None:
+        batch = build_batch(_guarded_tool_traces(), SPOKE)
+
+        assert _guards_group(batch)["body"]["parentObservationId"] == _copy_id("tr", "t1")
+
+    def test_noop_guards_dropped_by_default(self) -> None:
+        batch = build_batch(_guarded_tool_traces(), SPOKE)
+
+        ids = {event["id"] for event in batch}
+        assert _copy_id("tr", "h1") not in ids
+        assert _copy_id("tr", "h2") not in ids
+
+    def test_keep_noop_guards_retains_children_under_the_group(self) -> None:
+        batch = build_batch(_guarded_tool_traces(), SPOKE, keep_noop_guards=True)
+
+        group_id = _guards_group(batch)["body"]["id"]
+        assert _by_orig(batch, "tr", "h1")["body"]["parentObservationId"] == group_id
+        assert _by_orig(batch, "tr", "h2")["body"]["parentObservationId"] == group_id
+
+    def test_by_hook_rollup_counts_all_raw_including_dropped(self) -> None:
+        batch = build_batch(_guarded_tool_traces(), SPOKE)
+
+        metadata = _guards_group(batch)["body"]["metadata"]
+        assert metadata["count"] == 2
+        assert metadata["total_ms"] == 900
+        assert metadata["by_hook"] == {
+            "PostToolUse.sh": {"count": 1, "ms": 500},
+            "PreToolUse.sh": {"count": 1, "ms": 400},
+        }
+        assert metadata["decisions"] == ["allow"]
+
+    def test_non_allow_guard_kept_even_by_default(self) -> None:
+        interaction, tool, _pre, _post = _guarded_tool_traces()[0][1]
+        deny = _guard(
+            "h3",
+            "PreToolUse.sh",
+            tool_use_id="tu-1",
+            start="2026-01-02T00:00:01Z",
+            end="2026-01-02T00:00:01.200Z",
+            decision="deny",
+        )
+
+        batch = build_batch([("tr", [interaction, tool, deny])], SPOKE)
+
+        assert (
+            _by_orig(batch, "tr", "h3")["body"]["parentObservationId"]
+            == _guards_group(batch)["body"]["id"]
+        )
+
+    def test_slow_allow_guard_kept_even_by_default(self) -> None:
+        interaction, tool, _pre, _post = _guarded_tool_traces()[0][1]
+        slow = _guard(
+            "h4",
+            "PreToolUse.sh",
+            tool_use_id="tu-1",
+            start="2026-01-02T00:00:00Z",
+            end="2026-01-02T00:00:02Z",  # 2s allow/success
+        )
+
+        batch = build_batch([("tr", [interaction, tool, slow])], SPOKE)
+
+        assert (
+            _by_orig(batch, "tr", "h4")["body"]["parentObservationId"]
+            == _guards_group(batch)["body"]["id"]
+        )
+
+    def test_group_body_carries_no_usage_or_model(self) -> None:
+        batch = build_batch(_guarded_tool_traces(), SPOKE)
+
+        body = _guards_group(batch)["body"]
+        assert "usageDetails" not in body
+        assert "model" not in body
+
+    def test_session_guards_group_under_root(self) -> None:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+        )
+        start_hook = _guard(
+            "s1",
+            "SessionStart.sh",
+            start="2026-01-02T00:00:00Z",
+            end="2026-01-02T00:00:00.300Z",
+        )
+        stop_hook = _guard(
+            "s2",
+            "Stop.sh",
+            start="2026-01-02T00:00:09Z",
+            end="2026-01-02T00:00:09.200Z",
+        )
+
+        batch = build_batch([("tr", [interaction, start_hook, stop_hook])], SPOKE)
+
+        session = _session_guards(batch)
+        assert session["body"]["parentObservationId"] == root_id_for(SPOKE)
+        assert session["body"]["metadata"]["count"] == 2
+
+    def test_guards_group_present_in_cycle_view(self) -> None:
+        batch = build_cycle_batch(_guarded_tool_traces(), SPOKE)
+
+        assert len([e for e in batch if e["body"].get("name") == "guards"]) == 1
+
+    def test_double_build_is_byte_identical(self) -> None:
+        first = json.dumps(build_batch(_guarded_tool_traces(), SPOKE))
+        second = json.dumps(build_batch(_guarded_tool_traces(), SPOKE))
+
+        assert first == second
+
+
+class TestGuardGroupDuration:
+    """#157 AC2: the ``hook`` duration bucket reflects real guard time (sum of raw ``.sh``
+    durations), and ``rollup.duration.components`` is identical with --keep-noop-guards on/off."""
+
+    def test_components_identical_keep_noop_on_off(self) -> None:
+        default = build_batch(_guarded_tool_traces(), SPOKE)
+        kept = build_batch(_guarded_tool_traces(), SPOKE, keep_noop_guards=True)
+
+        default_dur = _by_orig(default, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
+        kept_dur = _by_orig(kept, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
+        assert default_dur == kept_dur
+
+    def test_hook_bucket_is_sum_of_raw_guard_durations(self) -> None:
+        batch = build_batch(_guarded_tool_traces(), SPOKE)
+
+        duration = _by_orig(batch, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
+        assert duration["components"]["hook"] == 900
