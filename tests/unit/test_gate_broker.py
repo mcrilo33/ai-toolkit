@@ -305,21 +305,28 @@ def test_broker_service_gate_escalates_when_fingerprint_unavailable(
     assert "fingerprint" in log.lower(), log
 
 
-def test_worktree_fingerprint_detects_mutation(spoke_repo: Path) -> None:
-    # A content fingerprint of the LIVE worktree (tracked + untracked, not just HEAD):
-    # stable across a no-op, changes on a new file AND on a content edit of a file.
+def test_worktree_fingerprint_tracks_only_tracked_content(spoke_repo: Path) -> None:
+    # A content fingerprint of the TRACKED worktree content (issue #168): deterministic
+    # across a no-op, UNCHANGED by a parked spoke's own untracked runtime writes (a
+    # still-finishing push gate's `.testmondata`, OTel dumps under `.ai-toolkit/` — the
+    # false-positive that burned three healthy reasoner runs), and changed ONLY by a
+    # content edit of a tracked file.
     (spoke_repo / "a.txt").write_text("one")
+    subprocess.run(["git", "add", "a.txt"], cwd=spoke_repo, check=True, capture_output=True)
     fp1 = _call(f"_broker_worktree_fingerprint '{spoke_repo}'").stdout.strip()
     fp1b = _call(f"_broker_worktree_fingerprint '{spoke_repo}'").stdout.strip()
     assert fp1 and fp1 == fp1b, "fingerprint must be deterministic"
 
-    (spoke_repo / "b.txt").write_text("two")
+    (spoke_repo / ".testmondata").write_text("push-gate coverage db")
+    (spoke_repo / ".testmondata-shm").write_text("wal")
+    (spoke_repo / ".ai-toolkit" / "raw-bodies").mkdir(parents=True)
+    (spoke_repo / ".ai-toolkit" / "raw-bodies" / "dump.json").write_text("{}")
     fp2 = _call(f"_broker_worktree_fingerprint '{spoke_repo}'").stdout.strip()
-    assert fp2 != fp1, "a new untracked file must change the fingerprint"
+    assert fp2 == fp1, "untracked spoke-runtime writes must NOT drift the fingerprint"
 
     (spoke_repo / "a.txt").write_text("one-edited")
     fp3 = _call(f"_broker_worktree_fingerprint '{spoke_repo}'").stdout.strip()
-    assert fp3 != fp2, "a content edit of an existing file must change the fingerprint"
+    assert fp3 != fp1, "a content edit of a tracked file must change the fingerprint"
 
 
 def test_reasoner_runs_in_worktree_cwd(spoke_repo: Path, tmp_path: Path) -> None:
@@ -341,23 +348,55 @@ def test_reasoner_runs_in_worktree_cwd(spoke_repo: Path, tmp_path: Path) -> None
     assert real in result.stdout, f"reasoner cwd should be the worktree: {result.stdout}"
 
 
-def test_broker_service_gate_voids_answer_when_reasoner_mutates_worktree(
+def test_broker_service_gate_voids_answer_when_reasoner_mutates_tracked_content(
     spoke_repo: Path, waiting_spoke_env: dict[str, str]
 ) -> None:
-    # The read-only guard: a reasoner that mutates the live worktree has its answer
-    # VOIDED and the gate escalated (unattended) — a mutation is never trusted, even
-    # when the reasoner also emitted a plausible ANSWER.
+    # The read-only guard, narrowed to TRACKED content (#168): a reasoner that mutates a
+    # tracked file has its answer VOIDED and the gate escalated (unattended) — a tracked
+    # mutation is never trusted, even alongside a plausible ANSWER. (Untracked runtime
+    # drift no longer voids — see test_broker_service_gate_injects_despite_runtime_drift.)
+    (spoke_repo / "tracked.txt").write_text("original")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=spoke_repo, check=True, capture_output=True)
     env = {
         **waiting_spoke_env,
-        "AFK_ANSWERER_CMD": "touch pwned-by-reasoner; printf 'ANSWER: go ahead'",
+        "AFK_ANSWERER_CMD": "printf 'mutated' > tracked.txt; printf 'ANSWER: go ahead'",
     }
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
 
     assert result.returncode == 0, result.stderr
     log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log, f"a worktree mutation must escalate, not inject: {log}"
+    assert "--blocked 5" in log, f"a tracked mutation must escalate, not inject: {log}"
     assert "worktree" in log.lower() or "mutat" in log.lower(), log
+
+
+def test_broker_service_gate_injects_despite_runtime_drift(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # Issue #168 headline regression: a parked spoke's own push gate writes `.testmondata`
+    # during the reason step. That untracked runtime drift must NOT void a healthy answer —
+    # the guard only cares about tracked content. The answer INJECTS; the gate does NOT
+    # escalate to blocked.
+    fake_bin = tmp_path / "bin"  # the waiting_spoke_env fake bin (holds gh); add tmux
+    jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # pin old so the inject's append advances it
+    tmux_log = _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": "printf x > .testmondata; printf 'ANSWER: use Redis'",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    ready_log = Path(env["_READY_LOG"])
+    ready_text = ready_log.read_text() if ready_log.exists() else ""
+    assert "--blocked" not in ready_text, f"untracked runtime drift must not escalate: {ready_text}"
+    assert "use Redis" in tmux_log.read_text(), (
+        f"the healthy answer must inject despite the .testmondata write: {tmux_log.read_text()}"
+    )
 
 
 def test_reasoner_prompt_has_readonly_posture_and_evidence(tmp_path: Path) -> None:

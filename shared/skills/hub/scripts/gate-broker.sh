@@ -502,17 +502,24 @@ assert_readonly_tools() {
   return 0
 }
 
-# _broker_worktree_fingerprint <wt> -> a content hash of the LIVE worktree: each
-# tracked-or-untracked (non-ignored) file's path + its CURRENT working-tree content. A
-# new file, a deletion, or a content edit all change it. Empty (stable) for a non-git or
-# missing path, so a non-worktree reasoner never trips a false breach.
+# _broker_worktree_fingerprint <wt> -> a content hash of the LIVE worktree's TRACKED
+# content: each tracked (index) file's path + its CURRENT working-tree content. A tracked
+# edit, a staged addition, or a deletion all change it. UNTRACKED files are excluded on
+# purpose (issue #168): a parked spoke is not a frozen worktree — its own still-finishing
+# push gate writes `.testmondata`, OTel dumps land under `.ai-toolkit/`, etc. Those runtime
+# artifacts are not what the land cares about and must not be blamed on the read-only
+# reasoner. A reasoner CREATING a brand-new untracked file is therefore invisible here by
+# design; that surface is covered by PREVENTION (reasoner_allowed_tools / the read-only
+# allowlist — no Write/Edit/bare-Bash), leaving this DETECTION layer as the hard guarantee
+# for TRACKED content, which is all a land commits. Empty (stable) for a non-git or missing
+# path, so a non-worktree reasoner never trips a false breach.
 _broker_worktree_fingerprint() {
   local wt="$1"
   [ -d "$wt" ] || return 0
   (
     cd "$wt" 2>/dev/null || exit 0
     git rev-parse --git-dir >/dev/null 2>&1 || exit 0
-    git ls-files -z --cached --others --exclude-standard 2>/dev/null |
+    git ls-files -z --cached 2>/dev/null |
       while IFS= read -r -d '' f; do
         printf '%s\0' "$f"
         if [ -f "$f" ]; then git hash-object "$f" 2>/dev/null || printf 'ERR'; else printf 'GONE'; fi
