@@ -48,11 +48,13 @@ _DEGENERATE = _FIXTURES / "degenerate.request.json"
 _COMBINED = _FIXTURES / "combined_reminder.request.json"
 
 
-def _reminder_inner(path: Path) -> str:
-    """Return the inner text of the single ``<system-reminder>`` in ``messages[0]``."""
+def _reminder_full(path: Path) -> str:
+    """Return the whole ``<system-reminder>…</system-reminder>`` block in ``messages[0]``."""
     obj = json.loads(path.read_text(encoding="utf-8"))
     text = obj["messages"][0]["content"][0]["text"]
-    return re.search(r"<system-reminder>(.*?)</system-reminder>", text, re.DOTALL).group(1)
+    match = re.search(r"<system-reminder>.*?</system-reminder>", text, re.DOTALL)
+    assert match is not None
+    return match.group(0)
 
 
 def _by_category(items: list[ContextItem], category: str) -> list[ContextItem]:
@@ -175,7 +177,8 @@ def test_turn0_splits_combined_block_per_rule_file() -> None:
 
 def test_turn0_combined_block_split_is_lossless_on_real_fixture() -> None:
     # Arrange: the split items derive wholly from the single combined reminder, so their
-    # token sizes must sum to the reminder's own size — no residue dropped (AC #1).
+    # token sizes must sum to the WHOLE block — the ``<system-reminder>`` wrapper tags
+    # included — with no residue dropped (AC #1). The turn-0 path folds in no remainder.
     parsed = parse_request_obj(json.loads(_COMBINED.read_text(encoding="utf-8")))
     split = [item for item in parsed.items if item.category in {"rules", "skills", "environment"}]
 
@@ -183,8 +186,30 @@ def test_turn0_combined_block_split_is_lossless_on_real_fixture() -> None:
     rows = measure_request_items(split, counter=len, price=1.0)
     split_tokens = sum(cast(int, row["tokens"]) for row in rows)
 
-    # Assert: Σ(split items) == token size of the original reminder block.
-    assert split_tokens == len(_reminder_inner(_COMBINED))
+    # Assert: Σ(split items) == token size of the original reminder block (wrapper and all).
+    assert split_tokens == len(_reminder_full(_COMBINED))
+
+
+def test_turn0_skills_split_conserves_header_and_wrapper() -> None:
+    # Arrange: a lone skills reminder — the pre-skill header and the <system-reminder> tags
+    # must be conserved (as environment), not dropped, since the turn-0 path has no remainder.
+    block = _reminder(
+        "The following skills are available for use with the Skill tool:",
+        "- afk: Drain the backlog unattended.",
+        "- hub: Orient a fresh planning-hub session.",
+    )
+    obj = _body([], [], [_msg("user", block)])
+
+    # Act
+    parsed = parse_request_obj(obj)
+    from_block = [i for i in parsed.items if i.category in {"skills", "environment"}]
+    total = sum(
+        cast(int, r["tokens"]) for r in measure_request_items(from_block, counter=len, price=1.0)
+    )
+
+    # Assert: skills itemized per name and the split is lossless against the whole block.
+    assert {i.name for i in parsed.items if i.category == "skills"} == {"afk", "hub"}
+    assert total == len(block)
 
 
 def test_turn0_split_leaves_cache_boundaries_and_effort_unaffected() -> None:
@@ -239,7 +264,7 @@ def test_effort_parsed_from_output_config() -> None:
 
 def test_effort_absent_is_none() -> None:
     # Arrange: a body with no output_config block at all.
-    obj = {"tools": [], "system": [], "messages": []}
+    obj: dict[str, object] = {"tools": [], "system": [], "messages": []}
 
     # Act
     parsed = parse_request_obj(obj)
