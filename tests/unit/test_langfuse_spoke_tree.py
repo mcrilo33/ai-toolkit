@@ -4769,3 +4769,120 @@ class TestHookEndTimeStamping:
 
         duration = _by_cycle(batch, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
         assert duration == _dur(10_000, {"tool": 5_000, "self": 5_000})
+
+
+class TestFailureLevels:
+    """#157: fold failure data onto Langfuse levels (was all DEFAULT). Tool success=false/error ->
+    ERROR; a guard whose decision is deny/ask/block or whose status != success -> WARNING (span AND
+    its group); hook_execution_complete with num_blocking>0 -> WARNING; blocked-tool:* -> WARNING.
+    Precedence ERROR > WARNING > DEFAULT."""
+
+    def _tool_with_execution(self, **exec_attrs: object) -> list:
+        tool = _obs(
+            "tb", "tool:Bash", parent=None, metadata={"attributes": {"tool_use_id": "tu-1"}}
+        )
+        execu = _obs(
+            "ex",
+            "claude_code.tool.execution",
+            parent="tb",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:01Z",
+            metadata={"attributes": {"tool_use_id": "tu-1", **exec_attrs}},
+        )
+        return [("tr", [tool, execu])]
+
+    def _guarded_tool(self, **guard_attrs: object) -> list:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+        )
+        tool = _obs(
+            "t1",
+            "tool:Bash",
+            parent="i1",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:05Z",
+            metadata={"attributes": {"tool_use_id": "tu-1"}},
+        )
+        guard = _guard(
+            "h1",
+            "PreToolUse.sh",
+            tool_use_id="tu-1",
+            start="2026-01-02T00:00:01Z",
+            end="2026-01-02T00:00:01.200Z",
+            **guard_attrs,
+        )
+        return [("tr", [interaction, tool, guard])]
+
+    def test_tool_success_false_is_error(self) -> None:
+        batch = build_batch(self._tool_with_execution(success=False), SPOKE)
+
+        assert _by_orig(batch, "tr", "tb")["body"]["level"] == "ERROR"
+
+    def test_tool_error_is_error(self) -> None:
+        batch = build_batch(self._tool_with_execution(success=True, error="boom"), SPOKE)
+
+        assert _by_orig(batch, "tr", "tb")["body"]["level"] == "ERROR"
+
+    def test_successful_tool_is_not_error(self) -> None:
+        batch = build_batch(self._tool_with_execution(success=True), SPOKE)
+
+        assert _by_orig(batch, "tr", "tb")["body"].get("level") != "ERROR"
+
+    def test_deny_guard_is_warning_on_span_and_group(self) -> None:
+        batch = build_batch(self._guarded_tool(decision="deny"), SPOKE)
+
+        assert _by_orig(batch, "tr", "h1")["body"]["level"] == "WARNING"
+        assert _guards_group(batch)["body"]["level"] == "WARNING"
+
+    def test_failed_status_guard_is_warning(self) -> None:
+        batch = build_batch(self._guarded_tool(status="failure"), SPOKE)
+
+        assert _by_orig(batch, "tr", "h1")["body"]["level"] == "WARNING"
+        assert _guards_group(batch)["body"]["level"] == "WARNING"
+
+    def test_allow_success_guard_is_not_warning(self) -> None:
+        # A kept-but-benign guard (slow allow/success) must not be flagged.
+        batch = build_batch(self._guarded_tool(), SPOKE, keep_noop_guards=True)
+
+        assert _by_orig(batch, "tr", "h1")["body"].get("level") != "WARNING"
+        assert _guards_group(batch)["body"].get("level") != "WARNING"
+
+    def test_hook_event_num_blocking_is_warning(self) -> None:
+        interaction = _obs("i1", "claude_code.interaction", parent=None)
+        tool = _obs(
+            "t1", "tool:Edit", parent="i1", metadata={"attributes": {"tool_use_id": "tu-1"}}
+        )
+        hook = _obs(
+            "h1",
+            "hook_execution_complete:PreToolUse",
+            type_="EVENT",
+            parent=None,
+            startTime="2026-01-02T00:00:01Z",
+            metadata={"tool_use_id": "tu-1", "num_blocking": 1},
+        )
+
+        batch = build_batch([("tr", [interaction, tool, hook])], SPOKE)
+
+        assert _by_orig(batch, "tr", "h1")["body"]["level"] == "WARNING"
+
+    def test_non_blocking_hook_event_is_not_warning(self) -> None:
+        interaction = _obs("i1", "claude_code.interaction", parent=None)
+        tool = _obs(
+            "t1", "tool:Edit", parent="i1", metadata={"attributes": {"tool_use_id": "tu-1"}}
+        )
+        hook = _obs(
+            "h1",
+            "hook_execution_complete:PreToolUse",
+            type_="EVENT",
+            parent=None,
+            startTime="2026-01-02T00:00:01Z",
+            metadata={"tool_use_id": "tu-1", "num_blocking": 0},
+        )
+
+        batch = build_batch([("tr", [interaction, tool, hook])], SPOKE)
+
+        assert _by_orig(batch, "tr", "h1")["body"].get("level") != "WARNING"
