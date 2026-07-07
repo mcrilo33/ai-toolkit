@@ -485,7 +485,11 @@ def test_explicit_prompt_overrides_default_task_contract_seed(hub: Path, tmp_pat
     assert proc.returncode == 0, proc.stderr
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation"
-    assert new_window[0].endswith("claude --model claude-opus-4-8\\[1m\\] /source; exec /bin/zsh")
+    # The explicit prompt is the trailing arg; the default task.md seed never fires.
+    # Match the model→prompt boundary without pinning $SHELL (the `; exec <shell>`
+    # suffix is shell-dependent and covered by test_window_survives_agent_exit_via_exec_shell).
+    assert "claude --model claude-opus-4-8\\[1m\\] /source; exec " in new_window[0]
+    assert ".ai-toolkit/task.md" not in new_window[0]
 
 
 def test_no_task_contract_for_adhoc_slug(hub: Path, tmp_path: Path) -> None:

@@ -213,10 +213,14 @@ echo "→ lane / mode        $LANE / $MODE"
 # ride along inside the body verbatim.
 TASK_MD="$WT_DIR/.ai-toolkit/task.md"
 if [[ "$ISSUE" =~ ^[0-9]+$ ]] && command -v gh >/dev/null 2>&1; then
-  # Reuse the title already fetched for the slug (numeric no-slug path); otherwise
-  # fetch it. TITLE is unset on the explicit-slug path, so default-expand under set -u.
-  TASK_TITLE="${TITLE:-$(gh issue view "$ISSUE" --json title -q .title 2>/dev/null || true)}"
-  TASK_BODY="$(gh issue view "$ISSUE" --json body -q .body 2>/dev/null || true)"
+  # Reuse what earlier blocks already fetched so a spawn makes at most one gh call
+  # per field (an unbounded gh here would double the round-trips and, under /afk's
+  # synchronous dispatch, add a second hang point). TITLE comes from the slug path
+  # (numeric, no-slug); ISSUE_BODY from the Model: block (when WT_AGENT_MODEL is
+  # unset). Both are unset on the other paths, so `-` (not `:-`) fetches only then
+  # and an already-fetched empty value is honoured, not re-fetched.
+  TASK_TITLE="${TITLE-$(gh issue view "$ISSUE" --json title -q .title 2>/dev/null || true)}"
+  TASK_BODY="${ISSUE_BODY-$(gh issue view "$ISSUE" --json body -q .body 2>/dev/null || true)}"
   # Only write when the fetch actually yielded something — a total gh miss (both
   # empty) leaves no task.md so the seed prompt still falls back to /source-task,
   # rather than stamping a hollow contract that suppresses that fallback.
@@ -475,7 +479,7 @@ WT_AGENT_EFFORT="${WT_AGENT_EFFORT:-${WT_AGENT_EFFORT_DEFAULT:-max}}"
 # /source-task round-trip. An explicit --prompt (start-task, hub-afk's
 # kickoff_for) still wins; ad-hoc slugs (no task.md) keep the unseeded launch.
 if [ -z "$PROMPT" ] && [ -f "$TASK_MD" ]; then
-  PROMPT="Read your task contract at .ai-toolkit/task.md (issue #${ISSUE}, fetched at spawn -- no need to run /source-task). Break it into a task ledger (one entry per subtask x the solo-cycle steps ANCHOR/RED/GREEN/REVIEW/PUSH, exactly one in_progress), honor its Gate: line (if plan, print the full implementation plan and emit 'bash .ai-toolkit/scripts/spoke-ready.sh --gate ${ISSUE}', then WAIT for approval before GREEN; if none, run autonomous), then implement via the solo-cycle (/cycle: RED -> GREEN -> REVIEW -> PUSH). Push your own branch each subtask; when the acceptance criteria are all met, push the final subtask and emit 'bash .ai-toolkit/scripts/spoke-push.sh --ready ${ISSUE}'. Do NOT self-land. If task.md is missing, run /source-task ${ISSUE} to re-anchor."
+  PROMPT="Read your task contract at .ai-toolkit/task.md (issue #${ISSUE}, fetched at spawn -- no need to run /source-task). Break it into a task ledger (one entry per subtask x the solo-cycle steps ANCHOR/RED/GREEN/REVIEW/PUSH, exactly one in_progress). Honor its Gate: line: plan (the default for non-trivial work, and whenever no Gate: line is present) means the PLAN gate comes first -- explore, print the full implementation plan, emit 'bash .ai-toolkit/scripts/spoke-ready.sh --gate ${ISSUE}', and WAIT for approval before GREEN; only Gate: none runs autonomous straight through. Then implement via the solo-cycle (/cycle: RED -> GREEN -> REVIEW -> PUSH). Push your own branch each subtask; when the acceptance criteria are all met, push the final subtask and emit 'bash .ai-toolkit/scripts/spoke-push.sh --ready ${ISSUE}'. Do NOT self-land. If task.md is missing, or the issue was edited after spawn, run /source-task ${ISSUE} to re-anchor from the live issue."
 fi
 
 AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(printf '%q' "$WT_AGENT_EFFORT") claude --model $(printf '%q' "$WT_AGENT_MODEL")"
