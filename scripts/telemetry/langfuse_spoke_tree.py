@@ -1464,6 +1464,12 @@ def _duration_rollup(
         # min…max envelope (#157): the envelope brackets the tool's own execution, so unioning it
         # would erase that execution from the tool's exclusive time. Plain children union by
         # interval as before.
+        # UPGRADE: guard_cover is summed as a scalar, so when a guard's real interval overlaps a
+        # PLAIN sibling (a mid-turn Notification/Stop hook over its turn, a gate over an
+        # llm_request under a sub-agent) that overlap is counted in both terms and the container's
+        # own gap bucket is under-reported by the overlap — bounded (guards are short), never
+        # inflating, and sum(components)==total still holds. Switch to unioning the group's real
+        # member intervals into the parent if per-bucket gap exactness ever matters.
         guard_cover = sum(
             _guards_total_ms(by_id[kid]) for kid in kids if _is_guards_group(by_id.get(kid))
         )
