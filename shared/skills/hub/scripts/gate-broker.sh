@@ -456,6 +456,20 @@ _still_parked_same() {
   [ "$(extract_pending_question "$wt")" = "$question" ]
 }
 
+# _spoke_moved_on <wt> <before_mtime> -> true ONLY when the spoke's transcript has a NEW
+# write since <before_mtime>: a positive, confident signal that it is actively working. The
+# escalation freshness-gate (#171-subtask-2) uses this rather than !_still_parked_same so it
+# fails SAFE: an unreadable clock (empty / non-numeric mtime) or a non-numeric baseline reads
+# as "cannot confirm movement" → NOT moved on → the escalation is still stamped. Dropping an
+# escalation is only warranted on demonstrated activity, never on an ambiguous probe (review).
+_spoke_moved_on() {
+  local wt="$1" before="$2" now
+  now="$(_transcript_mtime "$wt")"
+  case "$now" in '' | *[!0-9]* ) return 1 ;; esac
+  case "$before" in '' | *[!0-9]* ) return 1 ;; esac
+  [ "$now" -gt "$before" ]
+}
+
 # --- the answerer (the one reasoning step) ------------------------------------
 
 # --- read-only worktree reasoner (issue #155, subtask B) ----------------------
@@ -702,44 +716,42 @@ EOF
 }
 
 # --- bounding the reasoner (issue #171, subtask 1) ----------------------------
-# An untimed headless `claude` can hang the whole tick; every reasoner run is bounded so
-# a wedged answerer never freezes the supervisor. Expiry yields no decision line, so the
-# gate fails SAFE to escalate (blocked/<issue>) — the existing no-decision fail-safe.
-
-# _afk_timeout_bin -> the bounding binary (`timeout`/`gtimeout`), or empty when neither is
-# installed (the macOS hub ships no coreutils, so _afk_run_bounded then uses the perl
-# fallback). AFK_TIMEOUT_BIN overrides (set empty to force the non-binary path in tests).
-_afk_timeout_bin() {
-  if [ -n "${AFK_TIMEOUT_BIN+x}" ]; then printf '%s\n' "$AFK_TIMEOUT_BIN"; return; fi
-  if command -v timeout >/dev/null 2>&1; then printf 'timeout\n'
-  elif command -v gtimeout >/dev/null 2>&1; then printf 'gtimeout\n'; fi
-}
+# An untimed headless `claude` can hang the whole tick; every reasoner run is bounded so a
+# wedged answerer never freezes the supervisor. Expiry yields no decision line, so the gate
+# fails SAFE to escalate (blocked/<issue>) — the existing no-decision fail-safe.
 
 # _afk_answerer_timeout -> the reasoner's wall-clock budget in seconds. AFK_ANSWERER_TIMEOUT
-# tunes it (default 900); a non-numeric override falls back to the default (guards `set -u`).
+# tunes it (default 900); a non-numeric OR non-positive override (0 disables the bound in
+# both `timeout` and perl `alarm`) falls back to the default, so the cap is never silently
+# lifted (#171 review).
 _afk_answerer_timeout() {
   local s="${AFK_ANSWERER_TIMEOUT:-900}"
   case "$s" in '' | *[!0-9]* ) s=900 ;; esac
+  [ "$s" -lt 1 ] && s=900
   printf '%s\n' "$s"
 }
 
-# _afk_run_bounded <secs> <cmd> -> run `bash -c "$cmd"` (prompt on this function's stdin)
-# under a <secs> wall-clock cap, emitting its combined stdout+stderr and returning its exit
-# code (nonzero on expiry). Prefers the timeout binary; falls back to a perl(alarm) wrapper
-# (macOS always ships perl) — the SIGALRM timer survives exec and terminates a runaway; last
-# resort is unbounded (documented). stdin flows through to the command in every path.
-_afk_run_bounded() {
-  local secs="$1" cmd="$2" to_bin
-  to_bin="$(_afk_timeout_bin)"
-  if [ -n "$to_bin" ]; then
-    "$to_bin" "$secs" bash -c "$cmd" 2>&1
-    return
-  fi
+# _broker_run_bounded <secs> <cmd...> -> run <cmd...> (prompt on this function's stdin) under
+# a <secs> wall-clock cap and return its exit code (nonzero on expiry). PREFERS hub-afk's
+# shared _afk_with_timeout when the supervisor sourced it (issue #170): it tree-kills a
+# wedged grandchild via _afk_kill_tree, so a hung `claude` can't keep run_answerer's capture
+# pipe open and re-hang the tick. Reused (not re-implemented) via a runtime existence check —
+# the same seam gate-broker uses for respawn_wedged_spoke — so the bound has one owner. Falls
+# back to a self-contained bound only for a STANDALONE / attended broker without hub-afk (the
+# tests): coreutils timeout/gtimeout, then a perl(alarm) wrapper (SIGALRM survives exec and
+# terminates a runaway), then best-effort unbounded.
+_broker_run_bounded() {
+  local secs="$1"; shift
+  if command -v _afk_with_timeout >/dev/null 2>&1; then _afk_with_timeout "$secs" "$@"; return; fi
+  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"; return; fi
+  if command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"; return; fi
   if command -v perl >/dev/null 2>&1; then
-    perl -e 'alarm shift @ARGV; exec @ARGV or exit 127' "$secs" bash -c "$cmd" 2>&1
-    return
+    # UPGRADE: unlike _afk_with_timeout this does not reap a wedged grandchild — only reached
+    # in a hub-less standalone/attended context where a long-lived `claude` grandchild is not
+    # expected; production routes through _afk_with_timeout above.
+    perl -e 'alarm shift @ARGV; exec @ARGV or exit 127' "$secs" "$@"; return
   fi
-  bash -c "$cmd" 2>&1   # no bounding tool available — best-effort unbounded
+  "$@"   # no bounding tool available — best-effort unbounded
 }
 
 # run_answerer <issue> <question> [wt] -> the reasoner's raw output (stdout AND stderr),
@@ -748,7 +760,7 @@ _afk_run_bounded() {
 # READ-ONLY tool allowlist; the prompt is passed on stdin so a long contract never hits
 # argv limits. When <wt> is a directory it becomes the reasoner's cwd, so its read-only
 # tools verify against the spoke's live state (the mutation guard in broker_service_gate
-# is what makes that safe). The run is bounded by AFK_ANSWERER_TIMEOUT (_afk_run_bounded)
+# is what makes that safe). The run is bounded by AFK_ANSWERER_TIMEOUT (_broker_run_bounded)
 # so a hung `claude` never freezes the tick; expiry reads as no decision → escalate.
 # stderr is folded into the captured stream (NOT discarded)
 # because the CLI prints credential failures there and exits nonzero — the auth-failure
@@ -775,12 +787,23 @@ run_answerer() {
   local tools; tools="$(reasoner_allowed_tools)"
   local cmd="${AFK_ANSWERER_CMD:-claude -p --no-session-persistence --model claude-fable-5 --allowedTools '$tools'}"
   local secs; secs="$(_afk_answerer_timeout)"
-  # _afk_run_bounded caps the reasoner (#171): a hung `claude` never freezes the tick.
-  if [ -n "$wt" ] && [ -d "$wt" ]; then
-    ( cd "$wt" && CLAUDE_EFFORT="$AFK_ANSWERER_EFFORT" _afk_run_bounded "$secs" "$cmd" <<<"$prompt" )
-  else
-    CLAUDE_EFFORT="$AFK_ANSWERER_EFFORT" _afk_run_bounded "$secs" "$cmd" <<<"$prompt"
-  fi
+  # Deliver the prompt via a temp file the wrapped command re-opens with `exec <`, NOT only
+  # the here-string: the bound (_afk_with_timeout's portable fallback) BACKGROUNDS the
+  # command, and POSIX assigns a backgrounded job's stdin to /dev/null — a plain here-string
+  # would be lost, starving the reasoner of its prompt. `exec <file` reopens stdin inside the
+  # backgrounded shell, so the prompt survives every bound path. The here-string stays as a
+  # fallback for when mktemp is unavailable (the foreground timeout/perl paths keep stdin).
+  local pf rc; pf="$(mktemp 2>/dev/null)" || pf=""
+  [ -n "$pf" ] && { printf '%s' "$prompt" > "$pf"; cmd="exec <'$pf'; $cmd"; }
+  # _broker_run_bounded caps the reasoner (#171): a hung `claude` never freezes the tick.
+  # stderr is folded in (2>&1) so the auth-failure detector still sees credential messages.
+  (
+    [ -n "$wt" ] && [ -d "$wt" ] && cd "$wt"
+    CLAUDE_EFFORT="$AFK_ANSWERER_EFFORT" _broker_run_bounded "$secs" bash -c "$cmd" <<<"$prompt" 2>&1
+  )
+  rc=$?
+  [ -n "$pf" ] && rm -f "$pf"
+  return "$rc"
 }
 
 # parse_decision <raw-answerer-output> -> "ANSWER\t<text>" or "ESCALATE\t<reason>" on
@@ -852,14 +875,19 @@ _permission_seg_safe() {
     'ls' | 'ls '* | 'cat '* | 'head '* | 'tail '* | 'wc' | 'wc '* ) return 0 ;;
     'grep '* | 'rg '* | 'echo' | 'echo '* | 'tree' | 'tree '* ) return 0 ;;
     'find '* )
-      # A read-only find is a fine self-op, but `-delete` destroys files and `-exec`/
-      # `-execdir` spawns arbitrary processes — neither is a safe scoped self-op (#171).
-      case "$seg" in *-delete* | *-exec* ) return 1 ;; esac
+      # A read-only find is a fine self-op, but any side-effecting primary is not: `-delete`
+      # destroys files; `-exec`/`-execdir`/`-ok`/`-okdir` spawn processes; `-fprint`/`-fprintf`/
+      # `-fprint0`/`-fls` write to an arbitrary file. Deny them all (#171 + review). `-print`/
+      # `-printf` write only to stdout and stay allowed. Over-denial (a filename that happens to
+      # contain one of these) escalates to a human, the safe direction for a default-deny guard.
+      case "$seg" in *-delete* | *-exec* | *-ok* | *-fprint* | *-fls* ) return 1 ;; esac
       return 0 ;;
-    # chmod +x only on a RELATIVE path: an absolute target escapes the worktree. Reject a
-    # leading `/` and any ` /` token (a later absolute arg like `chmod +x a /bin/x`) (#171).
-    'chmod +x /'* | 'chmod +x '*' /'* ) return 1 ;;
-    'chmod +x '* ) return 0 ;;
+    'chmod +x '* )
+      # chmod +x only on a RELATIVE, in-tree path. Reject an absolute target (a leading `/` or
+      # a later ` /` token like `chmod +x a /bin/x`) and any `..` that would traverse out of the
+      # spoke's worktree (#171 + review). A false deny (a filename containing `..`) escalates.
+      case "$seg" in *' /'* | 'chmod +x /'* | *'..'* ) return 1 ;; esac
+      return 0 ;;
     * ) return 1 ;;
   esac
 }
@@ -1326,15 +1354,17 @@ ${orig_question:-(the plan prose could not be extracted from the transcript — 
   else
     text="answerer returned no decision — escalating for human review"
   fi
-  # Park freshness gates the ESCALATE / no-decision / inject-failure escalation too, not
-  # just the ANSWER inject (#171-subtask-2): the answerer takes minutes (or timed out), and
-  # if the spoke moved on meanwhile (a human replied, the turn resumed) stamping blocked/<N>
-  # would strand an actively-working spoke — worse now that a blocked-at-tip park is
-  # re-answerable (#171-subtask-3). A late-registered inject also drops here rather than
-  # double-escalating. Drop with a log instead. (The ANSWER branch already re-checks before
-  # injecting; this is the second checkpoint before the escalation is stamped.)
-  if ! _still_parked_same "$wt" "$issue" "$was_gate" "$orig_question" "$parked_mtime"; then
-    log "  #$issue is no longer parked on that prompt — dropping the escalation (spoke moved on)"
+  # Park freshness gates the ESCALATE / no-decision / inject-failure escalation too, not just
+  # the ANSWER inject (#171-subtask-2): the answerer takes minutes (or timed out), and if the
+  # spoke moved on meanwhile (a human replied, the turn resumed) stamping blocked/<N> would
+  # strand an actively-working spoke — worse now that a blocked-at-tip park is re-answerable
+  # (#171-subtask-3). A late-registered inject also drops here rather than double-escalating.
+  # Uses _spoke_moved_on (a POSITIVE transcript-advanced signal), NOT !_still_parked_same:
+  # an ambiguous probe must NOT drop a real escalation (review) — only demonstrated activity
+  # does. (The ANSWER branch's own pre-inject re-check stays _still_parked_same: there,
+  # dropping on uncertainty is the safe direction — it just skips a possibly-stale inject.)
+  if _spoke_moved_on "$wt" "$parked_mtime"; then
+    log "  #$issue transcript advanced while reasoning — dropping the escalation (spoke moved on)"
     return 0
   fi
   _broker_on_human_decision "$mode" "$wt" "$issue" "$text"

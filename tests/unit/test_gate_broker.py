@@ -967,50 +967,55 @@ def test_decide_permission_logs_escalate_verdict(spoke_repo: Path, tmp_path: Pat
 # subtask 1: the reasoner is bounded so a hung headless claude never freezes the tick ──
 
 
-def test_run_answerer_wraps_answerer_in_timeout(spoke_repo: Path, tmp_path: Path) -> None:
-    # run_answerer must bound the reasoner: it invokes the timeout binary with the configured
-    # AFK_ANSWERER_TIMEOUT seconds, then the answerer. A fake `timeout` echoes the seconds it
-    # was handed and execs the rest, proving both the wrap and the seconds passthrough.
+def test_run_answerer_delegates_to_shared_timeout(spoke_repo: Path, tmp_path: Path) -> None:
+    # In production hub-afk.sh defines _afk_with_timeout (which tree-kills a wedged grandchild
+    # so it can't hold run_answerer's capture pipe open); run_answerer must REUSE it and pass
+    # the configured AFK_ANSWERER_TIMEOUT seconds, not roll its own bound. A stub echoes the
+    # seconds it was handed and runs the command, proving both the delegation and the budget.
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
     (fake_bin / "gh").chmod(0o755)
-    fake_timeout = tmp_path / "fake-timeout"
-    fake_timeout.write_text('#!/usr/bin/env bash\necho "BOUND=$1"\nshift\nexec "$@"\n')
-    fake_timeout.chmod(0o755)
 
     result = _call(
-        "run_answerer 5 'q'",
+        '_afk_with_timeout() { echo "BOUND=$1"; shift; "$@"; }; run_answerer 5 \'q\'',
         env={
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "AFK_TIMEOUT_BIN": str(fake_timeout),
             "AFK_ANSWERER_TIMEOUT": "42",
             "AFK_ANSWERER_CMD": "printf 'ANSWER: ok'",
         },
     )
 
     assert result.returncode == 0, result.stderr
-    assert "BOUND=42" in result.stdout, f"the reasoner must be wrapped in timeout: {result.stdout}"
+    assert "BOUND=42" in result.stdout, (
+        f"must delegate to _afk_with_timeout with the budget: {result.stdout}"
+    )
     assert "ANSWER: ok" in result.stdout, (
-        f"the answerer must still run under timeout: {result.stdout}"
+        f"the answerer must still run under the bound: {result.stdout}"
     )
 
 
-def test_broker_service_gate_escalates_when_answerer_times_out(
-    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
-) -> None:
-    # A timed-out reasoner (the timeout binary exits 124 with no output) is a "no decision":
-    # the gate must escalate to blocked/<issue> — the existing fail-safe — never hang.
-    fake_timeout = tmp_path / "fake-timeout"
-    fake_timeout.write_text("#!/usr/bin/env bash\nexit 124\n")  # model expiry: kill, no output
-    fake_timeout.chmod(0o755)
-    env = {
-        **waiting_spoke_env,
-        "AFK_TIMEOUT_BIN": str(fake_timeout),
-        "AFK_ANSWERER_CMD": "printf 'ANSWER: should never run'",
-    }
+def test_answerer_timeout_rejects_zero_budget() -> None:
+    # AFK_ANSWERER_TIMEOUT=0 (or non-numeric) must not disable the bound — `timeout 0` and
+    # perl `alarm 0` both mean "no limit". _afk_answerer_timeout falls back to the default.
+    for spec in ("0", "00", "abc", ""):
+        got = _call("_afk_answerer_timeout", env={"AFK_ANSWERER_TIMEOUT": spec}).stdout.strip()
+        assert got == "900", f"AFK_ANSWERER_TIMEOUT={spec!r} must fall back to 900, got {got}"
+    ok = _call("_afk_answerer_timeout", env={"AFK_ANSWERER_TIMEOUT": "30"}).stdout.strip()
+    assert ok == "30", ok
 
-    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+def test_broker_service_gate_escalates_when_answerer_times_out(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str]
+) -> None:
+    # A timed-out reasoner (the bound returns nonzero with no output) is a "no decision":
+    # the gate must escalate to blocked/<issue> — the existing fail-safe — never hang.
+    env = {**waiting_spoke_env, "AFK_ANSWERER_CMD": "printf 'ANSWER: should never run'"}
+
+    result = _call(
+        f"_afk_with_timeout() {{ return 124; }}; broker_service_gate '{spoke_repo}' 5 unattended",
+        env=env,
+    )
 
     assert result.returncode == 0, result.stderr
     log = Path(env["_READY_LOG"]).read_text()
@@ -1018,13 +1023,12 @@ def test_broker_service_gate_escalates_when_answerer_times_out(
     assert "no decision" in log.lower(), log
 
 
-def test_run_answerer_perl_fallback_bounds_a_slow_answerer(
+def test_run_answerer_standalone_fallback_bounds_a_slow_answerer(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
-    # The macOS hub ships no coreutils `timeout`; run_answerer must still bound the reasoner
-    # via the perl(alarm) fallback so a hung headless claude never freezes the tick. Force the
-    # non-binary path (AFK_TIMEOUT_BIN="") and give a slow answerer a 1s budget: it is killed
-    # before it can print, and run_answerer returns nonzero (→ no decision → escalate).
+    # Sourced standalone (no hub-afk _afk_with_timeout) on a coreutils-less host, the
+    # self-contained fallback (perl alarm) must still bound the reasoner: a slow answerer is
+    # killed before it prints, and run_answerer returns nonzero (→ no decision → escalate).
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
@@ -1034,7 +1038,6 @@ def test_run_answerer_perl_fallback_bounds_a_slow_answerer(
         "run_answerer 5 'q'; echo RC=$?",
         env={
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "AFK_TIMEOUT_BIN": "",  # no binary → exercise the perl(alarm) fallback
             "AFK_ANSWERER_TIMEOUT": "1",
             "AFK_ANSWERER_CMD": "sleep 5; printf 'ANSWER: too late'",
         },
@@ -1082,7 +1085,31 @@ def test_broker_service_gate_drops_escalation_when_spoke_moves_on(
     assert result.returncode == 0, result.stderr
     ready_text = ready_log.read_text() if ready_log.exists() else ""
     assert "--blocked" not in ready_text, f"a moved-on spoke must not be escalated: {ready_text}"
-    assert "no longer parked" in result.stderr.lower(), result.stderr
+    assert "dropping the escalation" in result.stderr.lower(), result.stderr
+
+
+def test_spoke_moved_on_requires_a_confirmed_advance(spoke_repo: Path, tmp_path: Path) -> None:
+    # The escalation gate must fail SAFE: it drops a real escalation ONLY on a demonstrated
+    # transcript advance, never on an ambiguous probe (an empty/garbage baseline). Otherwise a
+    # transient stat miss would silently swallow a blocked/<N> and strand the spoke unsurfaced.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    jsonl.write_text("{}\n")
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+    env = {"CLAUDE_PROJECTS_DIR": str(projects)}
+
+    def moved_on(before: str) -> str:
+        out = _call(f"_spoke_moved_on '{spoke_repo}' '{before}'; echo RC=$?", env=env)
+        return out.stdout.strip().splitlines()[-1]
+
+    assert moved_on("1000000000") == "RC=1", "unchanged mtime is not movement"
+    os.utime(jsonl, (1_000_000_050, 1_000_000_050))
+    assert moved_on("1000000000") == "RC=0", "a strictly newer write is movement"
+    assert moved_on("") == "RC=1", "an empty baseline is not confident movement (fail safe)"
+    assert moved_on("nope") == "RC=1", (
+        "a non-numeric baseline is not confident movement (fail safe)"
+    )
 
 
 # subtask 3: blocked-at-tip over a still-parked spoke reads as waiting, not terminal ──
@@ -1171,9 +1198,16 @@ def test_inject_verify_default_budget_is_60(spoke_repo: Path, tmp_path: Path) ->
     [
         ("find . -name foo -delete", "ESCALATE"),  # -delete can destroy files
         ("find /tmp -type f -exec cat {} +", "ESCALATE"),  # -exec can spawn anything
+        ("find . -fprint /tmp/out", "ESCALATE"),  # -fprint writes to an arbitrary file
+        ("find . -type f -fprintf /tmp/out '%p'", "ESCALATE"),  # -fprintf too
+        ("find . -fls /tmp/out", "ESCALATE"),  # -fls writes a listing to a file
+        ("find . -ok rm {} ;", "ESCALATE"),  # -ok spawns a process
         ("find . -type f -name '*.py'", "APPROVE"),  # a read-only find is fine
+        ("find . -type f -print0", "APPROVE"),  # -print0 writes only to stdout — safe
         ("chmod +x /usr/local/bin/tool", "ESCALATE"),  # absolute path escapes the worktree
-        ("chmod +x ./scripts/x.sh", "APPROVE"),  # relative self-op
+        ("chmod +x foo /usr/bin/bar", "ESCALATE"),  # a later absolute token escapes too
+        ("chmod +x ../../../etc/cron.d/payload", "ESCALATE"),  # `..` traversal escapes the worktree
+        ("chmod +x ./scripts/x.sh", "APPROVE"),  # relative in-tree self-op
         ("chmod +x scripts/x.sh", "APPROVE"),
         ("pytest", "ESCALATE"),  # a bare pytest is the full-suite ref-rewind hazard (#135)
         ("python -m pytest", "ESCALATE"),
