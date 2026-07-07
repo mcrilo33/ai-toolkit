@@ -14,6 +14,8 @@ These AAA tests run against a checked-in, sanitized fixture
 
 from __future__ import annotations
 
+import json
+import re
 import sys
 from pathlib import Path
 from typing import cast
@@ -39,6 +41,18 @@ from telemetry.request_body import (
 _FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 _SAMPLE = _FIXTURES / "sample.request.json"
 _DEGENERATE = _FIXTURES / "degenerate.request.json"
+# A REAL captured combined rules+memory+env reminder (sanitized from a raw-bodies dump):
+# one ``<system-reminder>`` in ``messages[0]`` packing the claudeMd intro, the project
+# CLAUDE.md and the memory index (each a ``Contents of <path>`` section), and the env
+# headers. Pins the turn-0 section router on an authentic reminder shape (Issue #159).
+_COMBINED = _FIXTURES / "combined_reminder.request.json"
+
+
+def _reminder_inner(path: Path) -> str:
+    """Return the inner text of the single ``<system-reminder>`` in ``messages[0]``."""
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    text = obj["messages"][0]["content"][0]["text"]
+    return re.search(r"<system-reminder>(.*?)</system-reminder>", text, re.DOTALL).group(1)
 
 
 def _by_category(items: list[ContextItem], category: str) -> list[ContextItem]:
@@ -115,13 +129,75 @@ def test_reminder_blocks_classified_by_kind() -> None:
     parsed = parse_request_body(_SAMPLE)
     context_names = [item.name for item in _by_category(parsed.items, "context")]
 
-    # Assert: every injected reminder kind is recognized, plus the residual prompt.
+    # Assert: the whole-kept reminder kinds stay in ``context``, plus the residual prompt.
+    # The rules+memory+env and skills reminders are routed to their own categories (Issue
+    # #159), so they no longer appear here.
     assert "session-start-hook" in context_names
     assert "deferred-tools" in context_names
     assert "agent-types" in context_names
-    assert "skills" in context_names
-    assert "rules+memory+env" in context_names
     assert "prompt" in context_names
+    assert "rules+memory+env" not in context_names
+    assert "skills" not in context_names
+
+
+def test_turn0_routes_skills_reminder_to_skills_category() -> None:
+    # Arrange / Act: the sample's skills reminder splits per skill on the turn-0 path (#159).
+    parsed = parse_request_body(_SAMPLE)
+
+    # Assert: the skill names land in the ``skills`` category, not a lumped ``context`` item.
+    skill_names = {item.name for item in _by_category(parsed.items, "skills")}
+    assert skill_names == {"afk", "hub"}
+
+
+def test_turn0_routes_rules_reminder_to_rules_category() -> None:
+    # Arrange / Act: the sample's rules+memory+env reminder splits per file on turn-0 (#159).
+    parsed = parse_request_body(_SAMPLE)
+
+    # Assert: the ``Contents of`` file becomes a ``rules`` item named by its basename.
+    rule_names = {item.name for item in _by_category(parsed.items, "rules")}
+    assert rule_names == {"CLAUDE.md"}
+
+
+# --- turn-0 combined-block section router (Issue #159) ------------------------
+
+
+def test_turn0_splits_combined_block_per_rule_file() -> None:
+    # Arrange / Act: a REAL combined rules+memory+env reminder in messages[0].
+    parsed = parse_request_obj(json.loads(_COMBINED.read_text(encoding="utf-8")))
+
+    # Assert: each ``Contents of <path>`` section is its own ``rules`` item by basename;
+    # the memory index rides inside its file's item and env residue is one item.
+    rule_names = {item.name for item in _by_category(parsed.items, "rules")}
+    assert rule_names == {"CLAUDE.md", "MEMORY.md"}
+    assert _by_category(parsed.items, "environment")
+    assert "rules+memory+env" not in {item.name for item in _by_category(parsed.items, "context")}
+
+
+def test_turn0_combined_block_split_is_lossless_on_real_fixture() -> None:
+    # Arrange: the split items derive wholly from the single combined reminder, so their
+    # token sizes must sum to the reminder's own size — no residue dropped (AC #1).
+    parsed = parse_request_obj(json.loads(_COMBINED.read_text(encoding="utf-8")))
+    split = [item for item in parsed.items if item.category in {"rules", "skills", "environment"}]
+
+    # Act: measure with the character counter (token size == len under counter=len).
+    rows = measure_request_items(split, counter=len, price=1.0)
+    split_tokens = sum(cast(int, row["tokens"]) for row in rows)
+
+    # Assert: Σ(split items) == token size of the original reminder block.
+    assert split_tokens == len(_reminder_inner(_COMBINED))
+
+
+def test_turn0_split_leaves_cache_boundaries_and_effort_unaffected() -> None:
+    # Arrange / Act: routing the reminder must not perturb boundaries/effort (AC #3).
+    parsed = parse_request_obj(json.loads(_COMBINED.read_text(encoding="utf-8")))
+
+    # Assert: the fixture's own breakpoints and effort are read exactly as before.
+    assert parsed.cache_boundaries == [
+        CacheBoundary("system", 2),
+        CacheBoundary("system", 3),
+        CacheBoundary("messages", 1),
+    ]
+    assert parsed.effort == "high"
 
 
 def test_prompt_block_is_cache_flagged() -> None:

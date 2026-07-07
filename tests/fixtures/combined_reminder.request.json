@@ -1,0 +1,81 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 32000,
+  "output_config": {
+    "effort": "high"
+  },
+  "tools": [
+    {
+      "name": "Bash",
+      "description": "Run a shell command.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "x"
+        ]
+      }
+    },
+    {
+      "name": "Edit",
+      "description": "Edit a file in place.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "x"
+        ]
+      }
+    }
+  ],
+  "system": [
+    {
+      "type": "text",
+      "text": "billing header"
+    },
+    {
+      "type": "text",
+      "text": "identity preamble"
+    },
+    {
+      "type": "text",
+      "text": "base system prompt body",
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    },
+    {
+      "type": "text",
+      "text": "tool-use + output prompt body",
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# claudeMd\nCodebase and user instructions are shown below. Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.\n\nContents of /Users/mathieucrilout/Repos/ai-toolkit-159/CLAUDE.md (project instructions, checked into the codebase):\n\n# AI Toolkit — Agent Context\n\nThis repository contains shared rules, skills, prompts, and agents for AI coding assistants (Copilot, Cursor, Claude Code).\n\n## Key references\n\n- `docs/available-tools.md` — Complete inventory of all tools accessible to agents (~140+ tools across file ops, terminal, Git, GitHub, browser, notebooks, Jira, Confluence, Notion, macOS automation, web research, GCP)\n- `docs/rules-frontmatter.md` — Rules frontmatter field reference per platform\n- `docs/skills-frontmatter.md` — Skills frontmatter field reference per platform\n- `docs/metadata-and-sync.md` — How `shared/` files are synced to platform-specific configs\n- `docs/parallel-worktrees.md` — Running parallel Claude sessions with one git worktree per task (`worktree-new.sh` / `worktree-done.sh`, review window, merge flow)\n- `docs/telemetry-pull-layer.md` — Telemetry pull layer: the land-time view builder (`langfuse_spoke_tree.py`) that assembles the `spoketree-`/`spokecycle-` views from on-machine transcript parsing; no backfill/healing path since #140 (the Streamlit dashboard + DuckDB store were removed in #90; `ccusage` + the pull-cost layer were retired in #91 — Langfuse computes cost from token usage)\n- `docs/spoke-otel-langfuse-spike.md` — Spike (#83): opt-in (`AI_TOOLKIT_OTEL=1`) Claude Code native-OTel trace export per spoke to Langfuse / a local OTLP collector; native-view-vs-dashboard comparison and the hybrid recommendation\n- `dashboard/langfuse/otelcol.yaml` — OTel collector config for the Langfuse push path (the single observability surface since #90)\n\n## Repository structure\n\n- `shared/rules/` — Instruction rules (guidelines, code quality, security, etc.)\n- `shared/skills/` — Skills with SKILL.md + optional scripts/references/templates/assets\n- `shared/prompts/` — Reusable prompt templates\n- `shared/agents/` — Agent mode definitions\n- `scripts/` — Sync pipeline (`sync-to-repo.sh`, `metadata_parser.py`)\n- `settings/` — IDE-specific settings (VS Code, Cursor, Claude)\n- `tests/` — Unit and integration tests\n\n## Sync pipeline\n\n```bash\n./scripts/sync-to-repo.sh <target-repo> [copilot|cursor|claude|all]\n```\n\nReads `metadata.yml` per category, merges shared defaults with per-tool overrides, prepends YAML frontmatter, writes to platform-specific paths.\n\n## Conventions\n\n- All rules, skills, and prompts use `metadata.yml` for frontmatter definitions\n- Skill folders must contain `SKILL.md` as the entry point\n- Commit messages follow conventional commits format\n- Tests use pytest with AAA structure\n\nContents of /Users/mathieucrilout/.claude/projects/-Users-mathieucrilout-Repos-ai-toolkit/memory/MEMORY.md (user's auto-memory, persists across conversations):\n\n# Memory Index\n\n- [Native commit-msg gate is a no-op](native-commit-msg-payload-double-encoded.md) — install-git-hooks jq -nc double-encodes the synthesized command so commit-quality never matches a real git commit; format/anchor gate silently never fires. Fix: jq -nr.\n- [New hub script needs sync registration](new-hub-script-needs-sync-registration.md) — a new hub/scripts/*.sh is inert until added to sync_workflow_scripts() (+ its test); unit tests hide it. Verify with …\n- [testmon blind to bash changes](testmon-blind-to-bash-changes.md) — the push gate's testmon tracks Python imports only; a bash-only edit won't re-run the subprocess-sourcing suites (test_hub_afk), so run them by hand.\n- [Concurrent sibling trips tripwire](concurrent-sibling-trips-tripwire.md) — a sibling's legit ref push mid-gate reads as a REPO-INTEGRITY BREACH; re-push TEST_SELECT_SKIP=1. `assert N not in x` …\n- [#144 own land predates its fix](144-own-land-predates-its-fix.md) — #144's trust-the-marker auto_land isn't live until it merges; land #144 by hand with --skip-tests (its tree is green ready/144), it self-flakes on the tripwire under a live drain like #140.\n\n- [Spoke-tree #100 step grouping](spoke-tree-100-step-grouping.md) — steps from todo ledger; don't flatten interactions (TRACEPARENT causal); fold 3 sub-spans onto the tool.\n- [No fake blocking deps](no-fake-blocking-deps.md) — don't fabricate blocked-by to scope an /afk run; Scope graph + exclusivity already serialize. Stop the supervisor …\n- [AFK answerer state-mismatch strands spoke](afk-answerer-state-mismatch-strands-spoke.md) — drain answerer injects a stale answer past that state, interrupts the tool call, strands it unpushed (#89).\n- [AFK supervisor crash + self-modify hazard](afk-supervisor-crash-and-selfmodify.md) — drain can die silently (exit 0) leaving stale state + orphans; nohup re-arm; never land hub-afk.sh during a live …\n- [AFK resume dead-pane spoke](afk-resume-dead-pane-spoke.md) — drain won't revive a crashed-pane spoke; relaunch via tmux new-window reusing spoke_run_id; seed prompt plain …\n- [tmux multi-line approval not submitted](tmux-multiline-approval-not-submitted.md) — multi-line `send-keys -l` buffers as a bracketed paste; send Enter as a SEPARATE call, then capture-pane to verify.\n- [AFK injector unsubmitted answer](afk-injector-unsubmitted-answer.md) — drain auto-answers sit unsubmitted (same paste bug); recover bare Enter per pane + delete blocked/<N>; fix injector …\n\n\n\n\n\n\n# userEmail\nThe user's email address is user@example.com.\n# currentDate\nToday's date is 2026-07-07.\n\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\n</system-reminder>"
+        },
+        {
+          "type": "text",
+          "text": "Anchor the spoke to issue #159.",
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        }
+      ]
+    }
+  ]
+}
