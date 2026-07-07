@@ -322,9 +322,10 @@ def test_batch_env_cli_empty_when_unset(tmp_path: Path) -> None:
     assert cfg._cli(["ai_toolkit_config.py", "batch-env", str(path)]) == ""
 
 
-def test_real_config_batch_defaults_to_autoderive(real_config: dict) -> None:
-    # The seed leaves both blank ⇒ the consumer auto-derives the cap and default stagger.
-    assert cfg.batch_concurrency_cap(real_config) is None
+def test_real_config_batch_cap_pinned_stagger_autoderives(real_config: dict) -> None:
+    # The hub pins the cap for its hardware (M5 Max 18c/48GB, #151 headroom);
+    # the stagger stays blank ⇒ the consumer auto-derives its default.
+    assert cfg.batch_concurrency_cap(real_config) == 4
     assert cfg.batch_stagger_seconds(real_config) is None
 
 
