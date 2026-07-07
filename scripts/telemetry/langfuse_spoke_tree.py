@@ -204,6 +204,17 @@ _SCORE_PREFIX = "tree-score-"
 _PERMISSION_WAIT_SCORE = "permission_wait_ms"  # per blocked tool observation
 _GATE_PARK_SCORE = "gate_park_ms"  # trace-level PLAN-gate park wait
 _TOOL_RESULT_SIZE_SCORE = "tool_result_size"  # bytes of a tool node's reconstructed tool_result
+# Per-phase step cost/token scores (#158): the phase is the score-name suffix (a metrics
+# dimension), so "what does RED cost across all spokes" is a one-widget Scores query.
+_STEP_COST_SCORE = "step_cost_usd"  # per View B step observation, from rollup.written x price
+_STEP_TOKENS_WRITTEN_SCORE = (
+    "step_tokens_written"  # per View B step observation, from rollup.written
+)
+# The canonical solo-cycle phases parsed out of a step subject (e.g. "A-RED: …" → RED). Kept a
+# closed set so a step subject can never mint a free-text score name (a metrics-cardinality guard).
+_STEP_PHASES = ("ANCHOR", "RED", "GREEN", "REVIEW", "PUSH")
+_STEP_PHASE_OTHER = "other"
+_STEP_PHASE_RE = re.compile(rf"\b({'|'.join(_STEP_PHASES)})\b")
 # output_config.effort handling (#101). ``ultra`` is the ultracode/harness mode, NOT an
 # effort level: it is diverted to a spoke-level ``ultracode`` trace tag, never recorded as
 # an ``effort:<value>`` tag or on llm_request metadata.
@@ -3372,7 +3383,7 @@ def _score_event(
     spoke_run_id: str,
     *,
     name: str,
-    value: int,
+    value: float,
     trace_id: str,
     base_ts: str,
     observation_id: str | None = None,
@@ -3553,6 +3564,87 @@ def build_score_events(
     return events
 
 
+def _step_phase(subject: str) -> str:
+    """Return the canonical solo-cycle phase named in a step subject, or ``other`` (#158).
+
+    ``"A-RED: red first"`` → ``RED``; ``"ANCHOR #154 …"`` → ``ANCHOR``; a compound subject like
+    ``"REVIEW + PUSH"`` takes the leftmost keyword (``REVIEW``). The result is always one of the
+    closed :data:`_STEP_PHASES` set or ``other`` — never free text — so it is a safe score-name
+    suffix.
+    """
+    match = _STEP_PHASE_RE.search(subject.upper())
+    return match.group(1) if match else _STEP_PHASE_OTHER
+
+
+def _step_phase_of(body: dict[str, Any]) -> str:
+    """Return the phase of one View B step node: ``pre`` / ``post`` for the boundary partitions,
+    else the phase parsed from its subject."""
+    name = body.get("name") or ""
+    if name == _PRE_STEP_NAME:
+        return _PRE_STEP_KEY
+    if name == _POST_STEP_NAME:
+        return _POST_STEP_KEY
+    subject = (body.get("metadata") or {}).get("subject") or name
+    return _step_phase(subject)
+
+
+def build_step_cost_scores(
+    spoke_run_id: str, cycle_batch: list[IngestEvent], *, base_ts: str, price: float
+) -> list[IngestEvent]:
+    """Build per-phase step cost/token scores from View B's step rollups (#158).
+
+    ``step:*`` nodes carry token rollups only in ``metadata.rollup`` (never ``usageDetails`` — the
+    #114 double-count guard), so per-step cost is invisible to the Metrics API. Score NAMES are a
+    metrics dimension, so each View B step emits ``step_cost_usd:<PHASE>`` and
+    ``step_tokens_written:<PHASE>`` from its rollup's ``written`` tokens (cost = written × the
+    cache-creation ``price``), observation-scoped to the step node with a deterministic id.
+
+    Emitted on View B (the cycle lens) ONLY: a step lives on both views, but scoring both would
+    double every phase in a Scores-view sum, so — like the other per-call enrichments — this is
+    single-emit. A step with no rollup (a childless boundary partition) is skipped.
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids).
+        cycle_batch: The assembled View B events (its step nodes' rollups are read).
+        base_ts: ISO timestamp stamped on every score event.
+        price: Cache-creation price in USD per written token.
+
+    Returns:
+        The ``score-create`` events (empty when View B has no step rollups).
+    """
+    trace_id = cycle_trace_id_for(spoke_run_id)
+    events: list[IngestEvent] = []
+    for event in cycle_batch:
+        body = event["body"]
+        if not body["id"].startswith(_CYCLE_STEP_PREFIX):
+            continue
+        written = ((body.get("metadata") or {}).get("rollup") or {}).get("written")
+        if written is None:
+            continue
+        phase = _step_phase_of(body)
+        events.append(
+            _score_event(
+                spoke_run_id,
+                name=f"{_STEP_COST_SCORE}:{phase}",
+                value=written * price,
+                trace_id=trace_id,
+                base_ts=base_ts,
+                observation_id=body["id"],
+            )
+        )
+        events.append(
+            _score_event(
+                spoke_run_id,
+                name=f"{_STEP_TOKENS_WRITTEN_SCORE}:{phase}",
+                value=written,
+                trace_id=trace_id,
+                base_ts=base_ts,
+                observation_id=body["id"],
+            )
+        )
+    return events
+
+
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse the CLI arguments for the spoke-tree assembler."""
     env = os.environ
@@ -3679,7 +3771,10 @@ def main(argv: list[str] | None = None) -> int:
     # calls↔bodies pairing once in main and pass it in if the body count ever makes it measurable.
     efforts = apply_request_body_metadata(batch, traces, bodies_dir)
     score_events = build_score_events(args.spoke_run_id, traces, batch, base_ts=base_ts)
-    post_in_chunks(batch + context_events + score_events + cycle_batch, post)
+    step_scores = build_step_cost_scores(
+        args.spoke_run_id, cycle_batch, base_ts=base_ts, price=args.price
+    )
+    post_in_chunks(batch + context_events + score_events + cycle_batch + step_scores, post)
 
     trace_id = trace_id_for(args.spoke_run_id)
     cycle_trace_id = cycle_trace_id_for(args.spoke_run_id)
@@ -3691,6 +3786,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{decomposed} llm_requests cache-decomposed, "
         f"{efforts} llm_requests effort-tagged, "
         f"{len(score_events)} numeric scores emitted, "
+        f"{len(step_scores)} per-phase step cost/token scores emitted, "
         f"tagged mode={mode} lane={lane}; "
         f"{len(cycle_batch) - 2} observations assembled under cycle trace {cycle_trace_id}"
     )
