@@ -4844,6 +4844,13 @@ class TestFailureLevels:
         assert _by_orig(batch, "tr", "h1")["body"]["level"] == "WARNING"
         assert _guards_group(batch)["body"]["level"] == "WARNING"
 
+    @pytest.mark.parametrize("decision", ["ask", "block"])
+    def test_ask_and_block_guard_decisions_are_warning(self, decision: str) -> None:
+        batch = build_batch(self._guarded_tool(decision=decision), SPOKE)
+
+        assert _by_orig(batch, "tr", "h1")["body"]["level"] == "WARNING"
+        assert _guards_group(batch)["body"]["level"] == "WARNING"
+
     def test_allow_success_guard_is_not_warning(self) -> None:
         # A kept-but-benign guard (slow allow/success) must not be flagged.
         batch = build_batch(self._guarded_tool(), SPOKE, keep_noop_guards=True)

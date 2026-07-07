@@ -909,12 +909,17 @@ def _stamp_hook_endtimes(copies: list[IngestEvent]) -> list[IngestEvent]:
             continue
         start = body.get("startTime")
         total = _attr(body, _TOTAL_DURATION_KEY)
+        # UPGRADE: accept only a native numeric counter; a numeric-string total_duration_ms would
+        # be skipped (left zero-width). Coerce here if a future emission path ever stringifies it.
         if not start or not isinstance(total, (int, float)):
             continue
         parsed = _parse_utc(start)
         if parsed is None:
             continue
         end = parsed + timedelta(milliseconds=total)
+        # metadata is aliased from the source observation (copied via _COPIED_FIELDS), so this
+        # writes time_source back onto the source dict too — intentional and inert (time_source is
+        # never read; the write is idempotent), matching the module's other in-place patterns.
         body["endTime"] = end.isoformat().replace("+00:00", "Z")
         body.setdefault("metadata", {})[_TIME_SOURCE_KEY] = _TIME_SOURCE_LAGGING
     return copies
