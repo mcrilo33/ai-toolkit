@@ -1821,6 +1821,30 @@ class TestRebuildIdempotency:
         assert json.dumps(rebuilt) == json.dumps(fresh)
 
 
+class TestSchemaRev:
+    """#156: both view trace-create bodies stamp a schema_rev so a consumer can tell
+    which builder generation produced a stored view."""
+
+    def test_view_a_trace_create_carries_schema_rev(self) -> None:
+        batch = build_batch(_traces(), SPOKE)
+
+        assert isinstance(batch[0]["body"]["metadata"]["schema_rev"], int)
+
+    def test_view_b_trace_create_carries_schema_rev(self) -> None:
+        batch = build_cycle_batch(_traces(), SPOKE)
+
+        assert isinstance(batch[0]["body"]["metadata"]["schema_rev"], int)
+
+    def test_both_views_stamp_the_same_schema_rev(self) -> None:
+        a_batch = build_batch(_traces(), SPOKE)
+        b_batch = build_cycle_batch(_traces(), SPOKE)
+
+        assert (
+            a_batch[0]["body"]["metadata"]["schema_rev"]
+            == b_batch[0]["body"]["metadata"]["schema_rev"]
+        )
+
+
 def _tool_obs(obs_id: str, name: str, tool_use_id: str, **extra) -> dict:
     """Build a source observation carrying a tool-call id under metadata["attributes"]."""
     return _obs(
