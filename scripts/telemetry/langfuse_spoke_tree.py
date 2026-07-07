@@ -165,10 +165,14 @@ from telemetry.measure_context_cost import (
     measure_items,
 )
 from telemetry.request_body import (
+    ContextDelta,
+    ContextItem,
     decompose_request_body,
+    diff_snapshots,
     first_real_request,
     measure_request_items,
     parse_request_body,
+    snapshot_items_from_path,
 )
 from telemetry.session_parser import project_dir_for_worktree
 
@@ -184,6 +188,16 @@ _ROOT_PREFIX = "spokeroot-"
 _COPY_PREFIX = "tree-"
 # Deterministic id prefix for the synthetic cycle-step nodes (#100, derived from the ledger).
 _STEP_PREFIX = "tree-step-"
+# Synthetic timeline nodes (#162): git commits and the PLAN-gate park, keyed off the spoke run
+# id (+ sha) so a rerun overwrites the same node. The ``wait:`` name prefix routes the park into
+# the duration ``wait`` bucket (see _duration_class); the field separator is the byte git emits
+# between --format fields in the commit dump (_parse_commits).
+_COMMIT_PREFIX = "tree-commit-"
+_GATE_PARK_PREFIX = "tree-gatepark-"
+_GATE_PARK_NODE_NAME = "wait:gate-park"
+_WAIT_PREFIX = "wait:"
+_COMMIT_FIELD_SEP = "\x1f"
+_COMMIT_LINE_MARKER = "commit"
 # View B (#113) — the second "steps -> work" trace assembled from the same observation copies,
 # re-homed onto a pure cycle axis (preStep / step:N / postStep). Its ids live in a separate
 # namespace so its copies never collide with View A's in the local Langfuse store.
@@ -204,6 +218,17 @@ _SCORE_PREFIX = "tree-score-"
 _PERMISSION_WAIT_SCORE = "permission_wait_ms"  # per blocked tool observation
 _GATE_PARK_SCORE = "gate_park_ms"  # trace-level PLAN-gate park wait
 _TOOL_RESULT_SIZE_SCORE = "tool_result_size"  # bytes of a tool node's reconstructed tool_result
+# Per-phase step cost/token scores (#158): the phase is the score-name suffix (a metrics
+# dimension), so "what does RED cost across all spokes" is a one-widget Scores query.
+_STEP_COST_SCORE = "step_cost_usd"  # per View B step observation, from rollup.written x price
+_STEP_TOKENS_WRITTEN_SCORE = (
+    "step_tokens_written"  # per View B step observation, from rollup.written
+)
+# The canonical solo-cycle phases parsed out of a step subject (e.g. "A-RED: …" → RED). Kept a
+# closed set so a step subject can never mint a free-text score name (a metrics-cardinality guard).
+_STEP_PHASES = ("ANCHOR", "RED", "GREEN", "REVIEW", "PUSH")
+_STEP_PHASE_OTHER = "other"
+_STEP_PHASE_RE = re.compile(rf"\b({'|'.join(_STEP_PHASES)})\b")
 # output_config.effort handling (#101). ``ultra`` is the ultracode/harness mode, NOT an
 # effort level: it is diverted to a spoke-level ``ultracode`` trace tag, never recorded as
 # an ``effort:<value>`` tag or on llm_request metadata.
@@ -237,6 +262,10 @@ _PURGE_POLL_INTERVAL = 1.0
 
 # Observation fields copied verbatim into the assembled trace when present.
 _COPIED_FIELDS = ("input", "output", "usageDetails", "costDetails", "metadata", "model", "level")
+# The otelcol renames a ``tool:Agent`` span to ``sub-agent:<type>`` (e.g. ``sub-agent:code-review``);
+# such a container still carries the invoking tool's ``tool_use_id`` so its transcript output grafts
+# like any other tool (#161).
+_SUB_AGENT_PREFIX = "sub-agent:"
 # Metadata keys that may carry a tool-call id, in priority order.
 _TOOL_USE_ID_KEYS = ("tool_use_id", "gen_ai.tool.call.id")
 # The per-turn id Claude Code stamps on a ``claude_code.interaction`` and every event-layer
@@ -1394,12 +1423,23 @@ def _is_tool_span(observation: Observation) -> bool:
     return (observation.get("name") or "").startswith("tool:")
 
 
+def _is_graftable_span(observation: Observation) -> bool:
+    """Whether transcript ``input``/``output`` may be grafted onto this span by ``tool_use_id``.
+
+    Both a visible ``tool:`` span and a ``sub-agent:<type>`` container (the otelcol-renamed
+    ``tool:Agent``) carry the invoking tool's call id, so each joins its transcript entry the
+    same way. The ``claude_code.tool.execution`` / ``*.blocked_on_user`` siblings do not.
+    """
+    name = observation.get("name") or ""
+    return name.startswith("tool:") or name.startswith(_SUB_AGENT_PREFIX)
+
+
 def _tool_span_ids(traces: list[TraceObservations]) -> set[str]:
-    """Collect the tool-call ids of every visible ``tool:`` span across the source traces."""
+    """Collect the tool-call ids of every graftable ``tool:`` / ``sub-agent:`` span."""
     ids: set[str] = set()
     for _orig_trace_id, observations in traces:
         for observation in observations:
-            if not _is_tool_span(observation):
+            if not _is_graftable_span(observation):
                 continue
             tuid = _tool_use_id(observation)
             if tuid:
@@ -1425,10 +1465,10 @@ def _tool_additions(
 ) -> dict[str, Any]:
     """Return the input/output to graft onto a tool span's create body, empty when none.
 
-    Only a visible ``tool:`` span with a matching transcript entry contributes, and only for
-    a field the source span does not already carry — so collector-provided content (Bash's
-    ``input``) is never overwritten and non-tool spans are untouched. Oversized values are
-    truncated by :func:`_capped`.
+    A visible ``tool:`` span or a ``sub-agent:<type>`` container with a matching transcript
+    entry contributes, and only for a field the source span does not already carry — so
+    collector-provided content (Bash's ``input``) is never overwritten and non-graftable spans
+    are untouched. Oversized values are truncated by :func:`_capped`.
 
     Args:
         observation: The source observation being copied.
@@ -1437,7 +1477,7 @@ def _tool_additions(
     Returns:
         A mapping with ``input`` and/or ``output`` to merge into the body, or ``{}``.
     """
-    if not _is_tool_span(observation):
+    if not _is_graftable_span(observation):
         return {}
     content = tool_content.get(_tool_use_id(observation) or "")
     if content is None:
@@ -1457,6 +1497,9 @@ def _tool_result_size(observation: Observation, tool_content: dict[str, ToolCont
     large tool result reports its true size. None for a non-tool span or one with no reconstructed
     output, so the caller emits no score for it.
     """
+    # UPGRADE: sizing stays tool:-only, so a sub-agent's grafted output is not sized for the #101
+    # bloat chart — widen to _is_graftable_span if sub-agent report bloat needs charting (it would
+    # add a tool_result_size score per sub-agent, a cardinality change worth its own test).
     if not _is_tool_span(observation):
         return None
     content = tool_content.get(_tool_use_id(observation) or "")
@@ -1486,9 +1529,9 @@ def _copy_event(
     The type tracks the source: a ``GENERATION`` becomes a ``generation-create``, anything
     else a ``span-create``. ``usageDetails`` and ``model`` are re-passed so Langfuse
     recomputes ``costDetails`` identically; an explicit ``costDetails`` is forwarded too.
-    For a visible ``tool:`` span, transcript-sourced ``input``/``output`` is grafted into the
-    create body (see :func:`_tool_additions`) so the fresh observation carries content the
-    native span lacked, set in the same create event that fixes its name and type.
+    For a graftable (``tool:`` / ``sub-agent:``) span, transcript-sourced ``input``/``output`` is
+    grafted into the create body (see :func:`_tool_additions`) so the fresh observation carries
+    content the native span lacked, set in the same create event that fixes its name and type.
 
     Args:
         observation: The source observation to copy.
@@ -1550,7 +1593,7 @@ def _duration_class(event: IngestEvent) -> str:
     if event["type"] == "generation-create":
         return "llm_request"
     name = body.get("name") or ""
-    if _is_gate_observation(body) or name == _FOLD_BLOCKED_NAME:
+    if _is_gate_observation(body) or name == _FOLD_BLOCKED_NAME or name.startswith(_WAIT_PREFIX):
         return "wait"
     if name.startswith("step:") or name in (_PRE_STEP_NAME, _POST_STEP_NAME):
         return "step"
@@ -1779,6 +1822,48 @@ def _apply_container_rollups(
             intervals=intervals,
             exclude=duration_exclude,
         )
+
+
+def _strip_container_usage(copies: list[IngestEvent]) -> list[IngestEvent]:
+    """Drop own usage from any span copy that has a generation descendant, in place (#161).
+
+    A container span's own ``usageDetails`` would double-count against its generation children
+    in both the subtree rollup and Langfuse's trace cost, so a span (never a generation) with a
+    ``generation-create`` anywhere in its subtree must carry no usage of its own. Native
+    sub-agent / interaction containers already ship empty usage; this is the future-proof guard
+    should the collector ever stamp usage on a container.
+
+    Args:
+        copies: The assembled observation copies. Mutated in place and returned.
+
+    Returns:
+        The same list, with container usage/cost stripped.
+    """
+    bodies = [event["body"] for event in copies]
+    _by_id, children = build_tree(bodies)
+    generation_ids = {
+        event["body"]["id"] for event in copies if event["type"] == "generation-create"
+    }
+
+    def _has_generation_descendant(node_id: str) -> bool:
+        stack = list(children.get(node_id, []))
+        while stack:
+            current = stack.pop()
+            if current in generation_ids:
+                return True
+            stack.extend(children.get(current, []))
+        return False
+
+    for event in copies:
+        body = event["body"]
+        if event["type"] == "generation-create":
+            continue
+        if not (body.get("usageDetails") or body.get("costDetails")):
+            continue
+        if _has_generation_descendant(body["id"]):
+            body.pop("usageDetails", None)
+            body.pop("costDetails", None)
+    return copies
 
 
 def _earliest_start(traces: list[TraceObservations]) -> str:
@@ -2161,6 +2246,7 @@ def build_batch(
     tool_content: dict[str, ToolContent] | None = None,
     *,
     keep_noop_guards: bool = False,
+    commits: list[dict[str, Any]] | None = None,
 ) -> list[IngestEvent]:
     """Assemble one nested trace from a spoke's source traces and their observations.
 
@@ -2227,7 +2313,23 @@ def build_batch(
         copies, traces, tool_content, spoke_run_id=spoke_run_id, trace_id=trace_id
     )
     events = [trace_event, root_event, *step_events, *copies]
-    _apply_container_rollups(events, duration_exclude=_hook_event_exclude(events))
+    commit_events = _commit_events(
+        commits or [],
+        spoke_run_id=spoke_run_id,
+        trace_id=trace_id,
+        cycle=False,
+        parent_for=lambda _at: root_id,
+    )
+    events.extend(commit_events)
+    gate_park = _gate_park_event(
+        traces, spoke_run_id=spoke_run_id, trace_id=trace_id, cycle=False, parent_id=root_id
+    )
+    if gate_park is not None:
+        events.append(gate_park)
+    # Commit instants are excluded from duration: an author time outside the captured span would
+    # otherwise stretch the end-time-less root's subtree interval and inflate total_ms/self.
+    commit_ids = {event["id"] for event in commit_events}
+    _apply_container_rollups(events, duration_exclude=_hook_event_exclude(events) | commit_ids)
     return events
 
 
@@ -2250,10 +2352,11 @@ def _assemble_copies(
     spans under a ``guards`` group and drops the no-op ones unless ``keep_noop_guards``
     (:func:`_apply_guard_groups`), stamps a lagging ``endTime`` onto ``hook_execution_complete``
     events (:func:`_stamp_hook_endtimes`), stamps WARNING/ERROR failure levels
-    (:func:`_apply_levels`), and demotes session-startup instants onto ``root_event``'s metadata
-    (:func:`_collapse_startup_instants`). View A wraps these in local step nodes; View B re-homes
-    them onto the cycle axis. ``root_event`` is the view's own synthetic root (its metadata is
-    mutated in place).
+    (:func:`_apply_levels`), demotes session-startup instants onto ``root_event``'s metadata
+    (:func:`_collapse_startup_instants`), and strips own usage from any container that has a
+    generation descendant (:func:`_strip_container_usage`). View A wraps these in local step
+    nodes; View B re-homes them onto the cycle axis. ``root_event`` is the view's own synthetic
+    root (its metadata is mutated in place).
     """
     tool_index = _build_tool_index(traces)
     request_index = _build_request_index(traces)
@@ -2301,7 +2404,8 @@ def _assemble_copies(
     )
     copies = _stamp_hook_endtimes(copies)
     copies = _apply_levels(copies)
-    return _collapse_startup_instants(copies, root_event)
+    copies = _collapse_startup_instants(copies, root_event)
+    return _strip_container_usage(copies)
 
 
 def _cycle_step_for(start: str, windows: list[StepWindow]) -> str:
@@ -2528,6 +2632,7 @@ def build_cycle_batch(
     tool_content: dict[str, ToolContent] | None = None,
     *,
     keep_noop_guards: bool = False,
+    commits: list[dict[str, Any]] | None = None,
 ) -> list[IngestEvent]:
     """Assemble the View B (steps -> work) ``spokecycle-<spoke>`` trace (#113).
 
@@ -2610,7 +2715,32 @@ def build_cycle_batch(
         latest=_latest_time(traces),
     )
     events = [trace_event, root_event, *step_events, *copies]
-    _apply_container_rollups(events, duration_exclude=marker_ids | _hook_event_exclude(events))
+    step_id_for = _cycle_step_ids(spoke_run_id, windows) if windows else {}
+
+    def _cycle_commit_parent(authored_at: str) -> str:
+        if not windows:
+            return root_id
+        return step_id_for.get(_cycle_step_for(authored_at, windows), root_id)
+
+    commit_events = _commit_events(
+        commits or [],
+        spoke_run_id=spoke_run_id,
+        trace_id=trace_id,
+        cycle=True,
+        parent_for=_cycle_commit_parent,
+    )
+    events.extend(commit_events)
+    # The park node is a visible block on the axis, but it overlaps the step partition it falls in,
+    # so it is EXCLUDED from View B's duration attribution (the axis already partitions the time).
+    # Commit instants are likewise excluded so an out-of-window author time cannot stretch the root.
+    duration_exclude = marker_ids | _hook_event_exclude(events) | {e["id"] for e in commit_events}
+    gate_park = _gate_park_event(
+        traces, spoke_run_id=spoke_run_id, trace_id=trace_id, cycle=True, parent_id=root_id
+    )
+    if gate_park is not None:
+        events.append(gate_park)
+        duration_exclude = duration_exclude | {gate_park["id"]}
+    _apply_container_rollups(events, duration_exclude=duration_exclude)
     return events
 
 
@@ -3169,6 +3299,220 @@ def apply_llm_decomposition(
     return decomposed
 
 
+def _memoized_counter(counter: TokenCounter) -> TokenCounter:
+    """Wrap a token counter to cache counts by content hash across the whole build (#160).
+
+    The stable prefix (tools / system / rules / skills) and every unchanged message are re-counted
+    on every consecutive snapshot and on every #99 decomposition, so the same text is measured
+    many times over a run; caching by sha256 collapses that to one call per distinct text. A
+    counter failure (``CountTokensError``) is not cached — it propagates so the caller's char/4
+    fallback still applies — so only successful counts are memoized.
+
+    Args:
+        counter: The underlying token counter.
+
+    Returns:
+        A counter with the same contract, backed by a per-build content-hash cache.
+    """
+    cache: dict[str, int] = {}
+
+    def _counting(text: str) -> int:
+        key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if key not in cache:
+            cache[key] = counter(text)
+        return cache[key]
+
+    return _counting
+
+
+def _blob_hash(value: object) -> str:
+    """Return a stable content hash of a str or JSON-able value (skill-output match identity)."""
+    text = (
+        value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
+    )
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _skill_output_hashes(
+    traces: list[TraceObservations], tool_content: dict[str, ToolContent]
+) -> dict[str, str]:
+    """Map each ``tool:Skill`` transcript output's content hash to its skill name (#160).
+
+    The exact identity a skill-load injects into the next request is the tool_result the
+    ``tool:Skill`` returned, so its content hash keys the attribution; the name comes from the
+    tool's transcript input (:func:`_activated_skill_name`).
+    """
+    hashes: dict[str, str] = {}
+    for _orig_trace_id, observations in traces:
+        for observation in observations:
+            if (observation.get("name") or "") != _SKILL_TOOL_NAME:
+                continue
+            tuid = _tool_use_id(observation)
+            content = tool_content.get(tuid or "")
+            name = _activated_skill_name(tuid, tool_content)
+            if content is None or content.output is None or not name:
+                continue
+            hashes[_blob_hash(content.output)] = name
+    return hashes
+
+
+def _match_skill_output(text: str | None, skill_hashes: dict[str, str]) -> str | None:
+    """Return the skill whose output an added message injected, matched by content hash, else None.
+
+    The message text is the canonical ``{role, content}`` JSON; a skill-load rides a
+    ``tool_result`` block whose ``content`` is the skill's output — that block's hash (or, for a
+    plain-string message content, the content itself) is matched against :func:`_skill_output_hashes`.
+    """
+    if not text:
+        return None
+    try:
+        message = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        return skill_hashes.get(_blob_hash(content))
+    for block in content or []:
+        if isinstance(block, dict) and block.get("type") == "tool_result":
+            skill = skill_hashes.get(_blob_hash(block.get("content")))
+            if skill:
+                return skill
+    return None
+
+
+def _label_skill_loads(
+    added: list[dict[str, object]],
+    curr_items: list[ContextItem],
+    skill_hashes: dict[str, str],
+) -> None:
+    """Label each added-message row whose injected content matches a skill output, in place (#160)."""
+    if not skill_hashes:
+        return
+    text_by_name = {item.name: item.text for item in curr_items if item.category == "messages"}
+    for row in added:
+        if row.get("category") != "messages":
+            continue
+        skill = _match_skill_output(text_by_name.get(str(row.get("name"))), skill_hashes)
+        if skill:
+            row["skill"] = skill
+
+
+def _context_delta_summary(delta: ContextDelta) -> dict[str, int]:
+    """Reduce a context delta to the token totals rolled up onto a step (net / added / removed)."""
+    added = sum(int(cast(int, row["tokens"])) for row in delta.added)
+    removed = sum(int(cast(int, row["tokens"])) for row in delta.removed)
+    return {"net_tokens": delta.net_tokens, "added": added, "removed": removed}
+
+
+def apply_context_deltas(
+    batch: list[IngestEvent],
+    traces: list[TraceObservations],
+    bodies_dir: Path,
+    *,
+    counter: TokenCounter,
+    price: float,
+    tool_content: dict[str, ToolContent],
+) -> dict[tuple[str, str], dict[str, int]]:
+    """Stamp ``metadata.context_delta`` on each llm_request copy from consecutive bodies (#160).
+
+    For every LLM call after the first (aligned positionally with its raw request body, same count
+    gate as :func:`apply_llm_decomposition`), the body is diffed against its predecessor
+    (:func:`telemetry.request_body.diff_snapshots`) into added / removed / size-changed rows,
+    ``net_tokens`` (which reconciles ± remainder against the call's observed ``cache_creation``),
+    and a compaction ``label``. An added message whose injected content matches a ``tool:Skill``
+    output is tagged with the skill name (:func:`_label_skill_loads`). The delta is stamped on the
+    call's View A copy only (single-emit) as metadata — it never touches billed usage.
+
+    Args:
+        batch: The assembled View A events; the llm_request copies are mutated in place.
+        traces: The source traces paired with their observations.
+        bodies_dir: The per-spoke raw-body dump directory.
+        counter: Token counter (memoize it — the stable prefix repeats every snapshot).
+        price: Cache-creation price in USD per token.
+        tool_content: Tool-call-id to :class:`ToolContent`, the source of skill outputs.
+
+    Returns:
+        A map of each stamped call's ``(orig_trace_id, observation_id)`` to its
+        :func:`_context_delta_summary`, so the step ``rollup.context`` can be aggregated per view.
+    """
+    calls = _llm_requests_in_order(traces)
+    bodies = find_request_files(bodies_dir)
+    if not calls or len(calls) != len(bodies):
+        return {}
+    by_id = {event["body"]["id"]: event for event in batch}
+    skill_hashes = _skill_output_hashes(traces, tool_content)
+    summaries: dict[tuple[str, str], dict[str, int]] = {}
+    prev_items: list[ContextItem] | None = None
+    for (orig_trace_id, observation), body_path in zip(calls, bodies):
+        try:
+            curr_items = snapshot_items_from_path(body_path)
+        except (OSError, json.JSONDecodeError):
+            logger.warning("cannot snapshot request body %s", body_path)
+            prev_items = None
+            continue
+        predecessor, prev_items = prev_items, curr_items
+        if predecessor is None:
+            continue  # the first call has no prior snapshot to diff against
+        event = by_id.get(_copy_id(orig_trace_id, observation["id"]))
+        if event is None:
+            continue  # the call's copy is not in the batch (defensive; should not happen)
+        delta = diff_snapshots(predecessor, curr_items, counter=counter, price=price)
+        _label_skill_loads(delta.added, curr_items, skill_hashes)
+        event["body"].setdefault("metadata", {})["context_delta"] = {
+            "added": delta.added,
+            "removed": delta.removed,
+            "changed": delta.changed,
+            "net_tokens": delta.net_tokens,
+            "label": delta.label,
+        }
+        summaries[(orig_trace_id, observation["id"])] = _context_delta_summary(delta)
+    return summaries
+
+
+def _apply_context_rollups(
+    events: list[IngestEvent], summary_by_id: dict[str, dict[str, int]]
+) -> None:
+    """Aggregate ``metadata.rollup.context`` onto each step node from its llm_request deltas (#160).
+
+    Sums the per-call context summaries of every llm_request copy in a step's subtree into
+    ``{net_tokens, added, removed}`` under the step's existing ``metadata.rollup``, so per-cycle
+    context cost reads without a full-trace GET. View-agnostic: the caller keys ``summary_by_id``
+    by that view's copy ids (View A ``tree-…`` / View B ``cyc-…``). A step with no llm_request
+    delta gets no ``context`` key.
+
+    Args:
+        events: The assembled events for one view; step-node bodies are mutated in place.
+        summary_by_id: Copy id (in this view's namespace) to its context-delta summary.
+    """
+    bodies = [event["body"] for event in events if event["type"] != "trace-create"]
+    _by_id, children = build_tree(bodies)
+    for body in bodies:
+        node_id = body["id"]
+        if not (node_id.startswith(_STEP_PREFIX) or node_id.startswith(_CYCLE_STEP_PREFIX)):
+            continue
+        context = _sum_context(node_id, children, summary_by_id)
+        if context is not None:
+            body.setdefault("metadata", {}).setdefault("rollup", {})["context"] = context
+
+
+def _sum_context(
+    node_id: str, children: dict[str | None, list[str]], summary_by_id: dict[str, dict[str, int]]
+) -> dict[str, int] | None:
+    """Sum the context summaries of a step's descendant llm_requests, or None when it has none."""
+    total = {"net_tokens": 0, "added": 0, "removed": 0}
+    found = False
+    stack = list(children.get(node_id, []))
+    while stack:
+        current = stack.pop()
+        summary = summary_by_id.get(current)
+        if summary is not None:
+            found = True
+            for key in total:
+                total[key] += summary[key]
+        stack.extend(children.get(current, []))
+    return total if found else None
+
+
 def _merge_trace_tags(batch: list[IngestEvent], tags: list[str]) -> None:
     """Merge ``tags`` into the batch's ``trace-create`` event, de-duplicated, order-stable."""
     if not tags:
@@ -3310,7 +3654,7 @@ def _score_event(
     spoke_run_id: str,
     *,
     name: str,
-    value: int,
+    value: float,
     trace_id: str,
     base_ts: str,
     observation_id: str | None = None,
@@ -3387,8 +3731,8 @@ def _earliest_after(candidates: list[str], floor: datetime) -> str | None:
     return best_str
 
 
-def _gate_park_ms(traces: list[TraceObservations]) -> int | None:
-    """Return the PLAN-gate park wait in ms, or None when the spoke never parked at a gate.
+def _gate_park_bounds(traces: list[TraceObservations]) -> tuple[str, str] | None:
+    """Return the PLAN-gate park's ``(start, end)`` ISO bounds, or None when the spoke never parked.
 
     The park starts at the end of the earliest gate observation (:func:`_is_gate_observation`,
     the ``spoke-ready.sh --gate`` emission) and ends at the first genuine spoke activity
@@ -3413,7 +3757,162 @@ def _gate_park_ms(traces: list[TraceObservations]) -> int | None:
     resume = _earliest_after(activity_starts, gate_floor)
     if resume is None:
         return None
-    return _elapsed_ms(gate_end, resume)
+    return gate_end, resume
+
+
+def _gate_park_ms(traces: list[TraceObservations]) -> int | None:
+    """Return the PLAN-gate park wait in ms, or None when the spoke never parked at a gate."""
+    bounds = _gate_park_bounds(traces)
+    return _elapsed_ms(*bounds) if bounds is not None else None
+
+
+def _parse_commits(dump: str) -> list[dict[str, Any]]:
+    """Parse a ``git log --numstat`` dump into per-commit records (#162).
+
+    The dump is produced with a ``commit<US>%H<US>%aI<US>%s`` format line per commit (``<US>`` is
+    :data:`_COMMIT_FIELD_SEP`), followed by the commit's ``additions<TAB>deletions<TAB>path``
+    numstat lines. A binary file's counts are ``-`` and contribute 0. Records preserve dump order.
+
+    Args:
+        dump: The raw ``git log --numstat`` output.
+
+    Returns:
+        One record per commit: ``{sha, message, authored_at, files, additions, deletions}``.
+    """
+    commits: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for line in dump.splitlines():
+        if line.startswith(_COMMIT_LINE_MARKER + _COMMIT_FIELD_SEP):
+            parts = line.split(_COMMIT_FIELD_SEP)
+            if len(parts) < 4:
+                current = None
+                continue
+            current = {
+                "sha": parts[1],
+                "message": _COMMIT_FIELD_SEP.join(parts[3:]),
+                "authored_at": parts[2],
+                "files": [],
+                "additions": 0,
+                "deletions": 0,
+            }
+            commits.append(current)
+        elif current is not None and line.strip():
+            columns = line.split("\t")
+            if len(columns) == 3:
+                added, deleted, path = columns
+                current["additions"] += int(added) if added.isdigit() else 0
+                current["deletions"] += int(deleted) if deleted.isdigit() else 0
+                current["files"].append(path)
+    return commits
+
+
+def _load_commits(path: Path | None) -> list[dict[str, Any]]:
+    """Read and parse a commit dump path, or return ``[]`` when absent/unreadable (best-effort)."""
+    if path is None:
+        return []
+    try:
+        # errors="replace": a commit subject in a non-UTF-8 locale must degrade a glyph, never
+        # crash the land-time view build (the whole ingest step is best-effort).
+        return _parse_commits(path.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        logger.warning("cannot read commits dump %s", path)
+        return []
+
+
+def _commit_id(spoke_run_id: str, sha: str, *, cycle: bool) -> str:
+    """Return the deterministic id of a commit node (per view, idempotent across reruns)."""
+    namespace = "cyccommit" if cycle else "commit"
+    digest = hashlib.sha1(f"{spoke_run_id}:{namespace}:{sha}".encode()).hexdigest()[:24]
+    return _COMMIT_PREFIX + digest
+
+
+def _gate_park_node_id(spoke_run_id: str, *, cycle: bool) -> str:
+    """Return the deterministic id of the gate-park node (per view, idempotent across reruns)."""
+    namespace = "cycgatepark" if cycle else "gatepark"
+    digest = hashlib.sha1(f"{spoke_run_id}:{namespace}".encode()).hexdigest()[:24]
+    return _GATE_PARK_PREFIX + digest
+
+
+def _commit_events(
+    commits: list[dict[str, Any]],
+    *,
+    spoke_run_id: str,
+    trace_id: str,
+    cycle: bool,
+    parent_for: Callable[[str], str],
+) -> list[IngestEvent]:
+    """Build ``commit:<sha7>`` timeline nodes, each an instant at its author time (#162).
+
+    Each node is placed under ``parent_for(author_time)`` (the root in View A, the containing step
+    in View B) and carries ``{sha, message, files, additions, deletions}`` metadata but no usage,
+    so it never affects trace cost or the duration rollup.
+    """
+    events: list[IngestEvent] = []
+    for commit in commits:
+        sha = str(commit["sha"])
+        authored_at = str(commit["authored_at"])
+        node_id = _commit_id(spoke_run_id, sha, cycle=cycle)
+        events.append(
+            {
+                "id": node_id,
+                "type": "span-create",
+                "timestamp": authored_at,
+                "body": {
+                    "id": node_id,
+                    "traceId": trace_id,
+                    "parentObservationId": parent_for(authored_at),
+                    "name": f"commit:{sha[:7]}",
+                    "startTime": authored_at,
+                    "endTime": authored_at,
+                    "metadata": {
+                        "sha": sha,
+                        "message": commit["message"],
+                        "files": commit["files"],
+                        "additions": commit["additions"],
+                        "deletions": commit["deletions"],
+                    },
+                },
+            }
+        )
+    return events
+
+
+def _gate_park_event(
+    traces: list[TraceObservations],
+    *,
+    spoke_run_id: str,
+    trace_id: str,
+    cycle: bool,
+    parent_id: str,
+) -> IngestEvent | None:
+    """Build the ``wait:gate-park`` timeline block from the gate-park bounds, or None (#162).
+
+    The block spans the gate's end to the resumption after approval (:func:`_gate_park_bounds`);
+    its ``wait:`` name routes it into the duration ``wait`` bucket, so in View A the park time
+    moves out of the root's ``self`` gap without changing ``total_ms``.
+
+    UPGRADE: in the rare case a non-activity span (a second gate, a hook) falls inside the park
+    window, both it and this node book the overlap into ``wait`` (span-time, not wall-time) — carve
+    the node's interval around such spans if the wait bucket ever needs to be exact.
+    """
+    bounds = _gate_park_bounds(traces)
+    if bounds is None:
+        return None
+    start, end = bounds
+    node_id = _gate_park_node_id(spoke_run_id, cycle=cycle)
+    return {
+        "id": node_id,
+        "type": "span-create",
+        "timestamp": start,
+        "body": {
+            "id": node_id,
+            "traceId": trace_id,
+            "parentObservationId": parent_id,
+            "name": _GATE_PARK_NODE_NAME,
+            "startTime": start,
+            "endTime": end,
+        },
+    }
 
 
 def build_score_events(
@@ -3491,6 +3990,87 @@ def build_score_events(
     return events
 
 
+def _step_phase(subject: str) -> str:
+    """Return the canonical solo-cycle phase named in a step subject, or ``other`` (#158).
+
+    ``"A-RED: red first"`` → ``RED``; ``"ANCHOR #154 …"`` → ``ANCHOR``; a compound subject like
+    ``"REVIEW + PUSH"`` takes the leftmost keyword (``REVIEW``). The result is always one of the
+    closed :data:`_STEP_PHASES` set or ``other`` — never free text — so it is a safe score-name
+    suffix.
+    """
+    match = _STEP_PHASE_RE.search(subject.upper())
+    return match.group(1) if match else _STEP_PHASE_OTHER
+
+
+def _step_phase_of(body: dict[str, Any]) -> str:
+    """Return the phase of one View B step node: ``pre`` / ``post`` for the boundary partitions,
+    else the phase parsed from its subject."""
+    name = body.get("name") or ""
+    if name == _PRE_STEP_NAME:
+        return _PRE_STEP_KEY
+    if name == _POST_STEP_NAME:
+        return _POST_STEP_KEY
+    subject = (body.get("metadata") or {}).get("subject") or name
+    return _step_phase(subject)
+
+
+def build_step_cost_scores(
+    spoke_run_id: str, cycle_batch: list[IngestEvent], *, base_ts: str, price: float
+) -> list[IngestEvent]:
+    """Build per-phase step cost/token scores from View B's step rollups (#158).
+
+    ``step:*`` nodes carry token rollups only in ``metadata.rollup`` (never ``usageDetails`` — the
+    #114 double-count guard), so per-step cost is invisible to the Metrics API. Score NAMES are a
+    metrics dimension, so each View B step emits ``step_cost_usd:<PHASE>`` and
+    ``step_tokens_written:<PHASE>`` from its rollup's ``written`` tokens (cost = written × the
+    cache-creation ``price``), observation-scoped to the step node with a deterministic id.
+
+    Emitted on View B (the cycle lens) ONLY: a step lives on both views, but scoring both would
+    double every phase in a Scores-view sum, so — like the other per-call enrichments — this is
+    single-emit. A step with no rollup (a childless boundary partition) is skipped.
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids).
+        cycle_batch: The assembled View B events (its step nodes' rollups are read).
+        base_ts: ISO timestamp stamped on every score event.
+        price: Cache-creation price in USD per written token.
+
+    Returns:
+        The ``score-create`` events (empty when View B has no step rollups).
+    """
+    trace_id = cycle_trace_id_for(spoke_run_id)
+    events: list[IngestEvent] = []
+    for event in cycle_batch:
+        body = event["body"]
+        if not body["id"].startswith(_CYCLE_STEP_PREFIX):
+            continue
+        written = ((body.get("metadata") or {}).get("rollup") or {}).get("written")
+        if written is None:
+            continue
+        phase = _step_phase_of(body)
+        events.append(
+            _score_event(
+                spoke_run_id,
+                name=f"{_STEP_COST_SCORE}:{phase}",
+                value=written * price,
+                trace_id=trace_id,
+                base_ts=base_ts,
+                observation_id=body["id"],
+            )
+        )
+        events.append(
+            _score_event(
+                spoke_run_id,
+                name=f"{_STEP_TOKENS_WRITTEN_SCORE}:{phase}",
+                value=written,
+                trace_id=trace_id,
+                base_ts=base_ts,
+                observation_id=body["id"],
+            )
+        )
+    return events
+
+
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse the CLI arguments for the spoke-tree assembler."""
     env = os.environ
@@ -3549,6 +4129,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "(#157)."
         ),
     )
+    parser.add_argument(
+        "--commits",
+        type=Path,
+        default=None,
+        help=(
+            "A `git log --numstat` dump of the spoke branch's origin/main..HEAD commits "
+            "(commit<US>%%H<US>%%aI<US>%%s format lines); each becomes a commit:<sha7> timeline "
+            "node (#162). Omitted for a non-land re-run (no worktree to read commits from)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -3577,17 +4167,30 @@ def main(argv: list[str] | None = None) -> int:
     traces = fetch_session(args.spoke_run_id, get)
     scan_root = transcript_scan_root(args.projects, args.root.resolve())
     tool_content = scan_transcripts(scan_root, _tool_span_ids(traces))
+    commits = _load_commits(args.commits)
     batch = build_batch(
-        traces, args.spoke_run_id, tool_content, keep_noop_guards=args.keep_noop_guards
+        traces,
+        args.spoke_run_id,
+        tool_content,
+        keep_noop_guards=args.keep_noop_guards,
+        commits=commits,
     )
     cycle_batch = build_cycle_batch(
-        traces, args.spoke_run_id, tool_content, keep_noop_guards=args.keep_noop_guards
+        traces,
+        args.spoke_run_id,
+        tool_content,
+        keep_noop_guards=args.keep_noop_guards,
+        commits=commits,
     )
     mode, lane = read_mode_lane(args.root.resolve())
     apply_mode_lane_tags(batch, mode, lane)
     apply_mode_lane_tags(cycle_batch, mode, lane)
 
-    counter = make_counter(endpoint=args.endpoint, api_key=args.api_key, model=args.model)
+    # One counter, memoized by content hash and shared across the loaded-context measurement, the
+    # #99 decomposition, and the #160 context deltas — the stable prefix repeats on every snapshot.
+    counter = _memoized_counter(
+        make_counter(endpoint=args.endpoint, api_key=args.api_key, model=args.model)
+    )
     base_ts = _earliest_start(traces)
     bodies_dir = args.request_bodies or (args.root.resolve() / _BODY_DIR_CONVENTION)
     request_rows = request_context_rows(bodies_dir, counter=counter, price=args.price)
@@ -3616,8 +4219,18 @@ def main(argv: list[str] | None = None) -> int:
     # _llm_requests_in_order and re-stat find_request_files over the same inputs — compute the
     # calls↔bodies pairing once in main and pass it in if the body count ever makes it measurable.
     efforts = apply_request_body_metadata(batch, traces, bodies_dir)
+    deltas = apply_context_deltas(
+        batch, traces, bodies_dir, counter=counter, price=args.price, tool_content=tool_content
+    )
+    _apply_context_rollups(batch, {_copy_id(o, i): s for (o, i), s in deltas.items()})
+    _apply_context_rollups(
+        cycle_batch, {cycle_copy_id_for(o, i): s for (o, i), s in deltas.items()}
+    )
     score_events = build_score_events(args.spoke_run_id, traces, batch, base_ts=base_ts)
-    post_in_chunks(batch + context_events + score_events + cycle_batch, post)
+    step_scores = build_step_cost_scores(
+        args.spoke_run_id, cycle_batch, base_ts=base_ts, price=args.price
+    )
+    post_in_chunks(batch + context_events + score_events + cycle_batch + step_scores, post)
 
     trace_id = trace_id_for(args.spoke_run_id)
     cycle_trace_id = cycle_trace_id_for(args.spoke_run_id)
@@ -3627,8 +4240,11 @@ def main(argv: list[str] | None = None) -> int:
         f"(roots collapsed to 1), {filled} tool spans filled from transcript, "
         f"{len(rows)} loaded-context items collapsed into 1 node (source: {source}), "
         f"{decomposed} llm_requests cache-decomposed, "
+        f"{len(deltas)} llm_requests context-delta stamped, "
         f"{efforts} llm_requests effort-tagged, "
         f"{len(score_events)} numeric scores emitted, "
+        f"{len(step_scores)} per-phase step cost/token scores emitted, "
+        f"{len(commits)} commit nodes synthesized, "
         f"tagged mode={mode} lane={lane}; "
         f"{len(cycle_batch) - 2} observations assembled under cycle trace {cycle_trace_id}"
     )

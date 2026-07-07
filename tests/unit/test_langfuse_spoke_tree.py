@@ -33,7 +33,13 @@ from telemetry.langfuse_spoke_tree import (
     ToolContent,
     _copy_id,
     _decomp_metadata,
+    _gate_park_ms,
     _is_own_output,
+    _memoized_counter,
+    _parse_commits,
+    _step_phase,
+    _tool_span_ids,
+    apply_context_deltas,
     apply_llm_decomposition,
     apply_mode_lane_tags,
     apply_request_body_metadata,
@@ -41,6 +47,7 @@ from telemetry.langfuse_spoke_tree import (
     build_cycle_batch,
     build_loaded_context_events,
     build_score_events,
+    build_step_cost_scores,
     build_step_windows,
     cycle_copy_id_for,
     cycle_root_id_for,
@@ -3102,6 +3109,143 @@ class TestToolContentFilledIntoCreateBody:
         assert "output" not in body
 
 
+class TestSubAgentContentGraft:
+    """#161: ``sub-agent:*`` container spans graft transcript content like ``tool:`` spans.
+
+    The otelcol renames ``tool:Agent`` → ``sub-agent:<type>``, so the review verdict the
+    sub-agent returned (its transcript ``tool_result``) must still be grafted as ``output``.
+    """
+
+    def test_subagent_output_set_from_transcript(self, tmp_path: Path) -> None:
+        span = _tool_obs("sa1", "sub-agent:code-review", "tu-1")
+        _write_transcript(
+            tmp_path,
+            [
+                _tool_use("tu-1", "Agent", {"prompt": "review the diff"}),
+                _tool_result("tu-1", "REVIEW: SHIP - no blocking issues"),
+            ],
+        )
+
+        batch = build_batch([("trace", [span])], SPOKE, scan_transcripts(tmp_path, {"tu-1"}))
+
+        body = _by_orig(batch, "trace", "sa1")["body"]
+        assert body["output"] == "REVIEW: SHIP - no blocking issues"
+        assert body["input"] == {"prompt": "review the diff"}
+
+    def test_subagent_graft_does_not_overwrite_native_output(self, tmp_path: Path) -> None:
+        # Non-destructive fill: a sub-agent span already carrying output keeps it.
+        span = _tool_obs("sa1", "sub-agent:code-review", "tu-1", output="native verdict")
+        _write_transcript(
+            tmp_path,
+            [
+                _tool_use("tu-1", "Agent", {"prompt": "x"}),
+                _tool_result("tu-1", "transcript verdict"),
+            ],
+        )
+
+        batch = build_batch([("trace", [span])], SPOKE, scan_transcripts(tmp_path, {"tu-1"}))
+
+        assert _by_orig(batch, "trace", "sa1")["body"]["output"] == "native verdict"
+
+    def test_large_subagent_output_is_truncated_with_marker(self, tmp_path: Path) -> None:
+        span = _tool_obs("sa1", "sub-agent:general-purpose", "tu-1")
+        huge = "x" * (_MAX_CONTENT_CHARS + 500)
+        _write_transcript(
+            tmp_path,
+            [_tool_use("tu-1", "Agent", {"prompt": "x"}), _tool_result("tu-1", huge)],
+        )
+
+        batch = build_batch([("trace", [span])], SPOKE, scan_transcripts(tmp_path, {"tu-1"}))
+
+        output = _by_orig(batch, "trace", "sa1")["body"]["output"]
+        assert output.endswith(_TRUNCATION_MARKER)
+        assert len(output) == _MAX_CONTENT_CHARS + len(_TRUNCATION_MARKER)
+
+    def test_subagent_tool_use_id_included_in_scan_set(self) -> None:
+        # _tool_span_ids scopes scan_transcripts; a sub-agent id absent here is never fetched.
+        span = _tool_obs("sa1", "sub-agent:code-review", "tu-1")
+
+        assert _tool_span_ids([("trace", [span])]) == {"tu-1"}
+
+
+class TestSubAgentRollupPinning:
+    """#161: pin the existing sub-agent nesting/rollup behavior against regressions."""
+
+    def test_subagent_container_usage_absent_but_rollup_present(self) -> None:
+        # A sub-agent container holding one generation: the copy carries no own usageDetails
+        # (double-count guard) but a subtree token rollup.
+        agent = _obs("sa1", "sub-agent:code-review", parent=None)
+        gen = _obs(
+            "sg1",
+            "llm_request",
+            type_="GENERATION",
+            parent="sa1",
+            usageDetails={
+                "input": 10,
+                "output": 4,
+                "cache_read_input_tokens": 7,
+                "cache_creation_input_tokens": 2,
+            },
+        )
+
+        batch = build_batch([("trace-a", [agent, gen])], SPOKE)
+
+        body = _by_orig(batch, "trace-a", "sa1")["body"]
+        assert not body.get("usageDetails")
+        assert body["metadata"]["rollup"] == {
+            "reused": 7,
+            "written": 2,
+            "input": 10,
+            "output": 4,
+            "duration": _dur(0),
+        }
+
+    def test_container_with_generation_descendant_strips_native_usage(self) -> None:
+        # Future-proof guard: even if the collector someday stamps usage on the container
+        # span, the copy must drop it so trace cost never double-counts the generation child.
+        agent = _obs(
+            "sa1", "sub-agent:code-review", parent=None, usageDetails={"input": 999, "output": 999}
+        )
+        gen = _obs(
+            "sg1",
+            "llm_request",
+            type_="GENERATION",
+            parent="sa1",
+            usageDetails={"input": 10, "output": 4},
+        )
+
+        batch = build_batch([("trace-a", [agent, gen])], SPOKE)
+
+        assert not _by_orig(batch, "trace-a", "sa1")["body"].get("usageDetails")
+
+    def test_nested_subagent_trees_roll_up_recursively(self) -> None:
+        # sub-agent -> nested sub-agent -> generation: the outer rollup sums the whole subtree.
+        outer = _obs("sa1", "sub-agent:code-review", parent=None)
+        inner = _obs("sa2", "sub-agent:general-purpose", parent="sa1")
+        gen = _obs(
+            "sg1",
+            "llm_request",
+            type_="GENERATION",
+            parent="sa2",
+            usageDetails={
+                "input": 10,
+                "output": 4,
+                "cache_read_input_tokens": 7,
+                "cache_creation_input_tokens": 2,
+            },
+        )
+
+        batch = build_batch([("trace-a", [outer, inner, gen])], SPOKE)
+
+        assert _by_orig(batch, "trace-a", "sa1")["body"]["metadata"]["rollup"] == {
+            "reused": 7,
+            "written": 2,
+            "input": 10,
+            "output": 4,
+            "duration": _dur(0),
+        }
+
+
 class TestPrefixTotal:
     def test_sums_cache_read_and_creation_of_earliest_call(self) -> None:
         early = _obs(
@@ -3480,6 +3624,273 @@ class TestLlmDecompositionMetadata:
         assert meta["measured"] == 17
         item_sum = sum(tok for comp in meta["components"].values() for tok in comp.values())
         assert item_sum == meta["measured"]
+
+
+def _canonical_msg(message: dict) -> str:
+    """The canonical ``{role, content}`` JSON a snapshot item carries (mirrors _full_message_items)."""
+    return json.dumps(
+        {"role": message["role"], "content": message["content"]},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+class TestMemoizedCounter:
+    """#160: one token counter memoized by content hash, shared by deltas + decomposition."""
+
+    def test_counts_each_distinct_text_once(self) -> None:
+        seen: list[str] = []
+
+        def spy(text: str) -> int:
+            seen.append(text)
+            return len(text)
+
+        memo = _memoized_counter(spy)
+
+        assert memo("abc") == 3
+        assert memo("abc") == 3  # cached — the underlying counter is not called again
+        assert memo("de") == 2
+        assert seen == ["abc", "de"]
+
+
+class TestContextDeltas:
+    """#160: per-llm_request context deltas from consecutive raw bodies (View A, single-emit)."""
+
+    _TOOL = {"name": "Bash", "description": "d" * 40, "input_schema": {"type": "object"}}
+
+    def _bodies(self, tmp_path: Path, *objs: dict) -> Path:
+        bodies = tmp_path / "bodies"
+        bodies.mkdir()
+        for index, obj in enumerate(objs):
+            (bodies / f"{index:02d}-body.request.json").write_text(
+                json.dumps(obj), encoding="utf-8"
+            )
+        return bodies
+
+    def _body(self, messages: list[dict]) -> dict:
+        return {
+            "tools": [self._TOOL],
+            "system": [{"type": "text", "text": "sys"}],
+            "messages": messages,
+        }
+
+    def _gen(self, obs_id: str, start: str, *, read: int, creation: int) -> dict:
+        return _obs(
+            obs_id,
+            "llm_request",
+            type_="GENERATION",
+            parent="i1",
+            startTime=start,
+            usageDetails={"cache_read_input_tokens": read, "cache_creation_input_tokens": creation},
+        )
+
+    def _meta(self, batch: list[dict], obs_id: str) -> dict:
+        return _by_orig(batch, "tr", obs_id)["body"].get("metadata", {})
+
+    def test_stamps_added_message_delta_on_the_later_call(self, tmp_path: Path) -> None:
+        m1 = {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        m2 = {"role": "assistant", "content": [{"type": "text", "text": "the newest turn"}]}
+        added_tokens = len(_canonical_msg(m2))
+        bodies = self._bodies(tmp_path, self._body([m1]), self._body([m1, m2]))
+        g1 = self._gen("g1", "2026-01-02T00:00:00Z", read=0, creation=100)
+        g2 = self._gen("g2", "2026-01-02T00:00:01Z", read=100, creation=added_tokens)
+        traces = [("tr", [g1, g2])]
+        batch = build_batch(traces, SPOKE)
+
+        apply_context_deltas(batch, traces, bodies, counter=len, price=1.0, tool_content={})
+
+        delta = self._meta(batch, "g2")["context_delta"]
+        # net_tokens reconciles (remainder 0 here) against the call's observed cache_creation.
+        assert delta["net_tokens"] == added_tokens
+        assert any(row["category"] == "messages" for row in delta["added"])
+
+    def test_first_call_has_no_delta(self, tmp_path: Path) -> None:
+        m1 = {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        m2 = {"role": "assistant", "content": [{"type": "text", "text": "next"}]}
+        bodies = self._bodies(tmp_path, self._body([m1]), self._body([m1, m2]))
+        g1 = self._gen("g1", "2026-01-02T00:00:00Z", read=0, creation=100)
+        g2 = self._gen("g2", "2026-01-02T00:00:01Z", read=100, creation=50)
+        traces = [("tr", [g1, g2])]
+        batch = build_batch(traces, SPOKE)
+
+        apply_context_deltas(batch, traces, bodies, counter=len, price=1.0, tool_content={})
+
+        assert "context_delta" not in self._meta(batch, "g1")
+
+    def test_count_gate_mismatch_skips_deltas(self, tmp_path: Path) -> None:
+        # Two bodies but a single llm_request — positional alignment is unsafe → nothing stamped.
+        m1 = {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        bodies = self._bodies(tmp_path, self._body([m1]), self._body([m1]))
+        g1 = self._gen("g1", "2026-01-02T00:00:00Z", read=0, creation=100)
+        traces = [("tr", [g1])]
+        batch = build_batch(traces, SPOKE)
+
+        stamped = apply_context_deltas(
+            batch, traces, bodies, counter=len, price=1.0, tool_content={}
+        )
+
+        assert not stamped
+        assert "context_delta" not in self._meta(batch, "g1")
+
+    def test_skill_added_message_labeled_with_skill_name(self, tmp_path: Path) -> None:
+        m1 = {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        skill_msg = {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "tu-sk", "content": "SKILL BODY"}],
+        }
+        bodies = self._bodies(tmp_path, self._body([m1]), self._body([m1, skill_msg]))
+        skill_span = _tool_obs("sk", "tool:Skill", "tu-sk")
+        g1 = self._gen("g1", "2026-01-02T00:00:00Z", read=0, creation=100)
+        g2 = self._gen("g2", "2026-01-02T00:00:01Z", read=100, creation=40)
+        traces = [("tr", [skill_span, g1, g2])]
+        tool_content = {"tu-sk": ToolContent({"skill": "langfuse"}, "SKILL BODY")}
+        batch = build_batch(traces, SPOKE, tool_content)
+
+        apply_context_deltas(
+            batch, traces, bodies, counter=len, price=1.0, tool_content=tool_content
+        )
+
+        added = self._meta(batch, "g2")["context_delta"]["added"]
+        skill_rows = [row for row in added if row.get("skill") == "langfuse"]
+        assert len(skill_rows) == 1
+
+    def test_compaction_turn_labeled(self, tmp_path: Path) -> None:
+        m1 = {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        big = {"role": "assistant", "content": [{"type": "text", "text": "x" * 12000}]}
+        bodies = self._bodies(tmp_path, self._body([m1, big]), self._body([m1]))
+        g1 = self._gen("g1", "2026-01-02T00:00:00Z", read=0, creation=100)
+        g2 = self._gen("g2", "2026-01-02T00:00:01Z", read=100, creation=5)
+        traces = [("tr", [g1, g2])]
+        batch = build_batch(traces, SPOKE)
+
+        apply_context_deltas(batch, traces, bodies, counter=len, price=1.0, tool_content={})
+
+        assert self._meta(batch, "g2")["context_delta"]["label"] == "compaction"
+
+    def test_context_delta_is_metadata_only(self, tmp_path: Path) -> None:
+        m1 = {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        m2 = {"role": "assistant", "content": [{"type": "text", "text": "next"}]}
+        bodies = self._bodies(tmp_path, self._body([m1]), self._body([m1, m2]))
+        g1 = self._gen("g1", "2026-01-02T00:00:00Z", read=0, creation=100)
+        g2 = self._gen("g2", "2026-01-02T00:00:01Z", read=100, creation=50)
+        traces = [("tr", [g1, g2])]
+        batch = build_batch(traces, SPOKE)
+
+        apply_context_deltas(batch, traces, bodies, counter=len, price=1.0, tool_content={})
+
+        body = _by_orig(batch, "tr", "g2")["body"]
+        # The delta rides metadata only; the call's billed usage is untouched.
+        assert body["usageDetails"] == {
+            "cache_read_input_tokens": 100,
+            "cache_creation_input_tokens": 50,
+        }
+        assert "context_delta" in body["metadata"]
+
+
+class TestContextRollup:
+    """#160: aggregate rollup.context onto each step node so per-cycle context cost reads local."""
+
+    def _content(self) -> dict[str, ToolContent]:
+        return {
+            "tu-c1": ToolContent(
+                {"subject": "S1 RED: x"}, "Task #1 created successfully: S1 RED: x"
+            ),
+            "tu-u1": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
+            "tu-u2": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
+        }
+
+    _TOOL = {"name": "Bash", "description": "d" * 40, "input_schema": {"type": "object"}}
+
+    def _bodies(self, tmp_path: Path, *objs: dict) -> Path:
+        bodies = tmp_path / "bodies"
+        bodies.mkdir()
+        for index, obj in enumerate(objs):
+            (bodies / f"{index:02d}-body.request.json").write_text(
+                json.dumps(obj), encoding="utf-8"
+            )
+        return bodies
+
+    def _body(self, messages: list[dict]) -> dict:
+        return {
+            "tools": [self._TOOL],
+            "system": [{"type": "text", "text": "sys"}],
+            "messages": messages,
+        }
+
+    def _gen(self, obs_id: str, start: str, *, read: int, creation: int) -> dict:
+        return _obs(
+            obs_id,
+            "claude_code.llm_request",
+            type_="GENERATION",
+            parent="i1",
+            startTime=start,
+            endTime=start,
+            usageDetails={"cache_read_input_tokens": read, "cache_creation_input_tokens": creation},
+        )
+
+    def _traces(self) -> list[tuple[str, list[dict]]]:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:40Z",
+        )
+        create = _ledger_child(
+            "tc1",
+            "tool:TaskCreate",
+            "tu-c1",
+            parent="i1",
+            start="2026-01-02T00:00:02Z",
+            end="2026-01-02T00:00:02Z",
+        )
+        started = _ledger_child(
+            "tu1",
+            "tool:TaskUpdate",
+            "tu-u1",
+            parent="i1",
+            start="2026-01-02T00:00:05Z",
+            end="2026-01-02T00:00:05Z",
+        )
+        g1 = self._gen("g1", "2026-01-02T00:00:06Z", read=0, creation=100)
+        g2 = self._gen("g2", "2026-01-02T00:00:12Z", read=100, creation=40)
+        done = _ledger_child(
+            "tu2",
+            "tool:TaskUpdate",
+            "tu-u2",
+            parent="i1",
+            start="2026-01-02T00:00:20Z",
+            end="2026-01-02T00:00:21Z",
+        )
+        return [("tr", [interaction, create, started, g1, g2, done])]
+
+    def test_step_node_carries_context_rollup_both_views(self, tmp_path: Path) -> None:
+        m1 = {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        m2 = {"role": "assistant", "content": [{"type": "text", "text": "the newest turn"}]}
+        added_tokens = len(_canonical_msg(m2))
+        bodies = self._bodies(tmp_path, self._body([m1]), self._body([m1, m2]))
+        traces = self._traces()
+        batch = build_batch(traces, SPOKE, self._content())
+        cycle = build_cycle_batch(traces, SPOKE, self._content())
+
+        by_orig = {
+            (o, i): s
+            for (o, i), s in apply_context_deltas(
+                batch, traces, bodies, counter=len, price=1.0, tool_content=self._content()
+            ).items()
+        }
+        assert by_orig  # a delta was produced
+
+        from telemetry.langfuse_spoke_tree import _apply_context_rollups, _copy_id
+
+        _apply_context_rollups(batch, {_copy_id(o, i): s for (o, i), s in by_orig.items()})
+        _apply_context_rollups(cycle, {cycle_copy_id_for(o, i): s for (o, i), s in by_orig.items()})
+
+        view_a_step = _only_step(batch)
+        view_b_step = _cycle_step(cycle, "step:S1 RED: x")
+        expected = {"net_tokens": added_tokens, "added": added_tokens, "removed": 0}
+        assert view_a_step["body"]["metadata"]["rollup"]["context"] == expected
+        assert view_b_step["body"]["metadata"]["rollup"]["context"] == expected
 
 
 class TestRequestBodyMetadata:
@@ -4236,6 +4647,400 @@ class TestCycleView:
             _by_cycle(batch, "tr", "sk1")["body"]["parentObservationId"]
             == _cycle_step(batch, "preStep")["id"]
         )
+
+
+class TestStepPhaseParser:
+    """#158: map an arbitrary step subject into the closed phase set (cardinality pin)."""
+
+    @pytest.mark.parametrize(
+        "subject,phase",
+        [
+            ("S1 RED: failing test", "RED"),
+            ("A-RED: red first", "RED"),
+            ("ANCHOR #154 source the issue", "ANCHOR"),
+            ("S2 GREEN: implement", "GREEN"),
+            ("S1 REVIEW + PUSH", "REVIEW"),
+            ("S4 PUSH final subtask", "PUSH"),
+            ("miscellaneous chore", "other"),
+        ],
+    )
+    def test_maps_subject_into_closed_set(self, subject: str, phase: str) -> None:
+        assert _step_phase(subject) == phase
+
+    def test_unknown_subject_yields_other_never_free_text(self) -> None:
+        assert _step_phase("totally unrelated subject 123") == "other"
+
+
+class TestStepCostScores:
+    """#158: per-phase ``step_cost_usd:<PHASE>`` / ``step_tokens_written:<PHASE>`` scores.
+
+    ``step:*`` nodes carry token rollups only in ``metadata.rollup`` (no ``usageDetails`` — the
+    #114 double-count guard), so per-step cost is invisible to the Metrics API. Score NAMES are a
+    metrics dimension, so each View B step emits its cost/written from the rollup (cost = written x
+    price). Single-emit on View B only, so a Scores sum never doubles a phase across both views.
+    """
+
+    _BASE_TS = "2026-01-02T00:00:00Z"
+
+    def _content(self) -> dict[str, ToolContent]:
+        return {
+            "tu-c1": ToolContent(
+                {"subject": "S1 RED: x"}, "Task #1 created successfully: S1 RED: x"
+            ),
+            "tu-u1": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
+            "tu-u2": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
+        }
+
+    def _traces(self) -> list[tuple[str, list[dict]]]:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:40Z",
+        )
+        create = _ledger_child(
+            "tc1",
+            "tool:TaskCreate",
+            "tu-c1",
+            parent="i1",
+            start="2026-01-02T00:00:02Z",
+            end="2026-01-02T00:00:02Z",
+        )
+        started = _ledger_child(
+            "tu1",
+            "tool:TaskUpdate",
+            "tu-u1",
+            parent="i1",
+            start="2026-01-02T00:00:05Z",
+            end="2026-01-02T00:00:05Z",
+        )
+        work_gen = _obs(
+            "wg",
+            "claude_code.llm_request",
+            type_="GENERATION",
+            parent="i1",
+            startTime="2026-01-02T00:00:12Z",
+            endTime="2026-01-02T00:00:13Z",
+            usageDetails={
+                "input": 10,
+                "output": 4,
+                "cache_read_input_tokens": 7,
+                "cache_creation_input_tokens": 50,
+            },
+        )
+        done = _ledger_child(
+            "tu2",
+            "tool:TaskUpdate",
+            "tu-u2",
+            parent="i1",
+            start="2026-01-02T00:00:20Z",
+            end="2026-01-02T00:00:21Z",
+        )
+        return [("tr", [interaction, create, started, work_gen, done])]
+
+    def test_emits_cost_and_tokens_scores_for_the_red_step(self) -> None:
+        cycle = build_cycle_batch(self._traces(), SPOKE, self._content())
+
+        scores = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
+
+        names = {s["body"]["name"] for s in scores}
+        assert "step_cost_usd:RED" in names
+        assert "step_tokens_written:RED" in names
+
+    def test_boundary_partition_maps_to_pre_phase(self) -> None:
+        # preStep (the pre-first-window partition) carries ledger tools, so it emits its own
+        # boundary-phase score — locking the closed-set pre/post branch of the parser.
+        cycle = build_cycle_batch(self._traces(), SPOKE, self._content())
+
+        scores = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
+
+        pre = _cycle_step(cycle, "preStep")
+        assert any(
+            s["body"]["name"] == "step_cost_usd:pre"
+            and s["body"]["observationId"] == pre["body"]["id"]
+            for s in scores
+        )
+
+    def test_cost_is_written_times_price_and_observation_scoped(self) -> None:
+        cycle = build_cycle_batch(self._traces(), SPOKE, self._content())
+        step = _cycle_step(cycle, "step:S1 RED: x")
+        written = step["body"]["metadata"]["rollup"]["written"]
+
+        scores = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
+
+        cost = next(s for s in scores if s["body"]["name"] == "step_cost_usd:RED")
+        assert cost["body"]["value"] == pytest.approx(written * 0.001)
+        assert cost["body"]["observationId"] == step["body"]["id"]
+
+    def test_tokens_written_score_equals_rollup_written(self) -> None:
+        cycle = build_cycle_batch(self._traces(), SPOKE, self._content())
+        step = _cycle_step(cycle, "step:S1 RED: x")
+
+        scores = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
+
+        tokens = next(s for s in scores if s["body"]["name"] == "step_tokens_written:RED")
+        assert tokens["body"]["value"] == step["body"]["metadata"]["rollup"]["written"]
+
+    def test_exactly_one_cost_score_for_the_ledger_step(self) -> None:
+        cycle = build_cycle_batch(self._traces(), SPOKE, self._content())
+
+        scores = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
+
+        red_costs = [s for s in scores if s["body"]["name"] == "step_cost_usd:RED"]
+        assert len(red_costs) == 1
+
+    def test_view_a_score_events_carry_no_step_cost_scores(self) -> None:
+        # Single-emit: View A's build_score_events never emits a step cost score.
+        batch = build_batch(self._traces(), SPOKE, self._content())
+
+        view_a = build_score_events(SPOKE, self._traces(), batch, base_ts=self._BASE_TS)
+
+        assert not any(s["body"]["name"].startswith("step_cost_usd:") for s in view_a)
+
+    def test_scores_are_deterministic_across_reruns(self) -> None:
+        cycle = build_cycle_batch(self._traces(), SPOKE, self._content())
+
+        first = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
+        second = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
+
+        assert [e["id"] for e in first] == [e["id"] for e in second]
+
+    def test_no_step_node_carries_usage_or_model(self) -> None:
+        # Double-count pin: step nodes in BOTH views stay free of usageDetails / model.
+        batch = build_batch(self._traces(), SPOKE, self._content())
+        cycle = build_cycle_batch(self._traces(), SPOKE, self._content())
+
+        step_nodes = [
+            e
+            for e in batch + cycle
+            if e["id"].startswith(_STEP_PREFIX) or e["id"].startswith(_CYCLE_STEP_PREFIX)
+        ]
+        assert step_nodes  # the fixture actually produces step nodes
+        for event in step_nodes:
+            assert "usageDetails" not in event["body"]
+            assert "model" not in event["body"]
+
+
+def _commit(sha: str, message: str, at: str, files: list[str], add: int, dele: int) -> dict:
+    """A parsed commit record as the builder consumes it."""
+    return {
+        "sha": sha,
+        "message": message,
+        "authored_at": at,
+        "files": files,
+        "additions": add,
+        "deletions": dele,
+    }
+
+
+def _commit_node(batch: list[dict], sha7: str) -> dict:
+    """Return the synthesized commit:<sha7> node, asserting it exists."""
+    return next(e for e in batch if e["body"]["name"] == f"commit:{sha7}")
+
+
+def _gate_park_node(batch: list[dict]) -> dict | None:
+    """Return the synthesized wait:gate-park node, or None when absent."""
+    return next((e for e in batch if e["body"]["name"] == "wait:gate-park"), None)
+
+
+class TestParseCommits:
+    """#162: parse a ``git log --numstat`` dump into commit records."""
+
+    def test_parses_sha_message_time_and_numstat(self) -> None:
+        sep = "\x1f"
+        dump = (
+            f"commit{sep}abcdef1234567{sep}2026-01-02T00:00:05+00:00{sep}feat: a thing\n"
+            "3\t1\tsrc/a.py\n"
+            "5\t0\tsrc/b.py\n"
+            "\n"
+            f"commit{sep}0123456abcdef{sep}2026-01-02T00:00:20+00:00{sep}fix: b thing\n"
+            "-\t-\tbin/blob\n"
+        )
+
+        commits = _parse_commits(dump)
+
+        assert commits[0] == _commit(
+            "abcdef1234567",
+            "feat: a thing",
+            "2026-01-02T00:00:05+00:00",
+            ["src/a.py", "src/b.py"],
+            8,
+            1,
+        )
+        # Binary files show "-" for add/del and contribute 0.
+        assert commits[1]["additions"] == 0
+        assert commits[1]["deletions"] == 0
+        assert commits[1]["files"] == ["bin/blob"]
+
+    def test_empty_dump_yields_no_commits(self) -> None:
+        assert _parse_commits("") == []
+
+
+class TestCommitNodes:
+    """#162: synthesize commit:<sha7> timeline nodes placed by author time."""
+
+    _SHA = "abcdef1234567890"
+    _COMMIT = _commit(_SHA, "feat: land it", "2026-01-02T00:00:12Z", ["a.py"], 4, 2)
+
+    def _content(self) -> dict[str, ToolContent]:
+        return {
+            "tu-c1": ToolContent(
+                {"subject": "S1 RED: x"}, "Task #1 created successfully: S1 RED: x"
+            ),
+            "tu-u1": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
+            "tu-u2": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
+        }
+
+    def _traces(self) -> list[tuple[str, list[dict]]]:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:40Z",
+        )
+        create = _ledger_child(
+            "tc1",
+            "tool:TaskCreate",
+            "tu-c1",
+            parent="i1",
+            start="2026-01-02T00:00:02Z",
+            end="2026-01-02T00:00:02Z",
+        )
+        started = _ledger_child(
+            "tu1",
+            "tool:TaskUpdate",
+            "tu-u1",
+            parent="i1",
+            start="2026-01-02T00:00:05Z",
+            end="2026-01-02T00:00:05Z",
+        )
+        done = _ledger_child(
+            "tu2",
+            "tool:TaskUpdate",
+            "tu-u2",
+            parent="i1",
+            start="2026-01-02T00:00:20Z",
+            end="2026-01-02T00:00:21Z",
+        )
+        return [("tr", [interaction, create, started, done])]
+
+    def test_commit_node_carries_metadata_and_no_usage_view_a(self) -> None:
+        batch = build_batch(self._traces(), SPOKE, self._content(), commits=[self._COMMIT])
+
+        node = _commit_node(batch, "abcdef1")["body"]
+        assert node["metadata"] == {
+            "sha": self._SHA,
+            "message": "feat: land it",
+            "files": ["a.py"],
+            "additions": 4,
+            "deletions": 2,
+        }
+        assert "usageDetails" not in node
+
+    def test_commit_node_placed_in_containing_step_window_view_b(self) -> None:
+        cycle = build_cycle_batch(self._traces(), SPOKE, self._content(), commits=[self._COMMIT])
+
+        # Author time 00:12 falls inside the task window [00:05, 00:21] → under step:S1 RED: x.
+        step = _cycle_step(cycle, "step:S1 RED: x")
+        assert _commit_node(cycle, "abcdef1")["body"]["parentObservationId"] == step["body"]["id"]
+
+    def test_no_commits_arg_emits_no_commit_node(self) -> None:
+        batch = build_batch(self._traces(), SPOKE, self._content())
+
+        assert not any(e["body"]["name"].startswith("commit:") for e in batch)
+
+    def test_double_build_is_byte_identical(self) -> None:
+        first = build_batch(self._traces(), SPOKE, self._content(), commits=[self._COMMIT])
+        second = build_batch(self._traces(), SPOKE, self._content(), commits=[self._COMMIT])
+
+        assert first == second
+
+    def test_cycle_double_build_is_byte_identical(self) -> None:
+        first = build_cycle_batch(self._traces(), SPOKE, self._content(), commits=[self._COMMIT])
+        second = build_cycle_batch(self._traces(), SPOKE, self._content(), commits=[self._COMMIT])
+
+        assert first == second
+
+    def test_out_of_window_commit_does_not_inflate_root_duration(self) -> None:
+        # A commit authored long after the last captured span must not stretch the end-time-less
+        # root's subtree interval — commit instants are excluded from duration attribution.
+        far = _commit("f" * 12, "chore: late", "2026-01-02T00:59:00Z", ["z.py"], 1, 0)
+
+        without = build_batch(self._traces(), SPOKE, self._content())
+        withcommit = build_batch(self._traces(), SPOKE, self._content(), commits=[far])
+
+        def _root_total(batch: list[dict]) -> int:
+            root = next(e for e in batch if e["id"] == root_id_for(SPOKE))
+            return root["body"]["metadata"]["rollup"]["duration"]["total_ms"]
+
+        assert _root_total(withcommit) == _root_total(without)
+
+
+class TestGateParkNode:
+    """#162: synthesize a wait:gate-park timeline block from the gate-park bounds."""
+
+    def _traces(self) -> list[tuple[str, list[dict]]]:
+        gate = _obs(
+            "g1",
+            "script:gate",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:01Z",
+        )
+        resume = _obs(
+            "t1",
+            "tool:Edit",
+            parent=None,
+            startTime="2026-01-02T00:00:11Z",
+            endTime="2026-01-02T00:00:12Z",
+        )
+        return [("tr", [gate, resume])]
+
+    def test_gate_park_node_duration_equals_gate_park_ms(self) -> None:
+        traces = self._traces()
+        batch = build_batch(traces, SPOKE)
+
+        node = _gate_park_node(batch)
+        assert node is not None
+        assert node["body"]["parentObservationId"] == root_id_for(SPOKE)
+        assert "usageDetails" not in node["body"]
+        # The block spans the gate's end to the resume activity's start (== gate_park_ms).
+        assert node["body"]["startTime"] == "2026-01-02T00:00:01Z"
+        assert node["body"]["endTime"] == "2026-01-02T00:00:11Z"
+        assert _gate_park_ms(traces) == 10000
+
+    def test_park_time_moves_from_root_self_to_wait(self) -> None:
+        traces = self._traces()
+        batch = build_batch(traces, SPOKE)
+
+        root = next(e for e in batch if e["id"] == root_id_for(SPOKE))
+        duration = root["body"]["metadata"]["rollup"]["duration"]
+        # base_ts 00:00 → latest 00:12 = 12000ms, fully attributed; the 10s park is wait, not self.
+        assert duration["total_ms"] == 12000
+        assert duration["components"]["wait"] == 11000  # 1s gate span + 10s park
+        assert duration["components"]["self"] == 0
+
+    def test_no_gate_emits_no_wait_node(self) -> None:
+        traces = [
+            (
+                "tr",
+                [
+                    _obs(
+                        "t1",
+                        "tool:Edit",
+                        parent=None,
+                        startTime="2026-01-02T00:00:00Z",
+                        endTime="2026-01-02T00:00:01Z",
+                    )
+                ],
+            )
+        ]
+
+        batch = build_batch(traces, SPOKE)
+
+        assert _gate_park_node(batch) is None
 
 
 def _guard(
