@@ -304,8 +304,9 @@ class TestBuildBatch:
         copy = _by_orig(batch, "trace-audit", "r6")
         assert copy["body"]["parentObservationId"] == _copy_id("trace-tool", "t6")
 
-    def test_audit_event_without_a_match_collapses_to_spoke_root(self) -> None:
-        # An unmatched tool_use_id is never dropped — it falls through to the synthetic root.
+    def test_audit_event_without_a_match_synthesizes_blocked_tool_at_root(self) -> None:
+        # #157: an unmatched tool_use_id synthesizes a blocked-tool node; with no enclosing turn it
+        # sits at the root, and the tool_decision folds its decision onto it.
         decision = _obs(
             "d0",
             "tool_decision:reject",
@@ -316,8 +317,9 @@ class TestBuildBatch:
 
         batch = build_batch([("trace-audit", [decision])], SPOKE)
 
-        copy = _by_orig(batch, "trace-audit", "d0")
-        assert copy["body"]["parentObservationId"] == root_id_for(SPOKE)
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["parentObservationId"] == root_id_for(SPOKE)
+        assert blocked["body"]["metadata"]["decision"] == "reject"
 
     def test_hook_nests_under_tool_not_a_sibling_audit_event(self) -> None:
         # A tool_decision audit event shares the tool_use_id but must NOT become the
@@ -386,9 +388,9 @@ class TestBuildBatch:
         copy = _by_orig(batch, "trace-audit", "h9a")
         assert copy["body"]["parentObservationId"] == root_id_for(SPOKE)
 
-    def test_unmatched_hook_execution_complete_event_collapses_to_root(self) -> None:
-        # A Pre/PostToolUse hook whose tool_use_id matches no tool span is never dropped --
-        # it falls through to the synthetic root.
+    def test_unmatched_hook_execution_complete_event_nests_under_blocked_tool_at_root(self) -> None:
+        # #157: a Pre/PostToolUse hook whose tool_use_id matches no tool span synthesizes a
+        # blocked-tool node (at the root, no enclosing turn) and nests under it.
         hook = _obs(
             "h10",
             "hook_execution_complete:PostToolUse",
@@ -403,8 +405,12 @@ class TestBuildBatch:
 
         batch = build_batch([("trace-audit", [hook])], SPOKE)
 
-        copy = _by_orig(batch, "trace-audit", "h10")
-        assert copy["body"]["parentObservationId"] == root_id_for(SPOKE)
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["parentObservationId"] == root_id_for(SPOKE)
+        assert (
+            _by_orig(batch, "trace-audit", "h10")["body"]["parentObservationId"]
+            == blocked["body"]["id"]
+        )
 
     def test_hook_execution_complete_event_is_not_a_tool_index_owner(self) -> None:
         # A hook_execution_complete event shares the tool_use_id but must NOT become the
@@ -456,11 +462,12 @@ class TestBuildBatch:
 
 
 class TestEnclosingTurnFallback:
-    """#110 AC1: a satellite carrying a tool_use_id whose tool was denied/cancelled (so no
-    tool span exists to attach to) nests under its enclosing claude_code.interaction — by
-    prompt.id first, then by [start,end] window containment for a real-timing gate hook —
-    instead of dropping to the synthetic root. A lagging-timestamp audit instant is never
-    window-placed (anti-lag), and a satellite with no enclosing turn at all stays at the root.
+    """#110 AC1 as reshaped by #157: a satellite whose tool was denied/cancelled (no tool span)
+    now gets a synthesized ``blocked-tool`` node, and the #110 enclosing-turn resolution runs on
+    THAT node — by prompt.id first, then by [start,end] window containment for a real-timing gate
+    hook — instead of on each satellite. A lagging-timestamp audit instant is never window-placed
+    (anti-lag), and a blocked tool with no enclosing turn at all stays at the root. The satellites
+    then adopt the blocked-tool node (gate hooks via their guards group; audit events directly).
     """
 
     def test_unmatched_gate_hook_nests_under_turn_by_prompt_id(self) -> None:
@@ -488,8 +495,10 @@ class TestEnclosingTurnFallback:
 
         batch = build_batch(traces, SPOKE)
 
-        copy = _by_orig(batch, "trace-hook", "h1")
-        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        # The blocked-tool node resolves to the turn by prompt.id; the gate hook adopts it via its group.
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        assert _guards_group(batch)["body"]["parentObservationId"] == blocked["body"]["id"]
 
     def test_unmatched_hook_execution_complete_nests_under_turn_by_prompt_id(self) -> None:
         # A hook_execution_complete audit instant (lagging time) with an unmatched tool_use_id
@@ -516,8 +525,12 @@ class TestEnclosingTurnFallback:
 
         batch = build_batch(traces, SPOKE)
 
-        copy = _by_orig(batch, "trace-audit", "h7")
-        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        assert (
+            _by_orig(batch, "trace-audit", "h7")["body"]["parentObservationId"]
+            == blocked["body"]["id"]
+        )
 
     def test_interaction_prompt_id_in_flat_metadata_rehomes_event(self) -> None:
         # #111: the message bridge stamps prompt.id onto the interaction as a FLAT metadata key
@@ -546,8 +559,12 @@ class TestEnclosingTurnFallback:
 
         batch = build_batch(traces, SPOKE)
 
-        copy = _by_orig(batch, "trace-audit", "h8")
-        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        assert (
+            _by_orig(batch, "trace-audit", "h8")["body"]["parentObservationId"]
+            == blocked["body"]["id"]
+        )
 
     def test_unmatched_gate_hook_nests_by_time_window_without_prompt_id(self) -> None:
         # A real-timing gate hook with no prompt.id falls back to [start,end] containment: its
@@ -570,8 +587,8 @@ class TestEnclosingTurnFallback:
 
         batch = build_batch(traces, SPOKE)
 
-        copy = _by_orig(batch, "trace-hook", "h2")
-        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        # The blocked-tool node window-places to the containing turn; the gate hook adopts it.
+        assert _one_blocked(batch)["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
 
     def test_innermost_turn_wins_on_overlapping_windows(self) -> None:
         # When a resume interaction nests inside an outer one, a window-matched hook homes to
@@ -601,8 +618,7 @@ class TestEnclosingTurnFallback:
 
         batch = build_batch(traces, SPOKE)
 
-        copy = _by_orig(batch, "trace-hook", "h3")
-        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i_in")
+        assert _one_blocked(batch)["body"]["parentObservationId"] == _copy_id("trace-int", "i_in")
 
     def test_innermost_turn_wins_on_equal_start_windows(self) -> None:
         # Two turns sharing a start: the narrower (earlier end) is the innermost and wins.
@@ -631,8 +647,7 @@ class TestEnclosingTurnFallback:
 
         batch = build_batch(traces, SPOKE)
 
-        copy = _by_orig(batch, "trace-hook", "h6")
-        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i_in")
+        assert _one_blocked(batch)["body"]["parentObservationId"] == _copy_id("trace-int", "i_in")
 
     def test_unmatched_tool_decision_nests_under_turn_by_prompt_id(self) -> None:
         # The canonical denied-tool case: a tool_decision:reject for a tool that produced no
@@ -654,8 +669,10 @@ class TestEnclosingTurnFallback:
 
         batch = build_batch(traces, SPOKE)
 
-        copy = _by_orig(batch, "trace-audit", "d9")
-        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        # The tool_decision folds its decision onto the blocked-tool node, which homes to the turn.
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        assert blocked["body"]["metadata"]["decision"] == "reject"
 
     def test_audit_instant_hook_without_prompt_id_is_not_window_placed(self) -> None:
         # The anti-lag guard: a hook_execution_complete carries a LAGGING startTime, so without
@@ -683,8 +700,14 @@ class TestEnclosingTurnFallback:
 
         batch = build_batch(traces, SPOKE)
 
-        copy = _by_orig(batch, "trace-audit", "h4")
-        assert copy["body"]["parentObservationId"] == root_id_for(SPOKE)
+        # No prompt.id and a lagging audit timestamp -> the blocked-tool node is not window-placed,
+        # so it (and the hook under it) stay at the root.
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["parentObservationId"] == root_id_for(SPOKE)
+        assert (
+            _by_orig(batch, "trace-audit", "h4")["body"]["parentObservationId"]
+            == blocked["body"]["id"]
+        )
 
     def test_matched_tool_still_wins_over_enclosing_turn(self) -> None:
         # The fallback never overrides a real match: a hook whose tool_use_id DOES resolve to a
@@ -930,7 +953,9 @@ class TestToolSubspanFolding:
         assert _by_orig(batch, "tr", "ex")["body"]["parentObservationId"] == _copy_id("tr", "i1")
         assert "success" not in _by_orig(batch, "tr", "i1")["body"].get("metadata", {})
 
-    def test_unmatched_tool_decision_keeps_its_node(self) -> None:
+    def test_unmatched_tool_decision_folds_onto_synthesized_blocked_tool(self) -> None:
+        # #157: an unmatched tool_decision now synthesizes a blocked-tool node and folds its
+        # decision onto that node (previously it kept its own node at the root).
         decision = _obs(
             "d0",
             "tool_decision:reject",
@@ -941,10 +966,10 @@ class TestToolSubspanFolding:
 
         batch = build_batch([("trace-audit", [decision])], SPOKE)
 
-        assert not self._dropped(batch, "trace-audit", "d0")
-        assert _by_orig(batch, "trace-audit", "d0")["body"]["parentObservationId"] == root_id_for(
-            SPOKE
-        )
+        assert self._dropped(batch, "trace-audit", "d0")
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["metadata"]["decision"] == "reject"
+        assert blocked["body"]["parentObservationId"] == root_id_for(SPOKE)
 
     def test_child_of_a_folded_subspan_is_rehomed_onto_the_tool(self) -> None:
         # A resume interaction nests under the tool.execution via TRACEPARENT; when the execution

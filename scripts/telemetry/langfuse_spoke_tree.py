@@ -275,6 +275,19 @@ _GUARDS_SESSION_NAME = "guards:session"
 _GUARDS_PREFIX = "tree-guards-"
 _GUARD_NOOP_MAX_MS = 1000
 
+# Blocked-tool synthesis (#157). A ``tool_use_id`` that appears only on satellites (hooks /
+# tool-scoped audit events) and never on a real ``tool:`` span is a denied / never-run call; it
+# gets one synthesized ``blocked-tool:<Name>`` node (level WARNING, no usageDetails/model) so its
+# satellites nest under a real parent instead of dangling on the turn. The ``blocked-tool:``
+# prefix (never ``tool:``) keeps it out of tool-latency metrics.
+_BLOCKED_TOOL_PREFIX = "tree-blocked-"
+_BLOCKED_TOOL_NAME_PREFIX = "blocked-tool:"
+_BLOCKED_TOOL_UNKNOWN = "unknown"
+# Attribute keys naming the blocked tool, in priority order (bare tool name, then the
+# ``<HookEvent>:<Tool>`` hook name whose suffix is the tool).
+_TOOL_NAME_KEYS = ("tool_name", "gen_ai.tool.name")
+_HOOK_NAME_KEY = "hook_name"
+
 # Span-less session-startup audit instants (#104). They ride the OTel logs signal, so their
 # observation ``startTime`` is the LAGGING flush time, never the true event time; placing them
 # on the timeline by it renders them misleadingly late. They carry no causal id-join to a tool
@@ -421,6 +434,11 @@ def _copy_id(orig_trace_id: str, orig_obs_id: str) -> str:
 def _guards_id(parent_id: str) -> str:
     """Return the deterministic id of the ``guards`` group under ``parent_id`` (a tool / root)."""
     return _GUARDS_PREFIX + hashlib.sha1(parent_id.encode()).hexdigest()[:24]
+
+
+def _blocked_tool_id(tool_use_id: str) -> str:
+    """Return the deterministic id of the ``blocked-tool:*`` node synthesized for a tool-call id."""
+    return _BLOCKED_TOOL_PREFIX + hashlib.sha1(tool_use_id.encode()).hexdigest()[:24]
 
 
 def cycle_trace_id_for(spoke_run_id: str) -> str:
@@ -761,11 +779,7 @@ def _guard_group_metadata(members: list[IngestEvent]) -> dict[str, Any]:
 
 def _guard_envelope(members: list[IngestEvent]) -> tuple[str | None, str | None]:
     """Return the (min start, max end) ISO bounds over the guard members, chronologically."""
-    starts = [m["body"]["startTime"] for m in members if m["body"].get("startTime")]
-    ends = [m["body"]["endTime"] for m in members if m["body"].get("endTime")]
-    start = min(starts, key=lambda s: _parse_utc(s) or datetime.min) if starts else None
-    end = max(ends, key=lambda s: _parse_utc(s) or datetime.min) if ends else None
-    return start, end
+    return _obs_envelope([member["body"] for member in members])
 
 
 def _guard_group_event(
@@ -977,6 +991,92 @@ def _enclosing_turn(observation: Observation, index: InteractionIndex) -> str | 
         ):
             chosen = window
     return chosen[2] if chosen else None
+
+
+def _blocked_tool_name(satellites: list[Observation]) -> str:
+    """Return the blocked tool's name: a ``tool_name`` attr, else a ``hook_name`` suffix, else unknown."""
+    for satellite in satellites:
+        name = _attr(satellite, *_TOOL_NAME_KEYS)
+        if name:
+            return str(name)
+    for satellite in satellites:
+        hook_name = _attr(satellite, _HOOK_NAME_KEY)
+        if hook_name and ":" in str(hook_name):
+            return str(hook_name).split(":", 1)[1]
+    return _BLOCKED_TOOL_UNKNOWN
+
+
+def _obs_envelope(observations: list[Observation]) -> tuple[str | None, str | None]:
+    """Return the (min start, max end) ISO bounds over ``observations``, chronologically."""
+    starts = [o["startTime"] for o in observations if o.get("startTime")]
+    ends = [o["endTime"] for o in observations if o.get("endTime")]
+    start = min(starts, key=lambda s: _parse_utc(s) or datetime.min) if starts else None
+    end = max(ends, key=lambda s: _parse_utc(s) or datetime.min) if ends else None
+    return start, end
+
+
+def _synthesize_blocked_tools(
+    traces: list[TraceObservations],
+    *,
+    tool_index: dict[str, str],
+    interaction_index: InteractionIndex,
+    trace_id: str,
+    root_id: str,
+) -> tuple[list[IngestEvent], dict[str, str]]:
+    """Synthesize a ``blocked-tool:<Name>`` node per orphaned tool-call id (#157).
+
+    An orphaned id is one carried by a satellite (:func:`_joins_under_tool`) but owned by no
+    ``tool:`` span (:func:`_build_tool_index`). Each becomes one WARNING ``blocked-tool:`` node
+    parented to its enclosing turn (:func:`_enclosing_turn`, else the root), spanning its
+    satellites' time envelope and carrying no usageDetails/model. The returned index maps each
+    orphaned id to its node so the copy pass and fold re-home the satellites onto it.
+
+    Args:
+        traces: The source traces paired with their observations.
+        tool_index: Real-tool ownership map (an id present here is NOT orphaned).
+        interaction_index: Enclosing-turn lookup for parenting the synthesized node.
+        trace_id: The assembled trace id every synthesized node references.
+        root_id: The synthetic root id (parent when no enclosing turn resolves).
+
+    Returns:
+        ``(events, index)``: the synthesized ``span-create`` events and the orphaned-id → node-id map.
+    """
+    by_tuid: dict[str, list[Observation]] = {}
+    for _orig_trace_id, observations in traces:
+        for observation in observations:
+            if not _joins_under_tool(observation):
+                continue
+            tuid = _tool_use_id(observation)
+            if tuid and tuid not in tool_index:
+                by_tuid.setdefault(tuid, []).append(observation)
+    events: list[IngestEvent] = []
+    index: dict[str, str] = {}
+    for tuid, satellites in by_tuid.items():
+        node_id = _blocked_tool_id(tuid)
+        parent = next(
+            (turn for s in satellites if (turn := _enclosing_turn(s, interaction_index))), root_id
+        )
+        start, end = _obs_envelope(satellites)
+        body: dict[str, Any] = {
+            "id": node_id,
+            "traceId": trace_id,
+            "parentObservationId": parent,
+            "name": _BLOCKED_TOOL_NAME_PREFIX + _blocked_tool_name(satellites),
+            "startTime": start or _INGEST_TIMESTAMP,
+            "endTime": end,
+            "level": "WARNING",
+            "metadata": {"synthesized": True, "tool_use_id": tuid},
+        }
+        events.append(
+            {
+                "id": node_id,
+                "type": "span-create",
+                "timestamp": start or _INGEST_TIMESTAMP,
+                "body": body,
+            }
+        )
+        index[tuid] = node_id
+    return events, index
 
 
 class SkillCandidate(NamedTuple):
@@ -2024,17 +2124,29 @@ def _assemble_copies(
 
     Re-parents every source observation across the original trace boundaries
     (:func:`_resolve_parent`), grafts transcript content into the create body
-    (:func:`_copy_event`), folds the three 1:1 tool sub-spans (:func:`_fold_tool_subspans`),
-    collapses each tool's / the session's ``.sh`` guard spans under a ``guards`` group and drops
-    the no-op ones unless ``keep_noop_guards`` (:func:`_apply_guard_groups`), and demotes
-    session-startup instants onto ``root_event``'s metadata (:func:`_collapse_startup_instants`).
-    View A wraps these in local step nodes; View B re-homes them onto the cycle axis. ``root_event``
-    is the view's own synthetic root (its metadata is mutated in place).
+    (:func:`_copy_event`), synthesizes a ``blocked-tool:`` node per orphaned tool-call id so its
+    satellites nest under it (:func:`_synthesize_blocked_tools`), folds the three 1:1 tool
+    sub-spans (:func:`_fold_tool_subspans`), collapses each tool's / the session's ``.sh`` guard
+    spans under a ``guards`` group and drops the no-op ones unless ``keep_noop_guards``
+    (:func:`_apply_guard_groups`), and demotes session-startup instants onto ``root_event``'s
+    metadata (:func:`_collapse_startup_instants`). View A wraps these in local step nodes; View B
+    re-homes them onto the cycle axis. ``root_event`` is the view's own synthetic root (its
+    metadata is mutated in place).
     """
     tool_index = _build_tool_index(traces)
     request_index = _build_request_index(traces)
     interaction_index = _build_interaction_index(traces)
     skill_index = _build_skill_index(traces, tool_content)
+    blocked_events, blocked_index = _synthesize_blocked_tools(
+        traces,
+        tool_index=tool_index,
+        interaction_index=interaction_index,
+        trace_id=trace_id,
+        root_id=root_id,
+    )
+    # A blocked-tool node owns its orphaned id like a real tool, so its satellites join it in the
+    # copy pass (via _resolve_parent) and its tool_decision folds onto it (via _fold_tool_subspans).
+    tool_index = {**tool_index, **blocked_index}
     copies: list[IngestEvent] = []
     for orig_trace_id, observations in traces:
         for observation in observations:
@@ -2056,6 +2168,7 @@ def _assemble_copies(
                     tool_content=tool_content,
                 )
             )
+    copies.extend(blocked_events)
     copies = _fold_tool_subspans(copies, traces, tool_index)
     copies = _apply_guard_groups(
         copies,
