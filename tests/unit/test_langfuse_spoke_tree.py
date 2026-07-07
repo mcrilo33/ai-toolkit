@@ -4791,7 +4791,7 @@ class TestFailureLevels:
         )
         return [("tr", [tool, execu])]
 
-    def _guarded_tool(self, **guard_attrs: object) -> list:
+    def _guarded_tool(self, **guard_attrs: str) -> list:
         interaction = _obs(
             "i1",
             "claude_code.interaction",

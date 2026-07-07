@@ -294,6 +294,16 @@ _HOOK_EXECUTION_PREFIX = "hook_execution_complete"
 _TOTAL_DURATION_KEY = "total_duration_ms"
 _TIME_SOURCE_KEY = "time_source"
 _TIME_SOURCE_LAGGING = "lagging"
+
+# Failure levels (#157). The native trace is all ``level=DEFAULT`` even though the failure data is
+# already folded onto tools; :func:`_apply_levels` maps it: a failed/errored tool -> ERROR; a
+# non-allow / failed guard (span + its group), a blocking ``hook_execution_complete``, and a
+# synthesized blocked-tool -> WARNING (precedence ERROR > WARNING > DEFAULT).
+_LEVEL_ERROR = "ERROR"
+_LEVEL_WARNING = "WARNING"
+_STATUS_SUCCESS = "success"
+_GUARD_WARN_DECISIONS = ("deny", "ask", "block")
+_NUM_BLOCKING_KEY = "num_blocking"
 # Attribute keys naming the blocked tool, in priority order (bare tool name, then the
 # ``<HookEvent>:<Tool>`` hook name whose suffix is the tool).
 _TOOL_NAME_KEYS = ("tool_name", "gen_ai.tool.name")
@@ -809,6 +819,8 @@ def _guard_group_event(
         "endTime": end,
         "metadata": _guard_group_metadata(members),
     }
+    if any(_guard_warns(member["body"]) for member in members):
+        body["level"] = _LEVEL_WARNING  # a non-allow / failed guard flags its whole group (#157)
     return {
         "id": group_id,
         "type": "span-create",
@@ -920,6 +932,46 @@ def _hook_event_exclude(events: list[IngestEvent]) -> set[str]:
         for event in events
         if event["type"] != "trace-create" and _is_hook_event(event["body"])
     }
+
+
+def _guard_warns(body: Observation) -> bool:
+    """Whether a guard span is failure-worthy: a deny/ask/block decision or a non-success status."""
+    decision = _attr(body, "decision")
+    status = _attr(body, "status")
+    return decision in _GUARD_WARN_DECISIONS or (status is not None and status != _STATUS_SUCCESS)
+
+
+def _level_for(body: Observation) -> str | None:
+    """Return the failure level (:data:`_LEVEL_ERROR` / :data:`_LEVEL_WARNING`) for a node, or None.
+
+    ERROR for a tool whose folded metadata shows ``success is False`` or an ``error``; WARNING for a
+    failure-worthy guard span (:func:`_guard_warns`), a synthesized blocked-tool node, or a
+    ``hook_execution_complete`` with ``num_blocking > 0``. Each node matches at most one rule, so
+    the ERROR > WARNING precedence needs no explicit tie-break. The guards GROUP's level is set at
+    build time (:func:`_apply_guard_groups`) from its raw members, not here.
+    """
+    if _is_tool_span(body):
+        metadata = body.get("metadata") or {}
+        if metadata.get("success") is False or metadata.get("error"):
+            return _LEVEL_ERROR
+        return None
+    if _is_blocked_tool(body):
+        return _LEVEL_WARNING
+    if _is_hook(body):
+        return _LEVEL_WARNING if _guard_warns(body) else None
+    if _is_hook_event(body):
+        num = _attr(body, _NUM_BLOCKING_KEY)
+        return _LEVEL_WARNING if isinstance(num, (int, float)) and num > 0 else None
+    return None
+
+
+def _apply_levels(copies: list[IngestEvent]) -> list[IngestEvent]:
+    """Stamp WARNING/ERROR failure levels onto the assembled nodes in place (#157, :func:`_level_for`)."""
+    for event in copies:
+        level = _level_for(event["body"])
+        if level:
+            event["body"]["level"] = level
+    return copies
 
 
 def _guards_total_ms(body: Observation) -> int:
@@ -1124,9 +1176,9 @@ def _synthesize_blocked_tools(
             "name": _BLOCKED_TOOL_NAME_PREFIX + _blocked_tool_name(satellites),
             "startTime": start or _INGEST_TIMESTAMP,
             "endTime": end,
-            "level": "WARNING",
             "metadata": {"synthesized": True, "tool_use_id": tuid},
         }
+        # level WARNING is stamped centrally by _apply_levels (#157), like every other node.
         events.append(
             {
                 "id": node_id,
@@ -2191,10 +2243,12 @@ def _assemble_copies(
     satellites nest under it (:func:`_synthesize_blocked_tools`), folds the three 1:1 tool
     sub-spans (:func:`_fold_tool_subspans`), collapses each tool's / the session's ``.sh`` guard
     spans under a ``guards`` group and drops the no-op ones unless ``keep_noop_guards``
-    (:func:`_apply_guard_groups`), and demotes session-startup instants onto ``root_event``'s
-    metadata (:func:`_collapse_startup_instants`). View A wraps these in local step nodes; View B
-    re-homes them onto the cycle axis. ``root_event`` is the view's own synthetic root (its
-    metadata is mutated in place).
+    (:func:`_apply_guard_groups`), stamps a lagging ``endTime`` onto ``hook_execution_complete``
+    events (:func:`_stamp_hook_endtimes`), stamps WARNING/ERROR failure levels
+    (:func:`_apply_levels`), and demotes session-startup instants onto ``root_event``'s metadata
+    (:func:`_collapse_startup_instants`). View A wraps these in local step nodes; View B re-homes
+    them onto the cycle axis. ``root_event`` is the view's own synthetic root (its metadata is
+    mutated in place).
     """
     tool_index = _build_tool_index(traces)
     request_index = _build_request_index(traces)
@@ -2241,6 +2295,7 @@ def _assemble_copies(
         keep_noop_guards=keep_noop_guards,
     )
     copies = _stamp_hook_endtimes(copies)
+    copies = _apply_levels(copies)
     return _collapse_startup_instants(copies, root_event)
 
 
