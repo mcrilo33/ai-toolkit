@@ -391,7 +391,8 @@ def test_no_server_falls_back_to_manual_advice(hub: Path, tmp_path: Path) -> Non
     assert not _calls(log.read_text(), "new-window")
     assert "Start the agent in a new terminal window:" in proc.stdout
     assert "CLAUDE_EFFORT=max claude --model claude-opus-4-8\\[1m\\]" in proc.stdout
-    assert "/source" in proc.stdout
+    # The seeded default kickoff points the spoke at its on-disk task contract.
+    assert ".ai-toolkit/task.md" in proc.stdout
 
 
 def test_agent_launch_pins_model_and_effort_by_default(hub: Path, tmp_path: Path) -> None:
@@ -400,7 +401,7 @@ def test_agent_launch_pins_model_and_effort_by_default(hub: Path, tmp_path: Path
     assert proc.returncode == 0, proc.stderr
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation"
-    assert "CLAUDE_EFFORT=max claude --model claude-opus-4-8\\[1m\\]; exec " in new_window[0]
+    assert "CLAUDE_EFFORT=max claude --model claude-opus-4-8\\[1m\\]" in new_window[0]
 
 
 def test_agent_launch_respects_model_and_effort_overrides(hub: Path, tmp_path: Path) -> None:
@@ -411,7 +412,7 @@ def test_agent_launch_respects_model_and_effort_overrides(hub: Path, tmp_path: P
     assert proc.returncode == 0, proc.stderr
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation"
-    assert "CLAUDE_EFFORT=high claude --model sonnet; exec " in new_window[0]
+    assert "CLAUDE_EFFORT=high claude --model sonnet" in new_window[0]
 
 
 def test_agent_launch_appends_budget_args_when_set(hub: Path, tmp_path: Path) -> None:
@@ -439,6 +440,71 @@ def test_agent_launch_keeps_seeded_prompt_after_pinning(hub: Path, tmp_path: Pat
     )
 
 
+# ── Task contract on disk + task.md seed prompt (issue #177) ──
+#
+# Anchoring used to be an LLM errand: the seed prompt told the spoke to run
+# /source-task, which shells `gh issue view`. The dispatcher already knows the
+# issue, so worktree-new.sh writes the contract to <wt>/.ai-toolkit/task.md at
+# spawn and its default seed prompt points the spoke there. /source-task stays
+# for crash re-anchor (a lost task.md).
+
+
+def test_writes_task_contract_at_spawn(hub: Path, tmp_path: Path) -> None:
+    body = "Do the thing.\n\nScope: scripts/worktree-new.sh\nGate: none\n"
+    env = {"GH_ISSUE_TITLE": "Anchor the spoke at spawn", "GH_ISSUE_BODY": body}
+
+    proc, _ = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", extra_env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    task_md = _worktree_dir(hub, "8") / ".ai-toolkit" / "task.md"
+    assert task_md.is_file(), "task.md must be written at spawn"
+    text = task_md.read_text()
+    assert "#8" in text, "task.md must carry the issue number"
+    assert "Anchor the spoke at spawn" in text, "task.md must carry the issue title"
+    assert "Do the thing." in text, "task.md must carry the issue body"
+    assert "Scope: scripts/worktree-new.sh" in text, "task.md must carry the Scope: line"
+    assert "Gate: none" in text, "task.md must carry the Gate: line"
+
+
+def test_default_seed_prompt_points_at_task_contract(hub: Path, tmp_path: Path) -> None:
+    # With no --prompt, the spoke is seeded to read task.md rather than run an
+    # LLM /source-task round-trip.
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code")
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    assert ".ai-toolkit/task.md" in new_window[0], "default seed prompt must point at task.md"
+
+
+def test_explicit_prompt_overrides_default_task_contract_seed(hub: Path, tmp_path: Path) -> None:
+    # An explicit --prompt (start-task, hub-afk's kickoff_for) still wins — the
+    # default task.md seed only fills an unset prompt.
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", "--prompt", "/source")
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    # The explicit prompt is the trailing arg; the default task.md seed never fires.
+    # Match the model→prompt boundary without pinning $SHELL (the `; exec <shell>`
+    # suffix is shell-dependent and covered by test_window_survives_agent_exit_via_exec_shell).
+    assert "claude --model claude-opus-4-8\\[1m\\] /source; exec " in new_window[0]
+    assert ".ai-toolkit/task.md" not in new_window[0]
+
+
+def test_no_task_contract_for_adhoc_slug(hub: Path, tmp_path: Path) -> None:
+    # Ad-hoc (non-numeric) work has no issue to fetch — no task.md, and the
+    # default seed does not point at one.
+    proc, log = _run_new(hub, tmp_path, "refactor-sync", "-t", "chore", "--no-code")
+
+    assert proc.returncode == 0, proc.stderr
+    task_md = _worktree_dir(hub, "refactor-sync") / ".ai-toolkit" / "task.md"
+    assert not task_md.exists(), "ad-hoc slugs have no issue, so no task.md"
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    assert ".ai-toolkit/task.md" not in new_window[0]
+
+
 # ── Per-issue Model: override + config spoke default (issue #142) ──
 
 
@@ -453,7 +519,7 @@ def test_issue_model_line_pins_spoke_model(hub: Path, tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation"
-    assert "claude --model claude-sonnet-5; exec " in new_window[0]
+    assert "claude --model claude-sonnet-5" in new_window[0]
 
 
 def test_env_model_overrides_issue_model_line(hub: Path, tmp_path: Path) -> None:
@@ -465,7 +531,7 @@ def test_env_model_overrides_issue_model_line(hub: Path, tmp_path: Path) -> None
     assert proc.returncode == 0, proc.stderr
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation"
-    assert "claude --model opus-pinned; exec " in new_window[0]
+    assert "claude --model opus-pinned" in new_window[0]
 
 
 def test_spoke_default_sourced_from_config_env(hub: Path, tmp_path: Path) -> None:
@@ -479,7 +545,7 @@ def test_spoke_default_sourced_from_config_env(hub: Path, tmp_path: Path) -> Non
     assert proc.returncode == 0, proc.stderr
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation"
-    assert "CLAUDE_EFFORT=high claude --model team-opus; exec " in new_window[0]
+    assert "CLAUDE_EFFORT=high claude --model team-opus" in new_window[0]
 
 
 def test_spoke_default_resolved_from_config_file(hub: Path, tmp_path: Path) -> None:
@@ -495,7 +561,7 @@ def test_spoke_default_resolved_from_config_file(hub: Path, tmp_path: Path) -> N
     assert proc.returncode == 0, proc.stderr
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation"
-    assert "CLAUDE_EFFORT=low claude --model config-file-model; exec " in new_window[0]
+    assert "CLAUDE_EFFORT=low claude --model config-file-model" in new_window[0]
 
 
 def test_agent_launch_shell_quotes_metacharacter_overrides(hub: Path, tmp_path: Path) -> None:
@@ -506,7 +572,7 @@ def test_agent_launch_shell_quotes_metacharacter_overrides(hub: Path, tmp_path: 
     assert proc.returncode == 0, proc.stderr
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation"
-    assert "claude --model foo\\ bar; exec " in new_window[0]
+    assert "claude --model foo\\ bar" in new_window[0]
 
 
 def test_agent_launch_never_typed_via_send_keys(hub: Path, tmp_path: Path) -> None:

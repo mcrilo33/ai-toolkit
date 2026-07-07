@@ -202,6 +202,37 @@ printf '%s\n' "$LANE" > "$WT_DIR/.ai-toolkit/lane"
 printf '%s\n' "$MODE" > "$WT_DIR/.ai-toolkit/mode"
 echo "→ lane / mode        $LANE / $MODE"
 
+# --- write the task contract to disk (issue #177) ----------------------------
+# Anchoring used to be an LLM errand: the seed prompt told the spoke to run
+# /source-task, which shells `gh issue view`. The dispatcher already knows the
+# issue, so write the contract to <wt>/.ai-toolkit/task.md at spawn and point the
+# seed prompts (this script's default below and hub-afk's kickoff_for) at it.
+# /source-task stays for crash re-anchor (a lost task.md). Numbered issues only —
+# an ad-hoc slug has no issue to fetch; best-effort, a gh miss simply leaves no
+# task.md and the seed falls back to /source-task. The Scope:/Gate: control lines
+# ride along inside the body verbatim.
+TASK_MD="$WT_DIR/.ai-toolkit/task.md"
+if [[ "$ISSUE" =~ ^[0-9]+$ ]] && command -v gh >/dev/null 2>&1; then
+  # Reuse what earlier blocks already fetched so a spawn makes at most one gh call
+  # per field (an unbounded gh here would double the round-trips and, under /afk's
+  # synchronous dispatch, add a second hang point). TITLE comes from the slug path
+  # (numeric, no-slug); ISSUE_BODY from the Model: block (when WT_AGENT_MODEL is
+  # unset). Both are unset on the other paths, so `-` (not `:-`) fetches only then
+  # and an already-fetched empty value is honoured, not re-fetched.
+  TASK_TITLE="${TITLE-$(gh issue view "$ISSUE" --json title -q .title 2>/dev/null || true)}"
+  TASK_BODY="${ISSUE_BODY-$(gh issue view "$ISSUE" --json body -q .body 2>/dev/null || true)}"
+  # Only write when the fetch actually yielded something — a total gh miss (both
+  # empty) leaves no task.md so the seed prompt still falls back to /source-task,
+  # rather than stamping a hollow contract that suppresses that fallback.
+  if [ -n "$TASK_TITLE" ] || [ -n "$TASK_BODY" ]; then
+    {
+      printf '# Issue #%s: %s\n\n' "$ISSUE" "${TASK_TITLE:-(title unavailable)}"
+      printf '%s\n' "$TASK_BODY"
+    } > "$TASK_MD"
+    echo "→ task contract      .ai-toolkit/task.md (#$ISSUE)"
+  fi
+fi
+
 # .claude/ is gitignored runtime config (skills, hooks, settings) synced from
 # shared/. `git worktree add` checks out only TRACKED files, so without this copy
 # the worktree has no active skills/hooks. (`.worktreeinclude` would handle this,
@@ -443,6 +474,14 @@ fi
 WT_AGENT_MODEL="${WT_AGENT_MODEL:-${WT_AGENT_MODEL_DEFAULT:-claude-opus-4-8[1m]}}"
 WT_AGENT_EFFORT="${WT_AGENT_EFFORT:-${WT_AGENT_EFFORT_DEFAULT:-max}}"
 
+# Default seed prompt (issue #177): with no caller-supplied --prompt, seed the
+# spoke to READ its on-disk task contract instead of anchoring via an LLM
+# /source-task round-trip. An explicit --prompt (start-task, hub-afk's
+# kickoff_for) still wins; ad-hoc slugs (no task.md) keep the unseeded launch.
+if [ -z "$PROMPT" ] && [ -f "$TASK_MD" ]; then
+  PROMPT="Read your task contract at .ai-toolkit/task.md (issue #${ISSUE}, fetched at spawn -- no need to run /source-task). Break it into a task ledger (one entry per subtask x the solo-cycle steps ANCHOR/RED/GREEN/REVIEW/PUSH, exactly one in_progress). Honor its Gate: line: plan (the default for non-trivial work, and whenever no Gate: line is present) means the PLAN gate comes first -- explore, print the full implementation plan, emit 'bash .ai-toolkit/scripts/spoke-ready.sh --gate ${ISSUE}', and WAIT for approval before GREEN; only Gate: none runs autonomous straight through. Then implement via the solo-cycle (/cycle: RED -> GREEN -> REVIEW -> PUSH). Push your own branch each subtask; when the acceptance criteria are all met, push the final subtask and emit 'bash .ai-toolkit/scripts/spoke-push.sh --ready ${ISSUE}'. Do NOT self-land. If task.md is missing, or the issue was edited after spawn, run /source-task ${ISSUE} to re-anchor from the live issue."
+fi
+
 AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(printf '%q' "$WT_AGENT_EFFORT") claude --model $(printf '%q' "$WT_AGENT_MODEL")"
 # Best-effort in-process budget cap for unattended spokes. A caller may set
 # WT_AGENT_BUDGET_ARGS (e.g. "--max-budget-usd 5"); it is a pre-formed multi-arg
@@ -518,4 +557,9 @@ wt_emit_lifecycle "worktree-new" "spawn" "success" "$WT_T0" "$WT_DIR"
 wt_emit_script "worktree-new" "success" "$WT_T0" "$WT_DIR"
 
 echo
-echo "  Then in that session, run:  /source   (anchor to the issue, then /cycle)"
+if [ -f "$TASK_MD" ]; then
+  echo "  Task contract on disk:  .ai-toolkit/task.md  (the spoke reads it, then /cycle)"
+  echo "  Crash re-anchor:        /source-task $ISSUE"
+else
+  echo "  Then in that session, run:  /source-task   (anchor to the issue, then /cycle)"
+fi

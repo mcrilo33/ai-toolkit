@@ -563,8 +563,11 @@ _block_all_inflight() {
 kickoff_for() {
   local n="$1"
   cat <<EOF
-You're in a dedicated worktree for issue #$n. Run /source-task to anchor to issue #$n and read
-it. Before touching code, break the issue body into a task ledger (TaskCreate, or
+You're in a dedicated worktree for issue #$n. Your task contract is on disk at
+.ai-toolkit/task.md (worktree-new.sh fetched it at spawn) — read it; no need to run
+/source-task (that stays for re-anchor: run /source-task $n only if task.md is missing
+or the issue was edited after spawn — that re-fetches the live issue). Before touching
+code, break the task into a task ledger (TaskCreate, or
 TodoWrite on older runtimes) — one todo per subtask × the solo-cycle steps that apply
 (ANCHOR/RED/GREEN/REVIEW/PUSH), exactly one in_progress.
 
