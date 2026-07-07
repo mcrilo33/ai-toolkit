@@ -4429,3 +4429,165 @@ class TestGuardGroupDuration:
         duration = _by_orig(batch, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
         assert duration == _dur(10_000, {"tool": 4_100, "hook": 900, "self": 5_000})
         assert sum(duration["components"].values()) == duration["total_ms"]
+
+
+def _blocked_tools(batch: list[dict]) -> list[dict]:
+    """Return every synthesized ``blocked-tool:*`` node in a batch."""
+    return [e for e in batch if (e["body"].get("name") or "").startswith("blocked-tool:")]
+
+
+def _one_blocked(batch: list[dict]) -> dict:
+    """Return the single synthesized ``blocked-tool:*`` node, asserting exactly one exists."""
+    nodes = _blocked_tools(batch)
+    assert len(nodes) == 1
+    return nodes[0]
+
+
+class TestBlockedToolSynthesis:
+    """#157: an orphaned tool_use_id (satellites but no tool span — a denied/never-run call)
+    gets a synthesized `blocked-tool:<Name>` node, WARNING, no usage/model, never a `tool:`
+    prefix, parented to its enclosing turn, that its hooks / audit events / decision adopt."""
+
+    def _orphan_audit(self) -> list[tuple[str, list[dict]]]:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "p1"}},
+        )
+        hook = _obs(
+            "h1",
+            "hook_execution_complete:PreToolUse",
+            type_="EVENT",
+            parent=None,
+            metadata={
+                "hook_event": "PreToolUse",
+                "hook_name": "PreToolUse:Edit",
+                "tool_use_id": "tu-denied",
+                "prompt.id": "p1",
+            },
+        )
+        return [("trace-int", [interaction]), ("trace-audit", [hook])]
+
+    def test_orphaned_audit_event_synthesizes_blocked_tool_under_turn(self) -> None:
+        batch = build_batch(self._orphan_audit(), SPOKE)
+
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        assert (
+            _by_orig(batch, "trace-audit", "h1")["body"]["parentObservationId"]
+            == blocked["body"]["id"]
+        )
+
+    def test_blocked_tool_name_from_hook_name_suffix(self) -> None:
+        batch = build_batch(self._orphan_audit(), SPOKE)
+
+        assert _one_blocked(batch)["body"]["name"] == "blocked-tool:Edit"
+
+    def test_blocked_tool_is_warning_and_carries_no_usage(self) -> None:
+        batch = build_batch(self._orphan_audit(), SPOKE)
+
+        body = _one_blocked(batch)["body"]
+        assert body["level"] == "WARNING"
+        assert "usageDetails" not in body
+        assert "model" not in body
+
+    def test_blocked_tool_never_uses_tool_prefix(self) -> None:
+        batch = build_batch(self._orphan_audit(), SPOKE)
+
+        assert not _one_blocked(batch)["body"]["name"].startswith("tool:")
+
+    def test_matched_tool_produces_no_blocked_node(self) -> None:
+        interaction = _obs("i1", "claude_code.interaction", parent=None)
+        tool = _obs(
+            "t1", "tool:Edit", parent="i1", metadata={"attributes": {"tool_use_id": "tu-1"}}
+        )
+        hook = _obs(
+            "h1",
+            "hook_execution_complete:PreToolUse",
+            type_="EVENT",
+            parent=None,
+            metadata={"hook_name": "PreToolUse:Edit", "tool_use_id": "tu-1"},
+        )
+
+        batch = build_batch([("tr", [interaction, tool, hook])], SPOKE)
+
+        assert _blocked_tools(batch) == []
+
+    def test_orphaned_gate_hook_adopts_blocked_tool_via_guards_group(self) -> None:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+        )
+        gate = _guard(
+            "h1",
+            "PreToolUse.sh",
+            tool_use_id="tu-denied",
+            start="2026-01-02T00:00:05Z",
+            end="2026-01-02T00:00:05.300Z",
+            decision="deny",
+            **{"tool_name": "Bash"},
+        )
+
+        batch = build_batch([("trace-int", [interaction]), ("trace-hook", [gate])], SPOKE)
+
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["name"] == "blocked-tool:Bash"
+        assert blocked["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        group = _guards_group(batch)
+        assert group["body"]["parentObservationId"] == blocked["body"]["id"]
+
+    def test_orphaned_tool_decision_folds_onto_blocked_tool(self) -> None:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "p1"}},
+        )
+        decision = _obs(
+            "d1",
+            "tool_decision:deny",
+            type_="EVENT",
+            parent=None,
+            metadata={"tool_use_id": "tu-denied", "decision": "deny", "prompt.id": "p1"},
+        )
+
+        batch = build_batch([("trace-int", [interaction]), ("trace-audit", [decision])], SPOKE)
+
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["metadata"]["decision"] == "deny"
+        # the decision sub-span folds into the node and is dropped
+        assert all(e["id"] != _copy_id("trace-audit", "d1") for e in batch)
+
+    def test_blocked_tool_name_falls_back_to_unknown(self) -> None:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "p1"}},
+        )
+        result = _obs(
+            "r1",
+            "tool_result",
+            type_="EVENT",
+            parent=None,
+            metadata={"tool_use_id": "tu-denied", "prompt.id": "p1"},
+        )
+
+        batch = build_batch([("trace-int", [interaction]), ("trace-audit", [result])], SPOKE)
+
+        assert _one_blocked(batch)["body"]["name"] == "blocked-tool:unknown"
+
+    def test_blocked_tool_present_in_cycle_view(self) -> None:
+        batch = build_cycle_batch(self._orphan_audit(), SPOKE)
+
+        assert len(_blocked_tools(batch)) == 1
+
+    def test_blocked_tool_double_build_is_byte_identical(self) -> None:
+        first = json.dumps(build_batch(self._orphan_audit(), SPOKE))
+        second = json.dumps(build_batch(self._orphan_audit(), SPOKE))
+
+        assert first == second
