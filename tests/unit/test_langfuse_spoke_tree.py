@@ -24,16 +24,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from telemetry.langfuse_spoke_tree import (
-    _CYCLE_STEP_PREFIX,
     _DISK_CATEGORY_ORDER,
     _REQUEST_CATEGORY_ORDER,
     ToolContent,
     _copy_id,
-    _gate_park_ms,
     _is_own_output,
     _memoized_counter,
-    _parse_commits,
-    _step_phase,
     apply_context_deltas,
     apply_llm_decomposition,
     apply_mode_lane_tags,
@@ -67,8 +63,11 @@ from telemetry.spoke_tree.assembly import (
     _TRUNCATION_MARKER,
     _tool_span_ids,
 )
+from telemetry.spoke_tree.commits import _gate_park_ms, _parse_commits
+from telemetry.spoke_tree.ids import _CYCLE_STEP_PREFIX
 from telemetry.spoke_tree.llm_decomp import _decomp_metadata
 from telemetry.spoke_tree.loaded_context import find_request_files
+from telemetry.spoke_tree.scores import _step_phase
 from telemetry.spoke_tree.steps import _STEP_PREFIX
 
 SPOKE = "feature/22-demo+1700000000"

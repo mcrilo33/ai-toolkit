@@ -44,7 +44,8 @@ All live in `scripts/telemetry/`:
 | `spans.py` | The `Span` dataclass — the frozen schema plus the additive, optional, pull-only `summary` field (Issue #47). |
 | `session_parser.py` | Parse `~/.claude/projects/*/*.jsonl` into `skill` / `agent` / `todo` / `human` spans plus a `tool` leaf per `tool_use` (Issue #47). Walk `<session>/subagents/agent-<id>.jsonl` transcripts into `UsageEvent`s **and** the sub-agent's own step spans (#47 S3) — re-homed onto the parent session with `parent_id` = the agent span, so they nest under it. |
 | `spoke_runs.py` | Group spans into spoke-run lifetimes; per-invocation normalized metrics. |
-| `langfuse_spoke_tree.py` | The land-time view builder — assemble the `spoketree-` nested view and `spokecycle-` todo view for one spoke (Issues #87/#100/#114/#128). |
+| `langfuse_spoke_tree.py` | The land-time view builder — assemble the `spoketree-` nested view and `spokecycle-` todo view for one spoke (Issues #87/#100/#114/#128). Since #166 this is the **orchestrator**: it holds `build_batch`/`build_cycle_batch` and drives the post-build enrichments through an ordered `_ENRICHMENTS` registry; the families live in the `telemetry/spoke_tree/` package (see below). |
+| `spoke_tree/` | The view-builder families, split out of the monolith (#166) so view-builder features touch disjoint files. Foundation (`ids`, `observations`); core span-copy plumbing (`indices`, `folding`, `assembly`); `rollups`; view lenses (`steps` = View A, `cycle` = View B); enrichments (`loaded_context`, `llm_decomp`, `context_deltas`, `metadata`, `commits`, `scores`). Each has a `tests/unit/test_spoke_tree_<family>.py`. |
 | `langfuse_rollup.py` | Shared token-rollup sum logic + the standalone `rollup` patcher the view builder reuses. |
 
 ## How attribution works

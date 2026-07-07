@@ -125,28 +125,35 @@ Import-safe: no environment is read at import time, so :func:`build_batch`,
 :func:`scan_transcripts`, and :func:`build_loaded_context_events` are unit-testable with no
 network. The HTTP I/O happens only in :func:`main`. Stdlib only; reuses the fetch/post
 helpers, env vars, and ingestion endpoint of ``langfuse_rollup``.
+
+Module layout (#166): this file is the ORCHESTRATOR — it holds the two view assemblers
+(:func:`build_batch` / :func:`build_cycle_batch` / :func:`_assemble_copies`), the Langfuse
+fetch/post I/O, the transcript scan, and :func:`main`. Everything else lives in the
+``telemetry.spoke_tree`` package, one module per family (foundation ``ids`` / ``observations``;
+core plumbing ``indices`` / ``folding`` / ``assembly``; ``rollups``; view lenses ``steps`` /
+``cycle``; enrichments ``loaded_context`` / ``llm_decomp`` / ``context_deltas`` / ``metadata`` /
+``commits`` / ``scores``). :func:`main` drives the post-build enrichments through the ordered
+:data:`_ENRICHMENTS` registry over a shared :class:`EnrichmentContext`, so a future enrichment is
+one new module + one registry line.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import logging
 import os
-import re
 import sys
 import time
 import urllib.parse
 from collections.abc import Callable
-from datetime import datetime
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from telemetry.langfuse_rollup import (
     DeleteFn,
     GetFn,
-    Observation,
     PostFn,
     all_observations,
     make_delete,
@@ -156,6 +163,7 @@ from telemetry.langfuse_rollup import (
 from telemetry.measure_context_cost import (
     DEFAULT_ENDPOINT,
     DEFAULT_MODEL,
+    TokenCounter,
     make_counter,
 )
 from telemetry.session_parser import project_dir_for_worktree
@@ -165,10 +173,9 @@ from telemetry.spoke_tree.assembly import (
     _tool_additions,
     _tool_span_ids,
 )
+from telemetry.spoke_tree.commits import _commit_events, _gate_park_event, _load_commits
 from telemetry.spoke_tree.context_deltas import _apply_context_rollups, apply_context_deltas
 from telemetry.spoke_tree.cycle import (
-    _POST_STEP_KEY,
-    _PRE_STEP_KEY,
     _apply_cycle_axis,
     _cycle_step_for,
     _cycle_step_ids,
@@ -181,7 +188,6 @@ from telemetry.spoke_tree.folding import (
     _stamp_hook_endtimes,
 )
 from telemetry.spoke_tree.ids import (
-    _CYCLE_STEP_PREFIX,
     _copy_id,
     cycle_copy_id_for,
     cycle_root_id_for,
@@ -211,22 +217,17 @@ from telemetry.spoke_tree.metadata import (
     read_mode_lane,
 )
 from telemetry.spoke_tree.observations import (
-    _INTERACTION_NAME,
-    _POST_STEP_NAME,
-    _PRE_STEP_NAME,
     IngestEvent,
     ToolContent,
     TraceObservations,
     _earliest_start,
-    _elapsed_ms,
-    _is_gate_observation,
     _latest_time,
-    _parse_ts,
 )
 from telemetry.spoke_tree.rollups import (
     _apply_container_rollups,
     _strip_container_usage,
 )
+from telemetry.spoke_tree.scores import build_score_events, build_step_cost_scores
 from telemetry.spoke_tree.steps import (
     _apply_step_grouping,
     _collapse_startup_instants,
@@ -236,34 +237,8 @@ from telemetry.spoke_tree.steps import (
 logger = logging.getLogger("langfuse_spoke_tree")
 
 
-# Synthetic timeline nodes (#162): git commits and the PLAN-gate park, keyed off the spoke run
-# id (+ sha) so a rerun overwrites the same node. The ``wait:`` name prefix routes the park into
-# the duration ``wait`` bucket (see _duration_class); the field separator is the byte git emits
-# between --format fields in the commit dump (_parse_commits).
-_COMMIT_PREFIX = "tree-commit-"
-_GATE_PARK_PREFIX = "tree-gatepark-"
-_GATE_PARK_NODE_NAME = "wait:gate-park"
-_COMMIT_FIELD_SEP = "\x1f"
-_COMMIT_LINE_MARKER = "commit"
 _CYCLE_TRACE_NAME_PREFIX = "spoke-cycle:"
 _CYCLE_ROOT_NAME_PREFIX = "cycle:"
-# Deterministic id prefix for the numeric Langfuse scores (#100 amendment: chartable time budget).
-_SCORE_PREFIX = "tree-score-"
-# Score names — Langfuse sums/charts numeric scores (it cannot chart arbitrary metadata).
-_PERMISSION_WAIT_SCORE = "permission_wait_ms"  # per blocked tool observation
-_GATE_PARK_SCORE = "gate_park_ms"  # trace-level PLAN-gate park wait
-_TOOL_RESULT_SIZE_SCORE = "tool_result_size"  # bytes of a tool node's reconstructed tool_result
-# Per-phase step cost/token scores (#158): the phase is the score-name suffix (a metrics
-# dimension), so "what does RED cost across all spokes" is a one-widget Scores query.
-_STEP_COST_SCORE = "step_cost_usd"  # per View B step observation, from rollup.written x price
-_STEP_TOKENS_WRITTEN_SCORE = (
-    "step_tokens_written"  # per View B step observation, from rollup.written
-)
-# The canonical solo-cycle phases parsed out of a step subject (e.g. "A-RED: …" → RED). Kept a
-# closed set so a step subject can never mint a free-text score name (a metrics-cardinality guard).
-_STEP_PHASES = ("ANCHOR", "RED", "GREEN", "REVIEW", "PUSH")
-_STEP_PHASE_OTHER = "other"
-_STEP_PHASE_RE = re.compile(rf"\b({'|'.join(_STEP_PHASES)})\b")
 _TRACE_NAME_PREFIX = "spoke-tree:"
 _ROOT_NAME_PREFIX = "spoke:"
 
@@ -801,410 +776,6 @@ def filled_tool_spans(traces: list[TraceObservations], tool_content: dict[str, T
     )
 
 
-def _score_id(spoke_run_id: str, name: str, target: str) -> str:
-    """Return the deterministic id of one score for a spoke (idempotent across reruns)."""
-    digest = hashlib.sha1(f"{spoke_run_id}:score:{name}:{target}".encode()).hexdigest()[:24]
-    return _SCORE_PREFIX + digest
-
-
-def _score_event(
-    spoke_run_id: str,
-    *,
-    name: str,
-    value: float,
-    trace_id: str,
-    base_ts: str,
-    observation_id: str | None = None,
-) -> IngestEvent:
-    """Shape one numeric ``score-create`` ingestion event (trace- or observation-level)."""
-    target = observation_id or "trace"
-    score_id = _score_id(spoke_run_id, name, target)
-    body: dict[str, Any] = {
-        "id": score_id,
-        "traceId": trace_id,
-        "name": name,
-        "value": value,
-        "dataType": "NUMERIC",
-    }
-    if observation_id is not None:
-        body["observationId"] = observation_id
-    return {"id": score_id, "type": "score-create", "timestamp": base_ts, "body": body}
-
-
-def _is_activity_observation(observation: Observation) -> bool:
-    """Whether an observation is genuine spoke activity (a turn, an LLM call, or a tool call).
-
-    Used to find where the spoke resumed after a PLAN-gate park — the markers, hooks, and
-    script spans that may fire right after the gate are NOT activity and are skipped.
-    """
-    if observation.get("type") == "GENERATION":
-        return True
-    name = observation.get("name") or ""
-    return name == _INTERACTION_NAME or name.startswith("tool:")
-
-
-def _earliest_after(candidates: list[str], floor: datetime) -> str | None:
-    """Return the chronologically-earliest ISO ``candidates`` value parsed strictly after ``floor``.
-
-    Compares PARSED datetimes (not raw strings), so mixed ISO forms (``Z`` vs ``+00:00``,
-    fractional seconds) order correctly. A candidate whose parse fails or whose tz-awareness
-    differs from ``floor`` (an uncomparable pair) is skipped rather than crashing.
-    """
-    best_dt: datetime | None = None
-    best_str: str | None = None
-    for value in candidates:
-        parsed = _parse_ts(value)
-        if parsed is None:
-            continue
-        try:
-            after = parsed > floor
-        except TypeError:
-            continue  # naive vs aware — uncomparable, skip
-        if after and (best_dt is None or parsed < best_dt):
-            best_dt, best_str = parsed, value
-    return best_str
-
-
-def _gate_park_bounds(traces: list[TraceObservations]) -> tuple[str, str] | None:
-    """Return the PLAN-gate park's ``(start, end)`` ISO bounds, or None when the spoke never parked.
-
-    The park starts at the end of the earliest gate observation (:func:`_is_gate_observation`,
-    the ``spoke-ready.sh --gate`` emission) and ends at the first genuine spoke activity
-    (:func:`_is_activity_observation`) that starts after it — the resumption once the plan was
-    approved. All comparisons parse the ISO timestamps. None when there is no gate observation or
-    nothing resumed after it.
-    """
-    gate_ends: list[str] = []
-    activity_starts: list[str] = []
-    for _orig_trace_id, observations in traces:
-        for observation in observations:
-            if _is_gate_observation(observation):
-                end = observation.get("endTime") or observation.get("startTime")
-                if end:
-                    gate_ends.append(end)
-            elif _is_activity_observation(observation) and observation.get("startTime"):
-                activity_starts.append(observation["startTime"])
-    parsed_gates = [(dt, end) for end in gate_ends if (dt := _parse_ts(end)) is not None]
-    if not parsed_gates:
-        return None
-    gate_floor, gate_end = min(parsed_gates, key=lambda pair: pair[0])
-    resume = _earliest_after(activity_starts, gate_floor)
-    if resume is None:
-        return None
-    return gate_end, resume
-
-
-def _gate_park_ms(traces: list[TraceObservations]) -> int | None:
-    """Return the PLAN-gate park wait in ms, or None when the spoke never parked at a gate."""
-    bounds = _gate_park_bounds(traces)
-    return _elapsed_ms(*bounds) if bounds is not None else None
-
-
-def _parse_commits(dump: str) -> list[dict[str, Any]]:
-    """Parse a ``git log --numstat`` dump into per-commit records (#162).
-
-    The dump is produced with a ``commit<US>%H<US>%aI<US>%s`` format line per commit (``<US>`` is
-    :data:`_COMMIT_FIELD_SEP`), followed by the commit's ``additions<TAB>deletions<TAB>path``
-    numstat lines. A binary file's counts are ``-`` and contribute 0. Records preserve dump order.
-
-    Args:
-        dump: The raw ``git log --numstat`` output.
-
-    Returns:
-        One record per commit: ``{sha, message, authored_at, files, additions, deletions}``.
-    """
-    commits: list[dict[str, Any]] = []
-    current: dict[str, Any] | None = None
-    for line in dump.splitlines():
-        if line.startswith(_COMMIT_LINE_MARKER + _COMMIT_FIELD_SEP):
-            parts = line.split(_COMMIT_FIELD_SEP)
-            if len(parts) < 4:
-                current = None
-                continue
-            current = {
-                "sha": parts[1],
-                "message": _COMMIT_FIELD_SEP.join(parts[3:]),
-                "authored_at": parts[2],
-                "files": [],
-                "additions": 0,
-                "deletions": 0,
-            }
-            commits.append(current)
-        elif current is not None and line.strip():
-            columns = line.split("\t")
-            if len(columns) == 3:
-                added, deleted, path = columns
-                current["additions"] += int(added) if added.isdigit() else 0
-                current["deletions"] += int(deleted) if deleted.isdigit() else 0
-                current["files"].append(path)
-    return commits
-
-
-def _load_commits(path: Path | None) -> list[dict[str, Any]]:
-    """Read and parse a commit dump path, or return ``[]`` when absent/unreadable (best-effort)."""
-    if path is None:
-        return []
-    try:
-        # errors="replace": a commit subject in a non-UTF-8 locale must degrade a glyph, never
-        # crash the land-time view build (the whole ingest step is best-effort).
-        return _parse_commits(path.read_text(encoding="utf-8", errors="replace"))
-    except OSError:
-        logger.warning("cannot read commits dump %s", path)
-        return []
-
-
-def _commit_id(spoke_run_id: str, sha: str, *, cycle: bool) -> str:
-    """Return the deterministic id of a commit node (per view, idempotent across reruns)."""
-    namespace = "cyccommit" if cycle else "commit"
-    digest = hashlib.sha1(f"{spoke_run_id}:{namespace}:{sha}".encode()).hexdigest()[:24]
-    return _COMMIT_PREFIX + digest
-
-
-def _gate_park_node_id(spoke_run_id: str, *, cycle: bool) -> str:
-    """Return the deterministic id of the gate-park node (per view, idempotent across reruns)."""
-    namespace = "cycgatepark" if cycle else "gatepark"
-    digest = hashlib.sha1(f"{spoke_run_id}:{namespace}".encode()).hexdigest()[:24]
-    return _GATE_PARK_PREFIX + digest
-
-
-def _commit_events(
-    commits: list[dict[str, Any]],
-    *,
-    spoke_run_id: str,
-    trace_id: str,
-    cycle: bool,
-    parent_for: Callable[[str], str],
-) -> list[IngestEvent]:
-    """Build ``commit:<sha7>`` timeline nodes, each an instant at its author time (#162).
-
-    Each node is placed under ``parent_for(author_time)`` (the root in View A, the containing step
-    in View B) and carries ``{sha, message, files, additions, deletions}`` metadata but no usage,
-    so it never affects trace cost or the duration rollup.
-    """
-    events: list[IngestEvent] = []
-    for commit in commits:
-        sha = str(commit["sha"])
-        authored_at = str(commit["authored_at"])
-        node_id = _commit_id(spoke_run_id, sha, cycle=cycle)
-        events.append(
-            {
-                "id": node_id,
-                "type": "span-create",
-                "timestamp": authored_at,
-                "body": {
-                    "id": node_id,
-                    "traceId": trace_id,
-                    "parentObservationId": parent_for(authored_at),
-                    "name": f"commit:{sha[:7]}",
-                    "startTime": authored_at,
-                    "endTime": authored_at,
-                    "metadata": {
-                        "sha": sha,
-                        "message": commit["message"],
-                        "files": commit["files"],
-                        "additions": commit["additions"],
-                        "deletions": commit["deletions"],
-                    },
-                },
-            }
-        )
-    return events
-
-
-def _gate_park_event(
-    traces: list[TraceObservations],
-    *,
-    spoke_run_id: str,
-    trace_id: str,
-    cycle: bool,
-    parent_id: str,
-) -> IngestEvent | None:
-    """Build the ``wait:gate-park`` timeline block from the gate-park bounds, or None (#162).
-
-    The block spans the gate's end to the resumption after approval (:func:`_gate_park_bounds`);
-    its ``wait:`` name routes it into the duration ``wait`` bucket, so in View A the park time
-    moves out of the root's ``self`` gap without changing ``total_ms``.
-
-    UPGRADE: in the rare case a non-activity span (a second gate, a hook) falls inside the park
-    window, both it and this node book the overlap into ``wait`` (span-time, not wall-time) — carve
-    the node's interval around such spans if the wait bucket ever needs to be exact.
-    """
-    bounds = _gate_park_bounds(traces)
-    if bounds is None:
-        return None
-    start, end = bounds
-    node_id = _gate_park_node_id(spoke_run_id, cycle=cycle)
-    return {
-        "id": node_id,
-        "type": "span-create",
-        "timestamp": start,
-        "body": {
-            "id": node_id,
-            "traceId": trace_id,
-            "parentObservationId": parent_id,
-            "name": _GATE_PARK_NODE_NAME,
-            "startTime": start,
-            "endTime": end,
-        },
-    }
-
-
-def build_score_events(
-    spoke_run_id: str,
-    traces: list[TraceObservations],
-    batch: list[IngestEvent],
-    *,
-    base_ts: str,
-) -> list[IngestEvent]:
-    """Build the numeric Langfuse scores that make a spoke's metadata chartable (#100, #101).
-
-    Langfuse dashboards can sum/aggregate numeric SCORES but not arbitrary observation metadata,
-    so three signals already present as metadata are ALSO emitted as scores:
-
-    - ``permission_wait_ms`` — an observation-level score on every ``tool:`` node carrying a
-      folded ``blocked_on_user_ms`` (Part 2), so permission-prompt wait sums across spokes.
-    - ``tool_result_size`` — an observation-level score on every ``tool:`` node carrying a
-      reconstructed ``tool_result_size`` (#101 part 4), so "which tool outputs bloat context"
-      is a one-click chart.
-    - ``gate_park_ms`` — a trace-level score for the PLAN-gate park (:func:`_gate_park_ms`),
-      emitted only when the spoke parked at a gate.
-
-    All ids derive from the spoke run id so a rerun overwrites the same scores.
-
-    Args:
-        spoke_run_id: The spoke run identifier.
-        traces: The source traces (for the gate-park gap).
-        batch: The assembled events (read for the folded ``blocked_on_user_ms`` /
-            ``tool_result_size`` tool metadata).
-        base_ts: ISO timestamp stamped on every score event.
-
-    Returns:
-        The ``score-create`` ingestion events (empty when no signal is present).
-    """
-    trace_id = trace_id_for(spoke_run_id)
-    events: list[IngestEvent] = []
-    for event in batch:
-        body = event["body"]
-        metadata = body.get("metadata") or {}
-        wait = metadata.get("blocked_on_user_ms")
-        if wait is not None:
-            events.append(
-                _score_event(
-                    spoke_run_id,
-                    name=_PERMISSION_WAIT_SCORE,
-                    value=int(wait),
-                    trace_id=trace_id,
-                    base_ts=base_ts,
-                    observation_id=body["id"],
-                )
-            )
-        size = metadata.get("tool_result_size")
-        if size is not None:
-            events.append(
-                _score_event(
-                    spoke_run_id,
-                    name=_TOOL_RESULT_SIZE_SCORE,
-                    value=int(size),
-                    trace_id=trace_id,
-                    base_ts=base_ts,
-                    observation_id=body["id"],
-                )
-            )
-    park = _gate_park_ms(traces)
-    if park is not None:
-        events.append(
-            _score_event(
-                spoke_run_id,
-                name=_GATE_PARK_SCORE,
-                value=park,
-                trace_id=trace_id,
-                base_ts=base_ts,
-            )
-        )
-    return events
-
-
-def _step_phase(subject: str) -> str:
-    """Return the canonical solo-cycle phase named in a step subject, or ``other`` (#158).
-
-    ``"A-RED: red first"`` → ``RED``; ``"ANCHOR #154 …"`` → ``ANCHOR``; a compound subject like
-    ``"REVIEW + PUSH"`` takes the leftmost keyword (``REVIEW``). The result is always one of the
-    closed :data:`_STEP_PHASES` set or ``other`` — never free text — so it is a safe score-name
-    suffix.
-    """
-    match = _STEP_PHASE_RE.search(subject.upper())
-    return match.group(1) if match else _STEP_PHASE_OTHER
-
-
-def _step_phase_of(body: dict[str, Any]) -> str:
-    """Return the phase of one View B step node: ``pre`` / ``post`` for the boundary partitions,
-    else the phase parsed from its subject."""
-    name = body.get("name") or ""
-    if name == _PRE_STEP_NAME:
-        return _PRE_STEP_KEY
-    if name == _POST_STEP_NAME:
-        return _POST_STEP_KEY
-    subject = (body.get("metadata") or {}).get("subject") or name
-    return _step_phase(subject)
-
-
-def build_step_cost_scores(
-    spoke_run_id: str, cycle_batch: list[IngestEvent], *, base_ts: str, price: float
-) -> list[IngestEvent]:
-    """Build per-phase step cost/token scores from View B's step rollups (#158).
-
-    ``step:*`` nodes carry token rollups only in ``metadata.rollup`` (never ``usageDetails`` — the
-    #114 double-count guard), so per-step cost is invisible to the Metrics API. Score NAMES are a
-    metrics dimension, so each View B step emits ``step_cost_usd:<PHASE>`` and
-    ``step_tokens_written:<PHASE>`` from its rollup's ``written`` tokens (cost = written × the
-    cache-creation ``price``), observation-scoped to the step node with a deterministic id.
-
-    Emitted on View B (the cycle lens) ONLY: a step lives on both views, but scoring both would
-    double every phase in a Scores-view sum, so — like the other per-call enrichments — this is
-    single-emit. A step with no rollup (a childless boundary partition) is skipped.
-
-    Args:
-        spoke_run_id: The spoke run identifier (keys the deterministic score ids).
-        cycle_batch: The assembled View B events (its step nodes' rollups are read).
-        base_ts: ISO timestamp stamped on every score event.
-        price: Cache-creation price in USD per written token.
-
-    Returns:
-        The ``score-create`` events (empty when View B has no step rollups).
-    """
-    trace_id = cycle_trace_id_for(spoke_run_id)
-    events: list[IngestEvent] = []
-    for event in cycle_batch:
-        body = event["body"]
-        if not body["id"].startswith(_CYCLE_STEP_PREFIX):
-            continue
-        written = ((body.get("metadata") or {}).get("rollup") or {}).get("written")
-        if written is None:
-            continue
-        phase = _step_phase_of(body)
-        events.append(
-            _score_event(
-                spoke_run_id,
-                name=f"{_STEP_COST_SCORE}:{phase}",
-                value=written * price,
-                trace_id=trace_id,
-                base_ts=base_ts,
-                observation_id=body["id"],
-            )
-        )
-        events.append(
-            _score_event(
-                spoke_run_id,
-                name=f"{_STEP_TOKENS_WRITTEN_SCORE}:{phase}",
-                value=written,
-                trace_id=trace_id,
-                base_ts=base_ts,
-                observation_id=body["id"],
-            )
-        )
-    return events
-
-
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse the CLI arguments for the spoke-tree assembler."""
     env = os.environ
@@ -1276,6 +847,115 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+@dataclass
+class EnrichmentContext:
+    """The shared inputs + accumulated outputs threaded through the enrichment passes.
+
+    The read-only inputs (``batch`` / ``cycle_batch`` are mutated in place by the passes) plus the
+    per-pass result fields the summary line reports. One object is built once in :func:`main` and
+    handed to each entry in :data:`_ENRICHMENTS` in order.
+    """
+
+    spoke_run_id: str
+    traces: list[TraceObservations]
+    batch: list[IngestEvent]
+    cycle_batch: list[IngestEvent]
+    tool_content: dict[str, ToolContent]
+    bodies_dir: Path
+    counter: TokenCounter
+    price: float
+    base_ts: str
+    root: Path
+    # Accumulated outputs (populated by the passes, read by the summary line).
+    context_events: list[IngestEvent] = field(default_factory=list)
+    rows: list[dict[str, object]] = field(default_factory=list)
+    source: str = ""
+    decomposed: int = 0
+    efforts: int = 0
+    deltas: dict[tuple[str, str], dict[str, int]] = field(default_factory=dict)
+    score_events: list[IngestEvent] = field(default_factory=list)
+    step_scores: list[IngestEvent] = field(default_factory=list)
+
+
+def _enrich_loaded_context(ctx: EnrichmentContext) -> None:
+    """Collapse the startup inventory into one ``loaded-context`` node (#87), request body else disk."""
+    request_rows = request_context_rows(ctx.bodies_dir, counter=ctx.counter, price=ctx.price)
+    if request_rows is not None:
+        ctx.rows, ctx.source = request_rows, "request body"
+        ctx.context_events = build_loaded_context_events(
+            ctx.spoke_run_id, ctx.rows, category_order=_REQUEST_CATEGORY_ORDER, base_ts=ctx.base_ts
+        )
+    else:
+        ctx.rows, ctx.source = (
+            loaded_context_rows(ctx.root, counter=ctx.counter, price=ctx.price),
+            "disk",
+        )
+        ctx.context_events = build_loaded_context_events(
+            ctx.spoke_run_id,
+            ctx.rows,
+            category_order=_DISK_CATEGORY_ORDER,
+            base_ts=ctx.base_ts,
+            prefix_total=prefix_total(ctx.traces),
+            price=ctx.price,
+        )
+
+
+def _enrich_llm_decomposition(ctx: EnrichmentContext) -> None:
+    """Fold each llm_request's #99 cache_read/cache_creation decomposition onto its View A copy."""
+    ctx.decomposed = apply_llm_decomposition(
+        ctx.batch, ctx.traces, ctx.bodies_dir, counter=ctx.counter, price=ctx.price
+    )
+
+
+def _enrich_request_body_metadata(ctx: EnrichmentContext) -> None:
+    """Surface each request body's #101 effort + cache-breakpoint signals on its llm_request copy."""
+    ctx.efforts = apply_request_body_metadata(ctx.batch, ctx.traces, ctx.bodies_dir)
+
+
+def _enrich_context_deltas(ctx: EnrichmentContext) -> None:
+    """Stamp #160 per-request context deltas and aggregate them onto both views' step rollups."""
+    ctx.deltas = apply_context_deltas(
+        ctx.batch,
+        ctx.traces,
+        ctx.bodies_dir,
+        counter=ctx.counter,
+        price=ctx.price,
+        tool_content=ctx.tool_content,
+    )
+    _apply_context_rollups(ctx.batch, {_copy_id(o, i): s for (o, i), s in ctx.deltas.items()})
+    _apply_context_rollups(
+        ctx.cycle_batch, {cycle_copy_id_for(o, i): s for (o, i), s in ctx.deltas.items()}
+    )
+
+
+def _enrich_scores(ctx: EnrichmentContext) -> None:
+    """Emit the trace/observation numeric scores (#100, #101) from the assembled View A batch."""
+    ctx.score_events = build_score_events(
+        ctx.spoke_run_id, ctx.traces, ctx.batch, base_ts=ctx.base_ts
+    )
+
+
+def _enrich_step_scores(ctx: EnrichmentContext) -> None:
+    """Emit the per-phase step cost/token scores (#158) from View B's step rollups."""
+    ctx.step_scores = build_step_cost_scores(
+        ctx.spoke_run_id, ctx.cycle_batch, base_ts=ctx.base_ts, price=ctx.price
+    )
+
+
+# The enrichment passes, in the exact order main applies them. Adding a future enrichment is one
+# module + one line here; the passes mutate the batches / accumulate onto the shared context above
+# (a plain ordered list, deliberately not a self-registering registry — the cross-pass data flow
+# through EnrichmentContext makes explicit ordering the honest shape).
+_ENRICHMENTS: tuple[tuple[str, Callable[[EnrichmentContext], None]], ...] = (
+    ("loaded-context", _enrich_loaded_context),
+    ("llm-decomposition", _enrich_llm_decomposition),
+    ("request-body-metadata", _enrich_request_body_metadata),
+    ("context-deltas", _enrich_context_deltas),
+    ("scores", _enrich_scores),
+    ("step-scores", _enrich_step_scores),
+)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Assemble a spoke's rich Langfuse observations into one nested trace.
 
@@ -1327,44 +1007,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     base_ts = _earliest_start(traces)
     bodies_dir = args.request_bodies or (args.root.resolve() / _BODY_DIR_CONVENTION)
-    request_rows = request_context_rows(bodies_dir, counter=counter, price=args.price)
-    if request_rows is not None:
-        rows, source = request_rows, "request body"
-        context_events = build_loaded_context_events(
-            args.spoke_run_id, rows, category_order=_REQUEST_CATEGORY_ORDER, base_ts=base_ts
-        )
-    else:
-        rows, source = (
-            loaded_context_rows(args.root.resolve(), counter=counter, price=args.price),
-            "disk",
-        )
-        context_events = build_loaded_context_events(
-            args.spoke_run_id,
-            rows,
-            category_order=_DISK_CATEGORY_ORDER,
-            base_ts=base_ts,
-            prefix_total=prefix_total(traces),
-            price=args.price,
-        )
-    decomposed = apply_llm_decomposition(
-        batch, traces, bodies_dir, counter=counter, price=args.price
-    )
     # UPGRADE: apply_llm_decomposition + apply_request_body_metadata each re-walk
     # _llm_requests_in_order and re-stat find_request_files over the same inputs — compute the
-    # calls↔bodies pairing once in main and pass it in if the body count ever makes it measurable.
-    efforts = apply_request_body_metadata(batch, traces, bodies_dir)
-    deltas = apply_context_deltas(
-        batch, traces, bodies_dir, counter=counter, price=args.price, tool_content=tool_content
+    # calls↔bodies pairing once and pass it in if the body count ever makes it measurable.
+    ctx = EnrichmentContext(
+        spoke_run_id=args.spoke_run_id,
+        traces=traces,
+        batch=batch,
+        cycle_batch=cycle_batch,
+        tool_content=tool_content,
+        bodies_dir=bodies_dir,
+        counter=counter,
+        price=args.price,
+        base_ts=base_ts,
+        root=args.root.resolve(),
     )
-    _apply_context_rollups(batch, {_copy_id(o, i): s for (o, i), s in deltas.items()})
-    _apply_context_rollups(
-        cycle_batch, {cycle_copy_id_for(o, i): s for (o, i), s in deltas.items()}
+    for _name, enrich in _ENRICHMENTS:
+        enrich(ctx)
+    post_in_chunks(
+        batch + ctx.context_events + ctx.score_events + cycle_batch + ctx.step_scores, post
     )
-    score_events = build_score_events(args.spoke_run_id, traces, batch, base_ts=base_ts)
-    step_scores = build_step_cost_scores(
-        args.spoke_run_id, cycle_batch, base_ts=base_ts, price=args.price
-    )
-    post_in_chunks(batch + context_events + score_events + cycle_batch + step_scores, post)
 
     trace_id = trace_id_for(args.spoke_run_id)
     cycle_trace_id = cycle_trace_id_for(args.spoke_run_id)
@@ -1372,12 +1034,12 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"{len(batch) - 2} observations assembled under trace {trace_id} "
         f"(roots collapsed to 1), {filled} tool spans filled from transcript, "
-        f"{len(rows)} loaded-context items collapsed into 1 node (source: {source}), "
-        f"{decomposed} llm_requests cache-decomposed, "
-        f"{len(deltas)} llm_requests context-delta stamped, "
-        f"{efforts} llm_requests effort-tagged, "
-        f"{len(score_events)} numeric scores emitted, "
-        f"{len(step_scores)} per-phase step cost/token scores emitted, "
+        f"{len(ctx.rows)} loaded-context items collapsed into 1 node (source: {ctx.source}), "
+        f"{ctx.decomposed} llm_requests cache-decomposed, "
+        f"{len(ctx.deltas)} llm_requests context-delta stamped, "
+        f"{ctx.efforts} llm_requests effort-tagged, "
+        f"{len(ctx.score_events)} numeric scores emitted, "
+        f"{len(ctx.step_scores)} per-phase step cost/token scores emitted, "
         f"{len(commits)} commit nodes synthesized, "
         f"tagged mode={mode} lane={lane}; "
         f"{len(cycle_batch) - 2} observations assembled under cycle trace {cycle_trace_id}"
