@@ -14,9 +14,11 @@ This module parses one such file into named :class:`ContextItem` entries:
   into ``tools``. The serialized schema is the text whose tokens are measured.
 - ``system[*]`` — one item per system block, labeled by position (billing header /
   identity preamble / base system prompt / tool-use + output prompt).
-- ``messages[0]`` — each ``<system-reminder>`` block, classified by kind
-  (session-start-hook / deferred-tools / agent-types / skills / rules+memory+env),
-  plus the residual user prompt; all in the ``context`` category.
+- ``messages[0]`` — each ``<system-reminder>`` block, routed through the combined-block
+  section router (#159): a rules+memory+env reminder splits into per-file ``rules`` items
+  plus an ``environment`` residue, a skills reminder into per-skill ``skills`` items, and
+  every other kind (session-start-hook / deferred-tools / agent-types) stays a whole
+  ``context`` item; plus the residual user prompt.
 
 It also records every ``cache_control`` prefix boundary (read directly, not
 inferred) and counts the deferred tools that are named-only in a reminder — their
@@ -262,11 +264,14 @@ def _message_items(
 ) -> tuple[list[ContextItem], list[CacheBoundary], int]:
     """Itemize ``messages[0]`` into reminder blocks + the residual prompt.
 
-    Each ``<system-reminder>`` is split out and classified; whatever text remains in a
-    block after the reminders are removed is the user prompt. A block (and every reminder /
-    prompt within it) is in the cached prefix when it sits at/before the last ``messages``
-    breakpoint. Deferred tools named in a deferred-tools reminder are tallied (their schemas
-    are absent, so never sized).
+    Each ``<system-reminder>`` is routed through :func:`_decompose_reminder`, the shared
+    combined-block section router (#159): a rules+memory+env reminder splits into one
+    ``rules`` item per ``Contents of <path>`` file plus an ``environment`` residue, a skills
+    reminder splits into one ``skills`` item per skill, and every other kind stays a whole
+    ``context`` item. Whatever text remains in a block after the reminders are removed is the
+    user prompt. A block (and every item within it) is in the cached prefix when it sits
+    at/before the last ``messages`` breakpoint. Deferred tools named in a deferred-tools
+    reminder are tallied (their schemas are absent, so never sized).
     """
     if not isinstance(messages, list) or not messages:
         return [], [], 0
@@ -284,9 +289,8 @@ def _message_items(
             boundaries.append(CacheBoundary("messages", index))
         cached = index <= last_marker
         for full, inner in ((m.group(0), m.group(1)) for m in _REMINDER_RE.finditer(text)):
-            kind = _classify_reminder(inner)
-            items.append(ContextItem("context", kind, full, cached))
-            if kind == "deferred-tools":
+            items.extend(_decompose_reminder(full, inner, cached=cached))
+            if _classify_reminder(inner) == "deferred-tools":
                 deferred += _count_deferred(inner)
         residual = _REMINDER_RE.sub("", text).strip()
         if residual:
@@ -411,7 +415,14 @@ def _decompose_first_message(first: object, *, any_later_marker: bool) -> list[C
 
 
 def _decompose_reminder(full: str, inner: str, *, cached: bool) -> list[ContextItem]:
-    """Route one reminder to the per-file / per-skill splitter or keep it as a context item."""
+    """Route one reminder to the per-file / per-skill splitter or keep it as a context item.
+
+    The shared combined-block section router: a rules+memory+env reminder splits into one
+    ``rules`` item per ``Contents of <path>`` file plus an ``environment`` residue, a skills
+    reminder splits into one ``skills`` item per skill, every other kind stays a whole
+    ``context`` item. Used by both the turn-0 baseline (:func:`_message_items`) and the
+    full-body decomposition (:func:`_decompose_first_message`).
+    """
     kind = _classify_reminder(inner)
     if kind == "rules+memory+env":
         return _split_rules_items(inner, cached=cached)

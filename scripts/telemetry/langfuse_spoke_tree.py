@@ -294,8 +294,11 @@ _DEFAULT_PROJECTS = Path("~/.claude/projects").expanduser()
 _LC_PREFIX = "tree-lc-"
 # Default cache-creation price (USD per token), Opus tier — mirrors measure_context_cost.
 _DEFAULT_PRICE = 0.00000625
-# Category order for the request-body itemization (the primary, fully-itemized path).
-_REQUEST_CATEGORY_ORDER = ("tools", "mcp", "system", "context")
+# Category order for the request-body itemization (the primary, fully-itemized path). The
+# turn-0 combined-block router (#159) splits the rules+memory+env reminder into ``rules`` /
+# ``environment`` items and the skills reminder into ``skills`` items, so those keys sit
+# between ``system`` and the whole-kept ``context`` reminders (empty categories are dropped).
+_REQUEST_CATEGORY_ORDER = ("tools", "mcp", "system", "rules", "skills", "environment", "context")
 # Component order for the per-llm_request cache decomposition (#99), in request order so the
 # stable prefix (tools/system/rules/skills) groups ahead of the volatile messages.
 _DECOMP_CATEGORY_ORDER = (
