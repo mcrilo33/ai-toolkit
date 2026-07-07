@@ -1396,3 +1396,166 @@ def test_classify_permission_tightened_cases(cmd: str, verdict: str) -> None:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == verdict, f"{cmd!r}: {result.stdout}"
+
+
+# ── issue #175: the structured plan artifact replaces transcript extraction ────
+# The gate park hands its plan to the broker through a scripted artifact
+# (<wt>/.ai-toolkit/gate-<N>.md, written by spoke-ready.sh --gate) rather than the
+# transcript heuristic. The gate route PREFERS the artifact when present (transcript
+# fallback intact); _consume_gate_tag removes it alongside the tag.
+
+
+def _gate_park_transcript(plan: str) -> str:
+    """A gate-park transcript line: a prose plan + a spoke-ready --gate Bash, no AskUserQuestion."""
+    return (
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": plan},
+                        {
+                            "type": "tool_use",
+                            "name": "Bash",
+                            "input": {
+                                "command": "bash .ai-toolkit/scripts/spoke-ready.sh --gate 5"
+                            },
+                        },
+                    ]
+                },
+            }
+        )
+        + "\n"
+    )
+
+
+def _tag_gate_at_head(wt: Path, issue: int) -> None:
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(
+        ["git", "tag", "-a", f"gate/{issue}", "-m", "plan"],
+        cwd=wt,
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+
+
+def _gate_broker_env(spoke_repo: Path, tmp_path: Path, *, prompt_log: Path) -> dict[str, str]:
+    """Env for a gate-parked broker run: transcript plan + a prompt-capturing answerer.
+
+    The answerer (AFK_ANSWERER_CMD) appends the prompt it receives on stdin to
+    ``prompt_log`` then ESCALATEs, so a test can assert which plan the broker fed it.
+    """
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    (pd / "session.jsonl").write_text(_gate_park_transcript("TRANSCRIPT PLAN prose"))
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text("#!/usr/bin/env bash\ntrue\n")
+    ready_stub.chmod(0o755)
+
+    return {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "SPOKE_READY": str(ready_stub),
+        "AFK_STATE_DIR": str(tmp_path / "sd"),
+        "AFK_ANSWERER_CMD": f"cat >> '{prompt_log}'; printf 'ESCALATE: capture'",
+    }
+
+
+def test_read_gate_artifact_returns_plan(spoke_repo: Path) -> None:
+    (spoke_repo / ".ai-toolkit").mkdir()
+    (spoke_repo / ".ai-toolkit" / "gate-5.md").write_text("ARTIFACT PLAN: do the thing\n")
+
+    result = _call(f"_read_gate_artifact '{spoke_repo}' 5")
+
+    assert result.returncode == 0, result.stderr
+    assert "ARTIFACT PLAN: do the thing" in result.stdout
+
+
+def test_read_gate_artifact_empty_when_absent(spoke_repo: Path) -> None:
+    result = _call(f"_read_gate_artifact '{spoke_repo}' 5")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "", (
+        "no artifact → empty (the broker falls back to the transcript)"
+    )
+
+
+def test_read_gate_artifact_caps_at_4000_chars_not_bytes(spoke_repo: Path) -> None:
+    # #175 review: the cap matches extract_pending_question (out[:4000] — CHARACTERS). A
+    # multibyte plan must not be cut on bytes (head -c), which both truncates a valid plan
+    # earlier than 4000 chars and can split a char mid-sequence.
+    (spoke_repo / ".ai-toolkit").mkdir()
+    (spoke_repo / ".ai-toolkit" / "gate-5.md").write_text("é" * 5000, encoding="utf-8")
+
+    result = _call(f"_read_gate_artifact '{spoke_repo}' 5")
+
+    assert result.returncode == 0, result.stderr
+    # 4000 characters, not 4000 bytes (a byte cap yields 2000 'é' — each is 2 UTF-8 bytes).
+    assert result.stdout.count("é") == 4000, (
+        f"expected a 4000-CHARACTER cap, got {result.stdout.count('é')} chars"
+    )
+
+
+def test_broker_gate_route_prefers_artifact_over_transcript(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    prompt_log = tmp_path / "prompt.log"
+    env = _gate_broker_env(spoke_repo, tmp_path, prompt_log=prompt_log)
+    (spoke_repo / ".ai-toolkit").mkdir()
+    (spoke_repo / ".ai-toolkit" / "gate-5.md").write_text("ARTIFACT PLAN: the real plan\n")
+    _tag_gate_at_head(spoke_repo, 5)
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    prompt = prompt_log.read_text()
+    assert "ARTIFACT PLAN: the real plan" in prompt, (
+        "the broker must feed the reasoner the scripted artifact plan"
+    )
+    assert "TRANSCRIPT PLAN prose" not in prompt, (
+        "the artifact must REPLACE transcript extraction when present"
+    )
+
+
+def test_broker_gate_route_falls_back_to_transcript_without_artifact(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    prompt_log = tmp_path / "prompt.log"
+    env = _gate_broker_env(spoke_repo, tmp_path, prompt_log=prompt_log)
+    _tag_gate_at_head(spoke_repo, 5)  # no artifact written
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "TRANSCRIPT PLAN prose" in prompt_log.read_text(), (
+        "with no artifact the transcript fallback must stay intact"
+    )
+
+
+def test_consume_gate_tag_removes_artifact(spoke_repo: Path) -> None:
+    (spoke_repo / ".ai-toolkit").mkdir()
+    artifact = spoke_repo / ".ai-toolkit" / "gate-5.md"
+    artifact.write_text("plan\n")
+    _tag_gate_at_head(spoke_repo, 5)
+
+    result = _call(f"_consume_gate_tag '{spoke_repo}' 5")
+
+    assert result.returncode == 0, result.stderr
+    assert not artifact.exists(), "_consume_gate_tag must remove the plan artifact"
+    tags = subprocess.run(
+        ["git", "tag", "-l", "gate/5"], cwd=spoke_repo, capture_output=True, text=True
+    )
+    assert tags.stdout.strip() == "", "the local gate tag must also be dropped"

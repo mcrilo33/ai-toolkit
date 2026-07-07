@@ -469,6 +469,39 @@ _gate_parked() {
   [ "$(git -C "$wt" rev-parse -q --verify "refs/tags/gate/${issue}^{commit}" 2>/dev/null)" = "$tip" ]
 }
 
+# _gate_artifact_path <wt> <issue> -> the gate plan artifact path (<wt>/.ai-toolkit/
+# gate-<issue>.md). The single owner of that layout, shared by _read_gate_artifact and
+# _consume_gate_tag (spoke-ready.sh writes the same path from the spoke side, #175). Falls
+# back to <wt> as the root when rev-parse can't resolve a toplevel (a non-git path in a test).
+_gate_artifact_path() {
+  local wt="$1" issue="$2" root
+  root="$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$wt")"
+  printf '%s\n' "$root/.ai-toolkit/gate-$issue.md"
+}
+
+# _read_gate_artifact <wt> <issue> -> the plan the spoke wrote to its gate artifact
+# (<wt>/.ai-toolkit/gate-<issue>.md, written by spoke-ready.sh --gate, issue #175), or empty
+# when absent. The SCRIPTED handoff channel the gate route PREFERS over parsing the spoke
+# transcript (extract_pending_question): a script reads what a script wrote, no heuristic.
+# Empty (fall back to the transcript) when the spoke parked without writing one (a bare --gate).
+_read_gate_artifact() {
+  local wt="$1" issue="$2" f
+  f="$(_gate_artifact_path "$wt" "$issue")"
+  [ -f "$f" ] || return 0
+  # Cap at 4000 CHARACTERS (matching extract_pending_question's out[:4000]) so a huge plan
+  # can't blow up the answerer prompt AND a multibyte plan is never split mid-character —
+  # head -c would cut on bytes. python3 is the broker's existing text tool (the
+  # extract_pending_question path); when it is unavailable the untruncated plan
+  # (spoke-authored, bounded in practice) is safer than a byte-truncated one.
+  if command -v python3 >/dev/null 2>&1; then
+    _AFK_GATE_FILE="$f" python3 -c \
+      'import os,sys; sys.stdout.write(open(os.environ["_AFK_GATE_FILE"], encoding="utf-8", errors="replace").read()[:4000])' \
+      2>/dev/null
+  else
+    cat "$f" 2>/dev/null
+  fi
+}
+
 # _still_parked_same <wt> <issue> <was_gate> <question> <before_mtime> -> true when the
 # spoke is still parked on the SAME prompt the answerer reasoned about. The answerer
 # takes minutes; a spoke that moved on meanwhile (a human replied, the turn resumed)
@@ -1192,6 +1225,9 @@ _consume_gate_tag() {
   local wt="$1" issue="$2"
   git -C "$wt" tag -d "gate/$issue" >/dev/null 2>&1 || true
   git -C "$wt" push origin ":refs/tags/gate/$issue" >/dev/null 2>&1 || true
+  # Drop the scripted plan artifact too (issue #175): once the gate is answered the plan
+  # handoff is spent, and a lingering gate-<N>.md would feed a stale plan to a later re-park.
+  rm -f "$(_gate_artifact_path "$wt" "$issue")" 2>/dev/null || true
 }
 
 # --- attended QCM surface (issue #155, subtask C) -----------------------------
@@ -1295,12 +1331,15 @@ broker_service_gate() {
   question="$orig_question"
   if [ "$was_gate" -eq 1 ]; then
     # Route a PLAN-gate park to approve/amend-the-POSTED-PLAN — generic transcript
-    # re-extraction is what replayed the seed six times in #124. The fallback keeps an
-    # unextractable gate park (rotated transcript, no gate Bash record) answerable
-    # instead of silently stranded.
+    # re-extraction is what replayed the seed six times in #124. PREFER the scripted plan
+    # artifact (issue #175: a script reads what a script wrote) over transcript extraction;
+    # orig_question (the transcript walk) stays as the fallback for an unextractable gate
+    # park (rotated transcript, no gate Bash record) or a bare --gate that wrote no artifact.
+    local plan; plan="$(_read_gate_artifact "$wt" "$issue")"
+    [ -n "$plan" ] || plan="$orig_question"
     question="The spoke is parked at its PLAN gate; below is the plan it posted. Approve it or state precise amendments to it. Do NOT restate or re-issue the task itself.
 
-${orig_question:-(the plan prose could not be extracted from the transcript — approve or amend from the issue contract above)}"
+${plan:-(the plan prose could not be extracted — approve or amend from the issue contract above)}"
   elif [ -z "$question" ]; then
     return 0
   fi
