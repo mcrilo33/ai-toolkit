@@ -634,3 +634,53 @@ class TestSpokeMainGuardRegistration:
         assert os.access(script, os.X_OK), (
             "spoke-main-guard.sh must be executable for sync to install"
         )
+
+
+# ── plan-gate-guard registration against the REAL shared/hooks/metadata.yml ──
+# plan-gate-guard (issue #173) is a tier-1 DENY guard that blocks writes while a
+# spoke is parked at its PLAN gate. Like hub-guard it spans both Bash (git commit)
+# and the file-edit tools, so on Claude it carries NO `if` clause (matcher
+# "Edit|Write|NotebookEdit|Bash", the script self-filters). Cursor has no
+# pre-file-edit dedicated event, so — mirroring config-protection — it remaps
+# onto beforeShellExecution and enforces the park at commit time.
+
+
+class TestPlanGateGuardRegistration:
+    SCRIPT = "plan-gate-guard.sh"
+
+    def test_claude_registered_on_bash_and_edit_without_if(self) -> None:
+        cfg = generate_claude(parse_hooks_metadata(str(REAL_META)))
+        guard = _claude_handler(cfg, "PreToolUse", self.SCRIPT)
+        assert guard is not None, "plan-gate-guard not registered for Claude PreToolUse"
+        # Spans git commit AND file writes — no single `if` rule fits, so it
+        # fires on the whole matcher group and the script self-filters.
+        assert guard.get("if") is None
+
+    def test_claude_matcher_covers_edit_write_notebook_and_bash(self) -> None:
+        cfg = generate_claude(parse_hooks_metadata(str(REAL_META)))
+        for group in cfg.get("PreToolUse", []):
+            for handler in group.get("hooks", []):
+                if handler.get("command", "").endswith(self.SCRIPT):
+                    tools = set(group.get("matcher", "").split("|"))
+                    assert {"Edit", "Write", "NotebookEdit", "Bash"} <= tools
+                    return
+        raise AssertionError("plan-gate-guard not found under a matcher group")
+
+    def test_is_tier_1(self) -> None:
+        meta = parse_hooks_metadata(str(REAL_META))
+        assert meta["plan-gate-guard"]["__defaults"]["tier"] == "1"
+
+    def test_cursor_wired_to_before_shell_execution_on_commit(self) -> None:
+        cfg = generate_cursor(parse_hooks_metadata(str(REAL_META)))
+        guard = _cursor_entry(cfg, "beforeShellExecution", self.SCRIPT)
+        assert guard is not None, "plan-gate-guard not wired to Cursor beforeShellExecution"
+        pattern = re.compile(guard["matcher"])
+        assert pattern.search("git commit -m x")
+        assert not pattern.search("git status --short")
+
+    def test_script_exists_and_executable(self) -> None:
+        script = REAL_META.parent / self.SCRIPT
+        assert script.is_file(), "plan-gate-guard.sh missing from shared/hooks/"
+        assert os.access(script, os.X_OK), (
+            "plan-gate-guard.sh must be executable for sync to install"
+        )
