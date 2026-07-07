@@ -42,6 +42,13 @@
 #   AFK_TELEMETRY_CONF           optional conf file for LANGFUSE_BASIC_AUTH / LANGFUSE_HOST
 #                                when env leaves auth unset (env wins) [default: ~/.afk-telemetry]
 #   AFK_PORT_WAIT_TRIES/SLEEP    collector/bridge re-probe attempts + interval after a launch
+#   AFK_PLANNER_TIMEOUT=120      seconds bounding each batch-plan.sh call (#170)
+#   AFK_GH_TIMEOUT=30            seconds bounding each gh call (scope resolve, arm auth) (#170)
+#   AFK_TIMEOUT_KILL_AFTER=10    SIGKILL grace after SIGTERM when a bounded call expires (#170)
+#   AFK_STALE_TICKS=10           heartbeat age (x AFK_TICK_SECONDS) that flags a wedged supervisor
+#   AFK_DISPATCH_MAX_FAILURES=3  consecutive worktree-new.sh failures before an issue is blocked
+#   AFK_ARM_PRECHECK=1           arm-precondition gate (=0 skips live/dirty/branch/gh-auth checks)
+#   AFK_AUTH_PROBE_CMD           reap-time auth probe (default: a bounded headless claude no-op)
 #   CLAUDE_PROJECTS_DIR          transcript root (default: $HOME/.claude/projects)
 #   AFK_REMOTE_HOST / AFK_REMOTE_REPO / AFK_REMOTE_SESSION / AFK_REMOTE_DRAIN_CMD
 #                                --remote target config (or a sourced AFK_REMOTE_CONF file)
@@ -68,6 +75,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${AFK_SPOKE_MAX_MINUTES:=180}"
 : "${AFK_IDLE_MINUTES:=30}"
 : "${AFK_ANSWERER_EFFORT:=high}"
+# Timeouts on the tick's external calls (#170 ST1): a wedged planner / gh must never
+# freeze the whole supervisor — a bounded call that times out logs and means "retry next
+# tick", never a trusted empty result.
+: "${AFK_PLANNER_TIMEOUT:=120}"
+: "${AFK_GH_TIMEOUT:=30}"
 
 # Raised to 1 when the answerer's own `claude` reports an auth failure (the
 # subscription token could not refresh): a process-global the main loop reads to halt
@@ -103,6 +115,56 @@ for _cand in \
   if [ -n "$_cand" ] && [ -f "$_cand" ]; then . "$_cand"; break; fi
 done
 unset _cand
+
+# --- bounded external calls (issue #170 ST1) ----------------------------------
+# One wedged external call (a hung `batch-plan.sh`, a stuck `gh`) used to freeze the whole
+# supervisor forever behind a live pid. Every external call the tick makes is now run under
+# a REAL time bound on both platforms: the coreutils `timeout`/`gtimeout` when installed,
+# and a portable bash fallback otherwise (the default macOS hub ships neither). Callers
+# treat any nonzero exit (a timeout or a real failure) as "retry next tick".
+# AFK_TIMEOUT_KILL_AFTER (default 10) is the SIGKILL grace after the SIGTERM on expiry.
+: "${AFK_TIMEOUT_KILL_AFTER:=10}"
+
+# _afk_timeout_bin -> the installed timeout binary (timeout | gtimeout), or empty.
+_afk_timeout_bin() {
+  if command -v timeout >/dev/null 2>&1; then printf 'timeout\n'
+  elif command -v gtimeout >/dev/null 2>&1; then printf 'gtimeout\n'
+  fi
+}
+
+# _afk_kill_tree <pid> <signal> -> signal <pid> and all its descendants leaf-first, so a
+# wrapped command's grandchildren die with it: killing only the direct child (e.g. the
+# `bash batch-plan.sh` whose real work is `gh api … | python`) would orphan a grandchild
+# that keeps the output pipe open and hangs the whole substitution. `pgrep -P` matches by
+# numeric parent pid (never argv), so the repo's non-ASCII `pgrep -f` hazard doesn't apply;
+# LC_ALL=C is belt-and-suspenders.
+_afk_kill_tree() {
+  local pid="$1" sig="$2" child
+  for child in $(LC_ALL=C pgrep -P "$pid" 2>/dev/null); do _afk_kill_tree "$child" "$sig"; done
+  kill "-$sig" "$pid" 2>/dev/null || true
+}
+
+# _afk_with_timeout <seconds> <cmd...> -> run <cmd...> bounded to <seconds>. The timeout
+# binary (with a `-k` SIGKILL grace) when installed; else a portable fallback: background
+# the command, a killer tree-kills it (TERM then KILL) on expiry, and we wait for it — so
+# the bound is real even where coreutils is absent. Returns the command's exit code.
+_afk_with_timeout() {
+  local secs="$1"; shift
+  local tb grace="${AFK_TIMEOUT_KILL_AFTER:-10}"
+  case "$grace" in '' | *[!0-9]*) grace=10 ;; esac
+  tb="$(_afk_timeout_bin)"
+  if [ -n "$tb" ]; then "$tb" -k "$grace" "$secs" "$@"; return $?; fi
+  local cmd_pid killer rc
+  "$@" &
+  cmd_pid=$!
+  ( sleep "$secs"; _afk_kill_tree "$cmd_pid" TERM; sleep "$grace"; _afk_kill_tree "$cmd_pid" KILL ) \
+    </dev/null >/dev/null 2>&1 &
+  killer=$!
+  wait "$cmd_pid" 2>/dev/null; rc=$?
+  _afk_kill_tree "$killer" TERM   # the command finished first — cancel the pending killer
+  wait "$killer" 2>/dev/null
+  return "$rc"
+}
 
 # --- window spec → end epoch (the pure time layer) ----------------------------
 
@@ -501,7 +563,7 @@ _block_all_inflight() {
 kickoff_for() {
   local n="$1"
   cat <<EOF
-You're in a dedicated worktree for issue #$n. Run /source to anchor to issue #$n and read
+You're in a dedicated worktree for issue #$n. Run /source-task to anchor to issue #$n and read
 it. Before touching code, break the issue body into a task ledger (TaskCreate, or
 TodoWrite on older runtimes) — one todo per subtask × the solo-cycle steps that apply
 (ANCHOR/RED/GREEN/REVIEW/PUSH), exactly one in_progress.
@@ -533,7 +595,13 @@ _inflight_scope_args() {
   local issue body scope
   while IFS= read -r issue; do
     [ -n "$issue" ] || continue
-    body="$(gh issue view "$issue" --json body -q .body 2>/dev/null || true)"
+    # Bound the gh call (#170 ST1): a hung `gh issue view` used to freeze the tick. A
+    # timeout / failure logs and leaves the scope unknown, which fails CLOSED below
+    # (`--inflight *` holds back every ready issue) — never a silent empty scope.
+    if ! body="$(_afk_with_timeout "$AFK_GH_TIMEOUT" gh issue view "$issue" --json body -q .body 2>/dev/null)"; then
+      log "  gh issue view #$issue timed out or failed — treating its scope as unknown (exclusive)"
+      body=""
+    fi
     scope="$(printf '%s\n' "$body" | sed -n 's/^[[:space:]]*[Ss]cope:[[:space:]]*//p' | head -1)"
     printf -- '--inflight\n%s\n' "${scope:-*}"
   done < <(inflight_issues)
@@ -596,13 +664,45 @@ _afk_dispatch_stagger() {
   printf '%s\n' "$s"
 }
 
+# --- dispatch-failure ceiling (issue #170 ST6) --------------------------------
+# A worktree-new.sh that keeps failing for one issue (a malformed issue, a wedged infra
+# dep) used to be retried silently every tick forever. Count consecutive failures per issue
+# in the state dir; at AFK_DISPATCH_MAX_FAILURES (default 3) record a durable local block
+# (the _afk_record_blocked_locally pattern, surfaced by --status) and skip that issue for
+# the rest of the window. A success clears the counter. Cleared on a fresh arm.
+: "${AFK_DISPATCH_MAX_FAILURES:=3}"
+_afk_dispatch_fail_file() { printf '%s\n' "$(_afk_state_dir)/dispatch-fail-$1.count"; }
+_afk_read_dispatch_failures() {
+  local f n; f="$(_afk_dispatch_fail_file "$1")"
+  n="$( [ -f "$f" ] && head -n1 "$f" 2>/dev/null | tr -d '[:space:]' )"
+  case "$n" in '' | *[!0-9]*) n=0 ;; esac
+  printf '%s\n' "$n"
+}
+# _afk_incr_dispatch_failures <issue> -> bump and echo the new consecutive-failure count.
+_afk_incr_dispatch_failures() {
+  local issue="$1" n dir
+  dir="$(_afk_state_dir)"; mkdir -p "$dir" 2>/dev/null || true
+  n=$(( $(_afk_read_dispatch_failures "$issue") + 1 ))
+  printf '%s\n' "$n" > "$(_afk_dispatch_fail_file "$issue")" 2>/dev/null || true
+  printf '%s\n' "$n"
+}
+_afk_clear_dispatch_failures() { rm -f "$(_afk_dispatch_fail_file "$1")" 2>/dev/null || true; }
+_afk_clear_dispatch_fail_counts() { rm -f "$(_afk_state_dir)"/dispatch-fail-*.count 2>/dev/null || true; }
+# _afk_dispatch_max_failures -> the ceiling, guarded to a positive integer. dispatch_batch
+# computes this once per tick and compares each issue's count against the cached value.
+_afk_dispatch_max_failures() {
+  local max="${AFK_DISPATCH_MAX_FAILURES:-3}"
+  case "$max" in '' | *[!0-9]* | 0) max=3 ;; esac
+  printf '%s\n' "$max"
+}
+
 # dispatch_batch -> plan the next concurrent batch (batch-plan.sh, capped) and spawn a
 # spoke for each issue not already in flight, seeded with the ultra kickoff and staggered
 # so first-push suites don't all hit at once. A missing planner or dispatcher logs and is
 # a no-op (the next tick retries).
 dispatch_batch() {
   [ "$_AFK_AUTH_FAILED" -eq 1 ] && return 0   # auth is dead — don't spawn spokes into it
-  local bp wt_new inflight args=() batch n cap stagger spawned=0
+  local bp wt_new inflight args=() batch n cap stagger spawned=0 fails max
   bp="$(_afk_find_script "${BATCH_PLAN:-}" batch-plan.sh)" || { log "batch-plan.sh not found — skipping dispatch"; return 0; }
   wt_new="$(_afk_find_script "${WT_NEW:-}" worktree-new.sh)" || { log "worktree-new.sh not found — skipping dispatch"; return 0; }
   inflight="$(inflight_issues)"
@@ -611,9 +711,24 @@ dispatch_batch() {
   cap="$(_afk_dispatch_cap)"
   stagger="$(_afk_dispatch_stagger)"
   args+=("--cap" "$cap")
-  batch="$(bash "$bp" "${args[@]+"${args[@]}"}" 2>/dev/null || true)"
+  # Bound the planner (#170 ST1): a wedged batch-plan.sh used to hang the tick. A timeout
+  # or nonzero exit logs and skips dispatch THIS tick (retry next tick) — never a silent
+  # empty batch that would look like "nothing to dispatch".
+  if ! batch="$(_afk_with_timeout "$AFK_PLANNER_TIMEOUT" bash "$bp" "${args[@]+"${args[@]}"}" 2>/dev/null)"; then
+    log "batch-plan.sh timed out or failed — skipping dispatch this tick (retry next tick)"
+    return 0
+  fi
+  max="$(_afk_dispatch_max_failures)"
   for n in $batch; do
+    # Dispatch is a LONG phase (a bounded planner, per-spawn staggers, worktree spawns);
+    # stamp the heartbeat each iteration so the wedged-supervisor watchdog (#170 ST2) never
+    # mistakes a busy dispatch for a hang and kills a working supervisor mid-spawn.
+    afk_write_heartbeat
     printf '%s\n' "$inflight" | grep -qxF "$n" && continue   # already in flight (idempotent)
+    # Ceiling (#170 ST6): an issue that already failed to dispatch AFK_DISPATCH_MAX_FAILURES
+    # times this window is durably blocked — skip it instead of retrying forever. Uses the
+    # cached `max` (computed once above) rather than recomputing it per issue.
+    [ "$(_afk_read_dispatch_failures "$n")" -ge "$max" ] && continue
     # Stagger consecutive spawns (before the 2nd onward), so the co-located Langfuse
     # isn't hit by several first-push full suites at the same instant.
     [ "$spawned" -gt 0 ] && [ "$stagger" -gt 0 ] && sleep "$stagger" 2>/dev/null || true
@@ -622,9 +737,16 @@ dispatch_batch() {
     # spoke defaults to attended in worktree-new.sh.
     if bash "$wt_new" "$n" --type feature --mode afk --prompt "$(kickoff_for "$n")"; then
       stamp_dispatch_epoch "$n"
+      _afk_clear_dispatch_failures "$n"   # a success resets the consecutive-failure count
       spawned=$(( spawned + 1 ))
     else
-      log "  dispatch of #$n failed — will retry next tick"
+      fails="$(_afk_incr_dispatch_failures "$n")"
+      if [ "$fails" -ge "$max" ]; then
+        log "  dispatch of #$n failed $fails times — recording a durable block and skipping it for this window (see --status)"
+        _afk_record_blocked_locally "$n" "dispatch (worktree-new.sh) failed $fails consecutive times — needs a human"
+      else
+        log "  dispatch of #$n failed ($fails/$max) — will retry next tick"
+      fi
     fi
   done
 }
@@ -656,6 +778,28 @@ _afk_run_with_heartbeat() {
     done
   done
   wait "$child"; rc=$?
+  afk_write_heartbeat
+  return "$rc"
+}
+
+# _afk_run_with_heartbeat_fg <cmd...> -> the same keep-the-heartbeat-fresh guarantee as
+# _afk_run_with_heartbeat, but for a command that must run in the CURRENT shell because it
+# sets a variable the caller reads. answer_pass's decide_and_act raises the process-global
+# _AFK_AUTH_FAILED on a dead subscription token, and that assignment only propagates when
+# it runs in the loop's own shell — backgrounding it (as _afk_run_with_heartbeat does the
+# land) would lose it in the subshell. So here it is the STAMPER that is backgrounded: a
+# child loop stamps the heartbeat every AFK_LAND_HEARTBEAT_SECONDS (`$$` in a subshell is
+# still the supervisor's pid) while <cmd...> runs foreground, so a legitimately long
+# answerer keeps the heartbeat epoch honest and never reads as wedged (#170 ST2).
+# Returns the command's exit code.
+_afk_run_with_heartbeat_fg() {
+  local stamper rc interval="${AFK_LAND_HEARTBEAT_SECONDS:-30}"
+  case "$interval" in '' | *[!0-9]* | 0) interval=30 ;; esac
+  ( while :; do afk_write_heartbeat; sleep "$interval" 2>/dev/null || true; done ) &
+  stamper=$!
+  "$@"; rc=$?
+  kill "$stamper" 2>/dev/null || true
+  wait "$stamper" 2>/dev/null || true
   afk_write_heartbeat
   return "$rc"
 }
@@ -786,14 +930,46 @@ answer_pass() {
   local path issue
   while IFS=$'\t' read -r path issue; do
     [ -n "$issue" ] || continue
-    [ "$(slot_state "$path" "$issue")" = "waiting" ] && decide_and_act "$path" "$issue"
+    # Keep the heartbeat stamping THROUGH the answerer (a high-effort headless `claude`
+    # that can run for minutes) so a legitimately long answer never trips the wedged-
+    # supervisor respawn (#170 ST2). The foreground variant preserves decide_and_act's
+    # _AFK_AUTH_FAILED assignment (a backgrounded command would lose it in its subshell).
+    [ "$(slot_state "$path" "$issue")" = "waiting" ] \
+      && _afk_run_with_heartbeat_fg decide_and_act "$path" "$issue"
   done < <(inflight_worktrees)
 }
+# _afk_auth_is_dead -> true when a bounded headless `claude` no-op reports an auth failure:
+# the subscription token is dead so every spoke is stalled on auth, not individually hung.
+# Detection mirrors the answerer's (is_auth_failure #170 ST7): a NONZERO exit AND an
+# auth-failure signature together — a healthy probe (exit 0), or a nonzero exit without an
+# auth signature (a transient blip, `claude` not on PATH), reads as alive so a hiccup never
+# halts the drain. AFK_AUTH_PROBE_CMD overrides the probe (tests); AFK_AUTH_PROBE_TIMEOUT
+# bounds it so a wedged probe can't itself freeze the reap.
+_afk_auth_is_dead() {
+  local cmd raw rc
+  cmd="${AFK_AUTH_PROBE_CMD:-claude -p --no-session-persistence --model claude-fable-5 ok}"
+  raw="$(_afk_with_timeout "${AFK_AUTH_PROBE_TIMEOUT:-30}" bash -c "$cmd" 2>&1)"; rc=$?
+  [ "$rc" -ne 0 ] && is_auth_failure "$raw"
+}
+
 reap_pass() {
-  local path issue
+  local path issue probed=0
   while IFS=$'\t' read -r path issue; do
     [ -n "$issue" ] || continue
     [ "$(slot_state "$path" "$issue")" = "reap" ] || continue
+    # Auth probe before the FIRST reap this tick (#170 ST7): if the subscription token is
+    # dead, every idle spoke is stalled on auth, not hung — reaping them one-by-one would
+    # block live work into dead auth. Probe once; on a real auth failure raise the global
+    # stop flag and bail, letting the main loop's halt-all path block them together.
+    if [ "$probed" -eq 0 ]; then
+      probed=1
+      afk_write_heartbeat   # the probe is a bounded `claude` call — keep the epoch fresh (#170 ST2)
+      if _afk_auth_is_dead; then
+        _AFK_AUTH_FAILED=1
+        log "/afk: auth probe failed during reap — halting instead of reaping spokes into dead auth"
+        return 0
+      fi
+    fi
     _reap_or_resume "$path" "$issue"
   done < <(inflight_worktrees)
 }
@@ -873,7 +1049,14 @@ afk_done() {
   inflight_count="$(inflight_issues | grep -c '^[0-9]' || true)"
   [ "$inflight_count" -eq 0 ] || return 1
   bp="$(_afk_find_script "${BATCH_PLAN:-}" batch-plan.sh)" || return 1
-  batch="$(bash "$bp" 2>/dev/null || true)"
+  # A planner ERROR is not an empty backlog (#170 ST3): declare drain-done only when
+  # batch-plan EXITS 0 and prints an empty batch. A nonzero exit (a `gh` blip, a timeout)
+  # means "could not determine the backlog" — return "not done" so a transient failure
+  # never ends the whole drain with a false "done" + drain-complete notification.
+  if ! batch="$(_afk_with_timeout "$AFK_PLANNER_TIMEOUT" bash "$bp" 2>/dev/null)"; then
+    log "/afk: batch-plan.sh timed out or failed during the done-check — not declaring done (retry next tick)"
+    return 1
+  fi
   [ -z "$(printf '%s' "$batch" | tr -d '[:space:]')" ]
 }
 
@@ -887,6 +1070,58 @@ afk_done() {
 # recovers orphans without re-dispatching or re-arming. Exactly one watchdog runs per
 # checkout (a pidfile dedups), and it exits when --off clears the state.
 : "${AFK_WATCHDOG_SECONDS:=60}"
+# Heartbeat-age staleness (#170 ST2, the #107 UPGRADE): a supervisor whose pid is alive but
+# has not stamped a tick in AFK_STALE_TICKS x AFK_TICK_SECONDS is wedged on a hung call, not
+# working — the watchdog kills and respawns it. answer_pass + auto_land keep stamping through
+# their long phases (_afk_run_with_heartbeat[_fg]), so a busy supervisor never reads as wedged.
+: "${AFK_STALE_TICKS:=10}"
+
+# _afk_heartbeat_wedged -> true when the heartbeat epoch is older than
+# AFK_STALE_TICKS x AFK_TICK_SECONDS. The caller (watchdog_tick) has already confirmed the
+# heartbeat pid is a LIVE process, so a stale epoch here means the supervisor is wedged. A
+# missing / unparseable epoch is NOT wedged (the pid-liveness `stale` path owns that case).
+_afk_heartbeat_wedged() {
+  local hb tick age stale_ticks limit
+  hb="$(afk_read_heartbeat)"; [ -n "$hb" ] || return 1
+  tick="${hb##* }"
+  case "$tick" in '' | *[!0-9]*) return 1 ;; esac
+  stale_ticks="${AFK_STALE_TICKS:-10}"
+  case "$stale_ticks" in '' | *[!0-9]*) stale_ticks=10 ;; esac
+  limit=$(( stale_ticks * AFK_TICK_SECONDS ))
+  age=$(( $(afk_now) - tick ))
+  [ "$age" -gt "$limit" ]
+}
+
+# _afk_kill_wedged_supervisor -> terminate the heartbeat pid so a respawn does not leave two
+# supervisors racing on the per-run state. SIGTERM first, a bounded grace, then SIGKILL if it
+# ignored TERM. Best-effort; the pid is known live (watchdog_tick checked). AFK_WEDGE_KILL_CMD
+# overrides the whole kill for tests.
+# Pid-recycling guard (#170 review): a supervisor that died without clearing its heartbeat
+# leaves a pid the OS may recycle onto an unrelated process; kill only a pid whose command
+# still looks like a hub-afk supervisor (AFK_WEDGE_PID_MATCH, default "hub-afk"), never a
+# random recycled process. Set AFK_WEDGE_PID_MATCH= (empty) to skip the check.
+_afk_kill_wedged_supervisor() {
+  if [ -n "${AFK_WEDGE_KILL_CMD:-}" ]; then bash -c "$AFK_WEDGE_KILL_CMD"; return 0; fi
+  local hb pid waited grace match cmdline
+  hb="$(afk_read_heartbeat)"; pid="${hb%% *}"
+  case "$pid" in '' | *[!0-9]*) return 0 ;; esac
+  match="${AFK_WEDGE_PID_MATCH-hub-afk}"
+  if [ -n "$match" ]; then
+    cmdline="$(LC_ALL=C ps -o command= -p "$pid" 2>/dev/null)"
+    case "$cmdline" in
+      *"$match"*) : ;;
+      *) log "  wedged-supervisor pid $pid is not a '$match' process (recycled?) — not killing"; return 0 ;;
+    esac
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+  grace="${AFK_WEDGE_KILL_GRACE:-3}"; case "$grace" in '' | *[!0-9]*) grace=3 ;; esac
+  waited=0
+  while [ "$waited" -lt "$grace" ] && kill -0 "$pid" 2>/dev/null; do
+    sleep 1 2>/dev/null || true; waited=$(( waited + 1 ))
+  done
+  kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  return 0
+}
 
 # _afk_self -> the path the watchdog respawns. When running from an exec'd tmp copy
 # (#133), AFK_ORIG_SCRIPT carries the checkout's real path: a respawn deliberately
@@ -933,12 +1168,21 @@ _afk_watchdog_respawn() {
 
 # watchdog_tick -> one watchdog check, printing the observed supervisor state:
 #   off       — no window armed; the watchdog should stop.
-#   live      — a supervisor is alive and stamping the heartbeat; nothing to do.
-#   respawned — the window is armed but the supervisor is gone; respawn it.
+#   live      — a supervisor is alive and recently stamped the heartbeat; nothing to do.
+#   respawned — the window is armed but the supervisor is gone (dead pid) OR wedged (live
+#               pid, stale heartbeat, #170 ST2): respawn it, first killing a wedged one.
 watchdog_tick() {
   case "$(afk_supervisor_state)" in
     off)  printf 'off\n' ;;
-    live) printf 'live\n' ;;
+    live)
+      if _afk_heartbeat_wedged; then
+        log "/afk watchdog: supervisor pid alive but heartbeat stale >$(( ${AFK_STALE_TICKS:-10} * AFK_TICK_SECONDS ))s — killing the wedged supervisor and respawning"
+        _afk_kill_wedged_supervisor
+        _afk_watchdog_respawn
+        printf 'respawned\n'
+      else
+        printf 'live\n'
+      fi ;;
     stale)
       log "/afk watchdog: supervisor gone but window still armed — respawning"
       _afk_watchdog_respawn
@@ -1183,6 +1427,46 @@ afk_telemetry_status() {
   printf '/afk: telemetry %s (collector %s, bridge %s, auth %s)\n' "$overall" "$c" "$b" "$a"
 }
 
+# --- arm preconditions (issue #170 ST4) ---------------------------------------
+# Mirror the telemetry preflight's refuse-to-arm posture for the drain's OWN prerequisites:
+# a second supervisor clobbers per-run state, a dirty tree / off-base HEAD means the drain
+# would land on top of uncommitted or wrong-branch work, and dead `gh` auth fails every
+# dispatch/land/answer. Each is checked BEFORE writing state, so a bad precondition refuses
+# loudly (never a half-armed window). AFK_ARM_PRECHECK=0 opts the whole gate out (tests, or
+# an operator who has vetted the state by hand); it is on by default.
+
+# afk_arm_preconditions <repo_root> -> rc 0 when every precondition holds, else log which
+# one failed and return 1 (main turns that into a refuse-to-arm, exit 2).
+afk_arm_preconditions() {
+  local repo_root="$1" base cur
+  [ "${AFK_ARM_PRECHECK:-1}" = "0" ] && return 0
+  if [ "$(afk_supervisor_state)" = "live" ]; then
+    log "/afk: refusing to arm — a supervisor is already live (heartbeat pid running); run /afk --off first (a second supervisor clobbers per-run state)"
+    return 1
+  fi
+  # --untracked-files=no: refuse on uncommitted TRACKED changes (a drain lands on top of
+  # the base branch), but tolerate untracked/generated files a routine hub sync leaves
+  # behind — those never conflict with a merge and shouldn't block the drain (#170 review).
+  if [ -n "$(git -C "$repo_root" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+    log "/afk: refusing to arm — the working tree has uncommitted tracked changes; commit or stash first (an unattended drain lands on top of the base branch)"
+    return 1
+  fi
+  base="$(_afk_default_ref "$repo_root")"; base="${base#origin/}"
+  cur="$(git -C "$repo_root" branch --show-current 2>/dev/null)"
+  # An empty `cur` is a DETACHED HEAD — refuse (a drain must arm from the base branch, else
+  # auto_land's commits are orphaned with no branch advancing, #170 review). Only skip the
+  # check when the base itself can't be resolved (nothing to compare against).
+  if [ -n "$base" ] && [ "$cur" != "$base" ]; then
+    log "/afk: refusing to arm — HEAD is on '${cur:-a detached HEAD}', not the base branch '$base'; check out $base before draining"
+    return 1
+  fi
+  if ! _afk_with_timeout "$AFK_GH_TIMEOUT" gh auth status >/dev/null 2>&1; then
+    log "/afk: refusing to arm — 'gh auth status' failed; run 'gh auth login' (dispatch/land/answer all need GitHub)"
+    return 1
+  fi
+  return 0
+}
+
 # --- CLI ----------------------------------------------------------------------
 
 # _afk_status_state_line <state> <now> -> echo the window's state line: STALE (#107) when
@@ -1265,7 +1549,7 @@ main() {
     --status)   _status; return 0 ;;
     --off)      afk_clear_state; echo "/afk: off (state cleared; the supervisor + watchdog stop on their next tick)"; return 0 ;;
     --watchdog) watchdog_loop; return $? ;;
-    -h|--help)  sed -n '2,57p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
+    -h|--help)  sed -n '2,64p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
   esac
 
   local once=0
@@ -1275,6 +1559,10 @@ main() {
     # A window spec: compute + persist the end bound before the first tick.
     local end
     end="$(compute_end_epoch "$@" "$(afk_now)")" || { log "unrecognized window: '$*' (use <duration>, 'until HH:MM', or 'drain')"; return 2; }
+    # Arm preconditions BEFORE arming (#170 ST4): refuse loudly on a live supervisor, a
+    # dirty tree, an off-base HEAD, or dead gh auth — the drain's own prerequisites, checked
+    # the same refuse-to-arm way the telemetry preflight checks the pipeline's.
+    afk_arm_preconditions "$MAIN_ROOT" || return 2
     # Telemetry preflight BEFORE arming: an unattended drain must not dispatch spokes into
     # a dead telemetry pipeline (the dashboard is the SSOT). Refuse to arm — write no state,
     # never reach the loop — when collector/bridge/auth can't be wired (#108).
@@ -1286,6 +1574,7 @@ main() {
     _afk_clear_landed_count  # fresh window ⇒ the landed tally starts at zero (#150)
     _afk_clear_drain_complete # ...and drop any un-consumed completion signal from a prior drain
     _clear_blocked_records   # fresh window ⇒ --status shows only THIS run's durable blocks
+    _afk_clear_dispatch_fail_counts # fresh window ⇒ every issue's dispatch ceiling resets (#170)
     log "/afk: armed ($([ "$end" = drain ] && echo 'drain — until the backlog is empty' || echo "until $(wt_date_ymd "$end") $(date -r "$end" +%H:%M 2>/dev/null || date -d "@$end" +%H:%M)"))"
   fi
 
