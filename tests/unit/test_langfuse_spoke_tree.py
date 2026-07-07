@@ -4419,3 +4419,13 @@ class TestGuardGroupDuration:
 
         duration = _by_orig(batch, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
         assert duration["components"]["hook"] == 900
+
+    def test_guard_grouping_preserves_tool_execution_time(self) -> None:
+        # The Pre+Post-with-gap guards must NOT erase the tool's inter-guard execution: the
+        # group covers only its real 900ms of guard time, so the 5s tool still books 4.1s and
+        # the components sum to the interaction wall-clock (the #128 invariant).
+        batch = build_batch(_guarded_tool_traces(), SPOKE)
+
+        duration = _by_orig(batch, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
+        assert duration == _dur(10_000, {"tool": 4_100, "hook": 900, "self": 5_000})
+        assert sum(duration["components"].values()) == duration["total_ms"]

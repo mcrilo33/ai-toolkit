@@ -780,7 +780,7 @@ def _guard_group_event(
         "traceId": trace_id,
         "parentObservationId": parent_id,
         "name": name,
-        "startTime": start,
+        "startTime": start or _INGEST_TIMESTAMP,
         "endTime": end,
         "metadata": _guard_group_metadata(members),
     }
@@ -1460,7 +1460,16 @@ def _duration_rollup(
     def visit(node_id: str) -> None:
         kids = [kid for kid in children.get(node_id, []) if kid not in exclude]
         own = intervals.get(node_id)
-        covered = _union_ms([intervals.get(kid) for kid in kids], clip=own) if own else 0
+        # A guards-group child covers only its summed RAW guard time (``total_ms``), never its
+        # min…max envelope (#157): the envelope brackets the tool's own execution, so unioning it
+        # would erase that execution from the tool's exclusive time. Plain children union by
+        # interval as before.
+        guard_cover = sum(
+            _guards_total_ms(by_id[kid]) for kid in kids if _is_guards_group(by_id.get(kid))
+        )
+        plain = [kid for kid in kids if not _is_guards_group(by_id.get(kid))]
+        union = _union_ms([intervals.get(kid) for kid in plain], clip=own) if own else 0
+        covered = min(_interval_ms(own), union + guard_cover)
         exclusive = max(0, _interval_ms(own) - covered)
         bucket = "self" if node_id == root_id else class_of.get(node_id, "other")
         if bucket == "tool":
@@ -1468,9 +1477,9 @@ def _duration_rollup(
             components["wait"] += wait
             components["tool"] += exclusive - wait
         elif _is_guards_group(by_id.get(node_id)):
-            # A guards group books the summed RAW guard time (#157), not its min…max envelope,
-            # minus the slice its surviving children already book — so root's ``hook`` bucket is
-            # real guard cost and dropping no-op guards leaves the components unchanged.
+            # The group books its RAW guard time minus the slice its surviving children already
+            # book, so root's ``hook`` bucket is real guard cost and dropping no-op guards leaves
+            # the components unchanged.
             kept = sum(_interval_ms(intervals.get(kid)) for kid in kids)
             components["hook"] += max(0, _guards_total_ms(by_id[node_id]) - kept)
         else:
