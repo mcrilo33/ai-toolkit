@@ -25,6 +25,7 @@ a host's global/system config never reaches the fixture repo.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -45,14 +46,32 @@ def _git(repo: Path, *args: str) -> str:
     ).stdout
 
 
-def _run(repo: Path, *args: str) -> subprocess.CompletedProcess:
+def _run(repo: Path, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["bash", str(SPOKE_READY), *args],
         cwd=str(repo),
         capture_output=True,
         text=True,
-        env=_GIT_ENV,
+        env=env or _GIT_ENV,
     )
+
+
+def _stamp_review(repo: Path, *, age_offset: int = 0) -> Path:
+    """Write a ``.review/*.json`` artifact and set its mtime relative to the tip.
+
+    The ready gate's precondition 3 (issue #172, timestamp fallback) accepts a
+    review only when the newest ``.review/*.json`` is at least as new as the tip
+    commit. ``age_offset`` shifts the artifact's mtime off the HEAD commit time:
+    ``0`` sits it exactly on the ``>=`` boundary, a negative value makes it stale.
+    """
+    review_dir = repo / ".review"
+    review_dir.mkdir(exist_ok=True)
+    artifact = review_dir / "review.json"
+    artifact.write_text('{"verdict": "APPROVE"}\n')
+    tip = int(_git(repo, "log", "-1", "--format=%ct", "HEAD").strip())
+    stamp = tip + age_offset
+    os.utime(artifact, (stamp, stamp))
+    return artifact
 
 
 @pytest.fixture()
@@ -78,7 +97,10 @@ def main_checkout(tmp_path: Path, remote: Path) -> Path:
     for k, v in (("user.email", "t@t.t"), ("user.name", "t"), ("commit.gpgsign", "false")):
         _git(repo, "config", k, v)
     (repo / "README.md").write_text("seed\n")
-    _git(repo, "add", "README.md")
+    # Mirror the real repo: .review/ is gitignored, so a review artifact never
+    # reads as a dirty working tree in the ready gate's clean-tree precondition.
+    (repo / ".gitignore").write_text(".review/\n")
+    _git(repo, "add", "README.md", ".gitignore")
     _git(repo, "commit", "-qm", "chore: seed", "-m", "Refs #0")
     _git(repo, "remote", "add", "origin", str(remote))
     _git(repo, "push", "-q", "-u", "origin", "main")
@@ -93,6 +115,9 @@ def spoke(main_checkout: Path) -> Path:
     _git(main_checkout, "add", "work.txt")
     _git(main_checkout, "commit", "-qm", "feat: work", "-m", "Refs #45")
     _git(main_checkout, "push", "-q", "-u", "origin", OWN)
+    # A ready-eligible spoke is clean, pushed AND carries a review of the tip —
+    # stamp one so the #172 gate's happy path is the fixture's default state.
+    _stamp_review(main_checkout)
     return main_checkout
 
 
@@ -174,6 +199,7 @@ def test_ready_retags_at_new_head(spoke: Path) -> None:
     # A terminal marker requires the tip to be on origin (durability, issue #40),
     # so push the new commit before re-emitting at the new tip.
     _git(spoke, "push", "-q", "origin", OWN)
+    _stamp_review(spoke)  # the ready gate (#172) needs a review of the NEW tip
 
     result = _run(spoke, "45")
 
@@ -194,6 +220,7 @@ def test_ready_force_moves_the_remote_tag(spoke: Path, remote: Path) -> None:
     # Push the new commit first — a terminal marker is refused over un-pushed
     # work (durability, issue #40), so the force-move re-emits at a pushed tip.
     _git(spoke, "push", "-q", "origin", OWN)
+    _stamp_review(spoke)  # the ready gate (#172) needs a review of the NEW tip
 
     result = _run(spoke, "45")
 
@@ -349,3 +376,160 @@ def test_conflicting_state_flags_error(spoke: Path) -> None:
     result = _run(spoke, "--gate", "--accept", "45")
 
     assert result.returncode == 2, "two mutually-exclusive state flags is a usage error (exit 2)"
+
+
+# ── ready/N precondition gate (issue #172) ───────────────────────────────────
+# ready/<N> is auto_land's entire trust basis — it lands with --skip-tests — so
+# emission must be MECHANICALLY verified, not asserted. spoke-ready refuses ready/N
+# unless (1) the working tree is clean, (2) HEAD is exactly the pushed tip
+# (@{upstream}), and (3) a review artifact is at least as new as the tip commit.
+# On refusal it names the unmet condition and the fix command. The escape hatch
+# AI_TOOLKIT_READY_FORCE=1 skips the gate, logged loudly. The other markers
+# (--gate/--accept/--blocked) keep their prior behavior and stay ungated.
+
+
+def test_ready_emitted_when_all_preconditions_met(spoke: Path, remote: Path) -> None:
+    # The `spoke` fixture is clean, pushed (HEAD==@{upstream}) and carries a fresh
+    # review artifact — the gate must let ready/45 through.
+    result = _run(spoke, "45")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+def test_ready_refused_dirty_working_tree(spoke: Path, remote: Path) -> None:
+    (spoke / "work.txt").write_text("uncommitted edit\n")  # tracked file now dirty
+
+    result = _run(spoke, "45")
+
+    assert result.returncode != 0, "a dirty tree must block ready/N"
+    assert "working tree" in (result.stdout + result.stderr).lower(), (
+        "refusal must name the failing precondition"
+    )
+    assert not _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+def test_ready_refused_untracked_file(spoke: Path, remote: Path) -> None:
+    (spoke / "stray.txt").write_text("untracked\n")  # not ignored → tree not clean
+
+    result = _run(spoke, "45")
+
+    assert result.returncode != 0, "an untracked file leaves the tree unclean"
+    assert not _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+def test_ready_review_artifact_does_not_dirty_the_tree(spoke: Path, remote: Path) -> None:
+    # .review/ is gitignored, so the present review artifact must NOT read as a
+    # dirty tree — the gate has to emit ready/N with the artifact in place.
+    result = _run(spoke, "45")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+def test_ready_refused_head_ahead_of_upstream(spoke: Path, remote: Path) -> None:
+    (spoke / "more.txt").write_text("unpushed\n")
+    _git(spoke, "add", "more.txt")
+    _git(spoke, "commit", "-qm", "feat: more", "-m", "Refs #45")  # HEAD now ahead
+    _stamp_review(spoke)  # fresh review, so only precondition 2 is unmet
+
+    result = _run(spoke, "45")
+
+    assert result.returncode != 0, "un-pushed HEAD must block ready/N"
+    assert "pushed tip" in (result.stdout + result.stderr).lower()
+    assert not _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+def test_ready_refused_head_behind_upstream(spoke: Path) -> None:
+    # Strict equality (#172): HEAD *behind* the pushed tip is refused too — the
+    # old ancestor-based durability check let a behind-HEAD through.
+    (spoke / "more.txt").write_text("pushed\n")
+    _git(spoke, "add", "more.txt")
+    _git(spoke, "commit", "-qm", "feat: more", "-m", "Refs #45")
+    _git(spoke, "push", "-q", "origin", OWN)  # upstream now at C2
+    _git(spoke, "reset", "--hard", "HEAD~1")  # HEAD back at C1, upstream ahead
+    _stamp_review(spoke)
+
+    result = _run(spoke, "45")
+
+    assert result.returncode != 0, "HEAD behind the pushed tip must block ready/N"
+    assert "pushed tip" in (result.stdout + result.stderr).lower()
+
+
+def test_ready_refused_no_upstream(main_checkout: Path) -> None:
+    # A branch that was never pushed has no @{upstream} — refuse and say so.
+    _git(main_checkout, "checkout", "-q", "-b", "fix/45-unpushed")
+    (main_checkout / "w.txt").write_text("w\n")
+    _git(main_checkout, "add", "w.txt")
+    _git(main_checkout, "commit", "-qm", "feat: w", "-m", "Refs #45")
+    _stamp_review(main_checkout)
+
+    result = _run(main_checkout, "45")
+
+    assert result.returncode != 0, "no upstream must block ready/N"
+    assert "upstream" in (result.stdout + result.stderr).lower()
+
+
+def test_ready_refused_without_review_artifact(spoke: Path, remote: Path) -> None:
+    shutil.rmtree(spoke / ".review")  # no review evidence at all
+
+    result = _run(spoke, "45")
+
+    assert result.returncode != 0, "a missing review artifact must block ready/N"
+    assert "review" in (result.stdout + result.stderr).lower()
+    assert not _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+def test_ready_refused_stale_review_artifact(spoke: Path, remote: Path) -> None:
+    # A review recorded BEFORE the tip commit does not cover it.
+    (spoke / "more.txt").write_text("later work\n")
+    _git(spoke, "add", "more.txt")
+    _git(spoke, "commit", "-qm", "feat: more", "-m", "Refs #45")
+    _git(spoke, "push", "-q", "origin", OWN)
+    _stamp_review(spoke, age_offset=-100)  # artifact predates the new tip
+
+    result = _run(spoke, "45")
+
+    assert result.returncode != 0, "a stale review artifact must block ready/N"
+    assert "review" in (result.stdout + result.stderr).lower()
+
+
+def test_ready_accepts_review_artifact_on_tip_boundary(spoke: Path, remote: Path) -> None:
+    # mtime exactly equal to the tip commit time counts — the check is `>=`.
+    _stamp_review(spoke, age_offset=0)
+
+    result = _run(spoke, "45")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remote_has_ref(remote, "refs/tags/ready/45")
+
+
+def test_ready_force_bypasses_preconditions(spoke: Path, remote: Path) -> None:
+    shutil.rmtree(spoke / ".review")  # precondition 3 would refuse
+    (spoke / "work.txt").write_text("dirty\n")  # precondition 1 would refuse too
+
+    result = _run(spoke, "45", env={**_GIT_ENV, "AI_TOOLKIT_READY_FORCE": "1"})
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remote_has_ref(remote, "refs/tags/ready/45"), "force must still emit the marker"
+
+
+def test_ready_force_is_logged_loudly(spoke: Path) -> None:
+    shutil.rmtree(spoke / ".review")
+
+    result = _run(spoke, "45", env={**_GIT_ENV, "AI_TOOLKIT_READY_FORCE": "1"})
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "FORCE" in (result.stdout + result.stderr), "the force bypass must be logged loudly"
+
+
+def test_accept_is_not_subject_to_the_ready_gate(spoke: Path, remote: Path) -> None:
+    # --accept is unchanged by #172: it keeps only its durability check, so a
+    # missing review artifact / dirty tree must NOT block it.
+    shutil.rmtree(spoke / ".review")
+    (spoke / "work.txt").write_text("dirty\n")
+
+    result = _run(spoke, "--accept", "45")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remote_has_ref(remote, "refs/tags/accept/45")

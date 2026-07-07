@@ -77,7 +77,10 @@ def main_checkout(tmp_path: Path, remote: Path) -> Path:
     for k, v in (("user.email", "t@t.t"), ("user.name", "t"), ("commit.gpgsign", "false")):
         _git(repo, "config", k, v)
     (repo / "README.md").write_text("seed\n")
-    _git(repo, "add", "README.md")
+    # Mirror the real repo: .review/ is gitignored so a review artifact never
+    # reads as a dirty tree in the ready gate's clean-tree precondition (#172).
+    (repo / ".gitignore").write_text(".review/\n")
+    _git(repo, "add", "README.md", ".gitignore")
     _git(repo, "commit", "-qm", "chore: seed", "-m", "Refs #0")
     _git(repo, "remote", "add", "origin", str(remote))
     _git(repo, "push", "-q", "-u", "origin", "main")
@@ -91,7 +94,28 @@ def spoke(main_checkout: Path) -> Path:
     (main_checkout / "work.txt").write_text("spoke work\n")
     _git(main_checkout, "add", "work.txt")
     _git(main_checkout, "commit", "-qm", "feat: work", "-m", "Refs #37")
+    # The --ready path inherits spoke-ready's #172 gate, which needs a review of
+    # the tip; stamp one so the ready happy path is the fixture's default state.
+    _stamp_review(main_checkout)
     return main_checkout
+
+
+def _stamp_review(repo: Path, *, age_offset: int = 0) -> Path:
+    """Write a ``.review/*.json`` artifact and set its mtime relative to the tip.
+
+    spoke-ready's precondition 3 (issue #172) accepts a review only when the
+    newest ``.review/*.json`` is at least as new as the tip commit. ``age_offset``
+    shifts the mtime off the HEAD commit time: ``0`` sits it on the ``>=``
+    boundary, a negative value makes it stale.
+    """
+    review_dir = repo / ".review"
+    review_dir.mkdir(exist_ok=True)
+    artifact = review_dir / "review.json"
+    artifact.write_text('{"verdict": "APPROVE"}\n')
+    tip = int(_git(repo, "log", "-1", "--format=%ct", "HEAD").strip())
+    stamp = tip + age_offset
+    os.utime(artifact, (stamp, stamp))
+    return artifact
 
 
 def _remote_has_ref(remote: Path, ref: str) -> bool:
@@ -236,3 +260,44 @@ def test_push_preserves_existing_git_ssh_command(spoke: Path, remote: Path, tmp_
     assert f"GIT_SSH_COMMAND=[ssh -o ConnectTimeout=7 {KEEPALIVE_OPTS}] push -u origin {OWN}" in (
         recorded
     )
+
+
+# ── --ready inherits spoke-ready's #172 precondition gate ────────────────────
+# The --ready path shells out to spoke-ready.sh, which mechanically verifies the
+# ready/N preconditions (clean tree, HEAD==@{upstream}, review artifact binds the
+# tip). A refusal propagates (set -e) — but the BRANCH push, which runs first, has
+# already happened, so an unmet precondition blocks only the marker, not the push.
+
+
+def test_ready_refused_without_review_artifact(spoke: Path, remote: Path) -> None:
+    shutil.rmtree(spoke / ".review")  # no review of the tip
+
+    result = _run(spoke, "--ready", "37")
+
+    assert result.returncode != 0, "a missing review artifact must block ready/37"
+    assert _remote_has_ref(remote, f"refs/heads/{OWN}"), "the branch push still happens"
+    assert not _remote_has_ref(remote, "refs/tags/ready/37")
+
+
+def test_ready_refused_on_dirty_tree(spoke: Path, remote: Path) -> None:
+    (spoke / "work.txt").write_text("uncommitted\n")
+
+    result = _run(spoke, "--ready", "37")
+
+    assert result.returncode != 0, "a dirty tree must block the ready marker"
+    assert not _remote_has_ref(remote, "refs/tags/ready/37")
+
+
+def test_ready_force_emits_despite_unmet_precondition(spoke: Path, remote: Path) -> None:
+    shutil.rmtree(spoke / ".review")
+
+    result = subprocess.run(
+        ["bash", str(SPOKE_PUSH), "--ready", "37"],
+        cwd=str(spoke),
+        capture_output=True,
+        text=True,
+        env={**_GIT_ENV, "AI_TOOLKIT_READY_FORCE": "1"},
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remote_has_ref(remote, "refs/tags/ready/37")
