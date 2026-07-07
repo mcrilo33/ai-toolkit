@@ -102,16 +102,16 @@ if ! git rev-parse --verify -q HEAD >/dev/null; then
   exit 1
 fi
 
-# Durability: ready/<N> and accept/<N> CLAIM the work is landable/reviewable, so
-# the hub frees the slot and the morning report shows a LAND/EYEBALL row. If the
-# branch commits never reached origin (the #43 narrated-push failure), that claim
-# is over un-pushed work the hub can't see — refuse unless HEAD is contained in the
-# branch's pushed upstream. gate/<N> (PLAN park) and blocked/<N> (stuck) are STOP
-# signals over incomplete work that make no landable claim — and the hub itself
-# emits blocked/<N> when it reaps a hung spoke whose work never landed — so they
-# are EXEMPT.
+# Durability: accept/<N> CLAIMS the work is reviewable/landable, so the hub frees
+# the slot and the morning report shows an EYEBALL row. If the branch commits never
+# reached origin (the #43 narrated-push failure), that claim is over un-pushed work
+# the hub can't see — refuse unless HEAD is contained in the branch's pushed
+# upstream. gate/<N> (PLAN park) and blocked/<N> (stuck) are STOP signals over
+# incomplete work that make no landable claim — and the hub itself emits blocked/<N>
+# when it reaps a hung spoke whose work never landed — so they are EXEMPT. ready/<N>
+# is NOT here: it has the stricter #172 precondition gate below.
 case "$KIND" in
-  ready|accept)
+  accept)
     if ! git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
       echo "spoke-ready: refusing $KIND/$ISSUE — the branch has no pushed upstream." >&2
       echo "  Push it first (bash .ai-toolkit/scripts/spoke-push.sh), then re-run." >&2
@@ -124,6 +124,78 @@ case "$KIND" in
     fi
     ;;
 esac
+
+# ── ready/<N> precondition gate (issue #172) ─────────────────────────────────
+# ready/<N> is auto_land's ENTIRE trust basis — the drain lands it with
+# --skip-tests — so "ready" must be a MECHANICALLY verified contract, not an LLM
+# judgment. Refuse ready/<N> unless all three hold, naming the first unmet one and
+# the command that fixes it:
+#   1. clean working tree — no staged or unstaged changes (a dirty tree means the
+#      pushed tip is not what's on disk);
+#   2. HEAD == @{upstream} — everything is pushed, so the pre-push gates ran on
+#      THIS exact commit (stricter than accept's "ancestor of upstream": a HEAD
+#      behind the pushed tip is refused too);
+#   3. a review artifact (.review/*.json) covers the tip.
+# Escape hatch AI_TOOLKIT_READY_FORCE=1 skips the gate, logged loudly.
+
+# _ready_review_covers_tip — true when the newest .review/*.json is at least as new
+# as the tip commit (a review was recorded at or after HEAD was committed).
+#
+# We deliberately do NOT source utils.sh to reuse review_diff_hash: (a) sourcing it
+# has source-time side effects (it arms a per-hook telemetry span and exits when the
+# toolkit is globally disabled), and (b) at ready time HEAD == @{upstream}, so its
+# hash base (merge-base @{upstream} HEAD) collapses to HEAD and the range diff is
+# empty — the hash can't bind a whole-branch review here anyway. So use the issue
+# #172 timestamp fallback. Portable stat is GNU-first (`-c %Y`) then BSD (`-f %m`);
+# the order is load-bearing (see wt_bridge_source_mtime in worktree-lib.sh, #132).
+_ready_review_covers_tip() {
+  local root newest=0 tip m f
+  root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
+  [ -d "$root/.review" ] || return 1
+  tip="$(git log -1 --format=%ct HEAD 2>/dev/null)" || return 1
+  [ -n "$tip" ] || return 1
+  for f in "$root"/.review/*.json; do
+    [ -f "$f" ] || continue
+    m="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null)" || continue
+    [ "$m" -gt "$newest" ] && newest="$m"
+  done
+  [ "$newest" -ge "$tip" ]
+}
+
+# verify_ready_preconditions <issue> — exit 1 on the first unmet precondition,
+# printing what failed and the fix; return 0 when all three hold.
+verify_ready_preconditions() {
+  local issue="$1" upstream_sha head_sha
+  if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    echo "spoke-ready: refusing ready/$issue — the working tree is not clean (uncommitted changes)." >&2
+    echo "  Commit or discard them (git status), then re-run." >&2
+    exit 1
+  fi
+  if ! upstream_sha="$(git rev-parse --verify -q '@{upstream}' 2>/dev/null)"; then
+    echo "spoke-ready: refusing ready/$issue — the branch has no pushed upstream." >&2
+    echo "  Push it first (bash .ai-toolkit/scripts/spoke-push.sh), then re-run." >&2
+    exit 1
+  fi
+  head_sha="$(git rev-parse --verify HEAD)"
+  if [ "$head_sha" != "$upstream_sha" ]; then
+    echo "spoke-ready: refusing ready/$issue — HEAD is not the pushed tip (@{upstream})." >&2
+    echo "  Push it first (bash .ai-toolkit/scripts/spoke-push.sh), then re-run." >&2
+    exit 1
+  fi
+  if ! _ready_review_covers_tip; then
+    echo "spoke-ready: refusing ready/$issue — no code-review artifact covers the current tip." >&2
+    echo "  Review this diff (the code-review agent writes .review/<hash>.json), then re-run." >&2
+    exit 1
+  fi
+}
+
+if [ "$KIND" = "ready" ]; then
+  if [ "${AI_TOOLKIT_READY_FORCE:-}" = "1" ]; then
+    echo "spoke-ready: ⚠ AI_TOOLKIT_READY_FORCE=1 — emitting ready/$ISSUE WITHOUT verifying its preconditions (clean tree / pushed tip / review artifact). This bypasses auto_land's trust gate." >&2
+  else
+    verify_ready_preconditions "$ISSUE"
+  fi
+fi
 
 TAG="$KIND/$ISSUE"
 
