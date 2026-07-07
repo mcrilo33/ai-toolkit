@@ -60,6 +60,15 @@ def _isolated_afk_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     # (_afk_run_with_heartbeat, #133 ST4), and without this pin any test driving a
     # land path writes .afk-heartbeat into the REAL <git-common-dir>.
     monkeypatch.setenv("AFK_HEARTBEAT", str(tmp_path / "afk-heartbeat"))
+    # Strip the self-copy guards from the ambient env so a leak cannot suppress the
+    # copy the self-copy tests assert (#169). The #124 post-land sweep runs the suite
+    # as a child of the afk supervisor, which execs from a private copy and exports
+    # AFK_RUNNING_COPY=1; that (or a host AFK_SELF_COPY=0 opt-out) flowed through the
+    # tests' os.environ into _afk_exec_self_copy, which then correctly no-op'd — green
+    # on a direct hub run, red under the sweep. Tests that need a guard set still pass
+    # it explicitly via _call(env=...) or an inline `export`.
+    monkeypatch.delenv("AFK_RUNNING_COPY", raising=False)
+    monkeypatch.delenv("AFK_SELF_COPY", raising=False)
 
 
 def _call(fn_call: str, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
