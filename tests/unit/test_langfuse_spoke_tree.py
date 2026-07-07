@@ -4616,3 +4616,90 @@ class TestBlockedToolSynthesis:
         second = json.dumps(build_batch(self._orphan_audit(), SPOKE))
 
         assert first == second
+
+    def test_blocked_tool_in_cycle_view_anchors_to_turn_start_not_lagging_time(self) -> None:
+        # Regression: the blocked node's own start is a LAGGING audit timestamp (35s, in the
+        # postStep). In the ledgered cycle view it must anchor to its turn's start (0s -> preStep),
+        # never land in the step its lag happens to fall in.
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:40Z",
+            metadata={"attributes": {"prompt.id": "p1"}},
+        )
+        create = _ledger_child(
+            "tc1",
+            "tool:TaskCreate",
+            "tu-c1",
+            parent="i1",
+            start="2026-01-02T00:00:02Z",
+            end="2026-01-02T00:00:02Z",
+        )
+        started = _ledger_child(
+            "tu1",
+            "tool:TaskUpdate",
+            "tu-u1",
+            parent="i1",
+            start="2026-01-02T00:00:05Z",
+            end="2026-01-02T00:00:05Z",
+        )
+        done = _ledger_child(
+            "tu2",
+            "tool:TaskUpdate",
+            "tu-u2",
+            parent="i1",
+            start="2026-01-02T00:00:20Z",
+            end="2026-01-02T00:00:21Z",
+        )
+        decision = _obs(
+            "d1",
+            "tool_decision:deny",
+            type_="EVENT",
+            parent=None,
+            startTime="2026-01-02T00:00:35Z",
+            metadata={"tool_use_id": "tu-denied", "decision": "deny", "prompt.id": "p1"},
+        )
+        content = {
+            "tu-c1": ToolContent({"subject": "S1"}, "Task #1 created successfully: S1"),
+            "tu-u1": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
+            "tu-u2": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
+        }
+
+        batch = build_cycle_batch(
+            [("tr", [interaction, create, started, done, decision])], SPOKE, content
+        )
+
+        assert (
+            _one_blocked(batch)["body"]["parentObservationId"]
+            == _cycle_step(batch, "preStep")["id"]
+        )
+
+    def test_multiple_orphans_get_distinct_blocked_tools(self) -> None:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "p1"}},
+        )
+        d_a = _obs(
+            "da",
+            "tool_decision:deny",
+            type_="EVENT",
+            parent=None,
+            metadata={"tool_use_id": "tu-a", "decision": "deny", "prompt.id": "p1"},
+        )
+        d_b = _obs(
+            "db",
+            "tool_decision:ask",
+            type_="EVENT",
+            parent=None,
+            metadata={"tool_use_id": "tu-b", "decision": "ask", "prompt.id": "p1"},
+        )
+
+        batch = build_batch([("trace-int", [interaction]), ("trace-audit", [d_a, d_b])], SPOKE)
+
+        blocked = _blocked_tools(batch)
+        assert len(blocked) == 2
+        assert len({b["body"]["id"] for b in blocked}) == 2

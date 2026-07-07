@@ -39,23 +39,24 @@ Re-parenting rules for each source observation:
 - It had a ``parentObservationId`` -> the copy points at the copy of that parent.
 - It was a trace-root interaction / marker / lifecycle / script -> the synthetic root.
 - It was a trace-root satellite of a tool call -> the copy of the tool whose
-  ``tool_use_id`` matches the satellite's; or, when the satellite names a tool that produced
-  no span (the tool was denied/cancelled), its enclosing ``claude_code.interaction`` —
-  by ``prompt.id``, falling back to ``[start,end]`` window containment (#110,
-  :func:`_enclosing_turn`); only a satellite naming no tool (no ``tool_use_id``) or one with
-  no enclosing turn at all reaches the synthetic root. A satellite is a gate hook (name ends
-  ``.sh`` or ``metadata.attributes.workflow.kind == hook``) or a #93 tool-scoped audit event
-  (``tool_result``, minted on the per-spoke audit trace with its ``tool_use_id`` in flat
-  metadata). (Langfuse nests OTel span attributes under ``metadata["attributes"]``; the audit
-  events carry their id at the metadata top level.)
+  ``tool_use_id`` matches the satellite's; or, when the satellite names a tool that produced no
+  span (the tool was denied/cancelled), a synthesized ``blocked-tool:<Name>`` node standing in
+  for that missing call (#157, :func:`_synthesize_blocked_tools`) — itself parented to the
+  enclosing ``claude_code.interaction`` by ``prompt.id``, falling back to ``[start,end]`` window
+  containment (#110, :func:`_enclosing_turn`), reaching the synthetic root only when no turn
+  encloses it. Only a satellite naming no tool (no ``tool_use_id``) reaches the root directly. A
+  satellite is a gate hook (name ends ``.sh`` or ``metadata.attributes.workflow.kind == hook``)
+  or a #93 tool-scoped audit event (``tool_result``, minted on the per-spoke audit trace with its
+  ``tool_use_id`` in flat metadata). (Langfuse nests OTel span attributes under
+  ``metadata["attributes"]``; the audit events carry their id at the metadata top level.)
 
 Three native 1:1 sub-spans do NOT nest — they FOLD into their tool's metadata and their nodes
 are dropped (#100, :func:`_fold_tool_subspans`): ``claude_code.tool.execution`` ->
 ``execution_ms``/``success``/``error``, ``claude_code.tool.blocked_on_user`` ->
 ``blocked_on_user_ms``/``decision``/``decision_source``, and the ``tool_decision:<d>`` audit
 event -> ``decision``/``decision_source``. An unmatched ``tool_decision`` (the tool was
-denied/cancelled, so no span) keeps its node and re-homes to its enclosing turn by ``prompt.id``
-(#110), reaching the root only when no turn encloses it.
+denied/cancelled, so no span) folds onto the synthesized ``blocked-tool`` node that stands in for
+the missing call (#157), supplying its ``decision`` (deny/ask); its own node is dropped.
 
 The same session also carries the ``spoke-audit:`` trace's span-less audit/lifecycle events
 (#93). They are folded in here too (#104), placed by CAUSAL id-join — never by their lagging
@@ -862,6 +863,11 @@ def _is_guards_group(body: Observation | None) -> bool:
     return bool(body) and (body.get("name") in (_GUARDS_NAME, _GUARDS_SESSION_NAME))
 
 
+def _is_blocked_tool(body: Observation | None) -> bool:
+    """Whether a node is a synthesized ``blocked-tool:*`` node (#157)."""
+    return bool(body) and (body.get("name") or "").startswith(_BLOCKED_TOOL_NAME_PREFIX)
+
+
 def _guards_total_ms(body: Observation) -> int:
     """Return a guards group's summed raw guard duration from its metadata (0 if malformed)."""
     total = (body.get("metadata") or {}).get("total_ms")
@@ -1242,9 +1248,12 @@ def _resolve_parent(
         tuid = _tool_use_id(observation)
         if tuid and tuid in tool_index:
             return tool_index[tuid]
-        # #110 AC1: the satellite named a tool that produced no span (denied/cancelled before
-        # execution). Re-home it to its enclosing turn rather than the synthetic root; a hook
-        # naming no tool (SessionStart/Stop) has no tuid and still falls through to the root.
+        # #110 AC1 / #157: a satellite naming a tool that produced no span (denied/cancelled) is
+        # normally already resolved above — #157 synthesizes a blocked-tool node for every such
+        # orphaned tuid and augments tool_index, so the branch above catches it. This is a
+        # defensive fallback (re-home to the enclosing turn) kept for depth in case a satellite's
+        # tuid ever escapes synthesis; a hook naming no tool (SessionStart/Stop) has no tuid and
+        # still falls through to the root.
         if tuid:
             turn = _enclosing_turn(observation, interaction_index)
             if turn is not None:
@@ -2286,15 +2295,16 @@ def _resolve_cycle_parent(
     A copy whose View A parent is a surviving span (a tool, llm_request, sub-agent, or nested
     interaction) keeps that parent (rides along by causal key). A copy left at the synthetic root
     or under a flattened top-level interaction lands on the cycle axis: a reliably-timestamped span
-    by its own ``startTime``, an audit instant by its turn's start (never its lagging own time),
-    falling back to ``preStep``. The flattened top-level interaction marker itself is just such a
-    reliably-timestamped span (parent is the root), so it lands in the step window of its own start.
+    by its own ``startTime``, an audit instant OR a synthesized ``blocked-tool`` node (whose own
+    start is derived from lagging audit timestamps, #157) by its turn's start, falling back to
+    ``preStep``. The flattened top-level interaction marker itself is just such a reliably-
+    timestamped span (parent is the root), so it lands in the step window of its own start.
     """
     if parent_a != a_root_id and parent_a not in flattened and parent_a in by_id_a:
         return _cycle_copy_id(parent_a)
     if not windows:
         return root_id  # no ledger -> no cycle axis; copies hang flat under the cycle root
-    if _is_audit_instant(body) or not body.get("startTime"):
+    if _is_audit_instant(body) or _is_blocked_tool(body) or not body.get("startTime"):
         anchor = interaction_start.get(parent_a)
         key = _cycle_step_for(anchor, windows) if anchor else _PRE_STEP_KEY
     else:
