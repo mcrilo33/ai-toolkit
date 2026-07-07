@@ -4935,6 +4935,16 @@ def test_kickoff_for_seeds_source_task_command() -> None:
     assert "/source " not in result.stdout, "never the nonexistent bare /source command"
 
 
+def test_kickoff_for_points_at_task_contract() -> None:
+    # Anchoring is scripted now (issue #177): worktree-new.sh writes the contract
+    # to .ai-toolkit/task.md at spawn, so the kickoff points the spoke there
+    # instead of an LLM /source-task fetch. /source-task stays for crash re-anchor.
+    result = _call("kickoff_for 42")
+
+    assert ".ai-toolkit/task.md" in result.stdout, "kickoff must point the spoke at task.md"
+    assert "#42" in result.stdout, "kickoff must reference the issue number"
+
+
 # ── ST6: dispatch-failure ceiling ─────────────────────────────────────────────
 
 
