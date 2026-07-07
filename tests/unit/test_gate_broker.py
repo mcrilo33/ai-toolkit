@@ -1493,6 +1493,22 @@ def test_read_gate_artifact_empty_when_absent(spoke_repo: Path) -> None:
     )
 
 
+def test_read_gate_artifact_caps_at_4000_chars_not_bytes(spoke_repo: Path) -> None:
+    # #175 review: the cap matches extract_pending_question (out[:4000] — CHARACTERS). A
+    # multibyte plan must not be cut on bytes (head -c), which both truncates a valid plan
+    # earlier than 4000 chars and can split a char mid-sequence.
+    (spoke_repo / ".ai-toolkit").mkdir()
+    (spoke_repo / ".ai-toolkit" / "gate-5.md").write_text("é" * 5000, encoding="utf-8")
+
+    result = _call(f"_read_gate_artifact '{spoke_repo}' 5")
+
+    assert result.returncode == 0, result.stderr
+    # 4000 characters, not 4000 bytes (a byte cap yields 2000 'é' — each is 2 UTF-8 bytes).
+    assert result.stdout.count("é") == 4000, (
+        f"expected a 4000-CHARACTER cap, got {result.stdout.count('é')} chars"
+    )
+
+
 def test_broker_gate_route_prefers_artifact_over_transcript(
     spoke_repo: Path, tmp_path: Path
 ) -> None:

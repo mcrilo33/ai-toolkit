@@ -575,10 +575,12 @@ Honor the issue's Gate: line. If it is \`plan\` (the default for non-trivial wor
 PLAN gate comes first — explore the code, then print the full implementation plan (files,
 approach, test strategy, open questions) as a normal visible message. Then emit the gate
 marker AND hand it your plan, so the hub reads it from a scripted artifact rather than
-parsing your transcript: write the plan to a file and pass it with
-\`bash .ai-toolkit/scripts/spoke-ready.sh --gate $n --plan-file <file>\` (or inline a short
-plan with \`--gate $n -m "<plan>"\`). That parks you at the gate; WAIT for approval before
-writing code (before GREEN). If the gate is \`none\`, run autonomous straight through.
+parsing your transcript: write the plan to a gitignored scratch file (e.g.
+\`.ai-toolkit/gate-plan.md\` — the .ai-toolkit/ dir is gitignored, so it never dirties your
+tree or blocks the ready gate) and pass it with
+\`bash .ai-toolkit/scripts/spoke-ready.sh --gate $n --plan-file .ai-toolkit/gate-plan.md\`
+(or inline a short plan with \`--gate $n -m "<plan>"\`). That parks you at the gate; WAIT for
+approval before writing code (before GREEN). If the gate is \`none\`, run autonomous straight through.
 
 Then implement following the solo-cycle (/cycle: RED → GREEN → REVIEW → PUSH). Push your
 own branch on every subtask without asking; when your ledger shows the issue's acceptance

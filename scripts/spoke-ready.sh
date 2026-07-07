@@ -244,14 +244,24 @@ fi
 # gate-broker reads directly, replacing the transcript heuristic (extract_pending_question):
 # a script reads what a script wrote. The plan still rides the tag annotation (BODY above);
 # the artifact is the primary channel. Written before the tag push, under the gitignored
-# .ai-toolkit/ dir so it never dirties the working tree. A bare --gate (no plan) writes
-# nothing, leaving the broker its transcript fallback.
-if [ "$KIND" = "gate" ] && [ -n "$BODY" ]; then
+# .ai-toolkit/ dir so it never dirties the working tree.
+#
+# The write site OWNS the artifact's freshness (#175 review): every --gate emission either
+# writes the current plan OR, when none was handed over (a bare --gate re-park after an
+# escalation or an in-pane human answer), CLEARS any stale artifact from a prior park — so
+# the broker never prefers an outdated plan over the current transcript.
+if [ "$KIND" = "gate" ]; then
   GATE_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   if [ -n "$GATE_ROOT" ]; then
-    mkdir -p "$GATE_ROOT/.ai-toolkit"
-    printf '%s\n' "$BODY" > "$GATE_ROOT/.ai-toolkit/gate-$ISSUE.md"
-    echo "→ wrote plan artifact .ai-toolkit/gate-$ISSUE.md"
+    GATE_ARTIFACT="$GATE_ROOT/.ai-toolkit/gate-$ISSUE.md"
+    if [ -n "$BODY" ]; then
+      mkdir -p "$GATE_ROOT/.ai-toolkit"
+      printf '%s\n' "$BODY" > "$GATE_ARTIFACT"
+      echo "→ wrote plan artifact .ai-toolkit/gate-$ISSUE.md"
+    elif [ -f "$GATE_ARTIFACT" ]; then
+      rm -f "$GATE_ARTIFACT"
+      echo "→ cleared stale plan artifact .ai-toolkit/gate-$ISSUE.md (bare --gate hands over no plan)"
+    fi
   fi
 fi
 

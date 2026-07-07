@@ -339,6 +339,22 @@ def test_plan_artifact_only_for_gate(spoke: Path) -> None:
     )
 
 
+def test_gate_bare_repark_clears_stale_artifact(spoke: Path) -> None:
+    # #175 review: the write site owns the artifact's freshness. A plan-bearing park writes
+    # gate-N.md; a later BARE --gate (a re-park that hands over no plan — after an escalation
+    # or a human in-pane answer) must CLEAR it, so the broker never prefers a stale prior plan
+    # over the current transcript.
+    _run(spoke, "--gate", "45", "-m", "stale plan A")
+    assert (spoke / ".ai-toolkit" / "gate-45.md").is_file(), "precondition: the artifact exists"
+
+    result = _run(spoke, "--gate", "45")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (spoke / ".ai-toolkit" / "gate-45.md").exists(), (
+        "a bare re-park must clear the stale plan artifact so the broker falls back to the transcript"
+    )
+
+
 # ── accept/N and blocked/N: the terminal markers ─────────────────────────────
 # An unattended drain (`/afk`) adds two more terminal markers beside ready/N, each
 # frees a supervisor slot:

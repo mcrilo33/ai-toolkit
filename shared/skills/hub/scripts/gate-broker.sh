@@ -469,19 +469,37 @@ _gate_parked() {
   [ "$(git -C "$wt" rev-parse -q --verify "refs/tags/gate/${issue}^{commit}" 2>/dev/null)" = "$tip" ]
 }
 
+# _gate_artifact_path <wt> <issue> -> the gate plan artifact path (<wt>/.ai-toolkit/
+# gate-<issue>.md). The single owner of that layout, shared by _read_gate_artifact and
+# _consume_gate_tag (spoke-ready.sh writes the same path from the spoke side, #175). Falls
+# back to <wt> as the root when rev-parse can't resolve a toplevel (a non-git path in a test).
+_gate_artifact_path() {
+  local wt="$1" issue="$2" root
+  root="$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$wt")"
+  printf '%s\n' "$root/.ai-toolkit/gate-$issue.md"
+}
+
 # _read_gate_artifact <wt> <issue> -> the plan the spoke wrote to its gate artifact
 # (<wt>/.ai-toolkit/gate-<issue>.md, written by spoke-ready.sh --gate, issue #175), or empty
 # when absent. The SCRIPTED handoff channel the gate route PREFERS over parsing the spoke
 # transcript (extract_pending_question): a script reads what a script wrote, no heuristic.
-# Bounded to the same 4000 chars extract_pending_question caps at so a huge plan can't blow
-# up the answerer prompt. Empty (fall back to the transcript) when the spoke parked without
-# writing one (a bare --gate).
+# Empty (fall back to the transcript) when the spoke parked without writing one (a bare --gate).
 _read_gate_artifact() {
-  local wt="$1" issue="$2" root f
-  root="$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$wt")"
-  f="$root/.ai-toolkit/gate-$issue.md"
+  local wt="$1" issue="$2" f
+  f="$(_gate_artifact_path "$wt" "$issue")"
   [ -f "$f" ] || return 0
-  head -c 4000 "$f" 2>/dev/null
+  # Cap at 4000 CHARACTERS (matching extract_pending_question's out[:4000]) so a huge plan
+  # can't blow up the answerer prompt AND a multibyte plan is never split mid-character —
+  # head -c would cut on bytes. python3 is the broker's existing text tool (the
+  # extract_pending_question path); when it is unavailable the untruncated plan
+  # (spoke-authored, bounded in practice) is safer than a byte-truncated one.
+  if command -v python3 >/dev/null 2>&1; then
+    _AFK_GATE_FILE="$f" python3 -c \
+      'import os,sys; sys.stdout.write(open(os.environ["_AFK_GATE_FILE"], encoding="utf-8", errors="replace").read()[:4000])' \
+      2>/dev/null
+  else
+    cat "$f" 2>/dev/null
+  fi
 }
 
 # _still_parked_same <wt> <issue> <was_gate> <question> <before_mtime> -> true when the
@@ -1204,13 +1222,12 @@ afk_emit_decision() { _afk_emit_span "$1" afk-answer "$2"; }
 # waiting and re-answer the same gate). The remote delete is cosmetic (dashboard /
 # hub-status) and best-effort. Never aborts the loop.
 _consume_gate_tag() {
-  local wt="$1" issue="$2" root
+  local wt="$1" issue="$2"
   git -C "$wt" tag -d "gate/$issue" >/dev/null 2>&1 || true
   git -C "$wt" push origin ":refs/tags/gate/$issue" >/dev/null 2>&1 || true
   # Drop the scripted plan artifact too (issue #175): once the gate is answered the plan
   # handoff is spent, and a lingering gate-<N>.md would feed a stale plan to a later re-park.
-  root="$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$wt")"
-  rm -f "$root/.ai-toolkit/gate-$issue.md" 2>/dev/null || true
+  rm -f "$(_gate_artifact_path "$wt" "$issue")" 2>/dev/null || true
 }
 
 # --- attended QCM surface (issue #155, subtask C) -----------------------------

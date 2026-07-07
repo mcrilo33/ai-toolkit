@@ -5070,3 +5070,8 @@ def test_kickoff_instructs_gate_plan_passthrough() -> None:
     assert "--plan-file" in out or "-m " in out, (
         "the kickoff must instruct passing the plan to --gate (--plan-file or -m)"
     )
+    # #175 review: the plan file must land in a gitignored location — a tracked plan.md
+    # left behind blocks the ready gate's clean-tree precondition.
+    assert "gitignored" in out, (
+        "the kickoff must direct the --plan-file to a gitignored scratch path"
+    )
