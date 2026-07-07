@@ -4477,6 +4477,20 @@ class TestStepCostScores:
         assert "step_cost_usd:RED" in names
         assert "step_tokens_written:RED" in names
 
+    def test_boundary_partition_maps_to_pre_phase(self) -> None:
+        # preStep (the pre-first-window partition) carries ledger tools, so it emits its own
+        # boundary-phase score — locking the closed-set pre/post branch of the parser.
+        cycle = build_cycle_batch(self._traces(), SPOKE, self._content())
+
+        scores = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
+
+        pre = _cycle_step(cycle, "preStep")
+        assert any(
+            s["body"]["name"] == "step_cost_usd:pre"
+            and s["body"]["observationId"] == pre["body"]["id"]
+            for s in scores
+        )
+
     def test_cost_is_written_times_price_and_observation_scoped(self) -> None:
         cycle = build_cycle_batch(self._traces(), SPOKE, self._content())
         step = _cycle_step(cycle, "step:S1 RED: x")
