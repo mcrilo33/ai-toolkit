@@ -174,8 +174,13 @@ class TestBuildBatch:
     def test_one_copy_per_source_observation(self) -> None:
         batch = build_batch(_traces(), SPOKE)
 
-        copies = batch[2:]
-        # 6 source observations across the 4 traces.
+        # 6 source observations across the 4 traces; the two `.sh` hooks additionally spawn a
+        # `guards` + `guards:session` group each (#157), so filter those out to count the sources.
+        copies = [
+            event
+            for event in batch[2:]
+            if event["body"].get("name") not in ("guards", "guards:session")
+        ]
         assert len(copies) == 6
         assert all(event["body"]["traceId"] == trace_id_for(SPOKE) for event in copies)
         assert {event["type"] for event in copies} == {"span-create", "generation-create"}
@@ -223,16 +228,22 @@ class TestBuildBatch:
         assert marker["body"]["parentObservationId"] == root_id
 
     def test_hook_matching_a_tool_is_parented_under_that_tool(self) -> None:
+        # #157: the hook nests under its tool's `guards` group, which nests under the tool.
         batch = build_batch(_traces(), SPOKE)
 
+        group = _guards_group(batch)
         hook = _by_orig(batch, "trace-hook", "h1")
-        assert hook["body"]["parentObservationId"] == _copy_id("trace-int", "t1")
+        assert hook["body"]["parentObservationId"] == group["body"]["id"]
+        assert group["body"]["parentObservationId"] == _copy_id("trace-int", "t1")
 
     def test_hook_without_a_match_collapses_to_spoke_root(self) -> None:
+        # #157: a root-level (session) hook nests under the root `guards:session` group.
         batch = build_batch(_traces(), SPOKE)
 
+        session = _session_guards(batch)
         stray = _by_orig(batch, "trace-stray", "h2")
-        assert stray["body"]["parentObservationId"] == root_id_for(SPOKE)
+        assert stray["body"]["parentObservationId"] == session["body"]["id"]
+        assert session["body"]["parentObservationId"] == root_id_for(SPOKE)
 
     def test_hook_matches_tool_via_gen_ai_tool_call_id(self) -> None:
         # The tool exposes its id only as gen_ai.tool.call.id; the hook references it as
@@ -253,12 +264,14 @@ class TestBuildBatch:
 
         batch = build_batch(traces, SPOKE)
 
+        group = _guards_group(batch)
         copy = _by_orig(batch, "trace-hook", "h9")
-        assert copy["body"]["parentObservationId"] == _copy_id("trace-tool", "t9")
+        assert copy["body"]["parentObservationId"] == group["body"]["id"]
+        assert group["body"]["parentObservationId"] == _copy_id("trace-tool", "t9")
 
     def test_hook_detected_by_workflow_kind_without_sh_name(self) -> None:
-        # A hook whose name does not end in ".sh" is still detected via workflow.kind and
-        # collapses to the root when nothing matches its id.
+        # A hook whose name does not end in ".sh" is still detected via workflow.kind; with no
+        # tool_use_id it is a session guard, nested under the root `guards:session` group (#157).
         hook = _obs(
             "h8",
             "hook-emit",
@@ -268,8 +281,10 @@ class TestBuildBatch:
 
         batch = build_batch([("trace-hook", [hook])], SPOKE)
 
+        session = _session_guards(batch)
         copy = _by_orig(batch, "trace-hook", "h8")
-        assert copy["body"]["parentObservationId"] == root_id_for(SPOKE)
+        assert copy["body"]["parentObservationId"] == session["body"]["id"]
+        assert session["body"]["parentObservationId"] == root_id_for(SPOKE)
 
     def test_tool_result_audit_event_nests_under_its_tool(self) -> None:
         # tool_result audit observations join by the same rule (forward-compat with the
@@ -289,8 +304,9 @@ class TestBuildBatch:
         copy = _by_orig(batch, "trace-audit", "r6")
         assert copy["body"]["parentObservationId"] == _copy_id("trace-tool", "t6")
 
-    def test_audit_event_without_a_match_collapses_to_spoke_root(self) -> None:
-        # An unmatched tool_use_id is never dropped — it falls through to the synthetic root.
+    def test_audit_event_without_a_match_synthesizes_blocked_tool_at_root(self) -> None:
+        # #157: an unmatched tool_use_id synthesizes a blocked-tool node; with no enclosing turn it
+        # sits at the root, and the tool_decision folds its decision onto it.
         decision = _obs(
             "d0",
             "tool_decision:reject",
@@ -301,8 +317,9 @@ class TestBuildBatch:
 
         batch = build_batch([("trace-audit", [decision])], SPOKE)
 
-        copy = _by_orig(batch, "trace-audit", "d0")
-        assert copy["body"]["parentObservationId"] == root_id_for(SPOKE)
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["parentObservationId"] == root_id_for(SPOKE)
+        assert blocked["body"]["metadata"]["decision"] == "reject"
 
     def test_hook_nests_under_tool_not_a_sibling_audit_event(self) -> None:
         # A tool_decision audit event shares the tool_use_id but must NOT become the
@@ -326,8 +343,11 @@ class TestBuildBatch:
 
         batch = build_batch(traces, SPOKE)
 
+        # #157: the gate hook still resolves to its tool — now via its tool's `guards` group.
+        group = _guards_group(batch)
         hook_copy = _by_orig(batch, "trace-hook", "h5")
-        assert hook_copy["body"]["parentObservationId"] == _copy_id("trace-tool", "t5")
+        assert hook_copy["body"]["parentObservationId"] == group["body"]["id"]
+        assert group["body"]["parentObservationId"] == _copy_id("trace-tool", "t5")
 
     def test_hook_execution_complete_event_nests_under_its_tool(self) -> None:
         # A hook_execution_complete:PreToolUse audit observation now carries the tool_use_id
@@ -368,9 +388,9 @@ class TestBuildBatch:
         copy = _by_orig(batch, "trace-audit", "h9a")
         assert copy["body"]["parentObservationId"] == root_id_for(SPOKE)
 
-    def test_unmatched_hook_execution_complete_event_collapses_to_root(self) -> None:
-        # A Pre/PostToolUse hook whose tool_use_id matches no tool span is never dropped --
-        # it falls through to the synthetic root.
+    def test_unmatched_hook_execution_complete_event_nests_under_blocked_tool_at_root(self) -> None:
+        # #157: a Pre/PostToolUse hook whose tool_use_id matches no tool span synthesizes a
+        # blocked-tool node (at the root, no enclosing turn) and nests under it.
         hook = _obs(
             "h10",
             "hook_execution_complete:PostToolUse",
@@ -385,8 +405,12 @@ class TestBuildBatch:
 
         batch = build_batch([("trace-audit", [hook])], SPOKE)
 
-        copy = _by_orig(batch, "trace-audit", "h10")
-        assert copy["body"]["parentObservationId"] == root_id_for(SPOKE)
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["parentObservationId"] == root_id_for(SPOKE)
+        assert (
+            _by_orig(batch, "trace-audit", "h10")["body"]["parentObservationId"]
+            == blocked["body"]["id"]
+        )
 
     def test_hook_execution_complete_event_is_not_a_tool_index_owner(self) -> None:
         # A hook_execution_complete event shares the tool_use_id but must NOT become the
@@ -418,8 +442,11 @@ class TestBuildBatch:
 
         batch = build_batch(traces, SPOKE)
 
+        # #157: the gate hook resolves to its tool via the tool's `guards` group.
+        group = _guards_group(batch)
         gate_copy = _by_orig(batch, "trace-hook", "h11")
-        assert gate_copy["body"]["parentObservationId"] == _copy_id("trace-tool", "t11")
+        assert gate_copy["body"]["parentObservationId"] == group["body"]["id"]
+        assert group["body"]["parentObservationId"] == _copy_id("trace-tool", "t11")
 
     def test_ids_are_deterministic_across_runs(self) -> None:
         first = {event["id"] for event in build_batch(_traces(), SPOKE)}
@@ -435,11 +462,12 @@ class TestBuildBatch:
 
 
 class TestEnclosingTurnFallback:
-    """#110 AC1: a satellite carrying a tool_use_id whose tool was denied/cancelled (so no
-    tool span exists to attach to) nests under its enclosing claude_code.interaction — by
-    prompt.id first, then by [start,end] window containment for a real-timing gate hook —
-    instead of dropping to the synthetic root. A lagging-timestamp audit instant is never
-    window-placed (anti-lag), and a satellite with no enclosing turn at all stays at the root.
+    """#110 AC1 as reshaped by #157: a satellite whose tool was denied/cancelled (no tool span)
+    now gets a synthesized ``blocked-tool`` node, and the #110 enclosing-turn resolution runs on
+    THAT node — by prompt.id first, then by [start,end] window containment for a real-timing gate
+    hook — instead of on each satellite. A lagging-timestamp audit instant is never window-placed
+    (anti-lag), and a blocked tool with no enclosing turn at all stays at the root. The satellites
+    then adopt the blocked-tool node (gate hooks via their guards group; audit events directly).
     """
 
     def test_unmatched_gate_hook_nests_under_turn_by_prompt_id(self) -> None:
@@ -467,8 +495,10 @@ class TestEnclosingTurnFallback:
 
         batch = build_batch(traces, SPOKE)
 
-        copy = _by_orig(batch, "trace-hook", "h1")
-        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        # The blocked-tool node resolves to the turn by prompt.id; the gate hook adopts it via its group.
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        assert _guards_group(batch)["body"]["parentObservationId"] == blocked["body"]["id"]
 
     def test_unmatched_hook_execution_complete_nests_under_turn_by_prompt_id(self) -> None:
         # A hook_execution_complete audit instant (lagging time) with an unmatched tool_use_id
@@ -495,8 +525,12 @@ class TestEnclosingTurnFallback:
 
         batch = build_batch(traces, SPOKE)
 
-        copy = _by_orig(batch, "trace-audit", "h7")
-        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        assert (
+            _by_orig(batch, "trace-audit", "h7")["body"]["parentObservationId"]
+            == blocked["body"]["id"]
+        )
 
     def test_interaction_prompt_id_in_flat_metadata_rehomes_event(self) -> None:
         # #111: the message bridge stamps prompt.id onto the interaction as a FLAT metadata key
@@ -525,8 +559,12 @@ class TestEnclosingTurnFallback:
 
         batch = build_batch(traces, SPOKE)
 
-        copy = _by_orig(batch, "trace-audit", "h8")
-        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        assert (
+            _by_orig(batch, "trace-audit", "h8")["body"]["parentObservationId"]
+            == blocked["body"]["id"]
+        )
 
     def test_unmatched_gate_hook_nests_by_time_window_without_prompt_id(self) -> None:
         # A real-timing gate hook with no prompt.id falls back to [start,end] containment: its
@@ -549,8 +587,8 @@ class TestEnclosingTurnFallback:
 
         batch = build_batch(traces, SPOKE)
 
-        copy = _by_orig(batch, "trace-hook", "h2")
-        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        # The blocked-tool node window-places to the containing turn; the gate hook adopts it.
+        assert _one_blocked(batch)["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
 
     def test_innermost_turn_wins_on_overlapping_windows(self) -> None:
         # When a resume interaction nests inside an outer one, a window-matched hook homes to
@@ -580,8 +618,7 @@ class TestEnclosingTurnFallback:
 
         batch = build_batch(traces, SPOKE)
 
-        copy = _by_orig(batch, "trace-hook", "h3")
-        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i_in")
+        assert _one_blocked(batch)["body"]["parentObservationId"] == _copy_id("trace-int", "i_in")
 
     def test_innermost_turn_wins_on_equal_start_windows(self) -> None:
         # Two turns sharing a start: the narrower (earlier end) is the innermost and wins.
@@ -610,8 +647,7 @@ class TestEnclosingTurnFallback:
 
         batch = build_batch(traces, SPOKE)
 
-        copy = _by_orig(batch, "trace-hook", "h6")
-        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i_in")
+        assert _one_blocked(batch)["body"]["parentObservationId"] == _copy_id("trace-int", "i_in")
 
     def test_unmatched_tool_decision_nests_under_turn_by_prompt_id(self) -> None:
         # The canonical denied-tool case: a tool_decision:reject for a tool that produced no
@@ -633,8 +669,10 @@ class TestEnclosingTurnFallback:
 
         batch = build_batch(traces, SPOKE)
 
-        copy = _by_orig(batch, "trace-audit", "d9")
-        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        # The tool_decision folds its decision onto the blocked-tool node, which homes to the turn.
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        assert blocked["body"]["metadata"]["decision"] == "reject"
 
     def test_audit_instant_hook_without_prompt_id_is_not_window_placed(self) -> None:
         # The anti-lag guard: a hook_execution_complete carries a LAGGING startTime, so without
@@ -662,8 +700,14 @@ class TestEnclosingTurnFallback:
 
         batch = build_batch(traces, SPOKE)
 
-        copy = _by_orig(batch, "trace-audit", "h4")
-        assert copy["body"]["parentObservationId"] == root_id_for(SPOKE)
+        # No prompt.id and a lagging audit timestamp -> the blocked-tool node is not window-placed,
+        # so it (and the hook under it) stay at the root.
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["parentObservationId"] == root_id_for(SPOKE)
+        assert (
+            _by_orig(batch, "trace-audit", "h4")["body"]["parentObservationId"]
+            == blocked["body"]["id"]
+        )
 
     def test_matched_tool_still_wins_over_enclosing_turn(self) -> None:
         # The fallback never overrides a real match: a hook whose tool_use_id DOES resolve to a
@@ -692,8 +736,11 @@ class TestEnclosingTurnFallback:
 
         batch = build_batch(traces, SPOKE)
 
+        # #157: the matched tool still wins over the enclosing turn — reached via its `guards` group.
+        group = _guards_group(batch)
         copy = _by_orig(batch, "trace-hook", "h5")
-        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "t1")
+        assert copy["body"]["parentObservationId"] == group["body"]["id"]
+        assert group["body"]["parentObservationId"] == _copy_id("trace-int", "t1")
 
 
 class TestSessionScopedHookNoDangle:
@@ -847,9 +894,11 @@ class TestToolSubspanFolding:
 
         batch = build_batch([("tr", [tool, hook])], SPOKE)
 
-        # the hook survives as a node nested under its tool — only the 3 sub-spans fold.
+        # the hook survives as a node (not folded) — nested under its tool's `guards` group (#157).
         assert not self._dropped(batch, "tr", "hk")
-        assert _by_orig(batch, "tr", "hk")["body"]["parentObservationId"] == _copy_id("tr", "tb")
+        group = _guards_group(batch)
+        assert _by_orig(batch, "tr", "hk")["body"]["parentObservationId"] == group["body"]["id"]
+        assert group["body"]["parentObservationId"] == _copy_id("tr", "tb")
 
     def test_tool_result_event_is_not_folded(self) -> None:
         tool = _obs("tb", "Read", parent=None, metadata={"attributes": {"tool_use_id": "tu-1"}})
@@ -904,7 +953,9 @@ class TestToolSubspanFolding:
         assert _by_orig(batch, "tr", "ex")["body"]["parentObservationId"] == _copy_id("tr", "i1")
         assert "success" not in _by_orig(batch, "tr", "i1")["body"].get("metadata", {})
 
-    def test_unmatched_tool_decision_keeps_its_node(self) -> None:
+    def test_unmatched_tool_decision_folds_onto_synthesized_blocked_tool(self) -> None:
+        # #157: an unmatched tool_decision now synthesizes a blocked-tool node and folds its
+        # decision onto that node (previously it kept its own node at the root).
         decision = _obs(
             "d0",
             "tool_decision:reject",
@@ -915,10 +966,10 @@ class TestToolSubspanFolding:
 
         batch = build_batch([("trace-audit", [decision])], SPOKE)
 
-        assert not self._dropped(batch, "trace-audit", "d0")
-        assert _by_orig(batch, "trace-audit", "d0")["body"]["parentObservationId"] == root_id_for(
-            SPOKE
-        )
+        assert self._dropped(batch, "trace-audit", "d0")
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["metadata"]["decision"] == "reject"
+        assert blocked["body"]["parentObservationId"] == root_id_for(SPOKE)
 
     def test_child_of_a_folded_subspan_is_rehomed_onto_the_tool(self) -> None:
         # A resume interaction nests under the tool.execution via TRACEPARENT; when the execution
@@ -4185,3 +4236,660 @@ class TestCycleView:
             _by_cycle(batch, "tr", "sk1")["body"]["parentObservationId"]
             == _cycle_step(batch, "preStep")["id"]
         )
+
+
+def _guard(
+    obs_id: str,
+    name: str,
+    *,
+    tool_use_id: str | None = None,
+    start: str,
+    end: str,
+    decision: str = "allow",
+    status: str = "success",
+    **attrs: object,
+) -> dict:
+    """Build a ``.sh`` guard-hook source span with decision/status under metadata['attributes']."""
+    attributes: dict[str, object] = {
+        "workflow.kind": "hook",
+        "decision": decision,
+        "status": status,
+    }
+    if tool_use_id:
+        attributes["tool_use_id"] = tool_use_id
+    attributes.update(attrs)
+    return _obs(
+        obs_id, name, parent=None, startTime=start, endTime=end, metadata={"attributes": attributes}
+    )
+
+
+def _guards_group(batch: list[dict]) -> dict:
+    """Return the single per-tool ``guards`` group node, asserting exactly one exists."""
+    groups = [event for event in batch if event["body"].get("name") == "guards"]
+    assert len(groups) == 1
+    return groups[0]
+
+
+def _session_guards(batch: list[dict]) -> dict:
+    """Return the single root ``guards:session`` group node, asserting exactly one exists."""
+    groups = [event for event in batch if event["body"].get("name") == "guards:session"]
+    assert len(groups) == 1
+    return groups[0]
+
+
+def _guarded_tool_traces() -> list[tuple[str, list[dict]]]:
+    """One turn: a 5s tool with two no-op (allow/success, <1s) ``.sh`` guards sharing its id."""
+    interaction = _obs(
+        "i1",
+        "claude_code.interaction",
+        parent=None,
+        startTime="2026-01-02T00:00:00Z",
+        endTime="2026-01-02T00:00:10Z",
+    )
+    tool = _obs(
+        "t1",
+        "tool:Bash",
+        parent="i1",
+        startTime="2026-01-02T00:00:00Z",
+        endTime="2026-01-02T00:00:05Z",
+        metadata={"attributes": {"tool_use_id": "tu-1"}},
+    )
+    pre = _guard(
+        "h1",
+        "PreToolUse.sh",
+        tool_use_id="tu-1",
+        start="2026-01-02T00:00:00Z",
+        end="2026-01-02T00:00:00.400Z",  # 400ms noop
+    )
+    post = _guard(
+        "h2",
+        "PostToolUse.sh",
+        tool_use_id="tu-1",
+        start="2026-01-02T00:00:04Z",
+        end="2026-01-02T00:00:04.500Z",  # 500ms noop
+    )
+    return [("tr", [interaction, tool, pre, post])]
+
+
+class TestGuardGroups:
+    """#157: `.sh` guard spans join a per-tool ``guards`` group (and a root ``guards:session``);
+    no-op raw spans drop by default but their stats survive in the group's ``by_hook`` rollup."""
+
+    def test_guards_group_created_under_the_tool(self) -> None:
+        batch = build_batch(_guarded_tool_traces(), SPOKE)
+
+        assert _guards_group(batch)["body"]["parentObservationId"] == _copy_id("tr", "t1")
+
+    def test_noop_guards_dropped_by_default(self) -> None:
+        batch = build_batch(_guarded_tool_traces(), SPOKE)
+
+        ids = {event["id"] for event in batch}
+        assert _copy_id("tr", "h1") not in ids
+        assert _copy_id("tr", "h2") not in ids
+
+    def test_keep_noop_guards_retains_children_under_the_group(self) -> None:
+        batch = build_batch(_guarded_tool_traces(), SPOKE, keep_noop_guards=True)
+
+        group_id = _guards_group(batch)["body"]["id"]
+        assert _by_orig(batch, "tr", "h1")["body"]["parentObservationId"] == group_id
+        assert _by_orig(batch, "tr", "h2")["body"]["parentObservationId"] == group_id
+
+    def test_by_hook_rollup_counts_all_raw_including_dropped(self) -> None:
+        batch = build_batch(_guarded_tool_traces(), SPOKE)
+
+        metadata = _guards_group(batch)["body"]["metadata"]
+        assert metadata["count"] == 2
+        assert metadata["total_ms"] == 900
+        assert metadata["by_hook"] == {
+            "PostToolUse.sh": {"count": 1, "ms": 500},
+            "PreToolUse.sh": {"count": 1, "ms": 400},
+        }
+        assert metadata["decisions"] == ["allow"]
+
+    def test_non_allow_guard_kept_even_by_default(self) -> None:
+        interaction, tool, _pre, _post = _guarded_tool_traces()[0][1]
+        deny = _guard(
+            "h3",
+            "PreToolUse.sh",
+            tool_use_id="tu-1",
+            start="2026-01-02T00:00:01Z",
+            end="2026-01-02T00:00:01.200Z",
+            decision="deny",
+        )
+
+        batch = build_batch([("tr", [interaction, tool, deny])], SPOKE)
+
+        assert (
+            _by_orig(batch, "tr", "h3")["body"]["parentObservationId"]
+            == _guards_group(batch)["body"]["id"]
+        )
+
+    def test_slow_allow_guard_kept_even_by_default(self) -> None:
+        interaction, tool, _pre, _post = _guarded_tool_traces()[0][1]
+        slow = _guard(
+            "h4",
+            "PreToolUse.sh",
+            tool_use_id="tu-1",
+            start="2026-01-02T00:00:00Z",
+            end="2026-01-02T00:00:02Z",  # 2s allow/success
+        )
+
+        batch = build_batch([("tr", [interaction, tool, slow])], SPOKE)
+
+        assert (
+            _by_orig(batch, "tr", "h4")["body"]["parentObservationId"]
+            == _guards_group(batch)["body"]["id"]
+        )
+
+    def test_group_body_carries_no_usage_or_model(self) -> None:
+        batch = build_batch(_guarded_tool_traces(), SPOKE)
+
+        body = _guards_group(batch)["body"]
+        assert "usageDetails" not in body
+        assert "model" not in body
+
+    def test_session_guards_group_under_root(self) -> None:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+        )
+        start_hook = _guard(
+            "s1",
+            "SessionStart.sh",
+            start="2026-01-02T00:00:00Z",
+            end="2026-01-02T00:00:00.300Z",
+        )
+        stop_hook = _guard(
+            "s2",
+            "Stop.sh",
+            start="2026-01-02T00:00:09Z",
+            end="2026-01-02T00:00:09.200Z",
+        )
+
+        batch = build_batch([("tr", [interaction, start_hook, stop_hook])], SPOKE)
+
+        session = _session_guards(batch)
+        assert session["body"]["parentObservationId"] == root_id_for(SPOKE)
+        assert session["body"]["metadata"]["count"] == 2
+
+    def test_guards_group_present_in_cycle_view(self) -> None:
+        batch = build_cycle_batch(_guarded_tool_traces(), SPOKE)
+
+        assert len([e for e in batch if e["body"].get("name") == "guards"]) == 1
+
+    def test_double_build_is_byte_identical(self) -> None:
+        first = json.dumps(build_batch(_guarded_tool_traces(), SPOKE))
+        second = json.dumps(build_batch(_guarded_tool_traces(), SPOKE))
+
+        assert first == second
+
+
+class TestGuardGroupDuration:
+    """#157 AC2: the ``hook`` duration bucket reflects real guard time (sum of raw ``.sh``
+    durations), and ``rollup.duration.components`` is identical with --keep-noop-guards on/off."""
+
+    def test_components_identical_keep_noop_on_off(self) -> None:
+        default = build_batch(_guarded_tool_traces(), SPOKE)
+        kept = build_batch(_guarded_tool_traces(), SPOKE, keep_noop_guards=True)
+
+        default_dur = _by_orig(default, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
+        kept_dur = _by_orig(kept, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
+        assert default_dur == kept_dur
+
+    def test_hook_bucket_is_sum_of_raw_guard_durations(self) -> None:
+        batch = build_batch(_guarded_tool_traces(), SPOKE)
+
+        duration = _by_orig(batch, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
+        assert duration["components"]["hook"] == 900
+
+    def test_guard_grouping_preserves_tool_execution_time(self) -> None:
+        # The Pre+Post-with-gap guards must NOT erase the tool's inter-guard execution: the
+        # group covers only its real 900ms of guard time, so the 5s tool still books 4.1s and
+        # the components sum to the interaction wall-clock (the #128 invariant).
+        batch = build_batch(_guarded_tool_traces(), SPOKE)
+
+        duration = _by_orig(batch, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
+        assert duration == _dur(10_000, {"tool": 4_100, "hook": 900, "self": 5_000})
+        assert sum(duration["components"].values()) == duration["total_ms"]
+
+
+def _blocked_tools(batch: list[dict]) -> list[dict]:
+    """Return every synthesized ``blocked-tool:*`` node in a batch."""
+    return [e for e in batch if (e["body"].get("name") or "").startswith("blocked-tool:")]
+
+
+def _one_blocked(batch: list[dict]) -> dict:
+    """Return the single synthesized ``blocked-tool:*`` node, asserting exactly one exists."""
+    nodes = _blocked_tools(batch)
+    assert len(nodes) == 1
+    return nodes[0]
+
+
+class TestBlockedToolSynthesis:
+    """#157: an orphaned tool_use_id (satellites but no tool span — a denied/never-run call)
+    gets a synthesized `blocked-tool:<Name>` node, WARNING, no usage/model, never a `tool:`
+    prefix, parented to its enclosing turn, that its hooks / audit events / decision adopt."""
+
+    def _orphan_audit(self) -> list[tuple[str, list[dict]]]:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "p1"}},
+        )
+        hook = _obs(
+            "h1",
+            "hook_execution_complete:PreToolUse",
+            type_="EVENT",
+            parent=None,
+            metadata={
+                "hook_event": "PreToolUse",
+                "hook_name": "PreToolUse:Edit",
+                "tool_use_id": "tu-denied",
+                "prompt.id": "p1",
+            },
+        )
+        return [("trace-int", [interaction]), ("trace-audit", [hook])]
+
+    def test_orphaned_audit_event_synthesizes_blocked_tool_under_turn(self) -> None:
+        batch = build_batch(self._orphan_audit(), SPOKE)
+
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        assert (
+            _by_orig(batch, "trace-audit", "h1")["body"]["parentObservationId"]
+            == blocked["body"]["id"]
+        )
+
+    def test_blocked_tool_name_from_hook_name_suffix(self) -> None:
+        batch = build_batch(self._orphan_audit(), SPOKE)
+
+        assert _one_blocked(batch)["body"]["name"] == "blocked-tool:Edit"
+
+    def test_blocked_tool_is_warning_and_carries_no_usage(self) -> None:
+        batch = build_batch(self._orphan_audit(), SPOKE)
+
+        body = _one_blocked(batch)["body"]
+        assert body["level"] == "WARNING"
+        assert "usageDetails" not in body
+        assert "model" not in body
+
+    def test_blocked_tool_never_uses_tool_prefix(self) -> None:
+        batch = build_batch(self._orphan_audit(), SPOKE)
+
+        assert not _one_blocked(batch)["body"]["name"].startswith("tool:")
+
+    def test_matched_tool_produces_no_blocked_node(self) -> None:
+        interaction = _obs("i1", "claude_code.interaction", parent=None)
+        tool = _obs(
+            "t1", "tool:Edit", parent="i1", metadata={"attributes": {"tool_use_id": "tu-1"}}
+        )
+        hook = _obs(
+            "h1",
+            "hook_execution_complete:PreToolUse",
+            type_="EVENT",
+            parent=None,
+            metadata={"hook_name": "PreToolUse:Edit", "tool_use_id": "tu-1"},
+        )
+
+        batch = build_batch([("tr", [interaction, tool, hook])], SPOKE)
+
+        assert _blocked_tools(batch) == []
+
+    def test_orphaned_gate_hook_adopts_blocked_tool_via_guards_group(self) -> None:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+        )
+        gate = _guard(
+            "h1",
+            "PreToolUse.sh",
+            tool_use_id="tu-denied",
+            start="2026-01-02T00:00:05Z",
+            end="2026-01-02T00:00:05.300Z",
+            decision="deny",
+            **{"tool_name": "Bash"},
+        )
+
+        batch = build_batch([("trace-int", [interaction]), ("trace-hook", [gate])], SPOKE)
+
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["name"] == "blocked-tool:Bash"
+        assert blocked["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
+        group = _guards_group(batch)
+        assert group["body"]["parentObservationId"] == blocked["body"]["id"]
+
+    def test_orphaned_tool_decision_folds_onto_blocked_tool(self) -> None:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "p1"}},
+        )
+        decision = _obs(
+            "d1",
+            "tool_decision:deny",
+            type_="EVENT",
+            parent=None,
+            metadata={"tool_use_id": "tu-denied", "decision": "deny", "prompt.id": "p1"},
+        )
+
+        batch = build_batch([("trace-int", [interaction]), ("trace-audit", [decision])], SPOKE)
+
+        blocked = _one_blocked(batch)
+        assert blocked["body"]["metadata"]["decision"] == "deny"
+        # the decision sub-span folds into the node and is dropped
+        assert all(e["id"] != _copy_id("trace-audit", "d1") for e in batch)
+
+    def test_blocked_tool_name_falls_back_to_unknown(self) -> None:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "p1"}},
+        )
+        result = _obs(
+            "r1",
+            "tool_result",
+            type_="EVENT",
+            parent=None,
+            metadata={"tool_use_id": "tu-denied", "prompt.id": "p1"},
+        )
+
+        batch = build_batch([("trace-int", [interaction]), ("trace-audit", [result])], SPOKE)
+
+        assert _one_blocked(batch)["body"]["name"] == "blocked-tool:unknown"
+
+    def test_blocked_tool_present_in_cycle_view(self) -> None:
+        batch = build_cycle_batch(self._orphan_audit(), SPOKE)
+
+        assert len(_blocked_tools(batch)) == 1
+
+    def test_blocked_tool_double_build_is_byte_identical(self) -> None:
+        first = json.dumps(build_batch(self._orphan_audit(), SPOKE))
+        second = json.dumps(build_batch(self._orphan_audit(), SPOKE))
+
+        assert first == second
+
+    def test_blocked_tool_in_cycle_view_anchors_to_turn_start_not_lagging_time(self) -> None:
+        # Regression: the blocked node's own start is a LAGGING audit timestamp (35s, in the
+        # postStep). In the ledgered cycle view it must anchor to its turn's start (0s -> preStep),
+        # never land in the step its lag happens to fall in.
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:40Z",
+            metadata={"attributes": {"prompt.id": "p1"}},
+        )
+        create = _ledger_child(
+            "tc1",
+            "tool:TaskCreate",
+            "tu-c1",
+            parent="i1",
+            start="2026-01-02T00:00:02Z",
+            end="2026-01-02T00:00:02Z",
+        )
+        started = _ledger_child(
+            "tu1",
+            "tool:TaskUpdate",
+            "tu-u1",
+            parent="i1",
+            start="2026-01-02T00:00:05Z",
+            end="2026-01-02T00:00:05Z",
+        )
+        done = _ledger_child(
+            "tu2",
+            "tool:TaskUpdate",
+            "tu-u2",
+            parent="i1",
+            start="2026-01-02T00:00:20Z",
+            end="2026-01-02T00:00:21Z",
+        )
+        decision = _obs(
+            "d1",
+            "tool_decision:deny",
+            type_="EVENT",
+            parent=None,
+            startTime="2026-01-02T00:00:35Z",
+            metadata={"tool_use_id": "tu-denied", "decision": "deny", "prompt.id": "p1"},
+        )
+        content = {
+            "tu-c1": ToolContent({"subject": "S1"}, "Task #1 created successfully: S1"),
+            "tu-u1": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
+            "tu-u2": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
+        }
+
+        batch = build_cycle_batch(
+            [("tr", [interaction, create, started, done, decision])], SPOKE, content
+        )
+
+        assert (
+            _one_blocked(batch)["body"]["parentObservationId"]
+            == _cycle_step(batch, "preStep")["id"]
+        )
+
+    def test_multiple_orphans_get_distinct_blocked_tools(self) -> None:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            metadata={"attributes": {"prompt.id": "p1"}},
+        )
+        d_a = _obs(
+            "da",
+            "tool_decision:deny",
+            type_="EVENT",
+            parent=None,
+            metadata={"tool_use_id": "tu-a", "decision": "deny", "prompt.id": "p1"},
+        )
+        d_b = _obs(
+            "db",
+            "tool_decision:ask",
+            type_="EVENT",
+            parent=None,
+            metadata={"tool_use_id": "tu-b", "decision": "ask", "prompt.id": "p1"},
+        )
+
+        batch = build_batch([("trace-int", [interaction]), ("trace-audit", [d_a, d_b])], SPOKE)
+
+        blocked = _blocked_tools(batch)
+        assert len(blocked) == 2
+        assert len({b["body"]["id"] for b in blocked}) == 2
+
+
+class TestHookEndTimeStamping:
+    """#157: hook_execution_complete events carry total_duration_ms but no endTime; stamp
+    endTime = startTime + total_duration_ms (time_source: lagging) and EXCLUDE them from
+    duration attribution, since that duration duplicates the .sh spans already in the hook
+    bucket — so rollup.duration.components is identical before vs after stamping (AC2 pin)."""
+
+    def _hook_under_tool(self, *, total_duration_ms: int | None = 2000) -> list:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+        )
+        tool = _obs(
+            "t1",
+            "tool:Edit",
+            parent="i1",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:05Z",
+            metadata={"attributes": {"tool_use_id": "tu-1"}},
+        )
+        meta: dict = {"tool_use_id": "tu-1"}
+        if total_duration_ms is not None:
+            meta["total_duration_ms"] = total_duration_ms
+        hook = _obs(
+            "h1",
+            "hook_execution_complete:PostToolUse",
+            type_="EVENT",
+            parent=None,
+            startTime="2026-01-02T00:00:01Z",
+            metadata=meta,
+        )
+        return [("tr", [interaction, tool, hook])]
+
+    def test_endtime_stamped_from_total_duration_ms(self) -> None:
+        batch = build_batch(self._hook_under_tool(), SPOKE)
+
+        body = _by_orig(batch, "tr", "h1")["body"]
+        assert body["endTime"] == "2026-01-02T00:00:03Z"
+        assert body["metadata"]["time_source"] == "lagging"
+
+    def test_hook_event_without_total_duration_is_not_stamped(self) -> None:
+        batch = build_batch(self._hook_under_tool(total_duration_ms=None), SPOKE)
+
+        body = _by_orig(batch, "tr", "h1")["body"]
+        assert body.get("endTime") is None
+        assert "time_source" not in (body.get("metadata") or {})
+
+    def test_stamped_hook_event_excluded_from_view_a_components(self) -> None:
+        # The pin: the stamped 2s duration must NOT appear in any bucket — the tool books its
+        # full 5s and there is no "other", exactly as when the event had no endTime.
+        batch = build_batch(self._hook_under_tool(), SPOKE)
+
+        duration = _by_orig(batch, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
+        assert duration == _dur(10_000, {"tool": 5_000, "self": 5_000})
+
+    def test_stamped_hook_event_excluded_from_cycle_turn_marker_rollup(self) -> None:
+        # The same pin for View B: a flattened turn-marker's own rollup.duration (#114) must also
+        # exclude the stamped hook event.
+        batch = build_cycle_batch(self._hook_under_tool(), SPOKE)
+
+        duration = _by_cycle(batch, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
+        assert duration == _dur(10_000, {"tool": 5_000, "self": 5_000})
+
+
+class TestFailureLevels:
+    """#157: fold failure data onto Langfuse levels (was all DEFAULT). Tool success=false/error ->
+    ERROR; a guard whose decision is deny/ask/block or whose status != success -> WARNING (span AND
+    its group); hook_execution_complete with num_blocking>0 -> WARNING; blocked-tool:* -> WARNING.
+    Precedence ERROR > WARNING > DEFAULT."""
+
+    def _tool_with_execution(self, **exec_attrs: object) -> list:
+        tool = _obs(
+            "tb", "tool:Bash", parent=None, metadata={"attributes": {"tool_use_id": "tu-1"}}
+        )
+        execu = _obs(
+            "ex",
+            "claude_code.tool.execution",
+            parent="tb",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:01Z",
+            metadata={"attributes": {"tool_use_id": "tu-1", **exec_attrs}},
+        )
+        return [("tr", [tool, execu])]
+
+    def _guarded_tool(self, **guard_attrs: str) -> list:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+        )
+        tool = _obs(
+            "t1",
+            "tool:Bash",
+            parent="i1",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:05Z",
+            metadata={"attributes": {"tool_use_id": "tu-1"}},
+        )
+        guard = _guard(
+            "h1",
+            "PreToolUse.sh",
+            tool_use_id="tu-1",
+            start="2026-01-02T00:00:01Z",
+            end="2026-01-02T00:00:01.200Z",
+            **guard_attrs,
+        )
+        return [("tr", [interaction, tool, guard])]
+
+    def test_tool_success_false_is_error(self) -> None:
+        batch = build_batch(self._tool_with_execution(success=False), SPOKE)
+
+        assert _by_orig(batch, "tr", "tb")["body"]["level"] == "ERROR"
+
+    def test_tool_error_is_error(self) -> None:
+        batch = build_batch(self._tool_with_execution(success=True, error="boom"), SPOKE)
+
+        assert _by_orig(batch, "tr", "tb")["body"]["level"] == "ERROR"
+
+    def test_successful_tool_is_not_error(self) -> None:
+        batch = build_batch(self._tool_with_execution(success=True), SPOKE)
+
+        assert _by_orig(batch, "tr", "tb")["body"].get("level") != "ERROR"
+
+    def test_deny_guard_is_warning_on_span_and_group(self) -> None:
+        batch = build_batch(self._guarded_tool(decision="deny"), SPOKE)
+
+        assert _by_orig(batch, "tr", "h1")["body"]["level"] == "WARNING"
+        assert _guards_group(batch)["body"]["level"] == "WARNING"
+
+    def test_failed_status_guard_is_warning(self) -> None:
+        batch = build_batch(self._guarded_tool(status="failure"), SPOKE)
+
+        assert _by_orig(batch, "tr", "h1")["body"]["level"] == "WARNING"
+        assert _guards_group(batch)["body"]["level"] == "WARNING"
+
+    @pytest.mark.parametrize("decision", ["ask", "block"])
+    def test_ask_and_block_guard_decisions_are_warning(self, decision: str) -> None:
+        batch = build_batch(self._guarded_tool(decision=decision), SPOKE)
+
+        assert _by_orig(batch, "tr", "h1")["body"]["level"] == "WARNING"
+        assert _guards_group(batch)["body"]["level"] == "WARNING"
+
+    def test_allow_success_guard_is_not_warning(self) -> None:
+        # A kept-but-benign guard (slow allow/success) must not be flagged.
+        batch = build_batch(self._guarded_tool(), SPOKE, keep_noop_guards=True)
+
+        assert _by_orig(batch, "tr", "h1")["body"].get("level") != "WARNING"
+        assert _guards_group(batch)["body"].get("level") != "WARNING"
+
+    def test_hook_event_num_blocking_is_warning(self) -> None:
+        interaction = _obs("i1", "claude_code.interaction", parent=None)
+        tool = _obs(
+            "t1", "tool:Edit", parent="i1", metadata={"attributes": {"tool_use_id": "tu-1"}}
+        )
+        hook = _obs(
+            "h1",
+            "hook_execution_complete:PreToolUse",
+            type_="EVENT",
+            parent=None,
+            startTime="2026-01-02T00:00:01Z",
+            metadata={"tool_use_id": "tu-1", "num_blocking": 1},
+        )
+
+        batch = build_batch([("tr", [interaction, tool, hook])], SPOKE)
+
+        assert _by_orig(batch, "tr", "h1")["body"]["level"] == "WARNING"
+
+    def test_non_blocking_hook_event_is_not_warning(self) -> None:
+        interaction = _obs("i1", "claude_code.interaction", parent=None)
+        tool = _obs(
+            "t1", "tool:Edit", parent="i1", metadata={"attributes": {"tool_use_id": "tu-1"}}
+        )
+        hook = _obs(
+            "h1",
+            "hook_execution_complete:PreToolUse",
+            type_="EVENT",
+            parent=None,
+            startTime="2026-01-02T00:00:01Z",
+            metadata={"tool_use_id": "tu-1", "num_blocking": 0},
+        )
+
+        batch = build_batch([("tr", [interaction, tool, hook])], SPOKE)
+
+        assert _by_orig(batch, "tr", "h1")["body"].get("level") != "WARNING"

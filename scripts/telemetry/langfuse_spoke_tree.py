@@ -39,23 +39,24 @@ Re-parenting rules for each source observation:
 - It had a ``parentObservationId`` -> the copy points at the copy of that parent.
 - It was a trace-root interaction / marker / lifecycle / script -> the synthetic root.
 - It was a trace-root satellite of a tool call -> the copy of the tool whose
-  ``tool_use_id`` matches the satellite's; or, when the satellite names a tool that produced
-  no span (the tool was denied/cancelled), its enclosing ``claude_code.interaction`` —
-  by ``prompt.id``, falling back to ``[start,end]`` window containment (#110,
-  :func:`_enclosing_turn`); only a satellite naming no tool (no ``tool_use_id``) or one with
-  no enclosing turn at all reaches the synthetic root. A satellite is a gate hook (name ends
-  ``.sh`` or ``metadata.attributes.workflow.kind == hook``) or a #93 tool-scoped audit event
-  (``tool_result``, minted on the per-spoke audit trace with its ``tool_use_id`` in flat
-  metadata). (Langfuse nests OTel span attributes under ``metadata["attributes"]``; the audit
-  events carry their id at the metadata top level.)
+  ``tool_use_id`` matches the satellite's; or, when the satellite names a tool that produced no
+  span (the tool was denied/cancelled), a synthesized ``blocked-tool:<Name>`` node standing in
+  for that missing call (#157, :func:`_synthesize_blocked_tools`) — itself parented to the
+  enclosing ``claude_code.interaction`` by ``prompt.id``, falling back to ``[start,end]`` window
+  containment (#110, :func:`_enclosing_turn`), reaching the synthetic root only when no turn
+  encloses it. Only a satellite naming no tool (no ``tool_use_id``) reaches the root directly. A
+  satellite is a gate hook (name ends ``.sh`` or ``metadata.attributes.workflow.kind == hook``)
+  or a #93 tool-scoped audit event (``tool_result``, minted on the per-spoke audit trace with its
+  ``tool_use_id`` in flat metadata). (Langfuse nests OTel span attributes under
+  ``metadata["attributes"]``; the audit events carry their id at the metadata top level.)
 
 Three native 1:1 sub-spans do NOT nest — they FOLD into their tool's metadata and their nodes
 are dropped (#100, :func:`_fold_tool_subspans`): ``claude_code.tool.execution`` ->
 ``execution_ms``/``success``/``error``, ``claude_code.tool.blocked_on_user`` ->
 ``blocked_on_user_ms``/``decision``/``decision_source``, and the ``tool_decision:<d>`` audit
 event -> ``decision``/``decision_source``. An unmatched ``tool_decision`` (the tool was
-denied/cancelled, so no span) keeps its node and re-homes to its enclosing turn by ``prompt.id``
-(#110), reaching the root only when no turn encloses it.
+denied/cancelled, so no span) folds onto the synthesized ``blocked-tool`` node that stands in for
+the missing call (#157), supplying its ``decision`` (deny/ask); its own node is dropped.
 
 The same session also carries the ``spoke-audit:`` trace's span-less audit/lifecycle events
 (#93). They are folded in here too (#104), placed by CAUSAL id-join — never by their lagging
@@ -138,7 +139,7 @@ import sys
 import time
 import urllib.parse
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
@@ -224,7 +225,9 @@ _CHUNK_SIZE = 100
 
 # Builder generation stamped into both trace-create bodies (#156) so a consumer can tell
 # which builder produced a stored view. Bump on any change to the assembled view shape.
-_SCHEMA_REV = 1
+# rev 2 (#157): guards / guards:session group nodes, blocked-tool:* synthesis, hook endTime
+# stamping, and WARNING/ERROR failure levels.
+_SCHEMA_REV = 2
 
 # --rebuild purge poll (#156): a bulk trace delete is asynchronous on the Langfuse server,
 # so after issuing it we poll the session listing until both view traces are gone before
@@ -260,6 +263,51 @@ _TOOL_AUDIT_EVENT_PREFIXES = ("tool_decision", "tool_result", "hook_execution_co
 _FOLD_EXECUTION_NAME = "claude_code.tool.execution"
 _FOLD_BLOCKED_NAME = "claude_code.tool.blocked_on_user"
 _FOLD_DECISION_PREFIX = "tool_decision"
+
+# Guard-group nodes (#157). Every ``.sh`` guard span that joins a tool (or the root) is
+# collapsed under one synthetic ``guards`` group (``guards:session`` at the root) carrying a
+# ``by_hook`` rollup over ALL raw guards; a no-op guard (``decision=allow`` ∧
+# ``status=success`` ∧ ``duration_ms < _GUARD_NOOP_MAX_MS``) is dropped by default and kept
+# only under ``--keep-noop-guards``. The group's own hook-bucket time is the summed raw guard
+# duration (``total_ms``), not its min…max envelope, so the root's ``hook`` bucket reflects
+# real guard cost and the keep-noop drop leaves ``rollup.duration.components`` unchanged.
+_GUARDS_NAME = "guards"
+_GUARDS_SESSION_NAME = "guards:session"
+_GUARDS_PREFIX = "tree-guards-"
+_GUARD_NOOP_MAX_MS = 1000
+
+# Blocked-tool synthesis (#157). A ``tool_use_id`` that appears only on satellites (hooks /
+# tool-scoped audit events) and never on a real ``tool:`` span is a denied / never-run call; it
+# gets one synthesized ``blocked-tool:<Name>`` node (level WARNING, no usageDetails/model) so its
+# satellites nest under a real parent instead of dangling on the turn. The ``blocked-tool:``
+# prefix (never ``tool:``) keeps it out of tool-latency metrics.
+_BLOCKED_TOOL_PREFIX = "tree-blocked-"
+_BLOCKED_TOOL_NAME_PREFIX = "blocked-tool:"
+_BLOCKED_TOOL_UNKNOWN = "unknown"
+# hook_execution_complete endTime stamping (#157). These events carry total_duration_ms but no
+# endTime; stamping ``endTime = startTime + total_duration_ms`` gives them a width, and
+# ``time_source: lagging`` flags that the width is derived, not observed. That duration duplicates
+# the ``.sh`` spans already booked in the ``hook`` bucket, so the stamped events are EXCLUDED from
+# duration attribution (:func:`_hook_event_exclude`) — the components stay identical to the
+# pre-stamp (zero-width) shape.
+_HOOK_EXECUTION_PREFIX = "hook_execution_complete"
+_TOTAL_DURATION_KEY = "total_duration_ms"
+_TIME_SOURCE_KEY = "time_source"
+_TIME_SOURCE_LAGGING = "lagging"
+
+# Failure levels (#157). The native trace is all ``level=DEFAULT`` even though the failure data is
+# already folded onto tools; :func:`_apply_levels` maps it: a failed/errored tool -> ERROR; a
+# non-allow / failed guard (span + its group), a blocking ``hook_execution_complete``, and a
+# synthesized blocked-tool -> WARNING (precedence ERROR > WARNING > DEFAULT).
+_LEVEL_ERROR = "ERROR"
+_LEVEL_WARNING = "WARNING"
+_STATUS_SUCCESS = "success"
+_GUARD_WARN_DECISIONS = ("deny", "ask", "block")
+_NUM_BLOCKING_KEY = "num_blocking"
+# Attribute keys naming the blocked tool, in priority order (bare tool name, then the
+# ``<HookEvent>:<Tool>`` hook name whose suffix is the tool).
+_TOOL_NAME_KEYS = ("tool_name", "gen_ai.tool.name")
+_HOOK_NAME_KEY = "hook_name"
 
 # Span-less session-startup audit instants (#104). They ride the OTel logs signal, so their
 # observation ``startTime`` is the LAGGING flush time, never the true event time; placing them
@@ -402,6 +450,16 @@ def _copy_id(orig_trace_id: str, orig_obs_id: str) -> str:
     """Return the deterministic copy id for a source observation in the assembled trace."""
     digest = hashlib.sha1(f"{orig_trace_id}:{orig_obs_id}".encode()).hexdigest()[:24]
     return _COPY_PREFIX + digest
+
+
+def _guards_id(parent_id: str) -> str:
+    """Return the deterministic id of the ``guards`` group under ``parent_id`` (a tool / root)."""
+    return _GUARDS_PREFIX + hashlib.sha1(parent_id.encode()).hexdigest()[:24]
+
+
+def _blocked_tool_id(tool_use_id: str) -> str:
+    """Return the deterministic id of the ``blocked-tool:*`` node synthesized for a tool-call id."""
+    return _BLOCKED_TOOL_PREFIX + hashlib.sha1(tool_use_id.encode()).hexdigest()[:24]
 
 
 def cycle_trace_id_for(spoke_run_id: str) -> str:
@@ -700,6 +758,233 @@ def _fold_tool_subspans(
     return [event for event in copies if event["body"]["id"] not in reparent]
 
 
+def _guard_noop(body: Observation) -> bool:
+    """Whether a guard span is a droppable no-op: ``decision=allow`` ∧ ``status=success`` ∧ <1s."""
+    ms = _duration_ms(body)
+    return (
+        _attr(body, "decision") == "allow"
+        and _attr(body, "status") == "success"
+        and ms is not None
+        and ms < _GUARD_NOOP_MAX_MS
+    )
+
+
+def _guard_group_metadata(members: list[IngestEvent]) -> dict[str, Any]:
+    """Return a guards group's rollup over ALL its raw guard spans (before any are dropped).
+
+    ``by_hook`` keys are sorted and ``decisions`` de-duplicated + sorted so the group body is
+    byte-stable across reruns; ``count`` / ``total_ms`` / per-hook ``ms`` sum every member,
+    including the no-op spans dropped from the tree (#157 AC1).
+    """
+    by_hook: dict[str, dict[str, int]] = {}
+    total_ms = 0
+    decisions: set[str] = set()
+    for member in members:
+        body = member["body"]
+        name = body.get("name") or ""
+        ms = _duration_ms(body) or 0
+        entry = by_hook.setdefault(name, {"count": 0, "ms": 0})
+        entry["count"] += 1
+        entry["ms"] += ms
+        total_ms += ms
+        decision = _attr(body, "decision")
+        if decision is not None:
+            decisions.add(str(decision))
+    return {
+        "count": len(members),
+        "total_ms": total_ms,
+        "by_hook": {name: by_hook[name] for name in sorted(by_hook)},
+        "decisions": sorted(decisions),
+    }
+
+
+def _guard_envelope(members: list[IngestEvent]) -> tuple[str | None, str | None]:
+    """Return the (min start, max end) ISO bounds over the guard members, chronologically."""
+    return _obs_envelope([member["body"] for member in members])
+
+
+def _guard_group_event(
+    parent_id: str, members: list[IngestEvent], *, trace_id: str, root_id: str
+) -> IngestEvent:
+    """Build the synthetic ``guards`` / ``guards:session`` group node for one parent's guards."""
+    group_id = _guards_id(parent_id)
+    name = _GUARDS_SESSION_NAME if parent_id == root_id else _GUARDS_NAME
+    start, end = _guard_envelope(members)
+    body: dict[str, Any] = {
+        "id": group_id,
+        "traceId": trace_id,
+        "parentObservationId": parent_id,
+        "name": name,
+        "startTime": start or _INGEST_TIMESTAMP,
+        "endTime": end,
+        "metadata": _guard_group_metadata(members),
+    }
+    if any(_guard_warns(member["body"]) for member in members):
+        body["level"] = _LEVEL_WARNING  # a non-allow / failed guard flags its whole group (#157)
+    return {
+        "id": group_id,
+        "type": "span-create",
+        "timestamp": start or _INGEST_TIMESTAMP,
+        "body": body,
+    }
+
+
+def _apply_guard_groups(
+    copies: list[IngestEvent],
+    *,
+    trace_id: str,
+    root_id: str,
+    tool_owner_ids: set[str],
+    keep_noop_guards: bool,
+) -> list[IngestEvent]:
+    """Collapse each tool's (and the session's) ``.sh`` guard copies under a ``guards`` group (#157).
+
+    A guard copy (:func:`_is_hook`) whose resolved parent is a tool owner or the synthetic root is
+    re-homed under a synthesized ``guards`` group (``guards:session`` at the root) parented where
+    the guard sat. No-op guards (:func:`_guard_noop`) are dropped unless ``keep_noop_guards``; the
+    survivors keep their nodes under the group. Guards resolved under anything else (e.g. an
+    interaction) and non-guard satellites are left untouched. The group's ``by_hook`` rollup counts
+    every raw guard including the dropped ones (:func:`_guard_group_metadata`).
+
+    Args:
+        copies: The assembled copies; guard copies are re-parented or dropped in place.
+        trace_id: The assembled trace id every group node references.
+        root_id: The synthetic root id (host of the ``guards:session`` group).
+        tool_owner_ids: Copy ids that own a tool call (real tool spans + synthesized blocked-tools).
+        keep_noop_guards: When True, no-op guards are retained under their group instead of dropped.
+
+    Returns:
+        The copies with grouped guards re-parented, no-ops dropped, and group nodes appended.
+    """
+    grouped: dict[str, list[IngestEvent]] = {}
+    for event in copies:
+        body = event["body"]
+        if not _is_hook(body):
+            continue
+        parent = body.get("parentObservationId")
+        if parent in tool_owner_ids or parent == root_id:
+            grouped.setdefault(parent, []).append(event)
+    if not grouped:
+        return copies
+    dropped: set[str] = set()
+    group_events: list[IngestEvent] = []
+    for parent_id, members in grouped.items():
+        group = _guard_group_event(parent_id, members, trace_id=trace_id, root_id=root_id)
+        group_events.append(group)
+        for member in members:
+            if not keep_noop_guards and _guard_noop(member["body"]):
+                dropped.add(member["body"]["id"])
+            else:
+                member["body"]["parentObservationId"] = group["body"]["id"]
+    kept = [event for event in copies if event["body"]["id"] not in dropped]
+    return kept + group_events
+
+
+def _is_guards_group(body: Observation | None) -> bool:
+    """Whether a node is a synthesized ``guards`` / ``guards:session`` group (#157)."""
+    return bool(body) and (body.get("name") in (_GUARDS_NAME, _GUARDS_SESSION_NAME))
+
+
+def _is_blocked_tool(body: Observation | None) -> bool:
+    """Whether a node is a synthesized ``blocked-tool:*`` node (#157)."""
+    return bool(body) and (body.get("name") or "").startswith(_BLOCKED_TOOL_NAME_PREFIX)
+
+
+def _is_hook_event(body: Observation | None) -> bool:
+    """Whether a node is a ``hook_execution_complete`` audit event (#157)."""
+    return bool(body) and (body.get("name") or "").startswith(_HOOK_EXECUTION_PREFIX)
+
+
+def _stamp_hook_endtimes(copies: list[IngestEvent]) -> list[IngestEvent]:
+    """Give each ``hook_execution_complete`` copy a derived endTime from ``total_duration_ms`` (#157).
+
+    A hook event carries ``total_duration_ms`` but no ``endTime``; set ``endTime = startTime +
+    total_duration_ms`` and ``metadata.time_source = "lagging"`` so the timeline can render its
+    width while flagging it as derived. Events missing a start or ``total_duration_ms`` are left
+    untouched. Mutates the bodies in place and returns ``copies``.
+    """
+    for event in copies:
+        body = event["body"]
+        if not _is_hook_event(body) or body.get("endTime"):
+            continue
+        start = body.get("startTime")
+        total = _attr(body, _TOTAL_DURATION_KEY)
+        # UPGRADE: accept only a native numeric counter; a numeric-string total_duration_ms would
+        # be skipped (left zero-width). Coerce here if a future emission path ever stringifies it.
+        if not start or not isinstance(total, (int, float)):
+            continue
+        parsed = _parse_utc(start)
+        if parsed is None:
+            continue
+        end = parsed + timedelta(milliseconds=total)
+        # metadata is aliased from the source observation (copied via _COPIED_FIELDS), so this
+        # writes time_source back onto the source dict too — intentional and inert (time_source is
+        # never read; the write is idempotent), matching the module's other in-place patterns.
+        body["endTime"] = end.isoformat().replace("+00:00", "Z")
+        body.setdefault("metadata", {})[_TIME_SOURCE_KEY] = _TIME_SOURCE_LAGGING
+    return copies
+
+
+def _hook_event_exclude(events: list[IngestEvent]) -> set[str]:
+    """Return the ids of ``hook_execution_complete`` nodes to drop from duration attribution (#157).
+
+    Their stamped width (:func:`_stamp_hook_endtimes`) duplicates the ``.sh`` guard durations
+    already booked in the ``hook`` bucket, so they must contribute nothing to ``rollup.duration``.
+    Name-based, so it resolves the same ids in either view's id namespace.
+    """
+    return {
+        event["body"]["id"]
+        for event in events
+        if event["type"] != "trace-create" and _is_hook_event(event["body"])
+    }
+
+
+def _guard_warns(body: Observation) -> bool:
+    """Whether a guard span is failure-worthy: a deny/ask/block decision or a non-success status."""
+    decision = _attr(body, "decision")
+    status = _attr(body, "status")
+    return decision in _GUARD_WARN_DECISIONS or (status is not None and status != _STATUS_SUCCESS)
+
+
+def _level_for(body: Observation) -> str | None:
+    """Return the failure level (:data:`_LEVEL_ERROR` / :data:`_LEVEL_WARNING`) for a node, or None.
+
+    ERROR for a tool whose folded metadata shows ``success is False`` or an ``error``; WARNING for a
+    failure-worthy guard span (:func:`_guard_warns`), a synthesized blocked-tool node, or a
+    ``hook_execution_complete`` with ``num_blocking > 0``. Each node matches at most one rule, so
+    the ERROR > WARNING precedence needs no explicit tie-break. The guards GROUP's level is set at
+    build time (:func:`_apply_guard_groups`) from its raw members, not here.
+    """
+    if _is_tool_span(body):
+        metadata = body.get("metadata") or {}
+        if metadata.get("success") is False or metadata.get("error"):
+            return _LEVEL_ERROR
+        return None
+    if _is_blocked_tool(body):
+        return _LEVEL_WARNING
+    if _is_hook(body):
+        return _LEVEL_WARNING if _guard_warns(body) else None
+    if _is_hook_event(body):
+        num = _attr(body, _NUM_BLOCKING_KEY)
+        return _LEVEL_WARNING if isinstance(num, (int, float)) and num > 0 else None
+    return None
+
+
+def _apply_levels(copies: list[IngestEvent]) -> list[IngestEvent]:
+    """Stamp WARNING/ERROR failure levels onto the assembled nodes in place (#157, :func:`_level_for`)."""
+    for event in copies:
+        level = _level_for(event["body"])
+        if level:
+            event["body"]["level"] = level
+    return copies
+
+
+def _guards_total_ms(body: Observation) -> int:
+    """Return a guards group's summed raw guard duration from its metadata (0 if malformed)."""
+    total = (body.get("metadata") or {}).get("total_ms")
+    return total if isinstance(total, int) else 0
+
+
 def _build_tool_index(traces: list[TraceObservations]) -> dict[str, str]:
     """Map each tool-call id to the copy id of the tool observation that owns it.
 
@@ -823,6 +1108,92 @@ def _enclosing_turn(observation: Observation, index: InteractionIndex) -> str | 
         ):
             chosen = window
     return chosen[2] if chosen else None
+
+
+def _blocked_tool_name(satellites: list[Observation]) -> str:
+    """Return the blocked tool's name: a ``tool_name`` attr, else a ``hook_name`` suffix, else unknown."""
+    for satellite in satellites:
+        name = _attr(satellite, *_TOOL_NAME_KEYS)
+        if name:
+            return str(name)
+    for satellite in satellites:
+        hook_name = _attr(satellite, _HOOK_NAME_KEY)
+        if hook_name and ":" in str(hook_name):
+            return str(hook_name).split(":", 1)[1]
+    return _BLOCKED_TOOL_UNKNOWN
+
+
+def _obs_envelope(observations: list[Observation]) -> tuple[str | None, str | None]:
+    """Return the (min start, max end) ISO bounds over ``observations``, chronologically."""
+    starts = [o["startTime"] for o in observations if o.get("startTime")]
+    ends = [o["endTime"] for o in observations if o.get("endTime")]
+    start = min(starts, key=lambda s: _parse_utc(s) or datetime.min) if starts else None
+    end = max(ends, key=lambda s: _parse_utc(s) or datetime.min) if ends else None
+    return start, end
+
+
+def _synthesize_blocked_tools(
+    traces: list[TraceObservations],
+    *,
+    tool_index: dict[str, str],
+    interaction_index: InteractionIndex,
+    trace_id: str,
+    root_id: str,
+) -> tuple[list[IngestEvent], dict[str, str]]:
+    """Synthesize a ``blocked-tool:<Name>`` node per orphaned tool-call id (#157).
+
+    An orphaned id is one carried by a satellite (:func:`_joins_under_tool`) but owned by no
+    ``tool:`` span (:func:`_build_tool_index`). Each becomes one WARNING ``blocked-tool:`` node
+    parented to its enclosing turn (:func:`_enclosing_turn`, else the root), spanning its
+    satellites' time envelope and carrying no usageDetails/model. The returned index maps each
+    orphaned id to its node so the copy pass and fold re-home the satellites onto it.
+
+    Args:
+        traces: The source traces paired with their observations.
+        tool_index: Real-tool ownership map (an id present here is NOT orphaned).
+        interaction_index: Enclosing-turn lookup for parenting the synthesized node.
+        trace_id: The assembled trace id every synthesized node references.
+        root_id: The synthetic root id (parent when no enclosing turn resolves).
+
+    Returns:
+        ``(events, index)``: the synthesized ``span-create`` events and the orphaned-id → node-id map.
+    """
+    by_tuid: dict[str, list[Observation]] = {}
+    for _orig_trace_id, observations in traces:
+        for observation in observations:
+            if not _joins_under_tool(observation):
+                continue
+            tuid = _tool_use_id(observation)
+            if tuid and tuid not in tool_index:
+                by_tuid.setdefault(tuid, []).append(observation)
+    events: list[IngestEvent] = []
+    index: dict[str, str] = {}
+    for tuid, satellites in by_tuid.items():
+        node_id = _blocked_tool_id(tuid)
+        parent = next(
+            (turn for s in satellites if (turn := _enclosing_turn(s, interaction_index))), root_id
+        )
+        start, end = _obs_envelope(satellites)
+        body: dict[str, Any] = {
+            "id": node_id,
+            "traceId": trace_id,
+            "parentObservationId": parent,
+            "name": _BLOCKED_TOOL_NAME_PREFIX + _blocked_tool_name(satellites),
+            "startTime": start or _INGEST_TIMESTAMP,
+            "endTime": end,
+            "metadata": {"synthesized": True, "tool_use_id": tuid},
+        }
+        # level WARNING is stamped centrally by _apply_levels (#157), like every other node.
+        events.append(
+            {
+                "id": node_id,
+                "type": "span-create",
+                "timestamp": start or _INGEST_TIMESTAMP,
+                "body": body,
+            }
+        )
+        index[tuid] = node_id
+    return events, index
 
 
 class SkillCandidate(NamedTuple):
@@ -988,9 +1359,12 @@ def _resolve_parent(
         tuid = _tool_use_id(observation)
         if tuid and tuid in tool_index:
             return tool_index[tuid]
-        # #110 AC1: the satellite named a tool that produced no span (denied/cancelled before
-        # execution). Re-home it to its enclosing turn rather than the synthetic root; a hook
-        # naming no tool (SessionStart/Stop) has no tuid and still falls through to the root.
+        # #110 AC1 / #157: a satellite naming a tool that produced no span (denied/cancelled) is
+        # normally already resolved above — #157 synthesizes a blocked-tool node for every such
+        # orphaned tuid and augments tool_index, so the branch above catches it. This is a
+        # defensive fallback (re-home to the enclosing turn) kept for depth in case a satellite's
+        # tuid ever escapes synthesis; a hook naming no tool (SessionStart/Stop) has no tuid and
+        # still falls through to the root.
         if tuid:
             turn = _enclosing_turn(observation, interaction_index)
             if turn is not None:
@@ -1184,7 +1558,7 @@ def _duration_class(event: IngestEvent) -> str:
         return "turn"
     if name.startswith("script:") or _attr(body, "workflow.kind") == "script":
         return "script"
-    if _is_hook(body):
+    if _is_guards_group(body) or _is_hook(body):
         return "hook"
     if _is_tool_span(body):
         return "tool"
@@ -1306,13 +1680,34 @@ def _duration_rollup(
     def visit(node_id: str) -> None:
         kids = [kid for kid in children.get(node_id, []) if kid not in exclude]
         own = intervals.get(node_id)
-        covered = _union_ms([intervals.get(kid) for kid in kids], clip=own) if own else 0
+        # A guards-group child covers only its summed RAW guard time (``total_ms``), never its
+        # min…max envelope (#157): the envelope brackets the tool's own execution, so unioning it
+        # would erase that execution from the tool's exclusive time. Plain children union by
+        # interval as before.
+        # UPGRADE: guard_cover is summed as a scalar, so when a guard's real interval overlaps a
+        # PLAIN sibling (a mid-turn Notification/Stop hook over its turn, a gate over an
+        # llm_request under a sub-agent) that overlap is counted in both terms and the container's
+        # own gap bucket is under-reported by the overlap — bounded (guards are short), never
+        # inflating, and sum(components)==total still holds. Switch to unioning the group's real
+        # member intervals into the parent if per-bucket gap exactness ever matters.
+        guard_cover = sum(
+            _guards_total_ms(by_id[kid]) for kid in kids if _is_guards_group(by_id.get(kid))
+        )
+        plain = [kid for kid in kids if not _is_guards_group(by_id.get(kid))]
+        union = _union_ms([intervals.get(kid) for kid in plain], clip=own) if own else 0
+        covered = min(_interval_ms(own), union + guard_cover)
         exclusive = max(0, _interval_ms(own) - covered)
         bucket = "self" if node_id == root_id else class_of.get(node_id, "other")
         if bucket == "tool":
             wait = min(exclusive, _blocked_ms(by_id[node_id]))
             components["wait"] += wait
             components["tool"] += exclusive - wait
+        elif _is_guards_group(by_id.get(node_id)):
+            # The group books its RAW guard time minus the slice its surviving children already
+            # book, so root's ``hook`` bucket is real guard cost and dropping no-op guards leaves
+            # the components unchanged.
+            kept = sum(_interval_ms(intervals.get(kid)) for kid in kids)
+            components["hook"] += max(0, _guards_total_ms(by_id[node_id]) - kept)
         else:
             components[bucket] += exclusive
         for kid in kids:
@@ -1764,6 +2159,8 @@ def build_batch(
     traces: list[TraceObservations],
     spoke_run_id: str,
     tool_content: dict[str, ToolContent] | None = None,
+    *,
+    keep_noop_guards: bool = False,
 ) -> list[IngestEvent]:
     """Assemble one nested trace from a spoke's source traces and their observations.
 
@@ -1819,13 +2216,18 @@ def build_batch(
         },
     }
     copies = _assemble_copies(
-        traces, trace_id=trace_id, root_id=root_id, tool_content=tool_content, root_event=root_event
+        traces,
+        trace_id=trace_id,
+        root_id=root_id,
+        tool_content=tool_content,
+        root_event=root_event,
+        keep_noop_guards=keep_noop_guards,
     )
     step_events = _apply_step_grouping(
         copies, traces, tool_content, spoke_run_id=spoke_run_id, trace_id=trace_id
     )
     events = [trace_event, root_event, *step_events, *copies]
-    _apply_container_rollups(events)
+    _apply_container_rollups(events, duration_exclude=_hook_event_exclude(events))
     return events
 
 
@@ -1836,13 +2238,19 @@ def _assemble_copies(
     root_id: str,
     tool_content: dict[str, ToolContent],
     root_event: IngestEvent,
+    keep_noop_guards: bool = False,
 ) -> list[IngestEvent]:
     """Build the re-parented, folded, startup-collapsed observation copies both views share.
 
     Re-parents every source observation across the original trace boundaries
     (:func:`_resolve_parent`), grafts transcript content into the create body
-    (:func:`_copy_event`), folds the three 1:1 tool sub-spans (:func:`_fold_tool_subspans`), and
-    demotes session-startup instants onto ``root_event``'s metadata
+    (:func:`_copy_event`), synthesizes a ``blocked-tool:`` node per orphaned tool-call id so its
+    satellites nest under it (:func:`_synthesize_blocked_tools`), folds the three 1:1 tool
+    sub-spans (:func:`_fold_tool_subspans`), collapses each tool's / the session's ``.sh`` guard
+    spans under a ``guards`` group and drops the no-op ones unless ``keep_noop_guards``
+    (:func:`_apply_guard_groups`), stamps a lagging ``endTime`` onto ``hook_execution_complete``
+    events (:func:`_stamp_hook_endtimes`), stamps WARNING/ERROR failure levels
+    (:func:`_apply_levels`), and demotes session-startup instants onto ``root_event``'s metadata
     (:func:`_collapse_startup_instants`). View A wraps these in local step nodes; View B re-homes
     them onto the cycle axis. ``root_event`` is the view's own synthetic root (its metadata is
     mutated in place).
@@ -1851,6 +2259,16 @@ def _assemble_copies(
     request_index = _build_request_index(traces)
     interaction_index = _build_interaction_index(traces)
     skill_index = _build_skill_index(traces, tool_content)
+    blocked_events, blocked_index = _synthesize_blocked_tools(
+        traces,
+        tool_index=tool_index,
+        interaction_index=interaction_index,
+        trace_id=trace_id,
+        root_id=root_id,
+    )
+    # A blocked-tool node owns its orphaned id like a real tool, so its satellites join it in the
+    # copy pass (via _resolve_parent) and its tool_decision folds onto it (via _fold_tool_subspans).
+    tool_index = {**tool_index, **blocked_index}
     copies: list[IngestEvent] = []
     for orig_trace_id, observations in traces:
         for observation in observations:
@@ -1872,7 +2290,17 @@ def _assemble_copies(
                     tool_content=tool_content,
                 )
             )
+    copies.extend(blocked_events)
     copies = _fold_tool_subspans(copies, traces, tool_index)
+    copies = _apply_guard_groups(
+        copies,
+        trace_id=trace_id,
+        root_id=root_id,
+        tool_owner_ids=set(tool_index.values()),
+        keep_noop_guards=keep_noop_guards,
+    )
+    copies = _stamp_hook_endtimes(copies)
+    copies = _apply_levels(copies)
     return _collapse_startup_instants(copies, root_event)
 
 
@@ -1982,15 +2410,16 @@ def _resolve_cycle_parent(
     A copy whose View A parent is a surviving span (a tool, llm_request, sub-agent, or nested
     interaction) keeps that parent (rides along by causal key). A copy left at the synthetic root
     or under a flattened top-level interaction lands on the cycle axis: a reliably-timestamped span
-    by its own ``startTime``, an audit instant by its turn's start (never its lagging own time),
-    falling back to ``preStep``. The flattened top-level interaction marker itself is just such a
-    reliably-timestamped span (parent is the root), so it lands in the step window of its own start.
+    by its own ``startTime``, an audit instant OR a synthesized ``blocked-tool`` node (whose own
+    start is derived from lagging audit timestamps, #157) by its turn's start, falling back to
+    ``preStep``. The flattened top-level interaction marker itself is just such a reliably-
+    timestamped span (parent is the root), so it lands in the step window of its own start.
     """
     if parent_a != a_root_id and parent_a not in flattened and parent_a in by_id_a:
         return _cycle_copy_id(parent_a)
     if not windows:
         return root_id  # no ledger -> no cycle axis; copies hang flat under the cycle root
-    if _is_audit_instant(body) or not body.get("startTime"):
+    if _is_audit_instant(body) or _is_blocked_tool(body) or not body.get("startTime"):
         anchor = interaction_start.get(parent_a)
         key = _cycle_step_for(anchor, windows) if anchor else _PRE_STEP_KEY
     else:
@@ -2052,7 +2481,10 @@ def _apply_cycle_axis(
     a_bodies = [event["body"] for event in copies]
     a_by_id, a_children = build_tree(a_bodies)
     a_class = {event["body"]["id"]: _duration_class(event) for event in copies}
-    a_intervals = _effective_intervals(a_bodies, a_children, frozenset())
+    # Exclude the stamped hook events from the per-turn rollup too (#157) — their derived width
+    # duplicates the guard time already in the ``hook`` bucket, exactly as for the container rollups.
+    hook_exclude = _hook_event_exclude(copies)
+    a_intervals = _effective_intervals(a_bodies, a_children, hook_exclude)
     turn_rollup = {
         iid: _container_rollup(
             iid,
@@ -2060,7 +2492,7 @@ def _apply_cycle_axis(
             children=a_children,
             class_of=a_class,
             intervals=a_intervals,
-            exclude=frozenset(),
+            exclude=hook_exclude,
         )
         for iid in flattened
     }
@@ -2094,6 +2526,8 @@ def build_cycle_batch(
     traces: list[TraceObservations],
     spoke_run_id: str,
     tool_content: dict[str, ToolContent] | None = None,
+    *,
+    keep_noop_guards: bool = False,
 ) -> list[IngestEvent]:
     """Assemble the View B (steps -> work) ``spokecycle-<spoke>`` trace (#113).
 
@@ -2161,6 +2595,7 @@ def build_cycle_batch(
         root_id=a_root_id,
         tool_content=tool_content,
         root_event=root_event,
+        keep_noop_guards=keep_noop_guards,
     )
     windows = build_step_windows(traces, tool_content)
     copies, step_events, marker_ids = _apply_cycle_axis(
@@ -2175,7 +2610,7 @@ def build_cycle_batch(
         latest=_latest_time(traces),
     )
     events = [trace_event, root_event, *step_events, *copies]
-    _apply_container_rollups(events, duration_exclude=marker_ids)
+    _apply_container_rollups(events, duration_exclude=marker_ids | _hook_event_exclude(events))
     return events
 
 
@@ -3105,6 +3540,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "re-posting, so a view-shape change fully replaces stale span bodies (#156)."
         ),
     )
+    parser.add_argument(
+        "--keep-noop-guards",
+        action="store_true",
+        help=(
+            "Retain no-op guard spans (decision=allow, status=success, <1s) as children of their "
+            "guards group instead of dropping them; the per-hook rollup is unchanged either way "
+            "(#157)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -3133,8 +3577,12 @@ def main(argv: list[str] | None = None) -> int:
     traces = fetch_session(args.spoke_run_id, get)
     scan_root = transcript_scan_root(args.projects, args.root.resolve())
     tool_content = scan_transcripts(scan_root, _tool_span_ids(traces))
-    batch = build_batch(traces, args.spoke_run_id, tool_content)
-    cycle_batch = build_cycle_batch(traces, args.spoke_run_id, tool_content)
+    batch = build_batch(
+        traces, args.spoke_run_id, tool_content, keep_noop_guards=args.keep_noop_guards
+    )
+    cycle_batch = build_cycle_batch(
+        traces, args.spoke_run_id, tool_content, keep_noop_guards=args.keep_noop_guards
+    )
     mode, lane = read_mode_lane(args.root.resolve())
     apply_mode_lane_tags(batch, mode, lane)
     apply_mode_lane_tags(cycle_batch, mode, lane)
