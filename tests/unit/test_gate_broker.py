@@ -959,3 +959,230 @@ def test_decide_permission_logs_escalate_verdict(spoke_repo: Path, tmp_path: Pat
     )
     codify = _call("codify_decisions 2", env={"AFK_STATE_DIR": str(statedir)})
     assert "git-reset+git-add" not in codify.stdout, "a flag-dependent conflict must not codify"
+
+
+# ── issue #171: harden the answer path (freshness, timeouts, classifier gaps) ──
+
+
+# subtask 1: the reasoner is bounded so a hung headless claude never freezes the tick ──
+
+
+def test_run_answerer_wraps_answerer_in_timeout(spoke_repo: Path, tmp_path: Path) -> None:
+    # run_answerer must bound the reasoner: it invokes the timeout binary with the configured
+    # AFK_ANSWERER_TIMEOUT seconds, then the answerer. A fake `timeout` echoes the seconds it
+    # was handed and execs the rest, proving both the wrap and the seconds passthrough.
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+    fake_timeout = tmp_path / "fake-timeout"
+    fake_timeout.write_text('#!/usr/bin/env bash\necho "BOUND=$1"\nshift\nexec "$@"\n')
+    fake_timeout.chmod(0o755)
+
+    result = _call(
+        "run_answerer 5 'q'",
+        env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "AFK_TIMEOUT_BIN": str(fake_timeout),
+            "AFK_ANSWERER_TIMEOUT": "42",
+            "AFK_ANSWERER_CMD": "printf 'ANSWER: ok'",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "BOUND=42" in result.stdout, f"the reasoner must be wrapped in timeout: {result.stdout}"
+    assert "ANSWER: ok" in result.stdout, (
+        f"the answerer must still run under timeout: {result.stdout}"
+    )
+
+
+def test_broker_service_gate_escalates_when_answerer_times_out(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # A timed-out reasoner (the timeout binary exits 124 with no output) is a "no decision":
+    # the gate must escalate to blocked/<issue> — the existing fail-safe — never hang.
+    fake_timeout = tmp_path / "fake-timeout"
+    fake_timeout.write_text("#!/usr/bin/env bash\nexit 124\n")  # model expiry: kill, no output
+    fake_timeout.chmod(0o755)
+    env = {
+        **waiting_spoke_env,
+        "AFK_TIMEOUT_BIN": str(fake_timeout),
+        "AFK_ANSWERER_CMD": "printf 'ANSWER: should never run'",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    log = Path(env["_READY_LOG"]).read_text()
+    assert "--blocked 5" in log, f"a timed-out answerer must escalate: {log}"
+    assert "no decision" in log.lower(), log
+
+
+def test_run_answerer_perl_fallback_bounds_a_slow_answerer(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The macOS hub ships no coreutils `timeout`; run_answerer must still bound the reasoner
+    # via the perl(alarm) fallback so a hung headless claude never freezes the tick. Force the
+    # non-binary path (AFK_TIMEOUT_BIN="") and give a slow answerer a 1s budget: it is killed
+    # before it can print, and run_answerer returns nonzero (→ no decision → escalate).
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+
+    result = _call(
+        "run_answerer 5 'q'; echo RC=$?",
+        env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "AFK_TIMEOUT_BIN": "",  # no binary → exercise the perl(alarm) fallback
+            "AFK_ANSWERER_TIMEOUT": "1",
+            "AFK_ANSWERER_CMD": "sleep 5; printf 'ANSWER: too late'",
+        },
+    )
+
+    assert "too late" not in result.stdout, f"a slow answerer must be killed first: {result.stdout}"
+    assert result.stdout.strip().splitlines()[-1] != "RC=0", (
+        "a timed-out answerer must return nonzero"
+    )
+
+
+# subtask 2: a stale ESCALATE / no-decision must not strand an actively-working spoke ──
+
+
+def test_broker_service_gate_drops_escalation_when_spoke_moves_on(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The answerer takes minutes; if the spoke moved on meanwhile (a human replied, the turn
+    # resumed) an ESCALATE / no-decision must be DROPPED with a log, never stamped as a
+    # spurious blocked/<N> on an actively-working spoke. Model "moved on" by having the
+    # answerer advance the spoke's own transcript mid-reason, then escalate.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    jsonl.write_text(json.dumps(_ask_record("Which store?", [("Redis", "fast")])) + "\n")
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # pin old so the reasoner write advances it
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "SPOKE_READY": str(ready_stub),
+        # The reasoner bumps the spoke transcript (a human reply landed) then escalates.
+        "AFK_ANSWERER_CMD": f"printf '{{}}\\n' >> '{jsonl}'; printf 'ESCALATE: needs a human'",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    ready_text = ready_log.read_text() if ready_log.exists() else ""
+    assert "--blocked" not in ready_text, f"a moved-on spoke must not be escalated: {ready_text}"
+    assert "no longer parked" in result.stderr.lower(), result.stderr
+
+
+# subtask 3: blocked-at-tip over a still-parked spoke reads as waiting, not terminal ──
+
+
+def test_slot_state_blocked_at_tip_with_pending_question_is_waiting(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A spurious blocked/<N> over a spoke still parked on a question must NOT read as terminal
+    # 'done' (which stranded it — never re-answered, never reaped). With an extractable pending
+    # question it reads 'waiting' (re-answerable); reconcile clears the tag once commits land.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    (pd / "session.jsonl").write_text(
+        json.dumps(_ask_record("Which store?", [("Redis", "fast")])) + "\n"
+    )
+    subprocess.run(
+        ["git", "tag", "-f", "blocked/5"], cwd=spoke_repo, check=True, capture_output=True
+    )
+
+    result = _call(f"slot_state '{spoke_repo}' 5", env={"CLAUDE_PROJECTS_DIR": str(projects)})
+
+    assert result.stdout.strip() == "waiting", result.stdout + result.stderr
+
+
+def test_slot_state_blocked_at_tip_without_pending_stays_done(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The terminal reading is preserved when the spoke is NOT parked: a genuine blocked/<N>
+    # with no extractable question/permission is still 'done'.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    (pd / "session.jsonl").write_text(
+        json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}}
+        )
+        + "\n"
+    )
+    subprocess.run(
+        ["git", "tag", "-f", "blocked/5"], cwd=spoke_repo, check=True, capture_output=True
+    )
+
+    result = _call(f"slot_state '{spoke_repo}' 5", env={"CLAUDE_PROJECTS_DIR": str(projects)})
+
+    assert result.stdout.strip() == "done", result.stdout + result.stderr
+
+
+# subtask 4: the inject-verify budget default widened 20 -> 60 ──
+
+
+def test_inject_verify_default_budget_is_60(spoke_repo: Path, tmp_path: Path) -> None:
+    # A slow first token after submit must not read as "did not register" (which fed a false
+    # escalation #3 then made sticky). Drive _transcript_advanced against a transcript that
+    # never advances with an instant fake `sleep` that just counts calls: at poll=1 the loop
+    # sleeps `budget` times, so the default budget shows up as 60 one-second polls.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    jsonl.write_text("{}\n")
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    sleeps = fake_bin / "sleeps.log"
+    (fake_bin / "sleep").write_text(f'#!/usr/bin/env bash\necho x >> "{sleeps}"\nexit 0\n')
+    (fake_bin / "sleep").chmod(0o755)
+
+    result = _call(
+        f"_transcript_advanced '{spoke_repo}' 1000000000; echo RC=$?",
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "AFK_INJECT_POLL_SECONDS": "1",
+        },
+    )
+
+    assert result.stdout.strip().splitlines()[-1] == "RC=1", result.stdout + result.stderr
+    count = sleeps.read_text().count("x") if sleeps.exists() else 0
+    assert count == 60, f"default inject-verify budget must be 60s (60 one-second polls): {count}"
+
+
+# subtask 5: classify_permission tightening (find/-exec, chmod +x, bare pytest) ──
+
+
+@pytest.mark.parametrize(
+    "cmd,verdict",
+    [
+        ("find . -name foo -delete", "ESCALATE"),  # -delete can destroy files
+        ("find /tmp -type f -exec cat {} +", "ESCALATE"),  # -exec can spawn anything
+        ("find . -type f -name '*.py'", "APPROVE"),  # a read-only find is fine
+        ("chmod +x /usr/local/bin/tool", "ESCALATE"),  # absolute path escapes the worktree
+        ("chmod +x ./scripts/x.sh", "APPROVE"),  # relative self-op
+        ("chmod +x scripts/x.sh", "APPROVE"),
+        ("pytest", "ESCALATE"),  # a bare pytest is the full-suite ref-rewind hazard (#135)
+        ("python -m pytest", "ESCALATE"),
+        ("pytest tests/x.py", "APPROVE"),  # an argument scopes it
+        ("python3 -m pytest tests/unit", "APPROVE"),
+    ],
+)
+def test_classify_permission_tightened_cases(cmd: str, verdict: str) -> None:
+    result = _call('classify_permission "$CMD" | cut -f1', env={"CMD": cmd})
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == verdict, f"{cmd!r}: {result.stdout}"
