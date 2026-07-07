@@ -3236,6 +3236,26 @@ class TestRequestContextSubtree:
     def test_node_total_is_full_itemized_prefix(self) -> None:
         assert _only_node(self._build())["metadata"]["tokens"] == 440  # 120 + 40 + 200 + 80
 
+    def test_breakdown_surfaces_per_file_rules_and_per_skill_entries(self) -> None:
+        # Arrange: the turn-0 combined-block router (#159) yields rules/skills/environment rows.
+        rows = [
+            {"category": "rules", "name": "CLAUDE.md", "tokens": 300, "cost_usd": 0.3},
+            {"category": "rules", "name": "MEMORY.md", "tokens": 250, "cost_usd": 0.25},
+            {"category": "skills", "name": "afk", "tokens": 30, "cost_usd": 0.03},
+            {"category": "environment", "name": "environment", "tokens": 20, "cost_usd": 0.02},
+        ]
+
+        # Act: render the breakdown with the request-path category order.
+        node = build_loaded_context_events(
+            SPOKE, rows, category_order=_REQUEST_CATEGORY_ORDER, base_ts="2026-01-01T00:00:00Z"
+        )
+        breakdown = _only_node(node)["metadata"]["breakdown"]
+
+        # Assert: per-file rules and per-skill entries are itemized (previously invisible).
+        assert breakdown["rules"] == {"CLAUDE.md": 300, "MEMORY.md": 250}
+        assert breakdown["skills"] == {"afk": 30}
+        assert breakdown["environment"] == {"environment": 20}
+
 
 class TestRequestContextRows:
     """Sourcing rows from a per-spoke dir of raw request bodies."""

@@ -14,9 +14,9 @@ This module parses one such file into named :class:`ContextItem` entries:
   into ``tools``. The serialized schema is the text whose tokens are measured.
 - ``system[*]`` — one item per system block, labeled by position (billing header /
   identity preamble / base system prompt / tool-use + output prompt).
-- ``messages[0]`` — each ``<system-reminder>`` block, classified by kind
-  (session-start-hook / deferred-tools / agent-types / skills / rules+memory+env),
-  plus the residual user prompt; all in the ``context`` category.
+- ``messages[0]`` — each ``<system-reminder>`` block, routed through the combined-block
+  section router (:func:`_route_reminder`, #159) into per-file ``rules`` / per-skill
+  ``skills`` / ``environment`` / whole ``context`` items; plus the residual user prompt.
 
 It also records every ``cache_control`` prefix boundary (read directly, not
 inferred) and counts the deferred tools that are named-only in a reminder — their
@@ -97,8 +97,9 @@ class ContextItem:
     """One named, individually-sizable loaded-context entry from the request body.
 
     Attributes:
-        category: Section key — ``tools`` / ``mcp`` / ``system`` / ``context``.
-        name: Display name (tool name, system block label, or reminder kind).
+        category: Section key — ``tools`` / ``mcp`` / ``system`` / ``context``, plus the
+            combined-block router's ``rules`` / ``skills`` / ``environment`` (#159).
+        name: Display name (tool name, system block label, reminder kind, or split section).
         text: The exact source text whose tokens are measured.
         cached: Whether the entry lies within the cached prefix — at or before the last
             ``cache_control`` breakpoint, which is what the prompt cache actually reuses
@@ -148,7 +149,8 @@ class RequestBody:
     """The parsed loaded-context view of one ``.request.json`` dump.
 
     Attributes:
-        items: Every itemizable loaded-context entry (tools, system, context).
+        items: Every itemizable loaded-context entry (tools, system, context, and the
+            combined-block router's rules / skills / environment splits).
         cache_boundaries: The ``cache_control`` prefix breakpoints, in order.
         deferred_tool_count: Deferred tools named-only in a reminder (counted, not sized).
         model: The request's model id, when present.
@@ -262,11 +264,11 @@ def _message_items(
 ) -> tuple[list[ContextItem], list[CacheBoundary], int]:
     """Itemize ``messages[0]`` into reminder blocks + the residual prompt.
 
-    Each ``<system-reminder>`` is split out and classified; whatever text remains in a
-    block after the reminders are removed is the user prompt. A block (and every reminder /
-    prompt within it) is in the cached prefix when it sits at/before the last ``messages``
-    breakpoint. Deferred tools named in a deferred-tools reminder are tallied (their schemas
-    are absent, so never sized).
+    Each ``<system-reminder>`` is routed through :func:`_route_reminder` (the shared
+    combined-block section router, #159). Whatever text remains in a block after the reminders
+    are removed is the user prompt. A block (and every item within it) is in the cached prefix
+    when it sits at/before the last ``messages`` breakpoint. Deferred tools named in a
+    deferred-tools reminder are tallied (their schemas are absent, so never sized).
     """
     if not isinstance(messages, list) or not messages:
         return [], [], 0
@@ -285,7 +287,7 @@ def _message_items(
         cached = index <= last_marker
         for full, inner in ((m.group(0), m.group(1)) for m in _REMINDER_RE.finditer(text)):
             kind = _classify_reminder(inner)
-            items.append(ContextItem("context", kind, full, cached))
+            items.extend(_route_reminder(full, inner, kind, cached=cached))
             if kind == "deferred-tools":
                 deferred += _count_deferred(inner)
         residual = _REMINDER_RE.sub("", text).strip()
@@ -359,14 +361,19 @@ def _split_rules_items(text: str, *, cached: bool) -> list[ContextItem]:
 def _split_skill_items(text: str, *, cached: bool) -> list[ContextItem]:
     """Split a skills reminder into one ``skills`` item per ``- <name>: …`` line (#99).
 
-    Each skill's item text runs from its listing line up to the next skill (the leading prose
-    header before the first skill is left out and falls into the reconciled remainder). With no
-    listing line the whole text is one ``skills`` item, so nothing is dropped.
+    Each skill's item text runs from its listing line up to the next skill. The leading prose
+    header before the first skill (``The following skills are available…``) is emitted as an
+    ``environment`` residue item rather than dropped, so the split is lossless — the turn-0
+    path (:func:`_message_items`) has no reconciliation remainder to absorb it. With no listing
+    line the whole text is one ``skills`` item, so nothing is dropped.
     """
     matches = list(_SKILL_LINE_RE.finditer(text))
     if not matches:
         return [ContextItem("skills", "skills", text, cached)] if text.strip() else []
     items: list[ContextItem] = []
+    header = text[: matches[0].start()]
+    if header:
+        items.append(ContextItem("environment", "environment", header, cached))
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         items.append(ContextItem("skills", match.group(1), text[match.start() : end], cached))
@@ -403,21 +410,35 @@ def _decompose_first_message(first: object, *, any_later_marker: bool) -> list[C
             continue
         cached = any_later_marker or index <= last_marker
         for full, inner in ((m.group(0), m.group(1)) for m in _REMINDER_RE.finditer(text)):
-            items.extend(_decompose_reminder(full, inner, cached=cached))
+            items.extend(_route_reminder(full, inner, _classify_reminder(inner), cached=cached))
         residual = _REMINDER_RE.sub("", text).strip()
         if residual:
             items.extend(_decompose_residual(residual, cached=cached))
     return items
 
 
-def _decompose_reminder(full: str, inner: str, *, cached: bool) -> list[ContextItem]:
-    """Route one reminder to the per-file / per-skill splitter or keep it as a context item."""
-    kind = _classify_reminder(inner)
+def _route_reminder(full: str, inner: str, kind: str, *, cached: bool) -> list[ContextItem]:
+    """The shared combined-block section router (#159).
+
+    A rules+memory+env reminder splits into one ``rules`` item per ``Contents of <path>`` file
+    plus an ``environment`` residue; a skills reminder into one ``skills`` item per skill (its
+    header falling into ``environment``); every other kind stays a whole ``context`` item. The
+    ``<system-reminder>`` wrapper tags the splitters exclude are conserved as their own
+    ``environment`` item, so ``Σ items == the whole block`` — the turn-0 baseline
+    (:func:`_message_items`) has no reconciliation remainder to absorb any dropped bytes. Also
+    used by the full-body decomposition (:func:`_decompose_first_message`). ``kind`` is passed
+    in (classified once by the caller) rather than recomputed here.
+    """
+    if kind not in ("rules+memory+env", "skills"):
+        return [ContextItem("context", kind, full, cached)]
     if kind == "rules+memory+env":
-        return _split_rules_items(inner, cached=cached)
-    if kind == "skills":
-        return _split_skill_items(inner, cached=cached)
-    return [ContextItem("context", kind, full, cached)]
+        items = _split_rules_items(inner, cached=cached)
+    else:
+        items = _split_skill_items(inner, cached=cached)
+    wrapper = full.replace(inner, "", 1)  # the <system-reminder> … </system-reminder> tags
+    if wrapper:
+        items.append(ContextItem("environment", "environment", wrapper, cached))
+    return items
 
 
 def _decompose_residual(residual: str, *, cached: bool) -> list[ContextItem]:
