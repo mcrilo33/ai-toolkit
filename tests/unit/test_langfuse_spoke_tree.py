@@ -34,6 +34,7 @@ from telemetry.langfuse_spoke_tree import (
     _copy_id,
     _decomp_metadata,
     _is_own_output,
+    _tool_span_ids,
     apply_llm_decomposition,
     apply_mode_lane_tags,
     apply_request_body_metadata,
@@ -3100,6 +3101,143 @@ class TestToolContentFilledIntoCreateBody:
         body = _by_orig(batch, "trace", "t1")["body"]
         assert "input" not in body
         assert "output" not in body
+
+
+class TestSubAgentContentGraft:
+    """#161: ``sub-agent:*`` container spans graft transcript content like ``tool:`` spans.
+
+    The otelcol renames ``tool:Agent`` → ``sub-agent:<type>``, so the review verdict the
+    sub-agent returned (its transcript ``tool_result``) must still be grafted as ``output``.
+    """
+
+    def test_subagent_output_set_from_transcript(self, tmp_path: Path) -> None:
+        span = _tool_obs("sa1", "sub-agent:code-review", "tu-1")
+        _write_transcript(
+            tmp_path,
+            [
+                _tool_use("tu-1", "Agent", {"prompt": "review the diff"}),
+                _tool_result("tu-1", "REVIEW: SHIP - no blocking issues"),
+            ],
+        )
+
+        batch = build_batch([("trace", [span])], SPOKE, scan_transcripts(tmp_path, {"tu-1"}))
+
+        body = _by_orig(batch, "trace", "sa1")["body"]
+        assert body["output"] == "REVIEW: SHIP - no blocking issues"
+        assert body["input"] == {"prompt": "review the diff"}
+
+    def test_subagent_graft_does_not_overwrite_native_output(self, tmp_path: Path) -> None:
+        # Non-destructive fill: a sub-agent span already carrying output keeps it.
+        span = _tool_obs("sa1", "sub-agent:code-review", "tu-1", output="native verdict")
+        _write_transcript(
+            tmp_path,
+            [
+                _tool_use("tu-1", "Agent", {"prompt": "x"}),
+                _tool_result("tu-1", "transcript verdict"),
+            ],
+        )
+
+        batch = build_batch([("trace", [span])], SPOKE, scan_transcripts(tmp_path, {"tu-1"}))
+
+        assert _by_orig(batch, "trace", "sa1")["body"]["output"] == "native verdict"
+
+    def test_large_subagent_output_is_truncated_with_marker(self, tmp_path: Path) -> None:
+        span = _tool_obs("sa1", "sub-agent:general-purpose", "tu-1")
+        huge = "x" * (_MAX_CONTENT_CHARS + 500)
+        _write_transcript(
+            tmp_path,
+            [_tool_use("tu-1", "Agent", {"prompt": "x"}), _tool_result("tu-1", huge)],
+        )
+
+        batch = build_batch([("trace", [span])], SPOKE, scan_transcripts(tmp_path, {"tu-1"}))
+
+        output = _by_orig(batch, "trace", "sa1")["body"]["output"]
+        assert output.endswith(_TRUNCATION_MARKER)
+        assert len(output) == _MAX_CONTENT_CHARS + len(_TRUNCATION_MARKER)
+
+    def test_subagent_tool_use_id_included_in_scan_set(self) -> None:
+        # _tool_span_ids scopes scan_transcripts; a sub-agent id absent here is never fetched.
+        span = _tool_obs("sa1", "sub-agent:code-review", "tu-1")
+
+        assert _tool_span_ids([("trace", [span])]) == {"tu-1"}
+
+
+class TestSubAgentRollupPinning:
+    """#161: pin the existing sub-agent nesting/rollup behavior against regressions."""
+
+    def test_subagent_container_usage_absent_but_rollup_present(self) -> None:
+        # A sub-agent container holding one generation: the copy carries no own usageDetails
+        # (double-count guard) but a subtree token rollup.
+        agent = _obs("sa1", "sub-agent:code-review", parent=None)
+        gen = _obs(
+            "sg1",
+            "llm_request",
+            type_="GENERATION",
+            parent="sa1",
+            usageDetails={
+                "input": 10,
+                "output": 4,
+                "cache_read_input_tokens": 7,
+                "cache_creation_input_tokens": 2,
+            },
+        )
+
+        batch = build_batch([("trace-a", [agent, gen])], SPOKE)
+
+        body = _by_orig(batch, "trace-a", "sa1")["body"]
+        assert not body.get("usageDetails")
+        assert body["metadata"]["rollup"] == {
+            "reused": 7,
+            "written": 2,
+            "input": 10,
+            "output": 4,
+            "duration": _dur(0),
+        }
+
+    def test_container_with_generation_descendant_strips_native_usage(self) -> None:
+        # Future-proof guard: even if the collector someday stamps usage on the container
+        # span, the copy must drop it so trace cost never double-counts the generation child.
+        agent = _obs(
+            "sa1", "sub-agent:code-review", parent=None, usageDetails={"input": 999, "output": 999}
+        )
+        gen = _obs(
+            "sg1",
+            "llm_request",
+            type_="GENERATION",
+            parent="sa1",
+            usageDetails={"input": 10, "output": 4},
+        )
+
+        batch = build_batch([("trace-a", [agent, gen])], SPOKE)
+
+        assert not _by_orig(batch, "trace-a", "sa1")["body"].get("usageDetails")
+
+    def test_nested_subagent_trees_roll_up_recursively(self) -> None:
+        # sub-agent -> nested sub-agent -> generation: the outer rollup sums the whole subtree.
+        outer = _obs("sa1", "sub-agent:code-review", parent=None)
+        inner = _obs("sa2", "sub-agent:general-purpose", parent="sa1")
+        gen = _obs(
+            "sg1",
+            "llm_request",
+            type_="GENERATION",
+            parent="sa2",
+            usageDetails={
+                "input": 10,
+                "output": 4,
+                "cache_read_input_tokens": 7,
+                "cache_creation_input_tokens": 2,
+            },
+        )
+
+        batch = build_batch([("trace-a", [outer, inner, gen])], SPOKE)
+
+        assert _by_orig(batch, "trace-a", "sa1")["body"]["metadata"]["rollup"] == {
+            "reused": 7,
+            "written": 2,
+            "input": 10,
+            "output": 4,
+            "duration": _dur(0),
+        }
 
 
 class TestPrefixTotal:
