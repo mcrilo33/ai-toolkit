@@ -26,10 +26,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 from telemetry.langfuse_spoke_tree import (
     _CYCLE_STEP_PREFIX,
     _DISK_CATEGORY_ORDER,
-    _MAX_CONTENT_CHARS,
     _REQUEST_CATEGORY_ORDER,
     _STEP_PREFIX,
-    _TRUNCATION_MARKER,
     ToolContent,
     _copy_id,
     _decomp_metadata,
@@ -38,7 +36,6 @@ from telemetry.langfuse_spoke_tree import (
     _memoized_counter,
     _parse_commits,
     _step_phase,
-    _tool_span_ids,
     apply_context_deltas,
     apply_llm_decomposition,
     apply_mode_lane_tags,
@@ -68,6 +65,11 @@ from telemetry.request_body import (
     measure_request_items,
 )
 from telemetry.session_parser import project_dir_for_worktree
+from telemetry.spoke_tree.assembly import (
+    _MAX_CONTENT_CHARS,
+    _TRUNCATION_MARKER,
+    _tool_span_ids,
+)
 
 SPOKE = "feature/22-demo+1700000000"
 
