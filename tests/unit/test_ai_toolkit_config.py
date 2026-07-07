@@ -34,9 +34,10 @@ OPUS = "claude-opus-4-8"
 SONNET = "claude-sonnet-5"
 
 # Mirrors shared/agents/metadata.yml's #141 routing — now sourced from the config.
+# Fable budget is exhausted, so architect/planner route to Opus like the rest.
 EXPECTED_AGENT_ROUTING = {
-    "architect": FABLE,
-    "planner": FABLE,
+    "architect": OPUS,
+    "planner": OPUS,
     "debug": OPUS,
     "security-reviewer": OPUS,
     "code-review": OPUS,

@@ -72,16 +72,16 @@ model:
       model: claude-sonnet-5
       effort: max
 
-  # Per sub-agent model routing (issue #141): Fable is scarce, so it is reserved
-  # for the design/plan agents; Opus 4.8 for the reasoning-heavy ones; Sonnet 5
+  # Per sub-agent model routing (issue #141): Fable budget is exhausted, so the
+  # design/plan agents now run on Opus 4.8 like the reasoning-heavy ones; Sonnet 5
   # for the capable-but-routine ones; Haiku for none. Sync stamps these into
   # each agent's claude `model:`/`effort:` frontmatter.
   subagents:
     architect:
-      model: claude-fable-5
+      model: claude-opus-4-8
       effort: max
     planner:
-      model: claude-fable-5
+      model: claude-opus-4-8
       effort: max
     debug:
       model: claude-opus-4-8

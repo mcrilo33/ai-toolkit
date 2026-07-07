@@ -1,9 +1,9 @@
 """Unit tests for the agent model routing POLICY (issues #141, #142).
 
-Fable credit is scarce; Opus 4.8 is plentiful. The per-agent model must
-therefore route by role: Fable only for the design/plan agents (`architect`,
-`planner`), Opus 4.8 for the reasoning-heavy ones, Sonnet 5 for the
-capable-but-routine ones, and Haiku for none. Effort stays `max` everywhere.
+Fable budget is exhausted, so no agent may route to it: the design/plan agents
+(`architect`, `planner`) now run on Opus 4.8 alongside the reasoning-heavy ones,
+Sonnet 5 for the capable-but-routine ones, and Haiku for none. Effort stays
+`max` everywhere.
 
 Since #142 the routing lives in `settings/ai-toolkit.yml` (the single source of
 truth), NOT in `shared/agents/metadata.yml` frontmatter — sync stamps it into
@@ -33,8 +33,8 @@ OPUS = "claude-opus-4-8"
 SONNET = "claude-sonnet-5"
 
 EXPECTED_ROUTING = {
-    "architect": FABLE,
-    "planner": FABLE,
+    "architect": OPUS,
+    "planner": OPUS,
     "debug": OPUS,
     "security-reviewer": OPUS,
     "code-review": OPUS,
@@ -67,8 +67,7 @@ def test_agent_effort_stays_max(config: dict, name: str) -> None:
     assert cfg.agent_model(config, name)[1] == "max"
 
 
-@pytest.mark.parametrize(
-    "name", sorted(n for n in EXPECTED_ROUTING if n not in ("architect", "planner"))
-)
-def test_fable_reserved_for_design_and_plan(config: dict, name: str) -> None:
+@pytest.mark.parametrize("name", sorted(EXPECTED_ROUTING))
+def test_no_agent_routes_to_fable(config: dict, name: str) -> None:
+    # Fable budget is exhausted — no agent, design/plan included, may route to it.
     assert cfg.agent_model(config, name)[0] != FABLE
