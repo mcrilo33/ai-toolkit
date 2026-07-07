@@ -214,18 +214,46 @@ _transcript_idle_seconds() {
   [ -n "$mtime" ] || return 0
   printf '%s\n' "$(( $(afk_now) - mtime ))"
 }
-# _spoke_idle_seconds <wt_path> <issue> -> idle seconds for the REAPER's clock: since
-# the transcript's last write OR the supervisor's last answer-delivery attempt,
-# whichever is later — time with a buffered/undelivered answer is not idle (#133;
-# the reaper killed #125 right as its answer was delivered). Empty when neither
-# reference exists (same "can't measure" contract as _transcript_idle_seconds).
+# _task_output_mtime <wt_path> -> newest mtime among the harness background-task output
+# files for this worktree's sessions, or empty when none exist. A spoke waiting on a
+# background workflow (a code-review) writes nothing to its transcript (#180), so the
+# reaper's idle clock reads a stale transcript mtime and kills it as hung. The harness
+# streams each background task's stdout to <tmp>/claude-*/<munged-wt>/*/tasks/*.output as
+# it runs — a fresh write there is the missing "still working" signal. AFK_TASKS_ROOT
+# overrides the tmp root (tests; defaults to macOS /private/tmp).
+_task_output_mtime() {
+  local wt_path="$1" slug root newest="" mt f
+  slug="$(printf '%s' "$wt_path" | sed 's/[^A-Za-z0-9]/-/g')"
+  root="${AFK_TASKS_ROOT:-/private/tmp}"
+  for f in "$root"/claude-*/"$slug"/*/tasks/*.output; do
+    [ -f "$f" ] || continue        # no match: the glob stays literal, skipped here
+    mt="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)"
+    [ -n "$mt" ] || continue
+    if [ -z "$newest" ] || [ "$mt" -gt "$newest" ]; then newest="$mt"; fi
+  done
+  [ -n "$newest" ] && printf '%s\n' "$newest"
+}
+# _spoke_idle_seconds <wt_path> <issue> -> idle seconds for the REAPER's clock: since the
+# LATEST of three references — the transcript's last write, the supervisor's last
+# answer-delivery attempt, and the newest background-task output write. Time with a
+# buffered/undelivered answer is not idle (#133; the reaper killed #125 right as its
+# answer was delivered); neither is a spoke waiting on a background workflow that writes
+# nothing to its transcript (#180; the reaper killed a healthy #168 mid code-review).
+# These signals EXTEND the idle reference only — the wall-clock ceiling (#133) is checked
+# separately and stays untouched. Empty when no reference exists (same "can't measure"
+# contract as _transcript_idle_seconds).
 _spoke_idle_seconds() {
-  local wt="$1" issue="$2" ref attempt
+  local wt="$1" issue="$2" ref attempt task
   ref="$(_transcript_mtime "$wt")"
   attempt="$(read_answer_attempt "$issue")"
   case "$attempt" in
     '' | *[!0-9]*) : ;;
     *) if [ -z "$ref" ] || [ "$attempt" -gt "$ref" ]; then ref="$attempt"; fi ;;
+  esac
+  task="$(_task_output_mtime "$wt")"
+  case "$task" in
+    '' | *[!0-9]*) : ;;
+    *) if [ -z "$ref" ] || [ "$task" -gt "$ref" ]; then ref="$task"; fi ;;
   esac
   [ -n "$ref" ] || return 0
   printf '%s\n' "$(( $(afk_now) - ref ))"
