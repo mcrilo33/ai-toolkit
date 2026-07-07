@@ -34,8 +34,10 @@ from telemetry.langfuse_spoke_tree import (
     _copy_id,
     _decomp_metadata,
     _is_own_output,
+    _memoized_counter,
     _step_phase,
     _tool_span_ids,
+    apply_context_deltas,
     apply_llm_decomposition,
     apply_mode_lane_tags,
     apply_request_body_metadata,
@@ -3620,6 +3622,273 @@ class TestLlmDecompositionMetadata:
         assert meta["measured"] == 17
         item_sum = sum(tok for comp in meta["components"].values() for tok in comp.values())
         assert item_sum == meta["measured"]
+
+
+def _canonical_msg(message: dict) -> str:
+    """The canonical ``{role, content}`` JSON a snapshot item carries (mirrors _full_message_items)."""
+    return json.dumps(
+        {"role": message["role"], "content": message["content"]},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+class TestMemoizedCounter:
+    """#160: one token counter memoized by content hash, shared by deltas + decomposition."""
+
+    def test_counts_each_distinct_text_once(self) -> None:
+        seen: list[str] = []
+
+        def spy(text: str) -> int:
+            seen.append(text)
+            return len(text)
+
+        memo = _memoized_counter(spy)
+
+        assert memo("abc") == 3
+        assert memo("abc") == 3  # cached — the underlying counter is not called again
+        assert memo("de") == 2
+        assert seen == ["abc", "de"]
+
+
+class TestContextDeltas:
+    """#160: per-llm_request context deltas from consecutive raw bodies (View A, single-emit)."""
+
+    _TOOL = {"name": "Bash", "description": "d" * 40, "input_schema": {"type": "object"}}
+
+    def _bodies(self, tmp_path: Path, *objs: dict) -> Path:
+        bodies = tmp_path / "bodies"
+        bodies.mkdir()
+        for index, obj in enumerate(objs):
+            (bodies / f"{index:02d}-body.request.json").write_text(
+                json.dumps(obj), encoding="utf-8"
+            )
+        return bodies
+
+    def _body(self, messages: list[dict]) -> dict:
+        return {
+            "tools": [self._TOOL],
+            "system": [{"type": "text", "text": "sys"}],
+            "messages": messages,
+        }
+
+    def _gen(self, obs_id: str, start: str, *, read: int, creation: int) -> dict:
+        return _obs(
+            obs_id,
+            "llm_request",
+            type_="GENERATION",
+            parent="i1",
+            startTime=start,
+            usageDetails={"cache_read_input_tokens": read, "cache_creation_input_tokens": creation},
+        )
+
+    def _meta(self, batch: list[dict], obs_id: str) -> dict:
+        return _by_orig(batch, "tr", obs_id)["body"].get("metadata", {})
+
+    def test_stamps_added_message_delta_on_the_later_call(self, tmp_path: Path) -> None:
+        m1 = {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        m2 = {"role": "assistant", "content": [{"type": "text", "text": "the newest turn"}]}
+        added_tokens = len(_canonical_msg(m2))
+        bodies = self._bodies(tmp_path, self._body([m1]), self._body([m1, m2]))
+        g1 = self._gen("g1", "2026-01-02T00:00:00Z", read=0, creation=100)
+        g2 = self._gen("g2", "2026-01-02T00:00:01Z", read=100, creation=added_tokens)
+        traces = [("tr", [g1, g2])]
+        batch = build_batch(traces, SPOKE)
+
+        apply_context_deltas(batch, traces, bodies, counter=len, price=1.0, tool_content={})
+
+        delta = self._meta(batch, "g2")["context_delta"]
+        # net_tokens reconciles (remainder 0 here) against the call's observed cache_creation.
+        assert delta["net_tokens"] == added_tokens
+        assert any(row["category"] == "messages" for row in delta["added"])
+
+    def test_first_call_has_no_delta(self, tmp_path: Path) -> None:
+        m1 = {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        m2 = {"role": "assistant", "content": [{"type": "text", "text": "next"}]}
+        bodies = self._bodies(tmp_path, self._body([m1]), self._body([m1, m2]))
+        g1 = self._gen("g1", "2026-01-02T00:00:00Z", read=0, creation=100)
+        g2 = self._gen("g2", "2026-01-02T00:00:01Z", read=100, creation=50)
+        traces = [("tr", [g1, g2])]
+        batch = build_batch(traces, SPOKE)
+
+        apply_context_deltas(batch, traces, bodies, counter=len, price=1.0, tool_content={})
+
+        assert "context_delta" not in self._meta(batch, "g1")
+
+    def test_count_gate_mismatch_skips_deltas(self, tmp_path: Path) -> None:
+        # Two bodies but a single llm_request — positional alignment is unsafe → nothing stamped.
+        m1 = {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        bodies = self._bodies(tmp_path, self._body([m1]), self._body([m1]))
+        g1 = self._gen("g1", "2026-01-02T00:00:00Z", read=0, creation=100)
+        traces = [("tr", [g1])]
+        batch = build_batch(traces, SPOKE)
+
+        stamped = apply_context_deltas(
+            batch, traces, bodies, counter=len, price=1.0, tool_content={}
+        )
+
+        assert not stamped
+        assert "context_delta" not in self._meta(batch, "g1")
+
+    def test_skill_added_message_labeled_with_skill_name(self, tmp_path: Path) -> None:
+        m1 = {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        skill_msg = {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "tu-sk", "content": "SKILL BODY"}],
+        }
+        bodies = self._bodies(tmp_path, self._body([m1]), self._body([m1, skill_msg]))
+        skill_span = _tool_obs("sk", "tool:Skill", "tu-sk")
+        g1 = self._gen("g1", "2026-01-02T00:00:00Z", read=0, creation=100)
+        g2 = self._gen("g2", "2026-01-02T00:00:01Z", read=100, creation=40)
+        traces = [("tr", [skill_span, g1, g2])]
+        tool_content = {"tu-sk": ToolContent({"skill": "langfuse"}, "SKILL BODY")}
+        batch = build_batch(traces, SPOKE, tool_content)
+
+        apply_context_deltas(
+            batch, traces, bodies, counter=len, price=1.0, tool_content=tool_content
+        )
+
+        added = self._meta(batch, "g2")["context_delta"]["added"]
+        skill_rows = [row for row in added if row.get("skill") == "langfuse"]
+        assert len(skill_rows) == 1
+
+    def test_compaction_turn_labeled(self, tmp_path: Path) -> None:
+        m1 = {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        big = {"role": "assistant", "content": [{"type": "text", "text": "x" * 12000}]}
+        bodies = self._bodies(tmp_path, self._body([m1, big]), self._body([m1]))
+        g1 = self._gen("g1", "2026-01-02T00:00:00Z", read=0, creation=100)
+        g2 = self._gen("g2", "2026-01-02T00:00:01Z", read=100, creation=5)
+        traces = [("tr", [g1, g2])]
+        batch = build_batch(traces, SPOKE)
+
+        apply_context_deltas(batch, traces, bodies, counter=len, price=1.0, tool_content={})
+
+        assert self._meta(batch, "g2")["context_delta"]["label"] == "compaction"
+
+    def test_context_delta_is_metadata_only(self, tmp_path: Path) -> None:
+        m1 = {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        m2 = {"role": "assistant", "content": [{"type": "text", "text": "next"}]}
+        bodies = self._bodies(tmp_path, self._body([m1]), self._body([m1, m2]))
+        g1 = self._gen("g1", "2026-01-02T00:00:00Z", read=0, creation=100)
+        g2 = self._gen("g2", "2026-01-02T00:00:01Z", read=100, creation=50)
+        traces = [("tr", [g1, g2])]
+        batch = build_batch(traces, SPOKE)
+
+        apply_context_deltas(batch, traces, bodies, counter=len, price=1.0, tool_content={})
+
+        body = _by_orig(batch, "tr", "g2")["body"]
+        # The delta rides metadata only; the call's billed usage is untouched.
+        assert body["usageDetails"] == {
+            "cache_read_input_tokens": 100,
+            "cache_creation_input_tokens": 50,
+        }
+        assert "context_delta" in body["metadata"]
+
+
+class TestContextRollup:
+    """#160: aggregate rollup.context onto each step node so per-cycle context cost reads local."""
+
+    def _content(self) -> dict[str, ToolContent]:
+        return {
+            "tu-c1": ToolContent(
+                {"subject": "S1 RED: x"}, "Task #1 created successfully: S1 RED: x"
+            ),
+            "tu-u1": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
+            "tu-u2": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
+        }
+
+    _TOOL = {"name": "Bash", "description": "d" * 40, "input_schema": {"type": "object"}}
+
+    def _bodies(self, tmp_path: Path, *objs: dict) -> Path:
+        bodies = tmp_path / "bodies"
+        bodies.mkdir()
+        for index, obj in enumerate(objs):
+            (bodies / f"{index:02d}-body.request.json").write_text(
+                json.dumps(obj), encoding="utf-8"
+            )
+        return bodies
+
+    def _body(self, messages: list[dict]) -> dict:
+        return {
+            "tools": [self._TOOL],
+            "system": [{"type": "text", "text": "sys"}],
+            "messages": messages,
+        }
+
+    def _gen(self, obs_id: str, start: str, *, read: int, creation: int) -> dict:
+        return _obs(
+            obs_id,
+            "claude_code.llm_request",
+            type_="GENERATION",
+            parent="i1",
+            startTime=start,
+            endTime=start,
+            usageDetails={"cache_read_input_tokens": read, "cache_creation_input_tokens": creation},
+        )
+
+    def _traces(self) -> list[tuple[str, list[dict]]]:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:40Z",
+        )
+        create = _ledger_child(
+            "tc1",
+            "tool:TaskCreate",
+            "tu-c1",
+            parent="i1",
+            start="2026-01-02T00:00:02Z",
+            end="2026-01-02T00:00:02Z",
+        )
+        started = _ledger_child(
+            "tu1",
+            "tool:TaskUpdate",
+            "tu-u1",
+            parent="i1",
+            start="2026-01-02T00:00:05Z",
+            end="2026-01-02T00:00:05Z",
+        )
+        g1 = self._gen("g1", "2026-01-02T00:00:06Z", read=0, creation=100)
+        g2 = self._gen("g2", "2026-01-02T00:00:12Z", read=100, creation=40)
+        done = _ledger_child(
+            "tu2",
+            "tool:TaskUpdate",
+            "tu-u2",
+            parent="i1",
+            start="2026-01-02T00:00:20Z",
+            end="2026-01-02T00:00:21Z",
+        )
+        return [("tr", [interaction, create, started, g1, g2, done])]
+
+    def test_step_node_carries_context_rollup_both_views(self, tmp_path: Path) -> None:
+        m1 = {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        m2 = {"role": "assistant", "content": [{"type": "text", "text": "the newest turn"}]}
+        added_tokens = len(_canonical_msg(m2))
+        bodies = self._bodies(tmp_path, self._body([m1]), self._body([m1, m2]))
+        traces = self._traces()
+        batch = build_batch(traces, SPOKE, self._content())
+        cycle = build_cycle_batch(traces, SPOKE, self._content())
+
+        by_orig = {
+            (o, i): s
+            for (o, i), s in apply_context_deltas(
+                batch, traces, bodies, counter=len, price=1.0, tool_content=self._content()
+            ).items()
+        }
+        assert by_orig  # a delta was produced
+
+        from telemetry.langfuse_spoke_tree import _apply_context_rollups, _copy_id
+
+        _apply_context_rollups(batch, {_copy_id(o, i): s for (o, i), s in by_orig.items()})
+        _apply_context_rollups(cycle, {cycle_copy_id_for(o, i): s for (o, i), s in by_orig.items()})
+
+        view_a_step = _only_step(batch)
+        view_b_step = _cycle_step(cycle, "step:S1 RED: x")
+        expected = {"net_tokens": added_tokens, "added": added_tokens, "removed": 0}
+        assert view_a_step["body"]["metadata"]["rollup"]["context"] == expected
+        assert view_b_step["body"]["metadata"]["rollup"]["context"] == expected
 
 
 class TestRequestBodyMetadata:
