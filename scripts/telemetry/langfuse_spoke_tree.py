@@ -237,6 +237,10 @@ _PURGE_POLL_INTERVAL = 1.0
 
 # Observation fields copied verbatim into the assembled trace when present.
 _COPIED_FIELDS = ("input", "output", "usageDetails", "costDetails", "metadata", "model", "level")
+# The otelcol renames a ``tool:Agent`` span to ``sub-agent:<type>`` (e.g. ``sub-agent:code-review``);
+# such a container still carries the invoking tool's ``tool_use_id`` so its transcript output grafts
+# like any other tool (#161).
+_SUB_AGENT_PREFIX = "sub-agent:"
 # Metadata keys that may carry a tool-call id, in priority order.
 _TOOL_USE_ID_KEYS = ("tool_use_id", "gen_ai.tool.call.id")
 # The per-turn id Claude Code stamps on a ``claude_code.interaction`` and every event-layer
@@ -1394,12 +1398,23 @@ def _is_tool_span(observation: Observation) -> bool:
     return (observation.get("name") or "").startswith("tool:")
 
 
+def _is_graftable_span(observation: Observation) -> bool:
+    """Whether transcript ``input``/``output`` may be grafted onto this span by ``tool_use_id``.
+
+    Both a visible ``tool:`` span and a ``sub-agent:<type>`` container (the otelcol-renamed
+    ``tool:Agent``) carry the invoking tool's call id, so each joins its transcript entry the
+    same way. The ``claude_code.tool.execution`` / ``*.blocked_on_user`` siblings do not.
+    """
+    name = observation.get("name") or ""
+    return name.startswith("tool:") or name.startswith(_SUB_AGENT_PREFIX)
+
+
 def _tool_span_ids(traces: list[TraceObservations]) -> set[str]:
-    """Collect the tool-call ids of every visible ``tool:`` span across the source traces."""
+    """Collect the tool-call ids of every graftable ``tool:`` / ``sub-agent:`` span."""
     ids: set[str] = set()
     for _orig_trace_id, observations in traces:
         for observation in observations:
-            if not _is_tool_span(observation):
+            if not _is_graftable_span(observation):
                 continue
             tuid = _tool_use_id(observation)
             if tuid:
@@ -1425,10 +1440,10 @@ def _tool_additions(
 ) -> dict[str, Any]:
     """Return the input/output to graft onto a tool span's create body, empty when none.
 
-    Only a visible ``tool:`` span with a matching transcript entry contributes, and only for
-    a field the source span does not already carry — so collector-provided content (Bash's
-    ``input``) is never overwritten and non-tool spans are untouched. Oversized values are
-    truncated by :func:`_capped`.
+    A visible ``tool:`` span or a ``sub-agent:<type>`` container with a matching transcript
+    entry contributes, and only for a field the source span does not already carry — so
+    collector-provided content (Bash's ``input``) is never overwritten and non-graftable spans
+    are untouched. Oversized values are truncated by :func:`_capped`.
 
     Args:
         observation: The source observation being copied.
@@ -1437,7 +1452,7 @@ def _tool_additions(
     Returns:
         A mapping with ``input`` and/or ``output`` to merge into the body, or ``{}``.
     """
-    if not _is_tool_span(observation):
+    if not _is_graftable_span(observation):
         return {}
     content = tool_content.get(_tool_use_id(observation) or "")
     if content is None:
@@ -1779,6 +1794,46 @@ def _apply_container_rollups(
             intervals=intervals,
             exclude=duration_exclude,
         )
+
+
+def _strip_container_usage(copies: list[IngestEvent]) -> list[IngestEvent]:
+    """Drop own usage from any span copy that has a generation descendant, in place (#161).
+
+    A container span's own ``usageDetails`` would double-count against its generation children
+    in both the subtree rollup and Langfuse's trace cost, so a span (never a generation) with a
+    ``generation-create`` anywhere in its subtree must carry no usage of its own. Native
+    sub-agent / interaction containers already ship empty usage; this is the future-proof guard
+    should the collector ever stamp usage on a container.
+
+    Args:
+        copies: The assembled observation copies. Mutated in place and returned.
+
+    Returns:
+        The same list, with container usage/cost stripped.
+    """
+    bodies = [event["body"] for event in copies]
+    _by_id, children = build_tree(bodies)
+    generation_ids = {
+        event["body"]["id"] for event in copies if event["type"] == "generation-create"
+    }
+
+    def _has_generation_descendant(node_id: str) -> bool:
+        stack = list(children.get(node_id, []))
+        while stack:
+            current = stack.pop()
+            if current in generation_ids:
+                return True
+            stack.extend(children.get(current, []))
+        return False
+
+    for event in copies:
+        body = event["body"]
+        if event["type"] == "generation-create" or not body.get("usageDetails"):
+            continue
+        if _has_generation_descendant(body["id"]):
+            body.pop("usageDetails", None)
+            body.pop("costDetails", None)
+    return copies
 
 
 def _earliest_start(traces: list[TraceObservations]) -> str:
@@ -2301,7 +2356,8 @@ def _assemble_copies(
     )
     copies = _stamp_hook_endtimes(copies)
     copies = _apply_levels(copies)
-    return _collapse_startup_instants(copies, root_event)
+    copies = _collapse_startup_instants(copies, root_event)
+    return _strip_container_usage(copies)
 
 
 def _cycle_step_for(start: str, windows: list[StepWindow]) -> str:
