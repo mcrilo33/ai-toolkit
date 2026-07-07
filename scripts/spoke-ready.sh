@@ -65,6 +65,7 @@ SUBJECT="ready"
 STATE_FLAG=""
 ISSUE=""
 BODY=""
+PLAN_FILE=""
 
 # set_state <kind> <subject> — select the marker namespace, rejecting a second
 # state flag so e.g. `--gate --accept` can't emit an ambiguous marker.
@@ -86,6 +87,9 @@ while [ "$#" -gt 0 ]; do
     -m|--message)  [ "$#" -ge 2 ] || { echo "spoke-ready: -m needs a value" >&2; usage; }
                    BODY="$2"; shift 2 ;;
     --message=*)   BODY="${1#--message=}"; shift ;;
+    --plan-file)   [ "$#" -ge 2 ] || { echo "spoke-ready: --plan-file needs a value" >&2; usage; }
+                   PLAN_FILE="$2"; shift 2 ;;
+    --plan-file=*) PLAN_FILE="${1#--plan-file=}"; shift ;;
     -h|--help)     usage ;;
     -*)            echo "spoke-ready: unknown option: $1" >&2; usage ;;
     *)             [ -z "$ISSUE" ] || { echo "spoke-ready: unexpected argument: $1" >&2; usage; }
@@ -94,6 +98,18 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$ISSUE" ] || { echo "spoke-ready: an issue number is required" >&2; usage; }
+
+# The plan text (a PLAN-gate park's handoff, issue #175) comes either inline (-m) or
+# from a file (--plan-file); both feed BODY, so they are mutually exclusive. --plan-file
+# reads the whole file, letting a spoke hand over a multi-line plan without argv quoting.
+if [ -n "$PLAN_FILE" ]; then
+  if [ -n "$BODY" ]; then
+    echo "spoke-ready: -m and --plan-file conflict (pick one)" >&2
+    usage
+  fi
+  [ -f "$PLAN_FILE" ] || { echo "spoke-ready: --plan-file not found: $PLAN_FILE" >&2; exit 1; }
+  BODY="$(cat "$PLAN_FILE")"
+fi
 
 # Resolve HEAD up front so an empty/detached repo fails clearly rather than
 # emitting a dangling marker.
@@ -223,6 +239,22 @@ MSG_ARGS=(-m "$SUBJECT")
 if [ -n "$BODY" ]; then
   MSG_ARGS+=(-m "$BODY")
 fi
+
+# A PLAN-gate park writes its plan to a SCRIPTED handoff artifact (issue #175) the
+# gate-broker reads directly, replacing the transcript heuristic (extract_pending_question):
+# a script reads what a script wrote. The plan still rides the tag annotation (BODY above);
+# the artifact is the primary channel. Written before the tag push, under the gitignored
+# .ai-toolkit/ dir so it never dirties the working tree. A bare --gate (no plan) writes
+# nothing, leaving the broker its transcript fallback.
+if [ "$KIND" = "gate" ] && [ -n "$BODY" ]; then
+  GATE_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -n "$GATE_ROOT" ]; then
+    mkdir -p "$GATE_ROOT/.ai-toolkit"
+    printf '%s\n' "$BODY" > "$GATE_ROOT/.ai-toolkit/gate-$ISSUE.md"
+    echo "→ wrote plan artifact .ai-toolkit/gate-$ISSUE.md"
+  fi
+fi
+
 echo "→ git tag -f -a $TAG ${MSG_ARGS[*]}"
 git tag -f -a "$TAG" "${MSG_ARGS[@]}"
 echo "→ git push -f origin $TAG"

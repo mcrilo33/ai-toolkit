@@ -264,6 +264,81 @@ def test_gate_does_not_emit_ready(spoke: Path, remote: Path) -> None:
     assert not _remote_has_ref(remote, "refs/tags/ready/45")
 
 
+# ── --gate N: the structured plan artifact (issue #175) ──────────────────────
+# The gate park hands its plan to the broker through a SCRIPTED channel instead of
+# the transcript heuristic: `--gate N` accepts the plan (`-m <text>` or `--plan-file
+# <path>`) and writes it to <wt>/.ai-toolkit/gate-<N>.md (and into the tag body)
+# before pushing the tag, so a script reads what a script wrote.
+
+
+def test_gate_plan_written_to_artifact(spoke: Path) -> None:
+    result = _run(spoke, "--gate", "45", "-m", "Plan: add a helper, then wire it in.")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    artifact = spoke / ".ai-toolkit" / "gate-45.md"
+    assert artifact.is_file(), "the plan artifact must be written for a --gate park"
+    assert "add a helper, then wire it in" in artifact.read_text()
+
+
+def test_gate_plan_also_lands_in_tag_body(spoke: Path) -> None:
+    result = _run(spoke, "--gate", "45", "-m", "Plan: add a helper, then wire it in.")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    body = _git(spoke, "tag", "-l", "--format=%(contents:body)", "gate/45")
+    assert "add a helper, then wire it in" in body, "the plan must also ride the tag annotation"
+
+
+def test_gate_plan_file_read_into_artifact_and_tag(spoke: Path, tmp_path: Path) -> None:
+    plan_file = tmp_path / "plan.md"
+    plan_file.write_text("# Plan\n\nStep 1: RED\nStep 2: GREEN\n")
+
+    result = _run(spoke, "--gate", "45", "--plan-file", str(plan_file))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    artifact = spoke / ".ai-toolkit" / "gate-45.md"
+    assert artifact.is_file(), "the plan artifact must be written from --plan-file"
+    assert "Step 1: RED" in artifact.read_text()
+    body = _git(spoke, "tag", "-l", "--format=%(contents:body)", "gate/45")
+    assert "Step 1: RED" in body, "the --plan-file content must ride the tag annotation"
+
+
+def test_gate_without_plan_writes_no_artifact(spoke: Path) -> None:
+    # A bare --gate (no plan given) stays back-compatible: it emits the marker but
+    # writes no artifact, so the broker falls back to the transcript.
+    result = _run(spoke, "--gate", "45")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (spoke / ".ai-toolkit" / "gate-45.md").exists(), (
+        "no plan given → no artifact (transcript fallback)"
+    )
+
+
+def test_gate_plan_file_missing_is_an_error(spoke: Path) -> None:
+    result = _run(spoke, "--gate", "45", "--plan-file", str(spoke / "nope.md"))
+
+    assert result.returncode != 0, "a missing --plan-file path must error, not emit a blank plan"
+
+
+def test_message_and_plan_file_conflict_is_a_usage_error(spoke: Path, tmp_path: Path) -> None:
+    plan_file = tmp_path / "plan.md"
+    plan_file.write_text("plan\n")
+
+    result = _run(spoke, "--gate", "45", "-m", "inline", "--plan-file", str(plan_file))
+
+    assert result.returncode == 2, "passing both -m and --plan-file is a usage error (exit 2)"
+
+
+def test_plan_artifact_only_for_gate(spoke: Path) -> None:
+    # The plan artifact is a PLAN-gate concept: --blocked -m <reason> stamps the tag
+    # body but must not spill a gate-<N>.md artifact.
+    result = _run(spoke, "--blocked", "45", "-m", "stuck on ambiguity")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (spoke / ".ai-toolkit" / "gate-45.md").exists(), (
+        "only --gate writes the plan artifact"
+    )
+
+
 # ── accept/N and blocked/N: the terminal markers ─────────────────────────────
 # An unattended drain (`/afk`) adds two more terminal markers beside ready/N, each
 # frees a supervisor slot:
