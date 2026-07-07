@@ -46,6 +46,7 @@ from telemetry.langfuse_spoke_tree import (
     fetch_session,
     find_request_files,
     prefix_total,
+    purge_own_views,
     read_mode_lane,
     request_context_rows,
     root_id_for,
@@ -1736,6 +1737,86 @@ class TestFetchSession:
         result = fetch_session("sess", lambda path: pages[path])
 
         assert result == [("tr-a", [{"id": "o1"}]), ("tr-b", [{"id": "o2"}])]
+
+
+def _traces_page(*ids: str) -> dict:
+    """A single-page /traces response listing the given trace ids."""
+    return {"data": [{"id": tid} for tid in ids], "meta": {"totalPages": 1}}
+
+
+class TestPurgeOwnViews:
+    """#156: --rebuild deletes the two deterministic view traces, then polls them gone."""
+
+    def test_deletes_both_view_ids_then_polls_until_gone(self) -> None:
+        a_id, b_id = trace_id_for(SESSION), cycle_trace_id_for(SESSION)
+        deleted: list[list[str]] = []
+        sleeps: list[float] = []
+        # First poll still lists both views (async delete not yet applied); second is clean.
+        responses = iter([_traces_page(a_id, b_id, "native"), _traces_page("native")])
+
+        purge_own_views(
+            SESSION,
+            lambda _path: next(responses),
+            deleted.append,
+            sleep=sleeps.append,
+        )
+
+        assert deleted == [[a_id, b_id]]
+        assert len(sleeps) == 1  # slept once between the present→gone polls
+
+    def test_returns_immediately_when_views_already_absent(self) -> None:
+        deleted: list[list[str]] = []
+        sleeps: list[float] = []
+
+        purge_own_views(
+            SESSION,
+            lambda _path: _traces_page("native"),
+            deleted.append,
+            sleep=sleeps.append,
+        )
+
+        assert len(deleted) == 1  # delete is always issued (idempotent no-op server-side)
+        assert sleeps == []  # already gone → no polling wait
+
+    def test_raises_when_views_never_disappear(self) -> None:
+        a_id = trace_id_for(SESSION)
+
+        with pytest.raises(RuntimeError, match="not deleted"):
+            purge_own_views(
+                SESSION,
+                lambda _path: _traces_page(a_id),
+                lambda _ids: None,
+                sleep=lambda _s: None,
+                attempts=3,
+            )
+
+
+class TestRebuildIdempotency:
+    """#156: a rebuild with prior views in the store is byte-identical to a fresh build."""
+
+    def test_build_batch_byte_identical_with_prior_views_present(self) -> None:
+        native = [(tid, None, obs) for tid, obs in _traces()]
+        prior_a = (trace_id_for(SESSION), f"spoke-tree:{SESSION}", [_obs("spokeroot-x", "spoke:x")])
+        prior_b = (cycle_trace_id_for(SESSION), f"spoke-cycle:{SESSION}", [_obs("cyc-y", "Bash")])
+
+        fresh = build_batch(fetch_session(SESSION, _stub_get(native)), SESSION)
+        rebuilt = build_batch(
+            fetch_session(SESSION, _stub_get(native + [prior_a, prior_b])), SESSION
+        )
+
+        assert json.dumps(rebuilt) == json.dumps(fresh)
+
+    def test_build_cycle_batch_byte_identical_with_prior_views_present(self) -> None:
+        native = [(tid, None, obs) for tid, obs in _traces()]
+        prior_a = (trace_id_for(SESSION), f"spoke-tree:{SESSION}", [_obs("spokeroot-x", "spoke:x")])
+        prior_b = (cycle_trace_id_for(SESSION), f"spoke-cycle:{SESSION}", [_obs("cyc-y", "Bash")])
+
+        fresh = build_cycle_batch(fetch_session(SESSION, _stub_get(native)), SESSION)
+        rebuilt = build_cycle_batch(
+            fetch_session(SESSION, _stub_get(native + [prior_a, prior_b])), SESSION
+        )
+
+        assert json.dumps(rebuilt) == json.dumps(fresh)
 
 
 def _tool_obs(obs_id: str, name: str, tool_use_id: str, **extra) -> dict:
