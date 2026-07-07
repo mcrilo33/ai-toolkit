@@ -2183,24 +2183,26 @@ def all_traces(spoke_run_id: str, get: GetFn) -> list[dict[str, Any]]:
     return out
 
 
-def _is_own_output(trace: dict[str, Any], target_trace_id: str) -> bool:
+def _is_own_output(trace: dict[str, Any], spoke_run_id: str) -> bool:
     """Whether a fetched session trace is this synthesizer's own assembled output.
 
-    The assembled trace carries ``sessionId == spoke_run_id``, so on a re-run it reappears in
-    the session listing; sourcing it would copy its spans again and multiply the tree. It is
-    recognised by its deterministic id or, defensively for older ids, its ``spoke-tree:`` name.
+    Both assembled views — View A (``spoketree-``, ``spoke-tree:``) and View B
+    (``spokecycle-``, ``spoke-cycle:``) — carry ``sessionId == spoke_run_id``, so on a
+    re-run they reappear in the session listing; sourcing either would copy its spans again
+    and multiply the tree (#156). Each is recognised by its deterministic id or, defensively
+    for older ids, its ``spoke-tree:`` / ``spoke-cycle:`` name prefix.
 
     Args:
         trace: A trace dict as returned by the Langfuse traces endpoint.
-        target_trace_id: The deterministic id of this spoke's assembled tree.
+        spoke_run_id: The spoke run id whose assembled views must be excluded.
 
     Returns:
         True when the trace is the synthesizer's own output and must be excluded.
     """
-    if trace.get("id") == target_trace_id:
+    if trace.get("id") in {trace_id_for(spoke_run_id), cycle_trace_id_for(spoke_run_id)}:
         return True
     name = trace.get("name") or ""
-    return name.startswith(_TRACE_NAME_PREFIX)
+    return name.startswith((_TRACE_NAME_PREFIX, _CYCLE_TRACE_NAME_PREFIX))
 
 
 def fetch_session(spoke_run_id: str, get: GetFn) -> list[TraceObservations]:
@@ -2217,11 +2219,8 @@ def fetch_session(spoke_run_id: str, get: GetFn) -> list[TraceObservations]:
     Returns:
         Each native trace id paired with its observations (full fields), in fetch order.
     """
-    target_trace_id = trace_id_for(spoke_run_id)
     traces = [
-        trace
-        for trace in all_traces(spoke_run_id, get)
-        if not _is_own_output(trace, target_trace_id)
+        trace for trace in all_traces(spoke_run_id, get) if not _is_own_output(trace, spoke_run_id)
     ]
     return [(trace["id"], all_observations(trace["id"], get)) for trace in traces]
 
