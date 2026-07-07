@@ -1472,6 +1472,9 @@ def _tool_result_size(observation: Observation, tool_content: dict[str, ToolCont
     large tool result reports its true size. None for a non-tool span or one with no reconstructed
     output, so the caller emits no score for it.
     """
+    # UPGRADE: sizing stays tool:-only, so a sub-agent's grafted output is not sized for the #101
+    # bloat chart — widen to _is_graftable_span if sub-agent report bloat needs charting (it would
+    # add a tool_result_size score per sub-agent, a cardinality change worth its own test).
     if not _is_tool_span(observation):
         return None
     content = tool_content.get(_tool_use_id(observation) or "")
@@ -1501,9 +1504,9 @@ def _copy_event(
     The type tracks the source: a ``GENERATION`` becomes a ``generation-create``, anything
     else a ``span-create``. ``usageDetails`` and ``model`` are re-passed so Langfuse
     recomputes ``costDetails`` identically; an explicit ``costDetails`` is forwarded too.
-    For a visible ``tool:`` span, transcript-sourced ``input``/``output`` is grafted into the
-    create body (see :func:`_tool_additions`) so the fresh observation carries content the
-    native span lacked, set in the same create event that fixes its name and type.
+    For a graftable (``tool:`` / ``sub-agent:``) span, transcript-sourced ``input``/``output`` is
+    grafted into the create body (see :func:`_tool_additions`) so the fresh observation carries
+    content the native span lacked, set in the same create event that fixes its name and type.
 
     Args:
         observation: The source observation to copy.
@@ -1828,7 +1831,9 @@ def _strip_container_usage(copies: list[IngestEvent]) -> list[IngestEvent]:
 
     for event in copies:
         body = event["body"]
-        if event["type"] == "generation-create" or not body.get("usageDetails"):
+        if event["type"] == "generation-create":
+            continue
+        if not (body.get("usageDetails") or body.get("costDetails")):
             continue
         if _has_generation_descendant(body["id"]):
             body.pop("usageDetails", None)
@@ -2305,10 +2310,11 @@ def _assemble_copies(
     spans under a ``guards`` group and drops the no-op ones unless ``keep_noop_guards``
     (:func:`_apply_guard_groups`), stamps a lagging ``endTime`` onto ``hook_execution_complete``
     events (:func:`_stamp_hook_endtimes`), stamps WARNING/ERROR failure levels
-    (:func:`_apply_levels`), and demotes session-startup instants onto ``root_event``'s metadata
-    (:func:`_collapse_startup_instants`). View A wraps these in local step nodes; View B re-homes
-    them onto the cycle axis. ``root_event`` is the view's own synthetic root (its metadata is
-    mutated in place).
+    (:func:`_apply_levels`), demotes session-startup instants onto ``root_event``'s metadata
+    (:func:`_collapse_startup_instants`), and strips own usage from any container that has a
+    generation descendant (:func:`_strip_container_usage`). View A wraps these in local step
+    nodes; View B re-homes them onto the cycle axis. ``root_event`` is the view's own synthetic
+    root (its metadata is mutated in place).
     """
     tool_index = _build_tool_index(traces)
     request_index = _build_request_index(traces)
