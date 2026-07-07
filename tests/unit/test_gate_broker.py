@@ -392,6 +392,7 @@ def test_broker_service_gate_injects_despite_runtime_drift(
     # escalate to blocked.
     fake_bin = tmp_path / "bin"  # the waiting_spoke_env fake bin (holds gh); add tmux
     jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # pin old so the inject's append advances it
     tmux_log = _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
     env = {
         **waiting_spoke_env,
