@@ -4703,3 +4703,69 @@ class TestBlockedToolSynthesis:
         blocked = _blocked_tools(batch)
         assert len(blocked) == 2
         assert len({b["body"]["id"] for b in blocked}) == 2
+
+
+class TestHookEndTimeStamping:
+    """#157: hook_execution_complete events carry total_duration_ms but no endTime; stamp
+    endTime = startTime + total_duration_ms (time_source: lagging) and EXCLUDE them from
+    duration attribution, since that duration duplicates the .sh spans already in the hook
+    bucket — so rollup.duration.components is identical before vs after stamping (AC2 pin)."""
+
+    def _hook_under_tool(self, *, total_duration_ms: int | None = 2000) -> list:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:10Z",
+        )
+        tool = _obs(
+            "t1",
+            "tool:Edit",
+            parent="i1",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:05Z",
+            metadata={"attributes": {"tool_use_id": "tu-1"}},
+        )
+        meta: dict = {"tool_use_id": "tu-1"}
+        if total_duration_ms is not None:
+            meta["total_duration_ms"] = total_duration_ms
+        hook = _obs(
+            "h1",
+            "hook_execution_complete:PostToolUse",
+            type_="EVENT",
+            parent=None,
+            startTime="2026-01-02T00:00:01Z",
+            metadata=meta,
+        )
+        return [("tr", [interaction, tool, hook])]
+
+    def test_endtime_stamped_from_total_duration_ms(self) -> None:
+        batch = build_batch(self._hook_under_tool(), SPOKE)
+
+        body = _by_orig(batch, "tr", "h1")["body"]
+        assert body["endTime"] == "2026-01-02T00:00:03Z"
+        assert body["metadata"]["time_source"] == "lagging"
+
+    def test_hook_event_without_total_duration_is_not_stamped(self) -> None:
+        batch = build_batch(self._hook_under_tool(total_duration_ms=None), SPOKE)
+
+        body = _by_orig(batch, "tr", "h1")["body"]
+        assert body.get("endTime") is None
+        assert "time_source" not in (body.get("metadata") or {})
+
+    def test_stamped_hook_event_excluded_from_view_a_components(self) -> None:
+        # The pin: the stamped 2s duration must NOT appear in any bucket — the tool books its
+        # full 5s and there is no "other", exactly as when the event had no endTime.
+        batch = build_batch(self._hook_under_tool(), SPOKE)
+
+        duration = _by_orig(batch, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
+        assert duration == _dur(10_000, {"tool": 5_000, "self": 5_000})
+
+    def test_stamped_hook_event_excluded_from_cycle_turn_marker_rollup(self) -> None:
+        # The same pin for View B: a flattened turn-marker's own rollup.duration (#114) must also
+        # exclude the stamped hook event.
+        batch = build_cycle_batch(self._hook_under_tool(), SPOKE)
+
+        duration = _by_cycle(batch, "tr", "i1")["body"]["metadata"]["rollup"]["duration"]
+        assert duration == _dur(10_000, {"tool": 5_000, "self": 5_000})
