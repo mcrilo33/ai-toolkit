@@ -167,6 +167,9 @@ def test_parked_denies_file_writes(parked_spoke: Path, tool: str) -> None:
         pytest.param("cd sub && git commit -m x", id="chained-commit"),
         pytest.param("VAR=1 git commit -m x", id="env-prefixed-commit"),
         pytest.param("git -C . commit -m x", id="dashC-commit"),
+        # A `-c key=val` global option value must not orphan and hide the verb
+        # (the bypass spoke-main-guard closes the same way).
+        pytest.param("git -c core.pager=cat commit -m x", id="dashc-config-commit"),
     ],
 )
 def test_parked_denies_git_commit(parked_spoke: Path, command: str) -> None:

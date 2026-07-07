@@ -676,6 +676,9 @@ class TestPlanGateGuardRegistration:
         assert guard is not None, "plan-gate-guard not wired to Cursor beforeShellExecution"
         pattern = re.compile(guard["matcher"])
         assert pattern.search("git commit -m x")
+        # A `-c key=val` value must not break the chain to the verb (mirrors the
+        # spoke-main-guard matcher; is_git_commit's plainer form misses this).
+        assert pattern.search("git -c core.pager=cat commit -m x")
         assert not pattern.search("git status --short")
 
     def test_script_exists_and_executable(self) -> None:

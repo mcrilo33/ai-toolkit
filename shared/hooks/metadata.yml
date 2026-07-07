@@ -327,7 +327,7 @@ plan-gate-guard:
     matcher: "edit|create"
   cursor:
     event: beforeShellExecution
-    matcher: "git( +-[^ ]+| +-C +[^ ]+)* +commit( |$)"
+    matcher: "git( +-[cC] +[^ ]+| +-[^ ]+)* +commit( |$)"
 
 # parent-span-export (issue #66): telemetry Phase 2 — script causality. On every
 # Bash call, record the tool_use_id to <root>/.ai-toolkit/parent-span; telemetry.sh

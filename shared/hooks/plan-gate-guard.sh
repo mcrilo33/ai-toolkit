@@ -38,6 +38,16 @@ set -euo pipefail
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/lib/utils.sh"
 
+# is_gated_commit <command> — a `git commit` at a command boundary. Same
+# boundary-awareness as utils.sh's is_git_commit (start/`;`/`&`/`|`/backtick/`$(`,
+# env-assignment prefixes) but with a `-[cC] <value>` alternative LEADING the
+# option group so a `git -c core.pager=cat commit` value cannot orphan and hide
+# the verb — the bypass is_git_commit misses and spoke-main-guard closes the same
+# way (see its GATE_RE). Match-only + fail-open, so the tolerant heuristic is safe.
+is_gated_commit() {
+  printf '%s' "$1" | grep -qE '(^|[;&|`]|\$\()[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git([[:space:]]+(-[cC][[:space:]]+[^[:space:]]+|-[^[:space:]]+|--[^[:space:]]+))*[[:space:]]+commit\b'
+}
+
 INPUT=$(read_stdin)
 
 # ── Classify the tool call: is it a parked-write we care about? ──────
@@ -46,7 +56,7 @@ INPUT=$(read_stdin)
 # allowed. An empty command means a file-edit tool; care only about the writers.
 COMMAND=$(get_shell_command "$INPUT")
 if [ -n "$COMMAND" ]; then
-  is_git_commit "$COMMAND" || exit 0
+  is_gated_commit "$COMMAND" || exit 0
 else
   case "$(get_tool_name "$INPUT")" in
     Edit | Write | NotebookEdit | MultiEdit | edit | create) ;;
