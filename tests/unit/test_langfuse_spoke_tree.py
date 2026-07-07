@@ -31,6 +31,7 @@ from telemetry.langfuse_spoke_tree import (
     ToolContent,
     _copy_id,
     _decomp_metadata,
+    _is_own_output,
     apply_llm_decomposition,
     apply_mode_lane_tags,
     apply_request_body_metadata,
@@ -1630,6 +1631,37 @@ class TestExcludesOwnOutput:
 
         # Only the native traces survive; the synthetic observations were never sourced.
         assert fetched == [(tid, obs) for tid, _name, obs in native]
+
+    def test_fetch_session_drops_prior_view_b_trace(self) -> None:
+        # #156: View B (spokecycle-<id>, name spoke-cycle:<id>) also carries
+        # sessionId == spoke_run_id, so a rebuild would source its ~2,100 copies as if
+        # native and multiply them. It must be self-excluded exactly like View A.
+        native = [(tid, None, obs) for tid, obs in _traces()]
+        prior_b = (
+            cycle_trace_id_for(SESSION),
+            f"spoke-cycle:{SESSION}",
+            [_obs("cyc-y", "Bash")],
+        )
+        prior_b_old = ("spokecycle-legacy", f"spoke-cycle:{SESSION}", [_obs("cyc-z", "Bash")])
+
+        fetched = fetch_session(SESSION, _stub_get(native + [prior_b, prior_b_old]))
+
+        assert fetched == [(tid, obs) for tid, _name, obs in native]
+
+    def test_is_own_output_excludes_view_b_by_id(self) -> None:
+        trace = {"id": cycle_trace_id_for(SESSION), "name": None}
+
+        assert _is_own_output(trace, SESSION) is True
+
+    def test_is_own_output_excludes_view_b_by_name(self) -> None:
+        trace = {"id": "spokecycle-legacy", "name": f"spoke-cycle:{SESSION}"}
+
+        assert _is_own_output(trace, SESSION) is True
+
+    def test_is_own_output_keeps_a_native_trace(self) -> None:
+        trace = {"id": "trace-native", "name": "claude_code.interaction"}
+
+        assert _is_own_output(trace, SESSION) is False
 
     def test_rerun_with_prior_output_in_session_is_idempotent(self) -> None:
         target_id = trace_id_for(SESSION)
