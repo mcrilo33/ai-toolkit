@@ -33,6 +33,16 @@
 #     stdout, the exit code, and dispatch behavior are untouched. A
 #     `Split: intentional — <why>` body line in ANY issue of the chain records the
 #     deliberate split and silences the lint for that chain only.
+#   * UNCHAINED MERGE-CANDIDATE LINT (issue #167) — the #125 lint above only catches
+#     blocked-by CHAINS. A cluster of READY, mutually-unblocked issues sharing a
+#     concrete scope token with NO dependency edge between them is serialized by the
+#     greedy pack yet never surfaced (the #158/#160/#161/#162 case). This lint groups
+#     the ready set by scope-token overlap and prints one `⚠ merge candidates … ready
+#     & unchained` proposal per cluster of ≥2 on STDERR. A cluster fully contained in
+#     one #125 chain component is skipped (already on a #125 line), but a collision
+#     ACROSS two separate chains — which #125 never pairs — is still surfaced, so
+#     nothing is double-reported yet nothing real is dropped. Same detection-only /
+#     `Split: intentional` semantics.
 #
 # Read-only. Run on the hub (main checkout). Functions are source-guarded so the unit
 # tests can drive `plan_from_json` with a fixture graph without any network round-trip.
@@ -222,26 +232,15 @@ def order_chain(comp, comp_edges):
     return order
 
 
-def print_merge_candidates(issues, children):
-    """Warn on stderr about blocked-by chains of open issues with colliding scopes.
+def connected_components(adj):
+    """Connected components of an undirected adjacency map, each as a set of nodes.
 
-    Such a chain is strictly serialized AND scope-colliding — the planner can never
-    batch its members, so filing them separately bought zero throughput (issue #125).
-    Detection-only: prints proposals on stderr, never touches the batch on stdout,
-    the exit code, or which issues get dispatched. A `Split: intentional` marker in
-    any member suppresses the proposal for that chain only.
+    Shared by both merge-candidate lints (#125 chains, #167 unchained clusters) so
+    their clustering can never silently diverge. Isolated nodes absent from `adj`
+    are not walked — a caller wanting singletons must seed `adj` with them.
     """
-    edges = [
-        (parent, child)
-        for parent, kids in children.items()
-        for child in kids
-        if conflict(issues[parent]["scope"], issues[child]["scope"])
-    ]
-    adj = {}
-    for a, b in edges:
-        adj.setdefault(a, set()).add(b)
-        adj.setdefault(b, set()).add(a)
     seen = set()
+    comps = []
     for start in sorted(adj):
         if start in seen:
             continue
@@ -254,8 +253,38 @@ def print_merge_candidates(issues, children):
             comp.add(n)
             stack.extend(adj[n] - comp)
         seen |= comp
+        comps.append(comp)
+    return comps
+
+
+def print_merge_candidates(issues, children):
+    """Warn on stderr about blocked-by chains of open issues with colliding scopes.
+
+    Such a chain is strictly serialized AND scope-colliding — the planner can never
+    batch its members, so filing them separately bought zero throughput (issue #125).
+    Detection-only: prints proposals on stderr, never touches the batch on stdout,
+    the exit code, or which issues get dispatched. A `Split: intentional` marker in
+    any member suppresses the proposal for that chain only.
+
+    Returns the list of reported components (each a set of issue numbers), so the
+    unchained lint (#167) can skip a cluster this chain already covers and never
+    double-report the same collision.
+    """
+    reported = []
+    edges = [
+        (parent, child)
+        for parent, kids in children.items()
+        for child in kids
+        if conflict(issues[parent]["scope"], issues[child]["scope"])
+    ]
+    adj = {}
+    for a, b in edges:
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+    for comp in connected_components(adj):
         if any(issues[n]["split"] for n in comp):
             continue  # deliberate split — the chain opted out of the proposal
+        reported.append(comp)
         comp_edges = [(a, b) for a, b in edges if a in comp and b in comp]
         shared = set()
         for a, b in comp_edges:
@@ -269,6 +298,61 @@ def print_merge_candidates(issues, children):
         print(
             f"⚠ merge candidates: {chain} ({detail}, strictly serialized)"
             " — consider one issue with subtasks",
+            file=sys.stderr,
+        )
+    return reported
+
+
+def print_unchained_merge_candidates(issues, ready_nums, flagged_components):
+    """Warn on stderr about a cluster of ready issues sharing scope with no deps.
+
+    The #125 lint fires only on blocked-by CHAINS. An UNCHAINED cluster — ready,
+    mutually-unblocked issues (all blockers closed) that share a concrete scope
+    token but have no dependency edge between them — is serialized by the greedy
+    disjoint-scope pack yet never surfaced, so splitting bought zero throughput
+    (issue #167, the #158/#160/#161/#162 case merged by hand as #165).
+
+    Groups the ready set by concrete-token overlap (the same literal set-intersection
+    the packer uses) and prints one umbrella-candidate hint per connected cluster of
+    ≥2. `flagged_components` is what #125 already reported: a cluster fully contained
+    in one such component is skipped (that collision is already on the #125 line), but
+    two ready heads colliding ACROSS separate chains — which #125 never pairs — are
+    still surfaced. Exclusive (`Scope: *`/missing) issues carry no named token to
+    report and are left to #125's "exclusive scope" path.
+
+    Detection-only: prints to stderr, never touches the batch, the exit code, or
+    which issues dispatch. A `Split: intentional` marker opts an issue out of its own
+    candidacy, so a deliberately-separate issue no longer silences its unmarked peers.
+    """
+    # Candidates: ready, with a concrete (non-exclusive) scope, and not themselves
+    # opted out via `Split: intentional`. Two share an edge when their tokens overlap.
+    candidates = sorted(
+        n
+        for n in ready_nums
+        if issues[n]["scope"] is not None and not issues[n]["split"]
+    )
+    adj = {n: set() for n in candidates}
+    for i, a in enumerate(candidates):
+        for b in candidates[i + 1:]:
+            if issues[a]["scope"] & issues[b]["scope"]:
+                adj[a].add(b)
+                adj[b].add(a)
+
+    for comp in connected_components(adj):
+        if len(comp) < 2:
+            continue
+        if any(comp <= fc for fc in flagged_components):
+            continue  # already reported on a #125 chain line — don't double-report
+        members = sorted(comp)
+        shared = set()
+        for i, a in enumerate(members):
+            for b in members[i + 1:]:
+                shared |= issues[a]["scope"] & issues[b]["scope"]
+        names = " ".join(f"#{n}" for n in members)
+        print(
+            f"⚠ merge candidates: {names} "
+            f"(scope collides on {', '.join(sorted(shared))}, ready & unchained)"
+            " — consider one umbrella issue",
             file=sys.stderr,
         )
 
@@ -460,7 +544,9 @@ def main():
     if batch:
         print(" ".join(str(n) for n in batch))
 
-    print_merge_candidates(issues, children)
+    flagged_components = print_merge_candidates(issues, children)
+    ready_nums = {info["number"] for info in ready}
+    print_unchained_merge_candidates(issues, ready_nums, flagged_components)
     print_undeclared_dependencies(issues, children, os.environ.get("_BATCH_REPO_ROOT", ""))
 
 
