@@ -4431,3 +4431,34 @@ def test_spawn_watchdog_strips_copy_guard(tmp_path: Path) -> None:
     assert _wait_for_glob(tmp_path, "hub-afk-self.*/hub-afk.sh"), (
         "the spawned watchdog must exec from a copy despite the inherited guard"
     )
+
+
+def test_self_copy_tests_survive_leaked_running_copy_env() -> None:
+    # #169: the post-land sweep (issue #124) runs the full suite as a child of the
+    # afk supervisor, which execs from a private COPY and exports AFK_RUNNING_COPY=1.
+    # That guard leaked through the sweep's pytest into the self-copy tests — which
+    # spread os.environ into their subprocesses — so _afk_exec_self_copy correctly
+    # no-op'd, no copy dir was created, and the three assertions failed (green on a
+    # direct hub run, red under the sweep). Re-run those three with the guard leaked
+    # into the environment: the isolation fixture must strip it so they stay green
+    # regardless of the launching environment.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            f"{REPO_ROOT}/tests/unit/test_hub_afk.py::test_exec_self_copy_execs_from_private_copy",
+            f"{REPO_ROOT}/tests/unit/test_hub_afk.py::test_watchdog_entry_execs_from_private_copy",
+            f"{REPO_ROOT}/tests/unit/test_hub_afk.py::test_drain_survives_source_rewrite_mid_run",
+        ],
+        cwd=REPO_ROOT,
+        env={**os.environ, "AFK_RUNNING_COPY": "1"},
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
