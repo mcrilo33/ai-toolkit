@@ -171,6 +171,16 @@ run_step() {
 BUILD_ARGS=("$TELEMETRY_DIR/langfuse_spoke_tree.py" "$SPOKE_RUN_ID")
 if [ -n "$BODY_DIR" ]; then
   BUILD_ARGS+=(--request-bodies "$BODY_DIR" --root "$WT_DIR")
+  # Commit timeline nodes (#162): dump the spoke branch's origin/main..HEAD commits with numstat
+  # for the view builder to synthesize commit:<sha7> nodes. Best-effort — a checkout without an
+  # origin/main ref (or no commits ahead) yields no dump, so no --commits is passed. The unit
+  # separator (\037) delimits the format fields so a commit subject never collides with them.
+  COMMITS_DUMP="$AIT_DIR/commits.dump"
+  US=$'\037'
+  if git -C "$WT_DIR" log --numstat --format="commit${US}%H${US}%aI${US}%s" \
+       origin/main..HEAD > "$COMMITS_DUMP" 2>/dev/null && [ -s "$COMMITS_DUMP" ]; then
+    BUILD_ARGS+=(--commits "$COMMITS_DUMP")
+  fi
 fi
 [ -n "$REBUILD" ] && BUILD_ARGS+=("$REBUILD")
 run_step "loaded-context itemization (#87)" "${BUILD_ARGS[@]}"

@@ -188,6 +188,16 @@ _ROOT_PREFIX = "spokeroot-"
 _COPY_PREFIX = "tree-"
 # Deterministic id prefix for the synthetic cycle-step nodes (#100, derived from the ledger).
 _STEP_PREFIX = "tree-step-"
+# Synthetic timeline nodes (#162): git commits and the PLAN-gate park, keyed off the spoke run
+# id (+ sha) so a rerun overwrites the same node. The ``wait:`` name prefix routes the park into
+# the duration ``wait`` bucket (see _duration_class); the field separator is the byte git emits
+# between --format fields in the commit dump (_parse_commits).
+_COMMIT_PREFIX = "tree-commit-"
+_GATE_PARK_PREFIX = "tree-gatepark-"
+_GATE_PARK_NODE_NAME = "wait:gate-park"
+_WAIT_PREFIX = "wait:"
+_COMMIT_FIELD_SEP = "\x1f"
+_COMMIT_LINE_MARKER = "commit"
 # View B (#113) — the second "steps -> work" trace assembled from the same observation copies,
 # re-homed onto a pure cycle axis (preStep / step:N / postStep). Its ids live in a separate
 # namespace so its copies never collide with View A's in the local Langfuse store.
@@ -1583,7 +1593,7 @@ def _duration_class(event: IngestEvent) -> str:
     if event["type"] == "generation-create":
         return "llm_request"
     name = body.get("name") or ""
-    if _is_gate_observation(body) or name == _FOLD_BLOCKED_NAME:
+    if _is_gate_observation(body) or name == _FOLD_BLOCKED_NAME or name.startswith(_WAIT_PREFIX):
         return "wait"
     if name.startswith("step:") or name in (_PRE_STEP_NAME, _POST_STEP_NAME):
         return "step"
@@ -2236,6 +2246,7 @@ def build_batch(
     tool_content: dict[str, ToolContent] | None = None,
     *,
     keep_noop_guards: bool = False,
+    commits: list[dict[str, Any]] | None = None,
 ) -> list[IngestEvent]:
     """Assemble one nested trace from a spoke's source traces and their observations.
 
@@ -2302,6 +2313,20 @@ def build_batch(
         copies, traces, tool_content, spoke_run_id=spoke_run_id, trace_id=trace_id
     )
     events = [trace_event, root_event, *step_events, *copies]
+    events.extend(
+        _commit_events(
+            commits or [],
+            spoke_run_id=spoke_run_id,
+            trace_id=trace_id,
+            cycle=False,
+            parent_for=lambda _at: root_id,
+        )
+    )
+    gate_park = _gate_park_event(
+        traces, spoke_run_id=spoke_run_id, trace_id=trace_id, cycle=False, parent_id=root_id
+    )
+    if gate_park is not None:
+        events.append(gate_park)
     _apply_container_rollups(events, duration_exclude=_hook_event_exclude(events))
     return events
 
@@ -2605,6 +2630,7 @@ def build_cycle_batch(
     tool_content: dict[str, ToolContent] | None = None,
     *,
     keep_noop_guards: bool = False,
+    commits: list[dict[str, Any]] | None = None,
 ) -> list[IngestEvent]:
     """Assemble the View B (steps -> work) ``spokecycle-<spoke>`` trace (#113).
 
@@ -2687,7 +2713,34 @@ def build_cycle_batch(
         latest=_latest_time(traces),
     )
     events = [trace_event, root_event, *step_events, *copies]
-    _apply_container_rollups(events, duration_exclude=marker_ids | _hook_event_exclude(events))
+    step_id_for = _cycle_step_ids(spoke_run_id, windows) if windows else {}
+
+    def _cycle_commit_parent(authored_at: str) -> str:
+        if not windows:
+            return root_id
+        return step_id_for.get(_cycle_step_for(authored_at, windows), root_id)
+
+    events.extend(
+        _commit_events(
+            commits or [],
+            spoke_run_id=spoke_run_id,
+            trace_id=trace_id,
+            cycle=True,
+            parent_for=_cycle_commit_parent,
+        )
+    )
+    # The park node is a visible block on the axis, but it overlaps the step partition it falls in,
+    # so it is EXCLUDED from View B's duration attribution (the axis already partitions the time).
+    gate_exclude: set[str] = set()
+    gate_park = _gate_park_event(
+        traces, spoke_run_id=spoke_run_id, trace_id=trace_id, cycle=True, parent_id=root_id
+    )
+    if gate_park is not None:
+        events.append(gate_park)
+        gate_exclude = {gate_park["id"]}
+    _apply_container_rollups(
+        events, duration_exclude=marker_ids | _hook_event_exclude(events) | gate_exclude
+    )
     return events
 
 
@@ -3678,8 +3731,8 @@ def _earliest_after(candidates: list[str], floor: datetime) -> str | None:
     return best_str
 
 
-def _gate_park_ms(traces: list[TraceObservations]) -> int | None:
-    """Return the PLAN-gate park wait in ms, or None when the spoke never parked at a gate.
+def _gate_park_bounds(traces: list[TraceObservations]) -> tuple[str, str] | None:
+    """Return the PLAN-gate park's ``(start, end)`` ISO bounds, or None when the spoke never parked.
 
     The park starts at the end of the earliest gate observation (:func:`_is_gate_observation`,
     the ``spoke-ready.sh --gate`` emission) and ends at the first genuine spoke activity
@@ -3704,7 +3757,156 @@ def _gate_park_ms(traces: list[TraceObservations]) -> int | None:
     resume = _earliest_after(activity_starts, gate_floor)
     if resume is None:
         return None
-    return _elapsed_ms(gate_end, resume)
+    return gate_end, resume
+
+
+def _gate_park_ms(traces: list[TraceObservations]) -> int | None:
+    """Return the PLAN-gate park wait in ms, or None when the spoke never parked at a gate."""
+    bounds = _gate_park_bounds(traces)
+    return _elapsed_ms(*bounds) if bounds is not None else None
+
+
+def _parse_commits(dump: str) -> list[dict[str, Any]]:
+    """Parse a ``git log --numstat`` dump into per-commit records (#162).
+
+    The dump is produced with a ``commit<US>%H<US>%aI<US>%s`` format line per commit (``<US>`` is
+    :data:`_COMMIT_FIELD_SEP`), followed by the commit's ``additions<TAB>deletions<TAB>path``
+    numstat lines. A binary file's counts are ``-`` and contribute 0. Records preserve dump order.
+
+    Args:
+        dump: The raw ``git log --numstat`` output.
+
+    Returns:
+        One record per commit: ``{sha, message, authored_at, files, additions, deletions}``.
+    """
+    commits: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for line in dump.splitlines():
+        if line.startswith(_COMMIT_LINE_MARKER + _COMMIT_FIELD_SEP):
+            parts = line.split(_COMMIT_FIELD_SEP)
+            if len(parts) < 4:
+                current = None
+                continue
+            current = {
+                "sha": parts[1],
+                "message": _COMMIT_FIELD_SEP.join(parts[3:]),
+                "authored_at": parts[2],
+                "files": [],
+                "additions": 0,
+                "deletions": 0,
+            }
+            commits.append(current)
+        elif current is not None and line.strip():
+            columns = line.split("\t")
+            if len(columns) == 3:
+                added, deleted, path = columns
+                current["additions"] += int(added) if added.isdigit() else 0
+                current["deletions"] += int(deleted) if deleted.isdigit() else 0
+                current["files"].append(path)
+    return commits
+
+
+def _load_commits(path: Path | None) -> list[dict[str, Any]]:
+    """Read and parse a commit dump path, or return ``[]`` when absent/unreadable (best-effort)."""
+    if path is None:
+        return []
+    try:
+        return _parse_commits(path.read_text(encoding="utf-8"))
+    except OSError:
+        logger.warning("cannot read commits dump %s", path)
+        return []
+
+
+def _commit_id(spoke_run_id: str, sha: str, *, cycle: bool) -> str:
+    """Return the deterministic id of a commit node (per view, idempotent across reruns)."""
+    namespace = "cyccommit" if cycle else "commit"
+    digest = hashlib.sha1(f"{spoke_run_id}:{namespace}:{sha}".encode()).hexdigest()[:24]
+    return _COMMIT_PREFIX + digest
+
+
+def _gate_park_node_id(spoke_run_id: str, *, cycle: bool) -> str:
+    """Return the deterministic id of the gate-park node (per view, idempotent across reruns)."""
+    namespace = "cycgatepark" if cycle else "gatepark"
+    digest = hashlib.sha1(f"{spoke_run_id}:{namespace}".encode()).hexdigest()[:24]
+    return _GATE_PARK_PREFIX + digest
+
+
+def _commit_events(
+    commits: list[dict[str, Any]],
+    *,
+    spoke_run_id: str,
+    trace_id: str,
+    cycle: bool,
+    parent_for: Callable[[str], str],
+) -> list[IngestEvent]:
+    """Build ``commit:<sha7>`` timeline nodes, each an instant at its author time (#162).
+
+    Each node is placed under ``parent_for(author_time)`` (the root in View A, the containing step
+    in View B) and carries ``{sha, message, files, additions, deletions}`` metadata but no usage,
+    so it never affects trace cost or the duration rollup.
+    """
+    events: list[IngestEvent] = []
+    for commit in commits:
+        sha = str(commit["sha"])
+        authored_at = str(commit["authored_at"])
+        node_id = _commit_id(spoke_run_id, sha, cycle=cycle)
+        events.append(
+            {
+                "id": node_id,
+                "type": "span-create",
+                "timestamp": authored_at,
+                "body": {
+                    "id": node_id,
+                    "traceId": trace_id,
+                    "parentObservationId": parent_for(authored_at),
+                    "name": f"commit:{sha[:7]}",
+                    "startTime": authored_at,
+                    "endTime": authored_at,
+                    "metadata": {
+                        "sha": sha,
+                        "message": commit["message"],
+                        "files": commit["files"],
+                        "additions": commit["additions"],
+                        "deletions": commit["deletions"],
+                    },
+                },
+            }
+        )
+    return events
+
+
+def _gate_park_event(
+    traces: list[TraceObservations],
+    *,
+    spoke_run_id: str,
+    trace_id: str,
+    cycle: bool,
+    parent_id: str,
+) -> IngestEvent | None:
+    """Build the ``wait:gate-park`` timeline block from the gate-park bounds, or None (#162).
+
+    The block spans the gate's end to the resumption after approval (:func:`_gate_park_bounds`);
+    its ``wait:`` name routes it into the duration ``wait`` bucket, so in View A the park time
+    moves out of the root's ``self`` gap without changing ``total_ms``.
+    """
+    bounds = _gate_park_bounds(traces)
+    if bounds is None:
+        return None
+    start, end = bounds
+    node_id = _gate_park_node_id(spoke_run_id, cycle=cycle)
+    return {
+        "id": node_id,
+        "type": "span-create",
+        "timestamp": start,
+        "body": {
+            "id": node_id,
+            "traceId": trace_id,
+            "parentObservationId": parent_id,
+            "name": _GATE_PARK_NODE_NAME,
+            "startTime": start,
+            "endTime": end,
+        },
+    }
 
 
 def build_score_events(
@@ -3921,6 +4123,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "(#157)."
         ),
     )
+    parser.add_argument(
+        "--commits",
+        type=Path,
+        default=None,
+        help=(
+            "A `git log --numstat` dump of the spoke branch's origin/main..HEAD commits "
+            "(commit<US>%%H<US>%%aI<US>%%s format lines); each becomes a commit:<sha7> timeline "
+            "node (#162). Omitted for a non-land re-run (no worktree to read commits from)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -3949,11 +4161,20 @@ def main(argv: list[str] | None = None) -> int:
     traces = fetch_session(args.spoke_run_id, get)
     scan_root = transcript_scan_root(args.projects, args.root.resolve())
     tool_content = scan_transcripts(scan_root, _tool_span_ids(traces))
+    commits = _load_commits(args.commits)
     batch = build_batch(
-        traces, args.spoke_run_id, tool_content, keep_noop_guards=args.keep_noop_guards
+        traces,
+        args.spoke_run_id,
+        tool_content,
+        keep_noop_guards=args.keep_noop_guards,
+        commits=commits,
     )
     cycle_batch = build_cycle_batch(
-        traces, args.spoke_run_id, tool_content, keep_noop_guards=args.keep_noop_guards
+        traces,
+        args.spoke_run_id,
+        tool_content,
+        keep_noop_guards=args.keep_noop_guards,
+        commits=commits,
     )
     mode, lane = read_mode_lane(args.root.resolve())
     apply_mode_lane_tags(batch, mode, lane)
@@ -4017,6 +4238,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{efforts} llm_requests effort-tagged, "
         f"{len(score_events)} numeric scores emitted, "
         f"{len(step_scores)} per-phase step cost/token scores emitted, "
+        f"{len(commits)} commit nodes synthesized, "
         f"tagged mode={mode} lane={lane}; "
         f"{len(cycle_batch) - 2} observations assembled under cycle trace {cycle_trace_id}"
     )
