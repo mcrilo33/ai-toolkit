@@ -66,7 +66,10 @@ def _isolated_afk_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     # AFK_RUNNING_COPY=1; that (or a host AFK_SELF_COPY=0 opt-out) flowed through the
     # tests' os.environ into _afk_exec_self_copy, which then correctly no-op'd — green
     # on a direct hub run, red under the sweep. Tests that need a guard set still pass
-    # it explicitly via _call(env=...) or an inline `export`.
+    # it explicitly via _call(env=...) or an inline `export`. Because this strip hides
+    # an inherited guard from every test in the module, the leak-vs-strip contract is
+    # covered explicitly by test_self_copy_tests_survive_leaked_running_copy_env — keep
+    # it when refactoring these self-copy tests.
     monkeypatch.delenv("AFK_RUNNING_COPY", raising=False)
     monkeypatch.delenv("AFK_SELF_COPY", raising=False)
 
@@ -4447,10 +4450,16 @@ def test_self_copy_tests_survive_leaked_running_copy_env() -> None:
     # afk supervisor, which execs from a private COPY and exports AFK_RUNNING_COPY=1.
     # That guard leaked through the sweep's pytest into the self-copy tests — which
     # spread os.environ into their subprocesses — so _afk_exec_self_copy correctly
-    # no-op'd, no copy dir was created, and the three assertions failed (green on a
-    # direct hub run, red under the sweep). Re-run those three with the guard leaked
-    # into the environment: the isolation fixture must strip it so they stay green
-    # regardless of the launching environment.
+    # no-op'd, no copy dir was created, and their assertions failed (green on a direct
+    # hub run, red under the sweep). Re-run the two cheap self-copy tests with the
+    # guard leaked into the environment: the isolation fixture must strip it so they
+    # stay green regardless of the launching environment. Two lightweight tests prove
+    # the leak-and-strip mechanism (shared by the third, sleeping drain test) without
+    # re-paying its ~3s cost or risking the 180s timeout tripping under sweep load.
+    selected = [
+        "test_exec_self_copy_execs_from_private_copy",
+        "test_watchdog_entry_execs_from_private_copy",
+    ]
     result = subprocess.run(
         [
             sys.executable,
@@ -4459,9 +4468,7 @@ def test_self_copy_tests_survive_leaked_running_copy_env() -> None:
             "-q",
             "-p",
             "no:cacheprovider",
-            f"{REPO_ROOT}/tests/unit/test_hub_afk.py::test_exec_self_copy_execs_from_private_copy",
-            f"{REPO_ROOT}/tests/unit/test_hub_afk.py::test_watchdog_entry_execs_from_private_copy",
-            f"{REPO_ROOT}/tests/unit/test_hub_afk.py::test_drain_survives_source_rewrite_mid_run",
+            *(f"{Path(__file__)}::{name}" for name in selected),
         ],
         cwd=REPO_ROOT,
         env={**os.environ, "AFK_RUNNING_COPY": "1"},
@@ -4471,3 +4478,7 @@ def test_self_copy_tests_survive_leaked_running_copy_env() -> None:
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+    # Guard against a future skip marker (or a rename selecting nothing) silently
+    # passing: require both selected tests to have actually run and passed.
+    assert f"{len(selected)} passed" in result.stdout, result.stdout + result.stderr
+    assert "skipped" not in result.stdout, result.stdout + result.stderr
