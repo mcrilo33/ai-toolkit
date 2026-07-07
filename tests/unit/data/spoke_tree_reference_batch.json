@@ -1,0 +1,684 @@
+{
+  "view_a": [
+    {
+      "id": "spoketree-23b79fa73d155fc8",
+      "type": "trace-create",
+      "timestamp": "2026-01-02T00:00:00Z",
+      "body": {
+        "id": "spoketree-23b79fa73d155fc8",
+        "name": "spoke-tree:feature/22-demo+1700000000",
+        "sessionId": "feature/22-demo+1700000000",
+        "timestamp": "2026-01-02T00:00:00Z",
+        "metadata": {
+          "schema_rev": 2
+        }
+      }
+    },
+    {
+      "id": "spokeroot-23b79fa73d155fc8",
+      "type": "span-create",
+      "timestamp": "2026-01-02T00:00:00Z",
+      "body": {
+        "id": "spokeroot-23b79fa73d155fc8",
+        "traceId": "spoketree-23b79fa73d155fc8",
+        "name": "spoke:feature/22-demo+1700000000",
+        "startTime": "2026-01-02T00:00:00Z",
+        "metadata": {
+          "rollup": {
+            "reused": 900,
+            "written": 300,
+            "input": 120,
+            "output": 45,
+            "duration": {
+              "total_ms": 1000,
+              "components": {
+                "llm_request": 1000,
+                "tool": 0,
+                "hook": 0,
+                "script": 0,
+                "step": 0,
+                "wait": 0,
+                "turn": 0,
+                "self": 0,
+                "other": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "tree-56272d712a1c0fa5292d720a",
+      "type": "span-create",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "body": {
+        "id": "tree-56272d712a1c0fa5292d720a",
+        "traceId": "spoketree-23b79fa73d155fc8",
+        "parentObservationId": "spokeroot-23b79fa73d155fc8",
+        "name": "claude_code.interaction",
+        "startTime": null,
+        "endTime": null,
+        "metadata": {
+          "kind": "turn",
+          "rollup": {
+            "reused": 900,
+            "written": 300,
+            "input": 120,
+            "output": 45,
+            "duration": {
+              "total_ms": 1000,
+              "components": {
+                "llm_request": 1000,
+                "tool": 0,
+                "hook": 0,
+                "script": 0,
+                "step": 0,
+                "wait": 0,
+                "turn": 0,
+                "self": 0,
+                "other": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "tree-616ca7b41f1f925045187a56",
+      "type": "span-create",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "body": {
+        "id": "tree-616ca7b41f1f925045187a56",
+        "traceId": "spoketree-23b79fa73d155fc8",
+        "parentObservationId": "tree-56272d712a1c0fa5292d720a",
+        "name": "Bash",
+        "startTime": null,
+        "endTime": null,
+        "metadata": {
+          "attributes": {
+            "tool_name": "Bash",
+            "tool_use_id": "tu-1",
+            "gen_ai.tool.call.id": "tu-1"
+          },
+          "rollup": {
+            "reused": 0,
+            "written": 0,
+            "input": 0,
+            "output": 0,
+            "duration": {
+              "total_ms": 0,
+              "components": {
+                "llm_request": 0,
+                "tool": 0,
+                "hook": 0,
+                "script": 0,
+                "step": 0,
+                "wait": 0,
+                "turn": 0,
+                "self": 0,
+                "other": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "tree-b79ad3cca59d9cf64269b85d",
+      "type": "generation-create",
+      "timestamp": "2026-01-02T00:00:00Z",
+      "body": {
+        "id": "tree-b79ad3cca59d9cf64269b85d",
+        "traceId": "spoketree-23b79fa73d155fc8",
+        "parentObservationId": "tree-56272d712a1c0fa5292d720a",
+        "name": "llm_request",
+        "startTime": "2026-01-02T00:00:00Z",
+        "endTime": "2026-01-02T00:00:01Z",
+        "input": "hello",
+        "output": "hi there",
+        "usageDetails": {
+          "input": 120,
+          "output": 45,
+          "cache_read_input_tokens": 900,
+          "cache_creation_input_tokens": 300
+        },
+        "metadata": {
+          "kind": "turn",
+          "rollup": {
+            "input": 120
+          }
+        },
+        "model": "claude-opus-4-8"
+      }
+    },
+    {
+      "id": "tree-cf5310d4443536322a8d7a54",
+      "type": "span-create",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "body": {
+        "id": "tree-cf5310d4443536322a8d7a54",
+        "traceId": "spoketree-23b79fa73d155fc8",
+        "parentObservationId": "spokeroot-23b79fa73d155fc8",
+        "name": "step:green",
+        "startTime": null,
+        "endTime": null,
+        "metadata": {
+          "kind": "step"
+        }
+      }
+    },
+    {
+      "id": "tree-632171f2ff147abbbf2e3e2f",
+      "type": "span-create",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "body": {
+        "id": "tree-632171f2ff147abbbf2e3e2f",
+        "traceId": "spoketree-23b79fa73d155fc8",
+        "parentObservationId": "tree-guards-63e90f415ef2dc4eca50409b",
+        "name": "PreToolUse.sh",
+        "startTime": null,
+        "endTime": null,
+        "metadata": {
+          "attributes": {
+            "workflow.kind": "hook",
+            "hook_event": "PreToolUse",
+            "tool_use_id": "tu-1"
+          }
+        }
+      }
+    },
+    {
+      "id": "tree-96a45b0a4cc0bffc5b3f8624",
+      "type": "span-create",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "body": {
+        "id": "tree-96a45b0a4cc0bffc5b3f8624",
+        "traceId": "spoketree-23b79fa73d155fc8",
+        "parentObservationId": "tree-guards-6ec869d60ae8f1486a0abb4a",
+        "name": "Stop.sh",
+        "startTime": null,
+        "endTime": null,
+        "metadata": {
+          "attributes": {
+            "workflow.kind": "hook",
+            "hook_event": "Stop"
+          }
+        }
+      }
+    },
+    {
+      "id": "tree-guards-63e90f415ef2dc4eca50409b",
+      "type": "span-create",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "body": {
+        "id": "tree-guards-63e90f415ef2dc4eca50409b",
+        "traceId": "spoketree-23b79fa73d155fc8",
+        "parentObservationId": "tree-616ca7b41f1f925045187a56",
+        "name": "guards",
+        "startTime": "2026-01-01T00:00:00Z",
+        "endTime": null,
+        "metadata": {
+          "count": 1,
+          "total_ms": 0,
+          "by_hook": {
+            "PreToolUse.sh": {
+              "count": 1,
+              "ms": 0
+            }
+          },
+          "decisions": [],
+          "rollup": {
+            "reused": 0,
+            "written": 0,
+            "input": 0,
+            "output": 0,
+            "duration": {
+              "total_ms": 0,
+              "components": {
+                "llm_request": 0,
+                "tool": 0,
+                "hook": 0,
+                "script": 0,
+                "step": 0,
+                "wait": 0,
+                "turn": 0,
+                "self": 0,
+                "other": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "tree-guards-6ec869d60ae8f1486a0abb4a",
+      "type": "span-create",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "body": {
+        "id": "tree-guards-6ec869d60ae8f1486a0abb4a",
+        "traceId": "spoketree-23b79fa73d155fc8",
+        "parentObservationId": "spokeroot-23b79fa73d155fc8",
+        "name": "guards:session",
+        "startTime": "2026-01-01T00:00:00Z",
+        "endTime": null,
+        "metadata": {
+          "count": 1,
+          "total_ms": 0,
+          "by_hook": {
+            "Stop.sh": {
+              "count": 1,
+              "ms": 0
+            }
+          },
+          "decisions": [],
+          "rollup": {
+            "reused": 0,
+            "written": 0,
+            "input": 0,
+            "output": 0,
+            "duration": {
+              "total_ms": 0,
+              "components": {
+                "llm_request": 0,
+                "tool": 0,
+                "hook": 0,
+                "script": 0,
+                "step": 0,
+                "wait": 0,
+                "turn": 0,
+                "self": 0,
+                "other": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "tree-commit-f9eb36e0f4eb9e60c6bfe88f",
+      "type": "span-create",
+      "timestamp": "2026-01-02T00:00:00Z",
+      "body": {
+        "id": "tree-commit-f9eb36e0f4eb9e60c6bfe88f",
+        "traceId": "spoketree-23b79fa73d155fc8",
+        "parentObservationId": "spokeroot-23b79fa73d155fc8",
+        "name": "commit:aaaaaaa",
+        "startTime": "2026-01-02T00:00:00Z",
+        "endTime": "2026-01-02T00:00:00Z",
+        "metadata": {
+          "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "message": "test(telemetry): RED for reference spoke",
+          "files": [
+            "tests/unit/test_x.py"
+          ],
+          "additions": 12,
+          "deletions": 0
+        }
+      }
+    },
+    {
+      "id": "tree-commit-a376680990b7ab0a1f531f2e",
+      "type": "span-create",
+      "timestamp": "2026-01-02T00:00:02Z",
+      "body": {
+        "id": "tree-commit-a376680990b7ab0a1f531f2e",
+        "traceId": "spoketree-23b79fa73d155fc8",
+        "parentObservationId": "spokeroot-23b79fa73d155fc8",
+        "name": "commit:bbbbbbb",
+        "startTime": "2026-01-02T00:00:02Z",
+        "endTime": "2026-01-02T00:00:02Z",
+        "metadata": {
+          "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "message": "feat(telemetry): GREEN for reference spoke",
+          "files": [
+            "scripts/telemetry/x.py"
+          ],
+          "additions": 34,
+          "deletions": 5
+        }
+      }
+    }
+  ],
+  "view_b": [
+    {
+      "id": "spokecycle-23b79fa73d155fc8",
+      "type": "trace-create",
+      "timestamp": "2026-01-02T00:00:00Z",
+      "body": {
+        "id": "spokecycle-23b79fa73d155fc8",
+        "name": "spoke-cycle:feature/22-demo+1700000000",
+        "sessionId": "feature/22-demo+1700000000",
+        "timestamp": "2026-01-02T00:00:00Z",
+        "metadata": {
+          "schema_rev": 2
+        }
+      }
+    },
+    {
+      "id": "spokecycleroot-23b79fa73d155fc8",
+      "type": "span-create",
+      "timestamp": "2026-01-02T00:00:00Z",
+      "body": {
+        "id": "spokecycleroot-23b79fa73d155fc8",
+        "traceId": "spokecycle-23b79fa73d155fc8",
+        "name": "cycle:feature/22-demo+1700000000",
+        "startTime": "2026-01-02T00:00:00Z",
+        "metadata": {
+          "rollup": {
+            "reused": 900,
+            "written": 300,
+            "input": 120,
+            "output": 45,
+            "duration": {
+              "total_ms": 1000,
+              "components": {
+                "llm_request": 1000,
+                "tool": 0,
+                "hook": 0,
+                "script": 0,
+                "step": 0,
+                "wait": 0,
+                "turn": 0,
+                "self": 0,
+                "other": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "cyc-56272d712a1c0fa5292d720a",
+      "type": "span-create",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "body": {
+        "id": "cyc-56272d712a1c0fa5292d720a",
+        "traceId": "spokecycle-23b79fa73d155fc8",
+        "parentObservationId": "spokecycleroot-23b79fa73d155fc8",
+        "name": "claude_code.interaction",
+        "startTime": null,
+        "endTime": null,
+        "metadata": {
+          "kind": "turn",
+          "rollup": {
+            "reused": 900,
+            "written": 300,
+            "input": 120,
+            "output": 45,
+            "duration": {
+              "total_ms": 1000,
+              "components": {
+                "llm_request": 1000,
+                "tool": 0,
+                "hook": 0,
+                "script": 0,
+                "step": 0,
+                "wait": 0,
+                "turn": 0,
+                "self": 0,
+                "other": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "cyc-616ca7b41f1f925045187a56",
+      "type": "span-create",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "body": {
+        "id": "cyc-616ca7b41f1f925045187a56",
+        "traceId": "spokecycle-23b79fa73d155fc8",
+        "parentObservationId": "spokecycleroot-23b79fa73d155fc8",
+        "name": "Bash",
+        "startTime": null,
+        "endTime": null,
+        "metadata": {
+          "attributes": {
+            "tool_name": "Bash",
+            "tool_use_id": "tu-1",
+            "gen_ai.tool.call.id": "tu-1"
+          },
+          "rollup": {
+            "reused": 0,
+            "written": 0,
+            "input": 0,
+            "output": 0,
+            "duration": {
+              "total_ms": 0,
+              "components": {
+                "llm_request": 0,
+                "tool": 0,
+                "hook": 0,
+                "script": 0,
+                "step": 0,
+                "wait": 0,
+                "turn": 0,
+                "self": 0,
+                "other": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "cyc-b79ad3cca59d9cf64269b85d",
+      "type": "generation-create",
+      "timestamp": "2026-01-02T00:00:00Z",
+      "body": {
+        "id": "cyc-b79ad3cca59d9cf64269b85d",
+        "traceId": "spokecycle-23b79fa73d155fc8",
+        "parentObservationId": "spokecycleroot-23b79fa73d155fc8",
+        "name": "llm_request",
+        "startTime": "2026-01-02T00:00:00Z",
+        "endTime": "2026-01-02T00:00:01Z",
+        "input": "hello",
+        "output": "hi there",
+        "usageDetails": {
+          "input": 120,
+          "output": 45,
+          "cache_read_input_tokens": 900,
+          "cache_creation_input_tokens": 300
+        },
+        "metadata": {
+          "kind": "turn",
+          "rollup": {
+            "input": 120
+          }
+        },
+        "model": "claude-opus-4-8"
+      }
+    },
+    {
+      "id": "cyc-cf5310d4443536322a8d7a54",
+      "type": "span-create",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "body": {
+        "id": "cyc-cf5310d4443536322a8d7a54",
+        "traceId": "spokecycle-23b79fa73d155fc8",
+        "parentObservationId": "spokecycleroot-23b79fa73d155fc8",
+        "name": "step:green",
+        "startTime": null,
+        "endTime": null,
+        "metadata": {
+          "kind": "step"
+        }
+      }
+    },
+    {
+      "id": "cyc-632171f2ff147abbbf2e3e2f",
+      "type": "span-create",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "body": {
+        "id": "cyc-632171f2ff147abbbf2e3e2f",
+        "traceId": "spokecycle-23b79fa73d155fc8",
+        "parentObservationId": "cyc-guards-63e90f415ef2dc4eca50409b",
+        "name": "PreToolUse.sh",
+        "startTime": null,
+        "endTime": null,
+        "metadata": {
+          "attributes": {
+            "workflow.kind": "hook",
+            "hook_event": "PreToolUse",
+            "tool_use_id": "tu-1"
+          }
+        }
+      }
+    },
+    {
+      "id": "cyc-96a45b0a4cc0bffc5b3f8624",
+      "type": "span-create",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "body": {
+        "id": "cyc-96a45b0a4cc0bffc5b3f8624",
+        "traceId": "spokecycle-23b79fa73d155fc8",
+        "parentObservationId": "cyc-guards-6ec869d60ae8f1486a0abb4a",
+        "name": "Stop.sh",
+        "startTime": null,
+        "endTime": null,
+        "metadata": {
+          "attributes": {
+            "workflow.kind": "hook",
+            "hook_event": "Stop"
+          }
+        }
+      }
+    },
+    {
+      "id": "cyc-guards-63e90f415ef2dc4eca50409b",
+      "type": "span-create",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "body": {
+        "id": "cyc-guards-63e90f415ef2dc4eca50409b",
+        "traceId": "spokecycle-23b79fa73d155fc8",
+        "parentObservationId": "cyc-616ca7b41f1f925045187a56",
+        "name": "guards",
+        "startTime": "2026-01-01T00:00:00Z",
+        "endTime": null,
+        "metadata": {
+          "count": 1,
+          "total_ms": 0,
+          "by_hook": {
+            "PreToolUse.sh": {
+              "count": 1,
+              "ms": 0
+            }
+          },
+          "decisions": [],
+          "rollup": {
+            "reused": 0,
+            "written": 0,
+            "input": 0,
+            "output": 0,
+            "duration": {
+              "total_ms": 0,
+              "components": {
+                "llm_request": 0,
+                "tool": 0,
+                "hook": 0,
+                "script": 0,
+                "step": 0,
+                "wait": 0,
+                "turn": 0,
+                "self": 0,
+                "other": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "cyc-guards-6ec869d60ae8f1486a0abb4a",
+      "type": "span-create",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "body": {
+        "id": "cyc-guards-6ec869d60ae8f1486a0abb4a",
+        "traceId": "spokecycle-23b79fa73d155fc8",
+        "parentObservationId": "spokecycleroot-23b79fa73d155fc8",
+        "name": "guards:session",
+        "startTime": "2026-01-01T00:00:00Z",
+        "endTime": null,
+        "metadata": {
+          "count": 1,
+          "total_ms": 0,
+          "by_hook": {
+            "Stop.sh": {
+              "count": 1,
+              "ms": 0
+            }
+          },
+          "decisions": [],
+          "rollup": {
+            "reused": 0,
+            "written": 0,
+            "input": 0,
+            "output": 0,
+            "duration": {
+              "total_ms": 0,
+              "components": {
+                "llm_request": 0,
+                "tool": 0,
+                "hook": 0,
+                "script": 0,
+                "step": 0,
+                "wait": 0,
+                "turn": 0,
+                "self": 0,
+                "other": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "tree-commit-f04ff5e08cc01db9ff6d36ff",
+      "type": "span-create",
+      "timestamp": "2026-01-02T00:00:00Z",
+      "body": {
+        "id": "tree-commit-f04ff5e08cc01db9ff6d36ff",
+        "traceId": "spokecycle-23b79fa73d155fc8",
+        "parentObservationId": "spokecycleroot-23b79fa73d155fc8",
+        "name": "commit:aaaaaaa",
+        "startTime": "2026-01-02T00:00:00Z",
+        "endTime": "2026-01-02T00:00:00Z",
+        "metadata": {
+          "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "message": "test(telemetry): RED for reference spoke",
+          "files": [
+            "tests/unit/test_x.py"
+          ],
+          "additions": 12,
+          "deletions": 0
+        }
+      }
+    },
+    {
+      "id": "tree-commit-e13c91f27f63e23e49a471be",
+      "type": "span-create",
+      "timestamp": "2026-01-02T00:00:02Z",
+      "body": {
+        "id": "tree-commit-e13c91f27f63e23e49a471be",
+        "traceId": "spokecycle-23b79fa73d155fc8",
+        "parentObservationId": "spokecycleroot-23b79fa73d155fc8",
+        "name": "commit:bbbbbbb",
+        "startTime": "2026-01-02T00:00:02Z",
+        "endTime": "2026-01-02T00:00:02Z",
+        "metadata": {
+          "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "message": "feat(telemetry): GREEN for reference spoke",
+          "files": [
+            "scripts/telemetry/x.py"
+          ],
+          "additions": 34,
+          "deletions": 5
+        }
+      }
+    }
+  ],
+  "scores": [],
+  "step_scores": []
+}
