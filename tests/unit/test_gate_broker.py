@@ -881,6 +881,135 @@ def test_spoke_idle_seconds_not_refreshed_by_reasoner_write(
     )
 
 
+# ── #180: a spoke waiting on a background task is busy, not idle ───────────────
+
+
+def _seed_task_output(tasks_root: Path, wt_path: Path, mtime: int) -> Path:
+    """Write a harness background-task output file for `wt_path`, pinned to `mtime`.
+
+    Mirrors the live layout <root>/claude-*/<munged-wt>/<session>/tasks/*.output.
+    """
+    import re
+
+    slug = re.sub(r"[^A-Za-z0-9]", "-", str(wt_path))
+    d = tasks_root / "claude-502" / slug / "sess1" / "tasks"
+    d.mkdir(parents=True, exist_ok=True)
+    out = d / "w3cadq3wh.output"
+    out.write_text("running the review workflow...\n")
+    os.utime(out, (mtime, mtime))
+    return out
+
+
+def test_spoke_idle_seconds_folds_in_task_output(spoke_repo: Path, tmp_path: Path) -> None:
+    # A spoke waiting on a background workflow writes nothing to its transcript (#180), so the
+    # idle clock must fold in the newest task-output mtime. Transcript pinned an hour stale, a
+    # task-output write 100s ago: idle reads 100 (the fresher signal), not 3600.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    jsonl.write_text("{}\n")
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+    tasks_root = tmp_path / "tasks-root"
+    _seed_task_output(tasks_root, spoke_repo, 1_000_003_500)
+
+    result = _call(
+        f"_spoke_idle_seconds '{spoke_repo}' 5",
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_TASKS_ROOT": str(tasks_root),
+            "AFK_NOW": "1000003600",
+        },
+    )
+
+    assert result.stdout.strip() == "100", (
+        f"a fresh task-output write must extend the idle clock: {result.stdout}{result.stderr}"
+    )
+
+
+def test_slot_state_task_output_keeps_live_spoke_busy(spoke_repo: Path, tmp_path: Path) -> None:
+    # AC1 regression: a live-pane spoke with a stale transcript but a task-output file written
+    # within AFK_IDLE_MINUTES is `busy`, not `reap` — the #168 healthy-spoke kill.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    jsonl.write_text(
+        json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "working"}]}}
+        )
+        + "\n"
+    )
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # stale transcript → would reap alone
+    tasks_root = tmp_path / "tasks-root"
+    _seed_task_output(tasks_root, spoke_repo, 1_000_003_500)  # fresh background work
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_TASKS_ROOT": str(tasks_root),
+            "AFK_NOW": "1000003600",
+        },
+    )
+
+    assert result.stdout.strip() == "busy", result.stdout + result.stderr
+
+
+def test_slot_state_reaps_stale_spoke_without_task_evidence(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # AC2: a live-pane spoke with a stale transcript AND no task evidence still reaps — the
+    # new signal must EXTEND the idle reference, never disable the ceiling.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    jsonl.write_text(
+        json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "working"}]}}
+        )
+        + "\n"
+    )
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+    tasks_root = tmp_path / "tasks-root"  # exists but holds no output for this spoke
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_TASKS_ROOT": str(tasks_root),
+            "AFK_NOW": "1000003600",
+        },
+    )
+
+    assert result.stdout.strip() == "reap", result.stdout + result.stderr
+
+
+def test_slot_state_task_output_does_not_lift_hard_ceiling(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # AC3: the absolute hard ceiling (#133) is unchanged. A spoke past the hard wall-clock
+    # ceiling reaps even with a brand-new task-output write — the signal extends idle, not the
+    # ceiling. dispatch is stamped at an early clock, `now` is well past MAX_MINUTES x 3.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    jsonl.write_text("{}\n")
+    os.utime(jsonl, (1_000_019_900, 1_000_019_900))  # transcript itself is fresh
+    tasks_root = tmp_path / "tasks-root"
+    _seed_task_output(tasks_root, spoke_repo, 1_000_019_900)  # fresh background work too
+
+    result = _call(
+        f"AFK_NOW=1000000000 stamp_dispatch_epoch 5; slot_state '{spoke_repo}' 5",
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_TASKS_ROOT": str(tasks_root),
+            "AFK_SPOKE_MAX_MINUTES": "60",  # hard ceiling = 180 min
+            "AFK_NOW": "1000020000",  # 333 min since dispatch → over the hard ceiling
+        },
+    )
+
+    assert result.stdout.strip() == "reap", result.stdout + result.stderr
+
+
 def test_broker_service_gate_injects_despite_reasoner_transcript(
     spoke_repo: Path, reasoner_env: dict[str, str], tmp_path: Path
 ) -> None:
