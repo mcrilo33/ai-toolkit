@@ -613,7 +613,7 @@ _PERMISSION_PROMPT = "Bash command\n  git reset -q\nDo you want to proceed?\n❯
 def test_decision_signature_collides_across_arg_variation(cmd: str) -> None:
     # The signature normalises a command to its verb skeleton so recurrences of the SAME
     # shape (different files/flags) collide into one automatable signature.
-    result = _call(f"_broker_decision_signature permission \"$CMD\"", env={"CMD": cmd})
+    result = _call(f'_broker_decision_signature permission "$CMD"', env={"CMD": cmd})
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "git-reset+git-add", result.stdout
 
@@ -696,6 +696,184 @@ def test_decide_permission_logs_auto_approve(spoke_repo: Path, tmp_path: Path) -
     assert log.exists(), "a safe auto-approve must be logged"
     fields = log.read_text().strip().split("\t")
     assert fields[2] == "permission" and fields[3] == "git-reset+git-add" and fields[4] == "APPROVE"
+
+
+# ── issue #164: the reasoner transcript must not pollute the spoke's session ────
+#
+# Regression from #155-B: the read-only reasoner runs headless `claude` with cwd = the
+# spoke's worktree, so ITS OWN session transcript lands in the SAME
+# ~/.claude/projects/<munged-wt>/ dir as the spoke's. `_spoke_jsonl` picked the newest
+# jsonl there — the answerer's own transcript — so `_still_parked_same` always saw the
+# transcript "move", every AFK answer was dropped as stale, and the spoke sat stranded.
+#
+# These tests drive the behaviour through the DEFAULT reasoner command (they do NOT
+# override AFK_ANSWERER_CMD) so they exercise the exact surface the fix changes. A fake
+# `claude` on PATH models the real CLI's session persistence: like the real binary it
+# writes its own transcript into the project dir for its cwd — UNLESS invoked with
+# `--no-session-persistence`, which suppresses the write. So the fix (adding that flag to
+# the default reasoner command — option 2, killing the write at source) flips these from
+# RED to GREEN exactly as it does for the real CLI; a downstream `_spoke_jsonl` filter
+# (option 3) would satisfy them too, since every assertion is on the spoke's resolved
+# transcript, not on how the pollution was avoided.
+
+
+def _install_fake_claude(fake_bin: Path, decision: str) -> None:
+    """Install a fake ``claude`` that models real session-transcript persistence.
+
+    It writes its own transcript into the project dir for its cwd (mirroring the real CLI's
+    ``<projects>/<munged-cwd>/`` layout, resolved like the broker via ``CLAUDE_PROJECTS_DIR``
+    / ``~/.claude/projects``) UNLESS ``--no-session-persistence`` is present, then prints the
+    decision. A ``gh`` stub is also installed so ``build_answerer_prompt`` stays hermetic.
+    """
+    reasoner_record = json.dumps(
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "reasoning about the gate"}]},
+        }
+    )
+    (fake_bin / "claude").write_text(
+        "#!/usr/bin/env bash\n"
+        "persist=1\n"
+        'for a in "$@"; do [ "$a" = "--no-session-persistence" ] && persist=0; done\n'
+        "cat >/dev/null 2>&1\n"  # consume the reasoner prompt on stdin
+        'if [ "$persist" -eq 1 ]; then\n'
+        # Guard: never fall back to the real ~/.claude store — a caller that forgets
+        # CLAUDE_PROJECTS_DIR must fail loudly here, not pollute the developer's machine.
+        '  base="${CLAUDE_PROJECTS_DIR:?fake claude needs CLAUDE_PROJECTS_DIR}"\n'
+        "  slug=\"$(pwd | sed 's/[^A-Za-z0-9]/-/g')\"\n"
+        '  mkdir -p "$base/$slug"\n'
+        f"  printf '%s\\n' '{reasoner_record}' > \"$base/$slug/reasoner-transcript.jsonl\"\n"
+        "fi\n"
+        f"printf '%s' '{decision}'\n"
+    )
+    (fake_bin / "claude").chmod(0o755)
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+
+
+@pytest.fixture
+def reasoner_env(spoke_repo: Path, tmp_path: Path) -> dict[str, str]:
+    """A spoke parked on a question + a fake `claude` reasoner on PATH (default command)."""
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    spoke_jsonl = pd / "session.jsonl"
+    spoke_jsonl.write_text(json.dumps(_ask_record("Which store?", [("Redis", "fast")])) + "\n")
+    os.utime(spoke_jsonl, (1_000_000_000, 1_000_000_000))
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _install_fake_claude(fake_bin, "ANSWER: go ahead")
+
+    return {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "_SPOKE_JSONL": str(spoke_jsonl),
+        "_FAKE_BIN": str(fake_bin),
+    }
+
+
+def test_run_answerer_does_not_pollute_spoke_jsonl(
+    spoke_repo: Path, reasoner_env: dict[str, str]
+) -> None:
+    # After the reasoner runs, the spoke's OWN transcript must still be the one
+    # `_spoke_jsonl` resolves — not the reasoner's fresh transcript.
+    result = _call(
+        f"run_answerer 5 'q' '{spoke_repo}' >/dev/null; _spoke_jsonl '{spoke_repo}'",
+        env=reasoner_env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == reasoner_env["_SPOKE_JSONL"], (
+        f"_spoke_jsonl must resolve the spoke's own transcript, not the reasoner's: {result.stdout}"
+    )
+
+
+def test_still_parked_same_survives_reasoner_transcript(
+    spoke_repo: Path, reasoner_env: dict[str, str]
+) -> None:
+    # `_still_parked_same` must judge freshness against the spoke's transcript alone: a
+    # reasoner write during the reason step is NOT the spoke moving on. Snapshot the clock,
+    # run the reasoner (which writes its own transcript), then assert the spoke still reads
+    # as parked on the same question.
+    question = "Q: Which store?\n  - Redis: fast"
+
+    result = _call(
+        f"before=\"$(_transcript_mtime '{spoke_repo}')\"; "
+        f"run_answerer 5 'q' '{spoke_repo}' >/dev/null; "
+        f'_still_parked_same \'{spoke_repo}\' 5 0 "$QUESTION" "$before"; echo RC=$?',
+        env={**reasoner_env, "QUESTION": question},
+    )
+
+    assert result.stdout.strip().splitlines()[-1] == "RC=0", (
+        f"a reasoner write must not make the spoke read as 'moved on': {result.stdout}{result.stderr}"
+    )
+
+
+def test_extract_pending_question_ignores_reasoner_transcript(
+    spoke_repo: Path, reasoner_env: dict[str, str]
+) -> None:
+    # The reasoner transcript carries no AskUserQuestion; if `extract_pending_question`
+    # read it instead of the spoke's, the park would vanish. It must keep returning the
+    # spoke's real question after the reasoner runs.
+    result = _call(
+        f"run_answerer 5 'q' '{spoke_repo}' >/dev/null; extract_pending_question '{spoke_repo}'",
+        env=reasoner_env,
+    )
+
+    assert "Which store?" in result.stdout, (
+        f"extract_pending_question must read the spoke's transcript, not the reasoner's: {result.stdout}"
+    )
+
+
+def test_spoke_idle_seconds_not_refreshed_by_reasoner_write(
+    spoke_repo: Path, reasoner_env: dict[str, str]
+) -> None:
+    # The reaper's idle clock keys off the spoke's transcript mtime. A reasoner write must
+    # not reset it, or a genuinely-stranded spoke never ages out. With "now" pinned an hour
+    # past the spoke's last write, idle must read ~3600s regardless of the reasoner's fresh
+    # transcript.
+    result = _call(
+        f"run_answerer 5 'q' '{spoke_repo}' >/dev/null; _spoke_idle_seconds '{spoke_repo}' 5",
+        env={**reasoner_env, "AFK_NOW": "1000003600"},
+    )
+
+    assert result.stdout.strip() == "3600", (
+        f"a reasoner write must not refresh the reaper's idle clock: {result.stdout}{result.stderr}"
+    )
+
+
+def test_broker_service_gate_injects_despite_reasoner_transcript(
+    spoke_repo: Path, reasoner_env: dict[str, str], tmp_path: Path
+) -> None:
+    # End to end: a parked spoke, a reasoner that ANSWERS (and writes its own transcript
+    # mid-answer). The answer must be INJECTED, not dropped as stale — the #164 stranding.
+    fake_bin = Path(reasoner_env["_FAKE_BIN"])
+    _install_fake_claude(fake_bin, "ANSWER: Approved — use Redis.")
+    tmux_log = _fake_tmux_pane(fake_bin, spoke_repo, Path(reasoner_env["_SPOKE_JSONL"]))
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+    env = {
+        **reasoner_env,
+        "SPOKE_READY": str(ready_stub),
+        "AFK_STATE_DIR": str(tmp_path / "sd"),
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "dropping the stale answer" not in result.stderr, (
+        f"the answer must not be dropped as stale: {result.stderr}"
+    )
+    assert "Approved — use Redis." in tmux_log.read_text(), (
+        f"the reasoner's answer must be injected into the spoke: {tmux_log.read_text()}"
+    )
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
+        "a healthy answer must inject, not escalate to blocked"
+    )
 
 
 def test_decide_permission_logs_escalate_verdict(spoke_repo: Path, tmp_path: Path) -> None:

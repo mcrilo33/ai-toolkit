@@ -692,11 +692,26 @@ EOF
 # because the CLI prints credential failures there and exits nonzero — the auth-failure
 # detector needs both the message and the exit code. parse_decision is line-anchored, so
 # interleaved stderr noise never pollutes a decision.
+#
+# --no-session-persistence is REQUIRED, not cosmetic (#164): the reasoner runs with
+# cwd=<wt>, so a persisted session transcript would land in the SAME
+# ~/.claude/projects/<munged-wt>/ dir as the spoke's own transcript. `_spoke_jsonl` picks
+# the newest jsonl there, so the reasoner's transcript would shadow the spoke's — every
+# `_still_parked_same` check would see the transcript "move" and drop the answer as stale,
+# stranding the spoke. Disabling persistence kills the pollution at the source (the
+# reasoner writes no transcript at all) while keeping cwd=<wt> for read-only verification.
+# It does NOT touch CLAUDE_CONFIG_DIR, so keychain credentials/auth are unaffected. An
+# AFK_ANSWERER_CMD override that runs a persisting `claude` with cwd=<wt> reintroduces
+# #164, so any override must pass --no-session-persistence too.
+# UPGRADE: if a deployed `claude` lacks --no-session-persistence it exits nonzero with no
+# decision, so the gate fails SAFE (escalates to blocked/<issue>) rather than stranding —
+# but auto-answering silently stops; drop the flag / switch to filtering the reasoner's
+# jsonl out of _spoke_jsonl if the installed CLI ever loses it.
 run_answerer() {
   local issue="$1" question="$2" wt="${3:-}"
   local prompt; prompt="$(build_answerer_prompt "$issue" "$question" "$wt")"
   local tools; tools="$(reasoner_allowed_tools)"
-  local cmd="${AFK_ANSWERER_CMD:-claude -p --model claude-fable-5 --allowedTools '$tools'}"
+  local cmd="${AFK_ANSWERER_CMD:-claude -p --no-session-persistence --model claude-fable-5 --allowedTools '$tools'}"
   if [ -n "$wt" ] && [ -d "$wt" ]; then
     ( cd "$wt" && CLAUDE_EFFORT="$AFK_ANSWERER_EFFORT" bash -c "$cmd" <<<"$prompt" 2>&1 )
   else
