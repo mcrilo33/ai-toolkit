@@ -41,7 +41,9 @@ batch:
   # Max spokes running at once. Empty ⇒ auto min(2, cores/4); set a positive
   # integer to override. batch-plan.sh truncates the batch so (in-flight +
   # newly-dispatched) never exceeds this.
-  concurrency_cap:
+  # Sized for the M5 Max hub (18 cores / 48 GB): 4 concurrent spokes leaves
+  # headroom for the co-located Langfuse stack (#151) and per-spoke suites.
+  concurrency_cap: 4
   # Seconds to wait between consecutive spawns in one batch, so first-push full
   # suites don't all hit at once. Empty ⇒ 45; 0 disables the stagger.
   stagger_seconds:
