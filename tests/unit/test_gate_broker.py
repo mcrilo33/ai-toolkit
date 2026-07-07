@@ -983,6 +983,53 @@ def test_slot_state_reaps_stale_spoke_without_task_evidence(
     assert result.stdout.strip() == "reap", result.stdout + result.stderr
 
 
+def test_spoke_idle_seconds_task_output_only_extends(spoke_repo: Path, tmp_path: Path) -> None:
+    # #180 review: a task-output write only EXTENDS an existing reference. With no transcript
+    # and no answer-attempt, a stale .output left in tmp by a PRIOR run at the same worktree
+    # path must not fabricate a measurable idle age — the clock stays unmeasurable (empty).
+    projects = tmp_path / "projects"
+    _project_dir_for(projects, spoke_repo)  # project dir exists, but NO transcript written
+    tasks_root = tmp_path / "tasks-root"
+    _seed_task_output(tasks_root, spoke_repo, 1_000_000_000)  # stale prior-run output
+
+    result = _call(
+        f"_spoke_idle_seconds '{spoke_repo}' 5",
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_TASKS_ROOT": str(tasks_root),
+            "AFK_NOW": "1000003600",
+        },
+    )
+
+    assert result.stdout.strip() == "", (
+        f"a task-output alone must not create measurability: {result.stdout!r}{result.stderr}"
+    )
+
+
+def test_slot_state_stale_task_output_does_not_reap_transcriptless_spoke(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #180 review: tmp is not cleared between runs, so a lingering .output from a prior
+    # incarnation at a reused worktree path must NOT make a fresh, transcript-less spoke
+    # reapable. With no transcript the idle clock stays unmeasurable -> busy, even though the
+    # stale task-output is an hour old.
+    projects = tmp_path / "projects"
+    _project_dir_for(projects, spoke_repo)  # no transcript
+    tasks_root = tmp_path / "tasks-root"
+    _seed_task_output(tasks_root, spoke_repo, 1_000_000_000)  # stale prior-run output
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_TASKS_ROOT": str(tasks_root),
+            "AFK_NOW": "1000003600",
+        },
+    )
+
+    assert result.stdout.strip() == "busy", result.stdout + result.stderr
+
+
 def test_slot_state_task_output_does_not_lift_hard_ceiling(
     spoke_repo: Path, tmp_path: Path
 ) -> None:

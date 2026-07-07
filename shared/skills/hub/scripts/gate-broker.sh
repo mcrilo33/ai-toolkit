@@ -250,10 +250,16 @@ _spoke_idle_seconds() {
     '' | *[!0-9]*) : ;;
     *) if [ -z "$ref" ] || [ "$attempt" -gt "$ref" ]; then ref="$attempt"; fi ;;
   esac
+  # A task-output write only EXTENDS an existing reference — it never creates
+  # measurability on its own. tmp is not cleared between runs, so a lingering .output from
+  # a prior incarnation at a reused worktree path would otherwise drag a transcript-less
+  # fresh spoke out of the "can't measure -> busy" guard and into a bogus idle reap off a
+  # stale mtime (#180 review). Unlike the answer-attempt epoch (cleared per window), the
+  # task-output signal can be stale, so it must not stand alone.
   task="$(_task_output_mtime "$wt")"
   case "$task" in
     '' | *[!0-9]*) : ;;
-    *) if [ -z "$ref" ] || [ "$task" -gt "$ref" ]; then ref="$task"; fi ;;
+    *) if [ -n "$ref" ] && [ "$task" -gt "$ref" ]; then ref="$task"; fi ;;
   esac
   [ -n "$ref" ] || return 0
   printf '%s\n' "$(( $(afk_now) - ref ))"
