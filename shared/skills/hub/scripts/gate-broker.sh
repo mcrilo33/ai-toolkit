@@ -508,8 +508,11 @@ assert_readonly_tools() {
 # purpose (issue #168): a parked spoke is not a frozen worktree — its own still-finishing
 # push gate writes `.testmondata`, OTel dumps land under `.ai-toolkit/`, etc. Those runtime
 # artifacts are not what the land cares about and must not be blamed on the read-only
-# reasoner. Empty (stable) for a non-git or missing path, so a non-worktree reasoner never
-# trips a false breach.
+# reasoner. A reasoner CREATING a brand-new untracked file is therefore invisible here by
+# design; that surface is covered by PREVENTION (reasoner_allowed_tools / the read-only
+# allowlist — no Write/Edit/bare-Bash), leaving this DETECTION layer as the hard guarantee
+# for TRACKED content, which is all a land commits. Empty (stable) for a non-git or missing
+# path, so a non-worktree reasoner never trips a false breach.
 _broker_worktree_fingerprint() {
   local wt="$1"
   [ -d "$wt" ] || return 0

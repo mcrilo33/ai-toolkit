@@ -306,40 +306,27 @@ def test_broker_service_gate_escalates_when_fingerprint_unavailable(
 
 
 def test_worktree_fingerprint_tracks_only_tracked_content(spoke_repo: Path) -> None:
-    # A content fingerprint of the TRACKED worktree content (issue #168): stable across a
-    # no-op, UNCHANGED by a new untracked file (a parked spoke's own runtime writes), but
-    # changed by a content edit of a tracked file.
+    # A content fingerprint of the TRACKED worktree content (issue #168): deterministic
+    # across a no-op, UNCHANGED by a parked spoke's own untracked runtime writes (a
+    # still-finishing push gate's `.testmondata`, OTel dumps under `.ai-toolkit/` — the
+    # false-positive that burned three healthy reasoner runs), and changed ONLY by a
+    # content edit of a tracked file.
     (spoke_repo / "a.txt").write_text("one")
     subprocess.run(["git", "add", "a.txt"], cwd=spoke_repo, check=True, capture_output=True)
     fp1 = _call(f"_broker_worktree_fingerprint '{spoke_repo}'").stdout.strip()
     fp1b = _call(f"_broker_worktree_fingerprint '{spoke_repo}'").stdout.strip()
     assert fp1 and fp1 == fp1b, "fingerprint must be deterministic"
 
-    (spoke_repo / "b.txt").write_text("two")
-    fp2 = _call(f"_broker_worktree_fingerprint '{spoke_repo}'").stdout.strip()
-    assert fp2 == fp1, "a new untracked file must NOT change the fingerprint"
-
-    (spoke_repo / "a.txt").write_text("one-edited")
-    fp3 = _call(f"_broker_worktree_fingerprint '{spoke_repo}'").stdout.strip()
-    assert fp3 != fp1, "a content edit of a tracked file must change the fingerprint"
-
-
-def test_worktree_fingerprint_ignores_spoke_runtime_writes(spoke_repo: Path) -> None:
-    # Issue #168: a parked spoke is NOT a frozen worktree. Its own still-finishing push
-    # gate writes `.testmondata`/`.testmondata-shm`; OTel dumps land under `.ai-toolkit/`.
-    # None of these are tracked, so none may drift the read-only fingerprint and void the
-    # reasoner's answer — that false-positive burned three healthy reasoner runs.
-    (spoke_repo / "keep.txt").write_text("data")
-    subprocess.run(["git", "add", "keep.txt"], cwd=spoke_repo, check=True, capture_output=True)
-    fp1 = _call(f"_broker_worktree_fingerprint '{spoke_repo}'").stdout.strip()
-
     (spoke_repo / ".testmondata").write_text("push-gate coverage db")
     (spoke_repo / ".testmondata-shm").write_text("wal")
     (spoke_repo / ".ai-toolkit" / "raw-bodies").mkdir(parents=True)
     (spoke_repo / ".ai-toolkit" / "raw-bodies" / "dump.json").write_text("{}")
     fp2 = _call(f"_broker_worktree_fingerprint '{spoke_repo}'").stdout.strip()
+    assert fp2 == fp1, "untracked spoke-runtime writes must NOT drift the fingerprint"
 
-    assert fp1 and fp2 == fp1, "spoke-runtime writes must not drift the read-only fingerprint"
+    (spoke_repo / "a.txt").write_text("one-edited")
+    fp3 = _call(f"_broker_worktree_fingerprint '{spoke_repo}'").stdout.strip()
+    assert fp3 != fp1, "a content edit of a tracked file must change the fingerprint"
 
 
 def test_reasoner_runs_in_worktree_cwd(spoke_repo: Path, tmp_path: Path) -> None:
