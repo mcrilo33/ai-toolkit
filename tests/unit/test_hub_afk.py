@@ -3254,12 +3254,14 @@ def test_watchdog_tick_live_does_not_respawn(tmp_path: Path) -> None:
     state.write_text("drain\n")
     hb = tmp_path / "heartbeat"
     marker = tmp_path / "respawned"
-    # $$ (the sourcing shell) is a live pid ⇒ the supervisor is live ⇒ no respawn.
+    # $$ (the sourcing shell) is a live pid AND the heartbeat is RECENT (age 60s, far below
+    # the AFK_STALE_TICKS x AFK_TICK_SECONDS limit) => the supervisor is live => no respawn.
     expr = f'printf "%s 1700000000\\n" "$$" > "{hb}"; watchdog_tick'
     env = {
         "AFK_STATE": str(state),
         "AFK_HEARTBEAT": str(hb),
         "AFK_RESPAWN_CMD": f"touch {marker}",
+        "AFK_NOW": "1700000060",
     }
 
     result = _call(expr, env=env)
@@ -3602,6 +3604,8 @@ def test_arm_refuses_when_telemetry_cannot_be_wired(tmp_path: Path) -> None:
             "AFK_STATE": str(state),
             "AFK_TELEMETRY_CONF": str(tmp_path / "no-conf"),
             "AFK_PORT_WAIT_TRIES": "0",
+            # Isolate the telemetry refusal from the #170 arm preconditions (a separate gate).
+            "AFK_ARM_PRECHECK": "0",
         },
     )
 
@@ -3838,6 +3842,9 @@ def _reaper_env(
         "AFK_DEFAULT_BRANCH": "main",
         "AFK_IDLE_MINUTES": "0",
         "AFK_NOW": "1700000000",
+        # The reap-time auth probe (#170 ST7) fires before the first reap; a healthy stub
+        # (exit 0) keeps these reap tests exercising the reap path, not the auth-halt path.
+        "AFK_AUTH_PROBE_CMD": "true",
     }
     return expr, env, ready_log, statedir
 
@@ -4353,6 +4360,9 @@ def test_drain_survives_source_rewrite_mid_run(spoke_repo: Path, tmp_path: Path)
         "BATCH_PLAN": str(bp),
         "AFK_WATCHDOG_SPAWN_CMD": ":",
         "AFK_WT_LIB": str(REPO_ROOT / "scripts" / "worktree-lib.sh"),
+        # This test targets the self-copy/rewrite survival path, not the #170 arm
+        # preconditions — opt out so an unstubbed gh/branch state can't refuse the arm.
+        "AFK_ARM_PRECHECK": "0",
         # Point the isolated copy at the real gate-broker.sh, mirroring AFK_WT_LIB:
         # the copy lives alone in orig_dir, so its shared core (sourced once at
         # startup) must be located explicitly (#155 split it out of hub-afk.sh).
@@ -4482,3 +4492,553 @@ def test_self_copy_tests_survive_leaked_running_copy_env() -> None:
     # passing: require both selected tests to have actually run and passed.
     assert f"{len(selected)} passed" in result.stdout, result.stdout + result.stderr
     assert "skipped" not in result.stdout, result.stdout + result.stderr
+
+
+# ══ issue #170: harden the supervisor loop ════════════════════════════════════
+# Timeouts on tick externals, heartbeat-age hang detection, a planner-error ≠ empty-backlog
+# done-check, arm preconditions, the /source-task kickoff fix, a dispatch-failure ceiling,
+# and an auth probe before reap. Each new behavior is env-tunable with today's value as the
+# default (AC2), so the tests drive the seams (stub commands, tiny thresholds) directly.
+
+
+# ── ST1: bounded external calls (_afk_with_timeout) ───────────────────────────
+
+
+def test_with_timeout_runs_command_when_no_binary(tmp_path: Path) -> None:
+    # macOS ships neither timeout nor gtimeout: the wrapper must degrade to running the
+    # command unbounded (fail-open) rather than erroring. An empty PATH-but-for-coreutils
+    # is impractical, so assert the command's output regardless of a real timeout binary.
+    result = _call("_afk_with_timeout 5 printf 'HI\\n'")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "HI"
+
+
+def test_with_timeout_uses_timeout_binary_when_present(tmp_path: Path) -> None:
+    # When a timeout binary IS on PATH, the wrapper routes through it with a `-k <grace>`
+    # SIGKILL fallback and the seconds bound. The stub skips the `-k N` pair, then records
+    # the seconds arg and runs the rest.
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "timeout").write_text(
+        '#!/usr/bin/env bash\n[ "$1" = "-k" ] && shift 2\n'
+        'printf "TIMEOUT_CALLED %s\\n" "$1"; shift; "$@"\n'
+    )
+    (fake_bin / "timeout").chmod(0o755)
+
+    result = _call(
+        "_afk_with_timeout 7 printf 'HI\\n'", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    )
+
+    assert "TIMEOUT_CALLED 7" in result.stdout, result.stdout + result.stderr
+    assert "HI" in result.stdout
+
+
+def test_with_timeout_fallback_bounds_a_hung_command() -> None:
+    # The portable fallback (this hub ships no timeout/gtimeout) must REALLY bound a hung
+    # command and kill its grandchildren, so a wedged planner (bash → gh|python) can't
+    # freeze the tick. A 1s bound on a 10s pipeline must return in well under 10s.
+    expr = (
+        "t0=$SECONDS; "
+        "_afk_with_timeout 1 bash -c 'sleep 10 | cat'; "
+        'echo "ELAPSED=$((SECONDS-t0))"'
+    )
+    result = _call(expr, env={"AFK_TIMEOUT_KILL_AFTER": "1"})
+
+    line = result.stdout.strip().splitlines()[-1]
+    elapsed = int(line.split("ELAPSED=")[1].split()[0])
+    assert elapsed < 6, f"the fallback must bound the call (~1s), not run the full 10s: {line}"
+
+
+def _planner_stub(tmp_path: Path, *, exit_code: int, out: str = "") -> Path:
+    """A batch-plan.sh stub that prints <out> and exits <exit_code> (a timeout is 124)."""
+    bp = tmp_path / "batch-plan.sh"
+    # %b so a "\n" in <out> expands to a real newline (the planner prints newline-joined
+    # issue numbers), while an empty <out> prints nothing (the drained state).
+    bp.write_text(f'#!/usr/bin/env bash\nprintf "%b" {json.dumps(out)}\nexit {exit_code}\n')
+    bp.chmod(0o755)
+    return bp
+
+
+def test_dispatch_batch_skips_when_planner_times_out(tmp_path: Path) -> None:
+    # A planner that exits nonzero (a timeout is exit 124) must NOT be read as an empty
+    # batch: dispatch_batch logs and dispatches nothing this tick (retry next tick).
+    bp = _planner_stub(tmp_path, exit_code=124)
+    dispatched = tmp_path / "dispatched.log"
+    wt_new = tmp_path / "wtnew.sh"
+    wt_new.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{dispatched}"\n')
+    wt_new.chmod(0o755)
+    expr = "inflight_issues() { :; }; inflight_worktrees() { :; }; dispatch_batch"
+
+    result = _call(
+        expr,
+        env={"BATCH_PLAN": str(bp), "WT_NEW": str(wt_new), "AFK_DISPATCH_STAGGER": "0"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not dispatched.exists(), "a planner timeout/failure must not dispatch anything"
+    assert "timed out or failed" in result.stderr
+
+
+def test_inflight_scope_args_marks_scope_exclusive_when_gh_fails(tmp_path: Path) -> None:
+    # A gh that times out / fails leaves the scope UNKNOWN, which fails closed (exclusive),
+    # never a silent empty scope that would let an overlapping ready issue co-dispatch.
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text("#!/usr/bin/env bash\nexit 1\n")  # gh always fails
+    (fake_bin / "gh").chmod(0o755)
+    expr = 'inflight_issues() { printf "72\\n"; }; _inflight_scope_args'
+
+    result = _call(expr, env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+
+    assert result.stdout.splitlines() == ["--inflight", "*"]
+    assert "timed out or failed" in result.stderr
+
+
+# ── ST3: a planner error is not an empty backlog (afk_done) ───────────────────
+
+
+def test_afk_done_not_done_when_planner_errors(tmp_path: Path) -> None:
+    # Nothing in flight, but the planner EXITS NONZERO (a gh blip / timeout): afk_done must
+    # return "not done" (rc 1) so a transient failure never ends the whole drain falsely.
+    bp = _planner_stub(tmp_path, exit_code=1)
+    expr = 'inflight_issues() { :; }; afk_done drain 1700000000; echo "RC=$?"'
+
+    result = _call(expr, env={"BATCH_PLAN": str(bp)})
+
+    assert "RC=1" in result.stdout, result.stdout + result.stderr
+    assert "not declaring done" in result.stderr
+
+
+def test_afk_done_done_when_planner_empty_and_no_inflight(tmp_path: Path) -> None:
+    # The genuine drained state: nothing in flight AND the planner exits 0 with an empty
+    # batch ⇒ done (rc 0).
+    bp = _planner_stub(tmp_path, exit_code=0, out="")
+    expr = 'inflight_issues() { :; }; afk_done drain 1700000000; echo "RC=$?"'
+
+    result = _call(expr, env={"BATCH_PLAN": str(bp)})
+
+    assert "RC=0" in result.stdout, result.stdout + result.stderr
+
+
+def test_afk_done_not_done_when_planner_prints_a_batch(tmp_path: Path) -> None:
+    # The planner exits 0 but still has work to dispatch ⇒ not done.
+    bp = _planner_stub(tmp_path, exit_code=0, out="5\n")
+    expr = 'inflight_issues() { :; }; afk_done drain 1700000000; echo "RC=$?"'
+
+    result = _call(expr, env={"BATCH_PLAN": str(bp)})
+
+    assert "RC=1" in result.stdout, result.stdout + result.stderr
+
+
+# ── ST2: heartbeat-age hang detection + answer_pass heartbeat wrap ─────────────
+
+
+def test_heartbeat_wedged_true_when_epoch_stale(tmp_path: Path) -> None:
+    hb = tmp_path / "hb"
+    hb.write_text("4242 1000\n")  # epoch 1000
+    env = {
+        "AFK_HEARTBEAT": str(hb),
+        "AFK_NOW": "9999",
+        "AFK_STALE_TICKS": "1",
+        "AFK_TICK_SECONDS": "1",
+    }
+
+    result = _call('_afk_heartbeat_wedged; echo "RC=$?"', env=env)
+
+    assert "RC=0" in result.stdout, "an epoch far past the stale limit is wedged"
+
+
+def test_heartbeat_wedged_false_when_epoch_fresh(tmp_path: Path) -> None:
+    hb = tmp_path / "hb"
+    hb.write_text("4242 9900\n")  # 99s ago vs the 1200s limit below
+    env = {
+        "AFK_HEARTBEAT": str(hb),
+        "AFK_NOW": "9999",
+        "AFK_STALE_TICKS": "10",
+        "AFK_TICK_SECONDS": "120",
+    }
+
+    result = _call('_afk_heartbeat_wedged; echo "RC=$?"', env=env)
+
+    assert "RC=1" in result.stdout, "a recent tick is not wedged"
+
+
+def test_watchdog_tick_respawns_and_kills_wedged_supervisor(tmp_path: Path) -> None:
+    # A supervisor with a LIVE pid but a stale heartbeat is wedged (hung external call): the
+    # watchdog kills that pid, then respawns. Spawn a real disposable process to stand in for
+    # the wedged supervisor so the kill is genuinely exercised (never $$, which is the test).
+    state = tmp_path / "state"
+    state.write_text("drain\n")
+    hb = tmp_path / "heartbeat"
+    marker = tmp_path / "respawned"
+    # A process whose command matches the pid-recycling guard ("hub-afk") stands in for the
+    # wedged supervisor; stamp its pid with an ancient epoch so it reads as wedged.
+    expr = (
+        "bash -c 'exec -a hub-afk-wedged sleep 300' & wedged=$!; "
+        f'printf "%s 1000\\n" "$wedged" > "{hb}"; '
+        f"watchdog_tick; "
+        f'kill -0 "$wedged" 2>/dev/null && echo WEDGED_ALIVE || echo WEDGED_DEAD'
+    )
+    env = {
+        "AFK_STATE": str(state),
+        "AFK_HEARTBEAT": str(hb),
+        "AFK_RESPAWN_CMD": f"touch {marker}",
+        "AFK_NOW": "99999",
+        "AFK_STALE_TICKS": "1",
+        "AFK_TICK_SECONDS": "1",
+    }
+
+    result = _call(expr, env=env)
+
+    assert "respawned" in result.stdout, result.stdout + result.stderr
+    assert marker.exists(), "a wedged supervisor must be respawned"
+    assert "WEDGED_DEAD" in result.stdout, "the wedged supervisor's pid must be killed first"
+
+
+def test_kill_wedged_supervisor_spares_a_recycled_pid(tmp_path: Path) -> None:
+    # Pid-recycling guard: if the heartbeat pid was recycled onto an unrelated process (its
+    # command no longer looks like a hub-afk supervisor), the kill must NOT touch it.
+    hb = tmp_path / "heartbeat"
+    expr = (
+        "bash -c 'exec -a some-other-daemon sleep 30' & other=$!; "
+        f'printf "%s 1000\\n" "$other" > "{hb}"; '
+        "_afk_kill_wedged_supervisor; "
+        'kill -0 "$other" 2>/dev/null && echo OTHER_ALIVE || echo OTHER_DEAD; '
+        'kill "$other" 2>/dev/null'
+    )
+
+    result = _call(expr, env={"AFK_HEARTBEAT": str(hb)})
+
+    assert "OTHER_ALIVE" in result.stdout, "a recycled non-hub-afk pid must not be killed"
+    assert "not a 'hub-afk' process" in result.stderr
+
+
+def test_run_with_heartbeat_fg_stamps_and_preserves_global(tmp_path: Path) -> None:
+    # The foreground variant runs its command in the CURRENT shell (so a variable the
+    # command sets propagates — decide_and_act's _AFK_AUTH_FAILED) AND stamps the heartbeat.
+    hb = tmp_path / "hb"
+    expr = (
+        "f() { _AFK_AUTH_FAILED=7; }; _afk_run_with_heartbeat_fg f; "
+        f'echo "FLAG=$_AFK_AUTH_FAILED"; cat "{hb}"'
+    )
+
+    result = _call(expr, env={"AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000000"})
+
+    assert "FLAG=7" in result.stdout, "the wrapped command runs in the current shell"
+    assert hb.read_text().strip().endswith("1700000000"), "the heartbeat was stamped"
+
+
+def test_answer_pass_preserves_auth_failed_flag(spoke_repo: Path) -> None:
+    # Regression: wrapping decide_and_act in the heartbeat stamper must NOT lose its
+    # _AFK_AUTH_FAILED propagation (a backgrounded command would drop it in a subshell).
+    expr = (
+        'slot_state() { printf "waiting\\n"; }; '
+        "decide_and_act() { _AFK_AUTH_FAILED=1; }; "
+        f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; '
+        'answer_pass; echo "FLAG=$_AFK_AUTH_FAILED"'
+    )
+
+    result = _call(expr)
+
+    assert "FLAG=1" in result.stdout, "answer_pass must keep decide_and_act's stop flag"
+
+
+def test_answer_pass_stamps_heartbeat_for_waiting_spoke(spoke_repo: Path, tmp_path: Path) -> None:
+    hb = tmp_path / "hb"
+    expr = (
+        'slot_state() { printf "waiting\\n"; }; decide_and_act() { :; }; '
+        f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; answer_pass'
+    )
+
+    _call(expr, env={"AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000000"})
+
+    assert hb.exists() and hb.read_text().strip().endswith("1700000000"), (
+        "the answerer wrap must stamp the heartbeat so a long answer never reads as wedged"
+    )
+
+
+# ── ST4: arm preconditions ────────────────────────────────────────────────────
+
+
+def _clean_hub(tmp_path: Path, *, branch: str = "main") -> Path:
+    """A clean git repo on `branch` with one committed (tracked) file, as the hub checkout."""
+    repo = tmp_path / "hub"
+    repo.mkdir()
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    (repo / "README").write_text("base\n")
+    for cmd in (
+        ["git", "init", "-q", "-b", branch],
+        ["git", "add", "README"],
+        ["git", "commit", "-q", "-m", "base"],
+    ):
+        subprocess.run(cmd, cwd=repo, check=True, env=env, capture_output=True)
+    return repo
+
+
+def _gh_auth_stub(tmp_path: Path, *, exit_code: int) -> Path:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    (fake_bin / "gh").write_text(f"#!/usr/bin/env bash\nexit {exit_code}\n")
+    (fake_bin / "gh").chmod(0o755)
+    return fake_bin
+
+
+def test_arm_preconditions_pass_when_all_ok(tmp_path: Path) -> None:
+    repo = _clean_hub(tmp_path)
+    fake_bin = _gh_auth_stub(tmp_path, exit_code=0)
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE": str(tmp_path / "no-state"),  # off ⇒ no live supervisor
+        "AFK_DEFAULT_BRANCH": "main",
+    }
+
+    result = _call(f"afk_arm_preconditions '{repo}'; echo RC=$?", env=env)
+
+    assert "RC=0" in result.stdout, result.stdout + result.stderr
+
+
+def test_arm_preconditions_refuses_when_supervisor_live(tmp_path: Path) -> None:
+    repo = _clean_hub(tmp_path)
+    fake_bin = _gh_auth_stub(tmp_path, exit_code=0)
+    state = tmp_path / "state"
+    state.write_text("drain\n")
+    hb = tmp_path / "hb"
+    # $$ is a live pid ⇒ afk_supervisor_state == live ⇒ refuse (a 2nd supervisor clobbers state).
+    expr = f'printf "%s 1700000000\\n" "$$" > "{hb}"; afk_arm_preconditions \'{repo}\'; echo RC=$?'
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE": str(state),
+        "AFK_HEARTBEAT": str(hb),
+        "AFK_DEFAULT_BRANCH": "main",
+    }
+
+    result = _call(expr, env=env)
+
+    assert "RC=1" in result.stdout, "a live supervisor must refuse a second arm"
+    assert "already live" in result.stderr
+
+
+def test_arm_preconditions_refuses_uncommitted_tracked_changes(tmp_path: Path) -> None:
+    repo = _clean_hub(tmp_path)
+    (repo / "README").write_text("modified\n")  # tracked file changed ⇒ real dirt
+    fake_bin = _gh_auth_stub(tmp_path, exit_code=0)
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE": str(tmp_path / "no-state"),
+        "AFK_DEFAULT_BRANCH": "main",
+    }
+
+    result = _call(f"afk_arm_preconditions '{repo}'; echo RC=$?", env=env)
+
+    assert "RC=1" in result.stdout, "an uncommitted tracked change must refuse to arm"
+    assert "tracked changes" in result.stderr
+
+
+def test_arm_preconditions_tolerates_untracked_files(tmp_path: Path) -> None:
+    # Untracked/generated files (e.g. left by a routine hub sync) must NOT block the drain —
+    # they never conflict with a merge (#170 review).
+    repo = _clean_hub(tmp_path)
+    (repo / "synced-artifact.txt").write_text("generated\n")  # untracked only
+    fake_bin = _gh_auth_stub(tmp_path, exit_code=0)
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE": str(tmp_path / "no-state"),
+        "AFK_DEFAULT_BRANCH": "main",
+    }
+
+    result = _call(f"afk_arm_preconditions '{repo}'; echo RC=$?", env=env)
+
+    assert "RC=0" in result.stdout, "untracked files alone must not refuse to arm"
+
+
+def test_arm_preconditions_refuses_off_base_branch(tmp_path: Path) -> None:
+    repo = _clean_hub(tmp_path, branch="feature/x")  # HEAD not on the base branch
+    fake_bin = _gh_auth_stub(tmp_path, exit_code=0)
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE": str(tmp_path / "no-state"),
+        "AFK_DEFAULT_BRANCH": "main",
+    }
+
+    result = _call(f"afk_arm_preconditions '{repo}'; echo RC=$?", env=env)
+
+    assert "RC=1" in result.stdout, "HEAD off the base branch must refuse to arm"
+    assert "base branch" in result.stderr
+
+
+def test_arm_preconditions_refuses_detached_head(tmp_path: Path) -> None:
+    # A detached HEAD (`git branch --show-current` empty) must refuse — arming there would
+    # orphan auto_land's commits with no branch advancing (#170 review).
+    repo = _clean_hub(tmp_path)
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "-q", head], check=True, capture_output=True
+    )
+    fake_bin = _gh_auth_stub(tmp_path, exit_code=0)
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE": str(tmp_path / "no-state"),
+        "AFK_DEFAULT_BRANCH": "main",
+    }
+
+    result = _call(f"afk_arm_preconditions '{repo}'; echo RC=$?", env=env)
+
+    assert "RC=1" in result.stdout, "a detached HEAD must refuse to arm"
+    assert "detached HEAD" in result.stderr
+
+
+def test_arm_preconditions_refuses_when_gh_auth_fails(tmp_path: Path) -> None:
+    repo = _clean_hub(tmp_path)
+    fake_bin = _gh_auth_stub(tmp_path, exit_code=1)  # gh auth status fails
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE": str(tmp_path / "no-state"),
+        "AFK_DEFAULT_BRANCH": "main",
+    }
+
+    result = _call(f"afk_arm_preconditions '{repo}'; echo RC=$?", env=env)
+
+    assert "RC=1" in result.stdout, "dead gh auth must refuse to arm"
+    assert "gh auth status" in result.stderr
+
+
+def test_arm_preconditions_opt_out_skips_all_checks(tmp_path: Path) -> None:
+    repo = _clean_hub(tmp_path, branch="feature/x")  # off-base AND...
+    (repo / "dirty.txt").write_text("x\n")  # ...dirty — both would refuse
+    env = {
+        "AFK_ARM_PRECHECK": "0",
+        "AFK_STATE": str(tmp_path / "no-state"),
+        "AFK_DEFAULT_BRANCH": "main",
+    }
+
+    result = _call(f"afk_arm_preconditions '{repo}'; echo RC=$?", env=env)
+
+    assert "RC=0" in result.stdout, "AFK_ARM_PRECHECK=0 skips the whole gate"
+
+
+# ── ST5: the kickoff seeds /source-task, not the nonexistent /source ──────────
+
+
+def test_kickoff_for_seeds_source_task_command() -> None:
+    result = _call("kickoff_for 42")
+
+    assert "/source-task" in result.stdout, "the kickoff must seed the real /source-task skill"
+    assert "/source " not in result.stdout, "never the nonexistent bare /source command"
+
+
+# ── ST6: dispatch-failure ceiling ─────────────────────────────────────────────
+
+
+def _ceiling_env(tmp_path: Path, *, wt_new_exit: int) -> tuple[str, dict[str, str], Path, Path]:
+    """dispatch_batch against a planner that always offers #5 and a wt_new with a fixed exit."""
+    bp = _planner_stub(tmp_path, exit_code=0, out="5\n")
+    attempts = tmp_path / "attempts.log"
+    wt_new = tmp_path / "wtnew.sh"
+    wt_new.write_text(
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{attempts}"\nexit {wt_new_exit}\n'
+    )
+    wt_new.chmod(0o755)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    expr = "inflight_issues() { :; }; inflight_worktrees() { :; }; "
+    env = {
+        "BATCH_PLAN": str(bp),
+        "WT_NEW": str(wt_new),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_DISPATCH_STAGGER": "0",
+        "AFK_SPOKE_CAP": "4",
+        "AFK_DISPATCH_MAX_FAILURES": "3",
+    }
+    return expr, env, attempts, statedir
+
+
+def test_dispatch_ceiling_blocks_issue_after_max_failures(tmp_path: Path) -> None:
+    # Three consecutive worktree-new.sh failures for #5 ⇒ a durable local block record and
+    # no further attempts, instead of retrying silently forever.
+    expr, env, attempts, statedir = _ceiling_env(tmp_path, wt_new_exit=1)
+    # Four ticks: 3 attempts hit the ceiling, the 4th must be skipped (no attempt).
+    result = _call(expr + "dispatch_batch; dispatch_batch; dispatch_batch; dispatch_batch", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert attempts.read_text().split() == ["5", "5", "5"], (
+        "exactly AFK_DISPATCH_MAX_FAILURES attempts, then skip for the window"
+    )
+    assert (statedir / "blocked-5.txt").exists(), "the ceiling records a durable block (--status)"
+
+
+def test_dispatch_failure_count_resets_on_success(tmp_path: Path) -> None:
+    # A success between failures clears the counter, so transient failures never accumulate
+    # to a false ceiling. Fail twice, then succeed ⇒ no durable block.
+    bp = _planner_stub(tmp_path, exit_code=0, out="5\n")
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    # A wt_new that fails while a flag file is absent, then succeeds once it appears.
+    flag = tmp_path / "succeed"
+    wt_new = tmp_path / "wtnew.sh"
+    wt_new.write_text(f'#!/usr/bin/env bash\n[ -e "{flag}" ] && exit 0\nexit 1\n')
+    wt_new.chmod(0o755)
+    env = {
+        "BATCH_PLAN": str(bp),
+        "WT_NEW": str(wt_new),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_DISPATCH_STAGGER": "0",
+        "AFK_SPOKE_CAP": "4",
+        "AFK_DISPATCH_MAX_FAILURES": "3",
+    }
+    expr = (
+        "inflight_issues() { :; }; inflight_worktrees() { :; }; "
+        f'dispatch_batch; dispatch_batch; touch "{flag}"; dispatch_batch'
+    )
+
+    _call(expr, env=env)
+
+    assert not (statedir / "blocked-5.txt").exists(), "a success resets the failure counter"
+    assert (
+        _call("_afk_read_dispatch_failures 5", env={"AFK_STATE_DIR": str(statedir)}).stdout.strip()
+        == "0"
+    )
+
+
+# ── ST7: auth probe before reap ───────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "probe_cmd,expected",
+    [
+        ("true", 1),  # healthy (exit 0) ⇒ not dead
+        ("echo authentication_error; exit 1", 0),  # nonzero + auth signature ⇒ dead
+        ("echo boom; exit 1", 1),  # nonzero WITHOUT an auth signature ⇒ a blip, not dead
+    ],
+)
+def test_afk_auth_is_dead_predicate(probe_cmd: str, expected: int) -> None:
+    result = _call('_afk_auth_is_dead; echo "RC=$?"', env={"AFK_AUTH_PROBE_CMD": probe_cmd})
+
+    assert f"RC={expected}" in result.stdout, result.stdout + result.stderr
+
+
+def test_reap_pass_halts_on_dead_auth_instead_of_reaping(tmp_path: Path) -> None:
+    # An idle reap candidate with a DEAD subscription token: reap_pass must probe once, raise
+    # the global stop flag, and NOT reap the spoke (blocking it into dead auth one-by-one).
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, _tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)
+    expr, env, ready_log, _statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    env["AFK_AUTH_PROBE_CMD"] = "echo authentication_error; exit 1"  # dead auth
+    expr = expr + '; echo "FLAG=$_AFK_AUTH_FAILED"'
+
+    result = _call(expr, env=env)
+
+    assert "FLAG=1" in result.stdout, "a dead-auth probe must raise the halt-all stop flag"
+    # reap_pass bails before reaping, so spoke-ready is never invoked (no log written).
+    blocked = ready_log.read_text() if ready_log.exists() else ""
+    assert "--blocked" not in blocked, (
+        "a dead-auth reap must NOT block the spoke — the halt-all path owns it"
+    )
