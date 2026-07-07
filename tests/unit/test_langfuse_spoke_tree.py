@@ -1844,6 +1844,18 @@ class TestSchemaRev:
             == b_batch[0]["body"]["metadata"]["schema_rev"]
         )
 
+    def test_schema_rev_survives_mode_lane_tagging(self) -> None:
+        # apply_mode_lane_tags merges mode/lane into the same body.metadata via setdefault;
+        # schema_rev must coexist, not be clobbered.
+        batch = build_batch(_traces(), SPOKE)
+
+        apply_mode_lane_tags(batch, "afk", "spoke")
+
+        metadata = batch[0]["body"]["metadata"]
+        assert isinstance(metadata["schema_rev"], int)
+        assert metadata["mode"] == "afk"
+        assert metadata["lane"] == "spoke"
+
 
 def _tool_obs(obs_id: str, name: str, tool_use_id: str, **extra) -> dict:
     """Build a source observation carrying a tool-call id under metadata["attributes"]."""

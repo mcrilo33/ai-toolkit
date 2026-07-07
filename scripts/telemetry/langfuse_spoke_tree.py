@@ -222,6 +222,10 @@ _PAGE_LIMIT = 100
 # Max ingestion events per POST, to keep each request small.
 _CHUNK_SIZE = 100
 
+# Builder generation stamped into both trace-create bodies (#156) so a consumer can tell
+# which builder produced a stored view. Bump on any change to the assembled view shape.
+_SCHEMA_REV = 1
+
 # --rebuild purge poll (#156): a bulk trace delete is asynchronous on the Langfuse server,
 # so after issuing it we poll the session listing until both view traces are gone before
 # re-posting. Give up (raise) after the budget rather than re-post over a half-deleted trace.
@@ -1797,6 +1801,7 @@ def build_batch(
             "name": _TRACE_NAME_PREFIX + spoke_run_id,
             "sessionId": spoke_run_id,
             "timestamp": base_ts,
+            "metadata": {"schema_rev": _SCHEMA_REV},
         },
     }
     root_event: IngestEvent = {
@@ -2133,6 +2138,7 @@ def build_cycle_batch(
             "name": _CYCLE_TRACE_NAME_PREFIX + spoke_run_id,
             "sessionId": spoke_run_id,
             "timestamp": base_ts,
+            "metadata": {"schema_rev": _SCHEMA_REV},
         },
     }
     root_event: IngestEvent = {
