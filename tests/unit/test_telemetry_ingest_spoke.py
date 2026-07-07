@@ -453,3 +453,60 @@ def test_skips_when_spoke_run_id_missing(worktree: Path, tmp_path: Path) -> None
     # Assert
     assert result.returncode == 0, result.stderr
     assert not runlog.exists()
+
+
+def _git(repo: Path, *args: str) -> None:
+    """Run a git command in `repo` with a pinned identity (no reliance on host config)."""
+    subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@e",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@e",
+        },
+    )
+
+
+def test_passes_commits_for_the_spoke_branch(worktree: Path, tmp_path: Path) -> None:
+    # Arrange: the worktree is the spoke checkout — a base commit pinned as origin/main,
+    # then one commit ahead that the land will attribute to this spoke.
+    _git(worktree, "init", "-q")
+    (worktree / "base.txt").write_text("base\n")
+    _git(worktree, "add", "-A")
+    _git(worktree, "commit", "-qm", "chore: base")
+    _git(worktree, "update-ref", "refs/remotes/origin/main", "HEAD")
+    (worktree / "a.py").write_text("x\ny\n")
+    _git(worktree, "add", "a.py")
+    _git(worktree, "commit", "-qm", "feat: add a")
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+
+    # Act
+    result = _run(worktree, bindir)
+
+    # Assert: the builder gets --commits <dump> and the dump carries the ahead commit only.
+    assert result.returncode == 0, result.stderr
+    (tree,) = runlog.read_text().splitlines()
+    assert "--commits" in tree
+    dump = (worktree / ".ai-toolkit" / "commits.dump").read_text()
+    assert "feat: add a" in dump
+    assert "a.py" in dump
+    assert "chore: base" not in dump  # only origin/main..HEAD, not the base
+
+
+def test_no_commits_flag_when_not_a_git_repo(worktree: Path, tmp_path: Path) -> None:
+    # Arrange: the plain worktree is not a git repo → git log fails → no --commits.
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+
+    # Act
+    result = _run(worktree, bindir)
+
+    # Assert
+    assert result.returncode == 0, result.stderr
+    (tree,) = runlog.read_text().splitlines()
+    assert "--commits" not in tree

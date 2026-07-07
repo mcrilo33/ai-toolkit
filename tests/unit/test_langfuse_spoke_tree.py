@@ -33,8 +33,10 @@ from telemetry.langfuse_spoke_tree import (
     ToolContent,
     _copy_id,
     _decomp_metadata,
+    _gate_park_ms,
     _is_own_output,
     _memoized_counter,
+    _parse_commits,
     _step_phase,
     _tool_span_ids,
     apply_context_deltas,
@@ -4818,6 +4820,207 @@ class TestStepCostScores:
         for event in step_nodes:
             assert "usageDetails" not in event["body"]
             assert "model" not in event["body"]
+
+
+def _commit(sha: str, message: str, at: str, files: list[str], add: int, dele: int) -> dict:
+    """A parsed commit record as the builder consumes it."""
+    return {
+        "sha": sha,
+        "message": message,
+        "authored_at": at,
+        "files": files,
+        "additions": add,
+        "deletions": dele,
+    }
+
+
+def _commit_node(batch: list[dict], sha7: str) -> dict:
+    """Return the synthesized commit:<sha7> node, asserting it exists."""
+    return next(e for e in batch if e["body"]["name"] == f"commit:{sha7}")
+
+
+def _gate_park_node(batch: list[dict]) -> dict | None:
+    """Return the synthesized wait:gate-park node, or None when absent."""
+    return next((e for e in batch if e["body"]["name"] == "wait:gate-park"), None)
+
+
+class TestParseCommits:
+    """#162: parse a ``git log --numstat`` dump into commit records."""
+
+    def test_parses_sha_message_time_and_numstat(self) -> None:
+        sep = "\x1f"
+        dump = (
+            f"commit{sep}abcdef1234567{sep}2026-01-02T00:00:05+00:00{sep}feat: a thing\n"
+            "3\t1\tsrc/a.py\n"
+            "5\t0\tsrc/b.py\n"
+            "\n"
+            f"commit{sep}0123456abcdef{sep}2026-01-02T00:00:20+00:00{sep}fix: b thing\n"
+            "-\t-\tbin/blob\n"
+        )
+
+        commits = _parse_commits(dump)
+
+        assert commits[0] == _commit(
+            "abcdef1234567",
+            "feat: a thing",
+            "2026-01-02T00:00:05+00:00",
+            ["src/a.py", "src/b.py"],
+            8,
+            1,
+        )
+        # Binary files show "-" for add/del and contribute 0.
+        assert commits[1]["additions"] == 0
+        assert commits[1]["deletions"] == 0
+        assert commits[1]["files"] == ["bin/blob"]
+
+    def test_empty_dump_yields_no_commits(self) -> None:
+        assert _parse_commits("") == []
+
+
+class TestCommitNodes:
+    """#162: synthesize commit:<sha7> timeline nodes placed by author time."""
+
+    _SHA = "abcdef1234567890"
+    _COMMIT = _commit(_SHA, "feat: land it", "2026-01-02T00:00:12Z", ["a.py"], 4, 2)
+
+    def _content(self) -> dict[str, ToolContent]:
+        return {
+            "tu-c1": ToolContent(
+                {"subject": "S1 RED: x"}, "Task #1 created successfully: S1 RED: x"
+            ),
+            "tu-u1": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
+            "tu-u2": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
+        }
+
+    def _traces(self) -> list[tuple[str, list[dict]]]:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:40Z",
+        )
+        create = _ledger_child(
+            "tc1",
+            "tool:TaskCreate",
+            "tu-c1",
+            parent="i1",
+            start="2026-01-02T00:00:02Z",
+            end="2026-01-02T00:00:02Z",
+        )
+        started = _ledger_child(
+            "tu1",
+            "tool:TaskUpdate",
+            "tu-u1",
+            parent="i1",
+            start="2026-01-02T00:00:05Z",
+            end="2026-01-02T00:00:05Z",
+        )
+        done = _ledger_child(
+            "tu2",
+            "tool:TaskUpdate",
+            "tu-u2",
+            parent="i1",
+            start="2026-01-02T00:00:20Z",
+            end="2026-01-02T00:00:21Z",
+        )
+        return [("tr", [interaction, create, started, done])]
+
+    def test_commit_node_carries_metadata_and_no_usage_view_a(self) -> None:
+        batch = build_batch(self._traces(), SPOKE, self._content(), commits=[self._COMMIT])
+
+        node = _commit_node(batch, "abcdef1")["body"]
+        assert node["metadata"] == {
+            "sha": self._SHA,
+            "message": "feat: land it",
+            "files": ["a.py"],
+            "additions": 4,
+            "deletions": 2,
+        }
+        assert "usageDetails" not in node
+
+    def test_commit_node_placed_in_containing_step_window_view_b(self) -> None:
+        cycle = build_cycle_batch(self._traces(), SPOKE, self._content(), commits=[self._COMMIT])
+
+        # Author time 00:12 falls inside the task window [00:05, 00:21] → under step:S1 RED: x.
+        step = _cycle_step(cycle, "step:S1 RED: x")
+        assert _commit_node(cycle, "abcdef1")["body"]["parentObservationId"] == step["body"]["id"]
+
+    def test_no_commits_arg_emits_no_commit_node(self) -> None:
+        batch = build_batch(self._traces(), SPOKE, self._content())
+
+        assert not any(e["body"]["name"].startswith("commit:") for e in batch)
+
+    def test_double_build_is_byte_identical(self) -> None:
+        first = build_batch(self._traces(), SPOKE, self._content(), commits=[self._COMMIT])
+        second = build_batch(self._traces(), SPOKE, self._content(), commits=[self._COMMIT])
+
+        assert first == second
+
+
+class TestGateParkNode:
+    """#162: synthesize a wait:gate-park timeline block from the gate-park bounds."""
+
+    def _traces(self) -> list[tuple[str, list[dict]]]:
+        gate = _obs(
+            "g1",
+            "script:gate",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:01Z",
+        )
+        resume = _obs(
+            "t1",
+            "tool:Edit",
+            parent=None,
+            startTime="2026-01-02T00:00:11Z",
+            endTime="2026-01-02T00:00:12Z",
+        )
+        return [("tr", [gate, resume])]
+
+    def test_gate_park_node_duration_equals_gate_park_ms(self) -> None:
+        traces = self._traces()
+        batch = build_batch(traces, SPOKE)
+
+        node = _gate_park_node(batch)
+        assert node is not None
+        assert node["body"]["parentObservationId"] == root_id_for(SPOKE)
+        assert "usageDetails" not in node["body"]
+        # The block spans the gate's end to the resume activity's start (== gate_park_ms).
+        assert node["body"]["startTime"] == "2026-01-02T00:00:01Z"
+        assert node["body"]["endTime"] == "2026-01-02T00:00:11Z"
+        assert _gate_park_ms(traces) == 10000
+
+    def test_park_time_moves_from_root_self_to_wait(self) -> None:
+        traces = self._traces()
+        batch = build_batch(traces, SPOKE)
+
+        root = next(e for e in batch if e["id"] == root_id_for(SPOKE))
+        duration = root["body"]["metadata"]["rollup"]["duration"]
+        # base_ts 00:00 → latest 00:12 = 12000ms, fully attributed; the 10s park is wait, not self.
+        assert duration["total_ms"] == 12000
+        assert duration["components"]["wait"] == 11000  # 1s gate span + 10s park
+        assert duration["components"]["self"] == 0
+
+    def test_no_gate_emits_no_wait_node(self) -> None:
+        traces = [
+            (
+                "tr",
+                [
+                    _obs(
+                        "t1",
+                        "tool:Edit",
+                        parent=None,
+                        startTime="2026-01-02T00:00:00Z",
+                        endTime="2026-01-02T00:00:01Z",
+                    )
+                ],
+            )
+        ]
+
+        batch = build_batch(traces, SPOKE)
+
+        assert _gate_park_node(batch) is None
 
 
 def _guard(
