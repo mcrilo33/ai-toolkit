@@ -174,8 +174,13 @@ class TestBuildBatch:
     def test_one_copy_per_source_observation(self) -> None:
         batch = build_batch(_traces(), SPOKE)
 
-        copies = batch[2:]
-        # 6 source observations across the 4 traces.
+        # 6 source observations across the 4 traces; the two `.sh` hooks additionally spawn a
+        # `guards` + `guards:session` group each (#157), so filter those out to count the sources.
+        copies = [
+            event
+            for event in batch[2:]
+            if event["body"].get("name") not in ("guards", "guards:session")
+        ]
         assert len(copies) == 6
         assert all(event["body"]["traceId"] == trace_id_for(SPOKE) for event in copies)
         assert {event["type"] for event in copies} == {"span-create", "generation-create"}
@@ -223,16 +228,22 @@ class TestBuildBatch:
         assert marker["body"]["parentObservationId"] == root_id
 
     def test_hook_matching_a_tool_is_parented_under_that_tool(self) -> None:
+        # #157: the hook nests under its tool's `guards` group, which nests under the tool.
         batch = build_batch(_traces(), SPOKE)
 
+        group = _guards_group(batch)
         hook = _by_orig(batch, "trace-hook", "h1")
-        assert hook["body"]["parentObservationId"] == _copy_id("trace-int", "t1")
+        assert hook["body"]["parentObservationId"] == group["body"]["id"]
+        assert group["body"]["parentObservationId"] == _copy_id("trace-int", "t1")
 
     def test_hook_without_a_match_collapses_to_spoke_root(self) -> None:
+        # #157: a root-level (session) hook nests under the root `guards:session` group.
         batch = build_batch(_traces(), SPOKE)
 
+        session = _session_guards(batch)
         stray = _by_orig(batch, "trace-stray", "h2")
-        assert stray["body"]["parentObservationId"] == root_id_for(SPOKE)
+        assert stray["body"]["parentObservationId"] == session["body"]["id"]
+        assert session["body"]["parentObservationId"] == root_id_for(SPOKE)
 
     def test_hook_matches_tool_via_gen_ai_tool_call_id(self) -> None:
         # The tool exposes its id only as gen_ai.tool.call.id; the hook references it as
@@ -253,12 +264,14 @@ class TestBuildBatch:
 
         batch = build_batch(traces, SPOKE)
 
+        group = _guards_group(batch)
         copy = _by_orig(batch, "trace-hook", "h9")
-        assert copy["body"]["parentObservationId"] == _copy_id("trace-tool", "t9")
+        assert copy["body"]["parentObservationId"] == group["body"]["id"]
+        assert group["body"]["parentObservationId"] == _copy_id("trace-tool", "t9")
 
     def test_hook_detected_by_workflow_kind_without_sh_name(self) -> None:
-        # A hook whose name does not end in ".sh" is still detected via workflow.kind and
-        # collapses to the root when nothing matches its id.
+        # A hook whose name does not end in ".sh" is still detected via workflow.kind; with no
+        # tool_use_id it is a session guard, nested under the root `guards:session` group (#157).
         hook = _obs(
             "h8",
             "hook-emit",
@@ -268,8 +281,10 @@ class TestBuildBatch:
 
         batch = build_batch([("trace-hook", [hook])], SPOKE)
 
+        session = _session_guards(batch)
         copy = _by_orig(batch, "trace-hook", "h8")
-        assert copy["body"]["parentObservationId"] == root_id_for(SPOKE)
+        assert copy["body"]["parentObservationId"] == session["body"]["id"]
+        assert session["body"]["parentObservationId"] == root_id_for(SPOKE)
 
     def test_tool_result_audit_event_nests_under_its_tool(self) -> None:
         # tool_result audit observations join by the same rule (forward-compat with the
@@ -326,8 +341,11 @@ class TestBuildBatch:
 
         batch = build_batch(traces, SPOKE)
 
+        # #157: the gate hook still resolves to its tool — now via its tool's `guards` group.
+        group = _guards_group(batch)
         hook_copy = _by_orig(batch, "trace-hook", "h5")
-        assert hook_copy["body"]["parentObservationId"] == _copy_id("trace-tool", "t5")
+        assert hook_copy["body"]["parentObservationId"] == group["body"]["id"]
+        assert group["body"]["parentObservationId"] == _copy_id("trace-tool", "t5")
 
     def test_hook_execution_complete_event_nests_under_its_tool(self) -> None:
         # A hook_execution_complete:PreToolUse audit observation now carries the tool_use_id
@@ -418,8 +436,11 @@ class TestBuildBatch:
 
         batch = build_batch(traces, SPOKE)
 
+        # #157: the gate hook resolves to its tool via the tool's `guards` group.
+        group = _guards_group(batch)
         gate_copy = _by_orig(batch, "trace-hook", "h11")
-        assert gate_copy["body"]["parentObservationId"] == _copy_id("trace-tool", "t11")
+        assert gate_copy["body"]["parentObservationId"] == group["body"]["id"]
+        assert group["body"]["parentObservationId"] == _copy_id("trace-tool", "t11")
 
     def test_ids_are_deterministic_across_runs(self) -> None:
         first = {event["id"] for event in build_batch(_traces(), SPOKE)}
@@ -692,8 +713,11 @@ class TestEnclosingTurnFallback:
 
         batch = build_batch(traces, SPOKE)
 
+        # #157: the matched tool still wins over the enclosing turn — reached via its `guards` group.
+        group = _guards_group(batch)
         copy = _by_orig(batch, "trace-hook", "h5")
-        assert copy["body"]["parentObservationId"] == _copy_id("trace-int", "t1")
+        assert copy["body"]["parentObservationId"] == group["body"]["id"]
+        assert group["body"]["parentObservationId"] == _copy_id("trace-int", "t1")
 
 
 class TestSessionScopedHookNoDangle:
@@ -847,9 +871,11 @@ class TestToolSubspanFolding:
 
         batch = build_batch([("tr", [tool, hook])], SPOKE)
 
-        # the hook survives as a node nested under its tool — only the 3 sub-spans fold.
+        # the hook survives as a node (not folded) — nested under its tool's `guards` group (#157).
         assert not self._dropped(batch, "tr", "hk")
-        assert _by_orig(batch, "tr", "hk")["body"]["parentObservationId"] == _copy_id("tr", "tb")
+        group = _guards_group(batch)
+        assert _by_orig(batch, "tr", "hk")["body"]["parentObservationId"] == group["body"]["id"]
+        assert group["body"]["parentObservationId"] == _copy_id("tr", "tb")
 
     def test_tool_result_event_is_not_folded(self) -> None:
         tool = _obs("tb", "Read", parent=None, metadata={"attributes": {"tool_use_id": "tu-1"}})

@@ -224,7 +224,9 @@ _CHUNK_SIZE = 100
 
 # Builder generation stamped into both trace-create bodies (#156) so a consumer can tell
 # which builder produced a stored view. Bump on any change to the assembled view shape.
-_SCHEMA_REV = 1
+# rev 2 (#157): guards / guards:session group nodes, blocked-tool:* synthesis, hook endTime
+# stamping, and WARNING/ERROR failure levels.
+_SCHEMA_REV = 2
 
 # --rebuild purge poll (#156): a bulk trace delete is asynchronous on the Langfuse server,
 # so after issuing it we poll the session listing until both view traces are gone before
@@ -260,6 +262,18 @@ _TOOL_AUDIT_EVENT_PREFIXES = ("tool_decision", "tool_result", "hook_execution_co
 _FOLD_EXECUTION_NAME = "claude_code.tool.execution"
 _FOLD_BLOCKED_NAME = "claude_code.tool.blocked_on_user"
 _FOLD_DECISION_PREFIX = "tool_decision"
+
+# Guard-group nodes (#157). Every ``.sh`` guard span that joins a tool (or the root) is
+# collapsed under one synthetic ``guards`` group (``guards:session`` at the root) carrying a
+# ``by_hook`` rollup over ALL raw guards; a no-op guard (``decision=allow`` ∧
+# ``status=success`` ∧ ``duration_ms < _GUARD_NOOP_MAX_MS``) is dropped by default and kept
+# only under ``--keep-noop-guards``. The group's own hook-bucket time is the summed raw guard
+# duration (``total_ms``), not its min…max envelope, so the root's ``hook`` bucket reflects
+# real guard cost and the keep-noop drop leaves ``rollup.duration.components`` unchanged.
+_GUARDS_NAME = "guards"
+_GUARDS_SESSION_NAME = "guards:session"
+_GUARDS_PREFIX = "tree-guards-"
+_GUARD_NOOP_MAX_MS = 1000
 
 # Span-less session-startup audit instants (#104). They ride the OTel logs signal, so their
 # observation ``startTime`` is the LAGGING flush time, never the true event time; placing them
@@ -402,6 +416,11 @@ def _copy_id(orig_trace_id: str, orig_obs_id: str) -> str:
     """Return the deterministic copy id for a source observation in the assembled trace."""
     digest = hashlib.sha1(f"{orig_trace_id}:{orig_obs_id}".encode()).hexdigest()[:24]
     return _COPY_PREFIX + digest
+
+
+def _guards_id(parent_id: str) -> str:
+    """Return the deterministic id of the ``guards`` group under ``parent_id`` (a tool / root)."""
+    return _GUARDS_PREFIX + hashlib.sha1(parent_id.encode()).hexdigest()[:24]
 
 
 def cycle_trace_id_for(spoke_run_id: str) -> str:
@@ -698,6 +717,141 @@ def _fold_tool_subspans(
                 parent = reparent[parent]
             event["body"]["parentObservationId"] = parent
     return [event for event in copies if event["body"]["id"] not in reparent]
+
+
+def _guard_noop(body: Observation) -> bool:
+    """Whether a guard span is a droppable no-op: ``decision=allow`` ∧ ``status=success`` ∧ <1s."""
+    ms = _duration_ms(body)
+    return (
+        _attr(body, "decision") == "allow"
+        and _attr(body, "status") == "success"
+        and ms is not None
+        and ms < _GUARD_NOOP_MAX_MS
+    )
+
+
+def _guard_group_metadata(members: list[IngestEvent]) -> dict[str, Any]:
+    """Return a guards group's rollup over ALL its raw guard spans (before any are dropped).
+
+    ``by_hook`` keys are sorted and ``decisions`` de-duplicated + sorted so the group body is
+    byte-stable across reruns; ``count`` / ``total_ms`` / per-hook ``ms`` sum every member,
+    including the no-op spans dropped from the tree (#157 AC1).
+    """
+    by_hook: dict[str, dict[str, int]] = {}
+    total_ms = 0
+    decisions: set[str] = set()
+    for member in members:
+        body = member["body"]
+        name = body.get("name") or ""
+        ms = _duration_ms(body) or 0
+        entry = by_hook.setdefault(name, {"count": 0, "ms": 0})
+        entry["count"] += 1
+        entry["ms"] += ms
+        total_ms += ms
+        decision = _attr(body, "decision")
+        if decision is not None:
+            decisions.add(str(decision))
+    return {
+        "count": len(members),
+        "total_ms": total_ms,
+        "by_hook": {name: by_hook[name] for name in sorted(by_hook)},
+        "decisions": sorted(decisions),
+    }
+
+
+def _guard_envelope(members: list[IngestEvent]) -> tuple[str | None, str | None]:
+    """Return the (min start, max end) ISO bounds over the guard members, chronologically."""
+    starts = [m["body"]["startTime"] for m in members if m["body"].get("startTime")]
+    ends = [m["body"]["endTime"] for m in members if m["body"].get("endTime")]
+    start = min(starts, key=lambda s: _parse_utc(s) or datetime.min) if starts else None
+    end = max(ends, key=lambda s: _parse_utc(s) or datetime.min) if ends else None
+    return start, end
+
+
+def _guard_group_event(
+    parent_id: str, members: list[IngestEvent], *, trace_id: str, root_id: str
+) -> IngestEvent:
+    """Build the synthetic ``guards`` / ``guards:session`` group node for one parent's guards."""
+    group_id = _guards_id(parent_id)
+    name = _GUARDS_SESSION_NAME if parent_id == root_id else _GUARDS_NAME
+    start, end = _guard_envelope(members)
+    body: dict[str, Any] = {
+        "id": group_id,
+        "traceId": trace_id,
+        "parentObservationId": parent_id,
+        "name": name,
+        "startTime": start,
+        "endTime": end,
+        "metadata": _guard_group_metadata(members),
+    }
+    return {
+        "id": group_id,
+        "type": "span-create",
+        "timestamp": start or _INGEST_TIMESTAMP,
+        "body": body,
+    }
+
+
+def _apply_guard_groups(
+    copies: list[IngestEvent],
+    *,
+    trace_id: str,
+    root_id: str,
+    tool_owner_ids: set[str],
+    keep_noop_guards: bool,
+) -> list[IngestEvent]:
+    """Collapse each tool's (and the session's) ``.sh`` guard copies under a ``guards`` group (#157).
+
+    A guard copy (:func:`_is_hook`) whose resolved parent is a tool owner or the synthetic root is
+    re-homed under a synthesized ``guards`` group (``guards:session`` at the root) parented where
+    the guard sat. No-op guards (:func:`_guard_noop`) are dropped unless ``keep_noop_guards``; the
+    survivors keep their nodes under the group. Guards resolved under anything else (e.g. an
+    interaction) and non-guard satellites are left untouched. The group's ``by_hook`` rollup counts
+    every raw guard including the dropped ones (:func:`_guard_group_metadata`).
+
+    Args:
+        copies: The assembled copies; guard copies are re-parented or dropped in place.
+        trace_id: The assembled trace id every group node references.
+        root_id: The synthetic root id (host of the ``guards:session`` group).
+        tool_owner_ids: Copy ids that own a tool call (real tool spans + synthesized blocked-tools).
+        keep_noop_guards: When True, no-op guards are retained under their group instead of dropped.
+
+    Returns:
+        The copies with grouped guards re-parented, no-ops dropped, and group nodes appended.
+    """
+    grouped: dict[str, list[IngestEvent]] = {}
+    for event in copies:
+        body = event["body"]
+        if not _is_hook(body):
+            continue
+        parent = body.get("parentObservationId")
+        if parent in tool_owner_ids or parent == root_id:
+            grouped.setdefault(parent, []).append(event)
+    if not grouped:
+        return copies
+    dropped: set[str] = set()
+    group_events: list[IngestEvent] = []
+    for parent_id, members in grouped.items():
+        group = _guard_group_event(parent_id, members, trace_id=trace_id, root_id=root_id)
+        group_events.append(group)
+        for member in members:
+            if not keep_noop_guards and _guard_noop(member["body"]):
+                dropped.add(member["body"]["id"])
+            else:
+                member["body"]["parentObservationId"] = group["body"]["id"]
+    kept = [event for event in copies if event["body"]["id"] not in dropped]
+    return kept + group_events
+
+
+def _is_guards_group(body: Observation | None) -> bool:
+    """Whether a node is a synthesized ``guards`` / ``guards:session`` group (#157)."""
+    return bool(body) and (body.get("name") in (_GUARDS_NAME, _GUARDS_SESSION_NAME))
+
+
+def _guards_total_ms(body: Observation) -> int:
+    """Return a guards group's summed raw guard duration from its metadata (0 if malformed)."""
+    total = (body.get("metadata") or {}).get("total_ms")
+    return total if isinstance(total, int) else 0
 
 
 def _build_tool_index(traces: list[TraceObservations]) -> dict[str, str]:
@@ -1184,7 +1338,7 @@ def _duration_class(event: IngestEvent) -> str:
         return "turn"
     if name.startswith("script:") or _attr(body, "workflow.kind") == "script":
         return "script"
-    if _is_hook(body):
+    if _is_guards_group(body) or _is_hook(body):
         return "hook"
     if _is_tool_span(body):
         return "tool"
@@ -1313,6 +1467,12 @@ def _duration_rollup(
             wait = min(exclusive, _blocked_ms(by_id[node_id]))
             components["wait"] += wait
             components["tool"] += exclusive - wait
+        elif _is_guards_group(by_id.get(node_id)):
+            # A guards group books the summed RAW guard time (#157), not its min…max envelope,
+            # minus the slice its surviving children already book — so root's ``hook`` bucket is
+            # real guard cost and dropping no-op guards leaves the components unchanged.
+            kept = sum(_interval_ms(intervals.get(kid)) for kid in kids)
+            components["hook"] += max(0, _guards_total_ms(by_id[node_id]) - kept)
         else:
             components[bucket] += exclusive
         for kid in kids:
@@ -1764,6 +1924,8 @@ def build_batch(
     traces: list[TraceObservations],
     spoke_run_id: str,
     tool_content: dict[str, ToolContent] | None = None,
+    *,
+    keep_noop_guards: bool = False,
 ) -> list[IngestEvent]:
     """Assemble one nested trace from a spoke's source traces and their observations.
 
@@ -1819,7 +1981,12 @@ def build_batch(
         },
     }
     copies = _assemble_copies(
-        traces, trace_id=trace_id, root_id=root_id, tool_content=tool_content, root_event=root_event
+        traces,
+        trace_id=trace_id,
+        root_id=root_id,
+        tool_content=tool_content,
+        root_event=root_event,
+        keep_noop_guards=keep_noop_guards,
     )
     step_events = _apply_step_grouping(
         copies, traces, tool_content, spoke_run_id=spoke_run_id, trace_id=trace_id
@@ -1836,16 +2003,18 @@ def _assemble_copies(
     root_id: str,
     tool_content: dict[str, ToolContent],
     root_event: IngestEvent,
+    keep_noop_guards: bool = False,
 ) -> list[IngestEvent]:
     """Build the re-parented, folded, startup-collapsed observation copies both views share.
 
     Re-parents every source observation across the original trace boundaries
     (:func:`_resolve_parent`), grafts transcript content into the create body
-    (:func:`_copy_event`), folds the three 1:1 tool sub-spans (:func:`_fold_tool_subspans`), and
-    demotes session-startup instants onto ``root_event``'s metadata
-    (:func:`_collapse_startup_instants`). View A wraps these in local step nodes; View B re-homes
-    them onto the cycle axis. ``root_event`` is the view's own synthetic root (its metadata is
-    mutated in place).
+    (:func:`_copy_event`), folds the three 1:1 tool sub-spans (:func:`_fold_tool_subspans`),
+    collapses each tool's / the session's ``.sh`` guard spans under a ``guards`` group and drops
+    the no-op ones unless ``keep_noop_guards`` (:func:`_apply_guard_groups`), and demotes
+    session-startup instants onto ``root_event``'s metadata (:func:`_collapse_startup_instants`).
+    View A wraps these in local step nodes; View B re-homes them onto the cycle axis. ``root_event``
+    is the view's own synthetic root (its metadata is mutated in place).
     """
     tool_index = _build_tool_index(traces)
     request_index = _build_request_index(traces)
@@ -1873,6 +2042,13 @@ def _assemble_copies(
                 )
             )
     copies = _fold_tool_subspans(copies, traces, tool_index)
+    copies = _apply_guard_groups(
+        copies,
+        trace_id=trace_id,
+        root_id=root_id,
+        tool_owner_ids=set(tool_index.values()),
+        keep_noop_guards=keep_noop_guards,
+    )
     return _collapse_startup_instants(copies, root_event)
 
 
@@ -2094,6 +2270,8 @@ def build_cycle_batch(
     traces: list[TraceObservations],
     spoke_run_id: str,
     tool_content: dict[str, ToolContent] | None = None,
+    *,
+    keep_noop_guards: bool = False,
 ) -> list[IngestEvent]:
     """Assemble the View B (steps -> work) ``spokecycle-<spoke>`` trace (#113).
 
@@ -2161,6 +2339,7 @@ def build_cycle_batch(
         root_id=a_root_id,
         tool_content=tool_content,
         root_event=root_event,
+        keep_noop_guards=keep_noop_guards,
     )
     windows = build_step_windows(traces, tool_content)
     copies, step_events, marker_ids = _apply_cycle_axis(
@@ -3105,6 +3284,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "re-posting, so a view-shape change fully replaces stale span bodies (#156)."
         ),
     )
+    parser.add_argument(
+        "--keep-noop-guards",
+        action="store_true",
+        help=(
+            "Retain no-op guard spans (decision=allow, status=success, <1s) as children of their "
+            "guards group instead of dropping them; the per-hook rollup is unchanged either way "
+            "(#157)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -3133,8 +3321,12 @@ def main(argv: list[str] | None = None) -> int:
     traces = fetch_session(args.spoke_run_id, get)
     scan_root = transcript_scan_root(args.projects, args.root.resolve())
     tool_content = scan_transcripts(scan_root, _tool_span_ids(traces))
-    batch = build_batch(traces, args.spoke_run_id, tool_content)
-    cycle_batch = build_cycle_batch(traces, args.spoke_run_id, tool_content)
+    batch = build_batch(
+        traces, args.spoke_run_id, tool_content, keep_noop_guards=args.keep_noop_guards
+    )
+    cycle_batch = build_cycle_batch(
+        traces, args.spoke_run_id, tool_content, keep_noop_guards=args.keep_noop_guards
+    )
     mode, lane = read_mode_lane(args.root.resolve())
     apply_mode_lane_tags(batch, mode, lane)
     apply_mode_lane_tags(cycle_batch, mode, lane)
