@@ -291,11 +291,13 @@ def test_merge_candidates_warn_for_colliding_open_chain() -> None:
 
 
 def test_merge_candidates_silent_for_disjoint_chain() -> None:
-    # The acceptance chain #1 → #2 → #3 has disjoint scopes (a.py, b.py, c.py).
+    # The acceptance chain #1 → #2 → #3 has disjoint scopes (a.py, b.py, c.py), so the
+    # #125 CHAIN lint (`strictly serialized`) stays silent. (The ready pair #1/#4
+    # collides on a.py — the unchained #167 lint covers that, not this assertion.)
     proc = _run_plan(_acceptance_graph())
 
     assert proc.returncode == 0, proc.stderr
-    assert "merge candidates" not in proc.stderr
+    assert "strictly serialized" not in proc.stderr
 
 
 def test_merge_candidates_chain_coalesces_into_one_line() -> None:
@@ -458,6 +460,196 @@ def test_split_marker_requires_intentional_value() -> None:
     proc = _run_plan(nodes)
 
     assert "merge candidates: #1 → #2" in proc.stderr
+
+
+# ── unchained merge-candidate lint: ready colliding cluster, no deps (issue #167) ─
+# The #125 lint fires only on blocked-by CHAINS. A cluster of ready, mutually-
+# unblocked issues sharing a scope (e.g. #158/#160/#161/#162) is serialized by the
+# greedy pack but never flagged. This lint groups the ready set by concrete-token
+# overlap and prints one umbrella-candidate hint per cluster of ≥2 — report-only,
+# stderr, and structurally disjoint from #125 (a #125 component always contains a
+# non-ready child, so no cluster is reported by both).
+
+
+def test_unchained_merge_candidates_warn_for_ready_colliding_cluster() -> None:
+    # Four ready, dependency-free issues on an identical scope — the #165 case.
+    nodes = [_node(n, "langfuse_spoke_tree.py") for n in (158, 160, 161, 162)]
+
+    proc = _run_plan(nodes)
+
+    assert proc.returncode == 0, proc.stderr
+    warnings = [line for line in proc.stderr.splitlines() if "merge candidates" in line]
+    assert len(warnings) == 1
+    assert "#158 #160 #161 #162" in warnings[0]
+    assert "ready & unchained" in warnings[0]
+    assert "langfuse_spoke_tree.py" in warnings[0]
+
+
+def test_unchained_merge_candidates_silent_for_disjoint_ready() -> None:
+    # Independent, disjoint-scope ready issues parallelize — nothing to merge.
+    nodes = [_node(1, "a.py"), _node(2, "b.py"), _node(3, "c.py")]
+
+    proc = _run_plan(nodes)
+
+    assert "merge candidates" not in proc.stderr
+
+
+def test_unchained_single_ready_issue_no_hint() -> None:
+    # A lone ready issue is not a cluster.
+    nodes = [_node(1, "a.py")]
+
+    proc = _run_plan(nodes)
+
+    assert "merge candidates" not in proc.stderr
+
+
+def test_unchained_not_double_reported_with_chain() -> None:
+    # A colliding chain is the #125 case: it prints the chain line and NOT an
+    # unchained line, even though its head (#1) is ready.
+    nodes = [_node(1, "a.py"), _node(2, "a.py", blocked_by=[(1, "OPEN")])]
+
+    proc = _run_plan(nodes)
+
+    warnings = [line for line in proc.stderr.splitlines() if "merge candidates" in line]
+    assert len(warnings) == 1
+    assert "#1 → #2" in warnings[0]
+    assert "ready & unchained" not in proc.stderr
+
+
+def test_unchained_and_chain_reported_separately() -> None:
+    # A #125 chain (a.py) and an unchained ready cluster (b.py) each print one line.
+    nodes = [
+        _node(1, "a.py"),
+        _node(2, "a.py", blocked_by=[(1, "OPEN")]),
+        _node(31, "b.py"),
+        _node(32, "b.py"),
+    ]
+
+    proc = _run_plan(nodes)
+
+    chain = [line for line in proc.stderr.splitlines() if "strictly serialized" in line]
+    unchained = [line for line in proc.stderr.splitlines() if "ready & unchained" in line]
+    assert len(chain) == 1 and "#1 → #2" in chain[0]
+    assert len(unchained) == 1
+    assert "#31 #32" in unchained[0]
+
+
+def test_unchained_lint_is_detection_only() -> None:
+    # The lint fires but leaves the greedy-pack batch and exit code untouched: two
+    # ready issues colliding on a.py still dispatch exactly one.
+    nodes = [_node(1, "a.py"), _node(2, "a.py")]
+
+    proc = _run_plan(nodes)
+
+    assert proc.returncode == 0
+    assert [int(tok) for tok in proc.stdout.split()] == [1]
+    assert "ready & unchained" in proc.stderr
+
+
+def test_unchained_reports_collision_across_separate_chains() -> None:
+    # #1 and #5 each head their own colliding chain (#125 reports each pair), but they
+    # also collide with EACH OTHER on a.py — a cross-chain ready collision #125 never
+    # pairs. The unchained lint must still surface #1/#5 rather than drop both as
+    # already-flagged.
+    nodes = [
+        _node(1, "a.py"),
+        _node(2, "a.py", blocked_by=[(1, "OPEN")]),
+        _node(5, "a.py"),
+        _node(6, "a.py", blocked_by=[(5, "OPEN")]),
+    ]
+
+    proc = _run_plan(nodes)
+
+    unchained = [line for line in proc.stderr.splitlines() if "ready & unchained" in line]
+    assert len(unchained) == 1
+    assert "#1 #5" in unchained[0]
+    assert "a.py" in unchained[0]
+
+
+def test_unchained_cluster_within_one_chain_is_not_double_reported() -> None:
+    # #1 and #2 are both ready and both block the same non-ready #3, all on a.py, so
+    # #125 already reports the whole {1,2,3} component. The ready pair {1,2} is a
+    # subset of that component ⇒ the unchained lint stays silent (no double-report).
+    nodes = [
+        _node(1, "a.py"),
+        _node(2, "a.py"),
+        _node(3, "a.py", blocked_by=[(1, "OPEN"), (2, "OPEN")]),
+    ]
+
+    proc = _run_plan(nodes)
+
+    assert "ready & unchained" not in proc.stderr
+    assert "strictly serialized" in proc.stderr, "#125 still reports the chain component"
+
+
+def test_unchained_split_intentional_opts_out_only_the_marked_issue() -> None:
+    # #1 records a deliberate split, but its unmarked peers #2/#3 are still redundant
+    # duplicates on a.py — the marker opts #1 out of candidacy without silencing #2/#3.
+    nodes = [
+        _node(1, "a.py", split="intentional — kept apart on purpose"),
+        _node(2, "a.py"),
+        _node(3, "a.py"),
+    ]
+
+    proc = _run_plan(nodes)
+
+    unchained = [line for line in proc.stderr.splitlines() if "ready & unchained" in line]
+    assert len(unchained) == 1
+    assert "#2 #3" in unchained[0]
+    assert "#1" not in unchained[0]
+
+
+def test_unchained_split_intentional_suppresses_lone_pair() -> None:
+    # With only the marked issue and one peer, opting #1 out leaves a cluster of one,
+    # so the deliberate split still silences the hint.
+    nodes = [_node(1, "a.py", split="intentional — kept apart on purpose"), _node(2, "a.py")]
+
+    proc = _run_plan(nodes)
+
+    assert "merge candidates" not in proc.stderr
+
+
+def test_unchained_excludes_held_issue() -> None:
+    # A held issue is staged out of dispatch, so it is not a current merge candidate:
+    # only the non-held peer remains, leaving a cluster of one.
+    nodes = [_node(1, "a.py", labels=["hold"]), _node(2, "a.py")]
+
+    proc = _run_plan(nodes)
+
+    assert "merge candidates" not in proc.stderr
+
+
+def test_unchained_excludes_blocked_issue() -> None:
+    # #2 has an OPEN blocker (#99, absent from the OPEN payload but still open), so it
+    # is not ready and cannot join the ready cluster with #1.
+    nodes = [_node(1, "a.py"), _node(2, "a.py", blocked_by=[(99, "OPEN")])]
+
+    proc = _run_plan(nodes)
+
+    assert "merge candidates" not in proc.stderr
+
+
+def test_unchained_pair_reports_only_shared_token() -> None:
+    # Partial overlap: the hint names the shared token, not each issue's private files.
+    nodes = [_node(1, "a.py shared.py"), _node(2, "shared.py b.py")]
+
+    proc = _run_plan(nodes)
+
+    warnings = [line for line in proc.stderr.splitlines() if "merge candidates" in line]
+    assert len(warnings) == 1
+    assert "shared.py" in warnings[0]
+    assert "a.py" not in warnings[0]
+    assert "b.py" not in warnings[0]
+
+
+def test_unchained_exclusive_star_not_clustered() -> None:
+    # Two `Scope: *` ready issues share no named token, so the unchained lint (which
+    # names the shared token) leaves them alone.
+    nodes = [_node(1, "*"), _node(2, "*")]
+
+    proc = _run_plan(nodes)
+
+    assert "merge candidates" not in proc.stderr
 
 
 # ── undeclared-dependency lint: shared not-yet-created scope path (issue #148) ─
