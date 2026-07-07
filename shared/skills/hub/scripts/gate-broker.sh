@@ -696,7 +696,7 @@ run_answerer() {
   local issue="$1" question="$2" wt="${3:-}"
   local prompt; prompt="$(build_answerer_prompt "$issue" "$question" "$wt")"
   local tools; tools="$(reasoner_allowed_tools)"
-  local cmd="${AFK_ANSWERER_CMD:-claude -p --model claude-opus-4-8 --allowedTools '$tools'}"
+  local cmd="${AFK_ANSWERER_CMD:-claude -p --model claude-fable-5 --allowedTools '$tools'}"
   if [ -n "$wt" ] && [ -d "$wt" ]; then
     ( cd "$wt" && CLAUDE_EFFORT="$AFK_ANSWERER_EFFORT" bash -c "$cmd" <<<"$prompt" 2>&1 )
   else
