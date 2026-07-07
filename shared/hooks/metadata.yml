@@ -308,6 +308,27 @@ spoke-main-guard:
     event: beforeShellExecution
     matcher: "git( +-[cC] +[^ ]+| +-[^ ]+)* +(checkout|switch|merge|branch|reset|update-ref|push)( |$)|worktree-land[.]sh"
 
+# plan-gate-guard (issue #173): enforce the PLAN-gate park. While a gate/<N> tag
+# sits at the branch tip (N from the branch slug) the spoke is parked awaiting
+# review, so this DENIES Edit/Write/NotebookEdit and `git commit` — parking
+# becomes physics, not a request (#117). Reads, searches, git status/diff, and
+# spoke-ready.sh stay allowed; the gate answer path deletes the tag
+# (_consume_gate_tag), which un-blocks with no new machinery. Like hub-guard it
+# spans both the file-edit tools and Bash, so on Claude it carries NO `if` clause
+# (matcher "Edit|Write|NotebookEdit|Bash", the script self-filters). Cursor has no
+# pre-file-edit dedicated event, so — mirroring config-protection — it remaps onto
+# beforeShellExecution and enforces the park at commit time.
+plan-gate-guard:
+  event: preToolUse
+  matcher: "Edit|Write|NotebookEdit|Bash"
+  description: "While gate/<N> sits at the branch tip (PLAN-gate park), DENY Edit/Write/NotebookEdit and git commit; reads, searches, git status/diff, and spoke-ready.sh stay allowed. Un-blocks when the gate tag is consumed or the tip advances"
+  tier: 1
+  copilot:
+    matcher: "edit|create"
+  cursor:
+    event: beforeShellExecution
+    matcher: "git( +-[cC] +[^ ]+| +-[^ ]+)* +commit( |$)"
+
 # parent-span-export (issue #66): telemetry Phase 2 — script causality. On every
 # Bash call, record the tool_use_id to <root>/.ai-toolkit/parent-span; telemetry.sh
 # reads it (after $AI_TOOLKIT_PARENT_SPAN, before the spoke root) so agent-run
