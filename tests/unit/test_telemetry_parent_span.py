@@ -406,6 +406,10 @@ class TestScriptToScriptParent:
             "AI_TOOLKIT_TELEMETRY_DIR": str(telemetry_dir),
             "AI_TOOLKIT_WORKFLOW_REV": "testrev0",
             "AI_TOOLKIT_PARENT_SPAN": "toolu_pushcall",
+            # This test asserts span causality, not spoke-ready's #172 ready gate;
+            # bypass the gate (the fixture has an untracked file / no review) so
+            # both spans still emit.
+            "AI_TOOLKIT_READY_FORCE": "1",
         }
         res = subprocess.run(
             ["bash", str(SPOKE_PUSH), "--ready", "66"],

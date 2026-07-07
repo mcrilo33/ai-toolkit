@@ -59,6 +59,16 @@ def _run(script: Path, repo: Path, env: dict[str, str], *args: str) -> subproces
     )
 
 
+def _stamp_review(repo: Path) -> None:
+    """Write a fresh APPROVE ``.review/*.json`` so spoke-ready's #172 gate passes."""
+    review_dir = repo / ".review"
+    review_dir.mkdir(exist_ok=True)
+    artifact = review_dir / "review.json"
+    artifact.write_text('{"verdict": "APPROVE"}\n')
+    tip = int(_git(repo, "log", "-1", "--format=%ct", "HEAD").strip())
+    os.utime(artifact, (tip, tip))
+
+
 def _events(telemetry_dir: Path) -> list[dict]:
     f = telemetry_dir / "events.jsonl"
     if not f.exists():
@@ -94,7 +104,8 @@ def spoke(tmp_path: Path, remote: Path) -> Path:
     for k, v in (("user.email", "t@t.t"), ("user.name", "t"), ("commit.gpgsign", "false")):
         _git(repo, "config", k, v)
     (repo / "README.md").write_text("seed\n")
-    _git(repo, "add", "README.md")
+    (repo / ".gitignore").write_text(".review/\n")  # .review/ must not dirty the tree
+    _git(repo, "add", "README.md", ".gitignore")
     _git(repo, "commit", "-qm", "chore: seed", "-m", "Refs #0")
     _git(repo, "remote", "add", "origin", str(remote))
     _git(repo, "push", "-q", "-u", "origin", "main")
@@ -103,6 +114,7 @@ def spoke(tmp_path: Path, remote: Path) -> Path:
     _git(repo, "add", "work.txt")
     _git(repo, "commit", "-qm", "feat: work", "-m", "Refs #54")
     _git(repo, "push", "-q", "-u", "origin", OWN)
+    _stamp_review(repo)  # satisfy spoke-ready's #172 ready gate (review of the tip)
     return repo
 
 
