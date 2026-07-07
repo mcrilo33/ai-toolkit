@@ -34,6 +34,7 @@ from telemetry.langfuse_spoke_tree import (
     _copy_id,
     _decomp_metadata,
     _is_own_output,
+    _step_phase,
     _tool_span_ids,
     apply_llm_decomposition,
     apply_mode_lane_tags,
@@ -42,6 +43,7 @@ from telemetry.langfuse_spoke_tree import (
     build_cycle_batch,
     build_loaded_context_events,
     build_score_events,
+    build_step_cost_scores,
     build_step_windows,
     cycle_copy_id_for,
     cycle_root_id_for,
@@ -4374,6 +4376,165 @@ class TestCycleView:
             _by_cycle(batch, "tr", "sk1")["body"]["parentObservationId"]
             == _cycle_step(batch, "preStep")["id"]
         )
+
+
+class TestStepPhaseParser:
+    """#158: map an arbitrary step subject into the closed phase set (cardinality pin)."""
+
+    @pytest.mark.parametrize(
+        "subject,phase",
+        [
+            ("S1 RED: failing test", "RED"),
+            ("A-RED: red first", "RED"),
+            ("ANCHOR #154 source the issue", "ANCHOR"),
+            ("S2 GREEN: implement", "GREEN"),
+            ("S1 REVIEW + PUSH", "REVIEW"),
+            ("S4 PUSH final subtask", "PUSH"),
+            ("miscellaneous chore", "other"),
+        ],
+    )
+    def test_maps_subject_into_closed_set(self, subject: str, phase: str) -> None:
+        assert _step_phase(subject) == phase
+
+    def test_unknown_subject_yields_other_never_free_text(self) -> None:
+        assert _step_phase("totally unrelated subject 123") == "other"
+
+
+class TestStepCostScores:
+    """#158: per-phase ``step_cost_usd:<PHASE>`` / ``step_tokens_written:<PHASE>`` scores.
+
+    ``step:*`` nodes carry token rollups only in ``metadata.rollup`` (no ``usageDetails`` — the
+    #114 double-count guard), so per-step cost is invisible to the Metrics API. Score NAMES are a
+    metrics dimension, so each View B step emits its cost/written from the rollup (cost = written x
+    price). Single-emit on View B only, so a Scores sum never doubles a phase across both views.
+    """
+
+    _BASE_TS = "2026-01-02T00:00:00Z"
+
+    def _content(self) -> dict[str, ToolContent]:
+        return {
+            "tu-c1": ToolContent(
+                {"subject": "S1 RED: x"}, "Task #1 created successfully: S1 RED: x"
+            ),
+            "tu-u1": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
+            "tu-u2": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
+        }
+
+    def _traces(self) -> list[tuple[str, list[dict]]]:
+        interaction = _obs(
+            "i1",
+            "claude_code.interaction",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:40Z",
+        )
+        create = _ledger_child(
+            "tc1",
+            "tool:TaskCreate",
+            "tu-c1",
+            parent="i1",
+            start="2026-01-02T00:00:02Z",
+            end="2026-01-02T00:00:02Z",
+        )
+        started = _ledger_child(
+            "tu1",
+            "tool:TaskUpdate",
+            "tu-u1",
+            parent="i1",
+            start="2026-01-02T00:00:05Z",
+            end="2026-01-02T00:00:05Z",
+        )
+        work_gen = _obs(
+            "wg",
+            "claude_code.llm_request",
+            type_="GENERATION",
+            parent="i1",
+            startTime="2026-01-02T00:00:12Z",
+            endTime="2026-01-02T00:00:13Z",
+            usageDetails={
+                "input": 10,
+                "output": 4,
+                "cache_read_input_tokens": 7,
+                "cache_creation_input_tokens": 50,
+            },
+        )
+        done = _ledger_child(
+            "tu2",
+            "tool:TaskUpdate",
+            "tu-u2",
+            parent="i1",
+            start="2026-01-02T00:00:20Z",
+            end="2026-01-02T00:00:21Z",
+        )
+        return [("tr", [interaction, create, started, work_gen, done])]
+
+    def test_emits_cost_and_tokens_scores_for_the_red_step(self) -> None:
+        cycle = build_cycle_batch(self._traces(), SPOKE, self._content())
+
+        scores = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
+
+        names = {s["body"]["name"] for s in scores}
+        assert "step_cost_usd:RED" in names
+        assert "step_tokens_written:RED" in names
+
+    def test_cost_is_written_times_price_and_observation_scoped(self) -> None:
+        cycle = build_cycle_batch(self._traces(), SPOKE, self._content())
+        step = _cycle_step(cycle, "step:S1 RED: x")
+        written = step["body"]["metadata"]["rollup"]["written"]
+
+        scores = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
+
+        cost = next(s for s in scores if s["body"]["name"] == "step_cost_usd:RED")
+        assert cost["body"]["value"] == pytest.approx(written * 0.001)
+        assert cost["body"]["observationId"] == step["body"]["id"]
+
+    def test_tokens_written_score_equals_rollup_written(self) -> None:
+        cycle = build_cycle_batch(self._traces(), SPOKE, self._content())
+        step = _cycle_step(cycle, "step:S1 RED: x")
+
+        scores = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
+
+        tokens = next(s for s in scores if s["body"]["name"] == "step_tokens_written:RED")
+        assert tokens["body"]["value"] == step["body"]["metadata"]["rollup"]["written"]
+
+    def test_exactly_one_cost_score_for_the_ledger_step(self) -> None:
+        cycle = build_cycle_batch(self._traces(), SPOKE, self._content())
+
+        scores = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
+
+        red_costs = [s for s in scores if s["body"]["name"] == "step_cost_usd:RED"]
+        assert len(red_costs) == 1
+
+    def test_view_a_score_events_carry_no_step_cost_scores(self) -> None:
+        # Single-emit: View A's build_score_events never emits a step cost score.
+        batch = build_batch(self._traces(), SPOKE, self._content())
+
+        view_a = build_score_events(SPOKE, self._traces(), batch, base_ts=self._BASE_TS)
+
+        assert not any(s["body"]["name"].startswith("step_cost_usd:") for s in view_a)
+
+    def test_scores_are_deterministic_across_reruns(self) -> None:
+        cycle = build_cycle_batch(self._traces(), SPOKE, self._content())
+
+        first = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
+        second = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
+
+        assert [e["id"] for e in first] == [e["id"] for e in second]
+
+    def test_no_step_node_carries_usage_or_model(self) -> None:
+        # Double-count pin: step nodes in BOTH views stay free of usageDetails / model.
+        batch = build_batch(self._traces(), SPOKE, self._content())
+        cycle = build_cycle_batch(self._traces(), SPOKE, self._content())
+
+        step_nodes = [
+            e
+            for e in batch + cycle
+            if e["id"].startswith(_STEP_PREFIX) or e["id"].startswith(_CYCLE_STEP_PREFIX)
+        ]
+        assert step_nodes  # the fixture actually produces step nodes
+        for event in step_nodes:
+            assert "usageDetails" not in event["body"]
+            assert "model" not in event["body"]
 
 
 def _guard(
