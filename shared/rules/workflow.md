@@ -64,6 +64,14 @@ gates in a single cycle; lane 1's gate is the hub's diff review before `--local`
 commit-anchor gate without an issue anchor — this is the sanctioned no-issue commit path
 for lanes 1 and 2. See the `commit-quality` hook for the exact file-set rules.
 
+When triaging a *backlog* rather than a single task, balance chaining against
+parallelism: disjoint-scope issues parallelize (bounded by the shared usage
+window — past saturation, extra concurrent spokes only buy race conditions, so
+~3–4 active spokes is the practical cap); scope-colliding issues serialize, so
+merge those into one umbrella spoke per the "Colliding scopes" rule in
+issue-hygiene. Fixed per-spoke overhead is the quantity to amortize: one warm
+spoke doing N subtasks on one file beats N cold spokes paying N overheads.
+
 ## Commands
 
 | Command | Skill | Purpose |

@@ -50,6 +50,26 @@ differently:
 State ordering only when it is real. A spurious blocked-by edge stalls work that could
 have proceeded; a missing one lets a spoke start against an unfinished prerequisite.
 
+## Colliding scopes: merge toward one spoke
+
+When several ready issues declare overlapping `Scope:` lines, the planner can only
+serialize them — splitting bought no parallelism, and each issue still pays full
+spoke overhead (spawn, cold context read, PLAN gate, first-push full suite, land).
+Batch such a cluster into ONE umbrella issue with ordered subtasks instead, within
+a single spoke's budget (~3–5 subtasks, a couple of hours, comfortable context).
+A larger cluster becomes 2–3 sequential umbrellas chained by real blocked-by.
+
+Guardrails:
+
+- **Priority escapes the chain.** A priority item gets its own small issue at the
+  head of the cluster so it lands immediately; the umbrella follows it.
+- **Keep the specs.** Close the merged originals with a pointer to the umbrella;
+  the umbrella references them per subtask (`gh issue view <n>` reads closed issues).
+- **Recurring collisions are an architecture signal.** When clusters keep forming
+  on the same file, file a decoupling refactor for that hotspot (blocked by the
+  umbrella) so future work touches disjoint files — converting chains into real
+  parallelism instead of managing them.
+
 ## Declared as a checked step at creation
 
 Answering "does this depend on open work?" is a **checked step** of issue creation — the
