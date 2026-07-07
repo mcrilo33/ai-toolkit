@@ -288,12 +288,137 @@ if [ -z "$SKIP_TESTS" ] && [ -z "$TEST_CMD" ] && [ -z "${LAND_FORCE_GATE:-}" ] \
   AUTO_SKIP=1
 fi
 
+# --- merge-sanity on a diverged --skip-tests land (issue #174) --------------------
+# auto_land trusts the ready-marker green and lands with --skip-tests — correct
+# per-branch, but a DIVERGED land builds a merge commit whose combined tree (the
+# hub's post-marker commits + the branch) nobody ever tested: the one untested
+# state that reaches $DEFAULT unattended. Before pushing it, run a BOUNDED sanity
+# check on the merged tree: `pytest --collect-only -q` (import/collection health)
+# plus the tests the reverse index maps to the files the merge changed — NEVER the
+# full suite (the #140 ref-collision class). Target wall-clock < 60s: collection is
+# a couple of seconds, and the mapped bodies are capped (MERGE_SANITY_MAX_MAPPED) so
+# a change to a widely-referenced script can't drag the land into a multi-minute
+# suite. A pytest failure rolls the merge back and aborts (the /afk caller then
+# escalates blocked/<N>). Fires ONLY for --skip-tests + a real merge commit;
+# fast-forward --skip-tests lands and manual (no --skip-tests) lands are untouched.
+merge_sanity_rollback() {
+  wt_warn "merge-sanity check FAILED on the diverged merge (issue #174) — rolling back: git reset --keep $PRE_SHA"
+  git reset --keep "$PRE_SHA" \
+    || wt_die "rollback failed — hub is still on the merge commit; reset by hand: git reset --keep $PRE_SHA"
+  wt_die "landing aborted: the diverged --skip-tests merge failed its merge-sanity check; nothing was pushed. Fix on the branch, push from the spoke, and re-run."
+}
+
+# run_merge_sanity — exit code is a THREE-way signal so the report can stay honest:
+#   0  the check RAN and passed
+#   1  the check RAN and a pytest run failed (or the tripwire tripped) → abort
+#   2  DEGRADED: no libs / no runner — nothing was actually verified (don't claim
+#      "passed"). Only code 1 blocks the land; a degrade proceeds like the rest of
+#      this script's best-effort tail.
+# Runs in a SUBSHELL: sourcing the hook libs may `exit 0` when the toolkit is
+# globally off (enabled.sh) or arm a telemetry EXIT trap — both must stay contained
+# so the land in progress is never aborted or instrumented by the check's own libs.
+run_merge_sanity() (
+  lib_dir=""
+  for cand in "$SCRIPT_DIR/../shared/hooks/lib" \
+              "$(git rev-parse --git-path hooks/ai-toolkit-scripts/lib 2>/dev/null || true)"; do
+    if [ -n "$cand" ] && [ -f "$cand/utils.sh" ] && [ -f "$cand/test-reverse-index.sh" ]; then
+      lib_dir="$cand"; break
+    fi
+  done
+  if [ -z "$lib_dir" ]; then
+    wt_warn "merge-sanity: hook libs not found — SKIPPING the diverged-land check (install with scripts/install-git-hooks.sh); the merged tree is UNVERIFIED"
+    return 2
+  fi
+  # shellcheck source=../shared/hooks/lib/utils.sh
+  source "$lib_dir/utils.sh" 2>/dev/null || true
+  # shellcheck source=../shared/hooks/lib/test-reverse-index.sh
+  source "$lib_dir/test-reverse-index.sh" 2>/dev/null || true
+  # Guard every function used below — a partial source (edited/truncated lib) can
+  # define some and not others, and calling an undefined one under set -e would
+  # abort the land instead of degrading.
+  if ! command -v detect_pytest >/dev/null 2>&1 \
+     || ! command -v run_under_tripwire >/dev/null 2>&1 \
+     || ! command -v reverse_index_tests_for >/dev/null 2>&1; then
+    wt_warn "merge-sanity: hook libs incomplete — SKIPPING the diverged-land check; the merged tree is UNVERIFIED"
+    return 2
+  fi
+
+  runner="$(detect_pytest "." || true)"
+  if [ -z "$runner" ]; then
+    wt_warn "merge-sanity: no pytest available — SKIPPING the diverged-land check; the merged tree is UNVERIFIED"
+    return 2
+  fi
+  read -r -a runner_arr <<< "$runner"
+
+  # Strip git's ambient repo-targeting env before every pytest child (the same
+  # defense test-select.sh applies): a test that shells out to git must hit its own
+  # tmpdir, never the REAL hub repo, even if worktree-land was invoked with GIT_*
+  # exported. The tripwire is the backstop; this keeps it from firing in the first
+  # place.
+  git_unset=(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY \
+    -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_PREFIX)
+
+  # Collection/import health of the whole suite against the merged tree — bounded
+  # (no test bodies execute), catches a cross-import break the combined tree adds.
+  echo "→ merge-sanity: pytest --collect-only -q on the merged tree (import/collection health)"
+  run_under_tripwire "${git_unset[@]}" "${runner_arr[@]}" --collect-only -q || return 1
+
+  # The tests test-select maps to the files the merge changed (PRE_SHA..MERGED_SHA),
+  # deduped and existing only. No mapping → collection health was the whole check.
+  mapped=""
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    hits="$(reverse_index_tests_for "$f")"
+    [ -n "$hits" ] && mapped="$mapped$hits"$'\n'
+  done < <(git diff --name-only "$PRE_SHA" "$MERGED_SHA" 2>/dev/null || true)
+
+  sel=()
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    [ -f "$t" ] && sel+=("$t")
+  done < <(printf '%s' "$mapped" | sort -u)
+
+  if [ "${#sel[@]}" -eq 0 ]; then
+    echo "→ merge-sanity: no mapped tests for the merged diff — collection health only"
+    return 0
+  fi
+  # Boundedness cap: a change to a widely-referenced control-plane script (e.g. the
+  # land script itself) maps a dozen heavy subprocess-driven suites — running them
+  # would blow the < 60s target and stall an /afk drain holding the land lock. When
+  # the mapped set is large, keep the fast collection-health signal and skip the
+  # mapped bodies with a loud note rather than the full suite (MERGE_SANITY_MAX_MAPPED
+  # tunes the cap).
+  if [ "${#sel[@]}" -gt "${MERGE_SANITY_MAX_MAPPED:-4}" ]; then
+    wt_warn "merge-sanity: the merged diff maps ${#sel[@]} test files (> ${MERGE_SANITY_MAX_MAPPED:-4}) — too many to stay bounded; running collection health only (raise MERGE_SANITY_MAX_MAPPED to force them)"
+    return 0
+  fi
+  echo "→ merge-sanity: mapped tests for the merged diff — ${sel[*]}"
+  run_under_tripwire "${git_unset[@]}" "${runner_arr[@]}" "${sel[@]}" || return 1
+  return 0
+)
+
+MERGE_SANITY_RAN=""
+if [ -n "$SKIP_TESTS" ] && [ "$MERGED_SHA" != "$(git rev-parse "refs/heads/$WT_BRANCH")" ]; then
+  echo "→ diverged --skip-tests land — running the bounded merge-sanity check (issue #174)"
+  MS_RC=0
+  run_merge_sanity || MS_RC=$?
+  case "$MS_RC" in
+    0) MERGE_SANITY_RAN=1 ;;      # ran and passed — the report may say so
+    2) : ;;                       # degraded (warned inside) — report stays honest
+    *) merge_sanity_rollback ;;   # ran and failed / tripwire → roll back and abort
+  esac
+fi
+
 # --- ship: push main; the pre-push hook is the single test gate (issue #19) -------
 # --skip-tests / --test-cmd are threaded to the hook via TEST_SELECT_*, so the
 # hook stays the single executor. A rejected push — the gate failing, or a remote
 # refusal — rolls the merge back, so a failed land always leaves a clean hub.
 if [ -n "$SKIP_TESTS" ]; then
-  SUITE_RESULT="skipped (--skip-tests)"
+  if [ -n "$MERGE_SANITY_RAN" ]; then
+    SUITE_RESULT="skipped (--skip-tests); merge-sanity check passed on the diverged tree (issue #174)"
+  else
+    SUITE_RESULT="skipped (--skip-tests)"
+  fi
 elif [ -n "$AUTO_SKIP" ]; then
   SUITE_RESULT="skipped (clean fast-forward of an already-gated tree, issue #96)"
 elif [ -n "$TEST_CMD" ]; then
