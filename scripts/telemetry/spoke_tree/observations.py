@@ -321,3 +321,25 @@ def _obs_envelope(observations: list[Observation]) -> tuple[str | None, str | No
     start = min(starts, key=lambda s: _parse_utc(s) or datetime.min) if starts else None
     end = max(ends, key=lambda s: _parse_utc(s) or datetime.min) if ends else None
     return start, end
+
+
+def _earliest_start(traces: list[TraceObservations]) -> str:
+    """Return the earliest ISO ``startTime`` across all observations, or the fixed base."""
+    starts = [
+        observation["startTime"]
+        for _, observations in traces
+        for observation in observations
+        if observation.get("startTime")
+    ]
+    return min(starts) if starts else _INGEST_TIMESTAMP
+
+
+def _latest_time(traces: list[TraceObservations]) -> str:
+    """Return the latest ISO ``endTime``/``startTime`` across all observations, or the base."""
+    times = [
+        observation.get("endTime") or observation.get("startTime") or ""
+        for _orig_trace_id, observations in traces
+        for observation in observations
+        if observation.get("endTime") or observation.get("startTime")
+    ]
+    return max(times) if times else _INGEST_TIMESTAMP
