@@ -139,7 +139,7 @@ import sys
 import time
 import urllib.parse
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
@@ -284,6 +284,16 @@ _GUARD_NOOP_MAX_MS = 1000
 _BLOCKED_TOOL_PREFIX = "tree-blocked-"
 _BLOCKED_TOOL_NAME_PREFIX = "blocked-tool:"
 _BLOCKED_TOOL_UNKNOWN = "unknown"
+# hook_execution_complete endTime stamping (#157). These events carry total_duration_ms but no
+# endTime; stamping ``endTime = startTime + total_duration_ms`` gives them a width, and
+# ``time_source: lagging`` flags that the width is derived, not observed. That duration duplicates
+# the ``.sh`` spans already booked in the ``hook`` bucket, so the stamped events are EXCLUDED from
+# duration attribution (:func:`_hook_event_exclude`) — the components stay identical to the
+# pre-stamp (zero-width) shape.
+_HOOK_EXECUTION_PREFIX = "hook_execution_complete"
+_TOTAL_DURATION_KEY = "total_duration_ms"
+_TIME_SOURCE_KEY = "time_source"
+_TIME_SOURCE_LAGGING = "lagging"
 # Attribute keys naming the blocked tool, in priority order (bare tool name, then the
 # ``<HookEvent>:<Tool>`` hook name whose suffix is the tool).
 _TOOL_NAME_KEYS = ("tool_name", "gen_ai.tool.name")
@@ -866,6 +876,50 @@ def _is_guards_group(body: Observation | None) -> bool:
 def _is_blocked_tool(body: Observation | None) -> bool:
     """Whether a node is a synthesized ``blocked-tool:*`` node (#157)."""
     return bool(body) and (body.get("name") or "").startswith(_BLOCKED_TOOL_NAME_PREFIX)
+
+
+def _is_hook_event(body: Observation | None) -> bool:
+    """Whether a node is a ``hook_execution_complete`` audit event (#157)."""
+    return bool(body) and (body.get("name") or "").startswith(_HOOK_EXECUTION_PREFIX)
+
+
+def _stamp_hook_endtimes(copies: list[IngestEvent]) -> list[IngestEvent]:
+    """Give each ``hook_execution_complete`` copy a derived endTime from ``total_duration_ms`` (#157).
+
+    A hook event carries ``total_duration_ms`` but no ``endTime``; set ``endTime = startTime +
+    total_duration_ms`` and ``metadata.time_source = "lagging"`` so the timeline can render its
+    width while flagging it as derived. Events missing a start or ``total_duration_ms`` are left
+    untouched. Mutates the bodies in place and returns ``copies``.
+    """
+    for event in copies:
+        body = event["body"]
+        if not _is_hook_event(body) or body.get("endTime"):
+            continue
+        start = body.get("startTime")
+        total = _attr(body, _TOTAL_DURATION_KEY)
+        if not start or not isinstance(total, (int, float)):
+            continue
+        parsed = _parse_utc(start)
+        if parsed is None:
+            continue
+        end = parsed + timedelta(milliseconds=total)
+        body["endTime"] = end.isoformat().replace("+00:00", "Z")
+        body.setdefault("metadata", {})[_TIME_SOURCE_KEY] = _TIME_SOURCE_LAGGING
+    return copies
+
+
+def _hook_event_exclude(events: list[IngestEvent]) -> set[str]:
+    """Return the ids of ``hook_execution_complete`` nodes to drop from duration attribution (#157).
+
+    Their stamped width (:func:`_stamp_hook_endtimes`) duplicates the ``.sh`` guard durations
+    already booked in the ``hook`` bucket, so they must contribute nothing to ``rollup.duration``.
+    Name-based, so it resolves the same ids in either view's id namespace.
+    """
+    return {
+        event["body"]["id"]
+        for event in events
+        if event["type"] != "trace-create" and _is_hook_event(event["body"])
+    }
 
 
 def _guards_total_ms(body: Observation) -> int:
@@ -2116,7 +2170,7 @@ def build_batch(
         copies, traces, tool_content, spoke_run_id=spoke_run_id, trace_id=trace_id
     )
     events = [trace_event, root_event, *step_events, *copies]
-    _apply_container_rollups(events)
+    _apply_container_rollups(events, duration_exclude=_hook_event_exclude(events))
     return events
 
 
@@ -2186,6 +2240,7 @@ def _assemble_copies(
         tool_owner_ids=set(tool_index.values()),
         keep_noop_guards=keep_noop_guards,
     )
+    copies = _stamp_hook_endtimes(copies)
     return _collapse_startup_instants(copies, root_event)
 
 
@@ -2366,7 +2421,10 @@ def _apply_cycle_axis(
     a_bodies = [event["body"] for event in copies]
     a_by_id, a_children = build_tree(a_bodies)
     a_class = {event["body"]["id"]: _duration_class(event) for event in copies}
-    a_intervals = _effective_intervals(a_bodies, a_children, frozenset())
+    # Exclude the stamped hook events from the per-turn rollup too (#157) — their derived width
+    # duplicates the guard time already in the ``hook`` bucket, exactly as for the container rollups.
+    hook_exclude = _hook_event_exclude(copies)
+    a_intervals = _effective_intervals(a_bodies, a_children, hook_exclude)
     turn_rollup = {
         iid: _container_rollup(
             iid,
@@ -2374,7 +2432,7 @@ def _apply_cycle_axis(
             children=a_children,
             class_of=a_class,
             intervals=a_intervals,
-            exclude=frozenset(),
+            exclude=hook_exclude,
         )
         for iid in flattened
     }
@@ -2492,7 +2550,7 @@ def build_cycle_batch(
         latest=_latest_time(traces),
     )
     events = [trace_event, root_event, *step_events, *copies]
-    _apply_container_rollups(events, duration_exclude=marker_ids)
+    _apply_container_rollups(events, duration_exclude=marker_ids | _hook_event_exclude(events))
     return events
 
 
