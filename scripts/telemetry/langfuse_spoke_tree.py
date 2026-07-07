@@ -139,7 +139,7 @@ import sys
 import time
 import urllib.parse
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
@@ -189,31 +189,48 @@ from telemetry.spoke_tree.ids import (
     trace_id_for,
 )
 from telemetry.spoke_tree.observations import (
+    _BLOCKED_TOOL_NAME_PREFIX,
     _FOLD_BLOCKED_NAME,
     _FOLD_DECISION_PREFIX,
     _FOLD_EXECUTION_NAME,
+    _GUARDS_NAME,
+    _GUARDS_SESSION_NAME,
+    _INGEST_TIMESTAMP,
     _INTERACTION_NAME,
+    _POST_STEP_NAME,
+    _PRE_STEP_NAME,
+    _WAIT_PREFIX,
+    IngestEvent,
     ToolContent,
+    TraceObservations,
     _attr,
     _duration_ms,
     _elapsed_ms,
     _is_audit_instant,
+    _is_blocked_tool,
     _is_fold_subspan,
+    _is_gate_observation,
+    _is_graftable_span,
+    _is_guards_group,
     _is_hook,
+    _is_hook_event,
     _is_interaction,
     _is_request_audit_event,
+    _is_skill_activated,
     _is_startup_instant,
+    _is_tool_span,
     _joins_under_tool,
+    _obs_envelope,
+    _parse_ts,
+    _parse_utc,
     _prompt_id,
     _request_id,
+    _skill_name,
     _tool_use_id,
 )
 
 logger = logging.getLogger("langfuse_spoke_tree")
 
-IngestEvent = dict[str, Any]
-# One source trace paired with all of its observations: ``(orig_trace_id, observations)``.
-TraceObservations = tuple[str, list[Observation]]
 
 # Deterministic id prefix for the synthetic cycle-step nodes (#100, derived from the ledger).
 _STEP_PREFIX = "tree-step-"
@@ -224,7 +241,6 @@ _STEP_PREFIX = "tree-step-"
 _COMMIT_PREFIX = "tree-commit-"
 _GATE_PARK_PREFIX = "tree-gatepark-"
 _GATE_PARK_NODE_NAME = "wait:gate-park"
-_WAIT_PREFIX = "wait:"
 _COMMIT_FIELD_SEP = "\x1f"
 _COMMIT_LINE_MARKER = "commit"
 _CYCLE_TRACE_NAME_PREFIX = "spoke-cycle:"
@@ -232,8 +248,6 @@ _CYCLE_ROOT_NAME_PREFIX = "cycle:"
 # The cycle-axis bookend node names + the keys that map to their synthetic ids.
 _PRE_STEP_KEY = "pre"
 _POST_STEP_KEY = "post"
-_PRE_STEP_NAME = "preStep"
-_POST_STEP_NAME = "postStep"
 # Deterministic id prefix for the numeric Langfuse scores (#100 amendment: chartable time budget).
 _SCORE_PREFIX = "tree-score-"
 # Score names — Langfuse sums/charts numeric scores (it cannot chart arbitrary metadata).
@@ -256,14 +270,9 @@ _STEP_PHASE_RE = re.compile(rf"\b({'|'.join(_STEP_PHASES)})\b")
 # an ``effort:<value>`` tag or on llm_request metadata.
 _ULTRA_MODE = "ultra"
 _ULTRACODE_TAG = "ultracode"
-# The spoke-ready --gate emission: a kind=script span labelled ``<kind>:<phase>`` in OTel.
-_GATE_OBSERVATION_NAME = "script:gate"
 _TRACE_NAME_PREFIX = "spoke-tree:"
 _ROOT_NAME_PREFIX = "spoke:"
 
-# Langfuse ingestion requires a timestamp on every event; used for the trace/root and as a
-# fallback when a source observation carries no ``startTime``. Fixed so reruns stay stable.
-_INGEST_TIMESTAMP = "2026-01-01T00:00:00Z"
 
 # Max page size the Langfuse traces endpoint accepts.
 _PAGE_LIMIT = 100
@@ -284,32 +293,11 @@ _PURGE_POLL_INTERVAL = 1.0
 
 # Observation fields copied verbatim into the assembled trace when present.
 _COPIED_FIELDS = ("input", "output", "usageDetails", "costDetails", "metadata", "model", "level")
-# The otelcol renames a ``tool:Agent`` span to ``sub-agent:<type>`` (e.g. ``sub-agent:code-review``);
-# such a container still carries the invoking tool's ``tool_use_id`` so its transcript output grafts
-# like any other tool (#161).
-_SUB_AGENT_PREFIX = "sub-agent:"
 
 
-# Guard-group nodes (#157). Every ``.sh`` guard span that joins a tool (or the root) is
-# collapsed under one synthetic ``guards`` group (``guards:session`` at the root) carrying a
-# ``by_hook`` rollup over ALL raw guards; a no-op guard (``decision=allow`` ∧
-# ``status=success`` ∧ ``duration_ms < _GUARD_NOOP_MAX_MS``) is dropped by default and kept
-# only under ``--keep-noop-guards``. The group's own hook-bucket time is the summed raw guard
-# duration (``total_ms``), not its min…max envelope, so the root's ``hook`` bucket reflects
-# real guard cost and the keep-noop drop leaves ``rollup.duration.components`` unchanged.
-_GUARDS_NAME = "guards"
-_GUARDS_SESSION_NAME = "guards:session"
 _GUARD_NOOP_MAX_MS = 1000
 
-_BLOCKED_TOOL_NAME_PREFIX = "blocked-tool:"
 _BLOCKED_TOOL_UNKNOWN = "unknown"
-# hook_execution_complete endTime stamping (#157). These events carry total_duration_ms but no
-# endTime; stamping ``endTime = startTime + total_duration_ms`` gives them a width, and
-# ``time_source: lagging`` flags that the width is derived, not observed. That duration duplicates
-# the ``.sh`` spans already booked in the ``hook`` bucket, so the stamped events are EXCLUDED from
-# duration attribution (:func:`_hook_event_exclude`) — the components stay identical to the
-# pre-stamp (zero-width) shape.
-_HOOK_EXECUTION_PREFIX = "hook_execution_complete"
 _TOTAL_DURATION_KEY = "total_duration_ms"
 _TIME_SOURCE_KEY = "time_source"
 _TIME_SOURCE_LAGGING = "lagging"
@@ -400,8 +388,6 @@ _TASK_ID_RE = re.compile(r"#(\d+)")
 # event carries no ``tool_use_id``, so it is matched to its tool by ``prompt.id`` + ``skill.name``
 # (+ nearest timestamp), see :func:`_build_skill_index` / :func:`_match_skill_tool`.
 _SKILL_TOOL_NAME = "tool:Skill"
-_SKILL_ACTIVATED_NAME = "skill_activated"
-_SKILL_NAME_KEY = "skill.name"
 # The Skill tool's input key naming the activated skill, read from the transcript content.
 _SKILL_INPUT_KEY = "skill"
 
@@ -655,21 +641,6 @@ def _apply_guard_groups(
     return kept + group_events
 
 
-def _is_guards_group(body: Observation | None) -> bool:
-    """Whether a node is a synthesized ``guards`` / ``guards:session`` group (#157)."""
-    return bool(body) and (body.get("name") in (_GUARDS_NAME, _GUARDS_SESSION_NAME))
-
-
-def _is_blocked_tool(body: Observation | None) -> bool:
-    """Whether a node is a synthesized ``blocked-tool:*`` node (#157)."""
-    return bool(body) and (body.get("name") or "").startswith(_BLOCKED_TOOL_NAME_PREFIX)
-
-
-def _is_hook_event(body: Observation | None) -> bool:
-    """Whether a node is a ``hook_execution_complete`` audit event (#157)."""
-    return bool(body) and (body.get("name") or "").startswith(_HOOK_EXECUTION_PREFIX)
-
-
 def _stamp_hook_endtimes(copies: list[IngestEvent]) -> list[IngestEvent]:
     """Give each ``hook_execution_complete`` copy a derived endTime from ``total_duration_ms`` (#157).
 
@@ -898,15 +869,6 @@ def _blocked_tool_name(satellites: list[Observation]) -> str:
     return _BLOCKED_TOOL_UNKNOWN
 
 
-def _obs_envelope(observations: list[Observation]) -> tuple[str | None, str | None]:
-    """Return the (min start, max end) ISO bounds over ``observations``, chronologically."""
-    starts = [o["startTime"] for o in observations if o.get("startTime")]
-    ends = [o["endTime"] for o in observations if o.get("endTime")]
-    start = min(starts, key=lambda s: _parse_utc(s) or datetime.min) if starts else None
-    end = max(ends, key=lambda s: _parse_utc(s) or datetime.min) if ends else None
-    return start, end
-
-
 def _synthesize_blocked_tools(
     traces: list[TraceObservations],
     *,
@@ -982,19 +944,6 @@ class SkillCandidate(NamedTuple):
     start: str | None
     copy_id: str
     skill_name: str | None
-
-
-def _is_skill_activated(observation: Observation) -> bool:
-    """Whether an observation is a span-less ``skill_activated`` lifecycle event (#110 AC2)."""
-    return (observation.get("name") or "") == _SKILL_ACTIVATED_NAME
-
-
-def _skill_name(observation: Observation) -> str | None:
-    """Return the ``skill.name`` carried by a ``skill_activated`` event, or None."""
-    metadata = observation.get("metadata") or {}
-    attributes = metadata.get("attributes") or {}
-    value = attributes.get(_SKILL_NAME_KEY) or metadata.get(_SKILL_NAME_KEY)
-    return str(value) if value else None
 
 
 def _activated_skill_name(tuid: str | None, tool_content: dict[str, ToolContent]) -> str | None:
@@ -1157,27 +1106,6 @@ def _resolve_parent(
         if rid and rid in request_index:
             return request_index[rid]
     return root_id
-
-
-def _is_tool_span(observation: Observation) -> bool:
-    """Whether an observation is a visible ``tool:<Name>`` span (e.g. ``tool:TaskCreate``).
-
-    Only these spans carry the tool call the user sees; the ``claude_code.tool.execution``,
-    ``*.blocked_on_user``, and ``*.sh`` hook siblings that share a ``tool_use_id`` are not
-    tool spans and are never filled with transcript content.
-    """
-    return (observation.get("name") or "").startswith("tool:")
-
-
-def _is_graftable_span(observation: Observation) -> bool:
-    """Whether transcript ``input``/``output`` may be grafted onto this span by ``tool_use_id``.
-
-    Both a visible ``tool:`` span and a ``sub-agent:<type>`` container (the otelcol-renamed
-    ``tool:Agent``) carry the invoking tool's call id, so each joins its transcript entry the
-    same way. The ``claude_code.tool.execution`` / ``*.blocked_on_user`` siblings do not.
-    """
-    name = observation.get("name") or ""
-    return name.startswith("tool:") or name.startswith(_SUB_AGENT_PREFIX)
 
 
 def _tool_span_ids(traces: list[TraceObservations]) -> set[str]:
@@ -1355,14 +1283,6 @@ def _duration_class(event: IngestEvent) -> str:
 
 
 _Interval = tuple[datetime, datetime]
-
-
-def _parse_utc(value: str | None) -> datetime | None:
-    """Parse an ISO timestamp to an aware datetime (naive assumed UTC), or None."""
-    parsed = _parse_ts(value) if value else None
-    if parsed is None:
-        return None
-    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
 
 
 def _interval_ms(interval: _Interval | None) -> int:
@@ -3425,29 +3345,6 @@ def _is_activity_observation(observation: Observation) -> bool:
         return True
     name = observation.get("name") or ""
     return name == _INTERACTION_NAME or name.startswith("tool:")
-
-
-def _is_gate_observation(observation: Observation) -> bool:
-    """Whether an observation is the ``spoke-ready --gate`` (PLAN-gate park) span.
-
-    Matched by the OTel span label ``script:gate`` OR, robustly, by the workflow attributes
-    (``workflow.kind == script`` and ``workflow.phase == gate``) so a label-format change does
-    not silently drop the gate-park score.
-    """
-    if (observation.get("name") or "") == _GATE_OBSERVATION_NAME:
-        return True
-    attributes = (observation.get("metadata") or {}).get("attributes") or {}
-    return (
-        attributes.get("workflow.kind") == "script" and attributes.get("workflow.phase") == "gate"
-    )
-
-
-def _parse_ts(value: str) -> datetime | None:
-    """Parse an ISO timestamp to a datetime, or None when malformed."""
-    try:
-        return datetime.fromisoformat(value)
-    except (ValueError, TypeError):
-        return None
 
 
 def _earliest_after(candidates: list[str], floor: datetime) -> str | None:

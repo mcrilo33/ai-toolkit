@@ -9,14 +9,38 @@ on :class:`~telemetry.langfuse_rollup.Observation`, so it stays a foundation lea
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import NamedTuple
+from datetime import UTC, datetime
+from typing import Any, NamedTuple
 
 from telemetry.langfuse_rollup import Observation
+
+# One Langfuse ingestion event (a ``*-create`` body); the assembled batches are lists of these.
+IngestEvent = dict[str, Any]
+# One source trace paired with all of its observations: ``(orig_trace_id, observations)``.
+TraceObservations = tuple[str, list[Observation]]
+
+# Langfuse ingestion requires a timestamp on every event; used for the trace/root and as a
+# fallback when a source observation carries no ``startTime``. Fixed so reruns stay stable.
+_INGEST_TIMESTAMP = "2026-01-01T00:00:00Z"
 
 # The native per-turn container span; kept nested in View A, flattened to a childless leaf
 # turn-marker on the cycle axis in View B (#114).
 _INTERACTION_NAME = "claude_code.interaction"
+
+# Node-name vocabulary of the ASSEMBLED tree. The predicates below classify a node by these
+# names; the family modules that MINT such a node import the constant from here so the naming
+# stays single-sourced.
+_SUB_AGENT_PREFIX = "sub-agent:"  # the otelcol-renamed ``tool:Agent`` container (#161)
+_GUARDS_NAME = "guards"  # per-tool guard group (#157)
+_GUARDS_SESSION_NAME = "guards:session"  # the root's guard group (#157)
+_BLOCKED_TOOL_NAME_PREFIX = "blocked-tool:"  # synthesized denied/never-run tool node (#157)
+_HOOK_EXECUTION_PREFIX = "hook_execution_complete"  # a Pre/PostToolUse hook audit event (#157)
+_GATE_OBSERVATION_NAME = "script:gate"  # the ``spoke-ready --gate`` PLAN-gate park span
+_WAIT_PREFIX = "wait:"  # routes a node into the duration ``wait`` bucket (#162)
+_PRE_STEP_NAME = "preStep"  # View B cycle-axis bookend nodes (#113)
+_POST_STEP_NAME = "postStep"
+_SKILL_ACTIVATED_NAME = "skill_activated"  # the span-less lifecycle event (#110 AC2)
+_SKILL_NAME_KEY = "skill.name"
 # Metadata keys that may carry a tool-call id, in priority order.
 _TOOL_USE_ID_KEYS = ("tool_use_id", "gen_ai.tool.call.id")
 # The per-turn id Claude Code stamps on a ``claude_code.interaction`` and every event-layer
@@ -208,3 +232,92 @@ def _attr(observation: Observation, *keys: str) -> object | None:
         if value is not None:
             return value
     return None
+
+
+def _is_tool_span(observation: Observation) -> bool:
+    """Whether an observation is a visible ``tool:<Name>`` span (e.g. ``tool:TaskCreate``).
+
+    Only these spans carry the tool call the user sees; the ``claude_code.tool.execution``,
+    ``*.blocked_on_user``, and ``*.sh`` hook siblings that share a ``tool_use_id`` are not
+    tool spans and are never filled with transcript content.
+    """
+    return (observation.get("name") or "").startswith("tool:")
+
+
+def _is_graftable_span(observation: Observation) -> bool:
+    """Whether transcript ``input``/``output`` may be grafted onto this span by ``tool_use_id``.
+
+    Both a visible ``tool:`` span and a ``sub-agent:<type>`` container (the otelcol-renamed
+    ``tool:Agent``) carry the invoking tool's call id, so each joins its transcript entry the
+    same way. The ``claude_code.tool.execution`` / ``*.blocked_on_user`` siblings do not.
+    """
+    name = observation.get("name") or ""
+    return name.startswith("tool:") or name.startswith(_SUB_AGENT_PREFIX)
+
+
+def _is_guards_group(body: Observation | None) -> bool:
+    """Whether a node is a synthesized ``guards`` / ``guards:session`` group (#157)."""
+    return bool(body) and (body.get("name") in (_GUARDS_NAME, _GUARDS_SESSION_NAME))
+
+
+def _is_blocked_tool(body: Observation | None) -> bool:
+    """Whether a node is a synthesized ``blocked-tool:*`` node (#157)."""
+    return bool(body) and (body.get("name") or "").startswith(_BLOCKED_TOOL_NAME_PREFIX)
+
+
+def _is_hook_event(body: Observation | None) -> bool:
+    """Whether a node is a ``hook_execution_complete`` audit event (#157)."""
+    return bool(body) and (body.get("name") or "").startswith(_HOOK_EXECUTION_PREFIX)
+
+
+def _is_skill_activated(observation: Observation) -> bool:
+    """Whether an observation is a span-less ``skill_activated`` lifecycle event (#110 AC2)."""
+    return (observation.get("name") or "") == _SKILL_ACTIVATED_NAME
+
+
+def _skill_name(observation: Observation) -> str | None:
+    """Return the ``skill.name`` carried by a ``skill_activated`` event, or None."""
+    metadata = observation.get("metadata") or {}
+    attributes = metadata.get("attributes") or {}
+    value = attributes.get(_SKILL_NAME_KEY) or metadata.get(_SKILL_NAME_KEY)
+    return str(value) if value else None
+
+
+def _is_gate_observation(observation: Observation) -> bool:
+    """Whether an observation is the ``spoke-ready --gate`` (PLAN-gate park) span.
+
+    Matched by the OTel span label ``script:gate`` OR, robustly, by the workflow attributes
+    (``workflow.kind == script`` and ``workflow.phase == gate``) so a label-format change does
+    not silently drop the gate-park score.
+    """
+    if (observation.get("name") or "") == _GATE_OBSERVATION_NAME:
+        return True
+    attributes = (observation.get("metadata") or {}).get("attributes") or {}
+    return (
+        attributes.get("workflow.kind") == "script" and attributes.get("workflow.phase") == "gate"
+    )
+
+
+def _parse_ts(value: str) -> datetime | None:
+    """Parse an ISO timestamp to a datetime, or None when malformed."""
+    try:
+        return datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_utc(value: str | None) -> datetime | None:
+    """Parse an ISO timestamp to an aware datetime (naive assumed UTC), or None."""
+    parsed = _parse_ts(value) if value else None
+    if parsed is None:
+        return None
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
+
+
+def _obs_envelope(observations: list[Observation]) -> tuple[str | None, str | None]:
+    """Return the (min start, max end) ISO bounds over ``observations``, chronologically."""
+    starts = [o["startTime"] for o in observations if o.get("startTime")]
+    ends = [o["endTime"] for o in observations if o.get("endTime")]
+    start = min(starts, key=lambda s: _parse_utc(s) or datetime.min) if starts else None
+    end = max(ends, key=lambda s: _parse_utc(s) or datetime.min) if ends else None
+    return start, end
