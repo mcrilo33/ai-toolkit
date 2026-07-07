@@ -117,9 +117,10 @@ fi
 # on /land; a mid-cycle push passes no --ready and so emits nothing.
 #
 # The branch push above ran FIRST, so by here HEAD is on origin — that satisfies
-# the first two of spoke-ready's #172 ready preconditions (clean tree, HEAD ==
-# @{upstream}); the third (a review artifact covering the tip) it verifies itself.
-# A refused marker propagates (set -e) but leaves the completed branch push intact.
+# just spoke-ready's #172 precondition 2 (HEAD == @{upstream}). Preconditions 1
+# (clean working tree) and 3 (an APPROVE review covering the tip) it verifies
+# itself and can still refuse after a successful push. A refused marker propagates
+# (set -e) but leaves the completed branch push intact.
 if [ -n "$READY" ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   # Run spoke-ready with THIS push's span id as its parent (Issue #66) so the

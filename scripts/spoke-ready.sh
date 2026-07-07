@@ -138,8 +138,23 @@ esac
 #   3. a review artifact (.review/*.json) covers the tip.
 # Escape hatch AI_TOOLKIT_READY_FORCE=1 skips the gate, logged loudly.
 
-# _ready_review_covers_tip — true when the newest .review/*.json is at least as new
-# as the tip commit (a review was recorded at or after HEAD was committed).
+# _ready_artifact_verdict <file> — print a review artifact's verdict (APPROVE |
+# REQUEST_CHANGES). jq when present, else a grep fallback — the same self-contained
+# parse review_artifact_verdict uses in utils.sh, inlined here to avoid sourcing.
+_ready_artifact_verdict() {
+  local file="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '.verdict // empty' "$file" 2>/dev/null
+  else
+    grep -oE '"verdict"[[:space:]]*:[[:space:]]*"[^"]*"' "$file" 2>/dev/null \
+      | head -1 | sed 's/.*: *"//;s/"$//'
+  fi
+}
+
+# _ready_approved_review_covers_tip — true when a .review/*.json with an APPROVE
+# verdict is at least as new as the tip commit (an approving review was recorded at
+# or after HEAD was committed). Verdict matters: ready/<N> is auto_land's basis and
+# lands with --skip-tests, so a fresh REQUEST_CHANGES must not satisfy the gate.
 #
 # We deliberately do NOT source utils.sh to reuse review_diff_hash: (a) sourcing it
 # has source-time side effects (it arms a per-hook telemetry span and exits when the
@@ -148,8 +163,8 @@ esac
 # empty — the hash can't bind a whole-branch review here anyway. So use the issue
 # #172 timestamp fallback. Portable stat is GNU-first (`-c %Y`) then BSD (`-f %m`);
 # the order is load-bearing (see wt_bridge_source_mtime in worktree-lib.sh, #132).
-_ready_review_covers_tip() {
-  local root newest=0 tip m f
+_ready_approved_review_covers_tip() {
+  local root tip m f
   root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
   [ -d "$root/.review" ] || return 1
   tip="$(git log -1 --format=%ct HEAD 2>/dev/null)" || return 1
@@ -157,9 +172,10 @@ _ready_review_covers_tip() {
   for f in "$root"/.review/*.json; do
     [ -f "$f" ] || continue
     m="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null)" || continue
-    [ "$m" -gt "$newest" ] && newest="$m"
+    [ "$m" -ge "$tip" ] || continue
+    [ "$(_ready_artifact_verdict "$f")" = "APPROVE" ] && return 0
   done
-  [ "$newest" -ge "$tip" ]
+  return 1
 }
 
 # verify_ready_preconditions <issue> — exit 1 on the first unmet precondition,
@@ -176,15 +192,15 @@ verify_ready_preconditions() {
     echo "  Push it first (bash .ai-toolkit/scripts/spoke-push.sh), then re-run." >&2
     exit 1
   fi
-  head_sha="$(git rev-parse --verify HEAD)"
+  head_sha="$(git rev-parse --verify HEAD 2>/dev/null)"  # HEAD verified at start
   if [ "$head_sha" != "$upstream_sha" ]; then
     echo "spoke-ready: refusing ready/$issue — HEAD is not the pushed tip (@{upstream})." >&2
     echo "  Push it first (bash .ai-toolkit/scripts/spoke-push.sh), then re-run." >&2
     exit 1
   fi
-  if ! _ready_review_covers_tip; then
-    echo "spoke-ready: refusing ready/$issue — no code-review artifact covers the current tip." >&2
-    echo "  Review this diff (the code-review agent writes .review/<hash>.json), then re-run." >&2
+  if ! _ready_approved_review_covers_tip; then
+    echo "spoke-ready: refusing ready/$issue — no APPROVED code-review artifact covers the current tip." >&2
+    echo "  Review this diff (the code-review agent writes an APPROVE .review/<hash>.json), then re-run." >&2
     exit 1
   fi
 }
