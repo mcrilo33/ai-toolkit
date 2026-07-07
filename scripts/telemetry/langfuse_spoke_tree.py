@@ -141,7 +141,7 @@ import urllib.parse
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from telemetry.langfuse_rollup import (
     DeleteFn,
@@ -149,7 +149,6 @@ from telemetry.langfuse_rollup import (
     Observation,
     PostFn,
     all_observations,
-    build_tree,
     make_delete,
     make_get,
     make_post,
@@ -157,20 +156,7 @@ from telemetry.langfuse_rollup import (
 from telemetry.measure_context_cost import (
     DEFAULT_ENDPOINT,
     DEFAULT_MODEL,
-    TokenCounter,
-    assemble_items,
     make_counter,
-    measure_items,
-)
-from telemetry.request_body import (
-    ContextDelta,
-    ContextItem,
-    decompose_request_body,
-    diff_snapshots,
-    first_real_request,
-    measure_request_items,
-    parse_request_body,
-    snapshot_items_from_path,
 )
 from telemetry.session_parser import project_dir_for_worktree
 from telemetry.spoke_tree.assembly import (
@@ -179,6 +165,7 @@ from telemetry.spoke_tree.assembly import (
     _tool_additions,
     _tool_span_ids,
 )
+from telemetry.spoke_tree.context_deltas import _apply_context_rollups, apply_context_deltas
 from telemetry.spoke_tree.cycle import (
     _POST_STEP_KEY,
     _PRE_STEP_KEY,
@@ -203,13 +190,25 @@ from telemetry.spoke_tree.ids import (
     trace_id_for,
 )
 from telemetry.spoke_tree.indices import (
-    _SKILL_TOOL_NAME,
-    _activated_skill_name,
     _build_interaction_index,
     _build_request_index,
     _build_skill_index,
     _build_tool_index,
     _synthesize_blocked_tools,
+)
+from telemetry.spoke_tree.llm_decomp import _memoized_counter, apply_llm_decomposition
+from telemetry.spoke_tree.loaded_context import (
+    _DISK_CATEGORY_ORDER,
+    _REQUEST_CATEGORY_ORDER,
+    build_loaded_context_events,
+    loaded_context_rows,
+    prefix_total,
+    request_context_rows,
+)
+from telemetry.spoke_tree.metadata import (
+    apply_mode_lane_tags,
+    apply_request_body_metadata,
+    read_mode_lane,
 )
 from telemetry.spoke_tree.observations import (
     _INTERACTION_NAME,
@@ -223,14 +222,12 @@ from telemetry.spoke_tree.observations import (
     _is_gate_observation,
     _latest_time,
     _parse_ts,
-    _tool_use_id,
 )
 from telemetry.spoke_tree.rollups import (
     _apply_container_rollups,
     _strip_container_usage,
 )
 from telemetry.spoke_tree.steps import (
-    _STEP_PREFIX,
     _apply_step_grouping,
     _collapse_startup_instants,
     build_step_windows,
@@ -267,11 +264,6 @@ _STEP_TOKENS_WRITTEN_SCORE = (
 _STEP_PHASES = ("ANCHOR", "RED", "GREEN", "REVIEW", "PUSH")
 _STEP_PHASE_OTHER = "other"
 _STEP_PHASE_RE = re.compile(rf"\b({'|'.join(_STEP_PHASES)})\b")
-# output_config.effort handling (#101). ``ultra`` is the ultracode/harness mode, NOT an
-# effort level: it is diverted to a spoke-level ``ultracode`` trace tag, never recorded as
-# an ``effort:<value>`` tag or on llm_request metadata.
-_ULTRA_MODE = "ultra"
-_ULTRACODE_TAG = "ultracode"
 _TRACE_NAME_PREFIX = "spoke-tree:"
 _ROOT_NAME_PREFIX = "spoke:"
 
@@ -297,41 +289,12 @@ _PURGE_POLL_INTERVAL = 1.0
 # Default root holding Claude Code session transcripts.
 _DEFAULT_PROJECTS = Path("~/.claude/projects").expanduser()
 
-# Deterministic id prefix for the synthetic loaded-context node.
-_LC_PREFIX = "tree-lc-"
 # Default cache-creation price (USD per token), Opus tier — mirrors measure_context_cost.
 _DEFAULT_PRICE = 0.00000625
-# Category order for the request-body itemization (the primary, fully-itemized path). Carries
-# the turn-0 combined-block router's rules / skills / environment splits (see
-# request_body._route_reminder, #159) between ``system`` and the whole-kept ``context``
-# reminders; empty categories are dropped by _breakdown_by_category.
-_REQUEST_CATEGORY_ORDER = ("tools", "mcp", "system", "rules", "skills", "environment", "context")
-# Component order for the per-llm_request cache decomposition (#99), in request order so the
-# stable prefix (tools/system/rules/skills) groups ahead of the volatile messages.
-_DECOMP_CATEGORY_ORDER = (
-    "tools",
-    "mcp",
-    "system",
-    "rules",
-    "skills",
-    "environment",
-    "context",
-    "messages",
-)
-# Category order for the disk fallback used when no request body is available.
-_DISK_CATEGORY_ORDER = ("rules", "memory", "skills", "sub-agents", "environment")
 # Env var naming the per-spoke dir of OTEL_LOG_RAW_API_BODIES=file:<dir> dumps.
 _BODY_DIR_ENV = "AI_TOOLKIT_OTEL_BODY_DIR"
 # Conventional per-spoke body dir under a worktree root (worktree-new.sh writes here).
 _BODY_DIR_CONVENTION = Path(".ai-toolkit/raw-bodies")
-# Execution mode + lane pointer files under a worktree root, stamped at launch by
-# worktree-new.sh / worktree-quick.sh (#102). Surfaced as trace tags + metadata.
-_MODE_POINTER = Path(".ai-toolkit/mode")
-_LANE_POINTER = Path(".ai-toolkit/lane")
-_VALID_MODES = ("afk", "attended")
-_VALID_LANES = ("micro", "express", "quick", "spoke")
-_DEFAULT_MODE = "attended"
-_DEFAULT_LANE = "spoke"
 
 
 def build_batch(
@@ -836,688 +799,6 @@ def filled_tool_spans(traces: list[TraceObservations], tool_content: dict[str, T
         for _orig_trace_id, observations in traces
         for observation in observations
     )
-
-
-def prefix_total(traces: list[TraceObservations]) -> int:
-    """Return the full session prefix size from the first LLM call's token usage.
-
-    Claude Code writes the whole session prefix (rules, skills, tools, base system
-    prompt, ...) to the prompt cache on the first call. A cold cache writes it all as
-    ``cache_creation``; a warm one splits it into ``cache_read`` + ``cache_creation``.
-    The prefix total is therefore their SUM on the earliest observation carrying usage
-    (chosen by ``startTime``) — ``cache_creation`` alone undercounts a warm session to
-    near zero. That total is the figure the loaded-context items reconcile against.
-
-    Args:
-        traces: The source traces paired with their observations.
-
-    Returns:
-        The first call's ``cache_read + cache_creation`` token total, or 0 when no usage
-        is present.
-    """
-    best_start: str | None = None
-    best_value = 0
-    for _orig_trace_id, observations in traces:
-        for observation in observations:
-            usage = observation.get("usageDetails") or {}
-            read = usage.get("cache_read_input_tokens")
-            written = usage.get("cache_creation_input_tokens")
-            if read is None and written is None:
-                continue
-            start = observation.get("startTime") or ""
-            if best_start is None or start < best_start:
-                best_start = start
-                best_value = int(read or 0) + int(written or 0)
-    return best_value
-
-
-def _lc_id(spoke_run_id: str, key: str) -> str:
-    """Return the deterministic id of one loaded-context node for a spoke."""
-    digest = hashlib.sha1(f"{spoke_run_id}:{key}".encode()).hexdigest()[:24]
-    return _LC_PREFIX + digest
-
-
-def _human_tokens(tokens: int) -> str:
-    """Render a token count compactly for a node label (e.g. ``3.2k``)."""
-    return f"{tokens / 1000:.1f}k" if tokens >= 1000 else str(tokens)
-
-
-def _lc_node(
-    *, node_id: str, parent_id: str, trace_id: str, name: str, base_ts: str, metadata: dict
-) -> IngestEvent:
-    """Shape one loaded-context span-create event."""
-    return {
-        "id": node_id,
-        "type": "span-create",
-        "timestamp": base_ts,
-        "body": {
-            "id": node_id,
-            "traceId": trace_id,
-            "parentObservationId": parent_id,
-            "name": name,
-            "startTime": base_ts,
-            "metadata": metadata,
-        },
-    }
-
-
-def build_loaded_context_events(
-    spoke_run_id: str,
-    item_rows: list[dict[str, object]],
-    *,
-    category_order: tuple[str, ...],
-    base_ts: str,
-    prefix_total: int | None = None,
-    price: float | None = None,
-) -> list[IngestEvent]:
-    """Build the single collapsed loaded-context observation under the spoke root.
-
-    The loaded-context items are static startup inventory with token weights, not work —
-    they share one timestamp and carry no causal order — so they collapse into ONE
-    ``loaded-context`` span under the synthetic root instead of a ~60-leaf subtree. Its
-    headline ``metadata.tokens`` is the total startup context tokens (the one number worth
-    aggregating across spokes); ``metadata.breakdown`` carries the full itemization grouped
-    by category (``{category: {name: tokens}}``, in ``category_order``, duplicate names
-    summed); ``metadata.cost_usd`` is the aggregate cost.
-
-    The primary, request-body path itemizes the WHOLE first-call prefix — every tool / MCP
-    tool / system block / reminder by name and exact size — so it needs no reconciliation;
-    ``prefix_total`` is then left None. The disk fallback (no request body) can only measure
-    the on-disk categories, so it passes ``prefix_total`` and ``price`` to fold a single
-    reconciled ``remainder`` = ``prefix_total - Σ measured`` (clamped ≥ 0) into both
-    ``metadata.remainder`` and the headline total/cost — absorbing the base system prompt,
-    all tool schemas, and MCP together, without a separate node.
-
-    The id derives from the spoke run id so a rerun overwrites the same node.
-
-    Args:
-        spoke_run_id: The spoke run identifier.
-        item_rows: Per-name measured rows (from :func:`measure_request_items` or
-            :func:`measure_items`), each with ``category``, ``name``, ``tokens``,
-            ``cost_usd`` (other per-row fields are ignored at this rendering layer).
-        category_order: The category keys to render, in display order; empties are dropped.
-        base_ts: ISO timestamp stamped on the synthetic node.
-        prefix_total: The first-call ``cache_read + cache_creation`` total; pass it (with
-            ``price``) only on the disk fallback to fold in the reconciled remainder.
-        price: Cache-creation price in USD per token, for the folded remainder's cost.
-
-    Returns:
-        A single-element list: the collapsed loaded-context ingestion event.
-    """
-    measured_tokens = sum(int(cast(int, row["tokens"])) for row in item_rows)
-    measured_cost = sum(float(cast(float, row["cost_usd"])) for row in item_rows)
-
-    metadata: dict[str, object] = {
-        "tokens": measured_tokens,
-        "cost_usd": measured_cost,
-        "breakdown": _breakdown_by_category(item_rows, category_order),
-    }
-    if prefix_total is not None and price is not None:
-        remainder = max(0, prefix_total - measured_tokens)
-        metadata["remainder"] = remainder
-        metadata["tokens"] = measured_tokens + remainder
-        metadata["cost_usd"] = measured_cost + remainder * price
-
-    total = cast(int, metadata["tokens"])
-    return [
-        _lc_node(
-            node_id=_lc_id(spoke_run_id, "loaded-context"),
-            parent_id=root_id_for(spoke_run_id),
-            trace_id=trace_id_for(spoke_run_id),
-            name=f"loaded-context: {_human_tokens(total)}",
-            base_ts=base_ts,
-            metadata=metadata,
-        )
-    ]
-
-
-def _breakdown_by_category(
-    item_rows: list[dict[str, object]], category_order: tuple[str, ...]
-) -> dict[str, dict[str, int]]:
-    """Group per-name token counts by category in ``category_order``, summing duplicate names.
-
-    Drops empty categories. Duplicate ``(category, name)`` rows (e.g. a nested ``CLAUDE.md``)
-    are summed so each name appears once with its combined weight.
-    """
-    breakdown: dict[str, dict[str, int]] = {}
-    for category in category_order:
-        names: dict[str, int] = {}
-        for row in item_rows:
-            if row["category"] != category:
-                continue
-            name = cast(str, row["name"])
-            names[name] = names.get(name, 0) + int(cast(int, row["tokens"]))
-        if names:
-            breakdown[category] = names
-    return breakdown
-
-
-def loaded_context_rows(
-    root: Path, *, counter: TokenCounter, price: float
-) -> list[dict[str, object]]:
-    """Measure the disk-sourceable loaded-context entries, one row per name.
-
-    Only the on-disk categories (rules / memory / skills / sub-agents / environment) are
-    itemized; the built-in tool and MCP schemas are NOT on disk and are not obtainable
-    per-tool, so they are reconciled in aggregate by :func:`build_loaded_context_events`.
-
-    Args:
-        root: Worktree root for the disk-measurable items.
-        counter: Token counter; raises ``CountTokensError`` when unreachable.
-        price: Cache-creation price in USD per token.
-
-    Returns:
-        The per-name rows for rules / memory / skills / sub-agents / environment.
-    """
-    return measure_items(assemble_items(root), counter=counter, price=price)
-
-
-def find_request_files(bodies_dir: Path) -> list[Path]:
-    """Return the ``*.request.json`` dumps in ``bodies_dir``, oldest first.
-
-    Sorted by modification time, not name: the dumps are ``<uuid>.request.json`` and random
-    UUIDs are not chronological, so a name sort would not yield emission order.
-    """
-    if not bodies_dir.is_dir():
-        return []
-    return sorted(bodies_dir.glob("*.request.json"), key=lambda path: path.stat().st_mtime)
-
-
-def request_context_rows(
-    bodies_dir: Path, *, counter: TokenCounter, price: float
-) -> list[dict[str, object]] | None:
-    """Itemize the loaded context from the first real raw request body in ``bodies_dir``.
-
-    Picks the first ``.request.json`` whose ``tools`` array is non-empty (skipping any
-    degenerate aux call), parses it, and measures every tool / MCP tool / system block /
-    reminder by name and exact size. This is the primary, fully-itemized path.
-
-    Args:
-        bodies_dir: The per-spoke ``OTEL_LOG_RAW_API_BODIES=file:<dir>`` dump directory.
-        counter: Token counter; raises ``CountTokensError`` when unreachable.
-        price: Cache-creation price in USD per token.
-
-    Returns:
-        The per-name request-body rows, or None when no real request body is found (the
-        caller then falls back to disk measurement).
-    """
-    path = first_real_request(find_request_files(bodies_dir))
-    if path is None:
-        return None
-    parsed = parse_request_body(path)
-    return measure_request_items(parsed.items, counter=counter, price=price)
-
-
-def _llm_requests_in_order(traces: list[TraceObservations]) -> list[tuple[str, Observation]]:
-    """Return ``(orig_trace_id, observation)`` for each LLM call, oldest first by ``startTime``.
-
-    An LLM call is any observation carrying ``cache_read_input_tokens`` or
-    ``cache_creation_input_tokens`` usage — the same set the request-body dumps correspond to,
-    so the two align positionally (the basis of the count gate in
-    :func:`apply_llm_decomposition`).
-    """
-    calls: list[tuple[str, str, Observation]] = []
-    for orig_trace_id, observations in traces:
-        for observation in observations:
-            usage = observation.get("usageDetails") or {}
-            if (
-                usage.get("cache_read_input_tokens") is None
-                and usage.get("cache_creation_input_tokens") is None
-            ):
-                continue
-            calls.append((observation.get("startTime") or "", orig_trace_id, observation))
-    calls.sort(key=lambda call: call[0])
-    return [(orig_trace_id, observation) for _start, orig_trace_id, observation in calls]
-
-
-def _split_rows_by_cache(
-    rows: list[dict[str, object]], *, cache_read: int, cache_creation: int
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """Partition itemized rows into the cache_read / cache_creation budgets by cumulative fit.
-
-    Walking the items in request order, the first ``cache_read`` tokens fall in the reused
-    prefix, the next ``cache_creation`` tokens are the portion written this turn, and anything
-    beyond is fresh input (not shown). Each item is assigned WHOLE by its cumulative start
-    offset, so the split reconciles to the observed counters with a per-bucket remainder rather
-    than the ``cached`` flag, which mislabels both cold calls (whole prefix written, not read)
-    and the freshly-written delta of warm calls.
-    """
-    read: list[dict[str, object]] = []
-    creation: list[dict[str, object]] = []
-    offset = 0
-    for row in rows:
-        start = offset
-        offset += int(cast(int, row["tokens"]))
-        if start < cache_read:
-            read.append(row)
-        elif start < cache_read + cache_creation:
-            creation.append(row)
-    return read, creation
-
-
-def _decomp_metadata(rows: list[dict[str, object]], observed: int) -> dict[str, Any]:
-    """Shape one cache bucket's decomposition metadata: per-component -> per-item, reconciled.
-
-    ``components`` maps each category (in :data:`_DECOMP_CATEGORY_ORDER`) to ``{name: tokens}``
-    for the items the split routed into this bucket — items that share a name within a category
-    are SUMMED (by :func:`_breakdown_by_category`), so ``Σ components == measured`` holds;
-    ``measured`` is their sum and ``remainder`` is ``observed - measured`` so the itemization
-    reconciles (≈) to the billed counter (the remainder absorbs the base system prompt / tool
-    schemas not itemized per-name).
-    """
-    measured = sum(int(cast(int, row["tokens"])) for row in rows)
-    return {
-        "observed": observed,
-        "measured": measured,
-        "remainder": observed - measured,
-        "components": _breakdown_by_category(rows, _DECOMP_CATEGORY_ORDER),
-    }
-
-
-def apply_llm_decomposition(
-    batch: list[IngestEvent],
-    traces: list[TraceObservations],
-    bodies_dir: Path,
-    *,
-    counter: TokenCounter,
-    price: float,
-) -> int:
-    """Fold the #99 cache_read/cache_creation decomposition onto each llm_request copy (#100).
-
-    For each LLM call (aligned positionally with its raw request body) the body is itemized by
-    :func:`telemetry.request_body.decompose_request_body` — rules per file, skills per skill,
-    every message — split into the observed ``cache_read`` / ``cache_creation`` budgets by
-    cumulative fit (:func:`_split_rows_by_cache`), and written as ``metadata.cache_read`` /
-    ``metadata.cache_creation`` on the call's copy in ``batch`` (per-component -> per-item, with
-    an ``observed`` / ``measured`` / ``remainder`` reconciliation) — NOT as nested child nodes,
-    so the call reads as a single node with the decomposition on it.
-
-    The alignment is positional (LLM calls by ``startTime`` ↔ bodies by mtime) and is only
-    applied when the counts match — otherwise an aux/degenerate call has skewed the alignment and
-    the decomposition is skipped entirely (the count gate).
-
-    Args:
-        batch: The assembled ingestion events; the llm_request copies are mutated in place.
-        traces: The source traces paired with their observations.
-        bodies_dir: The per-spoke ``OTEL_LOG_RAW_API_BODIES=file:<dir>`` dump directory.
-        counter: Token counter; raises ``CountTokensError`` to trigger the char/4 fallback.
-        price: Cache-creation price in USD per token (used by ``measure_request_items``).
-
-    Returns:
-        The number of llm_request copies that received a decomposition (0 when none align).
-    """
-    calls = _llm_requests_in_order(traces)
-    bodies = find_request_files(bodies_dir)
-    if not calls or len(calls) != len(bodies):
-        return 0
-    by_id = {event["body"]["id"]: event for event in batch}
-    decomposed = 0
-    for (orig_trace_id, observation), body_path in zip(calls, bodies):
-        event = by_id.get(_copy_id(orig_trace_id, observation["id"]))
-        if event is None:
-            continue  # the call's copy is not in the batch (defensive; should not happen)
-        try:
-            items = decompose_request_body(body_path)
-        except (OSError, json.JSONDecodeError):
-            logger.warning("cannot decompose request body %s", body_path)
-            continue
-        rows = measure_request_items(items, counter=counter, price=price)
-        usage = observation.get("usageDetails") or {}
-        read_tokens = int(usage.get("cache_read_input_tokens") or 0)
-        creation_tokens = int(usage.get("cache_creation_input_tokens") or 0)
-        read_rows, creation_rows = _split_rows_by_cache(
-            rows, cache_read=read_tokens, cache_creation=creation_tokens
-        )
-        metadata = event["body"].setdefault("metadata", {})
-        metadata["cache_read"] = _decomp_metadata(read_rows, read_tokens)
-        metadata["cache_creation"] = _decomp_metadata(creation_rows, creation_tokens)
-        decomposed += 1
-    return decomposed
-
-
-def _memoized_counter(counter: TokenCounter) -> TokenCounter:
-    """Wrap a token counter to cache counts by content hash across the whole build (#160).
-
-    The stable prefix (tools / system / rules / skills) and every unchanged message are re-counted
-    on every consecutive snapshot and on every #99 decomposition, so the same text is measured
-    many times over a run; caching by sha256 collapses that to one call per distinct text. A
-    counter failure (``CountTokensError``) is not cached — it propagates so the caller's char/4
-    fallback still applies — so only successful counts are memoized.
-
-    Args:
-        counter: The underlying token counter.
-
-    Returns:
-        A counter with the same contract, backed by a per-build content-hash cache.
-    """
-    cache: dict[str, int] = {}
-
-    def _counting(text: str) -> int:
-        key = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        if key not in cache:
-            cache[key] = counter(text)
-        return cache[key]
-
-    return _counting
-
-
-def _blob_hash(value: object) -> str:
-    """Return a stable content hash of a str or JSON-able value (skill-output match identity)."""
-    text = (
-        value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
-    )
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def _skill_output_hashes(
-    traces: list[TraceObservations], tool_content: dict[str, ToolContent]
-) -> dict[str, str]:
-    """Map each ``tool:Skill`` transcript output's content hash to its skill name (#160).
-
-    The exact identity a skill-load injects into the next request is the tool_result the
-    ``tool:Skill`` returned, so its content hash keys the attribution; the name comes from the
-    tool's transcript input (:func:`_activated_skill_name`).
-    """
-    hashes: dict[str, str] = {}
-    for _orig_trace_id, observations in traces:
-        for observation in observations:
-            if (observation.get("name") or "") != _SKILL_TOOL_NAME:
-                continue
-            tuid = _tool_use_id(observation)
-            content = tool_content.get(tuid or "")
-            name = _activated_skill_name(tuid, tool_content)
-            if content is None or content.output is None or not name:
-                continue
-            hashes[_blob_hash(content.output)] = name
-    return hashes
-
-
-def _match_skill_output(text: str | None, skill_hashes: dict[str, str]) -> str | None:
-    """Return the skill whose output an added message injected, matched by content hash, else None.
-
-    The message text is the canonical ``{role, content}`` JSON; a skill-load rides a
-    ``tool_result`` block whose ``content`` is the skill's output — that block's hash (or, for a
-    plain-string message content, the content itself) is matched against :func:`_skill_output_hashes`.
-    """
-    if not text:
-        return None
-    try:
-        message = json.loads(text)
-    except (TypeError, ValueError):
-        return None
-    content = message.get("content") if isinstance(message, dict) else None
-    if isinstance(content, str):
-        return skill_hashes.get(_blob_hash(content))
-    for block in content or []:
-        if isinstance(block, dict) and block.get("type") == "tool_result":
-            skill = skill_hashes.get(_blob_hash(block.get("content")))
-            if skill:
-                return skill
-    return None
-
-
-def _label_skill_loads(
-    added: list[dict[str, object]],
-    curr_items: list[ContextItem],
-    skill_hashes: dict[str, str],
-) -> None:
-    """Label each added-message row whose injected content matches a skill output, in place (#160)."""
-    if not skill_hashes:
-        return
-    text_by_name = {item.name: item.text for item in curr_items if item.category == "messages"}
-    for row in added:
-        if row.get("category") != "messages":
-            continue
-        skill = _match_skill_output(text_by_name.get(str(row.get("name"))), skill_hashes)
-        if skill:
-            row["skill"] = skill
-
-
-def _context_delta_summary(delta: ContextDelta) -> dict[str, int]:
-    """Reduce a context delta to the token totals rolled up onto a step (net / added / removed)."""
-    added = sum(int(cast(int, row["tokens"])) for row in delta.added)
-    removed = sum(int(cast(int, row["tokens"])) for row in delta.removed)
-    return {"net_tokens": delta.net_tokens, "added": added, "removed": removed}
-
-
-def apply_context_deltas(
-    batch: list[IngestEvent],
-    traces: list[TraceObservations],
-    bodies_dir: Path,
-    *,
-    counter: TokenCounter,
-    price: float,
-    tool_content: dict[str, ToolContent],
-) -> dict[tuple[str, str], dict[str, int]]:
-    """Stamp ``metadata.context_delta`` on each llm_request copy from consecutive bodies (#160).
-
-    For every LLM call after the first (aligned positionally with its raw request body, same count
-    gate as :func:`apply_llm_decomposition`), the body is diffed against its predecessor
-    (:func:`telemetry.request_body.diff_snapshots`) into added / removed / size-changed rows,
-    ``net_tokens`` (which reconciles ± remainder against the call's observed ``cache_creation``),
-    and a compaction ``label``. An added message whose injected content matches a ``tool:Skill``
-    output is tagged with the skill name (:func:`_label_skill_loads`). The delta is stamped on the
-    call's View A copy only (single-emit) as metadata — it never touches billed usage.
-
-    Args:
-        batch: The assembled View A events; the llm_request copies are mutated in place.
-        traces: The source traces paired with their observations.
-        bodies_dir: The per-spoke raw-body dump directory.
-        counter: Token counter (memoize it — the stable prefix repeats every snapshot).
-        price: Cache-creation price in USD per token.
-        tool_content: Tool-call-id to :class:`ToolContent`, the source of skill outputs.
-
-    Returns:
-        A map of each stamped call's ``(orig_trace_id, observation_id)`` to its
-        :func:`_context_delta_summary`, so the step ``rollup.context`` can be aggregated per view.
-    """
-    calls = _llm_requests_in_order(traces)
-    bodies = find_request_files(bodies_dir)
-    if not calls or len(calls) != len(bodies):
-        return {}
-    by_id = {event["body"]["id"]: event for event in batch}
-    skill_hashes = _skill_output_hashes(traces, tool_content)
-    summaries: dict[tuple[str, str], dict[str, int]] = {}
-    prev_items: list[ContextItem] | None = None
-    for (orig_trace_id, observation), body_path in zip(calls, bodies):
-        try:
-            curr_items = snapshot_items_from_path(body_path)
-        except (OSError, json.JSONDecodeError):
-            logger.warning("cannot snapshot request body %s", body_path)
-            prev_items = None
-            continue
-        predecessor, prev_items = prev_items, curr_items
-        if predecessor is None:
-            continue  # the first call has no prior snapshot to diff against
-        event = by_id.get(_copy_id(orig_trace_id, observation["id"]))
-        if event is None:
-            continue  # the call's copy is not in the batch (defensive; should not happen)
-        delta = diff_snapshots(predecessor, curr_items, counter=counter, price=price)
-        _label_skill_loads(delta.added, curr_items, skill_hashes)
-        event["body"].setdefault("metadata", {})["context_delta"] = {
-            "added": delta.added,
-            "removed": delta.removed,
-            "changed": delta.changed,
-            "net_tokens": delta.net_tokens,
-            "label": delta.label,
-        }
-        summaries[(orig_trace_id, observation["id"])] = _context_delta_summary(delta)
-    return summaries
-
-
-def _apply_context_rollups(
-    events: list[IngestEvent], summary_by_id: dict[str, dict[str, int]]
-) -> None:
-    """Aggregate ``metadata.rollup.context`` onto each step node from its llm_request deltas (#160).
-
-    Sums the per-call context summaries of every llm_request copy in a step's subtree into
-    ``{net_tokens, added, removed}`` under the step's existing ``metadata.rollup``, so per-cycle
-    context cost reads without a full-trace GET. View-agnostic: the caller keys ``summary_by_id``
-    by that view's copy ids (View A ``tree-…`` / View B ``cyc-…``). A step with no llm_request
-    delta gets no ``context`` key.
-
-    Args:
-        events: The assembled events for one view; step-node bodies are mutated in place.
-        summary_by_id: Copy id (in this view's namespace) to its context-delta summary.
-    """
-    bodies = [event["body"] for event in events if event["type"] != "trace-create"]
-    _by_id, children = build_tree(bodies)
-    for body in bodies:
-        node_id = body["id"]
-        if not (node_id.startswith(_STEP_PREFIX) or node_id.startswith(_CYCLE_STEP_PREFIX)):
-            continue
-        context = _sum_context(node_id, children, summary_by_id)
-        if context is not None:
-            body.setdefault("metadata", {}).setdefault("rollup", {})["context"] = context
-
-
-def _sum_context(
-    node_id: str, children: dict[str | None, list[str]], summary_by_id: dict[str, dict[str, int]]
-) -> dict[str, int] | None:
-    """Sum the context summaries of a step's descendant llm_requests, or None when it has none."""
-    total = {"net_tokens": 0, "added": 0, "removed": 0}
-    found = False
-    stack = list(children.get(node_id, []))
-    while stack:
-        current = stack.pop()
-        summary = summary_by_id.get(current)
-        if summary is not None:
-            found = True
-            for key in total:
-                total[key] += summary[key]
-        stack.extend(children.get(current, []))
-    return total if found else None
-
-
-def _merge_trace_tags(batch: list[IngestEvent], tags: list[str]) -> None:
-    """Merge ``tags`` into the batch's ``trace-create`` event, de-duplicated, order-stable."""
-    if not tags:
-        return
-    trace = next((event for event in batch if event.get("type") == "trace-create"), None)
-    if trace is None:
-        return  # defensive: build_batch always emits one
-    existing: list[str] = trace["body"].setdefault("tags", [])
-    for tag in tags:
-        if tag not in existing:
-            existing.append(tag)
-
-
-def _read_pointer(path: Path, valid: tuple[str, ...], default: str) -> str:
-    """Read a one-line ``.ai-toolkit`` pointer, falling back to ``default`` safely.
-
-    A missing file, an unreadable file, a blank value, or a value outside ``valid`` all
-    resolve to ``default`` — a legacy or corrupt pointer must never crash the assembler or
-    mislabel the trace.
-    """
-    try:
-        value = path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return default
-    return value if value in valid else default
-
-
-def read_mode_lane(root: Path) -> tuple[str, str]:
-    """Return the spoke's ``(mode, lane)`` from its launch pointer files under ``root``.
-
-    Args:
-        root: The worktree root holding ``.ai-toolkit/mode`` and ``.ai-toolkit/lane``.
-
-    Returns:
-        The validated ``(mode, lane)`` pair, defaulting to ``("attended", "spoke")`` for a
-        missing, blank, or unrecognized pointer (#102).
-    """
-    mode = _read_pointer(root / _MODE_POINTER, _VALID_MODES, _DEFAULT_MODE)
-    lane = _read_pointer(root / _LANE_POINTER, _VALID_LANES, _DEFAULT_LANE)
-    return mode, lane
-
-
-def apply_mode_lane_tags(batch: list[IngestEvent], mode: str, lane: str) -> None:
-    """Attach the spoke's execution ``mode`` + ``lane`` to its trace (#102).
-
-    Both surface as trace-level ``mode:<value>`` / ``lane:<value>`` tags (so a Langfuse
-    dashboard can group/filter/chart spokes by how they were run) and are mirrored, bare,
-    into trace metadata for direct lookup.
-
-    Args:
-        batch: The assembled ingestion events; the ``trace-create`` event is mutated in place.
-        mode: The execution mode (``afk`` | ``attended``).
-        lane: The spoke's lane (``micro`` | ``express`` | ``quick`` | ``spoke``).
-    """
-    _merge_trace_tags(batch, [f"mode:{mode}", f"lane:{lane}"])
-    trace = next((event for event in batch if event.get("type") == "trace-create"), None)
-    if trace is None:
-        return  # defensive: build_batch always emits one
-    metadata = trace["body"].setdefault("metadata", {})
-    metadata["mode"] = mode
-    metadata["lane"] = lane
-
-
-def apply_request_body_metadata(
-    batch: list[IngestEvent],
-    traces: list[TraceObservations],
-    bodies_dir: Path,
-) -> int:
-    """Fold each request body's ``output_config.effort`` + cache breakpoints onto its copy (#101).
-
-    For each LLM call (aligned positionally with its raw request body, the same alignment and
-    count gate as :func:`apply_llm_decomposition`) the body is parsed once and two request-derived
-    signals are surfaced on the call's llm_request copy:
-
-    - ``metadata.cache_breakpoints`` — the ``cache_control`` prefix boundary positions
-      (``{location, index}``, in order), surfaced on EVERY aligned call as a list (empty when the
-      body has no marker) so "no breakpoints" reads distinctly from "not measured". This diagnoses
-      a moved breakpoint that busted the cache.
-    - ``metadata.effort`` + a trace-level ``effort:<value>`` tag — the ``output_config.effort``
-      reasoning level, when it is a genuine effort (Langfuse can group/filter/chart traces by tag).
-      ``ultra`` is the ultracode/harness mode, not an effort: it is diverted to a single
-      ``ultracode`` trace tag and never recorded as an effort.
-
-    Args:
-        batch: The assembled ingestion events; the llm_request copies + trace are mutated in place.
-        traces: The source traces paired with their observations.
-        bodies_dir: The per-spoke ``OTEL_LOG_RAW_API_BODIES=file:<dir>`` dump directory.
-
-    Returns:
-        The number of llm_request copies that received an ``effort`` (0 when none align or only
-        ultracode was seen); cache breakpoints are surfaced independently of this count.
-    """
-    calls = _llm_requests_in_order(traces)
-    bodies = find_request_files(bodies_dir)
-    if not calls or len(calls) != len(bodies):
-        return 0
-    by_id = {event["body"]["id"]: event for event in batch}
-    efforts: list[str] = []
-    ultracode = False
-    attached = 0
-    for (orig_trace_id, observation), body_path in zip(calls, bodies):
-        event = by_id.get(_copy_id(orig_trace_id, observation["id"]))
-        if event is None:
-            continue  # the call's copy is not in the batch (defensive; should not happen)
-        try:
-            body = parse_request_body(body_path)
-        except (OSError, json.JSONDecodeError):
-            logger.warning("cannot read request body %s", body_path)
-            continue
-        metadata = event["body"].setdefault("metadata", {})
-        metadata["cache_breakpoints"] = [
-            {"location": boundary.location, "index": boundary.index}
-            for boundary in body.cache_boundaries
-        ]
-        effort = body.effort
-        if effort is None:
-            continue
-        if effort == _ULTRA_MODE:
-            ultracode = True
-            continue
-        metadata["effort"] = effort
-        if effort not in efforts:
-            efforts.append(effort)
-        attached += 1
-    tags = [f"effort:{effort}" for effort in efforts]
-    if ultracode:
-        tags.append(_ULTRACODE_TAG)
-    _merge_trace_tags(batch, tags)
-    return attached
 
 
 def _score_id(spoke_run_id: str, name: str, target: str) -> str:

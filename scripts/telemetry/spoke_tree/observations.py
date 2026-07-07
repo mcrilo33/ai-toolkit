@@ -343,3 +343,25 @@ def _latest_time(traces: list[TraceObservations]) -> str:
         if observation.get("endTime") or observation.get("startTime")
     ]
     return max(times) if times else _INGEST_TIMESTAMP
+
+
+def _llm_requests_in_order(traces: list[TraceObservations]) -> list[tuple[str, Observation]]:
+    """Return ``(orig_trace_id, observation)`` for each LLM call, oldest first by ``startTime``.
+
+    An LLM call is any observation carrying ``cache_read_input_tokens`` or
+    ``cache_creation_input_tokens`` usage — the same set the request-body dumps correspond to,
+    so the two align positionally (the basis of the count gate in
+    :func:`apply_llm_decomposition`).
+    """
+    calls: list[tuple[str, str, Observation]] = []
+    for orig_trace_id, observations in traces:
+        for observation in observations:
+            usage = observation.get("usageDetails") or {}
+            if (
+                usage.get("cache_read_input_tokens") is None
+                and usage.get("cache_creation_input_tokens") is None
+            ):
+                continue
+            calls.append((observation.get("startTime") or "", orig_trace_id, observation))
+    calls.sort(key=lambda call: call[0])
+    return [(orig_trace_id, observation) for _start, orig_trace_id, observation in calls]
