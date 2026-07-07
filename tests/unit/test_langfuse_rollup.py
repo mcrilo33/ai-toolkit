@@ -300,7 +300,7 @@ def test_make_delete_issues_bulk_delete_with_trace_ids(monkeypatch: Any) -> None
     captured: dict[str, Any] = {}
 
     class _Resp:
-        def __enter__(self) -> "_Resp":
+        def __enter__(self) -> _Resp:
             return self
 
         def __exit__(self, *_exc: object) -> None:

@@ -65,6 +65,8 @@ TokenTotals = dict[str, int]
 GetFn = Callable[[str], dict[str, Any]]
 # Post a list of ingestion batch events to Langfuse.
 PostFn = Callable[[list[dict[str, Any]]], None]
+# Bulk-delete Langfuse traces by id (async on the server; poll the listing to confirm gone).
+DeleteFn = Callable[[list[str]], None]
 
 
 def build_tree(
@@ -262,6 +264,33 @@ def make_post(host: str, auth: str) -> PostFn:
             resp.read()
 
     return post
+
+
+def make_delete(host: str, auth: str) -> DeleteFn:
+    """Build a bulk trace-deleter bound to ``host`` and ``auth``.
+
+    Args:
+        host: Base Langfuse URL, e.g. ``http://localhost:3000``.
+        auth: The ``Authorization`` header value, ``Basic <base64(pk:sk)>``.
+
+    Returns:
+        A callable that issues one ``DELETE /api/public/traces`` for the given trace ids.
+        Deletion is asynchronous on the server, so callers must poll the listing to confirm
+        the traces are gone before re-posting (see ``purge_own_views``).
+    """
+
+    def delete(trace_ids: list[str]) -> None:
+        data = json.dumps({"traceIds": trace_ids}).encode()
+        request = urllib.request.Request(
+            f"{host}/api/public/traces",
+            data=data,
+            headers={"Authorization": auth, "Content-Type": "application/json"},
+            method="DELETE",
+        )
+        with urllib.request.urlopen(request, timeout=30) as resp:
+            resp.read()
+
+    return delete
 
 
 def main(argv: list[str] | None = None) -> int:

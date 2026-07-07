@@ -19,6 +19,8 @@ import urllib.parse
 from collections.abc import Sequence
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from telemetry.langfuse_spoke_tree import (
@@ -1645,7 +1647,7 @@ class TestExcludesOwnOutput:
         )
         prior_b_old = ("spokecycle-legacy", f"spoke-cycle:{SESSION}", [_obs("cyc-z", "Bash")])
 
-        fetched = fetch_session(SESSION, _stub_get(native + [prior_b, prior_b_old]))
+        fetched = fetch_session(SESSION, _stub_get([*native, prior_b, prior_b_old]))
 
         assert fetched == [(tid, obs) for tid, _name, obs in native]
 
@@ -1801,7 +1803,7 @@ class TestRebuildIdempotency:
 
         fresh = build_batch(fetch_session(SESSION, _stub_get(native)), SESSION)
         rebuilt = build_batch(
-            fetch_session(SESSION, _stub_get(native + [prior_a, prior_b])), SESSION
+            fetch_session(SESSION, _stub_get([*native, prior_a, prior_b])), SESSION
         )
 
         assert json.dumps(rebuilt) == json.dumps(fresh)
@@ -1813,7 +1815,7 @@ class TestRebuildIdempotency:
 
         fresh = build_cycle_batch(fetch_session(SESSION, _stub_get(native)), SESSION)
         rebuilt = build_cycle_batch(
-            fetch_session(SESSION, _stub_get(native + [prior_a, prior_b])), SESSION
+            fetch_session(SESSION, _stub_get([*native, prior_a, prior_b])), SESSION
         )
 
         assert json.dumps(rebuilt) == json.dumps(fresh)
