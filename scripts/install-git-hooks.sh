@@ -129,7 +129,7 @@ MSG_FILE="$1"
 # the agent path. Strip comment lines git would drop.
 MSG_BODY=$(grep -v '^[[:space:]]*#' "$MSG_FILE" || true)
 if command -v jq >/dev/null 2>&1; then
-  CMD=$(jq -nc --arg m "$MSG_BODY" '"git commit -m " + ($m | @json)')
+  CMD=$(jq -nr --arg m "$MSG_BODY" '"git commit -m " + ($m | @json)')
   PAYLOAD=$(jq -nc --arg c "$CMD" '{tool_name:"Bash", tool_input:{command:$c}}')
 else
   ESC=$(printf '%s' "$MSG_BODY" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')
