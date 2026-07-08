@@ -284,6 +284,64 @@ def test_inject_and_verify_rejects_advance_while_needle_still_in_pane(
     assert result.stdout.strip().splitlines()[-1] == "RC=2", result.stdout + result.stderr
 
 
+def test_inject_and_verify_succeeds_when_answer_lands_despite_pane_echo(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    """A genuine submit ECHOES the message into the scrollback (`> text`), so the pane
+    keeps showing the needle after a real success. The #201 composer-release check must
+    accept that: transcript advanced AND the answer landed as a user record => rc 0 —
+    never a false wedge that respawns a healthy pane mid-turn.
+    """
+    answer = 'Approved — proceed with "phase 2".'  # quotes: the JSON-escaped needle path
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    jsonl.write_text("{}\n")
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+    pasted = tmp_path / "pasted"
+
+    # What Claude Code appends on submit: the user turn, JSON-encoded raw-UTF-8.
+    user_record = json.dumps(
+        {"type": "user", "message": {"content": [{"type": "text", "text": answer}]}},
+        ensure_ascii=False,
+    )
+    record_file = tmp_path / "user-record.json"
+    record_file.write_text(user_record + "\n")
+    echo_file = tmp_path / "echo.txt"
+    echo_file.write_text(f"> {answer}\n")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    # Fake tmux: the paste shows in the pane, the submitting Enter appends the user
+    # record to the session transcript, and the echo KEEPS the needle visible after.
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        "  send-keys)\n"
+        '    case "$*" in\n'
+        f'      *" -l "*) touch "{pasted}" ;;\n'
+        f'      *Enter*) [ -e "{pasted}" ] && cat "{record_file}" >> "{jsonl}" ;;\n'
+        "    esac ;;\n"
+        "  capture-pane)\n"
+        f'    [ -e "{pasted}" ] && cat "{echo_file}" ;;\n'
+        "esac\nexit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+
+    result = _call(
+        f"inject_and_verify '{spoke_repo}' afk:1 \"$ANSWER\"; echo RC=$?",
+        env={
+            "ANSWER": answer,
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "AFK_INJECT_MENU_PAUSE": "0",
+            "AFK_INJECT_VERIFY_SECONDS": "0",
+        },
+    )
+
+    assert result.stdout.strip().splitlines()[-1] == "RC=0", result.stdout + result.stderr
+
+
 # ── subtask B: read-only-worktree reasoner + evidence + mutation guard ─────────
 
 

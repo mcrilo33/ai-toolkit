@@ -1182,6 +1182,58 @@ _composer_shows_text() {
   tmux capture-pane -p -t "$target" 2>/dev/null | grep -qF -- "$needle"
 }
 
+# _answer_in_transcript <wt_path> <text> -> true when the answer's needle (the same
+# first-line prefix _composer_shows_text greps for) appears in any jsonl of the spoke's
+# project dir. A submitted answer lands as a user record in the session transcript, so
+# post-inject presence is POSITIVE proof the composer let go (#201) — the pane alone
+# cannot give it, because a successful submit also ECHOES the message into the
+# scrollback and would keep reading as "still buffered". The needle is matched in its
+# JSON-encoded form (quotes/backslashes in the answer cannot hide it) against the raw
+# lines — no per-record parse. Callers baseline this pre-inject exactly like
+# _composer_shows_text: a canned answer repeated across gates may already be present.
+# Fail-CLOSED: no python3 / no project dir reads as "not found" (unconfirmed).
+_answer_in_transcript() {
+  local wt="$1" text="$2" needle dir
+  needle="${text%%$'\n'*}"
+  needle="${needle:0:40}"
+  [ -n "$needle" ] || return 1
+  dir="$(_spoke_project_dir "$wt")"
+  [ -d "$dir" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  _AFK_DIR="$dir" _AFK_NEEDLE="$needle" python3 2>/dev/null <<'PYEOF'
+import glob, json, os, sys
+
+# The transcript stores the answer JSON-encoded (raw UTF-8, like JSON.stringify),
+# so the encoded needle appears verbatim in the raw line iff the decoded needle
+# appears contiguously inside some string value.
+needle = json.dumps(os.environ["_AFK_NEEDLE"], ensure_ascii=False)[1:-1]
+for path in glob.glob(os.path.join(os.environ["_AFK_DIR"], "*.jsonl")):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            if any(needle in line for line in fh):
+                sys.exit(0)
+    except OSError:
+        continue
+sys.exit(1)
+PYEOF
+}
+
+# _answer_delivered <wt> <target> <text> <baseline_shows> <baseline_logged> -> after
+# _transcript_advanced succeeded, decide whether the answer actually LEFT the composer
+# (#201: an advance alone scored two wedged pastes as "injected answer into #182" while
+# the answer sat unsubmitted). Delivered when the pane no longer shows the needle, OR
+# the pane check is unusable (needle pre-existing: baseline_shows=1 — advance alone
+# decides, the pre-#201 contract), OR the answer NEWLY landed in the transcript itself
+# (a genuine submit echoes the message in the scrollback; without this a visible needle
+# would misread every real success as a wedge and respawn a healthy pane).
+_answer_delivered() {
+  local wt="$1" target="$2" text="$3" baseline_shows="$4" baseline_logged="$5"
+  [ "$baseline_shows" -eq 1 ] && return 0
+  _composer_shows_text "$target" "$text" || return 0
+  [ "$baseline_logged" -eq 0 ] && _answer_in_transcript "$wt" "$text" && return 0
+  return 1
+}
+
 # _transcript_advanced <wt_path> <baseline_mtime> -> true once the spoke's newest
 # transcript mtime exceeds the baseline, polling up to AFK_INJECT_VERIFY_SECONDS in
 # AFK_INJECT_POLL_SECONDS steps. An empty baseline (no prior transcript) means any
@@ -1202,26 +1254,38 @@ _transcript_advanced() {
 }
 
 # inject_and_verify <wt_path> <pane_target> <text> -> deliver the answer and CONFIRM
-# it registered (the spoke's transcript advanced). The retry is a bare Enter, NEVER a
-# re-paste: the common failure is a buffered paste whose submitting Enter was lost, and
-# the old full re-inject duplicated the answer on top of it (#133, from #123/#124).
-#   rc 0 — registered (the transcript advanced; the answer took).
+# it registered: the spoke's transcript advanced AND the composer let go of the text
+# (#201: a non-turn write bumping the newest jsonl made "a file moved" score two
+# wedged pastes as success). The retry is a bare Enter, NEVER a re-paste: the common
+# failure is a buffered paste whose submitting Enter was lost, and the old full
+# re-inject duplicated the answer on top of it (#133, from #123/#124).
+#   rc 0 — delivered (the transcript advanced and the composer released the answer).
 #   rc 2 — WEDGED: the text survived the Enter-only retry (an unterminated paste no
 #          keystroke can submit or clear) — the caller respawns the pane.
 #   rc 1 — not registered and no text observable in the composer — the caller escalates.
 inject_and_verify() {
-  local wt="$1" target="$2" text="$3" before baseline_shows=0
+  local wt="$1" target="$2" text="$3" before baseline_shows=0 baseline_logged=0
   before="$(_transcript_mtime "$wt")"
   # Baseline BEFORE pasting: a short answer often also appears in the rendered
   # question above the composer. If the needle was already visible pre-inject,
   # post-retry presence proves nothing — never classify wedged off a pre-existing
   # match (a false wedge would kill a live pane where rc 1 safely escalates).
   _composer_shows_text "$target" "$text" && baseline_shows=1
+  _answer_in_transcript "$wt" "$text" && baseline_logged=1
   inject_answer "$target" "$text" || return 1
-  _transcript_advanced "$wt" "$before" && return 0
+  if _transcript_advanced "$wt" "$before"; then
+    _answer_delivered "$wt" "$target" "$text" "$baseline_shows" "$baseline_logged" && return 0
+    # #201: the advance was a non-turn write while the paste sat unsubmitted.
+    # Re-baseline so the retry waits for REAL post-Enter progress, then fall
+    # through to the same bare-Enter / wedge path a plain non-advance takes.
+    before="$(_transcript_mtime "$wt")"
+    log "  transcript advanced but the answer never left the composer — NOT delivered (#201)"
+  fi
   log "  injected answer did not register — retrying with a bare Enter (never a re-paste)"
   tmux send-keys -t "$target" Enter 2>/dev/null || true
-  _transcript_advanced "$wt" "$before" && return 0
+  if _transcript_advanced "$wt" "$before"; then
+    _answer_delivered "$wt" "$target" "$text" "$baseline_shows" "$baseline_logged" && return 0
+  fi
   [ "$baseline_shows" -eq 0 ] && _composer_shows_text "$target" "$text" && return 2
   return 1
 }
