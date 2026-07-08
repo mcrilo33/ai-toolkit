@@ -150,6 +150,8 @@ is_doc() {
 
 is_py() { case "$1" in *.py) return 0 ;; *) return 1 ;; esac; }
 
+is_shell() { case "$1" in *.sh) return 0 ;; *) return 1 ;; esac; }
+
 # Exempt handling (issue #123): the parser lives in lib/test-reverse-index.sh
 # (reverse_index_is_exempt) so this gate and the commit-time nudge share one
 # definition of "exempt". Note the list's own basename (.test-select-exempt)
@@ -236,6 +238,7 @@ has_py=0
 has_other=0
 UNMAPPED=0
 UNMAPPED_FILE=""
+UNMAPPED_SH=""
 MAPPED_TESTS=""
 EXEMPT_SKIPPED=0
 while IFS= read -r f; do
@@ -260,8 +263,27 @@ while IFS= read -r f; do
     has_other=1
     UNMAPPED=1
     [ -n "$UNMAPPED_FILE" ] || UNMAPPED_FILE="$f"
+    # Witness signal (issue #191): a changed *.sh with no referencing test is
+    # the testmon blind spot this gate exists to close — testmon tracks python
+    # imports only, so a bash-only edit re-exercised by subprocess/source
+    # (test_hub_afk and friends) is invisible to it. The unmapped file already
+    # escalates to the full suite below, but the full suite has no
+    # subprocess-sourcing suite for THIS script either, so it stays untested.
+    # Collect each such script for a distinct, greppable warning (fed to #187's
+    # fail-open audit as a witness); non-shell unmapped files don't qualify.
+    if is_shell "$f"; then
+      UNMAPPED_SH="$UNMAPPED_SH$f"$'\n'
+    fi
   fi
 done <<< "$FILES"
+
+# Emit the bash blind-spot witness (issue #191) before the tier decision so it
+# surfaces even when a green-tree stamp later short-circuits the run: the
+# coverage gap it names is a property of the diff, not of whether the suite ran.
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  note "WARNING (witness: unmapped-shell) $f — shell change with no referencing test; testmon is blind to shell, nothing re-exercises it. Add a test referencing its basename or a .test-select-exempt entry."
+done <<< "$UNMAPPED_SH"
 
 # The selection: deduped, and every entry must still exist — a mapping to a
 # vanished test proves nothing, so it escalates instead.
