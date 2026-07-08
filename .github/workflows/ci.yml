@@ -146,7 +146,10 @@ jobs:
           # selection lives here rather than behind a pytest marker. The token
           # boundary ([^a-zA-Z0-9]|$) is portable ERE (BSD + GNU grep) and
           # drops false matches like `github.sha`.
-          subset=$(grep -rlE '\.sh([^a-zA-Z0-9]|$)' tests --include='test_*.py' | sort)
+          # `|| true`: grep exits 1 on no-match, which under `set -eo
+          # pipefail` would abort at this assignment before the guard
+          # below runs — swallow it so the guard prints its diagnostic.
+          subset=$(grep -rlE '\.sh([^a-zA-Z0-9]|$)' tests --include='test_*.py' | sort || true)
           if [ -z "$subset" ]; then
             echo "No shell-control-plane tests matched — selection is broken." >&2
             exit 1
