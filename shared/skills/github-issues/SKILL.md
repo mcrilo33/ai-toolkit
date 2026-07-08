@@ -107,7 +107,10 @@ gh api graphql -f query='{ organization(login: "ORG") { issueTypes(first: 10) { 
 
 ### Body Structure
 
-Always use the templates in [references/templates.md](references/templates.md). Choose based on issue type:
+Always use the templates in [references/templates.md](references/templates.md). Every
+template ends with the `Scope:` + `Gate:` footer that makes the issue schedulable — keep
+both lines (a missing `Scope:` silently serializes the issue; see the `issue-hygiene`
+rule). Choose based on issue type:
 
 | User Request | Template |
 |--------------|----------|

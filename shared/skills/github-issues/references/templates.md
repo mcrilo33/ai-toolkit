@@ -2,9 +2,19 @@
 
 Copy and customize these templates for issue bodies.
 
-Every dispatchable issue ends with a **`Scope:`** line — a space- or comma-separated list
-of the files/globs it will touch — so the planner can batch it (see the `issue-hygiene`
-rule). A missing line or `Scope: *` marks the issue exclusive (runs alone, the slow path).
+Every dispatchable issue ends with a two-line **`Scope:` + `Gate:`** footer so the planner
+can schedule it (see the `issue-hygiene` rule):
+
+- **`Scope:`** — a whitespace- or comma-separated list of the file paths/globs it will
+  touch, so the planner can batch it against disjoint work. A **missing** line or
+  `Scope: *` marks the issue **exclusive**: it runs alone, never batched — the slow path.
+  A missing line is the *accidental* exclusive (`batch-plan.sh` warns when it holds one
+  back); `*` is the *deliberate* one. Write a concrete file list whenever you can.
+- **`Gate:`** — `none` or `plan`. `none` runs the spoke autonomously straight to `ready/`;
+  `plan` (the default for non-trivial work) pauses the spoke for a human plan review
+  before it writes code. Omitting it defaults to `plan`.
+
+Both lines are plain `Key: value` body lines a scripted planner reads — not `##` headers.
 
 ## Bug Report Template
 
@@ -35,6 +45,7 @@ rule). A missing line or `Scope: *` marks the issue exclusive (runs alone, the s
 [Any other relevant information]
 
 Scope: [files/globs this fix touches; '*' or omitted ⇒ exclusive]
+Gate: [none | plan — omitted ⇒ plan]
 ```
 
 ## Feature Request Template
@@ -61,6 +72,7 @@ Scope: [files/globs this fix touches; '*' or omitted ⇒ exclusive]
 [Mockups, examples, or related issues]
 
 Scope: [files/globs this feature touches; '*' or omitted ⇒ exclusive]
+Gate: [none | plan — omitted ⇒ plan]
 ```
 
 ## Task Template
@@ -84,6 +96,7 @@ Scope: [files/globs this feature touches; '*' or omitted ⇒ exclusive]
 [Additional context or considerations]
 
 Scope: [files/globs this task touches; '*' or omitted ⇒ exclusive]
+Gate: [none | plan — omitted ⇒ plan]
 ```
 
 ## Minimal Template
@@ -99,4 +112,5 @@ For simple issues:
 - [ ] [Task 2]
 
 Scope: [files/globs this issue touches; '*' or omitted ⇒ exclusive]
+Gate: [none | plan — omitted ⇒ plan]
 ```
