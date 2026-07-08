@@ -171,6 +171,67 @@ def test_cycle_step_model_is_none_for_unknown_step(tmp_path: Path) -> None:
     assert cfg.cycle_step_model(config, "deploy") is None
 
 
+# ─── cycle_step_agent / cycle_step_effective_model (the delegation consumer) ───
+
+
+@pytest.mark.parametrize(
+    ("step", "agent"),
+    [("red", "tdd-red"), ("green", "tdd-green"), ("review", "code-review")],
+)
+def test_cycle_step_agent_returns_delegate(step: str, agent: str) -> None:
+    # The step→delegate map is a static wiring fact (which agent runs each step),
+    # independent of the config file — so it takes no config argument.
+    assert cfg.cycle_step_agent(step) == agent
+
+
+@pytest.mark.parametrize("step", ["anchor", "push"])
+def test_cycle_step_agent_is_none_for_undelegated_step(step: str) -> None:
+    # anchor/push are mechanical (driver-run) — no subagent delegate, so the
+    # effective model fails open to the spoke driver.
+    assert cfg.cycle_step_agent(step) is None
+
+
+def test_cycle_step_agent_is_none_for_unknown_step() -> None:
+    assert cfg.cycle_step_agent("deploy") is None
+
+
+def test_cycle_step_effective_model_returns_delegate_routing(tmp_path: Path) -> None:
+    # GREEN runs on whatever model the green delegate (tdd-green) is routed to —
+    # the effective model is read from the delegate's config entry, not hardcoded.
+    config = cfg.load_config(
+        _write(
+            tmp_path,
+            "model:\n"
+            "  subagents:\n"
+            "    tdd-green:\n"
+            "      model: claude-sonnet-5\n"
+            "      effort: max\n",
+        ).as_posix()
+    )
+
+    assert cfg.cycle_step_effective_model(config, "green") == ("claude-sonnet-5", "max")
+
+
+def test_cycle_step_effective_model_fails_open_for_undelegated_step(tmp_path: Path) -> None:
+    # push has no delegate ⇒ None ⇒ the consumer keeps the spoke driver model.
+    config = cfg.load_config(
+        _write(
+            tmp_path,
+            "model:\n  subagents:\n    tdd-green:\n      model: claude-sonnet-5\n",
+        ).as_posix()
+    )
+
+    assert cfg.cycle_step_effective_model(config, "push") is None
+
+
+def test_cycle_step_effective_model_fails_open_when_delegate_unrouted(tmp_path: Path) -> None:
+    # green is delegated, but the config routes no tdd-green ⇒ None ⇒ fail-open to
+    # today's behavior (the spoke driver model), never a crash or a scarce default.
+    config = cfg.load_config(_write(tmp_path, "model:\n  spoke:\n    model: x\n").as_posix())
+
+    assert cfg.cycle_step_effective_model(config, "green") is None
+
+
 # ─── afk_answerer_model ───
 
 
@@ -362,6 +423,32 @@ def test_seed_routing_matches_the_agent_roster(real_config: dict) -> None:
 @pytest.mark.parametrize(("name", "model"), sorted(EXPECTED_AGENT_ROUTING.items()))
 def test_real_config_agent_routing_matches_seed(real_config: dict, name: str, model: str) -> None:
     assert cfg.agent_model(real_config, name) == (model, "max")
+
+
+# ─── real config: cycle-step routing is a live, self-consistent SSOT (issue #182) ───
+
+
+@pytest.mark.parametrize("step", ["green", "red", "review"])
+def test_real_config_cycle_step_declared_model_matches_its_delegate(
+    real_config: dict, step: str
+) -> None:
+    # `model.cycle_steps.<step>` declares the intent; the delegate subagent is the
+    # mechanism that delivers it. Bind them: a drift (e.g. cycle_steps.green bumped
+    # to Opus while tdd-green stays Sonnet) must fail here, not route silently wrong.
+    delegate = cfg.CYCLE_STEP_AGENTS[step]
+
+    assert cfg.cycle_step_model(real_config, step) == cfg.agent_model(real_config, delegate)
+
+
+@pytest.mark.parametrize("step", ["green", "red", "review"])
+def test_real_config_cycle_step_effective_model_delivers_declared_model(
+    real_config: dict, step: str
+) -> None:
+    # The effective (delegate-resolved) model a step actually runs on equals the
+    # declared cycle_steps model — so GREEN demonstrably runs on the cheaper model.
+    assert cfg.cycle_step_effective_model(real_config, step) == cfg.cycle_step_model(
+        real_config, step
+    )
 
 
 # ─── agent_model_overrides (the sync-stamping overlay source) ───
