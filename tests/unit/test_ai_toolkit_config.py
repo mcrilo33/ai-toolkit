@@ -67,7 +67,11 @@ def test_load_config_returns_nested_mapping(tmp_path: Path) -> None:
     config = cfg.load_config(str(path))
 
     assert config["base_branch"] == "develop"
-    assert config["model"]["spoke"]["model"] == "claude-opus-4-8[1m]"
+    model = config["model"]
+    assert isinstance(model, dict)
+    spoke = model["spoke"]
+    assert isinstance(spoke, dict)
+    assert spoke["model"] == "claude-opus-4-8[1m]"
 
 
 # ─── spoke_model ───
@@ -384,9 +388,10 @@ def test_batch_env_cli_empty_when_unset(tmp_path: Path) -> None:
 
 
 def test_real_config_batch_cap_pinned_stagger_autoderives(real_config: dict) -> None:
-    # The hub pins the cap for its hardware (M5 Max 18c/48GB, #151 headroom);
+    # The hub pins the cap for its hardware (M5 Max 18c/48GB; measured headroom
+    # 2026-07-08, see the config comment — hold at 6 until #188/#203 land);
     # the stagger stays blank ⇒ the consumer auto-derives its default.
-    assert cfg.batch_concurrency_cap(real_config) == 4
+    assert cfg.batch_concurrency_cap(real_config) == 6
     assert cfg.batch_stagger_seconds(real_config) is None
 
 
