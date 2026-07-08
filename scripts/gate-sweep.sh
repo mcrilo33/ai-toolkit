@@ -281,17 +281,26 @@ process_request() {
 do_run() {
   mkdir -p "$SWEEP_DIR"
   PIDFILE="$SWEEP_DIR/lock.pid"
+  # Install the release trap BEFORE acquiring the lock, so a signal any time
+  # after the pidfile appears releases it instead of leaving a stale lock that
+  # wedges the safety net until the kill-0 self-heal notices. The LOCK_OWNED
+  # guard in release_lock makes it a no-op until we actually own the lock, so
+  # the queue-blocked path below never deletes the live holder's pidfile.
+  trap 'release_lock; exit 0' EXIT INT TERM
   if ! acquire_lock; then
     queue_request || log "could not queue follow-up sweep for ${SHA:0:9}"
     log "sweep already running — queued follow-up for ${SHA:0:9}"
     return 0
   fi
-  trap 'release_lock; exit 0' EXIT
   while :; do
     process_request
-    [ -f "$SWEEP_DIR/queue" ] || break
-    IFS=$'\t' read -r SHA BRANCH ISSUE < "$SWEEP_DIR/queue" || true
-    rm -f "$SWEEP_DIR/queue"
+    # Atomic claim: rename the queue to a private copy before reading it. A
+    # request mv'd over `queue` after this point lands as a fresh queue and is
+    # picked up on the next iteration — a read-then-rm would instead delete a
+    # newer request that arrived in the read→rm window, unprocessed.
+    mv "$SWEEP_DIR/queue" "$SWEEP_DIR/queue.$$" 2>/dev/null || break
+    IFS=$'\t' read -r SHA BRANCH ISSUE < "$SWEEP_DIR/queue.$$" || true
+    rm -f "$SWEEP_DIR/queue.$$"
   done
 }
 
