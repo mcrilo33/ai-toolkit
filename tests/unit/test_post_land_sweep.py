@@ -13,10 +13,11 @@ repository. With an in-flight worktree for issue #168 present, ``_escalate_block
 stamped ``blocked/168`` there.
 
 The cure lives in ``tests/conftest.py``: it relocates the session's working directory
-to a neutral, non-git sandbox at import time, so a bare ``git`` invocation with no
-explicit cwd finds NO repository and cannot touch the real one. Tests that pass an
-explicit ``cwd=`` (their own throwaway repos) are unaffected. These tests pin that
-contract; do not drop the conftest chdir without removing this file's reason to exist.
+to a throwaway git-repo sandbox at import time, so a bare ``git`` invocation with no
+explicit cwd resolves the SANDBOX — never the real repo — and any stray write lands
+there instead. Tests that pass an explicit ``cwd=`` (their own throwaway repos) are
+unaffected. These tests pin that contract; do not drop the conftest chdir/sandbox
+without removing this file's reason to exist.
 """
 
 from __future__ import annotations
@@ -28,19 +29,21 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_default_cwd_is_not_a_git_worktree() -> None:
-    # A subprocess that shells `git` with NO explicit cwd inherits the pytest
-    # process cwd. That cwd must not be a git work tree, or a script that bare-`git`s
-    # would mutate whatever repo the suite happens to sit in — the real one.
+def test_bare_git_does_not_resolve_the_real_repo() -> None:
+    # A subprocess that shells `git` with NO explicit cwd inherits the pytest process
+    # cwd. Whatever repo that git resolves must NOT be the real checkout, or a script
+    # that bare-`git`s (hub-afk's inflight_worktrees -> _escalate_blocked) would mutate
+    # the real repo's refs — exactly the escape that stamped refs/tags/blocked/168.
     result = subprocess.run(
-        ["git", "rev-parse", "--is-inside-work-tree"],
+        ["git", "rev-parse", "--show-toplevel"],
         capture_output=True,
         text=True,
     )
+    toplevel = Path(result.stdout.strip()).resolve() if result.stdout.strip() else None
 
-    assert result.returncode != 0, (
-        f"pytest cwd is a git work tree ({os.getcwd()}); a test that shells git "
-        "without cwd= would mutate the real repo (issue #179)"
+    assert toplevel != REPO_ROOT, (
+        f"bare git resolves the real repo ({toplevel}); a test that shells git without "
+        "cwd= would mutate the real repo (issue #179)"
     )
 
 
