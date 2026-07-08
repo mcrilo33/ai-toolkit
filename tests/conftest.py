@@ -41,12 +41,40 @@ gated solely on ``AI_TOOLKIT_OTEL_SPAN_ENDPOINT`` (NOT on ``AI_TOOLKIT_TELEMETRY
 inheriting a spoke's exported endpoint leaked fixture spans straight to Langfuse. A network
 endpoint has no sandbox to redirect to, so the cure is to strip the whole export family —
 done below, same import-time mechanism, same regression guard.
+
+The cwd is the OTHER half of git isolation (issue #179). Stripping ``GIT_DIR`` &co keeps a
+leaked env var from RETARGETING a subprocess git, but git ALSO discovers a repo from the
+process working directory — and pytest is launched from the real repo root. A test that
+shells a git-touching script WITHOUT passing an explicit ``cwd=`` (hub-afk's
+``inflight_worktrees`` -> ``_escalate_blocked`` is the live case) inherits that cwd, so
+``git worktree list`` / ``git tag`` silently run against the REAL repository — the #124
+post-land sweep tripped the repo-integrity tripwire when one such test stamped
+``refs/tags/blocked/168`` there.
+
+The cure relocates the session's working directory to a throwaway git repo whose worktree
+MIRRORS the real checkout's top-level entries via symlinks (see ``_build_git_cwd_sandbox``).
+It is a mirror, not a bare temp dir, because git-cwd isolation cuts both ways: some tests
+legitimately READ the toolkit through the inherited cwd — hub-afk's self-copy resolves
+``worktree-lib.sh`` from ``git rev-parse --show-toplevel`` — and a plain non-repo cwd would
+break those reads. Against the mirror, ``show-toplevel`` resolves to the sandbox and the
+symlinked ``scripts/`` / ``shared/`` still read the real files, while ``git worktree list``
+reports NO task worktrees (so the escalation escape finds nothing to stamp) and any stray
+REF write (a ``git tag`` / ``git update-ref``) lands in the sandbox's own ``.git`` — never
+the real repo. (A relative-path FILE write through a symlinked entry, e.g.
+``$(git rev-parse --show-toplevel)/scripts/x``, would still reach the real file — but that
+is not the #179 escape, no test does it, and the real-repo cwd it replaced was no safer.)
+Tests that pass their own ``cwd=`` (isolated tmp repos) are untouched.
+``GIT_CEILING_DIRECTORIES`` pins the walk to the sandbox as belt-and-suspenders against an
+oddly-placed ``TMPDIR``. The regression guard is ``tests/unit/test_post_land_sweep.py``.
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import tempfile
+from pathlib import Path
 
 _LEAKED_GIT_HOOK_VARS = (
     "GIT_DIR",
@@ -107,3 +135,45 @@ for _var in ("LANGFUSE_BASIC_AUTH", "LANGFUSE_HOST"):
 os.environ["AFK_TELEMETRY_CONF"] = os.path.join(
     tempfile.mkdtemp(prefix="ai-toolkit-test-afk-"), "no-such-conf"
 )
+
+
+# Git cwd isolation (issue #179) — see the module docstring. Relocate the session's
+# working directory to a throwaway git-repo sandbox that mirrors the real checkout, so a
+# subprocess that shells `git` without an explicit cwd= resolves the SANDBOX (never the
+# real repo root pytest was launched from): toolkit reads still resolve via the symlinks,
+# while `git worktree list` sees no task worktrees and stray ref writes land in the
+# sandbox's own .git. Reads of the real repo layout keep working; ref writes can't escape.
+def _build_git_cwd_sandbox() -> str:
+    """Create a throwaway git repo whose worktree mirrors the real checkout's top-level
+    entries via symlinks, and return its path. Raises on any failure — the caller turns
+    that into a LOUD warning, because a silent failure leaves the session cwd at the real
+    repo and re-opens the #179 escape (the env strips above do NOT cover cwd discovery)."""
+    repo_root = Path(__file__).resolve().parents[1]
+    sandbox = Path(tempfile.mkdtemp(prefix="ai-toolkit-test-cwd-"))
+    # Mirror every top-level entry except the real .git (the sandbox gets its own).
+    for entry in repo_root.iterdir():
+        if entry.name == ".git":
+            continue
+        os.symlink(entry, sandbox / entry.name)
+    subprocess.run(
+        ["git", "init", "-q", str(sandbox)],
+        check=True,
+        capture_output=True,
+    )
+    return str(sandbox)
+
+
+try:
+    _GIT_CWD_SANDBOX = _build_git_cwd_sandbox()
+    os.environ["GIT_CEILING_DIRECTORIES"] = _GIT_CWD_SANDBOX
+    os.chdir(_GIT_CWD_SANDBOX)
+except (OSError, subprocess.SubprocessError) as _cwd_err:
+    # Fail OPEN (don't abort the whole suite over a transient git hiccup) but LOUDLY:
+    # the session cwd is still the real repo, so a bare-git test can escape isolation —
+    # test_post_land_sweep.py will fail, and this banner makes a re-tripped tripwire
+    # traceable to the cause instead of looking like a fresh mystery escape (#179).
+    print(
+        f"conftest: WARNING — could not build the git-cwd sandbox ({_cwd_err!r}); "
+        "the session cwd is still the real repo and bare-git tests may mutate it (#179)",
+        file=sys.stderr,
+    )
