@@ -769,6 +769,74 @@ def test_undeclared_dependency_needs_two_issues(tmp_path: Path) -> None:
     assert _UNDECLARED() not in proc.stderr
 
 
+# ── scopeless-ready warning: a missing Scope: line is flagged (issue #217) ────
+# A MISSING `Scope:` line marks the issue exclusive (runs alone, never batched) —
+# correct fail-closed semantics, but silent, so a whole drain can serialize on a batch
+# of scope-less issues unnoticed until a human spots it. This warning names each ready
+# issue with no Scope: line so the serialization is diagnosable from the plan log (the
+# no-silent-caps rule). `Scope: *` is a DELIBERATE exclusive and stays silent — only the
+# accidental missing-line case is flagged. Detection-only, stderr.
+
+
+def _SCOPELESS() -> str:
+    return "has no Scope: line — treated exclusive"
+
+
+def test_scopeless_ready_issue_warns() -> None:
+    # A ready issue with no Scope: line at all is flagged by number.
+    proc = _run_plan([_node(1, None)])
+
+    assert proc.returncode == 0, proc.stderr
+    assert f"#1 {_SCOPELESS()}" in proc.stderr
+
+
+def test_star_scope_is_not_a_scopeless_warning() -> None:
+    # `Scope: *` is a deliberate exclusive — it must NOT trip the missing-line warning.
+    proc = _run_plan([_node(1, "*")])
+
+    assert proc.returncode == 0, proc.stderr
+    assert _SCOPELESS() not in proc.stderr
+
+
+def test_scoped_issue_does_not_warn_scopeless() -> None:
+    # A concrete Scope: line is the normal case — silent.
+    proc = _run_plan([_node(1, "a.py")])
+
+    assert proc.returncode == 0, proc.stderr
+    assert _SCOPELESS() not in proc.stderr
+
+
+def test_scopeless_warning_only_for_ready_issues() -> None:
+    # #2 is blocked (open blocker) and scope-less; it is not ready, so it is not warned
+    # about — only the ready-but-scope-less #1 is.
+    nodes = [_node(1, None), _node(2, None, blocked_by=[(99, "OPEN")])]
+
+    proc = _run_plan(nodes)
+
+    assert f"#1 {_SCOPELESS()}" in proc.stderr
+    assert f"#2 {_SCOPELESS()}" not in proc.stderr
+
+
+def test_scopeless_warning_names_each_ready_issue() -> None:
+    # Two ready scope-less issues ⇒ one warning line each, by number.
+    proc = _run_plan([_node(1, None), _node(2, None)])
+
+    warned = [line for line in proc.stderr.splitlines() if _SCOPELESS() in line]
+    assert len(warned) == 2
+    assert any("#1" in line for line in warned)
+    assert any("#2" in line for line in warned)
+
+
+def test_scopeless_warning_is_detection_only() -> None:
+    # The warning fires but the scope-less issue is still dispatched (alone) and the
+    # exit code is unchanged — detection-only, like the other lints.
+    proc = _run_plan([_node(1, None)])
+
+    assert proc.returncode == 0
+    assert [int(t) for t in proc.stdout.split()] == [1]
+    assert _SCOPELESS() in proc.stderr
+
+
 # ── tie-break: equal depth ⇒ more direct dependents wins ──────────────────────
 
 
