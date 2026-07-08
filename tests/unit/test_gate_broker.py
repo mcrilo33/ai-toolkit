@@ -2126,6 +2126,27 @@ def test_classify_permission_escalates_shell_expansion_in_mutation_path(
     assert _classify_with_wt(cmd, spoke_repo, tasks) == "ESCALATE"
 
 
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "chmod -R 777 .",  # recursively reaches .git/ and in-tree secrets
+        "rm -rf .",
+        "cp . dst",
+        "mkdir .",
+        "chmod +x ./.",  # the `/.` collapses to the root too
+    ],
+)
+def test_classify_permission_escalates_bare_dot_root_target(
+    cmd: str, spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A bare `.` (or `./.`) targets the worktree ROOT — a `chmod -R` there recursively hits
+    # .git/ internals and secret files the per-token guards never see. It must escalate: the
+    # "never target the worktree root" invariant fires only if `.` resolves to the root itself.
+    tasks = tmp_path / "tasks"
+
+    assert _classify_with_wt(cmd, spoke_repo, tasks) == "ESCALATE"
+
+
 def test_classify_permission_mutation_lane_inert_without_worktree() -> None:
     # Backward-compatible: with NO worktree argument the mutation lane is inert, so a bare
     # `mv`/`rm`/`chmod` still default-denies exactly as before (#149/#171 posture).

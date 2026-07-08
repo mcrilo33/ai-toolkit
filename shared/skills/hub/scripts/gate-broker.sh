@@ -1079,6 +1079,7 @@ _broker_resolve_in_roots() {
   while case "$abs" in */./* | *//*) true ;; *) false ;; esac; do
     abs="${abs//\/.\//$sl}"; abs="${abs//\/\//$sl}"
   done
+  abs="${abs%/.}"                                  # a trailing `/.` (bare `.` target) → the dir
   abs="${abs%/}"; [ -n "$abs" ] || abs="/"
   case "$abs" in "$wt"/.git | "$wt"/.git/*) return 1 ;; esac      # never .git internals (textual)
   case "$abs" in
