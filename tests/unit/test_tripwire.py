@@ -170,6 +170,26 @@ def test_restore_writes_labeled_reflog_entry(repo: Path) -> None:
     assert _rev(repo, "main@{1}") == rewound  # the entry points back at the pre-restore tip
 
 
+def test_restore_creates_reflog_where_none_exists(repo: Path) -> None:
+    # The #188 incident shape: reflog logging is OFF for the ref (a bare hub
+    # ref store / core.logAllRefUpdates=false), so without --create-reflog the
+    # rollback leaves NO trace at all — `-m` alone writes nothing there. The
+    # restore must create the reflog and leave the labeled entry.
+    tip = _commit(repo, {"src/a.py": "x = 1\n"})
+    _git(repo, "config", "core.logAllRefUpdates", "false")
+    _git(repo, "branch", "side")  # created with logging off — no reflog exists
+    proc = _lib(
+        repo,
+        'b="$(tripwire_capture)"\n'
+        "git update-ref refs/heads/side refs/heads/side~1\n"  # lost a commit mid-run
+        'tripwire_restore "$b"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert _rev(repo, "side") == tip  # restored to the snapshot
+    assert "tripwire: restore after aborted gate" in _git(repo, "reflog", "show", "side")
+
+
 def test_restore_skips_deleting_ref_checked_out_in_worktree(repo: Path, tmp_path: Path) -> None:
     # A ref that appeared during the run but is checked out in a registered
     # worktree is a live spoke's branch — deleting it destroys the spoke's
