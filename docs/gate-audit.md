@@ -112,7 +112,7 @@ Verdict legend: **FAIL-OPEN** = confirmed silent pass / crash-allow (filed);
 Each was verified read-only. Repros feed malformed payloads on stdin or code-trace an
 exact branch — none mutate state.
 
-### 1. jq-terminal extraction crashes guards open (exit 5)
+### 1. jq-terminal extraction crashes guards open (exit 5) — #208
 
 `secrets-scan.sh:23`, `config-protection.sh:61,90`, `hub-guard.sh:114` extract via a
 jq-terminal assignment (`EVENT=$(get_hook_event "$INPUT")` /
@@ -134,7 +134,7 @@ printf '{"tool_name":"Write","tool_input":{"file_path":"pyproject.toml","content
 (`get_edit_new_content` can only extract via jq → empty content → exit 0 → nothing
 scanned).
 
-### 2. spoke-main-guard newline bypass
+### 2. spoke-main-guard newline bypass — #209
 
 `spoke-main-guard.sh:288` normalizes `(){}` and backticks to `;` before tokenizing but
 never newlines, and (unlike rm/chmod guards) does not bail on newlines. A
@@ -151,7 +151,7 @@ printf '{"tool_name":"Bash","tool_input":{"command":"true\ngit checkout main"},"
 Multi-line Bash blocks are routine agent output, so the #32 "no checkout main in a
 spoke" invariant is practically reachable.
 
-### 3. red-proof-verify has no native backstop
+### 3. red-proof-verify has no native backstop — #210
 
 `red-proof-verify.sh` is wired **only** as a CC PreToolUse hook (`if: Bash(git commit *)`,
 `settings.json:41-45`) — it is not in the native commit-msg hook
@@ -163,7 +163,7 @@ lets the commit through, and its only output is the very trailer it was meant to
 printf 'garbage' | bash shared/hooks/red-proof-verify.sh; echo $?      # → 0 (silent pass)
 ```
 
-### 4. block-no-verify is a crash-open CC-only prefix match
+### 4. block-no-verify is a crash-open CC-only prefix match — #211
 
 `block-no-verify.sh` (`if: Bash(git * --no-verify *)`, `settings.json:26-29`) is the
 sole defense against the one flag that disarms **both** the commit-msg and pre-push
@@ -175,7 +175,7 @@ live in). Any chained/env-prefixed spelling the `if` filter misses, or a crash
 printf '{"tool_name":"Bash"}' | bash shared/hooks/block-no-verify.sh; echo $?   # → 0 (no command → pass)
 ```
 
-### 5. install-git-hooks commit-msg silently skips missing cage scripts
+### 5. install-git-hooks commit-msg silently skips missing cage scripts — #212
 
 `install-git-hooks.sh:139-143` guards each cage script with `if [ -x "$SCRIPTS/$s.sh" ]`
 and **no `else`** — a deleted or `chmod -x`'d `commit-quality.sh`/`commit-gauntlet.sh`
@@ -188,7 +188,7 @@ SCRIPTS=/nonexistent; for s in commit-quality commit-gauntlet; do
   [ -x "$SCRIPTS/$s.sh" ] && echo run || echo silently-skipped; done   # both: silently-skipped
 ```
 
-### 6. test-select: no pytest → exit 0
+### 6. test-select: no pytest → exit 0 — #213
 
 `test-select.sh:285-289`: when no pytest runner is found, `note "no pytest available —
 nothing to run"; exit 0`. A python-touching diff on a fresh checkout (no `.venv`,
@@ -202,7 +202,7 @@ exactly that empty input.
 printf '' | bash shared/hooks/test-select.sh; echo $?                  # → 0 ("empty diff")
 ```
 
-### 7. worktree-land 141-retry lane auto-degrades to TEST_SELECT_SKIP=1
+### 7. worktree-land 141-retry lane auto-degrades to TEST_SELECT_SKIP=1 — #214
 
 `worktree-lib.sh:154` treats **any** exit 141 as post-green SSH transport death, and
 `worktree-land.sh:488-492` recognizes a real pytest failure only by its printed summary
@@ -211,7 +211,7 @@ prints no summary and can exit 141 — the land then retries once with
 `TEST_SELECT_SKIP=1`, shipping a tree whose suite never finished. Loud (a warn line),
 but automatic. Code-traced; live repro would kill a pytest mid-land and is not run here.
 
-### 8. hub-notify suppresses gate/ready pings forever under stale `.afk-state`
+### 8. hub-notify suppresses gate/ready pings forever under stale `.afk-state` — #215
 
 `hub-notify.sh:58-63` gates notifications on `.afk-state` being *non-empty*, not on
 supervisor liveness. A crashed drain whose watchdog is also gone keeps suppressing every
