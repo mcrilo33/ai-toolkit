@@ -1189,6 +1189,48 @@ def test_creates_allowlist_without_hub_claude_dir(hub: Path) -> None:
         assert rule in allow, f"missing seeded rule: {rule}"
 
 
+# ── Managed runtime-artifact excludes (issue #206) ──
+#
+# The pre-push test gate writes .testmondata* (the testmon DB plus its -shm/-wal
+# WAL sidecars) at the worktree root. Without a managed exclude those untracked
+# files make `git status --porcelain` non-empty, which the #172 ready gate reads
+# as a dirty tree and refuses ready/<N> — stalling a drain on any checkout that
+# lacks a happenstance local exclude. worktree-new seeds the .testmondata* glob
+# into the worktree's git-dir info/exclude alongside the .ai-toolkit/ / .claude/
+# entries it already manages.
+
+
+def _info_exclude_path(wt: Path) -> Path:
+    """Resolve the git-dir info/exclude file for a worktree (absolute)."""
+    raw = subprocess.run(
+        ["git", "-C", str(wt), "rev-parse", "--git-path", "info/exclude"],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=_GIT_ENV,
+    ).stdout.strip()
+    p = Path(raw)
+    return p if p.is_absolute() else wt / p
+
+
+def test_seeds_testmondata_exclude(hub: Path) -> None:
+    proc = _run_new_quiet(hub, "99", "pushguard")
+
+    assert proc.returncode == 0, proc.stderr
+    lines = _info_exclude_path(_worktree_dir(hub, "99")).read_text().splitlines()
+    assert ".testmondata*" in lines, f"managed .testmondata* exclude not seeded\n{lines}"
+
+
+def test_testmondata_exclude_seeded_at_most_once(hub: Path) -> None:
+    # The exclude append is guarded by grep -qxF, so a second run (or a machine
+    # whose exclude already carries the entry) never duplicates it.
+    proc = _run_new_quiet(hub, "99", "pushguard")
+
+    assert proc.returncode == 0, proc.stderr
+    lines = _info_exclude_path(_worktree_dir(hub, "99")).read_text().splitlines()
+    assert lines.count(".testmondata*") == 1, f"duplicate .testmondata* exclude\n{lines}"
+
+
 @pytest.mark.skipif(shutil.which("jq") is None, reason="merge templating requires jq")
 def test_merges_existing_settings_local(hub: Path) -> None:
     existing = {

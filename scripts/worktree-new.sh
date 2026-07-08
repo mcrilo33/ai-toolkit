@@ -180,10 +180,15 @@ git worktree add "$WT_DIR" -b "$BRANCH" "$BASE_START"
 # on dev machines whose personal global git ignore covers .claude/ (#132).
 # The exclude entries are local to the repo's git dir, never committed, and
 # appended at most once each.
+# The `.testmondata*` glob (issue #206) covers the testmon DB the pre-push gate
+# writes AND its `-shm`/`-wal` WAL sidecars: unmanaged they read as untracked and
+# the #172 ready gate refuses ready/<N> as a dirty tree. The OTel raw-request-body
+# dumps live under .ai-toolkit/ (already excluded above), so no extra entry is
+# needed for them.
 EXCLUDE_FILE="$(git -C "$WT_DIR" rev-parse --git-path info/exclude 2>/dev/null || true)"
 if [ -n "$EXCLUDE_FILE" ]; then
   mkdir -p "$(dirname "$EXCLUDE_FILE")"
-  for entry in '.ai-toolkit/' '.claude/'; do
+  for entry in '.ai-toolkit/' '.claude/' '.testmondata*'; do
     grep -qxF "$entry" "$EXCLUDE_FILE" 2>/dev/null \
       || printf '%s\n' "$entry" >> "$EXCLUDE_FILE"
   done

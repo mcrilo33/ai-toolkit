@@ -637,6 +637,30 @@ def test_ready_accepts_review_artifact_on_tip_boundary(spoke: Path, remote: Path
     assert _remote_has_ref(remote, "refs/tags/ready/45")
 
 
+def test_ready_not_refused_by_excluded_testmondata(spoke: Path, remote: Path) -> None:
+    # Issue #206 — the pre-push test gate writes .testmondata* (its DB plus the
+    # -shm/-wal WAL sidecars) at the worktree root. With those paths in the git-dir
+    # info/exclude (managed by worktree-new / install-git-hooks), `git status
+    # --porcelain` ignores them by construction, so the #172 clean-tree precondition
+    # must NOT read them as a dirty tree and refuse ready/N.
+    info_exclude = Path(_git(spoke, "rev-parse", "--git-path", "info/exclude").strip())
+    if not info_exclude.is_absolute():
+        info_exclude = spoke / info_exclude
+    info_exclude.parent.mkdir(parents=True, exist_ok=True)
+    with info_exclude.open("a") as f:
+        f.write(".testmondata*\n")
+    (spoke / ".testmondata").write_text("db\n")
+    (spoke / ".testmondata-shm").write_text("shm\n")
+    (spoke / ".testmondata-wal").write_text("wal\n")
+
+    result = _run(spoke, "45")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remote_has_ref(remote, "refs/tags/ready/45"), (
+        "an excluded artifact must not block ready/N"
+    )
+
+
 def test_ready_force_bypasses_preconditions(spoke: Path, remote: Path) -> None:
     shutil.rmtree(spoke / ".review")  # precondition 3 would refuse
     (spoke / "work.txt").write_text("dirty\n")  # precondition 1 would refuse too

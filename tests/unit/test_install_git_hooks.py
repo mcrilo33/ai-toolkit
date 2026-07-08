@@ -315,6 +315,42 @@ def test_commit_msg_gate_blocks_non_conventional_message(repo: Path) -> None:
     assert _git(repo, "rev-parse", "HEAD").strip() == seed  # nothing committed
 
 
+# ── Managed runtime-artifact excludes (issue #206) ──
+#
+# The pre-push test gate writes .testmondata* (plus its -shm/-wal WAL sidecars)
+# and, under AI_TOOLKIT_OTEL, per-run OTel artifacts under .ai-toolkit/. On an
+# EXISTING checkout without a committed .gitignore for these, the untracked files
+# make `git status --porcelain` non-empty and the #172 ready gate refuses
+# ready/<N>. worktree-new seeds these into a spoke worktree; the installer does
+# the same for an existing checkout (the hub, or a pre-#206 worktree).
+
+
+def _info_exclude_lines(repo: Path) -> list[str]:
+    raw = _git(repo, "rev-parse", "--git-path", "info/exclude").strip()
+    p = Path(raw)
+    if not p.is_absolute():
+        p = repo / p
+    return p.read_text().splitlines() if p.exists() else []
+
+
+def test_seeds_runtime_artifact_excludes(repo: Path) -> None:
+    _install(repo)
+
+    lines = _info_exclude_lines(repo)
+    assert ".testmondata*" in lines, f".testmondata* not seeded into info/exclude\n{lines}"
+    assert ".ai-toolkit/" in lines, f".ai-toolkit/ not seeded into info/exclude\n{lines}"
+
+
+def test_runtime_artifact_excludes_seeded_at_most_once(repo: Path) -> None:
+    # A repeat install (routine after a hook change) must not duplicate entries.
+    _install(repo)
+    _install(repo)
+
+    lines = _info_exclude_lines(repo)
+    assert lines.count(".testmondata*") == 1, f"duplicate .testmondata* exclude\n{lines}"
+    assert lines.count(".ai-toolkit/") == 1, f"duplicate .ai-toolkit/ exclude\n{lines}"
+
+
 def test_telemetry_lib_copied_and_utils_sources_clean(repo: Path) -> None:
     # utils.sh sources lib/telemetry.sh unconditionally; an install without it
     # ships hooks that die at source-time with every push blocked (the

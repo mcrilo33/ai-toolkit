@@ -223,6 +223,26 @@ install_hook() {
 install_hook commit-msg emit_commit_msg_hook
 install_hook pre-push  emit_pre_push_hook
 
+# --- managed runtime-artifact excludes (issue #206) --------------------------
+# The pre-push test gate writes .testmondata* (the testmon DB plus its -shm/-wal
+# WAL sidecars), and under AI_TOOLKIT_OTEL per-run OTel artifacts land under
+# .ai-toolkit/. On a checkout without a committed .gitignore for these, the
+# untracked files make `git status --porcelain` non-empty, which the #172 ready
+# gate reads as a dirty tree and refuses ready/<N> — stalling a drain.
+# worktree-new.sh already seeds these into a spoke worktree's info/exclude; do the
+# same here for an EXISTING checkout (the hub, or a pre-#206 worktree). The
+# entries are local to the git dir, never committed, and appended at most once.
+EXCLUDE_FILE="$(git -C "$TARGET" rev-parse --git-path info/exclude 2>/dev/null || true)"
+if [ -n "$EXCLUDE_FILE" ]; then
+  case "$EXCLUDE_FILE" in /*) ;; *) EXCLUDE_FILE="$TARGET/$EXCLUDE_FILE" ;; esac
+  mkdir -p "$(dirname "$EXCLUDE_FILE")"
+  for entry in '.testmondata*' '.ai-toolkit/'; do
+    grep -qxF "$entry" "$EXCLUDE_FILE" 2>/dev/null \
+      || printf '%s\n' "$entry" >> "$EXCLUDE_FILE"
+  done
+  info "Seeded runtime-artifact excludes (.testmondata*, .ai-toolkit/) into info/exclude"
+fi
+
 echo ""
 info "ai-toolkit cage installed as native git hooks in $TARGET"
 warn "Blocking gates (commit-quality, commit-gauntlet) now enforce on real git commit."
