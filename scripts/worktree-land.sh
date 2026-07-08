@@ -112,7 +112,7 @@ HUB_BRANCH="$(git symbolic-ref --short -q HEAD || true)"
 # It NEVER re-merges or re-pushes. Returns 1 (no-op) when no resume signal exists, so
 # the caller aborts exactly as before.
 land_resume_finalize() {
-  local target="$1" issue marker_sha br br_tip state sess win name path
+  local target="$1" issue marker_sha fetch_ok br br_tip state sess win name path
   [[ "$target" =~ ^[0-9]+$ ]] || return 1
   issue="$target"
   marker_sha="$(git rev-parse -q --verify "refs/tags/ready/${issue}^{commit}" 2>/dev/null || true)"
@@ -121,8 +121,12 @@ land_resume_finalize() {
 
   wt_warn "issue #$issue shipped (ready/$issue at ${marker_sha:0:9} is merged into $DEFAULT) but its teardown left residue — cleaning it up (issue #151)"
 
-  # Refresh remote state so the merged-remote guard below is honest (best-effort).
-  git fetch origin --quiet 2>/dev/null || true
+  # Refresh remote state so the merged-remote guard below is honest. The land
+  # itself stays best-effort, but a FAILED fetch disarms the remote delete below
+  # (issue #195): the merged-remote check would otherwise pass on a stale
+  # tracking ref while the real remote holds commits the hub never fetched.
+  fetch_ok=1
+  git fetch origin --quiet 2>/dev/null || fetch_ok=""
 
   # Prune ONLY the exact branch that shipped: its tip IS the merged marker commit, so a
   # same-numbered but unrelated branch is never touched. `git branch -d` is merged-only;
@@ -134,8 +138,11 @@ land_resume_finalize() {
     [ "$br_tip" = "$marker_sha" ] || continue
     if git branch -d "$br" >/dev/null 2>&1; then
       echo "✓ pruned merged branch $br"
-      if git merge-base --is-ancestor "refs/remotes/origin/$br" "$DEFAULT" 2>/dev/null; then
-        wt_git_push origin --delete "$br" >/dev/null 2>&1 || true
+      if [ -z "$fetch_ok" ]; then
+        wt_warn "fetch failed — kept remote origin/$br (its merged-ness can't be verified against stale remote state, issue #195); once origin is reachable, delete it by hand if it still exists: git push origin --delete $br"
+      elif git merge-base --is-ancestor "refs/remotes/origin/$br" "$DEFAULT" 2>/dev/null; then
+        wt_git_push origin --delete "$br" >/dev/null 2>&1 \
+          || wt_warn "couldn't delete remote origin/$br — delete it by hand: git push origin --delete $br"
       else
         wt_warn "kept remote origin/$br — it has commits not in $DEFAULT; reconcile it by hand"
       fi
@@ -213,8 +220,17 @@ else
 fi
 
 if [ -z "$LOCAL" ]; then
+  # A failed fetch is FATAL, not a warning (issue #195): the ahead/behind guards
+  # below would otherwise run against the LAST-KNOWN origin/<branch> — a spoke
+  # push the hub never fetched reads behind=0, the land proceeds, and teardown
+  # deletes origin/<branch> with the remote-only commits. Destructive decisions
+  # never run on stale remote state. One immediate retry absorbs a transient
+  # blip (the #119 SSH-staleness class — a fresh short connection usually
+  # clears it) so an unattended /afk land isn't escalated blocked/<N> over a
+  # moment of network noise; a real outage still dies.
   git fetch origin --quiet 2>/dev/null \
-    || wt_warn "fetch failed — ahead/behind checks use the last-known remote state"
+    || git fetch origin --quiet 2>/dev/null \
+    || wt_die "fetch from origin failed — refusing to land on last-known remote state (a spoke push this checkout never fetched would be silently pruned). Restore connectivity and re-run."
   # Upstream guards: the spoke's push is its ship gate.
   UPSTREAM="$(git rev-parse --symbolic-full-name "${WT_BRANCH}@{upstream}" 2>/dev/null || true)"
   [ -n "$UPSTREAM" ] || wt_die "branch $WT_BRANCH has never been pushed — the spoke's push is its ship gate"

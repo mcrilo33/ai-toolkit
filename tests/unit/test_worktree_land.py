@@ -240,6 +240,23 @@ def _log_text(log: Path) -> str:
     return log.read_text() if log.exists() else ""
 
 
+def _fetch_fail_git_shim(tmp_path: Path) -> None:
+    """PATH-front `git` shim: every `git fetch` dies (the network-down/stale-SSH
+    shape, issue #195); everything else delegates to the real git. Written into
+    the same bindir _run_land prepends to PATH."""
+    real_git = shutil.which("git")
+    assert real_git is not None
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    shim = bindir / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = fetch ]; then echo "fatal: unable to access origin (stubbed)" >&2; exit 128; fi\n'
+        f'exec "{real_git}" "$@"\n'
+    )
+    shim.chmod(0o755)
+
+
 # --- happy path ----------------------------------------------------------------
 
 
@@ -392,6 +409,25 @@ def test_refuses_spoke_behind_upstream(hub: Path, tmp_path: Path) -> None:
     assert "behind" in proc.stderr.lower()
     assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha
     assert _remote_sha(hub, "feature/1-behind") != ""  # remote ref untouched
+
+
+def test_fetch_failure_aborts_land_before_merge(hub: Path, tmp_path: Path) -> None:
+    # Issue #195: on a failed fetch the ahead/behind guards run against the
+    # LAST-KNOWN origin/<branch> — a spoke push the hub never fetched reads
+    # behind=0, the land proceeds, and teardown later deletes the remote ref
+    # with its commits. Stale remote state must never feed that destructive
+    # chain: the land aborts before any merge instead of warning and going on.
+    wt = _make_spoke(hub, tmp_path, "feature/1-fetchdead", push=True, ready=True)
+    pre_sha = _git(hub, "rev-parse", "HEAD").strip()
+    _fetch_fail_git_shim(tmp_path)
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode != 0
+    assert "fetch" in proc.stderr.lower()
+    assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha  # nothing merged
+    assert wt.exists()  # no teardown
+    assert _remote_sha(hub, "feature/1-fetchdead") != ""  # remote ref untouched
 
 
 def test_merge_conflict_aborts_cleanly(hub: Path, tmp_path: Path) -> None:
@@ -1635,3 +1671,32 @@ def test_reland_does_not_reclose_done_issue_with_lingering_marker(
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "issue close 1" not in _log_text(logs["gh"]), "a CLOSED issue must not be re-closed"
     assert "ready/1" not in _local_tags(hub), "the stale marker is still cleaned up"
+
+
+def test_reland_finalize_fetch_failure_skips_remote_delete(hub: Path, tmp_path: Path) -> None:
+    # Issue #195: the finalize's merged-remote guard is only honest right after a
+    # SUCCESSFUL fetch. Model the hazard: the spoke pushed one more commit after
+    # the hub's last fetch (the stale tracking ref still sits at the merged
+    # marker), then the resume-finalize runs with fetch dead. The stale ref would
+    # pass the ancestor check and the delete would destroy the remote-only
+    # commit — a failed fetch must skip the remote delete, loudly, while the
+    # local prune (git branch -d, merged-only, safe) still runs.
+    wt = _make_spoke(hub, tmp_path, "feature/1-wtgone", push=True, ready=True)
+    marker_sha = _git(hub, "rev-parse", "feature/1-wtgone").strip()
+    _complete_ship(hub, "feature/1-wtgone")
+    (wt / "late.txt").write_text("pushed after the hub's last fetch\n")
+    _git(wt, "add", "late.txt")
+    _git(wt, "commit", "-qm", "feat: late", "-m", "Refs #1")
+    _git(wt, "push", "-q", "origin", "feature/1-wtgone")
+    _git(wt, "reset", "-q", "--hard", marker_sha)  # local branch back at the marker
+    # The hub never fetched the late push: rewind the shared tracking ref to the marker.
+    _git(hub, "update-ref", "refs/remotes/origin/feature/1-wtgone", marker_sha)
+    _git(hub, "worktree", "remove", str(wt))
+    _fetch_fail_git_shim(tmp_path)
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "feature/1-wtgone" not in _local_branches(hub), "local prune still runs"
+    assert _remote_sha(hub, "feature/1-wtgone") != "", "the remote-only commit survives"
+    assert "origin/feature/1-wtgone" in proc.stderr, "the skipped delete is loud"

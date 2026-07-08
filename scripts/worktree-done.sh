@@ -228,6 +228,29 @@ prune_branch() {
   fi
   echo "  pruned merged branch $WT_BRANCH."
   if git show-ref --verify --quiet "refs/remotes/origin/$WT_BRANCH"; then
+    # Defense-in-depth (issue #195): the ancestor proof above is about the LOCAL
+    # branch — the remote ref may hold commits this checkout never fetched, and
+    # deleting it would be the silent data-loss the land guards exist to stop.
+    # Refresh the remote state (one retry for a transient blip, the #119 class;
+    # --prune so a remote branch already deleted collapses its tracking ref
+    # instead of feeding the checks below as a stale ghost) and require the
+    # freshly-fetched remote ref itself to be merged; a failed fetch skips the
+    # delete loudly — stale remote state never feeds it.
+    if ! git fetch origin --prune --quiet 2>/dev/null && ! git fetch origin --prune --quiet 2>/dev/null; then
+      wt_warn "fetch failed — kept remote origin/$WT_BRANCH (its merged-ness can't be verified against stale remote state, issue #195); once origin is reachable, delete it by hand if it still exists: git push origin --delete \"$WT_BRANCH\""
+      return
+    fi
+    if ! git show-ref --verify --quiet "refs/remotes/origin/$WT_BRANCH"; then
+      return  # the fetch pruned it — the remote branch is already gone, nothing to delete
+    fi
+    # Merged-ness of the remote ref, against the local base or — when this
+    # checkout's base is behind — the freshly-fetched origin/<base>, where a
+    # concurrent hub may have integrated the spoke's late push just as durably.
+    if ! git merge-base --is-ancestor "refs/remotes/origin/$WT_BRANCH" "$base_branch" 2>/dev/null \
+       && ! git merge-base --is-ancestor "refs/remotes/origin/$WT_BRANCH" "refs/remotes/origin/$base_branch" 2>/dev/null; then
+      wt_warn "kept remote origin/$WT_BRANCH — it has commits not in $base_branch; reconcile it by hand"
+      return
+    fi
     if wt_git_push origin --delete "$WT_BRANCH" >/dev/null 2>&1; then
       echo "  deleted origin/$WT_BRANCH."
     else
