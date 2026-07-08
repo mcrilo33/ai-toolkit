@@ -1170,9 +1170,8 @@ inject_answer() {
 }
 
 # _answer_needle <text> -> the shared delivery needle: the first ~40 chars of the
-# answer's first line. One derivation feeds every delivery proof (_composer_shows_text,
-# _composer_released, _answer_appended) so the pane and transcript checks can never
-# grep diverging strings.
+# answer's first line. One derivation feeds both delivery proofs (_composer_shows_text,
+# _answer_appended) so the pane and transcript checks can never grep diverging strings.
 _answer_needle() {
   local needle="${1%%$'\n'*}"
   printf '%s\n' "${needle:0:40}"
