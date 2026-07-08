@@ -760,3 +760,119 @@ def test_no_spool_when_heartbeat_pid_is_dead(spoke: Path, tmp_path: Path) -> Non
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert not (state / "events").exists(), "a dead heartbeat pid => nothing to wake, no spool"
+
+
+# ── The marker push: SSH keepalive + retry-once on transport death (issue #184) ──
+# On the --ready path the tag push runs seconds after the branch push's ~6-minute
+# in-push gate staled the SSH connection (issue #119): a bare `git push -f` died in
+# the transfer phase (exit 141 / SIGPIPE), so the branch landed but the spoke never
+# announced itself and the drain stalled. The ONE push line all four marker kinds
+# share must (a) route through wt_git_push so GIT_SSH_COMMAND carries ServerAlive*
+# keepalive options, and (b) mirror worktree-land's second line of defense: retry
+# EXACTLY once when a failed attempt is demonstrably a TRANSPORT death — a
+# non-transport failure (hook/policy rejection) must NOT be retried.
+
+KEEPALIVE_OPTS = "-o ServerAliveInterval=15 -o ServerAliveCountMax=40"
+
+
+def _install_git_shim(tmp_path: Path, *, fail_first_push: str | None = None) -> tuple[Path, Path]:
+    """A PATH-front ``git`` logging GIT_SSH_COMMAND + argv per push, then delegating.
+
+    With ``fail_first_push``, the FIRST ``git push`` invocation fails instead of
+    delegating: ``"transport"`` simulates a stale-SSH transport death (exit 141,
+    the post-gate SIGPIPE shape of issue #119); ``"rejected"`` a hook/policy
+    rejection (exit 1, no transport signature). Every later push delegates to the
+    real git, so a retried push still lands on the hermetic bare origin.
+    """
+    real_git = shutil.which("git")
+    assert real_git is not None
+    bindir = tmp_path / "shim-bin"
+    bindir.mkdir()
+    log = tmp_path / "push-invocations.log"
+    marker = tmp_path / "first-push-done"
+    fail_snippet = ""
+    if fail_first_push == "transport":
+        fail_snippet = (
+            f'  if [ ! -f "{marker}" ]; then\n'
+            f'    touch "{marker}"\n'
+            '    echo "client_loop: send disconnect: Broken pipe" >&2\n'
+            "    exit 141\n"
+            "  fi\n"
+        )
+    elif fail_first_push == "rejected":
+        fail_snippet = (
+            f'  if [ ! -f "{marker}" ]; then\n'
+            f'    touch "{marker}"\n'
+            '    echo "remote: rejected by policy" >&2\n'
+            "    exit 1\n"
+            "  fi\n"
+        )
+    shim = bindir / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = push ]; then\n'
+        f'  echo "GIT_SSH_COMMAND=[$GIT_SSH_COMMAND] $*" >> "{log}"\n'
+        f"{fail_snippet}"
+        "fi\n"
+        f'exec "{real_git}" "$@"\n'
+    )
+    shim.chmod(0o755)
+    return log, bindir
+
+
+def _run_with_shim(repo: Path, bindir: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    env.pop("GIT_SSH_COMMAND", None)
+    return subprocess.run(
+        ["bash", str(SPOKE_READY), *args],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+@pytest.mark.parametrize(
+    "args,tag",
+    [
+        pytest.param(("45",), "ready/45", id="ready"),
+        pytest.param(("--blocked", "45"), "blocked/45", id="blocked"),
+    ],
+)
+def test_marker_push_carries_keepalive_ssh_command(
+    spoke: Path, remote: Path, tmp_path: Path, args: tuple[str, ...], tag: str
+) -> None:
+    log, bindir = _install_git_shim(tmp_path)
+
+    result = _run_with_shim(spoke, bindir, *args)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remote_has_ref(remote, f"refs/tags/{tag}")
+    recorded = log.read_text()
+    assert f"GIT_SSH_COMMAND=[ssh {KEEPALIVE_OPTS}] push -f origin {tag}" in recorded
+
+
+def test_marker_push_retries_once_on_transport_death(
+    spoke: Path, remote: Path, tmp_path: Path
+) -> None:
+    log, bindir = _install_git_shim(tmp_path, fail_first_push="transport")
+
+    result = _run_with_shim(spoke, bindir, "45")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _remote_has_ref(remote, "refs/tags/ready/45"), "the retried push must land the marker"
+    pushes = log.read_text().splitlines()  # the shim logs one line per `git push`
+    assert len(pushes) == 2, f"a transport death must be retried exactly once, saw {pushes}"
+
+
+def test_marker_push_not_retried_on_rejection(spoke: Path, remote: Path, tmp_path: Path) -> None:
+    # Only a demonstrable transport death earns the retry: a hook/policy rejection
+    # must fail the emission on the first attempt, not be blindly re-pushed.
+    log, bindir = _install_git_shim(tmp_path, fail_first_push="rejected")
+
+    result = _run_with_shim(spoke, bindir, "45")
+
+    assert result.returncode != 0, "a rejected push must fail the emission"
+    assert not _remote_has_ref(remote, "refs/tags/ready/45")
+    pushes = log.read_text().splitlines()
+    assert len(pushes) == 1, f"a non-transport failure must NOT be retried, saw {pushes}"
