@@ -236,6 +236,54 @@ def test_inject_and_verify_registers_when_transcript_advances(
     assert result.stdout.strip().splitlines()[-1] == "RC=0", result.stdout + result.stderr
 
 
+def test_inject_and_verify_rejects_advance_while_needle_still_in_pane(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    """#201: a non-turn write bumps the newest jsonl while the paste sits unsubmitted.
+
+    Transcript-advance alone must never score the delivery as success: the needle is
+    still in the composer (and was NOT there pre-inject), so the injector must fall
+    through to the bare-Enter retry and classify the surviving paste as wedged (rc 2)
+    — never rc 0 ("injected answer into #182" while the spoke sat parked 25+ min).
+    """
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    jsonl.write_text("{}\n")
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+    sidecar = pd / "sidecar.jsonl"  # the #182 mystery non-turn writer
+    pasted = tmp_path / "pasted"
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    # Fake tmux: the paste wedges in the composer (state file) while a NON-TURN write
+    # bumps the project dir's newest jsonl; every Enter is swallowed (the #123/#124
+    # unterminated-paste state) and capture-pane keeps showing the answer — the
+    # composer never lets go.
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        "  send-keys)\n"
+        f'    case "$*" in *" -l "*) touch "{pasted}"; printf "{{}}\\n" >> "{sidecar}" ;; esac ;;\n'
+        "  capture-pane)\n"
+        f'    [ -e "{pasted}" ] && echo "Approved — proceed with the plan." ;;\n'
+        "esac\nexit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+
+    result = _call(
+        f"inject_and_verify '{spoke_repo}' afk:1 'Approved — proceed with the plan.'; echo RC=$?",
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "AFK_INJECT_MENU_PAUSE": "0",
+            "AFK_INJECT_VERIFY_SECONDS": "0",
+        },
+    )
+
+    assert result.stdout.strip().splitlines()[-1] == "RC=2", result.stdout + result.stderr
+
+
 # ── subtask B: read-only-worktree reasoner + evidence + mutation guard ─────────
 
 
