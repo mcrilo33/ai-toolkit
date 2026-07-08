@@ -848,6 +848,69 @@ def test_unmapped_shell_change_escalates_to_full(repo: Path, tmp_path: Path) -> 
     assert "RUN \n" in _runlog(runlog)  # the full suite, not a selection
 
 
+def test_unmapped_shell_change_emits_witness_warning(repo: Path, tmp_path: Path) -> None:
+    # #191 witness signal (feeds #187's fail-open audit): a changed *.sh that no
+    # test references is a bash blind spot — testmon tracks python imports only, so
+    # nothing re-exercises the script by subprocess/source. It still escalates to
+    # FULL, but the gate must emit a distinct, greppable warning that names it.
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")  # tests/ exists, refs do.sh only
+    base = _commit(repo, {}, "test: seed referencing tests")
+    tip = _commit(repo, {"scripts/new.sh": "echo new\n"})  # unmapped shell change
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN \n" in _runlog(runlog)  # conservative fallback: FULL still runs
+    assert "witness: unmapped-shell" in proc.stderr  # the greppable audit signal …
+    assert "scripts/new.sh" in proc.stderr  # … naming the offending script
+
+
+def test_mapped_shell_change_emits_no_witness_warning(repo: Path, tmp_path: Path) -> None:
+    # A *.sh WITH a referencing test is not a blind spot — no witness warning.
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
+    tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "witness: unmapped-shell" not in proc.stderr
+
+
+def test_unmapped_nonshell_change_emits_no_shell_witness(repo: Path, tmp_path: Path) -> None:
+    # The witness is scoped to shell: an unmapped .yml escalates to FULL but is not
+    # the testmon-blind bash blind spot, so it must not raise the shell signal.
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
+    tip = _commit(repo, {"ci/build.yml": "on: push\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "witness: unmapped-shell" not in proc.stderr
+
+
+def test_exempt_shell_change_emits_no_witness_warning(repo: Path, tmp_path: Path) -> None:
+    # An exempt shell script has intentionally no test surface — it skips the suite
+    # entirely and must not raise the blind-spot witness.
+    _commit(repo, {".test-select-exempt": "scripts/\n"}, "chore: exempt scripts")
+    base = _rev(repo)
+    tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "witness: unmapped-shell" not in proc.stderr
+
+
 def test_mixed_mapped_and_unmapped_escalates_to_full(repo: Path, tmp_path: Path) -> None:
     _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
     base = _commit(repo, {}, "test: seed referencing tests")
