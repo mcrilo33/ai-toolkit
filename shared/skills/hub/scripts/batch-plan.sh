@@ -43,6 +43,13 @@
 #     ACROSS two separate chains — which #125 never pairs — is still surfaced, so
 #     nothing is double-reported yet nothing real is dropped. Same detection-only /
 #     `Split: intentional` semantics.
+#   * SCOPELESS-READY WARNING (issue #217) — a MISSING `Scope:` line marks an issue
+#     exclusive (runs alone), correct fail-closed semantics but silent, so a batch of
+#     scope-less issues can serialize a whole drain unnoticed. This names each READY
+#     issue with no `Scope:` line on STDERR (`#N has no Scope: line — treated
+#     exclusive`) so the serialization is diagnosable from the plan log. `Scope: *` is
+#     a deliberate exclusive and stays silent — only the accidental missing line is
+#     flagged. Detection-only: the batch, exit code, and dispatch are untouched.
 #
 # Read-only. Run on the hub (main checkout). Functions are source-guarded so the unit
 # tests can drive `plan_from_json` with a fixture graph without any network round-trip.
@@ -169,6 +176,19 @@ def scope_of(body):
     if not tokens or "*" in tokens:
         return None  # `Scope: *` ⇒ exclusive
     return set(tokens)
+
+
+def scope_line_missing(body):
+    """True when the body carries NO `Scope:` line at all.
+
+    Distinct from `Scope: *`: both are exclusive (scope_of ⇒ None), but a MISSING
+    line is the accidental case worth flagging (issue #217), while `*` is a deliberate
+    exclusive that stays silent.
+    """
+    for raw in (body or "").splitlines():
+        if raw.strip().lower().startswith("scope:"):
+            return False
+    return True
 
 
 def has_split_marker(body):
@@ -357,6 +377,28 @@ def print_unchained_merge_candidates(issues, ready_nums, flagged_components):
         )
 
 
+def print_scopeless_ready(issues, ready_nums):
+    """Warn on stderr for each ready issue with NO `Scope:` line (issue #217).
+
+    A missing `Scope:` line marks the issue exclusive (runs alone, never batched) —
+    correct fail-closed semantics, but silent, so a whole drain can serialize on a
+    batch of scope-less issues before a human notices (the two 2026-07-08 batches that
+    motivated this). Naming each ready scope-less issue makes that serialization
+    diagnosable from the plan log (the no-silent-caps rule). `Scope: *` is a DELIBERATE
+    exclusive and stays silent — only the accidental missing-line case is flagged.
+
+    Detection-only: prints to stderr, never touches the batch, the exit code, or which
+    issues dispatch.
+    """
+    for num in sorted(ready_nums):
+        if issues[num]["scope_missing"]:
+            print(
+                f"⚠ #{num} has no Scope: line — treated exclusive (runs alone) — "
+                "add a concrete Scope: line so it can batch",
+                file=sys.stderr,
+            )
+
+
 def is_glob(token):
     """True when a scope token carries glob metacharacters (not a concrete path)."""
     return any(ch in token for ch in "*?[")
@@ -464,6 +506,7 @@ def main():
         issues[num] = {
             "number": num,
             "scope": scope_of(node.get("body")),
+            "scope_missing": scope_line_missing(node.get("body")),
             "split": has_split_marker(node.get("body")),
             "blockers": blockers,
             "hold": "hold" in labels,
@@ -548,6 +591,7 @@ def main():
     ready_nums = {info["number"] for info in ready}
     print_unchained_merge_candidates(issues, ready_nums, flagged_components)
     print_undeclared_dependencies(issues, children, os.environ.get("_BATCH_REPO_ROOT", ""))
+    print_scopeless_ready(issues, ready_nums)
 
 
 main()
