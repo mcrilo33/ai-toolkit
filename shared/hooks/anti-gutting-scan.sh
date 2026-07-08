@@ -7,25 +7,36 @@
 #
 #   * ATTENDED it is advisory everywhere — findings print to stderr, exit 0 — so a
 #     human's ordinary test edit is never gated.
-#   * UNATTENDED (/afk armed — the UNATTENDED env, the supervisor's
-#     `ai-toolkit-afk/unattended` marker (#74), or a non-empty `.afk-state`, all
-#     under the git common dir every spoke worktree shares) it fails CLOSED on the
-#     SHIP paths: a finding on a branch ref or `refs/tags/ready/*` blocks the push,
-#     because no human is watching for a test-gutting diff.
-#   * The ESCALATION markers `refs/tags/blocked/*` and `refs/tags/gate/*` are EXEMPT
-#     from blocking in every context (findings still print for the log). This
-#     ordering is the invariant the whole hub-and-spoke liveness model rests on: the
-#     exact spoke whose diff needs a human decision ("my diff reduces assertions —
-#     is that legit?") must always be able to announce it, or the tripwire deadlocks
-#     the escalation channel and the drain sees a silent, stuck spoke instead of a
-#     blocked/ ping — the same principle as spoke-ready's blocked/+gate/ exemption
-#     from the upstream guard (#103). The exemption is PER-REF: a mixed push
-#     carrying a gated ref alongside a marker still blocks (git pre-push is
+#   * UNATTENDED (/afk armed — the UNATTENDED env set truthy, or the supervisor's
+#     `ai-toolkit-afk/unattended` marker (#74) under the git common dir every spoke
+#     worktree shares) it fails CLOSED on the SHIP paths: a finding on a branch ref
+#     or `refs/tags/ready/*` blocks the push, because no human is watching for a
+#     test-gutting diff. Deliberately NOT read: hub-afk's `.afk-state` window file —
+#     it conflates "a drain is armed" with "THIS push is unattended", so a stale or
+#     live drain window would hard-block the hub operator's own attended pushes
+#     with no bypass. Arming is the supervisor's explicit act (see #187's
+#     enforcement audit for restoring the producer, removed with #143).
+#   * Every OTHER tag is EXEMPT from blocking in every context (findings still
+#     print for the log). The escalation markers `refs/tags/blocked/*` and
+#     `refs/tags/gate/*` are the point: the exact spoke whose diff needs a human
+#     decision ("my diff reduces assertions — is that legit?") must always be able
+#     to announce it, or the tripwire deadlocks the escalation channel and the
+#     drain sees a silent, stuck spoke instead of a blocked/ ping — the same
+#     principle as spoke-ready's blocked/+gate/ exemption from the upstream guard
+#     (#103). `refs/tags/accept/*` parks finished work for a human EYEBALL — the
+#     human is the gate — and a foreign tag (a consumer repo's v1.2.3) carries no
+#     hub semantics; neither ships code, because the code only moves on the gated
+#     branch push. `refs/tags/ready/*` alone stays gated: it is auto_land's trust
+#     basis, the trigger for an unattended land. The exemption is PER-REF: a mixed
+#     push carrying a gated ref alongside a marker still blocks (git pre-push is
 #     all-or-nothing), so escalation markers are pushed alone.
 #
 # It reads git's pre-push stdin (`<lref> <lsha> <rref> <rsha>` lines) exactly like
 # test-select.sh, resolving the range `rsha..lsha` (a new ref with an all-zero
-# remote sha falls back to the merge-base with the default branch).
+# remote sha falls back to the merge-base with the default branch). Classification
+# keys on the REMOTE ref — the ref the push actually updates — so a refspec push
+# (`git push origin <local>:<remote>`) cannot smuggle a gutting diff onto a branch
+# under an escalation-tag local name.
 #
 # Signatures (a clean RED->GREEN diff only ADDS real assertions, so these stand out):
 #   * any *.py: an added `sys.exit(0)` / `sys.exit()` / `os._exit(...)` — a hard
@@ -69,14 +80,16 @@ default_branch() {
 DEFAULT="$(default_branch)"
 
 # Resolve the range(s) to scan from the pushed refs. Each entry is "<mode> <range>":
-# `exempt` for the escalation markers (blocked/<N>, gate/<N> — never block, #193),
-# `gated` for every ship path (branches, ready/<N>, any other ref — fail closed
-# under unattended).
+# `gated` for the ship paths — branches, ready/<N>, any non-tag ref — which fail
+# closed under unattended; `exempt` for every other tag (escalation markers
+# blocked/<N> + gate/<N>, the accept/<N> eyeball park, foreign tags — never block,
+# #193). The mode keys on the REMOTE ref (`rref`), the ref this push updates.
 RANGES=()
-while read -r _lref lsha _rref rsha; do
+while read -r _lref lsha rref rsha; do
   [ -n "${lsha:-}" ] || continue
-  case "$_lref" in
-    refs/tags/blocked/*|refs/tags/gate/*) mode=exempt ;;
+  case "${rref:-}" in
+    refs/tags/ready/*) mode=gated ;;
+    refs/tags/*) mode=exempt ;;
     *) mode=gated ;;
   esac
   is_zero_sha "$lsha" && continue   # deleting a ref — nothing added
@@ -149,15 +162,16 @@ done
   for f in "${FINDINGS[@]}"; do echo "  • $f"; done
 } >&2
 
-# is_unattended — an /afk drain is armed and no human is watching (#74/#193): the
-# UNATTENDED env, the supervisor's dedicated marker, or hub-afk.sh's non-empty
-# `.afk-state` window file, both under the git common dir every spoke worktree shares.
+# is_unattended — an /afk drain armed the tripwire and no human is watching
+# (#74/#193): a truthy UNATTENDED env (0/false/empty mean attended), or the
+# supervisor's dedicated marker under the git common dir every spoke worktree
+# shares. Arming is an explicit act — see the header for why `.afk-state` is not
+# read here.
 is_unattended() {
-  [ -n "${UNATTENDED:-}" ] && return 0
+  case "${UNATTENDED:-}" in ""|0|false) ;; *) return 0 ;; esac
   local common
   common="$(git rev-parse --git-common-dir 2>/dev/null)" || return 1
-  [ -f "$common/ai-toolkit-afk/unattended" ] && return 0
-  [ -s "$common/.afk-state" ]
+  [ -f "$common/ai-toolkit-afk/unattended" ]
 }
 
 # Fail CLOSED only on a SHIP-path finding under an unattended drain. Escalation-marker
