@@ -1007,6 +1007,51 @@ def test_next_batch_skill_documents_dispatch() -> None:
     assert "worktree-new.sh" in skill, "the skill must dispatch via worktree-new.sh"
 
 
+# ── doc guards: every filed issue carries Scope:/Gate: (issue #217) ────────────
+# Both the footer convention (author-facing skill docs) and its rule home
+# (issue-hygiene) must teach `Scope:` + `Gate:` with their semantics, so the
+# missing-scope silent-serialization that motivated #217 stops being tribal knowledge.
+
+
+def test_github_issues_templates_show_scope_and_gate_footer() -> None:
+    # The issue templates are where bodies get authored — they must show BOTH footer
+    # lines with semantics, not just Scope:.
+    templates = (SKILLS_DIR / "github-issues" / "references" / "templates.md").read_text()
+
+    assert "Scope:" in templates, "templates must show the Scope: footer line"
+    assert "Gate:" in templates, "templates must show the Gate: footer line"
+    assert "none" in templates and "plan" in templates, (
+        "the Gate: semantics (none | plan) must be spelled out"
+    )
+    assert "exclusive" in templates, "the Scope: exclusivity semantics must be spelled out"
+
+
+def test_start_task_shows_scope_and_gate_footer() -> None:
+    # start-task's issue-drafting step must carry both footer lines with semantics.
+    skill = (SKILLS_DIR / "start-task" / "SKILL.md").read_text()
+
+    assert "Gate:" in skill and "Scope:" in skill, "start-task must show both footer lines"
+    assert "exclusive" in skill, "start-task must spell out the missing ⇒ exclusive semantics"
+
+
+def test_issue_hygiene_documents_gate_line() -> None:
+    # The issue-filing conventions rule must document the Gate: line, not only Scope:.
+    rule = (REPO_ROOT / "shared" / "rules" / "issue-hygiene.md").read_text()
+
+    assert "Gate:" in rule, "issue-hygiene must document the Gate: line"
+
+
+def test_issue_hygiene_requires_programmatic_filers_to_emit_scope_gate() -> None:
+    # Audits / workflows that file issues in bulk are exactly the paths that shipped
+    # scope-less issues (#183-#200, #208-#215); the rule must require them to emit
+    # Scope:/Gate: too.
+    rule = (REPO_ROOT / "shared" / "rules" / "issue-hygiene.md").read_text()
+
+    assert "programmatically" in rule, (
+        "the rule must require programmatic filers to emit Scope:/Gate:"
+    )
+
+
 # ── doc guards: blocked-by is a checked step at creation (issue #148) ──────────
 
 
