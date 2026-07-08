@@ -290,6 +290,13 @@ ALLOW_RULES=(
   "Bash(git add:*)"
   "Bash(git reset)" "Bash(git reset -q)"
   "Bash(git reset HEAD:*)" "Bash(git reset -q HEAD:*)"
+  # Hub-root READ access (#181) — a spoke routinely studies hub scripts/hooks OUTSIDE its
+  # own worktree (e.g. reading the hub's .git/hooks/pre-push to understand the push cage),
+  # a write-free research read that otherwise fires a permission dialog and, unattended,
+  # escalates to blocked/<N>. READ-only and scoped to the hub root subtree — never Edit/Write
+  # (a spoke must never mutate the hub). The `Read(//<abs>/**)` form matches Claude Code's
+  # absolute-path read pattern (REPO_ROOT is already absolute, so the leading `/` yields `//`).
+  "Read(/${REPO_ROOT}/**)"
 )
 SETTINGS_LOCAL="$WT_DIR/.claude/settings.local.json"
 mkdir -p "$WT_DIR/.claude"

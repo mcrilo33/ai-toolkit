@@ -1140,6 +1140,34 @@ def test_seeds_own_worktree_staging(hub: Path) -> None:
         assert rule not in allow, f"destructive reset wildcard seeded: {rule}"
 
 
+def test_seeds_read_access_to_hub_root(hub: Path) -> None:
+    # Issue #181 — spokes routinely study hub scripts/hooks OUTSIDE their own worktree (e.g.
+    # reading the hub's .git/hooks/pre-push to understand the push cage). Seed read access to
+    # the hub root subtree so those write-free research reads never fire a permission dialog.
+    _seed_hub_claude(hub)
+
+    proc = _run_new_quiet(hub, "99", "pushguard")
+
+    assert proc.returncode == 0, proc.stderr
+    allow = _load_allowlist(_worktree_dir(hub, "99"))["permissions"]["allow"]
+    expected = f"Read(/{os.path.realpath(hub)}/**)"
+    assert expected in allow, f"missing hub-root read rule: {expected}\n{allow}"
+
+
+def test_seeds_no_write_access_to_hub_root(hub: Path) -> None:
+    # The #181 seeding is READ-only — never an Edit/Write into the hub, which a spoke must
+    # never mutate. Guard against a broadened rule slipping in.
+    _seed_hub_claude(hub)
+
+    proc = _run_new_quiet(hub, "99", "pushguard")
+
+    assert proc.returncode == 0, proc.stderr
+    allow = _load_allowlist(_worktree_dir(hub, "99"))["permissions"]["allow"]
+    root = os.path.realpath(hub)
+    for forbidden in (f"Edit(/{root}/**)", f"Write(/{root}/**)"):
+        assert forbidden not in allow, f"write access to the hub root seeded: {forbidden}"
+
+
 def test_copied_runtime_config_still_present(hub: Path) -> None:
     _seed_hub_claude(hub)
 
@@ -1178,6 +1206,9 @@ def test_merges_existing_settings_local(hub: Path) -> None:
     assert data["other"] is True
     for rule in SEEDED_RULES:
         assert rule in data["permissions"]["allow"], f"missing seeded rule: {rule}"
+    # The dynamic hub-root read rule (#181) survives the jq merge branch too, not just
+    # the initial-write branch — the merge is rule-agnostic ($rules - $cur).
+    assert f"Read(/{os.path.realpath(hub)}/**)" in data["permissions"]["allow"]
 
 
 def test_adhoc_branch_allowlist(hub: Path) -> None:
