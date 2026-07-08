@@ -203,14 +203,22 @@ def test_broker_service_gate_defaults_to_unattended(
 
 
 def _write_fake_tmux(
-    tmp_path: Path, *, on_paste: str = ":", on_enter: str = ":", on_capture: str = ":"
+    tmp_path: Path,
+    *,
+    on_paste: str = ":",
+    on_enter: str = ":",
+    on_capture: str = ":",
+    pane_path: Path | None = None,
 ) -> Path:
     """Fake tmux encoding inject_answer's key contract (Escape, `send-keys -l --`
     paste, separate Enter): one single-line bash snippet runs per event, capture-pane
     runs on_capture. One builder so every inject test drives the SAME contract —
     divergent inline fakes would let the suite stay green against a stale contract.
-    Returns the bin dir to prepend to PATH.
+    pane_path additionally makes list-panes advertise an afk:1 pane at that path
+    (for callers that locate the pane via _spoke_pane_target). Returns the bin dir
+    to prepend to PATH.
     """
+    list_panes = f'printf "afk:1\\t%s\\n" "{pane_path}"' if pane_path else ":"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
     (fake_bin / "tmux").write_text(
@@ -222,6 +230,7 @@ def _write_fake_tmux(
         f"      *Enter*) {on_enter} ;;\n"
         "    esac ;;\n"
         f"  capture-pane) {on_capture} ;;\n"
+        f"  list-panes) {list_panes} ;;\n"
         "esac\nexit 0\n"
     )
     (fake_bin / "tmux").chmod(0o755)
@@ -234,6 +243,7 @@ def _inject_env(projects: Path, fake_bin: Path, **extra: str) -> dict[str, str]:
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "AFK_INJECT_MENU_PAUSE": "0",
         "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_INJECT_POLL_SECONDS": "0",
         **extra,
     }
 
@@ -371,8 +381,8 @@ def test_inject_and_verify_wedge_with_preexisting_needle_escalates(
     """The answer text is visible in the pane BEFORE the inject (an AskUserQuestion
     option label), the paste wedges, and #182's non-turn write bumps the mtime. The
     pane proves nothing either way (baseline_shows=1) and nothing landed in appended
-    transcript bytes, so the injector must escalate (rc 1) — never report success and
-    never classify a wedge off a pre-existing pane match.
+    transcript bytes, so the injector must report a refuted delivery (rc 3) — never
+    success, and never a wedge classified off a pre-existing pane match.
     """
     answer = "Approved — proceed with the plan."
     projects = tmp_path / "projects"
@@ -389,7 +399,82 @@ def test_inject_and_verify_wedge_with_preexisting_needle_escalates(
         env=_inject_env(projects, fake_bin, ANSWER=answer),
     )
 
-    assert result.stdout.strip().splitlines()[-1] == "RC=1", result.stdout + result.stderr
+    assert result.stdout.strip().splitlines()[-1] == "RC=3", result.stdout + result.stderr
+
+
+def test_inject_and_verify_ignores_needle_in_non_user_appended_record(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    """A non-turn write that happens to QUOTE the answer text (a re-rendered question
+    record with the option label, a foreign sidecar) is not delivery proof — only a
+    type:"user" record is. The wedged paste must still classify as rc 2 (#201 review).
+    """
+    answer = "Approved — proceed with the plan."
+    quoting_record = json.dumps(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": answer}]}},
+        ensure_ascii=False,
+    )
+    projects = tmp_path / "projects"
+    _seed_transcript(projects, spoke_repo)
+    sidecar = _project_dir_for(projects, spoke_repo) / "sidecar.jsonl"
+    quote_file = tmp_path / "quote.json"
+    quote_file.write_text(quoting_record + "\n")
+    pasted = tmp_path / "pasted"
+    fake_bin = _write_fake_tmux(
+        tmp_path,
+        on_paste=f'touch "{pasted}"; cat "{quote_file}" >> "{sidecar}"',
+        on_capture=f'[ -e "{pasted}" ] && echo "> {answer}"',
+    )
+
+    result = _call(
+        f"inject_and_verify '{spoke_repo}' afk:1 \"$ANSWER\"; echo RC=$?",
+        env=_inject_env(projects, fake_bin, ANSWER=answer),
+    )
+
+    assert result.stdout.strip().splitlines()[-1] == "RC=2", result.stdout + result.stderr
+
+
+def test_broker_service_gate_escalates_wedge_despite_advanced_mtime(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    """#201 review (CONFIRMED): the non-turn write that triggers the wedge signature
+    also advances the transcript past parked_mtime. The escalation freshness gate must
+    not read that EXPLAINED advance as "spoke moved on" — dropping it would leave the
+    gate tag in place and re-paste onto the wedged composer every tick, with no
+    blocked/<issue> ever stamped.
+    """
+    pd = _project_dir_for(Path(waiting_spoke_env["CLAUDE_PROJECTS_DIR"]), spoke_repo)
+    os.utime(pd / "session.jsonl", (1_000_000_000, 1_000_000_000))
+    sidecar = pd / "sidecar.jsonl"
+    pasted = tmp_path / "pasted"
+    answer = "Approved — use Redis for the store."
+    fake_bin = _write_fake_tmux(
+        tmp_path,
+        on_paste=f'touch "{pasted}"; printf "{{}}\\n" >> "{sidecar}"',
+        on_capture=f'[ -e "{pasted}" ] && echo "> {answer}"',
+        pane_path=spoke_repo,
+    )
+    env = {
+        **waiting_spoke_env,
+        "PATH": f"{fake_bin}:{waiting_spoke_env['PATH']}",
+        "AFK_ANSWERER_CMD": f"printf 'reasoning\\nANSWER: {answer}'",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_INJECT_POLL_SECONDS": "0",
+    }
+    # _spoke_pane_target canonicalizes via worktree-lib's wt_realpath; define it here
+    # since these tests source gate-broker.sh on its own.
+    expr = (
+        'wt_realpath() { (cd "$1" 2>/dev/null && pwd -P) || true; }; '
+        f"broker_service_gate '{spoke_repo}' 7 unattended"
+    )
+
+    result = _call(expr, env=env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    log = Path(env["_READY_LOG"]).read_text()
+    assert "--blocked 7" in log, result.stdout + result.stderr + log
+    assert "composer wedged" in log
 
 
 def test_inject_and_verify_unobservable_pane_degrades_to_advance(

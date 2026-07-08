@@ -1202,17 +1202,21 @@ _transcript_sizes() {
   done
 }
 
-# _answer_appended <wt_path> <text> <sizes> -> did the answer's needle land in
+# _answer_appended <wt_path> <text> <sizes> -> did the answer land as a USER record in
 # transcript bytes appended after the <sizes> snapshot? A submitted answer is recorded
 # as a user turn in the session jsonl, so a fresh match is positive proof the composer
 # let go (#201) — the pane alone cannot give it, because a successful submit also
 # ECHOES the message into the scrollback and keeps the needle visible. The match is
 # byte-level against the needle's JSON-encoded form (quotes/backslashes cannot hide
 # it; JSON keeps non-ASCII as raw UTF-8, and a needle byte-truncated mid-character by
-# a C-locale slice still matches as a byte prefix). Only appended regions are read —
-# never a full transcript rescan. rc 0 found, rc 1 not found, rc 2 scan unavailable
-# (no python3 / no project dir / interpreter died) — callers must treat 2 as "no
-# evidence either way", never as a wedge.
+# a C-locale slice still matches as a byte prefix), then the matching line must parse
+# as a type:"user" record — a non-turn write coincidentally quoting the answer (a
+# re-rendered question record, a foreign sidecar) is NOT proof (#201 review). Only
+# appended regions are read — never a full transcript rescan; a rotated/unstat-able
+# file degrades to a from-0 scan of that file (fail-toward-pre-#201, accepted).
+# rc 0 found, rc 1 not found, rc 2 scan unavailable (no python3 / no project dir /
+# interpreter died — a crash exits 1 in python, so "not found" is the DISTINCT exit 3
+# and everything else maps to 2). Callers must treat 2 as "no evidence either way".
 _answer_appended() {
   local wt="$1" text="$2" sizes="$3" needle dir
   needle="$(_answer_needle "$text")"
@@ -1221,17 +1225,21 @@ _answer_appended() {
   [ -d "$dir" ] || return 2
   command -v python3 >/dev/null 2>&1 || return 2
   _AFK_DIR="$dir" _AFK_NEEDLE="$needle" _AFK_SIZES="$sizes" python3 2>/dev/null <<'PYEOF'
-import glob, os, sys
+import glob, json, os, sys
 
 raw = os.environb.get(b"_AFK_NEEDLE", b"")
+for i, byte in enumerate(raw):
+    if byte < 0x20 and byte not in (9, 13):  # control char the escape map can't encode
+        raw = raw[:i]
+        break
+if not raw:
+    sys.exit(4)  # no usable needle: unavailable, not "not found"
 needle = (
     raw.replace(b"\\", b"\\\\")
     .replace(b'"', b'\\"')
     .replace(b"\t", b"\\t")
     .replace(b"\r", b"\\r")
 )
-if not needle:
-    sys.exit(1)
 offsets = {}
 for line in os.environb.get(b"_AFK_SIZES", b"").splitlines():
     size, _, path = line.partition(b"\t")
@@ -1248,13 +1256,21 @@ for path in glob.glob(os.path.join(os.environ["_AFK_DIR"], "*.jsonl")):
             if offset > fh.tell():  # rotated/truncated since the snapshot: rescan
                 offset = 0
             fh.seek(offset)
-            if needle in fh.read():
-                sys.exit(0)
+            appended = fh.read()
     except OSError:
         continue
-sys.exit(1)
+    for line in appended.splitlines():
+        if needle not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue  # partial flush at the offset boundary: not a record yet
+        if isinstance(record, dict) and record.get("type") == "user":
+            sys.exit(0)
+sys.exit(3)
 PYEOF
-  case $? in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
+  case $? in 0) return 0 ;; 3) return 1 ;; *) return 2 ;; esac
 }
 
 # _answer_delivered <wt> <target> <text> <sizes> -> after _transcript_advanced
@@ -1271,8 +1287,8 @@ _answer_delivered() {
   local wt="$1" target="$2" text="$3" sizes="$4" rc
   _answer_appended "$wt" "$text" "$sizes"; rc=$?
   [ "$rc" -eq 0 ] && return 0
-  _composer_shows_text "$target" "$text" || return 0
   [ "$rc" -eq 2 ] && return 0
+  _composer_shows_text "$target" "$text" || return 0
   return 1
 }
 
@@ -1304,9 +1320,14 @@ _transcript_advanced() {
 #   rc 0 — delivered (the transcript advanced and the composer released the answer).
 #   rc 2 — WEDGED: the text survived the Enter-only retry (an unterminated paste no
 #          keystroke can submit or clear) — the caller respawns the pane.
+#   rc 3 — REFUTED: the transcript advanced but delivery was positively disproven (a
+#          readable pane still shows the needle and no user record landed in appended
+#          bytes — the #182 signature, minus the wedge-classifiable pane state). The
+#          advance is EXPLAINED: callers must NOT read it as the spoke moving on — a
+#          moved-on drop here leaves the gate tag and re-pastes forever (#201 review).
 #   rc 1 — not registered and no text observable in the composer — the caller escalates.
 inject_and_verify() {
-  local wt="$1" target="$2" text="$3" before baseline_shows=0 sizes
+  local wt="$1" target="$2" text="$3" before baseline_shows=0 sizes vetoed=0
   before="$(_transcript_mtime "$wt")"
   # Baseline BEFORE pasting: a short answer often also appears in the rendered
   # question above the composer. If the needle was already visible pre-inject,
@@ -1317,6 +1338,11 @@ inject_and_verify() {
   inject_answer "$target" "$text" || return 1
   if _transcript_advanced "$wt" "$before"; then
     _answer_delivered "$wt" "$target" "$text" "$sizes" && return 0
+    # The advance may have raced the submit's own user-record write by milliseconds:
+    # one grace re-check before treating the veto as real (#201 review).
+    sleep "${AFK_INJECT_POLL_SECONDS:-2}" 2>/dev/null || true
+    _answer_appended "$wt" "$text" "$sizes" && return 0
+    vetoed=1
     # #201: the advance was a non-turn write while the paste sat unsubmitted.
     # Re-baseline so the retry waits for REAL post-Enter progress, then fall
     # through to the same bare-Enter / wedge path a plain non-advance takes.
@@ -1327,8 +1353,14 @@ inject_and_verify() {
   tmux send-keys -t "$target" Enter 2>/dev/null || true
   if _transcript_advanced "$wt" "$before"; then
     _answer_delivered "$wt" "$target" "$text" "$sizes" && return 0
+    vetoed=1
   fi
+  # Last look before classifying: the bare-Enter submit can land in the same whole
+  # second as the re-baseline (the mtime advance never fires) — the appended user
+  # record, not the clock, is the truth (#201 review).
+  _answer_appended "$wt" "$text" "$sizes" && return 0
   [ "$baseline_shows" -eq 0 ] && _composer_shows_text "$target" "$text" && return 2
+  [ "$vetoed" -eq 1 ] && return 3
   return 1
 }
 
@@ -1453,7 +1485,7 @@ _broker_present_qcm() {
 # answer, or escalate to blocked/<issue>. Fail-safe: an answerer that returns no decision
 # (or an answer we cannot inject) escalates rather than guessing.
 broker_service_gate() {
-  local wt="$1" issue="$2" mode="${3:-unattended}" question orig_question raw rc decision kind text target was_gate=0
+  local wt="$1" issue="$2" mode="${3:-unattended}" question orig_question raw rc decision kind text target was_gate=0 inject_diagnosed=0
   # A pending permission dialog is decided by the rules classifier, not the answerer (#149).
   if _permission_pending "$wt"; then _decide_permission "$wt" "$issue"; return; fi
   # Snapshot the transcript clock BEFORE the park checks: a write landing between
@@ -1549,6 +1581,11 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
           # The old window is dead and the answer text lives nowhere else — carry its
           # head in the blocked reason so the returning human need not re-derive it.
           text="composer wedged and the pane respawn could not be confirmed — needs a human; the undelivered answer began: $(printf '%.120s' "${text%%$'\n'*}")"
+          inject_diagnosed=1
+        elif [ "$rc" -eq 3 ]; then
+          log "  answer to #$issue never left the composer (delivery refuted) — escalating"
+          text="answer never left the composer (delivery refuted, #201) — needs a human"
+          inject_diagnosed=1
         else
           log "  answer to #$issue did not register — escalating"
           text="answer did not register in the spoke (inject not confirmed) — needs a human"
@@ -1569,7 +1606,11 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
   # an ambiguous probe must NOT drop a real escalation (review) — only demonstrated activity
   # does. (The ANSWER branch's own pre-inject re-check stays _still_parked_same: there,
   # dropping on uncertainty is the safe direction — it just skips a possibly-stale inject.)
-  if _spoke_moved_on "$wt" "$parked_mtime"; then
+  # EXCEPT when the injector itself diagnosed a wedge/refuted delivery (rc 2/3): there the
+  # advance is EXPLAINED by the very non-turn write that triggered the diagnosis, so reading
+  # it as "moved on" would drop every #201 escalation and re-paste onto the wedged composer
+  # forever, with no blocked/<issue> ever stamped (#201 review, CONFIRMED).
+  if [ "$inject_diagnosed" -eq 0 ] && _spoke_moved_on "$wt" "$parked_mtime"; then
     log "  #$issue transcript advanced while reasoning — dropping the escalation (spoke moved on)"
     return 0
   fi
