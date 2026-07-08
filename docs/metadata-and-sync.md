@@ -101,12 +101,21 @@ behavior; sync applies both on every run (parsed by `scripts/ai_toolkit_config.p
 stdlib only):
 
 - **Model routing** — `model.spoke` (the spoke driver), `model.subagents.<type>`
-  (each sub-agent), plus `model.cycle_steps`, `model.afk.answerer`, and
-  `model.overrides.by_label` (schema present; consumers land in follow-ups). Each
-  entry is `{model, effort}`; effort defaults to `max`. Sync stamps each agent's
-  `model`/`effort` frontmatter from `model.subagents` (so `shared/agents/metadata.yml`
-  carries no model literals) and emits `.ai-toolkit/scripts/spoke-model.env` for
-  `worktree-new.sh` to source.
+  (each sub-agent), and `model.cycle_steps` (each solo-cycle step), plus
+  `model.afk.answerer` and `model.overrides.by_label` (schema present; consumers
+  land in follow-ups). Each entry is `{model, effort}`; effort defaults to `max`.
+  Sync stamps each agent's `model`/`effort` frontmatter from `model.subagents` (so
+  `shared/agents/metadata.yml` carries no model literals) and emits
+  `.ai-toolkit/scripts/spoke-model.env` for `worktree-new.sh` to source.
+  `model.cycle_steps` is consumed at run time by **delegation, not sync**: the
+  `solo-cycle` skill delegates each step to its routed subagent
+  (`red`→`tdd-red`, `green`→`tdd-green`, `review`→`code-review`), so the step runs
+  on that agent's stamped model with its own per-span attribution.
+  `ai_toolkit_config.py::cycle_step_effective_model` resolves the model a step
+  actually runs on and returns `None` — fail-open to the spoke driver model — for
+  the undelegated `anchor`/`push` steps or any step with no configured routing. A
+  per-step value MUST match its delegate's `model.subagents` entry; a real-config
+  test binds the two so a drift fails loudly rather than routing silently wrong.
 - **Base branch** — `base_branch:` is written to `git config ai-toolkit.base-branch`
   on the target, feeding the canonical `wt_base_branch` resolver. Empty/absent clears
   it (auto-detection). See [parallel worktrees](./parallel-worktrees.md).
