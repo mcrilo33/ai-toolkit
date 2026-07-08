@@ -2160,6 +2160,32 @@ def test_classify_permission_escalates_bare_dot_root_target(
     assert _classify_with_wt(cmd, spoke_repo, tasks) == "ESCALATE"
 
 
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        'rm "/etc/passwd"',  # a quoted absolute path: the shell strips the quote at exec
+        "rm '/etc/passwd'",  # single-quoted form
+        'cp sub/f "/etc/evilcopy"',
+        'chmod 777 "/etc/passwd"',
+        r"rm \/etc/passwd",  # backslash-escaped leading slash
+        "mv -t/etc/ sub/file.txt",  # GNU glued target-directory hides the out-of-tree dest
+        "mv --target-directory=/etc sub/file.txt",
+        "cp -t /etc sub/file.txt",  # separate-token target-directory too
+    ],
+)
+def test_classify_permission_escalates_quoted_or_target_dir_escapes(
+    cmd: str, spoke_repo: Path, tmp_path: Path
+) -> None:
+    # Containment is decided on tokens that STILL carry shell quoting/escaping the shell
+    # strips at execution: a leading quote/backslash makes an out-of-tree absolute path look
+    # in-tree, and a GNU -t/--target-directory hides the destination inside a flag. Both must
+    # escalate — the classifier must never approve what the shell would run out of tree.
+    tasks = tmp_path / "tasks"
+    (spoke_repo / "sub").mkdir()
+
+    assert _classify_with_wt(cmd, spoke_repo, tasks) == "ESCALATE"
+
+
 def test_classify_permission_mutation_lane_inert_without_worktree() -> None:
     # Backward-compatible: with NO worktree argument the mutation lane is inert, so a bare
     # `mv`/`rm`/`chmod` still default-denies exactly as before (#149/#171 posture).

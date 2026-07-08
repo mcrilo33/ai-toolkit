@@ -1073,8 +1073,16 @@ PYEOF
 # resolver cannot see through those, and a false deny escalates — the safe direction.
 _broker_resolve_in_roots() {
   local p="$1" cwd="$2" wt="$3" slug="$4" tasks="$5" abs
+  # Reject any token the shell rewrites at execution to a path the textual/realpath checks
+  # cannot see: traversal (`..`), variable/command substitution (`$`, backtick), tilde, brace
+  # and glob metacharacters, AND quoting/escaping (`"` `'` `\`). The last three are load-
+  # bearing: `rm "/etc/x"` carries a leading quote, so the `/*` absolute test below misses it
+  # and it is joined onto the worktree cwd as if relative — realpath treats the quote as an
+  # ordinary character, so a quoted out-of-tree absolute path would pass containment yet the
+  # shell strips the quote and mutates the real path. A false deny escalates — the safe way.
   case "$p" in
-    *'..'* | *'$'* | *'`'* | '~'* | *'{'* | *'}'* | *'*'* | *'?'* | *'['* | *']'*) return 1 ;;
+    *'..'* | *'$'* | *'`'* | '~'* | *'{'* | *'}'* | *'*'* | *'?'* | *'['* | *']'* \
+      | *'"'* | *"'"* | *'\'*) return 1 ;;
   esac
   case "$p" in /*) abs="$p" ;; *) abs="$cwd/$p" ;; esac
   # Collapse `/./` and duplicate slashes textually (no glob, no fs touch). The replacement
@@ -1127,6 +1135,13 @@ _permission_seg_mutation_ok() {
     [ -n "$rest" ] || break
     tok="${rest%%[[:space:]]*}"                 # first token
     rest="${rest#"$tok"}"
+    # `-t DIR` / `-tDIR` / `--target-directory[=DIR]` (GNU mv/cp) hide the DESTINATION inside
+    # a flag; the glued/`=`-form would be skipped as a flag and its out-of-tree target never
+    # checked. Deny the whole segment when one appears — a false deny escalates (BSD mv/cp on
+    # the macOS host lacks -t, but this repo also runs on Linux/GNU coreutils).
+    case "$tok" in
+      -t | -t?* | --target-directory | --target-directory=*) return 1 ;;
+    esac
     case "$tok" in -*) continue ;; esac         # a flag (mv -f, mkdir -p, …)
     if [ "$mode_pending" -eq 1 ]; then mode_pending=0; continue; fi
     _broker_seg_secretlike "$tok" && return 1
