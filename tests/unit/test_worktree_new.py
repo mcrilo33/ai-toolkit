@@ -1258,8 +1258,15 @@ def test_seeds_testmondata_exclude(hub: Path) -> None:
 
 
 def test_testmondata_exclude_seeded_at_most_once(hub: Path) -> None:
-    # The exclude append is guarded by grep -qxF, so a second run (or a machine
-    # whose exclude already carries the entry) never duplicates it.
+    # The exclude append is guarded by grep -qxF: pre-seed the entry (a machine
+    # whose exclude already carries it, e.g. a re-run) so the run must find it
+    # present and NOT append a duplicate. A linked worktree resolves info/exclude to
+    # the shared common git dir, so seeding the hub's exclude is what the run sees.
+    hub_exclude = _info_exclude_path(hub)
+    hub_exclude.parent.mkdir(parents=True, exist_ok=True)
+    with hub_exclude.open("a") as f:
+        f.write(".testmondata*\n")
+
     proc = _run_new_quiet(hub, "99", "pushguard")
 
     assert proc.returncode == 0, proc.stderr
