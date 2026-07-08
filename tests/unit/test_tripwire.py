@@ -152,6 +152,24 @@ def test_restore_still_recovers_rewound_ref(repo: Path) -> None:
     assert _rev(repo, "main") == tip  # the lost commit is back
 
 
+def test_restore_writes_labeled_reflog_entry(repo: Path) -> None:
+    # Issue #188: a killed mid-gate push once rolled a branch back with NO
+    # reflog trace, leaving committed work unreachable. Every restore must be
+    # reflog-visible: a labeled entry whose previous position (`ref@{1}`) is
+    # the pre-restore tip, so the rollback is recoverable from `git reflog`.
+    tip = _commit(repo, {"src/a.py": "x = 1\n"})
+    rewound = _rev(repo, "main~1")
+    proc = _lib(
+        repo,
+        'b="$(tripwire_capture)"\ngit reset -q --hard HEAD~1\ntripwire_restore "$b"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert _rev(repo, "main") == tip  # restored to the snapshot
+    assert "tripwire: restore after aborted gate" in _git(repo, "reflog", "show", "main")
+    assert _rev(repo, "main@{1}") == rewound  # the entry points back at the pre-restore tip
+
+
 def test_restore_skips_deleting_ref_checked_out_in_worktree(repo: Path, tmp_path: Path) -> None:
     # A ref that appeared during the run but is checked out in a registered
     # worktree is a live spoke's branch — deleting it destroys the spoke's
