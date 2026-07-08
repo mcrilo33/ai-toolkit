@@ -89,6 +89,7 @@ ALL_RULE_NAMES = {
     "mermaid-conventions",
     "pytest-conventions",
     "workflow",
+    "operational-gotchas",
     "github-actions",
     "library-research",
     "agent-orchestration",
@@ -109,6 +110,7 @@ CLAUDE_RULES_WITH_PATHS = {
     "markdown-style",
     "mermaid-conventions",
     "pytest-conventions",
+    "operational-gotchas",
     "github-actions",
 }
 
