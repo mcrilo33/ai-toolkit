@@ -83,6 +83,33 @@ _clear_dispatch_epochs() {
   rm -f "$dir"/dispatch-*.epoch 2>/dev/null || true
 }
 
+# --- event spool (issue #176) -------------------------------------------------
+# The event-driven wake path: a spoke ANNOUNCES a state change (a marker push, a
+# permission/question park) by dropping one content-free file per event, named
+# <epoch>-<issue>-<type>, into this spool and SIGUSR1-ing the supervisor. Events are
+# WAKE-UPS, not state — on wake the supervisor re-derives everything via slot_state, so a
+# duplicate, stale, or lost event is safe (a lost one is caught by the next full sweep).
+# The reader (hub-afk.sh) lives here; the two writers (spoke-ready.sh + the Notification
+# hook) deploy to different dirs than the reader and inline the same tiny emit, sharing
+# only this filename contract.
+afk_event_dir() { printf '%s\n' "$(_afk_state_dir)/events"; }
+
+# afk_drain_event_issues -> print each DISTINCT issue number that has a spooled event
+# (one per line, sorted) and delete every spool file. Malformed names (no <issue> field)
+# are dropped silently. Draining and dedup happen in one pass: the caller re-derives each
+# named spoke's state via slot_state, so servicing an issue once per drain is enough.
+afk_drain_event_issues() {
+  local dir f base issue; dir="$(afk_event_dir)"
+  [ -d "$dir" ] || return 0
+  for f in "$dir"/*; do
+    [ -f "$f" ] || continue
+    base="${f##*/}"                      # <epoch>-<issue>-<type>
+    issue="${base#*-}"; issue="${issue%%-*}"   # middle field
+    case "$issue" in '' | *[!0-9]*) ;; *) printf '%s\n' "$issue" ;; esac
+    rm -f "$f" 2>/dev/null || true
+  done | sort -un
+}
+
 # --- per-spoke progress + answer-attempt epochs (issue #133, subtask 3) --------
 # progress-<issue>.epoch — the reap ceiling's reference alongside the dispatch epoch:
 # stamped when the branch tip advances between ticks, on a resume/respawn, and when a
