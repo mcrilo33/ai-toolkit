@@ -280,10 +280,13 @@ done <<< "$FILES"
 # Emit the bash blind-spot witness (issue #191) before the tier decision so it
 # surfaces even when a green-tree stamp later short-circuits the run: the
 # coverage gap it names is a property of the diff, not of whether the suite ran.
+# Dedup with sort -u (as MAPPED_TESTS is above) so a script carried by two
+# pushed refs — the same path twice in FILES — is named once, not doubled into
+# the #187 audit stream.
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   note "WARNING (witness: unmapped-shell) $f — shell change with no referencing test; testmon is blind to shell, nothing re-exercises it. Add a test referencing its basename or a .test-select-exempt entry."
-done <<< "$UNMAPPED_SH"
+done <<< "$(printf '%s' "$UNMAPPED_SH" | sort -u)"
 
 # The selection: deduped, and every entry must still exist — a mapping to a
 # vanished test proves nothing, so it escalates instead.

@@ -867,6 +867,23 @@ def test_unmapped_shell_change_emits_witness_warning(repo: Path, tmp_path: Path)
     assert "scripts/new.sh" in proc.stderr  # … naming the offending script
 
 
+def test_witness_warning_deduped_across_refs(repo: Path, tmp_path: Path) -> None:
+    # A push carrying the same unmapped .sh on two refs lists the path twice in
+    # the diff set; the witness must name it once, not double the #187 audit
+    # stream (review finding: UNMAPPED_SH lacked the once-guard MAPPED_TESTS has).
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
+    tip = _commit(repo, {"scripts/new.sh": "echo new\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+    stdin = _stdin(tip, base, "refs/heads/feature/a") + _stdin(tip, base, "refs/heads/feature/b")
+
+    proc = _run_select(repo, stdin, tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr.count("witness: unmapped-shell") == 1
+
+
 def test_mapped_shell_change_emits_no_witness_warning(repo: Path, tmp_path: Path) -> None:
     # A *.sh WITH a referencing test is not a blind spot — no witness warning.
     _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
