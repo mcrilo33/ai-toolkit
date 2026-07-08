@@ -1252,6 +1252,11 @@ classify_permission() {
     case "$seg" in
       'cd '*)
         target="${seg#cd }"; target="${target#"${target%%[![:space:]]*}"}"
+        # An empty target (`cd` → $HOME) or a `-`-prefixed one (`cd -`/`--`/`-P`/`-L` → $OLDPWD
+        # or $HOME) navigates OUT of the tree — never a literal in-tree dir. Reject before the
+        # resolver, which would otherwise read `--` as an in-tree directory name and track a
+        # bogus cwd. A real dir starting with `-` is always reachable as `./-x`.
+        case "$target" in '' | -*) printf 'ESCALATE\t%s\n' "risky or unrecognised command: $cmd"; return 0 ;; esac
         if [ -n "$wt" ] && new_cwd="$(_broker_resolve_in_roots "$target" "$cwd" "$wt" "$slug" "$tasks")"; then
           cwd="$new_cwd"; continue
         fi

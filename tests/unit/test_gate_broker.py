@@ -2202,6 +2202,26 @@ def test_classify_permission_escalates_redirection_in_cd_target(
     assert _classify_with_wt(f"cd foo>{spoke_repo}/.env", spoke_repo, tasks) == "ESCALATE"
 
 
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cd -- && rm -rf .ssh",  # `cd --` → $HOME, not an in-tree dir named `--`
+        "cd -P && rm .bashrc",  # `cd -P`/`-L` → $HOME
+        "cd -L && rm .bashrc",
+        "cd - && rm a.txt",  # `cd -` → $OLDPWD
+    ],
+)
+def test_classify_permission_escalates_dash_cd_target(
+    cmd: str, spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A `cd` target beginning with `-` is a flag/special the shell resolves OUT of the tree
+    # (`--`/`-P`/`-L` → $HOME, `-` → $OLDPWD), not a literal in-tree directory. The cd handler
+    # must escalate it rather than track a bogus in-tree cwd and approve the following mutation.
+    tasks = tmp_path / "tasks"
+
+    assert _classify_with_wt(cmd, spoke_repo, tasks) == "ESCALATE"
+
+
 def test_classify_permission_mutation_lane_inert_without_worktree() -> None:
     # Backward-compatible: with NO worktree argument the mutation lane is inert, so a bare
     # `mv`/`rm`/`chmod` still default-denies exactly as before (#149/#171 posture).
