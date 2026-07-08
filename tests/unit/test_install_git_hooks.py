@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -243,17 +244,14 @@ def test_reverse_index_lib_copied_into_hooks(repo: Path) -> None:
 # gate silently never ran (a safety gate failing open).
 
 
-def _stub_capture(hooks: Path, name: str, log: Path) -> None:
-    """Overwrite a copied cage script with a stub that logs its stdin and passes."""
+def _stub_cage(hooks: Path, name: str, log: Path | None = None) -> None:
+    """Overwrite a copied cage script with a stub that passes, optionally logging stdin."""
     s = _scripts_dir(hooks) / f"{name}.sh"
-    s.write_text(f'#!/bin/sh\ncat >> "{log}"\nexit 0\n')
-    s.chmod(0o755)
-
-
-def _stub_pass(hooks: Path, name: str) -> None:
-    """Overwrite a copied cage script with a no-op that passes."""
-    s = _scripts_dir(hooks) / f"{name}.sh"
-    s.write_text("#!/bin/sh\nexit 0\n")
+    body = "#!/bin/sh\n"
+    if log is not None:
+        body += f'cat >> "{log}"\n'
+    body += "exit 0\n"
+    s.write_text(body)
     s.chmod(0o755)
 
 
@@ -270,14 +268,20 @@ def _commit(repo: Path, *msg_args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+@pytest.mark.skipif(
+    shutil.which("jq") is None,
+    reason="asserts the jq `@json` command shape; a jq-less host takes the sed fallback",
+)
 def test_commit_msg_synthesizes_raw_command(repo: Path, tmp_path: Path) -> None:
     # The captured payload's command must be byte-identical to a real commit
     # invocation: `git commit -m ` + the JSON-encoded message (quotes/newlines
     # escaped), with `git` at a command boundary — NOT wrapped in outer quotes.
+    # The exact `@json` encoding is jq-specific (the no-jq fallback collapses
+    # newlines to spaces), so this precise-equality check is guarded on jq.
     hooks = _install(repo)
     log = tmp_path / "payload.json"
-    _stub_capture(hooks, "commit-quality", log)
-    _stub_pass(hooks, "commit-gauntlet")
+    _stub_cage(hooks, "commit-quality", log)
+    _stub_cage(hooks, "commit-gauntlet")
 
     commit = _commit(repo, "-m", 'feat(x): add "q" thing', "-m", "Refs #185")
 
