@@ -2567,6 +2567,27 @@ def test_classify_permission_read_prefixed_bash_never_bypasses_gate(
         assert _classify_with_wt(cmd, spoke_repo, tasks) == "ESCALATE", cmd
 
 
+def test_read_prefixed_bash_tooluse_end_to_end_escalates(spoke_repo: Path, tmp_path: Path) -> None:
+    # End-to-end: a real Bash tool_use whose command TEXT starts with "Read " flows through
+    # extract_pending_command (which emits it raw) into classify_permission, and must escalate —
+    # binding both halves of the chain, not just the decision point.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    (pd / "session.jsonl").write_text(
+        json.dumps(_bash_tool_record(f"Read {spoke_repo}/a.txt; rm -rf /tmp/PWNED")) + "\n"
+    )
+
+    extracted = _call(
+        f"extract_pending_command '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
+    ).stdout.strip()
+    verdict = _call(
+        'classify_permission "$CMD" "$WT" | cut -f1',
+        env={"CMD": extracted, "WT": str(spoke_repo), "AFK_TASKS_ROOT": str(tmp_path / "tasks")},
+    ).stdout.strip()
+
+    assert verdict == "ESCALATE"
+
+
 def test_classify_permission_read_of_symlink_to_secret_escalates(
     spoke_repo: Path, tmp_path: Path
 ) -> None:

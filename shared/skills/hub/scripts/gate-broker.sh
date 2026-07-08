@@ -1345,6 +1345,15 @@ PYEOF
 # operator / traversal makes the target unapprovable here (a false deny escalates — the safe
 # direction). The secret class is then checked on BOTH the raw path and its resolved realpath, so
 # an in-family symlink with a benign name (notes.txt -> deploy.pem) can't launder a key.
+#
+# Two properties of the whitespace rejection are load-bearing, DO NOT weaken blindly:
+#   - It is a DENYLIST: safety rests on the reject set covering every shell control / expansion /
+#     quoting metacharacter. Extend the set, never trim it.
+#   - `*[[:space:]]*` rejects an embedded NEWLINE too (a case-glob matches it), closing the
+#     newline-as-command-separator variant. If anyone ever relaxes this to allow spaced paths,
+#     ONLY space/tab may be re-admitted — a re-allowed newline reopens the masquerade.
+# Known limitation: a worktree whose ROOT path itself contains whitespace makes every family read
+# non-clean, so the feature degrades to always-escalate for that checkout (safe, but silent).
 _classify_read_tool() {
   local path="$1" wt="${2:-}" abs
   if [ -z "$path" ]; then
