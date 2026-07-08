@@ -281,26 +281,44 @@ git tag -f -a "$TAG" "${MSG_ARGS[@]}"
 # spoke finished without announcing itself and the drain stalled. Second line of
 # defense, mirroring worktree-land: when a failed attempt is demonstrably a
 # TRANSPORT death, retry exactly once. Unlike the land path there is no
-# TEST_SELECT_SKIP on the retry and no pytest-shape filter on the capture — the
-# gate short-circuits a tag-only push, so no suite runs inside it and a transport
-# signature in the output can only be the transport itself. The capture file is
-# complete when the pipeline returns (tee exits 0, pipefail keeps git's own code).
-echo "→ git push -f origin $TAG"
-PUSH_LOG="$(mktemp "${TMPDIR:-/tmp}/spoke-ready-push.XXXXXX")"
+# TEST_SELECT_SKIP on the retry: a tag-only push short-circuits the gate. The
+# pytest-shape filter IS kept — a STALE installed pre-push hook (predating the
+# tag-only short-circuit) can still run the suite inside this push, and a red
+# suite quoting a transport phrase must read as a failed gate, not staleness.
+echo "→ wt_git_push -f origin $TAG (SSH keepalive, issue #119)"
+# The capture file exists only to classify a failure; a host without a writable
+# TMPDIR degrades to an uncaptured keepalive push (classification then rests on
+# exit 141 alone) rather than dying under set -e before any push is attempted.
+PUSH_LOG="$(mktemp "${TMPDIR:-/tmp}/spoke-ready-push.XXXXXX" 2>/dev/null || true)"
 PUSH_RC=0
-wt_git_push -f origin "$TAG" 2>&1 | tee "$PUSH_LOG" || PUSH_RC=$?
+if [ -n "$PUSH_LOG" ]; then
+  # tee streams the output live AND captures it; PIPESTATUS[0] keeps git's own
+  # exit code even if tee itself fails (pipefail would report tee's rc, turning
+  # a landed marker into a spurious "rejected").
+  wt_git_push -f origin "$TAG" 2>&1 | tee "$PUSH_LOG" || PUSH_RC="${PIPESTATUS[0]}"
+else
+  echo "spoke-ready: warning — cannot create a capture file under ${TMPDIR:-/tmp}; pushing uncaptured" >&2
+  wt_git_push -f origin "$TAG" || PUSH_RC=$?
+fi
+RETRY_TRANSPORT=0
+if [ "$PUSH_RC" -ne 0 ] \
+   && wt_push_transport_died "$PUSH_RC" "${PUSH_LOG:-/dev/null}" \
+   && ! grep -qE '[0-9]+ (failed|error)|Interrupted' "${PUSH_LOG:-/dev/null}" 2>/dev/null; then
+  RETRY_TRANSPORT=1
+fi
+if [ -n "$PUSH_LOG" ]; then rm -f "$PUSH_LOG"; fi
 if [ "$PUSH_RC" -ne 0 ]; then
-  if wt_push_transport_died "$PUSH_RC" "$PUSH_LOG"; then
-    rm -f "$PUSH_LOG"
+  if [ "$RETRY_TRANSPORT" -eq 1 ]; then
     echo "spoke-ready: push transport died (SSH staleness, issue #119) — retrying ONCE" >&2
-    wt_git_push -f origin "$TAG"
+    if ! wt_git_push -f origin "$TAG"; then
+      echo "spoke-ready: retry push failed — $TAG did not reach origin" >&2
+      exit 1
+    fi
   else
-    rm -f "$PUSH_LOG"
     echo "spoke-ready: push of $TAG rejected — the marker did not reach origin" >&2
     exit "$PUSH_RC"
   fi
 fi
-rm -f "$PUSH_LOG"
 
 echo "✓ spoke-ready: emitted $TAG at $(git rev-parse --short HEAD)"
 
