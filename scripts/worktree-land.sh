@@ -139,7 +139,7 @@ land_resume_finalize() {
     if git branch -d "$br" >/dev/null 2>&1; then
       echo "✓ pruned merged branch $br"
       if [ -z "$fetch_ok" ]; then
-        wt_warn "fetch failed — kept remote origin/$br (its merged-ness can't be verified against stale remote state, issue #195); delete it by hand once origin is reachable: git push origin --delete $br"
+        wt_warn "fetch failed — kept remote origin/$br (its merged-ness can't be verified against stale remote state, issue #195); once origin is reachable, delete it by hand if it still exists: git push origin --delete $br"
       elif git merge-base --is-ancestor "refs/remotes/origin/$br" "$DEFAULT" 2>/dev/null; then
         wt_git_push origin --delete "$br" >/dev/null 2>&1 \
           || wt_warn "couldn't delete remote origin/$br — delete it by hand: git push origin --delete $br"
@@ -224,8 +224,12 @@ if [ -z "$LOCAL" ]; then
   # below would otherwise run against the LAST-KNOWN origin/<branch> — a spoke
   # push the hub never fetched reads behind=0, the land proceeds, and teardown
   # deletes origin/<branch> with the remote-only commits. Destructive decisions
-  # never run on stale remote state.
+  # never run on stale remote state. One immediate retry absorbs a transient
+  # blip (the #119 SSH-staleness class — a fresh short connection usually
+  # clears it) so an unattended /afk land isn't escalated blocked/<N> over a
+  # moment of network noise; a real outage still dies.
   git fetch origin --quiet 2>/dev/null \
+    || git fetch origin --quiet 2>/dev/null \
     || wt_die "fetch from origin failed — refusing to land on last-known remote state (a spoke push this checkout never fetched would be silently pruned). Restore connectivity and re-run."
   # Upstream guards: the spoke's push is its ship gate.
   UPSTREAM="$(git rev-parse --symbolic-full-name "${WT_BRANCH}@{upstream}" 2>/dev/null || true)"
