@@ -36,6 +36,15 @@ def _git(repo: Path, *args: str) -> str:
     ).stdout
 
 
+def _dead_pid() -> int:
+    """A pid that named a real process which has since exited — a crashed
+    supervisor's heartbeat pid. Spawn a trivial process and reap it so the pid is
+    gone (reuse within a test is vanishingly unlikely)."""
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    return proc.pid
+
+
 @pytest.fixture()
 def hub(tmp_path: Path) -> Path:
     """A hub (main checkout) with one feature branch, feature/1-work, one commit
@@ -79,14 +88,22 @@ def _run(
         "HUB_NOTIFY_CMD": str(notifier),
     }
     env.pop("AI_TOOLKIT_BASE_BRANCH", None)
-    # Control afk-mode deterministically: pop any inherited state, then arm a
-    # drain window (a non-empty .afk-state, matching hub-afk's convention) only
-    # when the test asks for it.
+    # Control afk-mode deterministically: pop any inherited state/heartbeat, then
+    # arm a LIVE drain window only when the test asks for it. hub-notify gates
+    # suppression on supervisor liveness (#215) — an armed .afk-state whose
+    # heartbeat pid is a running process — so `afk=True` writes BOTH the armed
+    # state and a heartbeat naming this test process's own (live) pid. A stale
+    # window (armed state, dead/absent heartbeat) is modelled per-test via
+    # env_extra, and must NOT suppress.
     env.pop("AFK_STATE", None)
+    env.pop("AFK_HEARTBEAT", None)
     if afk:
         afk_state = tmp_path / "afk-state"
         afk_state.write_text("drain\n")
         env["AFK_STATE"] = str(afk_state)
+        afk_hb = tmp_path / "afk-heartbeat"
+        afk_hb.write_text(f"{os.getpid()} 0\n")
+        env["AFK_HEARTBEAT"] = str(afk_hb)
     if env_extra:
         env.update(env_extra)
 
@@ -310,17 +327,81 @@ def test_attended_fires_gate_when_no_afk_window(hub: Path, tmp_path: Path) -> No
     assert "parked" in messages[0].lower()
 
 
-def test_afk_suppressed_gate_is_recorded_as_seen(hub: Path, tmp_path: Path) -> None:
-    # A marker suppressed under a drain is still persisted into the seen-set, so
-    # it must NOT belatedly ping when the window ends and attended resumes.
+# Supervisor-liveness gating (issue #215): the afk-suppression of gate/ready is
+# gated on the drain supervisor actually running — an armed .afk-state whose
+# heartbeat pid is a live process — NOT on .afk-state being merely non-empty. A
+# crashed drain (armed state, dead/absent heartbeat) is STALE and must not
+# suppress, or the operator loses visibility into parked/ready spokes forever.
+def test_stale_drain_absent_heartbeat_does_not_suppress_gate(hub: Path, tmp_path: Path) -> None:
+    # Armed window, no heartbeat file at all → no supervisor behind the state →
+    # the gate ping still fires.
+    state = tmp_path / "stale-afk-state"
+    state.write_text("drain\n")
+    missing_hb = tmp_path / "no-heartbeat"  # never created
+    _git(hub, "tag", "-a", "-m", "plan", "gate/1", "feature/1-work")
+
+    _proc, messages = _run(
+        hub, tmp_path, env_extra={"AFK_STATE": str(state), "AFK_HEARTBEAT": str(missing_hb)}
+    )
+
+    assert len(messages) == 1
+    assert "parked" in messages[0].lower()
+
+
+def test_stale_drain_dead_heartbeat_pid_does_not_suppress_ready(hub: Path, tmp_path: Path) -> None:
+    # Heartbeat present but its pid is gone (supervisor crashed after stamping) →
+    # stale → the ready ping still fires.
+    state = tmp_path / "stale-afk-state"
+    state.write_text("drain\n")
+    hb = tmp_path / "dead-heartbeat"
+    hb.write_text(f"{_dead_pid()} 0\n")
+    _git(hub, "tag", "ready/1", "feature/1-work")
+
+    _proc, messages = _run(
+        hub, tmp_path, env_extra={"AFK_STATE": str(state), "AFK_HEARTBEAT": str(hb)}
+    )
+
+    assert len(messages) == 1
+    assert "/land 1" in messages[0]
+
+
+def test_afk_suppressed_gate_pings_after_drain_ends(hub: Path, tmp_path: Path) -> None:
+    # A gate suppressed under a LIVE drain is NOT recorded as seen (#215): the ping
+    # is deferred, not lost. Once the drain ends and attended resumes, the still-
+    # present marker fires so the operator regains visibility into the parked spoke.
     seen = tmp_path / "seen"
     _git(hub, "tag", "-a", "-m", "plan", "gate/1", "feature/1-work")
 
     _proc1, first = _run(hub, tmp_path, seen_file=seen, afk=True)
     _proc2, second = _run(hub, tmp_path, seen_file=seen, afk=False)
 
+    assert first == []  # suppressed while the drain is live
+    assert len(second) == 1  # deferred, then delivered once attended resumes
+    assert "parked" in second[0].lower()
+
+
+def test_afk_suppressed_gate_pings_when_supervisor_dies(hub: Path, tmp_path: Path) -> None:
+    # The exact issue scenario: a park is suppressed under a live drain, then the
+    # supervisor crashes (state stays armed, heartbeat pid gone). Because the
+    # suppressed marker was never recorded seen, the now-stale window lets it fire —
+    # the lost-forever ping is instead delivered on the next poll.
+    seen = tmp_path / "seen"
+    _git(hub, "tag", "-a", "-m", "plan", "gate/1", "feature/1-work")
+
+    _proc1, first = _run(hub, tmp_path, seen_file=seen, afk=True)
+    armed_state = tmp_path / "afk-state"  # written by the afk=True run, still armed
+    dead_hb = tmp_path / "crashed-heartbeat"
+    dead_hb.write_text(f"{_dead_pid()} 0\n")
+    _proc2, second = _run(
+        hub,
+        tmp_path,
+        seen_file=seen,
+        env_extra={"AFK_STATE": str(armed_state), "AFK_HEARTBEAT": str(dead_hb)},
+    )
+
     assert first == []
-    assert second == []
+    assert len(second) == 1
+    assert "parked" in second[0].lower()
 
 
 # /afk drain-complete (issue #150): hub-afk writes <git-common-dir>/.afk-drain-complete
