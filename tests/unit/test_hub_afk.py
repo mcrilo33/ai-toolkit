@@ -5075,3 +5075,141 @@ def test_kickoff_instructs_gate_plan_passthrough() -> None:
     assert "gitignored" in out, (
         "the kickoff must direct the --plan-file to a gitignored scratch path"
     )
+
+
+# ── event-driven wake (issue #176) ────────────────────────────────────────────
+# The 120s poll is inverted: parked spokes announce and SIGUSR1 the supervisor, which
+# sleeps interruptibly and, on wake, drains the spool + services the announcers. The tick
+# relaxes to a 300s backstop. Events are WAKE-UPS, not state — slot_state re-derives, so
+# duplicate / stale / lost events are all safe.
+
+
+def test_afk_tick_seconds_defaults_to_300() -> None:
+    # The relaxed backstop tick (#176): the poll is no longer the primary answer latency.
+    result = _call("echo $AFK_TICK_SECONDS", env={"AFK_TICK_SECONDS": ""})
+
+    assert result.stdout.strip() == "300"
+
+
+def test_afk_stale_ticks_defaults_to_4() -> None:
+    # Scaled to the 300s tick so the wedge threshold stays ~20min (4x300s), not the ~50min
+    # a 120s-era default of 10 would silently stretch to.
+    result = _call("echo $AFK_STALE_TICKS", env={"AFK_STALE_TICKS": ""})
+
+    assert result.stdout.strip() == "4"
+
+
+def test_usr1_sets_the_woken_flag() -> None:
+    # The trap the whole wake path hangs on: a delivered USR1 flips _AFK_WOKEN.
+    result = _call('kill -USR1 $$; sleep 0.1; echo "woken=$_AFK_WOKEN"')
+
+    assert "woken=1" in result.stdout, result.stdout + result.stderr
+
+
+def test_afk_interruptible_sleep_wakes_early_on_usr1() -> None:
+    # Park -> answer under one tick: a USR1 during the sleep returns it in well under the
+    # 30s argument, so servicing does not wait a full backstop interval.
+    start = time.monotonic()
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{HUB_AFK}"; ( sleep 0.5; kill -USR1 $$ ) & afk_interruptible_sleep 30; echo "done woken=$_AFK_WOKEN"',
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TZ": "UTC"},
+        timeout=15,
+    )
+    elapsed = time.monotonic() - start
+
+    # woken=1 proves the trap fired (not an instant no-op); the timing window proves it both
+    # WAITED for the signal (> the 0.5s killer) and returned early (< the 30s argument).
+    assert result.stdout.strip() == "done woken=1", result.stderr
+    assert 0.4 < elapsed < 10, f"USR1 must cut the 30s sleep short after ~0.5s, took {elapsed:.1f}s"
+
+
+def test_afk_interruptible_sleep_runs_full_when_no_signal() -> None:
+    # With no signal it is a real sleep, not a no-op that would busy-spin the loop.
+    start = time.monotonic()
+    _call("afk_interruptible_sleep 1")
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= 0.9, f"a signal-free sleep must actually wait, took {elapsed:.1f}s"
+
+
+def _wake_stub_prelude() -> str:
+    """Stub the passes so service_event_wake is driven without shelling out to git/claude."""
+    return (
+        "answer_pass() { echo ANSWER; }; "
+        "auto_land() { echo LAND; }; "
+        "dispatch_batch() { echo DISPATCH; }; "
+        "reap_pass() { echo REAP; }; "
+        "reconcile_markers() { echo RECONCILE; }; "
+    )
+
+
+def test_service_event_wake_drains_and_answers_and_lands(tmp_path: Path) -> None:
+    events = tmp_path / "st" / "events"
+    events.mkdir(parents=True)
+    (events / "100-5-park").touch()
+
+    result = _call(
+        _wake_stub_prelude() + "service_event_wake", env={"AFK_STATE_DIR": str(tmp_path / "st")}
+    )
+
+    out = result.stdout
+    assert "ANSWER" in out and "LAND" in out, out + result.stderr
+    assert "DISPATCH" not in out and "REAP" not in out and "RECONCILE" not in out, (
+        "a wake runs only the announce-driven passes; silence-shaped work stays on the tick"
+    )
+    assert not any(events.iterdir()), "the spool is drained on wake"
+
+
+def test_service_event_wake_skips_land_on_auth_failure(tmp_path: Path) -> None:
+    events = tmp_path / "st" / "events"
+    events.mkdir(parents=True)
+    (events / "100-5-park").touch()
+    prelude = "answer_pass() { _AFK_AUTH_FAILED=1; echo ANSWER; }; auto_land() { echo LAND; }; "
+
+    result = _call(prelude + "service_event_wake", env={"AFK_STATE_DIR": str(tmp_path / "st")})
+
+    assert "ANSWER" in result.stdout
+    assert "LAND" not in result.stdout, "a dead token must skip auto_land, like supervise_tick"
+
+
+def test_duplicate_events_service_the_issue_once(tmp_path: Path) -> None:
+    # Duplicate-event idempotence: two events for one issue drain to a single log line and a
+    # single answer_pass invocation — slot_state, not the event count, drives the work.
+    events = tmp_path / "st" / "events"
+    events.mkdir(parents=True)
+    (events / "100-5-gate").touch()
+    (events / "101-5-park").touch()
+    prelude = "answer_pass() { echo ANSWER; }; auto_land() { :; }; "
+
+    result = _call(prelude + "service_event_wake", env={"AFK_STATE_DIR": str(tmp_path / "st")})
+
+    assert result.stdout.count("ANSWER") == 1, "answer_pass runs once, not once per event"
+    assert result.stderr.count("event wake — servicing") == 1
+    assert "servicing 5" in result.stderr, "the one distinct issue is logged once"
+
+
+def test_lost_event_is_handled_by_the_next_sweep(tmp_path: Path) -> None:
+    # Lost-event degradation: a spool file whose signal never arrived. The full sweep does
+    # not read the spool at all — it re-derives via slot_state — so a waiting spoke is still
+    # answered on the next tick, and the (lost) event never gates the outcome.
+    events = tmp_path / "st" / "events"
+    events.mkdir(parents=True)
+    (events / "100-5-park").touch()  # the lost event: written, never signaled
+    prelude = (
+        'inflight_worktrees() { printf "/wt/5\\t5\\n"; }; '
+        "slot_state() { echo waiting; }; "
+        "_afk_run_with_heartbeat_fg() { shift; echo ANSWERED; }; "
+        "reconcile_markers() { :; }; dispatch_batch() { :; }; auto_land() { :; }; reap_pass() { :; }; "
+    )
+
+    result = _call(prelude + "supervise_tick", env={"AFK_STATE_DIR": str(tmp_path / "st")})
+
+    assert "ANSWERED" in result.stdout, (
+        "the sweep services the waiting spoke regardless of the event"
+    )
