@@ -738,13 +738,40 @@ review_artifact_signature() {
 TRIPWIRE_UNSET='—'            # sentinel for a config marker that is not set
 TRIPWIRE_BREACH_RC=97        # exit code on breach; outside pytest's 0-5 range
 
+# Scoped tripwire (issue #205): when _TRIPWIRE_SCOPE is a non-empty newline list of
+# refnames, capture/check/restore consider ONLY those refs (plus HEAD and the config
+# markers) — every other ref in a shared ref store is ignored. run_under_tripwire_scoped
+# sets it (dynamically scoped `local`, so the nested capture/check/restore see it) for
+# worktree-land's merge-sanity check, which runs pytest INSIDE the shared hub ref store:
+# there a sibling spoke committing, pushing a branch, or pushing a ready/<N> tag would
+# otherwise trip a false breach (and the restore would roll the sibling ref back). Empty
+# / unset = the original whole-repo tripwire (the pre-push gate, red-proof backstop).
+
+# Filter a `git show-ref [--head]` stream to HEAD + the scoped refnames. Passthrough
+# (no filtering) when the scope is empty. Each input line is `<sha> <refname>`. The
+# scope is passed through the environment and read via awk ENVIRON — a multi-ref list
+# is newline-separated, and BSD/macOS awk aborts on a newline in a `-v` assignment
+# (which would silently empty the snapshot and disable the tripwire), whereas ENVIRON
+# carries newlines intact.
+_tripwire_scope_filter() {
+  local scope="${_TRIPWIRE_SCOPE:-}"
+  if [ -z "$scope" ]; then cat; return 0; fi
+  _TRIPWIRE_SCOPE_ENV="$scope" awk '
+    BEGIN {
+      n = split(ENVIRON["_TRIPWIRE_SCOPE_ENV"], a, "\n")
+      for (i = 1; i <= n; i++) if (a[i] != "") keep[a[i]] = 1
+    }
+    $2 == "HEAD" || ($2 in keep)
+  '
+}
+
 # Capture the integrity markers for the repo of the current git context (the
-# real repo the hook targets). Read-only.
+# real repo the hook targets). Read-only. Honors _TRIPWIRE_SCOPE (issue #205).
 tripwire_capture() {
   local line bare worktree
   while IFS= read -r line; do
     [ -n "$line" ] && printf 'ref %s\n' "$line"
-  done < <(git show-ref --head 2>/dev/null || true)
+  done < <(git show-ref --head 2>/dev/null | _tripwire_scope_filter || true)
   bare="$(git config --get core.bare 2>/dev/null || printf '%s' "$TRIPWIRE_UNSET")"
   worktree="$(git config --get core.worktree 2>/dev/null || printf '%s' "$TRIPWIRE_UNSET")"
   printf 'cfg core.bare %s\n' "$bare"
@@ -892,7 +919,7 @@ tripwire_restore() {
       continue
     fi
     git update-ref -d "$cur_ref" 2>/dev/null || true
-  done < <(git show-ref 2>/dev/null || true)
+  done < <(git show-ref 2>/dev/null | _tripwire_scope_filter || true)
   # Restore the config markers (whitespace-preserving extraction).
   _tripwire_restore_cfg core.bare "$(_tripwire_cfg_value "$before" core.bare)"
   _tripwire_restore_cfg core.worktree "$(_tripwire_cfg_value "$before" core.worktree)"
@@ -927,4 +954,19 @@ run_under_tripwire() {
   _tripwire_report_breach "$changed" "restoring the snapshot and ABORTING the push."
   tripwire_restore "$before"
   return "$TRIPWIRE_BREACH_RC"
+}
+
+# Like run_under_tripwire, but the integrity snapshot/check/restore covers ONLY the
+# refs named in $1 (a newline-separated list) plus HEAD and the config markers; every
+# other ref in a shared ref store is ignored (issue #205). worktree-land's merge-sanity
+# check runs pytest inside the shared hub ref store, where a concurrent sibling spoke
+# legitimately moves refs the land does not own — a committed sibling head, a pushed
+# branch's remote-tracking ref, an /afk drain's ready/<N> tag. Snapshotting those made a
+# sibling's mid-check push read as a breach AND let the restore delete the sibling's
+# freshly-pushed ref. Scope the tripwire to the ref the land itself owns
+# (refs/heads/<default>, the merge commit it is about to push): a real escape onto that
+# ref is still caught, sibling churn on every other ref is not.
+run_under_tripwire_scoped() {
+  local _TRIPWIRE_SCOPE="$1"; shift
+  run_under_tripwire "$@"
 }
