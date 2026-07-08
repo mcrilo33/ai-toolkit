@@ -55,8 +55,12 @@ model:
     model: claude-opus-4-8[1m]
     effort: max
 
-  # Model per solo-cycle step. SCHEMA ONLY for now — no consumer selects a
-  # model per cycle step yet; wiring lands in a follow-up (see issue #142).
+  # Model per solo-cycle step (issue #182). Realized by delegating each step to
+  # its routed subagent (red→tdd-red, green→tdd-green, review→code-review); the
+  # solo-cycle skill instructs the delegation and `cycle_step_effective_model`
+  # in ai_toolkit_config.py resolves the model. anchor/push have no delegate and
+  # fail open to the spoke driver model. A per-step value here MUST match its
+  # delegate's `model.subagents` entry (a test binds them, so a drift fails loud).
   cycle_steps:
     anchor:
       model: claude-opus-4-8

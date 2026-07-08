@@ -87,14 +87,52 @@ def agent_model(config: dict, name: str) -> ModelSpec | None:
 
 
 def cycle_step_model(config: dict, step: str) -> ModelSpec | None:
-    """A solo-cycle step's (model, effort), or None when unset.
+    """A solo-cycle step's declared (model, effort), or None when unset.
 
-    Schema-only for now — no consumer selects a model per cycle step yet.
+    This is the *declared intent* for a cycle step. The step is realized by
+    delegating to a routed subagent (see :data:`CYCLE_STEP_AGENTS` /
+    :func:`cycle_step_effective_model`); the two are bound self-consistent by a
+    real-config test so a drift fails loudly rather than routing silently wrong.
     """
     steps = _model_section(config).get("cycle_steps")
     if not isinstance(steps, dict):
         return None
     return _spec(steps.get(step))
+
+
+# The solo-cycle step → delegate subagent map (issue #182). The delegate is what
+# actually runs the step, so it carries the model the step executes on (per-span
+# attributable in Langfuse). anchor/push have no delegate — they are mechanical,
+# driver-run work — so the effective model fails open to the spoke driver model.
+CYCLE_STEP_AGENTS: dict[str, str] = {
+    "red": "tdd-red",
+    "green": "tdd-green",
+    "review": "code-review",
+}
+
+
+def cycle_step_agent(step: str) -> str | None:
+    """The subagent a solo-cycle step delegates to, or None when driver-run.
+
+    A static wiring fact (which agent runs each step), independent of the config
+    file — so it takes no config. None for anchor/push (mechanical, no delegate)
+    and for any unknown step.
+    """
+    return CYCLE_STEP_AGENTS.get(step)
+
+
+def cycle_step_effective_model(config: dict, step: str) -> ModelSpec | None:
+    """The (model, effort) a cycle step actually runs on, or None to fail open.
+
+    Resolves the step's delegate subagent (:func:`cycle_step_agent`) and returns
+    that agent's configured routing (:func:`agent_model`). Returns None — so the
+    consumer keeps today's behavior (the spoke driver model) — when the step has
+    no delegate (anchor/push/unknown) or the delegate carries no config routing.
+    """
+    agent = cycle_step_agent(step)
+    if agent is None:
+        return None
+    return agent_model(config, agent)
 
 
 def afk_answerer_model(config: dict) -> ModelSpec | None:
