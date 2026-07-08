@@ -96,6 +96,16 @@ for _var in _LEAKED_GIT_HOOK_VARS:
 for _var in [_k for _k in os.environ if _k.startswith("GIT_CONFIG_")]:
     os.environ.pop(_var, None)
 
+# Ready-gate bypass isolation (issue #206). AI_TOOLKIT_READY_FORCE=1 makes spoke-ready.sh
+# skip the whole #172 ready-gate precondition check (clean tree / pushed tip / review
+# artifact) — auto_land's ENTIRE trust basis. A dev shell that exported it as a convenience,
+# or a leaked fixture env (the GIT_* / AI_TOOLKIT_PARENT_SPAN leak class), would silently
+# disarm that gate for every test that inherits os.environ, turning the ready-refusal tests
+# green-by-bypass instead of by-behavior. Strip it session-wide; a test that wants the force
+# path opts in explicitly by passing it in the child env. Regression guard:
+# tests/unit/test_spoke_ready.py::test_conftest_strips_ready_force.
+os.environ.pop("AI_TOOLKIT_READY_FORCE", None)
+
 # Telemetry isolation (issue #49) — see the module docstring. Drop the opt-in so the
 # recorder no-ops, and redirect the dir to a throwaway sandbox as belt-and-suspenders
 # against any test that re-enables telemetry without supplying its own dir.

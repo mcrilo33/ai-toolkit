@@ -227,8 +227,13 @@ verify_ready_preconditions() {
   fi
 }
 
+# READY_FORCED records a force bypass so it can be stamped into the tag annotation
+# below — a bypass of auto_land's trust gate must be auditable at LAND time, not just
+# a line in this shell's stderr the hub never sees (issue #206).
+READY_FORCED=0
 if [ "$KIND" = "ready" ]; then
   if [ "${AI_TOOLKIT_READY_FORCE:-}" = "1" ]; then
+    READY_FORCED=1
     echo "spoke-ready: ⚠ AI_TOOLKIT_READY_FORCE=1 — emitting ready/$ISSUE WITHOUT verifying its preconditions (clean tree / pushed tip / review artifact). This bypasses auto_land's trust gate." >&2
   else
     verify_ready_preconditions "$ISSUE"
@@ -236,6 +241,20 @@ if [ "$KIND" = "ready" ]; then
 fi
 
 TAG="$KIND/$ISSUE"
+
+# A force-bypassed ready/<N> stamps the bypass LOUDLY into the tag annotation
+# (issue #206): the hub reads the tag body at land time (%(contents:body)), so the
+# audit trail travels WITH the marker instead of living only in this shell's stderr.
+if [ "$READY_FORCED" = "1" ]; then
+  FORCE_NOTE="AI_TOOLKIT_READY_FORCE=1: ready-gate preconditions (clean tree / pushed tip / review artifact) NOT verified — auto_land trust gate bypassed."
+  if [ -n "$BODY" ]; then
+    BODY="$BODY
+
+$FORCE_NOTE"
+  else
+    BODY="$FORCE_NOTE"
+  fi
+fi
 
 # The annotated tag carries SUBJECT (the state word) and, when a reason was
 # given, BODY as a second message paragraph — read back by consumers via

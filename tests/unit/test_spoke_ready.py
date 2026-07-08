@@ -680,6 +680,44 @@ def test_ready_force_is_logged_loudly(spoke: Path) -> None:
     assert "FORCE" in (result.stdout + result.stderr), "the force bypass must be logged loudly"
 
 
+def test_ready_force_stamped_into_tag_annotation(spoke: Path) -> None:
+    # Issue #206 — the force bypass must be auditable at LAND time, not only a line
+    # in the emitting shell's stderr the hub never sees. Stamp it LOUDLY into the tag
+    # annotation body, which the hub reads back via %(contents:body).
+    shutil.rmtree(spoke / ".review")
+
+    result = _run(spoke, "45", env={**_GIT_ENV, "AI_TOOLKIT_READY_FORCE": "1"})
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    body = _git(spoke, "tag", "-l", "--format=%(contents:body)", "ready/45")
+    assert "AI_TOOLKIT_READY_FORCE" in body, (
+        f"the force bypass must be recorded in the tag annotation\n{body!r}"
+    )
+
+
+def test_ready_tag_body_clean_when_not_forced(spoke: Path) -> None:
+    # The audit note rides ONLY on a forced emission — a normal (gated) ready/N tag
+    # must not carry a spurious force stamp.
+    result = _run(spoke, "45")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    body = _git(spoke, "tag", "-l", "--format=%(contents:body)", "ready/45")
+    assert "AI_TOOLKIT_READY_FORCE" not in body, (
+        f"unforced ready/N must not stamp a force note\n{body!r}"
+    )
+
+
+def test_conftest_strips_ready_force() -> None:
+    # Issue #206 — AI_TOOLKIT_READY_FORCE bypasses auto_land's ENTIRE trust gate.
+    # A leaked env (the GIT_* / AI_TOOLKIT_PARENT_SPAN leak class) would silently
+    # disarm the #172 gate for every test inheriting os.environ (turning the refusal
+    # tests green-by-bypass), so the conftest must strip it session-wide.
+    assert not os.environ.get("AI_TOOLKIT_READY_FORCE"), (
+        "conftest must strip AI_TOOLKIT_READY_FORCE so no test inherits a gate bypass; "
+        f"it is still set to {os.environ.get('AI_TOOLKIT_READY_FORCE')!r}"
+    )
+
+
 def test_accept_is_not_subject_to_the_ready_gate(spoke: Path, remote: Path) -> None:
     # --accept is unchanged by #172: it keeps only its durability check, so a
     # missing review artifact / dirty tree must NOT block it.
