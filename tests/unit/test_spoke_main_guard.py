@@ -177,6 +177,8 @@ def spoke(hub: Path, tmp_path: Path) -> Path:
         pytest.param("cd /tmp\ngit checkout main", id="newline-after-cd-checkout"),
         pytest.param("echo hi\ngit switch main", id="newline-switch-main"),
         pytest.param("true\ngit branch main", id="newline-branch-bare-create"),
+        # The land-script substring deny must still fire across a newline.
+        pytest.param("true\nworktree-land.sh 32", id="newline-land-script"),
     ],
 )
 def test_spoke_denies_main_mutation(spoke: Path, command: str) -> None:
@@ -234,6 +236,12 @@ def test_spoke_deny_emits_reason(spoke: Path) -> None:
         pytest.param("ls -la", id="non-git"),
         # A newline boundary must not over-block the sanctioned reconciliation.
         pytest.param("git fetch origin\ngit merge origin/main", id="newline-fetch-merge"),
+        # A newline INSIDE a quoted string stays inert (sg_walk_segments tracks
+        # quote state), so a checkout-main-shaped substring in a commit message
+        # is not laundered into a forbidden clause and must not be denied.
+        pytest.param(
+            'git commit -m "fix:\ngit checkout main was broken"', id="newline-in-quoted-msg"
+        ),
     ],
 )
 def test_spoke_allows_reconciliation_and_own_work(spoke: Path, command: str) -> None:
