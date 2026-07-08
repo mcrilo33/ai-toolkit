@@ -1075,14 +1075,16 @@ _broker_resolve_in_roots() {
   local p="$1" cwd="$2" wt="$3" slug="$4" tasks="$5" abs
   # Reject any token the shell rewrites at execution to a path the textual/realpath checks
   # cannot see: traversal (`..`), variable/command substitution (`$`, backtick), tilde, brace
-  # and glob metacharacters, AND quoting/escaping (`"` `'` `\`). The last three are load-
-  # bearing: `rm "/etc/x"` carries a leading quote, so the `/*` absolute test below misses it
-  # and it is joined onto the worktree cwd as if relative — realpath treats the quote as an
-  # ordinary character, so a quoted out-of-tree absolute path would pass containment yet the
-  # shell strips the quote and mutates the real path. A false deny escalates — the safe way.
+  # and glob metacharacters, quoting/escaping (`"` `'` `\`), and redirection (`>` `<`). Two
+  # are load-bearing beyond the obvious: a leading quote/backslash (`rm "/etc/x"`) makes the
+  # `/*` absolute test below miss it so it is joined onto the worktree cwd as if relative, and
+  # a redirection (`cd foo>/etc/x`) hides an out-of-tree target the shell splits off — this
+  # resolver is the cd-handler's ONLY guard, so it must reject `>`/`<` that _permission_seg_safe
+  # rejects on the mutation path. realpath treats all these as ordinary chars, so an escaped
+  # target would pass containment yet the shell mutates the real path. A false deny escalates.
   case "$p" in
     *'..'* | *'$'* | *'`'* | '~'* | *'{'* | *'}'* | *'*'* | *'?'* | *'['* | *']'* \
-      | *'"'* | *"'"* | *'\'*) return 1 ;;
+      | *'"'* | *"'"* | *'\'* | *'>'* | *'<'*) return 1 ;;
   esac
   case "$p" in /*) abs="$p" ;; *) abs="$cwd/$p" ;; esac
   # Collapse `/./` and duplicate slashes textually (no glob, no fs touch). The replacement

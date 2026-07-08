@@ -2186,6 +2186,22 @@ def test_classify_permission_escalates_quoted_or_target_dir_escapes(
     assert _classify_with_wt(cmd, spoke_repo, tasks) == "ESCALATE"
 
 
+def test_classify_permission_escalates_redirection_in_cd_target(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The cd-tracking branch resolves its target through _broker_resolve_in_roots, which must
+    # reject redirection operators too: `cd foo>/etc/x` looks like one in-tree token but the
+    # shell splits it into `cd foo` + an out-of-tree redirect. Pre-#203 the `cd` segment fell
+    # through to the segment-level `>` guard; the new branch must not regress that.
+    tasks = tmp_path / "tasks"
+
+    assert _classify_with_wt("cd foo>/etc/afk_probe", spoke_repo, tasks) == "ESCALATE"
+    assert _classify_with_wt("cd foo 2>/etc/afk_probe", spoke_repo, tasks) == "ESCALATE"
+    assert _classify_with_wt("cd foo>>/etc/afk_probe", spoke_repo, tasks) == "ESCALATE"
+    # a redirect into an in-tree secret escapes the cd path's (absent) secret guard too
+    assert _classify_with_wt(f"cd foo>{spoke_repo}/.env", spoke_repo, tasks) == "ESCALATE"
+
+
 def test_classify_permission_mutation_lane_inert_without_worktree() -> None:
     # Backward-compatible: with NO worktree argument the mutation lane is inert, so a bare
     # `mv`/`rm`/`chmod` still default-denies exactly as before (#149/#171 posture).
