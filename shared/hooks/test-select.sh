@@ -77,6 +77,15 @@ fi
 
 note() { echo "test-select: $*" >&2; }
 
+is_zero_sha() {
+  local sha="$1"
+  [ -n "$sha" ] || return 1
+  case "$sha" in
+    *[!0]*) return 1 ;;  # contains a non-zero char
+    *) return 0 ;;       # all zeros
+  esac
+}
+
 # Defense-in-depth for issue #30: git exports GIT_DIR/GIT_WORK_TREE/etc. into this
 # hook's environment. tests/conftest.py strips them before fixtures load, but we
 # also drop them for every pytest CHILD here so a test that spawns git before the
@@ -93,6 +102,23 @@ GIT_HOOK_UNSET=(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
 # unread pipe would hand the caller a SIGPIPE under pipefail.
 STDIN="$(cat || true)"
 
+# Tripwire scope (issue #188): the integrity snapshot guards ONLY the refs this
+# push updates — the local refs git names on the pre-push stdin — plus HEAD and
+# the config markers. Any other ref moving mid-gate is concurrent-spoke behavior
+# in the shared ref store (a sibling's commit, rewind, marker tag, or completing
+# push), not a breach — the whole-namespace snapshot both false-aborted those
+# pushes and rolled sibling refs back on restore (#135, #188). A ref deletion
+# carries no local ref and a raw-sha local side is not a refname, so neither
+# contributes; an empty scope degrades to the whole-repo tripwire.
+PUSH_SCOPE=""
+while read -r _lref lsha _rref _rsha; do
+  [ -n "${lsha:-}" ] || continue
+  if is_zero_sha "$lsha"; then continue; fi
+  case "$_lref" in
+    refs/*) PUSH_SCOPE+="${_lref}"$'\n' ;;
+  esac
+done <<< "$STDIN"
+
 # ── Env escape hatches (worktree-land's --skip-tests / --test-cmd) ──────────────
 if [ -n "${TEST_SELECT_SKIP:-}" ]; then
   note "TEST_SELECT_SKIP set — skipping tests"
@@ -104,7 +130,7 @@ if [ -n "${TEST_SELECT_CMD:-}" ]; then
   # The custom suite is a test command too (worktree-land --test-cmd) — run it
   # under the same git-hook env strip so it can't reach the real repo either, and
   # under the repo-integrity tripwire (issue #31) so an escape still aborts.
-  run_under_tripwire "${GIT_HOOK_UNSET[@]}" bash -c "$TEST_SELECT_CMD" || rc=$?
+  run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" bash -c "$TEST_SELECT_CMD" || rc=$?
   exit "$rc"
 fi
 
@@ -146,15 +172,6 @@ fi
 # it. Guarded on file existence: synced repos without the file are unaffected.
 META_TEST_FILE="tests/unit/test_test_reverse_index.py"
 META_TEST_NODE="$META_TEST_FILE::TestControlPlaneCoverage"
-
-is_zero_sha() {
-  local sha="$1"
-  [ -n "$sha" ] || return 1
-  case "$sha" in
-    *[!0]*) return 1 ;;  # contains a non-zero char
-    *) return 0 ;;       # all zeros
-  esac
-}
 
 # Default branch for the new-branch merge-base fallback: origin/HEAD, else the
 # conventional main/master, else main.
@@ -364,31 +381,32 @@ if [ "$STAMPS" = "1" ]; then
   fi
 fi
 
-# Every tier runs pytest under the repo-integrity tripwire (issue #31): the run
-# is bracketed by a snapshot/verify of HEAD + ref tips + core.bare/worktree, so a
-# test that escapes isolation and mutates THIS repo aborts the push (and the
-# snapshot is restored — without ever rewinding a ref that only gained commits;
-# issue #135) instead of corrupting it silently. Fast-forward advances of
-# branches checked out in live sibling worktrees are legitimate concurrent work,
-# not escapes, and do not trip it (#135). Only TEST_SELECT_SKIP (handled above)
-# bypasses the gate.
+# Every tier runs pytest under the repo-integrity tripwire (issue #31), scoped
+# to the refs this push updates (PUSH_SCOPE, issue #188): the run is bracketed
+# by a snapshot/verify of the pushed ref tips + HEAD + core.bare/worktree, so a
+# test that escapes isolation and mutates what this push ships aborts the push
+# (and the snapshot is restored — without ever rewinding a ref that only gained
+# commits; issue #135) instead of corrupting it silently. Refs outside the push
+# are concurrent-spoke territory (sibling commits, marker tags, completing
+# pushes) and are neither checked nor restored (#135, #188). Only
+# TEST_SELECT_SKIP (handled above) bypasses the gate.
 rc=0
 case "$DECISION" in
   PYTHON)
     if [ "$TIER_TO_RUN" = "testmon" ]; then
       note "python-only diff — pytest --testmon"
-      run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" --testmon || rc=$?
+      run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" --testmon || rc=$?
       # The meta-test rides along as its own invocation: mixing an explicit
       # node id into --testmon would let testmon deselect it.
       if [ -f "$META_TEST_FILE" ]; then
         note "control-plane coverage meta-test"
         rc2=0
-        run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" "$META_TEST_NODE" || rc2=$?
+        run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" "$META_TEST_NODE" || rc2=$?
         [ "$rc" -ne 0 ] || rc=$rc2
       fi
     else
       note "python-only diff but testmon not installed — full suite"
-      run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" || rc=$?
+      run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" || rc=$?
     fi
     ;;
   SELECTED)
@@ -400,11 +418,11 @@ case "$DECISION" in
       SEL_ARR+=("$META_TEST_NODE")
     fi
     note "mapped diff — selected test files: ${SEL_ARR[*]}"
-    run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" "${SEL_ARR[@]}" || rc=$?
+    run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" "${SEL_ARR[@]}" || rc=$?
     if [ "$has_py" = "1" ]; then
       note "mixed diff — pytest --testmon for the python part"
       rc2=0
-      run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" --testmon || rc2=$?
+      run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" --testmon || rc2=$?
       [ "$rc" -ne 0 ] || rc=$rc2
     fi
     ;;
@@ -414,7 +432,7 @@ case "$DECISION" in
     else
       note "non-python or unrecognized changes — full suite"
     fi
-    run_under_tripwire "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" || rc=$?
+    run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" || rc=$?
     ;;
 esac
 
