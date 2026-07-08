@@ -1206,6 +1206,9 @@ def test_merges_existing_settings_local(hub: Path) -> None:
     assert data["other"] is True
     for rule in SEEDED_RULES:
         assert rule in data["permissions"]["allow"], f"missing seeded rule: {rule}"
+    # The dynamic hub-root read rule (#181) survives the jq merge branch too, not just
+    # the initial-write branch — the merge is rule-agnostic ($rules - $cur).
+    assert f"Read(/{os.path.realpath(hub)}/**)" in data["permissions"]["allow"]
 
 
 def test_adhoc_branch_allowlist(hub: Path) -> None:
