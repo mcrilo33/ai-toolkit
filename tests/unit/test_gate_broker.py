@@ -139,8 +139,15 @@ def spoke_repo(tmp_path: Path) -> Path:
         "GIT_COMMITTER_NAME": "t",
         "GIT_COMMITTER_EMAIL": "t@t",
     }
-    for cmd in (["git", "init", "-q"], ["git", "commit", "-q", "--allow-empty", "-m", "init"]):
-        subprocess.run(cmd, cwd=wt, check=True, env=env, capture_output=True)
+    # Commit a .gitignore modelling the production spoke worktree: the runtime artifacts a
+    # parked spoke writes (`.testmondata*`, OTel dumps under `.ai-toolkit/`) are IGNORED, so
+    # the untracked-not-ignored fingerprint (#203) never blames them on the reasoner.
+    (wt / ".gitignore").write_text(".testmondata*\n.ai-toolkit/\n.venv/\n")
+    subprocess.run(["git", "init", "-q"], cwd=wt, check=True, env=env, capture_output=True)
+    subprocess.run(["git", "add", ".gitignore"], cwd=wt, check=True, env=env, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "init"], cwd=wt, check=True, env=env, capture_output=True
+    )
     return wt
 
 
@@ -624,6 +631,38 @@ def test_worktree_fingerprint_tracks_only_tracked_content(spoke_repo: Path) -> N
     (spoke_repo / "a.txt").write_text("one-edited")
     fp3 = _call(f"_broker_worktree_fingerprint '{spoke_repo}'").stdout.strip()
     assert fp3 != fp1, "a content edit of a tracked file must change the fingerprint"
+
+
+def test_worktree_fingerprint_detects_untracked_creation(spoke_repo: Path) -> None:
+    # #203 finding 2: a reasoner that CREATES a brand-new untracked-not-ignored file mutates
+    # the worktree. The tracked-only fingerprint (#168) missed it — the read-only DETECTION
+    # layer must catch it. Untracked-not-ignored (`--others --exclude-standard`) closes the
+    # gap while the ignored runtime artifacts (the #168 false-positive class) stay excluded.
+    fp1 = _call(f"_broker_worktree_fingerprint '{spoke_repo}'").stdout.strip()
+
+    (spoke_repo / "reasoner_new.py").write_text("print('created by the reasoner')\n")
+    fp2 = _call(f"_broker_worktree_fingerprint '{spoke_repo}'").stdout.strip()
+
+    assert fp1 and fp2 != fp1, "a new untracked-not-ignored file must change the fingerprint"
+
+
+def test_broker_service_gate_voids_answer_when_reasoner_creates_file(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str]
+) -> None:
+    # The read-only guard must void an answer when the reasoner CREATES a new untracked file
+    # (not just when it edits tracked content): a creation is a mutation of a read-only tree,
+    # so the gate escalates rather than trusting the answer (#203 finding 2).
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": "printf 'x' > reasoner_new.py; printf 'ANSWER: go ahead'",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    log = Path(env["_READY_LOG"]).read_text()
+    assert "--blocked 5" in log, f"a reasoner file-creation must escalate, not inject: {log}"
+    assert "worktree" in log.lower() or "mutat" in log.lower(), log
 
 
 def test_reasoner_runs_in_worktree_cwd(spoke_repo: Path, tmp_path: Path) -> None:
@@ -1684,7 +1723,16 @@ def test_inject_verify_default_budget_is_60(spoke_repo: Path, tmp_path: Path) ->
         ("chmod +x scripts/x.sh", "APPROVE"),
         ("pytest", "ESCALATE"),  # a bare pytest is the full-suite ref-rewind hazard (#135)
         ("python -m pytest", "ESCALATE"),
-        ("pytest tests/x.py", "APPROVE"),  # an argument scopes it
+        ("pytest -q", "ESCALATE"),  # #203: flags alone still run the whole suite
+        ("pytest -x", "ESCALATE"),
+        ("python -m pytest -q --tb=short", "ESCALATE"),  # only flags → full suite
+        ("pytest -k foo", "ESCALATE"),  # -k's value is not a scoping path → full collection
+        ("pytest -m slow", "ESCALATE"),  # -m's value likewise
+        ("pytest -p no:cacheprovider", "ESCALATE"),  # -p's value likewise
+        ("pytest tests/x.py", "APPROVE"),  # a NON-FLAG arg (path/node-id) scopes it
+        ("pytest -q tests/x.py", "APPROVE"),  # flags + a path is fine
+        ("pytest -k foo tests/x.py", "APPROVE"),  # a real path alongside -k is fine
+        ("pytest tests", "APPROVE"),  # a bare dir target scopes it
         ("python3 -m pytest tests/unit", "APPROVE"),
     ],
 )
@@ -1900,3 +1948,226 @@ def test_afk_drain_event_issues_empty_when_no_spool(tmp_path: Path) -> None:
 
     assert result.returncode == 0
     assert result.stdout.strip() == ""
+
+
+# ── issue #203 finding 4: compound-command decomposition + in-worktree lane ────
+# A confirmation dialog on a COMPOUND command (cd into the worktree, mv a stashed file
+# from the scratchpad, chmod +x it, stash pop, targeted pytest) used to be classified as
+# one opaque "risky" string and escalated, wedging the whole drain. classify_permission
+# now takes the spoke's worktree, decomposes the command, tracks `cd`, and APPROVES writes
+# confined to the worktree or its session scratchpad.
+
+
+def _slug_for(wt: Path) -> str:
+    import re
+
+    return re.sub(r"[^A-Za-z0-9]", "-", str(wt))
+
+
+def _scratchpad_for(tasks_root: Path, wt: Path) -> Path:
+    """The spoke's session scratchpad under <tasks_root>/claude-*/<munged-wt>/<sess>/."""
+    return tasks_root / "claude-77" / _slug_for(wt) / "sess-1" / "scratchpad"
+
+
+def _classify_with_wt(cmd: str, wt: Path, tasks_root: Path) -> str:
+    result = _call(
+        'classify_permission "$CMD" "$WT" | cut -f1',
+        env={"CMD": cmd, "WT": str(wt), "AFK_TASKS_ROOT": str(tasks_root)},
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+def test_classify_permission_approves_the_overnight_compound(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The exact overnight #176 shape auto-approves: cd into its own worktree, mv a stashed
+    # file from the scratchpad into the tree, chmod +x it, stash pop, run targeted pytest.
+    tasks = tmp_path / "tasks"
+    scratch = _scratchpad_for(tasks, spoke_repo)
+    cmd = (
+        f"cd {spoke_repo} && mv {scratch}/hook.sh {spoke_repo}/hook.sh && "
+        f"chmod +x {spoke_repo}/hook.sh && git stash pop && pytest tests/x.py"
+    )
+
+    assert _classify_with_wt(cmd, spoke_repo, tasks) == "APPROVE"
+
+
+def test_classify_permission_approves_relative_in_worktree_mutations(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # cd-tracking within the compound: after `cd` into a subdir, relative paths resolve
+    # under the worktree and stay approvable (mkdir/cp/rm on the spoke's own files).
+    tasks = tmp_path / "tasks"
+    (spoke_repo / "sub").mkdir()
+    cmd = "cd sub && mkdir -p out && cp a.txt out/a.txt && rm out/a.txt"
+
+    assert _classify_with_wt(cmd, spoke_repo, tasks) == "APPROVE"
+
+
+def test_classify_permission_decomposes_multiline_compound(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # Decomposition handles a multi-line string (newline-joined segments), not just && chains.
+    tasks = tmp_path / "tasks"
+    scratch = _scratchpad_for(tasks, spoke_repo)
+    cmd = f"cd {spoke_repo}\nmv {scratch}/a {spoke_repo}/a\nchmod +x {spoke_repo}/a"
+
+    assert _classify_with_wt(cmd, spoke_repo, tasks) == "APPROVE"
+
+
+def test_classify_permission_escalates_path_outside_worktree(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # One segment writing OUTSIDE the worktree/scratchpad escalates the whole compound.
+    tasks = tmp_path / "tasks"
+    scratch = _scratchpad_for(tasks, spoke_repo)
+    cmd = f"cd {spoke_repo} && mv {scratch}/hook.sh /etc/cron.d/payload"
+
+    assert _classify_with_wt(cmd, spoke_repo, tasks) == "ESCALATE"
+
+
+def test_classify_permission_escalates_chmod_on_git_internals(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A chmod on .git/ internals escapes the benign lane even though it is under the worktree.
+    tasks = tmp_path / "tasks"
+    cmd = f"chmod +x {spoke_repo}/.git/hooks/pre-commit"
+
+    assert _classify_with_wt(cmd, spoke_repo, tasks) == "ESCALATE"
+
+
+def test_classify_permission_escalates_relative_chmod_on_git_internals(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A RELATIVE chmod on .git/ must not slip past the lane into the legacy relative-chmod
+    # rule: with a worktree known, a mutation-lane miss is terminal (no fallthrough). Arming
+    # a .git/hooks script is exactly the case the lane exists to keep out.
+    tasks = tmp_path / "tasks"
+
+    assert _classify_with_wt("chmod +x .git/hooks/pre-commit", spoke_repo, tasks) == "ESCALATE"
+
+
+def test_classify_permission_escalates_brace_expansion_escape(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # Brace expansion is a shell metacharacter the textual resolver cannot see through: at
+    # runtime `{/etc/passwd,keep}` expands to two words, one out-of-tree. It must escalate.
+    tasks = tmp_path / "tasks"
+
+    assert _classify_with_wt("rm {/etc/passwd,keep}", spoke_repo, tasks) == "ESCALATE"
+    assert _classify_with_wt("cp in {out,/tmp/EXFIL}", spoke_repo, tasks) == "ESCALATE"
+
+
+def test_classify_permission_escalates_symlink_following_mutation(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A logically-in-tree path that is a symlink to an out-of-tree target must escalate: a
+    # `cp`/`chmod` follows the link and writes outside the worktree. Physical (realpath)
+    # containment catches what the textual check cannot.
+    tasks = tmp_path / "tasks"
+    outside = tmp_path / "outside_target"
+    outside.write_text("original\n")
+    link = spoke_repo / "link_out"
+    link.symlink_to(outside)
+
+    assert _classify_with_wt(
+        f"cp {spoke_repo}/payload {spoke_repo}/link_out", spoke_repo, tasks
+    ) == ("ESCALATE")
+
+
+def test_classify_permission_escalates_mutation_of_secretlike_path(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A write to a secret-like path (a .pem key) is never in the benign lane.
+    tasks = tmp_path / "tasks"
+    cmd = f"cp {spoke_repo}/deploy.pem {spoke_repo}/copy.pem"
+
+    assert _classify_with_wt(cmd, spoke_repo, tasks) == "ESCALATE"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "~/.bashrc",  # tilde expands to $HOME at execution — escapes the worktree
+        "$HOME/.bashrc",  # variable expansion escapes too
+        "${HOME}/x",
+    ],
+)
+def test_classify_permission_escalates_shell_expansion_in_mutation_path(
+    path: str, spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A path token carrying tilde or variable expansion resolves OUTSIDE the worktree at
+    # execution even though it looks in-tree textually — it must never enter the benign lane.
+    tasks = tmp_path / "tasks"
+    cmd = f"cp {spoke_repo}/a.txt {path}"
+
+    assert _classify_with_wt(cmd, spoke_repo, tasks) == "ESCALATE"
+
+
+def test_classify_permission_mutation_lane_inert_without_worktree() -> None:
+    # Backward-compatible: with NO worktree argument the mutation lane is inert, so a bare
+    # `mv`/`rm`/`chmod` still default-denies exactly as before (#149/#171 posture).
+    result = _call('classify_permission "$CMD" | cut -f1', env={"CMD": "mv a b"})
+    assert result.stdout.strip() == "ESCALATE"
+
+
+# ── issue #203 finding 1: re-answer ceiling on the same prompt ─────────────────
+# A legitimately-escalated spoke (answerer ESCALATE, timeout, unconfirmable inject) stays
+# parked on the SAME prompt; #171's blocked-at-tip→waiting fix had no ceiling, so every tick
+# re-ran the full 900s reasoner to the same ESCALATE — a doom-loop that starved the tick.
+# The ceiling caps attempts on the SAME (tip, prompt-signature); it resets when the prompt
+# changes or the tip moves.
+
+
+def test_reanswer_ceiling_caps_repeated_reasoning(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    calls = tmp_path / "answerer.calls"
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": f"printf x >> '{calls}'; printf 'ESCALATE: legitimately stuck'",
+        "AFK_REANSWER_CEILING": "2",
+    }
+
+    for _ in range(4):
+        result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+        assert result.returncode == 0, result.stderr
+
+    n = calls.read_text().count("x") if calls.exists() else 0
+    assert n == 2, f"the reasoner must stop after 2 attempts on the same prompt, ran {n}"
+
+
+def test_reanswer_ceiling_resets_after_tip_advances(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # Terminal only until the tip MOVES: a revived/committing spoke gets a fresh budget so a
+    # once-exhausted gate is never permanently stuck.
+    calls = tmp_path / "answerer.calls"
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": f"printf x >> '{calls}'; printf 'ESCALATE: stuck'",
+        "AFK_REANSWER_CEILING": "1",
+    }
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)  # attempt 1 → runs
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)  # exhausted → skipped
+    assert calls.read_text().count("x") == 1, "ceiling=1 stops the second attempt"
+
+    subprocess.run(
+        ["git", "commit", "-q", "--allow-empty", "-m", "progress"],
+        cwd=spoke_repo,
+        check=True,
+        env=git_env,
+        capture_output=True,
+    )
+
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)  # tip moved → runs again
+    assert calls.read_text().count("x") == 2, "a tip advance must reset the ceiling"
