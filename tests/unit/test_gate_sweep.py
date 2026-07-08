@@ -349,6 +349,126 @@ def test_run_stale_lock_is_taken_over(repo: Path, tmp_path: Path) -> None:
     assert runner_log.exists()
 
 
+def _run_sweep_with_rm_shim(
+    repo: Path,
+    tmp_path: Path,
+    *args: str,
+    cmd: str,
+    inject_queue: Path,
+    inject_line: str,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    """Run the worker with an `rm` shim that re-queues once in the claim window.
+
+    The shim, on the first removal of a `queue*` file, atomically (re)creates a
+    fresh `queue` with `inject_line` — a newer request arriving exactly as the
+    worker consumes the queue — then performs the real removal. The read-then-rm
+    drain deletes that newer request unprocessed (the bug); the mv-to-private-copy
+    claim leaves it as a fresh `queue` that survives the next iteration.
+    """
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    gh_log = tmp_path / "gh-calls.log"
+    gh = bindir / "gh"
+    gh.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{gh_log}"\nexit 0\n')
+    gh.chmod(0o755)
+    sentinel = tmp_path / "rm-injected"
+    rm = bindir / "rm"
+    rm.write_text(
+        "#!/bin/sh\n"
+        'if [ -n "$RM_INJECT_SENTINEL" ] && [ ! -e "$RM_INJECT_SENTINEL" ]; then\n'
+        '  for arg in "$@"; do\n'
+        '    case "${arg##*/}" in\n'
+        "      queue*)\n"
+        '        : > "$RM_INJECT_SENTINEL"\n'
+        '        printf "%s" "$RM_INJECT_LINE" > "$RM_INJECT_QUEUE"\n'
+        "        break ;;\n"
+        "    esac\n"
+        "  done\n"
+        "fi\n"
+        'exec /bin/rm "$@"\n'
+    )
+    rm.chmod(0o755)
+    env = {
+        **_GIT_ENV,
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "GATE_SWEEP_CMD": cmd,
+        "RM_INJECT_SENTINEL": str(sentinel),
+        "RM_INJECT_QUEUE": str(inject_queue),
+        "RM_INJECT_LINE": inject_line,
+    }
+    proc = subprocess.run(
+        ["bash", str(GATE_SWEEP), *args],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+    return proc, gh_log
+
+
+def test_run_requeue_in_claim_window_is_not_dropped(repo: Path, tmp_path: Path) -> None:
+    # A newer request mv'd over `queue` between the worker's read and its rm
+    # must not be silently deleted (the #124 safety net owes it a run). The
+    # atomic claim (mv to a private copy) leaves a late arrival as a fresh
+    # queue; a read-then-rm drain removes it unprocessed.
+    _mint(repo, "testmon")
+    _sweep_dir(repo).mkdir(parents=True, exist_ok=True)
+    # A request already queued (drained after the initial HEAD sweep).
+    (_sweep_dir(repo) / "queue").write_text("shaB\tfeature/199-B\t199\n")
+    red = 'printf "FAILED tests/unit/test_x.py::t - E\\n"; exit 1'
+
+    proc, gh_log = _run_sweep_with_rm_shim(
+        repo,
+        tmp_path,
+        "--run",
+        _head(repo),
+        "--branch",
+        "feature/199-A",
+        "--issue",
+        "199",
+        cmd=red,
+        inject_queue=_sweep_dir(repo) / "queue",
+        inject_line="shaC\tfeature/199-C\t199\n",
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    text = gh_log.read_text()
+    assert "feature/199-A" in text  # the landed request swept
+    assert "feature/199-B" in text  # the already-queued follow-up swept
+    assert "feature/199-C" in text  # the request re-queued in the claim window: not dropped
+
+
+def test_run_signal_while_holding_lock_releases_the_lock(repo: Path, tmp_path: Path) -> None:
+    # The release trap is installed before acquiring the lock and covers signals,
+    # so a worker killed while holding the lock releases it — no stale lock left
+    # to wedge the safety net until the kill-0 self-heal notices.
+    _mint(repo, "testmon")
+
+    # The suite signals its own worker mid-sweep (SIGTERM), then returns.
+    proc, _ = _run_sweep(repo, tmp_path, "--run", _head(repo), cmd="kill -TERM $PPID")
+
+    assert proc.returncode == 0, proc.stderr  # trapped signal exits clean (best-effort)
+    assert not (_sweep_dir(repo) / "lock.pid").exists()  # trap released the lock
+
+
+def test_run_queue_path_preserves_the_live_holders_lock(repo: Path, tmp_path: Path) -> None:
+    # Installing the release trap before acquire means the queue-blocked path
+    # runs it on return; its LOCK_OWNED guard must keep it a no-op there so a
+    # worker that only queued never deletes the live holder's pidfile.
+    _mint(repo, "testmon")
+    _sweep_dir(repo).mkdir(parents=True, exist_ok=True)
+    live = f"{os.getpid()}\n"
+    (_sweep_dir(repo) / "lock.pid").write_text(live)
+    runner_log = tmp_path / "runner.log"
+
+    proc, _ = _run_sweep(repo, tmp_path, "--run", _head(repo), cmd=_runner_cmd(runner_log))
+
+    assert proc.returncode == 0, proc.stderr
+    assert not runner_log.exists()  # it queued instead of sweeping
+    assert (_sweep_dir(repo) / "lock.pid").read_text() == live  # live lock untouched
+
+
 def test_run_drains_queue_and_dedupes_same_tree(repo: Path, tmp_path: Path) -> None:
     # Back-to-back lands of the SAME content sweep once: the drained follow-up
     # hits the full stamp the first (green) pass just minted, and stops.
