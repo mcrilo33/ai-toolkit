@@ -1302,10 +1302,12 @@ _broker_repo_family_roots() {
   done
 }
 
-# _broker_read_in_family <path> <wt> -> rc 0 when <path> resolves under some repo-family root,
-# rc 1 otherwise. Resolves <path> against the worktree cwd when relative and follows symlinks
-# (a logically in-tree path can physically resolve out), mirroring _broker_path_physically_in.
-# Fails CLOSED (rc 1) without python3 or a resolvable family — an unverifiable read escalates.
+# _broker_read_in_family <path> <wt> -> print <path>'s realpath (symlinks followed) IF it
+# resolves under some repo-family root, else rc 1. Resolves <path> against the worktree cwd when
+# relative, mirroring _broker_path_physically_in. The printed realpath lets the caller re-check
+# the secret class on the RESOLVED surface (a benign-named in-family symlink to a key, or a
+# trailing-slash form, evades a raw-path-only check). Fails CLOSED (rc 1) without python3 or a
+# resolvable family — an unverifiable read escalates, the safe direction.
 _broker_read_in_family() {
   local path="$1" wt="${2:-}" roots
   roots="$(_broker_repo_family_roots "$wt")"
@@ -1325,30 +1327,50 @@ def under(p, root):
 
 for root in os.environ["_AFK_ROOTS"].splitlines():
     if root and under(abs_, os.path.realpath(root)):
+        print(abs_)
         sys.exit(0)
 sys.exit(1)
 PYEOF
 }
 
 # _classify_read_tool <path> [wt] -> print "APPROVE" or "ESCALATE<TAB><reason>" for a Read of
-# <path>. APPROVE only when <path> is confined to the repo family AND is not secret-like; a
-# secret target is rejected FIRST (it overrides family membership), an out-of-family or
-# unverifiable target escalates. rc is always 0 (the verdict is on stdout, like classify_permission).
+# <path>. APPROVE only when <path> is a CLEAN inert path, confined to the repo family, and not
+# secret-like. rc is always 0 (the verdict is on stdout, like classify_permission).
+#
+# The clean-path guard is load-bearing security, not cosmetics: extract_pending_command emits a
+# Bash tool_use as its RAW command string in the same slot a Read emits "Read <file_path>", so a
+# Bash command whose text starts with "Read " (e.g. `Read x.py; rm -rf ~`) would otherwise enter
+# this lane and SKIP classify_permission's operator-split default-deny — auto-approving arbitrary
+# shell. A genuine Read file_path is a single inert path, so any whitespace / shell metacharacter /
+# operator / traversal makes the target unapprovable here (a false deny escalates — the safe
+# direction). The secret class is then checked on BOTH the raw path and its resolved realpath, so
+# an in-family symlink with a benign name (notes.txt -> deploy.pem) can't launder a key.
 _classify_read_tool() {
-  local path="$1" wt="${2:-}"
+  local path="$1" wt="${2:-}" abs
   if [ -z "$path" ]; then
     printf 'ESCALATE\t%s\n' "Read with no target"
     return 0
   fi
+  case "$path" in
+    *[[:space:]]* | *';'* | *'&'* | *'|'* | *'$'* | *'`'* | '~'* | *'..'* \
+      | *'{'* | *'}'* | *'*'* | *'?'* | *'['* | *']'* | *'"'* | *"'"* | *'\'* \
+      | *'>'* | *'<'* | *'('* | *')'*)
+      printf 'ESCALATE\t%s\n' "read target is not a clean path: $path"
+      return 0 ;;
+  esac
   if _broker_seg_secretlike "$path"; then
     printf 'ESCALATE\t%s\n' "secret-like read target: $path"
     return 0
   fi
-  if _broker_read_in_family "$path" "$wt"; then
-    printf 'APPROVE\n'
+  abs="$(_broker_read_in_family "$path" "$wt")" || {
+    printf 'ESCALATE\t%s\n' "read outside the repo family: $path"
+    return 0
+  }
+  if _broker_seg_secretlike "$abs"; then
+    printf 'ESCALATE\t%s\n' "secret-like read target (resolved): $abs"
     return 0
   fi
-  printf 'ESCALATE\t%s\n' "read outside the repo family: $path"
+  printf 'APPROVE\n'
 }
 
 # classify_permission <command> [worktree] -> "APPROVE" or "ESCALATE<TAB><reason>".
