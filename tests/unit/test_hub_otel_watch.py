@@ -458,20 +458,74 @@ def test_watch_loop_no_reexec_when_source_unchanged(tmp_path: Path) -> None:
     assert result.stdout.count("COLLECTOR /repo") == 2
 
 
+def test_watch_loop_no_reexec_on_empty_hash(tmp_path: Path) -> None:
+    # A transient hasher failure makes _watch_source_hash return '' (its documented
+    # "no hasher, opt out" signal). An empty per-tick stamp must NOT be read as a
+    # change (that would spuriously re-exec and re-stamp an empty baseline, killing
+    # recycle for good) — the loop just keeps ticking and exits on the idle grace.
+    parts = [
+        _pane_pattern_stub(tmp_path, "L"),
+        _LOOP_ENV,
+        '_watch_source_hash() { printf ""; }',
+        "_watch_reexec() { echo REEXEC; exit 1; }",
+        '_watch_loop "BASELINE"',
+    ]
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "REEXEC" not in result.stdout
+
+
+def test_watch_loop_no_reexec_on_idle_tick(tmp_path: Path) -> None:
+    # A land while NO spoke pane is live must not re-exec an about-to-exit watchdog
+    # (it would only reset the idle countdown and linger uselessly). Even with a
+    # changed stamp, an all-idle loop tears down after the idle grace, never recycling.
+    parts = [
+        _pane_pattern_stub(tmp_path, ""),
+        _LOOP_ENV,
+        "_watch_source_hash() { echo CHANGED; }",
+        "_watch_reexec() { echo REEXEC; exit 1; }",
+        '_watch_loop "BASELINE"',
+    ]
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "REEXEC" not in result.stdout
+    assert (tmp_path / "ticks").read_text() == "3"
+
+
+def test_watch_reexec_declines_when_new_source_unparseable(tmp_path: Path) -> None:
+    # The self-recycle must never re-exec into a land that shipped a parse-broken
+    # script — a dead watchdog defeats the whole point (#115). When a bundle file
+    # fails `bash -n`, _watch_reexec logs and RETURNS (keeps the current code alive)
+    # instead of exec'ing into code that would abort on parse.
+    broken = tmp_path / "broken.sh"
+    broken.write_text("if [ ; then\n")  # deliberate syntax error
+    parts = [
+        f'_HUB_OTEL_SOURCE_FILES=("{broken}")',
+        f'_HUB_OTEL_SELF="{broken}"',
+        "_watch_reexec && echo RETURNED",
+    ]
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "RETURNED" in result.stdout
+    assert "fails to parse" in result.stdout
+
+
 def test_daemon_reexec_reclaims_own_pidfile(tmp_path: Path) -> None:
     # A re-exec keeps the daemon's pid, so the pidfile already names a LIVE pid (our
-    # own $$). With _HUB_OTEL_REEXEC=1 the singleton guard must NOT refuse — it
-    # reclaims the file and runs the loop (all-idle → 3 ticks) rather than reporting
-    # "already running".
+    # own $$). The `--reexec` flag (passed only by _watch_reexec, never ambient) tells
+    # the singleton guard to reclaim the file and run the loop (all-idle → 3 ticks)
+    # rather than report "already running".
     pidfile = tmp_path / "watch.pid"
     parts = [
         _pane_pattern_stub(tmp_path, ""),
         _LOOP_ENV,
         f'export HUB_OTEL_WATCH_PIDFILE="{pidfile}"',
         f'export HUB_OTEL_WATCH_LOG="{tmp_path / "watch.log"}"',
-        "export _HUB_OTEL_REEXEC=1",
         f'printf "%s" "$$" > "{pidfile}"',
-        "_daemon",
+        "_daemon --reexec",
     ]
     result = _call("; ".join(parts))
 

@@ -163,13 +163,23 @@ _watch_source_hash() { wt_source_hash "${_HUB_OTEL_SOURCE_FILES[@]}"; }
 
 # _watch_reexec -> replace this daemon with a fresh copy running the on-disk
 # (post-land) code. `exec` preserves the pid, so the pidfile keeps naming a live
-# process and no second daemon is armed; _HUB_OTEL_REEXEC=1 tells the new _daemon to
-# reclaim its own pidfile rather than refuse as "already running". Split out so the
-# loop's recycle branch is testable without a real exec.
+# process and no second daemon is armed; the `--reexec` flag (passed ONLY here, not
+# an ambient env var) tells the new _daemon to reclaim its own pidfile rather than
+# refuse as "already running". First `bash -n`-checks the whole bundle: a dead
+# watchdog is worse than a stale one (#115), so if a land shipped a parse-broken
+# script we keep running the current (working) code and return — the loop retries
+# next tick until a good version lands. Split out so the recycle branch is testable.
 _watch_reexec() {
+  local f
+  for f in "${_HUB_OTEL_SOURCE_FILES[@]}"; do
+    [ -f "$f" ] || continue
+    if ! bash -n "$f" 2>/dev/null; then
+      _watch_log "on-disk source changed but $f fails to parse — NOT re-exec'ing; keeping current code"
+      return 0
+    fi
+  done
   _watch_log "source changed on disk (a land) — re-exec'ing into fresh code"
-  export _HUB_OTEL_REEXEC=1
-  exec bash "$_HUB_OTEL_SELF" --daemon
+  exec bash "$_HUB_OTEL_SELF" --daemon --reexec
 }
 
 # _watch_loop -> tick every HUB_OTEL_WATCH_INTERVAL seconds (default 30): on a
@@ -180,25 +190,29 @@ _watch_reexec() {
 # grace for transient tmux blips and the spawn race); a live tick resets the
 # counter. Never fatal: ensure failures are best-effort and the loop keeps going.
 _watch_loop() {
-  local baseline="${1:-}"
+  local baseline="${1:-}" cur
   local interval="${HUB_OTEL_WATCH_INTERVAL:-30}" max_idle="${HUB_OTEL_WATCH_IDLE_TICKS:-3}" idle=0
   _watch_log "watch loop started (pid $$, interval ${interval}s, idle grace ${max_idle} ticks)"
   while :; do
     if spoke_pane_live; then
       idle=0
       _ensure_or_notice
+      # #190: a land rewrote our own source on disk → re-exec into it so the ensure
+      # paths we run go live with no human recycle. Only on a spoke-live tick (idle
+      # ticks are about to tear down anyway), and only when the fresh stamp is
+      # present AND differs — a content hash so an identical rewrite never flaps, and
+      # a transient empty stamp (hasher blip) is not mistaken for a change. Empty
+      # baseline (no hasher / one-shot callers) opts out entirely.
+      cur="$(_watch_source_hash)"
+      if [ -n "$baseline" ] && [ -n "$cur" ] && [ "$cur" != "$baseline" ]; then
+        _watch_reexec  # exec's into fresh code; returns only if it won't parse
+      fi
     else
       idle=$((idle + 1))
       if [ "$idle" -ge "$max_idle" ]; then
         _watch_log "no spoke pane live for ${max_idle} ticks — exiting"
         return 0
       fi
-    fi
-    # #190: a land rewrote our own source on disk → re-exec into it so the ensure
-    # paths we run go live with no human recycle. Content-hashed, so an identical
-    # rewrite never flaps. Empty baseline (no hasher / one-shot callers) opts out.
-    if [ -n "$baseline" ] && [ "$(_watch_source_hash)" != "$baseline" ]; then
-      _watch_reexec  # exec — does not return
     fi
     sleep "$interval"
   done
@@ -213,21 +227,21 @@ _watch_loop() {
 # <git-common-dir>/hub-otel-watch.log, HUB_OTEL_WATCH_LOG override) so a
 # recovery is auditable after the fact. Always returns 0.
 _daemon() {
-  local common pidfile logfile pid baseline
+  local reexec="${1:-}" common pidfile logfile pid baseline
   common="$(_watch_common_dir)"
   pidfile="${HUB_OTEL_WATCH_PIDFILE:-$common/hub-otel-watch.pid}"
   logfile="${HUB_OTEL_WATCH_LOG:-$common/hub-otel-watch.log}"
   # A re-exec (self-recycle into post-land code) keeps this pid, so the pidfile it
-  # left behind names a live process — us. Skip the singleton guard in that case so
-  # we reclaim our own file instead of refusing; a fresh start never sets the flag.
-  if [ "${_HUB_OTEL_REEXEC:-}" != "1" ] && [ -f "$pidfile" ]; then
+  # left behind names a live process — us. The `--reexec` flag, passed ONLY by
+  # _watch_reexec, tells us to reclaim our own file instead of refusing; a fresh arm
+  # never passes it, so an ambient env can't bypass the singleton guard.
+  if [ "$reexec" != "--reexec" ] && [ -f "$pidfile" ]; then
     pid="$(cat "$pidfile" 2>/dev/null)"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       printf '%s\n' "hub-otel-watch: already running (pid $pid, pidfile $pidfile)"
       return 0
     fi
   fi
-  unset _HUB_OTEL_REEXEC
   printf '%s' "$$" >"$pidfile"
   # Claimed: from here on this shell owns the pidfile, so remove it on exit. The
   # path rides a global — a function-local is out of scope when the trap fires.
@@ -242,7 +256,7 @@ _daemon() {
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   case "${1:-}" in
-    --daemon) _daemon ;;
+    --daemon) _daemon "${2:-}" ;;
     *) main "$@" ;;
   esac
 fi
