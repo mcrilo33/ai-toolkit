@@ -1906,6 +1906,101 @@ def test_consume_gate_tag_removes_artifact(spoke_repo: Path) -> None:
     assert tags.stdout.strip() == "", "the local gate tag must also be dropped"
 
 
+# ── issue #204: consume a stale gate tag when the answer already landed ─────────
+# _consume_gate_tag ran ONLY on the broker's confirmed-inject path. An answer that
+# registered late, a wedge respawn started outside the broker, or an attended/manual
+# reply in the pane left gate/<N> at the tip — re-read as "waiting" and re-answered,
+# and (with the #204 guard) wedging the resumed spoke. The broker now self-heals: when
+# the transcript shows a genuine user reply AFTER the PLAN-gate park, it consumes the
+# stale tag instead of re-answering.
+
+
+def _resumed_gate_transcript(plan: str) -> str:
+    """A gate-park transcript where a TYPED reply already landed after the park."""
+    reply = (
+        json.dumps(
+            {"type": "user", "promptSource": "typed", "message": {"content": "Approved — proceed."}}
+        )
+        + "\n"
+    )
+    return _gate_park_transcript(plan) + reply
+
+
+def test_gate_answer_landed_true_after_genuine_reply(spoke_repo: Path, tmp_path: Path) -> None:
+    projects = tmp_path / "projects"
+    (_project_dir_for(projects, spoke_repo) / "s.jsonl").write_text(
+        _resumed_gate_transcript("PLAN")
+    )
+
+    result = _call(
+        f"_gate_answer_landed '{spoke_repo}' && echo LANDED || echo NO",
+        env={"CLAUDE_PROJECTS_DIR": str(projects)},
+    )
+
+    assert result.stdout.strip().splitlines()[-1] == "LANDED", result.stdout + result.stderr
+
+
+def test_gate_answer_landed_false_while_still_parked(spoke_repo: Path, tmp_path: Path) -> None:
+    # Only the plan + gate Bash, no reply yet → still parked, must NOT read as landed.
+    projects = tmp_path / "projects"
+    (_project_dir_for(projects, spoke_repo) / "s.jsonl").write_text(_gate_park_transcript("PLAN"))
+
+    result = _call(
+        f"_gate_answer_landed '{spoke_repo}' && echo LANDED || echo NO",
+        env={"CLAUDE_PROJECTS_DIR": str(projects)},
+    )
+
+    assert result.stdout.strip().splitlines()[-1] == "NO", result.stdout + result.stderr
+
+
+def test_gate_answer_landed_false_for_synthetic_post_park_turn(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A harness-injected (non-typed) user turn after the park must NOT read as an answer,
+    # or the broker would tear down the gate on a spoke still awaiting its first approval.
+    projects = tmp_path / "projects"
+    synth = (
+        json.dumps(
+            {"type": "user", "message": {"content": "<task-notification>done</task-notification>"}}
+        )
+        + "\n"
+    )
+    (_project_dir_for(projects, spoke_repo) / "s.jsonl").write_text(
+        _gate_park_transcript("PLAN") + synth
+    )
+
+    result = _call(
+        f"_gate_answer_landed '{spoke_repo}' && echo LANDED || echo NO",
+        env={"CLAUDE_PROJECTS_DIR": str(projects)},
+    )
+
+    assert result.stdout.strip().splitlines()[-1] == "NO", result.stdout + result.stderr
+
+
+def test_broker_consumes_stale_tag_when_answer_already_landed(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    prompt_log = tmp_path / "prompt.log"
+    env = _gate_broker_env(spoke_repo, tmp_path, prompt_log=prompt_log)
+    # A genuine reply already landed after the park (a late / external / attended inject).
+    pd = _project_dir_for(Path(env["CLAUDE_PROJECTS_DIR"]), spoke_repo)
+    (pd / "session.jsonl").write_text(_resumed_gate_transcript("stale PLAN prose"))
+    (spoke_repo / ".ai-toolkit").mkdir()
+    artifact = spoke_repo / ".ai-toolkit" / "gate-5.md"
+    artifact.write_text("stale plan\n")
+    _tag_gate_at_head(spoke_repo, 5)
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    tags = subprocess.run(
+        ["git", "tag", "-l", "gate/5"], cwd=spoke_repo, capture_output=True, text=True
+    )
+    assert tags.stdout.strip() == "", "the stale gate tag must be consumed"
+    assert not artifact.exists(), "the spent plan artifact must be dropped too"
+    assert not prompt_log.exists(), "a resumed spoke must NOT be re-answered"
+
+
 # ── event spool (issue #176) ──────────────────────────────────────────────────
 # The event-driven wake path: a spoke drops one <epoch>-<issue>-<type> file in the spool
 # and signals the supervisor. The reader (afk_event_dir / afk_drain_event_issues) lives in
