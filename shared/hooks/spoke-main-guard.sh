@@ -279,13 +279,16 @@ SM_TOKS=()
 SM_AI=0
 
 # sg_walk_segments splits on `;`, `&&`, `||`, `|` but NOT on grouping/subshell
-# punctuation, so `(git checkout main)` or `true && { git checkout main; }` would
-# reach the validator as one unparseable segment and slip through. Convert
-# `( ) { }` and backticks to `;` first: outside quotes that creates the missing
-# boundaries; inside quotes the substituted `;` stays inert (sg_walk_segments
-# tracks quote state), so quoted content is unaffected. `$(` becomes `$;`, so a
-# command substitution's inner command is judged as its own clause.
-NORMALIZED=$(printf '%s' "$COMMAND" | tr '(){}`' ';;;;;')
+# punctuation OR newlines, so `(git checkout main)` or a multi-line block like
+# `true<newline>git checkout main` would reach the validator as one segment whose
+# first token isn't `git` and slip through. Convert `( ) { }`, backticks, and
+# newlines to `;` first: outside quotes that creates the missing boundaries;
+# inside quotes the substituted `;` stays inert (sg_walk_segments tracks quote
+# state), so quoted content is unaffected. `$(` becomes `$;`, so a command
+# substitution's inner command is judged as its own clause. A newline is a shell
+# clause separator exactly like `;`, so multi-line Bash blocks (routine agent
+# output) are judged clause-by-clause instead of laundering a forbidden verb.
+NORMALIZED=$(printf '%s' "$COMMAND" | tr '(){}`\n' ';;;;;;')
 
 # Walk every clause; the validator stops (and sets DENY_REASON) on the first
 # forbidden form. Unparseable input makes the walk return non-zero with no
