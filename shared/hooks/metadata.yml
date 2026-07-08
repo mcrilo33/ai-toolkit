@@ -204,6 +204,11 @@ todo-ledger-nudge:
   description: "At session start, nudge the agent to seed a task ledger (TodoWrite or Tasks) before the first commit (advisory; companion of todo-ledger-warn)"
   tier: 3
 
+afk-notify-wake:
+  event: notification
+  description: "On a permission/question Notification, announce the parked spoke to a live /afk supervisor (spool a wake event + SIGUSR1) so it is serviced without waiting a full tick (Claude-only, #176)"
+  tier: 2
+
 delegation-gate-warn:
   event: preToolUse
   matcher: Bash
