@@ -24,7 +24,15 @@ from pathlib import Path
 import pytest
 
 INSTALL = Path(__file__).resolve().parents[2] / "scripts" / "install-git-hooks.sh"
-_GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+# Strip any ambient arming signal: the composed pre-push runs the REAL
+# anti-gutting-scan.sh, which fails closed on gutting diffs under a truthy
+# UNATTENDED (#193) — a drain-time leak would flip the attended-advisory
+# assertions (the #169 env-leak class).
+_GIT_ENV = {
+    **{k: v for k, v in os.environ.items() if k != "UNATTENDED"},
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+}
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -131,11 +139,12 @@ def test_anti_gutting_copied_into_hooks(repo: Path) -> None:
     assert os.access(scan, os.X_OK)
 
 
-# --- the anti-gutting tripwire is advisory: it warns but never blocks -----------
+# --- the anti-gutting tripwire is advisory when ATTENDED (fail-closed lives
+# --- under unattended /afk — #193; see test_anti_gutting.py) --------------------
 
 
 def test_pre_push_allows_gutting_but_warns(repo: Path) -> None:
-    # The tripwire is advisory — a human's ordinary test edit (which may
+    # Attended, the tripwire is advisory — a human's ordinary test edit (which may
     # legitimately remove/weaken an assert) is never gated, but the smell is
     # surfaced on stderr so it can be eyeballed before landing.
     _unpushed_gutting_commit(repo)
