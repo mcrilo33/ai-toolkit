@@ -549,6 +549,60 @@ _gate_parked() {
   [ "$(git -C "$wt" rev-parse -q --verify "refs/tags/gate/${issue}^{commit}" 2>/dev/null)" = "$tip" ]
 }
 
+# _gate_answer_landed <wt> -> rc 0 when the spoke's transcript shows a GENUINE human/hub
+# reply — a TYPED prompt submission (promptSource == "typed"): a human typing in the pane,
+# or the broker's own tmux inject — AFTER the assistant turn that ran `spoke-ready.sh
+# --gate`, i.e. the PLAN-gate approval reply already landed. Used to self-heal a STALE gate
+# tag (issue #204): _consume_gate_tag ran only on the broker's confirmed-inject path, so an
+# answer that registered late, a wedge respawn started OUTSIDE the broker, or ANY
+# attended/manual reply in the pane left gate/<N> at the tip — re-read as "waiting" and
+# re-answered, and (with the #204 guard) wedging the resumed spoke. Every synthetic user
+# turn the harness injects (tool_results, <task-notification>/<system-reminder>, skill/meta
+# turns, SDK/system prompts) carries a non-"typed" promptSource (or none), so it can NOT
+# false-consume the tag on a spoke still awaiting its first approval. A (re-)park supersedes
+# an earlier approval. Fail-CLOSED (rc 1): no transcript, no python3, or no typed post-park
+# turn means "cannot prove a reply landed" → the broker services the gate as before. The
+# plan-gate-guard's approval_in_transcript mirrors this so both sides read the same signal.
+_gate_answer_landed() {
+  local wt="$1" jsonl
+  jsonl="$(_spoke_jsonl "$wt")"
+  [ -n "$jsonl" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  _AFK_JSONL="$jsonl" python3 2>/dev/null <<'PYEOF'
+import json, os, sys
+
+parked = False
+approved = False
+try:
+    with open(os.environ["_AFK_JSONL"], encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            ttype = obj.get("type")
+            content = (obj.get("message") or {}).get("content")
+            if ttype == "assistant":
+                for block in content if isinstance(content, list) else []:
+                    if (isinstance(block, dict)
+                            and block.get("type") == "tool_use"
+                            and block.get("name") == "Bash"
+                            and "spoke-ready.sh --gate" in ((block.get("input") or {}).get("command") or "")):
+                        parked = True       # a (re-)park supersedes any earlier approval
+                        approved = False
+            elif ttype == "user" and parked:
+                # ONLY a typed prompt submission is a genuine reply — harness-injected user
+                # turns (tool_results, notifications, skill/meta, SDK/system) are not.
+                if obj.get("promptSource") == "typed" and not obj.get("isMeta"):
+                    approved = True
+except Exception:
+    sys.exit(1)
+sys.exit(0 if approved else 1)
+PYEOF
+}
+
 # _gate_artifact_path <wt> <issue> -> the gate plan artifact path (<wt>/.ai-toolkit/
 # gate-<issue>.md). The single owner of that layout, shared by _read_gate_artifact and
 # _consume_gate_tag (spoke-ready.sh writes the same path from the spoke side, #175). Falls
@@ -1748,6 +1802,16 @@ _broker_present_qcm() {
 # (or an answer we cannot inject) escalates rather than guessing.
 broker_service_gate() {
   local wt="$1" issue="$2" mode="${3:-unattended}" question orig_question raw rc decision kind text target was_gate=0 inject_diagnosed=0
+  # Self-heal a stale gate tag (issue #204): if gate/<issue> is at the tip but the spoke
+  # already resumed past its PLAN gate (a late / external / attended approval that never ran
+  # the confirmed-inject path), consume the stale tag and stop — do NOT re-answer, and do NOT
+  # count it against the re-answer ceiling (checked BEFORE it, so a resumed spoke heals even
+  # once exhausted). The plan-gate-guard self-heals the same signal from the spoke side.
+  if _gate_parked "$wt" "$issue" && _gate_answer_landed "$wt"; then
+    log "  #$issue resumed past its PLAN gate outside the broker — consuming the stale gate/$issue tag"
+    _consume_gate_tag "$wt" "$issue"
+    return 0
+  fi
   # Re-answer ceiling (#203 finding 1): a legitimately-escalated spoke parked on the SAME
   # prompt must not re-run the reasoner/classifier every tick forever. After the ceiling on
   # the SAME (tip, prompt-signature) the gate is terminal — it stays blocked/<issue> at the
