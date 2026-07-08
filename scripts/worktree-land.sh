@@ -337,7 +337,7 @@ run_merge_sanity() (
   # define some and not others, and calling an undefined one under set -e would
   # abort the land instead of degrading.
   if ! command -v detect_pytest >/dev/null 2>&1 \
-     || ! command -v run_under_tripwire >/dev/null 2>&1 \
+     || ! command -v run_under_tripwire_scoped >/dev/null 2>&1 \
      || ! command -v reverse_index_tests_for >/dev/null 2>&1; then
     wt_warn "merge-sanity: hook libs incomplete — SKIPPING the diverged-land check; the merged tree is UNVERIFIED"
     return 2
@@ -358,10 +358,18 @@ run_merge_sanity() (
   git_unset=(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY \
     -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_PREFIX)
 
+  # The check runs in the SHARED hub ref store, where sibling spokes legitimately move
+  # their own refs mid-run (a committed head, a pushed branch's remote-tracking ref, an
+  # /afk drain's ready/<N> tag). Scope the tripwire to the one ref the land itself owns —
+  # refs/heads/$DEFAULT, the merge commit we are about to push — so sibling churn is not
+  # mistaken for an escape and the restore can never roll a sibling ref back (issue #205).
+  # A test that escapes onto $DEFAULT is still caught and aborts the land.
+  sanity_scope="refs/heads/$DEFAULT"
+
   # Collection/import health of the whole suite against the merged tree — bounded
   # (no test bodies execute), catches a cross-import break the combined tree adds.
   echo "→ merge-sanity: pytest --collect-only -q on the merged tree (import/collection health)"
-  run_under_tripwire "${git_unset[@]}" "${runner_arr[@]}" --collect-only -q || return 1
+  run_under_tripwire_scoped "$sanity_scope" "${git_unset[@]}" "${runner_arr[@]}" --collect-only -q || return 1
 
   # The tests test-select maps to the files the merge changed (PRE_SHA..MERGED_SHA),
   # deduped and existing only. No mapping → collection health was the whole check.
@@ -393,7 +401,7 @@ run_merge_sanity() (
     return 0
   fi
   echo "→ merge-sanity: mapped tests for the merged diff — ${sel[*]}"
-  run_under_tripwire "${git_unset[@]}" "${runner_arr[@]}" "${sel[@]}" || return 1
+  run_under_tripwire_scoped "$sanity_scope" "${git_unset[@]}" "${runner_arr[@]}" "${sel[@]}" || return 1
   return 0
 )
 

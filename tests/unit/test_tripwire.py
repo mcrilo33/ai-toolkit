@@ -283,6 +283,85 @@ def test_check_trips_on_ff_advance_of_unregistered_branch(repo: Path) -> None:
     assert "refs/heads/side" in proc.stdout
 
 
+# --- scoped tripwire: only the land's own refs (issue #205) -----------------------
+# worktree-land's merge-sanity check runs pytest INSIDE the shared hub ref store,
+# where sibling spokes legitimately move their own refs (a committed head, a pushed
+# branch's remote-tracking ref, an /afk drain's ready/<N> tag). run_under_tripwire_scoped
+# narrows the snapshot to the refs the land owns (refs/heads/<default>), so a concurrent
+# sibling ref move is neither a breach nor rolled back by the restore — while a real
+# escape onto the owned ref is still caught.
+
+
+def test_scoped_check_ignores_out_of_scope_ref_change(repo: Path) -> None:
+    # With the scope pinned to refs/heads/main, creating an out-of-scope tag (a
+    # sibling's ready/<N> push) leaves the check CLEAN.
+    proc = _lib(
+        repo,
+        '_TRIPWIRE_SCOPE="refs/heads/main"\n'
+        'b="$(tripwire_capture)"\n'
+        "git tag ready/99 HEAD\n"
+        'out="$(tripwire_check "$b")" && echo CLEAN || echo "CHANGED $out"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "CLEAN" in proc.stdout
+
+
+def test_scoped_check_multi_ref_list(repo: Path, tmp_path: Path) -> None:
+    # The scope is documented as a newline-separated list; with two in-scope refs a
+    # move of EITHER trips the check while an out-of-scope tag stays clean. Guards
+    # the BSD/macOS awk trap where a newline in an `-v` assignment aborts awk and
+    # silently empties the snapshot (disabling the tripwire).
+    _git(repo, "branch", "release")
+    proc = _lib(
+        repo,
+        "_TRIPWIRE_SCOPE=$"
+        "'"
+        "refs/heads/main\nrefs/heads/release"
+        "'"
+        "\n"
+        'b="$(tripwire_capture)"\n'
+        "git update-ref refs/heads/release refs/heads/main\n"  # not an ancestor move
+        "git commit --allow-empty -q -m sneak\n"  # advances main too
+        "git tag ready/99 HEAD\n"  # out of scope — must be ignored
+        'out="$(tripwire_check "$b")" && echo CLEAN || echo "CHANGED $out"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "CHANGED" in proc.stdout
+    assert "refs/heads/main" in proc.stdout
+    assert "ready/99" not in proc.stdout  # out-of-scope tag never enters the diff
+
+
+def test_scoped_run_ignores_concurrent_out_of_scope_tag(repo: Path) -> None:
+    # A scoped run whose command creates an out-of-scope tag returns the command's
+    # own exit code (0), prints no breach, and leaves the tag in place (pre-#205 the
+    # whole-repo restore deleted it).
+    proc = _lib(
+        repo,
+        'run_under_tripwire_scoped "refs/heads/main" bash -c "git tag ready/99 HEAD" && echo OK',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "OK" in proc.stdout
+    assert "REPO-INTEGRITY BREACH" not in proc.stderr
+    assert _git(repo, "tag", "--list").strip() == "ready/99"  # not rolled back
+
+
+def test_scoped_run_still_catches_escape_on_owned_ref(repo: Path) -> None:
+    # An escape onto the owned ref (refs/heads/main) is still a breach: the scoped
+    # run returns BREACH_RC and names the ref.
+    proc = _lib(
+        repo,
+        'run_under_tripwire_scoped "refs/heads/main" '
+        'bash -c "git commit --allow-empty -q -m sneak" || echo "RC=$?"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert f"RC={BREACH_RC}" in proc.stdout
+    assert "refs/heads/main" in proc.stderr
+
+
 # --- integration: the test-select.sh pre-push gate -------------------------------
 
 
