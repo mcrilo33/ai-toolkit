@@ -168,6 +168,25 @@ bash .ai-toolkit/scripts/spoke-ready.sh --blocked <issue> -m "<the blocker>"
 
 Then: next subtask → back to step 1 (or step 2 if it is the same issue).
 
+### Per-cycle-step model routing
+
+The spoke driver is an expensive model, but a cycle step need not run on it. Each
+step is **realized by delegating to a routed subagent**, and that subagent runs on
+its own configured model — so RED (`tdd-red`), GREEN (`tdd-green`, `tdd-refactor`),
+and REVIEW (`code-review`) each execute on the model the config assigns, with their
+own per-span model attribution in Langfuse.
+
+The routing is **config-driven, not hardcoded here**:
+`settings/ai-toolkit.yml` `model.cycle_steps.<step>` declares the model, the sync
+pipeline stamps it onto the delegate agent's frontmatter, and
+`ai_toolkit_config.py::cycle_step_effective_model` resolves what a step actually
+runs on. Change the config and re-sync — nothing in this skill hardcodes a model.
+GREEN is routed to the cheaper tier, which is where the token saving lands.
+
+ANCHOR and PUSH have **no delegate** — they are mechanical (git plumbing, marker
+emission), so they run on the spoke driver and the routing **fails open** to
+today's behavior. A step with no configured model does the same.
+
 ### 1. ANCHOR
 
 Ensure an issue exists — `gh issue create` for ad-hoc work, or pick an existing
@@ -180,17 +199,23 @@ one. Then either:
 
 ### 2. RED
 
-Write the failing test (inline is fine; use the `tdd-red` agent when you want a
-clean context boundary). Commit it with a `Tested-RED: <pytest-node-id>`
-trailer. At commit time `red-proof-verify` runs that node and blocks the commit
-if it PASSES — a passing test is not driving any new code. The gate is the
-proof, not the author.
+Write the failing test by delegating to the `tdd-red` agent — it carries the
+model the config routes the RED step to (see [Per-cycle-step model
+routing](#per-cycle-step-model-routing) below), so the step runs on that model
+with its own per-span attribution. Inline authoring is fine for a trivial
+one-liner, but it runs on the spoke driver model instead. Commit the test with a
+`Tested-RED: <pytest-node-id>` trailer. At commit time `red-proof-verify` runs
+that node and blocks the commit if it PASSES — a passing test is not driving any
+new code. The gate is the proof, not the author.
 
 ### 3. GREEN
 
-Write the implementation (inline, or via the `tdd-green` then `tdd-refactor`
-agents) and commit it. `commit-gauntlet` lints and typechecks the changed lines;
-`secrets-scan` blocks hardcoded credentials.
+Write the implementation by delegating to the `tdd-green` agent (then
+`tdd-refactor`) rather than inline — these carry the model the config routes the
+GREEN step to, the **cheaper tier**, so the bulk of the mechanical implementation
+work runs off the expensive spoke driver (the highest-leverage token saving in
+the cycle). Then commit. `commit-gauntlet` lints and typechecks the changed
+lines; `secrets-scan` blocks hardcoded credentials.
 
 ### 4. REVIEW
 
