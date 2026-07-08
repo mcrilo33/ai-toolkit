@@ -365,6 +365,23 @@ def test_stale_drain_dead_heartbeat_pid_does_not_suppress_ready(hub: Path, tmp_p
     assert "/land 1" in messages[0]
 
 
+def test_garbled_heartbeat_pid_does_not_suppress_gate(hub: Path, tmp_path: Path) -> None:
+    # A partially-written heartbeat whose pid field is non-numeric ("12ab") reads as
+    # no live supervisor (mirrors hub-afk's _afk_pid_alive guard) → stale → still fires.
+    state = tmp_path / "stale-afk-state"
+    state.write_text("drain\n")
+    hb = tmp_path / "garbled-heartbeat"
+    hb.write_text("12ab 0\n")
+    _git(hub, "tag", "-a", "-m", "plan", "gate/1", "feature/1-work")
+
+    _proc, messages = _run(
+        hub, tmp_path, env_extra={"AFK_STATE": str(state), "AFK_HEARTBEAT": str(hb)}
+    )
+
+    assert len(messages) == 1
+    assert "parked" in messages[0].lower()
+
+
 def test_afk_suppressed_gate_pings_after_drain_ends(hub: Path, tmp_path: Path) -> None:
     # A gate suppressed under a LIVE drain is NOT recorded as seen (#215): the ping
     # is deferred, not lost. Once the drain ends and attended resumes, the still-
