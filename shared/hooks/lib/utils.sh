@@ -875,6 +875,12 @@ _tripwire_cfg_value() {
 # snapshot tip, delete refs that appeared during the run, and restore
 # core.bare/core.worktree. Best-effort — leaves the repo as the snapshot found it.
 #
+# Reflog visibility (issue #188): a killed mid-gate push once rolled a branch
+# back with NO reflog trace, leaving committed work unreachable. Every ref
+# reset here goes through `git update-ref -m --create-reflog`, so any rollback
+# is a labeled reflog entry whose previous position is the pre-restore tip —
+# recoverable with `git reflog <ref>` even where the ref had no reflog yet.
+#
 # No-data-loss rule (issue #135): restore never ORPHANS commits. A ref whose
 # snapshot tip is a strict ancestor of its current tip only gained commits —
 # rewinding it destroys them (four live spokes were rewound this way), so it is
@@ -904,7 +910,8 @@ tripwire_restore() {
       echo "tripwire: NOT rewinding $name to $sha — strict ancestor of its tip $cur_sha (would orphan commits); the abort is the protection." >&2
       continue
     fi
-    git update-ref "$name" "$sha" 2>/dev/null || true
+    git update-ref -m "tripwire: restore after aborted gate" --create-reflog \
+      "$name" "$sha" 2>/dev/null || true
   done <<< "$before"
   # Drop refs that appeared during the run (present now, absent in the snapshot),
   # except a branch checked out in a registered worktree — a live spoke's anchor.
