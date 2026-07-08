@@ -178,17 +178,22 @@ def scope_of(body):
     return set(tokens)
 
 
-def scope_line_missing(body):
-    """True when the body carries NO `Scope:` line at all.
+def scope_undeclared(body):
+    """True when the body declares no USABLE scope: no `Scope:` line at all, or a bare
+    `Scope:` label with no tokens.
 
-    Distinct from `Scope: *`: both are exclusive (scope_of ⇒ None), but a MISSING
-    line is the accidental case worth flagging (issue #217), while `*` is a deliberate
-    exclusive that stays silent.
+    Both leave the issue exclusive-by-accident (scope_of ⇒ None) — the silent case
+    issue #217 flags. A deliberate `Scope: *` DECLARES exclusivity (a token is
+    present), so it is not treated as undeclared and stays silent. Uses the same
+    `scope:`-prefix / comma+whitespace token split as scope_of, so the two can never
+    disagree on which issues are exclusive.
     """
     for raw in (body or "").splitlines():
-        if raw.strip().lower().startswith("scope:"):
-            return False
-    return True
+        stripped = raw.strip()
+        if stripped.lower().startswith("scope:"):
+            tokens = [t for t in stripped[len("scope:"):].replace(",", " ").split() if t]
+            return not tokens  # bare label ⇒ nothing declared; any token (incl `*`) ⇒ declared
+    return True  # no `Scope:` line at all
 
 
 def has_split_marker(body):
@@ -391,7 +396,7 @@ def print_scopeless_ready(issues, ready_nums):
     issues dispatch.
     """
     for num in sorted(ready_nums):
-        if issues[num]["scope_missing"]:
+        if issues[num]["scope_undeclared"]:
             print(
                 f"⚠ #{num} has no Scope: line — treated exclusive (runs alone) — "
                 "add a concrete Scope: line so it can batch",
@@ -506,7 +511,7 @@ def main():
         issues[num] = {
             "number": num,
             "scope": scope_of(node.get("body")),
-            "scope_missing": scope_line_missing(node.get("body")),
+            "scope_undeclared": scope_undeclared(node.get("body")),
             "split": has_split_marker(node.get("body")),
             "blockers": blockers,
             "hold": "hold" in labels,

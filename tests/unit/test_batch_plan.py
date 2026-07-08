@@ -837,6 +837,29 @@ def test_scopeless_warning_is_detection_only() -> None:
     assert _SCOPELESS() in proc.stderr
 
 
+def test_empty_scope_label_warns_like_a_missing_line() -> None:
+    # A bare `Scope:` label with no tokens declares nothing usable — the same
+    # accidental-exclusive silent serialization as a missing line, so it is flagged.
+    node = _node(1, None)
+    node["body"] += "Scope:  \n"
+
+    proc = _run_plan([node])
+
+    assert proc.returncode == 0, proc.stderr
+    assert f"#1 {_SCOPELESS()}" in proc.stderr
+
+
+def test_scopeless_warning_excludes_held_issue() -> None:
+    # A `hold`-labelled scope-less issue is staged out of the ready set, so it is not
+    # a current merge candidate and is not warned about — only the ready peer is.
+    nodes = [_node(1, None, labels=["hold"]), _node(2, None)]
+
+    proc = _run_plan(nodes)
+
+    assert f"#1 {_SCOPELESS()}" not in proc.stderr
+    assert f"#2 {_SCOPELESS()}" in proc.stderr
+
+
 # ── tie-break: equal depth ⇒ more direct dependents wins ──────────────────────
 
 
