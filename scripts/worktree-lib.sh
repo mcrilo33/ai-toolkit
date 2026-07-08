@@ -422,6 +422,29 @@ wt_resolve() {
   return 1
 }
 
+# --- daemon source-hash stamp (issue #190) -----------------------------------
+# The reusable "source-hash stamp" primitive: a content hash (sha256) over a long-
+# running daemon's source bundle, so the process can detect it is executing code a
+# land has since rewritten on disk. Hashing file CONTENT — not mtime — is load-
+# bearing: a no-op land that rewrites a file with identical bytes must NOT read as
+# changed (no flap-recycle), and a per-worktree checkout that only bumps mtimes must
+# not either. A missing bundle path contributes nothing, so an unresolved sibling
+# lib never blows up the stamp. '' only when no hasher is available (callers then
+# skip the staleness decision). Args: the bundle files, in any order. Consumed by
+# hub-otel-watch's daemon self-recycle; overridable in tests.
+wt_source_hash() {
+  local f
+  { for f in "$@"; do [ -f "$f" ] && cat "$f"; done; } | wt_sha256_stdin
+}
+
+# sha256 of stdin -> the bare hex digest, portably (shasum on BSD/macOS, sha256sum
+# on GNU). '' when neither is available. The single hash pipeline shared by the
+# source-hash stamp above and the collector config-version stamp below, so the two
+# staleness/recycle checks can never drift apart on a future hasher change.
+wt_sha256_stdin() {
+  { shasum -a 256 2>/dev/null || sha256sum 2>/dev/null; } | awk '{print $1}'
+}
+
 # --- native-OTel message-bridge preflight (auto-populate) --------------------
 # A spoke that opted into native OTel (AI_TOOLKIT_OTEL=1) needs the Langfuse
 # message bridge (scripts/telemetry/langfuse_message_bridge.py, port :4319) up, or
@@ -594,7 +617,7 @@ wt_collector_config_version() {
   local cfg="$1/dashboard/langfuse/otelcol.yaml"
   [ -f "$cfg" ] || return 0
   { cat "$cfg"; printf '%s\n%s\n' "$WT_COLLECTOR_PORT_FLAGS" "$WT_COLLECTOR_IMAGE"; } \
-    | { shasum -a 256 2>/dev/null || sha256sum 2>/dev/null; } | awk '{print $1}'
+    | wt_sha256_stdin
 }
 
 # Start the otelcol collector (lf-collector) in a detached Docker container.

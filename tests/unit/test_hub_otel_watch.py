@@ -415,6 +415,125 @@ def test_daemon_cli_dispatch_reports_already_running(tmp_path: Path) -> None:
     assert "already running" in result.stdout + result.stderr
 
 
+# ── daemon self-recycle (#190): re-exec into post-land code ──────────────────
+#
+# The daemon is itself a long-running process executing the bash a land has since
+# rewritten on the hub checkout. It stamps its own source bundle (this script + the
+# worktree-lib.sh it sources) at start and, each tick, re-execs into the fresh code
+# when the on-disk stamp differs — so a fix to the ensure paths goes live with no
+# human recycle. These drive _watch_loop with the stamp probe and the exec stubbed.
+
+
+def test_watch_loop_reexecs_when_source_changed(tmp_path: Path) -> None:
+    # A live tick whose current source stamp differs from the start baseline (a land
+    # rewrote the watcher/lib on disk) → re-exec into the fresh code, not another
+    # idle sleep.
+    parts = [
+        _pane_pattern_stub(tmp_path, "L"),
+        _LOOP_ENV,
+        "_watch_source_hash() { echo CHANGED; }",
+        "_watch_reexec() { echo REEXEC; exit 0; }",
+        '_watch_loop "BASELINE"',
+    ]
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "REEXEC" in result.stdout
+
+
+def test_watch_loop_no_reexec_when_source_unchanged(tmp_path: Path) -> None:
+    # The stamp still equals the baseline (no land) → never re-exec: the daemon must
+    # not flap-recycle itself, it just keeps ticking and exits on the idle grace.
+    parts = [
+        _pane_pattern_stub(tmp_path, "LL"),
+        _LOOP_ENV,
+        "_watch_source_hash() { echo BASELINE; }",
+        "_watch_reexec() { echo REEXEC; exit 1; }",
+        '_watch_loop "BASELINE"',
+    ]
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "REEXEC" not in result.stdout
+    assert result.stdout.count("COLLECTOR /repo") == 2
+
+
+def test_watch_loop_no_reexec_on_empty_hash(tmp_path: Path) -> None:
+    # A transient hasher failure makes _watch_source_hash return '' (its documented
+    # "no hasher, opt out" signal). An empty per-tick stamp must NOT be read as a
+    # change (that would spuriously re-exec and re-stamp an empty baseline, killing
+    # recycle for good) — the loop just keeps ticking and exits on the idle grace.
+    parts = [
+        _pane_pattern_stub(tmp_path, "L"),
+        _LOOP_ENV,
+        '_watch_source_hash() { printf ""; }',
+        "_watch_reexec() { echo REEXEC; exit 1; }",
+        '_watch_loop "BASELINE"',
+    ]
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "REEXEC" not in result.stdout
+
+
+def test_watch_loop_no_reexec_on_idle_tick(tmp_path: Path) -> None:
+    # A land while NO spoke pane is live must not re-exec an about-to-exit watchdog
+    # (it would only reset the idle countdown and linger uselessly). Even with a
+    # changed stamp, an all-idle loop tears down after the idle grace, never recycling.
+    parts = [
+        _pane_pattern_stub(tmp_path, ""),
+        _LOOP_ENV,
+        "_watch_source_hash() { echo CHANGED; }",
+        "_watch_reexec() { echo REEXEC; exit 1; }",
+        '_watch_loop "BASELINE"',
+    ]
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "REEXEC" not in result.stdout
+    assert (tmp_path / "ticks").read_text() == "3"
+
+
+def test_watch_reexec_declines_when_new_source_unparseable(tmp_path: Path) -> None:
+    # The self-recycle must never re-exec into a land that shipped a parse-broken
+    # script — a dead watchdog defeats the whole point (#115). When a bundle file
+    # fails `bash -n`, _watch_reexec logs and RETURNS (keeps the current code alive)
+    # instead of exec'ing into code that would abort on parse.
+    broken = tmp_path / "broken.sh"
+    broken.write_text("if [ ; then\n")  # deliberate syntax error
+    parts = [
+        f'_HUB_OTEL_SOURCE_FILES=("{broken}")',
+        f'_HUB_OTEL_SELF="{broken}"',
+        "_watch_reexec && echo RETURNED",
+    ]
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "RETURNED" in result.stdout
+    assert "fails to parse" in result.stdout
+
+
+def test_daemon_reexec_reclaims_own_pidfile(tmp_path: Path) -> None:
+    # A re-exec keeps the daemon's pid, so the pidfile already names a LIVE pid (our
+    # own $$). The `--reexec` flag (passed only by _watch_reexec, never ambient) tells
+    # the singleton guard to reclaim the file and run the loop (all-idle → 3 ticks)
+    # rather than report "already running".
+    pidfile = tmp_path / "watch.pid"
+    parts = [
+        _pane_pattern_stub(tmp_path, ""),
+        _LOOP_ENV,
+        f'export HUB_OTEL_WATCH_PIDFILE="{pidfile}"',
+        f'export HUB_OTEL_WATCH_LOG="{tmp_path / "watch.log"}"',
+        f'printf "%s" "$$" > "{pidfile}"',
+        "_daemon --reexec",
+    ]
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "already running" not in result.stdout + result.stderr
+    assert (tmp_path / "ticks").read_text() == "3"
+
+
 # ── spawn-time auto-arm (#138 ST2): wt_otel_watch_arm in worktree-lib.sh ─────
 #
 # worktree-new.sh arms `hub-otel-watch.sh --daemon` at every spoke spawn via
