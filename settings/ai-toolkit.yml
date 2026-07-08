@@ -104,6 +104,11 @@ model:
     devops:
       model: claude-opus-4-8
       effort: max
+    # Accurate Scope: derivation is the whole value of bug-scoper (#220); route
+    # it to the strongest reasoning model.
+    bug-scoper:
+      model: claude-opus-4-8
+      effort: max
     tdd-green:
       model: claude-sonnet-5
       effort: max

@@ -161,6 +161,19 @@ security-reviewer:
       agent: debug
       prompt: "Fix the security vulnerabilities identified in the audit above."
 
+bug-scoper:
+  name: "bug-scoper"
+  description: "Investigate a defect, derive its real Scope:/Gate: footer, and file (or draft) a correctly-scoped GitHub bug issue — never fixes the bug."
+  argument-hint: "Describe the defect — symptom, error, or wrong behavior (plus any code context)"
+  disallowedTools: [replace_string_in_file, multi_replace_string_in_file, create_file, edit_notebook_file, run_in_terminal, send_to_terminal]
+  claude:
+    skills:
+      - github-issues
+  handoffs:
+    - label: "Fix the bug now"
+      agent: debug
+      prompt: "Fix the bug scoped in the issue above (whether it was filed, drafted for approval, or deduped into an existing one)."
+
 architect:
   name: "architect"
   description: "System design and architecture decisions — boundaries, trade-offs, ADRs, and diagrams. Designs structure; never writes implementation."
