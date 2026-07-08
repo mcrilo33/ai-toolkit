@@ -428,7 +428,9 @@ def test_real_config_agent_routing_matches_seed(real_config: dict, name: str, mo
 # ─── real config: cycle-step routing is a live, self-consistent SSOT (issue #182) ───
 
 
-@pytest.mark.parametrize("step", ["green", "red", "review"])
+# Derive from the LIVE map (not a hand-kept literal) so a new delegated step added
+# to CYCLE_STEP_AGENTS is automatically drift-guarded here, like the agent roster.
+@pytest.mark.parametrize("step", sorted(cfg.CYCLE_STEP_AGENTS))
 def test_real_config_cycle_step_declared_model_matches_its_delegate(
     real_config: dict, step: str
 ) -> None:
@@ -440,7 +442,7 @@ def test_real_config_cycle_step_declared_model_matches_its_delegate(
     assert cfg.cycle_step_model(real_config, step) == cfg.agent_model(real_config, delegate)
 
 
-@pytest.mark.parametrize("step", ["green", "red", "review"])
+@pytest.mark.parametrize("step", sorted(cfg.CYCLE_STEP_AGENTS))
 def test_real_config_cycle_step_effective_model_delivers_declared_model(
     real_config: dict, step: str
 ) -> None:
@@ -449,6 +451,15 @@ def test_real_config_cycle_step_effective_model_delivers_declared_model(
     assert cfg.cycle_step_effective_model(real_config, step) == cfg.cycle_step_model(
         real_config, step
     )
+
+
+@pytest.mark.parametrize("step", ["anchor", "push"])
+def test_real_config_mechanical_steps_fail_open_to_driver(real_config: dict, step: str) -> None:
+    # anchor/push have no delegate and are intentionally NOT declared in
+    # cycle_steps — both the declared and the effective model resolve to None so
+    # the consumer keeps the spoke driver model (the approved fail-open for #182).
+    assert cfg.cycle_step_effective_model(real_config, step) is None
+    assert cfg.cycle_step_model(real_config, step) is None
 
 
 # ─── agent_model_overrides (the sync-stamping overlay source) ───

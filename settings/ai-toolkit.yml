@@ -58,13 +58,13 @@ model:
   # Model per solo-cycle step (issue #182). Realized by delegating each step to
   # its routed subagent (red→tdd-red, green→tdd-green, review→code-review); the
   # solo-cycle skill instructs the delegation and `cycle_step_effective_model`
-  # in ai_toolkit_config.py resolves the model. anchor/push have no delegate and
-  # fail open to the spoke driver model. A per-step value here MUST match its
-  # delegate's `model.subagents` entry (a test binds them, so a drift fails loud).
+  # in ai_toolkit_config.py resolves the model. ONLY the delegated steps are
+  # listed — anchor and push are mechanical (git plumbing, marker emission) with
+  # no subagent, so they always run on the spoke driver model; declaring a model
+  # for them would be dead config (nothing consumes it). A per-step value here
+  # MUST match its delegate's `model.subagents` entry (a test binds them, so a
+  # drift fails loud); an absent step fails open to the spoke driver model.
   cycle_steps:
-    anchor:
-      model: claude-opus-4-8
-      effort: max
     red:
       model: claude-opus-4-8
       effort: max
@@ -73,9 +73,6 @@ model:
       effort: max
     review:
       model: claude-opus-4-8
-      effort: max
-    push:
-      model: claude-sonnet-5
       effort: max
 
   # Per sub-agent model routing (issue #141): Fable is scarce, so it is reserved

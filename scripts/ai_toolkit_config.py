@@ -12,7 +12,7 @@ Config shape (block-style YAML; see settings/ai-toolkit.yml for the full seed)::
     base_branch: <name-or-empty>
     model:
       spoke:       {model, effort}
-      cycle_steps: {anchor|red|green|review|push: {model, effort}}
+      cycle_steps: {red|green|review: {model, effort}}  # delegated steps only
       subagents:   {<agent>: {model, effort}}
       afk:         {answerer: {model, effort}}
       overrides:   {by_label: {<label>: {model, effort}}}
@@ -89,10 +89,12 @@ def agent_model(config: dict, name: str) -> ModelSpec | None:
 def cycle_step_model(config: dict, step: str) -> ModelSpec | None:
     """A solo-cycle step's declared (model, effort), or None when unset.
 
-    This is the *declared intent* for a cycle step. The step is realized by
-    delegating to a routed subagent (see :data:`CYCLE_STEP_AGENTS` /
-    :func:`cycle_step_effective_model`); the two are bound self-consistent by a
-    real-config test so a drift fails loudly rather than routing silently wrong.
+    This is the *declared intent* for a delegated cycle step. The step is
+    realized by delegating to a routed subagent (see :data:`CYCLE_STEP_AGENTS` /
+    :func:`cycle_step_effective_model`); for each delegated step the declared and
+    the effective model are bound self-consistent by a real-config test so a
+    drift fails loudly rather than routing silently wrong. Undelegated steps
+    (anchor/push) carry no declaration and return None here (fail-open).
     """
     steps = _model_section(config).get("cycle_steps")
     if not isinstance(steps, dict):
