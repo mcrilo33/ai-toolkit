@@ -2005,6 +2005,27 @@ def test_classify_permission_approves_relative_in_worktree_mutations(
     assert _classify_with_wt(cmd, spoke_repo, tasks) == "APPROVE"
 
 
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "cp ./a.txt ./b.txt",  # `./`-prefixed in-tree paths (the most common form)
+        "rm ./sub/b.txt",
+        "chmod +x ./sub/hook.sh",
+        "mkdir -p ./out",
+        "cd ./sub && rm b.txt",  # `./` in a cd target must normalize too
+    ],
+)
+def test_classify_permission_approves_dot_slash_in_tree_mutations(
+    cmd: str, spoke_repo: Path, tmp_path: Path
+) -> None:
+    # `/./` and `//` path normalization must collapse cleanly: an idiomatic `./`-prefixed
+    # in-tree path (or a `cd ./sub`) still resolves under the worktree and stays approvable.
+    tasks = tmp_path / "tasks"
+    (spoke_repo / "sub").mkdir()
+
+    assert _classify_with_wt(cmd, spoke_repo, tasks) == "APPROVE"
+
+
 def test_classify_permission_decomposes_multiline_compound(
     spoke_repo: Path, tmp_path: Path
 ) -> None:

@@ -178,6 +178,7 @@ _broker_reanswer_exhausted() {
   [ -n "$sig" ] || return 1
   ceiling="${AFK_REANSWER_CEILING:-2}"
   case "$ceiling" in '' | *[!0-9]*) ceiling=2 ;; esac
+  [ "$ceiling" -lt 1 ] && ceiling=1   # floor at 1: a 0 ceiling would strand every gate unanswered
   tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"
   f="$(_reanswer_state_file "$issue")"
   if [ -f "$f" ]; then
@@ -1071,9 +1072,12 @@ _broker_resolve_in_roots() {
     *'..'* | *'$'* | *'`'* | '~'* | *'{'* | *'}'* | *'*'* | *'?'* | *'['* | *']'*) return 1 ;;
   esac
   case "$p" in /*) abs="$p" ;; *) abs="$cwd/$p" ;; esac
-  # Collapse `/./` and duplicate slashes textually (no glob, no fs touch).
+  # Collapse `/./` and duplicate slashes textually (no glob, no fs touch). The replacement
+  # is `$sl` (a bare slash held in a var), NOT a literal `\/`: bash keeps the backslash in a
+  # `${var//pat/repl}` replacement string, so `\/` would corrupt the path (`/x/./y`→`/x\/y`).
+  local sl=/
   while case "$abs" in */./* | *//*) true ;; *) false ;; esac; do
-    abs="${abs//\/.\//\/}"; abs="${abs//\/\//\/}"
+    abs="${abs//\/.\//$sl}"; abs="${abs//\/\//$sl}"
   done
   abs="${abs%/}"; [ -n "$abs" ] || abs="/"
   case "$abs" in "$wt"/.git | "$wt"/.git/*) return 1 ;; esac      # never .git internals (textual)
