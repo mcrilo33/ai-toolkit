@@ -57,6 +57,18 @@ fi
 # If no message found (e.g. git commit --amend), allow
 [ -z "$MSG" ] && exit 0
 
+# Git-generated messages are exempt: merge commits ("Merge branch '…'", "Merge
+# pull request …", "Merge remote-tracking branch …") and native reverts
+# ("Revert \"…\"") never follow type(scope): — every conventional-commit linter
+# exempts them. Without this, worktree-land's merge into main is denied and the
+# land misreads the failed merge as a conflict (the 2026-07-08 drain wedge).
+# "Revert " (not lowercase revert:) — git's native subject is `Revert "…"`, but
+# the quote normalization above can truncate the extracted MSG at the inner
+# quote, so match on the word + space rather than requiring the quote char.
+case "$MSG" in
+  "Merge "* | "Revert "*) exit 0 ;;
+esac
+
 # ── Conventional commits validation ─────────────────────────────────
 # Pattern: type(optional-scope): description
 #   OR: type!: description (breaking change)

@@ -211,6 +211,30 @@ def test_commit_quality_escaped_double_quotes_pass(on_branch: Callable[[str], Pa
     assert run_hook(COMMIT_QUALITY, command, cwd=repo) == ALLOW
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(
+            "git commit -m \"Merge branch 'feature/188-push-gate-tripwire-scope'\"",
+            id="merge-branch",
+        ),
+        pytest.param('git commit -m "Merge pull request #12 from x/y"', id="merge-pr"),
+        pytest.param(
+            "git commit -m \"Merge remote-tracking branch 'origin/main'\"",
+            id="merge-remote",
+        ),
+        pytest.param('git commit -m "Revert \\"feat(core): add helper\\""', id="native-revert"),
+    ],
+)
+def test_commit_quality_exempts_git_generated_messages(
+    on_branch: Callable[[str], Path], command: str
+) -> None:
+    # worktree-land's merge into main carries git's own "Merge branch '…'"
+    # message; denying it wedges every diverged land (2026-07-08 drain outage).
+    repo = on_branch("landing")  # no issue anchor — the exemption alone must allow
+    assert run_hook(COMMIT_QUALITY, command, cwd=repo) == ALLOW
+
+
 # ── commit-quality: issue-anchor gate ─────────────────────
 
 
@@ -1777,9 +1801,7 @@ def _run_gauntlet(repo: Path) -> subprocess.CompletedProcess:
 
 
 class TestGauntletCoverageNudge:
-    def test_new_unreferenced_control_plane_script_warns_and_allows(
-        self, nudge_repo: Path
-    ) -> None:
+    def test_new_unreferenced_control_plane_script_warns_and_allows(self, nudge_repo: Path) -> None:
         _stage_nudge(nudge_repo, "scripts/new-tool.sh", "#!/bin/sh\necho hi\n")
 
         proc = _run_gauntlet(nudge_repo)
@@ -1788,9 +1810,7 @@ class TestGauntletCoverageNudge:
         assert "new-tool.sh" in proc.stderr
         assert "referencing" in proc.stderr
 
-    def test_new_script_with_staged_referencing_test_stays_silent(
-        self, nudge_repo: Path
-    ) -> None:
+    def test_new_script_with_staged_referencing_test_stays_silent(self, nudge_repo: Path) -> None:
         _stage_nudge(nudge_repo, "scripts/new-tool.sh", "#!/bin/sh\necho hi\n")
         _stage_nudge(nudge_repo, "tests/unit/test_new_tool.py", '"""Covers new-tool.sh."""\n')
 
