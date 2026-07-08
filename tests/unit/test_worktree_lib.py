@@ -328,6 +328,75 @@ def test_bridge_preflight_stale_but_auth_missing_leaves_process() -> None:
     assert "LANGFUSE_BASIC_AUTH" in result.stderr
 
 
+# --- wt_source_hash: content-hash source stamp (issue #190) --------------------
+# The reusable "source-hash stamp" primitive: a content hash over a daemon's source
+# bundle, so a long-running process can detect it is running code a land has since
+# rewritten. Content — not mtime — is the signal: a no-op land that rewrites a file
+# with identical bytes must NOT read as changed (no flapping), and a per-worktree
+# checkout that bumps mtimes without changing content must not either.
+
+
+def _source_hash(*files: Path | str) -> subprocess.CompletedProcess[str]:
+    """Invoke wt_source_hash over the given paths, in order."""
+    argv = " ".join(f'"{f}"' for f in files)
+    return _call(f"wt_source_hash {argv}")
+
+
+def test_source_hash_is_stable_for_identical_content(tmp_path: Path) -> None:
+    # Same bytes → same stamp, even after a rewrite that bumps mtime (a no-op land):
+    # the daemon must not flap-recycle when nothing actually changed.
+    f = tmp_path / "daemon.sh"
+    f.write_text("echo hello\n")
+    first = _source_hash(f)
+    f.write_text("echo hello\n")  # rewritten identically — newer mtime, same content
+    second = _source_hash(f)
+
+    assert first.returncode == 0, first.stderr
+    assert first.stdout.strip() != ""
+    assert first.stdout.strip() == second.stdout.strip()
+
+
+def test_source_hash_changes_when_content_changes(tmp_path: Path) -> None:
+    # A real code change (a land rewriting the source) → a different stamp, which is
+    # what lets the daemon detect it is running stale code.
+    f = tmp_path / "daemon.sh"
+    f.write_text("echo old\n")
+    before = _source_hash(f)
+    f.write_text("echo new\n")
+    after = _source_hash(f)
+
+    assert before.returncode == 0, before.stderr
+    assert before.stdout.strip() != after.stdout.strip()
+
+
+def test_source_hash_covers_the_whole_bundle(tmp_path: Path) -> None:
+    # The stamp spans EVERY file in the bundle (script + its sourced libs): a change
+    # to the second file alone still moves the hash.
+    a = tmp_path / "script.sh"
+    b = tmp_path / "lib.sh"
+    a.write_text("a\n")
+    b.write_text("b\n")
+    before = _source_hash(a, b)
+    b.write_text("b changed\n")
+    after = _source_hash(a, b)
+
+    assert before.returncode == 0, before.stderr
+    assert before.stdout.strip() != after.stdout.strip()
+
+
+def test_source_hash_skips_missing_files(tmp_path: Path) -> None:
+    # A bundle path that does not exist contributes nothing (never errors), so the
+    # stamp equals the hash of just the present files — an unresolved sibling lib
+    # must not blow up the stamp.
+    a = tmp_path / "script.sh"
+    a.write_text("a\n")
+    with_missing = _source_hash(a, tmp_path / "absent.sh")
+    present_only = _source_hash(a)
+
+    assert with_missing.returncode == 0, with_missing.stderr
+    assert with_missing.stdout.strip() == present_only.stdout.strip()
+
+
 def test_bridge_pid_resolves_via_lsof_not_pgrep(tmp_path: Path) -> None:
     # The bridge pid MUST be found via lsof on :4319, never pgrep -f — pgrep
     # false-negatives on non-ASCII argv under a non-UTF8 locale. Stub both on PATH:
