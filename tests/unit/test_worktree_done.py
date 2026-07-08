@@ -293,6 +293,51 @@ def test_remote_delete_skipped_when_remote_has_unfetched_commits(hub: Path, tmp_
     assert "origin/feature/11-late" in proc.stderr, "the kept remote is loud"
 
 
+def test_remote_delete_noop_when_remote_branch_already_gone(hub: Path, tmp_path: Path) -> None:
+    # The remote branch was already deleted on origin (e.g. by a prior resumed
+    # land) but the stale tracking ref survives locally. The freshness fetch
+    # runs with --prune, so the ghost collapses and teardown recognizes there is
+    # nothing to delete — no ancestor check against the stale ref, no misleading
+    # "couldn't delete" / "kept remote" warning.
+    _make_spoke(hub, tmp_path, "feature/12-gone", push=True, merge=True)
+    _git(tmp_path / "remote.git", "update-ref", "-d", "refs/heads/feature/12-gone")
+    _git(hub, "rev-parse", "--verify", "refs/remotes/origin/feature/12-gone")  # ghost present
+
+    proc, _ = _run_done(hub, tmp_path, "12")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "feature/12-gone" not in _local_branches(hub)  # local prune still runs
+    assert "origin/feature/12-gone" not in proc.stderr, "no warning about a branch already gone"
+
+
+def test_remote_delete_proceeds_when_merged_into_origin_base_only(
+    hub: Path, tmp_path: Path
+) -> None:
+    # Concurrent-hub case: the spoke pushed a late commit and ANOTHER hub landed
+    # it on origin/main; this checkout's local main is behind. The late commit is
+    # durably integrated in origin/main, so the remote delete must still proceed
+    # instead of keeping the branch with a misleading "commits not in main" warn.
+    wt = _make_spoke(hub, tmp_path, "feature/13-conc", push=True, merge=True)
+    merged_sha = _git(hub, "rev-parse", "feature/13-conc").strip()
+    (wt / "late.txt").write_text("landed by another hub\n")
+    _git(wt, "add", "late.txt")
+    _git(wt, "commit", "-qm", "feat: late", "-m", "Refs #1")
+    _git(wt, "push", "-q", "origin", "feature/13-conc")
+    # Another hub integrates the late push into origin/main; local main stays behind.
+    _git(hub, "checkout", "-q", "-b", "tmpint", "main")
+    _git(hub, "merge", "-q", "--no-ff", "feature/13-conc", "-m", "merge elsewhere")
+    _git(hub, "push", "-q", "origin", "tmpint:main")
+    _git(hub, "checkout", "-q", "main")
+    _git(hub, "branch", "-qD", "tmpint")
+    _git(wt, "reset", "-q", "--hard", merged_sha)  # local branch back at the merged tip
+
+    proc, _ = _run_done(hub, tmp_path, "13")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "feature/13-conc" not in _local_branches(hub)
+    assert not _remote_has(hub, "feature/13-conc"), "merged-into-origin/main branch is deleted"
+
+
 def test_unmerged_branch_is_kept(hub: Path, tmp_path: Path) -> None:
     _make_spoke(hub, tmp_path, "feature/2-unmerged", push=False, merge=False)
     proc, _ = _run_done(hub, tmp_path, "2")
