@@ -376,6 +376,8 @@ def test_same_basename_repos_get_distinct_sessions(tmp_path: Path) -> None:
 
 
 def test_no_server_falls_back_to_manual_advice(hub: Path, tmp_path: Path) -> None:
+    # A COMPLETE contract (title AND body, issue #206) is needed for task.md to be
+    # written and the default kickoff to point at it, so seed both fields.
     proc, log = _run_new(
         hub,
         tmp_path,
@@ -385,6 +387,7 @@ def test_no_server_falls_back_to_manual_advice(hub: Path, tmp_path: Path) -> Non
         inside_tmux=False,
         has_session_rc=1,
         new_session_rc=1,
+        extra_env={"GH_ISSUE_TITLE": "Some Issue Title", "GH_ISSUE_BODY": "Do the thing.\n"},
     )
 
     assert proc.returncode == 0, proc.stderr
@@ -467,14 +470,47 @@ def test_writes_task_contract_at_spawn(hub: Path, tmp_path: Path) -> None:
 
 
 def test_default_seed_prompt_points_at_task_contract(hub: Path, tmp_path: Path) -> None:
-    # With no --prompt, the spoke is seeded to read task.md rather than run an
-    # LLM /source-task round-trip.
-    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code")
+    # With no --prompt, the spoke is seeded to read task.md rather than run an LLM
+    # /source-task round-trip. task.md is written only for a COMPLETE contract
+    # (title AND body, issue #206), so seed both fields.
+    env = {"GH_ISSUE_TITLE": "Some Issue Title", "GH_ISSUE_BODY": "Do the thing.\nGate: none\n"}
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", extra_env=env)
 
     assert proc.returncode == 0, proc.stderr
     new_window = _calls(log.read_text(), "new-window")
     assert new_window, "expected a new-window invocation"
     assert ".ai-toolkit/task.md" in new_window[0], "default seed prompt must point at task.md"
+
+
+def test_partial_gh_failure_writes_no_task_contract(hub: Path, tmp_path: Path) -> None:
+    # Issue #206 — if the body fetch fails (empty) after the title fetch succeeds, a
+    # title-only task.md would exist but be empty of contract, and its mere existence
+    # suppresses the spoke's /source-task fallback. task.md must be written only when
+    # COMPLETE (title AND body); a partial fetch leaves none so the fallback engages.
+    env = {"GH_ISSUE_TITLE": "Title only", "GH_ISSUE_BODY": ""}
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", extra_env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    task_md = _worktree_dir(hub, "8") / ".ai-toolkit" / "task.md"
+    assert not task_md.exists(), "a title-only (partial) fetch must not write a hollow task.md"
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    assert ".ai-toolkit/task.md" not in new_window[0], (
+        "with no complete contract the seed must fall back, not point at a hollow task.md"
+    )
+
+
+def test_task_contract_written_atomically_without_leftover_temp(hub: Path, tmp_path: Path) -> None:
+    # Issue #206 — task.md is written atomically (temp file + rename), so no partial
+    # scratch file (task.md.*) survives alongside the final contract.
+    env = {"GH_ISSUE_TITLE": "T", "GH_ISSUE_BODY": "Do the thing.\nGate: none\n"}
+    proc, _ = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", extra_env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    ai_dir = _worktree_dir(hub, "8") / ".ai-toolkit"
+    assert (ai_dir / "task.md").is_file(), "the complete contract must be written"
+    leftovers = sorted(p.name for p in ai_dir.glob("task.md.*"))
+    assert leftovers == [], f"atomic write must leave no temp file: {leftovers}"
 
 
 def test_explicit_prompt_overrides_default_task_contract_seed(hub: Path, tmp_path: Path) -> None:

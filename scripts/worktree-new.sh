@@ -226,14 +226,20 @@ if [[ "$ISSUE" =~ ^[0-9]+$ ]] && command -v gh >/dev/null 2>&1; then
   # and an already-fetched empty value is honoured, not re-fetched.
   TASK_TITLE="${TITLE-$(gh issue view "$ISSUE" --json title -q .title 2>/dev/null || true)}"
   TASK_BODY="${ISSUE_BODY-$(gh issue view "$ISSUE" --json body -q .body 2>/dev/null || true)}"
-  # Only write when the fetch actually yielded something — a total gh miss (both
-  # empty) leaves no task.md so the seed prompt still falls back to /source-task,
-  # rather than stamping a hollow contract that suppresses that fallback.
-  if [ -n "$TASK_TITLE" ] || [ -n "$TASK_BODY" ]; then
+  # Write ONLY a COMPLETE contract — both title AND body present (issue #206). A
+  # partial gh failure (e.g. the body fetch dies after the title fetch) that left a
+  # title-only task.md would stamp a hollow contract whose mere existence suppresses
+  # the seed's /source-task fallback; requiring both means such a fetch leaves no
+  # task.md and the fallback still engages (same as a total gh miss). Written
+  # ATOMICALLY (temp file + rename) so a mid-write interruption never leaves a
+  # partial task.md that the fallback would likewise be fooled by.
+  if [ -n "$TASK_TITLE" ] && [ -n "$TASK_BODY" ]; then
+    TASK_TMP="$(mktemp "$WT_DIR/.ai-toolkit/task.md.XXXXXX")"
     {
-      printf '# Issue #%s: %s\n\n' "$ISSUE" "${TASK_TITLE:-(title unavailable)}"
+      printf '# Issue #%s: %s\n\n' "$ISSUE" "$TASK_TITLE"
       printf '%s\n' "$TASK_BODY"
-    } > "$TASK_MD"
+    } > "$TASK_TMP"
+    mv "$TASK_TMP" "$TASK_MD"
     echo "→ task contract      .ai-toolkit/task.md (#$ISSUE)"
   fi
 fi
