@@ -41,6 +41,9 @@ EXPECTED_ROUTING = {
     "code-review": OPUS,
     "tdd-red": OPUS,
     "devops": OPUS,
+    # bug-scoper investigates the codebase to derive a real Scope: line — accurate
+    # scoping is its whole value, so it gets the strongest reasoning model (#220).
+    "bug-scoper": OPUS,
     "tdd-green": SONNET,
     "tdd-refactor": SONNET,
     "refactor": SONNET,

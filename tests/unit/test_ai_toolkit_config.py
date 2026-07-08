@@ -44,6 +44,9 @@ EXPECTED_AGENT_ROUTING = {
     "code-review": OPUS,
     "tdd-red": OPUS,
     "devops": OPUS,
+    # bug-scoper investigates to derive a real Scope: line; accurate scoping is its
+    # whole value, so it routes to the strongest reasoning model (#220).
+    "bug-scoper": OPUS,
     "tdd-green": SONNET,
     "tdd-refactor": SONNET,
     "refactor": SONNET,
