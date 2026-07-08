@@ -59,16 +59,20 @@ legitimately READ the toolkit through the inherited cwd — hub-afk's self-copy 
 break those reads. Against the mirror, ``show-toplevel`` resolves to the sandbox and the
 symlinked ``scripts/`` / ``shared/`` still read the real files, while ``git worktree list``
 reports NO task worktrees (so the escalation escape finds nothing to stamp) and any stray
-ref write lands in the sandbox's own ``.git`` — never the real repo. Tests that pass their
-own ``cwd=`` (isolated tmp repos) are untouched. ``GIT_CEILING_DIRECTORIES`` pins the walk
-to the sandbox as belt-and-suspenders against an oddly-placed ``TMPDIR``. The regression
-guard is ``tests/unit/test_post_land_sweep.py``.
+REF write (a ``git tag`` / ``git update-ref``) lands in the sandbox's own ``.git`` — never
+the real repo. (A relative-path FILE write through a symlinked entry, e.g.
+``$(git rev-parse --show-toplevel)/scripts/x``, would still reach the real file — but that
+is not the #179 escape, no test does it, and the real-repo cwd it replaced was no safer.)
+Tests that pass their own ``cwd=`` (isolated tmp repos) are untouched.
+``GIT_CEILING_DIRECTORIES`` pins the walk to the sandbox as belt-and-suspenders against an
+oddly-placed ``TMPDIR``. The regression guard is ``tests/unit/test_post_land_sweep.py``.
 """
 
 from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -138,11 +142,12 @@ os.environ["AFK_TELEMETRY_CONF"] = os.path.join(
 # subprocess that shells `git` without an explicit cwd= resolves the SANDBOX (never the
 # real repo root pytest was launched from): toolkit reads still resolve via the symlinks,
 # while `git worktree list` sees no task worktrees and stray ref writes land in the
-# sandbox's own .git. Reads of the real repo layout keep working; writes can't escape.
+# sandbox's own .git. Reads of the real repo layout keep working; ref writes can't escape.
 def _build_git_cwd_sandbox() -> str:
     """Create a throwaway git repo whose worktree mirrors the real checkout's top-level
-    entries via symlinks, and return its path. Best-effort: on any failure the caller
-    leaves the cwd where it is (the strips above still limit the blast radius)."""
+    entries via symlinks, and return its path. Raises on any failure — the caller turns
+    that into a LOUD warning, because a silent failure leaves the session cwd at the real
+    repo and re-opens the #179 escape (the env strips above do NOT cover cwd discovery)."""
     repo_root = Path(__file__).resolve().parents[1]
     sandbox = Path(tempfile.mkdtemp(prefix="ai-toolkit-test-cwd-"))
     # Mirror every top-level entry except the real .git (the sandbox gets its own).
@@ -162,5 +167,13 @@ try:
     _GIT_CWD_SANDBOX = _build_git_cwd_sandbox()
     os.environ["GIT_CEILING_DIRECTORIES"] = _GIT_CWD_SANDBOX
     os.chdir(_GIT_CWD_SANDBOX)
-except (OSError, subprocess.SubprocessError):
-    pass
+except (OSError, subprocess.SubprocessError) as _cwd_err:
+    # Fail OPEN (don't abort the whole suite over a transient git hiccup) but LOUDLY:
+    # the session cwd is still the real repo, so a bare-git test can escape isolation —
+    # test_post_land_sweep.py will fail, and this banner makes a re-tripped tripwire
+    # traceable to the cause instead of looking like a fresh mystery escape (#179).
+    print(
+        f"conftest: WARNING — could not build the git-cwd sandbox ({_cwd_err!r}); "
+        "the session cwd is still the real repo and bare-git tests may mutate it (#179)",
+        file=sys.stderr,
+    )
