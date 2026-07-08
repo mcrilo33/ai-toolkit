@@ -90,6 +90,74 @@ jobs:
           fi
           echo "Sync is idempotent (no drift beyond reconciler .bak backups)."
 
+  # macOS + non-C locale reproduction of the production control-plane
+  # environment (#194). Linux CI is structurally blind to the BSD/GNU +
+  # locale divergence bug class: pgrep -f illegal-byte-sequence false
+  # negatives, French-formatted `ps -o lstart` breaking staleness detection,
+  # grep ERE portability (anti-gutting-scan.sh carries BSD-portability
+  # comments), and the #129/#132 tmp-path / global-gitignore cluster — all
+  # pass on ubuntu where the code does not run. This job runs only the
+  # shell-control-plane test subset (suites that drive a *.sh hook or
+  # scripts/*.sh via subprocess), not the full suite, to keep macOS minutes
+  # bounded. continue-on-error while the documented flakes are burned down;
+  # remove it to make the job required once green. Related: #189.
+  shell-control-plane-macos:
+    name: Shell control-plane (macOS, fr_FR.UTF-8)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    env:
+      LANG: fr_FR.UTF-8
+      LC_ALL: fr_FR.UTF-8
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Confirm the non-C locale resolved on the runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Fail loud if fr_FR.UTF-8 is unavailable — a silent fallback to C
+          # would make this job green for the wrong reason (the locale bug
+          # class only reproduces under a real non-C UTF-8 locale).
+          locale -a | grep -qiE '^fr_FR\.(UTF-8|utf8)$'
+          locale
+
+      - name: Select and run the shell-control-plane test subset
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Subset = every test file that drives a *.sh control-plane script
+          # (hook or scripts/*.sh) via subprocess, detected by a *.sh token
+          # reference. Selected dynamically so the subset self-maintains as
+          # suites are added; ci.yml is the only file in scope for #194, so the
+          # selection lives here rather than behind a pytest marker. The token
+          # boundary ([^a-zA-Z0-9]|$) is portable ERE (BSD + GNU grep) and
+          # drops false matches like `github.sha`.
+          subset=$(grep -rlE '\.sh([^a-zA-Z0-9]|$)' tests --include='test_*.py' | sort)
+          if [ -z "$subset" ]; then
+            echo "No shell-control-plane tests matched — selection is broken." >&2
+            exit 1
+          fi
+          echo "Selected shell-control-plane test files:"
+          echo "$subset" | sed 's/^/  /'
+          # Intentional word-split on the newline-separated file list; paths
+          # carry no spaces. Default macOS /bin/bash is 3.2 (no mapfile).
+          # shellcheck disable=SC2086
+          python -m pytest $subset -q
+
   # A permanently red check is noise that hides the day it fails for a real
   # reason (#129): on any red gate job, land the failure in the backlog as a
   # GitHub issue instead of an unread checks tab. Dedup contract: one open
