@@ -38,4 +38,18 @@ PROJECT_ROOT=$(project_root_from_payload "$INPUT")
 mkdir -p "$PROJECT_ROOT/.review"
 date +%s > "$PROJECT_ROOT/.review/.window"
 
+# Key the window to its opener so review-window-close.sh removes only the
+# window it owns (issue #197): record the reviewer's session id, when the
+# payload carries one, in a sidecar. When no session id resolves the window is
+# left unkeyed (no sidecar) and any code-review stop may close it — the
+# historical single-window behaviour. review-stamp-guard.sh only checks the
+# window's existence and mtime, so this sidecar never affects the freshness gate.
+SESSION_ID=""
+if command -v jq &>/dev/null; then
+  SESSION_ID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
+fi
+if [ -n "$SESSION_ID" ]; then
+  printf '%s\n' "$SESSION_ID" > "$PROJECT_ROOT/.review/.window.owner"
+fi
+
 exit 0
