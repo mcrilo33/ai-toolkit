@@ -41,12 +41,13 @@ batch:
   # Max spokes running at once. Empty ⇒ auto min(2, cores/4); set a positive
   # integer to override. batch-plan.sh truncates the batch so (in-flight +
   # newly-dispatched) never exceeds this.
-  # Sized for the M5 Max hub (18 cores / 48 GB). Measured 2026-07-08 with 4
-  # spokes live: load 6/18, 59% RAM free, ClickHouse ~30% of one core — 6 keeps
-  # #151 headroom. Hold at 6 until #188 (tripwire ref scoping) and #203 (broker
-  # re-answer ceiling) land; those bound the failure modes that widen with the
-  # batch (sibling-push false aborts, serial answerer queueing).
-  concurrency_cap: 6
+  # Sized for the M5 Max hub (18 cores / 48 GB) — hardware headroom is fine at 6
+  # (measured 2026-07-08: load 6/18, 59% RAM free). The binding constraint is the
+  # weekly subscription budget, not the box: with Opus spokes the account limit
+  # hits before CPU/RAM. Capped at 3 to stretch the weekly budget across more of
+  # the backlog; raise toward 6 when budget is ample. #188/#203 (the failure
+  # modes that widen with the batch) have landed, so 6 is safe hardware-wise.
+  concurrency_cap: 3
   # Seconds to wait between consecutive spawns in one batch, so first-push full
   # suites don't all hit at once. Empty ⇒ 45; 0 disables the stagger.
   stagger_seconds:
