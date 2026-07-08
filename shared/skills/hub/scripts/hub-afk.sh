@@ -33,7 +33,7 @@
 #   AFK_WATCHDOG_SECONDS=60      watchdog poll interval (respawn a crashed supervisor)
 #   AFK_SPOKE_MAX_MINUTES=180    wall-clock ceiling per spoke before a reap
 #   AFK_IDLE_MINUTES=30          a spoke idle this long with no marker AND not waiting → reap
-#   AFK_ANSWERER_CMD             the answerer command (default: claude -p --model claude-fable-5)
+#   AFK_ANSWERER_CMD             the answerer command (default: claude -p --model claude-opus-4-8)
 #   AFK_ANSWERER_EFFORT=high     thinking budget for the answerer (exported as CLAUDE_EFFORT)
 #   AFK_NOW                      override "now" (epoch seconds) — testing/cron
 #   AFK_STATE                    state-file path (default: <git-common-dir>/.afk-state)
@@ -960,7 +960,7 @@ answer_pass() {
 # bounds it so a wedged probe can't itself freeze the reap.
 _afk_auth_is_dead() {
   local cmd raw rc
-  cmd="${AFK_AUTH_PROBE_CMD:-claude -p --no-session-persistence --model claude-fable-5 ok}"
+  cmd="${AFK_AUTH_PROBE_CMD:-claude -p --no-session-persistence --model claude-opus-4-8 ok}"
   raw="$(_afk_with_timeout "${AFK_AUTH_PROBE_TIMEOUT:-30}" bash -c "$cmd" 2>&1)"; rc=$?
   [ "$rc" -ne 0 ] && is_auth_failure "$raw"
 }

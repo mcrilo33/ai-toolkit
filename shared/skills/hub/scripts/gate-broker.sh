@@ -879,7 +879,7 @@ run_answerer() {
   local issue="$1" question="$2" wt="${3:-}"
   local prompt; prompt="$(build_answerer_prompt "$issue" "$question" "$wt")"
   local tools; tools="$(reasoner_allowed_tools)"
-  local cmd="${AFK_ANSWERER_CMD:-claude -p --no-session-persistence --model claude-fable-5 --allowedTools '$tools'}"
+  local cmd="${AFK_ANSWERER_CMD:-claude -p --no-session-persistence --model claude-opus-4-8 --allowedTools '$tools'}"
   local secs; secs="$(_afk_answerer_timeout)"
   # Deliver the prompt via a temp file the wrapped command re-opens with `exec <`, NOT only
   # the here-string: the bound (_afk_with_timeout's portable fallback) BACKGROUNDS the

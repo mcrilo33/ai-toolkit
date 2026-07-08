@@ -1193,12 +1193,13 @@ class TestConfigDrivenSync:
     """settings/ai-toolkit.yml is the source of truth for model + base_branch."""
 
     def test_claude_agent_model_stamped_from_config(self, target_repo: Path) -> None:
-        # The real seed config routes architect→fable, debug→opus, tdd-green→sonnet.
+        # The real seed config routes architect→opus, debug→opus, tdd-green→sonnet.
+        # (architect carried claude-fable-5 until it was retired in #218.)
         _run_sync(target_repo, "claude")
 
         agents = target_repo / ".claude" / "agents"
         assert (
-            _parse_frontmatter((agents / "architect.md").read_text())["model"] == "claude-fable-5"
+            _parse_frontmatter((agents / "architect.md").read_text())["model"] == "claude-opus-4-8"
         )
         assert _parse_frontmatter((agents / "debug.md").read_text())["model"] == "claude-opus-4-8"
         assert (

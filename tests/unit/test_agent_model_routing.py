@@ -28,13 +28,14 @@ from metadata_parser import parse  # noqa: E402
 
 AGENTS_METADATA = REPO_ROOT / "shared" / "agents" / "metadata.yml"
 
-FABLE = "claude-fable-5"
 OPUS = "claude-opus-4-8"
 SONNET = "claude-sonnet-5"
 
 EXPECTED_ROUTING = {
-    "architect": FABLE,
-    "planner": FABLE,
+    # architect/planner carried claude-fable-5 until it was retired (#218); they
+    # fell back to opus, the strongest reasoning model still available.
+    "architect": OPUS,
+    "planner": OPUS,
     "debug": OPUS,
     "security-reviewer": OPUS,
     "code-review": OPUS,
@@ -64,11 +65,14 @@ def test_agent_model_matches_routing(config: dict, name: str, model: str) -> Non
 
 @pytest.mark.parametrize("name", sorted(EXPECTED_ROUTING))
 def test_agent_effort_stays_max(config: dict, name: str) -> None:
-    assert cfg.agent_model(config, name)[1] == "max"
+    routed = cfg.agent_model(config, name)
+    assert routed is not None
+    assert routed[1] == "max"
 
 
-@pytest.mark.parametrize(
-    "name", sorted(n for n in EXPECTED_ROUTING if n not in ("architect", "planner"))
-)
-def test_fable_reserved_for_design_and_plan(config: dict, name: str) -> None:
-    assert cfg.agent_model(config, name)[0] != FABLE
+def test_fable_is_fully_retired(config: dict) -> None:
+    # claude-fable-5 was retired (#218); no agent may route to it any more.
+    for name in EXPECTED_ROUTING:
+        routed = cfg.agent_model(config, name)
+        assert routed is not None
+        assert routed[0] != "claude-fable-5"

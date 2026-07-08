@@ -131,17 +131,18 @@ security-reviewer → debug → code-review
 
 ## Model and effort assignment
 
-Each agent is matched to a model by **role type**, treating Fable as the scarce
-currency (issue #141): only the design/plan roles whose output gates everything
-downstream get `claude-fable-5`; reasoning-heavy execution roles get
-`claude-opus-4-8` (plentiful); capable-but-routine roles get `claude-sonnet-5`;
-Haiku is reserved — no current role is provably trivial. Effort is `max`
-everywhere.
+Each agent is matched to a model by **role type** (issue #141): the design/plan
+roles whose output gates everything downstream get the strongest reasoning
+model, `claude-opus-4-8`; reasoning-heavy execution roles also get
+`claude-opus-4-8`; capable-but-routine roles get `claude-sonnet-5`; Haiku is
+reserved — no current role is provably trivial. Effort is `max` everywhere.
+(`claude-fable-5` was retired in issue #218; the design/plan roles it used to
+carry fell back to `claude-opus-4-8`.)
 
 | Agent | Model | Effort | Rationale |
 | ----- | ----- | ------ | --------- |
-| `architect` | `claude-fable-5` | `max` | System design needs the strongest reasoning |
-| `planner` | `claude-fable-5` | `max` | Decomposition quality gates all downstream work |
+| `architect` | `claude-opus-4-8` | `max` | System design needs the strongest reasoning |
+| `planner` | `claude-opus-4-8` | `max` | Decomposition quality gates all downstream work |
 | `code-review` | `claude-opus-4-8` | `max` | Catching subtle bugs needs strong reasoning |
 | `security-reviewer` | `claude-opus-4-8` | `max` | Highest stakes; assumes hostile code |
 | `debug` | `claude-opus-4-8` | `max` | Root-cause investigation is hard |
@@ -153,7 +154,7 @@ everywhere.
 | `documentation` | `claude-sonnet-5` | `max` | Reads code, writes prose |
 
 These are declared **only under the `claude:` override block** in
-`shared/agents/metadata.yml`. Full model IDs (`claude-fable-5`,
+`shared/agents/metadata.yml`. Full model IDs (`claude-opus-4-8`,
 `claude-sonnet-5`) and the `effort` field are Claude-specific — Cursor's
 `model` accepts only `inherit`/`fast`/model-id, and `effort` is not a Cursor or
 Copilot field. Scoping them to `claude:` keeps invalid values out of the other
