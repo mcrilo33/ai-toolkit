@@ -422,6 +422,22 @@ wt_resolve() {
   return 1
 }
 
+# --- daemon source-hash stamp (issue #190) -----------------------------------
+# The reusable "source-hash stamp" primitive: a content hash (sha256) over a long-
+# running daemon's source bundle, so the process can detect it is executing code a
+# land has since rewritten on disk. Hashing file CONTENT — not mtime — is load-
+# bearing: a no-op land that rewrites a file with identical bytes must NOT read as
+# changed (no flap-recycle), and a per-worktree checkout that only bumps mtimes must
+# not either. A missing bundle path contributes nothing, so an unresolved sibling
+# lib never blows up the stamp. '' only when no hasher is available (callers then
+# skip the staleness decision). Args: the bundle files, in any order. Consumed by
+# hub-otel-watch's daemon self-recycle; overridable in tests.
+wt_source_hash() {
+  local f
+  { for f in "$@"; do [ -f "$f" ] && cat "$f"; done; } \
+    | { shasum -a 256 2>/dev/null || sha256sum 2>/dev/null; } | awk '{print $1}'
+}
+
 # --- native-OTel message-bridge preflight (auto-populate) --------------------
 # A spoke that opted into native OTel (AI_TOOLKIT_OTEL=1) needs the Langfuse
 # message bridge (scripts/telemetry/langfuse_message_bridge.py, port :4319) up, or

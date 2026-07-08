@@ -30,15 +30,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # (scripts/worktree-lib.sh, four levels up from this hub script) and a synced target
 # (co-located flat in .ai-toolkit/scripts/). HUB_OTEL_WT_LIB wins for tests.
 _TOPLEVEL="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+HUB_OTEL_RESOLVED_WT_LIB=""
 for _cand in \
   "${HUB_OTEL_WT_LIB:-}" \
   "$SCRIPT_DIR/worktree-lib.sh" \
   "$SCRIPT_DIR/../../../../scripts/worktree-lib.sh" \
   "${_TOPLEVEL:+$_TOPLEVEL/scripts/worktree-lib.sh}" \
   "${_TOPLEVEL:+$_TOPLEVEL/.ai-toolkit/scripts/worktree-lib.sh}"; do
-  if [ -n "$_cand" ] && [ -f "$_cand" ]; then . "$_cand"; break; fi
+  if [ -n "$_cand" ] && [ -f "$_cand" ]; then . "$_cand"; HUB_OTEL_RESOLVED_WT_LIB="$_cand"; break; fi
 done
 unset _cand
+
+# --- self-recycle source bundle (#190) ----------------------------------------
+# The daemon is itself a long-running process running the bash it was started with;
+# a land rewrites these files on the hub checkout. The bundle is this script plus
+# the worktree-lib.sh it sourced (where the ensure paths live). It is stamped at
+# daemon start and re-checked each tick — see _watch_source_hash / _watch_reexec.
+_HUB_OTEL_SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+_HUB_OTEL_SOURCE_FILES=("$_HUB_OTEL_SELF" "$HUB_OTEL_RESOLVED_WT_LIB")
 
 # The hub checkout — the repo_root the preflights launch/mount the collector and
 # bridge against. Overridable (tests set it directly); resolves to the current
@@ -147,6 +156,22 @@ _watch_common_dir() {
 # Timestamped log line (LC_ALL=C: locale-formatted dates have burned us before).
 _watch_log() { printf 'hub-otel-watch: [%s] %s\n' "$(LC_ALL=C date '+%F %T')" "$*"; }
 
+# _watch_source_hash -> the current stamp of the daemon's own source bundle
+# (delegates to worktree-lib's wt_source_hash). Split out so the self-recycle
+# decision is overridable in tests without real files.
+_watch_source_hash() { wt_source_hash "${_HUB_OTEL_SOURCE_FILES[@]}"; }
+
+# _watch_reexec -> replace this daemon with a fresh copy running the on-disk
+# (post-land) code. `exec` preserves the pid, so the pidfile keeps naming a live
+# process and no second daemon is armed; _HUB_OTEL_REEXEC=1 tells the new _daemon to
+# reclaim its own pidfile rather than refuse as "already running". Split out so the
+# loop's recycle branch is testable without a real exec.
+_watch_reexec() {
+  _watch_log "source changed on disk (a land) — re-exec'ing into fresh code"
+  export _HUB_OTEL_REEXEC=1
+  exec bash "$_HUB_OTEL_SELF" --daemon
+}
+
 # _watch_loop -> tick every HUB_OTEL_WATCH_INTERVAL seconds (default 30): on a
 # live tick run the same ensure path as the one-shot main (recovery output —
 # "→ started lf-collector…" — flows through to the caller/logfile, which is what
@@ -155,6 +180,7 @@ _watch_log() { printf 'hub-otel-watch: [%s] %s\n' "$(LC_ALL=C date '+%F %T')" "$
 # grace for transient tmux blips and the spawn race); a live tick resets the
 # counter. Never fatal: ensure failures are best-effort and the loop keeps going.
 _watch_loop() {
+  local baseline="${1:-}"
   local interval="${HUB_OTEL_WATCH_INTERVAL:-30}" max_idle="${HUB_OTEL_WATCH_IDLE_TICKS:-3}" idle=0
   _watch_log "watch loop started (pid $$, interval ${interval}s, idle grace ${max_idle} ticks)"
   while :; do
@@ -167,6 +193,12 @@ _watch_loop() {
         _watch_log "no spoke pane live for ${max_idle} ticks — exiting"
         return 0
       fi
+    fi
+    # #190: a land rewrote our own source on disk → re-exec into it so the ensure
+    # paths we run go live with no human recycle. Content-hashed, so an identical
+    # rewrite never flaps. Empty baseline (no hasher / one-shot callers) opts out.
+    if [ -n "$baseline" ] && [ "$(_watch_source_hash)" != "$baseline" ]; then
+      _watch_reexec  # exec — does not return
     fi
     sleep "$interval"
   done
@@ -181,24 +213,30 @@ _watch_loop() {
 # <git-common-dir>/hub-otel-watch.log, HUB_OTEL_WATCH_LOG override) so a
 # recovery is auditable after the fact. Always returns 0.
 _daemon() {
-  local common pidfile logfile pid
+  local common pidfile logfile pid baseline
   common="$(_watch_common_dir)"
   pidfile="${HUB_OTEL_WATCH_PIDFILE:-$common/hub-otel-watch.pid}"
   logfile="${HUB_OTEL_WATCH_LOG:-$common/hub-otel-watch.log}"
-  if [ -f "$pidfile" ]; then
+  # A re-exec (self-recycle into post-land code) keeps this pid, so the pidfile it
+  # left behind names a live process — us. Skip the singleton guard in that case so
+  # we reclaim our own file instead of refusing; a fresh start never sets the flag.
+  if [ "${_HUB_OTEL_REEXEC:-}" != "1" ] && [ -f "$pidfile" ]; then
     pid="$(cat "$pidfile" 2>/dev/null)"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       printf '%s\n' "hub-otel-watch: already running (pid $pid, pidfile $pidfile)"
       return 0
     fi
   fi
+  unset _HUB_OTEL_REEXEC
   printf '%s' "$$" >"$pidfile"
   # Claimed: from here on this shell owns the pidfile, so remove it on exit. The
   # path rides a global — a function-local is out of scope when the trap fires.
   _WATCH_PIDFILE="$pidfile"
   trap 'rm -f "$_WATCH_PIDFILE"' EXIT
   printf '%s\n' "hub-otel-watch: daemon armed (pid $$, log $logfile)"
-  _watch_loop >>"$logfile" 2>&1
+  # Stamp the source bundle NOW so the loop re-execs when a later land moves it.
+  baseline="$(_watch_source_hash)"
+  _watch_loop "$baseline" >>"$logfile" 2>&1
   return 0
 }
 
