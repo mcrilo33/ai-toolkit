@@ -2222,6 +2222,27 @@ def test_classify_permission_escalates_dash_cd_target(
     assert _classify_with_wt(cmd, spoke_repo, tasks) == "ESCALATE"
 
 
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "chmod 600 .ENV",  # case-variant of a secret basename (macOS FS is case-insensitive)
+        "rm .ENV",
+        "mv .ENV stolen",
+        "cp a.txt secret.PEM",
+        "cp a.txt ID_RSA",
+    ],
+)
+def test_classify_permission_escalates_case_variant_secretlike(
+    cmd: str, spoke_repo: Path, tmp_path: Path
+) -> None:
+    # macOS's default filesystem is case-insensitive, so `.ENV` addresses the same inode as
+    # `.env`; the secret-like guard must match case-insensitively (mirroring the .git guard),
+    # or a case-variant secret slips into the benign lane.
+    tasks = tmp_path / "tasks"
+
+    assert _classify_with_wt(cmd, spoke_repo, tasks) == "ESCALATE"
+
+
 def test_classify_permission_mutation_lane_inert_without_worktree() -> None:
     # Backward-compatible: with NO worktree argument the mutation lane is inert, so a bare
     # `mv`/`rm`/`chmod` still default-denies exactly as before (#149/#171 posture).

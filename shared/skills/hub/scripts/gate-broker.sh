@@ -1108,13 +1108,20 @@ _broker_resolve_in_roots() {
 
 # _broker_seg_secretlike <token> -> rc 0 when a path token looks like a secret (a mutation of
 # it is never in the benign lane, even inside the worktree). Mirrors the repo's own secret
-# .gitignore classes (.env, *.pem) plus the common credential filenames.
+# .gitignore classes (.env, *.pem) plus the common credential filenames. Matched case-
+# INSENSITIVELY (via tr — bash 3.2 lacks `${v,,}`): macOS's default filesystem is case-
+# insensitive, so `.ENV` addresses the same inode as `.env` and must not slip the guard
+# (mirroring the case-folded `.git` component check in _broker_path_physically_in).
 _broker_seg_secretlike() {
-  case "${1##*/}" in
+  local base lower path_lower
+  base="${1##*/}"
+  lower="$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')"
+  case "$lower" in
     .env | .env.* | *.pem | *.key | *.p12 | id_rsa | id_dsa | id_ecdsa | id_ed25519 \
       | .netrc | credentials | .npmrc | .pypirc) return 0 ;;
   esac
-  case "$1" in */.ssh/* | */.aws/* | */.gnupg/*) return 0 ;; esac
+  path_lower="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$path_lower" in */.ssh/* | */.aws/* | */.gnupg/*) return 0 ;; esac
   return 1
 }
 
