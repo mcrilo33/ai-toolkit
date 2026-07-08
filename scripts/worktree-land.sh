@@ -290,6 +290,15 @@ if ! git merge --no-edit "$WT_BRANCH"; then
 fi
 MERGED_SHA="$(git rev-parse HEAD)"
 
+# Roll the hub back to its pre-merge tip. A failed reset leaves the hub on the merge
+# commit — unrecoverable here, so die with by-hand instructions. Shared by the three
+# land abort paths (merge-sanity, missing-hook, push-rejection) so the recovery
+# command and its guidance never drift across copies (issue #196).
+land_reset_keep_or_die() {
+  git reset --keep "$PRE_SHA" \
+    || wt_die "rollback failed — hub is still on the merge commit; reset by hand: git reset --keep $PRE_SHA"
+}
+
 # --- skip the redundant gate on a clean fast-forward land (issue #96) -------------
 # A clean fast-forward leaves HEAD identical to the branch tip the spoke already
 # gated on its push (GATED_TREE: marker == tip == upstream), so re-running the
@@ -319,8 +328,7 @@ fi
 # fast-forward --skip-tests lands and manual (no --skip-tests) lands are untouched.
 merge_sanity_rollback() {
   wt_warn "merge-sanity check FAILED on the diverged merge (issue #174) — rolling back: git reset --keep $PRE_SHA"
-  git reset --keep "$PRE_SHA" \
-    || wt_die "rollback failed — hub is still on the merge commit; reset by hand: git reset --keep $PRE_SHA"
+  land_reset_keep_or_die
   wt_die "landing aborted: the diverged --skip-tests merge failed its merge-sanity check; nothing was pushed. Fix on the branch, push from the spoke, and re-run."
 }
 
@@ -450,14 +458,18 @@ elif [ -n "$TEST_CMD" ]; then
 else
   SUITE_RESULT="via pre-push hook (tiered)"
 fi
-# The pre-push hook IS the test gate (issue #19). If it is not installed here,
-# the push runs NOTHING — warn so a green land is never mistaken for a tested
-# one, and report it honestly rather than claiming the gate ran.
+# The pre-push hook IS the test gate (issue #19). If a gate is REQUIRED here (not a
+# --skip-tests / auto-skip land) and no executable hook is installed, the push would
+# run NOTHING — a missing enforcement precondition silently shipping untested code to
+# $DEFAULT (the #187 fail-open shape, issue #196). ABORT: roll the merge back and die
+# with the install command, so landing ungated is only ever a visible flag, never an
+# environmental accident.
 if [ -z "$SKIP_TESTS" ] && [ -z "$AUTO_SKIP" ]; then
   PREPUSH_HOOK="$(git rev-parse --git-path hooks/pre-push 2>/dev/null || true)"
   if [ -z "$PREPUSH_HOOK" ] || [ ! -x "$PREPUSH_HOOK" ]; then
-    wt_warn "no executable pre-push hook here — the test gate will NOT run on this push; install it with scripts/install-git-hooks.sh"
-    SUITE_RESULT="NOT RUN — no pre-push hook installed"
+    wt_warn "no executable pre-push hook here — the test gate cannot run; rolling back: git reset --keep $PRE_SHA"
+    land_reset_keep_or_die
+    wt_die "landing aborted: the pre-push test gate is REQUIRED but no executable hook is installed here, so the push would ship untested code to $DEFAULT. Install it with scripts/install-git-hooks.sh, or land ungated on purpose with --skip-tests. Nothing was pushed."
   fi
 fi
 echo "→ pushing $DEFAULT to origin (the pre-push hook runs the test gate)"
@@ -478,8 +490,7 @@ land_push() {
 land_rollback() {
   rm -f "$PUSH_LOG"
   wt_warn "$1 — rolling back: git reset --keep $PRE_SHA"
-  git reset --keep "$PRE_SHA" \
-    || wt_die "rollback failed — hub is still on the merged commit; reset by hand: git reset --keep $PRE_SHA"
+  land_reset_keep_or_die
   wt_die "landing aborted; nothing was pushed. Fix on the branch (push from the spoke when it has one) and re-run."
 }
 

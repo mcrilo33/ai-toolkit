@@ -60,6 +60,11 @@ def hub(tmp_path: Path) -> Path:
     _git(hub, "commit", "-qm", "chore: seed", "-m", "Refs #0")
     _git(hub, "remote", "add", "origin", str(remote))
     _git(hub, "push", "-q", "-u", "origin", "main")
+    # A real hub has the pre-push test gate installed (issue #19); a required-gate
+    # land with no executable hook now ABORTS (issue #196), so model the installed
+    # state by default. Tests that exercise the missing-hook or gate-failure paths
+    # overwrite this stub (or chmod it -x) via _install_prepush_stub.
+    _install_prepush_stub(hub, exit_code=0)
     return hub
 
 
@@ -569,8 +574,9 @@ def test_local_micro_spoke_exempt_from_marker(hub: Path, tmp_path: Path) -> None
 def test_default_land_runs_no_land_side_pytest(hub: Path, tmp_path: Path) -> None:
     # Landing no longer runs the suite itself; the pre-push hook tests once on the
     # main push. A diverged merge takes the gate path (a clean-FF land instead
-    # auto-skips it — see test_clean_ff_land_skips_redundant_gate), and with no
-    # hook installed here the land honestly warns that the gate did not run.
+    # auto-skips it — see test_clean_ff_land_skips_redundant_gate). With the hook
+    # installed (the fixture default), the land delegates the gate to it and never
+    # invokes pytest land-side.
     _make_spoke(hub, tmp_path, "feature/1-nopytest", push=True)
     (hub / "hub-only.txt").write_text("hub moved on\n")
     _git(hub, "add", "hub-only.txt")
@@ -581,7 +587,6 @@ def test_default_land_runs_no_land_side_pytest(hub: Path, tmp_path: Path) -> Non
     assert proc.returncode == 0, proc.stderr
     assert _log_text(logs["pytest"]) == ""  # land never invoked pytest itself
     assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
-    assert "test gate will NOT run" in proc.stderr  # honest about the absent hook
 
 
 # --- skip the redundant gate on a clean fast-forward land (issue #96) ------------
@@ -621,6 +626,50 @@ def test_diverged_merge_still_runs_gate(hub: Path, tmp_path: Path) -> None:
 
     assert proc.returncode == 0, proc.stderr
     assert "TEST_SELECT_SKIP" not in _log_text(env_log)
+
+
+# --- a required gate with no executable pre-push hook aborts the land (issue #196) -
+# The pre-push hook is the single test gate (issue #19). If a gate is REQUIRED (not a
+# --skip-tests / auto-skip land) and no executable hook is installed, the push runs
+# NOTHING — the #187 fail-open shape. Landing must ABORT with the install command,
+# never warn-and-push untested code to main.
+
+
+def test_missing_prepush_hook_aborts_required_gate_land(hub: Path, tmp_path: Path) -> None:
+    # Diverged merge → gate required. The hook exists but is not executable (a fresh
+    # checkout, a botched install, or a chmod -x): the land must roll the merge back
+    # and abort before pushing main, telling the operator how to install the hook.
+    pre_main = _remote_sha(hub, "main")
+    wt = _make_spoke(hub, tmp_path, "feature/1-nohook", push=True)
+    (hub / "hub-only.txt").write_text("hub moved on\n")
+    _git(hub, "add", "hub-only.txt")
+    _git(hub, "commit", "-qm", "chore: hub work", "-m", "Refs #0")
+    pre_sha = _git(hub, "rev-parse", "HEAD").strip()  # hub tip the merge builds on
+    (hub / ".git" / "hooks" / "pre-push").chmod(0o644)  # fixture hook made non-executable
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode != 0
+    assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha  # merge rolled back
+    assert _remote_sha(hub, "main") == pre_main  # nothing was pushed
+    assert "install-git-hooks.sh" in proc.stderr  # the fix is in the error
+    assert wt.exists()  # teardown never ran
+
+
+def test_missing_prepush_hook_skip_tests_still_lands(hub: Path, tmp_path: Path) -> None:
+    # The escape hatch stays a VISIBLE flag: --skip-tests lands ungated even with no
+    # executable hook, because the operator explicitly asked for no gate.
+    wt = _make_spoke(hub, tmp_path, "feature/1-skipnohook", push=True)
+    (hub / "hub-only.txt").write_text("hub moved on\n")
+    _git(hub, "add", "hub-only.txt")
+    _git(hub, "commit", "-qm", "chore: hub work", "-m", "Refs #0")
+    (hub / ".git" / "hooks" / "pre-push").chmod(0o644)  # fixture hook made non-executable
+
+    proc, _ = _run_land(hub, tmp_path, "1", "--skip-tests")
+
+    assert proc.returncode == 0, proc.stderr
+    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()  # landed
+    assert not wt.exists()  # teardown ran
 
 
 # --- merge-sanity on a diverged --skip-tests land (issue #174) --------------------
