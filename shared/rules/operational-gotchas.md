@@ -11,18 +11,22 @@ The RED commit of a `/cycle` subtask (tests only, implementation withheld) passe
 three separate checks that each read a different surface. Get all three right or
 the commit blocks:
 
-- **`Tested-RED:` is a machine-read trailer, not prose.** `red-proof-verify` runs
-  every whitespace-separated token after the colon as a pytest node ID
-  (`tests/unit/test_x.py::test_name`) and requires each to FAIL. Prose like
-  `Tested-RED: layout resolution fails` makes it try to run `layout` as a node
-  and blocks with "no pytest runner". Put only space-separated full node IDs on
-  that line; explain the failure in the body above it.
+- **`Tested-RED:` is a machine-read trailer, not prose.** `red-proof-verify`
+  extracts the pytest node ID (`tests/unit/test_x.py::test_name`) that follows the
+  keyword and requires it to FAIL. The extractor takes the **first token after
+  each `Tested-RED:` occurrence** — not every token on the line. So
+  `Tested-RED: tests/x.py::test_a tests/x.py::test_b` proves only `test_a`;
+  `test_b` rides along unverified. To prove several RED nodes, **repeat the
+  keyword** — `Tested-RED: tests/x.py::test_a Tested-RED: tests/x.py::test_b` — so
+  each node is a first-token. Prose like `Tested-RED: layout resolution fails`
+  makes it run `layout` as a node and block with "no pytest runner". Put only
+  full node IDs after each keyword; explain the failure in the body above.
 - **Commit inline with `-m`, never `-F <file>`.** `commit-gauntlet` skips its
   whole-file typecheck only when it sees `Tested-RED:` in the git-commit *command
   string* the PreToolUse hook inspects. `-F` hides the trailer in a file, so the
   typecheck runs and a RED test referencing a not-yet-existing API fails pyright.
-  Keep the trailer **space-preceded inside a line** (e.g. `... Refs #NNN.
-  Tested-RED: <nodes>`) so it matches both the raw-command and the jq-escaped
+  Keep each `Tested-RED:` **space-preceded inside a line** (e.g. `... Refs #NNN.
+  Tested-RED: <node>`) so it matches both the raw-command and the jq-escaped
   commit-msg forms.
 - **Stash the implementation before committing RED.** `red-proof-verify` runs the
   listed nodes against the *working tree*. If the implementation is already
@@ -37,11 +41,11 @@ the commit blocks:
 `commit-gauntlet` runs ruff on the **changed** python lines of your diff. Two
 things that pass local pytest but block the commit:
 
-- **RUF003 ambiguous unicode in comments.** The multiplication sign `×` and
-  `≪`/`≫` trip it; the em-dash `—` and `⇒` used throughout this repo do not.
-  Write ASCII in new or edited python comments — `x` for "times", `<<` for "much
-  less than". Pre-existing unicode elsewhere in the file is ignored; only your
-  diff's lines matter.
+- **RUF003 ambiguous unicode in comments.** The multiplication sign `×` trips it
+  (other exotic math glyphs may too); the em-dash `—` and `⇒` used throughout this
+  repo do not. Write ASCII in new or edited python comments — `x` for "times",
+  `<<` for "much less than". Pre-existing unicode elsewhere in the file is ignored;
+  only your diff's lines matter.
 - **A `×` adjacent to a shell `$var` is also a bash bug.** Under a non-UTF-8
   locale the `0xC3` byte is absorbed into the variable name (`$fails×` →
   `unbound variable`).
@@ -71,7 +75,7 @@ files, and never concurrently with commits.
 - **The first push per worktree legitimately runs the full suite once** to seed
   `.testmondata`; subsequent pushes select only affected tests. Ensure
   `pytest-testmon` is installed (`pip install -r requirements-dev.txt`) or every
-  push degrades to the full ~1k-test suite.
+  push degrades to the full multi-thousand-test suite.
 
 ## Merge `origin/main` before pushing when behind
 
