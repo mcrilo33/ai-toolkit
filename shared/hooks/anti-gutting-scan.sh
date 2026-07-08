@@ -2,21 +2,30 @@
 # anti-gutting-scan.sh — mechanical tripwire against an implementation that GUTS
 # the tests to go green.
 #
-# A deterministic scan of the pushed diff for test-gutting signatures. It is ADVISORY
-# in EVERY context — it prints findings to stderr and always exits 0 — so a human's
-# ordinary test edit is never gated, while still surfacing the smell before landing.
+# A deterministic scan of the pushed diff for test-gutting signatures, with
+# enforcement split by CHANNEL (#193):
 #
-# Enforcement lives elsewhere: under unattended /afk the REASONING code-review verdict
-# is the gate (hub-afk.sh auto_land escalates a spoke to blocked/<issue> on a non-clean
-# verdict — #143), replacing the brittle line-count fail-closed this scan used to arm.
-# A clean RED->GREEN diff only ADDS real assertions, so the signatures below still stand
-# out as a useful hint, but they never block.
+#   * ATTENDED it is advisory everywhere — findings print to stderr, exit 0 — so a
+#     human's ordinary test edit is never gated.
+#   * UNATTENDED (/afk armed — the UNATTENDED env, the supervisor's
+#     `ai-toolkit-afk/unattended` marker (#74), or a non-empty `.afk-state`, all
+#     under the git common dir every spoke worktree shares) it fails CLOSED on the
+#     SHIP paths: a finding on a branch ref or `refs/tags/ready/*` blocks the push,
+#     because no human is watching for a test-gutting diff.
+#   * The ESCALATION markers `refs/tags/blocked/*` and `refs/tags/gate/*` are EXEMPT
+#     from blocking in every context (findings still print for the log). This
+#     ordering is the invariant the whole hub-and-spoke liveness model rests on: the
+#     exact spoke whose diff needs a human decision ("my diff reduces assertions —
+#     is that legit?") must always be able to announce it, or the tripwire deadlocks
+#     the escalation channel and the drain sees a silent, stuck spoke instead of a
+#     blocked/ ping — the same principle as spoke-ready's blocked/+gate/ exemption
+#     from the upstream guard (#103). The exemption is PER-REF: a mixed push
+#     carrying a gated ref alongside a marker still blocks (git pre-push is
+#     all-or-nothing), so escalation markers are pushed alone.
 #
 # It reads git's pre-push stdin (`<lref> <lsha> <rref> <rsha>` lines) exactly like
-# test-select.sh, resolving the range `rsha..lsha` (a new branch with an all-zero
-# remote sha falls back to the merge-base with the default branch). Tag-only / marker
-# pushes (`refs/tags/*`) carry no reviewable code and are skipped entirely, so a spoke
-# escalating its state can always push its blocked/<issue> marker (#143).
+# test-select.sh, resolving the range `rsha..lsha` (a new ref with an all-zero
+# remote sha falls back to the merge-base with the default branch).
 #
 # Signatures (a clean RED->GREEN diff only ADDS real assertions, so these stand out):
 #   * any *.py: an added `sys.exit(0)` / `sys.exit()` / `os._exit(...)` — a hard
@@ -59,21 +68,27 @@ default_branch() {
 
 DEFAULT="$(default_branch)"
 
-# Resolve the range(s) to scan from the pushed refs.
+# Resolve the range(s) to scan from the pushed refs. Each entry is "<mode> <range>":
+# `exempt` for the escalation markers (blocked/<N>, gate/<N> — never block, #193),
+# `gated` for every ship path (branches, ready/<N>, any other ref — fail closed
+# under unattended).
 RANGES=()
 while read -r _lref lsha _rref rsha; do
   [ -n "${lsha:-}" ] || continue
-  case "$_lref" in refs/tags/*) continue ;; esac   # tag/marker push — no reviewable code
+  case "$_lref" in
+    refs/tags/blocked/*|refs/tags/gate/*) mode=exempt ;;
+    *) mode=gated ;;
+  esac
   is_zero_sha "$lsha" && continue   # deleting a ref — nothing added
   if is_zero_sha "${rsha:-0}"; then
     base="$(git merge-base "$DEFAULT" "$lsha" 2>/dev/null || true)"
     [ -n "$base" ] || continue      # unresolved base — can't scan this ref
-    RANGES+=("$base..$lsha")
+    RANGES+=("$mode $base..$lsha")
   else
     # A non-zero but unresolvable rsha (e.g. GC'd after a force-push) yields an
     # empty `git diff` and so a missed scan rather than a false block — acceptable
     # because this is defense-in-depth; test-select.sh remains the blocking gate.
-    RANGES+=("$rsha..$lsha")
+    RANGES+=("$mode $rsha..$lsha")
   fi
 done <<< "$STDIN"
 
@@ -86,7 +101,11 @@ count_matches() {
 }
 
 FINDINGS=()
-for range in "${RANGES[@]}"; do
+GATED_HIT=0   # set when a finding lands on a gated (ship-path) range
+for entry in "${RANGES[@]}"; do
+  mode="${entry%% *}"
+  range="${entry#* }"
+  before="${#FINDINGS[@]}"
   # Added lines (drop the +++ header) of any python file. Diff markers use bracket
   # classes ([+]/[-]) rather than ^\+ so the pattern is portable across BSD/GNU/ugrep
   # (BSD grep rejects a leading \+ as a repetition operator).
@@ -117,6 +136,10 @@ for range in "${RANGES[@]}"; do
   if [ "${removed_asserts:-0}" -gt "${added_asserts:-0}" ]; then
     FINDINGS+=("net decrease in assertions ($removed_asserts removed, $added_asserts added) ($range)")
   fi
+
+  if [ "$mode" = gated ] && [ "${#FINDINGS[@]}" -gt "$before" ]; then
+    GATED_HIT=1
+  fi
 done
 
 [ "${#FINDINGS[@]}" -gt 0 ] || exit 0
@@ -126,7 +149,27 @@ done
   for f in "${FINDINGS[@]}"; do echo "  • $f"; done
 } >&2
 
-# Advisory in every context (#143): the reasoning code-review verdict is the /afk gate,
-# so this scan warns but never blocks — a human's ordinary test edit is never gated.
+# is_unattended — an /afk drain is armed and no human is watching (#74/#193): the
+# UNATTENDED env, the supervisor's dedicated marker, or hub-afk.sh's non-empty
+# `.afk-state` window file, both under the git common dir every spoke worktree shares.
+is_unattended() {
+  [ -n "${UNATTENDED:-}" ] && return 0
+  local common
+  common="$(git rev-parse --git-common-dir 2>/dev/null)" || return 1
+  [ -f "$common/ai-toolkit-afk/unattended" ] && return 0
+  [ -s "$common/.afk-state" ]
+}
+
+# Fail CLOSED only on a SHIP-path finding under an unattended drain. Escalation-marker
+# findings (blocked/<N>, gate/<N>) fall through to the advisory exit in every context:
+# the spoke that trips this scan must always be able to ask for a human (#193).
+if [ "$GATED_HIT" -eq 1 ] && is_unattended; then
+  {
+    echo "anti-gutting: UNATTENDED — blocking the push; no human is watching, so a ship ref (branch / ready/<N>) carrying a test-weakening diff must not land (#193)."
+    echo "anti-gutting: the escalation channel stays open — push the blocked/<N> or gate/<N> marker ALONE to ask for a human."
+  } >&2
+  exit 1
+fi
+
 echo "anti-gutting: advisory — push allowed; review the above before landing." >&2
 exit 0
