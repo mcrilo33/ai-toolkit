@@ -1279,6 +1279,78 @@ _permission_seg_safe() {
   esac
 }
 
+# --- read-only Read tool lane (issue #181) ------------------------------------
+# A spoke parks on a `Read` PERMISSION dialog for a legitimate, write-free research read —
+# a hub script/hook (#175 parked on Read(<hub>/.git/hooks/pre-push)) or a sibling worktree.
+# extract_pending_command surfaces such a park as "Read <file_path>"; classify_permission
+# AUTO-APPROVES it when the target is confined to the repo family (the main root + its
+# worktrees) and is not secret-like. A Read mutates nothing, so — unlike the write lane above
+# — .git internals are readable; only the global secret classes (~/.ssh, ~/.aws, *.pem,
+# id_rsa*, credential confs) stay denied. Every OTHER non-Bash tool arrives as a bare name and
+# keeps default-deny.
+
+# _broker_repo_family_roots <wt> -> print each repo-family root (the main worktree PLUS every
+# linked worktree, from `git worktree list`), realpath-canonicalized, one per line. Empty when
+# <wt> is not a git worktree. This is the read scope a spoke legitimately studies.
+_broker_repo_family_roots() {
+  local wt="$1" line p
+  [ -n "$wt" ] || return 0
+  git -C "$wt" worktree list --porcelain 2>/dev/null | while IFS= read -r line; do
+    case "$line" in
+      'worktree '*) p="${line#worktree }"; wt_realpath "$p" ;;
+    esac
+  done
+}
+
+# _broker_read_in_family <path> <wt> -> rc 0 when <path> resolves under some repo-family root,
+# rc 1 otherwise. Resolves <path> against the worktree cwd when relative and follows symlinks
+# (a logically in-tree path can physically resolve out), mirroring _broker_path_physically_in.
+# Fails CLOSED (rc 1) without python3 or a resolvable family — an unverifiable read escalates.
+_broker_read_in_family() {
+  local path="$1" wt="${2:-}" roots
+  roots="$(_broker_repo_family_roots "$wt")"
+  [ -n "$roots" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  _AFK_PATH="$path" _AFK_WT="$wt" _AFK_ROOTS="$roots" python3 2>/dev/null <<'PYEOF'
+import os, sys
+
+path = os.environ["_AFK_PATH"]
+wt = os.environ.get("_AFK_WT", "")
+if not os.path.isabs(path) and wt:
+    path = os.path.join(wt, path)
+abs_ = os.path.realpath(path)
+
+def under(p, root):
+    return p == root or p.startswith(root.rstrip("/") + "/")
+
+for root in os.environ["_AFK_ROOTS"].splitlines():
+    if root and under(abs_, os.path.realpath(root)):
+        sys.exit(0)
+sys.exit(1)
+PYEOF
+}
+
+# _classify_read_tool <path> [wt] -> print "APPROVE" or "ESCALATE<TAB><reason>" for a Read of
+# <path>. APPROVE only when <path> is confined to the repo family AND is not secret-like; a
+# secret target is rejected FIRST (it overrides family membership), an out-of-family or
+# unverifiable target escalates. rc is always 0 (the verdict is on stdout, like classify_permission).
+_classify_read_tool() {
+  local path="$1" wt="${2:-}"
+  if [ -z "$path" ]; then
+    printf 'ESCALATE\t%s\n' "Read with no target"
+    return 0
+  fi
+  if _broker_seg_secretlike "$path"; then
+    printf 'ESCALATE\t%s\n' "secret-like read target: $path"
+    return 0
+  fi
+  if _broker_read_in_family "$path" "$wt"; then
+    printf 'APPROVE\n'
+    return 0
+  fi
+  printf 'ESCALATE\t%s\n' "read outside the repo family: $path"
+}
+
 # classify_permission <command> [worktree] -> "APPROVE" or "ESCALATE<TAB><reason>".
 # DEFAULT-DENY: the command is APPROVEd only when EVERY segment (split on ; && || |) is a
 # safe scoped self-op, so a single risky segment in a chain escalates the whole. When the
@@ -1294,6 +1366,12 @@ classify_permission() {
     tasks="${AFK_TASKS_ROOT:-/private/tmp}"
     cwd="$wt"                                       # the compound starts in the worktree
   fi
+  # A non-Bash READ tool invocation arrives as "Read <file_path>" (extract_pending_command
+  # carries the target). It is decided ENTIRELY by the read lane (#181), BEFORE operator-
+  # splitting so a path with shell-ish characters is never chopped into bogus segments.
+  case "$cmd" in
+    'Read '*) _classify_read_tool "${cmd#Read }" "$wt"; return 0 ;;
+  esac
   # Normalise the shell operators to newlines, longest first so `||` is not split by `|`
   # and `&&` is not split by a single `&`. The single `&` (background) MUST also split, or
   # `echo x & rm -rf /` would match the safe `echo ` prefix and never inspect the tail.
@@ -1372,6 +1450,11 @@ try:
                     c = ((block.get("input") or {}).get("command") or "").strip()
                     if c:
                         cmd = c
+                elif name == "Read":
+                    # Carry the Read TARGET alongside the name (#181) so the classifier can
+                    # vet the path — a repo-family read is auto-approvable, a bare name is not.
+                    fp = ((block.get("input") or {}).get("file_path") or "").strip()
+                    cmd = f"{name} {fp}" if fp else name
                 elif name:
                     cmd = name
 except Exception:
