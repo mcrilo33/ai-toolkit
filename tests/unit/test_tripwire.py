@@ -19,6 +19,11 @@ rewound. And restore never orphans commits: a ref is never rewound to a strict
 ancestor of its current tip (warn + abort instead), and an appeared ref checked
 out in a registered worktree is never deleted.
 
+Issue #188 narrows the gate further: the pre-push stdin names exactly the refs
+the push updates, and the gate's tripwire snapshot covers ONLY those (plus HEAD
+and the config markers) — any other ref moving mid-gate is concurrent-spoke
+behavior, not a breach.
+
 Two layers are covered:
 
 * the ``tripwire_*`` library in ``lib/utils.sh`` (capture / check / restore),
@@ -484,23 +489,63 @@ def test_live_spoke_commit_mid_gate_passes_and_survives(
     )  # the spoke's commit survives
 
 
-def test_sibling_rewind_mid_gate_still_aborts_and_recovers(
+# --- gate scoped to the pushed refs (issue #188) ----------------------------------
+# The pre-push stdin names exactly the refs this push updates; the gate's tripwire
+# guards ONLY those (plus HEAD and the config markers). Any other ref moving during
+# the 6-8 min gate window — a sibling spoke's commit, rewind, marker tag, or a
+# push completing into the shared store — is normal concurrent-spoke behavior:
+# the push proceeds, nothing is reported, and the restore never touches it
+# (whole-namespace policing is what orphaned #135's spokes and false-aborted
+# sibling pushes).
+
+
+def test_sibling_rewind_mid_gate_out_of_scope_passes(
     repo: Path, spoke: Path, tmp_path: Path
 ) -> None:
-    # Counter-case: a sibling ref moving BACKWARD mid-gate is genuine
-    # corruption — abort, and restore brings the lost commit back (forward
-    # moves are not the strict-ancestor rewind restore refuses).
+    # The push updates only refs/heads/main, so a sibling ref moving BACKWARD
+    # mid-gate is no longer the gate's business — the push proceeds and the
+    # gate neither reports a breach nor "restores" the sibling ref.
     _git(spoke, "commit", "--allow-empty", "-qm", "spoke-work")
-    spoke_tip = _rev(repo, "refs/heads/feature/spoke")
     base = _rev(repo)
     tip = _commit(repo, {"ci/build.yml": "on: push\n"})
+    rewind_target = _rev(repo, "refs/heads/feature/spoke~1")
     _make_pytest_stub(tmp_path / "bin", f'git -C "{spoke}" reset -q --hard HEAD~1')
 
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
-    assert proc.returncode == BREACH_RC, proc.stderr  # still a breach
-    assert "refs/heads/feature/spoke" in proc.stderr  # named
-    assert _rev(repo, "refs/heads/feature/spoke") == spoke_tip  # recovered
+    assert proc.returncode == 0, proc.stderr  # push proceeds
+    assert "REPO-INTEGRITY BREACH" not in proc.stderr
+    assert _rev(repo, "refs/heads/feature/spoke") == rewind_target  # left alone
+
+
+def test_concurrent_marker_tag_mid_gate_passes_and_survives(repo: Path, tmp_path: Path) -> None:
+    # A sibling's ready/<N> marker landing in the shared store mid-gate is an
+    # out-of-scope appeared ref: no breach, and the restore must not delete it
+    # (the pre-#188 whole-namespace restore rolled such tags back).
+    base = _rev(repo)
+    tip = _commit(repo, {"ci/build.yml": "on: push\n"})
+    _make_pytest_stub(tmp_path / "bin", "git tag ready/99 HEAD")
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "REPO-INTEGRITY BREACH" not in proc.stderr
+    assert _git(repo, "tag", "--list").strip() == "ready/99"  # survives
+
+
+def test_concurrent_remote_tracking_update_mid_gate_passes(repo: Path, tmp_path: Path) -> None:
+    # A sibling's `git push` completing mid-gate updates a remote-tracking ref
+    # in the shared store — the false REPO-INTEGRITY BREACH that aborted
+    # legitimate pushes. Out of scope now: the push proceeds.
+    base = _rev(repo)
+    tip = _commit(repo, {"ci/build.yml": "on: push\n"})
+    _make_pytest_stub(tmp_path / "bin", "git update-ref refs/remotes/origin/feature/other HEAD")
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "REPO-INTEGRITY BREACH" not in proc.stderr
+    assert _rev(repo, "refs/remotes/origin/feature/other")  # survives
 
 
 # --- the backstop: run_pytest_node under the tripwire (issue #31) -----------------
