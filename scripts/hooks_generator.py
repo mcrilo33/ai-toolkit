@@ -95,10 +95,15 @@ CLAUDE_EVENT_MAP: dict[str, str] = {
     "preCompact": "PreCompact",
     "subagentStart": "SubagentStart",
     "subagentStop": "SubagentStop",
+    # Notification (issue #176): fires when Claude Code surfaces a permission /
+    # question prompt. No Copilot/Cursor equivalent, so it maps for Claude ONLY and
+    # the other generators skip it (see the skip-unmapped note in generate_copilot).
+    "notification": "Notification",
 }
 
 
 # ── Metadata parser (reuses the lightweight YAML parser pattern) ────
+
 
 def parse_hooks_metadata(path: str) -> dict[str, dict]:
     """Parse hooks/metadata.yml into {hook_name: {defaults, overrides}}."""
@@ -181,6 +186,7 @@ def _ordered_hooks(hooks: dict[str, dict]) -> list[tuple[str, dict]]:
 
 # ── Generator functions ─────────────────────────────────────────────
 
+
 def _script_ref(hook_name: str, tool: str, script_prefix: str | None = None) -> str:
     """Return the command string pointing to the hook script.
 
@@ -235,6 +241,12 @@ def generate_copilot(hooks: dict[str, dict], script_prefix: str | None = None) -
     for name, data in _ordered_hooks(hooks):
         merged = _merged(data, "copilot")
         event = merged.get("event", "")
+        # Skip a CANONICAL event with no Copilot mapping — a Claude-only lifecycle like
+        # `notification` (#176) — rather than passthrough-emitting a bucket Copilot never
+        # fires. A non-canonical value is a native per-platform override (e.g. `agentStop`
+        # from a `copilot: event:` block) and still passes through below.
+        if event not in COPILOT_EVENT_MAP and event in CLAUDE_EVENT_MAP:
+            continue
         event = COPILOT_EVENT_MAP.get(event, event)
         if not event:
             continue
@@ -261,6 +273,10 @@ def generate_cursor(hooks: dict[str, dict], script_prefix: str | None = None) ->
     for name, data in _ordered_hooks(hooks):
         merged = _merged(data, "cursor")
         event = merged.get("event", "")
+        # Skip a CANONICAL event with no Cursor mapping (the Claude-only `notification`
+        # event, #176) — same reason as generate_copilot; native overrides pass through.
+        if event not in CURSOR_EVENT_MAP and event in CLAUDE_EVENT_MAP:
+            continue
         event = CURSOR_EVENT_MAP.get(event, event)
         if not event:
             continue

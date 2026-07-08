@@ -39,10 +39,20 @@ def _hook_event_counts(tool_event_map: dict[str, str], *, tool: str | None = Non
         canonical = data.get("event", "")
         if tool and isinstance(data.get(tool), dict) and data[tool].get("event"):
             canonical = data[tool]["event"]
+        # Mirror hooks_generator's skip-unmapped rule (#176): a Claude-only canonical
+        # event (e.g. `notification`) is skipped for the other platforms rather than
+        # passthrough-emitting a bucket they never fire.
+        if tool in ("cursor", "copilot") and canonical in _CLAUDE_ONLY_EVENTS:
+            continue
         platform_event = tool_event_map.get(canonical, canonical)
         if platform_event:
             counts[platform_event] += 1
     return counts
+
+
+# Canonical events Claude fires but Copilot/Cursor do not — the generator skips them for
+# those platforms rather than emitting a bogus bucket (mirror hooks_generator.py, #176).
+_CLAUDE_ONLY_EVENTS = {"notification"}
 
 
 # Canonical → platform event maps (mirror hooks_generator.py)
@@ -58,6 +68,7 @@ _CLAUDE_EVENT_MAP = {
     "preToolUse": "PreToolUse",
     "postToolUse": "PostToolUse",
     "sessionStart": "SessionStart",
+    "notification": "Notification",
 }
 
 # ── Expected rules derived from metadata ─────────────────

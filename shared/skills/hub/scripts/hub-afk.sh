@@ -25,7 +25,11 @@
 # source of truth for what happened.
 #
 # Knobs (env, with defaults):
-#   AFK_TICK_SECONDS=120         supervisor poll interval
+#   AFK_TICK_SECONDS=300         supervisor poll interval — the BACKSTOP tick (#176). Parked
+#                                spokes announce (spoke-ready.sh / the Notification hook) and
+#                                SIGUSR1 the supervisor, so an answer no longer waits a full
+#                                tick; the tick stays authoritative for everything silence-
+#                                shaped (reap, resume, reconcile, dispatch, drain-done).
 #   AFK_WATCHDOG_SECONDS=60      watchdog poll interval (respawn a crashed supervisor)
 #   AFK_SPOKE_MAX_MINUTES=180    wall-clock ceiling per spoke before a reap
 #   AFK_IDLE_MINUTES=30          a spoke idle this long with no marker AND not waiting → reap
@@ -45,7 +49,9 @@
 #   AFK_PLANNER_TIMEOUT=120      seconds bounding each batch-plan.sh call (#170)
 #   AFK_GH_TIMEOUT=30            seconds bounding each gh call (scope resolve, arm auth) (#170)
 #   AFK_TIMEOUT_KILL_AFTER=10    SIGKILL grace after SIGTERM when a bounded call expires (#170)
-#   AFK_STALE_TICKS=10           heartbeat age (x AFK_TICK_SECONDS) that flags a wedged supervisor
+#   AFK_STALE_TICKS=4            heartbeat age (x AFK_TICK_SECONDS) that flags a wedged supervisor
+#                                — scaled to the 300s tick so the wedge threshold stays ~20min
+#                                (4x300s), not the ~50min a 120s-era default of 10 would stretch to
 #   AFK_DISPATCH_MAX_FAILURES=3  consecutive worktree-new.sh failures before an issue is blocked
 #   AFK_ARM_PRECHECK=1           arm-precondition gate (=0 skips live/dirty/branch/gh-auth checks)
 #   AFK_AUTH_PROBE_CMD           reap-time auth probe (default: a bounded headless claude no-op)
@@ -71,7 +77,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-: "${AFK_TICK_SECONDS:=120}"
+: "${AFK_TICK_SECONDS:=300}"
 : "${AFK_SPOKE_MAX_MINUTES:=180}"
 : "${AFK_IDLE_MINUTES:=30}"
 : "${AFK_ANSWERER_EFFORT:=high}"
@@ -1046,6 +1052,44 @@ supervise_tick() {
   reap_pass
 }
 
+# --- event-driven wake (issue #176) -------------------------------------------
+# A writer (spoke-ready.sh / the Notification hook) drops an event file in the spool and
+# SIGUSR1s this pid; the trap flips _AFK_WOKEN and the interruptible sleep returns early,
+# so a parked spoke is serviced in seconds, not a full tick. Events are WAKE-UPS, not
+# state: on wake we re-derive via slot_state, so a duplicate/stale/lost event is safe (a
+# lost one is caught by the next full sweep).
+_AFK_WOKEN=0
+_afk_on_usr1() { _AFK_WOKEN=1; }
+trap _afk_on_usr1 USR1
+
+# afk_interruptible_sleep <secs> -> a sleep that a USR1 cuts short. A trapped signal
+# interrupts the `wait` builtin (not a bare `sleep`), so background the timer and wait on
+# it; the trap runs and wait returns, then kill the timer if it is still running. The tiny
+# race — a USR1 delivered after `sleep &` but before `wait` — degrades to servicing on the
+# next full tick, exactly the design's guaranteed-safe "lost event" path.
+afk_interruptible_sleep() {
+  local secs="$1" t
+  sleep "$secs" & t=$!
+  wait "$t" 2>/dev/null || true
+  kill "$t" 2>/dev/null || true
+}
+
+# service_event_wake -> the targeted pass an event signal triggers: drain the spool (log
+# the announcers) then answer + land. It runs only the announce-driven passes — a wake
+# means a spoke ANNOUNCED, never that one went silent — so the silence-shaped work
+# (dispatch, reap, reconcile, drain-done) stays on the full tick. answer_pass / auto_land
+# already self-limit to waiting / ready spokes, so re-deriving over the whole in-flight set
+# is a safe superset of "service only the named spokes" (slot_state is authoritative).
+service_event_wake() {
+  local issues; issues="$(afk_drain_event_issues)"
+  [ -n "$issues" ] && log "/afk: event wake — servicing $(printf '%s' "$issues" | tr '\n' ' ')"
+  answer_pass
+  # Same auth short-circuit as supervise_tick: a dead token means auto_land would shell
+  # into dead auth; the main loop's post-service check halts + blocks the in-flight set.
+  [ "$_AFK_AUTH_FAILED" -eq 1 ] && return 0
+  auto_land
+}
+
 # afk_done <state> <now> -> true when the supervisor should stop: the window was turned off
 # (no state), a clock-bound window expired, or the backlog is drained (the planner returns
 # an empty batch AND nothing is in flight).
@@ -1081,7 +1125,7 @@ afk_done() {
 # has not stamped a tick in AFK_STALE_TICKS x AFK_TICK_SECONDS is wedged on a hung call, not
 # working — the watchdog kills and respawns it. answer_pass + auto_land keep stamping through
 # their long phases (_afk_run_with_heartbeat[_fg]), so a busy supervisor never reads as wedged.
-: "${AFK_STALE_TICKS:=10}"
+: "${AFK_STALE_TICKS:=4}"
 
 # _afk_heartbeat_wedged -> true when the heartbeat epoch is older than
 # AFK_STALE_TICKS x AFK_TICK_SECONDS. The caller (watchdog_tick) has already confirmed the
@@ -1592,7 +1636,15 @@ main() {
     # heal each other: neither is a single silent point of failure (#107). Skipped for
     # --once (a one-shot cron tick must not leave a background keeper behind).
     [ "$once" -eq 0 ] && _afk_spawn_watchdog
-    supervise_tick
+    # A wake (USR1 during the last sleep) runs the targeted announce-driven pass; a full
+    # tick (the sleep ran out, or --once) runs the whole sweep. Either way slot_state
+    # re-derives, so the two never disagree — a wake is just an early, narrower tick.
+    if [ "$_AFK_WOKEN" -eq 1 ] && [ "$once" -eq 0 ]; then
+      _AFK_WOKEN=0
+      service_event_wake
+    else
+      supervise_tick
+    fi
     if [ "$_AFK_AUTH_FAILED" -eq 1 ]; then
       log "/afk: subscription auth failed — blocking in-flight spokes and stopping (re-run /login on the host)"
       _block_all_inflight "subscription auth failed — token could not refresh; re-run /login on the host"
@@ -1602,7 +1654,9 @@ main() {
     if afk_done "$(afk_read_state)" "$(afk_now)"; then
       log "/afk: done"; _afk_emit_drain_complete; afk_clear_state; break
     fi
-    sleep "$AFK_TICK_SECONDS"
+    # Skip the wait when a signal already arrived (during the pass) so the pending event is
+    # serviced immediately rather than after another full interval.
+    [ "$_AFK_WOKEN" -eq 1 ] || afk_interruptible_sleep "$AFK_TICK_SECONDS"
   done
   return 0
 }

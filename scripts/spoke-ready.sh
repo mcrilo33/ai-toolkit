@@ -272,6 +272,32 @@ git push -f origin "$TAG"
 
 echo "✓ spoke-ready: emitted $TAG at $(git rev-parse --short HEAD)"
 
+# --- event-driven wake (issue #176) -------------------------------------------
+# Now that the marker reached origin, ANNOUNCE it to a live /afk supervisor: drop a
+# content-free <epoch>-<issue>-<kind> file in the event spool and SIGUSR1 the heartbeat
+# pid, so a parked answer/land fires in seconds instead of waiting the backstop tick.
+# Gated on a LIVE supervisor (the heartbeat pid is a running process) so an attended run
+# leaves no spool artifact and signals nothing. Events are WAKE-UPS, not state — the
+# supervisor re-derives via slot_state — so this is best-effort: a missed signal is caught
+# by the next sweep, and the writer never fails the emission. The spool path + filename
+# mirror the reader (afk_event_dir / afk_drain_event_issues in gate-broker.sh) and honor
+# the same AFK_HEARTBEAT / AFK_STATE_DIR overrides; the emit is inlined here (not shared)
+# because a spoke deploys spoke-ready.sh to a different dir than the hub reader.
+_afk_emit_wake_event() {
+  local issue="$1" kind="$2" common hb pid dir
+  common="$(git rev-parse --git-common-dir 2>/dev/null)" || return 0
+  hb="${AFK_HEARTBEAT:-$common/.afk-heartbeat}"
+  [ -f "$hb" ] || return 0
+  pid="$(head -n1 "$hb" 2>/dev/null | awk '{print $1}')"
+  case "$pid" in '' | *[!0-9]*) return 0 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 0   # no live supervisor -> nothing to wake
+  dir="${AFK_STATE_DIR:-$common/ai-toolkit-afk}/events"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  : > "$dir/$(date +%s)-$issue-$kind" 2>/dev/null || return 0
+  kill -USR1 "$pid" 2>/dev/null || true
+}
+_afk_emit_wake_event "$ISSUE" "$KIND"
+
 # Trace node: this run as a kind=script span, tagged with the marker namespace it
 # emitted (phase = ready|gate|accept|blocked) so the trace tells a completion
 # marker apart from a PLAN-gate park. emits stays null on push (parser-filled).

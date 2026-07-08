@@ -666,3 +666,97 @@ def test_accept_is_not_subject_to_the_ready_gate(spoke: Path, remote: Path) -> N
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert _remote_has_ref(remote, "refs/tags/accept/45")
+
+
+# ── event-driven wake: announce the marker to a live /afk supervisor (issue #176) ──
+# After the marker reaches origin, spoke-ready drops a <epoch>-<issue>-<kind> file in the
+# event spool and SIGUSR1s the heartbeat pid, so a parked answer/land fires without waiting
+# the backstop tick. Gated on a LIVE supervisor: attended runs leave no spool artifact.
+
+
+def _live_pid(tmp_path: Path) -> subprocess.Popen:
+    """A real background process to stand in for a running supervisor's heartbeat pid."""
+    return subprocess.Popen(["sleep", "30"])
+
+
+def _wake_env(heartbeat: Path, state_dir: Path) -> dict[str, str]:
+    return {**_GIT_ENV, "AFK_HEARTBEAT": str(heartbeat), "AFK_STATE_DIR": str(state_dir)}
+
+
+def test_gate_emits_spool_file_when_supervisor_live(spoke: Path, tmp_path: Path) -> None:
+    proc = _live_pid(tmp_path)
+    hb = tmp_path / "hb"
+    hb.write_text(f"{proc.pid} 1000000\n")
+    state = tmp_path / "afk-state"
+    try:
+        result = _run(spoke, "--gate", "45", env=_wake_env(hb, state))
+    finally:
+        proc.terminate()
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    events = list((state / "events").glob("*-45-gate"))
+    assert len(events) == 1, f"a live supervisor must get one gate spool file, saw {events}"
+
+
+@pytest.mark.parametrize("flag,kind", [("--gate", "gate"), ("--blocked", "blocked")])
+def test_marker_kinds_spool_their_own_type(
+    spoke: Path, tmp_path: Path, flag: str, kind: str
+) -> None:
+    proc = _live_pid(tmp_path)
+    hb = tmp_path / "hb"
+    hb.write_text(f"{proc.pid} 1000000\n")
+    state = tmp_path / "afk-state"
+    try:
+        result = _run(spoke, flag, "45", env=_wake_env(hb, state))
+    finally:
+        proc.terminate()
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert list((state / "events").glob(f"*-45-{kind}")), f"{flag} must spool a {kind} event"
+
+
+def test_wake_signals_the_heartbeat_pid(spoke: Path, tmp_path: Path) -> None:
+    # The signal itself, not just the spool file: a process trapping USR1 must be woken.
+    flag_file = tmp_path / "signalled"
+    # `sleep & wait` (not a bare `sleep`) so USR1 interrupts the wait and the trap fires at
+    # once — the same reason the real supervisor's afk_interruptible_sleep backgrounds it.
+    proc = subprocess.Popen(
+        ["bash", "-c", f'trap "touch {flag_file}; exit 0" USR1; sleep 30 & wait']
+    )
+    hb = tmp_path / "hb"
+    hb.write_text(f"{proc.pid} 1000000\n")
+    state = tmp_path / "afk-state"
+    try:
+        _run(spoke, "--gate", "45", env=_wake_env(hb, state))
+        proc.wait(timeout=5)  # the trap calls exit on USR1
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+
+    assert flag_file.exists(), "the heartbeat pid must receive SIGUSR1"
+
+
+def test_no_spool_without_a_heartbeat_file(spoke: Path, tmp_path: Path) -> None:
+    # Attended run (no supervisor): no heartbeat -> no spool artifact, emission still succeeds.
+    hb = tmp_path / "hb"  # never created
+    state = tmp_path / "afk-state"
+
+    result = _run(spoke, "--gate", "45", env=_wake_env(hb, state))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (state / "events").exists(), "no live supervisor => no spool dir/file"
+
+
+def test_no_spool_when_heartbeat_pid_is_dead(spoke: Path, tmp_path: Path) -> None:
+    proc = subprocess.Popen(["sleep", "30"])
+    dead_pid = proc.pid
+    proc.terminate()
+    proc.wait()
+    hb = tmp_path / "hb"
+    hb.write_text(f"{dead_pid} 1000000\n")
+    state = tmp_path / "afk-state"
+
+    result = _run(spoke, "--gate", "45", env=_wake_env(hb, state))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (state / "events").exists(), "a dead heartbeat pid => nothing to wake, no spool"

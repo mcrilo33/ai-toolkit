@@ -687,3 +687,83 @@ class TestPlanGateGuardRegistration:
         assert os.access(script, os.X_OK), (
             "plan-gate-guard.sh must be executable for sync to install"
         )
+
+
+# ── afk-notify-wake: the Notification event, Claude-only (issue #176) ──────────
+# The event-driven wake's permission/question announcer is a Notification hook. Claude Code
+# is the only platform that fires Notification, so it maps for Claude and the other two
+# generators must SKIP it (an unmapped canonical event must not leak a bogus bucket).
+
+
+@pytest.fixture()
+def notification_meta(tmp_path: Path) -> Path:
+    content = textwrap.dedent("""\
+        afk-notify-wake:
+          event: notification
+          description: "announce a parked spoke"
+          tier: 2
+    """)
+    p = tmp_path / "metadata.yml"
+    p.write_text(content)
+    return p
+
+
+def test_notification_maps_to_capitalized_event_for_claude(notification_meta: Path) -> None:
+    cfg = generate_claude(parse_hooks_metadata(str(notification_meta)))
+
+    assert "Notification" in cfg, "the canonical `notification` event must map to Notification"
+    handler = _claude_handler(cfg, "Notification", "afk-notify-wake.sh")
+    assert handler is not None, "the hook must be registered under the Notification event"
+
+
+def test_notification_has_no_matcher_group_for_claude(notification_meta: Path) -> None:
+    # Notification carries no tool matcher, so its group is matcher-less (like SessionStart).
+    cfg = generate_claude(parse_hooks_metadata(str(notification_meta)))
+
+    assert "matcher" not in cfg["Notification"][0], "a Notification group takes no matcher"
+
+
+def test_notification_is_skipped_for_copilot(notification_meta: Path) -> None:
+    cfg = generate_copilot(parse_hooks_metadata(str(notification_meta)))
+
+    hooks = cfg["hooks"]
+    assert "notification" not in hooks and "Notification" not in hooks, (
+        "a Claude-only event must not emit a bucket for Copilot"
+    )
+
+
+def test_notification_is_skipped_for_cursor(notification_meta: Path) -> None:
+    cfg = generate_cursor(parse_hooks_metadata(str(notification_meta)))
+
+    hooks = cfg["hooks"]
+    assert "notification" not in hooks and "Notification" not in hooks, (
+        "a Claude-only event must not emit a bucket for Cursor"
+    )
+
+
+class TestAfkNotifyWakeRegistration:
+    """Registration through the sync pipeline is an explicit #176 acceptance criterion."""
+
+    SCRIPT = "afk-notify-wake.sh"
+
+    def test_registered_for_claude_notification(self) -> None:
+        cfg = generate_claude(parse_hooks_metadata(str(REAL_META)))
+        handler = _claude_handler(cfg, "Notification", self.SCRIPT)
+        assert handler is not None, "afk-notify-wake not registered for Claude Notification"
+
+    def test_not_registered_for_copilot_or_cursor(self) -> None:
+        cop = generate_copilot(parse_hooks_metadata(str(REAL_META)))["hooks"]
+        cur = generate_cursor(parse_hooks_metadata(str(REAL_META)))["hooks"]
+        assert not any(self.SCRIPT in json_dump(v) for v in cop.values()), "leaked into Copilot"
+        assert not any(self.SCRIPT in json_dump(v) for v in cur.values()), "leaked into Cursor"
+
+    def test_hook_script_present_and_executable(self) -> None:
+        script = REAL_META.parent / self.SCRIPT
+        assert script.is_file(), "afk-notify-wake.sh missing from shared/hooks/"
+        assert os.access(script, os.X_OK), "afk-notify-wake.sh must be executable for sync"
+
+
+def json_dump(obj: object) -> str:
+    import json
+
+    return json.dumps(obj)
