@@ -1169,68 +1169,111 @@ inject_answer() {
   tmux send-keys -t "$target" Enter 2>/dev/null || return 1
 }
 
+# _answer_needle <text> -> the shared delivery needle: the first ~40 chars of the
+# answer's first line. One derivation feeds every delivery proof (_composer_shows_text,
+# _composer_released, _answer_appended) so the pane and transcript checks can never
+# grep diverging strings.
+_answer_needle() {
+  local needle="${1%%$'\n'*}"
+  printf '%s\n' "${needle:0:40}"
+}
+
 # _composer_shows_text <pane_target> <text> -> true when the pane still displays the
-# answer — its needle: the first ~40 chars of the first line — i.e. the paste is
-# buffered in the composer, not submitted (#133). Fail-OPEN: an unreadable pane
-# (capture error, no tmux) reads as "not shown", so the caller escalates instead of
-# wedge-respawning a pane it cannot observe.
+# answer's needle, i.e. the paste is buffered in the composer, not submitted (#133).
+# Fail-OPEN: an unreadable pane (capture error, no tmux) reads as "not shown", so the
+# caller escalates instead of wedge-respawning a pane it cannot observe.
 _composer_shows_text() {
   local target="$1" text="$2" needle
-  needle="${text%%$'\n'*}"
-  needle="${needle:0:40}"
+  needle="$(_answer_needle "$text")"
   [ -n "$needle" ] || return 1
   tmux capture-pane -p -t "$target" 2>/dev/null | grep -qF -- "$needle"
 }
 
-# _answer_in_transcript <wt_path> <text> -> true when the answer's needle (the same
-# first-line prefix _composer_shows_text greps for) appears in any jsonl of the spoke's
-# project dir. A submitted answer lands as a user record in the session transcript, so
-# post-inject presence is POSITIVE proof the composer let go (#201) — the pane alone
-# cannot give it, because a successful submit also ECHOES the message into the
-# scrollback and would keep reading as "still buffered". The needle is matched in its
-# JSON-encoded form (quotes/backslashes in the answer cannot hide it) against the raw
-# lines — no per-record parse. Callers baseline this pre-inject exactly like
-# _composer_shows_text: a canned answer repeated across gates may already be present.
-# Fail-CLOSED: no python3 / no project dir reads as "not found" (unconfirmed).
-_answer_in_transcript() {
-  local wt="$1" text="$2" needle dir
-  needle="${text%%$'\n'*}"
-  needle="${needle:0:40}"
+# _transcript_sizes <wt_path> -> one "size<TAB>path" line per jsonl in the spoke's
+# project dir (empty when none). The pre-inject snapshot _answer_appended scans past:
+# delivery proof is the answer landing in bytes APPENDED after this point, so a canned
+# answer already sitting in an older record can neither satisfy nor disable the check.
+_transcript_sizes() {
+  local dir f
+  dir="$(_spoke_project_dir "$1")"
+  [ -d "$dir" ] || return 0
+  for f in "$dir"/*.jsonl; do
+    [ -e "$f" ] || continue
+    printf '%s\t%s\n' "$(stat -f %z "$f" 2>/dev/null || stat -c %s "$f" 2>/dev/null)" "$f"
+  done
+}
+
+# _answer_appended <wt_path> <text> <sizes> -> did the answer's needle land in
+# transcript bytes appended after the <sizes> snapshot? A submitted answer is recorded
+# as a user turn in the session jsonl, so a fresh match is positive proof the composer
+# let go (#201) — the pane alone cannot give it, because a successful submit also
+# ECHOES the message into the scrollback and keeps the needle visible. The match is
+# byte-level against the needle's JSON-encoded form (quotes/backslashes cannot hide
+# it; JSON keeps non-ASCII as raw UTF-8, and a needle byte-truncated mid-character by
+# a C-locale slice still matches as a byte prefix). Only appended regions are read —
+# never a full transcript rescan. rc 0 found, rc 1 not found, rc 2 scan unavailable
+# (no python3 / no project dir / interpreter died) — callers must treat 2 as "no
+# evidence either way", never as a wedge.
+_answer_appended() {
+  local wt="$1" text="$2" sizes="$3" needle dir
+  needle="$(_answer_needle "$text")"
   [ -n "$needle" ] || return 1
   dir="$(_spoke_project_dir "$wt")"
-  [ -d "$dir" ] || return 1
-  command -v python3 >/dev/null 2>&1 || return 1
-  _AFK_DIR="$dir" _AFK_NEEDLE="$needle" python3 2>/dev/null <<'PYEOF'
-import glob, json, os, sys
+  [ -d "$dir" ] || return 2
+  command -v python3 >/dev/null 2>&1 || return 2
+  _AFK_DIR="$dir" _AFK_NEEDLE="$needle" _AFK_SIZES="$sizes" python3 2>/dev/null <<'PYEOF'
+import glob, os, sys
 
-# The transcript stores the answer JSON-encoded (raw UTF-8, like JSON.stringify),
-# so the encoded needle appears verbatim in the raw line iff the decoded needle
-# appears contiguously inside some string value.
-needle = json.dumps(os.environ["_AFK_NEEDLE"], ensure_ascii=False)[1:-1]
+raw = os.environb.get(b"_AFK_NEEDLE", b"")
+needle = (
+    raw.replace(b"\\", b"\\\\")
+    .replace(b'"', b'\\"')
+    .replace(b"\t", b"\\t")
+    .replace(b"\r", b"\\r")
+)
+if not needle:
+    sys.exit(1)
+offsets = {}
+for line in os.environb.get(b"_AFK_SIZES", b"").splitlines():
+    size, _, path = line.partition(b"\t")
+    if path:
+        try:
+            offsets[os.fsdecode(path)] = int(size)
+        except ValueError:
+            pass
 for path in glob.glob(os.path.join(os.environ["_AFK_DIR"], "*.jsonl")):
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            if any(needle in line for line in fh):
+        with open(path, "rb") as fh:
+            offset = offsets.get(path, 0)
+            fh.seek(0, 2)
+            if offset > fh.tell():  # rotated/truncated since the snapshot: rescan
+                offset = 0
+            fh.seek(offset)
+            if needle in fh.read():
                 sys.exit(0)
     except OSError:
         continue
 sys.exit(1)
 PYEOF
+  case $? in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
 }
 
-# _answer_delivered <wt> <target> <text> <baseline_shows> <baseline_logged> -> after
-# _transcript_advanced succeeded, decide whether the answer actually LEFT the composer
-# (#201: an advance alone scored two wedged pastes as "injected answer into #182" while
-# the answer sat unsubmitted). Delivered when the pane no longer shows the needle, OR
-# the pane check is unusable (needle pre-existing: baseline_shows=1 — advance alone
-# decides, the pre-#201 contract), OR the answer NEWLY landed in the transcript itself
-# (a genuine submit echoes the message in the scrollback; without this a visible needle
-# would misread every real success as a wedge and respawn a healthy pane).
+# _answer_delivered <wt> <target> <text> <sizes> -> after _transcript_advanced
+# succeeded, decide whether the answer actually LEFT the composer (#201: an advance
+# alone scored two wedged pastes as "injected answer into #182" while the answer sat
+# unsubmitted). NOT delivered only on the full #182 signature — positive evidence the
+# composer still holds the text: the scan worked, the needle did NOT land in appended
+# transcript bytes (so a pane match is not the echo of a genuine submit), and a
+# readable pane still shows it. Everything short of that keeps the pre-#201 contract
+# (advance alone = delivered): an unobservable pane or unavailable scan is NO evidence
+# of a wedge, and a false success parks one spoke where a false NOT-delivered would
+# stray-Enter, escalate, or respawn healthy panes on every echoed submit.
 _answer_delivered() {
-  local wt="$1" target="$2" text="$3" baseline_shows="$4" baseline_logged="$5"
-  [ "$baseline_shows" -eq 1 ] && return 0
+  local wt="$1" target="$2" text="$3" sizes="$4" rc
+  _answer_appended "$wt" "$text" "$sizes"; rc=$?
+  [ "$rc" -eq 0 ] && return 0
   _composer_shows_text "$target" "$text" || return 0
-  [ "$baseline_logged" -eq 0 ] && _answer_in_transcript "$wt" "$text" && return 0
+  [ "$rc" -eq 2 ] && return 0
   return 1
 }
 
@@ -1264,17 +1307,17 @@ _transcript_advanced() {
 #          keystroke can submit or clear) — the caller respawns the pane.
 #   rc 1 — not registered and no text observable in the composer — the caller escalates.
 inject_and_verify() {
-  local wt="$1" target="$2" text="$3" before baseline_shows=0 baseline_logged=0
+  local wt="$1" target="$2" text="$3" before baseline_shows=0 sizes
   before="$(_transcript_mtime "$wt")"
   # Baseline BEFORE pasting: a short answer often also appears in the rendered
   # question above the composer. If the needle was already visible pre-inject,
   # post-retry presence proves nothing — never classify wedged off a pre-existing
   # match (a false wedge would kill a live pane where rc 1 safely escalates).
   _composer_shows_text "$target" "$text" && baseline_shows=1
-  _answer_in_transcript "$wt" "$text" && baseline_logged=1
+  sizes="$(_transcript_sizes "$wt")"
   inject_answer "$target" "$text" || return 1
   if _transcript_advanced "$wt" "$before"; then
-    _answer_delivered "$wt" "$target" "$text" "$baseline_shows" "$baseline_logged" && return 0
+    _answer_delivered "$wt" "$target" "$text" "$sizes" && return 0
     # #201: the advance was a non-turn write while the paste sat unsubmitted.
     # Re-baseline so the retry waits for REAL post-Enter progress, then fall
     # through to the same bare-Enter / wedge path a plain non-advance takes.
@@ -1284,7 +1327,7 @@ inject_and_verify() {
   log "  injected answer did not register — retrying with a bare Enter (never a re-paste)"
   tmux send-keys -t "$target" Enter 2>/dev/null || true
   if _transcript_advanced "$wt" "$before"; then
-    _answer_delivered "$wt" "$target" "$text" "$baseline_shows" "$baseline_logged" && return 0
+    _answer_delivered "$wt" "$target" "$text" "$sizes" && return 0
   fi
   [ "$baseline_shows" -eq 0 ] && _composer_shows_text "$target" "$text" && return 2
   return 1
