@@ -133,10 +133,63 @@ read_progress_epoch()   { _read_issue_epoch progress "$1"; }
 stamp_answer_attempt()  { _stamp_issue_epoch answer-attempt "$1"; }
 read_answer_attempt()   { _read_issue_epoch answer-attempt "$1"; }
 # Fresh window ⇒ no stale progress/attempt state: a leftover answer-attempt epoch
-# would suppress a legitimate idle reap in the next window.
+# would suppress a legitimate idle reap in the next window; a leftover re-answer counter
+# (#203) would strand a spoke at a ceiling reached in a prior window.
 _clear_progress_state() {
   local dir; dir="$(_afk_state_dir)"
-  rm -f "$dir"/progress-*.epoch "$dir"/answer-attempt-*.epoch "$dir"/tip-* 2>/dev/null || true
+  rm -f "$dir"/progress-*.epoch "$dir"/answer-attempt-*.epoch "$dir"/tip-* \
+    "$dir"/reanswer-* 2>/dev/null || true
+}
+
+# --- re-answer ceiling (issue #203, finding 1) --------------------------------
+# #171's blocked-at-tip→waiting fix made a parked spoke re-answerable with NO attempt
+# ceiling: a legitimately-escalated spoke (answerer ESCALATE, timeout, unconfirmable
+# inject) stays on the SAME prompt, and every tick re-ran the full 900s reasoner to reach
+# the same ESCALATE — a doom-loop starving the tick and burning the subscription. The
+# ceiling caps attempts on the SAME (tip, prompt-signature); a changed prompt or a moved
+# tip resets it. Keyed like the decisions-log signature machinery (a content hash here).
+
+# _broker_park_signature <wt> <issue> -> a stable hash of WHATEVER prompt the spoke is
+# parked on (a permission command, a PLAN-gate plan, or an AskUserQuestion), or empty when
+# nothing is extractable. Empty ⇒ the ceiling never engages (fail-open to answering).
+_broker_park_signature() {
+  local wt="$1" issue="$2" basis=""
+  if _permission_pending "$wt"; then
+    basis="perm:$(extract_pending_command "$wt")"
+  elif _gate_parked "$wt" "$issue"; then
+    basis="gate:$(_read_gate_artifact "$wt" "$issue")"
+    [ "$basis" = "gate:" ] && basis="gate:$(extract_pending_question "$wt")"
+  else
+    basis="q:$(extract_pending_question "$wt")"
+  fi
+  case "$basis" in perm: | gate: | q:) return 0 ;; esac    # nothing extractable
+  printf '%s' "$basis" | shasum -a 256 2>/dev/null | awk '{print $1}'
+}
+
+# _reanswer_state_file <issue> -> the per-issue counter file: "<tip>\t<sig>\t<count>".
+_reanswer_state_file() { printf '%s\n' "$(_afk_state_dir)/reanswer-$1"; }
+
+# _broker_reanswer_exhausted <wt> <issue> <sig> -> rc 0 (EXHAUSTED — be terminal, skip the
+# reasoner) when the SAME (tip, sig) has already been attempted AFK_REANSWER_CEILING (default
+# 2) times; otherwise rc 1 AND this attempt is RECORDED (the counter bumped). A changed tip
+# or signature resets the counter. An empty signature never suppresses (fail-open).
+_broker_reanswer_exhausted() {
+  local wt="$1" issue="$2" sig="$3" ceiling tip f prev_tip="" prev_sig="" prev_n=0
+  [ -n "$sig" ] || return 1
+  ceiling="${AFK_REANSWER_CEILING:-2}"
+  case "$ceiling" in '' | *[!0-9]*) ceiling=2 ;; esac
+  [ "$ceiling" -lt 1 ] && ceiling=1   # floor at 1: a 0 ceiling would strand every gate unanswered
+  tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"
+  f="$(_reanswer_state_file "$issue")"
+  if [ -f "$f" ]; then
+    IFS=$'\t' read -r prev_tip prev_sig prev_n < "$f" 2>/dev/null || true
+    case "$prev_n" in '' | *[!0-9]*) prev_n=0 ;; esac
+  fi
+  if [ "$prev_tip" != "$tip" ] || [ "$prev_sig" != "$sig" ]; then prev_n=0; fi   # new context
+  [ "$prev_n" -ge "$ceiling" ] && return 0                                       # exhausted
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  printf '%s\t%s\t%s\n' "$tip" "$sig" "$(( prev_n + 1 ))" > "$f" 2>/dev/null || true
+  return 1
 }
 
 # _afk_note_tip_progress <wt> <issue> -> observe ledger progress as branch-tip
@@ -622,16 +675,17 @@ assert_readonly_tools() {
   return 0
 }
 
-# _broker_worktree_fingerprint <wt> -> a content hash of the LIVE worktree's TRACKED
-# content: each tracked (index) file's path + its CURRENT working-tree content. A tracked
-# edit, a staged addition, or a deletion all change it. UNTRACKED files are excluded on
-# purpose (issue #168): a parked spoke is not a frozen worktree — its own still-finishing
-# push gate writes `.testmondata`, OTel dumps land under `.ai-toolkit/`, etc. Those runtime
-# artifacts are not what the land cares about and must not be blamed on the read-only
-# reasoner. A reasoner CREATING a brand-new untracked file is therefore invisible here by
-# design; that surface is covered by PREVENTION (reasoner_allowed_tools / the read-only
-# allowlist — no Write/Edit/bare-Bash), leaving this DETECTION layer as the hard guarantee
-# for TRACKED content, which is all a land commits. Empty (stable) for a non-git or missing
+# _broker_worktree_fingerprint <wt> -> a content hash of the LIVE worktree's TRACKED content
+# PLUS its untracked-not-ignored files: each path + its CURRENT working-tree content. A
+# tracked edit, a staged addition, a deletion, OR a brand-new untracked-not-ignored file all
+# change it. IGNORED files stay excluded on purpose (issue #168): a parked spoke is not a
+# frozen worktree — its own still-finishing push gate writes `.testmondata`, OTel dumps land
+# under `.ai-toolkit/`, etc. Those runtime artifacts are git-ignored, so they must not be
+# blamed on the read-only reasoner. `--others --exclude-standard` (issue #203) closes the
+# creation gap #168 opened — a reasoner that CREATES a new untracked file used to be invisible
+# here, mutating the tree unprevented AND undetected — while keeping the #168 ignored-artifact
+# class safe (the exclude honors .gitignore, .git/info/exclude, AND the global excludesFile).
+# `sort -zu` makes the combined listing order-stable. Empty (stable) for a non-git or missing
 # path, so a non-worktree reasoner never trips a false breach.
 _broker_worktree_fingerprint() {
   local wt="$1"
@@ -639,7 +693,7 @@ _broker_worktree_fingerprint() {
   (
     cd "$wt" 2>/dev/null || exit 0
     git rev-parse --git-dir >/dev/null 2>&1 || exit 0
-    git ls-files -z --cached 2>/dev/null |
+    git ls-files -z --cached --others --exclude-standard 2>/dev/null | sort -zu |
       while IFS= read -r -d '' f; do
         printf '%s\0' "$f"
         if [ -f "$f" ]; then git hash-object "$f" 2>/dev/null || printf 'ERR'; else printf 'GONE'; fi
@@ -937,8 +991,178 @@ is_auth_failure() {
 # must be conservative. It is the unit-tested heart of the supervisor's permission
 # handling (the tmux detection + injection that drives it lives in decide_and_act).
 
-# _permission_seg_safe <segment> -> true when ONE command segment is a safe scoped
-# self-op the spoke legitimately runs on its OWN worktree: the same vetted class
+# _pytest_seg_scoped <segment> -> rc 0 when a `pytest` / `python -m pytest` segment carries a
+# genuine SCOPING argument (a path or node-id), rc 1 otherwise. A bare `pytest`, one carrying
+# only flags (`pytest -q`, `pytest -x`), OR one whose only non-flag token is a value belonging
+# to a selection option (`pytest -k foo`, `pytest -m slow`, `pytest -p plugin`) still collects
+# the WHOLE suite, whose escaped tests rewrite real refs (#135) — the full-suite ref-rewind
+# hazard (#203). A separate-token value of such an option is therefore SKIPPED, not counted as
+# a path. Tokens are walked by hand (no word-splitting) so a glob argument never expands.
+_pytest_seg_scoped() {
+  local seg="$1" rest tok skip_val=0
+  case "$seg" in
+    'python -m pytest'*)          rest="${seg#python -m pytest}" ;;
+    'python3 -m pytest'*)         rest="${seg#python3 -m pytest}" ;;
+    '.venv/bin/python -m pytest'*) rest="${seg#.venv/bin/python -m pytest}" ;;
+    'pytest'*)                    rest="${seg#pytest}" ;;
+    *) return 1 ;;
+  esac
+  while [ -n "$rest" ]; do
+    rest="${rest#"${rest%%[![:space:]]*}"}"          # ltrim
+    [ -n "$rest" ] || break
+    tok="${rest%%[[:space:]]*}"                       # first token
+    rest="${rest#"$tok"}"
+    if [ "$skip_val" -eq 1 ]; then skip_val=0; continue; fi   # a prior option's value token
+    case "$tok" in
+      # separate-token value options: the NEXT token is a value, not a scoping path.
+      -k | -m | -p | -c | -o | -W | -n | -r | --rootdir | --deselect | --ignore \
+        | --ignore-glob | --confcutdir | --override-ini) skip_val=1 ;;
+      -*) ;;                                          # any other flag (incl. --opt=value)
+      *) return 0 ;;                                  # a genuine non-flag token = a path/node-id
+    esac
+  done
+  return 1
+}
+
+# --- benign in-worktree mutation lane (issue #203, finding 4) ------------------
+# A confirmation dialog on a COMPOUND command (cd into the worktree, mv a stashed file from
+# the scratchpad, chmod +x it, stash pop, targeted pytest) used to classify as one opaque
+# "risky" string and escalate, wedging the whole drain. These helpers let classify_permission
+# APPROVE segments whose writes are confined to the spoke's OWN worktree or its session
+# scratchpad — the spoke already has unrestricted Edit/Write there, so a chmod on its own new
+# hook script carries no additional risk. .git/ internals and secret-like paths stay denied.
+
+# _broker_path_physically_in <abs> <wt> <tasks> -> rc 0 when <abs>, with ALL symlinks
+# resolved, is physically under the worktree or the tasks root and NOT under <wt>/.git; rc 1
+# otherwise. Closes the symlink-indirection escape a textual check cannot see: a logically
+# in-tree path (e.g. `.venv/bin/python3`, a symlink worktree-new.sh points out of tree) can
+# physically resolve anywhere. os.path.realpath resolves the existing prefix — following a
+# final symlink FILE (the overwrite case) — and appends any not-yet-created tail, so it works
+# for create targets too. Fails CLOSED (rc 1) without python3: an unverifiable mutation path
+# is denied, not trusted (a false deny escalates — the safe direction).
+_broker_path_physically_in() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  _AFK_ABS="$1" _AFK_WT="$2" _AFK_TASKS="$3" python3 2>/dev/null <<'PYEOF'
+import os, sys
+
+abs_ = os.path.realpath(os.environ["_AFK_ABS"])
+wt = os.path.realpath(os.environ["_AFK_WT"])
+tasks = os.path.realpath(os.environ["_AFK_TASKS"])
+
+def under(p, root):
+    return p == root or p.startswith(root.rstrip("/") + "/")
+
+if not (under(abs_, wt) or under(abs_, tasks)):
+    sys.exit(1)
+# Reject any `.git` path component, case-INSENSITIVELY: macOS's default filesystem is
+# case-insensitive, so `.GIT` addresses the same dir as `.git` and a literal-`.git` guard
+# alone misses it; this also covers a nested repo's `.git` anywhere under the roots.
+if any(part.lower() == ".git" for part in abs_.split(os.sep)):
+    sys.exit(1)
+sys.exit(0)
+PYEOF
+}
+
+# _broker_resolve_in_roots <path> <cwd> <wt> <slug> <tasks> -> print <path>'s absolute form
+# (resolved against <cwd>) IF it lies under the worktree <wt> or the spoke's session
+# scratchpad (<tasks>/claude-*/<slug>/…), and NOT under <wt>/.git; else rc 1. TWO layers:
+# a textual containment check (fast, and the only one that can bound the scratchpad glob),
+# THEN a physical symlink-resolving check (_broker_path_physically_in) — both must pass.
+# Any token the shell would EXPAND to a different path (traversal, variable/command
+# substitution, tilde, brace or glob metacharacters) is rejected outright: a textual
+# resolver cannot see through those, and a false deny escalates — the safe direction.
+_broker_resolve_in_roots() {
+  local p="$1" cwd="$2" wt="$3" slug="$4" tasks="$5" abs
+  # Reject any token the shell rewrites at execution to a path the textual/realpath checks
+  # cannot see: traversal (`..`), variable/command substitution (`$`, backtick), tilde, brace
+  # and glob metacharacters, quoting/escaping (`"` `'` `\`), and redirection (`>` `<`). Two
+  # are load-bearing beyond the obvious: a leading quote/backslash (`rm "/etc/x"`) makes the
+  # `/*` absolute test below miss it so it is joined onto the worktree cwd as if relative, and
+  # a redirection (`cd foo>/etc/x`) hides an out-of-tree target the shell splits off — this
+  # resolver is the cd-handler's ONLY guard, so it must reject `>`/`<` that _permission_seg_safe
+  # rejects on the mutation path. realpath treats all these as ordinary chars, so an escaped
+  # target would pass containment yet the shell mutates the real path. A false deny escalates.
+  case "$p" in
+    *'..'* | *'$'* | *'`'* | '~'* | *'{'* | *'}'* | *'*'* | *'?'* | *'['* | *']'* \
+      | *'"'* | *"'"* | *'\'* | *'>'* | *'<'*) return 1 ;;
+  esac
+  case "$p" in /*) abs="$p" ;; *) abs="$cwd/$p" ;; esac
+  # Collapse `/./` and duplicate slashes textually (no glob, no fs touch). The replacement
+  # is `$sl` (a bare slash held in a var), NOT a literal `\/`: bash keeps the backslash in a
+  # `${var//pat/repl}` replacement string, so `\/` would corrupt the path (`/x/./y`→`/x\/y`).
+  local sl=/
+  while case "$abs" in */./* | *//*) true ;; *) false ;; esac; do
+    abs="${abs//\/.\//$sl}"; abs="${abs//\/\//$sl}"
+  done
+  abs="${abs%/.}"                                  # a trailing `/.` (bare `.` target) → the dir
+  abs="${abs%/}"; [ -n "$abs" ] || abs="/"
+  case "$abs" in "$wt"/.git | "$wt"/.git/*) return 1 ;; esac      # never .git internals (textual)
+  case "$abs" in
+    "$wt" | "$wt"/*) ;;                                           # under the worktree
+    "$tasks"/claude-*/"$slug"/*) ;;                               # under the scratchpad
+    *) return 1 ;;
+  esac
+  _broker_path_physically_in "$abs" "$wt" "$tasks" || return 1   # symlink-resolved containment
+  printf '%s\n' "$abs"
+}
+
+# _broker_seg_secretlike <token> -> rc 0 when a path token looks like a secret (a mutation of
+# it is never in the benign lane, even inside the worktree). Mirrors the repo's own secret
+# .gitignore classes (.env, *.pem) plus the common credential filenames. Matched case-
+# INSENSITIVELY (via tr — bash 3.2 lacks `${v,,}`): macOS's default filesystem is case-
+# insensitive, so `.ENV` addresses the same inode as `.env` and must not slip the guard
+# (mirroring the case-folded `.git` component check in _broker_path_physically_in).
+_broker_seg_secretlike() {
+  local base lower path_lower
+  base="${1##*/}"
+  lower="$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')"
+  case "$lower" in
+    .env | .env.* | *.pem | *.key | *.p12 | id_rsa | id_dsa | id_ecdsa | id_ed25519 \
+      | .netrc | credentials | .npmrc | .pypirc) return 0 ;;
+  esac
+  path_lower="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$path_lower" in */.ssh/* | */.aws/* | */.gnupg/*) return 0 ;; esac
+  return 1
+}
+
+# _permission_seg_mutation_ok <segment> <cwd> <wt> <slug> <tasks> -> rc 0 when a mutating
+# segment (mv/cp/rm/mkdir/chmod) touches ONLY paths under the worktree or the spoke's
+# scratchpad, none secret-like, none the worktree root itself. Tokens are walked by hand (no
+# word-splitting) so a glob argument never expands. Inert (rc 1) without a worktree context.
+_permission_seg_mutation_ok() {
+  local seg="$1" cwd="$2" wt="$3" slug="$4" tasks="$5" verb rest tok resolved saw_path=0 mode_pending=0
+  [ -n "$wt" ] || return 1
+  verb="${seg%% *}"
+  case "$verb" in
+    mv | cp | rm | mkdir | chmod) ;;
+    *) return 1 ;;
+  esac
+  [ "$verb" = chmod ] && mode_pending=1        # chmod's first non-flag token is the mode
+  rest="${seg#"$verb"}"
+  while [ -n "$rest" ]; do
+    rest="${rest#"${rest%%[![:space:]]*}"}"    # ltrim
+    [ -n "$rest" ] || break
+    tok="${rest%%[[:space:]]*}"                 # first token
+    rest="${rest#"$tok"}"
+    # `-t DIR` / `-tDIR` / `--target-directory[=DIR]` (GNU mv/cp) hide the DESTINATION inside
+    # a flag; the glued/`=`-form would be skipped as a flag and its out-of-tree target never
+    # checked. Deny the whole segment when one appears — a false deny escalates (BSD mv/cp on
+    # the macOS host lacks -t, but this repo also runs on Linux/GNU coreutils).
+    case "$tok" in
+      -t | -t?* | --target-directory | --target-directory=*) return 1 ;;
+    esac
+    case "$tok" in -*) continue ;; esac         # a flag (mv -f, mkdir -p, …)
+    if [ "$mode_pending" -eq 1 ]; then mode_pending=0; continue; fi
+    _broker_seg_secretlike "$tok" && return 1
+    resolved="$(_broker_resolve_in_roots "$tok" "$cwd" "$wt" "$slug" "$tasks")" || return 1
+    [ "$resolved" = "$wt" ] && return 1         # never target the worktree root itself
+    saw_path=1
+  done
+  [ "$saw_path" -eq 1 ]
+}
+
+# _permission_seg_safe <segment> [cwd wt slug tasks] -> true when ONE command segment is a
+# safe scoped self-op the spoke legitimately runs on its OWN worktree: the same vetted class
 # worktree-new.sh seeds into the spoke allowlist (unstage/stage, own-file pytest,
 # read-only helpers). A segment carrying command substitution, backticks, or a
 # redirection is never safe — those could smuggle a destructive op behind a safe
@@ -946,9 +1170,22 @@ is_auth_failure() {
 # rejected before the safe `git reset` prefix matches — only unstage/uncommit is safe.
 # Everything unrecognised is unsafe (default-deny).
 _permission_seg_safe() {
-  local seg="$1"
+  local seg="$1" cwd="${2:-}" wt="${3:-}" slug="${4:-}" tasks="${5:-}"
   case "$seg" in
     *'$('* | *'`'* | *'>'* | *'<'*) return 1 ;;   # substitution / redirection smuggling
+  esac
+  # Benign in-worktree mutation lane (#203): when we know the spoke's worktree, a mutating
+  # verb (mv/cp/rm/mkdir/chmod) is decided ENTIRELY by the lane — approve when confined to
+  # the worktree or its scratchpad, else deny. Deciding it here (not falling through) is what
+  # keeps the legacy relative-only `chmod +x` rule below from re-approving a lane MISS such as
+  # `chmod +x .git/hooks/pre-commit`. Without worktree context the lane is inert and these
+  # verbs fall through to the context-free rules (the relative-only chmod rule / default-deny).
+  case "$seg" in
+    'mv '* | 'cp '* | 'rm '* | 'mkdir '* | 'chmod '*)
+      if [ -n "$wt" ]; then
+        _permission_seg_mutation_ok "$seg" "$cwd" "$wt" "$slug" "$tasks" && return 0
+        return 1
+      fi ;;
   esac
   case "$seg" in
     *'--hard'* | *'--merge'* | *'--keep'*) return 1 ;;  # reset modes that touch the worktree
@@ -957,15 +1194,17 @@ _permission_seg_safe() {
     'git status' | 'git status '* | 'git diff' | 'git diff '* ) return 0 ;;
     'git log' | 'git log '* | 'git show' | 'git show '* ) return 0 ;;
     'git rev-parse' | 'git rev-parse '* | 'git branch --show-current' ) return 0 ;;
-    'git fetch' | 'git fetch '* | 'git stash list' ) return 0 ;;
-    # pytest MUST carry an argument: a bare `pytest` runs the whole suite, whose escaped
-    # tests rewrite real refs (#135) — the full-suite ref-rewind hazard. The `'... '*`
-    # forms only match after a space + a non-space arg (segments are trimmed), so a bare
-    # invocation falls through to default-deny (#171).
-    'pytest '* ) return 0 ;;
-    'python -m pytest '* ) return 0 ;;
-    'python3 -m pytest '* ) return 0 ;;
-    '.venv/bin/python -m pytest '* ) return 0 ;;
+    'git fetch' | 'git fetch '* ) return 0 ;;
+    # git stash is worktree/stash-local (never touches main or the remote): pop/apply restore
+    # the spoke's own stashed work, push/save stash it, list/show inspect it (#203 finding 4).
+    'git stash' | 'git stash pop'* | 'git stash apply'* | 'git stash push'* \
+      | 'git stash save'* | 'git stash list'* | 'git stash show'* ) return 0 ;;
+    # pytest MUST carry a NON-FLAG argument (a path / node-id): a bare `pytest` OR one
+    # carrying only flags (`pytest -q`, `pytest -x`) still runs the whole suite, whose
+    # escaped tests rewrite real refs (#135) — the full-suite ref-rewind hazard. Requiring
+    # a token (not merely any token) closes the flag-only bypass (#203).
+    'pytest '* | 'python -m pytest '* | 'python3 -m pytest '* | '.venv/bin/python -m pytest '* )
+      _pytest_seg_scoped "$seg" && return 0 || return 1 ;;
     'ls' | 'ls '* | 'cat '* | 'head '* | 'tail '* | 'wc' | 'wc '* ) return 0 ;;
     'grep '* | 'rg '* | 'echo' | 'echo '* | 'tree' | 'tree '* ) return 0 ;;
     'find '* )
@@ -986,14 +1225,21 @@ _permission_seg_safe() {
   esac
 }
 
-# classify_permission <command> -> "APPROVE" or "ESCALATE<TAB><reason>". DEFAULT-DENY:
-# the command is APPROVEd only when EVERY segment (split on ; && || |) is a safe scoped
-# self-op, so a single risky segment in a chain escalates the whole. Anything unrecognised
-# — main-touching, force-push, history rewrite, deletion, network fetch, browser/computer/
-# mcp tool, or a bare non-Bash tool name — ESCALATEs, naming the offending command so the
-# block record is actionable.
+# classify_permission <command> [worktree] -> "APPROVE" or "ESCALATE<TAB><reason>".
+# DEFAULT-DENY: the command is APPROVEd only when EVERY segment (split on ; && || |) is a
+# safe scoped self-op, so a single risky segment in a chain escalates the whole. When the
+# spoke's <worktree> is known, the compound is DECOMPOSED and `cd` is tracked so the benign
+# in-worktree mutation lane (#203, finding 4) can approve writes confined to the worktree or
+# its scratchpad. Anything unrecognised — main-touching, force-push, history rewrite, an
+# out-of-tree deletion, network fetch, browser/computer/mcp tool, or a bare non-Bash tool
+# name — ESCALATEs, naming the offending command so the block record is actionable.
 classify_permission() {
-  local cmd="$1" norm seg saw_seg=0
+  local cmd="$1" wt="${2:-}" norm seg saw_seg=0 cwd="" slug="" tasks="" target new_cwd
+  if [ -n "$wt" ]; then
+    slug="$(printf '%s' "$wt" | sed 's/[^A-Za-z0-9]/-/g')"
+    tasks="${AFK_TASKS_ROOT:-/private/tmp}"
+    cwd="$wt"                                       # the compound starts in the worktree
+  fi
   # Normalise the shell operators to newlines, longest first so `||` is not split by `|`
   # and `&&` is not split by a single `&`. The single `&` (background) MUST also split, or
   # `echo x & rm -rf /` would match the safe `echo ` prefix and never inspect the tail.
@@ -1007,7 +1253,23 @@ classify_permission() {
     seg="${seg%"${seg##*[![:space:]]}"}"           # rtrim
     [ -n "$seg" ] || continue
     saw_seg=1
-    if ! _permission_seg_safe "$seg"; then
+    # cd-tracking within the compound: a `cd` into a path that stays under the worktree/
+    # scratchpad updates the current dir for the following segments' relative paths; a `cd`
+    # that escapes (or a bare `cd` → $HOME, or no worktree context) escalates the whole.
+    case "$seg" in
+      'cd '*)
+        target="${seg#cd }"; target="${target#"${target%%[![:space:]]*}"}"
+        # An empty target (`cd` → $HOME) or a `-`-prefixed one (`cd -`/`--`/`-P`/`-L` → $OLDPWD
+        # or $HOME) navigates OUT of the tree — never a literal in-tree dir. Reject before the
+        # resolver, which would otherwise read `--` as an in-tree directory name and track a
+        # bogus cwd. A real dir starting with `-` is always reachable as `./-x`.
+        case "$target" in '' | -*) printf 'ESCALATE\t%s\n' "risky or unrecognised command: $cmd"; return 0 ;; esac
+        if [ -n "$wt" ] && new_cwd="$(_broker_resolve_in_roots "$target" "$cwd" "$wt" "$slug" "$tasks")"; then
+          cwd="$new_cwd"; continue
+        fi
+        printf 'ESCALATE\t%s\n' "risky or unrecognised command: $cmd"; return 0 ;;
+    esac
+    if ! _permission_seg_safe "$seg" "$cwd" "$wt" "$slug" "$tasks"; then
       printf 'ESCALATE\t%s\n' "risky or unrecognised command: $cmd"
       return 0
     fi
@@ -1111,7 +1373,7 @@ _decide_permission() {
     _escalate_blocked "$wt" "$issue" "permission dialog with an unreadable command — needs a human"
     return 0
   fi
-  decision="$(classify_permission "$cmd")"
+  decision="$(classify_permission "$cmd" "$wt")"
   kind="${decision%%$'\t'*}"
   reason="${decision#*$'\t'}"
   # Record the classifier's VERDICT (both APPROVE and ESCALATE) for the codification pass,
@@ -1486,6 +1748,16 @@ _broker_present_qcm() {
 # (or an answer we cannot inject) escalates rather than guessing.
 broker_service_gate() {
   local wt="$1" issue="$2" mode="${3:-unattended}" question orig_question raw rc decision kind text target was_gate=0 inject_diagnosed=0
+  # Re-answer ceiling (#203 finding 1): a legitimately-escalated spoke parked on the SAME
+  # prompt must not re-run the reasoner/classifier every tick forever. After the ceiling on
+  # the SAME (tip, prompt-signature) the gate is terminal — it stays blocked/<issue> at the
+  # tip from the prior escalation — until the prompt changes or the tip moves. Checked before
+  # BOTH the permission path (#203 finding 4's compound dialog) and the answerer path.
+  local park_sig; park_sig="$(_broker_park_signature "$wt" "$issue")"
+  if _broker_reanswer_exhausted "$wt" "$issue" "$park_sig"; then
+    log "  #$issue re-answer ceiling reached on the same prompt — leaving it terminal (no re-answer)"
+    return 0
+  fi
   # A pending permission dialog is decided by the rules classifier, not the answerer (#149).
   if _permission_pending "$wt"; then _decide_permission "$wt" "$issue"; return; fi
   # Snapshot the transcript clock BEFORE the park checks: a write landing between
