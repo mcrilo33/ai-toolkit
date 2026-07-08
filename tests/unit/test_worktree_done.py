@@ -235,6 +235,109 @@ def test_remote_branch_delete_carries_keepalive(hub: Path, tmp_path: Path) -> No
     assert f"GIT_SSH_COMMAND=[ssh {keepalive}]" in delete_lines[0]
 
 
+def _fetch_fail_git_shim(tmp_path: Path) -> None:
+    """PATH-front `git` shim: every `git fetch` dies (the network-down/stale-SSH
+    shape, issue #195); everything else delegates to the real git. Written into
+    the same bindir _run_done prepends to PATH."""
+    real_git = shutil.which("git")
+    assert real_git is not None
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    shim = bindir / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = fetch ]; then echo "fatal: unable to access origin (stubbed)" >&2; exit 128; fi\n'
+        f'exec "{real_git}" "$@"\n'
+    )
+    shim.chmod(0o755)
+
+
+def test_remote_delete_skipped_when_fetch_fails(hub: Path, tmp_path: Path) -> None:
+    # Issue #195 defense-in-depth: the merged-ness proof above the remote delete
+    # is about the LOCAL branch; the remote ref may hold commits this checkout
+    # never fetched. When the freshness fetch fails, the delete must be skipped
+    # loudly — never run against last-known remote state. Local prune (merged-
+    # only, safe) still runs, and teardown still succeeds.
+    _make_spoke(hub, tmp_path, "feature/10-fetchdead", push=True, merge=True)
+    _fetch_fail_git_shim(tmp_path)
+
+    proc, _ = _run_done(hub, tmp_path, "10")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "feature/10-fetchdead" not in _local_branches(hub)  # local prune still runs
+    assert _remote_has(hub, "feature/10-fetchdead"), "remote ref must survive a dead fetch"
+    assert "origin/feature/10-fetchdead" in proc.stderr, "the skipped delete is loud"
+
+
+def test_remote_delete_skipped_when_remote_has_unfetched_commits(hub: Path, tmp_path: Path) -> None:
+    # Issue #195 defense-in-depth: the spoke pushed one more commit after this
+    # checkout's last fetch — the stale tracking ref sits at the merged sha while
+    # the real remote is ahead. After a SUCCESSFUL freshness fetch the remote ref
+    # is no ancestor of the base, so the delete must be skipped with a warning;
+    # deleting on the local-branch proof alone would destroy the remote-only commit.
+    wt = _make_spoke(hub, tmp_path, "feature/11-late", push=True, merge=True)
+    merged_sha = _git(hub, "rev-parse", "feature/11-late").strip()
+    (wt / "late.txt").write_text("pushed after this checkout's last fetch\n")
+    _git(wt, "add", "late.txt")
+    _git(wt, "commit", "-qm", "feat: late", "-m", "Refs #1")
+    _git(wt, "push", "-q", "origin", "feature/11-late")
+    _git(wt, "reset", "-q", "--hard", merged_sha)  # local branch back at the merged sha
+    # This checkout never fetched the late push: rewind the shared tracking ref.
+    _git(hub, "update-ref", "refs/remotes/origin/feature/11-late", merged_sha)
+
+    proc, _ = _run_done(hub, tmp_path, "11")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "feature/11-late" not in _local_branches(hub)  # local prune still runs
+    assert _remote_has(hub, "feature/11-late"), "the remote-only commit must survive"
+    assert "origin/feature/11-late" in proc.stderr, "the kept remote is loud"
+
+
+def test_remote_delete_noop_when_remote_branch_already_gone(hub: Path, tmp_path: Path) -> None:
+    # The remote branch was already deleted on origin (e.g. by a prior resumed
+    # land) but the stale tracking ref survives locally. The freshness fetch
+    # runs with --prune, so the ghost collapses and teardown recognizes there is
+    # nothing to delete — no ancestor check against the stale ref, no misleading
+    # "couldn't delete" / "kept remote" warning.
+    _make_spoke(hub, tmp_path, "feature/12-gone", push=True, merge=True)
+    _git(tmp_path / "remote.git", "update-ref", "-d", "refs/heads/feature/12-gone")
+    _git(hub, "rev-parse", "--verify", "refs/remotes/origin/feature/12-gone")  # ghost present
+
+    proc, _ = _run_done(hub, tmp_path, "12")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "feature/12-gone" not in _local_branches(hub)  # local prune still runs
+    assert "origin/feature/12-gone" not in proc.stderr, "no warning about a branch already gone"
+
+
+def test_remote_delete_proceeds_when_merged_into_origin_base_only(
+    hub: Path, tmp_path: Path
+) -> None:
+    # Concurrent-hub case: the spoke pushed a late commit and ANOTHER hub landed
+    # it on origin/main; this checkout's local main is behind. The late commit is
+    # durably integrated in origin/main, so the remote delete must still proceed
+    # instead of keeping the branch with a misleading "commits not in main" warn.
+    wt = _make_spoke(hub, tmp_path, "feature/13-conc", push=True, merge=True)
+    merged_sha = _git(hub, "rev-parse", "feature/13-conc").strip()
+    (wt / "late.txt").write_text("landed by another hub\n")
+    _git(wt, "add", "late.txt")
+    _git(wt, "commit", "-qm", "feat: late", "-m", "Refs #1")
+    _git(wt, "push", "-q", "origin", "feature/13-conc")
+    # Another hub integrates the late push into origin/main; local main stays behind.
+    _git(hub, "checkout", "-q", "-b", "tmpint", "main")
+    _git(hub, "merge", "-q", "--no-ff", "feature/13-conc", "-m", "merge elsewhere")
+    _git(hub, "push", "-q", "origin", "tmpint:main")
+    _git(hub, "checkout", "-q", "main")
+    _git(hub, "branch", "-qD", "tmpint")
+    _git(wt, "reset", "-q", "--hard", merged_sha)  # local branch back at the merged tip
+
+    proc, _ = _run_done(hub, tmp_path, "13")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "feature/13-conc" not in _local_branches(hub)
+    assert not _remote_has(hub, "feature/13-conc"), "merged-into-origin/main branch is deleted"
+
+
 def test_unmerged_branch_is_kept(hub: Path, tmp_path: Path) -> None:
     _make_spoke(hub, tmp_path, "feature/2-unmerged", push=False, merge=False)
     proc, _ = _run_done(hub, tmp_path, "2")
