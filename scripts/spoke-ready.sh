@@ -44,6 +44,12 @@ for _c in "$_SR_DIR/telemetry.sh" "$_SR_DIR/../shared/hooks/lib/telemetry.sh"; d
   if [ -f "$_c" ]; then . "$_c"; break; fi
 done
 unset _c
+# The SSH-keepalive push wrapper wt_git_push and its transport-death predicate
+# wt_push_transport_died (issue #119) live in worktree-lib.sh, co-located with
+# this script in both layouts (toolkit scripts/, synced .ai-toolkit/scripts/).
+# A missing sibling is a broken sync — fail loudly rather than fall back to a
+# keepalive-less push (same stance as spoke-push.sh).
+. "$_SR_DIR/worktree-lib.sh"
 _SR_T0="$(command -v _telemetry_now_ms >/dev/null 2>&1 && _telemetry_now_ms || true)"
 
 usage() {
@@ -267,8 +273,34 @@ fi
 
 echo "→ git tag -f -a $TAG ${MSG_ARGS[*]}"
 git tag -f -a "$TAG" "${MSG_ARGS[@]}"
+
+# The tag push routes through wt_git_push (issue #119, the #184 residual): on the
+# --ready path it runs seconds after the branch push's ~6-minute in-push gate
+# staled the SSH connection, and a bare push died in the transfer phase (exit
+# 141 / SIGPIPE) — the branch landed but the marker never reached origin, so the
+# spoke finished without announcing itself and the drain stalled. Second line of
+# defense, mirroring worktree-land: when a failed attempt is demonstrably a
+# TRANSPORT death, retry exactly once. Unlike the land path there is no
+# TEST_SELECT_SKIP on the retry and no pytest-shape filter on the capture — the
+# gate short-circuits a tag-only push, so no suite runs inside it and a transport
+# signature in the output can only be the transport itself. The capture file is
+# complete when the pipeline returns (tee exits 0, pipefail keeps git's own code).
 echo "→ git push -f origin $TAG"
-git push -f origin "$TAG"
+PUSH_LOG="$(mktemp "${TMPDIR:-/tmp}/spoke-ready-push.XXXXXX")"
+PUSH_RC=0
+wt_git_push -f origin "$TAG" 2>&1 | tee "$PUSH_LOG" || PUSH_RC=$?
+if [ "$PUSH_RC" -ne 0 ]; then
+  if wt_push_transport_died "$PUSH_RC" "$PUSH_LOG"; then
+    rm -f "$PUSH_LOG"
+    echo "spoke-ready: push transport died (SSH staleness, issue #119) — retrying ONCE" >&2
+    wt_git_push -f origin "$TAG"
+  else
+    rm -f "$PUSH_LOG"
+    echo "spoke-ready: push of $TAG rejected — the marker did not reach origin" >&2
+    exit "$PUSH_RC"
+  fi
+fi
+rm -f "$PUSH_LOG"
 
 echo "✓ spoke-ready: emitted $TAG at $(git rev-parse --short HEAD)"
 
