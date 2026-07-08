@@ -171,6 +171,12 @@ def spoke(hub: Path, tmp_path: Path) -> Path:
         pytest.param("{ git checkout main; }", id="brace-group-checkout-main"),
         pytest.param("true && (git checkout main)", id="and-subshell-checkout-main"),
         pytest.param("git branch main", id="branch-bare-create-main"),
+        # A newline is a clause boundary too: a segment whose first token isn't
+        # `git` must not launder a forbidden `git` on the next line (issue #209).
+        pytest.param("true\ngit checkout main", id="newline-checkout-main"),
+        pytest.param("cd /tmp\ngit checkout main", id="newline-after-cd-checkout"),
+        pytest.param("echo hi\ngit switch main", id="newline-switch-main"),
+        pytest.param("true\ngit branch main", id="newline-branch-bare-create"),
     ],
 )
 def test_spoke_denies_main_mutation(spoke: Path, command: str) -> None:
@@ -226,6 +232,8 @@ def test_spoke_deny_emits_reason(spoke: Path) -> None:
         pytest.param("git branch feature/32-tmp", id="branch-create-feature"),
         pytest.param("git status", id="status"),
         pytest.param("ls -la", id="non-git"),
+        # A newline boundary must not over-block the sanctioned reconciliation.
+        pytest.param("git fetch origin\ngit merge origin/main", id="newline-fetch-merge"),
     ],
 )
 def test_spoke_allows_reconciliation_and_own_work(spoke: Path, command: str) -> None:
