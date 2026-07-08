@@ -69,6 +69,14 @@ workflow:
   applyTo: "**"
   alwaysApply: false
 
+operational-gotchas:
+  name: "Operational Gotchas"
+  description: "Recurring mechanical traps a spoke hits in this repo's commit/push cage — RED-trailer node-IDs and inline -m mechanics, gauntlet ambiguous-unicode lint, the working-tree push gate (don't interleave the next RED with an in-flight push), the full-suite real-ref hazard, testmon first-push seeding, merge-main-before-push, review-artifact @{upstream} hash base, and LC_ALL=C locale wrappers. Teaches how to satisfy the existing gates, never to bypass them."
+  applyTo: "**"
+  globs: "**"
+  paths: "**"
+  alwaysApply: false
+
 github-actions:
   name: "GitHub Actions"
   description: "Workflow structure, SHA pinning, permissions, secrets, caching, and job conventions for GitHub Actions"

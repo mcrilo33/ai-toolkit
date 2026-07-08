@@ -216,3 +216,9 @@ SOURCE → DEFINE → EXECUTE → VERIFY → PUSH — per subtask; the hub lands
 - `tdd-workflow` — TDD guidance for DEFINE
 - `generate-commit-message` — Commit message format
 - `generate-tests` — Test generation
+
+## Related Rules
+
+- `operational-gotchas` — The mechanical traps of this repo's commit/push cage
+  (RED-trailer format, working-tree push gate, full-suite ref hazard, locale
+  wrappers) — how to satisfy the gates the lifecycle above runs you through.
