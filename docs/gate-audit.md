@@ -73,7 +73,7 @@ Verdict legend: **FAIL-OPEN** = confirmed silent pass / crash-allow (filed);
 |------|-----------------|-------|---------|---------|
 | `test-select.sh` | empty/malformed stdin → exit 0 ("empty diff"); bad sha → FULL | crash → nonzero → push aborts | green-tree stamp on pass only | **FAIL-OPEN** — empty stdin passes; **no pytest → exit 0** |
 | native `pre-push` hook | `cat \|\| true` drains read-fail to empty | test-select `\|\| exit $?`; missing test-select → exit 1 (blocks) | none of its own | closed wrapper; off-switch bypass (below) |
-| `anti-gutting-scan.sh` | no ranges → exit 0 | crash blocks; findings always exit 0 | stderr only | advisory-by-design (#143 moved enforcement) |
+| `anti-gutting-scan.sh` | no ranges → exit 0 | crash blocks; unattended + ship-ref finding → exit 1, else exit 0 | stderr only | attended advisory; #193 fails closed on branches/`ready/*` when UNATTENDED/#74 marker armed (arming producer still pending — #187), non-`ready/` tags exempt |
 | `review-stamp-guard.sh` | unparseable → exit 0 (approve proceeds) | CC crash (exit 1) → allows | step:review span (opt-in) | *suspected* (Cursor-path only; Claude allows by design) |
 | `review-window-open.sh` | no identity/no jq → substring fallback opens window | crash → window not opened | `.review/.window` file | *suspected* (open over-grants via substring) |
 | `review-window-close.sh` | substring-only match | crash → window stays open | window file | closed by 1800s TTL |

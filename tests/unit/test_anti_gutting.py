@@ -4,9 +4,20 @@ The adversarial code-review gate is unenforceable policy (a spoke can narrate a
 review it never ran — the #43 failure mode), and on the native Claude pre-push
 path reviewer-sep is advisory (it does not block). So the one MECHANICAL signal
 against the dangerous cheat — an implementation that guts the tests to go green —
-is a deterministic diff scan wired into the pre-push path. It is ADVISORY: on any
-test-gutting signature it prints a warning to stderr and exits 0, so it surfaces
-the smell before landing without gating a human's ordinary test refactor.
+is a deterministic diff scan wired into the pre-push path.
+
+Enforcement is split by CHANNEL (issue #193). Attended, the scan is advisory: it
+warns on stderr and exits 0, so a human's ordinary test refactor is never gated.
+Under an unattended /afk drain (armed by a truthy ``UNATTENDED`` env or the
+supervisor's ``ai-toolkit-afk/unattended`` marker under the shared git common dir)
+it fails CLOSED on the SHIP paths — branch refs and ``refs/tags/ready/*`` — because
+no human is watching for a test-gutting diff. Every other tag is exempt from
+blocking (findings still print for the log); the point is the escalation markers
+``refs/tags/blocked/*`` and ``refs/tags/gate/*``: a spoke whose diff trips the scan
+must always be able to announce "I need a human", or the tripwire deadlocks the very
+channel that reports it (the #103 liveness invariant). Classification keys on the
+REMOTE ref of git's pre-push stdin — the ref the push actually updates — so a
+refspec push cannot smuggle a gutting diff onto a branch under a marker local name.
 
 Gutting signatures (in the pushed range's diff):
   * added ``sys.exit(0)`` / ``sys.exit()`` / ``os._exit(...)`` in ANY .py — a hard
@@ -33,7 +44,14 @@ import pytest
 
 SCAN = Path(__file__).resolve().parents[2] / "shared" / "hooks" / "anti-gutting-scan.sh"
 
-_GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+# Strip any ambient arming signal so attended-mode assertions cannot be flipped by
+# the calling session's environment (the #169 env-leak class); tests that want the
+# unattended path set UNATTENDED explicitly via _scan(env=...).
+_GIT_ENV = {
+    **{k: v for k, v in os.environ.items() if k != "UNATTENDED"},
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+}
 
 _REAL_TEST = "def test_adds_up():\n    total = 2 + 2\n    assert total == 4\n    assert total > 0\n"
 
@@ -74,10 +92,20 @@ def _commit(repo: Path, files: dict[str, str], msg: str = "feat: change") -> tup
 
 
 def _scan(
-    repo: Path, base: str, head: str, *, env: dict[str, str] | None = None
+    repo: Path,
+    base: str,
+    head: str,
+    *,
+    ref: str = "refs/heads/feature",
+    local_ref: str = "refs/heads/local",
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
-    """Run the scan with a synthesized pre-push stdin line (range base..head)."""
-    stdin = f"refs/heads/feature {head} refs/heads/feature {base}\n"
+    """Run the scan with a synthesized pre-push stdin line (range base..head).
+
+    ``ref`` is the REMOTE ref the push updates — the one classification must key
+    on — so the local ref deliberately differs (a refspec push shape).
+    """
+    stdin = f"{local_ref} {head} {ref} {base}\n"
     return subprocess.run(
         ["bash", str(SCAN)],
         cwd=str(repo),
@@ -164,64 +192,150 @@ def test_new_branch_zero_remote_sha_uses_merge_base(repo: Path) -> None:
     assert "weakens tests" in result.stderr, "a new-branch push must still scan the new commits"
 
 
-# ── advisory everywhere: UNATTENDED no longer fails closed (issue #143) ───────
-# The reasoning code-review verdict is now the /afk gatekeeper (hub-afk.sh auto_land
-# escalates to blocked on a non-clean verdict), so the mechanical scan is advisory in
-# EVERY context — including under an unattended drain. The old fail-closed path (armed by
-# the UNATTENDED env or the supervisor's `unattended` marker) is gone: a gutting diff
-# still warns, but never blocks, regardless of the marker.
+# ── unattended fails CLOSED on the ship paths (issues #74 / #193) ─────────────
+# Under an unattended drain no human is watching for a test-gutting diff, so a
+# finding on a SHIP ref — a branch or refs/tags/ready/* — blocks the push (exit 1).
+# Attended, the same finding stays advisory. The fail-closed path is armed by a
+# truthy UNATTENDED env or by the supervisor's `ai-toolkit-afk/unattended` marker
+# (#74) under the git common dir, which every spoke worktree shares. Deliberately
+# NOT an arming signal: hub-afk's `.afk-state` window file — a live (or stale,
+# #107) drain window must not hard-block the hub operator's own attended pushes.
+
+_GUT = {"tests/test_taut.py": "def test_taut():\n    assert True\n"}
 
 
-def test_unattended_env_is_now_advisory(repo: Path) -> None:
-    base, head = _commit(repo, {"tests/test_taut.py": "def test_taut():\n    assert True\n"})
+def test_unattended_env_blocks_gutting_branch_push(repo: Path) -> None:
+    base, head = _commit(repo, _GUT)
 
     result = _scan(repo, base, head, env={"UNATTENDED": "1"})
 
-    assert result.returncode == 0, "UNATTENDED must no longer block — the scan is advisory"
-    assert "weakens tests" in result.stderr, "advisory mode must still warn under UNATTENDED"
+    assert result.returncode == 1, "UNATTENDED must fail closed on a gutting branch push"
+    assert "weakens tests" in result.stderr, "the block must name the findings"
 
 
-def test_unattended_marker_is_now_advisory(repo: Path) -> None:
+def test_unattended_marker_blocks_gutting_branch_push(repo: Path) -> None:
     marker_dir = repo / ".git" / "ai-toolkit-afk"
     marker_dir.mkdir(parents=True, exist_ok=True)
     (marker_dir / "unattended").write_text("")
-    base, head = _commit(repo, {"tests/test_taut.py": "def test_taut():\n    assert True\n"})
+    base, head = _commit(repo, _GUT)
 
     result = _scan(repo, base, head)
 
-    assert result.returncode == 0, "the unattended marker must no longer block — advisory only"
-    assert "weakens tests" in result.stderr, "advisory mode must still warn with the marker present"
+    assert result.returncode == 1, "the #74 unattended marker must fail closed"
+    assert "weakens tests" in result.stderr, "the block must name the findings"
 
 
-# ── tag-only / marker pushes are exempt (issue #143, false positive 2) ────────
-# A blocked/<issue> (or any tag) push carries no reviewable code, so anti-gutting must
-# not scan it at all — a spoke escalating its state must always be able to push its
-# marker. A push whose refs are ALL tags contributes no range: nothing is scanned and
-# nothing is warned, even when the underlying commit range has a gutting signature.
+def test_falsy_unattended_env_stays_advisory(repo: Path) -> None:
+    # UNATTENDED=0 (or false/empty) means ATTENDED — a falsy-but-set value from a
+    # wrapper shell must not arm the fail-closed path.
+    base, head = _commit(repo, _GUT)
+
+    result = _scan(repo, base, head, env={"UNATTENDED": "0"})
+
+    assert result.returncode == 0, "a falsy UNATTENDED must not arm the fail-closed path"
+    assert "weakens tests" in result.stderr, "advisory mode must still warn"
 
 
-def test_tag_only_push_is_exempt(repo: Path) -> None:
-    base, head = _commit(repo, {"tests/test_taut.py": "def test_taut():\n    assert True\n"})
-    stdin = f"refs/tags/blocked/5 {head} refs/tags/blocked/5 {base}\n"
+def test_armed_afk_state_alone_stays_advisory(repo: Path) -> None:
+    # A non-empty .afk-state says "a drain window is armed", not "THIS push is
+    # unattended": the hub operator's own attended pushes (and a stale state file
+    # from a crashed supervisor, #107) must never be hard-blocked by it.
+    (repo / ".git" / ".afk-state").write_text("drain\n")
+    base, head = _commit(repo, _GUT)
 
-    result = subprocess.run(
-        ["bash", str(SCAN)],
-        cwd=str(repo),
-        input=stdin,
-        capture_output=True,
-        text=True,
-        env={**_GIT_ENV},
+    result = _scan(repo, base, head)
+
+    assert result.returncode == 0, ".afk-state alone must not arm the fail-closed path"
+    assert "weakens tests" in result.stderr, "advisory mode must still warn"
+
+
+def test_unattended_ready_tag_push_is_gated(repo: Path) -> None:
+    # ready/<N> is auto_land's trust basis — a ship path, not an escalation marker —
+    # so it stays gated exactly like a branch push.
+    base, head = _commit(repo, _GUT)
+
+    result = _scan(repo, base, head, ref="refs/tags/ready/5", env={"UNATTENDED": "1"})
+
+    assert result.returncode == 1, "a ready/<N> tag push is a ship path and must stay gated"
+    assert "weakens tests" in result.stderr, "the block must name the findings"
+
+
+def test_unattended_clean_diff_is_not_blocked(repo: Path) -> None:
+    base, head = _commit(
+        repo,
+        {"tests/test_more.py": "def test_more():\n    assert (1 + 1) == 2\n    assert [1] != []\n"},
     )
 
-    assert result.returncode == 0, "a tag-only push must never be blocked"
-    assert "weakens tests" not in result.stderr, "a tag-only push must not even be scanned"
+    result = _scan(repo, base, head, env={"UNATTENDED": "1"})
+
+    assert result.returncode == 0, "fail-closed arms on FINDINGS, not on every unattended push"
+    assert "weakens tests" not in result.stderr, "a clean diff must not warn"
 
 
-def test_mixed_branch_and_tag_push_still_scans_the_branch(repo: Path) -> None:
-    # A push carrying BOTH a branch ref and a tag ref (separate stdin lines) must still
-    # scan the branch range — the exemption is per-ref, not "any tag ⇒ skip the push"
-    # (which would let anyone bypass the scan by tacking a tag onto a branch push).
-    base, head = _commit(repo, {"tests/test_taut.py": "def test_taut():\n    assert True\n"})
+# ── non-ready tags are exempt from the fail-closed path (issue #193) ──────────
+# blocked/<N> and gate/<N> are the spoke's ONLY way to announce "I need a human".
+# If the tripwire gated them, the exact spoke whose diff needs a human decision
+# could not report it — the drain would see a silent, stuck spoke instead of a
+# blocked/ ping (the same liveness invariant as spoke-ready's blocked/+gate/
+# exemption from the upstream guard, #103). accept/<N> parks finished work for a
+# human EYEBALL (the human is the gate) and a foreign tag (a consumer repo's
+# v1.2.3) carries no hub semantics; no tag ships code — the code only moves on the
+# gated branch push. Findings still print to stderr for the log, but the tag push
+# always goes through. Only ready/<N>, auto_land's trust basis, stays gated.
+
+
+@pytest.mark.parametrize(
+    "ref",
+    ["refs/tags/blocked/5", "refs/tags/gate/5", "refs/tags/accept/5", "refs/tags/v1.2.3"],
+)
+def test_unattended_non_ready_tag_push_succeeds(repo: Path, ref: str) -> None:
+    base, head = _commit(repo, _GUT)
+
+    result = _scan(repo, base, head, ref=ref, env={"UNATTENDED": "1"})
+
+    assert result.returncode == 0, f"a non-ready tag push must never be blocked ({ref})"
+    assert "weakens tests" in result.stderr, f"findings must still print for the log ({ref})"
+
+
+def test_unattended_refspec_push_to_branch_under_marker_local_name_is_gated(repo: Path) -> None:
+    # Classification must key on the REMOTE ref: `git push origin blocked/5:feature`
+    # updates a BRANCH, and naming the local side after an escalation marker must
+    # not smuggle the gutting diff past the gate.
+    base, head = _commit(repo, _GUT)
+
+    result = _scan(
+        repo,
+        base,
+        head,
+        ref="refs/heads/feature",
+        local_ref="refs/tags/blocked/5",
+        env={"UNATTENDED": "1"},
+    )
+
+    assert result.returncode == 1, "the remote ref (a branch) decides the channel, not the local"
+    assert "weakens tests" in result.stderr, "the block must name the findings"
+
+
+def test_unattended_gutting_blocks_branch_but_not_blocked_marker(repo: Path) -> None:
+    # The #193 acceptance criterion, from ONE repo state: the unattended flag is armed
+    # and the branch carries a gutting diff — the branch push is blocked, while the
+    # blocked/<N> marker push from that same state succeeds.
+    base, head = _commit(repo, _GUT)
+    env = {"UNATTENDED": "1"}
+
+    branch = _scan(repo, base, head, env=env)
+    marker = _scan(repo, base, head, ref="refs/tags/blocked/5", env=env)
+
+    assert branch.returncode == 1, "the ship path must fail closed on the gutting diff"
+    assert marker.returncode == 0, "the escalation channel must stay open from the same state"
+
+
+def test_unattended_mixed_push_with_gated_ref_is_blocked(repo: Path) -> None:
+    # A push carrying BOTH a branch ref and an escalation tag (separate stdin lines)
+    # must still block — the exemption is per-ref, not "any escalation tag ⇒ let the
+    # push through" (which would let a spoke smuggle a gutting branch past the gate by
+    # tacking a blocked/ tag onto the push). Escalation markers are pushed alone.
+    base, head = _commit(repo, _GUT)
     stdin = (
         f"refs/heads/feature {head} refs/heads/feature {base}\n"
         f"refs/tags/blocked/5 {head} refs/tags/blocked/5 {base}\n"
@@ -233,8 +347,18 @@ def test_mixed_branch_and_tag_push_still_scans_the_branch(repo: Path) -> None:
         input=stdin,
         capture_output=True,
         text=True,
-        env={**_GIT_ENV},
+        env={**_GIT_ENV, "UNATTENDED": "1"},
     )
 
-    assert result.returncode == 0, "advisory scan never blocks"
+    assert result.returncode == 1, "a gated ref in a mixed push must still fail closed"
     assert "weakens tests" in result.stderr, "the branch ref in a mixed push must still be scanned"
+
+
+def test_attended_escalation_marker_push_warns_but_passes(repo: Path) -> None:
+    # Attended, the marker push behaves like every other attended push: advisory.
+    base, head = _commit(repo, _GUT)
+
+    result = _scan(repo, base, head, ref="refs/tags/gate/5")
+
+    assert result.returncode == 0, "attended pushes are advisory on every channel"
+    assert "weakens tests" in result.stderr, "findings must still print for the log"
