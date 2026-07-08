@@ -105,6 +105,7 @@ def _run_land(
     stub_curl: bool = False,
     issue_state: str = "OPEN",
     pytest_exit: int = 0,
+    pytest_side_effect: str = "",
 ) -> tuple[subprocess.CompletedProcess, dict[str, Path]]:
     """Run worktree-land.sh from the hub with logging stubs on PATH.
 
@@ -113,6 +114,9 @@ def _run_land(
     runs pytest itself ONLY for the diverged --skip-tests merge-sanity check
     (issue #174); otherwise the suite runs once via the pre-push hook on the main
     push (issue #19). `pytest_exit` non-zero models a failing merge-sanity run.
+    `pytest_side_effect` is a shell snippet the pytest stub runs before exiting —
+    used to model a concurrent sibling ref move (or an escape) DURING the
+    merge-sanity tripwire window (issue #205).
     `tmux_windows` is the line(s) the tmux stub prints for `list-windows`.
     Returns the completed process and the stub logs by name.
 
@@ -152,7 +156,9 @@ def _run_land(
     tmux.chmod(0o755)
     pytest_stub = bindir / "pytest"
     pytest_stub.write_text(
-        f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{logs["pytest"]}"\nexit {pytest_exit}\n'
+        f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{logs["pytest"]}"\n'
+        f"{pytest_side_effect}\n"
+        f"exit {pytest_exit}\n"
     )
     pytest_stub.chmod(0o755)
     if stub_python312:
@@ -640,6 +646,67 @@ def test_diverged_skip_tests_merge_sanity_failure_aborts(hub: Path, tmp_path: Pa
     assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha  # merge rolled back
     assert _remote_sha(hub, "main") == pre_main  # nothing pushed
     assert wt.exists()  # teardown never ran
+
+
+# --- merge-sanity tripwire scoped to the land's own refs (issue #205) -------------
+# The merge-sanity pytest runs INSIDE the shared hub ref store. The pre-#205 check
+# wrapped it in the WHOLE-repo tripwire, which snapshots every ref: a sibling spoke
+# pushing a ready/<N> tag (or advancing a remote-tracking ref) mid-check read as a
+# REPO-INTEGRITY BREACH — aborting the land, and worse, its restore DELETED the
+# sibling's freshly-pushed ref. The tripwire must be scoped to the refs the land
+# itself owns (refs/heads/<default>), so concurrent sibling ref moves are ignored
+# while a real escape onto the base branch is still caught.
+
+
+def test_diverged_skip_tests_merge_sanity_ignores_concurrent_sibling_ref(
+    hub: Path, tmp_path: Path
+) -> None:
+    # An /afk sibling pushing a ready/<N> tag during the merge-sanity window moves a
+    # shared ref the land does not own — it must NOT read as a breach: the land still
+    # lands, and the sibling's freshly-pushed tag SURVIVES (pre-#205 the whole-repo
+    # tripwire aborted the land and its restore deleted the tag).
+    _make_spoke(hub, tmp_path, "feature/1-sibref", push=True, ready=True)
+    _diverge_hub(hub)
+    _install_prepush_stub(hub, exit_code=0)
+
+    proc, logs = _run_land(
+        hub,
+        tmp_path,
+        "1",
+        "--skip-tests",
+        pytest_side_effect="git tag ready/99 HEAD 2>/dev/null || true",
+    )
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "--collect-only" in _log_text(logs["pytest"])  # the sanity check ran
+    assert "REPO-INTEGRITY BREACH" not in proc.stderr  # not a spurious breach
+    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()  # landed
+    assert "ready/99" in _local_tags(hub)  # the sibling ref was NOT rolled back
+
+
+def test_diverged_skip_tests_merge_sanity_still_catches_base_branch_escape(
+    hub: Path, tmp_path: Path
+) -> None:
+    # Scoping the tripwire (issue #205) must NOT gut its core job: a test that
+    # escapes and moves refs/heads/main — the ref the land is about to push — is
+    # still a breach that aborts the land and rolls the merge back.
+    wt = _make_spoke(hub, tmp_path, "feature/1-escape", push=True, ready=True)
+    _diverge_hub(hub)
+    pre_main = _remote_sha(hub, "main")
+    _install_prepush_stub(hub, exit_code=0)
+
+    proc, _logs = _run_land(
+        hub,
+        tmp_path,
+        "1",
+        "--skip-tests",
+        pytest_side_effect="git update-ref refs/heads/main HEAD~1 2>/dev/null || true",
+    )
+
+    assert proc.returncode != 0
+    assert "REPO-INTEGRITY BREACH" in proc.stderr  # the escape was caught
+    assert _remote_sha(hub, "main") == pre_main  # nothing pushed
+    assert wt.exists()  # land aborted before teardown
 
 
 # --- SSH keepalive + retry-once-after-green on the ship push (issue #119) --------
