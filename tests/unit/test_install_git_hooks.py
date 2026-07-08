@@ -15,6 +15,7 @@ is made BEFORE install so the commit-msg hook never enters the picture.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -230,6 +231,75 @@ def test_reverse_index_lib_copied_into_hooks(repo: Path) -> None:
 
     lib = _scripts_dir(hooks) / "lib" / "test-reverse-index.sh"
     assert lib.is_file()
+
+
+# --- the commit-msg hook synthesizes a RAW `git commit` command (issue #185) ----
+#
+# The native commit-msg hook must feed the cage scripts a payload whose
+# tool_input.command is a real `git commit -m …` invocation — the same shape the
+# agent path produces — so commit-quality's boundary-aware `is_git_commit` matcher
+# fires. The `jq -nc` bug double-encoded CMD (outer quotes + escapes), so the
+# command reaching the matcher started with a literal `"` and the format/anchor
+# gate silently never ran (a safety gate failing open).
+
+
+def _stub_capture(hooks: Path, name: str, log: Path) -> None:
+    """Overwrite a copied cage script with a stub that logs its stdin and passes."""
+    s = _scripts_dir(hooks) / f"{name}.sh"
+    s.write_text(f'#!/bin/sh\ncat >> "{log}"\nexit 0\n')
+    s.chmod(0o755)
+
+
+def _stub_pass(hooks: Path, name: str) -> None:
+    """Overwrite a copied cage script with a no-op that passes."""
+    s = _scripts_dir(hooks) / f"{name}.sh"
+    s.write_text("#!/bin/sh\nexit 0\n")
+    s.chmod(0o755)
+
+
+def _commit(repo: Path, *msg_args: str) -> subprocess.CompletedProcess[str]:
+    """Stage a change and run a real `git commit` (drives the commit-msg hook)."""
+    (repo / "change.txt").write_text("work\n")
+    _git(repo, "add", "change.txt")
+    return subprocess.run(
+        ["git", "commit", *msg_args],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env=_GIT_ENV,
+    )
+
+
+def test_commit_msg_synthesizes_raw_command(repo: Path, tmp_path: Path) -> None:
+    # The captured payload's command must be byte-identical to a real commit
+    # invocation: `git commit -m ` + the JSON-encoded message (quotes/newlines
+    # escaped), with `git` at a command boundary — NOT wrapped in outer quotes.
+    hooks = _install(repo)
+    log = tmp_path / "payload.json"
+    _stub_capture(hooks, "commit-quality", log)
+    _stub_pass(hooks, "commit-gauntlet")
+
+    commit = _commit(repo, "-m", 'feat(x): add "q" thing', "-m", "Refs #185")
+
+    assert commit.returncode == 0, commit.stderr
+    payload = json.loads(log.read_text())
+    body = _git(repo, "show", "-s", "--format=%B", "HEAD").rstrip("\n")
+    expected = "git commit -m " + json.dumps(body)
+    assert payload["tool_input"]["command"] == expected
+
+
+def test_commit_msg_gate_blocks_non_conventional_message(repo: Path) -> None:
+    # End-to-end proof the real commit-quality matcher fires: a non-conventional
+    # subject must be BLOCKED. Under the jq -nc bug the matcher never saw a git
+    # commit command, so the commit went through ungated.
+    hooks = _install(repo)
+    seed = _git(repo, "rev-parse", "HEAD").strip()
+
+    commit = _commit(repo, "-m", "not a conventional message")
+
+    assert commit.returncode != 0, "commit-quality must block a non-conventional subject"
+    assert "conventional commits" in (commit.stdout + commit.stderr).lower()
+    assert _git(repo, "rev-parse", "HEAD").strip() == seed  # nothing committed
 
 
 def test_telemetry_lib_copied_and_utils_sources_clean(repo: Path) -> None:
