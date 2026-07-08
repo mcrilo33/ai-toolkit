@@ -1052,9 +1052,14 @@ tasks = os.path.realpath(os.environ["_AFK_TASKS"])
 def under(p, root):
     return p == root or p.startswith(root.rstrip("/") + "/")
 
-if under(abs_, os.path.join(wt, ".git")):
+if not (under(abs_, wt) or under(abs_, tasks)):
     sys.exit(1)
-sys.exit(0 if (under(abs_, wt) or under(abs_, tasks)) else 1)
+# Reject any `.git` path component, case-INSENSITIVELY: macOS's default filesystem is
+# case-insensitive, so `.GIT` addresses the same dir as `.git` and a literal-`.git` guard
+# alone misses it; this also covers a nested repo's `.git` anywhere under the roots.
+if any(part.lower() == ".git" for part in abs_.split(os.sep)):
+    sys.exit(1)
+sys.exit(0)
 PYEOF
 }
 

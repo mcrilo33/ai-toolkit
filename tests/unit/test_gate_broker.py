@@ -2097,6 +2097,19 @@ def test_classify_permission_escalates_symlink_following_mutation(
     ) == ("ESCALATE")
 
 
+def test_classify_permission_escalates_case_variant_git_internals(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # macOS's default filesystem is case-INSENSITIVE, so `.GIT` addresses the same dir as
+    # `.git`; the literal-`.git` textual guard alone would miss it. The physical layer must
+    # reject any `.git` path component case-insensitively.
+    tasks = tmp_path / "tasks"
+
+    assert _classify_with_wt(f"chmod +x {spoke_repo}/.GIT/hooks/pre-commit", spoke_repo, tasks) == (
+        "ESCALATE"
+    )
+
+
 def test_classify_permission_escalates_mutation_of_secretlike_path(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
