@@ -2425,7 +2425,7 @@ def test_auto_land_lands_on_clean_approve(spoke_repo: Path, tmp_path: Path) -> N
     statedir = tmp_path / "statedir"
     expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
 
-    # AFK_REVIEW_GATE=1 opts into the gate (OFF by default since #152).
+    # AFK_REVIEW_GATE=1 pins the gate on explicitly (it is also the default since #183).
     _call(
         expr, env={"WT_LAND": str(wt_land), "AFK_STATE_DIR": str(statedir), "AFK_REVIEW_GATE": "1"}
     )
@@ -2664,6 +2664,8 @@ def test_incr_landed_counts_up(tmp_path: Path) -> None:
 def test_auto_land_increments_landed_tally(spoke_repo: Path, tmp_path: Path) -> None:
     # A successful land bumps the tally by one (the count hub-notify surfaces).
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    # A #172-compliant ready carries an APPROVE (the gate is on by default now).
+    _seed_clean_review(spoke_repo)
     wt_land, land_log = _land_recorder(tmp_path)
     countfile = tmp_path / "landed-count"
     statedir = tmp_path / "statedir"
@@ -2685,6 +2687,8 @@ def test_auto_land_increments_landed_tally(spoke_repo: Path, tmp_path: Path) -> 
 def test_auto_land_failure_does_not_increment_tally(spoke_repo: Path, tmp_path: Path) -> None:
     # A failed land escalates blocked/<issue> and must NOT count toward "landed".
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    # Clean review so the LAND (exit 1) is what escalates, not the default-on gate.
+    _seed_clean_review(spoke_repo)
     wt_land = tmp_path / "wtland.sh"
     wt_land.write_text("#!/usr/bin/env bash\nexit 1\n")
     wt_land.chmod(0o755)
@@ -3070,6 +3074,8 @@ def test_auto_land_trusts_ready_marker_and_skips_suite(spoke_repo: Path, tmp_pat
     # AC1: land with --skip-tests, trusting the ready-marker green — no redundant full-suite
     # re-run (the source of the #140 self-flake).
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    # A #172-compliant ready carries an APPROVE (the gate is on by default now).
+    _seed_clean_review(spoke_repo)
     wt_land, land_log = _land_argv_recorder(tmp_path)
     statedir = tmp_path / "statedir"
     expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
@@ -3099,6 +3105,7 @@ def test_auto_land_retries_ready_blocked_at_tip(spoke_repo: Path, tmp_path: Path
     # With a land that now succeeds, the retry lands the spoke — no manual unblock needed.
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
     subprocess.run(["git", "tag", "blocked/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)  # gate on by default: the retry lands past a clean review
     wt_land, land_log = _land_recorder(tmp_path)  # succeeds (exit 0)
     statedir = tmp_path / "statedir"
     expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
@@ -3130,6 +3137,7 @@ def test_auto_land_ready_blocked_reescalates_on_repeat_failure(
     # tick can see the retry budget is spent (never an unbounded merge→fail→reset loop).
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
     subprocess.run(["git", "tag", "blocked/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)  # gate on by default: the failing land is what re-escalates
     wt_land = tmp_path / "wtland.sh"
     wt_land.write_text("#!/usr/bin/env bash\nexit 1\n")  # land still fails
     wt_land.chmod(0o755)
@@ -3160,6 +3168,7 @@ def test_auto_land_does_not_block_when_land_reports_cleanup_incomplete(
     # The code is already shipped, so auto_land must NOT stamp blocked over merged work — it
     # tallies the land and logs the incomplete cleanup instead.
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)  # gate on by default: reach the land so exit 3 is exercised
     wt_land = tmp_path / "wtland.sh"
     wt_land.write_text("#!/usr/bin/env bash\nexit 3\n")  # sentinel: main advanced, cleanup failed
     wt_land.chmod(0o755)
@@ -3191,6 +3200,7 @@ def test_auto_land_still_blocks_on_a_pre_merge_failure(spoke_repo: Path, tmp_pat
     # A non-sentinel nonzero (exit 1: merge conflict / push rejection — nothing shipped) still
     # escalates, so the sentinel path doesn't swallow genuine failures.
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)  # gate on by default: the exit-1 land is what escalates
     wt_land = tmp_path / "wtland.sh"
     wt_land.write_text("#!/usr/bin/env bash\nexit 1\n")
     wt_land.chmod(0o755)

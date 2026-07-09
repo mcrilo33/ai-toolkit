@@ -1073,13 +1073,16 @@ _afk_land_retry_max() {
 # reset → re-land forever (#140). auto_land skips any issue already carrying blocked/<issue>
 # at its tip (_blocked_at_tip); reconcile_markers revives it once the spoke commits a real fix.
 #
-# The reasoning code-review verdict is the /afk test-gutting gate (#143), but it is OFF by
-# default (#152): the #143 default-on gate false-positive-escalated clean lands whose spokes
-# left no verdict artifact in the format the reader wants (reviews that finished in <1s),
-# bricking the whole drain (#151). The mechanical anti-gutting scan stays the advisory
-# residual signal. Set AFK_REVIEW_GATE=1 to opt back in: auto_land then lands ONLY on a clean
-# APPROVE verdict — a REQUEST_CHANGES (the reviewer flagged gutting) or no review at all
-# escalates to blocked/<issue> instead.
+# The reasoning code-review verdict is the /afk test-gutting gate (#143), ON by default again
+# (#183): auto_land lands ONLY on a clean APPROVE verdict — a REQUEST_CHANGES (the reviewer
+# flagged gutting) or no review at all escalates to blocked/<issue> instead. It defaulted OFF
+# under #152 because the #143 gate false-positive-escalated clean lands whose spokes left no
+# verdict artifact in the reader's format (reviews that finished in <1s), bricking the whole
+# drain (#151). That failure class is now closed at the SOURCE by #172: every ready/<issue>
+# emission through spoke-ready requires an APPROVE artifact bound to the tip, so a ready with
+# no clean verdict can only be a hand-crafted bypass — escalating it is the intended gate, not
+# a false positive. Set AFK_REVIEW_GATE=0 to opt back out (restore the #152 land-anything
+# behavior); the mechanical anti-gutting scan stays the advisory residual signal either way.
 auto_land() {
   local wt_land path issue verdict max tries land_log land_rc
   wt_land="$(_afk_find_script "${WT_LAND:-}" worktree-land.sh)" || { log "worktree-land.sh not found — skipping land"; return 0; }
@@ -1105,7 +1108,7 @@ auto_land() {
       log "  skip land #$issue — foreign (no dispatch epoch) and AFK_LAND_FOREIGN=0"
       continue
     fi
-    if [ "${AFK_REVIEW_GATE:-0}" != "0" ]; then
+    if [ "${AFK_REVIEW_GATE:-1}" != "0" ]; then
       verdict="$(_afk_review_verdict "$path")"
       if [ "$verdict" != "APPROVE" ]; then
         _escalate_blocked "$path" "$issue" \
