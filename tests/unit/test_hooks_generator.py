@@ -763,6 +763,51 @@ class TestAfkNotifyWakeRegistration:
         assert os.access(script, os.X_OK), "afk-notify-wake.sh must be executable for sync"
 
 
+# ── cycle-step-mark registration against the REAL shared/hooks/metadata.yml ──
+# cycle-step-mark (issue #178) is a Claude-only tier-3 telemetry hook: it derives
+# solo-cycle step markers from commit/push/review witnesses on PostToolUse. Like
+# spoke-main-guard it spans two tool types (Bash for commit/push, Write for the
+# .review artifact), so it carries NO `if` clause and the script self-filters. It
+# is telemetry-only and Claude-centric (the spokecycle trace), so — like
+# afk-notify-wake — it must not leak into Copilot or Cursor.
+
+
+class TestCycleStepMarkRegistration:
+    SCRIPT = "cycle-step-mark.sh"
+
+    def test_registered_for_claude_post_tool_use_without_if(self) -> None:
+        cfg = generate_claude(parse_hooks_metadata(str(REAL_META)))
+        handler = _claude_handler(cfg, "PostToolUse", self.SCRIPT)
+        assert handler is not None, "cycle-step-mark not registered for Claude PostToolUse"
+        # Spans Bash (commit/push) and Write (.review artifact) — no single `if`
+        # rule fits, so it fires on all matched tools and the script self-filters.
+        assert handler.get("if") is None
+
+    def test_claude_grouped_under_bash_write_matcher(self) -> None:
+        cfg = generate_claude(parse_hooks_metadata(str(REAL_META)))
+        for group in cfg.get("PostToolUse", []):
+            for handler in group.get("hooks", []):
+                if handler.get("command", "").endswith(self.SCRIPT):
+                    assert group.get("matcher") == "Bash|Write"
+                    return
+        raise AssertionError("cycle-step-mark not found under a Bash|Write matcher group")
+
+    def test_is_tier_3(self) -> None:
+        meta = parse_hooks_metadata(str(REAL_META))
+        assert meta["cycle-step-mark"]["__defaults"]["tier"] == "3"
+
+    def test_not_registered_for_copilot_or_cursor(self) -> None:
+        cop = generate_copilot(parse_hooks_metadata(str(REAL_META)))["hooks"]
+        cur = generate_cursor(parse_hooks_metadata(str(REAL_META)))["hooks"]
+        assert not any(self.SCRIPT in json_dump(v) for v in cop.values()), "leaked into Copilot"
+        assert not any(self.SCRIPT in json_dump(v) for v in cur.values()), "leaked into Cursor"
+
+    def test_hook_script_present_and_executable(self) -> None:
+        script = REAL_META.parent / self.SCRIPT
+        assert script.is_file(), "cycle-step-mark.sh missing from shared/hooks/"
+        assert os.access(script, os.X_OK), "cycle-step-mark.sh must be executable for sync"
+
+
 def json_dump(obj: object) -> str:
     import json
 

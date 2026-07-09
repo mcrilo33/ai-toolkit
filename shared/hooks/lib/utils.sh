@@ -187,6 +187,16 @@ is_git_push_or_pr() {
   printf '%s' "$cmd" | grep -qE '(^|[;&|`]|\$\()[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*(git([[:space:]]+(-[^[:space:]]+|--[^[:space:]]+|-C[[:space:]]+[^[:space:]]+))*[[:space:]]+push\b|gh[[:space:]]+pr[[:space:]]+(create|merge)\b)'
 }
 
+# ── Recognize a `git push` invocation ────────────────────────────────
+# The push-only sibling of is_git_push_or_pr (same boundary-awareness and prefix
+# tolerance) narrowed to an actual `git push` — `gh pr create|merge` does NOT
+# match. Callers that key on a real branch push (not PR creation) use this.
+# Returns 0 on match.
+is_git_push() {
+  local cmd="$1"
+  printf '%s' "$cmd" | grep -qE '(^|[;&|`]|\$\()[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*git([[:space:]]+(-[^[:space:]]+|--[^[:space:]]+|-C[[:space:]]+[^[:space:]]+))*[[:space:]]+push\b'
+}
+
 # ── Recognize a branch-CREATING checkout/switch ──────────────────────
 # Matches branch creation at a command boundary (same boundary-awareness as
 # is_git_commit), tolerating leading options and env-assignment prefixes, so
