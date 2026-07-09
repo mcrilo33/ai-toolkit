@@ -488,6 +488,33 @@ wt_bridge_launch() {
   echo "→ started Langfuse message bridge on :${BRIDGE_PORT:-4319} (log: $log)"
 }
 
+# --- locale-hardened process probes (issue #189) ------------------------------
+# The host dev locale is non-C; a bare `pgrep -f` dies "illegal byte sequence" on
+# non-ASCII argv (a live process then reads as "not running") and self-matches a
+# monitor loop's own argv, while `ps -o lstart=` emits a locale-formatted date the
+# parser cannot read (staleness never fires). wt_pgrep / wt_ps_start_epoch are the
+# one sanctioned place the raw tools are called; every other control-plane script
+# goes through them (locked by tests/unit/test_process_probe_lint.py).
+
+# wt_pgrep <pgrep args...> -> locale-hardened, self-excluding `pgrep`. Runs pgrep
+# under LC_ALL=C so non-ASCII argv neither crashes it nor false-negatives, and
+# drops the caller's own pid ($$) from the result so a loop grepping its own
+# keyword (the classic `pgrep -f pytest` self-match) never reports itself. Prints
+# the matching pids, one per line. The exit code carries the outcome callers must
+# tell apart — a probe failure is never mistaken for "not running":
+#   0  one or more OTHER processes match
+#   1  nothing matches            -> "not running"
+#   2  the probe itself failed    -> "unknown", never conflate with not-running
+wt_pgrep() {
+  local out rc self=$$
+  out="$(LC_ALL=C pgrep "$@" 2>/dev/null)"
+  rc=$?
+  [ "$rc" -gt 1 ] && return 2     # pgrep 2/3 (syntax/fatal), or a locale death
+  out="$(printf '%s\n' "$out" | grep -vxF "$self")"
+  [ -n "$out" ] || return 1       # empty, or only the caller itself matched
+  printf '%s\n' "$out"
+}
+
 # PID LISTENing on the bridge port (default :4319), via `lsof -t` — NOT `pgrep -f`,
 # which false-negatives on non-ASCII argv under a non-UTF8 locale and would report a
 # live bridge as down. '' when nothing listens or lsof is unavailable. Split out so
@@ -498,21 +525,27 @@ wt_bridge_pid() {
   lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -n1
 }
 
-# Epoch seconds at which the given pid started. Reads `ps -o lstart=` and converts
-# with the portable BSD-then-GNU `date` pattern (mirroring wt_epoch_at). Both ps and
-# date run under LC_ALL=C: `ps lstart` is locale-formatted (e.g. fr_FR emits "lun.
-# 29 juin"), which `date -f "%a %b %e %T %Y"` cannot parse — the same locale trap
-# the issue flags for pgrep, which would silently strand the epoch empty and stop
-# staleness from ever firing. '' on any failure. Split out so the staleness decision
-# is overridable in tests with no real process. Args: $1 = pid.
-wt_proc_start_epoch() {
-  local pid="$1" lstart
-  lstart="$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null)" || return 0
+# wt_ps_start_epoch <pid> -> epoch seconds at which the pid started, on stdout.
+# Reads `ps -o lstart=` and converts with the portable BSD-then-GNU `date` pattern
+# (mirroring wt_epoch_at). Both ps and date run under LC_ALL=C: `ps lstart` is
+# locale-formatted (e.g. fr_FR emits "lun. 29 juin"), which `date -f "%a %b %e %T
+# %Y"` cannot parse — the same locale trap the issue flags for pgrep, which would
+# silently strand the epoch empty and stop staleness from ever firing. The exit
+# code separates the two failure modes so a caller never mistakes one for the other:
+#   0  epoch printed
+#   1  no such process        -> "not running" (empty stdout)
+#   2  a start time was read but could not be parsed -> "probe failed"
+# Split out so the staleness decision is overridable in tests with no real process.
+wt_ps_start_epoch() {
+  local pid="$1" lstart epoch
+  lstart="$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null)" || return 1  # no such pid
   lstart="${lstart#"${lstart%%[![:space:]]*}"}"   # strip leading padding
   lstart="${lstart%"${lstart##*[![:space:]]}"}"   # strip trailing padding
-  [ -n "$lstart" ] || return 0
-  LC_ALL=C date -j -f "%a %b %e %T %Y" "$lstart" +%s 2>/dev/null \
-    || LC_ALL=C date -d "$lstart" +%s 2>/dev/null || true
+  [ -n "$lstart" ] || return 1                    # empty ps line -> not running
+  epoch="$(LC_ALL=C date -j -f "%a %b %e %T %Y" "$lstart" +%s 2>/dev/null \
+    || LC_ALL=C date -d "$lstart" +%s 2>/dev/null)"
+  [ -n "$epoch" ] || return 2                     # got a start time, cannot parse
+  printf '%s' "$epoch"
 }
 
 # Newest mtime (epoch seconds) among the bridge's source bundle: the bridge itself
@@ -555,7 +588,7 @@ wt_bridge_restart_if_stale() {
   local repo_root="$1" port="$2" pid start src
   pid="$(wt_bridge_pid "$port")"
   [ -n "$pid" ] || return 0
-  start="$(wt_proc_start_epoch "$pid")"
+  start="$(wt_ps_start_epoch "$pid")"
   [ -n "$start" ] || return 0
   src="$(wt_bridge_source_mtime "$repo_root")"
   [ "$src" -gt "$start" ] 2>/dev/null || return 0

@@ -124,10 +124,10 @@ def test_wt_pgrep_is_locale_independent() -> None:
 
 def test_wt_ps_start_epoch_returns_epoch_for_a_live_pid() -> None:
     # The live shell's own pid resolves to a positive epoch, exit 0.
-    result = _run('wt_ps_start_epoch $$; echo "RC=$?"')
+    result = _run('out="$(wt_ps_start_epoch $$)"; rc=$?; echo "$out"; echo "RC=$rc"')
 
-    lines = result.stdout.split()
-    assert "RC=0" in result.stdout.splitlines(), result.stderr
+    lines = result.stdout.splitlines()
+    assert "RC=0" in lines, result.stderr
     assert lines[0].isdigit() and int(lines[0]) > 0, result.stdout
 
 

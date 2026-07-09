@@ -101,7 +101,7 @@ def _bridge_preflight_up(
     """Run wt_otel_bridge_preflight with the bridge UP and staleness stubbed.
 
     The port probe is forced up and the staleness signal is driven directly:
-    wt_bridge_pid (the :4319 listener pid), wt_proc_start_epoch (when it started),
+    wt_bridge_pid (the :4319 listener pid), wt_ps_start_epoch (when it started),
     and wt_bridge_source_mtime (newest mtime of the bridge's source bundle).
     wt_bridge_kill / wt_bridge_launch are marker echoes, so a recycle prints
     ``KILLED <pid>`` then ``LAUNCHED <repo>`` and nothing real is signalled or
@@ -110,7 +110,7 @@ def _bridge_preflight_up(
     parts = [
         "wt_port_listening() { return 0; }",
         f'wt_bridge_pid() {{ printf "%s" "{pid}"; }}',
-        f'wt_proc_start_epoch() {{ printf "%s" "{proc_start}"; }}',
+        f'wt_ps_start_epoch() {{ printf "%s" "{proc_start}"; }}',
         f'wt_bridge_source_mtime() {{ printf "%s" "{source_mtime}"; }}',
         'wt_bridge_kill() { echo "KILLED $1"; }',
         'wt_bridge_launch() { echo "LAUNCHED $1"; }',
@@ -423,7 +423,7 @@ def test_bridge_pid_resolves_via_lsof_not_pgrep(tmp_path: Path) -> None:
     assert not pgrep_marker.exists(), "wt_bridge_pid must not consult pgrep"
 
 
-def test_proc_start_epoch_is_locale_independent() -> None:
+def test_ps_start_epoch_is_locale_independent() -> None:
     # `ps -o lstart=` is locale-formatted (fr_FR emits "lun. 29 juin"), which
     # `date -f "%a %b %e %T %Y"` cannot parse — that would strand the epoch empty
     # and stop the bridge staleness check from ever firing. The helper must force
@@ -431,7 +431,7 @@ def test_proc_start_epoch_is_locale_independent() -> None:
     # (read-only — never kills) under a deliberately non-C inherited locale.
     env = {**os.environ, "LC_ALL": "fr_FR.UTF-8", "LANG": "fr_FR.UTF-8"}
     result = subprocess.run(
-        ["bash", "-c", f'source "{WT_LIB}"; wt_proc_start_epoch $$'],
+        ["bash", "-c", f'source "{WT_LIB}"; wt_ps_start_epoch $$'],
         capture_output=True,
         text=True,
         env=env,

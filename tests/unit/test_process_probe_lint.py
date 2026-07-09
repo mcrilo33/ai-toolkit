@@ -28,9 +28,10 @@ SCRIPT_DIRS = [
 # The sanctioned home of the hardened helpers: it alone may call the raw tools.
 EXEMPT = {REPO_ROOT / "scripts" / "worktree-lib.sh"}
 
-# A bare `pgrep` (NOT `wt_pgrep`) whose flags include `f` — the argv-matching probe
-# that dies "illegal byte sequence" on non-ASCII argv under a non-C locale.
-RAW_PGREP_F = re.compile(r"(?<![\w-])pgrep\b[^\n]*?\s-[A-Za-z]*f")
+# A bare `pgrep` (NOT `wt_pgrep`): `pgrep -f` dies "illegal byte sequence" on
+# non-ASCII argv under a non-C locale and self-matches a monitor loop's own argv.
+# Every pgrep now has a wt_pgrep path, so no bare pgrep survives outside the lib.
+RAW_PGREP = re.compile(r"(?<![\w-])pgrep\b")
 # A bare `ps` (NOT `wt_ps_start_epoch`) reading the locale-formatted start time.
 RAW_PS_LSTART = re.compile(r"(?<![\w-])ps\b[^\n]*?-o\s+lstart")
 
@@ -64,9 +65,9 @@ def test_no_bare_process_probes_outside_the_helper_lib() -> None:
     for path in _control_plane_scripts():
         for lineno, raw in enumerate(path.read_text().splitlines(), start=1):
             code = _strip_comment(raw)
-            if RAW_PGREP_F.search(code):
+            if RAW_PGREP.search(code):
                 violations.append(
-                    f"{path.relative_to(REPO_ROOT)}:{lineno}: bare `pgrep -f` — use wt_pgrep"
+                    f"{path.relative_to(REPO_ROOT)}:{lineno}: bare `pgrep` — use wt_pgrep"
                 )
             if RAW_PS_LSTART.search(code):
                 violations.append(
