@@ -5139,6 +5139,53 @@ def test_afk_done_not_done_when_planner_prints_a_batch(tmp_path: Path) -> None:
     assert "RC=1" in result.stdout, result.stdout + result.stderr
 
 
+# ── F: a drain with only poisoned issues completes (issue #202 F) ──────────────
+# A dispatch-ceiling-skipped issue stays open+ready, so batch-plan keeps returning it and
+# afk_done never saw an empty batch — the drain idled forever instead of stopping. afk_done
+# now treats poisoned issues (hit the dispatch-failure ceiling, or carry a durable local
+# block record) as not-dispatchable, so a batch of only-poisoned issues counts as drained.
+
+
+def test_afk_done_done_when_only_a_dispatch_ceiling_issue_remains(tmp_path: Path) -> None:
+    bp = _planner_stub(tmp_path, exit_code=0, out="5\n")
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "dispatch-fail-5.count").write_text("3\n")  # hit AFK_DISPATCH_MAX_FAILURES
+    expr = 'inflight_issues() { :; }; afk_done drain 1700000000; echo "RC=$?"'
+
+    result = _call(expr, env={"BATCH_PLAN": str(bp), "AFK_STATE_DIR": str(statedir)})
+
+    assert "RC=0" in result.stdout, (
+        "a batch of only dispatch-ceiling-poisoned issues must count as drained: "
+        + result.stdout
+        + result.stderr
+    )
+
+
+def test_afk_done_done_when_only_a_locally_blocked_issue_remains(tmp_path: Path) -> None:
+    bp = _planner_stub(tmp_path, exit_code=0, out="5\n")
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "blocked-5.txt").write_text("needs a human\n")  # durable local block record
+    expr = 'inflight_issues() { :; }; afk_done drain 1700000000; echo "RC=$?"'
+
+    result = _call(expr, env={"BATCH_PLAN": str(bp), "AFK_STATE_DIR": str(statedir)})
+
+    assert "RC=0" in result.stdout, result.stdout + result.stderr
+
+
+def test_afk_done_not_done_when_a_healthy_issue_survives_the_poison_filter(tmp_path: Path) -> None:
+    bp = _planner_stub(tmp_path, exit_code=0, out="5\n6\n")  # 5 poisoned, 6 healthy
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "dispatch-fail-5.count").write_text("3\n")
+    expr = 'inflight_issues() { :; }; afk_done drain 1700000000; echo "RC=$?"'
+
+    result = _call(expr, env={"BATCH_PLAN": str(bp), "AFK_STATE_DIR": str(statedir)})
+
+    assert "RC=1" in result.stdout, "a healthy issue among poisoned ones keeps the drain going"
+
+
 # ── ST2: heartbeat-age hang detection + answer_pass heartbeat wrap ─────────────
 
 

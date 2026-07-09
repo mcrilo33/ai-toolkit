@@ -1278,11 +1278,23 @@ service_event_wake() {
   auto_land
 }
 
+# _afk_issue_poisoned <issue> -> true when an open+ready issue is NOT dispatchable this
+# window: it hit the dispatch-failure ceiling (a malformed issue / wedged infra dep) or it
+# carries a durable local block record. batch-plan keeps returning such an issue every tick,
+# so without discounting it afk_done never sees an empty batch and a drain with only poisoned
+# issues idles forever (#202 F).
+_afk_issue_poisoned() {
+  local issue="$1"
+  [ "$(_afk_read_dispatch_failures "$issue")" -ge "$(_afk_dispatch_max_failures)" ] && return 0
+  [ -f "$(_afk_blocked_record "$issue")" ] && return 0
+  return 1
+}
+
 # afk_done <state> <now> -> true when the supervisor should stop: the window was turned off
 # (no state), a clock-bound window expired, or the backlog is drained (the planner returns
-# an empty batch AND nothing is in flight).
+# no DISPATCHABLE issue AND nothing is in flight).
 afk_done() {
-  local state="$1" now="$2" bp inflight_count batch
+  local state="$1" now="$2" bp inflight_count batch tok remaining=""
   [ -n "$state" ] || return 0
   window_expired "$state" "$now" && return 0
   inflight_count="$(inflight_issues | grep -c '^[0-9]' || true)"
@@ -1296,7 +1308,14 @@ afk_done() {
     log "/afk: batch-plan.sh timed out or failed during the done-check — not declaring done (retry next tick)"
     return 1
   fi
-  [ -z "$(printf '%s' "$batch" | tr -d '[:space:]')" ]
+  # Discount poisoned issues (#202 F): a dispatch-ceiling-skipped / locally-blocked issue is
+  # not dispatchable, so a batch of only poisoned issues is a drained backlog, not live work.
+  for tok in $batch; do
+    case "$tok" in *[!0-9]*) remaining="$remaining $tok"; continue ;; esac   # non-issue token — keep
+    _afk_issue_poisoned "$tok" && continue
+    remaining="$remaining $tok"
+  done
+  [ -z "$(printf '%s' "$remaining" | tr -d '[:space:]')" ]
 }
 
 # --- watchdog (auto-restart a crashed supervisor, issue #107) ------------------
