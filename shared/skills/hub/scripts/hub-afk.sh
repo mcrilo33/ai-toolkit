@@ -157,6 +157,18 @@ _afk_kill_tree() {
   kill "-$sig" "$pid" 2>/dev/null || true
 }
 
+# _afk_descendant_pids <pid> -> every descendant pid of <pid> (recursively, one per line),
+# collected via `pgrep -P` (numeric parent, ASCII-safe). Snapshotted BEFORE a kill so a
+# SIGKILL escalation can still reach a TERM-ignoring child after the parent — and thus the
+# `pgrep -P` chain — is gone (#202 E review). Does not include <pid> itself.
+_afk_descendant_pids() {
+  local pid="$1" child
+  for child in $(LC_ALL=C pgrep -P "$pid" 2>/dev/null); do
+    printf '%s\n' "$child"
+    _afk_descendant_pids "$child"
+  done
+}
+
 # _afk_with_timeout <seconds> <cmd...> -> run <cmd...> bounded to <seconds>. The timeout
 # binary (with a `-k` SIGKILL grace) when installed; else a portable fallback: background
 # the command, a killer tree-kills it (TERM then KILL) on expiry, and we wait for it — so
@@ -586,6 +598,13 @@ resume_spoke() {
   fi
   _afk_mark_resumed "$issue"
   stamp_progress_epoch "$issue"   # a deliberate revival resets the reap ceiling (#133)
+  # Reset the IDLE clock too (#202 C review): recover_dead_panes resumes then reap_pass runs
+  # in the SAME tick, and _spoke_idle_seconds measures the STALE transcript mtime (the fresh
+  # window has not written yet) — not the progress epoch — so a resumed idle-crashed spoke
+  # would be re-reaped as "live pane, likely hung" and its just-restored work blocked. The
+  # answer-attempt epoch is the idle clock's exclusion, so stamping it reads the revived spoke
+  # busy until its new session writes a transcript.
+  stamp_answer_attempt "$issue"
   _afk_emit_span "$wt" afk-resume success
   return 0
 }
@@ -1062,7 +1081,7 @@ _afk_land_retry_max() {
 # APPROVE verdict — a REQUEST_CHANGES (the reviewer flagged gutting) or no review at all
 # escalates to blocked/<issue> instead.
 auto_land() {
-  local wt_land path issue verdict
+  local wt_land path issue verdict max tries land_log land_rc
   wt_land="$(_afk_find_script "${WT_LAND:-}" worktree-land.sh)" || { log "worktree-land.sh not found — skipping land"; return 0; }
   while IFS=$'\t' read -r path issue; do
     [ -n "$issue" ] || continue
@@ -1099,7 +1118,6 @@ auto_land() {
     # Capture the land's output to a per-issue log (#198): the old >/dev/null discarded exactly
     # what an operator needs when a land half-completes. mkdir so the log write can't fail on a
     # not-yet-created state dir. _afk_run_with_heartbeat returns worktree-land's exit code.
-    local land_log land_rc
     land_log="$(_afk_state_dir)/land-$issue.log"; mkdir -p "$(_afk_state_dir)" 2>/dev/null || true
     _afk_run_with_heartbeat bash "$wt_land" "$issue" --skip-tests >"$land_log" 2>&1; land_rc=$?
     if [ "$land_rc" -eq 0 ]; then
@@ -1419,7 +1437,7 @@ _afk_heartbeat_wedged() {
 # random recycled process. Set AFK_WEDGE_PID_MATCH= (empty) to skip the check.
 _afk_kill_wedged_supervisor() {
   if [ -n "${AFK_WEDGE_KILL_CMD:-}" ]; then bash -c "$AFK_WEDGE_KILL_CMD"; return 0; fi
-  local hb pid waited grace match cmdline
+  local hb pid waited grace match cmdline descendants p
   hb="$(afk_read_heartbeat)"; pid="${hb%% *}"
   case "$pid" in '' | *[!0-9]*) return 0 ;; esac
   match="${AFK_WEDGE_PID_MATCH-hub-afk}"
@@ -1430,13 +1448,23 @@ _afk_kill_wedged_supervisor() {
       *) log "  wedged-supervisor pid $pid is not a '$match' process (recycled?) — not killing"; return 0 ;;
     esac
   fi
+  # Snapshot the descendant tree BEFORE the TERM (#202 E review): the supervisor bash traps
+  # only USR1, so it dies promptly on TERM — after which its children reparent to init and
+  # `pgrep -P "$pid"` finds NOTHING, leaving a TERM-ignoring child (a wedged `claude`, the very
+  # target here) unreachable for the SIGKILL escalation. Capture the pids now so we can KILL
+  # any survivor by pid even after the parent is gone.
+  descendants="$(_afk_descendant_pids "$pid")"
   _afk_kill_tree "$pid" TERM   # the supervisor + its hung children, leaf-first
   grace="${AFK_WEDGE_KILL_GRACE:-3}"; case "$grace" in '' | *[!0-9]*) grace=3 ;; esac
   waited=0
   while [ "$waited" -lt "$grace" ] && kill -0 "$pid" 2>/dev/null; do
     sleep 1 2>/dev/null || true; waited=$(( waited + 1 ))
   done
-  kill -0 "$pid" 2>/dev/null && _afk_kill_tree "$pid" KILL   # ignored TERM — SIGKILL the whole tree
+  # SIGKILL any survivor from the pre-TERM snapshot (the root, or a descendant that ignored
+  # TERM) — by pid, so a child that outlived its reparented-away parent still dies.
+  for p in $pid $descendants; do
+    kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null || true
+  done
   return 0
 }
 
@@ -2005,9 +2033,14 @@ main() {
     if afk_done "$(afk_read_state)" "$(afk_now)"; then
       log "/afk: done"; _afk_emit_drain_complete; afk_clear_state; break
     fi
-    # Skip the wait when a signal already arrived (during the pass) so the pending event is
-    # serviced immediately rather than after another full interval.
-    [ "$_AFK_WOKEN" -eq 1 ] || afk_interruptible_sleep "$AFK_TICK_SECONDS"
+    # Stamp AFTER the tick's work — including afk_done's up-to-AFK_PLANNER_TIMEOUT planner call,
+    # which runs unstamped — so the epoch is fresh going into the idle sleep and a healthy idle
+    # drain reads `idle` (age ≤ tick), never a false STALLED (#202 B review). Skip the wait when
+    # a signal already arrived (during the pass) so the pending event is serviced immediately.
+    if [ "$_AFK_WOKEN" -ne 1 ]; then
+      afk_write_heartbeat
+      afk_interruptible_sleep "$AFK_TICK_SECONDS"
+    fi
   done
   return 0
 }

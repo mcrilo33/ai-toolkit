@@ -4781,6 +4781,72 @@ def test_recover_dead_panes_blocks_clean_dead_pane_after_one_redispatch(tmp_path
     assert not redispatch.exists(), "re-dispatch is bounded to once per window"
 
 
+def _stateful_reaper_tmux(tmp_path: Path) -> tuple[Path, Path]:
+    """A tmux stub whose pane starts DEAD (list-panes empty) and goes ALIVE when a resume opens
+    a window: `new-window -c <path>` records <path> as the live pane. Models the exact
+    crash->resume transition the #202 C review flagged (recover resumes, reap_pass runs next)."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    log = tmp_path / "tmux.log"
+    panes = tmp_path / "panes.txt"
+    panes.write_text("")  # pane dead initially
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> "{log}"\n'
+        f'if [ "$1" = list-panes ]; then cat "{panes}"; fi\n'
+        'if [ "$1" = new-window ]; then p=""; while [ "$#" -gt 0 ]; do '
+        f'if [ "$1" = -c ]; then p="$2"; fi; shift; done; printf "afk:1\\t%s\\n" "$p" > "{panes}"; fi\n'
+        "exit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    return fake_bin, log
+
+
+def test_recover_then_reap_does_not_block_a_just_resumed_idle_spoke(tmp_path: Path) -> None:
+    # #202 C review regression: recover_dead_panes resumes a dead-pane spoke whose transcript is
+    # IDLE-stale, then reap_pass runs the SAME tick with the pane now alive. Without resetting the
+    # idle clock on resume, reap_pass reads "idle + live pane" and BLOCKS the just-restored work.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, tmux_log = _stateful_reaper_tmux(tmp_path)
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke)
+    _write_transcript(
+        pd, [{"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}}]
+    )
+    os.utime(pd / "session.jsonl", (1_000_000, 1_000_000))  # ancient ⇒ idle
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
+    (spoke / ".ai-toolkit" / "spoke-run-id").write_text("feature/5-x+1700000000\n")
+
+    expr = f'inflight_worktrees() {{ printf "{spoke}\\t5\\n"; }}; recover_dead_panes; reap_pass'
+    result = _call(
+        expr,
+        env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "SPOKE_READY": str(ready_stub),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_DEFAULT_BRANCH": "main",
+            "AFK_IDLE_MINUTES": "0",  # any idle reads reap — proves the resume reset the clock
+            "AFK_NOW": "1700000000",
+            "AFK_AUTH_PROBE_CMD": "true",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "new-window" in tmux_log.read_text(), (
+        "the crashed spoke is resumed by recover_dead_panes"
+    )
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "the same tick's reap_pass must NOT block a just-resumed spoke (#202 C review)"
+    )
+
+
 def test_recover_dead_panes_over_ceiling_blocks_despite_commits(tmp_path: Path) -> None:
     # An over-ceiling runaway always blocks (as reap_pass does) — recovery never resumes it,
     # so it isn't revived here only to be blocked by reap_pass in the same tick.
@@ -5474,6 +5540,35 @@ def test_kill_wedged_supervisor_kills_the_whole_hung_tree(tmp_path: Path) -> Non
 
     assert "PARENT_DEAD" in result.stdout, "the wedged supervisor pid must be killed"
     assert "CHILD_DEAD" in result.stdout, "the hung child must die with the supervisor (#202 E)"
+
+
+def test_kill_wedged_supervisor_sigkills_a_term_ignoring_child(tmp_path: Path) -> None:
+    # #202 E review: the supervisor dies promptly on TERM, so a child that IGNORES TERM (a
+    # wedged claude) would be orphaned and unreachable for the escalation once pgrep -P can no
+    # longer find it. The pre-TERM descendant snapshot must let the SIGKILL reach it by pid.
+    hb = tmp_path / "heartbeat"
+    childf = tmp_path / "childpid"
+    wedged = tmp_path / "wedged.sh"
+    # The child traps (ignores) TERM and only dies on KILL; the parent (default disposition)
+    # dies on TERM, so after the grace the child survives only via the pid snapshot.
+    wedged.write_text(
+        f'#!/usr/bin/env bash\nbash -c \'trap "" TERM; echo $$ > "{childf}"; sleep 300\' &\nsleep 300\n'
+    )
+    wedged.chmod(0o755)
+    expr = (
+        f"bash -c 'exec -a hub-afk-wedged bash \"{wedged}\"' & wedged=$!; "
+        f'for _ in $(seq 1 50); do [ -s "{childf}" ] && break; sleep 0.1; done; '
+        f'printf "%s 1000\\n" "$wedged" > "{hb}"; '
+        "_afk_kill_wedged_supervisor; "
+        f'child=$(cat "{childf}"); kill -0 "$child" 2>/dev/null && echo CHILD_ALIVE || echo CHILD_DEAD; '
+        'kill -9 "$wedged" "$child" 2>/dev/null || true'
+    )
+
+    result = _call(expr, env={"AFK_HEARTBEAT": str(hb), "AFK_WEDGE_KILL_GRACE": "1"})
+
+    assert "CHILD_DEAD" in result.stdout, (
+        "a TERM-ignoring child must be SIGKILLed via the pre-TERM snapshot (#202 E review)"
+    )
 
 
 def test_kill_wedged_supervisor_spares_a_recycled_pid(tmp_path: Path) -> None:
