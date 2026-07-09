@@ -350,3 +350,23 @@ parent-span-export:
   matcher: Bash
   description: "Record the Bash tool_use_id to .ai-toolkit/parent-span so scripts and native git-hooks emit telemetry spans with the causal parent_id; no command rewrite; no-op when telemetry is off"
   tier: 2
+
+# cycle-step-mark (issue #178): derive the solo-cycle step markers from the
+# mechanical witness of each transition instead of LLM narration — a git commit's
+# HEAD message (Tested-RED -> red, else green), a branch push that advanced
+# @{upstream} (-> push), and a new .review/<hash>.json artifact (-> review). All
+# emission routes through the idempotent telemetry_mark_cycle_step, so it dedupes
+# per (phase, HEAD) with the #139 gate emitters (review-stamp-guard, spoke-push.sh)
+# and fills the gaps they miss (RED/GREEN had no marker; an Agent-tool code-review
+# never hits the review-stamp MCP; a mid-cycle/quick-lane push never runs
+# spoke-push.sh). Like spoke-main-guard it spans two tool types (Bash for
+# commit/push, Write for the .review artifact), so it carries NO `if` and the script
+# self-filters. Claude-only + telemetry-only: the spokecycle trace is a Claude Code
+# concept, so — like afk-notify-wake — the event lives in the claude block and
+# Copilot/Cursor stay unwired (review-stamp-guard already owns Cursor's review path).
+cycle-step-mark:
+  description: "Derive solo-cycle step markers (red/green/review/push) from commit/push/review witnesses on PostToolUse; telemetry-only, idempotent per (phase, HEAD)"
+  tier: 3
+  claude:
+    event: postToolUse
+    matcher: "Bash|Write"
