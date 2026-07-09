@@ -2791,6 +2791,109 @@ def test_run_with_heartbeat_propagates_exit_code(tmp_path: Path) -> None:
     )
 
 
+# ── honest liveness: bounded stamping + orphan-safe stamper (issue #202 B) ─────
+# A land/answer that HANGS keeps its child alive, so the old "stamp while the child runs"
+# kept the heartbeat fresh forever and defeated the stale-tick watchdog. Stamping is now
+# bounded to AFK_PHASE_MAX_SECONDS so a hung phase ages the epoch. The fg stamper also stamps
+# the SUPERVISOR's pid (passed explicitly) and dies the moment the supervisor does, so a
+# reparented orphan can't keep a dead supervisor's heartbeat fresh or race a respawn.
+
+
+def test_write_heartbeat_pid_stamps_the_given_pid(tmp_path: Path) -> None:
+    hb = tmp_path / "heartbeat"
+    result = _call(
+        f'afk_write_heartbeat_pid 4242; cat "{hb}"',
+        env={"AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000000"},
+    )
+    assert result.stdout.strip() == "4242 1700000000", (
+        "the stamper must record the pid it is handed"
+    )
+
+
+def test_heartbeat_stamper_stamps_parent_pid_then_stops_at_cap(tmp_path: Path) -> None:
+    # A cap of 1 with a 1s interval ⇒ stamp exactly once (elapsed 0 < 1), then stop (1 >= 1):
+    # deterministic, and it proves the pid recorded is the PARENT pid ($$, alive) we hand it.
+    hb = tmp_path / "heartbeat"
+    log = tmp_path / "stamps.log"
+    expr = (
+        f'afk_write_heartbeat_pid() {{ printf "%s\\n" "$1" >> "{log}"; }}; '
+        f'printf "PPID=%s\\n" "$$"; _afk_heartbeat_stamper "$$"'
+    )
+    result = _call(
+        expr,
+        env={
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_PHASE_MAX_SECONDS": "1",
+            "AFK_LAND_HEARTBEAT_SECONDS": "1",
+        },
+    )
+    ppid = next(ln[len("PPID=") :] for ln in result.stdout.splitlines() if ln.startswith("PPID="))
+    assert log.read_text().split() == [ppid], "bounded to one stamp, carrying the parent pid"
+
+
+def test_heartbeat_stamper_stops_immediately_when_parent_dead(tmp_path: Path) -> None:
+    # A dead parent pid ⇒ the orphan guard exits before any stamp (a stamper that outlived a
+    # killed supervisor must not keep its heartbeat fresh / race the respawn).
+    log = tmp_path / "stamps.log"
+    expr = (
+        f'afk_write_heartbeat_pid() {{ printf "x\\n" >> "{log}"; }}; '
+        f'dead=$(sh -c "echo \\$$"); _afk_heartbeat_stamper "$dead"'
+    )
+    _call(expr, env={"AFK_PHASE_MAX_SECONDS": "0", "AFK_LAND_HEARTBEAT_SECONDS": "1"})
+    assert not log.exists(), "a dead supervisor parent ⇒ no stamps (orphan guard)"
+
+
+def test_run_with_heartbeat_bounded_stops_stamping_a_hung_phase(tmp_path: Path) -> None:
+    # With AFK_PHASE_MAX_SECONDS=1 and interval=1, only the FIRST iteration stamps (elapsed 0
+    # < 1); every later iteration of a still-running phase is skipped, so a 2s command yields
+    # exactly one in-loop stamp + one completion stamp = 2 (a hung phase would just stop aging).
+    hb = tmp_path / "heartbeat"
+    log = tmp_path / "stamps.log"
+    expr = f'afk_write_heartbeat() {{ printf "x\\n" >> "{log}"; }}; _afk_run_with_heartbeat sleep 2'
+    _call(
+        expr,
+        env={
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_PHASE_MAX_SECONDS": "1",
+            "AFK_LAND_HEARTBEAT_SECONDS": "1",
+        },
+    )
+    assert log.read_text().count("x") == 2, (
+        "a capped phase stamps once in-loop + once on completion"
+    )
+
+
+def test_run_with_heartbeat_fg_propagates_exit_and_stamps(tmp_path: Path) -> None:
+    hb = tmp_path / "heartbeat"
+    result = _call(
+        f'_afk_run_with_heartbeat_fg bash -c "exit 5"; echo RC=$?; cat "{hb}"',
+        env={"AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000000", "AFK_LAND_HEARTBEAT_SECONDS": "1"},
+    )
+    assert "RC=5" in result.stdout, "the fg variant must propagate the command's exit code"
+    assert "1700000000" in result.stdout, "and stamp a final heartbeat on completion"
+
+
+def test_no_arg_resume_refuses_when_a_supervisor_is_live(tmp_path: Path) -> None:
+    # A no-arg resume (a watchdog respawn or a manual re-run) must refuse when a supervisor is
+    # already live — a second one clobbers the per-run state (#202 B).
+    state = _armed_state(tmp_path, "drain")
+    hb = tmp_path / "heartbeat"
+    expr = f'printf "%s 1700000000\\n" "$$" > "{hb}"; main'
+
+    result = _call(
+        expr,
+        env={
+            "AFK_STATE": str(state),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_NOW": "1700000060",
+            "AFK_ARM_PRECHECK": "1",
+        },
+    )
+
+    assert result.returncode == 2, "a live supervisor must refuse a stacked no-arg resume"
+    assert "refusing to resume" in result.stderr, result.stderr
+
+
 def test_auto_land_keeps_heartbeat_fresh_during_slow_land(spoke_repo: Path, tmp_path: Path) -> None:
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
     _seed_clean_review(spoke_repo)
@@ -3215,8 +3318,8 @@ def _armed_state(tmp_path: Path, value: str) -> Path:
     return state
 
 
-def test_status_reports_stale_when_supervisor_dead(tmp_path: Path) -> None:
-    # Window armed (drain) but the heartbeat pid is gone ⇒ STALE, never `draining`.
+def test_status_reports_drain_dead_when_supervisor_dead(tmp_path: Path) -> None:
+    # Window armed (drain) but the heartbeat pid is gone ⇒ DRAIN DEAD, never `draining` (#202 B).
     state = _armed_state(tmp_path, "drain")
     hb = tmp_path / "heartbeat"
     expr = f'dead=$(sh -c "echo \\$$"); printf "%s 1700000000\\n" "$dead" > "{hb}"; _status'
@@ -3231,13 +3334,13 @@ def test_status_reports_stale_when_supervisor_dead(tmp_path: Path) -> None:
         },
     )
 
-    assert "STALE" in result.stdout
+    assert "DRAIN DEAD" in result.stdout
     assert "10m ago" in result.stdout  # 600s since the last tick
     assert "draining" not in result.stdout, "a dead supervisor must not report `draining` (#107)"
 
 
-def test_status_reports_stale_when_no_heartbeat(tmp_path: Path) -> None:
-    # Window armed but the supervisor never wrote a heartbeat ⇒ STALE, not `on`/`draining`.
+def test_status_reports_drain_dead_when_no_heartbeat(tmp_path: Path) -> None:
+    # Window armed but the supervisor never wrote a heartbeat ⇒ DRAIN DEAD, not `on`/`draining`.
     state = _armed_state(tmp_path, "drain")
     hb = tmp_path / "nope"
 
@@ -3251,12 +3354,12 @@ def test_status_reports_stale_when_no_heartbeat(tmp_path: Path) -> None:
         },
     )
 
-    assert "STALE" in result.stdout
+    assert "DRAIN DEAD" in result.stdout
     assert "draining" not in result.stdout
 
 
-def test_status_reports_stale_for_dead_clock_bound_window(tmp_path: Path) -> None:
-    # A clock-bound window still ahead, but the supervisor pid is gone ⇒ STALE, not the
+def test_status_reports_drain_dead_for_dead_clock_bound_window(tmp_path: Path) -> None:
+    # A clock-bound window still ahead, but the supervisor pid is gone ⇒ DRAIN DEAD, not the
     # "Nm remaining" line the state file alone would print.
     state = _armed_state(tmp_path, "1700003600")  # 1h after AFK_NOW
     hb = tmp_path / "heartbeat"
@@ -3272,15 +3375,71 @@ def test_status_reports_stale_for_dead_clock_bound_window(tmp_path: Path) -> Non
         },
     )
 
-    assert "STALE" in result.stdout
+    assert "DRAIN DEAD" in result.stdout
     assert "remaining" not in result.stdout
 
 
-def test_status_still_draining_when_supervisor_live(tmp_path: Path) -> None:
-    # Window armed AND a live heartbeat pid ($$) ⇒ the normal `draining` line, no STALE.
+def test_status_reports_stalled_when_pid_alive_but_no_progress(tmp_path: Path) -> None:
+    # Pid alive but the heartbeat epoch is older than a tick + grace ⇒ STALLED (wedged on a
+    # hung call), distinct from an idle drain — the misdiagnosis this pass exists to end (#202 B).
     state = _armed_state(tmp_path, "drain")
     hb = tmp_path / "heartbeat"
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "last-action").write_text("land #7\n")
     expr = f'printf "%s 1700000000\\n" "$$" > "{hb}"; _status'
+
+    result = _call(
+        expr,
+        env={
+            "AFK_STATE": str(state),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_NOW": "1700000700",  # 700s stale, > AFK_TICK_SECONDS (300) + grace
+            "AI_TOOLKIT_OTEL": "0",
+        },
+    )
+
+    assert "STALLED" in result.stdout
+    assert "no progress" in result.stdout
+    assert "land #7" in result.stdout, "STALLED must surface the last action for triage"
+    assert "DRAIN DEAD" not in result.stdout
+
+
+def test_status_reports_idle_with_next_tick_and_last_action(tmp_path: Path) -> None:
+    # Live pid with a recent heartbeat ⇒ idle-but-healthy: the drain line names the next tick
+    # and the last action so an operator sees it is alive, not hung (#202 B).
+    state = _armed_state(tmp_path, "drain")
+    hb = tmp_path / "heartbeat"
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "last-action").write_text("dispatch #12\n")
+    expr = f'printf "%s 1700000560\\n" "$$" > "{hb}"; _status'
+
+    result = _call(
+        expr,
+        env={
+            "AFK_STATE": str(state),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_NOW": "1700000600",  # 40s stale ⇒ idle
+            "AI_TOOLKIT_OTEL": "0",
+        },
+    )
+
+    assert "draining" in result.stdout
+    assert "idle" in result.stdout
+    assert "next tick in" in result.stdout
+    assert "dispatch #12" in result.stdout
+    assert "STALLED" not in result.stdout and "DRAIN DEAD" not in result.stdout
+
+
+def test_status_still_draining_when_supervisor_live(tmp_path: Path) -> None:
+    # Window armed AND a live heartbeat pid ($$) with a recent epoch ⇒ the idle-draining
+    # line, never DRAIN DEAD / STALLED.
+    state = _armed_state(tmp_path, "drain")
+    hb = tmp_path / "heartbeat"
+    expr = f'printf "%s 1700000560\\n" "$$" > "{hb}"; _status'
 
     result = _call(
         expr,
@@ -3292,7 +3451,7 @@ def test_status_still_draining_when_supervisor_live(tmp_path: Path) -> None:
         },
     )
 
-    assert "STALE" not in result.stdout
+    assert "DRAIN DEAD" not in result.stdout and "STALLED" not in result.stdout
     assert "draining" in result.stdout
 
 
@@ -3812,8 +3971,9 @@ def _run_status_with_telemetry(
     otel_line = "unset AI_TOOLKIT_OTEL" if otel is None else f"export AI_TOOLKIT_OTEL={otel}"
     auth_line = "export LANGFUSE_BASIC_AUTH=Basic-xyz" if auth else "unset LANGFUSE_BASIC_AUTH"
     prelude = _telemetry_prelude(up_dir, collector_up=collector_up, bridge_up=bridge_up)
-    # A live heartbeat pid ($$) keeps the window out of the STALE branch.
-    expr = f'{otel_line}; {auth_line}; {prelude}; printf "%s 1700000000\\n" "$$" > "{hb}"; _status'
+    # A live heartbeat pid ($$) with a RECENT epoch (age 40s < the idle limit) keeps the
+    # window in the healthy idle-draining branch, not DRAIN DEAD or STALLED (#202 B).
+    expr = f'{otel_line}; {auth_line}; {prelude}; printf "%s 1700000560\\n" "$$" > "{hb}"; _status'
     return _call(
         expr,
         env={

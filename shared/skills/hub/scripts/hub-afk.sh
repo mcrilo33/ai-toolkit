@@ -49,6 +49,11 @@
 #   AFK_PLANNER_TIMEOUT=120      seconds bounding each batch-plan.sh call (#170)
 #   AFK_GH_TIMEOUT=30            seconds bounding each gh call (scope resolve, arm auth) (#170)
 #   AFK_TIMEOUT_KILL_AFTER=10    SIGKILL grace after SIGTERM when a bounded call expires (#170)
+#   AFK_PHASE_MAX_SECONDS=900    cap on one phase's heartbeat stamping — a land/answer that
+#                                runs past this is HUNG, so stamping stops and the epoch ages
+#                                so the watchdog respawns the wedged tree (#202 B); 0 disables
+#   AFK_LAND_RETRY_MAX=1         retries of a stranded ready+blocked land before a visible
+#                                escalation, per issue per window (#202 D)
 #   AFK_STALE_TICKS=4            heartbeat age (x AFK_TICK_SECONDS) that flags a wedged supervisor
 #                                — scaled to the 300s tick so the wedge threshold stays ~20min
 #                                (4x300s), not the ~50min a 120s-era default of 10 would stretch to
@@ -64,7 +69,7 @@
 #   hub-afk.sh until <HH:MM>     # drain until the next HH:MM, then stop
 #   hub-afk.sh drain             # drain until the backlog is empty + nothing in flight
 #   hub-afk.sh --remote          # launch a detached `drain` on a configured always-on Mac
-#   hub-afk.sh --status          # report the active window, "off", or "STALE" (crashed)
+#   hub-afk.sh --status          # report the window: off / draining-idle / STALLED / DRAIN DEAD
 #   hub-afk.sh --off             # stop the supervisor + watchdog (clears the state file)
 #   hub-afk.sh --reconcile       # re-arm an armed-but-crashed drain (idempotent resume);
 #                                #   run at hub session start after a process/machine restart
@@ -303,9 +308,29 @@ afk_heartbeat_file() {
   local common; common="$(git rev-parse --git-common-dir 2>/dev/null)" || common=".git"
   printf '%s\n' "$common/.afk-heartbeat"
 }
-afk_write_heartbeat() { printf '%s %s\n' "$$" "$(afk_now)" > "$(afk_heartbeat_file)" 2>/dev/null || true; }
+# afk_write_heartbeat_pid <pid> -> stamp "<pid> <now>". A backgrounded stamper subshell must
+# record the SUPERVISOR's pid (its parent), not its own (#202 B), so the pid stays the truth
+# afk_supervisor_state cross-checks; afk_write_heartbeat is the common "stamp my own pid" case.
+afk_write_heartbeat_pid() { printf '%s %s\n' "$1" "$(afk_now)" > "$(afk_heartbeat_file)" 2>/dev/null || true; }
+afk_write_heartbeat() { afk_write_heartbeat_pid "$$"; }
 afk_read_heartbeat()  { local f; f="$(afk_heartbeat_file)"; [ -f "$f" ] && head -n1 "$f" 2>/dev/null || true; }
 afk_clear_heartbeat() { rm -f "$(afk_heartbeat_file)" 2>/dev/null || true; }
+
+# --- last-action record (issue #202 B) ----------------------------------------
+# A one-line label of the supervisor's most recent MEANINGFUL action (dispatch/answer/land/
+# reap/resume #N), stamped at each pass boundary and surfaced by --status as "(last action …)"
+# so an operator can tell idle-but-healthy from wedged at a glance without a process-tree
+# autopsy. Best-effort; never aborts a tick. Cleared on a fresh arm.
+_afk_last_action_file() {
+  if [ -n "${AFK_LAST_ACTION:-}" ]; then printf '%s\n' "$AFK_LAST_ACTION"; return; fi
+  printf '%s\n' "$(_afk_state_dir)/last-action"
+}
+_afk_set_last_action() {
+  local dir; dir="$(_afk_state_dir)"; mkdir -p "$dir" 2>/dev/null || true
+  printf '%s\n' "$1" > "$(_afk_last_action_file)" 2>/dev/null || true
+}
+_afk_read_last_action() { local f; f="$(_afk_last_action_file)"; [ -f "$f" ] && head -n1 "$f" 2>/dev/null || true; }
+_afk_clear_last_action() { rm -f "$(_afk_last_action_file)" 2>/dev/null || true; }
 
 # _afk_pid_alive <pid> -> true when <pid> is a live process. An empty / non-numeric pid is
 # never alive (guards `kill` against a bareword and a truncated partial heartbeat).
@@ -350,6 +375,7 @@ _kill_spoke_window() {
 reap_spoke() {
   local wt="$1" issue="$2" reason="$3"
   log "→ reap #$issue: $reason"
+  _afk_set_last_action "reap #$issue"
   _kill_spoke_window "$issue"
   _escalate_blocked "$wt" "$issue" "$reason"
 }
@@ -515,6 +541,7 @@ _afk_open_spoke_window() {
 resume_spoke() {
   local wt="$1" issue="$2"
   log "→ resume #$issue: pane crashed with work intact — re-adopting once"
+  _afk_set_last_action "resume #$issue"
   if ! _afk_open_spoke_window "$wt" "$issue" "$(_afk_resume_command "$wt" "$issue")"; then
     log "  could not open a resume window for #$issue"
     return 1
@@ -771,6 +798,7 @@ dispatch_batch() {
     # isn't hit by several first-push full suites at the same instant.
     [ "$spawned" -gt 0 ] && [ "$stagger" -gt 0 ] && sleep "$stagger" 2>/dev/null || true
     log "→ dispatch #$n"
+    _afk_set_last_action "dispatch #$n"
     # --mode afk stamps the spoke's trace as drain-driven (#102); a hand-dispatched
     # spoke defaults to attended in worktree-new.sh.
     if bash "$wt_new" "$n" --type feature --mode afk --prompt "$(kickoff_for "$n")"; then
@@ -791,22 +819,54 @@ dispatch_batch() {
 
 # --- auto-land + reap passes --------------------------------------------------
 
-# _afk_run_with_heartbeat <cmd...> -> run <cmd...> while stamping the heartbeat every
-# AFK_LAND_HEARTBEAT_SECONDS (default 30), so the heartbeat EPOCH stays honest through
-# the longest tick phase (auto-land's 6-10min suite) instead of freezing at tick top
-# (#133 item 4). Honest scope (ST4 review): afk_supervisor_state is currently
-# pid-based, so a stale epoch alone cannot flip --status to STALE or trigger a
-# watchdog respawn today — this keeps the epoch trustworthy for the operator-facing
-# age display and for the #107 UPGRADE (a tick-recency check), which must not
-# misread a live land as a dead supervisor when it lands.
+# The heartbeat must reflect PROGRESS, not merely child existence (#202 B): a land/answer
+# that HANGS keeps its child alive, so stamping "while the child runs" kept the epoch fresh
+# forever and defeated the stale-tick watchdog. So a single phase's stamping is BOUNDED to
+# AFK_PHASE_MAX_SECONDS (a generous multiple of any legit phase); once a phase runs past it,
+# stamping stops so the epoch ages, --status reads STALLED, and the watchdog respawns the
+# wedged tree. A phase that COMPLETES always gets a final stamp (completion IS progress), so
+# a merely slow-but-finishing land never triggers a false respawn. 0 disables the cap.
+: "${AFK_PHASE_MAX_SECONDS:=900}"
+_afk_phase_max_seconds() {
+  local s="${AFK_PHASE_MAX_SECONDS:-900}"
+  case "$s" in '' | *[!0-9]*) s=900 ;; esac
+  printf '%s\n' "$s"
+}
+
+# _afk_heartbeat_stamper <ppid> -> the backgrounded stamp loop shared by the fg runner: every
+# AFK_LAND_HEARTBEAT_SECONDS stamp the SUPERVISOR's pid (<ppid>, passed explicitly so a
+# reparented orphan can't stamp the wrong pid), until the supervisor dies (orphan guard —
+# `kill -0 <ppid>` fails once the parent is gone, so a stamper that outlived a killed
+# supervisor stops instead of racing the respawn with a dead pid) or the phase runs past the
+# AFK_PHASE_MAX_SECONDS cap (the hang surfaces). Returns when either bound is hit.
+_afk_heartbeat_stamper() {
+  local ppid="$1" interval maxs elapsed=0
+  interval="${AFK_LAND_HEARTBEAT_SECONDS:-30}"; case "$interval" in '' | *[!0-9]* | 0) interval=30 ;; esac
+  maxs="$(_afk_phase_max_seconds)"
+  while :; do
+    kill -0 "$ppid" 2>/dev/null || return 0                     # supervisor gone — stop (orphan guard)
+    { [ "$maxs" -ne 0 ] && [ "$elapsed" -ge "$maxs" ]; } && return 0   # phase hung — stop stamping
+    afk_write_heartbeat_pid "$ppid"
+    sleep "$interval" 2>/dev/null || true
+    elapsed=$(( elapsed + interval ))
+  done
+}
+
+# _afk_run_with_heartbeat <cmd...> -> run <cmd...> (backgrounded) while stamping the heartbeat
+# every AFK_LAND_HEARTBEAT_SECONDS, so the epoch stays honest through the longest tick phase
+# (#133 item 4) — but BOUNDED to AFK_PHASE_MAX_SECONDS so a hung child surfaces (#202 B). The
+# stamp loop runs in THIS shell, so a killed supervisor stops stamping outright (no orphan).
 # Returns the command's exit code (a failed land must still escalate).
 _afk_run_with_heartbeat() {
-  local child rc slept interval="${AFK_LAND_HEARTBEAT_SECONDS:-30}"
+  local child rc slept elapsed=0 interval="${AFK_LAND_HEARTBEAT_SECONDS:-30}" maxs
   case "$interval" in '' | *[!0-9]* | 0) interval=30 ;; esac
+  maxs="$(_afk_phase_max_seconds)"
   "$@" &
   child=$!
   while kill -0 "$child" 2>/dev/null; do
-    afk_write_heartbeat
+    # Stamp PROGRESS, not child-existence: stop refreshing once the phase runs past the cap
+    # so a hung land ages the epoch and the watchdog respawns the tree (#202 B).
+    { [ "$maxs" -eq 0 ] || [ "$elapsed" -lt "$maxs" ]; } && afk_write_heartbeat
     # Re-check the child every second within the stamp interval — a full-interval
     # sleep would hold the tick up to AFK_LAND_HEARTBEAT_SECONDS after a fast land.
     slept=0
@@ -814,31 +874,27 @@ _afk_run_with_heartbeat() {
       sleep 1 2>/dev/null || true
       slept=$(( slept + 1 ))
     done
+    elapsed=$(( elapsed + slept ))
   done
   wait "$child"; rc=$?
-  afk_write_heartbeat
+  afk_write_heartbeat   # the child COMPLETED — progress — so always stamp (a slow-but-done land is not wedged)
   return "$rc"
 }
 
-# _afk_run_with_heartbeat_fg <cmd...> -> the same keep-the-heartbeat-fresh guarantee as
-# _afk_run_with_heartbeat, but for a command that must run in the CURRENT shell because it
-# sets a variable the caller reads. answer_pass's decide_and_act raises the process-global
-# _AFK_AUTH_FAILED on a dead subscription token, and that assignment only propagates when
-# it runs in the loop's own shell — backgrounding it (as _afk_run_with_heartbeat does the
-# land) would lose it in the subshell. So here it is the STAMPER that is backgrounded: a
-# child loop stamps the heartbeat every AFK_LAND_HEARTBEAT_SECONDS (`$$` in a subshell is
-# still the supervisor's pid) while <cmd...> runs foreground, so a legitimately long
-# answerer keeps the heartbeat epoch honest and never reads as wedged (#170 ST2).
+# _afk_run_with_heartbeat_fg <cmd...> -> the same guarantee as _afk_run_with_heartbeat, but
+# for a command that must run in the CURRENT shell because it sets a variable the caller reads
+# (answer_pass's decide_and_act raises the process-global _AFK_AUTH_FAILED; backgrounding it
+# would lose the assignment in a subshell). So the STAMPER is backgrounded instead
+# (_afk_heartbeat_stamper), carrying the supervisor's pid + the orphan/phase-cap guards.
 # Returns the command's exit code.
 _afk_run_with_heartbeat_fg() {
-  local stamper rc interval="${AFK_LAND_HEARTBEAT_SECONDS:-30}"
-  case "$interval" in '' | *[!0-9]* | 0) interval=30 ;; esac
-  ( while :; do afk_write_heartbeat; sleep "$interval" 2>/dev/null || true; done ) &
+  local stamper rc
+  _afk_heartbeat_stamper "$$" &
   stamper=$!
   "$@"; rc=$?
   kill "$stamper" 2>/dev/null || true
   wait "$stamper" 2>/dev/null || true
-  afk_write_heartbeat
+  afk_write_heartbeat   # the command returned — progress — stamp the supervisor's pid
   return "$rc"
 }
 
@@ -995,6 +1051,7 @@ auto_land() {
       fi
     fi
     log "→ land #$issue"
+    _afk_set_last_action "land #$issue"
     if _afk_run_with_heartbeat bash "$wt_land" "$issue" --skip-tests >/dev/null 2>&1; then
       log "  landed #$issue"
       _afk_clear_land_retries "$issue"   # a successful land resets the retry budget (#202 D)
@@ -1014,8 +1071,10 @@ answer_pass() {
     # that can run for minutes) so a legitimately long answer never trips the wedged-
     # supervisor respawn (#170 ST2). The foreground variant preserves decide_and_act's
     # _AFK_AUTH_FAILED assignment (a backgrounded command would lose it in its subshell).
-    [ "$(slot_state "$path" "$issue")" = "waiting" ] \
-      && _afk_run_with_heartbeat_fg decide_and_act "$path" "$issue"
+    if [ "$(slot_state "$path" "$issue")" = "waiting" ]; then
+      _afk_set_last_action "answer #$issue"
+      _afk_run_with_heartbeat_fg decide_and_act "$path" "$issue"
+    fi
   done < <(inflight_worktrees)
 }
 # _afk_auth_is_dead -> true when a bounded headless `claude` no-op reports an auth failure:
@@ -1687,22 +1746,49 @@ afk_arm_preconditions() {
 
 # --- CLI ----------------------------------------------------------------------
 
-# _afk_status_state_line <state> <now> -> echo the window's state line: STALE (#107) when
-# the supervisor pid is gone, else draining / window-elapsed / "Nm remaining".
+# _afk_status_state_line <state> <now> -> echo the window's state line, distinguishing the
+# three cases an operator kept confusing at a glance (#202 B), so idle-vs-hung is a read, not
+# a process-tree autopsy:
+#   DRAIN DEAD — armed but the supervisor pid is gone (crashed); the watchdog respawns it.
+#   STALLED    — pid alive but the heartbeat epoch is older than a tick+grace: wedged on a
+#                hung call, not working (bounded stamping stops refreshing a hung phase).
+#   draining/on — idle: the heartbeat is recent (a plain tick sleep); report the next tick +
+#                the last action so a healthy idle drain is obviously alive.
+# The idle vs STALLED boundary is AFK_TICK_SECONDS + one stamp interval of grace: a healthy
+# supervisor stamps at least every tick (and every ~30s through a long phase), so a heartbeat
+# older than that means it is not ticking. A drain with no parseable heartbeat epoch (rare)
+# falls back to the plain draining/remaining line.
 _afk_status_state_line() {
-  local state="$1" now="$2" rem age
-  # Cross-check the heartbeat before trusting the state file: a window armed in
-  # .afk-state but no live supervisor pid means the process crashed and the state file
-  # is lying (#107). Report STALE rather than echoing `draining` / `Nm remaining`.
+  local state="$1" now="$2" rem age hb tick idle_limit nxt last
   if [ "$(afk_supervisor_state)" = "stale" ]; then
     age="$(_afk_heartbeat_age_minutes)"
     if [ -n "$age" ]; then
-      echo "/afk: STALE — last tick ${age}m ago, supervisor process not found (run /afk --off to clear, or the watchdog will respawn it)"
+      echo "/afk: DRAIN DEAD — supervisor process not found, last tick ${age}m ago (run /afk --off to clear, or the watchdog will respawn it)"
     else
-      echo "/afk: STALE — no heartbeat, supervisor process not found (run /afk --off to clear, or the watchdog will respawn it)"
+      echo "/afk: DRAIN DEAD — supervisor process not found, no heartbeat (run /afk --off to clear, or the watchdog will respawn it)"
     fi
     return 0
   fi
+  last="$(_afk_read_last_action)"
+  hb="$(afk_read_heartbeat)"; tick="${hb##* }"
+  case "$tick" in '' | *[!0-9]*) tick="" ;; esac
+  if [ -n "$tick" ]; then
+    age=$(( now - tick ))
+    idle_limit=$(( AFK_TICK_SECONDS + ${AFK_LAND_HEARTBEAT_SECONDS:-30} ))
+    if [ "$age" -gt "$idle_limit" ]; then
+      echo "/afk: STALLED — no progress in $(( age / AFK_TICK_SECONDS )) ticks (${age}s stale, last action: ${last:-none}); a wedged supervisor is killed + respawned by the watchdog"
+      return 0
+    fi
+    nxt=$(( AFK_TICK_SECONDS - age )); [ "$nxt" -lt 0 ] && nxt=0
+    if [ "$state" = "drain" ]; then
+      echo "/afk: draining — idle, next tick in ${nxt}s (last action: ${last:-none})"; return 0
+    fi
+    if window_expired "$state" "$now"; then echo "/afk: window elapsed (supervisor will stop on its next tick)"; return 0; fi
+    rem="$(minutes_remaining "$state" "$now")"
+    echo "/afk: on — idle, ${rem}m remaining, next tick in ${nxt}s (last action: ${last:-none})"
+    return 0
+  fi
+  # No parseable heartbeat epoch but the pid is live (rare) — the plain lines.
   if [ "$state" = "drain" ]; then echo "/afk: draining (no clock bound — stops when the backlog is empty)"; return 0; fi
   if window_expired "$state" "$now"; then echo "/afk: window elapsed (supervisor will stop on its next tick)"; return 0; fi
   rem="$(minutes_remaining "$state" "$now")"
@@ -1768,7 +1854,7 @@ main() {
     --off)       afk_clear_state; echo "/afk: off (state cleared; the supervisor + watchdog stop on their next tick)"; return 0 ;;
     --watchdog)  watchdog_loop; return $? ;;
     --reconcile) afk_reconcile "$MAIN_ROOT"; return $? ;;
-    -h|--help)   sed -n '2,77p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
+    -h|--help)   sed -n '2,82p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
   esac
 
   local once=0
@@ -1796,7 +1882,17 @@ main() {
     _clear_blocked_records   # fresh window ⇒ --status shows only THIS run's durable blocks
     _afk_clear_dispatch_fail_counts # fresh window ⇒ every issue's dispatch ceiling resets (#170)
     _afk_clear_land_retry_counts # fresh window ⇒ every issue's land-retry budget resets (#202 D)
+    _afk_clear_last_action   # fresh window ⇒ no stale last-action label from a prior drain (#202 B)
     log "/afk: armed ($([ "$end" = drain ] && echo 'drain — until the backlog is empty' || echo "until $(wt_date_ymd "$end") $(date -r "$end" +%H:%M 2>/dev/null || date -d "@$end" +%H:%M)"))"
+  else
+    # No window spec and not --once: a RESUME of the persisted window (a watchdog respawn or
+    # a manual re-run). Refuse if a supervisor is ALREADY live — a second one clobbers the
+    # per-run state (#202 B, the arm-precondition dedup extended to the resume path). The
+    # arm path already refuses this via afk_arm_preconditions; AFK_ARM_PRECHECK=0 opts out.
+    if [ "${AFK_ARM_PRECHECK:-1}" != "0" ] && [ "$(afk_supervisor_state)" = "live" ]; then
+      log "/afk: refusing to resume — a supervisor is already live (heartbeat pid running); run /afk --off first (a second supervisor clobbers per-run state)"
+      return 2
+    fi
   fi
 
   while :; do
