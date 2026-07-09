@@ -395,6 +395,16 @@ _spoke_has_commits() {
   [ "$base" != "$tip" ]
 }
 
+# _spoke_has_work <wt> -> true when the worktree holds anything worth preserving on a crash:
+# a commit above the branch point (_spoke_has_commits) OR a dirty tree (uncommitted WIP). The
+# dead-pane recovery pass (issue #202 C) revives a crashed pane that has_work and re-dispatches
+# one that does not — so an in-progress-but-uncommitted spoke is never torn down.
+_spoke_has_work() {
+  local wt="$1"
+  _spoke_has_commits "$wt" && return 0
+  [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]
+}
+
 # the once-per-window resume stamp: a spoke is auto-resumed at most ONCE per armed window
 # (a second crash escalates to a human). Cleared on a fresh arm (_clear_resume_markers).
 _afk_resumed_marker()  { printf '%s\n' "$(_afk_state_dir)/resumed-$1"; }
@@ -405,6 +415,19 @@ _afk_mark_resumed() {
   printf '%s\n' "$(afk_now)" > "$m" 2>/dev/null || true
 }
 _clear_resume_markers() { rm -f "$(_afk_state_dir)"/resumed-* 2>/dev/null || true; }
+
+# the once-per-window re-dispatch stamp (issue #202 C): a clean crashed worktree is torn
+# down and re-dispatched at most ONCE per armed window (a second clean crash escalates to a
+# human, so a persistently-crashing infra dep can't loop redispatch→crash forever). Cleared
+# on a fresh arm alongside the resume markers.
+_afk_redispatched_marker()  { printf '%s\n' "$(_afk_state_dir)/redispatched-$1"; }
+_afk_already_redispatched() { [ -f "$(_afk_redispatched_marker "$1")" ]; }
+_afk_mark_redispatched() {
+  local m; m="$(_afk_redispatched_marker "$1")"
+  mkdir -p "$(dirname "$m")" 2>/dev/null || true
+  printf '%s\n' "$(afk_now)" > "$m" 2>/dev/null || true
+}
+_clear_redispatch_markers() { rm -f "$(_afk_state_dir)"/redispatched-* 2>/dev/null || true; }
 
 # _afk_spoke_run_id <wt> -> the spoke's persisted spoke_run_id (worktree-new.sh stamps it
 # at .ai-toolkit/spoke-run-id), so a resumed run groups under the SAME spoke in Langfuse.
@@ -989,6 +1012,67 @@ reap_pass() {
   done < <(inflight_worktrees)
 }
 
+# --- dead-pane recovery each tick (issue #202 C) ------------------------------
+# reap_pass only visits a spoke once the idle ceiling elapses, so a pane that CRASHES with
+# work sat stranded for hours overnight (recovered by hand ~4x). recover_dead_panes runs
+# EVERY tick and acts on the crash directly — no idle wait:
+#   * dead pane + work (commits or dirty WIP) → resume in place ONCE (never reap work);
+#     a second crash after the resume escalates (blocked/<issue>, needs a human).
+#   * dead pane + clean (nothing to preserve) → tear the empty worktree down so the issue
+#     RE-DISPATCHES (not escalated); a second clean crash after that escalates.
+# A live pane and a terminal/parked spoke (done/waiting) are left untouched — reap_pass owns
+# the idle/hung decision, auto_land owns done, the answerer owns waiting.
+
+# _redispatch_dead_pane <wt> <issue> -> tear down a clean, empty crashed worktree so its
+# issue returns to the backlog and re-dispatches next tick. Kills the window, then removes
+# the worktree via worktree-done.sh (--force since the pane is dead; --no-code skips the
+# editor-workspace edit). Records the once-per-window stamp on success. AFK_REDISPATCH_CMD
+# overrides the teardown for tests. rc 1 when the teardown can't run (caller escalates).
+_redispatch_dead_pane() {
+  local wt="$1" issue="$2" wt_done
+  log "→ redispatch #$issue: pane crashed with no work to preserve — tearing down the empty worktree so it re-dispatches"
+  _kill_spoke_window "$issue"
+  if [ -n "${AFK_REDISPATCH_CMD:-}" ]; then
+    bash -c "$AFK_REDISPATCH_CMD"; _afk_mark_redispatched "$issue"; return 0
+  fi
+  wt_done="$(_afk_find_script "${WT_DONE:-}" worktree-done.sh)" \
+    || { log "  worktree-done.sh not found — cannot re-dispatch #$issue"; return 1; }
+  if bash "$wt_done" "$issue" --force --no-code >/dev/null 2>&1; then
+    _afk_mark_redispatched "$issue"
+    return 0
+  fi
+  log "  worktree-done.sh failed for #$issue — leaving the worktree in place"
+  return 1
+}
+
+recover_dead_panes() {
+  local path issue state
+  while IFS=$'\t' read -r path issue; do
+    [ -n "$issue" ] || continue
+    state="$(slot_state "$path" "$issue")"
+    case "$state" in done | waiting) continue ;; esac   # terminal / parked — not a crash
+    _spoke_pane_alive "$path" && continue                # live pane — reap_pass owns idle/hung
+    # An over-ceiling runaway always blocks (as reap_pass does) — resume/re-dispatch never
+    # applies. Checked first so a crashed-but-over-ceiling spoke is not revived here only to
+    # be blocked by reap_pass in the same tick (the hard ceiling ignores fresh progress).
+    if _spoke_over_any_ceiling "$issue" "$(afk_now)"; then
+      reap_spoke "$path" "$issue" "time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
+    elif _spoke_has_work "$path"; then
+      if _afk_already_resumed "$issue"; then
+        reap_spoke "$path" "$issue" "pane crashed again after an auto-resume — needs a human"
+      else
+        resume_spoke "$path" "$issue" \
+          || reap_spoke "$path" "$issue" "pane crashed and the auto-resume could not be launched — needs a human"
+      fi
+    elif _afk_already_redispatched "$issue"; then
+      reap_spoke "$path" "$issue" "pane crashed clean again after a re-dispatch — needs a human"
+    else
+      _redispatch_dead_pane "$path" "$issue" \
+        || reap_spoke "$path" "$issue" "pane crashed clean and the worktree teardown failed — needs a human"
+    fi
+  done < <(inflight_worktrees)
+}
+
 # --- marker reconciliation (issue #109, AC3) ----------------------------------
 # Live state wins over a stale marker. When the reaper blocked a spoke whose pane had only
 # crashed, the spoke could be auto-resumed and resume committing — leaving blocked/<issue>
@@ -1051,6 +1135,7 @@ supervise_tick() {
   # the in-flight spokes and stops.
   [ "$_AFK_AUTH_FAILED" -eq 1 ] && return 0
   auto_land
+  recover_dead_panes
   reap_pass
 }
 
@@ -1663,6 +1748,7 @@ main() {
     _clear_dispatch_epochs   # fresh window ⇒ empty "dispatched by this run" set
     _clear_progress_state    # fresh window ⇒ no stale progress / answer-attempt epochs
     _clear_resume_markers    # fresh window ⇒ every spoke gets its one auto-resume again
+    _clear_redispatch_markers # fresh window ⇒ every clean crash gets its one re-dispatch again (#202 C)
     _afk_clear_landed_count  # fresh window ⇒ the landed tally starts at zero (#150)
     _afk_clear_drain_complete # ...and drop any un-consumed completion signal from a prior drain
     _clear_blocked_records   # fresh window ⇒ --status shows only THIS run's durable blocks

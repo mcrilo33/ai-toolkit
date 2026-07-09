@@ -4271,6 +4271,182 @@ def test_reap_pass_over_ceiling_always_blocks(tmp_path: Path) -> None:
     assert "new-window" not in tmux_log.read_text(), "a runaway is never resumed"
 
 
+# ── dead-pane recovery each tick (issue #202 C) ───────────────────────────────
+# A crashed tmux pane is a CRASH, not a hang: reap_pass only sees it after the idle
+# ceiling elapses, so a pane that dies with work sat stranded for hours overnight (~4x
+# recovered by hand). recover_dead_panes sweeps EVERY tick: an in-flight worktree whose
+# pane is dead is revived in place when it holds work (commits or dirty WIP) — never
+# reaped — and, when it is clean with nothing to preserve, its empty worktree is torn
+# down so the issue re-dispatches (rather than escalated to a human). Both revivals are
+# bounded once per window; a second crash escalates. Independent of the idle clock —
+# these use a FRESH (non-idle) transcript, which reap_pass would leave `busy`.
+
+
+def _recover_env(
+    spoke: Path, tmp_path: Path, fake_bin: Path, *, redispatch_marker: Path | None = None
+) -> tuple[str, dict[str, str], Path, Path]:
+    """Drive recover_dead_panes against one in-flight spoke with a FRESH transcript.
+
+    Returns (expr, env, ready_log, statedir). The transcript is left recent (not idle),
+    so the recovery is proven to fire on crash detection alone, not the idle ceiling.
+    """
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke)
+    _write_transcript(
+        pd, [{"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}}]
+    )  # recent mtime ⇒ slot_state reads `busy`, not `reap`
+
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
+    (spoke / ".ai-toolkit" / "spoke-run-id").write_text("feature/5-x+1700000000\n")
+
+    expr = f'inflight_worktrees() {{ printf "{spoke}\\t5\\n"; }}; recover_dead_panes'
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "SPOKE_READY": str(ready_stub),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_DEFAULT_BRANCH": "main",
+        "AFK_NOW": "1700000000",
+    }
+    if redispatch_marker is not None:
+        env["AFK_REDISPATCH_CMD"] = f"touch {redispatch_marker}"
+    return expr, env, ready_log, statedir
+
+
+def test_recover_dead_panes_resumes_dead_pane_with_commits_when_not_idle(tmp_path: Path) -> None:
+    # The core of C: a dead pane with committed work is revived THIS tick, even though the
+    # transcript is fresh (reap_pass would read it `busy` and leave it stranded).
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
+    expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, fake_bin)
+
+    result = _call(expr, env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "new-window" in tmux_log.read_text(), "a crashed pane with commits is resumed in place"
+    assert (statedir / "resumed-5").exists(), "the once-per-window resume must be recorded"
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
+        "work is never reaped"
+    )
+
+
+def test_recover_dead_panes_resumes_dead_pane_with_dirty_wip(tmp_path: Path) -> None:
+    # WIP counts as work: a dead pane with an uncommitted (dirty) tree is revived, not reaped.
+    spoke = _branched_spoke(tmp_path, ahead=False)  # no commits above base…
+    (spoke / "wip.txt").write_text("half-done\n")  # …but a dirty tree to preserve
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
+    expr, env, ready_log, _statedir = _recover_env(spoke, tmp_path, fake_bin)
+
+    _call(expr, env=env)
+
+    assert "new-window" in tmux_log.read_text(), "dirty WIP is work — the crashed pane is revived"
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
+
+
+def test_recover_dead_panes_skips_live_pane(tmp_path: Path) -> None:
+    # A live pane is left to reap_pass's idle/hung logic — recover_dead_panes only handles crashes.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane ALIVE
+    expr, env, ready_log, _statedir = _recover_env(spoke, tmp_path, fake_bin)
+
+    _call(expr, env=env)
+
+    assert "new-window" not in tmux_log.read_text(), (
+        "a live pane is not a crash — never resumed here"
+    )
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
+
+
+def test_recover_dead_panes_reaps_after_one_resume(tmp_path: Path) -> None:
+    # A second crash after an auto-resume escalates to a human (bounded once per window).
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD again
+    expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, fake_bin)
+    (statedir / "resumed-5").write_text("1700000000\n")  # already resumed once this window
+
+    _call(expr, env=env)
+
+    assert "--blocked 5" in ready_log.read_text(), "a re-crash after resume escalates"
+    assert "new-window" not in tmux_log.read_text(), "resume is bounded to once per window"
+
+
+def test_recover_dead_panes_redispatches_clean_dead_pane(tmp_path: Path) -> None:
+    # A clean, empty crashed worktree (no commits, nothing dirty) is torn down so the issue
+    # re-dispatches — NOT escalated to a human (the manual ~4x-overnight step).
+    spoke = _branched_spoke(tmp_path, ahead=False)  # no commits, clean tree
+    fake_bin, _tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
+    redispatch = tmp_path / "redispatched"
+    expr, env, ready_log, statedir = _recover_env(
+        spoke, tmp_path, fake_bin, redispatch_marker=redispatch
+    )
+
+    result = _call(expr, env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert redispatch.exists(), "a clean crashed worktree is torn down to re-dispatch the issue"
+    assert (statedir / "redispatched-5").exists(), (
+        "the once-per-window re-dispatch must be recorded"
+    )
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
+        "a re-dispatchable clean crash must NOT be escalated to a human"
+    )
+
+
+def test_recover_dead_panes_blocks_clean_dead_pane_after_one_redispatch(tmp_path: Path) -> None:
+    # A clean pane that crashes AGAIN after a re-dispatch is a persistent infra problem →
+    # escalate to a human (bounded once, so re-dispatch can't loop forever).
+    spoke = _branched_spoke(tmp_path, ahead=False)
+    fake_bin, _tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
+    redispatch = tmp_path / "redispatched"
+    expr, env, ready_log, statedir = _recover_env(
+        spoke, tmp_path, fake_bin, redispatch_marker=redispatch
+    )
+    (statedir / "redispatched-5").write_text("1700000000\n")  # already re-dispatched once
+
+    _call(expr, env=env)
+
+    assert "--blocked 5" in ready_log.read_text(), "a re-crash after re-dispatch escalates"
+    assert not redispatch.exists(), "re-dispatch is bounded to once per window"
+
+
+def test_recover_dead_panes_over_ceiling_blocks_despite_commits(tmp_path: Path) -> None:
+    # An over-ceiling runaway always blocks (as reap_pass does) — recovery never resumes it,
+    # so it isn't revived here only to be blocked by reap_pass in the same tick.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD, with commits
+    expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, fake_bin)
+    (statedir / "dispatch-5.epoch").write_text("1000\n")  # dispatched long ago ⇒ over ceiling
+
+    _call(expr, env=env)
+
+    assert "--blocked 5" in ready_log.read_text(), "an over-ceiling runaway always blocks"
+    assert "new-window" not in tmux_log.read_text(), "a runaway is never resumed"
+
+
+def test_recover_dead_panes_skips_done_spoke(tmp_path: Path) -> None:
+    # A finished spoke (ready/<N> at the tip) with a dead pane is left for auto_land — never
+    # revived or torn down by the dead-pane pass.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke, check=True, capture_output=True)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
+    expr, env, ready_log, _statedir = _recover_env(spoke, tmp_path, fake_bin)
+
+    _call(expr, env=env)
+
+    # A done spoke is skipped before the pane check, so tmux is never even consulted.
+    assert not tmux_log.exists() or "new-window" not in tmux_log.read_text(), (
+        "a done spoke is not revived"
+    )
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
+
+
 # ── configurable base branch (issue #117) ────────────────────────────────────
 
 
