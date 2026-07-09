@@ -4795,6 +4795,84 @@ def test_recover_dead_panes_over_ceiling_blocks_despite_commits(tmp_path: Path) 
     assert "new-window" not in tmux_log.read_text(), "a runaway is never resumed"
 
 
+# ── J: pushed-but-unmarked detection (issue #202 J / #200) ────────────────────
+# When a spoke pushes its branch but the ready/<N> emission fails, origin is ahead with no
+# completion signal. _afk_pushed_but_unmarked recognizes that shape (HEAD == @{upstream},
+# clean, a commit above base, no marker at the tip) so the reaper reports an accurate,
+# actionable reason instead of "likely hung". It does NOT fire for a marked or unpushed spoke.
+
+_PUSH_ENV = {
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_AUTHOR_EMAIL": "t@t",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_COMMITTER_EMAIL": "t@t",
+}
+
+
+def _pushed_spoke(tmp_path: Path, *, ready: bool = False) -> Path:
+    """A branched spoke pushed to a bare origin, so @{upstream} is set (optionally marked)."""
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True, capture_output=True)
+    wt = _branched_spoke(tmp_path, ahead=True)  # branch feature/5-x, one commit above main
+    branch = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=wt, capture_output=True, text=True
+    ).stdout.strip()
+    env = {**os.environ, **_PUSH_ENV}
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(remote)], cwd=wt, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "push", "-q", "-u", "origin", branch],
+        cwd=wt,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    if ready:
+        subprocess.run(["git", "tag", "ready/5"], cwd=wt, check=True, capture_output=True)
+    return wt
+
+
+def test_pushed_but_unmarked_true_when_finished_without_marker(tmp_path: Path) -> None:
+    wt = _pushed_spoke(tmp_path, ready=False)
+
+    result = _call(
+        f"_afk_pushed_but_unmarked '{wt}' 5 && echo YES || echo NO",
+        env={"AFK_DEFAULT_BRANCH": "main"},
+    )
+
+    assert "YES" in result.stdout, "a pushed, clean, unmarked tip is pushed-but-unmarked (#200)"
+
+
+def test_pushed_but_unmarked_false_when_ready_marker_present(tmp_path: Path) -> None:
+    wt = _pushed_spoke(tmp_path, ready=True)
+
+    result = _call(
+        f"_afk_pushed_but_unmarked '{wt}' 5 && echo YES || echo NO",
+        env={"AFK_DEFAULT_BRANCH": "main"},
+    )
+
+    assert "NO" in result.stdout, "a marked tip is complete, not an unmarked gap"
+
+
+def test_pushed_but_unmarked_false_when_unpushed_work(tmp_path: Path) -> None:
+    wt = _pushed_spoke(tmp_path, ready=False)
+    subprocess.run(
+        ["git", "commit", "-q", "--allow-empty", "-m", "more"],
+        cwd=wt,
+        check=True,
+        capture_output=True,
+        env={**os.environ, **_PUSH_ENV},
+    )  # a local commit ahead of @{upstream} ⇒ not fully pushed ⇒ mid-work, not the gap
+
+    result = _call(
+        f"_afk_pushed_but_unmarked '{wt}' 5 && echo YES || echo NO",
+        env={"AFK_DEFAULT_BRANCH": "main"},
+    )
+
+    assert "NO" in result.stdout, "unpushed work is mid-task, not a pushed-but-unmarked finish"
+
+
 def test_recover_dead_panes_skips_done_spoke(tmp_path: Path) -> None:
     # A finished spoke (ready/<N> at the tip) with a dead pane is left for auto_land — never
     # revived or torn down by the dead-pane pass.

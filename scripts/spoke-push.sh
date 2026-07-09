@@ -126,7 +126,21 @@ if [ -n "$READY" ]; then
   # Run spoke-ready with THIS push's span id as its parent (Issue #66) so the
   # marker-emission span nests under this push, not our own parent (the Bash tool
   # call). Leading assignment scopes it to the child; empty is harmless (fallback).
-  AI_TOOLKIT_PARENT_SPAN="$_SP_SPAN_ID" bash "$SCRIPT_DIR/spoke-ready.sh" "$READY"
+  #
+  # Two-phase recovery contract (issue #200): the branch push above ALREADY succeeded, so a
+  # ready/<N> emission that now fails (a precondition refusal, a tag-push rejection) leaves
+  # origin ahead with NO completion signal — the silent gap that stranded a finished spoke.
+  # Surface it LOUDLY and exit a DISTINCT code (4, "pushed-but-unmarked") — never let it hide
+  # behind spoke-ready's generic non-zero — so the caller can tell it from a branch-push
+  # failure and re-run just the marker. The re-run is safe: spoke-ready emits via `git tag -f`
+  # + a force tag-push, so re-running `spoke-push.sh --ready <N>` at the same tip re-marks
+  # idempotently (the branch push is then a no-op) once the refusal is fixed.
+  if ! AI_TOOLKIT_PARENT_SPAN="$_SP_SPAN_ID" bash "$SCRIPT_DIR/spoke-ready.sh" "$READY"; then
+    echo "spoke-push: ⚠ PUSHED-BUT-UNMARKED — branch $BRANCH reached origin but ready/$READY did NOT." >&2
+    echo "  origin is ahead with no completion signal. Fix the refusal above, then re-run the marker" >&2
+    echo "  (idempotent; the branch push is a no-op): bash .ai-toolkit/scripts/spoke-push.sh --ready $READY" >&2
+    exit 4
+  fi
 fi
 
 echo "✓ spoke-push complete: pushed $BRANCH${READY:+ + marker ready/$READY}"

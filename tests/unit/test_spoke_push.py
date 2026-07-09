@@ -288,6 +288,25 @@ def test_ready_refused_on_dirty_tree(spoke: Path, remote: Path) -> None:
     assert not _remote_has_ref(remote, "refs/tags/ready/37")
 
 
+def test_ready_refusal_surfaces_pushed_but_unmarked(spoke: Path, remote: Path) -> None:
+    # Two-phase recovery contract (#200): the branch push succeeds but the ready emission is
+    # refused. spoke-push must surface "PUSHED-BUT-UNMARKED" loudly and exit the DISTINCT code
+    # (4) — so the caller can tell "origin ahead, no completion signal" from a branch-push
+    # failure and re-run just the marker.
+    shutil.rmtree(spoke / ".review")  # ready is refused (no review artifact)
+
+    result = _run(spoke, "--ready", "37")
+
+    assert result.returncode == 4, (
+        "a pushed-but-unmarked finish must exit the distinct sentinel (4): "
+        + result.stdout
+        + result.stderr
+    )
+    assert _remote_has_ref(remote, f"refs/heads/{OWN}"), "the branch push still reached origin"
+    assert not _remote_has_ref(remote, "refs/tags/ready/37"), "no marker was emitted"
+    assert "PUSHED-BUT-UNMARKED" in result.stderr, "the gap must be surfaced visibly"
+
+
 def test_ready_force_emits_despite_unmet_precondition(spoke: Path, remote: Path) -> None:
     shutil.rmtree(spoke / ".review")
 

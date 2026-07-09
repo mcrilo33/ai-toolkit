@@ -437,6 +437,28 @@ _spoke_has_commits() {
   [ "$base" != "$tip" ]
 }
 
+# _afk_pushed_but_unmarked <wt> <issue> -> true when the spoke did its work, PUSHED it, and is
+# clean — but carries NO completion/park marker at the tip (issue #200's two-phase gap: the
+# branch push landed but the ready/<issue> emission failed, leaving origin ahead with no
+# signal). Requires HEAD == @{upstream} (fully pushed), a clean tree, a commit above the base,
+# and no ready/accept/blocked/gate tag at the tip. Used to give the reaper an ACCURATE,
+# actionable reason (re-run the marker / land by hand) instead of the misleading "likely hung".
+# It deliberately does NOT auto-emit ready — a clean-pushed-no-marker tip is also the shape of
+# a spoke idle BETWEEN subtasks, so auto-completing it could land incomplete work; a crashed
+# such spoke is safely revived by recover_dead_panes (resume re-emits the mark after verifying).
+_afk_pushed_but_unmarked() {
+  local wt="$1" issue="$2" head up kind
+  head="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)" || return 1
+  up="$(git -C "$wt" rev-parse -q --verify '@{upstream}' 2>/dev/null)" || return 1
+  [ "$head" = "$up" ] || return 1
+  [ -z "$(git -C "$wt" status --porcelain 2>/dev/null)" ] || return 1
+  _spoke_has_commits "$wt" || return 1
+  for kind in ready accept blocked gate; do
+    [ "$(git -C "$wt" rev-parse -q --verify "refs/tags/${kind}/${issue}^{commit}" 2>/dev/null)" = "$head" ] && return 1
+  done
+  return 0
+}
+
 # _spoke_has_work <wt> -> true when the worktree holds anything worth preserving on a crash:
 # a commit above the branch point (_spoke_has_commits) OR a dirty tree (uncommitted WIP). The
 # dead-pane recovery pass (issue #202 C) revives a crashed pane that has_work and re-dispatches
@@ -603,7 +625,13 @@ _reap_or_resume() {
   if _spoke_over_any_ceiling "$issue" "$(afk_now)"; then
     reap_spoke "$wt" "$issue" "time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
   elif _spoke_pane_alive "$wt"; then
-    reap_spoke "$wt" "$issue" "went idle >${AFK_IDLE_MINUTES}m with a live pane and no marker — likely hung"
+    if _afk_pushed_but_unmarked "$wt" "$issue"; then
+      # Not hung — FINISHED but its completion mark never landed (#200). Surface the accurate,
+      # actionable reason instead of "likely hung", so a human re-runs the marker or lands it.
+      reap_spoke "$wt" "$issue" "pushed-but-unmarked: origin is at the clean tip but no ready/$issue — the completion mark didn't land (#200); re-run 'spoke-push.sh --ready $issue' on the spoke, or land it by hand"
+    else
+      reap_spoke "$wt" "$issue" "went idle >${AFK_IDLE_MINUTES}m with a live pane and no marker — likely hung"
+    fi
   elif ! _spoke_has_commits "$wt"; then
     reap_spoke "$wt" "$issue" "pane crashed with no committed work to preserve — needs a human"
   elif _afk_already_resumed "$issue"; then
