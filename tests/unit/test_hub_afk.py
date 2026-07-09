@@ -5204,6 +5204,31 @@ def test_watchdog_tick_respawns_and_kills_wedged_supervisor(tmp_path: Path) -> N
     assert "WEDGED_DEAD" in result.stdout, "the wedged supervisor's pid must be killed first"
 
 
+def test_kill_wedged_supervisor_kills_the_whole_hung_tree(tmp_path: Path) -> None:
+    # #202 E: killing only the supervisor pid left its hung CHILD (the answerer claude, a
+    # stuck batch-plan/gh) alive to collide with the respawn. The kill now walks the whole
+    # descendant tree, so a child of the wedged supervisor dies with it.
+    hb = tmp_path / "heartbeat"
+    childf = tmp_path / "childpid"
+    wedged = tmp_path / "wedged.sh"
+    wedged.write_text(f'#!/usr/bin/env bash\nsleep 300 & echo $! > "{childf}"\nsleep 300\n')
+    wedged.chmod(0o755)
+    expr = (
+        f"bash -c 'exec -a hub-afk-wedged bash \"{wedged}\"' & wedged=$!; "
+        f'for _ in $(seq 1 50); do [ -s "{childf}" ] && break; sleep 0.1; done; '
+        f'printf "%s 1000\\n" "$wedged" > "{hb}"; '
+        "_afk_kill_wedged_supervisor; "
+        'kill -0 "$wedged" 2>/dev/null && echo PARENT_ALIVE || echo PARENT_DEAD; '
+        f'child=$(cat "{childf}"); kill -0 "$child" 2>/dev/null && echo CHILD_ALIVE || echo CHILD_DEAD; '
+        'kill "$wedged" "$child" 2>/dev/null || true'
+    )
+
+    result = _call(expr, env={"AFK_HEARTBEAT": str(hb), "AFK_WEDGE_KILL_GRACE": "1"})
+
+    assert "PARENT_DEAD" in result.stdout, "the wedged supervisor pid must be killed"
+    assert "CHILD_DEAD" in result.stdout, "the hung child must die with the supervisor (#202 E)"
+
+
 def test_kill_wedged_supervisor_spares_a_recycled_pid(tmp_path: Path) -> None:
     # Pid-recycling guard: if the heartbeat pid was recycled onto an unrelated process (its
     # command no longer looks like a hub-afk supervisor), the kill must NOT touch it.

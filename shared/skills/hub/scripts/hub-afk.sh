@@ -1331,10 +1331,13 @@ _afk_heartbeat_wedged() {
   [ "$age" -gt "$limit" ]
 }
 
-# _afk_kill_wedged_supervisor -> terminate the heartbeat pid so a respawn does not leave two
-# supervisors racing on the per-run state. SIGTERM first, a bounded grace, then SIGKILL if it
-# ignored TERM. Best-effort; the pid is known live (watchdog_tick checked). AFK_WEDGE_KILL_CMD
-# overrides the whole kill for tests.
+# _afk_kill_wedged_supervisor -> terminate the wedged supervisor AND its whole hung call tree
+# so a respawn does not leave two supervisors racing on the per-run state — and, crucially, so
+# the hung CHILD (the answerer `claude`, a stuck `batch-plan`/`gh`) dies with it instead of
+# surviving to collide with the respawn (#202 E). Kills leaf-first via _afk_kill_tree (the
+# same descendant walk the bounded-call killer uses): SIGTERM the tree, a bounded grace, then
+# SIGKILL the tree if the supervisor ignored TERM. Best-effort; the pid is known live
+# (watchdog_tick checked). AFK_WEDGE_KILL_CMD overrides the whole kill for tests.
 # Pid-recycling guard (#170 review): a supervisor that died without clearing its heartbeat
 # leaves a pid the OS may recycle onto an unrelated process; kill only a pid whose command
 # still looks like a hub-afk supervisor (AFK_WEDGE_PID_MATCH, default "hub-afk"), never a
@@ -1352,13 +1355,13 @@ _afk_kill_wedged_supervisor() {
       *) log "  wedged-supervisor pid $pid is not a '$match' process (recycled?) — not killing"; return 0 ;;
     esac
   fi
-  kill -TERM "$pid" 2>/dev/null || true
+  _afk_kill_tree "$pid" TERM   # the supervisor + its hung children, leaf-first
   grace="${AFK_WEDGE_KILL_GRACE:-3}"; case "$grace" in '' | *[!0-9]*) grace=3 ;; esac
   waited=0
   while [ "$waited" -lt "$grace" ] && kill -0 "$pid" 2>/dev/null; do
     sleep 1 2>/dev/null || true; waited=$(( waited + 1 ))
   done
-  kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  kill -0 "$pid" 2>/dev/null && _afk_kill_tree "$pid" KILL   # ignored TERM — SIGKILL the whole tree
   return 0
 }
 
