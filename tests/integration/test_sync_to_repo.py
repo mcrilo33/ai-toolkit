@@ -97,10 +97,17 @@ ALL_RULE_NAMES = {
     "planning-hub",
     "issue-hygiene",
     "afk-answering",
+    "bug-triage",
 }
 
 # Rules that have no applyTo/globs in metadata
-RULES_WITHOUT_GLOB = {"library-research", "planning-hub", "issue-hygiene", "afk-answering"}
+RULES_WITHOUT_GLOB = {
+    "library-research",
+    "planning-hub",
+    "issue-hygiene",
+    "afk-answering",
+    "bug-triage",
+}
 
 # Rules that define 'paths' in metadata → generated as Claude rules
 CLAUDE_RULES_WITH_PATHS = {
