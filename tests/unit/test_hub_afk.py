@@ -2546,14 +2546,44 @@ def test_auto_land_review_gate_opt_out_lands_without_review(
     assert land_log.read_text().split() == ["5"], "AFK_REVIEW_GATE=0 lands without a review"
 
 
-def test_auto_land_default_lands_without_review_no_escalation(
+def test_auto_land_default_lands_on_clean_approve(spoke_repo: Path, tmp_path: Path) -> None:
+    # Issue #183: the review-verdict gate defaults back ON (AFK_REVIEW_GATE:-1) now that #172
+    # binds every ready/<N> emission to an APPROVE artifact. A drain with NO env override lands
+    # a normal #172-compliant spoke (ready + clean APPROVE) unmodified — the gate reads clean.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
+    wt_land, land_log = _land_recorder(tmp_path)
+    ready_stub, ready_log = _escalation_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    # No AFK_REVIEW_GATE in the env: the DEFAULT must consult the review and let a clean one land.
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "SPOKE_READY": str(ready_stub),
+            "AFK_STATE_DIR": str(statedir),
+        },
+    )
+
+    assert land_log.read_text().split() == ["5"], (
+        "the default (no AFK_REVIEW_GATE) must land a #172-compliant ready+APPROVE spoke"
+    )
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
+        "a clean APPROVE under the default gate must NOT escalate to blocked"
+    )
+
+
+def test_auto_land_default_escalates_foreign_ready_without_review(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
-    # Issue #152: the review-verdict gate defaults OFF, so a drain with NO env override
-    # lands a ready spoke even when no code-review artifact exists — no false blocked/5
-    # escalation bricking the whole drain (the #151 regression).
+    # Issue #183: the gate defaults ON. A FOREIGN ready/<N> hand-pushed without any review
+    # artifact (bypassing spoke-ready, which since #172 refuses to emit ready without an
+    # APPROVE) must ESCALATE to blocked with NO env override — that is the intended gate, not
+    # the #151 false positive (which #172 closed mechanically at the ready-emission side).
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
-    # No .review artifact at all: the pre-#152 default-on gate would escalate here.
+    # No .review artifact at all: an artifact-less ready can only be a bypass now.
     wt_land, land_log = _land_recorder(tmp_path)
     ready_stub, ready_log = _escalation_recorder(tmp_path)
     statedir = tmp_path / "statedir"
@@ -2568,11 +2598,11 @@ def test_auto_land_default_lands_without_review_no_escalation(
         },
     )
 
-    assert land_log.read_text().split() == ["5"], (
-        "the default (no AFK_REVIEW_GATE) must land a ready spoke without a review"
+    assert not land_log.exists() or land_log.read_text().strip() == "", (
+        "the default gate must NOT land an artifact-less foreign ready"
     )
-    assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
-        "the default gate must NOT escalate a clean-by-default land to blocked"
+    assert "--blocked 5" in ready_log.read_text(), (
+        "an artifact-less foreign ready must escalate to blocked under the default gate"
     )
 
 
