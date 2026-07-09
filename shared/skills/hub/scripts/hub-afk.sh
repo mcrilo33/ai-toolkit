@@ -1068,12 +1068,24 @@ auto_land() {
     fi
     log "→ land #$issue"
     _afk_set_last_action "land #$issue"
-    if _afk_run_with_heartbeat bash "$wt_land" "$issue" --skip-tests >/dev/null 2>&1; then
+    # Capture the land's output to a per-issue log (#198): the old >/dev/null discarded exactly
+    # what an operator needs when a land half-completes. mkdir so the log write can't fail on a
+    # not-yet-created state dir. _afk_run_with_heartbeat returns worktree-land's exit code.
+    local land_log land_rc
+    land_log="$(_afk_state_dir)/land-$issue.log"; mkdir -p "$(_afk_state_dir)" 2>/dev/null || true
+    _afk_run_with_heartbeat bash "$wt_land" "$issue" --skip-tests >"$land_log" 2>&1; land_rc=$?
+    if [ "$land_rc" -eq 0 ]; then
       log "  landed #$issue"
       _afk_clear_land_retries "$issue"   # a successful land resets the retry budget (#202 D)
       _afk_incr_landed   # tally for the drain-complete notification (#150)
+    elif [ "$land_rc" -eq 3 ]; then
+      # Sentinel (#198 / #202 I): main ADVANCED but a teardown step failed — the code IS
+      # shipped, so NEVER stamp blocked over merged work. Tally it and point at the log.
+      log "  landed #$issue but teardown incomplete (worktree-land exit 3) — see $land_log; NOT escalating (main already advanced)"
+      _afk_clear_land_retries "$issue"
+      _afk_incr_landed
     else
-      _escalate_blocked "$path" "$issue" "auto-land failed (merge conflict or push rejection) — needs a human"
+      _escalate_blocked "$path" "$issue" "auto-land failed (merge conflict or push rejection, exit $land_rc) — needs a human (see $land_log)"
     fi
   done < <(inflight_worktrees)
 }

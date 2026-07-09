@@ -557,8 +557,16 @@ if [ -n "$WT_DIR" ]; then
     || wt_warn "post-run Langfuse ingestion errored — landing continues"
 fi
 
+# From here on main has ADVANCED (origin/$DEFAULT moved). A teardown step that fails now must
+# NOT die with the generic exit 1 (which auto_land reads as "land failed" and stamps blocked
+# over already-merged code, issue #198): track it and exit the CLEANUP-INCOMPLETE sentinel (3)
+# at the end so the caller can tell "nothing shipped" (1) from "shipped, cleanup incomplete" (3).
+CLEANUP_INCOMPLETE=""
 if [ -n "$WT_DIR" ]; then
-  bash "$SCRIPT_DIR/worktree-done.sh" "$WT_DIR" ${KEEP_BRANCH:+--keep-branch}
+  # WT_DONE seams the teardown for tests (default: the sibling worktree-done.sh). A failure is
+  # post-ship residue, not a land failure — warn and flag the sentinel, never abort under set -e.
+  bash "${WT_DONE:-$SCRIPT_DIR/worktree-done.sh}" "$WT_DIR" ${KEEP_BRANCH:+--keep-branch} \
+    || { wt_warn "worktree-done teardown failed for $WT_DIR — main already advanced ($MERGED_SHA is on $DEFAULT); finish the teardown by hand"; CLEANUP_INCOMPLETE=1; }
 elif [ -z "$KEEP_BRANCH" ]; then
   # Bare-branch mode: the worktree is already gone; just delete the merged local branch.
   # Safe — just merged; warn rather than abort if deletion fails.
@@ -639,4 +647,10 @@ echo "✓ landed $WT_BRANCH"
 echo "  merged:  $MERGED_SHA"
 echo "  suite:   $SUITE_RESULT"
 echo "  pushed:  origin/$DEFAULT"
+# Exit 3 (CLEANUP INCOMPLETE) when main advanced but a teardown step failed — the work IS
+# shipped, so the caller must not treat this like a pre-merge failure (#202 I / #198).
+if [ -n "$CLEANUP_INCOMPLETE" ]; then
+  echo "  cleanup: INCOMPLETE — main advanced but a teardown step failed (see warnings above); finish it by hand"
+  exit 3
+fi
 exit 0

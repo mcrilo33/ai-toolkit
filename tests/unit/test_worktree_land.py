@@ -275,6 +275,30 @@ def test_lands_pushed_branch_into_main(hub: Path, tmp_path: Path) -> None:
     assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
 
 
+def test_land_returns_cleanup_sentinel_when_teardown_fails_after_push(
+    hub: Path, tmp_path: Path
+) -> None:
+    # #202 I / #198: a land that pushed main (main ADVANCED) but then failed a teardown step
+    # must exit with a DISTINCT sentinel (3), not the generic 1 — so hub-afk's auto_land can
+    # tell "nothing shipped" (escalate blocked) from "shipped, cleanup incomplete" (never
+    # stamp blocked over merged code). WT_DONE seams the worktree-done teardown to a failing stub.
+    _make_spoke(hub, tmp_path, "feature/1-done", push=True)
+    fail_done = tmp_path / "fail-done.sh"
+    fail_done.write_text("#!/bin/sh\necho 'teardown boom' >&2\nexit 1\n")
+    fail_done.chmod(0o755)
+
+    proc, _ = _run_land(hub, tmp_path, "1", extra_env={"WT_DONE": str(fail_done)})
+
+    assert proc.returncode == 3, (
+        "a teardown failure AFTER main advanced must exit the cleanup sentinel (3), not 1: "
+        + proc.stdout
+        + proc.stderr
+    )
+    # main really advanced despite the teardown failure — the work IS shipped.
+    assert (hub / "feature-1-done.txt").exists(), "the merge landed on main before teardown failed"
+    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
+
+
 def test_fast_forwards_when_possible(hub: Path, tmp_path: Path) -> None:
     wt = _make_spoke(hub, tmp_path, "feature/1-ff", push=True)
     spoke_sha = _git(wt, "rev-parse", "HEAD").strip()

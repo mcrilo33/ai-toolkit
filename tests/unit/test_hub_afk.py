@@ -3123,6 +3123,66 @@ def test_auto_land_ready_blocked_reescalates_on_repeat_failure(
     )
 
 
+def test_auto_land_does_not_block_when_land_reports_cleanup_incomplete(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #202 I: worktree-land exits 3 when main ADVANCED but a later teardown step failed.
+    # The code is already shipped, so auto_land must NOT stamp blocked over merged work — it
+    # tallies the land and logs the incomplete cleanup instead.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    wt_land = tmp_path / "wtland.sh"
+    wt_land.write_text("#!/usr/bin/env bash\nexit 3\n")  # sentinel: main advanced, cleanup failed
+    wt_land.chmod(0o755)
+    ready_stub, ready_log = _escalation_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    landed = tmp_path / "landed"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "SPOKE_READY": str(ready_stub),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_LANDED_COUNT": str(landed),
+        },
+    )
+
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
+        "exit 3 means main advanced — never stamp blocked over already-merged code (#198)"
+    )
+    assert landed.read_text().strip() == "1", (
+        "a shipped-but-cleanup-incomplete land is still tallied"
+    )
+
+
+def test_auto_land_still_blocks_on_a_pre_merge_failure(spoke_repo: Path, tmp_path: Path) -> None:
+    # A non-sentinel nonzero (exit 1: merge conflict / push rejection — nothing shipped) still
+    # escalates, so the sentinel path doesn't swallow genuine failures.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    wt_land = tmp_path / "wtland.sh"
+    wt_land.write_text("#!/usr/bin/env bash\nexit 1\n")
+    wt_land.chmod(0o755)
+    ready_stub, ready_log = _escalation_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "SPOKE_READY": str(ready_stub),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+        },
+    )
+
+    assert "--blocked 5" in ready_log.read_text(), (
+        "a pre-merge land failure (exit 1) still escalates"
+    )
+
+
 def test_auto_land_ready_blocked_escalates_visibly_when_retries_exhausted(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
