@@ -101,6 +101,14 @@ issue-hygiene:
   description: "What a dispatchable issue must contain so the /afk scheduler can batch and order it — a mandatory Scope: line of touched files/globs (missing or '*' means exclusive) plus a Gate: none|plan line, with genuine ordering expressed as native GitHub blocked-by dependencies rather than file overlap. Programmatic filers emit the footer too. Surfaced on demand when authoring issues, not auto-applied to every session."
   alwaysApply: false
 
+bug-triage:
+  name: "Bug Triage"
+  description: "When you discover a confirmed defect during any work, file it via the bug-scoper agent immediately without asking — the agent verifies evidence against the code and dedups, so filing-by-default is safe. Auto-file confirmed bugs; only surface genuine is-this-intended-design uncertainty for the human. Binds spokes too, so a mid-cycle discovery is filed, not buried."
+  applyTo: "**"
+  globs: "**"
+  paths: "**"
+  alwaysApply: true
+
 afk-answering:
   name: "AFK Answering"
   description: "How to answer a parked spoke on the human's behalf during an unattended /afk drain — reason about the prompt with a thinking budget, answer in the interest of the issue contract and repo conventions, prefer the spoke's own recommendation, and escalate (blocked/N) only when the decision is irreversible, outward-facing, or scope-changing. Surfaced on demand for the /afk answerer, not auto-applied to every session."
