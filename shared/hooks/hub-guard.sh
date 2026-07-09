@@ -28,6 +28,15 @@ set -euo pipefail
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/lib/utils.sh"
 
+# Fail closed on an unparseable payload (issue #208). The only extraction that can
+# crash (get_edit_file_path, below) runs ONLY after the hub checks confirm this is
+# the main checkout on the default branch — a spoke exits 0 earlier and never
+# reaches it — so a crash here is hub task work we could not classify. Without
+# this trap jq's non-zero exit under `set -euo pipefail` would propagate out and,
+# being neither 0 nor 2, let the edit/commit proceed on the hub (Claude Code
+# treats a non-2 exit as non-blocking). Convert any uncaught crash into a deny.
+trap 'deny "hub-guard could not parse the tool payload on the planning hub; blocking (fail-closed, issue #208). Dispatch task work into its own worktree via the start-task skill."' ERR
+
 # Resolve the base branch the hub stays on — the ONE canonical resolver
 # (issue #117): config ai-toolkit.base-branch > AI_TOOLKIT_BASE_BRANCH >
 # origin/HEAD > init.defaultBranch (existing ref) > main/master > "main".

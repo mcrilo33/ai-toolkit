@@ -19,6 +19,15 @@ set -euo pipefail
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/lib/utils.sh"
 
+# Fail closed on an unparseable payload (issue #208). jq choking on malformed or
+# shape-mismatched JSON exits non-zero (5); under `set -euo pipefail` that
+# propagates out of an extraction assignment and would exit the hook with jq's
+# code. Claude Code treats any exit other than 2 as a NON-blocking error, so the
+# guarded write would proceed with its content unscanned. This ERR trap converts
+# any uncaught crash below into a deny (exit 2) — a malformed payload blocks
+# instead of silently passing.
+trap 'deny "secrets-scan could not parse the tool payload to scan for secrets; blocking the write (fail-closed, issue #208)."' ERR
+
 INPUT=$(read_stdin)
 EVENT=$(get_hook_event "$INPUT")
 
@@ -53,6 +62,15 @@ Staged content was scanned via 'git diff --cached'."
 fi
 
 # ── Claude/Copilot: pre-write content scan ──────────────────────────
+# Content is extracted only via jq (get_edit_new_content is jq-only), so with jq
+# absent the scanner is blind and an empty CONTENT is indistinguishable from a
+# genuinely clean write. A blind secrets guard must fail closed rather than pass
+# an unscanned write (issue #208). The Cursor commit-time path above uses
+# git-diff + grep and does not need jq, so this gate is confined to this path.
+if ! command -v jq >/dev/null 2>&1; then
+  deny "secrets-scan cannot inspect content for hardcoded secrets: jq is unavailable. Install jq — the scanner fails closed rather than pass an unscanned write (issue #208)."
+fi
+
 CONTENT=$(get_edit_new_content "$INPUT")
 [ -z "$CONTENT" ] && exit 0
 

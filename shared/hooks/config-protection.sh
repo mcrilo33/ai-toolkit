@@ -19,6 +19,14 @@ set -euo pipefail
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HOOK_DIR/lib/utils.sh"
 
+# Fail closed on an unparseable payload (issue #208). jq choking on malformed or
+# shape-mismatched JSON exits non-zero (5); under `set -euo pipefail` that
+# propagates out of an extraction assignment and would exit the hook with jq's
+# code. Claude Code treats any exit other than 2 as a NON-blocking error, so a
+# possibly-protected config write would proceed unchecked. This ERR trap converts
+# any uncaught crash below into a deny (exit 2) so a malformed payload blocks.
+trap 'deny "config-protection could not parse the tool payload to check the target path; blocking the write (fail-closed, issue #208)."' ERR
+
 # ── Protected config files ──────────────────────────────────────────
 PROTECTED_FILES=(
   # Linters
