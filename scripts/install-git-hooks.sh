@@ -22,6 +22,13 @@
 #                 + test-select (BLOCKING: the single owner of test execution —
 #                 a tiered, diff-aware suite; non-zero exit aborts the push, #19)
 #
+# Deliberately NOT wired natively: block-no-verify (issue #211). It is the sole
+# defense against `git commit|push --no-verify` — the flag that skips exactly the
+# commit-msg and pre-push hooks this script installs — so a native copy would be
+# skipped by the very command it must catch. It therefore lives ONLY as an agent
+# PreToolUse hook with no backstop here, which is why that script fails closed
+# (crash/malformed payload → exit 2) rather than trusting a native safety net.
+#
 # The native hooks synthesize the {"tool_input":{"command":"..."}} JSON the
 # cage scripts expect (reusing the exact same scripts — single source of truth)
 # and pipe it in. Blocking scripts exit non-zero to abort the git operation.
