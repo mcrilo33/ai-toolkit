@@ -1672,13 +1672,16 @@ afk_resolve_telemetry_auth() {
   export AI_TOOLKIT_OTEL=1
 }
 
-# afk_ensure_port <port> <launch-fn> <repo_root> -> ensure something LISTENs on <port>:
-# a no-op when already up; otherwise run <launch-fn> <repo_root> and re-probe up to
-# AFK_PORT_WAIT_TRIES times (so a slow container start isn't a false DOWN). rc 1 when the
-# port is still down after the launch — the caller turns that into a refuse-to-arm.
+# afk_ensure_port <port> <launch-fn> <repo_root> [recover-fn] -> ensure something LISTENs on
+# <port>: a no-op when already up; otherwise, when the port is DOWN, first run the optional
+# <recover-fn> <repo_root> (issue #202 H — tear down a crashed/stopped container so its --name
+# doesn't clash with the relaunch), then run <launch-fn> <repo_root> and re-probe up to
+# AFK_PORT_WAIT_TRIES times (so a slow container start isn't a false DOWN). rc 1 when the port
+# is still down after the launch — the caller turns that into a refuse-to-arm.
 afk_ensure_port() {
-  local port="$1" launch="$2" repo_root="$3" tries="${AFK_PORT_WAIT_TRIES:-10}" i=0
+  local port="$1" launch="$2" repo_root="$3" recover="${4:-}" tries="${AFK_PORT_WAIT_TRIES:-10}" i=0
   wt_port_listening "$port" && return 0
+  [ -n "$recover" ] && "$recover" "$repo_root"   # e.g. wt_collector_recover_dead: docker rm a dead container
   "$launch" "$repo_root"
   while [ "$i" -lt "$tries" ]; do
     wt_port_listening "$port" && return 0
@@ -1699,7 +1702,11 @@ afk_telemetry_preflight() {
     log "/afk: telemetry preflight FAILED — LANGFUSE_BASIC_AUTH unset and no conf to resolve it; refusing to arm (set it, or AI_TOOLKIT_OTEL=0 to run without telemetry)"
     return 1
   fi
-  if ! afk_ensure_port 4317 wt_collector_launch "$repo_root"; then
+  # Recover a crashed/stopped lf-collector (docker exit 255 observed) before relaunching: an
+  # Exited/Dead container still owns the `lf-collector` name, so a bare relaunch fails the
+  # --name clash and re-arm is blocked forever (#202 H). wt_collector_recover_dead tears down
+  # only a NON-running container (a healthy one is left untouched) so the relaunch is clean.
+  if ! afk_ensure_port 4317 wt_collector_launch "$repo_root" wt_collector_recover_dead; then
     log "/afk: telemetry preflight FAILED — otelcol collector down on :4317 and won't come up; refusing to arm (set AI_TOOLKIT_OTEL=0 to run without telemetry)"
     return 1
   fi

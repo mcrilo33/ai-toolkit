@@ -3764,6 +3764,9 @@ def _telemetry_prelude(
         f'wt_port_listening() {{ [ -e "{up_dir}/$1" ]; }}',
         f'wt_collector_launch() {{ echo "LAUNCHED-COLLECTOR $1"; {bind_c}; }}',
         f'wt_bridge_launch() {{ echo "LAUNCHED-BRIDGE $1"; {bind_b}; }}',
+        # #202 H: the preflight recovers a crashed/stopped collector container (so its --name
+        # doesn't clash with a relaunch) before launching. Stubbed so no real docker runs.
+        'wt_collector_recover_dead() { echo "RECOVERED-COLLECTOR"; }',
     ]
     if collector_up:
         lines.append(f'touch "{up_dir}/4317"')
@@ -3823,6 +3826,23 @@ def test_preflight_idempotent_when_both_already_up(tmp_path: Path) -> None:
 
     assert "RC=0" in result.stdout, result.stderr + result.stdout
     assert "LAUNCHED" not in result.stdout, "a live collector/bridge must not be relaunched"
+    assert "RECOVERED-COLLECTOR" not in result.stdout, (
+        "a healthy collector (port up) must not be torn down"
+    )
+
+
+def test_preflight_recovers_a_dead_collector_before_launch(tmp_path: Path) -> None:
+    # #202 H: a crashed/stopped lf-collector still owns the container name, so a bare relaunch
+    # fails the --name clash and the preflight blocks re-arm forever. The preflight now recovers
+    # (tears down) the dead container BEFORE launching, so the relaunch succeeds and arms.
+    result = _run_preflight(tmp_path, auth=True, collector_up=False, bridge_up=False)
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    out = result.stdout
+    assert "RECOVERED-COLLECTOR" in out, "a down collector must be recovered before relaunch"
+    assert out.index("RECOVERED-COLLECTOR") < out.index("LAUNCHED-COLLECTOR"), (
+        "recovery (docker rm of the dead container) must run BEFORE the relaunch"
+    )
 
 
 def test_preflight_refuses_when_auth_missing(tmp_path: Path) -> None:
