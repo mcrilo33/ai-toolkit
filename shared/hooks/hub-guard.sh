@@ -35,6 +35,11 @@ source "$HOOK_DIR/lib/utils.sh"
 # this trap jq's non-zero exit under `set -euo pipefail` would propagate out and,
 # being neither 0 nor 2, let the edit/commit proceed on the hub (Claude Code
 # treats a non-2 exit as non-blocking). Convert any uncaught crash into a deny.
+# The spoke-no-op guarantee rests on bash's default: a jq failure inside an
+# earlier extraction's command substitution does NOT abort (errexit is off in
+# subshells), so only get_edit_file_path's top-level assignment can trip this
+# trap. Do not enable `shopt -s inherit_errexit` here without re-checking that
+# the pre-worktree extractions still recover rather than deny a spoke.
 trap 'deny "hub-guard could not parse the tool payload on the planning hub; blocking (fail-closed, issue #208). Dispatch task work into its own worktree via the start-task skill."' ERR
 
 # Resolve the base branch the hub stays on — the ONE canonical resolver

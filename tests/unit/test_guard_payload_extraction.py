@@ -148,6 +148,15 @@ class TestMalformedPayloadFailsClosed:
     def test_hub_guard_string_tool_input_on_hub_denies(self, git_repo: Path) -> None:
         assert _run(HUB_GUARD, STRING_TOOL_INPUT, cwd=git_repo).returncode == BLOCK
 
+    def test_secrets_scan_string_tool_input_allows(self) -> None:
+        # Intended asymmetry vs. config-protection / hub-guard, which DENY the
+        # same payload: get_edit_new_content ends on `echo "$content"` (always
+        # exit 0), so a bare-string tool_input extracts empty content and allows
+        # like any no-content write — it never trips the ERR trap. Pin it so a
+        # future refactor ending that extractor on the jq call (which would flip
+        # secrets-scan to deny here) is caught.
+        assert _run(SECRETS_SCAN, STRING_TOOL_INPUT).returncode == ALLOW
+
 
 # ── the fix must not over-block well-formed payloads ──────
 
