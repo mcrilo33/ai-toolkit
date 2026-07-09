@@ -9,11 +9,15 @@
 # or what drives git.
 #
 # Mapping (native git hook → cage scripts):
-#   commit-msg  → commit-quality + commit-gauntlet
-#                 (both need the message: commit-quality validates format +
+#   commit-msg  → commit-quality + commit-gauntlet + red-proof-verify
+#                 (all three need the message: commit-quality validates format +
 #                  issue-anchor; commit-gauntlet needs it for the Tested-RED
-#                  carve-out. At commit-msg both the staged index AND the
-#                  message file exist, so this is the correct stage for both.)
+#                  carve-out; red-proof-verify RUNS each Tested-RED node and
+#                  requires it to FAIL — the native backstop for the CC-only
+#                  PreToolUse hook, whose `if:` filter misses chained/prefixed
+#                  commits and whose crash/malformed paths fail open (issue #210).
+#                  At commit-msg both the staged index AND the message file
+#                  exist, so this is the correct stage for all three.)
 #   pre-push    → red-proof-warn + reviewer-sep-warn (advisory; read git log)
 #                 + test-select (BLOCKING: the single owner of test execution —
 #                 a tiered, diff-aware suite; non-zero exit aborts the push, #19)
@@ -84,6 +88,7 @@ fi
 mkdir -p "$SCRIPTS_DST/lib"
 cp "$SHARED_HOOKS/commit-quality.sh" \
    "$SHARED_HOOKS/commit-gauntlet.sh" \
+   "$SHARED_HOOKS/red-proof-verify.sh" \
    "$SHARED_HOOKS/red-proof-warn.sh" \
    "$SHARED_HOOKS/reviewer-sep-warn.sh" \
    "$SHARED_HOOKS/anti-gutting-scan.sh" \
@@ -107,8 +112,11 @@ emit_commit_msg_hook() {
   cat <<'HOOK'
 #!/usr/bin/env bash
 # >>> ai-toolkit cage >>>
-# Native commit-msg hook: runs commit-quality + commit-gauntlet against a
-# synthesized Bash-tool payload built from the real commit message ($1).
+# Native commit-msg hook: runs commit-quality + commit-gauntlet + red-proof-verify
+# against a synthesized Bash-tool payload built from the real commit message ($1).
+# red-proof-verify is the native backstop for the CC-only PreToolUse hook (#210):
+# native git fires this on every commit, so chained/prefixed/env-assigned forms
+# the agent `if:` filter misses are still gated here.
 set -euo pipefail
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS="$SELF_DIR/ai-toolkit-scripts"
@@ -136,7 +144,7 @@ else
   PAYLOAD="{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git commit -m \\\"$ESC\\\"\"}}"
 fi
 
-for s in commit-quality commit-gauntlet; do
+for s in commit-quality commit-gauntlet red-proof-verify; do
   if [ -x "$SCRIPTS/$s.sh" ]; then
     printf '%s' "$PAYLOAD" | "$SCRIPTS/$s.sh" || exit $?
   fi
@@ -245,7 +253,7 @@ fi
 
 echo ""
 info "ai-toolkit cage installed as native git hooks in $TARGET"
-warn "Blocking gates (commit-quality, commit-gauntlet) now enforce on real git commit."
+warn "Blocking gates (commit-quality, commit-gauntlet, red-proof-verify) now enforce on real git commit."
 warn "The pre-push test gate (test-select) blocks the push when the selected tests fail."
 warn "Advisory gates (red-proof-warn, reviewer-sep-warn) run on git push and never block."
 echo "  Uninstall with: scripts/install-git-hooks.sh --uninstall $TARGET"
