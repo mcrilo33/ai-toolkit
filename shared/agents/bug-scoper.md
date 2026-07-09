@@ -89,8 +89,17 @@ Issues are cheap and reversible, so **auto-file is the safe default.**
   create, with `labels` — you have no shell, so filing is MCP-only). Report the URL.
 - **Attended (a human is present to approve):** return the full drafted issue —
   title, body, footer, labels — for a one-look approval instead of filing blind.
+- **Target repo — set `owner`/`repo` EXPLICITLY, never rely on the ambient default.**
+  A defect in the **ai-toolkit tooling** (a synced rule/skill/hook/script/agent, or the
+  `scripts/telemetry/` code — anything originating from ai-toolkit) is filed to the
+  **ai-toolkit upstream repo**: `owner: mcrilo33, repo: ai-toolkit`. This matters
+  because ai-toolkit is synced *into* other projects: without an explicit target the
+  MCP call defaults to the current project's git remote and misfiles the toolkit's own
+  bug into the host project's tracker. A defect in the **host project's own code** is
+  filed to that project's repo. (Canonical upstream is `mcrilo33/ai-toolkit`; a fork
+  changes it here.)
 
-State which path you took and why.
+State which path you took, and which repo you filed to and why.
 
 ## Report
 

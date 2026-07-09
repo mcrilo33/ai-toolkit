@@ -39,6 +39,22 @@ default rather than a noise risk:
 Hand it the evidence you already have — `file:line`, the repro or failing invariant,
 a fix direction, and any label/scope hints — so it verifies fast.
 
+## Filing upstream from a downstream project
+
+ai-toolkit is synced *into* other projects, so where a bug is filed depends on **whose
+code is broken**, not on which repo you happen to be sitting in:
+
+- A defect in the **ai-toolkit tooling** — a synced rule, skill, hook, script, agent,
+  or the telemetry code (files under `shared/`, `.claude/`, `.ai-toolkit/`,
+  `scripts/telemetry/`, …) — is filed to the **ai-toolkit upstream repo**
+  (`mcrilo33/ai-toolkit`), even when discovered inside a host project. Otherwise the
+  toolkit's own bugs scatter across downstream trackers and never reach its maintainer.
+- A defect in the **host project's own code** is filed to the **host project's** repo,
+  as normal.
+
+The `bug-scoper` agent targets the upstream repo **explicitly** for tooling defects
+rather than defaulting to the current project's git remote — see its Phase 5.
+
 ## What this does not cover
 
 - **Enhancements and design ideas** are not bugs; raise them conversationally or file

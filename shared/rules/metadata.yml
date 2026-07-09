@@ -103,11 +103,8 @@ issue-hygiene:
 
 bug-triage:
   name: "Bug Triage"
-  description: "When you discover a confirmed defect during any work, file it via the bug-scoper agent immediately without asking — the agent verifies evidence against the code and dedups, so filing-by-default is safe. Auto-file confirmed bugs; only surface genuine is-this-intended-design uncertainty for the human. Binds spokes too, so a mid-cycle discovery is filed, not buried."
-  applyTo: "**"
-  globs: "**"
-  paths: "**"
-  alwaysApply: true
+  description: "When you discover a confirmed defect during any work, file it via the bug-scoper agent immediately without asking — the agent verifies evidence against the code and dedups, so filing-by-default is safe. Auto-file confirmed bugs; only surface genuine is-this-intended-design uncertainty. ai-toolkit tooling defects go to the ai-toolkit upstream repo even from a downstream project, never the host repo. Surfaced on demand, not auto-applied to every session."
+  alwaysApply: false
 
 afk-answering:
   name: "AFK Answering"
