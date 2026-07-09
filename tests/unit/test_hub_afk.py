@@ -3361,6 +3361,95 @@ def test_watchdog_loop_exits_when_window_off(tmp_path: Path) -> None:
     assert not marker.exists(), "with the window off the watchdog must exit without respawning"
 
 
+# ── restart-survival re-arm (issue #202 A) ────────────────────────────────────
+# The supervisor+watchdog die with the hub session's shell on a process/machine
+# teardown, leaving .afk-state armed with nothing draining. `hub-afk.sh --reconcile`
+# (afk_reconcile) re-arms idempotently: armed + no live supervisor ⇒ relaunch (detached
+# no-arg resume) + ensure the watchdog, gated behind the same arm preconditions +
+# telemetry preflight a fresh arm runs; a no-op when a supervisor is already live or the
+# window is off. The AFK_RESPAWN_CMD / AFK_WATCHDOG_SPAWN_CMD seams stand in for the two
+# launches; AFK_ARM_PRECHECK=0 + AI_TOOLKIT_OTEL=0 bypass the two gates (their own tests
+# cover them), so these pin only the re-arm decision.
+
+
+def _reconcile_env(tmp_path: Path, *, resp: Path, wsp: Path, wf: Path) -> dict[str, str]:
+    return {
+        "AFK_STATE": str(tmp_path / "state"),
+        "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+        "AFK_WATCHDOG_FILE": str(wf),
+        "AFK_RESPAWN_CMD": f"touch {resp}",
+        "AFK_WATCHDOG_SPAWN_CMD": f"touch {wsp}",
+        "AFK_ARM_PRECHECK": "0",
+        "AI_TOOLKIT_OTEL": "0",
+    }
+
+
+def test_reconcile_noop_when_off(tmp_path: Path) -> None:
+    resp, wsp, wf = tmp_path / "resp", tmp_path / "wsp", tmp_path / "wf"
+    env = _reconcile_env(tmp_path, resp=resp, wsp=wsp, wf=wf)  # state absent ⇒ off
+
+    result = _call("afk_reconcile .", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert not resp.exists(), "no window armed ⇒ nothing to re-arm"
+    assert not wsp.exists()
+
+
+def test_reconcile_noop_when_supervisor_live(tmp_path: Path) -> None:
+    resp, wsp, wf = tmp_path / "resp", tmp_path / "wsp", tmp_path / "wf"
+    env = _reconcile_env(tmp_path, resp=resp, wsp=wsp, wf=wf)
+    # Armed + a live pid ($$) stamping the heartbeat ⇒ a supervisor is already running,
+    # so reconcile must NOT stack a second one (idempotent at every SessionStart).
+    hb = env["AFK_HEARTBEAT"]
+    expr = f'printf "drain\\n" > "{env["AFK_STATE"]}"; printf "%s 1700000000\\n" "$$" > "{hb}"; afk_reconcile .'
+
+    result = _call(expr, env={**env, "AFK_NOW": "1700000060"})
+
+    assert result.returncode == 0, result.stderr
+    assert not resp.exists(), "a live supervisor must not be re-armed"
+    assert not wsp.exists()
+
+
+def test_reconcile_rearms_when_armed_and_stale(tmp_path: Path) -> None:
+    resp, wsp, wf = tmp_path / "resp", tmp_path / "wsp", tmp_path / "wf"
+    env = _reconcile_env(tmp_path, resp=resp, wsp=wsp, wf=wf)
+    # Armed + a reaped (dead) heartbeat pid ⇒ the supervisor crashed but the state file
+    # still says draining: re-arm — relaunch the supervisor AND ensure the watchdog.
+    hb = env["AFK_HEARTBEAT"]
+    expr = (
+        f'printf "drain\\n" > "{env["AFK_STATE"]}"; '
+        f'dead=$(sh -c "echo \\$$"); printf "%s 1700000000\\n" "$dead" > "{hb}"; '
+        f"afk_reconcile ."
+    )
+
+    result = _call(expr, env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert resp.exists(), "armed + dead supervisor ⇒ the supervisor must be relaunched"
+    assert wsp.exists(), "re-arm must also ensure the watchdog is alive"
+
+
+def test_reconcile_refuses_when_telemetry_preflight_fails(tmp_path: Path) -> None:
+    resp, wsp, wf = tmp_path / "resp", tmp_path / "wsp", tmp_path / "wf"
+    env = _reconcile_env(tmp_path, resp=resp, wsp=wsp, wf=wf)
+    # Telemetry ON but no resolvable auth ⇒ the preflight refuses exactly as a fresh arm
+    # would, so reconcile must refuse to re-arm (never dispatch into a dead pipeline).
+    env["AI_TOOLKIT_OTEL"] = "1"
+    env["LANGFUSE_BASIC_AUTH"] = ""
+    env["AFK_TELEMETRY_CONF"] = str(tmp_path / "no-such-conf")
+    hb = env["AFK_HEARTBEAT"]
+    expr = (
+        f'printf "drain\\n" > "{env["AFK_STATE"]}"; '
+        f'dead=$(sh -c "echo \\$$"); printf "%s 1700000000\\n" "$dead" > "{hb}"; '
+        f"afk_reconcile ."
+    )
+
+    result = _call(expr, env=env)
+
+    assert result.returncode == 1, "a failed telemetry preflight must refuse to re-arm"
+    assert not resp.exists(), "no re-arm when the telemetry preflight fails"
+
+
 # ── telemetry preflight (issue #108) ──────────────────────────────────────────
 # The hub's posture is the INVERSE of the spoke's (#106 wt_otel_*_preflight, which
 # warn-and-continue): for an unattended drain the dashboard is the single source of

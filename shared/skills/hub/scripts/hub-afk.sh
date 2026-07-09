@@ -66,6 +66,8 @@
 #   hub-afk.sh --remote          # launch a detached `drain` on a configured always-on Mac
 #   hub-afk.sh --status          # report the active window, "off", or "STALE" (crashed)
 #   hub-afk.sh --off             # stop the supervisor + watchdog (clears the state file)
+#   hub-afk.sh --reconcile       # re-arm an armed-but-crashed drain (idempotent resume);
+#                                #   run at hub session start after a process/machine restart
 #   hub-afk.sh --once            # run a single tick and exit (tests / external cron)
 #   hub-afk.sh --watchdog        # the keeper loop: respawn the supervisor if it crashes
 #                                #   (auto-spawned on arm; rarely run by hand)
@@ -1282,6 +1284,44 @@ watchdog_loop() {
   done
 }
 
+# --- restart-survival re-arm (issue #202 A) -----------------------------------
+# The supervisor and its watchdog are children of the hub session's shell, so a process
+# or machine teardown kills BOTH and nothing re-arms — .afk-state stays armed with no
+# process draining, and every in-flight spoke runs on with no answerer/lander (the
+# overnight ~10h strand). afk_reconcile is the idempotent resume the hub runs when it
+# comes back up (`hub-afk.sh --reconcile`): safe to call at every session start.
+#   off   — no window armed; nothing to re-arm.
+#   live  — a supervisor is already stamping the heartbeat; NO-OP (never stack a second,
+#           which would clobber the per-run state).
+#   stale — armed but no live supervisor (crashed / killed with the shell): re-run the
+#           SAME arm preconditions + telemetry preflight a fresh arm runs (so a spoke
+#           checkout / dirty tree / dead pipeline refuses exactly as arming would — the
+#           base-branch precondition makes this a no-op in a spoke worktree), then
+#           relaunch the supervisor via the detached no-arg resume (re-adopting the
+#           in-flight spokes, never re-arming a fresh window) and ensure the watchdog.
+# The resumed supervisor's first tick recovers stranded spokes (reconcile + dead-pane +
+# land passes), so re-arm is the single entry point that self-heals a teardown.
+afk_reconcile() {
+  local repo_root="${1:-${MAIN_ROOT:-}}"
+  case "$(afk_supervisor_state)" in
+    off)  log "/afk reconcile: no window armed — nothing to re-arm"; return 0 ;;
+    live) log "/afk reconcile: a supervisor is already live — nothing to do"; return 0 ;;
+  esac
+  log "/afk reconcile: window armed but no live supervisor — re-arming (resume)"
+  if ! afk_arm_preconditions "$repo_root"; then
+    log "/afk reconcile: preconditions not met — not re-arming (see above)"
+    return 1
+  fi
+  if ! afk_telemetry_preflight "$repo_root"; then
+    log "/afk reconcile: telemetry preflight failed — not re-arming (see above)"
+    return 1
+  fi
+  _afk_watchdog_respawn   # detached no-arg resume — re-adopts the in-flight spokes
+  _afk_spawn_watchdog     # keep exactly one watchdog alive (idempotent)
+  log "/afk reconcile: re-armed — supervisor resumed, watchdog ensured"
+  return 0
+}
+
 # --- remote launch (--remote) -------------------------------------------------
 # Launch a detached, caffeinate-wrapped backlog drain on a configured always-on Mac over
 # SSH (issue #73). The home Mac runs the drain unattended on the SAME Claude subscription
@@ -1591,16 +1631,17 @@ main() {
   # main (the test harness drives it with stubbed shell functions) never execs — an
   # exec would silently drop every stub defined in the sourcing shell.
   case "${1:-}" in
-    --status | --off | --once | -h | --help) ;;
+    --status | --off | --once | --reconcile | -h | --help) ;;
     *) [[ "${BASH_SOURCE[0]}" == "${0}" ]] && _afk_exec_self_copy "$@" ;;
   esac
 
   # Subcommands that do not start the LOCAL supervisor loop.
   case "${1:-}" in
-    --status)   _status; return 0 ;;
-    --off)      afk_clear_state; echo "/afk: off (state cleared; the supervisor + watchdog stop on their next tick)"; return 0 ;;
-    --watchdog) watchdog_loop; return $? ;;
-    -h|--help)  sed -n '2,64p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
+    --status)    _status; return 0 ;;
+    --off)       afk_clear_state; echo "/afk: off (state cleared; the supervisor + watchdog stop on their next tick)"; return 0 ;;
+    --watchdog)  watchdog_loop; return $? ;;
+    --reconcile) afk_reconcile "$MAIN_ROOT"; return $? ;;
+    -h|--help)   sed -n '2,77p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
   esac
 
   local once=0
