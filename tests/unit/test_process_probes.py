@@ -17,6 +17,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 WT_LIB = Path(__file__).resolve().parents[2] / "scripts" / "worktree-lib.sh"
 
 
@@ -68,19 +70,30 @@ def test_wt_pgrep_returns_1_when_nothing_matches() -> None:
 
 
 def test_wt_pgrep_excludes_the_caller_so_it_never_self_matches() -> None:
-    # The only process whose argv holds SELF_ONLY_TOKEN_189 is this very shell
-    # (the pattern literal is in its argv). Without self-exclusion wt_pgrep would
-    # report the caller; with it, the match set is empty -> exit 1.
-    result = _run(
-        r"""
-        pids="$(wt_pgrep -f "SELF_ONLY_TOKEN_189")"; rc=$?
+    # Put a unique token into THIS shell's own argv (a positional arg), so a raw
+    # `pgrep -f` genuinely matches the caller (and, on Linux, the forked `$(...)`
+    # subshell that inherits the same argv). wt_pgrep must exclude both and report
+    # nothing -> exit 1. Where the platform's `pgrep -f` cannot see the caller's
+    # argv (e.g. macOS with an inline `bash -c`), the property is vacuous and we
+    # SKIP rather than assert a hollow green.
+    token = f"WTPGREP_SELF_{os.getpid()}"
+    script = r"""
+        raw="$(LC_ALL=C pgrep -f "$TOKEN" 2>/dev/null)"
+        if [ -z "$raw" ]; then echo "SKIP"; exit 0; fi
+        pids="$(wt_pgrep -f "$TOKEN")"; rc=$?
         echo "RC=$rc"
         echo "PIDS=[$pids]"
         """
+    result = subprocess.run(
+        ["bash", "-c", f'source "{WT_LIB}"\n{script}', "_", token],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TOKEN": token},
     )
 
+    if "SKIP" in result.stdout.splitlines():
+        pytest.skip("pgrep -f cannot match the caller's own argv on this platform")
     assert "RC=1" in result.stdout.splitlines(), result.stdout
-    assert str(os.getpid()) not in result.stdout  # never leaks any pid here
     assert "PIDS=[]" in result.stdout, result.stdout
 
 

@@ -28,25 +28,32 @@ SCRIPT_DIRS = [
 # The sanctioned home of the hardened helpers: it alone may call the raw tools.
 EXEMPT = {REPO_ROOT / "scripts" / "worktree-lib.sh"}
 
-# A bare `pgrep` (NOT `wt_pgrep`): `pgrep -f` dies "illegal byte sequence" on
-# non-ASCII argv under a non-C locale and self-matches a monitor loop's own argv.
-# Every pgrep now has a wt_pgrep path, so no bare pgrep survives outside the lib.
-RAW_PGREP = re.compile(r"(?<![\w-])pgrep\b")
+# A bare `pgrep`/`pkill` (NOT `wt_pgrep`): argv matching dies "illegal byte
+# sequence" on non-ASCII argv under a non-C locale and self-matches a monitor
+# loop's own argv. Every such probe now has a wt_pgrep path (kill = wt_pgrep then
+# `kill`), so none survive outside the lib.
+RAW_PGREP = re.compile(r"(?<![\w-])p(?:grep|kill)\b")
 # A bare `ps` (NOT `wt_ps_start_epoch`) reading the locale-formatted start time.
-RAW_PS_LSTART = re.compile(r"(?<![\w-])ps\b[^\n]*?-o\s+lstart")
+# Tolerates a glued flag (`-olstart`) and extra columns (`-o pid,lstart`).
+RAW_PS_LSTART = re.compile(r"(?<![\w-])ps\b[^\n]*?-o\s*[\w,]*lstart")
+
+# Characters that (with whitespace and line start) begin a new shell word, so a
+# following `#` opens a comment: `;` `|` `&` `(`.
+_WORD_BOUNDARY = " \t;|&("
 
 
 def _strip_comment(line: str) -> str:
-    """Drop a shell comment: a ``#`` at start-of-word (line start or after space).
+    """Drop a shell comment: a ``#`` at start-of-word (line start or after a word
+    boundary such as whitespace, ``;``, ``|``, ``&``, ``(``).
 
     Leaves ``${v#pat}``, ``$#``, and any ``#`` mid-word intact so parameter
     expansions are not mistaken for comments.
     """
-    prev_ws = True  # line start counts as start-of-word
+    prev_boundary = True  # line start counts as start-of-word
     for i, ch in enumerate(line):
-        if ch == "#" and prev_ws:
+        if ch == "#" and prev_boundary:
             return line[:i]
-        prev_ws = ch.isspace()
+        prev_boundary = ch in _WORD_BOUNDARY
     return line
 
 
@@ -67,7 +74,7 @@ def test_no_bare_process_probes_outside_the_helper_lib() -> None:
             code = _strip_comment(raw)
             if RAW_PGREP.search(code):
                 violations.append(
-                    f"{path.relative_to(REPO_ROOT)}:{lineno}: bare `pgrep` — use wt_pgrep"
+                    f"{path.relative_to(REPO_ROOT)}:{lineno}: bare `pgrep`/`pkill` — use wt_pgrep"
                 )
             if RAW_PS_LSTART.search(code):
                 violations.append(
