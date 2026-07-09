@@ -44,7 +44,17 @@ is_git_commit "$COMMAND" || exit 0
 # Pull the Tested-RED node IDs from the commit message. No trailer ⇒ this is
 # not a declared RED commit; nothing to verify here (commit-gauntlet and the
 # push-time backstop cover the rest).
-NODES=$(extract_tested_red_nodes "$COMMAND")
+#
+# The native commit-msg backstop (install-git-hooks.sh, issue #210) synthesizes
+# this command via jq @json, which encodes the message's newlines as a literal
+# backslash-n. extract_tested_red_nodes terminates a node ID on whitespace only,
+# so a collapsed "\n" would otherwise be absorbed into the ID (yielding a bogus,
+# unrunnable node) and a second Tested-RED: on that collapsed line would never
+# match. Normalize literal "\n" back to whitespace so a Tested-RED: node that is
+# not the final token — and multiple nodes across separate -m lines — extract
+# identically to the agent (CC) path. Valid pytest node IDs never contain a
+# backslash, so the agent path (no literal "\n") is unaffected.
+NODES=$(extract_tested_red_nodes "${COMMAND//\\n/ }")
 [ -z "$NODES" ] && exit 0
 
 PROJECT_ROOT=$(project_root_from_payload "$INPUT")
