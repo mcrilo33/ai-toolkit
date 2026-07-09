@@ -336,13 +336,22 @@ afk_heartbeat_file() {
   local common; common="$(git rev-parse --git-common-dir 2>/dev/null)" || common=".git"
   printf '%s\n' "$common/.afk-heartbeat"
 }
-# afk_write_heartbeat_pid <pid> -> stamp "<pid> <now>". A backgrounded stamper subshell must
-# record the SUPERVISOR's pid (its parent), not its own (#202 B), so the pid stays the truth
+# afk_write_heartbeat_pid <pid> -> stamp "<pid> <now>[ wake1]". A backgrounded stamper subshell
+# must record the SUPERVISOR's pid (its parent), not its own (#202 B), so the pid stays the truth
 # afk_supervisor_state cross-checks; afk_write_heartbeat is the common "stamp my own pid" case.
-afk_write_heartbeat_pid() { _afk_atomic_write "$(afk_heartbeat_file)" "$1 $(afk_now)" || true; }
+# The optional trailing wake-capability token (#207) is appended only when this supervisor has
+# armed its USR1 trap (_AFK_WAKE_TOKEN set below), so afk-notify-wake never SIGUSR1s — and thus
+# never KILLs — a pre-#176 supervisor whose default SIGUSR1 action is terminate.
+afk_write_heartbeat_pid() {
+  _afk_atomic_write "$(afk_heartbeat_file)" "$1 $(afk_now)${_AFK_WAKE_TOKEN:+ $_AFK_WAKE_TOKEN}" || true
+}
 afk_write_heartbeat() { afk_write_heartbeat_pid "$$"; }
 afk_read_heartbeat()  { local f; f="$(afk_heartbeat_file)"; [ -f "$f" ] && head -n1 "$f" 2>/dev/null || true; }
 afk_clear_heartbeat() { rm -f "$(afk_heartbeat_file)" 2>/dev/null || true; }
+# afk_heartbeat_epoch <heartbeat-line> -> the 2nd field (last-tick epoch) of a "<pid> <epoch>
+# [wake1]" heartbeat. Extract field 2 explicitly — NOT the last field: `${hb##* }` returns the
+# `wake1` token on a three-field line (#207) and would strand every staleness/age check.
+afk_heartbeat_epoch() { local rest="${1#* }"; printf '%s\n' "${rest%% *}"; }
 
 # --- last-action record (issue #202 B) ----------------------------------------
 # A one-line label of the supervisor's most recent MEANINGFUL action (dispatch/answer/land/
@@ -386,7 +395,7 @@ afk_supervisor_state() {
 # there is no heartbeat. Used by --status to report how long ago the supervisor ticked.
 _afk_heartbeat_age_minutes() {
   local hb tick; hb="$(afk_read_heartbeat)"; [ -n "$hb" ] || return 0
-  tick="${hb##* }"
+  tick="$(afk_heartbeat_epoch "$hb")"
   case "$tick" in '' | *[!0-9]*) return 0 ;; esac
   printf '%s\n' "$(( ($(afk_now) - tick) / 60 ))"
 }
@@ -1326,6 +1335,12 @@ supervise_tick() {
 _AFK_WOKEN=0
 _afk_on_usr1() { _AFK_WOKEN=1; }
 trap _afk_on_usr1 USR1
+# Advertise wake-capability ONLY now that the USR1 trap is armed (#207): the heartbeat writer
+# appends this token, so afk-notify-wake signals this supervisor iff it can safely absorb the
+# signal. Set at the trap site (not at the top of the file) so "token present" structurally
+# tracks "trap installed" — a pre-#176 supervisor never runs this line, stamps a bare
+# two-field heartbeat, and is left un-signalled rather than killed.
+_AFK_WAKE_TOKEN="wake1"
 
 # afk_interruptible_sleep <secs> -> a sleep that a USR1 cuts short. A trapped signal
 # interrupts the `wait` builtin (not a bare `sleep`), so background the timer and wait on
@@ -1418,7 +1433,7 @@ afk_done() {
 _afk_heartbeat_wedged() {
   local hb tick age stale_ticks limit
   hb="$(afk_read_heartbeat)"; [ -n "$hb" ] || return 1
-  tick="${hb##* }"
+  tick="$(afk_heartbeat_epoch "$hb")"
   case "$tick" in '' | *[!0-9]*) return 1 ;; esac
   stale_ticks="${AFK_STALE_TICKS:-10}"
   case "$stale_ticks" in '' | *[!0-9]*) stale_ticks=10 ;; esac
@@ -1886,7 +1901,7 @@ _afk_status_state_line() {
     return 0
   fi
   last="$(_afk_read_last_action)"
-  hb="$(afk_read_heartbeat)"; tick="${hb##* }"
+  hb="$(afk_read_heartbeat)"; tick="$(afk_heartbeat_epoch "$hb")"
   case "$tick" in '' | *[!0-9]*) tick="" ;; esac
   if [ -n "$tick" ]; then
     age=$(( now - tick ))
