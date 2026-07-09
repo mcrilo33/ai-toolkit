@@ -15,6 +15,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 HOOK = Path(__file__).resolve().parents[2] / "shared" / "hooks" / "afk-notify-wake.sh"
 
 # Pin git config to nothing so a host's global/system config never reaches the fixtures.
@@ -55,6 +57,13 @@ def _wake_env(heartbeat: Path, state_dir: Path) -> dict[str, str]:
     return {**_GIT_ENV, "AFK_HEARTBEAT": str(heartbeat), "AFK_STATE_DIR": str(state_dir)}
 
 
+def _write_heartbeat(hb: Path, pid: int, *, token: str | None = "wake1") -> None:
+    """Stamp a "<pid> <epoch> [wake1]" heartbeat. token=None ⇒ a pre-#176 supervisor with
+    no USR1 trap advertises no wake-capability (bare two-field line)."""
+    line = f"{pid} 1000000" + (f" {token}" if token else "")
+    hb.write_text(line + "\n")
+
+
 def test_spools_a_park_event_when_supervisor_live(tmp_path: Path) -> None:
     repo = _spoke(tmp_path)
     proc = subprocess.Popen(["sleep", "30"])
@@ -71,7 +80,7 @@ def test_spools_a_park_event_when_supervisor_live(tmp_path: Path) -> None:
     assert len(events) == 1, f"a live supervisor must get one park event, saw {events}"
 
 
-def test_signals_the_heartbeat_pid(tmp_path: Path) -> None:
+def test_signals_a_wake_capable_heartbeat_pid(tmp_path: Path) -> None:
     repo = _spoke(tmp_path)
     flag_file = tmp_path / "signalled"
     # `sleep & wait` so USR1 interrupts the wait and the trap fires at once (see the real
@@ -80,7 +89,7 @@ def test_signals_the_heartbeat_pid(tmp_path: Path) -> None:
         ["bash", "-c", f'trap "touch {flag_file}; exit 0" USR1; sleep 30 & wait']
     )
     hb = tmp_path / "hb"
-    hb.write_text(f"{proc.pid} 1000000\n")
+    _write_heartbeat(hb, proc.pid)  # three-field: advertises the `wake1` token
     try:
         _run(repo, _wake_env(hb, tmp_path / "afk-state"))
         proc.wait(timeout=5)
@@ -88,7 +97,30 @@ def test_signals_the_heartbeat_pid(tmp_path: Path) -> None:
         if proc.poll() is None:
             proc.terminate()
 
-    assert flag_file.exists(), "the heartbeat pid must receive SIGUSR1"
+    assert flag_file.exists(), "a wake-capable heartbeat pid must receive SIGUSR1"
+
+
+def test_no_signal_to_a_wake_incapable_supervisor(tmp_path: Path) -> None:
+    # The #207 fix: a two-field heartbeat is a pre-#176 supervisor with no USR1 trap, so the
+    # default SIGUSR1 action would TERMINATE it. The hook must still spool the park (the tick
+    # backstop services it) but send NO signal. Proven with a trap-LESS process: had a signal
+    # arrived, the default action would kill it and `wait` would return before the timeout.
+    repo = _spoke(tmp_path)
+    proc = subprocess.Popen(["sleep", "30"])  # no USR1 trap: a bare signal kills it
+    hb = tmp_path / "hb"
+    _write_heartbeat(hb, proc.pid, token=None)  # two-field: no wake-capability token
+    state = tmp_path / "afk-state"
+    try:
+        result = _run(repo, _wake_env(hb, state))
+        with pytest.raises(subprocess.TimeoutExpired):
+            proc.wait(timeout=1)  # still alive ⇒ no signal was delivered
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    events = list((state / "events").glob("*-176-park"))
+    assert len(events) == 1, f"a token-less heartbeat still gets the spool write, saw {events}"
 
 
 def test_no_op_on_a_hub_checkout(tmp_path: Path) -> None:
@@ -158,7 +190,7 @@ def test_signal_delivery_is_prompt(tmp_path: Path) -> None:
         ["bash", "-c", f'trap "touch {flag_file}; exit 0" USR1; sleep 30 & wait']
     )
     hb = tmp_path / "hb"
-    hb.write_text(f"{proc.pid} 1000000\n")
+    _write_heartbeat(hb, proc.pid)  # three-field: advertises the `wake1` token
     start = time.monotonic()
     try:
         _run(repo, _wake_env(hb, tmp_path / "afk-state"))

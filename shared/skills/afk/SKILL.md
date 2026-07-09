@@ -62,10 +62,16 @@ mid-dispatch) used to strand the whole run: `.afk-state` still read `draining`, 
 `status` reported a healthy run that no longer existed, and an in-flight spoke kept
 running with no answerer. Two mechanisms close that gap (issue #107):
 
-- **Heartbeat.** Each tick the supervisor stamps `<pid> <last_tick_epoch>` to
+- **Heartbeat.** Each tick the supervisor stamps `<pid> <last_tick_epoch> wake1` to
   `<git-common-dir>/.afk-heartbeat`. `status` cross-checks it against pid liveness, so a
   crashed supervisor is reported as `STALE — last tick <N>m ago, supervisor process not
-  found` instead of echoing the stale state file.
+  found` instead of echoing the stale state file. The trailing `wake1` is the
+  wake-capability token (issue #207): a trap-armed supervisor advertises it so the
+  Notification wake (`afk-notify-wake`) SIGUSR1s only a supervisor that can absorb the
+  signal — a pre-trap supervisor stamps a bare two-field line and is left un-signalled (its
+  default `SIGUSR1` action would terminate it) rather than killed. (`spoke-ready.sh`'s
+  scripted-marker wake still signals unconditionally — folding it behind the same token gate
+  is a pending follow-up.)
 - **Watchdog.** A thin keeper loop, auto-armed alongside the supervisor (and re-checked
   every tick, so the two keep each other alive), respawns the supervisor whenever the
   window is armed but no live process is stamping the heartbeat. The respawn is a no-arg

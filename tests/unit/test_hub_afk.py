@@ -2790,9 +2790,10 @@ def test_run_with_heartbeat_stamps_supervisor_pid_and_fresh_epoch(tmp_path: Path
     shell_pid = next(
         ln.split("=")[1] for ln in result.stdout.splitlines() if ln.startswith("SHELL_PID=")
     )
-    pid, epoch = hb.read_text().split()
+    pid, epoch, token = hb.read_text().split()
     assert pid == shell_pid, f"heartbeat pid must be the supervisor's, got {pid} != {shell_pid}"
     assert int(epoch) >= start, f"epoch must be fresh, got {hb.read_text()}"
+    assert token == "wake1", f"the stamper must advertise wake-capability (#207), got {token!r}"
 
 
 def test_run_with_heartbeat_returns_promptly_for_fast_command(tmp_path: Path) -> None:
@@ -2839,8 +2840,8 @@ def test_write_heartbeat_pid_stamps_the_given_pid(tmp_path: Path) -> None:
         f'afk_write_heartbeat_pid 4242; cat "{hb}"',
         env={"AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000000"},
     )
-    assert result.stdout.strip() == "4242 1700000000", (
-        "the stamper must record the pid it is handed"
+    assert result.stdout.strip() == "4242 1700000000 wake1", (
+        "the stamper must record the pid it is handed, with the wake-capability token (#207)"
     )
 
 
@@ -3272,9 +3273,10 @@ def test_clear_dispatch_epochs_drops_stale_entries(tmp_path: Path) -> None:
 # stale state file by cross-checking pid liveness.
 
 
-def test_afk_write_heartbeat_records_pid_and_epoch(tmp_path: Path) -> None:
+def test_afk_write_heartbeat_records_pid_epoch_and_wake_token(tmp_path: Path) -> None:
     hb = tmp_path / "heartbeat"
-    # afk_write_heartbeat stamps THIS process's pid and AFK_NOW; echo $$ to compare.
+    # afk_write_heartbeat stamps THIS process's pid and AFK_NOW; echo $$ to compare. Sourcing
+    # hub-afk.sh installs the USR1 trap, so the supervisor advertises the `wake1` token (#207).
     expr = f'afk_write_heartbeat; printf "PID=%s\\n" "$$"; cat "{hb}"'
 
     result = _call(expr, env={"AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000000"})
@@ -3282,7 +3284,24 @@ def test_afk_write_heartbeat_records_pid_and_epoch(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     pid = next(ln[4:] for ln in result.stdout.splitlines() if ln.startswith("PID="))
     written = hb.read_text().strip()
-    assert written == f"{pid} 1700000000", f"heartbeat must be '<pid> <epoch>', got {written!r}"
+    assert written == f"{pid} 1700000000 wake1", (
+        f"a trap-armed supervisor's heartbeat must be '<pid> <epoch> wake1', got {written!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "line,expected",
+    [
+        ("4242 1700000000 wake1", "1700000000"),  # three-field: the token is ignored
+        ("4242 1700000000", "1700000000"),  # legacy two-field
+        ("4242", "4242"),  # 1-field line (never emitted in practice): returns the lone field
+        ("", ""),  # empty heartbeat
+    ],
+)
+def test_afk_heartbeat_epoch_extracts_second_field(line: str, expected: str) -> None:
+    result = _call(f"afk_heartbeat_epoch '{line}'")
+
+    assert result.stdout.strip() == expected
 
 
 def test_afk_read_heartbeat_round_trips(tmp_path: Path) -> None:
@@ -3351,7 +3370,7 @@ def test_write_heartbeat_is_atomic_rename_not_truncate(tmp_path: Path) -> None:
 
     _call("afk_write_heartbeat", env={"AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000000"})
 
-    assert hb.read_text().strip().endswith("1700000000"), "the heartbeat content is intact"
+    assert hb.read_text().split()[1] == "1700000000", "the heartbeat epoch field is intact"
     assert hb.stat().st_ino != ino_before, "afk_write_heartbeat must rename, not truncate in place"
 
 
@@ -3428,6 +3447,20 @@ def test_afk_supervisor_state_stale_when_no_heartbeat(tmp_path: Path) -> None:
 def test_heartbeat_age_minutes_counts_up(tmp_path: Path) -> None:
     hb = tmp_path / "heartbeat"
     hb.write_text("4242 1700000000\n")  # 600s = 10 min before AFK_NOW
+
+    result = _call(
+        "_afk_heartbeat_age_minutes",
+        env={"AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000600"},
+    )
+
+    assert result.stdout.strip() == "10"
+
+
+def test_heartbeat_age_minutes_tolerates_wake_token(tmp_path: Path) -> None:
+    # A three-field "<pid> <epoch> wake1" heartbeat (#207): the age must read the EPOCH
+    # (field 2), never the trailing `wake1` token — a last-field read would strand the age.
+    hb = tmp_path / "heartbeat"
+    hb.write_text("4242 1700000000 wake1\n")  # 600s = 10 min before AFK_NOW
 
     result = _call(
         "_afk_heartbeat_age_minutes",
@@ -5525,6 +5558,24 @@ def test_heartbeat_wedged_false_when_epoch_fresh(tmp_path: Path) -> None:
     assert "RC=1" in result.stdout, "a recent tick is not wedged"
 
 
+def test_heartbeat_wedged_reads_epoch_past_the_wake_token(tmp_path: Path) -> None:
+    # The watchdog's wedged check must read the EPOCH (field 2) of a three-field heartbeat,
+    # not the trailing `wake1` (#207): a last-field read would parse `wake1` as non-numeric
+    # and return "not wedged", so a genuinely stale supervisor would never be respawned.
+    hb = tmp_path / "hb"
+    hb.write_text("4242 1000 wake1\n")  # epoch 1000, far past the stale limit below
+    env = {
+        "AFK_HEARTBEAT": str(hb),
+        "AFK_NOW": "9999",
+        "AFK_STALE_TICKS": "1",
+        "AFK_TICK_SECONDS": "1",
+    }
+
+    result = _call('_afk_heartbeat_wedged; echo "RC=$?"', env=env)
+
+    assert "RC=0" in result.stdout, "a stale epoch behind a wake token is still wedged"
+
+
 def test_watchdog_tick_respawns_and_kills_wedged_supervisor(tmp_path: Path) -> None:
     # A supervisor with a LIVE pid but a stale heartbeat is wedged (hung external call): the
     # watchdog kills that pid, then respawns. Spawn a real disposable process to stand in for
@@ -5641,7 +5692,7 @@ def test_run_with_heartbeat_fg_stamps_and_preserves_global(tmp_path: Path) -> No
     result = _call(expr, env={"AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000000"})
 
     assert "FLAG=7" in result.stdout, "the wrapped command runs in the current shell"
-    assert hb.read_text().strip().endswith("1700000000"), "the heartbeat was stamped"
+    assert hb.read_text().split()[1] == "1700000000", "the heartbeat epoch was stamped fresh"
 
 
 def test_answer_pass_preserves_auth_failed_flag(spoke_repo: Path) -> None:
@@ -5668,7 +5719,7 @@ def test_answer_pass_stamps_heartbeat_for_waiting_spoke(spoke_repo: Path, tmp_pa
 
     _call(expr, env={"AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000000"})
 
-    assert hb.exists() and hb.read_text().strip().endswith("1700000000"), (
+    assert hb.exists() and hb.read_text().split()[1] == "1700000000", (
         "the answerer wrap must stamp the heartbeat so a long answer never reads as wedged"
     )
 

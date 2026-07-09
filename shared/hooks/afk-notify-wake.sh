@@ -48,12 +48,21 @@ COMMON="$(git -C "$WT" rev-parse --git-common-dir 2>/dev/null || true)"
 case "$COMMON" in /*) ;; *) COMMON="$WT/$COMMON" ;; esac   # rev-parse may print a relative dir
 HB="${AFK_HEARTBEAT:-$COMMON/.afk-heartbeat}"
 [ -f "$HB" ] || exit 0
-PID="$(head -n1 "$HB" 2>/dev/null | awk '{print $1}')"
+# Read the heartbeat's fields once: "<pid> <epoch> [wake1]" (#107 pid/epoch, #207 wake token).
+# Pre-init both: if $HB vanishes in the TOCTOU window after the -f check, the redirect fails
+# and `read` never runs — pre-initialized vars keep set -u from aborting this best-effort hook.
+PID='' WAKE=''
+read -r PID _ WAKE _ < "$HB" 2>/dev/null || true
 case "$PID" in '' | *[!0-9]*) exit 0 ;; esac
 kill -0 "$PID" 2>/dev/null || exit 0
 
 DIR="${AFK_STATE_DIR:-$COMMON/ai-toolkit-afk}/events"
 mkdir -p "$DIR" 2>/dev/null || exit 0
 : > "$DIR/$(date +%s)-$ISSUE-park" 2>/dev/null || exit 0
-kill -USR1 "$PID" 2>/dev/null || true
+# Signal ONLY a wake-capable supervisor (#207): the heartbeat's third field is the capability
+# token a trap-armed supervisor advertises. A bare "<pid> <epoch>" heartbeat — a pre-#176
+# supervisor with no USR1 trap — gets the spool write above (the tick backstop services it) but
+# NO signal: the default SIGUSR1 action would TERMINATE a trap-less supervisor. The token is a
+# contract string shared with hub-afk.sh's heartbeat writer (kept in sync, not imported).
+[ "$WAKE" = "wake1" ] && kill -USR1 "$PID" 2>/dev/null || true
 exit 0
