@@ -144,6 +144,9 @@ def test_commit_msg_blocks_passing_tested_red_node(repo: Path) -> None:
     )
 
     assert commit.returncode != 0, "native red-proof backstop must block a passing Tested-RED node"
+    # Assert red-proof-verify is the gate that blocked (not commit-quality/gauntlet
+    # for an unrelated reason): its deny message names the passing node.
+    assert "PASS at the RED commit" in (commit.stdout + commit.stderr)
     assert _git(repo, "rev-parse", "HEAD").strip() == seed  # nothing committed
 
 
@@ -170,6 +173,7 @@ def test_chained_commit_blocked_by_native_backstop(repo: Path) -> None:
     )
 
     assert proc.returncode != 0, "chained commit must still hit the native red-proof backstop"
+    assert "PASS at the RED commit" in (proc.stdout + proc.stderr)
     assert _git(repo, "rev-parse", "HEAD").strip() == seed
 
 
@@ -203,3 +207,30 @@ def test_commit_msg_allows_genuine_red_node(repo: Path) -> None:
     assert commit.returncode == 0, commit.stderr
     body = _git(repo, "show", "-s", "--format=%B", "HEAD")
     assert "Tested-RED: tests/test_feature.py::test_compute" in body
+
+
+@pytest_runner
+def test_commit_msg_allows_when_tested_red_not_last_token(repo: Path) -> None:
+    # Native-path parity: the commit-msg hook @json-encodes the message, so its
+    # newlines become a literal `\n`. A `Tested-RED:` node that is not the final
+    # token must still extract cleanly (not absorb the trailing `\n<line>`), or a
+    # genuine failing node would be mis-read as an unrunnable one and false-block.
+    # Here the trailer precedes `Refs`, and the node genuinely FAILS → allow.
+    _install(repo)
+    _stage(
+        repo,
+        "tests/test_feature.py",
+        "def test_compute():\n    # RED: not implemented yet\n    assert 0 == 42\n",
+    )
+
+    commit = _commit(
+        repo,
+        "-m",
+        "test: add failing test",
+        "-m",
+        "Tested-RED: tests/test_feature.py::test_compute",
+        "-m",
+        "Refs #1",
+    )
+
+    assert commit.returncode == 0, commit.stderr
