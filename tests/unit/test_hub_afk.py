@@ -3213,6 +3213,48 @@ def test_afk_clear_heartbeat_removes_file(tmp_path: Path) -> None:
     assert result.stdout.strip() == "absent"
 
 
+# ── G: atomic state writes (issue #202 G) ─────────────────────────────────────
+# .afk-state / .afk-heartbeat are read by the watchdog, a second --status shell, and a racing
+# respawn. Plain truncating `printf >` writes let a reader observe a half-written file. The
+# writers now go through _afk_atomic_write (temp file + rename), so a reader always sees a
+# COMPLETE old-or-new file. The observable proof: the write REPLACES the target's inode
+# (rename) rather than truncating it in place (same inode) — deterministic, unlike a race.
+
+
+def test_atomic_write_writes_exact_content_and_leaves_no_temp(tmp_path: Path) -> None:
+    target = tmp_path / "f"
+    result = _call(f'_afk_atomic_write "{target}" "hello world"; ls "{tmp_path}"')
+
+    assert result.returncode == 0, result.stderr
+    assert target.read_text() == "hello world\n", "atomic write preserves the exact content"
+    assert result.stdout.split() == ["f"], "no temp residue is left beside the target"
+
+
+def test_write_state_is_atomic_rename_not_truncate(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.write_text("old\n")
+    ino_before = state.stat().st_ino
+
+    _call("afk_write_state new", env={"AFK_STATE": str(state)})
+
+    assert state.read_text().strip() == "new"
+    assert state.stat().st_ino != ino_before, (
+        "afk_write_state must rename a temp file over the target (new inode), not truncate in "
+        "place, so a racing reader never sees a half-written .afk-state (#202 G)"
+    )
+
+
+def test_write_heartbeat_is_atomic_rename_not_truncate(tmp_path: Path) -> None:
+    hb = tmp_path / "heartbeat"
+    hb.write_text("1 1\n")
+    ino_before = hb.stat().st_ino
+
+    _call("afk_write_heartbeat", env={"AFK_HEARTBEAT": str(hb), "AFK_NOW": "1700000000"})
+
+    assert hb.read_text().strip().endswith("1700000000"), "the heartbeat content is intact"
+    assert hb.stat().st_ino != ino_before, "afk_write_heartbeat must rename, not truncate in place"
+
+
 def test_afk_pid_alive_true_for_running_process() -> None:
     # $$ is the sourcing shell — guaranteed alive while the expression runs.
     result = _call("_afk_pid_alive $$ && echo yes || echo no")

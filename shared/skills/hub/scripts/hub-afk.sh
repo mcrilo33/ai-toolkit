@@ -251,7 +251,23 @@ afk_state_file() {
   printf '%s\n' "$common/.afk-state"
 }
 
-afk_write_state() { printf '%s\n' "$1" > "$(afk_state_file)"; }
+# _afk_atomic_write <file> <content> -> write <content>\n to <file> atomically: a temp file in
+# the SAME directory (so the rename is a same-filesystem atomic swap) then `mv` over the
+# target. A reader — the watchdog, a second --status shell, a respawn racing a live supervisor
+# — then always observes a COMPLETE old-or-new file, never a half-written truncation (#202 G).
+# The temp name carries $$ so two concurrent writers don't clobber each other's temp; the last
+# rename wins atomically. Best-effort: a failure cleans up the temp and returns nonzero, so the
+# caller's `|| true` posture (a write must never abort a tick) is preserved.
+_afk_atomic_write() {
+  local file="$1" content="$2" tmp="$1.tmp.$$"
+  if printf '%s\n' "$content" > "$tmp" 2>/dev/null && mv -f "$tmp" "$file" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+  return 1
+}
+
+afk_write_state() { _afk_atomic_write "$(afk_state_file)" "$1" || true; }
 afk_read_state()  { local f; f="$(afk_state_file)"; [ -f "$f" ] && head -n1 "$f" 2>/dev/null | tr -d '[:space:]' || true; }
 afk_clear_state() { rm -f "$(afk_state_file)" 2>/dev/null || true; afk_clear_heartbeat; }
 
@@ -285,7 +301,7 @@ afk_read_landed_count() {
   printf '%s\n' "$n"
 }
 _afk_incr_landed() {
-  printf '%s\n' "$(( $(afk_read_landed_count) + 1 ))" > "$(afk_landed_count_file)" 2>/dev/null || true
+  _afk_atomic_write "$(afk_landed_count_file)" "$(( $(afk_read_landed_count) + 1 ))" || true
 }
 _afk_clear_landed_count() { rm -f "$(afk_landed_count_file)" 2>/dev/null || true; }
 _afk_clear_drain_complete() { rm -f "$(afk_drain_complete_file)" 2>/dev/null || true; }
@@ -293,7 +309,7 @@ _afk_clear_drain_complete() { rm -f "$(afk_drain_complete_file)" 2>/dev/null || 
 # write the count to .afk-drain-complete, then reset the counter so the next
 # window starts fresh. Best-effort; a write failure never aborts the stop path.
 _afk_emit_drain_complete() {
-  printf '%s\n' "$(afk_read_landed_count)" > "$(afk_drain_complete_file)" 2>/dev/null || true
+  _afk_atomic_write "$(afk_drain_complete_file)" "$(afk_read_landed_count)" || true
   _afk_clear_landed_count
 }
 
@@ -311,7 +327,7 @@ afk_heartbeat_file() {
 # afk_write_heartbeat_pid <pid> -> stamp "<pid> <now>". A backgrounded stamper subshell must
 # record the SUPERVISOR's pid (its parent), not its own (#202 B), so the pid stays the truth
 # afk_supervisor_state cross-checks; afk_write_heartbeat is the common "stamp my own pid" case.
-afk_write_heartbeat_pid() { printf '%s %s\n' "$1" "$(afk_now)" > "$(afk_heartbeat_file)" 2>/dev/null || true; }
+afk_write_heartbeat_pid() { _afk_atomic_write "$(afk_heartbeat_file)" "$1 $(afk_now)" || true; }
 afk_write_heartbeat() { afk_write_heartbeat_pid "$$"; }
 afk_read_heartbeat()  { local f; f="$(afk_heartbeat_file)"; [ -f "$f" ] && head -n1 "$f" 2>/dev/null || true; }
 afk_clear_heartbeat() { rm -f "$(afk_heartbeat_file)" 2>/dev/null || true; }
@@ -327,7 +343,7 @@ _afk_last_action_file() {
 }
 _afk_set_last_action() {
   local dir; dir="$(_afk_state_dir)"; mkdir -p "$dir" 2>/dev/null || true
-  printf '%s\n' "$1" > "$(_afk_last_action_file)" 2>/dev/null || true
+  _afk_atomic_write "$(_afk_last_action_file)" "$1" || true
 }
 _afk_read_last_action() { local f; f="$(_afk_last_action_file)"; [ -f "$f" ] && head -n1 "$f" 2>/dev/null || true; }
 _afk_clear_last_action() { rm -f "$(_afk_last_action_file)" 2>/dev/null || true; }
@@ -748,7 +764,7 @@ _afk_incr_dispatch_failures() {
   local issue="$1" n dir
   dir="$(_afk_state_dir)"; mkdir -p "$dir" 2>/dev/null || true
   n=$(( $(_afk_read_dispatch_failures "$issue") + 1 ))
-  printf '%s\n' "$n" > "$(_afk_dispatch_fail_file "$issue")" 2>/dev/null || true
+  _afk_atomic_write "$(_afk_dispatch_fail_file "$issue")" "$n" || true
   printf '%s\n' "$n"
 }
 _afk_clear_dispatch_failures() { rm -f "$(_afk_dispatch_fail_file "$1")" 2>/dev/null || true; }
@@ -976,7 +992,7 @@ _afk_incr_land_retries() {
   local issue="$1" n dir
   dir="$(_afk_state_dir)"; mkdir -p "$dir" 2>/dev/null || true
   n=$(( $(_afk_read_land_retries "$issue") + 1 ))
-  printf '%s\n' "$n" > "$(_afk_land_retry_file "$issue")" 2>/dev/null || true
+  _afk_atomic_write "$(_afk_land_retry_file "$issue")" "$n" || true
 }
 _afk_clear_land_retries() { rm -f "$(_afk_land_retry_file "$1")" 2>/dev/null || true; }
 _afk_clear_land_retry_counts() { rm -f "$(_afk_state_dir)"/land-retry-*.count 2>/dev/null || true; }
