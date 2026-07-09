@@ -2950,20 +2950,103 @@ def test_auto_land_trusts_ready_marker_and_skips_suite(spoke_repo: Path, tmp_pat
     )
 
 
-def test_auto_land_skips_issue_already_blocked_at_tip(spoke_repo: Path, tmp_path: Path) -> None:
-    # AC2: a prior deterministic land failure left blocked/5 at the tip (alongside ready/5).
-    # auto_land must NOT re-invoke the land — escalate once, never loop merge→fail→reset→merge.
+# ── stranded ready+blocked: retry the transient land, never skip forever (#202 D) ─
+# A finished spoke whose tip carries BOTH ready/<N> and blocked/<N> hit a TRANSIENT land
+# failure (a diverged-merge blip, a momentary push rejection) — the tip is final, so it
+# will never commit fresh work for reconcile_markers to clear the stale block, and the old
+# "skip a blocked-at-tip issue" logic skip-landed it every tick FOREVER (recovered by hand
+# with a manual blocked/<N> delete). auto_land now RETRIES the land (bounded by
+# AFK_LAND_RETRY_MAX, default 1): it clears the stale block and re-lands; a repeat failure
+# re-escalates and counts the attempt; once the retries are exhausted it escalates VISIBLY
+# (a durable local record --status surfaces) instead of spinning silently.
+
+
+def test_auto_land_retries_ready_blocked_at_tip(spoke_repo: Path, tmp_path: Path) -> None:
+    # ready/5 + blocked/5 at a finished tip = a transient land failure: RETRY (not skip).
+    # With a land that now succeeds, the retry lands the spoke — no manual unblock needed.
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
     subprocess.run(["git", "tag", "blocked/5"], cwd=spoke_repo, check=True, capture_output=True)
-    wt_land, land_log = _land_argv_recorder(tmp_path)
+    wt_land, land_log = _land_recorder(tmp_path)  # succeeds (exit 0)
     statedir = tmp_path / "statedir"
     expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
 
-    _call(expr, env={"WT_LAND": str(wt_land), "AFK_STATE_DIR": str(statedir)})
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+        },
+    )
+
+    assert land_log.read_text().split() == ["5"], (
+        "a ready+blocked coexistence at a finished tip must be RETRIED, not skipped forever"
+    )
+    blocked = subprocess.run(
+        ["git", "rev-parse", "-q", "--verify", "refs/tags/blocked/5"],
+        cwd=spoke_repo,
+        capture_output=True,
+    )
+    assert blocked.returncode != 0, "the retry clears the stale blocked/5 before re-landing"
+
+
+def test_auto_land_ready_blocked_reescalates_on_repeat_failure(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The retry itself fails again: re-escalate blocked AND count the attempt, so the next
+    # tick can see the retry budget is spent (never an unbounded merge→fail→reset loop).
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    subprocess.run(["git", "tag", "blocked/5"], cwd=spoke_repo, check=True, capture_output=True)
+    wt_land = tmp_path / "wtland.sh"
+    wt_land.write_text("#!/usr/bin/env bash\nexit 1\n")  # land still fails
+    wt_land.chmod(0o755)
+    ready_stub, ready_log = _escalation_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "SPOKE_READY": str(ready_stub),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+        },
+    )
+
+    assert "--blocked 5" in ready_log.read_text(), "a failed retry re-escalates blocked/5"
+    assert (statedir / "land-retry-5.count").read_text().strip() == "1", (
+        "the retry attempt is counted so the budget is bounded"
+    )
+
+
+def test_auto_land_ready_blocked_escalates_visibly_when_retries_exhausted(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The retry budget is spent (count == AFK_LAND_RETRY_MAX): stop re-landing, but escalate
+    # VISIBLY via a durable local block record --status surfaces — never a silent forever-skip.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    subprocess.run(["git", "tag", "blocked/5"], cwd=spoke_repo, check=True, capture_output=True)
+    wt_land, land_log = _land_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "land-retry-5.count").write_text("1\n")  # already retried once (== default max)
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+        },
+    )
 
     assert not land_log.exists() or land_log.read_text().strip() == "", (
-        "an issue already carrying blocked/<issue> at its tip must not be re-landed "
-        "(escalate once, no retry loop)"
+        "with the retry budget spent the land is not re-invoked (no spin)"
+    )
+    assert (statedir / "blocked-5.txt").exists(), (
+        "an exhausted retry escalates VISIBLY (a durable local record), never a silent skip"
     )
 
 

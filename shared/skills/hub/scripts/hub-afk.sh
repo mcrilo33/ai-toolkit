@@ -900,6 +900,36 @@ _afk_review_verdict() {
   printf '%s' "$verdict"
 }
 
+# --- stranded ready+blocked land-retry budget (issue #202 D) ------------------
+# A finished tip carrying BOTH ready/<issue> and blocked/<issue> hit a TRANSIENT land
+# failure (a diverged-merge blip, a momentary push rejection). The tip is final, so the
+# spoke never commits fresh work for reconcile_markers to clear the stale block — and the
+# old "skip a blocked-at-tip issue" logic skip-landed it EVERY tick forever (recovered by
+# hand with a manual `blocked/<N>` delete). auto_land now RETRIES the land up to
+# AFK_LAND_RETRY_MAX times (per issue, this window); once the budget is spent it escalates
+# VISIBLY (a durable local record --status surfaces) instead of spinning silently.
+: "${AFK_LAND_RETRY_MAX:=1}"
+_afk_land_retry_file() { printf '%s\n' "$(_afk_state_dir)/land-retry-$1.count"; }
+_afk_read_land_retries() {
+  local f n; f="$(_afk_land_retry_file "$1")"
+  n="$( [ -f "$f" ] && head -n1 "$f" 2>/dev/null | tr -d '[:space:]' )"
+  case "$n" in '' | *[!0-9]*) n=0 ;; esac
+  printf '%s\n' "$n"
+}
+_afk_incr_land_retries() {
+  local issue="$1" n dir
+  dir="$(_afk_state_dir)"; mkdir -p "$dir" 2>/dev/null || true
+  n=$(( $(_afk_read_land_retries "$issue") + 1 ))
+  printf '%s\n' "$n" > "$(_afk_land_retry_file "$issue")" 2>/dev/null || true
+}
+_afk_clear_land_retries() { rm -f "$(_afk_land_retry_file "$1")" 2>/dev/null || true; }
+_afk_clear_land_retry_counts() { rm -f "$(_afk_state_dir)"/land-retry-*.count 2>/dev/null || true; }
+_afk_land_retry_max() {
+  local max="${AFK_LAND_RETRY_MAX:-1}"
+  case "$max" in '' | *[!0-9]*) max=1 ;; esac
+  printf '%s\n' "$max"
+}
+
 # auto_land -> land every ready/<issue> spoke. The ready/<issue> marker is the readiness
 # contract (enforced by _ready_at_tip above), so a foreign ready/<issue> left by a parallel
 # session is adopted and landed by default (#95). A failed land (merge conflict) emits
@@ -938,8 +968,19 @@ auto_land() {
     [ -n "$issue" ] || continue
     _ready_at_tip "$path" "$issue" || continue
     if _blocked_at_tip "$path" "$issue"; then
-      log "  skip land #$issue — already escalated blocked/$issue at the tip (escalate once, no retry loop)"
-      continue
+      # ready+blocked at a finished tip = a TRANSIENT land failure. Retry the land up to
+      # AFK_LAND_RETRY_MAX times, then escalate VISIBLY — never skip-land it forever (#202 D).
+      max="$(_afk_land_retry_max)"; tries="$(_afk_read_land_retries "$issue")"
+      if [ "$tries" -ge "$max" ]; then
+        log "  skip land #$issue — ready+blocked persisted after $tries land-retry attempt(s); escalating for a human (see --status), no more retries"
+        _afk_record_blocked_locally "$issue" "land retried $tries time(s) and still fails at a finished tip — needs a human"
+        continue
+      fi
+      log "  retry land #$issue — ready+blocked coexist at a finished tip (transient land failure); clearing blocked/$issue and re-landing (attempt $(( tries + 1 ))/$max)"
+      _afk_incr_land_retries "$issue"
+      git -C "$path" tag -d "blocked/$issue" >/dev/null 2>&1 || true
+      git -C "$path" push origin ":refs/tags/blocked/$issue" >/dev/null 2>&1 || true
+      # fall through to the land attempt below
     fi
     if [ "${AFK_LAND_FOREIGN:-1}" = "0" ] && [ -z "$(read_dispatch_epoch "$issue")" ]; then
       log "  skip land #$issue — foreign (no dispatch epoch) and AFK_LAND_FOREIGN=0"
@@ -956,6 +997,7 @@ auto_land() {
     log "→ land #$issue"
     if _afk_run_with_heartbeat bash "$wt_land" "$issue" --skip-tests >/dev/null 2>&1; then
       log "  landed #$issue"
+      _afk_clear_land_retries "$issue"   # a successful land resets the retry budget (#202 D)
       _afk_incr_landed   # tally for the drain-complete notification (#150)
     else
       _escalate_blocked "$path" "$issue" "auto-land failed (merge conflict or push rejection) — needs a human"
@@ -1753,6 +1795,7 @@ main() {
     _afk_clear_drain_complete # ...and drop any un-consumed completion signal from a prior drain
     _clear_blocked_records   # fresh window ⇒ --status shows only THIS run's durable blocks
     _afk_clear_dispatch_fail_counts # fresh window ⇒ every issue's dispatch ceiling resets (#170)
+    _afk_clear_land_retry_counts # fresh window ⇒ every issue's land-retry budget resets (#202 D)
     log "/afk: armed ($([ "$end" = drain ] && echo 'drain — until the backlog is empty' || echo "until $(wt_date_ymd "$end") $(date -r "$end" +%H:%M 2>/dev/null || date -d "@$end" +%H:%M)"))"
   fi
 
