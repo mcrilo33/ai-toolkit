@@ -36,13 +36,14 @@ ALLOW = 0
 NO_VERIFY = "--no-" + "verify"
 
 
-def _run(script: Path, payload: str) -> int:
+def _run(script: Path, payload: str, *, cwd: Path | None = None) -> int:
     """Run the hook with a raw stdin payload; return its exit code."""
     return subprocess.run(
         ["bash", str(script)],
         input=payload,
         capture_output=True,
         text=True,
+        cwd=str(cwd) if cwd else None,
     ).returncode
 
 
@@ -70,11 +71,24 @@ def test_garbage_stdin_fails_closed() -> None:
     assert _run(BLOCK_NO_VERIFY, "not json at all") == BLOCK
 
 
-def test_lib_source_crash_fails_closed(tmp_path: Path) -> None:
-    # Copy the hook WITHOUT its lib/ so ``source lib/utils.sh`` fails. A crash
-    # (exit != 2) is fail-open on Claude Code; the hook must re-exit 2 instead.
+def test_missing_lib_fails_closed(tmp_path: Path) -> None:
+    # Copy the hook WITHOUT its lib/, so the readable guard trips before the
+    # source line: an absent utils.sh must DENY, not crash-open at exit 1.
     orphan = tmp_path / "block-no-verify.sh"
     shutil.copy(BLOCK_NO_VERIFY, orphan)
+    assert _run(orphan, _claude(f"git commit {NO_VERIFY} -m x")) == BLOCK
+
+
+def test_missing_transitive_lib_fails_closed(tmp_path: Path) -> None:
+    # utils.sh present but telemetry.sh (which utils.sh sources UNCONDITIONALLY)
+    # absent. `source utils.sh` would then exit the shell as a special builtin
+    # with code 1 — bypassing the ERR trap — so the hook must guard the transitive
+    # lib by hand and DENY. Without that guard this returns 1 (crash-open).
+    orphan = tmp_path / "block-no-verify.sh"
+    shutil.copy(BLOCK_NO_VERIFY, orphan)
+    lib = tmp_path / "lib"
+    shutil.copytree(HOOKS_DIR / "lib", lib)
+    (lib / "telemetry.sh").unlink()
     assert _run(orphan, _claude(f"git commit {NO_VERIFY} -m x")) == BLOCK
 
 
@@ -111,3 +125,23 @@ def test_no_verify_blocks(command: str) -> None:
 )
 def test_clean_and_force_push(command: str, expected: int) -> None:
     assert _run(BLOCK_NO_VERIFY, _claude(command)) == expected
+
+
+# ── Fail-closed must not override the #154 global off switch ───────────
+
+
+def test_disabled_toolkit_passes_through(tmp_path: Path) -> None:
+    # When the toolkit is disabled (the <git-common-dir>/ai-toolkit-off marker),
+    # utils.sh exits 0 during sourcing — BEFORE the telemetry span arms. A naive
+    # fail-closed EXIT trap would flip that passthrough into a deny and lock out
+    # every command; the readable-guard approach must leave the off switch intact.
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True, capture_output=True)
+    gcd = subprocess.run(
+        ["git", "rev-parse", "--git-common-dir"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (tmp_path / gcd / "ai-toolkit-off").touch()
+    assert _run(BLOCK_NO_VERIFY, _claude(f"git commit {NO_VERIFY} -m x"), cwd=tmp_path) == ALLOW

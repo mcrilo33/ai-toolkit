@@ -14,13 +14,18 @@
 # exit != 2 is a non-blocking error and the tool call PROCEEDS — so a crash, or a
 # malformed payload that yields no command, would otherwise let the bypass flag
 # through crash-open (issue #211). Three guards prevent that:
-#   1. `trap 'exit 2' ERR` — a set -e command failure (path resolution, a
-#      crashing helper) re-exits 2 (deny) rather than a non-2 crash code. EXIT is
-#      owned by the telemetry span in utils.sh; ERR is a separate trap slot, so
-#      the two compose.
-#   2. An explicit `[ -r "$LIB" ]` guard before the source: a missing/unreadable
-#      lib makes `source` exit the shell as a special builtin — bypassing ERR and
-#      leaving `$?` at 0 in any EXIT trap — so it is caught by hand, not a trap.
+#   1. `trap 'exit 2' ERR` — a failing top-level command or command substitution
+#      under set -e (e.g. HOOK_DIR resolution, read_stdin) re-exits 2 (deny)
+#      rather than a non-2 crash code. EXIT is owned by the telemetry span in
+#      utils.sh; ERR is a separate trap slot, so the two compose. (A failure
+#      INSIDE a called helper does not fire ERR without set -E — the readable
+#      guard below, not this trap, covers the lib-load crash.)
+#   2. An explicit readable guard before the source, covering utils.sh AND the
+#      libs it sources UNCONDITIONALLY (telemetry.sh): source of a missing file
+#      exits the shell as a special builtin — bypassing ERR and leaving `$?` at 0
+#      in any EXIT trap — so a partial install must be caught by hand, not a trap.
+#      (enabled.sh is `[ -f ]`-guarded inside utils.sh, so its absence degrades
+#      safely to ENABLED and needs no guard here.)
 #   3. An unreadable/empty command DENIES rather than silently passing — an
 #      unparseable Bash payload is exactly where a bypass would hide.
 #
@@ -40,12 +45,17 @@ set -euo pipefail
 trap 'exit 2' ERR
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LIB="$HOOK_DIR/lib/utils.sh"
-if [ ! -r "$LIB" ]; then
-  echo "[Hook] Blocked: block-no-verify cannot load its lib ($LIB) — failing closed (this is the sole --no-verify defense)." >&2
-  exit 2
-fi
-source "$LIB"
+LIB_DIR="$HOOK_DIR/lib"
+# Guard utils.sh and every lib it sources unconditionally: a missing file makes
+# `source` exit the shell (special builtin) before any code runs, and that exit
+# escapes both the ERR trap and a $?-based EXIT trap. Deny by hand instead.
+for _lib in utils.sh telemetry.sh; do
+  if [ ! -r "$LIB_DIR/$_lib" ]; then
+    echo "[Hook] Blocked: block-no-verify cannot load lib/$_lib — failing closed (this is the sole --no-verify defense)." >&2
+    exit 2
+  fi
+done
+source "$LIB_DIR/utils.sh"
 
 INPUT=$(read_stdin)
 COMMAND=$(get_shell_command "$INPUT")
