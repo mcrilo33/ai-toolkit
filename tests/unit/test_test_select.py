@@ -424,24 +424,123 @@ def test_branch_and_tag_mix_runs_the_suite(repo: Path, tmp_path: Path) -> None:
     assert "--testmon" in _runlog(runlog), "a branch+tag push still tests the branch"
 
 
-# --- safe fallback: no pytest at all ---------------------------------------------
+# --- no runner but tests are demanded: fail closed (issue #213) -------------------
 
 
-def test_no_pytest_runs_nothing(repo: Path, tmp_path: Path) -> None:
-    # With no pytest resolvable there is nothing to run, even for a python diff —
-    # the gate degrades to a no-op rather than erroring the push.
-    base = _rev(repo)
-    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+def _make_no_pytest_sandbox(tmp_path: Path) -> Path:
+    """Build a PATH sandbox with git reachable but no resolvable pytest runner.
+
+    `git` is symlinked in so the script's own classification calls work; the
+    `python3`/`python` stubs fail the `import pytest` probe, so `detect_pytest`
+    resolves nothing (no `.venv/bin/pytest` and no `pytest` on PATH either).
+    """
     sandbox = tmp_path / "nopy"
     sandbox.mkdir()
     git_bin = shutil.which("git")
     assert git_bin, "git must be on PATH for this test"
     os.symlink(git_bin, sandbox / "git")  # git stays reachable
-    for name in ("python3", "python"):  # but `import pytest` always fails
-        stub = sandbox / name
+    for py in ("python3", "python"):  # but `import pytest` always fails
+        stub = sandbox / py
         stub.write_text("#!/bin/sh\nexit 1\n")
         stub.chmod(0o755)
+    return sandbox
+
+
+def test_no_pytest_blocks_python_diff(repo: Path, tmp_path: Path) -> None:
+    # A python diff demands tests; with no runner resolvable the gate cannot
+    # prove the tree green, so it fails closed (nonzero) rather than shipping an
+    # untested diff on a silent exit 0 (issue #213).
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    sandbox = _make_no_pytest_sandbox(tmp_path)
     env = {**_GIT_ENV, "PATH": f"{sandbox}:/usr/bin:/bin"}
+
+    proc = subprocess.run(
+        ["/bin/bash", str(TEST_SELECT)],
+        cwd=str(repo),
+        input=_stdin(tip, base),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert proc.returncode != 0, proc.stderr
+    assert "no pytest" in proc.stderr
+
+
+def test_no_pytest_blocks_full_suite_demand(repo: Path, tmp_path: Path) -> None:
+    # An unmapped shell change escalates to the full suite; with no runner that
+    # full-suite demand also fails closed (issue #213) — a non-python diff that
+    # needs tests is no different from a python one.
+    base = _rev(repo)
+    tip = _commit(repo, {"scripts/unmapped.sh": "echo hi\n"})
+    sandbox = _make_no_pytest_sandbox(tmp_path)
+    env = {**_GIT_ENV, "PATH": f"{sandbox}:/usr/bin:/bin"}
+
+    proc = subprocess.run(
+        ["/bin/bash", str(TEST_SELECT)],
+        cwd=str(repo),
+        input=_stdin(tip, base),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert proc.returncode != 0, proc.stderr
+    assert "no pytest" in proc.stderr
+
+
+def test_no_pytest_blocks_selected_diff(repo: Path, tmp_path: Path) -> None:
+    # A mapped non-python change resolves to the SELECTED tier; with no runner it
+    # fails closed too, proving the block is tier-agnostic across all three
+    # test-demanding tiers (issue #213), not just PYTHON/FULL.
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
+    tip = _commit(repo, {"scripts/do.sh": "#!/bin/sh\necho hi\n"})
+    sandbox = _make_no_pytest_sandbox(tmp_path)
+    env = {**_GIT_ENV, "PATH": f"{sandbox}:/usr/bin:/bin"}
+
+    proc = subprocess.run(
+        ["/bin/bash", str(TEST_SELECT)],
+        cwd=str(repo),
+        input=_stdin(tip, base),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert proc.returncode != 0, proc.stderr
+    assert "no pytest" in proc.stderr
+
+
+def test_no_pytest_still_allows_docs_only(repo: Path, tmp_path: Path) -> None:
+    # A docs-only diff needs no runner at all — the missing-runner block sits
+    # after the NOTHING short-circuit, so this legitimate no-op still exits 0.
+    base = _rev(repo)
+    tip = _commit(repo, {"README.md": "seed\nmore\n"})
+    sandbox = _make_no_pytest_sandbox(tmp_path)
+    env = {**_GIT_ENV, "PATH": f"{sandbox}:/usr/bin:/bin"}
+
+    proc = subprocess.run(
+        ["/bin/bash", str(TEST_SELECT)],
+        cwd=str(repo),
+        input=_stdin(tip, base),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_no_pytest_with_skip_env_still_passes(repo: Path, tmp_path: Path) -> None:
+    # TEST_SELECT_SKIP is handled before the runner probe, so the explicit
+    # override still lets a runner-less checkout push (issue #213 keeps the
+    # escape hatch working — only the silent fail-open is closed).
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})
+    sandbox = _make_no_pytest_sandbox(tmp_path)
+    env = {**_GIT_ENV, "PATH": f"{sandbox}:/usr/bin:/bin", "TEST_SELECT_SKIP": "1"}
 
     proc = subprocess.run(
         ["/bin/bash", str(TEST_SELECT)],

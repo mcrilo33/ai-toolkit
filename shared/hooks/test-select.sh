@@ -20,9 +20,13 @@
 #   • anything else (an unmapped, non-exempt file)
 #       → the FULL suite (which contains the meta-test natively)
 #
-# SAFE FALLBACKS:
+# SAFE FALLBACKS (all fail CLOSED — a demand we can't prove blocks, never waves
+# through):
 #   • testmon not installed  → full suite (never silently skip python tests)
-#   • no pytest resolvable   → nothing to run (degrade, don't error the push)
+#   • no pytest resolvable    → block the push (issue #213): a docs-only/empty
+#     diff needs no runner and exits 0, but a diff that demands tests with no
+#     runner can't be proven green, so it fails closed (nonzero) rather than
+#     shipping untested — TEST_SELECT_SKIP is the explicit override
 #   • a diff range that can't be resolved → full suite (can't prove safe)
 #
 # INPUT: git feeds a pre-push hook the pushed refs on stdin, one per line:
@@ -323,11 +327,18 @@ if [ "$DECISION" = "NOTHING" ]; then
   exit 0
 fi
 
-# ── A runner is required for PYTHON/FULL; none → nothing to run (safe fallback) ──
+# ── A runner is required for PYTHON/SELECTED/FULL; none → fail closed (issue #213) ─
+# By here DECISION is PYTHON, SELECTED, or FULL — the NOTHING (docs-only/empty)
+# tier already exited 0 above, needing no runner. This diff demands tests but no
+# pytest resolves, so the tree CANNOT be proven green. Exiting 0 here would ship
+# an untested python diff on a silent pass — and mint no green-tree stamp, so the
+# post-land sweep never fires either. Fail closed instead, exactly as the bad-sha
+# path escalates rather than waving a diff through. TEST_SELECT_SKIP (handled
+# above) stays the explicit override for a runner-less checkout.
 RUNNER="$(detect_pytest "." || true)"
 if [ -z "$RUNNER" ]; then
-  note "no pytest available — nothing to run"
-  exit 0
+  note "no pytest available but this $DECISION diff demands tests — cannot prove the tree green; blocking the push. Install pytest (pip install -r requirements-dev.txt) or set TEST_SELECT_SKIP=1 to override deliberately."
+  exit 1
 fi
 read -r -a RUNNER_ARR <<< "$RUNNER"
 
