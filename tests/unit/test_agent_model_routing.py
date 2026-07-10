@@ -28,14 +28,15 @@ from metadata_parser import parse  # noqa: E402
 
 AGENTS_METADATA = REPO_ROOT / "shared" / "agents" / "metadata.yml"
 
+FABLE = "claude-fable-5"
 OPUS = "claude-opus-4-8"
 SONNET = "claude-sonnet-5"
 
 EXPECTED_ROUTING = {
-    # architect/planner carried claude-fable-5 until it was retired (#218); they
-    # fell back to opus, the strongest reasoning model still available.
-    "architect": OPUS,
-    "planner": OPUS,
+    # architect/planner returned to claude-fable-5 when it became available again
+    # (they fell back to opus during the #218 retirement window).
+    "architect": FABLE,
+    "planner": FABLE,
     "debug": OPUS,
     "security-reviewer": OPUS,
     "code-review": OPUS,
@@ -73,9 +74,13 @@ def test_agent_effort_stays_max(config: dict, name: str) -> None:
     assert routed[1] == "max"
 
 
-def test_fable_is_fully_retired(config: dict) -> None:
-    # claude-fable-5 was retired (#218); no agent may route to it any more.
+def test_fable_reserved_for_design_agents(config: dict) -> None:
+    # claude-fable-5 is back after the #218 retirement window, but stays scarce:
+    # only the design/plan agents (architect, planner) may route to it.
     for name in EXPECTED_ROUTING:
         routed = cfg.agent_model(config, name)
         assert routed is not None
-        assert routed[0] != "claude-fable-5"
+        if name in ("architect", "planner"):
+            assert routed[0] == FABLE
+        else:
+            assert routed[0] != FABLE

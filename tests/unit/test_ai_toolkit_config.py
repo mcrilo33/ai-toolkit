@@ -42,11 +42,11 @@ OPUS = "claude-opus-4-8"
 SONNET = "claude-sonnet-5"
 
 # Mirrors shared/agents/metadata.yml's #141 routing — now sourced from the config.
-# architect/planner carried FABLE until claude-fable-5 was retired (#218); they
-# fell back to OPUS, the strongest reasoning model still available.
+# architect/planner returned to FABLE when claude-fable-5 became available again
+# (they fell back to OPUS during the #218 retirement window).
 EXPECTED_AGENT_ROUTING = {
-    "architect": OPUS,
-    "planner": OPUS,
+    "architect": FABLE,
+    "planner": FABLE,
     "debug": OPUS,
     "security-reviewer": OPUS,
     "code-review": OPUS,

@@ -117,10 +117,10 @@ model:
   # each agent's claude `model:`/`effort:` frontmatter.
   subagents:
     architect:
-      model: claude-opus-4-8
+      model: claude-fable-5
       effort: max
     planner:
-      model: claude-opus-4-8
+      model: claude-fable-5
       effort: max
     debug:
       model: claude-opus-4-8
