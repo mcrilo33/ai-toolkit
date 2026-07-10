@@ -84,6 +84,11 @@ remove_block() {
 if [ "$UNINSTALL" -eq 1 ]; then
   for h in commit-msg pre-push; do
     remove_block "$HOOKS_DST/$h"
+    # Restore any foreign hook we moved aside at install (overwriting the now
+    # block-stripped remnant, i.e. the leftover shebang line).
+    if [ -f "$HOOKS_DST/$h.ai-toolkit-foreign" ]; then
+      mv "$HOOKS_DST/$h.ai-toolkit-foreign" "$HOOKS_DST/$h"
+    fi
   done
   rm -rf "$SCRIPTS_DST"
   info "Uninstalled ai-toolkit native git hooks from $TARGET"
@@ -152,10 +157,25 @@ else
 fi
 
 for s in commit-quality commit-gauntlet red-proof-verify; do
-  if [ -x "$SCRIPTS/$s.sh" ]; then
-    printf '%s' "$PAYLOAD" | "$SCRIPTS/$s.sh" || exit $?
+  # Fail CLOSED, mirroring the pre-push test-select check: a configured gate that
+  # is missing or not executable cannot run, so block the commit rather than let
+  # it proceed ungated (re-run install-git-hooks.sh to restore it). A silent skip
+  # here would mean a deleted/de-executable'd gate waves every commit through.
+  if [ ! -x "$SCRIPTS/$s.sh" ]; then
+    echo "commit-msg: $s.sh is missing or not executable — re-run scripts/install-git-hooks.sh" >&2
+    exit 1
   fi
+  printf '%s' "$PAYLOAD" | "$SCRIPTS/$s.sh" || exit $?
 done
+
+# Chain a pre-existing foreign commit-msg hook (moved aside by the installer) as a
+# SEPARATE process so it keeps its own shebang, shell options, and argv — inlining
+# it under our `set -euo pipefail` could turn a benign hook (e.g. an unmatched
+# `grep -q`) into a commit-blocker. Its non-zero exit still blocks, fail-closed.
+FOREIGN="${BASH_SOURCE[0]}.ai-toolkit-foreign"
+if [ -x "$FOREIGN" ]; then
+  "$FOREIGN" "$@" || exit $?
+fi
 # <<< ai-toolkit cage <<<
 HOOK
 }
@@ -214,6 +234,17 @@ if [ ! -x "$SCRIPTS/test-select.sh" ]; then
   exit 1
 fi
 printf '%s\n' "$PREPUSH_REFS" | "$SCRIPTS/test-select.sh" || exit $?
+
+# Chain a pre-existing foreign pre-push hook (moved aside by the installer) as a
+# SEPARATE process, re-feeding git's ref lines on its stdin (we drained them above)
+# and passing its argv. A here-string (not a `printf | hook` pipe) feeds stdin so a
+# foreign hook that ignores stdin cannot SIGPIPE the writer and, under pipefail,
+# abort the push on a code the hook itself never returned. Runs only once our
+# blocking gate has passed; the foreign hook's own non-zero exit still aborts.
+FOREIGN="${BASH_SOURCE[0]}.ai-toolkit-foreign"
+if [ -x "$FOREIGN" ]; then
+  "$FOREIGN" "$@" <<<"$PREPUSH_REFS" || exit $?
+fi
 exit 0
 # <<< ai-toolkit cage <<<
 HOOK
@@ -224,13 +255,21 @@ install_hook() {
   local dst="$HOOKS_DST/$name"
   mkdir -p "$HOOKS_DST"
   if [ -f "$dst" ] && ! grep -qF "$MARK" "$dst"; then
-    # Pre-existing non-ours hook: append our block instead of clobbering.
-    warn "Existing $name hook found — appending ai-toolkit block"
-    "$emit_fn" | tail -n +2 >> "$dst"   # drop the duplicate shebang
-  else
-    remove_block "$dst" 2>/dev/null || true
-    "$emit_fn" > "$dst"
+    # Pre-existing non-ours hook: move it ASIDE to a sidecar and install our block
+    # in its place. Appending our block after the foreign hook (the old behavior)
+    # left it unreachable whenever the foreign hook ended in `exit 0` (the common
+    # case) — the gate silently never ran, yet install reported success. Our block
+    # invokes the sidecar as a SEPARATE process (see the emitted hook), so the
+    # foreign hook keeps its own shebang, shell options, argv, and stdin instead of
+    # inheriting our `set -euo pipefail`. `mv` preserves the original mode, so a
+    # foreign hook the user had disabled (exec bit cleared) stays disabled — the
+    # emitted `[ -x ]` guard then skips it. The sidecar survives re-install (the
+    # MARK branch below leaves it untouched) and is restored on --uninstall.
+    warn "Existing $name hook found — chaining it after the ai-toolkit block"
+    mv "$dst" "$dst.ai-toolkit-foreign"
   fi
+  remove_block "$dst" 2>/dev/null || true
+  "$emit_fn" > "$dst"
   chmod +x "$dst"
   info "Installed native $name hook"
 }

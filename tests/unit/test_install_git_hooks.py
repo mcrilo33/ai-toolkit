@@ -315,6 +315,229 @@ def test_commit_msg_gate_blocks_non_conventional_message(repo: Path) -> None:
     assert _git(repo, "rev-parse", "HEAD").strip() == seed  # nothing committed
 
 
+# --- the commit-msg stage fails CLOSED on a missing/non-executable cage script --
+#
+# Symmetric with the pre-push test-select fail-closed check (issue #212): the
+# commit-msg loop's `if [ -x … ]` had no else, so a deleted or de-executable'd
+# commit-quality / commit-gauntlet / red-proof-verify was SILENTLY skipped and the
+# commit proceeded ungated. A configured gate that cannot run must block the commit
+# (re-run install-git-hooks.sh to restore it), never wave it through.
+
+
+_CAGE_SCRIPTS = ("commit-quality", "commit-gauntlet", "red-proof-verify")
+
+
+def _stub_other_cages(hooks: Path, target: str) -> None:
+    """Replace every cage script except `target` with a passing stub.
+
+    Isolates the fail-closed contract to the state of `target` alone (the
+    file's stub-the-copies philosophy), so a passing message cannot depend on
+    the real gates accepting the synthesized payload.
+    """
+    for other in _CAGE_SCRIPTS:
+        if other != target:
+            _stub_cage(hooks, other)
+
+
+@pytest.mark.parametrize("script", _CAGE_SCRIPTS)
+def test_commit_msg_blocks_when_cage_script_missing(repo: Path, script: str) -> None:
+    hooks = _install(repo)
+    seed = _git(repo, "rev-parse", "HEAD").strip()
+    _stub_other_cages(hooks, script)  # the missing gate is the only variable
+    (_scripts_dir(hooks) / f"{script}.sh").unlink()
+
+    commit = _commit(repo, "-m", "feat(x): valid subject", "-m", "Refs #1")
+
+    assert commit.returncode != 0, f"a missing {script}.sh must block the commit"
+    assert _git(repo, "rev-parse", "HEAD").strip() == seed  # nothing committed
+
+
+@pytest.mark.parametrize("script", _CAGE_SCRIPTS)
+def test_commit_msg_blocks_when_cage_script_not_executable(repo: Path, script: str) -> None:
+    # Losing the exec bit is the same fail-closed case as deletion.
+    hooks = _install(repo)
+    seed = _git(repo, "rev-parse", "HEAD").strip()
+    _stub_other_cages(hooks, script)
+    (_scripts_dir(hooks) / f"{script}.sh").chmod(0o644)
+
+    commit = _commit(repo, "-m", "feat(x): valid subject", "-m", "Refs #1")
+
+    assert commit.returncode != 0, f"a non-executable {script}.sh must block the commit"
+    assert _git(repo, "rev-parse", "HEAD").strip() == seed
+
+
+# --- a foreign hook cannot shadow the cage block; it is chained, not appended ----
+#
+# install_hook APPENDED the cage block after any pre-existing foreign hook. A
+# foreign hook ending in `exit 0` (the common case) returned before the appended
+# block ran, so the gate never fired yet install reported success. The installer
+# now moves the foreign hook to a `<hook>.ai-toolkit-foreign` sidecar and installs
+# the cage block in its place; the cage block invokes the sidecar as a SEPARATE
+# process (its own shebang / shell options / argv / stdin) once the gates pass.
+
+
+def _foreign(hooks_dir: Path, name: str, body: str) -> Path:
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    hook = hooks_dir / name
+    hook.write_text(body)
+    hook.chmod(0o755)
+    return hook
+
+
+def test_commit_msg_gate_runs_despite_foreign_hook_ending_in_exit_0(repo: Path) -> None:
+    # The foreign hook's `exit 0` no longer short-circuits our gate: the cage block
+    # runs FIRST (the foreign hook is only chained afterwards), so a bad message is
+    # still blocked. Pre-fix the appended block sat behind the foreign `exit 0`.
+    _foreign(repo / ".git" / "hooks", "commit-msg", "#!/bin/sh\nexit 0\n")
+
+    _install(repo)
+    seed = _git(repo, "rev-parse", "HEAD").strip()
+
+    commit = _commit(repo, "-m", "not a conventional message")
+
+    assert commit.returncode != 0, "cage gate must still block a bad message"
+    assert _git(repo, "rev-parse", "HEAD").strip() == seed
+
+
+def test_foreign_commit_msg_hook_is_chained_in_a_clean_shell(repo: Path, tmp_path: Path) -> None:
+    # The foreign hook runs as its OWN process: a body that returns non-zero before
+    # its `exit 0` (here an unmatched `grep -q`) must not be aborted by our
+    # `set -euo pipefail`. Inlining the body would turn this benign hook into a
+    # commit-blocker; chaining it in a fresh `/bin/sh` lets it complete and write
+    # its sentinel, and the commit succeeds.
+    sentinel = tmp_path / "foreign_ran"
+    _foreign(
+        repo / ".git" / "hooks",
+        "commit-msg",
+        f'#!/bin/sh\ngrep -q NEVER_MATCHES "$1"\necho ran > "{sentinel}"\nexit 0\n',
+    )
+
+    hooks = _install(repo)
+    for name in _CAGE_SCRIPTS:
+        _stub_cage(hooks, name)  # isolate: only the chained foreign hook can act
+
+    commit = _commit(repo, "-m", "feat(x): valid subject", "-m", "Refs #1")
+
+    assert commit.returncode == 0, commit.stderr
+    assert sentinel.is_file(), "chained foreign commit-msg hook must run to completion"
+
+
+def test_foreign_commit_msg_hook_can_still_veto_commit(repo: Path) -> None:
+    # The chained foreign hook stays fail-closed: its non-zero exit blocks the
+    # commit even after the cage gates pass.
+    _foreign(repo / ".git" / "hooks", "commit-msg", "#!/bin/sh\nexit 3\n")
+
+    hooks = _install(repo)
+    for name in _CAGE_SCRIPTS:
+        _stub_cage(hooks, name)
+    seed = _git(repo, "rev-parse", "HEAD").strip()
+
+    commit = _commit(repo, "-m", "feat(x): valid subject", "-m", "Refs #1")
+
+    assert commit.returncode != 0, "a foreign hook's non-zero exit must block the commit"
+    assert _git(repo, "rev-parse", "HEAD").strip() == seed
+
+
+def test_disabled_foreign_hook_stays_disabled(repo: Path, tmp_path: Path) -> None:
+    # A foreign hook the user disabled (exec bit cleared) must not be re-enabled by
+    # install: `mv` preserves the mode and the emitted `[ -x ]` guard skips it, so a
+    # body that would veto never runs.
+    sentinel = tmp_path / "foreign_ran"
+    foreign = _foreign(
+        repo / ".git" / "hooks", "commit-msg", f'#!/bin/sh\necho ran > "{sentinel}"\nexit 3\n'
+    )
+    foreign.chmod(0o644)  # disabled
+
+    hooks = _install(repo)
+    for name in _CAGE_SCRIPTS:
+        _stub_cage(hooks, name)
+
+    commit = _commit(repo, "-m", "feat(x): valid subject", "-m", "Refs #1")
+
+    assert commit.returncode == 0, commit.stderr  # disabled foreign hook did not veto
+    assert not sentinel.is_file(), "a disabled foreign hook must not be chained"
+
+
+def test_foreign_hook_chaining_survives_reinstall(repo: Path, tmp_path: Path) -> None:
+    # Re-running the installer (the fail-closed error tells users to) must not lose
+    # the foreign hook: the sidecar persists across a second install.
+    sentinel = tmp_path / "foreign_ran"
+    _foreign(repo / ".git" / "hooks", "commit-msg", f'#!/bin/sh\necho ran > "{sentinel}"\nexit 0\n')
+
+    _install(repo)
+    hooks = _install(repo)  # second install — must preserve the sidecar
+    for name in _CAGE_SCRIPTS:
+        _stub_cage(hooks, name)
+
+    commit = _commit(repo, "-m", "feat(x): valid subject", "-m", "Refs #1")
+
+    assert commit.returncode == 0, commit.stderr
+    assert sentinel.is_file(), "foreign hook must survive a re-install"
+
+
+def test_foreign_pre_push_hook_is_chained_with_stdin(repo: Path, tmp_path: Path) -> None:
+    # A foreign pre-push hook is chained too, and receives git's ref lines on stdin
+    # (the cage block drained them for the test gate, then re-feeds them).
+    log = tmp_path / "foreign_stdin.log"
+    _foreign(repo / ".git" / "hooks", "pre-push", f'#!/bin/sh\ncat >> "{log}"\nexit 0\n')
+    local = _unpushed_commit(repo)
+    hooks = _install(repo)
+    _stub_selector(hooks, exit_code=0)
+
+    push = _push(repo)
+
+    assert push.returncode == 0, push.stderr
+    assert log.is_file(), "foreign pre-push hook was not chained"
+    assert local in log.read_text()  # git's ref lines reached the foreign hook
+
+
+def test_foreign_pre_push_hook_can_still_veto_push(repo: Path) -> None:
+    # Symmetric with the commit-msg veto: a foreign pre-push hook's non-zero exit
+    # aborts the push after the cage test gate has passed.
+    seed = _remote_sha(repo)
+    _foreign(repo / ".git" / "hooks", "pre-push", "#!/bin/sh\nexit 5\n")
+    _unpushed_commit(repo)
+    hooks = _install(repo)
+    _stub_selector(hooks, exit_code=0)
+
+    push = _push(repo)
+
+    assert push.returncode != 0, "a foreign pre-push hook's non-zero exit must abort the push"
+    assert _remote_sha(repo) == seed
+
+
+def test_foreign_pre_push_hook_ignoring_stdin_does_not_abort_push(repo: Path) -> None:
+    # A foreign pre-push hook that never reads stdin must not abort the push: the
+    # here-string feed means the writer can't SIGPIPE and taint the exit code.
+    _foreign(repo / ".git" / "hooks", "pre-push", "#!/bin/sh\nexit 0\n")
+    _unpushed_commit(repo)
+    hooks = _install(repo)
+    _stub_selector(hooks, exit_code=0)
+
+    push = _push(repo)
+
+    assert push.returncode == 0, push.stderr
+    assert _remote_sha(repo) == _git(repo, "rev-parse", "HEAD").strip()
+
+
+def test_uninstall_restores_foreign_hook(repo: Path) -> None:
+    original = "#!/bin/sh\n# my own hook\nexit 0\n"
+    _foreign(repo / ".git" / "hooks", "commit-msg", original)
+
+    _install(repo)
+    subprocess.run(
+        ["bash", str(INSTALL), "--uninstall", str(repo)],
+        capture_output=True,
+        text=True,
+        env=_GIT_ENV,
+        check=True,
+    )
+
+    restored = repo / ".git" / "hooks" / "commit-msg"
+    assert restored.read_text() == original, "uninstall must restore the foreign hook verbatim"
+    assert not (repo / ".git" / "hooks" / "commit-msg.ai-toolkit-foreign").exists()
+
+
 # ── Managed runtime-artifact excludes (issue #206) ──
 #
 # The pre-push test gate writes .testmondata* (plus its -shm/-wal WAL sidecars)
