@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -1119,3 +1120,119 @@ def test_declared_blocker_holds_dependent_while_disjoint_peers_still_batch() -> 
 
     assert batch == [1, 3, 4], "the blocked dependent is held; disjoint peers still batch"
     assert 2 not in batch
+
+
+# ── `--explain` / `--explain-labels`: surface the scheduler's disposition (#223) ──
+
+
+def _explain(
+    nodes: list[dict],
+    *,
+    inflight_issues: list[int] | None = None,
+    labels: bool = False,
+) -> str:
+    """Drive plan_from_json in explain (human) or explain-labels (TSV) mode.
+
+    The in-flight set is passed as explicit `--inflight-issue N` flags (the pure
+    planner never touches the worktree list — main() derives those for the CLI).
+    """
+    args = ""
+    for n in inflight_issues or []:
+        args += f" --inflight-issue {n}"
+    args += " --explain-labels" if labels else " --explain"
+    proc = subprocess.run(
+        ["bash", "-c", f'source "{BATCH_PLAN}"; plan_from_json{args}'],
+        input=json.dumps(nodes),
+        capture_output=True,
+        text=True,
+        env={**os.environ},
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+def _label_map(nodes: list[dict], *, inflight_issues: list[int] | None = None) -> dict[str, str]:
+    out = _explain(nodes, inflight_issues=inflight_issues, labels=True)
+    return dict(line.split("\t") for line in out.splitlines() if line.strip())
+
+
+def _scheduling_graph() -> list[dict]:
+    # #189 is exclusive (Scope: *); the rest are ready with concrete scopes; #300 is held.
+    return [
+        _node(189, "*"),
+        _node(212, "batch-plan.sh"),
+        _node(214, "worktree-lib.sh worktree-land.sh"),
+        _node(222, "hub-afk.sh"),
+        _node(300, "held.py", labels=["hold"]),
+        _node(400, "solo.py"),
+    ]
+
+
+def test_explain_inflight_exclusive_names_what_it_holds_back() -> None:
+    out = _explain(_scheduling_graph(), inflight_issues=[189])
+
+    line = next(ln for ln in out.splitlines() if ln.startswith("#189"))
+    assert "in-flight" in line
+    assert "exclusive" in line
+    # An in-flight exclusive conflicts with every dispatchable peer (held #300 excluded),
+    # named in priority order (equal depth ⇒ ascending issue number).
+    assert "holds back #212, #214, #222, #400" in line
+
+
+def test_explain_marks_scope_collider_blocked_by_that_issue() -> None:
+    out = _explain(_scheduling_graph(), inflight_issues=[189])
+
+    # Every dispatchable peer collides with the exclusive in-flight #189.
+    assert re.search(r"^#222\b.*\bblocked-by-scope:#189\b.*\(hub-afk\.sh\)", out, re.M)
+    assert re.search(
+        r"^#214\b.*\bblocked-by-scope:#189\b.*\(worktree-lib\.sh worktree-land\.sh\)", out, re.M
+    )
+
+
+def test_explain_marks_held_issue() -> None:
+    out = _explain(_scheduling_graph(), inflight_issues=[189])
+
+    assert re.search(r"^#300\b.*\bheld\b", out, re.M)
+
+
+def test_explain_marks_disjoint_ready_issue_queued() -> None:
+    out = _explain([_node(10, "a.py"), _node(11, "b.py")])
+
+    assert re.search(r"^#10\b.*\bqueued\b.*\(a\.py\)", out, re.M)
+    assert re.search(r"^#11\b.*\bqueued\b.*\(b\.py\)", out, re.M)
+
+
+def test_explain_ready_scope_collision_between_peers_blocks_lower_priority() -> None:
+    # Two ready issues share a.py, nothing in-flight: the lower-numbered wins the slot
+    # (queued) and the other is blocked-by-scope on it — mirrors the greedy pack.
+    out = _explain([_node(10, "a.py"), _node(11, "a.py")])
+
+    assert re.search(r"^#10\b.*\bqueued\b", out, re.M)
+    assert re.search(r"^#11\b.*\bblocked-by-scope:#10\b", out, re.M)
+
+
+def test_explain_labels_collapse_to_the_four_label_set() -> None:
+    labels = _label_map(_scheduling_graph(), inflight_issues=[189])
+
+    assert labels["189"] == "afk:in-flight"
+    assert labels["222"] == "afk:blocked-by-scope"
+    assert labels["400"] == "afk:blocked-by-scope"
+    assert labels["300"] == "-", "a held issue carries no afk:* label"
+
+
+def test_explain_labels_mark_queued_and_exclusive() -> None:
+    labels = _label_map([_node(10, "a.py"), _node(11, "b.py"), _node(12, "a.py")])
+
+    assert labels["10"] == "afk:queued"
+    assert labels["11"] == "afk:queued"
+    assert labels["12"] == "afk:blocked-by-scope"
+
+    exclusive = _label_map([_node(9, "*")])
+    assert exclusive["9"] == "afk:exclusive"
+
+
+def test_explain_labels_strip_dep_blocked_issue() -> None:
+    # An issue with an OPEN native blocker is not dispatchable ⇒ no afk:* label ('-').
+    labels = _label_map([_node(1, "a.py"), _node(2, "b.py", blocked_by=[(1, "OPEN")])])
+
+    assert labels["2"] == "-"
