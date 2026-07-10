@@ -186,9 +186,10 @@ CMD=$(build_commit_cmd "$MSG_BODY")
 if command -v jq >/dev/null 2>&1; then
   PAYLOAD=$(jq -nc --arg c "$CMD" '{tool_name:"Bash", tool_input:{command:$c}}')
 else
-  # No jq: hand-encode CMD for JSON. CMD may carry real newlines inside a
-  # multi-line body paragraph; a hand-built JSON string cannot embed them, so
-  # collapse them to spaces (an anchor is then space-preceded, still recognized).
+  # No jq: hand-encode CMD for JSON. Per-line synthesis leaves CMD with no embedded
+  # newlines, but a hand-built JSON string cannot carry one anyway, so the final
+  # `tr` collapses any to spaces as belt-and-suspenders (an anchor stays recognized,
+  # space-preceded) should the builder ever change.
   ESC=$(printf '%s' "$CMD" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')
   PAYLOAD="{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"$ESC\"}}"
 fi

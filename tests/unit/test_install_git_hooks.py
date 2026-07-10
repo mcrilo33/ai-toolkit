@@ -328,8 +328,9 @@ def test_commit_msg_gate_blocks_non_conventional_message(repo: Path) -> None:
 # anchor (`Refs #1`) then sat right after the `n` of that `\n` — an [:alpha:] char —
 # defeating commit-quality's `(^|[^[:alpha:]])` boundary (a fail-CLOSED false
 # rejection) and commit-gauntlet's `(^|[[:space:]"'])Tested-RED:` carve-out. The fix
-# emits ONE `-m` per message paragraph (the agent two-`-m` shape), so the subject is
-# its own single-line `-m` and body-line anchors / Tested-RED sit at line starts.
+# emits ONE `-m` per non-blank LINE (the agent multi-`-m` shape), so no `-m` ever
+# carries an embedded newline: the subject stays its own single-line `-m` and
+# body-line anchors / Tested-RED sit at the start of their own `-m`.
 
 
 def _commit_file(
@@ -365,7 +366,7 @@ def test_commit_msg_multiline_bad_subject_still_denied(repo: Path) -> None:
     # real newlines would leave commit-quality's line-oriented subject extraction with
     # an unterminated quote on line 1 → empty MSG → the commit passes UNGATED. A
     # multi-line commit with a non-conventional subject AND no anchor must still be
-    # DENIED. The per-paragraph shape keeps the subject on its own terminated `-m`.
+    # DENIED. The per-line shape keeps the subject on its own terminated `-m`.
     _install(repo)
     seed = _git(repo, "rev-parse", "HEAD").strip()
 
