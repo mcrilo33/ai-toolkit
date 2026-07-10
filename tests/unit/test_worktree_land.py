@@ -24,7 +24,10 @@ from pathlib import Path
 
 import pytest
 
-WORKTREE_LAND = Path(__file__).resolve().parents[2] / "scripts" / "worktree-land.sh"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+WORKTREE_LAND = _REPO_ROOT / "scripts" / "worktree-land.sh"
+WORKTREE_LIB = _REPO_ROOT / "scripts" / "worktree-lib.sh"
+GATE_STAMP_LIB = _REPO_ROOT / "shared" / "hooks" / "lib" / "gate-stamp.sh"
 
 # Pin git config to nothing: a host's global/system config (core.hooksPath,
 # init.templateDir, protocol settings) must not reach the commits/pushes the
@@ -826,20 +829,83 @@ def test_diverged_skip_tests_merge_sanity_still_catches_base_branch_escape(
 # exactly once with TEST_SELECT_SKIP=1 — loudly, and never after a failed gate.
 
 
-def _install_counting_gate(hub: Path, log: Path, *, exit_code: int = 0, stderr: str = "") -> None:
+def _install_counting_gate(
+    hub: Path,
+    log: Path,
+    *,
+    exit_code: int = 0,
+    stderr: str = "",
+    mint_stamp: bool = False,
+) -> None:
     """A hub pre-push hook logging one `INVOKED skip=[…]` line per invocation.
 
     `stderr` simulates gate (pytest) output; `exit_code` non-zero models a
     failing gate. The skip value records the threaded TEST_SELECT_SKIP so a
     test can tell a first attempt from a skip-retry.
+
+    `mint_stamp` models a green gate (test-select.sh, issue #122): it writes a
+    green-tree stamp for HEAD^{tree} under <git-common-dir>/.gate-stamps/ before
+    exiting, exactly as the real gate does on a PASSING run — the positive proof
+    worktree-land now requires before honoring the transport retry (issue #214).
+    A killed gate never reaches its mint, so leaving `mint_stamp` False models
+    that.
     """
     hook = hub / ".git" / "hooks" / "pre-push"
-    body = f'#!/bin/sh\necho "INVOKED skip=[${{TEST_SELECT_SKIP:-}}]" >> "{log}"\n'
+    lines = ["#!/bin/sh", f'echo "INVOKED skip=[${{TEST_SELECT_SKIP:-}}]" >> "{log}"']
     if stderr:
-        body += f"cat >&2 <<'GATEEOF'\n{stderr}\nGATEEOF\n"
-    body += f"exit {exit_code}\n"
-    hook.write_text(body)
+        lines.append(f"cat >&2 <<'GATEEOF'\n{stderr}\nGATEEOF")
+    if mint_stamp:
+        lines.append(_MINT_STAMP_FN)
+        lines.append("_mint_green_stamp")
+    lines.append(f"exit {exit_code}")
+    hook.write_text("\n".join(lines) + "\n")
     hook.chmod(0o755)
+
+
+# Shared sh snippet: write a green-tree stamp for HEAD^{tree} under
+# <git-common-dir>/.gate-stamps/, mirroring gate-stamp.sh's placement contract
+# (issue #122). wt_gate_green_stamped only checks the file's existence, so a
+# minimal body suffices. Sourced into the git shim and the counting-gate hook.
+_MINT_STAMP_FN = r"""
+_mint_green_stamp() {
+  _t=$(git rev-parse "HEAD^{tree}") || return 0
+  _c=$(git rev-parse --git-common-dir) || return 0
+  case "$_c" in /*) ;; *) _c="$PWD/$_c" ;; esac
+  mkdir -p "$_c/.gate-stamps"
+  printf 'tier=full\nenv=test\n' > "$_c/.gate-stamps/$_t"
+}
+"""
+
+
+def _push141_git_shim(tmp_path: Path, *, mint_stamp: bool) -> None:
+    """PATH-front `git` shim: the FIRST ship push (`git push origin main`) exits
+    141 (SIGPIPE) — the transfer-phase death the keepalive lane retries (#119) —
+    and every other git call (including the retry push) delegates to real git.
+
+    With `mint_stamp`, the shim writes a green-tree stamp for HEAD^{tree} before
+    dying, modeling a gate that ran green and stamped THEN lost the transport (a
+    real post-green transport death). Without it, no stamp is left — the killed-
+    gate shape (#214): exit 141 with the suite never proven for this tree."""
+    real_git = shutil.which("git")
+    assert real_git is not None
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    marker = tmp_path / "ship-push-died-once"
+    mint = "_mint_green_stamp" if mint_stamp else ":"
+    shim = bindir / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'GIT_REAL="{real_git}"\n'
+        f'git() {{ "$GIT_REAL" "$@"; }}\n'
+        f"{_MINT_STAMP_FN}\n"
+        f'if [ "$1" = push ] && [ "$2" = origin ] && [ "$3" = main ] && [ ! -e "{marker}" ]; then\n'
+        f'  touch "{marker}"\n'
+        f"  {mint}\n"
+        "  exit 141\n"
+        "fi\n"
+        f'exec "$GIT_REAL" "$@"\n'
+    )
+    shim.chmod(0o755)
 
 
 def _install_pre_receive(
@@ -875,13 +941,14 @@ def _diverge_hub(hub: Path) -> None:
 
 
 def test_green_gate_transport_death_retries_once_with_skip(hub: Path, tmp_path: Path) -> None:
-    # Gate green, then the transfer dies with a transport signature → retry
-    # EXACTLY once with TEST_SELECT_SKIP=1 (the gate already ran green), loudly,
+    # Gate green (and stamps the tree, issue #122), then the transfer dies with a
+    # transport signature → retry EXACTLY once with TEST_SELECT_SKIP=1 (the gate
+    # already ran green and left a positive green-tree stamp, issue #214), loudly,
     # and the land completes.
     _make_spoke(hub, tmp_path, "feature/1-transport", push=True, ready=True)
     _diverge_hub(hub)
     gate_log = tmp_path / "gate-calls.log"
-    _install_counting_gate(hub, gate_log)
+    _install_counting_gate(hub, gate_log, mint_stamp=True)
     ref_log = tmp_path / "pre-receive-refs.log"
     _install_pre_receive(
         tmp_path,
@@ -906,6 +973,85 @@ def test_green_gate_transport_death_retries_once_with_skip(hub: Path, tmp_path: 
     # The retry is loud about what it is doing and why it may skip the gate.
     assert "retry" in proc.stderr.lower()
     assert "TEST_SELECT_SKIP" in proc.stderr
+    # The skip is witnessed: the suite result records the transport-retry so the
+    # issue-close comment does not read as a normal, fully-gated land (issue #214).
+    assert "TEST_SELECT_SKIP=1" in proc.stdout
+    assert "transport" in proc.stdout.lower()
+
+
+def test_transport_141_with_green_stamp_still_retries(hub: Path, tmp_path: Path) -> None:
+    # A ship push exiting 141 (SIGPIPE) whose gate DID run green and left a green-
+    # tree stamp is a real post-green transport death (issue #119): the retry
+    # still fires and the land completes. This proves the #214 fix does not gut
+    # the keepalive 141 lane — it only requires the positive stamp.
+    _make_spoke(hub, tmp_path, "feature/1-stamp141", push=True, ready=True)
+    _diverge_hub(hub)
+    _push141_git_shim(tmp_path, mint_stamp=True)
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode == 0, proc.stderr
+    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
+    # Loud about the retry, and the skip is recorded in the suite witness.
+    assert "TEST_SELECT_SKIP" in proc.stderr
+    assert "TEST_SELECT_SKIP=1" in proc.stdout
+
+
+def test_killed_gate_no_stamp_rolls_back_without_skip_retry(hub: Path, tmp_path: Path) -> None:
+    # THE #214 fix: a gate KILLED mid-run (SIGPIPE/OOM) makes the ship push exit
+    # 141 with no pytest summary and — because it never finished — no green-tree
+    # stamp. That is NOT a post-green transport death: it must roll back, never
+    # auto-retry with the suite skipped (which would ship a tree whose suite
+    # never finished).
+    _make_spoke(hub, tmp_path, "feature/1-killed", push=True, ready=True)
+    _diverge_hub(hub)
+    pre_sha = _git(hub, "rev-parse", "HEAD").strip()
+    remote_before = _remote_sha(hub, "main")
+    _push141_git_shim(tmp_path, mint_stamp=False)
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode != 0
+    assert _git(hub, "rev-parse", "HEAD").strip() == pre_sha  # rolled back
+    assert _remote_sha(hub, "main") == remote_before  # origin/main untouched
+    # The refusal names the missing green proof, not a generic push rejection.
+    assert "stamp" in proc.stderr.lower()
+    # No skip-retry was attempted (the suite was never proven for this tree).
+    assert "TEST_SELECT_SKIP" not in proc.stderr
+
+
+def test_gate_green_stamped_reads_a_real_writer_stamp(hub: Path) -> None:
+    # Parity guard against placement drift: wt_gate_green_stamped reimplements
+    # gate-stamp.sh's <git-common-dir>/.gate-stamps/<HEAD^{tree}> contract WITHOUT
+    # sourcing it. Drive the REAL writer (gate_stamp_mint) and assert the reader
+    # agrees — before the mint it must be false, after it true. A future change to
+    # the writer's placement/key that the reader does not track fails here.
+    def _reads_stamp() -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", "-c", f'. "{WORKTREE_LIB}"; wt_gate_green_stamped'],
+            cwd=str(hub),
+            capture_output=True,
+            text=True,
+            env=_GIT_ENV,
+        )
+
+    assert _reads_stamp().returncode != 0  # no stamp yet
+    # Mint via the authoritative writer for exactly this tree.
+    mint = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'. "{GATE_STAMP_LIB}"; '
+            'gate_stamp_mint "$(git rev-parse "HEAD^{tree}")" full "pytest-x.y"',
+        ],
+        cwd=str(hub),
+        capture_output=True,
+        text=True,
+        env=_GIT_ENV,
+    )
+    assert mint.returncode == 0, mint.stderr
+
+    assert _reads_stamp().returncode == 0  # reader now agrees the tree is proven
 
 
 def test_failed_gate_rolls_back_without_retry(hub: Path, tmp_path: Path) -> None:
