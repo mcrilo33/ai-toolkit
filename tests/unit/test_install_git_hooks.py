@@ -279,14 +279,16 @@ def _commit(repo: Path, *msg_args: str) -> subprocess.CompletedProcess[str]:
 
 @pytest.mark.skipif(
     shutil.which("jq") is None,
-    reason="asserts the jq `@json` command shape; a jq-less host takes the sed fallback",
+    reason="asserts the jq per-paragraph command shape; a jq-less host takes the sed fallback",
 )
 def test_commit_msg_synthesizes_raw_command(repo: Path, tmp_path: Path) -> None:
     # The captured payload's command must be byte-identical to a real commit
-    # invocation: `git commit -m ` + the JSON-encoded message (quotes/newlines
-    # escaped), with `git` at a command boundary — NOT wrapped in outer quotes.
-    # The exact `@json` encoding is jq-specific (the no-jq fallback collapses
-    # newlines to spaces), so this precise-equality check is guarded on jq.
+    # invocation in the agent multi-`-m` shape: ONE `-m "<line>"` per NON-BLANK
+    # physical line, each with only backslash + double-quote escaped, `git` at a
+    # command boundary — NOT wrapped in outer quotes, NOT a single @json-encoded -m,
+    # and never a `-m` carrying an embedded newline (issue #226). The exact escaping
+    # is jq-specific (the no-jq fallback collapses newlines to spaces), so this
+    # precise-equality check is guarded on jq.
     hooks = _install(repo)
     log = tmp_path / "payload.json"
     _stub_cage(hooks, "commit-quality", log)
@@ -297,7 +299,10 @@ def test_commit_msg_synthesizes_raw_command(repo: Path, tmp_path: Path) -> None:
     assert commit.returncode == 0, commit.stderr
     payload = json.loads(log.read_text())
     body = _git(repo, "show", "-s", "--format=%B", "HEAD").rstrip("\n")
-    expected = "git commit -m " + json.dumps(body)
+    lines = [ln for ln in body.split("\n") if ln]
+    expected = "git commit" + "".join(
+        ' -m "' + ln.replace("\\", "\\\\").replace('"', '\\"') + '"' for ln in lines
+    )
     assert payload["tool_input"]["command"] == expected
 
 
@@ -313,6 +318,114 @@ def test_commit_msg_gate_blocks_non_conventional_message(repo: Path) -> None:
     assert commit.returncode != 0, "commit-quality must block a non-conventional subject"
     assert "conventional commits" in (commit.stdout + commit.stderr).lower()
     assert _git(repo, "rev-parse", "HEAD").strip() == seed  # nothing committed
+
+
+# --- issue #226: a body-line anchor / Tested-RED survives the synthesis ----------
+#
+# The commit-msg hook synthesizes the `git commit` command from the real message.
+# The #185-era single `-m` shape encoded the body through jq `@json`, turning the
+# message's newlines into a literal backslash-n in the command string. A body-line
+# anchor (`Refs #1`) then sat right after the `n` of that `\n` — an [:alpha:] char —
+# defeating commit-quality's `(^|[^[:alpha:]])` boundary (a fail-CLOSED false
+# rejection) and commit-gauntlet's `(^|[[:space:]"'])Tested-RED:` carve-out. The fix
+# emits ONE `-m` per non-blank LINE (the agent multi-`-m` shape), so no `-m` ever
+# carries an embedded newline: the subject stays its own single-line `-m` and
+# body-line anchors / Tested-RED sit at the start of their own `-m`.
+
+
+def _commit_file(
+    repo: Path, rel: str, content: str, *msg_args: str
+) -> subprocess.CompletedProcess[str]:
+    """Stage a specific file and run a real `git commit` (drives the commit-msg hook)."""
+    p = repo / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content)
+    _git(repo, "add", rel)
+    return subprocess.run(
+        ["git", "commit", *msg_args], cwd=str(repo), capture_output=True, text=True, env=_GIT_ENV
+    )
+
+
+def test_commit_msg_accepts_body_line_anchor(repo: Path) -> None:
+    # A multi-line message whose ONLY issue anchor is a body-line `Refs #N`, on a
+    # branch with no issue ID (the fixture is on `main`), must be ACCEPTED — matching
+    # the agent two-`-m` path. Runs the REAL cage scripts (no stubs) so the fix is
+    # proven end-to-end through the synthesized command. Pre-fix: falsely rejected
+    # as "not anchored".
+    _install(repo)
+    seed = _git(repo, "rev-parse", "HEAD").strip()
+
+    commit = _commit(repo, "-m", "feat(x): valid subject", "-m", "Refs #1")
+
+    assert commit.returncode == 0, commit.stdout + commit.stderr
+    assert _git(repo, "rev-parse", "HEAD").strip() != seed  # the commit landed
+
+
+def test_commit_msg_multiline_bad_subject_still_denied(repo: Path) -> None:
+    # Negative guard against a fail-OPEN regression: a single `-m` carrying embedded
+    # real newlines would leave commit-quality's line-oriented subject extraction with
+    # an unterminated quote on line 1 → empty MSG → the commit passes UNGATED. A
+    # multi-line commit with a non-conventional subject AND no anchor must still be
+    # DENIED. The per-line shape keeps the subject on its own terminated `-m`.
+    _install(repo)
+    seed = _git(repo, "rev-parse", "HEAD").strip()
+
+    commit = _commit(repo, "-m", "not a conventional message", "-m", "some body text")
+
+    assert commit.returncode != 0, "a bad-subject multi-line commit must be blocked"
+    assert "conventional commits" in (commit.stdout + commit.stderr).lower()
+    assert _git(repo, "rev-parse", "HEAD").strip() == seed  # nothing committed
+
+
+def test_commit_msg_multiline_subject_block_still_denied(repo: Path) -> None:
+    # Regression (code-review of the #226 fix): a message whose SUBJECT BLOCK spans
+    # multiple physical lines with NO blank-line separator is ONE paragraph. Merging
+    # those lines into a single `-m` would carry a real newline, leaving commit-
+    # quality's line-oriented subject extraction with an unterminated quote on line 1
+    # → empty MSG → the commit passes UNGATED — the same fail-OPEN a single embedded-
+    # newline `-m` causes, just triggered by an intra-paragraph line break. The synth
+    # emits one `-m` per NON-BLANK LINE so every `-m` is single-line: a non-conventional
+    # multi-line subject block with no anchor is still DENIED.
+    _install(repo)
+    seed = _git(repo, "rev-parse", "HEAD").strip()
+
+    # A single `-m` with an embedded newline: subject "wip changes", body line
+    # "some detail", no blank line between them (one paragraph). Non-conventional,
+    # unanchored — must be blocked, not slipped through.
+    commit = _commit(repo, "-m", "wip changes\nsome detail")
+
+    assert commit.returncode != 0, "a multi-line non-conventional subject block must be blocked"
+    assert "conventional commits" in (commit.stdout + commit.stderr).lower()
+    assert _git(repo, "rev-parse", "HEAD").strip() == seed  # nothing committed
+
+
+@pytest.mark.skipif(
+    shutil.which("pyright") is None,
+    reason="the gauntlet carve-out is only observable when a typechecker produces a "
+    "type error to skip; without pyright the typecheck is skipped regardless",
+)
+def test_commit_msg_recognizes_body_line_tested_red(repo: Path) -> None:
+    # A `Tested-RED:` trailer at the start of its own body paragraph must trigger
+    # commit-gauntlet's typecheck carve-out through the synthesized command. On a
+    # branch with an issue ID (so commit-quality is anchor-satisfied regardless of the
+    # message), the gauntlet's RED carve-out is the ONLY discriminator: a staged .py
+    # with an unresolved import (pyright error, ruff-clean) is ALLOWED only when the
+    # carve-out fires. Pre-fix the literal `\n` before `Tested-RED:` misses the
+    # carve-out, pyright runs, and the commit is blocked.
+    _install(repo)
+    _git(repo, "checkout", "-q", "-b", "feature/1-red")
+
+    commit = _commit_file(
+        repo,
+        "pkg/red.py",
+        "from pkg._nope import thing\n\nvalue = thing\n",
+        "-m",
+        "test(x): failing red",
+        "-m",
+        "Tested-RED: pkg/red.py::test_x",
+    )
+
+    assert commit.returncode == 0, commit.stdout + commit.stderr
 
 
 # --- the commit-msg stage fails CLOSED on a missing/non-executable cage script --

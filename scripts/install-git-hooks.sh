@@ -144,16 +144,54 @@ fi
 
 MSG_FILE="$1"
 
-# Build a representative `git commit` command containing the message as a -m
-# arg so the cage scripts parse subject, anchor, and Tested-RED identically to
-# the agent path. Strip comment lines git would drop.
+# Build a representative `git commit` command containing the message so the cage
+# scripts parse subject, anchor, and Tested-RED identically to the agent path.
+# Strip comment lines git would drop.
 MSG_BODY=$(grep -v '^[[:space:]]*#' "$MSG_FILE" || true)
+
+# Emit ONE -m per NON-BLANK LINE of the message, reproducing the agent multi-`-m`
+# shape, rather than a single -m carrying the whole body (issue #226). A single -m
+# forces a choice between two broken encodings: @json turns the body's newlines
+# into a literal backslash-n, gluing a body-line anchor / Tested-RED to the
+# preceding 'n' and defeating commit-quality's (^|[^[:alpha:]]) boundary and
+# commit-gauntlet's (^|[[:space:]"'])Tested-RED: carve-out (a fail-CLOSED false
+# rejection); while embedding a REAL newline in ANY one -m leaves commit-quality's
+# line-oriented subject extraction (grep/sed operate per physical line) with an
+# unterminated quote on that -m's first line → empty MSG → the commit passes
+# UNGATED (fail-OPEN). Splitting per LINE — not per blank-line paragraph — is what
+# guarantees no -m ever holds an embedded newline: a subject block that spans
+# several physical lines with no blank separator is still one -m PER LINE, so the
+# subject stays a single quote-terminated -m (extracts cleanly) and every body-line
+# anchor / Tested-RED sits at the start of its own -m value, matched by the
+# consumer greps — exactly as in the agent path. Blank lines are dropped (an empty
+# -m would carry no anchor and only pad the command). Each line escapes only
+# backslash + double-quote; the outer jq (or the sed fallback) JSON-encodes the
+# assembled command once. Note the synthesized command feeds the cage PARSERS only
+# — it does not create the commit — so line-vs-paragraph granularity is immaterial
+# to the real message; the cage scripts scan for subject/anchor/Tested-RED, none of
+# which spans a line break.
+build_commit_cmd() {
+  local body="$1" cmd="git commit" line esc
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    esc=$(printf '%s' "$line" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    cmd="$cmd -m \"$esc\""
+  done <<LINES
+$body
+LINES
+  printf '%s' "$cmd"
+}
+CMD=$(build_commit_cmd "$MSG_BODY")
+
 if command -v jq >/dev/null 2>&1; then
-  CMD=$(jq -nr --arg m "$MSG_BODY" '"git commit -m " + ($m | @json)')
   PAYLOAD=$(jq -nc --arg c "$CMD" '{tool_name:"Bash", tool_input:{command:$c}}')
 else
-  ESC=$(printf '%s' "$MSG_BODY" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')
-  PAYLOAD="{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git commit -m \\\"$ESC\\\"\"}}"
+  # No jq: hand-encode CMD for JSON. Per-line synthesis leaves CMD with no embedded
+  # newlines, but a hand-built JSON string cannot carry one anyway, so the final
+  # `tr` collapses any to spaces as belt-and-suspenders (an anchor stays recognized,
+  # space-preceded) should the builder ever change.
+  ESC=$(printf '%s' "$CMD" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')
+  PAYLOAD="{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"$ESC\"}}"
 fi
 
 for s in commit-quality commit-gauntlet red-proof-verify; do
