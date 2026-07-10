@@ -145,16 +145,60 @@ wt_git_push() {
 
 # wt_push_transport_died <push-exit-code> <captured-output-file> — did a failed
 # push die at the TRANSPORT layer? git only enters the transfer phase after the
-# pre-push hook exits 0, so any of these signatures is proof the gate ran green:
-# worktree-land uses that to retry once with the suite skipped. A failed gate
-# (pytest output + git's local refusal) matches nothing here — deliberately no
-# bare "broken pipe" pattern, which a BrokenPipeError traceback in pytest output
-# would fake.
+# pre-push hook exits 0, so the named signatures are proof the gate ran green.
+# worktree-land uses that — TOGETHER WITH a positive green-tree stamp for the
+# pushed tree (wt_gate_green_stamped, issue #214) — to retry once with the suite
+# skipped. The bare exit 141 (SIGPIPE) is deliberately KEPT here as a transport
+# candidate even though a gate killed mid-run can share it: the caller no longer
+# trusts 141 alone, requiring the green stamp a killed gate never leaves. A
+# failed gate (pytest output + git's local refusal) matches nothing here —
+# deliberately no bare "broken pipe" pattern, which a BrokenPipeError traceback
+# in pytest output would fake.
 wt_push_transport_died() {
   [ "${1:-0}" -eq 141 ] && return 0
   grep -qiE \
     'closed by remote host|packet_write_wait|client_loop: send disconnect|remote end hung up unexpectedly|send-pack: unexpected disconnect' \
     "$2" 2>/dev/null
+}
+
+# wt_gate_green_stamped — 0 iff a GREEN-TREE stamp (issue #122) EXISTS for THIS
+# tree's HEAD^{tree}. It is the positive proof worktree-land requires before
+# honoring a transport retry (issue #214): a stamp is written ONLY by a passing
+# gate (test-select.sh mints on rc==0), so its presence proves this exact tree
+# ran green at some tier for some runner, whereas a gate KILLED mid-run
+# (SIGPIPE/OOM — exit 141, no pytest summary) never reaches its mint. The retry-
+# with-suite-skipped is refused absent such a stamp. shared/hooks/lib/gate-stamp.sh
+# is the authoritative WRITER; this reader mirrors its placement contract
+# (<git-common-dir>/.gate-stamps/ keyed by HEAD^{tree}) WITHOUT sourcing it, so
+# the READER path resolves identically in the ai-toolkit checkout and a synced
+# downstream hub (which carries no shared/hooks/lib/).
+#
+# Scope of the proof (deliberately weaker than the writer's gate_stamp_check):
+#   • EXISTENCE only — no tier/runner-fingerprint match. A pre-existing stamp
+#     that does not COVER the current demand (a weaker tier, a different runner)
+#     is accepted here even though the gate would not have consumed it. The tree
+#     is still proven green (at that other tier/env), so this is bounded — never
+#     "ship an untested tree" — and matches what a clean-FF land already trusts
+#     via AUTO_SKIP (issue #96). It is NOT a full re-verification.
+#   • The key is HEAD^{tree} alone — NOT gated on a clean working tree the way
+#     the writer's gate_stamp_tree is. The push does not move HEAD, so HEAD^{tree}
+#     is exactly the pushed tree; keeping the clean check would let the gate's own
+#     .testmondata* writes read the tree "dirty" post-push and deny a legitimate
+#     retry.
+# Fail-CLOSED on absence: an unborn HEAD or a missing stamp returns non-zero, so
+# the retry rolls back. This means the #119 keepalive retry is disabled whenever
+# no stamp was minted — an untracked file on the hub (the land tolerates it via
+# `git status --porcelain -uno`, but the writer's untracked-sensitive
+# gate_stamp_tree skips the mint) or a pre-#122 installed hook (STAMPS=0). Those
+# are the safe direction: re-running the land re-runs the gate.
+wt_gate_green_stamped() {
+  local common tree
+  tree="$(git rev-parse -q --verify 'HEAD^{tree}' 2>/dev/null)" || return 1
+  [ -n "$tree" ] || return 1
+  common="$(git rev-parse --git-common-dir 2>/dev/null)" || return 1
+  [ -n "$common" ] || return 1
+  case "$common" in /*) ;; *) common="$PWD/$common" ;; esac
+  [ -f "$common/.gate-stamps/$tree" ]
 }
 
 # --- portable date/time -------------------------------------------------------

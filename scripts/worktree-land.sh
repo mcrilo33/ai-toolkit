@@ -514,9 +514,25 @@ if [ "$PUSH_RC" -ne 0 ]; then
   # retry does too.
   if wt_push_transport_died "$PUSH_RC" "$PUSH_LOG" \
      && ! grep -qE '[0-9]+ (failed|error)|Interrupted' "$PUSH_LOG"; then
-    wt_warn "gate ran green but the push transport died (SSH staleness, issue #119) — retrying ONCE with TEST_SELECT_SKIP=1"
-    if ! land_push retry; then
-      land_rollback "retry push failed too"
+    # A transport-death SHAPE (exit 141 or an SSH-disconnect signature) with no
+    # pytest summary is necessary but NOT sufficient (issue #214): a gate KILLED
+    # mid-run (SIGPIPE/OOM) shares exit 141 and prints no summary either. Honor
+    # the skipped-suite retry ONLY when a green-tree stamp exists for this pushed
+    # HEAD^{tree} (issue #122) — proof the gate ran this tree green and stamped it
+    # before the transfer died. A killed gate never reaches its mint, so it leaves
+    # no stamp and rolls back rather than shipping a tree whose suite never
+    # completed. (wt_gate_green_stamped checks EXISTENCE, not tier/runner parity —
+    # see its header for the bounded weakening.)
+    if wt_gate_green_stamped; then
+      wt_warn "gate ran green (this tree is green-stamped) but the push transport died (SSH staleness, issue #119) — retrying ONCE with TEST_SELECT_SKIP=1"
+      if ! land_push retry; then
+        land_rollback "retry push failed too"
+      fi
+      # Witness the skip: record it in the suite result so the issue-close
+      # comment does not read as a normal, fully-gated land (issue #214).
+      SUITE_RESULT="$SUITE_RESULT; post-green transport death — re-pushed with TEST_SELECT_SKIP=1 (this tree was green-stamped, issue #214)"
+    else
+      land_rollback "push exited $PUSH_RC with no test summary and no green-tree stamp for this tree — the gate was killed mid-run (not a post-green transport death), or no stamp was minted; refusing to retry with the suite skipped. Re-run the land to re-run the gate (issue #214)"
     fi
   else
     land_rollback "push rejected (pre-push test gate or remote)"
