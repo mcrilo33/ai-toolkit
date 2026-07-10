@@ -114,6 +114,14 @@ ensure_otel_stack() {
 # #115 exists to prevent — so surface a one-line stderr notice in that case (it is
 # NOT the "no spoke / already healthy" silent path). Otherwise ensure the stack.
 _ensure_or_notice() {
+  # Honor the hub's telemetry config for a STANDALONE run (issue #228): a spoke
+  # spawned by worktree-new exports AI_TOOLKIT_OTEL into this daemon, but a bare
+  # /loop invocation inherits nothing — so layer env -> config toggle, and EXPORT it
+  # (the preflights read AI_TOOLKIT_OTEL). Best-effort: a config-less hub no-ops and
+  # AI_TOOLKIT_OTEL stays whatever the caller set. env still wins over config.
+  wt_resolve_telemetry_config "${AI_TOOLKIT_CONFIG:-$MAIN_ROOT/settings/ai-toolkit.yml}" 2>/dev/null || true
+  AI_TOOLKIT_OTEL="${AI_TOOLKIT_OTEL:-${AI_TOOLKIT_OTEL_DEFAULT:-}}"
+  export AI_TOOLKIT_OTEL
   if [ "${AI_TOOLKIT_OTEL:-}" != "1" ]; then
     printf '%s\n' "hub-otel-watch: a spoke is live but AI_TOOLKIT_OTEL!=1 — collector/bridge not ensured; that spoke's traces are lost (export AI_TOOLKIT_OTEL=1 to enable)" >&2
     return 0

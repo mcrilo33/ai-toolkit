@@ -453,7 +453,12 @@ fi
 # (system prompt + entire conversation + tools array) to disk under .ai-toolkit/.
 # This is conversation content leaving the box for every run, not just metadata.
 # To opt out entirely, launch the spoke with AI_TOOLKIT_OTEL=0.
-AI_TOOLKIT_OTEL="${AI_TOOLKIT_OTEL:-1}"
+# Client-side telemetry defaults from settings/ai-toolkit.yml (issue #228): sets
+# AI_TOOLKIT_OTEL_DEFAULT / AI_TOOLKIT_OTEL_SPAN_ENDPOINT_DEFAULT (and the langfuse
+# host/project/public-key defaults) so the toggle + endpoint below layer as
+# env -> config -> hardcoded default. Best-effort; a telemetry-less config no-ops.
+wt_resolve_telemetry_config "${AI_TOOLKIT_CONFIG:-$REPO_ROOT/settings/ai-toolkit.yml}"
+AI_TOOLKIT_OTEL="${AI_TOOLKIT_OTEL:-${AI_TOOLKIT_OTEL_DEFAULT:-1}}"
 OTEL_PREFIX=""
 if [ "${AI_TOOLKIT_OTEL:-}" = "1" ]; then
   OTEL_BODY_DIR="$WT_DIR/.ai-toolkit/raw-bodies"
@@ -467,7 +472,7 @@ if [ "${AI_TOOLKIT_OTEL:-}" = "1" ]; then
   # Workflow-span sink (#126): telemetry.sh's cycle step:/script/hook spans POST
   # OTLP HTTP-JSON to $AI_TOOLKIT_OTEL_SPAN_ENDPOINT/v1/traces, so this one targets
   # the collector's OTLP-HTTP listener (:4318), not the gRPC :4317 above.
-  : "${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:=http://localhost:4318}"
+  : "${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:=${AI_TOOLKIT_OTEL_SPAN_ENDPOINT_DEFAULT:-http://localhost:4318}}"
   # NB: the trailing space is load-bearing — it separates the prefix from the
   # WT_SPOKE pin that AGENT_CMD appends immediately after it. The auth header
   # (OTEL_EXPORTER_OTLP_HEADERS) is deliberately NOT here — it stays inherited env.

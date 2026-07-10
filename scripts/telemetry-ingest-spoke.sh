@@ -131,7 +131,9 @@ fi
 FLUSH_WAIT="${AI_TOOLKIT_INGEST_FLUSH_WAIT:-3}"
 [ "$FLUSH_WAIT" = "0" ] || sleep "$FLUSH_WAIT" 2>/dev/null || true
 
-export LANGFUSE_HOST="${LANGFUSE_HOST:-http://localhost:3000}"
+# env -> config default (LANGFUSE_HOST_DEFAULT, set by wt_resolve_langfuse_auth's
+# telemetry-config resolve above, issue #228) -> hardcoded local Langfuse.
+export LANGFUSE_HOST="${LANGFUSE_HOST:-${LANGFUSE_HOST_DEFAULT:-http://localhost:3000}}"
 export PYTHONPATH="$(dirname "$TELEMETRY_DIR")${PYTHONPATH:+:$PYTHONPATH}"
 
 # Retry budget (issue #151): a co-located Langfuse starved by concurrent spokes can
