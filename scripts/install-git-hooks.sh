@@ -144,16 +144,58 @@ fi
 
 MSG_FILE="$1"
 
-# Build a representative `git commit` command containing the message as a -m
-# arg so the cage scripts parse subject, anchor, and Tested-RED identically to
-# the agent path. Strip comment lines git would drop.
+# Build a representative `git commit` command containing the message so the cage
+# scripts parse subject, anchor, and Tested-RED identically to the agent path.
+# Strip comment lines git would drop.
 MSG_BODY=$(grep -v '^[[:space:]]*#' "$MSG_FILE" || true)
+
+# Emit ONE -m per message PARAGRAPH (blank-line separated), reproducing the agent
+# two-`-m` shape, rather than a single -m carrying the whole body (issue #226). A
+# single -m forces a choice between two broken encodings: @json turns the body's
+# newlines into a literal backslash-n, gluing a body-line anchor / Tested-RED to
+# the preceding 'n' and defeating commit-quality's (^|[^[:alpha:]]) boundary and
+# commit-gauntlet's (^|[[:space:]"'])Tested-RED: carve-out (a fail-CLOSED false
+# rejection); while embedding REAL newlines in one -m leaves commit-quality's
+# line-oriented subject extraction with an unterminated quote on line 1 → empty
+# MSG → the commit passes UNGATED (fail-OPEN). Per-paragraph avoids both: the
+# subject is its own single-line, quote-terminated -m (extracts cleanly), and a
+# body-line anchor / Tested-RED sits at a line start under real newlines, matched
+# by the ^-anchored consumer greps — exactly as in the agent path. Each paragraph
+# escapes only backslash + double-quote so its internal newlines stay real; the
+# outer jq (or the sed fallback) then JSON-encodes the assembled command once.
+build_commit_cmd() {
+  local body="$1" cmd="git commit" para="" line esc
+  _emit_para() {
+    [ -n "$para" ] || return 0
+    esc=$(printf '%s' "$para" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    cmd="$cmd -m \"$esc\""
+    para=""
+  }
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ -z "$line" ]; then
+      _emit_para
+    elif [ -z "$para" ]; then
+      para="$line"
+    else
+      para="$para
+$line"
+    fi
+  done <<PARAS
+$body
+PARAS
+  _emit_para
+  printf '%s' "$cmd"
+}
+CMD=$(build_commit_cmd "$MSG_BODY")
+
 if command -v jq >/dev/null 2>&1; then
-  CMD=$(jq -nr --arg m "$MSG_BODY" '"git commit -m " + ($m | @json)')
   PAYLOAD=$(jq -nc --arg c "$CMD" '{tool_name:"Bash", tool_input:{command:$c}}')
 else
-  ESC=$(printf '%s' "$MSG_BODY" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')
-  PAYLOAD="{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git commit -m \\\"$ESC\\\"\"}}"
+  # No jq: hand-encode CMD for JSON. CMD may carry real newlines inside a
+  # multi-line body paragraph; a hand-built JSON string cannot embed them, so
+  # collapse them to spaces (an anchor is then space-preceded, still recognized).
+  ESC=$(printf '%s' "$CMD" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')
+  PAYLOAD="{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"$ESC\"}}"
 fi
 
 for s in commit-quality commit-gauntlet red-proof-verify; do

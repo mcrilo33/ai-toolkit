@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -279,14 +280,16 @@ def _commit(repo: Path, *msg_args: str) -> subprocess.CompletedProcess[str]:
 
 @pytest.mark.skipif(
     shutil.which("jq") is None,
-    reason="asserts the jq `@json` command shape; a jq-less host takes the sed fallback",
+    reason="asserts the jq per-paragraph command shape; a jq-less host takes the sed fallback",
 )
 def test_commit_msg_synthesizes_raw_command(repo: Path, tmp_path: Path) -> None:
     # The captured payload's command must be byte-identical to a real commit
-    # invocation: `git commit -m ` + the JSON-encoded message (quotes/newlines
-    # escaped), with `git` at a command boundary — NOT wrapped in outer quotes.
-    # The exact `@json` encoding is jq-specific (the no-jq fallback collapses
-    # newlines to spaces), so this precise-equality check is guarded on jq.
+    # invocation in the agent two-`-m` shape: ONE `-m "<paragraph>"` per blank-line
+    # separated paragraph, each with only backslash + double-quote escaped (its
+    # internal newlines stay real), `git` at a command boundary — NOT wrapped in
+    # outer quotes, NOT a single @json-encoded -m (issue #226). The exact escaping
+    # is jq-specific (the no-jq fallback collapses newlines to spaces), so this
+    # precise-equality check is guarded on jq.
     hooks = _install(repo)
     log = tmp_path / "payload.json"
     _stub_cage(hooks, "commit-quality", log)
@@ -297,7 +300,10 @@ def test_commit_msg_synthesizes_raw_command(repo: Path, tmp_path: Path) -> None:
     assert commit.returncode == 0, commit.stderr
     payload = json.loads(log.read_text())
     body = _git(repo, "show", "-s", "--format=%B", "HEAD").rstrip("\n")
-    expected = "git commit -m " + json.dumps(body)
+    paragraphs = [p for p in re.split(r"\n{2,}", body) if p]
+    expected = "git commit" + "".join(
+        ' -m "' + p.replace("\\", "\\\\").replace('"', '\\"') + '"' for p in paragraphs
+    )
     assert payload["tool_input"]["command"] == expected
 
 
