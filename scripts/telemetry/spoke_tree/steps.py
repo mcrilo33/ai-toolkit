@@ -187,7 +187,13 @@ def _marker_spans(traces: list[TraceObservations]) -> list[dict[str, Any]]:
 
 
 def _subject_names_phase(subject: str, phase: str) -> bool:
-    """Whether ``subject`` names the marker ``phase`` as a whole word (e.g. ``"S1 RED: …"`` / RED)."""
+    """Whether ``subject`` names the marker ``phase`` as a whole word (e.g. ``"S1 RED: …"`` / RED).
+
+    A blank phase (a malformed marker with no ``workflow.phase`` and no ``step:<phase>`` label)
+    never matches — an empty pattern would otherwise word-boundary-match every subject.
+    """
+    if not phase:
+        return False
     return re.search(rf"\b{re.escape(phase.upper())}\b", subject.upper()) is not None
 
 

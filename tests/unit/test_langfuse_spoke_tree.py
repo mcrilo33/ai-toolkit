@@ -2200,6 +2200,79 @@ class TestBuildCycleWindows:
         bare = [("tr", [_obs("t1", "tool:Bash", parent=None, startTime="2026-01-02T00:00:00Z")])]
         assert build_cycle_windows(bare, {}) == []
 
+    def test_single_marker_window_clamps_to_latest_activity(self) -> None:
+        traces = [
+            (
+                "tr",
+                [
+                    _marker("m1", "green", "2026-01-02T00:00:03Z"),
+                    _obs(
+                        "t1",
+                        "tool:Bash",
+                        parent=None,
+                        startTime="2026-01-02T00:00:07Z",
+                        endTime="2026-01-02T00:00:08Z",
+                    ),
+                ],
+            )
+        ]
+
+        windows = build_cycle_windows(traces, {})
+
+        assert len(windows) == 1
+        assert windows[0].start == "2026-01-02T00:00:03Z"
+        assert windows[0].end == "2026-01-02T00:00:08Z"
+
+    def test_duplicate_phase_markers_yield_distinct_windows(self) -> None:
+        # Two GREEN markers (subtask A, subtask B) each open their own window.
+        traces = [
+            (
+                "tr",
+                [
+                    _marker("m1", "green", "2026-01-02T00:00:01Z"),
+                    _marker("m2", "green", "2026-01-02T00:00:09Z", end="2026-01-02T00:00:10Z"),
+                ],
+            )
+        ]
+
+        windows = build_cycle_windows(traces, {})
+
+        assert [w.task_id for w in windows] == ["marker0", "marker1"]
+        assert [_step_phase(w.subject) for w in windows] == ["GREEN", "GREEN"]
+
+    def test_malformed_marker_without_a_phase_never_borrows_a_ledger_subject(self) -> None:
+        # A kind=step span with no workflow.phase and no step:<phase> label must not word-boundary
+        # match (an empty phase) and steal an unrelated ledger subject.
+        content = {
+            "tu-c1": ToolContent(
+                {"subject": "S1 RED: failing test"},
+                "Task #1 created successfully: S1 RED: failing test",
+            ),
+            "tu-u1": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
+            "tu-u2": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
+        }
+        create = _ledger_obs(
+            "tc1", "tool:TaskCreate", "tu-c1", start="2026-01-02T00:00:00Z", end="0"
+        )
+        started = _ledger_obs(
+            "tu1", "tool:TaskUpdate", "tu-u1", start="2026-01-02T00:00:00Z", end="0"
+        )
+        done = _ledger_obs(
+            "tu2",
+            "tool:TaskUpdate",
+            "tu-u2",
+            start="2026-01-02T00:00:05Z",
+            end="2026-01-02T00:00:05Z",
+        )
+        blank_marker = _obs(
+            "m1", "weird", parent=None, startTime="2026-01-02T00:00:01Z", metadata={"kind": "step"}
+        )
+
+        windows = build_cycle_windows([("tr", [create, started, done, blank_marker])], content)
+
+        assert len(windows) == 1
+        assert windows[0].subject != "S1 RED: failing test"
+
 
 class TestCycleMarkerSpine:
     """#235: a ledger-untouched spoke still yields a full step spine + per-phase scores."""
