@@ -546,18 +546,25 @@ wt_bridge_launch() {
 # (the classic `pgrep -f pytest` self-match) never reports itself: both the
 # sourcing shell ($$) and — when invoked as `$(wt_pgrep …)`, where `pgrep -f` on
 # Linux matches the forked subshell's inherited argv — that command-substitution
-# subshell ($BASHPID; empty on bash 3.2, where it collapses to $$). Prints the
-# matching pids, one per line. The exit code carries the outcome callers must tell
-# apart — a probe failure is never mistaken for "not running":
+# subshell ($BASHPID; empty on bash 3.2, where it collapses to $$). pgrep's own
+# output is captured through a tempfile redirect, NOT a nested `out="$(pgrep …)"`:
+# that inner command substitution forks one more short-lived bash that inherits the
+# caller's argv, and on Linux `pgrep -f` catches it before it exec's pgrep — a third
+# self-match neither $$ nor $BASHPID covers. A plain redirect exec's pgrep straight
+# away, so no extra token-bearing shell exists to match. Prints the matching pids,
+# one per line. The exit code carries the outcome callers must tell apart — a probe
+# failure is never mistaken for "not running":
 #   0  one or more OTHER processes match
 #   1  nothing matches            -> "not running"
 #   2  the probe itself failed    -> "unknown", never conflate with not-running
 wt_pgrep() {
-  local out rc self=$$ sub="${BASHPID:-$$}"
-  out="$(LC_ALL=C pgrep "$@" 2>/dev/null)"
+  local out rc self=$$ sub="${BASHPID:-$$}" tmp
+  tmp="$(mktemp 2>/dev/null)" || return 2
+  LC_ALL=C pgrep "$@" >"$tmp" 2>/dev/null
   rc=$?
-  [ "$rc" -gt 1 ] && return 2     # pgrep 2/3 (syntax/fatal), or a locale death
-  out="$(printf '%s\n' "$out" | grep -vxF -e "$self" -e "$sub")"
+  [ "$rc" -gt 1 ] && { rm -f "$tmp"; return 2; }   # pgrep 2/3 (syntax/fatal), or a locale death
+  out="$(grep -vxF -e "$self" -e "$sub" "$tmp")"
+  rm -f "$tmp"
   [ -n "$out" ] || return 1       # empty, or only the caller itself matched
   printf '%s\n' "$out"
 }
