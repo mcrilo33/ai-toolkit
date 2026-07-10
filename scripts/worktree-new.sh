@@ -241,6 +241,50 @@ if [[ "$ISSUE" =~ ^[0-9]+$ ]] && command -v gh >/dev/null 2>&1; then
     } > "$TASK_TMP"
     mv "$TASK_TMP" "$TASK_MD"
     echo "→ task contract      .ai-toolkit/task.md (#$ISSUE)"
+
+    # --- pre-seed the todo-ledger skeleton (issue #235) ----------------------
+    # The step spine is script-stamped, but the ledger LABELS are still the
+    # spoke's, so structure is inherited rather than invented: emit one
+    # `#<issue>.<slug> · <STEP> — <label>` row (the ledger-schema-guard format)
+    # per subtask x the five solo-cycle steps. Subtasks come from a "## Subtasks"
+    # section of the body when present, else a single `#<issue>.main` row from the
+    # title. Gitignored (.ai-toolkit/), and only written for a COMPLETE contract.
+    # The `·`/`—` separators live only in printf FORMAT strings (fixed bytes, never
+    # absorbed into a $var), and subtask extraction is awk-based, so nothing here
+    # depends on locale-sensitive multibyte matching.
+    LEDGER_SKELETON="$WT_DIR/.ai-toolkit/ledger-skeleton.md"
+    SUBTASKS=$(printf '%s\n' "$TASK_BODY" | awk '
+      /^[[:space:]]*#+[[:space:]]*[Ss]ubtasks/ { grab=1; next }
+      grab && /^[[:space:]]*#+[[:space:]]/     { grab=0 }
+      grab && /^[[:space:]]*([-*]|[0-9]+[.)])[[:space:]]+/ {
+        sub(/^[[:space:]]*([-*]|[0-9]+[.)])[[:space:]]+/, "")
+        print
+      }')
+    SINGLE=""
+    if [ -z "$SUBTASKS" ]; then
+      SUBTASKS="$TASK_TITLE"
+      SINGLE=1
+    fi
+    {
+      printf '# Ledger skeleton for #%s — seed your task ledger from these rows\n\n' "$ISSUE"
+      while IFS= read -r label; do
+        [ -n "$label" ] || continue
+        if [ -n "$SINGLE" ]; then
+          slug="main"
+        else
+          slug=$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]' \
+            | tr -cs 'a-z0-9' '-' | sed -e 's/^-//' -e 's/-$//' | cut -c1-24 | sed -e 's/-$//')
+          [ -n "$slug" ] || slug="subtask"
+        fi
+        for step in ANCHOR RED GREEN REVIEW PUSH; do
+          printf '#%s.%s · %s — %s\n' "$ISSUE" "$slug" "$step" "$label"
+        done
+        printf '\n'
+      done <<EOF
+$SUBTASKS
+EOF
+    } > "$LEDGER_SKELETON"
+    echo "→ ledger skeleton    .ai-toolkit/ledger-skeleton.md"
   fi
 fi
 
@@ -502,7 +546,7 @@ WT_AGENT_EFFORT="${WT_AGENT_EFFORT:-${WT_AGENT_EFFORT_DEFAULT:-max}}"
 # /source-task round-trip. An explicit --prompt (start-task, hub-afk's
 # kickoff_for) still wins; ad-hoc slugs (no task.md) keep the unseeded launch.
 if [ -z "$PROMPT" ] && [ -f "$TASK_MD" ]; then
-  PROMPT="Read your task contract at .ai-toolkit/task.md (issue #${ISSUE}, fetched at spawn -- no need to run /source-task). Break it into a task ledger (one entry per subtask x the solo-cycle steps ANCHOR/RED/GREEN/REVIEW/PUSH, exactly one in_progress). Honor its Gate: line: plan (the default for non-trivial work, and whenever no Gate: line is present) means the PLAN gate comes first -- explore, print the full implementation plan, emit 'bash .ai-toolkit/scripts/spoke-ready.sh --gate ${ISSUE}', and WAIT for approval before GREEN; only Gate: none runs autonomous straight through. Then implement via the solo-cycle (/cycle: RED -> GREEN -> REVIEW -> PUSH). Push your own branch each subtask; when the acceptance criteria are all met, push the final subtask and emit 'bash .ai-toolkit/scripts/spoke-push.sh --ready ${ISSUE}'. Do NOT self-land. If task.md is missing, or the issue was edited after spawn, run /source-task ${ISSUE} to re-anchor from the live issue."
+  PROMPT="Read your task contract at .ai-toolkit/task.md (issue #${ISSUE}, fetched at spawn -- no need to run /source-task). Break it into a task ledger (one entry per subtask x the solo-cycle steps ANCHOR/RED/GREEN/REVIEW/PUSH, exactly one in_progress) -- a skeleton is pre-seeded at .ai-toolkit/ledger-skeleton.md; seed your ledger from its rows so your entries match the '#<issue>.<slug> - <STEP> - <label>' schema. Honor its Gate: line: plan (the default for non-trivial work, and whenever no Gate: line is present) means the PLAN gate comes first -- explore, print the full implementation plan, emit 'bash .ai-toolkit/scripts/spoke-ready.sh --gate ${ISSUE}', and WAIT for approval before GREEN; only Gate: none runs autonomous straight through. Then implement via the solo-cycle (/cycle: RED -> GREEN -> REVIEW -> PUSH). Push your own branch each subtask; when the acceptance criteria are all met, push the final subtask and emit 'bash .ai-toolkit/scripts/spoke-push.sh --ready ${ISSUE}'. Do NOT self-land. If task.md is missing, or the issue was edited after spawn, run /source-task ${ISSUE} to re-anchor from the live issue."
 fi
 
 AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(printf '%q' "$WT_AGENT_EFFORT") claude --model $(printf '%q' "$WT_AGENT_MODEL")"

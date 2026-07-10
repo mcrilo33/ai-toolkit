@@ -513,6 +513,59 @@ def test_task_contract_written_atomically_without_leftover_temp(hub: Path, tmp_p
     assert leftovers == [], f"atomic write must leave no temp file: {leftovers}"
 
 
+# ── Ledger skeleton seed (issue #235) ──
+#
+# The step spine is script-stamped, but the todo-ledger LABELS still come from the
+# spoke. So structure is inherited, not invented: worktree-new.sh pre-seeds a
+# gitignored .ai-toolkit/ledger-skeleton.md — one `#<issue>.<slug> · <STEP> — <label>`
+# row per subtask x ANCHOR/RED/GREEN/REVIEW/PUSH — from the task.md body. A body with
+# no machine-readable subtask list gets a single `#<issue>.main` skeleton.
+
+
+def test_seeds_ledger_skeleton_for_a_complete_contract(hub: Path, tmp_path: Path) -> None:
+    env = {"GH_ISSUE_TITLE": "Scripted step spine", "GH_ISSUE_BODY": "Do it.\nGate: none\n"}
+
+    proc, _ = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", extra_env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    skeleton = _worktree_dir(hub, "8") / ".ai-toolkit" / "ledger-skeleton.md"
+    assert skeleton.is_file(), "a complete contract must seed the ledger skeleton"
+    text = skeleton.read_text()
+    # No machine-readable subtasks -> a single #8.main subtask across all five steps.
+    for step in ("ANCHOR", "RED", "GREEN", "REVIEW", "PUSH"):
+        assert f"#8.main · {step} — " in text, f"missing {step} row in the guard format"
+
+
+def test_ledger_skeleton_derives_a_row_per_subtask(hub: Path, tmp_path: Path) -> None:
+    body = (
+        "Intro.\n\n"
+        "## Subtasks\n\n"
+        "- Marker spine builder\n"
+        "- Ledger schema guard\n\n"
+        "## Acceptance criteria\n\n- [ ] done\nGate: none\n"
+    )
+    env = {"GH_ISSUE_TITLE": "T", "GH_ISSUE_BODY": body}
+
+    proc, _ = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", extra_env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    text = (_worktree_dir(hub, "8") / ".ai-toolkit" / "ledger-skeleton.md").read_text()
+    assert "#8.marker-spine-builder · RED — " in text
+    assert "#8.ledger-schema-guard · GREEN — " in text
+    assert "#8.main" not in text, "with parsed subtasks, no generic main row is emitted"
+
+
+def test_no_ledger_skeleton_without_a_task_contract(hub: Path, tmp_path: Path) -> None:
+    # A partial gh fetch writes no task.md; without a contract there is nothing to seed.
+    env = {"GH_ISSUE_TITLE": "Title only", "GH_ISSUE_BODY": ""}
+
+    proc, _ = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", extra_env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    skeleton = _worktree_dir(hub, "8") / ".ai-toolkit" / "ledger-skeleton.md"
+    assert not skeleton.exists(), "no task contract -> no ledger skeleton"
+
+
 def test_explicit_prompt_overrides_default_task_contract_seed(hub: Path, tmp_path: Path) -> None:
     # An explicit --prompt (start-task, hub-afk's kickoff_for) still wins — the
     # default task.md seed only fills an unset prompt.
