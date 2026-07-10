@@ -1344,14 +1344,6 @@ _afk_seed_status_labels() {
 }
 _afk_clear_status_labels_seed() { rm -f "$(_afk_status_labels_seed_marker)" 2>/dev/null || true; }
 
-# _afk_status_label_search -> the `label:a,b,c` GitHub-search qualifier (comma ⇒ OR) that
-# selects every issue carrying ANY afk:* label, so a CLOSED holder is found and stripped too.
-_afk_status_label_search() {
-  local lbl csv=""
-  for lbl in $AFK_STATUS_LABELS; do csv="${csv:+$csv,}$lbl"; done
-  printf 'label:%s\n' "$csv"
-}
-
 # afk_sync_status_labels -> reconcile every open issue's afk:* label to its scheduling
 # disposition (and strip stale ones). A no-op unless AFK_GH_STATUS_LABELS=1. Best-effort
 # throughout: a missing tool, a failed planner, or a failed gh edit logs and returns 0.
@@ -1370,9 +1362,12 @@ afk_sync_status_labels() {
     return 0
   fi
   [ -n "$desired" ] || return 0
-  # Current holders across ALL states (a closed/landed issue must lose its label too).
+  # Current issues across ALL states (a closed/landed issue must lose its label too). A plain
+  # --state all list (not a `--search label:` query, whose default-state semantics are
+  # unreliable) keeps this unambiguous; python filters to the afk:* holders. --limit bounds
+  # the payload: a recently-closed issue needing a strip is always in the newest slice.
   local current
-  if ! current="$(_afk_with_timeout "$AFK_GH_TIMEOUT" gh issue list --state all --limit 200 --search "$(_afk_status_label_search)" --json number,state,labels 2>/dev/null)"; then
+  if ! current="$(_afk_with_timeout "$AFK_GH_TIMEOUT" gh issue list --state all --limit 200 --json number,state,labels 2>/dev/null)"; then
     current="[]"
   fi
   _afk_seed_status_labels
