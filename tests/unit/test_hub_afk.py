@@ -20,6 +20,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -6235,3 +6236,133 @@ def test_lost_event_is_handled_by_the_next_sweep(tmp_path: Path) -> None:
     assert "ANSWERED" in result.stdout, (
         "the sweep services the waiting spoke regardless of the event"
     )
+
+
+# ── afk:* status labels on GitHub issues (issue #223) ─────────────────────────
+
+
+def _status_label_env(
+    tmp_path: Path,
+    *,
+    desired: str,
+    current: list[dict],
+    edit_exit: int = 0,
+) -> tuple[dict[str, str], Path]:
+    """A fake `gh` + a batch-plan stub for afk_sync_status_labels (#223).
+
+    The batch-plan stub prints the `desired` TSV (`<num>\\t<afk:label|->`); the gh
+    stub answers `issue list` with `current` (the holders JSON), no-ops `label
+    create`, and appends every `issue edit` invocation to a log so the diff is
+    observable. Returns (env, edit_log).
+    """
+    bindir = tmp_path / "labelbin"
+    bindir.mkdir()
+    edit_log = tmp_path / "edits.log"
+    gh = bindir / "gh"
+    gh.write_text(
+        "#!/usr/bin/env bash\n"
+        'sub="${1:-}"; shift 2>/dev/null || true\n'
+        'case "$sub" in\n'
+        "  label) exit 0 ;;\n"
+        "  issue)\n"
+        '    action="${1:-}"; shift 2>/dev/null || true\n'
+        '    case "$action" in\n'
+        '      list) printf "%s" "$AFK_TEST_CURRENT" ;;\n'
+        f'      edit) printf "%s\\n" "$*" >> "{edit_log}"; exit "${{AFK_TEST_EDIT_EXIT:-0}}" ;;\n'
+        "      *) exit 0 ;;\n"
+        "    esac ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    gh.chmod(0o755)
+    bp = tmp_path / "batch-plan-stub.sh"
+    bp.write_text('#!/usr/bin/env bash\nprintf "%s" "$AFK_TEST_DESIRED"\n')
+    bp.chmod(0o755)
+    env = {
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "BATCH_PLAN": str(bp),
+        "AFK_TEST_DESIRED": desired,
+        "AFK_TEST_CURRENT": json.dumps(current),
+        "AFK_TEST_EDIT_EXIT": str(edit_exit),
+    }
+    return env, edit_log
+
+
+def test_status_labels_noop_without_flag(tmp_path: Path) -> None:
+    env, edit_log = _status_label_env(
+        tmp_path,
+        desired="189\tafk:queued\n",
+        current=[{"number": 189, "state": "OPEN", "labels": [{"name": "afk:in-flight"}]}],
+    )
+    # AFK_GH_STATUS_LABELS is NOT set → the whole feature is a no-op.
+    result = _call("afk_sync_status_labels", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert not edit_log.exists(), "no gh issue edit may run when the flag is off"
+
+
+def test_status_labels_edit_swaps_on_change(tmp_path: Path) -> None:
+    env, edit_log = _status_label_env(
+        tmp_path,
+        desired="189\tafk:in-flight\n",
+        current=[{"number": 189, "state": "OPEN", "labels": [{"name": "afk:queued"}]}],
+    )
+    env["AFK_GH_STATUS_LABELS"] = "1"
+
+    result = _call("afk_sync_status_labels", env=env)
+
+    assert result.returncode == 0, result.stderr
+    log = edit_log.read_text()
+    assert "189" in log
+    assert "--add-label afk:in-flight" in log
+    assert "--remove-label afk:queued" in log
+
+
+def test_status_labels_no_edit_when_unchanged(tmp_path: Path) -> None:
+    env, edit_log = _status_label_env(
+        tmp_path,
+        desired="189\tafk:in-flight\n",
+        current=[{"number": 189, "state": "OPEN", "labels": [{"name": "afk:in-flight"}]}],
+    )
+    env["AFK_GH_STATUS_LABELS"] = "1"
+
+    result = _call("afk_sync_status_labels", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert not edit_log.exists(), "write-on-change: an already-correct label needs no gh call"
+
+
+def test_status_labels_strip_closed_issue(tmp_path: Path) -> None:
+    # #189 carries a label but is no longer in the open backlog (closed/landed) ⇒ stripped;
+    # #222 is open and gains its label. This is the in-scope 'stripped on close' path.
+    env, edit_log = _status_label_env(
+        tmp_path,
+        desired="222\tafk:queued\n",
+        current=[
+            {"number": 189, "state": "CLOSED", "labels": [{"name": "afk:in-flight"}]},
+            {"number": 222, "state": "OPEN", "labels": []},
+        ],
+    )
+    env["AFK_GH_STATUS_LABELS"] = "1"
+
+    result = _call("afk_sync_status_labels", env=env)
+
+    assert result.returncode == 0, result.stderr
+    log = edit_log.read_text()
+    assert re.search(r"189.*--remove-label afk:in-flight", log)
+    assert re.search(r"222.*--add-label afk:queued", log)
+
+
+def test_status_labels_gh_failure_does_not_break_tick(tmp_path: Path) -> None:
+    env, _edit_log = _status_label_env(
+        tmp_path,
+        desired="189\tafk:queued\n",
+        current=[{"number": 189, "state": "OPEN", "labels": [{"name": "afk:in-flight"}]}],
+        edit_exit=1,
+    )
+    env["AFK_GH_STATUS_LABELS"] = "1"
+
+    result = _call("afk_sync_status_labels", env=env)
+
+    # A gh label failure logs and continues — the tick (return code) is never broken.
+    assert result.returncode == 0, result.stderr

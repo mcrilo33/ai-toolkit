@@ -372,4 +372,25 @@ else
 fi
 echo
 
+# --- Scheduling (issue #223) -------------------------------------------------
+# Surface the batch scheduler's own pre-dispatch decisions — why only one thing is
+# running, what a `Scope: *` issue is holding back — right in the hub survey, so the
+# answer is a glance rather than reading Scope: lines by hand. It reuses batch-plan's
+# `--explain` renderer (the disposition logic lives in exactly one place); BATCH_PLAN
+# overrides the resolved sibling for tests. Read-only, best-effort: a gh/graphql
+# failure just yields an empty view — never an error that breaks the survey.
+bold "Scheduling"
+_bp="${BATCH_PLAN:-$_script_dir/batch-plan.sh}"
+if command -v gh >/dev/null 2>&1 && [ -f "$_bp" ]; then
+  sched="$(bash "$_bp" --explain 2>/dev/null || true)"
+  if [ -n "$sched" ]; then
+    printf '%s\n' "$sched" | sed 's/^/  /'
+  else
+    echo "  (nothing dispatchable)"
+  fi
+else
+  echo "  (batch-plan unavailable — gh or batch-plan.sh missing)"
+fi
+echo
+
 exit 0

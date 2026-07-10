@@ -1310,11 +1310,127 @@ reconcile_markers() {
   done < <(inflight_worktrees)
 }
 
+# --- afk:* status labels on GitHub issues (issue #223) ------------------------
+# Behind AFK_GH_STATUS_LABELS=1, the drain maintains ONE afk:* status label per open issue
+# reflecting its scheduling disposition, so the GitHub issue LIST answers "what's running /
+# why is this waiting" at a glance. The label set (AFK_STATUS_LABELS overrides it for tests):
+#   afk:in-flight | afk:queued | afk:blocked-by-scope | afk:exclusive
+# Deliberately WITHOUT the cross-issue "blocks #N" detail — that stays in `--explain`; the
+# per-issue label is only the issue's own state. Disposition comes from batch-plan's
+# `--explain-labels` (the SAME renderer the terminal view uses), so the two never drift.
+#
+# afk_sync_status_labels is a per-tick RECONCILE: it also strips the label from any issue no
+# longer open/in-flight (closed/landed, now held, or dep-blocked), so "stripped on close" is
+# satisfied from within the drain — worktree-land.sh / worktree-done.sh are never edited. The
+# design cautions the issue calls out: update IN PLACE (swap the one label, never comment),
+# write only on CHANGE (skip the gh edit when unchanged, bounding API use per tick), and stay
+# BEST-EFFORT (a gh failure logs and continues, never breaks a tick).
+: "${AFK_STATUS_LABELS:=afk:in-flight afk:queued afk:blocked-by-scope afk:exclusive}"
+
+afk_status_labels_enabled() { [ "${AFK_GH_STATUS_LABELS:-}" = "1" ]; }
+
+# _afk_seed_status_labels -> create the afk:* label set in the repo once per window (a marker
+# in the state dir dedups). `gh label create --force` is idempotent (updates an existing
+# label rather than erroring). Best-effort: a create failure never aborts a tick.
+_afk_status_labels_seed_marker() { printf '%s\n' "$(_afk_state_dir)/status-labels-seeded"; }
+_afk_seed_status_labels() {
+  local m lbl; m="$(_afk_status_labels_seed_marker)"
+  [ -f "$m" ] && return 0
+  for lbl in $AFK_STATUS_LABELS; do
+    _afk_with_timeout "$AFK_GH_TIMEOUT" gh label create "$lbl" --force >/dev/null 2>&1 || true
+  done
+  mkdir -p "$(_afk_state_dir)" 2>/dev/null || true
+  printf '%s\n' "$(afk_now)" > "$m" 2>/dev/null || true
+}
+_afk_clear_status_labels_seed() { rm -f "$(_afk_status_labels_seed_marker)" 2>/dev/null || true; }
+
+# afk_sync_status_labels -> reconcile every open issue's afk:* label to its scheduling
+# disposition (and strip stale ones). A no-op unless AFK_GH_STATUS_LABELS=1. Best-effort
+# throughout: a missing tool, a failed planner, or a failed gh edit logs and returns 0.
+afk_sync_status_labels() {
+  afk_status_labels_enabled || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  local bp; bp="$(_afk_find_script "${BATCH_PLAN:-}" batch-plan.sh)" || return 0
+  # Desired: `<num>\t<afk:label|->` per open issue, seeded with the live in-flight set so a
+  # running spoke's issue is labelled afk:in-flight. A planner failure means "unknown" —
+  # skip this tick rather than strip every label on a transient blip.
+  local ifargs=() n desired
+  while IFS= read -r n; do [ -n "$n" ] && ifargs+=("--inflight-issue" "$n"); done < <(inflight_issues)
+  if ! desired="$(_afk_with_timeout "$AFK_PLANNER_TIMEOUT" bash "$bp" --explain-labels ${ifargs[@]+"${ifargs[@]}"} 2>/dev/null)"; then
+    log "  afk labels: batch-plan --explain-labels failed — skipping label sync this tick"
+    return 0
+  fi
+  [ -n "$desired" ] || return 0
+  # Current issues across ALL states (a closed/landed issue must lose its label too). A plain
+  # --state all list (not a `--search label:` query, whose default-state semantics are
+  # unreliable) keeps this unambiguous; python filters to the afk:* holders. --limit bounds
+  # the payload: a recently-closed issue needing a strip is always in the newest slice.
+  local current
+  if ! current="$(_afk_with_timeout "$AFK_GH_TIMEOUT" gh issue list --state all --limit 200 --json number,state,labels 2>/dev/null)"; then
+    current="[]"
+  fi
+  _afk_seed_status_labels
+  # Diff desired-vs-current in python (JSON label parsing is unpleasant in bash): emit one
+  # `<num>\t<add|->\t<remove-csv|->` line per issue that actually CHANGES (write-on-change).
+  local plan
+  plan="$(_AFK_DESIRED="$desired" _AFK_CURRENT="$current" _AFK_LABELS="$AFK_STATUS_LABELS" python3 <<'PYEOF'
+import json
+import os
+
+afk = set(os.environ.get("_AFK_LABELS", "").split())
+desired = {}
+for line in os.environ.get("_AFK_DESIRED", "").splitlines():
+    if not line.strip():
+        continue
+    num, _tab, lab = line.partition("\t")
+    num, lab = num.strip(), lab.strip()
+    if num:
+        desired[num] = lab  # an afk:* label, or "-" for held/dep-blocked (no label)
+
+try:
+    holders = json.loads(os.environ.get("_AFK_CURRENT", "") or "[]")
+except Exception:
+    holders = []
+present = {}
+for item in holders if isinstance(holders, list) else []:
+    num = str(item.get("number"))
+    present[num] = [l.get("name") for l in (item.get("labels") or []) if l.get("name") in afk]
+
+for num in set(desired) | set(present):
+    want = desired.get(num, "-")  # absent from the open backlog ⇒ strip whatever it carries
+    have = present.get(num, [])
+    if want == "-":
+        if have:
+            print(f"{num}\t-\t{','.join(have)}")
+        continue
+    if have == [want]:
+        continue  # already correct — no gh call
+    remove = [l for l in have if l != want]
+    print(f"{num}\t{want}\t{','.join(remove) if remove else '-'}")
+PYEOF
+)"
+  local issue add remove args
+  while IFS=$'\t' read -r issue add remove; do
+    [ -n "$issue" ] || continue
+    args=()
+    [ "$add" != "-" ] && args+=("--add-label" "$add")
+    [ "$remove" != "-" ] && args+=("--remove-label" "$remove")
+    [ "${#args[@]}" -gt 0 ] || continue
+    if _afk_with_timeout "$AFK_GH_TIMEOUT" gh issue edit "$issue" ${args[@]+"${args[@]}"} >/dev/null 2>&1; then
+      log "  afk label #$issue → ${add}${remove:+ (was $remove)}"
+    else
+      log "  afk labels: gh issue edit #$issue failed (best-effort) — continuing"
+    fi
+  done < <(printf '%s\n' "$plan")
+}
+
 # --- the supervisor tick + stop condition -------------------------------------
 
 # supervise_tick -> one full pass: reconcile stale markers, dispatch the next batch, answer
-# parked spokes, land the ready ones, reap the hung ones. Each pass re-surveys the in-flight
-# set, so a spoke that changed state earlier in the tick is seen fresh.
+# parked spokes, land the ready ones, reap the hung ones, then reconcile the afk:* status
+# labels (#223). Each pass re-surveys the in-flight set, so a spoke that changed state
+# earlier in the tick is seen fresh.
 supervise_tick() {
   reconcile_markers
   dispatch_batch
@@ -1326,6 +1442,8 @@ supervise_tick() {
   auto_land
   recover_dead_panes
   reap_pass
+  # Reflect the tick's final disposition on GitHub (best-effort, no-op unless the flag is on).
+  afk_sync_status_labels
 }
 
 # --- event-driven wake (issue #176) -------------------------------------------
@@ -2022,6 +2140,7 @@ main() {
     _afk_clear_dispatch_fail_counts # fresh window ⇒ every issue's dispatch ceiling resets (#170)
     _afk_clear_land_retry_counts # fresh window ⇒ every issue's land-retry budget resets (#202 D)
     _afk_clear_last_action   # fresh window ⇒ no stale last-action label from a prior drain (#202 B)
+    _afk_clear_status_labels_seed # fresh window ⇒ re-seed the afk:* label set once (#223)
     log "/afk: armed ($([ "$end" = drain ] && echo 'drain — until the backlog is empty' || echo "until $(wt_date_ymd "$end") $(date -r "$end" +%H:%M 2>/dev/null || date -d "@$end" +%H:%M)"))"
   else
     # No window spec and not --once: a RESUME of the persisted window (a watchdog respawn or

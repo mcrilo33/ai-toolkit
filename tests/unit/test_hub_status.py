@@ -83,6 +83,7 @@ def _run_hub_status_proc(
     projects_dir: Path | None = None,
     listening: str = "4317 4318",
     otel: str | None = None,
+    batch_plan: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run hub-status.sh from the hub with `gh`, `tmux` and `lsof` stubs on PATH.
 
@@ -166,6 +167,10 @@ def _run_hub_status_proc(
     env["HUB_STATUS_TEST_SESSION"] = current_session
     env["HUB_STATUS_TEST_ISSUE_STATE"] = issue_state
     env["HUB_STATUS_TEST_TMUX_FAIL"] = "1" if tmux_fail else ""
+    # A batch-plan.sh override for the Scheduling section (#223): points hub-status at a
+    # stub so the section is hermetic without a real gh graphql round-trip.
+    if batch_plan is not None:
+        env["BATCH_PLAN"] = batch_plan
     fallback_projects = tmp_path / "no-claude-projects"
     env["CLAUDE_PROJECTS_DIR"] = str(
         projects_dir if projects_dir is not None else fallback_projects
@@ -191,6 +196,7 @@ def _run_hub_status(
     projects_dir: Path | None = None,
     listening: str = "4317 4318",
     otel: str | None = None,
+    batch_plan: str | None = None,
 ) -> str:
     """Run hub-status.sh and return its stdout (see _run_hub_status_proc)."""
     return _run_hub_status_proc(
@@ -204,6 +210,7 @@ def _run_hub_status(
         projects_dir=projects_dir,
         listening=listening,
         otel=otel,
+        batch_plan=batch_plan,
     ).stdout
 
 
@@ -969,3 +976,61 @@ def test_no_off_banner_when_enabled(hub_with_spokes: Path, tmp_path: Path) -> No
     out = _run_hub_status(hub_with_spokes, tmp_path)
 
     assert "AI-TOOLKIT OFF" not in out
+
+
+# ── Scheduling section (issue #223) ───────────────────────────────────────────
+
+
+def _batch_plan_stub(tmp_path: Path, *, stdout: str = "", exit_code: int = 0) -> str:
+    """A batch-plan.sh stub that echoes fixed `--explain` output.
+
+    hub-status invokes `bash <BATCH_PLAN> --explain`; the stub just prints the
+    canned scheduling view so the section is hermetic (no gh graphql round-trip).
+    """
+    stub = tmp_path / "batch-plan-stub.sh"
+    body = "#!/usr/bin/env bash\n"
+    if stdout:
+        # printf the literal fixture verbatim.
+        body += "cat <<'SCHED'\n" + stdout + "\nSCHED\n"
+    body += f"exit {exit_code}\n"
+    stub.write_text(body)
+    stub.chmod(0o755)
+    return str(stub)
+
+
+def test_scheduling_section_header_present(hub_with_spokes: Path, tmp_path: Path) -> None:
+    # Even with an empty schedule the section header is shown, so the hub survey
+    # always has a scheduling pane (#223).
+    stub = _batch_plan_stub(tmp_path, stdout="")
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, batch_plan=stub)
+
+    assert "Scheduling" in out
+
+
+def test_scheduling_section_renders_dispositions(hub_with_spokes: Path, tmp_path: Path) -> None:
+    fixture = (
+        "#189   in-flight              exclusive (Scope: *) — holds back #222, #214\n"
+        "#222   blocked-by-scope:#189  (hub-afk.sh)"
+    )
+    stub = _batch_plan_stub(tmp_path, stdout=fixture)
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, batch_plan=stub)
+
+    assert "Scheduling" in out
+    assert "#189" in out and "exclusive (Scope: *)" in out
+    assert "blocked-by-scope:#189" in out
+    # The section is rendered AFTER the worktree survey.
+    assert out.index("Scheduling") > out.index("Worktrees")
+
+
+def test_scheduling_section_empty_when_nothing_dispatchable(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    stub = _batch_plan_stub(tmp_path, stdout="")
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, batch_plan=stub)
+
+    # An empty schedule still reports the section, with a clear "nothing" marker.
+    scheduling = out[out.index("Scheduling"):]
+    assert re.search(r"nothing dispatchable|none", scheduling, re.I)
