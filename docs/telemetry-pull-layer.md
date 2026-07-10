@@ -35,6 +35,47 @@ extended thinking, an agent's full task prompt, a tool's secondary input
 (replacement text, file content) and its output, and human answers — stays
 filtered.
 
+## Client-side telemetry config (Issue #228)
+
+The **client-side** telemetry settings — whether capture is on and which Langfuse
+it targets — live in the `telemetry:` section of `settings/ai-toolkit.yml`, the
+declarative behavior config (see also model routing and `base_branch` there):
+
+```yaml
+telemetry:
+  enabled: true                    # replaces the AI_TOOLKIT_OTEL toggle
+  langfuse:
+    host: http://localhost:3000
+    project: proj-quicktest
+    public_key: pk-lf-quicktest    # public — safe to commit
+    otlp_endpoint: http://localhost:4318
+```
+
+`scripts/ai_toolkit_config.py` exposes these as accessors (`telemetry_enabled`,
+`langfuse_host`/`project`/`public_key`/`otlp_endpoint`) and a `telemetry-env` CLI
+seam. The bash consumers read them through `wt_resolve_telemetry_config`
+(`scripts/worktree-lib.sh`), layered **env → config → hardcoded default**: a live
+env var (`AI_TOOLKIT_OTEL`, `LANGFUSE_HOST`, …) still **wins**, so existing
+env-driven setups keep working; the config supplies the default where the operator
+set nothing; a telemetry-less config is a no-op that keeps each consumer's own
+literal. Consumers wired this way: the `AI_TOOLKIT_OTEL` toggle + span endpoint in
+`worktree-new.sh`, `LANGFUSE_HOST` in `telemetry-ingest-spoke.sh`, the toggle in
+`hub-otel-watch.sh`, and the host/project/public-key side of
+`wt_resolve_langfuse_auth`.
+
+> [!WARNING]
+> **The Langfuse SECRET never enters `ai-toolkit.yml`.** The config is committed
+> and synced into downstream projects, so only the *public* settings above belong
+> there. The secret key / `LANGFUSE_BASIC_AUTH` stays in `~/.afk-telemetry`
+> (gitignored, per-machine), resolved by `wt_resolve_langfuse_auth`; `secrets-scan`
+> and the security rule guard the boundary. A fresh **downstream** project should
+> ship `enabled: false` (opt-in) and point `host`/`otlp_endpoint` at its own
+> Langfuse rather than inherit `localhost`.
+
+The collector's own pipeline config (`dashboard/langfuse/otelcol.yaml`) is separate
+infrastructure and is **not** generated from this section — the config holds only the
+client-facing "where/whether to send," never the collector's exporters or ports.
+
 ## Modules
 
 All live in `scripts/telemetry/`:
