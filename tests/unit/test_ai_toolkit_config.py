@@ -15,6 +15,8 @@ model.
 
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -28,6 +30,12 @@ from metadata_parser import parse  # noqa: E402
 
 REAL_CONFIG = REPO_ROOT / "settings" / "ai-toolkit.yml"
 AGENTS_METADATA = REPO_ROOT / "shared" / "agents" / "metadata.yml"
+SECRETS_SCAN = REPO_ROOT / "shared" / "hooks" / "secrets-scan.sh"
+
+# A synthetic AWS-key-shaped value: matches secrets-scan's AKIA[0-9A-Z]{16} pattern
+# but is not a real credential. Built by concatenation so this test file itself
+# carries no contiguous secret literal (which the pre-write scanner would block).
+FAKE_SECRET = "AKIA" + "1234567890ABCDEF"
 
 FABLE = "claude-fable-5"
 OPUS = "claude-opus-4-8"
@@ -645,3 +653,59 @@ def test_real_config_langfuse_seed(real_config: dict) -> None:
     assert cfg.langfuse_project(real_config) == "proj-quicktest"
     assert cfg.langfuse_public_key(real_config) == "pk-lf-quicktest"
     assert cfg.langfuse_otlp_endpoint(real_config) == "http://localhost:4318"
+
+
+# ─── secret boundary: secrets-scan blocks a secret in ai-toolkit.yml (issue #228) ───
+
+# ai-toolkit.yml is committed AND synced into downstream projects, so the Langfuse
+# SECRET must never live there — only the public host/project/public_key/endpoint.
+# These pin the boundary as an enforced invariant, not just a documented one: the
+# pre-write secrets-scan hook DENIES (exit 2) a secret-shaped value written to
+# ai-toolkit.yml, while the declared-public key value is allowed through.
+
+
+def _scan_write(content: str) -> subprocess.CompletedProcess[str]:
+    """Run the pre-write secrets-scan hook on a Write to settings/ai-toolkit.yml."""
+    payload = json.dumps(
+        {
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": str(REPO_ROOT / "settings" / "ai-toolkit.yml"),
+                "content": content,
+            },
+        }
+    )
+    return subprocess.run(
+        ["bash", str(SECRETS_SCAN)], input=payload, capture_output=True, text=True
+    )
+
+
+def test_secrets_scan_blocks_secret_in_ai_toolkit_yml() -> None:
+    # A secret-key-shaped value under telemetry.langfuse in ai-toolkit.yml must be
+    # DENIED before the write lands (exit 2), enforcing the "secrets never in the
+    # committed config" boundary rather than merely documenting it.
+    content = f"telemetry:\n  langfuse:\n    secret_key: {FAKE_SECRET}\n"
+
+    result = _scan_write(content)
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "Secret detected" in result.stderr
+
+
+def test_secrets_scan_allows_public_key_in_ai_toolkit_yml() -> None:
+    # The declared-PUBLIC settings (host / project / public_key) are safe to commit,
+    # so the seed's own shape must pass — the boundary blocks secrets, not the public
+    # surface it is meant to carry.
+    content = (
+        "telemetry:\n"
+        "  enabled: true\n"
+        "  langfuse:\n"
+        "    host: http://localhost:3000\n"
+        "    project: proj-quicktest\n"
+        "    public_key: pk-lf-quicktest\n"
+        "    otlp_endpoint: http://localhost:4318\n"
+    )
+
+    result = _scan_write(content)
+
+    assert result.returncode == 0, result.stdout + result.stderr
