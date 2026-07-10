@@ -43,19 +43,35 @@ MSG=""
 FIRST_M=$(echo "$COMMAND" \
   | grep -oE '([[:space:]](-[a-zA-Z]*m|--message))([[:space:]=]|$).*' \
   | head -1 || true)
-if [ -n "$FIRST_M" ]; then
-  # Use ERE (-E): BSD/macOS sed does not support \| alternation in BRE, only
-  # GNU does. ERE alternation `|` is portable across both.
-  # Quoted: ... "..." or ... '...'  (first quoted token only)
-  MSG=$(echo "$FIRST_M" | sed -nE "s/^[[:space:]](-[a-zA-Z]*m|--message)[[:space:]=]*[\"']([^\"']*)[\"'].*/\2/p")
-  # Bare single word: ... message
-  if [ -z "$MSG" ]; then
-    MSG=$(echo "$FIRST_M" | sed -nE 's/^[[:space:]](-[a-zA-Z]*m|--message)[[:space:]=]*([^[:space:]"'"'"'][^[:space:]]*).*/\2/p')
-  fi
+
+# No message flag at all (e.g. git commit --amend, -F <file>, editor) — exempt.
+# This is the ONLY exemption: keying it on flag PRESENCE, not on an empty
+# extraction, closes issue #227. A quote-leading subject makes the extractor
+# below yield empty; the old `[ -z "$MSG" ] && exit 0` misread that as
+# "no message" and exited 0 BEFORE the format + anchor gates (fail-OPEN).
+[ -z "$FIRST_M" ] && exit 0
+
+# Use ERE (-E): BSD/macOS sed does not support \| alternation in BRE, only GNU
+# does. ERE alternation `|` is portable across both. Extract the SUBJECT from the
+# first message flag with a quote-TYPE-aware capture: a double-quoted value may
+# contain ' and a single-quoted value may contain " — so the inner class excludes
+# only the SAME quote as the delimiter. The old single `[\"']([^\"']*)[\"']` shared
+# the class across both delimiters, so a subject whose first char was a quote
+# (`-m '"add helper'`) captured the empty span before it (issue #227). Try
+# double-quoted, then single-quoted, then a bare single word.
+MSG=$(echo "$FIRST_M" | sed -nE 's/^[[:space:]](-[a-zA-Z]*m|--message)[[:space:]=]*"([^"]*)".*/\2/p')
+if [ -z "$MSG" ]; then
+  MSG=$(echo "$FIRST_M" | sed -nE "s/^[[:space:]](-[a-zA-Z]*m|--message)[[:space:]=]*'([^']*)'.*/\2/p")
+fi
+# Bare single word: ... message
+if [ -z "$MSG" ]; then
+  MSG=$(echo "$FIRST_M" | sed -nE 's/^[[:space:]](-[a-zA-Z]*m|--message)[[:space:]=]*([^[:space:]"'"'"'][^[:space:]]*).*/\2/p')
 fi
 
-# If no message found (e.g. git commit --amend), allow
-[ -z "$MSG" ] && exit 0
+# A flag WAS present but extraction is still empty — a quote-leading subject the
+# synth wrapped as `-m ""subject"` (unrecoverable textually) or a literal -m "".
+# Do NOT exit 0 here (that was the #227 fail-open): fall through so the
+# conventional check below denies the empty/non-conventional subject.
 
 # Git-generated messages are exempt: merge commits ("Merge branch '…'", "Merge
 # pull request …", "Merge remote-tracking branch …") and native reverts

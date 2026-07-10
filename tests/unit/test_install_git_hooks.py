@@ -320,6 +320,22 @@ def test_commit_msg_gate_blocks_non_conventional_message(repo: Path) -> None:
     assert _git(repo, "rev-parse", "HEAD").strip() == seed  # nothing committed
 
 
+def test_commit_msg_gate_blocks_leading_quote_subject(repo: Path) -> None:
+    # Issue #227: a subject whose first char is a quote reaches the synthesized
+    # command as `-m ""hello unconventional"` (the synth's outer wrapper quote plus
+    # the content's leading quote, after \" normalization). The quote-agnostic
+    # extractor captured the empty span between the two quotes → MSG empty → the
+    # `-z MSG` guard exited 0, so this non-conventional, unanchored (`main`) commit
+    # landed UNGATED. It must now be BLOCKED and nothing committed.
+    _install(repo)
+    seed = _git(repo, "rev-parse", "HEAD").strip()
+
+    commit = _commit(repo, "-m", '"hello unconventional')
+
+    assert commit.returncode != 0, "commit-quality must block a leading-quote subject"
+    assert _git(repo, "rev-parse", "HEAD").strip() == seed  # nothing committed
+
+
 # --- issue #226: a body-line anchor / Tested-RED survives the synthesis ----------
 #
 # The commit-msg hook synthesizes the `git commit` command from the real message.

@@ -212,6 +212,27 @@ def test_commit_quality_escaped_double_quotes_pass(on_branch: Callable[[str], Pa
 
 
 @pytest.mark.parametrize(
+    "command,branch",
+    [
+        pytest.param("git commit -m '\"add helper'", "feature/1-x", id="leading-double-anchored"),
+        pytest.param('git commit -m "\'add helper"', "feature/1-x", id="leading-single-anchored"),
+        pytest.param("git commit -m '\"feat: x'", "wip-no-anchor", id="leading-double-unanchored"),
+    ],
+)
+def test_commit_quality_leading_quote_subject_blocks(
+    on_branch: Callable[[str], Path], command: str, branch: str
+) -> None:
+    # Issue #227: when the subject's first char is a quote, the quote-agnostic
+    # extractor captured the EMPTY span between the opening shell quote and the
+    # leading content quote, so MSG came out empty and the `-z MSG` guard exited 0 —
+    # bypassing BOTH the conventional-format and issue-anchor gates (fail-OPEN). A
+    # leading-quote subject is never conventional, so it must BLOCK on both an
+    # anchored branch (format gate catches it) and an unanchored one.
+    repo = on_branch(branch)
+    assert run_hook(COMMIT_QUALITY, command, cwd=repo) == BLOCK
+
+
+@pytest.mark.parametrize(
     "command",
     [
         pytest.param(
