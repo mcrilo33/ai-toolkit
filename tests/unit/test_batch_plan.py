@@ -1237,3 +1237,18 @@ def test_explain_labels_strip_dep_blocked_issue() -> None:
     labels = _label_map([_node(1, "a.py"), _node(2, "b.py", blocked_by=[(1, "OPEN")])])
 
     assert labels["2"] == "-"
+
+
+def test_explain_exclusive_waiting_behind_another_reads_blocked_not_alone() -> None:
+    # Two exclusive ready issues, nothing in-flight: the lower-numbered grabs the slot
+    # (exclusive, runs alone), the second is held BEHIND it — it must read as blocked, not
+    # a misleading "runs alone", in both the view and the label.
+    nodes = [_node(9, "*"), _node(10, None)]  # #10 has no Scope: line ⇒ exclusive too
+
+    out = _explain(nodes)
+    assert re.search(r"^#9\b.*\bexclusive\b.*holds back #10", out, re.M)
+    assert re.search(r"^#10\b.*\bblocked-by-scope:#9\b", out, re.M)
+
+    labels = _label_map(nodes)
+    assert labels["9"] == "afk:exclusive"
+    assert labels["10"] == "afk:blocked-by-scope"
