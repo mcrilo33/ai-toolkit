@@ -591,7 +591,11 @@ wt_bridge_restart_if_stale() {
   local repo_root="$1" port="$2" pid start src
   pid="$(wt_bridge_pid "$port")"
   [ -n "$pid" ] || return 0
-  start="$(wt_ps_start_epoch "$pid")"
+  # `|| true`: wt_ps_start_epoch now returns non-zero on a dead/unparseable pid, and
+  # this runs under worktree-new.sh's `set -e`, where a failing command substitution
+  # in an assignment aborts before the guard below. Swallow it so the preflight stays
+  # best-effort (never fails the spawn); the empty-start guard covers both failures.
+  start="$(wt_ps_start_epoch "$pid")" || true
   [ -n "$start" ] || return 0
   src="$(wt_bridge_source_mtime "$repo_root")"
   [ "$src" -gt "$start" ] 2>/dev/null || return 0

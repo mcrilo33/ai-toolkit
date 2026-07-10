@@ -328,6 +328,33 @@ def test_bridge_preflight_stale_but_auth_missing_leaves_process() -> None:
     assert "LANGFUSE_BASIC_AUTH" in result.stderr
 
 
+def test_bridge_restart_survives_nonzero_start_epoch_under_errexit() -> None:
+    # Regression (#189): wt_ps_start_epoch now returns non-zero on a dead/unparseable
+    # pid, and wt_bridge_restart_if_stale runs under worktree-new.sh's `set -e`, where
+    # a failing `start="$(wt_ps_start_epoch …)"` assignment would abort the spawn
+    # before the empty-start guard. The `|| true` must keep the preflight best-effort:
+    # the function returns 0, kills/launches nothing, and control reaches the sentinel.
+    script = "; ".join(
+        [
+            "set -euo pipefail",
+            'wt_bridge_pid() { printf "4242"; }',
+            "wt_ps_start_epoch() { return 1; }",  # dead pid: empty stdout, non-zero
+            'wt_bridge_source_mtime() { printf "9999999999"; }',
+            'wt_bridge_kill() { echo "KILLED $1"; }',
+            'wt_bridge_launch() { echo "LAUNCHED $1"; }',
+            "export AI_TOOLKIT_OTEL=1 LANGFUSE_BASIC_AUTH=Basic-xyz",
+            "wt_bridge_restart_if_stale /repo 4319",
+            'echo "REACHED_END=$?"',
+        ]
+    )
+    result = _call(script)
+
+    assert result.returncode == 0, result.stderr
+    assert "REACHED_END=0" in result.stdout.splitlines(), result.stdout
+    assert "KILLED" not in result.stdout
+    assert "LAUNCHED" not in result.stdout
+
+
 # --- wt_source_hash: content-hash source stamp (issue #190) --------------------
 # The reusable "source-hash stamp" primitive: a content hash over a daemon's source
 # bundle, so a long-running process can detect it is running code a land has since
