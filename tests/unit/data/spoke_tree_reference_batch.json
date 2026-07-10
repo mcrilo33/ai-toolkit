@@ -152,22 +152,6 @@
       }
     },
     {
-      "id": "tree-cf5310d4443536322a8d7a54",
-      "type": "span-create",
-      "timestamp": "2026-01-01T00:00:00Z",
-      "body": {
-        "id": "tree-cf5310d4443536322a8d7a54",
-        "traceId": "spoketree-23b79fa73d155fc8",
-        "parentObservationId": "spokeroot-23b79fa73d155fc8",
-        "name": "step:green",
-        "startTime": null,
-        "endTime": null,
-        "metadata": {
-          "kind": "step"
-        }
-      }
-    },
-    {
       "id": "tree-632171f2ff147abbbf2e3e2f",
       "type": "span-create",
       "timestamp": "2026-01-01T00:00:00Z",
@@ -489,22 +473,6 @@
           }
         },
         "model": "claude-opus-4-8"
-      }
-    },
-    {
-      "id": "cyc-cf5310d4443536322a8d7a54",
-      "type": "span-create",
-      "timestamp": "2026-01-01T00:00:00Z",
-      "body": {
-        "id": "cyc-cf5310d4443536322a8d7a54",
-        "traceId": "spokecycle-23b79fa73d155fc8",
-        "parentObservationId": "spokecycleroot-23b79fa73d155fc8",
-        "name": "step:green",
-        "startTime": null,
-        "endTime": null,
-        "metadata": {
-          "kind": "step"
-        }
       }
     },
     {

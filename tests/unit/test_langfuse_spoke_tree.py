@@ -39,7 +39,6 @@ from telemetry.langfuse_spoke_tree import (
     build_loaded_context_events,
     build_score_events,
     build_step_cost_scores,
-    build_step_windows,
     cycle_copy_id_for,
     cycle_root_id_for,
     cycle_trace_id_for,
@@ -68,7 +67,7 @@ from telemetry.spoke_tree.ids import _CYCLE_STEP_PREFIX
 from telemetry.spoke_tree.llm_decomp import _decomp_metadata
 from telemetry.spoke_tree.loaded_context import find_request_files
 from telemetry.spoke_tree.scores import _step_phase
-from telemetry.spoke_tree.steps import _STEP_PREFIX, build_cycle_windows
+from telemetry.spoke_tree.steps import _STEP_PREFIX, build_cycle_windows, build_step_windows
 
 SPOKE = "feature/22-demo+1700000000"
 
@@ -182,14 +181,15 @@ class TestBuildBatch:
     def test_one_copy_per_source_observation(self) -> None:
         batch = build_batch(_traces(), SPOKE)
 
-        # 6 source observations across the 4 traces; the two `.sh` hooks additionally spawn a
-        # `guards` + `guards:session` group each (#157), so filter those out to count the sources.
+        # 6 source observations across the 4 traces, but the step:green cycle-marker is suppressed
+        # (#235), leaving 5 copies; the two `.sh` hooks additionally spawn a `guards` +
+        # `guards:session` group each (#157), so filter those out to count the sources.
         copies = [
             event
             for event in batch[2:]
             if event["body"].get("name") not in ("guards", "guards:session")
         ]
-        assert len(copies) == 6
+        assert len(copies) == 5
         assert all(event["body"]["traceId"] == trace_id_for(SPOKE) for event in copies)
         assert {event["type"] for event in copies} == {"span-create", "generation-create"}
 
@@ -215,10 +215,18 @@ class TestBuildBatch:
     def test_absent_fields_are_not_invented(self) -> None:
         batch = build_batch(_traces(), SPOKE)
 
-        marker = _by_orig(batch, "trace-marker", "m1")
-        assert "usageDetails" not in marker["body"]
-        assert "input" not in marker["body"]
-        assert "model" not in marker["body"]
+        interaction = _by_orig(batch, "trace-int", "i1")
+        assert "usageDetails" not in interaction["body"]
+        assert "input" not in interaction["body"]
+        assert "model" not in interaction["body"]
+
+    def test_cycle_marker_span_is_suppressed(self) -> None:
+        # #235: the step:<phase> marker is consumed to build the cycle spine, never copied verbatim.
+        batch = build_batch(_traces(), SPOKE)
+
+        copy_id = _copy_id("trace-marker", "m1")
+        assert not any(event["id"] == copy_id for event in batch)
+        assert "step:green" not in {event["body"].get("name") for event in batch}
 
     def test_intra_trace_parent_is_remapped(self) -> None:
         batch = build_batch(_traces(), SPOKE)
@@ -226,14 +234,12 @@ class TestBuildBatch:
         tool = _by_orig(batch, "trace-int", "t1")
         assert tool["body"]["parentObservationId"] == _copy_id("trace-int", "i1")
 
-    def test_interaction_and_marker_roots_collapse_to_spoke_root(self) -> None:
+    def test_interaction_root_collapses_to_spoke_root(self) -> None:
         batch = build_batch(_traces(), SPOKE)
 
         root_id = root_id_for(SPOKE)
         interaction = _by_orig(batch, "trace-int", "i1")
-        marker = _by_orig(batch, "trace-marker", "m1")
         assert interaction["body"]["parentObservationId"] == root_id
-        assert marker["body"]["parentObservationId"] == root_id
 
     def test_hook_matching_a_tool_is_parented_under_that_tool(self) -> None:
         # #157: the hook nests under its tool's `guards` group, which nests under the tool.

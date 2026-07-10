@@ -28,6 +28,18 @@
 # empty commit) leaves HEAD/@{upstream} unchanged, and the HEAD-keyed idempotency
 # skips the already-emitted marker rather than fabricating a new one.
 #
+# KNOWN GAP — the REVIEW witness (#235). REVIEW is stamped from a WRITE of a
+# worktree-root `.review/<name>.json` artifact, which the /code-review skill and the
+# review-stamp mint both produce. An Agent-tool `code-review` subagent that inspects
+# the diff and returns findings WITHOUT writing a `.review/*.json` artifact leaves no
+# mechanical witness, so its REVIEW step is not marked here (RED/GREEN/PUSH are
+# unaffected — they key on commit/push). This is by design: the marker spine only
+# stamps steps with a real mechanical trace. The #235 builder (build_cycle_windows)
+# still yields a contiguous spine from whichever markers ARE present, and the ledger
+# REVIEW entry labels the window when the spoke recorded one; a truly witness-less
+# REVIEW simply folds into the surrounding GREEN->PUSH span rather than minting a
+# phantom step.
+#
 # UPGRADE: a `git -C <other-repo> commit` is classified from THIS worktree's HEAD
 # (is_git_commit matches the -C form, but the root/HEAD resolve to the current
 # worktree). Harmless under dedup unless the current HEAD is unmarked; solving it

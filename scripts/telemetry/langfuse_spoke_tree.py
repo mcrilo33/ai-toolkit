@@ -26,8 +26,9 @@ Two views over the SAME observation copies (#113), differing only in the top-lev
   (:func:`_apply_step_grouping`).
 - **View B — the cycle/phase lens** (``spokecycle-<spoke>``, :func:`build_cycle_batch`). Flattens
   each top-level ``claude_code.interaction`` from a container to a childless leaf turn-marker and
-  re-homes the copies onto a pure cycle axis — ``preStep`` + one ``step:<subject>`` per ledger task
-  + ``postStep`` — placing each real span (and each turn-marker) by its timestamp and letting audit
+  re-homes the copies onto a pure cycle axis — ``preStep`` + one ``step:<subject>`` per cycle window
+  (:func:`build_cycle_windows`, marker-preferred, #235) + ``postStep`` — placing each real span
+  (and each turn-marker) by its timestamp and letting audit
   instants ride their tool/llm_request by causal key (:func:`_apply_cycle_axis`). The childless
   marker is stamped with its turn's ``metadata.rollup`` (the sum of its pre-flatten subtree, whose
   generations re-home onto the steps), recovering per-turn cost reading (#114).
@@ -221,6 +222,7 @@ from telemetry.spoke_tree.observations import (
     ToolContent,
     TraceObservations,
     _earliest_start,
+    _is_cycle_step_marker,
     _latest_time,
 )
 from telemetry.spoke_tree.rollups import (
@@ -231,7 +233,7 @@ from telemetry.spoke_tree.scores import build_score_events, build_step_cost_scor
 from telemetry.spoke_tree.steps import (
     _apply_step_grouping,
     _collapse_startup_instants,
-    build_step_windows,
+    build_cycle_windows,
 )
 
 logger = logging.getLogger("langfuse_spoke_tree")
@@ -341,6 +343,10 @@ def build_batch(
         root_event=root_event,
         keep_noop_guards=keep_noop_guards,
     )
+    # The solo-cycle marker spans (step:<phase>) are telemetry plumbing consumed to build the
+    # cycle spine (#235); drop them here so a marker never renders as an orphan ``step:green``
+    # sibling of the ledger-labelled ``step:GREEN`` grouping node.
+    copies = [event for event in copies if not _is_cycle_step_marker(event["body"])]
     step_events = _apply_step_grouping(
         copies, traces, tool_content, spoke_run_id=spoke_run_id, trace_id=trace_id
     )
@@ -452,7 +458,8 @@ def build_cycle_batch(
 
     Built from the SAME observation copies as :func:`build_batch` (same rich input/output,
     usageDetails, costDetails, metadata) but re-homed onto a pure cycle axis: the top level is
-    ``preStep`` + one ``step:<subject>`` per ledger task + ``postStep``, totally partitioning the
+    ``preStep`` + one ``step:<subject>`` per cycle window (marker-preferred, #235) + ``postStep``,
+    totally partitioning the
     timeline. Real spans (``tool:*`` / ``claude_code.llm_request``) are placed under the step
     whose window contains their ``startTime`` (gap -> preceding step); audit instants ride along
     under their tool / llm_request by causal key, never their lagging timestamp
@@ -516,7 +523,11 @@ def build_cycle_batch(
         root_event=root_event,
         keep_noop_guards=keep_noop_guards,
     )
-    windows = build_step_windows(traces, tool_content)
+    # Drop the marker spans before re-homing (#235): their startTimes seed the cycle windows
+    # (read from ``traces`` below), but the raw nodes must not land on the axis as leaf duplicates
+    # of the step they define.
+    copies = [event for event in copies if not _is_cycle_step_marker(event["body"])]
+    windows = build_cycle_windows(traces, tool_content)
     copies, step_events, marker_ids = _apply_cycle_axis(
         copies,
         traces,

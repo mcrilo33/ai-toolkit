@@ -188,6 +188,31 @@ def _is_interaction(observation: Observation) -> bool:
     return (observation.get("name") or "") == _INTERACTION_NAME
 
 
+def _is_cycle_step_marker(observation: Observation) -> bool:
+    """Whether an observation is a solo-cycle step marker span (cycle-step-mark.sh, #178/#235).
+
+    These carry ``workflow.kind == "step"`` (nested under ``metadata["attributes"]`` by Langfuse,
+    or as flat ``kind`` in the audit/test shapes) and render with an OTLP label ``step:<phase>``.
+    #235 reads them to build the View B cycle spine, then suppresses the raw node so a marker
+    never surfaces as an orphan ``step:green`` sibling of the labelled ``step:GREEN`` step.
+    """
+    return _attr(observation, "workflow.kind", "kind") == "step"
+
+
+def _cycle_marker_phase(observation: Observation) -> str:
+    """Return a cycle-step marker's lowercase phase (``red``/``green``/``review``/``push``).
+
+    From the ``workflow.phase`` attribute, falling back to the ``step:<phase>`` OTLP name label;
+    ``""`` when neither is present.
+    """
+    phase = _attr(observation, "workflow.phase")
+    if phase:
+        return str(phase).lower()
+    name = observation.get("name") or ""
+    prefix = "step:"
+    return name[len(prefix) :].lower() if name.startswith(prefix) else ""
+
+
 def _request_id(observation: Observation) -> str | None:
     """Return the LLM request id from an observation's attributes/flat metadata, or None."""
     metadata = observation.get("metadata") or {}

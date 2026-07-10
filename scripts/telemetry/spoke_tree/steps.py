@@ -4,7 +4,13 @@ Each ``TaskCreate`` subject is a step whose ``in_progress`` → ``completed`` ``
 window (:func:`build_step_windows`); :func:`_apply_step_grouping` inserts a ``step:<subject>`` node
 INSIDE each interaction that holds the task's markers, wrapping the contiguous run of same-parent
 siblings in the window. :func:`_collapse_startup_instants` demotes session-startup instants to the
-root's metadata (#104). Depends only on the foundation modules.
+root's metadata (#104).
+
+For the View B cycle spine, :func:`build_cycle_windows` PREFERS the mechanical ``step:<phase>``
+marker spans (``cycle-step-mark.sh``, #235) over the ledger — a crashed/relaunched spoke that never
+touches its ledger still yields a complete RED/GREEN/REVIEW/PUSH axis, with the ledger consulted for
+labels only; it falls back to :func:`build_step_windows` when no markers were stamped. Depends only
+on the foundation modules.
 """
 
 from __future__ import annotations
@@ -19,7 +25,9 @@ from telemetry.spoke_tree.observations import (
     IngestEvent,
     ToolContent,
     TraceObservations,
+    _cycle_marker_phase,
     _is_audit_instant,
+    _is_cycle_step_marker,
     _is_startup_instant,
     _latest_time,
     _tool_use_id,
@@ -163,6 +171,88 @@ def build_step_windows(
             )
         )
     windows.sort(key=lambda window: window.start)
+    return windows
+
+
+def _marker_spans(traces: list[TraceObservations]) -> list[dict[str, Any]]:
+    """Return the timestamped solo-cycle marker spans across all traces, sorted by start (#235)."""
+    markers = [
+        observation
+        for _orig_trace_id, observations in traces
+        for observation in observations
+        if _is_cycle_step_marker(observation) and observation.get("startTime")
+    ]
+    markers.sort(key=lambda observation: observation["startTime"])
+    return markers
+
+
+def _subject_names_phase(subject: str, phase: str) -> bool:
+    """Whether ``subject`` names the marker ``phase`` as a whole word (e.g. ``"S1 RED: …"`` / RED)."""
+    return re.search(rf"\b{re.escape(phase.upper())}\b", subject.upper()) is not None
+
+
+def _marker_label(phase: str, start: str, end: str, ledger: list[StepWindow]) -> str:
+    """Borrow an overlapping same-phase ledger subject for the marker window, else the PHASE (#235).
+
+    The mechanical marker owns the window bounds; the ledger only supplies a human label. A ledger
+    window of the same phase that overlaps ``[start, end]`` lends its subject; otherwise the bare
+    uppercase phase (``GREEN``) is used — still parseable by the closed-set phase scorer.
+    """
+    for window in ledger:
+        if (
+            window.start <= end
+            and start <= window.end
+            and _subject_names_phase(window.subject, phase)
+        ):
+            return window.subject
+    return phase.upper()
+
+
+def build_cycle_windows(
+    traces: list[TraceObservations], tool_content: dict[str, ToolContent]
+) -> list[StepWindow]:
+    """Derive the View B cycle spine, preferring the mechanical marker spans (#235).
+
+    ``cycle-step-mark.sh`` stamps one ``step:<phase>`` marker span per solo-cycle boundary from the
+    mechanical witness of each transition (a ``Tested-RED:`` commit -> red, a plain commit -> green,
+    a ``.review/*.json`` write -> review, a branch push -> push). This spine is LLM-independent, so a
+    crashed/relaunched spoke that never touches its ledger still yields a complete step axis — unlike
+    :func:`build_step_windows`, whose windows vanish when the ledger is empty.
+
+    Each marker opens a window that runs to the next marker's start (the last clamps to the spoke's
+    latest activity). The ledger is consulted for LABELS only: an overlapping same-phase ledger
+    subject is borrowed (so a step reads ``step:S1 RED: …``), otherwise the bare uppercase phase.
+    When no markers were stamped (legacy traces, or a telemetry-off run) it falls back to the
+    ledger-derived windows unchanged.
+
+    Args:
+        traces: The source traces paired with their observations.
+        tool_content: Tool-call-id to :class:`ToolContent` (the ledger ops' input/output, for labels).
+
+    Returns:
+        The cycle-step windows in chronological start order.
+    """
+    markers = _marker_spans(traces)
+    ledger = build_step_windows(traces, tool_content)
+    if not markers:
+        return ledger
+    latest = _latest_time(traces)
+    windows: list[StepWindow] = []
+    for index, marker in enumerate(markers):
+        start = marker["startTime"]
+        end = markers[index + 1]["startTime"] if index + 1 < len(markers) else latest
+        if end < start:
+            end = start
+        phase = _cycle_marker_phase(marker)
+        windows.append(
+            StepWindow(
+                task_id=f"marker{index}",
+                subject=_marker_label(phase, start, end, ledger),
+                start=start,
+                end=end,
+                status="completed",
+            )
+        )
     return windows
 
 
