@@ -306,6 +306,8 @@ npm_[a-zA-Z0-9]{36}	npm access token
 pypi-AgEIcH[a-zA-Z0-9_-]{50,}	PyPI API token
 SG\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9_-]{43}	SendGrid API key
 key-[a-zA-Z0-9]{32}	Mailgun API key
+sk-lf-[A-Za-z0-9-]{20,}	Langfuse secret key
+LANGFUSE_BASIC_AUTH["':= ]*Basic [A-Za-z0-9+/=]{20,}	Langfuse basic-auth credential
 PATTERNS
 }
 

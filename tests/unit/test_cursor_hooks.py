@@ -35,6 +35,18 @@ ALLOW = 0
 # real credential (synthetic test fixture, never used against any service).
 FAKE_SECRET = "AKIA" + "1234567890ABCDEF"
 
+# Synthetic Langfuse credentials (#229) — never used against any service. The
+# sk-lf-<uuid> secret key evades the OpenAI sk-[a-zA-Z0-9]{20,} pattern because the
+# -lf- and the UUID hyphens break the alphanumeric run; the pk-lf- PUBLIC key lives
+# in ai-toolkit.yml on purpose and MUST stay unblocked.
+FAKE_LANGFUSE_SECRET = "sk-lf-" + "b1234567-89ab-cdef-0123-456789abcdef"
+FAKE_LANGFUSE_PUBLIC = "pk-lf-" + "b1234567-89ab-cdef-0123-456789abcdef"
+# base64("pk-lf-...:sk-lf-...") -- the opaque LANGFUSE_BASIC_AUTH credential blob.
+FAKE_LANGFUSE_BASIC_AUTH = (
+    "cGstbGYtYjEyMzQ1NjctODlhYi1jZGVmLTAxMjMtNDU2Nzg5YWJjZGVmOnNrLWxm"
+    "LWIxMjM0NTY3LTg5YWItY2RlZi0wMTIzLTQ1Njc4OWFiY2RlZg=="
+)
+
 
 def _run(script: Path, payload: str, *, cwd: Path | None = None):
     return subprocess.run(
@@ -267,6 +279,24 @@ class TestSecretsScanCommitTime:
     def test_claude_pre_write_clean_allows(self) -> None:
         rc = _run(SECRETS_SCAN, claude_write("/x/c.py", "tok = 1\n"))
         assert rc.returncode == ALLOW
+
+    def test_blocks_commit_with_langfuse_secret_key(self, git_repo: Path) -> None:
+        _stage(git_repo, "bad.py", f'KEY = "{FAKE_LANGFUSE_SECRET}"\n')
+        rc = _run(SECRETS_SCAN, cursor_shell("git commit -m 'x'", git_repo), cwd=git_repo)
+        assert rc.returncode == BLOCK
+
+    def test_allows_commit_with_langfuse_public_key(self, git_repo: Path) -> None:
+        # The pk-lf- PUBLIC key lives in ai-toolkit.yml on purpose — never block it.
+        _stage(git_repo, "pub.py", f'PUBLIC = "{FAKE_LANGFUSE_PUBLIC}"\n')
+        rc = _run(SECRETS_SCAN, cursor_shell("git commit -m 'x'", git_repo), cwd=git_repo)
+        assert rc.returncode == ALLOW
+
+    def test_blocks_commit_with_langfuse_basic_auth(self, git_repo: Path) -> None:
+        _stage(
+            git_repo, "env.sh", f'export LANGFUSE_BASIC_AUTH="Basic {FAKE_LANGFUSE_BASIC_AUTH}"\n'
+        )
+        rc = _run(SECRETS_SCAN, cursor_shell("git commit -m 'x'", git_repo), cwd=git_repo)
+        assert rc.returncode == BLOCK
 
 
 # ── secrets-scan-revert: afterFileEdit containment ────────
