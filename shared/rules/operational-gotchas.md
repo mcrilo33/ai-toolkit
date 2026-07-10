@@ -114,6 +114,33 @@ Mechanical `LC_ALL=C` process-probe helpers are tracked in #189, and a
 non-C-locale CI job in #194 — prefer those helpers once they land over hand-rolled
 wrappers.
 
+## Keep debug scratch inside the worktree
+
+A benign one-off command — writing a probe's output to a scratch file, `chmod`-ing
+a fixture, `mkdir` of a temp dir, a repro script — is auto-approved unattended
+**only when every path it touches stays inside your own worktree or its
+`.ai-toolkit/` scratchpad.** The `/afk` gate-broker's benign-mutation lane cannot
+prove a write **outside** the worktree is harmless, so it escalates the permission
+dialog to `blocked/<issue>` and parks the spoke for a human — stalling the whole
+run on a throwaway command.
+
+The trap is reaching for `/tmp` out of habit. A `bash -c 'pgrep bash >
+/tmp/rotest/nofile'` repro escalated an entire spoke (#225) for a debug scratch
+file that had nothing to do with the change. Keep scratch under the worktree so
+benign experiments auto-approve:
+
+- `mktemp -d ./tmp.XXXXXX` (a worktree-relative temp dir), not `mktemp -d`
+  (defaults to `/tmp`).
+- Write repro files under the worktree or `.ai-toolkit/` — never `/tmp/...`,
+  `$HOME/...`, or a sibling worktree.
+- In pytest, use the `tmp_path` fixture (it lands under the run's own tmp root),
+  not a hard-coded `/tmp/<name>` path — the same isolation the #129/#132 cluster
+  enforces.
+
+A write that genuinely must leave the worktree is a real human decision — let it
+escalate. This rule is for the far more common case: scratch that never needed to
+leave in the first place.
+
 ## Ship discipline
 
 Push every subtask's branch without asking; emit the ready marker
