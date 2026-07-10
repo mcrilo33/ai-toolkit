@@ -149,41 +149,36 @@ MSG_FILE="$1"
 # Strip comment lines git would drop.
 MSG_BODY=$(grep -v '^[[:space:]]*#' "$MSG_FILE" || true)
 
-# Emit ONE -m per message PARAGRAPH (blank-line separated), reproducing the agent
-# two-`-m` shape, rather than a single -m carrying the whole body (issue #226). A
-# single -m forces a choice between two broken encodings: @json turns the body's
-# newlines into a literal backslash-n, gluing a body-line anchor / Tested-RED to
-# the preceding 'n' and defeating commit-quality's (^|[^[:alpha:]]) boundary and
+# Emit ONE -m per NON-BLANK LINE of the message, reproducing the agent multi-`-m`
+# shape, rather than a single -m carrying the whole body (issue #226). A single -m
+# forces a choice between two broken encodings: @json turns the body's newlines
+# into a literal backslash-n, gluing a body-line anchor / Tested-RED to the
+# preceding 'n' and defeating commit-quality's (^|[^[:alpha:]]) boundary and
 # commit-gauntlet's (^|[[:space:]"'])Tested-RED: carve-out (a fail-CLOSED false
-# rejection); while embedding REAL newlines in one -m leaves commit-quality's
-# line-oriented subject extraction with an unterminated quote on line 1 → empty
-# MSG → the commit passes UNGATED (fail-OPEN). Per-paragraph avoids both: the
-# subject is its own single-line, quote-terminated -m (extracts cleanly), and a
-# body-line anchor / Tested-RED sits at a line start under real newlines, matched
-# by the ^-anchored consumer greps — exactly as in the agent path. Each paragraph
-# escapes only backslash + double-quote so its internal newlines stay real; the
-# outer jq (or the sed fallback) then JSON-encodes the assembled command once.
+# rejection); while embedding a REAL newline in ANY one -m leaves commit-quality's
+# line-oriented subject extraction (grep/sed operate per physical line) with an
+# unterminated quote on that -m's first line → empty MSG → the commit passes
+# UNGATED (fail-OPEN). Splitting per LINE — not per blank-line paragraph — is what
+# guarantees no -m ever holds an embedded newline: a subject block that spans
+# several physical lines with no blank separator is still one -m PER LINE, so the
+# subject stays a single quote-terminated -m (extracts cleanly) and every body-line
+# anchor / Tested-RED sits at the start of its own -m value, matched by the
+# consumer greps — exactly as in the agent path. Blank lines are dropped (an empty
+# -m would carry no anchor and only pad the command). Each line escapes only
+# backslash + double-quote; the outer jq (or the sed fallback) JSON-encodes the
+# assembled command once. Note the synthesized command feeds the cage PARSERS only
+# — it does not create the commit — so line-vs-paragraph granularity is immaterial
+# to the real message; the cage scripts scan for subject/anchor/Tested-RED, none of
+# which spans a line break.
 build_commit_cmd() {
-  local body="$1" cmd="git commit" para="" line esc
-  _emit_para() {
-    [ -n "$para" ] || return 0
-    esc=$(printf '%s' "$para" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    cmd="$cmd -m \"$esc\""
-    para=""
-  }
+  local body="$1" cmd="git commit" line esc
   while IFS= read -r line || [ -n "$line" ]; do
-    if [ -z "$line" ]; then
-      _emit_para
-    elif [ -z "$para" ]; then
-      para="$line"
-    else
-      para="$para
-$line"
-    fi
-  done <<PARAS
+    [ -n "$line" ] || continue
+    esc=$(printf '%s' "$line" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    cmd="$cmd -m \"$esc\""
+  done <<LINES
 $body
-PARAS
-  _emit_para
+LINES
   printf '%s' "$cmd"
 }
 CMD=$(build_commit_cmd "$MSG_BODY")

@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -284,10 +283,10 @@ def _commit(repo: Path, *msg_args: str) -> subprocess.CompletedProcess[str]:
 )
 def test_commit_msg_synthesizes_raw_command(repo: Path, tmp_path: Path) -> None:
     # The captured payload's command must be byte-identical to a real commit
-    # invocation in the agent two-`-m` shape: ONE `-m "<paragraph>"` per blank-line
-    # separated paragraph, each with only backslash + double-quote escaped (its
-    # internal newlines stay real), `git` at a command boundary — NOT wrapped in
-    # outer quotes, NOT a single @json-encoded -m (issue #226). The exact escaping
+    # invocation in the agent multi-`-m` shape: ONE `-m "<line>"` per NON-BLANK
+    # physical line, each with only backslash + double-quote escaped, `git` at a
+    # command boundary — NOT wrapped in outer quotes, NOT a single @json-encoded -m,
+    # and never a `-m` carrying an embedded newline (issue #226). The exact escaping
     # is jq-specific (the no-jq fallback collapses newlines to spaces), so this
     # precise-equality check is guarded on jq.
     hooks = _install(repo)
@@ -300,9 +299,9 @@ def test_commit_msg_synthesizes_raw_command(repo: Path, tmp_path: Path) -> None:
     assert commit.returncode == 0, commit.stderr
     payload = json.loads(log.read_text())
     body = _git(repo, "show", "-s", "--format=%B", "HEAD").rstrip("\n")
-    paragraphs = [p for p in re.split(r"\n{2,}", body) if p]
+    lines = [ln for ln in body.split("\n") if ln]
     expected = "git commit" + "".join(
-        ' -m "' + p.replace("\\", "\\\\").replace('"', '\\"') + '"' for p in paragraphs
+        ' -m "' + ln.replace("\\", "\\\\").replace('"', '\\"') + '"' for ln in lines
     )
     assert payload["tool_input"]["command"] == expected
 
@@ -373,6 +372,28 @@ def test_commit_msg_multiline_bad_subject_still_denied(repo: Path) -> None:
     commit = _commit(repo, "-m", "not a conventional message", "-m", "some body text")
 
     assert commit.returncode != 0, "a bad-subject multi-line commit must be blocked"
+    assert "conventional commits" in (commit.stdout + commit.stderr).lower()
+    assert _git(repo, "rev-parse", "HEAD").strip() == seed  # nothing committed
+
+
+def test_commit_msg_multiline_subject_block_still_denied(repo: Path) -> None:
+    # Regression (code-review of the #226 fix): a message whose SUBJECT BLOCK spans
+    # multiple physical lines with NO blank-line separator is ONE paragraph. Merging
+    # those lines into a single `-m` would carry a real newline, leaving commit-
+    # quality's line-oriented subject extraction with an unterminated quote on line 1
+    # → empty MSG → the commit passes UNGATED — the same fail-OPEN a single embedded-
+    # newline `-m` causes, just triggered by an intra-paragraph line break. The synth
+    # emits one `-m` per NON-BLANK LINE so every `-m` is single-line: a non-conventional
+    # multi-line subject block with no anchor is still DENIED.
+    _install(repo)
+    seed = _git(repo, "rev-parse", "HEAD").strip()
+
+    # A single `-m` with an embedded newline: subject "wip changes", body line
+    # "some detail", no blank line between them (one paragraph). Non-conventional,
+    # unanchored — must be blocked, not slipped through.
+    commit = _commit(repo, "-m", "wip changes\nsome detail")
+
+    assert commit.returncode != 0, "a multi-line non-conventional subject block must be blocked"
     assert "conventional commits" in (commit.stdout + commit.stderr).lower()
     assert _git(repo, "rev-parse", "HEAD").strip() == seed  # nothing committed
 
