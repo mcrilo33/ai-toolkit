@@ -1184,8 +1184,9 @@ def test_explain_marks_scope_collider_blocked_by_that_issue() -> None:
 
     # Every dispatchable peer collides with the exclusive in-flight #189.
     assert re.search(r"^#222\b.*\bblocked-by-scope:#189\b.*\(hub-afk\.sh\)", out, re.M)
+    # Multi-token scopes render as a deterministic sorted set (land < lib).
     assert re.search(
-        r"^#214\b.*\bblocked-by-scope:#189\b.*\(worktree-lib\.sh worktree-land\.sh\)", out, re.M
+        r"^#214\b.*\bblocked-by-scope:#189\b.*\(worktree-land\.sh worktree-lib\.sh\)", out, re.M
     )
 
 

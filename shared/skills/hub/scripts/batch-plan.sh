@@ -118,6 +118,8 @@ fetch_issues() {
 # python3 pass; bash only marshals the in-flight scopes in via the environment.
 plan_from_json() {
   local inflight=()
+  local inflight_nums=()
+  local explain=""
   local cap=0
   local repo_root=""
   while [ "$#" -gt 0 ]; do
@@ -125,6 +127,17 @@ plan_from_json() {
       --inflight) [ "$#" -ge 2 ] || { echo "batch-plan: --inflight needs a value" >&2; return 2; }
                   inflight+=("$2"); shift 2 ;;
       --inflight=*) inflight+=("${1#--inflight=}"); shift ;;
+      # --explain (#223) annotates every open dispatchable issue with its scheduling
+      # disposition + reason instead of printing the winning batch; --explain-labels emits
+      # the same dispositions as a machine-readable `<num>\t<afk:label|->` TSV. --inflight-issue
+      # N (repeatable) names the in-flight issue NUMBERS so the view can attribute a
+      # blocked-by-scope collision to a specific live spoke (the scope is looked up from the
+      # backlog). All three are inert on the normal batch path (byte-identical output).
+      --explain) explain="view"; shift ;;
+      --explain-labels) explain="labels"; shift ;;
+      --inflight-issue) [ "$#" -ge 2 ] || { echo "batch-plan: --inflight-issue needs a value" >&2; return 2; }
+                        inflight_nums+=("$2"); shift 2 ;;
+      --inflight-issue=*) inflight_nums+=("${1#--inflight-issue=}"); shift ;;
       --cap) [ "$#" -ge 2 ] || { echo "batch-plan: --cap needs a value" >&2; return 2; }
              cap="$2"; shift 2 ;;
       --cap=*) cap="${1#--cap=}"; shift ;;
@@ -147,10 +160,16 @@ plan_from_json() {
   for s in ${inflight[@]+"${inflight[@]}"}; do
     joined+="${s}"$'\n'
   done
+  # The in-flight issue NUMBERS (--inflight-issue), newline-separated, for the explain view.
+  local joined_nums=""
+  for s in ${inflight_nums[@]+"${inflight_nums[@]}"}; do
+    joined_nums+="${s}"$'\n'
+  done
   command -v python3 >/dev/null 2>&1 || { echo "batch-plan: python3 required" >&2; return 1; }
   # The program is read from fd 3 (the heredoc), leaving python's stdin free to
   # carry the issue-node JSON piped in from fetch_issues / the tests.
-  _BATCH_INFLIGHT="$joined" _BATCH_CAP="$cap" _BATCH_REPO_ROOT="$repo_root" python3 /dev/fd/3 3<<'PYEOF'
+  _BATCH_INFLIGHT="$joined" _BATCH_INFLIGHT_NUMS="$joined_nums" _BATCH_EXPLAIN="$explain" \
+    _BATCH_CAP="$cap" _BATCH_REPO_ROOT="$repo_root" python3 /dev/fd/3 3<<'PYEOF'
 import json
 import os
 import sys
@@ -485,6 +504,139 @@ def print_undeclared_dependencies(issues, children, repo_root):
         )
 
 
+def _inflight_issue_nums():
+    """The in-flight issue NUMBERS passed via --inflight-issue (env-marshaled), as a set."""
+    nums = set()
+    for line in (os.environ.get("_BATCH_INFLIGHT_NUMS", "")).splitlines():
+        tok = line.strip()
+        if tok.isdigit():
+            nums.add(int(tok))
+    return nums
+
+
+def _explain_dispositions(issues, children, depth, is_ready):
+    """Classify every open issue by its scheduling disposition (issue #223).
+
+    Runs the SAME greedy disjoint-scope walk the packer uses, seeded with the in-flight
+    issue numbers (their scopes looked up from the backlog), so the surfaced dispositions
+    can never drift from what the scheduler actually does. Returns
+    (ranked, inflight_present, inflight_nums, collider_of, holds_back) where:
+      * ranked          — dispatchable issues (all blockers closed, incl. held) in priority order
+      * inflight_present— the in-flight issue numbers that are in the backlog, ascending
+      * collider_of[n]  — the already-chosen issue whose scope blocks n (in-flight or a
+                          higher-priority batched peer), when n is held back
+      * holds_back[m]   — the issues m blocks, in priority order (m names what it holds back)
+    """
+    inflight_nums = _inflight_issue_nums()
+    dispatchable = [n for n in issues if is_ready(issues[n])]
+    ranked = sorted(
+        dispatchable,
+        key=lambda n: (
+            0 if issues[n]["priority"] else 1,
+            -depth(n, set()),
+            -len(children.get(n, ())),
+            n,
+        ),
+    )
+    inflight_present = sorted(n for n in inflight_nums if n in issues)
+    chosen_order = list(inflight_present)
+    chosen_scope = {n: issues[n]["scope"] for n in inflight_present}
+    collider_of = {}
+    for n in ranked:
+        if n in inflight_nums or issues[n]["hold"]:
+            continue  # in-flight is already running; held is staged out — neither is packed
+        scope = issues[n]["scope"]
+        collider = next((m for m in chosen_order if conflict(chosen_scope[m], scope)), None)
+        if collider is not None:
+            collider_of[n] = collider
+        else:
+            chosen_order.append(n)
+            chosen_scope[n] = scope
+    holds_back = {}
+    for n, m in collider_of.items():  # collider_of was built in ranked (priority) order
+        holds_back.setdefault(m, []).append(n)
+    return ranked, inflight_present, inflight_nums, collider_of, holds_back
+
+
+def _explain_label(issues, ranked_set, inflight_nums, collider_of, n):
+    """The single afk:* label for issue n, or '-' when it carries none (#223).
+
+    The label collapses the disposition to the four-label set — deliberately WITHOUT the
+    cross-issue `#N` detail (that stays in the human view). A held or dep-blocked issue
+    carries no afk:* label so the GitHub issue list stays a clean live-scheduling glance.
+    """
+    if n in inflight_nums:
+        return "afk:in-flight"
+    if n not in ranked_set or issues[n]["hold"]:
+        return "-"  # dep-blocked (open native blocker) or held — not a scheduling candidate
+    if n in collider_of:
+        return "afk:blocked-by-scope"  # blocked reads first, even for an exclusive issue waiting
+    if issues[n]["scope"] is None:
+        return "afk:exclusive"
+    return "afk:queued"
+
+
+def _print_explain_view(issues, ranked, inflight_present, inflight_nums, collider_of, holds_back):
+    """Print the human `--explain` view: one `#N  <disposition>  <reason>` line per issue."""
+
+    def excl(n):
+        return "Scope: *" if not issues[n]["scope_undeclared"] else "no Scope: line"
+
+    def tokens(scope):
+        return "(" + " ".join(sorted(scope)) + ")"
+
+    def held_back_suffix(n):
+        blocked = holds_back.get(n, [])
+        return " — holds back " + ", ".join(f"#{k}" for k in blocked) if blocked else ""
+
+    def scope_detail(n):
+        scope = issues[n]["scope"]
+        return tokens(scope) if scope is not None else f"({excl(n)})"
+
+    def line(n):
+        scope = issues[n]["scope"]
+        if n in inflight_nums:
+            primary = "in-flight"
+            if scope is None:
+                detail = f"exclusive ({excl(n)})" + (held_back_suffix(n) or " — runs alone")
+            else:
+                detail = scope_detail(n) + held_back_suffix(n)
+        elif issues[n]["hold"]:
+            primary, detail = "held", "(hold label)"
+        elif n in collider_of:
+            # A held-back issue reads as blocked FIRST — even an exclusive one waiting behind
+            # another chosen spoke — so its reason is the collider, not a false "runs alone".
+            primary, detail = f"blocked-by-scope:#{collider_of[n]}", scope_detail(n)
+        elif scope is None:
+            primary = "exclusive"
+            detail = f"({excl(n)})" + (held_back_suffix(n) or " — runs alone")
+        else:
+            primary, detail = "queued", scope_detail(n)
+        return f"#{n:<5} {primary:<22} {detail}".rstrip()
+
+    for n in inflight_present:
+        print(line(n))
+    for n in ranked:
+        if n not in inflight_nums:
+            print(line(n))
+
+
+def render_explain(issues, children, depth, is_ready, mode):
+    """Render the disposition of every open issue (issue #223): the human `--explain` view
+    (mode 'view') or the machine-readable `<num>\\t<afk:label|->` TSV (mode 'labels')."""
+    ranked, inflight_present, inflight_nums, collider_of, holds_back = _explain_dispositions(
+        issues, children, depth, is_ready
+    )
+    if mode == "labels":
+        ranked_set = set(ranked)
+        for n in sorted(issues):
+            print(f"{n}\t{_explain_label(issues, ranked_set, inflight_nums, collider_of, n)}")
+    else:
+        _print_explain_view(
+            issues, ranked, inflight_present, inflight_nums, collider_of, holds_back
+        )
+
+
 def main():
     # Tolerate an empty / `null` / non-array payload (e.g. a graphql round-trip
     # that succeeded against a null `repository` — repo not found or a token-scope
@@ -550,6 +702,14 @@ def main():
         # Ready when every blocker is closed (no blocker still open).
         return all(state == "CLOSED" for _num, state in info["blockers"])
 
+    # `--explain` / `--explain-labels` (#223): a read-only disposition view over the SAME
+    # graph, rendered instead of the batch line + lints. Returns early so the normal path's
+    # output is untouched when neither flag is set.
+    explain = os.environ.get("_BATCH_EXPLAIN", "")
+    if explain:
+        render_explain(issues, children, depth, is_ready, explain)
+        return
+
     # A `hold`-labelled issue is staged, not dispatchable: excluded from every
     # batch until the label is removed. It stays open, so it still blocks its
     # dependents and still contributes to their critical-path depth.
@@ -603,15 +763,40 @@ main()
 PYEOF
 }
 
+# _batch_inflight_issue_nums — the issue number leading each task worktree's branch slug
+# (e.g. feature/223-slug → 223), one per line. Used to seed the --explain view with the
+# live in-flight set so it can attribute blocked-by-scope collisions to a running spoke.
+# The main checkout (branch `main`) and detached worktrees carry no leading digits and
+# are skipped. A best-effort standalone parse (no worktree-lib dependency).
+_batch_inflight_issue_nums() {
+  git worktree list --porcelain 2>/dev/null | awk '
+    /^branch /{ slug = $2; sub(/.*\//, "", slug); if (match(slug, /^[0-9]+/)) print substr(slug, RSTART, RLENGTH) }'
+}
+
 # main — fetch the open backlog and print the next concurrent batch. Pass through any
 # --inflight flags so the hub/skill can feed in the scopes of live spokes, and seed
 # --repo-root with the hub checkout so the undeclared-dependency lint can tell a
 # to-be-created scope path from an existing file. An explicit --repo-root in "$@"
 # (last-wins in the arg loop) still overrides this default.
+#
+# In an explain mode (#223) the in-flight issue NUMBERS are derived from the worktree
+# list and fed in as --inflight-issue flags, so `batch-plan --explain` reflects live work
+# standalone; the pure plan_from_json stays network-free for the tests.
 main() {
   local root
   root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-  fetch_issues | plan_from_json --repo-root "$root" "$@"
+  case " $* " in
+    *" --explain "* | *" --explain-labels "*)
+      local ifargs=() num
+      while IFS= read -r num; do
+        [ -n "$num" ] && ifargs+=("--inflight-issue" "$num")
+      done < <(_batch_inflight_issue_nums)
+      fetch_issues | plan_from_json --repo-root "$root" ${ifargs[@]+"${ifargs[@]}"} "$@"
+      ;;
+    *)
+      fetch_issues | plan_from_json --repo-root "$root" "$@"
+      ;;
+  esac
 }
 
 [[ "${BASH_SOURCE[0]}" == "${0}" ]] && main "$@"
