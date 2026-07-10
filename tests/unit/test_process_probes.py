@@ -114,12 +114,24 @@ def test_wt_pgrep_is_locale_independent() -> None:
     # A process with non-ASCII argv must be found even when the caller inherits a
     # non-C locale: the helper forces LC_ALL=C internally, so `pgrep -f` neither
     # dies nor false-negatives. Mirrors the ps-lstart locale test's approach.
+    #
+    # This asserts against a non-ASCII PATTERN, and BSD vs glibc `pgrep -f` diverge
+    # there under LC_ALL=C: BSD/macOS matches the high bytes, glibc/procps-ng does
+    # not (its C-locale regex won't match bytes >= 0x80), so the property is vacuous
+    # on glibc. Probe first with a raw `LC_ALL=C pgrep -f` and SKIP where the
+    # platform can't match it, rather than assert a hollow green — the same
+    # vacuous-skip shape as test_wt_pgrep_excludes_the_caller. Production callers
+    # only ever grep ASCII markers, so this cross-libc gap does not touch the
+    # helper's real contract; the death-under-non-C-locale case it guards reproduces
+    # on the dedicated macOS fr_FR.UTF-8 CI job, where this assertion runs for real.
     env = {"LC_ALL": "fr_FR.UTF-8", "LANG": "fr_FR.UTF-8"}
     result = _run(
         r"""
         ( exec -a "café-marker-$$" sleep 30 ) &
         bg=$!
         sleep 0.3
+        raw="$(LC_ALL=C pgrep -f "café-marker-$$" 2>/dev/null)"
+        if [ -z "$raw" ]; then kill "$bg" 2>/dev/null; echo "SKIP"; exit 0; fi
         pids="$(wt_pgrep -f "café-marker-$$")"; rc=$?
         kill "$bg" 2>/dev/null
         echo "RC=$rc"
@@ -128,6 +140,8 @@ def test_wt_pgrep_is_locale_independent() -> None:
         env=env,
     )
 
+    if "SKIP" in result.stdout.splitlines():
+        pytest.skip("pgrep -f cannot match non-ASCII argv under LC_ALL=C on this platform")
     assert "RC=0" in result.stdout.splitlines(), result.stderr
     assert "FOUND" in result.stdout, result.stdout
 
