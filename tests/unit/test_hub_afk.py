@@ -5525,6 +5525,62 @@ def test_afk_done_not_done_when_a_healthy_issue_survives_the_poison_filter(tmp_p
     assert "RC=1" in result.stdout, "a healthy issue among poisoned ones keeps the drain going"
 
 
+# ── #222: the backlog-drained stop is drain-mode-only ──────────────────────────
+# A non-expired clock-bound (numeric-epoch) window must keep ticking to its clock even when
+# the backlog is empty — only window_expired stops it. The empty-backlog completion path is
+# reserved for drain mode; without this gate a clock-bound window whose entire backlog is
+# empty / held / poisoned self-completes on tick one.
+
+
+def test_afk_done_not_done_for_unexpired_clock_bound_and_empty_backlog(tmp_path: Path) -> None:
+    # The repro from #222: a numeric state whose epoch is far in the future, an empty batch,
+    # nothing in flight ⇒ NOT done (rc 1). The window keeps ticking until window_expired.
+    bp = _planner_stub(tmp_path, exit_code=0, out="")
+    expr = 'inflight_issues() { :; }; afk_done 9999999999 1700000000; echo "RC=$?"'
+
+    result = _call(expr, env={"BATCH_PLAN": str(bp)})
+
+    assert "RC=1" in result.stdout, (
+        "a non-expired clock-bound window must keep ticking on an empty backlog: "
+        + result.stdout
+        + result.stderr
+    )
+
+
+def test_afk_done_not_done_for_unexpired_clock_bound_and_all_held_backlog(tmp_path: Path) -> None:
+    # The #202-F case made strictly worse: a batch of only poisoned issues counts as empty,
+    # so a clock-bound window with everything held would otherwise exit at once. Gated on
+    # drain, it stays not-done (rc 1).
+    bp = _planner_stub(tmp_path, exit_code=0, out="5\n")
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "dispatch-fail-5.count").write_text("3\n")  # hit AFK_DISPATCH_MAX_FAILURES
+    expr = 'inflight_issues() { :; }; afk_done 9999999999 1700000000; echo "RC=$?"'
+
+    result = _call(expr, env={"BATCH_PLAN": str(bp), "AFK_STATE_DIR": str(statedir)})
+
+    assert "RC=1" in result.stdout, (
+        "a non-expired clock-bound window with an all-held backlog must keep ticking: "
+        + result.stdout
+        + result.stderr
+    )
+
+
+def test_afk_done_done_for_expired_clock_bound_regardless_of_backlog(tmp_path: Path) -> None:
+    # window_expired stays the sole completion path for a clock-bound window: an EXPIRED
+    # numeric state returns done (rc 0) even with a healthy, non-empty backlog in flight.
+    bp = _planner_stub(tmp_path, exit_code=0, out="5\n")
+    expr = 'inflight_issues() { printf "%s\\n" 5; }; afk_done 1700000000 1700000001; echo "RC=$?"'
+
+    result = _call(expr, env={"BATCH_PLAN": str(bp)})
+
+    assert "RC=0" in result.stdout, (
+        "an expired clock-bound window stops regardless of the backlog: "
+        + result.stdout
+        + result.stderr
+    )
+
+
 # ── ST2: heartbeat-age hang detection + answer_pass heartbeat wrap ─────────────
 
 
