@@ -89,6 +89,30 @@ wt_now_ms() {
   command -v _telemetry_now_ms >/dev/null 2>&1 && _telemetry_now_ms || true
 }
 
+# --- client-side telemetry config resolution (issue #228) -----------------------
+# wt_resolve_telemetry_config [config-path] -> read the NON-SECRET client-side
+# telemetry settings from settings/ai-toolkit.yml (via ai_toolkit_config.py's
+# telemetry-env seam) and set the *_DEFAULT shell vars the consumers layer behind a
+# live env override (env -> config -> hardcoded default). Only keys the operator set
+# are emitted, so an un-migrated (telemetry-less) config leaves every default unset
+# and the consumer keeps its own literal. Best-effort and never fatal: a missing
+# python or config file is a silent no-op. The path defaults to the ai-toolkit
+# checkout's settings/ai-toolkit.yml (this lib's ../settings sibling); AI_TOOLKIT_CONFIG
+# overrides it, matching sync-to-repo.sh / worktree-new.sh. A synced target carries
+# no such file, so it no-ops there and telemetry stays env-or-default driven. The
+# SECRET (LANGFUSE_BASIC_AUTH) is never in the config — it stays in ~/.afk-telemetry,
+# resolved by wt_resolve_langfuse_auth below.
+wt_resolve_telemetry_config() {
+  local cfg="${1:-${AI_TOOLKIT_CONFIG:-$_WT_LIB_DIR/../settings/ai-toolkit.yml}}"
+  local pyc="$_WT_LIB_DIR/ai_toolkit_config.py"
+  [ -f "$pyc" ] && [ -f "$cfg" ] || return 0
+  # eval sets AI_TOOLKIT_OTEL_DEFAULT / LANGFUSE_HOST_DEFAULT /
+  # AI_TOOLKIT_OTEL_SPAN_ENDPOINT_DEFAULT / LANGFUSE_PROJECT_DEFAULT /
+  # LANGFUSE_PUBLIC_KEY_DEFAULT for the keys the config set; a parse failure or an
+  # empty section yields no assignment, so this never clobbers a live value.
+  eval "$(python3 "$pyc" telemetry-env "$cfg" 2>/dev/null || true)"
+}
+
 # --- hub-side Langfuse auth resolution (issue #127) -----------------------------
 # wt_resolve_langfuse_auth -> resolve LANGFUSE_BASIC_AUTH the way hub-afk.sh's
 # afk_resolve_telemetry_auth does — env first, then the SAME optional conf file
@@ -105,19 +129,39 @@ wt_now_ms() {
 # AI_TOOLKIT_OTEL=1); deduplicating the two is a follow-up once both land.
 wt_resolve_langfuse_auth() {
   local conf="${AFK_TELEMETRY_CONF:-$HOME/.afk-telemetry}"
+  # Client-side telemetry defaults (host/project/public_key/endpoint) from
+  # settings/ai-toolkit.yml (issue #228); sets the *_DEFAULT vars used as the final
+  # fallback below. The SECRET auth still comes from env / the conf file, never here.
+  wt_resolve_telemetry_config
   if [ -f "$conf" ]; then
     local s_auth="${LANGFUSE_BASIC_AUTH:-}" s_host="${LANGFUSE_HOST:-}" \
-          s_ep="${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:-}"
+          s_ep="${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:-}" \
+          s_proj="${LANGFUSE_PROJECT:-}" s_pk="${LANGFUSE_PUBLIC_KEY:-}"
     # shellcheck disable=SC1090
     . "$conf" 2>/dev/null || true
     [ -n "$s_auth" ] && LANGFUSE_BASIC_AUTH="$s_auth"
     [ -n "$s_host" ] && LANGFUSE_HOST="$s_host"
     [ -n "$s_ep" ] && AI_TOOLKIT_OTEL_SPAN_ENDPOINT="$s_ep"
+    # Project + public key are env-wins per field too (issue #228), so restore an
+    # env value the conf may have overwritten before the config default applies below.
+    [ -n "$s_proj" ] && LANGFUSE_PROJECT="$s_proj"
+    [ -n "$s_pk" ] && LANGFUSE_PUBLIC_KEY="$s_pk"
   fi
   [ -n "${LANGFUSE_BASIC_AUTH:-}" ] || return 1
   export LANGFUSE_BASIC_AUTH
-  export LANGFUSE_HOST="${LANGFUSE_HOST:-http://localhost:3000}"
-  export AI_TOOLKIT_OTEL_SPAN_ENDPOINT="${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:-http://localhost:4318}"
+  # env -> ~/.afk-telemetry conf (set above) -> config default -> hardcoded literal.
+  export LANGFUSE_HOST="${LANGFUSE_HOST:-${LANGFUSE_HOST_DEFAULT:-http://localhost:3000}}"
+  export AI_TOOLKIT_OTEL_SPAN_ENDPOINT="${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:-${AI_TOOLKIT_OTEL_SPAN_ENDPOINT_DEFAULT:-http://localhost:4318}}"
+  # Project + public key are both PUBLIC; export the config default only when set,
+  # and a live env value still wins. Guarded (not `&& export`) so an unset default
+  # can't make the whole function return non-zero on an otherwise-successful resolve.
+  if [ -n "${LANGFUSE_PROJECT_DEFAULT:-}" ]; then
+    export LANGFUSE_PROJECT="${LANGFUSE_PROJECT:-$LANGFUSE_PROJECT_DEFAULT}"
+  fi
+  if [ -n "${LANGFUSE_PUBLIC_KEY_DEFAULT:-}" ]; then
+    export LANGFUSE_PUBLIC_KEY="${LANGFUSE_PUBLIC_KEY:-$LANGFUSE_PUBLIC_KEY_DEFAULT}"
+  fi
+  return 0
 }
 
 # --- SSH-keepalive push (issue #119) --------------------------------------------
@@ -524,7 +568,10 @@ wt_bridge_launch() {
   log="$(mktemp -t lf-bridge.XXXXXX 2>/dev/null)" || log="/tmp/lf-bridge.log"
   (
     export PYTHONPATH="$repo_root/scripts"
-    export LANGFUSE_HOST="${LANGFUSE_HOST:-http://localhost:3000}"
+    # env -> config default (LANGFUSE_HOST_DEFAULT, set by wt_resolve_telemetry_config
+    # in the launching shell) -> hardcoded local Langfuse (issue #228). So the live
+    # bridge forwards to the SAME Langfuse the config names, not a hardcoded localhost.
+    export LANGFUSE_HOST="${LANGFUSE_HOST:-${LANGFUSE_HOST_DEFAULT:-http://localhost:3000}}"
     export LANGFUSE_BASIC_AUTH BRIDGE_PORT
     nohup python3 "$repo_root/scripts/telemetry/langfuse_message_bridge.py" \
       >"$log" 2>&1 &

@@ -15,6 +15,8 @@ model.
 
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -28,6 +30,12 @@ from metadata_parser import parse  # noqa: E402
 
 REAL_CONFIG = REPO_ROOT / "settings" / "ai-toolkit.yml"
 AGENTS_METADATA = REPO_ROOT / "shared" / "agents" / "metadata.yml"
+SECRETS_SCAN = REPO_ROOT / "shared" / "hooks" / "secrets-scan.sh"
+
+# A synthetic AWS-key-shaped value: matches secrets-scan's AKIA[0-9A-Z]{16} pattern
+# but is not a real credential. Built by concatenation so this test file itself
+# carries no contiguous secret literal (which the pre-write scanner would block).
+FAKE_SECRET = "AKIA" + "1234567890ABCDEF"
 
 FABLE = "claude-fable-5"
 OPUS = "claude-opus-4-8"
@@ -503,3 +511,201 @@ def test_agent_model_overrides_empty_without_subagents(tmp_path: Path) -> None:
 
 def test_real_config_overrides_cover_the_roster(real_config: dict) -> None:
     assert set(cfg.agent_model_overrides(real_config)) == set(parse(str(AGENTS_METADATA)))
+
+
+# ─── telemetry: client-side Langfuse settings (issue #228) ───
+
+# The full seed block, reused by the CLI + real-config tests. Only client-side,
+# non-secret settings — the Langfuse SECRET stays in ~/.afk-telemetry, never here.
+_TELEMETRY_SEED = (
+    "telemetry:\n"
+    "  enabled: true\n"
+    "  langfuse:\n"
+    "    host: http://localhost:3000\n"
+    "    project: proj-quicktest\n"
+    "    public_key: pk-lf-quicktest\n"
+    "    otlp_endpoint: http://localhost:4318\n"
+)
+
+
+def test_telemetry_enabled_true(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, "telemetry:\n  enabled: true\n").as_posix())
+
+    assert cfg.telemetry_enabled(config) is True
+
+
+def test_telemetry_enabled_false(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, "telemetry:\n  enabled: false\n").as_posix())
+
+    assert cfg.telemetry_enabled(config) is False
+
+
+def test_telemetry_enabled_none_when_section_absent(tmp_path: Path) -> None:
+    # Absent ⇒ None so the consumer keeps its own default (backward-compat: on),
+    # NOT a forced value — the accessor never fabricates a toggle it wasn't given.
+    config = cfg.load_config(_write(tmp_path, "base_branch: main\n").as_posix())
+
+    assert cfg.telemetry_enabled(config) is None
+
+
+def test_telemetry_enabled_none_when_blank(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, "telemetry:\n  enabled:\n").as_posix())
+
+    assert cfg.telemetry_enabled(config) is None
+
+
+def test_telemetry_enabled_off_token_disables(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, "telemetry:\n  enabled: off\n").as_posix())
+
+    assert cfg.telemetry_enabled(config) is False
+
+
+def test_langfuse_host_returns_value(tmp_path: Path) -> None:
+    config = cfg.load_config(
+        _write(tmp_path, "telemetry:\n  langfuse:\n    host: http://lf.example:3000\n").as_posix()
+    )
+
+    assert cfg.langfuse_host(config) == "http://lf.example:3000"
+
+
+def test_langfuse_project_returns_value(tmp_path: Path) -> None:
+    config = cfg.load_config(
+        _write(tmp_path, "telemetry:\n  langfuse:\n    project: proj-abc\n").as_posix()
+    )
+
+    assert cfg.langfuse_project(config) == "proj-abc"
+
+
+def test_langfuse_public_key_returns_value(tmp_path: Path) -> None:
+    config = cfg.load_config(
+        _write(tmp_path, "telemetry:\n  langfuse:\n    public_key: pk-lf-abc\n").as_posix()
+    )
+
+    assert cfg.langfuse_public_key(config) == "pk-lf-abc"
+
+
+def test_langfuse_otlp_endpoint_returns_value(tmp_path: Path) -> None:
+    config = cfg.load_config(
+        _write(
+            tmp_path, "telemetry:\n  langfuse:\n    otlp_endpoint: http://lf.example:4318\n"
+        ).as_posix()
+    )
+
+    assert cfg.langfuse_otlp_endpoint(config) == "http://lf.example:4318"
+
+
+def test_langfuse_accessors_none_when_section_absent(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, "telemetry:\n  enabled: true\n").as_posix())
+
+    assert cfg.langfuse_host(config) is None
+    assert cfg.langfuse_project(config) is None
+    assert cfg.langfuse_public_key(config) is None
+    assert cfg.langfuse_otlp_endpoint(config) is None
+
+
+def test_langfuse_host_none_when_blank(tmp_path: Path) -> None:
+    config = cfg.load_config(_write(tmp_path, "telemetry:\n  langfuse:\n    host:\n").as_posix())
+
+    assert cfg.langfuse_host(config) is None
+
+
+# ─── telemetry-env CLI seam (mirrors batch-env) ───
+
+
+def test_telemetry_env_cli_emits_set_values(tmp_path: Path) -> None:
+    path = _write(tmp_path, _TELEMETRY_SEED)
+
+    out = cfg._cli(["ai_toolkit_config.py", "telemetry-env", str(path)])
+
+    assert "AI_TOOLKIT_OTEL_DEFAULT=1" in out
+    assert "LANGFUSE_HOST_DEFAULT=http://localhost:3000" in out
+    assert "AI_TOOLKIT_OTEL_SPAN_ENDPOINT_DEFAULT=http://localhost:4318" in out
+    assert "LANGFUSE_PROJECT_DEFAULT=proj-quicktest" in out
+    assert "LANGFUSE_PUBLIC_KEY_DEFAULT=pk-lf-quicktest" in out
+
+
+def test_telemetry_env_cli_enabled_false_emits_zero(tmp_path: Path) -> None:
+    path = _write(tmp_path, "telemetry:\n  enabled: false\n")
+
+    out = cfg._cli(["ai_toolkit_config.py", "telemetry-env", str(path)])
+
+    assert "AI_TOOLKIT_OTEL_DEFAULT=0" in out
+
+
+def test_telemetry_env_cli_empty_when_unset(tmp_path: Path) -> None:
+    # No telemetry section ⇒ no exports, so the bash consumer keeps its own default.
+    path = _write(tmp_path, "base_branch: main\n")
+
+    assert cfg._cli(["ai_toolkit_config.py", "telemetry-env", str(path)]) == ""
+
+
+# ─── real config: telemetry seed ───
+
+
+def test_real_config_telemetry_enabled(real_config: dict) -> None:
+    # The hub captures telemetry, so the seed ships enabled. (Downstream opt-in-off
+    # is an explicit `telemetry.enabled: false`, documented — not this repo's seed.)
+    assert cfg.telemetry_enabled(real_config) is True
+
+
+def test_real_config_langfuse_seed(real_config: dict) -> None:
+    assert cfg.langfuse_host(real_config) == "http://localhost:3000"
+    assert cfg.langfuse_project(real_config) == "proj-quicktest"
+    assert cfg.langfuse_public_key(real_config) == "pk-lf-quicktest"
+    assert cfg.langfuse_otlp_endpoint(real_config) == "http://localhost:4318"
+
+
+# ─── secret boundary: secrets-scan blocks a secret in ai-toolkit.yml (issue #228) ───
+
+# ai-toolkit.yml is committed AND synced into downstream projects, so the Langfuse
+# SECRET must never live there — only the public host/project/public_key/endpoint.
+# These pin the boundary as an enforced invariant, not just a documented one: the
+# pre-write secrets-scan hook DENIES (exit 2) a secret-shaped value written to
+# ai-toolkit.yml, while the declared-public key value is allowed through.
+
+
+def _scan_write(content: str) -> subprocess.CompletedProcess[str]:
+    """Run the pre-write secrets-scan hook on a Write to settings/ai-toolkit.yml."""
+    payload = json.dumps(
+        {
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": str(REPO_ROOT / "settings" / "ai-toolkit.yml"),
+                "content": content,
+            },
+        }
+    )
+    return subprocess.run(
+        ["bash", str(SECRETS_SCAN)], input=payload, capture_output=True, text=True
+    )
+
+
+def test_secrets_scan_blocks_secret_in_ai_toolkit_yml() -> None:
+    # A secret-key-shaped value under telemetry.langfuse in ai-toolkit.yml must be
+    # DENIED before the write lands (exit 2), enforcing the "secrets never in the
+    # committed config" boundary rather than merely documenting it.
+    content = f"telemetry:\n  langfuse:\n    secret_key: {FAKE_SECRET}\n"
+
+    result = _scan_write(content)
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "Secret detected" in result.stderr
+
+
+def test_secrets_scan_allows_public_key_in_ai_toolkit_yml() -> None:
+    # The declared-PUBLIC settings (host / project / public_key) are safe to commit,
+    # so the seed's own shape must pass — the boundary blocks secrets, not the public
+    # surface it is meant to carry.
+    content = (
+        "telemetry:\n"
+        "  enabled: true\n"
+        "  langfuse:\n"
+        "    host: http://localhost:3000\n"
+        "    project: proj-quicktest\n"
+        "    public_key: pk-lf-quicktest\n"
+        "    otlp_endpoint: http://localhost:4318\n"
+    )
+
+    result = _scan_write(content)
+
+    assert result.returncode == 0, result.stdout + result.stderr

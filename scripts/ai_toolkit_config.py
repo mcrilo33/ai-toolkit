@@ -230,6 +230,74 @@ def base_branch(config: dict) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+# --- telemetry: client-side Langfuse settings (issue #228) --------------------
+# The config carries only the NON-SECRET, client-facing "where/whether to send"
+# telemetry settings; the Langfuse secret (LANGFUSE_BASIC_AUTH / secret key) stays
+# in ~/.afk-telemetry, resolved by worktree-lib.sh's wt_resolve_langfuse_auth.
+# Consumers layer these as env -> config -> hardcoded default, so an env override
+# still wins and an un-migrated (telemetry-less) config keeps today's behavior.
+
+
+def _telemetry_section(config: dict) -> dict:
+    section = config.get("telemetry")
+    return section if isinstance(section, dict) else {}
+
+
+def _langfuse_section(config: dict) -> dict:
+    langfuse = _telemetry_section(config).get("langfuse")
+    return langfuse if isinstance(langfuse, dict) else {}
+
+
+def _langfuse_str(config: dict, key: str) -> str | None:
+    """A ``telemetry.langfuse.<key>`` string, stripped, or None when absent/blank."""
+    value = _langfuse_section(config).get(key)
+    if isinstance(value, str):
+        return value.strip() or None
+    return None
+
+
+def telemetry_enabled(config: dict) -> bool | None:
+    """Whether native OTel telemetry is on, or None when unset (issue #228).
+
+    Returns None when the ``telemetry`` section (or its ``enabled`` key) is absent
+    or blank, so the consumer keeps its own default rather than the accessor
+    fabricating a toggle it was never given. Accepts a YAML bool or a string; only
+    an explicit false-y token (false/0/off/no/disabled, case-insensitive) disables.
+    """
+    value = _telemetry_section(config).get("enabled")
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    return text.lower() not in {"false", "0", "off", "no", "disabled"}
+
+
+def langfuse_host(config: dict) -> str | None:
+    """The Langfuse base URL (``telemetry.langfuse.host``), or None when unset."""
+    return _langfuse_str(config, "host")
+
+
+def langfuse_project(config: dict) -> str | None:
+    """The Langfuse project (``telemetry.langfuse.project``), or None when unset."""
+    return _langfuse_str(config, "project")
+
+
+def langfuse_public_key(config: dict) -> str | None:
+    """The Langfuse public key (``telemetry.langfuse.public_key``), or None.
+
+    Public by design (safe to commit) — the SECRET key never enters the config.
+    """
+    return _langfuse_str(config, "public_key")
+
+
+def langfuse_otlp_endpoint(config: dict) -> str | None:
+    """The OTLP-HTTP endpoint (``telemetry.langfuse.otlp_endpoint``), or None."""
+    return _langfuse_str(config, "otlp_endpoint")
+
+
 def enabled(config: dict) -> bool:
     """Whether toolkit enforcement is on by default (issue #154).
 
@@ -276,18 +344,42 @@ def _cli(argv: list[str]) -> str:
         if stagger is not None:
             lines.append(f"AI_TOOLKIT_BATCH_STAGGER={shlex.quote(str(stagger))}")
         return "\n".join(lines)
+    if command == "telemetry-env":
+        # Emit ONLY the keys the operator explicitly set (issue #228); a blank/absent
+        # entry yields no line, so the bash consumer keeps its own env-or-hardcoded
+        # default (env -> config -> default). Var names carry a _DEFAULT suffix so the
+        # consumer layers them behind a live env override. Values are non-secret URLs/
+        # ids, but shell-quote anyway — the consumer evals this output.
+        lines = []
+        enabled_flag = telemetry_enabled(config)
+        if enabled_flag is not None:
+            lines.append(f"AI_TOOLKIT_OTEL_DEFAULT={shlex.quote('1' if enabled_flag else '0')}")
+        host = langfuse_host(config)
+        if host is not None:
+            lines.append(f"LANGFUSE_HOST_DEFAULT={shlex.quote(host)}")
+        endpoint = langfuse_otlp_endpoint(config)
+        if endpoint is not None:
+            lines.append(f"AI_TOOLKIT_OTEL_SPAN_ENDPOINT_DEFAULT={shlex.quote(endpoint)}")
+        project = langfuse_project(config)
+        if project is not None:
+            lines.append(f"LANGFUSE_PROJECT_DEFAULT={shlex.quote(project)}")
+        public_key = langfuse_public_key(config)
+        if public_key is not None:
+            lines.append(f"LANGFUSE_PUBLIC_KEY_DEFAULT={shlex.quote(public_key)}")
+        return "\n".join(lines)
     raise SystemExit(
-        f"ai_toolkit_config: unknown command {command!r} (base-branch|enabled|spoke-env|batch-env)"
+        "ai_toolkit_config: unknown command "
+        f"{command!r} (base-branch|enabled|spoke-env|batch-env|telemetry-env)"
     )
 
 
 def main() -> None:
-    """CLI: ``ai_toolkit_config.py <base-branch|enabled|spoke-env|batch-env> [config-path]``.
+    """CLI: ``ai_toolkit_config.py <base-branch|enabled|spoke-env|batch-env|telemetry-env> [config-path]``.
 
     A thin bash-facing seam so sync-to-repo.sh can set ``ai-toolkit.base-branch``
-    and ``ai-toolkit.enabled``, emit the spoke-default env file, and the hub
-    dispatch path can read the batch concurrency cap / stagger, without a YAML
-    parser of their own.
+    and ``ai-toolkit.enabled``, emit the spoke-default env file, the hub dispatch
+    path can read the batch concurrency cap / stagger, and the telemetry consumers
+    can read the client-side Langfuse defaults — without a YAML parser of their own.
     """
     print(_cli(sys.argv))
 

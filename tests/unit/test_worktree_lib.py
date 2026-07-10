@@ -190,6 +190,44 @@ def test_bridge_launch_forwards_required_env_to_child(tmp_path: Path) -> None:
     assert "BRIDGE_PORT=4321" in recorded
 
 
+def _bridge_launch_host(tmp_path: Path, expr: str) -> str:
+    """Launch wt_bridge_launch under a python3 stub that records LANGFUSE_HOST."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    dump = tmp_path / "child-host.txt"
+    stub = bindir / "python3"
+    stub.write_text('#!/bin/sh\necho "LANGFUSE_HOST=$LANGFUSE_HOST" > "$STUB_ENV_DUMP"\n')
+    stub.chmod(0o755)
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "STUB_ENV_DUMP": str(dump)}
+    subprocess.run(["bash", "-c", f'source "{WT_LIB}"; {expr}'], env=env, check=True)
+    deadline = time.monotonic() + 5.0
+    while not dump.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert dump.exists(), "bridge child never launched / wrote its host"
+    return dump.read_text()
+
+
+def test_bridge_launch_forwards_config_host_default(tmp_path: Path) -> None:
+    # env LANGFUSE_HOST unset but the config default is set (as wt_resolve_telemetry_config
+    # would) ⇒ the live bridge forwards to the config's Langfuse, not hardcoded localhost.
+    expr = (
+        "unset LANGFUSE_HOST; LANGFUSE_HOST_DEFAULT=http://cfg.example:3000; "
+        "LANGFUSE_BASIC_AUTH=tok; BRIDGE_PORT=4321; wt_bridge_launch /repo"
+    )
+
+    assert "LANGFUSE_HOST=http://cfg.example:3000" in _bridge_launch_host(tmp_path, expr)
+
+
+def test_bridge_launch_env_host_wins_over_config_default(tmp_path: Path) -> None:
+    # A live env LANGFUSE_HOST still outranks the config default.
+    expr = (
+        "LANGFUSE_HOST=http://env.example:9999; LANGFUSE_HOST_DEFAULT=http://cfg.example:3000; "
+        "LANGFUSE_BASIC_AUTH=tok; BRIDGE_PORT=4321; wt_bridge_launch /repo"
+    )
+
+    assert "LANGFUSE_HOST=http://env.example:9999" in _bridge_launch_host(tmp_path, expr)
+
+
 # --- wt_bridge_source_mtime portable stat (issue #132) -------------------------
 # The helper reads real file mtimes behind a stat fallback. The GNU-first order
 # (`stat -c %Y || stat -f %m`) is load-bearing: BSD-first breaks on GNU stat,
@@ -1225,6 +1263,157 @@ def test_resolve_langfuse_auth_conf_may_supply_span_endpoint(tmp_path: Path) -> 
 
     assert "RC=0" in result.stdout, result.stderr + result.stdout
     assert "C_EP=http://conf.example:4318" in result.stdout, "conf endpoint is honored"
+
+
+# --- telemetry config resolution (issue #228) ---------------------------------
+# wt_resolve_telemetry_config reads the client-side telemetry defaults from
+# settings/ai-toolkit.yml (via ai_toolkit_config.py's telemetry-env seam) and sets
+# the *_DEFAULT vars the consumers layer behind a live env override
+# (env -> config -> hardcoded default). wt_resolve_langfuse_auth then uses the
+# config host/project/public_key as its default where it used to hardcode them.
+
+_TELEMETRY_CFG = (
+    "telemetry:\n"
+    "  enabled: true\n"
+    "  langfuse:\n"
+    "    host: http://cfg.example:3000\n"
+    "    project: proj-cfg\n"
+    "    public_key: pk-lf-cfg\n"
+    "    otlp_endpoint: http://cfg.example:4318\n"
+)
+
+_TELEMETRY_DEFAULT_VARS = (
+    "AI_TOOLKIT_OTEL_DEFAULT LANGFUSE_HOST_DEFAULT "
+    "AI_TOOLKIT_OTEL_SPAN_ENDPOINT_DEFAULT LANGFUSE_PROJECT_DEFAULT LANGFUSE_PUBLIC_KEY_DEFAULT"
+)
+
+
+def _resolve_telemetry(
+    tmp_path: Path, cfg_text: str | None, *, arg: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run wt_resolve_telemetry_config and echo the *_DEFAULT vars it set.
+
+    A `cfg_text` writes a tmp config passed as the resolver's argument; `arg`
+    overrides the path literally (e.g. a nonexistent path). The *_DEFAULT vars
+    are cleared first so only what the resolver sets is visible.
+    """
+    if arg is None:
+        cfg = tmp_path / "ai-toolkit.yml"
+        cfg.write_text(cfg_text or "")
+        arg = str(cfg)
+    parts = [
+        f"unset {_TELEMETRY_DEFAULT_VARS}",
+        f'wt_resolve_telemetry_config "{arg}"; echo "RC=$?"',
+        'echo "D_OTEL=${AI_TOOLKIT_OTEL_DEFAULT:-UNSET} D_HOST=${LANGFUSE_HOST_DEFAULT:-UNSET}'
+        " D_EP=${AI_TOOLKIT_OTEL_SPAN_ENDPOINT_DEFAULT:-UNSET}"
+        ' D_PROJ=${LANGFUSE_PROJECT_DEFAULT:-UNSET} D_PK=${LANGFUSE_PUBLIC_KEY_DEFAULT:-UNSET}"',
+    ]
+    return _call("; ".join(parts))
+
+
+def test_resolve_telemetry_config_sets_defaults_from_config(tmp_path: Path) -> None:
+    result = _resolve_telemetry(tmp_path, _TELEMETRY_CFG)
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    assert "D_OTEL=1" in result.stdout
+    assert "D_HOST=http://cfg.example:3000" in result.stdout
+    assert "D_EP=http://cfg.example:4318" in result.stdout
+    assert "D_PROJ=proj-cfg" in result.stdout
+    assert "D_PK=pk-lf-cfg" in result.stdout
+
+
+def test_resolve_telemetry_config_enabled_false_sets_zero(tmp_path: Path) -> None:
+    result = _resolve_telemetry(tmp_path, "telemetry:\n  enabled: false\n")
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    assert "D_OTEL=0" in result.stdout
+
+
+def test_resolve_telemetry_config_noop_when_section_absent(tmp_path: Path) -> None:
+    # No telemetry section ⇒ no *_DEFAULT vars set, so the consumer keeps its own
+    # hardcoded default (backward-compat) rather than a fabricated value.
+    result = _resolve_telemetry(tmp_path, "base_branch: main\n")
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    assert "D_OTEL=UNSET" in result.stdout
+    assert "D_HOST=UNSET" in result.stdout
+
+
+def test_resolve_telemetry_config_noop_when_config_missing(tmp_path: Path) -> None:
+    # A nonexistent config path is a best-effort no-op (rc 0), never a failure.
+    result = _resolve_telemetry(tmp_path, None, arg=str(tmp_path / "nope.yml"))
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    assert "D_OTEL=UNSET" in result.stdout
+
+
+def _resolve_auth_cfg(
+    tmp_path: Path, *, cfg_text: str, pre: str = ""
+) -> subprocess.CompletedProcess[str]:
+    """Run wt_resolve_langfuse_auth with AI_TOOLKIT_CONFIG pinned to a tmp config.
+
+    The conf file (~/.afk-telemetry) is pinned absent and the LANGFUSE_* env is
+    cleared, so only the config supplies host/project/public_key defaults; `pre`
+    re-exports any field a test wants preset (to prove env still wins).
+    """
+    conf_path = tmp_path / "afk-telemetry-absent"
+    cfg = tmp_path / "ai-toolkit.yml"
+    cfg.write_text(cfg_text)
+    parts = [
+        f'export AFK_TELEMETRY_CONF="{conf_path}"',
+        f'export AI_TOOLKIT_CONFIG="{cfg}"',
+        "unset LANGFUSE_BASIC_AUTH LANGFUSE_HOST AI_TOOLKIT_OTEL_SPAN_ENDPOINT "
+        "LANGFUSE_PROJECT LANGFUSE_PUBLIC_KEY",
+        "export LANGFUSE_BASIC_AUTH=Basic-env",
+        pre,
+        'wt_resolve_langfuse_auth; echo "RC=$?"',
+        "bash -c 'echo \"C_HOST=$LANGFUSE_HOST C_PROJ=$LANGFUSE_PROJECT"
+        " C_PK=$LANGFUSE_PUBLIC_KEY\"'",
+    ]
+    return _call("; ".join(p for p in parts if p))
+
+
+def test_resolve_langfuse_auth_config_host_default(tmp_path: Path) -> None:
+    # env + conf silent on host ⇒ the config supplies the host default (replacing
+    # the old hardcoded localhost:3000), and exports project + public key too.
+    result = _resolve_auth_cfg(tmp_path, cfg_text=_TELEMETRY_CFG)
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    assert "C_HOST=http://cfg.example:3000" in result.stdout
+    assert "C_PROJ=proj-cfg" in result.stdout
+    assert "C_PK=pk-lf-cfg" in result.stdout
+
+
+def test_resolve_langfuse_auth_env_host_wins_over_config(tmp_path: Path) -> None:
+    # A live env LANGFUSE_HOST still outranks the config default (env override).
+    result = _resolve_auth_cfg(
+        tmp_path, cfg_text=_TELEMETRY_CFG, pre="export LANGFUSE_HOST=http://env.example:9999"
+    )
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    assert "C_HOST=http://env.example:9999" in result.stdout
+
+
+def test_resolve_langfuse_auth_env_project_wins_over_conf(tmp_path: Path) -> None:
+    # env-wins per field must hold for LANGFUSE_PROJECT too: a ~/.afk-telemetry conf
+    # that sets it must NOT clobber a live env value (the save/restore covers it).
+    conf = tmp_path / "afk-telemetry"
+    conf.write_text('LANGFUSE_PROJECT="proj-from-conf"\n')
+    cfg = tmp_path / "ai-toolkit.yml"
+    cfg.write_text(_TELEMETRY_CFG)
+    parts = [
+        f'export AFK_TELEMETRY_CONF="{conf}"',
+        f'export AI_TOOLKIT_CONFIG="{cfg}"',
+        "unset LANGFUSE_HOST AI_TOOLKIT_OTEL_SPAN_ENDPOINT LANGFUSE_PUBLIC_KEY",
+        "export LANGFUSE_BASIC_AUTH=Basic-env",
+        "export LANGFUSE_PROJECT=proj-from-env",
+        'wt_resolve_langfuse_auth; echo "RC=$?"',
+        "bash -c 'echo \"C_PROJ=$LANGFUSE_PROJECT\"'",
+    ]
+    result = _call("; ".join(parts))
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    assert "C_PROJ=proj-from-env" in result.stdout
 
 
 # --- review workspace file management (issue #134) ----------------------------

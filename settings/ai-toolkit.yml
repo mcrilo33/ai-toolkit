@@ -34,6 +34,38 @@ base_branch:
 # by the sync parser and would be read as part of the value.
 enabled: true
 
+# Client-side telemetry / Langfuse target (issue #228). The SINGLE view of "is
+# telemetry on, and where does it go" — previously scattered across the
+# AI_TOOLKIT_OTEL env toggle, a hardcoded LANGFUSE_HOST default, the
+# AI_TOOLKIT_OTEL_SPAN_ENDPOINT var, and the collector config. Consumers read
+# these as env -> config -> hardcoded default: a live env var (AI_TOOLKIT_OTEL,
+# LANGFUSE_HOST, ...) still WINS, so existing env-driven setups keep working;
+# this file supplies the default where the operator set nothing.
+#
+# SECRET BOUNDARY (hard): this file is committed and synced into downstream
+# projects, so the Langfuse SECRET key / LANGFUSE_BASIC_AUTH MUST NEVER live here
+# (secrets-scan + the security rule would block it, and it would leak downstream).
+# The secret stays in ~/.afk-telemetry (gitignored, per-machine), read by
+# wt_resolve_langfuse_auth. Only the PUBLIC settings below belong here.
+#
+# `enabled` replaces the AI_TOOLKIT_OTEL toggle. This repo (the hub) captures
+# telemetry, so it ships `true`. A fresh DOWNSTREAM project should ship
+# `enabled: false` (opt-in-off) and point host/otlp_endpoint at its OWN Langfuse
+# rather than inheriting localhost. Absent/blank ⇒ the consumer keeps its own
+# default (today: on) — set `false` explicitly to opt a downstream out.
+# The collector's own pipeline config (dashboard/langfuse/otelcol.yaml) is
+# separate infra and is NOT generated from this section.
+telemetry:
+  enabled: true
+  langfuse:
+    host: http://localhost:3000
+    project: proj-quicktest
+    # public_key is public (safe to commit); the SECRET key is never stored here.
+    # Keep each value on its own line — an inline `# comment` is NOT stripped by
+    # the sync parser and would be read as part of the value.
+    public_key: pk-lf-quicktest
+    otlp_endpoint: http://localhost:4318
+
 # Hub batch/dispatch hardening (issue #151). Caps how many spokes the hub runs
 # concurrently across /next-batch and /afk, so wide parallelism can't drive load
 # high enough to starve the co-located Langfuse (the #151 telemetry-loss trigger).
