@@ -1385,12 +1385,18 @@ _afk_issue_poisoned() {
 }
 
 # afk_done <state> <now> -> true when the supervisor should stop: the window was turned off
-# (no state), a clock-bound window expired, or the backlog is drained (the planner returns
-# no DISPATCHABLE issue AND nothing is in flight).
+# (no state) or a clock-bound window expired. In DRAIN mode only, it also stops when the
+# backlog is drained (the planner returns no DISPATCHABLE issue AND nothing is in flight) --
+# a clock-bound window ignores an empty backlog and ticks until its clock, so window_expired
+# is its sole completion path (#222).
 afk_done() {
   local state="$1" now="$2" bp inflight_count batch tok remaining=""
   [ -n "$state" ] || return 0
   window_expired "$state" "$now" && return 0
+  # The backlog-drained stop below is drain-mode-only: a non-expired clock-bound (numeric)
+  # state keeps ticking regardless of the backlog, so it never self-completes on tick one
+  # when the whole backlog is empty / held / poisoned (#222).
+  [ "$state" = drain ] || return 1
   inflight_count="$(inflight_issues | grep -c '^[0-9]' || true)"
   [ "$inflight_count" -eq 0 ] || return 1
   bp="$(_afk_find_script "${BATCH_PLAN:-}" batch-plan.sh)" || return 1
