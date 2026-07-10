@@ -68,7 +68,7 @@ from telemetry.spoke_tree.ids import _CYCLE_STEP_PREFIX
 from telemetry.spoke_tree.llm_decomp import _decomp_metadata
 from telemetry.spoke_tree.loaded_context import find_request_files
 from telemetry.spoke_tree.scores import _step_phase
-from telemetry.spoke_tree.steps import _STEP_PREFIX
+from telemetry.spoke_tree.steps import _STEP_PREFIX, build_cycle_windows
 
 SPOKE = "feature/22-demo+1700000000"
 
@@ -1956,6 +1956,18 @@ def _ledger_obs(obs_id: str, name: str, tool_use_id: str, *, start: str, end: st
     )
 
 
+def _marker(obs_id: str, phase: str, start: str, *, end: str | None = None) -> dict:
+    """A solo-cycle marker span (kind=step, name=step:<phase>) as cycle-step-mark.sh emits it."""
+    return _obs(
+        obs_id,
+        f"step:{phase}",
+        parent=None,
+        startTime=start,
+        endTime=end or start,
+        metadata={"attributes": {"workflow.kind": "step", "workflow.phase": phase}},
+    )
+
+
 def _step_node(batch: list[dict]) -> dict | None:
     """Return the first synthetic step node in a batch, or None when there is none."""
     return next((e for e in batch if e["id"].startswith(_STEP_PREFIX)), None)
@@ -2070,6 +2082,182 @@ class TestBuildStepWindows:
         )
 
         assert build_step_windows([("tr", [create])], content) == []
+
+
+class TestBuildCycleWindows:
+    """#235: the cycle spine prefers the mechanical marker spans; the ledger only labels."""
+
+    def _markers(self) -> list[tuple[str, list[dict]]]:
+        # A trailing generation so the final (push) window has real width beyond its marker start.
+        trailing = _obs(
+            "g1",
+            "llm_request",
+            type_="GENERATION",
+            parent=None,
+            startTime="2026-01-02T00:00:11Z",
+            endTime="2026-01-02T00:00:12Z",
+        )
+        return [
+            (
+                "tr",
+                [
+                    _marker("m1", "red", "2026-01-02T00:00:00Z"),
+                    _marker("m2", "green", "2026-01-02T00:00:05Z"),
+                    _marker("m3", "review", "2026-01-02T00:00:08Z"),
+                    _marker("m4", "push", "2026-01-02T00:00:10Z"),
+                    trailing,
+                ],
+            )
+        ]
+
+    def test_marker_only_yields_one_window_per_phase_bounded_by_next_marker(self) -> None:
+        windows = build_cycle_windows(self._markers(), {})
+
+        assert [_step_phase(w.subject) for w in windows] == ["RED", "GREEN", "REVIEW", "PUSH"]
+        assert [w.start for w in windows] == [
+            "2026-01-02T00:00:00Z",
+            "2026-01-02T00:00:05Z",
+            "2026-01-02T00:00:08Z",
+            "2026-01-02T00:00:10Z",
+        ]
+        # Each window ends where the next marker starts; the last clamps to the latest activity.
+        assert windows[0].end == "2026-01-02T00:00:05Z"
+        assert windows[3].end == "2026-01-02T00:00:12Z"
+
+    def test_marker_window_borrows_an_overlapping_same_phase_ledger_subject(self) -> None:
+        content = {
+            "tu-c1": ToolContent(
+                {"subject": "S1 RED: failing test"},
+                "Task #1 created successfully: S1 RED: failing test",
+            ),
+            "tu-u1": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
+            "tu-u2": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
+        }
+        create = _ledger_obs(
+            "tc1", "tool:TaskCreate", "tu-c1", start="2026-01-02T00:00:00Z", end="0"
+        )
+        started = _ledger_obs(
+            "tu1", "tool:TaskUpdate", "tu-u1", start="2026-01-02T00:00:00Z", end="0"
+        )
+        done = _ledger_obs(
+            "tu2",
+            "tool:TaskUpdate",
+            "tu-u2",
+            start="2026-01-02T00:00:04Z",
+            end="2026-01-02T00:00:04Z",
+        )
+        traces = [
+            (
+                "tr",
+                [
+                    create,
+                    started,
+                    done,
+                    _marker("m1", "red", "2026-01-02T00:00:01Z"),
+                    _marker("m2", "green", "2026-01-02T00:00:06Z"),
+                ],
+            )
+        ]
+
+        windows = build_cycle_windows(traces, content)
+
+        assert windows[0].subject == "S1 RED: failing test"  # borrowed from the ledger
+        assert _step_phase(windows[1].subject) == "GREEN"  # no ledger match -> generic phase label
+
+    def test_falls_back_to_ledger_windows_when_no_markers(self) -> None:
+        content = {
+            "tu-c1": ToolContent(
+                {"subject": "S1 RED: failing test"},
+                "Task #1 created successfully: S1 RED: failing test",
+            ),
+            "tu-u1": ToolContent({"taskId": "1", "status": "in_progress"}, "ok"),
+            "tu-u2": ToolContent({"taskId": "1", "status": "completed"}, "ok"),
+        }
+        create = _ledger_obs(
+            "tc1", "tool:TaskCreate", "tu-c1", start="2026-01-02T00:00:00Z", end="0"
+        )
+        started = _ledger_obs(
+            "tu1", "tool:TaskUpdate", "tu-u1", start="2026-01-02T00:00:01Z", end="0"
+        )
+        done = _ledger_obs(
+            "tu2",
+            "tool:TaskUpdate",
+            "tu-u2",
+            start="2026-01-02T00:00:09Z",
+            end="2026-01-02T00:00:10Z",
+        )
+        ledger = [("tr", [create, started, done])]
+
+        assert build_cycle_windows(ledger, content) == build_step_windows(ledger, content)
+
+    def test_no_markers_and_no_ledger_yields_no_windows(self) -> None:
+        bare = [("tr", [_obs("t1", "tool:Bash", parent=None, startTime="2026-01-02T00:00:00Z")])]
+        assert build_cycle_windows(bare, {}) == []
+
+
+class TestCycleMarkerSpine:
+    """#235: a ledger-untouched spoke still yields a full step spine + per-phase scores."""
+
+    _BASE_TS = "2026-01-02T00:00:00Z"
+
+    def _marker_only_traces(self) -> list[tuple[str, list[dict]]]:
+        # No TaskCreate/TaskUpdate at all — only the mechanical marker spans plus a token-bearing
+        # generation inside the GREEN window (the crash/relaunch case from #225).
+        work_gen = _obs(
+            "wg",
+            "claude_code.llm_request",
+            type_="GENERATION",
+            parent=None,
+            startTime="2026-01-02T00:00:12Z",
+            endTime="2026-01-02T00:00:13Z",
+            usageDetails={
+                "input": 10,
+                "output": 4,
+                "cache_read_input_tokens": 7,
+                "cache_creation_input_tokens": 50,
+            },
+        )
+        return [
+            (
+                "tr",
+                [
+                    _marker("m1", "red", "2026-01-02T00:00:02Z"),
+                    _marker("m2", "green", "2026-01-02T00:00:10Z"),
+                    _marker("m3", "review", "2026-01-02T00:00:25Z"),
+                    _marker("m4", "push", "2026-01-02T00:00:30Z"),
+                    work_gen,
+                ],
+            )
+        ]
+
+    def test_marker_only_spoke_yields_a_full_four_step_axis(self) -> None:
+        cycle = build_cycle_batch(self._marker_only_traces(), SPOKE, {})
+
+        phases = {
+            _step_phase(e["body"].get("metadata", {}).get("subject") or e["body"]["name"])
+            for e in cycle
+            if e["body"]["id"].startswith(_CYCLE_STEP_PREFIX)
+        }
+        assert {"RED", "GREEN", "REVIEW", "PUSH"} <= phases
+
+    def test_marker_only_spoke_emits_per_phase_cost_scores(self) -> None:
+        cycle = build_cycle_batch(self._marker_only_traces(), SPOKE, {})
+
+        scores = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
+
+        assert "step_cost_usd:GREEN" in {s["body"]["name"] for s in scores}
+
+    def test_marker_span_not_rendered_as_orphan_node_in_cycle_view(self) -> None:
+        cycle = build_cycle_batch(self._marker_only_traces(), SPOKE, {})
+
+        names = {e["body"].get("name") for e in cycle}
+        assert not (names & {"step:red", "step:green", "step:review", "step:push"})
+
+    def test_marker_span_not_rendered_as_orphan_node_in_nested_view(self) -> None:
+        batch = build_batch(self._marker_only_traces(), SPOKE, {})
+
+        names = {e["body"].get("name") for e in batch}
+        assert not (names & {"step:red", "step:green", "step:review", "step:push"})
 
 
 def _root_marker(obs_id: str, name: str, start: str) -> dict:
