@@ -519,7 +519,9 @@ def _explain_dispositions(issues, children, depth, is_ready):
 
     Runs the SAME greedy disjoint-scope walk the packer uses, seeded with the in-flight
     issue numbers (their scopes looked up from the backlog), so the surfaced dispositions
-    can never drift from what the scheduler actually does. Returns
+    track what the scheduler actually does. (An in-flight issue absent from the fetched
+    backlog is dropped from the seed here, whereas dispatch fails it closed to `*`; that
+    rare not-in-fetch case can only under-report a collision, never invent one.) Returns
     (ranked, inflight_present, inflight_nums, collider_of, holds_back) where:
       * ranked          — dispatchable issues (all blockers closed, incl. held) in priority order
       * inflight_present— the in-flight issue numbers that are in the backlog, ascending
@@ -767,9 +769,11 @@ PYEOF
 # (e.g. feature/223-slug → 223), one per line. Used to seed the --explain view with the
 # live in-flight set so it can attribute blocked-by-scope collisions to a running spoke.
 # The main checkout (branch `main`) and detached worktrees carry no leading digits and
-# are skipped. A best-effort standalone parse (no worktree-lib dependency).
+# are skipped. A best-effort standalone parse (no worktree-lib dependency). LC_ALL=C forces
+# a byte-stable locale for the system-tool parse, matching this repo's locale-hardening
+# discipline (#189/#194) even though worktree branch refs are ASCII.
 _batch_inflight_issue_nums() {
-  git worktree list --porcelain 2>/dev/null | awk '
+  LC_ALL=C git worktree list --porcelain 2>/dev/null | LC_ALL=C awk '
     /^branch /{ slug = $2; sub(/.*\//, "", slug); if (match(slug, /^[0-9]+/)) print substr(slug, RSTART, RLENGTH) }'
 }
 
