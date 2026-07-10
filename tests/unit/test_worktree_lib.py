@@ -101,7 +101,7 @@ def _bridge_preflight_up(
     """Run wt_otel_bridge_preflight with the bridge UP and staleness stubbed.
 
     The port probe is forced up and the staleness signal is driven directly:
-    wt_bridge_pid (the :4319 listener pid), wt_proc_start_epoch (when it started),
+    wt_bridge_pid (the :4319 listener pid), wt_ps_start_epoch (when it started),
     and wt_bridge_source_mtime (newest mtime of the bridge's source bundle).
     wt_bridge_kill / wt_bridge_launch are marker echoes, so a recycle prints
     ``KILLED <pid>`` then ``LAUNCHED <repo>`` and nothing real is signalled or
@@ -110,7 +110,7 @@ def _bridge_preflight_up(
     parts = [
         "wt_port_listening() { return 0; }",
         f'wt_bridge_pid() {{ printf "%s" "{pid}"; }}',
-        f'wt_proc_start_epoch() {{ printf "%s" "{proc_start}"; }}',
+        f'wt_ps_start_epoch() {{ printf "%s" "{proc_start}"; }}',
         f'wt_bridge_source_mtime() {{ printf "%s" "{source_mtime}"; }}',
         'wt_bridge_kill() { echo "KILLED $1"; }',
         'wt_bridge_launch() { echo "LAUNCHED $1"; }',
@@ -328,6 +328,33 @@ def test_bridge_preflight_stale_but_auth_missing_leaves_process() -> None:
     assert "LANGFUSE_BASIC_AUTH" in result.stderr
 
 
+def test_bridge_restart_survives_nonzero_start_epoch_under_errexit() -> None:
+    # Regression (#189): wt_ps_start_epoch now returns non-zero on a dead/unparseable
+    # pid, and wt_bridge_restart_if_stale runs under worktree-new.sh's `set -e`, where
+    # a failing `start="$(wt_ps_start_epoch …)"` assignment would abort the spawn
+    # before the empty-start guard. The `|| true` must keep the preflight best-effort:
+    # the function returns 0, kills/launches nothing, and control reaches the sentinel.
+    script = "; ".join(
+        [
+            "set -euo pipefail",
+            'wt_bridge_pid() { printf "4242"; }',
+            "wt_ps_start_epoch() { return 1; }",  # dead pid: empty stdout, non-zero
+            'wt_bridge_source_mtime() { printf "9999999999"; }',
+            'wt_bridge_kill() { echo "KILLED $1"; }',
+            'wt_bridge_launch() { echo "LAUNCHED $1"; }',
+            "export AI_TOOLKIT_OTEL=1 LANGFUSE_BASIC_AUTH=Basic-xyz",
+            "wt_bridge_restart_if_stale /repo 4319",
+            'echo "REACHED_END=$?"',
+        ]
+    )
+    result = _call(script)
+
+    assert result.returncode == 0, result.stderr
+    assert "REACHED_END=0" in result.stdout.splitlines(), result.stdout
+    assert "KILLED" not in result.stdout
+    assert "LAUNCHED" not in result.stdout
+
+
 # --- wt_source_hash: content-hash source stamp (issue #190) --------------------
 # The reusable "source-hash stamp" primitive: a content hash over a daemon's source
 # bundle, so a long-running process can detect it is running code a land has since
@@ -423,7 +450,7 @@ def test_bridge_pid_resolves_via_lsof_not_pgrep(tmp_path: Path) -> None:
     assert not pgrep_marker.exists(), "wt_bridge_pid must not consult pgrep"
 
 
-def test_proc_start_epoch_is_locale_independent() -> None:
+def test_ps_start_epoch_is_locale_independent() -> None:
     # `ps -o lstart=` is locale-formatted (fr_FR emits "lun. 29 juin"), which
     # `date -f "%a %b %e %T %Y"` cannot parse — that would strand the epoch empty
     # and stop the bridge staleness check from ever firing. The helper must force
@@ -431,7 +458,7 @@ def test_proc_start_epoch_is_locale_independent() -> None:
     # (read-only — never kills) under a deliberately non-C inherited locale.
     env = {**os.environ, "LC_ALL": "fr_FR.UTF-8", "LANG": "fr_FR.UTF-8"}
     result = subprocess.run(
-        ["bash", "-c", f'source "{WT_LIB}"; wt_proc_start_epoch $$'],
+        ["bash", "-c", f'source "{WT_LIB}"; wt_ps_start_epoch $$'],
         capture_output=True,
         text=True,
         env=env,

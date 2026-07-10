@@ -150,20 +150,22 @@ _afk_timeout_bin() {
 # `bash batch-plan.sh` whose real work is `gh api … | python`) would orphan a grandchild
 # that keeps the output pipe open and hangs the whole substitution. `pgrep -P` matches by
 # numeric parent pid (never argv), so the repo's non-ASCII `pgrep -f` hazard doesn't apply;
-# LC_ALL=C is belt-and-suspenders.
+# wt_pgrep (issue #189) forces LC_ALL=C as belt-and-suspenders and excludes this
+# supervisor's own pid, so a kill-tree walk can never turn on itself.
 _afk_kill_tree() {
   local pid="$1" sig="$2" child
-  for child in $(LC_ALL=C pgrep -P "$pid" 2>/dev/null); do _afk_kill_tree "$child" "$sig"; done
+  for child in $(wt_pgrep -P "$pid"); do _afk_kill_tree "$child" "$sig"; done
   kill "-$sig" "$pid" 2>/dev/null || true
 }
 
 # _afk_descendant_pids <pid> -> every descendant pid of <pid> (recursively, one per line),
 # collected via `pgrep -P` (numeric parent, ASCII-safe). Snapshotted BEFORE a kill so a
 # SIGKILL escalation can still reach a TERM-ignoring child after the parent — and thus the
-# `pgrep -P` chain — is gone (#202 E review). Does not include <pid> itself.
+# `pgrep -P` chain — is gone (#202 E review). Does not include <pid> itself. Goes through
+# wt_pgrep (issue #189) so every process probe shares the one LC_ALL=C, self-excluding path.
 _afk_descendant_pids() {
   local pid="$1" child
-  for child in $(LC_ALL=C pgrep -P "$pid" 2>/dev/null); do
+  for child in $(wt_pgrep -P "$pid"); do
     printf '%s\n' "$child"
     _afk_descendant_pids "$child"
   done
