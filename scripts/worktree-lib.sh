@@ -135,12 +135,17 @@ wt_resolve_langfuse_auth() {
   wt_resolve_telemetry_config
   if [ -f "$conf" ]; then
     local s_auth="${LANGFUSE_BASIC_AUTH:-}" s_host="${LANGFUSE_HOST:-}" \
-          s_ep="${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:-}"
+          s_ep="${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:-}" \
+          s_proj="${LANGFUSE_PROJECT:-}" s_pk="${LANGFUSE_PUBLIC_KEY:-}"
     # shellcheck disable=SC1090
     . "$conf" 2>/dev/null || true
     [ -n "$s_auth" ] && LANGFUSE_BASIC_AUTH="$s_auth"
     [ -n "$s_host" ] && LANGFUSE_HOST="$s_host"
     [ -n "$s_ep" ] && AI_TOOLKIT_OTEL_SPAN_ENDPOINT="$s_ep"
+    # Project + public key are env-wins per field too (issue #228), so restore an
+    # env value the conf may have overwritten before the config default applies below.
+    [ -n "$s_proj" ] && LANGFUSE_PROJECT="$s_proj"
+    [ -n "$s_pk" ] && LANGFUSE_PUBLIC_KEY="$s_pk"
   fi
   [ -n "${LANGFUSE_BASIC_AUTH:-}" ] || return 1
   export LANGFUSE_BASIC_AUTH
@@ -563,7 +568,10 @@ wt_bridge_launch() {
   log="$(mktemp -t lf-bridge.XXXXXX 2>/dev/null)" || log="/tmp/lf-bridge.log"
   (
     export PYTHONPATH="$repo_root/scripts"
-    export LANGFUSE_HOST="${LANGFUSE_HOST:-http://localhost:3000}"
+    # env -> config default (LANGFUSE_HOST_DEFAULT, set by wt_resolve_telemetry_config
+    # in the launching shell) -> hardcoded local Langfuse (issue #228). So the live
+    # bridge forwards to the SAME Langfuse the config names, not a hardcoded localhost.
+    export LANGFUSE_HOST="${LANGFUSE_HOST:-${LANGFUSE_HOST_DEFAULT:-http://localhost:3000}}"
     export LANGFUSE_BASIC_AUTH BRIDGE_PORT
     nohup python3 "$repo_root/scripts/telemetry/langfuse_message_bridge.py" \
       >"$log" 2>&1 &

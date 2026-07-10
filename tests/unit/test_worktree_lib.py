@@ -190,6 +190,44 @@ def test_bridge_launch_forwards_required_env_to_child(tmp_path: Path) -> None:
     assert "BRIDGE_PORT=4321" in recorded
 
 
+def _bridge_launch_host(tmp_path: Path, expr: str) -> str:
+    """Launch wt_bridge_launch under a python3 stub that records LANGFUSE_HOST."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    dump = tmp_path / "child-host.txt"
+    stub = bindir / "python3"
+    stub.write_text('#!/bin/sh\necho "LANGFUSE_HOST=$LANGFUSE_HOST" > "$STUB_ENV_DUMP"\n')
+    stub.chmod(0o755)
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "STUB_ENV_DUMP": str(dump)}
+    subprocess.run(["bash", "-c", f'source "{WT_LIB}"; {expr}'], env=env, check=True)
+    deadline = time.monotonic() + 5.0
+    while not dump.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert dump.exists(), "bridge child never launched / wrote its host"
+    return dump.read_text()
+
+
+def test_bridge_launch_forwards_config_host_default(tmp_path: Path) -> None:
+    # env LANGFUSE_HOST unset but the config default is set (as wt_resolve_telemetry_config
+    # would) ⇒ the live bridge forwards to the config's Langfuse, not hardcoded localhost.
+    expr = (
+        "unset LANGFUSE_HOST; LANGFUSE_HOST_DEFAULT=http://cfg.example:3000; "
+        "LANGFUSE_BASIC_AUTH=tok; BRIDGE_PORT=4321; wt_bridge_launch /repo"
+    )
+
+    assert "LANGFUSE_HOST=http://cfg.example:3000" in _bridge_launch_host(tmp_path, expr)
+
+
+def test_bridge_launch_env_host_wins_over_config_default(tmp_path: Path) -> None:
+    # A live env LANGFUSE_HOST still outranks the config default.
+    expr = (
+        "LANGFUSE_HOST=http://env.example:9999; LANGFUSE_HOST_DEFAULT=http://cfg.example:3000; "
+        "LANGFUSE_BASIC_AUTH=tok; BRIDGE_PORT=4321; wt_bridge_launch /repo"
+    )
+
+    assert "LANGFUSE_HOST=http://env.example:9999" in _bridge_launch_host(tmp_path, expr)
+
+
 # --- wt_bridge_source_mtime portable stat (issue #132) -------------------------
 # The helper reads real file mtimes behind a stat fallback. The GNU-first order
 # (`stat -c %Y || stat -f %m`) is load-bearing: BSD-first breaks on GNU stat,
@@ -1354,6 +1392,28 @@ def test_resolve_langfuse_auth_env_host_wins_over_config(tmp_path: Path) -> None
 
     assert "RC=0" in result.stdout, result.stderr + result.stdout
     assert "C_HOST=http://env.example:9999" in result.stdout
+
+
+def test_resolve_langfuse_auth_env_project_wins_over_conf(tmp_path: Path) -> None:
+    # env-wins per field must hold for LANGFUSE_PROJECT too: a ~/.afk-telemetry conf
+    # that sets it must NOT clobber a live env value (the save/restore covers it).
+    conf = tmp_path / "afk-telemetry"
+    conf.write_text('LANGFUSE_PROJECT="proj-from-conf"\n')
+    cfg = tmp_path / "ai-toolkit.yml"
+    cfg.write_text(_TELEMETRY_CFG)
+    parts = [
+        f'export AFK_TELEMETRY_CONF="{conf}"',
+        f'export AI_TOOLKIT_CONFIG="{cfg}"',
+        "unset LANGFUSE_HOST AI_TOOLKIT_OTEL_SPAN_ENDPOINT LANGFUSE_PUBLIC_KEY",
+        "export LANGFUSE_BASIC_AUTH=Basic-env",
+        "export LANGFUSE_PROJECT=proj-from-env",
+        'wt_resolve_langfuse_auth; echo "RC=$?"',
+        "bash -c 'echo \"C_PROJ=$LANGFUSE_PROJECT\"'",
+    ]
+    result = _call("; ".join(parts))
+
+    assert "RC=0" in result.stdout, result.stderr + result.stdout
+    assert "C_PROJ=proj-from-env" in result.stdout
 
 
 # --- review workspace file management (issue #134) ----------------------------
