@@ -3301,3 +3301,111 @@ def test_parse_decision_field_extracts_reversibility_and_warn() -> None:
     # parse_decision still extracts the ANSWER decision unchanged.
     kind, _, text = dec.partition("\t")
     assert kind == "ANSWER" and text == "deny; rebase instead", dec
+
+
+# ── issue #241 S3: classify_permission ESCALATE routes to the reasoner + warns ──
+# A permission dialog the mechanical classifier will not auto-approve no longer parks the
+# spoke as blocked/<issue>. It routes to the always-answering reasoner: APPROVE a safe,
+# reversible, in-scope command; DENY an irreversible/destructive one (Esc-cancel the dialog
+# and inject the reversible-path guidance) — never auto-approve a destructive command. Either
+# way the taken decision is warned + journaled, and the spoke stays serviced (never blocked).
+
+
+def _perm_env(tmp_path: Path, spoke_repo: Path, command: str, answerer: str) -> dict[str, str]:
+    """Park spoke #5 on a permission dialog for <command>, stub the reasoner with <answerer>,
+    and record any blocked escalation. A fake tmux logs every send-keys to _KEYLOG and, on an
+    Enter, advances the transcript so approve/inject verification can register."""
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    jsonl.write_text(json.dumps(_bash_tool_record(command)) + "\n")
+    keylog = tmp_path / "keys.log"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        "  send-keys)\n"
+        f'    printf "%s\\n" "$*" >> "{keylog}"\n'
+        f'    case "$*" in *Enter*) printf "{{}}\\n" >> "{jsonl}" ;; esac ;;\n'
+        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        "esac\nexit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    statedir = tmp_path / "sd"
+    statedir.mkdir(exist_ok=True)
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+    gh = fake_bin / "gh"
+    gh.write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    gh.chmod(0o755)
+    return {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE_DIR": str(statedir),
+        "SPOKE_READY": str(ready_stub),
+        "AFK_ANSWERER_CMD": answerer,
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_INJECT_POLL_SECONDS": "0",
+        "_KEYLOG": str(keylog),
+        "_READY_LOG": str(ready_log),
+        "_STATEDIR": str(statedir),
+    }
+
+
+def test_permission_escalate_reasoner_approve_injects_yes_and_warns(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    env = _perm_env(
+        tmp_path,
+        spoke_repo,
+        "npm run deploy",  # unrecognised -> classify ESCALATE
+        "printf 'REVERSIBILITY: reversible\\nANSWER: APPROVE'",
+    )
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    keys = Path(env["_KEYLOG"]).read_text() if Path(env["_KEYLOG"]).exists() else ""
+    statedir = Path(env["_STATEDIR"])
+    # The reasoner approved -> the "Yes" (option 1) keystroke was delivered.
+    assert any(line.split()[-1] == "1" for line in keys.splitlines()), keys
+    # Taken decision is warned + journaled, and the spoke is NEVER blocked.
+    assert (statedir / "warned-5.txt").exists()
+    assert (statedir / "decision-journal.jsonl").exists()
+    ready = Path(env["_READY_LOG"])
+    assert not ready.exists() or "--blocked 5" not in ready.read_text()
+
+
+def test_permission_escalate_reasoner_deny_cancels_and_redirects(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    destructive = "git reset --hard origin/main"  # irreversible -> must be denied
+    env = _perm_env(
+        tmp_path,
+        spoke_repo,
+        destructive,
+        "printf 'REVERSIBILITY: irreversible\\nANSWER: DENY: do not hard-reset; create a backup branch first'",
+    )
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    keys = Path(env["_KEYLOG"]).read_text() if Path(env["_KEYLOG"]).exists() else ""
+    statedir = Path(env["_STATEDIR"])
+    # Deny cancels the dialog (Escape) and never sends the bare "Yes" (option 1).
+    assert "Escape" in keys, keys
+    assert not any(line.split()[-1] == "1" for line in keys.splitlines()), (
+        "an irreversible command must never be auto-approved"
+    )
+    # The reversible-path guidance was injected to the spoke.
+    assert "backup branch" in keys, keys
+    # Warned + journaled with the irreversible class; never blocked.
+    assert "irreversible" in (statedir / "decision-journal.jsonl").read_text()
+    ready = Path(env["_READY_LOG"])
+    assert not ready.exists() or "--blocked 5" not in ready.read_text()
