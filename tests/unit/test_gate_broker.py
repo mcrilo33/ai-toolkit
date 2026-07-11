@@ -152,6 +152,43 @@ def spoke_repo(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def linked_spoke_repo(tmp_path: Path) -> Path:
+    """A REAL linked worktree as the spoke: its `.git` is a gitfile pointing at the shared
+    common gitdir (`git worktree add`), the production shape #237's `spoke_repo` (a
+    standalone `git init`, `.git` a directory) never models. Commit subjects are
+    conventional — the repo's commit-quality hook rejects a bare subject."""
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    main = tmp_path / "main"
+    main.mkdir()
+    (main / ".gitignore").write_text(".testmondata*\n.ai-toolkit/\n.venv/\n")
+    subprocess.run(["git", "init", "-q"], cwd=main, check=True, env=env, capture_output=True)
+    subprocess.run(["git", "add", ".gitignore"], cwd=main, check=True, env=env, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "chore: init"],
+        cwd=main,
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    wt = tmp_path / "spoke"
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", "feature/x", str(wt)],
+        cwd=main,
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    assert (wt / ".git").is_file(), "the spoke's .git must be a gitfile (linked worktree)"
+    return wt
+
+
+@pytest.fixture
 def waiting_spoke_env(tmp_path: Path, spoke_repo: Path) -> dict[str, str]:
     """A spoke parked on a question + a recording spoke-ready stub + a fake gh."""
     projects = tmp_path / "projects"
@@ -804,6 +841,78 @@ def test_broker_service_gate_injects_despite_runtime_drift(
     )
 
 
+def test_snapshot_isolates_linked_worktree_refs_from_shared_gitdir(
+    linked_spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #239 headline: a linked worktree's `.git` is a gitfile still pointing at the SHARED
+    # common gitdir, so a git write-verb inside the #237 snapshot copy (which cp -R'd the
+    # gitfile verbatim) resolves to the REAL refs and mutates them. The private-gitdir
+    # snapshot must isolate them: a reasoner `git commit --allow-empty` + `git update-ref`
+    # inside the copy leaves the live worktree's HEAD and branch tip byte-for-byte unchanged.
+    wt = linked_spoke_repo
+
+    def _rev(ref: str) -> str:
+        return subprocess.run(
+            ["git", "rev-parse", ref], cwd=wt, capture_output=True, text=True
+        ).stdout.strip()
+
+    head_before, branch_before = _rev("HEAD"), _rev("feature/x")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+    result = _call(
+        f"run_answerer 5 'q' '{wt}'",
+        env={
+            "AFK_ANSWERER_CMD": (
+                "git commit --allow-empty -q -m 'chore: sneaky'; "
+                "git update-ref refs/heads/feature/x HEAD; printf 'ANSWER: ok'"
+            ),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _rev("HEAD") == head_before, (
+        "a reasoner git write in the copy must not move the live linked-worktree HEAD"
+    )
+    assert _rev("feature/x") == branch_before, (
+        "a reasoner git write in the copy must not rewrite the live branch tip"
+    )
+
+
+def test_broker_service_gate_voids_answer_when_reasoner_mutates_refs(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str]
+) -> None:
+    # Defense-in-depth backstop (#239), parallel to the tracked-content void at :703: a
+    # reasoner ref write to the LIVE $wt (absolute-path bypass of the snapshot) is now
+    # DETECTED by the ref-covering fingerprint, so broker_service_gate voids the answer and
+    # escalates to blocked/<issue> — the content-only fingerprint used to miss it entirely.
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": (
+            f"git -C '{spoke_repo}' commit --allow-empty -q -m 'chore: sneaky'; "
+            "printf 'ANSWER: go ahead'"
+        ),
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    log = Path(env["_READY_LOG"]).read_text()
+    assert "--blocked 5" in log, f"a reasoner ref write must escalate, not inject: {log}"
+    assert "worktree" in log.lower() or "mutat" in log.lower(), log
+
+
 def test_reasoner_prompt_has_readonly_posture_and_evidence(tmp_path: Path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -820,6 +929,13 @@ def test_reasoner_prompt_has_readonly_posture_and_evidence(tmp_path: Path) -> No
     assert "read-only" in low, "the prompt must state the reasoner has read-only worktree access"
     assert "evidence" in low, "the prompt must ask the reasoner to cite worktree evidence"
     assert "prior gate decisions" in low or "decisions-digest" in low, "digest section missing"
+    # #239 secondary facet: post-snapshot the reasoner's cwd is a throwaway COPY, so the
+    # prompt must NOT disclose the live-tree absolute path (which invited an absolute-path
+    # write into the real $wt) and must point cwd at the copy instead.
+    assert "/some/worktree" not in result.stdout, (
+        "the prompt must not disclose the live worktree's absolute path"
+    )
+    assert "copy" in low, "the prompt must describe the reasoner's cwd as a throwaway copy"
 
 
 def test_read_decisions_digest_reflects_prior_outcomes(spoke_repo: Path, tmp_path: Path) -> None:
