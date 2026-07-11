@@ -13,6 +13,7 @@ from telemetry.spoke_tree.scores import (
     _step_phase,
     _step_phase_of,
     build_score_events,
+    build_script_success_scores,
     build_step_cost_scores,
     build_step_duration_scores,
     build_step_total_cost_scores,
@@ -39,6 +40,58 @@ class TestBuildScoreEvents:
     def test_no_signals_no_scores(self) -> None:
         batch = [{"body": {"id": "t1", "metadata": {}}}]
         assert build_score_events(SPOKE, [("tr", [])], batch, base_ts="x") == []
+
+
+class TestBuildScriptSuccessScores:
+    """#233: mirror each control-script span's status into a script_success:<name> 0/1 score."""
+
+    def _script(self, obs_id: str, name: str, status: str, phase: str | None = None) -> dict:
+        attributes: dict[str, str] = {"workflow.kind": "script", "status": status}
+        if phase is not None:
+            attributes["workflow.phase"] = phase
+        return {"body": {"id": obs_id, "name": name, "metadata": {"attributes": attributes}}}
+
+    def test_success_status_scores_one_per_script_node(self) -> None:
+        batch = [self._script("s1", "spoke-push", "success")]
+
+        events = build_script_success_scores(SPOKE, batch, base_ts="t")
+
+        assert len(events) == 1
+        body = events[0]["body"]
+        assert events[0]["type"] == "score-create"
+        assert body["name"] == "script_success:spoke-push"
+        assert body["value"] == 1.0
+        assert body["observationId"] == "s1"
+
+    def test_failure_status_scores_zero(self) -> None:
+        batch = [self._script("s1", "spoke-push", "failure")]
+
+        events = build_script_success_scores(SPOKE, batch, base_ts="t")
+
+        assert events[0]["body"]["value"] == 0.0
+
+    def test_phased_script_name_strips_the_kind_prefix(self) -> None:
+        batch = [self._script("g", "script:gate", "success", phase="gate")]
+
+        events = build_script_success_scores(SPOKE, batch, base_ts="t")
+
+        assert events[0]["body"]["name"] == "script_success:gate"
+
+    def test_non_script_nodes_are_ignored(self) -> None:
+        batch = [{"body": {"id": "t1", "name": "tool:Bash", "metadata": {}}}]
+
+        assert build_script_success_scores(SPOKE, batch, base_ts="t") == []
+
+    def test_repeat_invocations_keep_distinct_observation_scores(self) -> None:
+        batch = [
+            self._script("s1", "spoke-push", "success"),
+            self._script("s2", "spoke-push", "failure"),
+        ]
+
+        events = build_script_success_scores(SPOKE, batch, base_ts="t")
+
+        assert len(events) == 2
+        assert {e["body"]["observationId"] for e in events} == {"s1", "s2"}
 
 
 class TestStepPhase:
