@@ -3491,3 +3491,66 @@ def test_permission_reasoner_auth_failure_halts_not_denies(
     # No spurious denial: the reversible-path guidance was never injected.
     keys = Path(env["_KEYLOG"]).read_text() if Path(env["_KEYLOG"]).exists() else ""
     assert "reversible, in-scope path" not in keys, "auth failure must not inject a spurious deny"
+
+
+# ── issue #241 S4: the re-answer ceiling backs off, never goes terminal ─────────
+# Pre-#241 the ceiling was TERMINAL: once a spoke exhausted its attempts on the same (tip,
+# prompt) the reasoner never ran again until a human intervened. #241 §5 makes it warn + retry
+# on an exponential backoff — doom-loop safety is the growing curve, not abandonment.
+
+
+def test_reanswer_ceiling_backs_off_and_retries(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    calls = tmp_path / "answerer.calls"
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    base = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": f"printf x >> '{calls}'; printf 'ESCALATE: legitimately stuck'",
+        "AFK_REANSWER_CEILING": "1",
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_WARN_BACKOFF_BASE": "60",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    # First run exhausts the ceiling (=1). A second tick at the SAME clock stays inside the
+    # backoff (no re-run). A third tick past the 60s backoff takes ONE supervised retry.
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env={**base, "AFK_NOW": "1000"})
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env={**base, "AFK_NOW": "1000"})
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env={**base, "AFK_NOW": "1100"})
+
+    n = calls.read_text().count("x") if calls.exists() else 0
+    assert n >= 2, f"the ceiling must retry after the backoff, not stay terminal; ran {n}"
+    assert (statedir / "warned-5.txt").exists(), "the ceiling must warn"
+    assert "ceiling" in (statedir / "decision-journal.jsonl").read_text()
+
+
+# ── issue #241 S4: staleness recomputes against the current park, never bare-drops ──
+# Pre-#241 a park-signature change dropped the answer and returned. #241 §4: if the spoke is
+# still parked (on a possibly-changed prompt), recompute against the CURRENT park in the same
+# pass — a recurring false-staleness (a non-turn write bumping the transcript mtime) otherwise
+# strands the spoke (the #240 hang class). The #89 protection stays: a spoke that genuinely
+# MOVED ON (no park extractable) is still dropped, never injected mid-turn.
+
+
+def test_staleness_recomputes_against_current_park(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    calls = tmp_path / "answerer.calls"
+    # The reasoner touches the LIVE transcript, so the post-reason _still_parked_same mtime
+    # check always reports "changed" — a false staleness. The pane still shows the park, so #241
+    # must recompute (re-run) rather than drop. The recompute is depth-bounded to one re-run.
+    live_jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": f"printf x >> '{calls}'; touch '{live_jsonl}'; printf 'ANSWER: pick Redis'",
+        "AFK_REANSWER_CEILING": "5",  # keep the ceiling out of this test
+        "AFK_STATE_DIR": str(tmp_path / "sd"),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    n = calls.read_text().count("x") if calls.exists() else 0
+    assert n == 2, f"a still-parked staleness must recompute once (not bare-drop); ran {n}"
