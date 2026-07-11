@@ -37,8 +37,10 @@ from telemetry.langfuse_spoke_tree import (
     build_batch,
     build_cycle_batch,
     build_loaded_context_events,
+    build_rule_carry_cost_scores,
     build_score_events,
     build_step_cost_scores,
+    build_tooldef_carry_cost_scores,
     build_step_duration_scores,
     build_step_total_cost_scores,
     cycle_copy_id_for,
@@ -1254,6 +1256,116 @@ class TestScoreEvents:
         scores = self._scores([("tr", [gate, turn])])
 
         assert self._by_name(scores, "gate_park_ms")[0]["body"]["value"] == 500
+
+
+class TestCarryCostScores:
+    """#232 subtask carry: per-rule and per-tooldef carry-cost scores from the loaded-context
+    rows x n_requests x cache-read price (+ a one-time cache-write share). Carry cost is what a
+    rule / tool schema costs EVERY request just by being loaded, whether it is ever invoked.
+    """
+
+    _BASE_TS = "2026-01-01T00:00:00Z"
+
+    def _rule_scores(
+        self, rows: list[dict], n_requests: int = 10, price: float = 0.001
+    ) -> list[dict]:
+        return build_rule_carry_cost_scores(
+            SPOKE, rows, n_requests, base_ts=self._BASE_TS, price=price
+        )
+
+    def _tooldef_scores(
+        self, rows: list[dict], n_requests: int = 10, price: float = 0.001
+    ) -> list[dict]:
+        return build_tooldef_carry_cost_scores(
+            SPOKE, rows, n_requests, base_ts=self._BASE_TS, price=price
+        )
+
+    def test_rule_carry_cost_score_per_rule_file(self) -> None:
+        rows = [
+            {"category": "rules", "name": "python-style.md", "tokens": 100},
+            {"category": "rules", "name": "MEMORY.md", "tokens": 50},
+            {"category": "tools", "name": "Bash", "tokens": 120},
+        ]
+
+        scores = self._rule_scores(rows)
+
+        names = {s["body"]["name"] for s in scores}
+        assert names == {
+            "rule_carry_cost_usd:python-style.md",
+            "rule_carry_cost_usd:MEMORY.md",
+        }
+
+    def test_rule_carry_cost_value_folds_n_requests_reads_and_one_write_share(self) -> None:
+        rows = [{"category": "rules", "name": "python-style.md", "tokens": 100}]
+
+        scores = self._rule_scores(rows, n_requests=10, price=0.001)
+
+        body = scores[0]["body"]
+        # 100 x (10 reads x 0.001x0.08 + one 0.001 write share) = 100 x 0.0018 = 0.18
+        assert body["value"] == pytest.approx(0.18)
+        assert body["dataType"] == "NUMERIC"
+        assert body["traceId"] == trace_id_for(SPOKE)
+        assert "observationId" not in body  # trace-level
+
+    def test_no_rule_scores_without_rule_rows(self) -> None:
+        scores = self._rule_scores([{"category": "tools", "name": "Bash", "tokens": 120}])
+
+        assert scores == []
+
+    def test_duplicate_rule_names_are_summed(self) -> None:
+        rows = [
+            {"category": "rules", "name": "CLAUDE.md", "tokens": 100},
+            {"category": "rules", "name": "CLAUDE.md", "tokens": 40},
+        ]
+
+        scores = self._rule_scores(rows, n_requests=1, price=0.001)
+
+        assert len(scores) == 1
+        assert scores[0]["body"]["value"] == pytest.approx(140 * (0.001 * 0.08 + 0.001))
+
+    def test_rule_score_ids_are_deterministic(self) -> None:
+        rows = [{"category": "rules", "name": "python-style.md", "tokens": 100}]
+
+        first = {s["id"] for s in self._rule_scores(rows)}
+        second = {s["id"] for s in self._rule_scores(rows)}
+
+        assert first == second and first
+
+    def test_tooldef_carry_cost_score_per_tool(self) -> None:
+        rows = [
+            {"category": "tools", "name": "Bash", "tokens": 120},
+            {"category": "mcp", "name": "mcp__x__y", "tokens": 80},
+            {"category": "rules", "name": "a.md", "tokens": 10},
+        ]
+
+        scores = self._tooldef_scores(rows)
+
+        names = {s["body"]["name"] for s in scores}
+        assert names == {
+            "tooldef_carry_cost_usd:Bash",
+            "tooldef_carry_cost_usd:mcp__x__y",
+        }
+
+    def test_tooldef_scores_capped_to_top_n_with_other_bucket(self) -> None:
+        rows = [{"category": "tools", "name": f"T{i}", "tokens": 1000 - i} for i in range(20)]
+
+        scores = self._tooldef_scores(rows)
+
+        names = [s["body"]["name"] for s in scores]
+        assert len(scores) == 16  # top 15 by cost + one folded :other bucket
+        assert "tooldef_carry_cost_usd:other" in names
+        assert "tooldef_carry_cost_usd:T0" in names  # largest is named
+        assert "tooldef_carry_cost_usd:T19" not in names  # smallest is folded
+
+    def test_tooldef_other_bucket_sums_folded_tokens(self) -> None:
+        # 17 equal-token tools: exactly two are folded regardless of tie-break order.
+        rows = [{"category": "tools", "name": f"T{i}", "tokens": 100} for i in range(17)]
+
+        scores = self._tooldef_scores(rows, n_requests=1, price=0.001)
+
+        other = [s for s in scores if s["body"]["name"] == "tooldef_carry_cost_usd:other"]
+        assert len(other) == 1
+        assert other[0]["body"]["value"] == pytest.approx(200 * (0.001 * 0.08 + 0.001))
 
 
 class TestContainerRollups:
