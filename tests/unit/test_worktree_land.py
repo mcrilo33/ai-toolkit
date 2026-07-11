@@ -195,6 +195,8 @@ def _run_land(
     # The host's own spoke marker must never steer the guard; set it explicitly
     # only when a test means to model a spoke session (issue #26).
     env.pop("WT_SPOKE", None)
+    # The host must not steer the issue #236 lifecycle-label mirror on/off.
+    env.pop("AI_TOOLKIT_GH_LIFECYCLE_LABELS", None)
     if spoke_marker is not None:
         env["WT_SPOKE"] = spoke_marker
     if extra_env:
@@ -1919,3 +1921,71 @@ def test_reland_finalize_fetch_failure_skips_remote_delete(hub: Path, tmp_path: 
     assert "feature/1-wtgone" not in _local_branches(hub), "local prune still runs"
     assert _remote_sha(hub, "feature/1-wtgone") != "", "the remote-only commit survives"
     assert "origin/feature/1-wtgone" in proc.stderr, "the skipped delete is loud"
+
+
+# --- lifecycle-label clear on land (issue #236) -------------------------------
+# A landed/torn-down spoke no longer has live local state, so the land clears the
+# status:*/mode:*/lane:* labels the dispatch stamped. The close comment is separate
+# and unchanged; the clear is best-effort (a failing gh never fails the land) and
+# only for numbered issues (ad-hoc branches never carried the labels).
+
+
+def test_land_clears_lifecycle_labels(hub: Path, tmp_path: Path) -> None:
+    _make_spoke(hub, tmp_path, "feature/7-shipped", push=True)
+
+    proc, logs = _run_land(hub, tmp_path, "7")
+
+    assert proc.returncode == 0, proc.stderr
+    gh = _log_text(logs["gh"])
+    edits = [ln for ln in gh.splitlines() if ln.startswith("issue edit 7")]
+    assert len(edits) == 1, f"expected one label-clear edit, got {edits}"
+    for lbl in (
+        "status:in-progress",
+        "status:gate",
+        "status:ready",
+        "status:blocked",
+        "mode:afk",
+        "mode:attended",
+        "lane:spoke",
+    ):
+        assert f"--remove-label {lbl}" in edits[0]
+    assert "--add-label" not in edits[0]
+
+
+def test_land_close_comment_unchanged_by_label_clear(hub: Path, tmp_path: Path) -> None:
+    _make_spoke(hub, tmp_path, "feature/7-shipped", push=True)
+
+    proc, logs = _run_land(hub, tmp_path, "7")
+
+    assert proc.returncode == 0, proc.stderr
+    gh = _log_text(logs["gh"])
+    assert "issue close 7" in gh
+    assert "Landed on" in gh, "the close comment must be preserved verbatim"
+
+
+def test_land_adhoc_branch_clears_no_labels(hub: Path, tmp_path: Path) -> None:
+    _make_spoke(hub, tmp_path, "chore/adhoc-task", push=True)
+
+    proc, logs = _run_land(hub, tmp_path, "adhoc-task")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "issue edit" not in _log_text(logs["gh"])
+
+
+def test_land_label_clear_gh_failure_non_fatal(hub: Path, tmp_path: Path) -> None:
+    _make_spoke(hub, tmp_path, "feature/7-ghdown", push=True)
+
+    proc, _ = _run_land(hub, tmp_path, "7", gh_exit=1)
+
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_land_mirror_opt_out_clears_no_labels(hub: Path, tmp_path: Path) -> None:
+    _make_spoke(hub, tmp_path, "feature/7-optout", push=True)
+
+    proc, logs = _run_land(
+        hub, tmp_path, "7", extra_env={"AI_TOOLKIT_GH_LIFECYCLE_LABELS": "0"}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "issue edit" not in _log_text(logs["gh"])
