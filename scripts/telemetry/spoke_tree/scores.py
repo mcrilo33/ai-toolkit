@@ -49,13 +49,16 @@ _SCRIPT_SUCCESS_SCORE = "script_success"
 _STATUS_SUCCESS = "success"
 # Agent verdict (#233): the outcome of an agent that ran under the spoke, as a numeric score named
 # by the agent type. code-review reads the APPROVE/REJECT verdict from its signed ``.review``
-# artifact; a schema-returning sub-agent reads the ``status`` its structured return carried; a
-# reaper-killed sub-agent (an ``ERROR``-level container) scores the ``died`` sentinel. The three
-# values are ordered so a Scores-view average reads as an approval/health rate.
+# artifact; a schema-returning sub-agent reads the ``status`` its structured return carried. The
+# verdict score is strictly 0/1 so a Scores-view average reads directly as an approval/health rate.
+# A reaper-killed (``ERROR``-level) sub-agent scores a SEPARATE ``agent_verdict:<type>:died`` flag
+# (value 1.0, a count) — the died class is kept off the 0/1 rate name so a death never drags the
+# averaged approval rate below zero (a distinct failure mode from a returned reject).
 _AGENT_VERDICT_SCORE = "agent_verdict"
 _VERDICT_APPROVE = 1.0  # APPROVE / a success-class sub-agent status
 _VERDICT_REJECT = 0.0  # REQUEST_CHANGES / a non-success sub-agent status
-_VERDICT_DIED = -1.0  # a reaper-killed (ERROR-level) sub-agent container — distinct from a reject
+_DIED_SCORE_SUFFIX = "died"  # the ``agent_verdict:<type>:died`` count score name suffix
+_DIED_FLAG = 1.0  # one death — a count, not a point on the 0/1 verdict scale
 _REVIEW_AGENT_TYPE = "code-review"
 _REVIEW_APPROVE_VERDICT = "APPROVE"
 _LEVEL_ERROR = "ERROR"  # the #157 failure level stamped on a failed/killed node
@@ -307,9 +310,14 @@ def _review_artifact_scores(
     events: list[IngestEvent] = []
     for artifact in sorted(review_dir.glob("*.json")):
         try:
-            verdict = json.loads(artifact.read_text()).get("verdict")
+            parsed = json.loads(artifact.read_text())
         except (OSError, ValueError):
             continue
+        # A valid-but-non-object artifact (a JSON array / scalar / null) is skipped, not fatal —
+        # ``.get`` on a non-dict would raise and abort the whole land-time build.
+        if not isinstance(parsed, dict):
+            continue
+        verdict = parsed.get("verdict")
         if not verdict:
             continue
         events.append(
@@ -325,21 +333,36 @@ def _review_artifact_scores(
     return events
 
 
-def _sub_agent_verdict(body: dict[str, Any]) -> float | None:
-    """Return a sub-agent container's verdict value, or None when it carries no verdict signal (#233).
+def _output_status(output: object) -> str | None:
+    """Return the lowercased ``status`` a sub-agent's grafted ``output`` carried, or None (#233).
 
-    A reaper-killed container is stamped the #157 ``ERROR`` level, so it scores ``died``. Otherwise a
-    schema-returning agent whose grafted ``output`` is a mapping with a ``status`` key scores by that
-    status (:data:`_AGENT_SUCCESS_STATUSES`). A plain-text / status-less output carries no verdict
-    (a free-form agent's prose is not an outcome), so it is skipped.
+    The transcript grafts a sub-agent's structured return either as an already-parsed mapping OR as
+    a raw JSON string (the tool_result content is frequently a string), so a string is decoded first.
+    A non-JSON string (a free-form agent's prose) or a JSON value without a ``status`` key carries no
+    outcome and yields None.
     """
-    if body.get("level") == _LEVEL_ERROR:
-        return _VERDICT_DIED
-    output = body.get("output")
+    if isinstance(output, str):
+        try:
+            output = json.loads(output)
+        except ValueError:
+            return None
     if isinstance(output, dict) and "status" in output:
-        status = str(output["status"]).lower()
-        return _VERDICT_APPROVE if status in _AGENT_SUCCESS_STATUSES else _VERDICT_REJECT
+        return str(output["status"]).lower()
     return None
+
+
+def _sub_agent_verdict(body: dict[str, Any]) -> float | None:
+    """Return a sub-agent's 0/1 verdict from its returned status, or None when it carried none (#233).
+
+    A schema-returning agent's ``output`` status (:func:`_output_status`) maps to
+    :data:`_VERDICT_APPROVE` / :data:`_VERDICT_REJECT` via :data:`_AGENT_SUCCESS_STATUSES`. A
+    status-less / plain-text output carries no verdict, so it is skipped. A reaper-killed container
+    is handled separately by the caller (a died-class count score, not a point on this 0/1 scale).
+    """
+    status = _output_status(body.get("output"))
+    if status is None:
+        return None
+    return _VERDICT_APPROVE if status in _AGENT_SUCCESS_STATUSES else _VERDICT_REJECT
 
 
 def build_agent_verdict_scores(
@@ -347,15 +370,18 @@ def build_agent_verdict_scores(
 ) -> list[IngestEvent]:
     """Build per-agent ``agent_verdict:<type>`` scores from reviews and sub-agent outcomes (#233).
 
-    Two sources feed one score family named by the agent type:
+    Two sources feed the score family named by the agent type:
 
     - **code-review** — the signed ``.review/*.json`` artifacts under ``review_dir``, each an APPROVE
-      / REQUEST_CHANGES verdict (:func:`_review_artifact_scores`). Trace-level, one per artifact.
-    - **schema / killed sub-agents** — every ``sub-agent:<type>`` container in the assembled batch
-      (excluding the ``sub-agent:llm`` calls, which are the sub-agent's own LLM turns, not an agent)
-      scores its :func:`_sub_agent_verdict`: ``died`` for an ERROR-level (reaper-killed) container, a
-      success/reject verdict from a structured ``status`` return, or nothing when it carried no
-      verdict signal. Observation-scoped to the container.
+      / REQUEST_CHANGES verdict (:func:`_review_artifact_scores`). Trace-level, one per artifact. This
+      is the AUTHORITATIVE source for code-review, so a ``sub-agent:code-review`` container is skipped
+      below — otherwise a killed reviewer's died flag would land under the same ``agent_verdict:
+      code-review`` name and blend into the artifact-based approve rate.
+    - **schema / killed sub-agents** — every OTHER ``sub-agent:<type>`` container in the assembled
+      batch (excluding the ``sub-agent:llm`` calls, which are the sub-agent's own LLM turns, not an
+      agent). A reaper-killed (ERROR-level) container scores a SEPARATE ``agent_verdict:<type>:died``
+      count (kept off the 0/1 rate name); otherwise a structured ``status`` return scores the 0/1
+      :func:`_sub_agent_verdict`. A container with neither signal scores nothing. Observation-scoped.
 
     All ids derive from the spoke run id so a rerun overwrites the same scores.
 
@@ -366,7 +392,7 @@ def build_agent_verdict_scores(
         base_ts: ISO timestamp stamped on every score event.
 
     Returns:
-        The ``score-create`` events (empty when no review ran and no sub-agent carried a verdict).
+        The ``score-create`` events (empty when no review ran and no sub-agent carried a signal).
     """
     trace_id = trace_id_for(spoke_run_id)
     events = _review_artifact_scores(spoke_run_id, review_dir, trace_id, base_ts)
@@ -376,7 +402,21 @@ def build_agent_verdict_scores(
         if not name.startswith(_SUB_AGENT_PREFIX):
             continue
         agent_type = name[len(_SUB_AGENT_PREFIX) :]
-        if agent_type == "llm":
+        # llm: the sub-agent's own LLM turns, not an agent. code-review: owned by the .review
+        # artifacts above (the authoritative verdict source), so its container is not scored here.
+        if agent_type in ("llm", _REVIEW_AGENT_TYPE):
+            continue
+        if body.get("level") == _LEVEL_ERROR:
+            events.append(
+                _score_event(
+                    spoke_run_id,
+                    name=f"{_AGENT_VERDICT_SCORE}:{agent_type}:{_DIED_SCORE_SUFFIX}",
+                    value=_DIED_FLAG,
+                    trace_id=trace_id,
+                    base_ts=base_ts,
+                    observation_id=body["id"],
+                )
+            )
             continue
         value = _sub_agent_verdict(body)
         if value is None:

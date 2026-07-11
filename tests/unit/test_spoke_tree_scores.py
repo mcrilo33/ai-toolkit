@@ -149,15 +149,28 @@ class TestBuildAgentVerdictScores:
     def test_missing_review_dir_no_code_review_score(self, tmp_path: Path) -> None:
         assert build_agent_verdict_scores(SPOKE, [], tmp_path / "absent", base_ts="t") == []
 
-    def test_sub_agent_error_level_scores_died(self, tmp_path: Path) -> None:
+    def test_non_object_review_artifact_is_skipped_not_fatal(self, tmp_path: Path) -> None:
+        # A valid-but-non-object artifact (a JSON array / scalar / null) must be skipped, not raise
+        # AttributeError and abort the whole land-time build.
+        review = tmp_path / ".review"
+        review.mkdir()
+        (review / "arr.json").write_text("[1, 2, 3]\n")
+        (review / "null.json").write_text("null\n")
+        (review / "ok.json").write_text(json.dumps({"verdict": "APPROVE"}) + "\n")
+
+        events = build_agent_verdict_scores(SPOKE, [], review, base_ts="t")
+
+        assert [e["body"]["value"] for e in events] == [1.0]  # only the object artifact scores
+
+    def test_sub_agent_error_level_scores_a_separate_died_flag(self, tmp_path: Path) -> None:
         batch = [{"body": {"id": "sa", "name": "sub-agent:bug-scoper", "level": "ERROR"}}]
 
         events = build_agent_verdict_scores(SPOKE, batch, tmp_path / "absent", base_ts="t")
 
         assert len(events) == 1
         body = events[0]["body"]
-        assert body["name"] == "agent_verdict:bug-scoper"
-        assert body["value"] == -1.0
+        assert body["name"] == "agent_verdict:bug-scoper:died"  # separate name, off the 0/1 rate
+        assert body["value"] == 1.0
         assert body["observationId"] == "sa"
 
     def test_sub_agent_status_output_scores_verdict(self, tmp_path: Path) -> None:
@@ -170,6 +183,23 @@ class TestBuildAgentVerdictScores:
 
         by_obs = {e["body"]["observationId"]: e["body"]["value"] for e in events}
         assert by_obs == {"p1": 1.0, "p2": 0.0}
+
+    def test_sub_agent_status_from_json_string_output(self, tmp_path: Path) -> None:
+        # A structured return grafted as a raw JSON STRING (the common tool_result shape) is decoded.
+        batch = [
+            {"body": {"id": "p1", "name": "sub-agent:planner", "output": '{"status": "success"}'}}
+        ]
+
+        events = build_agent_verdict_scores(SPOKE, batch, tmp_path / "absent", base_ts="t")
+
+        assert events[0]["body"]["value"] == 1.0
+
+    def test_sub_agent_code_review_container_is_not_scored(self, tmp_path: Path) -> None:
+        # code-review's verdict is owned by the .review artifacts; a killed code-review container
+        # must not mint an agent_verdict:code-review score that collides with them.
+        batch = [{"body": {"id": "cr", "name": "sub-agent:code-review", "level": "ERROR"}}]
+
+        assert build_agent_verdict_scores(SPOKE, batch, tmp_path / "absent", base_ts="t") == []
 
     def test_sub_agent_llm_calls_are_ignored(self, tmp_path: Path) -> None:
         batch = [{"body": {"id": "g", "name": "sub-agent:llm", "level": "ERROR"}}]
