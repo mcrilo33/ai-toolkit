@@ -1059,7 +1059,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(ctx.deltas)} llm_requests context-delta stamped, "
         f"{ctx.efforts} llm_requests effort-tagged, "
         f"{len(ctx.score_events)} numeric scores emitted, "
-        f"{len(ctx.step_scores)} per-phase step cost/token scores emitted, "
+        f"{len(ctx.step_scores)} per-phase step cost/token/duration scores emitted, "
         f"{len(commits)} commit nodes synthesized, "
         f"tagged mode={mode} lane={lane}; "
         f"{len(cycle_batch) - 2} observations assembled under cycle trace {cycle_trace_id}"
