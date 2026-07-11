@@ -205,8 +205,12 @@ markers; script spans `worktree-new` / `worktree-land` / `worktree-done` /
 `script:ready` / `script:gate` / `script:accept` / `script:blocked`; native
 `claude_code.llm_request` generations; numeric scores `gate_park_ms` (trace-level
 PLAN-gate park), `permission_wait_ms` (per blocked tool), and the per-phase
-cycle-step scores `step_cache_write_usd:<PHASE>` / `step_tokens_written:<PHASE>`
-(View B step nodes).
+cycle-step scores `step_cache_write_usd:<PHASE>` / `step_tokens_written:<PHASE>` /
+`step_total_cost_usd:<PHASE>` (View B step nodes). `step_total_cost_usd` is the
+true per-step cost — every generation's Langfuse `costDetails`, main-loop and
+sub-agent, windowed onto its step so the per-phase scores sum to the trace
+`totalCost` (pre-first-step spend lands in a `:pre` residual), whereas
+`step_cache_write_usd` is the cache-write slice only.
 
 > [!WARNING]
 > **Dashboard-breaking rename (#230):** the per-phase score formerly named
