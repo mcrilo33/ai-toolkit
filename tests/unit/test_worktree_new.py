@@ -159,7 +159,9 @@ def _run_new(
     # (issue edit / comment / label create) so a test can model an offline gh.
     gh.write_text(
         "#!/bin/sh\n"
-        'printf "%s\\n" "$*" >> "$GH_LOG"\n'
+        # Log each call on ONE line (a multi-line --body is flattened) so the log
+        # stays one-record-per-invocation.
+        '{ printf "%s" "$*" | tr "\\n" " "; printf "\\n"; } >> "$GH_LOG"\n'
         'case "$*" in\n'
         '  *"--json title"*) printf "%s\\n" "${GH_ISSUE_TITLE:-Some Issue Title}" ;;\n'
         '  *"--json body"*)  printf "%s\\n" "$GH_ISSUE_BODY" ;;\n'
