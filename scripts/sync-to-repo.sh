@@ -502,7 +502,7 @@ sync_workflow_scripts() {
     # hooks/lib/) so the worktree scripts can source them as siblings — see
     # worktree-lib.sh's telemetry and base-branch blocks.
     local name src
-    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh worktree-quick.sh spoke-push.sh spoke-ready.sh gate-sweep.sh telemetry-ingest-spoke.sh hub-status.sh hub-ready-watch.sh hub-notify.sh hub-otel-watch.sh hub-afk.sh gate-broker.sh batch-plan.sh telemetry.sh base-branch.sh enabled.sh; do
+    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh worktree-quick.sh spoke-push.sh spoke-ready.sh spoke-relaunch.sh gate-sweep.sh telemetry-ingest-spoke.sh hub-status.sh hub-ready-watch.sh hub-notify.sh hub-otel-watch.sh hub-afk.sh gate-broker.sh batch-plan.sh telemetry.sh base-branch.sh enabled.sh; do
         case "$name" in
             hub-status.sh|hub-ready-watch.sh|hub-notify.sh|hub-otel-watch.sh|hub-afk.sh|gate-broker.sh|batch-plan.sh) src="$SHARED_DIR/skills/hub/scripts/$name" ;;
             telemetry.sh|base-branch.sh|enabled.sh)      src="$SHARED_DIR/hooks/lib/$name" ;;

@@ -33,6 +33,9 @@ WORKTREE_SCRIPTS = (
     "worktree-lib.sh",
     "spoke-push.sh",
     "spoke-ready.sh",
+    # The dead-pane relaunch script (issue #233) ships alongside its spoke siblings so a
+    # crashed spoke can be relaunched with its identity + ledger + lifecycle span intact.
+    "spoke-relaunch.sh",
     "telemetry-ingest-spoke.sh",
     "worktree-quick.sh",
     # The land tail's conditional post-land sweep worker (issue #124) — must

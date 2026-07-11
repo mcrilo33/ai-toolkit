@@ -89,6 +89,36 @@ wt_now_ms() {
   command -v _telemetry_now_ms >/dev/null 2>&1 && _telemetry_now_ms || true
 }
 
+# Build the native-OTel launch env PREFIX (issue #83, reused by relaunch #233).
+# Emits the exact env prefix a spoke's `claude` launch carries so the run streams
+# one nested trace grouped by its spoke_run_id (carried in OTEL_RESOURCE_ATTRIBUTES).
+# Empty string when native OTel is opted out (AI_TOOLKIT_OTEL != 1) — the full
+# opt-out. The non-secret connection endpoints default to the local collector; an
+# operator override in the env is preserved (`:=`). The trailing space is
+# load-bearing: it separates this prefix from the WT_SPOKE pin the caller appends.
+# The AUTH header (OTEL_EXPORTER_OTLP_HEADERS) is deliberately NOT emitted — it stays
+# inherited env, off the command line (visible in ps/tmux). SINGLE SOURCE for both
+# worktree-new.sh (spawn) and spoke-relaunch.sh (relaunch), so the two never drift.
+# The body dir is created by the caller (it also passes it to the bridge preflight).
+# Usage: wt_native_otel_prefix <spoke_run_id> <body_dir>
+wt_native_otel_prefix() {
+  local spoke_run_id="$1" body_dir="$2"
+  [ "${AI_TOOLKIT_OTEL:-}" = "1" ] || return 0
+  # Default the non-secret endpoints when unset (operator override preserved); the
+  # normal gRPC :4317 / beta HTTP :4418 split is load-bearing — a beta endpoint on the
+  # normal host:port silently kills trace+log export. The span sink is OTLP-HTTP :4318.
+  : "${OTEL_EXPORTER_OTLP_ENDPOINT:=http://localhost:4317}"
+  : "${BETA_TRACING_ENDPOINT:=http://localhost:4418}"
+  : "${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:=${AI_TOOLKIT_OTEL_SPAN_ENDPOINT_DEFAULT:-http://localhost:4318}}"
+  printf 'CLAUDE_CODE_ENABLE_TELEMETRY=1 CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 OTEL_TRACES_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp ENABLE_BETA_TRACING_DETAILED=1 OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false OTEL_EXPORTER_OTLP_PROTOCOL=grpc OTEL_EXPORTER_OTLP_ENDPOINT=%s BETA_TRACING_ENDPOINT=%s AI_TOOLKIT_OTEL_SPAN_ENDPOINT=%s OTEL_LOG_USER_PROMPTS=1 OTEL_LOG_TOOL_DETAILS=1 OTEL_LOG_TOOL_CONTENT=1 OTEL_LOG_RAW_API_BODIES=%s AI_TOOLKIT_OTEL_BODY_DIR=%s OTEL_RESOURCE_ATTRIBUTES=%s ' \
+    "$(printf '%q' "$OTEL_EXPORTER_OTLP_ENDPOINT")" \
+    "$(printf '%q' "$BETA_TRACING_ENDPOINT")" \
+    "$(printf '%q' "$AI_TOOLKIT_OTEL_SPAN_ENDPOINT")" \
+    "$(printf '%q' "file:${body_dir}")" \
+    "$(printf '%q' "$body_dir")" \
+    "$(printf '%q' "spoke_run_id=${spoke_run_id}")"
+}
+
 # --- client-side telemetry config resolution (issue #228) -----------------------
 # wt_resolve_telemetry_config [config-path] -> read the NON-SECRET client-side
 # telemetry settings from settings/ai-toolkit.yml (via ai_toolkit_config.py's
