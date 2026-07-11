@@ -235,6 +235,7 @@ from telemetry.spoke_tree.rollups import (
 )
 from telemetry.spoke_tree.scores import (
     build_rule_carry_cost_scores,
+    build_rule_enforcement_scores,
     build_rule_invocation_scores,
     build_score_events,
     build_step_cost_scores,
@@ -902,6 +903,7 @@ class EnrichmentContext:
     step_scores: list[IngestEvent] = field(default_factory=list)
     carry_scores: list[IngestEvent] = field(default_factory=list)
     invocation_scores: list[IngestEvent] = field(default_factory=list)
+    enforcement_scores: list[IngestEvent] = field(default_factory=list)
 
 
 def _enrich_loaded_context(ctx: EnrichmentContext) -> None:
@@ -1001,6 +1003,13 @@ def _enrich_invocation_scores(ctx: EnrichmentContext) -> None:
     )
 
 
+def _enrich_enforcement_scores(ctx: EnrichmentContext) -> None:
+    """Emit per-rule ``rule_enforcement_fires:<rule>`` scores from the #232 hook-block events."""
+    ctx.enforcement_scores = build_rule_enforcement_scores(
+        ctx.spoke_run_id, ctx.batch, base_ts=ctx.base_ts
+    )
+
+
 # The enrichment passes, in the exact order main applies them. Adding a future enrichment is one
 # module + one line here; the passes mutate the batches / accumulate onto the shared context above
 # (a plain ordered list, deliberately not a self-registering registry — the cross-pass data flow
@@ -1014,6 +1023,7 @@ _ENRICHMENTS: tuple[tuple[str, Callable[[EnrichmentContext], None]], ...] = (
     ("step-scores", _enrich_step_scores),
     ("carry-cost", _enrich_carry_cost),
     ("invocation-scores", _enrich_invocation_scores),
+    ("enforcement-scores", _enrich_enforcement_scores),
 )
 
 
@@ -1093,7 +1103,8 @@ def main(argv: list[str] | None = None) -> int:
         + cycle_batch
         + ctx.step_scores
         + ctx.carry_scores
-        + ctx.invocation_scores,
+        + ctx.invocation_scores
+        + ctx.enforcement_scores,
         post,
     )
 
@@ -1112,6 +1123,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(ctx.carry_scores)} rule/tooldef carry-cost scores emitted "
         f"(n_requests={ctx.n_requests}), "
         f"{len(ctx.invocation_scores)} rule-invocation scores emitted, "
+        f"{len(ctx.enforcement_scores)} rule-enforcement-fire scores emitted, "
         f"{len(commits)} commit nodes synthesized, "
         f"tagged mode={mode} lane={lane}; "
         f"{len(cycle_batch) - 2} observations assembled under cycle trace {cycle_trace_id}"

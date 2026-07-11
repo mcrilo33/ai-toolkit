@@ -20,11 +20,13 @@ from telemetry.spoke_tree.commits import _gate_park_ms
 from telemetry.spoke_tree.cycle import _POST_STEP_KEY, _PRE_STEP_KEY
 from telemetry.spoke_tree.ids import _CYCLE_STEP_PREFIX, cycle_trace_id_for, trace_id_for
 from telemetry.spoke_tree.observations import (
+    _HOOK_EXECUTION_PREFIX,
     _POST_STEP_NAME,
     _PRE_STEP_NAME,
     _SUB_AGENT_PREFIX,
     IngestEvent,
     TraceObservations,
+    _attr,
     _llm_requests_in_order,
     _parse_utc,
 )
@@ -63,6 +65,19 @@ _STEP_PHASE_RE = re.compile(rf"\b({'|'.join(_STEP_PHASES)})\b")
 _CACHE_READ_RATIO = 0.08
 _RULE_CARRY_COST_SCORE = "rule_carry_cost_usd"  # per rule file in the loaded-context breakdown
 _RULE_INVOCATION_SCORE = "rule_invocations"  # per glob-scoped rule injected on a file-match (#232)
+_RULE_ENFORCEMENT_SCORE = "rule_enforcement_fires"  # per rule whose hook blocked a tool call (#232)
+# Per-script hook identity is blocked upstream (#110 AC3): Claude Code emits one
+# ``hook_execution_complete`` per (event x tool) with ``hook_name = "<event>:<tool>"``, not the
+# ``.sh`` script, so an enforcement fire (``num_blocking >= 1``) is attributed by the (event:tool)
+# SURFACE to the rule that solely guards it. Write/Edit is guarded only by the security rule's hooks
+# (secrets-scan + config-protection); Bash surfaces are guarded by several rules (block-no-verify /
+# push-scope-guard / git-push-review) and so are ambiguous — omitted here, they yield no score.
+_HOOK_SURFACE_RULE_MAP = {
+    "PreToolUse:Write": "security",
+    "PreToolUse:Edit": "security",
+    "PostToolUse:Write": "security",
+    "PostToolUse:Edit": "security",
+}
 _TOOLDEF_CARRY_COST_SCORE = "tooldef_carry_cost_usd"  # per tool / mcp schema
 # The loaded instruction files that carry cost every request. The request-body path itemizes the
 # auto-memory (MEMORY.md) under ``rules``; the disk fallback splits it into its own ``memory``
@@ -361,6 +376,59 @@ def build_rule_invocation_scores(
         _score_event(
             spoke_run_id,
             name=f"{_RULE_INVOCATION_SCORE}:{rule}",
+            value=count,
+            trace_id=trace_id,
+            base_ts=base_ts,
+        )
+        for rule, count in sorted(counts.items())
+    ]
+
+
+def _blocking_count(body: dict[str, Any]) -> int:
+    """Return a hook_execution_complete's ``num_blocking`` as an int, 0 when absent/unparseable."""
+    value = _attr(body, "num_blocking")
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
+def build_rule_enforcement_scores(
+    spoke_run_id: str, batch: list[IngestEvent], *, base_ts: str
+) -> list[IngestEvent]:
+    """Build per-rule ``rule_enforcement_fires:<rule>`` scores from hook blocks (#232).
+
+    An enforcement fire is a ``hook_execution_complete`` audit event with ``num_blocking >= 1`` (a
+    hook denied a tool call). Per-script hook identity is blocked upstream (#110 AC3) — the event
+    carries only ``hook_name = "<event>:<tool>"`` — so the fire is attributed by the (event:tool)
+    SURFACE to the rule that solely guards it (:data:`_HOOK_SURFACE_RULE_MAP`); a surface guarded by
+    several rules (Bash) has no unambiguous rule and is skipped (no score). The per-rule fire counts
+    are emitted as trace-level NUMERIC scores, so a dashboard sees which rules actually enforce.
+    Ids derive from the spoke run id (idempotent reruns).
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids).
+        batch: The assembled View A events (its ``hook_execution_complete`` nodes are read).
+        base_ts: ISO timestamp stamped on every score event.
+
+    Returns:
+        The ``score-create`` events, one per rule that enforced (empty when nothing blocked or
+        every block was on an unmapped surface).
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    counts: dict[str, int] = {}
+    for event in batch:
+        body = event["body"]
+        if not (body.get("name") or "").startswith(_HOOK_EXECUTION_PREFIX):
+            continue
+        blocking = _blocking_count(body)
+        rule = _HOOK_SURFACE_RULE_MAP.get(str(_attr(body, "hook_name") or ""))
+        if blocking and rule:
+            counts[rule] = counts.get(rule, 0) + blocking
+    return [
+        _score_event(
+            spoke_run_id,
+            name=f"{_RULE_ENFORCEMENT_SCORE}:{rule}",
             value=count,
             trace_id=trace_id,
             base_ts=base_ts,
