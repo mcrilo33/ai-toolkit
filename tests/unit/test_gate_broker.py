@@ -216,19 +216,19 @@ def waiting_spoke_env(tmp_path: Path, spoke_repo: Path) -> dict[str, str]:
     }
 
 
-def test_broker_service_gate_unattended_escalates_on_escalate(
+def test_broker_service_gate_unattended_warns_on_escalate(
     spoke_repo: Path, waiting_spoke_env: dict[str, str]
 ) -> None:
-    # The unattended adapter over the shared core: a human-decision (ESCALATE) parks
-    # the spoke as blocked/<issue> — the same fail-safe /afk has always had.
+    # #241: a human-decision (ESCALATE) reply no longer parks the spoke blocked/<issue> — the
+    # unattended adapter WARNS loudly and keeps the spoke serviced (retried on the backoff).
     env = {**waiting_spoke_env, "AFK_ANSWERER_CMD": "printf 'reasoning\\nESCALATE: needs a human'"}
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
 
     assert result.returncode == 0, result.stderr
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log
-    assert "needs a human" in log
+    log = Path(env["_READY_LOG"]).read_text() if Path(env["_READY_LOG"]).exists() else ""
+    assert "--blocked 5" not in log, "an ESCALATE reply must warn-and-continue, not park"
+    assert "WARNING: #5" in result.stderr, result.stderr
 
 
 def test_broker_service_gate_defaults_to_unattended(
@@ -241,7 +241,10 @@ def test_broker_service_gate_defaults_to_unattended(
     result = _call(f"broker_service_gate '{spoke_repo}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    assert "--blocked 5" in Path(env["_READY_LOG"]).read_text()
+    _rl = Path(env["_READY_LOG"])
+    assert not _rl.exists() or "--blocked 5" not in _rl.read_text()
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert "WARNING: #5" in result.stderr, result.stderr
 
 
 # ── the hardened injector submits (no stranded paste) ─────────────────────────
@@ -517,9 +520,12 @@ def test_broker_service_gate_escalates_wedge_despite_advanced_mtime(
     result = _call(expr, env=env)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 7" in log, result.stdout + result.stderr + log
-    assert "composer wedged" in log
+    _rl = Path(env["_READY_LOG"])
+    log = _rl.read_text() if _rl.exists() else ""
+    # #241: an unrecoverable wedge no longer parks blocked/<issue> — it warns-and-continues.
+    assert "--blocked 7" not in log, log
+    assert "WARNING: #7" in result.stderr, result.stderr
+    assert "composer wedged" in result.stderr
 
 
 def test_inject_and_verify_unobservable_pane_degrades_to_advance(
@@ -642,9 +648,11 @@ def test_broker_service_gate_escalates_when_fingerprint_unavailable(
     )
 
     assert result.returncode == 0, result.stderr
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log, f"unverifiable read-only must escalate: {log}"
-    assert "fingerprint" in log.lower(), log
+    _rl = Path(env["_READY_LOG"])
+    log = _rl.read_text() if _rl.exists() else ""
+    assert "--blocked 5" not in log, f"unverifiable read-only must warn-and-continue: {log}"
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert "fingerprint" in result.stderr.lower(), result.stderr
 
 
 def test_worktree_fingerprint_tracks_only_tracked_content(spoke_repo: Path) -> None:
@@ -700,9 +708,11 @@ def test_broker_service_gate_voids_answer_when_reasoner_creates_file(
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
 
     assert result.returncode == 0, result.stderr
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log, f"a reasoner file-creation must escalate, not inject: {log}"
-    assert "worktree" in log.lower() or "mutat" in log.lower(), log
+    _rl = Path(env["_READY_LOG"])
+    log = _rl.read_text() if _rl.exists() else ""
+    assert "--blocked 5" not in log, f"a voided file-creation must warn-and-continue: {log}"
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert "worktree" in result.stderr.lower() or "mutat" in result.stderr.lower(), result.stderr
 
 
 def test_reasoner_runs_in_isolated_copy_not_live_tree(spoke_repo: Path, tmp_path: Path) -> None:
@@ -757,9 +767,11 @@ def test_broker_service_gate_voids_answer_when_reasoner_mutates_tracked_content(
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
 
     assert result.returncode == 0, result.stderr
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log, f"a tracked mutation must escalate, not inject: {log}"
-    assert "worktree" in log.lower() or "mutat" in log.lower(), log
+    _rl = Path(env["_READY_LOG"])
+    log = _rl.read_text() if _rl.exists() else ""
+    assert "--blocked 5" not in log, f"a voided tracked mutation must warn-and-continue: {log}"
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert "worktree" in result.stderr.lower() or "mutat" in result.stderr.lower(), result.stderr
 
 
 def test_broker_service_gate_isolates_reasoner_writes_from_live_tree(
@@ -909,9 +921,11 @@ def test_broker_service_gate_voids_answer_when_reasoner_mutates_refs(
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
 
     assert result.returncode == 0, result.stderr
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log, f"a reasoner ref write must escalate, not inject: {log}"
-    assert "worktree" in log.lower() or "mutat" in log.lower(), log
+    _rl = Path(env["_READY_LOG"])
+    log = _rl.read_text() if _rl.exists() else ""
+    assert "--blocked 5" not in log, f"a voided ref write must warn-and-continue: {log}"
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert "worktree" in result.stderr.lower() or "mutat" in result.stderr.lower(), result.stderr
 
 
 def test_fingerprint_immune_to_sibling_ref_changes(linked_spoke_repo: Path) -> None:
@@ -1794,9 +1808,11 @@ def test_broker_service_gate_escalates_when_answerer_times_out(
     )
 
     assert result.returncode == 0, result.stderr
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log, f"a timed-out answerer must escalate: {log}"
-    assert "no decision" in log.lower(), log
+    _rl = Path(env["_READY_LOG"])
+    log = _rl.read_text() if _rl.exists() else ""
+    assert "--blocked 5" not in log, f"a timed-out answerer must warn-and-continue: {log}"
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert "no decision" in result.stderr.lower(), result.stderr
 
 
 def test_run_answerer_standalone_fallback_bounds_a_slow_answerer(
@@ -2745,19 +2761,20 @@ def test_reanswer_ceiling_resets_after_tip_advances(
     assert calls.read_text().count("x") == 2, "a tip advance must reset the ceiling"
 
 
-# ── issue #237: mutation-void is terminal on first occurrence + log-once ───────
+# ── issue #237 + #241 §5: mutation-void backs off (not terminal) + log-once ────
 
 
-def test_broker_service_gate_mutation_void_is_terminal_on_first_occurrence(
+def test_broker_service_gate_mutation_void_backs_off_not_terminal(
     spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
 ) -> None:
-    # A reasoner that mutates the live tree (here via an absolute-path write, modelling an
-    # isolation bypass) has its answer voided and the gate escalated. That verdict is
-    # TERMINAL on the FIRST occurrence: a human is required regardless of tip/prompt, and the
-    # reasoner must NOT re-run on later ticks. This is asserted WITHOUT depending on tip/sig
-    # stability — the ceiling is set high (5), so only the durable void marker can cap the
-    # reasoner at a single run across four ticks.
+    # A reasoner that mutates the live tree (here an absolute-path write, an isolation bypass)
+    # has its answer VOIDED. #241 §5: the void is no longer terminal-forever — it warns and
+    # backs off. Within the backoff window (pinned huge here) the durable void marker caps the
+    # reasoner at a single run across four fast ticks (the ceiling is 5, so only the void marker
+    # can cap it) — and it WARNS instead of parking blocked/<issue>.
     calls = tmp_path / "answerer.calls"
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
     (spoke_repo / "tracked.txt").write_text("original")
     subprocess.run(["git", "add", "tracked.txt"], cwd=spoke_repo, check=True, capture_output=True)
     env = {
@@ -2767,6 +2784,9 @@ def test_broker_service_gate_mutation_void_is_terminal_on_first_occurrence(
             "printf 'ANSWER: go ahead'"
         ),
         "AFK_REANSWER_CEILING": "5",
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_WARN_BACKOFF_BASE": "1000000",  # keep the 4 fast ticks inside one backoff window
+        "AFK_JOURNAL_GH_COMMENT": "0",
     }
 
     for _ in range(4):
@@ -2774,8 +2794,10 @@ def test_broker_service_gate_mutation_void_is_terminal_on_first_occurrence(
         assert result.returncode == 0, result.stderr
 
     n = calls.read_text().count("x") if calls.exists() else 0
-    assert n == 1, f"a mutation-void must run the reasoner once, then stay terminal; ran {n}"
-    assert "--blocked 5" in Path(env["_READY_LOG"]).read_text()
+    assert n == 1, f"a mutation-void must run the reasoner once, then back off; ran {n}"
+    _rl = Path(env["_READY_LOG"])
+    assert not _rl.exists() or "--blocked 5" not in _rl.read_text(), "void warns, never parks"
+    assert (statedir / "warned-5.txt").exists()
 
 
 def test_reanswer_ceiling_logs_terminal_once(

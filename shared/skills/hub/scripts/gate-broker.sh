@@ -2458,13 +2458,17 @@ broker_service_gate() {
     _consume_gate_tag "$wt" "$issue"
     return 0
   fi
-  # A prior tick found the reasoner mutated the live tree for this gate (#237): that verdict is
-  # terminal on FIRST occurrence — a human is required — and independent of tip/signature, which
-  # the mutation itself perturbs. Skip the reasoner entirely; the first-occurrence escalation
-  # already stamped blocked/<issue>. Silent here (it was logged once when first voided); a fresh
-  # arm clears the marker. Checked before the (tip, sig) ceiling on purpose: keying a void on
-  # that ceiling would let the mutation reset it every tick and re-run forever.
-  if _broker_gate_voided "$issue"; then return 0; fi
+  # A prior tick found the reasoner mutated the live tree for this gate (#237). The mutation
+  # perturbs the (tip, sig) ceiling every tick (a tree write flips the pending command), so a
+  # DURABLE void marker — not the ceiling — is what throttles the mutating reasoner. #241 §5: the
+  # void is no longer terminal-forever — it is BACKOFF-paced. Inside the warned-retry backoff:
+  # skip (parked LAST). Once the backoff elapses: clear the marker for ONE supervised retry (if
+  # the reasoner mutates again this tick it re-voids + re-arms a longer backoff). Checked before
+  # the ceiling on purpose. A fresh arm clears both the marker and the backoff.
+  if _broker_gate_voided "$issue"; then
+    _afk_warned_due "$issue" || return 0                             # inside the backoff → parked LAST
+    rm -f "$(_broker_voided_marker "$issue")" 2>/dev/null || true    # backoff elapsed → allow one retry
+  fi
   # Re-answer ceiling (#203 finding 1): a legitimately-escalated spoke parked on the SAME
   # prompt must not re-run the reasoner/classifier every tick forever. After the ceiling on
   # the SAME (tip, prompt-signature) the gate is terminal — it stays blocked/<issue> at the
@@ -2640,18 +2644,21 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
 
 decide_and_act() { broker_service_gate "$1" "$2" unattended; }
 
-# _broker_on_human_decision <mode> <wt> <issue> <reason> -> route a decision that is the
-# human's to make (the ONE mode-divergent seam of the shared core). Unattended (/afk):
-# escalate to blocked/<issue> so the returning operator resolves it. Attended: present a
-# structured QCM on a dedicated per-gate surface (subtask C, #155); until that adapter is
-# defined it also escalates, so a parked spoke is never left hanging.
+# _broker_on_human_decision <mode> <wt> <issue> <reason> -> route a decision that the answerer
+# could not resolve into an injectable answer (a voided/mutated read-only tree, an unverifiable
+# fingerprint, an ESCALATE/no-decision reasoner reply, an inject failure). The ONE mode-divergent
+# seam of the shared core. Attended: present a structured QCM on a dedicated per-gate surface
+# (#155). Unattended (/afk): #241 no longer parks blocked/<issue> — it WARNS loudly, journals the
+# taken decision, and keeps the spoke serviced (retried on the warned-retry backoff). The reason
+# IS the decision text; these are reversible (the answer is voided/undelivered, the spoke's work
+# is intact and re-serviceable).
 _broker_on_human_decision() {
   local mode="$1" wt="$2" issue="$3" reason="$4"
   if [ "$mode" = attended ] && command -v _broker_present_qcm >/dev/null 2>&1; then
     _broker_present_qcm "$wt" "$issue" "$reason"
     return
   fi
-  _escalate_blocked "$wt" "$issue" "$reason"
+  broker_warn_continue "$wt" "$issue" answer "$reason" reversible
 }
 
 # --- durable local block record (issue #109, AC2) -----------------------------

@@ -1426,10 +1426,16 @@ def test_decide_and_act_wedge_respawn_failure_escalates(tmp_path: Path) -> None:
     result = _call(f"decide_and_act '{spoke}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    log = ready_log.read_text()
-    assert "--blocked 5" in log
-    assert "respawn" in log, f"the reason must name the failed wedge respawn, got: {log}"
-    assert "use Redis" in log, f"the reason must carry the undelivered answer's head, got: {log}"
+    log = ready_log.read_text() if ready_log.exists() else ""
+    # #241: a failed wedge respawn warns-and-continues instead of parking blocked/<issue>.
+    assert "--blocked 5" not in log, log
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert "respawn" in result.stderr, (
+        f"the warning must name the failed wedge respawn: {result.stderr}"
+    )
+    assert "use Redis" in result.stderr, (
+        f"the warning must carry the undelivered answer's head: {result.stderr}"
+    )
 
 
 def test_decide_and_act_wedge_respawn_unverified_escalates(tmp_path: Path) -> None:
@@ -1451,8 +1457,10 @@ def test_decide_and_act_wedge_respawn_unverified_escalates(tmp_path: Path) -> No
 
     assert result.returncode == 0, result.stderr
     assert "new-window" in tmux_log.read_text(), "the respawn was attempted"
-    log = ready_log.read_text()
-    assert "--blocked 5" in log, "an unconfirmed respawn must escalate, not report success"
+    log = ready_log.read_text() if ready_log.exists() else ""
+    # #241: an unconfirmed respawn warns-and-continues (never reports success), not blocked.
+    assert "--blocked 5" not in log, log
+    assert "WARNING: #5" in result.stderr, result.stderr
 
 
 # ── answerer discipline: seed-replay suppression, gate routing, parked re-check
@@ -1541,9 +1549,11 @@ def test_decide_and_act_suppresses_seed_replay_answer(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     tmux_calls = tmux_log.read_text() if tmux_log.exists() else ""
     assert " -l " not in f" {tmux_calls} ", "a seed replay must never be pasted"
-    log = ready_log.read_text()
-    assert "--blocked 5" in log
-    assert "seed" in log, f"the reason must name the seed replay, got: {log}"
+    log = ready_log.read_text() if ready_log.exists() else ""
+    # #241: a suppressed seed replay warns-and-continues instead of parking blocked/<issue>.
+    assert "--blocked 5" not in log, log
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert "seed" in result.stderr, f"the warning must name the seed replay: {result.stderr}"
 
 
 def test_decide_and_act_gate_park_routes_plan_to_answerer(tmp_path: Path) -> None:
@@ -1774,39 +1784,40 @@ def stub_env(tmp_path: Path, spoke_repo: Path) -> dict[str, str]:
     }
 
 
-def test_decide_and_act_escalates_to_blocked(spoke_repo: Path, stub_env: dict[str, str]) -> None:
+def test_decide_and_act_warns_on_escalate(spoke_repo: Path, stub_env: dict[str, str]) -> None:
+    # #241: an ESCALATE reply warns-and-continues instead of parking blocked/<issue>.
     env = {**stub_env, "AFK_ANSWERER_CMD": "printf 'reasoning\\nESCALATE: needs a human'"}
 
     result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log
-    assert "needs a human" in log
+    _rl = Path(env["_READY_LOG"])
+    assert not _rl.exists() or "--blocked 5" not in _rl.read_text()
+    assert "WARNING: #5" in result.stderr and "needs a human" in result.stderr, result.stderr
 
 
-def test_decide_and_act_no_decision_escalates(spoke_repo: Path, stub_env: dict[str, str]) -> None:
+def test_decide_and_act_no_decision_warns(spoke_repo: Path, stub_env: dict[str, str]) -> None:
     env = {**stub_env, "AFK_ANSWERER_CMD": "printf 'I never concluded.'"}
 
-    _call(f"decide_and_act '{spoke_repo}' 5", env=env)
+    result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log
-    assert "no decision" in log
+    _rl = Path(env["_READY_LOG"])
+    assert not _rl.exists() or "--blocked 5" not in _rl.read_text()
+    assert "WARNING: #5" in result.stderr and "no decision" in result.stderr, result.stderr
 
 
-def test_decide_and_act_answer_without_pane_escalates(
+def test_decide_and_act_answer_without_pane_warns(
     spoke_repo: Path, stub_env: dict[str, str]
 ) -> None:
     # The answerer decides, but no tmux pane maps to this throwaway path, so injection
-    # fails and the supervisor fails safe to escalation rather than dropping the answer.
+    # fails — #241 warns-and-continues rather than dropping or parking the answer.
     env = {**stub_env, "AFK_ANSWERER_CMD": "printf 'ANSWER: do the thing'"}
 
-    _call(f"decide_and_act '{spoke_repo}' 5", env=env)
+    result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log
-    assert "pane" in log
+    _rl = Path(env["_READY_LOG"])
+    assert not _rl.exists() or "--blocked 5" not in _rl.read_text()
+    assert "WARNING: #5" in result.stderr and "pane" in result.stderr, result.stderr
 
 
 def test_decide_and_act_injects_and_emits_success_span(spoke_repo: Path, tmp_path: Path) -> None:
@@ -1911,12 +1922,12 @@ def test_decide_and_act_consumes_gate_tag_on_inject(spoke_repo: Path, tmp_path: 
     assert tag.returncode != 0, "the gate/5 tag must be consumed after a successful inject"
 
 
-def test_decide_and_act_escalates_when_answer_does_not_register(
+def test_decide_and_act_warns_when_answer_does_not_register(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
     # The answerer decides and a pane maps, but the inject never registers (the transcript
-    # does not advance). The supervisor must re-inject and then escalate — never leave the
-    # spoke silently parked (issue #74, defect 2).
+    # does not advance). The supervisor must re-inject and then #241 warn-and-continue —
+    # never leave the spoke silently parked, never park blocked/<issue>.
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke_repo)
     _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
@@ -1948,9 +1959,9 @@ def test_decide_and_act_escalates_when_answer_does_not_register(
     result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    log = ready_log.read_text()
-    assert "--blocked 5" in log
-    assert "register" in log
+    log = ready_log.read_text() if ready_log.exists() else ""
+    assert "--blocked 5" not in log, log
+    assert "WARNING: #5" in result.stderr and "register" in result.stderr, result.stderr
 
 
 def test_build_answerer_prompt_includes_rule_and_question(
@@ -2082,9 +2093,12 @@ def test_decide_and_act_healthy_answer_mentioning_auth_is_not_a_failure(
     result = _call(f"decide_and_act '{spoke_repo}' 5; echo \"FLAG=$_AFK_AUTH_FAILED\"", env=env)
 
     assert "FLAG=0" in result.stdout
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "could not refresh" not in log
-    assert "human" in log  # the ordinary ESCALATE reason
+    _rl = Path(env["_READY_LOG"])
+    # A healthy ESCALATE is NOT an auth halt: no auth-block, no auth flag. #241: it warns
+    # (the ordinary human-call reason) and continues, never parking blocked/<issue>.
+    assert not _rl.exists() or "could not refresh" not in _rl.read_text()
+    assert "could not refresh" not in result.stderr
+    assert "human" in result.stderr, result.stderr
 
 
 # ── the --remote launcher (issue #73) ─────────────────────────────────────────
