@@ -79,7 +79,7 @@ batch:
   # hits before CPU/RAM. Capped at 3 to stretch the weekly budget across more of
   # the backlog; raise toward 6 when budget is ample. #188/#203 (the failure
   # modes that widen with the batch) have landed, so 6 is safe hardware-wise.
-  concurrency_cap: 3
+  concurrency_cap: 6
   # Seconds to wait between consecutive spawns in one batch, so first-push full
   # suites don't all hit at once. Empty ⇒ 45; 0 disables the stagger.
   stagger_seconds:
