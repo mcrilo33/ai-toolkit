@@ -3088,3 +3088,117 @@ def test_classify_permission_read_of_secret_with_trailing_slash_escalates(
     (spoke_repo / "deploy.pem").write_text("KEY\n")
 
     assert _classify_with_wt(f"Read {spoke_repo}/deploy.pem/", spoke_repo, tasks) == "ESCALATE"
+
+
+# ── issue #241: decision journal + warn-and-continue foundation ────────────────
+# The /afk answerer now ALWAYS answers: every former terminal stop site takes the best
+# action, WARNS loudly, journals the decision, and parks the spoke LAST on an exponential
+# backoff instead of abandoning it. These pin the shared primitives every converted site
+# builds on: the decision journal, the loud warn record, the warn-continue seam (which must
+# NOT emit a blocked marker), and the backoff that gates re-service.
+
+
+def test_broker_journal_decision_appends_structured_line(tmp_path: Path) -> None:
+    import json as _json
+
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_NOW": "1700000000",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    r = _call(
+        "broker_journal_decision 41 permission 'denied force-push; use a new branch' irreversible",
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+
+    line = (statedir / "decision-journal.jsonl").read_text().strip()
+    rec = _json.loads(line)
+    assert rec["issue"] == "41"
+    assert rec["park"] == "permission"
+    assert rec["reversibility"] == "irreversible"
+    assert "force-push" in rec["decision"]
+
+
+def test_broker_journal_decision_posts_issue_comment(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    gh_log = tmp_path / "gh.log"
+    gh = bindir / "gh"
+    gh.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "' + str(gh_log) + '"\n')
+    gh.chmod(0o755)
+    env = {
+        "AFK_STATE_DIR": str(statedir),
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+    }
+
+    r = _call("broker_journal_decision 41 gate 'approved the plan' reversible", env=env)
+    assert r.returncode == 0, r.stderr
+    # The journal posts a per-decision issue comment (the morning post-review surface, #241 §10).
+    assert gh_log.exists(), "no gh call recorded"
+    assert "issue comment 41" in gh_log.read_text()
+
+
+def test_broker_warn_writes_record_and_logs_warning(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1700000000"}
+
+    r = _call("broker_warn 41 'took the reversible alternative'", env=env)
+    assert r.returncode == 0, r.stderr
+
+    assert "WARNING" in r.stderr and "#41" in r.stderr
+    rec = (statedir / "warned-41.txt").read_text().strip()
+    assert rec.split("\t")[0] == "1700000000"
+    assert "reversible alternative" in rec
+
+
+def test_broker_warn_continue_does_not_block(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_JOURNAL_GH_COMMENT": "0"}
+
+    r = _call(
+        f"broker_warn_continue '{spoke_repo}' 41 permission 'denied; use reversible path' irreversible",
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+
+    # Warn-and-continue NEVER escalates: a warned record exists, a journal line exists,
+    # but NO durable blocked record is written (the difference from _escalate_blocked).
+    assert (statedir / "warned-41.txt").exists()
+    assert (statedir / "decision-journal.jsonl").exists()
+    assert not (statedir / "blocked-41.txt").exists(), "warn-continue must not block the spoke"
+
+
+def test_warned_backoff_gates_retry_and_grows(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_WARN_BACKOFF_BASE": "60",
+        "AFK_WARN_BACKOFF_CAP": "1800",
+    }
+
+    r = _call(
+        "( export AFK_NOW=1000; _afk_warned_arm 41 ); "
+        "_afk_warned_due 41 1000 && echo A-DUE || echo A-WAIT; "
+        "_afk_warned_due 41 1060 && echo B-DUE || echo B-WAIT; "
+        "( export AFK_NOW=1060; _afk_warned_arm 41 ); "
+        "_afk_warned_due 41 1100 && echo C-DUE || echo C-WAIT; "
+        "_afk_warned_due 41 1180 && echo D-DUE || echo D-WAIT",
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert "A-WAIT" in out, out  # within the base 60s backoff → parked LAST
+    assert "B-DUE" in out, out  # 60s elapsed → due for re-service
+    assert "C-WAIT" in out, out  # second warn doubled the backoff to 120s; only 40s elapsed
+    assert "D-DUE" in out, out  # 120s elapsed → due again
