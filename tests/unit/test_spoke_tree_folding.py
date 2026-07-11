@@ -135,6 +135,15 @@ class TestLevels:
     def test_failed_tool_is_error(self) -> None:
         assert _level_for({"name": "tool:Bash", "metadata": {"success": False}}) == "ERROR"
 
+    def test_failed_skill_is_error(self) -> None:
+        # #234: a relabeled skill:<name> carries the same folded success/error as a tool, so a
+        # failed skill must earn ERROR even though its name no longer starts with tool:.
+        assert _level_for({"name": "skill:code-review", "metadata": {"success": False}}) == "ERROR"
+        assert _level_for({"name": "skill:code-review", "metadata": {"error": "boom"}}) == "ERROR"
+
+    def test_clean_skill_has_no_level(self) -> None:
+        assert _level_for({"name": "skill:code-review", "metadata": {"success": True}}) is None
+
     def test_blocked_tool_is_warning(self) -> None:
         assert _level_for({"name": "blocked-tool:Bash"}) == "WARNING"
 

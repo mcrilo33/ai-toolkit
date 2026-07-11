@@ -119,6 +119,32 @@ class TestApplyContainerRollups:
         assert rollup["duration"]["total_ms"] == 10000
         assert rollup["duration"]["components"]["llm_request"] == 2000
 
+    def test_mcp_call_blocked_on_user_carves_into_wait(self) -> None:
+        # #234 regression: an MCP call is now ``mcp``-classed, not ``tool`` — its folded
+        # blocked_on_user_ms (permission wait) must still carve into the ``wait`` bucket, not stay
+        # in ``mcp``. A 10s call with a 4s permission block splits 4s wait / 6s mcp.
+        events = [
+            _span(
+                "root",
+                parent=None,
+                start="2026-01-02T00:00:00Z",
+                end="2026-01-02T00:00:10Z",
+                name="spoke:x",
+            ),
+            _span(
+                "m1",
+                parent="root",
+                start="2026-01-02T00:00:00Z",
+                end="2026-01-02T00:00:10Z",
+                name="tool:mcp__chrome__navigate",
+                metadata={"blocked_on_user_ms": 4000},
+            ),
+        ]
+        _apply_container_rollups(events)
+        components = events[0]["body"]["metadata"]["rollup"]["duration"]["components"]
+        assert components["wait"] == 4000
+        assert components["mcp"] == 6000
+
     def test_leaf_gets_no_rollup(self) -> None:
         events = [
             _span(

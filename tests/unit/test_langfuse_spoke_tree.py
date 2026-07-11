@@ -6495,3 +6495,15 @@ class TestMcpGrouping:
         assert _by_orig(batch, "tr", "t1")["body"]["parentObservationId"] == group_id
         assert _by_orig(batch, "tr", "t2")["body"]["parentObservationId"] == group_id
         assert groups[0]["body"]["metadata"]["calls"] == 2
+
+    def test_mcp_group_survives_in_cycle_view_with_tools_riding_it(self) -> None:
+        # View B: the mcp group lands on the cycle axis and its member tools keep riding it (their
+        # cycle-namespace parent is the group), not scattered flat under the cycle root.
+        cycle = build_cycle_batch(self._traces(), SPOKE)
+
+        groups = [e for e in cycle if (e["body"].get("name") or "") == "mcp:chrome"]
+        assert len(groups) == 1
+        group_id = groups[0]["body"]["id"]
+        tools = [e for e in cycle if (e["body"].get("name") or "").startswith("tool:mcp__chrome__")]
+        assert len(tools) == 2
+        assert {t["body"]["parentObservationId"] for t in tools} == {group_id}

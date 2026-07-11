@@ -217,10 +217,14 @@ def _duration_rollup(
         covered = min(_interval_ms(own), union + guard_cover)
         exclusive = max(0, _interval_ms(own) - covered)
         bucket = "self" if node_id == root_id else class_of.get(node_id, "other")
-        if bucket == "tool":
+        # A folded ``blocked_on_user_ms`` (permission-prompt wait) is carved into ``wait`` for any
+        # call node that carries one — ``tool``, ``mcp`` (MCP calls frequently require approval), or
+        # ``skill`` (#234). Keying on the bucket set rather than only ``tool`` keeps the wait carve
+        # honest after #234 reclassified MCP/skill spans out of the ``tool`` class.
+        if bucket in ("tool", "mcp", "skill"):
             wait = min(exclusive, _blocked_ms(by_id[node_id]))
             components["wait"] += wait
-            components["tool"] += exclusive - wait
+            components[bucket] += exclusive - wait
         elif _is_guards_group(by_id.get(node_id)):
             # The group books its RAW guard time minus the slice its surviving children already
             # book, so root's ``hook`` bucket is real guard cost and dropping no-op guards leaves

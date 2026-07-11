@@ -31,6 +31,7 @@ from telemetry.spoke_tree.observations import (
     _is_hook,
     _is_hook_event,
     _is_mcp_tool_span,
+    _is_skill_span,
     _is_tool_span,
     _mcp_server,
     _obs_envelope,
@@ -440,13 +441,16 @@ def _guard_warns(body: Observation) -> bool:
 def _level_for(body: Observation) -> str | None:
     """Return the failure level (:data:`_LEVEL_ERROR` / :data:`_LEVEL_WARNING`) for a node, or None.
 
-    ERROR for a tool whose folded metadata shows ``success is False`` or an ``error``; WARNING for a
-    failure-worthy guard span (:func:`_guard_warns`), a synthesized blocked-tool node, or a
-    ``hook_execution_complete`` with ``num_blocking > 0``. Each node matches at most one rule, so
-    the ERROR > WARNING precedence needs no explicit tie-break. The guards GROUP's level is set at
-    build time (:func:`_apply_guard_groups`) from its raw members, not here.
+    ERROR for a tool OR a relabeled ``skill:<name>`` span (#234) whose folded metadata shows
+    ``success is False`` or an ``error`` — the #100 fold keys on ``tool_use_id`` and stamps the same
+    ``success``/``error`` onto a skill copy, so a failed skill must earn ERROR too (an MCP tool keeps
+    its ``tool:`` name, so it is already covered). WARNING for a failure-worthy guard span
+    (:func:`_guard_warns`), a synthesized blocked-tool node, or a ``hook_execution_complete`` with
+    ``num_blocking > 0``. Each node matches at most one rule, so the ERROR > WARNING precedence needs
+    no explicit tie-break. The guards GROUP's level is set at build time
+    (:func:`_apply_guard_groups`) from its raw members, not here.
     """
-    if _is_tool_span(body):
+    if _is_tool_span(body) or _is_skill_span(body):
         metadata = body.get("metadata") or {}
         if metadata.get("success") is False or metadata.get("error"):
             return _LEVEL_ERROR
