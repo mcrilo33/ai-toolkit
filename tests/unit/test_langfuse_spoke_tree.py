@@ -40,13 +40,14 @@ from telemetry.langfuse_spoke_tree import (
     build_rule_carry_cost_scores,
     build_score_events,
     build_step_cost_scores,
-    build_tooldef_carry_cost_scores,
     build_step_duration_scores,
     build_step_total_cost_scores,
+    build_tooldef_carry_cost_scores,
     cycle_copy_id_for,
     cycle_root_id_for,
     cycle_trace_id_for,
     fetch_session,
+    main_loop_request_count,
     prefix_total,
     purge_own_views,
     read_mode_lane,
@@ -1312,6 +1313,15 @@ class TestCarryCostScores:
 
         assert scores == []
 
+    def test_disk_fallback_memory_category_is_scored(self) -> None:
+        # The disk fallback splits the auto-memory into its own 'memory' category; MEMORY.md must
+        # still get a carry-cost score, mirroring the request-body path where it lands under 'rules'.
+        rows = [{"category": "memory", "name": "MEMORY.md", "tokens": 4350}]
+
+        scores = self._rule_scores(rows)
+
+        assert {s["body"]["name"] for s in scores} == {"rule_carry_cost_usd:MEMORY.md"}
+
     def test_duplicate_rule_names_are_summed(self) -> None:
         rows = [
             {"category": "rules", "name": "CLAUDE.md", "tokens": 100},
@@ -1366,6 +1376,28 @@ class TestCarryCostScores:
         other = [s for s in scores if s["body"]["name"] == "tooldef_carry_cost_usd:other"]
         assert len(other) == 1
         assert other[0]["body"]["value"] == pytest.approx(200 * (0.001 * 0.08 + 0.001))
+
+    def test_main_loop_request_count_excludes_sub_agent_calls(self) -> None:
+        # A rule/tool sits in the MAIN loop's prefix only; sub-agent:llm calls run their own prefix
+        # and must not inflate the read multiplier.
+        main = _obs(
+            "mg",
+            "claude_code.llm_request",
+            type_="GENERATION",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            usageDetails={"cache_read_input_tokens": 1},
+        )
+        sub_agent = _obs(
+            "sag",
+            "sub-agent:llm",
+            type_="GENERATION",
+            parent=None,
+            startTime="2026-01-02T00:00:05Z",
+            usageDetails={"cache_read_input_tokens": 1},
+        )
+
+        assert main_loop_request_count([("tr", [main, sub_agent])]) == 1
 
 
 class TestContainerRollups:

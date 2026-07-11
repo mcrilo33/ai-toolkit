@@ -22,8 +22,10 @@ from telemetry.spoke_tree.ids import _CYCLE_STEP_PREFIX, cycle_trace_id_for, tra
 from telemetry.spoke_tree.observations import (
     _POST_STEP_NAME,
     _PRE_STEP_NAME,
+    _SUB_AGENT_PREFIX,
     IngestEvent,
     TraceObservations,
+    _llm_requests_in_order,
     _parse_utc,
 )
 
@@ -61,6 +63,13 @@ _STEP_PHASE_RE = re.compile(rf"\b({'|'.join(_STEP_PHASES)})\b")
 _CACHE_READ_RATIO = 0.08
 _RULE_CARRY_COST_SCORE = "rule_carry_cost_usd"  # per rule file in the loaded-context breakdown
 _TOOLDEF_CARRY_COST_SCORE = "tooldef_carry_cost_usd"  # per tool / mcp schema
+# The loaded instruction files that carry cost every request. The request-body path itemizes the
+# auto-memory (MEMORY.md) under ``rules``; the disk fallback splits it into its own ``memory``
+# category (_DISK_CATEGORY_ORDER), so both are read to keep the two paths consistent.
+_RULE_CARRY_CATEGORIES = ("rules", "memory")
+# Tool schemas are only itemized on the request-body loaded-context path; the disk fallback has no
+# tools/mcp rows, so tooldef carry cost is naturally empty for a disk-sourced spoke.
+_TOOLDEF_CARRY_CATEGORIES = ("tools", "mcp")
 # Tool names (built-in + MCP + deferred) run to 100+, but a score NAME is a metrics dimension, so
 # only the top-N most expensive tool defs get their own score; the cheaper tail folds into a single
 # ``:other`` bucket (a visible, non-silent cap). Rule names are a small closed set and stay uncapped.
@@ -173,12 +182,29 @@ def build_score_events(
     return events
 
 
+def main_loop_request_count(traces: list[TraceObservations]) -> int:
+    """Count the MAIN-LOOP llm_requests over a spoke — the read multiplier for carry cost (#232).
+
+    A rule / tool schema is loaded into the MAIN loop's cached prefix only; a ``sub-agent:llm``
+    call runs its own prefix (different system prompt + tools) and does NOT carry the spoke's rules,
+    so it must be excluded or every carry-cost score inflates by the sub-agent request count. The
+    sub-agent generations are the ones whose name carries the :data:`_SUB_AGENT_PREFIX`.
+    """
+    return sum(
+        1
+        for _orig_trace_id, observation in _llm_requests_in_order(traces)
+        if not (observation.get("name") or "").startswith(_SUB_AGENT_PREFIX)
+    )
+
+
 def _carry_cost_usd(tokens: int, n_requests: int, price: float) -> float:
     """Return the USD a loaded item of ``tokens`` costs across ``n_requests`` (#232).
 
-    The item sits in the cached prefix: cache-WRITTEN once (``tokens x price``, the cache-creation
-    price the module carries) and cache-READ on every request (``tokens x n_requests x`` the cheaper
-    read price). Carry cost is dominated by the read term; the one-time write share is added once.
+    The item sits in the cached prefix: cache-WRITTEN once to seed it (``tokens x price``, the
+    cache-creation price the module carries) and cache-READ on each request (``tokens x n_requests
+    x`` the cheaper read price — a warm-started spoke reads the prefix on its first request too, so
+    the read term is charged for the full count rather than n-1). Carry cost is dominated by the
+    read term; the one-time write share is added once.
     """
     return tokens * (n_requests * price * _CACHE_READ_RATIO + price)
 
@@ -208,17 +234,20 @@ def build_rule_carry_cost_scores(
 ) -> list[IngestEvent]:
     """Build per-rule ``rule_carry_cost_usd:<rule>`` scores from the loaded-context rows (#232).
 
-    Every rule file the loaded-context breakdown itemizes (``operational-gotchas.md``, ``MEMORY.md``,
+    Every loaded instruction file the breakdown itemizes (``operational-gotchas.md``, ``MEMORY.md``,
     a glob-scoped rule that got injected, …) costs tokens on EVERY request whether or not it is ever
-    invoked. Each rule's carry cost (:func:`_carry_cost_usd`) is emitted as a trace-level NUMERIC
-    score named by the rule; paired with ``rule_invocations:<rule>`` (same suffix) a dashboard can
-    rank rules by carry cost filtered to zero invocations. Rule names are a small closed set, so —
-    unlike tool defs — they are uncapped. Ids derive from the spoke run id (idempotent reruns).
+    invoked. Each one's carry cost (:func:`_carry_cost_usd`) is emitted as a trace-level NUMERIC
+    score named by the file; the companion ``rule_invocations:<rule>`` score (emitted by the #232
+    invocation pass, same suffix) lets a dashboard rank rules by carry cost filtered to zero
+    invocations. Both on-disk instruction categories are read (:data:`_RULE_CARRY_CATEGORIES`) so
+    the auto-memory (``rules`` on the request-body path, ``memory`` on the disk fallback) is not
+    dropped on either source. Rule names are a small closed set, so — unlike tool defs — they are
+    uncapped. Ids derive from the spoke run id (idempotent reruns).
 
     Args:
         spoke_run_id: The spoke run identifier (keys the deterministic score ids).
         rows: The loaded-context measured rows (``category`` / ``name`` / ``tokens`` read).
-        n_requests: The count of real LLM requests over the spoke (the read multiplier).
+        n_requests: The count of main-loop LLM requests over the spoke (the read multiplier).
         base_ts: ISO timestamp stamped on every score event.
         price: Cache-creation (write) price in USD per token.
 
@@ -234,7 +263,7 @@ def build_rule_carry_cost_scores(
             trace_id=trace_id,
             base_ts=base_ts,
         )
-        for rule, tokens in sorted(_tokens_by_name(rows, ("rules",)).items())
+        for rule, tokens in sorted(_tokens_by_name(rows, _RULE_CARRY_CATEGORIES).items())
     ]
 
 
@@ -252,13 +281,15 @@ def build_tooldef_carry_cost_scores(
     carries the same cost model as a rule (:func:`_carry_cost_usd`). Tool names (built-in + MCP +
     deferred) run to 100+, so only the :data:`_TOOLDEF_SCORE_TOP_N` most expensive get their own
     score; the cheaper tail folds into one ``tooldef_carry_cost_usd:other`` bucket (a visible cap,
-    not a silent drop). Ties break by name so the cut is byte-stable across reruns. Trace-level
-    NUMERIC scores; ids derive from the spoke run id.
+    not a silent drop). Ties break by name so the cut is byte-stable across reruns. Only the
+    request-body loaded-context path itemizes tools, so a disk-sourced spoke (no captured request
+    body) yields no tooldef scores at all. Trace-level NUMERIC scores; ids derive from the spoke
+    run id.
 
     Args:
         spoke_run_id: The spoke run identifier (keys the deterministic score ids).
         rows: The loaded-context measured rows (``tools`` and ``mcp`` categories read).
-        n_requests: The count of real LLM requests over the spoke (the read multiplier).
+        n_requests: The count of main-loop LLM requests over the spoke (the read multiplier).
         base_ts: ISO timestamp stamped on every score event.
         price: Cache-creation (write) price in USD per token.
 
@@ -267,7 +298,10 @@ def build_tooldef_carry_cost_scores(
         (empty when no tool rows are present).
     """
     trace_id = trace_id_for(spoke_run_id)
-    by_tokens = _tokens_by_name(rows, ("tools", "mcp"))
+    # A real tool literally named "other" is assumed not to exist (Claude Code tool names are
+    # PascalCase / mcp__server__tool); if one ever did and landed in the top-N it would collide with
+    # the fold bucket's score name — revisit the bucket key then.
+    by_tokens = _tokens_by_name(rows, _TOOLDEF_CARRY_CATEGORIES)
     ranked = sorted(by_tokens.items(), key=lambda item: (-item[1], item[0]))
     events: list[IngestEvent] = [
         _score_event(

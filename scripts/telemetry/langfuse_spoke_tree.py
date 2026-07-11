@@ -224,7 +224,6 @@ from telemetry.spoke_tree.observations import (
     _earliest_start,
     _is_cycle_step_marker,
     _latest_time,
-    _llm_requests_in_order,
 )
 from telemetry.spoke_tree.rollups import (
     _apply_container_rollups,
@@ -237,6 +236,7 @@ from telemetry.spoke_tree.scores import (
     build_step_duration_scores,
     build_step_total_cost_scores,
     build_tooldef_carry_cost_scores,
+    main_loop_request_count,
 )
 from telemetry.spoke_tree.steps import (
     _apply_step_grouping,
@@ -1060,7 +1060,7 @@ def main(argv: list[str] | None = None) -> int:
         price=args.price,
         base_ts=base_ts,
         root=args.root.resolve(),
-        n_requests=len(_llm_requests_in_order(traces)),
+        n_requests=main_loop_request_count(traces),
     )
     for _name, enrich in _ENRICHMENTS:
         enrich(ctx)
