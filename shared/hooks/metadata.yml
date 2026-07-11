@@ -370,3 +370,20 @@ cycle-step-mark:
   claude:
     event: postToolUse
     matcher: "Bash|Write"
+
+# ledger-schema-guard (issue #235): enforce the todo-ledger entry schema so
+# scripted cycle steps and ad-hoc todos stay aggregable. Every TaskCreate /
+# subject-changing TaskUpdate subject must read `<subtask-id> · <STEP|type> —
+# <label>` (STEP from ANCHOR/RED/GREEN/REVIEW/PUSH; an ad-hoc entry carries a type
+# from investigate|fix|test|docs|chore|recover); a non-conforming write is DENIED
+# with the expected format (same UX as commit-gauntlet). Spoke-only (WT_SPOKE), so
+# the hub / quick lanes are never blocked. Claude-only + a Claude-tool matcher:
+# TaskCreate/TaskUpdate are Claude Code ledger tools with no Cursor/Copilot analog,
+# so — like cycle-step-mark and afk-notify-wake — the event lives in the claude
+# block and Copilot/Cursor stay unwired (empty canonical event).
+ledger-schema-guard:
+  description: "Enforce the todo-ledger entry schema (<subtask-id> · <STEP|type> — <label>) on TaskCreate/TaskUpdate; deny non-conforming/merged/free-form entries with the expected format (spoke-only)"
+  tier: 1
+  claude:
+    event: preToolUse
+    matcher: "TaskCreate|TaskUpdate"

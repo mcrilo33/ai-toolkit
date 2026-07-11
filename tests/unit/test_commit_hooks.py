@@ -40,6 +40,7 @@ GIT_PUSH_REVIEW = HOOKS_DIR / "git-push-review.sh"
 DELEGATION = HOOKS_DIR / "delegation-gate-warn.sh"
 HUB_GUARD = HOOKS_DIR / "hub-guard.sh"
 TODO_LEDGER = HOOKS_DIR / "todo-ledger-warn.sh"
+LEDGER_GUARD = HOOKS_DIR / "ledger-schema-guard.sh"
 UTILS = HOOKS_DIR / "lib" / "utils.sh"
 
 BLOCK = 2
@@ -1890,3 +1891,97 @@ def test_corrupt_reverse_index_lib_does_not_fail_open(nudge_repo: Path, tmp_path
     proc = _run(hookdir / "commit-gauntlet.sh", _payload("git commit -m 'x'"), cwd=nudge_repo)
 
     assert proc.returncode == BLOCK, proc.stderr  # the lint gate still fired
+
+
+# ── ledger-schema-guard (issue #235): enforce the todo-ledger entry schema ──
+#
+# Every ledger entry subject must read `<subtask-id> · <STEP|type> — <label>` so
+# cycle steps and ad-hoc todos stay aggregable. STEP is one of ANCHOR/RED/GREEN/
+# REVIEW/PUSH; an ad-hoc entry instead carries a type from investigate|fix|test|
+# docs|chore|recover. A non-conforming TaskCreate / subject-changing TaskUpdate is
+# DENIED with the expected format; a status-only TaskUpdate (no subject) passes.
+# Gated on WT_SPOKE so the hub / quick lanes are never blocked.
+
+_DOT = "\N{MIDDLE DOT}"
+_DASH = "\N{EM DASH}"
+
+
+def _ledger_payload(subject: str | None, *, tool: str = "TaskCreate") -> str:
+    tool_input: dict = {"status": "in_progress"} if tool == "TaskUpdate" else {}
+    if subject is not None:
+        tool_input["subject"] = subject
+    if tool == "TaskUpdate":
+        tool_input["taskId"] = "1"
+    return json.dumps({"tool_name": tool, "tool_input": tool_input})
+
+
+def run_ledger(subject: str | None, *, tool: str = "TaskCreate", spoke: bool = True) -> int:
+    env = {**os.environ}
+    if spoke:
+        env["WT_SPOKE"] = "1"
+    else:
+        env.pop("WT_SPOKE", None)
+    return subprocess.run(
+        ["bash", str(LEDGER_GUARD)],
+        input=_ledger_payload(subject, tool=tool),
+        capture_output=True,
+        text=True,
+        env=env,
+    ).returncode
+
+
+def _entry(keyword: str, *, sub: str = "#235.main", label: str = "pin the failing test") -> str:
+    return f"{sub} {_DOT} {keyword} {_DASH} {label}"
+
+
+class TestLedgerSchemaGuard:
+    def test_allows_a_conforming_step_entry(self) -> None:
+        assert run_ledger(_entry("RED")) == ALLOW
+
+    def test_allows_every_solo_cycle_step_keyword(self) -> None:
+        for step in ("ANCHOR", "RED", "GREEN", "REVIEW", "PUSH"):
+            assert run_ledger(_entry(step)) == ALLOW, step
+
+    def test_allows_a_conforming_adhoc_type_entry(self) -> None:
+        assert run_ledger(_entry("fix", label="patch the off-by-one")) == ALLOW
+
+    def test_blocks_a_free_form_entry(self) -> None:
+        assert run_ledger("implement the marker spine") == BLOCK
+
+    def test_blocks_a_merged_step_entry(self) -> None:
+        # The #229 regression: "REVIEW + sync + PUSH" merged into one entry.
+        assert run_ledger(_entry("REVIEW + sync + PUSH")) == BLOCK
+
+    def test_blocks_an_ascii_separator_entry(self) -> None:
+        # A plain hyphen/pipe instead of the ` · `/` — ` separators is rejected.
+        assert run_ledger("#235.main - RED - label") == BLOCK
+
+    def test_blocks_an_unknown_keyword(self) -> None:
+        assert run_ledger(_entry("frobnicate")) == BLOCK
+
+    def test_blocks_a_missing_subtask_id(self) -> None:
+        assert run_ledger(f"{_DOT} RED {_DASH} no id") == BLOCK
+
+    def test_blocks_an_empty_label(self) -> None:
+        assert run_ledger(f"#235.main {_DOT} RED {_DASH} ") == BLOCK
+
+    def test_status_only_update_without_a_subject_passes(self) -> None:
+        assert run_ledger(None, tool="TaskUpdate") == ALLOW
+
+    def test_conforming_subject_update_passes(self) -> None:
+        assert run_ledger(_entry("GREEN"), tool="TaskUpdate") == ALLOW
+
+    def test_no_op_outside_a_spoke(self) -> None:
+        # The hub / quick lanes (no WT_SPOKE) are never blocked, even on a bad entry.
+        assert run_ledger("free form nonsense", spoke=False) == ALLOW
+
+    def test_ignores_other_tools(self) -> None:
+        env = {**os.environ, "WT_SPOKE": "1"}
+        rc = subprocess.run(
+            ["bash", str(LEDGER_GUARD)],
+            input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}}),
+            capture_output=True,
+            text=True,
+            env=env,
+        ).returncode
+        assert rc == ALLOW

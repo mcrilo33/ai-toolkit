@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -513,6 +514,56 @@ class TestTodoLedgerRegistration:
 # rm-scope-guard is a PreToolUse Bash guard like hub-guard: Claude gates it with
 # the same `Bash(rm *)` rule the user's ask backstop uses, and Cursor remaps it
 # onto beforeShellExecution with a command-regex matcher that fires on rm.
+
+
+# ── ledger-schema-guard registration against the REAL shared/hooks/metadata.yml ──
+# ledger-schema-guard is a Claude-only PreToolUse guard on the TaskCreate/TaskUpdate
+# ledger tools (tier 1, deny-with-format). Like cycle-step-mark / afk-notify-wake the
+# event lives in the claude block only, so Cursor/Copilot stay unwired.
+
+
+def _claude_group(cfg: dict, event: str, script: str) -> dict | None:
+    for group in cfg.get(event, []):
+        if any(h.get("command", "").endswith(script) for h in group.get("hooks", [])):
+            return group
+    return None
+
+
+class TestLedgerSchemaGuardRegistration:
+    SCRIPT = "ledger-schema-guard.sh"
+
+    def test_registered_for_claude_pretooluse(self) -> None:
+        cfg = generate_claude(parse_hooks_metadata(str(REAL_META)))
+        assert _claude_handler(cfg, "PreToolUse", self.SCRIPT) is not None, (
+            "ledger-schema-guard not registered for Claude PreToolUse"
+        )
+
+    def test_grouped_under_the_task_tool_matcher_not_an_if(self) -> None:
+        cfg = generate_claude(parse_hooks_metadata(str(REAL_META)))
+        group = _claude_group(cfg, "PreToolUse", self.SCRIPT)
+        assert group is not None
+        assert group.get("matcher") == "TaskCreate|TaskUpdate"
+        handler = _claude_handler(cfg, "PreToolUse", self.SCRIPT)
+        assert handler is not None and "if" not in handler, (
+            "a tool-name matcher guard carries no Bash if-clause"
+        )
+
+    def test_tier_1(self) -> None:
+        meta = parse_hooks_metadata(str(REAL_META))
+        assert meta["ledger-schema-guard"]["__defaults"]["tier"] == "1"
+
+    def test_claude_only_unwired_on_cursor_and_copilot(self) -> None:
+        meta = parse_hooks_metadata(str(REAL_META))
+        cursor = generate_cursor(meta)
+        wired = any(
+            self.SCRIPT in entry.get("command", "")
+            for entries in cursor.get("hooks", {}).values()
+            for entry in entries
+        )
+        assert not wired, "a Claude-only ledger guard must not wire into Cursor"
+        assert self.SCRIPT not in json.dumps(generate_copilot(meta)), (
+            "a Claude-only ledger guard must not wire into Copilot"
+        )
 
 
 class TestRmScopeGuardRegistration:

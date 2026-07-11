@@ -13,12 +13,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
+from hooks_generator import generate_claude, parse_hooks_metadata
 from hooks_reconciler import (
     _is_owned,
     reconcile_bucket,
     reconcile_claude,
     reconcile_cursor,
 )
+
+REAL_META = Path(__file__).resolve().parents[2] / "shared" / "hooks" / "metadata.yml"
 
 # ── Sample entries ────────────────────────────────────────
 
@@ -223,3 +226,41 @@ class TestReconcileClaude:
         assert result["preferredNotifChannel"] == "notifications_disabled"
         assert result["model"] == "x"
         assert result["hooks"]["PreToolUse"] == [OWNED_CLAUDE_GROUP]
+
+
+# ── ledger-schema-guard (issue #235) flows through reconcile as an owned hook ──
+
+
+def _ledger_group(cfg: dict) -> dict | None:
+    for group in cfg.get("PreToolUse", []):
+        if any("ledger-schema-guard.sh" in h.get("command", "") for h in group.get("hooks", [])):
+            return group
+    return None
+
+
+class TestLedgerSchemaGuardReconcile:
+    def test_generated_group_is_ai_toolkit_owned(self) -> None:
+        cfg = generate_claude(parse_hooks_metadata(str(REAL_META)))
+        group = _ledger_group(cfg)
+        assert group is not None, "ledger-schema-guard missing from the generated Claude config"
+        assert _is_owned(group), "the ledger-schema-guard group must be recognised as owned"
+
+    def test_reconcile_preserves_a_user_hook_and_installs_the_guard(self) -> None:
+        cfg = generate_claude(parse_hooks_metadata(str(REAL_META)))
+        existing = {
+            "hooks": {"PreToolUse": [USER_CLAUDE_GROUP]},
+            "otherSetting": "keep me",
+        }
+        result = reconcile_claude(existing, cfg)
+        pre = result["hooks"]["PreToolUse"]
+        assert USER_CLAUDE_GROUP in pre, "user hooks must be preserved"
+        assert _ledger_group({"PreToolUse": pre}) is not None, "the guard must be installed"
+        assert result["otherSetting"] == "keep me"
+
+    def test_reconcile_is_idempotent_for_the_guard(self) -> None:
+        cfg = generate_claude(parse_hooks_metadata(str(REAL_META)))
+        first = reconcile_claude({}, cfg)
+        second = reconcile_claude(first, cfg)
+        groups = [g for g in second["hooks"]["PreToolUse"] if _ledger_group({"PreToolUse": [g]})]
+        assert len(groups) == 1, "reconcile must not duplicate the guard group"
+        assert first == second
