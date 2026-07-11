@@ -1896,3 +1896,37 @@ def test_gh_mirror_bounds_calls_with_timeout_when_present(tmp_path: Path) -> Non
 
     assert proc.returncode == 0, proc.stderr
     assert any(c.startswith("timeout ") for c in calls), "gh must be wrapped in timeout"
+
+
+def test_gh_bounds_a_hung_gh_without_coreutils_timeout(tmp_path: Path) -> None:
+    # PRODUCTION condition on a coreutils-less host (no timeout/gtimeout): a HUNG gh
+    # (black-hole network, not clean-offline) must STILL be killed within the budget so
+    # a caller — hub-afk's escalation path calls wt_gh directly — is never frozen (#170
+    # portability guarantee). Force the no-coreutils branch by overriding the detector.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    mark = tmp_path / "mark"
+    gh = bindir / "gh"
+    gh.write_text('#!/bin/sh\nprintf start >> "$MARK"\nsleep 6\nprintf done >> "$MARK"\n')
+    gh.chmod(0o755)
+    script = (
+        f'source "{WT_LIB}"; '
+        "_wt_gh_timeout_bin() { :; }; "  # force the portable fallback (no coreutils timeout)
+        "wt_gh issue edit 7 --add-label status:blocked; echo rc=$?"
+    )
+    env = {
+        **os.environ,
+        "TZ": "UTC",
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "MARK": str(mark),
+        "AI_TOOLKIT_GH_TIMEOUT": "1",
+        "WT_GH_SEED_DIR": str(tmp_path / "seed"),
+    }
+    start = time.time()
+    proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+    elapsed = time.time() - start
+
+    assert proc.returncode == 0, proc.stderr
+    assert "rc=0" in proc.stdout
+    assert elapsed < 4, f"wt_gh must bound a hung gh even with no coreutils timeout (took {elapsed:.1f}s)"
+    assert mark.exists() and "start" in mark.read_text(), "gh must actually have been invoked"
