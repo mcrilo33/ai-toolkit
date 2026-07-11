@@ -1187,6 +1187,12 @@ auto_land() {
   while IFS=$'\t' read -r path issue; do
     [ -n "$issue" ] || continue
     _ready_at_tip "$path" "$issue" || continue
+    # #241: pace the whole per-issue land attempt on the warned-retry backoff. A prior land
+    # failure / unclean-review / retry-exhausted warn armed the backoff; while it is pending this
+    # spoke is skipped (parked LAST), so a permanently-conflicted land is re-attempted at LOW
+    # frequency (worktree-land is expensive) — not every tick. A fresh (never-warned) spoke is
+    # always due, so the first land attempt is never delayed. Cleared on a successful land below.
+    _afk_warned_due "$issue" || continue
     if _blocked_at_tip "$path" "$issue"; then
       # ready+blocked at a finished tip = a TRANSIENT land failure. Retry the land up to
       # AFK_LAND_RETRY_MAX times, then escalate VISIBLY — never skip-land it forever (#202 D).
@@ -1220,7 +1226,8 @@ auto_land() {
         #     first" step is not implementable here). UPGRADE: mint a hub-side review attempt.
         if [ "${AFK_REVIEW_GATE_ON_UNCLEAN:-retry}" = "land" ]; then
           broker_warn "$issue" "LANDING despite an unclean review verdict (${verdict:-no review}) — possible test-gutting; review post-hoc"
-          broker_journal_decision "$issue" review "landed despite unclean review verdict (${verdict:-no review})" scope
+          # outward: the land merges+pushes to shared main (others pull it, CI fires) — not merely a scope change.
+          broker_journal_decision "$issue" review "landed despite unclean review verdict (${verdict:-no review})" outward
           # fall through to land
         else
           _warn_parked_last "$path" "$issue" "code-review verdict not clean (${verdict:-no review}) — warn + retry; set AFK_REVIEW_GATE_ON_UNCLEAN=land to land with a warning" review
@@ -1238,12 +1245,14 @@ auto_land() {
     if [ "$land_rc" -eq 0 ]; then
       log "  landed #$issue"
       _afk_clear_land_retries "$issue"   # a successful land resets the retry budget (#202 D)
+      _afk_clear_warned "$issue"         # #241: progress → drop the land's warned-retry backoff
       _afk_incr_landed   # tally for the drain-complete notification (#150)
     elif [ "$land_rc" -eq 3 ]; then
       # Sentinel (#198 / #202 I): main ADVANCED but a teardown step failed — the code IS
       # shipped, so NEVER stamp blocked over merged work. Tally it and point at the log.
       log "  landed #$issue but teardown incomplete (worktree-land exit 3) — see $land_log; NOT escalating (main already advanced)"
       _afk_clear_land_retries "$issue"
+      _afk_clear_warned "$issue"         # #241: shipped → drop the warned-retry backoff
       _afk_incr_landed
     else
       # #241 §5: an auto-land failure (merge conflict / push rejection) warns + retries on the

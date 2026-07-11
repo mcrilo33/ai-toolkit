@@ -2498,7 +2498,7 @@ def test_auto_land_lands_on_clean_approve(spoke_repo: Path, tmp_path: Path) -> N
     assert land_log.read_text().split() == ["5"], "a clean APPROVE verdict must land"
 
 
-def test_auto_land_escalates_on_request_changes(spoke_repo: Path, tmp_path: Path) -> None:
+def test_auto_land_warns_on_request_changes(spoke_repo: Path, tmp_path: Path) -> None:
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
     # Latest-wins: an older APPROVE then a newer REQUEST_CHANGES ⇒ the reviewer's FINAL
     # verdict is REQUEST_CHANGES, so the spoke must be escalated, not landed.
@@ -2526,9 +2526,10 @@ def test_auto_land_escalates_on_request_changes(spoke_repo: Path, tmp_path: Path
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
         "#241: a REQUEST_CHANGES verdict warns + retries, never blocks"
     )
+    assert (statedir / "warned-5.txt").exists(), "the taken decision must be warned, not silently dropped"
 
 
-def test_auto_land_escalates_when_no_review(spoke_repo: Path, tmp_path: Path) -> None:
+def test_auto_land_warns_when_no_review(spoke_repo: Path, tmp_path: Path) -> None:
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
     # No .review artifact at all ⇒ no clean review exists ⇒ escalate, never land.
     wt_land, land_log = _land_recorder(tmp_path)
@@ -2553,9 +2554,10 @@ def test_auto_land_escalates_when_no_review(spoke_repo: Path, tmp_path: Path) ->
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
         "#241: no review warns + retries, never blocks"
     )
+    assert (statedir / "warned-5.txt").exists(), "the taken decision must be warned, not silently dropped"
 
 
-def test_auto_land_escalates_when_review_dir_empty(spoke_repo: Path, tmp_path: Path) -> None:
+def test_auto_land_warns_when_review_dir_empty(spoke_repo: Path, tmp_path: Path) -> None:
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
     (spoke_repo / ".review").mkdir()  # present but no artifacts ⇒ no verdict ⇒ escalate
     wt_land, land_log = _land_recorder(tmp_path)
@@ -2580,6 +2582,7 @@ def test_auto_land_escalates_when_review_dir_empty(spoke_repo: Path, tmp_path: P
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
         "#241: an empty .review dir warns + retries, never blocks"
     )
+    assert (statedir / "warned-5.txt").exists(), "the taken decision must be warned, not silently dropped"
 
 
 def test_auto_land_lands_after_fix_supersedes_changes(spoke_repo: Path, tmp_path: Path) -> None:
@@ -2647,7 +2650,7 @@ def test_auto_land_default_lands_on_clean_approve(spoke_repo: Path, tmp_path: Pa
     )
 
 
-def test_auto_land_default_escalates_foreign_ready_without_review(
+def test_auto_land_default_warns_foreign_ready_without_review(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
     # Issue #183: the gate defaults ON. A FOREIGN ready/<N> hand-pushed without any review
@@ -3030,7 +3033,7 @@ def test_auto_land_keeps_heartbeat_fresh_during_slow_land(spoke_repo: Path, tmp_
     assert epoch >= start, f"the heartbeat must stay fresh THROUGH the land, got {hb.read_text()}"
 
 
-def test_auto_land_failing_land_still_escalates_through_wrapper(
+def test_auto_land_failing_land_still_warns_through_wrapper(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
     # End to end through the real call site: a land that fails under the heartbeat
@@ -3207,7 +3210,7 @@ def test_auto_land_retries_ready_blocked_at_tip(spoke_repo: Path, tmp_path: Path
     assert blocked.returncode != 0, "the retry clears the stale blocked/5 before re-landing"
 
 
-def test_auto_land_ready_blocked_reescalates_on_repeat_failure(
+def test_auto_land_ready_blocked_rewarns_on_repeat_failure(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
     # The retry itself fails again: re-escalate blocked AND count the attempt, so the next
@@ -3277,7 +3280,7 @@ def test_auto_land_does_not_block_when_land_reports_cleanup_incomplete(
     )
 
 
-def test_auto_land_still_blocks_on_a_pre_merge_failure(spoke_repo: Path, tmp_path: Path) -> None:
+def test_auto_land_warns_on_a_pre_merge_failure(spoke_repo: Path, tmp_path: Path) -> None:
     # A non-sentinel nonzero (exit 1: merge conflict / push rejection — nothing shipped) still
     # escalates, so the sentinel path doesn't swallow genuine failures.
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
@@ -3303,9 +3306,10 @@ def test_auto_land_still_blocks_on_a_pre_merge_failure(spoke_repo: Path, tmp_pat
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
         "#241: a pre-merge land failure (exit 1) warns + retries, never blocks"
     )
+    assert (statedir / "warned-5.txt").exists(), "the taken decision must be warned, not silently dropped"
 
 
-def test_auto_land_ready_blocked_escalates_visibly_when_retries_exhausted(
+def test_auto_land_ready_blocked_warns_visibly_when_retries_exhausted(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
     # The retry budget is spent (count == AFK_LAND_RETRY_MAX): stop re-landing, but escalate
@@ -6092,7 +6096,7 @@ def _ceiling_env(tmp_path: Path, *, wt_new_exit: int) -> tuple[str, dict[str, st
     return expr, env, attempts, statedir
 
 
-def test_dispatch_ceiling_blocks_issue_after_max_failures(tmp_path: Path) -> None:
+def test_dispatch_ceiling_warns_issue_after_max_failures(tmp_path: Path) -> None:
     # Three consecutive worktree-new.sh failures for #5 ⇒ a durable local block record and
     # no further attempts, instead of retrying silently forever.
     expr, env, attempts, statedir = _ceiling_env(tmp_path, wt_new_exit=1)
@@ -6729,3 +6733,35 @@ def test_auto_land_failure_warns_retries_not_blocks(spoke_repo: Path, tmp_path: 
     )
     assert "WARNING: #5" in result.stderr, result.stderr
     assert (statedir / "warned-5.txt").exists()
+
+
+def test_auto_land_failure_is_backoff_paced_not_every_tick(spoke_repo: Path, tmp_path: Path) -> None:
+    # #241 BLOCKER fix: a persistently-failing land (merge conflict) is re-attempted at LOW
+    # frequency (the warned-retry backoff), NOT every tick — worktree-land is expensive. Within
+    # one backoff window the land runs once; a later tick past the window runs it again.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _write_review(spoke_repo, "ok", "APPROVE", "2026-07-05T01:00:00Z")
+    lands = tmp_path / "lands.count"
+    wt_land = tmp_path / "worktree-land.sh"
+    wt_land.write_text(f'#!/usr/bin/env bash\nprintf x >> "{lands}"\nexit 1\n')  # land always fails
+    wt_land.chmod(0o755)
+    ready_stub, ready_log = _escalation_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+    base = {
+        "WT_LAND": str(wt_land),
+        "SPOKE_READY": str(ready_stub),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_REVIEW_GATE": "0",
+        "AFK_WARN_BACKOFF_BASE": "60",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    _call(expr, env={**base, "AFK_NOW": "1000"})  # tick 1: due → land (fails) → arm backoff
+    _call(expr, env={**base, "AFK_NOW": "1000"})  # tick 2: inside backoff → skip the land
+    _call(expr, env={**base, "AFK_NOW": "1030"})  # tick 3: still inside → skip
+    _call(expr, env={**base, "AFK_NOW": "1100"})  # tick 4: past 60s → land again (fails)
+
+    n = lands.read_text().count("x") if lands.exists() else 0
+    assert n == 2, f"a failing land must be backoff-paced, not re-run every tick; ran {n}"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text()
