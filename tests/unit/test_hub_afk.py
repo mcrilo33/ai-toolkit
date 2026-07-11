@@ -1921,7 +1921,10 @@ def test_build_answerer_prompt_includes_rule_and_question(
 
     assert "THE-AFK-RULE-MARKER" in result.stdout
     assert "Which store should I use?" in result.stdout
-    assert "ANSWER:" in result.stdout and "ESCALATE:" in result.stdout
+    # #241: the reasoner ALWAYS answers — the prompt offers ANSWER: (with a REVERSIBILITY:
+    # class line) and no longer an ESCALATE: escape hatch.
+    assert "ANSWER:" in result.stdout and "REVERSIBILITY:" in result.stdout
+    assert "ESCALATE:" not in result.stdout
 
 
 def test_afk_emit_decision_writes_dashboard_span(spoke_repo: Path, tmp_path: Path) -> None:
