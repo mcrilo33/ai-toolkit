@@ -1411,8 +1411,17 @@ class TestRuleInvocationScores:
 
     _BASE_TS = "2026-01-01T00:00:00Z"
 
-    def _msg(self, rule_basename: str) -> str:
-        content = f"Contents of /repo/.claude/rules/{rule_basename}:\n# heading\nbody"
+    def _reminder_msg(self, *rule_basenames: str) -> str:
+        # A genuine injection: the rule header(s) sit INSIDE a <system-reminder>.
+        headers = "\n".join(
+            f"Contents of /repo/.claude/rules/{name}:\n# heading\nbody" for name in rule_basenames
+        )
+        content = f"<system-reminder>\n{headers}\n</system-reminder>"
+        return json.dumps({"role": "user", "content": content})
+
+    def _quote_msg(self, rule_basename: str) -> str:
+        # A tool-result / diff that merely QUOTES the header, not wrapped in a reminder.
+        content = f"tool output: Contents of /repo/.claude/rules/{rule_basename}: ..."
         return json.dumps({"role": "user", "content": content})
 
     def test_load_scoped_rules_returns_only_glob_scoped(self, tmp_path: Path) -> None:
@@ -1431,31 +1440,55 @@ class TestRuleInvocationScores:
         assert load_scoped_rules(tmp_path) == set()
 
     def test_label_tags_added_message_injecting_a_scoped_rule(self) -> None:
-        curr = [ContextItem("messages", "msg[3]:user", self._msg("code-quality.md"))]
+        curr = [ContextItem("messages", "msg[3]:user", self._reminder_msg("code-quality.md"))]
         added = [{"category": "messages", "name": "msg[3]:user", "tokens": 10}]
 
         _label_rule_injections(added, curr, {"code-quality.md"})
 
-        assert added[0]["rule"] == "code-quality.md"
+        assert added[0]["rules"] == ["code-quality.md"]
+
+    def test_label_collects_all_rules_in_one_reminder(self) -> None:
+        # Editing a test file injects several scoped rules in ONE reminder; all must be counted.
+        curr = [
+            ContextItem(
+                "messages",
+                "msg[3]:user",
+                self._reminder_msg("python-style.md", "pytest-conventions.md"),
+            )
+        ]
+        added = [{"category": "messages", "name": "msg[3]:user", "tokens": 10}]
+
+        _label_rule_injections(added, curr, {"python-style.md", "pytest-conventions.md"})
+
+        assert added[0]["rules"] == ["pytest-conventions.md", "python-style.md"]
+
+    def test_label_ignores_header_quoted_outside_a_reminder(self) -> None:
+        # A tool-result quoting the header is not a real injection and must not be counted.
+        curr = [ContextItem("messages", "msg[3]:user", self._quote_msg("code-quality.md"))]
+        added = [{"category": "messages", "name": "msg[3]:user", "tokens": 10}]
+
+        _label_rule_injections(added, curr, {"code-quality.md"})
+
+        assert "rules" not in added[0]
 
     def test_label_ignores_an_unscoped_rule_mention(self) -> None:
-        curr = [ContextItem("messages", "msg[3]:user", self._msg("security.md"))]
+        curr = [ContextItem("messages", "msg[3]:user", self._reminder_msg("security.md"))]
         added = [{"category": "messages", "name": "msg[3]:user", "tokens": 10}]
 
         _label_rule_injections(added, curr, {"code-quality.md"})
 
-        assert "rule" not in added[0]
+        assert "rules" not in added[0]
 
     def test_label_noop_when_no_scoped_rules(self) -> None:
-        curr = [ContextItem("messages", "msg[3]:user", self._msg("code-quality.md"))]
+        curr = [ContextItem("messages", "msg[3]:user", self._reminder_msg("code-quality.md"))]
         added = [{"category": "messages", "name": "msg[3]:user", "tokens": 10}]
 
         _label_rule_injections(added, curr, set())
 
-        assert "rule" not in added[0]
+        assert "rules" not in added[0]
 
     def _delta_event(self, *rules: str) -> dict:
-        added = [{"category": "messages", "name": "m", "tokens": 1, "rule": rule} for rule in rules]
+        added = [{"category": "messages", "name": "m", "tokens": 1, "rules": list(rules)}]
         return {"body": {"id": "e", "metadata": {"context_delta": {"added": added}}}}
 
     def test_build_rule_invocation_scores_counts_per_rule(self) -> None:

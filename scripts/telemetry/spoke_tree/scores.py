@@ -335,11 +335,12 @@ def build_rule_invocation_scores(
 
     The #160 context-delta pass stamps each llm_request copy's ``metadata.context_delta.added`` with
     the rows that entered context that turn, and :func:`~telemetry.spoke_tree.context_deltas`
-    ._label_rule_injections tags each added row that injected a glob-scoped rule with ``rule``. This
-    scans the assembled batch for those labels and emits one trace-level NUMERIC score per rule whose
-    value is the number of times the rule entered play. Paired with ``rule_carry_cost_usd:<rule>``
-    (same ``<rule>`` suffix), a dashboard ranks rules by carry cost filtered to zero invocations —
-    the dead-weight signal. Ids derive from the spoke run id (idempotent reruns).
+    ._label_rule_injections tags each added row that injected glob-scoped rule(s) with a ``rules``
+    list (one reminder can inject several). This scans the assembled batch for those labels and emits
+    one trace-level NUMERIC score per rule whose value is the number of turns the rule entered play.
+    Paired with ``rule_carry_cost_usd:<rule>`` (same ``<rule>`` suffix), a dashboard ranks rules by
+    carry cost filtered to zero invocations — the dead-weight signal. Ids derive from the spoke run
+    id (idempotent reruns).
 
     Args:
         spoke_run_id: The spoke run identifier (keys the deterministic score ids).
@@ -354,8 +355,7 @@ def build_rule_invocation_scores(
     for event in batch:
         delta = (event["body"].get("metadata") or {}).get("context_delta") or {}
         for row in delta.get("added") or []:
-            rule = row.get("rule")
-            if rule:
+            for rule in row.get("rules") or []:
                 counts[str(rule)] = counts.get(str(rule), 0) + 1
     return [
         _score_event(

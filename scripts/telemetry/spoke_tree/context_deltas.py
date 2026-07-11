@@ -44,10 +44,15 @@ logger = logging.getLogger("langfuse_spoke_tree")
 # The shared rules frontmatter, relative to the worktree root — the source of which rules are
 # glob-scoped (injected on a file-match) rather than always-on.
 _RULES_METADATA_PATH = ("shared", "rules", "metadata.yml")
-# A ``Contents of <path>/<rule>.md`` file header inside an injected reminder (the same shape the
-# request-body itemizer keys on). Unanchored: in a diff snapshot the header sits inside a message's
-# serialized ``{role, content}`` JSON, not at a line start.
-_RULE_INJECTION_RE = re.compile(r"Contents of (\S+?\.md)\b")
+# One ``<system-reminder>…</system-reminder>`` block (DOTALL; the serialized message is one JSON
+# line with escaped newlines). A genuine glob-scoped-rule injection always rides such a reminder, so
+# scoping the header search to reminder bodies excludes a tool-result / diff that merely QUOTES a
+# ``Contents of …`` header (kept a local mirror of ``request_body._REMINDER_RE`` to avoid a
+# cross-module private import).
+_REMINDER_RE = re.compile(r"<system-reminder>(.*?)</system-reminder>", re.DOTALL)
+# A ``Contents of <path>/<rule>.md`` file header (the same shape the request-body itemizer keys on),
+# matched unanchored WITHIN a reminder body.
+_RULE_HEADER_RE = re.compile(r"Contents of (\S+?\.md)\b")
 
 
 def load_scoped_rules(root: Path) -> set[str]:
@@ -83,15 +88,24 @@ def load_scoped_rules(root: Path) -> set[str]:
     return scoped
 
 
-def _matched_scoped_rule(text: str | None, scoped_rules: set[str]) -> str | None:
-    """Return the scoped rule whose ``Contents of …/<rule>.md`` header appears in ``text``, else None."""
+def _injected_scoped_rules(text: str | None, scoped_rules: set[str]) -> list[str]:
+    """Return every glob-scoped rule injected in ``text``, sorted (empty when none, #232).
+
+    A genuine injection carries a ``Contents of …/<rule>.md`` header INSIDE a ``<system-reminder>``
+    block, so the search is scoped to reminder bodies — a tool-result or diff that merely quotes the
+    header outside a reminder is not counted. A single reminder can inject several scoped rules at
+    once (editing a test file matches ``python-style`` AND ``pytest-conventions``), so ALL matches
+    are collected rather than only the first.
+    """
     if not text:
-        return None
-    for match in _RULE_INJECTION_RE.finditer(text):
-        basename = match.group(1).rsplit("/", 1)[-1]
-        if basename in scoped_rules:
-            return basename
-    return None
+        return []
+    found: set[str] = set()
+    for reminder in _REMINDER_RE.findall(text):
+        for match in _RULE_HEADER_RE.finditer(reminder):
+            basename = match.group(1).rsplit("/", 1)[-1]
+            if basename in scoped_rules:
+                found.add(basename)
+    return sorted(found)
 
 
 def _label_rule_injections(
@@ -99,11 +113,12 @@ def _label_rule_injections(
     curr_items: list[ContextItem],
     scoped_rules: set[str],
 ) -> None:
-    """Label each added-message row whose injected content is a glob-scoped rule, in place (#232).
+    """Label each added-message row that injected glob-scoped rule(s), in place (#232).
 
     A scoped rule entering context on a file-match rides an added message whose serialized content
-    carries a ``Contents of …/<rule>.md`` header; the row is tagged ``rule=<basename>`` so
-    :func:`build_rule_invocation_scores` can count it. Mirrors :func:`_label_skill_loads`.
+    carries a ``Contents of …/<rule>.md`` header inside a ``<system-reminder>``; the row is tagged
+    ``rules=[<basename>, …]`` (a list — one reminder can inject several) so
+    :func:`build_rule_invocation_scores` can count each. Mirrors :func:`_label_skill_loads`.
     """
     if not scoped_rules:
         return
@@ -111,9 +126,9 @@ def _label_rule_injections(
     for row in added:
         if row.get("category") != "messages":
             continue
-        rule = _matched_scoped_rule(text_by_name.get(str(row.get("name"))), scoped_rules)
-        if rule:
-            row["rule"] = rule
+        rules = _injected_scoped_rules(text_by_name.get(str(row.get("name"))), scoped_rules)
+        if rules:
+            row["rules"] = rules
 
 
 def _blob_hash(value: object) -> str:
