@@ -6612,3 +6612,91 @@ def test_reap_pass_pushed_but_unmarked_warns_not_reaps(tmp_path: Path) -> None:
         "auto-landing incomplete work must not happen — surface it for the human instead"
     )
     assert (statedir / "warned-5.txt").exists()
+
+
+# ── issue #241 S7: auto_land review-gate / land-retry / land-failure warn, not block ──
+# The land pass never parks a spoke blocked/<issue>. An unclean review verdict warns + retries
+# by default (or warns + LANDS with AFK_REVIEW_GATE_ON_UNCLEAN=land, never silent block); a land
+# failure and an exhausted land-retry warn + retry on the backoff instead of going terminal.
+
+
+def test_auto_land_unclean_review_warns_retries_not_blocks(spoke_repo: Path, tmp_path: Path) -> None:
+    # #241 §6 default: an unclean review verdict is NOT auto-landed (it would land a #172-bypass
+    # to main) and NOT blocked — it warns loudly and retries.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _write_review(spoke_repo, "new", "REQUEST_CHANGES", "2026-07-05T01:00:00Z")
+    wt_land, land_log = _land_recorder(tmp_path)
+    ready_stub, ready_log = _escalation_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    result = _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "SPOKE_READY": str(ready_stub),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_REVIEW_GATE": "1",
+            "AFK_JOURNAL_GH_COMMENT": "0",
+        },
+    )
+
+    assert not land_log.exists() or land_log.read_text().strip() == "", "unclean review must NOT land by default"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), "warn + retry, never block"
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert (statedir / "warned-5.txt").exists()
+
+
+def test_auto_land_unclean_review_lands_with_land_knob(spoke_repo: Path, tmp_path: Path) -> None:
+    # #241 §6 opt-in: AFK_REVIEW_GATE_ON_UNCLEAN=land lands the spoke WITH a loud warning
+    # recording the unclean verdict for post-review — the operator's explicit choice.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _write_review(spoke_repo, "new", "REQUEST_CHANGES", "2026-07-05T01:00:00Z")
+    wt_land, land_log = _land_recorder(tmp_path)
+    ready_stub, ready_log = _escalation_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    result = _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "SPOKE_READY": str(ready_stub),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_REVIEW_GATE": "1",
+            "AFK_REVIEW_GATE_ON_UNCLEAN": "land",
+            "AFK_JOURNAL_GH_COMMENT": "0",
+        },
+    )
+
+    assert land_log.exists() and land_log.read_text().split() == ["5"], "the land knob must land"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), "never block"
+    assert "WARNING: #5" in result.stderr, "landing an unclean verdict must warn loudly"
+
+
+def test_auto_land_failure_warns_retries_not_blocks(spoke_repo: Path, tmp_path: Path) -> None:
+    # #241 §5: an auto-land failure (merge conflict / push rejection) warns + retries instead of
+    # parking blocked/<issue>.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _write_review(spoke_repo, "ok", "APPROVE", "2026-07-05T01:00:00Z")
+    wt_land = tmp_path / "worktree-land.sh"
+    wt_land.write_text("#!/usr/bin/env bash\nexit 1\n")  # land always fails
+    wt_land.chmod(0o755)
+    ready_stub, ready_log = _escalation_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    result = _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "SPOKE_READY": str(ready_stub),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_REVIEW_GATE": "0",
+            "AFK_JOURNAL_GH_COMMENT": "0",
+        },
+    )
+
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), "land failure warns, never blocks"
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert (statedir / "warned-5.txt").exists()
