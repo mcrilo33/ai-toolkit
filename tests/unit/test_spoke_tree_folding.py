@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from telemetry.spoke_tree.folding import (
     _apply_levels,
+    _apply_mcp_groups,
     _fold_attrs,
     _guard_group_metadata,
     _guard_noop,
@@ -20,6 +21,51 @@ from telemetry.spoke_tree.folding import (
 
 def _copy(obs_id: str, name: str, **body) -> dict:
     return {"id": obs_id, "type": "span-create", "body": {"id": obs_id, "name": name, **body}}
+
+
+class TestMcpGroups:
+    def _mcp_tool(self, obs_id: str, tool: str, *, parent: str = "i1", **md) -> dict:
+        return _copy(
+            obs_id,
+            f"tool:mcp__srv__{tool}",
+            parentObservationId=parent,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:01Z",
+            metadata=md,
+        )
+
+    def test_groups_same_server_tools_under_one_mcp_node(self) -> None:
+        copies = [self._mcp_tool("a", "navigate"), self._mcp_tool("b", "read_page")]
+
+        result = _apply_mcp_groups(copies, trace_id="T")
+
+        groups = [e for e in result if e["body"]["name"] == "mcp:srv"]
+        assert len(groups) == 1
+        group_id = groups[0]["body"]["id"]
+        assert {
+            e["body"]["parentObservationId"] for e in result if e["body"]["id"] in ("a", "b")
+        } == {group_id}
+        assert groups[0]["body"]["metadata"]["calls"] == 2
+        assert groups[0]["body"]["metadata"]["failures"] == 0
+        assert "level" not in groups[0]["body"]
+
+    def test_error_shaped_member_flags_group_warning(self) -> None:
+        copies = [
+            self._mcp_tool("a", "navigate"),
+            self._mcp_tool("b", "read_page", success=False),
+        ]
+
+        group = next(
+            e for e in _apply_mcp_groups(copies, trace_id="T") if e["body"]["name"] == "mcp:srv"
+        )
+
+        assert group["body"]["metadata"]["failures"] == 1
+        assert group["body"]["level"] == "WARNING"
+
+    def test_no_mcp_tools_leaves_copies_untouched(self) -> None:
+        copies = [_copy("t", "tool:Bash", parentObservationId="i1")]
+
+        assert _apply_mcp_groups(copies, trace_id="T") == copies
 
 
 class TestFoldAttrs:

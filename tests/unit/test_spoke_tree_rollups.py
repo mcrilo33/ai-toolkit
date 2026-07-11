@@ -56,6 +56,13 @@ class TestDurationClass:
             == "skill"
         )
 
+    def test_mcp_tool_and_group_are_mcp(self) -> None:
+        assert (
+            _duration_class({"type": "span-create", "body": {"name": "tool:mcp__srv__navigate"}})
+            == "mcp"
+        )
+        assert _duration_class({"type": "span-create", "body": {"name": "mcp:srv"}}) == "mcp"
+
     def test_unknown_is_other(self) -> None:
         assert _duration_class({"type": "span-create", "body": {"name": "mystery"}}) == "other"
 

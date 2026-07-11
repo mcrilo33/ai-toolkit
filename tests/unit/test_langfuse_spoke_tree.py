@@ -6460,3 +6460,37 @@ class TestFailureLevels:
         batch = build_batch([("tr", [interaction, tool, hook])], SPOKE)
 
         assert _by_orig(batch, "tr", "h1")["body"].get("level") != "WARNING"
+
+
+class TestMcpGrouping:
+    """#234: fold tool:mcp__<server>__<tool> spans into one mcp:<server> group per server."""
+
+    def _traces(self) -> list[tuple[str, list[dict]]]:
+        interaction = _obs("i1", "claude_code.interaction", parent=None)
+        nav = _obs(
+            "t1",
+            "tool:mcp__chrome__navigate",
+            parent="i1",
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:01Z",
+            metadata={"attributes": {"tool_use_id": "tu-1"}},
+        )
+        read = _obs(
+            "t2",
+            "tool:mcp__chrome__read_page",
+            parent="i1",
+            startTime="2026-01-02T00:00:01Z",
+            endTime="2026-01-02T00:00:02Z",
+            metadata={"attributes": {"tool_use_id": "tu-2"}},
+        )
+        return [("tr", [interaction, nav, read])]
+
+    def test_mcp_tools_group_under_one_server_node(self) -> None:
+        batch = build_batch(self._traces(), SPOKE)
+
+        groups = [e for e in batch if (e["body"].get("name") or "") == "mcp:chrome"]
+        assert len(groups) == 1
+        group_id = groups[0]["body"]["id"]
+        assert _by_orig(batch, "tr", "t1")["body"]["parentObservationId"] == group_id
+        assert _by_orig(batch, "tr", "t2")["body"]["parentObservationId"] == group_id
+        assert groups[0]["body"]["metadata"]["calls"] == 2

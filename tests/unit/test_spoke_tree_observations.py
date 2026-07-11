@@ -18,9 +18,12 @@ from telemetry.spoke_tree.observations import (
     _is_hook,
     _is_hook_event,
     _is_interaction,
+    _is_mcp_group,
+    _is_mcp_tool_span,
     _is_skill_span,
     _is_tool_span,
     _joins_under_tool,
+    _mcp_server,
     _obs_envelope,
     _parse_utc,
     _prompt_id,
@@ -106,6 +109,21 @@ class TestNodePredicates:
         assert _is_skill_span(_obs("skill:claude-hud:setup"))
         assert not _is_skill_span(_obs("tool:Skill"))
         assert not _is_skill_span(_obs("tool:Bash"))
+
+    def test_is_mcp_tool_span_matches_mcp_tool_prefix(self) -> None:
+        assert _is_mcp_tool_span(_obs("tool:mcp__claude-in-chrome__navigate"))
+        assert not _is_mcp_tool_span(_obs("tool:Bash"))
+        assert not _is_mcp_tool_span(_obs("mcp:claude-in-chrome"))
+
+    def test_is_mcp_group_matches_group_prefix(self) -> None:
+        assert _is_mcp_group(_obs("mcp:claude-in-chrome"))
+        assert not _is_mcp_group(_obs("tool:mcp__claude-in-chrome__navigate"))
+        assert not _is_mcp_group(_obs("mcp_server_connection"))
+
+    def test_mcp_server_extracts_server_between_separators(self) -> None:
+        assert _mcp_server("tool:mcp__claude-in-chrome__navigate") == "claude-in-chrome"
+        assert _mcp_server("tool:mcp__my_server__do__thing") == "my_server"
+        assert _mcp_server("tool:Bash") is None
 
     def test_is_blocked_tool_matches_prefix(self) -> None:
         assert _is_blocked_tool(_obs("blocked-tool:Bash"))

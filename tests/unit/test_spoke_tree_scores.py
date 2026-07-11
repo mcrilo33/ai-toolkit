@@ -14,6 +14,7 @@ from telemetry.spoke_tree.scores import (
     _step_phase,
     _step_phase_of,
     build_agent_verdict_scores,
+    build_mcp_call_scores,
     build_score_events,
     build_script_success_scores,
     build_skill_success_scores,
@@ -145,6 +146,43 @@ class TestBuildSkillSuccessScores:
         batch = [{"body": {"id": "t1", "name": "tool:Skill", "metadata": {}}}]
 
         assert build_skill_success_scores(SPOKE, batch, base_ts="t") == []
+
+
+class TestBuildMcpCallScores:
+    """#234: per-server mcp_success:<server> 0/1 + mcp_calls:<server> count from the mcp groups."""
+
+    def _group(self, obs_id: str, server: str, *, calls: int, failures: int) -> dict:
+        return {
+            "body": {
+                "id": obs_id,
+                "name": f"mcp:{server}",
+                "metadata": {"server": server, "calls": calls, "failures": failures},
+            }
+        }
+
+    def test_clean_group_scores_success_and_call_count(self) -> None:
+        batch = [self._group("g1", "chrome", calls=3, failures=0)]
+
+        events = build_mcp_call_scores(SPOKE, batch, base_ts="t")
+
+        by_name = {e["body"]["name"]: e["body"]["value"] for e in events}
+        assert by_name == {"mcp_success:chrome": 1.0, "mcp_calls:chrome": 3}
+        assert all(e["body"]["observationId"] == "g1" for e in events)
+
+    def test_group_with_failures_scores_zero_success(self) -> None:
+        batch = [self._group("g1", "chrome", calls=3, failures=1)]
+
+        by_name = {
+            e["body"]["name"]: e["body"]["value"]
+            for e in build_mcp_call_scores(SPOKE, batch, base_ts="t")
+        }
+
+        assert by_name["mcp_success:chrome"] == 0.0
+
+    def test_non_mcp_group_nodes_ignored(self) -> None:
+        batch = [{"body": {"id": "t", "name": "tool:Bash", "metadata": {}}}]
+
+        assert build_mcp_call_scores(SPOKE, batch, base_ts="t") == []
 
 
 class TestBuildAgentVerdictScores:

@@ -12,6 +12,7 @@ from telemetry.spoke_tree.ids import (
     _copy_id,
     _cycle_copy_id,
     _guards_id,
+    _mcp_group_id,
     cycle_copy_id_for,
     cycle_root_id_for,
     cycle_trace_id_for,
@@ -58,3 +59,9 @@ class TestSyntheticNodeIds:
     def test_blocked_tool_id_keys_on_tool_use_id(self) -> None:
         assert _blocked_tool_id("tu-1") != _blocked_tool_id("tu-2")
         assert _blocked_tool_id("tu-1").startswith("tree-blocked-")
+
+    def test_mcp_group_id_keys_on_parent_and_server(self) -> None:
+        assert _mcp_group_id("p1", "srv-a") != _mcp_group_id("p1", "srv-b")
+        assert _mcp_group_id("p1", "srv-a") != _mcp_group_id("p2", "srv-a")
+        assert _mcp_group_id("p1", "srv-a") == _mcp_group_id("p1", "srv-a")
+        assert _mcp_group_id("p1", "srv-a").startswith("tree-mcp-")
