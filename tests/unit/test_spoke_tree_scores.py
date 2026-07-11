@@ -5,6 +5,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
 from telemetry.spoke_tree.scores import (
@@ -12,6 +14,7 @@ from telemetry.spoke_tree.scores import (
     _step_phase_of,
     build_score_events,
     build_step_cost_scores,
+    build_step_total_cost_scores,
 )
 
 SPOKE = "feature/22-demo+1700000000"
@@ -70,3 +73,68 @@ class TestBuildStepCostScores:
     def test_step_without_rollup_is_skipped(self) -> None:
         cycle_batch = [{"body": {"id": "cycstep-abc", "name": "preStep", "metadata": {}}}]
         assert build_step_cost_scores(SPOKE, cycle_batch, base_ts="t", price=0.001) == []
+
+
+class TestBuildStepTotalCostScores:
+    """#230: sum each generation's costDetails into its nearest cycle-step ancestor."""
+
+    def _green_step(self) -> dict:
+        return {
+            "type": "span-create",
+            "body": {
+                "id": "cycstep-green",
+                "name": "step:GREEN x",
+                "metadata": {"subject": "GREEN x"},
+            },
+        }
+
+    def test_generation_cost_attributed_to_nearest_step_ancestor(self) -> None:
+        # A sub-agent generation nested under sub-agent:code-review under the GREEN step, plus a
+        # main-loop generation directly under the step. Both roll into GREEN.
+        cycle_batch = [
+            self._green_step(),
+            {
+                "type": "span-create",
+                "body": {"id": "sac", "parentObservationId": "cycstep-green"},
+            },
+            {
+                "type": "generation-create",
+                "body": {"id": "sag", "parentObservationId": "sac", "costDetails": {"total": 2.0}},
+            },
+            {
+                "type": "generation-create",
+                "body": {
+                    "id": "mg",
+                    "parentObservationId": "cycstep-green",
+                    "costDetails": {"input": 0.3, "output": 0.7},
+                },
+            },
+        ]
+
+        events = build_step_total_cost_scores(SPOKE, cycle_batch, base_ts="t")
+
+        score = next(e for e in events if e["body"]["name"] == "step_total_cost_usd:GREEN")
+        assert score["body"]["value"] == pytest.approx(3.0)
+        assert score["body"]["observationId"] == "cycstep-green"
+
+    def test_explicit_total_wins_over_component_sum(self) -> None:
+        # costDetails carrying BOTH components and a reserved total must not double-count.
+        cycle_batch = [
+            self._green_step(),
+            {
+                "type": "generation-create",
+                "body": {
+                    "id": "mg",
+                    "parentObservationId": "cycstep-green",
+                    "costDetails": {"input": 0.3, "output": 0.7, "total": 1.0},
+                },
+            },
+        ]
+
+        events = build_step_total_cost_scores(SPOKE, cycle_batch, base_ts="t")
+
+        score = next(e for e in events if e["body"]["name"] == "step_total_cost_usd:GREEN")
+        assert score["body"]["value"] == pytest.approx(1.0)
+
+    def test_no_generations_no_scores(self) -> None:
+        assert build_step_total_cost_scores(SPOKE, [self._green_step()], base_ts="t") == []
