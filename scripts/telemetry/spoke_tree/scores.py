@@ -383,11 +383,22 @@ def build_rule_invocation_scores(
 def _blocked_at_surface(body: dict[str, Any]) -> bool:
     """Whether a hook_execution_complete event blocked a tool call (``num_blocking >= 1``).
 
-    Reads ``num_blocking`` as a native number (mirrors ``folding._level_for``'s
-    ``isinstance(num, (int, float))`` check, so the two hook-block readers agree on typing).
+    ``num_blocking`` may arrive as a native int/float OR a numeric string — OTel span attributes
+    are frequently flattened to strings during ingestion — so both are accepted (``float`` coerces
+    all three). A ``bool`` is guarded out first: it is never a real count and ``float(True)`` would
+    otherwise read as 1.0.
+
+    UPGRADE: ``folding._level_for`` reads the same ``num_blocking`` with an ``isinstance(int, float)``
+    check, so it would miss a stringified value where this counts one — align it if a stringified
+    emission ever surfaces, so a scored fire always renders a WARNING node too.
     """
     num = _attr(body, "num_blocking")
-    return isinstance(num, (int, float)) and not isinstance(num, bool) and num >= 1
+    if isinstance(num, bool):
+        return False
+    try:
+        return float(num) >= 1  # type: ignore[arg-type]  # int / float / numeric string
+    except (TypeError, ValueError):
+        return False
 
 
 def build_enforcement_fire_scores(

@@ -1539,7 +1539,7 @@ class TestEnforcementFireScores:
 
     _BASE_TS = "2026-01-01T00:00:00Z"
 
-    def _hook_event(self, hook_name: str, num_blocking: int) -> dict:
+    def _hook_event(self, hook_name: str, num_blocking: int | str) -> dict:
         return {
             "body": {
                 "id": "h",
@@ -1561,6 +1561,12 @@ class TestEnforcementFireScores:
 
     def test_no_score_when_nothing_blocked(self) -> None:
         assert self._scores([self._hook_event("PreToolUse:Edit", 0)]) == []
+
+    def test_stringified_num_blocking_still_counts(self) -> None:
+        # OTel span attributes are frequently flattened to strings during ingestion.
+        scores = self._scores([self._hook_event("PreToolUse:Edit", "1")])
+
+        assert self._by_name(scores) == {"enforcement_fires:PreToolUse:Edit": 1}
 
     def test_bash_surface_is_scored_too(self) -> None:
         scores = self._scores([self._hook_event("PreToolUse:Bash", 1)])
