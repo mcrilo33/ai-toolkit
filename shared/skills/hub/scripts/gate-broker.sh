@@ -1156,10 +1156,29 @@ _rule_file() {
 # posture points at "a throwaway copy (your cwd)" and — deliberately (#239) — never
 # discloses the live worktree's absolute path, which used to invite an absolute-path write
 # into the real tree.
+# _default_answerer_policy -> the built-in fallback policy shipped when the afk-answering rule
+# file is absent. #241: the reasoner ALWAYS answers — it never escalates-and-parks. It is kept
+# in lockstep with shared/rules/afk-answering.md by a binding test, so both surfaces retire the
+# ESCALATE output token and both instruct the ANSWER + REVERSIBILITY lines.
+_default_answerer_policy() {
+  cat <<'POLICY'
+Answer in the interest of the issue contract and repo conventions; prefer the spoke's own
+recommended option. You ALWAYS answer — you never escalate and park the spoke for a human.
+For an irreversible, outward-facing, or scope-changing ask, choose the REVERSIBLE, in-scope
+alternative when one exists (that IS the answer — e.g. do not force-push; rebase onto a new
+branch instead; deny a destructive command and tell the spoke the reversible path); only when
+no reversible alternative exists do you decide on the merits. Precede your decision with a
+'REVERSIBILITY: reversible|outward|scope|irreversible' line naming the class, and add a
+'WARN: <what the human should double-check>' line whenever you take a critical or irreversible
+decision so it is loudly recorded for morning post-review. End with exactly one final line:
+'ANSWER: <reply>'.
+POLICY
+}
+
 build_answerer_prompt() {
   local issue="$1" question="$2" rule body digest
   rule="$(_rule_file)" && rule="$(cat "$rule")" \
-    || rule="Answer in the interest of the issue contract and repo conventions; prefer the spoke's own recommended option; escalate (output 'ESCALATE: <reason>') only when the decision is irreversible, outward-facing, or scope-changing. Otherwise output 'ANSWER: <reply>'."
+    || rule="$(_default_answerer_policy)"
   body="$(gh issue view "$issue" --json title,body -q '.title + "\n\n" + .body' 2>/dev/null || echo "(issue #$issue body unavailable)")"
   digest="$(read_decisions_digest "$issue")"
   cat <<EOF
@@ -1186,7 +1205,10 @@ ${digest:-(none recorded yet)}
 
 $question
 
-Decide per the policy above. End your reply with exactly one line: 'ANSWER: <reply>' or 'ESCALATE: <reason>'.
+Decide per the policy above — you ALWAYS answer, never escalate-and-park. Precede your
+decision with a 'REVERSIBILITY: reversible|outward|scope|irreversible' line, and a
+'WARN: <what to double-check>' line for any critical/irreversible call. End with exactly one
+final line: 'ANSWER: <reply>'.
 EOF
 }
 
@@ -1310,6 +1332,19 @@ parse_decision() {
   rest="${line#*:}"
   rest="${rest#"${rest%%[![:space:]]*}"}"          # ltrim
   printf '%s\t%s\n' "$kind" "$rest"
+}
+
+# parse_decision_field <raw-answerer-output> <KEYWORD> -> the trimmed value of the LAST
+# '<KEYWORD>: <value>' line (empty when absent). #241 reads the reasoner's 'REVERSIBILITY:'
+# class and 'WARN:' note off the same single-line convention as the ANSWER line, so a taken
+# decision carries its reversibility class + human-review flag into the decision journal.
+parse_decision_field() {
+  local raw="$1" key="$2" line rest
+  line="$(printf '%s\n' "$raw" | grep -E "^${key}:" | tail -1)"
+  [ -n "$line" ] || return 0
+  rest="${line#*:}"
+  rest="${rest#"${rest%%[![:space:]]*}"}"          # ltrim
+  printf '%s\n' "$rest"
 }
 
 # is_auth_failure <raw-answerer-output> -> true (rc 0) when the text carries a Claude /
