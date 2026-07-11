@@ -24,6 +24,7 @@ from telemetry.spoke_tree.observations import (
     _PRE_STEP_NAME,
     IngestEvent,
     TraceObservations,
+    _parse_utc,
 )
 
 # Deterministic id prefix for the numeric Langfuse scores (#100 amendment: chartable time budget).
@@ -44,6 +45,9 @@ _STEP_TOKENS_WRITTEN_SCORE = (
 # sub-agent:llm) into the cycle-step that contains it, so the per-phase scores reconcile to
 # the trace totalCost rather than only the cache-write slice above.
 _STEP_TOTAL_COST_SCORE = "step_total_cost_usd"  # per View B step observation, from costDetails
+# Per-phase step latency (#230): the cycle-step window length as a numeric score, so step
+# duration is a Scores-view sum/percentile dimension and not only a span the UI renders.
+_STEP_DURATION_SCORE = "step_duration_ms"  # per View B step observation, from its window length
 # The canonical solo-cycle phases parsed out of a step subject (e.g. "A-RED: …" → RED). Kept a
 # closed set so a step subject can never mint a free-text score name (a metrics-cardinality guard).
 _STEP_PHASES = ("ANCHOR", "RED", "GREEN", "REVIEW", "PUSH")
@@ -323,6 +327,57 @@ def build_step_total_cost_scores(
                 trace_id=trace_id,
                 base_ts=base_ts,
                 observation_id=step_id,
+            )
+        )
+    return events
+
+
+def _step_duration_ms(body: dict[str, Any]) -> int | None:
+    """Return a cycle-step node's window length in ms from its start/end, or None when unparseable."""
+    start = _parse_utc(body.get("startTime"))
+    end = _parse_utc(body.get("endTime"))
+    if start is None or end is None or end < start:
+        return None
+    return int((end - start).total_seconds() * 1000)
+
+
+def build_step_duration_scores(
+    spoke_run_id: str, cycle_batch: list[IngestEvent], *, base_ts: str
+) -> list[IngestEvent]:
+    """Build per-phase ``step_duration_ms:<PHASE>`` scores from each cycle-step window (#230).
+
+    A cycle-step node's ``[startTime, endTime]`` is its phase window, but latency is only a span the
+    Langfuse UI renders, not a numeric a Scores widget can sum or percentile across spokes. Each
+    View B step node (``preStep`` / ``step:*`` / ``postStep``) therefore also emits its window
+    length in milliseconds as ``step_duration_ms:<phase>``, observation-scoped with a deterministic
+    id — mirroring the cost scores. A step whose bounds are missing/inverted is skipped.
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids).
+        cycle_batch: The assembled View B events (its step nodes' start/end are read).
+        base_ts: ISO timestamp stamped on every score event.
+
+    Returns:
+        The ``score-create`` events (empty when View B has no timestamped step nodes).
+    """
+    trace_id = cycle_trace_id_for(spoke_run_id)
+    events: list[IngestEvent] = []
+    for event in cycle_batch:
+        body = event["body"]
+        if not body["id"].startswith(_CYCLE_STEP_PREFIX):
+            continue
+        duration = _step_duration_ms(body)
+        if duration is None:
+            continue
+        phase = _step_phase_of(body)
+        events.append(
+            _score_event(
+                spoke_run_id,
+                name=f"{_STEP_DURATION_SCORE}:{phase}",
+                value=duration,
+                trace_id=trace_id,
+                base_ts=base_ts,
+                observation_id=body["id"],
             )
         )
     return events

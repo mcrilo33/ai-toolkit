@@ -232,6 +232,7 @@ from telemetry.spoke_tree.rollups import (
 from telemetry.spoke_tree.scores import (
     build_score_events,
     build_step_cost_scores,
+    build_step_duration_scores,
     build_step_total_cost_scores,
 )
 from telemetry.spoke_tree.steps import (
@@ -951,10 +952,14 @@ def _enrich_scores(ctx: EnrichmentContext) -> None:
 
 
 def _enrich_step_scores(ctx: EnrichmentContext) -> None:
-    """Emit the per-phase step cache-write/token (#158) + true total cost (#230) scores."""
-    ctx.step_scores = build_step_cost_scores(
-        ctx.spoke_run_id, ctx.cycle_batch, base_ts=ctx.base_ts, price=ctx.price
-    ) + build_step_total_cost_scores(ctx.spoke_run_id, ctx.cycle_batch, base_ts=ctx.base_ts)
+    """Emit per-phase step cache-write/token (#158) + true total cost + duration (#230) scores."""
+    ctx.step_scores = (
+        build_step_cost_scores(
+            ctx.spoke_run_id, ctx.cycle_batch, base_ts=ctx.base_ts, price=ctx.price
+        )
+        + build_step_total_cost_scores(ctx.spoke_run_id, ctx.cycle_batch, base_ts=ctx.base_ts)
+        + build_step_duration_scores(ctx.spoke_run_id, ctx.cycle_batch, base_ts=ctx.base_ts)
+    )
 
 
 # The enrichment passes, in the exact order main applies them. Adding a future enrichment is one
