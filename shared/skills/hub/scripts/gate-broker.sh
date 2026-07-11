@@ -771,12 +771,19 @@ assert_readonly_tools() {
 # creation gap #168 opened — a reasoner that CREATES a new untracked file used to be invisible
 # here, mutating the tree unprevented AND undetected — while keeping the #168 ignored-artifact
 # class safe (the exclude honors .gitignore, .git/info/exclude, AND the global excludesFile).
-# `sort -zu` makes the combined listing order-stable. REFS are folded in too (issue #239): `git
-# rev-parse HEAD` + `git for-each-ref` so a ref write (`git commit` / `update-ref`) — which the
-# index/working-tree content scan can never see — still changes the fingerprint, backstopping
-# the snapshot isolation should it ever regress. `LC_ALL=C sort` keeps the ref listing stable
-# under this host's non-C locale. Empty (stable) for a non-git or missing path, so a
-# non-worktree reasoner never trips a false breach.
+# `sort -zu` makes the combined listing order-stable. THIS WORKTREE'S HEAD is folded in too
+# (issue #239): `git rev-parse HEAD` so a reasoner ref write that moves HEAD (`git commit` /
+# `update-ref` of the checked-out branch) — which the index/working-tree content scan can never
+# see — still changes the fingerprint, backstopping the snapshot isolation should it ever
+# regress. Deliberately NOT `git for-each-ref`: on a linked worktree that lists the SHARED refs,
+# so ordinary concurrent /afk-drain activity (a sibling spoke's push, a hub auto-land advancing
+# main, a background fetch) would flip the fingerprint and terminally FALSE-void a correct
+# answer — the concurrent-sibling false-BREACH class this repo already fights. HEAD reflects only
+# THIS worktree's own branch tip, immune to sibling ref churn. UPGRADE: to also catch a ref
+# write that does NOT move HEAD (a stray tag / non-checked-out branch), fingerprint the
+# worktree's own per-worktree refs specifically — never the shared ref namespace.
+# Empty (stable) for a non-git or missing path, so a non-worktree reasoner never trips a
+# false breach.
 _broker_worktree_fingerprint() {
   local wt="$1"
   [ -d "$wt" ] || return 0
@@ -791,7 +798,6 @@ _broker_worktree_fingerprint() {
           printf '\0'
         done
       printf 'HEAD\0'; git rev-parse -q --verify HEAD 2>/dev/null || printf 'NONE'; printf '\0'
-      git for-each-ref --format='%(objectname) %(refname)' 2>/dev/null | LC_ALL=C sort
     } |
       shasum -a 256 2>/dev/null | awk '{print $1}'
   )
@@ -842,7 +848,12 @@ _broker_snapshot_worktree() {
   if [ -d "$wt/.git" ]; then
     cp -R "$wt/.git" "$dest/.git" 2>/dev/null
   elif [ -f "$wt/.git" ]; then
-    _broker_private_gitdir "$wt" "$dest" || return 1
+    # Best-effort (like the old `cp -R … 2>/dev/null`): even a partial/failed private gitdir is
+    # still a PRIVATE $dest/.git — never a gitfile pointing at the shared common dir — so keeping
+    # the copy preserves write isolation. A hard `return 1` here would make run_answerer fall
+    # back to running the reasoner in the LIVE tree, silently dropping the very isolation this
+    # provides; the reasoner's git reads just degrade if the private gitdir is incomplete.
+    _broker_private_gitdir "$wt" "$dest" || true
   fi
   (
     cd "$wt" 2>/dev/null || exit 0
@@ -862,7 +873,11 @@ _broker_snapshot_worktree() {
 # READ-ONLY via alternates (cheap: no per-tick copy of the object store); the shared refs +
 # packed-refs are copied so read verbs reflect real state and a ref write lands locally; HEAD +
 # index come from the per-worktree gitdir so `git status`/`diff` reflect the spoke's real
-# uncommitted state. rc 1 if the git dirs can't be resolved (caller then falls back to in-place).
+# uncommitted state; the real common config is copied (with worktree-specific bits neutralized)
+# so any `[extensions]` carry over. rc 1 on a failure the caller treats as best-effort — a
+# partial $dest/.git is still private, so write isolation holds either way.
+# UPGRADE: the ref copy assumes the `files` ref backend; a `reftable`-backend repo keeps refs in
+# a `reftable/` dir, not `refs/` + `packed-refs`, and would need that copied instead.
 _broker_private_gitdir() {
   local wt="$1" dest="$2" common gitdir
   common="$(git -C "$wt" rev-parse --git-common-dir 2>/dev/null)" || return 1
@@ -875,7 +890,16 @@ _broker_private_gitdir() {
   [ -f "$common/packed-refs" ] && cp "$common/packed-refs" "$dest/.git/packed-refs" 2>/dev/null
   cp "$gitdir/HEAD" "$dest/.git/HEAD" 2>/dev/null || return 1
   [ -f "$gitdir/index" ] && cp "$gitdir/index" "$dest/.git/index" 2>/dev/null
-  printf '[core]\n\trepositoryformatversion = 0\n\tbare = false\n' > "$dest/.git/config"
+  # Copy the REAL common config (not a hardcoded version-0 stub) so any `[extensions]` the shared
+  # repo needs — objectformat=sha256, etc. — carry over and the shared objects still parse; then
+  # neutralize the worktree-specific bits so the copy is a plain non-bare worktree rooted at $dest.
+  if [ -f "$common/config" ]; then
+    cp "$common/config" "$dest/.git/config" 2>/dev/null
+  else
+    printf '[core]\n\tbare = false\n' > "$dest/.git/config"
+  fi
+  git -C "$dest" config core.bare false 2>/dev/null || true
+  git -C "$dest" config --unset core.worktree 2>/dev/null || true
   return 0
 }
 

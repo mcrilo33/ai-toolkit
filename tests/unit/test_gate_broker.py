@@ -913,6 +913,74 @@ def test_broker_service_gate_voids_answer_when_reasoner_mutates_refs(
     assert "worktree" in log.lower() or "mutat" in log.lower(), log
 
 
+def test_fingerprint_immune_to_sibling_ref_changes(linked_spoke_repo: Path) -> None:
+    # #239 review: the fingerprint folds in only THIS worktree's HEAD, NOT `git for-each-ref`.
+    # A linked worktree shares the ref namespace, so ordinary concurrent /afk-drain activity (a
+    # sibling spoke's branch, a hub auto-land advancing main) must NOT flip the spoke's
+    # fingerprint and terminally false-void a correct answer. Only a ref write that moves THIS
+    # worktree's own HEAD counts.
+    wt = linked_spoke_repo
+    main = wt.parent / "main"
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    fp1 = _call(f"_broker_worktree_fingerprint '{wt}'").stdout.strip()
+
+    # a sibling branch appears in the SHARED gitdir — models a concurrent drain sibling
+    subprocess.run(
+        ["git", "branch", "feature/sibling"], cwd=main, check=True, env=git_env, capture_output=True
+    )
+    fp2 = _call(f"_broker_worktree_fingerprint '{wt}'").stdout.strip()
+    assert fp1 and fp2 == fp1, "a sibling ref change must not drift the spoke's fingerprint"
+
+    # but a commit on the spoke's OWN branch (moves HEAD) MUST change the fingerprint
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-q", "-m", "chore: local"],
+        cwd=wt,
+        check=True,
+        env=git_env,
+        capture_output=True,
+    )
+    fp3 = _call(f"_broker_worktree_fingerprint '{wt}'").stdout.strip()
+    assert fp3 != fp1, "a ref write that moves the spoke's own HEAD must change the fingerprint"
+
+
+def test_snapshot_falls_back_to_copy_when_private_gitdir_fails(
+    linked_spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #239 review: if _broker_private_gitdir fails, the snapshot must STILL run the reasoner in a
+    # copy — a partial private $dest/.git is never a pointer to the shared common dir, so write
+    # isolation holds — rather than silently reverting to running against the LIVE tree.
+    wt = linked_spoke_repo
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+    real = subprocess.run(
+        ["bash", "-c", f"cd '{wt}' && pwd -P"], capture_output=True, text=True
+    ).stdout.strip()
+
+    result = _call(
+        f"_broker_private_gitdir() {{ return 1; }}; run_answerer 5 'q' '{wt}'",
+        env={
+            "AFK_ANSWERER_CMD": "printf x > escaped_probe.txt; pwd -P",
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not (wt / "escaped_probe.txt").exists(), (
+        "a private-gitdir failure must not drop the reasoner into the live tree"
+    )
+    assert result.stdout.strip().splitlines()[-1] != real, (
+        f"the reasoner's cwd must stay an isolated copy on private-gitdir failure: {result.stdout}"
+    )
+
+
 def test_reasoner_prompt_has_readonly_posture_and_evidence(tmp_path: Path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
