@@ -20,6 +20,8 @@ _COPY_PREFIX = "tree-"
 _GUARDS_PREFIX = "tree-guards-"
 # Synthesized blocked-tool node ids (#157, one per orphaned tool-call id).
 _BLOCKED_TOOL_PREFIX = "tree-blocked-"
+# Synthesized MCP per-server group node ids (#234, one per (parent, server)).
+_MCP_GROUP_PREFIX = "tree-mcp-"
 # View B (#113) id namespace — kept separate so its copies never collide with View A's in the
 # local Langfuse store.
 _CYCLE_TRACE_PREFIX = "spokecycle-"
@@ -59,6 +61,16 @@ def _guards_id(parent_id: str) -> str:
 def _blocked_tool_id(tool_use_id: str) -> str:
     """Return the deterministic id of the ``blocked-tool:*`` node synthesized for a tool-call id."""
     return _BLOCKED_TOOL_PREFIX + hashlib.sha1(tool_use_id.encode()).hexdigest()[:24]
+
+
+def _mcp_group_id(parent_id: str, server: str) -> str:
+    """Return the deterministic id of the ``mcp:<server>`` group under ``parent_id`` (#234).
+
+    Keyed by parent AND server so MCP tools of one server under different turns group separately
+    (like :func:`_guards_id` keys per parent), stable across reruns.
+    """
+    digest = hashlib.sha1(f"{parent_id}:{server}".encode()).hexdigest()[:24]
+    return _MCP_GROUP_PREFIX + digest
 
 
 def cycle_trace_id_for(spoke_run_id: str) -> str:

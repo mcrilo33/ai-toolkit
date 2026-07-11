@@ -22,6 +22,7 @@ from telemetry.spoke_tree.commits import _gate_park_ms
 from telemetry.spoke_tree.cycle import _POST_STEP_KEY, _PRE_STEP_KEY
 from telemetry.spoke_tree.ids import _CYCLE_STEP_PREFIX, cycle_trace_id_for, trace_id_for
 from telemetry.spoke_tree.observations import (
+    _MCP_GROUP_PREFIX,
     _POST_STEP_NAME,
     _PRE_STEP_NAME,
     _SKILL_SPAN_PREFIX,
@@ -31,6 +32,7 @@ from telemetry.spoke_tree.observations import (
     _attr,
     _is_gate_observation,
     _is_hook_event,
+    _is_mcp_group,
     _is_script_node,
     _is_skill_span,
     _llm_requests_in_order,
@@ -56,6 +58,13 @@ _STATUS_SUCCESS = "success"
 # contract stamps a status. Read from the skill span attributes, in priority order.
 _SKILL_SUCCESS_SCORE = "skill_success"
 _SKILL_STATUS_KEYS = ("skill.status", "skill_exit_status")
+# MCP call scores (#234): per ``mcp:<server>`` group, mirror its call count and success into
+# chartable numeric scores — ``mcp_success:<server>`` is 1.0 when the server's group had zero
+# error-shaped calls else 0.0 (so a Scores-view average reads as its success rate), and
+# ``mcp_calls:<server>`` is how many calls that group folded (a volume dimension). Observation-scoped
+# to the group so a spoke that hit one server under two turns keeps both.
+_MCP_SUCCESS_SCORE = "mcp_success"
+_MCP_CALLS_SCORE = "mcp_calls"
 # Agent verdict (#233): the outcome of an agent that ran under the spoke, as a numeric score named
 # by the agent type. code-review reads the APPROVE/REJECT verdict from its signed ``.review``
 # artifact; a schema-returning sub-agent reads the ``status`` its structured return carried. The
@@ -352,6 +361,62 @@ def build_skill_success_scores(
                 spoke_run_id,
                 name=f"{_SKILL_SUCCESS_SCORE}:{_skill_span_name(body)}",
                 value=1.0 if status == _STATUS_SUCCESS else 0.0,
+                trace_id=trace_id,
+                base_ts=base_ts,
+                observation_id=body["id"],
+            )
+        )
+    return events
+
+
+def build_mcp_call_scores(
+    spoke_run_id: str, batch: list[IngestEvent], *, base_ts: str
+) -> list[IngestEvent]:
+    """Build per-server ``mcp_success`` / ``mcp_calls`` scores from the MCP group nodes (#234).
+
+    Each ``mcp:<server>`` group (:func:`~telemetry.spoke_tree.folding._apply_mcp_groups`) carries a
+    ``metadata`` rollup of its ``server`` / ``calls`` / ``failures``, but Langfuse charts numeric
+    SCORES not span metadata. Each group therefore emits ``mcp_success:<server>`` — ``1.0`` when it
+    had zero error-shaped calls else ``0.0`` — and ``mcp_calls:<server>`` — its folded call count —
+    observation-scoped to the group with deterministic ids (a server hit under two turns keeps both,
+    so the view's average is the per-server success rate). A group with no ``calls`` metadata is
+    skipped (defensive; a real group always carries it).
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids).
+        batch: The assembled View A events (its ``mcp:`` group nodes are read).
+        base_ts: ISO timestamp stamped on every score event.
+
+    Returns:
+        The ``score-create`` events, two per MCP group (empty when the spoke made no MCP call).
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    events: list[IngestEvent] = []
+    for event in batch:
+        body = event["body"]
+        if not _is_mcp_group(body):
+            continue
+        metadata = body.get("metadata") or {}
+        calls = metadata.get("calls")
+        if calls is None:
+            continue
+        server = metadata.get("server") or (body.get("name") or "")[len(_MCP_GROUP_PREFIX) :]
+        success = 1.0 if not metadata.get("failures") else 0.0
+        events.append(
+            _score_event(
+                spoke_run_id,
+                name=f"{_MCP_SUCCESS_SCORE}:{server}",
+                value=success,
+                trace_id=trace_id,
+                base_ts=base_ts,
+                observation_id=body["id"],
+            )
+        )
+        events.append(
+            _score_event(
+                spoke_run_id,
+                name=f"{_MCP_CALLS_SCORE}:{server}",
+                value=int(calls),
                 trace_id=trace_id,
                 base_ts=base_ts,
                 observation_id=body["id"],

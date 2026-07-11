@@ -13,7 +13,7 @@ from datetime import timedelta
 from typing import Any
 
 from telemetry.langfuse_rollup import Observation
-from telemetry.spoke_tree.ids import _copy_id, _guards_id
+from telemetry.spoke_tree.ids import _copy_id, _guards_id, _mcp_group_id
 from telemetry.spoke_tree.observations import (
     _FOLD_BLOCKED_NAME,
     _FOLD_DECISION_PREFIX,
@@ -21,6 +21,7 @@ from telemetry.spoke_tree.observations import (
     _GUARDS_NAME,
     _GUARDS_SESSION_NAME,
     _INGEST_TIMESTAMP,
+    _MCP_GROUP_PREFIX,
     IngestEvent,
     TraceObservations,
     _attr,
@@ -29,7 +30,9 @@ from telemetry.spoke_tree.observations import (
     _is_fold_subspan,
     _is_hook,
     _is_hook_event,
+    _is_mcp_tool_span,
     _is_tool_span,
+    _mcp_server,
     _obs_envelope,
     _parse_utc,
     _tool_use_id,
@@ -297,6 +300,90 @@ def _apply_guard_groups(
                 member["body"]["parentObservationId"] = group["body"]["id"]
     kept = [event for event in copies if event["body"]["id"] not in dropped]
     return kept + group_events
+
+
+def _mcp_member_failed(body: Observation) -> bool:
+    """Whether an MCP tool member's folded result is error-shaped (#234).
+
+    The #100 fold stamps ``success`` / ``error`` from the tool's ``claude_code.tool.execution``
+    sub-span onto the tool node, so an error-shaped MCP result surfaces as ``success is False`` or a
+    non-empty ``error`` — the same signal :func:`_level_for` reads to flag a failed tool ERROR.
+    """
+    metadata = body.get("metadata") or {}
+    return metadata.get("success") is False or bool(metadata.get("error"))
+
+
+def _mcp_group_metadata(server: str, members: list[IngestEvent]) -> dict[str, Any]:
+    """Return an ``mcp:<server>`` group's rollup: the server, its call count, and its failures."""
+    failures = sum(1 for member in members if _mcp_member_failed(member["body"]))
+    return {"server": server, "calls": len(members), "failures": failures}
+
+
+def _mcp_group_event(
+    parent_id: str, server: str, members: list[IngestEvent], *, trace_id: str
+) -> IngestEvent:
+    """Build the synthetic ``mcp:<server>`` group node for one parent's MCP calls (#234)."""
+    group_id = _mcp_group_id(parent_id, server)
+    start, end = _obs_envelope([member["body"] for member in members])
+    metadata = _mcp_group_metadata(server, members)
+    body: dict[str, Any] = {
+        "id": group_id,
+        "traceId": trace_id,
+        "parentObservationId": parent_id,
+        "name": _MCP_GROUP_PREFIX + server,
+        "startTime": start or _INGEST_TIMESTAMP,
+        "endTime": end,
+        "metadata": metadata,
+    }
+    if metadata["failures"]:
+        body["level"] = _LEVEL_WARNING  # an error-shaped call flags its whole server group (#234)
+    return {
+        "id": group_id,
+        "type": "span-create",
+        "timestamp": start or _INGEST_TIMESTAMP,
+        "body": body,
+    }
+
+
+def _apply_mcp_groups(copies: list[IngestEvent], *, trace_id: str) -> list[IngestEvent]:
+    """Fold each turn's ``tool:mcp__<server>__<tool>`` copies under one ``mcp:<server>`` group (#234).
+
+    Every MCP tool span (:func:`_is_mcp_tool_span`) is re-homed under a synthesized ``mcp:<server>``
+    group parented where the calls sat (their common ``parentObservationId``), so a server's calls
+    read as one unit with a duration rollup (the group is a container, stamped by
+    :func:`~telemetry.spoke_tree.rollups._apply_container_rollups`) and a success signal
+    (:func:`_mcp_group_metadata`; an error-shaped member flags the group WARNING). Grouping is keyed
+    by ``(parent, server)`` so calls to one server across different turns stay in their own turn's
+    group. Runs AFTER guard grouping so an MCP tool's guards already nest under the tool and ride it
+    under the group. Non-MCP copies are untouched; when the spoke made no MCP call, ``copies`` is
+    returned unchanged.
+
+    Args:
+        copies: The assembled copies; MCP tool copies are re-parented in place.
+        trace_id: The assembled trace id every group node references.
+
+    Returns:
+        The copies with grouped MCP tools re-parented and the group nodes appended.
+    """
+    grouped: dict[tuple[str, str], list[IngestEvent]] = {}
+    for event in copies:
+        body = event["body"]
+        if not _is_mcp_tool_span(body):
+            continue
+        server = _mcp_server(body.get("name") or "")
+        if not server:
+            continue
+        parent_id = body.get("parentObservationId") or ""
+        grouped.setdefault((parent_id, server), []).append(event)
+    if not grouped:
+        return copies
+    group_events: list[IngestEvent] = []
+    for (parent_id, server), members in grouped.items():
+        group = _mcp_group_event(parent_id, server, members, trace_id=trace_id)
+        group_events.append(group)
+        for member in members:
+            member["body"]["parentObservationId"] = group["body"]["id"]
+    return copies + group_events
 
 
 def _stamp_hook_endtimes(copies: list[IngestEvent]) -> list[IngestEvent]:

@@ -188,6 +188,7 @@ from telemetry.spoke_tree.cycle import (
 from telemetry.spoke_tree.folding import (
     _apply_guard_groups,
     _apply_levels,
+    _apply_mcp_groups,
     _fold_tool_subspans,
     _hook_event_exclude,
     _stamp_hook_endtimes,
@@ -236,6 +237,7 @@ from telemetry.spoke_tree.rollups import (
 from telemetry.spoke_tree.scores import (
     build_agent_verdict_scores,
     build_enforcement_fire_scores,
+    build_mcp_call_scores,
     build_rule_carry_cost_scores,
     build_rule_invocation_scores,
     build_score_events,
@@ -459,6 +461,9 @@ def _assemble_copies(
     )
     copies = _stamp_hook_endtimes(copies)
     copies = _apply_levels(copies)
+    # After guard grouping / level stamping so an MCP tool's guards already nest under it and ride it
+    # under the server group, and the group can read each member's folded success/error (#234).
+    copies = _apply_mcp_groups(copies, trace_id=trace_id)
     copies = _collapse_startup_instants(copies, root_event)
     return _strip_container_usage(copies)
 
@@ -909,6 +914,7 @@ class EnrichmentContext:
     enforcement_scores: list[IngestEvent] = field(default_factory=list)
     script_success_scores: list[IngestEvent] = field(default_factory=list)
     skill_success_scores: list[IngestEvent] = field(default_factory=list)
+    mcp_call_scores: list[IngestEvent] = field(default_factory=list)
     agent_verdict_scores: list[IngestEvent] = field(default_factory=list)
 
 
@@ -1030,6 +1036,11 @@ def _enrich_skill_success(ctx: EnrichmentContext) -> None:
     )
 
 
+def _enrich_mcp_calls(ctx: EnrichmentContext) -> None:
+    """Emit per-server ``mcp_success`` / ``mcp_calls`` scores from the assembled MCP group nodes (#234)."""
+    ctx.mcp_call_scores = build_mcp_call_scores(ctx.spoke_run_id, ctx.batch, base_ts=ctx.base_ts)
+
+
 def _enrich_agent_verdict(ctx: EnrichmentContext) -> None:
     """Emit per-agent ``agent_verdict:<type>`` scores from reviews + sub-agent outcomes (#233).
 
@@ -1057,6 +1068,7 @@ _ENRICHMENTS: tuple[tuple[str, Callable[[EnrichmentContext], None]], ...] = (
     ("enforcement-scores", _enrich_enforcement_scores),
     ("script-success", _enrich_script_success),
     ("skill-success", _enrich_skill_success),
+    ("mcp-calls", _enrich_mcp_calls),
     ("agent-verdict", _enrich_agent_verdict),
 )
 
@@ -1141,6 +1153,7 @@ def main(argv: list[str] | None = None) -> int:
         + ctx.enforcement_scores
         + ctx.script_success_scores
         + ctx.skill_success_scores
+        + ctx.mcp_call_scores
         + ctx.agent_verdict_scores,
         post,
     )
@@ -1163,6 +1176,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(ctx.enforcement_scores)} enforcement-fire scores emitted, "
         f"{len(ctx.script_success_scores)} script-success scores emitted, "
         f"{len(ctx.skill_success_scores)} skill-success scores emitted, "
+        f"{len(ctx.mcp_call_scores)} mcp-call scores emitted, "
         f"{len(ctx.agent_verdict_scores)} agent-verdict scores emitted, "
         f"{len(commits)} commit nodes synthesized, "
         f"tagged mode={mode} lane={lane}; "

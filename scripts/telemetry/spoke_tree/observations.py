@@ -44,6 +44,11 @@ _SKILL_NAME_KEY = "skill.name"
 # The first-class skill invocation node (#234): a copied ``tool:Skill`` span relabeled to
 # ``skill:<name>`` so a skill reads as a per-skill unit with its own cost rollup and success score.
 _SKILL_SPAN_PREFIX = "skill:"
+# MCP call grouping (#234): an MCP tool span is named ``tool:mcp__<server>__<tool>`` (the
+# ``mcp__server__tool`` convention, ``__`` separating server from tool); its calls fold into one
+# synthesized ``mcp:<server>`` group per server. Both prefixes are single-sourced here.
+_MCP_TOOL_PREFIX = "tool:mcp__"
+_MCP_GROUP_PREFIX = "mcp:"
 # Metadata keys that may carry a tool-call id, in priority order.
 _TOOL_USE_ID_KEYS = ("tool_use_id", "gen_ai.tool.call.id")
 # The per-turn id Claude Code stamps on a ``claude_code.interaction`` and every event-layer
@@ -311,6 +316,29 @@ def _is_skill_span(observation: Observation) -> bool:
     it.
     """
     return (observation.get("name") or "").startswith(_SKILL_SPAN_PREFIX)
+
+
+def _is_mcp_tool_span(observation: Observation) -> bool:
+    """Whether a node is an MCP tool call span (``tool:mcp__<server>__<tool>``, #234)."""
+    return (observation.get("name") or "").startswith(_MCP_TOOL_PREFIX)
+
+
+def _is_mcp_group(observation: Observation) -> bool:
+    """Whether a node is a synthesized ``mcp:<server>`` per-server group (#234)."""
+    return (observation.get("name") or "").startswith(_MCP_GROUP_PREFIX)
+
+
+def _mcp_server(name: str) -> str | None:
+    """Return the server segment of an MCP tool span name, or None when it is not one (#234).
+
+    ``tool:mcp__<server>__<tool>`` -> ``<server>``; the ``__`` after the server delimits the tool
+    (a tool name may itself contain ``__``, so only the first split matters). A server segment with
+    single underscores (``my_server``) is preserved intact.
+    """
+    if not name.startswith(_MCP_TOOL_PREFIX):
+        return None
+    server = name[len(_MCP_TOOL_PREFIX) :].split("__", 1)[0]
+    return server or None
 
 
 def _skill_name(observation: Observation) -> str | None:
