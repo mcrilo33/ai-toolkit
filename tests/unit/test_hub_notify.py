@@ -82,12 +82,31 @@ def _run(
     notifier.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{notify_log}"\n')
     notifier.chmod(0o755)
 
+    # A logging `gh` stub on PATH so the issue #236 status-label mirror is hermetic
+    # and its `gh issue edit` / `gh label create` calls are asserted from $GH_LOG.
+    # $GH_MIRROR_RC forces a nonzero exit to model an offline gh.
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    gh_log = tmp_path / "gh-calls.log"
+    gh = bindir / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        '{ printf "%s" "$*" | tr "\\n" " "; printf "\\n"; } >> "$GH_LOG"\n'
+        'case "$*" in "issue edit"*|"issue comment"*|"label create"*) exit "${GH_MIRROR_RC:-0}";; esac\n'
+    )
+    gh.chmod(0o755)
+
     env = {
         **os.environ,
         "HUB_NOTIFY_SEEN_FILE": str(seen_file if seen_file is not None else tmp_path / "seen"),
         "HUB_NOTIFY_CMD": str(notifier),
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "GH_LOG": str(gh_log),
+        "HUB_LABEL_SEEN_FILE": str(tmp_path / "label-seen"),
     }
     env.pop("AI_TOOLKIT_BASE_BRANCH", None)
+    env.pop("AI_TOOLKIT_GH_LIFECYCLE_LABELS", None)
+    env.pop("GH_MIRROR_RC", None)
     # Control afk-mode deterministically: pop any inherited state/heartbeat, then
     # arm a LIVE drain window only when the test asks for it. hub-notify gates
     # suppression on supervisor liveness (#215) — an armed .afk-state whose
@@ -502,3 +521,125 @@ def test_whitespace_only_afk_state_does_not_suppress(hub: Path, tmp_path: Path) 
 
     assert len(messages) == 1
     assert "parked" in messages[0].lower()
+
+
+# --- status-label mirror (issue #236) -----------------------------------------
+# The hub-notify watch loop is the single writer that mirrors spoke-emitted
+# gate/ready/blocked marker transitions onto the GitHub issue's status:* label.
+# It flips the label with its OWN dedup seen-set (independent of the ping seen-set)
+# so a label moves exactly once per new marker sha, and — unlike the ping — the flip
+# is DECOUPLED from afk suppression: under a live drain the ping is withheld but the
+# label must still reflect state (the whole point of remote visibility). Best-effort.
+
+
+def _gh_calls(tmp_path: Path) -> list[str]:
+    log = tmp_path / "gh-calls.log"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def _status_edits(tmp_path: Path) -> list[str]:
+    return [c for c in _gh_calls(tmp_path) if c.startswith("issue edit")]
+
+
+def test_gate_marker_flips_status_gate_label(hub: Path, tmp_path: Path) -> None:
+    _git(hub, "tag", "-a", "-m", "plan", "gate/1", "feature/1-work")
+
+    proc, _ = _run(hub, tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    edits = _status_edits(tmp_path)
+    assert len(edits) == 1, edits
+    assert edits[0].startswith("issue edit 1 ")
+    assert "--add-label status:gate" in edits[0]
+    assert "--remove-label status:in-progress" in edits[0]
+
+
+def test_ready_marker_flips_status_ready_label(hub: Path, tmp_path: Path) -> None:
+    _git(hub, "tag", "ready/1", "feature/1-work")
+
+    proc, _ = _run(hub, tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    edits = _status_edits(tmp_path)
+    assert len(edits) == 1 and "--add-label status:ready" in edits[0]
+
+
+def test_blocked_marker_flips_status_blocked_label(hub: Path, tmp_path: Path) -> None:
+    _git(hub, "tag", "-a", "-m", "blocked", "-m", "stuck", "blocked/1", "feature/1-work")
+
+    proc, _ = _run(hub, tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    edits = _status_edits(tmp_path)
+    assert len(edits) == 1 and "--add-label status:blocked" in edits[0]
+
+
+def test_status_label_flip_is_deduped(hub: Path, tmp_path: Path) -> None:
+    _git(hub, "tag", "-a", "-m", "plan", "gate/1", "feature/1-work")
+    seen = tmp_path / "seen"
+    label_seen = tmp_path / "label-seen"
+
+    _run(hub, tmp_path, seen_file=seen, env_extra={"HUB_LABEL_SEEN_FILE": str(label_seen)})
+    # A second poll with no marker movement must not re-flip.
+    (tmp_path / "gh-calls.log").unlink(missing_ok=True)
+    proc, _ = _run(
+        hub, tmp_path, seen_file=seen, env_extra={"HUB_LABEL_SEEN_FILE": str(label_seen)}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert _status_edits(tmp_path) == [], "a steady marker must not re-flip the label"
+
+
+def test_status_label_flips_even_when_ping_afk_suppressed(hub: Path, tmp_path: Path) -> None:
+    # Under a live drain the gate PING is withheld, but the label must still flip —
+    # the remote issue view must reflect state during a drain.
+    _git(hub, "tag", "-a", "-m", "plan", "gate/1", "feature/1-work")
+
+    proc, messages = _run(hub, tmp_path, afk=True)
+
+    assert proc.returncode == 0, proc.stderr
+    assert messages == [], "the gate ping must be afk-suppressed"
+    edits = _status_edits(tmp_path)
+    assert len(edits) == 1 and "--add-label status:gate" in edits[0]
+
+
+def test_status_label_reflips_on_force_moved_marker(hub: Path, tmp_path: Path) -> None:
+    _git(hub, "tag", "-a", "-m", "plan", "gate/1", "feature/1-work")
+    seen = tmp_path / "seen"
+    label_seen = tmp_path / "label-seen"
+    _run(hub, tmp_path, seen_file=seen, env_extra={"HUB_LABEL_SEEN_FILE": str(label_seen)})
+
+    # Advance the branch and force-move the gate marker → a fresh sha → re-flip.
+    (hub / "b.txt").write_text("b\n")
+    _git(hub, "checkout", "-q", "feature/1-work")
+    _git(hub, "add", "b.txt")
+    _git(hub, "commit", "-qm", "feat: b", "-m", "Refs #1")
+    _git(hub, "tag", "-f", "-a", "-m", "plan", "gate/1", "feature/1-work")
+    _git(hub, "checkout", "-q", "main")
+    (tmp_path / "gh-calls.log").unlink(missing_ok=True)
+
+    proc, _ = _run(
+        hub, tmp_path, seen_file=seen, env_extra={"HUB_LABEL_SEEN_FILE": str(label_seen)}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert len(_status_edits(tmp_path)) == 1, "a force-moved marker must re-flip the label"
+
+
+def test_status_label_mirror_opt_out_makes_no_calls(hub: Path, tmp_path: Path) -> None:
+    _git(hub, "tag", "-a", "-m", "plan", "gate/1", "feature/1-work")
+
+    proc, _ = _run(hub, tmp_path, env_extra={"AI_TOOLKIT_GH_LIFECYCLE_LABELS": "0"})
+
+    assert proc.returncode == 0, proc.stderr
+    assert _status_edits(tmp_path) == []
+
+
+def test_status_label_mirror_survives_offline_gh(hub: Path, tmp_path: Path) -> None:
+    _git(hub, "tag", "ready/1", "feature/1-work")
+
+    proc, messages = _run(hub, tmp_path, env_extra={"GH_MIRROR_RC": "1"})
+
+    # A failing gh never breaks the watcher — the ping still fires.
+    assert proc.returncode == 0, proc.stderr
+    assert any("/land 1" in m for m in messages)
