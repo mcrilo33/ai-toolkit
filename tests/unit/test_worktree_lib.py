@@ -1715,7 +1715,7 @@ def test_workspace_remove_invalid_json_leaves_file_and_signals_fallback(
 # source the lib and drive the helpers under a logging `gh` stub, pinning the
 # exact `gh` argument vectors and the offline/disabled no-op contracts.
 
-_GH_STUB = "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_LOG\"\nexit \"${GH_RC:-0}\"\n"
+_GH_STUB = '#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$GH_LOG"\nexit "${GH_RC:-0}"\n'
 
 
 def _gh_lib_call(
@@ -1739,15 +1739,14 @@ def _gh_lib_call(
         # A `timeout` stub that records it wrapped the call, then execs the rest
         # (dropping the duration arg) so the wrapped `gh` still runs and logs.
         tstub = bindir / "timeout"
-        tstub.write_text(
-            "#!/bin/sh\n"
-            'printf "timeout %s\\n" "$1" >> "$GH_LOG"\n'
-            'shift\nexec "$@"\n'
-        )
+        tstub.write_text('#!/bin/sh\nprintf "timeout %s\\n" "$1" >> "$GH_LOG"\nshift\nexec "$@"\n')
         tstub.chmod(0o755)
     env = {**os.environ, "TZ": "UTC", "GH_LOG": str(log), "PATH": f"{bindir}:{os.environ['PATH']}"}
     env.pop("AI_TOOLKIT_GH_LIFECYCLE_LABELS", None)
     env.pop("GH_RC", None)
+    # Isolate the once-per-repo seed marker per test (else it would resolve to the real
+    # repo's .git and make seeding skip across tests).
+    env.setdefault("WT_GH_SEED_DIR", str(tmp_path / "seed"))
     if env_extra:
         env.update(env_extra)
     proc = subprocess.run(
@@ -1844,9 +1843,7 @@ def test_gh_clear_lifecycle_labels_removes_every_prefix(tmp_path: Path) -> None:
 
 
 def test_gh_dispatch_comment_posts_body(tmp_path: Path) -> None:
-    proc, calls = _gh_lib_call(
-        tmp_path, 'wt_gh_dispatch_comment 42 "dispatched: feature/42-x"'
-    )
+    proc, calls = _gh_lib_call(tmp_path, 'wt_gh_dispatch_comment 42 "dispatched: feature/42-x"')
 
     assert proc.returncode == 0, proc.stderr
     comments = [c for c in calls if c.startswith("issue comment")]
@@ -1928,5 +1925,7 @@ def test_gh_bounds_a_hung_gh_without_coreutils_timeout(tmp_path: Path) -> None:
 
     assert proc.returncode == 0, proc.stderr
     assert "rc=0" in proc.stdout
-    assert elapsed < 4, f"wt_gh must bound a hung gh even with no coreutils timeout (took {elapsed:.1f}s)"
+    assert elapsed < 4, (
+        f"wt_gh must bound a hung gh even with no coreutils timeout (took {elapsed:.1f}s)"
+    )
     assert mark.exists() and "start" in mark.read_text(), "gh must actually have been invoked"

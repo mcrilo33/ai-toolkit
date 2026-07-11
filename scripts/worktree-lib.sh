@@ -966,28 +966,59 @@ WT_GH_LANE_LABELS="lane:spoke"
 wt_gh_lifecycle_enabled() { [ "${AI_TOOLKIT_GH_LIFECYCLE_LABELS:-1}" != "0" ]; }
 
 # _wt_gh_timeout_bin -> the installed coreutils timeout binary (timeout | gtimeout),
-# or empty when neither is present (the default macOS hub ships neither, so the mirror
-# then runs gh unbounded — the pre-existing dispatch/land gh calls already do).
+# or empty when neither is present (the default macOS hub ships neither — see the
+# portable fallback in wt_gh).
 _wt_gh_timeout_bin() {
   if command -v timeout >/dev/null 2>&1; then printf 'timeout\n'
   elif command -v gtimeout >/dev/null 2>&1; then printf 'gtimeout\n'
   fi
 }
 
+# _wt_kill_tree <pid> <signal> — signal a pid and all its descendants leaf-first, so a
+# bounded gh's children (a forked git/curl helper) die with it rather than being orphaned
+# holding the pipe open. Mirrors hub-afk's _afk_kill_tree but self-contained here so the
+# lib carries no hub dependency; wt_pgrep -P matches by numeric parent pid under LC_ALL=C
+# (ASCII-safe), so the non-ASCII `pgrep -f` hazard (#189) doesn't apply.
+_wt_kill_tree() {
+  local pid="$1" sig="$2" child
+  for child in $(wt_pgrep -P "$pid" 2>/dev/null); do _wt_kill_tree "$child" "$sig"; done
+  kill "-$sig" "$pid" 2>/dev/null || true
+}
+
 # wt_gh <gh args...> — one BEST-EFFORT, time-bounded gh invocation. A no-op (rc 0,
-# execs nothing) when the mirror is disabled or gh is absent; otherwise runs gh
-# under the coreutils timeout when available (AI_TOOLKIT_GH_TIMEOUT seconds, default
-# 10), else bare. ALWAYS returns 0 — a gh failure (offline, unauthed, a hung call
-# the timeout kills) must never abort a set -e caller mid-dispatch/land/tick.
+# execs nothing) when the mirror is disabled or gh is absent. Otherwise gh is ALWAYS
+# time-bounded (AI_TOOLKIT_GH_TIMEOUT seconds, default 10): under the coreutils
+# timeout when installed, else a self-contained portable fallback that backgrounds gh
+# and kill-trees it past the deadline (SIGTERM, then SIGKILL after a short grace) — so
+# a HUNG gh (a black-hole network, not clean-offline) can NEVER freeze a caller on a
+# coreutils-less host. This is the #170 portability guarantee extended to every wt_gh
+# caller, including hub-afk's escalation path which calls the label helpers directly.
+# ALWAYS returns 0 — a gh failure or a killed hang must never abort a set -e caller.
 wt_gh() {
   wt_gh_lifecycle_enabled || return 0
   command -v gh >/dev/null 2>&1 || return 0
+  local budget="${AI_TOOLKIT_GH_TIMEOUT:-10}"
+  case "$budget" in '' | *[!0-9]*) budget=10 ;; esac
   local tbin; tbin="$(_wt_gh_timeout_bin)"
   if [ -n "$tbin" ]; then
-    "$tbin" "${AI_TOOLKIT_GH_TIMEOUT:-10}" gh "$@" >/dev/null 2>&1 || true
-  else
-    gh "$@" >/dev/null 2>&1 || true
+    "$tbin" "$budget" gh "$@" >/dev/null 2>&1 || true
+    return 0
   fi
+  # Portable fallback (no coreutils timeout): background gh, and a detached killer that
+  # kill-trees it after the budget. `wait ... || true` neutralizes errexit so a nonzero
+  # gh (or a killed hang) never aborts a set -e caller. When gh finishes first the killer
+  # is cancelled immediately (no lingering sleep), so the fast path stays fast.
+  local grace="${AI_TOOLKIT_GH_KILL_AFTER:-2}"
+  case "$grace" in '' | *[!0-9]*) grace=2 ;; esac
+  local cmd_pid killer
+  gh "$@" >/dev/null 2>&1 &
+  cmd_pid=$!
+  ( sleep "$budget"; _wt_kill_tree "$cmd_pid" TERM; sleep "$grace"; _wt_kill_tree "$cmd_pid" KILL ) \
+    </dev/null >/dev/null 2>&1 &
+  killer=$!
+  wait "$cmd_pid" 2>/dev/null || true
+  _wt_kill_tree "$killer" TERM 2>/dev/null || true   # gh finished — cancel the pending killer
+  wait "$killer" 2>/dev/null || true
   return 0
 }
 
@@ -999,31 +1030,51 @@ wt_gh_ensure_label() {
   wt_gh label create "$1" --color "$2" --description "$3" --force
 }
 
-# _wt_gh_seed_status_labels — ensure the four status:* labels exist. Guarded per
-# process so a run that mirrors several transitions seeds once. status swaps
-# --remove-label a sibling, which errors (failing the edit) unless the label
-# exists in the repo — so seeding is the precondition for a clean swap.
-_WT_GH_STATUS_SEEDED=""
-_wt_gh_seed_status_labels() {
-  [ -n "$_WT_GH_STATUS_SEEDED" ] && return 0
+# _wt_gh_seed_dir -> the dir holding the once-per-repo seed marker. WT_GH_SEED_DIR
+# overrides it (tests / a caller with no git dir); otherwise the git common dir
+# (shared across a repo's worktrees, so ONE dispatch per repo seeds and every later
+# dispatch/transition skips the label-create round-trips). Empty (rc 1) when neither
+# resolves — the seeder then falls back to a per-process guard.
+_wt_gh_seed_dir() {
+  if [ -n "${WT_GH_SEED_DIR:-}" ]; then printf '%s' "$WT_GH_SEED_DIR"; return 0; fi
+  local common
+  common="$(git rev-parse --git-common-dir 2>/dev/null)" || return 1
+  [ -n "$common" ] || return 1
+  case "$common" in /*) ;; *) common="$PWD/$common" ;; esac
+  printf '%s' "$common"
+}
+
+# _wt_gh_seed_labels — ensure ALL status:*/mode:*/lane:* labels exist in the repo, so a
+# later --add-label/--remove-label of any of them can never fail the whole edit for a
+# missing repo label. Idempotent and cheap-once: a PERSISTENT once-per-repo marker under
+# _wt_gh_seed_dir means only the FIRST dispatch/transition per repo pays the label-create
+# round-trips (the review flagged the per-process guard re-seeding every dispatch). Falls
+# back to a per-process shell guard when no seed dir resolves. All three label writers
+# (set_status / apply_dispatch / clear) route through this, so a status-only transition
+# still guarantees the mode/lane labels exist too.
+_WT_GH_LABELS_SEEDED=""
+_wt_gh_seed_labels() {
+  local dir marker
+  dir="$(_wt_gh_seed_dir 2>/dev/null || true)"
+  if [ -n "$dir" ]; then
+    marker="$dir/.gh-lifecycle-labels-seeded"
+    [ -f "$marker" ] && return 0
+  else
+    [ -n "$_WT_GH_LABELS_SEEDED" ] && return 0
+  fi
   wt_gh_ensure_label "status:in-progress" "1d76db" "spoke dispatched, working"
   wt_gh_ensure_label "status:gate"        "fbca04" "parked on a plan gate"
   wt_gh_ensure_label "status:ready"       "0e8a16" "final push, awaiting land"
   wt_gh_ensure_label "status:blocked"     "b60205" "escalated, needs a human"
-  _WT_GH_STATUS_SEEDED=1
-}
-
-# _wt_gh_seed_lifecycle_labels — ensure ALL status:*/mode:*/lane:* labels exist,
-# so a dispatch add and a land clear never fail on a missing repo label. Guarded
-# per process. Extends the status seed with the mode/lane labels.
-_WT_GH_LIFECYCLE_SEEDED=""
-_wt_gh_seed_lifecycle_labels() {
-  [ -n "$_WT_GH_LIFECYCLE_SEEDED" ] && return 0
-  _wt_gh_seed_status_labels
   wt_gh_ensure_label "mode:afk"      "5319e7" "unattended /afk drain spoke"
   wt_gh_ensure_label "mode:attended" "c5def5" "attended (interactive) spoke"
   wt_gh_ensure_label "lane:spoke"    "bfdadc" "issue-backed full-cycle spoke"
-  _WT_GH_LIFECYCLE_SEEDED=1
+  if [ -n "$dir" ]; then
+    mkdir -p "$dir" 2>/dev/null || true
+    : > "$marker" 2>/dev/null || true
+  else
+    _WT_GH_LABELS_SEEDED=1
+  fi
 }
 
 # wt_gh_set_status_label <issue> <status-label> — swap the issue's status:* label
@@ -1034,7 +1085,7 @@ wt_gh_set_status_label() {
   local issue="$1" want="$2" args=() s
   wt_gh_lifecycle_enabled || return 0
   command -v gh >/dev/null 2>&1 || return 0
-  _wt_gh_seed_status_labels
+  _wt_gh_seed_labels
   args+=(--add-label "$want")
   for s in $WT_GH_STATUS_LABELS; do
     [ "$s" = "$want" ] && continue
@@ -1050,7 +1101,7 @@ wt_gh_apply_dispatch_labels() {
   local issue="$1" mode="$2" lane="$3" args=() s
   wt_gh_lifecycle_enabled || return 0
   command -v gh >/dev/null 2>&1 || return 0
-  _wt_gh_seed_lifecycle_labels
+  _wt_gh_seed_labels
   args+=(--add-label "status:in-progress" --add-label "mode:$mode" --add-label "lane:$lane")
   for s in $WT_GH_STATUS_LABELS; do
     [ "$s" = "status:in-progress" ] && continue
@@ -1070,7 +1121,7 @@ wt_gh_clear_lifecycle_labels() {
   local issue="$1" args=() s
   wt_gh_lifecycle_enabled || return 0
   command -v gh >/dev/null 2>&1 || return 0
-  _wt_gh_seed_lifecycle_labels
+  _wt_gh_seed_labels
   for s in $WT_GH_STATUS_LABELS $WT_GH_MODE_LABELS $WT_GH_LANE_LABELS; do
     args+=(--remove-label "$s")
   done

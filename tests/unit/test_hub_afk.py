@@ -80,7 +80,11 @@ def _call(fn_call: str, *, env: dict[str, str] | None = None) -> subprocess.Comp
 
     TZ=UTC is forced so the window clock is deterministic regardless of host TZ.
     """
-    full_env = {**os.environ, "TZ": "UTC"}
+    # Default the #236 gh lifecycle-label mirror OFF: this host has an authed `gh` and
+    # _call runs with cwd = the real repo, so a reap/escalation exercising
+    # _afk_escalate_blocked would otherwise fire a REAL `gh issue edit` at the live repo.
+    # The label-assertion tests opt back in (=1) behind a PATH gh stub (_blocked_label_env).
+    full_env = {**os.environ, "TZ": "UTC", "AI_TOOLKIT_GH_LIFECYCLE_LABELS": "0"}
     if env:
         full_env.update(env)
     return subprocess.run(
@@ -6387,10 +6391,7 @@ def _blocked_label_env(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
     bindir.mkdir()
     gh_log = tmp_path / "gh-calls.log"
     gh = bindir / "gh"
-    gh.write_text(
-        "#!/bin/sh\n"
-        '{ printf "%s" "$*" | tr "\\n" " "; printf "\\n"; } >> "$GH_LOG"\n'
-    )
+    gh.write_text('#!/bin/sh\n{ printf "%s" "$*" | tr "\\n" " "; printf "\\n"; } >> "$GH_LOG"\n')
     gh.chmod(0o755)
     env = {
         "SPOKE_READY": str(ready),
@@ -6398,6 +6399,8 @@ def _blocked_label_env(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
         "GH_LOG": str(gh_log),
         "AFK_ESCALATE_SLEEP": "0",
         "AI_TOOLKIT_GH_LIFECYCLE_LABELS": "1",
+        # Isolate the once-per-repo label-seed marker so it lands in tmp, not the real .git.
+        "WT_GH_SEED_DIR": str(tmp_path / "seed"),
     }
     return env, ready_log, gh_log
 
