@@ -985,49 +985,58 @@ _wt_kill_tree() {
   kill "-$sig" "$pid" 2>/dev/null || true
 }
 
-# wt_gh <gh args...> — one BEST-EFFORT, time-bounded gh invocation. A no-op (rc 0,
-# execs nothing) when the mirror is disabled or gh is absent. Otherwise gh is ALWAYS
-# time-bounded (AI_TOOLKIT_GH_TIMEOUT seconds, default 10): under the coreutils
-# timeout when installed, else a self-contained portable fallback that backgrounds gh
-# and kill-trees it past the deadline (SIGTERM, then SIGKILL after a short grace) — so
-# a HUNG gh (a black-hole network, not clean-offline) can NEVER freeze a caller on a
-# coreutils-less host. This is the #170 portability guarantee extended to every wt_gh
-# caller, including hub-afk's escalation path which calls the label helpers directly.
-# ALWAYS returns 0 — a gh failure or a killed hang must never abort a set -e caller.
-wt_gh() {
-  wt_gh_lifecycle_enabled || return 0
-  command -v gh >/dev/null 2>&1 || return 0
+# _wt_gh_run <gh args...> — bounded gh returning gh's REAL exit code (0 success; nonzero
+# on a gh failure OR a killed timeout; 127 when gh is absent). gh is ALWAYS time-bounded
+# (AI_TOOLKIT_GH_TIMEOUT seconds, default 10): under the coreutils timeout when installed,
+# else a self-contained portable fallback that backgrounds gh and kill-trees it past the
+# deadline (SIGTERM, then SIGKILL after a short grace) — so a HUNG gh (a black-hole network,
+# not clean-offline) can NEVER freeze a caller on a coreutils-less host (#170 guarantee).
+# Every branch uses an `if`/`else` (never `cmd; return $?`) so capturing the rc can't itself
+# trip a set -e caller's errexit. The seeder needs the real rc to tell a real create from a
+# swallowed failure; callers that don't care use wt_gh (which discards it).
+_wt_gh_run() {
+  command -v gh >/dev/null 2>&1 || return 127
   local budget="${AI_TOOLKIT_GH_TIMEOUT:-10}"
   case "$budget" in '' | *[!0-9]*) budget=10 ;; esac
   local tbin; tbin="$(_wt_gh_timeout_bin)"
   if [ -n "$tbin" ]; then
-    "$tbin" "$budget" gh "$@" >/dev/null 2>&1 || true
-    return 0
+    if "$tbin" "$budget" gh "$@" >/dev/null 2>&1; then return 0; else return $?; fi
   fi
-  # Portable fallback (no coreutils timeout): background gh, and a detached killer that
-  # kill-trees it after the budget. `wait ... || true` neutralizes errexit so a nonzero
-  # gh (or a killed hang) never aborts a set -e caller. When gh finishes first the killer
-  # is cancelled immediately (no lingering sleep), so the fast path stays fast.
+  # Portable fallback: background gh + a detached killer that kill-trees it after the
+  # budget. When gh finishes first the killer is cancelled immediately (no lingering
+  # sleep), so the fast path stays fast.
   local grace="${AI_TOOLKIT_GH_KILL_AFTER:-2}"
   case "$grace" in '' | *[!0-9]*) grace=2 ;; esac
-  local cmd_pid killer
+  local cmd_pid killer rc
   gh "$@" >/dev/null 2>&1 &
   cmd_pid=$!
   ( sleep "$budget"; _wt_kill_tree "$cmd_pid" TERM; sleep "$grace"; _wt_kill_tree "$cmd_pid" KILL ) \
     </dev/null >/dev/null 2>&1 &
   killer=$!
-  wait "$cmd_pid" 2>/dev/null || true
+  if wait "$cmd_pid" 2>/dev/null; then rc=0; else rc=$?; fi
   _wt_kill_tree "$killer" TERM 2>/dev/null || true   # gh finished — cancel the pending killer
   wait "$killer" 2>/dev/null || true
+  return "$rc"
+}
+
+# wt_gh <gh args...> — one BEST-EFFORT, time-bounded gh invocation. A no-op (rc 0) when
+# the mirror is disabled or gh is absent; otherwise runs _wt_gh_run and DISCARDS its exit
+# code. ALWAYS returns 0 — a gh failure or a killed hang must never abort a set -e caller
+# mid-dispatch/land/tick. Used for the label edits and the dispatch comment, where the
+# outcome doesn't gate anything.
+wt_gh() {
+  wt_gh_lifecycle_enabled || return 0
+  _wt_gh_run "$@" || true
   return 0
 }
 
 # wt_gh_ensure_label <name> <color> <desc> — idempotently create/update a label
 # (`gh label create --force` updates an existing one rather than erroring), so a
-# later --add-label/--remove-label of it can never fail the whole edit for a
-# missing repo label. Best-effort.
+# later --add-label/--remove-label of it can never fail the whole edit for a missing
+# repo label. RETURNS the real gh exit code (via _wt_gh_run) so the seeder can gate the
+# persistent marker on a proven success. Call it in an `&&`/`||`/`if` context under set -e.
 wt_gh_ensure_label() {
-  wt_gh label create "$1" --color "$2" --description "$3" --force
+  _wt_gh_run label create "$1" --color "$2" --description "$3" --force
 }
 
 # _wt_gh_seed_dir -> the dir holding the once-per-repo seed marker. WT_GH_SEED_DIR
@@ -1047,14 +1056,24 @@ _wt_gh_seed_dir() {
 # _wt_gh_seed_labels — ensure ALL status:*/mode:*/lane:* labels exist in the repo, so a
 # later --add-label/--remove-label of any of them can never fail the whole edit for a
 # missing repo label. Idempotent and cheap-once: a PERSISTENT once-per-repo marker under
-# _wt_gh_seed_dir means only the FIRST dispatch/transition per repo pays the label-create
-# round-trips (the review flagged the per-process guard re-seeding every dispatch). Falls
-# back to a per-process shell guard when no seed dir resolves. All three label writers
-# (set_status / apply_dispatch / clear) route through this, so a status-only transition
-# still guarantees the mode/lane labels exist too.
+# _wt_gh_seed_dir means only the FIRST *successful* dispatch/transition per repo pays the
+# label-create round-trips (the review flagged the per-process guard re-seeding every
+# dispatch). Falls back to a per-process shell guard when no seed dir resolves. All three
+# label writers (set_status / apply_dispatch / clear) route through this, so a status-only
+# transition still guarantees the mode/lane labels exist too.
+#
+# The marker is persisted ONLY when EVERY create succeeded (all_ok). A first seed whose gh
+# calls fail — offline, unauthed, or a hung gh the timeout kills (the exact black-hole path
+# #236 hardens) — must NOT stamp the marker, or it would permanently skip re-seeding and
+# leave the mirror dead for the repo with no self-heal. On any failure the marker stays
+# unwritten and the NEXT transition retries seeding (gh label create --force is idempotent,
+# so a re-seed after a partial success is harmless). Recovery from a stale marker is simply
+# `rm <git-common-dir>/.gh-lifecycle-labels-seeded`.
 _WT_GH_LABELS_SEEDED=""
 _wt_gh_seed_labels() {
-  local dir marker
+  wt_gh_lifecycle_enabled || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  local dir marker all_ok=1
   dir="$(_wt_gh_seed_dir 2>/dev/null || true)"
   if [ -n "$dir" ]; then
     marker="$dir/.gh-lifecycle-labels-seeded"
@@ -1062,13 +1081,16 @@ _wt_gh_seed_labels() {
   else
     [ -n "$_WT_GH_LABELS_SEEDED" ] && return 0
   fi
-  wt_gh_ensure_label "status:in-progress" "1d76db" "spoke dispatched, working"
-  wt_gh_ensure_label "status:gate"        "fbca04" "parked on a plan gate"
-  wt_gh_ensure_label "status:ready"       "0e8a16" "final push, awaiting land"
-  wt_gh_ensure_label "status:blocked"     "b60205" "escalated, needs a human"
-  wt_gh_ensure_label "mode:afk"      "5319e7" "unattended /afk drain spoke"
-  wt_gh_ensure_label "mode:attended" "c5def5" "attended (interactive) spoke"
-  wt_gh_ensure_label "lane:spoke"    "bfdadc" "issue-backed full-cycle spoke"
+  # `|| all_ok=0` keeps errexit from aborting on a failed create (the failure is on the
+  # left of ||), and records that this seed pass is not fully proven.
+  wt_gh_ensure_label "status:in-progress" "1d76db" "spoke dispatched, working" || all_ok=0
+  wt_gh_ensure_label "status:gate"        "fbca04" "parked on a plan gate" || all_ok=0
+  wt_gh_ensure_label "status:ready"       "0e8a16" "final push, awaiting land" || all_ok=0
+  wt_gh_ensure_label "status:blocked"     "b60205" "escalated, needs a human" || all_ok=0
+  wt_gh_ensure_label "mode:afk"      "5319e7" "unattended /afk drain spoke" || all_ok=0
+  wt_gh_ensure_label "mode:attended" "c5def5" "attended (interactive) spoke" || all_ok=0
+  wt_gh_ensure_label "lane:spoke"    "bfdadc" "issue-backed full-cycle spoke" || all_ok=0
+  [ "$all_ok" = "1" ] || return 0   # a failed seed leaves NO marker so it self-heals
   if [ -n "$dir" ]; then
     mkdir -p "$dir" 2>/dev/null || true
     : > "$marker" 2>/dev/null || true

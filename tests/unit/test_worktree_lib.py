@@ -1929,3 +1929,34 @@ def test_gh_bounds_a_hung_gh_without_coreutils_timeout(tmp_path: Path) -> None:
         f"wt_gh must bound a hung gh even with no coreutils timeout (took {elapsed:.1f}s)"
     )
     assert mark.exists() and "start" in mark.read_text(), "gh must actually have been invoked"
+
+
+def test_gh_seed_marker_only_persists_on_success_and_self_heals(tmp_path: Path) -> None:
+    # A first seed whose gh calls FAIL (offline / hung / unauthed) must NOT stamp the
+    # persistent once-per-repo marker — else it would permanently skip re-seeding and leave
+    # the label mirror dead for the repo (the review's poisoned-marker regression). On the
+    # NEXT (successful) transition the seed self-heals. gh label create --force is idempotent.
+    seed_dir = tmp_path / "shared-seed"
+    marker = seed_dir / ".gh-lifecycle-labels-seeded"
+    t1 = tmp_path / "run1"
+    t1.mkdir()
+    t2 = tmp_path / "run2"
+    t2.mkdir()
+
+    proc1, _ = _gh_lib_call(
+        t1,
+        "wt_gh_set_status_label 42 status:gate",
+        env_extra={"WT_GH_SEED_DIR": str(seed_dir), "GH_RC": "1"},
+    )
+    assert proc1.returncode == 0, proc1.stderr
+    assert not marker.exists(), "a failed first seed must not stamp the persistent marker"
+
+    proc2, calls2 = _gh_lib_call(
+        t2,
+        "wt_gh_set_status_label 42 status:gate",
+        env_extra={"WT_GH_SEED_DIR": str(seed_dir)},
+    )
+    assert proc2.returncode == 0, proc2.stderr
+    assert marker.exists(), "a fully-successful seed must stamp the marker"
+    seeded = {c.split()[2] for c in calls2 if c.startswith("label create")}
+    assert "status:gate" in seeded, "the second run must re-seed — the failed run left no marker"
