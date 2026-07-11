@@ -54,6 +54,19 @@ _STEP_PHASES = ("ANCHOR", "RED", "GREEN", "REVIEW", "PUSH")
 _STEP_PHASE_OTHER = "other"
 _STEP_PHASE_RE = re.compile(rf"\b({'|'.join(_STEP_PHASES)})\b")
 
+# Per-rule / per-tooldef carry-cost scores (#232): what a rule or tool schema costs EVERY request
+# just by being loaded, whether it is ever invoked. A loaded prefix is cache-WRITTEN once, then
+# cache-READ on every request. Anthropic prices a 5-min cache write at 1.25x base input and a cache
+# read at 0.1x, so a read is 0.1/1.25 = 0.08x the cache-write price the rest of this module carries.
+_CACHE_READ_RATIO = 0.08
+_RULE_CARRY_COST_SCORE = "rule_carry_cost_usd"  # per rule file in the loaded-context breakdown
+_TOOLDEF_CARRY_COST_SCORE = "tooldef_carry_cost_usd"  # per tool / mcp schema
+# Tool names (built-in + MCP + deferred) run to 100+, but a score NAME is a metrics dimension, so
+# only the top-N most expensive tool defs get their own score; the cheaper tail folds into a single
+# ``:other`` bucket (a visible, non-silent cap). Rule names are a small closed set and stay uncapped.
+_TOOLDEF_SCORE_TOP_N = 15
+_TOOLDEF_OTHER_KEY = "other"
+
 
 def _score_id(spoke_run_id: str, name: str, target: str) -> str:
     """Return the deterministic id of one score for a spoke (idempotent across reruns)."""
@@ -153,6 +166,126 @@ def build_score_events(
                 spoke_run_id,
                 name=_GATE_PARK_SCORE,
                 value=park,
+                trace_id=trace_id,
+                base_ts=base_ts,
+            )
+        )
+    return events
+
+
+def _carry_cost_usd(tokens: int, n_requests: int, price: float) -> float:
+    """Return the USD a loaded item of ``tokens`` costs across ``n_requests`` (#232).
+
+    The item sits in the cached prefix: cache-WRITTEN once (``tokens x price``, the cache-creation
+    price the module carries) and cache-READ on every request (``tokens x n_requests x`` the cheaper
+    read price). Carry cost is dominated by the read term; the one-time write share is added once.
+    """
+    return tokens * (n_requests * price * _CACHE_READ_RATIO + price)
+
+
+def _tokens_by_name(rows: list[dict[str, Any]], categories: tuple[str, ...]) -> dict[str, int]:
+    """Sum loaded-context row tokens by ``name`` for the given categories (duplicate names summed).
+
+    Mirrors the loaded-context breakdown, which sums duplicate ``(category, name)`` rows (e.g. a
+    nested ``CLAUDE.md``) so each name is weighed once.
+    """
+    tokens: dict[str, int] = {}
+    for row in rows:
+        if row.get("category") not in categories:
+            continue
+        name = str(row.get("name"))
+        tokens[name] = tokens.get(name, 0) + int(row.get("tokens") or 0)
+    return tokens
+
+
+def build_rule_carry_cost_scores(
+    spoke_run_id: str,
+    rows: list[dict[str, Any]],
+    n_requests: int,
+    *,
+    base_ts: str,
+    price: float,
+) -> list[IngestEvent]:
+    """Build per-rule ``rule_carry_cost_usd:<rule>`` scores from the loaded-context rows (#232).
+
+    Every rule file the loaded-context breakdown itemizes (``operational-gotchas.md``, ``MEMORY.md``,
+    a glob-scoped rule that got injected, …) costs tokens on EVERY request whether or not it is ever
+    invoked. Each rule's carry cost (:func:`_carry_cost_usd`) is emitted as a trace-level NUMERIC
+    score named by the rule; paired with ``rule_invocations:<rule>`` (same suffix) a dashboard can
+    rank rules by carry cost filtered to zero invocations. Rule names are a small closed set, so —
+    unlike tool defs — they are uncapped. Ids derive from the spoke run id (idempotent reruns).
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids).
+        rows: The loaded-context measured rows (``category`` / ``name`` / ``tokens`` read).
+        n_requests: The count of real LLM requests over the spoke (the read multiplier).
+        base_ts: ISO timestamp stamped on every score event.
+        price: Cache-creation (write) price in USD per token.
+
+    Returns:
+        The ``score-create`` events, one per rule file (empty when no rule rows are present).
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    return [
+        _score_event(
+            spoke_run_id,
+            name=f"{_RULE_CARRY_COST_SCORE}:{rule}",
+            value=_carry_cost_usd(tokens, n_requests, price),
+            trace_id=trace_id,
+            base_ts=base_ts,
+        )
+        for rule, tokens in sorted(_tokens_by_name(rows, ("rules",)).items())
+    ]
+
+
+def build_tooldef_carry_cost_scores(
+    spoke_run_id: str,
+    rows: list[dict[str, Any]],
+    n_requests: int,
+    *,
+    base_ts: str,
+    price: float,
+) -> list[IngestEvent]:
+    """Build per-tool ``tooldef_carry_cost_usd:<tool>`` scores from the loaded-context rows (#232).
+
+    A tool schema is loaded-context too — the ``Workflow`` def alone is ~5.3k tokens/request — so it
+    carries the same cost model as a rule (:func:`_carry_cost_usd`). Tool names (built-in + MCP +
+    deferred) run to 100+, so only the :data:`_TOOLDEF_SCORE_TOP_N` most expensive get their own
+    score; the cheaper tail folds into one ``tooldef_carry_cost_usd:other`` bucket (a visible cap,
+    not a silent drop). Ties break by name so the cut is byte-stable across reruns. Trace-level
+    NUMERIC scores; ids derive from the spoke run id.
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids).
+        rows: The loaded-context measured rows (``tools`` and ``mcp`` categories read).
+        n_requests: The count of real LLM requests over the spoke (the read multiplier).
+        base_ts: ISO timestamp stamped on every score event.
+        price: Cache-creation (write) price in USD per token.
+
+    Returns:
+        The ``score-create`` events: the top-N tools plus one ``:other`` fold when any were cut
+        (empty when no tool rows are present).
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    by_tokens = _tokens_by_name(rows, ("tools", "mcp"))
+    ranked = sorted(by_tokens.items(), key=lambda item: (-item[1], item[0]))
+    events: list[IngestEvent] = [
+        _score_event(
+            spoke_run_id,
+            name=f"{_TOOLDEF_CARRY_COST_SCORE}:{tool}",
+            value=_carry_cost_usd(tokens, n_requests, price),
+            trace_id=trace_id,
+            base_ts=base_ts,
+        )
+        for tool, tokens in ranked[:_TOOLDEF_SCORE_TOP_N]
+    ]
+    folded_tokens = sum(tokens for _tool, tokens in ranked[_TOOLDEF_SCORE_TOP_N:])
+    if folded_tokens:
+        events.append(
+            _score_event(
+                spoke_run_id,
+                name=f"{_TOOLDEF_CARRY_COST_SCORE}:{_TOOLDEF_OTHER_KEY}",
+                value=_carry_cost_usd(folded_tokens, n_requests, price),
                 trace_id=trace_id,
                 base_ts=base_ts,
             )

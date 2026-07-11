@@ -224,16 +224,19 @@ from telemetry.spoke_tree.observations import (
     _earliest_start,
     _is_cycle_step_marker,
     _latest_time,
+    _llm_requests_in_order,
 )
 from telemetry.spoke_tree.rollups import (
     _apply_container_rollups,
     _strip_container_usage,
 )
 from telemetry.spoke_tree.scores import (
+    build_rule_carry_cost_scores,
     build_score_events,
     build_step_cost_scores,
     build_step_duration_scores,
     build_step_total_cost_scores,
+    build_tooldef_carry_cost_scores,
 )
 from telemetry.spoke_tree.steps import (
     _apply_step_grouping,
@@ -882,6 +885,7 @@ class EnrichmentContext:
     price: float
     base_ts: str
     root: Path
+    n_requests: int = 0
     # Accumulated outputs (populated by the passes, read by the summary line).
     context_events: list[IngestEvent] = field(default_factory=list)
     rows: list[dict[str, object]] = field(default_factory=list)
@@ -891,6 +895,7 @@ class EnrichmentContext:
     deltas: dict[tuple[str, str], dict[str, int]] = field(default_factory=dict)
     score_events: list[IngestEvent] = field(default_factory=list)
     step_scores: list[IngestEvent] = field(default_factory=list)
+    carry_scores: list[IngestEvent] = field(default_factory=list)
 
 
 def _enrich_loaded_context(ctx: EnrichmentContext) -> None:
@@ -962,6 +967,19 @@ def _enrich_step_scores(ctx: EnrichmentContext) -> None:
     )
 
 
+def _enrich_carry_cost(ctx: EnrichmentContext) -> None:
+    """Emit per-rule + per-tooldef carry-cost scores from the loaded-context rows (#232).
+
+    Reads the same measured rows the loaded-context node collapsed (populated by
+    :func:`_enrich_loaded_context`, so this pass runs after it) and the once-computed request count.
+    """
+    ctx.carry_scores = build_rule_carry_cost_scores(
+        ctx.spoke_run_id, ctx.rows, ctx.n_requests, base_ts=ctx.base_ts, price=ctx.price
+    ) + build_tooldef_carry_cost_scores(
+        ctx.spoke_run_id, ctx.rows, ctx.n_requests, base_ts=ctx.base_ts, price=ctx.price
+    )
+
+
 # The enrichment passes, in the exact order main applies them. Adding a future enrichment is one
 # module + one line here; the passes mutate the batches / accumulate onto the shared context above
 # (a plain ordered list, deliberately not a self-registering registry — the cross-pass data flow
@@ -973,6 +991,7 @@ _ENRICHMENTS: tuple[tuple[str, Callable[[EnrichmentContext], None]], ...] = (
     ("context-deltas", _enrich_context_deltas),
     ("scores", _enrich_scores),
     ("step-scores", _enrich_step_scores),
+    ("carry-cost", _enrich_carry_cost),
 )
 
 
@@ -1041,11 +1060,18 @@ def main(argv: list[str] | None = None) -> int:
         price=args.price,
         base_ts=base_ts,
         root=args.root.resolve(),
+        n_requests=len(_llm_requests_in_order(traces)),
     )
     for _name, enrich in _ENRICHMENTS:
         enrich(ctx)
     post_in_chunks(
-        batch + ctx.context_events + ctx.score_events + cycle_batch + ctx.step_scores, post
+        batch
+        + ctx.context_events
+        + ctx.score_events
+        + cycle_batch
+        + ctx.step_scores
+        + ctx.carry_scores,
+        post,
     )
 
     trace_id = trace_id_for(args.spoke_run_id)
@@ -1060,6 +1086,8 @@ def main(argv: list[str] | None = None) -> int:
         f"{ctx.efforts} llm_requests effort-tagged, "
         f"{len(ctx.score_events)} numeric scores emitted, "
         f"{len(ctx.step_scores)} per-phase step cost/token/duration scores emitted, "
+        f"{len(ctx.carry_scores)} rule/tooldef carry-cost scores emitted "
+        f"(n_requests={ctx.n_requests}), "
         f"{len(commits)} commit nodes synthesized, "
         f"tagged mode={mode} lane={lane}; "
         f"{len(cycle_batch) - 2} observations assembled under cycle trace {cycle_trace_id}"
