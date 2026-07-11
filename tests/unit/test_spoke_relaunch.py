@@ -153,24 +153,26 @@ def _detach_head(wt: Path) -> None:
     subprocess.run(["git", "checkout", "-q", head], cwd=str(wt), check=True, env=_GIT_ENV)
 
 
-def test_detached_head_refuses_to_spawn_without_force(spoke_worktree, tmp_path: Path) -> None:
-    main, wt = spoke_worktree
-    _detach_head(wt)  # the live window's branch-slug name is now unrecoverable
-
-    proc, _calls = _run(main, str(wt), tmp_path=tmp_path)
-
-    # The guard cannot prove the pane is dead, so it must fail safe rather than risk a double launch.
-    assert proc.returncode != 0
-    assert "detached-HEAD" in proc.stderr
-
-
-def test_detached_head_with_force_tags_from_dir_not_literal_head(
+def test_detached_head_warns_but_proceeds_so_unattended_recovery_works(
     spoke_worktree, tmp_path: Path
 ) -> None:
     main, wt = spoke_worktree
+    _detach_head(wt)  # the live window's branch-slug name is now unrecoverable
+
+    proc, calls = _run(main, str(wt), tmp_path=tmp_path)
+
+    # Recovery is the script's primary job (the hub only relaunches a pane it believes dead), so
+    # a detached HEAD warns about the un-guardable case but still relaunches — it must not block.
+    assert proc.returncode == 0, proc.stderr
+    assert "detached-HEAD" in proc.stderr
+    assert any(ln.startswith("new-window") for ln in calls.splitlines())
+
+
+def test_detached_head_tags_from_dir_not_literal_head(spoke_worktree, tmp_path: Path) -> None:
+    main, wt = spoke_worktree
     _detach_head(wt)
 
-    proc, calls = _run(main, str(wt), "--force", tmp_path=tmp_path)
+    proc, calls = _run(main, str(wt), tmp_path=tmp_path)
 
     assert proc.returncode == 0, proc.stderr
     # AGENT_CMD (with WT_SPOKE) is the new-window shell command, so both the tag and the window
