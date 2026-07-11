@@ -39,6 +39,8 @@ from telemetry.langfuse_spoke_tree import (
     build_loaded_context_events,
     build_score_events,
     build_step_cost_scores,
+    build_step_duration_scores,
+    build_step_total_cost_scores,
     cycle_copy_id_for,
     cycle_root_id_for,
     cycle_trace_id_for,
@@ -160,7 +162,18 @@ def _by_orig(batch: list[dict], orig_trace_id: str, orig_obs_id: str) -> dict:
 
 def _dur(total_ms: int, components: dict[str, int] | None = None) -> dict:
     """The expected ``rollup.duration`` object: every class key present, zeros filled in."""
-    classes = ("llm_request", "tool", "hook", "script", "step", "wait", "turn", "self", "other")
+    classes = (
+        "llm_request",
+        "sub-agent",
+        "tool",
+        "hook",
+        "script",
+        "step",
+        "wait",
+        "turn",
+        "self",
+        "other",
+    )
     filled = {key: 0 for key in classes}
     filled.update(components or {})
     return {"total_ms": total_ms, "components": filled}
@@ -2324,7 +2337,7 @@ class TestCycleMarkerSpine:
 
         scores = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
 
-        assert "step_cost_usd:GREEN" in {s["body"]["name"] for s in scores}
+        assert "step_cache_write_usd:GREEN" in {s["body"]["name"] for s in scores}
 
     def test_marker_span_not_rendered_as_orphan_node_in_cycle_view(self) -> None:
         cycle = build_cycle_batch(self._marker_only_traces(), SPOKE, {})
@@ -2337,6 +2350,135 @@ class TestCycleMarkerSpine:
 
         names = {e["body"].get("name") for e in batch}
         assert not (names & {"step:red", "step:green", "step:review", "step:push"})
+
+
+class TestStepTotalCostScores:
+    """#230: ``step_total_cost_usd:<PHASE>`` windows EVERY generation's true cost into its step.
+
+    Unlike ``step_cache_write_usd`` (cache-write cost only), this sums each generation's full
+    Langfuse ``costDetails`` — main-loop ``claude_code.llm_request`` AND ``sub-agent:llm`` — into
+    the cycle-step that contains it (nearest step ancestor), so the per-phase scores sum to the
+    trace's total cost with only the pre-first-step spend left in a ``:pre`` residual.
+    """
+
+    _BASE_TS = "2026-01-02T00:00:00Z"
+
+    def _traces(self) -> list[tuple[str, list[dict]]]:
+        # Marker spine: red@02 green@10 review@25 push@30. A pre-step generation, a main-loop
+        # generation + a sub-agent (container + sub-agent:llm) in GREEN, and a PUSH generation.
+        pre_gen = _obs(
+            "pg",
+            "claude_code.llm_request",
+            type_="GENERATION",
+            parent=None,
+            startTime="2026-01-02T00:00:01Z",
+            endTime="2026-01-02T00:00:01Z",
+            usageDetails={"input": 5},
+            costDetails={"total": 0.10},
+        )
+        main_gen = _obs(
+            "mg",
+            "claude_code.llm_request",
+            type_="GENERATION",
+            parent=None,
+            startTime="2026-01-02T00:00:12Z",
+            endTime="2026-01-02T00:00:13Z",
+            usageDetails={"input": 30, "output": 70},
+            # component-only costDetails (no explicit total) — exercises the summed-components path.
+            costDetails={"input": 0.30, "output": 0.70},
+        )
+        sa_container = _obs(
+            "sac",
+            "sub-agent:code-review",
+            parent=None,
+            startTime="2026-01-02T00:00:13Z",
+            endTime="2026-01-02T00:00:20Z",
+        )
+        sa_gen = _obs(
+            "sag",
+            "sub-agent:llm",
+            type_="GENERATION",
+            parent="sac",
+            startTime="2026-01-02T00:00:14Z",
+            endTime="2026-01-02T00:00:19Z",
+            usageDetails={"input": 200, "output": 40},
+            costDetails={"total": 2.00},
+        )
+        push_gen = _obs(
+            "pushg",
+            "claude_code.llm_request",
+            type_="GENERATION",
+            parent=None,
+            startTime="2026-01-02T00:00:31Z",
+            endTime="2026-01-02T00:00:32Z",
+            usageDetails={"input": 8},
+            costDetails={"total": 0.50},
+        )
+        return [
+            (
+                "tr",
+                [
+                    _marker("m1", "red", "2026-01-02T00:00:02Z"),
+                    _marker("m2", "green", "2026-01-02T00:00:10Z"),
+                    _marker("m3", "review", "2026-01-02T00:00:25Z"),
+                    _marker("m4", "push", "2026-01-02T00:00:30Z"),
+                    pre_gen,
+                    main_gen,
+                    sa_container,
+                    sa_gen,
+                    push_gen,
+                ],
+            )
+        ]
+
+    def _by_name(self, scores: list[dict]) -> dict[str, float]:
+        return {s["body"]["name"]: s["body"]["value"] for s in scores}
+
+    def test_green_step_sums_main_loop_and_sub_agent_cost(self) -> None:
+        cycle = build_cycle_batch(self._traces(), SPOKE, {})
+
+        scores = build_step_total_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS)
+
+        # main_gen (0.30 + 0.70) + sa_gen (2.00) both fall in the GREEN window.
+        assert self._by_name(scores)["step_total_cost_usd:GREEN"] == pytest.approx(3.00)
+
+    def test_green_score_is_observation_scoped_to_the_green_step(self) -> None:
+        cycle = build_cycle_batch(self._traces(), SPOKE, {})
+        green = _cycle_step(cycle, "step:GREEN")
+
+        scores = build_step_total_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS)
+
+        green_score = next(s for s in scores if s["body"]["name"] == "step_total_cost_usd:GREEN")
+        assert green_score["body"]["observationId"] == green["body"]["id"]
+
+    def test_pre_first_step_spend_is_reported_as_pre(self) -> None:
+        cycle = build_cycle_batch(self._traces(), SPOKE, {})
+
+        scores = build_step_total_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS)
+
+        assert self._by_name(scores)["step_total_cost_usd:pre"] == pytest.approx(0.10)
+
+    def test_phase_scores_sum_to_the_whole_trace_cost(self) -> None:
+        cycle = build_cycle_batch(self._traces(), SPOKE, {})
+
+        scores = build_step_total_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS)
+
+        total = sum(
+            s["body"]["value"]
+            for s in scores
+            if s["body"]["name"].startswith("step_total_cost_usd:")
+        )
+        # 0.10 (pre) + 3.00 (green) + 0.50 (push) == every generation's costDetails.
+        assert total == pytest.approx(3.60)
+
+    def test_green_step_duration_score_is_the_window_length(self) -> None:
+        # GREEN spans green@10 -> review@25 = 15s, dashboardable as a numeric score.
+        cycle = build_cycle_batch(self._traces(), SPOKE, {})
+
+        scores = build_step_duration_scores(SPOKE, cycle, base_ts=self._BASE_TS)
+
+        by_name = {s["body"]["name"]: s["body"]["value"] for s in scores}
+        assert by_name["step_duration_ms:GREEN"] == 15000
 
 
 def _root_marker(obs_id: str, name: str, start: str) -> dict:
@@ -4940,7 +5082,7 @@ class TestStepPhaseParser:
 
 
 class TestStepCostScores:
-    """#158: per-phase ``step_cost_usd:<PHASE>`` / ``step_tokens_written:<PHASE>`` scores.
+    """#158: per-phase ``step_cache_write_usd:<PHASE>`` / ``step_tokens_written:<PHASE>`` scores.
 
     ``step:*`` nodes carry token rollups only in ``metadata.rollup`` (no ``usageDetails`` — the
     #114 double-count guard), so per-step cost is invisible to the Metrics API. Score NAMES are a
@@ -5013,7 +5155,7 @@ class TestStepCostScores:
         scores = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
 
         names = {s["body"]["name"] for s in scores}
-        assert "step_cost_usd:RED" in names
+        assert "step_cache_write_usd:RED" in names
         assert "step_tokens_written:RED" in names
 
     def test_boundary_partition_maps_to_pre_phase(self) -> None:
@@ -5025,7 +5167,7 @@ class TestStepCostScores:
 
         pre = _cycle_step(cycle, "preStep")
         assert any(
-            s["body"]["name"] == "step_cost_usd:pre"
+            s["body"]["name"] == "step_cache_write_usd:pre"
             and s["body"]["observationId"] == pre["body"]["id"]
             for s in scores
         )
@@ -5037,7 +5179,7 @@ class TestStepCostScores:
 
         scores = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
 
-        cost = next(s for s in scores if s["body"]["name"] == "step_cost_usd:RED")
+        cost = next(s for s in scores if s["body"]["name"] == "step_cache_write_usd:RED")
         assert cost["body"]["value"] == pytest.approx(written * 0.001)
         assert cost["body"]["observationId"] == step["body"]["id"]
 
@@ -5055,7 +5197,7 @@ class TestStepCostScores:
 
         scores = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
 
-        red_costs = [s for s in scores if s["body"]["name"] == "step_cost_usd:RED"]
+        red_costs = [s for s in scores if s["body"]["name"] == "step_cache_write_usd:RED"]
         assert len(red_costs) == 1
 
     def test_view_a_score_events_carry_no_step_cost_scores(self) -> None:
@@ -5064,7 +5206,7 @@ class TestStepCostScores:
 
         view_a = build_score_events(SPOKE, self._traces(), batch, base_ts=self._BASE_TS)
 
-        assert not any(s["body"]["name"].startswith("step_cost_usd:") for s in view_a)
+        assert not any(s["body"]["name"].startswith("step_cache_write_usd:") for s in view_a)
 
     def test_scores_are_deterministic_across_reruns(self) -> None:
         cycle = build_cycle_batch(self._traces(), SPOKE, self._content())

@@ -53,6 +53,20 @@ class TestDurationClass:
     def test_unknown_is_other(self) -> None:
         assert _duration_class({"type": "span-create", "body": {"name": "mystery"}}) == "other"
 
+    def test_sub_agent_generation_is_sub_agent(self) -> None:
+        # #230: a sub-agent's LLM call (``sub-agent:llm``) books to the sub-agent bucket, not
+        # llm_request — the name prefix is checked before the generation branch.
+        assert (
+            _duration_class({"type": "generation-create", "body": {"name": "sub-agent:llm"}})
+            == "sub-agent"
+        )
+
+    def test_sub_agent_container_is_sub_agent(self) -> None:
+        assert (
+            _duration_class({"type": "span-create", "body": {"name": "sub-agent:code-review"}})
+            == "sub-agent"
+        )
+
 
 class TestUnionMs:
     def test_overlapping_intervals_counted_once(self) -> None:
@@ -104,6 +118,42 @@ class TestApplyContainerRollups:
         ]
         _apply_container_rollups(events)
         assert "rollup" not in events[0]["body"].get("metadata", {})
+
+    def test_sub_agent_subtree_books_the_sub_agent_bucket(self) -> None:
+        # #230: a sub-agent container + its LLM call book their wall-clock to the ``sub-agent``
+        # duration bucket, not ``llm_request``/``other``, so the step's ``self`` shrinks.
+        events = [
+            _span(
+                "root",
+                parent=None,
+                start="2026-01-02T00:00:00Z",
+                end="2026-01-02T00:00:10Z",
+                name="spoke:x",
+            ),
+            _span(
+                "sa",
+                parent="root",
+                start="2026-01-02T00:00:01Z",
+                end="2026-01-02T00:00:09Z",
+                name="sub-agent:code-review",
+            ),
+            {
+                "id": "sag",
+                "type": "generation-create",
+                "body": {
+                    "id": "sag",
+                    "parentObservationId": "sa",
+                    "name": "sub-agent:llm",
+                    "startTime": "2026-01-02T00:00:02Z",
+                    "endTime": "2026-01-02T00:00:08Z",
+                    "usageDetails": {"input": 10, "output": 5},
+                },
+            },
+        ]
+        _apply_container_rollups(events)
+        components = events[0]["body"]["metadata"]["rollup"]["duration"]["components"]
+        assert components["sub-agent"] == 8000
+        assert components["llm_request"] == 0
 
 
 class TestStripContainerUsage:

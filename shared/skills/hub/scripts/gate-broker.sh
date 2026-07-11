@@ -134,11 +134,12 @@ stamp_answer_attempt()  { _stamp_issue_epoch answer-attempt "$1"; }
 read_answer_attempt()   { _read_issue_epoch answer-attempt "$1"; }
 # Fresh window ⇒ no stale progress/attempt state: a leftover answer-attempt epoch
 # would suppress a legitimate idle reap in the next window; a leftover re-answer counter
-# (#203) would strand a spoke at a ceiling reached in a prior window.
+# (#203) would strand a spoke at a ceiling reached in a prior window; a leftover gate-voided /
+# terminal-logged marker (#237) would keep a since-resolved gate terminal across windows.
 _clear_progress_state() {
   local dir; dir="$(_afk_state_dir)"
   rm -f "$dir"/progress-*.epoch "$dir"/answer-attempt-*.epoch "$dir"/tip-* \
-    "$dir"/reanswer-* 2>/dev/null || true
+    "$dir"/reanswer-* "$dir"/gate-voided-* "$dir"/terminal-logged-* 2>/dev/null || true
 }
 
 # --- re-answer ceiling (issue #203, finding 1) --------------------------------
@@ -190,6 +191,37 @@ _broker_reanswer_exhausted() {
   mkdir -p "$(dirname "$f")" 2>/dev/null || true
   printf '%s\t%s\t%s\n' "$tip" "$sig" "$(( prev_n + 1 ))" > "$f" 2>/dev/null || true
   return 1
+}
+
+# --- terminal gate markers (issue #237) ---------------------------------------
+# A reasoner mutation-void is terminal on the FIRST occurrence: the reasoner wrote the
+# spoke's live tree, so a human is required regardless of the parked prompt or branch tip.
+# Unlike the (tip, sig) re-answer ceiling — which the mutation itself perturbs, since the
+# write moves the tip and flips the pending command, resetting that counter every tick — this
+# marker is durable and independent of both, so a voided gate never re-runs the reasoner.
+# Cleared only on a fresh arm (_clear_progress_state), a current-window view.
+_broker_voided_marker() { printf '%s\n' "$(_afk_state_dir)/gate-voided-$1"; }
+_broker_gate_voided()   { [ -f "$(_broker_voided_marker "$1")" ]; }
+_broker_mark_voided() {
+  local issue="$1" f; f="$(_broker_voided_marker "$issue")"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  printf '%s\n' "$(afk_now)" > "$f" 2>/dev/null || true
+}
+
+# _broker_log_terminal_once <issue> <key> <msg> -> log <msg> only the FIRST tick a gate
+# becomes terminal for <key>; a later tick on the same key stays silent, so a terminal gate
+# never re-emits its "terminal" line on every event wake (issue #237). <key> folds in whatever
+# the terminal state keys on (tip + signature for the re-answer ceiling), so a genuinely NEW
+# terminal context (a moved tip / changed prompt) logs afresh.
+_broker_terminal_log_file() { printf '%s\n' "$(_afk_state_dir)/terminal-logged-$1"; }
+_broker_log_terminal_once() {
+  local issue="$1" key="$2" msg="$3" f prev=""
+  f="$(_broker_terminal_log_file "$issue")"
+  [ -f "$f" ] && prev="$(cat "$f" 2>/dev/null)"
+  [ "$prev" = "$key" ] && return 0
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  printf '%s\n' "$key" > "$f" 2>/dev/null || true
+  log "$msg"
 }
 
 # _afk_note_tip_progress <wt> <issue> -> observe ledger progress as branch-tip
@@ -773,6 +805,39 @@ _broker_is_git_worktree() {
   [ -d "$1" ] && git -C "$1" rev-parse --git-dir >/dev/null 2>&1
 }
 
+# _broker_snapshot_worktree <wt> <dest> -> populate <dest> with a throwaway COPY of <wt>'s
+# content so the reasoner can run there (cwd=<dest>) instead of the spoke's LIVE tree — real
+# write isolation (#237), the "verify agent worktree isolation" prior art: even a tool that
+# ignores the read-only allowlist writes into the copy, never the spoke's tree. rc 0 on a
+# populated copy, rc 1 when <wt> is not a git worktree (the caller then runs in-place and the
+# fingerprint void still guards). The copy carries ONLY the tracked + untracked-not-ignored
+# set (the SAME set _broker_worktree_fingerprint measures) plus the .git linkage, so a per-tick
+# copy never recurses the ignored heavy trees (.venv, .testmondata*, .ai-toolkit/ OTel dumps).
+# `cp -R` preserves the worktree's uncommitted + untracked state — fidelity `git worktree add`
+# (committed-HEAD only) can't give — so the reasoner's read git verbs still reflect real state.
+# UPGRADE: for a LINKED worktree `.git` is a gitfile still referencing the shared gitdir, so
+# the copied read-only git verbs read shared metadata; the write-isolation guarantee holds
+# regardless (the copy is a distinct directory and the reasoner has no commit/add/reset in its
+# allowlist). Point the copy at a private gitdir clone if a linked worktree ever needs fully
+# self-contained git in the reasoner.
+_broker_snapshot_worktree() {
+  local wt="$1" dest="$2" f
+  _broker_is_git_worktree "$wt" || return 1
+  # Copy the git linkage first (a full .git dir OR a linked-worktree gitfile) so read-only
+  # git verbs resolve, then the exact fingerprint set — never the ignored heavy trees.
+  [ -e "$wt/.git" ] && cp -R "$wt/.git" "$dest/.git" 2>/dev/null
+  (
+    cd "$wt" 2>/dev/null || exit 0
+    git ls-files -z --cached --others --exclude-standard 2>/dev/null |
+      while IFS= read -r -d '' f; do
+        [ -f "$f" ] || continue
+        mkdir -p "$dest/$(dirname "$f")" 2>/dev/null || true
+        cp -p "$f" "$dest/$f" 2>/dev/null || true
+      done
+  )
+  return 0
+}
+
 # read_decisions_digest <issue> -> a compact digest of THIS spoke's prior gate outcomes,
 # seeded into the reasoner for cross-gate consistency (NOT the old transcript, which
 # replayed the seed in #124). Reads the automatable-decisions log (subtask D's writer),
@@ -969,16 +1034,15 @@ _broker_run_bounded() {
 # detector needs both the message and the exit code. parse_decision is line-anchored, so
 # interleaved stderr noise never pollutes a decision.
 #
-# --no-session-persistence is REQUIRED, not cosmetic (#164): the reasoner runs with
-# cwd=<wt>, so a persisted session transcript would land in the SAME
-# ~/.claude/projects/<munged-wt>/ dir as the spoke's own transcript. `_spoke_jsonl` picks
-# the newest jsonl there, so the reasoner's transcript would shadow the spoke's — every
-# `_still_parked_same` check would see the transcript "move" and drop the answer as stale,
-# stranding the spoke. Disabling persistence kills the pollution at the source (the
-# reasoner writes no transcript at all) while keeping cwd=<wt> for read-only verification.
-# It does NOT touch CLAUDE_CONFIG_DIR, so keychain credentials/auth are unaffected. An
-# AFK_ANSWERER_CMD override that runs a persisting `claude` with cwd=<wt> reintroduces
-# #164, so any override must pass --no-session-persistence too.
+# --no-session-persistence stays belt-and-suspenders for #164. The original collision: the
+# reasoner ran with cwd=<wt>, so a persisted transcript landed in the SAME
+# ~/.claude/projects/<munged-wt>/ dir as the spoke's own, shadowing it — `_spoke_jsonl` picks
+# the newest jsonl there, so every `_still_parked_same` check saw the transcript "move" and
+# dropped the answer as stale, stranding the spoke. The #237 write-isolation snapshot already
+# removes that collision at the root: the reasoner's cwd is now a mktemp copy, so any persisted
+# transcript maps to the copy's OWN munged dir — disjoint from <wt>'s. We keep the flag anyway
+# so no throwaway transcript is written for the snapshot path at all. It does NOT touch
+# CLAUDE_CONFIG_DIR, so keychain credentials/auth are unaffected.
 # UPGRADE: if a deployed `claude` lacks --no-session-persistence it exits nonzero with no
 # decision, so the gate fails SAFE (escalates to blocked/<issue>) rather than stranding —
 # but auto-answering silently stops; drop the flag / switch to filtering the reasoner's
@@ -997,14 +1061,29 @@ run_answerer() {
   # fallback for when mktemp is unavailable (the foreground timeout/perl paths keep stdin).
   local pf rc; pf="$(mktemp 2>/dev/null)" || pf=""
   [ -n "$pf" ] && { printf '%s' "$prompt" > "$pf"; cmd="exec <'$pf'; $cmd"; }
+  # Write isolation (#237): run the reasoner against a throwaway COPY of the worktree, not the
+  # spoke's LIVE tree — so even a tool that ignores the read-only allowlist writes into the
+  # copy. The reasoner's cwd moves to the snapshot; broker_service_gate still fingerprints the
+  # real $wt, now a should-never-fire backstop. On any copy failure (no mktemp, non-git tree),
+  # fall back to running in-place: the fingerprint void remains the guard.
+  local snap="" run_dir="$wt"
+  if [ -n "$wt" ] && [ -d "$wt" ]; then
+    snap="$(mktemp -d 2>/dev/null)" || snap=""
+    if [ -n "$snap" ] && _broker_snapshot_worktree "$wt" "$snap"; then
+      run_dir="$snap"
+    elif [ -n "$snap" ]; then
+      rm -rf "$snap" 2>/dev/null || true; snap=""
+    fi
+  fi
   # _broker_run_bounded caps the reasoner (#171): a hung `claude` never freezes the tick.
   # stderr is folded in (2>&1) so the auth-failure detector still sees credential messages.
   (
-    [ -n "$wt" ] && [ -d "$wt" ] && cd "$wt"
+    [ -n "$run_dir" ] && [ -d "$run_dir" ] && cd "$run_dir"
     CLAUDE_EFFORT="$AFK_ANSWERER_EFFORT" _broker_run_bounded "$secs" bash -c "$cmd" <<<"$prompt" 2>&1
   )
   rc=$?
   [ -n "$pf" ] && rm -f "$pf"
+  [ -n "$snap" ] && rm -rf "$snap" 2>/dev/null || true
   return "$rc"
 }
 
@@ -1926,6 +2005,13 @@ broker_service_gate() {
     _consume_gate_tag "$wt" "$issue"
     return 0
   fi
+  # A prior tick found the reasoner mutated the live tree for this gate (#237): that verdict is
+  # terminal on FIRST occurrence — a human is required — and independent of tip/signature, which
+  # the mutation itself perturbs. Skip the reasoner entirely; the first-occurrence escalation
+  # already stamped blocked/<issue>. Silent here (it was logged once when first voided); a fresh
+  # arm clears the marker. Checked before the (tip, sig) ceiling on purpose: keying a void on
+  # that ceiling would let the mutation reset it every tick and re-run forever.
+  if _broker_gate_voided "$issue"; then return 0; fi
   # Re-answer ceiling (#203 finding 1): a legitimately-escalated spoke parked on the SAME
   # prompt must not re-run the reasoner/classifier every tick forever. After the ceiling on
   # the SAME (tip, prompt-signature) the gate is terminal — it stays blocked/<issue> at the
@@ -1933,7 +2019,11 @@ broker_service_gate() {
   # BOTH the permission path (#203 finding 4's compound dialog) and the answerer path.
   local park_sig; park_sig="$(_broker_park_signature "$wt" "$issue")"
   if _broker_reanswer_exhausted "$wt" "$issue" "$park_sig"; then
-    log "  #$issue re-answer ceiling reached on the same prompt — leaving it terminal (no re-answer)"
+    # Log the terminal state ONCE per (tip, sig) — not on every event wake (#237). A moved tip
+    # or changed prompt is a new key that resets the ceiling AND logs afresh when it re-exhausts.
+    local _tip; _tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"
+    _broker_log_terminal_once "$issue" "ceiling:${_tip}:${park_sig}" \
+      "  #$issue re-answer ceiling reached on the same prompt — leaving it terminal (no re-answer)"
     return 0
   fi
   # A pending permission dialog is decided by the rules classifier, not the answerer (#149).
@@ -1976,7 +2066,11 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
     return 0
   fi
   if ! _broker_worktree_unchanged "$wt" "$fp_before"; then
-    log "  reasoner mutated the read-only worktree of #$issue — voiding its answer"
+    # Stamp the durable void marker FIRST so this gate is terminal on the first occurrence
+    # (#237): later ticks short-circuit at the top and never re-run the reasoner. This log
+    # fires exactly once — the short-circuit keeps the mutation branch from re-running.
+    _broker_mark_voided "$issue"
+    log "  reasoner mutated the read-only worktree of #$issue — voiding its answer (terminal; a human is required)"
     _broker_on_human_decision "$mode" "$wt" "$issue" \
       "the gate reasoner mutated the read-only worktree — its answer is voided; needs a human"
     return 0

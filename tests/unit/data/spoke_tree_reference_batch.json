@@ -33,6 +33,7 @@
               "total_ms": 1000,
               "components": {
                 "llm_request": 1000,
+                "sub-agent": 0,
                 "tool": 0,
                 "hook": 0,
                 "script": 0,
@@ -69,6 +70,7 @@
               "total_ms": 1000,
               "components": {
                 "llm_request": 1000,
+                "sub-agent": 0,
                 "tool": 0,
                 "hook": 0,
                 "script": 0,
@@ -109,6 +111,7 @@
               "total_ms": 0,
               "components": {
                 "llm_request": 0,
+                "sub-agent": 0,
                 "tool": 0,
                 "hook": 0,
                 "script": 0,
@@ -220,6 +223,7 @@
               "total_ms": 0,
               "components": {
                 "llm_request": 0,
+                "sub-agent": 0,
                 "tool": 0,
                 "hook": 0,
                 "script": 0,
@@ -264,6 +268,7 @@
               "total_ms": 0,
               "components": {
                 "llm_request": 0,
+                "sub-agent": 0,
                 "tool": 0,
                 "hook": 0,
                 "script": 0,
@@ -357,6 +362,7 @@
               "total_ms": 1000,
               "components": {
                 "llm_request": 1000,
+                "sub-agent": 0,
                 "tool": 0,
                 "hook": 0,
                 "script": 0,
@@ -393,6 +399,7 @@
               "total_ms": 1000,
               "components": {
                 "llm_request": 1000,
+                "sub-agent": 0,
                 "tool": 0,
                 "hook": 0,
                 "script": 0,
@@ -433,6 +440,7 @@
               "total_ms": 0,
               "components": {
                 "llm_request": 0,
+                "sub-agent": 0,
                 "tool": 0,
                 "hook": 0,
                 "script": 0,
@@ -544,6 +552,7 @@
               "total_ms": 0,
               "components": {
                 "llm_request": 0,
+                "sub-agent": 0,
                 "tool": 0,
                 "hook": 0,
                 "script": 0,
@@ -588,6 +597,7 @@
               "total_ms": 0,
               "components": {
                 "llm_request": 0,
+                "sub-agent": 0,
                 "tool": 0,
                 "hook": 0,
                 "script": 0,
@@ -648,5 +658,7 @@
     }
   ],
   "scores": [],
-  "step_scores": []
+  "step_scores": [],
+  "step_total_cost_scores": [],
+  "step_duration_scores": []
 }

@@ -229,7 +229,12 @@ from telemetry.spoke_tree.rollups import (
     _apply_container_rollups,
     _strip_container_usage,
 )
-from telemetry.spoke_tree.scores import build_score_events, build_step_cost_scores
+from telemetry.spoke_tree.scores import (
+    build_score_events,
+    build_step_cost_scores,
+    build_step_duration_scores,
+    build_step_total_cost_scores,
+)
 from telemetry.spoke_tree.steps import (
     _apply_step_grouping,
     _collapse_startup_instants,
@@ -947,9 +952,13 @@ def _enrich_scores(ctx: EnrichmentContext) -> None:
 
 
 def _enrich_step_scores(ctx: EnrichmentContext) -> None:
-    """Emit the per-phase step cost/token scores (#158) from View B's step rollups."""
-    ctx.step_scores = build_step_cost_scores(
-        ctx.spoke_run_id, ctx.cycle_batch, base_ts=ctx.base_ts, price=ctx.price
+    """Emit per-phase step cache-write/token (#158) + true total cost + duration (#230) scores."""
+    ctx.step_scores = (
+        build_step_cost_scores(
+            ctx.spoke_run_id, ctx.cycle_batch, base_ts=ctx.base_ts, price=ctx.price
+        )
+        + build_step_total_cost_scores(ctx.spoke_run_id, ctx.cycle_batch, base_ts=ctx.base_ts)
+        + build_step_duration_scores(ctx.spoke_run_id, ctx.cycle_batch, base_ts=ctx.base_ts)
     )
 
 
@@ -1050,7 +1059,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(ctx.deltas)} llm_requests context-delta stamped, "
         f"{ctx.efforts} llm_requests effort-tagged, "
         f"{len(ctx.score_events)} numeric scores emitted, "
-        f"{len(ctx.step_scores)} per-phase step cost/token scores emitted, "
+        f"{len(ctx.step_scores)} per-phase step cost/token/duration scores emitted, "
         f"{len(commits)} commit nodes synthesized, "
         f"tagged mode={mode} lane={lane}; "
         f"{len(cycle_batch) - 2} observations assembled under cycle trace {cycle_trace_id}"
