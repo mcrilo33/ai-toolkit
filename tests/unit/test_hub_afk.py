@@ -453,7 +453,13 @@ def test_decide_and_act_approves_safe_permission(spoke_repo: Path, tmp_path: Pat
     assert not ready_log.exists(), f"safe permission must NOT escalate: {ready_log.read_text()}"
 
 
-def test_decide_and_act_escalates_risky_permission(spoke_repo: Path, tmp_path: Path) -> None:
+def test_decide_and_act_risky_permission_reasoner_denies_and_warns(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #241: a risky permission the mechanical classifier will not auto-approve no longer parks
+    # the spoke blocked/<issue>. It routes to the always-answering reasoner (stubbed to DENY),
+    # which declines the command and injects the reversible-path guidance — warned, not blocked,
+    # and never auto-approved.
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke_repo)
     _write_transcript(pd, [_bash_tool_record("git push origin main")])
@@ -466,15 +472,25 @@ def test_decide_and_act_escalates_risky_permission(spoke_repo: Path, tmp_path: P
         "SPOKE_READY": str(ready_stub),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "AFK_STATE_DIR": str(statedir),
+        "AFK_ANSWERER_CMD": "printf 'REVERSIBILITY: irreversible\\nANSWER: DENY: push a feature branch and open a PR instead'",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_INJECT_POLL_SECONDS": "0",
     }
 
     result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    assert ready_log.exists(), "risky permission must escalate to blocked/<issue>"
-    assert "--blocked 5" in ready_log.read_text()
-    # Must NOT have injected an approval keystroke for a risky command.
-    assert "send-keys -t afk:1 1" not in tmux_log.read_text()
+    # Never parked, never auto-approved; warned + journaled instead.
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "a risky permission must warn-and-continue, not escalate to blocked"
+    )
+    assert "send-keys -t afk:1 1" not in tmux_log.read_text(), (
+        "must not auto-approve a risky command"
+    )
+    assert (statedir / "warned-5.txt").exists(), "the taken decision must be warned"
+    assert "irreversible" in (statedir / "decision-journal.jsonl").read_text()
 
 
 # ── the TRANSCRIPT layer ──────────────────────────────────────────────────────

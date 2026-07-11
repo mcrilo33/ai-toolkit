@@ -1711,6 +1711,16 @@ def test_decide_permission_logs_escalate_verdict(spoke_repo: Path, tmp_path: Pat
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "AFK_STATE_DIR": str(statedir),
         "SPOKE_READY": str(ready_stub),
+        # #241: an ESCALATE verdict now routes to the reasoner (stubbed) instead of parking.
+        # The mechanical ESCALATE verdict is still recorded to decisions.log for codification.
+        "AFK_ANSWERER_CMD": "printf 'ANSWER: DENY: use git restore instead'",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        # Zero the inject verify timings: this stub's tmux never advances the transcript, so
+        # the deny-path inject would otherwise burn the full 60s x2 verify budget (real spokes
+        # respond, so this is a test-only bound).
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_INJECT_POLL_SECONDS": "0",
     }
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)

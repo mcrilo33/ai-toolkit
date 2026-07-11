@@ -1914,14 +1914,74 @@ approve_permission() {
   _transcript_advanced "$wt" "$before"
 }
 
-# _decide_permission <wt_path> <issue> -> classify the spoke's pending permission dialog and
-# act: AUTO-APPROVE a safe scoped self-op (inject "Yes"), or ESCALATE a risky/unreadable one to
-# blocked/<issue>. classify_permission is the policy; this is the tmux delivery around it.
+# _deny_permission <wt_path> <guidance> -> decline the pending permission dialog and tell the
+# spoke the reversible path: the hardened injector Esc-cancels the menu, then submits <guidance>
+# as a new message. Best-effort (rc from inject_and_verify) — a failed delivery still lets the
+# caller warn + retry on the backoff, never park.
+_deny_permission() {
+  local wt="$1" guidance="$2" target
+  target="$(_spoke_pane_target "$wt")"
+  [ -n "$target" ] || return 1
+  inject_and_verify "$wt" "$target" "$guidance" >/dev/null 2>&1
+}
+
+# _reason_permission <wt> <issue> <cmd> <classify_reason> -> the reasoner decides a permission
+# dialog the fixed rules would NOT auto-approve (#241 §2: the reasoner decides even irreversible
+# asks). It runs in run_answerer's read-only snapshot copy and answers 'ANSWER: APPROVE' or
+# 'ANSWER: DENY: <reversible path>'. APPROVE delivers Yes; DENY (or any unclear reply — the safe
+# default) declines the dialog and injects the reversible-path guidance. Either way the taken
+# decision is warned + journaled with its reversibility class, and the spoke is NEVER parked.
+_reason_permission() {
+  local wt="$1" issue="$2" cmd="$3" why="$4" q raw ans text rev guidance
+  q="The spoke is parked on a PERMISSION dialog and wants to run this command:
+
+$cmd
+
+The mechanical classifier would not auto-approve it ($why). Decide: APPROVE only if it is
+safe, reversible, and in-scope (touches the spoke's own worktree; no default branch, no
+force-push, no history rewrite, no deletion outside the worktree, no outward/network action);
+otherwise DENY. NEVER approve an irreversible, destructive, or outward command — DENY it and
+name the reversible path. Your ANSWER line MUST begin with 'APPROVE' or 'DENY: <the reversible
+path to tell the spoke>'."
+  # Stamp the attempt FIRST so the reason→deliver window never reads as idle (#202 C).
+  stamp_answer_attempt "$issue"
+  raw="$(run_answerer "$issue" "$q" "$wt")"
+  ans="$(parse_decision "$raw")"
+  text="${ans#*$'\t'}"
+  rev="$(parse_decision_field "$raw" REVERSIBILITY)"; [ -n "$rev" ] || rev=unknown
+  # NB: the classifier verdict (ESCALATE) is already recorded in decisions.log by the caller;
+  # the reasoned approve/deny lands in the decision journal via broker_warn_continue, NOT in
+  # decisions.log — that log codifies only the MECHANICAL classifier (#155 D).
+  case "$text" in
+    APPROVE*)
+      if approve_permission "$wt"; then
+        broker_warn_continue "$wt" "$issue" permission "reasoner APPROVED: $cmd" "$rev"
+      else
+        broker_warn_continue "$wt" "$issue" permission "reasoner APPROVED but delivery failed: $cmd" "$rev"
+      fi ;;
+    *)
+      # DENY, or any reply that does not clearly approve — the safe default is to decline.
+      guidance="${text#DENY:}"; guidance="${guidance#"${guidance%%[![:space:]]*}"}"
+      [ -n "$guidance" ] || guidance="Declined that command — take the reversible, in-scope path instead."
+      _deny_permission "$wt" "$guidance" || true
+      broker_warn_continue "$wt" "$issue" permission "reasoner DENIED ($cmd): $guidance" "${rev:-reversible}" ;;
+  esac
+}
+
+# _decide_permission <wt_path> <issue> -> classify the spoke's pending permission dialog and act.
+# AUTO-APPROVE a safe scoped self-op (mechanical fast path, unchanged, unwarned). Anything the
+# fixed rules will not auto-approve — an ESCALATE verdict or an unreadable command — no longer
+# parks the spoke: it routes to the always-answering reasoner (#241) which approves a safe
+# command or declines-and-redirects a risky one, warning + journaling the taken decision.
 _decide_permission() {
   local wt="$1" issue="$2" cmd decision kind reason
   cmd="$(extract_pending_command "$wt")"
   if [ -z "$cmd" ]; then
-    _escalate_blocked "$wt" "$issue" "permission dialog with an unreadable command — needs a human"
+    # Unreadable command: cannot classify. Decline it (the reversible action) + warn — never
+    # park. The spoke gets a denial and keeps going; the backoff paces any retry.
+    stamp_answer_attempt "$issue"
+    _deny_permission "$wt" "Declined an unreadable permission command — re-issue it in a clearer form." || true
+    broker_warn_continue "$wt" "$issue" permission "declined an unreadable permission command" reversible
     return 0
   fi
   decision="$(classify_permission "$cmd" "$wt")"
@@ -1942,10 +2002,14 @@ _decide_permission() {
       afk_emit_decision "$wt" success
       return 0
     fi
-    _escalate_blocked "$wt" "$issue" "could not deliver permission approval to the spoke — needs a human"
+    # Delivery failed — warn + retry on the backoff, never park (#241).
+    broker_warn_continue "$wt" "$issue" permission "could not deliver the approval to the spoke — will retry" reversible
     return 0
   fi
-  _escalate_blocked "$wt" "$issue" "$reason — needs a human"
+  # ESCALATE: the fixed rules will not auto-approve this one. The reasoner decides it (#241) —
+  # approve a safe/reversible command, or decline an irreversible one and name the reversible
+  # path — and warns + journals the taken decision. Never park.
+  _reason_permission "$wt" "$issue" "$cmd" "$reason"
 }
 
 # --- tmux injection + telemetry -----------------------------------------------
