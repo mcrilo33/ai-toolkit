@@ -3523,19 +3523,22 @@ def test_permission_approve_delivery_failure_warns_not_blocks(
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text()
 
 
-def test_permission_reasoner_auth_failure_halts_not_denies(
+def test_permission_reasoner_auth_failure_warns_not_denies(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
     # If the supervisor's own token dies while the reasoner decides a permission dialog, the
     # blob is an auth error, not a decision. The permission path must detect it (rc != 0 + auth
-    # signature), raise the global halt, and escalate — NOT inject a spurious denial into the
-    # live dialog (mirrors the gate/park path).
-    env = _perm_env(
-        tmp_path,
-        spoke_repo,
-        "npm run deploy",  # ESCALATE -> reasoner
-        "printf 'Invalid API key . Please run /login'; exit 1",
-    )
+    # signature), raise the global halt flag — and #241 §9 WARN the spoke (not block it, not
+    # inject a spurious denial into the live dialog).
+    env = {
+        **_perm_env(
+            tmp_path,
+            spoke_repo,
+            "npm run deploy",  # ESCALATE -> reasoner
+            "printf 'Invalid API key . Please run /login'; exit 1",
+        ),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
 
     result = _call(
         f"broker_service_gate '{spoke_repo}' 5 unattended; echo AUTH=$_AFK_AUTH_FAILED",
@@ -3545,7 +3548,10 @@ def test_permission_reasoner_auth_failure_halts_not_denies(
 
     assert "AUTH=1" in result.stdout, "an auth failure must raise the global halt flag"
     ready = Path(env["_READY_LOG"])
-    assert ready.exists() and "--blocked 5" in ready.read_text(), "auth failure escalates (S3)"
+    assert not ready.exists() or "--blocked 5" not in ready.read_text(), (
+        "#241: auth warns, never blocks"
+    )
+    assert "WARNING: #5" in result.stderr, result.stderr
     # No spurious denial: the reversible-path guidance was never injected.
     keys = Path(env["_KEYLOG"]).read_text() if Path(env["_KEYLOG"]).exists() else ""
     assert "reversible, in-scope path" not in keys, "auth failure must not inject a spurious deny"

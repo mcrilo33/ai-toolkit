@@ -2048,20 +2048,22 @@ def test_is_auth_failure_ignores_normal_output(text: str) -> None:
 # the auth branch on the nonzero exit.
 
 
-def test_decide_and_act_auth_failure_escalates_with_auth_reason(
+def test_decide_and_act_auth_failure_warns_with_auth_reason(
     spoke_repo: Path, stub_env: dict[str, str]
 ) -> None:
     env = {
         **stub_env,
         "AFK_ANSWERER_CMD": "printf 'authentication_error: OAuth token expired' >&2; exit 1",
+        "AFK_JOURNAL_GH_COMMENT": "0",
     }
 
     result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log
-    assert "auth" in log.lower()
+    _rl = Path(env["_READY_LOG"])
+    # #241 §9: an auth failure warns the spoke with the auth reason, never blocks it.
+    assert not _rl.exists() or "--blocked 5" not in _rl.read_text()
+    assert "WARNING: #5" in result.stderr and "auth" in result.stderr.lower(), result.stderr
 
 
 def test_decide_and_act_auth_failure_raises_stop_flag(
@@ -2526,7 +2528,9 @@ def test_auto_land_warns_on_request_changes(spoke_repo: Path, tmp_path: Path) ->
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
         "#241: a REQUEST_CHANGES verdict warns + retries, never blocks"
     )
-    assert (statedir / "warned-5.txt").exists(), "the taken decision must be warned, not silently dropped"
+    assert (statedir / "warned-5.txt").exists(), (
+        "the taken decision must be warned, not silently dropped"
+    )
 
 
 def test_auto_land_warns_when_no_review(spoke_repo: Path, tmp_path: Path) -> None:
@@ -2554,7 +2558,9 @@ def test_auto_land_warns_when_no_review(spoke_repo: Path, tmp_path: Path) -> Non
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
         "#241: no review warns + retries, never blocks"
     )
-    assert (statedir / "warned-5.txt").exists(), "the taken decision must be warned, not silently dropped"
+    assert (statedir / "warned-5.txt").exists(), (
+        "the taken decision must be warned, not silently dropped"
+    )
 
 
 def test_auto_land_warns_when_review_dir_empty(spoke_repo: Path, tmp_path: Path) -> None:
@@ -2582,7 +2588,9 @@ def test_auto_land_warns_when_review_dir_empty(spoke_repo: Path, tmp_path: Path)
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
         "#241: an empty .review dir warns + retries, never blocks"
     )
-    assert (statedir / "warned-5.txt").exists(), "the taken decision must be warned, not silently dropped"
+    assert (statedir / "warned-5.txt").exists(), (
+        "the taken decision must be warned, not silently dropped"
+    )
 
 
 def test_auto_land_lands_after_fix_supersedes_changes(spoke_repo: Path, tmp_path: Path) -> None:
@@ -3306,7 +3314,9 @@ def test_auto_land_warns_on_a_pre_merge_failure(spoke_repo: Path, tmp_path: Path
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
         "#241: a pre-merge land failure (exit 1) warns + retries, never blocks"
     )
-    assert (statedir / "warned-5.txt").exists(), "the taken decision must be warned, not silently dropped"
+    assert (statedir / "warned-5.txt").exists(), (
+        "the taken decision must be warned, not silently dropped"
+    )
 
 
 def test_auto_land_ready_blocked_warns_visibly_when_retries_exhausted(
@@ -6735,7 +6745,9 @@ def test_auto_land_failure_warns_retries_not_blocks(spoke_repo: Path, tmp_path: 
     assert (statedir / "warned-5.txt").exists()
 
 
-def test_auto_land_failure_is_backoff_paced_not_every_tick(spoke_repo: Path, tmp_path: Path) -> None:
+def test_auto_land_failure_is_backoff_paced_not_every_tick(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
     # #241 BLOCKER fix: a persistently-failing land (merge conflict) is re-attempted at LOW
     # frequency (the warned-retry backoff), NOT every tick — worktree-land is expensive. Within
     # one backoff window the land runs once; a later tick past the window runs it again.
@@ -6805,12 +6817,12 @@ def test_service_auth_halt_resumes_when_auth_recovers(tmp_path: Path) -> None:
     base = {"AFK_STATE_DIR": str(statedir), "AFK_JOURNAL_GH_COMMENT": "0"}
 
     recovered = _call(
-        '_AFK_AUTH_FAILED=1; inflight_worktrees() { :; }; '
+        "_AFK_AUTH_FAILED=1; inflight_worktrees() { :; }; "
         '_afk_service_auth_halt; echo "FLAG=$_AFK_AUTH_FAILED"',
         env={**base, "AFK_AUTH_PROBE_CMD": "true"},  # auth healthy again
     )
     still_dead = _call(
-        '_AFK_AUTH_FAILED=1; inflight_worktrees() { :; }; '
+        "_AFK_AUTH_FAILED=1; inflight_worktrees() { :; }; "
         '_afk_service_auth_halt; echo "FLAG=$_AFK_AUTH_FAILED"',
         env={**base, "AFK_AUTH_PROBE_CMD": "echo authentication_error; exit 1"},
     )
@@ -6833,6 +6845,8 @@ def test_decide_and_act_auth_failure_warns_not_blocks(
     result = _call(f"decide_and_act '{spoke_repo}' 5; echo \"FLAG=$_AFK_AUTH_FAILED\"", env=env)
 
     _rl = Path(env["_READY_LOG"])
-    assert not _rl.exists() or "--blocked 5" not in _rl.read_text(), "auth failure warns, never blocks"
+    assert not _rl.exists() or "--blocked 5" not in _rl.read_text(), (
+        "auth failure warns, never blocks"
+    )
     assert "WARNING: #5" in result.stderr and "auth" in result.stderr.lower(), result.stderr
     assert "FLAG=1" in result.stdout, "the global halt flag must still be raised"

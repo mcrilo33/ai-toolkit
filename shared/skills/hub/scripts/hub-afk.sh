@@ -757,17 +757,31 @@ _reap_or_resume() {
   fi
 }
 
-# _block_all_inflight <reason> -> emit blocked/<issue> for every in-flight spoke not
-# already at a terminal marker. Called on an auth-failure stop so the dashboard shows
-# every affected spoke as blocked (no orphaned window left silently stuck on dead auth)
-# rather than just the one whose answerer surfaced the failure.
-_block_all_inflight() {
+# _warn_all_inflight <reason> -> WARN every in-flight spoke not already at a terminal marker
+# (#241 §9). Called while the drain is halted on dead auth: an auth failure is NOT the spoke's
+# fault, so it is warned (loud, re-fired by hub-notify), NEVER blocked — the drain resumes
+# servicing it once auth recovers. Replaces the pre-#241 _block_all_inflight (which parked them).
+_warn_all_inflight() {
   local reason="$1" path issue
   while IFS=$'\t' read -r path issue; do
     [ -n "$issue" ] || continue
     [ "$(slot_state "$path" "$issue")" = "done" ] && continue
-    _afk_escalate_blocked "$path" "$issue" "$reason"
+    broker_warn "$issue" "$reason"
   done < <(inflight_worktrees)
+}
+
+# _afk_service_auth_halt -> service a raised _AFK_AUTH_FAILED WITHOUT stopping the drain (#241 §9).
+# Auth is the one true external blocker, but it only HALTS DISPATCH (the _AFK_AUTH_FAILED
+# short-circuits), warns the in-flight spokes loudly + repeatedly, RE-PROBES auth each tick, and
+# CLEARS the flag (resuming the drain) the moment auth recovers. The re-probe is the bounded
+# headless-claude no-op _afk_auth_is_dead already uses.
+_afk_service_auth_halt() {
+  log "/afk: subscription auth failed — dispatch HALTED (re-run /login on the host); re-probing each tick, NOT stopping the drain (#241 §9)"
+  _warn_all_inflight "subscription auth failed — dispatch halted; re-run /login on the host (retrying auth each tick)"
+  if ! _afk_auth_is_dead; then
+    _AFK_AUTH_FAILED=0
+    log "/afk: auth recovered — resuming the drain"
+  fi
 }
 
 # --- dispatch -----------------------------------------------------------------
@@ -2283,9 +2297,9 @@ main() {
       supervise_tick
     fi
     if [ "$_AFK_AUTH_FAILED" -eq 1 ]; then
-      log "/afk: subscription auth failed — blocking in-flight spokes and stopping (re-run /login on the host)"
-      _block_all_inflight "subscription auth failed — token could not refresh; re-run /login on the host"
-      afk_clear_state; break
+      # #241 §9: auth no longer STOPS the drain. Halt dispatch (the short-circuits already do),
+      # warn the in-flight spokes, re-probe, and resume the moment auth recovers. Never break.
+      _afk_service_auth_halt
     fi
     [ "$once" -eq 1 ] && break
     if afk_done "$(afk_read_state)" "$(afk_now)"; then

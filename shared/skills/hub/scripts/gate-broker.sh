@@ -1964,12 +1964,13 @@ path to tell the spoke>'."
   raw="$(run_answerer "$issue" "$q" "$wt")"; rc=$?
   # Auth failure is the one true external blocker (#73): a dead supervisor token yields an
   # auth-error blob, not a decision — and parse_decision would fall to the DENY default and
-  # inject a SPURIOUS denial into the live dialog. Detect it exactly as the gate/park path does
-  # (rc != 0 AND an auth signature), raise the global halt, and return without injecting.
-  # (#241 §9 will convert this terminal escalation to a retry-loop; here it mirrors the gate.)
+  # inject a SPURIOUS denial into the live dialog. Detect it (rc != 0 AND an auth signature),
+  # raise the global halt flag (the supervisor pauses DISPATCH + re-probes, #241 §9), and return
+  # without injecting. #241 §9: WARN the spoke (an auth failure is not the spoke's fault — never
+  # block it); the drain resumes servicing it once auth recovers.
   if [ "$rc" -ne 0 ] && is_auth_failure "$raw"; then
     _AFK_AUTH_FAILED=1
-    _escalate_blocked "$wt" "$issue" "subscription auth failed — token could not refresh; re-run /login on the host"
+    broker_warn_continue "$wt" "$issue" auth "subscription auth failed — token could not refresh; re-run /login on the host (drain paused, re-probing)" outward
     return 0
   fi
   ans="$(parse_decision "$raw")"
@@ -2551,12 +2552,13 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
   # other `claude` (the spokes, the next tick's answerer) is dead too. We treat it as an
   # auth failure only when the answerer EXITED NONZERO and its output carries an auth
   # signature — a healthy answer that merely discusses auth exits 0 and is unaffected.
-  # Raise the global stop flag and block THIS spoke so the failure surfaces as
-  # blocked/<issue> on the dashboard rather than spinning the loop; the main loop halts.
+  # Raise the global stop flag so the supervisor pauses DISPATCH and re-probes (#241 §9). WARN
+  # this spoke (an auth failure is not its fault — never block it); the drain resumes servicing
+  # it once auth recovers, rather than parking it blocked/<issue>.
   if [ "$rc" -ne 0 ] && is_auth_failure "$raw"; then
     _AFK_AUTH_FAILED=1
-    _escalate_blocked "$wt" "$issue" \
-      "subscription auth failed — token could not refresh; re-run /login on the host"
+    broker_warn_continue "$wt" "$issue" auth \
+      "subscription auth failed — token could not refresh; re-run /login on the host (drain paused, re-probing)" outward
     return 0
   fi
   decision="$(parse_decision "$raw")"
