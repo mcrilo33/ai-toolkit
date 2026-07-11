@@ -36,6 +36,7 @@ from telemetry.spoke_tree.observations import (
     _is_script_node,
     _is_skill_span,
     _llm_requests_in_order,
+    _mcp_server,
     _parse_utc,
 )
 
@@ -65,6 +66,12 @@ _SKILL_STATUS_KEYS = ("skill.status", "skill_exit_status")
 # to the group so a spoke that hit one server under two turns keeps both.
 _MCP_SUCCESS_SCORE = "mcp_success"
 _MCP_CALLS_SCORE = "mcp_calls"
+# MCP def scores (#234): the carrying-vs-using split for MCP schemas, mirroring rules (#232).
+# ``mcp_carry_cost_usd:<server>`` is what a server's loaded tool schemas cost every request whether
+# used or not; ``mcp_def_loads:<server>`` counts on-demand ToolSearch schema loads mid-session.
+_MCP_CARRY_COST_SCORE = "mcp_carry_cost_usd"
+_MCP_DEF_LOADS_SCORE = "mcp_def_loads"
+_MCP_CARRY_CATEGORY = "mcp"
 # Agent verdict (#233): the outcome of an agent that ran under the spoke, as a numeric score named
 # by the agent type. code-review reads the APPROVE/REJECT verdict from its signed ``.review``
 # artifact; a schema-returning sub-agent reads the ``status`` its structured return carried. The
@@ -423,6 +430,98 @@ def build_mcp_call_scores(
             )
         )
     return events
+
+
+def _tokens_by_server(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """Sum the ``mcp``-category loaded-context row tokens by server (#234)."""
+    servers: dict[str, int] = {}
+    for row in rows:
+        if row.get("category") != _MCP_CARRY_CATEGORY:
+            continue
+        server = _mcp_server(str(row.get("name") or ""))
+        if server:
+            servers[server] = servers.get(server, 0) + int(row.get("tokens") or 0)
+    return servers
+
+
+def build_mcp_carry_cost_scores(
+    spoke_run_id: str,
+    rows: list[dict[str, Any]],
+    n_requests: int,
+    *,
+    base_ts: str,
+    price: float,
+) -> list[IngestEvent]:
+    """Build per-server ``mcp_carry_cost_usd:<server>`` scores from the loaded-context mcp rows (#234).
+
+    An MCP server's tool schemas sit in the cached prefix and cost tokens on EVERY request whether
+    or not any of its tools are called — the same carry-cost model as a rule (:func:`_carry_cost_usd`),
+    but rolled up per SERVER (the ``mcp`` breakdown keys per tool; a server exposes many). Paired with
+    ``mcp_def_loads:<server>`` (same suffix), a dashboard ranks servers by carry cost filtered to zero
+    on-demand loads. Only the request-body loaded-context path itemizes MCP, so a disk-sourced spoke
+    yields none. Trace-level NUMERIC scores; ids derive from the spoke run id (idempotent reruns).
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids).
+        rows: The loaded-context measured rows (the ``mcp`` category is read).
+        n_requests: The count of main-loop LLM requests over the spoke (the read multiplier).
+        base_ts: ISO timestamp stamped on every score event.
+        price: Cache-creation (write) price in USD per token.
+
+    Returns:
+        The ``score-create`` events, one per MCP server (empty when no MCP def was loaded).
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    return [
+        _score_event(
+            spoke_run_id,
+            name=f"{_MCP_CARRY_COST_SCORE}:{server}",
+            value=_carry_cost_usd(tokens, n_requests, price),
+            trace_id=trace_id,
+            base_ts=base_ts,
+        )
+        for server, tokens in sorted(_tokens_by_server(rows).items())
+    ]
+
+
+def build_mcp_def_load_scores(
+    spoke_run_id: str, batch: list[IngestEvent], *, base_ts: str
+) -> list[IngestEvent]:
+    """Build per-server ``mcp_def_loads:<server>`` scores from the context-delta labels (#234).
+
+    The #160 context-delta pass tags each added ``mcp``-category def row (a ToolSearch schema load)
+    with ``mcp_def_load=<server>`` (:func:`~telemetry.spoke_tree.context_deltas._label_mcp_def_loads`).
+    This scans the assembled batch for those labels and emits one trace-level NUMERIC score per
+    server whose value is how many times that server's schemas were loaded on demand — the "using"
+    half of the carrying-vs-using split, paired with ``mcp_carry_cost_usd:<server>``. Mirrors
+    :func:`build_rule_invocation_scores`. Ids derive from the spoke run id (idempotent reruns).
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids).
+        batch: The assembled View A events (their ``context_delta.added`` rows are read).
+        base_ts: ISO timestamp stamped on every score event.
+
+    Returns:
+        The ``score-create`` events, one per server loaded on demand (empty when none were).
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    counts: dict[str, int] = {}
+    for event in batch:
+        delta = (event["body"].get("metadata") or {}).get("context_delta") or {}
+        for row in delta.get("added") or []:
+            server = row.get("mcp_def_load")
+            if server:
+                counts[str(server)] = counts.get(str(server), 0) + 1
+    return [
+        _score_event(
+            spoke_run_id,
+            name=f"{_MCP_DEF_LOADS_SCORE}:{server}",
+            value=count,
+            trace_id=trace_id,
+            base_ts=base_ts,
+        )
+        for server, count in sorted(counts.items())
+    ]
 
 
 def _review_artifact_scores(

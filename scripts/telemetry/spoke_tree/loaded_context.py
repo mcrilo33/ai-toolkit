@@ -22,7 +22,7 @@ from telemetry.request_body import (
     parse_request_body,
 )
 from telemetry.spoke_tree.ids import root_id_for, trace_id_for
-from telemetry.spoke_tree.observations import IngestEvent, TraceObservations
+from telemetry.spoke_tree.observations import IngestEvent, TraceObservations, _mcp_server
 
 # Deterministic id prefix for the synthetic loaded-context node.
 _LC_PREFIX = "tree-lc-"
@@ -149,6 +149,11 @@ def build_loaded_context_events(
         "cost_usd": measured_cost,
         "breakdown": _breakdown_by_category(item_rows, category_order),
     }
+    mcp_by_server = _mcp_by_server(item_rows)
+    if mcp_by_server:
+        # A per-server MCP carry-cost line (#234): the ``mcp`` breakdown keys on full tool names, so
+        # this rolls them up per server for the companion ``mcp_carry_cost_usd:<server>`` score.
+        metadata["mcp_by_server"] = mcp_by_server
     if prefix_total is not None and price is not None:
         remainder = max(0, prefix_total - measured_tokens)
         metadata["remainder"] = remainder
@@ -166,6 +171,23 @@ def build_loaded_context_events(
             metadata=metadata,
         )
     ]
+
+
+def _mcp_by_server(item_rows: list[dict[str, object]]) -> dict[str, int]:
+    """Sum the ``mcp`` breakdown rows by server (#234), for the per-server carry-cost line.
+
+    The ``mcp`` category itemizes each MCP tool by its full ``mcp__<server>__<tool>`` name; this
+    rolls those up to ``{server: tokens}`` (sorted, duplicate tools summed) so a spoke reads its MCP
+    carry cost per server, not only per tool. Empty when the spoke loaded no MCP def.
+    """
+    servers: dict[str, int] = {}
+    for row in item_rows:
+        if row.get("category") != "mcp":
+            continue
+        server = _mcp_server(str(row.get("name") or ""))
+        if server:
+            servers[server] = servers.get(server, 0) + int(cast(int, row["tokens"]))
+    return {server: servers[server] for server in sorted(servers)}
 
 
 def _breakdown_by_category(

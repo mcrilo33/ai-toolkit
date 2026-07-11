@@ -52,6 +52,7 @@ class TestEnrichmentRegistry:
             "script-success",
             "skill-success",
             "mcp-calls",
+            "mcp-def-loads",
             "agent-verdict",
         ]
 

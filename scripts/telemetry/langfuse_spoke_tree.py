@@ -238,6 +238,8 @@ from telemetry.spoke_tree.scores import (
     build_agent_verdict_scores,
     build_enforcement_fire_scores,
     build_mcp_call_scores,
+    build_mcp_carry_cost_scores,
+    build_mcp_def_load_scores,
     build_rule_carry_cost_scores,
     build_rule_invocation_scores,
     build_score_events,
@@ -915,6 +917,7 @@ class EnrichmentContext:
     script_success_scores: list[IngestEvent] = field(default_factory=list)
     skill_success_scores: list[IngestEvent] = field(default_factory=list)
     mcp_call_scores: list[IngestEvent] = field(default_factory=list)
+    mcp_def_load_scores: list[IngestEvent] = field(default_factory=list)
     agent_verdict_scores: list[IngestEvent] = field(default_factory=list)
 
 
@@ -993,15 +996,21 @@ def _enrich_step_scores(ctx: EnrichmentContext) -> None:
 
 
 def _enrich_carry_cost(ctx: EnrichmentContext) -> None:
-    """Emit per-rule + per-tooldef carry-cost scores from the loaded-context rows (#232).
+    """Emit per-rule + per-tooldef + per-MCP-server carry-cost scores from loaded-context rows (#232/#234).
 
     Reads the same measured rows the loaded-context node collapsed (populated by
     :func:`_enrich_loaded_context`, so this pass runs after it) and the once-computed request count.
     """
-    ctx.carry_scores = build_rule_carry_cost_scores(
-        ctx.spoke_run_id, ctx.rows, ctx.n_requests, base_ts=ctx.base_ts, price=ctx.price
-    ) + build_tooldef_carry_cost_scores(
-        ctx.spoke_run_id, ctx.rows, ctx.n_requests, base_ts=ctx.base_ts, price=ctx.price
+    ctx.carry_scores = (
+        build_rule_carry_cost_scores(
+            ctx.spoke_run_id, ctx.rows, ctx.n_requests, base_ts=ctx.base_ts, price=ctx.price
+        )
+        + build_tooldef_carry_cost_scores(
+            ctx.spoke_run_id, ctx.rows, ctx.n_requests, base_ts=ctx.base_ts, price=ctx.price
+        )
+        + build_mcp_carry_cost_scores(
+            ctx.spoke_run_id, ctx.rows, ctx.n_requests, base_ts=ctx.base_ts, price=ctx.price
+        )
     )
 
 
@@ -1041,6 +1050,16 @@ def _enrich_mcp_calls(ctx: EnrichmentContext) -> None:
     ctx.mcp_call_scores = build_mcp_call_scores(ctx.spoke_run_id, ctx.batch, base_ts=ctx.base_ts)
 
 
+def _enrich_mcp_def_loads(ctx: EnrichmentContext) -> None:
+    """Emit per-server ``mcp_def_loads`` scores from the #234 context-delta mcp def-load labels.
+
+    Reads the labels the context-deltas pass stamped on the batch, so it runs after it.
+    """
+    ctx.mcp_def_load_scores = build_mcp_def_load_scores(
+        ctx.spoke_run_id, ctx.batch, base_ts=ctx.base_ts
+    )
+
+
 def _enrich_agent_verdict(ctx: EnrichmentContext) -> None:
     """Emit per-agent ``agent_verdict:<type>`` scores from reviews + sub-agent outcomes (#233).
 
@@ -1069,6 +1088,7 @@ _ENRICHMENTS: tuple[tuple[str, Callable[[EnrichmentContext], None]], ...] = (
     ("script-success", _enrich_script_success),
     ("skill-success", _enrich_skill_success),
     ("mcp-calls", _enrich_mcp_calls),
+    ("mcp-def-loads", _enrich_mcp_def_loads),
     ("agent-verdict", _enrich_agent_verdict),
 )
 
@@ -1154,6 +1174,7 @@ def main(argv: list[str] | None = None) -> int:
         + ctx.script_success_scores
         + ctx.skill_success_scores
         + ctx.mcp_call_scores
+        + ctx.mcp_def_load_scores
         + ctx.agent_verdict_scores,
         post,
     )
@@ -1177,6 +1198,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(ctx.script_success_scores)} script-success scores emitted, "
         f"{len(ctx.skill_success_scores)} skill-success scores emitted, "
         f"{len(ctx.mcp_call_scores)} mcp-call scores emitted, "
+        f"{len(ctx.mcp_def_load_scores)} mcp-def-load scores emitted, "
         f"{len(ctx.agent_verdict_scores)} agent-verdict scores emitted, "
         f"{len(commits)} commit nodes synthesized, "
         f"tagged mode={mode} lane={lane}; "

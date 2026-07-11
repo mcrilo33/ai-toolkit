@@ -329,16 +329,19 @@ def _is_mcp_group(observation: Observation) -> bool:
 
 
 def _mcp_server(name: str) -> str | None:
-    """Return the server segment of an MCP tool span name, or None when it is not one (#234).
+    """Return the server segment of an MCP identifier, or None when it is not one (#234).
 
-    ``tool:mcp__<server>__<tool>`` -> ``<server>``; the ``__`` after the server delimits the tool
-    (a tool name may itself contain ``__``, so only the first split matters). A server segment with
-    single underscores (``my_server``) is preserved intact.
+    Handles both an MCP tool SPAN name (``tool:mcp__<server>__<tool>``) and a bare MCP DEF name as
+    it appears in the loaded-context breakdown / context deltas (``mcp__<server>__<tool>``) ->
+    ``<server>``. The ``__`` after the server delimits the tool (a tool name may itself contain
+    ``__``, so only the first split matters); a server with single underscores (``my_server``) is
+    preserved intact.
     """
-    if not name.startswith(_MCP_TOOL_PREFIX):
-        return None
-    server = name[len(_MCP_TOOL_PREFIX) :].split("__", 1)[0]
-    return server or None
+    for prefix in (_MCP_TOOL_PREFIX, "mcp__"):
+        if name.startswith(prefix):
+            server = name[len(prefix) :].split("__", 1)[0]
+            return server or None
+    return None
 
 
 def _skill_name(observation: Observation) -> str | None:

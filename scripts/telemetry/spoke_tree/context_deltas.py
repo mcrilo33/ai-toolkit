@@ -35,6 +35,7 @@ from telemetry.spoke_tree.observations import (
     ToolContent,
     TraceObservations,
     _llm_requests_in_order,
+    _mcp_server,
     _tool_use_id,
 )
 from telemetry.spoke_tree.steps import _STEP_PREFIX
@@ -129,6 +130,22 @@ def _label_rule_injections(
         rules = _injected_scoped_rules(text_by_name.get(str(row.get("name"))), scoped_rules)
         if rules:
             row["rules"] = rules
+
+
+def _label_mcp_def_loads(added: list[dict[str, object]]) -> None:
+    """Label each added ``mcp``-category def row with its server, in place (#234).
+
+    A deferred MCP tool schema entering context mid-session (a ToolSearch load) rides an added row
+    of category ``mcp`` whose name is ``mcp__<server>__<tool>``; tagging it ``mcp_def_load=<server>``
+    lets :func:`~telemetry.spoke_tree.scores.build_mcp_def_load_scores` count on-demand loads per
+    server — the carrying-vs-using split rules get in #232. Mirrors :func:`_label_rule_injections`.
+    """
+    for row in added:
+        if row.get("category") != "mcp":
+            continue
+        server = _mcp_server(str(row.get("name") or ""))
+        if server:
+            row["mcp_def_load"] = server
 
 
 def _blob_hash(value: object) -> str:
@@ -228,8 +245,10 @@ def apply_context_deltas(
     ``net_tokens`` (which reconciles ± remainder against the call's observed ``cache_creation``),
     and a compaction ``label``. An added message whose injected content matches a ``tool:Skill``
     output is tagged with the skill name (:func:`_label_skill_loads`); an added message injecting a
-    glob-scoped rule is tagged with the rule (:func:`_label_rule_injections`, #232). The delta is
-    stamped on the call's View A copy only (single-emit) as metadata — it never touches billed usage.
+    glob-scoped rule is tagged with the rule (:func:`_label_rule_injections`, #232); an added
+    ``mcp``-category def row (a ToolSearch schema load) is tagged with its server
+    (:func:`_label_mcp_def_loads`, #234). The delta is stamped on the call's View A copy only
+    (single-emit) as metadata — it never touches billed usage.
 
     Args:
         batch: The assembled View A events; the llm_request copies are mutated in place.
@@ -269,6 +288,7 @@ def apply_context_deltas(
         delta = diff_snapshots(predecessor, curr_items, counter=counter, price=price)
         _label_skill_loads(delta.added, curr_items, skill_hashes)
         _label_rule_injections(delta.added, curr_items, scoped_rules or set())
+        _label_mcp_def_loads(delta.added)
         event["body"].setdefault("metadata", {})["context_delta"] = {
             "added": delta.added,
             "removed": delta.removed,
