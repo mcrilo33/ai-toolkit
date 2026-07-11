@@ -1970,7 +1970,7 @@ path to tell the spoke>'."
   # block it); the drain resumes servicing it once auth recovers.
   if [ "$rc" -ne 0 ] && is_auth_failure "$raw"; then
     _AFK_AUTH_FAILED=1
-    broker_warn_continue "$wt" "$issue" auth "subscription auth failed — token could not refresh; re-run /login on the host (drain paused, re-probing)" outward
+    broker_warn_continue "$wt" "$issue" auth "subscription auth failed — token could not refresh; re-run /login on the host (drain paused, re-probing)" reversible
     return 0
   fi
   ans="$(parse_decision "$raw")"
@@ -2558,7 +2558,7 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
   if [ "$rc" -ne 0 ] && is_auth_failure "$raw"; then
     _AFK_AUTH_FAILED=1
     broker_warn_continue "$wt" "$issue" auth \
-      "subscription auth failed — token could not refresh; re-run /login on the host (drain paused, re-probing)" outward
+      "subscription auth failed — token could not refresh; re-run /login on the host (drain paused, re-probing)" reversible
     return 0
   fi
   decision="$(parse_decision "$raw")"

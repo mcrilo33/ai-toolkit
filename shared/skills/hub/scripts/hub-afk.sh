@@ -59,7 +59,7 @@
 #                                (4x300s), not the ~50min a 120s-era default of 10 would stretch to
 #   AFK_DISPATCH_MAX_FAILURES=3  consecutive worktree-new.sh failures before an issue is blocked
 #   AFK_ARM_PRECHECK=1           arm-precondition gate (=0 skips live/dirty/branch/gh-auth checks)
-#   AFK_AUTH_PROBE_CMD           reap-time auth probe (default: a bounded headless claude no-op)
+#   AFK_AUTH_PROBE_CMD           auth probe: reap-time AND the #241 §9 per-tick auth-halt re-probe (default: a bounded headless claude no-op)
 #   CLAUDE_PROJECTS_DIR          transcript root (default: $HOME/.claude/projects)
 #   AFK_REMOTE_HOST / AFK_REMOTE_REPO / AFK_REMOTE_SESSION / AFK_REMOTE_DRAIN_CMD
 #                                --remote target config (or a sourced AFK_REMOTE_CONF file)
@@ -1313,7 +1313,8 @@ reap_pass() {
     # Auth probe before the FIRST reap this tick (#170 ST7): if the subscription token is
     # dead, every idle spoke is stalled on auth, not hung — reaping them one-by-one would
     # block live work into dead auth. Probe once; on a real auth failure raise the global
-    # stop flag and bail, letting the main loop's halt-all path block them together.
+    # stop flag and bail, letting the main loop's _afk_service_auth_halt WARN them + re-probe
+    # (never block/stop — #241 §9).
     if [ "$probed" -eq 0 ]; then
       probed=1
       afk_write_heartbeat   # the probe is a bounded `claude` call — keep the epoch fresh (#170 ST2)
@@ -1563,8 +1564,8 @@ supervise_tick() {
   dispatch_batch
   answer_pass
   # If the answer pass detected a dead subscription token, skip land + reap this tick:
-  # both would shell out to a `claude`/suite that is just as dead. The main loop blocks
-  # the in-flight spokes and stops.
+  # both would shell out to a `claude`/suite that is just as dead. The main loop then WARNS
+  # the in-flight spokes + re-probes (never blocks/stops — #241 §9, _afk_service_auth_halt).
   [ "$_AFK_AUTH_FAILED" -eq 1 ] && return 0
   auto_land
   recover_dead_panes
@@ -1612,7 +1613,8 @@ service_event_wake() {
   [ -n "$issues" ] && log "/afk: event wake — servicing $(printf '%s' "$issues" | tr '\n' ' ')"
   answer_pass
   # Same auth short-circuit as supervise_tick: a dead token means auto_land would shell
-  # into dead auth; the main loop's post-service check halts + blocks the in-flight set.
+  # into dead auth; the main loop's _afk_service_auth_halt then WARNS the in-flight set +
+  # re-probes (never blocks/stops — #241 §9).
   [ "$_AFK_AUTH_FAILED" -eq 1 ] && return 0
   auto_land
 }
