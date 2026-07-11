@@ -2695,6 +2695,9 @@ def test_reanswer_ceiling_caps_repeated_reasoning(
         **waiting_spoke_env,
         "AFK_ANSWERER_CMD": f"printf x >> '{calls}'; printf 'ESCALATE: legitimately stuck'",
         "AFK_REANSWER_CEILING": "2",
+        # #241: the ceiling now retries after a backoff; keep the backoff far beyond the 4 fast
+        # ticks so this "caps at 2" assertion stays wall-clock-independent (no mid-test retry).
+        "AFK_WARN_BACKOFF_BASE": "1000000",
     }
 
     for _ in range(4):
@@ -2702,7 +2705,9 @@ def test_reanswer_ceiling_caps_repeated_reasoning(
         assert result.returncode == 0, result.stderr
 
     n = calls.read_text().count("x") if calls.exists() else 0
-    assert n == 2, f"the reasoner must stop after 2 attempts on the same prompt, ran {n}"
+    assert n == 2, (
+        f"the reasoner must stop after 2 attempts on the same prompt within the backoff, ran {n}"
+    )
 
 
 def test_reanswer_ceiling_resets_after_tip_advances(

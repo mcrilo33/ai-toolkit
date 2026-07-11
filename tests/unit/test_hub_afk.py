@@ -1612,9 +1612,14 @@ def test_decide_and_act_aborts_when_no_longer_parked(tmp_path: Path) -> None:
     _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
     fake_bin, tmux_log = _injector_tmux(tmp_path, capture="│ > │\n", pane_path=spoke)
     env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
-    # The answerer's side effect: a human answered while it reasoned.
+    # The answerer's side effect: a human answered while it reasoned (a genuine TYPED reply,
+    # so #241 §4 reads it as moved-on and drops rather than recomputing).
     human_reply = json.dumps(
-        {"type": "user", "message": {"content": [{"type": "text", "text": "use Redis"}]}}
+        {
+            "type": "user",
+            "promptSource": "typed",
+            "message": {"content": [{"type": "text", "text": "use Redis"}]},
+        }
     )
     env["AFK_ANSWERER_CMD"] = (
         f"printf '%s\\n' '{human_reply}' >> \"{pd / 'session.jsonl'}\"; printf 'ANSWER: use Redis'"
@@ -1685,7 +1690,11 @@ def test_decide_and_act_gate_park_moved_on_aborts(tmp_path: Path) -> None:
     # The answerer's side effect: a human approved in-pane while it reasoned (a user
     # text turn lands; no commit, so gate/5 is still at the tip).
     human_reply = json.dumps(
-        {"type": "user", "message": {"content": [{"type": "text", "text": "approved, go ahead"}]}}
+        {
+            "type": "user",
+            "promptSource": "typed",
+            "message": {"content": [{"type": "text", "text": "approved, go ahead"}]},
+        }
     )
     env["AFK_ANSWERER_CMD"] = (
         f"printf '%s\\n' '{human_reply}' >> \"{pd / 'session.jsonl'}\"; "
@@ -1711,7 +1720,11 @@ def test_decide_and_act_moved_on_seed_replay_drops_not_blocks(tmp_path: Path) ->
     env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
     _write_transcript(pd, [_seed_record(), _ask_record("Which store?", [("Redis", "fast")])])
     human_reply = json.dumps(
-        {"type": "user", "message": {"content": [{"type": "text", "text": "use Redis"}]}}
+        {
+            "type": "user",
+            "promptSource": "typed",
+            "message": {"content": [{"type": "text", "text": "use Redis"}]},
+        }
     )
     env["AFK_ANSWERER_CMD"] = (
         f"printf '%s\\n' '{human_reply}' >> \"{pd / 'session.jsonl'}\"; "

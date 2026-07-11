@@ -140,11 +140,14 @@ read_answer_attempt()   { _read_issue_epoch answer-attempt "$1"; }
 # Fresh window ⇒ no stale progress/attempt state: a leftover answer-attempt epoch
 # would suppress a legitimate idle reap in the next window; a leftover re-answer counter
 # (#203) would strand a spoke at a ceiling reached in a prior window; a leftover gate-voided /
-# terminal-logged marker (#237) would keep a since-resolved gate terminal across windows.
+# terminal-logged marker (#237) would keep a since-resolved gate terminal across windows; a
+# leftover warned-retry backoff (#241) would inherit a prior window's grown cadence and skip
+# the clean first-exhaustion re-service.
 _clear_progress_state() {
   local dir; dir="$(_afk_state_dir)"
   rm -f "$dir"/progress-*.epoch "$dir"/answer-attempt-*.epoch "$dir"/tip-* \
     "$dir"/reanswer-* "$dir"/gate-voided-* "$dir"/terminal-logged-* 2>/dev/null || true
+  _clear_warned_records   # #241: drop the warned-retry backoff + records for a fresh window
 }
 
 # --- re-answer ceiling (issue #203, finding 1) --------------------------------
@@ -2180,12 +2183,14 @@ PYEOF
   case $? in 0) return 0 ;; 3) return 1 ;; *) return 2 ;; esac
 }
 
-# _user_turn_appended <wt_path> <sizes> -> did ANY type:"user" record land in transcript bytes
-# appended after the <sizes> snapshot? The genuine "the spoke MOVED ON" signal (#241 §4): a
-# human/self reply is recorded as a user turn, whereas a non-turn write (the #240 pending
-# -tool_use flush, an OTel dump) only bumps the mtime. The staleness recompute gates on the
-# DEFINITE "no user turn" (rc 1); rc 0 (a reply landed) or rc 2 (cannot tell) both fall to the
-# #89-safe drop. rc 0 found, rc 1 none, rc 2 unavailable (no python3 / no project dir / crash).
+# _user_turn_appended <wt_path> <sizes> -> did a GENUINE typed reply land in transcript bytes
+# appended after the <sizes> snapshot? The "the spoke MOVED ON" signal (#241 §4): a human/self
+# reply is a type:"user" record with promptSource=="typed" and not isMeta — the SAME filter
+# _gate_answer_landed uses to reject SYNTHETIC user turns (tool_results, <system-reminder> /
+# <task-notification>, skill/meta, SDK/system), which are non-turn writes that only bump the
+# mtime while the spoke stays parked (the #240 hang class). The staleness recompute gates on the
+# DEFINITE "no genuine reply" (rc 1); rc 0 (a typed reply landed) or rc 2 (cannot tell) both fall
+# to the #89-safe drop. rc 0 found, rc 1 none, rc 2 unavailable (no python3 / no project dir / crash).
 _user_turn_appended() {
   local wt="$1" sizes="$2" dir
   dir="$(_spoke_project_dir "$wt")"
@@ -2218,7 +2223,12 @@ for path in glob.glob(os.path.join(os.environ["_AFK_DIR"], "*.jsonl")):
             record = json.loads(line)
         except Exception:
             continue
-        if isinstance(record, dict) and record.get("type") == "user":
+        # ONLY a genuine typed prompt submission is a reply — synthetic harness user turns
+        # (tool_results, system-reminders/notifications, skill/meta, SDK/system) are not, and
+        # must read as a non-turn write so §4 recomputes rather than strands (mirrors
+        # _gate_answer_landed's filter).
+        if (isinstance(record, dict) and record.get("type") == "user"
+                and record.get("promptSource") == "typed" and not record.get("isMeta")):
             sys.exit(0)
 sys.exit(3)
 PYEOF
