@@ -31,6 +31,22 @@ main_root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
   exit 1
 }
 
+# Source worktree-lib.sh for the best-effort gh lifecycle-label mirror (issue #236):
+# hub-notify is the single writer that flips the issue's status:* label on a
+# spoke-emitted gate/ready/blocked marker transition. Two-layout resolution mirrors
+# hub-ready-watch's base-branch sourcing — the ai-toolkit checkout (four levels up in
+# scripts/) and a synced target (co-located in .ai-toolkit/scripts/); HUB_NOTIFY_WT_LIB
+# wins for tests. A missing lib simply leaves the mirror functions undefined, and the
+# mirror pass below self-gates on their presence, so the notifier still runs.
+_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for _cand in \
+  "${HUB_NOTIFY_WT_LIB:-}" \
+  "$_script_dir/worktree-lib.sh" \
+  "$_script_dir/../../../../scripts/worktree-lib.sh"; do
+  if [ -n "$_cand" ] && [ -f "$_cand" ]; then . "$_cand"; break; fi
+done
+unset _cand
+
 # The last-seen set persists across runs (git common dir, shared across
 # worktrees, per-repo) so only NEW transitions surface. Each line is
 # "<tag> <sha>"; tracking the sha, not just the name, makes a force-moved marker
@@ -191,6 +207,50 @@ if [ -n "$persist" ]; then
   printf '%s' "$persist" >"$seen_file" 2>/dev/null || true
 else
   : >"$seen_file" 2>/dev/null || true
+fi
+
+# --- GitHub status-label mirror (issue #236) ----------------------------------
+# hub-notify is the single writer that mirrors a spoke-emitted gate/ready/blocked
+# marker transition onto its GitHub issue's status:* label. Runs as a SEPARATE pass
+# with its OWN dedup seen-set (HUB_LABEL_SEEN_FILE), so the label flips exactly once
+# per new marker sha — and DECOUPLED from the ping's afk suppression above: under a
+# live drain the ping is withheld, but the label must still reflect state (that is
+# the whole point of the remote mirror). Best-effort throughout: skipped entirely
+# when the mirror is disabled, gh is absent, or worktree-lib didn't source (the
+# helper is undefined) — in which case the label-seen-set is left untouched so the
+# flip is retried once the precondition returns.
+if command -v wt_gh_set_status_label >/dev/null 2>&1 \
+  && command -v gh >/dev/null 2>&1 \
+  && wt_gh_lifecycle_enabled; then
+  label_seen_file="${HUB_LABEL_SEEN_FILE:-$common_dir/hub-notify-label-seen}"
+  label_seen=""
+  [ -f "$label_seen_file" ] && label_seen="$(cat "$label_seen_file" 2>/dev/null)"
+  label_persist=""
+  while IFS=' ' read -r tag sha; do
+    [ -n "$tag" ] || continue
+    kind="${tag%%/*}"
+    issue="${tag#*/}"
+    case "$issue" in '' | *[!0-9]*) continue ;; esac
+    # Already mirrored at this exact sha → steady, keep it seen (no re-flip). A
+    # force-moved marker has a fresh sha and falls through as a new transition.
+    if printf '%s\n' "$label_seen" | grep -qxF "$tag $sha"; then
+      label_persist+="$tag $sha"$'\n'
+      continue
+    fi
+    case "$kind" in
+      gate)    wt_gh_set_status_label "$issue" "status:gate" ;;
+      ready)   wt_gh_set_status_label "$issue" "status:ready" ;;
+      blocked) wt_gh_set_status_label "$issue" "status:blocked" ;;
+      *)       continue ;;
+    esac
+    label_persist+="$tag $sha"$'\n'
+  done <<<"$current"
+  mkdir -p "$(dirname "$label_seen_file")" 2>/dev/null || true
+  if [ -n "$label_persist" ]; then
+    printf '%s' "$label_persist" >"$label_seen_file" 2>/dev/null || true
+  else
+    : >"$label_seen_file" 2>/dev/null || true
+  fi
 fi
 
 # /afk drain-complete (issue #150): hub-afk writes <git-common-dir>/.afk-drain-complete

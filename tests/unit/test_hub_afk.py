@@ -80,7 +80,11 @@ def _call(fn_call: str, *, env: dict[str, str] | None = None) -> subprocess.Comp
 
     TZ=UTC is forced so the window clock is deterministic regardless of host TZ.
     """
-    full_env = {**os.environ, "TZ": "UTC"}
+    # Default the #236 gh lifecycle-label mirror OFF: this host has an authed `gh` and
+    # _call runs with cwd = the real repo, so a reap/escalation exercising
+    # _afk_escalate_blocked would otherwise fire a REAL `gh issue edit` at the live repo.
+    # The label-assertion tests opt back in (=1) behind a PATH gh stub (_blocked_label_env).
+    full_env = {**os.environ, "TZ": "UTC", "AI_TOOLKIT_GH_LIFECYCLE_LABELS": "0"}
     if env:
         full_env.update(env)
     return subprocess.run(
@@ -6366,3 +6370,104 @@ def test_status_labels_gh_failure_does_not_break_tick(tmp_path: Path) -> None:
 
     # A gh label failure logs and continues — the tick (return code) is never broken.
     assert result.returncode == 0, result.stderr
+
+
+# --- supervisor blocked-escalation label mirror + AC5 (issue #236) ------------
+# When the drain escalates a spoke to blocked, hub-afk is the single writer of that
+# supervisor-driven transition (the spoke may already be torn down, so the hub-notify
+# watch loop can't be relied on): it flips the issue's status:* label to status:blocked,
+# best-effort. And the drain's OWN label reads — afk_sync_status_labels' afk:* reconcile
+# (#223) — must stay unaffected by the new status:*/mode:*/lane: labels (AC5).
+
+
+def _blocked_label_env(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
+    """A succeeding spoke-ready stub + a logging gh stub for _afk_escalate_blocked.
+    Returns (env, ready_log, gh_log)."""
+    ready_log = tmp_path / "ready.log"
+    ready = tmp_path / "spoke-ready.sh"
+    ready.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready.chmod(0o755)
+    bindir = tmp_path / "ghbin"
+    bindir.mkdir()
+    gh_log = tmp_path / "gh-calls.log"
+    gh = bindir / "gh"
+    gh.write_text('#!/bin/sh\n{ printf "%s" "$*" | tr "\\n" " "; printf "\\n"; } >> "$GH_LOG"\n')
+    gh.chmod(0o755)
+    env = {
+        "SPOKE_READY": str(ready),
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "GH_LOG": str(gh_log),
+        "AFK_ESCALATE_SLEEP": "0",
+        "AI_TOOLKIT_GH_LIFECYCLE_LABELS": "1",
+        # Isolate the once-per-repo label-seed marker so it lands in tmp, not the real .git.
+        "WT_GH_SEED_DIR": str(tmp_path / "seed"),
+    }
+    return env, ready_log, gh_log
+
+
+def test_afk_escalate_flips_status_blocked_label(spoke_repo: Path, tmp_path: Path) -> None:
+    env, _ready_log, gh_log = _blocked_label_env(tmp_path)
+
+    result = _call(f"_afk_escalate_blocked '{spoke_repo}' 103 'stuck'", env=env)
+
+    assert result.returncode == 0, result.stderr
+    edits = [ln for ln in gh_log.read_text().splitlines() if ln.startswith("issue edit 103")]
+    assert len(edits) == 1, f"expected one status flip, got {edits}"
+    assert "--add-label status:blocked" in edits[0]
+    assert "--remove-label status:in-progress" in edits[0]
+
+
+def test_afk_escalate_still_emits_the_blocked_marker(spoke_repo: Path, tmp_path: Path) -> None:
+    # The wrapper must not lose the underlying escalation (the blocked/<N> marker emit).
+    env, ready_log, _gh_log = _blocked_label_env(tmp_path)
+
+    result = _call(f"_afk_escalate_blocked '{spoke_repo}' 103 'stuck'", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "--blocked 103" in ready_log.read_text()
+
+
+def test_afk_escalate_label_flip_is_best_effort(spoke_repo: Path, tmp_path: Path) -> None:
+    # A failing gh (offline) must never fail the escalation.
+    env, _ready_log, _gh_log = _blocked_label_env(tmp_path)
+    failing = tmp_path / "ghbin" / "gh"
+    failing.write_text(
+        '#!/bin/sh\n{ printf "%s" "$*" | tr "\\n" " "; printf "\\n"; } >> "$GH_LOG"\nexit 1\n'
+    )
+    failing.chmod(0o755)
+
+    result = _call(f"_afk_escalate_blocked '{spoke_repo}' 103 'stuck'", env=env)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_afk_sync_labels_ignores_lifecycle_labels(tmp_path: Path) -> None:
+    # AC5: the afk:* reconcile (#223) must never strip a #236 status:*/mode:*/lane: label.
+    env, edit_log = _status_label_env(
+        tmp_path,
+        desired="189\tafk:in-flight\n",
+        current=[
+            {
+                "number": 189,
+                "state": "OPEN",
+                "labels": [
+                    {"name": "afk:queued"},
+                    {"name": "status:gate"},
+                    {"name": "mode:afk"},
+                    {"name": "lane:spoke"},
+                ],
+            }
+        ],
+    )
+    env["AFK_GH_STATUS_LABELS"] = "1"
+
+    result = _call("afk_sync_status_labels", env=env)
+
+    assert result.returncode == 0, result.stderr
+    log = edit_log.read_text()
+    # It swaps only the afk:* label; the lifecycle labels are left untouched.
+    assert "--add-label afk:in-flight" in log
+    assert "--remove-label afk:queued" in log
+    assert "status:" not in log
+    assert "mode:" not in log
+    assert "lane:" not in log

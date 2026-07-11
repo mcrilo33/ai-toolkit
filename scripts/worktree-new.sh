@@ -615,6 +615,32 @@ fi
 # best-effort and self-gating (no-op unless AI_TOOLKIT_OTEL=1, singleton).
 wt_otel_watch_arm "$REPO_ROOT"
 
+# --- GitHub lifecycle-label mirror: dispatch (issue #236) --------------------
+# Stamp the issue so its GitHub list entry shows the spoke is live: status:in-progress
+# + mode:<attended|afk> + lane:spoke, plus a one-time dispatch comment linking the
+# issue back to the branch / worktree / tmux window / spoke_run_id (and thus its
+# Langfuse session). Numbered issues only — an ad-hoc slug carries no issue, so the
+# express/quick/micro lanes mirror nothing by construction. Every write is
+# best-effort and time-bounded inside the wt_gh_* helpers, so a failed / hung /
+# absent / opted-out gh never fails the spawn. LANE is "spoke" for numbered issues
+# (derived above). The tmux window (if one was spawned) links the live pane.
+# UPGRADE: correcting the mode label of an ALREADY-attended spoke when a drain
+# arms mid-run is left to a follow-up — dispatch stamps mode once, and hub-afk
+# passes --mode afk for drain-dispatched spokes so those are correct at spawn.
+if [[ "$ISSUE" =~ ^[0-9]+$ ]]; then
+  # Name the tmux window ONLY when one was actually spawned (SPAWNED=1): a tmux
+  # present-but-failed spawn still leaves win_name/sess assigned, so gate on SPAWNED
+  # to avoid naming a window that doesn't exist.
+  if [ "${SPAWNED:-0}" -eq 1 ] && [ -n "${win_name:-}" ]; then
+    DISPATCH_WINDOW="${sess:-}:${win_name}"
+  else
+    DISPATCH_WINDOW="(no tmux window)"
+  fi
+  wt_gh_apply_dispatch_labels "$ISSUE" "$MODE" "$LANE"
+  wt_gh_dispatch_comment "$ISSUE" "$(printf 'Dispatched — spoke is live (issue #236 lifecycle mirror).\n- branch: %s\n- worktree: %s\n- tmux window: %s\n- spoke_run_id: %s' \
+    "$BRANCH" "$WT_DIR" "$DISPATCH_WINDOW" "$SPOKE_RUN_ID")"
+fi
+
 # --- telemetry: spawn lifecycle marker + script run-node ---------------------
 # Attributed to the new spoke (emitted with the worktree as CWD), carrying the
 # spoke_run_id minted above. The script span is this control script as a trace

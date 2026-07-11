@@ -771,20 +771,34 @@ assert_readonly_tools() {
 # creation gap #168 opened — a reasoner that CREATES a new untracked file used to be invisible
 # here, mutating the tree unprevented AND undetected — while keeping the #168 ignored-artifact
 # class safe (the exclude honors .gitignore, .git/info/exclude, AND the global excludesFile).
-# `sort -zu` makes the combined listing order-stable. Empty (stable) for a non-git or missing
-# path, so a non-worktree reasoner never trips a false breach.
+# `sort -zu` makes the combined listing order-stable. THIS WORKTREE'S HEAD is folded in too
+# (issue #239): `git rev-parse HEAD` so a reasoner ref write that moves HEAD (`git commit` /
+# `update-ref` of the checked-out branch) — which the index/working-tree content scan can never
+# see — still changes the fingerprint, backstopping the snapshot isolation should it ever
+# regress. Deliberately NOT `git for-each-ref`: on a linked worktree that lists the SHARED refs,
+# so ordinary concurrent /afk-drain activity (a sibling spoke's push, a hub auto-land advancing
+# main, a background fetch) would flip the fingerprint and terminally FALSE-void a correct
+# answer — the concurrent-sibling false-BREACH class this repo already fights. HEAD reflects only
+# THIS worktree's own branch tip, immune to sibling ref churn. UPGRADE: to also catch a ref
+# write that does NOT move HEAD (a stray tag / non-checked-out branch), fingerprint the
+# worktree's own per-worktree refs specifically — never the shared ref namespace.
+# Empty (stable) for a non-git or missing path, so a non-worktree reasoner never trips a
+# false breach.
 _broker_worktree_fingerprint() {
   local wt="$1"
   [ -d "$wt" ] || return 0
   (
     cd "$wt" 2>/dev/null || exit 0
     git rev-parse --git-dir >/dev/null 2>&1 || exit 0
-    git ls-files -z --cached --others --exclude-standard 2>/dev/null | sort -zu |
-      while IFS= read -r -d '' f; do
-        printf '%s\0' "$f"
-        if [ -f "$f" ]; then git hash-object "$f" 2>/dev/null || printf 'ERR'; else printf 'GONE'; fi
-        printf '\0'
-      done |
+    {
+      git ls-files -z --cached --others --exclude-standard 2>/dev/null | sort -zu |
+        while IFS= read -r -d '' f; do
+          printf '%s\0' "$f"
+          if [ -f "$f" ]; then git hash-object "$f" 2>/dev/null || printf 'ERR'; else printf 'GONE'; fi
+          printf '\0'
+        done
+      printf 'HEAD\0'; git rev-parse -q --verify HEAD 2>/dev/null || printf 'NONE'; printf '\0'
+    } |
       shasum -a 256 2>/dev/null | awk '{print $1}'
   )
 }
@@ -815,17 +829,32 @@ _broker_is_git_worktree() {
 # copy never recurses the ignored heavy trees (.venv, .testmondata*, .ai-toolkit/ OTel dumps).
 # `cp -R` preserves the worktree's uncommitted + untracked state — fidelity `git worktree add`
 # (committed-HEAD only) can't give — so the reasoner's read git verbs still reflect real state.
-# UPGRADE: for a LINKED worktree `.git` is a gitfile still referencing the shared gitdir, so
-# the copied read-only git verbs read shared metadata; the write-isolation guarantee holds
-# regardless (the copy is a distinct directory and the reasoner has no commit/add/reset in its
-# allowlist). Point the copy at a private gitdir clone if a linked worktree ever needs fully
-# self-contained git in the reasoner.
+# LINKED-WORKTREE GITDIR ISOLATION (#239): a spoke is always a LINKED worktree, whose `.git` is
+# a gitfile still pointing at the SHARED common gitdir. Copying that pointer verbatim (`cp -R`)
+# leaves git WRITE-verbs in the copy (a tool that ignores the read-only allowlist) resolving to
+# the real shared refs — `git commit`/`update-ref` in the copy moved the live HEAD/branch tip
+# and the content-only fingerprint never saw it. So for the gitfile case we give the copy a
+# PRIVATE, self-contained gitdir (_broker_private_gitdir): the object store is shared READ-ONLY
+# via `objects/info/alternates` (no per-tick object copy), while refs/HEAD/index are copied so
+# read verbs still reflect real state AND every write lands in the copy's own gitdir. The
+# main-checkout `.git`-DIRECTORY fast path stays `cp -R` — a self-contained dir is already
+# isolated wholesale.
 _broker_snapshot_worktree() {
   local wt="$1" dest="$2" f
   _broker_is_git_worktree "$wt" || return 1
-  # Copy the git linkage first (a full .git dir OR a linked-worktree gitfile) so read-only
-  # git verbs resolve, then the exact fingerprint set — never the ignored heavy trees.
-  [ -e "$wt/.git" ] && cp -R "$wt/.git" "$dest/.git" 2>/dev/null
+  # Provide the git linkage first so read-only git verbs resolve, then the exact fingerprint
+  # set — never the ignored heavy trees. A `.git` DIRECTORY copies wholesale (already isolated);
+  # a linked-worktree GITFILE gets a private gitdir so writes can't reach the shared common dir.
+  if [ -d "$wt/.git" ]; then
+    cp -R "$wt/.git" "$dest/.git" 2>/dev/null
+  elif [ -f "$wt/.git" ]; then
+    # Best-effort (like the old `cp -R … 2>/dev/null`): even a partial/failed private gitdir is
+    # still a PRIVATE $dest/.git — never a gitfile pointing at the shared common dir — so keeping
+    # the copy preserves write isolation. A hard `return 1` here would make run_answerer fall
+    # back to running the reasoner in the LIVE tree, silently dropping the very isolation this
+    # provides; the reasoner's git reads just degrade if the private gitdir is incomplete.
+    _broker_private_gitdir "$wt" "$dest" || true
+  fi
   (
     cd "$wt" 2>/dev/null || exit 0
     git ls-files -z --cached --others --exclude-standard 2>/dev/null |
@@ -835,6 +864,42 @@ _broker_snapshot_worktree() {
         cp -p "$f" "$dest/$f" 2>/dev/null || true
       done
   )
+  return 0
+}
+
+# _broker_private_gitdir <wt> <dest> -> build a PRIVATE, self-contained gitdir at <dest>/.git
+# for a LINKED worktree <wt> (whose own `.git` is a gitfile at the shared common gitdir), so a
+# git write-verb in the copy writes ONLY here — never the shared refs (#239). Objects are shared
+# READ-ONLY via alternates (cheap: no per-tick copy of the object store); the shared refs +
+# packed-refs are copied so read verbs reflect real state and a ref write lands locally; HEAD +
+# index come from the per-worktree gitdir so `git status`/`diff` reflect the spoke's real
+# uncommitted state; the real common config is copied (with worktree-specific bits neutralized)
+# so any `[extensions]` carry over. rc 1 on a failure the caller treats as best-effort — a
+# partial $dest/.git is still private, so write isolation holds either way.
+# UPGRADE: the ref copy assumes the `files` ref backend; a `reftable`-backend repo keeps refs in
+# a `reftable/` dir, not `refs/` + `packed-refs`, and would need that copied instead.
+_broker_private_gitdir() {
+  local wt="$1" dest="$2" common gitdir
+  common="$(git -C "$wt" rev-parse --git-common-dir 2>/dev/null)" || return 1
+  gitdir="$(git -C "$wt" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+  [ -n "$common" ] && [ -n "$gitdir" ] || return 1
+  case "$common" in /*) ;; *) common="$wt/$common" ;; esac   # resolve a relative common dir
+  mkdir -p "$dest/.git/objects/info" "$dest/.git/refs" || return 1
+  printf '%s\n' "$common/objects" > "$dest/.git/objects/info/alternates"
+  cp -R "$common/refs/." "$dest/.git/refs/" 2>/dev/null || true
+  [ -f "$common/packed-refs" ] && cp "$common/packed-refs" "$dest/.git/packed-refs" 2>/dev/null
+  cp "$gitdir/HEAD" "$dest/.git/HEAD" 2>/dev/null || return 1
+  [ -f "$gitdir/index" ] && cp "$gitdir/index" "$dest/.git/index" 2>/dev/null
+  # Copy the REAL common config (not a hardcoded version-0 stub) so any `[extensions]` the shared
+  # repo needs — objectformat=sha256, etc. — carry over and the shared objects still parse; then
+  # neutralize the worktree-specific bits so the copy is a plain non-bare worktree rooted at $dest.
+  if [ -f "$common/config" ]; then
+    cp "$common/config" "$dest/.git/config" 2>/dev/null
+  else
+    printf '[core]\n\tbare = false\n' > "$dest/.git/config"
+  fi
+  git -C "$dest" config core.bare false 2>/dev/null || true
+  git -C "$dest" config --unset core.worktree 2>/dev/null || true
   return 0
 }
 
@@ -943,17 +1008,20 @@ _rule_file() {
   return 1
 }
 
-# build_answerer_prompt <issue> <question> [wt] -> the full prompt for the reasoner: the
+# build_answerer_prompt <issue> <question> -> the full prompt for the reasoner: the
 # governing rule, the issue contract, the read-only-worktree posture + evidence contract,
 # a decisions-digest of this spoke's prior gate outcomes, and the parked prompt.
-# Self-contained so the headless reasoner needs no project context loaded.
+# Self-contained so the headless reasoner needs no project context loaded. The reasoner's
+# cwd is the #237 snapshot COPY (created in run_answerer before this is called), so the
+# posture points at "a throwaway copy (your cwd)" and — deliberately (#239) — never
+# discloses the live worktree's absolute path, which used to invite an absolute-path write
+# into the real tree.
 build_answerer_prompt() {
-  local issue="$1" question="$2" wt="${3:-}" rule body digest at=""
+  local issue="$1" question="$2" rule body digest
   rule="$(_rule_file)" && rule="$(cat "$rule")" \
     || rule="Answer in the interest of the issue contract and repo conventions; prefer the spoke's own recommended option; escalate (output 'ESCALATE: <reason>') only when the decision is irreversible, outward-facing, or scope-changing. Otherwise output 'ANSWER: <reply>'."
   body="$(gh issue view "$issue" --json title,body -q '.title + "\n\n" + .body' 2>/dev/null || echo "(issue #$issue body unavailable)")"
   digest="$(read_decisions_digest "$issue")"
-  [ -n "$wt" ] && at=" at $wt"
   cat <<EOF
 $rule
 
@@ -963,8 +1031,8 @@ $body
 
 ## Read-only worktree access
 
-You have READ-ONLY access to the spoke's worktree$at (your cwd). Use your read/search
-tools to verify the decision against the code as it ACTUALLY is — confirm a command
+You have READ-ONLY access to a throwaway COPY of the spoke's worktree (your cwd). Use your
+read/search tools to verify the decision against the code as it ACTUALLY is — confirm a command
 touches only the spoke's own files, that a posted plan matches real state, and so on.
 You must NOT edit, stage, commit, or push anything: the tree is read-only and any write
 voids your answer. When you auto-answer, cite the worktree EVIDENCE you checked on an
@@ -1049,23 +1117,15 @@ _broker_run_bounded() {
 # jsonl out of _spoke_jsonl if the installed CLI ever loses it.
 run_answerer() {
   local issue="$1" question="$2" wt="${3:-}"
-  local prompt; prompt="$(build_answerer_prompt "$issue" "$question" "$wt")"
   local tools; tools="$(reasoner_allowed_tools)"
   local cmd="${AFK_ANSWERER_CMD:-claude -p --no-session-persistence --model claude-opus-4-8 --allowedTools '$tools'}"
   local secs; secs="$(_afk_answerer_timeout)"
-  # Deliver the prompt via a temp file the wrapped command re-opens with `exec <`, NOT only
-  # the here-string: the bound (_afk_with_timeout's portable fallback) BACKGROUNDS the
-  # command, and POSIX assigns a backgrounded job's stdin to /dev/null — a plain here-string
-  # would be lost, starving the reasoner of its prompt. `exec <file` reopens stdin inside the
-  # backgrounded shell, so the prompt survives every bound path. The here-string stays as a
-  # fallback for when mktemp is unavailable (the foreground timeout/perl paths keep stdin).
-  local pf rc; pf="$(mktemp 2>/dev/null)" || pf=""
-  [ -n "$pf" ] && { printf '%s' "$prompt" > "$pf"; cmd="exec <'$pf'; $cmd"; }
   # Write isolation (#237): run the reasoner against a throwaway COPY of the worktree, not the
   # spoke's LIVE tree — so even a tool that ignores the read-only allowlist writes into the
   # copy. The reasoner's cwd moves to the snapshot; broker_service_gate still fingerprints the
   # real $wt, now a should-never-fire backstop. On any copy failure (no mktemp, non-git tree),
-  # fall back to running in-place: the fingerprint void remains the guard.
+  # fall back to running in-place: the fingerprint void remains the guard. The snapshot is
+  # built BEFORE the prompt (#239) so the posture can point cwd at the copy and never disclose $wt.
   local snap="" run_dir="$wt"
   if [ -n "$wt" ] && [ -d "$wt" ]; then
     snap="$(mktemp -d 2>/dev/null)" || snap=""
@@ -1075,6 +1135,15 @@ run_answerer() {
       rm -rf "$snap" 2>/dev/null || true; snap=""
     fi
   fi
+  local prompt; prompt="$(build_answerer_prompt "$issue" "$question")"
+  # Deliver the prompt via a temp file the wrapped command re-opens with `exec <`, NOT only
+  # the here-string: the bound (_afk_with_timeout's portable fallback) BACKGROUNDS the
+  # command, and POSIX assigns a backgrounded job's stdin to /dev/null — a plain here-string
+  # would be lost, starving the reasoner of its prompt. `exec <file` reopens stdin inside the
+  # backgrounded shell, so the prompt survives every bound path. The here-string stays as a
+  # fallback for when mktemp is unavailable (the foreground timeout/perl paths keep stdin).
+  local pf rc; pf="$(mktemp 2>/dev/null)" || pf=""
+  [ -n "$pf" ] && { printf '%s' "$prompt" > "$pf"; cmd="exec <'$pf'; $cmd"; }
   # _broker_run_bounded caps the reasoner (#171): a hung `claude` never freezes the tick.
   # stderr is folded in (2>&1) so the auth-failure detector still sees credential messages.
   (

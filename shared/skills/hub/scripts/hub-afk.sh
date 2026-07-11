@@ -411,12 +411,29 @@ _kill_spoke_window() {
       case "$name" in "${issue}-"* | "$issue") tmux kill-window -t "$target" 2>/dev/null || true ;; esac
     done
 }
+# _afk_escalate_blocked <wt> <issue> <reason> — the ONE supervisor escalation path
+# (issue #236). It runs the gate-broker core _escalate_blocked (marker emit + durable
+# local-record fallback + deny span) AND mirrors the transition onto the GitHub issue's
+# status label. The supervisor is the single WRITER of a supervisor-driven blocked
+# transition: it escalates when a spoke is reaped or a land fails, by which point the
+# spoke may be torn down, so the hub-notify watch loop can't be relied on to flip the
+# label. Best-effort throughout (wt_gh_set_status_label self-gates on disabled / gh-absent
+# / a numeric issue), so a failed gh never fails a tick.
+_afk_escalate_blocked() {
+  _escalate_blocked "$1" "$2" "$3"
+  case "$2" in
+    '' | *[!0-9]*) ;;  # non-numeric (ad-hoc) issue — no GitHub issue to mirror onto
+    *) command -v wt_gh_set_status_label >/dev/null 2>&1 \
+         && wt_gh_set_status_label "$2" "status:blocked" || true ;;
+  esac
+}
+
 reap_spoke() {
   local wt="$1" issue="$2" reason="$3"
   log "→ reap #$issue: $reason"
   _afk_set_last_action "reap #$issue"
   _kill_spoke_window "$issue"
-  _escalate_blocked "$wt" "$issue" "$reason"
+  _afk_escalate_blocked "$wt" "$issue" "$reason"
 }
 
 # --- crash ≠ hang: auto-resume-once a pane-dead spoke (issue #109) -------------
@@ -681,7 +698,7 @@ _block_all_inflight() {
   while IFS=$'\t' read -r path issue; do
     [ -n "$issue" ] || continue
     [ "$(slot_state "$path" "$issue")" = "done" ] && continue
-    _escalate_blocked "$path" "$issue" "$reason"
+    _afk_escalate_blocked "$path" "$issue" "$reason"
   done < <(inflight_worktrees)
 }
 
@@ -1122,7 +1139,7 @@ auto_land() {
     if [ "${AFK_REVIEW_GATE:-1}" != "0" ]; then
       verdict="$(_afk_review_verdict "$path")"
       if [ "$verdict" != "APPROVE" ]; then
-        _escalate_blocked "$path" "$issue" \
+        _afk_escalate_blocked "$path" "$issue" \
           "code-review verdict not clean (${verdict:-no review}) — possible test-gutting, needs a human"
         continue
       fi
@@ -1145,7 +1162,7 @@ auto_land() {
       _afk_clear_land_retries "$issue"
       _afk_incr_landed
     else
-      _escalate_blocked "$path" "$issue" "auto-land failed (merge conflict or push rejection, exit $land_rc) — needs a human (see $land_log)"
+      _afk_escalate_blocked "$path" "$issue" "auto-land failed (merge conflict or push rejection, exit $land_rc) — needs a human (see $land_log)"
     fi
   done < <(inflight_worktrees)
 }

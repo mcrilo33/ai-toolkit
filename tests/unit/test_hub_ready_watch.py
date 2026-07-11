@@ -98,6 +98,19 @@ def _run(
     env["HUB_NOTIFY_CMD"] = str(notifier)
     env["HUB_NOTIFY_SEEN_FILE"] = str(tmp_path / "hub-notify-seen")
     env.pop("AFK_STATE", None)
+    # A logging `gh` stub on PATH so the merged-in hub-notify status-label mirror
+    # (issue #236) is hermetic; its `gh issue edit` calls are readable at
+    # _gh_calls(tmp_path). ready-watch invokes hub-notify with the env inherited, so
+    # the label seen-file + log path pass straight through.
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    gh = bindir / "gh"
+    gh.write_text('#!/bin/sh\n{ printf "%s" "$*" | tr "\\n" " "; printf "\\n"; } >> "$GH_LOG"\n')
+    gh.chmod(0o755)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["GH_LOG"] = str(tmp_path / "gh-calls.log")
+    env["HUB_LABEL_SEEN_FILE"] = str(tmp_path / "label-seen")
+    env.pop("AI_TOOLKIT_GH_LIFECYCLE_LABELS", None)
     return subprocess.run(
         ["bash", str(WATCH)],
         cwd=str(hub),
@@ -299,3 +312,21 @@ def test_ready_watch_loop_also_fires_hub_notify(hub: Path, tmp_path: Path) -> No
     assert len(notes) == 1
     assert "#1" in notes[0]
     assert "BLOCKED" in notes[0]
+
+
+def _gh_calls(tmp_path: Path) -> list[str]:
+    """The gh calls hub-notify made (via the PATH stub) during _run."""
+    log = tmp_path / "gh-calls.log"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def test_ready_watch_drives_hub_notify_status_label_mirror(hub: Path, tmp_path: Path) -> None:
+    # ready-watch delegates the single fetch to hub-notify (HUB_NOTIFY_SKIP_FETCH=1),
+    # so the status-label mirror (issue #236) fires through this path too.
+    _git(hub, "tag", "ready/1", "feature/1-pushed")
+
+    proc = _run(hub, tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    edits = [c for c in _gh_calls(tmp_path) if c.startswith("issue edit 1")]
+    assert len(edits) == 1 and "--add-label status:ready" in edits[0]

@@ -992,3 +992,39 @@ def test_marker_push_survives_unwritable_tmpdir(spoke: Path, remote: Path, tmp_p
     assert result.returncode == 0, result.stdout + result.stderr
     assert _remote_has_ref(remote, "refs/tags/ready/45"), "the uncaptured push must still land"
     assert "uncaptured" in result.stderr, "the degraded mode must be announced"
+
+
+# --- single-writer boundary: spoke-ready writes NO GitHub labels (issue #236) --
+# The lifecycle-label mirror is the HUB's job (worktree-new at dispatch, hub-notify
+# on marker transitions, hub-afk on escalation, worktree-land at close). spoke-ready
+# sources worktree-lib.sh — so the wt_gh_* helpers are IN SCOPE in its process — but it
+# must NEVER invoke them: a spoke is a non-writer. This locks that boundary so a future
+# edit can't silently make the spoke start writing to GitHub.
+
+
+def _gh_logging_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
+    bindir = tmp_path / "ghbin"
+    bindir.mkdir(exist_ok=True)
+    log = tmp_path / "gh-calls.log"
+    gh = bindir / "gh"
+    gh.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$GH_LOG"\n')
+    gh.chmod(0o755)
+    env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}", "GH_LOG": str(log)}
+    return env, log
+
+
+@pytest.mark.parametrize(
+    "args",
+    [("45",), ("--gate", "45"), ("--accept", "45"), ("--blocked", "45")],
+    ids=["ready", "gate", "accept", "blocked"],
+)
+def test_spoke_ready_emits_no_gh_calls(
+    spoke: Path, remote: Path, tmp_path: Path, args: tuple[str, ...]
+) -> None:
+    env, log = _gh_logging_env(tmp_path)
+
+    proc = _run(spoke, *args, env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    calls = log.read_text() if log.exists() else ""
+    assert calls == "", f"spoke-ready must not touch gh — the hub mirrors, not the spoke: {calls!r}"
