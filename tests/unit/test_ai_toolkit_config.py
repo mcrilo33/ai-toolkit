@@ -401,10 +401,10 @@ def test_batch_env_cli_empty_when_unset(tmp_path: Path) -> None:
 
 
 def test_real_config_batch_cap_pinned_stagger_autoderives(real_config: dict) -> None:
-    # The hub pins the cap to conserve the weekly subscription budget (the
-    # binding constraint with Opus spokes, not hardware — see the config comment);
-    # the stagger stays blank ⇒ the consumer auto-derives its default.
-    assert cfg.batch_concurrency_cap(real_config) == 3
+    # Budget is ample, so the cap sits at 6 — the hardware-safe ceiling now that
+    # #188/#203 landed (see the config comment); drop it toward 3 to stretch a
+    # tight weekly budget. The stagger stays blank ⇒ the consumer auto-derives.
+    assert cfg.batch_concurrency_cap(real_config) == 6
     assert cfg.batch_stagger_seconds(real_config) is None
 
 

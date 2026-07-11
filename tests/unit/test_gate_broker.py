@@ -2417,6 +2417,76 @@ def test_classify_permission_escalates_relative_chmod_on_git_internals(
     assert _classify_with_wt("chmod +x .git/hooks/pre-commit", spoke_repo, tasks) == "ESCALATE"
 
 
+# ── issue #240: approve constrained in-worktree ./script execution ─────────────
+# The secondary facet: with extraction fixed, a spoke parked on running its OWN in-tree
+# executable (#238's smoke: `chmod +x scripts/dev/afk-gate-smoke.sh &&
+# ./scripts/dev/afk-gate-smoke.sh`) still escalated — the safe-segment lane had no rule for
+# `./<relative-in-tree-path>` execution. Option A (the plan-gate decision) approves it when
+# the path resolves under the worktree via _broker_resolve_in_roots, which already rejects
+# `..`, absolute paths, `.git`, secret-like names, and shell metacharacters.
+
+
+def test_classify_permission_approves_in_worktree_smoke_compound(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The exact #238 compound: chmod +x its own in-tree script, then run it. Both segments
+    # are scoped self-ops on the spoke's worktree, so the whole compound auto-approves.
+    tasks = tmp_path / "tasks"
+    cmd = "chmod +x scripts/dev/afk-gate-smoke.sh && ./scripts/dev/afk-gate-smoke.sh"
+
+    assert _classify_with_wt(cmd, spoke_repo, tasks) == "APPROVE"
+
+
+def test_classify_permission_approves_relative_script_exec_alone(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A bare `./<in-tree-path>` execution (with trailing args, opaque to which code runs)
+    # approves on its own — the executable resolves under the worktree.
+    tasks = tmp_path / "tasks"
+
+    assert _classify_with_wt("./scripts/dev/afk-gate-smoke.sh --check", spoke_repo, tasks) == (
+        "APPROVE"
+    )
+
+
+def test_classify_permission_escalates_absolute_script_exec(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # An ABSOLUTE-path execution is not the scoped `./` self-op form — default-deny escalates.
+    tasks = tmp_path / "tasks"
+
+    assert _classify_with_wt("/usr/local/bin/evil.sh", spoke_repo, tasks) == "ESCALATE"
+
+
+def test_classify_permission_escalates_script_exec_traversal_escape(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A `..` in the exec path could traverse out of the worktree at runtime; the resolver
+    # rejects it, so the execution escalates.
+    tasks = tmp_path / "tasks"
+
+    assert _classify_with_wt("./../escape.sh", spoke_repo, tasks) == "ESCALATE"
+
+
+def test_classify_permission_escalates_script_exec_without_worktree(spoke_repo: Path) -> None:
+    # With no worktree context the in-tree claim cannot be verified, so `./script` execution
+    # fails closed → escalate (mirrors the mutation lane's inert-without-worktree behaviour).
+    result = _call('classify_permission "$CMD" | cut -f1', env={"CMD": "./scripts/dev/x.sh"})
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ESCALATE"
+
+
+def test_classify_permission_escalates_script_exec_with_substitution(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A command substitution smuggled behind a safe-looking `./script` prefix must escalate —
+    # the segment-level reject fires before the exec rule can approve it.
+    tasks = tmp_path / "tasks"
+
+    assert _classify_with_wt("./x.sh $(rm -rf ~)", spoke_repo, tasks) == "ESCALATE"
+
+
 def test_classify_permission_escalates_brace_expansion_escape(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
@@ -2780,6 +2850,82 @@ def test_extract_pending_command_other_tool_stays_bare_name(
     assert result.stdout.strip() == "Write"
 
 
+# ── issue #240: extract_pending_command must return the PENDING (unresolved) tool_use ──
+# The permission dialog flushes the pending tool_use to the JSONL as an UNRESOLVED block
+# (no matching tool_result) for the whole park, while the PRIOR calls are already resolved.
+# The old walk kept the last tool_use in file order regardless of resolution, so a spoke
+# that parked right after a completed Write surfaced a phantom "Write" and escalated on it.
+
+
+def _tool_result_record(tool_use_id: str) -> dict:
+    # The user turn Claude Code appends when a tool_use completes — its tool_result carries
+    # the matching tool_use_id, which is what marks the tool_use RESOLVED.
+    return {
+        "type": "user",
+        "message": {
+            "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": "ok"}]
+        },
+    }
+
+
+_SMOKE_COMPOUND = "chmod +x scripts/dev/afk-gate-smoke.sh && ./scripts/dev/afk-gate-smoke.sh"
+
+
+def test_extract_pending_command_ignores_resolved_trailing_tool(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The exact #238 repro: the last tool_use is a COMPLETED Write (with a matching
+    # tool_result) and there is NO unresolved tool_use. extract_pending_command must NOT
+    # return the resolved "Write" — with nothing pending it returns empty, so the caller
+    # escalates honestly ("unreadable command") instead of on a phantom tool name.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    records = [
+        _read_tool_record(str(spoke_repo / "task.md")),
+        _tool_result_record("tu_r"),
+        _bash_tool_record("ls -la scripts/dev/"),
+        _tool_result_record("tu_1"),
+        _named_tool_record("Write", {"file_path": "scripts/dev/x.sh", "content": "y"}),
+        _tool_result_record("tu_n"),
+    ]
+    (pd / "session.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+
+    result = _call(
+        f"extract_pending_command '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "", (
+        f"a resolved trailing tool must not surface: {result.stdout!r}"
+    )
+
+
+def test_extract_pending_command_returns_unresolved_pending_command(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The live-park case: prior Read+Write are RESOLVED, and the pending Bash compound the
+    # dialog is gating sits UNRESOLVED (no tool_result) for the length of the park. That
+    # real command — not the resolved Write — is what surfaces, so the classifier can decide
+    # it. This is the command the drain recovers to auto-service #238.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    records = [
+        _read_tool_record(str(spoke_repo / "task.md")),
+        _tool_result_record("tu_r"),
+        _named_tool_record("Write", {"file_path": "scripts/dev/afk-gate-smoke.sh", "content": "#"}),
+        _tool_result_record("tu_n"),
+        _bash_tool_record(_SMOKE_COMPOUND),  # tu_1, no tool_result → the pending dialog
+    ]
+    (pd / "session.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+
+    result = _call(
+        f"extract_pending_command '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == _SMOKE_COMPOUND
+
+
 def test_classify_permission_approves_read_in_repo_family(spoke_repo: Path, tmp_path: Path) -> None:
     # A Read of a path under the repo family (here the spoke's own worktree, the sole entry
     # of its `git worktree list`) auto-approves — a write-free research read.
@@ -2893,6 +3039,32 @@ def test_read_prefixed_bash_tooluse_end_to_end_escalates(spoke_repo: Path, tmp_p
     ).stdout.strip()
 
     assert verdict == "ESCALATE"
+
+
+def test_smoke_compound_end_to_end_auto_approves(spoke_repo: Path, tmp_path: Path) -> None:
+    # The #238 acceptance in miniature: a spoke parked after a completed Write, with the
+    # smoke compound sitting UNRESOLVED, must flow through extract_pending_command (which now
+    # recovers the real compound, not the resolved "Write") into classify_permission and
+    # AUTO-APPROVE — binding both halves of the fix (extraction + exec policy).
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    records = [
+        _named_tool_record("Write", {"file_path": "scripts/dev/afk-gate-smoke.sh", "content": "#"}),
+        _tool_result_record("tu_n"),
+        _bash_tool_record(_SMOKE_COMPOUND),  # tu_1, unresolved → the pending dialog
+    ]
+    (pd / "session.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+
+    extracted = _call(
+        f"extract_pending_command '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
+    ).stdout.strip()
+    assert extracted == _SMOKE_COMPOUND
+    verdict = _call(
+        'classify_permission "$CMD" "$WT" | cut -f1',
+        env={"CMD": extracted, "WT": str(spoke_repo), "AFK_TASKS_ROOT": str(tmp_path / "tasks")},
+    ).stdout.strip()
+
+    assert verdict == "APPROVE"
 
 
 def test_classify_permission_read_of_symlink_to_secret_escalates(
