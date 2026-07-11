@@ -175,7 +175,11 @@ from telemetry.spoke_tree.assembly import (
     _tool_span_ids,
 )
 from telemetry.spoke_tree.commits import _commit_events, _gate_park_event, _load_commits
-from telemetry.spoke_tree.context_deltas import _apply_context_rollups, apply_context_deltas
+from telemetry.spoke_tree.context_deltas import (
+    _apply_context_rollups,
+    apply_context_deltas,
+    load_scoped_rules,
+)
 from telemetry.spoke_tree.cycle import (
     _apply_cycle_axis,
     _cycle_step_for,
@@ -231,6 +235,7 @@ from telemetry.spoke_tree.rollups import (
 )
 from telemetry.spoke_tree.scores import (
     build_rule_carry_cost_scores,
+    build_rule_invocation_scores,
     build_score_events,
     build_step_cost_scores,
     build_step_duration_scores,
@@ -896,6 +901,7 @@ class EnrichmentContext:
     score_events: list[IngestEvent] = field(default_factory=list)
     step_scores: list[IngestEvent] = field(default_factory=list)
     carry_scores: list[IngestEvent] = field(default_factory=list)
+    invocation_scores: list[IngestEvent] = field(default_factory=list)
 
 
 def _enrich_loaded_context(ctx: EnrichmentContext) -> None:
@@ -934,7 +940,11 @@ def _enrich_request_body_metadata(ctx: EnrichmentContext) -> None:
 
 
 def _enrich_context_deltas(ctx: EnrichmentContext) -> None:
-    """Stamp #160 per-request context deltas and aggregate them onto both views' step rollups."""
+    """Stamp #160 per-request context deltas and aggregate them onto both views' step rollups.
+
+    The delta pass also labels each added message that injected a #232 glob-scoped rule, so the
+    later invocation-scores pass can count them; the scoped-rule set is read once from the worktree.
+    """
     ctx.deltas = apply_context_deltas(
         ctx.batch,
         ctx.traces,
@@ -942,6 +952,7 @@ def _enrich_context_deltas(ctx: EnrichmentContext) -> None:
         counter=ctx.counter,
         price=ctx.price,
         tool_content=ctx.tool_content,
+        scoped_rules=load_scoped_rules(ctx.root),
     )
     _apply_context_rollups(ctx.batch, {_copy_id(o, i): s for (o, i), s in ctx.deltas.items()})
     _apply_context_rollups(
@@ -980,6 +991,16 @@ def _enrich_carry_cost(ctx: EnrichmentContext) -> None:
     )
 
 
+def _enrich_invocation_scores(ctx: EnrichmentContext) -> None:
+    """Emit per-rule ``rule_invocations:<rule>`` scores from the #232 context-delta rule labels.
+
+    Reads the rule labels the context-deltas pass stamped on the batch, so it runs after it.
+    """
+    ctx.invocation_scores = build_rule_invocation_scores(
+        ctx.spoke_run_id, ctx.batch, base_ts=ctx.base_ts
+    )
+
+
 # The enrichment passes, in the exact order main applies them. Adding a future enrichment is one
 # module + one line here; the passes mutate the batches / accumulate onto the shared context above
 # (a plain ordered list, deliberately not a self-registering registry — the cross-pass data flow
@@ -992,6 +1013,7 @@ _ENRICHMENTS: tuple[tuple[str, Callable[[EnrichmentContext], None]], ...] = (
     ("scores", _enrich_scores),
     ("step-scores", _enrich_step_scores),
     ("carry-cost", _enrich_carry_cost),
+    ("invocation-scores", _enrich_invocation_scores),
 )
 
 
@@ -1070,7 +1092,8 @@ def main(argv: list[str] | None = None) -> int:
         + ctx.score_events
         + cycle_batch
         + ctx.step_scores
-        + ctx.carry_scores,
+        + ctx.carry_scores
+        + ctx.invocation_scores,
         post,
     )
 
@@ -1088,6 +1111,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(ctx.step_scores)} per-phase step cost/token/duration scores emitted, "
         f"{len(ctx.carry_scores)} rule/tooldef carry-cost scores emitted "
         f"(n_requests={ctx.n_requests}), "
+        f"{len(ctx.invocation_scores)} rule-invocation scores emitted, "
         f"{len(commits)} commit nodes synthesized, "
         f"tagged mode={mode} lane={lane}; "
         f"{len(cycle_batch) - 2} observations assembled under cycle trace {cycle_trace_id}"

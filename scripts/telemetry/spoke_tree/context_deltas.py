@@ -13,8 +13,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 from typing import cast
+
+import yaml
 
 from telemetry.langfuse_rollup import build_tree
 from telemetry.measure_context_cost import TokenCounter
@@ -37,6 +40,80 @@ from telemetry.spoke_tree.observations import (
 from telemetry.spoke_tree.steps import _STEP_PREFIX
 
 logger = logging.getLogger("langfuse_spoke_tree")
+
+# The shared rules frontmatter, relative to the worktree root — the source of which rules are
+# glob-scoped (injected on a file-match) rather than always-on.
+_RULES_METADATA_PATH = ("shared", "rules", "metadata.yml")
+# A ``Contents of <path>/<rule>.md`` file header inside an injected reminder (the same shape the
+# request-body itemizer keys on). Unanchored: in a diff snapshot the header sits inside a message's
+# serialized ``{role, content}`` JSON, not at a line start.
+_RULE_INJECTION_RE = re.compile(r"Contents of (\S+?\.md)\b")
+
+
+def load_scoped_rules(root: Path) -> set[str]:
+    """Return the glob-scoped rule filenames (``<name>.md``) from the rules metadata (#232).
+
+    A rule is glob-scoped — it enters context on a file-match rather than being always-on — when its
+    frontmatter has ``alwaysApply`` falsy AND a concrete ``globs`` pattern (not the catch-all
+    ``**``). Those are the rules whose injection counts as an invocation; always-on rules and the
+    ``**`` operational rule are pure carry cost. Best-effort: a missing or malformed metadata file
+    yields an empty set (no invocation scores), mirroring the loaded-context measurement's own
+    best-effort reads.
+
+    Args:
+        root: The worktree root holding ``shared/rules/metadata.yml``.
+
+    Returns:
+        The set of glob-scoped rule basenames, e.g. ``{"code-quality.md", "python-style.md"}``.
+    """
+    path = root.joinpath(*_RULES_METADATA_PATH)
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    scoped: set[str] = set()
+    for name, meta in data.items():
+        if not isinstance(meta, dict) or meta.get("alwaysApply"):
+            continue
+        globs = meta.get("globs")
+        if isinstance(globs, str) and globs and globs != "**":
+            scoped.add(f"{name}.md")
+    return scoped
+
+
+def _matched_scoped_rule(text: str | None, scoped_rules: set[str]) -> str | None:
+    """Return the scoped rule whose ``Contents of …/<rule>.md`` header appears in ``text``, else None."""
+    if not text:
+        return None
+    for match in _RULE_INJECTION_RE.finditer(text):
+        basename = match.group(1).rsplit("/", 1)[-1]
+        if basename in scoped_rules:
+            return basename
+    return None
+
+
+def _label_rule_injections(
+    added: list[dict[str, object]],
+    curr_items: list[ContextItem],
+    scoped_rules: set[str],
+) -> None:
+    """Label each added-message row whose injected content is a glob-scoped rule, in place (#232).
+
+    A scoped rule entering context on a file-match rides an added message whose serialized content
+    carries a ``Contents of …/<rule>.md`` header; the row is tagged ``rule=<basename>`` so
+    :func:`build_rule_invocation_scores` can count it. Mirrors :func:`_label_skill_loads`.
+    """
+    if not scoped_rules:
+        return
+    text_by_name = {item.name: item.text for item in curr_items if item.category == "messages"}
+    for row in added:
+        if row.get("category") != "messages":
+            continue
+        rule = _matched_scoped_rule(text_by_name.get(str(row.get("name"))), scoped_rules)
+        if rule:
+            row["rule"] = rule
 
 
 def _blob_hash(value: object) -> str:
@@ -126,6 +203,7 @@ def apply_context_deltas(
     counter: TokenCounter,
     price: float,
     tool_content: dict[str, ToolContent],
+    scoped_rules: set[str] | None = None,
 ) -> dict[tuple[str, str], dict[str, int]]:
     """Stamp ``metadata.context_delta`` on each llm_request copy from consecutive bodies (#160).
 
@@ -134,8 +212,9 @@ def apply_context_deltas(
     (:func:`telemetry.request_body.diff_snapshots`) into added / removed / size-changed rows,
     ``net_tokens`` (which reconciles ± remainder against the call's observed ``cache_creation``),
     and a compaction ``label``. An added message whose injected content matches a ``tool:Skill``
-    output is tagged with the skill name (:func:`_label_skill_loads`). The delta is stamped on the
-    call's View A copy only (single-emit) as metadata — it never touches billed usage.
+    output is tagged with the skill name (:func:`_label_skill_loads`); an added message injecting a
+    glob-scoped rule is tagged with the rule (:func:`_label_rule_injections`, #232). The delta is
+    stamped on the call's View A copy only (single-emit) as metadata — it never touches billed usage.
 
     Args:
         batch: The assembled View A events; the llm_request copies are mutated in place.
@@ -144,6 +223,8 @@ def apply_context_deltas(
         counter: Token counter (memoize it — the stable prefix repeats every snapshot).
         price: Cache-creation price in USD per token.
         tool_content: Tool-call-id to :class:`ToolContent`, the source of skill outputs.
+        scoped_rules: The glob-scoped rule basenames (:func:`load_scoped_rules`) whose injection
+            counts as an invocation; None/empty disables rule labeling.
 
     Returns:
         A map of each stamped call's ``(orig_trace_id, observation_id)`` to its
@@ -172,6 +253,7 @@ def apply_context_deltas(
             continue  # the call's copy is not in the batch (defensive; should not happen)
         delta = diff_snapshots(predecessor, curr_items, counter=counter, price=price)
         _label_skill_loads(delta.added, curr_items, skill_hashes)
+        _label_rule_injections(delta.added, curr_items, scoped_rules or set())
         event["body"].setdefault("metadata", {})["context_delta"] = {
             "added": delta.added,
             "removed": delta.removed,

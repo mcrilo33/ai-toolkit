@@ -62,6 +62,7 @@ _STEP_PHASE_RE = re.compile(rf"\b({'|'.join(_STEP_PHASES)})\b")
 # read at 0.1x, so a read is 0.1/1.25 = 0.08x the cache-write price the rest of this module carries.
 _CACHE_READ_RATIO = 0.08
 _RULE_CARRY_COST_SCORE = "rule_carry_cost_usd"  # per rule file in the loaded-context breakdown
+_RULE_INVOCATION_SCORE = "rule_invocations"  # per glob-scoped rule injected on a file-match (#232)
 _TOOLDEF_CARRY_COST_SCORE = "tooldef_carry_cost_usd"  # per tool / mcp schema
 # The loaded instruction files that carry cost every request. The request-body path itemizes the
 # auto-memory (MEMORY.md) under ``rules``; the disk fallback splits it into its own ``memory``
@@ -325,6 +326,47 @@ def build_tooldef_carry_cost_scores(
             )
         )
     return events
+
+
+def build_rule_invocation_scores(
+    spoke_run_id: str, batch: list[IngestEvent], *, base_ts: str
+) -> list[IngestEvent]:
+    """Build per-rule ``rule_invocations:<rule>`` scores from the context-delta labels (#232).
+
+    The #160 context-delta pass stamps each llm_request copy's ``metadata.context_delta.added`` with
+    the rows that entered context that turn, and :func:`~telemetry.spoke_tree.context_deltas`
+    ._label_rule_injections tags each added row that injected a glob-scoped rule with ``rule``. This
+    scans the assembled batch for those labels and emits one trace-level NUMERIC score per rule whose
+    value is the number of times the rule entered play. Paired with ``rule_carry_cost_usd:<rule>``
+    (same ``<rule>`` suffix), a dashboard ranks rules by carry cost filtered to zero invocations —
+    the dead-weight signal. Ids derive from the spoke run id (idempotent reruns).
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids).
+        batch: The assembled View A events (their ``context_delta.added`` rows are read).
+        base_ts: ISO timestamp stamped on every score event.
+
+    Returns:
+        The ``score-create`` events, one per invoked rule (empty when no rule was injected).
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    counts: dict[str, int] = {}
+    for event in batch:
+        delta = (event["body"].get("metadata") or {}).get("context_delta") or {}
+        for row in delta.get("added") or []:
+            rule = row.get("rule")
+            if rule:
+                counts[str(rule)] = counts.get(str(rule), 0) + 1
+    return [
+        _score_event(
+            spoke_run_id,
+            name=f"{_RULE_INVOCATION_SCORE}:{rule}",
+            value=count,
+            trace_id=trace_id,
+            base_ts=base_ts,
+        )
+        for rule, count in sorted(counts.items())
+    ]
 
 
 def _step_phase(subject: str) -> str:

@@ -47,6 +47,7 @@ class TestEnrichmentRegistry:
             "scores",
             "step-scores",
             "carry-cost",
+            "invocation-scores",
         ]
 
     def test_running_the_loop_populates_scores_matching_direct_calls(self, tmp_path: Path) -> None:
