@@ -25,6 +25,7 @@ from telemetry.spoke_tree.observations import (
     _INTERACTION_NAME,
     _POST_STEP_NAME,
     _PRE_STEP_NAME,
+    _SUB_AGENT_PREFIX,
     _WAIT_PREFIX,
     IngestEvent,
     _attr,
@@ -37,6 +38,7 @@ from telemetry.spoke_tree.observations import (
 
 _DURATION_CLASSES: tuple[str, ...] = (
     "llm_request",
+    "sub-agent",
     "tool",
     "hook",
     "script",
@@ -53,18 +55,22 @@ _Interval = tuple[datetime, datetime]
 def _duration_class(event: IngestEvent) -> str:
     """Return the duration-attribution class of one assembled node (#128).
 
-    The buckets mirror the issue's split — LLM calls, tool calls, hooks, scripts, cycle
-    steps, human/gate wait, turns — plus ``other`` for anything unclassified. Human wait
-    covers the gate script (``spoke-ready --gate``) and an UNMATCHED blocked-on-user span
-    (its tool was denied/cancelled, so the #100 fold never absorbed it); the tool-side
-    share of ``wait`` (folded ``blocked_on_user_ms``) is carved out in
-    :func:`_duration_rollup`. ``script:`` outranks the ``.sh`` hook suffix so a
-    script-labelled span never drifts into the hook bucket.
+    The buckets mirror the issue's split — LLM calls, sub-agent work, tool calls, hooks,
+    scripts, cycle steps, human/gate wait, turns — plus ``other`` for anything unclassified.
+    Any ``sub-agent:`` node (the ``sub-agent:<type>`` container AND its ``sub-agent:llm`` calls)
+    books to ``sub-agent`` — checked BEFORE the generation branch so a sub-agent's LLM time is
+    attributed to sub-agent, not the main-loop ``llm_request`` bucket (#230). Human wait covers
+    the gate script (``spoke-ready --gate``) and an UNMATCHED blocked-on-user span (its tool was
+    denied/cancelled, so the #100 fold never absorbed it); the tool-side share of ``wait``
+    (folded ``blocked_on_user_ms``) is carved out in :func:`_duration_rollup`. ``script:``
+    outranks the ``.sh`` hook suffix so a script-labelled span never drifts into the hook bucket.
     """
     body = event["body"]
+    name = body.get("name") or ""
+    if name.startswith(_SUB_AGENT_PREFIX):
+        return "sub-agent"
     if event["type"] == "generation-create":
         return "llm_request"
-    name = body.get("name") or ""
     if _is_gate_observation(body) or name == _FOLD_BLOCKED_NAME or name.startswith(_WAIT_PREFIX):
         return "wait"
     if name.startswith("step:") or name in (_PRE_STEP_NAME, _POST_STEP_NAME):

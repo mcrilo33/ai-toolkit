@@ -160,7 +160,18 @@ def _by_orig(batch: list[dict], orig_trace_id: str, orig_obs_id: str) -> dict:
 
 def _dur(total_ms: int, components: dict[str, int] | None = None) -> dict:
     """The expected ``rollup.duration`` object: every class key present, zeros filled in."""
-    classes = ("llm_request", "tool", "hook", "script", "step", "wait", "turn", "self", "other")
+    classes = (
+        "llm_request",
+        "sub-agent",
+        "tool",
+        "hook",
+        "script",
+        "step",
+        "wait",
+        "turn",
+        "self",
+        "other",
+    )
     filled = {key: 0 for key in classes}
     filled.update(components or {})
     return {"total_ms": total_ms, "components": filled}
