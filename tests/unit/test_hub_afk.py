@@ -6765,3 +6765,74 @@ def test_auto_land_failure_is_backoff_paced_not_every_tick(spoke_repo: Path, tmp
     n = lands.read_text().count("x") if lands.exists() else 0
     assert n == 2, f"a failing land must be backoff-paced, not re-run every tick; ran {n}"
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text()
+
+
+# ── issue #241 S8: auth failure halts DISPATCH but never stops the drain ───────
+# Auth is the one true external blocker, but it no longer breaks the main loop or blocks
+# in-flight spokes. On a dead token the drain halts dispatch, WARNS the in-flight spokes
+# (never blocks them), re-probes each tick, and RESUMES the moment auth recovers.
+
+
+def test_warn_all_inflight_warns_not_blocks(tmp_path: Path) -> None:
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    ready_stub, ready_log = _escalation_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    expr = (
+        f'inflight_worktrees() {{ printf "{spoke}\\t5\\n"; }}; '
+        '_warn_all_inflight "subscription auth failed — dispatch halted"'
+    )
+
+    _call(
+        expr,
+        env={
+            "SPOKE_READY": str(ready_stub),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_JOURNAL_GH_COMMENT": "0",
+        },
+    )
+
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "an auth halt warns the in-flight spoke, never blocks it"
+    )
+    assert (statedir / "warned-5.txt").exists()
+
+
+def test_service_auth_halt_resumes_when_auth_recovers(tmp_path: Path) -> None:
+    # With the flag raised: a HEALTHY re-probe clears it (resume); a DEAD probe leaves it set.
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    base = {"AFK_STATE_DIR": str(statedir), "AFK_JOURNAL_GH_COMMENT": "0"}
+
+    recovered = _call(
+        '_AFK_AUTH_FAILED=1; inflight_worktrees() { :; }; '
+        '_afk_service_auth_halt; echo "FLAG=$_AFK_AUTH_FAILED"',
+        env={**base, "AFK_AUTH_PROBE_CMD": "true"},  # auth healthy again
+    )
+    still_dead = _call(
+        '_AFK_AUTH_FAILED=1; inflight_worktrees() { :; }; '
+        '_afk_service_auth_halt; echo "FLAG=$_AFK_AUTH_FAILED"',
+        env={**base, "AFK_AUTH_PROBE_CMD": "echo authentication_error; exit 1"},
+    )
+
+    assert "FLAG=0" in recovered.stdout, "a recovered auth probe must clear the halt flag (resume)"
+    assert "FLAG=1" in still_dead.stdout, "a still-dead auth probe keeps the drain halted"
+
+
+def test_decide_and_act_auth_failure_warns_not_blocks(
+    spoke_repo: Path, stub_env: dict[str, str]
+) -> None:
+    # #241 §9: an answerer auth failure warns the spoke (not blocks it — it's not the spoke's
+    # fault) and still raises the global halt flag so dispatch pauses.
+    env = {
+        **stub_env,
+        "AFK_ANSWERER_CMD": "printf 'authentication_error: OAuth token expired' >&2; exit 1",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"decide_and_act '{spoke_repo}' 5; echo \"FLAG=$_AFK_AUTH_FAILED\"", env=env)
+
+    _rl = Path(env["_READY_LOG"])
+    assert not _rl.exists() or "--blocked 5" not in _rl.read_text(), "auth failure warns, never blocks"
+    assert "WARNING: #5" in result.stderr and "auth" in result.stderr.lower(), result.stderr
+    assert "FLAG=1" in result.stdout, "the global halt flag must still be raised"
