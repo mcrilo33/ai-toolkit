@@ -247,6 +247,7 @@ _afk_note_tip_progress() {
   elif [ "$last" != "$tip" ]; then
     printf '%s\n' "$tip" > "$f" 2>/dev/null || true
     stamp_progress_epoch "$issue"
+    _afk_clear_warned "$issue"   # #241: a tip advance is genuine progress → drop the warned-retry backoff
   fi
   return 0
 }
@@ -2535,13 +2536,15 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
     return 0
   fi
   if ! _broker_worktree_unchanged "$wt" "$fp_before"; then
-    # Stamp the durable void marker FIRST so this gate is terminal on the first occurrence
-    # (#237): later ticks short-circuit at the top and never re-run the reasoner. This log
-    # fires exactly once — the short-circuit keeps the mutation branch from re-running.
+    # Stamp the durable void marker FIRST so the backoff-paced void short-circuit (top of this
+    # function) throttles the mutating reasoner across ticks — the (tip, sig) ceiling can't,
+    # since the tree write perturbs it every tick. #241 §5: no longer terminal; warn + back off.
     _broker_mark_voided "$issue"
-    log "  reasoner mutated the read-only worktree of #$issue — voiding its answer (terminal; a human is required)"
+    log "  reasoner mutated the read-only worktree of #$issue — voiding its answer (backoff-paced; #241)"
+    # 'unknown' reversibility: the reasoner ESCAPED #237 snapshot isolation and wrote the LIVE
+    # tree — a should-never-fire event the morning review must be able to triage from the benign.
     _broker_on_human_decision "$mode" "$wt" "$issue" \
-      "the gate reasoner mutated the read-only worktree — its answer is voided; needs a human"
+      "the gate reasoner mutated the read-only worktree — its answer is voided; review the live tree" unknown
     return 0
   fi
   # The answerer is the supervisor's own `claude`; if its credentials are dead, every
@@ -2594,6 +2597,7 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
         if [ "$rc" -eq 0 ]; then
           log "  injected answer into #$issue"
           _consume_gate_tag "$wt" "$issue"
+          _afk_clear_warned "$issue"   # #241: genuine progress → drop this issue's warned-retry backoff
           afk_emit_decision "$wt" success
           return 0
         elif [ "$rc" -eq 2 ] && command -v respawn_wedged_spoke >/dev/null 2>&1 && respawn_wedged_spoke "$wt" "$issue" "$text"; then
@@ -2639,7 +2643,11 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
     log "  #$issue transcript advanced while reasoning — dropping the escalation (spoke moved on)"
     return 0
   fi
-  _broker_on_human_decision "$mode" "$wt" "$issue" "$text"
+  # A diagnosed wedge/refuted inject (rc 2/3) is genuinely UNCERTAIN — the paste may have
+  # partially landed — so journal it 'unknown' for triage; an ESCALATE/no-decision is reversible.
+  local decision_rev=reversible
+  [ "$inject_diagnosed" -eq 1 ] && decision_rev=unknown
+  _broker_on_human_decision "$mode" "$wt" "$issue" "$text" "$decision_rev"
 }
 
 decide_and_act() { broker_service_gate "$1" "$2" unattended; }
@@ -2653,12 +2661,16 @@ decide_and_act() { broker_service_gate "$1" "$2" unattended; }
 # IS the decision text; these are reversible (the answer is voided/undelivered, the spoke's work
 # is intact and re-serviceable).
 _broker_on_human_decision() {
-  local mode="$1" wt="$2" issue="$3" reason="$4"
+  local mode="$1" wt="$2" issue="$3" reason="$4" rev="${5:-reversible}"
   if [ "$mode" = attended ] && command -v _broker_present_qcm >/dev/null 2>&1; then
     _broker_present_qcm "$wt" "$issue" "$reason"
     return
   fi
-  broker_warn_continue "$wt" "$issue" answer "$reason" reversible
+  # <rev> is the reversibility of the DECISION taken (void/decline the answer, retry) — almost
+  # always reversible. Callers pass 'unknown' when the underlying EVENT is genuinely uncertain
+  # (a reasoner that escaped snapshot isolation and wrote the live tree; a wedge whose paste may
+  # have partially landed) so the morning review can triage those out of the benign default.
+  broker_warn_continue "$wt" "$issue" answer "$reason" "$rev"
 }
 
 # --- durable local block record (issue #109, AC2) -----------------------------

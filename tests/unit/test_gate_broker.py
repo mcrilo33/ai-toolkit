@@ -244,7 +244,6 @@ def test_broker_service_gate_defaults_to_unattended(
     _rl = Path(env["_READY_LOG"])
     assert not _rl.exists() or "--blocked 5" not in _rl.read_text()
     assert "WARNING: #5" in result.stderr, result.stderr
-    assert "WARNING: #5" in result.stderr, result.stderr
 
 
 # ── the hardened injector submits (no stranded paste) ─────────────────────────
@@ -2798,6 +2797,38 @@ def test_broker_service_gate_mutation_void_backs_off_not_terminal(
     _rl = Path(env["_READY_LOG"])
     assert not _rl.exists() or "--blocked 5" not in _rl.read_text(), "void warns, never parks"
     assert (statedir / "warned-5.txt").exists()
+
+
+def test_broker_service_gate_mutation_void_retries_after_backoff(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # #241 §5: the void is NOT terminal-forever. Once the warned-retry backoff elapses, the void
+    # marker is cleared for ONE supervised retry (the reasoner re-runs) — proof the void backs
+    # off rather than staying terminal. (The sibling test pins the backoff huge so this
+    # fall-through never fires; here it does.)
+    calls = tmp_path / "answerer.calls"
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (spoke_repo / "tracked.txt").write_text("original")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=spoke_repo, check=True, capture_output=True)
+    base = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": (
+            f"printf x >> '{calls}'; printf 'mutated' > '{spoke_repo}/tracked.txt'; "
+            "printf 'ANSWER: go ahead'"
+        ),
+        "AFK_REANSWER_CEILING": "5",
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_WARN_BACKOFF_BASE": "60",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env={**base, "AFK_NOW": "1000"})
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env={**base, "AFK_NOW": "1000"})
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env={**base, "AFK_NOW": "1100"})
+
+    n = calls.read_text().count("x") if calls.exists() else 0
+    assert n == 2, f"the void must retry once the backoff elapses, not stay terminal; ran {n}"
 
 
 def test_reanswer_ceiling_logs_terminal_once(
