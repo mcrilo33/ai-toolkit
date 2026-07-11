@@ -234,8 +234,8 @@ from telemetry.spoke_tree.rollups import (
     _strip_container_usage,
 )
 from telemetry.spoke_tree.scores import (
+    build_enforcement_fire_scores,
     build_rule_carry_cost_scores,
-    build_rule_enforcement_scores,
     build_rule_invocation_scores,
     build_score_events,
     build_step_cost_scores,
@@ -1004,8 +1004,8 @@ def _enrich_invocation_scores(ctx: EnrichmentContext) -> None:
 
 
 def _enrich_enforcement_scores(ctx: EnrichmentContext) -> None:
-    """Emit per-rule ``rule_enforcement_fires:<rule>`` scores from the #232 hook-block events."""
-    ctx.enforcement_scores = build_rule_enforcement_scores(
+    """Emit per-surface ``enforcement_fires:<event>:<tool>`` scores from the #232 hook-block events."""
+    ctx.enforcement_scores = build_enforcement_fire_scores(
         ctx.spoke_run_id, ctx.batch, base_ts=ctx.base_ts
     )
 
@@ -1123,7 +1123,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(ctx.carry_scores)} rule/tooldef carry-cost scores emitted "
         f"(n_requests={ctx.n_requests}), "
         f"{len(ctx.invocation_scores)} rule-invocation scores emitted, "
-        f"{len(ctx.enforcement_scores)} rule-enforcement-fire scores emitted, "
+        f"{len(ctx.enforcement_scores)} enforcement-fire scores emitted, "
         f"{len(commits)} commit nodes synthesized, "
         f"tagged mode={mode} lane={lane}; "
         f"{len(cycle_batch) - 2} observations assembled under cycle trace {cycle_trace_id}"

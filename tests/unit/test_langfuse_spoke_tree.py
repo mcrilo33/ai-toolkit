@@ -36,9 +36,9 @@ from telemetry.langfuse_spoke_tree import (
     apply_request_body_metadata,
     build_batch,
     build_cycle_batch,
+    build_enforcement_fire_scores,
     build_loaded_context_events,
     build_rule_carry_cost_scores,
-    build_rule_enforcement_scores,
     build_rule_invocation_scores,
     build_score_events,
     build_step_cost_scores,
@@ -1527,13 +1527,14 @@ class TestRuleInvocationScores:
         assert build_rule_invocation_scores(SPOKE, [event], base_ts=self._BASE_TS) == []
 
 
-class TestRuleEnforcementScores:
-    """#232 subtask enforce: count hook enforcement blocks per rule as rule_enforcement_fires:<rule>.
+class TestEnforcementFireScores:
+    """#232 subtask enforce: count hook enforcement blocks per (event:tool) SURFACE as
+    enforcement_fires:<event>:<tool>.
 
     Per-script hook identity is blocked upstream (#110 AC3) — Claude Code emits one
-    hook_execution_complete per (event x tool) with hook_name '<event>:<tool>', so a fire
-    (num_blocking >= 1) is attributed by the (event:tool) SURFACE to the rule that solely guards it.
-    Ambiguous surfaces (Bash — multiple rules) are skipped.
+    hook_execution_complete per (event x tool) with hook_name '<event>:<tool>' — and every surface
+    is guarded by many hooks across different rules + workflow mechanics, so a block cannot be
+    attributed to one rule. The surface is the honest granularity; each blocked call counts once.
     """
 
     _BASE_TS = "2026-01-01T00:00:00Z"
@@ -1548,31 +1549,43 @@ class TestRuleEnforcementScores:
         }
 
     def _scores(self, batch: list[dict]) -> list[dict]:
-        return build_rule_enforcement_scores(SPOKE, batch, base_ts=self._BASE_TS)
+        return build_enforcement_fire_scores(SPOKE, batch, base_ts=self._BASE_TS)
 
     def _by_name(self, scores: list[dict]) -> dict[str, float]:
         return {s["body"]["name"]: s["body"]["value"] for s in scores}
 
-    def test_edit_block_scores_the_security_rule(self) -> None:
+    def test_block_scores_the_surface(self) -> None:
         scores = self._scores([self._hook_event("PreToolUse:Edit", 1)])
 
-        assert self._by_name(scores) == {"rule_enforcement_fires:security": 1}
+        assert self._by_name(scores) == {"enforcement_fires:PreToolUse:Edit": 1}
 
     def test_no_score_when_nothing_blocked(self) -> None:
         assert self._scores([self._hook_event("PreToolUse:Edit", 0)]) == []
 
-    def test_ambiguous_bash_surface_is_skipped(self) -> None:
-        assert self._scores([self._hook_event("PreToolUse:Bash", 1)]) == []
+    def test_bash_surface_is_scored_too(self) -> None:
+        scores = self._scores([self._hook_event("PreToolUse:Bash", 1)])
 
-    def test_num_blocking_counts_as_fires_and_sums(self) -> None:
+        assert self._by_name(scores) == {"enforcement_fires:PreToolUse:Bash": 1}
+
+    def test_two_hooks_blocking_one_call_count_once(self) -> None:
+        # num_blocking=2 means two hooks blocked the SAME tool call — that is one blocked call.
+        scores = self._scores([self._hook_event("PreToolUse:Edit", 2)])
+
+        assert self._by_name(scores) == {"enforcement_fires:PreToolUse:Edit": 1}
+
+    def test_repeated_surface_blocks_sum(self) -> None:
         batch = [
-            self._hook_event("PreToolUse:Edit", 2),
+            self._hook_event("PreToolUse:Edit", 1),
+            self._hook_event("PreToolUse:Edit", 3),
             self._hook_event("PostToolUse:Write", 1),
         ]
 
         scores = self._scores(batch)
 
-        assert self._by_name(scores) == {"rule_enforcement_fires:security": 3}
+        assert self._by_name(scores) == {
+            "enforcement_fires:PreToolUse:Edit": 2,
+            "enforcement_fires:PostToolUse:Write": 1,
+        }
 
     def test_enforcement_scores_are_trace_level_numeric(self) -> None:
         scores = self._scores([self._hook_event("PreToolUse:Edit", 1)])
