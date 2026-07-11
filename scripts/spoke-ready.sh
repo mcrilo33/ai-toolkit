@@ -242,6 +242,16 @@ fi
 
 TAG="$KIND/$ISSUE"
 
+# Single-writer boundary (issue #236): this script emits the git-native marker tag and
+# nothing more. Mirroring the transition onto the GitHub issue's status:*/mode:*/lane:*
+# labels is the HUB's job — worktree-new stamps status:in-progress at dispatch, the
+# hub-ready-watch -> hub-notify watch loop flips status:* on a gate/ready/blocked marker,
+# hub-afk stamps status:blocked on a supervisor escalation, and worktree-land clears them
+# at close. A spoke is a non-writer of GitHub labels (it may lack hub credentials and its
+# worktree can be torn down before the transition settles), so spoke-ready makes NO `gh`
+# calls even though it sources worktree-lib.sh and the wt_gh_* helpers are in scope. This
+# boundary is locked by tests/unit/test_spoke_ready.py::test_spoke_ready_emits_no_gh_calls.
+
 # A force-bypassed ready/<N> stamps the bypass LOUDLY into the tag annotation
 # (issue #206): the hub reads the tag body at land time (%(contents:body)), so the
 # audit trail travels WITH the marker instead of living only in this shell's stderr.
