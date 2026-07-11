@@ -153,11 +153,17 @@ def _run_new(
     # fetch (Model: override) runs for ANY numbered issue, so the stub keeps both
     # off the network regardless of whether a slug was passed.
     gh = bindir / "gh"
+    # Logs every invocation to $GH_LOG (issue #236 lifecycle-label mirror asserts on
+    # `gh issue edit` / `gh issue comment` / `gh label create`), still answering the
+    # title/body fetches. $GH_MIRROR_RC forces a nonzero exit for the mirror writes
+    # (issue edit / comment / label create) so a test can model an offline gh.
     gh.write_text(
         "#!/bin/sh\n"
+        'printf "%s\\n" "$*" >> "$GH_LOG"\n'
         'case "$*" in\n'
         '  *"--json title"*) printf "%s\\n" "${GH_ISSUE_TITLE:-Some Issue Title}" ;;\n'
         '  *"--json body"*)  printf "%s\\n" "$GH_ISSUE_BODY" ;;\n'
+        '  "issue edit"*|"issue comment"*|"label create"*) exit "${GH_MIRROR_RC:-0}" ;;\n'
         "esac\n"
     )
     gh.chmod(0o755)
@@ -171,7 +177,12 @@ def _run_new(
         "HOME": str(home),
         "STUB_HAS_SESSION": str(has_session_rc),
         "STUB_NEW_SESSION": str(new_session_rc),
+        # The gh-call log for the lifecycle-label mirror assertions (issue #236).
+        "GH_LOG": str(tmp_path / "gh-calls.log"),
     }
+    # The host must not force the mirror on/off or inject a mirror exit code.
+    env.pop("AI_TOOLKIT_GH_LIFECYCLE_LABELS", None)
+    env.pop("GH_MIRROR_RC", None)
     env.pop("TMUX", None)  # the host's real tmux must never steer the script
     # The host's agent pinning must never leak in — defaults are under test.
     env.pop("WT_AGENT_MODEL", None)
@@ -1593,3 +1604,94 @@ def test_new_no_code_touches_neither_workspace_file_nor_code(hub: Path, tmp_path
     assert proc.returncode == 0, proc.stderr
     assert ws.read_text() == before
     assert code_log.read_text() == ""
+
+
+# --- dispatch lifecycle-label mirror (issue #236) -----------------------------
+# A dispatched issue-backed spoke stamps its GitHub issue so the issue list shows
+# it is live: status:in-progress + mode:<afk|attended> + lane:spoke, plus a
+# one-time dispatch comment linking back to the branch / worktree / tmux window /
+# spoke_run_id. Best-effort: a failing gh never fails the spawn; ad-hoc (no-issue)
+# lanes mirror nothing by construction.
+
+
+def _gh_calls(tmp_path: Path) -> list[str]:
+    log = tmp_path / "gh-calls.log"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def _one_issue_edit(calls: list[str]) -> str:
+    edits = [c for c in calls if c.startswith("issue edit")]
+    assert len(edits) == 1, f"expected exactly one gh issue-edit, got {edits}"
+    return edits[0]
+
+
+def test_dispatch_adds_in_progress_mode_lane_labels(hub: Path, tmp_path: Path) -> None:
+    proc, _ = _run_new(hub, tmp_path, "8", "some-slug", "--no-code")
+
+    assert proc.returncode == 0, proc.stderr
+    edit = _one_issue_edit(_gh_calls(tmp_path))
+    assert edit.startswith("issue edit 8 ")
+    assert "--add-label status:in-progress" in edit
+    assert "--add-label mode:attended" in edit
+    assert "--add-label lane:spoke" in edit
+
+
+def test_dispatch_afk_mode_label(hub: Path, tmp_path: Path) -> None:
+    proc, _ = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", "--mode", "afk")
+
+    assert proc.returncode == 0, proc.stderr
+    edit = _one_issue_edit(_gh_calls(tmp_path))
+    assert "--add-label mode:afk" in edit
+    assert "--remove-label mode:attended" in edit
+
+
+def test_dispatch_posts_comment_linking_the_live_spoke(hub: Path, tmp_path: Path) -> None:
+    proc, _ = _run_new(hub, tmp_path, "8", "some-slug", "--no-code")
+
+    assert proc.returncode == 0, proc.stderr
+    calls = _gh_calls(tmp_path)
+    comments = [c for c in calls if c.startswith("issue comment 8 ")]
+    assert len(comments) == 1, f"expected one dispatch comment, got {comments}"
+    body = comments[0]
+    # The comment links the issue back to its live spoke: branch, worktree path,
+    # tmux window, spoke_run_id.
+    assert "feature/8-some-slug" in body  # branch
+    assert f"{hub.name}-8" in body  # worktree dir basename
+    assert "8-some-slug" in body  # tmux window name
+
+
+def test_dispatch_adhoc_slug_mirrors_nothing(hub: Path, tmp_path: Path) -> None:
+    # An ad-hoc (non-numeric) target has no issue to mirror onto — no labels, no
+    # comment, no label seeding.
+    proc, _ = _run_new(hub, tmp_path, "refactor-sync", "--no-code")
+
+    assert proc.returncode == 0, proc.stderr
+    calls = _gh_calls(tmp_path)
+    assert not [c for c in calls if c.startswith("issue edit")]
+    assert not [c for c in calls if c.startswith("issue comment")]
+    assert not [c for c in calls if c.startswith("label create")]
+
+
+def test_dispatch_gh_failure_never_fails_the_spawn(hub: Path, tmp_path: Path) -> None:
+    # Offline / unauthed gh (the mirror writes exit nonzero) must not fail dispatch.
+    proc, _ = _run_new(
+        hub, tmp_path, "8", "some-slug", "--no-code", extra_env={"GH_MIRROR_RC": "1"}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_dispatch_mirror_opt_out_makes_no_label_calls(hub: Path, tmp_path: Path) -> None:
+    proc, _ = _run_new(
+        hub,
+        tmp_path,
+        "8",
+        "some-slug",
+        "--no-code",
+        extra_env={"AI_TOOLKIT_GH_LIFECYCLE_LABELS": "0"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    calls = _gh_calls(tmp_path)
+    assert not [c for c in calls if c.startswith("issue edit")]
+    assert not [c for c in calls if c.startswith("issue comment")]
