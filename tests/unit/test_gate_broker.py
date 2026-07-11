@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from shlex import quote as shlex_quote
 
 import pytest
 
@@ -3158,9 +3159,7 @@ def test_broker_warn_writes_record_and_logs_warning(tmp_path: Path) -> None:
     assert "reversible alternative" in rec
 
 
-def test_broker_warn_continue_does_not_block(
-    spoke_repo: Path, tmp_path: Path
-) -> None:
+def test_broker_warn_continue_does_not_block(spoke_repo: Path, tmp_path: Path) -> None:
     statedir = tmp_path / "sd"
     statedir.mkdir()
     env = {"AFK_STATE_DIR": str(statedir), "AFK_JOURNAL_GH_COMMENT": "0"}
@@ -3243,3 +3242,56 @@ def test_clear_warned_records_resets_window(tmp_path: Path) -> None:
     assert not (statedir / "warned-state-41").exists()
     assert not (statedir / "warned-42.txt").exists()
     assert not (statedir / "warned-state-42").exists()
+
+
+# ── issue #241 S2: the reasoner ALWAYS answers (rule <-> fallback policy binding) ──
+# The escalate-and-park posture is gone: the reasoner takes even irreversible/outward/
+# scope-changing decisions, preferring the reversible in-scope alternative (that IS the
+# answer). The governing rule (afk-answering.md) and the built-in fallback policy the broker
+# ships when that file is absent must stay in lockstep — a binding test pins them so a future
+# edit can't drift one back toward ESCALATE while the other says always-answer.
+
+RULE_FILE = REPO_ROOT / "shared" / "rules" / "afk-answering.md"
+
+
+def test_default_answerer_policy_binds_to_rule_file() -> None:
+    policy = _call("_default_answerer_policy").stdout
+    rule = RULE_FILE.read_text()
+
+    # The output token ESCALATE: is retired from BOTH surfaces — the reasoner never emits it.
+    assert "ESCALATE:" not in policy, "the fallback policy must not instruct an ESCALATE output"
+    assert "ESCALATE:" not in rule, "the rule must not instruct an ESCALATE output"
+    # Both instruct the single ANSWER: output and the REVERSIBILITY: reversibility-class line.
+    for surface, name in ((policy, "fallback policy"), (rule, "rule file")):
+        assert "ANSWER:" in surface, f"{name} must instruct the ANSWER output line"
+        assert "REVERSIBILITY:" in surface, f"{name} must instruct the REVERSIBILITY class line"
+        assert "reversible" in surface.lower(), f"{name} must state the prefer-reversible posture"
+
+
+def test_answerer_prompt_instructs_answer_only(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+
+    out = _call(
+        "build_answerer_prompt 5 'Which store?' '/some/worktree'",
+        env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    ).stdout
+
+    assert "ANSWER:" in out, "the prompt must instruct the reasoner to end with ANSWER:"
+    assert "ESCALATE:" not in out, "the always-answer prompt must not offer an ESCALATE output"
+
+
+def test_parse_decision_field_extracts_reversibility_and_warn() -> None:
+    raw = "reasoning\nREVERSIBILITY: irreversible\nWARN: took a critical call\nANSWER: deny; rebase instead"
+
+    rev = _call(f"parse_decision_field {shlex_quote(raw)} REVERSIBILITY").stdout.strip()
+    warn = _call(f"parse_decision_field {shlex_quote(raw)} WARN").stdout.strip()
+    dec = _call(f"parse_decision {shlex_quote(raw)}").stdout.strip()
+
+    assert rev == "irreversible", rev
+    assert warn == "took a critical call", warn
+    # parse_decision still extracts the ANSWER decision unchanged.
+    kind, _, text = dec.partition("\t")
+    assert kind == "ANSWER" and text == "deny; rebase instead", dec
