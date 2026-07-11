@@ -6531,3 +6531,66 @@ def test_afk_sync_labels_ignores_lifecycle_labels(tmp_path: Path) -> None:
     assert "status:" not in log
     assert "mode:" not in log
     assert "lane:" not in log
+
+
+# ── issue #241 S6: reap becomes revive-first + warned-parked-LAST, never abandon ──
+# The reaper no longer kills a stuck spoke into blocked/<issue>. A live-but-frozen claude or a
+# crashed pane is REVIVED (kill + relaunch); only a twice-failed revival downgrades to
+# warned-and-parked-LAST (retried at low frequency), never abandoned. A finished-but-unmarked
+# spoke (#200) is auto-marked ready, not reaped.
+
+
+def test_reap_pass_revives_pane_alive_idle_spoke(tmp_path: Path) -> None:
+    # #241 §8: a live-but-frozen claude is a REVIVAL case (kill the hung pane + relaunch),
+    # NOT a terminal block. It warns + revives (opens a fresh window), never parks blocked.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane ALIVE (frozen)
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+
+    _call(expr, env=env)
+
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "a hung live pane must be revived + warned, never blocked"
+    )
+    assert "new-window" in tmux_log.read_text(), "a hung live pane is REVIVED (relaunched)"
+    assert (statedir / "warned-5.txt").exists()
+
+
+def test_reap_pass_revival_exhausted_parks_last_not_blocked(tmp_path: Path) -> None:
+    # After a revival already happened this window, a second stuck tick warns-and-parks-LAST
+    # (retried at low frequency on the backoff) — NEVER blocked, NEVER killed/abandoned.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, _ = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD again
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    (statedir / "resumed-5").write_text("1700000000\n")  # a revival already happened this window
+
+    _call(expr, env=env)
+
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "a twice-failed revival parks LAST, never blocks"
+    )
+    assert (statedir / "warned-5.txt").exists()
+
+
+def test_reap_pass_pushed_but_unmarked_auto_marks_not_reaps(tmp_path: Path) -> None:
+    # #200/#241 §8: a spoke that FINISHED and pushed but whose completion mark never landed is
+    # auto-marked ready (the drain then lands it), not reaped/blocked.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, _ = _reaper_tmux(tmp_path, pane_path=spoke)  # pane alive
+    expr, env, ready_log, _ = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    push_log = tmp_path / "push.log"
+    push_stub = tmp_path / "spoke-push.sh"
+    push_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{push_log}"\n')
+    push_stub.chmod(0o755)
+    env["SPOKE_PUSH"] = str(push_stub)
+    # Force the pushed-but-unmarked signal deterministically (a real upstream is elaborate).
+    expr = "_afk_pushed_but_unmarked() { return 0; }; " + expr
+
+    _call(expr, env=env)
+
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "a pushed-but-unmarked spoke is auto-marked, not blocked"
+    )
+    assert push_log.exists() and "--ready 5" in push_log.read_text(), (
+        "the completion mark must be auto-emitted"
+    )
