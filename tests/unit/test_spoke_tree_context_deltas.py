@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 from telemetry.spoke_tree.context_deltas import (
     _apply_context_rollups,
     _blob_hash,
+    _label_mcp_def_loads,
     _match_skill_output,
     _sum_context,
 )
@@ -36,6 +37,23 @@ class TestMatchSkillOutput:
 
     def test_none_on_non_json_text(self) -> None:
         assert _match_skill_output("not json", {"h": "x"}) is None
+
+
+class TestLabelMcpDefLoads:
+    """#234: an added mcp-category def row (a ToolSearch schema load) is tagged with its server."""
+
+    def test_mcp_def_row_labeled_with_server(self) -> None:
+        added = [
+            {"category": "mcp", "name": "mcp__chrome__navigate", "tokens": 40},
+            {"category": "tools", "name": "Bash", "tokens": 10},
+            {"category": "messages", "name": "m0", "tokens": 5},
+        ]
+
+        _label_mcp_def_loads(added)
+
+        assert added[0]["mcp_def_load"] == "chrome"
+        assert "mcp_def_load" not in added[1]
+        assert "mcp_def_load" not in added[2]
 
 
 class TestSumContext:

@@ -74,6 +74,25 @@ class TestBuildLoadedContextEvents:
         assert meta["tokens"] == 30
         assert meta["breakdown"] == {"rules": {"a": 10}, "skills": {"b": 20}}
 
+    def test_mcp_rows_add_a_per_server_carry_line(self) -> None:
+        rows = [
+            _row("mcp", "mcp__chrome__navigate", 40),
+            _row("mcp", "mcp__chrome__read_page", 60),
+            _row("mcp", "mcp__notion__query", 30),
+            _row("tools", "Bash", 10),
+        ]
+        events = build_loaded_context_events(
+            "sp", rows, category_order=("tools", "mcp"), base_ts="2026-01-02T00:00:00Z"
+        )
+        assert events[0]["body"]["metadata"].get("mcp_by_server") == {"chrome": 100, "notion": 30}
+
+    def test_no_mcp_rows_omit_the_per_server_line(self) -> None:
+        rows = [_row("rules", "a", 10)]
+        events = build_loaded_context_events(
+            "sp", rows, category_order=("rules",), base_ts="2026-01-02T00:00:00Z"
+        )
+        assert "mcp_by_server" not in events[0]["body"]["metadata"]
+
     def test_disk_fallback_folds_reconciled_remainder(self) -> None:
         rows = [_row("rules", "a", 10, 0.0)]
         events = build_loaded_context_events(

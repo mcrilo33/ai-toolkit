@@ -125,6 +125,11 @@ class TestNodePredicates:
         assert _mcp_server("tool:mcp__my_server__do__thing") == "my_server"
         assert _mcp_server("tool:Bash") is None
 
+    def test_mcp_server_handles_bare_def_name(self) -> None:
+        # A loaded-context / context-delta MCP def name has no ``tool:`` prefix.
+        assert _mcp_server("mcp__chrome__navigate") == "chrome"
+        assert _mcp_server("Read") is None
+
     def test_is_blocked_tool_matches_prefix(self) -> None:
         assert _is_blocked_tool(_obs("blocked-tool:Bash"))
         assert not _is_blocked_tool(_obs("tool:Bash"))

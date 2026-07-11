@@ -15,6 +15,8 @@ from telemetry.spoke_tree.scores import (
     _step_phase_of,
     build_agent_verdict_scores,
     build_mcp_call_scores,
+    build_mcp_carry_cost_scores,
+    build_mcp_def_load_scores,
     build_score_events,
     build_script_success_scores,
     build_skill_success_scores,
@@ -183,6 +185,50 @@ class TestBuildMcpCallScores:
         batch = [{"body": {"id": "t", "name": "tool:Bash", "metadata": {}}}]
 
         assert build_mcp_call_scores(SPOKE, batch, base_ts="t") == []
+
+
+class TestBuildMcpCarryCostScores:
+    """#234: per-server mcp_carry_cost_usd:<server> from the loaded-context mcp rows."""
+
+    def test_carry_cost_aggregates_mcp_rows_per_server(self) -> None:
+        rows = [
+            {"category": "mcp", "name": "mcp__chrome__navigate", "tokens": 100},
+            {"category": "mcp", "name": "mcp__chrome__read", "tokens": 100},
+            {"category": "mcp", "name": "mcp__notion__query", "tokens": 50},
+            {"category": "tools", "name": "Bash", "tokens": 999},
+        ]
+
+        events = build_mcp_carry_cost_scores(SPOKE, rows, 4, base_ts="t", price=0.001)
+
+        names = {e["body"]["name"] for e in events}
+        assert names == {"mcp_carry_cost_usd:chrome", "mcp_carry_cost_usd:notion"}
+        chrome = next(e for e in events if e["body"]["name"] == "mcp_carry_cost_usd:chrome")
+        # 200 tokens x (4 reads x price x 0.08 read-ratio + price) one-time write.
+        assert chrome["body"]["value"] == pytest.approx(200 * (4 * 0.001 * 0.08 + 0.001))
+
+    def test_no_mcp_rows_no_scores(self) -> None:
+        rows = [{"category": "rules", "name": "a", "tokens": 10}]
+        assert build_mcp_carry_cost_scores(SPOKE, rows, 4, base_ts="t", price=0.001) == []
+
+
+class TestBuildMcpDefLoadScores:
+    """#234: mcp_def_loads:<server> counts on-demand ToolSearch schema loads from delta labels."""
+
+    def _call(self, obs_id: str, *servers: str) -> dict:
+        added = [{"category": "mcp", "name": f"mcp__{s}__x", "mcp_def_load": s} for s in servers]
+        return {"body": {"id": obs_id, "metadata": {"context_delta": {"added": added}}}}
+
+    def test_counts_loads_per_server(self) -> None:
+        batch = [self._call("g1", "chrome", "chrome"), self._call("g2", "notion")]
+
+        events = build_mcp_def_load_scores(SPOKE, batch, base_ts="t")
+
+        by_name = {e["body"]["name"]: e["body"]["value"] for e in events}
+        assert by_name == {"mcp_def_loads:chrome": 2, "mcp_def_loads:notion": 1}
+
+    def test_no_loads_no_scores(self) -> None:
+        batch = [{"body": {"id": "g", "metadata": {}}}]
+        assert build_mcp_def_load_scores(SPOKE, batch, base_ts="t") == []
 
 
 class TestBuildAgentVerdictScores:
