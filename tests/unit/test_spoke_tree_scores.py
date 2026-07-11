@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 from telemetry.spoke_tree.scores import (
     _step_phase,
     _step_phase_of,
+    build_agent_verdict_scores,
     build_score_events,
     build_script_success_scores,
     build_step_cost_scores,
@@ -92,6 +94,85 @@ class TestBuildScriptSuccessScores:
 
         assert len(events) == 2
         assert {e["body"]["observationId"] for e in events} == {"s1", "s2"}
+
+
+class TestBuildAgentVerdictScores:
+    """#233: agent_verdict:<type> — code-review from the .review artifact, sub-agents from
+    their returned status, reaper-killed sub-agents score a died class."""
+
+    def _write_review(self, review_dir: Path, stem: str, verdict: str) -> None:
+        review_dir.mkdir(exist_ok=True)
+        (review_dir / f"{stem}.json").write_text(
+            json.dumps({"verdict": verdict, "reviewer": "code-review"}) + "\n"
+        )
+
+    def test_code_review_approve_artifact_scores_one(self, tmp_path: Path) -> None:
+        review = tmp_path / ".review"
+        self._write_review(review, "abc123", "APPROVE")
+
+        events = build_agent_verdict_scores(SPOKE, [], review, base_ts="t")
+
+        assert len(events) == 1
+        body = events[0]["body"]
+        assert events[0]["type"] == "score-create"
+        assert body["name"] == "agent_verdict:code-review"
+        assert body["value"] == 1.0
+        assert "observationId" not in body  # trace-level (the artifact is not a span)
+
+    def test_code_review_request_changes_scores_zero(self, tmp_path: Path) -> None:
+        review = tmp_path / ".review"
+        self._write_review(review, "abc123", "REQUEST_CHANGES")
+
+        events = build_agent_verdict_scores(SPOKE, [], review, base_ts="t")
+
+        assert events[0]["body"]["value"] == 0.0
+
+    def test_multiple_review_artifacts_each_score_distinctly(self, tmp_path: Path) -> None:
+        review = tmp_path / ".review"
+        self._write_review(review, "hashone", "APPROVE")
+        self._write_review(review, "hashtwo", "REQUEST_CHANGES")
+
+        events = build_agent_verdict_scores(SPOKE, [], review, base_ts="t")
+
+        assert len(events) == 2
+        assert all(e["body"]["name"] == "agent_verdict:code-review" for e in events)
+        assert len({e["body"]["id"] for e in events}) == 2  # distinct ids so both survive ingest
+        assert sorted(e["body"]["value"] for e in events) == [0.0, 1.0]
+
+    def test_missing_review_dir_no_code_review_score(self, tmp_path: Path) -> None:
+        assert build_agent_verdict_scores(SPOKE, [], tmp_path / "absent", base_ts="t") == []
+
+    def test_sub_agent_error_level_scores_died(self, tmp_path: Path) -> None:
+        batch = [{"body": {"id": "sa", "name": "sub-agent:bug-scoper", "level": "ERROR"}}]
+
+        events = build_agent_verdict_scores(SPOKE, batch, tmp_path / "absent", base_ts="t")
+
+        assert len(events) == 1
+        body = events[0]["body"]
+        assert body["name"] == "agent_verdict:bug-scoper"
+        assert body["value"] == -1.0
+        assert body["observationId"] == "sa"
+
+    def test_sub_agent_status_output_scores_verdict(self, tmp_path: Path) -> None:
+        batch = [
+            {"body": {"id": "p1", "name": "sub-agent:planner", "output": {"status": "completed"}}},
+            {"body": {"id": "p2", "name": "sub-agent:planner", "output": {"status": "failed"}}},
+        ]
+
+        events = build_agent_verdict_scores(SPOKE, batch, tmp_path / "absent", base_ts="t")
+
+        by_obs = {e["body"]["observationId"]: e["body"]["value"] for e in events}
+        assert by_obs == {"p1": 1.0, "p2": 0.0}
+
+    def test_sub_agent_llm_calls_are_ignored(self, tmp_path: Path) -> None:
+        batch = [{"body": {"id": "g", "name": "sub-agent:llm", "level": "ERROR"}}]
+
+        assert build_agent_verdict_scores(SPOKE, batch, tmp_path / "absent", base_ts="t") == []
+
+    def test_sub_agent_with_no_signal_scores_nothing(self, tmp_path: Path) -> None:
+        batch = [{"body": {"id": "sa", "name": "sub-agent:Explore", "output": "some prose"}}]
+
+        assert build_agent_verdict_scores(SPOKE, batch, tmp_path / "absent", base_ts="t") == []
 
 
 class TestStepPhase:
