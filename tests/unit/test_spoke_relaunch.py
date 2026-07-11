@@ -156,12 +156,33 @@ def test_detached_head_tags_from_the_worktree_dir_not_literal_head(
     ).stdout.strip()
     subprocess.run(["git", "checkout", "-q", head], cwd=str(wt), check=True, env=_GIT_ENV)
 
-    proc, _calls = _run(main, str(wt), "--no-terminal", tmp_path=tmp_path)
+    proc, calls = _run(main, str(wt), tmp_path=tmp_path)
 
     assert proc.returncode == 0, proc.stderr
-    # WT_SPOKE must be the dir tag (42), never the literal HEAD (which would mis-tag markers).
-    assert "WT_SPOKE=42" in proc.stdout
-    assert "WT_SPOKE=HEAD" not in proc.stdout
+    # The window-spawn passes AGENT_CMD (with WT_SPOKE) as the new-window shell command, so both
+    # the tag and the window name land in the tmux call log. Neither may be the literal "HEAD":
+    # WT_SPOKE=HEAD would mis-tag the spoke's markers, and a window named "HEAD" would defeat the
+    # double-launch guard (which greps list-windows for the window name).
+    new_window = next((ln for ln in calls.splitlines() if ln.startswith("new-window")), "")
+    assert "WT_SPOKE=42" in new_window
+    assert "WT_SPOKE=HEAD" not in new_window
+    assert "-n 42" in new_window
+    assert "-n HEAD" not in new_window
+
+
+def test_budget_args_are_reapplied_for_parity_with_spawn(spoke_worktree, tmp_path: Path) -> None:
+    main, _wt = spoke_worktree
+
+    proc, _calls = _run(
+        main,
+        "42",
+        "--no-terminal",
+        tmp_path=tmp_path,
+        extra_env={"WT_AGENT_BUDGET_ARGS": "--max-budget-usd 5"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "--max-budget-usd 5" in proc.stdout
 
 
 def test_refuses_a_worktree_without_a_spoke_run_id(spoke_worktree, tmp_path: Path) -> None:

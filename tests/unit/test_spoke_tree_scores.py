@@ -194,10 +194,25 @@ class TestBuildAgentVerdictScores:
 
         assert events[0]["body"]["value"] == 1.0
 
-    def test_sub_agent_code_review_container_is_not_scored(self, tmp_path: Path) -> None:
-        # code-review's verdict is owned by the .review artifacts; a killed code-review container
-        # must not mint an agent_verdict:code-review score that collides with them.
+    def test_killed_code_review_scores_died_but_not_a_colliding_verdict(
+        self, tmp_path: Path
+    ) -> None:
+        # A killed code-review still scores a died COUNT (distinct :died name, no collision), but
+        # never an agent_verdict:code-review 0/1 score — that verdict is owned by the .review artifacts.
         batch = [{"body": {"id": "cr", "name": "sub-agent:code-review", "level": "ERROR"}}]
+
+        events = build_agent_verdict_scores(SPOKE, batch, tmp_path / "absent", base_ts="t")
+
+        assert len(events) == 1
+        assert events[0]["body"]["name"] == "agent_verdict:code-review:died"
+        assert events[0]["body"]["value"] == 1.0
+
+    def test_code_review_container_verdict_is_not_scored_from_output(self, tmp_path: Path) -> None:
+        # A (non-killed) code-review container's status output must NOT mint a verdict — the .review
+        # artifact is authoritative, so scoring the container too would double-count.
+        batch = [
+            {"body": {"id": "cr", "name": "sub-agent:code-review", "output": {"status": "ok"}}}
+        ]
 
         assert build_agent_verdict_scores(SPOKE, batch, tmp_path / "absent", base_ts="t") == []
 

@@ -507,10 +507,13 @@ OTEL_PREFIX=""
 if [ "${AI_TOOLKIT_OTEL:-}" = "1" ]; then
   OTEL_BODY_DIR="$WT_DIR/.ai-toolkit/raw-bodies"
   mkdir -p "$OTEL_BODY_DIR"
-  # The whole prefix — including the non-secret endpoint defaulting (normal gRPC :4317,
-  # beta HTTP :4418, span sink :4318) — is built by wt_native_otel_prefix (worktree-lib.sh),
-  # the SINGLE source shared with spoke-relaunch.sh (#233) so spawn and relaunch never drift.
-  # No preflight below reads the endpoint vars, so nothing needs them defaulted in this shell.
+  # The launch-prefix endpoints (normal gRPC :4317, beta HTTP :4418) are defaulted inside
+  # wt_native_otel_prefix (worktree-lib.sh) — the SINGLE source shared with spoke-relaunch.sh
+  # (#233) so spawn and relaunch never drift. But the span-sink endpoint must ALSO be set in
+  # THIS shell: the wt_emit_lifecycle/wt_emit_script calls below run telemetry.sh's emit, whose
+  # OTLP sink (telemetry.sh, gated on AI_TOOLKIT_OTEL_SPAN_ENDPOINT) fires only when it is set —
+  # the helper's own defaulting happens in a command-substitution subshell and cannot leak back.
+  : "${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:=${AI_TOOLKIT_OTEL_SPAN_ENDPOINT_DEFAULT:-http://localhost:4318}}"
   OTEL_PREFIX="$(wt_native_otel_prefix "$SPOKE_RUN_ID" "$OTEL_BODY_DIR")"
 fi
 

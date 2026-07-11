@@ -374,13 +374,13 @@ def build_agent_verdict_scores(
 
     - **code-review** — the signed ``.review/*.json`` artifacts under ``review_dir``, each an APPROVE
       / REQUEST_CHANGES verdict (:func:`_review_artifact_scores`). Trace-level, one per artifact. This
-      is the AUTHORITATIVE source for code-review, so a ``sub-agent:code-review`` container is skipped
-      below — otherwise a killed reviewer's died flag would land under the same ``agent_verdict:
-      code-review`` name and blend into the artifact-based approve rate.
-    - **schema / killed sub-agents** — every OTHER ``sub-agent:<type>`` container in the assembled
-      batch (excluding the ``sub-agent:llm`` calls, which are the sub-agent's own LLM turns, not an
-      agent). A reaper-killed (ERROR-level) container scores a SEPARATE ``agent_verdict:<type>:died``
-      count (kept off the 0/1 rate name); otherwise a structured ``status`` return scores the 0/1
+      is the AUTHORITATIVE source for a code-review VERDICT, so a ``sub-agent:code-review`` container
+      does not emit an approve/reject score below — but a KILLED reviewer still scores a died count
+      (under the distinct ``:died`` name, which cannot collide with the artifact scores).
+    - **schema / killed sub-agents** — every non-``llm`` ``sub-agent:<type>`` container in the batch
+      (``sub-agent:llm`` is the sub-agent's own LLM turns, not an agent). A reaper-killed (ERROR-level)
+      container scores a SEPARATE ``agent_verdict:<type>:died`` count (kept off the 0/1 rate name);
+      otherwise, and only for a non-code-review type, a structured ``status`` return scores the 0/1
       :func:`_sub_agent_verdict`. A container with neither signal scores nothing. Observation-scoped.
 
     All ids derive from the spoke run id so a rerun overwrites the same scores.
@@ -402,10 +402,10 @@ def build_agent_verdict_scores(
         if not name.startswith(_SUB_AGENT_PREFIX):
             continue
         agent_type = name[len(_SUB_AGENT_PREFIX) :]
-        # llm: the sub-agent's own LLM turns, not an agent. code-review: owned by the .review
-        # artifacts above (the authoritative verdict source), so its container is not scored here.
-        if agent_type in ("llm", _REVIEW_AGENT_TYPE):
+        if agent_type == "llm":  # the sub-agent's own LLM turns, not an agent
             continue
+        # A reaper-killed container scores a died count for EVERY type, code-review included — the
+        # distinct :died name never collides with code-review's artifact-based verdict scores.
         if body.get("level") == _LEVEL_ERROR:
             events.append(
                 _score_event(
@@ -417,6 +417,9 @@ def build_agent_verdict_scores(
                     observation_id=body["id"],
                 )
             )
+            continue
+        # code-review's non-died verdict is owned by the authoritative .review artifacts above.
+        if agent_type == _REVIEW_AGENT_TYPE:
             continue
         value = _sub_agent_verdict(body)
         if value is None:
