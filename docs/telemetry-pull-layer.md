@@ -204,7 +204,17 @@ markers; script spans `worktree-new` / `worktree-land` / `worktree-done` /
 `spoke-push` (the push span's window covers the pre-push test gate) and
 `script:ready` / `script:gate` / `script:accept` / `script:blocked`; native
 `claude_code.llm_request` generations; numeric scores `gate_park_ms` (trace-level
-PLAN-gate park) and `permission_wait_ms` (per blocked tool).
+PLAN-gate park), `permission_wait_ms` (per blocked tool), and the per-phase
+cycle-step scores `step_cache_write_usd:<PHASE>` / `step_tokens_written:<PHASE>`
+(View B step nodes).
+
+> [!WARNING]
+> **Dashboard-breaking rename (#230):** the per-phase score formerly named
+> `step_cost_usd:<PHASE>` is now `step_cache_write_usd:<PHASE>`. Its value is
+> unchanged — cache-WRITE cost only (`rollup.written x cache-write price`) — but the
+> old name was misleading, since it omitted cache reads, output tokens, and all
+> sub-agent spend. Any Scores widget filtering on `step_cost_usd:*` must be repointed
+> to `step_cache_write_usd:*`.
 
 ### Widget 1 — cycle-step duration by step name
 

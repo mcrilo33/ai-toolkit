@@ -4,8 +4,8 @@ Langfuse dashboards can sum/aggregate numeric SCORES but not arbitrary observati
 signals already present as metadata are ALSO emitted as scores: :func:`build_score_events` emits
 per-tool ``permission_wait_ms`` / ``tool_result_size`` and the trace-level ``gate_park_ms`` (from
 :func:`~telemetry.spoke_tree.commits._gate_park_ms`); :func:`build_step_cost_scores` emits per-phase
-``step_cost_usd`` / ``step_tokens_written`` from View B's step rollups. Depends on the foundation,
-``ids``, ``steps``, and ``commits``.
+``step_cache_write_usd`` / ``step_tokens_written`` from View B's step rollups. Depends on the
+foundation, ``ids``, ``steps``, and ``commits``.
 """
 
 from __future__ import annotations
@@ -32,7 +32,9 @@ _GATE_PARK_SCORE = "gate_park_ms"  # trace-level PLAN-gate park wait
 _TOOL_RESULT_SIZE_SCORE = "tool_result_size"  # bytes of a tool node's reconstructed tool_result
 # Per-phase step cost/token scores (#158): the phase is the score-name suffix (a metrics
 # dimension), so "what does RED cost across all spokes" is a one-widget Scores query.
-_STEP_COST_SCORE = "step_cost_usd"  # per View B step observation, from rollup.written x price
+_STEP_CACHE_WRITE_SCORE = (
+    "step_cache_write_usd"  # per View B step observation, from rollup.written x cache-write price
+)
 _STEP_TOKENS_WRITTEN_SCORE = (
     "step_tokens_written"  # per View B step observation, from rollup.written
 )
@@ -179,9 +181,11 @@ def build_step_cost_scores(
 
     ``step:*`` nodes carry token rollups only in ``metadata.rollup`` (never ``usageDetails`` — the
     #114 double-count guard), so per-step cost is invisible to the Metrics API. Score NAMES are a
-    metrics dimension, so each View B step emits ``step_cost_usd:<PHASE>`` and
+    metrics dimension, so each View B step emits ``step_cache_write_usd:<PHASE>`` and
     ``step_tokens_written:<PHASE>`` from its rollup's ``written`` tokens (cost = written x the
-    cache-creation ``price``), observation-scoped to the step node with a deterministic id.
+    cache-creation ``price``), observation-scoped to the step node with a deterministic id. This
+    score is cache-WRITE cost only (its #230 rename made that explicit); the true
+    all-generations per-step total is a separate score.
 
     Emitted on View B (the cycle lens) ONLY: a step lives on both views, but scoring both would
     double every phase in a Scores-view sum, so — like the other per-call enrichments — this is
@@ -209,7 +213,7 @@ def build_step_cost_scores(
         events.append(
             _score_event(
                 spoke_run_id,
-                name=f"{_STEP_COST_SCORE}:{phase}",
+                name=f"{_STEP_CACHE_WRITE_SCORE}:{phase}",
                 value=written * price,
                 trace_id=trace_id,
                 base_ts=base_ts,
