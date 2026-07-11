@@ -628,7 +628,10 @@ wt_otel_watch_arm "$REPO_ROOT"
 # arms mid-run is left to a follow-up — dispatch stamps mode once, and hub-afk
 # passes --mode afk for drain-dispatched spokes so those are correct at spawn.
 if [[ "$ISSUE" =~ ^[0-9]+$ ]]; then
-  if [ -n "${win_name:-}" ]; then
+  # Name the tmux window ONLY when one was actually spawned (SPAWNED=1): a tmux
+  # present-but-failed spawn still leaves win_name/sess assigned, so gate on SPAWNED
+  # to avoid naming a window that doesn't exist.
+  if [ "${SPAWNED:-0}" -eq 1 ] && [ -n "${win_name:-}" ]; then
     DISPATCH_WINDOW="${sess:-}:${win_name}"
   else
     DISPATCH_WINDOW="(no tmux window)"

@@ -1013,11 +1013,17 @@ def _gh_logging_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
     return env, log
 
 
-@pytest.mark.parametrize("flag", ["--gate", "--blocked"])
-def test_spoke_ready_emits_no_gh_calls(spoke: Path, remote: Path, tmp_path: Path, flag: str) -> None:
+@pytest.mark.parametrize(
+    "args",
+    [("45",), ("--gate", "45"), ("--accept", "45"), ("--blocked", "45")],
+    ids=["ready", "gate", "accept", "blocked"],
+)
+def test_spoke_ready_emits_no_gh_calls(
+    spoke: Path, remote: Path, tmp_path: Path, args: tuple[str, ...]
+) -> None:
     env, log = _gh_logging_env(tmp_path)
 
-    proc = _run(spoke, flag, "45", env=env)
+    proc = _run(spoke, *args, env=env)
 
     assert proc.returncode == 0, proc.stderr
     calls = log.read_text() if log.exists() else ""
