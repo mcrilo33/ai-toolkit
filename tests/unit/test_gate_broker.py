@@ -3263,9 +3263,15 @@ def test_default_answerer_policy_binds_to_rule_file() -> None:
     assert "ESCALATE:" not in rule, "the rule must not instruct an ESCALATE output"
     # Both instruct the single ANSWER: output and the REVERSIBILITY: reversibility-class line.
     for surface, name in ((policy, "fallback policy"), (rule, "rule file")):
+        low = surface.lower()
         assert "ANSWER:" in surface, f"{name} must instruct the ANSWER output line"
         assert "REVERSIBILITY:" in surface, f"{name} must instruct the REVERSIBILITY class line"
-        assert "reversible" in surface.lower(), f"{name} must state the prefer-reversible posture"
+        # A DISTINCTIVE phrase, not the bare "reversible" (which matches inside "irreversible"
+        # and would pass even if the prefer-reversible instruction were deleted).
+        assert "reversible, in-scope" in low, f"{name} must state the prefer-reversible posture"
+        # WARN must fire for all four risk classes, in lockstep across the surfaces.
+        for cls in ("irreversible", "outward", "scope"):
+            assert cls in low, f"{name} must name the {cls} risk class for WARN"
 
 
 def test_answerer_prompt_instructs_answer_only(tmp_path: Path) -> None:

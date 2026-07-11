@@ -1169,9 +1169,9 @@ alternative when one exists (that IS the answer — e.g. do not force-push; reba
 branch instead; deny a destructive command and tell the spoke the reversible path); only when
 no reversible alternative exists do you decide on the merits. Precede your decision with a
 'REVERSIBILITY: reversible|outward|scope|irreversible' line naming the class, and add a
-'WARN: <what the human should double-check>' line whenever you take a critical or irreversible
-decision so it is loudly recorded for morning post-review. End with exactly one final line:
-'ANSWER: <reply>'.
+'WARN: <what the human should double-check>' line whenever you take a critical, irreversible,
+outward-facing, or scope-changing decision so it is loudly recorded for morning post-review.
+End with exactly one final line: 'ANSWER: <reply>'.
 POLICY
 }
 
@@ -1207,8 +1207,8 @@ $question
 
 Decide per the policy above — you ALWAYS answer, never escalate-and-park. Precede your
 decision with a 'REVERSIBILITY: reversible|outward|scope|irreversible' line, and a
-'WARN: <what to double-check>' line for any critical/irreversible call. End with exactly one
-final line: 'ANSWER: <reply>'.
+'WARN: <what to double-check>' line for any critical, irreversible, outward-facing, or
+scope-changing call. End with exactly one final line: 'ANSWER: <reply>'.
 EOF
 }
 
@@ -1338,12 +1338,15 @@ parse_decision() {
 # '<KEYWORD>: <value>' line (empty when absent). #241 reads the reasoner's 'REVERSIBILITY:'
 # class and 'WARN:' note off the same single-line convention as the ANSWER line, so a taken
 # decision carries its reversibility class + human-review flag into the decision journal.
+# <KEYWORD> must be a metacharacter-free literal (callers pass REVERSIBILITY / WARN); it is
+# interpolated into an ERE. The value is both l- and r-trimmed so a class enum compares exact.
 parse_decision_field() {
   local raw="$1" key="$2" line rest
   line="$(printf '%s\n' "$raw" | grep -E "^${key}:" | tail -1)"
   [ -n "$line" ] || return 0
   rest="${line#*:}"
   rest="${rest#"${rest%%[![:space:]]*}"}"          # ltrim
+  rest="${rest%"${rest##*[![:space:]]}"}"          # rtrim
   printf '%s\n' "$rest"
 }
 
