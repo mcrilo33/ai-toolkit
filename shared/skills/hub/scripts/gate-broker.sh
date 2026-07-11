@@ -134,11 +134,12 @@ stamp_answer_attempt()  { _stamp_issue_epoch answer-attempt "$1"; }
 read_answer_attempt()   { _read_issue_epoch answer-attempt "$1"; }
 # Fresh window ⇒ no stale progress/attempt state: a leftover answer-attempt epoch
 # would suppress a legitimate idle reap in the next window; a leftover re-answer counter
-# (#203) would strand a spoke at a ceiling reached in a prior window.
+# (#203) would strand a spoke at a ceiling reached in a prior window; a leftover gate-voided /
+# terminal-logged marker (#237) would keep a since-resolved gate terminal across windows.
 _clear_progress_state() {
   local dir; dir="$(_afk_state_dir)"
   rm -f "$dir"/progress-*.epoch "$dir"/answer-attempt-*.epoch "$dir"/tip-* \
-    "$dir"/reanswer-* 2>/dev/null || true
+    "$dir"/reanswer-* "$dir"/gate-voided-* "$dir"/terminal-logged-* 2>/dev/null || true
 }
 
 # --- re-answer ceiling (issue #203, finding 1) --------------------------------
@@ -190,6 +191,37 @@ _broker_reanswer_exhausted() {
   mkdir -p "$(dirname "$f")" 2>/dev/null || true
   printf '%s\t%s\t%s\n' "$tip" "$sig" "$(( prev_n + 1 ))" > "$f" 2>/dev/null || true
   return 1
+}
+
+# --- terminal gate markers (issue #237) ---------------------------------------
+# A reasoner mutation-void is terminal on the FIRST occurrence: the reasoner wrote the
+# spoke's live tree, so a human is required regardless of the parked prompt or branch tip.
+# Unlike the (tip, sig) re-answer ceiling — which the mutation itself perturbs, since the
+# write moves the tip and flips the pending command, resetting that counter every tick — this
+# marker is durable and independent of both, so a voided gate never re-runs the reasoner.
+# Cleared only on a fresh arm (_clear_progress_state), a current-window view.
+_broker_voided_marker() { printf '%s\n' "$(_afk_state_dir)/gate-voided-$1"; }
+_broker_gate_voided()   { [ -f "$(_broker_voided_marker "$1")" ]; }
+_broker_mark_voided() {
+  local issue="$1" f; f="$(_broker_voided_marker "$issue")"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  printf '%s\n' "$(afk_now)" > "$f" 2>/dev/null || true
+}
+
+# _broker_log_terminal_once <issue> <key> <msg> -> log <msg> only the FIRST tick a gate
+# becomes terminal for <key>; a later tick on the same key stays silent, so a terminal gate
+# never re-emits its "terminal" line on every event wake (issue #237). <key> folds in whatever
+# the terminal state keys on (tip + signature for the re-answer ceiling), so a genuinely NEW
+# terminal context (a moved tip / changed prompt) logs afresh.
+_broker_terminal_log_file() { printf '%s\n' "$(_afk_state_dir)/terminal-logged-$1"; }
+_broker_log_terminal_once() {
+  local issue="$1" key="$2" msg="$3" f prev=""
+  f="$(_broker_terminal_log_file "$issue")"
+  [ -f "$f" ] && prev="$(cat "$f" 2>/dev/null)"
+  [ "$prev" = "$key" ] && return 0
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  printf '%s\n' "$key" > "$f" 2>/dev/null || true
+  log "$msg"
 }
 
 # _afk_note_tip_progress <wt> <issue> -> observe ledger progress as branch-tip
@@ -1973,6 +2005,13 @@ broker_service_gate() {
     _consume_gate_tag "$wt" "$issue"
     return 0
   fi
+  # A prior tick found the reasoner mutated the live tree for this gate (#237): that verdict is
+  # terminal on FIRST occurrence — a human is required — and independent of tip/signature, which
+  # the mutation itself perturbs. Skip the reasoner entirely; the first-occurrence escalation
+  # already stamped blocked/<issue>. Silent here (it was logged once when first voided); a fresh
+  # arm clears the marker. Checked before the (tip, sig) ceiling on purpose: keying a void on
+  # that ceiling would let the mutation reset it every tick and re-run forever.
+  if _broker_gate_voided "$issue"; then return 0; fi
   # Re-answer ceiling (#203 finding 1): a legitimately-escalated spoke parked on the SAME
   # prompt must not re-run the reasoner/classifier every tick forever. After the ceiling on
   # the SAME (tip, prompt-signature) the gate is terminal — it stays blocked/<issue> at the
@@ -1980,7 +2019,11 @@ broker_service_gate() {
   # BOTH the permission path (#203 finding 4's compound dialog) and the answerer path.
   local park_sig; park_sig="$(_broker_park_signature "$wt" "$issue")"
   if _broker_reanswer_exhausted "$wt" "$issue" "$park_sig"; then
-    log "  #$issue re-answer ceiling reached on the same prompt — leaving it terminal (no re-answer)"
+    # Log the terminal state ONCE per (tip, sig) — not on every event wake (#237). A moved tip
+    # or changed prompt is a new key that resets the ceiling AND logs afresh when it re-exhausts.
+    local _tip; _tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"
+    _broker_log_terminal_once "$issue" "ceiling:${_tip}:${park_sig}" \
+      "  #$issue re-answer ceiling reached on the same prompt — leaving it terminal (no re-answer)"
     return 0
   fi
   # A pending permission dialog is decided by the rules classifier, not the answerer (#149).
@@ -2023,7 +2066,11 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
     return 0
   fi
   if ! _broker_worktree_unchanged "$wt" "$fp_before"; then
-    log "  reasoner mutated the read-only worktree of #$issue — voiding its answer"
+    # Stamp the durable void marker FIRST so this gate is terminal on the first occurrence
+    # (#237): later ticks short-circuit at the top and never re-run the reasoner. This log
+    # fires exactly once — the short-circuit keeps the mutation branch from re-running.
+    _broker_mark_voided "$issue"
+    log "  reasoner mutated the read-only worktree of #$issue — voiding its answer (terminal; a human is required)"
     _broker_on_human_decision "$mode" "$wt" "$issue" \
       "the gate reasoner mutated the read-only worktree — its answer is voided; needs a human"
     return 0
