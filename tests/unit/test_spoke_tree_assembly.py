@@ -108,3 +108,17 @@ class TestCopyEvent:
         tool = _obs("t1", "tool:Bash", metadata={"attributes": {"tool_use_id": "tu-1"}})
         agent = _obs("a1", "sub-agent:x", metadata={"attributes": {"tool_use_id": "tu-2"}})
         assert _tool_span_ids([("tr", [tool, agent])]) == {"tu-1", "tu-2"}
+
+    def test_tool_skill_span_is_relabeled_to_skill_name(self) -> None:
+        obs = _obs("sk", "tool:Skill", metadata={"attributes": {"tool_use_id": "tu-sk"}})
+        content = {"tu-sk": ToolContent(input={"skill": "code-review"}, output=None)}
+        event = _copy_event(
+            obs, orig_trace_id="tr", trace_id="T", parent_id="P", tool_content=content
+        )
+        assert event["body"]["name"] == "skill:code-review"
+        assert event["body"]["metadata"]["skill"] == "code-review"
+
+    def test_tool_skill_span_without_known_name_keeps_tool_skill(self) -> None:
+        obs = _obs("sk", "tool:Skill", metadata={"attributes": {"tool_use_id": "tu-sk"}})
+        event = _copy_event(obs, orig_trace_id="tr", trace_id="T", parent_id="P", tool_content={})
+        assert event["body"]["name"] == "tool:Skill"

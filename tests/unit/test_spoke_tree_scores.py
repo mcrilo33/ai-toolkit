@@ -16,6 +16,7 @@ from telemetry.spoke_tree.scores import (
     build_agent_verdict_scores,
     build_score_events,
     build_script_success_scores,
+    build_skill_success_scores,
     build_step_cost_scores,
     build_step_duration_scores,
     build_step_total_cost_scores,
@@ -101,6 +102,49 @@ class TestBuildScriptSuccessScores:
 
         assert len(events) == 2
         assert {e["body"]["observationId"] for e in events} == {"s1", "s2"}
+
+
+class TestBuildSkillSuccessScores:
+    """#234: mirror a skill span's SCRIPTED exit-status into a skill_success:<name> 0/1 score.
+
+    Ready-but-latent (like #233 script_success): a score is emitted ONLY when a skill carries a
+    scripted status attribute — a skill with no scripted status is not scored 0 (absence is not a
+    failure), so no skill self-reports success and the widget stays empty until the SKILL.md/hook
+    contract stamps a status.
+    """
+
+    def _skill(self, obs_id: str, name: str, status: str | None) -> dict:
+        attributes: dict[str, str] = {}
+        if status is not None:
+            attributes["skill.status"] = status
+        return {"body": {"id": obs_id, "name": name, "metadata": {"attributes": attributes}}}
+
+    def test_scripted_success_scores_one(self) -> None:
+        batch = [self._skill("s1", "skill:code-review", "success")]
+
+        events = build_skill_success_scores(SPOKE, batch, base_ts="t")
+
+        assert len(events) == 1
+        body = events[0]["body"]
+        assert events[0]["type"] == "score-create"
+        assert body["name"] == "skill_success:code-review"
+        assert body["value"] == 1.0
+        assert body["observationId"] == "s1"
+
+    def test_scripted_failure_scores_zero(self) -> None:
+        batch = [self._skill("s1", "skill:code-review", "failure")]
+
+        assert build_skill_success_scores(SPOKE, batch, base_ts="t")[0]["body"]["value"] == 0.0
+
+    def test_skill_without_scripted_status_emits_nothing(self) -> None:
+        batch = [self._skill("s1", "skill:code-review", None)]
+
+        assert build_skill_success_scores(SPOKE, batch, base_ts="t") == []
+
+    def test_non_skill_nodes_are_ignored(self) -> None:
+        batch = [{"body": {"id": "t1", "name": "tool:Skill", "metadata": {}}}]
+
+        assert build_skill_success_scores(SPOKE, batch, base_ts="t") == []
 
 
 class TestBuildAgentVerdictScores:

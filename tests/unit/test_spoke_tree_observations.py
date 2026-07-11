@@ -18,6 +18,7 @@ from telemetry.spoke_tree.observations import (
     _is_hook,
     _is_hook_event,
     _is_interaction,
+    _is_skill_span,
     _is_tool_span,
     _joins_under_tool,
     _obs_envelope,
@@ -99,6 +100,12 @@ class TestNodePredicates:
         assert _is_guards_group(_obs("guards"))
         assert _is_guards_group(_obs("guards:session"))
         assert not _is_guards_group(_obs("Bash"))
+
+    def test_is_skill_span_matches_skill_prefix(self) -> None:
+        assert _is_skill_span(_obs("skill:code-review"))
+        assert _is_skill_span(_obs("skill:claude-hud:setup"))
+        assert not _is_skill_span(_obs("tool:Skill"))
+        assert not _is_skill_span(_obs("tool:Bash"))
 
     def test_is_blocked_tool_matches_prefix(self) -> None:
         assert _is_blocked_tool(_obs("blocked-tool:Bash"))

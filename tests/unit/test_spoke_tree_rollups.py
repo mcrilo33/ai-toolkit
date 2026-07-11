@@ -50,6 +50,12 @@ class TestDurationClass:
     def test_tool_span_is_tool(self) -> None:
         assert _duration_class({"type": "span-create", "body": {"name": "tool:Bash"}}) == "tool"
 
+    def test_skill_span_is_skill(self) -> None:
+        assert (
+            _duration_class({"type": "span-create", "body": {"name": "skill:code-review"}})
+            == "skill"
+        )
+
     def test_unknown_is_other(self) -> None:
         assert _duration_class({"type": "span-create", "body": {"name": "mystery"}}) == "other"
 
