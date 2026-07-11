@@ -3202,3 +3202,44 @@ def test_warned_backoff_gates_retry_and_grows(tmp_path: Path) -> None:
     assert "B-DUE" in out, out  # 60s elapsed → due for re-service
     assert "C-WAIT" in out, out  # second warn doubled the backoff to 120s; only 40s elapsed
     assert "D-DUE" in out, out  # 120s elapsed → due again
+
+
+def test_broker_journal_decision_escapes_control_chars(tmp_path: Path) -> None:
+    import json as _json
+
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_JOURNAL_GH_COMMENT": "0"}
+
+    # A decision built from captured tool output can carry a CR / control byte; the journal
+    # must still be valid JSONL a strict parser accepts (the record advertises "structured").
+    r = _call(
+        "broker_journal_decision 41 permission \"$(printf 'denied\\rforce-push\\tfoo')\" irreversible",
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+
+    raw = (statedir / "decision-journal.jsonl").read_text()
+    assert "\r" not in raw, "raw CR must not survive into the journal line"
+    rec = _json.loads(raw.strip())  # must parse — control chars neutralized
+    assert "force-push" in rec["decision"]
+
+
+def test_clear_warned_records_resets_window(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1000"}
+
+    r = _call(
+        "broker_warn 41 'w'; _afk_warned_arm 41; "
+        "broker_warn 42 'w'; _afk_warned_arm 42; "
+        "_afk_clear_warned 41; "  # one-issue clear (a genuine progress signal)
+        "_clear_warned_records",  # full window reset
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    # Both the human-facing record and the backoff bookkeeping are gone after the resets.
+    assert not (statedir / "warned-41.txt").exists()
+    assert not (statedir / "warned-state-41").exists()
+    assert not (statedir / "warned-42.txt").exists()
+    assert not (statedir / "warned-state-42").exists()

@@ -1010,13 +1010,17 @@ codify_decisions() {
 # _broker_journal_file -> the per-run decision journal (one JSON line per taken decision).
 _broker_journal_file() { printf '%s\n' "$(_afk_state_dir)/decision-journal.jsonl"; }
 
-# _broker_json_escape <s> -> minimally escape a value for a JSON string literal.
+# _broker_json_escape <s> -> escape a value for a JSON string literal. A decision/reason can
+# be built from captured tool output (git/gh/build lines carry \r, \t, and other C0 controls),
+# and JSON forbids raw control characters in a string — so escape \ and ", space out the
+# common whitespace for readability, then DROP any remaining C0 byte so the journal line stays
+# valid JSONL a strict parser accepts. LC_ALL=C makes the byte range literal on this non-C host.
 _broker_json_escape() {
   local s="$1"
   s="${s//\\/\\\\}"   # backslashes first, else the quote-escapes below get doubled
   s="${s//\"/\\\"}"
-  s="${s//$'\t'/ }"; s="${s//$'\n'/ }"   # keep the record one physical line
-  printf '%s' "$s"
+  s="${s//$'\t'/ }"; s="${s//$'\n'/ }"; s="${s//$'\r'/ }"   # keep the record one physical line
+  printf '%s' "$s" | LC_ALL=C tr -d '\000-\037'
 }
 
 # broker_journal_decision <issue> <park_kind> <decision> <reversibility> [reasoning_ref] ->
@@ -1042,10 +1046,19 @@ broker_journal_decision() {
 _broker_journal_gh_comment() {
   [ "${AFK_JOURNAL_GH_COMMENT:-1}" = 0 ] && return 0
   command -v gh >/dev/null 2>&1 || return 0
-  local issue="$1" park="$2" decision="$3" rev="$4"
-  gh issue comment "$issue" \
-    --body "AFK auto-decision [$rev] on the $park park: $decision (review and post-adjust if wrong)" \
-    >/dev/null 2>&1 || true
+  local issue="$1" park="$2" decision="$3" rev="$4" body
+  # Wrap the decision in backticks: a decision containing `#123` or `@name` would otherwise
+  # render as a cross-issue link / user mention on GitHub, back-referencing unrelated issues.
+  body="AFK auto-decision [$rev] on the $park park: \`$decision\` (review and post-adjust if wrong)"
+  # Route through the TIME-BOUNDED runner so a hung gh (a black-hole network) can never
+  # freeze the servicing tick — this is on the synchronous answer path. _wt_gh_run bounds
+  # gh at AI_TOOLKIT_GH_TIMEOUT and returns its real rc (which we discard). Fall back to a
+  # raw best-effort gh only when worktree-lib.sh did not source (the helper is undefined).
+  if command -v _wt_gh_run >/dev/null 2>&1; then
+    _wt_gh_run issue comment "$issue" --body "$body" || true
+  else
+    gh issue comment "$issue" --body "$body" >/dev/null 2>&1 || true
+  fi
   return 0
 }
 
@@ -1058,6 +1071,7 @@ _broker_warned_record() { printf '%s\n' "$(_afk_state_dir)/warned-$1.txt"; }
 # overwrite the durable warned record (latest warning wins). Best-effort; never aborts.
 broker_warn() {
   local issue="$1" reason="$2" f
+  reason="${reason//$'\n'/ }"; reason="${reason//$'\r'/ }"   # keep the record one line (hub-notify cut -f2-)
   log "  WARNING: #$issue $reason"
   f="$(_broker_warned_record "$issue")"
   mkdir -p "$(dirname "$f")" 2>/dev/null || true
