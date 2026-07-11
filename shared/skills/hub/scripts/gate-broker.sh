@@ -36,6 +36,11 @@ SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 : "${AFK_SPOKE_MAX_MINUTES:=180}"
 : "${AFK_IDLE_MINUTES:=30}"
 : "${AFK_ANSWERER_EFFORT:=high}"
+# Warned-retry backoff (issue #241): a converted stop site parks a spoke LAST rather than
+# abandoning it — warn, then re-service on an exponential backoff so a persistently-failing
+# spoke is retried rarely (doom-loop safety by the curve, not by abandonment; #144/#140/#202).
+: "${AFK_WARN_BACKOFF_BASE:=60}"
+: "${AFK_WARN_BACKOFF_CAP:=1800}"
 
 # --- source worktree-lib.sh (the shared date/time + worktree helpers) ---------
 # Resolution covers both layouts: the ai-toolkit checkout (scripts/worktree-lib.sh, four
@@ -993,6 +998,127 @@ codify_decisions() {
         if (count[s] >= min && !(s in conflict))
           printf "RULE: %s -> %s (%d occurrences, unanimous; verify destructive flag variants)\n", s, decision[s], count[s]
     }' "$log" 2>/dev/null | sort || true
+}
+
+# --- decision journal + warn-and-continue (issue #241) ------------------------
+# The /afk answerer ALWAYS answers: every former terminal stop site (escalate-blocked, reap,
+# ceiling, void, inject-failure, dispatch/land/auth halts) now TAKES the best action, WARNS
+# loudly to four surfaces (drain log + hub-notify ping + --status + this decision journal),
+# and parks the spoke LAST on the warned-retry backoff — never abandoned. The journal is the
+# post-adjust surface: the operator reads it in the morning and reverses whatever was wrong.
+
+# _broker_journal_file -> the per-run decision journal (one JSON line per taken decision).
+_broker_journal_file() { printf '%s\n' "$(_afk_state_dir)/decision-journal.jsonl"; }
+
+# _broker_json_escape <s> -> minimally escape a value for a JSON string literal.
+_broker_json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"   # backslashes first, else the quote-escapes below get doubled
+  s="${s//\"/\\\"}"
+  s="${s//$'\t'/ }"; s="${s//$'\n'/ }"   # keep the record one physical line
+  printf '%s' "$s"
+}
+
+# broker_journal_decision <issue> <park_kind> <decision> <reversibility> [reasoning_ref] ->
+# append one structured JSONL record (ts, issue, park, decision, reversibility, reasoning_ref)
+# AND post a best-effort GitHub issue comment, so the morning review reads either surface.
+# reversibility is one of reversible|outward|scope|irreversible|unknown. Best-effort; never
+# aborts the caller.
+broker_journal_decision() {
+  local issue="$1" park="$2" decision="$3" rev="${4:-unknown}" ref="${5:-}" f
+  f="$(_broker_journal_file)"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  printf '{"ts":%s,"issue":"%s","park":"%s","decision":"%s","reversibility":"%s","reasoning_ref":"%s"}\n' \
+    "$(afk_now)" "$(_broker_json_escape "$issue")" "$(_broker_json_escape "$park")" \
+    "$(_broker_json_escape "$decision")" "$(_broker_json_escape "$rev")" \
+    "$(_broker_json_escape "$ref")" >>"$f" 2>/dev/null || true
+  _broker_journal_gh_comment "$issue" "$park" "$decision" "$rev"
+  return 0
+}
+
+# _broker_journal_gh_comment <issue> <park> <decision> <rev> -> best-effort issue comment
+# recording the taken decision (#241 §10). Opt-out via AFK_JOURNAL_GH_COMMENT=0; no-op when
+# gh is absent. Never aborts.
+_broker_journal_gh_comment() {
+  [ "${AFK_JOURNAL_GH_COMMENT:-1}" = 0 ] && return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  local issue="$1" park="$2" decision="$3" rev="$4"
+  gh issue comment "$issue" \
+    --body "AFK auto-decision [$rev] on the $park park: $decision (review and post-adjust if wrong)" \
+    >/dev/null 2>&1 || true
+  return 0
+}
+
+# _broker_warned_record <issue> -> the durable, human-facing warned record: "<ts>\t<reason>".
+# --status surfaces it and hub-notify pings on it (re-fired on an interval, unlike the
+# once-deduped blocked ping). Distinct from blocked-<issue>.txt so the two states never blur.
+_broker_warned_record() { printf '%s\n' "$(_afk_state_dir)/warned-$1.txt"; }
+
+# broker_warn <issue> <reason> -> the loud, repeatable WARNING surface: log a WARNING line and
+# overwrite the durable warned record (latest warning wins). Best-effort; never aborts.
+broker_warn() {
+  local issue="$1" reason="$2" f
+  log "  WARNING: #$issue $reason"
+  f="$(_broker_warned_record "$issue")"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  printf '%s\t%s\n' "$(afk_now)" "$reason" >"$f" 2>/dev/null || true
+  return 0
+}
+
+# _afk_warned_state_file <issue> -> the backoff bookkeeping: "<attempt>\t<next_retry_epoch>".
+_afk_warned_state_file() { printf '%s\n' "$(_afk_state_dir)/warned-state-$1"; }
+
+# _afk_warned_arm <issue> -> advance the warned-retry backoff: read the prior attempt count
+# (0 if none), schedule the next retry at now + min(BASE * 2^attempt, CAP), and persist
+# "<attempt+1>\t<next>". Exponential so a standing failure is retried ever more rarely.
+_afk_warned_arm() {
+  local issue="$1" f base cap attempt=0 delay now i=0
+  base="${AFK_WARN_BACKOFF_BASE:-60}"; case "$base" in '' | *[!0-9]*) base=60 ;; esac
+  cap="${AFK_WARN_BACKOFF_CAP:-1800}"; case "$cap" in '' | *[!0-9]*) cap=1800 ;; esac
+  f="$(_afk_warned_state_file "$issue")"
+  if [ -f "$f" ]; then IFS=$'\t' read -r attempt _ <"$f" 2>/dev/null || true; fi
+  case "$attempt" in '' | *[!0-9]*) attempt=0 ;; esac
+  delay="$base"
+  while [ "$i" -lt "$attempt" ] && [ "$delay" -lt "$cap" ]; do delay=$(( delay * 2 )); i=$(( i + 1 )); done
+  [ "$delay" -gt "$cap" ] && delay="$cap"
+  now="$(afk_now)"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  printf '%s\t%s\n' "$(( attempt + 1 ))" "$(( now + delay ))" >"$f" 2>/dev/null || true
+}
+
+# _afk_warned_due <issue> [now] -> rc 0 when the spoke is due for a retry (never warned, or the
+# backoff window has elapsed), rc 1 when still inside the backoff (parked LAST this tick).
+_afk_warned_due() {
+  local issue="$1" now="${2:-$(afk_now)}" f next=""
+  f="$(_afk_warned_state_file "$issue")"
+  [ -f "$f" ] || return 0
+  IFS=$'\t' read -r _ next <"$f" 2>/dev/null || true
+  case "$next" in '' | *[!0-9]*) return 0 ;; esac
+  [ "$now" -ge "$next" ]
+}
+
+# _afk_clear_warned <issue> -> drop one spoke's warned record + backoff (called on genuine
+# progress: a tip advance or a fresh marker means the warned state is stale).
+_afk_clear_warned() {
+  rm -f "$(_afk_warned_state_file "$1")" "$(_broker_warned_record "$1")" 2>/dev/null || true
+}
+# _clear_warned_records -> drop every warned record + backoff for a freshly-armed window.
+_clear_warned_records() {
+  local dir; dir="$(_afk_state_dir)"
+  rm -f "$dir"/warned-*.txt "$dir"/warned-state-* 2>/dev/null || true
+}
+
+# broker_warn_continue <wt> <issue> <park_kind> <decision> <reversibility> -> the #241
+# replacement for _escalate_blocked at a converted stop site: warn loudly, journal the taken
+# decision, advance the backoff, emit a warn span, and RETURN — the spoke stays in rotation
+# (no blocked tag, no pane kill). It is retried on the backoff until it makes progress.
+broker_warn_continue() {
+  local wt="$1" issue="$2" park="$3" decision="$4" rev="${5:-unknown}"
+  broker_warn "$issue" "$decision"
+  broker_journal_decision "$issue" "$park" "$decision" "$rev"
+  _afk_warned_arm "$issue"
+  afk_emit_decision "$wt" warn
+  return 0
 }
 
 # _rule_file -> the afk-answering rule path, across both layouts; empty if unfound.
