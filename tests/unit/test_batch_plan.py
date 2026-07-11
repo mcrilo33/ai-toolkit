@@ -236,6 +236,32 @@ def test_hold_label_is_case_insensitive_among_other_labels() -> None:
     assert batch == [2], "a HOLD-labelled issue is excluded even alongside other labels"
 
 
+def test_hold_read_unaffected_by_lifecycle_labels() -> None:
+    # AC5 (issue #236): the new status:*/mode:*/lane: lifecycle labels must not disturb
+    # the exact-name hold read — a held issue also carrying them is still staged out.
+    nodes = [
+        _node(1, "a.py", labels=["hold", "status:in-progress", "mode:afk", "lane:spoke"]),
+        _node(2, "b.py"),
+    ]
+
+    batch = _plan(nodes)
+
+    assert batch == [2], "lifecycle labels must not mask the hold read"
+
+
+def test_priority_read_unaffected_by_lifecycle_labels() -> None:
+    # AC5 (issue #236): the priority read is likewise untouched by the lifecycle labels.
+    nodes = [
+        _node(10, "shared.py", labels=["priority", "status:gate", "lane:spoke"]),
+        _node(20, "shared.py"),
+    ]
+
+    batch = _plan(nodes)
+
+    assert batch[0] == 10, "lifecycle labels must not mask the priority read"
+    assert 20 not in batch
+
+
 # ── priority label: dispatched ahead of equally-eligible peers (issue #147) ───
 
 
