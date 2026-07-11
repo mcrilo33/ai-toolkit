@@ -3419,3 +3419,75 @@ def test_permission_escalate_reasoner_deny_cancels_and_redirects(
     assert "irreversible" in (statedir / "decision-journal.jsonl").read_text()
     ready = Path(env["_READY_LOG"])
     assert not ready.exists() or "--blocked 5" not in ready.read_text()
+
+
+def test_permission_approve_delivery_failure_warns_not_blocks(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A known-safe command classifies APPROVE, but the Yes keystroke fails to register (the
+    # transcript never advances). #241: that no longer parks the spoke blocked/<issue> — it
+    # warns and retries on the backoff.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    jsonl.write_text(json.dumps(_bash_tool_record("git reset -q; git add tests/x.py")) + "\n")
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # pinned mtime: no Enter-append -> no advance
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        "esac\nexit 0\n"  # send-keys is a no-op: the transcript never advances -> delivery fails
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE_DIR": str(statedir),
+        "SPOKE_READY": str(ready_stub),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_INJECT_POLL_SECONDS": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    assert (statedir / "warned-5.txt").exists(), "a failed approval delivery must warn, not park"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text()
+
+
+def test_permission_reasoner_auth_failure_halts_not_denies(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # If the supervisor's own token dies while the reasoner decides a permission dialog, the
+    # blob is an auth error, not a decision. The permission path must detect it (rc != 0 + auth
+    # signature), raise the global halt, and escalate — NOT inject a spurious denial into the
+    # live dialog (mirrors the gate/park path).
+    env = _perm_env(
+        tmp_path,
+        spoke_repo,
+        "npm run deploy",  # ESCALATE -> reasoner
+        "printf 'Invalid API key . Please run /login'; exit 1",
+    )
+
+    result = _call(
+        f"broker_service_gate '{spoke_repo}' 5 unattended; echo AUTH=$_AFK_AUTH_FAILED",
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+
+    assert "AUTH=1" in result.stdout, "an auth failure must raise the global halt flag"
+    ready = Path(env["_READY_LOG"])
+    assert ready.exists() and "--blocked 5" in ready.read_text(), "auth failure escalates (S3)"
+    # No spurious denial: the reversible-path guidance was never injected.
+    keys = Path(env["_KEYLOG"]).read_text() if Path(env["_KEYLOG"]).exists() else ""
+    assert "reversible, in-scope path" not in keys, "auth failure must not inject a spurious deny"

@@ -1932,7 +1932,7 @@ _deny_permission() {
 # default) declines the dialog and injects the reversible-path guidance. Either way the taken
 # decision is warned + journaled with its reversibility class, and the spoke is NEVER parked.
 _reason_permission() {
-  local wt="$1" issue="$2" cmd="$3" why="$4" q raw ans text rev guidance
+  local wt="$1" issue="$2" cmd="$3" why="$4" q raw rc ans text rev guidance
   q="The spoke is parked on a PERMISSION dialog and wants to run this command:
 
 $cmd
@@ -1945,25 +1945,43 @@ name the reversible path. Your ANSWER line MUST begin with 'APPROVE' or 'DENY: <
 path to tell the spoke>'."
   # Stamp the attempt FIRST so the reason→deliver window never reads as idle (#202 C).
   stamp_answer_attempt "$issue"
-  raw="$(run_answerer "$issue" "$q" "$wt")"
+  raw="$(run_answerer "$issue" "$q" "$wt")"; rc=$?
+  # Auth failure is the one true external blocker (#73): a dead supervisor token yields an
+  # auth-error blob, not a decision — and parse_decision would fall to the DENY default and
+  # inject a SPURIOUS denial into the live dialog. Detect it exactly as the gate/park path does
+  # (rc != 0 AND an auth signature), raise the global halt, and return without injecting.
+  # (#241 §9 will convert this terminal escalation to a retry-loop; here it mirrors the gate.)
+  if [ "$rc" -ne 0 ] && is_auth_failure "$raw"; then
+    _AFK_AUTH_FAILED=1
+    _escalate_blocked "$wt" "$issue" "subscription auth failed — token could not refresh; re-run /login on the host"
+    return 0
+  fi
   ans="$(parse_decision "$raw")"
   text="${ans#*$'\t'}"
-  rev="$(parse_decision_field "$raw" REVERSIBILITY)"; [ -n "$rev" ] || rev=unknown
+  rev="$(parse_decision_field "$raw" REVERSIBILITY)"
   # NB: the classifier verdict (ESCALATE) is already recorded in decisions.log by the caller;
   # the reasoned approve/deny lands in the decision journal via broker_warn_continue, NOT in
   # decisions.log — that log codifies only the MECHANICAL classifier (#155 D).
   case "$text" in
     APPROVE*)
       if approve_permission "$wt"; then
-        broker_warn_continue "$wt" "$issue" permission "reasoner APPROVED: $cmd" "$rev"
+        broker_warn_continue "$wt" "$issue" permission "reasoner APPROVED: $cmd" "${rev:-unknown}"
       else
-        broker_warn_continue "$wt" "$issue" permission "reasoner APPROVED but delivery failed: $cmd" "$rev"
+        broker_warn_continue "$wt" "$issue" permission "reasoner APPROVED but delivery failed: $cmd" "${rev:-unknown}"
       fi ;;
     *)
-      # DENY, or any reply that does not clearly approve — the safe default is to decline.
-      guidance="${text#DENY:}"; guidance="${guidance#"${guidance%%[![:space:]]*}"}"
+      # DENY, or any reply that does not clearly approve — the safe default is to decline. Only a
+      # DENY-prefixed reply carries guidance (with or without the colon); anything else uses the
+      # default decline message rather than injecting the raw reply.
+      case "$text" in
+        DENY*)
+          guidance="${text#DENY}"; guidance="${guidance#:}"
+          guidance="${guidance#"${guidance%%[![:space:]]*}"}" ;;   # ltrim
+        *) guidance="" ;;
+      esac
       [ -n "$guidance" ] || guidance="Declined that command — take the reversible, in-scope path instead."
       _deny_permission "$wt" "$guidance" || true
+      # A decline-and-redirect is reversible by construction, so default the class to reversible.
       broker_warn_continue "$wt" "$issue" permission "reasoner DENIED ($cmd): $guidance" "${rev:-reversible}" ;;
   esac
 }
