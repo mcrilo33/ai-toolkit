@@ -773,6 +773,39 @@ _broker_is_git_worktree() {
   [ -d "$1" ] && git -C "$1" rev-parse --git-dir >/dev/null 2>&1
 }
 
+# _broker_snapshot_worktree <wt> <dest> -> populate <dest> with a throwaway COPY of <wt>'s
+# content so the reasoner can run there (cwd=<dest>) instead of the spoke's LIVE tree — real
+# write isolation (#237), the "verify agent worktree isolation" prior art: even a tool that
+# ignores the read-only allowlist writes into the copy, never the spoke's tree. rc 0 on a
+# populated copy, rc 1 when <wt> is not a git worktree (the caller then runs in-place and the
+# fingerprint void still guards). The copy carries ONLY the tracked + untracked-not-ignored
+# set (the SAME set _broker_worktree_fingerprint measures) plus the .git linkage, so a per-tick
+# copy never recurses the ignored heavy trees (.venv, .testmondata*, .ai-toolkit/ OTel dumps).
+# `cp -R` preserves the worktree's uncommitted + untracked state — fidelity `git worktree add`
+# (committed-HEAD only) can't give — so the reasoner's read git verbs still reflect real state.
+# UPGRADE: for a LINKED worktree `.git` is a gitfile still referencing the shared gitdir, so
+# the copied read-only git verbs read shared metadata; the write-isolation guarantee holds
+# regardless (the copy is a distinct directory and the reasoner has no commit/add/reset in its
+# allowlist). Point the copy at a private gitdir clone if a linked worktree ever needs fully
+# self-contained git in the reasoner.
+_broker_snapshot_worktree() {
+  local wt="$1" dest="$2" f
+  _broker_is_git_worktree "$wt" || return 1
+  # Copy the git linkage first (a full .git dir OR a linked-worktree gitfile) so read-only
+  # git verbs resolve, then the exact fingerprint set — never the ignored heavy trees.
+  [ -e "$wt/.git" ] && cp -R "$wt/.git" "$dest/.git" 2>/dev/null
+  (
+    cd "$wt" 2>/dev/null || exit 0
+    git ls-files -z --cached --others --exclude-standard 2>/dev/null |
+      while IFS= read -r -d '' f; do
+        [ -f "$f" ] || continue
+        mkdir -p "$dest/$(dirname "$f")" 2>/dev/null || true
+        cp -p "$f" "$dest/$f" 2>/dev/null || true
+      done
+  )
+  return 0
+}
+
 # read_decisions_digest <issue> -> a compact digest of THIS spoke's prior gate outcomes,
 # seeded into the reasoner for cross-gate consistency (NOT the old transcript, which
 # replayed the seed in #124). Reads the automatable-decisions log (subtask D's writer),
@@ -969,16 +1002,15 @@ _broker_run_bounded() {
 # detector needs both the message and the exit code. parse_decision is line-anchored, so
 # interleaved stderr noise never pollutes a decision.
 #
-# --no-session-persistence is REQUIRED, not cosmetic (#164): the reasoner runs with
-# cwd=<wt>, so a persisted session transcript would land in the SAME
-# ~/.claude/projects/<munged-wt>/ dir as the spoke's own transcript. `_spoke_jsonl` picks
-# the newest jsonl there, so the reasoner's transcript would shadow the spoke's — every
-# `_still_parked_same` check would see the transcript "move" and drop the answer as stale,
-# stranding the spoke. Disabling persistence kills the pollution at the source (the
-# reasoner writes no transcript at all) while keeping cwd=<wt> for read-only verification.
-# It does NOT touch CLAUDE_CONFIG_DIR, so keychain credentials/auth are unaffected. An
-# AFK_ANSWERER_CMD override that runs a persisting `claude` with cwd=<wt> reintroduces
-# #164, so any override must pass --no-session-persistence too.
+# --no-session-persistence stays belt-and-suspenders for #164. The original collision: the
+# reasoner ran with cwd=<wt>, so a persisted transcript landed in the SAME
+# ~/.claude/projects/<munged-wt>/ dir as the spoke's own, shadowing it — `_spoke_jsonl` picks
+# the newest jsonl there, so every `_still_parked_same` check saw the transcript "move" and
+# dropped the answer as stale, stranding the spoke. The #237 write-isolation snapshot already
+# removes that collision at the root: the reasoner's cwd is now a mktemp copy, so any persisted
+# transcript maps to the copy's OWN munged dir — disjoint from <wt>'s. We keep the flag anyway
+# so no throwaway transcript is written for the snapshot path at all. It does NOT touch
+# CLAUDE_CONFIG_DIR, so keychain credentials/auth are unaffected.
 # UPGRADE: if a deployed `claude` lacks --no-session-persistence it exits nonzero with no
 # decision, so the gate fails SAFE (escalates to blocked/<issue>) rather than stranding —
 # but auto-answering silently stops; drop the flag / switch to filtering the reasoner's
@@ -997,14 +1029,29 @@ run_answerer() {
   # fallback for when mktemp is unavailable (the foreground timeout/perl paths keep stdin).
   local pf rc; pf="$(mktemp 2>/dev/null)" || pf=""
   [ -n "$pf" ] && { printf '%s' "$prompt" > "$pf"; cmd="exec <'$pf'; $cmd"; }
+  # Write isolation (#237): run the reasoner against a throwaway COPY of the worktree, not the
+  # spoke's LIVE tree — so even a tool that ignores the read-only allowlist writes into the
+  # copy. The reasoner's cwd moves to the snapshot; broker_service_gate still fingerprints the
+  # real $wt, now a should-never-fire backstop. On any copy failure (no mktemp, non-git tree),
+  # fall back to running in-place: the fingerprint void remains the guard.
+  local snap="" run_dir="$wt"
+  if [ -n "$wt" ] && [ -d "$wt" ]; then
+    snap="$(mktemp -d 2>/dev/null)" || snap=""
+    if [ -n "$snap" ] && _broker_snapshot_worktree "$wt" "$snap"; then
+      run_dir="$snap"
+    elif [ -n "$snap" ]; then
+      rm -rf "$snap" 2>/dev/null || true; snap=""
+    fi
+  fi
   # _broker_run_bounded caps the reasoner (#171): a hung `claude` never freezes the tick.
   # stderr is folded in (2>&1) so the auth-failure detector still sees credential messages.
   (
-    [ -n "$wt" ] && [ -d "$wt" ] && cd "$wt"
+    [ -n "$run_dir" ] && [ -d "$run_dir" ] && cd "$run_dir"
     CLAUDE_EFFORT="$AFK_ANSWERER_EFFORT" _broker_run_bounded "$secs" bash -c "$cmd" <<<"$prompt" 2>&1
   )
   rc=$?
   [ -n "$pf" ] && rm -f "$pf"
+  [ -n "$snap" ] && rm -rf "$snap" 2>/dev/null || true
   return "$rc"
 }
 
