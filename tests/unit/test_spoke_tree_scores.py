@@ -14,6 +14,7 @@ from telemetry.spoke_tree.scores import (
     _step_phase_of,
     build_score_events,
     build_step_cost_scores,
+    build_step_duration_scores,
     build_step_total_cost_scores,
 )
 
@@ -138,3 +139,40 @@ class TestBuildStepTotalCostScores:
 
     def test_no_generations_no_scores(self) -> None:
         assert build_step_total_cost_scores(SPOKE, [self._green_step()], base_ts="t") == []
+
+
+class TestBuildStepDurationScores:
+    """#230: per-phase step latency as a numeric score from the cycle-step window length."""
+
+    def test_emits_window_length_in_ms_per_phase(self) -> None:
+        cycle_batch = [
+            {
+                "type": "span-create",
+                "body": {
+                    "id": "cycstep-green",
+                    "name": "step:GREEN x",
+                    "startTime": "2026-01-02T00:00:10Z",
+                    "endTime": "2026-01-02T00:00:25Z",
+                    "metadata": {"subject": "GREEN x"},
+                },
+            }
+        ]
+
+        events = build_step_duration_scores(SPOKE, cycle_batch, base_ts="t")
+
+        score = next(e for e in events if e["body"]["name"] == "step_duration_ms:GREEN")
+        assert score["body"]["value"] == 15000
+        assert score["body"]["observationId"] == "cycstep-green"
+
+    def test_non_step_nodes_are_ignored(self) -> None:
+        cycle_batch = [
+            {
+                "type": "generation-create",
+                "body": {
+                    "id": "gen",
+                    "startTime": "2026-01-02T00:00:10Z",
+                    "endTime": "2026-01-02T00:00:25Z",
+                },
+            }
+        ]
+        assert build_step_duration_scores(SPOKE, cycle_batch, base_ts="t") == []

@@ -39,6 +39,7 @@ from telemetry.langfuse_spoke_tree import (
     build_loaded_context_events,
     build_score_events,
     build_step_cost_scores,
+    build_step_duration_scores,
     build_step_total_cost_scores,
     cycle_copy_id_for,
     cycle_root_id_for,
@@ -2469,6 +2470,15 @@ class TestStepTotalCostScores:
         )
         # 0.10 (pre) + 3.00 (green) + 0.50 (push) == every generation's costDetails.
         assert total == pytest.approx(3.60)
+
+    def test_green_step_duration_score_is_the_window_length(self) -> None:
+        # GREEN spans green@10 -> review@25 = 15s, dashboardable as a numeric score.
+        cycle = build_cycle_batch(self._traces(), SPOKE, {})
+
+        scores = build_step_duration_scores(SPOKE, cycle, base_ts=self._BASE_TS)
+
+        by_name = {s["body"]["name"]: s["body"]["value"] for s in scores}
+        assert by_name["step_duration_ms:GREEN"] == 15000
 
 
 def _root_marker(obs_id: str, name: str, start: str) -> dict:
