@@ -1705,3 +1705,194 @@ def test_workspace_remove_invalid_json_leaves_file_and_signals_fallback(
     assert result.returncode == 1
     assert ws.read_text() == before, "an unparseable file must be left untouched"
     assert "workspace" in result.stderr, "the parse failure must be surfaced as a warning"
+
+
+# --- gh lifecycle-label mirror (issue #236) -----------------------------------
+# worktree-lib.sh grows a small, best-effort, time-bounded gh mirror layer so the
+# spoke lifecycle (dispatch / gate / ready / blocked / land) shows up on the
+# GitHub issue as status:*/mode:*/lane:* labels + a dispatch comment. Every write
+# is best-effort: a failed/absent/disabled gh never fails the caller. These tests
+# source the lib and drive the helpers under a logging `gh` stub, pinning the
+# exact `gh` argument vectors and the offline/disabled no-op contracts.
+
+_GH_STUB = "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_LOG\"\nexit \"${GH_RC:-0}\"\n"
+
+
+def _gh_lib_call(
+    tmp_path: Path,
+    expr: str,
+    *,
+    env_extra: dict[str, str] | None = None,
+    with_gh: bool = True,
+    with_timeout: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    """Source worktree-lib.sh and run `expr` with a logging `gh` (and optional
+    `timeout`) stub on PATH. Returns (proc, logged_gh_calls)."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    log = tmp_path / "gh-calls.log"
+    if with_gh:
+        gh = bindir / "gh"
+        gh.write_text(_GH_STUB)
+        gh.chmod(0o755)
+    if with_timeout:
+        # A `timeout` stub that records it wrapped the call, then execs the rest
+        # (dropping the duration arg) so the wrapped `gh` still runs and logs.
+        tstub = bindir / "timeout"
+        tstub.write_text(
+            "#!/bin/sh\n"
+            'printf "timeout %s\\n" "$1" >> "$GH_LOG"\n'
+            'shift\nexec "$@"\n'
+        )
+        tstub.chmod(0o755)
+    env = {**os.environ, "TZ": "UTC", "GH_LOG": str(log), "PATH": f"{bindir}:{os.environ['PATH']}"}
+    env.pop("AI_TOOLKIT_GH_LIFECYCLE_LABELS", None)
+    env.pop("GH_RC", None)
+    if env_extra:
+        env.update(env_extra)
+    proc = subprocess.run(
+        ["bash", "-c", f'source "{WT_LIB}"; {expr}'],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    calls = log.read_text().splitlines() if log.exists() else []
+    return proc, calls
+
+
+def _issue_edit(calls: list[str]) -> str:
+    """The single `gh issue edit` call the mirror emitted."""
+    edits = [c for c in calls if c.startswith("issue edit")]
+    assert len(edits) == 1, f"expected exactly one issue-edit call, got {edits}"
+    return edits[0]
+
+
+def test_gh_ensure_label_force_creates_idempotently(tmp_path: Path) -> None:
+    proc, calls = _gh_lib_call(
+        tmp_path, 'wt_gh_ensure_label "status:gate" "fbca04" "parked on a plan gate"'
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert calls == [
+        "label create status:gate --color fbca04 --description parked on a plan gate --force"
+    ]
+
+
+def test_gh_set_status_label_swaps_the_sibling_statuses(tmp_path: Path) -> None:
+    proc, calls = _gh_lib_call(tmp_path, "wt_gh_set_status_label 42 status:gate")
+
+    assert proc.returncode == 0, proc.stderr
+    edit = _issue_edit(calls)
+    assert edit.startswith("issue edit 42 ")
+    assert "--add-label status:gate" in edit
+    for sib in ("status:in-progress", "status:ready", "status:blocked"):
+        assert f"--remove-label {sib}" in edit
+    # It must NOT touch mode/lane — a gate transition leaves those intact.
+    assert "mode:" not in edit
+    assert "lane:" not in edit
+
+
+def test_gh_set_status_label_seeds_the_status_labels_first(tmp_path: Path) -> None:
+    # The remove of a sibling status label errors unless the label exists in the
+    # repo, which would fail the whole edit — so all status labels are ensured first.
+    _proc, calls = _gh_lib_call(tmp_path, "wt_gh_set_status_label 42 status:ready")
+
+    seeds = [c for c in calls if c.startswith("label create")]
+    seeded = {c.split()[2] for c in seeds}
+    assert {"status:in-progress", "status:gate", "status:ready", "status:blocked"} <= seeded
+
+
+def test_gh_apply_dispatch_labels_adds_status_mode_lane(tmp_path: Path) -> None:
+    proc, calls = _gh_lib_call(tmp_path, "wt_gh_apply_dispatch_labels 7 afk spoke")
+
+    assert proc.returncode == 0, proc.stderr
+    edit = _issue_edit(calls)
+    assert "--add-label status:in-progress" in edit
+    assert "--add-label mode:afk" in edit
+    assert "--add-label lane:spoke" in edit
+    # stale status siblings + the other mode are swapped out (issue-number reuse)
+    for sib in ("status:gate", "status:ready", "status:blocked"):
+        assert f"--remove-label {sib}" in edit
+    assert "--remove-label mode:attended" in edit
+
+
+def test_gh_apply_dispatch_labels_attended_mode(tmp_path: Path) -> None:
+    proc, calls = _gh_lib_call(tmp_path, "wt_gh_apply_dispatch_labels 7 attended spoke")
+
+    assert proc.returncode == 0, proc.stderr
+    edit = _issue_edit(calls)
+    assert "--add-label mode:attended" in edit
+    assert "--remove-label mode:afk" in edit
+
+
+def test_gh_clear_lifecycle_labels_removes_every_prefix(tmp_path: Path) -> None:
+    proc, calls = _gh_lib_call(tmp_path, "wt_gh_clear_lifecycle_labels 42")
+
+    assert proc.returncode == 0, proc.stderr
+    edit = _issue_edit(calls)
+    for lbl in (
+        "status:in-progress",
+        "status:gate",
+        "status:ready",
+        "status:blocked",
+        "mode:afk",
+        "mode:attended",
+        "lane:spoke",
+    ):
+        assert f"--remove-label {lbl}" in edit
+    assert "--add-label" not in edit
+
+
+def test_gh_dispatch_comment_posts_body(tmp_path: Path) -> None:
+    proc, calls = _gh_lib_call(
+        tmp_path, 'wt_gh_dispatch_comment 42 "dispatched: feature/42-x"'
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    comments = [c for c in calls if c.startswith("issue comment")]
+    assert len(comments) == 1
+    assert comments[0].startswith("issue comment 42 --body ")
+    assert "dispatched: feature/42-x" in comments[0]
+
+
+def test_gh_mirror_disabled_makes_no_calls(tmp_path: Path) -> None:
+    proc, calls = _gh_lib_call(
+        tmp_path,
+        "wt_gh_apply_dispatch_labels 7 afk spoke",
+        env_extra={"AI_TOOLKIT_GH_LIFECYCLE_LABELS": "0"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert calls == [], "the opt-out must make zero gh calls"
+
+
+def test_gh_mirror_survives_failing_gh(tmp_path: Path) -> None:
+    # Offline / unauthed gh (nonzero exit) must never fail the helper — best-effort.
+    proc, _calls = _gh_lib_call(
+        tmp_path, "wt_gh_apply_dispatch_labels 7 afk spoke; echo rc=$?", env_extra={"GH_RC": "1"}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "rc=0" in proc.stdout
+
+
+def test_gh_mirror_noop_when_gh_absent(tmp_path: Path) -> None:
+    # gh not on PATH at all: the helper returns 0 and execs nothing.
+    proc, _calls = _gh_lib_call(
+        tmp_path,
+        'export PATH=""; wt_gh_apply_dispatch_labels 7 afk spoke; echo rc=$?',
+        with_gh=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "rc=0" in proc.stdout
+
+
+def test_gh_mirror_bounds_calls_with_timeout_when_present(tmp_path: Path) -> None:
+    # When a `timeout` binary is available, every gh write is run under it.
+    proc, calls = _gh_lib_call(
+        tmp_path, "wt_gh_set_status_label 42 status:ready", with_timeout=True
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert any(c.startswith("timeout ") for c in calls), "gh must be wrapped in timeout"
