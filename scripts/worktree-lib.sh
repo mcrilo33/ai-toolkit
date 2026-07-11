@@ -935,3 +935,151 @@ wt_otel_watch_arm() {
   )
   echo "→ armed hub-otel-watch daemon (collector/bridge self-heal across sleep/wake)"
 }
+
+# --- GitHub lifecycle-label mirror (issue #236) -------------------------------
+# Mirror the local spoke lifecycle onto its GitHub issue as labels + a dispatch
+# comment, so the issue list shows what local state (worktree branches, git
+# gate/ready/blocked tags, .afk-state) otherwise hides: dispatched, parked on a
+# gate, ready, blocked, mode, lane. GitHub is a READ-ONLY mirror of the local
+# markers — every write here is BEST-EFFORT and TIME-BOUNDED, so a failed / hung /
+# absent / opted-out `gh` never fails a dispatch, a land, or a drain tick (the
+# offline-safe local markers stay the source of truth).
+#
+# Single-writer contract (issue #236): dispatch (worktree-new.sh) stamps
+# status:in-progress + mode:* + lane:spoke; the hub-ready-watch → hub-notify watch
+# loop flips status:* on gate/ready/blocked marker transitions; hub-afk stamps
+# status:blocked on a supervisor escalation; worktree-land clears them all at the
+# issue-close step. spoke-ready.sh deliberately writes NO labels — the hub mirrors.
+#
+# Only issue-backed spokes mirror: express/quick/micro lanes carry no issue by
+# construction, so callers gate the whole thing on a numeric issue id.
+
+# The label taxonomy, as single sources of truth. status:* is mutually exclusive
+# (a set swaps the sibling out); mode:*/lane:* ride alongside.
+WT_GH_STATUS_LABELS="status:in-progress status:gate status:ready status:blocked"
+WT_GH_MODE_LABELS="mode:afk mode:attended"
+WT_GH_LANE_LABELS="lane:spoke"
+
+# wt_gh_lifecycle_enabled — the mirror is ON by default; AI_TOOLKIT_GH_LIFECYCLE_LABELS=0
+# is a clean full opt-out (parallel to #223's opt-IN afk:* scheduling labels, which
+# convey a different thing). Any other value (incl. unset) stays on.
+wt_gh_lifecycle_enabled() { [ "${AI_TOOLKIT_GH_LIFECYCLE_LABELS:-1}" != "0" ]; }
+
+# _wt_gh_timeout_bin -> the installed coreutils timeout binary (timeout | gtimeout),
+# or empty when neither is present (the default macOS hub ships neither, so the mirror
+# then runs gh unbounded — the pre-existing dispatch/land gh calls already do).
+_wt_gh_timeout_bin() {
+  if command -v timeout >/dev/null 2>&1; then printf 'timeout\n'
+  elif command -v gtimeout >/dev/null 2>&1; then printf 'gtimeout\n'
+  fi
+}
+
+# wt_gh <gh args...> — one BEST-EFFORT, time-bounded gh invocation. A no-op (rc 0,
+# execs nothing) when the mirror is disabled or gh is absent; otherwise runs gh
+# under the coreutils timeout when available (AI_TOOLKIT_GH_TIMEOUT seconds, default
+# 10), else bare. ALWAYS returns 0 — a gh failure (offline, unauthed, a hung call
+# the timeout kills) must never abort a set -e caller mid-dispatch/land/tick.
+wt_gh() {
+  wt_gh_lifecycle_enabled || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  local tbin; tbin="$(_wt_gh_timeout_bin)"
+  if [ -n "$tbin" ]; then
+    "$tbin" "${AI_TOOLKIT_GH_TIMEOUT:-10}" gh "$@" >/dev/null 2>&1 || true
+  else
+    gh "$@" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# wt_gh_ensure_label <name> <color> <desc> — idempotently create/update a label
+# (`gh label create --force` updates an existing one rather than erroring), so a
+# later --add-label/--remove-label of it can never fail the whole edit for a
+# missing repo label. Best-effort.
+wt_gh_ensure_label() {
+  wt_gh label create "$1" --color "$2" --description "$3" --force
+}
+
+# _wt_gh_seed_status_labels — ensure the four status:* labels exist. Guarded per
+# process so a run that mirrors several transitions seeds once. status swaps
+# --remove-label a sibling, which errors (failing the edit) unless the label
+# exists in the repo — so seeding is the precondition for a clean swap.
+_WT_GH_STATUS_SEEDED=""
+_wt_gh_seed_status_labels() {
+  [ -n "$_WT_GH_STATUS_SEEDED" ] && return 0
+  wt_gh_ensure_label "status:in-progress" "1d76db" "spoke dispatched, working"
+  wt_gh_ensure_label "status:gate"        "fbca04" "parked on a plan gate"
+  wt_gh_ensure_label "status:ready"       "0e8a16" "final push, awaiting land"
+  wt_gh_ensure_label "status:blocked"     "b60205" "escalated, needs a human"
+  _WT_GH_STATUS_SEEDED=1
+}
+
+# _wt_gh_seed_lifecycle_labels — ensure ALL status:*/mode:*/lane:* labels exist,
+# so a dispatch add and a land clear never fail on a missing repo label. Guarded
+# per process. Extends the status seed with the mode/lane labels.
+_WT_GH_LIFECYCLE_SEEDED=""
+_wt_gh_seed_lifecycle_labels() {
+  [ -n "$_WT_GH_LIFECYCLE_SEEDED" ] && return 0
+  _wt_gh_seed_status_labels
+  wt_gh_ensure_label "mode:afk"      "5319e7" "unattended /afk drain spoke"
+  wt_gh_ensure_label "mode:attended" "c5def5" "attended (interactive) spoke"
+  wt_gh_ensure_label "lane:spoke"    "bfdadc" "issue-backed full-cycle spoke"
+  _WT_GH_LIFECYCLE_SEEDED=1
+}
+
+# wt_gh_set_status_label <issue> <status-label> — swap the issue's status:* label
+# to <status-label> (e.g. status:gate), removing the other three. mode:*/lane:*
+# are left intact (a gate/ready/blocked transition changes only the status). Used
+# by the hub-notify watch loop and hub-afk's blocked escalation.
+wt_gh_set_status_label() {
+  local issue="$1" want="$2" args=() s
+  wt_gh_lifecycle_enabled || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  _wt_gh_seed_status_labels
+  args+=(--add-label "$want")
+  for s in $WT_GH_STATUS_LABELS; do
+    [ "$s" = "$want" ] && continue
+    args+=(--remove-label "$s")
+  done
+  wt_gh issue edit "$issue" "${args[@]}"
+}
+
+# wt_gh_apply_dispatch_labels <issue> <mode> <lane> — stamp a freshly-dispatched
+# spoke: status:in-progress + mode:<mode> + lane:<lane>, swapping out any stale
+# status sibling or other-mode label a reused issue number carried. Best-effort.
+wt_gh_apply_dispatch_labels() {
+  local issue="$1" mode="$2" lane="$3" args=() s
+  wt_gh_lifecycle_enabled || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  _wt_gh_seed_lifecycle_labels
+  args+=(--add-label "status:in-progress" --add-label "mode:$mode" --add-label "lane:$lane")
+  for s in $WT_GH_STATUS_LABELS; do
+    [ "$s" = "status:in-progress" ] && continue
+    args+=(--remove-label "$s")
+  done
+  for s in $WT_GH_MODE_LABELS; do
+    [ "$s" = "mode:$mode" ] && continue
+    args+=(--remove-label "$s")
+  done
+  wt_gh issue edit "$issue" "${args[@]}"
+}
+
+# wt_gh_clear_lifecycle_labels <issue> — remove every status:*/mode:*/lane:* label
+# from the issue (a landed/torn-down spoke no longer has live state). The close
+# comment worktree-land writes is separate and unchanged. Best-effort.
+wt_gh_clear_lifecycle_labels() {
+  local issue="$1" args=() s
+  wt_gh_lifecycle_enabled || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  _wt_gh_seed_lifecycle_labels
+  for s in $WT_GH_STATUS_LABELS $WT_GH_MODE_LABELS $WT_GH_LANE_LABELS; do
+    args+=(--remove-label "$s")
+  done
+  wt_gh issue edit "$issue" "${args[@]}"
+}
+
+# wt_gh_dispatch_comment <issue> <body> — post the one-time dispatch comment
+# linking the issue to its live spoke (branch, worktree, tmux window, spoke_run_id).
+# Best-effort.
+wt_gh_dispatch_comment() {
+  wt_gh issue comment "$1" --body "$2"
+}
