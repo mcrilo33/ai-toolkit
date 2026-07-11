@@ -2475,6 +2475,60 @@ def test_reanswer_ceiling_resets_after_tip_advances(
     assert calls.read_text().count("x") == 2, "a tip advance must reset the ceiling"
 
 
+# ── issue #237: mutation-void is terminal on first occurrence + log-once ───────
+
+
+def test_broker_service_gate_mutation_void_is_terminal_on_first_occurrence(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # A reasoner that mutates the live tree (here via an absolute-path write, modelling an
+    # isolation bypass) has its answer voided and the gate escalated. That verdict is
+    # TERMINAL on the FIRST occurrence: a human is required regardless of tip/prompt, and the
+    # reasoner must NOT re-run on later ticks. This is asserted WITHOUT depending on tip/sig
+    # stability — the ceiling is set high (5), so only the durable void marker can cap the
+    # reasoner at a single run across four ticks.
+    calls = tmp_path / "answerer.calls"
+    (spoke_repo / "tracked.txt").write_text("original")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=spoke_repo, check=True, capture_output=True)
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": (
+            f"printf x >> '{calls}'; printf 'mutated' > '{spoke_repo}/tracked.txt'; "
+            "printf 'ANSWER: go ahead'"
+        ),
+        "AFK_REANSWER_CEILING": "5",
+    }
+
+    for _ in range(4):
+        result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+        assert result.returncode == 0, result.stderr
+
+    n = calls.read_text().count("x") if calls.exists() else 0
+    assert n == 1, f"a mutation-void must run the reasoner once, then stay terminal; ran {n}"
+    assert "--blocked 5" in Path(env["_READY_LOG"]).read_text()
+
+
+def test_reanswer_ceiling_logs_terminal_once(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # An already-terminal gate must log its "re-answer ceiling reached … terminal" line
+    # exactly once across re-drains — not on every event wake (the #237 doom-loop symptom).
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": "printf 'ESCALATE: legitimately stuck'",
+        "AFK_REANSWER_CEILING": "2",
+    }
+
+    logs = ""
+    for _ in range(5):
+        result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+        assert result.returncode == 0, result.stderr
+        logs += result.stderr
+
+    n = logs.count("re-answer ceiling reached")
+    assert n <= 1, f"a terminal gate must log the ceiling line at most once, got {n}"
+
+
 # ── issue #181: auto-approve read-only Read permissions inside the repo family ──
 # A spoke parks on a `Read` permission dialog for a legitimate, write-free research read —
 # reading a hub script/hook (#175 parked on Read(<hub>/.git/hooks/pre-push)) or a sibling
