@@ -13,7 +13,9 @@ and ``commits``.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+from pathlib import Path
 from typing import Any
 
 from telemetry.spoke_tree.commits import _gate_park_ms
@@ -43,6 +45,23 @@ _TOOL_RESULT_SIZE_SCORE = "tool_result_size"  # bytes of a tool node's reconstru
 # per-script success rate.
 _SCRIPT_SUCCESS_SCORE = "script_success"
 _STATUS_SUCCESS = "success"
+# Agent verdict (#233): the outcome of an agent that ran under the spoke, as a numeric score named
+# by the agent type. code-review reads the APPROVE/REJECT verdict from its signed ``.review``
+# artifact; a schema-returning sub-agent reads the ``status`` its structured return carried; a
+# reaper-killed sub-agent (an ``ERROR``-level container) scores the ``died`` sentinel. The three
+# values are ordered so a Scores-view average reads as an approval/health rate.
+_AGENT_VERDICT_SCORE = "agent_verdict"
+_VERDICT_APPROVE = 1.0  # APPROVE / a success-class sub-agent status
+_VERDICT_REJECT = 0.0  # REQUEST_CHANGES / a non-success sub-agent status
+_VERDICT_DIED = -1.0  # a reaper-killed (ERROR-level) sub-agent container — distinct from a reject
+_REVIEW_AGENT_TYPE = "code-review"
+_REVIEW_APPROVE_VERDICT = "APPROVE"
+_LEVEL_ERROR = "ERROR"  # the #157 failure level stamped on a failed/killed node
+# Sub-agent structured-return statuses that count as a success verdict (else a reject). A closed set
+# so a free-text status never mints an unexpected value; extend as new schema statuses appear.
+_AGENT_SUCCESS_STATUSES = frozenset(
+    {"success", "completed", "approved", "pass", "passed", "ok", "done"}
+)
 # Per-phase step cost/token scores (#158): the phase is the score-name suffix (a metrics
 # dimension), so "what does RED cost across all spokes" is a one-widget Scores query.
 _STEP_CACHE_WRITE_SCORE = (
@@ -109,9 +128,16 @@ def _score_event(
     trace_id: str,
     base_ts: str,
     observation_id: str | None = None,
+    id_target: str | None = None,
 ) -> IngestEvent:
-    """Shape one numeric ``score-create`` ingestion event (trace- or observation-level)."""
-    target = observation_id or "trace"
+    """Shape one numeric ``score-create`` ingestion event (trace- or observation-level).
+
+    ``id_target`` disambiguates the deterministic id for a TRACE-level score that repeats under one
+    name (e.g. one ``agent_verdict:code-review`` per ``.review`` artifact): the body stays
+    trace-level but the id keys off ``id_target`` so the copies get distinct ids and both survive
+    ingest instead of upserting onto one. Ignored when ``observation_id`` is given.
+    """
+    target = observation_id or id_target or "trace"
     score_id = _score_id(spoke_run_id, name, target)
     body: dict[str, Any] = {
         "id": score_id,
@@ -256,6 +282,109 @@ def build_script_success_scores(
             _score_event(
                 spoke_run_id,
                 name=f"{_SCRIPT_SUCCESS_SCORE}:{_script_name(body)}",
+                value=value,
+                trace_id=trace_id,
+                base_ts=base_ts,
+                observation_id=body["id"],
+            )
+        )
+    return events
+
+
+def _review_artifact_scores(
+    spoke_run_id: str, review_dir: Path, trace_id: str, base_ts: str
+) -> list[IngestEvent]:
+    """Build ``agent_verdict:code-review`` scores from the signed ``.review/*.json`` artifacts (#233).
+
+    Each artifact records one review's ``verdict`` (``APPROVE`` / ``REQUEST_CHANGES``); the score is
+    ``1.0`` for APPROVE else ``0.0``, so a Scores-view average over a spoke's reviews reads as its
+    approve rate. Trace-level (the artifact is not a span), but the id keys off the artifact stem
+    (the diff hash) via ``id_target`` so multiple reviews on one spoke keep distinct ids. A malformed
+    or verdict-less artifact is skipped rather than scored 0 — an unreadable file is not a rejection.
+    """
+    if not review_dir.is_dir():
+        return []
+    events: list[IngestEvent] = []
+    for artifact in sorted(review_dir.glob("*.json")):
+        try:
+            verdict = json.loads(artifact.read_text()).get("verdict")
+        except (OSError, ValueError):
+            continue
+        if not verdict:
+            continue
+        events.append(
+            _score_event(
+                spoke_run_id,
+                name=f"{_AGENT_VERDICT_SCORE}:{_REVIEW_AGENT_TYPE}",
+                value=_VERDICT_APPROVE if verdict == _REVIEW_APPROVE_VERDICT else _VERDICT_REJECT,
+                trace_id=trace_id,
+                base_ts=base_ts,
+                id_target=f"{_REVIEW_AGENT_TYPE}:{artifact.stem}",
+            )
+        )
+    return events
+
+
+def _sub_agent_verdict(body: dict[str, Any]) -> float | None:
+    """Return a sub-agent container's verdict value, or None when it carries no verdict signal (#233).
+
+    A reaper-killed container is stamped the #157 ``ERROR`` level, so it scores ``died``. Otherwise a
+    schema-returning agent whose grafted ``output`` is a mapping with a ``status`` key scores by that
+    status (:data:`_AGENT_SUCCESS_STATUSES`). A plain-text / status-less output carries no verdict
+    (a free-form agent's prose is not an outcome), so it is skipped.
+    """
+    if body.get("level") == _LEVEL_ERROR:
+        return _VERDICT_DIED
+    output = body.get("output")
+    if isinstance(output, dict) and "status" in output:
+        status = str(output["status"]).lower()
+        return _VERDICT_APPROVE if status in _AGENT_SUCCESS_STATUSES else _VERDICT_REJECT
+    return None
+
+
+def build_agent_verdict_scores(
+    spoke_run_id: str, batch: list[IngestEvent], review_dir: Path, *, base_ts: str
+) -> list[IngestEvent]:
+    """Build per-agent ``agent_verdict:<type>`` scores from reviews and sub-agent outcomes (#233).
+
+    Two sources feed one score family named by the agent type:
+
+    - **code-review** — the signed ``.review/*.json`` artifacts under ``review_dir``, each an APPROVE
+      / REQUEST_CHANGES verdict (:func:`_review_artifact_scores`). Trace-level, one per artifact.
+    - **schema / killed sub-agents** — every ``sub-agent:<type>`` container in the assembled batch
+      (excluding the ``sub-agent:llm`` calls, which are the sub-agent's own LLM turns, not an agent)
+      scores its :func:`_sub_agent_verdict`: ``died`` for an ERROR-level (reaper-killed) container, a
+      success/reject verdict from a structured ``status`` return, or nothing when it carried no
+      verdict signal. Observation-scoped to the container.
+
+    All ids derive from the spoke run id so a rerun overwrites the same scores.
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids).
+        batch: The assembled View A events (its ``sub-agent:`` containers are read).
+        review_dir: The worktree's ``.review`` directory (its ``*.json`` artifacts are read).
+        base_ts: ISO timestamp stamped on every score event.
+
+    Returns:
+        The ``score-create`` events (empty when no review ran and no sub-agent carried a verdict).
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    events = _review_artifact_scores(spoke_run_id, review_dir, trace_id, base_ts)
+    for event in batch:
+        body = event["body"]
+        name = body.get("name") or ""
+        if not name.startswith(_SUB_AGENT_PREFIX):
+            continue
+        agent_type = name[len(_SUB_AGENT_PREFIX) :]
+        if agent_type == "llm":
+            continue
+        value = _sub_agent_verdict(body)
+        if value is None:
+            continue
+        events.append(
+            _score_event(
+                spoke_run_id,
+                name=f"{_AGENT_VERDICT_SCORE}:{agent_type}",
                 value=value,
                 trace_id=trace_id,
                 base_ts=base_ts,
