@@ -46,17 +46,19 @@ WT_T0="$(wt_now_ms)"
 # --- args --------------------------------------------------------------------
 TARGET=""
 SPAWN_TERMINAL=1
+FORCE=0
 for arg in "$@"; do
   case "$arg" in
     --no-terminal) SPAWN_TERMINAL=0 ;;
-    -*)            wt_die "unknown option: $arg (supported: --no-terminal)" ;;
+    --force)       FORCE=1 ;;
+    -*)            wt_die "unknown option: $arg (supported: --no-terminal, --force)" ;;
     *)
       [ -z "$TARGET" ] || wt_die "unexpected extra argument: $arg"
       TARGET="$arg"
       ;;
   esac
 done
-[ -n "$TARGET" ] || wt_die "usage: spoke-relaunch.sh <issue|slug|branch|path> [--no-terminal]"
+[ -n "$TARGET" ] || wt_die "usage: spoke-relaunch.sh <issue|slug|branch|path> [--no-terminal] [--force]"
 
 # --- resolve the existing worktree -------------------------------------------
 REPO_ROOT="$(wt_main_root)" || wt_die "could not locate the main worktree"
@@ -75,13 +77,22 @@ SPOKE_RUN_ID="$(cat "$SPOKE_RUN_ID_FILE")"
 echo "→ worktree            $WT_DIR"
 echo "→ spoke_run_id        $SPOKE_RUN_ID (reused)"
 
-# Branch + issue for the window name and seed prompt. `--abbrev-ref` on a detached
-# worktree prints "HEAD"; the leading-number slug parse then yields "HEAD", which
-# only affects the seed-prompt text, not the reused identity.
+# The spoke role tag (WT_SPOKE) is the ORIGINAL tag worktree-new.sh minted the
+# worktree with: it names the dir as `<repo>-<tag>`, so stripping that prefix round-
+# trips the exact tag (an issue number, or an ad-hoc slug) — robust even on a
+# detached HEAD, where `--abbrev-ref` would yield the literal "HEAD" and mis-tag the
+# spoke's gate/push markers (spoke-push #HEAD). The branch is read only for the tmux
+# window name and the seed prompt's issue reference.
+WT_TAG="$(basename "$WT_DIR")"
+WT_TAG="${WT_TAG#"$(basename "$REPO_ROOT")-"}"
 BRANCH="$(git -C "$WT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
 SLUG="${BRANCH##*/}"
 ISSUE="${SLUG%%-*}"
-WT_TAG="$ISSUE"
+# On a detached HEAD (ISSUE == "HEAD") or any non-numeric slug, fall back to the tag
+# so /source-task and the prompt reference the real issue, not the literal "HEAD".
+case "$ISSUE" in
+  '' | *[!0-9]*) ISSUE="$WT_TAG" ;;
+esac
 
 # --- ledger skeleton: reuse the persisted one (issue #235 seeder) ------------
 # The #235 skeleton was written at spawn and survives a pane crash, so the ledger
@@ -100,34 +111,26 @@ TASK_MD="$WT_DIR/.ai-toolkit/task.md"
 if [ -f "$TASK_MD" ]; then
   PROMPT="Your spoke pane was relaunched (issue #${ISSUE}); the worktree, branch and spoke_run_id are intact. Read your task contract at .ai-toolkit/task.md and re-seed your task ledger from .ai-toolkit/ledger-skeleton.md (one entry per subtask x ANCHOR/RED/GREEN/REVIEW/PUSH). Check git log and your pushed branch to see which subtasks already landed, then resume the solo-cycle from the first unfinished step. Honor the task's Gate: line. If task.md is missing or the issue changed, run /source-task ${ISSUE} to re-anchor."
 else
-  PROMPT="Your spoke pane was relaunched. Run /source-task ${TARGET} to re-anchor from the live issue, then resume the solo-cycle."
+  PROMPT="Your spoke pane was relaunched. Run /source-task ${ISSUE} to re-anchor from the live issue, then resume the solo-cycle."
 fi
 
-# --- pin model/effort from config (issue #142), matching worktree-new --------
+# --- pin model/effort via the shared helper (issue #142/#233) ----------------
+# Same resolution as worktree-new.sh so a relaunched spoke never runs on a
+# different/stale model than a freshly-spawned one for the same issue.
 WT_CONFIG="${AI_TOOLKIT_CONFIG:-$REPO_ROOT/settings/ai-toolkit.yml}"
-if [ -f "$SCRIPT_DIR/spoke-model.env" ]; then
-  # shellcheck disable=SC1091
-  . "$SCRIPT_DIR/spoke-model.env"
-elif [ -f "$SCRIPT_DIR/ai_toolkit_config.py" ] && [ -f "$WT_CONFIG" ]; then
-  eval "$(python3 "$SCRIPT_DIR/ai_toolkit_config.py" spoke-env "$WT_CONFIG" 2>/dev/null || true)"
-fi
-WT_AGENT_MODEL="${WT_AGENT_MODEL:-${WT_AGENT_MODEL_DEFAULT:-claude-opus-4-8[1m]}}"
-WT_AGENT_EFFORT="${WT_AGENT_EFFORT:-${WT_AGENT_EFFORT_DEFAULT:-max}}"
+wt_resolve_agent_model "$SCRIPT_DIR" "$WT_CONFIG"
 
 # --- native-OTel launch prefix (shared with worktree-new via worktree-lib) ---
 # Reuses the SAME spoke_run_id so the relaunched pane streams into the existing
-# Langfuse session rather than starting a new trace. The endpoint `:=` defaults
-# stay in this shell for the bridge/collector preflights below (the helper runs in
-# a subshell). AI_TOOLKIT_OTEL=0 is a clean full opt-out.
+# Langfuse session rather than starting a new trace. wt_native_otel_prefix builds the
+# whole prefix, including the endpoint defaulting — no preflight below reads those
+# endpoint vars, so nothing needs them set in this shell. AI_TOOLKIT_OTEL=0 opts out.
 wt_resolve_telemetry_config "$WT_CONFIG"
 AI_TOOLKIT_OTEL="${AI_TOOLKIT_OTEL:-${AI_TOOLKIT_OTEL_DEFAULT:-1}}"
 OTEL_PREFIX=""
 if [ "${AI_TOOLKIT_OTEL:-}" = "1" ]; then
   OTEL_BODY_DIR="$WT_DIR/.ai-toolkit/raw-bodies"
   mkdir -p "$OTEL_BODY_DIR"
-  : "${OTEL_EXPORTER_OTLP_ENDPOINT:=http://localhost:4317}"
-  : "${BETA_TRACING_ENDPOINT:=http://localhost:4418}"
-  : "${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:=${AI_TOOLKIT_OTEL_SPAN_ENDPOINT_DEFAULT:-http://localhost:4318}}"
   OTEL_PREFIX="$(wt_native_otel_prefix "$SPOKE_RUN_ID" "$OTEL_BODY_DIR")"
 fi
 
@@ -145,19 +148,32 @@ if [ "$SPAWN_TERMINAL" -eq 1 ]; then
   if command -v tmux >/dev/null 2>&1; then
     win_name="${BRANCH##*/}"
     sess="$(wt_tmux_session "$REPO_ROOT")"
+    # Double-launch guard: relaunch is for a DEAD pane. If a window for this branch is
+    # still present in the session the pane is likely alive — a second claude on the same
+    # branch + reused spoke_run_id would race the ref (concurrent commits/pushes, the
+    # tripwire-corruption class this repo warns about). Refuse unless --force. `list-windows`
+    # on a missing session is a no-op (no match), so a first-ever relaunch is unaffected.
+    if [ "$FORCE" -eq 0 ] \
+       && tmux list-windows -t "=$sess" -F '#{window_name}' 2>/dev/null | grep -qxF "$win_name"; then
+      wt_die "a tmux window '$win_name' already exists in session '$sess' — the pane may be live. Close it first, or pass --force to relaunch anyway."
+    fi
     if tmux has-session -t "=$sess" 2>/dev/null || tmux new-session -d -s "$sess" -c "$REPO_ROOT" 2>/dev/null; then
-      # `exec $SHELL` keeps the window alive after claude exits (matches worktree-new).
-      win="$(tmux new-window -t "=$sess:" -P -F '#{window_id}' -n "$win_name" -c "$WT_DIR" \
-             "$AGENT_CMD; exec ${SHELL:-zsh}")"
-      tmux set-window-option -t "$win" automatic-rename off
-      tmux set-window-option -t "$win" allow-rename off
-      echo "→ relaunched tmux window '$win_name' ($win) in session $sess"
-      if [ -n "${TMUX:-}" ]; then
-        echo "  tmux switch-client -t '${sess}:${win_name}'"
-      else
-        echo "  tmux attach -t '${sess}' \\; select-window -t '${sess}:${win_name}'"
+      # `exec $SHELL` keeps the window alive after claude exits (matches worktree-new). Guard
+      # the command substitution: under `set -e` a bare `win=$(...)` that fails (a tmux hiccup,
+      # or the session killed between has-session and new-window) would abort the whole script
+      # BEFORE the manual-launch fallback — so branch on it and let a failure fall through.
+      if win="$(tmux new-window -t "=$sess:" -P -F '#{window_id}' -n "$win_name" -c "$WT_DIR" \
+                "$AGENT_CMD; exec ${SHELL:-zsh}")"; then
+        tmux set-window-option -t "$win" automatic-rename off
+        tmux set-window-option -t "$win" allow-rename off
+        echo "→ relaunched tmux window '$win_name' ($win) in session $sess"
+        if [ -n "${TMUX:-}" ]; then
+          echo "  tmux switch-client -t '${sess}:${win_name}'"
+        else
+          echo "  tmux attach -t '${sess}' \\; select-window -t '${sess}:${win_name}'"
+        fi
+        SPAWNED=1
       fi
-      SPAWNED=1
     fi
   fi
   if [ "$SPAWNED" -eq 0 ]; then

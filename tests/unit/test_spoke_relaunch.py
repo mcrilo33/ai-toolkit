@@ -71,9 +71,12 @@ def _run(
     log = tmp_path / "tmux-calls.log"
     log.touch()
     tmux = bindir / "tmux"
+    # `list-windows` echoes $STUB_WINDOWS (one name per line) so a test can model a
+    # still-live window; `new-window` answers a fake id. Everything else is a no-op.
     tmux.write_text(
         "#!/bin/sh\n"
         f'printf "%s\\n" "$*" >> "{log}"\n'
+        'if [ "$1" = "list-windows" ]; then printf "%s" "${STUB_WINDOWS:-}"; fi\n'
         'if [ "$1" = "new-window" ]; then printf "@1\\n"; fi\n'
         "exit 0\n"
     )
@@ -119,6 +122,46 @@ def test_opens_a_tmux_window_named_for_the_branch_leaf(spoke_worktree, tmp_path:
     assert proc.returncode == 0, proc.stderr
     new_window = next((ln for ln in calls.splitlines() if ln.startswith("new-window")), "")
     assert "-n 42-relaunch-me" in new_window  # the branch leaf (feature/ stripped)
+
+
+def test_refuses_when_a_window_for_the_branch_is_still_live(spoke_worktree, tmp_path: Path) -> None:
+    main, _wt = spoke_worktree
+
+    proc, _calls = _run(
+        main, "42", tmp_path=tmp_path, extra_env={"STUB_WINDOWS": "42-relaunch-me\nother\n"}
+    )
+
+    assert proc.returncode != 0
+    assert "may be live" in proc.stderr
+
+
+def test_force_overrides_the_double_launch_guard(spoke_worktree, tmp_path: Path) -> None:
+    main, _wt = spoke_worktree
+
+    proc, calls = _run(
+        main, "42", "--force", tmp_path=tmp_path, extra_env={"STUB_WINDOWS": "42-relaunch-me\n"}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert any(ln.startswith("new-window") for ln in calls.splitlines())
+
+
+def test_detached_head_tags_from_the_worktree_dir_not_literal_head(
+    spoke_worktree, tmp_path: Path
+) -> None:
+    main, wt = spoke_worktree
+    # Detach HEAD so `git rev-parse --abbrev-ref HEAD` yields the literal "HEAD".
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(wt), capture_output=True, text=True, env=_GIT_ENV
+    ).stdout.strip()
+    subprocess.run(["git", "checkout", "-q", head], cwd=str(wt), check=True, env=_GIT_ENV)
+
+    proc, _calls = _run(main, str(wt), "--no-terminal", tmp_path=tmp_path)
+
+    assert proc.returncode == 0, proc.stderr
+    # WT_SPOKE must be the dir tag (42), never the literal HEAD (which would mis-tag markers).
+    assert "WT_SPOKE=42" in proc.stdout
+    assert "WT_SPOKE=HEAD" not in proc.stdout
 
 
 def test_refuses_a_worktree_without_a_spoke_run_id(spoke_worktree, tmp_path: Path) -> None:

@@ -507,41 +507,19 @@ OTEL_PREFIX=""
 if [ "${AI_TOOLKIT_OTEL:-}" = "1" ]; then
   OTEL_BODY_DIR="$WT_DIR/.ai-toolkit/raw-bodies"
   mkdir -p "$OTEL_BODY_DIR"
-  # Default the non-secret connection endpoints to the local collector when the
-  # operator left them unset; an explicit override is preserved (`:=` only assigns
-  # when empty). The split is load-bearing — normal gRPC :4317, beta HTTP :4418 —
-  # since a beta endpoint sharing the normal host:port silently kills trace+log export.
-  : "${OTEL_EXPORTER_OTLP_ENDPOINT:=http://localhost:4317}"
-  : "${BETA_TRACING_ENDPOINT:=http://localhost:4418}"
-  # Workflow-span sink (#126): telemetry.sh's cycle step:/script/hook spans POST
-  # OTLP HTTP-JSON to $AI_TOOLKIT_OTEL_SPAN_ENDPOINT/v1/traces, so this one targets
-  # the collector's OTLP-HTTP listener (:4318), not the gRPC :4317 above.
-  : "${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:=${AI_TOOLKIT_OTEL_SPAN_ENDPOINT_DEFAULT:-http://localhost:4318}}"
-  # The prefix string is built by wt_native_otel_prefix (worktree-lib.sh) — the SINGLE
-  # source shared with spoke-relaunch.sh (#233) so the spawn and relaunch launches never
-  # drift. The endpoint `:=` defaults above stay HERE too: they set this shell's env for
-  # the bridge/collector preflights below (the helper runs in a command-substitution
-  # subshell, so its own defaulting cannot leak back).
+  # The whole prefix — including the non-secret endpoint defaulting (normal gRPC :4317,
+  # beta HTTP :4418, span sink :4318) — is built by wt_native_otel_prefix (worktree-lib.sh),
+  # the SINGLE source shared with spoke-relaunch.sh (#233) so spawn and relaunch never drift.
+  # No preflight below reads the endpoint vars, so nothing needs them defaulted in this shell.
   OTEL_PREFIX="$(wt_native_otel_prefix "$SPOKE_RUN_ID" "$OTEL_BODY_DIR")"
 fi
 
-# Resolve the spoke driver's default model/effort from the declarative config
-# (issue #142), layered so it works both in a synced target AND in the hub:
-#   1. the sync-emitted spoke-model.env co-located with this script, else
-#   2. the hub's settings/ai-toolkit.yml via the config parser, else
-#   3. the historical literal defaults.
-# An explicit WT_AGENT_MODEL / WT_AGENT_EFFORT (env, or the Model: line above)
-# always wins — the defaults only fill an unset value below.
+# Resolve the spoke driver's default model/effort via the shared helper (issue #142,
+# #233): sync-emitted spoke-model.env -> hub config -> literal defaults. An explicit
+# WT_AGENT_MODEL / WT_AGENT_EFFORT (env, or the Model: line above) always wins.
 # The hub-side config path honors AI_TOOLKIT_CONFIG like sync-to-repo.sh does.
 WT_CONFIG="${AI_TOOLKIT_CONFIG:-$REPO_ROOT/settings/ai-toolkit.yml}"
-if [ -f "$SCRIPT_DIR/spoke-model.env" ]; then
-  # shellcheck disable=SC1091
-  . "$SCRIPT_DIR/spoke-model.env"
-elif [ -f "$SCRIPT_DIR/ai_toolkit_config.py" ] && [ -f "$WT_CONFIG" ]; then
-  eval "$(python3 "$SCRIPT_DIR/ai_toolkit_config.py" spoke-env "$WT_CONFIG" 2>/dev/null || true)"
-fi
-WT_AGENT_MODEL="${WT_AGENT_MODEL:-${WT_AGENT_MODEL_DEFAULT:-claude-opus-4-8[1m]}}"
-WT_AGENT_EFFORT="${WT_AGENT_EFFORT:-${WT_AGENT_EFFORT_DEFAULT:-max}}"
+wt_resolve_agent_model "$SCRIPT_DIR" "$WT_CONFIG"
 
 # Default seed prompt (issue #177): with no caller-supplied --prompt, seed the
 # spoke to READ its on-disk task contract instead of anchoring via an LLM

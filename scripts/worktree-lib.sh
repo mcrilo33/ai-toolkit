@@ -119,6 +119,29 @@ wt_native_otel_prefix() {
     "$(printf '%q' "spoke_run_id=${spoke_run_id}")"
 }
 
+# Resolve the spoke driver's default model + effort (issue #142), layered so it works
+# both in a synced target AND in the hub:
+#   1. the sync-emitted spoke-model.env co-located with the caller script, else
+#   2. the hub's config via ai_toolkit_config.py's `spoke-env` seam, else
+#   3. the historical literal defaults.
+# Sets WT_AGENT_MODEL / WT_AGENT_EFFORT in the CALLER'S shell (it is sourced, not run in
+# a subshell), so an explicit env / `Model:` override the caller already exported always
+# wins — the layers only fill an unset value. SINGLE source shared by worktree-new.sh
+# (spawn) and spoke-relaunch.sh (relaunch) so a relaunched spoke never runs on a
+# different/stale model than a freshly-spawned one for the same issue.
+# Usage: wt_resolve_agent_model <script_dir> <config_path>
+wt_resolve_agent_model() {
+  local script_dir="$1" config="$2"
+  if [ -f "$script_dir/spoke-model.env" ]; then
+    # shellcheck disable=SC1091
+    . "$script_dir/spoke-model.env"
+  elif [ -f "$script_dir/ai_toolkit_config.py" ] && [ -f "$config" ]; then
+    eval "$(python3 "$script_dir/ai_toolkit_config.py" spoke-env "$config" 2>/dev/null || true)"
+  fi
+  WT_AGENT_MODEL="${WT_AGENT_MODEL:-${WT_AGENT_MODEL_DEFAULT:-claude-opus-4-8[1m]}}"
+  WT_AGENT_EFFORT="${WT_AGENT_EFFORT:-${WT_AGENT_EFFORT_DEFAULT:-max}}"
+}
+
 # --- client-side telemetry config resolution (issue #228) -----------------------
 # wt_resolve_telemetry_config [config-path] -> read the NON-SECRET client-side
 # telemetry settings from settings/ai-toolkit.yml (via ai_toolkit_config.py's
