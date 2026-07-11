@@ -72,12 +72,19 @@ class TestBuildScriptSuccessScores:
 
         assert events[0]["body"]["value"] == 0.0
 
-    def test_phased_script_name_strips_the_kind_prefix(self) -> None:
+    def test_gate_park_span_is_excluded(self) -> None:
+        # script:gate is a PLAN-gate human-WAIT node with an always-success status, not a real
+        # control script — scoring it would add a bogus 100%-successful "gate" series.
         batch = [self._script("g", "script:gate", "success", phase="gate")]
+
+        assert build_script_success_scores(SPOKE, batch, base_ts="t") == []
+
+    def test_phased_non_gate_script_name_strips_the_kind_prefix(self) -> None:
+        batch = [self._script("s", "script:teardown", "success", phase="teardown")]
 
         events = build_script_success_scores(SPOKE, batch, base_ts="t")
 
-        assert events[0]["body"]["name"] == "script_success:gate"
+        assert events[0]["body"]["name"] == "script_success:teardown"
 
     def test_non_script_nodes_are_ignored(self) -> None:
         batch = [{"body": {"id": "t1", "name": "tool:Bash", "metadata": {}}}]

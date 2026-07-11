@@ -28,7 +28,9 @@ from telemetry.spoke_tree.observations import (
     IngestEvent,
     TraceObservations,
     _attr,
+    _is_gate_observation,
     _is_hook_event,
+    _is_script_node,
     _llm_requests_in_order,
     _parse_utc,
 )
@@ -226,17 +228,6 @@ def build_score_events(
     return events
 
 
-def _is_script_node(body: dict[str, Any]) -> bool:
-    """Whether an assembled node is a control-script run node (#233).
-
-    Matched the way :func:`~telemetry.spoke_tree.rollups._duration_class` classifies scripts: the
-    ``script:<phase>`` name label OR, robustly, the ``workflow.kind == "script"`` span attribute
-    (a phase-less script span keeps its raw name, so the attribute is the reliable signal).
-    """
-    name = body.get("name") or ""
-    return name.startswith("script:") or _attr(body, "workflow.kind") == "script"
-
-
 def _script_name(body: dict[str, Any]) -> str:
     """Return a script node's identity for the score-name suffix (#233).
 
@@ -255,13 +246,22 @@ def build_script_success_scores(
 ) -> list[IngestEvent]:
     """Build per-script ``script_success:<name>`` 0/1 scores from each script span's status (#233).
 
-    A control-script span (``worktree-new``, ``spoke-push``, ``spoke-ready``, ``script:gate``, …)
-    carries a ``status`` attribute already (``success`` / ``failure`` / …), but Langfuse can chart
-    numeric SCORES, not arbitrary span attributes. Each script node therefore ALSO emits an
+    A control-script span (``worktree-new``, ``spoke-push``, ``spoke-ready``, …) carries a
+    ``status`` attribute already (``success`` / ``failure`` / …), but Langfuse can chart numeric
+    SCORES, not arbitrary span attributes. Each real script node therefore ALSO emits an
     observation-scoped NUMERIC score named by the script whose value is ``1.0`` when the status is
     ``success`` and ``0.0`` otherwise — so "failure rate by script" is a one-widget Scores query and
     a script run twice keeps both scores (the view's average is the per-script success rate). Ids
     derive from the spoke run id + observation (idempotent reruns).
+
+    The PLAN-gate park span is a ``script:gate`` node too but is a human-WAIT node (``_duration_class``
+    buckets it as ``wait``, not ``script``) whose status is always ``success`` — scoring it would add
+    a bogus 100%-successful ``gate`` series — so it is excluded via :func:`_is_gate_observation`.
+
+    UPGRADE: the ``0.0`` (failure) branch is currently latent — every emit site passes a literal
+    ``success`` and a failing script exits before reaching its emit line (see the ``spoke-push.sh``
+    "emit a status=failure span" UPGRADE), so the widget reads a constant 100% until the emit layer
+    stamps failure spans. The scoring side is ready for it — no change needed here when it lands.
 
     Args:
         spoke_run_id: The spoke run identifier (keys the deterministic score ids).
@@ -269,13 +269,13 @@ def build_script_success_scores(
         base_ts: ISO timestamp stamped on every score event.
 
     Returns:
-        The ``score-create`` events, one per script node (empty when no script ran).
+        The ``score-create`` events, one per real (non-gate) script node (empty when none ran).
     """
     trace_id = trace_id_for(spoke_run_id)
     events: list[IngestEvent] = []
     for event in batch:
         body = event["body"]
-        if not _is_script_node(body):
+        if not _is_script_node(body) or _is_gate_observation(body):
             continue
         value = 1.0 if _attr(body, "status") == _STATUS_SUCCESS else 0.0
         events.append(

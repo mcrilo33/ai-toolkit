@@ -28,10 +28,10 @@ from telemetry.spoke_tree.observations import (
     _SUB_AGENT_PREFIX,
     _WAIT_PREFIX,
     IngestEvent,
-    _attr,
     _is_gate_observation,
     _is_guards_group,
     _is_hook,
+    _is_script_node,
     _is_tool_span,
     _parse_utc,
 )
@@ -77,7 +77,7 @@ def _duration_class(event: IngestEvent) -> str:
         return "step"
     if name == _INTERACTION_NAME:
         return "turn"
-    if name.startswith("script:") or _attr(body, "workflow.kind") == "script":
+    if _is_script_node(body):
         return "script"
     if _is_guards_group(body) or _is_hook(body):
         return "hook"

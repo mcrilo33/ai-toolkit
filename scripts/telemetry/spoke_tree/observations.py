@@ -323,6 +323,20 @@ def _is_gate_observation(observation: Observation) -> bool:
     )
 
 
+def _is_script_node(observation: Observation) -> bool:
+    """Whether a node is a control-script run node — a ``script:`` label or ``workflow.kind==script``.
+
+    The phased script spans keep a ``script:<phase>`` name; a phase-less one keeps its raw name, so
+    the ``workflow.kind`` attribute is the reliable signal. Single-sourced here so the duration
+    rollup's ``script`` bucket (:func:`~telemetry.spoke_tree.rollups._duration_class`) and the #233
+    ``script_success`` scores classify scripts identically. NOTE: the PLAN-gate park span is ALSO a
+    ``script:gate`` node, so a caller that means "real control script" must exclude
+    :func:`_is_gate_observation` first (as ``_duration_class`` does — it buckets the gate as ``wait``).
+    """
+    name = observation.get("name") or ""
+    return name.startswith("script:") or _attr(observation, "workflow.kind") == "script"
+
+
 def _parse_ts(value: str) -> datetime | None:
     """Parse an ISO timestamp to a datetime, or None when malformed."""
     try:
