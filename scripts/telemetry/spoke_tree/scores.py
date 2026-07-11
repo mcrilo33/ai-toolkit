@@ -37,6 +37,12 @@ _SCORE_PREFIX = "tree-score-"
 _PERMISSION_WAIT_SCORE = "permission_wait_ms"  # per blocked tool observation
 _GATE_PARK_SCORE = "gate_park_ms"  # trace-level PLAN-gate park wait
 _TOOL_RESULT_SIZE_SCORE = "tool_result_size"  # bytes of a tool node's reconstructed tool_result
+# Control-script success (#233): mirror each ``script:<name>`` span's ``status`` attribute into a
+# ``script_success:<name>`` 0/1 score so "failure rate by script" is a one-widget Scores query.
+# Observation-scoped, so a spoke that ran a script twice keeps both and the view's average IS the
+# per-script success rate.
+_SCRIPT_SUCCESS_SCORE = "script_success"
+_STATUS_SUCCESS = "success"
 # Per-phase step cost/token scores (#158): the phase is the score-name suffix (a metrics
 # dimension), so "what does RED cost across all spokes" is a one-widget Scores query.
 _STEP_CACHE_WRITE_SCORE = (
@@ -189,6 +195,71 @@ def build_score_events(
                 value=park,
                 trace_id=trace_id,
                 base_ts=base_ts,
+            )
+        )
+    return events
+
+
+def _is_script_node(body: dict[str, Any]) -> bool:
+    """Whether an assembled node is a control-script run node (#233).
+
+    Matched the way :func:`~telemetry.spoke_tree.rollups._duration_class` classifies scripts: the
+    ``script:<phase>`` name label OR, robustly, the ``workflow.kind == "script"`` span attribute
+    (a phase-less script span keeps its raw name, so the attribute is the reliable signal).
+    """
+    name = body.get("name") or ""
+    return name.startswith("script:") or _attr(body, "workflow.kind") == "script"
+
+
+def _script_name(body: dict[str, Any]) -> str:
+    """Return a script node's identity for the score-name suffix (#233).
+
+    A phased script span is named ``<kind>:<phase>`` (e.g. ``script:gate``), so the ``script:``
+    prefix is stripped to the phase; a phase-less span's whole name IS the script's identity
+    (``spoke-push``, ``worktree-new``). Never free text — it is a control-script constant the emit
+    layer passed as ``--name`` / ``--phase``.
+    """
+    name = body.get("name") or ""
+    prefix = "script:"
+    return name[len(prefix) :] if name.startswith(prefix) else name
+
+
+def build_script_success_scores(
+    spoke_run_id: str, batch: list[IngestEvent], *, base_ts: str
+) -> list[IngestEvent]:
+    """Build per-script ``script_success:<name>`` 0/1 scores from each script span's status (#233).
+
+    A control-script span (``worktree-new``, ``spoke-push``, ``spoke-ready``, ``script:gate``, …)
+    carries a ``status`` attribute already (``success`` / ``failure`` / …), but Langfuse can chart
+    numeric SCORES, not arbitrary span attributes. Each script node therefore ALSO emits an
+    observation-scoped NUMERIC score named by the script whose value is ``1.0`` when the status is
+    ``success`` and ``0.0`` otherwise — so "failure rate by script" is a one-widget Scores query and
+    a script run twice keeps both scores (the view's average is the per-script success rate). Ids
+    derive from the spoke run id + observation (idempotent reruns).
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids).
+        batch: The assembled View A events (its ``script:`` / ``workflow.kind==script`` nodes read).
+        base_ts: ISO timestamp stamped on every score event.
+
+    Returns:
+        The ``score-create`` events, one per script node (empty when no script ran).
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    events: list[IngestEvent] = []
+    for event in batch:
+        body = event["body"]
+        if not _is_script_node(body):
+            continue
+        value = 1.0 if _attr(body, "status") == _STATUS_SUCCESS else 0.0
+        events.append(
+            _score_event(
+                spoke_run_id,
+                name=f"{_SCRIPT_SUCCESS_SCORE}:{_script_name(body)}",
+                value=value,
+                trace_id=trace_id,
+                base_ts=base_ts,
+                observation_id=body["id"],
             )
         )
     return events
