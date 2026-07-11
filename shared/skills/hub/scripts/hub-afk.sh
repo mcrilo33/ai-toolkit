@@ -428,13 +428,9 @@ _afk_escalate_blocked() {
   esac
 }
 
-reap_spoke() {
-  local wt="$1" issue="$2" reason="$3"
-  log "→ reap #$issue: $reason"
-  _afk_set_last_action "reap #$issue"
-  _kill_spoke_window "$issue"
-  _afk_escalate_blocked "$wt" "$issue" "$reason"
-}
+# reap_spoke (kill window + escalate blocked/<issue>) is retired by #241: the reaper never
+# abandons a spoke — see _warn_parked_last / _afk_revive_or_park_last, which revive-first and
+# warn-and-park-LAST instead. (_afk_escalate_blocked remains for the auth halt + auto_land.)
 
 # --- crash ≠ hang: auto-resume-once a pane-dead spoke (issue #109) -------------
 # A reaped spoke is not always hung. The reaper abandoned #103 as "idle, likely hung"
@@ -663,29 +659,93 @@ respawn_wedged_spoke() {
   return 0
 }
 
-# _reap_or_resume <wt> <issue> -> decide a reaped spoke's fate. An over-ceiling runaway
-# always blocks (resume never applies). Otherwise it went idle: crash ≠ hang — a LIVE pane
-# is truly hung (block); a DEAD pane with commits is auto-resumed ONCE in place; a dead
-# pane with nothing to preserve, or one already resumed this window, is blocked.
+# --- #241 §7/§8: revive-first, warned-parked-LAST, never abandon -----------------
+# The reaper no longer kills a stuck spoke into blocked/<issue>. Every former reap TAKES a
+# revival first (kill any hung/crashed pane + relaunch `claude --continue`); only a spoke whose
+# revival was ALREADY tried this window downgrades to warned-and-parked-LAST (warn + journal +
+# arm the warned-retry backoff, retried at low frequency), NEVER killed or abandoned.
+
+# _warn_parked_last <wt> <issue> <reason> -> the never-abandon replacement for reap_spoke: warn
+# loudly, journal the decision, and keep the spoke in rotation on the warned-retry backoff. NO
+# window kill, NO blocked/<issue>. reversible: the spoke's committed work is intact.
+_warn_parked_last() {
+  local wt="$1" issue="$2" reason="$3"
+  log "→ warn-park-LAST #$issue: $reason"
+  _afk_set_last_action "warn-park #$issue"
+  broker_warn_continue "$wt" "$issue" revive "$reason" reversible
+}
+
+# _revive_spoke <wt> <issue> -> kill any hung/crashed window and relaunch the spoke via
+# `claude --continue` under the same spoke_run_id, resetting the reap + idle clocks (#133/#202
+# C: the fresh window hasn't written a transcript yet, so stamp the answer-attempt epoch or the
+# same-tick reap_pass re-reaps it as idle). Marks the once-per-window revival. rc 1 when the
+# window could not be opened (the caller warns + retries next tick).
+_revive_spoke() {
+  local wt="$1" issue="$2"
+  log "→ revive #$issue: killing any hung/crashed pane and relaunching (claude --continue)"
+  _afk_set_last_action "revive #$issue"
+  _kill_spoke_window "$issue"
+  if ! _afk_open_spoke_window "$wt" "$issue" "$(_afk_resume_command "$wt" "$issue")"; then
+    log "  could not open a revive window for #$issue"
+    return 1
+  fi
+  _afk_mark_resumed "$issue"
+  stamp_progress_epoch "$issue"
+  stamp_answer_attempt "$issue"
+  # #241 §10: a revival is a taken decision the morning review sees — journal it (a successful
+  # revival is not a loud warned record, just an auditable journal line + span).
+  broker_journal_decision "$issue" revive "revived a hung/crashed pane (killed + relaunched claude --continue)" reversible
+  _afk_emit_span "$wt" afk-revive success
+  return 0
+}
+
+# _afk_revive_or_park_last <wt> <issue> <reason> -> revive-first, then warned-parked-LAST. If a
+# revival was already tried this window (_afk_already_resumed) OR the relaunch cannot start, the
+# spoke is warned-and-parked-LAST rather than reaped — retried at low frequency, never abandoned.
+_afk_revive_or_park_last() {
+  local wt="$1" issue="$2" reason="$3"
+  if _afk_already_resumed "$issue"; then
+    _warn_parked_last "$wt" "$issue" "$reason — revival already tried this window; parked LAST, retried at low frequency"
+    return 0
+  fi
+  _revive_spoke "$wt" "$issue" \
+    || _warn_parked_last "$wt" "$issue" "$reason — revival launch could not be started; retrying"
+}
+
+# _afk_auto_mark_ready <wt> <issue> -> #200/#241 §8: a spoke that FINISHED and pushed but whose
+# completion mark never landed is AUTO-MARKED ready (the drain then lands it) + warned for
+# post-review, instead of reaped. Best-effort emit via spoke-push.sh --ready.
+_afk_auto_mark_ready() {
+  local wt="$1" issue="$2" sp
+  sp="$(_afk_find_script "${SPOKE_PUSH:-}" spoke-push.sh)" || sp=""
+  [ -n "$sp" ] && ( cd "$wt" && "$sp" --ready "$issue" ) >/dev/null 2>&1 || true
+  _warn_parked_last "$wt" "$issue" "pushed-but-unmarked (#200) — auto-emitted ready/$issue; review and land"
+}
+
+# _reap_or_resume <wt> <issue> -> #241 §7/§8: revive-first, never block. A finished-but-unmarked
+# spoke (#200) is auto-marked. Every other stuck spoke — over-ceiling runaway, hung LIVE pane
+# (a frozen claude is a revival case, not a block), or crashed pane — is revived; a spoke whose
+# revival was already tried this window is warned-and-parked-LAST, never reaped/abandoned.
 _reap_or_resume() {
   local wt="$1" issue="$2"
+  # #200/#241 §8: a live pane that FINISHED but whose mark never landed is auto-marked, not reaped.
+  if _spoke_pane_alive "$wt" && _afk_pushed_but_unmarked "$wt" "$issue"; then
+    _afk_auto_mark_ready "$wt" "$issue"
+    return 0
+  fi
   if _spoke_over_any_ceiling "$issue" "$(afk_now)"; then
-    reap_spoke "$wt" "$issue" "time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
+    _afk_revive_or_park_last "$wt" "$issue" "time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
   elif _spoke_pane_alive "$wt"; then
-    if _afk_pushed_but_unmarked "$wt" "$issue"; then
-      # Not hung — FINISHED but its completion mark never landed (#200). Surface the accurate,
-      # actionable reason instead of "likely hung", so a human re-runs the marker or lands it.
-      reap_spoke "$wt" "$issue" "pushed-but-unmarked: origin is at the clean tip but no ready/$issue — the completion mark didn't land (#200); re-run 'spoke-push.sh --ready $issue' on the spoke, or land it by hand"
-    else
-      reap_spoke "$wt" "$issue" "went idle >${AFK_IDLE_MINUTES}m with a live pane and no marker — likely hung"
-    fi
+    # #241 §8: a live-but-frozen claude is a REVIVAL case (kill the hung pane + relaunch), not a
+    # terminal block. answer attempts must not reset the reap clock, so this is a revival, not a re-answer.
+    _afk_revive_or_park_last "$wt" "$issue" "went idle >${AFK_IDLE_MINUTES}m with a live pane and no marker — likely hung"
   elif ! _spoke_has_commits "$wt"; then
-    reap_spoke "$wt" "$issue" "pane crashed with no committed work to preserve — needs a human"
+    _afk_revive_or_park_last "$wt" "$issue" "pane crashed with no committed work to preserve"
   elif _afk_already_resumed "$issue"; then
-    reap_spoke "$wt" "$issue" "pane crashed again after an auto-resume — needs a human"
+    _warn_parked_last "$wt" "$issue" "pane crashed again after an auto-resume — parked LAST, retried at low frequency"
   else
     resume_spoke "$wt" "$issue" \
-      || reap_spoke "$wt" "$issue" "pane crashed and the auto-resume could not be launched — needs a human"
+      || _warn_parked_last "$wt" "$issue" "pane crashed and the auto-resume could not be launched — retrying"
   fi
 }
 
@@ -1261,20 +1321,21 @@ recover_dead_panes() {
     # An over-ceiling runaway always blocks (as reap_pass does) — resume/re-dispatch never
     # applies. Checked first so a crashed-but-over-ceiling spoke is not revived here only to
     # be blocked by reap_pass in the same tick (the hard ceiling ignores fresh progress).
+    # #241 §7: revive-first, warned-parked-LAST — never reap/block/abandon a crashed pane.
     if _spoke_over_any_ceiling "$issue" "$(afk_now)"; then
-      reap_spoke "$path" "$issue" "time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
+      _afk_revive_or_park_last "$path" "$issue" "time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
     elif _spoke_has_work "$path"; then
       if _afk_already_resumed "$issue"; then
-        reap_spoke "$path" "$issue" "pane crashed again after an auto-resume — needs a human"
+        _warn_parked_last "$path" "$issue" "pane crashed again after an auto-resume — parked LAST, retried at low frequency"
       else
         resume_spoke "$path" "$issue" \
-          || reap_spoke "$path" "$issue" "pane crashed and the auto-resume could not be launched — needs a human"
+          || _warn_parked_last "$path" "$issue" "pane crashed and the auto-resume could not be launched — retrying"
       fi
     elif _afk_already_redispatched "$issue"; then
-      reap_spoke "$path" "$issue" "pane crashed clean again after a re-dispatch — needs a human"
+      _warn_parked_last "$path" "$issue" "pane crashed clean again after a re-dispatch — parked LAST, retried at low frequency"
     else
       _redispatch_dead_pane "$path" "$issue" \
-        || reap_spoke "$path" "$issue" "pane crashed clean and the worktree teardown failed — needs a human"
+        || _warn_parked_last "$path" "$issue" "pane crashed clean and the worktree teardown failed — retrying"
     fi
   done < <(inflight_worktrees)
 }

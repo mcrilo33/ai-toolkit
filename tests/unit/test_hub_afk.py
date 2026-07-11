@@ -4437,6 +4437,9 @@ def _reaper_env(
         # The reap-time auth probe (#170 ST7) fires before the first reap; a healthy stub
         # (exit 0) keeps these reap tests exercising the reap path, not the auth-halt path.
         "AFK_AUTH_PROBE_CMD": "true",
+        # #241: the revive/warn-park paths journal a decision — keep the gh issue comment OFF so
+        # the reaper tests never fire a real `gh issue comment` at the live repo.
+        "AFK_JOURNAL_GH_COMMENT": "0",
     }
     return expr, env, ready_log, statedir
 
@@ -4724,18 +4727,13 @@ def test_slot_state_ignores_ready_behind_tip(spoke_repo: Path) -> None:
     )
 
 
-def test_reap_pass_blocks_pane_alive_idle_spoke(tmp_path: Path) -> None:
-    spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane ALIVE
-    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
-
-    _call(expr, env=env)
-
-    assert "--blocked 5" in ready_log.read_text(), "a pane-alive idle spoke is truly hung → block"
-    assert "new-window" not in tmux_log.read_text(), "a live (hung) pane is never resumed"
+# NB: the pane-alive-idle case is covered by test_reap_pass_revives_pane_alive_idle_spoke
+# (#241 §8): a hung live pane is REVIVED, not blocked — the inverse of the old "block" test.
 
 
-def test_reap_pass_blocks_pane_dead_spoke_after_one_resume(tmp_path: Path) -> None:
+def test_reap_pass_warns_pane_dead_spoke_after_one_resume(tmp_path: Path) -> None:
+    # #241 §7: a second crash after a resume warns-and-parks-LAST, never blocks. Resume stays
+    # bounded to once per window.
     spoke = _branched_spoke(tmp_path, ahead=True)
     fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD again
     expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
@@ -4743,26 +4741,29 @@ def test_reap_pass_blocks_pane_dead_spoke_after_one_resume(tmp_path: Path) -> No
 
     _call(expr, env=env)
 
-    assert "--blocked 5" in ready_log.read_text(), (
-        "a second crash after a resume escalates to a human"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "a second crash after a resume warns-and-parks-LAST, never blocks"
     )
     assert "new-window" not in tmux_log.read_text(), "resume is bounded to once per window"
+    assert (statedir / "warned-5.txt").exists()
 
 
-def test_reap_pass_blocks_pane_dead_spoke_without_commits(tmp_path: Path) -> None:
+def test_reap_pass_revives_pane_dead_spoke_without_commits(tmp_path: Path) -> None:
+    # #241 §7: a dead pane with nothing committed is REVIVED (relaunched) — the crash may
+    # un-stick — not blocked. (Only a twice-failed revival parks LAST.)
     spoke = _branched_spoke(tmp_path, ahead=False)  # nothing to preserve
     fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
     expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
 
     _call(expr, env=env)
 
-    assert "--blocked 5" in ready_log.read_text(), "no commits to preserve → block, don't resume"
-    assert "new-window" not in tmux_log.read_text()
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), "revive, not block"
+    assert "new-window" in tmux_log.read_text(), "a crashed pane is revived (relaunched)"
 
 
-def test_reap_pass_over_ceiling_always_blocks(tmp_path: Path) -> None:
-    # A runaway over the wall-clock ceiling always blocks — resume never applies, even if
-    # the pane is dead with commits.
+def test_reap_pass_over_ceiling_revives_not_blocks(tmp_path: Path) -> None:
+    # #241 §7: a runaway over the wall-clock ceiling is REVIVED first (a hang may un-stick on
+    # relaunch) then parked LAST — never blocked.
     spoke = _branched_spoke(tmp_path, ahead=True)
     fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
     expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=False)
@@ -4770,8 +4771,10 @@ def test_reap_pass_over_ceiling_always_blocks(tmp_path: Path) -> None:
 
     _call(expr, env=env)
 
-    assert "--blocked 5" in ready_log.read_text(), "an over-ceiling runaway always blocks"
-    assert "new-window" not in tmux_log.read_text(), "a runaway is never resumed"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "an over-ceiling runaway is revived + parked LAST, never blocked"
+    )
+    assert "new-window" in tmux_log.read_text(), "the runaway is revived (relaunched)"
 
 
 # ── dead-pane recovery each tick (issue #202 C) ───────────────────────────────
@@ -4817,6 +4820,8 @@ def _recover_env(
         "AFK_STATE_DIR": str(statedir),
         "AFK_DEFAULT_BRANCH": "main",
         "AFK_NOW": "1700000000",
+        # #241: the revive/warn-park paths journal a decision — keep the gh issue comment OFF.
+        "AFK_JOURNAL_GH_COMMENT": "0",
     }
     if redispatch_marker is not None:
         env["AFK_REDISPATCH_CMD"] = f"touch {redispatch_marker}"
@@ -4867,8 +4872,9 @@ def test_recover_dead_panes_skips_live_pane(tmp_path: Path) -> None:
     assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
 
 
-def test_recover_dead_panes_reaps_after_one_resume(tmp_path: Path) -> None:
-    # A second crash after an auto-resume escalates to a human (bounded once per window).
+def test_recover_dead_panes_warns_after_one_resume(tmp_path: Path) -> None:
+    # #241 §7: a second crash after an auto-resume warns-and-parks-LAST (retried at low
+    # frequency), never blocks. Resume stays bounded to once per window.
     spoke = _branched_spoke(tmp_path, ahead=True)
     fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD again
     expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, fake_bin)
@@ -4876,8 +4882,11 @@ def test_recover_dead_panes_reaps_after_one_resume(tmp_path: Path) -> None:
 
     _call(expr, env=env)
 
-    assert "--blocked 5" in ready_log.read_text(), "a re-crash after resume escalates"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "a re-crash after resume warns-and-parks-LAST, never blocks"
+    )
     assert "new-window" not in tmux_log.read_text(), "resume is bounded to once per window"
+    assert (statedir / "warned-5.txt").exists()
 
 
 def test_recover_dead_panes_redispatches_clean_dead_pane(tmp_path: Path) -> None:
@@ -4902,9 +4911,9 @@ def test_recover_dead_panes_redispatches_clean_dead_pane(tmp_path: Path) -> None
     )
 
 
-def test_recover_dead_panes_blocks_clean_dead_pane_after_one_redispatch(tmp_path: Path) -> None:
-    # A clean pane that crashes AGAIN after a re-dispatch is a persistent infra problem →
-    # escalate to a human (bounded once, so re-dispatch can't loop forever).
+def test_recover_dead_panes_warns_clean_dead_pane_after_one_redispatch(tmp_path: Path) -> None:
+    # #241 §7: a clean pane that crashes AGAIN after a re-dispatch warns-and-parks-LAST
+    # (retried at low frequency), never blocks. Re-dispatch stays bounded once per window.
     spoke = _branched_spoke(tmp_path, ahead=False)
     fake_bin, _tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
     redispatch = tmp_path / "redispatched"
@@ -4915,8 +4924,11 @@ def test_recover_dead_panes_blocks_clean_dead_pane_after_one_redispatch(tmp_path
 
     _call(expr, env=env)
 
-    assert "--blocked 5" in ready_log.read_text(), "a re-crash after re-dispatch escalates"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "a re-crash after re-dispatch warns-and-parks-LAST, never blocks"
+    )
     assert not redispatch.exists(), "re-dispatch is bounded to once per window"
+    assert (statedir / "warned-5.txt").exists()
 
 
 def _stateful_reaper_tmux(tmp_path: Path) -> tuple[Path, Path]:
@@ -4985,9 +4997,9 @@ def test_recover_then_reap_does_not_block_a_just_resumed_idle_spoke(tmp_path: Pa
     )
 
 
-def test_recover_dead_panes_over_ceiling_blocks_despite_commits(tmp_path: Path) -> None:
-    # An over-ceiling runaway always blocks (as reap_pass does) — recovery never resumes it,
-    # so it isn't revived here only to be blocked by reap_pass in the same tick.
+def test_recover_dead_panes_over_ceiling_revives_not_blocks(tmp_path: Path) -> None:
+    # #241 §7: an over-ceiling runaway is REVIVED first (a hang may un-stick on relaunch) then
+    # parked LAST — never blocked. recover_dead_panes and reap_pass both revive-first now.
     spoke = _branched_spoke(tmp_path, ahead=True)
     fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD, with commits
     expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, fake_bin)
@@ -4995,8 +5007,10 @@ def test_recover_dead_panes_over_ceiling_blocks_despite_commits(tmp_path: Path) 
 
     _call(expr, env=env)
 
-    assert "--blocked 5" in ready_log.read_text(), "an over-ceiling runaway always blocks"
-    assert "new-window" not in tmux_log.read_text(), "a runaway is never resumed"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "an over-ceiling runaway is revived + parked LAST, never blocked"
+    )
+    assert "new-window" in tmux_log.read_text(), "the runaway is revived (relaunched)"
 
 
 # ── J: pushed-but-unmarked detection (issue #202 J / #200) ────────────────────
@@ -6550,10 +6564,11 @@ def test_reap_pass_revives_pane_alive_idle_spoke(tmp_path: Path) -> None:
     _call(expr, env=env)
 
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
-        "a hung live pane must be revived + warned, never blocked"
+        "a hung live pane must be revived, never blocked"
     )
     assert "new-window" in tmux_log.read_text(), "a hung live pane is REVIVED (relaunched)"
-    assert (statedir / "warned-5.txt").exists()
+    # A successful revival journals the taken decision for morning post-review (§10).
+    assert "revive" in (statedir / "decision-journal.jsonl").read_text()
 
 
 def test_reap_pass_revival_exhausted_parks_last_not_blocked(tmp_path: Path) -> None:
