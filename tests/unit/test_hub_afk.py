@@ -2516,14 +2516,15 @@ def test_auto_land_escalates_on_request_changes(spoke_repo: Path, tmp_path: Path
             "SPOKE_READY": str(ready_stub),
             "AFK_STATE_DIR": str(statedir),
             "AFK_REVIEW_GATE": "1",
+            "AFK_JOURNAL_GH_COMMENT": "0",
         },
     )
 
     assert not land_log.exists() or land_log.read_text().strip() == "", (
         "a REQUEST_CHANGES verdict must NOT land"
     )
-    assert "--blocked 5" in ready_log.read_text(), (
-        "a REQUEST_CHANGES verdict must escalate to blocked"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "#241: a REQUEST_CHANGES verdict warns + retries, never blocks"
     )
 
 
@@ -2542,13 +2543,16 @@ def test_auto_land_escalates_when_no_review(spoke_repo: Path, tmp_path: Path) ->
             "SPOKE_READY": str(ready_stub),
             "AFK_STATE_DIR": str(statedir),
             "AFK_REVIEW_GATE": "1",
+            "AFK_JOURNAL_GH_COMMENT": "0",
         },
     )
 
     assert not land_log.exists() or land_log.read_text().strip() == "", (
         "a spoke with no code-review artifact must NOT land"
     )
-    assert "--blocked 5" in ready_log.read_text(), "no review ⇒ escalate to blocked"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "#241: no review warns + retries, never blocks"
+    )
 
 
 def test_auto_land_escalates_when_review_dir_empty(spoke_repo: Path, tmp_path: Path) -> None:
@@ -2566,13 +2570,16 @@ def test_auto_land_escalates_when_review_dir_empty(spoke_repo: Path, tmp_path: P
             "SPOKE_READY": str(ready_stub),
             "AFK_STATE_DIR": str(statedir),
             "AFK_REVIEW_GATE": "1",
+            "AFK_JOURNAL_GH_COMMENT": "0",
         },
     )
 
     assert not land_log.exists() or land_log.read_text().strip() == "", (
         "an empty .review dir must NOT land"
     )
-    assert "--blocked 5" in ready_log.read_text(), "an empty .review dir ⇒ escalate to blocked"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "#241: an empty .review dir warns + retries, never blocks"
+    )
 
 
 def test_auto_land_lands_after_fix_supersedes_changes(spoke_repo: Path, tmp_path: Path) -> None:
@@ -2666,8 +2673,8 @@ def test_auto_land_default_escalates_foreign_ready_without_review(
     assert not land_log.exists() or land_log.read_text().strip() == "", (
         "the default gate must NOT land an artifact-less foreign ready"
     )
-    assert "--blocked 5" in ready_log.read_text(), (
-        "an artifact-less foreign ready must escalate to blocked under the default gate"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "#241: an artifact-less foreign ready warns + retries, never blocks"
     )
 
 
@@ -3048,12 +3055,15 @@ def test_auto_land_failing_land_still_escalates_through_wrapper(
             "SPOKE_READY": str(ready_stub),
             "AFK_STATE_DIR": str(statedir),
             "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
             "AFK_LAND_HEARTBEAT_SECONDS": "1",
         },
     )
 
     assert result.returncode == 0, result.stderr
-    assert "--blocked 5" in ready_log.read_text(), "a failed land must still escalate"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "#241: a failed land warns + retries, never blocks"
+    )
 
 
 def test_auto_land_skips_foreign_ready_spoke_when_opted_out(
@@ -3182,6 +3192,7 @@ def test_auto_land_retries_ready_blocked_at_tip(spoke_repo: Path, tmp_path: Path
             "WT_LAND": str(wt_land),
             "AFK_STATE_DIR": str(statedir),
             "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
         },
     )
 
@@ -3218,10 +3229,13 @@ def test_auto_land_ready_blocked_reescalates_on_repeat_failure(
             "SPOKE_READY": str(ready_stub),
             "AFK_STATE_DIR": str(statedir),
             "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
         },
     )
 
-    assert "--blocked 5" in ready_log.read_text(), "a failed retry re-escalates blocked/5"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "#241: a failed land-retry warns + retries, never blocks"
+    )
     assert (statedir / "land-retry-5.count").read_text().strip() == "1", (
         "the retry attempt is counted so the budget is bounded"
     )
@@ -3250,6 +3264,7 @@ def test_auto_land_does_not_block_when_land_reports_cleanup_incomplete(
             "SPOKE_READY": str(ready_stub),
             "AFK_STATE_DIR": str(statedir),
             "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
             "AFK_LANDED_COUNT": str(landed),
         },
     )
@@ -3281,11 +3296,12 @@ def test_auto_land_still_blocks_on_a_pre_merge_failure(spoke_repo: Path, tmp_pat
             "SPOKE_READY": str(ready_stub),
             "AFK_STATE_DIR": str(statedir),
             "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
         },
     )
 
-    assert "--blocked 5" in ready_log.read_text(), (
-        "a pre-merge land failure (exit 1) still escalates"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "#241: a pre-merge land failure (exit 1) warns + retries, never blocks"
     )
 
 
@@ -3308,13 +3324,14 @@ def test_auto_land_ready_blocked_escalates_visibly_when_retries_exhausted(
             "WT_LAND": str(wt_land),
             "AFK_STATE_DIR": str(statedir),
             "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
         },
     )
 
     assert not land_log.exists() or land_log.read_text().strip() == "", (
         "with the retry budget spent the land is not re-invoked (no spin)"
     )
-    assert (statedir / "blocked-5.txt").exists(), (
+    assert (statedir / "warned-5.txt").exists(), (
         "an exhausted retry escalates VISIBLY (a durable local record), never a silent skip"
     )
 
@@ -5348,6 +5365,7 @@ def test_watchdog_entry_execs_from_private_copy(tmp_path: Path) -> None:
             "TMPDIR": str(tmp_path),
             "AFK_STATE": str(tmp_path / "state"),
             "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
             "AFK_WATCHDOG_FILE": str(tmp_path / "watchdog.pid"),
             "AFK_WATCHDOG_SECONDS": "1",
         },
@@ -5370,6 +5388,7 @@ def test_spawn_watchdog_strips_copy_guard(tmp_path: Path) -> None:
             "TMPDIR": str(tmp_path),
             "AFK_STATE": str(tmp_path / "state"),
             "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
             "AFK_WATCHDOG_FILE": str(tmp_path / "watchdog.pid"),
             "AFK_WATCHDOG_SECONDS": "1",
         },
@@ -6068,6 +6087,7 @@ def _ceiling_env(tmp_path: Path, *, wt_new_exit: int) -> tuple[str, dict[str, st
         "AFK_DISPATCH_STAGGER": "0",
         "AFK_SPOKE_CAP": "4",
         "AFK_DISPATCH_MAX_FAILURES": "3",
+        "AFK_JOURNAL_GH_COMMENT": "0",
     }
     return expr, env, attempts, statedir
 
@@ -6083,7 +6103,7 @@ def test_dispatch_ceiling_blocks_issue_after_max_failures(tmp_path: Path) -> Non
     assert attempts.read_text().split() == ["5", "5", "5"], (
         "exactly AFK_DISPATCH_MAX_FAILURES attempts, then skip for the window"
     )
-    assert (statedir / "blocked-5.txt").exists(), "the ceiling records a durable block (--status)"
+    assert (statedir / "warned-5.txt").exists(), "#241: the ceiling warns (not a durable block)"
 
 
 def test_dispatch_failure_count_resets_on_success(tmp_path: Path) -> None:
@@ -6104,6 +6124,7 @@ def test_dispatch_failure_count_resets_on_success(tmp_path: Path) -> None:
         "AFK_DISPATCH_STAGGER": "0",
         "AFK_SPOKE_CAP": "4",
         "AFK_DISPATCH_MAX_FAILURES": "3",
+        "AFK_JOURNAL_GH_COMMENT": "0",
     }
     expr = (
         "inflight_issues() { :; }; inflight_worktrees() { :; }; "
@@ -6620,7 +6641,9 @@ def test_reap_pass_pushed_but_unmarked_warns_not_reaps(tmp_path: Path) -> None:
 # failure and an exhausted land-retry warn + retry on the backoff instead of going terminal.
 
 
-def test_auto_land_unclean_review_warns_retries_not_blocks(spoke_repo: Path, tmp_path: Path) -> None:
+def test_auto_land_unclean_review_warns_retries_not_blocks(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
     # #241 §6 default: an unclean review verdict is NOT auto-landed (it would land a #172-bypass
     # to main) and NOT blocked — it warns loudly and retries.
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
@@ -6641,8 +6664,12 @@ def test_auto_land_unclean_review_warns_retries_not_blocks(spoke_repo: Path, tmp
         },
     )
 
-    assert not land_log.exists() or land_log.read_text().strip() == "", "unclean review must NOT land by default"
-    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), "warn + retry, never block"
+    assert not land_log.exists() or land_log.read_text().strip() == "", (
+        "unclean review must NOT land by default"
+    )
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "warn + retry, never block"
+    )
     assert "WARNING: #5" in result.stderr, result.stderr
     assert (statedir / "warned-5.txt").exists()
 
@@ -6697,6 +6724,8 @@ def test_auto_land_failure_warns_retries_not_blocks(spoke_repo: Path, tmp_path: 
         },
     )
 
-    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), "land failure warns, never blocks"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "land failure warns, never blocks"
+    )
     assert "WARNING: #5" in result.stderr, result.stderr
     assert (statedir / "warned-5.txt").exists()

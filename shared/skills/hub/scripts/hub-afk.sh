@@ -967,8 +967,10 @@ dispatch_batch() {
     else
       fails="$(_afk_incr_dispatch_failures "$n")"
       if [ "$fails" -ge "$max" ]; then
-        log "  dispatch of #$n failed $fails times — recording a durable block and skipping it for this window (see --status)"
-        _afk_record_blocked_locally "$n" "dispatch (worktree-new.sh) failed $fails consecutive times — needs a human"
+        # #241 §5: no durable BLOCK — warn (backoff-gated, low frequency) and skip this window; a
+        # fresh arm retries. There is no spoke worktree yet, so pass an empty wt.
+        log "  dispatch of #$n failed $fails times — warn-parking (retries next window, see --status)"
+        _warn_parked_last "" "$n" "dispatch (worktree-new.sh) failed $fails consecutive times — retried at low frequency" dispatch
       else
         log "  dispatch of #$n failed ($fails/$max) — will retry next tick"
       fi
@@ -1190,8 +1192,10 @@ auto_land() {
       # AFK_LAND_RETRY_MAX times, then escalate VISIBLY — never skip-land it forever (#202 D).
       max="$(_afk_land_retry_max)"; tries="$(_afk_read_land_retries "$issue")"
       if [ "$tries" -ge "$max" ]; then
-        log "  skip land #$issue — ready+blocked persisted after $tries land-retry attempt(s); escalating for a human (see --status), no more retries"
-        _afk_record_blocked_locally "$issue" "land retried $tries time(s) and still fails at a finished tip — needs a human"
+        # #241 §5: no longer terminal — warn + retry on the warned-retry backoff (low frequency),
+        # never park blocked/<issue>. The land is re-attempted on later ticks/windows.
+        log "  land #$issue still fails after $tries retry attempt(s) — warn-parking on the backoff (#241)"
+        _warn_parked_last "$path" "$issue" "land retried $tries time(s) and still fails at a finished tip — retrying at low frequency" land
         continue
       fi
       log "  retry land #$issue — ready+blocked coexist at a finished tip (transient land failure); clearing blocked/$issue and re-landing (attempt $(( tries + 1 ))/$max)"
@@ -1207,9 +1211,21 @@ auto_land() {
     if [ "${AFK_REVIEW_GATE:-1}" != "0" ]; then
       verdict="$(_afk_review_verdict "$path")"
       if [ "$verdict" != "APPROVE" ]; then
-        _afk_escalate_blocked "$path" "$issue" \
-          "code-review verdict not clean (${verdict:-no review}) — possible test-gutting, needs a human"
-        continue
+        # #241 §6: never silent block. Per AFK_REVIEW_GATE_ON_UNCLEAN:
+        #   retry (DEFAULT, safe) — warn + retry; do NOT auto-land, since a ready/<issue> with an
+        #     unclean/missing verdict is a #172-bypass and landing it ships possibly-test-gutted
+        #     code to main. The loud warning surfaces it for the human.
+        #   land — warn LOUDLY + land anyway (records the unclean verdict for post-review), the
+        #     operator's explicit opt-in to §6's land-with-warning (the "mint a hub-side review
+        #     first" step is not implementable here). UPGRADE: mint a hub-side review attempt.
+        if [ "${AFK_REVIEW_GATE_ON_UNCLEAN:-retry}" = "land" ]; then
+          broker_warn "$issue" "LANDING despite an unclean review verdict (${verdict:-no review}) — possible test-gutting; review post-hoc"
+          broker_journal_decision "$issue" review "landed despite unclean review verdict (${verdict:-no review})" scope
+          # fall through to land
+        else
+          _warn_parked_last "$path" "$issue" "code-review verdict not clean (${verdict:-no review}) — warn + retry; set AFK_REVIEW_GATE_ON_UNCLEAN=land to land with a warning" review
+          continue
+        fi
       fi
     fi
     log "→ land #$issue"
@@ -1230,7 +1246,9 @@ auto_land() {
       _afk_clear_land_retries "$issue"
       _afk_incr_landed
     else
-      _afk_escalate_blocked "$path" "$issue" "auto-land failed (merge conflict or push rejection, exit $land_rc) — needs a human (see $land_log)"
+      # #241 §5: an auto-land failure (merge conflict / push rejection) warns + retries on the
+      # backoff instead of parking blocked/<issue>. The land is re-attempted on later ticks.
+      _warn_parked_last "$path" "$issue" "auto-land failed (merge conflict or push rejection, exit $land_rc) — retrying at low frequency (see $land_log)" land
     fi
   done < <(inflight_worktrees)
 }
