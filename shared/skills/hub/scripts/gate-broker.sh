@@ -1363,6 +1363,27 @@ _permission_seg_mutation_ok() {
   [ "$saw_path" -eq 1 ]
 }
 
+# _permission_seg_exec_ok <segment> <cwd> <wt> <slug> <tasks> -> rc 0 when the segment EXECUTES
+# a spoke-authored in-tree script via a `./<relative-path>` invocation whose executable resolves
+# under the worktree or the spoke's session scratchpad (via _broker_resolve_in_roots — the same
+# scope the mutation lane uses — which rejects `..`, absolute paths, `.git`, and shell
+# metacharacters). Trailing args are opaque to WHICH code runs and are left to the
+# script; the segment-level substitution/redirection reject in _permission_seg_safe has already
+# fired before this is reached. Inert (rc 1) without a worktree context. Approving this is a
+# worktree-trust-boundary call (#240): the gate protects SHARED state — main, the remote, sibling
+# worktrees, out-of-tree paths — and trusts the spoke inside its OWN worktree, where it already
+# has auto-accepted edits and where an APPROVEd targeted pytest already runs spoke-authored code.
+_permission_seg_exec_ok() {
+  local seg="$1" cwd="$2" wt="$3" slug="$4" tasks="$5" tok resolved
+  [ -n "$wt" ] || return 1
+  tok="${seg%%[[:space:]]*}"                   # the executable (first token)
+  case "$tok" in './'*) ;; *) return 1 ;; esac # only the relative ./ self-op form
+  _broker_seg_secretlike "$tok" && return 1
+  resolved="$(_broker_resolve_in_roots "$tok" "$cwd" "$wt" "$slug" "$tasks")" || return 1
+  [ "$resolved" = "$wt" ] && return 1          # never "execute" the worktree root itself
+  return 0
+}
+
 # _permission_seg_safe <segment> [cwd wt slug tasks] -> true when ONE command segment is a
 # safe scoped self-op the spoke legitimately runs on its OWN worktree: the same vetted class
 # worktree-new.sh seeds into the spoke allowlist (unstage/stage, own-file pytest,
@@ -1386,6 +1407,17 @@ _permission_seg_safe() {
     'mv '* | 'cp '* | 'rm '* | 'mkdir '* | 'chmod '*)
       if [ -n "$wt" ]; then
         _permission_seg_mutation_ok "$seg" "$cwd" "$wt" "$slug" "$tasks" && return 0
+        return 1
+      fi ;;
+  esac
+  # Benign in-worktree EXECUTION lane (#240): running the spoke's OWN in-tree script
+  # (`./path/to/script.sh`) is a scoped self-op, decided ENTIRELY by the lane when a worktree
+  # is known — mirroring the mutation lane above so the context-free rules below never re-judge
+  # it. Without a worktree context the lane is inert and `./…` falls through to default-deny.
+  case "$seg" in
+    './'*)
+      if [ -n "$wt" ]; then
+        _permission_seg_exec_ok "$seg" "$cwd" "$wt" "$slug" "$tasks" && return 0
         return 1
       fi ;;
   esac
@@ -1592,15 +1624,21 @@ classify_permission() {
 
 # --- permission-dialog detection + handling (issue #149) ----------------------
 # A permission dialog is a pane-only surface — a Claude Code confirmation prompt with no
-# transcript entry — so it is detected from the pane (the only signal) plus the command the
-# spoke is trying to run (its trailing transcript tool_use). classify_permission decides it;
-# these helpers see it and deliver the decision. _decide_permission is reached from
-# decide_and_act, which routes a permission-pending spoke here instead of to the answerer.
+# transcript entry of its OWN — but the tool_use it is gating IS flushed to the JSONL as an
+# UNRESOLVED block (no matching tool_result) for the whole park. So the dialog is detected
+# from the pane (the only "a dialog is up" signal) and the command it gates is read from that
+# unresolved tool_use. classify_permission decides it; these helpers see it and deliver the
+# decision. _decide_permission is reached from decide_and_act, which routes a
+# permission-pending spoke here instead of to the answerer.
 
-# extract_pending_command <wt_path> -> the command of the spoke's trailing assistant
-# tool_use (Bash -> its command string; any other tool -> the tool name, so the classifier
-# escalates non-Bash tools like browser/computer/mcp). Empty when unreadable. Mirrors
-# extract_pending_question's transcript walk.
+# extract_pending_command <wt_path> -> the command of the spoke's trailing UNRESOLVED
+# assistant tool_use — the one a permission dialog is gating (Bash -> its command string;
+# Read -> "Read <file_path>"; any other tool -> the tool name, so the classifier escalates
+# non-Bash tools like browser/computer/mcp). A tool_use is UNRESOLVED when no later
+# tool_result carries its id; the PRIOR calls a parked spoke already completed are resolved
+# and MUST be skipped (#240: returning the last resolved tool surfaced a phantom "Write" and
+# escalated a spoke that needed no human). Empty when nothing is unresolved -> the caller
+# escalates honestly ("unreadable command"), never on a stale resolved tool name.
 extract_pending_command() {
   local jsonl; jsonl="$(_spoke_jsonl "$1")"
   [ -n "$jsonl" ] || return 0
@@ -1608,7 +1646,12 @@ extract_pending_command() {
   _AFK_JSONL="$jsonl" python3 2>/dev/null <<'PYEOF'
 import json, os
 
-cmd = ""
+# Two passes over the transcript: first collect every tool_result's tool_use_id (a
+# tool_result always trails its tool_use in file order, so resolution can only be known
+# after a full read), then pick the LAST tool_use whose id is NOT among them — the one the
+# permission dialog is still gating. Prior, already-resolved calls are skipped (#240).
+tool_uses = []            # ordered (id, name, input) of every assistant tool_use
+resolved = set()          # tool_use_ids that a later tool_result has settled
 try:
     with open(os.environ["_AFK_JSONL"]) as fh:
         for raw in fh:
@@ -1616,28 +1659,42 @@ try:
                 obj = json.loads(raw)
             except Exception:
                 continue
-            if not isinstance(obj, dict) or obj.get("type") != "assistant":
+            if not isinstance(obj, dict):
                 continue
             content = (obj.get("message") or {}).get("content") or []
             if not isinstance(content, list):
                 continue
             for block in content:
-                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                if not isinstance(block, dict):
                     continue
-                name = (block.get("name") or "").strip()
-                if name == "Bash":
-                    c = ((block.get("input") or {}).get("command") or "").strip()
-                    if c:
-                        cmd = c
-                elif name == "Read":
-                    # Carry the Read TARGET alongside the name (#181) so the classifier can
-                    # vet the path — a repo-family read is auto-approvable, a bare name is not.
-                    fp = ((block.get("input") or {}).get("file_path") or "").strip()
-                    cmd = f"{name} {fp}" if fp else name
-                elif name:
-                    cmd = name
+                btype = block.get("type")
+                if btype == "tool_use" and obj.get("type") == "assistant":
+                    tool_uses.append(
+                        (block.get("id"), (block.get("name") or "").strip(), block.get("input") or {})
+                    )
+                elif btype == "tool_result":
+                    tid = block.get("tool_use_id")
+                    if tid:
+                        resolved.add(tid)
 except Exception:
-    pass
+    tool_uses = []
+
+cmd = ""
+for tid, name, inp in reversed(tool_uses):
+    if tid in resolved:       # a completed call the spoke already ran — never the pending one
+        continue
+    if not isinstance(inp, dict):
+        inp = {}
+    if name == "Bash":
+        cmd = (inp.get("command") or "").strip()
+    elif name == "Read":
+        # Carry the Read TARGET alongside the name (#181) so the classifier can vet the
+        # path — a repo-family read is auto-approvable, a bare name is not.
+        fp = (inp.get("file_path") or "").strip()
+        cmd = f"{name} {fp}" if fp else name
+    elif name:
+        cmd = name
+    break                     # the trailing unresolved tool_use is the pending command
 print(cmd[:2000].strip())
 PYEOF
 }
