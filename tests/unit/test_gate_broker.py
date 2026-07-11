@@ -651,10 +651,12 @@ def test_broker_service_gate_voids_answer_when_reasoner_creates_file(
 ) -> None:
     # The read-only guard must void an answer when the reasoner CREATES a new untracked file
     # (not just when it edits tracked content): a creation is a mutation of a read-only tree,
-    # so the gate escalates rather than trusting the answer (#203 finding 2).
+    # so the gate escalates rather than trusting the answer (#203 finding 2). Since #237 runs
+    # the reasoner in an isolated copy, the write here targets the ABSOLUTE live-tree path —
+    # modelling an isolation BYPASS the fingerprint backstop must still catch.
     env = {
         **waiting_spoke_env,
-        "AFK_ANSWERER_CMD": "printf 'x' > reasoner_new.py; printf 'ANSWER: go ahead'",
+        "AFK_ANSWERER_CMD": f"printf 'x' > '{spoke_repo}/reasoner_new.py'; printf 'ANSWER: go ahead'",
     }
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
@@ -665,9 +667,11 @@ def test_broker_service_gate_voids_answer_when_reasoner_creates_file(
     assert "worktree" in log.lower() or "mutat" in log.lower(), log
 
 
-def test_reasoner_runs_in_worktree_cwd(spoke_repo: Path, tmp_path: Path) -> None:
-    # The reasoner is seeded with cwd = the spoke's worktree so its read-only tools
-    # verify against real state. A `pwd` answerer proves the cwd.
+def test_reasoner_runs_in_isolated_copy_not_live_tree(spoke_repo: Path, tmp_path: Path) -> None:
+    # Write isolation (#237): the reasoner is seeded with cwd = a THROWAWAY COPY of the
+    # worktree, NOT $wt itself, so a tool that ignores the read-only allowlist writes into
+    # the copy — never the live tree — while its reads still see the worktree's content.
+    # A write to cwd + a read of a committed file prove both halves.
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
@@ -678,10 +682,22 @@ def test_reasoner_runs_in_worktree_cwd(spoke_repo: Path, tmp_path: Path) -> None
 
     result = _call(
         f"run_answerer 5 'q' '{spoke_repo}'",
-        env={"AFK_ANSWERER_CMD": "pwd -P", "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        env={
+            "AFK_ANSWERER_CMD": "printf x > escaped_probe.txt; cat .gitignore; pwd -P",
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        },
     )
 
-    assert real in result.stdout, f"reasoner cwd should be the worktree: {result.stdout}"
+    assert result.returncode == 0, result.stderr
+    assert ".testmondata" in result.stdout, (
+        f"the copy must mirror the worktree's committed content: {result.stdout}"
+    )
+    assert not (spoke_repo / "escaped_probe.txt").exists(), (
+        "a reasoner write must land in the copy, never the live tree"
+    )
+    assert result.stdout.strip().splitlines()[-1] != real, (
+        f"the reasoner's cwd must be an isolated copy, not the live worktree: {result.stdout}"
+    )
 
 
 def test_broker_service_gate_voids_answer_when_reasoner_mutates_tracked_content(
@@ -691,11 +707,13 @@ def test_broker_service_gate_voids_answer_when_reasoner_mutates_tracked_content(
     # tracked file has its answer VOIDED and the gate escalated (unattended) — a tracked
     # mutation is never trusted, even alongside a plausible ANSWER. (Untracked runtime
     # drift no longer voids — see test_broker_service_gate_injects_despite_runtime_drift.)
+    # Since #237 runs the reasoner in an isolated copy, the write targets the ABSOLUTE
+    # live-tree path — an isolation BYPASS the fingerprint backstop must still catch.
     (spoke_repo / "tracked.txt").write_text("original")
     subprocess.run(["git", "add", "tracked.txt"], cwd=spoke_repo, check=True, capture_output=True)
     env = {
         **waiting_spoke_env,
-        "AFK_ANSWERER_CMD": "printf 'mutated' > tracked.txt; printf 'ANSWER: go ahead'",
+        "AFK_ANSWERER_CMD": f"printf 'mutated' > '{spoke_repo}/tracked.txt'; printf 'ANSWER: go ahead'",
     }
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
@@ -704,6 +722,57 @@ def test_broker_service_gate_voids_answer_when_reasoner_mutates_tracked_content(
     log = Path(env["_READY_LOG"]).read_text()
     assert "--blocked 5" in log, f"a tracked mutation must escalate, not inject: {log}"
     assert "worktree" in log.lower() or "mutat" in log.lower(), log
+
+
+def test_broker_service_gate_isolates_reasoner_writes_from_live_tree(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # Write isolation headline (#237): a reasoner that writes a TRACKED file via a RELATIVE
+    # path (its cwd) leaves $wt byte-for-byte unchanged — the write lands in the throwaway
+    # copy, not the live tree — so the healthy answer (approving an in-tree op) INJECTS and
+    # the gate does NOT escalate. Contrast the two backstop tests, which write the ABSOLUTE
+    # live-tree path and still escalate.
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    (spoke_repo / "tracked.txt").write_text("original")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=spoke_repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "add tracked"],
+        cwd=spoke_repo,
+        check=True,
+        env=git_env,
+        capture_output=True,
+    )
+    fake_bin = tmp_path / "bin"  # the waiting_spoke_env fake bin (holds gh); add tmux
+    jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # pin old so the inject's append advances it
+    tmux_log = _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": "printf 'mutated' > tracked.txt; printf 'ANSWER: yes, the in-tree chmod is fine'",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert (spoke_repo / "tracked.txt").read_text() == "original", (
+        "the reasoner's write must land in the copy — the live tree must be byte-for-byte unchanged"
+    )
+    ready_log = Path(env["_READY_LOG"])
+    ready_text = ready_log.read_text() if ready_log.exists() else ""
+    assert "--blocked" not in ready_text, (
+        f"isolation must not escalate a healthy answer: {ready_text}"
+    )
+    assert "chmod is fine" in tmux_log.read_text(), (
+        f"the healthy answer must inject despite the in-copy write: {tmux_log.read_text()}"
+    )
 
 
 def test_broker_service_gate_injects_despite_runtime_drift(
