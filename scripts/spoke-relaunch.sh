@@ -104,22 +104,30 @@ case "$ISSUE" in
   '' | *[!0-9]*) ISSUE="$WT_TAG" ;;
 esac
 
+# The tmux session (one per project, #39) — derived ONCE and reused by the guard below and the
+# window spawn near the end, so the two can never target different sessions. Empty when not
+# spawning a terminal or tmux is absent.
+SESS=""
+if [ "$SPAWN_TERMINAL" -eq 1 ] && command -v tmux >/dev/null 2>&1; then
+  SESS="$(wt_tmux_session "$REPO_ROOT")"
+fi
+
 # --- double-launch guard (before any side effect) ----------------------------
 # Relaunch is for a DEAD pane; a second claude on the same branch + reused spoke_run_id would
 # race the ref (concurrent commits/pushes — the tripwire-corruption class this repo warns about).
 # Run this BEFORE the OTel docker preflights below so a refusal never leaves containers running.
-# Only relevant when actually spawning a tmux window.
-if [ "$SPAWN_TERMINAL" -eq 1 ] && [ "$FORCE" -eq 0 ] && command -v tmux >/dev/null 2>&1; then
-  GUARD_SESS="$(wt_tmux_session "$REPO_ROOT")"
+if [ -n "$SESS" ] && [ "$FORCE" -eq 0 ]; then
   if [ "$BRANCH_KNOWN" -eq 0 ]; then
     # Detached HEAD: the live window's branch-slug name is unknown, so the guard can neither
-    # confirm nor deny a live pane. Recovery is the script's primary job (an unattended hub/afk
-    # relaunch only fires when it already believes the pane is dead), so WARN and PROCEED rather
-    # than block — refusing here would strand the exact automated recovery this exists to do.
+    # confirm nor deny a live pane by name. Recovery is the script's primary job (an unattended
+    # hub/afk relaunch only fires when it already believes the pane is dead), and a detached
+    # worktree is NOT on its branch — so the branch-ref race the guard exists to prevent cannot
+    # happen from here anyway. WARN and PROCEED rather than block (which would strand the exact
+    # automated recovery this exists to do); --force silences the warning.
     wt_warn "detached-HEAD worktree — cannot verify no live pane by window name; proceeding. If a claude is still running there, Ctrl-C now."
-  elif tmux list-windows -t "=$GUARD_SESS" -F '#{window_name}' 2>/dev/null | grep -qxF "$WIN_NAME"; then
+  elif tmux list-windows -t "=$SESS" -F '#{window_name}' 2>/dev/null | grep -qxF "$WIN_NAME"; then
     # `list-windows` on a missing session is a no-op (no match), so a first-ever relaunch passes.
-    wt_die "a tmux window '$WIN_NAME' already exists in session '$GUARD_SESS' — the pane may be live. Close it first, or pass --force to relaunch anyway."
+    wt_die "a tmux window '$WIN_NAME' already exists in session '$SESS' — the pane may be live. Close it first, or pass --force to relaunch anyway."
   fi
 fi
 
@@ -186,9 +194,11 @@ wt_otel_bridge_preflight "$REPO_ROOT"
 # --- spawn the tmux window ---------------------------------------------------
 if [ "$SPAWN_TERMINAL" -eq 1 ]; then
   SPAWNED=0
-  if command -v tmux >/dev/null 2>&1; then
-    win_name="$WIN_NAME"  # the double-launch guard above already vetted this window name
-    sess="$(wt_tmux_session "$REPO_ROOT")"
+  if [ -n "$SESS" ]; then
+    # On-branch this window name was collision-checked by the guard above; on a detached HEAD the
+    # guard could only warn (the name is unknown), so no name-vetting guarantee holds there.
+    win_name="$WIN_NAME"
+    sess="$SESS"  # the single derivation from above, reused so the guard and spawn never diverge
     if tmux has-session -t "=$sess" 2>/dev/null || tmux new-session -d -s "$sess" -c "$REPO_ROOT" 2>/dev/null; then
       # `exec $SHELL` keeps the window alive after claude exits (matches worktree-new). Guard
       # the command substitution: under `set -e` a bare `win=$(...)` that fails (a tmux hiccup,
