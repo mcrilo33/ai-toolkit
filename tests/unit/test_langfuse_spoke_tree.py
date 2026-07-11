@@ -38,6 +38,7 @@ from telemetry.langfuse_spoke_tree import (
     build_cycle_batch,
     build_loaded_context_events,
     build_rule_carry_cost_scores,
+    build_rule_invocation_scores,
     build_score_events,
     build_step_cost_scores,
     build_step_duration_scores,
@@ -58,6 +59,7 @@ from telemetry.langfuse_spoke_tree import (
     transcript_scan_root,
 )
 from telemetry.request_body import (
+    ContextItem,
     decompose_request_body,
     measure_request_items,
 )
@@ -68,6 +70,7 @@ from telemetry.spoke_tree.assembly import (
     _tool_span_ids,
 )
 from telemetry.spoke_tree.commits import _gate_park_ms, _parse_commits
+from telemetry.spoke_tree.context_deltas import _label_rule_injections, load_scoped_rules
 from telemetry.spoke_tree.ids import _CYCLE_STEP_PREFIX
 from telemetry.spoke_tree.llm_decomp import _decomp_metadata
 from telemetry.spoke_tree.loaded_context import find_request_files
@@ -1398,6 +1401,96 @@ class TestCarryCostScores:
         )
 
         assert main_loop_request_count([("tr", [main, sub_agent])]) == 1
+
+
+class TestRuleInvocationScores:
+    """#232 subtask invoke: a glob-scoped rule entering context on a file-match is an ADDED
+    context-delta item; classify those and count them as rule_invocations:<rule>, so a dashboard
+    can rank rules by carry cost filtered to zero invocations (the same <rule> suffix as carry cost).
+    """
+
+    _BASE_TS = "2026-01-01T00:00:00Z"
+
+    def _msg(self, rule_basename: str) -> str:
+        content = f"Contents of /repo/.claude/rules/{rule_basename}:\n# heading\nbody"
+        return json.dumps({"role": "user", "content": content})
+
+    def test_load_scoped_rules_returns_only_glob_scoped(self, tmp_path: Path) -> None:
+        rules_dir = tmp_path / "shared" / "rules"
+        rules_dir.mkdir(parents=True)
+        (rules_dir / "metadata.yml").write_text(
+            "code-quality:\n  globs: '**/*.py'\n  alwaysApply: false\n"
+            "security:\n  alwaysApply: true\n"
+            "operational-gotchas:\n  globs: '**'\n  alwaysApply: false\n",
+            encoding="utf-8",
+        )
+
+        assert load_scoped_rules(tmp_path) == {"code-quality.md"}
+
+    def test_load_scoped_rules_missing_metadata_is_empty(self, tmp_path: Path) -> None:
+        assert load_scoped_rules(tmp_path) == set()
+
+    def test_label_tags_added_message_injecting_a_scoped_rule(self) -> None:
+        curr = [ContextItem("messages", "msg[3]:user", self._msg("code-quality.md"))]
+        added = [{"category": "messages", "name": "msg[3]:user", "tokens": 10}]
+
+        _label_rule_injections(added, curr, {"code-quality.md"})
+
+        assert added[0]["rule"] == "code-quality.md"
+
+    def test_label_ignores_an_unscoped_rule_mention(self) -> None:
+        curr = [ContextItem("messages", "msg[3]:user", self._msg("security.md"))]
+        added = [{"category": "messages", "name": "msg[3]:user", "tokens": 10}]
+
+        _label_rule_injections(added, curr, {"code-quality.md"})
+
+        assert "rule" not in added[0]
+
+    def test_label_noop_when_no_scoped_rules(self) -> None:
+        curr = [ContextItem("messages", "msg[3]:user", self._msg("code-quality.md"))]
+        added = [{"category": "messages", "name": "msg[3]:user", "tokens": 10}]
+
+        _label_rule_injections(added, curr, set())
+
+        assert "rule" not in added[0]
+
+    def _delta_event(self, *rules: str) -> dict:
+        added = [{"category": "messages", "name": "m", "tokens": 1, "rule": rule} for rule in rules]
+        return {"body": {"id": "e", "metadata": {"context_delta": {"added": added}}}}
+
+    def test_build_rule_invocation_scores_counts_per_rule(self) -> None:
+        batch = [
+            self._delta_event("code-quality.md", "python-style.md"),
+            self._delta_event("code-quality.md"),
+        ]
+
+        scores = build_rule_invocation_scores(SPOKE, batch, base_ts=self._BASE_TS)
+
+        by_name = {s["body"]["name"]: s["body"]["value"] for s in scores}
+        assert by_name == {
+            "rule_invocations:code-quality.md": 2,
+            "rule_invocations:python-style.md": 1,
+        }
+
+    def test_invocation_scores_are_trace_level_numeric(self) -> None:
+        scores = build_rule_invocation_scores(
+            SPOKE, [self._delta_event("code-quality.md")], base_ts=self._BASE_TS
+        )
+
+        body = scores[0]["body"]
+        assert body["dataType"] == "NUMERIC"
+        assert body["traceId"] == trace_id_for(SPOKE)
+        assert "observationId" not in body
+
+    def test_no_invocation_scores_without_rule_labels(self) -> None:
+        event = {
+            "body": {
+                "id": "e",
+                "metadata": {"context_delta": {"added": [{"category": "messages", "tokens": 1}]}},
+            }
+        }
+
+        assert build_rule_invocation_scores(SPOKE, [event], base_ts=self._BASE_TS) == []
 
 
 class TestContainerRollups:
