@@ -513,7 +513,7 @@ if [ "${AI_TOOLKIT_OTEL:-}" = "1" ]; then
   # THIS shell: the wt_emit_lifecycle/wt_emit_script calls below run telemetry.sh's emit, whose
   # OTLP sink (telemetry.sh, gated on AI_TOOLKIT_OTEL_SPAN_ENDPOINT) fires only when it is set —
   # the helper's own defaulting happens in a command-substitution subshell and cannot leak back.
-  : "${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:=${AI_TOOLKIT_OTEL_SPAN_ENDPOINT_DEFAULT:-http://localhost:4318}}"
+  wt_default_span_endpoint
   OTEL_PREFIX="$(wt_native_otel_prefix "$SPOKE_RUN_ID" "$OTEL_BODY_DIR")"
 fi
 

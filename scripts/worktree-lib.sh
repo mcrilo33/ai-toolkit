@@ -101,6 +101,17 @@ wt_now_ms() {
 # worktree-new.sh (spawn) and spoke-relaunch.sh (relaunch), so the two never drift.
 # The body dir is created by the caller (it also passes it to the bridge preflight).
 # Usage: wt_native_otel_prefix <spoke_run_id> <body_dir>
+# Default AI_TOOLKIT_OTEL_SPAN_ENDPOINT in the CALLER'S shell (unset -> the local
+# collector's OTLP-HTTP :4318, operator override preserved) and EXPORT it. The single
+# source for this default (#233): the span sink in telemetry.sh's emit reads it from the
+# emitting shell, so worktree-new.sh (spawn) and spoke-relaunch.sh (relaunch) each call
+# this before their wt_emit_* calls; wt_native_otel_prefix calls it too so the prefix
+# string's value matches. Must run non-subshelled to set the caller's var.
+wt_default_span_endpoint() {
+  : "${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:=${AI_TOOLKIT_OTEL_SPAN_ENDPOINT_DEFAULT:-http://localhost:4318}}"
+  export AI_TOOLKIT_OTEL_SPAN_ENDPOINT
+}
+
 wt_native_otel_prefix() {
   local spoke_run_id="$1" body_dir="$2"
   [ "${AI_TOOLKIT_OTEL:-}" = "1" ] || return 0
@@ -109,7 +120,7 @@ wt_native_otel_prefix() {
   # normal host:port silently kills trace+log export. The span sink is OTLP-HTTP :4318.
   : "${OTEL_EXPORTER_OTLP_ENDPOINT:=http://localhost:4317}"
   : "${BETA_TRACING_ENDPOINT:=http://localhost:4418}"
-  : "${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:=${AI_TOOLKIT_OTEL_SPAN_ENDPOINT_DEFAULT:-http://localhost:4318}}"
+  wt_default_span_endpoint
   printf 'CLAUDE_CODE_ENABLE_TELEMETRY=1 CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 OTEL_TRACES_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp ENABLE_BETA_TRACING_DETAILED=1 OTEL_METRICS_INCLUDE_ACCOUNT_UUID=false OTEL_EXPORTER_OTLP_PROTOCOL=grpc OTEL_EXPORTER_OTLP_ENDPOINT=%s BETA_TRACING_ENDPOINT=%s AI_TOOLKIT_OTEL_SPAN_ENDPOINT=%s OTEL_LOG_USER_PROMPTS=1 OTEL_LOG_TOOL_DETAILS=1 OTEL_LOG_TOOL_CONTENT=1 OTEL_LOG_RAW_API_BODIES=%s AI_TOOLKIT_OTEL_BODY_DIR=%s OTEL_RESOURCE_ATTRIBUTES=%s ' \
     "$(printf '%q' "$OTEL_EXPORTER_OTLP_ENDPOINT")" \
     "$(printf '%q' "$BETA_TRACING_ENDPOINT")" \

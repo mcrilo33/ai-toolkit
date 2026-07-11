@@ -88,11 +88,16 @@ WT_TAG="$(basename "$WT_DIR")"
 WT_TAG="${WT_TAG#"$(basename "$REPO_ROOT")-"}"
 BRANCH="$(git -C "$WT_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
 if [ -n "$BRANCH" ]; then
-  WIN_NAME="${BRANCH##*/}"
+  WIN_NAME="${BRANCH##*/}"   # exactly what worktree-new.sh named the window
   ISSUE="${WIN_NAME%%-*}"
+  BRANCH_KNOWN=1
 else
+  # Detached HEAD: the original branch slug (the live window's name) is unrecoverable, so
+  # WIN_NAME is only a best-effort tag and the double-launch guard cannot match a live
+  # window by name. BRANCH_KNOWN=0 makes the guard fail SAFE (refuse unless --force).
   WIN_NAME="$WT_TAG"
   ISSUE="$WT_TAG"
+  BRANCH_KNOWN=0
 fi
 # A non-numeric leading slug (an ad-hoc worktree) still references the tag as the issue.
 case "$ISSUE" in
@@ -142,7 +147,7 @@ OTEL_PREFIX=""
 if [ "${AI_TOOLKIT_OTEL:-}" = "1" ]; then
   OTEL_BODY_DIR="$WT_DIR/.ai-toolkit/raw-bodies"
   mkdir -p "$OTEL_BODY_DIR"
-  : "${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:=${AI_TOOLKIT_OTEL_SPAN_ENDPOINT_DEFAULT:-http://localhost:4318}}"
+  wt_default_span_endpoint
   OTEL_PREFIX="$(wt_native_otel_prefix "$SPOKE_RUN_ID" "$OTEL_BODY_DIR")"
 fi
 
@@ -163,16 +168,21 @@ wt_otel_bridge_preflight "$REPO_ROOT"
 if [ "$SPAWN_TERMINAL" -eq 1 ]; then
   SPAWNED=0
   if command -v tmux >/dev/null 2>&1; then
-    win_name="$WIN_NAME"  # detached-HEAD-safe (computed above), never the literal "HEAD"
+    win_name="$WIN_NAME"
     sess="$(wt_tmux_session "$REPO_ROOT")"
-    # Double-launch guard: relaunch is for a DEAD pane. If a window for this branch is
-    # still present in the session the pane is likely alive — a second claude on the same
-    # branch + reused spoke_run_id would race the ref (concurrent commits/pushes, the
-    # tripwire-corruption class this repo warns about). Refuse unless --force. `list-windows`
-    # on a missing session is a no-op (no match), so a first-ever relaunch is unaffected.
-    if [ "$FORCE" -eq 0 ] \
-       && tmux list-windows -t "=$sess" -F '#{window_name}' 2>/dev/null | grep -qxF "$win_name"; then
-      wt_die "a tmux window '$win_name' already exists in session '$sess' — the pane may be live. Close it first, or pass --force to relaunch anyway."
+    # Double-launch guard: relaunch is for a DEAD pane. A second claude on the same branch +
+    # reused spoke_run_id would race the ref (concurrent commits/pushes, the tripwire-corruption
+    # class this repo warns about), so refuse unless --force when a live pane may exist.
+    if [ "$FORCE" -eq 0 ]; then
+      if [ "$BRANCH_KNOWN" -eq 0 ]; then
+        # Detached HEAD: the live window's name (the branch slug) is unrecoverable, so the guard
+        # cannot prove a pane is dead. Fail safe — make the operator confirm and pass --force.
+        wt_die "cannot verify the pane is dead for a detached-HEAD worktree (its window name is unknown) — check no claude is running there, then re-run with --force."
+      fi
+      # `list-windows` on a missing session is a no-op (no match), so a first-ever relaunch passes.
+      if tmux list-windows -t "=$sess" -F '#{window_name}' 2>/dev/null | grep -qxF "$win_name"; then
+        wt_die "a tmux window '$win_name' already exists in session '$sess' — the pane may be live. Close it first, or pass --force to relaunch anyway."
+      fi
     fi
     if tmux has-session -t "=$sess" 2>/dev/null || tmux new-session -d -s "$sess" -c "$REPO_ROOT" 2>/dev/null; then
       # `exec $SHELL` keeps the window alive after claude exits (matches worktree-new). Guard

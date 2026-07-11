@@ -146,23 +146,35 @@ def test_force_overrides_the_double_launch_guard(spoke_worktree, tmp_path: Path)
     assert any(ln.startswith("new-window") for ln in calls.splitlines())
 
 
-def test_detached_head_tags_from_the_worktree_dir_not_literal_head(
-    spoke_worktree, tmp_path: Path
-) -> None:
-    main, wt = spoke_worktree
-    # Detach HEAD so `git rev-parse --abbrev-ref HEAD` yields the literal "HEAD".
+def _detach_head(wt: Path) -> None:
     head = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=str(wt), capture_output=True, text=True, env=_GIT_ENV
     ).stdout.strip()
     subprocess.run(["git", "checkout", "-q", head], cwd=str(wt), check=True, env=_GIT_ENV)
 
-    proc, calls = _run(main, str(wt), tmp_path=tmp_path)
+
+def test_detached_head_refuses_to_spawn_without_force(spoke_worktree, tmp_path: Path) -> None:
+    main, wt = spoke_worktree
+    _detach_head(wt)  # the live window's branch-slug name is now unrecoverable
+
+    proc, _calls = _run(main, str(wt), tmp_path=tmp_path)
+
+    # The guard cannot prove the pane is dead, so it must fail safe rather than risk a double launch.
+    assert proc.returncode != 0
+    assert "detached-HEAD" in proc.stderr
+
+
+def test_detached_head_with_force_tags_from_dir_not_literal_head(
+    spoke_worktree, tmp_path: Path
+) -> None:
+    main, wt = spoke_worktree
+    _detach_head(wt)
+
+    proc, calls = _run(main, str(wt), "--force", tmp_path=tmp_path)
 
     assert proc.returncode == 0, proc.stderr
-    # The window-spawn passes AGENT_CMD (with WT_SPOKE) as the new-window shell command, so both
-    # the tag and the window name land in the tmux call log. Neither may be the literal "HEAD":
-    # WT_SPOKE=HEAD would mis-tag the spoke's markers, and a window named "HEAD" would defeat the
-    # double-launch guard (which greps list-windows for the window name).
+    # AGENT_CMD (with WT_SPOKE) is the new-window shell command, so both the tag and the window
+    # name land in the tmux call log — neither may be the literal "HEAD".
     new_window = next((ln for ln in calls.splitlines() if ln.startswith("new-window")), "")
     assert "WT_SPOKE=42" in new_window
     assert "WT_SPOKE=HEAD" not in new_window
