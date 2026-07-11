@@ -694,6 +694,18 @@ _still_parked_same() {
   [ "$(extract_pending_question "$wt")" = "$question" ]
 }
 
+# _spoke_still_parked <wt> <issue> -> true when the spoke is currently parked on SOMETHING (a
+# permission dialog, a PLAN gate, or an extractable question) — regardless of whether it is the
+# SAME prompt as before. #241 §4 uses this to tell a genuine park-change (recompute) from a
+# spoke that has MOVED ON and is actively working (no park → drop, preserving the #89 no-inject
+# -mid-turn guard). A positive park signal, so an ambiguous read fails toward "moved on" (drop).
+_spoke_still_parked() {
+  local wt="$1" issue="$2"
+  _permission_pending "$wt" && return 0
+  _gate_parked "$wt" "$issue" && return 0
+  [ -n "$(extract_pending_question "$wt")" ]
+}
+
 # _spoke_moved_on <wt> <before_mtime> -> true ONLY when the spoke's transcript has a NEW
 # write since <before_mtime>: a positive, confident signal that it is actively working. The
 # escalation freshness-gate (#171-subtask-2) uses this rather than !_still_parked_same so it
@@ -2168,6 +2180,51 @@ PYEOF
   case $? in 0) return 0 ;; 3) return 1 ;; *) return 2 ;; esac
 }
 
+# _user_turn_appended <wt_path> <sizes> -> did ANY type:"user" record land in transcript bytes
+# appended after the <sizes> snapshot? The genuine "the spoke MOVED ON" signal (#241 §4): a
+# human/self reply is recorded as a user turn, whereas a non-turn write (the #240 pending
+# -tool_use flush, an OTel dump) only bumps the mtime. The staleness recompute gates on the
+# DEFINITE "no user turn" (rc 1); rc 0 (a reply landed) or rc 2 (cannot tell) both fall to the
+# #89-safe drop. rc 0 found, rc 1 none, rc 2 unavailable (no python3 / no project dir / crash).
+_user_turn_appended() {
+  local wt="$1" sizes="$2" dir
+  dir="$(_spoke_project_dir "$wt")"
+  [ -d "$dir" ] || return 2
+  command -v python3 >/dev/null 2>&1 || return 2
+  _AFK_DIR="$dir" _AFK_SIZES="$sizes" python3 2>/dev/null <<'PYEOF'
+import glob, json, os, sys
+
+offsets = {}
+for line in os.environb.get(b"_AFK_SIZES", b"").splitlines():
+    size, _, path = line.partition(b"\t")
+    if path:
+        try:
+            offsets[os.fsdecode(path)] = int(size)
+        except ValueError:
+            pass
+for path in glob.glob(os.path.join(os.environ["_AFK_DIR"], "*.jsonl")):
+    try:
+        with open(path, "rb") as fh:
+            offset = offsets.get(path, 0)
+            fh.seek(0, 2)
+            if offset > fh.tell():  # rotated/truncated since the snapshot: rescan
+                offset = 0
+            fh.seek(offset)
+            appended = fh.read()
+    except OSError:
+        continue
+    for line in appended.splitlines():
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(record, dict) and record.get("type") == "user":
+            sys.exit(0)
+sys.exit(3)
+PYEOF
+  case $? in 0) return 0 ;; 3) return 1 ;; *) return 2 ;; esac
+}
+
 # _answer_delivered <wt> <target> <text> <sizes> -> after _transcript_advanced
 # succeeded, decide whether the answer actually LEFT the composer (#201: an advance
 # alone scored two wedged pastes as "injected answer into #182" while the answer sat
@@ -2380,7 +2437,7 @@ _broker_present_qcm() {
 # answer, or escalate to blocked/<issue>. Fail-safe: an answerer that returns no decision
 # (or an answer we cannot inject) escalates rather than guessing.
 broker_service_gate() {
-  local wt="$1" issue="$2" mode="${3:-unattended}" question orig_question raw rc decision kind text target was_gate=0 inject_diagnosed=0
+  local wt="$1" issue="$2" mode="${3:-unattended}" depth="${4:-0}" question orig_question raw rc decision kind text target was_gate=0 inject_diagnosed=0
   # Self-heal a stale gate tag (issue #204): if gate/<issue> is at the tip but the spoke
   # already resumed past its PLAN gate (a late / external / attended approval that never ran
   # the confirmed-inject path), consume the stale tag and stop — do NOT re-answer, and do NOT
@@ -2405,18 +2462,30 @@ broker_service_gate() {
   # BOTH the permission path (#203 finding 4's compound dialog) and the answerer path.
   local park_sig; park_sig="$(_broker_park_signature "$wt" "$issue")"
   if _broker_reanswer_exhausted "$wt" "$issue" "$park_sig"; then
-    # Log the terminal state ONCE per (tip, sig) — not on every event wake (#237). A moved tip
-    # or changed prompt is a new key that resets the ceiling AND logs afresh when it re-exhausts.
-    local _tip; _tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"
-    _broker_log_terminal_once "$issue" "ceiling:${_tip}:${park_sig}" \
-      "  #$issue re-answer ceiling reached on the same prompt — leaving it terminal (no re-answer)"
-    return 0
+    # #241 §5: the ceiling is no longer TERMINAL — it warns and retries on an exponential
+    # backoff, so a doom-loop is throttled by the growing curve, not abandoned. On the FIRST
+    # exhaustion: warn, arm the backoff, and pause. Inside the backoff window: skip (parked
+    # LAST). Once the backoff elapses: warn, re-arm a longer backoff, and fall through for ONE
+    # supervised retry (the counter stays exhausted, so each window yields a single re-run).
+    local ws; ws="$(_afk_warned_state_file "$issue")"
+    if [ ! -f "$ws" ]; then
+      broker_warn "$issue" "re-answer ceiling reached on the same prompt — backing off (retried on the curve, #241)"
+      broker_journal_decision "$issue" ceiling "re-answer ceiling reached; backing off on unchanged park" reversible
+      _afk_warned_arm "$issue"
+      return 0
+    fi
+    if ! _afk_warned_due "$issue"; then return 0; fi   # inside the backoff window → parked LAST
+    broker_warn "$issue" "re-answer backoff elapsed — one supervised retry on the same prompt (#241)"
+    broker_journal_decision "$issue" ceiling "re-answer backoff elapsed; supervised retry" reversible
+    _afk_warned_arm "$issue"
+    # fall through for one supervised retry; the now-longer backoff paces the next
   fi
   # A pending permission dialog is decided by the rules classifier, not the answerer (#149).
   if _permission_pending "$wt"; then _decide_permission "$wt" "$issue"; return; fi
   # Snapshot the transcript clock BEFORE the park checks: a write landing between
   # this and the pre-inject re-check must count as movement (review nit, ST2).
   local parked_mtime; parked_mtime="$(_transcript_mtime "$wt")"
+  local parked_sizes; parked_sizes="$(_transcript_sizes "$wt")"   # #241 §4: detect a real reply vs a non-turn write
   _gate_parked "$wt" "$issue" && was_gate=1
   orig_question="$(extract_pending_question "$wt")"
   question="$orig_question"
@@ -2482,7 +2551,19 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
     # land mid-turn (#129/#89) and even a seed-replay escalation would stamp a
     # spurious blocked/<issue> on an actively-working spoke.
     if ! _still_parked_same "$wt" "$issue" "$was_gate" "$orig_question" "$parked_mtime"; then
-      log "  #$issue is no longer parked on that prompt — dropping the stale answer"
+      # #241 §4: the park may have CHANGED (a new prompt), or a non-turn write may have bumped
+      # the transcript mtime while the spoke is STILL parked (the recurring-false-staleness that
+      # stranded #240). Recompute against the CURRENT park in the same pass (depth-bounded to one
+      # re-run) ONLY when the spoke is still parked AND no USER TURN landed since the park — a
+      # DEFINITE no-reply (rc 1). Preserve #89/#129: a reply landing (rc 0) or an unreadable
+      # transcript (rc 2) means the spoke may have moved on, so drop rather than inject mid-turn.
+      _user_turn_appended "$wt" "$parked_sizes"; local _ut_rc=$?
+      if [ "$depth" -lt 1 ] && [ "$_ut_rc" -eq 1 ] && _spoke_still_parked "$wt" "$issue"; then
+        log "  #$issue still parked on a refreshed prompt (no reply landed) — recomputing against the current park (#241)"
+        broker_service_gate "$wt" "$issue" "$mode" "$(( depth + 1 ))"
+        return $?
+      fi
+      log "  #$issue is no longer parked on that prompt — dropping the stale answer (spoke moved on)"
       return 0
     elif _is_seed_replay "$wt" "$text"; then
       log "  answer to #$issue replays the spoke's own seed prompt — suppressing (#124)"

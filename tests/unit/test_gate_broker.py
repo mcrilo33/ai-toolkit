@@ -3542,6 +3542,9 @@ def test_staleness_recomputes_against_current_park(
     # check always reports "changed" — a false staleness. The pane still shows the park, so #241
     # must recompute (re-run) rather than drop. The recompute is depth-bounded to one re-run.
     live_jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    os.utime(
+        live_jsonl, (1_000_000_000, 1_000_000_000)
+    )  # pin OLD so the reasoner's touch reads as newer
     env = {
         **waiting_spoke_env,
         "AFK_ANSWERER_CMD": f"printf x >> '{calls}'; touch '{live_jsonl}'; printf 'ANSWER: pick Redis'",

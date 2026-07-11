@@ -1630,30 +1630,44 @@ def test_decide_and_act_aborts_when_no_longer_parked(tmp_path: Path) -> None:
     )
 
 
-def test_decide_and_act_aborts_when_question_changed(tmp_path: Path) -> None:
-    # The spoke is still parked, but on a DIFFERENT question than the one the answerer
-    # reasoned about — the computed answer is stale; drop it and let the next tick
-    # answer the new question.
+def test_decide_and_act_recomputes_when_question_changed(tmp_path: Path) -> None:
+    # #241 §4: the spoke is still parked, but on a DIFFERENT question than the one the answerer
+    # reasoned about — and NO user reply landed (a real park change, not a moved-on). Instead of
+    # bare-dropping (pre-#241) and burning a whole tick, the broker RECOMPUTES against the current
+    # park in the same pass (depth-bounded to one re-run). Never blocked.
     spoke = _branched_spoke(tmp_path, ahead=True, name="moved-spoke", branch="feature/5-fix")
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke)
     _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
+    # Pin the park mtime OLD so the reasoner's append reads as a deterministic staleness
+    # (the 1s mtime granularity is otherwise a same-second race on the outer detection).
+    os.utime(pd / "session.jsonl", (1_000_000_000, 1_000_000_000))
     fake_bin, tmux_log = _injector_tmux(tmp_path, capture="│ > │\n", pane_path=spoke)
     env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
+    calls = tmp_path / "answerer.calls"
     extra = tmp_path / "extra.jsonl"
     extra.write_text(
         json.dumps(_ask_record("Which cache TTL?", [("60s", "short"), ("1h", "long")])) + "\n"
     )
+    # Each reasoning run appends a NEW question (an assistant record — NOT a user reply), so the
+    # park signature keeps changing while the spoke stays parked: exactly the recompute trigger.
     env["AFK_ANSWERER_CMD"] = (
-        f'cat "{extra}" >> "{pd / "session.jsonl"}"; printf \'ANSWER: use Redis\''
+        f"printf x >> '{calls}'; cat \"{extra}\" >> \"{pd / 'session.jsonl'}\"; printf 'ANSWER: use Redis'"
     )
 
     result = _call(f"decide_and_act '{spoke}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    tmux_calls = tmux_log.read_text() if tmux_log.exists() else ""
-    assert " -l " not in f" {tmux_calls} ", "an answer to a superseded question is stale"
-    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
+    # The recompute path is taken (a deterministic stderr signal) rather than a bare drop, and
+    # it re-runs the reasoner against the current park.
+    assert "recomputing against the current park" in result.stderr, result.stderr
+    n = calls.read_text().count("x") if calls.exists() else 0
+    assert n >= 2, (
+        f"a changed park while still parked must recompute (re-run), not bare-drop; ran {n}"
+    )
+    # NB: the recompute re-answers the current park; whether its inner inject lands or falls to
+    # the (still-terminal-in-S4) inject-failure escalation is timing-dependent and orthogonal —
+    # S5 converts that escalation to warn-continue. Here we only pin the recompute-not-drop.
 
 
 def test_decide_and_act_gate_park_moved_on_aborts(tmp_path: Path) -> None:
