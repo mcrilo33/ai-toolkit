@@ -6587,12 +6587,13 @@ def test_reap_pass_revival_exhausted_parks_last_not_blocked(tmp_path: Path) -> N
     assert (statedir / "warned-5.txt").exists()
 
 
-def test_reap_pass_pushed_but_unmarked_auto_marks_not_reaps(tmp_path: Path) -> None:
-    # #200/#241 §8: a spoke that FINISHED and pushed but whose completion mark never landed is
-    # auto-marked ready (the drain then lands it), not reaped/blocked.
+def test_reap_pass_pushed_but_unmarked_warns_not_reaps(tmp_path: Path) -> None:
+    # #200/#241: a clean-pushed tip with no completion marker is warned-and-parked-LAST with an
+    # actionable reason, NOT reaped and NOT auto-landed — the shape is ambiguous with a spoke idle
+    # BETWEEN subtasks, so auto-emitting ready/<issue> could land incomplete work onto main.
     spoke = _branched_spoke(tmp_path, ahead=True)
     fake_bin, _ = _reaper_tmux(tmp_path, pane_path=spoke)  # pane alive
-    expr, env, ready_log, _ = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
     push_log = tmp_path / "push.log"
     push_stub = tmp_path / "spoke-push.sh"
     push_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{push_log}"\n')
@@ -6604,8 +6605,10 @@ def test_reap_pass_pushed_but_unmarked_auto_marks_not_reaps(tmp_path: Path) -> N
     _call(expr, env=env)
 
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
-        "a pushed-but-unmarked spoke is auto-marked, not blocked"
+        "a pushed-but-unmarked spoke is warned, not blocked"
     )
-    assert push_log.exists() and "--ready 5" in push_log.read_text(), (
-        "the completion mark must be auto-emitted"
+    # NEVER auto-lands: --ready must NOT be emitted (would land possibly-incomplete work).
+    assert not push_log.exists() or "--ready 5" not in push_log.read_text(), (
+        "auto-landing incomplete work must not happen — surface it for the human instead"
     )
+    assert (statedir / "warned-5.txt").exists()

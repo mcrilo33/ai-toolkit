@@ -665,14 +665,18 @@ respawn_wedged_spoke() {
 # revival was ALREADY tried this window downgrades to warned-and-parked-LAST (warn + journal +
 # arm the warned-retry backoff, retried at low frequency), NEVER killed or abandoned.
 
-# _warn_parked_last <wt> <issue> <reason> -> the never-abandon replacement for reap_spoke: warn
-# loudly, journal the decision, and keep the spoke in rotation on the warned-retry backoff. NO
-# window kill, NO blocked/<issue>. reversible: the spoke's committed work is intact.
+# _warn_parked_last <wt> <issue> <reason> [park_kind=reap] -> the never-abandon replacement for
+# reap_spoke: keep the spoke in rotation on the warned-retry backoff. NO window kill, NO
+# blocked/<issue>. It HONORS the backoff — it warns + journals only when the spoke is DUE, and
+# parks LAST SILENTLY inside the backoff window — so a permanently-stuck spoke is retried (and
+# re-warned) at LOW frequency, not warned + gh-commented every 5-minute tick. reversible: the
+# spoke's committed work is intact.
 _warn_parked_last() {
-  local wt="$1" issue="$2" reason="$3"
+  local wt="$1" issue="$2" reason="$3" park="${4:-reap}"
+  _afk_warned_due "$issue" || return 0   # inside the backoff → parked LAST silently this tick
   log "→ warn-park-LAST #$issue: $reason"
   _afk_set_last_action "warn-park #$issue"
-  broker_warn_continue "$wt" "$issue" revive "$reason" reversible
+  broker_warn_continue "$wt" "$issue" "$park" "$reason" reversible
 }
 
 # _revive_spoke <wt> <issue> -> kill any hung/crashed window and relaunch the spoke via
@@ -712,14 +716,17 @@ _afk_revive_or_park_last() {
     || _warn_parked_last "$wt" "$issue" "$reason — revival launch could not be started; retrying"
 }
 
-# _afk_auto_mark_ready <wt> <issue> -> #200/#241 §8: a spoke that FINISHED and pushed but whose
-# completion mark never landed is AUTO-MARKED ready (the drain then lands it) + warned for
-# post-review, instead of reaped. Best-effort emit via spoke-push.sh --ready.
-_afk_auto_mark_ready() {
-  local wt="$1" issue="$2" sp
-  sp="$(_afk_find_script "${SPOKE_PUSH:-}" spoke-push.sh)" || sp=""
-  [ -n "$sp" ] && ( cd "$wt" && "$sp" --ready "$issue" ) >/dev/null 2>&1 || true
-  _warn_parked_last "$wt" "$issue" "pushed-but-unmarked (#200) — auto-emitted ready/$issue; review and land"
+# _afk_warn_pushed_but_unmarked <wt> <issue> -> #200/#241: a clean-pushed tip with no completion
+# marker is warned-and-parked-LAST with an ACTIONABLE reason, NOT auto-marked. The shape is
+# AMBIGUOUS — genuinely finished (the marker just failed) vs idle BETWEEN subtasks (more work to
+# come, cf. _afk_pushed_but_unmarked's own caution) — so auto-emitting ready/<issue> could
+# auto-LAND incomplete work onto main (hard to reverse). Never abandoned: the loud warning
+# surfaces it for the human to re-run --ready or land by hand.
+_afk_warn_pushed_but_unmarked() {
+  local wt="$1" issue="$2"
+  _warn_parked_last "$wt" "$issue" \
+    "pushed-but-unmarked (#200): clean tip, no ready/$issue marker — if finished, re-run 'spoke-push.sh --ready $issue' or land by hand" \
+    markready
 }
 
 # _reap_or_resume <wt> <issue> -> #241 §7/§8: revive-first, never block. A finished-but-unmarked
@@ -728,9 +735,10 @@ _afk_auto_mark_ready() {
 # revival was already tried this window is warned-and-parked-LAST, never reaped/abandoned.
 _reap_or_resume() {
   local wt="$1" issue="$2"
-  # #200/#241 §8: a live pane that FINISHED but whose mark never landed is auto-marked, not reaped.
+  # #200/#241: a live pane at a clean-pushed tip with no marker is warned-and-parked-LAST with an
+  # actionable reason (NOT auto-marked/auto-landed — the shape is ambiguous with idle-between-subtasks).
   if _spoke_pane_alive "$wt" && _afk_pushed_but_unmarked "$wt" "$issue"; then
-    _afk_auto_mark_ready "$wt" "$issue"
+    _afk_warn_pushed_but_unmarked "$wt" "$issue"
     return 0
   fi
   if _spoke_over_any_ceiling "$issue" "$(afk_now)"; then
