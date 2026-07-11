@@ -3562,3 +3562,57 @@ def test_staleness_recomputes_against_current_park(
 
     n = calls.read_text().count("x") if calls.exists() else 0
     assert n == 2, f"a still-parked staleness must recompute once (not bare-drop); ran {n}"
+
+
+# ── issue #241 S5: the human-decision chokepoint warns-and-continues, never parks ──
+# _broker_on_human_decision (unattended) is the ONE seam every void/fingerprint/inject-failure/
+# ESCALATE/no-decision escalation funnels through. #241 converts it from _escalate_blocked
+# (terminal blocked/<issue>) to broker_warn_continue: warn loudly, journal the taken decision,
+# and keep the spoke serviced. The mutation-void becomes backoff-paced, not terminal-forever.
+
+
+def test_unattended_escalate_warns_not_blocks(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": "printf 'reasoning\\nESCALATE: this is a human call'",
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    log = Path(env["_READY_LOG"]).read_text() if Path(env["_READY_LOG"]).exists() else ""
+    assert "--blocked 5" not in log, "the answerer's human-call must warn-and-continue, not park"
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert (statedir / "warned-5.txt").exists()
+    assert (statedir / "decision-journal.jsonl").exists()
+
+
+def test_mutation_void_warns_not_blocks(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # A reasoner that mutates the read-only live tree still has its answer VOIDED (never
+    # injected), but #241 warns-and-continues instead of parking blocked/<issue>.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (spoke_repo / "tracked.txt").write_text("original")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=spoke_repo, check=True, capture_output=True)
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": f"printf 'mutated' > '{spoke_repo}/tracked.txt'; printf 'ANSWER: go ahead'",
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    log = Path(env["_READY_LOG"]).read_text() if Path(env["_READY_LOG"]).exists() else ""
+    assert "--blocked 5" not in log, "a voided mutation must warn-and-continue, not park"
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert (statedir / "warned-5.txt").exists()
