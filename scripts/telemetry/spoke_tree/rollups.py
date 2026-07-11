@@ -32,6 +32,7 @@ from telemetry.spoke_tree.observations import (
     _is_guards_group,
     _is_hook,
     _is_script_node,
+    _is_skill_span,
     _is_tool_span,
     _parse_utc,
 )
@@ -40,6 +41,7 @@ _DURATION_CLASSES: tuple[str, ...] = (
     "llm_request",
     "sub-agent",
     "tool",
+    "skill",
     "hook",
     "script",
     "step",
@@ -81,6 +83,8 @@ def _duration_class(event: IngestEvent) -> str:
         return "script"
     if _is_guards_group(body) or _is_hook(body):
         return "hook"
+    if _is_skill_span(body):
+        return "skill"
     if _is_tool_span(body):
         return "tool"
     return "other"

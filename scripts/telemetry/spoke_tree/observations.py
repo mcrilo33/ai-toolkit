@@ -41,6 +41,9 @@ _PRE_STEP_NAME = "preStep"  # View B cycle-axis bookend nodes (#113)
 _POST_STEP_NAME = "postStep"
 _SKILL_ACTIVATED_NAME = "skill_activated"  # the span-less lifecycle event (#110 AC2)
 _SKILL_NAME_KEY = "skill.name"
+# The first-class skill invocation node (#234): a copied ``tool:Skill`` span relabeled to
+# ``skill:<name>`` so a skill reads as a per-skill unit with its own cost rollup and success score.
+_SKILL_SPAN_PREFIX = "skill:"
 # Metadata keys that may carry a tool-call id, in priority order.
 _TOOL_USE_ID_KEYS = ("tool_use_id", "gen_ai.tool.call.id")
 # The per-turn id Claude Code stamps on a ``claude_code.interaction`` and every event-layer
@@ -298,6 +301,16 @@ def _is_hook_event(body: Observation | None) -> bool:
 def _is_skill_activated(observation: Observation) -> bool:
     """Whether an observation is a span-less ``skill_activated`` lifecycle event (#110 AC2)."""
     return (observation.get("name") or "") == _SKILL_ACTIVATED_NAME
+
+
+def _is_skill_span(observation: Observation) -> bool:
+    """Whether a node is a relabeled first-class ``skill:<name>`` invocation span (#234).
+
+    Only the assembled copy carries this name (the source span is a generic ``tool:Skill``); the
+    duration rollup books its exclusive time to the ``skill`` bucket and the success scorer keys off
+    it.
+    """
+    return (observation.get("name") or "").startswith(_SKILL_SPAN_PREFIX)
 
 
 def _skill_name(observation: Observation) -> str | None:

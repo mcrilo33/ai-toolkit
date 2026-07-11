@@ -50,6 +50,7 @@ class TestEnrichmentRegistry:
             "invocation-scores",
             "enforcement-scores",
             "script-success",
+            "skill-success",
             "agent-verdict",
         ]
 

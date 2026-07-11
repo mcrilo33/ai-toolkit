@@ -24,6 +24,7 @@ from telemetry.spoke_tree.ids import _CYCLE_STEP_PREFIX, cycle_trace_id_for, tra
 from telemetry.spoke_tree.observations import (
     _POST_STEP_NAME,
     _PRE_STEP_NAME,
+    _SKILL_SPAN_PREFIX,
     _SUB_AGENT_PREFIX,
     IngestEvent,
     TraceObservations,
@@ -31,6 +32,7 @@ from telemetry.spoke_tree.observations import (
     _is_gate_observation,
     _is_hook_event,
     _is_script_node,
+    _is_skill_span,
     _llm_requests_in_order,
     _parse_utc,
 )
@@ -47,6 +49,13 @@ _TOOL_RESULT_SIZE_SCORE = "tool_result_size"  # bytes of a tool node's reconstru
 # per-script success rate.
 _SCRIPT_SUCCESS_SCORE = "script_success"
 _STATUS_SUCCESS = "success"
+# Skill success (#234): mirror a skill span's SCRIPTED exit-status (stamped by the SKILL.md/hook
+# contract, never LLM-self-reported) into a ``skill_success:<name>`` 0/1 score. Ready-but-latent
+# like ``script_success`` above: emitted ONLY when a skill carries a scripted status attribute, so a
+# statusless skill is not scored 0 (absence is not a failure) and the widget stays empty until the
+# contract stamps a status. Read from the skill span attributes, in priority order.
+_SKILL_SUCCESS_SCORE = "skill_success"
+_SKILL_STATUS_KEYS = ("skill.status", "skill_exit_status")
 # Agent verdict (#233): the outcome of an agent that ran under the spoke, as a numeric score named
 # by the agent type. code-review reads the APPROVE/REJECT verdict from its signed ``.review``
 # artifact; a schema-returning sub-agent reads the ``status`` its structured return carried. The
@@ -286,6 +295,63 @@ def build_script_success_scores(
                 spoke_run_id,
                 name=f"{_SCRIPT_SUCCESS_SCORE}:{_script_name(body)}",
                 value=value,
+                trace_id=trace_id,
+                base_ts=base_ts,
+                observation_id=body["id"],
+            )
+        )
+    return events
+
+
+def _skill_span_name(body: dict[str, Any]) -> str:
+    """Return a ``skill:<name>`` span's skill identity for the score-name suffix (#234)."""
+    name = body.get("name") or ""
+    return name[len(_SKILL_SPAN_PREFIX) :]
+
+
+def build_skill_success_scores(
+    spoke_run_id: str, batch: list[IngestEvent], *, base_ts: str
+) -> list[IngestEvent]:
+    """Build per-skill ``skill_success:<name>`` 0/1 scores from each skill span's status (#234).
+
+    A first-class ``skill:<name>`` span (relabeled from ``tool:Skill``, :func:`_skill_relabel`)
+    carries a cost rollup already, but success must be SCRIPTED, never LLM-self-reported: this reads
+    a scripted exit-status attribute (:data:`_SKILL_STATUS_KEYS`) that the SKILL.md/hook contract
+    stamps, mirroring :func:`build_script_success_scores`. The value is ``1.0`` when the status is
+    ``success`` and ``0.0`` otherwise, observation-scoped to the skill node with a deterministic id
+    (a skill run twice keeps both, so the view's average is the per-skill success rate).
+
+    Ready-but-latent: a score is emitted ONLY when the skill carries a scripted status attribute — a
+    statusless skill is skipped rather than scored 0 (absence of a scripted status is not a failure),
+    so no skill self-reports and the widget stays empty until the contract (a separate cross-cutting
+    surface) stamps a status.
+
+    UPGRADE: a gate-shaped skill (``/afk``, ``/hub``) has no scripted exit-status but a mechanical
+    gate outcome (subtask landed) — derive its success from the existing gate signal once that join
+    is wired; today only the status-attribute path emits.
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids).
+        batch: The assembled View A events (its ``skill:`` nodes are read).
+        base_ts: ISO timestamp stamped on every score event.
+
+    Returns:
+        The ``score-create`` events, one per skill node carrying a scripted status (empty when none).
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    events: list[IngestEvent] = []
+    for event in batch:
+        body = event["body"]
+        if not _is_skill_span(body):
+            continue
+        status = _attr(body, *_SKILL_STATUS_KEYS)
+        if status is None:
+            continue
+        events.append(
+            _score_event(
+                spoke_run_id,
+                name=f"{_SKILL_SUCCESS_SCORE}:{_skill_span_name(body)}",
+                value=1.0 if status == _STATUS_SUCCESS else 0.0,
                 trace_id=trace_id,
                 base_ts=base_ts,
                 observation_id=body["id"],

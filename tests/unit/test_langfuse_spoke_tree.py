@@ -173,6 +173,7 @@ def _dur(total_ms: int, components: dict[str, int] | None = None) -> dict:
         "llm_request",
         "sub-agent",
         "tool",
+        "skill",
         "hook",
         "script",
         "step",

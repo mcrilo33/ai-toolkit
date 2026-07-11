@@ -240,6 +240,7 @@ from telemetry.spoke_tree.scores import (
     build_rule_invocation_scores,
     build_score_events,
     build_script_success_scores,
+    build_skill_success_scores,
     build_step_cost_scores,
     build_step_duration_scores,
     build_step_total_cost_scores,
@@ -907,6 +908,7 @@ class EnrichmentContext:
     invocation_scores: list[IngestEvent] = field(default_factory=list)
     enforcement_scores: list[IngestEvent] = field(default_factory=list)
     script_success_scores: list[IngestEvent] = field(default_factory=list)
+    skill_success_scores: list[IngestEvent] = field(default_factory=list)
     agent_verdict_scores: list[IngestEvent] = field(default_factory=list)
 
 
@@ -1021,6 +1023,13 @@ def _enrich_script_success(ctx: EnrichmentContext) -> None:
     )
 
 
+def _enrich_skill_success(ctx: EnrichmentContext) -> None:
+    """Emit per-skill ``skill_success:<name>`` 0/1 scores from each skill span's scripted status (#234)."""
+    ctx.skill_success_scores = build_skill_success_scores(
+        ctx.spoke_run_id, ctx.batch, base_ts=ctx.base_ts
+    )
+
+
 def _enrich_agent_verdict(ctx: EnrichmentContext) -> None:
     """Emit per-agent ``agent_verdict:<type>`` scores from reviews + sub-agent outcomes (#233).
 
@@ -1047,6 +1056,7 @@ _ENRICHMENTS: tuple[tuple[str, Callable[[EnrichmentContext], None]], ...] = (
     ("invocation-scores", _enrich_invocation_scores),
     ("enforcement-scores", _enrich_enforcement_scores),
     ("script-success", _enrich_script_success),
+    ("skill-success", _enrich_skill_success),
     ("agent-verdict", _enrich_agent_verdict),
 )
 
@@ -1130,6 +1140,7 @@ def main(argv: list[str] | None = None) -> int:
         + ctx.invocation_scores
         + ctx.enforcement_scores
         + ctx.script_success_scores
+        + ctx.skill_success_scores
         + ctx.agent_verdict_scores,
         post,
     )
@@ -1151,6 +1162,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(ctx.invocation_scores)} rule-invocation scores emitted, "
         f"{len(ctx.enforcement_scores)} enforcement-fire scores emitted, "
         f"{len(ctx.script_success_scores)} script-success scores emitted, "
+        f"{len(ctx.skill_success_scores)} skill-success scores emitted, "
         f"{len(ctx.agent_verdict_scores)} agent-verdict scores emitted, "
         f"{len(commits)} commit nodes synthesized, "
         f"tagged mode={mode} lane={lane}; "

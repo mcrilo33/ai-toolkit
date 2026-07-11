@@ -16,13 +16,16 @@ from typing import Any
 from telemetry.langfuse_rollup import Observation
 from telemetry.spoke_tree.ids import _copy_id
 from telemetry.spoke_tree.indices import (
+    _SKILL_TOOL_NAME,
     InteractionIndex,
     SkillCandidate,
+    _activated_skill_name,
     _enclosing_turn,
     _match_skill_tool,
 )
 from telemetry.spoke_tree.observations import (
     _INGEST_TIMESTAMP,
+    _SKILL_SPAN_PREFIX,
     IngestEvent,
     ToolContent,
     TraceObservations,
@@ -181,6 +184,19 @@ def _tool_result_size(observation: Observation, tool_content: dict[str, ToolCont
     return len(text.encode("utf-8"))
 
 
+def _skill_relabel(observation: Observation, tool_content: dict[str, ToolContent]) -> str | None:
+    """Return the activated skill name when a ``tool:Skill`` span should relabel to ``skill:<name>``.
+
+    A generic ``tool:Skill`` invocation carries the activated skill only in its transcript input
+    (:func:`_activated_skill_name`); surfacing it as the node's identity makes a skill a per-skill
+    unit (#234). None when the span is not a ``tool:Skill`` or its skill name is unavailable — the
+    node then keeps its original ``tool:Skill`` name.
+    """
+    if (observation.get("name") or "") != _SKILL_TOOL_NAME:
+        return None
+    return _activated_skill_name(_tool_use_id(observation), tool_content)
+
+
 def _copy_event(
     observation: Observation,
     *,
@@ -212,11 +228,12 @@ def _copy_event(
     obs_type = observation.get("type") or "SPAN"
     event_type = "generation-create" if obs_type == "GENERATION" else "span-create"
     start = observation.get("startTime") or _INGEST_TIMESTAMP
+    skill = _skill_relabel(observation, tool_content)
     body: dict[str, Any] = {
         "id": new_id,
         "traceId": trace_id,
         "parentObservationId": parent_id,
-        "name": observation.get("name"),
+        "name": f"{_SKILL_SPAN_PREFIX}{skill}" if skill else observation.get("name"),
         "startTime": observation.get("startTime"),
         "endTime": observation.get("endTime"),
     }
@@ -227,4 +244,6 @@ def _copy_event(
     size = _tool_result_size(observation, tool_content)
     if size is not None:
         body.setdefault("metadata", {})["tool_result_size"] = size
+    if skill:
+        body.setdefault("metadata", {})["skill"] = skill
     return {"id": new_id, "type": event_type, "timestamp": start, "body": body}
