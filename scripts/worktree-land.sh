@@ -611,6 +611,11 @@ if [ -n "$ISSUE" ]; then
     else
       wt_warn "couldn't close issue #$ISSUE — close it by hand: gh issue close $ISSUE"
     fi
+    # Mirror teardown (issue #236): the spoke no longer has live local state, so
+    # strip the status:*/mode:*/lane:* labels dispatch stamped. Best-effort and
+    # separate from the close comment above (which is unchanged): a failed gh here
+    # never fails the land.
+    wt_gh_clear_lifecycle_labels "$ISSUE"
   else
     wt_warn "gh not found — close issue #$ISSUE by hand"
   fi
