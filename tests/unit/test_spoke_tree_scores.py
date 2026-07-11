@@ -64,7 +64,7 @@ class TestBuildStepCostScores:
         ]
         events = build_step_cost_scores(SPOKE, cycle_batch, base_ts="t", price=0.001)
         by_name = {e["body"]["name"]: e["body"]["value"] for e in events}
-        assert by_name["step_cost_usd:RED"] == 1.0
+        assert by_name["step_cache_write_usd:RED"] == 1.0
         assert by_name["step_tokens_written:RED"] == 1000
 
     def test_step_without_rollup_is_skipped(self) -> None:

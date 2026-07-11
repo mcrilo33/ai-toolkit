@@ -2324,7 +2324,7 @@ class TestCycleMarkerSpine:
 
         scores = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
 
-        assert "step_cost_usd:GREEN" in {s["body"]["name"] for s in scores}
+        assert "step_cache_write_usd:GREEN" in {s["body"]["name"] for s in scores}
 
     def test_marker_span_not_rendered_as_orphan_node_in_cycle_view(self) -> None:
         cycle = build_cycle_batch(self._marker_only_traces(), SPOKE, {})
@@ -4940,7 +4940,7 @@ class TestStepPhaseParser:
 
 
 class TestStepCostScores:
-    """#158: per-phase ``step_cost_usd:<PHASE>`` / ``step_tokens_written:<PHASE>`` scores.
+    """#158: per-phase ``step_cache_write_usd:<PHASE>`` / ``step_tokens_written:<PHASE>`` scores.
 
     ``step:*`` nodes carry token rollups only in ``metadata.rollup`` (no ``usageDetails`` — the
     #114 double-count guard), so per-step cost is invisible to the Metrics API. Score NAMES are a
@@ -5013,7 +5013,7 @@ class TestStepCostScores:
         scores = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
 
         names = {s["body"]["name"] for s in scores}
-        assert "step_cost_usd:RED" in names
+        assert "step_cache_write_usd:RED" in names
         assert "step_tokens_written:RED" in names
 
     def test_boundary_partition_maps_to_pre_phase(self) -> None:
@@ -5025,7 +5025,7 @@ class TestStepCostScores:
 
         pre = _cycle_step(cycle, "preStep")
         assert any(
-            s["body"]["name"] == "step_cost_usd:pre"
+            s["body"]["name"] == "step_cache_write_usd:pre"
             and s["body"]["observationId"] == pre["body"]["id"]
             for s in scores
         )
@@ -5037,7 +5037,7 @@ class TestStepCostScores:
 
         scores = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
 
-        cost = next(s for s in scores if s["body"]["name"] == "step_cost_usd:RED")
+        cost = next(s for s in scores if s["body"]["name"] == "step_cache_write_usd:RED")
         assert cost["body"]["value"] == pytest.approx(written * 0.001)
         assert cost["body"]["observationId"] == step["body"]["id"]
 
@@ -5055,7 +5055,7 @@ class TestStepCostScores:
 
         scores = build_step_cost_scores(SPOKE, cycle, base_ts=self._BASE_TS, price=0.001)
 
-        red_costs = [s for s in scores if s["body"]["name"] == "step_cost_usd:RED"]
+        red_costs = [s for s in scores if s["body"]["name"] == "step_cache_write_usd:RED"]
         assert len(red_costs) == 1
 
     def test_view_a_score_events_carry_no_step_cost_scores(self) -> None:
@@ -5064,7 +5064,7 @@ class TestStepCostScores:
 
         view_a = build_score_events(SPOKE, self._traces(), batch, base_ts=self._BASE_TS)
 
-        assert not any(s["body"]["name"].startswith("step_cost_usd:") for s in view_a)
+        assert not any(s["body"]["name"].startswith("step_cache_write_usd:") for s in view_a)
 
     def test_scores_are_deterministic_across_reruns(self) -> None:
         cycle = build_cycle_batch(self._traces(), SPOKE, self._content())
