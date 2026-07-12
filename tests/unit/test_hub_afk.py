@@ -8187,6 +8187,7 @@ def test_self_deploy_happy_path_journals_and_execs(tmp_path: Path) -> None:
             **_SU_DEPLOY_ENV,
             "AFK_SELFUPDATE_ROOT": str(root),
             "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "hb"),
             "AFK_SELFUPDATE_SMOKE_CMD": "true",
             "AFK_SYNC_CMD": f"printf synced >> '{sync_log}'",
             "AFK_SELF_DEPLOY_EXEC_CMD": f"printf execed >> '{exec_log}'",
@@ -8215,6 +8216,7 @@ def test_self_deploy_broken_source_fails_safe(tmp_path: Path) -> None:
             **_SU_DEPLOY_ENV,
             "AFK_SELFUPDATE_ROOT": str(root),
             "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "hb"),
             "AFK_SYNC_CMD": f"printf synced >> '{sync_log}'",
             "AFK_SELF_DEPLOY_EXEC_CMD": f"printf execed >> '{exec_log}'",
         },
@@ -8243,6 +8245,7 @@ def test_self_deploy_startup_death_fails_safe_before_resync(tmp_path: Path) -> N
             **_SU_DEPLOY_ENV,
             "AFK_SELFUPDATE_ROOT": str(root),
             "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "hb"),
             "AFK_SELFUPDATE_SMOKE_CMD": "false",  # startup death
             "AFK_SYNC_CMD": f"printf synced >> '{sync_log}'",
             "AFK_SELF_DEPLOY_EXEC_CMD": f"printf execed >> '{exec_log}'",
@@ -8268,6 +8271,7 @@ def test_self_deploy_failed_sync_fails_safe(tmp_path: Path) -> None:
             **_SU_DEPLOY_ENV,
             "AFK_SELFUPDATE_ROOT": str(root),
             "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "hb"),
             "AFK_SELFUPDATE_SMOKE_CMD": "true",
             "AFK_SYNC_CMD": "false",  # sync fails
             "AFK_SELF_DEPLOY_EXEC_CMD": f"printf execed >> '{exec_log}'",
@@ -8345,3 +8349,146 @@ def test_main_loop_skips_deploy_when_not_flagged(tmp_path: Path) -> None:
     )
 
     assert not deployed.exists(), "no self-update flag ⇒ no deploy at the boundary"
+
+
+def test_main_loop_deploys_before_done_check_on_final_land(tmp_path: Path) -> None:
+    # #250 review finding 2: a supervisor-scope land that ALSO empties the backlog (afk_done
+    # true) must STILL deploy — the self-deploy check runs BEFORE afk_done, so the synced copy
+    # is not left stale. With the buggy order (afk_done first) the loop would break and never
+    # deploy.
+    state = tmp_path / "state"
+    statedir = tmp_path / "sd"
+    deployed = tmp_path / "deployed"
+    hb = tmp_path / "hb"
+    neuter = (
+        "afk_arm_preconditions() { return 0; }; afk_telemetry_preflight() { return 0; }; "
+        "_afk_spawn_watchdog() { :; }; _afk_arm_inhibitor() { :; }; dispatch_batch() { :; }; "
+        "afk_done() { return 0; }; "  # backlog drained THIS tick
+        "supervise_tick() { _afk_mark_selfupdate_pending 236; }; "
+        f'_afk_self_deploy() {{ touch "{deployed}"; exit 0; }}; '
+        "main 30m"
+    )
+
+    _call(
+        neuter,
+        env={
+            "AFK_STATE": str(state),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_ARM_PRECHECK": "0",
+            "AI_TOOLKIT_OTEL": "0",
+        },
+    )
+
+    assert deployed.exists(), "a backlog-emptying supervisor-scope land must still deploy"
+
+
+def test_once_tick_clears_pending_flag_and_does_not_deploy(tmp_path: Path) -> None:
+    # #250 review finding 3: a --once tick that flags a self-update must NOT self-exec, and must
+    # clear the flag so it can't leak into a later no-arg resume.
+    statedir = tmp_path / "sd"
+    deployed = tmp_path / "deployed"
+    hb = tmp_path / "hb"
+    expr = (
+        "supervise_tick() { _afk_mark_selfupdate_pending 236; }; "
+        f'_afk_self_deploy() {{ touch "{deployed}"; exit 0; }}; '
+        "main --once"
+    )
+
+    _call(
+        expr,
+        env={
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(hb),
+            "AI_TOOLKIT_OTEL": "0",
+        },
+    )
+
+    assert not deployed.exists(), "a --once tick must not self-exec a redeploy"
+    assert not (statedir / "self-update-pending").exists(), "--once must clear the flag (no leak)"
+
+
+# ── #250 review finding 1: watchdog respawn crash-loop guard ───────────────────
+# A self-deployed version that passes the --help smoke but dies in the drain loop would be
+# respawned forever. The watchdog bounds the respawn rate and escalates loudly instead.
+
+
+def test_respawn_allowed_until_limit(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    expr = "for _ in 1 2 3 4; do _afk_respawn_allowed && echo A || echo B; done"
+
+    result = _call(
+        expr,
+        env={
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_RESPAWN_MAX": "3",
+            "AFK_RESPAWN_WINDOW": "300",
+            "AFK_NOW": "1000",
+        },
+    )
+
+    assert result.stdout.split() == ["A", "A", "A", "B"], result.stdout
+
+
+def test_respawn_window_prunes_stale_entries(tmp_path: Path) -> None:
+    # Entries older than the window don't count, so a supervisor that stopped crashing resets.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "respawn-log").write_text("100\n200\n300\n")  # all older than now-window
+    expr = "_afk_respawn_allowed && echo ALLOWED || echo BLOCKED"
+
+    result = _call(
+        expr,
+        env={
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_RESPAWN_MAX": "3",
+            "AFK_RESPAWN_WINDOW": "300",
+            "AFK_NOW": "1000",  # cutoff 700 ⇒ the 3 stale entries are pruned
+        },
+    )
+
+    assert "ALLOWED" in result.stdout, result.stdout
+
+
+def test_watchdog_guarded_respawn_respawns_under_limit(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    respawned = tmp_path / "respawned"
+    expr = "_afk_watchdog_guarded_respawn crashed; echo RC=$?"
+
+    result = _call(
+        expr,
+        env={
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_RESPAWN_MAX": "5",
+            "AFK_NOW": "1000",
+            "AFK_RESPAWN_CMD": f"touch '{respawned}'",
+        },
+    )
+
+    assert "RC=0" in result.stdout, result.stdout
+    assert respawned.exists(), "under the limit, the watchdog must respawn"
+
+
+def test_watchdog_guarded_respawn_escalates_on_crashloop(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "respawn-log").write_text("1000\n")  # already at the limit within the window
+    respawned = tmp_path / "respawned"
+    expr = "_afk_watchdog_guarded_respawn wedged; echo RC=$?"
+
+    result = _call(
+        expr,
+        env={
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_RESPAWN_MAX": "1",
+            "AFK_RESPAWN_WINDOW": "300",
+            "AFK_NOW": "1000",
+            "AFK_JOURNAL_GH_COMMENT": "0",
+            "AFK_RESPAWN_CMD": f"touch '{respawned}'",
+        },
+    )
+
+    assert "RC=1" in result.stdout, result.stdout
+    assert not respawned.exists(), "a crash-loop must NOT respawn"
+    assert "CRASH-LOOP" in result.stderr, result.stderr
+    assert "crash-loop guard" in (statedir / "decision-journal.jsonl").read_text()

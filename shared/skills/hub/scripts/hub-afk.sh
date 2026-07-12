@@ -2235,6 +2235,10 @@ _afk_detect_selfupdate() {
 # _afk_selfupdate_source_scripts [root] -> the source scripts a self-deploy must prove parse
 # before it re-syncs: the supervisor's own script, everything it sources, and the siblings it
 # shells out to. Absent files are skipped by the validator (a slimmed checkout is not an error).
+# NOTE (#250 review finding 5): this is the FIXED set the DEFAULT AFK_SELFUPDATE_SCOPE fully
+# covers. AFK_SELFUPDATE_SCOPE only widens DETECTION (which land triggers a redeploy); it does
+# NOT extend this validated set. If you add a custom supervisor helper to AFK_SELFUPDATE_SCOPE,
+# add its source path here too, or a broken version of it would deploy unvalidated.
 _afk_selfupdate_source_scripts() {
   local root="${1:-${MAIN_ROOT:-.}}"
   printf '%s\n' \
@@ -2311,11 +2315,15 @@ _afk_selfupdate_fail() {
 # UPGRADE: a version that passes --help but dies only in the drain loop still relies on the
 # watchdog to respawn it — add a watchdog crash-loop backoff to bound that residual (as today's
 # manual-sync-broken-code risk already is).
-_afk_self_deploy() {
-  local root="${AFK_SELFUPDATE_ROOT:-${MAIN_ROOT:-.}}" issue
-  issue="$(_afk_read_selfupdate_issue)"
-  log "/afk: self-update — validating + redeploying the supervisor on landed #${issue:-?} code"
-  _afk_set_last_action "self-deploy #${issue:-?}"
+# _afk_selfupdate_prepare <root> -> the returning (non-exec) part of a self-deploy: validate +
+# smoke the source, then re-sync. Split out so _afk_self_deploy can run it UNDER the heartbeat
+# stamper (#250 review finding 4): validate+smoke+resync can take up to ~150s, and with no
+# heartbeat through it an aggressively-tuned watchdog (a short AFK_TICK_SECONDS) would read the
+# supervisor as wedged and SIGKILL it mid-resync, leaving a half-written synced tree the respawn
+# then runs. On the failing step it runs _afk_selfupdate_fail (the fallback) and returns nonzero
+# so the caller does NOT exec.
+_afk_selfupdate_prepare() {
+  local root="$1" issue; issue="$(_afk_read_selfupdate_issue)"
   if ! _afk_validate_scripts "$root" || ! _afk_smoke_source "$root"; then
     _afk_selfupdate_fail "$issue" "source failed validation/smoke (bash -n or --help) — merged code is broken"
     return 1
@@ -2323,6 +2331,18 @@ _afk_self_deploy() {
   if ! _afk_resync "$root"; then
     _afk_selfupdate_fail "$issue" "re-sync (sync-to-repo.sh) failed — synced scripts left on the previous good copy"
     return 1
+  fi
+  return 0
+}
+_afk_self_deploy() {
+  local root="${AFK_SELFUPDATE_ROOT:-${MAIN_ROOT:-.}}" issue
+  issue="$(_afk_read_selfupdate_issue)"
+  log "/afk: self-update — validating + redeploying the supervisor on landed #${issue:-?} code"
+  _afk_set_last_action "self-deploy #${issue:-?}"
+  # Run validate+smoke+resync UNDER the heartbeat stamper so a long (but bounded) prepare can't
+  # be mistaken for a wedged supervisor and SIGKILLed mid-resync (#250 review finding 4).
+  if ! _afk_run_with_heartbeat_fg _afk_selfupdate_prepare "$root"; then
+    return 1   # _afk_selfupdate_prepare already ran the fail-safe fallback (warn + journal + clear)
   fi
   # Record the deploy (file only — routine success, so no per-deploy gh comment) and clear the
   # flag BEFORE the exec: the re-exec'd resume must not read a still-pending flag and redeploy
@@ -2342,6 +2362,59 @@ _afk_self_deploy() {
 #   live      — a supervisor is alive and recently stamped the heartbeat; nothing to do.
 #   respawned — the window is armed but the supervisor is gone (dead pid) OR wedged (live
 #               pid, stale heartbeat, #170 ST2): respawn it, first killing a wedged one.
+# --- respawn crash-loop guard (issue #250 review finding 1) --------------------
+# A self-deployed version that PARSES and passes the `--help` smoke but dies only inside the
+# drain loop escapes the pre-exec fail-safe: the exec runs it, it crashes, and the watchdog
+# respawns the same (now-synced) broken code — forever, silently, with the drain never
+# progressing. The pre-exec validate+smoke cannot catch a loop-only runtime bug (it would also
+# have escaped the land's own suite), so the watchdog bounds the residual: after AFK_RESPAWN_MAX
+# respawns within AFK_RESPAWN_WINDOW seconds it stops respawning and escalates LOUDLY (log +
+# journal), converting an invisible respawn spin into a visible, operator-actionable halt. A
+# healthy supervisor never respawns, so the window prunes empty and the guard never fires in
+# normal operation. UPGRADE: keep a pre-deploy backup of the synced hub-afk.sh and auto-roll-back
+# on a tripped guard, so the drain self-heals instead of halting for a human.
+: "${AFK_RESPAWN_MAX:=5}"
+: "${AFK_RESPAWN_WINDOW:=300}"
+_afk_respawn_log_file() { printf '%s\n' "$(_afk_state_dir)/respawn-log"; }
+_afk_clear_respawn_log() { rm -f "$(_afk_respawn_log_file)" 2>/dev/null || true; }
+# _afk_respawn_allowed -> record this respawn and return true when the respawn RATE is under the
+# limit; false (a crash-loop) once AFK_RESPAWN_MAX or more respawns fell within the last
+# AFK_RESPAWN_WINDOW seconds. Prunes entries older than the window, so a supervisor that stops
+# crashing lets the window drain and the guard resets on its own.
+_afk_respawn_allowed() {
+  local f now win max cutoff line kept="" n=0
+  f="$(_afk_respawn_log_file)"; now="$(afk_now)"
+  win="${AFK_RESPAWN_WINDOW:-300}"; case "$win" in '' | *[!0-9]*) win=300 ;; esac
+  max="${AFK_RESPAWN_MAX:-5}"; case "$max" in '' | *[!0-9]*) max=5 ;; esac
+  cutoff=$(( now - win ))
+  if [ -f "$f" ]; then
+    while IFS= read -r line; do
+      case "$line" in '' | *[!0-9]*) continue ;; esac
+      [ "$line" -ge "$cutoff" ] && { kept="$kept$line
+"; n=$(( n + 1 )); }
+    done < "$f"
+  fi
+  if [ "$n" -ge "$max" ]; then
+    printf '%s' "$kept" > "$f" 2>/dev/null || true   # keep the pruned window; do NOT add this one
+    return 1
+  fi
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  printf '%s%s\n' "$kept" "$now" > "$f" 2>/dev/null || true
+  return 0
+}
+# _afk_watchdog_guarded_respawn <reason> -> respawn UNLESS the rate shows a crash-loop; on a
+# crash-loop, escalate loudly + journal and decline. Returns nonzero when it declined.
+_afk_watchdog_guarded_respawn() {
+  if _afk_respawn_allowed; then
+    _afk_watchdog_respawn
+    return 0
+  fi
+  log "/afk watchdog: CRASH-LOOP — the supervisor respawned >= ${AFK_RESPAWN_MAX:-5} times in ${AFK_RESPAWN_WINDOW:-300}s ($1); halting respawns. Likely a self-deployed version that dies in the drain loop. Run /afk --off, fix the code, and re-arm."
+  broker_journal_decision self-update self-deploy \
+    "watchdog crash-loop guard tripped ($1): supervisor respawned too fast — halting respawns (likely a bad self-deploy in the drain loop). Needs a human." irreversible
+  return 1
+}
+
 watchdog_tick() {
   case "$(afk_supervisor_state)" in
     off)  printf 'off\n' ;;
@@ -2349,8 +2422,7 @@ watchdog_tick() {
       if _afk_heartbeat_wedged; then
         log "/afk watchdog: supervisor pid alive but heartbeat stale >$(( ${AFK_STALE_TICKS:-10} * AFK_TICK_SECONDS ))s — killing the wedged supervisor and respawning"
         _afk_kill_wedged_supervisor
-        _afk_watchdog_respawn
-        printf 'respawned\n'
+        if _afk_watchdog_guarded_respawn wedged; then printf 'respawned\n'; else printf 'crashloop\n'; fi
       else
         # Re-check the sleep inhibitor each interval alongside the supervisor (#242): re-arm a
         # killed caffeinate, tied to the live supervisor's (heartbeat) pid. Idempotent — a
@@ -2361,8 +2433,7 @@ watchdog_tick() {
       fi ;;
     stale)
       log "/afk watchdog: supervisor gone but window still armed — respawning"
-      _afk_watchdog_respawn
-      printf 'respawned\n' ;;
+      if _afk_watchdog_guarded_respawn crashed; then printf 'respawned\n'; else printf 'crashloop\n'; fi ;;
   esac
 }
 
@@ -2953,6 +3024,7 @@ main() {
     _afk_clear_last_action   # fresh window ⇒ no stale last-action label from a prior drain (#202 B)
     _afk_clear_status_labels_seed # fresh window ⇒ re-seed the afk:* label set once (#223)
     _afk_clear_selfupdate_pending # fresh window ⇒ drop any stale self-update flag (#250)
+    _afk_clear_respawn_log   # fresh window ⇒ the crash-loop guard starts with an empty window (#250)
     log "/afk: armed ($([ "$end" = drain ] && echo 'drain — until the backlog is empty' || echo "until $(wt_date_ymd "$end") $(date -r "$end" +%H:%M 2>/dev/null || date -d "@$end" +%H:%M)"))"
     # Power-management caveats the sleep inhibitor cannot cover (#242): loud, once at arm.
     afk_warn_power          # on battery: the inhibitor holds only on AC, and a lid-close sleeps
@@ -3011,16 +3083,20 @@ main() {
       # warn the in-flight spokes, re-probe, and resume the moment auth recovers. Never break.
       _afk_service_auth_halt
     fi
-    [ "$once" -eq 1 ] && break
+    # A --once tick must NOT self-exec a redeploy; but its land may have flagged one, so clear
+    # the flag before exiting the one-shot — else it leaks on disk and a later no-arg resume
+    # (which also skips the arm-branch clear) would spuriously redeploy (#250 review finding 3).
+    if [ "$once" -eq 1 ]; then _afk_clear_selfupdate_pending; break; fi
+    # Self-update BEFORE the done-check (#250, review finding 2): a supervisor-scope land can
+    # ALSO empty the backlog, and afk_done would then break first and leave the synced copy
+    # stale — the operator would still have to sync by hand. Deploy at the tick boundary (never
+    # mid-tick) first. On success _afk_self_deploy execs this process in place onto the new code
+    # (never returns); on a fail-safe fallback it returns and the drain continues on old code.
+    if _afk_selfupdate_pending; then
+      _afk_self_deploy
+    fi
     if afk_done "$(afk_read_state)" "$(afk_now)"; then
       log "/afk: done"; _afk_emit_drain_complete; afk_clear_state; break
-    fi
-    # Self-update at the tick boundary (#250): a supervisor-scope land this tick flagged a
-    # redeploy — deploy it now, never mid-tick. On success _afk_self_deploy execs this process
-    # in place onto the new code (never returns); on a fail-safe fallback it returns and the
-    # drain continues on the old code. Skipped for --once (a one-shot tick must not self-exec).
-    if [ "$once" -eq 0 ] && _afk_selfupdate_pending; then
-      _afk_self_deploy
     fi
     # Stamp AFTER the tick's work — including afk_done's up-to-AFK_PLANNER_TIMEOUT planner call,
     # which runs unstamped — so the epoch is fresh going into the idle sleep and a healthy idle
