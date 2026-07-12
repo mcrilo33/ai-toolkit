@@ -624,3 +624,100 @@ def test_file_defect_off_by_gate_does_not_dispatch(tmp_path: Path) -> None:
     _call("_wd_file_defect dead-pane 5 r", env=env)
 
     assert not scoped.exists(), "HUB_WATCHDOG_FILE=0 suppresses filing"
+
+
+# ── the autonomy score + report (issue #251, subtask 5) ────────────────────────
+# score = 1 - interventions/spokes; a ZERO-firing run scores 1.000 - the pass criterion for
+# "afk autonomous on this backlog". These pin the arithmetic + the morning report.
+
+
+def _seed_spokes(state_dir: Path, issues: list[int]) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    for n in issues:
+        (state_dir / f"dispatch-{n}.epoch").write_text("1783880000\n")
+
+
+def _seed_ledger(ledger: Path, lines: list[str]) -> None:
+    ledger.write_text("".join(f"{line}\n" for line in lines))
+
+
+def test_spokes_serviced_counts_dispatch_epochs(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    _seed_spokes(state, [5, 7, 9])
+
+    result = _call("_wd_spokes_serviced", env={"AFK_STATE_DIR": str(state)})
+
+    assert result.stdout.strip() == "3", result.stderr
+
+
+def test_intervention_count_counts_ledger_lines(tmp_path: Path) -> None:
+    ledger = tmp_path / "l.jsonl"
+    _seed_ledger(ledger, ['{"condition":"a"}', '{"condition":"b"}'])
+
+    result = _call("_wd_intervention_count", env={"HUB_WATCHDOG_LEDGER": str(ledger)})
+
+    assert result.stdout.strip() == "2", result.stderr
+
+
+def test_autonomy_score_is_one_on_a_zero_firing_run(tmp_path: Path) -> None:
+    # The pass criterion: spokes serviced, no firing ⇒ afk was autonomous ⇒ 1.000.
+    state = tmp_path / "state"
+    _seed_spokes(state, [5, 7, 9, 11])
+    env = {"AFK_STATE_DIR": str(state), "HUB_WATCHDOG_LEDGER": str(tmp_path / "absent.jsonl")}
+
+    assert _call("_wd_autonomy_score", env=env).stdout.strip() == "1.000"
+
+
+def test_autonomy_score_reflects_intervention_ratio(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    _seed_spokes(state, [5, 7, 9, 11])  # 4 spokes
+    ledger = tmp_path / "l.jsonl"
+    _seed_ledger(ledger, ['{"condition":"dead-pane"}'])  # 1 firing → 1 - 1/4 = 0.75
+    env = {"AFK_STATE_DIR": str(state), "HUB_WATCHDOG_LEDGER": str(ledger)}
+
+    assert _call("_wd_autonomy_score", env=env).stdout.strip() == "0.750"
+
+
+def test_autonomy_score_clamps_at_zero(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    _seed_spokes(state, [5])  # 1 spoke
+    ledger = tmp_path / "l.jsonl"
+    _seed_ledger(ledger, ['{"c":1}', '{"c":2}', '{"c":3}'])  # 3 firings → 1 - 3 < 0 ⇒ 0.000
+    env = {"AFK_STATE_DIR": str(state), "HUB_WATCHDOG_LEDGER": str(ledger)}
+
+    assert _call("_wd_autonomy_score", env=env).stdout.strip() == "0.000"
+
+
+def test_report_prints_the_summary_line(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    _seed_spokes(state, [5, 7])
+    ledger = tmp_path / "l.jsonl"
+    _seed_ledger(ledger, ['{"class":"afk-defect"}'])
+    env = {
+        "AFK_STATE_DIR": str(state),
+        "HUB_WATCHDOG_LEDGER": str(ledger),
+        "HUB_WATCHDOG_NO_TELEMETRY": "1",
+    }
+
+    result = _call("_wd_report", env=env)
+
+    assert "interventions=1" in result.stdout
+    assert "defects_filed=1" in result.stdout
+    assert "spokes_serviced=2" in result.stdout
+    assert "autonomy_score=0.500" in result.stdout
+
+
+def test_cli_report_on_zero_firing_run(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    _seed_spokes(state, [5, 7, 9])
+    result = _run(
+        "--report",
+        env={
+            "AFK_STATE_DIR": str(state),
+            "HUB_WATCHDOG_LEDGER": str(tmp_path / "none.jsonl"),
+            "HUB_WATCHDOG_NO_TELEMETRY": "1",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "autonomy_score=1.000" in result.stdout

@@ -29,6 +29,7 @@
 #   hub-watchdog.sh --daemon      # run the self-looping daemon in the foreground
 #   hub-watchdog.sh --once        # one tick, no loop (cron / tests)
 #   hub-watchdog.sh --status      # report the observed drain + watchdog state
+#   hub-watchdog.sh --report      # the morning artifact: interventions, defects, autonomy score
 #
 # Knobs (env, with defaults):
 #   HUB_WATCHDOG_INTERVAL=60      loop tick interval (seconds)
@@ -36,8 +37,17 @@
 #   HUB_WATCHDOG_PIDFILE          daemon pidfile   [default: <git-common-dir>/hub-watchdog.pid]
 #   HUB_WATCHDOG_LOG              daemon logfile   [default: <git-common-dir>/hub-watchdog.log]
 #   HUB_WATCHDOG_HEARTBEAT        heartbeat file   [default: <git-common-dir>/.hub-watchdog-heartbeat]
+#   HUB_WATCHDOG_LEDGER           intervention-ledger [default: <drain-state-dir>/intervention-ledger.jsonl]
+#   HUB_WATCHDOG_PARK_CEILING=600    a waiting spoke unanswered this long ⇒ the drain fell short
+#   HUB_WATCHDOG_IDLE_CEILING=3600   a dead/idle spoke unrevived this long ⇒ the reaper missed it
+#   HUB_WATCHDOG_LAND_CEILING=900    a ready-at-tip branch un-landed this long ⇒ auto-land skipped
+#   HUB_WATCHDOG_FILE=1          auto-file afk-defects via the headless bug-scoper (0 disables)
+#   HUB_WATCHDOG_COARM=1         (read by hub-afk.sh) co-arm this watchdog alongside the drain
 #   AFK_STATE / AFK_HEARTBEAT     the drain's state + heartbeat files it cross-checks (must
 #                                 match hub-afk.sh's contract — same <git-common-dir> defaults)
+#   *_CMD seams (tests / overrides): HUB_WATCHDOG_ANSWER_CMD / _REVIVE_CMD / _RECONCILE_CMD /
+#                                 _LANDMARK_CMD / _REARM_CMD (interventions); _CLASSIFY_CMD /
+#                                 _SCOPER_CMD / _DEDUP_CMD / _LABEL_CMD (the instrument)
 #   HUB_WATCHDOG_WT_LIB           override the sourced worktree-lib.sh (tests)
 set -uo pipefail
 
@@ -457,6 +467,65 @@ _wd_run_conditions() {
   done < <(inflight_worktrees)
 }
 
+# --- the autonomy score + morning report (issue #251) -------------------------
+# The whole point: a run with ZERO firings means afk was autonomous for that workload. The
+# score = 1 − (interventions / spokes serviced) makes that measurable — 1.0 is the pass
+# criterion for "afk autonomous on this backlog". The report is the morning artifact:
+# interventions taken, defects filed, and the score, to stdout + a best-effort telemetry span.
+
+# _wd_intervention_count -> firings this run = lines in the intervention-ledger (0 when absent).
+_wd_intervention_count() {
+  local lf; lf="$(_wd_ledger_file)"
+  [ -f "$lf" ] && grep -c . "$lf" 2>/dev/null || printf '0\n'
+}
+
+# _wd_defect_count -> afk-defect firings (the drain-shortfall subset; novel-decisions excluded).
+_wd_defect_count() {
+  local lf; lf="$(_wd_ledger_file)"
+  [ -f "$lf" ] && grep -c '"class":"afk-defect"' "$lf" 2>/dev/null || printf '0\n'
+}
+
+# _wd_spokes_serviced -> distinct spokes the drain dispatched this run = the dispatch-<issue>.epoch
+# files in the drain state dir (the SAME record auto_land keys on). 0 when none.
+_wd_spokes_serviced() {
+  local dir n=0 f
+  if command -v _afk_state_dir >/dev/null 2>&1; then dir="$(_afk_state_dir)"; else dir="$(_wd_common_dir)"; fi
+  for f in "$dir"/dispatch-*.epoch; do [ -e "$f" ] && n=$((n + 1)); done
+  printf '%s\n' "$n"
+}
+
+# _wd_autonomy_score -> 1 − (interventions / spokes), to 3 decimals. No spokes ⇒ 1.000 when there
+# were also no interventions (nothing happened, trivially autonomous), else 0.000 (interventions
+# with no serviced spoke — e.g. a bare supervisor-death — is pure non-autonomy).
+_wd_autonomy_score() {
+  local interventions spokes
+  interventions="$(_wd_intervention_count)"
+  spokes="$(_wd_spokes_serviced)"
+  # LC_ALL=C: a non-C host locale makes awk's %.3f emit a comma decimal (1,000), which breaks
+  # every downstream parse of the score — the recurring locale trap in this repo.
+  LC_ALL=C awk -v i="$interventions" -v s="$spokes" 'BEGIN {
+    if (s == 0) { printf "%.3f\n", (i == 0 ? 1 : 0); exit }
+    v = 1 - (i / s); if (v < 0) v = 0; printf "%.3f\n", v
+  }'
+}
+
+# _wd_report -> the morning artifact: one summary line to stdout + a best-effort telemetry span
+# (kind=agent, name hub-watchdog:report) so the score lands in the observability surface too.
+_wd_report() {
+  local interventions defects spokes score
+  interventions="$(_wd_intervention_count)"
+  defects="$(_wd_defect_count)"
+  spokes="$(_wd_spokes_serviced)"
+  score="$(_wd_autonomy_score)"
+  printf 'hub-watchdog: interventions=%s defects_filed=%s spokes_serviced=%s autonomy_score=%s\n' \
+    "$interventions" "$defects" "$spokes" "$score"
+  if [ -z "${HUB_WATCHDOG_NO_TELEMETRY:-}" ] && command -v telemetry_emit_span >/dev/null 2>&1; then
+    telemetry_emit_span --kind agent --name "hub-watchdog:report" \
+      --attr "autonomy_score=$score" --attr "interventions=$interventions" \
+      --attr "spokes_serviced=$spokes" >/dev/null 2>&1 || true
+  fi
+}
+
 # --- one tick -----------------------------------------------------------------
 # _wd_tick <drain-state> -> one supervision pass: observe the drain, then run the 5 detection
 # conditions (each firing → a scripted intervention + a defect-record line in the ledger).
@@ -573,7 +642,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     --arm)     _wd_arm ;;
     --once)    _wd_once ;;
     --status)  _wd_status ;;
-    -h | --help) sed -n '2,49p' "$_WD_SELF" ;;
+    --report)  _wd_report ;;
+    -h | --help) sed -n '2,51p' "$_WD_SELF" ;;
     *)         _wd_status ;;
   esac
 fi
