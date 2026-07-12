@@ -7975,3 +7975,131 @@ def test_status_no_duplicate_warning_for_single_lineage(tmp_path: Path) -> None:
     )
 
     assert "supervisor lineages" not in result.stdout, result.stdout
+
+
+# ── #250: afk self-update — DETECTION (scope match + land-diff → pending flag) ──
+# A land that merges a change to the supervisor's own code must flag a self-update so
+# the drain redeploys onto the new code at the next tick boundary. Detection is the
+# supervisor-scope basename match over the merged diff (pre..post on the local default
+# branch); the flag is a per-run state file carrying the triggering issue.
+
+_SU_GIT_ENV = {
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_AUTHOR_EMAIL": "t@t",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_COMMITTER_EMAIL": "t@t",
+}
+
+
+def _su_git(repo: Path, *args: str) -> str:
+    out = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **_SU_GIT_ENV},
+    )
+    return out.stdout.strip()
+
+
+def _su_repo(tmp_path: Path) -> Path:
+    """A throwaway repo on a `main` branch with one base commit."""
+    repo = tmp_path / "hub"
+    repo.mkdir()
+    _su_git(repo, "init", "-q", "-b", "main")
+    (repo / "seed").write_text("seed\n")
+    _su_git(repo, "add", "seed")
+    _su_git(repo, "commit", "-qm", "base")
+    return repo
+
+
+def _su_commit(repo: Path, relpath: str, body: str = "x\n") -> str:
+    """Commit a file at relpath and return the new HEAD sha."""
+    target = repo / relpath
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body)
+    _su_git(repo, "add", relpath)
+    _su_git(repo, "commit", "-qm", f"add {relpath}")
+    return _su_git(repo, "rev-parse", "HEAD")
+
+
+def test_paths_in_scope_matches_supervisor_basename() -> None:
+    # A repo-relative source path AND the sibling land script both hit by basename.
+    result = _call("_afk_paths_in_scope $'docs/readme.md\\nscripts/gate-broker.sh'")
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_paths_in_scope_misses_unrelated_paths() -> None:
+    result = _call("_afk_paths_in_scope $'docs/readme.md\\nsrc/app.py'")
+
+    assert result.returncode == 1
+
+
+def test_paths_in_scope_honors_override() -> None:
+    result = _call("_afk_paths_in_scope $'src/app.py'", env={"AFK_SELFUPDATE_SCOPE": "app.py"})
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_selfupdate_pending_flag_roundtrip(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    expr = (
+        "_afk_mark_selfupdate_pending 236; "
+        "_afk_selfupdate_pending && echo PENDING; "
+        'echo "issue=$(_afk_read_selfupdate_issue)"; '
+        "_afk_clear_selfupdate_pending; "
+        "_afk_selfupdate_pending && echo STILL || echo CLEARED"
+    )
+
+    result = _call(expr, env={"AFK_STATE_DIR": str(statedir)})
+
+    assert "PENDING" in result.stdout, result.stdout
+    assert "issue=236" in result.stdout, result.stdout
+    assert "CLEARED" in result.stdout, result.stdout
+
+
+def test_detect_selfupdate_flags_when_diff_touches_scope(tmp_path: Path) -> None:
+    repo = _su_repo(tmp_path)
+    before = _su_git(repo, "rev-parse", "HEAD")
+    after = _su_commit(repo, "shared/skills/hub/scripts/hub-afk.sh", "# changed\n")
+    statedir = tmp_path / "sd"
+
+    result = _call(
+        f"_afk_detect_selfupdate {before} {after} 236 '{repo}'",
+        env={"AFK_STATE_DIR": str(statedir)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    flag = statedir / "self-update-pending"
+    assert flag.exists(), "an in-scope land must flag a pending self-update"
+    assert flag.read_text().strip() == "236", "the flag records the triggering issue"
+
+
+def test_detect_selfupdate_ignores_out_of_scope_diff(tmp_path: Path) -> None:
+    repo = _su_repo(tmp_path)
+    before = _su_git(repo, "rev-parse", "HEAD")
+    after = _su_commit(repo, "docs/readme.md", "# docs\n")
+    statedir = tmp_path / "sd"
+
+    result = _call(
+        f"_afk_detect_selfupdate {before} {after} 236 '{repo}'",
+        env={"AFK_STATE_DIR": str(statedir)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not (statedir / "self-update-pending").exists(), "a docs-only land must not self-update"
+
+
+def test_detect_selfupdate_noop_when_branch_did_not_advance(tmp_path: Path) -> None:
+    repo = _su_repo(tmp_path)
+    sha = _su_git(repo, "rev-parse", "HEAD")
+    statedir = tmp_path / "sd"
+
+    result = _call(
+        f"_afk_detect_selfupdate {sha} {sha} 236 '{repo}'",
+        env={"AFK_STATE_DIR": str(statedir)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not (statedir / "self-update-pending").exists()

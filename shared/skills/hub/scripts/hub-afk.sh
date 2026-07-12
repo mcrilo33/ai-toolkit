@@ -1468,7 +1468,7 @@ _afk_land_retry_max() {
 # a false positive. Set AFK_REVIEW_GATE=0 to opt back out (restore the #152 land-anything
 # behavior); the mechanical anti-gutting scan stays the advisory residual signal either way.
 auto_land() {
-  local wt_land path issue verdict max tries land_log land_rc
+  local wt_land path issue verdict max tries land_log land_rc land_before
   wt_land="$(_afk_find_script "${WT_LAND:-}" worktree-land.sh)" || { log "worktree-land.sh not found — skipping land"; return 0; }
   while IFS=$'\t' read -r path issue; do
     [ -n "$issue" ] || continue
@@ -1527,12 +1527,16 @@ auto_land() {
     # what an operator needs when a land half-completes. mkdir so the log write can't fail on a
     # not-yet-created state dir. _afk_run_with_heartbeat returns worktree-land's exit code.
     land_log="$(_afk_state_dir)/land-$issue.log"; mkdir -p "$(_afk_state_dir)" 2>/dev/null || true
+    # Bracket the land with the local default-branch SHA so a supervisor-scope merge is
+    # detectable from the pre..post diff (#250 self-update DETECT).
+    land_before="$(_afk_local_default_sha)"
     _afk_run_with_heartbeat bash "$wt_land" "$issue" --skip-tests >"$land_log" 2>&1; land_rc=$?
     if [ "$land_rc" -eq 0 ]; then
       log "  landed #$issue"
       _afk_clear_land_retries "$issue"   # a successful land resets the retry budget (#202 D)
       _afk_clear_warned "$issue"         # #241: progress → drop the land's warned-retry backoff
       _afk_incr_landed   # tally for the drain-complete notification (#150)
+      _afk_detect_selfupdate "$land_before" "$(_afk_local_default_sha)" "$issue"  # #250
     elif [ "$land_rc" -eq 3 ]; then
       # Sentinel (#198 / #202 I): main ADVANCED but a teardown step failed — the code IS
       # shipped, so NEVER stamp blocked over merged work. Tally it and point at the log.
@@ -1540,6 +1544,7 @@ auto_land() {
       _afk_clear_land_retries "$issue"
       _afk_clear_warned "$issue"         # #241: shipped → drop the warned-retry backoff
       _afk_incr_landed
+      _afk_detect_selfupdate "$land_before" "$(_afk_local_default_sha)" "$issue"  # #250: shipped ⇒ still deploy
     else
       # #241 §5: an auto-land failure (merge conflict / push rejection) warns + retries on the
       # backoff instead of parking blocked/<issue>. The land is re-attempted on later ticks.
@@ -2137,6 +2142,89 @@ _afk_watchdog_respawn() {
   if [ -n "${AFK_RESPAWN_CMD:-}" ]; then bash -c "$AFK_RESPAWN_CMD"; return 0; fi
   bash -c "$(_afk_resume_launch)"
   return 0
+}
+
+# --- self-update: deploy the supervisor's own landed code (issue #250) ---------
+# A land that merges a change to the supervisor's OWN code (hub-afk.sh, gate-broker.sh,
+# the answerer rule, …) used to require an operator recycle: the live drain keeps running
+# the OLD synced copy until it is restarted, and a mid-tick sync can corrupt an in-flight
+# tick (#135). This block gives the drain a self-update protocol so an afk-fix land
+# auto-deploys with zero operator commands:
+#   DETECT  — after a successful land, if the merged diff (PRE..POST on the local default
+#             branch) touches the supervisor scope, flag a pending self-update.
+#   DEPLOY  — at the NEXT tick boundary (never mid-tick), validate + smoke-test the SOURCE,
+#             re-sync the gitignored .ai-toolkit/scripts the /afk skill launches, then exec
+#             this process in place (a no-arg resume) onto the new code. `exec` preserves
+#             $$ so caffeinate (-w $$, #242) and the heartbeat pid survive untouched, and a
+#             no-arg launch re-adopts the in-flight spokes (dispatch_batch skips them).
+#   FAIL SAFE — the source is validated (bash -n) AND smoke-run (`hub-afk.sh --help`) BEFORE
+#             the re-sync, so a broken new version never becomes the synced copy the watchdog
+#             would respawn; on any failure the drain stays on the old code with a loud warn
+#             + journal, never stranded.
+# Each self-deploy is recorded in the #241 decision journal.
+
+# _afk_selfupdate_scope_paths -> the space-separated set of BASENAMES whose land triggers a
+# self-update. Matched by basename so a source path (shared/.../hub-afk.sh), its synced copy
+# (.ai-toolkit/scripts/hub-afk.sh), and scripts/worktree-land.sh all hit. AFK_SELFUPDATE_SCOPE
+# overrides the whole set (tests / operator tuning).
+_afk_selfupdate_scope_paths() {
+  printf '%s\n' "${AFK_SELFUPDATE_SCOPE:-hub-afk.sh gate-broker.sh hub-notify.sh worktree-lib.sh worktree-land.sh batch-plan.sh afk-answering.md}"
+}
+
+# _afk_paths_in_scope <newline-separated paths> -> true when ANY path's basename is in the
+# supervisor scope. Pure (no side effects) so the matcher is unit-testable in isolation.
+_afk_paths_in_scope() {
+  local paths="$1" scope p base
+  scope="$(_afk_selfupdate_scope_paths)"
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    base="${p##*/}"
+    case " $scope " in *" $base "*) return 0 ;; esac
+  done <<EOF
+$paths
+EOF
+  return 1
+}
+
+# The pending-self-update flag: a file under the per-run state dir (survives a watchdog
+# respawn, exactly as the resume/redispatch markers do) whose body is the issue whose land
+# triggered it (for the journal). Set on DETECT, consumed on DEPLOY, cleared on a fresh arm.
+_afk_selfupdate_flag_file() { printf '%s\n' "$(_afk_state_dir)/self-update-pending"; }
+_afk_mark_selfupdate_pending() {
+  local dir; dir="$(_afk_state_dir)"; mkdir -p "$dir" 2>/dev/null || true
+  _afk_atomic_write "$(_afk_selfupdate_flag_file)" "${1:-}" || true
+}
+_afk_selfupdate_pending() { [ -f "$(_afk_selfupdate_flag_file)" ]; }
+_afk_read_selfupdate_issue() {
+  local f; f="$(_afk_selfupdate_flag_file)"
+  [ -f "$f" ] && head -n1 "$f" 2>/dev/null | tr -d '[:space:]' || true
+}
+_afk_clear_selfupdate_pending() { rm -f "$(_afk_selfupdate_flag_file)" 2>/dev/null || true; }
+
+# _afk_local_default_sha [root] -> the SHA at the tip of the local default branch (the ref a
+# land advances), or empty. Used to bracket a land: PRE before, POST after, so the merged
+# diff is PRE..POST. Resolves the branch the same way arming does (_afk_default_ref).
+_afk_local_default_sha() {
+  local root="${1:-${MAIN_ROOT:-.}}" ref
+  ref="$(_afk_default_ref "$root")"; ref="${ref#origin/}"
+  [ -n "$ref" ] || return 0
+  git -C "$root" rev-parse -q --verify "refs/heads/$ref" 2>/dev/null || true
+}
+
+# _afk_detect_selfupdate <pre_sha> <post_sha> <issue> [root] -> flag a pending self-update when
+# the land's merged diff (pre..post) touches the supervisor scope. A no-op when the branch did
+# not advance (pre == post / empty), or the diff is out of scope. Idempotent — several in-scope
+# lands in one pass just re-mark the same flag.
+_afk_detect_selfupdate() {
+  local pre="$1" post="$2" issue="$3" root="${4:-${MAIN_ROOT:-.}}" files
+  [ -n "$pre" ] && [ -n "$post" ] || return 0
+  [ "$pre" != "$post" ] || return 0
+  files="$(git -C "$root" diff --name-only "$pre" "$post" 2>/dev/null || true)"
+  [ -n "$files" ] || return 0
+  if _afk_paths_in_scope "$files"; then
+    log "/afk: landed #$issue touched supervisor scope — flagging a self-update (redeploy at the next tick boundary)"
+    _afk_mark_selfupdate_pending "$issue"
+  fi
 }
 
 # watchdog_tick -> one watchdog check, printing the observed supervisor state:
@@ -2754,6 +2842,7 @@ main() {
     _afk_clear_land_retry_counts # fresh window ⇒ every issue's land-retry budget resets (#202 D)
     _afk_clear_last_action   # fresh window ⇒ no stale last-action label from a prior drain (#202 B)
     _afk_clear_status_labels_seed # fresh window ⇒ re-seed the afk:* label set once (#223)
+    _afk_clear_selfupdate_pending # fresh window ⇒ drop any stale self-update flag (#250)
     log "/afk: armed ($([ "$end" = drain ] && echo 'drain — until the backlog is empty' || echo "until $(wt_date_ymd "$end") $(date -r "$end" +%H:%M 2>/dev/null || date -d "@$end" +%H:%M)"))"
     # Power-management caveats the sleep inhibitor cannot cover (#242): loud, once at arm.
     afk_warn_power          # on battery: the inhibitor holds only on AC, and a lid-close sleeps
