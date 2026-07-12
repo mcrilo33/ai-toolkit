@@ -333,6 +333,31 @@ afk_new_arm_token() { printf '%s.%s\n' "$(afk_now)" "$$"; }
 # still runs after an upgrade.
 afk_arm_superseded() { [ "$(afk_read_arm_epoch)" != "$_AFK_ARM_EPOCH" ]; }
 
+# --- synchronous off (issue #252) ---------------------------------------------
+# `--off` clears state ASYNCHRONOUSLY — the supervisor only exits at its next tick. A scripted
+# recycle (the #250 self-update off->sync->arm) needs a BLOCKING off so it never races the old
+# lineage. afk_wait_supervisor_gone <pid> [heartbeat-line] polls the (pre-clear) heartbeat pid to
+# death, bounded by AFK_OFF_WAIT_SECONDS: returns 0 the instant the pid is gone (or was never
+# alive / non-numeric), 1 on timeout. A wake-capable supervisor (the `wake1` heartbeat token,
+# #207) is SIGUSR1-nudged first so it re-checks the loop-top supersede at once — with the
+# arm-epoch cleared it steps down within ~a stamp, not a full tick. A pre-#176 supervisor stamps
+# no wake token and is left to exit on its own tick (its default USR1 action is terminate).
+: "${AFK_OFF_WAIT_SECONDS:=30}"
+afk_wait_supervisor_gone() {
+  local pid="$1" hb="${2:-}" limit waited
+  case "$pid" in '' | *[!0-9]*) return 0 ;; esac
+  _afk_pid_alive "$pid" || return 0
+  limit="${AFK_OFF_WAIT_SECONDS:-30}"; case "$limit" in '' | *[!0-9]*) limit=30 ;; esac
+  case "$hb" in *' wake1'*) kill -USR1 "$pid" 2>/dev/null || true ;; esac
+  waited=0
+  while [ "$waited" -lt "$limit" ]; do
+    _afk_pid_alive "$pid" || return 0
+    sleep 1 2>/dev/null || true
+    waited=$(( waited + 1 ))
+  done
+  ! _afk_pid_alive "$pid"
+}
+
 # --- landed tally + drain-complete hand-off (issue #150) ----------------------
 # A completed drain fires ONE "drain complete — <k> landed" notification, but <k>
 # is not externally derivable: log() writes to stderr (redirected to /dev/null on
@@ -2625,7 +2650,22 @@ main() {
   # Subcommands that do not start the LOCAL supervisor loop.
   case "${1:-}" in
     --status)    _status; return 0 ;;
-    --off)       afk_clear_state; echo "/afk: off (state cleared; the supervisor + watchdog stop on their next tick)"; return 0 ;;
+    --off)
+      # Capture the heartbeat pid BEFORE clearing — afk_clear_state removes the heartbeat.
+      local off_wait=0 off_hb off_pid
+      case "${2:-}" in --wait | -w) off_wait=1 ;; esac
+      off_hb="$(afk_read_heartbeat)"; off_pid="${off_hb%% *}"
+      afk_clear_state
+      if [ "$off_wait" -eq 1 ]; then
+        # Synchronous off (#252): block until the supervisor is actually gone, so a scripted
+        # off->sync->arm recycle needs no sleep-guessing. Nonzero on timeout (a stuck supervisor).
+        if afk_wait_supervisor_gone "$off_pid" "$off_hb"; then
+          echo "/afk: off (supervisor exited; state cleared)"; return 0
+        fi
+        echo "/afk: off requested — state cleared, but the supervisor (pid ${off_pid:-unknown}) is still alive after ${AFK_OFF_WAIT_SECONDS}s; it will exit on its next tick" >&2
+        return 1
+      fi
+      echo "/afk: off (state cleared; the supervisor + watchdog stop on their next tick)"; return 0 ;;
     --watchdog)  watchdog_loop; return $? ;;
     --reconcile) afk_reconcile "$MAIN_ROOT"; return $? ;;
     -h|--help)   sed -n '2,82p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
