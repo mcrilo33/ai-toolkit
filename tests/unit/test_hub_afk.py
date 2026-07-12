@@ -7596,3 +7596,181 @@ def test_arm_inhibitor_converges_from_a_blank_pidfile(tmp_path: Path) -> None:
         assert _pid_alive(int(rec[0])), "must record exactly one live inhibitor"
     finally:
         _kill_inhibitor(pidfile)
+
+
+# ── #252: arm-generation token (singleton guard for a fast off/re-arm recycle) ──
+# The arming process IS the supervisor loop. A fast `--off -> re-arm` used to leave the old
+# (mid-tick-sleep) supervisor draining alongside the new one: `--off` cleared `.afk-state`, but
+# the re-arm re-created it before the old sleeper woke, so the sleeper read the NEW window and
+# kept ticking. The fix: each supervisor binds to an arm-GENERATION token at startup and steps
+# down the moment the on-disk token no longer matches — a fresh arm mints a new token, a resume
+# adopts the current one, and `--off` clears it. Directive 4's "armed epoch the old supervisor
+# can distinguish from a new arm".
+
+
+def test_arm_superseded_true_when_on_disk_epoch_differs(tmp_path: Path) -> None:
+    # A newer arm overwrote the token this supervisor bound to -> superseded (step down).
+    epoch = tmp_path / "arm-epoch"
+    epoch.write_text("NEWGEN\n")
+    result = _call(
+        '_AFK_ARM_EPOCH=OLDGEN; afk_arm_superseded && echo YES || echo NO',
+        env={"AFK_ARM_EPOCH_FILE": str(epoch)},
+    )
+
+    assert result.stdout.strip() == "YES", result.stderr
+
+
+def test_arm_superseded_false_when_on_disk_epoch_matches(tmp_path: Path) -> None:
+    # The token on disk is still the one this supervisor armed with -> keep running.
+    epoch = tmp_path / "arm-epoch"
+    epoch.write_text("GEN1\n")
+    result = _call(
+        '_AFK_ARM_EPOCH=GEN1; afk_arm_superseded && echo YES || echo NO',
+        env={"AFK_ARM_EPOCH_FILE": str(epoch)},
+    )
+
+    assert result.stdout.strip() == "NO", result.stderr
+
+
+def test_arm_superseded_true_when_epoch_cleared(tmp_path: Path) -> None:
+    # `--off` cleared the token (empty on disk) while this supervisor was bound to one -> the old
+    # sleeper steps down even though a re-arm may have re-created `.afk-state`.
+    epoch = tmp_path / "arm-epoch"  # absent
+    result = _call(
+        '_AFK_ARM_EPOCH=GEN1; afk_arm_superseded && echo YES || echo NO',
+        env={"AFK_ARM_EPOCH_FILE": str(epoch)},
+    )
+
+    assert result.stdout.strip() == "YES", result.stderr
+
+
+def test_arm_superseded_false_for_legacy_unbound(tmp_path: Path) -> None:
+    # A legacy resume (no epoch bound, no epoch file) reads empty==empty -> NOT superseded, so a
+    # pre-#252 armed window still runs after an upgrade.
+    epoch = tmp_path / "arm-epoch"  # absent
+    result = _call(
+        '_AFK_ARM_EPOCH=""; afk_arm_superseded && echo YES || echo NO',
+        env={"AFK_ARM_EPOCH_FILE": str(epoch)},
+    )
+
+    assert result.stdout.strip() == "NO", result.stderr
+
+
+def test_new_arm_token_is_unique_per_process(tmp_path: Path) -> None:
+    # The token must disambiguate a same-second recycle: it carries the arming pid, so two arms
+    # in the same wall-clock second still mint distinct tokens.
+    result = _call(
+        'a=$(afk_new_arm_token); echo "$a"',
+        env={"AFK_NOW": "1700000000"},
+    )
+
+    tok = result.stdout.strip()
+    assert tok.startswith("1700000000."), tok
+    assert tok != "1700000000", "the token must carry more than the epoch (the pid)"
+
+
+def test_fresh_arm_writes_a_new_arm_epoch(tmp_path: Path) -> None:
+    # Arming with a window spec mints + persists a generation token (bound by the loop's
+    # supersede check). The loop is neutered so main() arms then stops on the first done-check.
+    epoch = tmp_path / "arm-epoch"
+    neuter = (
+        "supervise_tick() { return 0; }; _afk_spawn_watchdog() { :; }; "
+        "_afk_arm_inhibitor() { :; }; afk_done() { return 0; }; afk_interruptible_sleep() { :; }"
+    )
+    result = _call(
+        f"{neuter}; main drain",
+        env={
+            "AFK_STATE": str(tmp_path / "state"),
+            "AFK_HEARTBEAT": str(tmp_path / "hb"),
+            "AFK_STATE_DIR": str(tmp_path / "sd"),
+            "AFK_ARM_EPOCH_FILE": str(epoch),
+            "AFK_ARM_PRECHECK": "0",
+            "AI_TOOLKIT_OTEL": "0",
+            "AFK_NOW": "1700000000",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert epoch.exists(), "a fresh arm must write the arm-epoch file"
+    assert epoch.read_text().strip().startswith("1700000000."), epoch.read_text()
+
+
+def test_no_arg_resume_adopts_existing_arm_epoch(tmp_path: Path) -> None:
+    # A no-arg resume (watchdog respawn / reconcile) must ADOPT the persisted token, never mint a
+    # new one -- else it would instantly read itself as superseded. The neutered tick records the
+    # bound _AFK_ARM_EPOCH so we can assert it equals the pre-existing generation.
+    epoch = tmp_path / "arm-epoch"
+    epoch.write_text("GEN1\n")
+    bound = tmp_path / "bound"
+    neuter = (
+        f'supervise_tick() {{ printf "%s" "$_AFK_ARM_EPOCH" > "{bound}"; return 0; }}; '
+        "_afk_spawn_watchdog() { :; }; _afk_arm_inhibitor() { :; }; "
+        "afk_done() { return 0; }; afk_interruptible_sleep() { :; }"
+    )
+    result = _call(
+        f"{neuter}; main",
+        env={
+            "AFK_STATE": str(_armed_state(tmp_path, "drain")),
+            "AFK_HEARTBEAT": str(tmp_path / "hb"),
+            "AFK_STATE_DIR": str(tmp_path / "sd"),
+            "AFK_ARM_EPOCH_FILE": str(epoch),
+            "AFK_ARM_PRECHECK": "0",
+            "AI_TOOLKIT_OTEL": "0",
+            "AFK_NOW": "1700000000",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert bound.read_text().strip() == "GEN1", "resume must adopt the persisted generation"
+    assert epoch.read_text().strip() == "GEN1", "resume must NOT overwrite the generation"
+
+
+def test_supervisor_steps_down_when_superseded_mid_run(tmp_path: Path) -> None:
+    # The heart of #252: a running supervisor whose generation was superseded by a fresh re-arm
+    # steps down at the next loop top instead of draining forever. RED-safe: the neutered tick
+    # overwrites the epoch on the FIRST pass and `exit 1`s on the SECOND, so WITHOUT the supersede
+    # check main reaches a second tick and fails fast (rc 1, no "superseded") rather than hanging.
+    epoch = tmp_path / "arm-epoch"
+    count = tmp_path / "tick-count"
+    tick = (
+        f'supervise_tick() {{ c=$(cat "{count}" 2>/dev/null || echo 0); c=$((c+1)); '
+        f'echo "$c" > "{count}"; [ "$c" -ge 2 ] && exit 1; afk_write_arm_epoch NEWGEN; }}'
+    )
+    neuter = (
+        f"{tick}; _afk_spawn_watchdog() {{ :; }}; _afk_arm_inhibitor() {{ :; }}; "
+        "afk_done() { return 1; }; afk_interruptible_sleep() { :; }"
+    )
+    result = _call(
+        f"{neuter}; main drain",
+        env={
+            "AFK_STATE": str(tmp_path / "state"),
+            "AFK_HEARTBEAT": str(tmp_path / "hb"),
+            "AFK_STATE_DIR": str(tmp_path / "sd"),
+            "AFK_ARM_EPOCH_FILE": str(epoch),
+            "AFK_ARM_PRECHECK": "0",  # supersede must fire EVEN when the precheck is opted out
+            "AI_TOOLKIT_OTEL": "0",
+            "AFK_NOW": "1700000000",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "superseded" in result.stderr.lower(), result.stderr
+    assert count.read_text().strip() == "1", "the loop must break BEFORE a second tick runs"
+
+
+def test_off_clears_the_arm_epoch(tmp_path: Path) -> None:
+    # `--off` clears the generation token (via afk_clear_state) so the old sleeper reads itself
+    # superseded even if a re-arm re-creates `.afk-state`.
+    epoch = tmp_path / "arm-epoch"
+    epoch.write_text("GEN1\n")
+    result = _call(
+        "afk_clear_state",
+        env={
+            "AFK_STATE": str(_armed_state(tmp_path, "drain")),
+            "AFK_HEARTBEAT": str(tmp_path / "hb"),
+            "AFK_ARM_EPOCH_FILE": str(epoch),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not epoch.exists(), "afk_clear_state must remove the arm-epoch file"
