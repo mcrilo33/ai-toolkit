@@ -2137,6 +2137,128 @@ _decide_permission() {
   _reason_permission "$wt" "$issue" "$cmd" "$reason"
 }
 
+# --- programmatic PreToolUse permission decision (issue #253) ------------------
+# The pane-answering path above (extract_pending_command + _pane_shows_permission_prompt +
+# approve_permission) detects and OPERATES a TUI dialog after it appears — the brittle surface
+# behind the #240/#246/#238 bug family (new dialog shapes, glyphs, and timing windows keep
+# breaking the scraper). afk_permission_hook_decide moves the COMMON case OFF the pane entirely:
+# a spoke-side PreToolUse hook runs classify_permission on the gated tool call BEFORE any dialog
+# and AUTO-APPROVES a benign scoped self-op, so no dialog is ever shown and there is nothing to
+# scrape. It reuses the SAME classify_permission verdict (one source of truth), journals the
+# auto-approve per #241, and NEVER denies: an ESCALATE — or any un-gated context — stays silent
+# (exit 0, no output), so the existing scope-guard hooks' denies remain authoritative and the
+# rare genuine escalation still falls through to the drain reasoner / pane path. (A2 — the hook
+# itself reasons and returns deny-with-reason to fully retire the pane — is a deferred follow-up.)
+
+# _afk_supervisor_live <wt> -> rc 0 when a LIVE /afk supervisor heartbeat governs <wt>. This is
+# the hook's self-limit: it auto-approves ONLY inside a running drain, never in an attended
+# session. Mirrors afk-notify-wake.sh's gate — the .afk-heartbeat pidfile in the git-common-dir
+# (AFK_HEARTBEAT overrides for tests) names a running pid. Fails CLOSED (rc 1) on any gap.
+_afk_supervisor_live() {
+  local wt="$1" common hb pid
+  common="$(git -C "$wt" rev-parse --git-common-dir 2>/dev/null)" || return 1
+  case "$common" in /*) ;; *) common="$wt/$common" ;; esac   # rev-parse may print a relative dir
+  hb="${AFK_HEARTBEAT:-$common/.afk-heartbeat}"
+  [ -f "$hb" ] || return 1
+  read -r pid _ < "$hb" 2>/dev/null || return 1
+  case "$pid" in '' | *[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null
+}
+
+# _afk_hook_emit_allow <reason> -> print the PreToolUse allow verdict. Mirrors chmod-scope-guard's
+# shape: hookSpecificOutput.permissionDecision for Claude Code + a top-level `permission` for
+# Cursor's beforeShellExecution, so the auto-approve is understood on both. jq when present, a
+# hand-rolled literal otherwise.
+_afk_hook_emit_allow() {
+  local reason="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq -nc --arg r "$reason" '{
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "allow",
+        permissionDecisionReason: $r
+      },
+      permission: "allow"
+    }'
+  else
+    printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"%s"},"permission":"allow"}\n' "$reason"
+  fi
+}
+
+# afk_permission_hook_decide -> read a Claude Code PreToolUse payload on stdin and print an
+# `allow` verdict IFF classify_permission APPROVEs the gated tool call inside a live drain;
+# otherwise print nothing. Always rc 0 (a PreToolUse allow-only hook must never fail a session).
+# The command string is rebuilt EXACTLY as extract_pending_command does (Bash -> its command;
+# Read -> "Read <file_path>"; any other tool -> the tool name) so the hook and the pane path
+# classify identically. Gated on a spoke branch (issue-numbered slug) AND a live supervisor, so
+# an attended session and the hub checkout are untouched.
+afk_permission_hook_decide() {
+  local payload wt cmd parsed br slug issue decision kind
+  payload="$(cat)"
+  command -v python3 >/dev/null 2>&1 || return 0
+  # One python pass: line 1 = cwd, the remainder = the classifier command string (a Bash command
+  # may itself contain newlines, so cmd is everything AFTER the first line, not just line 2).
+  parsed="$(_AFK_HOOK_PAYLOAD="$payload" python3 2>/dev/null <<'PYEOF'
+import json, os
+
+try:
+    obj = json.loads(os.environ.get("_AFK_HOOK_PAYLOAD") or "{}")
+except Exception:
+    obj = {}
+if not isinstance(obj, dict):
+    obj = {}
+name = (obj.get("tool_name") or "").strip()
+inp = obj.get("tool_input")
+if not isinstance(inp, dict):
+    inp = {}
+cwd = (obj.get("cwd") or "").strip()
+if name == "Bash":
+    cmd = (inp.get("command") or "").strip()
+elif name == "Read":
+    fp = (inp.get("file_path") or "").strip()
+    cmd = f"{name} {fp}" if fp else name
+elif name:
+    cmd = name
+else:
+    cmd = ""
+print(cwd)
+# NB: NOT truncated -- extract_pending_command caps at 2000 for pane/log DISPLAY, but a
+# silent auto-approve must classify the WHOLE command. Truncating a benign prefix off a
+# risky tail could hide the risky segment and mis-approve it with no dialog. Since
+# classify_permission is default-deny, an over-long or unrecognised command just escalates.
+# (Plain ASCII + no backticks/parens here: bash 3.2 mis-parses those inside a $()-nested
+# heredoc.)
+print(cmd.strip())
+PYEOF
+)"
+  # No newline ⇒ python emitted only the cwd line (empty command) — nothing to vouch for.
+  case "$parsed" in *$'\n'*) ;; *) return 0 ;; esac
+  # Line 1 is the cwd, the rest is the command. This assumes the payload cwd has no embedded
+  # newline (Claude Code sets it to a real dir path, never attacker-controlled). If one ever did,
+  # wt takes only the first line and the remainder prepends to cmd — which only makes classify
+  # STRICTER (extra bogus segments) and fails a bad `git -C "$wt"` below, so it fails CLOSED.
+  wt="${parsed%%$'\n'*}"
+  cmd="${parsed#*$'\n'}"
+  [ -n "$cmd" ] || return 0
+  [ -n "$wt" ] || wt="$(pwd)"
+  # Spoke self-limit: an issue-numbered branch slug AND a live supervisor. Either missing ⇒ stay
+  # silent so the normal permission flow (and any attended user) is untouched.
+  br="$(git -C "$wt" branch --show-current 2>/dev/null)" || return 0
+  slug="${br##*/}"; issue="${slug%%[!0-9]*}"
+  case "$issue" in '' | *[!0-9]*) return 0 ;; esac
+  _afk_supervisor_live "$wt" || return 0
+  decision="$(classify_permission "$cmd" "$wt")"
+  kind="${decision%%$'\t'*}"
+  # NEVER deny: only APPROVE emits a verdict; ESCALATE (or anything else) stays silent so the
+  # scope-guard denies stay authoritative and the reasoner/pane path still handles the rare case.
+  [ "$kind" = APPROVE ] || return 0
+  # #241: journal the hook-layer auto-approve (file only — a per-approve gh comment would be
+  # spam) BEFORE emitting the verdict, so a decision made with no dialog is auditable. A hook
+  # auto-approve is a benign scoped self-op by construction, hence reversible.
+  _broker_journal_line "$issue" permission "hook auto-approved: $cmd" reversible
+  _afk_hook_emit_allow "afk-permission-hook: classify_permission APPROVEd a benign scoped self-op inside a live drain — auto-allowed (no dialog; ESCALATE and everything else still prompt)"
+}
+
 # --- tmux injection + telemetry -----------------------------------------------
 
 # _scan_appended_turns <wt_path> <sizes> <mode> -> scan the transcript bytes APPENDED after the
