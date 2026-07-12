@@ -7102,3 +7102,151 @@ def test_watchdog_live_arms_the_inhibitor(tmp_path: Path) -> None:
         assert pidfile.read_text().split()[0].isdigit()
     finally:
         _kill_inhibitor(pidfile)
+
+
+# ── the inhibitor --status line + arm-time power warnings (issue #242) ─────────
+# --status surfaces the sleep-inhibitor state, and arming warns loudly about the two
+# limits caffeinate -s cannot cover (battery power, a lid-close) plus a non-macOS host
+# with no caffeinate. pmset/caffeinate are stubbed via AFK_PMSET_BIN / AFK_CAFFEINATE_BIN.
+
+
+def _pmset_stub(tmp_path: Path, source: str) -> Path:
+    """A pmset stub whose `-g batt` prints the given power source line."""
+    pm = tmp_path / "pmset"
+    pm.write_text(f'#!/usr/bin/env bash\nprintf "Now drawing from \\x27{source}\\x27\\n"\n')
+    pm.chmod(0o755)
+    return pm
+
+
+def test_inhibitor_status_active_names_the_pid(tmp_path: Path) -> None:
+    # AC4: --status reports the inhibitor as active with its caffeinate pid when it is running.
+    stub, _log = _caffeinate_stub(tmp_path)
+    pidfile = tmp_path / "sleep-inhibit"
+    env = {"AFK_CAFFEINATE_BIN": str(stub), "AFK_INHIBITOR_FILE": str(pidfile)}
+    try:
+        result = _call("_afk_arm_inhibitor 424242; afk_inhibitor_status", env=env)
+
+        assert re.search(r"sleep-inhibit: active \(pid \d+\)", result.stdout), result.stdout
+    finally:
+        _kill_inhibitor(pidfile)
+
+
+def test_inhibitor_status_missing_when_recorded_pid_is_dead(tmp_path: Path) -> None:
+    # AC4: caffeinate present but the recorded inhibitor pid is gone ⇒ MISSING (machine may sleep).
+    stub, _log = _caffeinate_stub(tmp_path)
+    pidfile = tmp_path / "sleep-inhibit"
+    env = {"AFK_CAFFEINATE_BIN": str(stub), "AFK_INHIBITOR_FILE": str(pidfile)}
+    # A reaped subshell pid is reliably dead (mirrors the DRAIN DEAD status tests).
+    expr = f'dead=$(sh -c "echo \\$$"); printf "%s 111111\\n" "$dead" > "{pidfile}"; afk_inhibitor_status'
+
+    result = _call(expr, env=env)
+
+    assert "sleep-inhibit: MISSING" in result.stdout
+    assert "machine may sleep" in result.stdout
+
+
+def test_inhibitor_status_unavailable_without_caffeinate(tmp_path: Path) -> None:
+    # AC4/AC5: on a host with no caffeinate the status line says unavailable and names the Linux
+    # equivalent, rather than claiming MISSING (which would imply caffeinate could have run).
+    pidfile = tmp_path / "sleep-inhibit"
+    env = {
+        "AFK_CAFFEINATE_BIN": str(tmp_path / "no-such-caffeinate"),
+        "AFK_INHIBITOR_FILE": str(pidfile),
+    }
+
+    result = _call("afk_inhibitor_status", env=env)
+
+    assert "sleep-inhibit: unavailable" in result.stdout
+    assert "systemd-inhibit" in result.stdout
+
+
+def test_warn_power_warns_on_battery_naming_both_limits(tmp_path: Path) -> None:
+    # AC4: on battery, arming warns that caffeinate -s holds only on AC and a lid-close sleeps
+    # regardless — both limits named so the operator plugs in and keeps the lid open.
+    pm = _pmset_stub(tmp_path, "Battery Power")
+
+    result = _call("afk_warn_power", env={"AFK_PMSET_BIN": str(pm)})
+
+    assert "WARNING" in result.stderr
+    assert "battery" in result.stderr.lower()
+    assert "AC" in result.stderr
+    assert "lid" in result.stderr.lower()
+
+
+def test_warn_power_silent_on_ac_power(tmp_path: Path) -> None:
+    # On AC power there is nothing to warn about — no spurious WARNING at arm.
+    pm = _pmset_stub(tmp_path, "AC Power")
+
+    result = _call("afk_warn_power", env={"AFK_PMSET_BIN": str(pm)})
+
+    assert "WARNING" not in result.stderr
+
+
+def test_warn_power_silent_without_pmset(tmp_path: Path) -> None:
+    # No pmset (non-macOS) ⇒ the battery check is a silent no-op, never a failure.
+    result = _call(
+        "afk_warn_power; echo RC=$?", env={"AFK_PMSET_BIN": str(tmp_path / "no-such-pmset")}
+    )
+
+    assert "RC=0" in result.stdout
+    assert "WARNING" not in result.stderr
+
+
+def test_warn_no_inhibitor_names_systemd_equivalent(tmp_path: Path) -> None:
+    # AC5: a non-macOS host (no caffeinate) is warned once at arm — arming proceeds, and the
+    # warning names the systemd-inhibit equivalent so the limitation is not silent.
+    result = _call(
+        "_afk_warn_no_inhibitor", env={"AFK_CAFFEINATE_BIN": str(tmp_path / "no-such-caffeinate")}
+    )
+
+    assert "WARNING" in result.stderr
+    assert "systemd-inhibit" in result.stderr
+
+
+def test_warn_no_inhibitor_silent_when_caffeinate_present(tmp_path: Path) -> None:
+    # With caffeinate present there is no non-macOS warning to emit.
+    stub, _log = _caffeinate_stub(tmp_path)
+
+    result = _call("_afk_warn_no_inhibitor", env={"AFK_CAFFEINATE_BIN": str(stub)})
+
+    assert result.stderr.strip() == ""
+
+
+def test_status_surfaces_inhibitor_line_for_live_drain(tmp_path: Path) -> None:
+    # AC4: a live drain's --status includes the sleep-inhibitor line alongside the state line.
+    stub, _log = _caffeinate_stub(tmp_path)
+    state = _armed_state(tmp_path, "drain")
+    hb = tmp_path / "heartbeat"
+    pidfile = tmp_path / "sleep-inhibit"
+    env = {
+        "AFK_STATE": str(state),
+        "AFK_HEARTBEAT": str(hb),
+        "AFK_CAFFEINATE_BIN": str(stub),
+        "AFK_INHIBITOR_FILE": str(pidfile),
+        "AFK_NOW": "1700000600",
+        "AI_TOOLKIT_OTEL": "0",
+    }
+    try:
+        expr = f'printf "%s 1700000560\\n" "$$" > "{hb}"; _afk_arm_inhibitor "$$"; _status'
+        result = _call(expr, env=env)
+
+        assert "sleep-inhibit:" in result.stdout
+    finally:
+        _kill_inhibitor(pidfile)
+
+
+def test_status_off_has_no_inhibitor_line(tmp_path: Path) -> None:
+    # When off, --status reports off and does not probe/print the inhibitor line.
+    stub, _log = _caffeinate_stub(tmp_path)
+    statef = tmp_path / "state"  # absent ⇒ off
+    env = {
+        "AFK_STATE": str(statef),
+        "AFK_CAFFEINATE_BIN": str(stub),
+        "AFK_INHIBITOR_FILE": str(tmp_path / "sleep-inhibit"),
+        "AI_TOOLKIT_OTEL": "0",
+    }
+
+    result = _call("_status", env=env)
+
+    assert "/afk: off" in result.stdout
+    assert "sleep-inhibit" not in result.stdout
