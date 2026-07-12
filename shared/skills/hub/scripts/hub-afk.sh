@@ -733,6 +733,86 @@ respawn_wedged_spoke() {
   return 0
 }
 
+# --- #243: hang-forensics capture before the reaper's revival kills the pane --------
+# A live-but-frozen claude spoke (idle>AFK_IDLE_MINUTES with a live pane) is REVIVED by
+# _revive_spoke — which kills the pane and relaunches (#241), DESTROYING the evidence a hang
+# autopsy / upstream Claude Code report needs (process state, pane content, the wedged-input
+# symptom). So just before the kill, capture a best-effort, BOUNDED bundle. A crashed pane
+# (no live process) has nothing to capture and skips gracefully. Evidence collection ONLY —
+# the revive itself is #241's job; this is the microscope, not the fix.
+
+# _afk_hang_forensics_dir -> the bundle root <git-common-dir>/hang-forensics. AFK_HANG_FORENSICS_DIR
+# overrides it for tests (mirrors _afk_state_dir).
+_afk_hang_forensics_dir() {
+  if [ -n "${AFK_HANG_FORENSICS_DIR:-}" ]; then printf '%s\n' "$AFK_HANG_FORENSICS_DIR"; return; fi
+  local common; common="$(git rev-parse --git-common-dir 2>/dev/null)" || common=".git"
+  printf '%s\n' "$common/hang-forensics"
+}
+
+# _afk_capture_proc_tree <pane_pid> <out> -> write the pane process tree's ps snapshot
+# (pid/stat/etime/wchan) plus, on macOS, a short `sample`, to <out>. The ps read forces
+# LC_ALL=C (the repo's locale trap: parsing localized columns silently strands the fields),
+# and the sample is time-BOUNDED so it can never delay the reap past the ~10s budget. Both
+# best-effort: an empty pane_pid or a failed probe leaves an empty/partial file, never an error.
+_afk_capture_proc_tree() {
+  local pane_pid="$1" out="$2" pids secs
+  case "$pane_pid" in '' | *[!0-9]*) return 0 ;; esac
+  pids="$pane_pid"
+  local child
+  for child in $(_afk_descendant_pids "$pane_pid"); do pids="$pids,$child"; done
+  LC_ALL=C ps -o pid,stat,etime,wchan -p "$pids" > "$out" 2>/dev/null || true
+  if command -v sample >/dev/null 2>&1; then
+    secs="${AFK_HANG_SAMPLE_SECONDS:-2}"; case "$secs" in '' | *[!0-9]*) secs=2 ;; esac
+    _afk_with_timeout "$(( secs + 2 ))" sample "$pane_pid" "$secs" >> "$out" 2>/dev/null || true
+  fi
+}
+
+# _afk_write_fingerprint <wt> <issue> <now> <mtime> -> emit the run fingerprint on stdout: the
+# transcript-activity-vs-UI-freeze delta (the hang's tell), elapsed since dispatch, the claude
+# version + model, and the OTEL env (the untested heavy-OTEL-logging correlation the issue flags).
+# All best-effort; a missing field records `unknown` rather than aborting.
+_afk_write_fingerprint() {
+  local wt="$1" issue="$2" now="$3" mtime="$4" disp elapsed=unknown silence=unknown ver model jsonl
+  disp="$(read_dispatch_epoch "$issue" | tr -d '[:space:]')"
+  case "$disp" in '' | *[!0-9]*) : ;; *) elapsed=$(( now - disp )) ;; esac
+  case "$mtime" in '' | *[!0-9]*) : ;; *) silence=$(( now - mtime )) ;; esac
+  ver="$(_afk_with_timeout 5 claude --version 2>/dev/null | head -1)"
+  jsonl="$(_spoke_jsonl "$wt")"
+  [ -n "$jsonl" ] && model="$(grep -oE '"model"[[:space:]]*:[[:space:]]*"[^"]*"' "$jsonl" 2>/dev/null | tail -1 | sed 's/.*: *"//;s/"$//')"
+  printf 'issue=%s\ncaptured_epoch=%s\ntranscript_mtime=%s\ntranscript_silence_seconds=%s\nelapsed_since_dispatch_seconds=%s\n' \
+    "$issue" "$now" "${mtime:-unknown}" "$silence" "$elapsed"
+  printf 'claude_version=%s\nmodel=%s\n' "${ver:-unknown}" "${model:-unknown}"
+  printf 'AI_TOOLKIT_OTEL=%s\nOTEL_EXPORTER_OTLP_ENDPOINT=%s\nAI_TOOLKIT_OTEL_SPAN_ENDPOINT=%s\nOTEL_RESOURCE_ATTRIBUTES=%s\n' \
+    "${AI_TOOLKIT_OTEL:-}" "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" "${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:-}" "${OTEL_RESOURCE_ATTRIBUTES:-}"
+}
+
+# _afk_capture_hang_forensics <wt> <issue> -> capture the hang bundle (best-effort, bounded) and
+# ECHO its path; echo NOTHING when there is no live pane to capture (a crashed spoke — the AC1
+# clean-reap skip). The bundle lands at <hang-forensics-dir>/<issue>-<epoch>/. Called from
+# _revive_spoke BEFORE the kill, so the frozen pane + its process tree are still observable.
+_afk_capture_hang_forensics() {
+  local wt="$1" issue="$2" target pane_pid dir jsonl now mtime
+  command -v tmux >/dev/null 2>&1 || return 0
+  target="$(_spoke_pane_target "$wt")"
+  [ -n "$target" ] || return 0            # dead pane — nothing to capture, skip gracefully
+  now="$(afk_now)"
+  dir="$(_afk_hang_forensics_dir)/$issue-$now"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  pane_pid="$(tmux display-message -p -t "$target" '#{pane_pid}' 2>/dev/null | tr -d '[:space:]')"
+  _afk_capture_proc_tree "$pane_pid" "$dir/process-tree.txt"
+  tmux capture-pane -p -S - -t "$target" > "$dir/pane.txt" 2>/dev/null || true
+  tmux display-message -p -t "$target" \
+    'pane_in_mode=#{pane_in_mode} pane_current_command=#{pane_current_command}' \
+    > "$dir/pane-meta.txt" 2>/dev/null || true
+  jsonl="$(_spoke_jsonl "$wt")"
+  if [ -n "$jsonl" ]; then
+    tail -n 50 "$jsonl" > "$dir/transcript-tail.jsonl" 2>/dev/null || true
+    mtime="$(stat -f %m "$jsonl" 2>/dev/null || stat -c %Y "$jsonl" 2>/dev/null)"
+  fi
+  _afk_write_fingerprint "$wt" "$issue" "$now" "${mtime:-}" > "$dir/fingerprint.txt" 2>/dev/null || true
+  printf '%s\n' "$dir"
+}
+
 # --- #241 §7/§8: revive-first, warned-parked-LAST, never abandon -----------------
 # The reaper no longer kills a stuck spoke into blocked/<issue>. Every former reap TAKES a
 # revival first (kill any hung/crashed pane + relaunch `claude --continue`); only a spoke whose
@@ -762,9 +842,12 @@ _warn_parked_last() {
 # same-tick reap_pass re-reaps it as idle). Marks the once-per-window revival. rc 1 when the
 # window could not be opened (the caller warns + retries next tick).
 _revive_spoke() {
-  local wt="$1" issue="$2"
+  local wt="$1" issue="$2" bundle
   log "→ revive #$issue: killing any hung/crashed pane and relaunching (claude --continue)"
   _afk_set_last_action "revive #$issue"
+  # #243: capture the hang forensics BEFORE the kill destroys them (a live pane leaves a bundle;
+  # a crashed pane echoes nothing and is skipped). Best-effort — a failed capture never blocks the revive.
+  bundle="$(_afk_capture_hang_forensics "$wt" "$issue")"
   _kill_spoke_window "$issue"
   if ! _afk_open_spoke_window "$wt" "$issue" "$(_afk_resume_command "$wt" "$issue")"; then
     log "  could not open a revive window for #$issue"
@@ -774,8 +857,10 @@ _revive_spoke() {
   stamp_progress_epoch "$issue"
   stamp_answer_attempt "$issue"
   # #241 §10: a revival is a taken decision the morning review sees — journal it (a successful
-  # revival is not a loud warned record, just an auditable journal line + span).
-  broker_journal_decision "$issue" revive "revived a hung/crashed pane (killed + relaunched claude --continue)" reversible
+  # revival is not a loud warned record, just an auditable journal line + span). #243: name the
+  # forensics bundle in the journal line so the morning review can open it.
+  broker_journal_decision "$issue" revive \
+    "revived a hung/crashed pane (killed + relaunched claude --continue)${bundle:+ — hang forensics: $bundle}" reversible
   _afk_bump_count "$wt" relaunch-count   # #231: a relaunch — failure economics vs a clean run
   _afk_clear_park_episode "$wt"          # #231: a fresh run may re-park → count the next block anew
   _afk_emit_span "$wt" afk-revive success
@@ -2403,6 +2488,17 @@ afk_blocked_locally_status() {
     "$list" "$dir"
 }
 
+# afk_hang_forensics_status -> a one-line summary of the hang-forensics bundles captured before
+# a reaper revival (#243), or nothing when none exist. Like the blocked-locally line, a bundle
+# outlives the drain, so the operator returning from AFK sees where the hang evidence sits.
+afk_hang_forensics_status() {
+  local dir count; dir="$(_afk_hang_forensics_dir)"
+  [ -d "$dir" ] || return 0
+  count="$(find "$dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d '[:space:]')"
+  case "$count" in '' | 0) return 0 ;; esac
+  printf '/afk: hang-forensics: %s bundle(s) captured [%s]\n' "$count" "$dir"
+}
+
 _status() {
   local state now
   state="$(afk_read_state)"; now="$(afk_now)"
@@ -2411,6 +2507,7 @@ _status() {
     # A durable escalation outlives the drain — surface it even when off, so the operator
     # returning from AFK sees a block that never reached the dashboard (#109).
     afk_blocked_locally_status
+    afk_hang_forensics_status   # #243: hang-forensics bundles outlive the drain too
     return 0
   fi
   _afk_status_state_line "$state" "$now"
@@ -2422,6 +2519,7 @@ _status() {
   # the operator must be able to see whether the inhibitor is actually holding.
   afk_inhibitor_status
   afk_blocked_locally_status
+  afk_hang_forensics_status   # #243: surface where a reaper revival stashed the hang evidence
 }
 
 main() {
