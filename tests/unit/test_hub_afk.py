@@ -16,11 +16,13 @@ from running on import) and drive its layers directly:
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -6949,3 +6951,132 @@ def test_decide_and_act_auth_failure_warns_not_blocks(
     )
     assert "WARNING: #5" in result.stderr and "auth" in result.stderr.lower(), result.stderr
     assert "FLAG=1" in result.stdout, "the global halt flag must still be raised"
+
+
+# ── the local sleep inhibitor (issue #242) ────────────────────────────────────
+# While a drain is armed the Mac must not sleep: arming ties a `caffeinate -is -w
+# <supervisor pid>` to the supervisor's lifetime (caffeinate -w self-exits when that
+# pid dies, so /afk off needs no teardown). caffeinate is stubbed via AFK_CAFFEINATE_BIN
+# so no real inhibitor is spawned; the pidfile is pinned via AFK_INHIBITOR_FILE.
+
+
+def _caffeinate_stub(tmp_path: Path, log_name: str = "caffeinate.log") -> tuple[Path, Path]:
+    """A caffeinate stub: record args, then `exec sleep` so the recorded pid stays alive.
+
+    `exec` keeps the SAME pid the launching shell captured in `$!`, so the pidfile's
+    caffeinate pid maps to a live process exactly as a real `caffeinate -w` would.
+    """
+    log = tmp_path / log_name
+    stub = tmp_path / "caffeinate"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\nexec sleep 600\n')
+    stub.chmod(0o755)
+    return stub, log
+
+
+def _kill_inhibitor(pidfile: Path) -> None:
+    """SIGKILL the caffeinate-stub pid the pidfile records, so no stub leaks past a test."""
+    if not pidfile.exists():
+        return
+    for tok in pidfile.read_text().split():
+        if tok.isdigit():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(tok), signal.SIGKILL)
+            return
+
+
+def test_arm_inhibitor_spawns_one_caffeinate_tied_to_the_pid(tmp_path: Path) -> None:
+    # AC1: arming spawns exactly one `caffeinate -is -w <supervisor pid>`, recorded in the
+    # pidfile so a later tick can tell it is already armed.
+    stub, log = _caffeinate_stub(tmp_path)
+    pidfile = tmp_path / "sleep-inhibit"
+    env = {"AFK_CAFFEINATE_BIN": str(stub), "AFK_INHIBITOR_FILE": str(pidfile)}
+    try:
+        result = _call("_afk_arm_inhibitor 424242; echo RC=$?", env=env)
+
+        assert "RC=0" in result.stdout, result.stderr
+        assert log.exists(), "caffeinate must have been launched"
+        assert log.read_text().strip() == "-is -w 424242", log.read_text()
+        rec = pidfile.read_text().split()
+        assert len(rec) == 2 and rec[1] == "424242", pidfile.read_text()
+        assert rec[0].isdigit()
+    finally:
+        _kill_inhibitor(pidfile)
+
+
+def test_arm_inhibitor_second_arm_does_not_stack(tmp_path: Path) -> None:
+    # AC1: a second arm for the SAME supervisor pid, with the inhibitor still alive, is a
+    # no-op — it must not spawn a second caffeinate (exactly one per checkout).
+    stub, log = _caffeinate_stub(tmp_path)
+    pidfile = tmp_path / "sleep-inhibit"
+    env = {"AFK_CAFFEINATE_BIN": str(stub), "AFK_INHIBITOR_FILE": str(pidfile)}
+    try:
+        _call("_afk_arm_inhibitor 424242; _afk_arm_inhibitor 424242", env=env)
+
+        assert log.read_text().splitlines() == ["-is -w 424242"], (
+            "a second arm must not stack a second caffeinate"
+        )
+    finally:
+        _kill_inhibitor(pidfile)
+
+
+def test_arm_inhibitor_reties_to_new_supervisor_pid(tmp_path: Path) -> None:
+    # AC2: a watchdog respawn re-ties the inhibitor to the NEW supervisor pid — arming with a
+    # different pid replaces the pidfile entry (the old `caffeinate -w <old pid>` self-dies).
+    stub, log = _caffeinate_stub(tmp_path)
+    pidfile = tmp_path / "sleep-inhibit"
+    env = {"AFK_CAFFEINATE_BIN": str(stub), "AFK_INHIBITOR_FILE": str(pidfile)}
+    try:
+        _call("_afk_arm_inhibitor 111111; _afk_arm_inhibitor 222222", env=env)
+
+        lines = log.read_text().splitlines()
+        assert "-is -w 111111" in lines and "-is -w 222222" in lines
+        rec = pidfile.read_text().split()
+        assert rec[1] == "222222", "the pidfile must re-tie to the new supervisor pid"
+        assert rec[0].isdigit()
+    finally:
+        _kill_inhibitor(pidfile)
+
+
+def test_arm_inhibitor_no_caffeinate_is_silent_and_never_fails(tmp_path: Path) -> None:
+    # AC5: on a host without caffeinate (non-macOS) the arm PROCEEDS — the ensure is a silent
+    # no-op (no pidfile, no spam), never a failure that would abort arming.
+    pidfile = tmp_path / "sleep-inhibit"
+    env = {
+        "AFK_CAFFEINATE_BIN": str(tmp_path / "definitely-not-a-real-binary"),
+        "AFK_INHIBITOR_FILE": str(pidfile),
+    }
+
+    result = _call("_afk_arm_inhibitor 424242; echo RC=$?", env=env)
+
+    assert "RC=0" in result.stdout, result.stderr
+    assert not pidfile.exists(), "no inhibitor pidfile when caffeinate is absent"
+
+
+def test_watchdog_live_arms_the_inhibitor(tmp_path: Path) -> None:
+    # The watchdog re-checks the inhibitor each interval alongside the supervisor: on a live
+    # (non-wedged) supervisor it (re-)arms the inhibitor tied to the heartbeat (supervisor) pid,
+    # so a killed caffeinate is re-armed between the supervisor's slower ticks.
+    stub, _log = _caffeinate_stub(tmp_path)
+    state = tmp_path / "state"
+    state.write_text("drain\n")
+    hb = tmp_path / "heartbeat"
+    pidfile = tmp_path / "sleep-inhibit"
+    marker = tmp_path / "respawned"
+    expr = f'printf "%s 1700000000\\n" "$$" > "{hb}"; watchdog_tick'
+    env = {
+        "AFK_STATE": str(state),
+        "AFK_HEARTBEAT": str(hb),
+        "AFK_INHIBITOR_FILE": str(pidfile),
+        "AFK_CAFFEINATE_BIN": str(stub),
+        "AFK_RESPAWN_CMD": f"touch {marker}",
+        "AFK_NOW": "1700000060",  # recent heartbeat ⇒ live, not wedged
+    }
+    try:
+        result = _call(expr, env=env)
+
+        assert result.stdout.strip() == "live"
+        assert not marker.exists(), "a live supervisor must not be respawned"
+        assert pidfile.exists(), "the watchdog must arm the inhibitor on a live supervisor"
+        assert pidfile.read_text().split()[0].isdigit()
+    finally:
+        _kill_inhibitor(pidfile)
