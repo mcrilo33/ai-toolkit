@@ -7863,13 +7863,33 @@ def test_wait_supervisor_gone_nonzero_on_timeout(tmp_path: Path) -> None:
 
 
 def test_wait_supervisor_gone_nudges_wake_capable(tmp_path: Path) -> None:
-    # A wake-capable heartbeat (the `wake1` token) is SIGUSR1-nudged so it steps down at once: the
-    # sleeper would outlast the bound, but the USR1 kills it well inside AFK_OFF_WAIT_SECONDS.
+    # A wake-capable heartbeat (the `wake1` token) is SIGUSR1-nudged so it steps down well inside
+    # the bound. This asserts the NUDGE contract, so the pass must REQUIRE the nudge: the fake
+    # supervisor's 300s lifetime FAR outlasts AFK_OFF_WAIT_SECONDS=30, so absent the SIGUSR1 the
+    # helper would exhaust the bound and time out (RC=1). (A bound above the sleeper's lifetime
+    # would pass vacuously — the sleeper would self-die within the bound whether or not the nudge
+    # landed, and a regression in the helper's USR1 path would sail through green.)
+    #
+    # The nudge is caught DETERMINISTICALLY, not via a wall-clock race:
+    #   - An explicit `trap ... USR1`, not SIGUSR1's default-terminate disposition: a single default
+    #     USR1 is unreliable under load (it can race the bash->sleep execve or hit a disposition
+    #     inherited SIG_IGN). An installed trap catches the signal regardless.
+    #   - `sleep 300 & wait` (not a foreground `sleep`) so the trap fires promptly — `wait` is
+    #     interruptible; a foreground sleep would defer the trap until it returned.
+    #   - A `sleep 1` settle before signalling, so the trap is installed and bash is blocked in
+    #     `wait` before the helper's USR1 arrives (a signal landing during startup, pre-trap, is
+    #     missed).
+    #   - The trap kills the sleeper and exits, so the happy path leaves no orphan; `>/dev/null`
+    #     redirects the fake supervisor so that even a failure-path orphan can never hold the
+    #     subprocess capture pipe and hang `_call` (a genuine regression fails fast at the bound).
+    # The generous 30s bound (vs the old 8s ceiling) leaves the 1-second-granularity poll ample room
+    # to observe the ~1-3s teardown under load. See #258.
     result = _call(
-        'bash -c "sleep 30" & pid=$!; '
+        "bash -c 'sleep 300 & s=$!; trap \"kill $s 2>/dev/null; exit 0\" USR1; wait' "
+        ">/dev/null 2>&1 & pid=$!; sleep 1; "
         'afk_wait_supervisor_gone "$pid" "$pid 1700000000 wake1"; rc=$?; '
         'kill "$pid" 2>/dev/null; echo RC=$rc',
-        env={"AFK_OFF_WAIT_SECONDS": "8"},
+        env={"AFK_OFF_WAIT_SECONDS": "30"},
     )
 
     assert "RC=0" in result.stdout, "a wake-capable supervisor must be nudged, not time out"
