@@ -7894,3 +7894,78 @@ def test_off_without_wait_returns_immediately(tmp_path: Path) -> None:
 
     assert "RC=0" in result.stdout, result.stderr
     assert not state.exists()
+
+
+# ── #252: --status duplicate-lineage warning ───────────────────────────────────
+# The heartbeat records only ONE pid, so a second live supervisor from a fast off/re-arm race is
+# invisible to afk_supervisor_state. `--status` therefore scans for live supervisor lineages
+# (overridable via AFK_SUPERVISOR_PIDS_CMD) and WARNS when more than one is running — warn-only,
+# it never acts.
+
+
+def test_duplicate_supervisor_status_warns_on_two_lineages(tmp_path: Path) -> None:
+    result = _call(
+        "afk_duplicate_supervisor_status",
+        env={"AFK_SUPERVISOR_PIDS_CMD": "printf '111\\n222\\n'"},
+    )
+
+    assert "WARNING" in result.stdout, result.stdout
+    assert "2 live supervisor lineages" in result.stdout, result.stdout
+    assert "111" in result.stdout and "222" in result.stdout, result.stdout
+
+
+def test_duplicate_supervisor_status_silent_on_single_lineage(tmp_path: Path) -> None:
+    result = _call(
+        "afk_duplicate_supervisor_status",
+        env={"AFK_SUPERVISOR_PIDS_CMD": "printf '111\\n'"},
+    )
+
+    assert result.stdout.strip() == "", "a single supervisor must not warn"
+
+
+def test_duplicate_supervisor_status_silent_on_zero(tmp_path: Path) -> None:
+    result = _call(
+        "afk_duplicate_supervisor_status",
+        env={"AFK_SUPERVISOR_PIDS_CMD": "true"},  # emits nothing
+    )
+
+    assert result.stdout.strip() == "", "no supervisors ⇒ no warning"
+
+
+def test_status_surfaces_duplicate_lineage_warning(tmp_path: Path) -> None:
+    # End to end through `_status`: a drain with two live lineages surfaces the warning so an
+    # operator returning to the hub sees the double-drain hazard at a glance.
+    state = _armed_state(tmp_path, "drain")
+    hb = tmp_path / "heartbeat"
+    expr = f'printf "%s 1700000000 wake1\\n" "$$" > "{hb}"; _status'
+    result = _call(
+        expr,
+        env={
+            "AFK_STATE": str(state),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_NOW": "1700000060",
+            "AI_TOOLKIT_OTEL": "0",
+            "AFK_SUPERVISOR_PIDS_CMD": "printf '111\\n222\\n'",
+        },
+    )
+
+    assert "2 live supervisor lineages" in result.stdout, result.stdout
+
+
+def test_status_no_duplicate_warning_for_single_lineage(tmp_path: Path) -> None:
+    # The healthy single-supervisor case: `--status` must NOT cry duplicate.
+    state = _armed_state(tmp_path, "drain")
+    hb = tmp_path / "heartbeat"
+    expr = f'printf "%s 1700000000 wake1\\n" "$$" > "{hb}"; _status'
+    result = _call(
+        expr,
+        env={
+            "AFK_STATE": str(state),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_NOW": "1700000060",
+            "AI_TOOLKIT_OTEL": "0",
+            "AFK_SUPERVISOR_PIDS_CMD": "printf '111\\n'",
+        },
+    )
+
+    assert "supervisor lineages" not in result.stdout, result.stdout
