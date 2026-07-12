@@ -1751,8 +1751,8 @@ afk_done() {
 # to the supervisor's LIFETIME: `caffeinate -w <pid>` self-exits the instant that pid dies,
 # so /afk off (and any crash) needs NO teardown — this mirrors the --remote path's
 # `caffeinate -s` wrap (build_remote_launch_cmd) for the LOCAL arm. AFK_CAFFEINATE_BIN wins
-# for tests. Battery/lid limits are warned at arm time (afk_warn_power); on a non-macOS host
-# the ensure is a silent no-op and the arm path warns once (_afk_warn_no_inhibitor).
+# for tests. On a non-macOS host (no caffeinate) the ensure is a SILENT no-op so arming never
+# fails; the loud battery/lid and missing-caffeinate warnings are surfaced separately at arm.
 #
 # The pidfile records "<caffeinate pid> <supervisor pid>" under the per-run state dir (so the
 # tests' AFK_STATE_DIR pin isolates it); AFK_INHIBITOR_FILE overrides it directly.
@@ -1769,8 +1769,8 @@ _afk_inhibitor_pid() {
 # _afk_arm_inhibitor <supervisor pid> -> ensure EXACTLY ONE `caffeinate -is -w <pid>` is
 # tied to <pid>. Idempotent: the supervisor calls it each tick (tied to $$) and the watchdog
 # each interval (tied to the live heartbeat pid), so a killed caffeinate is re-armed and a
-# respawn re-ties to the new pid. A non-numeric pid or an absent caffeinate is a silent no-op
-# (the arm path emits the one non-macOS warning), never a failure that would abort arming.
+# respawn re-ties to the new pid. A non-numeric pid or an absent caffeinate is a silent no-op,
+# never a failure that would abort arming (the non-macOS warning is surfaced once at arm time).
 #
 # Concurrency (supervisor tick vs watchdog tick both arming at once): the fast path no-ops
 # when a live inhibitor already ties to THIS pid, so a spawn only happens when there is none.
@@ -1803,12 +1803,16 @@ _afk_arm_inhibitor() {
       return 0   # claimed the pidfile — my inhibitor is the one
     fi
     rec="$(head -n1 "$f" 2>/dev/null)"; cpid="${rec%% *}"; spid="${rec##* }"
+    # A blank / partial record: a peer won the O_EXCL create microseconds ago but its content
+    # bytes have not landed yet (create and printf are two steps). Do NOT delete it — re-read
+    # next round; its pid converges and the peer's-live branch below then fires (#242 review).
+    case "$spid" in '' | *[!0-9]*) continue ;; esac
     if [ "$spid" = "$sup_pid" ] && _afk_pid_alive "$cpid"; then
       [ "$cpid" = "$mine" ] || kill "$mine" 2>/dev/null || true
       return 0   # a live inhibitor for this supervisor exists (mine or a peer's) — drop my double
     fi
-    # Stale incumbent (dead caffeinate, or an OLD supervisor pid i.e. a respawn re-tie): drop
-    # it and re-claim the now-empty pidfile.
+    # Genuinely stale incumbent (a real but dead caffeinate, or an OLD supervisor pid i.e. a
+    # respawn re-tie): drop it and re-claim the now-empty pidfile.
     [ "$cpid" != "$mine" ] && _afk_pid_alive "$cpid" && kill "$cpid" 2>/dev/null || true
     rm -f "$f" 2>/dev/null || true
   done
