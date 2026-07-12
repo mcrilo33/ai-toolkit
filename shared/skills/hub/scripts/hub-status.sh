@@ -352,6 +352,74 @@ while IFS= read -r line; do
 done < <(git -C "$main_root" worktree list 2>/dev/null)
 echo
 
+# --- Hub agents (issue #245) -------------------------------------------------
+# Hub-side agent work (pre-land reviews, bug-scopers, delta re-reviews) runs via
+# hub-agent.sh, which journals a start record when it launches and an end record
+# when it finishes. Surface the LIVE ones — a label whose latest journal event is
+# `start` (no matching `end`) — so a running hub agent is as visible as a spoke
+# pane. Strictly best-effort/read-only (mirrors the todos sub-line): a missing,
+# empty, or malformed journal yields an empty view, never an error. The dir is
+# overridable (AI_TOOLKIT_HUB_AGENTS_DIR) for tests; else the hub's gitignored
+# .ai-toolkit/hub-agents.
+bold "Hub agents"
+hub_agents_dir="${AI_TOOLKIT_HUB_AGENTS_DIR:-$main_root/.ai-toolkit/hub-agents}"
+hub_agents_journal="$hub_agents_dir/journal.jsonl"
+hub_agents_out=""
+if [ -f "$hub_agents_journal" ] && command -v python3 >/dev/null 2>&1; then
+  hub_agents_out="$(_HA_JOURNAL="$hub_agents_journal" python3 2>/dev/null <<'PYEOF'
+import json, os, time
+
+live = {}  # label -> latest start record (dropped once an end supersedes it)
+try:
+    with open(os.environ["_HA_JOURNAL"]) as fh:
+        for raw in fh:
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            label = obj.get("label")
+            event = obj.get("event")
+            if not label or event not in ("start", "end"):
+                continue
+            if event == "start":
+                live[label] = obj
+            else:
+                live.pop(label, None)
+except Exception:
+    pass
+
+now = time.time()
+for label, rec in live.items():
+    purpose = str(rec.get("purpose") or "").split("\n", 1)[0]
+    parts = [f"hub:{label}"]
+    if purpose:
+        parts.append(purpose)
+    try:
+        age = max(0, now - float(rec.get("ts_epoch")))
+        if age < 60:
+            parts.append(f"{int(age)}s")
+        elif age < 3600:
+            parts.append(f"{int(age // 60)}m")
+        else:
+            parts.append(f"{int(age // 3600)}h")
+    except (TypeError, ValueError):
+        pass
+    log = str(rec.get("log") or "")
+    if log:
+        parts.append(log)
+    print("  " + " · ".join(parts))
+PYEOF
+)"
+fi
+if [ -n "$hub_agents_out" ]; then
+  printf '%s\n' "$hub_agents_out"
+else
+  echo "  (none running)"
+fi
+echo
+
 # --- Open issues -----------------------------------------------------------
 bold "Open issues"
 if command -v gh >/dev/null 2>&1; then
