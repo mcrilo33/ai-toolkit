@@ -219,8 +219,10 @@ from telemetry.spoke_tree.loaded_context import (
 )
 from telemetry.spoke_tree.metadata import (
     apply_mode_lane_tags,
+    apply_outcome_tag,
     apply_request_body_metadata,
     read_mode_lane,
+    read_outcome,
 )
 from telemetry.spoke_tree.observations import (
     IngestEvent,
@@ -240,6 +242,7 @@ from telemetry.spoke_tree.scores import (
     build_mcp_call_scores,
     build_mcp_carry_cost_scores,
     build_mcp_def_load_scores,
+    build_outcome_count_scores,
     build_rule_carry_cost_scores,
     build_rule_invocation_scores,
     build_score_events,
@@ -919,6 +922,7 @@ class EnrichmentContext:
     mcp_call_scores: list[IngestEvent] = field(default_factory=list)
     mcp_def_load_scores: list[IngestEvent] = field(default_factory=list)
     agent_verdict_scores: list[IngestEvent] = field(default_factory=list)
+    outcome_count_scores: list[IngestEvent] = field(default_factory=list)
 
 
 def _enrich_loaded_context(ctx: EnrichmentContext) -> None:
@@ -1060,6 +1064,13 @@ def _enrich_mcp_def_loads(ctx: EnrichmentContext) -> None:
     )
 
 
+def _enrich_outcome_counts(ctx: EnrichmentContext) -> None:
+    """Emit the #231 trace-level gate_park_count / blocked_count / relaunch_count scores."""
+    ctx.outcome_count_scores = build_outcome_count_scores(
+        ctx.spoke_run_id, ctx.traces, ctx.root, base_ts=ctx.base_ts
+    )
+
+
 def _enrich_agent_verdict(ctx: EnrichmentContext) -> None:
     """Emit per-agent ``agent_verdict:<type>`` scores from reviews + sub-agent outcomes (#233).
 
@@ -1090,6 +1101,7 @@ _ENRICHMENTS: tuple[tuple[str, Callable[[EnrichmentContext], None]], ...] = (
     ("mcp-calls", _enrich_mcp_calls),
     ("mcp-def-loads", _enrich_mcp_def_loads),
     ("agent-verdict", _enrich_agent_verdict),
+    ("outcome-counts", _enrich_outcome_counts),
 )
 
 
@@ -1136,6 +1148,9 @@ def main(argv: list[str] | None = None) -> int:
     mode, lane = read_mode_lane(args.root.resolve())
     apply_mode_lane_tags(batch, mode, lane)
     apply_mode_lane_tags(cycle_batch, mode, lane)
+    outcome = read_outcome(args.root.resolve())
+    apply_outcome_tag(batch, outcome)
+    apply_outcome_tag(cycle_batch, outcome)
 
     # One counter, memoized by content hash and shared across the loaded-context measurement, the
     # #99 decomposition, and the #160 context deltas — the stable prefix repeats on every snapshot.
@@ -1175,7 +1190,8 @@ def main(argv: list[str] | None = None) -> int:
         + ctx.skill_success_scores
         + ctx.mcp_call_scores
         + ctx.mcp_def_load_scores
-        + ctx.agent_verdict_scores,
+        + ctx.agent_verdict_scores
+        + ctx.outcome_count_scores,
         post,
     )
 
@@ -1200,8 +1216,9 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(ctx.mcp_call_scores)} mcp-call scores emitted, "
         f"{len(ctx.mcp_def_load_scores)} mcp-def-load scores emitted, "
         f"{len(ctx.agent_verdict_scores)} agent-verdict scores emitted, "
+        f"{len(ctx.outcome_count_scores)} outcome-count scores emitted, "
         f"{len(commits)} commit nodes synthesized, "
-        f"tagged mode={mode} lane={lane}; "
+        f"tagged mode={mode} lane={lane} outcome={outcome}; "
         f"{len(cycle_batch) - 2} observations assembled under cycle trace {cycle_trace_id}"
     )
     return 0

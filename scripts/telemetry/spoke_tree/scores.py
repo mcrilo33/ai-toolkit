@@ -266,11 +266,61 @@ def build_score_events(
     return events
 
 
+def _read_count_pointer(root: Path, pointer: str) -> int:
+    """Return a non-negative integer from a ``.ai-toolkit`` count pointer, or 0 (#231).
+
+    A missing, unreadable, blank, or non-integer pointer resolves to 0 — supervisor state
+    that was never written reads as "no blocks/relaunches", never crashes the land-time build.
+    """
+    try:
+        value = (root / pointer).read_text(encoding="utf-8").strip()
+    except OSError:
+        return 0
+    return int(value) if value.isdigit() else 0
+
+
 def build_outcome_count_scores(
     spoke_run_id: str, traces: list[TraceObservations], root: Path, *, base_ts: str
 ) -> list[IngestEvent]:
-    """RED stub (#231) — GREEN emits gate_park_count/blocked_count/relaunch_count scores."""
-    return []
+    """Build the trace-level failure-economics count scores (#231).
+
+    A blocked/reaped disaster spoke and a clean landing carried identical trace tags, so these
+    three numeric scores make the difference queryable:
+
+    - ``gate_park_count`` — DERIVED from the traces: how many PLAN-gate park spans the spoke
+      emitted (:func:`_is_gate_observation`), so no shell input is needed.
+    - ``blocked_count`` / ``relaunch_count`` — supervisor state, read from the worktree's
+      ``.ai-toolkit`` integer pointers (:func:`_read_count_pointer`), defaulting to 0 so a
+      clean landing (0 blocks, 0 relaunches) reads distinctly from "not measured".
+
+    All three are emitted unconditionally (0 included) and trace-level, so each is a one-widget
+    Scores query; ids derive from the spoke run id so a rerun overwrites the same scores.
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids).
+        traces: The source traces (scanned for the gate-park spans).
+        root: The worktree root holding the ``.ai-toolkit`` count pointers.
+        base_ts: ISO timestamp stamped on every score event.
+
+    Returns:
+        The three ``score-create`` events (gate_park_count, blocked_count, relaunch_count).
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    gate_parks = sum(
+        1
+        for _orig_trace_id, observations in traces
+        for observation in observations
+        if _is_gate_observation(observation)
+    )
+    values = {
+        _GATE_PARK_COUNT_SCORE: gate_parks,
+        _BLOCKED_COUNT_SCORE: _read_count_pointer(root, _BLOCKED_COUNT_POINTER),
+        _RELAUNCH_COUNT_SCORE: _read_count_pointer(root, _RELAUNCH_COUNT_POINTER),
+    }
+    return [
+        _score_event(spoke_run_id, name=name, value=value, trace_id=trace_id, base_ts=base_ts)
+        for name, value in values.items()
+    ]
 
 
 def _script_name(body: dict[str, Any]) -> str:

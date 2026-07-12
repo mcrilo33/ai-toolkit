@@ -569,7 +569,24 @@ fi
 # self-gates (not-an-OTel spoke, no LANGFUSE_BASIC_AUTH) and is best-effort: it
 # never fails the land, so it never blocks shipping. No worktree (--local) → no-op.
 if [ -n "$WT_DIR" ]; then
-  bash "$SCRIPT_DIR/telemetry-ingest-spoke.sh" "$WT_DIR" \
+  # Terminal-outcome stamp (#231): record that this spoke LANDED before the view build reads it,
+  # so the assembled trace carries an outcome:landed tag. Any blocked/relaunch count pointers the
+  # supervisor left in .ai-toolkit persist here — the "disaster that eventually landed" economics.
+  # If the supervisor already stamped a non-landed outcome, a block-time view was posted, so pass
+  # --rebuild to refresh that partial snapshot rather than first-write-wins onto it. Only an
+  # existing .ai-toolkit dir is written (worktree-new.sh mints + git-excludes it for a real OTel
+  # spoke); a worktree without one is not an OTel spoke, so writing there would only dirty the tree
+  # the teardown then refuses to remove. Best-effort — a write failure never blocks a completed land.
+  REBUILD_VIEW=""
+  if [ -d "$WT_DIR/.ai-toolkit" ]; then
+    OUTCOME_FILE="$WT_DIR/.ai-toolkit/outcome"
+    if [ -f "$OUTCOME_FILE" ] && [ "$(head -n1 "$OUTCOME_FILE" 2>/dev/null)" != "landed" ]; then
+      REBUILD_VIEW="--rebuild"
+    fi
+    printf 'landed\n' > "$OUTCOME_FILE" 2>/dev/null \
+      || wt_warn "couldn't stamp outcome=landed for $WT_DIR — trace will lack the outcome tag"
+  fi
+  bash "$SCRIPT_DIR/telemetry-ingest-spoke.sh" "$WT_DIR" ${REBUILD_VIEW:+"$REBUILD_VIEW"} \
     || wt_warn "post-run Langfuse ingestion errored — landing continues"
 fi
 

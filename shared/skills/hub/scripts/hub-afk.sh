@@ -129,6 +129,21 @@ for _cand in \
 done
 unset _cand
 
+# --- resolve telemetry-ingest-spoke.sh (#231 block-time outcome view build) ----
+# On a terminal block the supervisor stamps outcome=blocked and rebuilds the spoke's
+# Langfuse view so a never-landing spoke still carries an outcome tag (worktree-land.sh
+# owns the landed path). Resolution mirrors worktree-lib above; AFK_INGEST_BIN wins for tests.
+_AFK_INGEST_BIN=""
+for _cand in \
+  "${AFK_INGEST_BIN:-}" \
+  "$SCRIPT_DIR/telemetry-ingest-spoke.sh" \
+  "$SCRIPT_DIR/../../../../scripts/telemetry-ingest-spoke.sh" \
+  "${_AFK_TOPLEVEL:+$_AFK_TOPLEVEL/scripts/telemetry-ingest-spoke.sh}" \
+  "${_AFK_TOPLEVEL:+$_AFK_TOPLEVEL/.ai-toolkit/scripts/telemetry-ingest-spoke.sh}"; do
+  if [ -n "$_cand" ] && [ -f "$_cand" ]; then _AFK_INGEST_BIN="$_cand"; break; fi
+done
+unset _cand
+
 # --- bounded external calls (issue #170 ST1) ----------------------------------
 # One wedged external call (a hung `batch-plan.sh`, a stuck `gh`) used to freeze the whole
 # supervisor forever behind a live pid. Every external call the tick makes is now run under
@@ -411,6 +426,37 @@ _kill_spoke_window() {
       case "$name" in "${issue}-"* | "$issue") tmux kill-window -t "$target" 2>/dev/null || true ;; esac
     done
 }
+# --- #231 terminal-outcome + failure-economics counts -------------------------
+# The supervisor knows a spoke's terminal state (blocked) and its relaunch history — state
+# a landed spoke's clean trace can't distinguish. These best-effort helpers stamp it into the
+# worktree's .ai-toolkit pointers the view builder reads (outcome tag + blocked/relaunch counts);
+# a torn-down or unwritable worktree is a silent no-op, never failing a tick.
+
+# _afk_stamp_outcome <wt> <outcome> -> record the spoke's terminal outcome pointer (#231).
+_afk_stamp_outcome() {
+  [ -d "$1/.ai-toolkit" ] || return 0
+  _afk_atomic_write "$1/.ai-toolkit/outcome" "$2" || true
+}
+
+# _afk_bump_count <wt> <basename> -> increment a .ai-toolkit integer count pointer from 0 (#231).
+_afk_bump_count() {
+  local file="$1/.ai-toolkit/$2" cur
+  [ -d "$1/.ai-toolkit" ] || return 0
+  cur="$(head -n1 "$file" 2>/dev/null | tr -dc '0-9')"
+  [ -n "$cur" ] || cur=0
+  _afk_atomic_write "$file" "$(( cur + 1 ))" || true
+}
+
+# _afk_build_outcome_view <wt> -> best-effort assemble the spoke's Langfuse view now that its
+# terminal outcome is stamped (#231), so a never-landing (blocked) spoke still gets an
+# outcome-tagged trace. Bounded + self-gating (telemetry-ingest-spoke.sh no-ops without the OTel
+# raw-bodies dir or Langfuse auth); --rebuild refreshes any partial view an earlier tick posted.
+_afk_build_outcome_view() {
+  [ -n "$_AFK_INGEST_BIN" ] || return 0
+  _afk_with_timeout "${AFK_INGEST_TIMEOUT:-120}" \
+    bash "$_AFK_INGEST_BIN" "$1" --rebuild >/dev/null 2>&1 || true
+}
+
 # _afk_escalate_blocked <wt> <issue> <reason> — the ONE supervisor escalation path
 # (issue #236). It runs the gate-broker core _escalate_blocked (marker emit + durable
 # local-record fallback + deny span) AND mirrors the transition onto the GitHub issue's
@@ -426,6 +472,11 @@ _afk_escalate_blocked() {
     *) command -v wt_gh_set_status_label >/dev/null 2>&1 \
          && wt_gh_set_status_label "$2" "status:blocked" || true ;;
   esac
+  # #231: stamp the terminal outcome + block count, then rebuild the view so a never-landing
+  # spoke still carries an outcome:blocked tag. All best-effort — never fails the escalation.
+  _afk_stamp_outcome "$1" blocked
+  _afk_bump_count "$1" blocked-count
+  _afk_build_outcome_view "$1"
 }
 
 # reap_spoke (kill window + escalate blocked/<issue>) is retired by #241: the reaper never
@@ -629,6 +680,7 @@ resume_spoke() {
   # answer-attempt epoch is the idle clock's exclusion, so stamping it reads the revived spoke
   # busy until its new session writes a transcript.
   stamp_answer_attempt "$issue"
+  _afk_bump_count "$wt" relaunch-count   # #231: a relaunch — failure economics vs a clean run
   _afk_emit_span "$wt" afk-resume success
   return 0
 }
@@ -655,6 +707,7 @@ respawn_wedged_spoke() {
     return 1
   fi
   stamp_progress_epoch "$issue"   # a deliberate revival resets the reap ceiling (#133)
+  _afk_bump_count "$wt" relaunch-count   # #231: a relaunch — failure economics vs a clean run
   _afk_emit_span "$wt" afk-wedge-respawn success
   return 0
 }
@@ -699,6 +752,7 @@ _revive_spoke() {
   # #241 §10: a revival is a taken decision the morning review sees — journal it (a successful
   # revival is not a loud warned record, just an auditable journal line + span).
   broker_journal_decision "$issue" revive "revived a hung/crashed pane (killed + relaunched claude --continue)" reversible
+  _afk_bump_count "$wt" relaunch-count   # #231: a relaunch — failure economics vs a clean run
   _afk_emit_span "$wt" afk-revive success
   return 0
 }

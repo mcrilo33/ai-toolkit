@@ -6550,6 +6550,65 @@ def test_afk_escalate_label_flip_is_best_effort(spoke_repo: Path, tmp_path: Path
     assert result.returncode == 0, result.stderr
 
 
+# --- #231 terminal-outcome + failure-economics count pointers -----------------
+# The supervisor stamps a spoke's terminal outcome + relaunch/block counts into its worktree
+# .ai-toolkit pointers, which the view builder reads; a torn-down worktree (no .ai-toolkit) is a
+# silent no-op so a stamp never dirties a tree or fails a tick.
+
+
+def test_afk_stamp_outcome_writes_pointer(spoke_repo: Path) -> None:
+    (spoke_repo / ".ai-toolkit").mkdir()
+
+    result = _call(f"_afk_stamp_outcome '{spoke_repo}' blocked")
+
+    assert result.returncode == 0, result.stderr
+    assert (spoke_repo / ".ai-toolkit" / "outcome").read_text().strip() == "blocked"
+
+
+def test_afk_stamp_outcome_noop_without_ai_toolkit(spoke_repo: Path) -> None:
+    result = _call(f"_afk_stamp_outcome '{spoke_repo}' blocked")
+
+    assert result.returncode == 0, result.stderr
+    assert not (spoke_repo / ".ai-toolkit").exists()
+
+
+def test_afk_bump_count_from_zero(spoke_repo: Path) -> None:
+    (spoke_repo / ".ai-toolkit").mkdir()
+
+    _call(f"_afk_bump_count '{spoke_repo}' relaunch-count")
+
+    assert (spoke_repo / ".ai-toolkit" / "relaunch-count").read_text().strip() == "1"
+
+
+def test_afk_bump_count_increments_existing(spoke_repo: Path) -> None:
+    ait = spoke_repo / ".ai-toolkit"
+    ait.mkdir()
+    (ait / "blocked-count").write_text("2\n")
+
+    _call(f"_afk_bump_count '{spoke_repo}' blocked-count")
+
+    assert (ait / "blocked-count").read_text().strip() == "3"
+
+
+def test_afk_escalate_stamps_outcome_and_builds_view(spoke_repo: Path, tmp_path: Path) -> None:
+    # A terminal block stamps outcome=blocked + bumps blocked-count and rebuilds the view (so a
+    # never-landing spoke still carries an outcome tag) — via the resolved ingest bin, --rebuild.
+    env, _ready_log, _gh_log = _blocked_label_env(tmp_path)
+    (spoke_repo / ".ai-toolkit").mkdir()
+    ingest_log = tmp_path / "ingest.log"
+    ingest = tmp_path / "ingest.sh"
+    ingest.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ingest_log}"\n')
+    ingest.chmod(0o755)
+    env["AFK_INGEST_BIN"] = str(ingest)
+
+    result = _call(f"_afk_escalate_blocked '{spoke_repo}' 103 'stuck'", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert (spoke_repo / ".ai-toolkit" / "outcome").read_text().strip() == "blocked"
+    assert (spoke_repo / ".ai-toolkit" / "blocked-count").read_text().strip() == "1"
+    assert f"{spoke_repo} --rebuild" in ingest_log.read_text()
+
+
 def test_afk_sync_labels_ignores_lifecycle_labels(tmp_path: Path) -> None:
     # AC5: the afk:* reconcile (#223) must never strip a #236 status:*/mode:*/lane: label.
     env, edit_log = _status_label_env(
