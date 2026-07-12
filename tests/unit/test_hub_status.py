@@ -84,6 +84,7 @@ def _run_hub_status_proc(
     listening: str = "4317 4318",
     otel: str | None = None,
     batch_plan: str | None = None,
+    hub_agents_dir: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run hub-status.sh from the hub with `gh`, `tmux` and `lsof` stubs on PATH.
 
@@ -175,6 +176,12 @@ def _run_hub_status_proc(
     env["CLAUDE_PROJECTS_DIR"] = str(
         projects_dir if projects_dir is not None else fallback_projects
     )
+    # Hub-agents journal dir (#245): default to a nonexistent dir so the host's
+    # real .ai-toolkit/hub-agents can never leak into a test.
+    fallback_agents = tmp_path / "no-hub-agents"
+    env["AI_TOOLKIT_HUB_AGENTS_DIR"] = str(
+        hub_agents_dir if hub_agents_dir is not None else fallback_agents
+    )
     return subprocess.run(
         ["bash", str(HUB_STATUS)],
         cwd=str(hub),
@@ -197,6 +204,7 @@ def _run_hub_status(
     listening: str = "4317 4318",
     otel: str | None = None,
     batch_plan: str | None = None,
+    hub_agents_dir: Path | None = None,
 ) -> str:
     """Run hub-status.sh and return its stdout (see _run_hub_status_proc)."""
     return _run_hub_status_proc(
@@ -211,6 +219,7 @@ def _run_hub_status(
         listening=listening,
         otel=otel,
         batch_plan=batch_plan,
+        hub_agents_dir=hub_agents_dir,
     ).stdout
 
 
@@ -1032,5 +1041,105 @@ def test_scheduling_section_empty_when_nothing_dispatchable(
     out = _run_hub_status(hub_with_spokes, tmp_path, batch_plan=stub)
 
     # An empty schedule still reports the section, with a clear "nothing" marker.
-    scheduling = out[out.index("Scheduling"):]
+    scheduling = out[out.index("Scheduling") :]
     assert re.search(r"nothing dispatchable|none", scheduling, re.I)
+
+
+# ── Hub agents section (issue #245) ───────────────────────────────────────────
+# Hub-side agent work (pre-land reviews, bug-scopers) runs via hub-agent.sh, which
+# journals start/end records. hub-status surfaces the LIVE ones (a label whose
+# latest event is `start`, no matching `end`) in a "Hub agents" section, so the
+# operator can see and jump to running hub agents just like spoke panes. The
+# render is strictly best-effort/read-only: a missing or malformed journal must
+# never break the survey.
+
+
+def _write_hub_agents_journal(agents_dir: Path, records: list[dict[str, object]]) -> None:
+    """Write journal.jsonl under the hub-agents dir from a list of records."""
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    lines = [json.dumps(r) for r in records]
+    (agents_dir / "journal.jsonl").write_text("\n".join(lines) + "\n")
+
+
+def _start_record(label: str, purpose: str, *, age_s: float = 5.0) -> dict[str, object]:
+    return {
+        "event": "start",
+        "label": label,
+        "purpose": purpose,
+        "pid": 4242,
+        "ts_epoch": int(time.time() - age_s),
+        "log": f"/tmp/hub-agents/{label}.log",
+    }
+
+
+def _end_record(label: str, status: str = "success") -> dict[str, object]:
+    return {"event": "end", "label": label, "status": status, "ts_epoch": int(time.time())}
+
+
+def test_hub_agents_section_lists_live_run(hub_with_spokes: Path, tmp_path: Path) -> None:
+    agents = tmp_path / "hub-agents"
+    _write_hub_agents_journal(agents, [_start_record("review-236", "pre-land review #236")])
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, hub_agents_dir=agents)
+
+    assert "Hub agents" in out
+    section = out[out.index("Hub agents") :]
+    assert "hub:review-236" in section
+    assert "pre-land review #236" in section
+
+
+def test_hub_agents_section_omits_completed_run(hub_with_spokes: Path, tmp_path: Path) -> None:
+    # A run with a matching `end` is done — not shown; with nothing else live the
+    # section reports its empty marker.
+    agents = tmp_path / "hub-agents"
+    _write_hub_agents_journal(
+        agents,
+        [_start_record("review-236", "pre-land review #236"), _end_record("review-236")],
+    )
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, hub_agents_dir=agents)
+
+    section = out[out.index("Hub agents") :]
+    assert "review-236" not in section
+    assert re.search(r"none", section, re.I)
+
+
+def test_hub_agents_section_empty_marker_without_journal(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    # No journal at all: the section header still renders with a "none" marker.
+    out = _run_hub_status(hub_with_spokes, tmp_path, hub_agents_dir=tmp_path / "absent")
+
+    assert "Hub agents" in out
+    section = out[out.index("Hub agents") :]
+    assert re.search(r"none", section, re.I)
+
+
+def test_hub_agents_section_after_worktrees(hub_with_spokes: Path, tmp_path: Path) -> None:
+    agents = tmp_path / "hub-agents"
+    _write_hub_agents_journal(agents, [_start_record("scope-240", "bug-scoper #240")])
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, hub_agents_dir=agents)
+
+    assert out.index("Hub agents") > out.index("Worktrees")
+
+
+def test_hub_agents_section_survives_malformed_journal(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    # A garbage line and a record missing keys must not abort the render nor the
+    # survey: the one valid live entry still shows, and the script exits 0.
+    agents = tmp_path / "hub-agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    (agents / "journal.jsonl").write_text(
+        "not json at all\n"
+        + json.dumps({"event": "start"})  # no label
+        + "\n"
+        + json.dumps(_start_record("review-241", "delta re-review #241"))
+        + "\n"
+    )
+
+    result = _run_hub_status_proc(hub_with_spokes, tmp_path, hub_agents_dir=agents)
+
+    assert result.returncode == 0
+    assert "hub:review-241" in result.stdout
