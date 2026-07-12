@@ -188,3 +188,21 @@ def test_environment_stamped_on_spans() -> None:
     assert any('"production"' in s for s in env_stmts), (
         "real spoke spans must default to the production environment"
     )
+
+
+def test_environment_override_runs_after_the_production_default() -> None:
+    # OTTL runs top-to-bottom, so the deployment.environment override MUST come AFTER the
+    # unconditional "production" default, or a test-collector diversion is silently clobbered.
+    statements = _span_statements(_load_config())
+
+    default_idx = next(
+        i for i, s in enumerate(statements) if 'langfuse.environment"], "production")' in s
+    )
+    override_idx = next(
+        i
+        for i, s in enumerate(statements)
+        if "langfuse.environment" in s and "deployment.environment" in s
+    )
+    assert override_idx > default_idx, (
+        "the deployment.environment override must win over the default"
+    )

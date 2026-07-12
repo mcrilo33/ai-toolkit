@@ -584,7 +584,7 @@ if [ -n "$WT_DIR" ]; then
       REBUILD_VIEW="--rebuild"
     fi
     printf 'landed\n' > "$OUTCOME_FILE" 2>/dev/null \
-      || wt_warn "couldn't stamp outcome=landed for $WT_DIR — trace will lack the outcome tag"
+      || wt_warn "couldn't stamp outcome=landed for $WT_DIR — trace may keep a stale/absent outcome tag"
   fi
   bash "$SCRIPT_DIR/telemetry-ingest-spoke.sh" "$WT_DIR" ${REBUILD_VIEW:+"$REBUILD_VIEW"} \
     || wt_warn "post-run Langfuse ingestion errored — landing continues"

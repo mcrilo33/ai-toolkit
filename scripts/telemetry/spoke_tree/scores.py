@@ -317,8 +317,11 @@ def build_normalization_scores(
     already has — the commit numstat (:func:`_parse_commits`) and the cycle windows — plus two
     derived ratios:
 
-    - ``files_changed`` — distinct paths touched across all commits.
-    - ``lines_changed`` — total additions + deletions across all commits.
+    - ``files_changed`` — distinct paths touched across all commits (de-duplicated).
+    - ``lines_changed`` — total additions + deletions summed over the per-commit numstat (the
+      churn the issue scopes to — the data ``commits.py`` already parses — NOT the net
+      ``merge-base..HEAD`` diff, so a spoke that rewrites the same lines across several commits
+      reads higher here than its net diff).
     - ``commits`` — number of commits on the branch.
     - ``subtasks`` — number of cycle windows (the ledger subtask count), passed in.
     - ``cost_per_changed_line`` — the trace's total generation cost (Σ ``costDetails``, the same

@@ -6590,23 +6590,63 @@ def test_afk_bump_count_increments_existing(spoke_repo: Path) -> None:
     assert (ait / "blocked-count").read_text().strip() == "3"
 
 
-def test_afk_escalate_stamps_outcome_and_builds_view(spoke_repo: Path, tmp_path: Path) -> None:
-    # A terminal block stamps outcome=blocked + bumps blocked-count and rebuilds the view (so a
-    # never-landing spoke still carries an outcome tag) — via the resolved ingest bin, --rebuild.
-    env, _ready_log, _gh_log = _blocked_label_env(tmp_path)
-    (spoke_repo / ".ai-toolkit").mkdir()
+def _ingest_stub_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
+    """A logging telemetry-ingest stub wired via AFK_INGEST_BIN. Returns (env, ingest_log)."""
     ingest_log = tmp_path / "ingest.log"
     ingest = tmp_path / "ingest.sh"
     ingest.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ingest_log}"\n')
     ingest.chmod(0o755)
-    env["AFK_INGEST_BIN"] = str(ingest)
+    return {"AFK_INGEST_BIN": str(ingest), "AFK_INGEST_TIMEOUT": "5"}, ingest_log
 
-    result = _call(f"_afk_escalate_blocked '{spoke_repo}' 103 'stuck'", env=env)
+
+def test_afk_park_terminal_stamps_outcome_and_builds_view(spoke_repo: Path, tmp_path: Path) -> None:
+    # The LIVE disaster-terminal path (_warn_parked_last -> _afk_park_terminal, post-#241) stamps
+    # outcome=blocked + bumps blocked-count and rebuilds the view via the ingest bin (--rebuild).
+    env, ingest_log = _ingest_stub_env(tmp_path)
+    (spoke_repo / ".ai-toolkit").mkdir()
+
+    result = _call(f"_afk_park_terminal '{spoke_repo}'", env=env)
 
     assert result.returncode == 0, result.stderr
     assert (spoke_repo / ".ai-toolkit" / "outcome").read_text().strip() == "blocked"
     assert (spoke_repo / ".ai-toolkit" / "blocked-count").read_text().strip() == "1"
     assert f"{spoke_repo} --rebuild" in ingest_log.read_text()
+
+
+def test_afk_park_terminal_counts_once_per_episode(spoke_repo: Path, tmp_path: Path) -> None:
+    # _warn_parked_last fires every DUE tick of a stuck spoke; the blocked-episode marker gates the
+    # count bump + view build to ONCE per episode (outcome stays stamped each tick, idempotently).
+    env, ingest_log = _ingest_stub_env(tmp_path)
+    (spoke_repo / ".ai-toolkit").mkdir()
+
+    _call(f"_afk_park_terminal '{spoke_repo}'", env=env)
+    _call(f"_afk_park_terminal '{spoke_repo}'", env=env)
+
+    assert (spoke_repo / ".ai-toolkit" / "blocked-count").read_text().strip() == "1"
+    assert len(ingest_log.read_text().splitlines()) == 1, "view built once per park episode"
+
+
+def test_afk_clear_park_episode_reopens_the_count(spoke_repo: Path, tmp_path: Path) -> None:
+    # A relaunch clears the episode marker, so the spoke's NEXT park counts as a fresh block.
+    env, _ingest_log = _ingest_stub_env(tmp_path)
+    (spoke_repo / ".ai-toolkit").mkdir()
+
+    _call(f"_afk_park_terminal '{spoke_repo}'", env=env)
+    _call(f"_afk_clear_park_episode '{spoke_repo}'", env=env)
+    _call(f"_afk_park_terminal '{spoke_repo}'", env=env)
+
+    assert (spoke_repo / ".ai-toolkit" / "blocked-count").read_text().strip() == "2"
+
+
+def test_afk_park_terminal_noop_without_ai_toolkit(spoke_repo: Path, tmp_path: Path) -> None:
+    # A worktree-less park (e.g. a dispatch failure) must be a silent no-op, never dirtying a tree.
+    env, ingest_log = _ingest_stub_env(tmp_path)
+
+    result = _call(f"_afk_park_terminal '{spoke_repo}'", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert not (spoke_repo / ".ai-toolkit").exists()
+    assert not ingest_log.exists()
 
 
 def test_afk_sync_labels_ignores_lifecycle_labels(tmp_path: Path) -> None:

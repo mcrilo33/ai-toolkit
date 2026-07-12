@@ -427,10 +427,12 @@ _kill_spoke_window() {
     done
 }
 # --- #231 terminal-outcome + failure-economics counts -------------------------
-# The supervisor knows a spoke's terminal state (blocked) and its relaunch history — state
-# a landed spoke's clean trace can't distinguish. These best-effort helpers stamp it into the
-# worktree's .ai-toolkit pointers the view builder reads (outcome tag + blocked/relaunch counts);
-# a torn-down or unwritable worktree is a silent no-op, never failing a tick.
+# The supervisor knows a spoke's terminal state (parked = blocked) and its relaunch history —
+# state a landed spoke's clean trace can't distinguish. Post-#241 the reaper never abandons; a
+# stuck spoke lands in _warn_parked_last (revive-first, warned-parked-LAST), so THAT is the live
+# "disaster" terminal path these best-effort helpers hook, not the retired escalate path. They
+# stamp the worktree's .ai-toolkit pointers the view builder reads (outcome tag + blocked/relaunch
+# counts); a torn-down / unwritable worktree is a silent no-op, never failing a tick.
 
 # _afk_stamp_outcome <wt> <outcome> -> record the spoke's terminal outcome pointer (#231).
 _afk_stamp_outcome() {
@@ -457,6 +459,28 @@ _afk_build_outcome_view() {
     bash "$_AFK_INGEST_BIN" "$1" --rebuild >/dev/null 2>&1 || true
 }
 
+# _afk_park_terminal <wt> -> stamp outcome=blocked + bump blocked-count + rebuild the view ONCE
+# per park episode (#231). _warn_parked_last fires on every DUE tick of a stuck spoke, so a
+# .ai-toolkit/blocked-episode marker gates the count bump + the expensive view build to the FIRST
+# park of an episode; _afk_clear_park_episode (called on every relaunch) reopens it so a re-park
+# after a revival counts again. A spoke that later lands overwrites outcome=landed (the counts
+# persist as the disaster-that-eventually-landed economics). No-op for a worktree-less park.
+_afk_park_terminal() {
+  local flag="$1/.ai-toolkit/blocked-episode"
+  [ -d "$1/.ai-toolkit" ] || return 0
+  _afk_stamp_outcome "$1" blocked   # idempotent: same value re-written each park tick
+  [ -f "$flag" ] && return 0        # this park episode already counted + built
+  _afk_bump_count "$1" blocked-count
+  : > "$flag" 2>/dev/null || true
+  _afk_build_outcome_view "$1"
+}
+
+# _afk_clear_park_episode <wt> -> drop the blocked-episode marker on a relaunch (#231), so the
+# spoke's NEXT park counts as a fresh block episode.
+_afk_clear_park_episode() {
+  rm -f "$1/.ai-toolkit/blocked-episode" 2>/dev/null || true
+}
+
 # _afk_escalate_blocked <wt> <issue> <reason> — the ONE supervisor escalation path
 # (issue #236). It runs the gate-broker core _escalate_blocked (marker emit + durable
 # local-record fallback + deny span) AND mirrors the transition onto the GitHub issue's
@@ -472,11 +496,6 @@ _afk_escalate_blocked() {
     *) command -v wt_gh_set_status_label >/dev/null 2>&1 \
          && wt_gh_set_status_label "$2" "status:blocked" || true ;;
   esac
-  # #231: stamp the terminal outcome + block count, then rebuild the view so a never-landing
-  # spoke still carries an outcome:blocked tag. All best-effort — never fails the escalation.
-  _afk_stamp_outcome "$1" blocked
-  _afk_bump_count "$1" blocked-count
-  _afk_build_outcome_view "$1"
 }
 
 # reap_spoke (kill window + escalate blocked/<issue>) is retired by #241: the reaper never
@@ -681,6 +700,7 @@ resume_spoke() {
   # busy until its new session writes a transcript.
   stamp_answer_attempt "$issue"
   _afk_bump_count "$wt" relaunch-count   # #231: a relaunch — failure economics vs a clean run
+  _afk_clear_park_episode "$wt"          # #231: a fresh run may re-park → count the next block anew
   _afk_emit_span "$wt" afk-resume success
   return 0
 }
@@ -708,6 +728,7 @@ respawn_wedged_spoke() {
   fi
   stamp_progress_epoch "$issue"   # a deliberate revival resets the reap ceiling (#133)
   _afk_bump_count "$wt" relaunch-count   # #231: a relaunch — failure economics vs a clean run
+  _afk_clear_park_episode "$wt"          # #231: a fresh run may re-park → count the next block anew
   _afk_emit_span "$wt" afk-wedge-respawn success
   return 0
 }
@@ -730,6 +751,9 @@ _warn_parked_last() {
   log "→ warn-park-LAST #$issue: $reason"
   _afk_set_last_action "warn-park #$issue"
   broker_warn_continue "$wt" "$issue" "$park" "$reason" reversible
+  # #231: this IS the live disaster-terminal path post-#241 — stamp outcome=blocked + build the
+  # view (once per episode) so a never-landing spoke is distinguishable from a clean landing.
+  _afk_park_terminal "$wt"
 }
 
 # _revive_spoke <wt> <issue> -> kill any hung/crashed window and relaunch the spoke via
@@ -753,6 +777,7 @@ _revive_spoke() {
   # revival is not a loud warned record, just an auditable journal line + span).
   broker_journal_decision "$issue" revive "revived a hung/crashed pane (killed + relaunched claude --continue)" reversible
   _afk_bump_count "$wt" relaunch-count   # #231: a relaunch — failure economics vs a clean run
+  _afk_clear_park_episode "$wt"          # #231: a fresh run may re-park → count the next block anew
   _afk_emit_span "$wt" afk-revive success
   return 0
 }
