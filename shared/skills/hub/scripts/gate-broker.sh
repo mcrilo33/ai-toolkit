@@ -1324,7 +1324,15 @@ _broker_run_bounded() {
 run_answerer() {
   local issue="$1" question="$2" wt="${3:-}"
   local tools; tools="$(reasoner_allowed_tools)"
-  local cmd="${AFK_ANSWERER_CMD:-claude -p --no-session-persistence --model claude-opus-4-8 --allowedTools '$tools'}"
+  # #247 option (c): `--output-format stream-json --verbose` streams every reasoner tool_use
+  # (name + input) onto the captured stdout so _reasoner_wrote_live_tree can AUDIT what the
+  # reasoner actually did (the void's attribution signal). The stream is NOT the final answer:
+  # every CALLER must run the raw output through _normalize_answerer_output before any text parse
+  # (parse_decision / parse_decision_field / is_auth_failure) — the audit is the ONE consumer that
+  # reads the raw stream. `--verbose` is required for stream-json under `-p`; a deployed CLI that
+  # lacks the format exits nonzero → the audit reads no stream (rc 2) and the void degrades to the
+  # #244 activity fallback — safe, never stranding.
+  local cmd="${AFK_ANSWERER_CMD:-claude -p --no-session-persistence --output-format stream-json --verbose --model claude-opus-4-8 --allowedTools '$tools'}"
   local secs; secs="$(_afk_answerer_timeout)"
   # Write isolation (#237): run the reasoner against a throwaway COPY of the worktree, not the
   # spoke's LIVE tree — so even a tool that ignores the read-only allowlist writes into the
@@ -1360,6 +1368,70 @@ run_answerer() {
   [ -n "$pf" ] && rm -f "$pf"
   [ -n "$snap" ] && rm -rf "$snap" 2>/dev/null || true
   return "$rc"
+}
+
+# _normalize_answerer_output <raw> -> the reasoner's FINAL TEXT, extracted from a
+# `--output-format stream-json` event stream (#247) so the line-anchored DECISION parsers
+# (parse_decision / parse_decision_field) see the ANSWER / REVERSIBILITY / WARN lines they
+# expect — NOT buried inside JSON, where they would silently read as empty and drop the #241
+# reversibility class + WARN note. (is_auth_failure is fed the RAW stream instead, so an auth
+# signature carried in a dropped event — a system/error line — is never missed; see the call
+# sites.) The extraction:
+#   - the final `type:"result"` event's `result` field (the consolidated answer) wins; a
+#     missing/empty result falls back to concatenated assistant `text` blocks (real claude emits
+#     BOTH, so the answer survives a drift in either shape);
+#   - NON-JSON lines pass through (a plain-text answerer stub is entirely non-JSON, so it is
+#     surfaced whole).
+# The raw stream is delivered via a temp FILE (path in env), never argv/env directly, so a verbose
+# stream echoing large tool_result payloads never trips ARG_MAX. A pure plain-text input (every
+# #244 answerer stub) has no JSON events, so its content passes through — the DECISION lines are
+# preserved, though the python path normalizes whitespace (drops blank lines, adds a trailing
+# newline); only the no-python3 branch is byte-identical. No python3 ⇒ byte-for-byte passthrough
+# (the degraded env keeps plain-text answerers working; the void degrades to the #244 fallback).
+_normalize_answerer_output() {
+  command -v python3 >/dev/null 2>&1 || { printf '%s' "$1"; return 0; }
+  local rawfile; rawfile="$(mktemp 2>/dev/null)" || { printf '%s' "$1"; return 0; }
+  printf '%s' "$1" > "$rawfile"
+  _AFK_RAWFILE="$rawfile" python3 2>/dev/null <<'PYEOF' || printf '%s' "$1"
+import json, os
+
+result_text = None
+assistant_texts = []
+passthrough = []
+with open(os.environ["_AFK_RAWFILE"], encoding="utf-8", errors="replace") as fh:
+    for raw_line in fh:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            passthrough.append(raw_line.rstrip("\n"))  # plain text (a stub) — surfaced whole
+            continue
+        if not isinstance(obj, dict):
+            continue
+        kind = obj.get("type")
+        if kind == "result":
+            r = obj.get("result")
+            if isinstance(r, str) and r.strip():
+                result_text = r  # the LAST result event's consolidated text wins
+        elif kind == "assistant":
+            content = (obj.get("message") or {}).get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text" and (block.get("text") or "").strip():
+                        assistant_texts.append(block["text"])
+        # other event types (system/user/tool_use noise) carry no final text — skipped.
+
+out = []
+if result_text is not None:
+    out.append(result_text)
+elif assistant_texts:
+    out.append("\n".join(assistant_texts))
+out.extend(passthrough)
+print("\n".join(out))
+PYEOF
+  rm -f "$rawfile" 2>/dev/null || true
 }
 
 # parse_decision <raw-answerer-output> -> "ANSWER\t<text>" or "ESCALATE\t<reason>" on
@@ -2002,6 +2074,10 @@ path to tell the spoke>'."
   # Stamp the attempt FIRST so the reason→deliver window never reads as idle (#202 C).
   stamp_answer_attempt "$issue"
   raw="$(run_answerer "$issue" "$q" "$wt")"; rc=$?
+  # #247: run_answerer streams stream-json; normalize ONCE to the final text for the DECISION
+  # parsers. is_auth_failure reads the RAW stream (below) so an auth signature in a dropped event
+  # is never missed.
+  local raw_text; raw_text="$(_normalize_answerer_output "$raw")"
   # Auth failure is the one true external blocker (#73): a dead supervisor token yields an
   # auth-error blob, not a decision — and parse_decision would fall to the DENY default and
   # inject a SPURIOUS denial into the live dialog. Detect it (rc != 0 AND an auth signature),
@@ -2013,9 +2089,9 @@ path to tell the spoke>'."
     broker_warn_continue "$wt" "$issue" auth "subscription auth failed — token could not refresh; re-run /login on the host (drain paused, re-probing)" reversible
     return 0
   fi
-  ans="$(parse_decision "$raw")"
+  ans="$(parse_decision "$raw_text")"
   text="${ans#*$'\t'}"
-  rev="$(parse_decision_field "$raw" REVERSIBILITY)"
+  rev="$(parse_decision_field "$raw_text" REVERSIBILITY)"
   # NB: the classifier verdict (ESCALATE) is already recorded in decisions.log by the caller; the
   # reasoned approve/deny is journaled here (a FILE line before the keypress + a gh comment after,
   # via _reason_permission_record), NOT in decisions.log — that log codifies only the MECHANICAL
@@ -2278,6 +2354,11 @@ for line in os.environb.get(b"_AFK_SIZES", b"").splitlines():
 def matches(record):
     if not isinstance(record, dict):
         return False
+    # `any` mode: ANY appended record is a spoke-side write — the ISOLATED reasoner (#237 cwd=snap,
+    # --no-session-persistence) never writes the live transcript, so a #240 tool_result-only
+    # self-resume still proves the spoke touched the tree (#247 residual 2, the fail-safe's DROP arm).
+    if mode == "any":
+        return True
     kind = record.get("type")
     # A genuine typed human/self reply — shared by both modes (mirrors _gate_answer_landed).
     if kind == "user" and record.get("promptSource") == "typed" and not record.get("isMeta"):
@@ -2310,7 +2391,7 @@ for path in glob.glob(os.path.join(os.environ["_AFK_DIR"], "*.jsonl")):
                 # NOT: a from-0 scan would match the PRE-park record (an AskUserQuestion IS an
                 # assistant tool_use) and mask a real escape (rc 0 -> drop). Skip the file instead,
                 # so the caller reads "no activity" (rc 1) and fails SAFE (voids) on a lost boundary.
-                if mode == "activity":
+                if mode in ("activity", "any"):
                     continue
                 offset = 0
             fh.seek(offset)
@@ -2344,6 +2425,119 @@ _user_turn_appended() { _scan_appended_turns "$1" "$2" typed; }
 # breach too — fail SAFE, mirroring the unverifiable-fingerprint escalation. rc 0 found, rc 1 none,
 # rc 2 unavailable (no python3 / no project dir / crash).
 _spoke_activity_appended() { _scan_appended_turns "$1" "$2" activity; }
+
+# _spoke_touched_transcript <wt_path> <sizes> -> did the spoke append ANY record to its live
+# transcript since the <sizes> snapshot? The #247 fail-safe's positive spoke signal: a weaker bar
+# than a full "turn" (it also counts a #240 tool_result-only self-resume — residual 2), sound
+# because the ISOLATED reasoner never writes the live transcript, so any appended record is the
+# spoke. Used when the reasoner audit did NOT prove a write (rw_rc 1/2): DROP on a positive touch,
+# else fail SAFE and VOID. rc 0 touched, rc 1 none, rc 2 unavailable (no python3 / no project dir).
+_spoke_touched_transcript() { _scan_appended_turns "$1" "$2" any; }
+
+# _reasoner_wrote_live_tree <raw-answerer-output> <wt> -> the #247 option (c) attribution
+# primitive: audit the REASONER's OWN tool_use stream (from `--output-format stream-json`) for a
+# write that could reach the LIVE tree, instead of attributing a whole-tree diff by the spoke's
+# transcript (the #244 discriminator, which is leaky at the edges because the diff carries no
+# evidence of WHO wrote it). Since #237 the reasoner runs in a snapshot COPY (cwd=snap), so its
+# RELATIVE writes land in the copy and never touch the live tree; the ONLY live-tree vector is an
+# ABSOLUTE path under <wt> (a write tool targeting $wt/…, or a mutating Bash referencing the
+# absolute $wt path / `git -C $wt`). This scans for exactly that:
+#   - a write tool (Write/Edit/MultiEdit/NotebookEdit) whose path input is absolute and under <wt>;
+#   - a Bash whose command references the absolute <wt> path AND is NOT a read-only git verb
+#     (mirrors _reasoner_bash_readonly, and also recognises the `git -C <wt> <verb>` form).
+# rc 0 a live-tree write is PROVEN (VOID even amid coincident spoke activity — closes residual 1);
+# rc 1 the stream parsed but shows NO modelled live-tree write; rc 2 the input is not an auditable
+# stream (a plain-text answerer stub / no stream / no python3). The caller treats ONLY rc 0 as proof:
+# on rc 1 / rc 2 it does NOT trust the audit alone (an escape via a vector this does not model must
+# still fail SAFE), so it attributes the diff to the spoke ONLY on a positive spoke-transcript signal
+# and otherwise VOIDs. The raw stream is delivered via a temp FILE (not argv/env) so a verbose
+# stream that echoes large tool_result payloads never trips ARG_MAX. Uses python3 like the scanners.
+_reasoner_wrote_live_tree() {
+  local raw="$1" wt="$2" rawfile rc
+  command -v python3 >/dev/null 2>&1 || return 2
+  # Deliver the raw stream via a temp FILE (path in env), never in argv/env directly: a verbose
+  # stream that echoes large tool_result payloads would trip ARG_MAX. mktemp mirrors run_answerer.
+  rawfile="$(mktemp 2>/dev/null)" || return 2
+  printf '%s' "$raw" > "$rawfile"
+  _AFK_WT="$wt" _AFK_RAWFILE="$rawfile" python3 2>/dev/null <<'PYEOF'
+import json, os, re, sys
+
+wt = os.environ.get("_AFK_WT", "")
+cands = {c for c in (wt, os.path.realpath(wt) if wt else "") if c}
+WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+RO_GIT = ("status", "diff", "log", "show", "rev-parse", "branch", "ls-files", "cat-file")
+
+
+def path_under_wt(p):
+    if not isinstance(p, str) or not p.startswith("/"):
+        return False  # a relative path writes into the #237 snapshot copy, not the live tree
+    # Compare both the raw and the symlink-resolved form so a /tmp-vs-/private/tmp alias (or any
+    # symlinked component) on either side still matches — cands already carries realpath(wt).
+    forms = {p}
+    try:
+        forms.add(os.path.realpath(p))
+    except Exception:
+        pass
+    return any(f == c or f.startswith(c.rstrip("/") + "/") for f in forms for c in cands)
+
+
+def references_wt(text):
+    # Boundary-aware: <wt> followed by a non-path char (/ , whitespace, quote, EOL) — never a bare
+    # substring, so a SIBLING worktree like `<wt>-2` / `<wt>.bak` is not mistaken for the live tree.
+    return any(re.search(re.escape(c) + r"(?![\w.-])", text) for c in cands)
+
+
+def bash_mutates_wt(cmd):
+    if not isinstance(cmd, str) or not references_wt(cmd):
+        return False  # does not reference the absolute live-tree path at all
+    # Command chaining / an output redirect could smuggle a write past a leading read-only verb
+    # (`git -C $wt status && rm $wt/x`, `... > $wt/x`) — treat such a compound as a mutation. A bare
+    # pipe is NOT included: `git -C $wt log | head` stays a read. (The reasoner is never told $wt's
+    # absolute path — #239 — so ANY command referencing it is already off-posture; voiding is safe.)
+    if any(t in cmd for t in (">", ";", "&&", "||", "$(", "`")):
+        return True
+    m = re.match(r"git\s+(?:-C\s+\S+\s+)?(\S+)", cmd.strip())
+    if m and m.group(1) in RO_GIT:
+        return False  # a LONE read-only `git [-C <wt>] status/diff/…` inspection — cannot mutate
+    return True  # any other command referencing the absolute live path is a potential live write
+
+
+saw_stream = False
+with open(os.environ["_AFK_RAWFILE"], encoding="utf-8", errors="replace") as fh:
+    for raw_line in fh:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue  # non-JSON (a plain-text answerer stub) — not an auditable stream event
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") in ("system", "assistant", "user", "result"):
+            saw_stream = True
+        if obj.get("type") != "assistant":
+            continue
+        content = (obj.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = block.get("name")
+            inp = block.get("input") or {}
+            if not isinstance(inp, dict):
+                continue
+            if name in WRITE_TOOLS and any(path_under_wt(inp.get(k)) for k in ("file_path", "path", "notebook_path")):
+                sys.exit(0)
+            if name == "Bash" and bash_mutates_wt(inp.get("command")):
+                sys.exit(0)
+sys.exit(3 if saw_stream else 4)
+PYEOF
+  rc=$?
+  rm -f "$rawfile" 2>/dev/null || true
+  case "$rc" in 0) return 0 ;; 3) return 1 ;; *) return 2 ;; esac
+}
 
 # _answer_delivered <wt> <target> <text> <sizes> -> after _transcript_advanced
 # succeeded, decide whether the answer actually LEFT the composer (#201: an advance
@@ -2644,11 +2838,13 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
   # writes land in the copy and the live-tree fingerprint is a should-never-fire backstop —
   # its one remaining true purpose is catching an ABSOLUTE-path escape (a reasoner tool
   # writing `$wt/…` / `git -C $wt`, which bypasses cwd=snap). Detection is the hard guarantee
-  # independent of the LLM's tool-allowlist. #244: a live-tree diff during the step is now
-  # almost always the SPOKE's OWN concurrent edits (it self-resumed mid-GREEN), not the
-  # reasoner — so the void is gated on _spoke_activity_appended below.
+  # independent of the LLM's tool-allowlist. #247: a live-tree diff is now ATTRIBUTED by the
+  # reasoner's own tool_use audit (_reasoner_wrote_live_tree), not the spoke transcript.
   local fp_before; fp_before="$(_broker_worktree_fingerprint "$wt")"
   raw="$(run_answerer "$issue" "$question" "$wt")"; rc=$?
+  # #247: run_answerer streams stream-json for the audit; the text parsers below (auth,
+  # parse_decision, parse_decision_field) read the NORMALIZED final text, the audit reads $raw.
+  local raw_text; raw_text="$(_normalize_answerer_output "$raw")"
   if _broker_is_git_worktree "$wt" && [ -z "$fp_before" ]; then
     # Fail SAFE: a git worktree with an empty fingerprint means the fingerprint tooling
     # is unavailable, so we cannot verify the reasoner stayed read-only. Never trust an
@@ -2659,46 +2855,54 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
     return 0
   fi
   if ! _broker_worktree_unchanged "$wt" "$fp_before"; then
-    # The live tree changed during the reason step. Since #237 the reasoner runs isolated, so
-    # this is one of two things — and once the tree moved under the answerer, its answer is
-    # derived from a stale tree and must NEVER be injected (#244 review): the tree-changed path
-    # ALWAYS returns here, so we never fall through to the ANSWER branch's recompute (which would
-    # re-baseline fp_before and inject over the mutated tree).
-    # Attribute the diff by the SPOKE's own transcript, not the tree: the spoke's own edits always
-    # leave a genuine turn (a typed reply or its own assistant tool_use), while the isolated
-    # reasoner writes nothing to the live transcript and a #240 non-turn bump / a HEAD-moving
-    # commit-escape leaves no turn. So NO activity + a tree diff (rc 1) is a reasoner escape.
-    _spoke_activity_appended "$wt" "$parked_sizes"; local act_rc=$?
-    if [ "$act_rc" -ne 0 ]; then
-      # We could NOT positively confirm the spoke did the edit — either NO genuine spoke turn
-      # landed (rc 1: the spoke was parked/idle, so the diff is a reasoner isolation escape via an
-      # absolute-path write / git -C $wt), OR the transcript is unreadable (rc 2: no python3 / no
-      # project dir). Fail SAFE and VOID in both, mirroring the unverifiable-fingerprint escalation
-      # above (never trust an unverifiable read-only claim) — robust to a #240 non-turn mtime bump
-      # and to a commit-escape that moves HEAD off the gate tag (neither is a spoke turn), the two
-      # masks _still_parked_same missed. Stamp the durable void marker FIRST so the top-of-function
-      # backoff short-circuit paces the mutating reasoner across ticks — the (tip, sig) ceiling
-      # can't, since the tree write perturbs it every tick. #241 §5: no longer terminal; warn+back off.
+    # The live tree changed during the reason step. Once the tree moved under the answerer its
+    # answer is derived from a stale tree and must NEVER be injected (#244 review): the tree-changed
+    # path ALWAYS returns here, so we never fall through to the ANSWER branch's recompute (which
+    # would re-baseline fp_before and inject over the mutated tree).
+    # #247 option (c): ATTRIBUTE the diff by the REASONER's OWN tool_use audit (whose whole-tree-diff
+    # attribution the spoke transcript could only guess at — #244 residuals). Only a PROVEN reasoner
+    # write (rw_rc 0) short-circuits to void amid spoke activity; when the audit does NOT prove a write
+    # we do NOT trust it alone — an escape via a vector the audit does not model must still fail SAFE
+    # (#244's "unconfirmed change => VOID"), so we attribute to the spoke ONLY on a positive spoke
+    # signal and otherwise VOID.
+    _reasoner_wrote_live_tree "$raw" "$wt"; local rw_rc=$? do_void=0
+    if [ "$rw_rc" -eq 0 ]; then
+      # The audit PROVES a reasoner live-tree write (a write tool under $wt / a mutating $wt-absolute
+      # Bash). Void even amid COINCIDENT genuine spoke activity — closes #244 residual 1.
+      do_void=1
+    elif [ "$rw_rc" -eq 1 ]; then
+      # The audit saw the reasoner's stream and found no modelled live-tree write. Attribute the diff
+      # to the spoke ONLY on a positive transcript TOUCH — any appended record, since the isolated
+      # reasoner writes nothing to the live transcript, so a #240 tool_result-only self-resume still
+      # proves the spoke (closes residual 2). Spoke totally silent + a tree diff the audit could not
+      # attribute ⇒ an unmodelled escape ⇒ fail SAFE and VOID (the #244 posture, restored).
+      _spoke_touched_transcript "$wt" "$parked_sizes"; local touch_rc=$?
+      [ "$touch_rc" -ne 0 ] && do_void=1
+    else
+      # rw_rc 2: the audit is UNAVAILABLE (a plain-text answerer / no stream-json / no python3) —
+      # fall back to the #244 spoke-activity signal, unchanged: void UNLESS a genuine spoke turn
+      # landed (fail SAFE on rc 2 there too, mirroring the unverifiable-fingerprint escalation). This
+      # is what keeps every #244 answerer-stub test green — those stubs carry no auditable stream.
+      _spoke_activity_appended "$wt" "$parked_sizes"; local act_rc=$?
+      [ "$act_rc" -ne 0 ] && do_void=1
+    fi
+    if [ "$do_void" -eq 1 ]; then
+      # Stamp the durable void marker FIRST so the top-of-function backoff short-circuit paces the
+      # mutating reasoner across ticks — the (tip, sig) ceiling can't, since the tree write perturbs
+      # it every tick. #241 §5: no longer terminal; warn + back off. 'unknown' reversibility: the
+      # reasoner ESCAPED #237 snapshot isolation and wrote the LIVE tree — a should-never-fire event
+      # the morning review must triage from the benign.
       _broker_mark_voided "$issue"
       log "  reasoner mutated the read-only worktree of #$issue — voiding its answer (backoff-paced; #241)"
-      # 'unknown' reversibility: the reasoner ESCAPED #237 snapshot isolation and wrote the LIVE
-      # tree — a should-never-fire event the morning review must triage from the benign.
       _broker_on_human_decision "$mode" "$wt" "$issue" \
         "the gate reasoner mutated the read-only worktree — its answer is voided; review the live tree" unknown
       return 0
     fi
-    # act_rc 0: a genuine spoke turn landed — the spoke self-resumed mid-GREEN and is editing its
-    # own tree (the #234 false-void), so the diff is the spoke's own work, not the reasoner. Do NOT
-    # void: no gate-voided marker, no blocked/<issue> on an actively-working spoke. The answer is
-    # still derived from a tree that changed under it, so DROP it, never inject (a recompute would
-    # re-baseline the fingerprint and inject the stale answer mid-turn, #89). A fresh park next tick
-    # is serviced anew.
-    # KNOWN LIMITS (accepted, both non-terminal under #241's warn+backoff): a reasoner escape that
-    # coincides with genuine spoke activity in the SAME window is attributed to the spoke and not
-    # voided — only a per-tool-call audit of the reasoner (the deferred option c) could separate a
-    # combined whole-tree diff; and a self-resume whose only appended record is a tool_result (its
-    # tool_use flushed just before the parked_sizes snapshot) reads as no-activity and can false-void.
-    log "  #$issue's live tree changed while the spoke was active — dropping the stale answer (#244)"
+    # No reasoner write: the diff is the spoke's own concurrent edit (the #234 self-resume) or a
+    # sibling's. DROP the stale answer, never inject (a recompute would re-baseline the fingerprint
+    # and inject mid-turn, #89): no gate-voided marker, no blocked/<issue> on an actively-working
+    # spoke. A fresh park next tick is serviced anew.
+    log "  #$issue's live tree changed but the reasoner did not write it — dropping the stale answer (#247)"
     return 0
   fi
   # The answerer is the supervisor's own `claude`; if its credentials are dead, every
@@ -2707,14 +2911,15 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
   # signature — a healthy answer that merely discusses auth exits 0 and is unaffected.
   # Raise the global stop flag so the supervisor pauses DISPATCH and re-probes (#241 §9). WARN
   # this spoke (an auth failure is not its fault — never block it); the drain resumes servicing
-  # it once auth recovers, rather than parking it blocked/<issue>.
+  # it once auth recovers, rather than parking it blocked/<issue>. #247: read the RAW stream (not
+  # the normalized text) so an auth signature in a dropped stream-json event is never missed.
   if [ "$rc" -ne 0 ] && is_auth_failure "$raw"; then
     _AFK_AUTH_FAILED=1
     broker_warn_continue "$wt" "$issue" auth \
       "subscription auth failed — token could not refresh; re-run /login on the host (drain paused, re-probing)" reversible
     return 0
   fi
-  decision="$(parse_decision "$raw")"
+  decision="$(parse_decision "$raw_text")"
   kind="${decision%%$'\t'*}"
   text="${decision#*$'\t'}"
   if [ "$kind" = "ANSWER" ] && [ -n "$text" ]; then
@@ -2758,7 +2963,7 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
           # is a NOTEWORTHY decision → a loud warned record + a journal line WITH a gh comment. A
           # routine reversible answer is a cheap FILE-ONLY journal line (no per-answer gh spam).
           local ans_rev_raw ans_rev ans_warn
-          ans_rev_raw="$(parse_decision_field "$raw" REVERSIBILITY)"
+          ans_rev_raw="$(parse_decision_field "$raw_text" REVERSIBILITY)"
           # Normalize to the first ALPHABETIC RUN (portable lowercasing, tolerant of quotes,
           # parens, or a trailing period around the class word) so 'Reversible', 'reversible.',
           # and '"irreversible"' all classify correctly. Gate the warn on the RAW presence, not
@@ -2766,7 +2971,7 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
           # empty, e.g. all-punctuation noise) must fail SAFE to a loud warned record, never
           # silently collapse to routine the way a bare trailing-strip did (#241 review).
           ans_rev="$(printf '%s' "$ans_rev_raw" | tr '[:upper:]' '[:lower:]' | grep -oE '[a-z]+' | head -n1 || true)"
-          ans_warn="$(parse_decision_field "$raw" WARN)"
+          ans_warn="$(parse_decision_field "$raw_text" WARN)"
           if [ -n "$ans_warn" ] || { [ -n "$ans_rev_raw" ] && [ "$ans_rev" != reversible ]; }; then
             # The clear above dropped the retry BACKOFF (progress); this warned record is the
             # DELIBERATE loud review flag for the noteworthy decision — not a stale leftover.
