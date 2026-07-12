@@ -3671,6 +3671,97 @@ def test_smoke_compound_end_to_end_auto_approves(spoke_repo: Path, tmp_path: Pat
     assert verdict == "APPROVE"
 
 
+# ── issue #257: the pane path must classify the WHOLE gated command, not a 2000-char cut ──
+#
+# extract_pending_command used to end its embedded python with `print(cmd[:2000].strip())`,
+# truncating the gated command to 2000 chars. In the pane path _decide_permission fed that
+# truncated string to the default-deny classify_permission (and the _reason_permission prompt),
+# so a >2KB compound whose risky segment lived past char 2000 was classified on its benign
+# prefix only and auto-approved — the exact hazard #253 fixed for afk_permission_hook_decide
+# (test_afk_permission_hook_classifies_the_whole_long_command). These bind the pane-path fix.
+
+
+def test_extract_pending_command_returns_untruncated_long_command(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The gated command feeds the default-deny classifier, so it must NOT be truncated: a risky
+    # tail past the old 2000-char cap would otherwise be hidden from classify_permission and
+    # mis-approved. extract_pending_command returns the FULL command (uncapped basis is fine for
+    # its other consumers — _permission_pending tests non-emptiness, _broker_park_signature hashes
+    # it). RED pre-fix: the old [:2000] cut returned a 2000-char prefix, not the full command.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    cmd = "git add x.py; " * 200 + "git push origin main"  # ~2820 chars, well past 2000
+    (pd / "session.jsonl").write_text(json.dumps(_bash_tool_record(cmd)) + "\n")
+
+    extracted = _call(
+        f"extract_pending_command '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
+    ).stdout.strip()
+
+    assert extracted == cmd
+    assert len(extracted) > 2000, "the classifier must see the whole command, not a 2000-char cut"
+
+
+def test_decide_permission_classifies_the_whole_long_command(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # Pane-path analogue of test_afk_permission_hook_classifies_the_whole_long_command (#253):
+    # a benign `git add x.py` prefix padded well past the old 2000-char cap with a risky
+    # `git push origin main` tail. extract_pending_command must NOT truncate, so classify sees the
+    # main-touching push and ESCALATEs (routes to the reasoner) instead of mis-approving the
+    # visible prefix. approve_permission is never invoked — no bare `1` is auto-typed — and the
+    # reasoner prompt carries the untruncated command (acceptance bullet 3).
+    #
+    # The prefix is sized so cmd[:2000] lands on a clean segment boundary: "git add x.py; " is 14
+    # chars, 142 whole units = 1988 chars, +12 = "git add x.py" (chars 1988..1999), so the 2000-
+    # char cut is exactly 143 complete `git add x.py` segments — all APPROVE pre-fix (genuinely RED).
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    cmd = "git add x.py; " * 200 + "git push origin main"
+    (pd / "session.jsonl").write_text(json.dumps(_bash_tool_record(cmd)) + "\n")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    tmux_log = fake_bin / "tmux.log"
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> "{tmux_log}"\n'
+        'case "$1" in\n'
+        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        "esac\nexit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    answerer_log = tmp_path / "answerer.log"
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE_DIR": str(statedir),
+        # The reasoner sees the pending command in its prompt (delivered on stdin); capture it and
+        # DENY, so the escalate path declines rather than auto-approving.
+        "AFK_ANSWERER_CMD": f"cat >> '{answerer_log}'; printf 'ANSWER: DENY: push your own branch, not main'",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_INJECT_POLL_SECONDS": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    # The whole command was classified: the main-touching push tail forces ESCALATE, not APPROVE.
+    fields = (statedir / "decisions.log").read_text().strip().split("\t")
+    assert fields[4] == "ESCALATE", fields
+    # approve_permission types a BARE `1` then Enter; the escalate→deny path must never do that.
+    assert "send-keys -t afk:1 1\n" not in tmux_log.read_text(), (
+        "no auto-approve keypress on ESCALATE"
+    )
+    # Acceptance bullet 3: the reasoner prompt carries the untruncated command, tail and all.
+    assert "git push origin main" in answerer_log.read_text(), "reasoner got a truncated command"
+
+
 def test_classify_permission_read_of_symlink_to_secret_escalates(
     spoke_repo: Path, tmp_path: Path
 ) -> None:

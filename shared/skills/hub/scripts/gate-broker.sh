@@ -1980,7 +1980,14 @@ for tid, name, inp in reversed(tool_uses):
     elif name:
         cmd = name
     break                     # the trailing unresolved tool_use is the pending command
-print(cmd[:2000].strip())
+# NB: NOT truncated since #257 -- this command feeds the default-deny classify_permission and the
+# _reason_permission prompt in the pane path. Truncating a benign prefix off a risky tail could
+# hide the risky segment and mis-approve it, exactly as #253 avoided for afk_permission_hook_decide.
+# The 2000-char DISPLAY cap now lives at the log call sites in _decide_permission via cmd_display,
+# not here. The other consumers tolerate the full command: _permission_pending tests non-emptiness
+# and _broker_park_signature hashes the basis.
+# Plain ASCII, no backticks/parens: bash 3.2 mis-parses those inside a heredoc.
+print(cmd.strip())
 PYEOF
 }
 
@@ -2099,7 +2106,7 @@ path to tell the spoke>'."
 # parks the spoke: it routes to the always-answering reasoner (#241) which approves a safe
 # command or declines-and-redirects a risky one, warning + journaling the taken decision.
 _decide_permission() {
-  local wt="$1" issue="$2" cmd decision kind reason
+  local wt="$1" issue="$2" cmd cmd_display decision kind reason
   cmd="$(extract_pending_command "$wt")"
   if [ -z "$cmd" ]; then
     # Unreadable command: cannot classify. Decline it (the reversible action) + warn — never
@@ -2109,6 +2116,13 @@ _decide_permission() {
     broker_warn_continue "$wt" "$issue" permission "declined an unreadable permission command" reversible
     return 0
   fi
+  # #257: classify the WHOLE command (uncapped) so a risky tail past 2000 chars can't hide behind
+  # a benign prefix. The 2000-char cap is DISPLAY-only now, applied to a copy used solely for the
+  # log/codify surfaces HERE (log_decision's signature + the drain log line) — kept byte-identical
+  # to pre-fix. The classifier and the _reason_permission prompt get the full $cmd; the reasoner
+  # path (its file journal + gh comment) then deliberately carries the untruncated command on its
+  # OWN surfaces, so a human reviewing a genuine escalation sees the whole thing.
+  cmd_display="${cmd:0:2000}"
   decision="$(classify_permission "$cmd" "$wt")"
   kind="${decision%%$'\t'*}"
   reason="${decision#*$'\t'}"
@@ -2117,9 +2131,9 @@ _decide_permission() {
   # unanimity check is vacuous. Logging both makes a flag-dependent signature (`git reset
   # -q` APPROVE vs `git reset --hard` ESCALATE, which share the signature git-reset+git-add)
   # correctly read as a CONFLICT, so codify never proposes it as a safe unanimous rule (#155 D).
-  log_decision "$issue" permission "$cmd" "$kind"
+  log_decision "$issue" permission "$cmd_display" "$kind"
   if [ "$kind" = "APPROVE" ]; then
-    log "→ auto-approving safe permission for #$issue: $cmd"
+    log "→ auto-approving safe permission for #$issue: $cmd_display"
     # Stamp the delivery attempt FIRST: the approve→resume window must not read as idle.
     stamp_answer_attempt "$issue"
     if approve_permission "$wt"; then
@@ -2222,9 +2236,10 @@ elif name:
 else:
     cmd = ""
 print(cwd)
-# NB: NOT truncated -- extract_pending_command caps at 2000 for pane/log DISPLAY, but a
-# silent auto-approve must classify the WHOLE command. Truncating a benign prefix off a
-# risky tail could hide the risky segment and mis-approve it with no dialog. Since
+# NB: NOT truncated -- the 2000-char cap lives in the _decide_permission cmd_display log-only
+# copy, never in extract_pending_command since #257, because a silent auto-approve must classify
+# the WHOLE command. Truncating a benign prefix off a risky tail could hide the risky segment
+# and mis-approve it with no dialog. Since
 # classify_permission is default-deny, an over-long or unrecognised command just escalates.
 # (Plain ASCII + no backticks/parens here: bash 3.2 mis-parses those inside a $()-nested
 # heredoc.)
