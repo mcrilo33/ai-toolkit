@@ -282,3 +282,237 @@ def test_cli_once_stamps_heartbeat_and_ticks(tmp_path: Path) -> None:
     assert "tick: drain supervisor is off" in result.stdout
     fields = hb.read_text().split()
     assert len(fields) == 2 and fields[0].isdigit(), f"heartbeat is '<pid> <epoch>': {fields}"
+
+
+# ── the 5 detectors + interventions (issue #251, subtask 3) ───────────────────
+# The daemon skeleton observes; these detectors decide WHEN the drain fell short and fire the
+# scripted intervention + a defect record. Detectors are pure predicates over the drain's own
+# state readers (slot_state / read_answer_attempt / read_progress_epoch / _spoke_pane_target),
+# stubbed inline here; the git-marker detectors run against a throwaway repo. `now` is pinned
+# via AFK_NOW so the grace-margin arithmetic is deterministic.
+
+NOW = "1783880000"
+
+
+def _git_repo(tmp_path: Path, name: str = "wt") -> Path:
+    wt = tmp_path / name
+    wt.mkdir()
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    for cmd in (["git", "init", "-q"], ["git", "commit", "-q", "--allow-empty", "-m", "c1"]):
+        subprocess.run(cmd, cwd=wt, check=True, env=env, capture_output=True)
+    return wt
+
+
+def _detect(prelude: str, call: str, *, env: dict[str, str] | None = None) -> int:
+    """Run a detector with the drain readers stubbed by `prelude`; return its rc."""
+    e = {"AFK_NOW": NOW}
+    if env:
+        e.update(env)
+    return _call(f"{prelude}; {call}", env=e).returncode
+
+
+# Condition 1 — park unanswered
+def test_park_unanswered_fires_when_never_attempted(tmp_path: Path) -> None:
+    prelude = 'slot_state() { echo waiting; }; read_answer_attempt() { echo ""; }'
+    assert _detect(prelude, "_wd_detect_park_unanswered /wt 5 " + NOW) == 0
+
+
+def test_park_unanswered_fires_when_attempt_is_stale(tmp_path: Path) -> None:
+    old = str(int(NOW) - 700)  # > 600s ceiling
+    prelude = f"slot_state() {{ echo waiting; }}; read_answer_attempt() {{ echo {old}; }}"
+    assert _detect(prelude, "_wd_detect_park_unanswered /wt 5 " + NOW) == 0
+
+
+def test_park_unanswered_quiet_when_attempt_is_fresh(tmp_path: Path) -> None:
+    fresh = str(int(NOW) - 60)  # < 600s ceiling
+    prelude = f"slot_state() {{ echo waiting; }}; read_answer_attempt() {{ echo {fresh}; }}"
+    assert _detect(prelude, "_wd_detect_park_unanswered /wt 5 " + NOW) == 1
+
+
+def test_park_unanswered_quiet_when_not_waiting(tmp_path: Path) -> None:
+    prelude = 'slot_state() { echo busy; }; read_answer_attempt() { echo ""; }'
+    assert _detect(prelude, "_wd_detect_park_unanswered /wt 5 " + NOW) == 1
+
+
+# Condition 2 — dead / idle pane
+def test_dead_idle_fires_when_pane_dead_and_progress_stale(tmp_path: Path) -> None:
+    old = str(int(NOW) - 4000)  # > 3600s ceiling
+    prelude = (
+        '_spoke_pane_target() { echo ""; }; slot_state() { echo busy; }; '
+        f"read_progress_epoch() {{ echo {old}; }}"
+    )
+    assert _detect(prelude, "_wd_detect_dead_idle /wt 5 " + NOW) == 0
+
+
+def test_dead_idle_quiet_when_pane_alive(tmp_path: Path) -> None:
+    old = str(int(NOW) - 4000)
+    prelude = (
+        '_spoke_pane_target() { echo "hub:0"; }; slot_state() { echo busy; }; '
+        f"read_progress_epoch() {{ echo {old}; }}"
+    )
+    assert _detect(prelude, "_wd_detect_dead_idle /wt 5 " + NOW) == 1
+
+
+def test_dead_idle_quiet_when_done(tmp_path: Path) -> None:
+    old = str(int(NOW) - 4000)
+    prelude = (
+        '_spoke_pane_target() { echo ""; }; slot_state() { echo done; }; '
+        f"read_progress_epoch() {{ echo {old}; }}"
+    )
+    assert _detect(prelude, "_wd_detect_dead_idle /wt 5 " + NOW) == 1
+
+
+# Condition 3 — stale blocked marker (real git)
+def test_stale_marker_fires_when_blocked_is_ancestor_of_tip(tmp_path: Path) -> None:
+    wt = _git_repo(tmp_path)
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "tag", "blocked/5"], cwd=wt, check=True, env=env, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "--allow-empty", "-m", "c2"],
+        cwd=wt,
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+
+    assert _call(f"_wd_detect_stale_marker '{wt}' 5").returncode == 0
+
+
+def test_stale_marker_quiet_when_blocked_at_tip(tmp_path: Path) -> None:
+    wt = _git_repo(tmp_path)
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "tag", "blocked/5"], cwd=wt, check=True, env=env, capture_output=True)
+
+    assert _call(f"_wd_detect_stale_marker '{wt}' 5").returncode == 1
+
+
+# Condition 4 — mergeable branch the drain skipped (escalate-only)
+def test_mergeable_skipped_fires_when_done_open_and_stale(tmp_path: Path) -> None:
+    wt = _git_repo(tmp_path)
+    old = str(int(NOW) - 1000)  # > 900s ceiling
+    prelude = f"slot_state() {{ echo done; }}; read_progress_epoch() {{ echo {old}; }}"
+    env = {"AFK_NOW": NOW, "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo open"}
+    assert _call(f"{prelude}; _wd_detect_mergeable_skipped '{wt}' 5 {NOW}", env=env).returncode == 0
+
+
+def test_mergeable_skipped_quiet_when_blocked_at_tip(tmp_path: Path) -> None:
+    wt = _git_repo(tmp_path)
+    env0 = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "tag", "blocked/5"], cwd=wt, check=True, env=env0, capture_output=True)
+    old = str(int(NOW) - 1000)
+    prelude = f"slot_state() {{ echo done; }}; read_progress_epoch() {{ echo {old}; }}"
+    env = {"AFK_NOW": NOW, "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo open"}
+    assert _call(f"{prelude}; _wd_detect_mergeable_skipped '{wt}' 5 {NOW}", env=env).returncode == 1
+
+
+def test_mergeable_skipped_quiet_when_issue_closed(tmp_path: Path) -> None:
+    wt = _git_repo(tmp_path)
+    old = str(int(NOW) - 1000)
+    prelude = f"slot_state() {{ echo done; }}; read_progress_epoch() {{ echo {old}; }}"
+    env = {"AFK_NOW": NOW, "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo closed"}
+    assert _call(f"{prelude}; _wd_detect_mergeable_skipped '{wt}' 5 {NOW}", env=env).returncode == 1
+
+
+# Condition 5 — supervisor dead
+def test_supervisor_dead_fires_when_drain_state_stale(tmp_path: Path) -> None:
+    prelude = "_wd_drain_state() { echo stale; }"
+    assert _call(f"{prelude}; _wd_detect_supervisor_dead").returncode == 0
+    prelude_live = "_wd_drain_state() { echo live; }"
+    assert _call(f"{prelude_live}; _wd_detect_supervisor_dead").returncode == 1
+
+
+# ── interventions fire the seam with the worktree + issue ─────────────────────
+def test_intervene_answer_invokes_the_seam(tmp_path: Path) -> None:
+    marker = tmp_path / "answered"
+    env = {"HUB_WATCHDOG_ANSWER_CMD": f'printf "%s %s" "$1" "$2" > {marker}'}
+
+    _call("_wd_intervene_answer /the/wt 5", env=env)
+
+    assert marker.read_text() == "/the/wt 5"
+
+
+def test_landmark_intervention_never_lands_only_marks(tmp_path: Path) -> None:
+    # Escalate-only: the default raises a needs-human-land tag and NEVER runs a land.
+    wt = _git_repo(tmp_path)
+
+    _call(f"_wd_intervene_landmark '{wt}' 5")
+
+    tags = subprocess.run(["git", "tag"], cwd=wt, capture_output=True, text=True).stdout
+    assert "needs-human-land/5" in tags
+
+
+# ── _wd_fire writes the intervention-ledger ───────────────────────────────────
+def test_fire_appends_a_ledger_line(tmp_path: Path) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    env = {"HUB_WATCHDOG_LEDGER": str(ledger), "AFK_NOW": NOW}
+
+    result = _call("_wd_fire park-unanswered 5 'drain fell short'", env=env)
+
+    assert result.returncode == 0, result.stderr
+    line = ledger.read_text().strip()
+    assert '"condition":"park-unanswered"' in line
+    assert '"issue":"5"' in line
+    assert f'"ts":{NOW}' in line
+    assert "FIRING [park-unanswered] #5" in result.stdout  # _wd_log → stdout (daemon tees to log)
+
+
+# ── the dispatcher: detect → fire → intervene, end to end ─────────────────────
+def test_run_conditions_fires_supervisor_dead_from_passed_state(tmp_path: Path) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    rearm = tmp_path / "rearmed"
+    env = {
+        "HUB_WATCHDOG_LEDGER": str(ledger),
+        "HUB_WATCHDOG_REARM_CMD": f"touch {rearm}",
+        "AFK_NOW": NOW,
+    }
+    # inflight_worktrees stubbed empty so only the global supervisor check runs.
+    prelude = "inflight_worktrees() { :; }"
+
+    _call(f"{prelude}; _wd_run_conditions {NOW} stale", env=env)
+
+    assert '"condition":"supervisor-dead"' in ledger.read_text()
+    assert rearm.exists(), "supervisor-dead must re-arm the drain"
+
+
+def test_run_conditions_fires_park_and_invokes_answer_seam(tmp_path: Path) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    answered = tmp_path / "answered"
+    env = {
+        "HUB_WATCHDOG_LEDGER": str(ledger),
+        "HUB_WATCHDOG_ANSWER_CMD": f"touch {answered}",
+        "AFK_NOW": NOW,
+    }
+    prelude = (
+        'inflight_worktrees() { printf "/the/wt\\t5\\n"; }; '
+        'slot_state() { echo waiting; }; read_answer_attempt() { echo ""; }; '
+        '_spoke_pane_target() { echo "hub:0"; }; read_progress_epoch() { echo ' + NOW + "; }"
+    )
+
+    _call(f"{prelude}; _wd_run_conditions {NOW} live", env=env)
+
+    assert '"condition":"park-unanswered"' in ledger.read_text()
+    assert answered.exists(), "a park firing must invoke the answer intervention"

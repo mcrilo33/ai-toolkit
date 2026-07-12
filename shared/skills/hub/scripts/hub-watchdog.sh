@@ -67,13 +67,30 @@ for _cand in "${AFK_HUB_INJECT:-}" "$HUB_WATCHDOG_SCRIPT_DIR/hub-inject.sh"; do
   if [ -n "$_cand" ] && [ -f "$_cand" ]; then . "$_cand"; _WD_RESOLVED_INJECT="$_cand"; break; fi
 done
 unset _cand
+# gate-broker.sh — the drain's state-reader API (inflight_worktrees, slot_state, the
+# answer-attempt/progress epochs, _afk_state_dir) the detectors cross-check against the SAME
+# truth the drain reads, so the two tiers can never disagree on what a spoke's state is. A
+# co-located sibling; it re-pulls worktree-lib + hub-inject idempotently. Sourced best-effort:
+# a detector existence-checks before use, so a standalone watchdog still runs (detectors no-op).
+# AFK_GATE_BROKER wins for tests.
+_WD_RESOLVED_BROKER=""
+# A distinct loop var (not _cand): gate-broker.sh's preamble runs an unconditional
+# `unset _cand` that would clobber a shared-name loop variable mid-iteration under set -u.
+# Capture the resolved path BEFORE sourcing for the same reason.
+for _wdgb in \
+  "${AFK_GATE_BROKER:-}" \
+  "$HUB_WATCHDOG_SCRIPT_DIR/gate-broker.sh" \
+  "$HUB_WATCHDOG_SCRIPT_DIR/../../../../scripts/gate-broker.sh"; do
+  if [ -n "$_wdgb" ] && [ -f "$_wdgb" ]; then _WD_RESOLVED_BROKER="$_wdgb"; . "$_wdgb"; break; fi
+done
+unset _wdgb 2>/dev/null || true
 
-# Guarded log fallback (hub-inject may already provide one; same stderr contract).
+# Guarded log fallback (hub-inject/gate-broker may already provide one; same stderr contract).
 declare -F log >/dev/null 2>&1 || log() { printf '%s\n' "$*" >&2; }
 
 # The daemon's own source bundle: this script + the libs it sources. Stamped at daemon start
 # and re-checked each tick so a land of the watchdog's own code re-execs it live (#251/#190).
-_WD_SOURCE_FILES=("$_WD_SELF" "$_WD_RESOLVED_INJECT" "$_WD_RESOLVED_WT_LIB")
+_WD_SOURCE_FILES=("$_WD_SELF" "$_WD_RESOLVED_BROKER" "$_WD_RESOLVED_INJECT" "$_WD_RESOLVED_WT_LIB")
 
 # --- paths --------------------------------------------------------------------
 # The hub's git common dir — shared across worktrees, per-repo — where the daemon's pidfile,
@@ -153,15 +170,202 @@ _wd_reexec() {
   exec bash "$_WD_SELF" --daemon --reexec
 }
 
+# --- detection conditions + scripted interventions (issue #251) ---------------
+# Each detector fires ONLY when the drain already had its chance and the condition persists
+# past a grace margin beyond the drain's OWN threshold — so a CORRECT drain never trips the
+# watchdog (every firing is an afk defect). On a firing the dispatcher records it (_wd_fire →
+# the intervention-ledger; subtask 4 adds classify + bug-scoper) AND takes the safe scripted
+# intervention behind a HUB_WATCHDOG_*_CMD seam (so each is unit-testable without a live
+# tmux/gh/claude). All best-effort: a detector/intervention error never aborts a tick.
+: "${HUB_WATCHDOG_PARK_CEILING:=600}"   # a waiting spoke unanswered this long ⇒ drain fell short
+: "${HUB_WATCHDOG_IDLE_CEILING:=3600}"  # a dead/idle spoke unrevived this long ⇒ reaper missed it
+: "${HUB_WATCHDOG_LAND_CEILING:=900}"   # a ready-at-tip branch un-landed this long ⇒ auto-land skipped
+
+# _wd_epoch_stale <epoch> <now> <ceiling> -> true when now-epoch > ceiling. Empty/non-numeric
+# reads as NOT stale (can't measure → never fire), guarding set -u arithmetic against a bareword.
+_wd_epoch_stale() {
+  local epoch="$1" now="$2" ceiling="$3"
+  case "$epoch" in '' | *[!0-9]*) return 1 ;; esac
+  case "$now" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$(( now - epoch ))" -gt "$ceiling" ]
+}
+
+# _wd_tag_at_tip <wt> <kind> <issue> -> true when <kind>/<issue> points exactly at HEAD.
+_wd_tag_at_tip() {
+  local wt="$1" kind="$2" issue="$3" tip tag
+  tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)" || return 1
+  tag="$(git -C "$wt" rev-parse -q --verify "refs/tags/${kind}/${issue}^{commit}" 2>/dev/null)" || return 1
+  [ -n "$tag" ] && [ "$tag" = "$tip" ]
+}
+
+# _wd_blocked_stale <wt> <issue> -> true when blocked/<issue> is a STRICT ancestor of the tip:
+# the spoke committed on top, so the drain's reconcile_markers should have cleared it already.
+_wd_blocked_stale() {
+  local wt="$1" issue="$2" tag tip
+  tag="$(git -C "$wt" rev-parse -q --verify "refs/tags/blocked/${issue}^{commit}" 2>/dev/null)" || return 1
+  [ -n "$tag" ] || return 1
+  tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)" || return 1
+  [ "$tag" != "$tip" ] || return 1
+  git -C "$wt" merge-base --is-ancestor "$tag" "$tip" 2>/dev/null
+}
+
+# _wd_issue_open <issue> -> best-effort "is this GitHub issue still open?" A closed issue was
+# landed (not skipped), so condition 4 must not fire on it. gh unavailable / a failed query
+# reads as OPEN (fire) — the drain-skip signal already gated it; HUB_WATCHDOG_ISSUE_STATE_CMD
+# overrides for tests (echo the state: open|closed).
+_wd_issue_open() {
+  local issue="$1" state
+  if [ -n "${HUB_WATCHDOG_ISSUE_STATE_CMD:-}" ]; then
+    state="$(bash -c "$HUB_WATCHDOG_ISSUE_STATE_CMD" hub-watchdog "$issue" 2>/dev/null)"
+  else
+    command -v gh >/dev/null 2>&1 || return 0
+    state="$(gh issue view "$issue" --json state -q .state 2>/dev/null)"
+  fi
+  case "$state" in [Cc]losed | CLOSED) return 1 ;; *) return 0 ;; esac
+}
+
+# --- the 5 detectors (pure predicates over the drain's own state readers) ------
+# Condition 1: a parked spoke answer_pass left unanswered past the grace margin.
+_wd_detect_park_unanswered() {
+  local wt="$1" issue="$2" now="$3" attempt
+  command -v slot_state >/dev/null 2>&1 || return 1
+  [ "$(slot_state "$wt" "$issue")" = "waiting" ] || return 1
+  attempt="$(read_answer_attempt "$issue" 2>/dev/null)"
+  case "$attempt" in '' | *[!0-9]*) return 0 ;; esac  # never attempted ⇒ fell short
+  _wd_epoch_stale "$attempt" "$now" "$HUB_WATCHDOG_PARK_CEILING"
+}
+
+# Condition 2: a dead/crashed pane recover_dead_panes/reap_pass never revived, past the ceiling.
+_wd_detect_dead_idle() {
+  local wt="$1" issue="$2" now="$3"
+  command -v slot_state >/dev/null 2>&1 || return 1
+  [ -z "$(_spoke_pane_target "$wt" 2>/dev/null)" ] || return 1   # a live pane is the reaper's job
+  [ "$(slot_state "$wt" "$issue")" = "done" ] && return 1        # terminal ⇒ not a hang
+  _wd_epoch_stale "$(read_progress_epoch "$issue" 2>/dev/null)" "$now" "$HUB_WATCHDOG_IDLE_CEILING"
+}
+
+# Condition 3: a stale blocked/ marker reconcile_markers should have cleared.
+_wd_detect_stale_marker() { _wd_blocked_stale "$1" "$2"; }
+
+# Condition 4: a mergeable (ready-at-tip) branch auto_land terminal-skipped. NOT blocked-at-tip
+# (a deliberate skip is never a false-skip), issue still open, un-landed past the ceiling.
+_wd_detect_mergeable_skipped() {
+  local wt="$1" issue="$2" now="$3"
+  command -v slot_state >/dev/null 2>&1 || return 1
+  [ "$(slot_state "$wt" "$issue")" = "done" ] || return 1
+  _wd_tag_at_tip "$wt" blocked "$issue" && return 1              # deliberately blocked → not a skip
+  _wd_epoch_stale "$(read_progress_epoch "$issue" 2>/dev/null)" "$now" "$HUB_WATCHDOG_LAND_CEILING" || return 1
+  _wd_issue_open "$issue"                                        # a closed issue was landed, not skipped
+}
+
+# Condition 5: the drain supervisor crashed (armed state, dead heartbeat).
+_wd_detect_supervisor_dead() { [ "$(_wd_drain_state)" = "stale" ]; }
+
+# --- the 5 scripted interventions (each behind a HUB_WATCHDOG_*_CMD seam) ------
+# The seam receives the worktree + issue as positional args ($1 $2 after the argv0 sentinel).
+_wd_intervene_answer() {   # route to the reasoner/permission lane directly
+  local wt="$1" issue="$2"
+  if [ -n "${HUB_WATCHDOG_ANSWER_CMD:-}" ]; then bash -c "$HUB_WATCHDOG_ANSWER_CMD" hub-watchdog "$wt" "$issue" >/dev/null 2>&1 || true; return 0; fi
+  command -v decide_and_act >/dev/null 2>&1 && decide_and_act "$wt" "$issue" >/dev/null 2>&1 || true
+}
+_wd_intervene_revive() {   # claude --continue revive in the worktree
+  local wt="$1" issue="$2"
+  if [ -n "${HUB_WATCHDOG_REVIVE_CMD:-}" ]; then bash -c "$HUB_WATCHDOG_REVIVE_CMD" hub-watchdog "$wt" "$issue" >/dev/null 2>&1 || true; return 0; fi
+  command -v claude >/dev/null 2>&1 && ( cd "$wt" 2>/dev/null && nohup claude --continue >/dev/null 2>&1 & ) || true
+}
+_wd_intervene_reconcile() {  # clear the stale blocked/ marker (local + remote)
+  local wt="$1" issue="$2"
+  if [ -n "${HUB_WATCHDOG_RECONCILE_CMD:-}" ]; then bash -c "$HUB_WATCHDOG_RECONCILE_CMD" hub-watchdog "$wt" "$issue" >/dev/null 2>&1 || true; return 0; fi
+  git -C "$wt" tag -d "blocked/$issue" >/dev/null 2>&1 || true
+  git -C "$wt" push origin ":refs/tags/blocked/$issue" >/dev/null 2>&1 || true
+}
+# ESCALATE-ONLY (#251 final ruling): the watchdog NEVER lands — a tier-2 loop must not ship to
+# main ("hub lands, never self-land"). It raises a human land marker (a needs-human-land/<issue>
+# tag) so a person lands it; the defect is filed either way (_wd_fire).
+_wd_intervene_landmark() {
+  local wt="$1" issue="$2"
+  if [ -n "${HUB_WATCHDOG_LANDMARK_CMD:-}" ]; then bash -c "$HUB_WATCHDOG_LANDMARK_CMD" hub-watchdog "$wt" "$issue" >/dev/null 2>&1 || true; return 0; fi
+  git -C "$wt" tag -f "needs-human-land/$issue" >/dev/null 2>&1 || true
+}
+_wd_intervene_rearm() {   # re-arm the crashed drain (self-update aware via hub-afk --reconcile)
+  if [ -n "${HUB_WATCHDOG_REARM_CMD:-}" ]; then bash -c "$HUB_WATCHDOG_REARM_CMD" hub-watchdog >/dev/null 2>&1 || true; return 0; fi
+  local afk=""
+  command -v _afk_find_script >/dev/null 2>&1 && afk="$(_afk_find_script "${HUB_WATCHDOG_AFK_BIN:-}" hub-afk.sh || true)"
+  [ -n "$afk" ] && bash "$afk" --reconcile >/dev/null 2>&1 || true
+}
+
+# --- the intervention-ledger + firing hook ------------------------------------
+# _wd_ledger_file -> the per-run intervention-ledger (one JSONL firing per line). Under the
+# drain's state dir so hub-status / the morning report find it; HUB_WATCHDOG_LEDGER overrides.
+_wd_ledger_file() {
+  if [ -n "${HUB_WATCHDOG_LEDGER:-}" ]; then printf '%s\n' "$HUB_WATCHDOG_LEDGER"; return; fi
+  local dir
+  if command -v _afk_state_dir >/dev/null 2>&1; then dir="$(_afk_state_dir)"; else dir="$(_wd_common_dir)"; fi
+  printf '%s\n' "$dir/intervention-ledger.jsonl"
+}
+
+# _wd_json_escape <str> -> minimal JSON string-body escape (defer to the broker's when present so
+# the ledger and the #241 decision-journal never diverge on escaping).
+_wd_json_escape() {
+  if command -v _broker_json_escape >/dev/null 2>&1; then _broker_json_escape "$1"; return; fi
+  local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"
+}
+
+# _wd_fire <condition> <issue> <reason> -> record ONE intervention firing: append a JSONL line to
+# the intervention-ledger and log it. Every firing is a bug report against afk. Subtask 4 extends
+# this with the {afk-defect|novel-decision} classification + the headless bug-scoper dispatch;
+# subtask 5's autonomy score counts these lines. Best-effort.
+_wd_fire() {
+  local condition="$1" issue="$2" reason="$3" lf
+  lf="$(_wd_ledger_file)"
+  mkdir -p "$(dirname "$lf")" 2>/dev/null || true
+  printf '{"ts":%s,"condition":"%s","issue":"%s","reason":"%s"}\n' \
+    "$(_wd_now)" "$(_wd_json_escape "$condition")" "$(_wd_json_escape "$issue")" \
+    "$(_wd_json_escape "$reason")" >> "$lf" 2>/dev/null || true
+  _wd_log "FIRING [$condition] #${issue} — ${reason}"
+}
+
+# --- the dispatcher -----------------------------------------------------------
+# _wd_run_conditions [now] -> run all 5 detectors; on each firing record it + take the scripted
+# intervention. Supervisor-dead is a single global check; the other four run per in-flight spoke.
+# Best-effort throughout: a missing drain reader (standalone watchdog) simply skips its condition.
+_wd_run_conditions() {
+  local now="${1:-$(_wd_now)}" state="${2:-$(_wd_drain_state)}" wt issue
+  # Use the drain state the loop already read (passed as $2) rather than re-probing — the loop
+  # reads it once per tick, and a second _wd_drain_state call would double-count under stubs.
+  if [ "$state" = "stale" ]; then
+    _wd_fire supervisor-dead "-" "drain supervisor heartbeat is stale — the drain crashed"
+    _wd_intervene_rearm
+  fi
+  command -v inflight_worktrees >/dev/null 2>&1 || return 0
+  while IFS=$'\t' read -r wt issue; do
+    [ -n "$issue" ] || continue
+    if _wd_detect_park_unanswered "$wt" "$issue" "$now"; then
+      _wd_fire park-unanswered "$issue" "drain left a parked spoke unanswered > ${HUB_WATCHDOG_PARK_CEILING}s"
+      _wd_intervene_answer "$wt" "$issue"
+    fi
+    if _wd_detect_dead_idle "$wt" "$issue" "$now"; then
+      _wd_fire dead-pane "$issue" "reaper missed a dead/idle pane (> ${HUB_WATCHDOG_IDLE_CEILING}s)"
+      _wd_intervene_revive "$wt" "$issue"
+    fi
+    if _wd_detect_stale_marker "$wt" "$issue"; then
+      _wd_fire stale-marker "$issue" "stale blocked/ marker the drain did not reconcile"
+      _wd_intervene_reconcile "$wt" "$issue"
+    fi
+    if _wd_detect_mergeable_skipped "$wt" "$issue" "$now"; then
+      _wd_fire auto-land-skipped "$issue" "mergeable branch un-landed > ${HUB_WATCHDOG_LAND_CEILING}s (escalate-only: human land)"
+      _wd_intervene_landmark "$wt" "$issue"
+    fi
+  done < <(inflight_worktrees)
+}
+
 # --- one tick -----------------------------------------------------------------
-# _wd_tick <drain-state> -> one supervision pass. In this subtask it observes and logs the
-# drain state; subtasks 3-5 add the 5 detectors, each firing → scripted intervention + a
-# defect-record line in the intervention-ledger + the autonomy tally.
+# _wd_tick <drain-state> -> one supervision pass: observe the drain, then run the 5 detection
+# conditions (each firing → a scripted intervention + a defect-record line in the ledger).
 _wd_tick() {
   local state="${1:-$(_wd_drain_state)}"
   _wd_log "tick: drain supervisor is ${state}"
-  # UPGRADE: run the 5 detection conditions here (subtask 3) — park-not-answered, dead-pane,
-  # stale-marker, mergeable-skipped, supervisor-dead — each recording an intervention firing.
+  _wd_run_conditions "$(_wd_now)" "$state"
 }
 
 # --- the daemon loop ----------------------------------------------------------
