@@ -3956,12 +3956,14 @@ def test_success_answer_quoted_irreversible_stays_flagged(
     assert "irreversible" in (statedir / "decision-journal.jsonl").read_text()
 
 
-def test_reasoned_terminal_arm_is_single_step_when_tick_prearmed(
+def test_broker_warn_continue_unconditionally_advances_backoff(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
-    # #241 review (Finding 3): the due-retry fall-through arms the backoff once and marks the tick
-    # (_AFK_ARMED_THIS_TICK); a reasoned terminal (broker_warn_continue) in that SAME tick must NOT
-    # advance the attempt counter a second time. A first-time escalation (flag unset) DOES arm.
+    # #241 review r2.2: broker_warn_continue must ALWAYS advance the warned-retry backoff. It is
+    # reached not only from broker_service_gate but also from hub-afk's reap/land/dispatch passes
+    # (_warn_parked_last), which have no per-tick reset — a suppression guard that skipped the arm
+    # there froze the next-due timestamp and re-warned every tick. Pin the monotonic-growth
+    # invariant the revert restored: repeated calls keep advancing the attempt counter.
     statedir = tmp_path / "sd"
     statedir.mkdir()
     env = {
@@ -3970,21 +3972,10 @@ def test_reasoned_terminal_arm_is_single_step_when_tick_prearmed(
         "AFK_WARN_BACKOFF_BASE": "60",
         "AFK_NOW": "1000",
     }
-    prearmed = _call(
-        "_afk_warned_arm 5; _AFK_ARMED_THIS_TICK=5; "
-        f"broker_warn_continue '{spoke_repo}' 5 escalate 'reasoned decline' reversible; "
+    result = _call(
+        f"broker_warn_continue '{spoke_repo}' 5 escalate 'first' reversible; "
+        f"broker_warn_continue '{spoke_repo}' 5 escalate 'second' reversible; "
         'IFS=$\'\\t\' read -r a _ < "$(_afk_warned_state_file 5)"; printf "attempt=%s\\n" "$a"',
         env=env,
     )
-    assert "attempt=1" in prearmed.stdout, prearmed.stdout + prearmed.stderr
-
-    statedir2 = tmp_path / "sd2"
-    statedir2.mkdir()
-    env2 = {**env, "AFK_STATE_DIR": str(statedir2)}
-    unarmed = _call(
-        "_afk_warned_arm 5; "  # attempt 0->1; tick NOT pre-armed
-        f"broker_warn_continue '{spoke_repo}' 5 escalate 'first escalation' reversible; "
-        'IFS=$\'\\t\' read -r a _ < "$(_afk_warned_state_file 5)"; printf "attempt=%s\\n" "$a"',
-        env=env2,
-    )
-    assert "attempt=2" in unarmed.stdout, unarmed.stdout + unarmed.stderr
+    assert "attempt=2" in result.stdout, result.stdout + result.stderr

@@ -1164,9 +1164,7 @@ broker_warn_continue() {
   local wt="$1" issue="$2" park="$3" decision="$4" rev="${5:-unknown}"
   broker_warn "$issue" "$decision"
   broker_journal_decision "$issue" "$park" "$decision" "$rev"
-  # Skip the arm when the due-retry fall-through already armed this tick (#241 review N3) so the
-  # backoff advances exactly one step per due-retry; a first-time escalation (flag unset) arms.
-  [ "${_AFK_ARMED_THIS_TICK:-}" = "$issue" ] || _afk_warned_arm "$issue"
+  _afk_warned_arm "$issue"
   afk_emit_decision "$wt" warn
   return 0
 }
@@ -1958,9 +1956,7 @@ _reason_permission_record() {
   local wt="$1" issue="$2" decision="$3" rev="$4"
   broker_warn "$issue" "$decision"
   _broker_journal_gh_comment "$issue" permission "$decision" "$rev"
-  # Skip the arm when the due-retry fall-through already armed this tick (#241 review N3) so the
-  # backoff advances exactly one step per due-retry; a first-time decision (flag unset) arms.
-  [ "${_AFK_ARMED_THIS_TICK:-}" = "$issue" ] || _afk_warned_arm "$issue"
+  _afk_warned_arm "$issue"
   afk_emit_decision "$wt" warn
 }
 
@@ -2506,12 +2502,6 @@ _broker_present_qcm() {
 # (or an answer we cannot inject) escalates rather than guessing.
 broker_service_gate() {
   local wt="$1" issue="$2" mode="${3:-unattended}" depth="${4:-0}" question orig_question raw rc decision kind text target was_gate=0 inject_diagnosed=0
-  # Per-tick single-arm guard (#241 review): the due-retry fall-through arms the backoff once so a
-  # MECHANICAL auto-approve (which neither arms nor clears) is still paced; when that same tick's
-  # terminal action self-arms (reasoned DENY, ESCALATE), it must NOT advance the counter a second
-  # time. Reset here (this global persists across the helper calls WITHIN one tick, not between
-  # ticks) so a reasoned path arms exactly once, matching the mechanical path.
-  _AFK_ARMED_THIS_TICK=""
   # Self-heal a stale gate tag (issue #204): if gate/<issue> is at the tip but the spoke
   # already resumed past its PLAN gate (a late / external / attended approval that never ran
   # the confirmed-inject path), consume the stale tag and stop — do NOT re-answer, and do NOT
@@ -2556,15 +2546,18 @@ broker_service_gate() {
     broker_warn "$issue" "re-answer backoff elapsed — one supervised retry on the same prompt (#241)"
     broker_journal_decision "$issue" ceiling "re-answer backoff elapsed; supervised retry" reversible
     # ARM the next (longer) backoff HERE, before the retry runs, so the pause is guaranteed
-    # regardless of the retry's OUTCOME. Not every fall-through terminal action re-arms — a
-    # MECHANICAL classifier auto-approve (line ~2065) that leaves the same (tip, park-sig) intact
-    # neither arms nor clears, so without this a re-appearing auto-approvable dialog would re-warn
-    # + re-run every tick (hub-review B1-cluster regression). Mark the tick as armed so a retry
-    # that DOES self-arm (reasoned DENY / ESCALATE) skips its own arm and the counter advances
-    # exactly ONE step per due-retry on every path — never two (#241 review N3). A success clears
-    # instead, which correctly wins over this arm.
-    _afk_warned_arm "$issue"; _AFK_ARMED_THIS_TICK="$issue"
-    # fall through for one supervised retry; the single arm above paces the next
+    # regardless of the retry's OUTCOME. This is the ONLY arm that paces a MECHANICAL classifier
+    # auto-approve (line ~2091) which, on success, leaves the same (tip, park-sig) intact and
+    # neither arms nor clears — without it a re-appearing auto-approvable dialog would re-warn +
+    # re-run every tick (hub-review B1-cluster regression). A retry that instead self-arms (reasoned
+    # DENY / ESCALATE) advances the counter a SECOND time; that double-step only GROWS the backoff
+    # (strictly more conservative, bounded by the cap) and is cleared the moment the tip advances
+    # (genuine progress), so it never strands a recoverable spoke. A guard that suppressed the
+    # second arm was tried and reverted (#241 review r2.2): a tick-scoped global leaked into the
+    # reap/land passes that also call broker_warn_continue and into the depth+1 recursion, which
+    # was strictly worse than the benign double-step it removed.
+    _afk_warned_arm "$issue"
+    # fall through for one supervised retry; the arm above paces the next
   fi
   # A pending permission dialog is decided by the rules classifier, not the answerer (#149).
   if _permission_pending "$wt"; then _decide_permission "$wt" "$issue"; return; fi
