@@ -903,6 +903,39 @@ def test_broker_service_gate_voids_commit_escape_on_gate_parked_spoke(
     assert "voiding its answer" in result.stderr, result.stderr
 
 
+def test_spoke_activity_appended_classifies_turns(spoke_repo: Path, tmp_path: Path) -> None:
+    # The #244 void discriminator: rc 0 when a genuine spoke turn (assistant tool_use / typed
+    # reply) appended, rc 1 when only a non-turn write did, rc 2 when the transcript is unreadable.
+    # The void gate treats BOTH rc 1 and rc 2 as a breach (fail SAFE), so rc 2 must be distinct.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    env = {"CLAUDE_PROJECTS_DIR": str(projects)}
+
+    jsonl.write_text(
+        json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Edit"}]}}
+        )
+        + "\n"
+    )
+    activity = _call(f"_spoke_activity_appended '{spoke_repo}' ''; echo RC=$?", env=env)
+    assert activity.stdout.strip().splitlines()[-1] == "RC=0", "an assistant tool_use is activity"
+
+    jsonl.write_text(  # a synthetic tool_result user record — a #240 non-turn write, not a turn
+        json.dumps({"type": "user", "message": {"content": [{"type": "tool_result"}]}}) + "\n"
+    )
+    non_turn = _call(f"_spoke_activity_appended '{spoke_repo}' ''; echo RC=$?", env=env)
+    assert non_turn.stdout.strip().splitlines()[-1] == "RC=1", "a non-turn write is not activity"
+
+    missing = _call(
+        f"_spoke_activity_appended '{spoke_repo}' ''; echo RC=$?",
+        env={"CLAUDE_PROJECTS_DIR": str(tmp_path / "nonexistent")},
+    )
+    assert missing.stdout.strip().splitlines()[-1] == "RC=2", (
+        "an unreadable transcript is rc 2 (unavailable) — the void gate voids on it, fail-safe"
+    )
+
+
 def test_broker_service_gate_isolates_reasoner_writes_from_live_tree(
     spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
 ) -> None:
