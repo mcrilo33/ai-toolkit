@@ -489,6 +489,9 @@ sync_mcp_servers() {
 # (issue #70) resolve in a synced target like their hub-status.sh siblings.
 # gate-sweep.sh ships so the land tail's conditional post-land sweep
 # (issue #124) can launch from the runtime dir.
+# travel-local.sh ships so `travel-local on|off|status` (issue #248) resolves in
+# a synced target; it lives at the toolkit-root scripts/, so it takes the loop's
+# default source case (src="$SCRIPT_DIR/$name") like the worktree scripts.
 # Sources: worktree-*.sh, spoke-push.sh, spoke-ready.sh and
 # telemetry-ingest-spoke.sh at the toolkit root scripts/, hub-status.sh,
 # hub-ready-watch.sh, hub-otel-watch.sh, hub-afk.sh and batch-plan.sh under
@@ -502,7 +505,7 @@ sync_workflow_scripts() {
     # hooks/lib/) so the worktree scripts can source them as siblings — see
     # worktree-lib.sh's telemetry and base-branch blocks.
     local name src
-    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh worktree-quick.sh spoke-push.sh spoke-ready.sh spoke-relaunch.sh gate-sweep.sh telemetry-ingest-spoke.sh hub-status.sh hub-ready-watch.sh hub-notify.sh hub-otel-watch.sh hub-afk.sh gate-broker.sh batch-plan.sh telemetry.sh base-branch.sh enabled.sh; do
+    for name in worktree-new.sh worktree-land.sh worktree-done.sh worktree-lib.sh worktree-quick.sh spoke-push.sh spoke-ready.sh spoke-relaunch.sh gate-sweep.sh travel-local.sh telemetry-ingest-spoke.sh hub-status.sh hub-ready-watch.sh hub-notify.sh hub-otel-watch.sh hub-afk.sh gate-broker.sh batch-plan.sh telemetry.sh base-branch.sh enabled.sh; do
         case "$name" in
             hub-status.sh|hub-ready-watch.sh|hub-notify.sh|hub-otel-watch.sh|hub-afk.sh|gate-broker.sh|batch-plan.sh) src="$SHARED_DIR/skills/hub/scripts/$name" ;;
             telemetry.sh|base-branch.sh|enabled.sh)      src="$SHARED_DIR/hooks/lib/$name" ;;
