@@ -321,9 +321,10 @@ fi
 # and `chmod +x` only. The staging tier (#149) seeds `git add:*` (worktree-confined)
 # and the non-destructive `git reset` unstage shapes ONLY — never the broad
 # `git reset:*`, which would hand over `git reset --hard` (a working-tree wipe).
-# Nothing else destructive or arbitrary-exec is seeded: no `python:*` / `python -c:*`
-# / `chmod:*` / `git tag:*` / `git push:*` / `git checkout|clean:*` /
-# `git reset --hard` / `rm` / `mv`.
+# The exec tier (#259) seeds `Bash(./:*)` so a compound self-op's `./<in-tree-script>`
+# segment is honored per-segment (see the rule's own comment for the always-on trade-off).
+# Nothing else destructive is seeded: no `python:*` / `python -c:*` / `chmod:*` (bare) /
+# `git tag:*` / `git push:*` / `git checkout|clean:*` / `git reset --hard` / `rm` / `mv`.
 ALLOW_RULES=(
   "Bash(bash .ai-toolkit/scripts/spoke-push.sh:*)"
   "Bash(bash .ai-toolkit/scripts/spoke-ready.sh:*)"
@@ -345,6 +346,23 @@ ALLOW_RULES=(
   "Bash(git add:*)"
   "Bash(git reset)" "Bash(git reset -q)"
   "Bash(git reset HEAD:*)" "Bash(git reset -q HEAD:*)"
+  # In-worktree self-script execution (#259). Claude Code evaluates a COMPOUND Bash command
+  # PER-SEGMENT against permissions.allow (precedence: deny > ask > allow > default-prompt),
+  # and a PreToolUse hook's whole-command `allow` does NOT satisfy that per-segment check. So
+  # the #253 afk-permission-hook — which classifies the WHOLE command and emits `allow` for a
+  # benign scoped self-op — could not suppress the dialog for the #238 smoke
+  # `chmod +x X && ./X`: `chmod +x X` matched the rule above but the `./X` segment matched no
+  # rule and re-prompted. Seeding `Bash(./:*)` covers that segment deterministically (the
+  # in-worktree exec lane classify_permission already APPROVEs, #240 — trusting the spoke to
+  # run its own in-tree scripts, no more dangerous than the seeded `pytest`).
+  #
+  # TRADE-OFF, on purpose: unlike the hook (self-limited to a live /afk drain), a settings
+  # rule is ALWAYS-ON — it auto-runs `./…` in ATTENDED sessions in this spoke worktree too,
+  # and its coarse prefix cannot express classify's worktree-confinement, so a `./../…`
+  # traversal is NOT rejected here. That residual is backstopped ONLY by the deny-scope hooks
+  # (rm/push/chmod/spoke-main guards — deny outranks allow, so they stay authoritative) and
+  # the pre-push ship gates, never by this ask. An honest cost for a deterministic no-dialog.
+  "Bash(./:*)"
   # Hub-root READ access (#181) — a spoke routinely studies hub scripts/hooks OUTSIDE its
   # own worktree (e.g. reading the hub's .git/hooks/pre-push to understand the push cage),
   # a write-free research read that otherwise fires a permission dialog and, unattended,

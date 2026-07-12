@@ -2163,6 +2163,13 @@ _decide_permission() {
 # (exit 0, no output), so the existing scope-guard hooks' denies remain authoritative and the
 # rare genuine escalation still falls through to the drain reasoner / pane path. (A2 — the hook
 # itself reasons and returns deny-with-reason to fully retire the pane — is a deferred follow-up.)
+#
+# COMPOUND LIMIT (#259): Claude Code evaluates a compound Bash command PER-SEGMENT against
+# permissions.allow (deny > ask > allow > default-prompt), and this whole-command `allow` does
+# NOT satisfy that per-segment check. So the hook suppresses the dialog only for a STANDALONE
+# benign op; a compound whose tail segment matches no allow rule (the #238 `chmod +x X && ./X`)
+# still prompts despite the allow. The deterministic layer for that class is worktree-new.sh's
+# dispatch-time exec-lane seed (`Bash(./:*)`) — this fn stays the standalone + #241-journal path.
 
 # _afk_supervisor_live <wt> -> rc 0 when a LIVE /afk supervisor heartbeat governs <wt>. This is
 # the hook's self-limit: it auto-approves ONLY inside a running drain, never in an attended

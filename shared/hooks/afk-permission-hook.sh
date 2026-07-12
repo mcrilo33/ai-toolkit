@@ -20,6 +20,15 @@
 #   .afk-heartbeat supervisor) on an issue-numbered spoke branch, so an attended session and
 #   the hub checkout are never silently auto-approved. See afk_permission_hook_decide.
 #
+# COMPOUND LIMIT (#259) — Claude Code evaluates a COMPOUND Bash command PER-SEGMENT against
+#   permissions.allow (precedence: deny > ask > allow > default-prompt), and this hook's
+#   whole-command `allow` does NOT satisfy that per-segment check. So the hook reliably
+#   suppresses the dialog only for a STANDALONE benign op; for a compound whose tail segment
+#   matches no allow rule (e.g. the #238 smoke `chmod +x X && ./X`, where `./X` matches
+#   nothing) the dialog still shows despite this hook's allow. The DETERMINISTIC fix for that
+#   class lives in worktree-new.sh, which seeds the exec-lane rule `Bash(./:*)` at dispatch so
+#   CC honors the `./…` segment. This hook stays as the standalone-op / audit-journal layer.
+#
 # DISCIPLINE — best-effort, ALWAYS exit 0. A PreToolUse allow-only hook must never fail a
 #   session; every gap (no gate-broker, no python3, no git) degrades to a silent no-op → the
 #   user's normal permission prompt stays the backstop.
