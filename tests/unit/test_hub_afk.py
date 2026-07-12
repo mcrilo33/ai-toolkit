@@ -7778,3 +7778,119 @@ def test_off_clears_the_arm_epoch(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert not epoch.exists(), "afk_clear_state must remove the arm-epoch file"
+
+
+# ── #252: synchronous off (`--off --wait`) ─────────────────────────────────────
+# `--off` is asynchronous: it clears state, but the supervisor only exits at its next tick. A
+# scripted recycle (the #250 self-update protocol's off->sync->arm) needs a BLOCKING off that
+# returns only once the supervisor is actually gone. `--off --wait` reads the heartbeat pid
+# before clearing, then polls it to death bounded by AFK_OFF_WAIT_SECONDS (nonzero on timeout),
+# nudging a wake-capable supervisor with SIGUSR1 so it re-checks the loop-top supersede at once.
+
+
+def test_wait_supervisor_gone_zero_for_dead_pid(tmp_path: Path) -> None:
+    # A pid that was never alive (a reaped subshell) is already gone -> return 0 immediately.
+    result = _call('dead=$(bash -c "echo \\$$"); afk_wait_supervisor_gone "$dead" ""; echo RC=$?')
+
+    assert "RC=0" in result.stdout, result.stderr
+
+
+@pytest.mark.parametrize("pid", ["", "abc"])
+def test_wait_supervisor_gone_zero_for_empty_or_garbage_pid(pid: str) -> None:
+    result = _call(f'afk_wait_supervisor_gone "{pid}" ""; echo RC=$?')
+
+    assert "RC=0" in result.stdout, result.stderr
+
+
+def test_wait_supervisor_gone_zero_when_process_exits(tmp_path: Path) -> None:
+    # A live pid that exits within the bound -> return 0 (the supervisor went away).
+    result = _call(
+        'sleep 2 & pid=$!; afk_wait_supervisor_gone "$pid" ""; echo RC=$?',
+        env={"AFK_OFF_WAIT_SECONDS": "8"},
+    )
+
+    assert "RC=0" in result.stdout, result.stderr
+
+
+def test_wait_supervisor_gone_nonzero_on_timeout(tmp_path: Path) -> None:
+    # A live pid that outlasts the bound -> nonzero (timeout). The sleeper is killed afterward so
+    # the test leaks nothing.
+    result = _call(
+        'sleep 30 & pid=$!; afk_wait_supervisor_gone "$pid" ""; rc=$?; '
+        'kill "$pid" 2>/dev/null; echo RC=$rc',
+        env={"AFK_OFF_WAIT_SECONDS": "1"},
+    )
+
+    assert "RC=1" in result.stdout, result.stderr
+
+
+def test_wait_supervisor_gone_nudges_wake_capable(tmp_path: Path) -> None:
+    # A wake-capable heartbeat (the `wake1` token) is SIGUSR1-nudged so it steps down at once: the
+    # sleeper would outlast the bound, but the USR1 kills it well inside AFK_OFF_WAIT_SECONDS.
+    result = _call(
+        'bash -c "sleep 30" & pid=$!; '
+        'afk_wait_supervisor_gone "$pid" "$pid 1700000000 wake1"; rc=$?; '
+        'kill "$pid" 2>/dev/null; echo RC=$rc',
+        env={"AFK_OFF_WAIT_SECONDS": "8"},
+    )
+
+    assert "RC=0" in result.stdout, "a wake-capable supervisor must be nudged, not time out"
+
+
+def test_off_wait_blocks_until_gone_and_clears_state(tmp_path: Path) -> None:
+    # End to end: `--off --wait` clears state, then blocks until the heartbeat pid dies (bounded),
+    # returning 0. A short-lived sleeper stands in for a supervisor exiting on its supersede check.
+    state = _armed_state(tmp_path, "drain")
+    hb = tmp_path / "heartbeat"
+    expr = (
+        f'sleep 1 & pid=$!; printf "%s 1700000000 wake1\\n" "$pid" > "{hb}"; '
+        "main --off --wait; echo RC=$?"
+    )
+    result = _call(
+        expr,
+        env={
+            "AFK_STATE": str(state),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_OFF_WAIT_SECONDS": "8",
+        },
+    )
+
+    assert "RC=0" in result.stdout, result.stderr
+    assert not state.exists(), "--off must clear the state file even in --wait mode"
+
+
+def test_off_wait_times_out_returns_nonzero(tmp_path: Path) -> None:
+    # `--off --wait` still clears state, but returns NONZERO when the supervisor outlasts the
+    # bound (AC2), so a scripted recycle can detect a stuck/wedged supervisor rather than racing.
+    state = _armed_state(tmp_path, "drain")
+    hb = tmp_path / "heartbeat"
+    expr = (
+        f'sleep 30 & pid=$!; printf "%s 1700000000\\n" "$pid" > "{hb}"; '
+        'main --off --wait; rc=$?; kill "$pid" 2>/dev/null; echo RC=$rc'
+    )
+    result = _call(
+        expr,
+        env={
+            "AFK_STATE": str(state),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_OFF_WAIT_SECONDS": "1",
+        },
+    )
+
+    assert "RC=1" in result.stdout, result.stderr
+    assert not state.exists(), "--off --wait must still clear state on timeout"
+
+
+def test_off_without_wait_returns_immediately(tmp_path: Path) -> None:
+    # Plain `--off` (no --wait) must NOT block on a still-live supervisor: it clears state and
+    # returns 0 at once (the supervisor exits on its own next tick / supersede).
+    state = _armed_state(tmp_path, "drain")
+    hb = tmp_path / "heartbeat"
+    expr = (
+        f'sleep 30 & pid=$!; printf "%s 1700000000\\n" "$pid" > "{hb}"; '
+        'main --off; rc=$?; kill "$pid" 2>/dev/null; echo RC=$rc'
+    )
+    result = _call(expr, env={"AFK_STATE": str(state), "AFK_HEARTBEAT": str(hb)})
+
+    assert "RC=0" in result.stdout, result.stderr
+    assert not state.exists()
