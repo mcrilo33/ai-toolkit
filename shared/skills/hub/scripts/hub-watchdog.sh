@@ -58,24 +58,29 @@ _WD_SELF="$HUB_WATCHDOG_SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 # --- source worktree-lib.sh (wt_source_hash, wt_realpath) + hub-inject.sh ------
 # Same dual-layout ladder as the hub siblings: the checkout (scripts/ four levels up) and a
 # synced .ai-toolkit/scripts/ target (co-located). HUB_WATCHDOG_WT_LIB / AFK_WT_LIB win for tests.
+# Every loop below captures the resolved path BEFORE `. "$cand"` and uses a WD-prefixed loop
+# variable: a sourced lib's own preamble may run an `unset _cand` (gate-broker unconditionally,
+# hub-inject when it also sources worktree-lib) that would otherwise clobber a shared-name loop
+# var mid-iteration and hit an unbound-variable error under set -u.
 _WD_TOPLEVEL="${_WD_TOPLEVEL:-$(git rev-parse --show-toplevel 2>/dev/null || true)}"
 _WD_RESOLVED_WT_LIB=""
-for _cand in \
+for _wdwl in \
   "${HUB_WATCHDOG_WT_LIB:-}" \
   "${AFK_WT_LIB:-}" \
   "$HUB_WATCHDOG_SCRIPT_DIR/worktree-lib.sh" \
   "$HUB_WATCHDOG_SCRIPT_DIR/../../../../scripts/worktree-lib.sh" \
   "${_WD_TOPLEVEL:+$_WD_TOPLEVEL/scripts/worktree-lib.sh}" \
   "${_WD_TOPLEVEL:+$_WD_TOPLEVEL/.ai-toolkit/scripts/worktree-lib.sh}"; do
-  if [ -n "$_cand" ] && [ -f "$_cand" ]; then . "$_cand"; _WD_RESOLVED_WT_LIB="$_cand"; break; fi
+  if [ -n "$_wdwl" ] && [ -f "$_wdwl" ]; then _WD_RESOLVED_WT_LIB="$_wdwl"; . "$_wdwl"; break; fi
 done
-unset _cand
+unset _wdwl 2>/dev/null || true
 # hub-inject.sh — the shared injector the watchdog's answer/revive interventions use (a
 # co-located sibling). Sourced best-effort; a detector that needs it existence-checks first.
 _WD_RESOLVED_INJECT=""
-for _cand in "${AFK_HUB_INJECT:-}" "$HUB_WATCHDOG_SCRIPT_DIR/hub-inject.sh"; do
-  if [ -n "$_cand" ] && [ -f "$_cand" ]; then . "$_cand"; _WD_RESOLVED_INJECT="$_cand"; break; fi
+for _wdinj in "${AFK_HUB_INJECT:-}" "$HUB_WATCHDOG_SCRIPT_DIR/hub-inject.sh"; do
+  if [ -n "$_wdinj" ] && [ -f "$_wdinj" ]; then _WD_RESOLVED_INJECT="$_wdinj"; . "$_wdinj"; break; fi
 done
+unset _wdinj 2>/dev/null || true
 unset _cand
 # gate-broker.sh — the drain's state-reader API (inflight_worktrees, slot_state, the
 # answer-attempt/progress epochs, _afk_state_dir) the detectors cross-check against the SAME
