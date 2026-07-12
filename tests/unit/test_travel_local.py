@@ -93,9 +93,13 @@ def env(tmp_path: Path) -> Iterator[TravelEnv]:
         'while [ "$1" = "-n" ] || [ "$1" = "-A" ]; do shift; done\n'
         'exec "$@"\n',
     )
+    # Default stub stays alive (sleep); STUB_CAFFEINATE=die models a daemon that launches
+    # but exits at once, so the post-launch liveness re-check must catch it.
     _write_stub(
         bindir / "caffeinate",
-        f'echo "caffeinate $*" >> "{log}"\nexec sleep 300\n',
+        f'echo "caffeinate $*" >> "{log}"\n'
+        'if [ "${STUB_CAFFEINATE:-alive}" = "die" ]; then exit 1; fi\n'
+        "exec sleep 300\n",
     )
     _write_stub(bindir / "curl", f'echo "curl $*" >> "{log}"\nexit "${{STUB_CURL_RC:-0}}"\n')
 
@@ -198,8 +202,9 @@ def test_on_happy_path_joins_verifies_disablesleep_and_caffeinates(env) -> None:
     assert "networksetup -setairportnetwork en0 Mathieu iPhone" in calls
     assert "curl" in calls
     assert "pmset -a disablesleep 1" in calls
-    # The pidfile (written synchronously by the launcher) is the deterministic proof the
-    # caffeinate daemon was started — the daemon's own call-log line is async.
+    # start_caffeinate's post-launch settle means the daemon has run (and logged) before the
+    # run returns, so its call-log line is a deterministic check that caffeinate -s was invoked.
+    assert "caffeinate -s" in calls
     assert env.pidfile.read_text().strip(), "caffeinate pid not recorded"
     assert "lid-close safe" in proc.stdout.lower()
 
@@ -221,6 +226,19 @@ def test_on_rolls_back_disablesleep_when_caffeinate_unavailable(env) -> None:
     # It flipped disablesleep on, then rolled it back before exiting.
     assert "pmset -a disablesleep 1" in calls
     assert "pmset -a disablesleep 0" in calls
+
+
+def test_on_rolls_back_disablesleep_when_caffeinate_dies_after_launch(env) -> None:
+    # The daemon launches but exits immediately; a 1s settle makes the exit certain before
+    # the liveness re-check, so the rollback path is exercised deterministically.
+    proc = env.run("on", STUB_CAFFEINATE="die", AFK_TRAVEL_SETTLE="1")
+
+    assert proc.returncode != 0
+    calls = _calls(env)
+    assert "pmset -a disablesleep 1" in calls
+    assert "pmset -a disablesleep 0" in calls
+    # A launch that died leaves no live pidfile behind.
+    assert not env.pidfile.exists()
 
 
 def test_on_is_idempotent_reusing_a_live_caffeinate(env) -> None:

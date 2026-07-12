@@ -27,22 +27,27 @@
 #
 # Test seams (env overrides): AFK_TRAVEL_CONF, AFK_TRAVEL_WIFI_DEV, AFK_TRAVEL_PIDFILE,
 # AFK_TRAVEL_API_URL, AFK_TRAVEL_JOIN_RETRIES, AFK_TRAVEL_JOIN_DELAY, AFK_TRAVEL_CAFFEINATE,
-# AFK_GATE_BROKER, AFK_HUB_AFK, AFK_STATE_DIR.
+# AFK_TRAVEL_SETTLE, AFK_GATE_BROKER, AFK_HUB_AFK, AFK_STATE_DIR.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TOPLEVEL="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+# Anchor the hub root to the SCRIPT's checkout, not the invocation cwd — on/off/status
+# must resolve the same repo (pidfile, afk state, worktrees) no matter where they run from.
+HUB_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
 
 info() { printf '%s\n' "$*" >&2; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf '%s\n' "$*" >&2; exit 1; }
+
+# _conf_path -> the config file path (~/.afk-travel unless overridden).
+_conf_path() { printf '%s\n' "${AFK_TRAVEL_CONF:-$HOME/.afk-travel}"; }
 
 # --- config -------------------------------------------------------------------
 
 # require_conf -> source ~/.afk-travel and guarantee TRAVEL_HOTSPOT_SSID; refuse (with the
 # exact fix) when the file is missing or the SSID is unset. Used by `on`.
 require_conf() {
-  local conf="${AFK_TRAVEL_CONF:-$HOME/.afk-travel}"
+  local conf; conf="$(_conf_path)"
   if [ ! -f "$conf" ]; then
     die "travel-local on: ~/.afk-travel missing — create it with TRAVEL_HOTSPOT_SSID='<your iPhone hotspot SSID>' (see docs/travel-local.md)"
   fi
@@ -56,7 +61,7 @@ require_conf() {
 # load_conf_optional -> source ~/.afk-travel when present (for TRAVEL_HOME_SSID); `off` and
 # `status` still work without it, so a missing file is not an error here.
 load_conf_optional() {
-  local conf="${AFK_TRAVEL_CONF:-$HOME/.afk-travel}"
+  local conf; conf="$(_conf_path)"
   # shellcheck disable=SC1090
   [ -f "$conf" ] && . "$conf" 2>/dev/null || true
 }
@@ -66,14 +71,21 @@ load_conf_optional() {
 # wifi_dev -> the Wi-Fi hardware port's BSD device (e.g. en0), or empty.
 wifi_dev() {
   if [ -n "${AFK_TRAVEL_WIFI_DEV:-}" ]; then printf '%s\n' "$AFK_TRAVEL_WIFI_DEV"; return; fi
-  networksetup -listallhardwareports 2>/dev/null | awk '/Wi-Fi/{getline; print $2; exit}'
+  # LC_ALL=C: parse the system tool's output by its English keyword regardless of host locale.
+  LC_ALL=C networksetup -listallhardwareports 2>/dev/null | awk '/Wi-Fi/{getline; print $2; exit}'
 }
 
-# current_ssid <dev> -> the joined SSID, or "unknown".
+# current_ssid <dev> -> the joined SSID, "not connected" when unassociated, or "unknown".
 current_ssid() {
-  local dev="$1"
+  local dev="$1" out
   [ -n "$dev" ] || { printf 'unknown\n'; return; }
-  networksetup -getairportnetwork "$dev" 2>/dev/null | sed 's/^Current Wi-Fi Network: //'
+  out="$(LC_ALL=C networksetup -getairportnetwork "$dev" 2>/dev/null)"
+  # macOS prints "Current Wi-Fi Network: <ssid>" when joined, else a sentence like
+  # "You are not associated with an AirPort network." — don't pass that through as an SSID.
+  case "$out" in
+    "Current Wi-Fi Network: "*) printf '%s\n' "${out#Current Wi-Fi Network: }" ;;
+    *)                          printf 'not connected\n' ;;
+  esac
 }
 
 # join_hotspot <dev> <ssid> -> retry the join (the hotspot only broadcasts while Personal
@@ -83,7 +95,7 @@ join_hotspot() {
   local retries="${AFK_TRAVEL_JOIN_RETRIES:-8}" delay="${AFK_TRAVEL_JOIN_DELAY:-3}"
   for (( i = 1; i <= retries; i++ )); do
     if networksetup -setairportnetwork "$dev" "$ssid"; then return 0; fi
-    sleep "$delay"
+    if [ "$i" -lt "$retries" ]; then sleep "$delay"; fi
   done
   return 1
 }
@@ -112,12 +124,15 @@ verify_connectivity() {
 set_disablesleep() { sudo pmset -a disablesleep "$1"; }
 
 read_disablesleep() {
-  pmset -g 2>/dev/null | awk '/SleepDisabled/{print $NF; f=1} END{if (!f) print "unknown"}'
+  LC_ALL=C pmset -g 2>/dev/null | awk '/SleepDisabled/{print $NF; f=1} END{if (!f) print "unknown"}'
 }
 
 caffeinate_pidfile() {
   if [ -n "${AFK_TRAVEL_PIDFILE:-}" ]; then printf '%s\n' "$AFK_TRAVEL_PIDFILE"; return; fi
-  local common; common="$(git rev-parse --git-common-dir 2>/dev/null)" || common=".git"
+  # An ABSOLUTE common dir so on/off/status agree from any cwd — `--git-common-dir` is
+  # cwd-relative (`.git`) in a main checkout, which would resolve a different pidfile per cwd.
+  local common; common="$(git -C "${HUB_ROOT:-$SCRIPT_DIR}" rev-parse --absolute-git-dir 2>/dev/null)" \
+    || common="${HUB_ROOT:-$SCRIPT_DIR}/.git"
   printf '%s\n' "$common/.afk-travel-caffeinate.pid"
 }
 
@@ -129,10 +144,12 @@ caffeinate_live() {
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
 }
 
-# start_caffeinate -> launch a detached `caffeinate -s` and record its pid. Idempotent: a
-# live caffeinate is reused. rc 1 when the binary is unavailable (so the caller rolls back
-# disablesleep rather than leave the Mac half-configured). AFK_TRAVEL_CAFFEINATE overrides
-# the binary name (tests inject an absent name to exercise the rollback).
+# start_caffeinate -> launch a detached `caffeinate -s`, record its pid, and confirm it
+# actually stayed up. Idempotent: a live caffeinate is reused. rc 1 (pidfile cleared) when
+# the binary is unavailable OR the launch died immediately — so the caller rolls back
+# disablesleep rather than leave the Mac half-configured and falsely report "holding".
+# AFK_TRAVEL_CAFFEINATE overrides the binary name (tests inject an absent name to exercise
+# the rollback); AFK_TRAVEL_SETTLE tunes the post-launch settle before the liveness re-check.
 start_caffeinate() {
   local pf pid bin; pf="$(caffeinate_pidfile)"; bin="${AFK_TRAVEL_CAFFEINATE:-caffeinate}"
   if caffeinate_live; then return 0; fi
@@ -142,6 +159,10 @@ start_caffeinate() {
   "$bin" -s </dev/null >/dev/null 2>&1 &
   pid=$!
   printf '%s\n' "$pid" > "$pf"
+  sleep "${AFK_TRAVEL_SETTLE:-0.3}"
+  if kill -0 "$pid" 2>/dev/null; then return 0; fi
+  rm -f "$pf"
+  return 1
 }
 
 # stop_caffeinate -> kill the recorded caffeinate and drop the pidfile. Idempotent.
@@ -184,6 +205,9 @@ refresh_spoke_epochs() {
     return 0
   fi
   (
+    # Anchor cwd to the hub checkout so the broker's `git rev-parse --git-common-dir` and
+    # inflight_worktrees resolve the hub's .git / worktrees, not the invocation cwd's.
+    [ -n "${HUB_ROOT:-}" ] && cd "$HUB_ROOT" 2>/dev/null || true
     # shellcheck disable=SC1090
     . "$broker" 2>/dev/null || exit 0
     while read -r issue; do
@@ -198,7 +222,9 @@ refresh_spoke_epochs() {
 
 cmd_on() {
   require_conf
-  local dev; dev="$(wifi_dev)"
+  # `|| true`: wifi_dev ends in a pipeline, so under pipefail a networksetup failure would
+  # abort the assignment before the explicit empty-check below could give its clear message.
+  local dev; dev="$(wifi_dev)" || true
   [ -n "$dev" ] || die "travel-local on: could not resolve the Wi-Fi device"
 
   info "joining hotspot '$TRAVEL_HOTSPOT_SSID'..."
@@ -223,7 +249,9 @@ cmd_on() {
 
 cmd_off() {
   load_conf_optional
-  set_disablesleep 0
+  # Every step is best-effort: the spoke-clock refresh is the whole point of `off`, so a
+  # failing pmset/kill/Wi-Fi step must never `set -e`-abort the run before it stamps them.
+  set_disablesleep 0 || warn "could not clear disablesleep (is passwordless pmset configured?)"
   stop_caffeinate
   restore_wifi
   refresh_spoke_epochs
@@ -232,7 +260,7 @@ cmd_off() {
 
 cmd_status() {
   load_conf_optional
-  local dev; dev="$(wifi_dev)"
+  local dev; dev="$(wifi_dev)" || true
   echo "disablesleep: $(read_disablesleep)"
   if caffeinate_live; then
     echo "caffeinate: running (pid $(cat "$(caffeinate_pidfile)"))"
