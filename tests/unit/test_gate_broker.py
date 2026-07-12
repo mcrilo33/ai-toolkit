@@ -3675,3 +3675,120 @@ def test_mutation_void_warns_not_blocks(
     assert "--blocked 5" not in log, "a voided mutation must warn-and-continue, not park"
     assert "WARNING: #5" in result.stderr, result.stderr
     assert (statedir / "warned-5.txt").exists()
+
+
+# ── issue #241 hub-review: journal-before-inject + success-path WARN journaling ──
+
+
+def test_permission_approve_journals_before_inject(spoke_repo: Path, tmp_path: Path) -> None:
+    # BLOCKER 1: the reasoner-APPROVE decision must be journaled BEFORE approve_permission
+    # delivers the "Yes" keypress — so the audit record can never be lost if the inject crashes
+    # or races the command it authorized. The fake tmux records, at the moment the approve "1"
+    # keystroke fires, whether the journal line already exists.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    journal = statedir / "decision-journal.jsonl"
+    probe = tmp_path / "probe"
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    (pd / "session.jsonl").write_text(json.dumps(_bash_tool_record("npm run deploy")) + "\n")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        "  send-keys)\n"
+        f'    case "$*" in *" 1") [ -f "{journal}" ] && echo EXISTS >> "{probe}" || echo MISSING >> "{probe}" ;; esac ;;\n'
+        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        "esac\nexit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE_DIR": str(statedir),
+        "SPOKE_READY": str(ready_stub),
+        "AFK_ANSWERER_CMD": "printf 'REVERSIBILITY: reversible\\nANSWER: APPROVE'",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_INJECT_POLL_SECONDS": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    assert probe.read_text().strip() == "EXISTS", (
+        "the decision must be journaled BEFORE the approve keystroke fires"
+    )
+    assert journal.exists() and "reasoner APPROVED" in journal.read_text()
+
+
+def test_success_answer_journals_warn_and_reversibility(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # BLOCKER 2: a successful main answer whose reasoner reply carries a WARN / non-reversible
+    # class is recorded for morning review — a loud warned record AND a journal line.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    fake_bin = tmp_path / "bin"
+    jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # pin old so the inject's append advances it
+    _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": (
+            "printf 'REVERSIBILITY: irreversible\\nWARN: double-check the migration\\nANSWER: proceed with Redis'"
+        ),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    assert (statedir / "warned-5.txt").exists(), "a WARN-flagged answer must warn for review"
+    journal = (statedir / "decision-journal.jsonl").read_text()
+    assert "irreversible" in journal and "double-check the migration" in journal
+
+
+def test_success_answer_routine_journals_file_only(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # WARNING: a routine (reversible, no-WARN) successful answer journals to the per-run FILE
+    # but does NOT gh-comment (that would be per-answer noise) and does NOT warn.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    fake_bin = tmp_path / "bin"
+    jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+    _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
+    gh_log = tmp_path / "gh.log"
+    (fake_bin / "gh").write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{gh_log}"\n')
+    (fake_bin / "gh").chmod(0o755)
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": "printf 'REVERSIBILITY: reversible\\nANSWER: use Redis'",
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        # NB: AFK_JOURNAL_GH_COMMENT left ON — the routine path must still not comment.
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    assert (statedir / "decision-journal.jsonl").exists(), "a routine answer still journals (file)"
+    assert not (statedir / "warned-5.txt").exists(), "a routine answer must NOT warn"
+    assert not gh_log.exists() or "issue comment" not in gh_log.read_text(), (
+        "a routine answer must NOT post a gh comment"
+    )

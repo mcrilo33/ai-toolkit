@@ -363,6 +363,14 @@ _task_output_mtime() {
 # These signals EXTEND the idle reference only — the wall-clock ceiling (#133) is checked
 # separately and stays untouched. Empty when no reference exists (same "can't measure"
 # contract as _transcript_idle_seconds).
+#
+# #241 review N2: folding the answer-attempt epoch into the idle reference is the DELIBERATE
+# #133 trade-off — a spoke sitting on a buffered/undelivered answer (or a frozen-but-alive
+# claude whose inject didn't land) reads BUSY, so the reaper never kills it mid-delivery. This
+# does NOT strand such a spoke: the separate WALL-CLOCK ceiling (_spoke_over_any_ceiling,
+# AFK_SPOKE_MAX_MINUTES × the hard multiplier) ignores the answer-attempt fold and still fires,
+# and under #241 §7 that ceiling REVIVES the spoke (kill + relaunch) rather than abandoning it.
+# So the fold is safe by construction and is intentionally NOT gated on inject success.
 _spoke_idle_seconds() {
   local wt="$1" issue="$2" ref attempt task
   ref="$(_transcript_mtime "$wt")"
@@ -1039,12 +1047,12 @@ _broker_json_escape() {
   printf '%s' "$s" | LC_ALL=C tr -d '\000-\037'
 }
 
-# broker_journal_decision <issue> <park_kind> <decision> <reversibility> [reasoning_ref] ->
-# append one structured JSONL record (ts, issue, park, decision, reversibility, reasoning_ref)
-# AND post a best-effort GitHub issue comment, so the morning review reads either surface.
-# reversibility is one of reversible|outward|scope|irreversible|unknown. Best-effort; never
-# aborts the caller.
-broker_journal_decision() {
+# _broker_journal_line <issue> <park_kind> <decision> <reversibility> [reasoning_ref] -> append
+# ONE structured JSONL record (ts, issue, park, decision, reversibility, reasoning_ref) to the
+# per-run journal FILE — and nothing else. This is the cheap, no-noise audit surface: a routine
+# successful answer journals here WITHOUT a GitHub comment (per-answer comments would be spam).
+# Best-effort; never aborts the caller.
+_broker_journal_line() {
   local issue="$1" park="$2" decision="$3" rev="${4:-unknown}" ref="${5:-}" f
   f="$(_broker_journal_file)"
   mkdir -p "$(dirname "$f")" 2>/dev/null || true
@@ -1052,6 +1060,16 @@ broker_journal_decision() {
     "$(afk_now)" "$(_broker_json_escape "$issue")" "$(_broker_json_escape "$park")" \
     "$(_broker_json_escape "$decision")" "$(_broker_json_escape "$rev")" \
     "$(_broker_json_escape "$ref")" >>"$f" 2>/dev/null || true
+}
+
+# broker_journal_decision <issue> <park_kind> <decision> <reversibility> [reasoning_ref] ->
+# journal the record (file) AND post a best-effort GitHub issue comment, so the morning review
+# reads either surface. Used for NOTEWORTHY decisions (a warned/parked call, a WARN-flagged or
+# non-reversible answer) — a routine successful answer uses _broker_journal_line (file only).
+# reversibility is one of reversible|outward|scope|irreversible|unknown. Best-effort; never aborts.
+broker_journal_decision() {
+  local issue="$1" park="$2" decision="$3" rev="${4:-unknown}"
+  _broker_journal_line "$@"
   _broker_journal_gh_comment "$issue" "$park" "$decision" "$rev"
   return 0
 }
@@ -1981,11 +1999,17 @@ path to tell the spoke>'."
   # decisions.log — that log codifies only the MECHANICAL classifier (#155 D).
   case "$text" in
     APPROVE*)
+      # #241 review B1: JOURNAL the taken decision BEFORE approve_permission delivers the
+      # keypress, so the audit record can never be lost if the inject crashes/races the command
+      # it just authorized. Then warn + span on the RESULT.
+      broker_journal_decision "$issue" permission "reasoner APPROVED: $cmd" "${rev:-unknown}"
       if approve_permission "$wt"; then
-        broker_warn_continue "$wt" "$issue" permission "reasoner APPROVED: $cmd" "${rev:-unknown}"
+        broker_warn "$issue" "reasoner APPROVED: $cmd"
       else
-        broker_warn_continue "$wt" "$issue" permission "reasoner APPROVED but delivery failed: $cmd" "${rev:-unknown}"
-      fi ;;
+        broker_warn "$issue" "reasoner APPROVED but delivery failed: $cmd"
+      fi
+      _afk_warned_arm "$issue"
+      afk_emit_decision "$wt" warn ;;
     *)
       # DENY, or any reply that does not clearly approve — the safe default is to decline. Only a
       # DENY-prefixed reply carries guidance (with or without the colon); anything else uses the
@@ -2493,8 +2517,11 @@ broker_service_gate() {
     if ! _afk_warned_due "$issue"; then return 0; fi   # inside the backoff window → parked LAST
     broker_warn "$issue" "re-answer backoff elapsed — one supervised retry on the same prompt (#241)"
     broker_journal_decision "$issue" ceiling "re-answer backoff elapsed; supervised retry" reversible
-    _afk_warned_arm "$issue"
-    # fall through for one supervised retry; the now-longer backoff paces the next
+    # NB: do NOT arm the backoff here (#241 review N1). The fall-through's terminal action arms it
+    # exactly once — the chokepoint (broker_warn_continue) if the retry re-escalates, the B1 path
+    # if it reasons a permission, or _afk_clear_warned if the retry injects successfully — so the
+    # attempt counter advances a single step per due retry, never two.
+    # fall through for one supervised retry; the (single) re-arm below paces the next
   fi
   # A pending permission dialog is decided by the rules classifier, not the answerer (#149).
   if _permission_pending "$wt"; then _decide_permission "$wt" "$issue"; return; fi
@@ -2600,6 +2627,19 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
           log "  injected answer into #$issue"
           _consume_gate_tag "$wt" "$issue"
           _afk_clear_warned "$issue"   # #241: genuine progress → drop this issue's warned-retry backoff
+          # #241 review B2: record the taken answer for morning review. Read the reasoner's own
+          # 'WARN:' note and 'REVERSIBILITY:' class off the reply. A WARN or a non-reversible class
+          # is a NOTEWORTHY decision → a loud warned record + a journal line WITH a gh comment. A
+          # routine reversible answer is a cheap FILE-ONLY journal line (no per-answer gh spam).
+          local ans_rev ans_warn
+          ans_rev="$(parse_decision_field "$raw" REVERSIBILITY)"
+          ans_warn="$(parse_decision_field "$raw" WARN)"
+          if [ -n "$ans_warn" ] || { [ -n "$ans_rev" ] && [ "$ans_rev" != reversible ]; }; then
+            broker_warn "$issue" "answered [${ans_rev:-unknown}]${ans_warn:+ — WARN: $ans_warn}"
+            broker_journal_decision "$issue" answer "injected answer${ans_warn:+ (WARN: $ans_warn)}" "${ans_rev:-unknown}"
+          else
+            _broker_journal_line "$issue" answer "injected answer (routine)" "${ans_rev:-reversible}"
+          fi
           afk_emit_decision "$wt" success
           return 0
         elif [ "$rc" -eq 2 ] && command -v respawn_wedged_spoke >/dev/null 2>&1 && respawn_wedged_spoke "$wt" "$issue" "$text"; then
