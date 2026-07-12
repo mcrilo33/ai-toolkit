@@ -107,6 +107,11 @@ def apply_mode_lane_tags(batch: list[IngestEvent], mode: str, lane: str) -> None
     metadata["lane"] = lane
 
 
+def apply_repo_tag(batch: list[IngestEvent], repo: str | None) -> None:
+    """RED stub (#231) — GREEN attaches the ``repo:<name>`` trace tag + bare metadata."""
+    return None
+
+
 def read_outcome(root: Path) -> str | None:
     """Return the spoke's terminal outcome from its ``.ai-toolkit/outcome`` pointer, or None (#231).
 

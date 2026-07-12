@@ -175,3 +175,16 @@ def test_prometheus_sink_listens_on_a_port_distinct_from_the_receivers() -> None
         _port(receivers["otlp/beta"]["protocols"]["http"]["endpoint"]),
     }
     assert prom_port not in receiver_ports, "Prometheus port must not collide with a receiver"
+
+
+def test_environment_stamped_on_spans() -> None:
+    # #231: every real spoke span is stamped langfuse.environment so a Langfuse dashboard can
+    # scope to environment=production and exclude test/fixture traffic. A deployment.environment
+    # resource attr (a test collector) overrides; otherwise it defaults to production.
+    statements = _span_statements(_load_config())
+
+    env_stmts = [s for s in statements if "langfuse.environment" in s]
+    assert env_stmts, "a transform must set langfuse.environment on spoke spans"
+    assert any('"production"' in s for s in env_stmts), (
+        "real spoke spans must default to the production environment"
+    )

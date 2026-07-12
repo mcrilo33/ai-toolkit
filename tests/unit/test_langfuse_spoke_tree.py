@@ -75,7 +75,7 @@ from telemetry.spoke_tree.context_deltas import _label_rule_injections, load_sco
 from telemetry.spoke_tree.ids import _CYCLE_STEP_PREFIX
 from telemetry.spoke_tree.llm_decomp import _decomp_metadata
 from telemetry.spoke_tree.loaded_context import find_request_files
-from telemetry.spoke_tree.metadata import apply_outcome_tag, read_outcome
+from telemetry.spoke_tree.metadata import apply_outcome_tag, apply_repo_tag, read_outcome
 from telemetry.spoke_tree.scores import (
     _step_phase,
     build_normalization_scores,
@@ -5014,7 +5014,11 @@ class TestNormalizationScores:
 
     def test_base_counts_from_commits_and_subtasks(self) -> None:
         scores = build_normalization_scores(
-            SPOKE, self._commits(), self._batch(total_ms=6000, cost=1.0), 3, base_ts="2026-01-01T00:00:00Z"
+            SPOKE,
+            self._commits(),
+            self._batch(total_ms=6000, cost=1.0),
+            3,
+            base_ts="2026-01-01T00:00:00Z",
         )
 
         assert self._val(scores, "files_changed") == 3  # x, y, z — y de-duplicated
@@ -5024,14 +5028,22 @@ class TestNormalizationScores:
 
     def test_cost_per_changed_line_divides_total_cost_by_lines(self) -> None:
         scores = build_normalization_scores(
-            SPOKE, self._commits(), self._batch(total_ms=6000, cost=2.0), 3, base_ts="2026-01-01T00:00:00Z"
+            SPOKE,
+            self._commits(),
+            self._batch(total_ms=6000, cost=2.0),
+            3,
+            base_ts="2026-01-01T00:00:00Z",
         )
 
         assert self._val(scores, "cost_per_changed_line") == pytest.approx(2.0 / 20)
 
     def test_wall_per_subtask_divides_root_duration_by_subtasks(self) -> None:
         scores = build_normalization_scores(
-            SPOKE, self._commits(), self._batch(total_ms=6000, cost=1.0), 3, base_ts="2026-01-01T00:00:00Z"
+            SPOKE,
+            self._commits(),
+            self._batch(total_ms=6000, cost=1.0),
+            3,
+            base_ts="2026-01-01T00:00:00Z",
         )
 
         assert self._val(scores, "wall_per_subtask") == pytest.approx(2000)
@@ -5046,7 +5058,11 @@ class TestNormalizationScores:
 
     def test_no_wall_ratio_when_no_subtasks(self) -> None:
         scores = build_normalization_scores(
-            SPOKE, self._commits(), self._batch(total_ms=6000, cost=1.0), 0, base_ts="2026-01-01T00:00:00Z"
+            SPOKE,
+            self._commits(),
+            self._batch(total_ms=6000, cost=1.0),
+            0,
+            base_ts="2026-01-01T00:00:00Z",
         )
 
         assert self._val(scores, "subtasks") == 0
@@ -5054,13 +5070,69 @@ class TestNormalizationScores:
 
     def test_normalization_scores_are_trace_level_numeric(self) -> None:
         scores = build_normalization_scores(
-            SPOKE, self._commits(), self._batch(total_ms=6000, cost=1.0), 3, base_ts="2026-01-01T00:00:00Z"
+            SPOKE,
+            self._commits(),
+            self._batch(total_ms=6000, cost=1.0),
+            3,
+            base_ts="2026-01-01T00:00:00Z",
         )
 
         body = self._by_name(scores, "files_changed")[0]["body"]
         assert body["traceId"] == trace_id_for(SPOKE)
         assert body["dataType"] == "NUMERIC"
         assert "observationId" not in body
+
+
+class TestRepoTag:
+    """#231: stamp the originating repo on every trace so cross-project comparison is queryable.
+
+    The repo name is resolved by the shell wrapper (git) and passed to ``apply_repo_tag``, which
+    attaches a ``repo:<name>`` trace tag + bare ``metadata.repo``; a None/empty name (an ad-hoc or
+    non-git checkout) leaves the trace untouched rather than tagging ``repo:``.
+    """
+
+    def _trace(self, batch: list[dict]) -> dict:
+        return next(event for event in batch if event["type"] == "trace-create")
+
+    def test_apply_adds_repo_trace_tag(self) -> None:
+        batch = build_batch([], SPOKE)
+
+        apply_repo_tag(batch, "ai-toolkit")
+
+        assert "repo:ai-toolkit" in self._trace(batch)["body"]["tags"]
+
+    def test_apply_mirrors_repo_into_metadata(self) -> None:
+        batch = build_batch([], SPOKE)
+
+        apply_repo_tag(batch, "ai-toolkit")
+
+        assert self._trace(batch)["body"]["metadata"]["repo"] == "ai-toolkit"
+
+    def test_apply_none_repo_leaves_untagged(self) -> None:
+        batch = build_batch([], SPOKE)
+
+        apply_repo_tag(batch, None)
+
+        body = self._trace(batch)["body"]
+        assert "tags" not in body or not body["tags"]
+
+
+class TestEnvironmentField:
+    """#231: every assembled view trace carries the Langfuse ``environment`` = production so a
+    dashboard can filter test/fixture traffic out (it lacks the field / is stamped otherwise)."""
+
+    def _trace(self, batch: list[dict]) -> dict:
+        return next(event for event in batch if event["type"] == "trace-create")
+
+    def test_build_batch_trace_is_production_environment(self) -> None:
+        batch = build_batch([], SPOKE)
+
+        assert self._trace(batch)["body"].get("environment") == "production"
+
+    def test_build_cycle_batch_trace_is_production_environment(self) -> None:
+        batch = build_cycle_batch([], SPOKE)
+
+        assert self._trace(batch)["body"].get("environment") == "production"
 
 
 def _by_cycle(batch: list[dict], orig_trace_id: str, orig_obs_id: str) -> dict:

@@ -160,6 +160,20 @@ def test_runs_view_builder_only_when_auth_set(worktree: Path, tmp_path: Path) ->
     assert "langfuse_backfill" not in tree
 
 
+def test_passes_repo_name_to_view_builder(worktree: Path, tmp_path: Path) -> None:
+    # #231: the ingest resolves the originating repo name (git remote, else the checkout dir
+    # basename) and passes it as --repo so the view builder can stamp a repo:<name> trace tag.
+    # A git-less hermetic worktree falls back to its dir basename ("wt").
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+
+    result = _run(worktree, bindir)
+
+    assert result.returncode == 0, result.stderr
+    (tree,) = runlog.read_text().splitlines()
+    assert "--repo wt" in tree
+
+
 def test_skips_when_auth_unset(worktree: Path, tmp_path: Path) -> None:
     # Arrange
     bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
