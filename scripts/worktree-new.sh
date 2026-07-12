@@ -323,7 +323,7 @@ fi
 # `git reset:*`, which would hand over `git reset --hard` (a working-tree wipe).
 # The exec tier (#259) seeds `Bash(./:*)` so a compound self-op's `./<in-tree-script>`
 # segment is honored per-segment (see the rule's own comment for the always-on trade-off).
-# Nothing else destructive is seeded: no `python:*` / `python -c:*` / `chmod:*` (bare) /
+# No directly-destructive verb is seeded: no `python:*` / `python -c:*` / `chmod:*` (bare) /
 # `git tag:*` / `git push:*` / `git checkout|clean:*` / `git reset --hard` / `rm` / `mv`.
 ALLOW_RULES=(
   "Bash(bash .ai-toolkit/scripts/spoke-push.sh:*)"
@@ -359,9 +359,14 @@ ALLOW_RULES=(
   # TRADE-OFF, on purpose: unlike the hook (self-limited to a live /afk drain), a settings
   # rule is ALWAYS-ON — it auto-runs `./…` in ATTENDED sessions in this spoke worktree too,
   # and its coarse prefix cannot express classify's worktree-confinement, so a `./../…`
-  # traversal is NOT rejected here. That residual is backstopped ONLY by the deny-scope hooks
-  # (rm/push/chmod/spoke-main guards — deny outranks allow, so they stay authoritative) and
-  # the pre-push ship gates, never by this ask. An honest cost for a deterministic no-dialog.
+  # traversal to a PRE-EXISTING out-of-tree script is NOT rejected here. What keeps that
+  # residual low-risk is WRITE-CONFINEMENT: the spoke cannot CREATE an out-of-tree
+  # `../evil.sh` (a write outside the worktree escalates), so `./../…` can only reach a script
+  # that already exists — not an accidental-damage pattern. The deny-scope hooks remain
+  # authoritative for directly-typed destructive VERBS (rm/push/chmod — which this rule never
+  # grants; spoke-main-guard also catches a traversal to the land script BY NAME), and the
+  # pre-push ship gates guard shared state — but none of those inspect a `./`-run script's
+  # body, so write-confinement is the load-bearing guard here. An honest cost for no-dialog.
   "Bash(./:*)"
   # Hub-root READ access (#181) — a spoke routinely studies hub scripts/hooks OUTSIDE its
   # own worktree (e.g. reading the hub's .git/hooks/pre-push to understand the push cage),

@@ -62,7 +62,8 @@ _GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM":
 _GIT_ENV.pop("AI_TOOLKIT_BASE_BRANCH", None)
 # Strip inherited git-location vars (issue #179 / #259): when these tests run inside a
 # `git commit` hook (e.g. red-proof-verify's Tested-RED replay), git sets GIT_DIR /
-# GIT_WORK_TREE / GIT_INDEX_FILE in the environment. Those OVERRIDE cwd-based discovery, so
+# GIT_WORK_TREE / GIT_INDEX_FILE / GIT_COMMON_DIR in the environment. Those OVERRIDE
+# cwd-based discovery, so
 # `git -C <tmp-hub>` and worktree-new.sh's internal git calls would silently operate on the
 # REAL repo and trip the isolation tripwire. Popping them restores cwd-based discovery.
 for _leak in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
