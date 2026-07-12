@@ -7613,7 +7613,7 @@ def test_arm_superseded_true_when_on_disk_epoch_differs(tmp_path: Path) -> None:
     epoch = tmp_path / "arm-epoch"
     epoch.write_text("NEWGEN\n")
     result = _call(
-        '_AFK_ARM_EPOCH=OLDGEN; afk_arm_superseded && echo YES || echo NO',
+        "_AFK_ARM_EPOCH=OLDGEN; afk_arm_superseded && echo YES || echo NO",
         env={"AFK_ARM_EPOCH_FILE": str(epoch)},
     )
 
@@ -7625,7 +7625,7 @@ def test_arm_superseded_false_when_on_disk_epoch_matches(tmp_path: Path) -> None
     epoch = tmp_path / "arm-epoch"
     epoch.write_text("GEN1\n")
     result = _call(
-        '_AFK_ARM_EPOCH=GEN1; afk_arm_superseded && echo YES || echo NO',
+        "_AFK_ARM_EPOCH=GEN1; afk_arm_superseded && echo YES || echo NO",
         env={"AFK_ARM_EPOCH_FILE": str(epoch)},
     )
 
@@ -7637,7 +7637,7 @@ def test_arm_superseded_true_when_epoch_cleared(tmp_path: Path) -> None:
     # sleeper steps down even though a re-arm may have re-created `.afk-state`.
     epoch = tmp_path / "arm-epoch"  # absent
     result = _call(
-        '_AFK_ARM_EPOCH=GEN1; afk_arm_superseded && echo YES || echo NO',
+        "_AFK_ARM_EPOCH=GEN1; afk_arm_superseded && echo YES || echo NO",
         env={"AFK_ARM_EPOCH_FILE": str(epoch)},
     )
 
@@ -7673,9 +7673,11 @@ def test_fresh_arm_writes_a_new_arm_epoch(tmp_path: Path) -> None:
     # Arming with a window spec mints + persists a generation token (bound by the loop's
     # supersede check). The loop is neutered so main() arms then stops on the first done-check.
     epoch = tmp_path / "arm-epoch"
+    cap = tmp_path / "epoch-mid-run"  # captured DURING the tick (drain-complete later clears it)
     neuter = (
-        "supervise_tick() { return 0; }; _afk_spawn_watchdog() { :; }; "
-        "_afk_arm_inhibitor() { :; }; afk_done() { return 0; }; afk_interruptible_sleep() { :; }"
+        f'supervise_tick() {{ cat "{epoch}" > "{cap}" 2>/dev/null; return 0; }}; '
+        "_afk_spawn_watchdog() { :; }; _afk_arm_inhibitor() { :; }; "
+        "afk_done() { return 0; }; afk_interruptible_sleep() { :; }"
     )
     result = _call(
         f"{neuter}; main drain",
@@ -7691,8 +7693,8 @@ def test_fresh_arm_writes_a_new_arm_epoch(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert epoch.exists(), "a fresh arm must write the arm-epoch file"
-    assert epoch.read_text().strip().startswith("1700000000."), epoch.read_text()
+    assert cap.exists(), "a fresh arm must write the arm-epoch file before the first tick"
+    assert cap.read_text().strip().startswith("1700000000."), cap.read_text()
 
 
 def test_no_arg_resume_adopts_existing_arm_epoch(tmp_path: Path) -> None:
@@ -7702,8 +7704,10 @@ def test_no_arg_resume_adopts_existing_arm_epoch(tmp_path: Path) -> None:
     epoch = tmp_path / "arm-epoch"
     epoch.write_text("GEN1\n")
     bound = tmp_path / "bound"
+    cap = tmp_path / "epoch-mid-run"  # the on-disk token during the tick (drain-complete clears it)
     neuter = (
-        f'supervise_tick() {{ printf "%s" "$_AFK_ARM_EPOCH" > "{bound}"; return 0; }}; '
+        f'supervise_tick() {{ printf "%s" "$_AFK_ARM_EPOCH" > "{bound}"; '
+        f'cat "{epoch}" > "{cap}" 2>/dev/null; return 0; }}; '
         "_afk_spawn_watchdog() { :; }; _afk_arm_inhibitor() { :; }; "
         "afk_done() { return 0; }; afk_interruptible_sleep() { :; }"
     )
@@ -7722,7 +7726,7 @@ def test_no_arg_resume_adopts_existing_arm_epoch(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert bound.read_text().strip() == "GEN1", "resume must adopt the persisted generation"
-    assert epoch.read_text().strip() == "GEN1", "resume must NOT overwrite the generation"
+    assert cap.read_text().strip() == "GEN1", "resume must NOT overwrite the generation mid-run"
 
 
 def test_supervisor_steps_down_when_superseded_mid_run(tmp_path: Path) -> None:

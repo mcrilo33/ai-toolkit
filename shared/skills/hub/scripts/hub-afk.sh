@@ -100,6 +100,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # loop, so the assignment propagates up.
 _AFK_AUTH_FAILED=0
 
+# The arm-GENERATION token THIS supervisor is bound to (issue #252). Empty until main() arms
+# (mint a fresh token) or resumes (adopt the persisted one); the loop steps down the instant the
+# on-disk token no longer matches, so a fast off/re-arm recycle can't leave two lineages draining.
+_AFK_ARM_EPOCH=""
+
 # --- source worktree-lib.sh (the shared date/time + worktree helpers) ---------
 # Resolution covers both layouts: the ai-toolkit checkout (scripts/worktree-lib.sh,
 # four levels up from this hub script) and a synced target (co-located flat in
@@ -298,7 +303,35 @@ _afk_atomic_write() {
 
 afk_write_state() { _afk_atomic_write "$(afk_state_file)" "$1" || true; }
 afk_read_state()  { local f; f="$(afk_state_file)"; [ -f "$f" ] && head -n1 "$f" 2>/dev/null | tr -d '[:space:]' || true; }
-afk_clear_state() { rm -f "$(afk_state_file)" 2>/dev/null || true; afk_clear_heartbeat; }
+afk_clear_state() { rm -f "$(afk_state_file)" 2>/dev/null || true; afk_clear_heartbeat; afk_clear_arm_epoch; }
+
+# --- arm-generation token (issue #252) ----------------------------------------
+# A fast `--off -> re-arm` recycle could leave the OLD (mid-tick-sleep) supervisor draining
+# alongside the new one: `--off` cleared `.afk-state`, but the re-arm re-created it before the
+# old sleeper woke (it only re-reads state at each tick top), so the sleeper read the NEW window
+# and kept ticking -- two lineages that can double-dispatch and double-land. So each supervisor
+# binds to an arm-GENERATION token at startup (_AFK_ARM_EPOCH) and steps down the instant the
+# on-disk token no longer matches: a FRESH arm mints a new token, a RESUME (watchdog respawn /
+# reconcile) ADOPTS the current one, and `--off` clears it (afk_clear_state above). This is
+# directive-4's "armed epoch the old supervisor can distinguish from a new arm".
+# AFK_ARM_EPOCH_FILE overrides the path for tests; the default lives under the git common dir
+# beside .afk-state, so it survives a watchdog respawn exactly as the window bound does.
+afk_arm_epoch_file() {
+  if [ -n "${AFK_ARM_EPOCH_FILE:-}" ]; then printf '%s\n' "$AFK_ARM_EPOCH_FILE"; return; fi
+  local common; common="$(git rev-parse --git-common-dir 2>/dev/null)" || common=".git"
+  printf '%s\n' "$common/.afk-arm-epoch"
+}
+afk_read_arm_epoch()  { local f; f="$(afk_arm_epoch_file)"; [ -f "$f" ] && head -n1 "$f" 2>/dev/null | tr -d '[:space:]' || true; }
+afk_write_arm_epoch() { _afk_atomic_write "$(afk_arm_epoch_file)" "$1" || true; }
+afk_clear_arm_epoch() { rm -f "$(afk_arm_epoch_file)" 2>/dev/null || true; }
+# afk_new_arm_token -> a fresh generation token "<epoch>.<pid>". The arming pid disambiguates a
+# same-second recycle: two arms in one wall-clock second still mint distinct generations.
+afk_new_arm_token() { printf '%s.%s\n' "$(afk_now)" "$$"; }
+# afk_arm_superseded -> true when the on-disk generation no longer matches the one THIS supervisor
+# bound to at startup (a newer arm overwrote it, or `--off` cleared it). A legacy resume with no
+# bound token and no epoch file reads empty==empty -> NOT superseded, so a pre-#252 armed window
+# still runs after an upgrade.
+afk_arm_superseded() { [ "$(afk_read_arm_epoch)" != "$_AFK_ARM_EPOCH" ]; }
 
 # --- landed tally + drain-complete hand-off (issue #150) ----------------------
 # A completed drain fires ONE "drain complete — <k> landed" notification, but <k>
@@ -2614,6 +2647,10 @@ main() {
     # never reach the loop — when collector/bridge/auth can't be wired (#108).
     afk_telemetry_preflight "$MAIN_ROOT" || return 2
     afk_write_state "$end"
+    # Mint + bind a fresh arm generation (#252): the old sleeper from a prior arm reads its bound
+    # token as superseded on its next tick and steps down, so an off/re-arm recycle never runs two.
+    _AFK_ARM_EPOCH="$(afk_new_arm_token)"
+    afk_write_arm_epoch "$_AFK_ARM_EPOCH"
     _clear_dispatch_epochs   # fresh window ⇒ empty "dispatched by this run" set
     _clear_progress_state    # fresh window ⇒ no stale progress / answer-attempt epochs
     _clear_resume_markers    # fresh window ⇒ every spoke gets its one auto-resume again
@@ -2638,9 +2675,21 @@ main() {
       log "/afk: refusing to resume — a supervisor is already live (heartbeat pid running); run /afk --off first (a second supervisor clobbers per-run state)"
       return 2
     fi
+    # Adopt the persisted arm generation (#252): a resume (watchdog respawn / reconcile) must NOT
+    # mint a new token — that would read itself superseded on tick one. Empty when a pre-#252
+    # window (or a torn-down epoch file) is resumed, which reads never-superseded (legacy-safe).
+    _AFK_ARM_EPOCH="$(afk_read_arm_epoch)"
   fi
 
   while :; do
+    # Step down the instant a newer arm (or --off) superseded this generation (#252): the old
+    # sleeper from an off/re-arm recycle exits here instead of draining alongside the new lineage.
+    # UNGATED by AFK_ARM_PRECHECK — a singleton-drain safety invariant, not an arm precondition.
+    # Skipped for --once (a one-shot tick binds no generation).
+    if [ "$once" -eq 0 ] && afk_arm_superseded; then
+      log "/afk: superseded — a newer arm (or --off) took over this checkout; stepping down (no double-drain)"
+      break
+    fi
     afk_write_heartbeat   # stamp this tick before working, so a crash mid-tick is visible
     # Keep exactly one watchdog alive (idempotent: a no-op while one runs, respawns it if
     # it died). Doing this each tick — not just at arm — means the supervisor and watchdog
