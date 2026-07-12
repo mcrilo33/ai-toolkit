@@ -7250,3 +7250,52 @@ def test_status_off_has_no_inhibitor_line(tmp_path: Path) -> None:
 
     assert "/afk: off" in result.stdout
     assert "sleep-inhibit" not in result.stdout
+
+
+def test_arm_emits_power_warnings_on_fresh_arm(tmp_path: Path) -> None:
+    # AC4 end-to-end: a fresh arm on battery emits the loud power warning (the arm-branch
+    # wiring, not just the unit function). The supervisor loop is neutered so main() arms then
+    # exits on the first tick; the inhibitor is stubbed so no real caffeinate spawns.
+    pm = _pmset_stub(tmp_path, "Battery Power")
+    state = tmp_path / "state"
+    neuter = (
+        "supervise_tick() { return 0; }; _afk_spawn_watchdog() { :; }; "
+        "_afk_arm_inhibitor() { :; }; afk_done() { return 0; }; sleep() { exit 0; }"
+    )
+
+    result = _call(
+        f"{neuter}; main 30m",
+        env={
+            "AFK_STATE": str(state),
+            "AFK_PMSET_BIN": str(pm),
+            "AFK_ARM_PRECHECK": "0",  # skip the #170 live/dirty/branch/gh gate
+            "AI_TOOLKIT_OTEL": "0",   # telemetry preflight is a no-op
+            "AFK_NOW": "1700000000",
+        },
+    )
+
+    assert "WARNING" in result.stderr, result.stderr
+    assert "battery" in result.stderr.lower()
+    assert "AC" in result.stderr and "lid" in result.stderr.lower()
+
+
+def test_once_tick_does_not_emit_power_warnings(tmp_path: Path) -> None:
+    # A --once cron tick is not a fresh arm: it must NOT emit the arm-time power warnings.
+    pm = _pmset_stub(tmp_path, "Battery Power")
+    neuter = (
+        "supervise_tick() { return 0; }; _afk_spawn_watchdog() { :; }; "
+        "_afk_arm_inhibitor() { :; }; sleep() { exit 0; }"
+    )
+
+    result = _call(
+        f"{neuter}; main --once",
+        env={
+            "AFK_STATE": str(tmp_path / "state"),
+            "AFK_PMSET_BIN": str(pm),
+            "AFK_ARM_PRECHECK": "0",
+            "AI_TOOLKIT_OTEL": "0",
+            "AFK_NOW": "1700000000",
+        },
+    )
+
+    assert "WARNING" not in result.stderr, result.stderr

@@ -2270,17 +2270,18 @@ afk_inhibitor_status() {
   fi
 }
 
-# afk_warn_power -> WARN at arm time when on BATTERY: `caffeinate -s` inhibits sleep only on AC
-# power, and a lid-close sleeps regardless — name BOTH limits so the operator plugs in and keeps
-# the lid open. Guarded on pmset (absent off macOS) and read under LC_ALL=C (the repo's locale
-# trap: an English-keyword parse of a localized `pmset -g batt` must force the C locale).
+# afk_warn_power -> WARN at arm time when on BATTERY: the `-s` in the inhibitor's `caffeinate
+# -is` holds sleep off only on AC power, and a lid-close sleeps regardless — name BOTH limits so
+# the operator plugs in and keeps the lid open. Guarded on pmset (absent off macOS) and read
+# under LC_ALL=C (the repo's locale trap: an English-keyword parse of a localized `pmset -g
+# batt` must force the C locale).
 afk_warn_power() {
   local pm batt; pm="${AFK_PMSET_BIN:-pmset}"
   command -v "$pm" >/dev/null 2>&1 || return 0
   batt="$(LC_ALL=C "$pm" -g batt 2>/dev/null)"
   case "$batt" in
     *"Battery Power"*)
-      log "/afk: WARNING — on battery power: 'caffeinate -s' inhibits sleep only on AC power, and a lid-close sleeps regardless; plug in and keep the lid open for an unattended drain" ;;
+      log "/afk: WARNING — on battery power: the sleep inhibitor holds only while on AC power, and a lid-close sleeps regardless; plug in and keep the lid open for an unattended drain" ;;
   esac
 }
 
@@ -2478,7 +2479,7 @@ main() {
     _afk_clear_status_labels_seed # fresh window ⇒ re-seed the afk:* label set once (#223)
     log "/afk: armed ($([ "$end" = drain ] && echo 'drain — until the backlog is empty' || echo "until $(wt_date_ymd "$end") $(date -r "$end" +%H:%M 2>/dev/null || date -d "@$end" +%H:%M)"))"
     # Power-management caveats the sleep inhibitor cannot cover (#242): loud, once at arm.
-    afk_warn_power          # on battery: caffeinate -s holds only on AC, and a lid-close sleeps
+    afk_warn_power          # on battery: the inhibitor holds only on AC, and a lid-close sleeps
     _afk_warn_no_inhibitor  # non-macOS: no caffeinate — arming proceeds, but sleep is not inhibited
   else
     # No window spec and not --once: a RESUME of the persisted window (a watchdog respawn or
