@@ -387,3 +387,25 @@ ledger-schema-guard:
   claude:
     event: preToolUse
     matcher: "TaskCreate|TaskUpdate"
+
+# afk-permission-hook (issue #253): answer a spoke's permission decision
+# PROGRAMMATICALLY on PreToolUse instead of pane-scraping a tmux dialog after it
+# appears (the #240/#246/#238 bug family). It runs the SAME classify_permission
+# verdict the /afk drain already trusts and auto-approves a benign scoped self-op
+# (permissionDecision:"allow"), so no dialog is ever shown and there is nothing to
+# scrape; it journals the auto-approve per #241. It NEVER denies — an ESCALATE or
+# any un-gated context stays silent, so the scope-guard hooks' denies stay
+# authoritative and the rare genuine escalation still falls through to the drain
+# reasoner. Self-limits to a LIVE /afk drain (a running .afk-heartbeat supervisor)
+# on an issue-numbered spoke branch, so attended sessions and the hub checkout are
+# untouched. Claude-only, like afk-notify-wake: the /afk drain + Claude Code
+# permission protocol are a Claude Code concept, so the event lives in the claude
+# block and Copilot/Cursor stay unwired. Placed LAST among the preToolUse hooks so
+# its matcher group emits after the scope-guards' — a never-deny hook whose allow
+# is a strict subset of what those guards permit, so no double-gating / no bypass.
+afk-permission-hook:
+  description: "On PreToolUse (Bash/Read) inside a live /afk drain, auto-approve a benign scoped self-op via classify_permission (permissionDecision:allow) so no tmux dialog is shown; never denies; journals per #241 (Claude-only, #253)"
+  tier: 1
+  claude:
+    event: preToolUse
+    matcher: "Bash|Read"

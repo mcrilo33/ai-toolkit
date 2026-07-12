@@ -4514,3 +4514,193 @@ def test_broker_warn_continue_unconditionally_advances_backoff(
         env=env,
     )
     assert "attempt=2" in result.stdout, result.stdout + result.stderr
+
+
+# ── issue #253: programmatic PreToolUse permission decision ───────────────────
+# The pane-scrape answering path detects+operates a TUI dialog AFTER it appears — the brittle
+# surface behind the #240/#246/#238 bug family. afk_permission_hook_decide moves the COMMON
+# case OFF the pane: a spoke PreToolUse hook runs classify_permission on the gated tool call
+# and AUTO-APPROVES a benign scoped self-op (permissionDecision:"allow"), so no dialog is ever
+# shown. It reuses the SAME classify_permission verdict (one source of truth), journals the
+# approve per #241, and NEVER denies — an ESCALATE (or any un-gated context) stays silent so the
+# scope-guard hooks' denies stay authoritative and the pane path is untouched.
+
+
+def _hook_payload(
+    tool_name: str, wt: Path, *, command: str | None = None, file_path: str | None = None
+) -> str:
+    """Build a Claude Code PreToolUse payload as the hook receives it on stdin."""
+    inp: dict[str, str] = {}
+    if command is not None:
+        inp["command"] = command
+    if file_path is not None:
+        inp["file_path"] = file_path
+    return json.dumps({"tool_name": tool_name, "tool_input": inp, "cwd": str(wt)})
+
+
+@pytest.fixture
+def afk_spoke(spoke_repo: Path, tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    """A spoke on an issue-numbered branch with a LIVE afk heartbeat — the hook's gate wide open.
+
+    The heartbeat names THIS pytest process's pid, which is alive for the duration of the
+    ``_call`` subprocess, so the hook's ``kill -0`` liveness probe succeeds.
+    """
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(
+        ["git", "checkout", "-q", "-b", "feature/253-hook"],
+        cwd=spoke_repo,
+        check=True,
+        env=git_env,
+        capture_output=True,
+    )
+    heartbeat = tmp_path / "heartbeat"
+    heartbeat.write_text(f"{os.getpid()} 1000 wake1\n")
+    statedir = tmp_path / "afk-state"
+    statedir.mkdir()
+    env = {
+        "AFK_HEARTBEAT": str(heartbeat),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_TASKS_ROOT": str(tmp_path / "tasks"),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_NOW": "1000",
+    }
+    return spoke_repo, env
+
+
+def _run_hook(payload: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return _call("afk_permission_hook_decide", env=env, stdin=payload)
+
+
+AFK_PERMISSION_HOOK = REPO_ROOT / "shared" / "hooks" / "afk-permission-hook.sh"
+
+
+def test_afk_permission_hook_shim_emits_allow_end_to_end(
+    afk_spoke: tuple[Path, dict[str, str]],
+) -> None:
+    # Exercise the actual PreToolUse shim SCRIPT (not just the sourced fn): it must locate and
+    # source gate-broker.sh, run afk_permission_hook_decide, and print the allow verdict for the
+    # #238 shape. CLAUDE_PROJECT_DIR is popped so the shim resolves the shared/ gate-broker via
+    # its fallback (the tmp spoke has no .claude/ copy).
+    wt, env = afk_spoke
+    (wt / "x.sh").write_text("#!/bin/sh\necho hi\n")
+    payload = _hook_payload("Bash", wt, command="chmod +x ./x.sh && ./x.sh")
+    proc_env = {**os.environ, **env}
+    proc_env.pop("CLAUDE_PROJECT_DIR", None)
+
+    result = subprocess.run(
+        ["bash", str(AFK_PERMISSION_HOOK)],
+        cwd=str(wt),
+        input=payload,
+        capture_output=True,
+        text=True,
+        env=proc_env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert '"permissionDecision":"allow"' in result.stdout, result.stdout + result.stderr
+
+
+def test_afk_permission_hook_approves_238_smoke(afk_spoke: tuple[Path, dict[str, str]]) -> None:
+    # The #238 shape — chmod +x a script in the worktree, then run it — is APPROVE under
+    # classify_permission's in-worktree script-exec lane. The hook emits permissionDecision:
+    # "allow", so the drain never sees a dialog and nothing is scraped.
+    wt, env = afk_spoke
+    (wt / "x.sh").write_text("#!/bin/sh\necho hi\n")
+
+    result = _run_hook(_hook_payload("Bash", wt, command="chmod +x ./x.sh && ./x.sh"), env)
+
+    assert result.returncode == 0, result.stderr
+    assert '"permissionDecision":"allow"' in result.stdout, result.stdout + result.stderr
+
+
+def test_afk_permission_hook_silent_on_escalate(afk_spoke: tuple[Path, dict[str, str]]) -> None:
+    # A main-touching push ESCALATEs — the hook NEVER denies. It emits nothing (exit 0) so the
+    # normal permission flow and the authoritative scope-guard denies are untouched.
+    wt, env = afk_spoke
+
+    result = _run_hook(_hook_payload("Bash", wt, command="git push origin main"), env)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "", result.stdout
+
+
+def test_afk_permission_hook_silent_without_live_supervisor(
+    afk_spoke: tuple[Path, dict[str, str]], tmp_path: Path
+) -> None:
+    # Self-limit: with no LIVE heartbeat the hook is inert even for an approvable command — an
+    # attended session must never have its dialogs silently auto-approved behind the user's back.
+    wt, env = afk_spoke
+    env = {**env, "AFK_HEARTBEAT": str(tmp_path / "does-not-exist")}
+
+    result = _run_hook(_hook_payload("Bash", wt, command="git add x.py"), env)
+
+    assert result.stdout.strip() == "", result.stdout
+
+
+def test_afk_permission_hook_silent_on_non_spoke_branch(
+    afk_spoke: tuple[Path, dict[str, str]],
+) -> None:
+    # A branch whose slug carries no issue number (the hub checkout, an ad-hoc branch) is not a
+    # drained spoke — the hook self-limits and stays silent even with a live heartbeat.
+    wt, env = afk_spoke
+    subprocess.run(
+        ["git", "checkout", "-q", "-b", "docs/readme"],
+        cwd=wt,
+        check=True,
+        env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t"},
+        capture_output=True,
+    )
+
+    result = _run_hook(_hook_payload("Bash", wt, command="git add x.py"), env)
+
+    assert result.stdout.strip() == "", result.stdout
+
+
+def test_afk_permission_hook_silent_on_non_bash_tool(
+    afk_spoke: tuple[Path, dict[str, str]],
+) -> None:
+    # A browser/computer/mcp tool arrives as a bare tool name — not an approvable scoped
+    # self-op. The hook stays silent (defers), never auto-approving an outward action.
+    wt, env = afk_spoke
+
+    result = _run_hook(_hook_payload("mcp__claude-in-chrome__navigate", wt), env)
+
+    assert result.stdout.strip() == "", result.stdout
+
+
+def test_afk_permission_hook_classifies_the_whole_long_command(
+    afk_spoke: tuple[Path, dict[str, str]],
+) -> None:
+    # A silent auto-approve must classify the WHOLE command — never a truncated prefix. A benign
+    # prefix padded past any display cap, with a risky `rm -rf ~` tail, must ESCALATE (silent),
+    # not be mis-APPROVEd because the tail was cut off.
+    wt, env = afk_spoke
+    padding = " && ".join(["git add x.py"] * 300)  # well over any 2KB display cap
+    cmd = f"{padding} && rm -rf ~"
+
+    result = _run_hook(_hook_payload("Bash", wt, command=cmd), env)
+
+    assert result.stdout.strip() == "", "a risky tail must never be truncated into an approve"
+
+
+def test_afk_permission_hook_journals_the_auto_approve(
+    afk_spoke: tuple[Path, dict[str, str]],
+) -> None:
+    # #241: an auto-approve at the hook layer still journals to the per-run decision journal, so
+    # a decision made with NO dialog is auditable in the morning review.
+    wt, env = afk_spoke
+
+    result = _run_hook(_hook_payload("Bash", wt, command="git add x.py"), env)
+
+    assert '"permissionDecision":"allow"' in result.stdout, result.stdout + result.stderr
+    journal = Path(env["AFK_STATE_DIR"]) / "decision-journal.jsonl"
+    assert journal.exists(), "auto-approve must journal per #241"
+    body = journal.read_text()
+    assert "hook auto-approved" in body, body
+    assert '"park":"permission"' in body, body
