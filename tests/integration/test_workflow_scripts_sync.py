@@ -64,6 +64,12 @@ SOURCES["hub-afk.sh"] = HUB_SCRIPTS_DIR / "hub-afk.sh"
 # is absent from .ai-toolkit/scripts/ every synced /afk drain fails at startup, unable
 # to resolve log()/afk_now()/broker_service_gate.
 SOURCES["gate-broker.sh"] = HUB_SCRIPTS_DIR / "gate-broker.sh"
+# The hardened tmux-inject primitive (issue #251) MUST install alongside gate-broker.sh: the
+# broker now sources it as a co-located sibling ($SCRIPT_DIR/hub-inject.sh) for the ONE
+# inject_and_verify both the /afk answerer and the hub-watchdog share — if it is absent from
+# .ai-toolkit/scripts/ every synced /afk drain fails at startup, unable to resolve
+# inject_and_verify / approve_permission / _spoke_pane_target.
+SOURCES["hub-inject.sh"] = HUB_SCRIPTS_DIR / "hub-inject.sh"
 SOURCES["batch-plan.sh"] = HUB_SCRIPTS_DIR / "batch-plan.sh"
 # The hub-side agent dispatcher (issue #245) ships alongside its siblings so the
 # land/hub skills' `.ai-toolkit/scripts/hub-agent.sh` references resolve in a

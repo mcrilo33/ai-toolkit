@@ -61,3 +61,34 @@ def test_travel_local_source_exists_and_is_executable() -> None:
     # the source must exist and be a real file.
     assert TRAVEL_LOCAL.is_file(), "scripts/travel-local.sh missing — sync would copy nothing"
     assert os.access(TRAVEL_LOCAL, os.X_OK), "scripts/travel-local.sh is not executable"
+
+
+# ── hub-inject.sh registration (issue #251) ───────────────────────────────────
+# gate-broker.sh now hard-depends on hub-inject.sh as a co-located sibling
+# ($SCRIPT_DIR/hub-inject.sh) for the shared inject_and_verify primitive. If hub-inject.sh
+# is not registered here it never lands in .ai-toolkit/scripts/, and the synced gate-broker
+# sources a MISSING file — every synced /afk drain breaks at startup. Unlike travel-local.sh
+# it is a hub-skill script, so it MUST take the hub-skill `case` mapping (not the default).
+HUB_INJECT = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "hub-inject.sh"
+
+
+def test_hub_inject_registered_in_sync_loop() -> None:
+    assert "hub-inject.sh" in _for_name_list(), (
+        "hub-inject.sh is not registered in sync_workflow_scripts() — gate-broker.sh would "
+        "source a missing sibling in a synced target and every /afk drain would break"
+    )
+
+
+def test_hub_inject_takes_the_hub_skill_source_case() -> None:
+    # A hub-skill script must map to shared/skills/hub/scripts/, not the toolkit-root default.
+    body = _sync_workflow_scripts_body()
+    hub_case = re.search(r"\n\s*([\w.|-]*hub-inject\.sh[\w.|-]*)\)\s+src=", body)
+    assert hub_case is not None, (
+        "hub-inject.sh must have the hub-skill case mapping "
+        '(src="$SHARED_DIR/skills/hub/scripts/$name"), not the toolkit-root default'
+    )
+
+
+def test_hub_inject_source_exists_and_is_executable() -> None:
+    assert HUB_INJECT.is_file(), "shared/skills/hub/scripts/hub-inject.sh missing"
+    assert os.access(HUB_INJECT, os.X_OK), "hub-inject.sh is not executable"
