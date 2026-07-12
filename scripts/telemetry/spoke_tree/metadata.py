@@ -37,6 +37,11 @@ _VALID_MODES = ("afk", "attended")
 _VALID_LANES = ("micro", "express", "quick", "spoke")
 _DEFAULT_MODE = "attended"
 _DEFAULT_LANE = "spoke"
+# Terminal-outcome pointer file under a worktree root (#231), stamped at land / reap time by
+# worktree-land.sh / hub-afk.sh — the state each already knows. Surfaced as an ``outcome:<v>``
+# trace tag + bare metadata so failure economics are queryable across spokes.
+_OUTCOME_POINTER = Path(".ai-toolkit/outcome")
+_VALID_OUTCOMES = ("landed", "blocked", "reaped", "abandoned")
 
 
 def _merge_trace_tags(batch: list[IngestEvent], tags: list[str]) -> None:
@@ -100,6 +105,16 @@ def apply_mode_lane_tags(batch: list[IngestEvent], mode: str, lane: str) -> None
     metadata = trace["body"].setdefault("metadata", {})
     metadata["mode"] = mode
     metadata["lane"] = lane
+
+
+def read_outcome(root: Path) -> str | None:
+    """RED stub (#231) — GREEN reads the ``.ai-toolkit/outcome`` pointer under ``root``."""
+    return None
+
+
+def apply_outcome_tag(batch: list[IngestEvent], outcome: str | None) -> None:
+    """RED stub (#231) — GREEN attaches the ``outcome:<v>`` trace tag + bare metadata."""
+    return None
 
 
 def apply_request_body_metadata(

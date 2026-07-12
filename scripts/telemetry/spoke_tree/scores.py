@@ -42,6 +42,16 @@ from telemetry.spoke_tree.observations import (
 
 # Deterministic id prefix for the numeric Langfuse scores (#100 amendment: chartable time budget).
 _SCORE_PREFIX = "tree-score-"
+# Failure-economics counts (#231): a blocked/reaped disaster spoke and a clean landing carried
+# identical tags, so these trace-level counts make the difference queryable. ``gate_park_count`` is
+# DERIVED from the traces (the PLAN-gate park spans); ``blocked_count`` / ``relaunch_count`` are
+# supervisor state, read from ``.ai-toolkit`` integer pointers (0 emitted so "clean" reads distinct
+# from "not measured").
+_GATE_PARK_COUNT_SCORE = "gate_park_count"
+_BLOCKED_COUNT_SCORE = "blocked_count"
+_RELAUNCH_COUNT_SCORE = "relaunch_count"
+_BLOCKED_COUNT_POINTER = ".ai-toolkit/blocked-count"
+_RELAUNCH_COUNT_POINTER = ".ai-toolkit/relaunch-count"
 # Score names — Langfuse sums/charts numeric scores (it cannot chart arbitrary metadata).
 _PERMISSION_WAIT_SCORE = "permission_wait_ms"  # per blocked tool observation
 _GATE_PARK_SCORE = "gate_park_ms"  # trace-level PLAN-gate park wait
@@ -254,6 +264,13 @@ def build_score_events(
             )
         )
     return events
+
+
+def build_outcome_count_scores(
+    spoke_run_id: str, traces: list[TraceObservations], root: Path, *, base_ts: str
+) -> list[IngestEvent]:
+    """RED stub (#231) — GREEN emits gate_park_count/blocked_count/relaunch_count scores."""
+    return []
 
 
 def _script_name(body: dict[str, Any]) -> str:
