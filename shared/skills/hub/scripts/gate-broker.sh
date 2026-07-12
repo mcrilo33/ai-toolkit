@@ -1371,54 +1371,57 @@ run_answerer() {
 }
 
 # _normalize_answerer_output <raw> -> the reasoner's FINAL TEXT, extracted from a
-# `--output-format stream-json` event stream (#247) so the line-anchored text parsers
-# (parse_decision / parse_decision_field / is_auth_failure) see the ANSWER / REVERSIBILITY /
-# WARN lines they expect — NOT buried inside JSON, where they would silently read as empty and
-# drop the #241 reversibility class + WARN note. The extraction:
+# `--output-format stream-json` event stream (#247) so the line-anchored DECISION parsers
+# (parse_decision / parse_decision_field) see the ANSWER / REVERSIBILITY / WARN lines they
+# expect — NOT buried inside JSON, where they would silently read as empty and drop the #241
+# reversibility class + WARN note. (is_auth_failure is fed the RAW stream instead, so an auth
+# signature carried in a dropped event — a system/error line — is never missed; see the call
+# sites.) The extraction:
 #   - the final `type:"result"` event's `result` field (the consolidated answer) wins; a
-#     missing/empty result falls back to concatenated assistant `text` blocks;
-#   - NON-JSON lines pass through verbatim (a plain-text answerer stub, and a credential error
-#     the CLI prints to the folded stderr — so is_auth_failure still sees the auth signature);
-#   - an error result event's raw JSON line is also passed through, a belt for any auth status
-#     embedded in JSON rather than on stderr.
-# A pure plain-text input (every #244 answerer stub) has no JSON events, so it passes through
-# byte-for-byte — zero behavior change on the stub path. No python3 ⇒ passthrough unchanged
-# (the degraded env keeps plain-text answerers working; stream-json there would not parse
-# anyway, and the void degrades to the #244 fallback).
+#     missing/empty result falls back to concatenated assistant `text` blocks (real claude emits
+#     BOTH, so the answer survives a drift in either shape);
+#   - NON-JSON lines pass through (a plain-text answerer stub is entirely non-JSON, so it is
+#     surfaced whole).
+# The raw stream is delivered via a temp FILE (path in env), never argv/env directly, so a verbose
+# stream echoing large tool_result payloads never trips ARG_MAX. A pure plain-text input (every
+# #244 answerer stub) has no JSON events, so its content passes through — the DECISION lines are
+# preserved, though the python path normalizes whitespace (drops blank lines, adds a trailing
+# newline); only the no-python3 branch is byte-identical. No python3 ⇒ byte-for-byte passthrough
+# (the degraded env keeps plain-text answerers working; the void degrades to the #244 fallback).
 _normalize_answerer_output() {
   command -v python3 >/dev/null 2>&1 || { printf '%s' "$1"; return 0; }
-  _AFK_RAW="$1" python3 2>/dev/null <<'PYEOF' || printf '%s' "$1"
+  local rawfile; rawfile="$(mktemp 2>/dev/null)" || { printf '%s' "$1"; return 0; }
+  printf '%s' "$1" > "$rawfile"
+  _AFK_RAWFILE="$rawfile" python3 2>/dev/null <<'PYEOF' || printf '%s' "$1"
 import json, os
 
 result_text = None
 assistant_texts = []
 passthrough = []
-error_lines = []
-for raw_line in os.environ.get("_AFK_RAW", "").splitlines():
-    line = raw_line.strip()
-    if not line:
-        continue
-    try:
-        obj = json.loads(line)
-    except Exception:
-        passthrough.append(raw_line)  # plain text (a stub) or a stderr credential line
-        continue
-    if not isinstance(obj, dict):
-        continue
-    kind = obj.get("type")
-    if kind == "result":
-        r = obj.get("result")
-        if isinstance(r, str) and r.strip():
-            result_text = r  # the LAST result event's consolidated text wins
-        if obj.get("is_error") or obj.get("subtype") not in (None, "success"):
-            error_lines.append(raw_line)
-    elif kind == "assistant":
-        content = (obj.get("message") or {}).get("content")
-        if isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text" and (block.get("text") or "").strip():
-                    assistant_texts.append(block["text"])
-    # other event types (system/user/tool_use noise) carry no final text — skipped.
+with open(os.environ["_AFK_RAWFILE"], encoding="utf-8", errors="replace") as fh:
+    for raw_line in fh:
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            passthrough.append(raw_line.rstrip("\n"))  # plain text (a stub) — surfaced whole
+            continue
+        if not isinstance(obj, dict):
+            continue
+        kind = obj.get("type")
+        if kind == "result":
+            r = obj.get("result")
+            if isinstance(r, str) and r.strip():
+                result_text = r  # the LAST result event's consolidated text wins
+        elif kind == "assistant":
+            content = (obj.get("message") or {}).get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text" and (block.get("text") or "").strip():
+                        assistant_texts.append(block["text"])
+        # other event types (system/user/tool_use noise) carry no final text — skipped.
 
 out = []
 if result_text is not None:
@@ -1426,9 +1429,9 @@ if result_text is not None:
 elif assistant_texts:
     out.append("\n".join(assistant_texts))
 out.extend(passthrough)
-out.extend(error_lines)
 print("\n".join(out))
 PYEOF
+  rm -f "$rawfile" 2>/dev/null || true
 }
 
 # parse_decision <raw-answerer-output> -> "ANSWER\t<text>" or "ESCALATE\t<reason>" on
@@ -2071,7 +2074,9 @@ path to tell the spoke>'."
   # Stamp the attempt FIRST so the reason→deliver window never reads as idle (#202 C).
   stamp_answer_attempt "$issue"
   raw="$(run_answerer "$issue" "$q" "$wt")"; rc=$?
-  # #247: run_answerer streams stream-json; normalize ONCE to the final text before every parse.
+  # #247: run_answerer streams stream-json; normalize ONCE to the final text for the DECISION
+  # parsers. is_auth_failure reads the RAW stream (below) so an auth signature in a dropped event
+  # is never missed.
   local raw_text; raw_text="$(_normalize_answerer_output "$raw")"
   # Auth failure is the one true external blocker (#73): a dead supervisor token yields an
   # auth-error blob, not a decision — and parse_decision would fall to the DENY default and
@@ -2079,7 +2084,7 @@ path to tell the spoke>'."
   # raise the global halt flag (the supervisor pauses DISPATCH + re-probes, #241 §9), and return
   # without injecting. #241 §9: WARN the spoke (an auth failure is not the spoke's fault — never
   # block it); the drain resumes servicing it once auth recovers.
-  if [ "$rc" -ne 0 ] && is_auth_failure "$raw_text"; then
+  if [ "$rc" -ne 0 ] && is_auth_failure "$raw"; then
     _AFK_AUTH_FAILED=1
     broker_warn_continue "$wt" "$issue" auth "subscription auth failed — token could not refresh; re-run /login on the host (drain paused, re-probing)" reversible
     return 0
@@ -2349,6 +2354,11 @@ for line in os.environb.get(b"_AFK_SIZES", b"").splitlines():
 def matches(record):
     if not isinstance(record, dict):
         return False
+    # `any` mode: ANY appended record is a spoke-side write — the ISOLATED reasoner (#237 cwd=snap,
+    # --no-session-persistence) never writes the live transcript, so a #240 tool_result-only
+    # self-resume still proves the spoke touched the tree (#247 residual 2, the fail-safe's DROP arm).
+    if mode == "any":
+        return True
     kind = record.get("type")
     # A genuine typed human/self reply — shared by both modes (mirrors _gate_answer_landed).
     if kind == "user" and record.get("promptSource") == "typed" and not record.get("isMeta"):
@@ -2381,7 +2391,7 @@ for path in glob.glob(os.path.join(os.environ["_AFK_DIR"], "*.jsonl")):
                 # NOT: a from-0 scan would match the PRE-park record (an AskUserQuestion IS an
                 # assistant tool_use) and mask a real escape (rc 0 -> drop). Skip the file instead,
                 # so the caller reads "no activity" (rc 1) and fails SAFE (voids) on a lost boundary.
-                if mode == "activity":
+                if mode in ("activity", "any"):
                     continue
                 offset = 0
             fh.seek(offset)
@@ -2416,6 +2426,14 @@ _user_turn_appended() { _scan_appended_turns "$1" "$2" typed; }
 # rc 2 unavailable (no python3 / no project dir / crash).
 _spoke_activity_appended() { _scan_appended_turns "$1" "$2" activity; }
 
+# _spoke_touched_transcript <wt_path> <sizes> -> did the spoke append ANY record to its live
+# transcript since the <sizes> snapshot? The #247 fail-safe's positive spoke signal: a weaker bar
+# than a full "turn" (it also counts a #240 tool_result-only self-resume — residual 2), sound
+# because the ISOLATED reasoner never writes the live transcript, so any appended record is the
+# spoke. Used when the reasoner audit did NOT prove a write (rw_rc 1/2): DROP on a positive touch,
+# else fail SAFE and VOID. rc 0 touched, rc 1 none, rc 2 unavailable (no python3 / no project dir).
+_spoke_touched_transcript() { _scan_appended_turns "$1" "$2" any; }
+
 # _reasoner_wrote_live_tree <raw-answerer-output> <wt> -> the #247 option (c) attribution
 # primitive: audit the REASONER's OWN tool_use stream (from `--output-format stream-json`) for a
 # write that could reach the LIVE tree, instead of attributing a whole-tree diff by the spoke's
@@ -2427,18 +2445,21 @@ _spoke_activity_appended() { _scan_appended_turns "$1" "$2" activity; }
 #   - a write tool (Write/Edit/MultiEdit/NotebookEdit) whose path input is absolute and under <wt>;
 #   - a Bash whose command references the absolute <wt> path AND is NOT a read-only git verb
 #     (mirrors _reasoner_bash_readonly, and also recognises the `git -C <wt> <verb>` form).
-# rc 0 a live-tree write is present (VOID even amid coincident spoke activity — closes residual 1);
-# rc 1 the stream parsed and shows NO live-tree write (a DEFINITE "the reasoner didn't write it" —
-# the diff is the spoke's/sibling's → DROP, closing residuals 2 & 3 without reading the spoke
-# transcript); rc 2 the input is not an auditable stream (a plain-text answerer stub / no stream /
-# no python3) → UNAVAILABLE, the caller falls back to the #244 activity signal. Like the
-# transcript scanners this uses python3, so in a no-python3 env BOTH this and the activity scan are
-# unavailable and the void fails safe (voids) — residual 3 (the unreadable-transcript false-void)
-# is closed only when python3 is present, which is acceptable (it is not an acceptance criterion).
+# rc 0 a live-tree write is PROVEN (VOID even amid coincident spoke activity — closes residual 1);
+# rc 1 the stream parsed but shows NO modelled live-tree write; rc 2 the input is not an auditable
+# stream (a plain-text answerer stub / no stream / no python3). The caller treats ONLY rc 0 as proof:
+# on rc 1 / rc 2 it does NOT trust the audit alone (an escape via a vector this does not model must
+# still fail SAFE), so it attributes the diff to the spoke ONLY on a positive spoke-transcript signal
+# and otherwise VOIDs. The raw stream is delivered via a temp FILE (not argv/env) so a verbose
+# stream that echoes large tool_result payloads never trips ARG_MAX. Uses python3 like the scanners.
 _reasoner_wrote_live_tree() {
-  local raw="$1" wt="$2"
+  local raw="$1" wt="$2" rawfile rc
   command -v python3 >/dev/null 2>&1 || return 2
-  _AFK_RAW="$raw" _AFK_WT="$wt" python3 2>/dev/null <<'PYEOF'
+  # Deliver the raw stream via a temp FILE (path in env), never in argv/env directly: a verbose
+  # stream that echoes large tool_result payloads would trip ARG_MAX. mktemp mirrors run_answerer.
+  rawfile="$(mktemp 2>/dev/null)" || return 2
+  printf '%s' "$raw" > "$rawfile"
+  _AFK_WT="$wt" _AFK_RAWFILE="$rawfile" python3 2>/dev/null <<'PYEOF'
 import json, os, re, sys
 
 wt = os.environ.get("_AFK_WT", "")
@@ -2450,15 +2471,30 @@ RO_GIT = ("status", "diff", "log", "show", "rev-parse", "branch", "ls-files", "c
 def path_under_wt(p):
     if not isinstance(p, str) or not p.startswith("/"):
         return False  # a relative path writes into the #237 snapshot copy, not the live tree
-    return any(p == c or p.startswith(c.rstrip("/") + "/") for c in cands)
+    # Compare both the raw and the symlink-resolved form so a /tmp-vs-/private/tmp alias (or any
+    # symlinked component) on either side still matches — cands already carries realpath(wt).
+    forms = {p}
+    try:
+        forms.add(os.path.realpath(p))
+    except Exception:
+        pass
+    return any(f == c or f.startswith(c.rstrip("/") + "/") for f in forms for c in cands)
+
+
+def references_wt(text):
+    # Boundary-aware: <wt> followed by a non-path char (/ , whitespace, quote, EOL) — never a bare
+    # substring, so a SIBLING worktree like `<wt>-2` / `<wt>.bak` is not mistaken for the live tree.
+    return any(re.search(re.escape(c) + r"(?![\w.-])", text) for c in cands)
 
 
 def bash_mutates_wt(cmd):
-    if not isinstance(cmd, str) or not any(c in cmd for c in cands):
+    if not isinstance(cmd, str) or not references_wt(cmd):
         return False  # does not reference the absolute live-tree path at all
-    # Redirection or command chaining could smuggle a write past a leading read-only verb
-    # (`git -C $wt status && rm $wt/x`) — treat any such compound referencing $wt as a mutation.
-    if any(t in cmd for t in (">", ";", "&&", "||", "|", "$(", "`")):
+    # Command chaining / an output redirect could smuggle a write past a leading read-only verb
+    # (`git -C $wt status && rm $wt/x`, `... > $wt/x`) — treat such a compound as a mutation. A bare
+    # pipe is NOT included: `git -C $wt log | head` stays a read. (The reasoner is never told $wt's
+    # absolute path — #239 — so ANY command referencing it is already off-posture; voiding is safe.)
+    if any(t in cmd for t in (">", ";", "&&", "||", "$(", "`")):
         return True
     m = re.match(r"git\s+(?:-C\s+\S+\s+)?(\S+)", cmd.strip())
     if m and m.group(1) in RO_GIT:
@@ -2467,37 +2503,40 @@ def bash_mutates_wt(cmd):
 
 
 saw_stream = False
-for raw_line in os.environ.get("_AFK_RAW", "").splitlines():
-    line = raw_line.strip()
-    if not line:
-        continue
-    try:
-        obj = json.loads(line)
-    except Exception:
-        continue  # non-JSON (a plain-text answerer stub) — not an auditable stream event
-    if not isinstance(obj, dict):
-        continue
-    if obj.get("type") in ("system", "assistant", "user", "result"):
-        saw_stream = True
-    if obj.get("type") != "assistant":
-        continue
-    content = (obj.get("message") or {}).get("content")
-    if not isinstance(content, list):
-        continue
-    for block in content:
-        if not isinstance(block, dict) or block.get("type") != "tool_use":
+with open(os.environ["_AFK_RAWFILE"], encoding="utf-8", errors="replace") as fh:
+    for raw_line in fh:
+        line = raw_line.strip()
+        if not line:
             continue
-        name = block.get("name")
-        inp = block.get("input") or {}
-        if not isinstance(inp, dict):
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue  # non-JSON (a plain-text answerer stub) — not an auditable stream event
+        if not isinstance(obj, dict):
             continue
-        if name in WRITE_TOOLS and any(path_under_wt(inp.get(k)) for k in ("file_path", "path", "notebook_path")):
-            sys.exit(0)
-        if name == "Bash" and bash_mutates_wt(inp.get("command")):
-            sys.exit(0)
+        if obj.get("type") in ("system", "assistant", "user", "result"):
+            saw_stream = True
+        if obj.get("type") != "assistant":
+            continue
+        content = (obj.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = block.get("name")
+            inp = block.get("input") or {}
+            if not isinstance(inp, dict):
+                continue
+            if name in WRITE_TOOLS and any(path_under_wt(inp.get(k)) for k in ("file_path", "path", "notebook_path")):
+                sys.exit(0)
+            if name == "Bash" and bash_mutates_wt(inp.get("command")):
+                sys.exit(0)
 sys.exit(3 if saw_stream else 4)
 PYEOF
-  case $? in 0) return 0 ;; 3) return 1 ;; *) return 2 ;; esac
+  rc=$?
+  rm -f "$rawfile" 2>/dev/null || true
+  case "$rc" in 0) return 0 ;; 3) return 1 ;; *) return 2 ;; esac
 }
 
 # _answer_delivered <wt> <target> <text> <sizes> -> after _transcript_advanced
@@ -2820,19 +2859,25 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
     # answer is derived from a stale tree and must NEVER be injected (#244 review): the tree-changed
     # path ALWAYS returns here, so we never fall through to the ANSWER branch's recompute (which
     # would re-baseline fp_before and inject over the mutated tree).
-    # #247 option (c): ATTRIBUTE the diff by the REASONER's OWN tool_use audit, not the spoke
-    # transcript (whose whole-tree-diff attribution was leaky at the edges — #244 residuals).
+    # #247 option (c): ATTRIBUTE the diff by the REASONER's OWN tool_use audit (whose whole-tree-diff
+    # attribution the spoke transcript could only guess at — #244 residuals). Only a PROVEN reasoner
+    # write (rw_rc 0) short-circuits to void amid spoke activity; when the audit does NOT prove a write
+    # we do NOT trust it alone — an escape via a vector the audit does not model must still fail SAFE
+    # (#244's "unconfirmed change => VOID"), so we attribute to the spoke ONLY on a positive spoke
+    # signal and otherwise VOID.
     _reasoner_wrote_live_tree "$raw" "$wt"; local rw_rc=$? do_void=0
     if [ "$rw_rc" -eq 0 ]; then
       # The audit PROVES a reasoner live-tree write (a write tool under $wt / a mutating $wt-absolute
       # Bash). Void even amid COINCIDENT genuine spoke activity — closes #244 residual 1.
       do_void=1
     elif [ "$rw_rc" -eq 1 ]; then
-      # The audit PROVES the reasoner made NO live-tree write, so the diff is the spoke's own edits
-      # (a self-resume) or a sibling's — DROP the stale answer, never void, WITHOUT reading the spoke
-      # transcript. Closes residual 2 (a self-resume leaving only a tool_result) and residual 3 (an
-      # unreadable transcript): neither can false-void, because attribution no longer depends on them.
-      do_void=0
+      # The audit saw the reasoner's stream and found no modelled live-tree write. Attribute the diff
+      # to the spoke ONLY on a positive transcript TOUCH — any appended record, since the isolated
+      # reasoner writes nothing to the live transcript, so a #240 tool_result-only self-resume still
+      # proves the spoke (closes residual 2). Spoke totally silent + a tree diff the audit could not
+      # attribute ⇒ an unmodelled escape ⇒ fail SAFE and VOID (the #244 posture, restored).
+      _spoke_touched_transcript "$wt" "$parked_sizes"; local touch_rc=$?
+      [ "$touch_rc" -ne 0 ] && do_void=1
     else
       # rw_rc 2: the audit is UNAVAILABLE (a plain-text answerer / no stream-json / no python3) —
       # fall back to the #244 spoke-activity signal, unchanged: void UNLESS a genuine spoke turn
@@ -2866,8 +2911,9 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
   # signature — a healthy answer that merely discusses auth exits 0 and is unaffected.
   # Raise the global stop flag so the supervisor pauses DISPATCH and re-probes (#241 §9). WARN
   # this spoke (an auth failure is not its fault — never block it); the drain resumes servicing
-  # it once auth recovers, rather than parking it blocked/<issue>.
-  if [ "$rc" -ne 0 ] && is_auth_failure "$raw_text"; then
+  # it once auth recovers, rather than parking it blocked/<issue>. #247: read the RAW stream (not
+  # the normalized text) so an auth signature in a dropped stream-json event is never missed.
+  if [ "$rc" -ne 0 ] && is_auth_failure "$raw"; then
     _AFK_AUTH_FAILED=1
     broker_warn_continue "$wt" "$issue" auth \
       "subscription auth failed — token could not refresh; re-run /login on the host (drain paused, re-probing)" reversible

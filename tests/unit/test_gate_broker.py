@@ -1031,8 +1031,57 @@ def test_reasoner_wrote_live_tree_classifies_tool_calls(spoke_repo: Path) -> Non
         )
         == "RC=1"
     )
+    # rc 1 — a read-only inspection PIPED to a pager references $wt but writes nothing (a bare pipe
+    # is not a mutation metachar), so it must not spuriously void a valid answer (review finding 3).
+    assert (
+        rc(
+            _assistant_tool_use("Bash", {"command": f"git -C {wt} log | head"})
+            + "\n"
+            + _result_event("ANSWER: ok")
+        )
+        == "RC=1"
+    )
+    # rc 1 — a SIBLING worktree whose path merely shares $wt as a string prefix is NOT the live tree;
+    # a bare-substring match would misclassify it as an escape (review finding 2).
+    assert (
+        rc(
+            _assistant_tool_use("Bash", {"command": f"cat {wt}-2/notes.txt"})
+            + "\n"
+            + _result_event("ANSWER: ok")
+        )
+        == "RC=1"
+    )
+    # rc 0 — a read-only verb CHAINED to a write of $wt must still be caught: the metachar guard
+    # keeps a compound from smuggling a mutation past a leading read verb.
+    assert (
+        rc(
+            _assistant_tool_use("Bash", {"command": f"git -C {wt} status && rm {wt}/tracked.txt"})
+            + "\n"
+            + _result_event("ANSWER: ok")
+        )
+        == "RC=0"
+    )
     # rc 2 — a plain-text stub carries no auditable stream → unavailable → the caller falls back.
     assert rc("reasoning\nANSWER: go ahead") == "RC=2"
+
+
+def test_reasoner_wrote_live_tree_resolves_symlinked_path(spoke_repo: Path, tmp_path: Path) -> None:
+    # A live-tree write whose absolute path reaches $wt through a symlink alias must still be caught
+    # (review finding 5): path_under_wt compares the symlink-resolved form on both sides.
+    alias = tmp_path / "alias"
+    alias.symlink_to(spoke_repo)  # alias/x.py resolves to spoke_repo/x.py
+    r = _call(
+        '_reasoner_wrote_live_tree "$RAW" "$WT"; echo RC=$?',
+        env={
+            "RAW": _assistant_tool_use("Write", {"file_path": f"{alias}/x.py"})
+            + "\n"
+            + _result_event("ANSWER: ok"),
+            "WT": str(spoke_repo),
+        },
+    )
+    assert r.stdout.strip().splitlines()[-1] == "RC=0", (
+        "a write via a symlink alias of $wt must be caught"
+    )
 
 
 def test_answerer_output_normalization_reads_real_stream_json() -> None:
@@ -1062,11 +1111,40 @@ def test_answerer_output_normalization_reads_real_stream_json() -> None:
     )
     assert warn.stdout.strip() == "nothing to check", warn.stdout
 
-    # A plain-text stub (the #244 answerer stubs) passes through byte-for-byte — zero regression.
+    # A plain-text stub (the #244 answerer stubs) passes through — its DECISION lines are preserved.
     passthrough = _call(
         '_normalize_answerer_output "$RAW"', env={"RAW": "reasoning\nANSWER: go ahead"}
     ).stdout
     assert "ANSWER: go ahead" in passthrough
+
+    # Fallback shape (review finding 6): if the CLI ever emits NO result event, the answer is still
+    # recovered from the assistant `text` blocks — real claude emits both, so the answer survives a
+    # drift in either shape.
+    assistant_only = (
+        json.dumps({"type": "system", "subtype": "init", "model": "m"})
+        + "\n"
+        + json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "REVERSIBILITY: reversible\nANSWER: from assistant",
+                        }
+                    ]
+                },
+            }
+        )
+    )
+    norm2 = _call('_normalize_answerer_output "$RAW"', env={"RAW": assistant_only})
+    kind2, _, text2 = (
+        _call('parse_decision "$(_normalize_answerer_output "$RAW")"', env={"RAW": assistant_only})
+        .stdout.strip()
+        .partition("\t")
+    )
+    assert "ANSWER: from assistant" in norm2.stdout, norm2.stdout
+    assert kind2 == "ANSWER" and text2 == "from assistant", norm2.stdout
 
 
 def test_broker_service_gate_voids_reasoner_escape_coincident_with_spoke_activity(
@@ -1152,6 +1230,43 @@ def test_broker_service_gate_no_void_when_reasoner_clean_and_only_tool_result(
         "a clean reasoner audit (no live write) must DROP the stale answer, never void (residual 2)"
     )
     assert "voiding its answer" not in result.stderr, result.stderr
+
+
+def test_broker_service_gate_voids_unmodelled_escape_when_spoke_silent(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # #247 review finding 1 (the fail-safe): a reasoner escape via a vector the audit does NOT model
+    # (its stream shows only a clean READ) that changes the live tree while the spoke is TOTALLY
+    # SILENT must still VOID — a clean audit must not be trusted alone to DROP an unattributable
+    # change. The audit returns rc 1 (stream, no modelled write); no transcript record is appended,
+    # so the fail-safe voids (the restored #244 "unconfirmed change => VOID").
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (spoke_repo / "tracked.txt").write_text("original")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=spoke_repo, check=True, capture_output=True)
+    live_jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    os.utime(live_jsonl, (1_000_000_000, 1_000_000_000))  # pinned old; the spoke appends NOTHING
+    read_event = _assistant_tool_use("Read", {"file_path": "README.md"})
+    env = {
+        **waiting_spoke_env,
+        # The tree changes (absolute write) but the reasoner's stream shows only a Read and the spoke
+        # appends no record — an unmodelled escape coincident with a silent spoke.
+        "AFK_ANSWERER_CMD": (
+            f"printf 'escaped' > '{spoke_repo}/tracked.txt'; "
+            f"printf '%s\\n' '{read_event}'; "
+            f"printf '%s\\n' '{_result_event('ANSWER: go ahead')}'"
+        ),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert (statedir / "gate-voided-5").exists(), (
+        "a clean-audit change the spoke cannot be shown to have made must VOID (fail-safe, finding 1)"
+    )
+    assert "voiding its answer" in result.stderr, result.stderr
 
 
 def test_broker_service_gate_isolates_reasoner_writes_from_live_tree(
