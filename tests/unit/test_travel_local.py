@@ -25,9 +25,25 @@ import contextlib
 import os
 import signal
 import subprocess
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+
+
+@dataclass
+class TravelEnv:
+    """Hermetic harness handed to each test: stub paths + a ``run`` helper."""
+
+    bindir: Path
+    log: Path
+    conf: Path
+    pidfile: Path
+    state: Path
+    base_env: dict[str, str]
+    run: Callable[..., subprocess.CompletedProcess[str]]
+
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "travel-local.sh"
 
@@ -38,10 +54,10 @@ def _write_stub(path: Path, body: str) -> None:
 
 
 @pytest.fixture()
-def env(tmp_path: Path):
+def env(tmp_path: Path) -> Iterator[TravelEnv]:
     """A hermetic PATH of logging stubs + a fake gate-broker and hub-afk.
 
-    Returns a small namespace: ``bindir``, ``log`` (the call-log path), ``conf``
+    Returns a :class:`TravelEnv`: ``bindir``, ``log`` (the call-log path), ``conf``
     (the ~/.afk-travel path), ``pidfile``, ``state`` (AFK_STATE_DIR), ``base_env``
     and a ``run(*args, **overrides)`` helper. Any caffeinate the run leaves alive is
     reaped in teardown via the pidfile.
@@ -79,9 +95,7 @@ def env(tmp_path: Path):
     )
     _write_stub(
         bindir / "caffeinate",
-        f'echo "caffeinate $*" >> "{log}"\n'
-        'if [ "${STUB_CAFFEINATE:-alive}" = "die" ]; then exit 1; fi\n'
-        "exec sleep 300\n",
+        f'echo "caffeinate $*" >> "{log}"\nexec sleep 300\n',
     )
     _write_stub(bindir / "curl", f'echo "curl $*" >> "{log}"\nexit "${{STUB_CURL_RC:-0}}"\n')
 
@@ -113,27 +127,26 @@ def env(tmp_path: Path):
         "AFK_TRAVEL_PIDFILE": str(pidfile),
         "AFK_TRAVEL_JOIN_DELAY": "0",
         "AFK_TRAVEL_JOIN_RETRIES": "3",
-        "AFK_TRAVEL_SETTLE": "0",
         "AFK_GATE_BROKER": str(broker),
         "AFK_HUB_AFK": str(hubafk),
         "AFK_STATE_DIR": str(state),
     }
 
-    class _Env:
-        pass
-
-    e = _Env()
-    e.bindir, e.log, e.conf, e.pidfile, e.state = bindir, log, conf, pidfile, state
-    e.base_env = base_env
-
-    def run(*args: str, **overrides: str) -> subprocess.CompletedProcess:
+    def run(*args: str, **overrides: str) -> subprocess.CompletedProcess[str]:
         run_env = {**base_env, **overrides}
         return subprocess.run(
             ["bash", str(SCRIPT), *args], capture_output=True, text=True, env=run_env
         )
 
-    e.run = run
-    yield e
+    yield TravelEnv(
+        bindir=bindir,
+        log=log,
+        conf=conf,
+        pidfile=pidfile,
+        state=state,
+        base_env=base_env,
+        run=run,
+    )
 
     # Reap any caffeinate the run left alive.
     if pidfile.exists():
@@ -185,8 +198,9 @@ def test_on_happy_path_joins_verifies_disablesleep_and_caffeinates(env) -> None:
     assert "networksetup -setairportnetwork en0 Mathieu iPhone" in calls
     assert "curl" in calls
     assert "pmset -a disablesleep 1" in calls
-    assert "caffeinate" in calls
-    assert env.pidfile.exists()
+    # The pidfile (written synchronously by the launcher) is the deterministic proof the
+    # caffeinate daemon was started — the daemon's own call-log line is async.
+    assert env.pidfile.read_text().strip(), "caffeinate pid not recorded"
     assert "lid-close safe" in proc.stdout.lower()
 
 
@@ -199,8 +213,8 @@ def test_on_fails_when_hotspot_never_appears(env) -> None:
     assert "pmset -a disablesleep 1" not in _calls(env)
 
 
-def test_on_rolls_back_disablesleep_when_caffeinate_dies(env) -> None:
-    proc = env.run("on", STUB_CAFFEINATE="die", AFK_TRAVEL_SETTLE="0.3")
+def test_on_rolls_back_disablesleep_when_caffeinate_unavailable(env) -> None:
+    proc = env.run("on", AFK_TRAVEL_CAFFEINATE="caffeinate-absent")
 
     assert proc.returncode != 0
     calls = _calls(env)
@@ -212,12 +226,14 @@ def test_on_rolls_back_disablesleep_when_caffeinate_dies(env) -> None:
 def test_on_is_idempotent_reusing_a_live_caffeinate(env) -> None:
     first = env.run("on")
     assert first.returncode == 0, first.stderr
+    pid_after_first = env.pidfile.read_text()
 
     second = env.run("on")
 
     assert second.returncode == 0, second.stderr
-    # The second run saw a live pidfile and did NOT launch a second caffeinate.
-    assert _calls(env).count("caffeinate") == 1
+    # The second run saw the live pidfile and reused it — the pid is unchanged, proving no
+    # second caffeinate was launched.
+    assert env.pidfile.read_text() == pid_after_first
 
 
 # --- off ----------------------------------------------------------------------
