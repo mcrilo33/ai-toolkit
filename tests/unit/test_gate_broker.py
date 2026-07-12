@@ -26,6 +26,7 @@ pytestmark = pytest.mark.skipif(
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GATE_BROKER = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "gate-broker.sh"
+FIXTURES = REPO_ROOT / "tests" / "unit" / "fixtures"
 
 
 @pytest.fixture(autouse=True)
@@ -956,6 +957,201 @@ def test_spoke_activity_appended_classifies_turns(spoke_repo: Path, tmp_path: Pa
     assert truncated.stdout.strip().splitlines()[-1] == "RC=1", (
         "activity mode must skip a truncated file, not from-0 match the pre-park record (fail-safe)"
     )
+
+
+# ── option (c): the reasoner tool-call audit (#247) ───────────────────────────
+# #244 attributed a whole-tree diff by the SPOKE's transcript activity — leaky at the
+# edges because the diff carries no evidence of WHO wrote it. #247 keys the void on
+# REASONER evidence: an audit of the reasoner's own tool_use stream. The fingerprint
+# stays the trigger ("the tree changed"); the audit is the attribution — void iff the
+# reasoner PROVABLY wrote the live tree, drop iff it provably did not. When the audit is
+# UNAVAILABLE (a plain-text stub, no stream, no python3) it falls back to the #244
+# activity signal, so the whole #244 suite stays green unchanged.
+
+
+def _assistant_tool_use(name: str, cmd_or_input: dict) -> str:
+    return json.dumps(
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "name": name, "input": cmd_or_input}]},
+        }
+    )
+
+
+def _result_event(text: str) -> str:
+    return json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": text})
+
+
+def test_reasoner_wrote_live_tree_classifies_tool_calls(spoke_repo: Path) -> None:
+    # The #247 attribution primitive: rc 0 when the reasoner's tool_use stream shows a LIVE-tree
+    # write (a write tool under $wt, or a mutating Bash referencing the absolute $wt path); rc 1
+    # when the stream is present but shows NO live write (a definite "the reasoner didn't write");
+    # rc 2 when the input is not an auditable stream (a plain-text stub → fall back to #244).
+    wt = spoke_repo
+
+    def rc(raw: str) -> str:
+        r = _call(
+            '_reasoner_wrote_live_tree "$RAW" "$WT"; echo RC=$?', env={"RAW": raw, "WT": str(wt)}
+        )
+        return r.stdout.strip().splitlines()[-1]
+
+    # rc 0 — a write tool whose absolute path is under $wt (an isolation escape).
+    assert (
+        rc(
+            _assistant_tool_use("Write", {"file_path": f"{wt}/x.py"})
+            + "\n"
+            + _result_event("ANSWER: ok")
+        )
+        == "RC=0"
+    )
+    # rc 0 — a Bash that mutates the absolute $wt path.
+    assert (
+        rc(
+            _assistant_tool_use("Bash", {"command": f"printf x > {wt}/tracked.txt"})
+            + "\n"
+            + _result_event("ANSWER: ok")
+        )
+        == "RC=0"
+    )
+    # rc 1 — a RELATIVE write lands in the #237 snapshot copy, never the live tree — not a breach.
+    assert (
+        rc(
+            _assistant_tool_use("Write", {"file_path": "relative.py"})
+            + "\n"
+            + _result_event("ANSWER: ok")
+        )
+        == "RC=1"
+    )
+    # rc 1 — a read-only `git -C $wt status` references $wt but cannot mutate it — not a breach.
+    assert (
+        rc(
+            _assistant_tool_use("Bash", {"command": f"git -C {wt} status"})
+            + "\n"
+            + _result_event("ANSWER: ok")
+        )
+        == "RC=1"
+    )
+    # rc 2 — a plain-text stub carries no auditable stream → unavailable → the caller falls back.
+    assert rc("reasoning\nANSWER: go ahead") == "RC=2"
+
+
+def test_answerer_output_normalization_reads_real_stream_json() -> None:
+    # #247 CRITICAL: the stream-json → final-text extraction is a SINGLE normalization step whose
+    # output feeds parse_decision, parse_decision_field (REVERSIBILITY/WARN) AND is_auth_failure —
+    # else the #241 reversibility class + WARN silently drop to empty under stream-json. Pinned
+    # against a REAL captured `--output-format stream-json --verbose` sample so the result-event
+    # shape we extract from can't silently drift.
+    sample = (FIXTURES / "answerer_stream_sample.jsonl").read_text()
+
+    norm = _call('_normalize_answerer_output "$RAW"', env={"RAW": sample}).stdout
+    assert "ANSWER: hello from the stream sample" in norm
+    assert "REVERSIBILITY: reversible" in norm
+    assert "WARN: nothing to check" in norm
+
+    dec = _call('parse_decision "$(_normalize_answerer_output "$RAW")"', env={"RAW": sample})
+    kind, _, text = dec.stdout.strip().partition("\t")
+    assert kind == "ANSWER" and text == "hello from the stream sample", dec.stdout
+
+    rev = _call(
+        'parse_decision_field "$(_normalize_answerer_output "$RAW")" REVERSIBILITY',
+        env={"RAW": sample},
+    )
+    assert rev.stdout.strip() == "reversible", rev.stdout
+    warn = _call(
+        'parse_decision_field "$(_normalize_answerer_output "$RAW")" WARN', env={"RAW": sample}
+    )
+    assert warn.stdout.strip() == "nothing to check", warn.stdout
+
+    # A plain-text stub (the #244 answerer stubs) passes through byte-for-byte — zero regression.
+    passthrough = _call(
+        '_normalize_answerer_output "$RAW"', env={"RAW": "reasoning\nANSWER: go ahead"}
+    ).stdout
+    assert "ANSWER: go ahead" in passthrough
+
+
+def test_broker_service_gate_voids_reasoner_escape_coincident_with_spoke_activity(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # #247 acceptance (residual 1): a real reasoner isolation-escape (absolute-path live-tree
+    # write) that lands in the SAME window as a GENUINE spoke turn is attributed WHOLLY to the
+    # spoke by #244 and dropped — no void, no triage marker. Keying on the reasoner's own
+    # tool_use audit closes it: the audit sees the live-tree write, so it VOIDS even amid the
+    # coincident spoke activity.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (spoke_repo / "tracked.txt").write_text("original")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=spoke_repo, check=True, capture_output=True)
+    live_jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    os.utime(live_jsonl, (1_000_000_000, 1_000_000_000))
+    # The spoke self-resumes concurrently: its own assistant tool_use — genuine #244 activity.
+    resumed = json.dumps(
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "name": "Edit", "input": {}}]},
+        }
+    )
+    tool_event = _assistant_tool_use(
+        "Bash", {"command": f"printf mutated > {spoke_repo}/tracked.txt"}
+    )
+    env = {
+        **waiting_spoke_env,
+        # The reasoner escapes isolation (an absolute-path live write, on stdout as a stream-json
+        # tool_use AND performed for real so the fingerprint changes) WHILE the spoke self-resumes.
+        "AFK_ANSWERER_CMD": (
+            f"printf 'escaped' > '{spoke_repo}/tracked.txt'; "
+            f"printf '%s\\n' '{tool_event}'; "
+            f"printf '%s\\n' '{_result_event('ANSWER: go ahead')}'; "
+            f"printf '%s\\n' '{resumed}' >> '{live_jsonl}'"
+        ),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert (statedir / "gate-voided-5").exists(), (
+        "a reasoner escape coincident with genuine spoke activity must VOID (residual 1 closed)"
+    )
+    assert "voiding its answer" in result.stderr, result.stderr
+
+
+def test_broker_service_gate_no_void_when_reasoner_clean_and_only_tool_result(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # #247 acceptance (residual 2): a self-resuming spoke whose ONLY appended record is a
+    # synthetic tool_result (its tool_use flushed just before the parked_sizes snapshot) reads as
+    # NO activity under #244 → false-void. Keying on the reasoner's own audit closes it: the audit
+    # shows the reasoner made NO live-tree write, so the diff is the spoke's → DROP, never void.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (spoke_repo / "tracked.txt").write_text("original")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=spoke_repo, check=True, capture_output=True)
+    live_jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    os.utime(live_jsonl, (1_000_000_000, 1_000_000_000))
+    tool_result = json.dumps({"type": "user", "message": {"content": [{"type": "tool_result"}]}})
+    read_event = _assistant_tool_use("Read", {"file_path": "README.md"})
+    env = {
+        **waiting_spoke_env,
+        # The spoke edits its own tracked file (a live-tree diff) but its self-resume leaves only a
+        # tool_result appended; the reasoner's audit stream shows only a clean READ (no live write).
+        "AFK_ANSWERER_CMD": (
+            f"printf 'edited by the spoke' > '{spoke_repo}/tracked.txt'; "
+            f"printf '%s\\n' '{read_event}'; "
+            f"printf '%s\\n' '{_result_event('ANSWER: go ahead')}'; "
+            f"printf '%s\\n' '{tool_result}' >> '{live_jsonl}'"
+        ),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert not (statedir / "gate-voided-5").exists(), (
+        "a clean reasoner audit (no live write) must DROP the stale answer, never void (residual 2)"
+    )
+    assert "voiding its answer" not in result.stderr, result.stderr
 
 
 def test_broker_service_gate_isolates_reasoner_writes_from_live_tree(
