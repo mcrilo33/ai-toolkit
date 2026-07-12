@@ -937,8 +937,11 @@ _reap_or_resume() {
   # same-tick slot_state flicker (answer_pass and reap_pass re-derive state independently) or a
   # future regression. _spoke_still_parked is a POSITIVE signal, so an ambiguous read falls
   # through to the revive logic below — a genuinely hung, unparked pane is unaffected (#246 item 4).
+  # Wrapped in _afk_run_with_heartbeat_fg like answer_pass's identical call (#170 ST2): the
+  # answerer is a high-effort headless `claude` that can run for minutes, so without the heartbeat
+  # stamper the --watchdog would declare the supervisor wedged and respawn it mid-answer.
   if _spoke_still_parked "$wt" "$issue"; then
-    decide_and_act "$wt" "$issue"
+    _afk_run_with_heartbeat_fg decide_and_act "$wt" "$issue"
     return 0
   fi
   # #200/#241: a live pane at a clean-pushed tip with no marker is warned-and-parked-LAST with an
@@ -1531,6 +1534,11 @@ reap_pass() {
       fi
     fi
     _reap_or_resume "$path" "$issue"
+    # The #246 park-guard may have run decide_and_act, whose answerer can raise _AFK_AUTH_FAILED
+    # (dead subscription token) mid-loop. reap_pass is the last pass, so nothing checks the flag
+    # after it — bail the loop now rather than revive the remaining over-ceiling survivors into
+    # dead auth (the #170 ST7 harm the top-of-loop probe already guards against for the first reap).
+    if [ "$_AFK_AUTH_FAILED" -eq 1 ]; then return 0; fi
   done < <(inflight_worktrees)
 }
 
