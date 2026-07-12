@@ -75,6 +75,10 @@ def _isolated_afk_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     # it when refactoring these self-copy tests.
     monkeypatch.delenv("AFK_RUNNING_COPY", raising=False)
     monkeypatch.delenv("AFK_SELF_COPY", raising=False)
+    # Same isolation for the #243 hang-forensics bundle root: the reaper's revive path now
+    # captures a bundle under <git-common-dir>/hang-forensics before it kills the pane, so
+    # without this pin any reap/revive test would write into the REAL repo's .git.
+    monkeypatch.setenv("AFK_HANG_FORENSICS_DIR", str(tmp_path / "hang-forensics"))
 
 
 def _call(fn_call: str, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -6750,6 +6754,200 @@ def test_reap_pass_pushed_but_unmarked_warns_not_reaps(tmp_path: Path) -> None:
     assert (statedir / "warned-5.txt").exists()
 
 
+# ── issue #243: hang-forensics bundle before the reaper tears down a frozen spoke ──
+# A live-but-frozen claude spoke is REVIVED (#241) by killing its pane and relaunching —
+# which DESTROYS the evidence needed to characterize the hang or file an upstream report.
+# So `_revive_spoke` captures a best-effort, bounded bundle to
+# <git-common-dir>/hang-forensics/<issue>-<epoch>/ BEFORE the kill. A crashed pane (no live
+# process) has nothing to capture and skips gracefully.
+
+
+def _forensics_bin(
+    tmp_path: Path,
+    *,
+    pane_path: Path | None,
+    pane_pid: str | None = None,
+    pane_text: str = "frozen composer: [pasted 4096 chars]",
+) -> tuple[Path, Path]:
+    """A tmux + `sample` PATH stub for the hang-capture path. `tmux` answers list-panes with
+    one pane at `pane_path` (or nothing ⇒ dead pane), display-message with the pid / pane-meta,
+    and capture-pane with `pane_text`. `sample` is stubbed so no real 2s sampler runs and the
+    `command -v sample` gate is exercised deterministically. Returns (fake_bin, tmux_log).
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    log = tmp_path / "tmux.log"
+    panes = tmp_path / "panes.txt"
+    panes.write_text(f"afk:1\t{pane_path}\n" if pane_path is not None else "")
+    pid = pane_pid if pane_pid is not None else str(os.getpid())
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> "{log}"\n'
+        'case "$1" in\n'
+        f'  list-panes) cat "{panes}" ;;\n'
+        f'  capture-pane) printf "%s\\n" "{pane_text}" ;;\n'
+        "  display-message)\n"
+        '    if printf "%s" "$*" | grep -q "pane_in_mode"; then\n'
+        '      printf "pane_in_mode=0 pane_current_command=node\\n"\n'
+        '    elif printf "%s" "$*" | grep -q "pane_pid"; then\n'
+        f'      printf "%s\\n" "{pid}"\n'
+        "    fi ;;\n"
+        "esac\n"
+        "exit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    (fake_bin / "sample").write_text(
+        '#!/usr/bin/env bash\nprintf "Sample stub for pid %s\\n" "$1"\nexit 0\n'
+    )
+    (fake_bin / "sample").chmod(0o755)
+    return fake_bin, log
+
+
+def test_capture_hang_forensics_writes_bundle_for_live_pane(tmp_path: Path) -> None:
+    # AC1/AC2: a live-but-frozen pane leaves a bundle with the process/pane/transcript/
+    # fingerprint evidence, and the bundle path is echoed for the caller's journal line.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke)
+    _write_transcript(
+        pd,
+        [
+            {"type": "assistant", "message": {"model": "claude-opus-4-8", "content": []}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}},
+        ],
+    )
+    fake_bin, _ = _forensics_bin(tmp_path, pane_path=spoke)
+    forensics = tmp_path / "hang-forensics"
+
+    result = _call(
+        f"_afk_capture_hang_forensics '{spoke}' 5",
+        env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_HANG_FORENSICS_DIR": str(forensics),
+            "AFK_NOW": "1700000000",
+            "AI_TOOLKIT_OTEL": "1",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4317",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    bundle = Path(result.stdout.strip())
+    assert bundle.is_dir(), f"expected an echoed bundle dir, got {result.stdout!r}"
+    assert bundle.parent == forensics and bundle.name == "5-1700000000"
+    assert (bundle / "process-tree.txt").exists()
+    assert (bundle / "pane.txt").read_text().strip() != "", "the frozen pane must be captured"
+    assert (bundle / "pane-meta.txt").exists()
+    assert "frozen composer" in (bundle / "pane.txt").read_text()
+    assert "[pasted" in (bundle / "pane.txt").read_text(), "the wedged-paste symptom is preserved"
+    tail = (bundle / "transcript-tail.jsonl").read_text()
+    assert '"text": "hi"' in tail or '"text":"hi"' in tail
+    fp = (bundle / "fingerprint.txt").read_text()
+    assert "AI_TOOLKIT_OTEL=1" in fp, "the OTEL env fingerprint must be recorded"
+    assert "http://localhost:4317" in fp
+
+
+def test_capture_hang_forensics_includes_process_tree_and_sample(tmp_path: Path) -> None:
+    # The process-tree snapshot carries the pane pid's ps row (etime/stat/wchan) and, on macOS,
+    # a `sample`; both are best-effort but must land when available.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke)
+    _write_transcript(pd, [{"type": "assistant", "message": {"content": []}}])
+    fake_bin, _ = _forensics_bin(tmp_path, pane_path=spoke, pane_pid=str(os.getpid()))
+
+    result = _call(
+        f"_afk_capture_hang_forensics '{spoke}' 5",
+        env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_HANG_FORENSICS_DIR": str(tmp_path / "hang-forensics"),
+            "AFK_NOW": "1700000000",
+        },
+    )
+
+    tree = (Path(result.stdout.strip()) / "process-tree.txt").read_text()
+    assert str(os.getpid()) in tree, "the pane pid's ps row must be captured"
+    assert "Sample stub" in tree, "a macOS `sample` is appended when available"
+
+
+def test_capture_hang_forensics_skips_dead_pane(tmp_path: Path) -> None:
+    # AC1: a clean reap (crashed pane, no live process) leaves NO bundle and does not error.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, _ = _forensics_bin(tmp_path, pane_path=None)  # empty list-panes ⇒ dead pane
+    forensics = tmp_path / "hang-forensics"
+
+    result = _call(
+        f'_afk_capture_hang_forensics "{spoke}" 5; echo "RC=$?"',
+        env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "AFK_HANG_FORENSICS_DIR": str(forensics),
+            "AFK_NOW": "1700000000",
+        },
+    )
+
+    assert "RC=0" in result.stdout, "a dead pane skips gracefully, never errors"
+    assert result.stdout.replace("RC=0", "").strip() == "", (
+        "no bundle path is echoed for a dead pane"
+    )
+    assert not forensics.exists() or not any(forensics.iterdir()), "no bundle for a crashed reap"
+
+
+def test_reap_pass_hung_spoke_captures_forensics_and_journals_path(tmp_path: Path) -> None:
+    # AC3: reaping a live-but-frozen spoke leaves a bundle AND the revive journal line names it.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, _ = _forensics_bin(tmp_path, pane_path=spoke)  # pane ALIVE (frozen)
+    expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    forensics = tmp_path / "hang-forensics"
+    env["AFK_HANG_FORENSICS_DIR"] = str(forensics)
+
+    _call(expr, env=env)
+
+    bundles = list(forensics.glob("5-*")) if forensics.exists() else []
+    assert bundles, "a reaped hung live pane must leave a forensics bundle"
+    journal = (statedir / "decision-journal.jsonl").read_text()
+    assert "revive" in journal
+    assert "hang forensics" in journal, "the revive journal line must surface the bundle location"
+    assert str(bundles[0]) in journal, "the journal line names the exact bundle path"
+
+
+def test_status_surfaces_hang_forensics_line_when_bundles_exist(tmp_path: Path) -> None:
+    # AC3: --status carries a one-line hang-forensics summary when bundles exist.
+    forensics = tmp_path / "hang-forensics"
+    (forensics / "232-1700000000").mkdir(parents=True)
+    (forensics / "240-1700000300").mkdir(parents=True)
+    state = _armed_state(tmp_path, "drain")
+    hb = tmp_path / "heartbeat"
+    expr = f'printf "%s 1700000560\\n" "$$" > "{hb}"; _status'
+
+    result = _call(
+        expr,
+        env={
+            "AFK_STATE": str(state),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_HANG_FORENSICS_DIR": str(forensics),
+            "AFK_NOW": "1700000600",
+            "AI_TOOLKIT_OTEL": "0",
+        },
+    )
+
+    assert "hang-forensics" in result.stdout
+    assert "2" in result.stdout, "the count of captured bundles is surfaced"
+    assert str(forensics) in result.stdout
+
+
+def test_hang_forensics_status_silent_when_no_bundles(tmp_path: Path) -> None:
+    # No bundles ⇒ no line (never a noisy "0 bundles" on every status read).
+    forensics = tmp_path / "hang-forensics"  # absent
+
+    result = _call(
+        "afk_hang_forensics_status",
+        env={"AFK_HANG_FORENSICS_DIR": str(forensics)},
+    )
+
+    assert result.stdout.strip() == "", "no hang-forensics line when nothing was captured"
+
+
 # ── issue #241 S7: auto_land review-gate / land-retry / land-failure warn, not block ──
 # The land pass never parks a spoke blocked/<issue>. An unclean review verdict warns + retries
 # by default (or warns + LANDS with AFK_REVIEW_GATE_ON_UNCLEAN=land, never silent block); a land
@@ -7269,7 +7467,7 @@ def test_arm_emits_power_warnings_on_fresh_arm(tmp_path: Path) -> None:
             "AFK_STATE": str(state),
             "AFK_PMSET_BIN": str(pm),
             "AFK_ARM_PRECHECK": "0",  # skip the #170 live/dirty/branch/gh gate
-            "AI_TOOLKIT_OTEL": "0",   # telemetry preflight is a no-op
+            "AI_TOOLKIT_OTEL": "0",  # telemetry preflight is a no-op
             "AFK_NOW": "1700000000",
         },
     )
