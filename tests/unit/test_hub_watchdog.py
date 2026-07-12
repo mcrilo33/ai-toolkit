@@ -26,8 +26,13 @@ HUB_WATCHDOG = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "hub-watchd
 
 
 def _call(fn_call: str, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-    """Source hub-watchdog.sh and invoke a shell expression against its functions."""
-    full_env = {**os.environ, "TZ": "UTC"}
+    """Source hub-watchdog.sh and invoke a shell expression against its functions.
+
+    HUB_WATCHDOG_FILE defaults OFF here: this host has an authed `gh`, so a default-on defect
+    file would fire a real hub-agent/gh against the live repo. The filing tests opt back in with
+    HUB_WATCHDOG_FILE=1 + the HUB_WATCHDOG_SCOPER_CMD / _DEDUP_CMD / _LABEL_CMD stubs.
+    """
+    full_env = {**os.environ, "TZ": "UTC", "HUB_WATCHDOG_FILE": "0"}
     if env:
         full_env.update(env)
     return subprocess.run(
@@ -516,3 +521,106 @@ def test_run_conditions_fires_park_and_invokes_answer_seam(tmp_path: Path) -> No
 
     assert '"condition":"park-unanswered"' in ledger.read_text()
     assert answered.exists(), "a park firing must invoke the answer intervention"
+
+
+# ── the instrument: classify + file the defect (issue #251, subtask 4) ─────────
+# Every firing is classified {afk-defect|novel-decision} so a genuine human-call escalation is
+# not mis-filed as an afk bug; afk-defects file (deduped) via a headless bug-scoper. Filing is
+# gated by HUB_WATCHDOG_FILE (default OFF in _call) so no test hits the live gh/hub-agent.
+
+
+def test_classify_defaults_to_afk_defect() -> None:
+    assert _call("_wd_classify dead-pane 5").stdout.strip() == "afk-defect"
+
+
+def test_classify_seam_overrides_to_novel_decision(tmp_path: Path) -> None:
+    env = {"HUB_WATCHDOG_CLASSIFY_CMD": "echo novel-decision"}
+    assert _call("_wd_classify park-unanswered 5", env=env).stdout.strip() == "novel-decision"
+
+
+def test_fire_records_the_class_in_the_ledger(tmp_path: Path) -> None:
+    ledger = tmp_path / "l.jsonl"
+    env = {"HUB_WATCHDOG_LEDGER": str(ledger), "AFK_NOW": NOW}
+
+    _call("_wd_fire dead-pane 5 'reaper missed it'", env=env)
+
+    assert '"class":"afk-defect"' in ledger.read_text()
+
+
+def test_afk_defect_firing_dispatches_the_scoper(tmp_path: Path) -> None:
+    ledger = tmp_path / "l.jsonl"
+    scoped = tmp_path / "scoped"
+    env = {
+        "HUB_WATCHDOG_LEDGER": str(ledger),
+        "HUB_WATCHDOG_FILE": "1",  # opt back in
+        "HUB_WATCHDOG_DEDUP_CMD": "true",  # no open dup (empty stdout)
+        "HUB_WATCHDOG_LABEL_CMD": "true",
+        "HUB_WATCHDOG_SCOPER_CMD": f'printf "%s %s" "$1" "$2" > {scoped}',
+        "AFK_STATE_DIR": str(tmp_path / "state"),
+        "AFK_NOW": NOW,
+    }
+
+    _call("_wd_fire dead-pane 5 'reaper missed it'", env=env)
+
+    assert scoped.read_text() == "dead-pane 5", "afk-defect must dispatch the bug-scoper"
+
+
+def test_novel_decision_firing_does_not_file(tmp_path: Path) -> None:
+    scoped = tmp_path / "scoped"
+    env = {
+        "HUB_WATCHDOG_LEDGER": str(tmp_path / "l.jsonl"),
+        "HUB_WATCHDOG_FILE": "1",
+        "HUB_WATCHDOG_CLASSIFY_CMD": "echo novel-decision",
+        "HUB_WATCHDOG_SCOPER_CMD": f"touch {scoped}",
+        "AFK_STATE_DIR": str(tmp_path / "state"),
+        "AFK_NOW": NOW,
+    }
+
+    _call("_wd_fire park-unanswered 5 'a real human call'", env=env)
+
+    assert not scoped.exists(), "a novel human decision must NOT be filed as an afk bug"
+
+
+def test_file_defect_dedups_within_the_run(tmp_path: Path) -> None:
+    calls = tmp_path / "calls"
+    env = {
+        "HUB_WATCHDOG_FILE": "1",
+        "HUB_WATCHDOG_DEDUP_CMD": "true",
+        "HUB_WATCHDOG_LABEL_CMD": "true",
+        "HUB_WATCHDOG_SCOPER_CMD": f"echo x >> {calls}",
+        "AFK_STATE_DIR": str(tmp_path / "state"),
+    }
+
+    _call(
+        "_wd_file_defect dead-pane 5 r; _wd_file_defect dead-pane 5 r; _wd_file_defect dead-pane 5 r",
+        env=env,
+    )
+
+    assert calls.read_text().count("x") == 1, "one defect per condition+issue per run"
+
+
+def test_file_defect_skips_when_open_defect_exists(tmp_path: Path) -> None:
+    scoped = tmp_path / "scoped"
+    env = {
+        "HUB_WATCHDOG_FILE": "1",
+        "HUB_WATCHDOG_DEDUP_CMD": "echo 999",  # a matching open issue exists
+        "HUB_WATCHDOG_SCOPER_CMD": f"touch {scoped}",
+        "AFK_STATE_DIR": str(tmp_path / "state"),
+    }
+
+    _call("_wd_file_defect dead-pane 5 r", env=env)
+
+    assert not scoped.exists(), "an already-open afk-defect must not be duplicated"
+
+
+def test_file_defect_off_by_gate_does_not_dispatch(tmp_path: Path) -> None:
+    scoped = tmp_path / "scoped"
+    env = {
+        "HUB_WATCHDOG_FILE": "0",  # gated off
+        "HUB_WATCHDOG_SCOPER_CMD": f"touch {scoped}",
+        "AFK_STATE_DIR": str(tmp_path / "state"),
+    }
+
+    _call("_wd_file_defect dead-pane 5 r", env=env)
+
+    assert not scoped.exists(), "HUB_WATCHDOG_FILE=0 suppresses filing"

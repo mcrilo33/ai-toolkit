@@ -311,18 +311,116 @@ _wd_json_escape() {
   local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"
 }
 
-# _wd_fire <condition> <issue> <reason> -> record ONE intervention firing: append a JSONL line to
-# the intervention-ledger and log it. Every firing is a bug report against afk. Subtask 4 extends
-# this with the {afk-defect|novel-decision} classification + the headless bug-scoper dispatch;
-# subtask 5's autonomy score counts these lines. Best-effort.
+# --- classify + file the defect (the instrument, issue #251) ------------------
+# Every firing is classified {afk-defect | novel-decision} so a genuine, first-of-its-kind
+# human decision (the reasoner CORRECTLY escalating a real judgment call) is not mis-filed as an
+# afk bug. The 5 conditions are drain shortfalls ⇒ afk-defect by default; a park-unanswered whose
+# spoke the reasoner deliberately escalated (a blocked/ marker exists) is a novel-decision. The
+# HUB_WATCHDOG_CLASSIFY_CMD seam overrides the whole decision (echo the class).
+: "${HUB_WATCHDOG_AFK_DEFECT_LABEL:=afk-defect}"
+
+_wd_classify() {
+  local condition="$1" issue="$2"
+  if [ -n "${HUB_WATCHDOG_CLASSIFY_CMD:-}" ]; then
+    bash -c "$HUB_WATCHDOG_CLASSIFY_CMD" hub-watchdog "$condition" "$issue" 2>/dev/null; return
+  fi
+  case "$condition" in
+    park-unanswered)
+      # A blocked/ record means the reasoner made a real human-call escalation — not a bug.
+      if command -v _afk_blocked_record >/dev/null 2>&1 && [ -f "$(_afk_blocked_record "$issue" 2>/dev/null)" ]; then
+        printf 'novel-decision\n'; return
+      fi ;;
+  esac
+  printf 'afk-defect\n'
+}
+
+# _wd_filed_marker <condition> <issue> -> the per-run dedup marker (one file per condition+issue)
+# so a persistent condition files ONE defect, not one per tick.
+_wd_filed_marker() {
+  local dir
+  if command -v _afk_state_dir >/dev/null 2>&1; then dir="$(_afk_state_dir)"; else dir="$(_wd_common_dir)"; fi
+  printf '%s\n' "$dir/wd-filed-$1-$2"
+}
+
+# _wd_seed_afk_defect_label -> create the afk-defect label once per run (a marker dedups). A red
+# defect color matching the repo's `bug` convention; best-effort. HUB_WATCHDOG_LABEL_CMD overrides.
+_wd_seed_afk_defect_label() {
+  local marker
+  marker="$(_wd_filed_marker label seeded)"
+  [ -f "$marker" ] && return 0
+  if [ -n "${HUB_WATCHDOG_LABEL_CMD:-}" ]; then
+    bash -c "$HUB_WATCHDOG_LABEL_CMD" hub-watchdog "$HUB_WATCHDOG_AFK_DEFECT_LABEL" >/dev/null 2>&1 || true
+  elif command -v gh >/dev/null 2>&1; then
+    gh label create "$HUB_WATCHDOG_AFK_DEFECT_LABEL" --color d73a4a \
+      --description "A watchdog-detected afk drain shortfall (issue #251)" --force >/dev/null 2>&1 || true
+  fi
+  mkdir -p "$(dirname "$marker")" 2>/dev/null || true
+  : > "$marker" 2>/dev/null || true
+}
+
+# _wd_open_defect_exists <condition> <issue> -> true when an OPEN afk-defect issue already covers
+# this firing, so we append/skip instead of filing a duplicate. Searches by the label + the
+# condition slug + the source issue number. gh unavailable reads as "no dup" (fall through to
+# file); HUB_WATCHDOG_DEDUP_CMD overrides (echo a nonempty match ⇒ exists).
+_wd_open_defect_exists() {
+  local condition="$1" issue="$2" hits
+  if [ -n "${HUB_WATCHDOG_DEDUP_CMD:-}" ]; then
+    hits="$(bash -c "$HUB_WATCHDOG_DEDUP_CMD" hub-watchdog "$condition" "$issue" 2>/dev/null)"
+    [ -n "$hits" ]; return
+  fi
+  command -v gh >/dev/null 2>&1 || return 1
+  hits="$(gh issue list --state open --label "$HUB_WATCHDOG_AFK_DEFECT_LABEL" \
+    --search "$condition #$issue" --json number -q '.[].number' 2>/dev/null)"
+  [ -n "$hits" ]
+}
+
+# _wd_file_defect <condition> <issue> <reason> -> file (or dedup) the afk-defect via a headless
+# bug-scoper on the hub-agent trackable surface. Gated by HUB_WATCHDOG_FILE (default on; the tests
+# default it off). Per-run + open-issue deduped. HUB_WATCHDOG_SCOPER_CMD is the dispatch seam.
+_wd_file_defect() {
+  local condition="$1" issue="$2" reason="$3" marker
+  [ "${HUB_WATCHDOG_FILE:-1}" = "1" ] || return 0
+  marker="$(_wd_filed_marker "$condition" "$issue")"
+  [ -f "$marker" ] && return 0                              # already filed this run
+  if _wd_open_defect_exists "$condition" "$issue"; then     # an open afk-defect already covers it
+    _wd_log "defect for [$condition] #$issue already open — not duplicating"
+    mkdir -p "$(dirname "$marker")" 2>/dev/null || true; : > "$marker" 2>/dev/null || true
+    return 0
+  fi
+  _wd_seed_afk_defect_label
+  local prompt="afk drain shortfall detected by hub-watchdog: [$condition] on #$issue — $reason. \
+Investigate why the /afk drain did not self-handle this, derive the Scope:/Gate: footer, and file \
+ONE afk-defect issue (label $HUB_WATCHDOG_AFK_DEFECT_LABEL). Dedup against open issues first."
+  if [ -n "${HUB_WATCHDOG_SCOPER_CMD:-}" ]; then
+    bash -c "$HUB_WATCHDOG_SCOPER_CMD" hub-watchdog "$condition" "$issue" "$reason" >/dev/null 2>&1 || true
+  else
+    local ha=""
+    command -v _afk_find_script >/dev/null 2>&1 && ha="$(_afk_find_script "${HUB_WATCHDOG_HUB_AGENT:-}" hub-agent.sh || true)"
+    if [ -n "$ha" ]; then
+      bash "$ha" "scope-${condition}-${issue}" --purpose "afk-defect: $condition #$issue" \
+        -- claude -p "$prompt" >/dev/null 2>&1 || true
+    fi
+  fi
+  mkdir -p "$(dirname "$marker")" 2>/dev/null || true; : > "$marker" 2>/dev/null || true
+  _wd_log "filed afk-defect for [$condition] #$issue via headless bug-scoper"
+}
+
+# _wd_fire <condition> <issue> <reason> -> record ONE intervention firing: classify it, append a
+# JSONL line to the intervention-ledger (with the class), log it, and — for an afk-defect — file
+# it via the headless bug-scoper (deduped). Every firing is a bug report against afk; subtask 5's
+# autonomy score counts these lines. Best-effort.
 _wd_fire() {
-  local condition="$1" issue="$2" reason="$3" lf
+  local condition="$1" issue="$2" reason="$3" lf klass
+  klass="$(_wd_classify "$condition" "$issue")"
+  case "$klass" in afk-defect | novel-decision) ;; *) klass="afk-defect" ;; esac
   lf="$(_wd_ledger_file)"
   mkdir -p "$(dirname "$lf")" 2>/dev/null || true
-  printf '{"ts":%s,"condition":"%s","issue":"%s","reason":"%s"}\n' \
+  printf '{"ts":%s,"condition":"%s","issue":"%s","class":"%s","reason":"%s"}\n' \
     "$(_wd_now)" "$(_wd_json_escape "$condition")" "$(_wd_json_escape "$issue")" \
-    "$(_wd_json_escape "$reason")" >> "$lf" 2>/dev/null || true
-  _wd_log "FIRING [$condition] #${issue} — ${reason}"
+    "$(_wd_json_escape "$klass")" "$(_wd_json_escape "$reason")" >> "$lf" 2>/dev/null || true
+  _wd_log "FIRING [$condition] #${issue} (${klass}) — ${reason}"
+  [ "$klass" = "afk-defect" ] && _wd_file_defect "$condition" "$issue" "$reason"
+  return 0
 }
 
 # --- the dispatcher -----------------------------------------------------------
