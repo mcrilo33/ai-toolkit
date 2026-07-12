@@ -36,6 +36,11 @@ SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 : "${AFK_SPOKE_MAX_MINUTES:=180}"
 : "${AFK_IDLE_MINUTES:=30}"
 : "${AFK_ANSWERER_EFFORT:=high}"
+# Warned-retry backoff (issue #241): a converted stop site parks a spoke LAST rather than
+# abandoning it — warn, then re-service on an exponential backoff so a persistently-failing
+# spoke is retried rarely (doom-loop safety by the curve, not by abandonment; #144/#140/#202).
+: "${AFK_WARN_BACKOFF_BASE:=60}"
+: "${AFK_WARN_BACKOFF_CAP:=1800}"
 
 # --- source worktree-lib.sh (the shared date/time + worktree helpers) ---------
 # Resolution covers both layouts: the ai-toolkit checkout (scripts/worktree-lib.sh, four
@@ -135,11 +140,14 @@ read_answer_attempt()   { _read_issue_epoch answer-attempt "$1"; }
 # Fresh window ⇒ no stale progress/attempt state: a leftover answer-attempt epoch
 # would suppress a legitimate idle reap in the next window; a leftover re-answer counter
 # (#203) would strand a spoke at a ceiling reached in a prior window; a leftover gate-voided /
-# terminal-logged marker (#237) would keep a since-resolved gate terminal across windows.
+# terminal-logged marker (#237) would keep a since-resolved gate terminal across windows; a
+# leftover warned-retry backoff (#241) would inherit a prior window's grown cadence and skip
+# the clean first-exhaustion re-service.
 _clear_progress_state() {
   local dir; dir="$(_afk_state_dir)"
   rm -f "$dir"/progress-*.epoch "$dir"/answer-attempt-*.epoch "$dir"/tip-* \
     "$dir"/reanswer-* "$dir"/gate-voided-* "$dir"/terminal-logged-* 2>/dev/null || true
+  _clear_warned_records   # #241: drop the warned-retry backoff + records for a fresh window
 }
 
 # --- re-answer ceiling (issue #203, finding 1) --------------------------------
@@ -239,6 +247,7 @@ _afk_note_tip_progress() {
   elif [ "$last" != "$tip" ]; then
     printf '%s\n' "$tip" > "$f" 2>/dev/null || true
     stamp_progress_epoch "$issue"
+    _afk_clear_warned "$issue"   # #241: a tip advance is genuine progress → drop the warned-retry backoff
   fi
   return 0
 }
@@ -354,6 +363,14 @@ _task_output_mtime() {
 # These signals EXTEND the idle reference only — the wall-clock ceiling (#133) is checked
 # separately and stays untouched. Empty when no reference exists (same "can't measure"
 # contract as _transcript_idle_seconds).
+#
+# #241 review N2: folding the answer-attempt epoch into the idle reference is the DELIBERATE
+# #133 trade-off — a spoke sitting on a buffered/undelivered answer (or a frozen-but-alive
+# claude whose inject didn't land) reads BUSY, so the reaper never kills it mid-delivery. This
+# does NOT strand such a spoke: the separate WALL-CLOCK ceiling (_spoke_over_any_ceiling,
+# AFK_SPOKE_MAX_MINUTES × the hard multiplier) ignores the answer-attempt fold and still fires,
+# and under #241 §7 that ceiling REVIVES the spoke (kill + relaunch) rather than abandoning it.
+# So the fold is safe by construction and is intentionally NOT gated on inject success.
 _spoke_idle_seconds() {
   local wt="$1" issue="$2" ref attempt task
   ref="$(_transcript_mtime "$wt")"
@@ -689,6 +706,18 @@ _still_parked_same() {
   [ "$(extract_pending_question "$wt")" = "$question" ]
 }
 
+# _spoke_still_parked <wt> <issue> -> true when the spoke is currently parked on SOMETHING (a
+# permission dialog, a PLAN gate, or an extractable question) — regardless of whether it is the
+# SAME prompt as before. #241 §4 uses this to tell a genuine park-change (recompute) from a
+# spoke that has MOVED ON and is actively working (no park → drop, preserving the #89 no-inject
+# -mid-turn guard). A positive park signal, so an ambiguous read fails toward "moved on" (drop).
+_spoke_still_parked() {
+  local wt="$1" issue="$2"
+  _permission_pending "$wt" && return 0
+  _gate_parked "$wt" "$issue" && return 0
+  [ -n "$(extract_pending_question "$wt")" ]
+}
+
 # _spoke_moved_on <wt> <before_mtime> -> true ONLY when the spoke's transcript has a NEW
 # write since <before_mtime>: a positive, confident signal that it is actively working. The
 # escalation freshness-gate (#171-subtask-2) uses this rather than !_still_parked_same so it
@@ -995,6 +1024,151 @@ codify_decisions() {
     }' "$log" 2>/dev/null | sort || true
 }
 
+# --- decision journal + warn-and-continue (issue #241) ------------------------
+# The /afk answerer ALWAYS answers: every former terminal stop site (escalate-blocked, reap,
+# ceiling, void, inject-failure, dispatch/land/auth halts) now TAKES the best action, WARNS
+# loudly to four surfaces (drain log + hub-notify ping + --status + this decision journal),
+# and parks the spoke LAST on the warned-retry backoff — never abandoned. The journal is the
+# post-adjust surface: the operator reads it in the morning and reverses whatever was wrong.
+
+# _broker_journal_file -> the per-run decision journal (one JSON line per taken decision).
+_broker_journal_file() { printf '%s\n' "$(_afk_state_dir)/decision-journal.jsonl"; }
+
+# _broker_json_escape <s> -> escape a value for a JSON string literal. A decision/reason can
+# be built from captured tool output (git/gh/build lines carry \r, \t, and other C0 controls),
+# and JSON forbids raw control characters in a string — so escape \ and ", space out the
+# common whitespace for readability, then DROP any remaining C0 byte so the journal line stays
+# valid JSONL a strict parser accepts. LC_ALL=C makes the byte range literal on this non-C host.
+_broker_json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"   # backslashes first, else the quote-escapes below get doubled
+  s="${s//\"/\\\"}"
+  s="${s//$'\t'/ }"; s="${s//$'\n'/ }"; s="${s//$'\r'/ }"   # keep the record one physical line
+  printf '%s' "$s" | LC_ALL=C tr -d '\000-\037'
+}
+
+# _broker_journal_line <issue> <park_kind> <decision> <reversibility> [reasoning_ref] -> append
+# ONE structured JSONL record (ts, issue, park, decision, reversibility, reasoning_ref) to the
+# per-run journal FILE — and nothing else. This is the cheap, no-noise audit surface: a routine
+# successful answer journals here WITHOUT a GitHub comment (per-answer comments would be spam).
+# Best-effort; never aborts the caller.
+_broker_journal_line() {
+  local issue="$1" park="$2" decision="$3" rev="${4:-unknown}" ref="${5:-}" f
+  f="$(_broker_journal_file)"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  printf '{"ts":%s,"issue":"%s","park":"%s","decision":"%s","reversibility":"%s","reasoning_ref":"%s"}\n' \
+    "$(afk_now)" "$(_broker_json_escape "$issue")" "$(_broker_json_escape "$park")" \
+    "$(_broker_json_escape "$decision")" "$(_broker_json_escape "$rev")" \
+    "$(_broker_json_escape "$ref")" >>"$f" 2>/dev/null || true
+}
+
+# broker_journal_decision <issue> <park_kind> <decision> <reversibility> [reasoning_ref] ->
+# journal the record (file) AND post a best-effort GitHub issue comment, so the morning review
+# reads either surface. Used for NOTEWORTHY decisions (a warned/parked call, a WARN-flagged or
+# non-reversible answer) — a routine successful answer uses _broker_journal_line (file only).
+# reversibility is one of reversible|outward|scope|irreversible|unknown. Best-effort; never aborts.
+broker_journal_decision() {
+  local issue="$1" park="$2" decision="$3" rev="${4:-unknown}"
+  _broker_journal_line "$@"
+  _broker_journal_gh_comment "$issue" "$park" "$decision" "$rev"
+  return 0
+}
+
+# _broker_journal_gh_comment <issue> <park> <decision> <rev> -> best-effort issue comment
+# recording the taken decision (#241 §10). Opt-out via AFK_JOURNAL_GH_COMMENT=0; no-op when
+# gh is absent. Never aborts.
+_broker_journal_gh_comment() {
+  [ "${AFK_JOURNAL_GH_COMMENT:-1}" = 0 ] && return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  local issue="$1" park="$2" decision="$3" rev="$4" body
+  # Wrap the decision in backticks: a decision containing `#123` or `@name` would otherwise
+  # render as a cross-issue link / user mention on GitHub, back-referencing unrelated issues.
+  body="AFK auto-decision [$rev] on the $park park: \`$decision\` (review and post-adjust if wrong)"
+  # Route through the TIME-BOUNDED runner so a hung gh (a black-hole network) can never
+  # freeze the servicing tick — this is on the synchronous answer path. _wt_gh_run bounds
+  # gh at AI_TOOLKIT_GH_TIMEOUT and returns its real rc (which we discard). Fall back to a
+  # raw best-effort gh only when worktree-lib.sh did not source (the helper is undefined).
+  if command -v _wt_gh_run >/dev/null 2>&1; then
+    _wt_gh_run issue comment "$issue" --body "$body" || true
+  else
+    gh issue comment "$issue" --body "$body" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# _broker_warned_record <issue> -> the durable, human-facing warned record: "<ts>\t<reason>".
+# --status surfaces it and hub-notify pings on it (re-fired on an interval, unlike the
+# once-deduped blocked ping). Distinct from blocked-<issue>.txt so the two states never blur.
+_broker_warned_record() { printf '%s\n' "$(_afk_state_dir)/warned-$1.txt"; }
+
+# broker_warn <issue> <reason> -> the loud, repeatable WARNING surface: log a WARNING line and
+# overwrite the durable warned record (latest warning wins). Best-effort; never aborts.
+broker_warn() {
+  local issue="$1" reason="$2" f
+  reason="${reason//$'\n'/ }"; reason="${reason//$'\r'/ }"   # keep the record one line (hub-notify cut -f2-)
+  log "  WARNING: #$issue $reason"
+  f="$(_broker_warned_record "$issue")"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  printf '%s\t%s\n' "$(afk_now)" "$reason" >"$f" 2>/dev/null || true
+  return 0
+}
+
+# _afk_warned_state_file <issue> -> the backoff bookkeeping: "<attempt>\t<next_retry_epoch>".
+_afk_warned_state_file() { printf '%s\n' "$(_afk_state_dir)/warned-state-$1"; }
+
+# _afk_warned_arm <issue> -> advance the warned-retry backoff: read the prior attempt count
+# (0 if none), schedule the next retry at now + min(BASE * 2^attempt, CAP), and persist
+# "<attempt+1>\t<next>". Exponential so a standing failure is retried ever more rarely.
+_afk_warned_arm() {
+  local issue="$1" f base cap attempt=0 delay now i=0
+  base="${AFK_WARN_BACKOFF_BASE:-60}"; case "$base" in '' | *[!0-9]*) base=60 ;; esac
+  cap="${AFK_WARN_BACKOFF_CAP:-1800}"; case "$cap" in '' | *[!0-9]*) cap=1800 ;; esac
+  f="$(_afk_warned_state_file "$issue")"
+  if [ -f "$f" ]; then IFS=$'\t' read -r attempt _ <"$f" 2>/dev/null || true; fi
+  case "$attempt" in '' | *[!0-9]*) attempt=0 ;; esac
+  delay="$base"
+  while [ "$i" -lt "$attempt" ] && [ "$delay" -lt "$cap" ]; do delay=$(( delay * 2 )); i=$(( i + 1 )); done
+  [ "$delay" -gt "$cap" ] && delay="$cap"
+  now="$(afk_now)"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  printf '%s\t%s\n' "$(( attempt + 1 ))" "$(( now + delay ))" >"$f" 2>/dev/null || true
+}
+
+# _afk_warned_due <issue> [now] -> rc 0 when the spoke is due for a retry (never warned, or the
+# backoff window has elapsed), rc 1 when still inside the backoff (parked LAST this tick).
+_afk_warned_due() {
+  local issue="$1" now="${2:-$(afk_now)}" f next=""
+  f="$(_afk_warned_state_file "$issue")"
+  [ -f "$f" ] || return 0
+  IFS=$'\t' read -r _ next <"$f" 2>/dev/null || true
+  case "$next" in '' | *[!0-9]*) return 0 ;; esac
+  [ "$now" -ge "$next" ]
+}
+
+# _afk_clear_warned <issue> -> drop one spoke's warned record + backoff (called on genuine
+# progress: a tip advance or a fresh marker means the warned state is stale).
+_afk_clear_warned() {
+  rm -f "$(_afk_warned_state_file "$1")" "$(_broker_warned_record "$1")" 2>/dev/null || true
+}
+# _clear_warned_records -> drop every warned record + backoff for a freshly-armed window.
+_clear_warned_records() {
+  local dir; dir="$(_afk_state_dir)"
+  rm -f "$dir"/warned-*.txt "$dir"/warned-state-* 2>/dev/null || true
+}
+
+# broker_warn_continue <wt> <issue> <park_kind> <decision> <reversibility> -> the #241
+# replacement for _escalate_blocked at a converted stop site: warn loudly, journal the taken
+# decision, advance the backoff, emit a warn span, and RETURN — the spoke stays in rotation
+# (no blocked tag, no pane kill). It is retried on the backoff until it makes progress.
+broker_warn_continue() {
+  local wt="$1" issue="$2" park="$3" decision="$4" rev="${5:-unknown}"
+  broker_warn "$issue" "$decision"
+  broker_journal_decision "$issue" "$park" "$decision" "$rev"
+  _afk_warned_arm "$issue"
+  afk_emit_decision "$wt" warn
+  return 0
+}
+
 # _rule_file -> the afk-answering rule path, across both layouts; empty if unfound.
 _rule_file() {
   local cand
@@ -1016,10 +1190,29 @@ _rule_file() {
 # posture points at "a throwaway copy (your cwd)" and — deliberately (#239) — never
 # discloses the live worktree's absolute path, which used to invite an absolute-path write
 # into the real tree.
+# _default_answerer_policy -> the built-in fallback policy shipped when the afk-answering rule
+# file is absent. #241: the reasoner ALWAYS answers — it never escalates-and-parks. It is kept
+# in lockstep with shared/rules/afk-answering.md by a binding test, so both surfaces retire the
+# ESCALATE output token and both instruct the ANSWER + REVERSIBILITY lines.
+_default_answerer_policy() {
+  cat <<'POLICY'
+Answer in the interest of the issue contract and repo conventions; prefer the spoke's own
+recommended option. You ALWAYS answer — you never escalate and park the spoke for a human.
+For an irreversible, outward-facing, or scope-changing ask, choose the REVERSIBLE, in-scope
+alternative when one exists (that IS the answer — e.g. do not force-push; rebase onto a new
+branch instead; deny a destructive command and tell the spoke the reversible path); only when
+no reversible alternative exists do you decide on the merits. Precede your decision with a
+'REVERSIBILITY: reversible|outward|scope|irreversible' line naming the class, and add a
+'WARN: <what the human should double-check>' line whenever you take a critical, irreversible,
+outward-facing, or scope-changing decision so it is loudly recorded for morning post-review.
+End with exactly one final line: 'ANSWER: <reply>'.
+POLICY
+}
+
 build_answerer_prompt() {
   local issue="$1" question="$2" rule body digest
   rule="$(_rule_file)" && rule="$(cat "$rule")" \
-    || rule="Answer in the interest of the issue contract and repo conventions; prefer the spoke's own recommended option; escalate (output 'ESCALATE: <reason>') only when the decision is irreversible, outward-facing, or scope-changing. Otherwise output 'ANSWER: <reply>'."
+    || rule="$(_default_answerer_policy)"
   body="$(gh issue view "$issue" --json title,body -q '.title + "\n\n" + .body' 2>/dev/null || echo "(issue #$issue body unavailable)")"
   digest="$(read_decisions_digest "$issue")"
   cat <<EOF
@@ -1046,7 +1239,10 @@ ${digest:-(none recorded yet)}
 
 $question
 
-Decide per the policy above. End your reply with exactly one line: 'ANSWER: <reply>' or 'ESCALATE: <reason>'.
+Decide per the policy above — you ALWAYS answer, never escalate-and-park. Precede your
+decision with a 'REVERSIBILITY: reversible|outward|scope|irreversible' line, and a
+'WARN: <what to double-check>' line for any critical, irreversible, outward-facing, or
+scope-changing call. End with exactly one final line: 'ANSWER: <reply>'.
 EOF
 }
 
@@ -1170,6 +1366,22 @@ parse_decision() {
   rest="${line#*:}"
   rest="${rest#"${rest%%[![:space:]]*}"}"          # ltrim
   printf '%s\t%s\n' "$kind" "$rest"
+}
+
+# parse_decision_field <raw-answerer-output> <KEYWORD> -> the trimmed value of the LAST
+# '<KEYWORD>: <value>' line (empty when absent). #241 reads the reasoner's 'REVERSIBILITY:'
+# class and 'WARN:' note off the same single-line convention as the ANSWER line, so a taken
+# decision carries its reversibility class + human-review flag into the decision journal.
+# <KEYWORD> must be a metacharacter-free literal (callers pass REVERSIBILITY / WARN); it is
+# interpolated into an ERE. The value is both l- and r-trimmed so a class enum compares exact.
+parse_decision_field() {
+  local raw="$1" key="$2" line rest
+  line="$(printf '%s\n' "$raw" | grep -E "^${key}:" | tail -1)"
+  [ -n "$line" ] || return 0
+  rest="${line#*:}"
+  rest="${rest#"${rest%%[![:space:]]*}"}"          # ltrim
+  rest="${rest%"${rest##*[![:space:]]}"}"          # rtrim
+  printf '%s\n' "$rest"
 }
 
 # is_auth_failure <raw-answerer-output> -> true (rc 0) when the text carries a Claude /
@@ -1736,14 +1948,127 @@ approve_permission() {
   _transcript_advanced "$wt" "$before"
 }
 
-# _decide_permission <wt_path> <issue> -> classify the spoke's pending permission dialog and
-# act: AUTO-APPROVE a safe scoped self-op (inject "Yes"), or ESCALATE a risky/unreadable one to
-# blocked/<issue>. classify_permission is the policy; this is the tmux delivery around it.
+# _reason_permission_record <wt> <issue> <decision> <rev> -> the post-DELIVERY record for a
+# reasoned permission decision: a loud warned record, a gh comment (off the keypress critical
+# path), the warned-retry backoff arm, and the warn span. The caller writes the cheap FILE
+# journal line BEFORE the keypress (durability); this reflects the delivered OUTCOME after.
+_reason_permission_record() {
+  local wt="$1" issue="$2" decision="$3" rev="$4"
+  broker_warn "$issue" "$decision"
+  _broker_journal_gh_comment "$issue" permission "$decision" "$rev"
+  _afk_warned_arm "$issue"
+  afk_emit_decision "$wt" warn
+}
+
+# _deny_permission <wt_path> <guidance> -> decline the pending permission dialog and tell the
+# spoke the reversible path: the hardened injector Esc-cancels the menu, then submits <guidance>
+# as a new message. Best-effort (rc from inject_and_verify) — a failed delivery still lets the
+# caller warn + retry on the backoff, never park.
+_deny_permission() {
+  local wt="$1" guidance="$2" target
+  target="$(_spoke_pane_target "$wt")"
+  [ -n "$target" ] || return 1
+  inject_and_verify "$wt" "$target" "$guidance" >/dev/null 2>&1
+}
+
+# _reason_permission <wt> <issue> <cmd> <classify_reason> -> the reasoner decides a permission
+# dialog the fixed rules would NOT auto-approve (#241 §2: the reasoner decides even irreversible
+# asks). It runs in run_answerer's read-only snapshot copy and answers 'ANSWER: APPROVE' or
+# 'ANSWER: DENY: <reversible path>'. APPROVE delivers Yes; DENY (or any unclear reply — the safe
+# default) declines the dialog and injects the reversible-path guidance. Either way the taken
+# decision is warned + journaled with its reversibility class, and the spoke is NEVER parked.
+_reason_permission() {
+  local wt="$1" issue="$2" cmd="$3" why="$4" q raw rc ans text rev guidance
+  q="The spoke is parked on a PERMISSION dialog and wants to run this command:
+
+$cmd
+
+The mechanical classifier would not auto-approve it ($why). Decide: APPROVE only if it is
+safe, reversible, and in-scope (touches the spoke's own worktree; no default branch, no
+force-push, no history rewrite, no deletion outside the worktree, no outward/network action);
+otherwise DENY. NEVER approve an irreversible, destructive, or outward command — DENY it and
+name the reversible path. Your ANSWER line MUST begin with 'APPROVE' or 'DENY: <the reversible
+path to tell the spoke>'."
+  # Stamp the attempt FIRST so the reason→deliver window never reads as idle (#202 C).
+  stamp_answer_attempt "$issue"
+  raw="$(run_answerer "$issue" "$q" "$wt")"; rc=$?
+  # Auth failure is the one true external blocker (#73): a dead supervisor token yields an
+  # auth-error blob, not a decision — and parse_decision would fall to the DENY default and
+  # inject a SPURIOUS denial into the live dialog. Detect it (rc != 0 AND an auth signature),
+  # raise the global halt flag (the supervisor pauses DISPATCH + re-probes, #241 §9), and return
+  # without injecting. #241 §9: WARN the spoke (an auth failure is not the spoke's fault — never
+  # block it); the drain resumes servicing it once auth recovers.
+  if [ "$rc" -ne 0 ] && is_auth_failure "$raw"; then
+    _AFK_AUTH_FAILED=1
+    broker_warn_continue "$wt" "$issue" auth "subscription auth failed — token could not refresh; re-run /login on the host (drain paused, re-probing)" reversible
+    return 0
+  fi
+  ans="$(parse_decision "$raw")"
+  text="${ans#*$'\t'}"
+  rev="$(parse_decision_field "$raw" REVERSIBILITY)"
+  # NB: the classifier verdict (ESCALATE) is already recorded in decisions.log by the caller; the
+  # reasoned approve/deny is journaled here (a FILE line before the keypress + a gh comment after,
+  # via _reason_permission_record), NOT in decisions.log — that log codifies only the MECHANICAL
+  # classifier (#155 D).
+  case "$text" in
+    APPROVE*)
+      # #241 review B1: journal the decision to the FILE BEFORE approve_permission delivers the
+      # keypress (durable if the inject crashes/races the command it authorized) — file-only, so
+      # no network gh-comment sits on the spoke's unblock critical path. The pre-keypress line is
+      # PROVISIONAL ("APPROVING", present-continuous) so a per-record read can never mistake the
+      # in-flight intent for a delivered-and-ran approval; the OUTCOME line (delivered / FAILED)
+      # is written after (#241 review).
+      _broker_journal_line "$issue" permission "reasoner APPROVING (delivery pending): $cmd" "${rev:-unknown}"
+      if approve_permission "$wt"; then
+        _broker_journal_line "$issue" permission "reasoner APPROVED (delivered): $cmd" "${rev:-unknown}"
+        _reason_permission_record "$wt" "$issue" "reasoner APPROVED (delivered): $cmd" "${rev:-unknown}"
+      else
+        # A delivery failure is distinct on the DURABLE surfaces (a FAILED journal line + gh),
+        # so the morning review never reads an undelivered approval as "authorized and ran".
+        _broker_journal_line "$issue" permission "reasoner APPROVED but delivery FAILED: $cmd" "${rev:-unknown}"
+        _reason_permission_record "$wt" "$issue" "reasoner APPROVED but delivery FAILED: $cmd" "${rev:-unknown}"
+      fi ;;
+    *)
+      # DENY, or any reply that does not clearly approve — the safe default is to decline. Only a
+      # DENY-prefixed reply carries guidance (with or without the colon); anything else uses the
+      # default decline message rather than injecting the raw reply.
+      case "$text" in
+        DENY*)
+          guidance="${text#DENY}"; guidance="${guidance#:}"
+          guidance="${guidance#"${guidance%%[![:space:]]*}"}" ;;   # ltrim
+        *) guidance="" ;;
+      esac
+      [ -n "$guidance" ] || guidance="Declined that command — take the reversible, in-scope path instead."
+      # B1 generalized to DENY (#241 review): a provisional FILE line before _deny_permission
+      # injects (survives a crash between inject and record), then the OUTCOME. The delivery rc is
+      # NOT swallowed: a failed redirect (dead pane / failed inject) is journaled DISTINCTLY, so a
+      # review never reads a stuck spoke as cleanly redirected. Decline-and-redirect is reversible
+      # by construction, so default the class to reversible.
+      _broker_journal_line "$issue" permission "reasoner DENYING (redirect pending) ($cmd): $guidance" "${rev:-reversible}"
+      if _deny_permission "$wt" "$guidance"; then
+        _broker_journal_line "$issue" permission "reasoner DENIED ($cmd): $guidance" "${rev:-reversible}"
+        _reason_permission_record "$wt" "$issue" "reasoner DENIED ($cmd): $guidance" "${rev:-reversible}"
+      else
+        _broker_journal_line "$issue" permission "reasoner DENIED but redirect delivery FAILED ($cmd): $guidance" "${rev:-reversible}"
+        _reason_permission_record "$wt" "$issue" "reasoner DENIED but redirect delivery FAILED ($cmd): $guidance" "${rev:-reversible}"
+      fi ;;
+  esac
+}
+
+# _decide_permission <wt_path> <issue> -> classify the spoke's pending permission dialog and act.
+# AUTO-APPROVE a safe scoped self-op (mechanical fast path, unchanged, unwarned). Anything the
+# fixed rules will not auto-approve — an ESCALATE verdict or an unreadable command — no longer
+# parks the spoke: it routes to the always-answering reasoner (#241) which approves a safe
+# command or declines-and-redirects a risky one, warning + journaling the taken decision.
 _decide_permission() {
   local wt="$1" issue="$2" cmd decision kind reason
   cmd="$(extract_pending_command "$wt")"
   if [ -z "$cmd" ]; then
-    _escalate_blocked "$wt" "$issue" "permission dialog with an unreadable command — needs a human"
+    # Unreadable command: cannot classify. Decline it (the reversible action) + warn — never
+    # park. The spoke gets a denial and keeps going; the backoff paces any retry.
+    stamp_answer_attempt "$issue"
+    _deny_permission "$wt" "Declined an unreadable permission command — re-issue it in a clearer form." || true
+    broker_warn_continue "$wt" "$issue" permission "declined an unreadable permission command" reversible
     return 0
   fi
   decision="$(classify_permission "$cmd" "$wt")"
@@ -1764,10 +2089,14 @@ _decide_permission() {
       afk_emit_decision "$wt" success
       return 0
     fi
-    _escalate_blocked "$wt" "$issue" "could not deliver permission approval to the spoke — needs a human"
+    # Delivery failed — warn + retry on the backoff, never park (#241).
+    broker_warn_continue "$wt" "$issue" permission "could not deliver the approval to the spoke — will retry" reversible
     return 0
   fi
-  _escalate_blocked "$wt" "$issue" "$reason — needs a human"
+  # ESCALATE: the fixed rules will not auto-approve this one. The reasoner decides it (#241) —
+  # approve a safe/reversible command, or decline an irreversible one and name the reversible
+  # path — and warns + journals the taken decision. Never park.
+  _reason_permission "$wt" "$issue" "$cmd" "$reason"
 }
 
 # --- tmux injection + telemetry -----------------------------------------------
@@ -1902,6 +2231,58 @@ for path in glob.glob(os.path.join(os.environ["_AFK_DIR"], "*.jsonl")):
         except Exception:
             continue  # partial flush at the offset boundary: not a record yet
         if isinstance(record, dict) and record.get("type") == "user":
+            sys.exit(0)
+sys.exit(3)
+PYEOF
+  case $? in 0) return 0 ;; 3) return 1 ;; *) return 2 ;; esac
+}
+
+# _user_turn_appended <wt_path> <sizes> -> did a GENUINE typed reply land in transcript bytes
+# appended after the <sizes> snapshot? The "the spoke MOVED ON" signal (#241 §4): a human/self
+# reply is a type:"user" record with promptSource=="typed" and not isMeta — the SAME filter
+# _gate_answer_landed uses to reject SYNTHETIC user turns (tool_results, <system-reminder> /
+# <task-notification>, skill/meta, SDK/system), which are non-turn writes that only bump the
+# mtime while the spoke stays parked (the #240 hang class). The staleness recompute gates on the
+# DEFINITE "no genuine reply" (rc 1); rc 0 (a typed reply landed) or rc 2 (cannot tell) both fall
+# to the #89-safe drop. rc 0 found, rc 1 none, rc 2 unavailable (no python3 / no project dir / crash).
+_user_turn_appended() {
+  local wt="$1" sizes="$2" dir
+  dir="$(_spoke_project_dir "$wt")"
+  [ -d "$dir" ] || return 2
+  command -v python3 >/dev/null 2>&1 || return 2
+  _AFK_DIR="$dir" _AFK_SIZES="$sizes" python3 2>/dev/null <<'PYEOF'
+import glob, json, os, sys
+
+offsets = {}
+for line in os.environb.get(b"_AFK_SIZES", b"").splitlines():
+    size, _, path = line.partition(b"\t")
+    if path:
+        try:
+            offsets[os.fsdecode(path)] = int(size)
+        except ValueError:
+            pass
+for path in glob.glob(os.path.join(os.environ["_AFK_DIR"], "*.jsonl")):
+    try:
+        with open(path, "rb") as fh:
+            offset = offsets.get(path, 0)
+            fh.seek(0, 2)
+            if offset > fh.tell():  # rotated/truncated since the snapshot: rescan
+                offset = 0
+            fh.seek(offset)
+            appended = fh.read()
+    except OSError:
+        continue
+    for line in appended.splitlines():
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+        # ONLY a genuine typed prompt submission is a reply — synthetic harness user turns
+        # (tool_results, system-reminders/notifications, skill/meta, SDK/system) are not, and
+        # must read as a non-turn write so §4 recomputes rather than strands (mirrors
+        # _gate_answer_landed's filter).
+        if (isinstance(record, dict) and record.get("type") == "user"
+                and record.get("promptSource") == "typed" and not record.get("isMeta")):
             sys.exit(0)
 sys.exit(3)
 PYEOF
@@ -2120,7 +2501,7 @@ _broker_present_qcm() {
 # answer, or escalate to blocked/<issue>. Fail-safe: an answerer that returns no decision
 # (or an answer we cannot inject) escalates rather than guessing.
 broker_service_gate() {
-  local wt="$1" issue="$2" mode="${3:-unattended}" question orig_question raw rc decision kind text target was_gate=0 inject_diagnosed=0
+  local wt="$1" issue="$2" mode="${3:-unattended}" depth="${4:-0}" question orig_question raw rc decision kind text target was_gate=0 inject_diagnosed=0
   # Self-heal a stale gate tag (issue #204): if gate/<issue> is at the tip but the spoke
   # already resumed past its PLAN gate (a late / external / attended approval that never ran
   # the confirmed-inject path), consume the stale tag and stop — do NOT re-answer, and do NOT
@@ -2131,13 +2512,17 @@ broker_service_gate() {
     _consume_gate_tag "$wt" "$issue"
     return 0
   fi
-  # A prior tick found the reasoner mutated the live tree for this gate (#237): that verdict is
-  # terminal on FIRST occurrence — a human is required — and independent of tip/signature, which
-  # the mutation itself perturbs. Skip the reasoner entirely; the first-occurrence escalation
-  # already stamped blocked/<issue>. Silent here (it was logged once when first voided); a fresh
-  # arm clears the marker. Checked before the (tip, sig) ceiling on purpose: keying a void on
-  # that ceiling would let the mutation reset it every tick and re-run forever.
-  if _broker_gate_voided "$issue"; then return 0; fi
+  # A prior tick found the reasoner mutated the live tree for this gate (#237). The mutation
+  # perturbs the (tip, sig) ceiling every tick (a tree write flips the pending command), so a
+  # DURABLE void marker — not the ceiling — is what throttles the mutating reasoner. #241 §5: the
+  # void is no longer terminal-forever — it is BACKOFF-paced. Inside the warned-retry backoff:
+  # skip (parked LAST). Once the backoff elapses: clear the marker for ONE supervised retry (if
+  # the reasoner mutates again this tick it re-voids + re-arms a longer backoff). Checked before
+  # the ceiling on purpose. A fresh arm clears both the marker and the backoff.
+  if _broker_gate_voided "$issue"; then
+    _afk_warned_due "$issue" || return 0                             # inside the backoff → parked LAST
+    rm -f "$(_broker_voided_marker "$issue")" 2>/dev/null || true    # backoff elapsed → allow one retry
+  fi
   # Re-answer ceiling (#203 finding 1): a legitimately-escalated spoke parked on the SAME
   # prompt must not re-run the reasoner/classifier every tick forever. After the ceiling on
   # the SAME (tip, prompt-signature) the gate is terminal — it stays blocked/<issue> at the
@@ -2145,18 +2530,41 @@ broker_service_gate() {
   # BOTH the permission path (#203 finding 4's compound dialog) and the answerer path.
   local park_sig; park_sig="$(_broker_park_signature "$wt" "$issue")"
   if _broker_reanswer_exhausted "$wt" "$issue" "$park_sig"; then
-    # Log the terminal state ONCE per (tip, sig) — not on every event wake (#237). A moved tip
-    # or changed prompt is a new key that resets the ceiling AND logs afresh when it re-exhausts.
-    local _tip; _tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"
-    _broker_log_terminal_once "$issue" "ceiling:${_tip}:${park_sig}" \
-      "  #$issue re-answer ceiling reached on the same prompt — leaving it terminal (no re-answer)"
-    return 0
+    # #241 §5: the ceiling is no longer TERMINAL — it warns and retries on an exponential
+    # backoff, so a doom-loop is throttled by the growing curve, not abandoned. On the FIRST
+    # exhaustion: warn, arm the backoff, and pause. Inside the backoff window: skip (parked
+    # LAST). Once the backoff elapses: warn, re-arm a longer backoff, and fall through for ONE
+    # supervised retry (the counter stays exhausted, so each window yields a single re-run).
+    local ws; ws="$(_afk_warned_state_file "$issue")"
+    if [ ! -f "$ws" ]; then
+      broker_warn "$issue" "re-answer ceiling reached on the same prompt — backing off (retried on the curve, #241)"
+      broker_journal_decision "$issue" ceiling "re-answer ceiling reached; backing off on unchanged park" reversible
+      _afk_warned_arm "$issue"
+      return 0
+    fi
+    if ! _afk_warned_due "$issue"; then return 0; fi   # inside the backoff window → parked LAST
+    broker_warn "$issue" "re-answer backoff elapsed — one supervised retry on the same prompt (#241)"
+    broker_journal_decision "$issue" ceiling "re-answer backoff elapsed; supervised retry" reversible
+    # ARM the next (longer) backoff HERE, before the retry runs, so the pause is guaranteed
+    # regardless of the retry's OUTCOME. This is the ONLY arm that paces a MECHANICAL classifier
+    # auto-approve (line ~2091) which, on success, leaves the same (tip, park-sig) intact and
+    # neither arms nor clears — without it a re-appearing auto-approvable dialog would re-warn +
+    # re-run every tick (hub-review B1-cluster regression). A retry that instead self-arms (reasoned
+    # DENY / ESCALATE) advances the counter a SECOND time; that double-step only GROWS the backoff
+    # (strictly more conservative, bounded by the cap) and is cleared the moment the tip advances
+    # (genuine progress), so it never strands a recoverable spoke. A guard that suppressed the
+    # second arm was tried and reverted (#241 review r2.2): a tick-scoped global leaked into the
+    # reap/land passes that also call broker_warn_continue and into the depth+1 recursion, which
+    # was strictly worse than the benign double-step it removed.
+    _afk_warned_arm "$issue"
+    # fall through for one supervised retry; the arm above paces the next
   fi
   # A pending permission dialog is decided by the rules classifier, not the answerer (#149).
   if _permission_pending "$wt"; then _decide_permission "$wt" "$issue"; return; fi
   # Snapshot the transcript clock BEFORE the park checks: a write landing between
   # this and the pre-inject re-check must count as movement (review nit, ST2).
   local parked_mtime; parked_mtime="$(_transcript_mtime "$wt")"
+  local parked_sizes; parked_sizes="$(_transcript_sizes "$wt")"   # #241 §4: detect a real reply vs a non-turn write
   _gate_parked "$wt" "$issue" && was_gate=1
   orig_question="$(extract_pending_question "$wt")"
   question="$orig_question"
@@ -2192,25 +2600,28 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
     return 0
   fi
   if ! _broker_worktree_unchanged "$wt" "$fp_before"; then
-    # Stamp the durable void marker FIRST so this gate is terminal on the first occurrence
-    # (#237): later ticks short-circuit at the top and never re-run the reasoner. This log
-    # fires exactly once — the short-circuit keeps the mutation branch from re-running.
+    # Stamp the durable void marker FIRST so the backoff-paced void short-circuit (top of this
+    # function) throttles the mutating reasoner across ticks — the (tip, sig) ceiling can't,
+    # since the tree write perturbs it every tick. #241 §5: no longer terminal; warn + back off.
     _broker_mark_voided "$issue"
-    log "  reasoner mutated the read-only worktree of #$issue — voiding its answer (terminal; a human is required)"
+    log "  reasoner mutated the read-only worktree of #$issue — voiding its answer (backoff-paced; #241)"
+    # 'unknown' reversibility: the reasoner ESCAPED #237 snapshot isolation and wrote the LIVE
+    # tree — a should-never-fire event the morning review must be able to triage from the benign.
     _broker_on_human_decision "$mode" "$wt" "$issue" \
-      "the gate reasoner mutated the read-only worktree — its answer is voided; needs a human"
+      "the gate reasoner mutated the read-only worktree — its answer is voided; review the live tree" unknown
     return 0
   fi
   # The answerer is the supervisor's own `claude`; if its credentials are dead, every
   # other `claude` (the spokes, the next tick's answerer) is dead too. We treat it as an
   # auth failure only when the answerer EXITED NONZERO and its output carries an auth
   # signature — a healthy answer that merely discusses auth exits 0 and is unaffected.
-  # Raise the global stop flag and block THIS spoke so the failure surfaces as
-  # blocked/<issue> on the dashboard rather than spinning the loop; the main loop halts.
+  # Raise the global stop flag so the supervisor pauses DISPATCH and re-probes (#241 §9). WARN
+  # this spoke (an auth failure is not its fault — never block it); the drain resumes servicing
+  # it once auth recovers, rather than parking it blocked/<issue>.
   if [ "$rc" -ne 0 ] && is_auth_failure "$raw"; then
     _AFK_AUTH_FAILED=1
-    _escalate_blocked "$wt" "$issue" \
-      "subscription auth failed — token could not refresh; re-run /login on the host"
+    broker_warn_continue "$wt" "$issue" auth \
+      "subscription auth failed — token could not refresh; re-run /login on the host (drain paused, re-probing)" reversible
     return 0
   fi
   decision="$(parse_decision "$raw")"
@@ -2222,7 +2633,19 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
     # land mid-turn (#129/#89) and even a seed-replay escalation would stamp a
     # spurious blocked/<issue> on an actively-working spoke.
     if ! _still_parked_same "$wt" "$issue" "$was_gate" "$orig_question" "$parked_mtime"; then
-      log "  #$issue is no longer parked on that prompt — dropping the stale answer"
+      # #241 §4: the park may have CHANGED (a new prompt), or a non-turn write may have bumped
+      # the transcript mtime while the spoke is STILL parked (the recurring-false-staleness that
+      # stranded #240). Recompute against the CURRENT park in the same pass (depth-bounded to one
+      # re-run) ONLY when the spoke is still parked AND no USER TURN landed since the park — a
+      # DEFINITE no-reply (rc 1). Preserve #89/#129: a reply landing (rc 0) or an unreadable
+      # transcript (rc 2) means the spoke may have moved on, so drop rather than inject mid-turn.
+      _user_turn_appended "$wt" "$parked_sizes"; local _ut_rc=$?
+      if [ "$depth" -lt 1 ] && [ "$_ut_rc" -eq 1 ] && _spoke_still_parked "$wt" "$issue"; then
+        log "  #$issue still parked on a refreshed prompt (no reply landed) — recomputing against the current park (#241)"
+        broker_service_gate "$wt" "$issue" "$mode" "$(( depth + 1 ))"
+        return $?
+      fi
+      log "  #$issue is no longer parked on that prompt — dropping the stale answer (spoke moved on)"
       return 0
     elif _is_seed_replay "$wt" "$text"; then
       log "  answer to #$issue replays the spoke's own seed prompt — suppressing (#124)"
@@ -2239,6 +2662,29 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
         if [ "$rc" -eq 0 ]; then
           log "  injected answer into #$issue"
           _consume_gate_tag "$wt" "$issue"
+          _afk_clear_warned "$issue"   # #241: genuine progress → drop this issue's warned-retry backoff
+          # #241 review B2: record the taken answer for morning review. Read the reasoner's own
+          # 'WARN:' note and 'REVERSIBILITY:' class off the reply. A WARN or a non-reversible class
+          # is a NOTEWORTHY decision → a loud warned record + a journal line WITH a gh comment. A
+          # routine reversible answer is a cheap FILE-ONLY journal line (no per-answer gh spam).
+          local ans_rev_raw ans_rev ans_warn
+          ans_rev_raw="$(parse_decision_field "$raw" REVERSIBILITY)"
+          # Normalize to the first ALPHABETIC RUN (portable lowercasing, tolerant of quotes,
+          # parens, or a trailing period around the class word) so 'Reversible', 'reversible.',
+          # and '"irreversible"' all classify correctly. Gate the warn on the RAW presence, not
+          # the normalized value: a present-but-non-reversible class (even one that normalizes to
+          # empty, e.g. all-punctuation noise) must fail SAFE to a loud warned record, never
+          # silently collapse to routine the way a bare trailing-strip did (#241 review).
+          ans_rev="$(printf '%s' "$ans_rev_raw" | tr '[:upper:]' '[:lower:]' | grep -oE '[a-z]+' | head -n1 || true)"
+          ans_warn="$(parse_decision_field "$raw" WARN)"
+          if [ -n "$ans_warn" ] || { [ -n "$ans_rev_raw" ] && [ "$ans_rev" != reversible ]; }; then
+            # The clear above dropped the retry BACKOFF (progress); this warned record is the
+            # DELIBERATE loud review flag for the noteworthy decision — not a stale leftover.
+            broker_warn "$issue" "answered [${ans_rev:-unknown}]${ans_warn:+ — WARN: $ans_warn}"
+            broker_journal_decision "$issue" answer "injected answer${ans_warn:+ (WARN: $ans_warn)}" "${ans_rev:-unknown}"
+          else
+            _broker_journal_line "$issue" answer "injected answer (routine)" "${ans_rev:-reversible}"
+          fi
           afk_emit_decision "$wt" success
           return 0
         elif [ "$rc" -eq 2 ] && command -v respawn_wedged_spoke >/dev/null 2>&1 && respawn_wedged_spoke "$wt" "$issue" "$text"; then
@@ -2284,23 +2730,34 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
     log "  #$issue transcript advanced while reasoning — dropping the escalation (spoke moved on)"
     return 0
   fi
-  _broker_on_human_decision "$mode" "$wt" "$issue" "$text"
+  # A diagnosed wedge/refuted inject (rc 2/3) is genuinely UNCERTAIN — the paste may have
+  # partially landed — so journal it 'unknown' for triage; an ESCALATE/no-decision is reversible.
+  local decision_rev=reversible
+  [ "$inject_diagnosed" -eq 1 ] && decision_rev=unknown
+  _broker_on_human_decision "$mode" "$wt" "$issue" "$text" "$decision_rev"
 }
 
 decide_and_act() { broker_service_gate "$1" "$2" unattended; }
 
-# _broker_on_human_decision <mode> <wt> <issue> <reason> -> route a decision that is the
-# human's to make (the ONE mode-divergent seam of the shared core). Unattended (/afk):
-# escalate to blocked/<issue> so the returning operator resolves it. Attended: present a
-# structured QCM on a dedicated per-gate surface (subtask C, #155); until that adapter is
-# defined it also escalates, so a parked spoke is never left hanging.
+# _broker_on_human_decision <mode> <wt> <issue> <reason> -> route a decision that the answerer
+# could not resolve into an injectable answer (a voided/mutated read-only tree, an unverifiable
+# fingerprint, an ESCALATE/no-decision reasoner reply, an inject failure). The ONE mode-divergent
+# seam of the shared core. Attended: present a structured QCM on a dedicated per-gate surface
+# (#155). Unattended (/afk): #241 no longer parks blocked/<issue> — it WARNS loudly, journals the
+# taken decision, and keeps the spoke serviced (retried on the warned-retry backoff). The reason
+# IS the decision text; these are reversible (the answer is voided/undelivered, the spoke's work
+# is intact and re-serviceable).
 _broker_on_human_decision() {
-  local mode="$1" wt="$2" issue="$3" reason="$4"
+  local mode="$1" wt="$2" issue="$3" reason="$4" rev="${5:-reversible}"
   if [ "$mode" = attended ] && command -v _broker_present_qcm >/dev/null 2>&1; then
     _broker_present_qcm "$wt" "$issue" "$reason"
     return
   fi
-  _escalate_blocked "$wt" "$issue" "$reason"
+  # <rev> is the reversibility of the DECISION taken (void/decline the answer, retry) — almost
+  # always reversible. Callers pass 'unknown' when the underlying EVENT is genuinely uncertain
+  # (a reasoner that escaped snapshot isolation and wrote the live tree; a wedge whose paste may
+  # have partially landed) so the morning review can triage those out of the benign default.
+  broker_warn_continue "$wt" "$issue" answer "$reason" "$rev"
 }
 
 # --- durable local block record (issue #109, AC2) -----------------------------

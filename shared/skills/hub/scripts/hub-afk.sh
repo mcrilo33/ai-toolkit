@@ -59,7 +59,7 @@
 #                                (4x300s), not the ~50min a 120s-era default of 10 would stretch to
 #   AFK_DISPATCH_MAX_FAILURES=3  consecutive worktree-new.sh failures before an issue is blocked
 #   AFK_ARM_PRECHECK=1           arm-precondition gate (=0 skips live/dirty/branch/gh-auth checks)
-#   AFK_AUTH_PROBE_CMD           reap-time auth probe (default: a bounded headless claude no-op)
+#   AFK_AUTH_PROBE_CMD           auth probe: reap-time AND the #241 §9 per-tick auth-halt re-probe (default: a bounded headless claude no-op)
 #   CLAUDE_PROJECTS_DIR          transcript root (default: $HOME/.claude/projects)
 #   AFK_REMOTE_HOST / AFK_REMOTE_REPO / AFK_REMOTE_SESSION / AFK_REMOTE_DRAIN_CMD
 #                                --remote target config (or a sourced AFK_REMOTE_CONF file)
@@ -428,13 +428,9 @@ _afk_escalate_blocked() {
   esac
 }
 
-reap_spoke() {
-  local wt="$1" issue="$2" reason="$3"
-  log "→ reap #$issue: $reason"
-  _afk_set_last_action "reap #$issue"
-  _kill_spoke_window "$issue"
-  _afk_escalate_blocked "$wt" "$issue" "$reason"
-}
+# reap_spoke (kill window + escalate blocked/<issue>) is retired by #241: the reaper never
+# abandons a spoke — see _warn_parked_last / _afk_revive_or_park_last, which revive-first and
+# warn-and-park-LAST instead. (_afk_escalate_blocked remains for the auth halt + auto_land.)
 
 # --- crash ≠ hang: auto-resume-once a pane-dead spoke (issue #109) -------------
 # A reaped spoke is not always hung. The reaper abandoned #103 as "idle, likely hung"
@@ -663,43 +659,129 @@ respawn_wedged_spoke() {
   return 0
 }
 
-# _reap_or_resume <wt> <issue> -> decide a reaped spoke's fate. An over-ceiling runaway
-# always blocks (resume never applies). Otherwise it went idle: crash ≠ hang — a LIVE pane
-# is truly hung (block); a DEAD pane with commits is auto-resumed ONCE in place; a dead
-# pane with nothing to preserve, or one already resumed this window, is blocked.
+# --- #241 §7/§8: revive-first, warned-parked-LAST, never abandon -----------------
+# The reaper no longer kills a stuck spoke into blocked/<issue>. Every former reap TAKES a
+# revival first (kill any hung/crashed pane + relaunch `claude --continue`); only a spoke whose
+# revival was ALREADY tried this window downgrades to warned-and-parked-LAST (warn + journal +
+# arm the warned-retry backoff, retried at low frequency), NEVER killed or abandoned.
+
+# _warn_parked_last <wt> <issue> <reason> [park_kind=reap] -> the never-abandon replacement for
+# reap_spoke: keep the spoke in rotation on the warned-retry backoff. NO window kill, NO
+# blocked/<issue>. It HONORS the backoff — it warns + journals only when the spoke is DUE, and
+# parks LAST SILENTLY inside the backoff window — so a permanently-stuck spoke is retried (and
+# re-warned) at LOW frequency, not warned + gh-commented every 5-minute tick. reversible: the
+# spoke's committed work is intact.
+_warn_parked_last() {
+  local wt="$1" issue="$2" reason="$3" park="${4:-reap}"
+  _afk_warned_due "$issue" || return 0   # inside the backoff → parked LAST silently this tick
+  log "→ warn-park-LAST #$issue: $reason"
+  _afk_set_last_action "warn-park #$issue"
+  broker_warn_continue "$wt" "$issue" "$park" "$reason" reversible
+}
+
+# _revive_spoke <wt> <issue> -> kill any hung/crashed window and relaunch the spoke via
+# `claude --continue` under the same spoke_run_id, resetting the reap + idle clocks (#133/#202
+# C: the fresh window hasn't written a transcript yet, so stamp the answer-attempt epoch or the
+# same-tick reap_pass re-reaps it as idle). Marks the once-per-window revival. rc 1 when the
+# window could not be opened (the caller warns + retries next tick).
+_revive_spoke() {
+  local wt="$1" issue="$2"
+  log "→ revive #$issue: killing any hung/crashed pane and relaunching (claude --continue)"
+  _afk_set_last_action "revive #$issue"
+  _kill_spoke_window "$issue"
+  if ! _afk_open_spoke_window "$wt" "$issue" "$(_afk_resume_command "$wt" "$issue")"; then
+    log "  could not open a revive window for #$issue"
+    return 1
+  fi
+  _afk_mark_resumed "$issue"
+  stamp_progress_epoch "$issue"
+  stamp_answer_attempt "$issue"
+  # #241 §10: a revival is a taken decision the morning review sees — journal it (a successful
+  # revival is not a loud warned record, just an auditable journal line + span).
+  broker_journal_decision "$issue" revive "revived a hung/crashed pane (killed + relaunched claude --continue)" reversible
+  _afk_emit_span "$wt" afk-revive success
+  return 0
+}
+
+# _afk_revive_or_park_last <wt> <issue> <reason> -> revive-first, then warned-parked-LAST. If a
+# revival was already tried this window (_afk_already_resumed) OR the relaunch cannot start, the
+# spoke is warned-and-parked-LAST rather than reaped — retried at low frequency, never abandoned.
+_afk_revive_or_park_last() {
+  local wt="$1" issue="$2" reason="$3"
+  if _afk_already_resumed "$issue"; then
+    _warn_parked_last "$wt" "$issue" "$reason — revival already tried this window; parked LAST, retried at low frequency"
+    return 0
+  fi
+  _revive_spoke "$wt" "$issue" \
+    || _warn_parked_last "$wt" "$issue" "$reason — revival launch could not be started; retrying"
+}
+
+# _afk_warn_pushed_but_unmarked <wt> <issue> -> #200/#241: a clean-pushed tip with no completion
+# marker is warned-and-parked-LAST with an ACTIONABLE reason, NOT auto-marked. The shape is
+# AMBIGUOUS — genuinely finished (the marker just failed) vs idle BETWEEN subtasks (more work to
+# come, cf. _afk_pushed_but_unmarked's own caution) — so auto-emitting ready/<issue> could
+# auto-LAND incomplete work onto main (hard to reverse). Never abandoned: the loud warning
+# surfaces it for the human to re-run --ready or land by hand.
+_afk_warn_pushed_but_unmarked() {
+  local wt="$1" issue="$2"
+  _warn_parked_last "$wt" "$issue" \
+    "pushed-but-unmarked (#200): clean tip, no ready/$issue marker — if finished, re-run 'spoke-push.sh --ready $issue' or land by hand" \
+    markready
+}
+
+# _reap_or_resume <wt> <issue> -> #241 §7/§8: revive-first, never block. A finished-but-unmarked
+# spoke (#200) is auto-marked. Every other stuck spoke — over-ceiling runaway, hung LIVE pane
+# (a frozen claude is a revival case, not a block), or crashed pane — is revived; a spoke whose
+# revival was already tried this window is warned-and-parked-LAST, never reaped/abandoned.
 _reap_or_resume() {
   local wt="$1" issue="$2"
+  # #200/#241: a live pane at a clean-pushed tip with no marker is warned-and-parked-LAST with an
+  # actionable reason (NOT auto-marked/auto-landed — the shape is ambiguous with idle-between-subtasks).
+  if _spoke_pane_alive "$wt" && _afk_pushed_but_unmarked "$wt" "$issue"; then
+    _afk_warn_pushed_but_unmarked "$wt" "$issue"
+    return 0
+  fi
   if _spoke_over_any_ceiling "$issue" "$(afk_now)"; then
-    reap_spoke "$wt" "$issue" "time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
+    _afk_revive_or_park_last "$wt" "$issue" "time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
   elif _spoke_pane_alive "$wt"; then
-    if _afk_pushed_but_unmarked "$wt" "$issue"; then
-      # Not hung — FINISHED but its completion mark never landed (#200). Surface the accurate,
-      # actionable reason instead of "likely hung", so a human re-runs the marker or lands it.
-      reap_spoke "$wt" "$issue" "pushed-but-unmarked: origin is at the clean tip but no ready/$issue — the completion mark didn't land (#200); re-run 'spoke-push.sh --ready $issue' on the spoke, or land it by hand"
-    else
-      reap_spoke "$wt" "$issue" "went idle >${AFK_IDLE_MINUTES}m with a live pane and no marker — likely hung"
-    fi
+    # #241 §8: a live-but-frozen claude is a REVIVAL case (kill the hung pane + relaunch), not a
+    # terminal block. answer attempts must not reset the reap clock, so this is a revival, not a re-answer.
+    _afk_revive_or_park_last "$wt" "$issue" "went idle >${AFK_IDLE_MINUTES}m with a live pane and no marker — likely hung"
   elif ! _spoke_has_commits "$wt"; then
-    reap_spoke "$wt" "$issue" "pane crashed with no committed work to preserve — needs a human"
+    _afk_revive_or_park_last "$wt" "$issue" "pane crashed with no committed work to preserve"
   elif _afk_already_resumed "$issue"; then
-    reap_spoke "$wt" "$issue" "pane crashed again after an auto-resume — needs a human"
+    _warn_parked_last "$wt" "$issue" "pane crashed again after an auto-resume — parked LAST, retried at low frequency"
   else
     resume_spoke "$wt" "$issue" \
-      || reap_spoke "$wt" "$issue" "pane crashed and the auto-resume could not be launched — needs a human"
+      || _warn_parked_last "$wt" "$issue" "pane crashed and the auto-resume could not be launched — retrying"
   fi
 }
 
-# _block_all_inflight <reason> -> emit blocked/<issue> for every in-flight spoke not
-# already at a terminal marker. Called on an auth-failure stop so the dashboard shows
-# every affected spoke as blocked (no orphaned window left silently stuck on dead auth)
-# rather than just the one whose answerer surfaced the failure.
-_block_all_inflight() {
+# _warn_all_inflight <reason> -> WARN every in-flight spoke not already at a terminal marker
+# (#241 §9). Called while the drain is halted on dead auth: an auth failure is NOT the spoke's
+# fault, so it is warned (loud, re-fired by hub-notify), NEVER blocked — the drain resumes
+# servicing it once auth recovers. Replaces the pre-#241 _block_all_inflight (which parked them).
+_warn_all_inflight() {
   local reason="$1" path issue
   while IFS=$'\t' read -r path issue; do
     [ -n "$issue" ] || continue
     [ "$(slot_state "$path" "$issue")" = "done" ] && continue
-    _afk_escalate_blocked "$path" "$issue" "$reason"
+    broker_warn "$issue" "$reason"
   done < <(inflight_worktrees)
+}
+
+# _afk_service_auth_halt -> service a raised _AFK_AUTH_FAILED WITHOUT stopping the drain (#241 §9).
+# Auth is the one true external blocker, but it only HALTS DISPATCH (the _AFK_AUTH_FAILED
+# short-circuits), warns the in-flight spokes loudly + repeatedly, RE-PROBES auth each tick, and
+# CLEARS the flag (resuming the drain) the moment auth recovers. The re-probe is the bounded
+# headless-claude no-op _afk_auth_is_dead already uses.
+_afk_service_auth_halt() {
+  log "/afk: subscription auth failed — dispatch HALTED (re-run /login on the host); re-probing each tick, NOT stopping the drain (#241 §9)"
+  _warn_all_inflight "subscription auth failed — dispatch halted; re-run /login on the host (retrying auth each tick)"
+  if ! _afk_auth_is_dead; then
+    _AFK_AUTH_FAILED=0
+    log "/afk: auth recovered — resuming the drain"
+  fi
 }
 
 # --- dispatch -----------------------------------------------------------------
@@ -899,8 +981,10 @@ dispatch_batch() {
     else
       fails="$(_afk_incr_dispatch_failures "$n")"
       if [ "$fails" -ge "$max" ]; then
-        log "  dispatch of #$n failed $fails times — recording a durable block and skipping it for this window (see --status)"
-        _afk_record_blocked_locally "$n" "dispatch (worktree-new.sh) failed $fails consecutive times — needs a human"
+        # #241 §5: no durable BLOCK — warn (backoff-gated, low frequency) and skip this window; a
+        # fresh arm retries. There is no spoke worktree yet, so pass an empty wt.
+        log "  dispatch of #$n failed $fails times — warn-parking (retries next window, see --status)"
+        _warn_parked_last "" "$n" "dispatch (worktree-new.sh) failed $fails consecutive times — retried at low frequency" dispatch
       else
         log "  dispatch of #$n failed ($fails/$max) — will retry next tick"
       fi
@@ -1117,13 +1201,21 @@ auto_land() {
   while IFS=$'\t' read -r path issue; do
     [ -n "$issue" ] || continue
     _ready_at_tip "$path" "$issue" || continue
+    # #241: pace the whole per-issue land attempt on the warned-retry backoff. A prior land
+    # failure / unclean-review / retry-exhausted warn armed the backoff; while it is pending this
+    # spoke is skipped (parked LAST), so a permanently-conflicted land is re-attempted at LOW
+    # frequency (worktree-land is expensive) — not every tick. A fresh (never-warned) spoke is
+    # always due, so the first land attempt is never delayed. Cleared on a successful land below.
+    _afk_warned_due "$issue" || continue
     if _blocked_at_tip "$path" "$issue"; then
       # ready+blocked at a finished tip = a TRANSIENT land failure. Retry the land up to
       # AFK_LAND_RETRY_MAX times, then escalate VISIBLY — never skip-land it forever (#202 D).
       max="$(_afk_land_retry_max)"; tries="$(_afk_read_land_retries "$issue")"
       if [ "$tries" -ge "$max" ]; then
-        log "  skip land #$issue — ready+blocked persisted after $tries land-retry attempt(s); escalating for a human (see --status), no more retries"
-        _afk_record_blocked_locally "$issue" "land retried $tries time(s) and still fails at a finished tip — needs a human"
+        # #241 §5: no longer terminal — warn + retry on the warned-retry backoff (low frequency),
+        # never park blocked/<issue>. The land is re-attempted on later ticks/windows.
+        log "  land #$issue still fails after $tries retry attempt(s) — warn-parking on the backoff (#241)"
+        _warn_parked_last "$path" "$issue" "land retried $tries time(s) and still fails at a finished tip — retrying at low frequency" land
         continue
       fi
       log "  retry land #$issue — ready+blocked coexist at a finished tip (transient land failure); clearing blocked/$issue and re-landing (attempt $(( tries + 1 ))/$max)"
@@ -1139,9 +1231,22 @@ auto_land() {
     if [ "${AFK_REVIEW_GATE:-1}" != "0" ]; then
       verdict="$(_afk_review_verdict "$path")"
       if [ "$verdict" != "APPROVE" ]; then
-        _afk_escalate_blocked "$path" "$issue" \
-          "code-review verdict not clean (${verdict:-no review}) — possible test-gutting, needs a human"
-        continue
+        # #241 §6: never silent block. Per AFK_REVIEW_GATE_ON_UNCLEAN:
+        #   retry (DEFAULT, safe) — warn + retry; do NOT auto-land, since a ready/<issue> with an
+        #     unclean/missing verdict is a #172-bypass and landing it ships possibly-test-gutted
+        #     code to main. The loud warning surfaces it for the human.
+        #   land — warn LOUDLY + land anyway (records the unclean verdict for post-review), the
+        #     operator's explicit opt-in to §6's land-with-warning (the "mint a hub-side review
+        #     first" step is not implementable here). UPGRADE: mint a hub-side review attempt.
+        if [ "${AFK_REVIEW_GATE_ON_UNCLEAN:-retry}" = "land" ]; then
+          broker_warn "$issue" "LANDING despite an unclean review verdict (${verdict:-no review}) — possible test-gutting; review post-hoc"
+          # outward: the land merges+pushes to shared main (others pull it, CI fires) — not merely a scope change.
+          broker_journal_decision "$issue" review "landed despite unclean review verdict (${verdict:-no review})" outward
+          # fall through to land
+        else
+          _warn_parked_last "$path" "$issue" "code-review verdict not clean (${verdict:-no review}) — warn + retry; set AFK_REVIEW_GATE_ON_UNCLEAN=land to land with a warning" review
+          continue
+        fi
       fi
     fi
     log "→ land #$issue"
@@ -1154,15 +1259,19 @@ auto_land() {
     if [ "$land_rc" -eq 0 ]; then
       log "  landed #$issue"
       _afk_clear_land_retries "$issue"   # a successful land resets the retry budget (#202 D)
+      _afk_clear_warned "$issue"         # #241: progress → drop the land's warned-retry backoff
       _afk_incr_landed   # tally for the drain-complete notification (#150)
     elif [ "$land_rc" -eq 3 ]; then
       # Sentinel (#198 / #202 I): main ADVANCED but a teardown step failed — the code IS
       # shipped, so NEVER stamp blocked over merged work. Tally it and point at the log.
       log "  landed #$issue but teardown incomplete (worktree-land exit 3) — see $land_log; NOT escalating (main already advanced)"
       _afk_clear_land_retries "$issue"
+      _afk_clear_warned "$issue"         # #241: shipped → drop the warned-retry backoff
       _afk_incr_landed
     else
-      _afk_escalate_blocked "$path" "$issue" "auto-land failed (merge conflict or push rejection, exit $land_rc) — needs a human (see $land_log)"
+      # #241 §5: an auto-land failure (merge conflict / push rejection) warns + retries on the
+      # backoff instead of parking blocked/<issue>. The land is re-attempted on later ticks.
+      _warn_parked_last "$path" "$issue" "auto-land failed (merge conflict or push rejection, exit $land_rc) — retrying at low frequency (see $land_log)" land
     fi
   done < <(inflight_worktrees)
 }
@@ -1204,7 +1313,8 @@ reap_pass() {
     # Auth probe before the FIRST reap this tick (#170 ST7): if the subscription token is
     # dead, every idle spoke is stalled on auth, not hung — reaping them one-by-one would
     # block live work into dead auth. Probe once; on a real auth failure raise the global
-    # stop flag and bail, letting the main loop's halt-all path block them together.
+    # stop flag and bail, letting the main loop's _afk_service_auth_halt WARN them + re-probe
+    # (never block/stop — #241 §9).
     if [ "$probed" -eq 0 ]; then
       probed=1
       afk_write_heartbeat   # the probe is a bounded `claude` call — keep the epoch fresh (#170 ST2)
@@ -1261,20 +1371,21 @@ recover_dead_panes() {
     # An over-ceiling runaway always blocks (as reap_pass does) — resume/re-dispatch never
     # applies. Checked first so a crashed-but-over-ceiling spoke is not revived here only to
     # be blocked by reap_pass in the same tick (the hard ceiling ignores fresh progress).
+    # #241 §7: revive-first, warned-parked-LAST — never reap/block/abandon a crashed pane.
     if _spoke_over_any_ceiling "$issue" "$(afk_now)"; then
-      reap_spoke "$path" "$issue" "time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
+      _afk_revive_or_park_last "$path" "$issue" "time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
     elif _spoke_has_work "$path"; then
       if _afk_already_resumed "$issue"; then
-        reap_spoke "$path" "$issue" "pane crashed again after an auto-resume — needs a human"
+        _warn_parked_last "$path" "$issue" "pane crashed again after an auto-resume — parked LAST, retried at low frequency"
       else
         resume_spoke "$path" "$issue" \
-          || reap_spoke "$path" "$issue" "pane crashed and the auto-resume could not be launched — needs a human"
+          || _warn_parked_last "$path" "$issue" "pane crashed and the auto-resume could not be launched — retrying"
       fi
     elif _afk_already_redispatched "$issue"; then
-      reap_spoke "$path" "$issue" "pane crashed clean again after a re-dispatch — needs a human"
+      _warn_parked_last "$path" "$issue" "pane crashed clean again after a re-dispatch — parked LAST, retried at low frequency"
     else
       _redispatch_dead_pane "$path" "$issue" \
-        || reap_spoke "$path" "$issue" "pane crashed clean and the worktree teardown failed — needs a human"
+        || _warn_parked_last "$path" "$issue" "pane crashed clean and the worktree teardown failed — retrying"
     fi
   done < <(inflight_worktrees)
 }
@@ -1453,8 +1564,8 @@ supervise_tick() {
   dispatch_batch
   answer_pass
   # If the answer pass detected a dead subscription token, skip land + reap this tick:
-  # both would shell out to a `claude`/suite that is just as dead. The main loop blocks
-  # the in-flight spokes and stops.
+  # both would shell out to a `claude`/suite that is just as dead. The main loop then WARNS
+  # the in-flight spokes + re-probes (never blocks/stops — #241 §9, _afk_service_auth_halt).
   [ "$_AFK_AUTH_FAILED" -eq 1 ] && return 0
   auto_land
   recover_dead_panes
@@ -1502,7 +1613,8 @@ service_event_wake() {
   [ -n "$issues" ] && log "/afk: event wake — servicing $(printf '%s' "$issues" | tr '\n' ' ')"
   answer_pass
   # Same auth short-circuit as supervise_tick: a dead token means auto_land would shell
-  # into dead auth; the main loop's post-service check halts + blocks the in-flight set.
+  # into dead auth; the main loop's _afk_service_auth_halt then WARNS the in-flight set +
+  # re-probes (never blocks/stops — #241 §9).
   [ "$_AFK_AUTH_FAILED" -eq 1 ] && return 0
   auto_land
 }
@@ -2187,9 +2299,9 @@ main() {
       supervise_tick
     fi
     if [ "$_AFK_AUTH_FAILED" -eq 1 ]; then
-      log "/afk: subscription auth failed — blocking in-flight spokes and stopping (re-run /login on the host)"
-      _block_all_inflight "subscription auth failed — token could not refresh; re-run /login on the host"
-      afk_clear_state; break
+      # #241 §9: auth no longer STOPS the drain. Halt dispatch (the short-circuits already do),
+      # warn the in-flight spokes, re-probe, and resume the moment auth recovers. Never break.
+      _afk_service_auth_halt
     fi
     [ "$once" -eq 1 ] && break
     if afk_done "$(afk_read_state)" "$(afk_now)"; then

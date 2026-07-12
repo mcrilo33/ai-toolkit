@@ -643,3 +643,59 @@ def test_status_label_mirror_survives_offline_gh(hub: Path, tmp_path: Path) -> N
     # A failing gh never breaks the watcher — the ping still fires.
     assert proc.returncode == 0, proc.stderr
     assert any("/land 1" in m for m in messages)
+
+
+# ── issue #241: warned-record pings (the /afk answerer warns instead of blocking) ──
+# A converted stop site writes a durable warned-<issue>.txt under the state dir instead of
+# parking the spoke blocked. hub-notify surfaces these — and, unlike the once-deduped blocked
+# ping, RE-FIRES on an interval so a standing warning stays loud until the human post-adjusts.
+
+
+def test_warned_record_fires_notification(hub: Path, tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "warned-5.txt").write_text("1700000000\ttook the reversible alternative\n")
+
+    _proc, messages = _run(
+        hub,
+        tmp_path,
+        env_extra={
+            "AFK_STATE_DIR": str(statedir),
+            "HUB_NOTIFY_WARN_SEEN_FILE": str(tmp_path / "warn-seen"),
+            "HUB_NOTIFY_NOW": "1700000000",
+        },
+    )
+
+    assert any("#5 WARNING" in m and "reversible alternative" in m for m in messages), messages
+
+
+def test_warned_record_refires_after_interval(hub: Path, tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "warned-5.txt").write_text("1000\tstanding warning\n")
+    warn_seen = tmp_path / "warn-seen"
+
+    def run_at(now: str):
+        return _run(
+            hub,
+            tmp_path,
+            env_extra={
+                "AFK_STATE_DIR": str(statedir),
+                "HUB_NOTIFY_WARN_SEEN_FILE": str(warn_seen),
+                "HUB_NOTIFY_WARN_REPEAT": "600",
+                "HUB_NOTIFY_NOW": now,
+            },
+        )
+
+    # The captured notifier log accumulates across runs (shared tmp_path), so a re-fire shows
+    # as one MORE "#5 WARNING" line; a suppressed poll adds none.
+    _p1, m1 = run_at("1000")
+    n1 = sum("#5 WARNING" in m for m in m1)
+    _p2, m2 = run_at("1100")  # only 100s later, < 600s repeat window → no re-fire
+    n2 = sum("#5 WARNING" in m for m in m2)
+    _p3, m3 = run_at("1700")  # 700s after the first fire → re-fires
+    n3 = sum("#5 WARNING" in m for m in m3)
+
+    assert n1 == 1, m1
+    assert n2 == 1, "within the repeat window a warning must not re-fire"
+    assert n3 == 2, "after the repeat window a standing warning re-fires"

@@ -453,7 +453,13 @@ def test_decide_and_act_approves_safe_permission(spoke_repo: Path, tmp_path: Pat
     assert not ready_log.exists(), f"safe permission must NOT escalate: {ready_log.read_text()}"
 
 
-def test_decide_and_act_escalates_risky_permission(spoke_repo: Path, tmp_path: Path) -> None:
+def test_decide_and_act_risky_permission_reasoner_denies_and_warns(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #241: a risky permission the mechanical classifier will not auto-approve no longer parks
+    # the spoke blocked/<issue>. It routes to the always-answering reasoner (stubbed to DENY),
+    # which declines the command and injects the reversible-path guidance — warned, not blocked,
+    # and never auto-approved.
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke_repo)
     _write_transcript(pd, [_bash_tool_record("git push origin main")])
@@ -466,15 +472,25 @@ def test_decide_and_act_escalates_risky_permission(spoke_repo: Path, tmp_path: P
         "SPOKE_READY": str(ready_stub),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "AFK_STATE_DIR": str(statedir),
+        "AFK_ANSWERER_CMD": "printf 'REVERSIBILITY: irreversible\\nANSWER: DENY: push a feature branch and open a PR instead'",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_INJECT_POLL_SECONDS": "0",
     }
 
     result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    assert ready_log.exists(), "risky permission must escalate to blocked/<issue>"
-    assert "--blocked 5" in ready_log.read_text()
-    # Must NOT have injected an approval keystroke for a risky command.
-    assert "send-keys -t afk:1 1" not in tmux_log.read_text()
+    # Never parked, never auto-approved; warned + journaled instead.
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "a risky permission must warn-and-continue, not escalate to blocked"
+    )
+    assert "send-keys -t afk:1 1" not in tmux_log.read_text(), (
+        "must not auto-approve a risky command"
+    )
+    assert (statedir / "warned-5.txt").exists(), "the taken decision must be warned"
+    assert "irreversible" in (statedir / "decision-journal.jsonl").read_text()
 
 
 # ── the TRANSCRIPT layer ──────────────────────────────────────────────────────
@@ -1410,10 +1426,16 @@ def test_decide_and_act_wedge_respawn_failure_escalates(tmp_path: Path) -> None:
     result = _call(f"decide_and_act '{spoke}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    log = ready_log.read_text()
-    assert "--blocked 5" in log
-    assert "respawn" in log, f"the reason must name the failed wedge respawn, got: {log}"
-    assert "use Redis" in log, f"the reason must carry the undelivered answer's head, got: {log}"
+    log = ready_log.read_text() if ready_log.exists() else ""
+    # #241: a failed wedge respawn warns-and-continues instead of parking blocked/<issue>.
+    assert "--blocked 5" not in log, log
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert "respawn" in result.stderr, (
+        f"the warning must name the failed wedge respawn: {result.stderr}"
+    )
+    assert "use Redis" in result.stderr, (
+        f"the warning must carry the undelivered answer's head: {result.stderr}"
+    )
 
 
 def test_decide_and_act_wedge_respawn_unverified_escalates(tmp_path: Path) -> None:
@@ -1435,8 +1457,10 @@ def test_decide_and_act_wedge_respawn_unverified_escalates(tmp_path: Path) -> No
 
     assert result.returncode == 0, result.stderr
     assert "new-window" in tmux_log.read_text(), "the respawn was attempted"
-    log = ready_log.read_text()
-    assert "--blocked 5" in log, "an unconfirmed respawn must escalate, not report success"
+    log = ready_log.read_text() if ready_log.exists() else ""
+    # #241: an unconfirmed respawn warns-and-continues (never reports success), not blocked.
+    assert "--blocked 5" not in log, log
+    assert "WARNING: #5" in result.stderr, result.stderr
 
 
 # ── answerer discipline: seed-replay suppression, gate routing, parked re-check
@@ -1525,9 +1549,11 @@ def test_decide_and_act_suppresses_seed_replay_answer(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     tmux_calls = tmux_log.read_text() if tmux_log.exists() else ""
     assert " -l " not in f" {tmux_calls} ", "a seed replay must never be pasted"
-    log = ready_log.read_text()
-    assert "--blocked 5" in log
-    assert "seed" in log, f"the reason must name the seed replay, got: {log}"
+    log = ready_log.read_text() if ready_log.exists() else ""
+    # #241: a suppressed seed replay warns-and-continues instead of parking blocked/<issue>.
+    assert "--blocked 5" not in log, log
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert "seed" in result.stderr, f"the warning must name the seed replay: {result.stderr}"
 
 
 def test_decide_and_act_gate_park_routes_plan_to_answerer(tmp_path: Path) -> None:
@@ -1596,9 +1622,14 @@ def test_decide_and_act_aborts_when_no_longer_parked(tmp_path: Path) -> None:
     _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
     fake_bin, tmux_log = _injector_tmux(tmp_path, capture="│ > │\n", pane_path=spoke)
     env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
-    # The answerer's side effect: a human answered while it reasoned.
+    # The answerer's side effect: a human answered while it reasoned (a genuine TYPED reply,
+    # so #241 §4 reads it as moved-on and drops rather than recomputing).
     human_reply = json.dumps(
-        {"type": "user", "message": {"content": [{"type": "text", "text": "use Redis"}]}}
+        {
+            "type": "user",
+            "promptSource": "typed",
+            "message": {"content": [{"type": "text", "text": "use Redis"}]},
+        }
     )
     env["AFK_ANSWERER_CMD"] = (
         f"printf '%s\\n' '{human_reply}' >> \"{pd / 'session.jsonl'}\"; printf 'ANSWER: use Redis'"
@@ -1614,30 +1645,44 @@ def test_decide_and_act_aborts_when_no_longer_parked(tmp_path: Path) -> None:
     )
 
 
-def test_decide_and_act_aborts_when_question_changed(tmp_path: Path) -> None:
-    # The spoke is still parked, but on a DIFFERENT question than the one the answerer
-    # reasoned about — the computed answer is stale; drop it and let the next tick
-    # answer the new question.
+def test_decide_and_act_recomputes_when_question_changed(tmp_path: Path) -> None:
+    # #241 §4: the spoke is still parked, but on a DIFFERENT question than the one the answerer
+    # reasoned about — and NO user reply landed (a real park change, not a moved-on). Instead of
+    # bare-dropping (pre-#241) and burning a whole tick, the broker RECOMPUTES against the current
+    # park in the same pass (depth-bounded to one re-run). Never blocked.
     spoke = _branched_spoke(tmp_path, ahead=True, name="moved-spoke", branch="feature/5-fix")
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke)
     _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
+    # Pin the park mtime OLD so the reasoner's append reads as a deterministic staleness
+    # (the 1s mtime granularity is otherwise a same-second race on the outer detection).
+    os.utime(pd / "session.jsonl", (1_000_000_000, 1_000_000_000))
     fake_bin, tmux_log = _injector_tmux(tmp_path, capture="│ > │\n", pane_path=spoke)
     env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
+    calls = tmp_path / "answerer.calls"
     extra = tmp_path / "extra.jsonl"
     extra.write_text(
         json.dumps(_ask_record("Which cache TTL?", [("60s", "short"), ("1h", "long")])) + "\n"
     )
+    # Each reasoning run appends a NEW question (an assistant record — NOT a user reply), so the
+    # park signature keeps changing while the spoke stays parked: exactly the recompute trigger.
     env["AFK_ANSWERER_CMD"] = (
-        f'cat "{extra}" >> "{pd / "session.jsonl"}"; printf \'ANSWER: use Redis\''
+        f"printf x >> '{calls}'; cat \"{extra}\" >> \"{pd / 'session.jsonl'}\"; printf 'ANSWER: use Redis'"
     )
 
     result = _call(f"decide_and_act '{spoke}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    tmux_calls = tmux_log.read_text() if tmux_log.exists() else ""
-    assert " -l " not in f" {tmux_calls} ", "an answer to a superseded question is stale"
-    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
+    # The recompute path is taken (a deterministic stderr signal) rather than a bare drop, and
+    # it re-runs the reasoner against the current park.
+    assert "recomputing against the current park" in result.stderr, result.stderr
+    n = calls.read_text().count("x") if calls.exists() else 0
+    assert n >= 2, (
+        f"a changed park while still parked must recompute (re-run), not bare-drop; ran {n}"
+    )
+    # NB: the recompute re-answers the current park; whether its inner inject lands or falls to
+    # the (still-terminal-in-S4) inject-failure escalation is timing-dependent and orthogonal —
+    # S5 converts that escalation to warn-continue. Here we only pin the recompute-not-drop.
 
 
 def test_decide_and_act_gate_park_moved_on_aborts(tmp_path: Path) -> None:
@@ -1655,7 +1700,11 @@ def test_decide_and_act_gate_park_moved_on_aborts(tmp_path: Path) -> None:
     # The answerer's side effect: a human approved in-pane while it reasoned (a user
     # text turn lands; no commit, so gate/5 is still at the tip).
     human_reply = json.dumps(
-        {"type": "user", "message": {"content": [{"type": "text", "text": "approved, go ahead"}]}}
+        {
+            "type": "user",
+            "promptSource": "typed",
+            "message": {"content": [{"type": "text", "text": "approved, go ahead"}]},
+        }
     )
     env["AFK_ANSWERER_CMD"] = (
         f"printf '%s\\n' '{human_reply}' >> \"{pd / 'session.jsonl'}\"; "
@@ -1681,7 +1730,11 @@ def test_decide_and_act_moved_on_seed_replay_drops_not_blocks(tmp_path: Path) ->
     env, ready_log = _wedge_env(spoke, tmp_path, fake_bin)
     _write_transcript(pd, [_seed_record(), _ask_record("Which store?", [("Redis", "fast")])])
     human_reply = json.dumps(
-        {"type": "user", "message": {"content": [{"type": "text", "text": "use Redis"}]}}
+        {
+            "type": "user",
+            "promptSource": "typed",
+            "message": {"content": [{"type": "text", "text": "use Redis"}]},
+        }
     )
     env["AFK_ANSWERER_CMD"] = (
         f"printf '%s\\n' '{human_reply}' >> \"{pd / 'session.jsonl'}\"; "
@@ -1731,39 +1784,40 @@ def stub_env(tmp_path: Path, spoke_repo: Path) -> dict[str, str]:
     }
 
 
-def test_decide_and_act_escalates_to_blocked(spoke_repo: Path, stub_env: dict[str, str]) -> None:
+def test_decide_and_act_warns_on_escalate(spoke_repo: Path, stub_env: dict[str, str]) -> None:
+    # #241: an ESCALATE reply warns-and-continues instead of parking blocked/<issue>.
     env = {**stub_env, "AFK_ANSWERER_CMD": "printf 'reasoning\\nESCALATE: needs a human'"}
 
     result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log
-    assert "needs a human" in log
+    _rl = Path(env["_READY_LOG"])
+    assert not _rl.exists() or "--blocked 5" not in _rl.read_text()
+    assert "WARNING: #5" in result.stderr and "needs a human" in result.stderr, result.stderr
 
 
-def test_decide_and_act_no_decision_escalates(spoke_repo: Path, stub_env: dict[str, str]) -> None:
+def test_decide_and_act_no_decision_warns(spoke_repo: Path, stub_env: dict[str, str]) -> None:
     env = {**stub_env, "AFK_ANSWERER_CMD": "printf 'I never concluded.'"}
 
-    _call(f"decide_and_act '{spoke_repo}' 5", env=env)
+    result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log
-    assert "no decision" in log
+    _rl = Path(env["_READY_LOG"])
+    assert not _rl.exists() or "--blocked 5" not in _rl.read_text()
+    assert "WARNING: #5" in result.stderr and "no decision" in result.stderr, result.stderr
 
 
-def test_decide_and_act_answer_without_pane_escalates(
+def test_decide_and_act_answer_without_pane_warns(
     spoke_repo: Path, stub_env: dict[str, str]
 ) -> None:
     # The answerer decides, but no tmux pane maps to this throwaway path, so injection
-    # fails and the supervisor fails safe to escalation rather than dropping the answer.
+    # fails — #241 warns-and-continues rather than dropping or parking the answer.
     env = {**stub_env, "AFK_ANSWERER_CMD": "printf 'ANSWER: do the thing'"}
 
-    _call(f"decide_and_act '{spoke_repo}' 5", env=env)
+    result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log
-    assert "pane" in log
+    _rl = Path(env["_READY_LOG"])
+    assert not _rl.exists() or "--blocked 5" not in _rl.read_text()
+    assert "WARNING: #5" in result.stderr and "pane" in result.stderr, result.stderr
 
 
 def test_decide_and_act_injects_and_emits_success_span(spoke_repo: Path, tmp_path: Path) -> None:
@@ -1868,12 +1922,12 @@ def test_decide_and_act_consumes_gate_tag_on_inject(spoke_repo: Path, tmp_path: 
     assert tag.returncode != 0, "the gate/5 tag must be consumed after a successful inject"
 
 
-def test_decide_and_act_escalates_when_answer_does_not_register(
+def test_decide_and_act_warns_when_answer_does_not_register(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
     # The answerer decides and a pane maps, but the inject never registers (the transcript
-    # does not advance). The supervisor must re-inject and then escalate — never leave the
-    # spoke silently parked (issue #74, defect 2).
+    # does not advance). The supervisor must re-inject and then #241 warn-and-continue —
+    # never leave the spoke silently parked, never park blocked/<issue>.
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke_repo)
     _write_transcript(pd, [_ask_record("Which store?", [("Redis", "fast")])])
@@ -1905,9 +1959,9 @@ def test_decide_and_act_escalates_when_answer_does_not_register(
     result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    log = ready_log.read_text()
-    assert "--blocked 5" in log
-    assert "register" in log
+    log = ready_log.read_text() if ready_log.exists() else ""
+    assert "--blocked 5" not in log, log
+    assert "WARNING: #5" in result.stderr and "register" in result.stderr, result.stderr
 
 
 def test_build_answerer_prompt_includes_rule_and_question(
@@ -1921,7 +1975,10 @@ def test_build_answerer_prompt_includes_rule_and_question(
 
     assert "THE-AFK-RULE-MARKER" in result.stdout
     assert "Which store should I use?" in result.stdout
-    assert "ANSWER:" in result.stdout and "ESCALATE:" in result.stdout
+    # #241: the reasoner ALWAYS answers — the prompt offers ANSWER: (with a REVERSIBILITY:
+    # class line) and no longer an ESCALATE: escape hatch.
+    assert "ANSWER:" in result.stdout and "REVERSIBILITY:" in result.stdout
+    assert "ESCALATE:" not in result.stdout
 
 
 def test_afk_emit_decision_writes_dashboard_span(spoke_repo: Path, tmp_path: Path) -> None:
@@ -1991,20 +2048,22 @@ def test_is_auth_failure_ignores_normal_output(text: str) -> None:
 # the auth branch on the nonzero exit.
 
 
-def test_decide_and_act_auth_failure_escalates_with_auth_reason(
+def test_decide_and_act_auth_failure_warns_with_auth_reason(
     spoke_repo: Path, stub_env: dict[str, str]
 ) -> None:
     env = {
         **stub_env,
         "AFK_ANSWERER_CMD": "printf 'authentication_error: OAuth token expired' >&2; exit 1",
+        "AFK_JOURNAL_GH_COMMENT": "0",
     }
 
     result = _call(f"decide_and_act '{spoke_repo}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log
-    assert "auth" in log.lower()
+    _rl = Path(env["_READY_LOG"])
+    # #241 §9: an auth failure warns the spoke with the auth reason, never blocks it.
+    assert not _rl.exists() or "--blocked 5" not in _rl.read_text()
+    assert "WARNING: #5" in result.stderr and "auth" in result.stderr.lower(), result.stderr
 
 
 def test_decide_and_act_auth_failure_raises_stop_flag(
@@ -2036,9 +2095,12 @@ def test_decide_and_act_healthy_answer_mentioning_auth_is_not_a_failure(
     result = _call(f"decide_and_act '{spoke_repo}' 5; echo \"FLAG=$_AFK_AUTH_FAILED\"", env=env)
 
     assert "FLAG=0" in result.stdout
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "could not refresh" not in log
-    assert "human" in log  # the ordinary ESCALATE reason
+    _rl = Path(env["_READY_LOG"])
+    # A healthy ESCALATE is NOT an auth halt: no auth-block, no auth flag. #241: it warns
+    # (the ordinary human-call reason) and continues, never parking blocked/<issue>.
+    assert not _rl.exists() or "could not refresh" not in _rl.read_text()
+    assert "could not refresh" not in result.stderr
+    assert "human" in result.stderr, result.stderr
 
 
 # ── the --remote launcher (issue #73) ─────────────────────────────────────────
@@ -2438,7 +2500,7 @@ def test_auto_land_lands_on_clean_approve(spoke_repo: Path, tmp_path: Path) -> N
     assert land_log.read_text().split() == ["5"], "a clean APPROVE verdict must land"
 
 
-def test_auto_land_escalates_on_request_changes(spoke_repo: Path, tmp_path: Path) -> None:
+def test_auto_land_warns_on_request_changes(spoke_repo: Path, tmp_path: Path) -> None:
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
     # Latest-wins: an older APPROVE then a newer REQUEST_CHANGES ⇒ the reviewer's FINAL
     # verdict is REQUEST_CHANGES, so the spoke must be escalated, not landed.
@@ -2456,18 +2518,22 @@ def test_auto_land_escalates_on_request_changes(spoke_repo: Path, tmp_path: Path
             "SPOKE_READY": str(ready_stub),
             "AFK_STATE_DIR": str(statedir),
             "AFK_REVIEW_GATE": "1",
+            "AFK_JOURNAL_GH_COMMENT": "0",
         },
     )
 
     assert not land_log.exists() or land_log.read_text().strip() == "", (
         "a REQUEST_CHANGES verdict must NOT land"
     )
-    assert "--blocked 5" in ready_log.read_text(), (
-        "a REQUEST_CHANGES verdict must escalate to blocked"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "#241: a REQUEST_CHANGES verdict warns + retries, never blocks"
+    )
+    assert (statedir / "warned-5.txt").exists(), (
+        "the taken decision must be warned, not silently dropped"
     )
 
 
-def test_auto_land_escalates_when_no_review(spoke_repo: Path, tmp_path: Path) -> None:
+def test_auto_land_warns_when_no_review(spoke_repo: Path, tmp_path: Path) -> None:
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
     # No .review artifact at all ⇒ no clean review exists ⇒ escalate, never land.
     wt_land, land_log = _land_recorder(tmp_path)
@@ -2482,16 +2548,22 @@ def test_auto_land_escalates_when_no_review(spoke_repo: Path, tmp_path: Path) ->
             "SPOKE_READY": str(ready_stub),
             "AFK_STATE_DIR": str(statedir),
             "AFK_REVIEW_GATE": "1",
+            "AFK_JOURNAL_GH_COMMENT": "0",
         },
     )
 
     assert not land_log.exists() or land_log.read_text().strip() == "", (
         "a spoke with no code-review artifact must NOT land"
     )
-    assert "--blocked 5" in ready_log.read_text(), "no review ⇒ escalate to blocked"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "#241: no review warns + retries, never blocks"
+    )
+    assert (statedir / "warned-5.txt").exists(), (
+        "the taken decision must be warned, not silently dropped"
+    )
 
 
-def test_auto_land_escalates_when_review_dir_empty(spoke_repo: Path, tmp_path: Path) -> None:
+def test_auto_land_warns_when_review_dir_empty(spoke_repo: Path, tmp_path: Path) -> None:
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
     (spoke_repo / ".review").mkdir()  # present but no artifacts ⇒ no verdict ⇒ escalate
     wt_land, land_log = _land_recorder(tmp_path)
@@ -2506,13 +2578,19 @@ def test_auto_land_escalates_when_review_dir_empty(spoke_repo: Path, tmp_path: P
             "SPOKE_READY": str(ready_stub),
             "AFK_STATE_DIR": str(statedir),
             "AFK_REVIEW_GATE": "1",
+            "AFK_JOURNAL_GH_COMMENT": "0",
         },
     )
 
     assert not land_log.exists() or land_log.read_text().strip() == "", (
         "an empty .review dir must NOT land"
     )
-    assert "--blocked 5" in ready_log.read_text(), "an empty .review dir ⇒ escalate to blocked"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "#241: an empty .review dir warns + retries, never blocks"
+    )
+    assert (statedir / "warned-5.txt").exists(), (
+        "the taken decision must be warned, not silently dropped"
+    )
 
 
 def test_auto_land_lands_after_fix_supersedes_changes(spoke_repo: Path, tmp_path: Path) -> None:
@@ -2580,7 +2658,7 @@ def test_auto_land_default_lands_on_clean_approve(spoke_repo: Path, tmp_path: Pa
     )
 
 
-def test_auto_land_default_escalates_foreign_ready_without_review(
+def test_auto_land_default_warns_foreign_ready_without_review(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
     # Issue #183: the gate defaults ON. A FOREIGN ready/<N> hand-pushed without any review
@@ -2606,8 +2684,8 @@ def test_auto_land_default_escalates_foreign_ready_without_review(
     assert not land_log.exists() or land_log.read_text().strip() == "", (
         "the default gate must NOT land an artifact-less foreign ready"
     )
-    assert "--blocked 5" in ready_log.read_text(), (
-        "an artifact-less foreign ready must escalate to blocked under the default gate"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "#241: an artifact-less foreign ready warns + retries, never blocks"
     )
 
 
@@ -2963,7 +3041,7 @@ def test_auto_land_keeps_heartbeat_fresh_during_slow_land(spoke_repo: Path, tmp_
     assert epoch >= start, f"the heartbeat must stay fresh THROUGH the land, got {hb.read_text()}"
 
 
-def test_auto_land_failing_land_still_escalates_through_wrapper(
+def test_auto_land_failing_land_still_warns_through_wrapper(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
     # End to end through the real call site: a land that fails under the heartbeat
@@ -2988,12 +3066,15 @@ def test_auto_land_failing_land_still_escalates_through_wrapper(
             "SPOKE_READY": str(ready_stub),
             "AFK_STATE_DIR": str(statedir),
             "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
             "AFK_LAND_HEARTBEAT_SECONDS": "1",
         },
     )
 
     assert result.returncode == 0, result.stderr
-    assert "--blocked 5" in ready_log.read_text(), "a failed land must still escalate"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "#241: a failed land warns + retries, never blocks"
+    )
 
 
 def test_auto_land_skips_foreign_ready_spoke_when_opted_out(
@@ -3122,6 +3203,7 @@ def test_auto_land_retries_ready_blocked_at_tip(spoke_repo: Path, tmp_path: Path
             "WT_LAND": str(wt_land),
             "AFK_STATE_DIR": str(statedir),
             "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
         },
     )
 
@@ -3136,7 +3218,7 @@ def test_auto_land_retries_ready_blocked_at_tip(spoke_repo: Path, tmp_path: Path
     assert blocked.returncode != 0, "the retry clears the stale blocked/5 before re-landing"
 
 
-def test_auto_land_ready_blocked_reescalates_on_repeat_failure(
+def test_auto_land_ready_blocked_rewarns_on_repeat_failure(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
     # The retry itself fails again: re-escalate blocked AND count the attempt, so the next
@@ -3158,10 +3240,13 @@ def test_auto_land_ready_blocked_reescalates_on_repeat_failure(
             "SPOKE_READY": str(ready_stub),
             "AFK_STATE_DIR": str(statedir),
             "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
         },
     )
 
-    assert "--blocked 5" in ready_log.read_text(), "a failed retry re-escalates blocked/5"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "#241: a failed land-retry warns + retries, never blocks"
+    )
     assert (statedir / "land-retry-5.count").read_text().strip() == "1", (
         "the retry attempt is counted so the budget is bounded"
     )
@@ -3190,6 +3275,7 @@ def test_auto_land_does_not_block_when_land_reports_cleanup_incomplete(
             "SPOKE_READY": str(ready_stub),
             "AFK_STATE_DIR": str(statedir),
             "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
             "AFK_LANDED_COUNT": str(landed),
         },
     )
@@ -3202,7 +3288,7 @@ def test_auto_land_does_not_block_when_land_reports_cleanup_incomplete(
     )
 
 
-def test_auto_land_still_blocks_on_a_pre_merge_failure(spoke_repo: Path, tmp_path: Path) -> None:
+def test_auto_land_warns_on_a_pre_merge_failure(spoke_repo: Path, tmp_path: Path) -> None:
     # A non-sentinel nonzero (exit 1: merge conflict / push rejection — nothing shipped) still
     # escalates, so the sentinel path doesn't swallow genuine failures.
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
@@ -3221,15 +3307,19 @@ def test_auto_land_still_blocks_on_a_pre_merge_failure(spoke_repo: Path, tmp_pat
             "SPOKE_READY": str(ready_stub),
             "AFK_STATE_DIR": str(statedir),
             "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
         },
     )
 
-    assert "--blocked 5" in ready_log.read_text(), (
-        "a pre-merge land failure (exit 1) still escalates"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "#241: a pre-merge land failure (exit 1) warns + retries, never blocks"
+    )
+    assert (statedir / "warned-5.txt").exists(), (
+        "the taken decision must be warned, not silently dropped"
     )
 
 
-def test_auto_land_ready_blocked_escalates_visibly_when_retries_exhausted(
+def test_auto_land_ready_blocked_warns_visibly_when_retries_exhausted(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
     # The retry budget is spent (count == AFK_LAND_RETRY_MAX): stop re-landing, but escalate
@@ -3248,13 +3338,14 @@ def test_auto_land_ready_blocked_escalates_visibly_when_retries_exhausted(
             "WT_LAND": str(wt_land),
             "AFK_STATE_DIR": str(statedir),
             "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
         },
     )
 
     assert not land_log.exists() or land_log.read_text().strip() == "", (
         "with the retry budget spent the land is not re-invoked (no spin)"
     )
-    assert (statedir / "blocked-5.txt").exists(), (
+    assert (statedir / "warned-5.txt").exists(), (
         "an exhausted retry escalates VISIBLY (a durable local record), never a silent skip"
     )
 
@@ -4377,6 +4468,9 @@ def _reaper_env(
         # The reap-time auth probe (#170 ST7) fires before the first reap; a healthy stub
         # (exit 0) keeps these reap tests exercising the reap path, not the auth-halt path.
         "AFK_AUTH_PROBE_CMD": "true",
+        # #241: the revive/warn-park paths journal a decision — keep the gh issue comment OFF so
+        # the reaper tests never fire a real `gh issue comment` at the live repo.
+        "AFK_JOURNAL_GH_COMMENT": "0",
     }
     return expr, env, ready_log, statedir
 
@@ -4664,18 +4758,13 @@ def test_slot_state_ignores_ready_behind_tip(spoke_repo: Path) -> None:
     )
 
 
-def test_reap_pass_blocks_pane_alive_idle_spoke(tmp_path: Path) -> None:
-    spoke = _branched_spoke(tmp_path, ahead=True)
-    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane ALIVE
-    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
-
-    _call(expr, env=env)
-
-    assert "--blocked 5" in ready_log.read_text(), "a pane-alive idle spoke is truly hung → block"
-    assert "new-window" not in tmux_log.read_text(), "a live (hung) pane is never resumed"
+# NB: the pane-alive-idle case is covered by test_reap_pass_revives_pane_alive_idle_spoke
+# (#241 §8): a hung live pane is REVIVED, not blocked — the inverse of the old "block" test.
 
 
-def test_reap_pass_blocks_pane_dead_spoke_after_one_resume(tmp_path: Path) -> None:
+def test_reap_pass_warns_pane_dead_spoke_after_one_resume(tmp_path: Path) -> None:
+    # #241 §7: a second crash after a resume warns-and-parks-LAST, never blocks. Resume stays
+    # bounded to once per window.
     spoke = _branched_spoke(tmp_path, ahead=True)
     fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD again
     expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
@@ -4683,26 +4772,29 @@ def test_reap_pass_blocks_pane_dead_spoke_after_one_resume(tmp_path: Path) -> No
 
     _call(expr, env=env)
 
-    assert "--blocked 5" in ready_log.read_text(), (
-        "a second crash after a resume escalates to a human"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "a second crash after a resume warns-and-parks-LAST, never blocks"
     )
     assert "new-window" not in tmux_log.read_text(), "resume is bounded to once per window"
+    assert (statedir / "warned-5.txt").exists()
 
 
-def test_reap_pass_blocks_pane_dead_spoke_without_commits(tmp_path: Path) -> None:
+def test_reap_pass_revives_pane_dead_spoke_without_commits(tmp_path: Path) -> None:
+    # #241 §7: a dead pane with nothing committed is REVIVED (relaunched) — the crash may
+    # un-stick — not blocked. (Only a twice-failed revival parks LAST.)
     spoke = _branched_spoke(tmp_path, ahead=False)  # nothing to preserve
     fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
     expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
 
     _call(expr, env=env)
 
-    assert "--blocked 5" in ready_log.read_text(), "no commits to preserve → block, don't resume"
-    assert "new-window" not in tmux_log.read_text()
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), "revive, not block"
+    assert "new-window" in tmux_log.read_text(), "a crashed pane is revived (relaunched)"
 
 
-def test_reap_pass_over_ceiling_always_blocks(tmp_path: Path) -> None:
-    # A runaway over the wall-clock ceiling always blocks — resume never applies, even if
-    # the pane is dead with commits.
+def test_reap_pass_over_ceiling_revives_not_blocks(tmp_path: Path) -> None:
+    # #241 §7: a runaway over the wall-clock ceiling is REVIVED first (a hang may un-stick on
+    # relaunch) then parked LAST — never blocked.
     spoke = _branched_spoke(tmp_path, ahead=True)
     fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
     expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=False)
@@ -4710,8 +4802,10 @@ def test_reap_pass_over_ceiling_always_blocks(tmp_path: Path) -> None:
 
     _call(expr, env=env)
 
-    assert "--blocked 5" in ready_log.read_text(), "an over-ceiling runaway always blocks"
-    assert "new-window" not in tmux_log.read_text(), "a runaway is never resumed"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "an over-ceiling runaway is revived + parked LAST, never blocked"
+    )
+    assert "new-window" in tmux_log.read_text(), "the runaway is revived (relaunched)"
 
 
 # ── dead-pane recovery each tick (issue #202 C) ───────────────────────────────
@@ -4757,6 +4851,8 @@ def _recover_env(
         "AFK_STATE_DIR": str(statedir),
         "AFK_DEFAULT_BRANCH": "main",
         "AFK_NOW": "1700000000",
+        # #241: the revive/warn-park paths journal a decision — keep the gh issue comment OFF.
+        "AFK_JOURNAL_GH_COMMENT": "0",
     }
     if redispatch_marker is not None:
         env["AFK_REDISPATCH_CMD"] = f"touch {redispatch_marker}"
@@ -4807,8 +4903,9 @@ def test_recover_dead_panes_skips_live_pane(tmp_path: Path) -> None:
     assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
 
 
-def test_recover_dead_panes_reaps_after_one_resume(tmp_path: Path) -> None:
-    # A second crash after an auto-resume escalates to a human (bounded once per window).
+def test_recover_dead_panes_warns_after_one_resume(tmp_path: Path) -> None:
+    # #241 §7: a second crash after an auto-resume warns-and-parks-LAST (retried at low
+    # frequency), never blocks. Resume stays bounded to once per window.
     spoke = _branched_spoke(tmp_path, ahead=True)
     fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD again
     expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, fake_bin)
@@ -4816,8 +4913,11 @@ def test_recover_dead_panes_reaps_after_one_resume(tmp_path: Path) -> None:
 
     _call(expr, env=env)
 
-    assert "--blocked 5" in ready_log.read_text(), "a re-crash after resume escalates"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "a re-crash after resume warns-and-parks-LAST, never blocks"
+    )
     assert "new-window" not in tmux_log.read_text(), "resume is bounded to once per window"
+    assert (statedir / "warned-5.txt").exists()
 
 
 def test_recover_dead_panes_redispatches_clean_dead_pane(tmp_path: Path) -> None:
@@ -4842,9 +4942,9 @@ def test_recover_dead_panes_redispatches_clean_dead_pane(tmp_path: Path) -> None
     )
 
 
-def test_recover_dead_panes_blocks_clean_dead_pane_after_one_redispatch(tmp_path: Path) -> None:
-    # A clean pane that crashes AGAIN after a re-dispatch is a persistent infra problem →
-    # escalate to a human (bounded once, so re-dispatch can't loop forever).
+def test_recover_dead_panes_warns_clean_dead_pane_after_one_redispatch(tmp_path: Path) -> None:
+    # #241 §7: a clean pane that crashes AGAIN after a re-dispatch warns-and-parks-LAST
+    # (retried at low frequency), never blocks. Re-dispatch stays bounded once per window.
     spoke = _branched_spoke(tmp_path, ahead=False)
     fake_bin, _tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD
     redispatch = tmp_path / "redispatched"
@@ -4855,8 +4955,11 @@ def test_recover_dead_panes_blocks_clean_dead_pane_after_one_redispatch(tmp_path
 
     _call(expr, env=env)
 
-    assert "--blocked 5" in ready_log.read_text(), "a re-crash after re-dispatch escalates"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "a re-crash after re-dispatch warns-and-parks-LAST, never blocks"
+    )
     assert not redispatch.exists(), "re-dispatch is bounded to once per window"
+    assert (statedir / "warned-5.txt").exists()
 
 
 def _stateful_reaper_tmux(tmp_path: Path) -> tuple[Path, Path]:
@@ -4925,9 +5028,9 @@ def test_recover_then_reap_does_not_block_a_just_resumed_idle_spoke(tmp_path: Pa
     )
 
 
-def test_recover_dead_panes_over_ceiling_blocks_despite_commits(tmp_path: Path) -> None:
-    # An over-ceiling runaway always blocks (as reap_pass does) — recovery never resumes it,
-    # so it isn't revived here only to be blocked by reap_pass in the same tick.
+def test_recover_dead_panes_over_ceiling_revives_not_blocks(tmp_path: Path) -> None:
+    # #241 §7: an over-ceiling runaway is REVIVED first (a hang may un-stick on relaunch) then
+    # parked LAST — never blocked. recover_dead_panes and reap_pass both revive-first now.
     spoke = _branched_spoke(tmp_path, ahead=True)
     fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD, with commits
     expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, fake_bin)
@@ -4935,8 +5038,10 @@ def test_recover_dead_panes_over_ceiling_blocks_despite_commits(tmp_path: Path) 
 
     _call(expr, env=env)
 
-    assert "--blocked 5" in ready_log.read_text(), "an over-ceiling runaway always blocks"
-    assert "new-window" not in tmux_log.read_text(), "a runaway is never resumed"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "an over-ceiling runaway is revived + parked LAST, never blocked"
+    )
+    assert "new-window" in tmux_log.read_text(), "the runaway is revived (relaunched)"
 
 
 # ── J: pushed-but-unmarked detection (issue #202 J / #200) ────────────────────
@@ -5274,6 +5379,7 @@ def test_watchdog_entry_execs_from_private_copy(tmp_path: Path) -> None:
             "TMPDIR": str(tmp_path),
             "AFK_STATE": str(tmp_path / "state"),
             "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
             "AFK_WATCHDOG_FILE": str(tmp_path / "watchdog.pid"),
             "AFK_WATCHDOG_SECONDS": "1",
         },
@@ -5296,6 +5402,7 @@ def test_spawn_watchdog_strips_copy_guard(tmp_path: Path) -> None:
             "TMPDIR": str(tmp_path),
             "AFK_STATE": str(tmp_path / "state"),
             "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
             "AFK_WATCHDOG_FILE": str(tmp_path / "watchdog.pid"),
             "AFK_WATCHDOG_SECONDS": "1",
         },
@@ -5994,11 +6101,12 @@ def _ceiling_env(tmp_path: Path, *, wt_new_exit: int) -> tuple[str, dict[str, st
         "AFK_DISPATCH_STAGGER": "0",
         "AFK_SPOKE_CAP": "4",
         "AFK_DISPATCH_MAX_FAILURES": "3",
+        "AFK_JOURNAL_GH_COMMENT": "0",
     }
     return expr, env, attempts, statedir
 
 
-def test_dispatch_ceiling_blocks_issue_after_max_failures(tmp_path: Path) -> None:
+def test_dispatch_ceiling_warns_issue_after_max_failures(tmp_path: Path) -> None:
     # Three consecutive worktree-new.sh failures for #5 ⇒ a durable local block record and
     # no further attempts, instead of retrying silently forever.
     expr, env, attempts, statedir = _ceiling_env(tmp_path, wt_new_exit=1)
@@ -6009,7 +6117,7 @@ def test_dispatch_ceiling_blocks_issue_after_max_failures(tmp_path: Path) -> Non
     assert attempts.read_text().split() == ["5", "5", "5"], (
         "exactly AFK_DISPATCH_MAX_FAILURES attempts, then skip for the window"
     )
-    assert (statedir / "blocked-5.txt").exists(), "the ceiling records a durable block (--status)"
+    assert (statedir / "warned-5.txt").exists(), "#241: the ceiling warns (not a durable block)"
 
 
 def test_dispatch_failure_count_resets_on_success(tmp_path: Path) -> None:
@@ -6030,6 +6138,7 @@ def test_dispatch_failure_count_resets_on_success(tmp_path: Path) -> None:
         "AFK_DISPATCH_STAGGER": "0",
         "AFK_SPOKE_CAP": "4",
         "AFK_DISPATCH_MAX_FAILURES": "3",
+        "AFK_JOURNAL_GH_COMMENT": "0",
     }
     expr = (
         "inflight_issues() { :; }; inflight_worktrees() { :; }; "
@@ -6471,3 +6580,273 @@ def test_afk_sync_labels_ignores_lifecycle_labels(tmp_path: Path) -> None:
     assert "status:" not in log
     assert "mode:" not in log
     assert "lane:" not in log
+
+
+# ── issue #241 S6: reap becomes revive-first + warned-parked-LAST, never abandon ──
+# The reaper no longer kills a stuck spoke into blocked/<issue>. A live-but-frozen claude or a
+# crashed pane is REVIVED (kill + relaunch); only a twice-failed revival downgrades to
+# warned-and-parked-LAST (retried at low frequency), never abandoned. A finished-but-unmarked
+# spoke (#200) is auto-marked ready, not reaped.
+
+
+def test_reap_pass_revives_pane_alive_idle_spoke(tmp_path: Path) -> None:
+    # #241 §8: a live-but-frozen claude is a REVIVAL case (kill the hung pane + relaunch),
+    # NOT a terminal block. It warns + revives (opens a fresh window), never parks blocked.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane ALIVE (frozen)
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+
+    _call(expr, env=env)
+
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "a hung live pane must be revived, never blocked"
+    )
+    assert "new-window" in tmux_log.read_text(), "a hung live pane is REVIVED (relaunched)"
+    # A successful revival journals the taken decision for morning post-review (§10).
+    assert "revive" in (statedir / "decision-journal.jsonl").read_text()
+
+
+def test_reap_pass_revival_exhausted_parks_last_not_blocked(tmp_path: Path) -> None:
+    # After a revival already happened this window, a second stuck tick warns-and-parks-LAST
+    # (retried at low frequency on the backoff) — NEVER blocked, NEVER killed/abandoned.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, _ = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD again
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    (statedir / "resumed-5").write_text("1700000000\n")  # a revival already happened this window
+
+    _call(expr, env=env)
+
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "a twice-failed revival parks LAST, never blocks"
+    )
+    assert (statedir / "warned-5.txt").exists()
+
+
+def test_reap_pass_pushed_but_unmarked_warns_not_reaps(tmp_path: Path) -> None:
+    # #200/#241: a clean-pushed tip with no completion marker is warned-and-parked-LAST with an
+    # actionable reason, NOT reaped and NOT auto-landed — the shape is ambiguous with a spoke idle
+    # BETWEEN subtasks, so auto-emitting ready/<issue> could land incomplete work onto main.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, _ = _reaper_tmux(tmp_path, pane_path=spoke)  # pane alive
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    push_log = tmp_path / "push.log"
+    push_stub = tmp_path / "spoke-push.sh"
+    push_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{push_log}"\n')
+    push_stub.chmod(0o755)
+    env["SPOKE_PUSH"] = str(push_stub)
+    # Force the pushed-but-unmarked signal deterministically (a real upstream is elaborate).
+    expr = "_afk_pushed_but_unmarked() { return 0; }; " + expr
+
+    _call(expr, env=env)
+
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "a pushed-but-unmarked spoke is warned, not blocked"
+    )
+    # NEVER auto-lands: --ready must NOT be emitted (would land possibly-incomplete work).
+    assert not push_log.exists() or "--ready 5" not in push_log.read_text(), (
+        "auto-landing incomplete work must not happen — surface it for the human instead"
+    )
+    assert (statedir / "warned-5.txt").exists()
+
+
+# ── issue #241 S7: auto_land review-gate / land-retry / land-failure warn, not block ──
+# The land pass never parks a spoke blocked/<issue>. An unclean review verdict warns + retries
+# by default (or warns + LANDS with AFK_REVIEW_GATE_ON_UNCLEAN=land, never silent block); a land
+# failure and an exhausted land-retry warn + retry on the backoff instead of going terminal.
+
+
+def test_auto_land_unclean_review_warns_retries_not_blocks(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #241 §6 default: an unclean review verdict is NOT auto-landed (it would land a #172-bypass
+    # to main) and NOT blocked — it warns loudly and retries.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _write_review(spoke_repo, "new", "REQUEST_CHANGES", "2026-07-05T01:00:00Z")
+    wt_land, land_log = _land_recorder(tmp_path)
+    ready_stub, ready_log = _escalation_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    result = _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "SPOKE_READY": str(ready_stub),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_REVIEW_GATE": "1",
+            "AFK_JOURNAL_GH_COMMENT": "0",
+        },
+    )
+
+    assert not land_log.exists() or land_log.read_text().strip() == "", (
+        "unclean review must NOT land by default"
+    )
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "warn + retry, never block"
+    )
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert (statedir / "warned-5.txt").exists()
+
+
+def test_auto_land_unclean_review_lands_with_land_knob(spoke_repo: Path, tmp_path: Path) -> None:
+    # #241 §6 opt-in: AFK_REVIEW_GATE_ON_UNCLEAN=land lands the spoke WITH a loud warning
+    # recording the unclean verdict for post-review — the operator's explicit choice.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _write_review(spoke_repo, "new", "REQUEST_CHANGES", "2026-07-05T01:00:00Z")
+    wt_land, land_log = _land_recorder(tmp_path)
+    ready_stub, ready_log = _escalation_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    result = _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "SPOKE_READY": str(ready_stub),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_REVIEW_GATE": "1",
+            "AFK_REVIEW_GATE_ON_UNCLEAN": "land",
+            "AFK_JOURNAL_GH_COMMENT": "0",
+        },
+    )
+
+    assert land_log.exists() and land_log.read_text().split() == ["5"], "the land knob must land"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), "never block"
+    assert "WARNING: #5" in result.stderr, "landing an unclean verdict must warn loudly"
+
+
+def test_auto_land_failure_warns_retries_not_blocks(spoke_repo: Path, tmp_path: Path) -> None:
+    # #241 §5: an auto-land failure (merge conflict / push rejection) warns + retries instead of
+    # parking blocked/<issue>.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _write_review(spoke_repo, "ok", "APPROVE", "2026-07-05T01:00:00Z")
+    wt_land = tmp_path / "worktree-land.sh"
+    wt_land.write_text("#!/usr/bin/env bash\nexit 1\n")  # land always fails
+    wt_land.chmod(0o755)
+    ready_stub, ready_log = _escalation_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    result = _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "SPOKE_READY": str(ready_stub),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_REVIEW_GATE": "0",
+            "AFK_JOURNAL_GH_COMMENT": "0",
+        },
+    )
+
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "land failure warns, never blocks"
+    )
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert (statedir / "warned-5.txt").exists()
+
+
+def test_auto_land_failure_is_backoff_paced_not_every_tick(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #241 BLOCKER fix: a persistently-failing land (merge conflict) is re-attempted at LOW
+    # frequency (the warned-retry backoff), NOT every tick — worktree-land is expensive. Within
+    # one backoff window the land runs once; a later tick past the window runs it again.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _write_review(spoke_repo, "ok", "APPROVE", "2026-07-05T01:00:00Z")
+    lands = tmp_path / "lands.count"
+    wt_land = tmp_path / "worktree-land.sh"
+    wt_land.write_text(f'#!/usr/bin/env bash\nprintf x >> "{lands}"\nexit 1\n')  # land always fails
+    wt_land.chmod(0o755)
+    ready_stub, ready_log = _escalation_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+    base = {
+        "WT_LAND": str(wt_land),
+        "SPOKE_READY": str(ready_stub),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_REVIEW_GATE": "0",
+        "AFK_WARN_BACKOFF_BASE": "60",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    _call(expr, env={**base, "AFK_NOW": "1000"})  # tick 1: due → land (fails) → arm backoff
+    _call(expr, env={**base, "AFK_NOW": "1000"})  # tick 2: inside backoff → skip the land
+    _call(expr, env={**base, "AFK_NOW": "1030"})  # tick 3: still inside → skip
+    _call(expr, env={**base, "AFK_NOW": "1100"})  # tick 4: past 60s → land again (fails)
+
+    n = lands.read_text().count("x") if lands.exists() else 0
+    assert n == 2, f"a failing land must be backoff-paced, not re-run every tick; ran {n}"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text()
+
+
+# ── issue #241 S8: auth failure halts DISPATCH but never stops the drain ───────
+# Auth is the one true external blocker, but it no longer breaks the main loop or blocks
+# in-flight spokes. On a dead token the drain halts dispatch, WARNS the in-flight spokes
+# (never blocks them), re-probes each tick, and RESUMES the moment auth recovers.
+
+
+def test_warn_all_inflight_warns_not_blocks(tmp_path: Path) -> None:
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    ready_stub, ready_log = _escalation_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    expr = (
+        f'inflight_worktrees() {{ printf "{spoke}\\t5\\n"; }}; '
+        '_warn_all_inflight "subscription auth failed — dispatch halted"'
+    )
+
+    _call(
+        expr,
+        env={
+            "SPOKE_READY": str(ready_stub),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_JOURNAL_GH_COMMENT": "0",
+        },
+    )
+
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "an auth halt warns the in-flight spoke, never blocks it"
+    )
+    assert (statedir / "warned-5.txt").exists()
+
+
+def test_service_auth_halt_resumes_when_auth_recovers(tmp_path: Path) -> None:
+    # With the flag raised: a HEALTHY re-probe clears it (resume); a DEAD probe leaves it set.
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    base = {"AFK_STATE_DIR": str(statedir), "AFK_JOURNAL_GH_COMMENT": "0"}
+
+    recovered = _call(
+        "_AFK_AUTH_FAILED=1; inflight_worktrees() { :; }; "
+        '_afk_service_auth_halt; echo "FLAG=$_AFK_AUTH_FAILED"',
+        env={**base, "AFK_AUTH_PROBE_CMD": "true"},  # auth healthy again
+    )
+    still_dead = _call(
+        "_AFK_AUTH_FAILED=1; inflight_worktrees() { :; }; "
+        '_afk_service_auth_halt; echo "FLAG=$_AFK_AUTH_FAILED"',
+        env={**base, "AFK_AUTH_PROBE_CMD": "echo authentication_error; exit 1"},
+    )
+
+    assert "FLAG=0" in recovered.stdout, "a recovered auth probe must clear the halt flag (resume)"
+    assert "FLAG=1" in still_dead.stdout, "a still-dead auth probe keeps the drain halted"
+
+
+def test_decide_and_act_auth_failure_warns_not_blocks(
+    spoke_repo: Path, stub_env: dict[str, str]
+) -> None:
+    # #241 §9: an answerer auth failure warns the spoke (not blocks it — it's not the spoke's
+    # fault) and still raises the global halt flag so dispatch pauses.
+    env = {
+        **stub_env,
+        "AFK_ANSWERER_CMD": "printf 'authentication_error: OAuth token expired' >&2; exit 1",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"decide_and_act '{spoke_repo}' 5; echo \"FLAG=$_AFK_AUTH_FAILED\"", env=env)
+
+    _rl = Path(env["_READY_LOG"])
+    assert not _rl.exists() or "--blocked 5" not in _rl.read_text(), (
+        "auth failure warns, never blocks"
+    )
+    assert "WARNING: #5" in result.stderr and "auth" in result.stderr.lower(), result.stderr
+    assert "FLAG=1" in result.stdout, "the global halt flag must still be raised"
