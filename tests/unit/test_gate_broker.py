@@ -773,6 +773,191 @@ def test_broker_service_gate_voids_answer_when_reasoner_mutates_tracked_content(
     assert "worktree" in result.stderr.lower() or "mutat" in result.stderr.lower(), result.stderr
 
 
+def test_broker_service_gate_no_void_when_spoke_self_resumes_during_reasoning(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # #244: since #237 the reasoner runs in an isolated snapshot copy, so a LIVE-tree diff
+    # during run_answerer is almost always the SPOKE's OWN concurrent edits — it self-resumed
+    # mid-GREEN — not the reasoner. The read-only void attributes a tree diff to the reasoner
+    # ONLY when NO genuine spoke turn landed during the step. Here the spoke self-resumes: the
+    # answerer CMD both edits the live tree AND appends the spoke's own assistant tool_use (an
+    # Edit) to the live transcript — a genuine spoke turn — so the diff is the spoke's. The stale
+    # answer is dropped, NOT voided: no gate-voided marker, no blocked tag. Contrast the :750
+    # backstop, where the spoke stays idle (no turn appended) and the same absolute write DOES void.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (spoke_repo / "tracked.txt").write_text("original")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=spoke_repo, check=True, capture_output=True)
+    live_jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    os.utime(live_jsonl, (1_000_000_000, 1_000_000_000))  # pin OLD (mtime is irrelevant to the fix)
+    # The spoke's own assistant work: a tool_use record (it ran Edit) — genuine spoke activity.
+    resumed = json.dumps(
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "name": "Edit", "input": {}}]},
+        }
+    )
+    env = {
+        **waiting_spoke_env,
+        # Model the spoke self-resuming DURING the reason step: it edits its own tracked file (a
+        # live-tree diff the fingerprint sees) AND appends its own assistant turn to the transcript.
+        "AFK_ANSWERER_CMD": (
+            f"printf 'edited by the spoke' > '{spoke_repo}/tracked.txt'; "
+            f"printf '%s\\n' '{resumed}' >> '{live_jsonl}'; "
+            "printf 'ANSWER: go ahead'"
+        ),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert not (statedir / "gate-voided-5").exists(), (
+        "the spoke's own concurrent edit must not be voided as a reasoner mutation"
+    )
+    log = Path(env["_READY_LOG"]).read_text() if Path(env["_READY_LOG"]).exists() else ""
+    assert "--blocked 5" not in log, f"a self-resumed spoke must not be blocked: {log}"
+    assert "voiding its answer" not in result.stderr, (
+        f"a self-resumed spoke's edit must not read as a reasoner void: {result.stderr}"
+    )
+
+
+def test_broker_service_gate_voids_masked_escape_no_spoke_activity(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # #244 review finding 1: a genuine reasoner escape (absolute-path live-tree write) that
+    # coincides with a #240 NON-TURN transcript bump must STILL void — a mtime bump alone must not
+    # mask the breach. The answerer writes the live tree by absolute path AND `touch`es the pinned-
+    # old jsonl (a non-turn bump, NOT a spoke turn), while the spoke stays parked. No genuine spoke
+    # activity landed, so the diff is the reasoner's: void + escalate, never a silent drop.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    live_jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    os.utime(live_jsonl, (1_000_000_000, 1_000_000_000))
+    (spoke_repo / "tracked.txt").write_text("original")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=spoke_repo, check=True, capture_output=True)
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": (
+            f"printf 'escaped' > '{spoke_repo}/tracked.txt'; "
+            f"touch '{live_jsonl}'; printf 'ANSWER: go ahead'"
+        ),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert (statedir / "gate-voided-5").exists(), (
+        "an escape masked by a non-turn mtime bump must still mint the void marker"
+    )
+    assert "voiding its answer" in result.stderr, result.stderr
+
+
+def test_broker_service_gate_voids_commit_escape_on_gate_parked_spoke(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #244 review finding 2: a reasoner escape that COMMITS to a GATE-parked spoke's live worktree
+    # moves HEAD off the gate tag. Keying the void on _still_parked_same (which folds in the gate
+    # tag) would route this to the silent DROP branch; keying on genuine spoke activity does not —
+    # the commit leaves no spoke turn in the transcript, so the HEAD-moving escape still voids.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    (pd / "session.jsonl").write_text(_gate_park_transcript("PLAN prose"))
+    os.utime(pd / "session.jsonl", (1_000_000_000, 1_000_000_000))
+    _tag_gate_at_head(spoke_repo, 5)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{tmp_path}/ready.log"\n')
+    ready_stub.chmod(0o755)
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "SPOKE_READY": str(ready_stub),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+        # The reasoner escapes isolation and commits to the LIVE tree, moving HEAD off gate/5.
+        "AFK_ANSWERER_CMD": (
+            f"git -C '{spoke_repo}' commit --allow-empty -q -m 'chore: sneaky'; "
+            "printf 'ANSWER: go ahead'"
+        ),
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert (statedir / "gate-voided-5").exists(), (
+        "a HEAD-moving commit-escape on a gate-parked spoke must still void, not silently drop"
+    )
+    assert "voiding its answer" in result.stderr, result.stderr
+
+
+def test_spoke_activity_appended_classifies_turns(spoke_repo: Path, tmp_path: Path) -> None:
+    # The #244 void discriminator: rc 0 when a genuine spoke turn (assistant tool_use / typed
+    # reply) appended, rc 1 when only a non-turn write did, rc 2 when the transcript is unreadable.
+    # The void gate treats BOTH rc 1 and rc 2 as a breach (fail SAFE), so rc 2 must be distinct.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    env = {"CLAUDE_PROJECTS_DIR": str(projects)}
+
+    jsonl.write_text(
+        json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Edit"}]}}
+        )
+        + "\n"
+    )
+    activity = _call(f"_spoke_activity_appended '{spoke_repo}' ''; echo RC=$?", env=env)
+    assert activity.stdout.strip().splitlines()[-1] == "RC=0", "an assistant tool_use is activity"
+
+    jsonl.write_text(  # a synthetic tool_result user record — a #240 non-turn write, not a turn
+        json.dumps({"type": "user", "message": {"content": [{"type": "tool_result"}]}}) + "\n"
+    )
+    non_turn = _call(f"_spoke_activity_appended '{spoke_repo}' ''; echo RC=$?", env=env)
+    assert non_turn.stdout.strip().splitlines()[-1] == "RC=1", "a non-turn write is not activity"
+
+    missing = _call(
+        f"_spoke_activity_appended '{spoke_repo}' ''; echo RC=$?",
+        env={"CLAUDE_PROJECTS_DIR": str(tmp_path / "nonexistent")},
+    )
+    assert missing.stdout.strip().splitlines()[-1] == "RC=2", (
+        "an unreadable transcript is rc 2 (unavailable) — the void gate voids on it, fail-safe"
+    )
+
+    # A record whose `message` is a non-dict must not crash the scanner (would surface as rc 2).
+    jsonl.write_text(json.dumps({"type": "assistant", "message": "oops-a-string"}) + "\n")
+    malformed = _call(f"_spoke_activity_appended '{spoke_repo}' ''; echo RC=$?", env=env)
+    assert malformed.stdout.strip().splitlines()[-1] == "RC=1", (
+        "a non-dict message must be skipped as non-activity, never crash the scan into rc 2"
+    )
+
+    # Truncation guard: activity mode must NOT from-0 rescan (which would match the PRE-park
+    # AskUserQuestion — itself an assistant tool_use — and mask a real escape). Feed a `sizes`
+    # snapshot claiming a larger offset than the file holds, so the truncation branch fires.
+    jsonl.write_text(
+        json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Ask"}]}}
+        )
+        + "\n"
+    )
+    inflated = f"999999\t{jsonl}"
+    truncated = _call(f"_spoke_activity_appended '{spoke_repo}' '{inflated}'; echo RC=$?", env=env)
+    assert truncated.stdout.strip().splitlines()[-1] == "RC=1", (
+        "activity mode must skip a truncated file, not from-0 match the pre-park record (fail-safe)"
+    )
+
+
 def test_broker_service_gate_isolates_reasoner_writes_from_live_tree(
     spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
 ) -> None:
