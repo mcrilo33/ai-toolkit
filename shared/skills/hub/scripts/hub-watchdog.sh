@@ -474,15 +474,21 @@ _wd_run_conditions() {
 # interventions taken, defects filed, and the score, to stdout + a best-effort telemetry span.
 
 # _wd_intervention_count -> firings this run = lines in the intervention-ledger (0 when absent).
+# `grep -c` on an existing file with zero matches prints "0" AND exits 1, so a naive
+# `[ -f ] && grep -c || echo 0` double-prints "0\n0" and corrupts the report — capture instead.
 _wd_intervention_count() {
-  local lf; lf="$(_wd_ledger_file)"
-  [ -f "$lf" ] && grep -c . "$lf" 2>/dev/null || printf '0\n'
+  local lf n; lf="$(_wd_ledger_file)"
+  [ -f "$lf" ] || { printf '0\n'; return; }
+  n="$(grep -c . "$lf" 2>/dev/null)" || true
+  printf '%s\n' "${n:-0}"
 }
 
 # _wd_defect_count -> afk-defect firings (the drain-shortfall subset; novel-decisions excluded).
 _wd_defect_count() {
-  local lf; lf="$(_wd_ledger_file)"
-  [ -f "$lf" ] && grep -c '"class":"afk-defect"' "$lf" 2>/dev/null || printf '0\n'
+  local lf n; lf="$(_wd_ledger_file)"
+  [ -f "$lf" ] || { printf '0\n'; return; }
+  n="$(grep -c '"class":"afk-defect"' "$lf" 2>/dev/null)" || true
+  printf '%s\n' "${n:-0}"
 }
 
 # _wd_spokes_serviced -> distinct spokes the drain dispatched this run = the dispatch-<issue>.epoch

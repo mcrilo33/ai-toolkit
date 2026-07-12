@@ -721,3 +721,15 @@ def test_cli_report_on_zero_firing_run(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "autonomy_score=1.000" in result.stdout
+
+
+def test_defect_count_is_single_line_when_no_afk_defects(tmp_path: Path) -> None:
+    # An existing ledger with zero afk-defect lines: grep -c prints "0" AND exits 1, so a naive
+    # `&& grep || echo 0` would double-print "0\n0" and corrupt the report. Must be exactly "0".
+    ledger = tmp_path / "l.jsonl"
+    _seed_ledger(ledger, ['{"class":"novel-decision"}'])
+
+    result = _call("_wd_defect_count", env={"HUB_WATCHDOG_LEDGER": str(ledger)})
+
+    assert result.stdout.strip() == "0"
+    assert result.stdout.count("0") == 1, f"exactly one '0', not a double-print: {result.stdout!r}"
