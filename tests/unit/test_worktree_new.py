@@ -60,6 +60,13 @@ WORKTREE_NEW = Path(__file__).resolve().parents[2] / "scripts" / "worktree-new.s
 _GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
 # The host's base-branch override (#117) must never steer the script under test.
 _GIT_ENV.pop("AI_TOOLKIT_BASE_BRANCH", None)
+# Strip inherited git-location vars (issue #179 / #259): when these tests run inside a
+# `git commit` hook (e.g. red-proof-verify's Tested-RED replay), git sets GIT_DIR /
+# GIT_WORK_TREE / GIT_INDEX_FILE in the environment. Those OVERRIDE cwd-based discovery, so
+# `git -C <tmp-hub>` and worktree-new.sh's internal git calls would silently operate on the
+# REAL repo and trip the isolation tripwire. Popping them restores cwd-based discovery.
+for _leak in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
+    _GIT_ENV.pop(_leak, None)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -1093,6 +1100,19 @@ TIER_STAGING_RULES = [
     "Bash(git reset -q HEAD:*)",
 ]
 
+# In-worktree self-script execution (issue #259). Claude Code evaluates a COMPOUND Bash
+# command per-segment against `permissions.allow` and a PreToolUse hook's whole-command
+# `allow` does NOT satisfy that per-segment check (deny > ask > allow > default-prompt). So
+# the #253 afk-permission-hook — which classifies the WHOLE command correctly and emits
+# `allow` — cannot suppress the dialog for the #238 compound `chmod +x X && ./X`: the `./X`
+# segment matches no rule and re-prompts. Seeding `Bash(./:*)` covers that segment
+# deterministically (the exec lane classify_permission already APPROVEs, #240). Unlike the
+# hook it is ALWAYS-ON, so a bare `Bash(./:*)` breadth is the deliberate trade-off — the
+# rm/push/chmod/main/spoke-main DENY hooks + the ship gates remain authoritative.
+TIER_EXEC_RULES = [
+    "Bash(./:*)",
+]
+
 SEEDED_RULES = [
     SCRIPT_RULE,
     READY_SCRIPT_RULE,
@@ -1100,6 +1120,7 @@ SEEDED_RULES = [
     *TIER2_RULES,
     *TIER_RUNNER_RULES,
     *TIER_STAGING_RULES,
+    *TIER_EXEC_RULES,
 ]
 
 # Wildcards that must NEVER be seeded — each would hand over a destructive verb
@@ -1240,6 +1261,25 @@ def test_seeds_own_worktree_staging(hub: Path) -> None:
         assert rule in allow, f"missing seeded staging rule: {rule}"
     for rule in ("Bash(git reset:*)", "Bash(git reset --hard)", "Bash(git reset --hard:*)"):
         assert rule not in allow, f"destructive reset wildcard seeded: {rule}"
+
+
+def test_seeds_exec_lane_for_compound_self_ops(hub: Path) -> None:
+    # Issue #259 — the #238 compound-chmod smoke `chmod +x X && ./X` re-prompted because CC
+    # evaluates the compound per-segment: `chmod +x X` matched `Bash(chmod +x:*)` but the
+    # `./X` segment matched no rule, and the afk-permission-hook's whole-command `allow` does
+    # not cover a per-segment gap. Seeding `Bash(./:*)` covers the exec segment so BOTH
+    # segments of the smoke are allowlisted and the drain resolves it with no dialog.
+    _seed_hub_claude(hub)
+
+    proc = _run_new_quiet(hub, "99", "pushguard")
+
+    assert proc.returncode == 0, proc.stderr
+    allow = _load_allowlist(_worktree_dir(hub, "99"))["permissions"]["allow"]
+    for rule in TIER_EXEC_RULES:
+        assert rule in allow, f"missing seeded exec-lane rule: {rule}"
+    # The #238 compound's two segments are each covered by a seeded rule.
+    assert "Bash(chmod +x:*)" in allow, "chmod segment of the #238 compound not covered"
+    assert "Bash(./:*)" in allow, "./script segment of the #238 compound not covered"
 
 
 def test_seeds_read_access_to_hub_root(hub: Path) -> None:
