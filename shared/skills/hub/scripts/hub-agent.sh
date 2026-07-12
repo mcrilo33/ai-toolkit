@@ -11,8 +11,8 @@
 #   - start/end records in `<hub-agents-dir>/journal.jsonl` that hub-status reads
 #     into its "Hub agents" section,
 #   - the headless agent launched with the native-OTel env prefix so its token
-#     cost streams to Langfuse (grouped under a `hub-<label>-<epoch>` session),
-#     plus one kind=agent boundary span marking the run.
+#     cost streams to Langfuse (grouped under a `hub-<label>-…` run session),
+#     plus one best-effort kind=agent boundary span marking the run.
 #
 # Usage:
 #   hub-agent.sh <label> [--purpose "<text>"] [--no-window] -- <command...>
@@ -114,7 +114,9 @@ mode_exec() {
   journal="$agents_dir/journal.jsonl"
   [ -n "$log" ] || log="$agents_dir/${safe_label}.log"
   mkdir -p "$agents_dir" "$(dirname "$log")" 2>/dev/null || true
-  run_id="hub-${safe_label}-$(_ha_epoch)"
+  # run_id keys this run in Langfuse AND in the hub-status live view; the pid
+  # disambiguates two same-label dispatches within the same second.
+  run_id="hub-${safe_label}-$(_ha_epoch)-$$"
   [ -n "$start_ms" ] || start_ms="$(wt_now_ms)"
 
   _ha_journal_append "$journal" \
@@ -123,11 +125,15 @@ mode_exec() {
 
   # Native-OTel launch prefix (issue #83), so the headless agent streams its own
   # trace and token cost lands in Langfuse under the run_id's session. Empty when
-  # opted out (AI_TOOLKIT_OTEL != 1) — the full opt-out.
+  # opted out (AI_TOOLKIT_OTEL != 1) — the full opt-out. Resolve the toggle into
+  # the REAL AI_TOOLKIT_OTEL env (default-on like worktree-new.sh) and export it:
+  # wt_native_otel_prefix self-gates on that exact var, so a local copy would leave
+  # the prefix silently empty and the agent uninstrumented.
   wt_resolve_telemetry_config 2>/dev/null || true
-  local otel="${AI_TOOLKIT_OTEL:-${AI_TOOLKIT_OTEL_DEFAULT:-1}}"
+  AI_TOOLKIT_OTEL="${AI_TOOLKIT_OTEL:-${AI_TOOLKIT_OTEL_DEFAULT:-1}}"
+  export AI_TOOLKIT_OTEL
   local prefix=""
-  if [ "$otel" = "1" ] && command -v wt_native_otel_prefix >/dev/null 2>&1; then
+  if [ "$AI_TOOLKIT_OTEL" = "1" ] && command -v wt_native_otel_prefix >/dev/null 2>&1; then
     local body_dir="$agents_dir/${safe_label}.raw-bodies"
     mkdir -p "$body_dir" 2>/dev/null || true
     wt_default_span_endpoint
@@ -143,12 +149,17 @@ mode_exec() {
   local span_status="success"
   [ "$status" -eq 0 ] || span_status="failure"
 
+  # Carry run_id on the end record so hub-status retires THIS run, not a sibling
+  # dispatched under the same label (the live view keys on run_id).
   _ha_journal_append "$journal" \
-    event end label "$safe_label" status "$span_status" \
+    event end label "$safe_label" run_id "$run_id" status "$span_status" \
     ts "$(_ha_iso)" ts_epoch "$(_ha_epoch)"
 
-  # Telemetry boundary span (kind=agent). Resolve hub-side Langfuse auth the same
-  # way worktree-land does (env -> ~/.afk-telemetry) so the span sink can fire;
+  # Telemetry boundary span (kind=agent), a best-effort marker of the run. It is
+  # emitted from the hub checkout, which has no spoke-run-id file, so it does NOT
+  # join the agent's own hub-<label> Langfuse session — the token cost lands there
+  # via the native OTel stream above, not this span. Resolve hub-side Langfuse auth
+  # the way worktree-land does (env -> ~/.afk-telemetry) so the sink can fire;
   # best-effort by contract — telemetry never fails the run.
   wt_resolve_langfuse_auth >/dev/null 2>&1 || true
   if command -v telemetry_emit_span >/dev/null 2>&1; then
@@ -184,8 +195,9 @@ mode_dispatch() {
   # Bring up the collector + Langfuse bridge best-effort so the agent's native
   # stream has a sink (idempotent, never fails the dispatch). Opt-out safe.
   wt_resolve_telemetry_config 2>/dev/null || true
-  local otel="${AI_TOOLKIT_OTEL:-${AI_TOOLKIT_OTEL_DEFAULT:-1}}"
-  if [ "$otel" = "1" ]; then
+  AI_TOOLKIT_OTEL="${AI_TOOLKIT_OTEL:-${AI_TOOLKIT_OTEL_DEFAULT:-1}}"
+  export AI_TOOLKIT_OTEL
+  if [ "$AI_TOOLKIT_OTEL" = "1" ]; then
     command -v wt_otel_collector_preflight >/dev/null 2>&1 && wt_otel_collector_preflight "$REPO_ROOT" || true
     command -v wt_otel_bridge_preflight >/dev/null 2>&1 && wt_otel_bridge_preflight "$REPO_ROOT" || true
   fi
@@ -209,18 +221,22 @@ mode_dispatch() {
       for a in "${worker[@]}"; do cmd_str="${cmd_str}$(printf '%q ' "$a")"; done
       # No `exec $SHELL` tail: the window closes when the agent completes (#245).
       local win
-      win="$(tmux new-window -t "=$sess:" -P -F '#{window_id}' -n "$win_name" \
-             -c "$REPO_ROOT" "$cmd_str" 2>/dev/null)"
-      tmux set-window-option -t "$win" automatic-rename off 2>/dev/null || true
-      tmux set-window-option -t "$win" allow-rename off 2>/dev/null || true
-      echo "→ hub agent '$safe_label' running in tmux window '$win_name' ($win)"
-      echo "  log: $log"
-      if [ -n "${TMUX:-}" ]; then
-        echo "  tmux select-window -t '${sess}:${win_name}'"
-      else
-        echo "  tmux attach -t '${sess}' \\; select-window -t '${sess}:${win_name}'"
+      # A failed new-window (server limit, transient error) must NOT be reported as
+      # success — the agent would never run. Require a non-empty window id, else
+      # fall through to the inline run so the review actually happens.
+      if win="$(tmux new-window -t "=$sess:" -P -F '#{window_id}' -n "$win_name" \
+             -c "$REPO_ROOT" "$cmd_str" 2>/dev/null)" && [ -n "$win" ]; then
+        tmux set-window-option -t "$win" automatic-rename off 2>/dev/null || true
+        tmux set-window-option -t "$win" allow-rename off 2>/dev/null || true
+        echo "→ hub agent '$safe_label' running in tmux window '$win_name' ($win)"
+        echo "  log: $log"
+        if [ -n "${TMUX:-}" ]; then
+          echo "  tmux select-window -t '${sess}:${win_name}'"
+        else
+          echo "  tmux attach -t '${sess}' \\; select-window -t '${sess}:${win_name}'"
+        fi
+        return 0
       fi
-      return 0
     fi
     wt_warn "tmux present but window spawn failed — running inline"
   fi

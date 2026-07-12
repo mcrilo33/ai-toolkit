@@ -369,7 +369,10 @@ if [ -f "$hub_agents_journal" ] && command -v python3 >/dev/null 2>&1; then
   hub_agents_out="$(_HA_JOURNAL="$hub_agents_journal" python3 2>/dev/null <<'PYEOF'
 import json, os, time
 
-live = {}  # label -> latest start record (dropped once an end supersedes it)
+# Keyed on run_id (unique per dispatch) so an `end` retires exactly its own run,
+# never a still-running sibling launched under the same label. Falls back to the
+# label when a record predates run_ids.
+live = {}
 try:
     with open(os.environ["_HA_JOURNAL"]) as fh:
         for raw in fh:
@@ -383,15 +386,35 @@ try:
             event = obj.get("event")
             if not label or event not in ("start", "end"):
                 continue
+            key = obj.get("run_id") or label
             if event == "start":
-                live[label] = obj
+                live[key] = obj
             else:
-                live.pop(label, None)
+                live.pop(key, None)
 except Exception:
     pass
 
+
+def _pid_alive(rec):
+    """A journaled worker with a dead pid never wrote its `end` (killed window,
+    crash, reboot). Retire it. A missing/unverifiable pid stays live."""
+    pid = rec.get("pid")
+    if not isinstance(pid, int):
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
+
+
 now = time.time()
-for label, rec in live.items():
+for rec in live.values():
+    if not _pid_alive(rec):
+        continue
+    label = rec.get("label")
     purpose = str(rec.get("purpose") or "").split("\n", 1)[0]
     parts = [f"hub:{label}"]
     if purpose:

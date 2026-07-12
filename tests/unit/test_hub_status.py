@@ -1061,19 +1061,45 @@ def _write_hub_agents_journal(agents_dir: Path, records: list[dict[str, object]]
     (agents_dir / "journal.jsonl").write_text("\n".join(lines) + "\n")
 
 
-def _start_record(label: str, purpose: str, *, age_s: float = 5.0) -> dict[str, object]:
+def _start_record(
+    label: str,
+    purpose: str,
+    *,
+    age_s: float = 5.0,
+    run_id: str | None = None,
+    pid: int | None = None,
+) -> dict[str, object]:
+    # pid defaults to the live test process so the liveness check keeps the row;
+    # a dead pid is passed explicitly by the retire-dead-agent test.
     return {
         "event": "start",
         "label": label,
         "purpose": purpose,
-        "pid": 4242,
+        "pid": pid if pid is not None else os.getpid(),
+        "run_id": run_id or f"hub-{label}-1",
         "ts_epoch": int(time.time() - age_s),
         "log": f"/tmp/hub-agents/{label}.log",
     }
 
 
-def _end_record(label: str, status: str = "success") -> dict[str, object]:
-    return {"event": "end", "label": label, "status": status, "ts_epoch": int(time.time())}
+def _end_record(
+    label: str, status: str = "success", *, run_id: str | None = None
+) -> dict[str, object]:
+    return {
+        "event": "end",
+        "label": label,
+        "run_id": run_id or f"hub-{label}-1",
+        "status": status,
+        "ts_epoch": int(time.time()),
+    }
+
+
+def _dead_pid() -> int:
+    """A pid that named a real process which has since exited — a crashed worker
+    that never wrote its end record. Spawn a trivial process and reap it."""
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    return proc.pid
 
 
 def test_hub_agents_section_lists_live_run(hub_with_spokes: Path, tmp_path: Path) -> None:
@@ -1143,3 +1169,40 @@ def test_hub_agents_section_survives_malformed_journal(
 
     assert result.returncode == 0
     assert "hub:review-241" in result.stdout
+
+
+def test_hub_agents_section_retires_dead_pid(hub_with_spokes: Path, tmp_path: Path) -> None:
+    # A start with no end but a dead pid (worker crashed / window killed) must not
+    # linger as running.
+    agents = tmp_path / "hub-agents"
+    _write_hub_agents_journal(
+        agents, [_start_record("review-236", "pre-land review #236", pid=_dead_pid())]
+    )
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, hub_agents_dir=agents)
+
+    section = out[out.index("Hub agents") :]
+    assert "review-236" not in section
+    assert re.search(r"none", section, re.I)
+
+
+def test_hub_agents_section_keeps_live_sibling_when_same_label_ends(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    # Two runs share a label; the first ends. Keyed on run_id, the second (still
+    # live) must remain shown — an end must retire only its own run.
+    agents = tmp_path / "hub-agents"
+    _write_hub_agents_journal(
+        agents,
+        [
+            _start_record("review-236", "first pass", run_id="hub-review-236-a"),
+            _start_record("review-236", "second pass", run_id="hub-review-236-b"),
+            _end_record("review-236", run_id="hub-review-236-a"),
+        ],
+    )
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, hub_agents_dir=agents)
+
+    section = out[out.index("Hub agents") :]
+    assert "hub:review-236" in section
+    assert "second pass" in section

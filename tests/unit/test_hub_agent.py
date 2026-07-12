@@ -48,15 +48,19 @@ def hub(tmp_path: Path) -> Path:
     return hub
 
 
-def _tmux_stub(bindir: Path, log: Path) -> None:
-    """A tmux stub that records every invocation's args (one line each) to `log`
-    and succeeds. new-window prints a fake window id so the caller can read it."""
+def _tmux_stub(bindir: Path, log: Path, *, new_window_ok: bool = True) -> None:
+    """A tmux stub that records every invocation's args (one line each) to `log`.
+
+    new-window prints a fake window id and exits 0 when `new_window_ok`, else it
+    prints nothing and exits 1 (simulating a spawn failure); every other subcommand
+    succeeds."""
+    nw = "printf '@9\\n'; exit 0" if new_window_ok else "exit 1"
     tmux = bindir / "tmux"
     tmux.write_text(
         "#!/bin/sh\n"
         f'printf "%s\\n" "$*" >> "{log}"\n'
         'case "$1" in\n'
-        "  new-window) printf '@9\\n' ;;\n"
+        f"  new-window) {nw} ;;\n"
         "  display-message) printf 'hub-sess\\n' ;;\n"
         "esac\n"
         "exit 0\n"
@@ -239,3 +243,36 @@ def test_dispatch_requires_command_after_double_dash(hub: Path, tmp_path: Path) 
 
     assert result.returncode != 0
     assert "--" in result.stderr or "command" in result.stderr.lower()
+
+
+def test_dispatch_falls_back_inline_when_new_window_fails(hub: Path, tmp_path: Path) -> None:
+    # tmux is present and the session resolves, but new-window fails: dispatch must
+    # NOT report success — it falls through to the inline run so the agent actually
+    # executes (and its log/journal are written).
+    env = _env(hub, tmp_path)
+    _tmux_stub(tmp_path / "bin", tmp_path / "tmux-calls.txt", new_window_ok=False)
+    log = tmp_path / "hub-agents" / "review-236.log"
+
+    result = _run(hub, "review-236", "--", "printf", "ran-inline\n", env=env)
+
+    assert result.returncode == 0
+    assert "ran-inline" in log.read_text()
+    assert any(e["event"] == "end" for e in _journal(env))
+
+
+def test_exec_applies_native_otel_prefix_when_enabled(hub: Path, tmp_path: Path) -> None:
+    # With AI_TOOLKIT_OTEL=1 the worker must launch the command with the native-OTel
+    # env prefix (so token cost streams). A fake `claude` echoes an OTel var it would
+    # only see if the prefix were actually applied to its environment.
+    env = _env(hub, tmp_path, extra={"AI_TOOLKIT_OTEL": "1"})
+    fake_claude = tmp_path / "bin" / "claude"
+    fake_claude.write_text("#!/bin/sh\nprintf 'exporter=%s\\n' \"$OTEL_TRACES_EXPORTER\"\n")
+    fake_claude.chmod(0o755)
+    log = tmp_path / "hub-agents" / "otelcheck.log"
+
+    result = _run(
+        hub, "--exec", "otelcheck", "--log", str(log), "--start-ms", "1000", "--", "claude", env=env
+    )
+
+    assert result.returncode == 0
+    assert "exporter=otlp" in log.read_text()
