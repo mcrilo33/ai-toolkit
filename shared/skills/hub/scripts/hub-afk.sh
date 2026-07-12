@@ -1744,6 +1744,80 @@ afk_done() {
   [ -z "$(printf '%s' "$remaining" | tr -d '[:space:]')" ]
 }
 
+# --- sleep inhibitor (issue #242) ---------------------------------------------
+# While a drain is armed the Mac must not sleep: system sleep freezes the supervisor,
+# every spoke, tmux, and the OTel stack mid-run, and wall-clock timers (reap ceilings,
+# staleness checks) misfire on wake. So arming ties a `caffeinate -is -w <supervisor pid>`
+# to the supervisor's LIFETIME: `caffeinate -w <pid>` self-exits the instant that pid dies,
+# so /afk off (and any crash) needs NO teardown — this mirrors the --remote path's
+# `caffeinate -s` wrap (build_remote_launch_cmd) for the LOCAL arm. AFK_CAFFEINATE_BIN wins
+# for tests. Battery/lid limits are warned at arm time (afk_warn_power); on a non-macOS host
+# the ensure is a silent no-op and the arm path warns once (_afk_warn_no_inhibitor).
+#
+# The pidfile records "<caffeinate pid> <supervisor pid>" under the per-run state dir (so the
+# tests' AFK_STATE_DIR pin isolates it); AFK_INHIBITOR_FILE overrides it directly.
+_afk_inhibitor_file() {
+  if [ -n "${AFK_INHIBITOR_FILE:-}" ]; then printf '%s\n' "$AFK_INHIBITOR_FILE"; return; fi
+  printf '%s\n' "$(_afk_state_dir)/sleep-inhibit"
+}
+# _afk_inhibitor_pid -> the recorded caffeinate pid (first field), for --status.
+_afk_inhibitor_pid() {
+  local f rec; f="$(_afk_inhibitor_file)"; [ -f "$f" ] || return 0
+  rec="$(head -n1 "$f" 2>/dev/null)"; printf '%s\n' "${rec%% *}"
+}
+
+# _afk_arm_inhibitor <supervisor pid> -> ensure EXACTLY ONE `caffeinate -is -w <pid>` is
+# tied to <pid>. Idempotent: the supervisor calls it each tick (tied to $$) and the watchdog
+# each interval (tied to the live heartbeat pid), so a killed caffeinate is re-armed and a
+# respawn re-ties to the new pid. A non-numeric pid or an absent caffeinate is a silent no-op
+# (the arm path emits the one non-macOS warning), never a failure that would abort arming.
+#
+# Concurrency (supervisor tick vs watchdog tick both arming at once): the fast path no-ops
+# when a live inhibitor already ties to THIS pid, so a spawn only happens when there is none.
+# When one is needed each caller spawns then CLAIMS the pidfile with a noclobber (O_EXCL)
+# create — the first creator wins, every loser reads the winner's live entry and kills its own
+# double, so exactly one survives even under real two-process concurrency (not just the
+# single-process tests). A stale incumbent (dead caffeinate, or an OLD supervisor pid) is
+# dropped and re-claimed.
+_afk_arm_inhibitor() {
+  local sup_pid="$1" bin f rec cpid spid mine tries
+  case "$sup_pid" in '' | *[!0-9]*) return 0 ;; esac
+  bin="${AFK_CAFFEINATE_BIN:-caffeinate}"
+  command -v "$bin" >/dev/null 2>&1 || return 0
+  f="$(_afk_inhibitor_file)"
+  # Fast path: a live inhibitor already tied to THIS supervisor pid — no spawn (exactly one).
+  if [ -f "$f" ]; then
+    rec="$(head -n1 "$f" 2>/dev/null)"; cpid="${rec%% *}"; spid="${rec##* }"
+    [ "$spid" = "$sup_pid" ] && _afk_pid_alive "$cpid" && return 0
+  fi
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  "$bin" -is -w "$sup_pid" >/dev/null 2>&1 &
+  mine=$!
+  # Converge on a single pidfile entry. Bounded: no caller writes a stale entry (each writes
+  # its own live pid), so once any caller claims, everyone else takes the "peer's live" branch;
+  # only the initial pre-existing stale file forces a re-claim, so this settles in <=2 rounds.
+  tries=0
+  while [ "$tries" -lt 5 ]; do
+    tries=$(( tries + 1 ))
+    if ( set -C; printf '%s %s\n' "$mine" "$sup_pid" > "$f" ) 2>/dev/null; then
+      return 0   # claimed the pidfile — my inhibitor is the one
+    fi
+    rec="$(head -n1 "$f" 2>/dev/null)"; cpid="${rec%% *}"; spid="${rec##* }"
+    if [ "$spid" = "$sup_pid" ] && _afk_pid_alive "$cpid"; then
+      [ "$cpid" = "$mine" ] || kill "$mine" 2>/dev/null || true
+      return 0   # a live inhibitor for this supervisor exists (mine or a peer's) — drop my double
+    fi
+    # Stale incumbent (dead caffeinate, or an OLD supervisor pid i.e. a respawn re-tie): drop
+    # it and re-claim the now-empty pidfile.
+    [ "$cpid" != "$mine" ] && _afk_pid_alive "$cpid" && kill "$cpid" 2>/dev/null || true
+    rm -f "$f" 2>/dev/null || true
+  done
+  # UPGRADE: the bounded loop cannot realistically exhaust (see above); on the impossible
+  # exhaustion, record mine so the machine still stays awake rather than leave it unrecorded.
+  _afk_atomic_write "$f" "$mine $sup_pid" || true
+  return 0
+}
+
 # --- watchdog (auto-restart a crashed supervisor, issue #107) ------------------
 # A silent supervisor crash (exit 0 mid-tick) leaves .afk-state armed with no process
 # draining — an in-flight spoke runs on with no answerer. The watchdog is a thin outer
@@ -1878,6 +1952,11 @@ watchdog_tick() {
         _afk_watchdog_respawn
         printf 'respawned\n'
       else
+        # Re-check the sleep inhibitor each interval alongside the supervisor (#242): re-arm a
+        # killed caffeinate, tied to the live supervisor's (heartbeat) pid. Idempotent — a
+        # no-op when it is already armed for that pid.
+        local hb pid; hb="$(afk_read_heartbeat)"; pid="${hb%% *}"
+        _afk_arm_inhibitor "$pid"
         printf 'live\n'
       fi ;;
     stale)
@@ -2368,6 +2447,11 @@ main() {
     # heal each other: neither is a single silent point of failure (#107). Skipped for
     # --once (a one-shot cron tick must not leave a background keeper behind).
     [ "$once" -eq 0 ] && _afk_spawn_watchdog
+    # Keep the Mac awake for the whole armed window (#242): arm a `caffeinate -is -w $$`
+    # tied to THIS supervisor's lifetime. Idempotent each tick (re-arms a killed caffeinate);
+    # a watchdog respawn re-ties to the new pid. Skipped for --once (no background inhibitor
+    # for a one-shot cron tick, mirroring the watchdog-spawn skip).
+    [ "$once" -eq 0 ] && _afk_arm_inhibitor "$$"
     # A wake (USR1 during the last sleep) runs the targeted announce-driven pass; a full
     # tick (the sleep ran out, or --once) runs the whole sweep. Either way slot_state
     # re-derives, so the two never disagree — a wake is just an early, narrower tick.

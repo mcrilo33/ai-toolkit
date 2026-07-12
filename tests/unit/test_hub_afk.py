@@ -6973,6 +6973,24 @@ def _caffeinate_stub(tmp_path: Path, log_name: str = "caffeinate.log") -> tuple[
     return stub, log
 
 
+def _wait_lines(path: Path, n: int = 1, timeout: float = 3.0) -> None:
+    """Poll until `path` has at least `n` non-empty lines (the caffeinate stub logs async)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if path.exists() and len([ln for ln in path.read_text().splitlines() if ln.strip()]) >= n:
+            return
+        time.sleep(0.02)
+
+
+def _pid_alive(pid: int) -> bool:
+    """True when `pid` is a live process (signal 0 probes without delivering)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
 def _kill_inhibitor(pidfile: Path) -> None:
     """SIGKILL the caffeinate-stub pid the pidfile records, so no stub leaks past a test."""
     if not pidfile.exists():
@@ -6994,6 +7012,7 @@ def test_arm_inhibitor_spawns_one_caffeinate_tied_to_the_pid(tmp_path: Path) -> 
         result = _call("_afk_arm_inhibitor 424242; echo RC=$?", env=env)
 
         assert "RC=0" in result.stdout, result.stderr
+        _wait_lines(log)
         assert log.exists(), "caffeinate must have been launched"
         assert log.read_text().strip() == "-is -w 424242", log.read_text()
         rec = pidfile.read_text().split()
@@ -7012,6 +7031,7 @@ def test_arm_inhibitor_second_arm_does_not_stack(tmp_path: Path) -> None:
     try:
         _call("_afk_arm_inhibitor 424242; _afk_arm_inhibitor 424242", env=env)
 
+        _wait_lines(log)
         assert log.read_text().splitlines() == ["-is -w 424242"], (
             "a second arm must not stack a second caffeinate"
         )
@@ -7028,11 +7048,13 @@ def test_arm_inhibitor_reties_to_new_supervisor_pid(tmp_path: Path) -> None:
     try:
         _call("_afk_arm_inhibitor 111111; _afk_arm_inhibitor 222222", env=env)
 
-        lines = log.read_text().splitlines()
-        assert "-is -w 111111" in lines and "-is -w 222222" in lines
+        # The pidfile re-ties to the NEW supervisor pid, and a live caffeinate for it is what
+        # is recorded (the old inhibitor is dropped on re-tie — its `-w <old pid>` self-dies).
+        _wait_lines(log)
+        assert "-is -w 222222" in log.read_text(), "the new inhibitor must have been armed"
         rec = pidfile.read_text().split()
         assert rec[1] == "222222", "the pidfile must re-tie to the new supervisor pid"
-        assert rec[0].isdigit()
+        assert _pid_alive(int(rec[0])), "the recorded caffeinate for the new pid must be live"
     finally:
         _kill_inhibitor(pidfile)
 
