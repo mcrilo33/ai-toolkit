@@ -220,6 +220,7 @@ from telemetry.spoke_tree.loaded_context import (
 from telemetry.spoke_tree.metadata import (
     apply_mode_lane_tags,
     apply_outcome_tag,
+    apply_repo_tag,
     apply_request_body_metadata,
     read_mode_lane,
     read_outcome,
@@ -268,6 +269,12 @@ _CYCLE_TRACE_NAME_PREFIX = "spoke-cycle:"
 _CYCLE_ROOT_NAME_PREFIX = "cycle:"
 _TRACE_NAME_PREFIX = "spoke-tree:"
 _ROOT_NAME_PREFIX = "spoke:"
+
+# Langfuse environment (#231): the assembled views are always real prod spoke data, so both view
+# trace-create bodies are stamped ``production``. A dashboard scoped to environment=production then
+# excludes test/fixture traffic (which lacks the field), the same signal the otelcol stamps on live
+# spans. Kept a constant here — the builder never assembles a view for anything but a real spoke.
+_ENVIRONMENT = "production"
 
 
 # Max page size the Langfuse traces endpoint accepts.
@@ -346,6 +353,7 @@ def build_batch(
             "name": _TRACE_NAME_PREFIX + spoke_run_id,
             "sessionId": spoke_run_id,
             "timestamp": base_ts,
+            "environment": _ENVIRONMENT,
             "metadata": {"schema_rev": _SCHEMA_REV},
         },
     }
@@ -529,6 +537,7 @@ def build_cycle_batch(
             "name": _CYCLE_TRACE_NAME_PREFIX + spoke_run_id,
             "sessionId": spoke_run_id,
             "timestamp": base_ts,
+            "environment": _ENVIRONMENT,
             "metadata": {"schema_rev": _SCHEMA_REV},
         },
     }
@@ -883,6 +892,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "node (#162). Omitted for a non-land re-run (no worktree to read commits from)."
         ),
     )
+    parser.add_argument(
+        "--repo",
+        default=None,
+        help=(
+            "The originating repository name, stamped as a repo:<name> trace tag so cross-project "
+            "cost/latency is comparable (#231). Resolved by the shell wrapper (git remote, else the "
+            "checkout dir basename); omitted for an ad-hoc run leaves the trace untagged."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1167,6 +1185,8 @@ def main(argv: list[str] | None = None) -> int:
     outcome = read_outcome(args.root.resolve())
     apply_outcome_tag(batch, outcome)
     apply_outcome_tag(cycle_batch, outcome)
+    apply_repo_tag(batch, args.repo)
+    apply_repo_tag(cycle_batch, args.repo)
 
     # One counter, memoized by content hash and shared across the loaded-context measurement, the
     # #99 decomposition, and the #160 context deltas — the stable prefix repeats on every snapshot.
@@ -1237,7 +1257,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(ctx.outcome_count_scores)} outcome-count scores emitted, "
         f"{len(ctx.normalization_scores)} normalization scores emitted, "
         f"{len(commits)} commit nodes synthesized, "
-        f"tagged mode={mode} lane={lane} outcome={outcome}; "
+        f"tagged mode={mode} lane={lane} outcome={outcome} repo={args.repo}; "
         f"{len(cycle_batch) - 2} observations assembled under cycle trace {cycle_trace_id}"
     )
     return 0

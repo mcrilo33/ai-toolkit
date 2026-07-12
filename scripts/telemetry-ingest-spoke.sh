@@ -173,6 +173,13 @@ run_step() {
 BUILD_ARGS=("$TELEMETRY_DIR/langfuse_spoke_tree.py" "$SPOKE_RUN_ID")
 if [ -n "$BODY_DIR" ]; then
   BUILD_ARGS+=(--request-bodies "$BODY_DIR" --root "$WT_DIR")
+  # Repo name (#231): stamp a repo:<name> trace tag so cross-project cost/latency is comparable.
+  # Prefer the origin remote's repo basename (strip a trailing .git); fall back to the checkout dir
+  # basename for a git-less / remote-less worktree. Best-effort — an empty name just omits the tag.
+  REPO_NAME="$(git -C "$WT_DIR" remote get-url origin 2>/dev/null \
+    | sed -E 's#.*[/:]##; s#\.git$##')"
+  [ -n "$REPO_NAME" ] || REPO_NAME="$(basename "$WT_DIR")"
+  [ -n "$REPO_NAME" ] && BUILD_ARGS+=(--repo "$REPO_NAME")
   # Commit timeline nodes (#162): dump the spoke branch's origin/main..HEAD commits with numstat
   # for the view builder to synthesize commit:<sha7> nodes. Best-effort — a checkout without an
   # origin/main ref (or no commits ahead) yields no dump, so no --commits is passed. The unit

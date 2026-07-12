@@ -6,8 +6,12 @@ per-tool ``permission_wait_ms`` / ``tool_result_size`` and the trace-level ``gat
 :func:`~telemetry.spoke_tree.commits._gate_park_ms`); :func:`build_step_cost_scores` emits per-phase
 ``step_cache_write_usd`` / ``step_tokens_written`` from View B's step rollups; and
 :func:`build_step_total_cost_scores` emits per-phase ``step_total_cost_usd`` — the true all-
-generations cost windowed onto each step (#230). Depends on the foundation, ``ids``, ``steps``,
-and ``commits``.
+generations cost windowed onto each step (#230). :func:`build_outcome_count_scores` emits the
+trace-level failure-economics counts (``gate_park_count`` / ``blocked_count`` /
+``relaunch_count``) and :func:`build_normalization_scores` the size/effort normalizers
+(``files_changed`` / ``lines_changed`` / ``commits`` / ``subtasks`` + the derived
+``cost_per_changed_line`` / ``wall_per_subtask``) so a spoke's cost is comparable across
+spokes/repos (#231). Depends on the foundation, ``ids``, ``steps``, and ``commits``.
 """
 
 from __future__ import annotations

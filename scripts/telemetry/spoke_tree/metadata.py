@@ -108,8 +108,24 @@ def apply_mode_lane_tags(batch: list[IngestEvent], mode: str, lane: str) -> None
 
 
 def apply_repo_tag(batch: list[IngestEvent], repo: str | None) -> None:
-    """RED stub (#231) — GREEN attaches the ``repo:<name>`` trace tag + bare metadata."""
-    return None
+    """Attach the originating repo to a spoke's trace so cross-project comparison is queryable (#231).
+
+    Surfaces as a ``repo:<name>`` trace tag (a dashboard can then group/filter/chart spokes by
+    repository) and is mirrored, bare, into trace metadata for direct lookup. The name is resolved
+    by the shell wrapper (git remote, else the checkout dir basename); a None/empty name (an ad-hoc
+    or non-git checkout) leaves the trace untouched rather than emitting a bare ``repo:`` tag.
+
+    Args:
+        batch: The assembled ingestion events; the ``trace-create`` event is mutated in place.
+        repo: The originating repository name, or None to skip.
+    """
+    if not repo:
+        return
+    _merge_trace_tags(batch, [f"repo:{repo}"])
+    trace = next((event for event in batch if event.get("type") == "trace-create"), None)
+    if trace is None:
+        return  # defensive: build_batch always emits one
+    trace["body"].setdefault("metadata", {})["repo"] = repo
 
 
 def read_outcome(root: Path) -> str | None:

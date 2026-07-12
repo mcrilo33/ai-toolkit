@@ -273,6 +273,42 @@ PLAN-gate park emission.
 > to the filters — or read `rollup.duration.components.wait` off the spoke's
 > assembled root span, which carries the same answer per spoke.
 
+## Outcome, normalization + cross-project stamping (Issue #231)
+
+A blocked/reaped disaster spoke and a clean landed spoke used to carry identical trace
+tags (`mode:`, `lane:`), so failure economics and cross-repo comparison were not queryable.
+The land-time view build now stamps three families onto every assembled trace:
+
+- **Outcome** — an `outcome:<landed|blocked|reaped|abandoned>` trace tag (+ bare
+  `metadata.outcome`), plus the `gate_park_count` / `blocked_count` / `relaunch_count`
+  numeric scores. `outcome:landed` is stamped by the land script; `outcome:blocked` (and the
+  block/relaunch counts) by the `/afk` supervisor, which also rebuilds the view on a terminal
+  block so a spoke that never lands still carries an outcome. `gate_park_count` is derived
+  from the PLAN-gate spans; the other two are read from `.ai-toolkit` pointers (default 0).
+- **Normalization** — `files_changed`, `lines_changed`, `commits`, `subtasks` numeric scores
+  plus the derived `cost_per_changed_line` and `wall_per_subtask`, so a cheap one-line fix
+  and an expensive refactor are comparable. Computed from the commit numstat + cycle windows
+  the builder already has (a ratio is skipped when its denominator is 0).
+- **Cross-project** — a `repo:<name>` trace tag (resolved by `telemetry-ingest-spoke.sh` from
+  the origin remote, else the checkout dir basename) and the Langfuse `environment` field:
+  the assembled views are stamped `production`, and `dashboard/langfuse/otelcol.yaml` stamps
+  `langfuse.environment` on every live spoke span (defaulting to `production`, overridable via
+  `OTEL_RESOURCE_ATTRIBUTES=deployment.environment=<env>` for a test collector).
+
+### Excluding test traffic from a dashboard
+
+The store holds ~10k synthetic fixture sessions from earlier test runs. They predate the
+`environment` field (or a test run stamps a non-`production` env), so a widget scoped to the
+production environment drops them without a fragile name-based filter:
+
+- **Dashboard scope** — set the dashboard's **Environment** selector to `production` (it
+  scopes every widget at once). This is the one-switch recipe.
+- **Per-widget filter** — where a single widget needs it, add
+  `{"column": "environment", "operator": "=", "value": "production", "type": "string"}` to
+  its filters. Legacy/fixture traces lacking the field (`default`) are excluded.
+- **Compare repos** — break down by the `repo:` tag (Traces view, group by `tags`) to read
+  cost/latency per repository once multiple projects export to the same store.
+
 ## Verification notes and follow-ups
 
 - **Timestamps** — every `user` and `assistant` record (the ones bracketed)
