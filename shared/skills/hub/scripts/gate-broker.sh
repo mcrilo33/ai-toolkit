@@ -534,8 +534,10 @@ PYEOF
 # --- slot state ---------------------------------------------------------------
 # slot_state <wt_path> <issue> -> done|waiting|reap|busy.
 #   done    — a TERMINAL marker (ready/accept/blocked) at the branch tip.
-#   waiting — parked on a question / gate (auto-answer it; never reaped).
-#   reap    — over the wall-clock ceiling, or idle past AFK_IDLE_MINUTES with no marker.
+#   waiting — parked on a question / gate / permission dialog (auto-answer it; never reaped,
+#             regardless of ceiling — park detection precedes both reap verdicts, #246).
+#   reap    — over the wall-clock ceiling, or idle past AFK_IDLE_MINUTES, AND with no
+#             detectable pending park (a hung/working spoke, not a park).
 #   busy    — actively working (or just spawned, no transcript yet).
 slot_state() {
   local wt_path="$1" issue="$2" tip marker kind age
@@ -568,11 +570,19 @@ slot_state() {
   # Ledger progress (a tip advance since the last tick) refreshes the ceiling before
   # it is measured — a revived spoke is not re-reaped off its stale dispatch epoch.
   _afk_note_tip_progress "$wt_path" "$issue"
-  if _spoke_over_any_ceiling "$issue" "$(afk_now)"; then printf 'reap\n'; return; fi
+  # Park detection precedes BOTH reaps (#246): an answerable park — a pending question or a
+  # permission dialog — is serviced by the answer lane, so it classifies `waiting` however long
+  # it has been parked, never `reap`. Pre-#246 the wall-clock ceiling reap ran first, so an
+  # over-ceiling permission-parked spoke was reaped + revived (claude --continue), which only
+  # re-raised the identical dialog: parked -> reaped -> revived -> parked forever. The doom-loop a
+  # genuinely-stuck dialog could form is bounded NOT here but in the answer lane
+  # (broker_service_gate's _broker_reanswer_exhausted / AFK_REANSWER_CEILING + the _afk_warned_arm
+  # backoff, escalating to blocked/<issue> on a real judgment call), so park-wins is unconditional.
   if [ -n "$(extract_pending_question "$wt_path")" ]; then printf 'waiting\n'; return; fi
   # A pending permission dialog (a CC confirmation prompt, no transcript entry) is decided by
-  # the supervisor's classifier, so it waits — never reaped as idle (#149).
+  # the supervisor's classifier, so it waits — never reaped as idle (#149) or over-ceiling (#246).
   if _permission_pending "$wt_path"; then printf 'waiting\n'; return; fi
+  if _spoke_over_any_ceiling "$issue" "$(afk_now)"; then printf 'reap\n'; return; fi
   age="$(_spoke_idle_seconds "$wt_path" "$issue")"
   if [ -n "$age" ] && [ "$age" -gt $(( AFK_IDLE_MINUTES * 60 )) ]; then printf 'reap\n'; return; fi
   printf 'busy\n'
