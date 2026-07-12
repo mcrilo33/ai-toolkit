@@ -7299,3 +7299,22 @@ def test_once_tick_does_not_emit_power_warnings(tmp_path: Path) -> None:
     )
 
     assert "WARNING" not in result.stderr, result.stderr
+
+
+def test_arm_inhibitor_converges_from_a_blank_pidfile(tmp_path: Path) -> None:
+    # Regression guard for the concurrency `continue` branch (#242 review): a blank pidfile is
+    # the shape a concurrent peer leaves in the O_EXCL-create -> content-write gap. The reconcile
+    # loop must NOT rm+respawn-loop on it — it converges and records exactly one live entry.
+    stub, _log = _caffeinate_stub(tmp_path)
+    pidfile = tmp_path / "sleep-inhibit"
+    pidfile.write_text("")  # a 0-byte incumbent (the mid-create window a peer would leave)
+    env = {"AFK_CAFFEINATE_BIN": str(stub), "AFK_INHIBITOR_FILE": str(pidfile)}
+    try:
+        result = _call("_afk_arm_inhibitor 424242; echo RC=$?", env=env)
+
+        assert "RC=0" in result.stdout, result.stderr  # terminated, never spun forever
+        rec = pidfile.read_text().split()
+        assert len(rec) == 2 and rec[1] == "424242", pidfile.read_text()
+        assert _pid_alive(int(rec[0])), "must record exactly one live inhibitor"
+    finally:
+        _kill_inhibitor(pidfile)
