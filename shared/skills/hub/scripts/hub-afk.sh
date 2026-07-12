@@ -31,6 +31,8 @@
 #                                tick; the tick stays authoritative for everything silence-
 #                                shaped (reap, resume, reconcile, dispatch, drain-done).
 #   AFK_WATCHDOG_SECONDS=60      watchdog poll interval (respawn a crashed supervisor)
+#   AFK_OFF_WAIT_SECONDS=30      `--off --wait` bound: seconds to poll the supervisor pid to
+#                                death before giving up (returns nonzero on timeout) (#252)
 #   AFK_SPOKE_MAX_MINUTES=180    wall-clock ceiling per spoke before a reap
 #   AFK_IDLE_MINUTES=30          a spoke idle this long with no marker AND not waiting → reap
 #   AFK_ANSWERER_CMD             the answerer command (default: claude -p --model claude-opus-4-8)
@@ -71,6 +73,9 @@
 #   hub-afk.sh --remote          # launch a detached `drain` on a configured always-on Mac
 #   hub-afk.sh --status          # report the window: off / draining-idle / STALLED / DRAIN DEAD
 #   hub-afk.sh --off             # stop the supervisor + watchdog (clears the state file)
+#   hub-afk.sh --off --wait      # ...and BLOCK until the supervisor has actually exited
+#                                #   (bounded by AFK_OFF_WAIT_SECONDS; nonzero on timeout) —
+#                                #   for a scripted off->sync->arm recycle (-w is an alias)
 #   hub-afk.sh --reconcile       # re-arm an armed-but-crashed drain (idempotent resume);
 #                                #   run at hub session start after a process/machine restart
 #   hub-afk.sh --once            # run a single tick and exit (tests / external cron)
@@ -99,6 +104,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # instead of spinning into dead auth. decide_and_act runs in the same shell as the
 # loop, so the assignment propagates up.
 _AFK_AUTH_FAILED=0
+
+# The arm-GENERATION token THIS supervisor is bound to (issue #252). Empty until main() arms
+# (mint a fresh token) or resumes (adopt the persisted one); the loop steps down the instant the
+# on-disk token no longer matches, so a fast off/re-arm recycle can't leave two lineages draining.
+_AFK_ARM_EPOCH=""
 
 # --- source worktree-lib.sh (the shared date/time + worktree helpers) ---------
 # Resolution covers both layouts: the ai-toolkit checkout (scripts/worktree-lib.sh,
@@ -298,7 +308,60 @@ _afk_atomic_write() {
 
 afk_write_state() { _afk_atomic_write "$(afk_state_file)" "$1" || true; }
 afk_read_state()  { local f; f="$(afk_state_file)"; [ -f "$f" ] && head -n1 "$f" 2>/dev/null | tr -d '[:space:]' || true; }
-afk_clear_state() { rm -f "$(afk_state_file)" 2>/dev/null || true; afk_clear_heartbeat; }
+afk_clear_state() { rm -f "$(afk_state_file)" 2>/dev/null || true; afk_clear_heartbeat; afk_clear_arm_epoch; }
+
+# --- arm-generation token (issue #252) ----------------------------------------
+# A fast `--off -> re-arm` recycle could leave the OLD (mid-tick-sleep) supervisor draining
+# alongside the new one: `--off` cleared `.afk-state`, but the re-arm re-created it before the
+# old sleeper woke (it only re-reads state at each tick top), so the sleeper read the NEW window
+# and kept ticking -- two lineages that can double-dispatch and double-land. So each supervisor
+# binds to an arm-GENERATION token at startup (_AFK_ARM_EPOCH) and steps down the instant the
+# on-disk token no longer matches: a FRESH arm mints a new token, a RESUME (watchdog respawn /
+# reconcile) ADOPTS the current one, and `--off` clears it (afk_clear_state above). This is
+# directive-4's "armed epoch the old supervisor can distinguish from a new arm".
+# AFK_ARM_EPOCH_FILE overrides the path for tests; the default lives under the git common dir
+# beside .afk-state, so it survives a watchdog respawn exactly as the window bound does.
+afk_arm_epoch_file() {
+  if [ -n "${AFK_ARM_EPOCH_FILE:-}" ]; then printf '%s\n' "$AFK_ARM_EPOCH_FILE"; return; fi
+  local common; common="$(git rev-parse --git-common-dir 2>/dev/null)" || common=".git"
+  printf '%s\n' "$common/.afk-arm-epoch"
+}
+afk_read_arm_epoch()  { local f; f="$(afk_arm_epoch_file)"; [ -f "$f" ] && head -n1 "$f" 2>/dev/null | tr -d '[:space:]' || true; }
+afk_write_arm_epoch() { _afk_atomic_write "$(afk_arm_epoch_file)" "$1" || true; }
+afk_clear_arm_epoch() { rm -f "$(afk_arm_epoch_file)" 2>/dev/null || true; }
+# afk_new_arm_token -> a fresh generation token "<epoch>.<pid>". The arming pid disambiguates a
+# same-second recycle: two arms in one wall-clock second still mint distinct generations.
+afk_new_arm_token() { printf '%s.%s\n' "$(afk_now)" "$$"; }
+# afk_arm_superseded -> true when the on-disk generation no longer matches the one THIS supervisor
+# bound to at startup (a newer arm overwrote it, or `--off` cleared it). A legacy resume with no
+# bound token and no epoch file reads empty==empty -> NOT superseded, so a pre-#252 armed window
+# still runs after an upgrade.
+afk_arm_superseded() { [ "$(afk_read_arm_epoch)" != "$_AFK_ARM_EPOCH" ]; }
+
+# --- synchronous off (issue #252) ---------------------------------------------
+# `--off` clears state ASYNCHRONOUSLY — the supervisor only exits at its next tick. A scripted
+# recycle (the #250 self-update off->sync->arm) needs a BLOCKING off so it never races the old
+# lineage. afk_wait_supervisor_gone <pid> [heartbeat-line] polls the (pre-clear) heartbeat pid to
+# death, bounded by AFK_OFF_WAIT_SECONDS: returns 0 the instant the pid is gone (or was never
+# alive / non-numeric), 1 on timeout. A wake-capable supervisor (the `wake1` heartbeat token,
+# #207) is SIGUSR1-nudged first so it re-checks the loop-top supersede at once — with the
+# arm-epoch cleared it steps down within ~a stamp, not a full tick. A pre-#176 supervisor stamps
+# no wake token and is left to exit on its own tick (its default USR1 action is terminate).
+: "${AFK_OFF_WAIT_SECONDS:=30}"
+afk_wait_supervisor_gone() {
+  local pid="$1" hb="${2:-}" limit waited
+  case "$pid" in '' | *[!0-9]*) return 0 ;; esac
+  _afk_pid_alive "$pid" || return 0
+  limit="${AFK_OFF_WAIT_SECONDS:-30}"; case "$limit" in '' | *[!0-9]*) limit=30 ;; esac
+  case "$hb" in *' wake1'*) kill -USR1 "$pid" 2>/dev/null || true ;; esac
+  waited=0
+  while [ "$waited" -lt "$limit" ]; do
+    _afk_pid_alive "$pid" || return 0
+    sleep 1 2>/dev/null || true
+    waited=$(( waited + 1 ))
+  done
+  ! _afk_pid_alive "$pid"
+}
 
 # --- landed tally + drain-complete hand-off (issue #150) ----------------------
 # A completed drain fires ONE "drain complete — <k> landed" notification, but <k>
@@ -2549,9 +2612,56 @@ afk_hang_forensics_status() {
   printf '/afk: hang-forensics: %s bundle(s) captured [%s]\n' "$count" "$dir"
 }
 
+# --- duplicate-lineage detection (issue #252) ---------------------------------
+# The heartbeat records only ONE pid, so a SECOND live supervisor from a fast off/re-arm race is
+# invisible to afk_supervisor_state. _afk_supervisor_pids emits one pid per live supervisor
+# LINEAGE. A single supervisor forks many transient subshells that all inherit its
+# `bash <self-copy>/hub-afk.sh <window>` argv, so counting matching pids wildly over-counts;
+# instead we DEDUP by the distinct script path (each armed lineage re-execs from its own unique
+# `hub-afk-self.XXXXXX/hub-afk.sh` copy, #133), emitting the first pid seen per path. The
+# --watchdog keeper (its own copy), the transient subcommands, and any `bash -c` SOURCED /
+# one-liner form (the test harness) are excluded. Best-effort + overridable via
+# AFK_SUPERVISOR_PIDS_CMD (the file's *_CMD test-hook pattern) — the scan is host-dependent, so
+# the warning is warn-only and never acts. Goes through wt_pgrep (LC_ALL=C, the non-ASCII trap).
+_afk_supervisor_pids() {
+  if [ -n "${AFK_SUPERVISOR_PIDS_CMD:-}" ]; then bash -c "$AFK_SUPERVISOR_PIDS_CMD"; return; fi
+  command -v wt_pgrep >/dev/null 2>&1 || return 0
+  local self="$$" seen="" pid rest tok path
+  while read -r pid rest; do
+    case "$pid" in '' | *[!0-9]*) continue ;; esac
+    [ "$pid" = "$self" ] && continue   # never count the process running this scan
+    case " $rest " in
+      *' -c '* | *' --watchdog'* | *' --status'* | *' --off'* | *' --reconcile'* | *' --once'* | *' --help'* | *' -h '*) continue ;;
+    esac
+    path=""
+    for tok in $rest; do case "$tok" in */hub-afk.sh) path="$tok"; break ;; esac; done
+    [ -n "$path" ] || continue
+    case " $seen " in *" $path "*) continue ;; esac   # this lineage already counted
+    seen="$seen $path"
+    printf '%s\n' "$pid"
+  done < <(wt_pgrep -fl 'hub-afk' 2>/dev/null)
+}
+
+# afk_duplicate_supervisor_status -> a one-line WARNING for --status when MORE THAN ONE live
+# supervisor lineage is draining this checkout (#252): a fast off/re-arm can leave the old sleeper
+# alongside the new one, and the single-pid heartbeat hides it. Prints nothing for 0/1.
+afk_duplicate_supervisor_status() {
+  local pids n list
+  pids="$(_afk_supervisor_pids)"
+  n="$(printf '%s\n' "$pids" | grep -c '[0-9]' 2>/dev/null || true)"
+  case "$n" in '' | *[!0-9]*) n=0 ;; esac
+  [ "$n" -gt 1 ] || return 0
+  list="$(printf '%s' "$pids" | tr '\n' ' ' | sed 's/  */ /g;s/^ //;s/ $//')"
+  printf '/afk: WARNING — %s live supervisor lineages detected (pids: %s) — a duplicate drain can double-dispatch/double-land; run /afk --off --wait, then re-arm\n' \
+    "$n" "$list"
+}
+
 _status() {
   local state now
   state="$(afk_read_state)"; now="$(afk_now)"
+  # Surface a double-drain hazard first (#252), in both off and armed states — a leftover lineage
+  # after an --off is exactly the danger, so it must show even when .afk-state reads off.
+  afk_duplicate_supervisor_status
   if [ -z "$state" ]; then
     echo "/afk: off"
     # A durable escalation outlives the drain — surface it even when off, so the operator
@@ -2592,10 +2702,25 @@ main() {
   # Subcommands that do not start the LOCAL supervisor loop.
   case "${1:-}" in
     --status)    _status; return 0 ;;
-    --off)       afk_clear_state; echo "/afk: off (state cleared; the supervisor + watchdog stop on their next tick)"; return 0 ;;
+    --off)
+      # Capture the heartbeat pid BEFORE clearing — afk_clear_state removes the heartbeat.
+      local off_wait=0 off_hb off_pid
+      case "${2:-}" in --wait | -w) off_wait=1 ;; esac
+      off_hb="$(afk_read_heartbeat)"; off_pid="${off_hb%% *}"
+      afk_clear_state
+      if [ "$off_wait" -eq 1 ]; then
+        # Synchronous off (#252): block until the supervisor is actually gone, so a scripted
+        # off->sync->arm recycle needs no sleep-guessing. Nonzero on timeout (a stuck supervisor).
+        if afk_wait_supervisor_gone "$off_pid" "$off_hb"; then
+          echo "/afk: off (supervisor exited; state cleared)"; return 0
+        fi
+        echo "/afk: off requested — state cleared, but the supervisor (pid ${off_pid:-unknown}) is still alive after ${AFK_OFF_WAIT_SECONDS}s; it will exit on its next tick" >&2
+        return 1
+      fi
+      echo "/afk: off (state cleared; the supervisor + watchdog stop on their next tick)"; return 0 ;;
     --watchdog)  watchdog_loop; return $? ;;
     --reconcile) afk_reconcile "$MAIN_ROOT"; return $? ;;
-    -h|--help)   sed -n '2,82p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
+    -h|--help)   sed -n '2,87p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
   esac
 
   local once=0
@@ -2614,6 +2739,10 @@ main() {
     # never reach the loop — when collector/bridge/auth can't be wired (#108).
     afk_telemetry_preflight "$MAIN_ROOT" || return 2
     afk_write_state "$end"
+    # Mint + bind a fresh arm generation (#252): the old sleeper from a prior arm reads its bound
+    # token as superseded on its next tick and steps down, so an off/re-arm recycle never runs two.
+    _AFK_ARM_EPOCH="$(afk_new_arm_token)"
+    afk_write_arm_epoch "$_AFK_ARM_EPOCH"
     _clear_dispatch_epochs   # fresh window ⇒ empty "dispatched by this run" set
     _clear_progress_state    # fresh window ⇒ no stale progress / answer-attempt epochs
     _clear_resume_markers    # fresh window ⇒ every spoke gets its one auto-resume again
@@ -2638,9 +2767,21 @@ main() {
       log "/afk: refusing to resume — a supervisor is already live (heartbeat pid running); run /afk --off first (a second supervisor clobbers per-run state)"
       return 2
     fi
+    # Adopt the persisted arm generation (#252): a resume (watchdog respawn / reconcile) must NOT
+    # mint a new token — that would read itself superseded on tick one. Empty when a pre-#252
+    # window (or a torn-down epoch file) is resumed, which reads never-superseded (legacy-safe).
+    _AFK_ARM_EPOCH="$(afk_read_arm_epoch)"
   fi
 
   while :; do
+    # Step down the instant a newer arm (or --off) superseded this generation (#252): the old
+    # sleeper from an off/re-arm recycle exits here instead of draining alongside the new lineage.
+    # UNGATED by AFK_ARM_PRECHECK — a singleton-drain safety invariant, not an arm precondition.
+    # Skipped for --once (a one-shot tick binds no generation).
+    if [ "$once" -eq 0 ] && afk_arm_superseded; then
+      log "/afk: superseded — a newer arm (or --off) took over this checkout; stepping down (no double-drain)"
+      break
+    fi
     afk_write_heartbeat   # stamp this tick before working, so a crash mid-tick is visible
     # Keep exactly one watchdog alive (idempotent: a no-op while one runs, respawns it if
     # it died). Doing this each tick — not just at arm — means the supervisor and watchdog

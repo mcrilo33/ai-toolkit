@@ -79,6 +79,12 @@ def _isolated_afk_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     # captures a bundle under <git-common-dir>/hang-forensics before it kills the pane, so
     # without this pin any reap/revive test would write into the REAL repo's .git.
     monkeypatch.setenv("AFK_HANG_FORENSICS_DIR", str(tmp_path / "hang-forensics"))
+    # Neutralize the #252 duplicate-lineage scan by default: `_status` runs the real host
+    # `pgrep -fl hub-afk` scan whenever AFK_SUPERVISOR_PIDS_CMD is unset, so on a macOS dev box
+    # with 2+ live `/afk drain` lineages every `_status`-driving test that asserts exact output
+    # (e.g. `== "/afk: off"`) would flakily gain a WARNING line. Pin it to a silent scan; the
+    # dedicated duplicate-lineage tests override it explicitly with their own pid list.
+    monkeypatch.setenv("AFK_SUPERVISOR_PIDS_CMD", "true")
 
 
 def _call(fn_call: str, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -7596,3 +7602,376 @@ def test_arm_inhibitor_converges_from_a_blank_pidfile(tmp_path: Path) -> None:
         assert _pid_alive(int(rec[0])), "must record exactly one live inhibitor"
     finally:
         _kill_inhibitor(pidfile)
+
+
+# ── #252: arm-generation token (singleton guard for a fast off/re-arm recycle) ──
+# The arming process IS the supervisor loop. A fast `--off -> re-arm` used to leave the old
+# (mid-tick-sleep) supervisor draining alongside the new one: `--off` cleared `.afk-state`, but
+# the re-arm re-created it before the old sleeper woke, so the sleeper read the NEW window and
+# kept ticking. The fix: each supervisor binds to an arm-GENERATION token at startup and steps
+# down the moment the on-disk token no longer matches — a fresh arm mints a new token, a resume
+# adopts the current one, and `--off` clears it. Directive 4's "armed epoch the old supervisor
+# can distinguish from a new arm".
+
+
+def test_arm_superseded_true_when_on_disk_epoch_differs(tmp_path: Path) -> None:
+    # A newer arm overwrote the token this supervisor bound to -> superseded (step down).
+    epoch = tmp_path / "arm-epoch"
+    epoch.write_text("NEWGEN\n")
+    result = _call(
+        "_AFK_ARM_EPOCH=OLDGEN; afk_arm_superseded && echo YES || echo NO",
+        env={"AFK_ARM_EPOCH_FILE": str(epoch)},
+    )
+
+    assert result.stdout.strip() == "YES", result.stderr
+
+
+def test_arm_superseded_false_when_on_disk_epoch_matches(tmp_path: Path) -> None:
+    # The token on disk is still the one this supervisor armed with -> keep running.
+    epoch = tmp_path / "arm-epoch"
+    epoch.write_text("GEN1\n")
+    result = _call(
+        "_AFK_ARM_EPOCH=GEN1; afk_arm_superseded && echo YES || echo NO",
+        env={"AFK_ARM_EPOCH_FILE": str(epoch)},
+    )
+
+    assert result.stdout.strip() == "NO", result.stderr
+
+
+def test_arm_superseded_true_when_epoch_cleared(tmp_path: Path) -> None:
+    # `--off` cleared the token (empty on disk) while this supervisor was bound to one -> the old
+    # sleeper steps down even though a re-arm may have re-created `.afk-state`.
+    epoch = tmp_path / "arm-epoch"  # absent
+    result = _call(
+        "_AFK_ARM_EPOCH=GEN1; afk_arm_superseded && echo YES || echo NO",
+        env={"AFK_ARM_EPOCH_FILE": str(epoch)},
+    )
+
+    assert result.stdout.strip() == "YES", result.stderr
+
+
+def test_arm_superseded_false_for_legacy_unbound(tmp_path: Path) -> None:
+    # A legacy resume (no epoch bound, no epoch file) reads empty==empty -> NOT superseded, so a
+    # pre-#252 armed window still runs after an upgrade.
+    epoch = tmp_path / "arm-epoch"  # absent
+    result = _call(
+        '_AFK_ARM_EPOCH=""; afk_arm_superseded && echo YES || echo NO',
+        env={"AFK_ARM_EPOCH_FILE": str(epoch)},
+    )
+
+    assert result.stdout.strip() == "NO", result.stderr
+
+
+def test_new_arm_token_is_unique_per_process(tmp_path: Path) -> None:
+    # The token must disambiguate a same-second recycle: it carries the arming pid, so two arms
+    # in the same wall-clock second still mint distinct tokens.
+    result = _call(
+        'a=$(afk_new_arm_token); echo "$a"',
+        env={"AFK_NOW": "1700000000"},
+    )
+
+    tok = result.stdout.strip()
+    assert tok.startswith("1700000000."), tok
+    assert tok != "1700000000", "the token must carry more than the epoch (the pid)"
+
+
+def test_fresh_arm_writes_a_new_arm_epoch(tmp_path: Path) -> None:
+    # Arming with a window spec mints + persists a generation token (bound by the loop's
+    # supersede check). The loop is neutered so main() arms then stops on the first done-check.
+    epoch = tmp_path / "arm-epoch"
+    cap = tmp_path / "epoch-mid-run"  # captured DURING the tick (drain-complete later clears it)
+    neuter = (
+        f'supervise_tick() {{ cat "{epoch}" > "{cap}" 2>/dev/null; return 0; }}; '
+        "_afk_spawn_watchdog() { :; }; _afk_arm_inhibitor() { :; }; "
+        "afk_done() { return 0; }; afk_interruptible_sleep() { :; }"
+    )
+    result = _call(
+        f"{neuter}; main drain",
+        env={
+            "AFK_STATE": str(tmp_path / "state"),
+            "AFK_HEARTBEAT": str(tmp_path / "hb"),
+            "AFK_STATE_DIR": str(tmp_path / "sd"),
+            "AFK_ARM_EPOCH_FILE": str(epoch),
+            "AFK_ARM_PRECHECK": "0",
+            "AI_TOOLKIT_OTEL": "0",
+            "AFK_NOW": "1700000000",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert cap.exists(), "a fresh arm must write the arm-epoch file before the first tick"
+    assert cap.read_text().strip().startswith("1700000000."), cap.read_text()
+
+
+def test_no_arg_resume_adopts_existing_arm_epoch(tmp_path: Path) -> None:
+    # A no-arg resume (watchdog respawn / reconcile) must ADOPT the persisted token, never mint a
+    # new one -- else it would instantly read itself as superseded. The neutered tick records the
+    # bound _AFK_ARM_EPOCH so we can assert it equals the pre-existing generation.
+    epoch = tmp_path / "arm-epoch"
+    epoch.write_text("GEN1\n")
+    bound = tmp_path / "bound"
+    cap = tmp_path / "epoch-mid-run"  # the on-disk token during the tick (drain-complete clears it)
+    neuter = (
+        f'supervise_tick() {{ printf "%s" "$_AFK_ARM_EPOCH" > "{bound}"; '
+        f'cat "{epoch}" > "{cap}" 2>/dev/null; return 0; }}; '
+        "_afk_spawn_watchdog() { :; }; _afk_arm_inhibitor() { :; }; "
+        "afk_done() { return 0; }; afk_interruptible_sleep() { :; }"
+    )
+    result = _call(
+        f"{neuter}; main",
+        env={
+            "AFK_STATE": str(_armed_state(tmp_path, "drain")),
+            "AFK_HEARTBEAT": str(tmp_path / "hb"),
+            "AFK_STATE_DIR": str(tmp_path / "sd"),
+            "AFK_ARM_EPOCH_FILE": str(epoch),
+            "AFK_ARM_PRECHECK": "0",
+            "AI_TOOLKIT_OTEL": "0",
+            "AFK_NOW": "1700000000",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert bound.read_text().strip() == "GEN1", "resume must adopt the persisted generation"
+    assert cap.read_text().strip() == "GEN1", "resume must NOT overwrite the generation mid-run"
+
+
+def test_supervisor_steps_down_when_superseded_mid_run(tmp_path: Path) -> None:
+    # The heart of #252: a running supervisor whose generation was superseded by a fresh re-arm
+    # steps down at the next loop top instead of draining forever. RED-safe: the neutered tick
+    # overwrites the epoch on the FIRST pass and `exit 1`s on the SECOND, so WITHOUT the supersede
+    # check main reaches a second tick and fails fast (rc 1, no "superseded") rather than hanging.
+    epoch = tmp_path / "arm-epoch"
+    count = tmp_path / "tick-count"
+    tick = (
+        f'supervise_tick() {{ c=$(cat "{count}" 2>/dev/null || echo 0); c=$((c+1)); '
+        f'echo "$c" > "{count}"; [ "$c" -ge 2 ] && exit 1; afk_write_arm_epoch NEWGEN; }}'
+    )
+    neuter = (
+        f"{tick}; _afk_spawn_watchdog() {{ :; }}; _afk_arm_inhibitor() {{ :; }}; "
+        "afk_done() { return 1; }; afk_interruptible_sleep() { :; }"
+    )
+    result = _call(
+        f"{neuter}; main drain",
+        env={
+            "AFK_STATE": str(tmp_path / "state"),
+            "AFK_HEARTBEAT": str(tmp_path / "hb"),
+            "AFK_STATE_DIR": str(tmp_path / "sd"),
+            "AFK_ARM_EPOCH_FILE": str(epoch),
+            "AFK_ARM_PRECHECK": "0",  # supersede must fire EVEN when the precheck is opted out
+            "AI_TOOLKIT_OTEL": "0",
+            "AFK_NOW": "1700000000",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "superseded" in result.stderr.lower(), result.stderr
+    assert count.read_text().strip() == "1", "the loop must break BEFORE a second tick runs"
+
+
+def test_off_clears_the_arm_epoch(tmp_path: Path) -> None:
+    # `--off` clears the generation token (via afk_clear_state) so the old sleeper reads itself
+    # superseded even if a re-arm re-creates `.afk-state`.
+    epoch = tmp_path / "arm-epoch"
+    epoch.write_text("GEN1\n")
+    result = _call(
+        "afk_clear_state",
+        env={
+            "AFK_STATE": str(_armed_state(tmp_path, "drain")),
+            "AFK_HEARTBEAT": str(tmp_path / "hb"),
+            "AFK_ARM_EPOCH_FILE": str(epoch),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not epoch.exists(), "afk_clear_state must remove the arm-epoch file"
+
+
+# ── #252: synchronous off (`--off --wait`) ─────────────────────────────────────
+# `--off` is asynchronous: it clears state, but the supervisor only exits at its next tick. A
+# scripted recycle (the #250 self-update protocol's off->sync->arm) needs a BLOCKING off that
+# returns only once the supervisor is actually gone. `--off --wait` reads the heartbeat pid
+# before clearing, then polls it to death bounded by AFK_OFF_WAIT_SECONDS (nonzero on timeout),
+# nudging a wake-capable supervisor with SIGUSR1 so it re-checks the loop-top supersede at once.
+
+
+def test_wait_supervisor_gone_zero_for_dead_pid(tmp_path: Path) -> None:
+    # A pid that was never alive (a reaped subshell) is already gone -> return 0 immediately.
+    result = _call('dead=$(bash -c "echo \\$$"); afk_wait_supervisor_gone "$dead" ""; echo RC=$?')
+
+    assert "RC=0" in result.stdout, result.stderr
+
+
+@pytest.mark.parametrize("pid", ["", "abc"])
+def test_wait_supervisor_gone_zero_for_empty_or_garbage_pid(pid: str) -> None:
+    result = _call(f'afk_wait_supervisor_gone "{pid}" ""; echo RC=$?')
+
+    assert "RC=0" in result.stdout, result.stderr
+
+
+def test_wait_supervisor_gone_zero_when_process_exits(tmp_path: Path) -> None:
+    # A live pid that exits within the bound -> return 0 (the supervisor went away).
+    result = _call(
+        'sleep 2 & pid=$!; afk_wait_supervisor_gone "$pid" ""; echo RC=$?',
+        env={"AFK_OFF_WAIT_SECONDS": "8"},
+    )
+
+    assert "RC=0" in result.stdout, result.stderr
+
+
+def test_wait_supervisor_gone_nonzero_on_timeout(tmp_path: Path) -> None:
+    # A live pid that outlasts the bound -> nonzero (timeout). The sleeper is killed afterward so
+    # the test leaks nothing.
+    result = _call(
+        'sleep 30 & pid=$!; afk_wait_supervisor_gone "$pid" ""; rc=$?; '
+        'kill "$pid" 2>/dev/null; echo RC=$rc',
+        env={"AFK_OFF_WAIT_SECONDS": "1"},
+    )
+
+    assert "RC=1" in result.stdout, result.stderr
+
+
+def test_wait_supervisor_gone_nudges_wake_capable(tmp_path: Path) -> None:
+    # A wake-capable heartbeat (the `wake1` token) is SIGUSR1-nudged so it steps down at once: the
+    # sleeper would outlast the bound, but the USR1 kills it well inside AFK_OFF_WAIT_SECONDS.
+    result = _call(
+        'bash -c "sleep 30" & pid=$!; '
+        'afk_wait_supervisor_gone "$pid" "$pid 1700000000 wake1"; rc=$?; '
+        'kill "$pid" 2>/dev/null; echo RC=$rc',
+        env={"AFK_OFF_WAIT_SECONDS": "8"},
+    )
+
+    assert "RC=0" in result.stdout, "a wake-capable supervisor must be nudged, not time out"
+
+
+def test_off_wait_blocks_until_gone_and_clears_state(tmp_path: Path) -> None:
+    # End to end: `--off --wait` clears state, then blocks until the heartbeat pid dies (bounded),
+    # returning 0. A short-lived sleeper stands in for a supervisor exiting on its supersede check.
+    state = _armed_state(tmp_path, "drain")
+    hb = tmp_path / "heartbeat"
+    expr = (
+        f'sleep 1 & pid=$!; printf "%s 1700000000 wake1\\n" "$pid" > "{hb}"; '
+        "main --off --wait; echo RC=$?"
+    )
+    result = _call(
+        expr,
+        env={
+            "AFK_STATE": str(state),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_OFF_WAIT_SECONDS": "8",
+        },
+    )
+
+    assert "RC=0" in result.stdout, result.stderr
+    assert not state.exists(), "--off must clear the state file even in --wait mode"
+
+
+def test_off_wait_times_out_returns_nonzero(tmp_path: Path) -> None:
+    # `--off --wait` still clears state, but returns NONZERO when the supervisor outlasts the
+    # bound (AC2), so a scripted recycle can detect a stuck/wedged supervisor rather than racing.
+    state = _armed_state(tmp_path, "drain")
+    hb = tmp_path / "heartbeat"
+    expr = (
+        f'sleep 30 & pid=$!; printf "%s 1700000000\\n" "$pid" > "{hb}"; '
+        'main --off --wait; rc=$?; kill "$pid" 2>/dev/null; echo RC=$rc'
+    )
+    result = _call(
+        expr,
+        env={
+            "AFK_STATE": str(state),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_OFF_WAIT_SECONDS": "1",
+        },
+    )
+
+    assert "RC=1" in result.stdout, result.stderr
+    assert not state.exists(), "--off --wait must still clear state on timeout"
+
+
+def test_off_without_wait_returns_immediately(tmp_path: Path) -> None:
+    # Plain `--off` (no --wait) must NOT block on a still-live supervisor: it clears state and
+    # returns 0 at once (the supervisor exits on its own next tick / supersede).
+    state = _armed_state(tmp_path, "drain")
+    hb = tmp_path / "heartbeat"
+    expr = (
+        f'sleep 30 & pid=$!; printf "%s 1700000000\\n" "$pid" > "{hb}"; '
+        'main --off; rc=$?; kill "$pid" 2>/dev/null; echo RC=$rc'
+    )
+    result = _call(expr, env={"AFK_STATE": str(state), "AFK_HEARTBEAT": str(hb)})
+
+    assert "RC=0" in result.stdout, result.stderr
+    assert not state.exists()
+
+
+# ── #252: --status duplicate-lineage warning ───────────────────────────────────
+# The heartbeat records only ONE pid, so a second live supervisor from a fast off/re-arm race is
+# invisible to afk_supervisor_state. `--status` therefore scans for live supervisor lineages
+# (overridable via AFK_SUPERVISOR_PIDS_CMD) and WARNS when more than one is running — warn-only,
+# it never acts.
+
+
+def test_duplicate_supervisor_status_warns_on_two_lineages(tmp_path: Path) -> None:
+    result = _call(
+        "afk_duplicate_supervisor_status",
+        env={"AFK_SUPERVISOR_PIDS_CMD": "printf '111\\n222\\n'"},
+    )
+
+    assert "WARNING" in result.stdout, result.stdout
+    assert "2 live supervisor lineages" in result.stdout, result.stdout
+    assert "111" in result.stdout and "222" in result.stdout, result.stdout
+
+
+def test_duplicate_supervisor_status_silent_on_single_lineage(tmp_path: Path) -> None:
+    result = _call(
+        "afk_duplicate_supervisor_status",
+        env={"AFK_SUPERVISOR_PIDS_CMD": "printf '111\\n'"},
+    )
+
+    assert result.stdout.strip() == "", "a single supervisor must not warn"
+
+
+def test_duplicate_supervisor_status_silent_on_zero(tmp_path: Path) -> None:
+    result = _call(
+        "afk_duplicate_supervisor_status",
+        env={"AFK_SUPERVISOR_PIDS_CMD": "true"},  # emits nothing
+    )
+
+    assert result.stdout.strip() == "", "no supervisors ⇒ no warning"
+
+
+def test_status_surfaces_duplicate_lineage_warning(tmp_path: Path) -> None:
+    # End to end through `_status`: a drain with two live lineages surfaces the warning so an
+    # operator returning to the hub sees the double-drain hazard at a glance.
+    state = _armed_state(tmp_path, "drain")
+    hb = tmp_path / "heartbeat"
+    expr = f'printf "%s 1700000000 wake1\\n" "$$" > "{hb}"; _status'
+    result = _call(
+        expr,
+        env={
+            "AFK_STATE": str(state),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_NOW": "1700000060",
+            "AI_TOOLKIT_OTEL": "0",
+            "AFK_SUPERVISOR_PIDS_CMD": "printf '111\\n222\\n'",
+        },
+    )
+
+    assert "2 live supervisor lineages" in result.stdout, result.stdout
+
+
+def test_status_no_duplicate_warning_for_single_lineage(tmp_path: Path) -> None:
+    # The healthy single-supervisor case: `--status` must NOT cry duplicate.
+    state = _armed_state(tmp_path, "drain")
+    hb = tmp_path / "heartbeat"
+    expr = f'printf "%s 1700000000 wake1\\n" "$$" > "{hb}"; _status'
+    result = _call(
+        expr,
+        env={
+            "AFK_STATE": str(state),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_NOW": "1700000060",
+            "AI_TOOLKIT_OTEL": "0",
+            "AFK_SUPERVISOR_PIDS_CMD": "printf '111\\n'",
+        },
+    )
+
+    assert "supervisor lineages" not in result.stdout, result.stdout
