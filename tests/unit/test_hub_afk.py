@@ -6812,7 +6812,11 @@ def test_capture_hang_forensics_writes_bundle_for_live_pane(tmp_path: Path) -> N
     _write_transcript(
         pd,
         [
-            {"type": "assistant", "message": {"model": "claude-opus-4-8", "content": []}},
+            {
+                "type": "assistant",
+                "version": "1.2.3",
+                "message": {"model": "claude-opus-4-8", "content": []},
+            },
             {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}},
         ],
     )
@@ -6845,6 +6849,9 @@ def test_capture_hang_forensics_writes_bundle_for_live_pane(tmp_path: Path) -> N
     fp = (bundle / "fingerprint.txt").read_text()
     assert "AI_TOOLKIT_OTEL=1" in fp, "the OTEL env fingerprint must be recorded"
     assert "http://localhost:4317" in fp
+    # version + model come from the transcript (no `claude --version` fork of the hung binary).
+    assert "claude_version=1.2.3" in fp
+    assert "model=claude-opus-4-8" in fp
 
 
 def test_capture_hang_forensics_includes_process_tree_and_sample(tmp_path: Path) -> None:
@@ -6869,6 +6876,33 @@ def test_capture_hang_forensics_includes_process_tree_and_sample(tmp_path: Path)
     tree = (Path(result.stdout.strip()) / "process-tree.txt").read_text()
     assert str(os.getpid()) in tree, "the pane pid's ps row must be captured"
     assert "Sample stub" in tree, "a macOS `sample` is appended when available"
+
+
+def test_hang_sample_pid_prefers_the_agent_descendant(tmp_path: Path) -> None:
+    # The pane is `sh -c "<cmd>; exec zsh"`, so pane_pid is a wrapper shell blocked in wait4() —
+    # `sample` must target the claude/node descendant that is actually hung, not the shell.
+    ps_stub = 'ps() { case "${@: -1}" in 300) echo node ;; *) echo bash ;; esac; }; '
+
+    result = _call(ps_stub + "_afk_hang_sample_pid 100 200 300")
+
+    assert result.stdout.strip() == "300", "must sample the claude/node descendant, not the shell"
+
+
+def test_hang_sample_pid_falls_back_to_first_descendant(tmp_path: Path) -> None:
+    # No descendant matches claude/node ⇒ the pane shell's direct child (first descendant) is the
+    # launched claude, so sample that rather than the wrapper shell (pane_pid).
+    ps_stub = "ps() { echo bash; }; "
+
+    result = _call(ps_stub + "_afk_hang_sample_pid 100 200 300")
+
+    assert result.stdout.strip() == "200", "with no comm match, sample the first descendant"
+
+
+def test_hang_sample_pid_falls_back_to_pane_pid_without_descendants(tmp_path: Path) -> None:
+    # No descendants at all (a bare process) ⇒ sample pane_pid itself, never nothing.
+    result = _call("ps() { echo bash; }; _afk_hang_sample_pid 100")
+
+    assert result.stdout.strip() == "100"
 
 
 def test_capture_hang_forensics_skips_dead_pane(tmp_path: Path) -> None:
