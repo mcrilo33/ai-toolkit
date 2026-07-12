@@ -37,6 +37,11 @@ _VALID_MODES = ("afk", "attended")
 _VALID_LANES = ("micro", "express", "quick", "spoke")
 _DEFAULT_MODE = "attended"
 _DEFAULT_LANE = "spoke"
+# Terminal-outcome pointer file under a worktree root (#231), stamped at land / reap time by
+# worktree-land.sh / hub-afk.sh — the state each already knows. Surfaced as an ``outcome:<v>``
+# trace tag + bare metadata so failure economics are queryable across spokes.
+_OUTCOME_POINTER = Path(".ai-toolkit/outcome")
+_VALID_OUTCOMES = ("landed", "blocked", "reaped", "abandoned")
 
 
 def _merge_trace_tags(batch: list[IngestEvent], tags: list[str]) -> None:
@@ -100,6 +105,67 @@ def apply_mode_lane_tags(batch: list[IngestEvent], mode: str, lane: str) -> None
     metadata = trace["body"].setdefault("metadata", {})
     metadata["mode"] = mode
     metadata["lane"] = lane
+
+
+def apply_repo_tag(batch: list[IngestEvent], repo: str | None) -> None:
+    """Attach the originating repo to a spoke's trace so cross-project comparison is queryable (#231).
+
+    Surfaces as a ``repo:<name>`` trace tag (a dashboard can then group/filter/chart spokes by
+    repository) and is mirrored, bare, into trace metadata for direct lookup. The name is resolved
+    by the shell wrapper (git remote, else the checkout dir basename); a None/empty name (an ad-hoc
+    or non-git checkout) leaves the trace untouched rather than emitting a bare ``repo:`` tag.
+
+    Args:
+        batch: The assembled ingestion events; the ``trace-create`` event is mutated in place.
+        repo: The originating repository name, or None to skip.
+    """
+    if not repo:
+        return
+    _merge_trace_tags(batch, [f"repo:{repo}"])
+    trace = next((event for event in batch if event.get("type") == "trace-create"), None)
+    if trace is None:
+        return  # defensive: build_batch always emits one
+    trace["body"].setdefault("metadata", {})["repo"] = repo
+
+
+def read_outcome(root: Path) -> str | None:
+    """Return the spoke's terminal outcome from its ``.ai-toolkit/outcome`` pointer, or None (#231).
+
+    Written at land / reap time by ``worktree-land.sh`` / ``hub-afk.sh`` — the state each
+    already knows. A missing, unreadable, blank, or unrecognized pointer resolves to None (no
+    outcome tag) rather than a mislabel, so a legacy spoke stays honestly untagged.
+
+    Args:
+        root: The worktree root holding ``.ai-toolkit/outcome``.
+
+    Returns:
+        One of :data:`_VALID_OUTCOMES`, or None when the pointer is absent/blank/unknown.
+    """
+    try:
+        value = (root / _OUTCOME_POINTER).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value if value in _VALID_OUTCOMES else None
+
+
+def apply_outcome_tag(batch: list[IngestEvent], outcome: str | None) -> None:
+    """Attach the spoke's terminal ``outcome`` to its trace (#231).
+
+    Surfaces as an ``outcome:<value>`` trace tag (so a dashboard can group/filter/chart spokes
+    by how they ended — landed vs blocked/reaped/abandoned) and is mirrored, bare, into trace
+    metadata for direct lookup. A None outcome (no pointer) leaves the trace untouched.
+
+    Args:
+        batch: The assembled ingestion events; the ``trace-create`` event is mutated in place.
+        outcome: The terminal outcome (one of :data:`_VALID_OUTCOMES`), or None to skip.
+    """
+    if outcome is None:
+        return
+    _merge_trace_tags(batch, [f"outcome:{outcome}"])
+    trace = next((event for event in batch if event.get("type") == "trace-create"), None)
+    if trace is None:
+        return  # defensive: build_batch always emits one
+    trace["body"].setdefault("metadata", {})["outcome"] = outcome
 
 
 def apply_request_body_metadata(

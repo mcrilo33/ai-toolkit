@@ -75,7 +75,12 @@ from telemetry.spoke_tree.context_deltas import _label_rule_injections, load_sco
 from telemetry.spoke_tree.ids import _CYCLE_STEP_PREFIX
 from telemetry.spoke_tree.llm_decomp import _decomp_metadata
 from telemetry.spoke_tree.loaded_context import find_request_files
-from telemetry.spoke_tree.scores import _step_phase
+from telemetry.spoke_tree.metadata import apply_outcome_tag, apply_repo_tag, read_outcome
+from telemetry.spoke_tree.scores import (
+    _step_phase,
+    build_normalization_scores,
+    build_outcome_count_scores,
+)
 from telemetry.spoke_tree.steps import _STEP_PREFIX, build_cycle_windows, build_step_windows
 
 SPOKE = "feature/22-demo+1700000000"
@@ -4845,6 +4850,289 @@ class TestModeLaneTags:
         metadata = self._trace(batch)["body"]["metadata"]
         assert metadata["mode"] == "attended"
         assert metadata["lane"] == "spoke"
+
+
+class TestOutcomeTag:
+    """#231: stamp a spoke's terminal outcome on its reconstructed trace.
+
+    ``read_outcome`` reads the ``.ai-toolkit/outcome`` pointer written at land / reap time,
+    validating against the closed ``{landed, blocked, reaped, abandoned}`` set and returning
+    None when the pointer is missing, blank, or carries an unknown value. ``apply_outcome_tag``
+    attaches an ``outcome:<v>`` trace tag + bare ``metadata.outcome`` — but only for a real
+    outcome, so a legacy spoke with no pointer stays untagged rather than mislabeled.
+    """
+
+    def _write_outcome(self, root: Path, value: str) -> Path:
+        (root / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
+        (root / ".ai-toolkit" / "outcome").write_text(value, encoding="utf-8")
+        return root
+
+    def _trace(self, batch: list[dict]) -> dict:
+        return next(event for event in batch if event["type"] == "trace-create")
+
+    def test_reads_outcome_from_pointer(self, tmp_path: Path) -> None:
+        root = self._write_outcome(tmp_path, "blocked\n")
+
+        assert read_outcome(root) == "blocked"
+
+    def test_missing_pointer_reads_none(self, tmp_path: Path) -> None:
+        assert read_outcome(tmp_path) is None
+
+    def test_unknown_outcome_value_reads_none(self, tmp_path: Path) -> None:
+        root = self._write_outcome(tmp_path, "exploded")
+
+        assert read_outcome(root) is None
+
+    def test_blank_pointer_reads_none(self, tmp_path: Path) -> None:
+        root = self._write_outcome(tmp_path, "   ")
+
+        assert read_outcome(root) is None
+
+    def test_apply_adds_outcome_trace_tag(self) -> None:
+        batch = build_batch([], SPOKE)
+
+        apply_outcome_tag(batch, "landed")
+
+        assert "outcome:landed" in self._trace(batch)["body"]["tags"]
+
+    def test_apply_mirrors_bare_value_into_trace_metadata(self) -> None:
+        batch = build_batch([], SPOKE)
+
+        apply_outcome_tag(batch, "reaped")
+
+        assert self._trace(batch)["body"]["metadata"]["outcome"] == "reaped"
+
+    def test_apply_none_leaves_trace_untagged(self) -> None:
+        batch = build_batch([], SPOKE)
+
+        apply_outcome_tag(batch, None)
+
+        assert "tags" not in self._trace(batch)["body"] or not self._trace(batch)["body"]["tags"]
+
+
+class TestOutcomeCountScores:
+    """#231: failure-economics counts as trace-level numeric scores.
+
+    ``gate_park_count`` is DERIVED from the traces (the PLAN-gate park spans), so no shell
+    input is needed; ``blocked_count`` / ``relaunch_count`` are supervisor state read from
+    ``.ai-toolkit`` integer pointers, defaulting to 0 (a clean landing reads distinctly from
+    "not measured"). All three are trace-level so they are one-widget Scores queries.
+    """
+
+    def _gate(self, obs_id: str) -> dict:
+        return _obs(
+            obs_id,
+            "script:gate",
+            parent=None,
+            startTime="2026-01-02T00:00:00Z",
+            endTime="2026-01-02T00:00:01Z",
+            metadata={"attributes": {"workflow.kind": "script", "workflow.phase": "gate"}},
+        )
+
+    def _by_name(self, scores: list[dict], name: str) -> list[dict]:
+        return [s for s in scores if s["body"]["name"] == name]
+
+    def _write_counts(self, root: Path, *, blocked: str, relaunch: str) -> Path:
+        (root / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
+        (root / ".ai-toolkit" / "blocked-count").write_text(blocked, encoding="utf-8")
+        (root / ".ai-toolkit" / "relaunch-count").write_text(relaunch, encoding="utf-8")
+        return root
+
+    def test_gate_park_count_derived_from_gate_spans(self, tmp_path: Path) -> None:
+        traces = [("tr", [self._gate("g1"), self._gate("g2")])]
+
+        scores = build_outcome_count_scores(SPOKE, traces, tmp_path, base_ts="2026-01-01T00:00:00Z")
+
+        park = self._by_name(scores, "gate_park_count")
+        assert len(park) == 1
+        assert park[0]["body"]["value"] == 2
+
+    def test_gate_park_count_zero_without_a_gate(self, tmp_path: Path) -> None:
+        scores = build_outcome_count_scores(SPOKE, [], tmp_path, base_ts="2026-01-01T00:00:00Z")
+
+        assert self._by_name(scores, "gate_park_count")[0]["body"]["value"] == 0
+
+    def test_blocked_and_relaunch_counts_read_from_pointers(self, tmp_path: Path) -> None:
+        root = self._write_counts(tmp_path, blocked="3\n", relaunch="1\n")
+
+        scores = build_outcome_count_scores(SPOKE, [], root, base_ts="2026-01-01T00:00:00Z")
+
+        assert self._by_name(scores, "blocked_count")[0]["body"]["value"] == 3
+        assert self._by_name(scores, "relaunch_count")[0]["body"]["value"] == 1
+
+    def test_absent_count_pointers_default_to_zero(self, tmp_path: Path) -> None:
+        scores = build_outcome_count_scores(SPOKE, [], tmp_path, base_ts="2026-01-01T00:00:00Z")
+
+        assert self._by_name(scores, "blocked_count")[0]["body"]["value"] == 0
+        assert self._by_name(scores, "relaunch_count")[0]["body"]["value"] == 0
+
+    def test_count_scores_are_trace_level_numeric(self, tmp_path: Path) -> None:
+        scores = build_outcome_count_scores(SPOKE, [], tmp_path, base_ts="2026-01-01T00:00:00Z")
+
+        body = self._by_name(scores, "gate_park_count")[0]["body"]
+        assert body["traceId"] == trace_id_for(SPOKE)
+        assert body["dataType"] == "NUMERIC"
+        assert "observationId" not in body
+
+
+class TestNormalizationScores:
+    """#231: view-build-time size/effort scores that normalize a spoke's cost + latency.
+
+    The four base counts come from the commit numstat the builder already parses and the cycle
+    windows it already computes; the two derived ratios normalize the trace's total generation
+    cost and root wall-clock by size. A ratio is skipped (not scored 0) when its denominator is
+    0, so an empty spoke never divides by zero. All are trace-level numeric scores.
+    """
+
+    def _commits(self) -> list[dict]:
+        return [
+            {"sha": "a", "additions": 10, "deletions": 2, "files": ["x.py", "y.py"]},
+            {"sha": "b", "additions": 5, "deletions": 3, "files": ["y.py", "z.py"]},
+        ]
+
+    def _batch(self, *, total_ms: int, cost: float) -> list[dict]:
+        root = {
+            "id": root_id_for(SPOKE),
+            "type": "span-create",
+            "body": {
+                "id": root_id_for(SPOKE),
+                "metadata": {"rollup": {"duration": {"total_ms": total_ms}}},
+            },
+        }
+        gen = {
+            "id": "g1",
+            "type": "generation-create",
+            "body": {"id": "g1", "costDetails": {"total": cost}},
+        }
+        return [root, gen]
+
+    def _by_name(self, scores: list[dict], name: str) -> list[dict]:
+        return [s for s in scores if s["body"]["name"] == name]
+
+    def _val(self, scores: list[dict], name: str) -> float:
+        return self._by_name(scores, name)[0]["body"]["value"]
+
+    def test_base_counts_from_commits_and_subtasks(self) -> None:
+        scores = build_normalization_scores(
+            SPOKE,
+            self._commits(),
+            self._batch(total_ms=6000, cost=1.0),
+            3,
+            base_ts="2026-01-01T00:00:00Z",
+        )
+
+        assert self._val(scores, "files_changed") == 3  # x, y, z — y de-duplicated
+        assert self._val(scores, "lines_changed") == 20  # (10+2) + (5+3)
+        assert self._val(scores, "commits") == 2
+        assert self._val(scores, "subtasks") == 3
+
+    def test_cost_per_changed_line_divides_total_cost_by_lines(self) -> None:
+        scores = build_normalization_scores(
+            SPOKE,
+            self._commits(),
+            self._batch(total_ms=6000, cost=2.0),
+            3,
+            base_ts="2026-01-01T00:00:00Z",
+        )
+
+        assert self._val(scores, "cost_per_changed_line") == pytest.approx(2.0 / 20)
+
+    def test_wall_per_subtask_divides_root_duration_by_subtasks(self) -> None:
+        scores = build_normalization_scores(
+            SPOKE,
+            self._commits(),
+            self._batch(total_ms=6000, cost=1.0),
+            3,
+            base_ts="2026-01-01T00:00:00Z",
+        )
+
+        assert self._val(scores, "wall_per_subtask") == pytest.approx(2000)
+
+    def test_no_cost_ratio_when_no_lines_changed(self) -> None:
+        scores = build_normalization_scores(
+            SPOKE, [], self._batch(total_ms=6000, cost=1.0), 3, base_ts="2026-01-01T00:00:00Z"
+        )
+
+        assert self._val(scores, "lines_changed") == 0
+        assert self._by_name(scores, "cost_per_changed_line") == []
+
+    def test_no_wall_ratio_when_no_subtasks(self) -> None:
+        scores = build_normalization_scores(
+            SPOKE,
+            self._commits(),
+            self._batch(total_ms=6000, cost=1.0),
+            0,
+            base_ts="2026-01-01T00:00:00Z",
+        )
+
+        assert self._val(scores, "subtasks") == 0
+        assert self._by_name(scores, "wall_per_subtask") == []
+
+    def test_normalization_scores_are_trace_level_numeric(self) -> None:
+        scores = build_normalization_scores(
+            SPOKE,
+            self._commits(),
+            self._batch(total_ms=6000, cost=1.0),
+            3,
+            base_ts="2026-01-01T00:00:00Z",
+        )
+
+        body = self._by_name(scores, "files_changed")[0]["body"]
+        assert body["traceId"] == trace_id_for(SPOKE)
+        assert body["dataType"] == "NUMERIC"
+        assert "observationId" not in body
+
+
+class TestRepoTag:
+    """#231: stamp the originating repo on every trace so cross-project comparison is queryable.
+
+    The repo name is resolved by the shell wrapper (git) and passed to ``apply_repo_tag``, which
+    attaches a ``repo:<name>`` trace tag + bare ``metadata.repo``; a None/empty name (an ad-hoc or
+    non-git checkout) leaves the trace untouched rather than tagging ``repo:``.
+    """
+
+    def _trace(self, batch: list[dict]) -> dict:
+        return next(event for event in batch if event["type"] == "trace-create")
+
+    def test_apply_adds_repo_trace_tag(self) -> None:
+        batch = build_batch([], SPOKE)
+
+        apply_repo_tag(batch, "ai-toolkit")
+
+        assert "repo:ai-toolkit" in self._trace(batch)["body"]["tags"]
+
+    def test_apply_mirrors_repo_into_metadata(self) -> None:
+        batch = build_batch([], SPOKE)
+
+        apply_repo_tag(batch, "ai-toolkit")
+
+        assert self._trace(batch)["body"]["metadata"]["repo"] == "ai-toolkit"
+
+    def test_apply_none_repo_leaves_untagged(self) -> None:
+        batch = build_batch([], SPOKE)
+
+        apply_repo_tag(batch, None)
+
+        body = self._trace(batch)["body"]
+        assert "tags" not in body or not body["tags"]
+
+
+class TestEnvironmentField:
+    """#231: every assembled view trace carries the Langfuse ``environment`` = production so a
+    dashboard can filter test/fixture traffic out (it lacks the field / is stamped otherwise)."""
+
+    def _trace(self, batch: list[dict]) -> dict:
+        return next(event for event in batch if event["type"] == "trace-create")
+
+    def test_build_batch_trace_is_production_environment(self) -> None:
+        batch = build_batch([], SPOKE)
+
+        assert self._trace(batch)["body"].get("environment") == "production"
+
+    def test_build_cycle_batch_trace_is_production_environment(self) -> None:
+        batch = build_cycle_batch([], SPOKE)
+
+        assert self._trace(batch)["body"].get("environment") == "production"
 
 
 def _by_cycle(batch: list[dict], orig_trace_id: str, orig_obs_id: str) -> dict:

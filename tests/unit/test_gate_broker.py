@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from shlex import quote as shlex_quote
 
 import pytest
 
@@ -215,19 +216,19 @@ def waiting_spoke_env(tmp_path: Path, spoke_repo: Path) -> dict[str, str]:
     }
 
 
-def test_broker_service_gate_unattended_escalates_on_escalate(
+def test_broker_service_gate_unattended_warns_on_escalate(
     spoke_repo: Path, waiting_spoke_env: dict[str, str]
 ) -> None:
-    # The unattended adapter over the shared core: a human-decision (ESCALATE) parks
-    # the spoke as blocked/<issue> — the same fail-safe /afk has always had.
+    # #241: a human-decision (ESCALATE) reply no longer parks the spoke blocked/<issue> — the
+    # unattended adapter WARNS loudly and keeps the spoke serviced (retried on the backoff).
     env = {**waiting_spoke_env, "AFK_ANSWERER_CMD": "printf 'reasoning\\nESCALATE: needs a human'"}
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
 
     assert result.returncode == 0, result.stderr
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log
-    assert "needs a human" in log
+    log = Path(env["_READY_LOG"]).read_text() if Path(env["_READY_LOG"]).exists() else ""
+    assert "--blocked 5" not in log, "an ESCALATE reply must warn-and-continue, not park"
+    assert "WARNING: #5" in result.stderr, result.stderr
 
 
 def test_broker_service_gate_defaults_to_unattended(
@@ -240,7 +241,9 @@ def test_broker_service_gate_defaults_to_unattended(
     result = _call(f"broker_service_gate '{spoke_repo}' 5", env=env)
 
     assert result.returncode == 0, result.stderr
-    assert "--blocked 5" in Path(env["_READY_LOG"]).read_text()
+    _rl = Path(env["_READY_LOG"])
+    assert not _rl.exists() or "--blocked 5" not in _rl.read_text()
+    assert "WARNING: #5" in result.stderr, result.stderr
 
 
 # ── the hardened injector submits (no stranded paste) ─────────────────────────
@@ -516,9 +519,12 @@ def test_broker_service_gate_escalates_wedge_despite_advanced_mtime(
     result = _call(expr, env=env)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 7" in log, result.stdout + result.stderr + log
-    assert "composer wedged" in log
+    _rl = Path(env["_READY_LOG"])
+    log = _rl.read_text() if _rl.exists() else ""
+    # #241: an unrecoverable wedge no longer parks blocked/<issue> — it warns-and-continues.
+    assert "--blocked 7" not in log, log
+    assert "WARNING: #7" in result.stderr, result.stderr
+    assert "composer wedged" in result.stderr
 
 
 def test_inject_and_verify_unobservable_pane_degrades_to_advance(
@@ -641,9 +647,11 @@ def test_broker_service_gate_escalates_when_fingerprint_unavailable(
     )
 
     assert result.returncode == 0, result.stderr
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log, f"unverifiable read-only must escalate: {log}"
-    assert "fingerprint" in log.lower(), log
+    _rl = Path(env["_READY_LOG"])
+    log = _rl.read_text() if _rl.exists() else ""
+    assert "--blocked 5" not in log, f"unverifiable read-only must warn-and-continue: {log}"
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert "fingerprint" in result.stderr.lower(), result.stderr
 
 
 def test_worktree_fingerprint_tracks_only_tracked_content(spoke_repo: Path) -> None:
@@ -699,9 +707,11 @@ def test_broker_service_gate_voids_answer_when_reasoner_creates_file(
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
 
     assert result.returncode == 0, result.stderr
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log, f"a reasoner file-creation must escalate, not inject: {log}"
-    assert "worktree" in log.lower() or "mutat" in log.lower(), log
+    _rl = Path(env["_READY_LOG"])
+    log = _rl.read_text() if _rl.exists() else ""
+    assert "--blocked 5" not in log, f"a voided file-creation must warn-and-continue: {log}"
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert "worktree" in result.stderr.lower() or "mutat" in result.stderr.lower(), result.stderr
 
 
 def test_reasoner_runs_in_isolated_copy_not_live_tree(spoke_repo: Path, tmp_path: Path) -> None:
@@ -756,9 +766,11 @@ def test_broker_service_gate_voids_answer_when_reasoner_mutates_tracked_content(
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
 
     assert result.returncode == 0, result.stderr
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log, f"a tracked mutation must escalate, not inject: {log}"
-    assert "worktree" in log.lower() or "mutat" in log.lower(), log
+    _rl = Path(env["_READY_LOG"])
+    log = _rl.read_text() if _rl.exists() else ""
+    assert "--blocked 5" not in log, f"a voided tracked mutation must warn-and-continue: {log}"
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert "worktree" in result.stderr.lower() or "mutat" in result.stderr.lower(), result.stderr
 
 
 def test_broker_service_gate_isolates_reasoner_writes_from_live_tree(
@@ -908,9 +920,11 @@ def test_broker_service_gate_voids_answer_when_reasoner_mutates_refs(
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
 
     assert result.returncode == 0, result.stderr
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log, f"a reasoner ref write must escalate, not inject: {log}"
-    assert "worktree" in log.lower() or "mutat" in log.lower(), log
+    _rl = Path(env["_READY_LOG"])
+    log = _rl.read_text() if _rl.exists() else ""
+    assert "--blocked 5" not in log, f"a voided ref write must warn-and-continue: {log}"
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert "worktree" in result.stderr.lower() or "mutat" in result.stderr.lower(), result.stderr
 
 
 def test_fingerprint_immune_to_sibling_ref_changes(linked_spoke_repo: Path) -> None:
@@ -1710,6 +1724,16 @@ def test_decide_permission_logs_escalate_verdict(spoke_repo: Path, tmp_path: Pat
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "AFK_STATE_DIR": str(statedir),
         "SPOKE_READY": str(ready_stub),
+        # #241: an ESCALATE verdict now routes to the reasoner (stubbed) instead of parking.
+        # The mechanical ESCALATE verdict is still recorded to decisions.log for codification.
+        "AFK_ANSWERER_CMD": "printf 'ANSWER: DENY: use git restore instead'",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        # Zero the inject verify timings: this stub's tmux never advances the transcript, so
+        # the deny-path inject would otherwise burn the full 60s x2 verify budget (real spokes
+        # respond, so this is a test-only bound).
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_INJECT_POLL_SECONDS": "0",
     }
 
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
@@ -1783,9 +1807,11 @@ def test_broker_service_gate_escalates_when_answerer_times_out(
     )
 
     assert result.returncode == 0, result.stderr
-    log = Path(env["_READY_LOG"]).read_text()
-    assert "--blocked 5" in log, f"a timed-out answerer must escalate: {log}"
-    assert "no decision" in log.lower(), log
+    _rl = Path(env["_READY_LOG"])
+    log = _rl.read_text() if _rl.exists() else ""
+    assert "--blocked 5" not in log, f"a timed-out answerer must warn-and-continue: {log}"
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert "no decision" in result.stderr.lower(), result.stderr
 
 
 def test_run_answerer_standalone_fallback_bounds_a_slow_answerer(
@@ -2684,6 +2710,9 @@ def test_reanswer_ceiling_caps_repeated_reasoning(
         **waiting_spoke_env,
         "AFK_ANSWERER_CMD": f"printf x >> '{calls}'; printf 'ESCALATE: legitimately stuck'",
         "AFK_REANSWER_CEILING": "2",
+        # #241: the ceiling now retries after a backoff; keep the backoff far beyond the 4 fast
+        # ticks so this "caps at 2" assertion stays wall-clock-independent (no mid-test retry).
+        "AFK_WARN_BACKOFF_BASE": "1000000",
     }
 
     for _ in range(4):
@@ -2691,7 +2720,9 @@ def test_reanswer_ceiling_caps_repeated_reasoning(
         assert result.returncode == 0, result.stderr
 
     n = calls.read_text().count("x") if calls.exists() else 0
-    assert n == 2, f"the reasoner must stop after 2 attempts on the same prompt, ran {n}"
+    assert n == 2, (
+        f"the reasoner must stop after 2 attempts on the same prompt within the backoff, ran {n}"
+    )
 
 
 def test_reanswer_ceiling_resets_after_tip_advances(
@@ -2729,19 +2760,20 @@ def test_reanswer_ceiling_resets_after_tip_advances(
     assert calls.read_text().count("x") == 2, "a tip advance must reset the ceiling"
 
 
-# ── issue #237: mutation-void is terminal on first occurrence + log-once ───────
+# ── issue #237 + #241 §5: mutation-void backs off (not terminal) + log-once ────
 
 
-def test_broker_service_gate_mutation_void_is_terminal_on_first_occurrence(
+def test_broker_service_gate_mutation_void_backs_off_not_terminal(
     spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
 ) -> None:
-    # A reasoner that mutates the live tree (here via an absolute-path write, modelling an
-    # isolation bypass) has its answer voided and the gate escalated. That verdict is
-    # TERMINAL on the FIRST occurrence: a human is required regardless of tip/prompt, and the
-    # reasoner must NOT re-run on later ticks. This is asserted WITHOUT depending on tip/sig
-    # stability — the ceiling is set high (5), so only the durable void marker can cap the
-    # reasoner at a single run across four ticks.
+    # A reasoner that mutates the live tree (here an absolute-path write, an isolation bypass)
+    # has its answer VOIDED. #241 §5: the void is no longer terminal-forever — it warns and
+    # backs off. Within the backoff window (pinned huge here) the durable void marker caps the
+    # reasoner at a single run across four fast ticks (the ceiling is 5, so only the void marker
+    # can cap it) — and it WARNS instead of parking blocked/<issue>.
     calls = tmp_path / "answerer.calls"
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
     (spoke_repo / "tracked.txt").write_text("original")
     subprocess.run(["git", "add", "tracked.txt"], cwd=spoke_repo, check=True, capture_output=True)
     env = {
@@ -2751,6 +2783,9 @@ def test_broker_service_gate_mutation_void_is_terminal_on_first_occurrence(
             "printf 'ANSWER: go ahead'"
         ),
         "AFK_REANSWER_CEILING": "5",
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_WARN_BACKOFF_BASE": "1000000",  # keep the 4 fast ticks inside one backoff window
+        "AFK_JOURNAL_GH_COMMENT": "0",
     }
 
     for _ in range(4):
@@ -2758,8 +2793,42 @@ def test_broker_service_gate_mutation_void_is_terminal_on_first_occurrence(
         assert result.returncode == 0, result.stderr
 
     n = calls.read_text().count("x") if calls.exists() else 0
-    assert n == 1, f"a mutation-void must run the reasoner once, then stay terminal; ran {n}"
-    assert "--blocked 5" in Path(env["_READY_LOG"]).read_text()
+    assert n == 1, f"a mutation-void must run the reasoner once, then back off; ran {n}"
+    _rl = Path(env["_READY_LOG"])
+    assert not _rl.exists() or "--blocked 5" not in _rl.read_text(), "void warns, never parks"
+    assert (statedir / "warned-5.txt").exists()
+
+
+def test_broker_service_gate_mutation_void_retries_after_backoff(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # #241 §5: the void is NOT terminal-forever. Once the warned-retry backoff elapses, the void
+    # marker is cleared for ONE supervised retry (the reasoner re-runs) — proof the void backs
+    # off rather than staying terminal. (The sibling test pins the backoff huge so this
+    # fall-through never fires; here it does.)
+    calls = tmp_path / "answerer.calls"
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (spoke_repo / "tracked.txt").write_text("original")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=spoke_repo, check=True, capture_output=True)
+    base = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": (
+            f"printf x >> '{calls}'; printf 'mutated' > '{spoke_repo}/tracked.txt'; "
+            "printf 'ANSWER: go ahead'"
+        ),
+        "AFK_REANSWER_CEILING": "5",
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_WARN_BACKOFF_BASE": "60",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env={**base, "AFK_NOW": "1000"})
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env={**base, "AFK_NOW": "1000"})
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env={**base, "AFK_NOW": "1100"})
+
+    n = calls.read_text().count("x") if calls.exists() else 0
+    assert n == 2, f"the void must retry once the backoff elapses, not stay terminal; ran {n}"
 
 
 def test_reanswer_ceiling_logs_terminal_once(
@@ -3088,3 +3157,825 @@ def test_classify_permission_read_of_secret_with_trailing_slash_escalates(
     (spoke_repo / "deploy.pem").write_text("KEY\n")
 
     assert _classify_with_wt(f"Read {spoke_repo}/deploy.pem/", spoke_repo, tasks) == "ESCALATE"
+
+
+# ── issue #241: decision journal + warn-and-continue foundation ────────────────
+# The /afk answerer now ALWAYS answers: every former terminal stop site takes the best
+# action, WARNS loudly, journals the decision, and parks the spoke LAST on an exponential
+# backoff instead of abandoning it. These pin the shared primitives every converted site
+# builds on: the decision journal, the loud warn record, the warn-continue seam (which must
+# NOT emit a blocked marker), and the backoff that gates re-service.
+
+
+def test_broker_journal_decision_appends_structured_line(tmp_path: Path) -> None:
+    import json as _json
+
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_NOW": "1700000000",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    r = _call(
+        "broker_journal_decision 41 permission 'denied force-push; use a new branch' irreversible",
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+
+    line = (statedir / "decision-journal.jsonl").read_text().strip()
+    rec = _json.loads(line)
+    assert rec["issue"] == "41"
+    assert rec["park"] == "permission"
+    assert rec["reversibility"] == "irreversible"
+    assert "force-push" in rec["decision"]
+
+
+def test_broker_journal_decision_posts_issue_comment(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    gh_log = tmp_path / "gh.log"
+    gh = bindir / "gh"
+    gh.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "' + str(gh_log) + '"\n')
+    gh.chmod(0o755)
+    env = {
+        "AFK_STATE_DIR": str(statedir),
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+    }
+
+    r = _call("broker_journal_decision 41 gate 'approved the plan' reversible", env=env)
+    assert r.returncode == 0, r.stderr
+    # The journal posts a per-decision issue comment (the morning post-review surface, #241 §10).
+    assert gh_log.exists(), "no gh call recorded"
+    assert "issue comment 41" in gh_log.read_text()
+
+
+def test_broker_warn_writes_record_and_logs_warning(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1700000000"}
+
+    r = _call("broker_warn 41 'took the reversible alternative'", env=env)
+    assert r.returncode == 0, r.stderr
+
+    assert "WARNING" in r.stderr and "#41" in r.stderr
+    rec = (statedir / "warned-41.txt").read_text().strip()
+    assert rec.split("\t")[0] == "1700000000"
+    assert "reversible alternative" in rec
+
+
+def test_broker_warn_continue_does_not_block(spoke_repo: Path, tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_JOURNAL_GH_COMMENT": "0"}
+
+    r = _call(
+        f"broker_warn_continue '{spoke_repo}' 41 permission 'denied; use reversible path' irreversible",
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+
+    # Warn-and-continue NEVER escalates: a warned record exists, a journal line exists,
+    # but NO durable blocked record is written (the difference from _escalate_blocked).
+    assert (statedir / "warned-41.txt").exists()
+    assert (statedir / "decision-journal.jsonl").exists()
+    assert not (statedir / "blocked-41.txt").exists(), "warn-continue must not block the spoke"
+
+
+def test_warned_backoff_gates_retry_and_grows(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_WARN_BACKOFF_BASE": "60",
+        "AFK_WARN_BACKOFF_CAP": "1800",
+    }
+
+    r = _call(
+        "( export AFK_NOW=1000; _afk_warned_arm 41 ); "
+        "_afk_warned_due 41 1000 && echo A-DUE || echo A-WAIT; "
+        "_afk_warned_due 41 1060 && echo B-DUE || echo B-WAIT; "
+        "( export AFK_NOW=1060; _afk_warned_arm 41 ); "
+        "_afk_warned_due 41 1100 && echo C-DUE || echo C-WAIT; "
+        "_afk_warned_due 41 1180 && echo D-DUE || echo D-WAIT",
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert "A-WAIT" in out, out  # within the base 60s backoff → parked LAST
+    assert "B-DUE" in out, out  # 60s elapsed → due for re-service
+    assert "C-WAIT" in out, out  # second warn doubled the backoff to 120s; only 40s elapsed
+    assert "D-DUE" in out, out  # 120s elapsed → due again
+
+
+def test_broker_journal_decision_escapes_control_chars(tmp_path: Path) -> None:
+    import json as _json
+
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_JOURNAL_GH_COMMENT": "0"}
+
+    # A decision built from captured tool output can carry a CR / control byte; the journal
+    # must still be valid JSONL a strict parser accepts (the record advertises "structured").
+    r = _call(
+        "broker_journal_decision 41 permission \"$(printf 'denied\\rforce-push\\tfoo')\" irreversible",
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+
+    raw = (statedir / "decision-journal.jsonl").read_text()
+    assert "\r" not in raw, "raw CR must not survive into the journal line"
+    rec = _json.loads(raw.strip())  # must parse — control chars neutralized
+    assert "force-push" in rec["decision"]
+
+
+def test_clear_warned_records_resets_window(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1000"}
+
+    r = _call(
+        "broker_warn 41 'w'; _afk_warned_arm 41; "
+        "broker_warn 42 'w'; _afk_warned_arm 42; "
+        "_afk_clear_warned 41; "  # one-issue clear (a genuine progress signal)
+        "_clear_warned_records",  # full window reset
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    # Both the human-facing record and the backoff bookkeeping are gone after the resets.
+    assert not (statedir / "warned-41.txt").exists()
+    assert not (statedir / "warned-state-41").exists()
+    assert not (statedir / "warned-42.txt").exists()
+    assert not (statedir / "warned-state-42").exists()
+
+
+# ── issue #241 S2: the reasoner ALWAYS answers (rule <-> fallback policy binding) ──
+# The escalate-and-park posture is gone: the reasoner takes even irreversible/outward/
+# scope-changing decisions, preferring the reversible in-scope alternative (that IS the
+# answer). The governing rule (afk-answering.md) and the built-in fallback policy the broker
+# ships when that file is absent must stay in lockstep — a binding test pins them so a future
+# edit can't drift one back toward ESCALATE while the other says always-answer.
+
+RULE_FILE = REPO_ROOT / "shared" / "rules" / "afk-answering.md"
+
+
+def test_default_answerer_policy_binds_to_rule_file() -> None:
+    policy = _call("_default_answerer_policy").stdout
+    rule = RULE_FILE.read_text()
+
+    # The output token ESCALATE: is retired from BOTH surfaces — the reasoner never emits it.
+    assert "ESCALATE:" not in policy, "the fallback policy must not instruct an ESCALATE output"
+    assert "ESCALATE:" not in rule, "the rule must not instruct an ESCALATE output"
+    # Both instruct the single ANSWER: output and the REVERSIBILITY: reversibility-class line.
+    for surface, name in ((policy, "fallback policy"), (rule, "rule file")):
+        low = surface.lower()
+        assert "ANSWER:" in surface, f"{name} must instruct the ANSWER output line"
+        assert "REVERSIBILITY:" in surface, f"{name} must instruct the REVERSIBILITY class line"
+        # A DISTINCTIVE phrase, not the bare "reversible" (which matches inside "irreversible"
+        # and would pass even if the prefer-reversible instruction were deleted).
+        assert "reversible, in-scope" in low, f"{name} must state the prefer-reversible posture"
+        # WARN must fire for all four risk classes, in lockstep across the surfaces.
+        for cls in ("irreversible", "outward", "scope"):
+            assert cls in low, f"{name} must name the {cls} risk class for WARN"
+
+
+def test_answerer_prompt_instructs_answer_only(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+
+    out = _call(
+        "build_answerer_prompt 5 'Which store?' '/some/worktree'",
+        env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    ).stdout
+
+    assert "ANSWER:" in out, "the prompt must instruct the reasoner to end with ANSWER:"
+    assert "ESCALATE:" not in out, "the always-answer prompt must not offer an ESCALATE output"
+
+
+def test_parse_decision_field_extracts_reversibility_and_warn() -> None:
+    raw = "reasoning\nREVERSIBILITY: irreversible\nWARN: took a critical call\nANSWER: deny; rebase instead"
+
+    rev = _call(f"parse_decision_field {shlex_quote(raw)} REVERSIBILITY").stdout.strip()
+    warn = _call(f"parse_decision_field {shlex_quote(raw)} WARN").stdout.strip()
+    dec = _call(f"parse_decision {shlex_quote(raw)}").stdout.strip()
+
+    assert rev == "irreversible", rev
+    assert warn == "took a critical call", warn
+    # parse_decision still extracts the ANSWER decision unchanged.
+    kind, _, text = dec.partition("\t")
+    assert kind == "ANSWER" and text == "deny; rebase instead", dec
+
+
+# ── issue #241 S3: classify_permission ESCALATE routes to the reasoner + warns ──
+# A permission dialog the mechanical classifier will not auto-approve no longer parks the
+# spoke as blocked/<issue>. It routes to the always-answering reasoner: APPROVE a safe,
+# reversible, in-scope command; DENY an irreversible/destructive one (Esc-cancel the dialog
+# and inject the reversible-path guidance) — never auto-approve a destructive command. Either
+# way the taken decision is warned + journaled, and the spoke stays serviced (never blocked).
+
+
+def _perm_env(tmp_path: Path, spoke_repo: Path, command: str, answerer: str) -> dict[str, str]:
+    """Park spoke #5 on a permission dialog for <command>, stub the reasoner with <answerer>,
+    and record any blocked escalation. A fake tmux logs every send-keys to _KEYLOG and, on an
+    Enter, advances the transcript so approve/inject verification can register."""
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    jsonl.write_text(json.dumps(_bash_tool_record(command)) + "\n")
+    keylog = tmp_path / "keys.log"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        "  send-keys)\n"
+        f'    printf "%s\\n" "$*" >> "{keylog}"\n'
+        f'    case "$*" in *Enter*) printf "{{}}\\n" >> "{jsonl}" ;; esac ;;\n'
+        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        "esac\nexit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    statedir = tmp_path / "sd"
+    statedir.mkdir(exist_ok=True)
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+    gh = fake_bin / "gh"
+    gh.write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    gh.chmod(0o755)
+    return {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE_DIR": str(statedir),
+        "SPOKE_READY": str(ready_stub),
+        "AFK_ANSWERER_CMD": answerer,
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_INJECT_POLL_SECONDS": "0",
+        "_KEYLOG": str(keylog),
+        "_READY_LOG": str(ready_log),
+        "_STATEDIR": str(statedir),
+    }
+
+
+def test_permission_escalate_reasoner_approve_injects_yes_and_warns(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    env = _perm_env(
+        tmp_path,
+        spoke_repo,
+        "npm run deploy",  # unrecognised -> classify ESCALATE
+        "printf 'REVERSIBILITY: reversible\\nANSWER: APPROVE'",
+    )
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    keys = Path(env["_KEYLOG"]).read_text() if Path(env["_KEYLOG"]).exists() else ""
+    statedir = Path(env["_STATEDIR"])
+    # The reasoner approved -> the "Yes" (option 1) keystroke was delivered.
+    assert any(line.split()[-1] == "1" for line in keys.splitlines()), keys
+    # Taken decision is warned + journaled, and the spoke is NEVER blocked.
+    assert (statedir / "warned-5.txt").exists()
+    assert (statedir / "decision-journal.jsonl").exists()
+    ready = Path(env["_READY_LOG"])
+    assert not ready.exists() or "--blocked 5" not in ready.read_text()
+
+
+def test_permission_escalate_reasoner_deny_cancels_and_redirects(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    destructive = "git reset --hard origin/main"  # irreversible -> must be denied
+    env = _perm_env(
+        tmp_path,
+        spoke_repo,
+        destructive,
+        "printf 'REVERSIBILITY: irreversible\\nANSWER: DENY: do not hard-reset; create a backup branch first'",
+    )
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    keys = Path(env["_KEYLOG"]).read_text() if Path(env["_KEYLOG"]).exists() else ""
+    statedir = Path(env["_STATEDIR"])
+    # Deny cancels the dialog (Escape) and never sends the bare "Yes" (option 1).
+    assert "Escape" in keys, keys
+    assert not any(line.split()[-1] == "1" for line in keys.splitlines()), (
+        "an irreversible command must never be auto-approved"
+    )
+    # The reversible-path guidance was injected to the spoke.
+    assert "backup branch" in keys, keys
+    # Warned + journaled with the irreversible class; never blocked.
+    assert "irreversible" in (statedir / "decision-journal.jsonl").read_text()
+    ready = Path(env["_READY_LOG"])
+    assert not ready.exists() or "--blocked 5" not in ready.read_text()
+
+
+def test_permission_approve_delivery_failure_warns_not_blocks(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A known-safe command classifies APPROVE, but the Yes keystroke fails to register (the
+    # transcript never advances). #241: that no longer parks the spoke blocked/<issue> — it
+    # warns and retries on the backoff.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    jsonl.write_text(json.dumps(_bash_tool_record("git reset -q; git add tests/x.py")) + "\n")
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # pinned mtime: no Enter-append -> no advance
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        "esac\nexit 0\n"  # send-keys is a no-op: the transcript never advances -> delivery fails
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE_DIR": str(statedir),
+        "SPOKE_READY": str(ready_stub),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_INJECT_POLL_SECONDS": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    assert (statedir / "warned-5.txt").exists(), "a failed approval delivery must warn, not park"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text()
+
+
+def test_permission_reasoner_auth_failure_warns_not_denies(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # If the supervisor's own token dies while the reasoner decides a permission dialog, the
+    # blob is an auth error, not a decision. The permission path must detect it (rc != 0 + auth
+    # signature), raise the global halt flag — and #241 §9 WARN the spoke (not block it, not
+    # inject a spurious denial into the live dialog).
+    env = {
+        **_perm_env(
+            tmp_path,
+            spoke_repo,
+            "npm run deploy",  # ESCALATE -> reasoner
+            "printf 'Invalid API key . Please run /login'; exit 1",
+        ),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(
+        f"broker_service_gate '{spoke_repo}' 5 unattended; echo AUTH=$_AFK_AUTH_FAILED",
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+
+    assert "AUTH=1" in result.stdout, "an auth failure must raise the global halt flag"
+    ready = Path(env["_READY_LOG"])
+    assert not ready.exists() or "--blocked 5" not in ready.read_text(), (
+        "#241: auth warns, never blocks"
+    )
+    assert "WARNING: #5" in result.stderr, result.stderr
+    # No spurious denial: the reversible-path guidance was never injected.
+    keys = Path(env["_KEYLOG"]).read_text() if Path(env["_KEYLOG"]).exists() else ""
+    assert "reversible, in-scope path" not in keys, "auth failure must not inject a spurious deny"
+
+
+# ── issue #241 S4: the re-answer ceiling backs off, never goes terminal ─────────
+# Pre-#241 the ceiling was TERMINAL: once a spoke exhausted its attempts on the same (tip,
+# prompt) the reasoner never ran again until a human intervened. #241 §5 makes it warn + retry
+# on an exponential backoff — doom-loop safety is the growing curve, not abandonment.
+
+
+def test_reanswer_ceiling_backs_off_and_retries(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    calls = tmp_path / "answerer.calls"
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    base = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": f"printf x >> '{calls}'; printf 'ESCALATE: legitimately stuck'",
+        "AFK_REANSWER_CEILING": "1",
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_WARN_BACKOFF_BASE": "60",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    # First run exhausts the ceiling (=1). A second tick at the SAME clock stays inside the
+    # backoff (no re-run). A third tick past the 60s backoff takes ONE supervised retry.
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env={**base, "AFK_NOW": "1000"})
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env={**base, "AFK_NOW": "1000"})
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env={**base, "AFK_NOW": "1100"})
+
+    n = calls.read_text().count("x") if calls.exists() else 0
+    assert n >= 2, f"the ceiling must retry after the backoff, not stay terminal; ran {n}"
+    assert (statedir / "warned-5.txt").exists(), "the ceiling must warn"
+    assert "ceiling" in (statedir / "decision-journal.jsonl").read_text()
+
+
+# ── issue #241 S4: staleness recomputes against the current park, never bare-drops ──
+# Pre-#241 a park-signature change dropped the answer and returned. #241 §4: if the spoke is
+# still parked (on a possibly-changed prompt), recompute against the CURRENT park in the same
+# pass — a recurring false-staleness (a non-turn write bumping the transcript mtime) otherwise
+# strands the spoke (the #240 hang class). The #89 protection stays: a spoke that genuinely
+# MOVED ON (no park extractable) is still dropped, never injected mid-turn.
+
+
+def test_staleness_recomputes_against_current_park(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    calls = tmp_path / "answerer.calls"
+    # The reasoner touches the LIVE transcript, so the post-reason _still_parked_same mtime
+    # check always reports "changed" — a false staleness. The pane still shows the park, so #241
+    # must recompute (re-run) rather than drop. The recompute is depth-bounded to one re-run.
+    live_jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    os.utime(
+        live_jsonl, (1_000_000_000, 1_000_000_000)
+    )  # pin OLD so the reasoner's touch reads as newer
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": f"printf x >> '{calls}'; touch '{live_jsonl}'; printf 'ANSWER: pick Redis'",
+        "AFK_REANSWER_CEILING": "5",  # keep the ceiling out of this test
+        "AFK_STATE_DIR": str(tmp_path / "sd"),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    n = calls.read_text().count("x") if calls.exists() else 0
+    assert n == 2, f"a still-parked staleness must recompute once (not bare-drop); ran {n}"
+
+
+# ── issue #241 S5: the human-decision chokepoint warns-and-continues, never parks ──
+# _broker_on_human_decision (unattended) is the ONE seam every void/fingerprint/inject-failure/
+# ESCALATE/no-decision escalation funnels through. #241 converts it from _escalate_blocked
+# (terminal blocked/<issue>) to broker_warn_continue: warn loudly, journal the taken decision,
+# and keep the spoke serviced. The mutation-void becomes backoff-paced, not terminal-forever.
+
+
+def test_unattended_escalate_warns_not_blocks(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": "printf 'reasoning\\nESCALATE: this is a human call'",
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    log = Path(env["_READY_LOG"]).read_text() if Path(env["_READY_LOG"]).exists() else ""
+    assert "--blocked 5" not in log, "the answerer's human-call must warn-and-continue, not park"
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert (statedir / "warned-5.txt").exists()
+    assert (statedir / "decision-journal.jsonl").exists()
+
+
+def test_mutation_void_warns_not_blocks(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # A reasoner that mutates the read-only live tree still has its answer VOIDED (never
+    # injected), but #241 warns-and-continues instead of parking blocked/<issue>.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (spoke_repo / "tracked.txt").write_text("original")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=spoke_repo, check=True, capture_output=True)
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": f"printf 'mutated' > '{spoke_repo}/tracked.txt'; printf 'ANSWER: go ahead'",
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    log = Path(env["_READY_LOG"]).read_text() if Path(env["_READY_LOG"]).exists() else ""
+    assert "--blocked 5" not in log, "a voided mutation must warn-and-continue, not park"
+    assert "WARNING: #5" in result.stderr, result.stderr
+    assert (statedir / "warned-5.txt").exists()
+
+
+# ── issue #241 hub-review: journal-before-inject + success-path WARN journaling ──
+
+
+def test_permission_approve_journals_before_inject(spoke_repo: Path, tmp_path: Path) -> None:
+    # BLOCKER 1: the reasoner-APPROVE decision must be journaled BEFORE approve_permission
+    # delivers the "Yes" keypress — so the audit record can never be lost if the inject crashes
+    # or races the command it authorized. The fake tmux records, at the moment the approve "1"
+    # keystroke fires, whether the journal line already exists.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    journal = statedir / "decision-journal.jsonl"
+    probe = tmp_path / "probe"
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    (pd / "session.jsonl").write_text(json.dumps(_bash_tool_record("npm run deploy")) + "\n")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        "  send-keys)\n"
+        f'    case "$*" in *" 1") [ -f "{journal}" ] && echo EXISTS >> "{probe}" || echo MISSING >> "{probe}" ;; esac ;;\n'
+        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        "esac\nexit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE_DIR": str(statedir),
+        "SPOKE_READY": str(ready_stub),
+        "AFK_ANSWERER_CMD": "printf 'REVERSIBILITY: reversible\\nANSWER: APPROVE'",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_INJECT_POLL_SECONDS": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    assert probe.read_text().strip() == "EXISTS", (
+        "the decision must be journaled BEFORE the approve keystroke fires"
+    )
+    # The approve keystroke does not advance the transcript here, so delivery FAILS — the durable
+    # journal must record the PROVISIONAL pre-keypress intent and the delivery-failure distinctly,
+    # and must NOT contain a 'delivered' line that would read as authorized-and-ran (#241 review).
+    journal_text = journal.read_text()
+    assert "APPROVING (delivery pending)" in journal_text, (
+        "the pre-keypress line must be provisional, not a completed-approval record"
+    )
+    assert "delivery FAILED" in journal_text, (
+        "a failed approval delivery must be journaled distinctly"
+    )
+    assert "APPROVED (delivered)" not in journal_text, (
+        "a failed delivery must never leave a 'delivered' record a reader takes as ran"
+    )
+
+
+def test_success_answer_journals_warn_and_reversibility(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # BLOCKER 2: a successful main answer whose reasoner reply carries a WARN / non-reversible
+    # class is recorded for morning review — a loud warned record AND a journal line.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    fake_bin = tmp_path / "bin"
+    jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # pin old so the inject's append advances it
+    _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": (
+            "printf 'REVERSIBILITY: irreversible\\nWARN: double-check the migration\\nANSWER: proceed with Redis'"
+        ),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    assert (statedir / "warned-5.txt").exists(), "a WARN-flagged answer must warn for review"
+    journal = (statedir / "decision-journal.jsonl").read_text()
+    assert "irreversible" in journal and "double-check the migration" in journal
+
+
+def test_success_answer_routine_journals_file_only(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # WARNING: a routine (reversible, no-WARN) successful answer journals to the per-run FILE
+    # but does NOT gh-comment (that would be per-answer noise) and does NOT warn.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    fake_bin = tmp_path / "bin"
+    jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+    _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
+    gh_log = tmp_path / "gh.log"
+    (fake_bin / "gh").write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{gh_log}"\n')
+    (fake_bin / "gh").chmod(0o755)
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": "printf 'REVERSIBILITY: reversible\\nANSWER: use Redis'",
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        # NB: AFK_JOURNAL_GH_COMMENT left ON — the routine path must still not comment.
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    assert (statedir / "decision-journal.jsonl").exists(), "a routine answer still journals (file)"
+    assert not (statedir / "warned-5.txt").exists(), "a routine answer must NOT warn"
+    assert not gh_log.exists() or "issue comment" not in gh_log.read_text(), (
+        "a routine answer must NOT post a gh comment"
+    )
+
+
+def test_ceiling_mechanical_approve_is_paced_not_every_tick(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #241 review (regression for the N1 fix): a mechanically-auto-approvable permission that keeps
+    # re-appearing at the SAME (tip, park-signature) — the approve keypress doesn't advance it — is
+    # PACED by the ceiling backoff once exhausted, NOT re-warned + re-approved every tick.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    keylog = tmp_path / "keys.log"
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    (pd / "session.jsonl").write_text(
+        json.dumps(_bash_tool_record("git reset -q; git add tests/x.py")) + "\n"  # classify APPROVE
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f'  send-keys) case "$*" in *" 1") printf "1\\n" >> "{keylog}" ;; esac ;;\n'
+        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        "esac\nexit 0\n"  # the approve never advances the transcript → the dialog re-appears
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text("#!/usr/bin/env bash\n:\n")
+    ready_stub.chmod(0o755)
+    base = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE_DIR": str(statedir),
+        "SPOKE_READY": str(ready_stub),
+        "AFK_REANSWER_CEILING": "1",
+        "AFK_WARN_BACKOFF_BASE": "60",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+    }
+    # Five ticks; the last three are past the 60s backoff window opened at tick 2.
+    for now in ("1000", "1000", "1100", "1100", "1100"):
+        _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env={**base, "AFK_NOW": now})
+
+    approves = keylog.read_text().count("1") if keylog.exists() else 0
+    assert approves <= 2, (
+        f"a re-appearing auto-approve must be backoff-paced, not every tick; fired {approves}"
+    )
+
+
+def test_success_answer_case_insensitive_reversibility_stays_routine(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # #241 review: a routine answer whose class is 'Reversible' (capitalized / punctuated) must be
+    # read as reversible — routine, file-only journal, NO loud warned record.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    fake_bin = tmp_path / "bin"
+    jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+    _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": "printf 'REVERSIBILITY: Reversible.\\nANSWER: use Redis'",
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    assert (statedir / "decision-journal.jsonl").exists(), "a routine answer still journals (file)"
+    assert not (statedir / "warned-5.txt").exists(), (
+        "a 'Reversible.' class must be read as reversible → routine, not a loud warned record"
+    )
+
+
+def test_permission_deny_delivery_failure_journaled_distinctly(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #241 review (CONFIRMED): the DENY path must NOT swallow the redirect inject rc. When the
+    # decline-and-redirect fails to reach the spoke (dead pane / failed inject), the durable
+    # journal must record the failure DISTINCTLY — never as a clean, delivered denial.
+    destructive = "git reset --hard origin/main"  # irreversible -> reasoner denies
+    env = _perm_env(
+        tmp_path,
+        spoke_repo,
+        destructive,
+        "printf 'REVERSIBILITY: irreversible\\nANSWER: DENY: create a backup branch first'",
+    )
+    fake_bin = Path(env["PATH"].split(":", 1)[0])
+    # Rewrite tmux so send-keys never advances the transcript -> the redirect inject FAILS.
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f'  send-keys) printf "%s\\n" "$*" >> "{env["_KEYLOG"]}" ;;\n'
+        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        "esac\nexit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    jsonl = _project_dir_for(Path(env["CLAUDE_PROJECTS_DIR"]), spoke_repo) / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # no external advance masks the failure
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    journal = (Path(env["_STATEDIR"]) / "decision-journal.jsonl").read_text()
+    assert "redirect delivery FAILED" in journal, (
+        "a failed deny-redirect must be journaled distinctly, not as a clean denial"
+    )
+    keys = Path(env["_KEYLOG"]).read_text() if Path(env["_KEYLOG"]).exists() else ""
+    assert not any(line.split()[-1:] == ["1"] for line in keys.splitlines()), (
+        "an irreversible command must never be auto-approved"
+    )
+
+
+def test_success_answer_quoted_irreversible_stays_flagged(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # #241 review (Finding 2 fail-safe): a class that LEADS with punctuation ('"irreversible"')
+    # must still be read as non-reversible and flagged with a loud warned record — the old
+    # trailing-strip collapsed it to empty and mis-filed a noteworthy decision as routine.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    fake_bin = tmp_path / "bin"
+    jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+    _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": "printf 'REVERSIBILITY: \"irreversible\"\\nANSWER: proceed with care'",
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    assert (statedir / "warned-5.txt").exists(), (
+        "a quoted 'irreversible' class must fail SAFE to a loud warned record, not routine"
+    )
+    assert "irreversible" in (statedir / "decision-journal.jsonl").read_text()
+
+
+def test_broker_warn_continue_unconditionally_advances_backoff(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #241 review r2.2: broker_warn_continue must ALWAYS advance the warned-retry backoff. It is
+    # reached not only from broker_service_gate but also from hub-afk's reap/land/dispatch passes
+    # (_warn_parked_last), which have no per-tick reset — a suppression guard that skipped the arm
+    # there froze the next-due timestamp and re-warned every tick. Pin the monotonic-growth
+    # invariant the revert restored: repeated calls keep advancing the attempt counter.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_WARN_BACKOFF_BASE": "60",
+        "AFK_NOW": "1000",
+    }
+    result = _call(
+        f"broker_warn_continue '{spoke_repo}' 5 escalate 'first' reversible; "
+        f"broker_warn_continue '{spoke_repo}' 5 escalate 'second' reversible; "
+        'IFS=$\'\\t\' read -r a _ < "$(_afk_warned_state_file 5)"; printf "attempt=%s\\n" "$a"',
+        env=env,
+    )
+    assert "attempt=2" in result.stdout, result.stdout + result.stderr

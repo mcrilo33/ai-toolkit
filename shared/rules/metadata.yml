@@ -108,7 +108,7 @@ bug-triage:
 
 afk-answering:
   name: "AFK Answering"
-  description: "How to answer a parked spoke on the human's behalf during an unattended /afk drain — reason about the prompt with a thinking budget, answer in the interest of the issue contract and repo conventions, prefer the spoke's own recommendation, and escalate (blocked/N) only when the decision is irreversible, outward-facing, or scope-changing. Surfaced on demand for the /afk answerer, not auto-applied to every session."
+  description: "How to answer a parked spoke on the human's behalf during an unattended /afk drain — reason about the park with a thinking budget and ALWAYS answer, never escalate-and-park (issue #241). Answer in the interest of the issue contract and repo conventions, prefer the spoke's own recommendation, and service every park surface (free-text, PLAN gate, permission dialog, AskUserQuestion QCM). For irreversible, outward-facing, or scope-changing asks, take the reversible in-scope alternative and record the reversibility class + a WARN line for morning post-review. Surfaced on demand for the /afk answerer, not auto-applied to every session."
   alwaysApply: false
 
 library-research:

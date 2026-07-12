@@ -118,6 +118,16 @@ processors:
           #    win (verified 2026-06-19: span session.id alone grouped under the UUID).
           - set(attributes["langfuse.session.id"], resource.attributes["spoke_run_id"]) where resource.attributes["spoke_run_id"] != nil
           - set(attributes["session.id"], resource.attributes["spoke_run_id"]) where resource.attributes["spoke_run_id"] != nil
+          # 3b) environment stamp → prod vs test (issue #231). The store holds ~10k synthetic
+          #     fixture sessions that a name-based dashboard widget can't exclude. Stamping every
+          #     LIVE spoke span with langfuse.environment lets a dashboard scope to
+          #     environment=production and drop test traffic (the assembled spoke-tree/-cycle
+          #     views set the same field). A spoke MAY divert to a test env by exporting
+          #     OTEL_RESOURCE_ATTRIBUTES=deployment.environment=<env> (a test collector /
+          #     fixture run); otherwise the real spoke defaults to production. The
+          #     deployment.environment override MUST run last so it wins over the default.
+          - set(attributes["langfuse.environment"], "production")
+          - set(attributes["langfuse.environment"], resource.attributes["deployment.environment"]) where resource.attributes["deployment.environment"] != nil
           # 4) content → Langfuse input/output. Opt-in: needs OTEL_LOG_USER_PROMPTS +
           #    OTEL_LOG_TOOL_DETAILS + OTEL_LOG_TOOL_CONTENT at spoke launch (these ship
           #    content off-box, so they are operator opt-in, NOT in the #83 gate). The

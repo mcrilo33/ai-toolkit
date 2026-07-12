@@ -6,8 +6,12 @@ per-tool ``permission_wait_ms`` / ``tool_result_size`` and the trace-level ``gat
 :func:`~telemetry.spoke_tree.commits._gate_park_ms`); :func:`build_step_cost_scores` emits per-phase
 ``step_cache_write_usd`` / ``step_tokens_written`` from View B's step rollups; and
 :func:`build_step_total_cost_scores` emits per-phase ``step_total_cost_usd`` — the true all-
-generations cost windowed onto each step (#230). Depends on the foundation, ``ids``, ``steps``,
-and ``commits``.
+generations cost windowed onto each step (#230). :func:`build_outcome_count_scores` emits the
+trace-level failure-economics counts (``gate_park_count`` / ``blocked_count`` /
+``relaunch_count``) and :func:`build_normalization_scores` the size/effort normalizers
+(``files_changed`` / ``lines_changed`` / ``commits`` / ``subtasks`` + the derived
+``cost_per_changed_line`` / ``wall_per_subtask``) so a spoke's cost is comparable across
+spokes/repos (#231). Depends on the foundation, ``ids``, ``steps``, and ``commits``.
 """
 
 from __future__ import annotations
@@ -20,7 +24,12 @@ from typing import Any
 
 from telemetry.spoke_tree.commits import _gate_park_ms
 from telemetry.spoke_tree.cycle import _POST_STEP_KEY, _PRE_STEP_KEY
-from telemetry.spoke_tree.ids import _CYCLE_STEP_PREFIX, cycle_trace_id_for, trace_id_for
+from telemetry.spoke_tree.ids import (
+    _CYCLE_STEP_PREFIX,
+    cycle_trace_id_for,
+    root_id_for,
+    trace_id_for,
+)
 from telemetry.spoke_tree.observations import (
     _MCP_GROUP_PREFIX,
     _POST_STEP_NAME,
@@ -42,6 +51,27 @@ from telemetry.spoke_tree.observations import (
 
 # Deterministic id prefix for the numeric Langfuse scores (#100 amendment: chartable time budget).
 _SCORE_PREFIX = "tree-score-"
+# Failure-economics counts (#231): a blocked/reaped disaster spoke and a clean landing carried
+# identical tags, so these trace-level counts make the difference queryable. ``gate_park_count`` is
+# DERIVED from the traces (the PLAN-gate park spans); ``blocked_count`` / ``relaunch_count`` are
+# supervisor state, read from ``.ai-toolkit`` integer pointers (0 emitted so "clean" reads distinct
+# from "not measured").
+_GATE_PARK_COUNT_SCORE = "gate_park_count"
+_BLOCKED_COUNT_SCORE = "blocked_count"
+_RELAUNCH_COUNT_SCORE = "relaunch_count"
+_BLOCKED_COUNT_POINTER = ".ai-toolkit/blocked-count"
+_RELAUNCH_COUNT_POINTER = ".ai-toolkit/relaunch-count"
+# Normalization scores (#231): the size + effort a spoke's cost/latency should be read against,
+# so a cheap one-line fix and an expensive refactor are comparable across spokes/repos. The four
+# base counts come from the commit numstat + the cycle windows the builder already has; the two
+# derived ratios normalize the trace's cost/wall by size. A ratio is skipped (not 0) when its
+# denominator is 0 so an empty spoke never divides by zero.
+_FILES_CHANGED_SCORE = "files_changed"
+_LINES_CHANGED_SCORE = "lines_changed"
+_COMMITS_SCORE = "commits"
+_SUBTASKS_SCORE = "subtasks"
+_COST_PER_CHANGED_LINE_SCORE = "cost_per_changed_line"
+_WALL_PER_SUBTASK_SCORE = "wall_per_subtask"
 # Score names — Langfuse sums/charts numeric scores (it cannot chart arbitrary metadata).
 _PERMISSION_WAIT_SCORE = "permission_wait_ms"  # per blocked tool observation
 _GATE_PARK_SCORE = "gate_park_ms"  # trace-level PLAN-gate park wait
@@ -254,6 +284,146 @@ def build_score_events(
             )
         )
     return events
+
+
+def _root_total_ms(spoke_run_id: str, batch: list[IngestEvent]) -> int:
+    """Return the View A root's subtree wall-clock in ms from its duration rollup, or 0 (#231).
+
+    ``_apply_container_rollups`` stamps ``metadata.rollup.duration.total_ms`` on the synthetic
+    root; a batch built before that pass (or a malformed one) yields 0 rather than crashing.
+    """
+    root_id = root_id_for(spoke_run_id)
+    for event in batch:
+        if event["body"].get("id") != root_id:
+            continue
+        duration = ((event["body"].get("metadata") or {}).get("rollup") or {}).get("duration") or {}
+        total = duration.get("total_ms")
+        return int(total) if isinstance(total, (int, float)) else 0
+    return 0
+
+
+def build_normalization_scores(
+    spoke_run_id: str,
+    commits: list[dict[str, Any]],
+    batch: list[IngestEvent],
+    subtasks: int,
+    *,
+    base_ts: str,
+) -> list[IngestEvent]:
+    """Build the trace-level normalization scores that size a spoke's cost + latency (#231).
+
+    A spoke's raw cost/wall-clock is only comparable across spokes/repos once normalized by how
+    much it changed and how many subtasks it ran. Four base counts come from data the builder
+    already has — the commit numstat (:func:`_parse_commits`) and the cycle windows — plus two
+    derived ratios:
+
+    - ``files_changed`` — distinct paths touched across all commits (de-duplicated).
+    - ``lines_changed`` — total additions + deletions summed over the per-commit numstat (the
+      churn the issue scopes to — the data ``commits.py`` already parses — NOT the net
+      ``merge-base..HEAD`` diff, so a spoke that rewrites the same lines across several commits
+      reads higher here than its net diff).
+    - ``commits`` — number of commits on the branch.
+    - ``subtasks`` — number of cycle windows (the ledger subtask count), passed in.
+    - ``cost_per_changed_line`` — the trace's total generation cost (Σ ``costDetails``, the same
+      figure :func:`build_step_total_cost_scores` reconciles to ``totalCost``) ÷ ``lines_changed``.
+    - ``wall_per_subtask`` — the root subtree wall-clock (ms) ÷ ``subtasks``.
+
+    The four base counts are always emitted (0 included); a ratio is SKIPPED when its denominator
+    is 0 so an empty spoke never divides by zero. All are trace-level NUMERIC scores; ids derive
+    from the spoke run id so a rerun overwrites the same scores.
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids + the root id).
+        commits: The parsed ``git log --numstat`` records (``files`` / ``additions`` / ``deletions``).
+        batch: The assembled View A events (its generations' ``costDetails`` + root duration read).
+        subtasks: The cycle-window count (the ledger subtask count).
+        base_ts: ISO timestamp stamped on every score event.
+
+    Returns:
+        The four base-count ``score-create`` events plus each derived ratio whose denominator is
+        non-zero.
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    files_changed = len({path for commit in commits for path in commit.get("files") or []})
+    lines_changed = sum(
+        int(commit.get("additions") or 0) + int(commit.get("deletions") or 0) for commit in commits
+    )
+    total_cost = sum(
+        _generation_total_cost(event["body"])
+        for event in batch
+        if event.get("type") == "generation-create"
+    )
+    values: dict[str, float] = {
+        _FILES_CHANGED_SCORE: files_changed,
+        _LINES_CHANGED_SCORE: lines_changed,
+        _COMMITS_SCORE: len(commits),
+        _SUBTASKS_SCORE: subtasks,
+    }
+    if lines_changed:
+        values[_COST_PER_CHANGED_LINE_SCORE] = total_cost / lines_changed
+    if subtasks:
+        values[_WALL_PER_SUBTASK_SCORE] = _root_total_ms(spoke_run_id, batch) / subtasks
+    return [
+        _score_event(spoke_run_id, name=name, value=value, trace_id=trace_id, base_ts=base_ts)
+        for name, value in values.items()
+    ]
+
+
+def _read_count_pointer(root: Path, pointer: str) -> int:
+    """Return a non-negative integer from a ``.ai-toolkit`` count pointer, or 0 (#231).
+
+    A missing, unreadable, blank, or non-integer pointer resolves to 0 — supervisor state
+    that was never written reads as "no blocks/relaunches", never crashes the land-time build.
+    """
+    try:
+        value = (root / pointer).read_text(encoding="utf-8").strip()
+    except OSError:
+        return 0
+    return int(value) if value.isdigit() else 0
+
+
+def build_outcome_count_scores(
+    spoke_run_id: str, traces: list[TraceObservations], root: Path, *, base_ts: str
+) -> list[IngestEvent]:
+    """Build the trace-level failure-economics count scores (#231).
+
+    A blocked/reaped disaster spoke and a clean landing carried identical trace tags, so these
+    three numeric scores make the difference queryable:
+
+    - ``gate_park_count`` — DERIVED from the traces: how many PLAN-gate park spans the spoke
+      emitted (:func:`_is_gate_observation`), so no shell input is needed.
+    - ``blocked_count`` / ``relaunch_count`` — supervisor state, read from the worktree's
+      ``.ai-toolkit`` integer pointers (:func:`_read_count_pointer`), defaulting to 0 so a
+      clean landing (0 blocks, 0 relaunches) reads distinctly from "not measured".
+
+    All three are emitted unconditionally (0 included) and trace-level, so each is a one-widget
+    Scores query; ids derive from the spoke run id so a rerun overwrites the same scores.
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids).
+        traces: The source traces (scanned for the gate-park spans).
+        root: The worktree root holding the ``.ai-toolkit`` count pointers.
+        base_ts: ISO timestamp stamped on every score event.
+
+    Returns:
+        The three ``score-create`` events (gate_park_count, blocked_count, relaunch_count).
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    gate_parks = sum(
+        1
+        for _orig_trace_id, observations in traces
+        for observation in observations
+        if _is_gate_observation(observation)
+    )
+    values = {
+        _GATE_PARK_COUNT_SCORE: gate_parks,
+        _BLOCKED_COUNT_SCORE: _read_count_pointer(root, _BLOCKED_COUNT_POINTER),
+        _RELAUNCH_COUNT_SCORE: _read_count_pointer(root, _RELAUNCH_COUNT_POINTER),
+    }
+    return [
+        _score_event(spoke_run_id, name=name, value=value, trace_id=trace_id, base_ts=base_ts)
+        for name, value in values.items()
+    ]
 
 
 def _script_name(body: dict[str, Any]) -> str:

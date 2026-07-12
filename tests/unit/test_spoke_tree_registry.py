@@ -54,6 +54,8 @@ class TestEnrichmentRegistry:
             "mcp-calls",
             "mcp-def-loads",
             "agent-verdict",
+            "outcome-counts",
+            "normalization",
         ]
 
     def test_running_the_loop_populates_scores_matching_direct_calls(self, tmp_path: Path) -> None:

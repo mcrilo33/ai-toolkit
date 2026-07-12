@@ -1604,6 +1604,79 @@ def test_land_ingest_skips_with_warn_when_no_conf_no_env(hub: Path, tmp_path: Pa
     assert _log_text(logs["python3.12"]) == "", "no ingester may run without auth"
 
 
+def _noop_wt_done(tmp_path: Path) -> Path:
+    """A no-op worktree-done stub so a land keeps the worktree for post-land inspection."""
+    stub = tmp_path / "bin" / "wt-done-noop.sh"
+    stub.parent.mkdir(exist_ok=True)
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+    return stub
+
+
+def test_land_stamps_outcome_landed_pointer(hub: Path, tmp_path: Path) -> None:
+    # #231: the land records outcome=landed into the worktree's .ai-toolkit/outcome pointer
+    # BEFORE the view build reads it, so the assembled trace carries an outcome:landed tag.
+    wt = _make_spoke(hub, tmp_path, "feature/1-outcome", push=True)
+    _seed_otel_spoke(hub, wt, raw_bodies=True)
+    conf = tmp_path / "afk-telemetry"
+    conf.write_text('LANGFUSE_BASIC_AUTH="Basic-test-127"\n')
+
+    proc, _logs = _run_land(
+        hub,
+        tmp_path,
+        "1",
+        stub_python312=True,
+        stub_curl=True,
+        extra_env={
+            "AFK_TELEMETRY_CONF": str(conf),
+            "AI_TOOLKIT_INGEST_FLUSH_WAIT": "0",
+            "WT_DONE": str(_noop_wt_done(tmp_path)),  # keep the worktree so the pointer survives
+        },
+    )
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert (wt / ".ai-toolkit" / "outcome").read_text().strip() == "landed"
+
+
+def test_land_after_prior_block_outcome_passes_rebuild(hub: Path, tmp_path: Path) -> None:
+    # #231: a spoke the supervisor already stamped outcome=blocked (a block-time view was posted)
+    # must land with --rebuild so the final landed view refreshes that partial snapshot, and the
+    # pointer ends at landed.
+    wt = _make_spoke(hub, tmp_path, "feature/1-reblock", push=True)
+    _seed_otel_spoke(hub, wt, raw_bodies=True)
+    (wt / ".ai-toolkit" / "outcome").write_text("blocked\n")
+    conf = tmp_path / "afk-telemetry"
+    conf.write_text('LANGFUSE_BASIC_AUTH="Basic-test-127"\n')
+
+    proc, logs = _run_land(
+        hub,
+        tmp_path,
+        "1",
+        stub_python312=True,
+        stub_curl=True,
+        extra_env={
+            "AFK_TELEMETRY_CONF": str(conf),
+            "AI_TOOLKIT_INGEST_FLUSH_WAIT": "0",
+            "WT_DONE": str(_noop_wt_done(tmp_path)),
+        },
+    )
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "--rebuild" in _log_text(logs["python3.12"]), "a prior block-time view must be rebuilt"
+    assert (wt / ".ai-toolkit" / "outcome").read_text().strip() == "landed"
+
+
+def test_land_without_ai_toolkit_dir_writes_no_outcome(hub: Path, tmp_path: Path) -> None:
+    # #231: a non-OTel worktree (no .ai-toolkit) must NOT gain an outcome pointer — writing there
+    # would only dirty a tree the teardown then refuses to remove. The land still succeeds.
+    wt = _make_spoke(hub, tmp_path, "feature/1-plain", push=True)
+
+    proc, _logs = _run_land(hub, tmp_path, "1", extra_env={"WT_DONE": str(_noop_wt_done(tmp_path))})
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert not (wt / ".ai-toolkit").exists()
+
+
 def test_land_script_span_posted_when_conf_present(hub: Path, tmp_path: Path) -> None:
     # With auth resolvable, the land's existing lifecycle/script span emission
     # must reach the OTLP span endpoint (defaulted to the local collector) — the
@@ -1983,9 +2056,7 @@ def test_land_label_clear_gh_failure_non_fatal(hub: Path, tmp_path: Path) -> Non
 def test_land_mirror_opt_out_clears_no_labels(hub: Path, tmp_path: Path) -> None:
     _make_spoke(hub, tmp_path, "feature/7-optout", push=True)
 
-    proc, logs = _run_land(
-        hub, tmp_path, "7", extra_env={"AI_TOOLKIT_GH_LIFECYCLE_LABELS": "0"}
-    )
+    proc, logs = _run_land(hub, tmp_path, "7", extra_env={"AI_TOOLKIT_GH_LIFECYCLE_LABELS": "0"})
 
     assert proc.returncode == 0, proc.stderr
     assert "issue edit" not in _log_text(logs["gh"])

@@ -175,3 +175,34 @@ def test_prometheus_sink_listens_on_a_port_distinct_from_the_receivers() -> None
         _port(receivers["otlp/beta"]["protocols"]["http"]["endpoint"]),
     }
     assert prom_port not in receiver_ports, "Prometheus port must not collide with a receiver"
+
+
+def test_environment_stamped_on_spans() -> None:
+    # #231: every real spoke span is stamped langfuse.environment so a Langfuse dashboard can
+    # scope to environment=production and exclude test/fixture traffic. A deployment.environment
+    # resource attr (a test collector) overrides; otherwise it defaults to production.
+    statements = _span_statements(_load_config())
+
+    env_stmts = [s for s in statements if "langfuse.environment" in s]
+    assert env_stmts, "a transform must set langfuse.environment on spoke spans"
+    assert any('"production"' in s for s in env_stmts), (
+        "real spoke spans must default to the production environment"
+    )
+
+
+def test_environment_override_runs_after_the_production_default() -> None:
+    # OTTL runs top-to-bottom, so the deployment.environment override MUST come AFTER the
+    # unconditional "production" default, or a test-collector diversion is silently clobbered.
+    statements = _span_statements(_load_config())
+
+    default_idx = next(
+        i for i, s in enumerate(statements) if 'langfuse.environment"], "production")' in s
+    )
+    override_idx = next(
+        i
+        for i, s in enumerate(statements)
+        if "langfuse.environment" in s and "deployment.environment" in s
+    )
+    assert override_idx > default_idx, (
+        "the deployment.environment override must win over the default"
+    )

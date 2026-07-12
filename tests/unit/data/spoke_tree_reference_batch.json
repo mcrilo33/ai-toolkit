@@ -9,6 +9,7 @@
         "name": "spoke-tree:feature/22-demo+1700000000",
         "sessionId": "feature/22-demo+1700000000",
         "timestamp": "2026-01-02T00:00:00Z",
+        "environment": "production",
         "metadata": {
           "schema_rev": 2
         }
@@ -348,6 +349,7 @@
         "name": "spoke-cycle:feature/22-demo+1700000000",
         "sessionId": "feature/22-demo+1700000000",
         "timestamp": "2026-01-02T00:00:00Z",
+        "environment": "production",
         "metadata": {
           "schema_rev": 2
         }

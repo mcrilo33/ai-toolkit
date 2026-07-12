@@ -253,6 +253,48 @@ if command -v wt_gh_set_status_label >/dev/null 2>&1 \
   fi
 fi
 
+# --- warned-record pings (issue #241) -----------------------------------------
+# The /afk answerer now WARNS-and-continues instead of parking a spoke as blocked at a
+# converted stop site: each taken decision writes a durable warned-<issue>.txt record under
+# the state dir (mirrors gate-broker.sh's _afk_state_dir — AFK_STATE_DIR wins, else the
+# git-common-dir default). Surface these as OS notifications — and, UNLIKE the once-deduped
+# blocked ping, RE-FIRE on an interval (HUB_NOTIFY_WARN_REPEAT, default 600s) so a standing
+# warning stays loud until the operator post-adjusts it. Never afk-suppressed: the warning IS
+# the review surface, and #241's auth path relies on the loud REPEAT. The per-issue last-fire
+# epoch persists in its own seen-set (HUB_NOTIFY_WARN_SEEN_FILE); HUB_NOTIFY_NOW pins the
+# clock for tests.
+warn_state_dir="${AFK_STATE_DIR:-$common_dir/ai-toolkit-afk}"
+warn_seen_file="${HUB_NOTIFY_WARN_SEEN_FILE:-$common_dir/hub-notify-warn-seen}"
+warn_repeat="${HUB_NOTIFY_WARN_REPEAT:-600}"
+case "$warn_repeat" in '' | *[!0-9]*) warn_repeat=600 ;; esac
+warn_now="${HUB_NOTIFY_NOW:-$(date +%s)}"
+case "$warn_now" in '' | *[!0-9]*) warn_now="$(date +%s)" ;; esac
+if [ -d "$warn_state_dir" ]; then
+  warn_seen=""
+  [ -f "$warn_seen_file" ] && warn_seen="$(cat "$warn_seen_file" 2>/dev/null)"
+  warn_persist=""
+  for wf in "$warn_state_dir"/warned-*.txt; do
+    [ -f "$wf" ] || continue
+    wbase="${wf##*/}"; wissue="${wbase#warned-}"; wissue="${wissue%.txt}"
+    case "$wissue" in '' | *[!0-9]*) continue ;; esac
+    wreason="$(cut -f2- "$wf" 2>/dev/null | head -n1)"
+    [ -n "$wreason" ] || wreason="auto-decision taken — review"
+    last="$(printf '%s\n' "$warn_seen" | awk -v i="$wissue" '$1 == i { print $2 }' | head -n1)"
+    case "$last" in '' | *[!0-9]*) last="" ;; esac
+    if [ -z "$last" ] || [ "$(( warn_now - last ))" -ge "$warn_repeat" ]; then
+      notify "#$wissue WARNING — $wreason"
+      last="$warn_now"
+    fi
+    warn_persist+="$wissue $last"$'\n'
+  done
+  mkdir -p "$(dirname "$warn_seen_file")" 2>/dev/null || true
+  if [ -n "$warn_persist" ]; then
+    printf '%s' "$warn_persist" >"$warn_seen_file" 2>/dev/null || true
+  else
+    : >"$warn_seen_file" 2>/dev/null || true
+  fi
+fi
+
 # /afk drain-complete (issue #150): hub-afk writes <git-common-dir>/.afk-drain-complete
 # with the landed count when a drain finishes (see hub-afk.sh _afk_emit_drain_complete).
 # Fire ONE "/afk drain complete — <k> landed" ping and consume the file, so a completed
