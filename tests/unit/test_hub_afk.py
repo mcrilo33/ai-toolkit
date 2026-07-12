@@ -3004,11 +3004,16 @@ def test_run_with_heartbeat_fg_propagates_exit_and_stamps(tmp_path: Path) -> Non
 
 
 def test_no_arg_resume_refuses_when_a_supervisor_is_live(tmp_path: Path) -> None:
-    # A no-arg resume (a watchdog respawn or a manual re-run) must refuse when a supervisor is
-    # already live — a second one clobbers the per-run state (#202 B).
+    # A no-arg resume (a watchdog respawn or a manual re-run) must refuse when a DIFFERENT
+    # supervisor is already live — a second one clobbers the per-run state (#202 B). A genuine
+    # stacked resume is a distinct process, so the live heartbeat pid is spawned separately
+    # (NOT $$, which the #250 self-exemption reads as self).
     state = _armed_state(tmp_path, "drain")
     hb = tmp_path / "heartbeat"
-    expr = f'printf "%s 1700000000\\n" "$$" > "{hb}"; main'
+    expr = (
+        f'sleep 30 & other=$!; printf "%s 1700000000\\n" "$other" > "{hb}"; '
+        'main; rc=$?; kill "$other" 2>/dev/null; exit $rc'
+    )
 
     result = _call(
         expr,
@@ -3022,6 +3027,33 @@ def test_no_arg_resume_refuses_when_a_supervisor_is_live(tmp_path: Path) -> None
 
     assert result.returncode == 2, "a live supervisor must refuse a stacked no-arg resume"
     assert "refusing to resume" in result.stderr, result.stderr
+
+
+def test_no_arg_resume_exempts_self_when_heartbeat_pid_is_own(tmp_path: Path) -> None:
+    # #250: a self-update deploy re-execs THIS process in place (exec preserves $$), so the
+    # live heartbeat holds our OWN pid. The resume guard must EXEMPT that — a supervisor is
+    # never its own "second supervisor" — else the self-deploy resume would refuse itself.
+    state = _armed_state(tmp_path, "drain")
+    hb = tmp_path / "heartbeat"
+    # afk_arm_superseded stubbed true so the loop breaks immediately after the guard is passed.
+    expr = (
+        f'printf "%s 1700000000\\n" "$$" > "{hb}"; '
+        "afk_arm_superseded() { return 0; }; main; echo RC=$?"
+    )
+
+    result = _call(
+        expr,
+        env={
+            "AFK_STATE": str(state),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_NOW": "1700000060",
+            "AFK_ARM_PRECHECK": "1",
+            "AFK_SELF_COPY": "0",
+        },
+    )
+
+    assert "RC=0" in result.stdout, result.stdout
+    assert "refusing to resume" not in result.stderr, result.stderr
 
 
 def test_auto_land_keeps_heartbeat_fresh_during_slow_land(spoke_repo: Path, tmp_path: Path) -> None:
@@ -8246,3 +8278,70 @@ def test_self_deploy_failed_sync_fails_safe(tmp_path: Path) -> None:
     assert not exec_log.exists(), "a failed re-sync must NOT exec the new code"
     assert not (statedir / "self-update-pending").exists()
     assert "aborted" in (statedir / "decision-journal.jsonl").read_text()
+
+
+# ── #250: afk self-update — WIRING (the main loop deploys at the tick boundary) ─
+# A tick whose auto_land flags a self-update must trigger _afk_self_deploy at the tick
+# boundary — after the tick's work completes, never mid-tick.
+
+_SU_LOOP_NEUTER = (
+    "afk_arm_preconditions() { return 0; }; afk_telemetry_preflight() { return 0; }; "
+    "_afk_spawn_watchdog() { :; }; _afk_arm_inhibitor() { :; }; dispatch_batch() { :; }; "
+    "afk_done() { return 1; }; "  # never "done" — so the loop reaches the boundary deploy check
+)
+
+
+def test_main_loop_deploys_at_tick_boundary_when_flagged(tmp_path: Path) -> None:
+    # The tick (supervise_tick) flags a self-update; the boundary must then run _afk_self_deploy.
+    # The deploy stub records it fired and exits (the real one execs and never returns).
+    state = tmp_path / "state"
+    statedir = tmp_path / "sd"
+    deployed = tmp_path / "deployed"
+    hb = tmp_path / "hb"
+    expr = (
+        f"{_SU_LOOP_NEUTER}"
+        "supervise_tick() { _afk_mark_selfupdate_pending 236; }; "
+        f'_afk_self_deploy() {{ touch "{deployed}"; exit 0; }}; '
+        "main 30m"
+    )
+
+    _call(
+        expr,
+        env={
+            "AFK_STATE": str(state),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_ARM_PRECHECK": "0",
+            "AI_TOOLKIT_OTEL": "0",
+        },
+    )
+
+    assert deployed.exists(), "a tick that flags a self-update must deploy at the tick boundary"
+
+
+def test_main_loop_skips_deploy_when_not_flagged(tmp_path: Path) -> None:
+    # No self-update flagged ⇒ the boundary must NOT call _afk_self_deploy; the tick just sleeps.
+    state = tmp_path / "state"
+    statedir = tmp_path / "sd"
+    deployed = tmp_path / "deployed"
+    hb = tmp_path / "hb"
+    expr = (
+        f"{_SU_LOOP_NEUTER}"
+        "supervise_tick() { :; }; "  # tick flags nothing
+        f'_afk_self_deploy() {{ touch "{deployed}"; exit 0; }}; '
+        "afk_interruptible_sleep() { exit 0; }; "  # exit main after the first tick
+        "main 30m"
+    )
+
+    _call(
+        expr,
+        env={
+            "AFK_STATE": str(state),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(hb),
+            "AFK_ARM_PRECHECK": "0",
+            "AI_TOOLKIT_OTEL": "0",
+        },
+    )
+
+    assert not deployed.exists(), "no self-update flag ⇒ no deploy at the boundary"

@@ -80,6 +80,21 @@ running with no answerer. Two mechanisms close that gap (issue #107):
   clears the state, so it exits within one watchdog interval (`AFK_WATCHDOG_SECONDS`,
   default 60).
 
+## Self-update: the drain deploys its own code (issue #250)
+
+When a land merges a change to the supervisor's **own** code (`hub-afk.sh`,
+`gate-broker.sh`, the answerer rule, the sibling worktree/land/batch scripts), the running
+drain redeploys onto the new code with **zero operator commands** — no `off → sync →
+re-arm` recycle. After the land, the drain flags a self-update; at the **next tick
+boundary** (never mid-tick) it validates + smoke-tests the merged source, re-syncs the
+gitignored `.ai-toolkit/scripts`, then `exec`s itself in place as a no-arg resume onto the
+new code. `exec` preserves the pid, so `caffeinate` and the heartbeat survive untouched and
+the watchdog keeps reading `live`; the resume **re-adopts** in-flight spokes. A broken new
+version fails safe — the source is proven healthy **before** the re-sync, so the synced copy
+the watchdog respawns is never overwritten with broken code, and the drain stays on the old
+code with a loud warning. Every self-deploy is journaled. `AFK_SELFUPDATE_SCOPE` overrides
+the trigger set.
+
 ## Remote AFK (an always-on Mac)
 
 When you are away from the machine that can run the backlog, `/afk --remote` triggers the

@@ -60,6 +60,11 @@
 #                                — scaled to the 300s tick so the wedge threshold stays ~20min
 #                                (4x300s), not the ~50min a 120s-era default of 10 would stretch to
 #   AFK_DISPATCH_MAX_FAILURES=3  consecutive worktree-new.sh failures before an issue is blocked
+#   AFK_SELFUPDATE_SCOPE         basenames whose land triggers a self-update redeploy (#250);
+#                                default: the supervisor's own scripts + the afk-answering rule.
+#                                A supervisor-scope land re-syncs + re-execs the drain in place
+#                                onto the new code at the next tick boundary (see the self-update
+#                                block below); AFK_SYNC_CMD / AFK_SELFUPDATE_SMOKE_CMD are seams.
 #   AFK_ARM_PRECHECK=1           arm-precondition gate (=0 skips live/dirty/branch/gh-auth checks)
 #   AFK_AUTH_PROBE_CMD           auth probe: reap-time AND the #241 §9 per-tick auth-halt re-probe (default: a bounded headless claude no-op)
 #   CLAUDE_PROJECTS_DIR          transcript root (default: $HOME/.claude/projects)
@@ -2957,7 +2962,12 @@ main() {
     # a manual re-run). Refuse if a supervisor is ALREADY live — a second one clobbers the
     # per-run state (#202 B, the arm-precondition dedup extended to the resume path). The
     # arm path already refuses this via afk_arm_preconditions; AFK_ARM_PRECHECK=0 opts out.
-    if [ "${AFK_ARM_PRECHECK:-1}" != "0" ] && [ "$(afk_supervisor_state)" = "live" ]; then
+    # SELF-EXEMPTION (#250): a self-update deploy re-execs THIS process in place, so $$ is
+    # preserved and the heartbeat still holds our own pid — a supervisor is never its own
+    # "second supervisor". Exempt the resume when the live heartbeat pid == $$.
+    local resume_hb resume_pid; resume_hb="$(afk_read_heartbeat)"; resume_pid="${resume_hb%% *}"
+    if [ "${AFK_ARM_PRECHECK:-1}" != "0" ] && [ "$(afk_supervisor_state)" = "live" ] \
+       && [ "$resume_pid" != "$$" ]; then
       log "/afk: refusing to resume — a supervisor is already live (heartbeat pid running); run /afk --off first (a second supervisor clobbers per-run state)"
       return 2
     fi
@@ -3004,6 +3014,13 @@ main() {
     [ "$once" -eq 1 ] && break
     if afk_done "$(afk_read_state)" "$(afk_now)"; then
       log "/afk: done"; _afk_emit_drain_complete; afk_clear_state; break
+    fi
+    # Self-update at the tick boundary (#250): a supervisor-scope land this tick flagged a
+    # redeploy — deploy it now, never mid-tick. On success _afk_self_deploy execs this process
+    # in place onto the new code (never returns); on a fail-safe fallback it returns and the
+    # drain continues on the old code. Skipped for --once (a one-shot tick must not self-exec).
+    if [ "$once" -eq 0 ] && _afk_selfupdate_pending; then
+      _afk_self_deploy
     fi
     # Stamp AFTER the tick's work — including afk_done's up-to-AFK_PLANNER_TIMEOUT planner call,
     # which runs unstamped — so the epoch is fresh going into the idle sleep and a healthy idle
