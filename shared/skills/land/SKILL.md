@@ -28,6 +28,23 @@ worktrees — `bash .ai-toolkit/scripts/hub-status.sh` if the state is not alrea
 known. If the branch is `dirty` or `unpushed`, stop: the spoke is still working; landing
 verifies pushes, it never rescues them.
 
+### Pre-land review (pane-visible, logged, costed)
+
+Any agent you run before landing — a `/code-review`, a bug-scoper, a delta re-review —
+should go through the hub-agent helper so it runs on a trackable surface instead of
+invisibly inside your session (issue #245): a tmux window `hub:<label>` you can watch
+live, output teed to a log, a `hub-status` row while it runs, and its token cost attributed
+in Langfuse.
+
+```bash
+.ai-toolkit/scripts/hub-agent.sh review-<id> --purpose "pre-land review #<id>" \
+  -- claude -p "/code-review <id>"
+```
+
+The window closes on completion; the log survives at
+`.ai-toolkit/hub-agents/<label>.log`, and `hub-status.sh` lists the run under **Hub
+agents** while it is live. Read the review, then land.
+
 ### 2. Confirm, then run the landing script
 
 Restate what is about to happen (branch, merge target, teardown) and get a quick yes —
