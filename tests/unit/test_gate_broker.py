@@ -3728,7 +3728,13 @@ def test_permission_approve_journals_before_inject(spoke_repo: Path, tmp_path: P
     assert probe.read_text().strip() == "EXISTS", (
         "the decision must be journaled BEFORE the approve keystroke fires"
     )
-    assert journal.exists() and "reasoner APPROVED" in journal.read_text()
+    # The approve keystroke does not advance the transcript here, so delivery FAILS — the durable
+    # journal must record BOTH the decision and the delivery-failure distinction (#241 review).
+    journal_text = journal.read_text()
+    assert "reasoner APPROVED" in journal_text
+    assert "delivery FAILED" in journal_text, (
+        "a failed approval delivery must be journaled distinctly"
+    )
 
 
 def test_success_answer_journals_warn_and_reversibility(
@@ -3791,4 +3797,80 @@ def test_success_answer_routine_journals_file_only(
     assert not (statedir / "warned-5.txt").exists(), "a routine answer must NOT warn"
     assert not gh_log.exists() or "issue comment" not in gh_log.read_text(), (
         "a routine answer must NOT post a gh comment"
+    )
+
+
+def test_ceiling_mechanical_approve_is_paced_not_every_tick(spoke_repo: Path, tmp_path: Path) -> None:
+    # #241 review (regression for the N1 fix): a mechanically-auto-approvable permission that keeps
+    # re-appearing at the SAME (tip, park-signature) — the approve keypress doesn't advance it — is
+    # PACED by the ceiling backoff once exhausted, NOT re-warned + re-approved every tick.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    keylog = tmp_path / "keys.log"
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    (pd / "session.jsonl").write_text(
+        json.dumps(_bash_tool_record("git reset -q; git add tests/x.py")) + "\n"  # classify APPROVE
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f'  send-keys) case "$*" in *" 1") printf "1\\n" >> "{keylog}" ;; esac ;;\n'
+        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        "esac\nexit 0\n"  # the approve never advances the transcript → the dialog re-appears
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text('#!/usr/bin/env bash\n:\n')
+    ready_stub.chmod(0o755)
+    base = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE_DIR": str(statedir),
+        "SPOKE_READY": str(ready_stub),
+        "AFK_REANSWER_CEILING": "1",
+        "AFK_WARN_BACKOFF_BASE": "60",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+    }
+    # Five ticks; the last three are past the 60s backoff window opened at tick 2.
+    for now in ("1000", "1000", "1100", "1100", "1100"):
+        _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env={**base, "AFK_NOW": now})
+
+    approves = keylog.read_text().count("1") if keylog.exists() else 0
+    assert approves <= 2, f"a re-appearing auto-approve must be backoff-paced, not every tick; fired {approves}"
+
+
+def test_success_answer_case_insensitive_reversibility_stays_routine(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # #241 review: a routine answer whose class is 'Reversible' (capitalized / punctuated) must be
+    # read as reversible — routine, file-only journal, NO loud warned record.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    fake_bin = tmp_path / "bin"
+    jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+    _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": "printf 'REVERSIBILITY: Reversible.\\nANSWER: use Redis'",
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    assert (statedir / "decision-journal.jsonl").exists(), "a routine answer still journals (file)"
+    assert not (statedir / "warned-5.txt").exists(), (
+        "a 'Reversible.' class must be read as reversible → routine, not a loud warned record"
     )
