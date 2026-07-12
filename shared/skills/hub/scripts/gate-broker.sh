@@ -534,8 +534,10 @@ PYEOF
 # --- slot state ---------------------------------------------------------------
 # slot_state <wt_path> <issue> -> done|waiting|reap|busy.
 #   done    — a TERMINAL marker (ready/accept/blocked) at the branch tip.
-#   waiting — parked on a question / gate (auto-answer it; never reaped).
-#   reap    — over the wall-clock ceiling, or idle past AFK_IDLE_MINUTES with no marker.
+#   waiting — parked on a question / gate / permission dialog (auto-answer it; never reaped,
+#             regardless of ceiling — park detection precedes both reap verdicts, #246).
+#   reap    — over the wall-clock ceiling, or idle past AFK_IDLE_MINUTES, AND with no
+#             detectable pending park (a hung/working spoke, not a park).
 #   busy    — actively working (or just spawned, no transcript yet).
 slot_state() {
   local wt_path="$1" issue="$2" tip marker kind age
@@ -568,11 +570,19 @@ slot_state() {
   # Ledger progress (a tip advance since the last tick) refreshes the ceiling before
   # it is measured — a revived spoke is not re-reaped off its stale dispatch epoch.
   _afk_note_tip_progress "$wt_path" "$issue"
-  if _spoke_over_any_ceiling "$issue" "$(afk_now)"; then printf 'reap\n'; return; fi
+  # Park detection precedes BOTH reaps (#246): an answerable park — a pending question or a
+  # permission dialog — is serviced by the answer lane, so it classifies `waiting` however long
+  # it has been parked, never `reap`. Pre-#246 the wall-clock ceiling reap ran first, so an
+  # over-ceiling permission-parked spoke was reaped + revived (claude --continue), which only
+  # re-raised the identical dialog: parked -> reaped -> revived -> parked forever. The doom-loop a
+  # genuinely-stuck dialog could form is bounded NOT here but in the answer lane
+  # (broker_service_gate's _broker_reanswer_exhausted / AFK_REANSWER_CEILING + the _afk_warned_arm
+  # backoff, escalating to blocked/<issue> on a real judgment call), so park-wins is unconditional.
   if [ -n "$(extract_pending_question "$wt_path")" ]; then printf 'waiting\n'; return; fi
   # A pending permission dialog (a CC confirmation prompt, no transcript entry) is decided by
-  # the supervisor's classifier, so it waits — never reaped as idle (#149).
+  # the supervisor's classifier, so it waits — never reaped as idle (#149) or over-ceiling (#246).
   if _permission_pending "$wt_path"; then printf 'waiting\n'; return; fi
+  if _spoke_over_any_ceiling "$issue" "$(afk_now)"; then printf 'reap\n'; return; fi
   age="$(_spoke_idle_seconds "$wt_path" "$issue")"
   if [ -n "$age" ] && [ "$age" -gt $(( AFK_IDLE_MINUTES * 60 )) ]; then printf 'reap\n'; return; fi
   printf 'busy\n'
@@ -2237,22 +2247,24 @@ PYEOF
   case $? in 0) return 0 ;; 3) return 1 ;; *) return 2 ;; esac
 }
 
-# _user_turn_appended <wt_path> <sizes> -> did a GENUINE typed reply land in transcript bytes
-# appended after the <sizes> snapshot? The "the spoke MOVED ON" signal (#241 §4): a human/self
-# reply is a type:"user" record with promptSource=="typed" and not isMeta — the SAME filter
-# _gate_answer_landed uses to reject SYNTHETIC user turns (tool_results, <system-reminder> /
-# <task-notification>, skill/meta, SDK/system), which are non-turn writes that only bump the
-# mtime while the spoke stays parked (the #240 hang class). The staleness recompute gates on the
-# DEFINITE "no genuine reply" (rc 1); rc 0 (a typed reply landed) or rc 2 (cannot tell) both fall
-# to the #89-safe drop. rc 0 found, rc 1 none, rc 2 unavailable (no python3 / no project dir / crash).
-_user_turn_appended() {
-  local wt="$1" sizes="$2" dir
+# _scan_appended_turns <wt_path> <sizes> <mode> -> scan the transcript bytes APPENDED after the
+# <sizes> snapshot for a matching record. <mode> selects the filter:
+#   typed    — ONLY a genuine typed prompt submission (type:"user", promptSource=="typed", not
+#              isMeta); SYNTHETIC harness user turns (tool_results, <system-reminder> /
+#              <task-notification>, skill/meta, SDK/system) do NOT match — the #240 non-turn class.
+#   activity — the above OR the spoke's OWN assistant work (an assistant record with a tool_use,
+#              e.g. Edit/Write/Bash, or non-empty text).
+# rc 0 a match landed, rc 1 none, rc 2 unavailable (no python3 / no project dir / interpreter crash).
+# Only appended regions are read (offset from <sizes>); a rotated/truncated file rescans from 0.
+_scan_appended_turns() {
+  local wt="$1" sizes="$2" mode="$3" dir
   dir="$(_spoke_project_dir "$wt")"
   [ -d "$dir" ] || return 2
   command -v python3 >/dev/null 2>&1 || return 2
-  _AFK_DIR="$dir" _AFK_SIZES="$sizes" python3 2>/dev/null <<'PYEOF'
+  _AFK_DIR="$dir" _AFK_SIZES="$sizes" _AFK_MODE="$mode" python3 2>/dev/null <<'PYEOF'
 import glob, json, os, sys
 
+mode = os.environ.get("_AFK_MODE", "activity")
 offsets = {}
 for line in os.environb.get(b"_AFK_SIZES", b"").splitlines():
     size, _, path = line.partition(b"\t")
@@ -2261,12 +2273,45 @@ for line in os.environb.get(b"_AFK_SIZES", b"").splitlines():
             offsets[os.fsdecode(path)] = int(size)
         except ValueError:
             pass
+
+
+def matches(record):
+    if not isinstance(record, dict):
+        return False
+    kind = record.get("type")
+    # A genuine typed human/self reply — shared by both modes (mirrors _gate_answer_landed).
+    if kind == "user" and record.get("promptSource") == "typed" and not record.get("isMeta"):
+        return True
+    if mode == "typed":
+        return False
+    # activity mode also counts the spoke's OWN assistant work: a tool_use (it ran Edit/Write/
+    # Bash) or a non-empty text turn. The isolated reasoner never writes the live transcript.
+    if kind == "assistant":
+        msg = record.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    return True
+                if block.get("type") == "text" and (block.get("text") or "").strip():
+                    return True
+    return False
+
+
 for path in glob.glob(os.path.join(os.environ["_AFK_DIR"], "*.jsonl")):
     try:
         with open(path, "rb") as fh:
             offset = offsets.get(path, 0)
             fh.seek(0, 2)
-            if offset > fh.tell():  # rotated/truncated since the snapshot: rescan
+            if offset > fh.tell():  # rotated/truncated since the snapshot
+                # typed mode fails toward a from-0 rescan (fail-toward-pre-#201). activity mode must
+                # NOT: a from-0 scan would match the PRE-park record (an AskUserQuestion IS an
+                # assistant tool_use) and mask a real escape (rc 0 -> drop). Skip the file instead,
+                # so the caller reads "no activity" (rc 1) and fails SAFE (voids) on a lost boundary.
+                if mode == "activity":
+                    continue
                 offset = 0
             fh.seek(offset)
             appended = fh.read()
@@ -2277,17 +2322,28 @@ for path in glob.glob(os.path.join(os.environ["_AFK_DIR"], "*.jsonl")):
             record = json.loads(line)
         except Exception:
             continue
-        # ONLY a genuine typed prompt submission is a reply — synthetic harness user turns
-        # (tool_results, system-reminders/notifications, skill/meta, SDK/system) are not, and
-        # must read as a non-turn write so §4 recomputes rather than strands (mirrors
-        # _gate_answer_landed's filter).
-        if (isinstance(record, dict) and record.get("type") == "user"
-                and record.get("promptSource") == "typed" and not record.get("isMeta")):
+        if matches(record):
             sys.exit(0)
 sys.exit(3)
 PYEOF
   case $? in 0) return 0 ;; 3) return 1 ;; *) return 2 ;; esac
 }
+
+# _user_turn_appended <wt_path> <sizes> -> did a GENUINE typed reply land in transcript bytes
+# appended after the <sizes> snapshot? The "the spoke MOVED ON" signal (#241 §4). The staleness
+# recompute gates on the DEFINITE "no genuine reply" (rc 1); rc 0 (a typed reply landed) or rc 2
+# (cannot tell) both fall to the #89-safe drop. rc 0 found, rc 1 none, rc 2 unavailable.
+_user_turn_appended() { _scan_appended_turns "$1" "$2" typed; }
+
+# _spoke_activity_appended <wt_path> <sizes> -> did a GENUINE spoke turn (a typed reply OR the
+# spoke's OWN assistant work) land in appended transcript bytes? The read-only void's #244
+# discriminator: a spoke that self-resumed mid-GREEN and edited its own tree ALWAYS leaves a turn
+# here, while the isolated reasoner (#237 cwd=snap, --no-session-persistence) never writes the live
+# transcript and a #240 non-turn bump / a HEAD-moving commit-escape is NOT a spoke turn. So a tree
+# diff with NO activity (rc 1) is a reasoner escape (VOID). rc 2 (cannot scan) is treated as a
+# breach too — fail SAFE, mirroring the unverifiable-fingerprint escalation. rc 0 found, rc 1 none,
+# rc 2 unavailable (no python3 / no project dir / crash).
+_spoke_activity_appended() { _scan_appended_turns "$1" "$2" activity; }
 
 # _answer_delivered <wt> <target> <text> <sizes> -> after _transcript_advanced
 # succeeded, decide whether the answer actually LEFT the composer (#201: an advance
@@ -2584,10 +2640,13 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
   fi
   log "→ answering #$issue (parked on input)"
   # Read-only guard (subtask B): fingerprint the LIVE worktree around the reason step.
-  # The reasoner gets read-only access (cwd=wt) to verify against real state; if the tree
-  # changed across the step it MUTATED a read-only worktree, so its answer is untrustworthy
-  # — void it and route to a human (escalate unattended / QCM attended), regardless of
-  # content. Detection is the hard guarantee independent of the LLM's tool-allowlist.
+  # Since #237 the reasoner runs in a throwaway snapshot COPY (cwd=snap), so its relative
+  # writes land in the copy and the live-tree fingerprint is a should-never-fire backstop —
+  # its one remaining true purpose is catching an ABSOLUTE-path escape (a reasoner tool
+  # writing `$wt/…` / `git -C $wt`, which bypasses cwd=snap). Detection is the hard guarantee
+  # independent of the LLM's tool-allowlist. #244: a live-tree diff during the step is now
+  # almost always the SPOKE's OWN concurrent edits (it self-resumed mid-GREEN), not the
+  # reasoner — so the void is gated on _spoke_activity_appended below.
   local fp_before; fp_before="$(_broker_worktree_fingerprint "$wt")"
   raw="$(run_answerer "$issue" "$question" "$wt")"; rc=$?
   if _broker_is_git_worktree "$wt" && [ -z "$fp_before" ]; then
@@ -2600,15 +2659,46 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
     return 0
   fi
   if ! _broker_worktree_unchanged "$wt" "$fp_before"; then
-    # Stamp the durable void marker FIRST so the backoff-paced void short-circuit (top of this
-    # function) throttles the mutating reasoner across ticks — the (tip, sig) ceiling can't,
-    # since the tree write perturbs it every tick. #241 §5: no longer terminal; warn + back off.
-    _broker_mark_voided "$issue"
-    log "  reasoner mutated the read-only worktree of #$issue — voiding its answer (backoff-paced; #241)"
-    # 'unknown' reversibility: the reasoner ESCAPED #237 snapshot isolation and wrote the LIVE
-    # tree — a should-never-fire event the morning review must be able to triage from the benign.
-    _broker_on_human_decision "$mode" "$wt" "$issue" \
-      "the gate reasoner mutated the read-only worktree — its answer is voided; review the live tree" unknown
+    # The live tree changed during the reason step. Since #237 the reasoner runs isolated, so
+    # this is one of two things — and once the tree moved under the answerer, its answer is
+    # derived from a stale tree and must NEVER be injected (#244 review): the tree-changed path
+    # ALWAYS returns here, so we never fall through to the ANSWER branch's recompute (which would
+    # re-baseline fp_before and inject over the mutated tree).
+    # Attribute the diff by the SPOKE's own transcript, not the tree: the spoke's own edits always
+    # leave a genuine turn (a typed reply or its own assistant tool_use), while the isolated
+    # reasoner writes nothing to the live transcript and a #240 non-turn bump / a HEAD-moving
+    # commit-escape leaves no turn. So NO activity + a tree diff (rc 1) is a reasoner escape.
+    _spoke_activity_appended "$wt" "$parked_sizes"; local act_rc=$?
+    if [ "$act_rc" -ne 0 ]; then
+      # We could NOT positively confirm the spoke did the edit — either NO genuine spoke turn
+      # landed (rc 1: the spoke was parked/idle, so the diff is a reasoner isolation escape via an
+      # absolute-path write / git -C $wt), OR the transcript is unreadable (rc 2: no python3 / no
+      # project dir). Fail SAFE and VOID in both, mirroring the unverifiable-fingerprint escalation
+      # above (never trust an unverifiable read-only claim) — robust to a #240 non-turn mtime bump
+      # and to a commit-escape that moves HEAD off the gate tag (neither is a spoke turn), the two
+      # masks _still_parked_same missed. Stamp the durable void marker FIRST so the top-of-function
+      # backoff short-circuit paces the mutating reasoner across ticks — the (tip, sig) ceiling
+      # can't, since the tree write perturbs it every tick. #241 §5: no longer terminal; warn+back off.
+      _broker_mark_voided "$issue"
+      log "  reasoner mutated the read-only worktree of #$issue — voiding its answer (backoff-paced; #241)"
+      # 'unknown' reversibility: the reasoner ESCAPED #237 snapshot isolation and wrote the LIVE
+      # tree — a should-never-fire event the morning review must triage from the benign.
+      _broker_on_human_decision "$mode" "$wt" "$issue" \
+        "the gate reasoner mutated the read-only worktree — its answer is voided; review the live tree" unknown
+      return 0
+    fi
+    # act_rc 0: a genuine spoke turn landed — the spoke self-resumed mid-GREEN and is editing its
+    # own tree (the #234 false-void), so the diff is the spoke's own work, not the reasoner. Do NOT
+    # void: no gate-voided marker, no blocked/<issue> on an actively-working spoke. The answer is
+    # still derived from a tree that changed under it, so DROP it, never inject (a recompute would
+    # re-baseline the fingerprint and inject the stale answer mid-turn, #89). A fresh park next tick
+    # is serviced anew.
+    # KNOWN LIMITS (accepted, both non-terminal under #241's warn+backoff): a reasoner escape that
+    # coincides with genuine spoke activity in the SAME window is attributed to the spoke and not
+    # voided — only a per-tool-call audit of the reasoner (the deferred option c) could separate a
+    # combined whole-tree diff; and a self-resume whose only appended record is a tool_result (its
+    # tool_use flushed just before the parked_sizes snapshot) reads as no-activity and can false-void.
+    log "  #$issue's live tree changed while the spoke was active — dropping the stale answer (#244)"
     return 0
   fi
   # The answerer is the supervisor's own `claude`; if its credentials are dead, every

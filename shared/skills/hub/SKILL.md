@@ -47,6 +47,9 @@ It reports, read-only:
   `idle Nm`, and `⚠ WAITING ON INPUT` is appended when the spoke is blocked on an
   unanswered question; `todos: none` means the spoke never seeded a ledger of either
   kind — that absence is signal, since kickoffs mandate one.
+- **Hub agents** — live hub-side agent runs (pre-land reviews, bug-scopers, delta
+  re-reviews) dispatched through `hub-agent.sh`, listed as `hub:<label> · <purpose> ·
+  <age> · <log>`. A run drops off the moment it finishes; `(none running)` when idle.
 - **Open issues** — flagged `worktree active` or `no worktree` so you can see what is
   unstarted.
 
@@ -55,6 +58,23 @@ marker (a git tag the spoke pushes after its FINAL subtask) points at the branch
 otherwise it reads `pushed (in progress)` — the spoke is between subtasks and a
 per-subtask push must not be mistaken for a finished issue. Ad-hoc/express branches
 (non-numbered slug) need no marker — their single push IS completion.
+
+### Run hub-side agents on a trackable surface
+
+Every unit of agent work should run somewhere the operator can watch it. Spokes already
+do (tmux window + hub-status row + Langfuse session); hub-side agents — pre-land
+reviews, bug-scopers, delta re-reviews — otherwise run invisibly inside your session.
+Dispatch them through the helper instead (issue #245):
+
+```bash
+.ai-toolkit/scripts/hub-agent.sh <label> --purpose "<one-line purpose>" -- <command>
+```
+
+It opens a tmux window `hub:<label>` (watchable live, closes on completion), tees output
+to `.ai-toolkit/hub-agents/<label>.log`, adds a **Hub agents** row to `hub-status.sh`
+while it runs, and launches the agent with the native-OTel prefix so its token cost lands
+in Langfuse. Without tmux it degrades to an inline foreground run. Use it for
+`claude -p "/code-review <id>"` before a manual land and for bug-scoper dispatches.
 
 ### Proactive ready-to-land watch (optional)
 

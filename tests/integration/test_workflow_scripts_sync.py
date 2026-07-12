@@ -65,6 +65,10 @@ SOURCES["hub-afk.sh"] = HUB_SCRIPTS_DIR / "hub-afk.sh"
 # to resolve log()/afk_now()/broker_service_gate.
 SOURCES["gate-broker.sh"] = HUB_SCRIPTS_DIR / "gate-broker.sh"
 SOURCES["batch-plan.sh"] = HUB_SCRIPTS_DIR / "batch-plan.sh"
+# The hub-side agent dispatcher (issue #245) ships alongside its siblings so the
+# land/hub skills' `.ai-toolkit/scripts/hub-agent.sh` references resolve in a
+# synced target — otherwise pre-land reviews/scopers have no trackable surface.
+SOURCES["hub-agent.sh"] = HUB_SCRIPTS_DIR / "hub-agent.sh"
 # Co-installed so the worktree scripts can source it as a sibling for lifecycle
 # telemetry (it also lives under .claude/hooks/lib/ for the hooks).
 SOURCES["telemetry.sh"] = REPO_ROOT / "shared" / "hooks" / "lib" / "telemetry.sh"
