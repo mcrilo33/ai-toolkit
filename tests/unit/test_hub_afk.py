@@ -8492,3 +8492,26 @@ def test_watchdog_guarded_respawn_escalates_on_crashloop(tmp_path: Path) -> None
     assert not respawned.exists(), "a crash-loop must NOT respawn"
     assert "CRASH-LOOP" in result.stderr, result.stderr
     assert "crash-loop guard" in (statedir / "decision-journal.jsonl").read_text()
+
+
+def test_watchdog_crashloop_escalation_debounces(tmp_path: Path) -> None:
+    # #250 review WARNING: a tripped guard must escalate ONCE per episode, not every tick —
+    # two consecutive tripped calls journal a single crash-loop line, not two.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "respawn-log").write_text("1000\n")  # already at the limit within the window
+    expr = "_afk_watchdog_guarded_respawn wedged; _afk_watchdog_guarded_respawn wedged; true"
+
+    _call(
+        expr,
+        env={
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_RESPAWN_MAX": "1",
+            "AFK_RESPAWN_WINDOW": "300",
+            "AFK_NOW": "1000",
+            "AFK_JOURNAL_GH_COMMENT": "0",
+        },
+    )
+
+    journal = (statedir / "decision-journal.jsonl").read_text()
+    assert journal.count("crash-loop guard tripped") == 1, "escalation must debounce to once"

@@ -2312,9 +2312,10 @@ _afk_selfupdate_fail() {
 # (-w $$, #242) and the heartbeat pid survive untouched (the watchdog keeps reading `live`), and
 # a no-arg launch re-adopts the in-flight spokes (dispatch_batch skips them). On success the exec
 # never returns; every failure path falls back to the old code via _afk_selfupdate_fail.
-# UPGRADE: a version that passes --help but dies only in the drain loop still relies on the
-# watchdog to respawn it — add a watchdog crash-loop backoff to bound that residual (as today's
-# manual-sync-broken-code risk already is).
+# A version that passes --help but dies only in the drain loop is caught downstream by the
+# watchdog crash-loop guard (_afk_watchdog_guarded_respawn), which halts respawns + escalates
+# loudly rather than spinning. UPGRADE: keep a pre-deploy backup of the synced hub-afk.sh and
+# auto-roll-back on a tripped guard, so the drain self-heals instead of halting for a human.
 # _afk_selfupdate_prepare <root> -> the returning (non-exec) part of a self-deploy: validate +
 # smoke the source, then re-sync. Split out so _afk_self_deploy can run it UNDER the heartbeat
 # stamper (#250 review finding 4): validate+smoke+resync can take up to ~150s, and with no
@@ -2376,7 +2377,12 @@ _afk_self_deploy() {
 : "${AFK_RESPAWN_MAX:=5}"
 : "${AFK_RESPAWN_WINDOW:=300}"
 _afk_respawn_log_file() { printf '%s\n' "$(_afk_state_dir)/respawn-log"; }
-_afk_clear_respawn_log() { rm -f "$(_afk_respawn_log_file)" 2>/dev/null || true; }
+# The tripped-marker debounces the loud escalation to the TRANSITION into a crash-loop, so a
+# tripped guard does not re-journal + re-spawn gh every watchdog tick (#250 review WARNING).
+_afk_respawn_tripped_marker() { printf '%s\n' "$(_afk_state_dir)/respawn-guard-tripped"; }
+_afk_clear_respawn_log() {
+  rm -f "$(_afk_respawn_log_file)" "$(_afk_respawn_tripped_marker)" 2>/dev/null || true
+}
 # _afk_respawn_allowed -> record this respawn and return true when the respawn RATE is under the
 # limit; false (a crash-loop) once AFK_RESPAWN_MAX or more respawns fell within the last
 # AFK_RESPAWN_WINDOW seconds. Prunes entries older than the window, so a supervisor that stops
@@ -2405,13 +2411,22 @@ _afk_respawn_allowed() {
 # _afk_watchdog_guarded_respawn <reason> -> respawn UNLESS the rate shows a crash-loop; on a
 # crash-loop, escalate loudly + journal and decline. Returns nonzero when it declined.
 _afk_watchdog_guarded_respawn() {
+  local trip; trip="$(_afk_respawn_tripped_marker)"
   if _afk_respawn_allowed; then
+    rm -f "$trip" 2>/dev/null || true   # recovered — re-arm the one-shot escalation
     _afk_watchdog_respawn
     return 0
   fi
-  log "/afk watchdog: CRASH-LOOP — the supervisor respawned >= ${AFK_RESPAWN_MAX:-5} times in ${AFK_RESPAWN_WINDOW:-300}s ($1); halting respawns. Likely a self-deployed version that dies in the drain loop. Run /afk --off, fix the code, and re-arm."
-  broker_journal_decision self-update self-deploy \
-    "watchdog crash-loop guard tripped ($1): supervisor respawned too fast — halting respawns (likely a bad self-deploy in the drain loop). Needs a human." irreversible
+  # Escalate loudly ONCE per crash-loop episode (the transition into the tripped state), not on
+  # every tick — else an unattended window re-journals + re-spawns gh ~every AFK_WATCHDOG_SECONDS
+  # for hours (#250 review WARNING). A later allowed respawn clears the marker so a fresh episode
+  # re-escalates.
+  if [ ! -f "$trip" ]; then
+    : > "$trip" 2>/dev/null || true
+    log "/afk watchdog: CRASH-LOOP — the supervisor respawned >= ${AFK_RESPAWN_MAX:-5} times in ${AFK_RESPAWN_WINDOW:-300}s ($1); halting respawns. Likely a self-deployed version that dies in the drain loop. Run /afk --off, fix the code, and re-arm."
+    broker_journal_decision self-update self-deploy \
+      "watchdog crash-loop guard tripped ($1): supervisor respawned too fast — halting respawns (likely a bad self-deploy in the drain loop). Needs a human." irreversible
+  fi
   return 1
 }
 
