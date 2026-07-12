@@ -1164,7 +1164,9 @@ broker_warn_continue() {
   local wt="$1" issue="$2" park="$3" decision="$4" rev="${5:-unknown}"
   broker_warn "$issue" "$decision"
   broker_journal_decision "$issue" "$park" "$decision" "$rev"
-  _afk_warned_arm "$issue"
+  # Skip the arm when the due-retry fall-through already armed this tick (#241 review N3) so the
+  # backoff advances exactly one step per due-retry; a first-time escalation (flag unset) arms.
+  [ "${_AFK_ARMED_THIS_TICK:-}" = "$issue" ] || _afk_warned_arm "$issue"
   afk_emit_decision "$wt" warn
   return 0
 }
@@ -1956,7 +1958,9 @@ _reason_permission_record() {
   local wt="$1" issue="$2" decision="$3" rev="$4"
   broker_warn "$issue" "$decision"
   _broker_journal_gh_comment "$issue" permission "$decision" "$rev"
-  _afk_warned_arm "$issue"
+  # Skip the arm when the due-retry fall-through already armed this tick (#241 review N3) so the
+  # backoff advances exactly one step per due-retry; a first-time decision (flag unset) arms.
+  [ "${_AFK_ARMED_THIS_TICK:-}" = "$issue" ] || _afk_warned_arm "$issue"
   afk_emit_decision "$wt" warn
 }
 
@@ -2014,12 +2018,16 @@ path to tell the spoke>'."
     APPROVE*)
       # #241 review B1: journal the decision to the FILE BEFORE approve_permission delivers the
       # keypress (durable if the inject crashes/races the command it authorized) — file-only, so
-      # no network gh-comment sits on the spoke's unblock critical path. Record the OUTCOME after.
-      _broker_journal_line "$issue" permission "reasoner APPROVED: $cmd" "${rev:-unknown}"
+      # no network gh-comment sits on the spoke's unblock critical path. The pre-keypress line is
+      # PROVISIONAL ("APPROVING", present-continuous) so a per-record read can never mistake the
+      # in-flight intent for a delivered-and-ran approval; the OUTCOME line (delivered / FAILED)
+      # is written after (#241 review).
+      _broker_journal_line "$issue" permission "reasoner APPROVING (delivery pending): $cmd" "${rev:-unknown}"
       if approve_permission "$wt"; then
-        _reason_permission_record "$wt" "$issue" "reasoner APPROVED: $cmd" "${rev:-unknown}"
+        _broker_journal_line "$issue" permission "reasoner APPROVED (delivered): $cmd" "${rev:-unknown}"
+        _reason_permission_record "$wt" "$issue" "reasoner APPROVED (delivered): $cmd" "${rev:-unknown}"
       else
-        # A delivery failure is distinct on the DURABLE surfaces (a second journal line + gh),
+        # A delivery failure is distinct on the DURABLE surfaces (a FAILED journal line + gh),
         # so the morning review never reads an undelivered approval as "authorized and ran".
         _broker_journal_line "$issue" permission "reasoner APPROVED but delivery FAILED: $cmd" "${rev:-unknown}"
         _reason_permission_record "$wt" "$issue" "reasoner APPROVED but delivery FAILED: $cmd" "${rev:-unknown}"
@@ -2035,12 +2043,19 @@ path to tell the spoke>'."
         *) guidance="" ;;
       esac
       [ -n "$guidance" ] || guidance="Declined that command — take the reversible, in-scope path instead."
-      # B1 generalized to DENY (#241 review): journal to the FILE before _deny_permission injects,
-      # so the audit record survives a crash between the inject and the record. A decline-and
-      # -redirect is reversible by construction, so default the class to reversible.
-      _broker_journal_line "$issue" permission "reasoner DENIED ($cmd): $guidance" "${rev:-reversible}"
-      _deny_permission "$wt" "$guidance" || true
-      _reason_permission_record "$wt" "$issue" "reasoner DENIED ($cmd): $guidance" "${rev:-reversible}" ;;
+      # B1 generalized to DENY (#241 review): a provisional FILE line before _deny_permission
+      # injects (survives a crash between inject and record), then the OUTCOME. The delivery rc is
+      # NOT swallowed: a failed redirect (dead pane / failed inject) is journaled DISTINCTLY, so a
+      # review never reads a stuck spoke as cleanly redirected. Decline-and-redirect is reversible
+      # by construction, so default the class to reversible.
+      _broker_journal_line "$issue" permission "reasoner DENYING (redirect pending) ($cmd): $guidance" "${rev:-reversible}"
+      if _deny_permission "$wt" "$guidance"; then
+        _broker_journal_line "$issue" permission "reasoner DENIED ($cmd): $guidance" "${rev:-reversible}"
+        _reason_permission_record "$wt" "$issue" "reasoner DENIED ($cmd): $guidance" "${rev:-reversible}"
+      else
+        _broker_journal_line "$issue" permission "reasoner DENIED but redirect delivery FAILED ($cmd): $guidance" "${rev:-reversible}"
+        _reason_permission_record "$wt" "$issue" "reasoner DENIED but redirect delivery FAILED ($cmd): $guidance" "${rev:-reversible}"
+      fi ;;
   esac
 }
 
@@ -2491,6 +2506,12 @@ _broker_present_qcm() {
 # (or an answer we cannot inject) escalates rather than guessing.
 broker_service_gate() {
   local wt="$1" issue="$2" mode="${3:-unattended}" depth="${4:-0}" question orig_question raw rc decision kind text target was_gate=0 inject_diagnosed=0
+  # Per-tick single-arm guard (#241 review): the due-retry fall-through arms the backoff once so a
+  # MECHANICAL auto-approve (which neither arms nor clears) is still paced; when that same tick's
+  # terminal action self-arms (reasoned DENY, ESCALATE), it must NOT advance the counter a second
+  # time. Reset here (this global persists across the helper calls WITHIN one tick, not between
+  # ticks) so a reasoned path arms exactly once, matching the mechanical path.
+  _AFK_ARMED_THIS_TICK=""
   # Self-heal a stale gate tag (issue #204): if gate/<issue> is at the tip but the spoke
   # already resumed past its PLAN gate (a late / external / attended approval that never ran
   # the confirmed-inject path), consume the stale tag and stop — do NOT re-answer, and do NOT
@@ -2538,11 +2559,12 @@ broker_service_gate() {
     # regardless of the retry's OUTCOME. Not every fall-through terminal action re-arms — a
     # MECHANICAL classifier auto-approve (line ~2065) that leaves the same (tip, park-sig) intact
     # neither arms nor clears, so without this a re-appearing auto-approvable dialog would re-warn
-    # + re-run every tick (hub-review B1-cluster regression). A re-escalating retry then arms a
-    # second time via the chokepoint; that double-step only GROWS the backoff (strictly more
-    # conservative, bounded by the cap) — never shrinks it — so the throttle always holds.
-    _afk_warned_arm "$issue"
-    # fall through for one supervised retry; the arm above paces the next
+    # + re-run every tick (hub-review B1-cluster regression). Mark the tick as armed so a retry
+    # that DOES self-arm (reasoned DENY / ESCALATE) skips its own arm and the counter advances
+    # exactly ONE step per due-retry on every path — never two (#241 review N3). A success clears
+    # instead, which correctly wins over this arm.
+    _afk_warned_arm "$issue"; _AFK_ARMED_THIS_TICK="$issue"
+    # fall through for one supervised retry; the single arm above paces the next
   fi
   # A pending permission dialog is decided by the rules classifier, not the answerer (#149).
   if _permission_pending "$wt"; then _decide_permission "$wt" "$issue"; return; fi
@@ -2652,13 +2674,17 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
           # 'WARN:' note and 'REVERSIBILITY:' class off the reply. A WARN or a non-reversible class
           # is a NOTEWORTHY decision → a loud warned record + a journal line WITH a gh comment. A
           # routine reversible answer is a cheap FILE-ONLY journal line (no per-answer gh spam).
-          local ans_rev ans_warn
-          # Normalize the class: lowercase (portable, no bash-4 ${,,}) and keep the leading word,
-          # so 'Reversible' / 'reversible.' are not mis-read as non-reversible (#241 review).
-          ans_rev="$(parse_decision_field "$raw" REVERSIBILITY | tr '[:upper:]' '[:lower:]')"
-          ans_rev="${ans_rev%%[![:alpha:]]*}"
+          local ans_rev_raw ans_rev ans_warn
+          ans_rev_raw="$(parse_decision_field "$raw" REVERSIBILITY)"
+          # Normalize to the first ALPHABETIC RUN (portable lowercasing, tolerant of quotes,
+          # parens, or a trailing period around the class word) so 'Reversible', 'reversible.',
+          # and '"irreversible"' all classify correctly. Gate the warn on the RAW presence, not
+          # the normalized value: a present-but-non-reversible class (even one that normalizes to
+          # empty, e.g. all-punctuation noise) must fail SAFE to a loud warned record, never
+          # silently collapse to routine the way a bare trailing-strip did (#241 review).
+          ans_rev="$(printf '%s' "$ans_rev_raw" | tr '[:upper:]' '[:lower:]' | grep -oE '[a-z]+' | head -n1 || true)"
           ans_warn="$(parse_decision_field "$raw" WARN)"
-          if [ -n "$ans_warn" ] || { [ -n "$ans_rev" ] && [ "$ans_rev" != reversible ]; }; then
+          if [ -n "$ans_warn" ] || { [ -n "$ans_rev_raw" ] && [ "$ans_rev" != reversible ]; }; then
             # The clear above dropped the retry BACKOFF (progress); this warned record is the
             # DELIBERATE loud review flag for the noteworthy decision — not a stale leftover.
             broker_warn "$issue" "answered [${ans_rev:-unknown}]${ans_warn:+ — WARN: $ans_warn}"

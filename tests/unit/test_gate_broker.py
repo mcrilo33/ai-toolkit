@@ -3729,11 +3729,17 @@ def test_permission_approve_journals_before_inject(spoke_repo: Path, tmp_path: P
         "the decision must be journaled BEFORE the approve keystroke fires"
     )
     # The approve keystroke does not advance the transcript here, so delivery FAILS — the durable
-    # journal must record BOTH the decision and the delivery-failure distinction (#241 review).
+    # journal must record the PROVISIONAL pre-keypress intent and the delivery-failure distinctly,
+    # and must NOT contain a 'delivered' line that would read as authorized-and-ran (#241 review).
     journal_text = journal.read_text()
-    assert "reasoner APPROVED" in journal_text
+    assert "APPROVING (delivery pending)" in journal_text, (
+        "the pre-keypress line must be provisional, not a completed-approval record"
+    )
     assert "delivery FAILED" in journal_text, (
         "a failed approval delivery must be journaled distinctly"
+    )
+    assert "APPROVED (delivered)" not in journal_text, (
+        "a failed delivery must never leave a 'delivered' record a reader takes as ran"
     )
 
 
@@ -3800,7 +3806,9 @@ def test_success_answer_routine_journals_file_only(
     )
 
 
-def test_ceiling_mechanical_approve_is_paced_not_every_tick(spoke_repo: Path, tmp_path: Path) -> None:
+def test_ceiling_mechanical_approve_is_paced_not_every_tick(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
     # #241 review (regression for the N1 fix): a mechanically-auto-approvable permission that keeps
     # re-appearing at the SAME (tip, park-signature) — the approve keypress doesn't advance it — is
     # PACED by the ceiling backoff once exhausted, NOT re-warned + re-approved every tick.
@@ -3826,7 +3834,7 @@ def test_ceiling_mechanical_approve_is_paced_not_every_tick(spoke_repo: Path, tm
     )
     (fake_bin / "tmux").chmod(0o755)
     ready_stub = tmp_path / "spoke-ready.sh"
-    ready_stub.write_text('#!/usr/bin/env bash\n:\n')
+    ready_stub.write_text("#!/usr/bin/env bash\n:\n")
     ready_stub.chmod(0o755)
     base = {
         "CLAUDE_PROJECTS_DIR": str(projects),
@@ -3844,7 +3852,9 @@ def test_ceiling_mechanical_approve_is_paced_not_every_tick(spoke_repo: Path, tm
         _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env={**base, "AFK_NOW": now})
 
     approves = keylog.read_text().count("1") if keylog.exists() else 0
-    assert approves <= 2, f"a re-appearing auto-approve must be backoff-paced, not every tick; fired {approves}"
+    assert approves <= 2, (
+        f"a re-appearing auto-approve must be backoff-paced, not every tick; fired {approves}"
+    )
 
 
 def test_success_answer_case_insensitive_reversibility_stays_routine(
@@ -3874,3 +3884,107 @@ def test_success_answer_case_insensitive_reversibility_stays_routine(
     assert not (statedir / "warned-5.txt").exists(), (
         "a 'Reversible.' class must be read as reversible → routine, not a loud warned record"
     )
+
+
+def test_permission_deny_delivery_failure_journaled_distinctly(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #241 review (CONFIRMED): the DENY path must NOT swallow the redirect inject rc. When the
+    # decline-and-redirect fails to reach the spoke (dead pane / failed inject), the durable
+    # journal must record the failure DISTINCTLY — never as a clean, delivered denial.
+    destructive = "git reset --hard origin/main"  # irreversible -> reasoner denies
+    env = _perm_env(
+        tmp_path,
+        spoke_repo,
+        destructive,
+        "printf 'REVERSIBILITY: irreversible\\nANSWER: DENY: create a backup branch first'",
+    )
+    fake_bin = Path(env["PATH"].split(":", 1)[0])
+    # Rewrite tmux so send-keys never advances the transcript -> the redirect inject FAILS.
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f'  send-keys) printf "%s\\n" "$*" >> "{env["_KEYLOG"]}" ;;\n'
+        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        "esac\nexit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    jsonl = _project_dir_for(Path(env["CLAUDE_PROJECTS_DIR"]), spoke_repo) / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # no external advance masks the failure
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    journal = (Path(env["_STATEDIR"]) / "decision-journal.jsonl").read_text()
+    assert "redirect delivery FAILED" in journal, (
+        "a failed deny-redirect must be journaled distinctly, not as a clean denial"
+    )
+    keys = Path(env["_KEYLOG"]).read_text() if Path(env["_KEYLOG"]).exists() else ""
+    assert not any(line.split()[-1:] == ["1"] for line in keys.splitlines()), (
+        "an irreversible command must never be auto-approved"
+    )
+
+
+def test_success_answer_quoted_irreversible_stays_flagged(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # #241 review (Finding 2 fail-safe): a class that LEADS with punctuation ('"irreversible"')
+    # must still be read as non-reversible and flagged with a loud warned record — the old
+    # trailing-strip collapsed it to empty and mis-filed a noteworthy decision as routine.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    fake_bin = tmp_path / "bin"
+    jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+    _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": "printf 'REVERSIBILITY: \"irreversible\"\\nANSWER: proceed with care'",
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    assert (statedir / "warned-5.txt").exists(), (
+        "a quoted 'irreversible' class must fail SAFE to a loud warned record, not routine"
+    )
+    assert "irreversible" in (statedir / "decision-journal.jsonl").read_text()
+
+
+def test_reasoned_terminal_arm_is_single_step_when_tick_prearmed(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #241 review (Finding 3): the due-retry fall-through arms the backoff once and marks the tick
+    # (_AFK_ARMED_THIS_TICK); a reasoned terminal (broker_warn_continue) in that SAME tick must NOT
+    # advance the attempt counter a second time. A first-time escalation (flag unset) DOES arm.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_WARN_BACKOFF_BASE": "60",
+        "AFK_NOW": "1000",
+    }
+    prearmed = _call(
+        "_afk_warned_arm 5; _AFK_ARMED_THIS_TICK=5; "
+        f"broker_warn_continue '{spoke_repo}' 5 escalate 'reasoned decline' reversible; "
+        'IFS=$\'\\t\' read -r a _ < "$(_afk_warned_state_file 5)"; printf "attempt=%s\\n" "$a"',
+        env=env,
+    )
+    assert "attempt=1" in prearmed.stdout, prearmed.stdout + prearmed.stderr
+
+    statedir2 = tmp_path / "sd2"
+    statedir2.mkdir()
+    env2 = {**env, "AFK_STATE_DIR": str(statedir2)}
+    unarmed = _call(
+        "_afk_warned_arm 5; "  # attempt 0->1; tick NOT pre-armed
+        f"broker_warn_continue '{spoke_repo}' 5 escalate 'first escalation' reversible; "
+        'IFS=$\'\\t\' read -r a _ < "$(_afk_warned_state_file 5)"; printf "attempt=%s\\n" "$a"',
+        env=env2,
+    )
+    assert "attempt=2" in unarmed.stdout, unarmed.stdout + unarmed.stderr
