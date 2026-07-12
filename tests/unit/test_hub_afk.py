@@ -8103,3 +8103,146 @@ def test_detect_selfupdate_noop_when_branch_did_not_advance(tmp_path: Path) -> N
 
     assert result.returncode == 0, result.stderr
     assert not (statedir / "self-update-pending").exists()
+
+
+# ── #250: afk self-update — DEPLOY (validate + smoke + resync + in-place exec) ──
+# At a tick boundary the drain validates + smoke-tests the SOURCE, re-syncs the gitignored
+# scripts, journals, then execs in place onto the new code. The SOURCE is proven healthy
+# BEFORE the re-sync, so the synced copy the watchdog respawns is never overwritten with
+# broken code; any failure falls back to the old code with a loud warn + journal (AC#4).
+
+# All deploy tests keep the decision-journal's GitHub comment OFF: this host has an authed
+# `gh`, and a fail-safe journal would otherwise fire a REAL comment at the live repo.
+_SU_DEPLOY_ENV = {"AFK_JOURNAL_GH_COMMENT": "0"}
+
+
+def _su_source_root(tmp_path: Path, hub_afk_body: str) -> Path:
+    """A minimal source tree carrying just shared/skills/hub/scripts/hub-afk.sh."""
+    root = tmp_path / "root"
+    scripts = root / "shared" / "skills" / "hub" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "hub-afk.sh").write_text(hub_afk_body)
+    return root
+
+
+def test_validate_scripts_passes_on_healthy_source() -> None:
+    # The real repo's in-scope scripts (including this change) must all parse.
+    result = _call(f"_afk_validate_scripts '{REPO_ROOT}'")
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_validate_scripts_fails_on_broken_source(tmp_path: Path) -> None:
+    root = _su_source_root(tmp_path, "if [ ; then\n")  # deliberate syntax error
+
+    result = _call(f"_afk_validate_scripts '{root}'")
+
+    assert result.returncode == 1
+    assert "fails to parse" in result.stderr, result.stderr
+
+
+def test_self_deploy_happy_path_journals_and_execs(tmp_path: Path) -> None:
+    root = _su_source_root(tmp_path, "echo ok\n")
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "self-update-pending").write_text("236\n")
+    exec_log = tmp_path / "exec.log"
+    sync_log = tmp_path / "sync.log"
+
+    result = _call(
+        "_afk_self_deploy",
+        env={
+            **_SU_DEPLOY_ENV,
+            "AFK_SELFUPDATE_ROOT": str(root),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_SELFUPDATE_SMOKE_CMD": "true",
+            "AFK_SYNC_CMD": f"printf synced >> '{sync_log}'",
+            "AFK_SELF_DEPLOY_EXEC_CMD": f"printf execed >> '{exec_log}'",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert sync_log.read_text() == "synced", "a healthy source must re-sync"
+    assert exec_log.read_text() == "execed", "a healthy deploy must exec the new code"
+    assert not (statedir / "self-update-pending").exists(), "the flag is cleared before the exec"
+    journal = (statedir / "decision-journal.jsonl").read_text()
+    assert "self-deploy" in journal and "236" in journal, journal
+
+
+def test_self_deploy_broken_source_fails_safe(tmp_path: Path) -> None:
+    root = _su_source_root(tmp_path, "if [ ; then\n")  # unparseable
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "self-update-pending").write_text("236\n")
+    exec_log = tmp_path / "exec.log"
+    sync_log = tmp_path / "sync.log"
+
+    result = _call(
+        "_afk_self_deploy",
+        env={
+            **_SU_DEPLOY_ENV,
+            "AFK_SELFUPDATE_ROOT": str(root),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_SYNC_CMD": f"printf synced >> '{sync_log}'",
+            "AFK_SELF_DEPLOY_EXEC_CMD": f"printf execed >> '{exec_log}'",
+        },
+    )
+
+    assert result.returncode == 1
+    assert not sync_log.exists(), "a broken source must NOT re-sync the watchdog's respawn target"
+    assert not exec_log.exists(), "a broken source must NOT exec"
+    assert not (statedir / "self-update-pending").exists(), "one-shot: the flag is cleared on abort"
+    assert "aborted" in (statedir / "decision-journal.jsonl").read_text()
+
+
+def test_self_deploy_startup_death_fails_safe_before_resync(tmp_path: Path) -> None:
+    # Parses fine, but the smoke run exits nonzero (stands in for a version that dies at
+    # startup). It must be caught BEFORE the re-sync, so the synced copy stays good.
+    root = _su_source_root(tmp_path, "echo ok\n")
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "self-update-pending").write_text("236\n")
+    sync_log = tmp_path / "sync.log"
+    exec_log = tmp_path / "exec.log"
+
+    result = _call(
+        "_afk_self_deploy",
+        env={
+            **_SU_DEPLOY_ENV,
+            "AFK_SELFUPDATE_ROOT": str(root),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_SELFUPDATE_SMOKE_CMD": "false",  # startup death
+            "AFK_SYNC_CMD": f"printf synced >> '{sync_log}'",
+            "AFK_SELF_DEPLOY_EXEC_CMD": f"printf execed >> '{exec_log}'",
+        },
+    )
+
+    assert result.returncode == 1
+    assert not sync_log.exists(), "a startup-death version must be caught before the re-sync"
+    assert not exec_log.exists()
+    assert not (statedir / "self-update-pending").exists()
+
+
+def test_self_deploy_failed_sync_fails_safe(tmp_path: Path) -> None:
+    root = _su_source_root(tmp_path, "echo ok\n")
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "self-update-pending").write_text("236\n")
+    exec_log = tmp_path / "exec.log"
+
+    result = _call(
+        "_afk_self_deploy",
+        env={
+            **_SU_DEPLOY_ENV,
+            "AFK_SELFUPDATE_ROOT": str(root),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_SELFUPDATE_SMOKE_CMD": "true",
+            "AFK_SYNC_CMD": "false",  # sync fails
+            "AFK_SELF_DEPLOY_EXEC_CMD": f"printf execed >> '{exec_log}'",
+        },
+    )
+
+    assert result.returncode == 1
+    assert not exec_log.exists(), "a failed re-sync must NOT exec the new code"
+    assert not (statedir / "self-update-pending").exists()
+    assert "aborted" in (statedir / "decision-journal.jsonl").read_text()

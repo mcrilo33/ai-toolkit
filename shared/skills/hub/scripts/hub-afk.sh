@@ -2227,6 +2227,111 @@ _afk_detect_selfupdate() {
   fi
 }
 
+# _afk_selfupdate_source_scripts [root] -> the source scripts a self-deploy must prove parse
+# before it re-syncs: the supervisor's own script, everything it sources, and the siblings it
+# shells out to. Absent files are skipped by the validator (a slimmed checkout is not an error).
+_afk_selfupdate_source_scripts() {
+  local root="${1:-${MAIN_ROOT:-.}}"
+  printf '%s\n' \
+    "$root/shared/skills/hub/scripts/hub-afk.sh" \
+    "$root/shared/skills/hub/scripts/gate-broker.sh" \
+    "$root/shared/skills/hub/scripts/hub-notify.sh" \
+    "$root/shared/skills/hub/scripts/batch-plan.sh" \
+    "$root/scripts/worktree-lib.sh" \
+    "$root/scripts/worktree-land.sh"
+}
+
+# _afk_validate_scripts [root] -> true when every present source script parses (bash -n). This
+# is the PRIMARY fail-safe: because sync-to-repo copies scripts verbatim, a source that parses
+# guarantees the synced copy parses, so the deploy never overwrites the synced copy the watchdog
+# respawns with unparseable code. Names the first offender and returns nonzero on any failure.
+_afk_validate_scripts() {
+  local root="${1:-${MAIN_ROOT:-.}}" f bad=0
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    if ! bash -n "$f" 2>/dev/null; then
+      log "/afk self-update: SOURCE $f fails to parse (bash -n) — aborting the deploy"
+      bad=1
+    fi
+  done <<EOF
+$(_afk_selfupdate_source_scripts "$root")
+EOF
+  [ "$bad" -eq 0 ]
+}
+
+# _afk_smoke_source [root] -> true when the SOURCE hub-afk.sh loads and runs a trivial subcommand
+# (`--help`) without dying. `--help` exercises the full top-of-file sourcing (gate-broker /
+# worktree-lib), every top-level statement (set -u traps, `: "${VAR:=…}"` defaults), and all
+# function definitions — but is exempt from the self-copy exec — so a version that parses yet
+# EXITS at startup is caught here, before the re-sync, rather than after the exec has already
+# replaced this process (closing the AC#4 "startup-death traps the watchdog" hole). Bounded so a
+# wedged new version can't freeze the deploy. AFK_SELFUPDATE_SMOKE_CMD overrides it for tests.
+_afk_smoke_source() {
+  if [ -n "${AFK_SELFUPDATE_SMOKE_CMD:-}" ]; then bash -c "$AFK_SELFUPDATE_SMOKE_CMD"; return $?; fi
+  local root="${1:-${MAIN_ROOT:-.}}" src
+  src="$root/shared/skills/hub/scripts/hub-afk.sh"
+  [ -f "$src" ] || return 1
+  _afk_with_timeout "${AFK_SELFUPDATE_SMOKE_TIMEOUT:-30}" bash "$src" --help >/dev/null 2>&1
+}
+
+# _afk_resync [root] -> regenerate the gitignored .ai-toolkit/scripts the /afk skill launches
+# from the freshly-merged source. Bounded; a failure is reported and the deploy aborts (the
+# synced copy is left on the previous good code). AFK_SYNC_CMD overrides the sync for tests.
+_afk_resync() {
+  if [ -n "${AFK_SYNC_CMD:-}" ]; then bash -c "$AFK_SYNC_CMD"; return $?; fi
+  local root="${1:-${MAIN_ROOT:-.}}" sync
+  sync="$root/scripts/sync-to-repo.sh"
+  [ -f "$sync" ] || { log "/afk self-update: sync-to-repo.sh not found at $sync — cannot redeploy"; return 1; }
+  _afk_with_timeout "${AFK_SYNC_TIMEOUT:-120}" bash "$sync" "$root" claude >/dev/null 2>&1
+}
+
+# _afk_selfupdate_fail <issue> <reason> -> the fail-safe exit from a self-deploy: warn loudly,
+# journal the aborted deploy (file + gh — a broken self-deploy is operator-noteworthy), and
+# clear the pending flag so the drain does NOT re-attempt a broken deploy every tick (the next
+# supervisor-scope land re-arms it). The drain continues on the OLD code, never stranded (AC#4).
+_afk_selfupdate_fail() {
+  local issue="$1" reason="$2"
+  log "/afk: self-update ABORTED — $reason; staying on the old code (drain continues)"
+  broker_journal_decision "${issue:-self-update}" self-deploy \
+    "self-deploy aborted: $reason — staying on old code" scope
+  _afk_clear_selfupdate_pending
+}
+
+# _afk_self_deploy -> the DEPLOY half of the #250 self-update protocol, run at a tick boundary
+# (never mid-tick). Validate + smoke the source, re-sync the synced scripts, journal, then EXEC
+# this process in place onto the new code as a no-arg resume: `exec` preserves $$ so caffeinate
+# (-w $$, #242) and the heartbeat pid survive untouched (the watchdog keeps reading `live`), and
+# a no-arg launch re-adopts the in-flight spokes (dispatch_batch skips them). On success the exec
+# never returns; every failure path falls back to the old code via _afk_selfupdate_fail.
+# UPGRADE: a version that passes --help but dies only in the drain loop still relies on the
+# watchdog to respawn it — add a watchdog crash-loop backoff to bound that residual (as today's
+# manual-sync-broken-code risk already is).
+_afk_self_deploy() {
+  local root="${AFK_SELFUPDATE_ROOT:-${MAIN_ROOT:-.}}" issue
+  issue="$(_afk_read_selfupdate_issue)"
+  log "/afk: self-update — validating + redeploying the supervisor on landed #${issue:-?} code"
+  _afk_set_last_action "self-deploy #${issue:-?}"
+  if ! _afk_validate_scripts "$root" || ! _afk_smoke_source "$root"; then
+    _afk_selfupdate_fail "$issue" "source failed validation/smoke (bash -n or --help) — merged code is broken"
+    return 1
+  fi
+  if ! _afk_resync "$root"; then
+    _afk_selfupdate_fail "$issue" "re-sync (sync-to-repo.sh) failed — synced scripts left on the previous good copy"
+    return 1
+  fi
+  # Record the deploy (file only — routine success, so no per-deploy gh comment) and clear the
+  # flag BEFORE the exec: the re-exec'd resume must not read a still-pending flag and redeploy
+  # in a loop.
+  _broker_journal_line "${issue:-self-update}" self-deploy \
+    "redeploying the supervisor onto landed #${issue:-?} code (validated + re-synced)" scope
+  _afk_clear_selfupdate_pending
+  log "/afk: self-update — code validated + re-synced; re-execing the supervisor in place (resume)"
+  if [ -n "${AFK_SELF_DEPLOY_EXEC_CMD:-}" ]; then bash -c "$AFK_SELF_DEPLOY_EXEC_CMD"; return $?; fi
+  # env -u AFK_RUNNING_COPY forces a fresh self-copy of the (now re-synced) original; no window
+  # arg ⇒ resume. `exec` keeps $$ so the caffeinate -w tie and the heartbeat pid are preserved.
+  exec env -u AFK_RUNNING_COPY bash "$(_afk_self)"
+}
+
 # watchdog_tick -> one watchdog check, printing the observed supervisor state:
 #   off       — no window armed; the watchdog should stop.
 #   live      — a supervisor is alive and recently stamped the heartbeat; nothing to do.
