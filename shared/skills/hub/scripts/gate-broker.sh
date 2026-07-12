@@ -2584,10 +2584,13 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
   fi
   log "→ answering #$issue (parked on input)"
   # Read-only guard (subtask B): fingerprint the LIVE worktree around the reason step.
-  # The reasoner gets read-only access (cwd=wt) to verify against real state; if the tree
-  # changed across the step it MUTATED a read-only worktree, so its answer is untrustworthy
-  # — void it and route to a human (escalate unattended / QCM attended), regardless of
-  # content. Detection is the hard guarantee independent of the LLM's tool-allowlist.
+  # Since #237 the reasoner runs in a throwaway snapshot COPY (cwd=snap), so its relative
+  # writes land in the copy and the live-tree fingerprint is a should-never-fire backstop —
+  # its one remaining true purpose is catching an ABSOLUTE-path escape (a reasoner tool
+  # writing `$wt/…` / `git -C $wt`, which bypasses cwd=snap). Detection is the hard guarantee
+  # independent of the LLM's tool-allowlist. #244: a live-tree diff during the step is now
+  # almost always the SPOKE's OWN concurrent edits (it self-resumed mid-GREEN), not the
+  # reasoner — so the void is gated on _still_parked_same below.
   local fp_before; fp_before="$(_broker_worktree_fingerprint "$wt")"
   raw="$(run_answerer "$issue" "$question" "$wt")"; rc=$?
   if _broker_is_git_worktree "$wt" && [ -z "$fp_before" ]; then
@@ -2599,7 +2602,15 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
       "could not fingerprint the worktree to verify the reasoner stayed read-only — needs a human"
     return 0
   fi
-  if ! _broker_worktree_unchanged "$wt" "$fp_before"; then
+  if ! _broker_worktree_unchanged "$wt" "$fp_before" \
+    && _still_parked_same "$wt" "$issue" "$was_gate" "$orig_question" "$parked_mtime"; then
+    # #244: attribute a live-tree diff to the reasoner ONLY when the spoke did NOT move — still
+    # parked on the SAME prompt (transcript unchanged, gate tag at tip, extraction unchanged).
+    # The spoke's own edits always advance its transcript, while a reasoner absolute-path escape
+    # never touches the live jsonl, so _still_parked_same cleanly separates the two. When the
+    # spoke moved on, we fall through: the ANSWER branch's own _still_parked_same re-check drops
+    # the stale answer (or recomputes per #241) and the ESCALATE path's _spoke_moved_on drops
+    # there — no gate-voided marker, no blocked/<issue> on an actively-working spoke.
     # Stamp the durable void marker FIRST so the backoff-paced void short-circuit (top of this
     # function) throttles the mutating reasoner across ticks — the (tip, sig) ceiling can't,
     # since the tree write perturbs it every tick. #241 §5: no longer terminal; warn + back off.
