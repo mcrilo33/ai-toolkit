@@ -2469,6 +2469,20 @@ _afk_watchdog_alive() {
 # _afk_spawn_watchdog -> launch a background watchdog UNLESS one is already alive (so a
 # re-arm, or a no-arg resume, never stacks keepers). AFK_WATCHDOG_SPAWN_CMD overrides the
 # launch for tests. Best-effort; never aborts the caller.
+# _afk_arm_hub_watchdog -> co-arm the tier-2 hub-watchdog (issue #251) alongside the keeper so
+# it runs "OS-level alongside the drain" (AC#1) and is re-armed if it died — the drain keeper
+# and the tier-2 watchdog cross-check each other. `hub-watchdog.sh --arm` is singleton-guarded
+# (idempotent) and detaches its own nohup daemon, so this is cheap when one already runs.
+# Best-effort: a missing script or a failed launch never aborts the drain. Opt-out
+# HUB_WATCHDOG_COARM=0; HUB_WATCHDOG_ARM_CMD overrides the launch (the tests' seam), and
+# HUB_WATCHDOG_BIN pins the script path.
+_afk_arm_hub_watchdog() {
+  [ "${HUB_WATCHDOG_COARM:-1}" = "1" ] || return 0
+  if [ -n "${HUB_WATCHDOG_ARM_CMD:-}" ]; then bash -c "$HUB_WATCHDOG_ARM_CMD" >/dev/null 2>&1 || true; return 0; fi
+  local wd; wd="$(_afk_find_script "${HUB_WATCHDOG_BIN:-}" hub-watchdog.sh)" || return 0
+  bash "$wd" --arm >/dev/null 2>&1 || true
+}
+
 _afk_spawn_watchdog() {
   _afk_watchdog_alive && return 0
   if [ -n "${AFK_WATCHDOG_SPAWN_CMD:-}" ]; then bash -c "$AFK_WATCHDOG_SPAWN_CMD"; return 0; fi
@@ -2478,6 +2492,7 @@ _afk_spawn_watchdog() {
   # Record the child pid immediately so the next tick's dedup check sees it alive before
   # the watchdog itself writes the pidfile (closes the launch→pidfile startup race).
   printf '%s\n' "$!" > "$(_afk_watchdog_file)" 2>/dev/null || true
+  _afk_arm_hub_watchdog   # tier-2 (#251): co-arm the OS-level hub-watchdog alongside the keeper
   return 0
 }
 

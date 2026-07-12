@@ -92,3 +92,30 @@ def test_hub_inject_takes_the_hub_skill_source_case() -> None:
 def test_hub_inject_source_exists_and_is_executable() -> None:
     assert HUB_INJECT.is_file(), "shared/skills/hub/scripts/hub-inject.sh missing"
     assert os.access(HUB_INJECT, os.X_OK), "hub-inject.sh is not executable"
+
+
+# ── hub-watchdog.sh registration (issue #251) ─────────────────────────────────
+# The tier-2 supervision daemon is a hub-skill script; it must sync into a target's
+# .ai-toolkit/scripts/ so /afk / the hub skill can arm it, and take the hub-skill case mapping.
+HUB_WATCHDOG = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "hub-watchdog.sh"
+
+
+def test_hub_watchdog_registered_in_sync_loop() -> None:
+    assert "hub-watchdog.sh" in _for_name_list(), (
+        "hub-watchdog.sh is not registered in sync_workflow_scripts() — it would not sync to a "
+        "target's .ai-toolkit/scripts/ and /afk could not arm the tier-2 watchdog there"
+    )
+
+
+def test_hub_watchdog_takes_the_hub_skill_source_case() -> None:
+    body = _sync_workflow_scripts_body()
+    hub_case = re.search(r"\n\s*([\w.|-]*hub-watchdog\.sh[\w.|-]*)\)\s+src=", body)
+    assert hub_case is not None, (
+        "hub-watchdog.sh must have the hub-skill case mapping "
+        '(src="$SHARED_DIR/skills/hub/scripts/$name"), not the toolkit-root default'
+    )
+
+
+def test_hub_watchdog_source_exists_and_is_executable() -> None:
+    assert HUB_WATCHDOG.is_file(), "shared/skills/hub/scripts/hub-watchdog.sh missing"
+    assert os.access(HUB_WATCHDOG, os.X_OK), "hub-watchdog.sh is not executable"

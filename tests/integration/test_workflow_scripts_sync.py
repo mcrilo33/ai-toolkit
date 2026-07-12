@@ -70,6 +70,9 @@ SOURCES["gate-broker.sh"] = HUB_SCRIPTS_DIR / "gate-broker.sh"
 # .ai-toolkit/scripts/ every synced /afk drain fails at startup, unable to resolve
 # inject_and_verify / approve_permission / _spoke_pane_target.
 SOURCES["hub-inject.sh"] = HUB_SCRIPTS_DIR / "hub-inject.sh"
+# The tier-2 supervision daemon (issue #251) ships so `/afk` / the hub skill can arm it in a
+# synced target like its hub-tool siblings — it cross-checks the drain and files afk-defects.
+SOURCES["hub-watchdog.sh"] = HUB_SCRIPTS_DIR / "hub-watchdog.sh"
 SOURCES["batch-plan.sh"] = HUB_SCRIPTS_DIR / "batch-plan.sh"
 # The hub-side agent dispatcher (issue #245) ships alongside its siblings so the
 # land/hub skills' `.ai-toolkit/scripts/hub-agent.sh` references resolve in a

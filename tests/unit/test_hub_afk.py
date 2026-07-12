@@ -85,6 +85,12 @@ def _isolated_afk_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     # (e.g. `== "/afk: off"`) would flakily gain a WARNING line. Pin it to a silent scan; the
     # dedicated duplicate-lineage tests override it explicitly with their own pid list.
     monkeypatch.setenv("AFK_SUPERVISOR_PIDS_CMD", "true")
+    # Neutralize the #251 tier-2 hub-watchdog co-arm by default: _afk_spawn_watchdog now
+    # co-arms the OS-level hub-watchdog, and without this pin the real-path spawn test would
+    # nohup a real daemon writing a pidfile into the REAL <git-common-dir>. A no-op seam keeps
+    # every test daemon-free; the dedicated co-arm tests override HUB_WATCHDOG_ARM_CMD with a
+    # recording stub.
+    monkeypatch.setenv("HUB_WATCHDOG_ARM_CMD", ":")
 
 
 def _call(fn_call: str, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -3883,6 +3889,31 @@ def test_spawn_watchdog_spawns_when_none_alive(tmp_path: Path) -> None:
     _call("_afk_spawn_watchdog", env=env)
 
     assert marker.exists(), "no live watchdog ⇒ one must be spawned"
+
+
+# ── tier-2 hub-watchdog co-arm (issue #251) ───────────────────────────────────
+# _afk_spawn_watchdog co-arms the OS-level hub-watchdog alongside the keeper so it runs
+# "alongside the drain" (AC#1) and is re-armed if it died. The HUB_WATCHDOG_ARM_CMD seam
+# stands in for the real `hub-watchdog.sh --arm` launch.
+
+
+def test_spawn_watchdog_co_arms_the_hub_watchdog(tmp_path: Path) -> None:
+    wf = tmp_path / "watchdog"  # absent ⇒ real spawn path runs → reaches the co-arm
+    coarm = tmp_path / "coarmed"
+    env = {"AFK_WATCHDOG_FILE": str(wf), "HUB_WATCHDOG_ARM_CMD": f"touch {coarm}"}
+
+    _call("_afk_spawn_watchdog", env=env)
+
+    assert coarm.exists(), "spawning the keeper must co-arm the tier-2 hub-watchdog"
+
+
+def test_hub_watchdog_co_arm_is_opt_outable(tmp_path: Path) -> None:
+    coarm = tmp_path / "coarmed"
+    env = {"HUB_WATCHDOG_COARM": "0", "HUB_WATCHDOG_ARM_CMD": f"touch {coarm}"}
+
+    _call("_afk_arm_hub_watchdog", env=env)
+
+    assert not coarm.exists(), "HUB_WATCHDOG_COARM=0 disables the co-arm"
 
 
 def test_spawn_watchdog_spawns_when_recorded_pid_dead(tmp_path: Path) -> None:
