@@ -31,6 +31,8 @@
 #                                tick; the tick stays authoritative for everything silence-
 #                                shaped (reap, resume, reconcile, dispatch, drain-done).
 #   AFK_WATCHDOG_SECONDS=60      watchdog poll interval (respawn a crashed supervisor)
+#   AFK_OFF_WAIT_SECONDS=30      `--off --wait` bound: seconds to poll the supervisor pid to
+#                                death before giving up (returns nonzero on timeout) (#252)
 #   AFK_SPOKE_MAX_MINUTES=180    wall-clock ceiling per spoke before a reap
 #   AFK_IDLE_MINUTES=30          a spoke idle this long with no marker AND not waiting → reap
 #   AFK_ANSWERER_CMD             the answerer command (default: claude -p --model claude-opus-4-8)
@@ -71,6 +73,9 @@
 #   hub-afk.sh --remote          # launch a detached `drain` on a configured always-on Mac
 #   hub-afk.sh --status          # report the window: off / draining-idle / STALLED / DRAIN DEAD
 #   hub-afk.sh --off             # stop the supervisor + watchdog (clears the state file)
+#   hub-afk.sh --off --wait      # ...and BLOCK until the supervisor has actually exited
+#                                #   (bounded by AFK_OFF_WAIT_SECONDS; nonzero on timeout) —
+#                                #   for a scripted off->sync->arm recycle (-w is an alias)
 #   hub-afk.sh --reconcile       # re-arm an armed-but-crashed drain (idempotent resume);
 #                                #   run at hub session start after a process/machine restart
 #   hub-afk.sh --once            # run a single tick and exit (tests / external cron)
@@ -2715,7 +2720,7 @@ main() {
       echo "/afk: off (state cleared; the supervisor + watchdog stop on their next tick)"; return 0 ;;
     --watchdog)  watchdog_loop; return $? ;;
     --reconcile) afk_reconcile "$MAIN_ROOT"; return $? ;;
-    -h|--help)   sed -n '2,82p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
+    -h|--help)   sed -n '2,87p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
   esac
 
   local once=0

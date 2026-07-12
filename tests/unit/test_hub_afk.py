@@ -79,6 +79,12 @@ def _isolated_afk_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     # captures a bundle under <git-common-dir>/hang-forensics before it kills the pane, so
     # without this pin any reap/revive test would write into the REAL repo's .git.
     monkeypatch.setenv("AFK_HANG_FORENSICS_DIR", str(tmp_path / "hang-forensics"))
+    # Neutralize the #252 duplicate-lineage scan by default: `_status` runs the real host
+    # `pgrep -fl hub-afk` scan whenever AFK_SUPERVISOR_PIDS_CMD is unset, so on a macOS dev box
+    # with 2+ live `/afk drain` lineages every `_status`-driving test that asserts exact output
+    # (e.g. `== "/afk: off"`) would flakily gain a WARNING line. Pin it to a silent scan; the
+    # dedicated duplicate-lineage tests override it explicitly with their own pid list.
+    monkeypatch.setenv("AFK_SUPERVISOR_PIDS_CMD", "true")
 
 
 def _call(fn_call: str, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
