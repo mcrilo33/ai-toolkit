@@ -2252,6 +2252,47 @@ afk_telemetry_status() {
   printf '/afk: telemetry %s (collector %s, bridge %s, auth %s)\n' "$overall" "$c" "$b" "$a"
 }
 
+# --- sleep-inhibitor status + arm-time power warnings (issue #242) -------------
+# afk_inhibitor_status -> a one-line, READ-ONLY sleep-inhibitor summary for --status: active
+# with its caffeinate pid, MISSING when the machine may sleep, or unavailable on a host with no
+# caffeinate (non-macOS). Probes only (no launch), so a status read has no side effects.
+afk_inhibitor_status() {
+  local bin cpid; bin="${AFK_CAFFEINATE_BIN:-caffeinate}"
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    printf '/afk: sleep-inhibit: unavailable (no caffeinate — non-macOS; the systemd-inhibit equivalent is unwired)\n'
+    return 0
+  fi
+  cpid="$(_afk_inhibitor_pid)"
+  if _afk_pid_alive "$cpid"; then
+    printf '/afk: sleep-inhibit: active (pid %s)\n' "$cpid"
+  else
+    printf '/afk: sleep-inhibit: MISSING — machine may sleep\n'
+  fi
+}
+
+# afk_warn_power -> WARN at arm time when on BATTERY: `caffeinate -s` inhibits sleep only on AC
+# power, and a lid-close sleeps regardless — name BOTH limits so the operator plugs in and keeps
+# the lid open. Guarded on pmset (absent off macOS) and read under LC_ALL=C (the repo's locale
+# trap: an English-keyword parse of a localized `pmset -g batt` must force the C locale).
+afk_warn_power() {
+  local pm batt; pm="${AFK_PMSET_BIN:-pmset}"
+  command -v "$pm" >/dev/null 2>&1 || return 0
+  batt="$(LC_ALL=C "$pm" -g batt 2>/dev/null)"
+  case "$batt" in
+    *"Battery Power"*)
+      log "/afk: WARNING — on battery power: 'caffeinate -s' inhibits sleep only on AC power, and a lid-close sleeps regardless; plug in and keep the lid open for an unattended drain" ;;
+  esac
+}
+
+# _afk_warn_no_inhibitor -> WARN once at arm time when caffeinate is absent (non-macOS): arming
+# still PROCEEDS (never fails), but the drain will NOT inhibit sleep — name the Linux equivalent
+# so the limitation is surfaced, not silent.
+_afk_warn_no_inhibitor() {
+  local bin; bin="${AFK_CAFFEINATE_BIN:-caffeinate}"
+  command -v "$bin" >/dev/null 2>&1 && return 0
+  log "/afk: WARNING — 'caffeinate' not found (non-macOS?); the drain will NOT inhibit system sleep — the equivalent here is 'systemd-inhibit --what=sleep'"
+}
+
 # --- arm preconditions (issue #170 ST4) ---------------------------------------
 # Mirror the telemetry preflight's refuse-to-arm posture for the drain's OWN prerequisites:
 # a second supervisor clobbers per-run state, a dirty tree / off-base HEAD means the drain
@@ -2376,6 +2417,9 @@ _status() {
   # so the operator must be able to see whether it's actually receiving data (#108). A
   # no-op line when telemetry is opted out (AI_TOOLKIT_OTEL=0).
   afk_telemetry_status
+  # ...and the sleep-inhibitor state (#242): while a drain is armed the Mac must not sleep, so
+  # the operator must be able to see whether the inhibitor is actually holding.
+  afk_inhibitor_status
   afk_blocked_locally_status
 }
 
@@ -2433,6 +2477,9 @@ main() {
     _afk_clear_last_action   # fresh window ⇒ no stale last-action label from a prior drain (#202 B)
     _afk_clear_status_labels_seed # fresh window ⇒ re-seed the afk:* label set once (#223)
     log "/afk: armed ($([ "$end" = drain ] && echo 'drain — until the backlog is empty' || echo "until $(wt_date_ymd "$end") $(date -r "$end" +%H:%M 2>/dev/null || date -d "@$end" +%H:%M)"))"
+    # Power-management caveats the sleep inhibitor cannot cover (#242): loud, once at arm.
+    afk_warn_power          # on battery: caffeinate -s holds only on AC, and a lid-close sleeps
+    _afk_warn_no_inhibitor  # non-macOS: no caffeinate — arming proceeds, but sleep is not inhibited
   else
     # No window spec and not --once: a RESUME of the persisted window (a watchdog respawn or
     # a manual re-run). Refuse if a supervisor is ALREADY live — a second one clobbers the
