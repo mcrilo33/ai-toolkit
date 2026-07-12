@@ -2602,24 +2602,40 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
       "could not fingerprint the worktree to verify the reasoner stayed read-only — needs a human"
     return 0
   fi
-  if ! _broker_worktree_unchanged "$wt" "$fp_before" \
-    && _still_parked_same "$wt" "$issue" "$was_gate" "$orig_question" "$parked_mtime"; then
-    # #244: attribute a live-tree diff to the reasoner ONLY when the spoke did NOT move — still
-    # parked on the SAME prompt (transcript unchanged, gate tag at tip, extraction unchanged).
-    # The spoke's own edits always advance its transcript, while a reasoner absolute-path escape
-    # never touches the live jsonl, so _still_parked_same cleanly separates the two. When the
-    # spoke moved on, we fall through: the ANSWER branch's own _still_parked_same re-check drops
-    # the stale answer (or recomputes per #241) and the ESCALATE path's _spoke_moved_on drops
-    # there — no gate-voided marker, no blocked/<issue> on an actively-working spoke.
-    # Stamp the durable void marker FIRST so the backoff-paced void short-circuit (top of this
-    # function) throttles the mutating reasoner across ticks — the (tip, sig) ceiling can't,
-    # since the tree write perturbs it every tick. #241 §5: no longer terminal; warn + back off.
-    _broker_mark_voided "$issue"
-    log "  reasoner mutated the read-only worktree of #$issue — voiding its answer (backoff-paced; #241)"
-    # 'unknown' reversibility: the reasoner ESCAPED #237 snapshot isolation and wrote the LIVE
-    # tree — a should-never-fire event the morning review must be able to triage from the benign.
-    _broker_on_human_decision "$mode" "$wt" "$issue" \
-      "the gate reasoner mutated the read-only worktree — its answer is voided; review the live tree" unknown
+  if ! _broker_worktree_unchanged "$wt" "$fp_before"; then
+    # The live tree changed during the reason step. Since #237 the reasoner runs isolated, so
+    # this is one of two things — and once the tree moved under the answerer, its answer is
+    # derived from a stale tree and must NEVER be injected (#244 review): the tree-changed path
+    # ALWAYS returns here, so we never fall through to the ANSWER branch's recompute (which would
+    # re-baseline fp_before and inject over the mutated tree).
+    if _still_parked_same "$wt" "$issue" "$was_gate" "$orig_question" "$parked_mtime"; then
+      # The spoke did NOT move — still parked on the SAME prompt (transcript unchanged, gate tag
+      # at tip, extraction unchanged) — yet the tree changed under it: a reasoner absolute-path
+      # escape ($wt/… / git -C $wt) bypassing #237's cwd=snap. VOID + escalate: the one true
+      # positive this backstop exists for. Stamp the durable void marker FIRST so the top-of-
+      # function backoff short-circuit paces the mutating reasoner across ticks — the (tip, sig)
+      # ceiling can't, since the tree write perturbs it every tick. #241 §5: warn + back off.
+      _broker_mark_voided "$issue"
+      log "  reasoner mutated the read-only worktree of #$issue — voiding its answer (backoff-paced; #241)"
+      # 'unknown' reversibility: the reasoner ESCAPED #237 snapshot isolation and wrote the LIVE
+      # tree — a should-never-fire event the morning review must triage from the benign.
+      _broker_on_human_decision "$mode" "$wt" "$issue" \
+        "the gate reasoner mutated the read-only worktree — its answer is voided; review the live tree" unknown
+      return 0
+    fi
+    # The spoke moved off the park while the answerer reasoned: almost always it self-resumed
+    # mid-GREEN and is editing its own tree (the #234 false-void), so the diff is the spoke's own
+    # concurrent work — do NOT void: no gate-voided marker, no blocked/<issue> on an actively-
+    # working spoke. We deliberately do NOT try to tell that apart from the rare case of a real
+    # reasoner escape masked by a #240 non-turn transcript bump: EITHER way this answer is derived
+    # from a tree that changed under it, so the safe move is the same — DROP it, never inject.
+    # Dropping WITHOUT recompute is the fix: a recompute would re-fingerprint with the change as
+    # its new baseline and inject the stale answer mid-turn (#89). The spoke keeps working; a
+    # fresh park next tick is serviced anew.
+    # UPGRADE: to also VOID (flag for triage) a masked escape here — not just drop it — detect
+    # genuine spoke assistant activity in the transcript (an editing spoke emits tool_use; a
+    # non-turn bump does not) rather than keying on mtime, then void when no such activity landed.
+    log "  #$issue's live tree changed after it moved off the park — dropping the stale answer (#244)"
     return 0
   fi
   # The answerer is the supervisor's own `claude`; if its credentials are dead, every

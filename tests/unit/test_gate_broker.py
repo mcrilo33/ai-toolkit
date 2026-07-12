@@ -824,6 +824,50 @@ def test_broker_service_gate_no_void_when_spoke_self_resumes_during_reasoning(
     )
 
 
+def test_broker_service_gate_never_injects_over_a_changed_tree(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # #244 review: once the live tree changed under the answerer, its answer is derived from a
+    # stale tree and must NEVER be injected — the tree-changed path must not fall through to the
+    # #241 recompute, which would re-baseline the fingerprint (dropping the change from its new
+    # baseline) and inject over the mutated tree. Model the exact hole: the FIRST answerer run
+    # mutates the live tree by absolute path AND a non-turn write bumps the transcript mtime (the
+    # #240 false-staleness), while the spoke stays parked on the SAME prompt; a naive recompute
+    # would then re-run, see a now-stable tree + a still-parked spoke, and inject.
+    projects = tmp_path / "projects"
+    live_jsonl = _project_dir_for(projects, spoke_repo) / "session.jsonl"
+    os.utime(live_jsonl, (1_000_000_000, 1_000_000_000))  # pin OLD so the mtime bump reads as newer
+    counter = tmp_path / "answerer.n"
+    (spoke_repo / "tracked.txt").write_text("original")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=spoke_repo, check=True, capture_output=True)
+    fake_bin = tmp_path / "bin"  # waiting_spoke_env's fake bin (holds gh); add the pane tmux
+    tmux_log = _fake_tmux_pane(fake_bin, spoke_repo, live_jsonl)
+    # First run: escape (absolute tree write) + a non-turn mtime bump (touch), spoke still parked.
+    # A recompute's second run would be clean, so a hole would inject on it — assert it never does.
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": (
+            f"n=$(cat '{counter}' 2>/dev/null || echo 0); n=$((n + 1)); echo $n > '{counter}'; "
+            f"if [ \"$n\" = 1 ]; then printf 'escaped' > '{spoke_repo}/tracked.txt'; "
+            f"touch '{live_jsonl}'; fi; printf 'ANSWER: SHOULD-NOT-INJECT'"
+        ),
+        "AFK_STATE_DIR": str(tmp_path / "sd"),
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    log = tmux_log.read_text() if tmux_log.exists() else ""
+    assert "SHOULD-NOT-INJECT" not in log, (
+        f"an answer derived from a tree that changed under the answerer must never inject: {log}"
+    )
+    ready_log = Path(env["_READY_LOG"]).read_text() if Path(env["_READY_LOG"]).exists() else ""
+    assert "--blocked 5" not in ready_log, f"the drop must not park the spoke blocked: {ready_log}"
+
+
 def test_broker_service_gate_isolates_reasoner_writes_from_live_tree(
     spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
 ) -> None:
