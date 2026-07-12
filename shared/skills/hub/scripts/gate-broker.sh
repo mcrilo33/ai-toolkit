@@ -58,6 +58,17 @@ unset _cand
 
 log() { printf '%s\n' "$*" >&2; }
 
+# --- source hub-inject.sh (the ONE hardened tmux-inject + delivery-proof unit) -
+# The spoke-pane injection + transcript-delivery primitives (issue #251) live in
+# hub-inject.sh so the /afk answerer (us) and the tier-2 hub-watchdog share one tested
+# helper. Always a co-located sibling — in the checkout AND a synced .ai-toolkit/scripts/
+# target — so $SCRIPT_DIR/hub-inject.sh resolves both layouts; AFK_HUB_INJECT wins for tests.
+# Sourced AFTER log()/worktree-lib so its guarded fallbacks defer to ours.
+for _cand in "${AFK_HUB_INJECT:-}" "$SCRIPT_DIR/hub-inject.sh"; do
+  if [ -n "$_cand" ] && [ -f "$_cand" ]; then . "$_cand"; break; fi
+done
+unset _cand
+
 # --- now-clock ----------------------------------------------------------------
 # Current time, overridable via AFK_NOW for tests/cron.
 afk_now() { printf '%s\n' "${AFK_NOW:-$(date +%s)}"; }
@@ -317,17 +328,6 @@ inflight_worktrees() {
 inflight_issues() { inflight_worktrees | cut -f2; }
 
 # --- transcript helpers (newest .jsonl in the spoke's Claude project dir) -----
-_spoke_project_dir() {
-  local wt_path="$1" projects_root slug
-  projects_root="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
-  slug="$(printf '%s' "$wt_path" | sed 's/[^A-Za-z0-9]/-/g')"
-  printf '%s\n' "$projects_root/$slug"
-}
-_spoke_jsonl() {
-  local dir; dir="$(_spoke_project_dir "$1")"
-  [ -d "$dir" ] || return 0
-  ls -t "$dir"/*.jsonl 2>/dev/null | head -1
-}
 _transcript_idle_seconds() {
   local jsonl mtime; jsonl="$(_spoke_jsonl "$1")"
   [ -n "$jsonl" ] || return 0
@@ -393,15 +393,6 @@ _spoke_idle_seconds() {
   [ -n "$ref" ] || return 0
   printf '%s\n' "$(( $(afk_now) - ref ))"
 }
-# _transcript_mtime <wt_path> -> epoch mtime of the spoke's newest transcript, or empty.
-# The registration signal for inject verification: it bumps when the spoke writes its
-# next turn after an injected answer is submitted.
-_transcript_mtime() {
-  local jsonl; jsonl="$(_spoke_jsonl "$1")"
-  [ -n "$jsonl" ] || return 0
-  stat -f %m "$jsonl" 2>/dev/null || stat -c %Y "$jsonl" 2>/dev/null
-}
-
 # extract_pending_question <wt_path> -> the prompt the spoke is parked on, or empty when
 # it is NOT waiting. The same waiting signal hub-status.sh surfaces (an open
 # AskUserQuestion, or a trailing notification entry) — but here we return the actual
@@ -1993,19 +1984,6 @@ print(cmd[:2000].strip())
 PYEOF
 }
 
-# _pane_shows_permission_prompt <wt_path> -> true when the spoke's pane shows a Claude Code
-# permission dialog. The signature regex is tunable via AFK_PERMISSION_PROMPT_RE. Fail-CLOSED
-# (return 1) when tmux or the pane is unavailable: an unobservable pane is never treated as a
-# pending permission, so slot_state's read of a no-tmux spoke is unchanged.
-_pane_shows_permission_prompt() {
-  local wt="$1" target re
-  re="${AFK_PERMISSION_PROMPT_RE:-Do you want to proceed\?}"
-  command -v tmux >/dev/null 2>&1 || return 1
-  target="$(_spoke_pane_target "$wt")"
-  [ -n "$target" ] || return 1
-  tmux capture-pane -p -t "$target" 2>/dev/null | grep -Eq -- "$re"
-}
-
 # _permission_pending <wt_path> -> true when the spoke is parked on a permission dialog we can
 # act on: the pane shows the prompt AND the command it is trying to run is readable. The single
 # gate slot_state and decide_and_act share.
@@ -2013,21 +1991,6 @@ _permission_pending() {
   local wt="$1"
   _pane_shows_permission_prompt "$wt" || return 1
   [ -n "$(extract_pending_command "$wt")" ]
-}
-
-# approve_permission <wt_path> -> select "Yes" on the pending permission dialog and confirm the
-# spoke resumed. Sends "1" then a SEPARATE Enter — option 1 is "Yes" (this once), NEVER option 2
-# ("Yes, don't ask again"), so nothing is silently broadened — then verifies the transcript
-# advanced. rc 0 approved; rc 1 no pane / not confirmed (the caller escalates).
-approve_permission() {
-  local wt="$1" target before
-  command -v tmux >/dev/null 2>&1 || return 1
-  target="$(_spoke_pane_target "$wt")"
-  [ -n "$target" ] || return 1
-  before="$(_transcript_mtime "$wt")"
-  tmux send-keys -t "$target" 1 2>/dev/null || return 1
-  tmux send-keys -t "$target" Enter 2>/dev/null || return 1
-  _transcript_advanced "$wt" "$before"
 }
 
 # _reason_permission_record <wt> <issue> <decision> <rev> -> the post-DELIVERY record for a
@@ -2040,17 +2003,6 @@ _reason_permission_record() {
   _broker_journal_gh_comment "$issue" permission "$decision" "$rev"
   _afk_warned_arm "$issue"
   afk_emit_decision "$wt" warn
-}
-
-# _deny_permission <wt_path> <guidance> -> decline the pending permission dialog and tell the
-# spoke the reversible path: the hardened injector Esc-cancels the menu, then submits <guidance>
-# as a new message. Best-effort (rc from inject_and_verify) — a failed delivery still lets the
-# caller warn + retry on the backoff, never park.
-_deny_permission() {
-  local wt="$1" guidance="$2" target
-  target="$(_spoke_pane_target "$wt")"
-  [ -n "$target" ] || return 1
-  inject_and_verify "$wt" "$target" "$guidance" >/dev/null 2>&1
 }
 
 # _reason_permission <wt> <issue> <cmd> <classify_reason> -> the reasoner decides a permission
@@ -2186,142 +2138,6 @@ _decide_permission() {
 }
 
 # --- tmux injection + telemetry -----------------------------------------------
-
-# _spoke_pane_target <wt_path> -> "session:window" of the spoke's pane, or empty.
-# Paths are canonicalized on both sides (wt_realpath): a worktree under a symlinked
-# root (/tmp → /private/tmp on macOS) would otherwise miss its pane, drop a valid
-# answer, and silently escalate.
-_spoke_pane_target() {
-  local wt_path="$1" target path want
-  command -v tmux >/dev/null 2>&1 || return 0
-  want="$(wt_realpath "$wt_path")"; want="${want:-$wt_path}"
-  while IFS=$'\t' read -r target path; do
-    [ "$(wt_realpath "$path")" = "$want" ] && { printf '%s\n' "$target"; return 0; }
-  done < <(tmux list-panes -a -F '#{session_name}:#{window_index}'$'\t''#{pane_current_path}' 2>/dev/null)
-  return 0
-}
-
-# inject_answer <pane_target> <text> -> type the answer into the spoke and submit it.
-# A PLAN gate renders as an interactive AskUserQuestion MENU (tab/arrow/enter) that
-# IGNORES typed free text, so the most common gate is never answered by a bare inject
-# (issue #74). We send Esc FIRST: it cancels the menu, surfaces the questions as text,
-# and opens a free-text prompt — and is a no-op (nothing typed yet to clear) when the
-# spoke is already at a plain text prompt. A short, tunable pause lets that prompt
-# re-render before we type. Then `send-keys -l` sends the text literally (no key-name
-# interpretation) and a separate Enter submits — the gotcha-proof re-drive pattern.
-inject_answer() {
-  local target="$1" text="$2"
-  command -v tmux >/dev/null 2>&1 || return 1
-  [ -n "$target" ] || return 1
-  tmux send-keys -t "$target" Escape 2>/dev/null || return 1
-  sleep "${AFK_INJECT_MENU_PAUSE:-0.3}" 2>/dev/null || true
-  tmux send-keys -t "$target" -l -- "$text" 2>/dev/null || return 1
-  tmux send-keys -t "$target" Enter 2>/dev/null || return 1
-}
-
-# _answer_needle <text> -> the shared delivery needle: the first ~40 chars of the
-# answer's first line. One derivation feeds both delivery proofs (_composer_shows_text,
-# _answer_appended) so the pane and transcript checks can never grep diverging strings.
-_answer_needle() {
-  local needle="${1%%$'\n'*}"
-  printf '%s\n' "${needle:0:40}"
-}
-
-# _composer_shows_text <pane_target> <text> -> true when the pane still displays the
-# answer's needle, i.e. the paste is buffered in the composer, not submitted (#133).
-# Fail-OPEN: an unreadable pane (capture error, no tmux) reads as "not shown", so the
-# caller escalates instead of wedge-respawning a pane it cannot observe.
-_composer_shows_text() {
-  local target="$1" text="$2" needle
-  needle="$(_answer_needle "$text")"
-  [ -n "$needle" ] || return 1
-  tmux capture-pane -p -t "$target" 2>/dev/null | grep -qF -- "$needle"
-}
-
-# _transcript_sizes <wt_path> -> one "size<TAB>path" line per jsonl in the spoke's
-# project dir (empty when none). The pre-inject snapshot _answer_appended scans past:
-# delivery proof is the answer landing in bytes APPENDED after this point, so a canned
-# answer already sitting in an older record can neither satisfy nor disable the check.
-_transcript_sizes() {
-  local dir f
-  dir="$(_spoke_project_dir "$1")"
-  [ -d "$dir" ] || return 0
-  for f in "$dir"/*.jsonl; do
-    [ -e "$f" ] || continue
-    printf '%s\t%s\n' "$(stat -f %z "$f" 2>/dev/null || stat -c %s "$f" 2>/dev/null)" "$f"
-  done
-}
-
-# _answer_appended <wt_path> <text> <sizes> -> did the answer land as a USER record in
-# transcript bytes appended after the <sizes> snapshot? A submitted answer is recorded
-# as a user turn in the session jsonl, so a fresh match is positive proof the composer
-# let go (#201) — the pane alone cannot give it, because a successful submit also
-# ECHOES the message into the scrollback and keeps the needle visible. The match is
-# byte-level against the needle's JSON-encoded form (quotes/backslashes cannot hide
-# it; JSON keeps non-ASCII as raw UTF-8, and a needle byte-truncated mid-character by
-# a C-locale slice still matches as a byte prefix), then the matching line must parse
-# as a type:"user" record — a non-turn write coincidentally quoting the answer (a
-# re-rendered question record, a foreign sidecar) is NOT proof (#201 review). Only
-# appended regions are read — never a full transcript rescan; a rotated/unstat-able
-# file degrades to a from-0 scan of that file (fail-toward-pre-#201, accepted).
-# rc 0 found, rc 1 not found, rc 2 scan unavailable (no python3 / no project dir /
-# interpreter died — a crash exits 1 in python, so "not found" is the DISTINCT exit 3
-# and everything else maps to 2). Callers must treat 2 as "no evidence either way".
-_answer_appended() {
-  local wt="$1" text="$2" sizes="$3" needle dir
-  needle="$(_answer_needle "$text")"
-  [ -n "$needle" ] || return 1
-  dir="$(_spoke_project_dir "$wt")"
-  [ -d "$dir" ] || return 2
-  command -v python3 >/dev/null 2>&1 || return 2
-  _AFK_DIR="$dir" _AFK_NEEDLE="$needle" _AFK_SIZES="$sizes" python3 2>/dev/null <<'PYEOF'
-import glob, json, os, sys
-
-raw = os.environb.get(b"_AFK_NEEDLE", b"")
-for i, byte in enumerate(raw):
-    if byte < 0x20 and byte not in (9, 13):  # control char the escape map can't encode
-        raw = raw[:i]
-        break
-if not raw:
-    sys.exit(4)  # no usable needle: unavailable, not "not found"
-needle = (
-    raw.replace(b"\\", b"\\\\")
-    .replace(b'"', b'\\"')
-    .replace(b"\t", b"\\t")
-    .replace(b"\r", b"\\r")
-)
-offsets = {}
-for line in os.environb.get(b"_AFK_SIZES", b"").splitlines():
-    size, _, path = line.partition(b"\t")
-    if path:
-        try:
-            offsets[os.fsdecode(path)] = int(size)
-        except ValueError:
-            pass
-for path in glob.glob(os.path.join(os.environ["_AFK_DIR"], "*.jsonl")):
-    try:
-        with open(path, "rb") as fh:
-            offset = offsets.get(path, 0)
-            fh.seek(0, 2)
-            if offset > fh.tell():  # rotated/truncated since the snapshot: rescan
-                offset = 0
-            fh.seek(offset)
-            appended = fh.read()
-    except OSError:
-        continue
-    for line in appended.splitlines():
-        if needle not in line:
-            continue
-        try:
-            record = json.loads(line)
-        except Exception:
-            continue  # partial flush at the offset boundary: not a record yet
-        if isinstance(record, dict) and record.get("type") == "user":
-            sys.exit(0)
-sys.exit(3)
-PYEOF
-  case $? in 0) return 0 ;; 3) return 1 ;; *) return 2 ;; esac
-}
 
 # _scan_appended_turns <wt_path> <sizes> <mode> -> scan the transcript bytes APPENDED after the
 # <sizes> snapshot for a matching record. <mode> selects the filter:
@@ -2537,97 +2353,6 @@ PYEOF
   rc=$?
   rm -f "$rawfile" 2>/dev/null || true
   case "$rc" in 0) return 0 ;; 3) return 1 ;; *) return 2 ;; esac
-}
-
-# _answer_delivered <wt> <target> <text> <sizes> -> after _transcript_advanced
-# succeeded, decide whether the answer actually LEFT the composer (#201: an advance
-# alone scored two wedged pastes as "injected answer into #182" while the answer sat
-# unsubmitted). NOT delivered only on the full #182 signature — positive evidence the
-# composer still holds the text: the scan worked, the needle did NOT land in appended
-# transcript bytes (so a pane match is not the echo of a genuine submit), and a
-# readable pane still shows it. Everything short of that keeps the pre-#201 contract
-# (advance alone = delivered): an unobservable pane or unavailable scan is NO evidence
-# of a wedge, and a false success parks one spoke where a false NOT-delivered would
-# stray-Enter, escalate, or respawn healthy panes on every echoed submit.
-_answer_delivered() {
-  local wt="$1" target="$2" text="$3" sizes="$4" rc
-  _answer_appended "$wt" "$text" "$sizes"; rc=$?
-  [ "$rc" -eq 0 ] && return 0
-  [ "$rc" -eq 2 ] && return 0
-  _composer_shows_text "$target" "$text" || return 0
-  return 1
-}
-
-# _transcript_advanced <wt_path> <baseline_mtime> -> true once the spoke's newest
-# transcript mtime exceeds the baseline, polling up to AFK_INJECT_VERIFY_SECONDS in
-# AFK_INJECT_POLL_SECONDS steps. An empty baseline (no prior transcript) means any
-# transcript now is progress. Used to confirm an injected answer actually registered.
-_transcript_advanced() {
-  local wt="$1" before="$2" budget poll waited=0 now
-  # 60s (was 20): a slow first token after submit was misread as "did not register",
-  # feeding a false escalation that #171-subtask-3 then made sticky (#171-subtask-4).
-  budget="${AFK_INJECT_VERIFY_SECONDS:-60}"
-  poll="${AFK_INJECT_POLL_SECONDS:-2}"
-  while : ; do
-    now="$(_transcript_mtime "$wt")"
-    if [ -n "$now" ] && { [ -z "$before" ] || [ "$now" -gt "$before" ]; }; then return 0; fi
-    [ "$waited" -ge "$budget" ] && return 1
-    sleep "$poll" 2>/dev/null || true
-    waited=$(( waited + poll ))
-  done
-}
-
-# inject_and_verify <wt_path> <pane_target> <text> -> deliver the answer and CONFIRM
-# it registered: the spoke's transcript advanced AND the composer let go of the text
-# (#201: a non-turn write bumping the newest jsonl made "a file moved" score two
-# wedged pastes as success). The retry is a bare Enter, NEVER a re-paste: the common
-# failure is a buffered paste whose submitting Enter was lost, and the old full
-# re-inject duplicated the answer on top of it (#133, from #123/#124).
-#   rc 0 — delivered (the transcript advanced and the composer released the answer).
-#   rc 2 — WEDGED: the text survived the Enter-only retry (an unterminated paste no
-#          keystroke can submit or clear) — the caller respawns the pane.
-#   rc 3 — REFUTED: the transcript advanced but delivery was positively disproven (a
-#          readable pane still shows the needle and no user record landed in appended
-#          bytes — the #182 signature, minus the wedge-classifiable pane state). The
-#          advance is EXPLAINED: callers must NOT read it as the spoke moving on — a
-#          moved-on drop here leaves the gate tag and re-pastes forever (#201 review).
-#   rc 1 — not registered and no text observable in the composer — the caller escalates.
-inject_and_verify() {
-  local wt="$1" target="$2" text="$3" before baseline_shows=0 sizes vetoed=0
-  before="$(_transcript_mtime "$wt")"
-  # Baseline BEFORE pasting: a short answer often also appears in the rendered
-  # question above the composer. If the needle was already visible pre-inject,
-  # post-retry presence proves nothing — never classify wedged off a pre-existing
-  # match (a false wedge would kill a live pane where rc 1 safely escalates).
-  _composer_shows_text "$target" "$text" && baseline_shows=1
-  sizes="$(_transcript_sizes "$wt")"
-  inject_answer "$target" "$text" || return 1
-  if _transcript_advanced "$wt" "$before"; then
-    _answer_delivered "$wt" "$target" "$text" "$sizes" && return 0
-    # The advance may have raced the submit's own user-record write by milliseconds:
-    # one grace re-check before treating the veto as real (#201 review).
-    sleep "${AFK_INJECT_POLL_SECONDS:-2}" 2>/dev/null || true
-    _answer_appended "$wt" "$text" "$sizes" && return 0
-    vetoed=1
-    # #201: the advance was a non-turn write while the paste sat unsubmitted.
-    # Re-baseline so the retry waits for REAL post-Enter progress, then fall
-    # through to the same bare-Enter / wedge path a plain non-advance takes.
-    before="$(_transcript_mtime "$wt")"
-    log "  transcript advanced but the answer never left the composer — NOT delivered (#201)"
-  fi
-  log "  injected answer did not register — retrying with a bare Enter (never a re-paste)"
-  tmux send-keys -t "$target" Enter 2>/dev/null || true
-  if _transcript_advanced "$wt" "$before"; then
-    _answer_delivered "$wt" "$target" "$text" "$sizes" && return 0
-    vetoed=1
-  fi
-  # Last look before classifying: the bare-Enter submit can land in the same whole
-  # second as the re-baseline (the mtime advance never fires) — the appended user
-  # record, not the clock, is the truth (#201 review).
-  _answer_appended "$wt" "$text" "$sizes" && return 0
-  [ "$baseline_shows" -eq 0 ] && _composer_shows_text "$target" "$text" && return 2
-  [ "$vetoed" -eq 1 ] && return 3
-  return 1
 }
 
 # afk_emit_decision <wt_path> <status> -> one kind=agent span per auto-answer decision,
