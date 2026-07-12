@@ -9,6 +9,12 @@ This is a runbook: the one-time host setup, the cross-network trigger, and the f
 Monitoring while away is **not** a goal — the home Mac drains, and you read the outcome on
 return.
 
+> [!TIP]
+> For a **metro-scale trip** (under ~1 hour, the Mac stays powered on) you don't need a
+> second machine at all — [travel-local](./travel-local.md) keeps *this* Mac draining
+> lid-closed on the iPhone hotspot. Reach for the second-Mac path here when the laptop must
+> sleep, power off, or stay free for other work.
+
 > [!NOTE]
 > The home Mac runs the same OS and toolkit as your local hub, so tooling and credentials
 > behave identically. The only new concerns are **unattended survival** (stay awake, keep
