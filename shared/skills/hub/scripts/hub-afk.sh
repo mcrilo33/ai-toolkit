@@ -2607,9 +2607,56 @@ afk_hang_forensics_status() {
   printf '/afk: hang-forensics: %s bundle(s) captured [%s]\n' "$count" "$dir"
 }
 
+# --- duplicate-lineage detection (issue #252) ---------------------------------
+# The heartbeat records only ONE pid, so a SECOND live supervisor from a fast off/re-arm race is
+# invisible to afk_supervisor_state. _afk_supervisor_pids emits one pid per live supervisor
+# LINEAGE. A single supervisor forks many transient subshells that all inherit its
+# `bash <self-copy>/hub-afk.sh <window>` argv, so counting matching pids wildly over-counts;
+# instead we DEDUP by the distinct script path (each armed lineage re-execs from its own unique
+# `hub-afk-self.XXXXXX/hub-afk.sh` copy, #133), emitting the first pid seen per path. The
+# --watchdog keeper (its own copy), the transient subcommands, and any `bash -c` SOURCED /
+# one-liner form (the test harness) are excluded. Best-effort + overridable via
+# AFK_SUPERVISOR_PIDS_CMD (the file's *_CMD test-hook pattern) — the scan is host-dependent, so
+# the warning is warn-only and never acts. Goes through wt_pgrep (LC_ALL=C, the non-ASCII trap).
+_afk_supervisor_pids() {
+  if [ -n "${AFK_SUPERVISOR_PIDS_CMD:-}" ]; then bash -c "$AFK_SUPERVISOR_PIDS_CMD"; return; fi
+  command -v wt_pgrep >/dev/null 2>&1 || return 0
+  local self="$$" seen="" pid rest tok path
+  while read -r pid rest; do
+    case "$pid" in '' | *[!0-9]*) continue ;; esac
+    [ "$pid" = "$self" ] && continue   # never count the process running this scan
+    case " $rest " in
+      *' -c '* | *' --watchdog'* | *' --status'* | *' --off'* | *' --reconcile'* | *' --once'* | *' --help'* | *' -h '*) continue ;;
+    esac
+    path=""
+    for tok in $rest; do case "$tok" in */hub-afk.sh) path="$tok"; break ;; esac; done
+    [ -n "$path" ] || continue
+    case " $seen " in *" $path "*) continue ;; esac   # this lineage already counted
+    seen="$seen $path"
+    printf '%s\n' "$pid"
+  done < <(wt_pgrep -fl 'hub-afk' 2>/dev/null)
+}
+
+# afk_duplicate_supervisor_status -> a one-line WARNING for --status when MORE THAN ONE live
+# supervisor lineage is draining this checkout (#252): a fast off/re-arm can leave the old sleeper
+# alongside the new one, and the single-pid heartbeat hides it. Prints nothing for 0/1.
+afk_duplicate_supervisor_status() {
+  local pids n list
+  pids="$(_afk_supervisor_pids)"
+  n="$(printf '%s\n' "$pids" | grep -c '[0-9]' 2>/dev/null || true)"
+  case "$n" in '' | *[!0-9]*) n=0 ;; esac
+  [ "$n" -gt 1 ] || return 0
+  list="$(printf '%s' "$pids" | tr '\n' ' ' | sed 's/  */ /g;s/^ //;s/ $//')"
+  printf '/afk: WARNING — %s live supervisor lineages detected (pids: %s) — a duplicate drain can double-dispatch/double-land; run /afk --off --wait, then re-arm\n' \
+    "$n" "$list"
+}
+
 _status() {
   local state now
   state="$(afk_read_state)"; now="$(afk_now)"
+  # Surface a double-drain hazard first (#252), in both off and armed states — a leftover lineage
+  # after an --off is exactly the danger, so it must show even when .afk-state reads off.
+  afk_duplicate_supervisor_status
   if [ -z "$state" ]; then
     echo "/afk: off"
     # A durable escalation outlives the drain — surface it even when off, so the operator
