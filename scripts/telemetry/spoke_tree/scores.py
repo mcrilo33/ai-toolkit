@@ -52,6 +52,17 @@ _BLOCKED_COUNT_SCORE = "blocked_count"
 _RELAUNCH_COUNT_SCORE = "relaunch_count"
 _BLOCKED_COUNT_POINTER = ".ai-toolkit/blocked-count"
 _RELAUNCH_COUNT_POINTER = ".ai-toolkit/relaunch-count"
+# Normalization scores (#231): the size + effort a spoke's cost/latency should be read against,
+# so a cheap one-line fix and an expensive refactor are comparable across spokes/repos. The four
+# base counts come from the commit numstat + the cycle windows the builder already has; the two
+# derived ratios normalize the trace's cost/wall by size. A ratio is skipped (not 0) when its
+# denominator is 0 so an empty spoke never divides by zero.
+_FILES_CHANGED_SCORE = "files_changed"
+_LINES_CHANGED_SCORE = "lines_changed"
+_COMMITS_SCORE = "commits"
+_SUBTASKS_SCORE = "subtasks"
+_COST_PER_CHANGED_LINE_SCORE = "cost_per_changed_line"
+_WALL_PER_SUBTASK_SCORE = "wall_per_subtask"
 # Score names — Langfuse sums/charts numeric scores (it cannot chart arbitrary metadata).
 _PERMISSION_WAIT_SCORE = "permission_wait_ms"  # per blocked tool observation
 _GATE_PARK_SCORE = "gate_park_ms"  # trace-level PLAN-gate park wait
@@ -264,6 +275,18 @@ def build_score_events(
             )
         )
     return events
+
+
+def build_normalization_scores(
+    spoke_run_id: str,
+    commits: list[dict[str, Any]],
+    batch: list[IngestEvent],
+    subtasks: int,
+    *,
+    base_ts: str,
+) -> list[IngestEvent]:
+    """RED stub (#231) — GREEN emits files/lines/commits/subtasks + the two derived ratios."""
+    return []
 
 
 def _read_count_pointer(root: Path, pointer: str) -> int:

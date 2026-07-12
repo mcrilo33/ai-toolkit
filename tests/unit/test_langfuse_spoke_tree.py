@@ -76,7 +76,11 @@ from telemetry.spoke_tree.ids import _CYCLE_STEP_PREFIX
 from telemetry.spoke_tree.llm_decomp import _decomp_metadata
 from telemetry.spoke_tree.loaded_context import find_request_files
 from telemetry.spoke_tree.metadata import apply_outcome_tag, read_outcome
-from telemetry.spoke_tree.scores import _step_phase, build_outcome_count_scores
+from telemetry.spoke_tree.scores import (
+    _step_phase,
+    build_normalization_scores,
+    build_outcome_count_scores,
+)
 from telemetry.spoke_tree.steps import _STEP_PREFIX, build_cycle_windows, build_step_windows
 
 SPOKE = "feature/22-demo+1700000000"
@@ -4966,6 +4970,94 @@ class TestOutcomeCountScores:
         scores = build_outcome_count_scores(SPOKE, [], tmp_path, base_ts="2026-01-01T00:00:00Z")
 
         body = self._by_name(scores, "gate_park_count")[0]["body"]
+        assert body["traceId"] == trace_id_for(SPOKE)
+        assert body["dataType"] == "NUMERIC"
+        assert "observationId" not in body
+
+
+class TestNormalizationScores:
+    """#231: view-build-time size/effort scores that normalize a spoke's cost + latency.
+
+    The four base counts come from the commit numstat the builder already parses and the cycle
+    windows it already computes; the two derived ratios normalize the trace's total generation
+    cost and root wall-clock by size. A ratio is skipped (not scored 0) when its denominator is
+    0, so an empty spoke never divides by zero. All are trace-level numeric scores.
+    """
+
+    def _commits(self) -> list[dict]:
+        return [
+            {"sha": "a", "additions": 10, "deletions": 2, "files": ["x.py", "y.py"]},
+            {"sha": "b", "additions": 5, "deletions": 3, "files": ["y.py", "z.py"]},
+        ]
+
+    def _batch(self, *, total_ms: int, cost: float) -> list[dict]:
+        root = {
+            "id": root_id_for(SPOKE),
+            "type": "span-create",
+            "body": {
+                "id": root_id_for(SPOKE),
+                "metadata": {"rollup": {"duration": {"total_ms": total_ms}}},
+            },
+        }
+        gen = {
+            "id": "g1",
+            "type": "generation-create",
+            "body": {"id": "g1", "costDetails": {"total": cost}},
+        }
+        return [root, gen]
+
+    def _by_name(self, scores: list[dict], name: str) -> list[dict]:
+        return [s for s in scores if s["body"]["name"] == name]
+
+    def _val(self, scores: list[dict], name: str) -> float:
+        return self._by_name(scores, name)[0]["body"]["value"]
+
+    def test_base_counts_from_commits_and_subtasks(self) -> None:
+        scores = build_normalization_scores(
+            SPOKE, self._commits(), self._batch(total_ms=6000, cost=1.0), 3, base_ts="2026-01-01T00:00:00Z"
+        )
+
+        assert self._val(scores, "files_changed") == 3  # x, y, z — y de-duplicated
+        assert self._val(scores, "lines_changed") == 20  # (10+2) + (5+3)
+        assert self._val(scores, "commits") == 2
+        assert self._val(scores, "subtasks") == 3
+
+    def test_cost_per_changed_line_divides_total_cost_by_lines(self) -> None:
+        scores = build_normalization_scores(
+            SPOKE, self._commits(), self._batch(total_ms=6000, cost=2.0), 3, base_ts="2026-01-01T00:00:00Z"
+        )
+
+        assert self._val(scores, "cost_per_changed_line") == pytest.approx(2.0 / 20)
+
+    def test_wall_per_subtask_divides_root_duration_by_subtasks(self) -> None:
+        scores = build_normalization_scores(
+            SPOKE, self._commits(), self._batch(total_ms=6000, cost=1.0), 3, base_ts="2026-01-01T00:00:00Z"
+        )
+
+        assert self._val(scores, "wall_per_subtask") == pytest.approx(2000)
+
+    def test_no_cost_ratio_when_no_lines_changed(self) -> None:
+        scores = build_normalization_scores(
+            SPOKE, [], self._batch(total_ms=6000, cost=1.0), 3, base_ts="2026-01-01T00:00:00Z"
+        )
+
+        assert self._val(scores, "lines_changed") == 0
+        assert self._by_name(scores, "cost_per_changed_line") == []
+
+    def test_no_wall_ratio_when_no_subtasks(self) -> None:
+        scores = build_normalization_scores(
+            SPOKE, self._commits(), self._batch(total_ms=6000, cost=1.0), 0, base_ts="2026-01-01T00:00:00Z"
+        )
+
+        assert self._val(scores, "subtasks") == 0
+        assert self._by_name(scores, "wall_per_subtask") == []
+
+    def test_normalization_scores_are_trace_level_numeric(self) -> None:
+        scores = build_normalization_scores(
+            SPOKE, self._commits(), self._batch(total_ms=6000, cost=1.0), 3, base_ts="2026-01-01T00:00:00Z"
+        )
+
+        body = self._by_name(scores, "files_changed")[0]["body"]
         assert body["traceId"] == trace_id_for(SPOKE)
         assert body["dataType"] == "NUMERIC"
         assert "observationId" not in body
