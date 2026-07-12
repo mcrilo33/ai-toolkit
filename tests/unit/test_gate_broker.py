@@ -935,6 +935,28 @@ def test_spoke_activity_appended_classifies_turns(spoke_repo: Path, tmp_path: Pa
         "an unreadable transcript is rc 2 (unavailable) — the void gate voids on it, fail-safe"
     )
 
+    # A record whose `message` is a non-dict must not crash the scanner (would surface as rc 2).
+    jsonl.write_text(json.dumps({"type": "assistant", "message": "oops-a-string"}) + "\n")
+    malformed = _call(f"_spoke_activity_appended '{spoke_repo}' ''; echo RC=$?", env=env)
+    assert malformed.stdout.strip().splitlines()[-1] == "RC=1", (
+        "a non-dict message must be skipped as non-activity, never crash the scan into rc 2"
+    )
+
+    # Truncation guard: activity mode must NOT from-0 rescan (which would match the PRE-park
+    # AskUserQuestion — itself an assistant tool_use — and mask a real escape). Feed a `sizes`
+    # snapshot claiming a larger offset than the file holds, so the truncation branch fires.
+    jsonl.write_text(
+        json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Ask"}]}}
+        )
+        + "\n"
+    )
+    inflated = f"999999\t{jsonl}"
+    truncated = _call(f"_spoke_activity_appended '{spoke_repo}' '{inflated}'; echo RC=$?", env=env)
+    assert truncated.stdout.strip().splitlines()[-1] == "RC=1", (
+        "activity mode must skip a truncated file, not from-0 match the pre-park record (fail-safe)"
+    )
+
 
 def test_broker_service_gate_isolates_reasoner_writes_from_live_tree(
     spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path

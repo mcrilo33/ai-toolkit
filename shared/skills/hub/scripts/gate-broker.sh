@@ -2277,7 +2277,8 @@ def matches(record):
     # activity mode also counts the spoke's OWN assistant work: a tool_use (it ran Edit/Write/
     # Bash) or a non-empty text turn. The isolated reasoner never writes the live transcript.
     if kind == "assistant":
-        content = (record.get("message") or {}).get("content") or []
+        msg = record.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
         if isinstance(content, list):
             for block in content:
                 if not isinstance(block, dict):
@@ -2294,7 +2295,13 @@ for path in glob.glob(os.path.join(os.environ["_AFK_DIR"], "*.jsonl")):
         with open(path, "rb") as fh:
             offset = offsets.get(path, 0)
             fh.seek(0, 2)
-            if offset > fh.tell():  # rotated/truncated since the snapshot: rescan
+            if offset > fh.tell():  # rotated/truncated since the snapshot
+                # typed mode fails toward a from-0 rescan (fail-toward-pre-#201). activity mode must
+                # NOT: a from-0 scan would match the PRE-park record (an AskUserQuestion IS an
+                # assistant tool_use) and mask a real escape (rc 0 -> drop). Skip the file instead,
+                # so the caller reads "no activity" (rc 1) and fails SAFE (voids) on a lost boundary.
+                if mode == "activity":
+                    continue
                 offset = 0
             fh.seek(offset)
             appended = fh.read()
