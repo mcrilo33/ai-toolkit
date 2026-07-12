@@ -242,6 +242,7 @@ from telemetry.spoke_tree.scores import (
     build_mcp_call_scores,
     build_mcp_carry_cost_scores,
     build_mcp_def_load_scores,
+    build_normalization_scores,
     build_outcome_count_scores,
     build_rule_carry_cost_scores,
     build_rule_invocation_scores,
@@ -905,6 +906,7 @@ class EnrichmentContext:
     base_ts: str
     root: Path
     n_requests: int = 0
+    commits: list[dict[str, Any]] = field(default_factory=list)
     # Accumulated outputs (populated by the passes, read by the summary line).
     context_events: list[IngestEvent] = field(default_factory=list)
     rows: list[dict[str, object]] = field(default_factory=list)
@@ -923,6 +925,7 @@ class EnrichmentContext:
     mcp_def_load_scores: list[IngestEvent] = field(default_factory=list)
     agent_verdict_scores: list[IngestEvent] = field(default_factory=list)
     outcome_count_scores: list[IngestEvent] = field(default_factory=list)
+    normalization_scores: list[IngestEvent] = field(default_factory=list)
 
 
 def _enrich_loaded_context(ctx: EnrichmentContext) -> None:
@@ -1071,6 +1074,18 @@ def _enrich_outcome_counts(ctx: EnrichmentContext) -> None:
     )
 
 
+def _enrich_normalization(ctx: EnrichmentContext) -> None:
+    """Emit the #231 files/lines/commits/subtasks + derived cost-per-line / wall-per-subtask scores.
+
+    ``subtasks`` is the cycle-window count (the ledger subtask count); the batch's duration rollup
+    and generation costs are read here, so this runs after the batch is assembled.
+    """
+    subtasks = len(build_cycle_windows(ctx.traces, ctx.tool_content))
+    ctx.normalization_scores = build_normalization_scores(
+        ctx.spoke_run_id, ctx.commits, ctx.batch, subtasks, base_ts=ctx.base_ts
+    )
+
+
 def _enrich_agent_verdict(ctx: EnrichmentContext) -> None:
     """Emit per-agent ``agent_verdict:<type>`` scores from reviews + sub-agent outcomes (#233).
 
@@ -1102,6 +1117,7 @@ _ENRICHMENTS: tuple[tuple[str, Callable[[EnrichmentContext], None]], ...] = (
     ("mcp-def-loads", _enrich_mcp_def_loads),
     ("agent-verdict", _enrich_agent_verdict),
     ("outcome-counts", _enrich_outcome_counts),
+    ("normalization", _enrich_normalization),
 )
 
 
@@ -1174,6 +1190,7 @@ def main(argv: list[str] | None = None) -> int:
         base_ts=base_ts,
         root=args.root.resolve(),
         n_requests=main_loop_request_count(traces),
+        commits=commits,
     )
     for _name, enrich in _ENRICHMENTS:
         enrich(ctx)
@@ -1191,7 +1208,8 @@ def main(argv: list[str] | None = None) -> int:
         + ctx.mcp_call_scores
         + ctx.mcp_def_load_scores
         + ctx.agent_verdict_scores
-        + ctx.outcome_count_scores,
+        + ctx.outcome_count_scores
+        + ctx.normalization_scores,
         post,
     )
 
@@ -1217,6 +1235,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(ctx.mcp_def_load_scores)} mcp-def-load scores emitted, "
         f"{len(ctx.agent_verdict_scores)} agent-verdict scores emitted, "
         f"{len(ctx.outcome_count_scores)} outcome-count scores emitted, "
+        f"{len(ctx.normalization_scores)} normalization scores emitted, "
         f"{len(commits)} commit nodes synthesized, "
         f"tagged mode={mode} lane={lane} outcome={outcome}; "
         f"{len(cycle_batch) - 2} observations assembled under cycle trace {cycle_trace_id}"

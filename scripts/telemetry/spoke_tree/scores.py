@@ -20,7 +20,12 @@ from typing import Any
 
 from telemetry.spoke_tree.commits import _gate_park_ms
 from telemetry.spoke_tree.cycle import _POST_STEP_KEY, _PRE_STEP_KEY
-from telemetry.spoke_tree.ids import _CYCLE_STEP_PREFIX, cycle_trace_id_for, trace_id_for
+from telemetry.spoke_tree.ids import (
+    _CYCLE_STEP_PREFIX,
+    cycle_trace_id_for,
+    root_id_for,
+    trace_id_for,
+)
 from telemetry.spoke_tree.observations import (
     _MCP_GROUP_PREFIX,
     _POST_STEP_NAME,
@@ -277,6 +282,22 @@ def build_score_events(
     return events
 
 
+def _root_total_ms(spoke_run_id: str, batch: list[IngestEvent]) -> int:
+    """Return the View A root's subtree wall-clock in ms from its duration rollup, or 0 (#231).
+
+    ``_apply_container_rollups`` stamps ``metadata.rollup.duration.total_ms`` on the synthetic
+    root; a batch built before that pass (or a malformed one) yields 0 rather than crashing.
+    """
+    root_id = root_id_for(spoke_run_id)
+    for event in batch:
+        if event["body"].get("id") != root_id:
+            continue
+        duration = ((event["body"].get("metadata") or {}).get("rollup") or {}).get("duration") or {}
+        total = duration.get("total_ms")
+        return int(total) if isinstance(total, (int, float)) else 0
+    return 0
+
+
 def build_normalization_scores(
     spoke_run_id: str,
     commits: list[dict[str, Any]],
@@ -285,8 +306,60 @@ def build_normalization_scores(
     *,
     base_ts: str,
 ) -> list[IngestEvent]:
-    """RED stub (#231) — GREEN emits files/lines/commits/subtasks + the two derived ratios."""
-    return []
+    """Build the trace-level normalization scores that size a spoke's cost + latency (#231).
+
+    A spoke's raw cost/wall-clock is only comparable across spokes/repos once normalized by how
+    much it changed and how many subtasks it ran. Four base counts come from data the builder
+    already has — the commit numstat (:func:`_parse_commits`) and the cycle windows — plus two
+    derived ratios:
+
+    - ``files_changed`` — distinct paths touched across all commits.
+    - ``lines_changed`` — total additions + deletions across all commits.
+    - ``commits`` — number of commits on the branch.
+    - ``subtasks`` — number of cycle windows (the ledger subtask count), passed in.
+    - ``cost_per_changed_line`` — the trace's total generation cost (Σ ``costDetails``, the same
+      figure :func:`build_step_total_cost_scores` reconciles to ``totalCost``) ÷ ``lines_changed``.
+    - ``wall_per_subtask`` — the root subtree wall-clock (ms) ÷ ``subtasks``.
+
+    The four base counts are always emitted (0 included); a ratio is SKIPPED when its denominator
+    is 0 so an empty spoke never divides by zero. All are trace-level NUMERIC scores; ids derive
+    from the spoke run id so a rerun overwrites the same scores.
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids + the root id).
+        commits: The parsed ``git log --numstat`` records (``files`` / ``additions`` / ``deletions``).
+        batch: The assembled View A events (its generations' ``costDetails`` + root duration read).
+        subtasks: The cycle-window count (the ledger subtask count).
+        base_ts: ISO timestamp stamped on every score event.
+
+    Returns:
+        The four base-count ``score-create`` events plus each derived ratio whose denominator is
+        non-zero.
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    files_changed = len({path for commit in commits for path in commit.get("files") or []})
+    lines_changed = sum(
+        int(commit.get("additions") or 0) + int(commit.get("deletions") or 0) for commit in commits
+    )
+    total_cost = sum(
+        _generation_total_cost(event["body"])
+        for event in batch
+        if event.get("type") == "generation-create"
+    )
+    values: dict[str, float] = {
+        _FILES_CHANGED_SCORE: files_changed,
+        _LINES_CHANGED_SCORE: lines_changed,
+        _COMMITS_SCORE: len(commits),
+        _SUBTASKS_SCORE: subtasks,
+    }
+    if lines_changed:
+        values[_COST_PER_CHANGED_LINE_SCORE] = total_cost / lines_changed
+    if subtasks:
+        values[_WALL_PER_SUBTASK_SCORE] = _root_total_ms(spoke_run_id, batch) / subtasks
+    return [
+        _score_event(spoke_run_id, name=name, value=value, trace_id=trace_id, base_ts=base_ts)
+        for name, value in values.items()
+    ]
 
 
 def _read_count_pointer(root: Path, pointer: str) -> int:
