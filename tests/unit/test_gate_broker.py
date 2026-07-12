@@ -773,6 +773,57 @@ def test_broker_service_gate_voids_answer_when_reasoner_mutates_tracked_content(
     assert "worktree" in result.stderr.lower() or "mutat" in result.stderr.lower(), result.stderr
 
 
+def test_broker_service_gate_no_void_when_spoke_self_resumes_during_reasoning(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    # #244: since #237 the reasoner runs in an isolated snapshot copy, so a LIVE-tree diff
+    # during run_answerer is almost always the SPOKE's OWN concurrent edits — it self-resumed
+    # mid-GREEN — not the reasoner. The read-only void must attribute a tree diff to the
+    # reasoner ONLY when the spoke did NOT move (still parked on the same prompt). Here the
+    # spoke self-resumes: the answerer CMD both edits the live tree AND rewrites the live
+    # transcript to a moved-on (no longer parked) state — so _still_parked_same is false via
+    # the PARK signal (clock-granularity-independent). The stale answer is dropped, NOT voided:
+    # no gate-voided marker, no blocked tag. Contrast the :750 backstop, where the spoke stays
+    # parked (transcript untouched) and the same absolute write DOES void.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (spoke_repo / "tracked.txt").write_text("original")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=spoke_repo, check=True, capture_output=True)
+    live_jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    os.utime(
+        live_jsonl, (1_000_000_000, 1_000_000_000)
+    )  # pin OLD so the spoke's resume reads as newer
+    # An assistant text turn carries no AskUserQuestion — extract_pending_question goes empty, so
+    # the spoke reads as MOVED ON off the park (independent of the second-granularity mtime).
+    resumed = json.dumps(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "resuming GREEN"}]}}
+    )
+    env = {
+        **waiting_spoke_env,
+        # Model the spoke self-resuming DURING the reason step: it edits its own tracked file (a
+        # live-tree diff the fingerprint sees) AND its transcript advances off the parked prompt.
+        "AFK_ANSWERER_CMD": (
+            f"printf 'edited by the spoke' > '{spoke_repo}/tracked.txt'; "
+            f"printf '%s\\n' '{resumed}' > '{live_jsonl}'; "
+            "printf 'ANSWER: go ahead'"
+        ),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert not (statedir / "gate-voided-5").exists(), (
+        "the spoke's own concurrent edit must not be voided as a reasoner mutation"
+    )
+    log = Path(env["_READY_LOG"]).read_text() if Path(env["_READY_LOG"]).exists() else ""
+    assert "--blocked 5" not in log, f"a self-resumed spoke must not be blocked: {log}"
+    assert "voiding its answer" not in result.stderr, (
+        f"a self-resumed spoke's edit must not read as a reasoner void: {result.stderr}"
+    )
+
+
 def test_broker_service_gate_isolates_reasoner_writes_from_live_tree(
     spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
 ) -> None:
