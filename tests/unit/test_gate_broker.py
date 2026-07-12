@@ -1845,6 +1845,45 @@ def test_slot_state_task_output_does_not_lift_hard_ceiling(
     assert result.stdout.strip() == "reap", result.stdout + result.stderr
 
 
+def test_slot_state_permission_park_beats_ceiling(spoke_repo: Path, tmp_path: Path) -> None:
+    # #246: a spoke parked on a permission dialog must classify `waiting` — never `reap` —
+    # even when it is over BOTH the wall-clock ceiling (AFK_SPOKE_MAX_MINUTES) and the idle
+    # ceiling (AFK_IDLE_MINUTES). Pre-fix the ceiling reap preceded park detection, so the
+    # over-ceiling park was reaped + revived, re-raising the same dialog forever.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    # An unresolved Bash tool_use → extract_pending_command non-empty → _permission_pending true.
+    jsonl.write_text(json.dumps(_bash_tool_record("git reset -q; git add tests/x.py")) + "\n")
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # stale transcript → also over the idle ceiling
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        "esac\nexit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "dispatch-5.epoch").write_text("1000\n")  # dispatched long ago ⇒ over the ceiling
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_NOW": "1000000000",  # ~31700 min since dispatch → well over the ceiling AND idle
+        },
+    )
+
+    assert result.stdout.strip() == "waiting", result.stdout + result.stderr
+
+
 def test_broker_service_gate_injects_despite_reasoner_transcript(
     spoke_repo: Path, reasoner_env: dict[str, str], tmp_path: Path
 ) -> None:

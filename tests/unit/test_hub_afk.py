@@ -6711,6 +6711,52 @@ def test_reap_pass_revives_pane_alive_idle_spoke(tmp_path: Path) -> None:
     assert "revive" in (statedir / "decision-journal.jsonl").read_text()
 
 
+def test_reap_or_resume_permission_park_routes_to_answerer(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #246 defense-in-depth: even over the ceiling with a live pane, a spoke STILL parked on a
+    # permission dialog must be ANSWERED (routed to decide_and_act), NOT revived — reviving only
+    # re-raises the same dialog. slot_state already keeps a park out of `reap`; this backstops a
+    # same-tick slot_state flicker. Pre-fix _reap_or_resume revived the over-ceiling/live pane.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    # A safe self-op the mechanical classifier auto-approves → the answerer presses "1".
+    _write_transcript(pd, [_bash_tool_record("git reset -q; git add tests/x.py")])
+    jsonl = pd / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+    ready_stub, ready_log = _blocked_recording_ready(tmp_path)
+    # Live pane (list-panes maps afk:1) + capture-pane shows the permission prompt; the first
+    # Enter clears it and touches the transcript so approve_permission confirms the resume.
+    fake_bin, tmux_log = _injector_tmux(
+        tmp_path, capture=_PROMPT, pane_path=spoke_repo, clear_on_enter=1, touch=jsonl
+    )
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "dispatch-5.epoch").write_text("1000\n")  # dispatched long ago ⇒ over the ceiling
+
+    result = _call(
+        f"_reap_or_resume '{spoke_repo}' 5",
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "SPOKE_READY": str(ready_stub),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_NOW": "1000000000",  # well over AFK_SPOKE_MAX_MINUTES since dispatch
+            "AFK_INJECT_VERIFY_SECONDS": "0",
+            "AFK_JOURNAL_GH_COMMENT": "0",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = tmux_log.read_text()
+    assert "send-keys -t afk:1 1" in calls, f"the park must be ANSWERED (option 1): {calls}"
+    assert "new-window" not in calls, f"a live park must NOT be revived: {calls}"
+    assert "revive #5" not in result.stderr, f"a live park must NOT be revived: {result.stderr}"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "a safe park is answered, not escalated to blocked"
+    )
+
+
 def test_reap_pass_revival_exhausted_parks_last_not_blocked(tmp_path: Path) -> None:
     # After a revival already happened this window, a second stuck tick warns-and-parks-LAST
     # (retried at low frequency on the backoff) — NEVER blocked, NEVER killed/abandoned.
