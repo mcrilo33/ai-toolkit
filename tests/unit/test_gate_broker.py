@@ -3012,6 +3012,23 @@ def test_note_tip_progress_clears_done_epoch_on_tip_advance(
     assert not (statedir / "done-5.epoch").exists()
 
 
+def test_note_tip_progress_clears_done_epoch_on_first_sighting(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The revival gap: a done-epoch can be live with NO recorded tip (fresh arm wiped tip-<issue>,
+    # then a first tick saw the spoke already ready-at-tip and stamped via slot_state's early
+    # return, never running this fn). If that spoke is later revived, the first non-terminal
+    # sighting here must drop the stale epoch so a re-ready re-stamps fresh — else condition 4
+    # measures from the pre-revival transition and false-fires (#263).
+    statedir = tmp_path / "afk-state"
+    statedir.mkdir(parents=True)
+    (statedir / "done-5.epoch").write_text("1700000000\n")  # live epoch, tip-5 absent
+
+    _call(f"_afk_note_tip_progress '{spoke_repo}' 5", env={"AFK_STATE_DIR": str(statedir)})
+
+    assert not (statedir / "done-5.epoch").exists()
+
+
 # subtask 4: the inject-verify budget default widened 20 -> 60 ──
 
 

@@ -322,6 +322,11 @@ _afk_note_tip_progress() {
   local wt="$1" issue="$2" tip dir f last
   tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)" || return 0
   [ -n "$tip" ] || return 0
+  # slot_state calls this ONLY after every terminal return, so a spoke observed here is
+  # non-terminal at this tip → any live done-epoch is stale. Drop it unconditionally (#263) so a
+  # revived-then-re-ready spoke re-stamps a fresh un-landed clock instead of measuring from the
+  # pre-revival transition — covers first-sighting, tip-advance, and unchanged-tip alike.
+  clear_done_epoch "$issue"
   dir="$(_afk_state_dir)"; f="$dir/tip-$issue"
   last="$( [ -f "$f" ] && cat "$f" 2>/dev/null )"
   if [ -z "$last" ]; then
@@ -330,7 +335,6 @@ _afk_note_tip_progress() {
   elif [ "$last" != "$tip" ]; then
     printf '%s\n' "$tip" > "$f" 2>/dev/null || true
     stamp_progress_epoch "$issue"
-    clear_done_epoch "$issue"    # #263: tip moved past any terminal → a later done re-stamps fresh
     _afk_clear_warned "$issue"   # #241: a tip advance is genuine progress → drop the warned-retry backoff
   fi
   return 0
