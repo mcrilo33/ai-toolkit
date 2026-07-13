@@ -822,6 +822,34 @@ _tripwire_benign_ref_change() {
   git merge-base --is-ancestor "$b_sha" "$a_sha" 2>/dev/null   # FF advance only
 }
 
+# The control-plane marker-tag namespaces an /afk drain or hub-watchdog stamps on a
+# live hub checkout: needs-human-land/* (the watchdog escalate-only land marker),
+# ready/*, accept/* (spoke-ready), blocked/* and gate/* (spoke state). Used by the
+# tripwire to tell these concurrent drain stamps apart from a #31 escape.
+_tripwire_marker_ns() {
+  case "$1" in
+    refs/tags/needs-human-land/* | refs/tags/ready/* | refs/tags/accept/* | \
+      refs/tags/blocked/* | refs/tags/gate/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# A CREATED control-plane marker tag is a concurrent drain/watchdog stamp, never a
+# #31 escape: a hermetic test writes only to its own tmpdir and never creates these
+# real namespaces. The watchdog's needs-human-land/<N> land marker, stamped mid-land
+# while a red-proof backstop node ran, was read as an escape and its restore deleted
+# the escalation (issue #272). Tolerated as a CREATION ONLY — a MOVE or DELETE of
+# such a ref is still a breach, so the #31 protection is not weakened. Deliberately
+# SEPARATE from (and narrower than) _tripwire_benign_ref_change (sibling-branch FF
+# moves), which #267 ruled must not be widened.
+_tripwire_benign_marker_creation() {
+  local name="$1" before="$2" after="$3" b_sha a_sha
+  _tripwire_marker_ns "$name" || return 1
+  b_sha="$(printf '%s\n' "$before" | awk -v r="$name" '$1=="ref" && $3==r {print $2; exit}')"
+  a_sha="$(printf '%s\n' "$after"  | awk -v r="$name" '$1=="ref" && $3==r {print $2; exit}')"
+  [ -z "$b_sha" ] && [ -n "$a_sha" ]                 # appeared during the run (creation) only
+}
+
 # Compare a prior snapshot ($1) against the markers now. Prints the names of the
 # markers that changed (e.g. `refs/heads/main`, `core.bare`) and returns 1 when
 # anything changed, 0 when the repo is intact. Benign moves of live sibling
@@ -851,6 +879,7 @@ tripwire_check() {
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     _tripwire_benign_ref_change "$name" "$before" "$after" "$siblings" && continue
+    _tripwire_benign_marker_creation "$name" "$before" "$after" && continue   # issue #272
     survivors+="${name}"$'\n'
   done <<< "$raw"
   if [ -z "$survivors" ]; then
@@ -935,6 +964,14 @@ tripwire_restore() {
     fi
     if printf '%s\n' "$wt_refs" | grep -qxF "$cur_ref"; then
       echo "tripwire: NOT deleting $cur_ref — checked out in a registered worktree." >&2
+      continue
+    fi
+    # A concurrent control-plane marker stamp (a needs-human-land/* escalation, a
+    # ready/* etc.) is not this run's to destroy: when a genuine escape forces a
+    # restore, deleting a marker created alongside it would silently lose the
+    # handoff (issue #272). The tripwire never creates these; leave them intact.
+    if _tripwire_marker_ns "$cur_ref"; then
+      echo "tripwire: NOT deleting $cur_ref — a concurrent control-plane marker (issue #272)." >&2
       continue
     fi
     git update-ref -d "$cur_ref" 2>/dev/null || true
