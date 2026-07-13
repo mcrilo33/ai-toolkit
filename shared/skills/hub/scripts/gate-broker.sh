@@ -2154,6 +2154,96 @@ classify_danger() {
   return 0
 }
 
+# --- Tier-3 headless LLM judge (issue #261) -----------------------------------
+# The residue tiers 1-2 did not resolve goes to a cheap headless judge: a TOOLLESS `claude -p`
+# (pure text yes/no classification, no tools granted, so it makes NO tool calls and can never
+# itself trigger the deny-wall or recurse), Haiku, bounded ~2s. FAIL-CLOSED: a timeout, a
+# nonzero exit, or an unparseable verdict all read as DANGEROUS -- an unjudgeable risky command
+# does not run under bypass (the caller warns + journals instead). Verdicts are cached by command
+# hash so a command repeated across a drain costs at most one LLM call.
+
+# _judge_cache_dir -> the per-run verdict cache dir (under the afk state dir, cleared per window).
+_judge_cache_dir() { printf '%s\n' "$(_afk_state_dir)/judge-cache"; }
+
+# _judge_cache_key <cmd> -> a stable content hash of the command (the cache filename). Empty
+# when shasum is unavailable, which disables caching (every call runs the judge) but is harmless.
+_judge_cache_key() { printf '%s' "$1" | shasum -a 256 2>/dev/null | awk '{print $1}'; }
+
+# _judge_timeout -> the judge wall-clock budget in seconds (AFK_JUDGE_TIMEOUT, default 2). A
+# non-numeric or non-positive override falls back to the default so the bound is never lifted.
+_judge_timeout() {
+  local s="${AFK_JUDGE_TIMEOUT:-2}"
+  case "$s" in '' | *[!0-9]*) s=2 ;; esac
+  [ "$s" -lt 1 ] && s=2
+  printf '%s\n' "$s"
+}
+
+# _judge_base_cmd -> the headless judge command (AFK_JUDGE_CMD override for tests). TOOLLESS by
+# construction: `--allowedTools ''` grants NO tools, so the judge can make no tool calls -- it can
+# never fire afk_danger_guard or recurse. Haiku + `-p` for a cheap, non-interactive run.
+# UPGRADE: confirm `--allowedTools ''` grants zero tools on the deployed CLI; if a future CLI
+# defaults some tool on, switch to an explicit `--disallowedTools '*'` or equivalent.
+_judge_base_cmd() {
+  printf '%s\n' "${AFK_JUDGE_CMD:-claude -p --no-session-persistence --model ${AFK_JUDGE_MODEL:-claude-haiku-4-5} --allowedTools ''}"
+}
+
+# _judge_prompt <cmd> -> the tight classification prompt. Plain ASCII (no backticks/parens in a
+# way that would trip bash 3.2, and this is a normal heredoc, not $()-nested).
+_judge_prompt() {
+  local cmd="$1"
+  cat <<EOF
+You are a security gate for an UNATTENDED coding agent running inside its OWN git worktree
+under bypassPermissions -- no human will ever see a prompt. Decide whether the shell command
+below is DANGEROUS to run unattended. It is DANGEROUS if its effects can reach OUTSIDE the
+worktree: writing or deleting files outside it, network egress to an untrusted host, reading
+credentials or the keychain, touching the main branch or other git refs, force-pushing or
+rewriting history, privilege escalation, or destroying disks. It is SAFE if its effects stay
+confined to the worktree. When in doubt, answer dangerous.
+End with EXACTLY one final line: 'VERDICT: safe' or 'VERDICT: dangerous'. You may precede it
+with a one-line reason.
+
+COMMAND:
+$cmd
+EOF
+}
+
+# judge_permission <cmd> [issue] -> "SAFE" or "DANGEROUS<TAB><reason>". Cache-first; otherwise
+# run the toolless headless judge, bounded and fail-closed, and cache the verdict. Always rc 0
+# (the verdict is on stdout, like classify_permission / classify_danger).
+judge_permission() {
+  local cmd="$1" key cache f raw rc verdict secs jcmd prompt pf tag
+  key="$(_judge_cache_key "$cmd")"
+  cache="$(_judge_cache_dir)"; f="$cache/$key"
+  if [ -n "$key" ] && [ -f "$f" ]; then cat "$f" 2>/dev/null; return 0; fi
+  secs="$(_judge_timeout)"
+  jcmd="$(_judge_base_cmd)"
+  prompt="$(_judge_prompt "$cmd")"
+  # Deliver the prompt via a temp file the wrapped command reopens with `exec <`, mirroring
+  # run_answerer: the bound (_afk_with_timeout portable fallback) BACKGROUNDS the command and a
+  # backgrounded job's stdin is /dev/null, so a bare here-string would be lost. The here-string
+  # stays as the fallback for the foreground timeout/perl paths (and when mktemp is unavailable).
+  pf="$(mktemp 2>/dev/null)" || pf=""
+  [ -n "$pf" ] && { printf '%s' "$prompt" > "$pf"; jcmd="exec <'$pf'; $jcmd"; }
+  raw="$(_broker_run_bounded "$secs" bash -c "$jcmd" <<<"$prompt" 2>/dev/null)"; rc=$?
+  [ -n "$pf" ] && rm -f "$pf" 2>/dev/null
+  if [ "$rc" -ne 0 ]; then
+    verdict="$(printf 'DANGEROUS\tjudge unavailable (rc=%s) -- fail-closed' "$rc")"
+  else
+    tag="$(printf '%s' "$raw" | grep -ioE 'VERDICT:[[:space:]]*(safe|dangerous)' | tail -1 \
+      | grep -ioE 'safe|dangerous' | tr '[:upper:]' '[:lower:]')"
+    case "$tag" in
+      safe) verdict="SAFE" ;;
+      dangerous) verdict="$(printf 'DANGEROUS\tjudge verdict: dangerous')" ;;
+      *) verdict="$(printf 'DANGEROUS\tjudge verdict unparseable -- fail-closed')" ;;
+    esac
+  fi
+  if [ -n "$key" ]; then
+    mkdir -p "$cache" 2>/dev/null || true
+    printf '%s\n' "$verdict" > "$f" 2>/dev/null || true
+  fi
+  printf '%s\n' "$verdict"
+}
+
 # --- permission-dialog detection + handling (issue #149) ----------------------
 # A permission dialog is a pane-only surface — a Claude Code confirmation prompt with no
 # transcript entry of its OWN — but the tool_use it is gating IS flushed to the JSONL as an
