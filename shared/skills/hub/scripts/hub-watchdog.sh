@@ -306,6 +306,32 @@ _wd_intervene_landmark() {
   if [ -n "${HUB_WATCHDOG_LANDMARK_CMD:-}" ]; then bash -c "$HUB_WATCHDOG_LANDMARK_CMD" hub-watchdog "$wt" "$issue" >/dev/null 2>&1 || true; return 0; fi
   git -C "$wt" tag -f "needs-human-land/$issue" >/dev/null 2>&1 || true
 }
+
+# _wd_landmark_repo -> a git checkout whose shared ref store holds the needs-human-land/<issue>
+# tags. The per-spoke worktree is gone after a land, so the sweep reads the hub toplevel
+# (captured at startup); HUB_WATCHDOG_LANDMARK_REPO overrides (tests point it at a scratch repo).
+_wd_landmark_repo() { printf '%s\n' "${HUB_WATCHDOG_LANDMARK_REPO:-$_WD_TOPLEVEL}"; }
+
+# _wd_clear_landed_landmarks -> self-clear the escalation (#263). A needs-human-land/<issue>
+# raised by condition 4 dangles after the drain lands the branch on its very next tick — neither
+# auto_land's success path nor reconcile_markers removes it, so a human is pointed at
+# already-shipped work. Each tick, drop every needs-human-land/<issue> whose issue is CLOSED (a
+# closed issue was landed): delete the tag local + remote (mirrors _wd_intervene_reconcile). A
+# still-open issue keeps its tag — a human genuinely still owes that land. Best-effort throughout.
+_wd_clear_landed_landmarks() {
+  local repo tag issue
+  repo="$(_wd_landmark_repo)"
+  [ -n "$repo" ] || return 0
+  while IFS= read -r tag; do
+    [ -n "$tag" ] || continue
+    issue="${tag#needs-human-land/}"
+    case "$issue" in '' | *[!0-9]*) continue ;; esac
+    _wd_issue_open "$issue" && continue          # still open ⇒ a human still owes the land
+    git -C "$repo" tag -d "$tag" >/dev/null 2>&1 || true
+    git -C "$repo" push origin ":refs/tags/$tag" >/dev/null 2>&1 || true
+    _wd_log "cleared resolved landmark $tag (issue #$issue closed/landed)"
+  done < <(git -C "$repo" tag -l 'needs-human-land/*' 2>/dev/null)
+}
 _wd_intervene_rearm() {   # re-arm the crashed drain (self-update aware via hub-afk --reconcile)
   if [ -n "${HUB_WATCHDOG_REARM_CMD:-}" ]; then bash -c "$HUB_WATCHDOG_REARM_CMD" hub-watchdog >/dev/null 2>&1 || true; return 0; fi
   local afk=""
@@ -454,6 +480,10 @@ _wd_run_conditions() {
     _wd_fire supervisor-dead "-" "drain supervisor heartbeat is stale — the drain crashed"
     _wd_intervene_rearm
   fi
+  # Self-clear any needs-human-land/<issue> whose issue has since landed/closed (#263). Runs
+  # BEFORE the in-flight loop: a landed issue's worktree is already gone, so its dangling
+  # escalation would never otherwise be revisited.
+  _wd_clear_landed_landmarks
   command -v inflight_worktrees >/dev/null 2>&1 || return 0
   while IFS=$'\t' read -r wt issue; do
     [ -n "$issue" ] || continue
