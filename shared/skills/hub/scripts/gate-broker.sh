@@ -232,6 +232,11 @@ _broker_park_signature() {
   local wt="$1" issue="$2" basis=""
   if _permission_pending "$wt"; then
     basis="perm:$(extract_pending_command "$wt")"
+    # A shown dialog whose gated command is unflushed (empty) still parks (#269). Give it a
+    # STABLE non-empty signature so the re-answer ceiling can BOUND the per-tick declines
+    # (keyed on (tip, sig), it backs off after AFK_REANSWER_CEILING) instead of fail-opening
+    # to a re-decline every tick on an empty signature (#269 review).
+    [ "$basis" = "perm:" ] && basis="perm:unreadable"
   elif _gate_parked "$wt" "$issue"; then
     basis="gate:$(_read_gate_artifact "$wt" "$issue")"
     [ "$basis" = "gate:" ] && basis="gate:$(extract_pending_question "$wt")"
@@ -2561,17 +2566,27 @@ PYEOF
 }
 
 # _permission_pending <wt_path> -> true when the spoke is parked on a permission dialog. #269
-# (#254 option b): DETECTION is decoupled from EXTRACTION. A shown pane prompt IS a park even
+# (#254 option b): DETECTION is decoupled from EXTRACTION. A shown pane dialog IS a park even
 # when extract_pending_command is empty -- the gated tool_use is not flushed while the dialog is
 # pending (the #240/#254 finding), so ANDing a non-empty command made a real park read as FALSE,
 # and the reaper (_reap_or_resume) fell past the park check into "likely hung -> revive",
-# re-raising the identical dialog. The pane is the sole "a dialog is up" signal, so it alone is
-# the predicate. The #240 guard is preserved: NO pane prompt -> _pane_shows_permission_prompt
-# false -> false (no phantom park on a stale RESOLVED tool). _decide_permission reads the command
-# separately and handles an unreadable one (decline + warn, never park). The single gate
-# slot_state and decide_and_act share.
+# re-raising the identical dialog. The pane is the "a dialog is up" signal -- but the prompt
+# PHRASE alone is not enough: it can appear in a spoke's OWN rendered output (a spoke maintaining
+# the afk subsystem git-shows the file that defines the phrase), a #240/#89-class false park
+# (#269 review). So require BOTH the phrase (_pane_shows_permission_prompt) AND the live dialog's
+# interactive affordance -- a numbered Yes/No option line the real menu draws but a plain text
+# echo does not. The #240 guard holds: NO pane dialog -> false (no phantom park on a stale
+# RESOLVED tool). _decide_permission reads the command separately and handles an unreadable one
+# (decline + warn, never park). Fail-closed on no tmux/pane. The single gate slot_state and
+# decide_and_act share.
 _permission_pending() {
-  _pane_shows_permission_prompt "$1"
+  local wt="$1" target
+  _pane_shows_permission_prompt "$wt" || return 1
+  command -v tmux >/dev/null 2>&1 || return 1
+  target="$(_spoke_pane_target "$wt")"
+  [ -n "$target" ] || return 1
+  tmux capture-pane -p -t "$target" 2>/dev/null \
+    | grep -Eq -- "${AFK_PERMISSION_AFFORD_RE:-[0-9]+\.[[:space:]]+(Yes|No)}"
 }
 
 # _reason_permission_record <wt> <issue> <decision> <rev> -> the post-DELIVERY record for a

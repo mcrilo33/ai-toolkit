@@ -4076,6 +4076,49 @@ def test_permission_pending_false_on_resolved_tool_without_pane_prompt(
     assert still.stdout.strip().splitlines()[-1] == "FREE", still.stdout + still.stderr
 
 
+def test_permission_pending_false_on_prompt_phrase_echo_without_affordance(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #269 review WARNING: the prompt PHRASE alone (no numbered Yes/No option line) is NOT a
+    # park -- it can appear in a spoke's OWN rendered output (a spoke editing the afk subsystem
+    # git-shows the file that literally contains "Do you want to proceed?"). Without the live
+    # dialog's interactive affordance, _permission_pending must stay FALSE, or that echo would
+    # trigger a spurious mid-turn decline injection (#89 class).
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _resolved_only_transcript(pd)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    # The phrase is on the pane, but NO "1. Yes"/"2. No" option line (a plain echo, not a menu).
+    _fake_tmux_capture(
+        fake_bin, spoke_repo, "Do you want to proceed? (from a git show of the source)"
+    )
+    env = {"CLAUDE_PROJECTS_DIR": str(projects), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+    pend = _call(f"_permission_pending '{spoke_repo}' && echo PARKED || echo FREE", env=env)
+    assert pend.stdout.strip().splitlines()[-1] == "FREE", pend.stdout + pend.stderr
+
+
+def test_park_signature_nonempty_for_pane_prompt_with_empty_command(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #269 review WARNING: an empty-command permission park must carry a STABLE non-empty
+    # signature so the re-answer ceiling can bound per-tick declines (an empty signature
+    # fail-opens and re-declines every tick). The full dialog is shown (affordance present) but
+    # the gated command is unflushed (empty), so the signature falls to the "perm:unreadable"
+    # stable basis and hashes to a non-empty value.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    _resolved_only_transcript(pd)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _fake_tmux_capture(fake_bin, spoke_repo, _PERMISSION_PROMPT)
+    env = {"CLAUDE_PROJECTS_DIR": str(projects), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+    result = _call(f"_broker_park_signature '{spoke_repo}' 5", env=env)
+    assert result.stdout.strip(), "an empty-command park must still yield a throttleable signature"
+
+
 def test_classify_permission_approves_read_in_repo_family(spoke_repo: Path, tmp_path: Path) -> None:
     # A Read of a path under the repo family (here the spoke's own worktree, the sole entry
     # of its `git worktree list`) auto-approves — a write-free research read.
