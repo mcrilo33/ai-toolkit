@@ -5364,6 +5364,62 @@ def test_exec_self_copy_execs_from_private_copy(tmp_path: Path) -> None:
     assert copies[0].read_text() == HUB_AFK.read_text(), "the copy is byte-identical"
 
 
+def test_self_copy_temp_launch_loads_transitive_helpers(tmp_path: Path) -> None:
+    # AC1/AC3 (issue #262): a supervisor running from the self-copy temp dir — which
+    # historically held ONLY hub-afk.sh — must still load gate-broker's transitive helpers.
+    # Mimic that copy (hub-afk.sh alone in a temp dir), then source it with NO resolution
+    # overrides and the real repo as CWD (so _AFK_TOPLEVEL resolves gate-broker, exactly as
+    # the live drain does). The #255-moved fns (now in hub-inject.sh) must be DEFINED; a
+    # bare temp SCRIPT_DIR must not strand them into `command not found`.
+    copy_dir = tmp_path / "hub-afk-self.test"
+    copy_dir.mkdir()
+    copy = copy_dir / "hub-afk.sh"
+    copy.write_text(HUB_AFK.read_text())
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("AFK_HUB_INJECT", "AFK_GATE_BROKER", "AFK_WT_LIB")
+    }
+    env.update({"TZ": "UTC", "AI_TOOLKIT_GH_LIFECYCLE_LABELS": "0"})
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{copy}"; for fn in _pane_shows_permission_prompt _transcript_mtime '
+            '_spoke_jsonl _transcript_sizes; do command -v "$fn" >/dev/null || '
+            '{ echo "missing: $fn"; exit 1; }; done; echo OK',
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(REPO_ROOT),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "command not found" not in result.stderr, result.stderr
+    assert result.stdout.strip().splitlines()[-1] == "OK"
+
+
+def test_self_copy_copies_sibling_set(tmp_path: Path) -> None:
+    # AC1 (issue #262): the self-copy must carry gate-broker's whole sibling set into the
+    # temp dir, not hub-afk.sh alone — otherwise a helper moved to a NEW sibling file (as
+    # #255 moved the pane/transcript helpers into hub-inject.sh) is absent from the copy and
+    # the drain strands. Exec the real self-copy path and assert the transitively-sourced
+    # siblings rode along.
+    result = _call(
+        "_afk_exec_self_copy --status",
+        env={"TMPDIR": str(tmp_path), "AFK_STATE": str(tmp_path / "state")},
+    )
+
+    assert "/afk: off" in result.stdout, result.stdout + result.stderr
+    assert _wait_for_glob(tmp_path, "hub-afk-self.*/gate-broker.sh"), (
+        "gate-broker.sh must ride along in the self-copy"
+    )
+    assert _wait_for_glob(tmp_path, "hub-afk-self.*/hub-inject.sh"), (
+        "hub-inject.sh must ride along in the self-copy"
+    )
+
+
 def _wait_for_file(path: Path, timeout: float = 15.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:

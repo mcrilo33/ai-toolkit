@@ -68,6 +68,57 @@ def test_gate_broker_defines_the_core() -> None:
     assert result.stdout.strip().splitlines()[-1] == "OK"
 
 
+def test_hub_inject_loads_under_foreign_script_dir(tmp_path: Path) -> None:
+    # The /afk self-copy supervisor runs hub-afk.sh from a temp dir and passes that dir
+    # down as SCRIPT_DIR; gate-broker.sh inherits it. hub-inject.sh (which #255 split the
+    # transcript/pane helpers into) is ALWAYS a co-located sibling of gate-broker.sh, so it
+    # must resolve from gate-broker's OWN location — not the inherited SCRIPT_DIR, which
+    # points at a temp dir holding only hub-afk.sh. Without that, every moved helper is
+    # undefined and the drain services nothing (issue #262). AFK_HUB_INJECT is emptied so
+    # only the built-in resolution is exercised.
+    result = _call(
+        "for fn in _pane_shows_permission_prompt _transcript_mtime _spoke_jsonl "
+        '_transcript_sizes; do command -v "$fn" >/dev/null || { echo "missing: $fn"; '
+        "exit 1; }; done; echo OK",
+        env={"SCRIPT_DIR": str(tmp_path), "AFK_HUB_INJECT": ""},
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "command not found" not in result.stderr, result.stderr
+    assert result.stdout.strip().splitlines()[-1] == "OK"
+
+
+def test_hub_inject_resolves_via_own_dir_without_toplevel(tmp_path: Path) -> None:
+    # Lock the PRIMARY resolution mechanism (issue #262): gate-broker must find its
+    # co-located hub-inject.sh from its OWN _GB_DIR even when the _AFK_TOPLEVEL fallback is
+    # unavailable — a synced-layout self-copy launched from a cwd OUTSIDE any git repo, with
+    # a foreign SCRIPT_DIR and no override. Without _GB_DIR this strands, so the later
+    # _AFK_TOPLEVEL candidates only LOOK like a safety net; this guards against a future
+    # change that drops _GB_DIR but keeps the toplevel fallback.
+    env = {
+        **os.environ,
+        "TZ": "UTC",
+        "SCRIPT_DIR": str(tmp_path / "fake"),
+        "AFK_HUB_INJECT": "",
+    }
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{GATE_BROKER}"; command -v _pane_shows_permission_prompt >/dev/null '
+            "&& command -v _transcript_sizes >/dev/null && echo OK",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "command not found" not in result.stderr, result.stderr
+    assert result.stdout.strip() == "OK"
+
+
 def test_parse_decision_extracts_answer() -> None:
     result = _call("parse_decision 'reasoning here\nANSWER: use Redis'")
 

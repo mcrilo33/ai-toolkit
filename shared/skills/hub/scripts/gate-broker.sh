@@ -31,6 +31,13 @@ set -uo pipefail
 
 SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
+# Our OWN location, ALWAYS from THIS file's BASH_SOURCE -- never the inherited SCRIPT_DIR,
+# which the /afk self-copy supervisor sets to a temp dir holding only hub-afk.sh (#262). The
+# sibling-source blocks below resolve from here FIRST so a co-located hub-inject.sh (and the
+# checkout's ../../../../scripts/ tree) is found regardless of who sourced us or what
+# SCRIPT_DIR they passed down.
+_GB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Defaults the moved reasoner/detector read directly (set -u safe when sourced standalone;
 # idempotent when hub-afk.sh already set them).
 : "${AFK_SPOKE_MAX_MINUTES:=180}"
@@ -48,6 +55,8 @@ SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 _AFK_TOPLEVEL="${_AFK_TOPLEVEL:-$(git rev-parse --show-toplevel 2>/dev/null || true)}"
 for _cand in \
   "${AFK_WT_LIB:-}" \
+  "$_GB_DIR/worktree-lib.sh" \
+  "$_GB_DIR/../../../../scripts/worktree-lib.sh" \
   "$SCRIPT_DIR/worktree-lib.sh" \
   "$SCRIPT_DIR/../../../../scripts/worktree-lib.sh" \
   "${_AFK_TOPLEVEL:+$_AFK_TOPLEVEL/scripts/worktree-lib.sh}" \
@@ -62,12 +71,20 @@ log() { printf '%s\n' "$*" >&2; }
 # The spoke-pane injection + transcript-delivery primitives (issue #251) live in
 # hub-inject.sh so the /afk answerer (us) and the tier-2 hub-watchdog share one tested
 # helper. Always a co-located sibling — in the checkout AND a synced .ai-toolkit/scripts/
-# target — so $SCRIPT_DIR/hub-inject.sh resolves both layouts; AFK_HUB_INJECT wins for tests.
-# Sourced AFTER log()/worktree-lib so its guarded fallbacks defer to ours.
-for _cand in "${AFK_HUB_INJECT:-}" "$SCRIPT_DIR/hub-inject.sh"; do
+# target — so it resolves from $_GB_DIR (OUR own dir) regardless of the inherited SCRIPT_DIR.
+# The _AFK_TOPLEVEL fallbacks mirror the worktree-lib block; without them a self-copy
+# supervisor (SCRIPT_DIR = a temp dir with only hub-afk.sh) left every moved helper undefined
+# and the drain serviced nothing (#262). AFK_HUB_INJECT wins for tests. Sourced AFTER
+# log()/worktree-lib so its guarded fallbacks defer to ours.
+for _cand in \
+  "${AFK_HUB_INJECT:-}" \
+  "$_GB_DIR/hub-inject.sh" \
+  "$SCRIPT_DIR/hub-inject.sh" \
+  "${_AFK_TOPLEVEL:+$_AFK_TOPLEVEL/shared/skills/hub/scripts/hub-inject.sh}" \
+  "${_AFK_TOPLEVEL:+$_AFK_TOPLEVEL/.ai-toolkit/scripts/hub-inject.sh}"; do
   if [ -n "$_cand" ] && [ -f "$_cand" ]; then . "$_cand"; break; fi
 done
-unset _cand
+unset _cand _GB_DIR
 
 # --- now-clock ----------------------------------------------------------------
 # Current time, overridable via AFK_NOW for tests/cron.

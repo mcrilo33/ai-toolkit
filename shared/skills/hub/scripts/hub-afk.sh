@@ -2397,11 +2397,19 @@ _afk_self() { printf '%s\n' "${AFK_ORIG_SCRIPT:-${BASH_SOURCE[0]}}"; }
 _afk_exec_self_copy() {
   [ "${AFK_SELF_COPY:-1}" = "0" ] && return 0
   [ "${AFK_RUNNING_COPY:-}" = "1" ] && return 0
-  local src dir copy
+  local src src_dir dir copy
   src="${BASH_SOURCE[0]}"
+  src_dir="$(cd "$(dirname "$src")" && pwd)" || return 0
   dir="$(mktemp -d "${TMPDIR:-/tmp}/hub-afk-self.XXXXXX" 2>/dev/null)" || return 0
   copy="$dir/hub-afk.sh"
-  cp "$src" "$copy" 2>/dev/null || return 0
+  # Copy the WHOLE sibling set (gate-broker.sh, hub-inject.sh, and anything else hub-afk
+  # sources transitively), not hub-afk.sh alone -- a helper moved to a new sibling file must
+  # ride along or the drain strands with `command not found` (#262). A generic glob, not an
+  # enumerated list, so a future sibling needs no registration here. Fail-OPEN: on a glob
+  # copy failure fall back to the lone script, and if even that leaves no hub-afk.sh copy,
+  # run from the original rather than refuse to arm.
+  cp "$src_dir"/*.sh "$dir"/ 2>/dev/null || cp "$src" "$copy" 2>/dev/null || return 0
+  [ -f "$copy" ] || cp "$src" "$copy" 2>/dev/null || return 0
   export AFK_RUNNING_COPY=1
   export AFK_ORIG_SCRIPT="$src"
   exec bash "$copy" "$@"
