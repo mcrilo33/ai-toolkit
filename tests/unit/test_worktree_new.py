@@ -453,6 +453,49 @@ def test_agent_launch_appends_budget_args_when_set(hub: Path, tmp_path: Path) ->
     assert "claude --model claude-opus-4-8\\[1m\\] --max-budget-usd 5" in new_window[0]
 
 
+# ── afk spokes launch under bypassPermissions (issue #261) ──
+#
+# An afk spoke must NEVER raise a permission dialog — the PreToolUse deny-wall
+# (afk-danger-guard) is the safety boundary, not prompt-then-approve. So
+# `worktree-new.sh --mode afk` appends `--permission-mode bypassPermissions` to
+# the claude launch. Attended/quick lanes (the default MODE=attended) keep default
+# prompting — the human is the wall — so their launch is byte-for-byte unchanged.
+
+
+def test_afk_mode_launches_bypass_permissions(hub: Path, tmp_path: Path) -> None:
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", "--mode", "afk")
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    assert "--permission-mode bypassPermissions" in new_window[0]
+
+
+def test_attended_mode_omits_bypass_permissions(hub: Path, tmp_path: Path) -> None:
+    # The default (attended) lane keeps default prompting: no bypass flag is added.
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code")
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    assert "--permission-mode" not in new_window[0]
+
+
+def test_afk_bypass_flag_precedes_seeded_prompt(hub: Path, tmp_path: Path) -> None:
+    # The bypass flag is a claude flag, so it must sit before the trailing seeded
+    # prompt (which stays the last positional arg the agent receives).
+    proc, log = _run_new(
+        hub, tmp_path, "8", "some-slug", "--no-code", "--mode", "afk", "--prompt", "/source"
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")
+    assert new_window, "expected a new-window invocation"
+    launch = new_window[0]
+    assert "--permission-mode bypassPermissions" in launch
+    assert launch.index("--permission-mode") < launch.index("/source")
+
+
 def test_agent_launch_keeps_seeded_prompt_after_pinning(hub: Path, tmp_path: Path) -> None:
     proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", "--prompt", "/source")
 
