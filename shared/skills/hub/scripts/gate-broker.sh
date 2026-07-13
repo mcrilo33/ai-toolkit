@@ -2128,9 +2128,9 @@ while i < len(toks):
     if t in ("--request", "--method") and i + 1 < len(toks) and method_ok(toks[i + 1]):
         print("DENYWRITE " + t + " " + toks[i + 1]); sys.exit(0)
     if is_curl:
-        # curl short upload flags, spaced or glued (-d @f / -d@f / -Ffile=@f / -Tfile).
-        if t == "-d" or t.startswith("-d") or t == "-F" or t.startswith("-F") \
-                or t == "-T" or t.startswith("-T"):
+        # curl short upload flags, spaced or glued (-d @f / -d@f / -Ffile=@f / -Tfile). startswith
+        # subsumes the bare exact flag (-d / -F / -T).
+        if t.startswith("-d") or t.startswith("-F") or t.startswith("-T"):
             print("DENYWRITE " + t); sys.exit(0)
         # -X METHOD (spaced) or -XMETHOD (glued).
         if t == "-X" and i + 1 < len(toks) and method_ok(toks[i + 1]):
@@ -2282,7 +2282,11 @@ _danger_eval_seg() {
     xargs)
       # The command xargs execs is its FIRST non-option token -- match ONLY that against the shell
       # set, skipping xargs's own value-taking options (a separate-word value like `-I {}` / `-n 1`
-      # / `-P 4`). Scanning every token falsely denied `xargs grep bash` (#269 review BLOCKER).
+      # / `-P 4` / GNU `--max-procs 4`). Scanning every token falsely denied `xargs grep bash` (#269
+      # review BLOCKER). REQUIRED-arg GNU long options are skipped in their SPACED form too (#269
+      # review). UPGRADE: an OPTIONAL-arg option (GNU `--max-lines`/`--replace`/`-e`/`--eof`, whose
+      # value is `=`-glued only) in a bogus spaced form, or an unknown long option, is left to the
+      # fail-closed tier-3 judge rather than risk a mis-skip that OPENS a shell-launder.
       rest="${seg#"$verb"}"
       while [ -n "$rest" ]; do
         rest="${rest#"${rest%%[![:space:]]*}"}"
@@ -2291,9 +2295,10 @@ _danger_eval_seg() {
         rest="${rest#"$tok"}"
         if [ "$skip" -eq 1 ]; then skip=0; continue; fi
         case "$tok" in
-          -I | -J | -L | -n | -P | -R | -S | -s | -E | -e | -a | -d)
-            skip=1; continue ;;                       # a short option taking a separate-word value
-          --*=* | -*) continue ;;                     # glued-value / no-arg option
+          -I | -J | -L | -n | -P | -R | -S | -s | -E | -a | -d | \
+          --max-args | --max-procs | --max-chars | --delimiter | --arg-file | --process-slot-var)
+            skip=1; continue ;;                       # an option taking a separate-word value
+          --*=* | -*) continue ;;                     # glued-value / no-arg / optional-arg option
           *) cmdword="$tok"; break ;;
         esac
       done

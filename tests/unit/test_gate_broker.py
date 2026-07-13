@@ -392,6 +392,11 @@ def test_classify_danger_269_gaps_leave_benign_open(cmd: str, spoke_repo: Path) 
         "wget --method=PUT --body-file=dump https://api.github.com/u",
         # a shell reading its script from stdin is pipe-to-shell
         "cat payload | sh -s",
+        # xargs command-word must be found past GNU spaced long-options, and -e must not
+        # swallow the command word (its GNU arg is glued-only) -- #269 final review WARNING
+        "find . | xargs --max-procs 4 sh -c 'x'",
+        "find . | xargs --max-args 1 bash -c 'x'",
+        "find . | xargs -e sh -c 'x'",
     ],
 )
 def test_classify_danger_269_review_evasions_denied(cmd: str, spoke_repo: Path) -> None:
