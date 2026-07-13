@@ -506,6 +506,20 @@ def test_clear_landed_landmarks_removes_tag_when_issue_closed(tmp_path: Path) ->
     assert "needs-human-land/7" in tags  # still open → kept
 
 
+def test_clear_landed_landmarks_keeps_tag_when_issue_state_ambiguous(tmp_path: Path) -> None:
+    # Fail-safe: an ambiguous issue-state read (gh down, query failure, empty output) must KEEP
+    # the escalation — never delete an un-landed human-land marker on a transient outage. Here
+    # the state command echoes nothing, mirroring _wd_issue_open's fail-open-to-open path.
+    repo = _git_repo(tmp_path)
+    subprocess.run(["git", "tag", "needs-human-land/9"], cwd=repo, check=True, capture_output=True)
+    env = {"HUB_WATCHDOG_LANDMARK_REPO": str(repo), "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo ''"}
+
+    _call("_wd_clear_landed_landmarks", env=env)
+
+    tags = subprocess.run(["git", "tag"], cwd=repo, capture_output=True, text=True).stdout
+    assert "needs-human-land/9" in tags  # ambiguous state → kept (fail-safe)
+
+
 # ── _wd_fire writes the intervention-ledger ───────────────────────────────────
 def test_fire_appends_a_ledger_line(tmp_path: Path) -> None:
     ledger = tmp_path / "ledger.jsonl"
