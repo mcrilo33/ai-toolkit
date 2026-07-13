@@ -6974,7 +6974,7 @@ def _ledger_records(done: int, total: int) -> list[dict]:
             {
                 "type": "user",
                 "message": {"content": [{"type": "tool_result", "tool_use_id": cid}]},
-                "toolUseResult": {"task": {"id": i, "subject": f"todo {i}"}},
+                "toolUseResult": {"task": {"id": f"t{i}", "subject": f"todo {i}"}},
             }
         )
     for i in range(done):
@@ -6988,7 +6988,7 @@ def _ledger_records(done: int, total: int) -> list[dict]:
                             "type": "tool_use",
                             "name": "TaskUpdate",
                             "id": uid,
-                            "input": {"taskId": i},
+                            "input": {"taskId": f"t{i}"},
                         }
                     ]
                 },
@@ -6998,7 +6998,7 @@ def _ledger_records(done: int, total: int) -> list[dict]:
             {
                 "type": "user",
                 "message": {"content": [{"type": "tool_result", "tool_use_id": uid}]},
-                "toolUseResult": {"taskId": i, "statusChange": {"to": "completed"}},
+                "toolUseResult": {"taskId": f"t{i}", "statusChange": {"to": "completed"}},
             }
         )
     records.append(

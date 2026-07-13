@@ -633,6 +633,113 @@ _afk_pushed_but_unmarked() {
   return 0
 }
 
+# --- #256: the ledger completion signal before a time-ceiling reap ------------
+# The wall-clock ceiling used to revive (kill + relaunch) EVERY over-ceiling spoke with no
+# check for whether it was essentially DONE — so #241 was reaped at 33/33 todos, all committed
+# and pushed, one step from ready. A near-complete task ledger is the "am I done?" signal the
+# clean-pushed check (_afk_pushed_but_unmarked) misses when the tree is not a pristine
+# HEAD==@{upstream} (a .testmondata-wal artifact, a final unpushed commit). It routes the spoke
+# to a finish-up nudge (emit ready / final push) instead of a blind kill.
+
+# AFK_LEDGER_DONE_PCT: a task ledger is "near-complete" when at least this % of its todos are
+# completed (default 90 — all-but-a-few of a long ledger, or a fully-complete short one, while a
+# low-progress runaway like 5/33=15% stays below). A bareword override would break the integer
+# test in _afk_ledger_near_complete, so guard it back to the default.
+: "${AFK_LEDGER_DONE_PCT:=90}"
+case "$AFK_LEDGER_DONE_PCT" in '' | *[!0-9]*) AFK_LEDGER_DONE_PCT=90 ;; esac
+
+# _afk_ledger_done_total <wt> -> "<done> <total>" for the spoke's task ledger, or nothing when no
+# ledger is readable. It reconstructs the ledger from the newest transcript exactly as
+# hub-status.sh:todos_for_path does — the Tasks system (TaskCreate/TaskUpdate tool_result pairs)
+# with the last TodoWrite snapshot as the older-runtime fallback. The parse is DUPLICATED from
+# that reader (trimmed to the counts) because #256's Scope confines edits to hub-afk.sh; keep the
+# two copies in sync — if the transcript ledger shape changes, update todos_for_path AND this.
+_afk_ledger_done_total() {
+  local jsonl; jsonl="$(_spoke_jsonl "$1")"
+  [ -n "$jsonl" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  _AFK_LEDGER_JSONL="$jsonl" python3 2>/dev/null <<'PYEOF'
+import json
+import os
+
+tasks = {}          # task id -> {"status"}, insertion-ordered (Tasks system)
+create_uses = set()  # TaskCreate tool_use ids awaiting their tool_result
+update_uses = {}     # TaskUpdate tool_use id -> input (taskId fallback)
+todos = None         # last TodoWrite snapshot (older-runtime fallback)
+try:
+    with open(os.environ["_AFK_LEDGER_JSONL"]) as fh:
+        for raw in fh:
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            typ = obj.get("type")
+            content = (obj.get("message") or {}).get("content") or []
+            if not isinstance(content, list):
+                continue
+            if typ == "assistant":
+                for block in content:
+                    if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+                        continue
+                    name = block.get("name")
+                    if name == "TodoWrite":
+                        todos = (block.get("input") or {}).get("todos") or []
+                    elif name == "TaskCreate":
+                        create_uses.add(block.get("id"))
+                    elif name == "TaskUpdate":
+                        update_uses[block.get("id")] = block.get("input") or {}
+            elif typ == "user":
+                tur = obj.get("toolUseResult")
+                if not isinstance(tur, dict):
+                    continue
+                for block in content:
+                    if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+                        continue
+                    uid = block.get("tool_use_id")
+                    if uid in create_uses:
+                        tid = (tur.get("task") or {}).get("id")
+                        if tid is not None:
+                            tasks[str(tid)] = {"status": "pending"}
+                    elif uid in update_uses:
+                        tid = str(tur.get("taskId") or update_uses[uid].get("taskId") or "")
+                        new = (tur.get("statusChange") or {}).get("to")
+                        if tid in tasks and new:
+                            if new == "deleted":
+                                del tasks[tid]
+                            else:
+                                tasks[tid]["status"] = new
+except Exception:
+    pass
+
+if tasks:
+    entries = list(tasks.values())
+elif todos is not None:
+    entries = [t for t in todos if isinstance(t, dict)]
+else:
+    entries = None
+
+if entries:
+    done = sum(1 for t in entries if t.get("status") == "completed")
+    print(f"{done} {len(entries)}")
+PYEOF
+}
+
+# _afk_ledger_near_complete <wt> -> rc 0 when the spoke's task ledger is readable, non-empty, and
+# at least AFK_LEDGER_DONE_PCT% of its todos are completed (#256's "essentially done" signal). rc
+# 1 on an unreadable / empty ledger or below-threshold progress — so a genuine runaway (no ledger,
+# or low progress) is NEVER mistaken for a finishing spoke and stays reapable (AC2).
+_afk_ledger_near_complete() {
+  local out done total
+  out="$(_afk_ledger_done_total "$1")" || return 1
+  [ -n "$out" ] || return 1
+  done="${out%% *}"; total="${out##* }"
+  case "$done$total" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$total" -gt 0 ] || return 1
+  [ "$(( done * 100 ))" -ge "$(( total * AFK_LEDGER_DONE_PCT ))" ]
+}
+
 # _spoke_has_work <wt> -> true when the worktree holds anything worth preserving on a crash:
 # a commit above the branch point (_spoke_has_commits) OR a dirty tree (uncommitted WIP). The
 # dead-pane recovery pass (issue #202 C) revives a crashed pane that has_work and re-dispatches
@@ -734,6 +841,21 @@ You finished your turn but stopped mid-cycle without continuing, and nothing is 
 no question or permission dialog is pending. Re-read your task ledger and the working tree, then
 continue the solo flow (RED -> GREEN -> REVIEW -> PUSH) from where you left off. Push each
 subtask and emit the ready marker when the issue's acceptance criteria are all met. Do NOT
+self-land -- the hub lands #$issue.
+EOF
+}
+
+# _afk_finish_up_prompt <issue> -> the #256 finish-up nudge message for an over-ceiling spoke
+# whose task ledger is near-complete: it is essentially DONE, so it is told to do the LAST step
+# (verify committed + pushed, then emit ready / the final push), NOT to start fresh work.
+_afk_finish_up_prompt() {
+  local issue="$1"
+  cat <<EOF
+You have run past the AFK time ceiling, but your task ledger shows you are essentially DONE --
+almost every todo is complete and nothing is blocking you. Do the LAST step now: make sure your
+work is committed and pushed, then emit the ready marker
+(bash .ai-toolkit/scripts/spoke-push.sh --ready $issue) once the issue's acceptance criteria are
+all met. If a final push is still pending, push it first. Do NOT start new work and do NOT
 self-land -- the hub lands #$issue.
 EOF
 }
@@ -1037,6 +1159,31 @@ _afk_nudge_spoke() {
   return "$rc"
 }
 
+# _afk_finish_up_nudge <wt> <issue> -> #256: an over-ceiling spoke whose ledger is near-complete
+# gets a FINISH-UP nudge (emit ready / final push) injected into its LIVE session, instead of the
+# kill + relaunch a blind ceiling reap would do. Mirrors _afk_nudge_spoke but carries the finish-up
+# prompt and journals a DISTINCT `finish-up` decision + span, so the morning review sees "ceiling
+# hit -> nudged to finish, not reaped" (AC3). Like the #255 nudge it stamps only the answer-attempt
+# epoch, never the progress epoch — a finishing spoke must not buy a fresh full ceiling. rc mirrors
+# inject_and_verify (the caller already counted the attempt; a failed delivery retries next tick
+# until the shared nudge budget falls back to the revive).
+_afk_finish_up_nudge() {
+  local wt="$1" issue="$2" target rc
+  log "→ finish-up #$issue: over the time ceiling but ledger near-complete — nudging it to emit ready / final push (no relaunch)"
+  _afk_set_last_action "finish-up #$issue"
+  target="$(_spoke_pane_target "$wt")"
+  if [ -z "$target" ]; then
+    log "  no live pane for #$issue — cannot nudge"
+    return 1
+  fi
+  stamp_answer_attempt "$issue"
+  inject_and_verify "$wt" "$target" "$(_afk_finish_up_prompt "$issue")"; rc=$?
+  broker_journal_decision "$issue" finish-up \
+    "time ceiling hit but ledger near-complete — nudged to finish (emit ready / final push), not reaped (#256)" reversible
+  if [ "$rc" -eq 0 ]; then _afk_emit_span "$wt" afk-finish-up success; else _afk_emit_span "$wt" afk-finish-up retry; fi
+  return "$rc"
+}
+
 # _afk_revive_or_park_last <wt> <issue> <reason> -> revive-first, then warned-parked-LAST. If a
 # revival was already tried this window (_afk_already_resumed) OR the relaunch cannot start, the
 # spoke is warned-and-parked-LAST rather than reaped — retried at low frequency, never abandoned.
@@ -1048,6 +1195,40 @@ _afk_revive_or_park_last() {
   fi
   _revive_spoke "$wt" "$issue" \
     || _warn_parked_last "$wt" "$issue" "$reason — revival launch could not be started; retrying"
+}
+
+# _afk_finish_up_or_revive <wt> <issue> <reason> -> #256: the ceiling-hit decision. A spoke over
+# the wall-clock ceiling is NOT automatically a runaway — if it shows a COMPLETION signal it is
+# essentially DONE and one step from ready, so a blind revive (kill + relaunch) throws away
+# finished work (the 2026-07-12 #241 incident: reaped at 33/33 todos, all committed + pushed).
+# Prefer a finish-up nudge / the pushed-but-unmarked warn over a kill; only a spoke over the
+# ceiling with NO completion signal is a true runaway to revive. Both signal branches are
+# pane-alive-gated, so at the recover_dead_panes call site (dead pane) they collapse to the
+# revive below — crashed-pane behavior is unchanged.
+_afk_finish_up_or_revive() {
+  local wt="$1" issue="$2" reason="$3"
+  # Signal 1: a clean pushed-ahead tip with no marker (#200) — surface it actionably (re-run
+  # --ready / land by hand), never kill. (In _reap_or_resume the live case is already caught
+  # upstream; keeping it here makes the fn self-contained + correct for both call sites.)
+  if _spoke_pane_alive "$wt" && _afk_pushed_but_unmarked "$wt" "$issue"; then
+    _afk_warn_pushed_but_unmarked "$wt" "$issue"
+    return 0
+  fi
+  # Signal 2: a near-complete task ledger on a finished-turn-idle pane — nudge it to finish up
+  # (emit ready / final push) rather than relaunch. Gated on _transcript_finished_turn_idle so the
+  # pane is genuinely at the prompt and the nudge can land (a near-complete-but-hung pane falls
+  # through to the revive). Bounded by the SHARED per-window nudge budget (#255) so a spoke that
+  # will not finish still falls through to the revive.
+  if _spoke_pane_alive "$wt" \
+     && _afk_ledger_near_complete "$wt" \
+     && _transcript_finished_turn_idle "$wt" \
+     && [ "$(_afk_read_nudge_count "$issue")" -lt "$AFK_NUDGE_MAX_ATTEMPTS" ]; then
+    _afk_incr_nudge_count "$issue" >/dev/null
+    _afk_run_with_heartbeat_fg _afk_finish_up_nudge "$wt" "$issue"
+    return 0
+  fi
+  # No completion signal (low progress, no pushed work) — a true runaway. Revive-first, park-LAST.
+  _afk_revive_or_park_last "$wt" "$issue" "$reason"
 }
 
 # _afk_warn_pushed_but_unmarked <wt> <issue> -> #200/#241: a clean-pushed tip with no completion
@@ -1090,7 +1271,9 @@ _reap_or_resume() {
     return 0
   fi
   if _spoke_over_any_ceiling "$issue" "$(afk_now)"; then
-    _afk_revive_or_park_last "$wt" "$issue" "time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
+    # #256: not automatically a runaway — a near-complete ledger / clean pushed-ahead tip is
+    # nudged to finish up (or warned), not blind-revived; only a NO-signal spoke revives.
+    _afk_finish_up_or_revive "$wt" "$issue" "time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
   elif _spoke_pane_alive "$wt" \
        && _transcript_finished_turn_idle "$wt" \
        && [ "$(_afk_read_nudge_count "$issue")" -lt "$AFK_NUDGE_MAX_ATTEMPTS" ]; then
@@ -1743,7 +1926,9 @@ recover_dead_panes() {
     # be blocked by reap_pass in the same tick (the hard ceiling ignores fresh progress).
     # #241 §7: revive-first, warned-parked-LAST — never reap/block/abandon a crashed pane.
     if _spoke_over_any_ceiling "$issue" "$(afk_now)"; then
-      _afk_revive_or_park_last "$path" "$issue" "time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
+      # #256: same completion-signal gate as reap_pass. This path only runs for a DEAD pane, so
+      # the pane-alive-gated signals collapse to the revive — crashed-pane behavior is unchanged.
+      _afk_finish_up_or_revive "$path" "$issue" "time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
     elif _spoke_has_work "$path"; then
       if _afk_already_resumed "$issue"; then
         _warn_parked_last "$path" "$issue" "pane crashed again after an auto-resume — parked LAST, retried at low frequency"
