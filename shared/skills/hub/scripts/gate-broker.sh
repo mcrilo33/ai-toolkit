@@ -1980,9 +1980,17 @@ classify_permission() {
 # orchestrator routes the command to the judge.
 #
 # CATEGORIES (the boundary the existing scope-guards do NOT already cover):
-#   - privilege escalation / disk destroyers: sudo/doas/su, dd, mkfs*, fdisk, parted, shred
+#   - privilege escalation / disk destroyers / ownership: sudo/doas/su, dd, mkfs*, fdisk,
+#     parted, shred, chown/chgrp
+#   - arbitrary exec / classifier-evasion (#269): eval, a shell `-c` inline command, a bare
+#     shell verb (pipe-to-shell target), xargs spawning a shell
 #   - network egress off-allowlist: curl/wget to a non-allowlisted host; raw sockets
-#     (nc/ncat/netcat/telnet/ssh/scp/sftp/ftp) denied outright
+#     (nc/ncat/netcat/telnet/ssh/scp/sftp/ftp) denied outright; a curl/wget WRITE-METHOD flag
+#     (-d/--data*, -F/--form, -T/--upload-file, -X POST|PUT|PATCH|DELETE) even to an allowed host
+#   - supply-chain publish (#269): npm/yarn/pnpm/poetry publish, twine upload, gem push,
+#     cargo publish, docker/podman push
+#   - repo/collaboration mutation (#269): mutating gh subcommands (pr create|merge|close|...,
+#     repo delete|create|..., release create|...) -- read/comment/issue subcommands stay open
 #   - keychain / credential reads: `security`, or a read of a secret-like path
 #   - out-of-tree writes: a mutating verb (mv/cp/rm/mkdir/chmod) not confined to the worktree,
 #     or a `>`/`>>` redirection whose target escapes it
@@ -2055,11 +2063,14 @@ PYEOF
 }
 
 # _danger_network_seg <segment> -> print a reason and rc 0 when the segment is off-allowlist
-# network egress, else rc 1. Raw-socket tools are denied outright; curl/wget URL hosts are parsed
-# (python3) and denied unless every host is allowlisted. Only `://`-scheme tokens are read as
-# hosts (a header/upload flag value is never mistaken for a host, so a legit upload to an allowed
-# host is not falsely blocked -- #261 review); a curl/wget carrying NO scheme URL fails CLOSED
-# (deny), as does an absent python3 -- an unverifiable egress does not run.
+# network egress OR a write-method egress (possible exfil), else rc 1. Raw-socket tools are denied
+# outright; curl/wget URL hosts are parsed (python3) and denied unless every host is allowlisted.
+# Only `://`-scheme tokens are read as hosts (so a bare hostless arg is never mistaken for a host);
+# a curl/wget carrying NO scheme URL fails CLOSED (deny), as does an absent python3 -- an
+# unverifiable egress does not run. #269: a WRITE-METHOD flag (-d/--data*, -F/--form,
+# -T/--upload-file, -X/--request with POST|PUT|PATCH|DELETE) is denied even to an allowlisted host
+# -- a POST body / upload can exfil to a gist or the API. Download flags -o/-O (write the RESPONSE
+# to a file) stay benign, so a legit `curl ... -o out.json` GET read is not blocked.
 _danger_network_seg() {
   local seg="$1" verb host_check
   verb="${seg%%[[:space:]]*}"
@@ -2086,9 +2097,24 @@ try:
 except Exception:
     print("DENY unparseable"); sys.exit(0)
 
+# A WRITE-METHOD flag makes this an upload/POST egress (possible exfil) regardless of host --
+# deny it even to an allowlisted host (#269). -o/-O write the RESPONSE to a file, not an upload,
+# so they stay benign. -X/--request only escalates for a mutating method.
+mutating = {"POST", "PUT", "PATCH", "DELETE"}
+i = 1
+while i < len(toks):
+    t = toks[i]
+    if t in ("-d", "--data", "--data-binary", "--data-raw", "--data-urlencode",
+             "-F", "--form", "-T", "--upload-file") or t.startswith("--data") \
+            or t.startswith("--post-data") or t.startswith("--post-file"):
+        print("DENYWRITE " + t); sys.exit(0)
+    if t in ("-X", "--request") and i + 1 < len(toks) and toks[i + 1].upper() in mutating:
+        print("DENYWRITE " + t + " " + toks[i + 1]); sys.exit(0)
+    i += 1
+
 # Only a scheme URL (contains ://) whose urlparse yields a hostname counts as an egress host.
-# A header value, a -d/-F payload, or a bare hostless arg is never a host -> no false deny, and a
-# curl with no scheme URL yields no host -> fail-closed DENY below.
+# A header value or a bare hostless arg is never a host -> no false deny, and a curl with no
+# scheme URL yields no host -> fail-closed DENY below.
 hosts = []
 for t in toks[1:]:
     if "://" in t:
@@ -2104,6 +2130,7 @@ PYEOF
 )"
   case "$host_check" in
     OK) return 1 ;;
+    'DENYWRITE '*) printf 'network write-method egress (possible exfil): %s' "${host_check#DENYWRITE }"; return 0 ;;
     'DENY '*) printf 'network egress to a non-allowlisted host: %s' "${host_check#DENY }"; return 0 ;;
     *) printf 'network egress unverifiable: %s' "$verb"; return 0 ;;
   esac
@@ -2159,13 +2186,104 @@ _danger_write_seg() {
   return 1
 }
 
-# _danger_privilege_seg <segment> -> print a reason and rc 0 for a privilege-escalation or
-# disk-destroying verb, else rc 1.
+# _danger_privilege_seg <segment> -> print a reason and rc 0 for a privilege-escalation,
+# disk-destroying, or ownership-mutation verb, else rc 1. chown/chgrp fold in here (deny
+# outright, unlike the in-tree-allowed chmod owned by _danger_write_seg): a worktree-confined
+# spoke has no legit ownership-mutation use, so a target check would only add surface (#269).
 _danger_privilege_seg() {
   local verb; verb="${1%%[[:space:]]*}"
   case "$verb" in
     sudo | doas | su | dd | fdisk | parted | shred | mkfs | mkfs.*)
       printf 'privileged / destructive command (%s) is denied' "$verb"; return 0 ;;
+    chown | chgrp)
+      printf 'ownership mutation (%s) is denied under bypass' "$verb"; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _danger_publish_seg <segment> -> print a reason and rc 0 for a supply-chain PUBLISH (an
+# outward package/image release a worktree-confined spoke never performs), else rc 1. A
+# two-token verb+subcommand match (npm/yarn/pnpm/poetry publish, twine upload, gem push,
+# cargo publish, docker/podman push); a bare `npm install` or `docker build` is untouched.
+_danger_publish_seg() {
+  local seg="$1" verb sub
+  verb="${seg%%[[:space:]]*}"
+  sub="${seg#"$verb"}"; sub="${sub#"${sub%%[![:space:]]*}"}"; sub="${sub%%[[:space:]]*}"
+  case "$verb $sub" in
+    'npm publish' | 'yarn publish' | 'pnpm publish' | 'poetry publish' | \
+    'twine upload' | 'gem push' | 'cargo publish' | 'docker push' | 'podman push')
+      printf 'supply-chain publish (%s %s) is denied under bypass' "$verb" "$sub"; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _danger_eval_seg <segment> -> print a reason and rc 0 for arbitrary-exec / classifier-evasion
+# shapes, else rc 1. `eval` runs an unsplit string (`eval "$(curl ...)"` is never operator-split
+# or host-checked), a shell verb carrying `-c` runs an inline command, a BARE shell verb (no
+# non-flag argument) is a pipe-to-shell target reading stdin (`curl ... | bash`, whose halves are
+# separate segments), and `xargs` spawning a shell (`xargs sh -c ...`) launders exec through the
+# argv. Benign `bash -n file` / `bash script.sh` (a non-flag arg, no -c) and `find | xargs grep`
+# (no shell verb) still pass. UPGRADE: a combined short flag (`bash -lc`) is not split here -- it
+# routes to the judge rather than this static deny; add flag-cluster parsing if the journal shows
+# it exploited.
+_danger_eval_seg() {
+  local seg="$1" verb rest tok has_arg=0
+  verb="${seg%%[[:space:]]*}"
+  case "$verb" in
+    eval) printf 'eval runs an uninspected command string -- denied under bypass'; return 0 ;;
+    sh | bash | zsh | dash | ksh)
+      rest="${seg#"$verb"}"
+      while [ -n "$rest" ]; do
+        rest="${rest#"${rest%%[![:space:]]*}"}"
+        [ -n "$rest" ] || break
+        tok="${rest%%[[:space:]]*}"
+        rest="${rest#"$tok"}"
+        case "$tok" in
+          -c) printf 'inline shell command (%s -c ...) is denied under bypass' "$verb"; return 0 ;;
+          -*) continue ;;
+          *) has_arg=1 ;;
+        esac
+      done
+      if [ "$has_arg" -eq 0 ]; then
+        printf 'pipe-to-shell / bare interactive shell (%s) is denied under bypass' "$verb"; return 0
+      fi
+      return 1 ;;
+    xargs)
+      rest="${seg#"$verb"}"
+      while [ -n "$rest" ]; do
+        rest="${rest#"${rest%%[![:space:]]*}"}"
+        [ -n "$rest" ] || break
+        tok="${rest%%[[:space:]]*}"
+        rest="${rest#"$tok"}"
+        case "$tok" in
+          sh | bash | zsh | dash | ksh | eval | /bin/sh | /bin/bash)
+            printf 'xargs spawning a shell (%s) is denied under bypass' "$tok"; return 0 ;;
+        esac
+      done
+      return 1 ;;
+  esac
+  return 1
+}
+
+# _danger_gh_seg <segment> -> print a reason and rc 0 for a MUTATING gh subcommand a
+# worktree-confined spoke never legitimately runs (repo/collaboration/release mutation), else
+# rc 1. Split at the SUBCOMMAND level, never blanket-deny: the spoke tooling shells `gh issue
+# view/comment` and `gh pr view` (allowlisted at worktree-new.sh:338), so only the mutating
+# pr/repo/release verbs are denied; every read/comment/issue subcommand falls through to Tier 1
+# / the judge. A spoke never self-lands or opens PRs (the ship-discipline rule).
+_danger_gh_seg() {
+  local seg="$1" verb obj sub rest
+  verb="${seg%%[[:space:]]*}"
+  [ "$verb" = gh ] || return 1
+  rest="${seg#gh}"; rest="${rest#"${rest%%[![:space:]]*}"}"
+  obj="${rest%%[[:space:]]*}"
+  rest="${rest#"$obj"}"; rest="${rest#"${rest%%[![:space:]]*}"}"
+  sub="${rest%%[[:space:]]*}"
+  case "$obj $sub" in
+    'pr create' | 'pr merge' | 'pr close' | 'pr reopen' | 'pr ready' | 'pr edit' | \
+    'repo delete' | 'repo create' | 'repo rename' | 'repo archive' | 'repo edit' | \
+    'release create' | 'release delete' | 'release edit' | 'release upload')
+      printf 'gh mutating subcommand (gh %s %s) is denied under bypass' "$obj" "$sub"; return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -2218,7 +2336,10 @@ classify_danger() {
         continue ;;
     esac
     if reason="$(_danger_privilege_seg "$seg")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
+    if reason="$(_danger_eval_seg "$seg")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
     if reason="$(_danger_network_seg "$seg")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
+    if reason="$(_danger_publish_seg "$seg")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
+    if reason="$(_danger_gh_seg "$seg")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
     if reason="$(_danger_credential_seg "$seg" "$cwd" "$wt" "$slug" "$tasks")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
     if reason="$(_danger_write_seg "$seg" "$cwd" "$wt" "$slug" "$tasks")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
   done <<< "$norm"
