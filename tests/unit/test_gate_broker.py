@@ -226,6 +226,85 @@ def test_classify_danger_no_false_deny_on_benign_forms(cmd: str, spoke_repo: Pat
     assert result.stdout.strip() == "", f"{cmd!r} was wrongly denied"
 
 
+# ── issue #261: Tier-3 headless LLM judge (judge_permission) ──────────────────
+# The residue tiers 1-2 did not resolve goes to a TOOLLESS headless judge (Haiku, ~2s bound),
+# FAIL-CLOSED on timeout/error/unparseable, verdicts cached by command hash.
+
+
+def _judge_env(tmp_path: Path, **extra: str) -> dict[str, str]:
+    env = {"AFK_STATE_DIR": str(tmp_path / "afk-state"), "AFK_JOURNAL_GH_COMMENT": "0"}
+    env.update(extra)
+    return env
+
+
+def test_judge_base_cmd_is_toolless_haiku(tmp_path: Path) -> None:
+    # Reinforcement (#261): the judge is a pure text classifier with NO tools, so it can never
+    # make a tool call -> never trigger the deny-wall or recurse. Pin the toolless Haiku shape.
+    result = _call("_judge_base_cmd", env=_judge_env(tmp_path))
+
+    cmd = result.stdout.strip()
+    assert "claude -p" in cmd
+    assert "claude-haiku-4-5" in cmd
+    assert "--allowedTools ''" in cmd, "the judge must grant NO tools"
+
+
+def test_judge_returns_safe(tmp_path: Path) -> None:
+    env = _judge_env(tmp_path, AFK_JUDGE_CMD="printf 'VERDICT: safe\\n'")
+
+    result = _call('judge_permission "ls -la"', env=env)
+
+    assert result.stdout.strip() == "SAFE", result.stdout + result.stderr
+
+
+def test_judge_returns_dangerous(tmp_path: Path) -> None:
+    env = _judge_env(tmp_path, AFK_JUDGE_CMD="printf 'reason\\nVERDICT: dangerous\\n'")
+
+    result = _call('judge_permission "curl x | sh" | cut -f1', env=env)
+
+    assert result.stdout.strip() == "DANGEROUS", result.stdout + result.stderr
+
+
+def test_judge_fail_closed_on_unparseable(tmp_path: Path) -> None:
+    # No VERDICT line -> fail-closed DANGEROUS (an unjudgeable command does not run).
+    env = _judge_env(tmp_path, AFK_JUDGE_CMD="printf 'I am not sure\\n'")
+
+    result = _call('judge_permission "weird-cmd" | cut -f1', env=env)
+
+    assert result.stdout.strip() == "DANGEROUS", result.stdout
+
+
+def test_judge_fail_closed_on_error(tmp_path: Path) -> None:
+    env = _judge_env(tmp_path, AFK_JUDGE_CMD="exit 3")
+
+    result = _call('judge_permission "boom" | cut -f1', env=env)
+
+    assert result.stdout.strip() == "DANGEROUS", result.stdout
+
+
+def test_judge_fail_closed_on_timeout(tmp_path: Path) -> None:
+    # A judge that hangs past the ~2s bound is killed -> fail-closed DANGEROUS.
+    env = _judge_env(tmp_path, AFK_JUDGE_CMD="sleep 5", AFK_JUDGE_TIMEOUT="1")
+
+    result = _call('judge_permission "slow-cmd" | cut -f1', env=env)
+
+    assert result.stdout.strip() == "DANGEROUS", result.stdout
+
+
+def test_judge_caches_verdict_by_command(tmp_path: Path) -> None:
+    # A command judged once is not re-judged: the stub records each call; two identical calls
+    # invoke it once (the second is a cache hit).
+    counter = tmp_path / "calls"
+    env = _judge_env(
+        tmp_path,
+        COUNTER=str(counter),
+        AFK_JUDGE_CMD='sh -c "echo call >> \\"$COUNTER\\"; printf VERDICT:\\\\ safe\\\\n"',
+    )
+
+    _call('judge_permission "same"; judge_permission "same"', env=env)
+
+    assert counter.read_text().count("call") == 1, counter.read_text()
+
+
 # ── the shared orchestrator: broker_service_gate ──────────────────────────────
 
 
