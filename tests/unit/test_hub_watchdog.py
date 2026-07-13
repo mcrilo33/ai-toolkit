@@ -483,6 +483,29 @@ def test_landmark_intervention_never_lands_only_marks(tmp_path: Path) -> None:
     assert "needs-human-land/5" in tags
 
 
+# ── #263: the escalation self-clears once the drain lands the branch ───────────
+def test_clear_landed_landmarks_removes_tag_when_issue_closed(tmp_path: Path) -> None:
+    # A needs-human-land/<issue> raised by condition 4 dangles after the drain lands the branch;
+    # the sweep drops it once the issue is CLOSED (landed), so a human is not pointed at
+    # already-shipped work. A still-open issue keeps its tag — a human still owes that land.
+    repo = _git_repo(tmp_path)
+    for issue in (5, 7):
+        subprocess.run(
+            ["git", "tag", f"needs-human-land/{issue}"], cwd=repo, check=True, capture_output=True
+        )
+    env = {
+        "HUB_WATCHDOG_LANDMARK_REPO": str(repo),
+        # issue 5 has landed (closed); issue 7 is still open.
+        "HUB_WATCHDOG_ISSUE_STATE_CMD": '[ "$1" = 5 ] && echo closed || echo open',
+    }
+
+    _call("_wd_clear_landed_landmarks", env=env)
+
+    tags = subprocess.run(["git", "tag"], cwd=repo, capture_output=True, text=True).stdout
+    assert "needs-human-land/5" not in tags  # closed/landed → swept
+    assert "needs-human-land/7" in tags  # still open → kept
+
+
 # ── _wd_fire writes the intervention-ledger ───────────────────────────────────
 def test_fire_appends_a_ledger_line(tmp_path: Path) -> None:
     ledger = tmp_path / "ledger.jsonl"
