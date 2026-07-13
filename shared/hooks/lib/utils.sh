@@ -989,3 +989,68 @@ run_under_tripwire_scoped() {
   local _TRIPWIRE_SCOPE="$1"; shift
   run_under_tripwire "$@"
 }
+
+# Classify the snapshot delta for the OBSERVE-only sweep tripwire (issue #267). Prints
+# one line per change that looks like a GENUINE escape — a config-marker flip, a ref
+# deletion, or a non-fast-forward ref move (the #29/#30/#31 corruption class) — and
+# nothing for legitimate concurrent-drain movement: a fast-forward advance, a newly
+# created ref/tag, or HEAD following an FF. Read-only; never mutates a ref. $1 = before
+# snapshot, $2 = after snapshot (both in tripwire_capture format). Unlike
+# _tripwire_benign_ref_change (which the pre-push gate shares and issue #267 must NOT
+# widen), this tolerance is confined to the sweep surface via run_under_tripwire_observe.
+_tripwire_observe_escapes() {
+  local before="$1" after="$2" kind sha name a_sha key
+  # Config markers never move while a hub checkout is live: any drift is an escape.
+  for key in core.bare core.worktree; do
+    if [ "$(_tripwire_cfg_value "$before" "$key")" != "$(_tripwire_cfg_value "$after" "$key")" ]; then
+      printf 'cfg %s changed\n' "$key"
+    fi
+  done
+  # For every ref in the snapshot: a deletion or a non-FF move is an escape; an FF
+  # advance (before is an ancestor of after) is drain movement. Refs that only APPEAR
+  # in the after snapshot are creations (a spawned branch, a needs-human-land/* tag) —
+  # not iterated here, so they stay silent.
+  while read -r kind sha name; do
+    [ "$kind" = "ref" ] || continue
+    a_sha="$(printf '%s\n' "$after" | awk -v r="$name" '$1=="ref" && $3==r {print $2; exit}')"
+    if [ -z "$a_sha" ]; then
+      printf '%s deleted\n' "$name"
+    elif [ "$a_sha" != "$sha" ] && ! git merge-base --is-ancestor "$sha" "$a_sha" 2>/dev/null; then
+      printf '%s moved non-fast-forward\n' "$name"
+    fi
+  done <<< "$before"
+}
+
+# Observe-only tripwire for the #124 post-land sweep (issue #267). The sweep re-runs the
+# full suite on the live hub/main checkout as a NON-PUSHING diagnostic, so:
+#   * its red/green verdict is the SUITE's own — this returns the wrapped command's exit
+#     code and NEVER TRIPWIRE_BREACH_RC (a concurrent-drain ref move must not read as a
+#     test failure), and
+#   * it NEVER restores — the /afk drain owns main/origin/*/sibling refs, the tags, and
+#     HEAD, all of which legitimately FF-advance throughout; rewinding any of them would
+#     corrupt the live hub (only #135's no-orphan guard ever saved this surface).
+# It still OBSERVES: it snapshots the integrity markers, and if a change looks like a
+# genuine escape the drain never produces (see _tripwire_observe_escapes) it logs a NOTE
+# to stderr — observation only, no verdict, no rewind. The wrapped command's stdout+stderr
+# are captured to <capfile> ($1) so the sweep can read failing ids from it while the NOTE
+# stays on the caller's stderr.
+run_under_tripwire_observe() {
+  local cap="$1"; shift
+  local before after rc=0 escapes m
+  before="$(tripwire_capture)"
+  "$@" > "$cap" 2>&1 || rc=$?
+  after="$(tripwire_capture)"
+  # `|| true`: the classifier returns non-zero when the last ref it inspects is a
+  # benign FF, which would abort this assignment under a caller's set -e (#189).
+  escapes="$(_tripwire_observe_escapes "$before" "$after")" || true
+  if [ -n "$escapes" ]; then
+    {
+      echo "tripwire: NOTE — post-land sweep observed a possible isolation escape" \
+           "(observed only; the suite's exit is the verdict, nothing is restored):"
+      while IFS= read -r m; do
+        [ -n "$m" ] && echo "tripwire:   - $m"
+      done <<< "$escapes"
+    } >&2
+  fi
+  return "$rc"
+}

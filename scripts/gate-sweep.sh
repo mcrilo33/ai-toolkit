@@ -21,7 +21,15 @@
 #            most ONE newest-wins follow-up in `queue`. The worker re-keys on
 #            the checkout's CURRENT clean tree (a land may have superseded the
 #            spawn), skips a tree already stamped `full`, and runs the full
-#            suite. Green upgrades the tree's stamp to `full` (so back-to-back
+#            suite. The suite runs under an OBSERVE-only repo-integrity tripwire
+#            (issue #267): the sweep's red/green verdict is the suite's OWN
+#            pytest exit, never a tripwire breach, and the tripwire never
+#            restores a ref. This is a live hub/main checkout, so a concurrent
+#            /afk drain FF-advancing main/origin/*/sibling refs, stamping
+#            needs-human-land/* tags, and moving HEAD is legitimate, not a
+#            breach; only a genuine escape (config flip / ref deletion / non-FF
+#            move) is logged (a note in sweep.log) — never a red verdict, never
+#            a rewind. Green upgrades the tree's stamp to `full` (so back-to-back
 #            lands of the same content sweep once); red files a GitHub issue
 #            carrying the failing test ids + the landed commit/branch so the
 #            failure drops into the normal backlog → spoke flow. A gh failure
@@ -186,7 +194,8 @@ run_suite() {
     bash -c "$GATE_SWEEP_CMD" > "$cap" 2>&1
     return
   fi
-  # Real runner: reuse the gate's own resolution + repo-integrity tripwire.
+  # Real runner: reuse the gate's own runner resolution, then run under an
+  # OBSERVE-only tripwire (issue #267 — see the tripwire block below).
   # utils.sh lives beside gate-stamp.sh in both source and installed layouts.
   local utils
   utils="$(dirname "$GS_LIB")/utils.sh"
@@ -203,8 +212,16 @@ run_suite() {
     return 0
   fi
   read -r -a RUNNER_ARR <<< "$runner"
-  if command -v run_under_tripwire >/dev/null 2>&1; then
-    run_under_tripwire "${RUNNER_ARR[@]}" > "$cap" 2>&1
+  # Observe-only on this surface (issue #267): the sweep re-runs the full suite on the
+  # live hub/main checkout, where a concurrent /afk drain legitimately FF-advances
+  # main/origin/*/sibling refs, stamps needs-human-land/* tags, and moves HEAD.
+  # run_under_tripwire_observe returns the SUITE's OWN exit code — never the tripwire's
+  # 97, so a drain ref move can never masquerade as a red — and never restores; it only
+  # logs a note (to $LOG) if a genuine escape (config flip / ref deletion / non-FF move)
+  # is seen. It captures the suite's stdout+stderr into $cap itself. The bare fallback
+  # is for an older installed utils.sh that predates the observe helper.
+  if command -v run_under_tripwire_observe >/dev/null 2>&1; then
+    run_under_tripwire_observe "$cap" "${RUNNER_ARR[@]}" 2>>"$LOG"
   else
     "${RUNNER_ARR[@]}" > "$cap" 2>&1
   fi
@@ -265,6 +282,10 @@ process_request() {
   fi
   cap="$(mktemp "${TMPDIR:-/tmp}/gate-sweep-out.XXXXXX")" || return 0
   log "sweep start: tree $tree (stamped: ${tier:-none}) for landed ${SHA:0:9}${BRANCH:+ ($BRANCH)}"
+  # $rc is the suite's OWN exit code (issue #267): run_suite runs the real suite under
+  # the observe-only tripwire, which never returns TRIPWIRE_BREACH_RC, so a concurrent
+  # /afk drain moving refs mid-sweep can no longer be conflated with a test failure and
+  # file a spurious red issue. Only a genuine pytest red reaches file_red_issue below.
   rc=0
   run_suite "$cap" || rc=$?
   if [ "$rc" -eq 0 ]; then
