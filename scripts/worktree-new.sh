@@ -556,6 +556,14 @@ if [ -z "$PROMPT" ] && [ -f "$TASK_MD" ]; then
 fi
 
 AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(printf '%q' "$WT_AGENT_EFFORT") claude --model $(printf '%q' "$WT_AGENT_MODEL")"
+# afk spokes launch under bypassPermissions (#261): no permission dialog is EVER raised, so
+# the whole dialog-answering bug family (#240/#246/#253/#254/#259) is removed at the root.
+# Safety moves to a PreToolUse deny-hook WALL (afk-danger-guard) that still fires and can DENY
+# even under bypass. afk-ONLY: attended/quick lanes keep default prompting (the human is the
+# wall), so their launch is unchanged. The flag precedes the seeded prompt below, which stays
+# the trailing arg. The wall's own gate is .ai-toolkit/mode == afk (written above), so it stays
+# authoritative for the whole bypass lifetime independent of supervisor liveness.
+[ "$MODE" = afk ] && AGENT_CMD="$AGENT_CMD --permission-mode bypassPermissions"
 # Best-effort in-process budget cap for unattended spokes. A caller may set
 # WT_AGENT_BUDGET_ARGS (e.g. "--max-budget-usd 5"); it is a pre-formed multi-arg
 # string appended verbatim (NOT %q-quoted), so leave it unset for ordinary attended
