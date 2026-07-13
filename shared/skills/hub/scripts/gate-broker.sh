@@ -2583,15 +2583,20 @@ PYEOF
 # echo does not. The #240 guard holds: NO pane dialog -> false (no phantom park on a stale
 # RESOLVED tool). _decide_permission reads the command separately and handles an unreadable one
 # (decline + warn, never park). Fail-closed on no tmux/pane. The single gate slot_state and
-# decide_and_act share.
+# decide_and_act share. The pane is captured ONCE and both patterns are grepped from that copy:
+# a second capture-pane doubled the tmux subprocess load and, more importantly, its extra
+# failure surface destabilized the park signature under heavy load (a flaked capture flipped the
+# park verdict, resetting the re-answer ceiling -- #269 final review NIT + a load-flake fix). The
+# phrase default MIRRORS _pane_shows_permission_prompt (hub-inject.sh) and reads the SAME
+# AFK_PERMISSION_PROMPT_RE override, so an operator retune stays consistent across both.
 _permission_pending() {
-  local wt="$1" target
-  _pane_shows_permission_prompt "$wt" || return 1
+  local wt="$1" target pane
   command -v tmux >/dev/null 2>&1 || return 1
   target="$(_spoke_pane_target "$wt")"
   [ -n "$target" ] || return 1
-  tmux capture-pane -p -t "$target" 2>/dev/null \
-    | grep -Eq -- "${AFK_PERMISSION_AFFORD_RE:-[0-9]+\.[[:space:]]+(Yes|No)}"
+  pane="$(tmux capture-pane -p -t "$target" 2>/dev/null)" || return 1
+  printf '%s\n' "$pane" | grep -Eq -- "${AFK_PERMISSION_PROMPT_RE:-Do you want to proceed\?}" || return 1
+  printf '%s\n' "$pane" | grep -Eq -- "${AFK_PERMISSION_AFFORD_RE:-[0-9]+\.[[:space:]]+(Yes|No)}"
 }
 
 # _reason_permission_record <wt> <issue> <decision> <rev> -> the post-DELIVERY record for a
