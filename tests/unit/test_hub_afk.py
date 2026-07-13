@@ -7128,8 +7128,38 @@ def test_reap_pass_over_ceiling_near_complete_revives_after_max_nudges(tmp_path:
 
     _call(expr, env=env)
 
-    assert "new-window" in tmux_log.read_text(), (
+    calls = tmux_log.read_text()
+    assert "new-window" in calls, (
         "past the nudge budget, an over-ceiling near-complete spoke revives"
+    )
+    assert "send-keys" not in calls, "past the budget it must revive, NOT nudge again"
+    assert "finish-up" not in (statedir / "decision-journal.jsonl").read_text(), (
+        "no finish-up decision once the nudge budget is spent"
+    )
+
+
+def test_recover_dead_panes_over_ceiling_near_complete_still_revives(tmp_path: Path) -> None:
+    # The second wiring: recover_dead_panes routes its ceiling branch through the same
+    # _afk_finish_up_or_revive, but it only runs for a DEAD pane. A near-complete ledger must NOT
+    # divert a crashed spoke to the (live-session) finish-up nudge — the pane-alive gate holds and
+    # it REVIVES, exactly as before #256. Guards against a future drop of that gate silently
+    # leaving a crashed near-done spoke un-revived (finish-up returns 1 on the empty pane target,
+    # but _afk_finish_up_or_revive would still return 0 as if handled).
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD, with commits
+    expr, env, _ready_log, statedir = _recover_env(spoke, tmp_path, fake_bin)
+    # A near-complete ledger on the (dead) pane — the signal that WOULD nudge a live pane.
+    _write_transcript(
+        _project_dir_for(tmp_path / "projects", spoke), _ledger_records(done=33, total=33)
+    )
+    (statedir / "dispatch-5.epoch").write_text("1000\n")  # over ceiling
+
+    _call(expr, env=env)
+
+    calls = tmux_log.read_text()
+    assert "new-window" in calls, "a crashed near-complete spoke still revives (pane-alive gate)"
+    assert "finish-up" not in (statedir / "decision-journal.jsonl").read_text(), (
+        "a dead pane is never diverted to the live-session finish-up nudge"
     )
 
 

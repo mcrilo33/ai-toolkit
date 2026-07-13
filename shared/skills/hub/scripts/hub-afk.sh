@@ -643,10 +643,17 @@ _afk_pushed_but_unmarked() {
 
 # AFK_LEDGER_DONE_PCT: a task ledger is "near-complete" when at least this % of its todos are
 # completed (default 90 — all-but-a-few of a long ledger, or a fully-complete short one, while a
-# low-progress runaway like 5/33=15% stays below). A bareword override would break the integer
-# test in _afk_ledger_near_complete, so guard it back to the default.
+# low-progress runaway like 5/33=15% stays below). Only a plain 1..100 integer is honored: a
+# bareword would break the integer test in _afk_ledger_near_complete, and an out-of-range value
+# (>100) would overflow `total * PCT` negative and read EVERY spoke as near-complete — inverting
+# AC2. The length bound (<=3 digits) keeps the range compare itself from erroring on a huge
+# override; anything outside falls back to the default.
 : "${AFK_LEDGER_DONE_PCT:=90}"
-case "$AFK_LEDGER_DONE_PCT" in '' | *[!0-9]*) AFK_LEDGER_DONE_PCT=90 ;; esac
+case "$AFK_LEDGER_DONE_PCT" in
+  '' | *[!0-9]*) AFK_LEDGER_DONE_PCT=90 ;;
+  *) { [ "${#AFK_LEDGER_DONE_PCT}" -le 3 ] && [ "$AFK_LEDGER_DONE_PCT" -ge 1 ] \
+       && [ "$AFK_LEDGER_DONE_PCT" -le 100 ]; } || AFK_LEDGER_DONE_PCT=90 ;;
+esac
 
 # _afk_ledger_done_total <wt> -> "<done> <total>" for the spoke's task ledger, or nothing when no
 # ledger is readable. It reconstructs the ledger from the newest transcript exactly as
