@@ -165,6 +165,17 @@ stamp_progress_epoch()  { _stamp_issue_epoch progress "$1"; }
 read_progress_epoch()   { _read_issue_epoch progress "$1"; }
 stamp_answer_attempt()  { _stamp_issue_epoch answer-attempt "$1"; }
 read_answer_attempt()   { _read_issue_epoch answer-attempt "$1"; }
+# done-<issue>.epoch — the un-landed clock's reference for the watchdog's auto-land-skipped
+# check (#263): stamped the FIRST tick slot_state reads a ready/accept-at-tip terminal, so the
+# ceiling measures from the done/ready transition, NOT the progress epoch (which is stamped
+# only on tip advances and pre-ages during a pre-ready park — the false-fire this fixes).
+# Cleared on a tip advance (a revived spoke re-stamps fresh) and on a fresh arm.
+stamp_done_epoch()      { _stamp_issue_epoch done "$1"; }
+read_done_epoch()       { _read_issue_epoch done "$1"; }
+clear_done_epoch()      { rm -f "$(_afk_state_dir)/done-$1.epoch" 2>/dev/null || true; }
+# stamp-once: a ready-at-tip spoke's un-landed clock starts at the FIRST done tick and does not
+# reset while it stays done, so the full ceiling elapses before the watchdog can fire.
+stamp_done_epoch_once() { [ -n "$(read_done_epoch "$1")" ] || stamp_done_epoch "$1"; }
 
 # --- network-outage state (issue #249) ----------------------------------------
 # A connectivity blackout makes the pre-reap auth probe fail for the WRONG reason. The two
@@ -211,7 +222,7 @@ _afk_refresh_offline_clocks() {
 # the clean first-exhaustion re-service.
 _clear_progress_state() {
   local dir; dir="$(_afk_state_dir)"
-  rm -f "$dir"/progress-*.epoch "$dir"/answer-attempt-*.epoch "$dir"/tip-* \
+  rm -f "$dir"/progress-*.epoch "$dir"/answer-attempt-*.epoch "$dir"/done-*.epoch "$dir"/tip-* \
     "$dir"/reanswer-* "$dir"/gate-voided-* "$dir"/terminal-logged-* \
     "$dir"/offline-since.epoch 2>/dev/null || true   # #249: drop a stale outage marker too
   _clear_warned_records   # #241: drop the warned-retry backoff + records for a fresh window
@@ -319,6 +330,7 @@ _afk_note_tip_progress() {
   elif [ "$last" != "$tip" ]; then
     printf '%s\n' "$tip" > "$f" 2>/dev/null || true
     stamp_progress_epoch "$issue"
+    clear_done_epoch "$issue"    # #263: tip moved past any terminal → a later done re-stamps fresh
     _afk_clear_warned "$issue"   # #241: a tip advance is genuine progress → drop the warned-retry backoff
   fi
   return 0
@@ -597,7 +609,9 @@ slot_state() {
   if [ -n "$tip" ]; then
     for kind in ready accept; do
       marker="$(git -C "$wt_path" rev-parse -q --verify "refs/tags/${kind}/${issue}^{commit}" 2>/dev/null)"
-      [ "$marker" = "$tip" ] && { printf 'done\n'; return; }
+      # Stamp the un-landed clock on the FIRST done tick (#263) so the watchdog measures the
+      # ceiling from here, not a progress epoch that pre-aged during a pre-ready park.
+      [ "$marker" = "$tip" ] && { stamp_done_epoch_once "$issue"; printf 'done\n'; return; }
     done
     # blocked/<issue> at the tip is terminal ONLY if the spoke is not still parked. A
     # spurious blocked/<N> (a false escalation) over a spoke still on a question / permission

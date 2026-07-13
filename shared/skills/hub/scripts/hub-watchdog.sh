@@ -264,12 +264,16 @@ _wd_detect_stale_marker() { _wd_blocked_stale "$1" "$2"; }
 
 # Condition 4: a mergeable (ready-at-tip) branch auto_land terminal-skipped. NOT blocked-at-tip
 # (a deliberate skip is never a false-skip), issue still open, un-landed past the ceiling.
+# Staleness is measured from the DONE epoch — stamped when slot_state first reads the spoke
+# `done` — not the progress epoch, which is stamped only on tip advances and pre-ages during a
+# pre-ready park (#263): a parked-then-ready spoke would otherwise trip an instant false-skip.
+# slot_state itself stamps the done epoch on that first done tick, so the ceiling starts here.
 _wd_detect_mergeable_skipped() {
   local wt="$1" issue="$2" now="$3"
   command -v slot_state >/dev/null 2>&1 || return 1
   [ "$(slot_state "$wt" "$issue")" = "done" ] || return 1
   _wd_tag_at_tip "$wt" blocked "$issue" && return 1              # deliberately blocked → not a skip
-  _wd_epoch_stale "$(read_progress_epoch "$issue" 2>/dev/null)" "$now" "$HUB_WATCHDOG_LAND_CEILING" || return 1
+  _wd_epoch_stale "$(read_done_epoch "$issue" 2>/dev/null)" "$now" "$HUB_WATCHDOG_LAND_CEILING" || return 1
   _wd_issue_open "$issue"                                        # a closed issue was landed, not skipped
 }
 
