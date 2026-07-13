@@ -6943,6 +6943,196 @@ def test_reap_pass_pushed_but_unmarked_warns_not_reaps(tmp_path: Path) -> None:
     assert (statedir / "warned-5.txt").exists()
 
 
+# ── issue #256: an "am I done?" check before a time-ceiling reap ──────────────────
+# The wall-clock ceiling used to hand every over-ceiling spoke straight to the revive
+# (kill + relaunch) with NO check for whether it was essentially DONE — so #241 was reaped
+# at 33/33 todos, all committed + pushed, one step from ready. Before a ceiling revive the
+# reaper now checks completion signals: a clean pushed-ahead tip (pushed-but-unmarked) or a
+# near-complete task ledger on a finished-turn-idle pane is treated as "finish-up" (the
+# pushed-but-unmarked warn, or a continue-nudge to emit ready / final push), NOT a kill. Only
+# a spoke over the ceiling with NO completion signal is a true runaway that still revives.
+
+
+def _ledger_records(done: int, total: int) -> list[dict]:
+    """Transcript records reconstructing a task ledger with `done`/`total` todos completed.
+
+    Emits TaskCreate + tool_result pairs for every todo, then TaskUpdate + tool_result pairs
+    marking the first `done` completed — the same Tasks-system shape hub-status.sh reads. Ends
+    on a finished (tool-use-free) assistant turn so the SAME transcript also reads
+    finished-turn-idle (the pane is at the input prompt, nudge-able).
+    """
+    records: list[dict] = []
+    for i in range(total):
+        cid = f"create{i}"
+        records.append(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "tool_use", "name": "TaskCreate", "id": cid}]},
+            }
+        )
+        records.append(
+            {
+                "type": "user",
+                "message": {"content": [{"type": "tool_result", "tool_use_id": cid}]},
+                "toolUseResult": {"task": {"id": i, "subject": f"todo {i}"}},
+            }
+        )
+    for i in range(done):
+        uid = f"update{i}"
+        records.append(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "TaskUpdate",
+                            "id": uid,
+                            "input": {"taskId": i},
+                        }
+                    ]
+                },
+            }
+        )
+        records.append(
+            {
+                "type": "user",
+                "message": {"content": [{"type": "tool_result", "tool_use_id": uid}]},
+                "toolUseResult": {"taskId": i, "statusChange": {"to": "completed"}},
+            }
+        )
+    records.append(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "done for now"}]}}
+    )
+    return records
+
+
+def test_afk_ledger_near_complete_true_when_all_todos_done(tmp_path: Path) -> None:
+    # The #241 shape: every todo of a long ledger completed ⇒ essentially DONE.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    projects = tmp_path / "projects"
+    _write_transcript(_project_dir_for(projects, spoke), _ledger_records(done=33, total=33))
+
+    result = _call(
+        f"_afk_ledger_near_complete '{spoke}' && echo YES || echo NO",
+        env={"CLAUDE_PROJECTS_DIR": str(projects)},
+    )
+
+    assert "YES" in result.stdout, "a 33/33 ledger is near-complete"
+
+
+def test_afk_ledger_near_complete_false_when_low_progress(tmp_path: Path) -> None:
+    # A genuine runaway: barely-started ledger ⇒ NOT a finishing spoke (AC2 stays reapable).
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    projects = tmp_path / "projects"
+    _write_transcript(_project_dir_for(projects, spoke), _ledger_records(done=2, total=33))
+
+    result = _call(
+        f"_afk_ledger_near_complete '{spoke}' && echo YES || echo NO",
+        env={"CLAUDE_PROJECTS_DIR": str(projects)},
+    )
+
+    assert "NO" in result.stdout, "2/33 is well below the near-complete threshold"
+
+
+def test_afk_ledger_near_complete_false_when_no_ledger(tmp_path: Path) -> None:
+    # No Tasks/TodoWrite entries at all ⇒ unmeasurable ⇒ NOT near-complete (fail toward reaping).
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    projects = tmp_path / "projects"
+    _write_transcript(
+        _project_dir_for(projects, spoke),
+        [{"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}}],
+    )
+
+    result = _call(
+        f"_afk_ledger_near_complete '{spoke}' && echo YES || echo NO",
+        env={"CLAUDE_PROJECTS_DIR": str(projects)},
+    )
+
+    assert "NO" in result.stdout, "an unreadable/empty ledger is not a completion signal"
+
+
+def test_afk_ledger_near_complete_respects_done_pct_override(tmp_path: Path) -> None:
+    # 30/33 ≈ 90.9%: near-complete at the default 90, but not under a stricter 95.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    projects = tmp_path / "projects"
+    _write_transcript(_project_dir_for(projects, spoke), _ledger_records(done=30, total=33))
+
+    default = _call(
+        f"_afk_ledger_near_complete '{spoke}' && echo YES || echo NO",
+        env={"CLAUDE_PROJECTS_DIR": str(projects)},
+    )
+    stricter = _call(
+        f"_afk_ledger_near_complete '{spoke}' && echo YES || echo NO",
+        env={"CLAUDE_PROJECTS_DIR": str(projects), "AFK_LEDGER_DONE_PCT": "95"},
+    )
+
+    assert "YES" in default.stdout, "30/33 clears the default 90% threshold"
+    assert "NO" in stricter.stdout, "a 95% threshold is respected"
+
+
+def test_reap_pass_over_ceiling_near_complete_nudges_not_revives(tmp_path: Path) -> None:
+    # AC1/AC3: an over-ceiling spoke whose ledger is near-complete and whose pane is at the
+    # input prompt is NUDGED to finish up (emit ready / final push) via the live-session
+    # injector — never killed + relaunched — and the taken decision is journaled as finish-up.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    projects = tmp_path / "projects"
+    jsonl = _project_dir_for(projects, spoke) / "session.jsonl"
+    fake_bin, tmux_log = _injector_tmux(
+        tmp_path, capture="│ > │\n", pane_path=spoke, clear_on_enter=1, touch=jsonl
+    )
+    expr, env, _ready_log, statedir = _reaper_env(
+        spoke, tmp_path, fake_bin, idle=True, transcript=_ledger_records(done=33, total=33)
+    )
+    env["AFK_INJECT_VERIFY_SECONDS"] = "5"
+    env["AFK_INJECT_POLL_SECONDS"] = "1"
+    (statedir / "dispatch-5.epoch").write_text("1000\n")  # dispatched long ago ⇒ over ceiling
+
+    _call(expr, env=env)
+
+    calls = tmux_log.read_text()
+    assert "send-keys -t afk:1 -l" in calls, (
+        f"a near-complete over-ceiling spoke is nudged: {calls}"
+    )
+    assert "new-window" not in calls, f"a finish-up nudge must NOT relaunch the pane: {calls}"
+    journal = (statedir / "decision-journal.jsonl").read_text()
+    assert "finish-up" in journal, f"the finish-up decision is journaled (AC3): {journal}"
+
+
+def test_reap_pass_over_ceiling_low_progress_still_revives(tmp_path: Path) -> None:
+    # AC2: an over-ceiling spoke with a barely-started ledger and no pushed work is a genuine
+    # runaway — it still REVIVES (kill + relaunch), no finish-up shortcut.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane alive
+    expr, env, _ready_log, statedir = _reaper_env(
+        spoke, tmp_path, fake_bin, idle=True, transcript=_ledger_records(done=2, total=33)
+    )
+    (statedir / "dispatch-5.epoch").write_text("1000\n")  # over ceiling
+
+    _call(expr, env=env)
+
+    assert "new-window" in tmux_log.read_text(), "a low-progress runaway still revives"
+    assert "revive" in (statedir / "decision-journal.jsonl").read_text()
+
+
+def test_reap_pass_over_ceiling_near_complete_revives_after_max_nudges(tmp_path: Path) -> None:
+    # The finish-up nudge is bounded by the shared per-window budget: once spent, a still-
+    # over-ceiling near-complete spoke falls through to the revive rather than nudged forever.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane alive
+    expr, env, _ready_log, statedir = _reaper_env(
+        spoke, tmp_path, fake_bin, idle=True, transcript=_ledger_records(done=33, total=33)
+    )
+    (statedir / "dispatch-5.epoch").write_text("1000\n")  # over ceiling
+    (statedir / "nudge-5.count").write_text("2\n")  # the shared nudge budget is already spent
+
+    _call(expr, env=env)
+
+    assert "new-window" in tmux_log.read_text(), (
+        "past the nudge budget, an over-ceiling near-complete spoke revives"
+    )
+
+
 # ── issue #243: hang-forensics bundle before the reaper tears down a frozen spoke ──
 # A live-but-frozen claude spoke is REVIVED (#241) by killing its pane and relaunching —
 # which DESTROYS the evidence needed to characterize the hang or file an upstream report.
