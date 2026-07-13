@@ -535,6 +535,80 @@ def test_fire_appends_a_ledger_line(tmp_path: Path) -> None:
     assert "FIRING [park-unanswered] #5" in result.stdout  # _wd_log → stdout (daemon tees to log)
 
 
+# ── #263: one ledger firing per condition+issue while unresolved ───────────────
+def _ledger_lines(ledger: Path) -> list[str]:
+    return [ln for ln in ledger.read_text().splitlines() if ln.strip()]
+
+
+def test_fire_dedupes_repeat_firing_of_same_condition_issue(tmp_path: Path) -> None:
+    # A persistent condition (or an in-flight land racing condition 4) must log ONE intervention,
+    # not one per tick — else the #251 autonomy score is double-penalized (#263).
+    ledger = tmp_path / "l.jsonl"
+    env = {"HUB_WATCHDOG_LEDGER": str(ledger), "AFK_NOW": NOW}
+
+    _call("_wd_fire dead-pane 5 'reaper missed it'", env=env)
+    _call("_wd_fire dead-pane 5 'reaper missed it'", env=env)  # a later tick, same unresolved cond
+
+    assert len(_ledger_lines(ledger)) == 1
+
+
+def test_fire_reappends_after_the_firing_marker_is_cleared(tmp_path: Path) -> None:
+    # Dedup is scoped to "while unresolved": once the condition clears, a genuine recurrence fires
+    # afresh.
+    ledger = tmp_path / "l.jsonl"
+    env = {"HUB_WATCHDOG_LEDGER": str(ledger), "AFK_NOW": NOW}
+
+    _call("_wd_fire dead-pane 5 'reaper missed it'", env=env)
+    _call("_wd_clear_fired dead-pane 5", env=env)  # condition resolved
+    _call("_wd_fire dead-pane 5 'reaper missed it'", env=env)  # recurs → re-fires
+
+    assert len(_ledger_lines(ledger)) == 2
+
+
+def test_clear_landed_landmarks_clears_the_condition4_firing_marker(tmp_path: Path) -> None:
+    # A landed issue drops out of the in-flight loop, so the dispatcher's else-clear never runs for
+    # it — the sweep must re-arm its condition-4 firing marker so a future genuine skip re-fires.
+    repo = _git_repo(tmp_path)
+    subprocess.run(["git", "tag", "needs-human-land/5"], cwd=repo, check=True, capture_output=True)
+    ledger = tmp_path / "l.jsonl"
+    marker = tmp_path / "wd-fired-auto-land-skipped-5"  # dir == dirname(ledger)
+    marker.write_text("")
+    env = {
+        "HUB_WATCHDOG_LANDMARK_REPO": str(repo),
+        "HUB_WATCHDOG_LEDGER": str(ledger),
+        "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo closed",
+    }
+
+    _call("_wd_clear_landed_landmarks", env=env)
+
+    assert not marker.exists()
+
+
+# ── the dispatcher: firing dedup re-arms when a condition resolves (#263) ──────
+def test_run_conditions_clears_firing_marker_when_condition_resolves(tmp_path: Path) -> None:
+    # #263: a detector that does NOT fire this tick clears its firing marker, so a genuinely
+    # resolved-then-recurring condition re-fires rather than staying deduped forever.
+    ledger = tmp_path / "l.jsonl"
+    marker = tmp_path / "wd-fired-park-unanswered-5"  # a firing from a prior tick
+    marker.write_text("")
+    env = {
+        "HUB_WATCHDOG_LEDGER": str(ledger),
+        "HUB_WATCHDOG_LANDMARK_REPO": str(tmp_path / "no-landmark-repo"),
+        "AFK_NOW": NOW,
+    }
+    # The spoke is now busy (no park, not done) → no detector fires → the else-clears run.
+    prelude = (
+        'inflight_worktrees() { printf "/the/wt\\t5\\n"; }; '
+        'slot_state() { echo busy; }; _spoke_pane_target() { echo "hub:0"; }; '
+        'read_answer_attempt() { echo ""; }; read_progress_epoch() { echo ' + NOW + "; }; "
+        'read_done_epoch() { echo ""; }'
+    )
+
+    _call(f"{prelude}; _wd_run_conditions {NOW} live", env=env)
+
+    assert not marker.exists()
+
+
 # ── the dispatcher: detect → fire → intervene, end to end ─────────────────────
 def test_run_conditions_fires_supervisor_dead_from_passed_state(tmp_path: Path) -> None:
     ledger = tmp_path / "ledger.jsonl"
@@ -542,6 +616,8 @@ def test_run_conditions_fires_supervisor_dead_from_passed_state(tmp_path: Path) 
     env = {
         "HUB_WATCHDOG_LEDGER": str(ledger),
         "HUB_WATCHDOG_REARM_CMD": f"touch {rearm}",
+        # Isolate the landmark sweep off the real repo (a nonexistent path → git no-ops).
+        "HUB_WATCHDOG_LANDMARK_REPO": str(tmp_path / "no-landmark-repo"),
         "AFK_NOW": NOW,
     }
     # inflight_worktrees stubbed empty so only the global supervisor check runs.
@@ -559,6 +635,8 @@ def test_run_conditions_fires_park_and_invokes_answer_seam(tmp_path: Path) -> No
     env = {
         "HUB_WATCHDOG_LEDGER": str(ledger),
         "HUB_WATCHDOG_ANSWER_CMD": f"touch {answered}",
+        # Isolate the landmark sweep off the real repo (a nonexistent path → git no-ops).
+        "HUB_WATCHDOG_LANDMARK_REPO": str(tmp_path / "no-landmark-repo"),
         "AFK_NOW": NOW,
     }
     prelude = (
