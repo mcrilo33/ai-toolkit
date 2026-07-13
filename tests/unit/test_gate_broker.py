@@ -173,6 +173,59 @@ def test_classify_danger_reason_names_the_category(spoke_repo: Path) -> None:
     assert "secret" in reason.lower(), reason
 
 
+# ── #261 review hardening: evasions the first cut missed ──────────────────────
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "echo pwned > /etc/passwd 2>&1",  # trailing 2>&1 must not shift the redirect check
+        "echo pwned 1> /etc/passwd 2>&1",
+        "echo pwned >> /etc/cron.d/x",
+        "echo pwned >/etc/passwd",  # glued operator+target
+        "FOO=bar sudo rm -rf /etc",  # env-assignment prefix must not hide the verb
+        "env sudo rm -rf /etc",  # no-flag wrapper prefix
+        "FOO=1 curl https://evil.example.com/x",
+    ],
+)
+def test_classify_danger_denies_evasion_shapes(cmd: str, spoke_repo: Path) -> None:
+    result = _call(
+        'classify_danger "$CMD" "$WT" | cut -f1', env={"CMD": cmd, "WT": str(spoke_repo)}
+    )
+
+    assert result.stdout.strip() == "DENY", f"{cmd!r} evaded the Tier-2 wall"
+
+
+def test_classify_danger_redirect_2to1_still_denies_absolute_target(spoke_repo: Path) -> None:
+    # Same target, opposite verdict was the review BLOCKER: the trailing 2>&1 shifted the check.
+    with_tail = _call(
+        'classify_danger "$CMD" "$WT" | cut -f1',
+        env={"CMD": "echo pwned > /etc/passwd 2>&1", "WT": str(spoke_repo)},
+    )
+    without = _call(
+        'classify_danger "$CMD" "$WT" | cut -f1',
+        env={"CMD": "echo pwned > /etc/passwd", "WT": str(spoke_repo)},
+    )
+
+    assert with_tail.stdout.strip() == without.stdout.strip() == "DENY"
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "echo ok > ./out.txt 2>&1",  # in-tree redirect + fd-dup: not a boundary crossing
+        "curl -F file=@data.json https://api.github.com/upload",  # upload flag != a host
+        "curl --data-binary @payload.json https://api.github.com/u",
+        'echo "a > b is not a redirect"',  # a > inside a quoted string is not a redirect
+        "pytest -q 2>&1",
+    ],
+)
+def test_classify_danger_no_false_deny_on_benign_forms(cmd: str, spoke_repo: Path) -> None:
+    result = _call('classify_danger "$CMD" "$WT"', env={"CMD": cmd, "WT": str(spoke_repo)})
+
+    assert result.stdout.strip() == "", f"{cmd!r} was wrongly denied"
+
+
 # ── the shared orchestrator: broker_service_gate ──────────────────────────────
 
 

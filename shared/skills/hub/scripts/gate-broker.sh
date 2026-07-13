@@ -1931,23 +1931,71 @@ classify_permission() {
 # UPGRADE: promote a judge-caught tier-2 miss (a novel destructive verb, a package-install that
 # ran a hostile lifecycle script) into a static case here once the journal shows it.
 
-# _danger_host_allowed <host> -> rc 0 when a network host is on the egress allowlist
-# (api.anthropic.com + *.anthropic.com, github.com + *.github.com, *.githubusercontent.com),
-# rc 1 otherwise. Case-folded. A subdomain suffix match still requires a literal dot boundary,
-# so `notgithub.com` / `github.com.evil.com` never match.
-_danger_host_allowed() {
-  local h; h="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
-  case "$h" in
-    api.anthropic.com | *.anthropic.com | anthropic.com \
-      | github.com | *.github.com | *.githubusercontent.com) return 0 ;;
-    *) return 1 ;;
-  esac
+# _danger_strip_prefix <segment> -> echo the segment with any leading `NAME=value` env
+# assignments and no-flag wrapper commands (env/command/nohup/setsid) removed, so a verb-keyed
+# category is not evaded by `FOO=1 sudo ...` or `env sudo ...` (the repo's #15292 env-prefix gap,
+# here on a DENY wall). The assignment case is the classic gap and is handled fully; a wrapper
+# that itself carries flags (`nice -n 10 sudo`, `env -i sudo`) stops the strip and routes to the
+# judge -- an acceptable partial fix for the common shapes.
+_danger_strip_prefix() {
+  local seg="$1" first
+  while :; do
+    seg="${seg#"${seg%%[![:space:]]*}"}"
+    first="${seg%%[[:space:]]*}"
+    case "$first" in
+      [A-Za-z_]*=*)
+        case "${first%%=*}" in *[!A-Za-z0-9_]*) break ;; esac   # not a valid var name -> stop
+        seg="${seg#"$first"}" ;;
+      env | command | nohup | setsid) seg="${seg#"$first"}" ;;
+      *) break ;;
+    esac
+  done
+  printf '%s' "${seg#"${seg%%[![:space:]]*}"}"
+}
+
+# _danger_redirect_targets <cmd> -> print each FILE redirect target in <cmd> (one per line),
+# skipping fd-duplications (2>&1, >&2). shlex-tokenized so a `>` inside a quoted string is NOT a
+# redirect and quoting is honored; prints `__UNPARSEABLE__` on unbalanced quotes (caller denies,
+# deny-lean). Replaces the last-`>`-only heuristic that a trailing `2>&1` defeated (#261 review):
+# scanning EVERY redirect operator token catches the real out-of-tree target regardless of what
+# trails it. Empty (no python3, or no redirects) -> the caller finds no target and moves on.
+_danger_redirect_targets() {
+  command -v python3 >/dev/null 2>&1 || return 0
+  _DANGER_CMD="$1" python3 2>/dev/null <<'PYEOF'
+import os, re, shlex
+
+cmd = os.environ["_DANGER_CMD"]
+try:
+    toks = shlex.split(cmd)
+except Exception:
+    print("__UNPARSEABLE__"); raise SystemExit(0)
+
+op = re.compile(r"^([0-9]*|&)(>>?)\|?")   # a redirect operator, possibly glued to its target
+targets = []
+i = 0
+while i < len(toks):
+    t = toks[i]
+    m = op.match(t)
+    if m:
+        suffix = t[m.end():]
+        if suffix:
+            if not suffix.startswith("&"):
+                targets.append(suffix)
+        elif i + 1 < len(toks) and not toks[i + 1].startswith("&"):
+            targets.append(toks[i + 1])
+            i += 1
+    i += 1
+for t in targets:
+    print(t)
+PYEOF
 }
 
 # _danger_network_seg <segment> -> print a reason and rc 0 when the segment is off-allowlist
-# network egress, else rc 1. Raw-socket tools are denied outright; curl/wget hosts are parsed
-# (python3) and denied unless every host is allowlisted. Fails CLOSED (deny) when curl/wget
-# carries no parseable host or python3 is absent -- an unverifiable egress does not run.
+# network egress, else rc 1. Raw-socket tools are denied outright; curl/wget URL hosts are parsed
+# (python3) and denied unless every host is allowlisted. Only `://`-scheme tokens are read as
+# hosts (a header/upload flag value is never mistaken for a host, so a legit upload to an allowed
+# host is not falsely blocked -- #261 review); a curl/wget carrying NO scheme URL fails CLOSED
+# (deny), as does an absent python3 -- an unverifiable egress does not run.
 _danger_network_seg() {
   local seg="$1" verb host_check
   verb="${seg%%[[:space:]]*}"
@@ -1964,10 +2012,8 @@ from urllib.parse import urlparse
 
 def allowed(h):
     h = h.lower()
-    if h in {"api.anthropic.com", "github.com", "api.github.com",
+    if h in {"api.anthropic.com", "anthropic.com", "github.com", "api.github.com",
              "raw.githubusercontent.com", "codeload.github.com", "objects.githubusercontent.com"}:
-        return True
-    if h == "anthropic.com":
         return True
     return any(h.endswith(s) for s in (".anthropic.com", ".github.com", ".githubusercontent.com"))
 
@@ -1976,25 +2022,15 @@ try:
 except Exception:
     print("DENY unparseable"); sys.exit(0)
 
+# Only a scheme URL (contains ://) whose urlparse yields a hostname counts as an egress host.
+# A header value, a -d/-F payload, or a bare hostless arg is never a host -> no false deny, and a
+# curl with no scheme URL yields no host -> fail-closed DENY below.
 hosts = []
-skip = False
 for t in toks[1:]:
-    if skip:
-        skip = False
-        continue
-    if t in ("-o", "-O", "--output", "-d", "--data", "-H", "--header", "-A", "-e", "-b", "-u"):
-        skip = True
-        continue
-    if t.startswith("-"):
-        continue
     if "://" in t:
         h = urlparse(t).hostname
         if h:
             hosts.append(h)
-    elif "." in t and "/" not in t:
-        hosts.append(t.split(":")[0])
-    elif "/" in t and not t.startswith("/") and "." in t.split("/")[0]:
-        hosts.append(t.split("/")[0].split(":")[0])
 
 if not hosts:
     print("DENY no-parseable-host"); sys.exit(0)
@@ -2035,12 +2071,12 @@ _danger_credential_seg() {
 }
 
 # _danger_write_seg <segment> <cwd> <wt> <slug> <tasks> -> print a reason and rc 0 when the
-# segment writes OUTSIDE the worktree, else rc 1. Two shapes: a mutating verb (mv/cp/rm/mkdir/
-# chmod) the in-worktree mutation lane does NOT confine (invert _permission_seg_mutation_ok),
-# and a `>`/`>>` redirection whose target does not resolve inside the worktree/scratchpad.
-# Inert (rc 1) without a worktree context -- the resolver needs it.
+# segment is a mutating verb (mv/cp/rm/mkdir/chmod) the in-worktree mutation lane does NOT
+# confine (invert _permission_seg_mutation_ok), else rc 1. Out-of-tree REDIRECTIONS are handled
+# separately, whole-command, in classify_danger (a `2>&1` tail must not shift the check off the
+# real target). Inert (rc 1) without a worktree context -- the resolver needs it.
 _danger_write_seg() {
-  local seg="$1" cwd="$2" wt="$3" slug="$4" tasks="$5" verb rt
+  local seg="$1" cwd="$2" wt="$3" slug="$4" tasks="$5" verb
   [ -n "$wt" ] || return 1
   verb="${seg%%[[:space:]]*}"
   case "$verb" in
@@ -2048,19 +2084,6 @@ _danger_write_seg() {
       if ! _permission_seg_mutation_ok "$seg" "$cwd" "$wt" "$slug" "$tasks"; then
         printf 'writes outside the worktree (%s)' "$verb"; return 0
       fi ;;
-  esac
-  # Redirection target: the token after the LAST redirect operator (covers append too). Resolve
-  # it against the worktree roots; a target that does not resolve inside them is out-of-tree.
-  case "$seg" in
-    *'>'*)
-      rt="${seg##*>}"; rt="${rt#"${rt%%[![:space:]]*}"}"; rt="${rt%%[[:space:]]*}"
-      case "$rt" in
-        '' | '&'*) : ;;   # empty, or an fd dup (2>&1); not a filesystem target
-        *)
-          if ! _broker_resolve_in_roots "$rt" "$cwd" "$wt" "$slug" "$tasks" >/dev/null 2>&1; then
-            printf 'writes outside the worktree via redirection: %s' "$rt"; return 0
-          fi ;;
-      esac ;;
   esac
   return 1
 }
@@ -2079,26 +2102,47 @@ _danger_privilege_seg() {
 # classify_danger <command> [worktree] -> "DENY<TAB><reason>" for the FIRST dangerous segment,
 # or empty (rc 0) when no segment statically matches (the orchestrator then routes to the judge).
 classify_danger() {
-  local cmd="$1" wt="${2:-}" norm seg slug="" tasks="" cwd="" reason target new_cwd
+  local cmd="$1" wt="${2:-}" norm seg slug="" tasks="" cwd="" reason target new_cwd rtargets rt
   if [ -n "$wt" ]; then
     slug="$(printf '%s' "$wt" | sed 's/[^A-Za-z0-9]/-/g')"
     tasks="${AFK_TASKS_ROOT:-/private/tmp}"
     cwd="$wt"
+    # Out-of-tree REDIRECTION (whole-command, shlex-based). Done once on the RAW command -- not
+    # per operator-split segment -- so a trailing `2>&1` (which the `&`-split would shatter) can
+    # never shift the check off the real target (#261 review). Targets resolve against the initial
+    # worktree cwd, so an ABSOLUTE out-of-tree redirect is caught regardless of any earlier `cd`.
+    rtargets="$(_danger_redirect_targets "$cmd")"
+    while IFS= read -r rt; do
+      [ -n "$rt" ] || continue
+      [ "$rt" = "__UNPARSEABLE__" ] && { printf 'DENY\t%s\n' "unparseable redirection (unbalanced quoting)"; return 0; }
+      case "$rt" in '&'*) continue ;; esac
+      if ! _broker_resolve_in_roots "$rt" "$wt" "$wt" "$slug" "$tasks" >/dev/null 2>&1; then
+        printf 'DENY\t%s\n' "writes outside the worktree via redirection: $rt"; return 0
+      fi
+    done <<< "$rtargets"
   fi
   norm="${cmd//&&/$'\n'}"; norm="${norm//&/$'\n'}"; norm="${norm//||/$'\n'}"
   norm="${norm//|/$'\n'}"; norm="${norm//;/$'\n'}"
   while IFS= read -r seg; do
     seg="${seg#"${seg%%[![:space:]]*}"}"; seg="${seg%"${seg##*[![:space:]]}"}"
     [ -n "$seg" ] || continue
+    # Strip a leading `FOO=bar` / `env|command|nohup|setsid` prefix so it can't shift the verb
+    # off a keyed category (the #15292 env-prefix gap, here on a DENY wall).
+    seg="$(_danger_strip_prefix "$seg")"
+    [ -n "$seg" ] || continue
     # cd-tracking mirrors classify_permission so a `cd`-then-write compound resolves relative
-    # targets against the right dir; a cd that escapes is itself an out-of-tree signal handled
-    # by the following segments (they resolve against the unchanged cwd and deny).
+    # targets against the right dir. A cd that ESCAPES the roots does NOT leave cwd in-tree
+    # (that let a following relative write resolve against a stale in-tree cwd, #261 review);
+    # instead cwd is set to an out-of-tree sentinel, so subsequent relative writes resolve
+    # out-of-tree and deny.
     case "$seg" in
       'cd '*)
         target="${seg#cd }"; target="${target#"${target%%[![:space:]]*}"}"
         case "$target" in '' | -*) continue ;; esac
         if [ -n "$wt" ] && new_cwd="$(_broker_resolve_in_roots "$target" "$cwd" "$wt" "$slug" "$tasks")"; then
           cwd="$new_cwd"
+        else
+          cwd="/__afk_cd_escaped__"   # out-of-tree sentinel: relative writes below now deny
         fi
         continue ;;
     esac
