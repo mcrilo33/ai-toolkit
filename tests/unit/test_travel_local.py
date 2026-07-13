@@ -25,6 +25,7 @@ import contextlib
 import os
 import signal
 import subprocess
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -162,6 +163,21 @@ def _calls(env) -> str:
     return env.log.read_text()
 
 
+def _wait_for_log(env, needle: str, timeout: float = 5.0) -> str:
+    """Poll the call-log until ``needle`` appears or ``timeout`` elapses; return the text.
+
+    A backgrounded stub (e.g. ``caffeinate``) echoes its call line before ``exec``-ing
+    ``sleep``, so that write races the parent script's return. Polling — rather than a
+    single read gated on a fixed settle — observes the detached write deterministically.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        text = env.log.read_text()
+        if needle in text or time.monotonic() >= deadline:
+            return text
+        time.sleep(0.02)
+
+
 # --- guards -------------------------------------------------------------------
 
 
@@ -202,8 +218,10 @@ def test_on_happy_path_joins_verifies_disablesleep_and_caffeinates(env) -> None:
     assert "networksetup -setairportnetwork en0 Mathieu iPhone" in calls
     assert "curl" in calls
     assert "pmset -a disablesleep 1" in calls
-    # start_caffeinate's post-launch settle means the daemon has run (and logged) before the
-    # run returns, so its call-log line is a deterministic check that caffeinate -s was invoked.
+    # caffeinate launches detached, so start_caffeinate's post-launch settle proves only
+    # liveness (via kill -0), NOT that the forked stub wrote its call-log line. Poll for the
+    # line so the caffeinate -s assertion is deterministic and does not depend on the settle.
+    calls = _wait_for_log(env, "caffeinate -s")
     assert "caffeinate -s" in calls
     assert env.pidfile.read_text().strip(), "caffeinate pid not recorded"
     assert "lid-close safe" in proc.stdout.lower()
