@@ -456,9 +456,32 @@ case "$DECISION" in
     note "mapped diff — selected test files: ${SEL_ARR[*]}"
     run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" "${SEL_ARR[@]}" || rc=$?
     if [ "$has_py" = "1" ]; then
-      note "mixed diff — pytest --testmon for the python part"
+      # Dedup (issue #270): the mapped test files ALREADY ran, in full, above. When
+      # the changed .py IS a mapped mirror test (the common tooling shape: a *.sh
+      # and its test_*.py edited together), testmon would reselect that same file
+      # here because it changed — running the heaviest suite twice. --ignore each
+      # mapped file (and the meta file) so testmon collects everything EXCEPT them:
+      # any impacted test inside a mapped file already ran above, so nothing is
+      # missed and nothing double-runs. (--ignore, not an explicit node list, so
+      # testmon can never deselect a mapped node — the line-438 hazard is avoided.)
+      IGNORE_ARR=()
+      while IFS= read -r t; do
+        [ -n "$t" ] && IGNORE_ARR+=("--ignore=$t")
+      done <<< "$SELECTED_TESTS"
+      if [ -f "$META_TEST_FILE" ]; then
+        IGNORE_ARR+=("--ignore=$META_TEST_FILE")
+      fi
+      note "mixed diff — pytest --testmon for the python part (mapped files ran above; --ignore'd here so testmon can't double-run them)"
       rc2=0
-      run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" --testmon || rc2=$?
+      run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" --testmon "${IGNORE_ARR[@]}" || rc2=$?
+      # Exit 5 = "no tests collected": when the mapped files ARE testmon's whole
+      # impact set, --ignore leaves testmon nothing to run. That is a GREEN outcome
+      # (everything testmon would run already ran above), the only exit-5 source on
+      # this leg — normalize it to success so the dedup never blocks a clean push.
+      if [ "$rc2" = "5" ]; then
+        note "mixed diff — testmon leg collected no tests after --ignore (mapped files were its whole impact set) — treating as green"
+        rc2=0
+      fi
       [ "$rc" -ne 0 ] || rc=$rc2
     fi
     ;;
