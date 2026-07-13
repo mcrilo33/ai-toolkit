@@ -5007,3 +5007,220 @@ def test_afk_permission_hook_journals_the_auto_approve(
     body = journal.read_text()
     assert "hook auto-approved" in body, body
     assert '"park":"permission"' in body, body
+
+
+# ── issue #261: the PreToolUse deny-wall (afk_danger_guard_decide) ────────────
+# Under bypassPermissions an afk spoke raises NO dialog, so this PreToolUse hook IS the safety
+# boundary. It runs classify_danger (Tier 2, deny-first) -> classify_permission (Tier 1, allow)
+# -> judge_permission (Tier 3), emitting permissionDecision:"deny" for boundary crossings and the
+# judge-dangerous residue. Gated on an issue-numbered spoke branch AND the fail-safe mode gate
+# (.ai-toolkit/mode: afk/ambiguous -> ACTIVE, positively-attended -> INERT).
+
+DANGER_GUARD_HOOK = REPO_ROOT / "shared" / "hooks" / "afk-danger-guard.sh"
+
+
+@pytest.fixture
+def afk_bypass_spoke(spoke_repo: Path, tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    """A spoke on an issue-numbered branch with .ai-toolkit/mode == afk (launched under bypass)."""
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(
+        ["git", "checkout", "-q", "-b", "feature/261-wall"],
+        cwd=spoke_repo,
+        check=True,
+        env=git_env,
+        capture_output=True,
+    )
+    (spoke_repo / ".ai-toolkit").mkdir(exist_ok=True)
+    (spoke_repo / ".ai-toolkit" / "mode").write_text("afk\n")
+    env = {
+        "AFK_STATE_DIR": str(tmp_path / "afk-state"),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_TASKS_ROOT": str(tmp_path / "tasks"),
+        # A safe-verdict judge stub by default; deny/timeout tests override it.
+        "AFK_JUDGE_CMD": "printf 'VERDICT: safe\\n'",
+    }
+    return spoke_repo, env
+
+
+def _decide(payload: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return _call("afk_danger_guard_decide", env=env, stdin=payload)
+
+
+def _perm(stdout: str) -> str:
+    stdout = stdout.strip()
+    if not stdout:
+        return "(silent)"
+    return json.loads(stdout)["hookSpecificOutput"]["permissionDecision"]
+
+
+def test_danger_guard_denies_out_of_tree_write(
+    afk_bypass_spoke: tuple[Path, dict[str, str]],
+) -> None:
+    wt, env = afk_bypass_spoke
+
+    result = _decide(_hook_payload("Bash", wt, command="echo pwned > /etc/passwd"), env)
+
+    assert result.returncode == 0, result.stderr
+    assert _perm(result.stdout) == "deny", result.stdout
+
+
+def test_danger_guard_denies_keychain_read(afk_bypass_spoke: tuple[Path, dict[str, str]]) -> None:
+    # classify_permission APPROVEs any `cat ...`; the deny-first order catches the secret read.
+    wt, env = afk_bypass_spoke
+
+    result = _decide(_hook_payload("Bash", wt, command="cat ~/.ssh/id_rsa"), env)
+
+    assert _perm(result.stdout) == "deny", result.stdout
+
+
+def test_danger_guard_allows_238_smoke(afk_bypass_spoke: tuple[Path, dict[str, str]]) -> None:
+    # The #238 acceptance shape -- chmod +x a worktree script then run it -- is a Tier-1 benign
+    # self-op: the wall stays silent, so under bypass it runs with no dialog and no judge.
+    wt, env = afk_bypass_spoke
+    (wt / "x.sh").write_text("#!/bin/sh\necho hi\n")
+
+    result = _decide(_hook_payload("Bash", wt, command="chmod +x ./x.sh && ./x.sh"), env)
+
+    assert result.stdout.strip() == "", result.stdout
+
+
+def test_danger_guard_judge_dangerous_denies(
+    afk_bypass_spoke: tuple[Path, dict[str, str]],
+) -> None:
+    # A residue command (neither statically safe nor dangerous) routes to the judge; a dangerous
+    # verdict denies.
+    wt, env = afk_bypass_spoke
+    env = {**env, "AFK_JUDGE_CMD": "printf 'VERDICT: dangerous\\n'"}
+
+    result = _decide(_hook_payload("Bash", wt, command="frobnicate --destroy"), env)
+
+    assert _perm(result.stdout) == "deny", result.stdout
+
+
+def test_danger_guard_judge_safe_allows(afk_bypass_spoke: tuple[Path, dict[str, str]]) -> None:
+    wt, env = afk_bypass_spoke  # default stub returns safe
+
+    result = _decide(_hook_payload("Bash", wt, command="frobnicate --wobble"), env)
+
+    assert result.stdout.strip() == "", result.stdout
+
+
+def test_danger_guard_fail_closed_on_judge_timeout(
+    afk_bypass_spoke: tuple[Path, dict[str, str]],
+) -> None:
+    wt, env = afk_bypass_spoke
+    env = {**env, "AFK_JUDGE_CMD": "sleep 5", "AFK_JUDGE_TIMEOUT": "1"}
+
+    result = _decide(_hook_payload("Bash", wt, command="frobnicate --residue"), env)
+
+    assert _perm(result.stdout) == "deny", "an unjudgeable command must fail closed"
+
+
+def test_danger_guard_inert_on_attended_mode(
+    afk_bypass_spoke: tuple[Path, dict[str, str]],
+) -> None:
+    # A positively-attended spoke keeps the human as the wall: the guard stays silent even for a
+    # boundary crossing (attended sessions still have prompts).
+    wt, env = afk_bypass_spoke
+    (wt / ".ai-toolkit" / "mode").write_text("attended\n")
+
+    result = _decide(_hook_payload("Bash", wt, command="sudo rm -rf /"), env)
+
+    assert result.stdout.strip() == "", result.stdout
+
+
+def test_danger_guard_active_when_mode_missing(
+    afk_bypass_spoke: tuple[Path, dict[str, str]],
+) -> None:
+    # FAIL-SAFE: a missing mode file keeps the wall ACTIVE -- a bypass spoke with the wall off is
+    # the one unacceptable state.
+    wt, env = afk_bypass_spoke
+    (wt / ".ai-toolkit" / "mode").unlink()
+
+    result = _decide(_hook_payload("Bash", wt, command="sudo rm -rf /"), env)
+
+    assert _perm(result.stdout) == "deny", result.stdout
+
+
+def test_danger_guard_inert_on_non_spoke_branch(
+    afk_bypass_spoke: tuple[Path, dict[str, str]],
+) -> None:
+    # A branch with no issue number (the hub on main, an ad-hoc branch) is not a bypass spoke.
+    wt, env = afk_bypass_spoke
+    subprocess.run(
+        ["git", "checkout", "-q", "-b", "docs/readme"],
+        cwd=wt,
+        check=True,
+        env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t"},
+        capture_output=True,
+    )
+
+    result = _decide(_hook_payload("Bash", wt, command="sudo rm -rf /"), env)
+
+    assert result.stdout.strip() == "", result.stdout
+
+
+def test_danger_guard_journals_tier2_deny(
+    afk_bypass_spoke: tuple[Path, dict[str, str]],
+) -> None:
+    # #241: every Tier-2 deny is journaled for the morning review.
+    wt, env = afk_bypass_spoke
+
+    _decide(_hook_payload("Bash", wt, command="cat ~/.ssh/id_rsa"), env)
+
+    journal = Path(env["AFK_STATE_DIR"]) / "decision-journal.jsonl"
+    assert journal.exists(), "a Tier-2 deny must journal"
+    body = journal.read_text()
+    assert "tier2 deny" in body, body
+
+
+def test_danger_guard_shim_emits_deny_end_to_end(
+    afk_bypass_spoke: tuple[Path, dict[str, str]],
+) -> None:
+    # Exercise the actual PreToolUse shim SCRIPT: it locates + sources gate-broker.sh, runs
+    # afk_danger_guard_decide, and prints the deny verdict.
+    wt, env = afk_bypass_spoke
+    payload = _hook_payload("Bash", wt, command="sudo rm -rf /")
+    proc_env = {**os.environ, **env}
+    proc_env.pop("CLAUDE_PROJECT_DIR", None)
+
+    result = subprocess.run(
+        ["bash", str(DANGER_GUARD_HOOK)],
+        cwd=str(wt),
+        input=payload,
+        capture_output=True,
+        text=True,
+        env=proc_env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert '"permissionDecision":"deny"' in result.stdout, result.stdout + result.stderr
+
+
+def test_danger_guard_registered_like_permission_hook() -> None:
+    # afk-danger-guard is wired exactly like afk-permission-hook: Claude-only PreToolUse Bash|Read.
+    import sys as _sys
+
+    _sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    from hooks_generator import generate_claude, parse_hooks_metadata
+
+    meta = parse_hooks_metadata(str(REPO_ROOT / "shared" / "hooks" / "metadata.yml"))
+    cfg = generate_claude(meta)
+
+    def _handler(script: str) -> dict | None:
+        for group in cfg.get("PreToolUse", []):
+            for h in group.get("hooks", []):
+                if h.get("command", "").endswith(script):
+                    return h
+        return None
+
+    danger = _handler("afk-danger-guard.sh")
+    perm = _handler("afk-permission-hook.sh")
+    assert danger is not None, "afk-danger-guard not registered for Claude PreToolUse"
+    assert perm is not None, "afk-permission-hook baseline missing"
