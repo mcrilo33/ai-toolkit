@@ -1625,7 +1625,15 @@ _broker_seg_secretlike() {
       | .netrc | credentials | .npmrc | .pypirc) return 0 ;;
   esac
   path_lower="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
-  case "$path_lower" in */.ssh/* | */.aws/* | */.gnupg/*) return 0 ;; esac
+  # Credential STORES by directory (issue #261 review): the SSH/AWS/GPG dirs plus the common
+  # cloud/registry credential dirs, so a `cat ~/.kube/config` / `~/.docker/config.json` /
+  # gcloud / gh-token read is recognized as secret-like and the deny-wall's credential lane
+  # stops it. UPGRADE: a novel cred store not listed here falls to the Tier-3 judge, not a
+  # static deny -- extend this set as the #261 journal surfaces new ones.
+  case "$path_lower" in
+    */.ssh/* | */.aws/* | */.gnupg/* | */.kube/* | */.docker/* \
+      | */.config/gcloud/* | */.config/gh/*) return 0 ;;
+  esac
   return 1
 }
 
@@ -1922,6 +1930,350 @@ classify_permission() {
   # An empty / all-whitespace command has no segment to vouch for — never approve nothing.
   [ "$saw_seg" -eq 1 ] || { printf 'ESCALATE\t%s\n' "empty or unreadable command"; return 0; }
   printf 'APPROVE\n'
+}
+
+# --- Tier-2 static danger classifier (issue #261) -----------------------------
+# The deny-wall's fast static blacklist. classify_permission (Tier 1) names the KNOWN-SAFE
+# scoped self-ops (APPROVE); classify_danger names the KNOWN-DANGEROUS boundary crossings
+# (DENY) among everything else, so the Tier-3 LLM judge runs ONLY on the true residue --
+# neither statically safe nor statically dangerous. Same operator-split as classify_permission
+# (; && || | &), first dangerous segment wins. Empty output = "no static danger" -> the
+# orchestrator routes the command to the judge.
+#
+# CATEGORIES (the boundary the existing scope-guards do NOT already cover):
+#   - privilege escalation / disk destroyers: sudo/doas/su, dd, mkfs*, fdisk, parted, shred
+#   - network egress off-allowlist: curl/wget to a non-allowlisted host; raw sockets
+#     (nc/ncat/netcat/telnet/ssh/scp/sftp/ftp) denied outright
+#   - keychain / credential reads: `security`, or a read of a secret-like path
+#   - out-of-tree writes: a mutating verb (mv/cp/rm/mkdir/chmod) not confined to the worktree,
+#     or a `>`/`>>` redirection whose target escapes it
+# NOT duplicated here (owned by sibling PreToolUse scope-guards, kept authoritative): push to
+# main / other refs (push-scope-guard, spoke-main-guard), secrets in a commit (secrets-scan),
+# config edits (config-protection), `--no-verify` (block-no-verify). Package-installs are
+# deliberately NOT statically denied -- they route to the judge so legit fresh-worktree setup
+# (`pip install -r requirements-dev.txt`) is not stranded; the journal surfaces a dangerous one
+# for promotion to a static rule (the #261 Phase-4 measure->promote loop).
+# UPGRADE: promote a judge-caught tier-2 miss (a novel destructive verb, a package-install that
+# ran a hostile lifecycle script) into a static case here once the journal shows it.
+
+# _danger_strip_prefix <segment> -> echo the segment with any leading `NAME=value` env
+# assignments and no-flag wrapper commands (env/command/nohup/setsid) removed, so a verb-keyed
+# category is not evaded by `FOO=1 sudo ...` or `env sudo ...` (the repo's #15292 env-prefix gap,
+# here on a DENY wall). The assignment case is the classic gap and is handled fully; a wrapper
+# that itself carries flags (`nice -n 10 sudo`, `env -i sudo`) stops the strip and routes to the
+# judge -- an acceptable partial fix for the common shapes.
+_danger_strip_prefix() {
+  local seg="$1" first
+  while :; do
+    seg="${seg#"${seg%%[![:space:]]*}"}"
+    first="${seg%%[[:space:]]*}"
+    case "$first" in
+      [A-Za-z_]*=*)
+        case "${first%%=*}" in *[!A-Za-z0-9_]*) break ;; esac   # not a valid var name -> stop
+        seg="${seg#"$first"}" ;;
+      env | command | nohup | setsid) seg="${seg#"$first"}" ;;
+      *) break ;;
+    esac
+  done
+  printf '%s' "${seg#"${seg%%[![:space:]]*}"}"
+}
+
+# _danger_redirect_targets <cmd> -> print each FILE redirect target in <cmd> (one per line),
+# skipping fd-duplications (2>&1, >&2). shlex-tokenized so a `>` inside a quoted string is NOT a
+# redirect and quoting is honored; prints `__UNPARSEABLE__` on unbalanced quotes (caller denies,
+# deny-lean). Replaces the last-`>`-only heuristic that a trailing `2>&1` defeated (#261 review):
+# scanning EVERY redirect operator token catches the real out-of-tree target regardless of what
+# trails it. Empty (no python3, or no redirects) -> the caller finds no target and moves on.
+_danger_redirect_targets() {
+  command -v python3 >/dev/null 2>&1 || return 0
+  _DANGER_CMD="$1" python3 2>/dev/null <<'PYEOF'
+import os, re, shlex
+
+cmd = os.environ["_DANGER_CMD"]
+try:
+    toks = shlex.split(cmd)
+except Exception:
+    print("__UNPARSEABLE__"); raise SystemExit(0)
+
+op = re.compile(r"^([0-9]*|&)(>>?)\|?")   # a redirect operator, possibly glued to its target
+targets = []
+i = 0
+while i < len(toks):
+    t = toks[i]
+    m = op.match(t)
+    if m:
+        suffix = t[m.end():]
+        if suffix:
+            if not suffix.startswith("&"):
+                targets.append(suffix)
+        elif i + 1 < len(toks) and not toks[i + 1].startswith("&"):
+            targets.append(toks[i + 1])
+            i += 1
+    i += 1
+for t in targets:
+    print(t)
+PYEOF
+}
+
+# _danger_network_seg <segment> -> print a reason and rc 0 when the segment is off-allowlist
+# network egress, else rc 1. Raw-socket tools are denied outright; curl/wget URL hosts are parsed
+# (python3) and denied unless every host is allowlisted. Only `://`-scheme tokens are read as
+# hosts (a header/upload flag value is never mistaken for a host, so a legit upload to an allowed
+# host is not falsely blocked -- #261 review); a curl/wget carrying NO scheme URL fails CLOSED
+# (deny), as does an absent python3 -- an unverifiable egress does not run.
+_danger_network_seg() {
+  local seg="$1" verb host_check
+  verb="${seg%%[[:space:]]*}"
+  case "$verb" in
+    nc | ncat | netcat | telnet | ssh | scp | sftp | ftp)
+      printf 'raw network egress (%s) is denied under bypass' "$verb"; return 0 ;;
+    curl | wget) ;;
+    *) return 1 ;;
+  esac
+  command -v python3 >/dev/null 2>&1 || { printf 'network egress unverifiable (no python3): %s' "$verb"; return 0; }
+  host_check="$(_DANGER_SEG="$seg" python3 2>/dev/null <<'PYEOF'
+import os, sys, shlex
+from urllib.parse import urlparse
+
+def allowed(h):
+    h = h.lower()
+    if h in {"api.anthropic.com", "anthropic.com", "github.com", "api.github.com",
+             "raw.githubusercontent.com", "codeload.github.com", "objects.githubusercontent.com"}:
+        return True
+    return any(h.endswith(s) for s in (".anthropic.com", ".github.com", ".githubusercontent.com"))
+
+try:
+    toks = shlex.split(os.environ["_DANGER_SEG"])
+except Exception:
+    print("DENY unparseable"); sys.exit(0)
+
+# Only a scheme URL (contains ://) whose urlparse yields a hostname counts as an egress host.
+# A header value, a -d/-F payload, or a bare hostless arg is never a host -> no false deny, and a
+# curl with no scheme URL yields no host -> fail-closed DENY below.
+hosts = []
+for t in toks[1:]:
+    if "://" in t:
+        h = urlparse(t).hostname
+        if h:
+            hosts.append(h)
+
+if not hosts:
+    print("DENY no-parseable-host"); sys.exit(0)
+bad = [h for h in hosts if not allowed(h)]
+print("DENY " + bad[0] if bad else "OK")
+PYEOF
+)"
+  case "$host_check" in
+    OK) return 1 ;;
+    'DENY '*) printf 'network egress to a non-allowlisted host: %s' "${host_check#DENY }"; return 0 ;;
+    *) printf 'network egress unverifiable: %s' "$verb"; return 0 ;;
+  esac
+}
+
+# _danger_credential_seg <segment> <cwd> <wt> <slug> <tasks> -> print a reason and rc 0 when the
+# segment reads a keychain or an OUT-OF-TREE secret-like path, else rc 1. `security`/`keychain`
+# (macOS keychain access) is denied on the verb; a read verb (cat/head/...) touching a secret-like
+# token (reusing _broker_seg_secretlike) is denied ONLY when the path is out-of-tree. An IN-TREE
+# secret-named file (`tests/fixtures/key.pem`) is the spoke's OWN fixture -- it already has write
+# access there, so reading it is within the worktree trust boundary and is NOT denied (#261 review
+# NIT). Without a worktree context every secret-like read is denied (can't prove in-tree -> safe).
+_danger_credential_seg() {
+  local seg="$1" cwd="${2:-}" wt="${3:-}" slug="${4:-}" tasks="${5:-}" verb rest tok
+  verb="${seg%%[[:space:]]*}"
+  case "$verb" in
+    security | keychain) printf 'keychain/credential access (%s) is denied' "$verb"; return 0 ;;
+    cat | less | more | head | tail | strings | xxd | od | base64 | openssl | grep | awk | sed | cp | dd | sort | uniq) ;;
+    *) return 1 ;;
+  esac
+  rest="${seg#"$verb"}"
+  while [ -n "$rest" ]; do
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    [ -n "$rest" ] || break
+    tok="${rest%%[[:space:]]*}"
+    rest="${rest#"$tok"}"
+    case "$tok" in -*) continue ;; esac
+    _broker_seg_secretlike "$tok" || continue
+    # An in-tree secret-named file is the spoke's own fixture -> within the trust boundary, allow.
+    if [ -n "$wt" ] && _broker_resolve_in_roots "$tok" "$cwd" "$wt" "$slug" "$tasks" >/dev/null 2>&1; then
+      continue
+    fi
+    printf 'reads a secret-like path: %s' "$tok"; return 0
+  done
+  return 1
+}
+
+# _danger_write_seg <segment> <cwd> <wt> <slug> <tasks> -> print a reason and rc 0 when the
+# segment is a mutating verb (mv/cp/rm/mkdir/chmod) the in-worktree mutation lane does NOT
+# confine (invert _permission_seg_mutation_ok), else rc 1. Out-of-tree REDIRECTIONS are handled
+# separately, whole-command, in classify_danger (a `2>&1` tail must not shift the check off the
+# real target). Inert (rc 1) without a worktree context -- the resolver needs it.
+_danger_write_seg() {
+  local seg="$1" cwd="$2" wt="$3" slug="$4" tasks="$5" verb
+  [ -n "$wt" ] || return 1
+  verb="${seg%%[[:space:]]*}"
+  case "$verb" in
+    mv | cp | rm | mkdir | chmod)
+      if ! _permission_seg_mutation_ok "$seg" "$cwd" "$wt" "$slug" "$tasks"; then
+        printf 'writes outside the worktree (%s)' "$verb"; return 0
+      fi ;;
+  esac
+  return 1
+}
+
+# _danger_privilege_seg <segment> -> print a reason and rc 0 for a privilege-escalation or
+# disk-destroying verb, else rc 1.
+_danger_privilege_seg() {
+  local verb; verb="${1%%[[:space:]]*}"
+  case "$verb" in
+    sudo | doas | su | dd | fdisk | parted | shred | mkfs | mkfs.*)
+      printf 'privileged / destructive command (%s) is denied' "$verb"; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# classify_danger <command> [worktree] -> "DENY<TAB><reason>" for the FIRST dangerous segment,
+# or empty (rc 0) when no segment statically matches (the orchestrator then routes to the judge).
+classify_danger() {
+  local cmd="$1" wt="${2:-}" norm seg slug="" tasks="" cwd="" reason target new_cwd rtargets rt
+  if [ -n "$wt" ]; then
+    slug="$(printf '%s' "$wt" | sed 's/[^A-Za-z0-9]/-/g')"
+    tasks="${AFK_TASKS_ROOT:-/private/tmp}"
+    cwd="$wt"
+    # Out-of-tree REDIRECTION (whole-command, shlex-based). Done once on the RAW command -- not
+    # per operator-split segment -- so a trailing `2>&1` (which the `&`-split would shatter) can
+    # never shift the check off the real target (#261 review). Targets resolve against the initial
+    # worktree cwd, so an ABSOLUTE out-of-tree redirect is caught regardless of any earlier `cd`.
+    rtargets="$(_danger_redirect_targets "$cmd")"
+    while IFS= read -r rt; do
+      [ -n "$rt" ] || continue
+      [ "$rt" = "__UNPARSEABLE__" ] && { printf 'DENY\t%s\n' "unparseable command (unbalanced quoting) -- fail-closed"; return 0; }
+      case "$rt" in '&'*) continue ;; esac
+      if ! _broker_resolve_in_roots "$rt" "$wt" "$wt" "$slug" "$tasks" >/dev/null 2>&1; then
+        printf 'DENY\t%s\n' "writes outside the worktree via redirection: $rt"; return 0
+      fi
+    done <<< "$rtargets"
+  fi
+  norm="${cmd//&&/$'\n'}"; norm="${norm//&/$'\n'}"; norm="${norm//||/$'\n'}"
+  norm="${norm//|/$'\n'}"; norm="${norm//;/$'\n'}"
+  while IFS= read -r seg; do
+    seg="${seg#"${seg%%[![:space:]]*}"}"; seg="${seg%"${seg##*[![:space:]]}"}"
+    [ -n "$seg" ] || continue
+    # Strip a leading `FOO=bar` / `env|command|nohup|setsid` prefix so it can't shift the verb
+    # off a keyed category (the #15292 env-prefix gap, here on a DENY wall).
+    seg="$(_danger_strip_prefix "$seg")"
+    [ -n "$seg" ] || continue
+    # cd-tracking mirrors classify_permission so a `cd`-then-write compound resolves relative
+    # targets against the right dir. A cd that ESCAPES the roots does NOT leave cwd in-tree
+    # (that let a following relative write resolve against a stale in-tree cwd, #261 review);
+    # instead cwd is set to an out-of-tree sentinel, so subsequent relative writes resolve
+    # out-of-tree and deny.
+    case "$seg" in
+      'cd '*)
+        target="${seg#cd }"; target="${target#"${target%%[![:space:]]*}"}"
+        case "$target" in '' | -*) continue ;; esac
+        if [ -n "$wt" ] && new_cwd="$(_broker_resolve_in_roots "$target" "$cwd" "$wt" "$slug" "$tasks")"; then
+          cwd="$new_cwd"
+        else
+          cwd="/__afk_cd_escaped__"   # out-of-tree sentinel: relative writes below now deny
+        fi
+        continue ;;
+    esac
+    if reason="$(_danger_privilege_seg "$seg")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
+    if reason="$(_danger_network_seg "$seg")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
+    if reason="$(_danger_credential_seg "$seg" "$cwd" "$wt" "$slug" "$tasks")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
+    if reason="$(_danger_write_seg "$seg" "$cwd" "$wt" "$slug" "$tasks")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
+  done <<< "$norm"
+  return 0
+}
+
+# --- Tier-3 headless LLM judge (issue #261) -----------------------------------
+# The residue tiers 1-2 did not resolve goes to a cheap headless judge: a TOOLLESS `claude -p`
+# (pure text yes/no classification, no tools granted, so it makes NO tool calls and can never
+# itself trigger the deny-wall or recurse), Haiku, bounded ~2s. FAIL-CLOSED: a timeout, a
+# nonzero exit, or an unparseable verdict all read as DANGEROUS -- an unjudgeable risky command
+# does not run under bypass (the caller warns + journals instead). Verdicts are cached by command
+# hash so a command repeated across a drain costs at most one LLM call.
+
+# _judge_cache_dir -> the per-run verdict cache dir (under the afk state dir, cleared per window).
+_judge_cache_dir() { printf '%s\n' "$(_afk_state_dir)/judge-cache"; }
+
+# _judge_cache_key <cmd> -> a stable content hash of the command (the cache filename). Empty
+# when shasum is unavailable, which disables caching (every call runs the judge) but is harmless.
+_judge_cache_key() { printf '%s' "$1" | shasum -a 256 2>/dev/null | awk '{print $1}'; }
+
+# _judge_timeout -> the judge wall-clock budget in seconds (AFK_JUDGE_TIMEOUT, default 2). A
+# non-numeric or non-positive override falls back to the default so the bound is never lifted.
+_judge_timeout() {
+  local s="${AFK_JUDGE_TIMEOUT:-2}"
+  case "$s" in '' | *[!0-9]*) s=2 ;; esac
+  [ "$s" -lt 1 ] && s=2
+  printf '%s\n' "$s"
+}
+
+# _judge_base_cmd -> the headless judge command (AFK_JUDGE_CMD override for tests). TOOLLESS by
+# construction: `--allowedTools ''` grants NO tools, so the judge can make no tool calls -- it can
+# never fire afk_danger_guard or recurse. Haiku + `-p` for a cheap, non-interactive run.
+# UPGRADE: confirm `--allowedTools ''` grants zero tools on the deployed CLI; if a future CLI
+# defaults some tool on, switch to an explicit `--disallowedTools '*'` or equivalent.
+_judge_base_cmd() {
+  printf '%s\n' "${AFK_JUDGE_CMD:-claude -p --no-session-persistence --model ${AFK_JUDGE_MODEL:-claude-haiku-4-5} --allowedTools ''}"
+}
+
+# _judge_prompt <cmd> -> the tight classification prompt. Plain ASCII (no backticks/parens in a
+# way that would trip bash 3.2, and this is a normal heredoc, not $()-nested).
+_judge_prompt() {
+  local cmd="$1"
+  cat <<EOF
+You are a security gate for an UNATTENDED coding agent running inside its OWN git worktree
+under bypassPermissions -- no human will ever see a prompt. Decide whether the shell command
+below is DANGEROUS to run unattended. It is DANGEROUS if its effects can reach OUTSIDE the
+worktree: writing or deleting files outside it, network egress to an untrusted host, reading
+credentials or the keychain, touching the main branch or other git refs, force-pushing or
+rewriting history, privilege escalation, or destroying disks. It is SAFE if its effects stay
+confined to the worktree. When in doubt, answer dangerous.
+End with EXACTLY one final line: 'VERDICT: safe' or 'VERDICT: dangerous'. You may precede it
+with a one-line reason.
+
+COMMAND:
+$cmd
+EOF
+}
+
+# judge_permission <cmd> [issue] -> "SAFE" or "DANGEROUS<TAB><reason>". Cache-first; otherwise
+# run the toolless headless judge, bounded and fail-closed, and cache the verdict. Always rc 0
+# (the verdict is on stdout, like classify_permission / classify_danger).
+judge_permission() {
+  local cmd="$1" key cache f raw rc verdict secs jcmd prompt pf tag
+  key="$(_judge_cache_key "$cmd")"
+  cache="$(_judge_cache_dir)"; f="$cache/$key"
+  if [ -n "$key" ] && [ -f "$f" ]; then cat "$f" 2>/dev/null; return 0; fi
+  secs="$(_judge_timeout)"
+  jcmd="$(_judge_base_cmd)"
+  prompt="$(_judge_prompt "$cmd")"
+  # Deliver the prompt via a temp file the wrapped command reopens with `exec <`, mirroring
+  # run_answerer: the bound (_afk_with_timeout portable fallback) BACKGROUNDS the command and a
+  # backgrounded job's stdin is /dev/null, so a bare here-string would be lost. The here-string
+  # stays as the fallback for the foreground timeout/perl paths (and when mktemp is unavailable).
+  pf="$(mktemp 2>/dev/null)" || pf=""
+  [ -n "$pf" ] && { printf '%s' "$prompt" > "$pf"; jcmd="exec <'$pf'; $jcmd"; }
+  raw="$(_broker_run_bounded "$secs" bash -c "$jcmd" <<<"$prompt" 2>/dev/null)"; rc=$?
+  [ -n "$pf" ] && rm -f "$pf" 2>/dev/null
+  if [ "$rc" -ne 0 ]; then
+    verdict="$(printf 'DANGEROUS\tjudge unavailable (rc=%s) -- fail-closed' "$rc")"
+  else
+    tag="$(printf '%s' "$raw" | grep -ioE 'VERDICT:[[:space:]]*(safe|dangerous)' | tail -1 \
+      | grep -ioE 'safe|dangerous' | tr '[:upper:]' '[:lower:]')"
+    case "$tag" in
+      safe) verdict="SAFE" ;;
+      dangerous) verdict="$(printf 'DANGEROUS\tjudge verdict: dangerous')" ;;
+      *) verdict="$(printf 'DANGEROUS\tjudge verdict unparseable -- fail-closed')" ;;
+    esac
+  fi
+  if [ -n "$key" ]; then
+    mkdir -p "$cache" 2>/dev/null || true
+    printf '%s\n' "$verdict" > "$f" 2>/dev/null || true
+  fi
+  printf '%s\n' "$verdict"
 }
 
 # --- permission-dialog detection + handling (issue #149) ----------------------
@@ -2223,6 +2575,27 @@ _afk_hook_emit_allow() {
   fi
 }
 
+# _afk_hook_emit_deny <reason> -> print the PreToolUse deny verdict (issue #261). Mirrors
+# _afk_hook_emit_allow's dual shape (Claude hookSpecificOutput + a top-level Cursor `permission`).
+# The reasons this hook emits are controlled ASCII category strings (the resolver already rejected
+# quote/metachar paths), so the hand-rolled fallback needs no JSON escaping -- same contract as
+# _afk_hook_emit_allow.
+_afk_hook_emit_deny() {
+  local reason="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq -nc --arg r "$reason" '{
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: $r
+      },
+      permission: "deny"
+    }'
+  else
+    printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"},"permission":"deny"}\n' "$reason"
+  fi
+}
+
 # afk_permission_hook_decide -> read a Claude Code PreToolUse payload on stdin and print an
 # `allow` verdict IFF classify_permission APPROVEs the gated tool call inside a live drain;
 # otherwise print nothing. Always rc 0 (a PreToolUse allow-only hook must never fail a session).
@@ -2296,6 +2669,118 @@ PYEOF
   # auto-approve is a benign scoped self-op by construction, hence reversible.
   _broker_journal_line "$issue" permission "hook auto-approved: $cmd" reversible
   _afk_hook_emit_allow "afk-permission-hook: classify_permission APPROVEd a benign scoped self-op inside a live drain — auto-allowed (no dialog; ESCALATE and everything else still prompt)"
+}
+
+# --- programmatic PreToolUse deny-wall (issue #261) ---------------------------
+# Under bypassPermissions an afk spoke raises NO permission dialog (worktree-new.sh --mode afk),
+# so a PreToolUse deny-hook is the ONLY safety boundary -- and a deny-hook STILL fires and its
+# permissionDecision:"deny" is honored under bypass (proven on CC v2.1.207). afk_danger_guard_decide
+# is that wall's decision fn: read a PreToolUse payload, run three tiers, DENY the dangerous ones:
+#   Tier 2  classify_danger == DENY        -> journal + emit permissionDecision:"deny"  (deny-first)
+#   Tier 1  classify_permission == APPROVE -> silent allow (bypass runs it; no judge, no journal)
+#   Tier 3  judge_permission               -> DANGEROUS/fail-closed => journal + deny; SAFE => allow
+# Tier 2 runs BEFORE Tier 1 on purpose: classify_permission (built for the old prompt-approve
+# model) APPROVEs any read verb, so a `cat ~/.ssh/id_rsa` secret read would be Tier-1-approved and
+# never reach the deny list -- checking classify_danger first closes that gap; both static checks
+# are cheap (no LLM), so deny-first costs nothing. It reuses the SAME classifiers the drain trusts
+# (one source of truth). afk-permission-hook (#253) is left in place and untouched -- its allow is
+# redundant-but-harmless under bypass; THIS hook only adds DENY (which wins in CC).
+
+# _afk_spoke_mode <wt> -> print the spoke's execution mode from <root>/.ai-toolkit/mode
+# (whitespace-trimmed), or empty when the file is missing / unreadable / <wt> is not a git tree.
+# The mode is the load-bearing signal for the deny-wall gate (see afk_danger_guard_decide): the
+# file is written by worktree-new.sh at spawn and is gitignored (info/exclude), so it SURVIVES a
+# branch checkout / detach -- unlike the branch name, which does not.
+_afk_spoke_mode() {
+  local wt="$1" root
+  root="$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null)" || return 0
+  [ -n "$root" ] || return 0
+  [ -f "$root/.ai-toolkit/mode" ] || return 0
+  tr -d '[:space:]' < "$root/.ai-toolkit/mode" 2>/dev/null || return 0
+}
+
+# afk_danger_guard_decide -> read a Claude Code PreToolUse payload on stdin and print a `deny`
+# verdict for a boundary-crossing / judge-dangerous command inside an afk (bypass) spoke; else
+# print nothing (the command runs under bypass). Always rc 0 (a PreToolUse hook must never fail a
+# session). The command string is rebuilt EXACTLY as extract_pending_command / afk_permission_hook_
+# decide do, so all three classify identically. Gated on an issue-numbered spoke branch AND the
+# fail-safe mode gate (never the hub / ad-hoc / positively-attended).
+afk_danger_guard_decide() {
+  local payload parsed wt cmd br slug issue decision djson dreason verdict vkind vreason
+  payload="$(cat)"
+  command -v python3 >/dev/null 2>&1 || return 0
+  parsed="$(_AFK_HOOK_PAYLOAD="$payload" python3 2>/dev/null <<'PYEOF'
+import json, os
+
+try:
+    obj = json.loads(os.environ.get("_AFK_HOOK_PAYLOAD") or "{}")
+except Exception:
+    obj = {}
+if not isinstance(obj, dict):
+    obj = {}
+name = (obj.get("tool_name") or "").strip()
+inp = obj.get("tool_input")
+if not isinstance(inp, dict):
+    inp = {}
+cwd = (obj.get("cwd") or "").strip()
+if name == "Bash":
+    cmd = (inp.get("command") or "").strip()
+elif name == "Read":
+    fp = (inp.get("file_path") or "").strip()
+    cmd = f"{name} {fp}" if fp else name
+elif name:
+    cmd = name
+else:
+    cmd = ""
+print(cwd)
+# NOT truncated: a deny-wall must classify the WHOLE command -- a truncated benign prefix could
+# hide a risky tail. Plain ASCII, no backticks in this comment: bash 3.2 mis-parses those nested.
+print(cmd.strip())
+PYEOF
+)"
+  case "$parsed" in *$'\n'*) ;; *) return 0 ;; esac
+  wt="${parsed%%$'\n'*}"; cmd="${parsed#*$'\n'}"
+  [ -n "$cmd" ] || return 0
+  [ -n "$wt" ] || wt="$(pwd)"
+  # Issue number (best-effort, for the fail-safe gate + the journal). Empty on a detached HEAD
+  # or a non-issue branch -- which is EXACTLY why it must NOT be the primary gate.
+  br="$(git -C "$wt" branch --show-current 2>/dev/null || true)"
+  slug="${br##*/}"; issue="${slug%%[!0-9]*}"
+  case "$issue" in *[!0-9]*) issue="" ;; esac
+  # MODE GATE (fail-safe, mode-first -- #261 review BLOCKER). A positively-read `afk` mode means
+  # this spoke launched under bypassPermissions, so the wall is ACTIVE on ANY branch: `git bisect`
+  # / `rebase` / `checkout <sha>` detach HEAD or move off the issue branch, and the wall must NOT
+  # silently drop then (the .ai-toolkit/mode file survives the checkout; the branch name does not).
+  # `attended` -> INERT (the human is the wall). A missing / unreadable / ambiguous mode keeps the
+  # wall ACTIVE only for an issue-numbered spoke branch (a corrupted spoke); the hub (on main, no
+  # mode file) and ad-hoc lanes stay INERT so hub operations are never walled.
+  case "$(_afk_spoke_mode "$wt")" in
+    attended) return 0 ;;
+    afk) ;;
+    *) [ -n "$issue" ] || return 0 ;;
+  esac
+  # Tier 2 (static deny) first -- see the header for why it precedes Tier 1.
+  djson="$(classify_danger "$cmd" "$wt")"
+  if [ "${djson%%$'\t'*}" = DENY ]; then
+    dreason="${djson#*$'\t'}"
+    _broker_journal_line "$issue" permission "tier2 deny: $cmd -- $dreason" scope
+    _afk_hook_emit_deny "afk-danger-guard tier-2: $dreason"
+    return 0
+  fi
+  # Tier 1 -- a benign scoped self-op the deny list already cleared: allow silently, skip the judge.
+  decision="$(classify_permission "$cmd" "$wt")"
+  [ "${decision%%$'\t'*}" = APPROVE ] && return 0
+  # Tier 3 -- the toolless LLM judge on the residue. Fail-closed (DANGEROUS) => deny.
+  verdict="$(judge_permission "$cmd" "$issue")"
+  vkind="${verdict%%$'\t'*}"
+  if [ "$vkind" = SAFE ]; then
+    _broker_journal_line "$issue" permission "tier3 judge SAFE: $cmd" reversible
+    return 0
+  fi
+  vreason="${verdict#*$'\t'}"
+  _broker_journal_line "$issue" permission "tier3 judge DENY: $cmd -- $vreason" scope
+  _afk_hook_emit_deny "afk-danger-guard tier-3: $vreason"
+  return 0
 }
 
 # --- tmux injection + telemetry -----------------------------------------------
