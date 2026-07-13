@@ -104,7 +104,7 @@ def test_sourcing_standalone_defines_the_primitives() -> None:
         "_spoke_project_dir _spoke_jsonl _transcript_mtime _spoke_pane_target inject_answer "
         "_composer_shows_text _transcript_sizes _answer_appended _answer_delivered "
         "_transcript_advanced inject_and_verify _pane_shows_permission_prompt "
-        "approve_permission _deny_permission _answer_needle"
+        "approve_permission _deny_permission _answer_needle _transcript_finished_turn_idle"
     )
     check = "; ".join(f"declare -F {f} >/dev/null || echo MISSING {f}" for f in fns.split())
 
@@ -229,6 +229,197 @@ def test_transcript_mtime_reads_newest_jsonl(tmp_path: Path) -> None:
     result = _call(f"_transcript_mtime '{wt}'", env={"CLAUDE_PROJECTS_DIR": str(projects)})
 
     assert result.stdout.strip() == "1700000000", result.stderr
+
+
+# ── #255: the finished-turn-idle transcript read ───────────────────────────────
+
+
+def _bash_tool_record(command: str) -> dict:
+    return {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {"type": "tool_use", "name": "Bash", "id": "tu_1", "input": {"command": command}}
+            ]
+        },
+    }
+
+
+def test_finished_turn_idle_true_when_last_turn_is_completed_assistant(tmp_path: Path) -> None:
+    # A completed tool cycle that ends on an assistant text turn: the spoke stopped at the
+    # prompt with no pending tool_use → nudge-able, not a hang.
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, wt)
+    (pd / "session.jsonl").write_text(
+        "\n".join(
+            json.dumps(r)
+            for r in [
+                _bash_tool_record("pytest -q"),
+                {
+                    "type": "user",
+                    "message": {"content": [{"type": "tool_result", "content": "ok"}]},
+                },
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": "done."}]}},
+            ]
+        )
+        + "\n"
+    )
+
+    result = _call(
+        f"_transcript_finished_turn_idle '{wt}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_finished_turn_idle_false_on_trailing_pending_tool_use(tmp_path: Path) -> None:
+    # A trailing UNRESOLVED tool_use is a pane hung MID-TOOL_USE (incl. the #240 flushed shape),
+    # NOT finished-turn-idle → the reaper revives it, never nudges.
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, wt)
+    (pd / "session.jsonl").write_text(
+        "\n".join(
+            json.dumps(r)
+            for r in [
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": "run"}]}},
+                _bash_tool_record("pytest -q"),
+            ]
+        )
+        + "\n"
+    )
+
+    result = _call(
+        f"_transcript_finished_turn_idle '{wt}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
+    )
+
+    assert result.returncode == 1, result.stderr
+
+
+def test_finished_turn_idle_true_with_trailing_task_notification(tmp_path: Path) -> None:
+    # #255 review: a spoke that finished its turn, awaited a background task, and then received
+    # a <task-notification> user turn (synthetic: no promptSource, not isMeta) is STILL nudge-
+    # able — the notification does not mean the spoke moved on. Skipped, so the completed
+    # assistant turn before it is the last genuine turn.
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, wt)
+    (pd / "session.jsonl").write_text(
+        "\n".join(
+            json.dumps(r)
+            for r in [
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": "stop"}]}},
+                {
+                    "type": "user",
+                    "message": {"content": "<task-notification>done</task-notification>"},
+                },
+            ]
+        )
+        + "\n"
+    )
+
+    result = _call(
+        f"_transcript_finished_turn_idle '{wt}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_finished_turn_idle_true_with_trailing_meta_turn(tmp_path: Path) -> None:
+    # An isMeta user turn (a skill/meta injection) after a completed assistant turn is likewise
+    # synthetic and skipped → the spoke is still nudge-able.
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, wt)
+    (pd / "session.jsonl").write_text(
+        "\n".join(
+            json.dumps(r)
+            for r in [
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": "stop"}]}},
+                {"type": "user", "isMeta": True, "message": {"content": "meta"}},
+            ]
+        )
+        + "\n"
+    )
+
+    result = _call(
+        f"_transcript_finished_turn_idle '{wt}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_finished_turn_idle_false_with_trailing_typed_reply(tmp_path: Path) -> None:
+    # A GENUINE typed user reply after the assistant turn means the spoke got real input and is
+    # about to work — not idle at the prompt → rc 1 (not nudged).
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, wt)
+    (pd / "session.jsonl").write_text(
+        "\n".join(
+            json.dumps(r)
+            for r in [
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": "stop"}]}},
+                {"type": "user", "promptSource": "typed", "message": {"content": "keep going"}},
+            ]
+        )
+        + "\n"
+    )
+
+    result = _call(
+        f"_transcript_finished_turn_idle '{wt}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
+    )
+
+    assert result.returncode == 1, result.stderr
+
+
+def test_finished_turn_idle_false_when_last_turn_is_tool_result(tmp_path: Path) -> None:
+    # The transcript ends on a tool_result user turn: the spoke stopped mid-turn (about to
+    # produce the next assistant message), not idle at the prompt → not finished-turn-idle.
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, wt)
+    (pd / "session.jsonl").write_text(
+        "\n".join(
+            json.dumps(r)
+            for r in [
+                _bash_tool_record("pytest -q"),
+                {
+                    "type": "user",
+                    "message": {"content": [{"type": "tool_result", "content": "ok"}]},
+                },
+            ]
+        )
+        + "\n"
+    )
+
+    result = _call(
+        f"_transcript_finished_turn_idle '{wt}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
+    )
+
+    assert result.returncode == 1, result.stderr
+
+
+def test_finished_turn_idle_false_when_no_transcript(tmp_path: Path) -> None:
+    # Fail-CLOSED: an absent transcript reads as "not proven finished-turn-idle" so the reaper
+    # falls through to its existing revive rather than nudging a pane it cannot observe.
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    projects = tmp_path / "projects"
+    projects.mkdir()
+
+    result = _call(
+        f"_transcript_finished_turn_idle '{wt}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
+    )
+
+    assert result.returncode == 1, result.stderr
 
 
 # ── the CLI (direct invocation, no bash-source seam) ───────────────────────────

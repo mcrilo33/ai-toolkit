@@ -4506,17 +4506,26 @@ def _reaper_tmux(tmp_path: Path, *, pane_path: Path | None) -> tuple[Path, Path]
 
 
 def _reaper_env(
-    spoke: Path, tmp_path: Path, fake_bin: Path, *, idle: bool
+    spoke: Path,
+    tmp_path: Path,
+    fake_bin: Path,
+    *,
+    idle: bool,
+    transcript: list[dict] | None = None,
 ) -> tuple[str, dict[str, str], Path, Path]:
     """Drive reap_pass against one in-flight spoke. Returns (expr, env, ready_log, statedir).
 
     A spoke-ready stub records `--blocked` calls; a plain idle transcript (when idle=True)
-    plus AFK_IDLE_MINUTES=0 makes slot_state read `reap`.
+    plus AFK_IDLE_MINUTES=0 makes slot_state read `reap`. The default transcript ends on a
+    completed assistant turn (the #255 finished-turn-idle shape); pass `transcript=` a
+    trailing unresolved tool_use to model a genuinely HUNG pane.
     """
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke)
     _write_transcript(
-        pd, [{"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}}]
+        pd,
+        transcript
+        or [{"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}}],
     )
     if idle:
         os.utime(pd / "session.jsonl", (1_000_000, 1_000_000))  # far in the past
@@ -6766,9 +6775,13 @@ def test_afk_sync_labels_ignores_lifecycle_labels(tmp_path: Path) -> None:
 def test_reap_pass_revives_pane_alive_idle_spoke(tmp_path: Path) -> None:
     # #241 §8: a live-but-frozen claude is a REVIVAL case (kill the hung pane + relaunch),
     # NOT a terminal block. It warns + revives (opens a fresh window), never parks blocked.
+    # #255: "hung" here means genuinely frozen MID-TOOL_USE — a trailing unresolved tool_use,
+    # distinct from the finished-turn-idle shape (which is nudged, not relaunched).
     spoke = _branched_spoke(tmp_path, ahead=True)
     fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane ALIVE (frozen)
-    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    expr, env, ready_log, statedir = _reaper_env(
+        spoke, tmp_path, fake_bin, idle=True, transcript=[_bash_tool_record("pytest -x")]
+    )
 
     _call(expr, env=env)
 
@@ -6824,6 +6837,67 @@ def test_reap_or_resume_permission_park_routes_to_answerer(
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
         "a safe park is answered, not escalated to blocked"
     )
+
+
+# ── issue #255: the finished-turn-idle spoke gets a continue-nudge, not a relaunch ──
+# A spoke that FINISHED its turn and stopped at the input prompt (pane alive, no dialog,
+# transcript ends on a completed assistant turn) is nudged — a "continue the cycle" message
+# injected into the LIVE session via the shared hardened injector — instead of the heavier
+# kill + `claude --continue` relaunch. Bounded to AFK_NUDGE_MAX_ATTEMPTS (2) per window, after
+# which it falls back to the existing revive.
+
+
+def test_reap_pass_finished_turn_idle_nudges_not_revives(tmp_path: Path) -> None:
+    # AC1/AC2: a finished-turn-idle live pane is NUDGED via the shared inject_and_verify
+    # (send-keys -l into the pane + a submitting Enter), never killed + relaunched.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    projects = tmp_path / "projects"
+    jsonl = _project_dir_for(projects, spoke) / "session.jsonl"
+    # The injector tmux: capture-pane serves the composer; the first Enter clears it and
+    # touches the transcript, so inject_and_verify confirms the nudge registered.
+    fake_bin, tmux_log = _injector_tmux(
+        tmp_path, capture="│ > │\n", pane_path=spoke, clear_on_enter=1, touch=jsonl
+    )
+    expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    env["AFK_INJECT_VERIFY_SECONDS"] = "5"
+    env["AFK_INJECT_POLL_SECONDS"] = "1"
+
+    _call(expr, env=env)
+
+    calls = tmux_log.read_text()
+    assert "send-keys -t afk:1 -l" in calls, f"a finished-turn-idle spoke is NUDGED: {calls}"
+    assert "new-window" not in calls, f"a nudge must NOT relaunch the pane: {calls}"
+    assert "nudge" in (statedir / "decision-journal.jsonl").read_text()
+    assert (statedir / "nudge-5.count").read_text().strip() == "1", "the nudge attempt is counted"
+
+
+def test_reap_pass_finished_turn_idle_revives_after_max_nudges(tmp_path: Path) -> None:
+    # AC3: after AFK_NUDGE_MAX_ATTEMPTS (2) nudges this window, a still-idle finished-turn spoke
+    # falls back to the revive (kill + relaunch), never nudged forever.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane ALIVE
+    expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    (statedir / "nudge-5.count").write_text("2\n")  # the nudge budget is already spent
+
+    _call(expr, env=env)
+
+    assert "new-window" in tmux_log.read_text(), (
+        "past the nudge budget, a finished-turn spoke revives"
+    )
+    assert "revive" in (statedir / "decision-journal.jsonl").read_text()
+
+
+def test_clear_nudge_counts_removes_per_window_stamps(tmp_path: Path) -> None:
+    # The nudge counter is per-window: a fresh arm clears it so every spoke gets its N again.
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "nudge-5.count").write_text("2\n")
+    (statedir / "nudge-7.count").write_text("1\n")
+
+    _call("_clear_nudge_counts", env={"AFK_STATE_DIR": str(statedir)})
+
+    assert not (statedir / "nudge-5.count").exists()
+    assert not (statedir / "nudge-7.count").exists()
 
 
 def test_reap_pass_revival_exhausted_parks_last_not_blocked(tmp_path: Path) -> None:
@@ -7044,9 +7118,13 @@ def test_capture_hang_forensics_skips_dead_pane(tmp_path: Path) -> None:
 
 def test_reap_pass_hung_spoke_captures_forensics_and_journals_path(tmp_path: Path) -> None:
     # AC3: reaping a live-but-frozen spoke leaves a bundle AND the revive journal line names it.
+    # #255: a genuine hang is frozen MID-TOOL_USE (trailing unresolved tool_use) → revived,
+    # not the finished-turn-idle shape (nudged).
     spoke = _branched_spoke(tmp_path, ahead=True)
     fake_bin, _ = _forensics_bin(tmp_path, pane_path=spoke)  # pane ALIVE (frozen)
-    expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    expr, env, _ready_log, statedir = _reaper_env(
+        spoke, tmp_path, fake_bin, idle=True, transcript=[_bash_tool_record("pytest -x")]
+    )
     forensics = tmp_path / "hang-forensics"
     env["AFK_HANG_FORENSICS_DIR"] = str(forensics)
 

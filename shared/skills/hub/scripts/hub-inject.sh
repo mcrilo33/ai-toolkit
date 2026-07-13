@@ -8,6 +8,7 @@
 #
 # The unit is "read a spoke's transcript state and inject into its pane":
 #   * transcript locators  — _spoke_project_dir / _spoke_jsonl / _transcript_mtime
+#   * transcript state     — _transcript_finished_turn_idle (the #255 finished-turn-idle read)
 #   * pane keystrokes      — _spoke_pane_target / inject_answer / _composer_shows_text
 #   * delivery proof       — _transcript_sizes / _answer_appended / _answer_delivered /
 #                            _transcript_advanced
@@ -63,6 +64,62 @@ _transcript_mtime() {
   local jsonl; jsonl="$(_spoke_jsonl "$1")"
   [ -n "$jsonl" ] || return 0
   stat -f %m "$jsonl" 2>/dev/null || stat -c %Y "$jsonl" 2>/dev/null
+}
+# _transcript_finished_turn_idle <wt_path> -> rc 0 when the spoke's newest transcript ends
+# with a COMPLETED assistant turn (no pending tool_use): the finished-turn-idle shape (#255).
+# The spoke finished its turn and stopped at the input prompt without continuing the cycle --
+# distinct from a pane frozen MID-TOOL_USE (a trailing unresolved tool_use, incl. the #240
+# flushed-tool_use shape), which reads as rc 1 so the reaper revives it (kill + relaunch),
+# while a finished-turn-idle spoke is nudged (a continue message injected into the LIVE session).
+# Only a GENUINE typed user reply counts as the last turn: a trailing SYNTHETIC user write --
+# a tool_result, a task-notification / system-reminder, or a skill/meta turn -- is skipped (the
+# promptSource convention the sibling readers use), so a spoke that finished its turn and then
+# received such a write is still nudge-able. Fail-CLOSED (rc 1) on no transcript / no
+# python3 / parse error: an unprovable state falls through to the existing revive, preserving
+# prior behavior. The pane-at-prompt + no-dialog half of the signal is already guaranteed by the
+# reaper's upstream checks (_spoke_still_parked and _permission_pending are both false by then).
+_transcript_finished_turn_idle() {
+  local jsonl; jsonl="$(_spoke_jsonl "$1")"
+  [ -n "$jsonl" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  _AFK_JSONL="$jsonl" python3 2>/dev/null <<'PYEOF'
+import json, os, sys
+
+last_turn_type = None            # type of the last genuine user/assistant turn
+last_assistant_has_tool_use = False
+try:
+    with open(os.environ["_AFK_JSONL"], encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            ttype = obj.get("type")
+            if ttype not in ("user", "assistant"):
+                continue          # notification / summary / system are not turns
+            if ttype == "user" and (obj.get("promptSource") != "typed" or obj.get("isMeta")):
+                # Only a GENUINE typed reply (a human in the pane, or the injector) is a real
+                # user turn -- the same promptSource convention the sibling readers use
+                # (gate-broker _gate_answer_landed, plan-gate-guard). A synthetic user turn --
+                # a tool_result, a task-notification / system-reminder, or a skill/meta turn --
+                # does NOT mean the spoke moved on, so it is skipped: a finished-turn-idle spoke
+                # whose trailing turn is such a synthetic write is still nudge-able.
+                continue
+            last_turn_type = ttype
+            if ttype == "assistant":
+                content = (obj.get("message") or {}).get("content")
+                blocks = content if isinstance(content, list) else []
+                last_assistant_has_tool_use = any(
+                    isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks
+                )
+except Exception:
+    sys.exit(1)
+# Finished-turn-idle: the last genuine turn is an assistant message that ended without a
+# pending tool_use. Anything else is not proven idle at the prompt.
+sys.exit(0 if last_turn_type == "assistant" and not last_assistant_has_tool_use else 1)
+PYEOF
 }
 # _answer_needle <text> -> the shared delivery needle: the first ~40 chars of the
 # answer's first line. One derivation feeds both delivery proofs (_composer_shows_text,

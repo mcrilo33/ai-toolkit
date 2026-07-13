@@ -667,6 +667,34 @@ _afk_mark_redispatched() {
 }
 _clear_redispatch_markers() { rm -f "$(_afk_state_dir)"/redispatched-* 2>/dev/null || true; }
 
+# --- #255: the finished-turn-idle continue-nudge counter ----------------------
+# A spoke that FINISHED its turn and stopped at the input prompt (pane alive, no dialog,
+# transcript ends on a completed assistant turn — _transcript_finished_turn_idle) is NUDGED (a
+# continue message injected into the LIVE session via the shared hardened injector) rather than
+# killed + relaunched. Bounded: after AFK_NUDGE_MAX_ATTEMPTS nudges in one window the reaper
+# falls back to the revive, so a spoke that will not resume is never nudged forever. The count
+# is per-window (cleared on a fresh arm) like the resume/redispatch stamps.
+: "${AFK_NUDGE_MAX_ATTEMPTS:=2}"
+# Guard a non-numeric override (matching AFK_REANSWER_CEILING): a bareword would make the
+# `[ count -lt $AFK_NUDGE_MAX_ATTEMPTS ]` test error and always fall through to the revive.
+case "$AFK_NUDGE_MAX_ATTEMPTS" in '' | *[!0-9]*) AFK_NUDGE_MAX_ATTEMPTS=2 ;; esac
+_afk_nudge_count_file() { printf '%s\n' "$(_afk_state_dir)/nudge-$1.count"; }
+_afk_read_nudge_count() {
+  local f n; f="$(_afk_nudge_count_file "$1")"
+  n="$( [ -f "$f" ] && head -n1 "$f" 2>/dev/null | tr -d '[:space:]' )"
+  case "$n" in '' | *[!0-9]*) n=0 ;; esac
+  printf '%s\n' "$n"
+}
+# _afk_incr_nudge_count <issue> -> bump and echo the new nudge count for this window.
+_afk_incr_nudge_count() {
+  local issue="$1" n
+  mkdir -p "$(_afk_state_dir)" 2>/dev/null || true
+  n=$(( $(_afk_read_nudge_count "$issue") + 1 ))
+  _afk_atomic_write "$(_afk_nudge_count_file "$issue")" "$n" || true
+  printf '%s\n' "$n"
+}
+_clear_nudge_counts() { rm -f "$(_afk_state_dir)"/nudge-*.count 2>/dev/null || true; }
+
 # _afk_spoke_run_id <wt> -> the spoke's persisted spoke_run_id (worktree-new.sh stamps it
 # at .ai-toolkit/spoke-run-id), so a resumed run groups under the SAME spoke in Langfuse.
 # Synthesized from the branch + now-clock if the file is missing.
@@ -692,6 +720,21 @@ intact -- do NOT start over. Run /source-task $issue to re-anchor, re-read your 
 and the working tree to see where you left off, then continue the solo flow (RED -> GREEN ->
 REVIEW -> PUSH) from there. Push each subtask and emit the ready marker when the issue's
 acceptance criteria are all met. Do NOT self-land -- the hub lands #$issue.
+EOF
+}
+
+# _afk_nudge_prompt <issue> -> the continue-nudge message for a finished-turn-idle spoke (#255).
+# Unlike _afk_resume_prompt (a crash re-anchor for a relaunched session), this rides into the
+# SAME live session: the spoke finished its turn and just stopped, so it only needs to be told
+# nothing is blocking it and to pick the cycle back up — no re-anchor, no "your session crashed".
+_afk_nudge_prompt() {
+  local issue="$1"
+  cat <<EOF
+You finished your turn but stopped mid-cycle without continuing, and nothing is blocking you --
+no question or permission dialog is pending. Re-read your task ledger and the working tree, then
+continue the solo flow (RED -> GREEN -> REVIEW -> PUSH) from where you left off. Push each
+subtask and emit the ready marker when the issue's acceptance criteria are all met. Do NOT
+self-land -- the hub lands #$issue.
 EOF
 }
 
@@ -966,6 +1009,34 @@ _revive_spoke() {
   return 0
 }
 
+# _afk_nudge_spoke <wt> <issue> -> deliver a continue-nudge into the spoke's LIVE session via the
+# shared hardened injector (inject_and_verify: paste-buffer + verified submit — the SAME primitive
+# the answerer uses), then journal the taken decision (#255). Unlike a revive, a nudge does NOT
+# reset the wall-clock reap ceiling (progress epoch): the caller only reaches here UNDER the
+# ceiling, and an answer-attempt-shaped action must not buy a spoke a fresh full ceiling (cf. the
+# #241 §8 "answer attempts must not reset the reap clock" note). It DOES stamp the answer-attempt
+# epoch so the same-tick / next-tick reap does not immediately re-reap the just-nudged spoke off a
+# stale transcript mtime (#202 C). rc 0 when the nudge delivered, else inject_and_verify's rc (the
+# caller has already counted the attempt; a failed delivery just retries next tick until the
+# budget falls back to a revive). Caller wraps this in _afk_run_with_heartbeat_fg because
+# inject_and_verify polls up to AFK_INJECT_VERIFY_SECONDS.
+_afk_nudge_spoke() {
+  local wt="$1" issue="$2" target rc
+  log "→ nudge #$issue: finished-turn-idle — injecting a continue message into the live session (no relaunch)"
+  _afk_set_last_action "nudge #$issue"
+  target="$(_spoke_pane_target "$wt")"
+  if [ -z "$target" ]; then
+    log "  no live pane for #$issue — cannot nudge"
+    return 1
+  fi
+  stamp_answer_attempt "$issue"
+  inject_and_verify "$wt" "$target" "$(_afk_nudge_prompt "$issue")"; rc=$?
+  broker_journal_decision "$issue" nudge \
+    "finished-turn-idle: injected a continue-nudge into the live session (no relaunch)" reversible
+  if [ "$rc" -eq 0 ]; then _afk_emit_span "$wt" afk-nudge success; else _afk_emit_span "$wt" afk-nudge retry; fi
+  return "$rc"
+}
+
 # _afk_revive_or_park_last <wt> <issue> <reason> -> revive-first, then warned-parked-LAST. If a
 # revival was already tried this window (_afk_already_resumed) OR the relaunch cannot start, the
 # spoke is warned-and-parked-LAST rather than reaped — retried at low frequency, never abandoned.
@@ -1020,9 +1091,21 @@ _reap_or_resume() {
   fi
   if _spoke_over_any_ceiling "$issue" "$(afk_now)"; then
     _afk_revive_or_park_last "$wt" "$issue" "time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
+  elif _spoke_pane_alive "$wt" \
+       && _transcript_finished_turn_idle "$wt" \
+       && [ "$(_afk_read_nudge_count "$issue")" -lt "$AFK_NUDGE_MAX_ATTEMPTS" ]; then
+    # #255: the FINISHED-TURN-IDLE class — the spoke finished its turn and stopped at the input
+    # prompt (transcript ends on a completed assistant turn, no pending tool_use), distinct from a
+    # pane frozen MID-TOOL_USE. It gets a lightweight continue-nudge into the LIVE session, NOT a
+    # kill + relaunch — bounded to AFK_NUDGE_MAX_ATTEMPTS nudges per window, after which it falls
+    # through to the revive below. Wrapped in _afk_run_with_heartbeat_fg (inject_and_verify polls
+    # up to AFK_INJECT_VERIFY_SECONDS) like answer_pass's decide_and_act call.
+    _afk_incr_nudge_count "$issue" >/dev/null
+    _afk_run_with_heartbeat_fg _afk_nudge_spoke "$wt" "$issue"
   elif _spoke_pane_alive "$wt"; then
-    # #241 §8: a live-but-frozen claude is a REVIVAL case (kill the hung pane + relaunch), not a
-    # terminal block. answer attempts must not reset the reap clock, so this is a revival, not a re-answer.
+    # #241 §8: a live-but-frozen claude (hung mid-tool_use), or a finished-turn-idle spoke past its
+    # nudge budget, is a REVIVAL case (kill the hung pane + relaunch), not a terminal block. answer
+    # attempts must not reset the reap clock, so this is a revival, not a re-answer.
     _afk_revive_or_park_last "$wt" "$issue" "went idle >${AFK_IDLE_MINUTES}m with a live pane and no marker — likely hung"
   elif ! _spoke_has_commits "$wt"; then
     _afk_revive_or_park_last "$wt" "$issue" "pane crashed with no committed work to preserve"
@@ -3046,6 +3129,7 @@ main() {
     _clear_progress_state    # fresh window ⇒ no stale progress / answer-attempt epochs
     _clear_resume_markers    # fresh window ⇒ every spoke gets its one auto-resume again
     _clear_redispatch_markers # fresh window ⇒ every clean crash gets its one re-dispatch again (#202 C)
+    _clear_nudge_counts      # fresh window ⇒ every spoke gets its AFK_NUDGE_MAX_ATTEMPTS nudges again (#255)
     _afk_clear_landed_count  # fresh window ⇒ the landed tally starts at zero (#150)
     _afk_clear_drain_complete # ...and drop any un-consumed completion signal from a prior drain
     _clear_blocked_records   # fresh window ⇒ --status shows only THIS run's durable blocks
