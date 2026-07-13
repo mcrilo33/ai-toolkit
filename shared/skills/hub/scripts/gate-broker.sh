@@ -1907,6 +1907,209 @@ classify_permission() {
   printf 'APPROVE\n'
 }
 
+# --- Tier-2 static danger classifier (issue #261) -----------------------------
+# The deny-wall's fast static blacklist. classify_permission (Tier 1) names the KNOWN-SAFE
+# scoped self-ops (APPROVE); classify_danger names the KNOWN-DANGEROUS boundary crossings
+# (DENY) among everything else, so the Tier-3 LLM judge runs ONLY on the true residue --
+# neither statically safe nor statically dangerous. Same operator-split as classify_permission
+# (; && || | &), first dangerous segment wins. Empty output = "no static danger" -> the
+# orchestrator routes the command to the judge.
+#
+# CATEGORIES (the boundary the existing scope-guards do NOT already cover):
+#   - privilege escalation / disk destroyers: sudo/doas/su, dd, mkfs*, fdisk, parted, shred
+#   - network egress off-allowlist: curl/wget to a non-allowlisted host; raw sockets
+#     (nc/ncat/netcat/telnet/ssh/scp/sftp/ftp) denied outright
+#   - keychain / credential reads: `security`, or a read of a secret-like path
+#   - out-of-tree writes: a mutating verb (mv/cp/rm/mkdir/chmod) not confined to the worktree,
+#     or a `>`/`>>` redirection whose target escapes it
+# NOT duplicated here (owned by sibling PreToolUse scope-guards, kept authoritative): push to
+# main / other refs (push-scope-guard, spoke-main-guard), secrets in a commit (secrets-scan),
+# config edits (config-protection), `--no-verify` (block-no-verify). Package-installs are
+# deliberately NOT statically denied -- they route to the judge so legit fresh-worktree setup
+# (`pip install -r requirements-dev.txt`) is not stranded; the journal surfaces a dangerous one
+# for promotion to a static rule (the #261 Phase-4 measure->promote loop).
+# UPGRADE: promote a judge-caught tier-2 miss (a novel destructive verb, a package-install that
+# ran a hostile lifecycle script) into a static case here once the journal shows it.
+
+# _danger_host_allowed <host> -> rc 0 when a network host is on the egress allowlist
+# (api.anthropic.com + *.anthropic.com, github.com + *.github.com, *.githubusercontent.com),
+# rc 1 otherwise. Case-folded. A subdomain suffix match still requires a literal dot boundary,
+# so `notgithub.com` / `github.com.evil.com` never match.
+_danger_host_allowed() {
+  local h; h="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$h" in
+    api.anthropic.com | *.anthropic.com | anthropic.com \
+      | github.com | *.github.com | *.githubusercontent.com) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _danger_network_seg <segment> -> print a reason and rc 0 when the segment is off-allowlist
+# network egress, else rc 1. Raw-socket tools are denied outright; curl/wget hosts are parsed
+# (python3) and denied unless every host is allowlisted. Fails CLOSED (deny) when curl/wget
+# carries no parseable host or python3 is absent -- an unverifiable egress does not run.
+_danger_network_seg() {
+  local seg="$1" verb host_check
+  verb="${seg%%[[:space:]]*}"
+  case "$verb" in
+    nc | ncat | netcat | telnet | ssh | scp | sftp | ftp)
+      printf 'raw network egress (%s) is denied under bypass' "$verb"; return 0 ;;
+    curl | wget) ;;
+    *) return 1 ;;
+  esac
+  command -v python3 >/dev/null 2>&1 || { printf 'network egress unverifiable (no python3): %s' "$verb"; return 0; }
+  host_check="$(_DANGER_SEG="$seg" python3 2>/dev/null <<'PYEOF'
+import os, sys, shlex
+from urllib.parse import urlparse
+
+def allowed(h):
+    h = h.lower()
+    if h in {"api.anthropic.com", "github.com", "api.github.com",
+             "raw.githubusercontent.com", "codeload.github.com", "objects.githubusercontent.com"}:
+        return True
+    if h == "anthropic.com":
+        return True
+    return any(h.endswith(s) for s in (".anthropic.com", ".github.com", ".githubusercontent.com"))
+
+try:
+    toks = shlex.split(os.environ["_DANGER_SEG"])
+except Exception:
+    print("DENY unparseable"); sys.exit(0)
+
+hosts = []
+skip = False
+for t in toks[1:]:
+    if skip:
+        skip = False
+        continue
+    if t in ("-o", "-O", "--output", "-d", "--data", "-H", "--header", "-A", "-e", "-b", "-u"):
+        skip = True
+        continue
+    if t.startswith("-"):
+        continue
+    if "://" in t:
+        h = urlparse(t).hostname
+        if h:
+            hosts.append(h)
+    elif "." in t and "/" not in t:
+        hosts.append(t.split(":")[0])
+    elif "/" in t and not t.startswith("/") and "." in t.split("/")[0]:
+        hosts.append(t.split("/")[0].split(":")[0])
+
+if not hosts:
+    print("DENY no-parseable-host"); sys.exit(0)
+bad = [h for h in hosts if not allowed(h)]
+print("DENY " + bad[0] if bad else "OK")
+PYEOF
+)"
+  case "$host_check" in
+    OK) return 1 ;;
+    'DENY '*) printf 'network egress to a non-allowlisted host: %s' "${host_check#DENY }"; return 0 ;;
+    *) printf 'network egress unverifiable: %s' "$verb"; return 0 ;;
+  esac
+}
+
+# _danger_credential_seg <segment> -> print a reason and rc 0 when the segment reads a keychain
+# or a secret-like path, else rc 1. `security` (macOS keychain) is denied on the verb; a read
+# verb touching a secret-like token (reusing _broker_seg_secretlike) is denied on the path.
+_danger_credential_seg() {
+  local seg="$1" verb rest tok
+  verb="${seg%%[[:space:]]*}"
+  case "$verb" in
+    security | keychain) printf 'keychain/credential access (%s) is denied' "$verb"; return 0 ;;
+    cat | less | more | head | tail | strings | xxd | od | base64 | openssl | grep | awk | sed | cp | dd | sort | uniq) ;;
+    *) return 1 ;;
+  esac
+  rest="${seg#"$verb"}"
+  while [ -n "$rest" ]; do
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    [ -n "$rest" ] || break
+    tok="${rest%%[[:space:]]*}"
+    rest="${rest#"$tok"}"
+    case "$tok" in -*) continue ;; esac
+    if _broker_seg_secretlike "$tok"; then
+      printf 'reads a secret-like path: %s' "$tok"; return 0
+    fi
+  done
+  return 1
+}
+
+# _danger_write_seg <segment> <cwd> <wt> <slug> <tasks> -> print a reason and rc 0 when the
+# segment writes OUTSIDE the worktree, else rc 1. Two shapes: a mutating verb (mv/cp/rm/mkdir/
+# chmod) the in-worktree mutation lane does NOT confine (invert _permission_seg_mutation_ok),
+# and a `>`/`>>` redirection whose target does not resolve inside the worktree/scratchpad.
+# Inert (rc 1) without a worktree context -- the resolver needs it.
+_danger_write_seg() {
+  local seg="$1" cwd="$2" wt="$3" slug="$4" tasks="$5" verb rt
+  [ -n "$wt" ] || return 1
+  verb="${seg%%[[:space:]]*}"
+  case "$verb" in
+    mv | cp | rm | mkdir | chmod)
+      if ! _permission_seg_mutation_ok "$seg" "$cwd" "$wt" "$slug" "$tasks"; then
+        printf 'writes outside the worktree (%s)' "$verb"; return 0
+      fi ;;
+  esac
+  # Redirection target: the token after the LAST redirect operator (covers append too). Resolve
+  # it against the worktree roots; a target that does not resolve inside them is out-of-tree.
+  case "$seg" in
+    *'>'*)
+      rt="${seg##*>}"; rt="${rt#"${rt%%[![:space:]]*}"}"; rt="${rt%%[[:space:]]*}"
+      case "$rt" in
+        '' | '&'*) : ;;   # empty, or an fd dup (2>&1); not a filesystem target
+        *)
+          if ! _broker_resolve_in_roots "$rt" "$cwd" "$wt" "$slug" "$tasks" >/dev/null 2>&1; then
+            printf 'writes outside the worktree via redirection: %s' "$rt"; return 0
+          fi ;;
+      esac ;;
+  esac
+  return 1
+}
+
+# _danger_privilege_seg <segment> -> print a reason and rc 0 for a privilege-escalation or
+# disk-destroying verb, else rc 1.
+_danger_privilege_seg() {
+  local verb; verb="${1%%[[:space:]]*}"
+  case "$verb" in
+    sudo | doas | su | dd | fdisk | parted | shred | mkfs | mkfs.*)
+      printf 'privileged / destructive command (%s) is denied' "$verb"; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# classify_danger <command> [worktree] -> "DENY<TAB><reason>" for the FIRST dangerous segment,
+# or empty (rc 0) when no segment statically matches (the orchestrator then routes to the judge).
+classify_danger() {
+  local cmd="$1" wt="${2:-}" norm seg slug="" tasks="" cwd="" reason target new_cwd
+  if [ -n "$wt" ]; then
+    slug="$(printf '%s' "$wt" | sed 's/[^A-Za-z0-9]/-/g')"
+    tasks="${AFK_TASKS_ROOT:-/private/tmp}"
+    cwd="$wt"
+  fi
+  norm="${cmd//&&/$'\n'}"; norm="${norm//&/$'\n'}"; norm="${norm//||/$'\n'}"
+  norm="${norm//|/$'\n'}"; norm="${norm//;/$'\n'}"
+  while IFS= read -r seg; do
+    seg="${seg#"${seg%%[![:space:]]*}"}"; seg="${seg%"${seg##*[![:space:]]}"}"
+    [ -n "$seg" ] || continue
+    # cd-tracking mirrors classify_permission so a `cd`-then-write compound resolves relative
+    # targets against the right dir; a cd that escapes is itself an out-of-tree signal handled
+    # by the following segments (they resolve against the unchanged cwd and deny).
+    case "$seg" in
+      'cd '*)
+        target="${seg#cd }"; target="${target#"${target%%[![:space:]]*}"}"
+        case "$target" in '' | -*) continue ;; esac
+        if [ -n "$wt" ] && new_cwd="$(_broker_resolve_in_roots "$target" "$cwd" "$wt" "$slug" "$tasks")"; then
+          cwd="$new_cwd"
+        fi
+        continue ;;
+    esac
+    if reason="$(_danger_privilege_seg "$seg")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
+    if reason="$(_danger_network_seg "$seg")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
+    if reason="$(_danger_credential_seg "$seg")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
+    if reason="$(_danger_write_seg "$seg" "$cwd" "$wt" "$slug" "$tasks")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
+  done <<< "$norm"
+  return 0
+}
+
 # --- permission-dialog detection + handling (issue #149) ----------------------
 # A permission dialog is a pane-only surface — a Claude Code confirmation prompt with no
 # transcript entry of its OWN — but the tool_use it is gating IS flushed to the JSONL as an
