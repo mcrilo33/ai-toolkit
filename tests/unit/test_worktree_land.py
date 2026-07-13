@@ -1386,13 +1386,33 @@ def test_stranded_tmux_window_is_killed(hub: Path, tmp_path: Path) -> None:
     assert "kill-window" in _log_text(logs["tmux"])
 
 
-def test_live_tmux_window_is_kept(hub: Path, tmp_path: Path) -> None:
+def test_landed_issue_window_killed_even_with_live_pane_dir(hub: Path, tmp_path: Path) -> None:
+    # The landed spoke is finished by definition (guards proved it pushed + carries
+    # the ready marker), so its window is reaped UNCONDITIONALLY — even when the
+    # pane's cwd still fully exists — before worktree-done.sh removes the worktree,
+    # so a still-live exporter can't recreate <wt>/.ai-toolkit and strand it (#273).
     _make_spoke(hub, tmp_path, "feature/1-alive", push=True)
 
     proc, logs = _run_land(hub, tmp_path, "1", tmux_windows=f"@3\t1-alive\t{tmp_path}")
 
     assert proc.returncode == 0, proc.stderr
-    assert "kill-window" not in _log_text(logs["tmux"])
+    assert "kill-window" in _log_text(logs["tmux"])
+
+
+def test_recreated_ai_toolkit_only_pane_dir_window_is_killed(hub: Path, tmp_path: Path) -> None:
+    # The recreated-dir case (#273): the spoke's OTel exporter rewrote
+    # <wt>/.ai-toolkit/raw-bodies by absolute path after teardown, so the pane's cwd
+    # re-exists holding ONLY the gitignored scratch dir. The pre-#273 `[ ! -d ]`
+    # sweep saw a live dir and KEPT the window, stranding the zombie; teardown must
+    # now kill it.
+    _make_spoke(hub, tmp_path, "feature/1-recreated", push=True)
+    pane = tmp_path / "recreated-wt"
+    (pane / ".ai-toolkit" / "raw-bodies").mkdir(parents=True)
+
+    proc, logs = _run_land(hub, tmp_path, "1", tmux_windows=f"@3\t1-recreated\t{pane}")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "kill-window" in _log_text(logs["tmux"])
 
 
 def test_unrelated_tmux_window_is_kept(hub: Path, tmp_path: Path) -> None:
@@ -2000,6 +2020,22 @@ def test_reland_after_worktree_removed_finalizes_from_marker(hub: Path, tmp_path
     assert "issue close 1" in _log_text(logs["gh"]), "the open issue is finally closed"
     assert "feature/1-wtgone" not in _local_branches(hub), "the merged branch is pruned"
     assert "ready/1" not in _local_tags(hub), "the completion marker is consumed"
+
+
+def test_reland_finalize_kills_scratch_only_stranded_window(hub: Path, tmp_path: Path) -> None:
+    # The resume-finalize path (:169-176) never reaches the primary pre-teardown
+    # kill, so it carries the SAME recreated-dir hole (#273): its sweep must treat a
+    # pane cwd holding only the gitignored .ai-toolkit scratch as stranded, not live.
+    wt = _make_spoke(hub, tmp_path, "feature/1-wtgone", push=True, ready=True)
+    _complete_ship(hub, "feature/1-wtgone")
+    _git(hub, "worktree", "remove", str(wt))
+    pane = tmp_path / "wtgone-recreated"
+    (pane / ".ai-toolkit" / "raw-bodies").mkdir(parents=True)
+
+    proc, logs = _run_land(hub, tmp_path, "1", tmux_windows=f"@3\t1-wtgone\t{pane}")
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "kill-window" in _log_text(logs["tmux"]), "the scratch-only stranded window is reaped"
 
 
 def test_reland_refuses_issue_without_ready_marker(hub: Path, tmp_path: Path) -> None:

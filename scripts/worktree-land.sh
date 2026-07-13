@@ -97,6 +97,50 @@ HUB_BRANCH="$(git symbolic-ref --short -q HEAD || true)"
 [ -z "$(git status --porcelain -uno)" ] \
   || wt_die "hub checkout is dirty — commit or stash before landing"
 
+# wt_pane_stranded <path> -> a tmux pane's cwd is teardown RESIDUE, not a live
+# worktree: it is gone, OR its only surviving entries are the gitignored scratch
+# dirs (.ai-toolkit telemetry / .claude) that a still-running spoke's OTel exporter
+# recreates by absolute path AFTER the worktree is removed (issue #273). The
+# pre-#273 sweeps killed only on a fully-vanished dir, so a recreated .ai-toolkit
+# read as "live" and kept the zombie window alive. worktree-new.sh git-excludes
+# both dirs, so neither is ever tracked worktree content. Force LC_ALL=C so a stray
+# non-ASCII filename can't break the match on this non-C dev host.
+wt_pane_stranded() {
+  local path="$1" rest
+  # A gone (or empty/unreadable) pane cwd is stranded, as the pre-#273 sweeps had it.
+  [ -d "$path" ] || return 0
+  rest="$(LC_ALL=C ls -A "$path" 2>/dev/null | LC_ALL=C grep -vxE '\.ai-toolkit|\.claude' || true)"
+  [ -z "$rest" ]
+}
+
+# kill_spoke_windows <tag> -> SIGKILL the landed spoke's tmux window(s) by NAME (the
+# reap-path shape of _kill_spoke_window in hub-afk.sh), UNCONDITIONALLY. Called on
+# the land teardown AFTER the post-run telemetry ingest has read the settled state
+# but BEFORE worktree-done.sh removes the worktree — so the spoke's OTel exporter is
+# dead and cannot recreate <wt>/.ai-toolkit by absolute path (issue #273), which
+# would else make the dir-existence sweeps keep the window and strand a zombie
+# claude. Unconditional for the landed issue: its spoke is finished by definition at
+# land time (the guards above proved it pushed + carries the ready marker). Scoped
+# to <tag> so a sibling issue's genuinely-live window is never touched.
+kill_spoke_windows() {
+  command -v tmux >/dev/null 2>&1 || return 0
+  local tag="$1" sess win name path
+  [ -n "$tag" ] || return 0
+  sess="$(wt_tmux_session "$REPO_ROOT")"
+  while IFS=$'\t' read -r win name path; do
+    [ -n "$win" ] || continue
+    case "$name" in
+      "$tag"|"$tag"-*) ;;
+      *) continue ;;
+    esac
+    if tmux kill-window -t "$win" 2>/dev/null; then
+      echo "✓ killed landed spoke's tmux window '$name' ($win)"
+    else
+      wt_warn "couldn't kill tmux window '$name' ($win) — close it by hand"
+    fi
+  done < <(tmux list-windows -t "=$sess" -F $'#{window_id}\t#{window_name}\t#{pane_current_path}' 2>/dev/null || true)
+}
+
 # land_resume_finalize <target> -> clean up the residue of a spoke whose land was
 # killed AFTER the worktree was removed but BEFORE its branch/tag/issue were cleaned up
 # (issue #151): a caller-timeout mid-teardown. Engages ONLY when <target> is a bare
@@ -166,13 +210,14 @@ land_resume_finalize() {
     fi
   fi
 
-  # Kill the stranded tmux window (its pane cwd vanished with the worktree).
+  # Kill the stranded tmux window: its pane cwd vanished with the worktree, or a
+  # still-live exporter recreated it as .ai-toolkit-only scratch (issue #273).
   if command -v tmux >/dev/null 2>&1; then
     sess="$(wt_tmux_session "$REPO_ROOT")"
     while IFS=$'\t' read -r win name path; do
       [ -n "$win" ] || continue
       case "$name" in "$issue" | "$issue"-*) ;; *) continue ;; esac
-      [ -d "$path" ] || tmux kill-window -t "$win" 2>/dev/null || true
+      wt_pane_stranded "$path" && tmux kill-window -t "$win" 2>/dev/null || true
     done < <(tmux list-windows -t "=$sess" -F $'#{window_id}\t#{window_name}\t#{pane_current_path}' 2>/dev/null || true)
   fi
 
@@ -620,6 +665,12 @@ fi
 # at the end so the caller can tell "nothing shipped" (1) from "shipped, cleanup incomplete" (3).
 CLEANUP_INCOMPLETE=""
 if [ -n "$WT_DIR" ]; then
+  # Reap the spoke's tmux window (SIGHUP-ing its pane claude) NOW — after the ingest
+  # above read the settled state, but BEFORE worktree-done.sh removes the worktree —
+  # so the exporter is dead and cannot recreate <wt>/.ai-toolkit by absolute path
+  # (issue #273). Doing it here, by name, replaces the dir-existence heuristic the
+  # end-of-land cleanup_tmux relied on, which a recreated .ai-toolkit defeated.
+  kill_spoke_windows "${ISSUE:-$BSLUG}"
   # WT_DONE seams the teardown for tests (default: the sibling worktree-done.sh). A failure is
   # post-ship residue, not a land failure — warn and flag the sentinel, never abort under set -e.
   bash "${WT_DONE:-$SCRIPT_DIR/worktree-done.sh}" "$WT_DIR" ${KEEP_BRANCH:+--keep-branch} \
@@ -665,9 +716,12 @@ fi
 # --- tmux: kill the task's stranded window in the project session -----------------
 # Spokes live as windows of the project's tmux session (issue #39: derived from
 # the repo root, '<parent>-<base>'), named "<id>" or "<id>-<slug>". A window is
-# stranded when its pane's cwd vanished with the worktree; live windows are kept.
-# The session name MUST match worktree-new.sh's spawn target, so derive it the
-# same way ('=' pins the exact match so a sibling session can't be enumerated).
+# stranded when its pane's cwd vanished with the worktree — or was recreated as
+# .ai-toolkit-only scratch by a live exporter (issue #273); live windows are kept.
+# The primary reap above (kill_spoke_windows) already handles this issue's window
+# before teardown; this end-sweep is the backstop. The session name MUST match
+# worktree-new.sh's spawn target, so derive it the same way ('=' pins the exact
+# match so a sibling session can't be enumerated).
 TAG="${ISSUE:-$BSLUG}"
 cleanup_tmux() {
   command -v tmux >/dev/null 2>&1 || return 0
@@ -679,7 +733,7 @@ cleanup_tmux() {
       "$TAG"|"$TAG"-*) ;;
       *) continue ;;
     esac
-    if [ ! -d "$path" ]; then
+    if wt_pane_stranded "$path"; then
       if tmux kill-window -t "$win" 2>/dev/null; then
         echo "✓ killed stranded tmux window '$name' ($win)"
       else
