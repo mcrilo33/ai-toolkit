@@ -88,6 +88,37 @@ def test_hub_inject_loads_under_foreign_script_dir(tmp_path: Path) -> None:
     assert result.stdout.strip().splitlines()[-1] == "OK"
 
 
+def test_hub_inject_resolves_via_own_dir_without_toplevel(tmp_path: Path) -> None:
+    # Lock the PRIMARY resolution mechanism (issue #262): gate-broker must find its
+    # co-located hub-inject.sh from its OWN _GB_DIR even when the _AFK_TOPLEVEL fallback is
+    # unavailable — a synced-layout self-copy launched from a cwd OUTSIDE any git repo, with
+    # a foreign SCRIPT_DIR and no override. Without _GB_DIR this strands, so the later
+    # _AFK_TOPLEVEL candidates only LOOK like a safety net; this guards against a future
+    # change that drops _GB_DIR but keeps the toplevel fallback.
+    env = {
+        **os.environ,
+        "TZ": "UTC",
+        "SCRIPT_DIR": str(tmp_path / "fake"),
+        "AFK_HUB_INJECT": "",
+    }
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{GATE_BROKER}"; command -v _pane_shows_permission_prompt >/dev/null '
+            "&& command -v _transcript_sizes >/dev/null && echo OK",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "command not found" not in result.stderr, result.stderr
+    assert result.stdout.strip() == "OK"
+
+
 def test_parse_decision_extracts_answer() -> None:
     result = _call("parse_decision 'reasoning here\nANSWER: use Redis'")
 
