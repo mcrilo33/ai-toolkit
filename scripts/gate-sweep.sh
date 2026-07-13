@@ -27,9 +27,9 @@
 #            restores a ref. This is a live hub/main checkout, so a concurrent
 #            /afk drain FF-advancing main/origin/*/sibling refs, stamping
 #            needs-human-land/* tags, and moving HEAD is legitimate, not a
-#            breach; only a genuine escape (config flip / ref deletion / non-FF
-#            move) is logged (a note in sweep.log) — never a red verdict, never
-#            a rewind. Green upgrades the tree's stamp to `full` (so back-to-back
+#            breach; only a genuine escape (config flip / non-FF ref move) is
+#            logged (a note in sweep.log) — never a red verdict, never a rewind.
+#            Green upgrades the tree's stamp to `full` (so back-to-back
 #            lands of the same content sweep once); red files a GitHub issue
 #            carrying the failing test ids + the landed commit/branch so the
 #            failure drops into the normal backlog → spoke flow. A gh failure
@@ -217,8 +217,8 @@ run_suite() {
   # main/origin/*/sibling refs, stamps needs-human-land/* tags, and moves HEAD.
   # run_under_tripwire_observe returns the SUITE's OWN exit code — never the tripwire's
   # 97, so a drain ref move can never masquerade as a red — and never restores; it only
-  # logs a note (to $LOG) if a genuine escape (config flip / ref deletion / non-FF move)
-  # is seen. It captures the suite's stdout+stderr into $cap itself. The bare fallback
+  # logs a note (to $LOG) if a genuine escape (config flip / non-FF ref move) is seen.
+  # It captures the suite's stdout+stderr into $cap itself. The bare fallback
   # is for an older installed utils.sh that predates the observe helper.
   if command -v run_under_tripwire_observe >/dev/null 2>&1; then
     run_under_tripwire_observe "$cap" "${RUNNER_ARR[@]}" 2>>"$LOG"

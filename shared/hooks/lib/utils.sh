@@ -991,13 +991,24 @@ run_under_tripwire_scoped() {
 }
 
 # Classify the snapshot delta for the OBSERVE-only sweep tripwire (issue #267). Prints
-# one line per change that looks like a GENUINE escape — a config-marker flip, a ref
-# deletion, or a non-fast-forward ref move (the #29/#30/#31 corruption class) — and
-# nothing for legitimate concurrent-drain movement: a fast-forward advance, a newly
-# created ref/tag, or HEAD following an FF. Read-only; never mutates a ref. $1 = before
-# snapshot, $2 = after snapshot (both in tripwire_capture format). Unlike
-# _tripwire_benign_ref_change (which the pre-push gate shares and issue #267 must NOT
-# widen), this tolerance is confined to the sweep surface via run_under_tripwire_observe.
+# one line per change that looks like a GENUINE escape the concurrent drain never
+# produces — a config-marker flip or a non-fast-forward ref move (the #29/#30/#31
+# corruption class) — and nothing for legitimate drain movement. Read-only; never
+# mutates a ref. $1 = before snapshot, $2 = after snapshot (both in tripwire_capture
+# format). Unlike _tripwire_benign_ref_change (which the pre-push gate shares and issue
+# #267 must NOT widen), this tolerance is confined to the sweep surface via
+# run_under_tripwire_observe.
+#
+# Only two signals are drain-IMMUNE, so only they are flagged:
+#   * config markers (core.bare/core.worktree) — the drain never touches them; and
+#   * a non-fast-forward move of a still-present ref — the drain only ever FF-advances.
+# Everything else on this live hub checkout has a legitimate drain explanation and is
+# tolerated silently: an FF advance (a landed spoke), a newly created ref/tag (a spawned
+# spoke / a needs-human-land/* stamp — refs that appear only in `after` are not iterated
+# here), and a DELETED ref (land teardown legitimately drops the landed feature branch,
+# prunes its remote-tracking ref, and clears its needs-human-land/* tag — a deletion is
+# indistinguishable from an escape here, so flagging it would be the very false alarm
+# #267 removes).
 _tripwire_observe_escapes() {
   local before="$1" after="$2" kind sha name a_sha key
   # Config markers never move while a hub checkout is live: any drift is an escape.
@@ -1006,16 +1017,15 @@ _tripwire_observe_escapes() {
       printf 'cfg %s changed\n' "$key"
     fi
   done
-  # For every ref in the snapshot: a deletion or a non-FF move is an escape; an FF
-  # advance (before is an ancestor of after) is drain movement. Refs that only APPEAR
-  # in the after snapshot are creations (a spawned branch, a needs-human-land/* tag) —
-  # not iterated here, so they stay silent.
+  # UPGRADE: forks one awk per before-ref to look up its after-sha; if a hub's ref count
+  # grows large, diff both snapshots in a single awk pass (as tripwire_check does). Kept
+  # per-ref for bash-3.2 portability (no associative arrays) and it runs once per ~45-min
+  # sweep, so the O(N) forks are negligible today.
   while read -r kind sha name; do
     [ "$kind" = "ref" ] || continue
     a_sha="$(printf '%s\n' "$after" | awk -v r="$name" '$1=="ref" && $3==r {print $2; exit}')"
-    if [ -z "$a_sha" ]; then
-      printf '%s deleted\n' "$name"
-    elif [ "$a_sha" != "$sha" ] && ! git merge-base --is-ancestor "$sha" "$a_sha" 2>/dev/null; then
+    [ -n "$a_sha" ] || continue   # vanished ref: legitimate drain teardown, not flagged
+    if [ "$a_sha" != "$sha" ] && ! git merge-base --is-ancestor "$sha" "$a_sha" 2>/dev/null; then
       printf '%s moved non-fast-forward\n' "$name"
     fi
   done <<< "$before"

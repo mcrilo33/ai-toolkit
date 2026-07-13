@@ -495,6 +495,23 @@ def test_observe_logs_note_on_non_ff_ref_move_without_restoring(repo: Path, tmp_
     assert _rev(repo, "main") != tip  # left rewound — observe restores nothing
 
 
+def test_observe_tolerates_concurrent_ref_deletion(repo: Path, tmp_path: Path) -> None:
+    # A concurrent /afk drain legitimately DELETES refs at land teardown (the landed
+    # feature branch, its remote-tracking ref, a needs-human-land/* tag). A vanished ref
+    # is indistinguishable from an escape here, so observe tolerates it silently — no
+    # NOTE — rather than raise the false alarm #267 removes.
+    _git(repo, "branch", "feature/251-landed", "main")
+    cap = tmp_path / "cap.log"
+    proc = _lib(
+        repo,
+        f'run_under_tripwire_observe "{cap}" bash -c "git branch -D feature/251-landed" && echo OK',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "OK" in proc.stdout
+    assert "NOTE" not in proc.stderr  # a deletion is legit drain teardown, not flagged
+
+
 def test_observe_captures_command_output_to_capfile(repo: Path, tmp_path: Path) -> None:
     # The wrapped command's stdout+stderr land in <capfile> (the sweep reads the
     # failing ids from there), not on the observe caller's streams.
