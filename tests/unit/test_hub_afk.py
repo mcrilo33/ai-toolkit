@@ -6368,6 +6368,30 @@ def test_afk_network_is_down_fails_open_without_curl() -> None:
     assert result.stdout.strip() == "RC=1", result.stdout + result.stderr
 
 
+def test_afk_network_is_down_default_probe_is_head_without_fail(tmp_path: Path) -> None:
+    # Linchpin guard (#249 review): with no AFK_NET_PROBE_CMD override the function builds its
+    # DEFAULT curl probe — record the args a stub `curl` receives and pin the shape: a bounded HEAD
+    # (-sI + --max-time) with NO --fail. --fail would make curl exit nonzero on the API's
+    # unauthenticated 401, so _afk_network_is_down would read a REAL dead token as "offline"
+    # (dispatch never halts, idle clocks refresh forever) — silently inverting the whole fix.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    arglog = tmp_path / "curl-args.txt"
+    fake_curl = bin_dir / "fakecurl"
+    fake_curl.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" > "{arglog}"\nexit 0\n')
+    fake_curl.chmod(0o755)
+
+    _call("_afk_network_is_down", env={"AFK_NET_PROBE_CMD": "", "AFK_CURL_BIN": str(fake_curl)})
+
+    tokens = arglog.read_text().split()
+    assert "-sI" in tokens, tokens
+    assert "--max-time" in tokens, tokens
+    assert "--fail" not in tokens and "-f" not in tokens, (
+        f"the reachability probe must NOT use --fail — the API's unauthenticated 401 must read "
+        f"as 'up', not 'offline': {tokens}"
+    )
+
+
 @pytest.mark.parametrize(
     "net_cmd,auth_cmd,expected",
     [

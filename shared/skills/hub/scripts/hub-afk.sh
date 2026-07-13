@@ -1903,7 +1903,7 @@ _afk_network_is_down() {
   if [ -z "${AFK_NET_PROBE_CMD:-}" ] && ! command -v "${AFK_CURL_BIN:-curl}" >/dev/null 2>&1; then
     return 1   # cannot probe -> fail open to "up" (normal reaping proceeds)
   fi
-  cmd="${AFK_NET_PROBE_CMD:-${AFK_CURL_BIN:-curl} -sI -o /dev/null --max-time $secs $AFK_NET_PROBE_URL}"
+  cmd="${AFK_NET_PROBE_CMD:-${AFK_CURL_BIN:-curl} -sI -o /dev/null --max-time $secs ${AFK_NET_PROBE_URL:-https://api.anthropic.com}}"
   ! _afk_with_timeout "$secs" bash -c "$cmd" >/dev/null 2>&1
 }
 
