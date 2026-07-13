@@ -405,6 +405,106 @@ def test_scoped_run_still_catches_escape_on_owned_ref(repo: Path) -> None:
     assert "refs/heads/main" in proc.stderr
 
 
+# --- observe-only sweep tripwire: verdict never overridden, never restores (#267) ---
+# The #124 post-land sweep re-runs the full suite on the live hub/main checkout as a
+# NON-PUSHING diagnostic. A concurrent /afk drain legitimately FF-advances
+# main/origin/*/sibling refs, stamps needs-human-land/* tags, and moves HEAD the whole
+# time — so run_under_tripwire_observe must (a) return the wrapped command's OWN exit
+# code, never BREACH_RC, (b) never restore any ref, and (c) only LOG a note when a
+# change looks like a genuine escape the drain never produces (a config flip, a ref
+# deletion, or a non-fast-forward move). The wrapped command's stdout+stderr are
+# captured to the <capfile> first arg (the sweep reads failing ids from there).
+
+
+def test_observe_returns_command_exit_despite_ff_ref_move(repo: Path, tmp_path: Path) -> None:
+    # The drain FF-advances main/HEAD mid-sweep; observe returns the suite's own exit
+    # (0), never BREACH_RC, and never rewinds the ref.
+    cap = tmp_path / "cap.log"
+    proc = _lib(
+        repo,
+        f'run_under_tripwire_observe "{cap}" bash -c "git commit --allow-empty -q -m drain-lands"'
+        ' && echo "RC=0"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RC=0" in proc.stdout
+    assert "REPO-INTEGRITY BREACH" not in proc.stderr
+    assert _git(repo, "log", "-1", "--format=%s", "main").strip() == "drain-lands"  # not rewound
+
+
+def test_observe_propagates_suite_failure_exit(repo: Path, tmp_path: Path) -> None:
+    # A genuinely failing suite surfaces its OWN exit code (1), not the tripwire's 97.
+    cap = tmp_path / "cap.log"
+    proc = _lib(repo, f'run_under_tripwire_observe "{cap}" bash -c "exit 1" || echo "RC=$?"')
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RC=1" in proc.stdout
+    assert f"RC={BREACH_RC}" not in proc.stdout
+
+
+def test_observe_tolerates_concurrent_tag_and_remote_ref(repo: Path, tmp_path: Path) -> None:
+    # needs-human-land/* tag creation + a remote-tracking ref FF are legitimate drain
+    # movement: the run stays green, prints no breach, and deletes nothing.
+    cap = tmp_path / "cap.log"
+    proc = _lib(
+        repo,
+        f'run_under_tripwire_observe "{cap}" bash -c "'
+        "git commit --allow-empty -q -m land; "
+        "git update-ref refs/remotes/origin/main HEAD; "
+        'git tag needs-human-land/261 HEAD" && echo OK',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "OK" in proc.stdout
+    assert "REPO-INTEGRITY BREACH" not in proc.stderr
+    assert _git(repo, "tag", "--list").strip() == "needs-human-land/261"  # not deleted
+
+
+def test_observe_logs_note_on_config_flip_without_restoring(repo: Path, tmp_path: Path) -> None:
+    # A config-marker flip IS the #29/#30 escape class the drain never produces:
+    # observe LOGS a note, still returns the suite's exit, and does NOT restore it
+    # (the non-pushing sweep restores nothing).
+    cap = tmp_path / "cap.log"
+    proc = _lib(
+        repo,
+        f'run_under_tripwire_observe "{cap}" bash -c "git config core.bare true" && echo OK',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "OK" in proc.stdout
+    assert "NOTE" in proc.stderr
+    assert "core.bare" in proc.stderr
+    assert _git(repo, "config", "--get", "core.bare").strip() == "true"  # not restored
+
+
+def test_observe_logs_note_on_non_ff_ref_move_without_restoring(repo: Path, tmp_path: Path) -> None:
+    # A ref REWIND (non-fast-forward) is garbage the drain never produces: observed
+    # and logged, but never a red verdict and never rewound back.
+    _git(repo, "commit", "--allow-empty", "-qm", "c1")
+    tip = _rev(repo, "main")
+    cap = tmp_path / "cap.log"
+    proc = _lib(
+        repo,
+        f'run_under_tripwire_observe "{cap}" bash -c "git reset -q --hard HEAD~1" && echo OK',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "OK" in proc.stdout
+    assert "NOTE" in proc.stderr
+    assert "refs/heads/main" in proc.stderr
+    assert _rev(repo, "main") != tip  # left rewound — observe restores nothing
+
+
+def test_observe_captures_command_output_to_capfile(repo: Path, tmp_path: Path) -> None:
+    # The wrapped command's stdout+stderr land in <capfile> (the sweep reads the
+    # failing ids from there), not on the observe caller's streams.
+    cap = tmp_path / "cap.log"
+    proc = _lib(repo, f'run_under_tripwire_observe "{cap}" bash -c "echo hello-suite"')
+
+    assert proc.returncode == 0, proc.stderr
+    assert "hello-suite" in cap.read_text()
+
+
 # --- integration: the test-select.sh pre-push gate -------------------------------
 
 

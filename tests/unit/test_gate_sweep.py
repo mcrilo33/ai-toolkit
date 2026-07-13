@@ -298,6 +298,106 @@ def test_run_red_gh_failure_is_logged(repo: Path, tmp_path: Path) -> None:
     assert "ERROR" in log and "issue" in log  # logged, never swallowed silently
 
 
+# --- --run: observe-only tripwire on the live hub surface (issue #267) -------------
+# The sweep re-runs the full suite on the hub/main checkout while a concurrent /afk
+# drain legitimately FF-advances main/origin/*/sibling refs, stamps needs-human-land/*
+# tags, and moves HEAD. Those moves must NOT read as a repo-integrity breach and file a
+# spurious "Post-land sweep red": the verdict is the suite's OWN pytest exit. These
+# drive run_suite's REAL-runner path (a PATH `pytest` stub, no GATE_SWEEP_CMD), which
+# resolves via detect_pytest and runs under the observe-only tripwire — the path that
+# historically returned TRIPWIRE_BREACH_RC (97) on the drain's ref movement.
+
+
+def _run_sweep_real_runner(
+    repo: Path,
+    tmp_path: Path,
+    *args: str,
+    suite_exit: int = 0,
+    drain: bool = True,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    """Run gate-sweep.sh via the REAL-runner path with a PATH `pytest` stub.
+
+    No GATE_SWEEP_CMD is set, so run_suite resolves the stub through detect_pytest and
+    wraps it in the sweep's tripwire. The stub answers --help/--version, optionally
+    simulates a concurrent drain (FF-advancing main/HEAD, creating origin/* refs, a
+    sibling branch, and a needs-human-land/* tag), then exits `suite_exit`. The drain
+    advances via an empty commit so HEAD^{tree} is preserved (the stamp keys on it).
+    """
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    gh_log = tmp_path / "gh-calls.log"
+    gh = bindir / "gh"
+    gh.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{gh_log}"\nexit 0\n')
+    gh.chmod(0o755)
+    drain_body = (
+        (
+            "git commit --allow-empty -q -m 'drain lands another spoke'\n"
+            "git update-ref refs/remotes/origin/main HEAD\n"
+            "git update-ref refs/remotes/origin/HEAD HEAD\n"
+            "git branch feature/251-sibling HEAD 2>/dev/null || true\n"
+            "git update-ref refs/remotes/origin/feature/251-sibling HEAD\n"
+            "git tag needs-human-land/261 HEAD 2>/dev/null || true\n"
+        )
+        if drain
+        else ""
+    )
+    pytest_stub = bindir / "pytest"
+    pytest_stub.write_text(
+        "#!/bin/sh\n"
+        'case "$1" in --help|-h) echo "usage: pytest"; exit 0 ;; '
+        '--version|-V) echo "pytest 9.9"; exit 0 ;; esac\n'
+        f"{drain_body}"
+        f"exit {suite_exit}\n"
+    )
+    pytest_stub.chmod(0o755)
+    env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    proc = subprocess.run(
+        ["bash", str(GATE_SWEEP), *args],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    return proc, gh_log
+
+
+def test_run_green_under_concurrent_drain_movement(repo: Path, tmp_path: Path) -> None:
+    # A passing suite must exit green, mint the `full` stamp, and file NO issue even
+    # though main/origin/*/sibling/needs-human-land tag/HEAD all moved during the run.
+    # Pre-#267 the whole-repo tripwire read those FF moves as a breach (97) and filed a
+    # spurious red.
+    _mint(repo, "testmon")
+
+    proc, gh_log = _run_sweep_real_runner(repo, tmp_path, "--run", _head(repo), suite_exit=0)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "tier=full\n" in _stamp_text(repo)  # green upgrade fired under the drain
+    assert not gh_log.exists() or gh_log.read_text() == ""  # no spurious "sweep red" issue
+
+
+def test_run_red_under_concurrent_drain_still_files_issue(repo: Path, tmp_path: Path) -> None:
+    # A genuinely failing suite still files a red issue amid the same drain movement:
+    # the verdict is the suite's own exit code, not the ref churn.
+    _mint(repo, "testmon")
+
+    proc, gh_log = _run_sweep_real_runner(
+        repo,
+        tmp_path,
+        "--run",
+        _head(repo),
+        "--branch",
+        "feature/9-x",
+        "--issue",
+        "9",
+        suite_exit=1,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert gh_log.exists() and "issue create" in gh_log.read_text()  # real red still files
+    assert "tier=testmon\n" in _stamp_text(repo)  # red keeps the pruned stamp
+
+
 # --- --run: one sweep at a time per checkout (lock + newest-wins queue) ------------
 
 
