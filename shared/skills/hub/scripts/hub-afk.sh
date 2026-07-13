@@ -67,6 +67,12 @@
 #                                block below); AFK_SYNC_CMD / AFK_SELFUPDATE_SMOKE_CMD are seams.
 #   AFK_ARM_PRECHECK=1           arm-precondition gate (=0 skips live/dirty/branch/gh-auth checks)
 #   AFK_AUTH_PROBE_CMD           auth probe: reap-time AND the #241 §9 per-tick auth-halt re-probe (default: a bounded headless claude no-op)
+#   AFK_NET_PROBE_URL            #249 reachability probe target (default: https://api.anthropic.com)
+#   AFK_NET_PROBE_TIMEOUT=10     seconds bounding the #249 reachability probe (via _afk_with_timeout)
+#   AFK_NET_PROBE_CMD            override the whole reachability probe (tests); AFK_CURL_BIN overrides `curl`.
+#                                Network-down is distinguished from auth-dead ahead of "token dead":
+#                                on a blackout the reap pass is SKIPPED this tick and idle clocks are
+#                                refreshed, so a merely-offline fleet is not mis-blocked (#249)
 #   CLAUDE_PROJECTS_DIR          transcript root (default: $HOME/.claude/projects)
 #   AFK_REMOTE_HOST / AFK_REMOTE_REPO / AFK_REMOTE_SESSION / AFK_REMOTE_DRAIN_CMD
 #                                --remote target config (or a sourced AFK_REMOTE_CONF file)
@@ -1323,15 +1329,30 @@ _warn_all_inflight() {
 # _afk_service_auth_halt -> service a raised _AFK_AUTH_FAILED WITHOUT stopping the drain (#241 §9).
 # Auth is the one true external blocker, but it only HALTS DISPATCH (the _AFK_AUTH_FAILED
 # short-circuits), warns the in-flight spokes loudly + repeatedly, RE-PROBES auth each tick, and
-# CLEARS the flag (resuming the drain) the moment auth recovers. The re-probe is the bounded
-# headless-claude no-op _afk_auth_is_dead already uses.
+# CLEARS the flag (resuming the drain) the moment auth recovers. The re-probe is _afk_probe_state
+# (#249): a network blackout is distinguished from real auth-death so a mere outage never reads as
+# recovery (that would resume dispatch into a dead network) — see the tri-state branches below.
 _afk_service_auth_halt() {
-  log "/afk: subscription auth failed — dispatch HALTED (re-run /login on the host); re-probing each tick, NOT stopping the drain (#241 §9)"
-  _warn_all_inflight "subscription auth failed — dispatch halted; re-run /login on the host (retrying auth each tick)"
-  if ! _afk_auth_is_dead; then
-    _AFK_AUTH_FAILED=0
-    log "/afk: auth recovered — resuming the drain"
-  fi
+  # #249: the re-probe is the SECOND _afk_auth_is_dead caller, so it distinguishes network-down
+  # the same way. If the network dropped while halted we CANNOT confirm recovery — a bare
+  # `! _afk_auth_is_dead` would misread the connection error as "auth recovered" and resume the
+  # drain into a dead network. On offline: stay halted, record the outage, refresh idle clocks,
+  # re-check next tick. On alive: auth recovered — clear the flag + the outage marker and resume.
+  afk_write_heartbeat   # the probes are bounded curl/`claude` calls — keep the epoch fresh
+  case "$(_afk_probe_state)" in
+    offline)
+      _afk_note_offline_tick
+      ;;
+    alive)  # auth recovered — clear the flag + any outage marker and resume the drain
+      _AFK_AUTH_FAILED=0
+      clear_offline_since
+      log "/afk: auth recovered — resuming the drain"
+      ;;
+    *)  # auth-dead: network up but the token is still dead — stay halted, warn the fleet again
+      log "/afk: subscription auth failed — dispatch HALTED (re-run /login on the host); re-probing each tick, NOT stopping the drain (#241 §9)"
+      _warn_all_inflight "subscription auth failed — dispatch halted; re-run /login on the host (retrying auth each tick)"
+      ;;
+  esac
 }
 
 # --- dispatch -----------------------------------------------------------------
@@ -1860,6 +1881,53 @@ _afk_auth_is_dead() {
   [ "$rc" -ne 0 ] && is_auth_failure "$raw"
 }
 
+# --- reachability probe: network-down as a THIRD outcome (issue #249) ----------
+# A connectivity blackout (a hotspot dropout, a lost home connection during a remote drain) makes
+# the auth probe above fail for the WRONG reason: a fleet that is merely OFFLINE used to read as
+# "subscription token dead" and get mis-blocked, stopping the whole drain. Before concluding "token
+# dead", the supervisor asks the only question that matters here — can this host reach the network
+# at all — with a bounded curl HEAD. curl exits 0 on ANY HTTP response (even a 401 from the
+# unauthenticated API root), and nonzero ONLY when it cannot connect / resolve / times out, so this
+# needs no valid credentials; NO `--fail`, or the API's unauthenticated 4xx would misread as down.
+# The probe is wrapped in _afk_with_timeout so a black-hole network can't hang the tick (the same
+# discipline as the gh / auth probes). AFK_NET_PROBE_CMD overrides the whole probe (tests).
+: "${AFK_NET_PROBE_URL:=https://api.anthropic.com}"
+: "${AFK_NET_PROBE_TIMEOUT:=10}"
+# _afk_network_is_down -> rc 0 (true) when the bounded reachability probe FAILS (no network), rc 1
+# (false, "up") when it succeeds OR when the probe cannot run at all (no curl and no override) — an
+# unrunnable probe must NEVER read as "down", or a curl-less host would suppress every reap for the
+# whole window. AFK_CURL_BIN overrides the binary (default `curl`) so the fail-open is testable.
+_afk_network_is_down() {
+  local secs="${AFK_NET_PROBE_TIMEOUT:-10}" cmd
+  case "$secs" in '' | *[!0-9]*) secs=10 ;; esac
+  if [ -z "${AFK_NET_PROBE_CMD:-}" ] && ! command -v "${AFK_CURL_BIN:-curl}" >/dev/null 2>&1; then
+    return 1   # cannot probe -> fail open to "up" (normal reaping proceeds)
+  fi
+  cmd="${AFK_NET_PROBE_CMD:-${AFK_CURL_BIN:-curl} -sI -o /dev/null --max-time $secs $AFK_NET_PROBE_URL}"
+  ! _afk_with_timeout "$secs" bash -c "$cmd" >/dev/null 2>&1
+}
+
+# _afk_probe_state -> the tri-state the two _afk_auth_is_dead callers branch on (#249):
+#   offline   — the reachability probe failed: skip the reap pass, ride out the outage.
+#   auth-dead — network up AND the auth probe returned an auth signature: block-and-halt (unchanged).
+#   alive     — network up AND auth healthy: proceed normally.
+# The reachability probe runs FIRST and short-circuits, so a blackout is never mistaken for dead auth.
+_afk_probe_state() {
+  if _afk_network_is_down; then printf 'offline\n'; return; fi
+  if _afk_auth_is_dead; then printf 'auth-dead\n'; return; fi
+  printf 'alive\n'
+}
+
+# _afk_note_offline_tick -> the shared response to a network-outage tick (#249): record the
+# offline-since epoch (idempotent — anchors the consecutive outage for --status), refresh every
+# in-flight spoke's idle + soft-ceiling clocks so the blackout never accumulates into a reap/block,
+# and log the outage with its running duration. The caller keeps the heartbeat stamped.
+_afk_note_offline_tick() {
+  stamp_offline_since
+  _afk_refresh_offline_clocks
+  log "/afk: network unreachable (OFFLINE for $(offline_minutes)m) — skipping the reap pass this tick, refreshing idle clocks, riding out the outage (#249)"
+}
+
 reap_pass() {
   local path issue probed=0
   while IFS=$'\t' read -r path issue; do
@@ -1872,12 +1940,26 @@ reap_pass() {
     # (never block/stop — #241 §9).
     if [ "$probed" -eq 0 ]; then
       probed=1
-      afk_write_heartbeat   # the probe is a bounded `claude` call — keep the epoch fresh (#170 ST2)
-      if _afk_auth_is_dead; then
-        _AFK_AUTH_FAILED=1
-        log "/afk: auth probe failed during reap — halting instead of reaping spokes into dead auth"
-        return 0
-      fi
+      afk_write_heartbeat   # the probes are bounded curl/`claude` calls — keep the epoch fresh (#170 ST2)
+      # #249: distinguish network-down from auth-dead BEFORE concluding "token dead". A blackout
+      # means every idle spoke is stalled on a dead NETWORK, not a dead token — reaping them would
+      # mis-block a merely-offline fleet. Skip the reap this tick, refresh idle clocks so the outage
+      # never accumulates into a reap/block, and re-check next tick. Auth-dead keeps the #170 ST7
+      # / #241 §9 behavior (raise the halt flag; the main loop WARNs + re-probes, never blocks/stops).
+      case "$(_afk_probe_state)" in
+        offline)
+          _afk_note_offline_tick
+          return 0
+          ;;
+        auth-dead)
+          _AFK_AUTH_FAILED=1
+          log "/afk: auth probe failed during reap — halting instead of reaping spokes into dead auth"
+          return 0
+          ;;
+        *)  # alive: network up + auth healthy — clear any outage marker and reap normally
+          clear_offline_since
+          ;;
+      esac
     fi
     _reap_or_resume "$path" "$issue"
     # The #246 park-guard may have run decide_and_act, whose answerer can raise _AFK_AUTH_FAILED
@@ -3183,6 +3265,16 @@ afk_blocked_locally_status() {
     "$list" "$dir"
 }
 
+# afk_offline_status -> a one-line OFFLINE diagnostic while a network outage is in progress (#249),
+# or nothing when reachable. Surfaced by --status so a stuck-offline drain is diagnosable without
+# attaching: it names how long the blackout has run, during which the reap pass is paused and the
+# idle clocks are refreshed each tick so the outage never accumulates into a reap/block.
+afk_offline_status() {
+  local mins; mins="$(offline_minutes)"
+  [ -n "$mins" ] || return 0
+  printf '/afk: OFFLINE for %sm — network unreachable, reaping paused (idle clocks refreshed); re-checked each tick\n' "$mins"
+}
+
 # afk_hang_forensics_status -> a one-line summary of the hang-forensics bundles captured before
 # a reaper revival (#243), or nothing when none exist. Like the blocked-locally line, a bundle
 # outlives the drain, so the operator returning from AFK sees where the hang evidence sits.
@@ -3253,6 +3345,9 @@ _status() {
     return 0
   fi
   _afk_status_state_line "$state" "$now"
+  # A network outage pauses reaping and refreshes idle clocks (#249) — surface it right under the
+  # state line so a stuck-offline drain is obvious without attaching. No-op when reachable.
+  afk_offline_status
   # For a live (or stale) drain, surface telemetry health too: the dashboard is the SSOT,
   # so the operator must be able to see whether it's actually receiving data (#108). A
   # no-op line when telemetry is opted out (AI_TOOLKIT_OTEL=0).

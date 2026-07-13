@@ -165,6 +165,44 @@ stamp_progress_epoch()  { _stamp_issue_epoch progress "$1"; }
 read_progress_epoch()   { _read_issue_epoch progress "$1"; }
 stamp_answer_attempt()  { _stamp_issue_epoch answer-attempt "$1"; }
 read_answer_attempt()   { _read_issue_epoch answer-attempt "$1"; }
+
+# --- network-outage state (issue #249) ----------------------------------------
+# A connectivity blackout makes the pre-reap auth probe fail for the WRONG reason. The two
+# _afk_auth_is_dead callers in hub-afk.sh (reap_pass + _afk_service_auth_halt) share this state:
+# the offline-since epoch anchors a CONSECUTIVE outage (surfaced as `OFFLINE for Nm` in --status),
+# and _afk_refresh_offline_clocks re-stamps every in-flight spoke's idle + soft-ceiling clocks so
+# the blackout is not counted toward a reap/block when connectivity returns. Per-window state,
+# cleared by _clear_progress_state on a fresh arm. AFK_STATE_DIR overrides the location for tests.
+_afk_offline_since_file() { printf '%s\n' "$(_afk_state_dir)/offline-since.epoch"; }
+# stamp_offline_since -> record the epoch of the FIRST tick of the current outage run; a later
+# tick must NOT overwrite it, so --status reports the true outage length, not just this tick.
+stamp_offline_since() {
+  local f; f="$(_afk_offline_since_file)"
+  [ -f "$f" ] && return 0
+  mkdir -p "$(_afk_state_dir)" 2>/dev/null || true
+  printf '%s\n' "$(afk_now)" > "$f" 2>/dev/null || true
+}
+read_offline_since()  { local f; f="$(_afk_offline_since_file)"; [ -f "$f" ] && cat "$f" 2>/dev/null || true; }
+clear_offline_since() { rm -f "$(_afk_offline_since_file)" 2>/dev/null || true; }
+# offline_minutes -> whole minutes since the outage began, or empty when there is no outage.
+offline_minutes() {
+  local since; since="$(read_offline_since)"
+  case "$since" in '' | *[!0-9]*) return 0 ;; esac
+  printf '%s\n' "$(( ($(afk_now) - since) / 60 ))"
+}
+# _afk_refresh_offline_clocks -> stamp a fresh progress (soft ceiling) + answer-attempt (idle
+# clock) epoch for every in-flight spoke, so a network-OUTAGE tick's frozen transcript mtime does
+# not accumulate into an idle/ceiling reap when connectivity returns (#249). The ABSOLUTE hard
+# ceiling (dispatch x mult) is deliberately left untouched as a backstop. Best-effort per spoke.
+_afk_refresh_offline_clocks() {
+  local path issue
+  while IFS=$'\t' read -r path issue; do
+    [ -n "$issue" ] || continue
+    stamp_progress_epoch "$issue"
+    stamp_answer_attempt "$issue"
+  done < <(inflight_worktrees)
+}
+
 # Fresh window ⇒ no stale progress/attempt state: a leftover answer-attempt epoch
 # would suppress a legitimate idle reap in the next window; a leftover re-answer counter
 # (#203) would strand a spoke at a ceiling reached in a prior window; a leftover gate-voided /
@@ -174,7 +212,8 @@ read_answer_attempt()   { _read_issue_epoch answer-attempt "$1"; }
 _clear_progress_state() {
   local dir; dir="$(_afk_state_dir)"
   rm -f "$dir"/progress-*.epoch "$dir"/answer-attempt-*.epoch "$dir"/tip-* \
-    "$dir"/reanswer-* "$dir"/gate-voided-* "$dir"/terminal-logged-* 2>/dev/null || true
+    "$dir"/reanswer-* "$dir"/gate-voided-* "$dir"/terminal-logged-* \
+    "$dir"/offline-since.epoch 2>/dev/null || true   # #249: drop a stale outage marker too
   _clear_warned_records   # #241: drop the warned-retry backoff + records for a fresh window
 }
 
