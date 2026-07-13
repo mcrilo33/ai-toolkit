@@ -749,3 +749,58 @@ def test_backstop_node_ref_move_breaches_and_refuses_rewind(repo: Path, tmp_path
     # FF advance → restore refuses the rewind and warns (issue #135).
     assert "NOT rewinding" in proc.stderr
     assert _git(repo, "log", "-1", "--format=%s", "main").strip() == "sneak"
+
+
+# --- backstop tolerates a concurrent control-plane marker stamp (issue #272) -------
+# The red-proof green backstop runs each Tested-RED node through run_pytest_node,
+# whose tripwire covers the whole repo (unscoped). While that node runs on a live
+# hub checkout, an /afk drain or hub-watchdog legitimately stamps a control-plane
+# marker tag — `needs-human-land/<N>` is the one that bit #272 (the watchdog's
+# escalate-only land marker), created mid-land while the backstop was armed. That
+# creation must NOT read as a #31 escape (a hermetic test writes only to its own
+# tmpdir; it never creates these real namespaces), and the marker must survive —
+# the pre-#272 restore collateral-deleted it as an "appeared ref", destroying the
+# escalation. Only CREATION is tolerated: a MOVE or DELETE of such a ref still
+# breaches, so #31 is not weakened.
+
+
+def test_backstop_tolerates_concurrent_marker_tag_creation(repo: Path, tmp_path: Path) -> None:
+    # The pinned repro: a node that stamps needs-human-land/<N> mid-run no longer
+    # yields BREACH, and the marker survives (AC1 + AC4).
+    _make_pytest_stub(tmp_path / "bin", "git tag needs-human-land/272 HEAD")
+
+    proc = _run_node(repo, tmp_path / "bin")
+
+    assert "VERDICT=PASS" in proc.stdout, proc.stderr  # creation tolerated, node verdict flows
+    assert "REPO-INTEGRITY BREACH" not in proc.stderr
+    assert "needs-human-land/272" in _git(repo, "tag", "--list")  # not collateral-deleted
+
+
+def test_backstop_real_breach_preserves_concurrent_marker(repo: Path, tmp_path: Path) -> None:
+    # A genuine escape (main moved) co-occurring with a concurrent needs-human-land/*
+    # stamp: the real escape still BREACHes, but the restore must NOT collateral-delete
+    # the innocent marker the wrapped command did not "own" (AC2 under a concurrent
+    # breach — the exact compound case #272 consequence #2 targets).
+    _make_pytest_stub(
+        tmp_path / "bin",
+        "git commit --allow-empty -q -m sneak; git tag needs-human-land/272 HEAD",
+    )
+
+    proc = _run_node(repo, tmp_path / "bin")
+
+    assert "VERDICT=BREACH" in proc.stdout, proc.stderr  # the real escape still fires
+    assert "refs/heads/main" in proc.stderr  # the moved ref is named
+    assert "needs-human-land/272" in _git(repo, "tag", "--list")  # marker survives the restore
+
+
+def test_backstop_marker_ns_move_still_breaches(repo: Path, tmp_path: Path) -> None:
+    # Only CREATION is tolerated. A pre-existing marker tag MOVED mid-run is not a
+    # creation, so it still BREACHes — the #31 protection is not weakened (AC3).
+    _git(repo, "commit", "--allow-empty", "-qm", "c1")
+    _git(repo, "tag", "needs-human-land/272", "HEAD~1")  # pre-existing, at the parent
+    _make_pytest_stub(tmp_path / "bin", "git tag -f needs-human-land/272 HEAD")  # move it forward
+
+    proc = _run_node(repo, tmp_path / "bin")
+
+    assert "VERDICT=BREACH" in proc.stdout, proc.stderr  # a move is not a tolerated creation
+    assert "needs-human-land/272" in proc.stderr  # the moved marker is named
