@@ -1960,3 +1960,103 @@ def test_gh_seed_marker_only_persists_on_success_and_self_heals(tmp_path: Path) 
     assert marker.exists(), "a fully-successful seed must stamp the marker"
     seeded = {c.split()[2] for c in calls2 if c.startswith("label create")}
     assert "status:gate" in seeded, "the second run must re-seed — the failed run left no marker"
+
+
+# --- wt_gate_green_stamped_fresh: freshness-bounded green-stamp check (issue #270) --
+# A freshness-bounded variant of wt_gate_green_stamped (existence-only) that a
+# tree-identical fast-forward land consults to reuse a RECENT green proof instead of
+# re-running the gate. Existence + HEAD^{tree} identity (as the base helper) PLUS the
+# stamp mtime younger than the max-age bound. Fail-CLOSED on absence / staleness /
+# unborn HEAD.
+
+_LIB_GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+
+
+def _repo_with_stamp(tmp_path: Path, *, stamp_age_seconds: int | None) -> Path:
+    """A git repo with one commit; a green stamp for HEAD^{tree} aged `stamp_age_seconds`.
+
+    `stamp_age_seconds=None` writes no stamp at all (the missing case). `0` writes a
+    fresh stamp (mtime now); a positive value back-dates the stamp mtime that many
+    seconds (the stale case).
+    """
+    repo = tmp_path / "repo"
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(repo)],
+        check=True,
+        capture_output=True,
+        env=_LIB_GIT_ENV,
+    )
+    for k, v in (("user.email", "t@t.t"), ("user.name", "t"), ("commit.gpgsign", "false")):
+        subprocess.run(
+            ["git", "config", k, v],
+            cwd=str(repo),
+            check=True,
+            capture_output=True,
+            env=_LIB_GIT_ENV,
+        )
+    (repo / "README.md").write_text("seed\n")
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+        env=_LIB_GIT_ENV,
+    )
+    subprocess.run(
+        ["git", "commit", "-qm", "chore: seed"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+        env=_LIB_GIT_ENV,
+    )
+    if stamp_age_seconds is not None:
+        tree = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"],
+            cwd=str(repo),
+            check=True,
+            capture_output=True,
+            text=True,
+            env=_LIB_GIT_ENV,
+        ).stdout.strip()
+        stamps = repo / ".git" / ".gate-stamps"
+        stamps.mkdir(parents=True, exist_ok=True)
+        stamp = stamps / tree
+        stamp.write_text("tier=selected-set\nenv=test\n")
+        if stamp_age_seconds:
+            when = time.time() - stamp_age_seconds
+            os.utime(stamp, (when, when))
+    return repo
+
+
+def _call_fresh(repo: Path, max_age: int) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "-c", f'. "{WT_LIB}"; wt_gate_green_stamped_fresh {max_age}'],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env=_LIB_GIT_ENV,
+    )
+
+
+def test_gate_green_stamped_fresh_accepts_a_recent_stamp(tmp_path: Path) -> None:
+    repo = _repo_with_stamp(tmp_path, stamp_age_seconds=0)  # minted just now
+
+    result = _call_fresh(repo, 86400)
+
+    assert result.returncode == 0, result.stderr  # within the bound → reuse the proof
+
+
+def test_gate_green_stamped_fresh_rejects_a_stale_stamp(tmp_path: Path) -> None:
+    repo = _repo_with_stamp(tmp_path, stamp_age_seconds=100000)  # older than 24h
+
+    result = _call_fresh(repo, 86400)
+
+    assert result.returncode != 0  # too old → fail closed, the land re-runs the gate
+
+
+def test_gate_green_stamped_fresh_rejects_a_missing_stamp(tmp_path: Path) -> None:
+    repo = _repo_with_stamp(tmp_path, stamp_age_seconds=None)  # no stamp at all
+
+    result = _call_fresh(repo, 86400)
+
+    assert result.returncode != 0  # no proof → fail closed

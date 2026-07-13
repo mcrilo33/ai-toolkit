@@ -657,6 +657,82 @@ def test_diverged_merge_still_runs_gate(hub: Path, tmp_path: Path) -> None:
     assert "TEST_SELECT_SKIP" not in _log_text(env_log)
 
 
+# --- reuse a fresh green stamp on a tree-identical (FF) non-numbered land (issue #270) -
+# A /quick express land uses a non-numbered `quick/` branch that carries NO ready
+# marker, so GATED_TREE is empty and the #96 clean-FF auto-skip never fires — the
+# identical FF tree re-runs the whole gate. When the merged HEAD^{tree} already has a
+# RECENT green stamp (the spoke's push minted it moments ago on the shared common
+# dir), the land reuses it: threads TEST_SELECT_SKIP=1 with a DISTINCT #270 witness.
+# A stale stamp or a diverged merge (new combined tree) still runs the gate.
+
+
+def _write_green_stamp(hub: Path, tree: str, *, age_seconds: int = 0) -> Path:
+    """Write a green-tree stamp for `tree` under <git-common-dir>/.gate-stamps/.
+
+    `age_seconds` back-dates the stamp mtime (0 = fresh/now) so a test can model a
+    just-minted proof vs one older than the land's freshness bound.
+    """
+    common = Path(_git(hub, "rev-parse", "--git-common-dir").strip())
+    if not common.is_absolute():
+        common = hub / common
+    stamps = common / ".gate-stamps"
+    stamps.mkdir(parents=True, exist_ok=True)
+    stamp = stamps / tree
+    stamp.write_text("tier=selected-set\nenv=test\n")
+    if age_seconds:
+        when = time.time() - age_seconds
+        os.utime(stamp, (when, when))
+    return stamp
+
+
+def test_nonnumbered_ff_land_with_fresh_stamp_skips_gate(hub: Path, tmp_path: Path) -> None:
+    _make_spoke(hub, tmp_path, "quick/dedup", push=True)  # non-numbered, no marker
+    # A clean FF lands the branch tip tree unchanged; stamp THAT tree, freshly.
+    tree = _git(hub, "rev-parse", "quick/dedup^{tree}").strip()
+    _write_green_stamp(hub, tree)
+    env_log = tmp_path / "prepush-env.log"
+    _install_prepush_stub(hub, exit_code=0, env_log=env_log)
+
+    proc, _ = _run_land(hub, tmp_path, "dedup")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "TEST_SELECT_SKIP=1" in _log_text(env_log)  # fresh stamp → gate skipped
+    assert "green-tree stamp reused" in proc.stdout  # the distinct #270 witness ...
+    assert "issue #270" in proc.stdout  # ... in SUITE_RESULT, not a normal gated land
+
+
+def test_nonnumbered_ff_land_with_stale_stamp_runs_gate(hub: Path, tmp_path: Path) -> None:
+    _make_spoke(hub, tmp_path, "quick/stale", push=True)
+    tree = _git(hub, "rev-parse", "quick/stale^{tree}").strip()
+    _write_green_stamp(hub, tree, age_seconds=100000)  # older than the 24h bound
+    env_log = tmp_path / "prepush-env.log"
+    _install_prepush_stub(hub, exit_code=0, env_log=env_log)
+
+    proc, _ = _run_land(hub, tmp_path, "stale")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "TEST_SELECT_SKIP" not in _log_text(env_log)  # stale → gate still runs
+
+
+def test_nonnumbered_diverged_land_with_stamp_runs_gate(hub: Path, tmp_path: Path) -> None:
+    _make_spoke(hub, tmp_path, "quick/div", push=True)
+    # main moves on → the land builds a NEW merge commit (not a fast-forward), whose
+    # combined tree was never proven; even a fresh stamp for the branch tip tree must
+    # not license a skip.
+    (hub / "hub-only.txt").write_text("hub moved on\n")
+    _git(hub, "add", "hub-only.txt")
+    _git(hub, "commit", "-qm", "chore: hub work", "-m", "Refs #0")
+    tree = _git(hub, "rev-parse", "quick/div^{tree}").strip()
+    _write_green_stamp(hub, tree)  # fresh, but for the pre-merge branch tree
+    env_log = tmp_path / "prepush-env.log"
+    _install_prepush_stub(hub, exit_code=0, env_log=env_log)
+
+    proc, _ = _run_land(hub, tmp_path, "div")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "TEST_SELECT_SKIP" not in _log_text(env_log)  # diverged → no FF skip
+
+
 # --- a required gate with no executable pre-push hook aborts the land (issue #196) -
 # The pre-push hook is the single test gate (issue #19). If a gate is REQUIRED (not a
 # --skip-tests / auto-skip land) and no executable hook is installed, the push runs

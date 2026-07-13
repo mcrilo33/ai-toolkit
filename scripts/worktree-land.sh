@@ -308,9 +308,29 @@ land_reset_keep_or_die() {
 # unit, so its gate must still run. Explicit --skip-tests / --test-cmd already own
 # the gate decision; LAND_FORCE_GATE=1 is the escape hatch to force it back on.
 AUTO_SKIP=""
-if [ -z "$SKIP_TESTS" ] && [ -z "$TEST_CMD" ] && [ -z "${LAND_FORCE_GATE:-}" ] \
-   && [ -n "$GATED_TREE" ] && [ "$MERGED_SHA" = "$(git rev-parse "refs/heads/$WT_BRANCH")" ]; then
-  AUTO_SKIP=1
+AUTO_SKIP_STAMP=""   # distinct witness for the marker-less #270 stamp-reuse skip
+if [ -z "$SKIP_TESTS" ] && [ -z "$TEST_CMD" ] && [ -z "${LAND_FORCE_GATE:-}" ]; then
+  IS_CLEAN_FF=""
+  if [ "$MERGED_SHA" = "$(git rev-parse "refs/heads/$WT_BRANCH")" ]; then
+    IS_CLEAN_FF=1
+  fi
+  if [ -n "$GATED_TREE" ] && [ -n "$IS_CLEAN_FF" ]; then
+    # #96: marker == tip == upstream proved the spoke gated exactly this tree.
+    AUTO_SKIP=1
+  elif [ -z "$LOCAL" ] && [ -z "$FORCE_LAND" ] && [ -z "$GATED_TREE" ] && [ -n "$IS_CLEAN_FF" ] \
+       && wt_gate_green_stamped_fresh "${LAND_STAMP_MAX_AGE:-86400}"; then
+    # #270: a non-numbered (/quick) FF land carries no ready marker, so GATED_TREE is
+    # empty and #96 can't fire — but the merged HEAD^{tree} already has a RECENT green
+    # stamp (the spoke's push minted it on the shared common dir moments ago). The
+    # merged tree is byte-identical to what was just proven green, so reuse the proof
+    # instead of re-running the whole gate. Existence-only + a freshness bound is the
+    # same bounded trust #96 extends on a clean FF (see wt_gate_green_stamped_fresh).
+    # --force-land / --local lands are excluded: they deliberately keep running the
+    # gate. A diverged merge (IS_CLEAN_FF empty) builds a new combined tree with no
+    # stamp and is untouched. LAND_STAMP_MAX_AGE (default 24h) tunes the bound.
+    AUTO_SKIP=1
+    AUTO_SKIP_STAMP=1
+  fi
 fi
 
 # --- merge-sanity on a diverged --skip-tests land (issue #174) --------------------
@@ -452,7 +472,11 @@ if [ -n "$SKIP_TESTS" ]; then
     SUITE_RESULT="skipped (--skip-tests)"
   fi
 elif [ -n "$AUTO_SKIP" ]; then
-  SUITE_RESULT="skipped (clean fast-forward of an already-gated tree, issue #96)"
+  if [ -n "$AUTO_SKIP_STAMP" ]; then
+    SUITE_RESULT="skipped (clean fast-forward; fresh green-tree stamp reused, issue #270)"
+  else
+    SUITE_RESULT="skipped (clean fast-forward of an already-gated tree, issue #96)"
+  fi
 elif [ -n "$TEST_CMD" ]; then
   SUITE_RESULT="via pre-push hook (--test-cmd: $TEST_CMD)"
 else

@@ -131,6 +131,58 @@ def _make_python_module_stub(bindir: Path, runlog: Path, *, testmon: bool) -> No
     (bindir / "python3").chmod(0o755)
 
 
+def _make_testmon_modeling_stub(bindir: Path, runlog: Path, *, impact: list[str]) -> None:
+    """Install a `pytest` stub that MODELS testmon selection + `--ignore` + exit 5.
+
+    The plain `_make_pytest_stub` only echoes its argv, so it cannot observe the
+    SELECTED-mixed double-run (issue #270): testmon re-running a mapped mirror test
+    the explicit leg already ran. This stub does model it.
+
+    For every invocation it logs one `RAN:<file>` line per test FILE it actually
+    executes, so a test can count executions (never confused with a file name that
+    merely appears inside a `--ignore=` flag):
+
+    - a plain (non-`--testmon`) call runs each positional test-file arg (a
+      `path::node` node-id is counted at its file);
+    - a `--testmon` call runs `impact` MINUS any `--ignore=<file>`'d files — and
+      when that leaves nothing, it exits 5 ("no tests collected"), exactly as real
+      pytest does when `--ignore` covers testmon's whole impact set.
+    """
+    bindir.mkdir(parents=True, exist_ok=True)
+    impact_words = " ".join(impact)
+    (bindir / "pytest").write_text(
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        '  --help|-h) echo "usage: pytest"; echo "  --testmon"; exit 0 ;;\n'
+        f'  --version) echo "{STUB_ENV_FINGERPRINT}"; exit 0 ;;\n'
+        "esac\n"
+        f'printf "RUN %s\\n" "$*" >> "{runlog}"\n'
+        "testmon=0\n"
+        'ignored=" "\n'
+        'for a in "$@"; do\n'
+        '  case "$a" in\n'
+        "    --testmon) testmon=1 ;;\n"
+        '    --ignore=*) ignored="$ignored${a#--ignore=} " ;;\n'
+        "    -*) : ;;\n"
+        '    *) f="${a%%::*}"; printf "RAN:%s\\n" "$f" >> "'
+        f'{runlog}" ;;\n'
+        "  esac\n"
+        "done\n"
+        'if [ "$testmon" = "1" ]; then\n'
+        "  ran=0\n"
+        f"  for f in {impact_words}; do\n"
+        '    case "$ignored" in\n'
+        '      *" $f "*) : ;;\n'
+        f'      *) printf "RAN:%s\\n" "$f" >> "{runlog}"; ran=1 ;;\n'
+        "    esac\n"
+        "  done\n"
+        '  [ "$ran" = "1" ] || exit 5\n'  # no tests collected after --ignore
+        "fi\n"
+        "exit 0\n"
+    )
+    (bindir / "pytest").chmod(0o755)
+
+
 def _run_select(
     repo: Path, stdin: str, bindir: Path, *, env_extra: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
@@ -929,8 +981,42 @@ def test_mixed_py_and_mapped_shell_runs_mapped_plus_testmon(repo: Path, tmp_path
     assert proc.returncode == 0, proc.stderr
     log = _runlog(runlog)
     assert "RUN tests/unit/test_do.py\n" in log  # the mapped set …
-    assert "RUN --testmon\n" in log  # … plus testmon for the python part
+    # ... plus testmon for the python part, with the mapped file --ignore'd so
+    # testmon cannot re-run what the explicit leg already ran (issue #270).
+    assert "RUN --testmon --ignore=tests/unit/test_do.py\n" in log
     assert "RUN \n" not in log
+
+
+def test_mixed_mirror_test_runs_exactly_once(repo: Path, tmp_path: Path) -> None:
+    # The common tooling shape (issue #270): a diff editing a mapped *.sh and its
+    # mirror *.py together. The explicit leg runs the mirror test file, and testmon
+    # — seeing the changed .py — would re-run the SAME file, so the ~292-test suite
+    # runs twice. The fix --ignore's the mapped files from the testmon leg, so the
+    # mirror executes EXACTLY once. When the mirror IS testmon's whole impact set,
+    # the ignored testmon leg collects nothing (exit 5) — a green outcome the gate
+    # must not propagate as a failure.
+    _write_ref_test(repo, "tests/unit/test_gate_broker.py", "gate-broker.sh")
+    _write_meta_stub(repo)
+    base = _commit(repo, {}, "test: seed referencing tests")
+    tip = _commit(
+        repo,
+        {
+            "shared/skills/hub/scripts/gate-broker.sh": "echo hi\n",
+            # the mirror .py changes too, but still references the script's basename
+            "tests/unit/test_gate_broker.py": '"""Covers gate-broker.sh behavior. edited."""\n',
+        },
+    )
+    runlog = tmp_path / "run.log"
+    _make_testmon_modeling_stub(tmp_path / "bin", runlog, impact=["tests/unit/test_gate_broker.py"])
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr  # empty testmon leg (exit 5) is green
+    log = _runlog(runlog)
+    # the core acceptance: the mirror test file executes exactly once, not twice
+    assert log.count("RAN:tests/unit/test_gate_broker.py\n") == 1
+    # coverage unchanged: the enforcement meta-test still runs (once, explicit leg)
+    assert "RAN:tests/unit/test_test_reverse_index.py\n" in log
 
 
 def test_unmapped_shell_change_escalates_to_full(repo: Path, tmp_path: Path) -> None:
