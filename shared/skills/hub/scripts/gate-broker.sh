@@ -2240,12 +2240,14 @@ _judge_cache_dir() { printf '%s\n' "$(_afk_state_dir)/judge-cache"; }
 # when shasum is unavailable, which disables caching (every call runs the judge) but is harmless.
 _judge_cache_key() { printf '%s' "$1" | shasum -a 256 2>/dev/null | awk '{print $1}'; }
 
-# _judge_timeout -> the judge wall-clock budget in seconds (AFK_JUDGE_TIMEOUT, default 2). A
+# _judge_timeout -> the judge wall-clock budget in seconds (AFK_JUDGE_TIMEOUT, default 120).
+# The default must accommodate a full headless claude -p round trip: CLI cold start alone
+# exceeds the old 2s bound, which fail-closed EVERY tier-3 decision on this host (#268). A
 # non-numeric or non-positive override falls back to the default so the bound is never lifted.
 _judge_timeout() {
-  local s="${AFK_JUDGE_TIMEOUT:-2}"
-  case "$s" in '' | *[!0-9]*) s=2 ;; esac
-  [ "$s" -lt 1 ] && s=2
+  local s="${AFK_JUDGE_TIMEOUT:-120}"
+  case "$s" in '' | *[!0-9]*) s=120 ;; esac
+  [ "$s" -lt 1 ] && s=120
   printf '%s\n' "$s"
 }
 
@@ -2279,10 +2281,12 @@ EOF
 }
 
 # judge_permission <cmd> [issue] -> "SAFE" or "DANGEROUS<TAB><reason>". Cache-first; otherwise
-# run the toolless headless judge, bounded and fail-closed, and cache the verdict. Always rc 0
-# (the verdict is on stdout, like classify_permission / classify_danger).
+# run the toolless headless judge, bounded and fail-closed. Only a PARSED verdict (VERDICT:
+# safe|dangerous) is cached: an unavailable or unparseable judge fails closed for THIS decision
+# but is never cached, so a transient failure cannot poison the command for the whole window
+# (#268). Always rc 0 (the verdict is on stdout, like classify_permission / classify_danger).
 judge_permission() {
-  local cmd="$1" key cache f raw rc verdict secs jcmd prompt pf tag
+  local cmd="$1" key cache f raw rc verdict secs jcmd prompt pf tag cacheable=0
   key="$(_judge_cache_key "$cmd")"
   cache="$(_judge_cache_dir)"; f="$cache/$key"
   if [ -n "$key" ] && [ -f "$f" ]; then cat "$f" 2>/dev/null; return 0; fi
@@ -2303,12 +2307,12 @@ judge_permission() {
     tag="$(printf '%s' "$raw" | grep -ioE 'VERDICT:[[:space:]]*(safe|dangerous)' | tail -1 \
       | grep -ioE 'safe|dangerous' | tr '[:upper:]' '[:lower:]')"
     case "$tag" in
-      safe) verdict="SAFE" ;;
-      dangerous) verdict="$(printf 'DANGEROUS\tjudge verdict: dangerous')" ;;
+      safe) verdict="SAFE"; cacheable=1 ;;
+      dangerous) verdict="$(printf 'DANGEROUS\tjudge verdict: dangerous')"; cacheable=1 ;;
       *) verdict="$(printf 'DANGEROUS\tjudge verdict unparseable -- fail-closed')" ;;
     esac
   fi
-  if [ -n "$key" ]; then
+  if [ -n "$key" ] && [ "$cacheable" -eq 1 ]; then
     mkdir -p "$cache" 2>/dev/null || true
     printf '%s\n' "$verdict" > "$f" 2>/dev/null || true
   fi
