@@ -329,6 +329,9 @@ _wd_clear_landed_landmarks() {
     _wd_issue_open "$issue" && continue          # still open ⇒ a human still owes the land
     git -C "$repo" tag -d "$tag" >/dev/null 2>&1 || true
     git -C "$repo" push origin ":refs/tags/$tag" >/dev/null 2>&1 || true
+    # The landed issue is gone from the in-flight loop, so the dispatcher's else-clear never runs
+    # for it — clear its condition-4 firing marker here so the autonomy score re-arms (#263).
+    _wd_clear_fired auto-land-skipped "$issue"
     _wd_log "cleared resolved landmark $tag (issue #$issue closed/landed)"
   done < <(git -C "$repo" tag -l 'needs-human-land/*' 2>/dev/null)
 }
@@ -386,6 +389,19 @@ _wd_filed_marker() {
   if command -v _afk_state_dir >/dev/null 2>&1; then dir="$(_afk_state_dir)"; else dir="$(_wd_common_dir)"; fi
   printf '%s\n' "$dir/wd-filed-$1-$2"
 }
+
+# _wd_fired_marker <condition> <issue> -> the per-run FIRING-dedup marker. NOTE: distinct from
+# _wd_filed_marker above (near-homonym) — that one dedups the defect FILING (`wd-filed-`), this
+# one dedups the ledger FIRING (`wd-fired-`). One firing per condition+issue while unresolved:
+# _wd_fire skips the ledger append when this exists, so a persistent condition (or an in-flight
+# land racing condition 4) logs ONE intervention, not one per tick — the #251 autonomy score is
+# not double-penalized (#263). Co-located with the ledger so it inherits the ledger's dir + test
+# isolation (HUB_WATCHDOG_LEDGER points at tmp); cleared when the condition resolves.
+_wd_fired_marker() {
+  local dir; dir="$(dirname "$(_wd_ledger_file)")"
+  printf '%s\n' "$dir/wd-fired-$1-$2"
+}
+_wd_clear_fired() { rm -f "$(_wd_fired_marker "$1" "$2")" 2>/dev/null || true; }
 
 # _wd_seed_afk_defect_label -> create the afk-defect label once per run (a marker dedups). A red
 # defect color matching the repo's `bug` convention; best-effort. HUB_WATCHDOG_LABEL_CMD overrides.
@@ -455,7 +471,9 @@ ONE afk-defect issue (label $HUB_WATCHDOG_AFK_DEFECT_LABEL). Dedup against open 
 # it via the headless bug-scoper (deduped). Every firing is a bug report against afk; subtask 5's
 # autonomy score counts these lines. Best-effort.
 _wd_fire() {
-  local condition="$1" issue="$2" reason="$3" lf klass
+  local condition="$1" issue="$2" reason="$3" lf klass marker
+  marker="$(_wd_fired_marker "$condition" "$issue")"
+  [ -f "$marker" ] && return 0   # already fired this unresolved occurrence — dedupe ledger + file
   klass="$(_wd_classify "$condition" "$issue")"
   case "$klass" in afk-defect | novel-decision) ;; *) klass="afk-defect" ;; esac
   lf="$(_wd_ledger_file)"
@@ -465,6 +483,7 @@ _wd_fire() {
     "$(_wd_json_escape "$klass")" "$(_wd_json_escape "$reason")" >> "$lf" 2>/dev/null || true
   _wd_log "FIRING [$condition] #${issue} (${klass}) — ${reason}"
   [ "$klass" = "afk-defect" ] && _wd_file_defect "$condition" "$issue" "$reason"
+  mkdir -p "$(dirname "$marker")" 2>/dev/null || true; : > "$marker" 2>/dev/null || true
   return 0
 }
 
@@ -479,6 +498,8 @@ _wd_run_conditions() {
   if [ "$state" = "stale" ]; then
     _wd_fire supervisor-dead "-" "drain supervisor heartbeat is stale — the drain crashed"
     _wd_intervene_rearm
+  else
+    _wd_clear_fired supervisor-dead "-"   # drain recovered → re-arm the firing for a future crash
   fi
   # Self-clear any needs-human-land/<issue> whose issue has since landed/closed (#263). Runs
   # BEFORE the in-flight loop: a landed issue's worktree is already gone, so its dangling
@@ -487,21 +508,31 @@ _wd_run_conditions() {
   command -v inflight_worktrees >/dev/null 2>&1 || return 0
   while IFS=$'\t' read -r wt issue; do
     [ -n "$issue" ] || continue
+    # Each detector: fire (deduped by _wd_fire's marker) + intervene when it trips; else clear the
+    # firing marker so a genuinely resolved-then-recurring condition re-fires (#263).
     if _wd_detect_park_unanswered "$wt" "$issue" "$now"; then
       _wd_fire park-unanswered "$issue" "drain left a parked spoke unanswered > ${HUB_WATCHDOG_PARK_CEILING}s"
       _wd_intervene_answer "$wt" "$issue"
+    else
+      _wd_clear_fired park-unanswered "$issue"
     fi
     if _wd_detect_dead_idle "$wt" "$issue" "$now"; then
       _wd_fire dead-pane "$issue" "reaper missed a dead/idle pane (> ${HUB_WATCHDOG_IDLE_CEILING}s)"
       _wd_intervene_revive "$wt" "$issue"
+    else
+      _wd_clear_fired dead-pane "$issue"
     fi
     if _wd_detect_stale_marker "$wt" "$issue"; then
       _wd_fire stale-marker "$issue" "stale blocked/ marker the drain did not reconcile"
       _wd_intervene_reconcile "$wt" "$issue"
+    else
+      _wd_clear_fired stale-marker "$issue"
     fi
     if _wd_detect_mergeable_skipped "$wt" "$issue" "$now"; then
       _wd_fire auto-land-skipped "$issue" "mergeable branch un-landed > ${HUB_WATCHDOG_LAND_CEILING}s (escalate-only: human land)"
       _wd_intervene_landmark "$wt" "$issue"
+    else
+      _wd_clear_fired auto-land-skipped "$issue"
     fi
   done < <(inflight_worktrees)
 }
