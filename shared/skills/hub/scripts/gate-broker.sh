@@ -232,6 +232,11 @@ _broker_park_signature() {
   local wt="$1" issue="$2" basis=""
   if _permission_pending "$wt"; then
     basis="perm:$(extract_pending_command "$wt")"
+    # A shown dialog whose gated command is unflushed (empty) still parks (#269). Give it a
+    # STABLE non-empty signature so the re-answer ceiling can BOUND the per-tick declines
+    # (keyed on (tip, sig), it backs off after AFK_REANSWER_CEILING) instead of fail-opening
+    # to a re-decline every tick on an empty signature (#269 review).
+    [ "$basis" = "perm:" ] && basis="perm:unreadable"
   elif _gate_parked "$wt" "$issue"; then
     basis="gate:$(_read_gate_artifact "$wt" "$issue")"
     [ "$basis" = "gate:" ] && basis="gate:$(extract_pending_question "$wt")"
@@ -1980,9 +1985,17 @@ classify_permission() {
 # orchestrator routes the command to the judge.
 #
 # CATEGORIES (the boundary the existing scope-guards do NOT already cover):
-#   - privilege escalation / disk destroyers: sudo/doas/su, dd, mkfs*, fdisk, parted, shred
+#   - privilege escalation / disk destroyers / ownership: sudo/doas/su, dd, mkfs*, fdisk,
+#     parted, shred, chown/chgrp
+#   - arbitrary exec / classifier-evasion (#269): eval, a shell `-c` inline command, a bare
+#     shell verb (pipe-to-shell target), xargs spawning a shell
 #   - network egress off-allowlist: curl/wget to a non-allowlisted host; raw sockets
-#     (nc/ncat/netcat/telnet/ssh/scp/sftp/ftp) denied outright
+#     (nc/ncat/netcat/telnet/ssh/scp/sftp/ftp) denied outright; a curl/wget WRITE-METHOD flag
+#     (-d/--data*, -F/--form, -T/--upload-file, -X POST|PUT|PATCH|DELETE) even to an allowed host
+#   - supply-chain publish (#269): npm/yarn/pnpm/poetry publish, twine upload, gem push,
+#     cargo publish, docker/podman push
+#   - repo/collaboration mutation (#269): mutating gh subcommands (pr create|merge|close|...,
+#     repo delete|create|..., release create|...) -- read/comment/issue subcommands stay open
 #   - keychain / credential reads: `security`, or a read of a secret-like path
 #   - out-of-tree writes: a mutating verb (mv/cp/rm/mkdir/chmod) not confined to the worktree,
 #     or a `>`/`>>` redirection whose target escapes it
@@ -2055,11 +2068,14 @@ PYEOF
 }
 
 # _danger_network_seg <segment> -> print a reason and rc 0 when the segment is off-allowlist
-# network egress, else rc 1. Raw-socket tools are denied outright; curl/wget URL hosts are parsed
-# (python3) and denied unless every host is allowlisted. Only `://`-scheme tokens are read as
-# hosts (a header/upload flag value is never mistaken for a host, so a legit upload to an allowed
-# host is not falsely blocked -- #261 review); a curl/wget carrying NO scheme URL fails CLOSED
-# (deny), as does an absent python3 -- an unverifiable egress does not run.
+# network egress OR a write-method egress (possible exfil), else rc 1. Raw-socket tools are denied
+# outright; curl/wget URL hosts are parsed (python3) and denied unless every host is allowlisted.
+# Only `://`-scheme tokens are read as hosts (so a bare hostless arg is never mistaken for a host);
+# a curl/wget carrying NO scheme URL fails CLOSED (deny), as does an absent python3 -- an
+# unverifiable egress does not run. #269: a WRITE-METHOD flag (-d/--data*, -F/--form,
+# -T/--upload-file, -X/--request with POST|PUT|PATCH|DELETE) is denied even to an allowlisted host
+# -- a POST body / upload can exfil to a gist or the API. Download flags -o/-O (write the RESPONSE
+# to a file) stay benign, so a legit `curl ... -o out.json` GET read is not blocked.
 _danger_network_seg() {
   local seg="$1" verb host_check
   verb="${seg%%[[:space:]]*}"
@@ -2086,9 +2102,46 @@ try:
 except Exception:
     print("DENY unparseable"); sys.exit(0)
 
+# A WRITE-METHOD flag makes this an upload/POST egress (possible exfil) regardless of host --
+# deny it even to an allowlisted host (#269). -o/-O write the RESPONSE to a file, not an upload,
+# so they stay benign. Short upload flags (-d/-F/-T) and their GLUED forms (-d@f, -XPOST) are
+# CURL-only: in wget -d/-F/-T mean --debug/--force-html/--timeout, so applying curl semantics to
+# wget false-denied benign reads (#269 review WARNING). wget write-methods are the long forms
+# (--post-data/--post-file/--body-data/--body-file/--method=), handled for both below.
+mutating = {"POST", "PUT", "PATCH", "DELETE"}
+verb = os.path.basename(toks[0]) if toks else ""
+is_curl = verb == "curl"
+
+def method_ok(m):
+    return m.upper() in mutating
+
+i = 1
+while i < len(toks):
+    t = toks[i]
+    # Long-form request bodies / methods -- curl AND wget.
+    if t.startswith("--data") or t.startswith("--form") or t == "--upload-file" \
+            or t.startswith("--post-data") or t.startswith("--post-file") \
+            or t.startswith("--body-data") or t.startswith("--body-file"):
+        print("DENYWRITE " + t); sys.exit(0)
+    if (t.startswith("--request=") or t.startswith("--method=")) and method_ok(t.split("=", 1)[1]):
+        print("DENYWRITE " + t); sys.exit(0)
+    if t in ("--request", "--method") and i + 1 < len(toks) and method_ok(toks[i + 1]):
+        print("DENYWRITE " + t + " " + toks[i + 1]); sys.exit(0)
+    if is_curl:
+        # curl short upload flags, spaced or glued (-d @f / -d@f / -Ffile=@f / -Tfile). startswith
+        # subsumes the bare exact flag (-d / -F / -T).
+        if t.startswith("-d") or t.startswith("-F") or t.startswith("-T"):
+            print("DENYWRITE " + t); sys.exit(0)
+        # -X METHOD (spaced) or -XMETHOD (glued).
+        if t == "-X" and i + 1 < len(toks) and method_ok(toks[i + 1]):
+            print("DENYWRITE -X " + toks[i + 1]); sys.exit(0)
+        if len(t) > 2 and t.startswith("-X") and method_ok(t[2:]):
+            print("DENYWRITE " + t); sys.exit(0)
+    i += 1
+
 # Only a scheme URL (contains ://) whose urlparse yields a hostname counts as an egress host.
-# A header value, a -d/-F payload, or a bare hostless arg is never a host -> no false deny, and a
-# curl with no scheme URL yields no host -> fail-closed DENY below.
+# A header value or a bare hostless arg is never a host -> no false deny, and a curl with no
+# scheme URL yields no host -> fail-closed DENY below.
 hosts = []
 for t in toks[1:]:
     if "://" in t:
@@ -2104,6 +2157,7 @@ PYEOF
 )"
   case "$host_check" in
     OK) return 1 ;;
+    'DENYWRITE '*) printf 'network write-method egress (possible exfil): %s' "${host_check#DENYWRITE }"; return 0 ;;
     'DENY '*) printf 'network egress to a non-allowlisted host: %s' "${host_check#DENY }"; return 0 ;;
     *) printf 'network egress unverifiable: %s' "$verb"; return 0 ;;
   esac
@@ -2159,13 +2213,123 @@ _danger_write_seg() {
   return 1
 }
 
-# _danger_privilege_seg <segment> -> print a reason and rc 0 for a privilege-escalation or
-# disk-destroying verb, else rc 1.
+# _danger_privilege_seg <segment> -> print a reason and rc 0 for a privilege-escalation,
+# disk-destroying, or ownership-mutation verb, else rc 1. chown/chgrp fold in here (deny
+# outright, unlike the in-tree-allowed chmod owned by _danger_write_seg): a worktree-confined
+# spoke has no legit ownership-mutation use, so a target check would only add surface (#269).
 _danger_privilege_seg() {
   local verb; verb="${1%%[[:space:]]*}"
   case "$verb" in
     sudo | doas | su | dd | fdisk | parted | shred | mkfs | mkfs.*)
       printf 'privileged / destructive command (%s) is denied' "$verb"; return 0 ;;
+    chown | chgrp)
+      printf 'ownership mutation (%s) is denied under bypass' "$verb"; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _danger_publish_seg <segment> -> print a reason and rc 0 for a supply-chain PUBLISH (an
+# outward package/image release a worktree-confined spoke never performs), else rc 1. A
+# two-token verb+subcommand match (npm/yarn/pnpm/poetry publish, twine upload, gem push,
+# cargo publish, docker/podman push); a bare `npm install` or `docker build` is untouched.
+_danger_publish_seg() {
+  local seg="$1" verb sub
+  verb="${seg%%[[:space:]]*}"
+  sub="${seg#"$verb"}"; sub="${sub#"${sub%%[![:space:]]*}"}"; sub="${sub%%[[:space:]]*}"
+  case "$verb $sub" in
+    'npm publish' | 'yarn publish' | 'pnpm publish' | 'poetry publish' | \
+    'twine upload' | 'gem push' | 'cargo publish' | 'docker push' | 'podman push')
+      printf 'supply-chain publish (%s %s) is denied under bypass' "$verb" "$sub"; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _danger_eval_seg <segment> -> print a reason and rc 0 for arbitrary-exec / classifier-evasion
+# shapes, else rc 1. `eval` runs an unsplit string (`eval "$(curl ...)"` is never operator-split
+# or host-checked); a shell verb carrying `-c` (inline command) or `-s` (script on stdin) runs
+# arbitrary code; a BARE shell verb (no non-flag argument) is a pipe-to-shell target reading stdin
+# (`curl ... | bash`, whose halves are separate segments); and `xargs` whose COMMAND WORD is a
+# shell (`xargs sh -c ...`) launders exec through the argv. Benign `bash -n file` / `bash
+# script.sh` (a non-flag arg, no -c/-s), `bash --version` (info probe), and `find | xargs grep
+# bash` (the command word is grep, NOT the shell-named ARGUMENT) all still pass -- the xargs scan
+# checks only the exec'd command word, skipping xargs's own value-taking options (#269 review
+# BLOCKER). UPGRADE: a combined short-flag cluster (`bash -lc`, `sh -sc`) is not split here -- it
+# routes to the fail-closed judge; add flag-cluster parsing if the journal shows it exploited.
+_danger_eval_seg() {
+  local seg="$1" verb rest tok has_arg=0 skip=0 cmdword=""
+  verb="${seg%%[[:space:]]*}"
+  case "$verb" in
+    eval) printf 'eval runs an uninspected command string -- denied under bypass'; return 0 ;;
+    sh | bash | zsh | dash | ksh)
+      rest="${seg#"$verb"}"
+      while [ -n "$rest" ]; do
+        rest="${rest#"${rest%%[![:space:]]*}"}"
+        [ -n "$rest" ] || break
+        tok="${rest%%[[:space:]]*}"
+        rest="${rest#"$tok"}"
+        case "$tok" in
+          -c | -s)
+            printf 'inline/stdin shell command (%s %s ...) is denied under bypass' "$verb" "$tok"; return 0 ;;
+          --version | --help | -V) return 1 ;;  # an info probe, not an exec -- benign
+          -*) continue ;;
+          *) has_arg=1 ;;
+        esac
+      done
+      if [ "$has_arg" -eq 0 ]; then
+        printf 'pipe-to-shell / bare interactive shell (%s) is denied under bypass' "$verb"; return 0
+      fi
+      return 1 ;;
+    xargs)
+      # The command xargs execs is its FIRST non-option token -- match ONLY that against the shell
+      # set, skipping xargs's own value-taking options (a separate-word value like `-I {}` / `-n 1`
+      # / `-P 4` / GNU `--max-procs 4`). Scanning every token falsely denied `xargs grep bash` (#269
+      # review BLOCKER). REQUIRED-arg GNU long options are skipped in their SPACED form too (#269
+      # review). UPGRADE: an OPTIONAL-arg option (GNU `--max-lines`/`--replace`/`-e`/`--eof`, whose
+      # value is `=`-glued only) in a bogus spaced form, or an unknown long option, is left to the
+      # fail-closed tier-3 judge rather than risk a mis-skip that OPENS a shell-launder.
+      rest="${seg#"$verb"}"
+      while [ -n "$rest" ]; do
+        rest="${rest#"${rest%%[![:space:]]*}"}"
+        [ -n "$rest" ] || break
+        tok="${rest%%[[:space:]]*}"
+        rest="${rest#"$tok"}"
+        if [ "$skip" -eq 1 ]; then skip=0; continue; fi
+        case "$tok" in
+          -I | -J | -L | -n | -P | -R | -S | -s | -E | -a | -d | \
+          --max-args | --max-procs | --max-chars | --delimiter | --arg-file | --process-slot-var)
+            skip=1; continue ;;                       # an option taking a separate-word value
+          --*=* | -*) continue ;;                     # glued-value / no-arg / optional-arg option
+          *) cmdword="$tok"; break ;;
+        esac
+      done
+      case "$cmdword" in
+        sh | bash | zsh | dash | ksh | eval | /bin/sh | /bin/bash | /usr/bin/env | env)
+          printf 'xargs spawning a shell (%s) is denied under bypass' "$cmdword"; return 0 ;;
+      esac
+      return 1 ;;
+  esac
+  return 1
+}
+
+# _danger_gh_seg <segment> -> print a reason and rc 0 for a MUTATING gh subcommand a
+# worktree-confined spoke never legitimately runs (repo/collaboration/release mutation), else
+# rc 1. Split at the SUBCOMMAND level, never blanket-deny: the spoke tooling shells `gh issue
+# view/comment` and `gh pr view` (allowlisted at worktree-new.sh:338), so only the mutating
+# pr/repo/release verbs are denied; every read/comment/issue subcommand falls through to Tier 1
+# / the judge. A spoke never self-lands or opens PRs (the ship-discipline rule).
+_danger_gh_seg() {
+  local seg="$1" verb obj sub rest
+  verb="${seg%%[[:space:]]*}"
+  [ "$verb" = gh ] || return 1
+  rest="${seg#gh}"; rest="${rest#"${rest%%[![:space:]]*}"}"
+  obj="${rest%%[[:space:]]*}"
+  rest="${rest#"$obj"}"; rest="${rest#"${rest%%[![:space:]]*}"}"
+  sub="${rest%%[[:space:]]*}"
+  case "$obj $sub" in
+    'pr create' | 'pr merge' | 'pr close' | 'pr reopen' | 'pr ready' | 'pr edit' | \
+    'repo delete' | 'repo create' | 'repo rename' | 'repo archive' | 'repo edit' | \
+    'release create' | 'release delete' | 'release edit' | 'release upload')
+      printf 'gh mutating subcommand (gh %s %s) is denied under bypass' "$obj" "$sub"; return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -2218,7 +2382,10 @@ classify_danger() {
         continue ;;
     esac
     if reason="$(_danger_privilege_seg "$seg")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
+    if reason="$(_danger_eval_seg "$seg")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
     if reason="$(_danger_network_seg "$seg")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
+    if reason="$(_danger_publish_seg "$seg")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
+    if reason="$(_danger_gh_seg "$seg")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
     if reason="$(_danger_credential_seg "$seg" "$cwd" "$wt" "$slug" "$tasks")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
     if reason="$(_danger_write_seg "$seg" "$cwd" "$wt" "$slug" "$tasks")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
   done <<< "$norm"
@@ -2403,13 +2570,33 @@ print(cmd.strip())
 PYEOF
 }
 
-# _permission_pending <wt_path> -> true when the spoke is parked on a permission dialog we can
-# act on: the pane shows the prompt AND the command it is trying to run is readable. The single
-# gate slot_state and decide_and_act share.
+# _permission_pending <wt_path> -> true when the spoke is parked on a permission dialog. #269
+# (#254 option b): DETECTION is decoupled from EXTRACTION. A shown pane dialog IS a park even
+# when extract_pending_command is empty -- the gated tool_use is not flushed while the dialog is
+# pending (the #240/#254 finding), so ANDing a non-empty command made a real park read as FALSE,
+# and the reaper (_reap_or_resume) fell past the park check into "likely hung -> revive",
+# re-raising the identical dialog. The pane is the "a dialog is up" signal -- but the prompt
+# PHRASE alone is not enough: it can appear in a spoke's OWN rendered output (a spoke maintaining
+# the afk subsystem git-shows the file that defines the phrase), a #240/#89-class false park
+# (#269 review). So require BOTH the phrase (_pane_shows_permission_prompt) AND the live dialog's
+# interactive affordance -- a numbered Yes/No option line the real menu draws but a plain text
+# echo does not. The #240 guard holds: NO pane dialog -> false (no phantom park on a stale
+# RESOLVED tool). _decide_permission reads the command separately and handles an unreadable one
+# (decline + warn, never park). Fail-closed on no tmux/pane. The single gate slot_state and
+# decide_and_act share. The pane is captured ONCE and both patterns are grepped from that copy:
+# a second capture-pane doubled the tmux subprocess load and, more importantly, its extra
+# failure surface destabilized the park signature under heavy load (a flaked capture flipped the
+# park verdict, resetting the re-answer ceiling -- #269 final review NIT + a load-flake fix). The
+# phrase default MIRRORS _pane_shows_permission_prompt (hub-inject.sh) and reads the SAME
+# AFK_PERMISSION_PROMPT_RE override, so an operator retune stays consistent across both.
 _permission_pending() {
-  local wt="$1"
-  _pane_shows_permission_prompt "$wt" || return 1
-  [ -n "$(extract_pending_command "$wt")" ]
+  local wt="$1" target pane
+  command -v tmux >/dev/null 2>&1 || return 1
+  target="$(_spoke_pane_target "$wt")"
+  [ -n "$target" ] || return 1
+  pane="$(tmux capture-pane -p -t "$target" 2>/dev/null)" || return 1
+  printf '%s\n' "$pane" | grep -Eq -- "${AFK_PERMISSION_PROMPT_RE:-Do you want to proceed\?}" || return 1
+  printf '%s\n' "$pane" | grep -Eq -- "${AFK_PERMISSION_AFFORD_RE:-[0-9]+\.[[:space:]]+(Yes|No)}"
 }
 
 # _reason_permission_record <wt> <issue> <decision> <rev> -> the post-DELIVERY record for a
