@@ -91,6 +91,13 @@ def _isolated_afk_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     # every test daemon-free; the dedicated co-arm tests override HUB_WATCHDOG_ARM_CMD with a
     # recording stub.
     monkeypatch.setenv("HUB_WATCHDOG_ARM_CMD", ":")
+    # Neutralize the #249 network reachability probe by default: `_afk_network_is_down` (the
+    # third outcome ahead of the auth-dead conclusion) runs a real `curl` to api.anthropic.com
+    # when AFK_NET_PROBE_CMD is unset, so without this pin every reap/auth-halt test would make
+    # a live network call and read "up" or "down" by the host's actual connectivity. Pin it to a
+    # stub that always reports the network UP (exit 0); the offline-path tests override it to
+    # "false" (down), and the fail-open test clears it and points AFK_CURL_BIN at a bogus binary.
+    monkeypatch.setenv("AFK_NET_PROBE_CMD", "true")
 
 
 def _call(fn_call: str, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -6328,6 +6335,199 @@ def test_reap_pass_halts_on_dead_auth_instead_of_reaping(tmp_path: Path) -> None
     assert "--blocked" not in blocked, (
         "a dead-auth reap must NOT block the spoke — the halt-all path owns it"
     )
+
+
+# ── #249: network-down is a THIRD outcome ahead of "token dead" ───────────────
+# A connectivity blackout makes the auth probe fail for the WRONG reason. Before concluding
+# "token dead", the supervisor runs a bounded reachability probe: network down => skip the reap
+# pass this tick, log, keep the heartbeat, and refresh the idle clocks so the outage never
+# accumulates into a reap/block; network up + auth signature => the existing block-and-halt.
+
+
+@pytest.mark.parametrize(
+    "probe_cmd,expected",
+    [
+        ("true", 1),  # reachable (exit 0) ⇒ NOT down
+        ("false", 0),  # unreachable (nonzero) ⇒ down
+    ],
+)
+def test_afk_network_is_down_predicate(probe_cmd: str, expected: int) -> None:
+    result = _call('_afk_network_is_down; echo "RC=$?"', env={"AFK_NET_PROBE_CMD": probe_cmd})
+
+    assert result.stdout.strip() == f"RC={expected}", result.stdout + result.stderr
+
+
+def test_afk_network_is_down_fails_open_without_curl() -> None:
+    # No curl AND no override ⇒ the probe cannot run, so it must read UP (rc 1): a curl-less host
+    # must NEVER think it is permanently offline and suppress every reap for the whole window.
+    result = _call(
+        '_afk_network_is_down; echo "RC=$?"',
+        env={"AFK_NET_PROBE_CMD": "", "AFK_CURL_BIN": "definitely-not-a-real-binary-xyz"},
+    )
+
+    assert result.stdout.strip() == "RC=1", result.stdout + result.stderr
+
+
+def test_afk_network_is_down_default_probe_is_head_without_fail(tmp_path: Path) -> None:
+    # Linchpin guard (#249 review): with no AFK_NET_PROBE_CMD override the function builds its
+    # DEFAULT curl probe — record the args a stub `curl` receives and pin the shape: a bounded HEAD
+    # (-sI + --max-time) with NO --fail. --fail would make curl exit nonzero on the API's
+    # unauthenticated 401, so _afk_network_is_down would read a REAL dead token as "offline"
+    # (dispatch never halts, idle clocks refresh forever) — silently inverting the whole fix.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    arglog = tmp_path / "curl-args.txt"
+    fake_curl = bin_dir / "fakecurl"
+    fake_curl.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" > "{arglog}"\nexit 0\n')
+    fake_curl.chmod(0o755)
+
+    _call("_afk_network_is_down", env={"AFK_NET_PROBE_CMD": "", "AFK_CURL_BIN": str(fake_curl)})
+
+    tokens = arglog.read_text().split()
+    assert "-sI" in tokens, tokens
+    assert "--max-time" in tokens, tokens
+    assert "--fail" not in tokens and "-f" not in tokens, (
+        f"the reachability probe must NOT use --fail — the API's unauthenticated 401 must read "
+        f"as 'up', not 'offline': {tokens}"
+    )
+
+
+@pytest.mark.parametrize(
+    "net_cmd,auth_cmd,expected",
+    [
+        ("false", "true", "offline"),  # net down ⇒ offline (auth is not even probed)
+        ("true", "echo authentication_error; exit 1", "auth-dead"),  # up + auth signature
+        ("true", "true", "alive"),  # up + auth healthy
+    ],
+)
+def test_afk_probe_state_tristate(net_cmd: str, auth_cmd: str, expected: str) -> None:
+    result = _call(
+        "_afk_probe_state",
+        env={"AFK_NET_PROBE_CMD": net_cmd, "AFK_AUTH_PROBE_CMD": auth_cmd},
+    )
+
+    assert result.stdout.strip() == expected, result.stdout + result.stderr
+
+
+def test_reap_pass_skips_reap_and_refreshes_clocks_when_network_down(tmp_path: Path) -> None:
+    # The core #249 fix: an idle reap candidate during a network blackout. reap_pass must probe
+    # reachability, find the network DOWN, and skip the reap — never raising the auth-halt flag,
+    # never blocking the spoke — while recording the outage and refreshing the idle/ceiling clocks
+    # so the blackout does not accumulate into a reap the instant the network returns.
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, _tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    env["AFK_NET_PROBE_CMD"] = "false"  # network down
+    expr = expr + '; echo "FLAG=$_AFK_AUTH_FAILED"'
+
+    result = _call(expr, env=env)
+
+    assert "FLAG=0" in result.stdout, "a network outage must NOT raise the auth-halt flag"
+    blocked = ready_log.read_text() if ready_log.exists() else ""
+    assert "--blocked" not in blocked, "an offline tick must not block/reap the spoke"
+    assert (statedir / "offline-since.epoch").exists(), "the offline tick is recorded for --status"
+    assert (statedir / "progress-5.epoch").exists(), "the ceiling clock is refreshed"
+    assert (statedir / "answer-attempt-5.epoch").exists(), "the idle clock is refreshed"
+
+
+def test_reap_pass_clears_offline_marker_when_network_recovers(tmp_path: Path) -> None:
+    # A prior outage left an offline marker; this tick the network is back and auth is healthy,
+    # so reap_pass proceeds normally AND clears the stale outage marker (consecutive-offline reset).
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, _tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)
+    expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    _call("stamp_offline_since", env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1"})
+    env["AFK_NET_PROBE_CMD"] = "true"  # network back up (auth stub in _reaper_env is healthy)
+
+    _call(expr, env=env)
+
+    assert not (statedir / "offline-since.epoch").exists(), (
+        "network recovery must clear the outage marker so --status stops reporting OFFLINE"
+    )
+
+
+def test_service_auth_halt_stays_halted_and_records_outage_when_network_down(
+    tmp_path: Path,
+) -> None:
+    # The re-probe in _afk_service_auth_halt is the SECOND _afk_auth_is_dead caller (#249). When
+    # auth was flagged dead and the network then drops, we cannot confirm recovery — a bare
+    # `! _afk_auth_is_dead` would misread the connection error as "auth recovered" and resume the
+    # drain into a dead network. Instead: stay halted and record the outage.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    expr = (
+        "inflight_worktrees() { :; }; _warn_all_inflight() { :; }; "
+        '_AFK_AUTH_FAILED=1; _afk_service_auth_halt; echo "FLAG=$_AFK_AUTH_FAILED"'
+    )
+
+    result = _call(
+        expr,
+        env={"AFK_NET_PROBE_CMD": "false", "AFK_STATE_DIR": str(statedir), "AFK_NOW": "1000"},
+    )
+
+    assert "FLAG=1" in result.stdout, "a network outage must not be mistaken for auth recovery"
+    assert (statedir / "offline-since.epoch").exists(), "the outage is recorded"
+
+
+def test_service_auth_halt_resumes_when_network_up_and_auth_recovers(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    expr = (
+        "inflight_worktrees() { :; }; _warn_all_inflight() { :; }; "
+        '_AFK_AUTH_FAILED=1; _afk_service_auth_halt; echo "FLAG=$_AFK_AUTH_FAILED"'
+    )
+
+    result = _call(
+        expr,
+        env={
+            "AFK_NET_PROBE_CMD": "true",
+            "AFK_AUTH_PROBE_CMD": "true",
+            "AFK_STATE_DIR": str(statedir),
+        },
+    )
+
+    assert "FLAG=0" in result.stdout, "network up + auth healthy resumes the drain"
+
+
+def test_service_auth_halt_stays_halted_when_network_up_but_auth_dead(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    expr = (
+        "inflight_worktrees() { :; }; _warn_all_inflight() { :; }; "
+        '_AFK_AUTH_FAILED=1; _afk_service_auth_halt; echo "FLAG=$_AFK_AUTH_FAILED"'
+    )
+
+    result = _call(
+        expr,
+        env={
+            "AFK_NET_PROBE_CMD": "true",
+            "AFK_AUTH_PROBE_CMD": "echo authentication_error; exit 1",
+            "AFK_STATE_DIR": str(statedir),
+        },
+    )
+
+    assert "FLAG=1" in result.stdout, "network up + still auth-dead keeps today's block-and-halt"
+
+
+def test_offline_status_surfaces_duration(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    _call("stamp_offline_since", env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1000"})
+
+    result = _call(
+        "afk_offline_status",
+        env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": str(1000 + 7 * 60)},
+    )
+
+    assert "OFFLINE for 7m" in result.stdout, result.stdout + result.stderr
+
+
+def test_offline_status_silent_when_online(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+
+    result = _call("afk_offline_status", env={"AFK_STATE_DIR": str(statedir)})
+
+    assert result.stdout.strip() == "", "no outage marker ⇒ no OFFLINE line"
 
 
 # ── issue #175: the kickoff instructs the spoke to hand its plan to --gate ─────

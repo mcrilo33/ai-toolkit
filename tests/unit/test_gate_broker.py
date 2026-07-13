@@ -5375,3 +5375,78 @@ def test_danger_guard_registered_like_permission_hook() -> None:
     perm = _handler("afk-permission-hook.sh")
     assert danger is not None, "afk-danger-guard not registered for Claude PreToolUse"
     assert perm is not None, "afk-permission-hook baseline missing"
+
+
+# ── #249: network-outage state (offline-since + idle-clock refresh) ───────────
+# The per-window outage marker and the idle/ceiling-clock refresh live in the shared core so
+# both _afk_auth_is_dead callers in hub-afk.sh (reap_pass + _afk_service_auth_halt) reuse them.
+
+
+def test_stamp_offline_since_records_first_tick_and_is_idempotent(tmp_path: Path) -> None:
+    # The offline-since epoch anchors a CONSECUTIVE outage: the FIRST offline tick stamps it and
+    # later ticks must NOT overwrite it, so --status reports the true outage duration.
+    statedir = tmp_path / "sd"
+    _call("stamp_offline_since", env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1000"})
+    _call("stamp_offline_since", env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "9999"})
+
+    result = _call("read_offline_since", env={"AFK_STATE_DIR": str(statedir)})
+
+    assert result.stdout.strip() == "1000", "the first offline tick's epoch is preserved"
+
+
+def test_offline_minutes_reports_elapsed_since_first_offline(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    _call("stamp_offline_since", env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1000"})
+
+    result = _call(
+        "offline_minutes", env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": str(1000 + 5 * 60)}
+    )
+
+    assert result.stdout.strip() == "5"
+
+
+def test_offline_minutes_empty_without_marker(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+
+    result = _call("offline_minutes", env={"AFK_STATE_DIR": str(statedir)})
+
+    assert result.stdout.strip() == "", "no outage ⇒ no duration"
+
+
+def test_clear_offline_since_drops_the_marker(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    _call("stamp_offline_since", env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1000"})
+    _call("clear_offline_since", env={"AFK_STATE_DIR": str(statedir)})
+
+    result = _call("read_offline_since", env={"AFK_STATE_DIR": str(statedir)})
+
+    assert result.stdout.strip() == ""
+
+
+def test_clear_progress_state_also_clears_offline_since(tmp_path: Path) -> None:
+    # A fresh /afk window must not inherit a prior run's outage marker (cleared alongside the
+    # progress / answer-attempt epochs).
+    statedir = tmp_path / "sd"
+    _call("stamp_offline_since", env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1000"})
+    _call("_clear_progress_state", env={"AFK_STATE_DIR": str(statedir)})
+
+    result = _call("read_offline_since", env={"AFK_STATE_DIR": str(statedir)})
+
+    assert result.stdout.strip() == "", "a fresh window drops the stale outage marker"
+
+
+def test_refresh_offline_clocks_stamps_progress_and_answer_attempt(tmp_path: Path) -> None:
+    # The idle-clock exclusion for an outage tick: every in-flight spoke gets a fresh progress
+    # epoch (soft ceiling) AND answer-attempt epoch (idle clock), so the blackout is not counted
+    # toward a reap when connectivity returns.
+    statedir = tmp_path / "sd"
+    expr = (
+        'inflight_worktrees() { printf "/wt/5\\t5\\n/wt/7\\t7\\n"; }; _afk_refresh_offline_clocks'
+    )
+
+    _call(expr, env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1700000000"})
+
+    for issue in ("5", "7"):
+        assert (statedir / f"progress-{issue}.epoch").read_text().strip() == "1700000000"
+        assert (statedir / f"answer-attempt-{issue}.epoch").read_text().strip() == "1700000000"
