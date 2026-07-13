@@ -301,8 +301,9 @@ def test_classify_danger_in_tree_secret_fixture_not_denied(spoke_repo: Path) -> 
 
 
 # ── issue #261: Tier-3 headless LLM judge (judge_permission) ──────────────────
-# The residue tiers 1-2 did not resolve goes to a TOOLLESS headless judge (Haiku, ~2s bound),
-# FAIL-CLOSED on timeout/error/unparseable, verdicts cached by command hash.
+# The residue tiers 1-2 did not resolve goes to a TOOLLESS headless judge (Haiku, bounded by
+# AFK_JUDGE_TIMEOUT), FAIL-CLOSED on timeout/error/unparseable. Only PARSED verdicts are
+# cached by command hash; a failure outcome is never cached (#268).
 
 
 def _judge_env(tmp_path: Path, **extra: str) -> dict[str, str]:
@@ -377,6 +378,39 @@ def test_judge_caches_verdict_by_command(tmp_path: Path) -> None:
     _call('judge_permission "same"; judge_permission "same"', env=env)
 
     assert counter.read_text().count("call") == 1, counter.read_text()
+
+
+def test_judge_default_timeout_survives_cold_start(tmp_path: Path) -> None:
+    # #268: the old 2s default was shorter than a headless claude -p cold start, so every
+    # uncached tier-3 decision failed closed. The default must budget a real round trip.
+    result = _call("_judge_timeout", env=_judge_env(tmp_path))
+
+    assert int(result.stdout.strip()) >= 60, result.stdout
+
+
+def test_judge_unavailable_verdict_is_not_cached(tmp_path: Path) -> None:
+    # #268: a judge failure fails closed for THAT decision only. A later call with a healthy
+    # judge must re-run it and succeed -- a cached failure would deny the command all window.
+    env_dead = _judge_env(tmp_path, AFK_JUDGE_CMD="exit 3")
+    env_ok = _judge_env(tmp_path, AFK_JUDGE_CMD="printf 'VERDICT: safe\\n'")
+
+    first = _call('judge_permission "same-cmd" | cut -f1', env=env_dead)
+    second = _call('judge_permission "same-cmd"', env=env_ok)
+
+    assert first.stdout.strip() == "DANGEROUS", first.stdout
+    assert second.stdout.strip() == "SAFE", second.stdout
+
+
+def test_judge_unparseable_verdict_is_not_cached(tmp_path: Path) -> None:
+    # Same rule for a judge that answered but without a VERDICT line (#268).
+    env_vague = _judge_env(tmp_path, AFK_JUDGE_CMD="printf 'no idea\\n'")
+    env_ok = _judge_env(tmp_path, AFK_JUDGE_CMD="printf 'VERDICT: safe\\n'")
+
+    first = _call('judge_permission "vague-cmd" | cut -f1', env=env_vague)
+    second = _call('judge_permission "vague-cmd"', env=env_ok)
+
+    assert first.stdout.strip() == "DANGEROUS", first.stdout
+    assert second.stdout.strip() == "SAFE", second.stdout
 
 
 # ── the shared orchestrator: broker_service_gate ──────────────────────────────
