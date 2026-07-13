@@ -2099,17 +2099,39 @@ except Exception:
 
 # A WRITE-METHOD flag makes this an upload/POST egress (possible exfil) regardless of host --
 # deny it even to an allowlisted host (#269). -o/-O write the RESPONSE to a file, not an upload,
-# so they stay benign. -X/--request only escalates for a mutating method.
+# so they stay benign. Short upload flags (-d/-F/-T) and their GLUED forms (-d@f, -XPOST) are
+# CURL-only: in wget -d/-F/-T mean --debug/--force-html/--timeout, so applying curl semantics to
+# wget false-denied benign reads (#269 review WARNING). wget write-methods are the long forms
+# (--post-data/--post-file/--body-data/--body-file/--method=), handled for both below.
 mutating = {"POST", "PUT", "PATCH", "DELETE"}
+verb = os.path.basename(toks[0]) if toks else ""
+is_curl = verb == "curl"
+
+def method_ok(m):
+    return m.upper() in mutating
+
 i = 1
 while i < len(toks):
     t = toks[i]
-    if t in ("-d", "--data", "--data-binary", "--data-raw", "--data-urlencode",
-             "-F", "--form", "-T", "--upload-file") or t.startswith("--data") \
-            or t.startswith("--post-data") or t.startswith("--post-file"):
+    # Long-form request bodies / methods -- curl AND wget.
+    if t.startswith("--data") or t.startswith("--form") or t == "--upload-file" \
+            or t.startswith("--post-data") or t.startswith("--post-file") \
+            or t.startswith("--body-data") or t.startswith("--body-file"):
         print("DENYWRITE " + t); sys.exit(0)
-    if t in ("-X", "--request") and i + 1 < len(toks) and toks[i + 1].upper() in mutating:
+    if (t.startswith("--request=") or t.startswith("--method=")) and method_ok(t.split("=", 1)[1]):
+        print("DENYWRITE " + t); sys.exit(0)
+    if t in ("--request", "--method") and i + 1 < len(toks) and method_ok(toks[i + 1]):
         print("DENYWRITE " + t + " " + toks[i + 1]); sys.exit(0)
+    if is_curl:
+        # curl short upload flags, spaced or glued (-d @f / -d@f / -Ffile=@f / -Tfile).
+        if t == "-d" or t.startswith("-d") or t == "-F" or t.startswith("-F") \
+                or t == "-T" or t.startswith("-T"):
+            print("DENYWRITE " + t); sys.exit(0)
+        # -X METHOD (spaced) or -XMETHOD (glued).
+        if t == "-X" and i + 1 < len(toks) and method_ok(toks[i + 1]):
+            print("DENYWRITE -X " + toks[i + 1]); sys.exit(0)
+        if len(t) > 2 and t.startswith("-X") and method_ok(t[2:]):
+            print("DENYWRITE " + t); sys.exit(0)
     i += 1
 
 # Only a scheme URL (contains ://) whose urlparse yields a hostname counts as an egress host.
@@ -2219,15 +2241,17 @@ _danger_publish_seg() {
 
 # _danger_eval_seg <segment> -> print a reason and rc 0 for arbitrary-exec / classifier-evasion
 # shapes, else rc 1. `eval` runs an unsplit string (`eval "$(curl ...)"` is never operator-split
-# or host-checked), a shell verb carrying `-c` runs an inline command, a BARE shell verb (no
-# non-flag argument) is a pipe-to-shell target reading stdin (`curl ... | bash`, whose halves are
-# separate segments), and `xargs` spawning a shell (`xargs sh -c ...`) launders exec through the
-# argv. Benign `bash -n file` / `bash script.sh` (a non-flag arg, no -c) and `find | xargs grep`
-# (no shell verb) still pass. UPGRADE: a combined short flag (`bash -lc`) is not split here -- it
-# routes to the judge rather than this static deny; add flag-cluster parsing if the journal shows
-# it exploited.
+# or host-checked); a shell verb carrying `-c` (inline command) or `-s` (script on stdin) runs
+# arbitrary code; a BARE shell verb (no non-flag argument) is a pipe-to-shell target reading stdin
+# (`curl ... | bash`, whose halves are separate segments); and `xargs` whose COMMAND WORD is a
+# shell (`xargs sh -c ...`) launders exec through the argv. Benign `bash -n file` / `bash
+# script.sh` (a non-flag arg, no -c/-s), `bash --version` (info probe), and `find | xargs grep
+# bash` (the command word is grep, NOT the shell-named ARGUMENT) all still pass -- the xargs scan
+# checks only the exec'd command word, skipping xargs's own value-taking options (#269 review
+# BLOCKER). UPGRADE: a combined short-flag cluster (`bash -lc`, `sh -sc`) is not split here -- it
+# routes to the fail-closed judge; add flag-cluster parsing if the journal shows it exploited.
 _danger_eval_seg() {
-  local seg="$1" verb rest tok has_arg=0
+  local seg="$1" verb rest tok has_arg=0 skip=0 cmdword=""
   verb="${seg%%[[:space:]]*}"
   case "$verb" in
     eval) printf 'eval runs an uninspected command string -- denied under bypass'; return 0 ;;
@@ -2239,7 +2263,9 @@ _danger_eval_seg() {
         tok="${rest%%[[:space:]]*}"
         rest="${rest#"$tok"}"
         case "$tok" in
-          -c) printf 'inline shell command (%s -c ...) is denied under bypass' "$verb"; return 0 ;;
+          -c | -s)
+            printf 'inline/stdin shell command (%s %s ...) is denied under bypass' "$verb" "$tok"; return 0 ;;
+          --version | --help | -V) return 1 ;;  # an info probe, not an exec -- benign
           -*) continue ;;
           *) has_arg=1 ;;
         esac
@@ -2249,17 +2275,27 @@ _danger_eval_seg() {
       fi
       return 1 ;;
     xargs)
+      # The command xargs execs is its FIRST non-option token -- match ONLY that against the shell
+      # set, skipping xargs's own value-taking options (a separate-word value like `-I {}` / `-n 1`
+      # / `-P 4`). Scanning every token falsely denied `xargs grep bash` (#269 review BLOCKER).
       rest="${seg#"$verb"}"
       while [ -n "$rest" ]; do
         rest="${rest#"${rest%%[![:space:]]*}"}"
         [ -n "$rest" ] || break
         tok="${rest%%[[:space:]]*}"
         rest="${rest#"$tok"}"
+        if [ "$skip" -eq 1 ]; then skip=0; continue; fi
         case "$tok" in
-          sh | bash | zsh | dash | ksh | eval | /bin/sh | /bin/bash)
-            printf 'xargs spawning a shell (%s) is denied under bypass' "$tok"; return 0 ;;
+          -I | -J | -L | -n | -P | -R | -S | -s | -E | -e | -a | -d)
+            skip=1; continue ;;                       # a short option taking a separate-word value
+          --*=* | -*) continue ;;                     # glued-value / no-arg option
+          *) cmdword="$tok"; break ;;
         esac
       done
+      case "$cmdword" in
+        sh | bash | zsh | dash | ksh | eval | /bin/sh | /bin/bash | /usr/bin/env | env)
+          printf 'xargs spawning a shell (%s) is denied under bypass' "$cmdword"; return 0 ;;
+      esac
       return 1 ;;
   esac
   return 1
@@ -2524,13 +2560,18 @@ print(cmd.strip())
 PYEOF
 }
 
-# _permission_pending <wt_path> -> true when the spoke is parked on a permission dialog we can
-# act on: the pane shows the prompt AND the command it is trying to run is readable. The single
-# gate slot_state and decide_and_act share.
+# _permission_pending <wt_path> -> true when the spoke is parked on a permission dialog. #269
+# (#254 option b): DETECTION is decoupled from EXTRACTION. A shown pane prompt IS a park even
+# when extract_pending_command is empty -- the gated tool_use is not flushed while the dialog is
+# pending (the #240/#254 finding), so ANDing a non-empty command made a real park read as FALSE,
+# and the reaper (_reap_or_resume) fell past the park check into "likely hung -> revive",
+# re-raising the identical dialog. The pane is the sole "a dialog is up" signal, so it alone is
+# the predicate. The #240 guard is preserved: NO pane prompt -> _pane_shows_permission_prompt
+# false -> false (no phantom park on a stale RESOLVED tool). _decide_permission reads the command
+# separately and handles an unreadable one (decline + warn, never park). The single gate
+# slot_state and decide_and_act share.
 _permission_pending() {
-  local wt="$1"
-  _pane_shows_permission_prompt "$wt" || return 1
-  [ -n "$(extract_pending_command "$wt")" ]
+  _pane_shows_permission_prompt "$1"
 }
 
 # _reason_permission_record <wt> <issue> <decision> <rev> -> the post-DELIVERY record for a
