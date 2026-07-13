@@ -1608,7 +1608,15 @@ _broker_seg_secretlike() {
       | .netrc | credentials | .npmrc | .pypirc) return 0 ;;
   esac
   path_lower="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
-  case "$path_lower" in */.ssh/* | */.aws/* | */.gnupg/*) return 0 ;; esac
+  # Credential STORES by directory (issue #261 review): the SSH/AWS/GPG dirs plus the common
+  # cloud/registry credential dirs, so a `cat ~/.kube/config` / `~/.docker/config.json` /
+  # gcloud / gh-token read is recognized as secret-like and the deny-wall's credential lane
+  # stops it. UPGRADE: a novel cred store not listed here falls to the Tier-3 judge, not a
+  # static deny -- extend this set as the #261 journal surfaces new ones.
+  case "$path_lower" in
+    */.ssh/* | */.aws/* | */.gnupg/* | */.kube/* | */.docker/* \
+      | */.config/gcloud/* | */.config/gh/*) return 0 ;;
+  esac
   return 1
 }
 
@@ -2045,11 +2053,15 @@ PYEOF
   esac
 }
 
-# _danger_credential_seg <segment> -> print a reason and rc 0 when the segment reads a keychain
-# or a secret-like path, else rc 1. `security` (macOS keychain) is denied on the verb; a read
-# verb touching a secret-like token (reusing _broker_seg_secretlike) is denied on the path.
+# _danger_credential_seg <segment> <cwd> <wt> <slug> <tasks> -> print a reason and rc 0 when the
+# segment reads a keychain or an OUT-OF-TREE secret-like path, else rc 1. `security`/`keychain`
+# (macOS keychain access) is denied on the verb; a read verb (cat/head/...) touching a secret-like
+# token (reusing _broker_seg_secretlike) is denied ONLY when the path is out-of-tree. An IN-TREE
+# secret-named file (`tests/fixtures/key.pem`) is the spoke's OWN fixture -- it already has write
+# access there, so reading it is within the worktree trust boundary and is NOT denied (#261 review
+# NIT). Without a worktree context every secret-like read is denied (can't prove in-tree -> safe).
 _danger_credential_seg() {
-  local seg="$1" verb rest tok
+  local seg="$1" cwd="${2:-}" wt="${3:-}" slug="${4:-}" tasks="${5:-}" verb rest tok
   verb="${seg%%[[:space:]]*}"
   case "$verb" in
     security | keychain) printf 'keychain/credential access (%s) is denied' "$verb"; return 0 ;;
@@ -2063,9 +2075,12 @@ _danger_credential_seg() {
     tok="${rest%%[[:space:]]*}"
     rest="${rest#"$tok"}"
     case "$tok" in -*) continue ;; esac
-    if _broker_seg_secretlike "$tok"; then
-      printf 'reads a secret-like path: %s' "$tok"; return 0
+    _broker_seg_secretlike "$tok" || continue
+    # An in-tree secret-named file is the spoke's own fixture -> within the trust boundary, allow.
+    if [ -n "$wt" ] && _broker_resolve_in_roots "$tok" "$cwd" "$wt" "$slug" "$tasks" >/dev/null 2>&1; then
+      continue
     fi
+    printf 'reads a secret-like path: %s' "$tok"; return 0
   done
   return 1
 }
@@ -2114,7 +2129,7 @@ classify_danger() {
     rtargets="$(_danger_redirect_targets "$cmd")"
     while IFS= read -r rt; do
       [ -n "$rt" ] || continue
-      [ "$rt" = "__UNPARSEABLE__" ] && { printf 'DENY\t%s\n' "unparseable redirection (unbalanced quoting)"; return 0; }
+      [ "$rt" = "__UNPARSEABLE__" ] && { printf 'DENY\t%s\n' "unparseable command (unbalanced quoting) -- fail-closed"; return 0; }
       case "$rt" in '&'*) continue ;; esac
       if ! _broker_resolve_in_roots "$rt" "$wt" "$wt" "$slug" "$tasks" >/dev/null 2>&1; then
         printf 'DENY\t%s\n' "writes outside the worktree via redirection: $rt"; return 0
@@ -2148,7 +2163,7 @@ classify_danger() {
     esac
     if reason="$(_danger_privilege_seg "$seg")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
     if reason="$(_danger_network_seg "$seg")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
-    if reason="$(_danger_credential_seg "$seg")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
+    if reason="$(_danger_credential_seg "$seg" "$cwd" "$wt" "$slug" "$tasks")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
     if reason="$(_danger_write_seg "$seg" "$cwd" "$wt" "$slug" "$tasks")"; then printf 'DENY\t%s\n' "$reason"; return 0; fi
   done <<< "$norm"
   return 0
@@ -2654,23 +2669,17 @@ PYEOF
 # (one source of truth). afk-permission-hook (#253) is left in place and untouched -- its allow is
 # redundant-but-harmless under bypass; THIS hook only adds DENY (which wins in CC).
 
-# _afk_bypass_wall_active <wt> -> rc 0 (wall ACTIVE) unless the spoke can be POSITIVELY confirmed
-# NOT under bypass. FAIL-SAFE / DENY-LEAN (#261): the ONE unacceptable state is a bypass (afk)
-# spoke with the wall OFF, so a missing / unreadable / ambiguous .ai-toolkit/mode keeps the wall
-# ACTIVE. The ONLY inert case is a positively-read `attended` mode (there the human is the wall,
-# and walling would block legit attended commands for no safety gain). The caller's issue-numbered
-# -branch gate already excludes the hub / ad-hoc lanes, so this only decides afk-vs-attended.
-_afk_bypass_wall_active() {
-  local wt="$1" root mode_file mode
-  root="$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null)" || return 0   # unresolvable -> ACTIVE
+# _afk_spoke_mode <wt> -> print the spoke's execution mode from <root>/.ai-toolkit/mode
+# (whitespace-trimmed), or empty when the file is missing / unreadable / <wt> is not a git tree.
+# The mode is the load-bearing signal for the deny-wall gate (see afk_danger_guard_decide): the
+# file is written by worktree-new.sh at spawn and is gitignored (info/exclude), so it SURVIVES a
+# branch checkout / detach -- unlike the branch name, which does not.
+_afk_spoke_mode() {
+  local wt="$1" root
+  root="$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null)" || return 0
   [ -n "$root" ] || return 0
-  mode_file="$root/.ai-toolkit/mode"
-  [ -f "$mode_file" ] || return 0                                            # missing -> ACTIVE
-  mode="$(tr -d '[:space:]' < "$mode_file" 2>/dev/null)" || return 0         # unreadable -> ACTIVE
-  case "$mode" in
-    attended) return 1 ;;   # positively attended -> INERT (the human is the wall)
-    *) return 0 ;;          # afk, or any ambiguous value -> ACTIVE (deny-lean)
-  esac
+  [ -f "$root/.ai-toolkit/mode" ] || return 0
+  tr -d '[:space:]' < "$root/.ai-toolkit/mode" 2>/dev/null || return 0
 }
 
 # afk_danger_guard_decide -> read a Claude Code PreToolUse payload on stdin and print a `deny`
@@ -2716,12 +2725,23 @@ PYEOF
   wt="${parsed%%$'\n'*}"; cmd="${parsed#*$'\n'}"
   [ -n "$cmd" ] || return 0
   [ -n "$wt" ] || wt="$(pwd)"
-  # Spoke gate: an issue-numbered branch slug excludes the hub (on main) and ad-hoc/express lanes.
-  br="$(git -C "$wt" branch --show-current 2>/dev/null)" || return 0
+  # Issue number (best-effort, for the fail-safe gate + the journal). Empty on a detached HEAD
+  # or a non-issue branch -- which is EXACTLY why it must NOT be the primary gate.
+  br="$(git -C "$wt" branch --show-current 2>/dev/null || true)"
   slug="${br##*/}"; issue="${slug%%[!0-9]*}"
-  case "$issue" in '' | *[!0-9]*) return 0 ;; esac
-  # Fail-safe mode gate: active for afk / ambiguous, inert only for a positively-attended spoke.
-  _afk_bypass_wall_active "$wt" || return 0
+  case "$issue" in *[!0-9]*) issue="" ;; esac
+  # MODE GATE (fail-safe, mode-first -- #261 review BLOCKER). A positively-read `afk` mode means
+  # this spoke launched under bypassPermissions, so the wall is ACTIVE on ANY branch: `git bisect`
+  # / `rebase` / `checkout <sha>` detach HEAD or move off the issue branch, and the wall must NOT
+  # silently drop then (the .ai-toolkit/mode file survives the checkout; the branch name does not).
+  # `attended` -> INERT (the human is the wall). A missing / unreadable / ambiguous mode keeps the
+  # wall ACTIVE only for an issue-numbered spoke branch (a corrupted spoke); the hub (on main, no
+  # mode file) and ad-hoc lanes stay INERT so hub operations are never walled.
+  case "$(_afk_spoke_mode "$wt")" in
+    attended) return 0 ;;
+    afk) ;;
+    *) [ -n "$issue" ] || return 0 ;;
+  esac
   # Tier 2 (static deny) first -- see the header for why it precedes Tier 1.
   djson="$(classify_danger "$cmd" "$wt")"
   if [ "${djson%%$'\t'*}" = DENY ]; then

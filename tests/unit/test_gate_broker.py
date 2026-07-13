@@ -226,6 +226,29 @@ def test_classify_danger_no_false_deny_on_benign_forms(cmd: str, spoke_repo: Pat
     assert result.stdout.strip() == "", f"{cmd!r} was wrongly denied"
 
 
+def test_classify_danger_denies_cloud_credential_read(spoke_repo: Path) -> None:
+    # #261 review: common cloud/registry credential stores are secret-like too, not just ~/.ssh.
+    result = _call(
+        'classify_danger "$CMD" "$WT" | cut -f1',
+        env={"CMD": "cat ~/.kube/config", "WT": str(spoke_repo)},
+    )
+
+    assert result.stdout.strip() == "DENY", result.stdout
+
+
+def test_classify_danger_in_tree_secret_fixture_not_denied(spoke_repo: Path) -> None:
+    # #261 review NIT: an IN-TREE secret-named file is the spoke's own fixture (it has write
+    # access there) -- reading it is within the trust boundary, so it must NOT be denied.
+    (spoke_repo / "tests").mkdir(exist_ok=True)
+    (spoke_repo / "tests" / "key.pem").write_text("-----FAKE FIXTURE-----\n")
+    result = _call(
+        'classify_danger "$CMD" "$WT"',
+        env={"CMD": "cat tests/key.pem", "WT": str(spoke_repo)},
+    )
+
+    assert result.stdout.strip() == "", "an in-tree .pem fixture read must not be denied"
+
+
 # ── issue #261: Tier-3 headless LLM judge (judge_permission) ──────────────────
 # The residue tiers 1-2 did not resolve goes to a TOOLLESS headless judge (Haiku, ~2s bound),
 # FAIL-CLOSED on timeout/error/unparseable, verdicts cached by command hash.
@@ -5148,11 +5171,13 @@ def test_danger_guard_active_when_mode_missing(
     assert _perm(result.stdout) == "deny", result.stdout
 
 
-def test_danger_guard_inert_on_non_spoke_branch(
+def test_danger_guard_inert_on_hub_no_mode_non_issue_branch(
     afk_bypass_spoke: tuple[Path, dict[str, str]],
 ) -> None:
-    # A branch with no issue number (the hub on main, an ad-hoc branch) is not a bypass spoke.
+    # The hub / ad-hoc lane: NO .ai-toolkit/mode file AND a non-issue branch -> not a bypass spoke,
+    # so hub operations are never walled. (A missing mode ONLY forces active on an issue branch.)
     wt, env = afk_bypass_spoke
+    (wt / ".ai-toolkit" / "mode").unlink()
     subprocess.run(
         ["git", "checkout", "-q", "-b", "docs/readme"],
         cwd=wt,
@@ -5164,6 +5189,47 @@ def test_danger_guard_inert_on_non_spoke_branch(
     result = _decide(_hook_payload("Bash", wt, command="sudo rm -rf /"), env)
 
     assert result.stdout.strip() == "", result.stdout
+
+
+def test_danger_guard_active_on_detached_head(
+    afk_bypass_spoke: tuple[Path, dict[str, str]],
+) -> None:
+    # #261 review BLOCKER: mode==afk must keep the wall ACTIVE on a DETACHED HEAD (git bisect /
+    # rebase / checkout <sha>) -- the .ai-toolkit/mode file survives the checkout, the branch does
+    # not, so the branch must NOT be the primary gate.
+    wt, env = afk_bypass_spoke
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=wt, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "checkout", "-q", sha],
+        cwd=wt,
+        check=True,
+        env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t"},
+        capture_output=True,
+    )
+
+    result = _decide(_hook_payload("Bash", wt, command="sudo rm -rf /"), env)
+
+    assert _perm(result.stdout) == "deny", "a bisect/detached afk spoke must stay walled"
+
+
+def test_danger_guard_active_on_scratch_branch(
+    afk_bypass_spoke: tuple[Path, dict[str, str]],
+) -> None:
+    # #261 review BLOCKER: mode==afk keeps the wall ACTIVE on a non-issue scratch branch too.
+    wt, env = afk_bypass_spoke
+    subprocess.run(
+        ["git", "checkout", "-q", "-b", "experiment"],
+        cwd=wt,
+        check=True,
+        env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t"},
+        capture_output=True,
+    )
+
+    result = _decide(_hook_payload("Bash", wt, command="sudo rm -rf /"), env)
+
+    assert _perm(result.stdout) == "deny", "an afk spoke on a scratch branch must stay walled"
 
 
 def test_danger_guard_journals_tier2_deny(

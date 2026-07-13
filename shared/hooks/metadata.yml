@@ -418,10 +418,14 @@ afk-permission-hook:
 # (Tier 1, benign self-op -> allow silently) -> a toolless Haiku judge (Tier 3, the
 # ambiguous residue, fail-closed on timeout/error). It emits ONLY permissionDecision:
 # "deny" (never allow -- afk-permission-hook keeps that role) and journals every deny +
-# verdict per #241. Gated on an issue-numbered spoke branch AND a fail-safe mode gate
-# (.ai-toolkit/mode != positively-attended keeps the wall ACTIVE even if the supervisor
-# died), so the hub / attended lanes are never walled. Claude-only, like
-# afk-permission-hook. Placed after it so a deny (CC's strongest verdict) settles last.
+# verdict per #241. Gated on a fail-safe MODE gate (.ai-toolkit/mode: positively-afk
+# keeps the wall ACTIVE on any branch even if the supervisor died or HEAD detached;
+# positively-attended -> inert; missing mode -> active only on an issue-numbered spoke
+# branch), so the hub / attended lanes are never walled. Claude-only, like
+# afk-permission-hook. NOTE: this hook emits ONLY deny and afk-permission-hook ONLY allow;
+# when both fire on one command CC resolves deny-over-allow by VERDICT-TYPE PRECEDENCE, not
+# by emission order (the generator sorts hooks by name, so this one actually emits first) --
+# so the two compose safely regardless of order.
 afk-danger-guard:
   description: "On PreToolUse (Bash/Read) inside an afk bypass spoke, DENY boundary-crossing / judge-dangerous commands (classify_danger -> classify_permission -> toolless Haiku judge, fail-closed); the safety wall for bypassPermissions; journals per #241 (Claude-only, #261)"
   tier: 1
