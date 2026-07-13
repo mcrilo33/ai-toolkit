@@ -507,6 +507,64 @@ def test_agent_launch_keeps_seeded_prompt_after_pinning(hub: Path, tmp_path: Pat
     )
 
 
+# ── issue #269: the launcher no longer claims bypass removes the dialog family, ─
+# and warns at afk spawn when a global permissions.ask rule would pierce it ─────
+# #238 proved an explicit user-global `permissions.ask` RULE outranks the
+# permission MODE (rules > mode), so a dialog CAN still reach a bypass spoke. The
+# stale comment at worktree-new.sh:559 must not claim otherwise, and an afk spawn
+# best-effort warns when such a rule exists.
+
+
+def test_afk_launch_comment_no_longer_claims_dialog_never_raised() -> None:
+    src = WORKTREE_NEW.read_text()
+
+    assert "no permission dialog is EVER raised" not in src, (
+        "the stale #238-falsified claim must be gone"
+    )
+    assert "permissions.ask" in src and "pierce" in src.lower(), (
+        "the corrected comment must state a permissions.ask rule pierces bypassPermissions"
+    )
+
+
+def _write_ask_settings(home: Path, rule: str) -> None:
+    cfg = home / ".claude"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "settings.json").write_text(json.dumps({"permissions": {"ask": [rule]}}) + "\n")
+
+
+def test_afk_spawn_warns_when_global_ask_rule_present(hub: Path, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    _write_ask_settings(home, "Bash(chmod *)")
+
+    proc, _log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", "--mode", "afk")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "permissions.ask" in proc.stderr, proc.stderr
+    assert "bypass" in proc.stderr.lower(), proc.stderr
+
+
+def test_afk_spawn_silent_without_ask_rule(hub: Path, tmp_path: Path) -> None:
+    # No settings.json / no ask rule -> no preflight warning (the common, healthy case).
+    proc, _log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", "--mode", "afk")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "permissions.ask" not in proc.stderr, proc.stderr
+
+
+def test_attended_spawn_never_runs_ask_preflight(hub: Path, tmp_path: Path) -> None:
+    # The preflight is afk-only: an attended spawn (the human IS the wall) never warns,
+    # even when a global ask rule is present.
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    _write_ask_settings(home, "Bash(chmod *)")
+
+    proc, _log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "permissions.ask" not in proc.stderr, proc.stderr
+
+
 # ── Task contract on disk + task.md seed prompt (issue #177) ──
 #
 # Anchoring used to be an LLM errand: the seed prompt told the spoke to run

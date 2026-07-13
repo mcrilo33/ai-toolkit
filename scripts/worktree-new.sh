@@ -555,15 +555,43 @@ if [ -z "$PROMPT" ] && [ -f "$TASK_MD" ]; then
   PROMPT="Read your task contract at .ai-toolkit/task.md (issue #${ISSUE}, fetched at spawn -- no need to run /source-task). Break it into a task ledger (one entry per subtask x the solo-cycle steps ANCHOR/RED/GREEN/REVIEW/PUSH, exactly one in_progress) -- a skeleton is pre-seeded at .ai-toolkit/ledger-skeleton.md; seed your ledger from its rows so your entries match the '#<issue>.<slug> - <STEP> - <label>' schema. Honor its Gate: line: plan (the default for non-trivial work, and whenever no Gate: line is present) means the PLAN gate comes first -- explore, print the full implementation plan, emit 'bash .ai-toolkit/scripts/spoke-ready.sh --gate ${ISSUE}', and WAIT for approval before GREEN; only Gate: none runs autonomous straight through. Then implement via the solo-cycle (/cycle: RED -> GREEN -> REVIEW -> PUSH). Push your own branch each subtask; when the acceptance criteria are all met, push the final subtask and emit 'bash .ai-toolkit/scripts/spoke-push.sh --ready ${ISSUE}'. Do NOT self-land. If task.md is missing, or the issue was edited after spawn, run /source-task ${ISSUE} to re-anchor from the live issue."
 fi
 
+# afk_ask_rule_preflight -> warn (stderr, best-effort) when the user-global settings carry a
+# `permissions.ask` rule that would PIERCE bypassPermissions (rules > mode, #238) and strand this
+# afk spoke on a dialog. Advisory only: never blocks the spawn, and is a silent no-op when the
+# settings file / python3 is absent or no ask rule exists. HONORS CLAUDE_CONFIG_DIR (the CC
+# config root) before falling back to ~/.claude, matching where CC reads user settings.
+afk_ask_rule_preflight() {
+  local settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" n
+  [ -f "$settings" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  n="$(WT_ASK_SETTINGS="$settings" python3 - <<'PYEOF' 2>/dev/null || printf 0
+import json, os
+try:
+    with open(os.environ["WT_ASK_SETTINGS"]) as fh:
+        rules = ((json.load(fh) or {}).get("permissions") or {}).get("ask") or []
+    print(len(rules) if isinstance(rules, list) else 0)
+except Exception:
+    print(0)
+PYEOF
+)"
+  case "$n" in '' | 0 | *[!0-9]*) return 0 ;; esac
+  printf '%s\n' "worktree-new: WARNING (afk): $settings has $n permissions.ask rule(s) -- an ask RULE pierces bypassPermissions (rules > mode) and can strand this spoke on a dialog. Remove global ask rules (or use an afk-aware machine-local hook) for a dialog-free drain." >&2
+}
+
 AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(printf '%q' "$WT_AGENT_EFFORT") claude --model $(printf '%q' "$WT_AGENT_MODEL")"
-# afk spokes launch under bypassPermissions (#261): no permission dialog is EVER raised, so
-# the whole dialog-answering bug family (#240/#246/#253/#254/#259) is removed at the root.
-# Safety moves to a PreToolUse deny-hook WALL (afk-danger-guard) that still fires and can DENY
-# even under bypass. afk-ONLY: attended/quick lanes keep default prompting (the human is the
-# wall), so their launch is unchanged. The flag precedes the seeded prompt below, which stays
-# the trailing arg. The wall's own gate is .ai-toolkit/mode == afk (written above), so it stays
-# authoritative for the whole bypass lifetime independent of supervisor liveness.
+# afk spokes launch under bypassPermissions (#261): the bypass MODE suppresses the routine
+# prompt-then-approve dialogs, moving safety to a PreToolUse deny-hook WALL (afk-danger-guard)
+# that still fires and can DENY even under bypass. But the mode is NOT absolute: a user-global
+# `permissions.ask` RULE outranks the permission mode (rules > mode), so such a rule PIERCES
+# bypassPermissions and still raises a dialog -- #238 proved this stranded a live afk run. The
+# afk_ask_rule_preflight below warns when one exists; the operator must remove global ask rules
+# (or replace them with an afk-aware machine-local hook) for a dialog-free drain. afk-ONLY:
+# attended/quick lanes keep default prompting (the human is the wall), so their launch is
+# unchanged. The flag precedes the seeded prompt below, which stays the trailing arg. The wall's
+# own gate is .ai-toolkit/mode == afk (written above), so it stays authoritative for the whole
+# bypass lifetime independent of supervisor liveness.
 [ "$MODE" = afk ] && AGENT_CMD="$AGENT_CMD --permission-mode bypassPermissions"
+[ "$MODE" = afk ] && afk_ask_rule_preflight
 # Best-effort in-process budget cap for unattended spokes. A caller may set
 # WT_AGENT_BUDGET_ARGS (e.g. "--max-budget-usd 5"); it is a pre-formed multi-arg
 # string appended verbatim (NOT %q-quoted), so leave it unset for ordinary attended
