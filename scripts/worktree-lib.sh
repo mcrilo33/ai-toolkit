@@ -299,20 +299,61 @@ wt_push_transport_died() {
 # `git status --porcelain -uno`, but the writer's untracked-sensitive
 # gate_stamp_tree skips the mint) or a pre-#122 installed hook (STAMPS=0). Those
 # are the safe direction: re-running the land re-runs the gate.
-wt_gate_green_stamped() {
+# _wt_gate_stamp_file — print the stamp path for HEAD^{tree}: the #122 contract
+# <git-common-dir>/.gate-stamps/<HEAD^{tree}>, resolved WITHOUT sourcing gate-stamp.sh
+# so a synced hub (no shared/hooks/lib/) resolves it identically. rc 1 (no output) on
+# an unborn HEAD or an unresolvable common dir. Shared by both stamp readers below.
+_wt_gate_stamp_file() {
   local common tree
   tree="$(git rev-parse -q --verify 'HEAD^{tree}' 2>/dev/null)" || return 1
   [ -n "$tree" ] || return 1
   common="$(git rev-parse --git-common-dir 2>/dev/null)" || return 1
   [ -n "$common" ] || return 1
   case "$common" in /*) ;; *) common="$PWD/$common" ;; esac
-  [ -f "$common/.gate-stamps/$tree" ]
+  printf '%s/.gate-stamps/%s' "$common" "$tree"
+}
+
+wt_gate_green_stamped() {
+  local stamp
+  stamp="$(_wt_gate_stamp_file)" || return 1
+  [ -f "$stamp" ]
+}
+
+# wt_gate_green_stamped_fresh <max_age_seconds> — like wt_gate_green_stamped, but
+# additionally requires the stamp to be YOUNGER than <max_age_seconds> by file mtime.
+# A tree-identical fast-forward land (issue #270) consults this to reuse a RECENT
+# green proof instead of re-running the gate on a byte-identical tree. Existence-only
+# is the same bounded trust a clean-FF land already extends via AUTO_SKIP (issue #96)
+# — the tree WAS proven green (at some tier/env) — and the freshness bound guards
+# against env drift (a new runner/dep since the proof) waving through a tree proven
+# long ago. Fail-CLOSED: a missing stamp, an unreadable/absent mtime, a future mtime
+# (clock skew), or an age beyond the bound all return non-zero, so the land re-runs
+# the gate. The mtime read is numeric (epoch seconds), so it needs no LC_ALL pin.
+wt_gate_green_stamped_fresh() {
+  local max_age="$1" stamp now mtime age
+  [ -n "$max_age" ] || return 1
+  stamp="$(_wt_gate_stamp_file)" || return 1
+  [ -f "$stamp" ] || return 1
+  now="$(date +%s 2>/dev/null)" || return 1
+  mtime="$(_wt_file_mtime "$stamp")" || return 1
+  [ -n "$mtime" ] || return 1
+  age=$(( now - mtime ))
+  [ "$age" -ge 0 ] || return 1          # future mtime (clock skew) → fail closed
+  [ "$age" -le "$max_age" ]
 }
 
 # --- portable date/time -------------------------------------------------------
 # BSD (macOS) and GNU date differ; try the BSD form first, fall back to GNU.
 # Kept here so the unattended supervisor (hub-afk.sh) and any future caller share
 # one copy of the date/time helpers.
+
+# _wt_file_mtime <path> -> the file's mtime in epoch seconds. GNU `stat -c %Y` first
+# (Linux/CI), BSD `stat -f %m` as the fallback (macOS dev host): the GNU form errors
+# on BSD stat (unknown -c) so the || cleanly selects the right one, the mirror of the
+# BSD-first date helpers below. rc 1 (no output) when the path is unreadable.
+_wt_file_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
 
 # wt_date_ymd <epoch> -> YYYY-MM-DD (local time).
 wt_date_ymd() {
