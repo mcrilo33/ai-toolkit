@@ -2543,6 +2543,27 @@ _afk_hook_emit_allow() {
   fi
 }
 
+# _afk_hook_emit_deny <reason> -> print the PreToolUse deny verdict (issue #261). Mirrors
+# _afk_hook_emit_allow's dual shape (Claude hookSpecificOutput + a top-level Cursor `permission`).
+# The reasons this hook emits are controlled ASCII category strings (the resolver already rejected
+# quote/metachar paths), so the hand-rolled fallback needs no JSON escaping -- same contract as
+# _afk_hook_emit_allow.
+_afk_hook_emit_deny() {
+  local reason="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq -nc --arg r "$reason" '{
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: $r
+      },
+      permission: "deny"
+    }'
+  else
+    printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"},"permission":"deny"}\n' "$reason"
+  fi
+}
+
 # afk_permission_hook_decide -> read a Claude Code PreToolUse payload on stdin and print an
 # `allow` verdict IFF classify_permission APPROVEs the gated tool call inside a live drain;
 # otherwise print nothing. Always rc 0 (a PreToolUse allow-only hook must never fail a session).
@@ -2616,6 +2637,113 @@ PYEOF
   # auto-approve is a benign scoped self-op by construction, hence reversible.
   _broker_journal_line "$issue" permission "hook auto-approved: $cmd" reversible
   _afk_hook_emit_allow "afk-permission-hook: classify_permission APPROVEd a benign scoped self-op inside a live drain — auto-allowed (no dialog; ESCALATE and everything else still prompt)"
+}
+
+# --- programmatic PreToolUse deny-wall (issue #261) ---------------------------
+# Under bypassPermissions an afk spoke raises NO permission dialog (worktree-new.sh --mode afk),
+# so a PreToolUse deny-hook is the ONLY safety boundary -- and a deny-hook STILL fires and its
+# permissionDecision:"deny" is honored under bypass (proven on CC v2.1.207). afk_danger_guard_decide
+# is that wall's decision fn: read a PreToolUse payload, run three tiers, DENY the dangerous ones:
+#   Tier 2  classify_danger == DENY        -> journal + emit permissionDecision:"deny"  (deny-first)
+#   Tier 1  classify_permission == APPROVE -> silent allow (bypass runs it; no judge, no journal)
+#   Tier 3  judge_permission               -> DANGEROUS/fail-closed => journal + deny; SAFE => allow
+# Tier 2 runs BEFORE Tier 1 on purpose: classify_permission (built for the old prompt-approve
+# model) APPROVEs any read verb, so a `cat ~/.ssh/id_rsa` secret read would be Tier-1-approved and
+# never reach the deny list -- checking classify_danger first closes that gap; both static checks
+# are cheap (no LLM), so deny-first costs nothing. It reuses the SAME classifiers the drain trusts
+# (one source of truth). afk-permission-hook (#253) is left in place and untouched -- its allow is
+# redundant-but-harmless under bypass; THIS hook only adds DENY (which wins in CC).
+
+# _afk_bypass_wall_active <wt> -> rc 0 (wall ACTIVE) unless the spoke can be POSITIVELY confirmed
+# NOT under bypass. FAIL-SAFE / DENY-LEAN (#261): the ONE unacceptable state is a bypass (afk)
+# spoke with the wall OFF, so a missing / unreadable / ambiguous .ai-toolkit/mode keeps the wall
+# ACTIVE. The ONLY inert case is a positively-read `attended` mode (there the human is the wall,
+# and walling would block legit attended commands for no safety gain). The caller's issue-numbered
+# -branch gate already excludes the hub / ad-hoc lanes, so this only decides afk-vs-attended.
+_afk_bypass_wall_active() {
+  local wt="$1" root mode_file mode
+  root="$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null)" || return 0   # unresolvable -> ACTIVE
+  [ -n "$root" ] || return 0
+  mode_file="$root/.ai-toolkit/mode"
+  [ -f "$mode_file" ] || return 0                                            # missing -> ACTIVE
+  mode="$(tr -d '[:space:]' < "$mode_file" 2>/dev/null)" || return 0         # unreadable -> ACTIVE
+  case "$mode" in
+    attended) return 1 ;;   # positively attended -> INERT (the human is the wall)
+    *) return 0 ;;          # afk, or any ambiguous value -> ACTIVE (deny-lean)
+  esac
+}
+
+# afk_danger_guard_decide -> read a Claude Code PreToolUse payload on stdin and print a `deny`
+# verdict for a boundary-crossing / judge-dangerous command inside an afk (bypass) spoke; else
+# print nothing (the command runs under bypass). Always rc 0 (a PreToolUse hook must never fail a
+# session). The command string is rebuilt EXACTLY as extract_pending_command / afk_permission_hook_
+# decide do, so all three classify identically. Gated on an issue-numbered spoke branch AND the
+# fail-safe mode gate (never the hub / ad-hoc / positively-attended).
+afk_danger_guard_decide() {
+  local payload parsed wt cmd br slug issue decision djson dreason verdict vkind vreason
+  payload="$(cat)"
+  command -v python3 >/dev/null 2>&1 || return 0
+  parsed="$(_AFK_HOOK_PAYLOAD="$payload" python3 2>/dev/null <<'PYEOF'
+import json, os
+
+try:
+    obj = json.loads(os.environ.get("_AFK_HOOK_PAYLOAD") or "{}")
+except Exception:
+    obj = {}
+if not isinstance(obj, dict):
+    obj = {}
+name = (obj.get("tool_name") or "").strip()
+inp = obj.get("tool_input")
+if not isinstance(inp, dict):
+    inp = {}
+cwd = (obj.get("cwd") or "").strip()
+if name == "Bash":
+    cmd = (inp.get("command") or "").strip()
+elif name == "Read":
+    fp = (inp.get("file_path") or "").strip()
+    cmd = f"{name} {fp}" if fp else name
+elif name:
+    cmd = name
+else:
+    cmd = ""
+print(cwd)
+# NOT truncated: a deny-wall must classify the WHOLE command -- a truncated benign prefix could
+# hide a risky tail. Plain ASCII, no backticks in this comment: bash 3.2 mis-parses those nested.
+print(cmd.strip())
+PYEOF
+)"
+  case "$parsed" in *$'\n'*) ;; *) return 0 ;; esac
+  wt="${parsed%%$'\n'*}"; cmd="${parsed#*$'\n'}"
+  [ -n "$cmd" ] || return 0
+  [ -n "$wt" ] || wt="$(pwd)"
+  # Spoke gate: an issue-numbered branch slug excludes the hub (on main) and ad-hoc/express lanes.
+  br="$(git -C "$wt" branch --show-current 2>/dev/null)" || return 0
+  slug="${br##*/}"; issue="${slug%%[!0-9]*}"
+  case "$issue" in '' | *[!0-9]*) return 0 ;; esac
+  # Fail-safe mode gate: active for afk / ambiguous, inert only for a positively-attended spoke.
+  _afk_bypass_wall_active "$wt" || return 0
+  # Tier 2 (static deny) first -- see the header for why it precedes Tier 1.
+  djson="$(classify_danger "$cmd" "$wt")"
+  if [ "${djson%%$'\t'*}" = DENY ]; then
+    dreason="${djson#*$'\t'}"
+    _broker_journal_line "$issue" permission "tier2 deny: $cmd -- $dreason" scope
+    _afk_hook_emit_deny "afk-danger-guard tier-2: $dreason"
+    return 0
+  fi
+  # Tier 1 -- a benign scoped self-op the deny list already cleared: allow silently, skip the judge.
+  decision="$(classify_permission "$cmd" "$wt")"
+  [ "${decision%%$'\t'*}" = APPROVE ] && return 0
+  # Tier 3 -- the toolless LLM judge on the residue. Fail-closed (DANGEROUS) => deny.
+  verdict="$(judge_permission "$cmd" "$issue")"
+  vkind="${verdict%%$'\t'*}"
+  if [ "$vkind" = SAFE ]; then
+    _broker_journal_line "$issue" permission "tier3 judge SAFE: $cmd" reversible
+    return 0
+  fi
+  vreason="${verdict#*$'\t'}"
+  _broker_journal_line "$issue" permission "tier3 judge DENY: $cmd -- $vreason" scope
+  _afk_hook_emit_deny "afk-danger-guard tier-3: $vreason"
+  return 0
 }
 
 # --- tmux injection + telemetry -----------------------------------------------
