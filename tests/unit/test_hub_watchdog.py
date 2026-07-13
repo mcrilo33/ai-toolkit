@@ -410,12 +410,25 @@ def test_stale_marker_quiet_when_blocked_at_tip(tmp_path: Path) -> None:
 
 
 # Condition 4 — mergeable branch the drain skipped (escalate-only)
+# Staleness is measured from the DONE epoch (stamped when slot_state first reads done, #263),
+# not the progress epoch — a spoke parked > ceiling BEFORE going ready must not false-fire.
 def test_mergeable_skipped_fires_when_done_open_and_stale(tmp_path: Path) -> None:
     wt = _git_repo(tmp_path)
-    old = str(int(NOW) - 1000)  # > 900s ceiling
-    prelude = f"slot_state() {{ echo done; }}; read_progress_epoch() {{ echo {old}; }}"
+    old = str(int(NOW) - 1000)  # done > 900s ago, un-landed → a real skip
+    prelude = f"slot_state() {{ echo done; }}; read_done_epoch() {{ echo {old}; }}"
     env = {"AFK_NOW": NOW, "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo open"}
     assert _call(f"{prelude}; _wd_detect_mergeable_skipped '{wt}' 5 {NOW}", env=env).returncode == 0
+
+
+def test_mergeable_skipped_quiet_when_freshly_done(tmp_path: Path) -> None:
+    # AC4 (the #263 false-fire): a spoke that parked long BEFORE going ready is `done` only
+    # recently — its done epoch is within the ceiling, so condition 4 stays quiet even though a
+    # progress-epoch base would already read stale. auto_land gets its full ceiling to land.
+    wt = _git_repo(tmp_path)
+    fresh = str(int(NOW) - 100)  # done 100s ago (< 900s ceiling)
+    prelude = f"slot_state() {{ echo done; }}; read_done_epoch() {{ echo {fresh}; }}"
+    env = {"AFK_NOW": NOW, "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo open"}
+    assert _call(f"{prelude}; _wd_detect_mergeable_skipped '{wt}' 5 {NOW}", env=env).returncode == 1
 
 
 def test_mergeable_skipped_quiet_when_blocked_at_tip(tmp_path: Path) -> None:
@@ -429,7 +442,7 @@ def test_mergeable_skipped_quiet_when_blocked_at_tip(tmp_path: Path) -> None:
     }
     subprocess.run(["git", "tag", "blocked/5"], cwd=wt, check=True, env=env0, capture_output=True)
     old = str(int(NOW) - 1000)
-    prelude = f"slot_state() {{ echo done; }}; read_progress_epoch() {{ echo {old}; }}"
+    prelude = f"slot_state() {{ echo done; }}; read_done_epoch() {{ echo {old}; }}"
     env = {"AFK_NOW": NOW, "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo open"}
     assert _call(f"{prelude}; _wd_detect_mergeable_skipped '{wt}' 5 {NOW}", env=env).returncode == 1
 
@@ -437,7 +450,7 @@ def test_mergeable_skipped_quiet_when_blocked_at_tip(tmp_path: Path) -> None:
 def test_mergeable_skipped_quiet_when_issue_closed(tmp_path: Path) -> None:
     wt = _git_repo(tmp_path)
     old = str(int(NOW) - 1000)
-    prelude = f"slot_state() {{ echo done; }}; read_progress_epoch() {{ echo {old}; }}"
+    prelude = f"slot_state() {{ echo done; }}; read_done_epoch() {{ echo {old}; }}"
     env = {"AFK_NOW": NOW, "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo closed"}
     assert _call(f"{prelude}; _wd_detect_mergeable_skipped '{wt}' 5 {NOW}", env=env).returncode == 1
 

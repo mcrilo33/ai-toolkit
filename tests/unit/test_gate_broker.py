@@ -2942,6 +2942,76 @@ def test_slot_state_blocked_at_tip_without_pending_stays_done(
     assert result.stdout.strip() == "done", result.stdout + result.stderr
 
 
+# ── #263: slot_state stamps the un-landed clock on the first done tick ─────────
+# The watchdog's auto-land-skipped ceiling measures from this done epoch, NOT the progress
+# epoch (which pre-ages during a pre-ready park). A ready-at-tip spoke stamps it once on its
+# first done read; a still-working/waiting spoke never does; a tip advance clears it.
+def test_slot_state_ready_at_tip_stamps_done_epoch(spoke_repo: Path, tmp_path: Path) -> None:
+    statedir = tmp_path / "afk-state"
+    subprocess.run(["git", "tag", "-f", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1700000000"},
+    )
+
+    assert result.stdout.strip() == "done", result.stdout + result.stderr
+    assert (statedir / "done-5.epoch").read_text().strip() == "1700000000"
+
+
+def test_slot_state_busy_spoke_does_not_stamp_done_epoch(spoke_repo: Path, tmp_path: Path) -> None:
+    # A working spoke with no terminal marker must not stamp a done epoch (nothing to land yet).
+    statedir = tmp_path / "afk-state"
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    (pd / "session.jsonl").write_text(
+        json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "working"}]}}
+        )
+        + "\n"
+    )
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={
+            "AFK_STATE_DIR": str(statedir),
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_NOW": "1700000000",
+        },
+    )
+
+    assert result.stdout.strip() == "busy", result.stdout + result.stderr
+    assert not (statedir / "done-5.epoch").exists()
+
+
+def test_stamp_done_epoch_once_is_idempotent(tmp_path: Path) -> None:
+    # Stamp-once: the un-landed clock is fixed at the FIRST done tick and never resets while the
+    # spoke stays done, so the full ceiling elapses before the watchdog can fire.
+    statedir = tmp_path / "afk-state"
+    env = {"AFK_STATE_DIR": str(statedir)}
+
+    _call("stamp_done_epoch_once 5", env={**env, "AFK_NOW": "1700000000"})
+    _call("stamp_done_epoch_once 5", env={**env, "AFK_NOW": "1700009999"})  # second tick
+
+    assert (statedir / "done-5.epoch").read_text().strip() == "1700000000"
+
+
+def test_note_tip_progress_clears_done_epoch_on_tip_advance(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A revived spoke (tip moved past a terminal marker) must drop the stale done epoch so its
+    # next done read re-stamps fresh — otherwise the watchdog would measure from a pre-revival
+    # transition and false-fire.
+    statedir = tmp_path / "afk-state"
+    statedir.mkdir(parents=True)
+    (statedir / "tip-5").write_text("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n")  # a stale tip
+    (statedir / "done-5.epoch").write_text("1700000000\n")
+
+    _call(f"_afk_note_tip_progress '{spoke_repo}' 5", env={"AFK_STATE_DIR": str(statedir)})
+
+    assert not (statedir / "done-5.epoch").exists()
+
+
 # subtask 4: the inject-verify budget default widened 20 -> 60 ──
 
 
