@@ -515,6 +515,124 @@ def test_mergeable_skipped_quiet_when_issue_closed(tmp_path: Path) -> None:
     assert _call(f"{prelude}; _wd_detect_mergeable_skipped '{wt}' 5 {NOW}", env=env).returncode == 1
 
 
+# Condition 4 (#285) — probe mergeability, defer while the LAND lane is mid-backoff, and fire a
+# DISTINCT `conflicted-land` reason (naming the conflicting files) instead of the false "mergeable
+# branch un-landed" when the branch actually conflicts with the base.
+def _git(wt: Path, *args: str) -> str:
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    return subprocess.run(
+        ["git", "-C", str(wt), *args], check=True, env=env, capture_output=True, text=True
+    ).stdout
+
+
+def _base_branch(wt: Path) -> str:
+    return _git(wt, "symbolic-ref", "--short", "HEAD").strip()
+
+
+def _conflicting_repo(tmp_path: Path) -> tuple[Path, str]:
+    """A repo whose checked-out feature branch CONFLICTS with the base branch on README.md."""
+    wt = _git_repo(tmp_path)
+    base = _base_branch(wt)
+    (wt / "README.md").write_text("base\n")
+    _git(wt, "add", "README.md")
+    _git(wt, "commit", "-qm", "chore: base readme")
+    _git(wt, "checkout", "-qb", "feature/5-x")
+    (wt / "README.md").write_text("spoke side\n")
+    _git(wt, "commit", "-qam", "feat: spoke readme")
+    _git(wt, "checkout", "-q", base)
+    (wt / "README.md").write_text("hub side\n")
+    _git(wt, "commit", "-qam", "chore: hub readme")
+    _git(wt, "checkout", "-q", "feature/5-x")
+    return wt, base
+
+
+def _mergeable_repo(tmp_path: Path) -> tuple[Path, str]:
+    """A repo whose feature branch is cleanly mergeable into the base (disjoint files)."""
+    wt = _git_repo(tmp_path)
+    base = _base_branch(wt)
+    (wt / "README.md").write_text("base\n")
+    _git(wt, "add", "README.md")
+    _git(wt, "commit", "-qm", "chore: base readme")
+    _git(wt, "checkout", "-qb", "feature/5-x")
+    (wt / "spoke.txt").write_text("spoke only\n")
+    _git(wt, "add", "spoke.txt")
+    _git(wt, "commit", "-qm", "feat: spoke file")
+    return wt, base
+
+
+def test_land_conflicts_names_the_conflicting_file(tmp_path: Path) -> None:
+    wt, base = _conflicting_repo(tmp_path)
+    out = _call(f"_wd_land_conflicts '{wt}' 5", env={"AI_TOOLKIT_BASE_BRANCH": base}).stdout
+    assert "README.md" in out
+
+
+def test_land_conflicts_empty_when_mergeable(tmp_path: Path) -> None:
+    wt, base = _mergeable_repo(tmp_path)
+    out = _call(f"_wd_land_conflicts '{wt}' 5", env={"AI_TOOLKIT_BASE_BRANCH": base}).stdout
+    assert out.strip() == ""
+
+
+def test_mergeable_skipped_defers_while_land_lane_mid_backoff(tmp_path: Path) -> None:
+    # AC5: the watchdog must NOT declare "skipped" while the drain's LAND lane has a fresh armed
+    # retry — an analogue of the answer-lane servicing defer. A future-dated warned-state-<issue>-
+    # land means the drain is actively retrying, so condition 4 stays quiet even when done+stale+open.
+    wt = _git_repo(tmp_path)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "warned-state-5-land").write_text(
+        f"2\t{int(NOW) + 500}\n"
+    )  # next-due in the future
+    old = str(int(NOW) - 1000)
+    prelude = f"slot_state() {{ echo done; }}; read_done_epoch() {{ echo {old}; }}"
+    env = {
+        "AFK_NOW": NOW,
+        "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo open",
+        "AFK_STATE_DIR": str(statedir),
+    }
+    assert _call(f"{prelude}; _wd_detect_mergeable_skipped '{wt}' 5 {NOW}", env=env).returncode == 1
+
+
+def _run_conditions_ledger(wt: Path, base: str, tmp_path: Path) -> str:
+    """Drive _wd_run_conditions for one done+stale+open spoke; return the intervention ledger text."""
+    ledger = tmp_path / "ledger.jsonl"
+    old = str(int(NOW) - 1000)
+    prelude = (
+        f'inflight_worktrees() {{ printf "%s\\t5\\n" "{wt}"; }}; '
+        f"slot_state() {{ echo done; }}; read_done_epoch() {{ echo {old}; }}"
+    )
+    env = {
+        "AFK_NOW": NOW,
+        "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo open",
+        "HUB_WATCHDOG_LEDGER": str(ledger),
+        "HUB_WATCHDOG_LANDMARK_CMD": "true",  # stub the landmark so no real tag is written
+        "HUB_WATCHDOG_LANDMARK_REPO": str(tmp_path / "nolandmarks"),
+        "AI_TOOLKIT_BASE_BRANCH": base,
+    }
+    _call(f"{prelude}; _wd_run_conditions {NOW} off", env=env)
+    return ledger.read_text() if ledger.exists() else ""
+
+
+def test_run_conditions_fires_conflicted_land_naming_files_on_conflict(tmp_path: Path) -> None:
+    wt, base = _conflicting_repo(tmp_path)
+    ledger = _run_conditions_ledger(wt, base, tmp_path)
+    assert '"condition":"conflicted-land"' in ledger
+    assert "README.md" in ledger
+    assert '"condition":"auto-land-skipped"' not in ledger
+
+
+def test_run_conditions_fires_auto_land_skipped_when_truly_mergeable(tmp_path: Path) -> None:
+    wt, base = _mergeable_repo(tmp_path)
+    ledger = _run_conditions_ledger(wt, base, tmp_path)
+    assert '"condition":"auto-land-skipped"' in ledger
+    assert '"condition":"conflicted-land"' not in ledger
+
+
 # Condition 5 — supervisor dead
 def test_supervisor_dead_fires_when_drain_state_stale(tmp_path: Path) -> None:
     prelude = "_wd_drain_state() { echo stale; }"
