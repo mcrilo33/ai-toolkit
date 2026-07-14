@@ -382,6 +382,32 @@ def test_note_park_episode_prints_the_current_episode_onset(tmp_path: Path) -> N
     assert result.stdout.strip() == "1000", "the caller reads the episode base off stdout"
 
 
+def test_note_park_episode_restamps_when_the_tip_advanced_under_an_identical_park(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The episode key folds in the branch tip, exactly as the broker's own park record does
+    # (_broker_reanswer_exhausted resets on a moved tip). Without it, a spoke that parks on a
+    # dialog, is approved, commits, then parks on an IDENTICAL dialog reads "signature unchanged"
+    # and inherits the FIRST park's onset — re-fusing episodes one layer below the bug #283 fixes.
+    statedir = tmp_path / "sd"
+    env = {"AFK_STATE_DIR": str(statedir)}
+    expr = f"_broker_park_signature() {{ printf '%s' 'sigA'; }}; note_park_episode '{spoke_repo}' 5"
+    _call(expr, env={**env, "AFK_NOW": "1000"})
+
+    subprocess.run(
+        ["git", "commit", "-q", "--allow-empty", "-m", "red"],
+        cwd=spoke_repo,
+        check=True,
+        capture_output=True,
+        env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t"},
+    )
+    _call(expr, env={**env, "AFK_NOW": "1600"})
+
+    assert (statedir / "park-onset-5.epoch").read_text().strip() == "1600", (
+        "a park at a NEW tip is a new episode even when its signature is identical"
+    )
+
+
 def test_note_park_episode_noop_on_empty_signature(tmp_path: Path) -> None:
     # An unextractable park (_broker_park_signature fail-opens to empty) must leave the onset
     # exactly as slot_state's stamp-once left it: no episode claim we cannot substantiate.
