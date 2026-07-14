@@ -2217,3 +2217,203 @@ def test_broker_warn_continue_unconditionally_advances_backoff(
         env=env,
     )
     assert "attempt=2" in result.stdout, result.stdout + result.stderr
+
+
+# ── issue #277: PLAN-gate fast-path (waive a redundant reasoner round trip) ─────
+# When a spoke's posted PLAN restates the issue body, the gate is auto-approved WITHOUT
+# the expensive run_answerer round trip. The waive is recorded on three audit surfaces
+# (journal + gh comment, a distinct fast-path span, a hub-status ledger); a genuinely
+# divergent plan still falls through to the full reasoner unchanged.
+
+_RESTATE_BODY = (
+    "afk plan-gate waive\n\n"
+    "The measured drain spends a full answerer round trip on redundant PLAN gates. "
+    "Force LC_ALL=C before the pgrep process probe helper so a non-english argv never "
+    "dies with an illegal byte sequence. Record the waive on the decision journal, a "
+    "visible hub-status marker, and a distinct langfuse span so an operator reviewing a "
+    "landed issue can always tell human-answered versus reasoner-answered versus fast-pathed."
+)
+_RESTATING_PLAN = (
+    "Force LC_ALL=C before the pgrep process probe helper so a non-english argv never dies "
+    "with the illegal byte sequence. Record the waive on the decision journal, a visible "
+    "hub-status marker, and a distinct langfuse span, so an operator reviewing a landed issue "
+    "can tell human-answered versus reasoner-answered versus fast-pathed."
+)
+_DIVERGENT_PLAN = (
+    "Redesign the observability warehouse: introduce a Kafka ingestion queue, migrate the "
+    "DuckDB schemas to ClickHouse, stand up Prometheus exporters and Grafana dashboards, and "
+    "rewrite the Streamlit frontend as a Next.js single-page application with GraphQL."
+)
+
+
+def _fastpath_env(
+    spoke_repo: Path,
+    tmp_path: Path,
+    *,
+    plan: str,
+    body: str,
+    canary: Path,
+    issue: int = 5,
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """A GATE-parked spoke (#175 plan artifact + tag) + a fake gh returning <body> + a fake tmux
+    pane + a recording spoke-ready + a CANARY reasoner that writes <canary> if it ever runs."""
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    jsonl.write_text(_gate_park_transcript("transcript fallback plan"))
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # pin old so the inject's append advances it
+
+    art = spoke_repo / ".ai-toolkit"
+    art.mkdir(exist_ok=True)
+    (art / f"gate-{issue}.md").write_text(plan)
+    _tag_gate_at_head(spoke_repo, issue)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text("#!/usr/bin/env bash\ncat <<'GHBODY'\n" + body + "\nGHBODY\n")
+    (fake_bin / "gh").chmod(0o755)
+    tmux_log = _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
+
+    ready_log = tmp_path / "ready.log"
+    ready_stub = tmp_path / "spoke-ready.sh"
+    ready_stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready_stub.chmod(0o755)
+
+    env = {
+        "CLAUDE_PROJECTS_DIR": str(projects),
+        "SPOKE_READY": str(ready_stub),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_STATE_DIR": str(tmp_path / "sd"),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_ANSWERER_CMD": f"printf ran > '{canary}'; printf 'REVERSIBILITY: reversible\\nANSWER: Approved'",
+        "_READY_LOG": str(ready_log),
+        "_TMUX_LOG": str(tmux_log),
+    }
+    if extra:
+        env.update(extra)
+    return env
+
+
+def test_broker_plan_is_restatement_scores_and_thresholds(spoke_repo: Path) -> None:
+    # The coverage helper ECHOES the bag-of-words overlap ratio AND returns rc 0 only for a
+    # confident restatement (coverage >= threshold AND enough significant tokens).
+    restate = _call(
+        f"_broker_plan_is_restatement {shlex_quote(_RESTATING_PLAN)} {shlex_quote(_RESTATE_BODY)}; "
+        'echo "|rc=$?|"'
+    )
+    assert restate.returncode == 0
+    assert "|rc=0|" in restate.stdout, restate.stdout
+    cov = float(restate.stdout.split("|rc=")[0].strip())
+    assert cov >= 0.85, f"a restating plan must score high coverage, got {cov}"
+
+    divergent = _call(
+        f"_broker_plan_is_restatement {shlex_quote(_DIVERGENT_PLAN)} {shlex_quote(_RESTATE_BODY)}; "
+        'echo "|rc=$?|"'
+    )
+    assert "|rc=1|" in divergent.stdout, divergent.stdout
+    cov_div = float(divergent.stdout.split("|rc=")[0].strip())
+    assert cov_div < 0.85, f"a divergent plan must score low coverage, got {cov_div}"
+
+
+def test_broker_plan_is_restatement_short_plan_falls_through(spoke_repo: Path) -> None:
+    # A trivially SHORT plan cannot be judged a confident restatement even at coverage 1.0 —
+    # too few significant tokens — so it falls through (rc 1) to the full reasoner.
+    out = _call(
+        f"_broker_plan_is_restatement 'apply the fix' {shlex_quote(_RESTATE_BODY)}; echo \"|rc=$?|\""
+    )
+    assert "|rc=1|" in out.stdout, out.stdout
+
+
+def test_broker_service_gate_fastpaths_a_restating_plan(spoke_repo: Path, tmp_path: Path) -> None:
+    # AC1 headline: a PLAN-gate park whose posted plan restates the issue body is resolved
+    # WITHOUT invoking run_answerer — the canary reasoner never runs, the spoke gets an approve
+    # inject, and the waive lands a park:gate journal line naming the coverage.
+    canary = tmp_path / "reasoner-ran"
+    env = _fastpath_env(
+        spoke_repo, tmp_path, plan=_RESTATING_PLAN, body=_RESTATE_BODY, canary=canary
+    )
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert not canary.exists(), "the reasoner must NOT run when the plan restates the body"
+    tmux_log = Path(env["_TMUX_LOG"]).read_text()
+    assert "proceed to implementation" in tmux_log, f"the approve reply must inject: {tmux_log}"
+    ready = Path(env["_READY_LOG"])
+    assert "--blocked" not in (ready.read_text() if ready.exists() else ""), (
+        "a waive must not block"
+    )
+    journal = (tmp_path / "sd" / "decision-journal.jsonl").read_text()
+    assert '"park":"gate"' in journal, f"the waive must journal a park:gate line: {journal}"
+    assert "fast-path" in journal and "coverage" in journal, journal
+
+
+def test_broker_service_gate_reasoner_runs_on_divergent_plan(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # AC1 contrast: a genuinely DIVERGENT plan is NOT a restatement, so the gate falls through
+    # to the full reasoner — the canary runs and its answer path takes over.
+    canary = tmp_path / "reasoner-ran"
+    env = _fastpath_env(
+        spoke_repo, tmp_path, plan=_DIVERGENT_PLAN, body=_RESTATE_BODY, canary=canary
+    )
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert canary.exists(), "a divergent plan must fall through to the full reasoner"
+
+
+def test_broker_service_gate_fastpath_emits_distinct_span(spoke_repo: Path, tmp_path: Path) -> None:
+    # AC4: the waive emits a DISTINCT afk-answer span variant (status fast-path), never folded
+    # into a normal success answer; telemetry-off stays a no-op (no events file at all).
+    canary = tmp_path / "reasoner-ran"
+    tele = tmp_path / "telemetry"
+    env = _fastpath_env(
+        spoke_repo,
+        tmp_path,
+        plan=_RESTATING_PLAN,
+        body=_RESTATE_BODY,
+        canary=canary,
+        extra={
+            "AI_TOOLKIT_TELEMETRY": "1",
+            "AI_TOOLKIT_TELEMETRY_DIR": str(tele),
+            "AI_TOOLKIT_OTEL_SPAN_ENDPOINT": "",
+        },
+    )
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    events = tele / "events.jsonl"
+    assert events.exists(), "telemetry-on must emit a span"
+    spans = [json.loads(line) for line in events.read_text().splitlines()]
+    fast = [s for s in spans if s.get("name") == "afk-answer" and s.get("status") == "fast-path"]
+    assert fast, f"the waive must emit a status=fast-path afk-answer span: {spans}"
+    assert not any(s.get("status") == "success" for s in spans), (
+        "a waive must not also emit a normal success answer span"
+    )
+
+
+def test_broker_service_gate_fastpath_telemetry_off_is_noop(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # AC4 tail: with telemetry off the fast-path emits no span at all.
+    canary = tmp_path / "reasoner-ran"
+    tele = tmp_path / "telemetry"
+    env = _fastpath_env(
+        spoke_repo,
+        tmp_path,
+        plan=_RESTATING_PLAN,
+        body=_RESTATE_BODY,
+        canary=canary,
+        extra={"AI_TOOLKIT_TELEMETRY_DIR": str(tele), "AI_TOOLKIT_OTEL_SPAN_ENDPOINT": ""},
+    )
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert not (tele / "events.jsonl").exists(), "telemetry-off must be a no-op"
