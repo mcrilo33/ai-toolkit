@@ -7805,6 +7805,152 @@ def test_auto_land_failure_is_backoff_paced_not_every_tick(
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text()
 
 
+# ── issue #274: the answer lane must not starve auto_land of a ready spoke ─────
+# The warned-retry backoff was a single per-issue file, so an ANSWER-lane re-answer ceiling
+# (armed to its 1800s cap during a spoke's ship-phase park) paced the LAND lane and made
+# auto_land skip a ready-at-tip spoke — silently — for up to 30 min, while the watchdog's
+# 900s land ceiling escalated first (guaranteed human land, #269). The fix: auto_land paces
+# on a distinct LAND lane, the ready→done transition clears the stale warned state, every
+# skip is logged with its next-due epoch, and the land lane caps below the watchdog ceiling.
+
+
+def test_auto_land_lands_despite_an_answer_lane_backoff(spoke_repo: Path, tmp_path: Path) -> None:
+    # #274 AC1: an answer-lane (default lane) backoff armed to its cap must NOT pace the land.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
+    wt_land, land_log = _land_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "warned-state-5").write_text("7\t9999999999\n")  # answer lane at the far-future cap
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
+            "AFK_NOW": "1000",
+        },
+    )
+
+    assert land_log.exists() and land_log.read_text().split() == ["5"], (
+        "auto_land must land a ready-at-tip spoke regardless of an ANSWER-lane backoff (#274 AC1)"
+    )
+
+
+def test_ready_at_tip_lands_within_the_watchdog_window_after_ship_park(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #274 AC2/AC4 (#269 shape): answer-lane warns armed the backoff to its 1800s cap 32s before
+    # ready/<issue>. The ready→done transition clears the stale backoff and the land runs at once
+    # — far inside the 900s watchdog land ceiling — never the silent ~30-min skip.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
+    wt_land, land_log = _land_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    now = 1783975683
+    (statedir / "warned-state-5").write_text(f"7\t{now + 1769}\n")  # #269: next-due ~1800s out
+    env = {
+        "WT_LAND": str(wt_land),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_NOW": str(now),
+        "CLAUDE_PROJECTS_DIR": "/nonexistent",
+    }
+    # One tick's shape: slot_state (clears the stale warned backoff on the done transition), then
+    # auto_land. Both run in the same statedir so the clear is observable.
+    _call(
+        f"slot_state '{spoke_repo}' 5 >&2; "
+        f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land',
+        env=env,
+    )
+
+    assert land_log.exists() and land_log.read_text().split() == ["5"], (
+        "a ready-at-tip spoke lands immediately — never delayed past the watchdog ceiling (#274)"
+    )
+    assert not (statedir / "warned-state-5").exists(), (
+        "the ready→done transition clears the stale answer-lane backoff (#274 AC2)"
+    )
+
+
+def test_auto_land_logs_every_ready_at_tip_skip_with_next_due(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #274 AC3: a land paced by the LAND-lane backoff logs the reason + next-due epoch — never a
+    # silent continue that hides why a ready-at-tip spoke is not landing.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
+    wt_land, land_log = _land_recorder(tmp_path)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "warned-state-5-land").write_text("2\t2000\n")  # land lane pending, next-due 2000
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    r = _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
+            "AFK_NOW": "1000",
+        },
+    )
+
+    assert not land_log.exists() or land_log.read_text().strip() == "", (
+        "inside the land-lane backoff window → the land is skipped this tick"
+    )
+    out = r.stdout + r.stderr
+    assert "skip land #5" in out and "2000" in out, (
+        f"the skip must log the reason + next-due epoch (no silent continue); got: {out}"
+    )
+
+
+def test_slot_state_clears_the_warned_backoff_on_the_first_done_tick(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #274 AC2: emitting ready/<issue> is genuine progress — the first done tick drops the stale
+    # warned-retry backoff (both lanes), per _afk_clear_warned's "fresh marker → stale" contract.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "warned-state-5").write_text("7\t9999999999\n")
+    (statedir / "warned-state-5-land").write_text("2\t9999999999\n")
+
+    r = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={"AFK_STATE_DIR": str(statedir), "CLAUDE_PROJECTS_DIR": "/nonexistent"},
+    )
+
+    assert r.stdout.strip() == "done"
+    assert not (statedir / "warned-state-5").exists(), "answer-lane backoff cleared on ready→done"
+    assert not (statedir / "warned-state-5-land").exists(), "land-lane backoff cleared too"
+
+
+def test_slot_state_does_not_reclear_a_land_backoff_on_a_later_done_tick(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The clear fires ONCE (mirrors stamp_done_epoch_once): a land failure on an already-done
+    # spoke arms the land lane, and a later done tick must NOT wipe it — that would defeat the
+    # #241 low-frequency land-retry pacing this fix preserves.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    env = {"AFK_STATE_DIR": str(statedir), "CLAUDE_PROJECTS_DIR": "/nonexistent"}
+
+    _call(f"slot_state '{spoke_repo}' 5", env=env)  # first done tick stamps the done epoch
+    (statedir / "warned-state-5-land").write_text("1\t9999999999\n")  # land failure arms the lane
+    _call(f"slot_state '{spoke_repo}' 5", env=env)  # a LATER done tick
+
+    assert (statedir / "warned-state-5-land").exists(), (
+        "a later done tick must not re-clear a land failure's own backoff (preserves #241 pacing)"
+    )
+
+
 # ── issue #241 S8: auth failure halts DISPATCH but never stops the drain ───────
 # Auth is the one true external blocker, but it no longer breaks the main loop or blocks
 # in-flight spokes. On a dead token the drain halts dispatch, WARNS the in-flight spokes

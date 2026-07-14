@@ -643,7 +643,15 @@ slot_state() {
       marker="$(git -C "$wt_path" rev-parse -q --verify "refs/tags/${kind}/${issue}^{commit}" 2>/dev/null)"
       # Stamp the un-landed clock on the FIRST done tick (#263) so the watchdog measures the
       # ceiling from here, not a progress epoch that pre-aged during a pre-ready park.
-      [ "$marker" = "$tip" ] && { stamp_done_epoch_once "$issue"; printf 'done\n'; return; }
+      if [ "$marker" = "$tip" ]; then
+        # #274: a fresh ready/accept marker at the tip is genuine progress — drop the stale
+        # warned-retry backoff (both lanes), per _afk_clear_warned's "fresh marker → stale" contract.
+        # Gated on the done epoch being unstamped so it fires ONCE on the transition (mirrors
+        # stamp_done_epoch_once): an unconditional clear each done tick would wipe a land failure's
+        # own land-lane backoff and defeat the #241 low-frequency land-retry pacing.
+        [ -n "$(read_done_epoch "$issue")" ] || _afk_clear_warned "$issue"
+        stamp_done_epoch_once "$issue"; printf 'done\n'; return
+      fi
     done
     # blocked/<issue> at the tip is terminal ONLY if the spoke is not still parked. A
     # spurious blocked/<N> (a false escalation) over a spoke still on a question / permission
@@ -1226,17 +1234,42 @@ broker_warn() {
   return 0
 }
 
-# _afk_warned_state_file <issue> -> the backoff bookkeeping: "<attempt>\t<next_retry_epoch>".
-_afk_warned_state_file() { printf '%s\n' "$(_afk_state_dir)/warned-state-$1"; }
+# _afk_warned_state_file <issue> [lane] -> the backoff bookkeeping: "<attempt>\t<next_retry_epoch>".
+# The backoff is keyed per (issue, LANE) so one pass's warns never pace another's (#274, the same
+# cross-pass-leak family as #241). An empty lane is the default ANSWER/service lane and keeps the
+# historical "warned-state-<issue>" name; a named lane (e.g. "land") gets its own suffixed file so
+# the answer lane's re-answer ceiling cannot starve auto_land of a ready spoke (#269).
+_afk_warned_state_file() {
+  local issue="$1" lane="${2:-}"
+  if [ -n "$lane" ]; then printf '%s\n' "$(_afk_state_dir)/warned-state-$issue-$lane"
+  else printf '%s\n' "$(_afk_state_dir)/warned-state-$issue"; fi
+}
 
-# _afk_warned_arm <issue> -> advance the warned-retry backoff: read the prior attempt count
-# (0 if none), schedule the next retry at now + min(BASE * 2^attempt, CAP), and persist
-# "<attempt+1>\t<next>". Exponential so a standing failure is retried ever more rarely.
+# _afk_warned_lane <park_kind> -> the backoff lane a park kind paces. auto_land is the only
+# land-lane consumer: its OWN park kinds (land, review) pace the LAND lane so a land failure
+# throttles future LAND attempts only; every other kind (answer/reap/dispatch/permission/ceiling)
+# stays on the default lane, where an answerer's re-answer backoff belongs (#274).
+_afk_warned_lane() {
+  case "$1" in land | review) printf 'land\n' ;; *) ;; esac
+}
+
+# _afk_warned_lane_cap <park_kind> -> the backoff CAP a park kind uses (empty => the default
+# AFK_WARN_BACKOFF_CAP). The land lane caps at AFK_LAND_BACKOFF_CAP (default 600s), deliberately
+# BELOW the watchdog land ceiling (HUB_WATCHDOG_LAND_CEILING, 900s), so a done spoke's land is
+# always re-attempted before the watchdog escalates — the #274 AC4 ceiling-inversion fix.
+_afk_warned_lane_cap() {
+  case "$1" in land | review) printf '%s\n' "${AFK_LAND_BACKOFF_CAP:-600}" ;; *) ;; esac
+}
+
+# _afk_warned_arm <issue> [lane] [cap] -> advance the warned-retry backoff for one lane: read the
+# prior attempt count (0 if none), schedule the next retry at now + min(BASE * 2^attempt, CAP), and
+# persist "<attempt+1>\t<next>". Exponential so a standing failure is retried ever more rarely. An
+# empty cap falls back to AFK_WARN_BACKOFF_CAP (the land lane passes a lower cap, #274 AC4).
 _afk_warned_arm() {
-  local issue="$1" f base cap attempt=0 delay now i=0
+  local issue="$1" lane="${2:-}" cap_override="${3:-}" f base cap attempt=0 delay now i=0
   base="${AFK_WARN_BACKOFF_BASE:-60}"; case "$base" in '' | *[!0-9]*) base=60 ;; esac
-  cap="${AFK_WARN_BACKOFF_CAP:-1800}"; case "$cap" in '' | *[!0-9]*) cap=1800 ;; esac
-  f="$(_afk_warned_state_file "$issue")"
+  cap="${cap_override:-${AFK_WARN_BACKOFF_CAP:-1800}}"; case "$cap" in '' | *[!0-9]*) cap=1800 ;; esac
+  f="$(_afk_warned_state_file "$issue" "$lane")"
   if [ -f "$f" ]; then IFS=$'\t' read -r attempt _ <"$f" 2>/dev/null || true; fi
   case "$attempt" in '' | *[!0-9]*) attempt=0 ;; esac
   delay="$base"
@@ -1247,21 +1280,34 @@ _afk_warned_arm() {
   printf '%s\t%s\n' "$(( attempt + 1 ))" "$(( now + delay ))" >"$f" 2>/dev/null || true
 }
 
-# _afk_warned_due <issue> [now] -> rc 0 when the spoke is due for a retry (never warned, or the
-# backoff window has elapsed), rc 1 when still inside the backoff (parked LAST this tick).
+# _afk_warned_due <issue> [now] [lane] -> rc 0 when the spoke is due for a retry on that lane
+# (never warned, or the backoff window has elapsed), rc 1 when still inside the backoff (parked
+# LAST this tick). An empty lane reads the default (answer/service) lane.
 _afk_warned_due() {
-  local issue="$1" now="${2:-$(afk_now)}" f next=""
-  f="$(_afk_warned_state_file "$issue")"
+  local issue="$1" now="${2:-$(afk_now)}" lane="${3:-}" f next=""
+  f="$(_afk_warned_state_file "$issue" "$lane")"
   [ -f "$f" ] || return 0
   IFS=$'\t' read -r _ next <"$f" 2>/dev/null || true
   case "$next" in '' | *[!0-9]*) return 0 ;; esac
   [ "$now" -ge "$next" ]
 }
 
-# _afk_clear_warned <issue> -> drop one spoke's warned record + backoff (called on genuine
-# progress: a tip advance or a fresh marker means the warned state is stale).
+# _afk_warned_next <issue> [lane] -> echo the lane's next-due epoch (empty when never armed). The
+# auto_land skip log names it so a paced land is visible, not a silent continue (#274 AC3).
+_afk_warned_next() {
+  local f next=""
+  f="$(_afk_warned_state_file "$1" "${2:-}")"
+  [ -f "$f" ] || return 0
+  IFS=$'\t' read -r _ next <"$f" 2>/dev/null || true
+  printf '%s\n' "$next"
+}
+
+# _afk_clear_warned <issue> -> drop one spoke's warned record + backoff for EVERY lane (called on
+# genuine progress: a tip advance or a fresh marker means the warned state is stale). Clears both
+# the default (answer) lane and the land lane so no stale record in either keeps pacing (#274).
 _afk_clear_warned() {
-  rm -f "$(_afk_warned_state_file "$1")" "$(_broker_warned_record "$1")" 2>/dev/null || true
+  rm -f "$(_afk_warned_state_file "$1")" "$(_afk_warned_state_file "$1" land)" \
+        "$(_broker_warned_record "$1")" 2>/dev/null || true
 }
 # _clear_warned_records -> drop every warned record + backoff for a freshly-armed window.
 _clear_warned_records() {
@@ -1277,7 +1323,9 @@ broker_warn_continue() {
   local wt="$1" issue="$2" park="$3" decision="$4" rev="${5:-unknown}"
   broker_warn "$issue" "$decision"
   broker_journal_decision "$issue" "$park" "$decision" "$rev"
-  _afk_warned_arm "$issue"
+  # Arm the lane the park kind belongs to (#274): a land/review park paces auto_land's LAND lane
+  # (capped below the watchdog ceiling); every other kind paces the default answer/service lane.
+  _afk_warned_arm "$issue" "$(_afk_warned_lane "$park")" "$(_afk_warned_lane_cap "$park")"
   afk_emit_decision "$wt" warn
   return 0
 }

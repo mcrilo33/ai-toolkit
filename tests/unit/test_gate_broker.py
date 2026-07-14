@@ -5080,6 +5080,122 @@ def test_clear_warned_records_resets_window(tmp_path: Path) -> None:
     assert not (statedir / "warned-state-42").exists()
 
 
+# ── issue #274: the warned-retry backoff is lane-scoped ───────────────────────
+# A single per-issue backoff file let the ANSWER lane's re-answer ceiling pace the LAND
+# lane (auto_land), silently starving the land of a ready spoke (#269). The backoff is now
+# keyed per (issue, lane): the default (empty) lane keeps the historical
+# "warned-state-<issue>" name for the answer/service lane; auto_land arms + reads a distinct
+# "land" lane so the two never leak into one another.
+
+
+def test_warned_backoff_lanes_are_independent(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_WARN_BACKOFF_BASE": "1000000",  # arm to the far future so an armed lane reads WAIT
+        "AFK_NOW": "1000",
+    }
+
+    # Arming ONE lane must leave the OTHER lane untouched (still due).
+    r = _call(
+        "_afk_warned_arm 5 land; "  # arm ONLY the land lane
+        "_afk_warned_due 5 1000 '' && echo D-DUE || echo D-WAIT; "  # default lane never armed
+        "_afk_warned_due 5 1000 land && echo L-DUE || echo L-WAIT; "  # land lane parked
+        "_afk_warned_arm 7 ''; "  # arm ONLY the default (answer) lane
+        "_afk_warned_due 7 1000 land && echo L7-DUE || echo L7-WAIT; "  # land lane never armed
+        "_afk_warned_due 7 1000 '' && echo D7-DUE || echo D7-WAIT",  # default lane parked
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert "D-DUE" in out, out  # a land-lane arm does not pace the default lane
+    assert "L-WAIT" in out, out
+    assert "L7-DUE" in out, out  # an answer-lane arm does not pace the land lane (#269 root)
+    assert "D7-WAIT" in out, out
+
+
+def test_clear_warned_drops_both_lanes(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    # A genuine-progress clear must wipe EVERY lane's backoff (the answer lane AND the land
+    # lane), so a stale record in either can never keep pacing a spoke that has moved on.
+    (statedir / "warned-state-5").write_text("3\t2000\n")
+    (statedir / "warned-state-5-land").write_text("2\t2000\n")
+    (statedir / "warned-5.txt").write_text("1000\tstuck\n")
+
+    r = _call("_afk_clear_warned 5", env={"AFK_STATE_DIR": str(statedir)})
+
+    assert r.returncode == 0, r.stderr
+    assert not (statedir / "warned-state-5").exists(), "default lane cleared"
+    assert not (statedir / "warned-state-5-land").exists(), "land lane cleared too (#274)"
+    assert not (statedir / "warned-5.txt").exists(), "human record cleared"
+
+
+def test_warned_next_reports_the_lane_due_epoch(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_WARN_BACKOFF_BASE": "60",
+        "AFK_NOW": "1000",
+    }
+    # The auto_land skip log names the next-due epoch so a paced land is visible, not silent.
+    r = _call("_afk_warned_arm 5 land; _afk_warned_next 5 land", env=env)
+    assert r.stdout.strip() == "1060", r.stdout + r.stderr
+    # A never-armed lane reports nothing (no crash, empty line).
+    r2 = _call("_afk_warned_next 6 land", env={"AFK_STATE_DIR": str(statedir)})
+    assert r2.returncode == 0 and r2.stdout.strip() == "", r2.stdout + r2.stderr
+
+
+def test_warned_lane_maps_land_and_review_to_the_land_lane() -> None:
+    # auto_land is the only land-lane consumer: its own park kinds (land, review) pace the LAND
+    # lane; every other kind stays on the default (answer/service) lane.
+    r = _call(
+        'printf "[%s]\\n" "$(_afk_warned_lane land)"; '
+        'printf "[%s]\\n" "$(_afk_warned_lane review)"; '
+        'printf "[%s]\\n" "$(_afk_warned_lane reap)"; '
+        'printf "[%s]\\n" "$(_afk_warned_lane answer)"'
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.count("[land]") == 2, r.stdout  # land + review
+    assert r.stdout.count("[]") == 2, r.stdout  # reap + answer → default lane (empty)
+
+
+def test_land_lane_cap_stays_below_the_watchdog_land_ceiling() -> None:
+    # #274 AC4: the land lane caps its backoff below HUB_WATCHDOG_LAND_CEILING (900s) so a done
+    # spoke's land is always re-attempted before the watchdog escalates. Non-land kinds use the
+    # default cap (empty override → _afk_warned_arm's AFK_WARN_BACKOFF_CAP).
+    r = _call(
+        'printf "[%s]\\n" "$(_afk_warned_lane_cap land)"; '
+        'printf "[%s]\\n" "$(_afk_warned_lane_cap reap)"'
+    )
+    assert r.returncode == 0, r.stderr
+    lines = [ln.strip("[]") for ln in r.stdout.splitlines() if ln.strip()]
+    assert lines[0].isdigit() and int(lines[0]) < 900, r.stdout  # land cap < 900s ceiling
+    assert lines[1] == "", r.stdout  # non-land → no override
+
+
+def test_broker_warn_continue_routes_land_park_to_the_land_lane(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A land-park warn (auto_land's land-failure / retry-exhausted path) must arm the LAND lane
+    # ONLY — never the default lane an answerer reads — so the two pacing clocks stay separate.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    env = {
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_WARN_BACKOFF_BASE": "60",
+        "AFK_NOW": "1000",
+    }
+
+    _call(f"broker_warn_continue '{spoke_repo}' 5 land 'land failed' reversible", env=env)
+
+    assert (statedir / "warned-state-5-land").exists(), "a land-park warn arms the LAND lane"
+    assert not (statedir / "warned-state-5").exists(), "it must NOT arm the default (answer) lane"
+
+
 # ── issue #241 S2: the reasoner ALWAYS answers (rule <-> fallback policy binding) ──
 # The escalate-and-park posture is gone: the reasoner takes even irreversible/outward/
 # scope-changing decisions, preferring the reversible in-scope alternative (that IS the

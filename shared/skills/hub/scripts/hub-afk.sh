@@ -1107,7 +1107,10 @@ _afk_capture_hang_forensics() {
 # spoke's committed work is intact.
 _warn_parked_last() {
   local wt="$1" issue="$2" reason="$3" park="${4:-reap}"
-  _afk_warned_due "$issue" || return 0   # inside the backoff → parked LAST silently this tick
+  # Gate on the SAME lane broker_warn_continue arms for this park kind (#274): a land/review park
+  # reads/arms auto_land's LAND lane, every other kind the default lane — so the due-check and the
+  # arm stay on one clock. Inside the backoff → parked LAST silently this tick.
+  _afk_warned_due "$issue" "" "$(_afk_warned_lane "$park")" || return 0
   log "→ warn-park-LAST #$issue: $reason"
   _afk_set_last_action "warn-park #$issue"
   broker_warn_continue "$wt" "$issue" "$park" "$reason" reversible
@@ -1782,12 +1785,20 @@ auto_land() {
   while IFS=$'\t' read -r path issue; do
     [ -n "$issue" ] || continue
     _ready_at_tip "$path" "$issue" || continue
-    # #241: pace the whole per-issue land attempt on the warned-retry backoff. A prior land
-    # failure / unclean-review / retry-exhausted warn armed the backoff; while it is pending this
-    # spoke is skipped (parked LAST), so a permanently-conflicted land is re-attempted at LOW
-    # frequency (worktree-land is expensive) — not every tick. A fresh (never-warned) spoke is
-    # always due, so the first land attempt is never delayed. Cleared on a successful land below.
-    _afk_warned_due "$issue" || continue
+    # #241/#274: pace the per-issue land attempt on the LAND-lane warned-retry backoff. A prior
+    # land failure / unclean-review / retry-exhausted warn armed the LAND lane (auto_land's own
+    # park kinds — land, review); while it is pending this spoke is skipped (parked LAST), so a
+    # permanently-conflicted land is re-attempted at LOW frequency (worktree-land is expensive) —
+    # not every tick. Reading the LAND lane (not the shared file) is the #274 fix: an ANSWER-lane
+    # re-answer backoff no longer starves the land of a ready spoke (#269). A fresh (never-warned)
+    # spoke is always due, so the first land attempt is never delayed; the ready→done transition
+    # clears the lane (slot_state, #274) and a successful land clears it below. Never a silent skip
+    # (#274 AC3): log the reason + next-due epoch so "drain still pacing" is distinguishable from
+    # "drain abandoned it" (the watchdog's auto-land-skipped escalation).
+    if ! _afk_warned_due "$issue" "" land; then
+      log "  skip land #$issue — land-lane retry backoff pending (next-due $(_afk_warned_next "$issue" land), now $(afk_now)); retrying at low frequency"
+      continue
+    fi
     if _blocked_at_tip "$path" "$issue"; then
       # ready+blocked at a finished tip = a TRANSIENT land failure. Retry the land up to
       # AFK_LAND_RETRY_MAX times, then escalate VISIBLY — never skip-land it forever (#202 D).
