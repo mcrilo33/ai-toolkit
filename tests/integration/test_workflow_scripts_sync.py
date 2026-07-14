@@ -64,6 +64,12 @@ SOURCES["hub-afk.sh"] = HUB_SCRIPTS_DIR / "hub-afk.sh"
 # is absent from .ai-toolkit/scripts/ every synced /afk drain fails at startup, unable
 # to resolve log()/afk_now()/broker_service_gate.
 SOURCES["gate-broker.sh"] = HUB_SCRIPTS_DIR / "gate-broker.sh"
+# The gate-broker.sh core is split into functional modules (issue #275); each MUST install
+# alongside gate-broker.sh so the entry lib can source it as a co-located sibling. A module
+# absent from .ai-toolkit/scripts/ makes the deny-wall fail CLOSED (see gate-broker.sh's
+# fail-closed source loop) — but it must never be absent, hence this end-to-end guard.
+for _gb_mod in ("markers", "detect", "classify", "danger", "answerer", "permission"):
+    SOURCES[f"gate-broker-{_gb_mod}.sh"] = HUB_SCRIPTS_DIR / f"gate-broker-{_gb_mod}.sh"
 # The hardened tmux-inject primitive (issue #251) MUST install alongside gate-broker.sh: the
 # broker now sources it as a co-located sibling ($SCRIPT_DIR/hub-inject.sh) for the ONE
 # inject_and_verify both the /afk answerer and the hub-watchdog share — if it is absent from

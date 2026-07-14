@@ -17,9 +17,18 @@ import os
 import re
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SYNC_SCRIPT = REPO_ROOT / "scripts" / "sync-to-repo.sh"
 TRAVEL_LOCAL = REPO_ROOT / "scripts" / "travel-local.sh"
+HUB_SCRIPTS_DIR = REPO_ROOT / "shared" / "skills" / "hub" / "scripts"
+
+# The gate-broker.sh core is split into functional modules (issue #275). Each must be
+# registered exactly like a hub-skill sibling so it lands in a synced target's
+# .ai-toolkit/scripts/ — otherwise the entry lib sources a missing sibling and the deny-wall
+# fails CLOSED (a walled-shut spoke). Extend this tuple as each module is extracted.
+GB_MODULES = ("markers", "detect", "classify", "danger", "answerer", "permission")
 
 
 def _sync_workflow_scripts_body() -> str:
@@ -119,3 +128,32 @@ def test_hub_watchdog_takes_the_hub_skill_source_case() -> None:
 def test_hub_watchdog_source_exists_and_is_executable() -> None:
     assert HUB_WATCHDOG.is_file(), "shared/skills/hub/scripts/hub-watchdog.sh missing"
     assert os.access(HUB_WATCHDOG, os.X_OK), "hub-watchdog.sh is not executable"
+
+
+# ── gate-broker functional modules (issue #275) ───────────────────────────────
+# gate-broker.sh sources each gate-broker-<stage>.sh as a co-located sibling; a module absent
+# from a synced target fails the deny-wall CLOSED. So every module must be in the loop, take
+# the hub-skill case mapping, and exist executable — mirroring the hub-inject/hub-watchdog guards.
+@pytest.mark.parametrize("module", GB_MODULES)
+def test_gate_broker_module_registered_in_sync_loop(module: str) -> None:
+    assert f"gate-broker-{module}.sh" in _for_name_list(), (
+        f"gate-broker-{module}.sh is not registered in sync_workflow_scripts() — the entry lib "
+        "would source a missing sibling in a synced target and the deny-wall would fail closed"
+    )
+
+
+@pytest.mark.parametrize("module", GB_MODULES)
+def test_gate_broker_module_takes_the_hub_skill_source_case(module: str) -> None:
+    body = _sync_workflow_scripts_body()
+    hub_case = re.search(rf"\n\s*([\w.|-]*gate-broker-{module}\.sh[\w.|-]*)\)\s+src=", body)
+    assert hub_case is not None, (
+        f"gate-broker-{module}.sh must have the hub-skill case mapping "
+        '(src="$SHARED_DIR/skills/hub/scripts/$name"), not the toolkit-root default'
+    )
+
+
+@pytest.mark.parametrize("module", GB_MODULES)
+def test_gate_broker_module_source_exists_and_is_executable(module: str) -> None:
+    src = HUB_SCRIPTS_DIR / f"gate-broker-{module}.sh"
+    assert src.is_file(), f"shared/skills/hub/scripts/gate-broker-{module}.sh missing"
+    assert os.access(src, os.X_OK), f"gate-broker-{module}.sh is not executable"
