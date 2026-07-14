@@ -2255,18 +2255,24 @@ def _fastpath_env(
     canary: Path,
     issue: int = 5,
     extra: dict[str, str] | None = None,
+    write_artifact: bool = True,
+    transcript_plan: str = "transcript fallback plan",
 ) -> dict[str, str]:
     """A GATE-parked spoke (#175 plan artifact + tag) + a fake gh returning <body> + a fake tmux
-    pane + a recording spoke-ready + a CANARY reasoner that writes <canary> if it ever runs."""
+    pane + a recording spoke-ready + a CANARY reasoner that writes <canary> if it ever runs.
+
+    write_artifact=False models a bare ``--gate`` park that wrote NO plan artifact, so the only
+    plan text is <transcript_plan> (the transcript-extraction fallback)."""
     projects = tmp_path / "projects"
     pd = _project_dir_for(projects, spoke_repo)
     jsonl = pd / "session.jsonl"
-    jsonl.write_text(_gate_park_transcript("transcript fallback plan"))
+    jsonl.write_text(_gate_park_transcript(transcript_plan))
     os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # pin old so the inject's append advances it
 
     art = spoke_repo / ".ai-toolkit"
     art.mkdir(exist_ok=True)
-    (art / f"gate-{issue}.md").write_text(plan)
+    if write_artifact:
+        (art / f"gate-{issue}.md").write_text(plan)
     _tag_gate_at_head(spoke_repo, issue)
 
     fake_bin = tmp_path / "bin"
@@ -2365,6 +2371,33 @@ def test_broker_service_gate_reasoner_runs_on_divergent_plan(
 
     assert result.returncode == 0, result.stderr
     assert canary.exists(), "a divergent plan must fall through to the full reasoner"
+
+
+def test_broker_service_gate_fastpath_ignores_transcript_fallback(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # Regression (#277 review): a bare `--gate` park that wrote NO plan artifact must NEVER be
+    # fast-pathed off the transcript-extraction fallback ($orig_question) — that narration is not
+    # a plan the spoke authored, and (issue-derived) it scores high coverage, so trusting it could
+    # auto-approve a plan that was never written. Even a fully-restating transcript must run the
+    # reasoner when no artifact exists.
+    canary = tmp_path / "reasoner-ran"
+    env = _fastpath_env(
+        spoke_repo,
+        tmp_path,
+        plan=_RESTATING_PLAN,
+        body=_RESTATE_BODY,
+        canary=canary,
+        write_artifact=False,
+        transcript_plan=_RESTATING_PLAN,
+    )
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert canary.exists(), (
+        "a bare --gate park with no artifact must run the reasoner, never fast-path the transcript"
+    )
 
 
 def test_broker_service_gate_fastpath_disabled_falls_through(
