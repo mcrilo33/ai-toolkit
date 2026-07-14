@@ -500,6 +500,7 @@ import json, os
 pending = None        # list of formatted AskUserQuestion questions, or None
 last_asst_text = ""   # text of the most recent assistant message
 gate_plan = ""        # plan prose of a PLAN-gate park (spoke-ready.sh --gate), or ""
+gate_ids = set()      # tool_use ids of gate emissions, to detect a FAILED one (is_error)
 last_type = None
 try:
     with open(os.environ["_AFK_JSONL"]) as fh:
@@ -517,7 +518,7 @@ try:
                     pending = None
                 continue
             if last_type == "assistant":
-                asks, texts, gate_here = [], [], False
+                asks, texts, gate_id = [], [], None
                 for block in content:
                     if not isinstance(block, dict):
                         continue
@@ -533,15 +534,25 @@ try:
                             asks.append("\n".join(lines))
                     elif block.get("type") == "tool_use" and block.get("name") == "Bash":
                         if "spoke-ready.sh --gate" in ((block.get("input") or {}).get("command") or ""):
-                            gate_here = True
+                            gate_id = block.get("id") or True   # True: a park with no id (fixtures)
                 if texts:
                     last_asst_text = "\n".join(t for t in texts if t).strip()
                 pending = asks or None
                 # A PLAN-gate park = prose plan + a `spoke-ready.sh --gate` Bash, no
-                # AskUserQuestion. Remember the plan so the answerer has it to reason about.
-                if gate_here:
+                # AskUserQuestion. Remember the plan so the answerer has it to reason about; the
+                # emission's tool_result (below) can still un-latch it if it FAILED.
+                if gate_id:
                     gate_plan = last_asst_text
+                    if gate_id is not True:
+                        gate_ids.add(gate_id)
             elif last_type == "user":
+                # A gate emission that resolved with is_error (a hook DENY or a script failure)
+                # never established a park (issue #271): un-latch the plan so a spoke that keeps
+                # working is read as busy, not `waiting` — the phantom park the watchdog answered.
+                for b in content:
+                    if (isinstance(b, dict) and b.get("type") == "tool_result"
+                            and b.get("tool_use_id") in gate_ids and b.get("is_error")):
+                        gate_plan = ""
                 # A real human reply (a text block) means the spoke is no longer parked;
                 # a tool_result-only user turn (e.g. the gate Bash's result) does NOT.
                 if any(isinstance(b, dict) and b.get("type") == "text" for b in content):
@@ -1776,6 +1787,65 @@ _permission_seg_exec_ok() {
   return 0
 }
 
+# _permission_seg_marker_ok <segment> <cwd> <wt> <slug> <tasks> -> rc 0 when the segment EMITS a
+# workflow marker via the canonical emitter — `bash <path>/spoke-ready.sh …` or `bash
+# <path>/spoke-push.sh …` — with the script resolving inside the spoke's worktree/scratchpad and
+# every argument fitting the marker shape: a state flag (--gate|--accept|--blocked|--ready), a
+# numeric issue, an optional --plan-file whose path ALSO resolves in-tree (so an out-of-tree file
+# is never read into the pushed tag body), and an optional -m/--message reason (free-form — once
+# seen the segment tail is accepted, since the segment-level substitution/redirection reject in
+# _permission_seg_safe has already fired). Gate-marker emission is the drain's MOST critical
+# control-plane op (#271): a deterministic Tier-1 lane keeps it off the probabilistic Tier-3 judge,
+# which was denying `bash <path>/spoke-ready.sh --gate <N>` and leaving a spoke unable to park. The
+# `./`-invoked form is already the #240 exec lane's job, so this lane only adds the `bash <path>`
+# invocation (worktree-new.sh's seed prompt, hub-afk.sh's nudge, solo-cycle all use it). Inert
+# (rc 1) without a worktree context — the SAME confinement discipline as the #203/#240 lanes,
+# reusing _broker_resolve_in_roots (which rejects `..`, absolute paths, `.git`, secret-like names,
+# and shell metacharacters).
+_permission_seg_marker_ok() {
+  local seg="$1" cwd="$2" wt="$3" slug="$4" tasks="$5" rest tok script val_pending=""
+  [ -n "$wt" ] || return 1
+  case "$seg" in
+    'bash '*) rest="${seg#bash }" ;;             # only the canonical `bash <path>` invocation
+    *) return 1 ;;
+  esac
+  rest="${rest#"${rest%%[![:space:]]*}"}"        # ltrim
+  script="${rest%%[[:space:]]*}"                 # the script path (first token)
+  rest="${rest#"$script"}"
+  # The basename must be EXACTLY one of the two canonical emitters — never a same-named decoy
+  # elsewhere and never an arbitrary script.
+  case "${script##*/}" in
+    spoke-ready.sh | spoke-push.sh) ;;
+    *) return 1 ;;
+  esac
+  _broker_seg_secretlike "$script" && return 1
+  _broker_resolve_in_roots "$script" "$cwd" "$wt" "$slug" "$tasks" >/dev/null || return 1
+  # Walk the arguments by hand (no word-splitting) so a glob never expands; each must fit the
+  # marker shape or the whole segment is denied (default-deny).
+  while [ -n "$rest" ]; do
+    rest="${rest#"${rest%%[![:space:]]*}"}"      # ltrim
+    [ -n "$rest" ] || break
+    tok="${rest%%[[:space:]]*}"                   # first token
+    rest="${rest#"$tok"}"
+    if [ "$val_pending" = plan ]; then           # a separate-token --plan-file value
+      _broker_resolve_in_roots "$tok" "$cwd" "$wt" "$slug" "$tasks" >/dev/null || return 1
+      val_pending=""; continue
+    fi
+    case "$tok" in
+      -m | --message | --message=*) return 0 ;;   # free-form reason tail — accept the remainder
+      --plan-file) val_pending=plan ;;
+      --plan-file=*)
+        _broker_resolve_in_roots "${tok#--plan-file=}" "$cwd" "$wt" "$slug" "$tasks" \
+          >/dev/null || return 1 ;;
+      --gate | --accept | --blocked | --ready | -h | --help) ;;
+      --ready=*) case "${tok#--ready=}" in '' | *[!0-9]*) return 1 ;; esac ;;
+      -*) return 1 ;;                             # any other flag is not marker shape
+      *) case "$tok" in '' | *[!0-9]*) return 1 ;; esac ;;   # a bare positional must be the numeric issue
+    esac
+  done
+  [ -z "$val_pending" ]                           # a dangling --plan-file (no value) is malformed
+}
+
 # _permission_seg_safe <segment> [cwd wt slug tasks] -> true when ONE command segment is a
 # safe scoped self-op the spoke legitimately runs on its OWN worktree: the same vetted class
 # worktree-new.sh seeds into the spoke allowlist (unstage/stage, own-file pytest,
@@ -1810,6 +1880,17 @@ _permission_seg_safe() {
     './'*)
       if [ -n "$wt" ]; then
         _permission_seg_exec_ok "$seg" "$cwd" "$wt" "$slug" "$tasks" && return 0
+        return 1
+      fi ;;
+  esac
+  # Marker-emission lane (#271): the drain's most critical control-plane op — emitting a workflow
+  # marker via `bash <path>/spoke-{ready,push}.sh …` — is decided ENTIRELY by the lane when a
+  # worktree is known (a deterministic Tier-1 APPROVE, never the Tier-3 judge), else `bash …`
+  # falls through to default-deny. Same shape as the mutation/exec lanes above.
+  case "$seg" in
+    'bash '*)
+      if [ -n "$wt" ]; then
+        _permission_seg_marker_ok "$seg" "$cwd" "$wt" "$slug" "$tasks" && return 0
         return 1
       fi ;;
   esac

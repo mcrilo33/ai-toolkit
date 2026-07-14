@@ -165,6 +165,12 @@ echo "→ creating worktree  $WT_DIR"
 echo "→ new branch         $BRANCH (from $BASE_START)"
 git worktree add "$WT_DIR" -b "$BRANCH" "$BASE_START"
 
+# Resolve the marker-emitter dir that EXISTS in the freshly-created worktree (#271): `scripts`
+# in the ai-toolkit checkout (tracked, so it is checked out), `.ai-toolkit/scripts` in a synced
+# target. The seed prompt + allowlist below name this path so the spoke's `bash <dir>/
+# spoke-ready.sh …` marker command is runnable verbatim (and matches the deny-wall's tier-1 lane).
+MARKER_DIR="$(wt_marker_script_dir "$WT_DIR")"
+
 # --- mint the spoke_run_id ---------------------------------------------------
 # Every hook/script emitting telemetry inside this worktree reads this id, so
 # all spans of one spoke share it across sessions and resumes. Format:
@@ -326,8 +332,8 @@ fi
 # No directly-destructive verb is seeded: no `python:*` / `python -c:*` / `chmod:*` (bare) /
 # `git tag:*` / `git push:*` / `git checkout|clean:*` / `git reset --hard` / `rm` / `mv`.
 ALLOW_RULES=(
-  "Bash(bash .ai-toolkit/scripts/spoke-push.sh:*)"
-  "Bash(bash .ai-toolkit/scripts/spoke-ready.sh:*)"
+  "Bash(bash $MARKER_DIR/spoke-push.sh:*)"
+  "Bash(bash $MARKER_DIR/spoke-ready.sh:*)"
   # Tier 1 — read-only, no side effects
   "Bash(git status:*)" "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)"
   "Bash(git rev-parse:*)" "Bash(git branch --show-current)"
@@ -552,7 +558,7 @@ wt_resolve_agent_model "$SCRIPT_DIR" "$WT_CONFIG"
 # /source-task round-trip. An explicit --prompt (start-task, hub-afk's
 # kickoff_for) still wins; ad-hoc slugs (no task.md) keep the unseeded launch.
 if [ -z "$PROMPT" ] && [ -f "$TASK_MD" ]; then
-  PROMPT="Read your task contract at .ai-toolkit/task.md (issue #${ISSUE}, fetched at spawn -- no need to run /source-task). Break it into a task ledger (one entry per subtask x the solo-cycle steps ANCHOR/RED/GREEN/REVIEW/PUSH, exactly one in_progress) -- a skeleton is pre-seeded at .ai-toolkit/ledger-skeleton.md; seed your ledger from its rows so your entries match the '#<issue>.<slug> - <STEP> - <label>' schema. Honor its Gate: line: plan (the default for non-trivial work, and whenever no Gate: line is present) means the PLAN gate comes first -- explore, print the full implementation plan, emit 'bash .ai-toolkit/scripts/spoke-ready.sh --gate ${ISSUE}', and WAIT for approval before GREEN; only Gate: none runs autonomous straight through. Then implement via the solo-cycle (/cycle: RED -> GREEN -> REVIEW -> PUSH). Push your own branch each subtask; when the acceptance criteria are all met, push the final subtask and emit 'bash .ai-toolkit/scripts/spoke-push.sh --ready ${ISSUE}'. Do NOT self-land. If task.md is missing, or the issue was edited after spawn, run /source-task ${ISSUE} to re-anchor from the live issue."
+  PROMPT="Read your task contract at .ai-toolkit/task.md (issue #${ISSUE}, fetched at spawn -- no need to run /source-task). Break it into a task ledger (one entry per subtask x the solo-cycle steps ANCHOR/RED/GREEN/REVIEW/PUSH, exactly one in_progress) -- a skeleton is pre-seeded at .ai-toolkit/ledger-skeleton.md; seed your ledger from its rows so your entries match the '#<issue>.<slug> - <STEP> - <label>' schema. Honor its Gate: line: plan (the default for non-trivial work, and whenever no Gate: line is present) means the PLAN gate comes first -- explore, print the full implementation plan, emit 'bash ${MARKER_DIR}/spoke-ready.sh --gate ${ISSUE}', and WAIT for approval before GREEN; only Gate: none runs autonomous straight through. Then implement via the solo-cycle (/cycle: RED -> GREEN -> REVIEW -> PUSH). Push your own branch each subtask; when the acceptance criteria are all met, push the final subtask and emit 'bash ${MARKER_DIR}/spoke-push.sh --ready ${ISSUE}'. Do NOT self-land. If task.md is missing, or the issue was edited after spawn, run /source-task ${ISSUE} to re-anchor from the live issue."
 fi
 
 # afk_ask_rule_preflight -> warn (stderr, best-effort) when the user-global settings carry a

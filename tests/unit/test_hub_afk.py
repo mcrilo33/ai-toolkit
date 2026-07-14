@@ -6226,6 +6226,20 @@ def test_kickoff_for_points_at_task_contract() -> None:
     assert "#42" in result.stdout, "kickoff must reference the issue number"
 
 
+def test_kickoff_for_marker_path_matches_repo_layout() -> None:
+    # #271: the nudge/kickoff must name the marker path that EXISTS in the spawned worktree.
+    # These tests run from the ai-toolkit checkout (tracked scripts/), so kickoff_for must
+    # emit `bash scripts/spoke-ready.sh …` — never the nonexistent `.ai-toolkit/scripts/…`
+    # that the deny-wall judged and could not exec.
+    result = _call("kickoff_for 42")
+
+    # (the prose wraps "bash" onto the previous line for the push, so match without it)
+    assert "scripts/spoke-ready.sh --gate 42" in result.stdout, result.stdout
+    assert "scripts/spoke-push.sh --ready 42" in result.stdout, result.stdout
+    assert ".ai-toolkit/scripts/spoke-ready.sh" not in result.stdout, result.stdout
+    assert ".ai-toolkit/scripts/spoke-push.sh" not in result.stdout, result.stdout
+
+
 # ── ST6: dispatch-failure ceiling ─────────────────────────────────────────────
 
 

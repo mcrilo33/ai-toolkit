@@ -384,6 +384,22 @@ wt_main_root() {
   wt_realpath "$p"
 }
 
+# wt_marker_script_dir <root> -> the relative dir under <root> where the canonical marker
+# emitters (spoke-ready.sh / spoke-push.sh) live and are RUNNABLE: `scripts` in the ai-toolkit
+# checkout (tracked, so `git worktree add` checks them out), else `.ai-toolkit/scripts` (a synced
+# target's gitignored sync dir). The seed prompt / allowlist (worktree-new.sh) and the /afk nudge
+# (hub-afk.sh) must name the path that actually EXISTS in the spawned worktree — a mismatch is
+# denied at the deny-wall AND fails to exec, the #271 phantom-park incident. Defaults to the
+# synced-target path (the historical hardcoded value) when neither is resolvable.
+wt_marker_script_dir() {
+  local root="$1"
+  if [ -f "$root/scripts/spoke-ready.sh" ]; then
+    printf 'scripts\n'
+  else
+    printf '.ai-toolkit/scripts\n'
+  fi
+}
+
 # --- review workspace file (issue #134) ----------------------------------------
 # The VS Code review "window" is a saved .code-workspace file. `code --add` /
 # `code --remove` target the *last-focused* window and routinely miss (landed

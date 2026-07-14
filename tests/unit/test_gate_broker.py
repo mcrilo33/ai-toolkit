@@ -2538,6 +2538,150 @@ def test_extract_pending_question_ignores_reasoner_transcript(
     )
 
 
+# ── issue #271: a FAILED gate emission must not latch a phantom park ───────────
+# extract_pending_question latched gate_plan whenever an assistant turn merely CONTAINED a
+# `spoke-ready.sh --gate` Bash — success was never checked, so a DENIED emission (the whole
+# #271 incident) left slot_state reading `waiting` forever over a busy spoke, and the watchdog
+# then answered a park that never existed. The fix ties the latch to the gate tool_use's
+# tool_result: an is_error result un-latches it.
+
+
+def _gate_bash_turn(plan: str, tool_id: str = "tu_gate", issue: int = 5) -> dict:
+    """An assistant turn: a prose plan + a `spoke-ready.sh --gate` Bash carrying a tool_use id."""
+    return {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {"type": "text", "text": plan},
+                {
+                    "type": "tool_use",
+                    "name": "Bash",
+                    "id": tool_id,
+                    "input": {
+                        "command": (
+                            f"bash .ai-toolkit/scripts/spoke-ready.sh --gate {issue} "
+                            "--plan-file .ai-toolkit/gate-plan.md"
+                        )
+                    },
+                },
+            ]
+        },
+    }
+
+
+def _gate_tool_result(tool_id: str = "tu_gate", *, is_error: bool) -> dict:
+    """The user turn Claude Code appends for the gate Bash's result (a hook deny → is_error)."""
+    block: dict = {"type": "tool_result", "tool_use_id": tool_id, "content": "result"}
+    if is_error:
+        block["is_error"] = True
+    return {"type": "user", "message": {"content": [block]}}
+
+
+def _spoke_activity_turn() -> dict:
+    """The spoke's OWN work after a failed emission — an assistant tool_use, no park."""
+    return {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {"type": "text", "text": "That was denied — investigating the guard instead."},
+                {"type": "tool_use", "name": "Read", "id": "tu_r", "input": {"file_path": "x.sh"}},
+            ]
+        },
+    }
+
+
+def _write_transcript(projects: Path, wt: Path, records: list[dict]) -> None:
+    pd = _project_dir_for(projects, wt)
+    (pd / "session.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+
+
+def test_extract_pending_question_drops_failed_gate_emission(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A gate Bash whose tool_result is_error (a deny), then the spoke keeps working: the
+    # emission failed, so no park was ever established — extract must return empty.
+    projects = tmp_path / "projects"
+    _write_transcript(
+        projects,
+        spoke_repo,
+        [
+            _gate_bash_turn("PLAN PROSE that must not latch a phantom park"),
+            _gate_tool_result(is_error=True),
+            _spoke_activity_turn(),
+        ],
+    )
+
+    result = _call(
+        f"extract_pending_question '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
+    )
+
+    assert result.stdout.strip() == "", (
+        f"a denied gate emission must not latch a phantom park: {result.stdout!r}"
+    )
+
+
+def test_extract_pending_question_keeps_plan_on_successful_gate(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A gate Bash whose tool_result is a SUCCESS (no is_error): a real park — extract still
+    # returns the plan prose so the answerer has it to reason about.
+    projects = tmp_path / "projects"
+    _write_transcript(
+        projects,
+        spoke_repo,
+        [
+            _gate_bash_turn("REAL PLAN PROSE for a genuine park"),
+            _gate_tool_result(is_error=False),
+        ],
+    )
+
+    result = _call(
+        f"extract_pending_question '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
+    )
+
+    assert "REAL PLAN PROSE" in result.stdout, (
+        f"a successful gate park must still surface the plan: {result.stdout!r}"
+    )
+
+
+def test_extract_pending_question_keeps_plan_before_tool_result(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # Backward-compat: a gate Bash with NO tool_result yet (the emission is still resolving, or
+    # a fixture omits it) stays a park — the latch clears only on a POSITIVE is_error signal.
+    projects = tmp_path / "projects"
+    _write_transcript(projects, spoke_repo, [_gate_bash_turn("PLAN awaiting its result")])
+
+    result = _call(
+        f"extract_pending_question '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
+    )
+
+    assert "PLAN awaiting its result" in result.stdout, result.stdout
+
+
+def test_slot_state_busy_after_failed_gate_emission(spoke_repo: Path, tmp_path: Path) -> None:
+    # The incident shape end to end: a denied gate emission, no gate/<N> tag at the tip, the
+    # spoke still working. slot_state must read `busy`, not `waiting` — so the watchdog never
+    # answers a phantom park.
+    projects = tmp_path / "projects"
+    _write_transcript(
+        projects,
+        spoke_repo,
+        [
+            _gate_bash_turn("PLAN PROSE"),
+            _gate_tool_result(is_error=True),
+            _spoke_activity_turn(),
+        ],
+    )
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={"CLAUDE_PROJECTS_DIR": str(projects), "AFK_NOW": "1000000100"},
+    )
+
+    assert result.stdout.strip() == "busy", result.stdout + result.stderr
+
+
 def test_spoke_idle_seconds_not_refreshed_by_reasoner_write(
     spoke_repo: Path, reasoner_env: dict[str, str]
 ) -> None:
@@ -3813,6 +3957,100 @@ def test_classify_permission_escalates_script_exec_with_substitution(
     tasks = tmp_path / "tasks"
 
     assert _classify_with_wt("./x.sh $(rm -rf ~)", spoke_repo, tasks) == "ESCALATE"
+
+
+# ── issue #271: tier-1 marker-emission lane (spoke-ready.sh / spoke-push.sh) ────
+# Gate-marker emission is the drain's most critical control-plane op, yet the canonical
+# `bash <path>/spoke-ready.sh --gate <N> …` invocation fell through _permission_seg_safe to
+# default-deny → the probabilistic Tier-3 judge, which denied it (a spoke could never park).
+# The marker lane gives it a DETERMINISTIC Tier-1 APPROVE: the script basename must be a
+# canonical emitter, the script + any --plan-file resolve inside the worktree, and the args
+# fit the marker shape. Confinement is identical to the #203/#240 lanes (decided entirely by
+# the lane when a worktree is known, else default-deny), so an out-of-tree or metachar form
+# escalates.
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # the contract's verbatim command (this repo's tracked scripts/ path)
+        "bash scripts/spoke-ready.sh --gate 270 --plan-file .ai-toolkit/gate-plan.md",
+        # the synced-target path form (resolves textually in-tree even if absent on disk)
+        "bash .ai-toolkit/scripts/spoke-ready.sh --gate 270",
+        "bash .ai-toolkit/scripts/spoke-ready.sh --gate 270 -m short plan text",
+        # spoke-push.sh --ready
+        "bash .ai-toolkit/scripts/spoke-push.sh --ready 270",
+        "bash scripts/spoke-push.sh",  # a bare per-subtask push
+        # the terminal markers the drain emits
+        "bash scripts/spoke-ready.sh --accept 270 -m built and reviewed",
+        "bash scripts/spoke-ready.sh --blocked 270 -m the blocker",
+        "bash scripts/spoke-ready.sh 270",  # bare ready
+    ],
+)
+def test_classify_permission_approves_marker_emission(
+    cmd: str, spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The canonical `bash <in-tree>/spoke-{ready,push}.sh …` marker invocation is a Tier-1
+    # scoped self-op: the script resolves under the worktree and the args fit the marker shape.
+    tasks = tmp_path / "tasks"
+
+    assert _classify_with_wt(cmd, spoke_repo, tasks) == "APPROVE"
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "bash /tmp/spoke-ready.sh --gate 270",  # absolute out-of-tree script
+        "bash ../evil/spoke-ready.sh --gate 270",  # traversal out of the worktree
+        "bash scripts/deploy.sh --gate 270",  # not a canonical marker basename
+        "bash scripts/spoke-ready.sh --gate $(rm -rf ~)",  # command substitution
+        "bash scripts/spoke-ready.sh --gate 270 > /etc/afk_probe",  # redirection
+        "bash scripts/spoke-ready.sh --gate 270 --plan-file /etc/passwd",  # out-of-tree plan-file
+        "bash scripts/spoke-ready.sh --gate 270; rm -rf .",  # a risky tail segment
+    ],
+)
+def test_classify_permission_escalates_marker_emission_escapes(
+    cmd: str, spoke_repo: Path, tmp_path: Path
+) -> None:
+    # Same-named script outside the worktree, a non-marker basename, an out-of-tree --plan-file,
+    # and any substitution/redirection metachar must escalate — the lane keeps the #203/#240
+    # confinement discipline.
+    tasks = tmp_path / "tasks"
+
+    assert _classify_with_wt(cmd, spoke_repo, tasks) == "ESCALATE"
+
+
+def test_classify_permission_escalates_marker_emission_without_worktree(
+    spoke_repo: Path,
+) -> None:
+    # With no worktree context the in-tree claim cannot be verified, so a `bash <path>` marker
+    # emission fails closed → escalate (mirrors the mutation/exec lanes' inert-without-worktree).
+    result = _call(
+        'classify_permission "$CMD" | cut -f1',
+        env={"CMD": "bash scripts/spoke-ready.sh --gate 270"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ESCALATE"
+
+
+def test_danger_guard_allows_marker_emission_without_judge(
+    afk_bypass_spoke: tuple[Path, dict[str, str]],
+) -> None:
+    # The load-bearing property (#271): under the bypass deny-wall, the canonical marker
+    # command is a Tier-1 benign self-op, so the wall stays SILENT and the Tier-3 judge is
+    # NEVER consulted. The judge stub is wired to DENY — if the marker command reached it, the
+    # wall would emit a deny; a silent verdict proves Tier 1 short-circuited before the judge.
+    wt, env = afk_bypass_spoke
+    env = {**env, "AFK_JUDGE_CMD": "printf 'VERDICT: dangerous\\n'"}
+    cmd = "bash scripts/spoke-ready.sh --gate 261 --plan-file .ai-toolkit/gate-plan.md"
+
+    result = _decide(_hook_payload("Bash", wt, command=cmd), env)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "", (
+        f"marker emission must be a Tier-1 silent allow, never judged: {result.stdout}"
+    )
 
 
 def test_classify_permission_escalates_brace_expansion_escape(

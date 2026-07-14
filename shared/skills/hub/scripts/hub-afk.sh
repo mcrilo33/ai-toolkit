@@ -1363,7 +1363,12 @@ _afk_service_auth_halt() {
 # and the supervisor's answerer plays the human. So the kickoff is deliberately the
 # everyday one, NOT a "park, never ask" variant.
 kickoff_for() {
-  local n="$1"
+  local n="$1" marker_dir
+  # Name the marker-emitter path that EXISTS in the spoke's worktree (#271): `scripts` in the
+  # ai-toolkit checkout, `.ai-toolkit/scripts` in a synced target. The spoke is cut from the hub
+  # (_AFK_TOPLEVEL), which shares the layout, so probe it — a hardcoded `.ai-toolkit/scripts/`
+  # nudge re-emits the nonexistent path this repo's deny-wall judges and cannot exec.
+  marker_dir="$(wt_marker_script_dir "${_AFK_TOPLEVEL:-.}")"
   cat <<EOF
 You're in a dedicated worktree for issue #$n. Your task contract is on disk at
 .ai-toolkit/task.md (worktree-new.sh fetched it at spawn) — read it; no need to run
@@ -1380,14 +1385,14 @@ marker AND hand it your plan, so the hub reads it from a scripted artifact rathe
 parsing your transcript: write the plan to a gitignored scratch file (e.g.
 \`.ai-toolkit/gate-plan.md\` — the .ai-toolkit/ dir is gitignored, so it never dirties your
 tree or blocks the ready gate) and pass it with
-\`bash .ai-toolkit/scripts/spoke-ready.sh --gate $n --plan-file .ai-toolkit/gate-plan.md\`
+\`bash ${marker_dir}/spoke-ready.sh --gate $n --plan-file .ai-toolkit/gate-plan.md\`
 (or inline a short plan with \`--gate $n -m "<plan>"\`). That parks you at the gate; WAIT for
 approval before writing code (before GREEN). If the gate is \`none\`, run autonomous straight through.
 
 Then implement following the solo-cycle (/cycle: RED → GREEN → REVIEW → PUSH). Push your
 own branch on every subtask without asking; when your ledger shows the issue's acceptance
 criteria are all met, push the final subtask and emit the ready marker (bash
-.ai-toolkit/scripts/spoke-push.sh --ready $n) — also without asking. Still ask before
+${marker_dir}/spoke-push.sh --ready $n) — also without asking. Still ask before
 genuinely dangerous or irreversible ops (force-push, history rewrites, anything touching
 \`main\`, deletions outside the worktree). Do NOT self-land — the hub lands #$n.
 EOF

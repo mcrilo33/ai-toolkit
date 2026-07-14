@@ -2060,3 +2060,48 @@ def test_gate_green_stamped_fresh_rejects_a_missing_stamp(tmp_path: Path) -> Non
     result = _call_fresh(repo, 86400)
 
     assert result.returncode != 0  # no proof → fail closed
+
+
+# ── issue #271: resolve the marker-emitter dir that EXISTS in the spawned worktree ──
+# The canonical emitters (spoke-ready.sh / spoke-push.sh) live at a DIFFERENT path in the
+# ai-toolkit checkout (tracked `scripts/`) than in a synced target (gitignored
+# `.ai-toolkit/scripts/`). worktree-new.sh's seed prompt / allowlist and hub-afk.sh's nudge
+# must name the path that is actually runnable there — a mismatch denies at the deny-wall AND
+# fails to exec, the #271 phantom-park incident. wt_marker_script_dir probes a root and prints
+# the right prefix.
+
+
+def test_wt_marker_script_dir_prefers_tracked_scripts(tmp_path: Path) -> None:
+    root = tmp_path / "toolkit"
+    (root / "scripts").mkdir(parents=True)
+    (root / "scripts" / "spoke-ready.sh").write_text("#!/usr/bin/env bash\n")
+
+    result = _call(f"wt_marker_script_dir '{root}'")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "scripts"
+
+
+def test_wt_marker_script_dir_falls_back_to_ai_toolkit(tmp_path: Path) -> None:
+    # A synced target has no tracked scripts/spoke-ready.sh; the emitters are synced into the
+    # gitignored .ai-toolkit/scripts/.
+    root = tmp_path / "target"
+    (root / ".ai-toolkit" / "scripts").mkdir(parents=True)
+    (root / ".ai-toolkit" / "scripts" / "spoke-ready.sh").write_text("#!/usr/bin/env bash\n")
+
+    result = _call(f"wt_marker_script_dir '{root}'")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == ".ai-toolkit/scripts"
+
+
+def test_wt_marker_script_dir_defaults_when_neither_present(tmp_path: Path) -> None:
+    # Neither layout resolvable (an empty/odd root): default to the synced-target path — the
+    # historical hardcoded value, so nothing regresses for a target that seeds scripts later.
+    root = tmp_path / "bare"
+    root.mkdir()
+
+    result = _call(f"wt_marker_script_dir '{root}'")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == ".ai-toolkit/scripts"

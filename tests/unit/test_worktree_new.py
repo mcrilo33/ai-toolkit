@@ -604,6 +604,69 @@ def test_default_seed_prompt_points_at_task_contract(hub: Path, tmp_path: Path) 
     assert ".ai-toolkit/task.md" in new_window[0], "default seed prompt must point at task.md"
 
 
+# ── issue #271: the seed marker command must be runnable in the spawned worktree ──
+# The seed prompt hardcoded `bash .ai-toolkit/scripts/spoke-ready.sh …` — correct for a synced
+# TARGET, but WRONG in the ai-toolkit checkout, where the emitters are tracked at scripts/ and a
+# fresh worktree's .ai-toolkit/ has no scripts/. A spoke then wasted judge round-trips on a path
+# that neither the deny-wall approved nor exec'd, and could never park. worktree-new.sh now
+# resolves the path that actually EXISTS in the worktree (wt_marker_script_dir).
+
+
+def _seed_hub_marker_scripts(hub: Path) -> None:
+    """Track scripts/spoke-ready.sh + spoke-push.sh in the hub — THIS repo's layout."""
+    scripts = hub / "scripts"
+    scripts.mkdir(exist_ok=True)
+    for name in ("spoke-ready.sh", "spoke-push.sh"):
+        (scripts / name).write_text("#!/usr/bin/env bash\ntrue\n")
+        (scripts / name).chmod(0o755)
+    _git(hub, "add", "scripts")
+    _git(hub, "commit", "-qm", "chore: add marker scripts", "-m", "Refs #0")
+    _git(hub, "push", "-q", "origin", "main")
+
+
+def test_seed_prompt_marker_path_runnable_in_toolkit_worktree(hub: Path, tmp_path: Path) -> None:
+    # #271 criterion 4: in a checkout that TRACKS scripts/spoke-ready.sh (the ai-toolkit repo),
+    # the dispatched contract's marker command must name `scripts/…`, not the nonexistent
+    # `.ai-toolkit/scripts/…`, so it is runnable VERBATIM in the fresh worktree.
+    _seed_hub_marker_scripts(hub)
+    env = {"GH_ISSUE_TITLE": "Some Issue Title", "GH_ISSUE_BODY": "Do the thing.\nGate: plan\n"}
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", extra_env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    # tmux logs the prompt with backslash-escaped spaces; strip them to test the plain text.
+    new_window = _calls(log.read_text(), "new-window")[0].replace("\\", "")
+    assert "bash scripts/spoke-ready.sh --gate" in new_window, new_window
+    assert "bash scripts/spoke-push.sh --ready" in new_window, new_window
+    assert ".ai-toolkit/scripts/spoke-ready.sh" not in new_window, new_window
+    wt = _worktree_dir(hub, "8")
+    assert (wt / "scripts" / "spoke-ready.sh").is_file(), "the marker script must exist to run"
+
+
+def test_seed_prompt_marker_allowlist_matches_toolkit_layout(hub: Path) -> None:
+    # The seeded harness allow rule must match the SAME path the prompt names, or an attended
+    # spoke re-prompts on every marker emission.
+    _seed_hub_marker_scripts(hub)
+    _seed_hub_claude(hub)
+
+    proc = _run_new_quiet(hub, "99", "pushguard")
+
+    assert proc.returncode == 0, proc.stderr
+    allow = _load_allowlist(_worktree_dir(hub, "99"))["permissions"]["allow"]
+    assert "Bash(bash scripts/spoke-ready.sh:*)" in allow, allow
+    assert "Bash(bash scripts/spoke-push.sh:*)" in allow, allow
+
+
+def test_seed_prompt_marker_path_defaults_for_synced_layout(hub: Path, tmp_path: Path) -> None:
+    # A hub WITHOUT tracked scripts/ (a synced target's shape) keeps the historical
+    # `.ai-toolkit/scripts/` path so nothing regresses for targets.
+    env = {"GH_ISSUE_TITLE": "T", "GH_ISSUE_BODY": "Do the thing.\nGate: plan\n"}
+    proc, log = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", extra_env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    new_window = _calls(log.read_text(), "new-window")[0].replace("\\", "")
+    assert "bash .ai-toolkit/scripts/spoke-ready.sh --gate" in new_window, new_window
+
+
 def test_partial_gh_failure_writes_no_task_contract(hub: Path, tmp_path: Path) -> None:
     # Issue #206 — if the body fetch fails (empty) after the title fetch succeeds, a
     # title-only task.md would exist but be empty of contract, and its mere existence
