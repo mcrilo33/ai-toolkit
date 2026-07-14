@@ -544,18 +544,15 @@ $cmd
 EOF
 }
 
-# judge_permission <cmd> [issue] -> "SAFE" or "DANGEROUS<TAB><reason>". Cache-first; otherwise
-# run the toolless headless judge, bounded and fail-closed. Only a PARSED verdict (VERDICT:
-# safe|dangerous) is cached: an unavailable or unparseable judge fails closed for THIS decision
-# but is never cached, so a transient failure cannot poison the command for the whole window
-# (#268). A nonzero rc also feeds the consecutive-unavailable streak (_judge_note_unavailable):
-# at the threshold a drain-level halt is raised; a reachable judge clears it (_judge_note_available).
-# Always rc 0 (the verdict is on stdout, like classify_permission / classify_danger).
-judge_permission() {
-  local cmd="$1" key cache f raw rc verdict secs jcmd prompt pf tag cacheable=0
-  key="$(_judge_cache_key "$cmd")"
-  cache="$(_judge_cache_dir)"; f="$cache/$key"
-  if [ -n "$key" ] && [ -f "$f" ]; then cat "$f" 2>/dev/null; return 0; fi
+# _judge_raw <cmd> -> run ONE bounded round trip of the toolless judge over <cmd> and print its
+# raw stdout; the rc is the judge's own (0 reachable, 124/142 timed out, anything else broken).
+# PURE: no cache read/write, no streak/halt bookkeeping, no verdict parsing -- the caller owns
+# every side effect. Shared by judge_permission (which decides, caches, and counts streaks) and
+# broker_judge_probe (which only asks "is the judge alive", #279) so the two can never drift on
+# WHAT a round trip is -- the probe must exercise the real prompt, command, and budget, or it
+# would prove the liveness of something the drain does not actually use.
+_judge_raw() {
+  local cmd="$1" secs jcmd prompt pf raw rc
   secs="$(_judge_timeout)"
   jcmd="$(_judge_base_cmd)"
   prompt="$(_judge_prompt "$cmd")"
@@ -567,22 +564,49 @@ judge_permission() {
   [ -n "$pf" ] && { printf '%s' "$prompt" > "$pf"; jcmd="exec <'$pf'; $jcmd"; }
   raw="$(_broker_run_bounded "$secs" bash -c "$jcmd" <<<"$prompt" 2>/dev/null)"; rc=$?
   [ -n "$pf" ] && rm -f "$pf" 2>/dev/null
+  printf '%s' "$raw"
+  return "$rc"
+}
+
+# _judge_parse_tag <raw> -> the verdict the judge answered: "safe", "dangerous", or EMPTY when
+# the output carries no parseable VERDICT line (which every caller reads as unusable).
+_judge_parse_tag() {
+  printf '%s' "$1" | grep -ioE 'VERDICT:[[:space:]]*(safe|dangerous)' | tail -1 \
+    | grep -ioE 'safe|dangerous' | tr '[:upper:]' '[:lower:]'
+}
+
+# _judge_fail_reason <rc> -> the fail-closed reason for a NONZERO judge rc (#268 AC3): a TIMEOUT
+# (coreutils `timeout` -> 124, perl `alarm`/SIGALRM -> 142, the path this macOS host hits with no
+# coreutils installed) reads differently from any other judge failure, so the decision journal
+# separates "the budget was too short" from "the judge is broken". 137/143 (SIGKILL/SIGTERM) are
+# deliberately NOT treated as timeouts -- they overlap with non-timeout kills and would over-claim.
+_judge_fail_reason() {
+  case "$1" in
+    124 | 142) printf 'judge timed out (rc=%s)' "$1" ;;
+    *) printf 'judge unavailable (rc=%s)' "$1" ;;
+  esac
+}
+
+# judge_permission <cmd> [issue] -> "SAFE" or "DANGEROUS<TAB><reason>". Cache-first; otherwise
+# run the toolless headless judge, bounded and fail-closed. Only a PARSED verdict (VERDICT:
+# safe|dangerous) is cached: an unavailable or unparseable judge fails closed for THIS decision
+# but is never cached, so a transient failure cannot poison the command for the whole window
+# (#268). A nonzero rc also feeds the consecutive-unavailable streak (_judge_note_unavailable):
+# at the threshold a drain-level halt is raised; a reachable judge clears it (_judge_note_available).
+# Always rc 0 (the verdict is on stdout, like classify_permission / classify_danger).
+judge_permission() {
+  local cmd="$1" key cache f raw rc verdict tag cacheable=0
+  key="$(_judge_cache_key "$cmd")"
+  cache="$(_judge_cache_dir)"; f="$cache/$key"
+  if [ -n "$key" ] && [ -f "$f" ]; then cat "$f" 2>/dev/null; return 0; fi
+  raw="$(_judge_raw "$cmd")"; rc=$?
   if [ "$rc" -ne 0 ]; then
-    # #268 AC3: distinguish a TIMEOUT (coreutils `timeout` -> 124, perl `alarm`/SIGALRM -> 142,
-    # the path this macOS host hits with no coreutils installed) from any other judge failure,
-    # so the decision journal separates "the budget was too short" from "the judge is broken".
-    # 137/143 (SIGKILL/SIGTERM) are deliberately NOT treated as timeouts -- they overlap with
-    # non-timeout kills and would over-claim.
-    case "$rc" in
-      124 | 142) verdict="$(printf 'DANGEROUS\tjudge timed out (rc=%s) -- fail-closed' "$rc")" ;;
-      *) verdict="$(printf 'DANGEROUS\tjudge unavailable (rc=%s) -- fail-closed' "$rc")" ;;
-    esac
+    verdict="$(printf 'DANGEROUS\t%s -- fail-closed' "$(_judge_fail_reason "$rc")")"
     # #268 AC4: an unavailable judge is a transient outcome -- count the consecutive streak and,
     # at the threshold, raise the drain-level halt so dispatch pauses instead of grinding on.
     _judge_note_unavailable
   else
-    tag="$(printf '%s' "$raw" | grep -ioE 'VERDICT:[[:space:]]*(safe|dangerous)' | tail -1 \
-      | grep -ioE 'safe|dangerous' | tr '[:upper:]' '[:lower:]')"
+    tag="$(_judge_parse_tag "$raw")"
     case "$tag" in
       safe) verdict="SAFE"; cacheable=1 ;;
       dangerous) verdict="$(printf 'DANGEROUS\tjudge verdict: dangerous')"; cacheable=1 ;;
@@ -597,4 +621,47 @@ judge_permission() {
     printf '%s\n' "$verdict" > "$f" 2>/dev/null || true
   fi
   printf '%s\n' "$verdict"
+}
+
+# --- arm-time judge liveness probe (issue #279) --------------------------------
+# The /afk arm path checks its dependencies STATICALLY, so the #268 host -- where a 2s budget
+# could not cover a `claude -p` cold start -- armed clean and then fail-closed every uncached
+# tier-3 verdict for an hour, diagnosed only by autopsying a stranded spoke's judge-cache. This
+# probe is the arm-time round trip that catches that class BEFORE a single spoke dispatches.
+
+# _judge_sentinel -> the command the liveness probe asks the judge to classify. Benign and
+# read-only: the probe cares whether the judge ANSWERS, so the sentinel must never be
+# interesting enough for its verdict to matter.
+_judge_sentinel() { printf '%s\n' "${AFK_JUDGE_SENTINEL:-git status --porcelain}"; }
+
+# broker_judge_probe [sentinel] -> rc 0 + "AVAILABLE<TAB><verdict>" when the real judge answered
+# with a PARSED verdict; rc 1 + "UNAVAILABLE<TAB><reason>" on a timeout, a broken judge, or an
+# unparseable answer. Runs through _judge_raw, so it exercises the real prompt/command/budget --
+# AFK_JUDGE_TIMEOUT=1 reproduces #268 here exactly as it did in production.
+#
+# Only PARSE-ability is required, never a specific verdict value: a judge answering "dangerous"
+# for a read-only sentinel is odd but demonstrably alive, and asserting the value would turn LLM
+# nondeterminism into a false arm refusal.
+#
+# SIDE-EFFECT-FREE BY CONSTRUCTION (#268): a probe is not a decision, so it writes NO verdict
+# cache entry (a cached sentinel would be the very poisoning #268 taught us to avoid) and
+# touches NEITHER _judge_note_unavailable NOR _judge_note_available -- the streak and the
+# drain-level halt belong to real decisions only. A probe that counted its own failures would
+# hand the fresh window a pre-raised halt; one that cleared the flag would resume dispatch on
+# no evidence. That is why this calls _judge_raw directly rather than reusing judge_permission.
+broker_judge_probe() {
+  local cmd raw rc tag
+  cmd="${1:-$(_judge_sentinel)}"
+  raw="$(_judge_raw "$cmd")"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf 'UNAVAILABLE\t%s\n' "$(_judge_fail_reason "$rc")"
+    return 1
+  fi
+  tag="$(_judge_parse_tag "$raw")"
+  if [ -z "$tag" ]; then
+    printf 'UNAVAILABLE\tjudge verdict unparseable\n'
+    return 1
+  fi
+  printf 'AVAILABLE\tjudge verdict: %s\n' "$tag"
+  return 0
 }
