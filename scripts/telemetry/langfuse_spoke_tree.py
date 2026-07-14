@@ -218,15 +218,18 @@ from telemetry.spoke_tree.loaded_context import (
     request_context_rows,
 )
 from telemetry.spoke_tree.metadata import (
+    apply_lifecycle_metadata,
     apply_mode_lane_tags,
     apply_outcome_tag,
     apply_repo_tag,
     apply_request_body_metadata,
+    build_lifecycle_timeline,
     read_mode_lane,
     read_outcome,
 )
 from telemetry.spoke_tree.observations import (
     IngestEvent,
+    Lifecycle,
     ToolContent,
     TraceObservations,
     _earliest_start,
@@ -240,6 +243,7 @@ from telemetry.spoke_tree.rollups import (
 from telemetry.spoke_tree.scores import (
     build_agent_verdict_scores,
     build_enforcement_fire_scores,
+    build_lifecycle_stage_scores,
     build_mcp_call_scores,
     build_mcp_carry_cost_scores,
     build_mcp_def_load_scores,
@@ -254,6 +258,7 @@ from telemetry.spoke_tree.scores import (
     build_step_duration_scores,
     build_step_total_cost_scores,
     build_tooldef_carry_cost_scores,
+    build_window_rollup_scores,
     main_loop_request_count,
 )
 from telemetry.spoke_tree.steps import (
@@ -815,6 +820,59 @@ def transcript_scan_root(projects_root: Path, worktree: Path) -> Path:
     return project_dir if project_dir.is_dir() else projects_root
 
 
+def _coerce_int(value: object) -> int | None:
+    """Coerce a lifecycle-JSON epoch/count field to int, or None when absent/unparseable.
+
+    A ``bool`` is guarded out (a stray ``true`` is never a real epoch/count, and ``int(True)`` would
+    read as 1); anything that is not already an int / float / numeric string yields None.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _load_lifecycle(path: Path | None) -> Lifecycle:
+    """Read the ingest shell's lifecycle-sources JSON into a :class:`Lifecycle`, best-effort (#280).
+
+    The shell gathers the on-disk / ``gh`` sources (dispatch + answer-attempt epochs, ``filed`` ISO,
+    the land instant, and the drain-window snapshot) into ``.ai-toolkit/lifecycle.json`` and passes
+    ``--lifecycle`` at land time. A missing path (a pre-#280 land, or the degraded id-only re-run), an
+    unreadable / malformed file, or a non-object body all yield an empty :class:`Lifecycle` so every
+    dependent metric skips rather than crashing the best-effort land-time build. Epoch / count fields
+    are coerced to int; ``issue`` / ``filed`` stay strings.
+
+    Args:
+        path: The ``--lifecycle`` JSON path, or None when the flag was not passed.
+
+    Returns:
+        The parsed :class:`Lifecycle` (all-None when the source is absent or unusable).
+    """
+    if path is None:
+        return Lifecycle()
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        logger.warning("cannot read lifecycle sources %s", path)
+        return Lifecycle()
+    if not isinstance(parsed, dict):
+        return Lifecycle()
+    issue = parsed.get("issue")
+    filed = parsed.get("filed")
+    return Lifecycle(
+        issue=str(issue) if issue else None,
+        filed=str(filed) if filed else None,
+        dispatched=_coerce_int(parsed.get("dispatched")),
+        answer_attempt=_coerce_int(parsed.get("answer_attempt")),
+        landed=_coerce_int(parsed.get("landed")),
+        window_start=_coerce_int(parsed.get("window_start")),
+        spokes_serviced=_coerce_int(parsed.get("spokes_serviced")),
+        interventions=_coerce_int(parsed.get("interventions")),
+    )
+
+
 def filled_tool_spans(traces: list[TraceObservations], tool_content: dict[str, ToolContent]) -> int:
     """Count the tool spans whose create body would gain transcript content (see summary)."""
     return sum(
@@ -901,6 +959,17 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "checkout dir basename); omitted for an ad-hoc run leaves the trace untagged."
         ),
     )
+    parser.add_argument(
+        "--lifecycle",
+        type=Path,
+        default=None,
+        help=(
+            "A JSON file of the per-issue cycle-time sources the ingest shell gathered off disk "
+            "(dispatch/answer-attempt epochs, filed ISO, land instant, drain-window snapshot) — "
+            "stamped as the lifecycle timeline + per-stage / window scores (#280). Omitted for a "
+            "pre-#280 land or the degraded id-only re-run leaves those metrics unstamped."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -925,6 +994,7 @@ class EnrichmentContext:
     root: Path
     n_requests: int = 0
     commits: list[dict[str, Any]] = field(default_factory=list)
+    lifecycle: Lifecycle = field(default_factory=Lifecycle)
     # Accumulated outputs (populated by the passes, read by the summary line).
     context_events: list[IngestEvent] = field(default_factory=list)
     rows: list[dict[str, object]] = field(default_factory=list)
@@ -1003,9 +1073,22 @@ def _enrich_context_deltas(ctx: EnrichmentContext) -> None:
 
 
 def _enrich_scores(ctx: EnrichmentContext) -> None:
-    """Emit the trace/observation numeric scores (#100, #101) from the assembled View A batch."""
+    """Emit the trace/observation numeric scores (#100, #101) plus the #280 cycle-time scores.
+
+    The base signals (``permission_wait_ms`` / ``tool_result_size`` / ``gate_park_ms``) are emitted
+    first, then the #280 per-stage overhead scores and the drain-window rollups are APPENDED (the
+    extension stays additive, and the window ratio reads the stage scores it just built). Folded into
+    this existing pass rather than a new ``_ENRICHMENTS`` entry so the registry order is unchanged.
+    """
     ctx.score_events = build_score_events(
         ctx.spoke_run_id, ctx.traces, ctx.batch, base_ts=ctx.base_ts
+    )
+    stage_scores = build_lifecycle_stage_scores(
+        ctx.spoke_run_id, ctx.traces, ctx.commits, ctx.lifecycle, base_ts=ctx.base_ts
+    )
+    ctx.score_events += stage_scores
+    ctx.score_events += build_window_rollup_scores(
+        ctx.spoke_run_id, ctx.batch, stage_scores, ctx.lifecycle, base_ts=ctx.base_ts
     )
 
 
@@ -1187,6 +1270,9 @@ def main(argv: list[str] | None = None) -> int:
     apply_outcome_tag(cycle_batch, outcome)
     apply_repo_tag(batch, args.repo)
     apply_repo_tag(cycle_batch, args.repo)
+    lifecycle = _load_lifecycle(args.lifecycle)
+    timeline = build_lifecycle_timeline(lifecycle, commits, traces)
+    apply_lifecycle_metadata(batch, cycle_batch, timeline)
 
     # One counter, memoized by content hash and shared across the loaded-context measurement, the
     # #99 decomposition, and the #160 context deltas — the stable prefix repeats on every snapshot.
@@ -1211,6 +1297,7 @@ def main(argv: list[str] | None = None) -> int:
         root=args.root.resolve(),
         n_requests=main_loop_request_count(traces),
         commits=commits,
+        lifecycle=lifecycle,
     )
     for _name, enrich in _ENRICHMENTS:
         enrich(ctx)
@@ -1257,6 +1344,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(ctx.outcome_count_scores)} outcome-count scores emitted, "
         f"{len(ctx.normalization_scores)} normalization scores emitted, "
         f"{len(commits)} commit nodes synthesized, "
+        f"{len(timeline)} lifecycle timeline legs stamped, "
         f"tagged mode={mode} lane={lane} outcome={outcome} repo={args.repo}; "
         f"{len(cycle_batch) - 2} observations assembled under cycle trace {cycle_trace_id}"
     )
