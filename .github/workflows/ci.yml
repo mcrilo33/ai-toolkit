@@ -102,10 +102,21 @@ jobs:
   # bounded. continue-on-error while the documented flakes are burned down;
   # remove it to make the job required once green. Related: #189.
   shell-control-plane-macos:
-    name: Shell control-plane (macOS, non-C UTF-8 locale)
-    runs-on: macos-latest
+    name: Shell control-plane (macOS, fr_FR.UTF-8)
+    # Pinned to macos-15, not macos-latest: the macos-26 image dropped the
+    # fr_FR.UTF-8 locale (#287), and the #194 canary tests hardcode
+    # LC_ALL=fr_FR.UTF-8 for their subprocesses (test_process_probes.py,
+    # test_worktree_lib.py), so the job MUST supply that exact locale — a
+    # different UTF-8 locale would let those canaries fall back to C and pass
+    # vacuously. macos-15 still ships fr_FR.UTF-8; the guard below fails the
+    # job loud if a future image drops it too. Making the canaries
+    # locale-agnostic is a separate change, out of this ci.yml-only scope.
+    runs-on: macos-15
     timeout-minutes: 15
     continue-on-error: true
+    env:
+      LANG: fr_FR.UTF-8
+      LC_ALL: fr_FR.UTF-8
     steps:
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -122,32 +133,17 @@ jobs:
       - name: Install test dependencies
         run: python -m pip install -r requirements-dev.txt
 
-      - name: Resolve a non-English UTF-8 locale on the runner
+      - name: Confirm the non-C locale resolved on the runner
         shell: bash
         run: |
           set -euo pipefail
-          # The macos-26 runner image dropped fr_FR.UTF-8 (#287), so pinning
-          # one locale is brittle across image churn. Resolve a non-English,
-          # non-C UTF-8 locale dynamically instead: the #194 bug class (pgrep
-          # illegal-byte-sequence, French-style `ps -o lstart`) only needs *a*
-          # real non-C UTF-8 locale, not fr_FR specifically. Prefer fr_FR for
-          # continuity, then any other non-English UTF-8 locale. Fail loud if
-          # none exists — a silent fallback to C would make this job green for
-          # the wrong reason. `|| true` swallows grep/head SIGPIPE-or-no-match
-          # exits that would otherwise abort under `set -o pipefail`.
-          avail=$(locale -a | grep -iE '[.]utf-?8$' | grep -viE '^(C|POSIX|en_)' || true)
-          pick=$(printf '%s\n' "$avail" | grep -iE '^fr_FR[.]' | head -n1 || true)
-          [ -n "$pick" ] || pick=$(printf '%s\n' "$avail" | head -n1 || true)
-          if [ -z "$pick" ]; then
-            echo "No non-English UTF-8 locale on this runner — cannot reproduce the #194 locale bug class." >&2
-            echo "locale -a produced:" >&2
-            locale -a >&2
-            exit 1
-          fi
-          echo "Resolved non-C UTF-8 locale: $pick"
-          printf 'LANG=%s\n' "$pick" >> "$GITHUB_ENV"
-          printf 'LC_ALL=%s\n' "$pick" >> "$GITHUB_ENV"
-          LC_ALL="$pick" LANG="$pick" locale
+          # Fail loud if fr_FR.UTF-8 is unavailable — a silent fallback to C
+          # would make this job green for the wrong reason. The #194 canaries
+          # (test_process_probes.py, test_worktree_lib.py) hardcode
+          # LC_ALL=fr_FR.UTF-8, so this exact locale must resolve or they pass
+          # vacuously under a C fallback.
+          locale -a | grep -qiE '^fr_FR\.(UTF-8|utf8)$'
+          locale
 
       - name: Select and run the shell-control-plane test subset
         shell: bash
