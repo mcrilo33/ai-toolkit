@@ -529,11 +529,68 @@ End with exactly one final line: 'ANSWER: <reply>'.
 POLICY
 }
 
+# _broker_issue_body <issue> -> the issue's "title\n\nbody" (via gh), or a placeholder when gh
+# is unavailable. Extracted from build_answerer_prompt so the reasoner prompt AND the #277
+# PLAN-gate fast-path pre-check compare the posted plan against the SAME issue text — one
+# source of truth, no drift between "what the reasoner sees" and "what the coverage measures".
+_broker_issue_body() {
+  gh issue view "$1" --json title,body -q '.title + "\n\n" + .body' 2>/dev/null \
+    || echo "(issue #$1 body unavailable)"
+}
+
+# _broker_plan_is_restatement <plan> <body> -> the #277 PLAN-gate fast-path predicate. ECHO the
+# coverage ratio [0.00-1.00] of the posted <plan>'s SIGNIFICANT tokens that also appear in the
+# issue <body> (a bag-of-words overlap coefficient) and RETURN rc 0 when the plan is a confident
+# RESTATEMENT of the body: coverage >= AFK_FASTPATH_COVERAGE (default 0.85) AND the plan carries
+# >= AFK_FASTPATH_MIN_TOKENS (default 12) significant tokens (a too-short plan can't be judged a
+# confident restatement, so it falls through). rc 1 = not a restatement — ALSO the no-python3
+# fallback: with the coverage unknowable the fast path fails SAFE to the full reasoner. Significant
+# = a lowercased [a-z0-9]+ run of length >= 3 that is not a common stopword. python3 is the broker's
+# text tool (as in _read_gate_artifact); the two texts ride env vars so a large plan never hits
+# argv limits.
+_broker_plan_is_restatement() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  _AFK_PLAN="$1" _AFK_BODY="$2" python3 2>/dev/null <<'PYEOF'
+import os, re, sys
+
+# Common function words plus a few plan/issue scaffolding words that appear in nearly every
+# body AND plan; dropping them SYMMETRICALLY leaves coverage reflecting SUBSTANTIVE overlap.
+STOP = {
+    "the", "and", "for", "that", "this", "with", "from", "into", "onto", "not", "but", "are",
+    "was", "will", "when", "then", "than", "its", "you", "your", "our", "does", "done",
+    "per", "via", "use", "used", "uses", "add", "adds", "set", "sets", "new", "one", "two",
+    "all", "any", "each", "only", "line", "lines", "file", "files", "test", "tests", "code",
+    "plan", "issue", "fix", "fixes", "should", "must", "can", "here", "have", "has",
+}
+
+
+def toks(s):
+    return {w for w in re.findall(r"[a-z0-9]+", s.lower()) if len(w) >= 3 and w not in STOP}
+
+
+def envnum(name, default):
+    try:
+        return float(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+plan = toks(os.environ.get("_AFK_PLAN", ""))
+body = toks(os.environ.get("_AFK_BODY", ""))
+thresh = envnum("AFK_FASTPATH_COVERAGE", 0.85)
+min_toks = envnum("AFK_FASTPATH_MIN_TOKENS", 12)
+
+cov = (len(plan & body) / len(plan)) if plan else 0.0
+sys.stdout.write(f"{cov:.2f}")
+sys.exit(0 if (len(plan) >= min_toks and cov >= thresh) else 1)
+PYEOF
+}
+
 build_answerer_prompt() {
   local issue="$1" question="$2" rule body digest
   rule="$(_rule_file)" && rule="$(cat "$rule")" \
     || rule="$(_default_answerer_policy)"
-  body="$(gh issue view "$issue" --json title,body -q '.title + "\n\n" + .body' 2>/dev/null || echo "(issue #$issue body unavailable)")"
+  body="$(_broker_issue_body "$issue")"
   digest="$(read_decisions_digest "$issue")"
   cat <<EOF
 $rule

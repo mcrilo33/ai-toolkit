@@ -350,6 +350,9 @@ PYEOF
 # span (the telemetry privacy contract logs no payload). No-op when telemetry is off.
 # _afk_emit_span <wt> <name> <status> -> the shared one-span emitter (kind=agent, phase
 # review), attributed to the spoke. No-op when telemetry is off or the worktree is gone.
+# <status> is normally success|warn|deny; #277 adds `fast-path` for a WAIVED PLAN gate
+# (auto-approved without the reasoner) so the waive is distinguishable in the trace and never
+# silently folded into a normal answer span.
 _afk_emit_span() {
   command -v telemetry_emit_span >/dev/null 2>&1 || return 0
   local wt="$1" name="$2" status="$3"
@@ -446,6 +449,47 @@ _broker_present_qcm() {
   return 0
 }
 
+# --- PLAN-gate fast-path (issue #277) -----------------------------------------
+# Most drain PLAN gates are bug-scoper-filed issues that already carry root-cause mechanics
+# and fix directions; the spoke's posted plan is then a near-restatement of that same body,
+# and spending a full high-effort run_answerer round trip (3-5 min, plus the #265/#271
+# park-window watchdog exposure) on it adds nothing. When the posted plan is substantively a
+# RESTATEMENT of the issue body we WAIVE the reasoner and auto-approve here — recording the
+# waive on all three audit surfaces (journal + gh comment, a distinct fast-path span, and the
+# hub-status waived-gates ledger that reads the journal) so the hub stays aware of every waive.
+# Anything that is NOT a confident restatement falls through to the full reasoner unchanged:
+# the fast path is a pure optimization, never a worse outcome. Disable with AFK_FASTPATH=0.
+
+# _broker_try_fastpath_gate <wt> <issue> <plan> <mode> -> rc 0 when the gate was WAIVED
+# (auto-approved + injected + recorded — the caller returns), rc 1 when the plan is not a
+# restatement OR the inject failed (the caller falls through to run_answerer). Synchronous (one
+# gh call + a local python coverage check), so the minutes-long staleness the reasoner path
+# guards against does not apply — no _still_parked_same recompute needed.
+_broker_try_fastpath_gate() {
+  local wt="$1" issue="$2" plan="$3" mode="$4" body cov target
+  [ "${AFK_FASTPATH:-1}" != 0 ] || return 1
+  [ -n "$plan" ] || return 1
+  body="$(_broker_issue_body "$issue")"
+  cov="$(_broker_plan_is_restatement "$plan" "$body")" || return 1   # rc 1 -> not a restatement
+  target="$(_spoke_pane_target "$wt")"
+  [ -n "$target" ] || return 1
+  # Deliver the approval through the SAME hardened path the reasoned-ANSWER branch uses.
+  stamp_answer_attempt "$issue"
+  inject_and_verify "$wt" "$target" \
+    "Approved — the posted plan restates the issue contract; proceed to implementation." \
+    || return 1
+  log "  fast-path auto-approved #$issue (plan restates issue body, coverage ${cov:-?})"
+  _consume_gate_tag "$wt" "$issue"
+  _afk_clear_warned "$issue"   # a waive is genuine progress → drop any warned-retry backoff
+  # broker_journal_decision (not the file-only _broker_journal_line): it ALSO posts a best-effort
+  # gh issue comment, the DURABLE record that survives the land so an operator reviewing a landed
+  # issue can still tell it was fast-pathed and why. park kind `gate` is distinct from answer/permission.
+  broker_journal_decision "$issue" gate \
+    "fast-path auto-approved: plan restates issue body (coverage ${cov:-?})" reversible
+  afk_emit_decision "$wt" fast-path
+  return 0
+}
+
 # decide_and_act <wt_path> <issue> -> reason about a parked spoke and act: inject the
 # answer, or escalate to blocked/<issue>. Fail-safe: an answerer that returns no decision
 # (or an answer we cannot inject) escalates rather than guessing.
@@ -525,6 +569,10 @@ broker_service_gate() {
     # park (rotated transcript, no gate Bash record) or a bare --gate that wrote no artifact.
     local plan; plan="$(_read_gate_artifact "$wt" "$issue")"
     [ -n "$plan" ] || plan="$orig_question"
+    # #277 fast-path: a posted plan that merely RESTATES the issue body is auto-approved here
+    # WITHOUT the expensive run_answerer round trip (the reason step below). Only a confident
+    # restatement short-circuits; anything else falls through to the full reasoner unchanged.
+    if _broker_try_fastpath_gate "$wt" "$issue" "$plan" "$mode"; then return 0; fi
     question="The spoke is parked at its PLAN gate; below is the plan it posted. Approve it or state precise amendments to it. Do NOT restate or re-issue the task itself.
 
 ${plan:-(the plan prose could not be extracted — approve or amend from the issue contract above)}"
