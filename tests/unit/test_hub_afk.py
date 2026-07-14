@@ -2967,6 +2967,36 @@ def test_auto_land_conflict_budget_distinct_from_crash_resume(
     )
 
 
+def test_conflict_resolution_no_redispatch_while_spoke_tip_unchanged(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #285 review: the budget is keyed on the SPOKE branch tip, so a re-land triggered by a
+    # sibling advancing main (fingerprint moves, spoke tip does NOT) must NOT re-inject the
+    # resolve prompt into a spoke already resolving. Two route calls at the same tip dispatch once.
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    dispatch_log = tmp_path / "dispatch.log"
+    expr = (
+        f'_afk_conflict_resolve_relaunch() {{ printf "relaunch %s\\n" "$2" >> "{dispatch_log}"; return 0; }}; '
+        f"_afk_route_conflict_resolution '{spoke_repo}' 5; "
+        f"_afk_route_conflict_resolution '{spoke_repo}' 5"
+    )
+
+    _call(
+        expr,
+        env={
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
+        },
+    )
+
+    assert dispatch_log.exists() and dispatch_log.read_text().count("relaunch 5") == 1, (
+        "resolution must dispatch ONCE per spoke tip — a same-tip re-route (sibling main advance) "
+        "must not re-inject into an already-resolving spoke"
+    )
+
+
 # ── landed tally + drain-complete emit (issue #150) ───────────────────────────
 # A completed /afk drain must fire ONE "drain complete — <k> landed" ping, but the
 # count is not externally derivable: log() writes to stderr (redirected to
