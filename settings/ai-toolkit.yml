@@ -85,11 +85,14 @@ batch:
   stagger_seconds:
 
 model:
-  # The interactive spoke driver launched by worktree-new.sh. `[1m]` selects
-  # the 1M-token context tier.
+  # The interactive spoke driver launched by worktree-new.sh. Routine spokes run
+  # Sonnet at high effort (2026-07-15 budget routing): no `[1m]` tier, so context
+  # compacts at the standard window instead of riding the long-context premium.
+  # Escalate a genuinely reasoning-heavy issue via the `lane:reasoning` label
+  # (model.overrides.by_label below) or an explicit `Model:` line in the issue.
   spoke:
-    model: claude-opus-4-8[1m]
-    effort: max
+    model: claude-sonnet-5
+    effort: high
 
   # Model per solo-cycle step (issue #182). Realized by delegating each step to
   # its routed subagent (red→tdd-red, green→tdd-green, review→code-review); the
@@ -103,13 +106,13 @@ model:
   cycle_steps:
     red:
       model: claude-opus-4-8
-      effort: max
+      effort: high
     green:
       model: claude-sonnet-5
-      effort: max
+      effort: high
     review:
-      model: claude-opus-4-8
-      effort: max
+      model: claude-sonnet-5
+      effort: high
 
   # Per sub-agent model routing (issue #141): Fable is scarce, so it is reserved
   # for the design/plan agents; Opus 4.8 for the reasoning-heavy ones; Sonnet 5
@@ -129,40 +132,43 @@ model:
       model: claude-opus-4-8
       effort: max
     code-review:
-      model: claude-opus-4-8
-      effort: max
+      model: claude-sonnet-5
+      effort: high
     tdd-red:
       model: claude-opus-4-8
-      effort: max
+      effort: high
     devops:
       model: claude-opus-4-8
       effort: max
     # Accurate Scope: derivation is the whole value of bug-scoper (#220); route
     # it to the strongest reasoning model.
     bug-scoper:
-      model: claude-opus-4-8
-      effort: max
+      model: claude-sonnet-5
+      effort: high
     tdd-green:
       model: claude-sonnet-5
-      effort: max
+      effort: high
     tdd-refactor:
       model: claude-sonnet-5
-      effort: max
+      effort: high
     refactor:
       model: claude-sonnet-5
-      effort: max
+      effort: high
     documentation:
       model: claude-sonnet-5
-      effort: max
+      effort: high
 
   # The reasoning answerer that resolves parked spokes under /afk. SCHEMA ONLY
   # for now — the AFK answerer wiring lands in a follow-up (see issue #142).
   afk:
     answerer:
       model: claude-opus-4-8
-      effort: max
+      effort: high
 
   # Per-issue-label model overrides. An issue carrying a listed label spawns its
   # spoke on the override model. Empty by default.
   overrides:
     by_label:
+      lane:reasoning:
+        model: claude-opus-4-8
+        effort: max

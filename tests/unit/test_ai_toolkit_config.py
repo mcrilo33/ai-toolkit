@@ -44,21 +44,23 @@ SONNET = "claude-sonnet-5"
 # Mirrors shared/agents/metadata.yml's #141 routing — now sourced from the config.
 # architect/planner returned to FABLE when claude-fable-5 became available again
 # (they fell back to OPUS during the #218 retirement window).
+# (model, effort) per agent — budget routing (2026-07-15): design/judgment agents
+# keep max effort on the scarce models; the routine workhorses (reviews, scoping,
+# green/refactor) run Sonnet at high effort. Per-issue escalation stays available
+# via the lane:reasoning label override.
 EXPECTED_AGENT_ROUTING = {
-    "architect": FABLE,
-    "planner": FABLE,
-    "debug": OPUS,
-    "security-reviewer": OPUS,
-    "code-review": OPUS,
-    "tdd-red": OPUS,
-    "devops": OPUS,
-    # bug-scoper investigates to derive a real Scope: line; accurate scoping is its
-    # whole value, so it routes to the strongest reasoning model (#220).
-    "bug-scoper": OPUS,
-    "tdd-green": SONNET,
-    "tdd-refactor": SONNET,
-    "refactor": SONNET,
-    "documentation": SONNET,
+    "architect": (FABLE, "max"),
+    "planner": (FABLE, "max"),
+    "debug": (OPUS, "max"),
+    "security-reviewer": (OPUS, "max"),
+    "code-review": (SONNET, "high"),
+    "tdd-red": (OPUS, "high"),
+    "devops": (OPUS, "max"),
+    "bug-scoper": (SONNET, "high"),
+    "tdd-green": (SONNET, "high"),
+    "tdd-refactor": (SONNET, "high"),
+    "refactor": (SONNET, "high"),
+    "documentation": (SONNET, "high"),
 }
 
 
@@ -417,7 +419,9 @@ def real_config() -> dict:
 
 
 def test_real_config_spoke_seed(real_config: dict) -> None:
-    assert cfg.spoke_model(real_config) == ("claude-opus-4-8[1m]", "max")
+    # Budget routing (2026-07-15): routine spokes on Sonnet/high, no 1m tier;
+    # per-issue escalation via lane:reasoning or an explicit Model: line.
+    assert cfg.spoke_model(real_config) == ("claude-sonnet-5", "high")
 
 
 def test_real_config_base_branch_defaults_to_autodetect(real_config: dict) -> None:
@@ -438,9 +442,11 @@ def test_seed_routing_matches_the_agent_roster(real_config: dict) -> None:
     assert set(EXPECTED_AGENT_ROUTING) == set(parse(str(AGENTS_METADATA)))
 
 
-@pytest.mark.parametrize(("name", "model"), sorted(EXPECTED_AGENT_ROUTING.items()))
-def test_real_config_agent_routing_matches_seed(real_config: dict, name: str, model: str) -> None:
-    assert cfg.agent_model(real_config, name) == (model, "max")
+@pytest.mark.parametrize(("name", "spec"), sorted(EXPECTED_AGENT_ROUTING.items()))
+def test_real_config_agent_routing_matches_seed(
+    real_config: dict, name: str, spec: tuple[str, str]
+) -> None:
+    assert cfg.agent_model(real_config, name) == spec
 
 
 # ─── real config: cycle-step routing is a live, self-consistent SSOT (issue #182) ───

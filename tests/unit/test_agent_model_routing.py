@@ -3,7 +3,10 @@
 Fable credit is scarce; Opus 4.8 is plentiful. The per-agent model must
 therefore route by role: Fable only for the design/plan agents (`architect`,
 `planner`), Opus 4.8 for the reasoning-heavy ones, Sonnet 5 for the
-capable-but-routine ones, and Haiku for none. Effort stays `max` everywhere.
+capable-but-routine ones, and Haiku for none. Effort routes by role too
+(budget policy, 2026-07-15): `max` is reserved for the design/judgment agents;
+the routine workhorses run `high`. Per-issue escalation stays available via the
+`lane:reasoning` label override in the config.
 
 Since #142 the routing lives in `settings/ai-toolkit.yml` (the single source of
 truth), NOT in `shared/agents/metadata.yml` frontmatter — sync stamps it into
@@ -32,24 +35,28 @@ FABLE = "claude-fable-5"
 OPUS = "claude-opus-4-8"
 SONNET = "claude-sonnet-5"
 
+# (model, effort) per agent. Budget routing (2026-07-15): reviews and scoping
+# moved to Sonnet/high — the volume drivers of subagent usage — while design and
+# judgment agents keep their scarce models at max.
 EXPECTED_ROUTING = {
     # architect/planner returned to claude-fable-5 when it became available again
     # (they fell back to opus during the #218 retirement window).
-    "architect": FABLE,
-    "planner": FABLE,
-    "debug": OPUS,
-    "security-reviewer": OPUS,
-    "code-review": OPUS,
-    "tdd-red": OPUS,
-    "devops": OPUS,
-    # bug-scoper investigates the codebase to derive a real Scope: line — accurate
-    # scoping is its whole value, so it gets the strongest reasoning model (#220).
-    "bug-scoper": OPUS,
-    "tdd-green": SONNET,
-    "tdd-refactor": SONNET,
-    "refactor": SONNET,
-    "documentation": SONNET,
+    "architect": (FABLE, "max"),
+    "planner": (FABLE, "max"),
+    "debug": (OPUS, "max"),
+    "security-reviewer": (OPUS, "max"),
+    "code-review": (SONNET, "high"),
+    "tdd-red": (OPUS, "high"),
+    "devops": (OPUS, "max"),
+    "bug-scoper": (SONNET, "high"),
+    "tdd-green": (SONNET, "high"),
+    "tdd-refactor": (SONNET, "high"),
+    "refactor": (SONNET, "high"),
+    "documentation": (SONNET, "high"),
 }
+
+# Agents allowed to burn `max` effort — the design/judgment set only.
+MAX_EFFORT_AGENTS = {"architect", "planner", "debug", "security-reviewer", "devops"}
 
 
 @pytest.fixture(scope="module")
@@ -62,16 +69,20 @@ def test_every_agent_has_an_explicit_routing_decision(config: dict) -> None:
     assert set(cfg.agent_model_overrides(config)) == set(parse(str(AGENTS_METADATA)))
 
 
-@pytest.mark.parametrize(("name", "model"), sorted(EXPECTED_ROUTING.items()))
-def test_agent_model_matches_routing(config: dict, name: str, model: str) -> None:
-    assert cfg.agent_model(config, name) == (model, "max")
+@pytest.mark.parametrize(("name", "spec"), sorted(EXPECTED_ROUTING.items()))
+def test_agent_model_matches_routing(config: dict, name: str, spec: tuple) -> None:
+    assert cfg.agent_model(config, name) == spec
 
 
 @pytest.mark.parametrize("name", sorted(EXPECTED_ROUTING))
-def test_agent_effort_stays_max(config: dict, name: str) -> None:
+def test_max_effort_reserved_for_judgment_agents(config: dict, name: str) -> None:
+    # Budget invariant: only the design/judgment agents may run at max effort;
+    # every other agent runs high. A new agent bumped to max must be a conscious
+    # decision here, not a default.
     routed = cfg.agent_model(config, name)
     assert routed is not None
-    assert routed[1] == "max"
+    expected = "max" if name in MAX_EFFORT_AGENTS else "high"
+    assert routed[1] == expected
 
 
 def test_fable_reserved_for_design_agents(config: dict) -> None:
