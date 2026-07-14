@@ -85,6 +85,7 @@ def _run_hub_status_proc(
     otel: str | None = None,
     batch_plan: str | None = None,
     hub_agents_dir: Path | None = None,
+    afk_state_dir: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run hub-status.sh from the hub with `gh`, `tmux` and `lsof` stubs on PATH.
 
@@ -182,6 +183,10 @@ def _run_hub_status_proc(
     env["AI_TOOLKIT_HUB_AGENTS_DIR"] = str(
         hub_agents_dir if hub_agents_dir is not None else fallback_agents
     )
+    # AFK state dir (#277): default to a nonexistent dir so the host's real decision journal
+    # can never leak into a test; the waived-gates section then reads a seeded journal here.
+    fallback_afk = tmp_path / "no-afk-state"
+    env["AFK_STATE_DIR"] = str(afk_state_dir if afk_state_dir is not None else fallback_afk)
     return subprocess.run(
         ["bash", str(HUB_STATUS)],
         cwd=str(hub),
@@ -205,6 +210,7 @@ def _run_hub_status(
     otel: str | None = None,
     batch_plan: str | None = None,
     hub_agents_dir: Path | None = None,
+    afk_state_dir: Path | None = None,
 ) -> str:
     """Run hub-status.sh and return its stdout (see _run_hub_status_proc)."""
     return _run_hub_status_proc(
@@ -220,6 +226,7 @@ def _run_hub_status(
         otel=otel,
         batch_plan=batch_plan,
         hub_agents_dir=hub_agents_dir,
+        afk_state_dir=afk_state_dir,
     ).stdout
 
 
@@ -1206,3 +1213,57 @@ def test_hub_agents_section_keeps_live_sibling_when_same_label_ends(
     section = out[out.index("Hub agents") :]
     assert "hub:review-236" in section
     assert "second pass" in section
+
+
+# ── Waived gates section (issue #277) ─────────────────────────────────────────
+# Every PLAN gate the /afk fast-path WAIVED (auto-approved without the reasoner) is a
+# park:gate line in the decision journal. The hub survey surfaces those so an operator sees
+# "this gate was fast-pathed, and why" at a glance — the gh comment alone is not a hub view.
+
+
+def _write_decision_journal(state_dir: Path, records: list[dict]) -> None:
+    """Seed <state_dir>/decision-journal.jsonl with one JSON record per line."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "decision-journal.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in records) + "\n"
+    )
+
+
+def test_waived_gates_section_renders_fast_path_waives(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    state = tmp_path / "afk-state"
+    _write_decision_journal(
+        state,
+        [
+            {
+                "ts": 1000,
+                "issue": "277",
+                "park": "gate",
+                "decision": "fast-path auto-approved: plan restates issue body (coverage 0.92)",
+                "reversibility": "reversible",
+                "reasoning_ref": "",
+            },
+            # A non-gate answer must NOT appear under waived gates.
+            {"ts": 1001, "issue": "300", "park": "answer", "decision": "injected answer"},
+        ],
+    )
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, afk_state_dir=state)
+
+    assert "Waived gates" in out
+    section = out[out.index("Waived gates") :]
+    assert "#277" in section
+    assert "coverage 0.92" in section
+    assert "#300" not in section, "a non-gate answer must not surface as a waived gate"
+
+
+def test_waived_gates_section_graceful_without_journal(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    # No decision journal (state dir absent): the section still renders with a clear marker.
+    out = _run_hub_status(hub_with_spokes, tmp_path, afk_state_dir=tmp_path / "nonexistent-afk")
+
+    assert "Waived gates" in out
+    section = out[out.index("Waived gates") :]
+    assert re.search(r"none|no decision journal", section, re.I)
