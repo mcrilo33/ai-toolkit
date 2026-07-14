@@ -64,10 +64,9 @@ class TestEnrichmentRegistry:
         for _name, enrich in _ENRICHMENTS:
             enrich(ctx)
 
-        # #280 folds the per-stage overhead + drain-window rollup scores into this pass, APPENDED
-        # after the base assignment, so the base scores are the leading slice of score_events.
-        base_scores = build_score_events(SPOKE, ctx.traces, ctx.batch, base_ts=_BASE_TS)
-        assert ctx.score_events[: len(base_scores)] == base_scores
+        assert ctx.score_events == build_score_events(
+            SPOKE, ctx.traces, ctx.batch, base_ts=_BASE_TS
+        )
         assert ctx.step_scores == build_step_cost_scores(
             SPOKE, ctx.cycle_batch, base_ts=_BASE_TS, price=0.0
         )

@@ -1003,6 +1003,11 @@ class EnrichmentContext:
     efforts: int = 0
     deltas: dict[tuple[str, str], dict[str, int]] = field(default_factory=dict)
     score_events: list[IngestEvent] = field(default_factory=list)
+    # #280 per-issue cycle-time scores (stage overhead + drain-window rollups). Accumulated on their
+    # OWN field, NOT appended to ``score_events``, so ``score_events`` stays exactly
+    # ``build_score_events(...)`` for any input — keeping the out-of-scope registry equality assertion
+    # (test_spoke_tree_registry.py) transparently true rather than true only for a source-less fixture.
+    lifecycle_scores: list[IngestEvent] = field(default_factory=list)
     step_scores: list[IngestEvent] = field(default_factory=list)
     carry_scores: list[IngestEvent] = field(default_factory=list)
     invocation_scores: list[IngestEvent] = field(default_factory=list)
@@ -1075,10 +1080,12 @@ def _enrich_context_deltas(ctx: EnrichmentContext) -> None:
 def _enrich_scores(ctx: EnrichmentContext) -> None:
     """Emit the trace/observation numeric scores (#100, #101) plus the #280 cycle-time scores.
 
-    The base signals (``permission_wait_ms`` / ``tool_result_size`` / ``gate_park_ms``) are emitted
-    first, then the #280 per-stage overhead scores and the drain-window rollups are APPENDED (the
-    extension stays additive, and the window ratio reads the stage scores it just built). Folded into
-    this existing pass rather than a new ``_ENRICHMENTS`` entry so the registry order is unchanged.
+    The base signals (``permission_wait_ms`` / ``tool_result_size`` / ``gate_park_ms``) are assigned
+    to ``score_events``, and the #280 per-stage overhead + drain-window rollup scores accumulate on
+    the SEPARATE ``lifecycle_scores`` field (the window ratio reads the stage scores it just built).
+    Folded into this existing pass — not a new ``_ENRICHMENTS`` entry, so the registry order is
+    unchanged — and kept off ``score_events`` so that field stays exactly ``build_score_events(...)``,
+    leaving the out-of-scope registry equality assertion transparently true.
     """
     ctx.score_events = build_score_events(
         ctx.spoke_run_id, ctx.traces, ctx.batch, base_ts=ctx.base_ts
@@ -1086,10 +1093,10 @@ def _enrich_scores(ctx: EnrichmentContext) -> None:
     stage_scores = build_lifecycle_stage_scores(
         ctx.spoke_run_id, ctx.traces, ctx.commits, ctx.lifecycle, base_ts=ctx.base_ts
     )
-    ctx.score_events += stage_scores
-    ctx.score_events += build_window_rollup_scores(
+    window_scores = build_window_rollup_scores(
         ctx.spoke_run_id, ctx.batch, stage_scores, ctx.lifecycle, base_ts=ctx.base_ts
     )
+    ctx.lifecycle_scores = stage_scores + window_scores
 
 
 def _enrich_step_scores(ctx: EnrichmentContext) -> None:
@@ -1305,6 +1312,7 @@ def main(argv: list[str] | None = None) -> int:
         batch
         + ctx.context_events
         + ctx.score_events
+        + ctx.lifecycle_scores
         + cycle_batch
         + ctx.step_scores
         + ctx.carry_scores
@@ -1345,6 +1353,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(ctx.normalization_scores)} normalization scores emitted, "
         f"{len(commits)} commit nodes synthesized, "
         f"{len(timeline)} lifecycle timeline legs stamped, "
+        f"{len(ctx.lifecycle_scores)} lifecycle stage/window scores emitted, "
         f"tagged mode={mode} lane={lane} outcome={outcome} repo={args.repo}; "
         f"{len(cycle_batch) - 2} observations assembled under cycle trace {cycle_trace_id}"
     )
