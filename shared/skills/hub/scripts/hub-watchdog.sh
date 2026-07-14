@@ -240,14 +240,49 @@ _wd_issue_open() {
 }
 
 # --- the 5 detectors (pure predicates over the drain's own state readers) ------
-# Condition 1: a parked spoke answer_pass left unanswered past the grace margin.
+# Condition 1: a parked spoke answer_pass left unanswered past the grace margin. The
+# never-attempted branch measures from PARK ONSET, not zero (#265): the answer-attempt epoch is
+# stamped only at answer DELIVERY (minutes into the answerer's reasoning), so a zero-grace floor
+# false-fired 1s after every fresh park. slot_state stamps the onset the first tick it reads
+# waiting; both branches then require now - base > the ceiling before firing.
 _wd_detect_park_unanswered() {
   local wt="$1" issue="$2" now="$3" attempt
   command -v slot_state >/dev/null 2>&1 || return 1
   [ "$(slot_state "$wt" "$issue")" = "waiting" ] || return 1
   attempt="$(read_answer_attempt "$issue" 2>/dev/null)"
-  case "$attempt" in '' | *[!0-9]*) return 0 ;; esac  # never attempted ⇒ fell short
-  _wd_epoch_stale "$attempt" "$now" "$HUB_WATCHDOG_PARK_CEILING"
+  case "$attempt" in
+    '' | *[!0-9]*)   # no delivery yet ⇒ measure the park itself, from onset
+      _wd_epoch_stale "$(read_park_onset_epoch "$issue" 2>/dev/null)" "$now" "$HUB_WATCHDOG_PARK_CEILING" ;;
+    *)               # a delivery was stamped ⇒ measure staleness from it
+      _wd_epoch_stale "$attempt" "$now" "$HUB_WATCHDOG_PARK_CEILING" ;;
+  esac
+}
+
+# _wd_park_unanswered_reason <issue> <now> -> the MEASURED firing reason for a park-unanswered
+# firing (#265): which branch fired (never-attempted vs stale-attempt) and the actual age, so the
+# ledger + auto-filed defect never claim a constant "> ${ceiling}s" for a seconds-old park. Reads
+# the same epochs the detector does, on demand (no cross-pass global — the #241 leak trap).
+_wd_park_unanswered_reason() {
+  local issue="$1" now="$2" attempt
+  attempt="$(read_answer_attempt "$issue" 2>/dev/null)"
+  case "$attempt" in
+    '' | *[!0-9]*)
+      printf 'park-unanswered (never-attempted): parked %s with no answer delivered (ceiling %ss)' \
+        "$(_wd_age_seconds "$(read_park_onset_epoch "$issue" 2>/dev/null)" "$now")" \
+        "$HUB_WATCHDOG_PARK_CEILING" ;;
+    *)
+      printf 'park-unanswered (stale-attempt): last answer delivery %s ago (ceiling %ss)' \
+        "$(_wd_age_seconds "$attempt" "$now")" "$HUB_WATCHDOG_PARK_CEILING" ;;
+  esac
+}
+
+# _wd_age_seconds <epoch> <now> -> "<n>s" elapsed, or "an unknown time" when unmeasurable
+# (empty/non-numeric epoch or now) — guards set -u arithmetic against a bareword.
+_wd_age_seconds() {
+  local epoch="$1" now="$2"
+  case "$epoch" in '' | *[!0-9]*) printf 'an unknown time'; return ;; esac
+  case "$now" in '' | *[!0-9]*) printf 'an unknown time'; return ;; esac
+  printf '%ss' "$(( now - epoch ))"
 }
 
 # Condition 2: a dead/crashed pane recover_dead_panes/reap_pass never revived, past the ceiling.
@@ -513,7 +548,7 @@ _wd_run_conditions() {
     # Each detector: fire (deduped by _wd_fire's marker) + intervene when it trips; else clear the
     # firing marker so a genuinely resolved-then-recurring condition re-fires (#263).
     if _wd_detect_park_unanswered "$wt" "$issue" "$now"; then
-      _wd_fire park-unanswered "$issue" "drain left a parked spoke unanswered > ${HUB_WATCHDOG_PARK_CEILING}s"
+      _wd_fire park-unanswered "$issue" "$(_wd_park_unanswered_reason "$issue" "$now")"
       _wd_intervene_answer "$wt" "$issue"
     else
       _wd_clear_fired park-unanswered "$issue"

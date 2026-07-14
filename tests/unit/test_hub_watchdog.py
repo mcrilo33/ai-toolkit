@@ -323,8 +323,25 @@ def _detect(prelude: str, call: str, *, env: dict[str, str] | None = None) -> in
 
 
 # Condition 1 — park unanswered
-def test_park_unanswered_fires_when_never_attempted(tmp_path: Path) -> None:
-    prelude = 'slot_state() { echo waiting; }; read_answer_attempt() { echo ""; }'
+# AC1/AC2 (#265): the never-attempted branch measures against PARK ONSET, not zero. The
+# answer-attempt epoch is stamped only at answer DELIVERY (minutes into the answerer's run), so
+# a zero-grace floor false-fired 1s after every fresh park. A freshly parked spoke with no
+# attempt stays quiet; only once the park itself outlives the ceiling may it fire.
+def test_park_unanswered_quiet_when_fresh_park_never_attempted(tmp_path: Path) -> None:
+    fresh = str(int(NOW) - 60)  # parked 60s ago (< 600s ceiling)
+    prelude = (
+        "slot_state() { echo waiting; }; read_answer_attempt() { echo ''; }; "
+        f"read_park_onset_epoch() {{ echo {fresh}; }}"
+    )
+    assert _detect(prelude, "_wd_detect_park_unanswered /wt 5 " + NOW) == 1
+
+
+def test_park_unanswered_fires_when_park_onset_stale_never_attempted(tmp_path: Path) -> None:
+    old = str(int(NOW) - 700)  # parked > 600s ago, still no answer → a real shortfall
+    prelude = (
+        "slot_state() { echo waiting; }; read_answer_attempt() { echo ''; }; "
+        f"read_park_onset_epoch() {{ echo {old}; }}"
+    )
     assert _detect(prelude, "_wd_detect_park_unanswered /wt 5 " + NOW) == 0
 
 
@@ -343,6 +360,26 @@ def test_park_unanswered_quiet_when_attempt_is_fresh(tmp_path: Path) -> None:
 def test_park_unanswered_quiet_when_not_waiting(tmp_path: Path) -> None:
     prelude = 'slot_state() { echo busy; }; read_answer_attempt() { echo ""; }'
     assert _detect(prelude, "_wd_detect_park_unanswered /wt 5 " + NOW) == 1
+
+
+# AC3 (#265): the firing reason reports the MEASURED age + which branch fired — never the
+# constant "> 600s" that made a 1-second-old park's ledger + auto-filed defect claim a 600s
+# breach. The never-attempted branch measures from park onset; the stale-attempt branch from the
+# last delivery.
+def test_park_unanswered_reason_never_attempted_reports_onset_age(tmp_path: Path) -> None:
+    old = str(int(NOW) - 700)
+    prelude = f"read_answer_attempt() {{ echo ''; }}; read_park_onset_epoch() {{ echo {old}; }}"
+    out = _call(f"{prelude}; _wd_park_unanswered_reason 5 {NOW}").stdout
+    assert "never-attempted" in out
+    assert "700s" in out  # the measured park age, not a constant ceiling
+
+
+def test_park_unanswered_reason_stale_attempt_reports_delivery_age(tmp_path: Path) -> None:
+    old = str(int(NOW) - 900)
+    prelude = f"read_answer_attempt() {{ echo {old}; }}"
+    out = _call(f"{prelude}; _wd_park_unanswered_reason 5 {NOW}").stdout
+    assert "stale-attempt" in out
+    assert "900s" in out
 
 
 # Condition 2 — dead / idle pane
@@ -622,10 +659,13 @@ def test_run_conditions_dedupes_ledger_but_keeps_intervening(tmp_path: Path) -> 
         "HUB_WATCHDOG_LANDMARK_REPO": str(tmp_path / "no-landmark-repo"),
         "AFK_NOW": NOW,
     }
-    # A parked spoke never answered → park-unanswered fires; the same park persists across ticks.
+    # A parked spoke never answered, parked past the ceiling → park-unanswered fires; the same
+    # park persists across ticks (onset stays stale, #265).
+    onset = str(int(NOW) - 700)
     prelude = (
         'inflight_worktrees() { printf "/the/wt\\t5\\n"; }; '
         'slot_state() { echo waiting; }; read_answer_attempt() { echo ""; }; '
+        f"read_park_onset_epoch() {{ echo {onset}; }}; "
         '_spoke_pane_target() { echo "hub:0"; }; read_progress_epoch() { echo ' + NOW + "; }"
     )
 
@@ -666,9 +706,13 @@ def test_run_conditions_fires_park_and_invokes_answer_seam(tmp_path: Path) -> No
         "HUB_WATCHDOG_LANDMARK_REPO": str(tmp_path / "no-landmark-repo"),
         "AFK_NOW": NOW,
     }
+    onset = str(
+        int(NOW) - 700
+    )  # parked past the ceiling (#265) so the never-attempted branch fires
     prelude = (
         'inflight_worktrees() { printf "/the/wt\\t5\\n"; }; '
         'slot_state() { echo waiting; }; read_answer_attempt() { echo ""; }; '
+        f"read_park_onset_epoch() {{ echo {onset}; }}; "
         '_spoke_pane_target() { echo "hub:0"; }; read_progress_epoch() { echo ' + NOW + "; }"
     )
 
