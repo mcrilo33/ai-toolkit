@@ -571,7 +571,7 @@ def test_clear_landed_landmarks_clears_the_condition4_firing_marker(tmp_path: Pa
     repo = _git_repo(tmp_path)
     subprocess.run(["git", "tag", "needs-human-land/5"], cwd=repo, check=True, capture_output=True)
     ledger = tmp_path / "l.jsonl"
-    marker = tmp_path / "wd-fired-auto-land-skipped-5"  # dir == dirname(ledger)
+    marker = tmp_path / "wd-fire-dedup-auto-land-skipped-5"  # dir == dirname(ledger)
     marker.write_text("")
     env = {
         "HUB_WATCHDOG_LANDMARK_REPO": str(repo),
@@ -589,7 +589,7 @@ def test_run_conditions_clears_firing_marker_when_condition_resolves(tmp_path: P
     # #263: a detector that does NOT fire this tick clears its firing marker, so a genuinely
     # resolved-then-recurring condition re-fires rather than staying deduped forever.
     ledger = tmp_path / "l.jsonl"
-    marker = tmp_path / "wd-fired-park-unanswered-5"  # a firing from a prior tick
+    marker = tmp_path / "wd-fire-dedup-park-unanswered-5"  # a firing from a prior tick
     marker.write_text("")
     env = {
         "HUB_WATCHDOG_LEDGER": str(ledger),
@@ -607,6 +607,33 @@ def test_run_conditions_clears_firing_marker_when_condition_resolves(tmp_path: P
     _call(f"{prelude}; _wd_run_conditions {NOW} live", env=env)
 
     assert not marker.exists()
+
+
+def test_run_conditions_dedupes_ledger_but_keeps_intervening(tmp_path: Path) -> None:
+    # The safety invariant of the dedup: across repeated ticks of the SAME unresolved condition,
+    # the ledger records ONE firing but the scripted intervention still runs EVERY tick (#263) —
+    # log once, keep intervening. A refactor folding the intervene call into _wd_fire's early
+    # return would silently break this.
+    ledger = tmp_path / "l.jsonl"
+    answers = tmp_path / "answers"  # one line per answer intervention
+    env = {
+        "HUB_WATCHDOG_LEDGER": str(ledger),
+        "HUB_WATCHDOG_ANSWER_CMD": f"printf 'x\\n' >> {answers}",
+        "HUB_WATCHDOG_LANDMARK_REPO": str(tmp_path / "no-landmark-repo"),
+        "AFK_NOW": NOW,
+    }
+    # A parked spoke never answered → park-unanswered fires; the same park persists across ticks.
+    prelude = (
+        'inflight_worktrees() { printf "/the/wt\\t5\\n"; }; '
+        'slot_state() { echo waiting; }; read_answer_attempt() { echo ""; }; '
+        '_spoke_pane_target() { echo "hub:0"; }; read_progress_epoch() { echo ' + NOW + "; }"
+    )
+
+    _call(f"{prelude}; _wd_run_conditions {NOW} live", env=env)  # tick 1: fire + intervene
+    _call(f"{prelude}; _wd_run_conditions {NOW} live", env=env)  # tick 2: deduped fire, intervene
+
+    assert len(_ledger_lines(ledger)) == 1  # one ledger firing across both ticks
+    assert answers.read_text().count("x") == 2  # but intervened on both ticks
 
 
 # ── the dispatcher: detect → fire → intervene, end to end ─────────────────────

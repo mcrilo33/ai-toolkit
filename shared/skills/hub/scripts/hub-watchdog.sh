@@ -392,14 +392,16 @@ _wd_filed_marker() {
 
 # _wd_fired_marker <condition> <issue> -> the per-run FIRING-dedup marker. NOTE: distinct from
 # _wd_filed_marker above (near-homonym) — that one dedups the defect FILING (`wd-filed-`), this
-# one dedups the ledger FIRING (`wd-fired-`). One firing per condition+issue while unresolved:
-# _wd_fire skips the ledger append when this exists, so a persistent condition (or an in-flight
-# land racing condition 4) logs ONE intervention, not one per tick — the #251 autonomy score is
-# not double-penalized (#263). Co-located with the ledger so it inherits the ledger's dir + test
-# isolation (HUB_WATCHDOG_LEDGER points at tmp); cleared when the condition resolves.
+# one dedups the ledger FIRING (`wd-fire-dedup-`, a deliberately non-colliding stem so no glob
+# conflates the two families). One firing per condition+issue while unresolved: _wd_fire skips
+# the ledger append when this exists, so a persistent condition (or an in-flight land racing
+# condition 4) logs ONE intervention, not one per tick — the #251 autonomy score is not
+# double-penalized (#263). Co-located with the ledger so it inherits the ledger's dir + test
+# isolation (HUB_WATCHDOG_LEDGER points at tmp). Per-window state: cleared when the condition
+# resolves, and on a fresh drain arm (_clear_progress_state) so it never leaks across windows.
 _wd_fired_marker() {
   local dir; dir="$(dirname "$(_wd_ledger_file)")"
-  printf '%s\n' "$dir/wd-fired-$1-$2"
+  printf '%s\n' "$dir/wd-fire-dedup-$1-$2"
 }
 _wd_clear_fired() { rm -f "$(_wd_fired_marker "$1" "$2")" 2>/dev/null || true; }
 

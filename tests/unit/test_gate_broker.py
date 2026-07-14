@@ -5797,6 +5797,19 @@ def test_clear_progress_state_also_clears_offline_since(tmp_path: Path) -> None:
     assert result.stdout.strip() == "", "a fresh window drops the stale outage marker"
 
 
+def test_clear_progress_state_also_clears_watchdog_firing_markers(tmp_path: Path) -> None:
+    # #263: the watchdog's per-condition firing-dedup markers are per-window state — a leftover
+    # would suppress a condition's first ledger firing in the next window (an autonomy under-count).
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    marker = statedir / "wd-fire-dedup-auto-land-skipped-5"
+    marker.write_text("")
+
+    _call("_clear_progress_state", env={"AFK_STATE_DIR": str(statedir)})
+
+    assert not marker.exists(), "a fresh window drops the stale firing-dedup marker"
+
+
 def test_refresh_offline_clocks_stamps_progress_and_answer_attempt(tmp_path: Path) -> None:
     # The idle-clock exclusion for an outage tick: every in-flight spoke gets a fresh progress
     # epoch (soft ceiling) AND answer-attempt epoch (idle clock), so the blackout is not counted

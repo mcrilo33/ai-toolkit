@@ -224,7 +224,10 @@ _clear_progress_state() {
   local dir; dir="$(_afk_state_dir)"
   rm -f "$dir"/progress-*.epoch "$dir"/answer-attempt-*.epoch "$dir"/done-*.epoch "$dir"/tip-* \
     "$dir"/reanswer-* "$dir"/gate-voided-* "$dir"/terminal-logged-* \
+    "$dir"/wd-fire-dedup-* \
     "$dir"/offline-since.epoch 2>/dev/null || true   # #249: drop a stale outage marker too
+  # #263: the watchdog's firing-dedup markers are per-window too — a leftover would suppress a
+  # condition's first ledger firing in the next window (an autonomy-score under-count).
   _clear_warned_records   # #241: drop the warned-retry backoff + records for a fresh window
 }
 
