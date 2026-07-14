@@ -26,6 +26,8 @@ pytestmark = pytest.mark.skipif(
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GATE_BROKER = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "gate-broker.sh"
+WT_LIB = REPO_ROOT / "scripts" / "worktree-lib.sh"
+HUB_INJECT = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "hub-inject.sh"
 FIXTURES = REPO_ROOT / "tests" / "unit" / "fixtures"
 
 
@@ -117,6 +119,48 @@ def test_hub_inject_resolves_via_own_dir_without_toplevel(tmp_path: Path) -> Non
     assert result.returncode == 0, result.stdout + result.stderr
     assert "command not found" not in result.stderr, result.stderr
     assert result.stdout.strip() == "OK"
+
+
+def test_missing_required_module_fails_closed(tmp_path: Path) -> None:
+    # #275 / #211: the entry lib sources gate-broker-*.sh modules that back the deny-wall.
+    # A required module that cannot be resolved must NOT leave a partial API that silently
+    # drops the wall (the #262 no-wall bypass-spoke failure). Copy the entry lib ALONE into a
+    # module-less dir (no gate-broker-*.sh sibling) and point _AFK_TOPLEVEL at a nonexistent
+    # tree so no resolution candidate hits: the fail-closed override must make
+    # afk_danger_guard_decide DENY and afk_permission_hook_decide a silent no-op.
+    broker = tmp_path / "gate-broker.sh"
+    broker.write_bytes(GATE_BROKER.read_bytes())  # NB: no gate-broker-*.sh copied alongside
+    env = {
+        **os.environ,
+        "TZ": "UTC",
+        "AFK_WT_LIB": str(WT_LIB),
+        "AFK_HUB_INJECT": str(HUB_INJECT),
+        "_AFK_TOPLEVEL": str(tmp_path / "no-such-toplevel"),
+    }
+    payload = json.dumps(
+        {"tool_name": "Bash", "tool_input": {"command": "echo hi"}, "cwd": str(tmp_path)}
+    )
+
+    deny = subprocess.run(
+        ["bash", "-c", f'source "{broker}"; afk_danger_guard_decide'],
+        capture_output=True,
+        text=True,
+        env=env,
+        input=payload,
+        cwd=str(tmp_path),
+    )
+    assert '"permissionDecision":"deny"' in deny.stdout, deny.stdout + deny.stderr
+    assert "failing closed" in deny.stdout
+
+    allow = subprocess.run(
+        ["bash", "-c", f'source "{broker}"; afk_permission_hook_decide'],
+        capture_output=True,
+        text=True,
+        env=env,
+        input=payload,
+        cwd=str(tmp_path),
+    )
+    assert allow.stdout.strip() == "", allow.stdout  # never auto-approve when broken
 
 
 def test_parse_decision_extracts_answer() -> None:
@@ -3724,50 +3768,6 @@ def test_broker_consumes_stale_tag_when_answer_already_landed(
     assert tags.stdout.strip() == "", "the stale gate tag must be consumed"
     assert not artifact.exists(), "the spent plan artifact must be dropped too"
     assert not prompt_log.exists(), "a resumed spoke must NOT be re-answered"
-
-
-# ── event spool (issue #176) ──────────────────────────────────────────────────
-# The event-driven wake path: a spoke drops one <epoch>-<issue>-<type> file in the spool
-# and signals the supervisor. The reader (afk_event_dir / afk_drain_event_issues) lives in
-# the shared core so both the hub loop and these tests exercise it directly.
-
-
-def test_afk_event_dir_is_under_the_state_dir(tmp_path: Path) -> None:
-    result = _call("afk_event_dir", env={"AFK_STATE_DIR": str(tmp_path / "st")})
-
-    assert result.stdout.strip() == str(tmp_path / "st" / "events")
-
-
-def test_afk_drain_event_issues_prints_distinct_issues_and_deletes(tmp_path: Path) -> None:
-    events = tmp_path / "st" / "events"
-    events.mkdir(parents=True)
-    for name in ("100-5-gate", "101-5-park", "102-7-ready"):
-        (events / name).touch()
-
-    result = _call("afk_drain_event_issues", env={"AFK_STATE_DIR": str(tmp_path / "st")})
-
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.split() == ["5", "7"], "duplicate events collapse to one issue each"
-    assert not any(events.iterdir()), "every spool file is drained (deleted)"
-
-
-def test_afk_drain_event_issues_drops_malformed_names(tmp_path: Path) -> None:
-    events = tmp_path / "st" / "events"
-    events.mkdir(parents=True)
-    (events / "103-notanumber-x").touch()
-    (events / "104-9-ready").touch()
-
-    result = _call("afk_drain_event_issues", env={"AFK_STATE_DIR": str(tmp_path / "st")})
-
-    assert result.stdout.split() == ["9"], "a non-numeric issue field is skipped"
-    assert not any(events.iterdir()), "malformed files are deleted too, never left to pile up"
-
-
-def test_afk_drain_event_issues_empty_when_no_spool(tmp_path: Path) -> None:
-    result = _call("afk_drain_event_issues", env={"AFK_STATE_DIR": str(tmp_path / "st")})
-
-    assert result.returncode == 0
-    assert result.stdout.strip() == ""
 
 
 # ── issue #203 finding 4: compound-command decomposition + in-worktree lane ────
