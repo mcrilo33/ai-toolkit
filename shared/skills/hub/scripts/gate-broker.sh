@@ -476,8 +476,12 @@ _broker_present_qcm() {
 # spoke-ready.sh --gate), NEVER the caller's transcript-extraction fallback: a bare --gate park that
 # wrote no artifact is NOT waivable — its transcript narration is not a plan the spoke authored, and
 # (issue-derived) it scores high coverage, so trusting it could auto-approve a plan never written
-# (#277 review). Synchronous (one gh call + a local python coverage check), so the minutes-long
-# staleness the reasoner path guards against does not apply — no _still_parked_same recompute needed.
+# (#277 review). Reading the artifact HERE rather than taking the caller's already-fallback-merged
+# plan re-reads it (the caller reads it again for the reasoner question) — a DELIBERATE trade: the
+# shared read is exactly what let the fallback reach the waive, and a second small file read is
+# nothing against a reasoner path that costs minutes. Synchronous (one gh call + a local python
+# coverage check), so the minutes-long staleness the reasoner path guards against does not apply —
+# no _still_parked_same recompute needed.
 _broker_try_fastpath_gate() {
   local wt="$1" issue="$2" mode="$3" plan body cov target
   [ "$mode" = unattended ] || return 1
