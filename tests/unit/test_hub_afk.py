@@ -112,9 +112,12 @@ _BASE_ENV = {"AI_TOOLKIT_GH_LIFECYCLE_LABELS": "0"}
 # to locate its own dir and the helper scripts it resolves once (worktree-lib.sh,
 # gate-broker.sh, telemetry-ingest-spoke.sh). A call overriding one cannot reuse the
 # already-sourced coprocess (the resolution is baked at source), so it routes to a
-# fresh source. (AFK_ORIG_SCRIPT / AFK_SELF_COPY are read inside functions at call
-# time, and the self-copy exec is guarded by BASH_SOURCE==$0 — never on a source — so
-# they are runtime-safe and stay on the coprocess.)
+# fresh source. INVARIANT: any NEW top-level (source-time) env read added to
+# hub-afk.sh — a lib-override var or a `: "${VAR:=default}"` — must be listed here (or
+# a `fresh=True` at the call site), or a test overriding it silently gets the stale
+# baked value. (AFK_ORIG_SCRIPT / AFK_SELF_COPY are read inside functions at call time,
+# and the self-copy exec is guarded by BASH_SOURCE==$0 — never on a source — so they
+# are runtime-safe and stay on the coprocess.)
 _FRESH_SOURCE_KEYS = frozenset({"SCRIPT_DIR", "AFK_WT_LIB", "AFK_GATE_BROKER", "AFK_INGEST_BIN"})
 
 _SESSION: BashSession | None = None
@@ -123,7 +126,7 @@ _SESSION: BashSession | None = None
 def _session() -> BashSession:
     """The module-scoped bash that sources hub-afk.sh once (issue #276)."""
     global _SESSION
-    if _SESSION is None:
+    if _SESSION is None or not _SESSION.alive:
         _SESSION = BashSession(HUB_AFK, base_env=_BASE_ENV)
     return _SESSION
 

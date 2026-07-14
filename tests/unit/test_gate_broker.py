@@ -38,10 +38,12 @@ def _isolated_afk_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("AFK_HEARTBEAT", str(tmp_path / "afk-heartbeat"))
 
 
-# Source-time resolution keys (issue #276): SCRIPT_DIR and AFK_HUB_INJECT are read
-# while gate-broker.sh is being SOURCED, to locate its co-located hub-inject.sh. A
-# call that overrides one cannot reuse the already-sourced coprocess, so it routes
-# to a fresh source instead.
+# Source-time resolution keys (issue #276): these are read while gate-broker.sh is
+# being SOURCED (to locate its co-located hub-inject.sh / worktree-lib.sh). A call
+# that overrides one cannot reuse the already-sourced coprocess (the resolution is
+# baked at source), so it routes to a fresh source instead. INVARIANT: any NEW
+# top-level (source-time) env read added to gate-broker.sh must be listed here, or a
+# test overriding it would silently get the stale baked value.
 _FRESH_SOURCE_KEYS = frozenset({"SCRIPT_DIR", "AFK_HUB_INJECT", "AFK_WT_LIB"})
 
 _SESSION: BashSession | None = None
@@ -50,7 +52,7 @@ _SESSION: BashSession | None = None
 def _session() -> BashSession:
     """The module-scoped bash that sources gate-broker.sh once (issue #276)."""
     global _SESSION
-    if _SESSION is None:
+    if _SESSION is None or not _SESSION.alive:
         _SESSION = BashSession(GATE_BROKER)
     return _SESSION
 

@@ -11,7 +11,9 @@ start-env, so the autouse per-test ``AFK_STATE_DIR`` / ``AFK_HEARTBEAT`` isolati
 (set via ``monkeypatch`` in the Python process AFTER the coprocess started) is
 faithfully re-injected on every call. Per-call stdin, and captured
 stdout/stderr/returncode, match ``subprocess.run(..., capture_output=True)`` so the
-call sites' assertions are unchanged.
+call sites' assertions are unchanged. (One edge differs: a call killed by a signal
+reports ``128+signum`` here, whereas ``subprocess.run`` reports a negative code —
+signal/trap tests route to :func:`fresh_call`, so no coprocess call asserts it.)
 
 Both libs use ``set -uo pipefail`` (NOT ``set -e``), so a call that returns
 non-zero never aborts the read-loop, and each subshell inherits ``-uo pipefail`` —
@@ -21,6 +23,13 @@ Calls whose per-call env touches a SOURCE-TIME resolution key (``SCRIPT_DIR`` an
 the lib-override vars, which the libs read while being sourced to locate their
 co-located helpers) cannot reuse the already-sourced coprocess. Those route to a
 fresh ``bash -c 'source; fn'`` subprocess via :func:`fresh_call`.
+
+Failure isolation: if the coprocess dies (a call kills its own shell, or bash
+exits), the read hits EOF, which raises :class:`BashSessionError` and marks the
+session not-``alive`` so the module singleton rebuilds a fresh coprocess on the next
+call rather than writing into a corpse. A call that truly *hangs* blocks the read,
+exactly as the old per-call ``subprocess.run`` (no timeout) would — such calls
+(signals, main-loop waits on ``$$``) route to :func:`fresh_call` instead.
 """
 
 from __future__ import annotations
@@ -49,6 +58,10 @@ done
 """
 
 
+class BashSessionError(RuntimeError):
+    """The coprocess died; the session is no longer usable and must be rebuilt."""
+
+
 class BashSession:
     """A long-lived bash that sources ``lib`` once and runs calls in subshells."""
 
@@ -65,6 +78,7 @@ class BashSession:
         # The env the coprocess was launched with — every per-call delta is computed
         # against this snapshot, so a monkeypatched-in AFK_STATE_DIR is re-exported.
         self._start_env: dict[str, str] = {**os.environ, **self._base_env}
+        self._alive = True
         self._tmp = Path(tempfile.mkdtemp(prefix="bash-session-"))
         self._witness = self._tmp / "source-count"
         self._witness.write_bytes(b"")
@@ -72,16 +86,25 @@ class BashSession:
         self._out = self._tmp / "out"
         self._err = self._tmp / "err"
         self._stin = self._tmp / "stin"
+        # The coprocess's OWN stderr (source-time parse/diagnostic noise) is teed to a
+        # file so a bring-up failure ("died before READY") is debuggable.
+        self._proc_err = self._tmp / "coprocess.err"
+        self._proc_err_fh = self._proc_err.open("w")
         self._proc = subprocess.Popen(
             ["bash", "-c", _COPROCESS_PROGRAM, "bash", self._lib, str(self._witness)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=self._proc_err_fh,
             env={**self._start_env},
             text=True,
             bufsize=1,
         )
         self._await("READY")
+
+    @property
+    def alive(self) -> bool:
+        """False once the coprocess has died — the singleton must rebuild it."""
+        return self._alive
 
     @property
     def source_count(self) -> int:
@@ -94,8 +117,14 @@ class BashSession:
         """Run ``fn_call`` in a subshell of the sourced coprocess.
 
         Returns a CompletedProcess with the call's captured stdout, stderr, and
-        returncode — shaped exactly like ``subprocess.run(capture_output=True)``.
+        returncode — shaped like ``subprocess.run(capture_output=True)``.
+
+        Raises:
+            BashSessionError: the coprocess is dead (before or during this call). The
+                session is marked not-alive so the next ``_call`` rebuilds it.
         """
+        if not self._alive:
+            raise BashSessionError("coprocess is dead — session must be rebuilt")
         desired = {**os.environ, **self._base_env}
         if env:
             desired.update(env)
@@ -110,8 +139,12 @@ class BashSession:
         self._out.write_bytes(b"")
         self._err.write_bytes(b"")
         assert self._proc.stdin is not None
-        self._proc.stdin.write(f"{self._frag}\t{self._out}\t{self._err}\t{self._stin}\n")
-        self._proc.stdin.flush()
+        try:
+            self._proc.stdin.write(f"{self._frag}\t{self._out}\t{self._err}\t{self._stin}\n")
+            self._proc.stdin.flush()
+        except (BrokenPipeError, ValueError) as exc:
+            self._die()
+            raise BashSessionError("coprocess pipe is closed") from exc
         rc = self._read_rc()
         return subprocess.CompletedProcess(
             args=fn_call,
@@ -129,23 +162,32 @@ class BashSession:
                 self._proc.wait(timeout=10)
             except (subprocess.TimeoutExpired, OSError):
                 self._proc.kill()
+        if not self._proc_err_fh.closed:
+            self._proc_err_fh.close()
+        self._alive = False
+
+    def _die(self) -> None:
+        self._alive = False
+        if self._proc.poll() is None:
+            self._proc.kill()
+
+    def _readline(self, what: str) -> str:
+        """One line from the coprocess; raise + mark dead on EOF (coprocess died)."""
+        assert self._proc.stdout is not None
+        line = self._proc.stdout.readline()
+        if line == "":
+            self._die()
+            tail = self._proc_err.read_text()[-2000:] if self._proc_err.exists() else ""
+            raise BashSessionError(f"coprocess died before {what}; stderr:\n{tail}")
+        return line
 
     def _await(self, token: str) -> None:
-        assert self._proc.stdout is not None
-        while True:
-            line = self._proc.stdout.readline()
-            if line == "":
-                raise RuntimeError(f"bash coprocess died before {token}")
-            if line.strip() == token:
-                return
+        while self._readline(token).strip() != token:
+            pass
 
     def _read_rc(self) -> int:
-        assert self._proc.stdout is not None
         while True:
-            line = self._proc.stdout.readline()
-            if line == "":
-                raise RuntimeError("bash coprocess died mid-call")
-            stripped = line.strip()
+            stripped = self._readline("RC").strip()
             if stripped.startswith("RC="):
                 return int(stripped[3:])
 
@@ -161,7 +203,8 @@ def fresh_call(
     """Source ``lib`` in a FRESH bash and run ``fn_call`` — the pre-#276 harness.
 
     Used for calls whose per-call env changes SOURCE-TIME resolution (SCRIPT_DIR,
-    lib-override vars), which the already-sourced :class:`BashSession` cannot honor.
+    lib-override vars), or that need whole-shell signal/trap/``$$`` semantics the
+    shared coprocess's per-call subshell cannot reproduce.
     """
     full_env = {**os.environ, "TZ": "UTC", **(base_env or {})}
     if env:
