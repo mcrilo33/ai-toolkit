@@ -409,7 +409,7 @@ def test_run_suite_parallelizes_the_full_sweep(repo: Path, tmp_path: Path) -> No
     pytest_stub = bindir / "pytest"
     pytest_stub.write_text(
         "#!/bin/sh\n"
-        'case "$1" in --help|-h) echo "usage: pytest"; exit 0 ;; '
+        'case "$1" in --help|-h) echo "usage: pytest"; echo "  -n numprocesses"; exit 0 ;; '
         '--version|-V) echo "pytest 9.9"; exit 0 ;; esac\n'
         f'printf "%s\\n" "$*" >> "{argv_log}"\n'
         "exit 0\n"

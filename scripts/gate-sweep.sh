@@ -212,6 +212,17 @@ run_suite() {
     return 0
   fi
   read -r -a RUNNER_ARR <<< "$runner"
+  # pytest-xdist on the full sweep (issue #276): the post-land sweep re-runs the
+  # whole suite, which is I/O-bound and embarrassingly parallel — run it under
+  # `-n auto`. Guarded on the plugin being present (an install without pytest-xdist
+  # degrades to single-process rather than erroring the sweep). Capture --help then
+  # case-match rather than piping to grep -q: an early -q match would SIGPIPE the
+  # runner under pipefail and falsely report xdist absent.
+  local xdist=() help=""
+  help="$("${RUNNER_ARR[@]}" --help 2>/dev/null || true)"
+  case "$help" in
+    *"-n numprocesses"*|*"--numprocesses"*) xdist=(-n auto) ;;
+  esac
   # Observe-only on this surface (issue #267): the sweep re-runs the full suite on the
   # live hub/main checkout, where a concurrent /afk drain legitimately FF-advances
   # main/origin/*/sibling refs, stamps needs-human-land/* tags, and moves HEAD.
@@ -221,9 +232,9 @@ run_suite() {
   # It captures the suite's stdout+stderr into $cap itself. The bare fallback
   # is for an older installed utils.sh that predates the observe helper.
   if command -v run_under_tripwire_observe >/dev/null 2>&1; then
-    run_under_tripwire_observe "$cap" "${RUNNER_ARR[@]}" 2>>"$LOG"
+    run_under_tripwire_observe "$cap" "${RUNNER_ARR[@]}" ${xdist[@]+"${xdist[@]}"} 2>>"$LOG"
   else
-    "${RUNNER_ARR[@]}" > "$cap" 2>&1
+    "${RUNNER_ARR[@]}" ${xdist[@]+"${xdist[@]}"} > "$cap" 2>&1
   fi
 }
 

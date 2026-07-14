@@ -75,23 +75,28 @@ def _stdin(local_sha: str, remote_sha: str, ref: str = "refs/heads/feature/x") -
     return f"{ref} {local_sha} {ref} {remote_sha}\n"
 
 
-def _make_pytest_stub(bindir: Path, runlog: Path, *, testmon: bool, exit_code: int = 0) -> None:
+def _make_pytest_stub(
+    bindir: Path, runlog: Path, *, testmon: bool, xdist: bool = True, exit_code: int = 0
+) -> None:
     """Install a `pytest` stub on PATH.
 
-    `--help` prints usage, advertising `--testmon` only when `testmon` is True
-    (this is how test-select.sh probes plugin availability). Any other call logs
-    `RUN <args>` plus the `GIT_DIR` it inherited as `GITDIR=[<val>|UNSET]` to
-    `runlog`, then exits `exit_code` — so a test can assert which tier ran, that a
-    failure propagates, and that the git-hook env strip reached the pytest child.
+    `--help` prints usage, advertising `--testmon` only when `testmon` is True and
+    xdist's `-n numprocesses` only when `xdist` is True (this is how test-select.sh
+    probes plugin availability). Any other call logs `RUN <args>` plus the `GIT_DIR`
+    it inherited as `GITDIR=[<val>|UNSET]` to `runlog`, then exits `exit_code` — so a
+    test can assert which tier ran, that a failure propagates, and that the git-hook
+    env strip reached the pytest child.
     """
     bindir.mkdir(parents=True, exist_ok=True)
     testmon_line = '  echo "  --testmon  select impacted tests"' if testmon else ":"
+    xdist_line = '  echo "  -n numprocesses, --numprocesses=numprocesses"' if xdist else ":"
     (bindir / "pytest").write_text(
         "#!/bin/sh\n"
         'case "$1" in\n'
         "  --help|-h)\n"
         '    echo "usage: pytest [options]"\n'
         f"    {testmon_line}\n"
+        f"    {xdist_line}\n"
         "    exit 0 ;;\n"
         "  --version)\n"
         f'    echo "{STUB_ENV_FINGERPRINT}"\n'
@@ -120,7 +125,8 @@ def _make_python_module_stub(bindir: Path, runlog: Path, *, testmon: bool) -> No
         'if [ "$1" = "-m" ] && [ "$2" = "pytest" ]; then\n'
         "  shift 2\n"
         '  case "$1" in\n'
-        f'    --help|-h) echo "usage: pytest"; {testmon_line}; exit 0 ;;\n'
+        f'    --help|-h) echo "usage: pytest"; {testmon_line}; '
+        'echo "  -n numprocesses"; exit 0 ;;\n'
         f'    --version) echo "{STUB_ENV_FINGERPRINT}"; exit 0 ;;\n'
         "  esac\n"
         f'  printf "RUN %s\\n" "$*" >> "{runlog}"\n'
@@ -153,7 +159,8 @@ def _make_testmon_modeling_stub(bindir: Path, runlog: Path, *, impact: list[str]
     (bindir / "pytest").write_text(
         "#!/bin/sh\n"
         'case "$1" in\n'
-        '  --help|-h) echo "usage: pytest"; echo "  --testmon"; exit 0 ;;\n'
+        '  --help|-h) echo "usage: pytest"; echo "  --testmon"; '
+        'echo "  -n numprocesses"; exit 0 ;;\n'
         f'  --version) echo "{STUB_ENV_FINGERPRINT}"; exit 0 ;;\n'
         "esac\n"
         f'printf "RUN %s\\n" "$*" >> "{runlog}"\n'
@@ -163,6 +170,7 @@ def _make_testmon_modeling_stub(bindir: Path, runlog: Path, *, impact: list[str]
         '  case "$a" in\n'
         "    --testmon) testmon=1 ;;\n"
         '    --ignore=*) ignored="$ignored${a#--ignore=} " ;;\n'
+        "    auto) : ;;\n"  # the `-n auto` value (xdist, #276) — not a test file
         "    -*) : ;;\n"
         '    *) f="${a%%::*}"; printf "RAN:%s\\n" "$f" >> "'
         f'{runlog}" ;;\n'
@@ -950,7 +958,7 @@ def test_mapped_shell_change_runs_only_mapped_tests(repo: Path, tmp_path: Path) 
 
     assert proc.returncode == 0, proc.stderr
     log = _runlog(runlog)
-    assert "RUN tests/unit/test_do.py\n" in log  # exactly the mapped set
+    assert "RUN -n auto tests/unit/test_do.py\n" in log  # exactly the mapped set
     assert "--testmon" not in log
     assert "RUN \n" not in log  # never the bare full suite
 
@@ -966,7 +974,7 @@ def test_two_mapped_files_run_deduped_sorted_union(repo: Path, tmp_path: Path) -
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "RUN tests/unit/test_a.py tests/unit/test_b.py\n" in _runlog(runlog)
+    assert "RUN -n auto tests/unit/test_a.py tests/unit/test_b.py\n" in _runlog(runlog)
 
 
 def test_mixed_py_and_mapped_shell_runs_mapped_plus_testmon(repo: Path, tmp_path: Path) -> None:
@@ -980,7 +988,7 @@ def test_mixed_py_and_mapped_shell_runs_mapped_plus_testmon(repo: Path, tmp_path
 
     assert proc.returncode == 0, proc.stderr
     log = _runlog(runlog)
-    assert "RUN tests/unit/test_do.py\n" in log  # the mapped set …
+    assert "RUN -n auto tests/unit/test_do.py\n" in log  # the mapped set …
     # ... plus testmon for the python part, with the mapped file --ignore'd so
     # testmon cannot re-run what the explicit leg already ran (issue #270).
     assert "RUN --testmon --ignore=tests/unit/test_do.py\n" in log
@@ -1030,7 +1038,7 @@ def test_unmapped_shell_change_escalates_to_full(repo: Path, tmp_path: Path) -> 
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "RUN \n" in _runlog(runlog)  # the full suite, not a selection
+    assert "RUN -n auto\n" in _runlog(runlog)  # the full suite, not a selection
 
 
 def test_unmapped_shell_change_emits_witness_warning(repo: Path, tmp_path: Path) -> None:
@@ -1047,7 +1055,7 @@ def test_unmapped_shell_change_emits_witness_warning(repo: Path, tmp_path: Path)
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "RUN \n" in _runlog(runlog)  # conservative fallback: FULL still runs
+    assert "RUN -n auto\n" in _runlog(runlog)  # conservative fallback: FULL still runs
     assert "witness: unmapped-shell" in proc.stderr  # the greppable audit signal …
     assert "scripts/new.sh" in proc.stderr  # … naming the offending script
 
@@ -1124,7 +1132,7 @@ def test_mixed_mapped_and_unmapped_escalates_to_full(repo: Path, tmp_path: Path)
 
     assert proc.returncode == 0, proc.stderr
     log = _runlog(runlog)
-    assert "RUN \n" in log
+    assert "RUN -n auto\n" in log
     assert "RUN tests/unit/test_do.py\n" not in log  # full subsumes the selection
 
 
@@ -1168,7 +1176,7 @@ def test_exempt_list_change_itself_escalates_to_full(repo: Path, tmp_path: Path)
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "RUN \n" in _runlog(runlog)
+    assert "RUN -n auto\n" in _runlog(runlog)
 
 
 def test_selected_failing_suite_blocks_push(repo: Path, tmp_path: Path) -> None:
@@ -1227,7 +1235,7 @@ def test_missing_reverse_index_lib_degrades_to_full(repo: Path, tmp_path: Path) 
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert "RUN \n" in _runlog(runlog)  # today's behavior, unchanged
+    assert "RUN -n auto\n" in _runlog(runlog)  # today's behavior, unchanged
 
 
 # --- the enforcement meta-test rides every pytest-running tier (#123) ------------
@@ -1253,7 +1261,7 @@ def test_selected_tier_appends_meta_test(repo: Path, tmp_path: Path) -> None:
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert f"RUN tests/unit/test_do.py {META_NODE}\n" in _runlog(runlog)
+    assert f"RUN -n auto tests/unit/test_do.py {META_NODE}\n" in _runlog(runlog)
 
 
 def test_python_tier_appends_meta_test_invocation(repo: Path, tmp_path: Path) -> None:
@@ -1296,7 +1304,7 @@ def test_full_tier_does_not_append_meta_test(repo: Path, tmp_path: Path) -> None
 
     assert proc.returncode == 0, proc.stderr
     log = _runlog(runlog)
-    assert "RUN \n" in log
+    assert "RUN -n auto\n" in log
     assert "TestControlPlaneCoverage" not in log
 
 
@@ -1313,7 +1321,7 @@ def test_script_under_docs_dir_is_never_a_doc(repo: Path, tmp_path: Path) -> Non
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "RUN \n" in _runlog(runlog)  # unmapped script → FULL, never NOTHING
+    assert "RUN -n auto\n" in _runlog(runlog)  # unmapped script → FULL, never NOTHING
 
 
 # --- selected-tier stamps: consume and mint with the set that ran (#123-D) --------
@@ -1358,7 +1366,7 @@ def test_different_selection_same_tree_runs(repo: Path, tmp_path: Path) -> None:
 
     assert proc.returncode == 0, proc.stderr
     assert len(_runlog(runlog)) > len(after_first)  # no unsound cover: it ran
-    assert "RUN tests/unit/test_one.py" in _runlog(runlog)
+    assert "RUN -n auto tests/unit/test_one.py" in _runlog(runlog)
 
 
 def test_python_push_after_selected_stamp_still_runs_testmon(repo: Path, tmp_path: Path) -> None:
@@ -1429,7 +1437,7 @@ def test_mixed_diff_without_testmon_falls_back_to_full(repo: Path, tmp_path: Pat
 
     assert proc.returncode == 0, proc.stderr
     log = _runlog(runlog)
-    assert "RUN \n" in log  # the python part demands the full suite
+    assert "RUN -n auto\n" in log  # the python part demands the full suite
     assert "--testmon" not in log
     assert "RUN tests/unit/test_do.py" not in log  # full subsumes the selection
 
@@ -1451,7 +1459,7 @@ def test_mapping_to_vanished_test_escalates_full(repo: Path, tmp_path: Path) -> 
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "RUN \n" in _runlog(runlog)  # escalated to full
+    assert "RUN -n auto\n" in _runlog(runlog)  # escalated to full
     assert "mapped test missing" in proc.stderr
 
 
@@ -1468,7 +1476,7 @@ def test_exempt_entry_cannot_hide_mapped_coverage(repo: Path, tmp_path: Path) ->
     proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
 
     assert proc.returncode == 0, proc.stderr
-    assert "RUN tests/unit/test_do.py" in _runlog(runlog)  # mapped coverage ran
+    assert "RUN -n auto tests/unit/test_do.py" in _runlog(runlog)  # mapped coverage ran
 
 
 def test_exempt_only_diff_notes_exemption(repo: Path, tmp_path: Path) -> None:
@@ -1512,7 +1520,7 @@ def test_missing_lib_ignores_exempt_entries_and_runs_full(repo: Path, tmp_path: 
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert "RUN \n" in _runlog(runlog)  # FULL, never a silent exempt skip
+    assert "RUN -n auto\n" in _runlog(runlog)  # FULL, never a silent exempt skip
 
 
 # ── Part 1 (issue #276): pytest-xdist on the non-testmon legs ────────────────────
@@ -1592,3 +1600,20 @@ def test_testmon_leg_is_never_parallelized(repo: Path, tmp_path: Path) -> None:
     log = _runlog(runlog)
     assert "RUN --testmon\n" in log  # the testmon leg ran …
     assert "-n auto" not in log  # … and was never parallelized
+
+
+def test_full_suite_degrades_to_single_process_without_xdist(repo: Path, tmp_path: Path) -> None:
+    # Graceful degrade (issue #276): a runner whose `--help` does not advertise
+    # pytest-xdist runs the FULL suite single-process — the gate never blocks a push
+    # on `pytest: unrecognized -n` when the plugin is absent.
+    base = _rev(repo)
+    tip = _commit(repo, {"scripts/thing.sh": "echo hi\n"})  # unmapped shell → FULL
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True, xdist=False)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    log = _runlog(runlog)
+    assert "RUN \n" in log  # bare full suite, no -n auto
+    assert "-n auto" not in log
