@@ -2100,6 +2100,80 @@ _classify_read_tool() {
   printf 'APPROVE\n'
 }
 
+# _permission_redirect_scan <cmd> -> tokenize <cmd> (shlex) and print, one line each:
+#   R<TAB><target>   for every FILE redirect target (>, >>, or <; glued `>f` or spaced `> f`),
+#                    skipping fd-duplications (2>&1, >&2) which carry no file target, and
+#   C<TAB><cleaned>  the command with every redirect operator+target removed, tokens rejoined
+#                    with single spaces (NOT shell-quoted, so a trailing background `&` survives
+#                    as a bare operator for the caller's textual operator-split).
+# A shlex error prints a lone `__UNPARSEABLE__` (caller denies, deny-lean). This is the Tier-1
+# APPROVE-side mirror of _danger_redirect_targets: classify_permission proves every target
+# resolves in-tree, then vouches the CLEANED command -- so an in-tree log redirect
+# (`>.ai-toolkit/push.log 2>&1`) no longer blocks Tier 1 while an out-of-tree target still fails
+# containment. Done on the RAW command BEFORE the operator-split so a `2>&1` (whose `&` the split
+# would shatter into a bogus `1` segment) is stripped whole. No python3 -> no output (the caller
+# treats an unverifiable redirect as deny). Plain ASCII, no backticks in this heredoc comment.
+_permission_redirect_scan() {
+  command -v python3 >/dev/null 2>&1 || return 0
+  _PERM_CMD="$1" python3 2>/dev/null <<'PYEOF'
+import os, re, shlex
+
+cmd = os.environ["_PERM_CMD"]
+try:
+    toks = shlex.split(cmd)
+except Exception:
+    print("__UNPARSEABLE__"); raise SystemExit(0)
+
+# A redirect operator, possibly glued to its target: an optional fd number or `&`, then
+# `>`/`>>`/`<`. The `<` is the addition over _danger_redirect_targets, so an out-of-tree INPUT
+# redirect is validated too, not silently passed.
+op = re.compile(r"^([0-9]*|&)(>>?|<)\|?")
+targets = []
+cleaned = []
+i = 0
+while i < len(toks):
+    t = toks[i]
+    m = op.match(t)
+    if m:
+        suffix = t[m.end():]
+        if suffix:
+            if not suffix.startswith("&"):        # a glued file target; &N is an fd-dup (skip)
+                targets.append(suffix)
+        elif i + 1 < len(toks) and not toks[i + 1].startswith("&"):
+            targets.append(toks[i + 1])           # a spaced file target (> file)
+            i += 1
+        i += 1
+        continue
+    cleaned.append(t)
+    i += 1
+for t in targets:
+    print("R\t" + t)
+print("C\t" + " ".join(cleaned))
+PYEOF
+}
+
+# _permission_redirects_ok <cmd> <cwd> <wt> <slug> <tasks> -> when EVERY file redirect target in
+# <cmd> resolves inside the worktree/scratchpad (via _broker_resolve_in_roots, which also rejects
+# `..`, absolute paths, `.git`, secret shell metacharacters), print the command with all redirects
+# stripped and return 0; else return 1 (an out-of-tree / unparseable target, or no python3).
+# classify_permission calls this on the RAW command so the vouched (cleaned) command carries no
+# redirect operator to be shattered by the `&`-split.
+_permission_redirects_ok() {
+  local cmd="$1" cwd="$2" wt="$3" slug="$4" tasks="$5" out tag val cleaned="" saw_cleaned=0
+  out="$(_permission_redirect_scan "$cmd")"
+  [ -n "$out" ] || return 1                          # no python3 -> unverifiable -> deny
+  case "$out" in *__UNPARSEABLE__*) return 1 ;; esac
+  while IFS=$'\t' read -r tag val; do
+    case "$tag" in
+      R) [ -n "$val" ] || continue
+         _broker_resolve_in_roots "$val" "$cwd" "$wt" "$slug" "$tasks" >/dev/null 2>&1 || return 1 ;;
+      C) cleaned="$val"; saw_cleaned=1 ;;
+    esac
+  done <<< "$out"
+  [ "$saw_cleaned" -eq 1 ] || return 1
+  printf '%s\n' "$cleaned"
+}
+
 # classify_permission <command> [worktree] -> "APPROVE" or "ESCALATE<TAB><reason>".
 # DEFAULT-DENY: the command is APPROVEd only when EVERY segment (split on ; && || |) is a
 # safe scoped self-op, so a single risky segment in a chain escalates the whole. When the
@@ -2109,7 +2183,7 @@ _classify_read_tool() {
 # out-of-tree deletion, network fetch, browser/computer/mcp tool, or a bare non-Bash tool
 # name — ESCALATEs, naming the offending command so the block record is actionable.
 classify_permission() {
-  local cmd="$1" wt="${2:-}" norm seg saw_seg=0 cwd="" slug="" tasks="" target new_cwd
+  local cmd="$1" wt="${2:-}" norm seg saw_seg=0 cwd="" slug="" tasks="" target new_cwd splitcmd
   if [ -n "$wt" ]; then
     slug="$(printf '%s' "$wt" | sed 's/[^A-Za-z0-9]/-/g')"
     tasks="${AFK_TASKS_ROOT:-/private/tmp}"
@@ -2121,10 +2195,23 @@ classify_permission() {
   case "$cmd" in
     'Read '*) _classify_read_tool "${cmd#Read }" "$wt"; return 0 ;;
   esac
+  # Redirection (#282): validate on the WHOLE raw command (mirroring classify_danger:2533) then
+  # STRIP it, so an in-tree log redirect no longer blocks Tier 1 and the `&`-split below never
+  # shatters a `2>&1` into a bogus `1` segment. Every file target must resolve in-tree (else
+  # escalate); the trailing `$(`/backtick reject still fires per segment on the cleaned command.
+  # Inert without a worktree — an unverifiable redirect stays rejected by _permission_seg_safe.
+  splitcmd="$cmd"
+  case "$cmd" in
+    *'>'* | *'<'*)
+      if [ -n "$wt" ] && splitcmd="$(_permission_redirects_ok "$cmd" "$cwd" "$wt" "$slug" "$tasks")"
+      then :
+      else printf 'ESCALATE\t%s\n' "risky or unrecognised command: $cmd"; return 0
+      fi ;;
+  esac
   # Normalise the shell operators to newlines, longest first so `||` is not split by `|`
   # and `&&` is not split by a single `&`. The single `&` (background) MUST also split, or
   # `echo x & rm -rf /` would match the safe `echo ` prefix and never inspect the tail.
-  norm="${cmd//&&/$'\n'}"
+  norm="${splitcmd//&&/$'\n'}"
   norm="${norm//&/$'\n'}"
   norm="${norm//||/$'\n'}"
   norm="${norm//|/$'\n'}"
@@ -2133,6 +2220,13 @@ classify_permission() {
     seg="${seg#"${seg%%[![:space:]]*}"}"           # ltrim
     seg="${seg%"${seg##*[![:space:]]}"}"           # rtrim
     [ -n "$seg" ] || continue
+    # Strip a leading `FOO=bar` / `env|command|nohup|setsid` wrapper before the lane dispatch,
+    # mirroring classify_danger (#282): the sanctioned `nohup ./scripts/spoke-push.sh …` detach
+    # otherwise reads its verb as `nohup` and misses the exec/marker lanes. Safe by construction —
+    # classify_danger runs FIRST under the wall and strips the same wrapper, so a dangerous op
+    # behind it is denied at Tier 2; and each lane still confines the residual op to the worktree.
+    seg="$(_danger_strip_prefix "$seg")"
+    [ -n "$seg" ] || continue                      # a bare wrapper (`nohup` alone) → nothing to vouch
     saw_seg=1
     # cd-tracking within the compound: a `cd` into a path that stays under the worktree/
     # scratchpad updates the current dir for the following segments' relative paths; a `cd`
