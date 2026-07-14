@@ -878,6 +878,29 @@ self-land -- the hub lands #$issue.
 EOF
 }
 
+# _afk_conflict_resolve_prompt <issue> -> the #285 resolution message for a spoke whose land
+# hit a DETERMINISTIC merge conflict (a sibling landed edits to a file this spoke also owns).
+# The hub cannot resolve it — the spoke must merge the base branch on its side and re-push, so
+# the hub re-lands on the fresh tip. Names the marker-emitter path that EXISTS in the spoke's
+# worktree (the #271 probe) so the re-emit step doesn't hand it a path the deny-wall approves
+# textually but that fails to exec.
+_afk_conflict_resolve_prompt() {
+  local issue="$1" marker_dir base
+  marker_dir="$(wt_marker_script_dir "${_AFK_TOPLEVEL:-.}")"
+  base="$(_afk_default_ref "${_AFK_TOPLEVEL:-.}")"; base="${base:-origin/main}"
+  cat <<EOF
+The hub could NOT land your branch: it CONFLICTS with $base because a sibling task landed
+changes to a file you also edited. Your committed work is intact -- resolve the conflict ON
+THE SPOKE so the hub can re-land on your fresh tip:
+  1. git fetch origin
+  2. merge the base branch into yours (git merge $base) and RESOLVE the conflicts
+  3. re-run your tests to confirm green
+  4. push your branch
+  5. re-emit the ready marker: bash ${marker_dir}/spoke-push.sh --ready $issue
+Do NOT self-land -- the hub lands #$issue once your tip is mergeable again.
+EOF
+}
+
 # _afk_continue_command <wt> <prompt> -> the `claude --continue '<prompt>'` launch
 # command for a re-opened spoke window (crash resume, wedge respawn). Pure (returns the
 # string) so it is inspectable in a test. It inline-exports the telemetry the window
@@ -1745,6 +1768,134 @@ _afk_land_retry_max() {
   printf '%s\n' "$max"
 }
 
+# --- #285: the conflicted-land resolution lane --------------------------------
+# A DETERMINISTIC merge conflict (worktree-land exit WT_LAND_CONFLICT_EXIT=4) is a pure
+# function of the two tips: re-running the identical land is futile until one tip moves. So
+# auto_land records a per-issue, per-window fingerprint "<branch_tip> <main_tip>" and, while it
+# is UNCHANGED, does NOT re-run the expensive land — it routes to a resolution lane instead
+# (relaunch a reaped spoke reusing its spoke_run_id, or inject a live one, with a merge the base
+# branch -> resolve -> re-push -> re-emit ready instruction). When the spoke resolves and the tip
+# moves, the fingerprint no longer matches and auto_land re-lands on the fresh tip.
+: "${WT_LAND_CONFLICT_EXIT:=4}"
+case "$WT_LAND_CONFLICT_EXIT" in '' | *[!0-9]*) WT_LAND_CONFLICT_EXIT=4 ;; esac
+
+_afk_land_conflict_fp_file() { printf '%s\n' "$(_afk_state_dir)/land-conflict-$1"; }
+_afk_read_land_conflict_fp() {
+  local f; f="$(_afk_land_conflict_fp_file "$1")"
+  [ -f "$f" ] && head -n1 "$f" 2>/dev/null || true
+}
+_afk_write_land_conflict_fp() {
+  local issue="$1" fp="$2"
+  mkdir -p "$(_afk_state_dir)" 2>/dev/null || true
+  _afk_atomic_write "$(_afk_land_conflict_fp_file "$issue")" "$fp" || true
+}
+_afk_clear_land_conflict_fp() { rm -f "$(_afk_land_conflict_fp_file "$1")" 2>/dev/null || true; }
+_afk_clear_land_conflict_fps() { rm -f "$(_afk_state_dir)"/land-conflict-* 2>/dev/null || true; }
+
+# _afk_land_conflict_fingerprint <wt> -> "<branch_tip> <main_tip>": the pair a conflict is a pure
+# function of. main_tip is the local default branch the land merges INTO (_afk_local_default_sha),
+# so a sibling land advancing main is detected as a moved fingerprint too.
+_afk_land_conflict_fingerprint() {
+  local wt="$1" bt mt
+  bt="$(git -C "$wt" rev-parse HEAD 2>/dev/null || true)"
+  mt="$(_afk_local_default_sha)"
+  printf '%s %s\n' "$bt" "$mt"
+}
+# _afk_land_conflict_unchanged <wt> <issue> -> true when a recorded conflict fingerprint exists
+# AND the current tips still match it (an identical re-land would deterministically re-conflict).
+_afk_land_conflict_unchanged() {
+  local wt="$1" issue="$2" prev
+  prev="$(_afk_read_land_conflict_fp "$issue")"
+  [ -n "$prev" ] || return 1
+  [ "$prev" = "$(_afk_land_conflict_fingerprint "$wt")" ]
+}
+
+# The resolution-lane budget is DISTINCT from the crash-resume budget (_afk_resumed_marker): a
+# conflict revive must neither consume nor be starved by the once-per-window crash-resume stamp.
+# It records the SPOKE branch tip at dispatch, so a re-land triggered by a sibling advancing main
+# (which moves the land fingerprint but NOT the spoke's own tip) does NOT re-inject the resolve
+# prompt into a spoke already resolving — only a spoke that moved its OWN tip (genuine progress)
+# earns a fresh dispatch (#285 review). Per-window (cleared on a fresh arm).
+_afk_conflict_resolved_marker() { printf '%s\n' "$(_afk_state_dir)/conflict-resolved-$1"; }
+_afk_already_conflict_resolved() { [ -f "$(_afk_conflict_resolved_marker "$1")" ]; }
+_afk_read_conflict_resolved_tip() {
+  local m; m="$(_afk_conflict_resolved_marker "$1")"
+  [ -f "$m" ] && head -n1 "$m" 2>/dev/null || true
+}
+_afk_mark_conflict_resolved() {
+  local issue="$1" tip="${2:-}" m
+  m="$(_afk_conflict_resolved_marker "$issue")"
+  mkdir -p "$(dirname "$m")" 2>/dev/null || true
+  printf '%s\n' "$tip" > "$m" 2>/dev/null || true
+}
+_afk_clear_conflict_resolved() { rm -f "$(_afk_conflict_resolved_marker "$1")" 2>/dev/null || true; }
+_clear_conflict_resolve_markers() { rm -f "$(_afk_state_dir)"/conflict-resolved-* 2>/dev/null || true; }
+
+# _afk_conflict_resolve_relaunch <wt> <issue> -> DEAD/reaped pane: relaunch the spoke reusing its
+# spoke_run_id (via _afk_continue_command) with the resolve prompt. Resets the reap + idle clocks
+# (the fresh window has not written a transcript yet). rc 1 when the window can't be opened.
+_afk_conflict_resolve_relaunch() {
+  local wt="$1" issue="$2"
+  log "→ conflict-resolve #$issue: relaunching the reaped spoke to merge the base branch + resolve + re-push"
+  _afk_set_last_action "conflict-resolve #$issue"
+  if ! _afk_open_spoke_window "$wt" "$issue" \
+       "$(_afk_continue_command "$wt" "$(_afk_conflict_resolve_prompt "$issue")")"; then
+    log "  could not open a conflict-resolve window for #$issue"
+    return 1
+  fi
+  stamp_progress_epoch "$issue"
+  stamp_answer_attempt "$issue"
+  broker_journal_decision "$issue" conflict-resolve \
+    "relaunched the reaped spoke to merge the base branch + resolve the land conflict + re-push" reversible
+  _afk_bump_count "$wt" relaunch-count
+  _afk_emit_span "$wt" afk-conflict-resolve success
+  return 0
+}
+# _afk_conflict_resolve_inject <wt> <issue> -> LIVE pane: inject the resolve prompt into the
+# running session (no relaunch — never kill a working spoke). rc mirrors inject_and_verify.
+_afk_conflict_resolve_inject() {
+  local wt="$1" issue="$2" target rc
+  log "→ conflict-resolve #$issue: injecting merge-base + resolve + re-push into the live session (no relaunch)"
+  _afk_set_last_action "conflict-resolve #$issue"
+  target="$(_spoke_pane_target "$wt")"
+  if [ -z "$target" ]; then
+    log "  no live pane for #$issue — cannot inject"
+    return 1
+  fi
+  stamp_answer_attempt "$issue"
+  inject_and_verify "$wt" "$target" "$(_afk_conflict_resolve_prompt "$issue")"; rc=$?
+  broker_journal_decision "$issue" conflict-resolve \
+    "injected merge the base branch + resolve + re-push into the live session (no relaunch)" reversible
+  if [ "$rc" -eq 0 ]; then _afk_emit_span "$wt" afk-conflict-resolve success; else _afk_emit_span "$wt" afk-conflict-resolve retry; fi
+  return "$rc"
+}
+# _afk_route_conflict_resolution <wt> <issue> -> dispatch ONE resolution per distinct conflict:
+# inject a live pane, relaunch a dead one. On a successful dispatch mark the distinct budget; a
+# failed dispatch (or a repeat while the tip is unchanged) warn-parks LAST on the LAND lane so
+# the watchdog escalates needs-human-land only after the drain's resolution genuinely fell short.
+_afk_route_conflict_resolution() {
+  local wt="$1" issue="$2" tip
+  tip="$(git -C "$wt" rev-parse HEAD 2>/dev/null || true)"
+  # Already dispatched for THIS spoke tip? Then the spoke has not progressed since — a re-land
+  # here was triggered by a sibling advancing main, not by the spoke. Warn-park LAST, never
+  # re-inject into a spoke already told to resolve; only a moved spoke tip earns a fresh dispatch.
+  if _afk_already_conflict_resolved "$issue" && [ "$(_afk_read_conflict_resolved_tip "$issue")" = "$tip" ]; then
+    _warn_parked_last "$wt" "$issue" "land conflicts deterministically; resolution already dispatched — waiting for the spoke to merge the base branch + resolve + re-push" land
+    return 0
+  fi
+  if _spoke_pane_alive "$wt"; then
+    if _afk_run_with_heartbeat_fg _afk_conflict_resolve_inject "$wt" "$issue"; then
+      _afk_mark_conflict_resolved "$issue" "$tip"
+    else
+      _warn_parked_last "$wt" "$issue" "land conflicts; live-pane resolve-inject did not register — retrying at low frequency" land
+    fi
+  elif _afk_conflict_resolve_relaunch "$wt" "$issue"; then
+    _afk_mark_conflict_resolved "$issue" "$tip"
+  else
+    _warn_parked_last "$wt" "$issue" "land conflicts and the resolution relaunch could not start — retrying at low frequency" land
+  fi
+}
+
 # auto_land -> land every ready/<issue> spoke. The ready/<issue> marker is the readiness
 # contract (enforced by _ready_at_tip above), so a foreign ready/<issue> left by a parallel
 # session is adopted and landed by default (#95). A failed land (merge conflict) emits
@@ -1799,6 +1950,18 @@ auto_land() {
       log "  skip land #$issue — land-lane retry backoff pending (next-due $(_afk_warned_next "$issue" land), now $(afk_now)); retrying at low frequency"
       continue
     fi
+    # #285: a recorded DETERMINISTIC conflict whose tips are UNCHANGED would re-conflict
+    # identically — do NOT re-run the expensive land; route to the resolution lane instead.
+    if _afk_land_conflict_unchanged "$path" "$issue"; then
+      log "  skip re-land #$issue — land conflicts deterministically and tips are unchanged; routing to the resolution lane (no identical re-land)"
+      _afk_route_conflict_resolution "$path" "$issue"
+      continue
+    fi
+    # The fingerprint moved (spoke resolved + re-pushed, or a sibling advanced main): the stale
+    # fingerprint no longer describes the pending land, so drop it and fall through to a fresh
+    # attempt. The resolution budget is NOT cleared here — it is keyed on the spoke's own tip
+    # (_afk_route_conflict_resolution), so a main-only advance never re-injects (#285 review).
+    _afk_clear_land_conflict_fp "$issue"
     if _blocked_at_tip "$path" "$issue"; then
       # ready+blocked at a finished tip = a TRANSIENT land failure. Retry the land up to
       # AFK_LAND_RETRY_MAX times, then escalate VISIBLY — never skip-land it forever (#202 D).
@@ -1865,10 +2028,19 @@ auto_land() {
       _afk_clear_warned "$issue"         # #241: shipped → drop the warned-retry backoff
       _afk_incr_landed
       _afk_detect_selfupdate "$land_before" "$(_afk_local_default_sha)" "$issue"  # #250: shipped ⇒ still deploy
+    elif [ "$land_rc" -eq "$WT_LAND_CONFLICT_EXIT" ]; then
+      # #285: a DETERMINISTIC merge conflict — record the tip fingerprint and route to the
+      # resolution lane (relaunch/inject the spoke to merge the base branch + resolve + re-push).
+      # NOT a generic warn-park: re-running the identical land is futile until a tip moves.
+      log "  land #$issue conflicts with the base branch (exit $land_rc) — routing to the resolution lane (see $land_log)"
+      _afk_write_land_conflict_fp "$issue" "$(_afk_land_conflict_fingerprint "$path")"
+      _afk_route_conflict_resolution "$path" "$issue"
     else
-      # #241 §5: an auto-land failure (merge conflict / push rejection) warns + retries on the
-      # backoff instead of parking blocked/<issue>. The land is re-attempted on later ticks.
-      _warn_parked_last "$path" "$issue" "auto-land failed (merge conflict or push rejection, exit $land_rc) — retrying at low frequency (see $land_log)" land
+      # #241 §5: a TRANSIENT / non-conflict auto-land failure (push rejection, dirty-tree guard,
+      # etc. — any non-conflict wt_die exit) warns + retries on the backoff instead of parking
+      # blocked/<issue>. The land is re-attempted on later ticks. (Exit 4 = a deterministic
+      # conflict is handled above; this branch is every OTHER non-zero exit.)
+      _warn_parked_last "$path" "$issue" "auto-land failed (non-conflict, exit $land_rc) — retrying at low frequency (see $land_log)" land
     fi
   done < <(inflight_worktrees)
 }
@@ -3451,6 +3623,8 @@ main() {
     _clear_blocked_records   # fresh window ⇒ --status shows only THIS run's durable blocks
     _afk_clear_dispatch_fail_counts # fresh window ⇒ every issue's dispatch ceiling resets (#170)
     _afk_clear_land_retry_counts # fresh window ⇒ every issue's land-retry budget resets (#202 D)
+    _afk_clear_land_conflict_fps # fresh window ⇒ drop stale conflicted-land tip fingerprints (#285)
+    _clear_conflict_resolve_markers # fresh window ⇒ every conflict gets its one resolution dispatch (#285)
     _afk_clear_last_action   # fresh window ⇒ no stale last-action label from a prior drain (#202 B)
     _afk_clear_status_labels_seed # fresh window ⇒ re-seed the afk:* label set once (#223)
     _afk_clear_selfupdate_pending # fresh window ⇒ drop any stale self-update flag (#250)

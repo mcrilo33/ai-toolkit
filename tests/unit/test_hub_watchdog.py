@@ -515,6 +515,142 @@ def test_mergeable_skipped_quiet_when_issue_closed(tmp_path: Path) -> None:
     assert _call(f"{prelude}; _wd_detect_mergeable_skipped '{wt}' 5 {NOW}", env=env).returncode == 1
 
 
+# Condition 4 (#285) — probe mergeability, defer while the LAND lane is mid-backoff, and fire a
+# DISTINCT `conflicted-land` reason (naming the conflicting files) instead of the false "mergeable
+# branch un-landed" when the branch actually conflicts with the base.
+def _git(wt: Path, *args: str) -> str:
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    return subprocess.run(
+        ["git", "-C", str(wt), *args], check=True, env=env, capture_output=True, text=True
+    ).stdout
+
+
+def _base_branch(wt: Path) -> str:
+    return _git(wt, "symbolic-ref", "--short", "HEAD").strip()
+
+
+def _conflicting_repo(tmp_path: Path) -> tuple[Path, str]:
+    """A repo whose checked-out feature branch CONFLICTS with the base branch on README.md."""
+    wt = _git_repo(tmp_path)
+    base = _base_branch(wt)
+    (wt / "README.md").write_text("base\n")
+    _git(wt, "add", "README.md")
+    _git(wt, "commit", "-qm", "chore: base readme")
+    _git(wt, "checkout", "-qb", "feature/5-x")
+    (wt / "README.md").write_text("spoke side\n")
+    _git(wt, "commit", "-qam", "feat: spoke readme")
+    _git(wt, "checkout", "-q", base)
+    (wt / "README.md").write_text("hub side\n")
+    _git(wt, "commit", "-qam", "chore: hub readme")
+    _git(wt, "checkout", "-q", "feature/5-x")
+    return wt, base
+
+
+def _mergeable_repo(tmp_path: Path) -> tuple[Path, str]:
+    """A repo whose feature branch is cleanly mergeable into the base (disjoint files)."""
+    wt = _git_repo(tmp_path)
+    base = _base_branch(wt)
+    (wt / "README.md").write_text("base\n")
+    _git(wt, "add", "README.md")
+    _git(wt, "commit", "-qm", "chore: base readme")
+    _git(wt, "checkout", "-qb", "feature/5-x")
+    (wt / "spoke.txt").write_text("spoke only\n")
+    _git(wt, "add", "spoke.txt")
+    _git(wt, "commit", "-qm", "feat: spoke file")
+    return wt, base
+
+
+def test_land_conflicts_names_the_conflicting_file(tmp_path: Path) -> None:
+    wt, base = _conflicting_repo(tmp_path)
+    out = _call(f"_wd_land_conflicts '{wt}'", env={"AI_TOOLKIT_BASE_BRANCH": base}).stdout
+    assert "README.md" in out
+
+
+def test_land_conflicts_empty_when_mergeable(tmp_path: Path) -> None:
+    wt, base = _mergeable_repo(tmp_path)
+    out = _call(f"_wd_land_conflicts '{wt}'", env={"AI_TOOLKIT_BASE_BRANCH": base}).stdout
+    assert out.strip() == ""
+
+
+def _run_conditions_ledger(
+    wt: Path, base: str, tmp_path: Path, *, servicing_next: int | None = None
+) -> str:
+    """Drive _wd_run_conditions for one done+stale+open spoke; return the intervention ledger text.
+
+    The ledger + state dir + fire-dedup marker are FIXED under tmp_path, so repeated calls
+    accumulate in the same ledger — the dedup / servicing-toggle tests rely on that. When
+    ``servicing_next`` is given, the drain's LAND-lane backoff is armed to that epoch (a future
+    epoch models mid-service); otherwise any prior servicing record is cleared.
+    """
+    ledger = tmp_path / "ledger.jsonl"
+    statedir = tmp_path / "statedir"
+    statedir.mkdir(exist_ok=True)
+    land_lane = statedir / "warned-state-5-land"
+    if servicing_next is not None:
+        land_lane.write_text(f"2\t{servicing_next}\n")
+    elif land_lane.exists():
+        land_lane.unlink()
+    old = str(int(NOW) - 1000)
+    prelude = (
+        f'inflight_worktrees() {{ printf "%s\\t5\\n" "{wt}"; }}; '
+        f"slot_state() {{ echo done; }}; read_done_epoch() {{ echo {old}; }}"
+    )
+    env = {
+        "AFK_NOW": NOW,
+        "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo open",
+        "HUB_WATCHDOG_LEDGER": str(ledger),
+        "HUB_WATCHDOG_LANDMARK_CMD": "true",  # stub the landmark so no real tag is written
+        "HUB_WATCHDOG_LANDMARK_REPO": str(tmp_path / "nolandmarks"),
+        "AI_TOOLKIT_BASE_BRANCH": base,
+        "AFK_STATE_DIR": str(statedir),
+    }
+    _call(f"{prelude}; _wd_run_conditions {NOW} off", env=env)
+    return ledger.read_text() if ledger.exists() else ""
+
+
+def test_run_conditions_fires_conflicted_land_naming_files_on_conflict(tmp_path: Path) -> None:
+    wt, base = _conflicting_repo(tmp_path)
+    ledger = _run_conditions_ledger(wt, base, tmp_path)
+    assert '"condition":"conflicted-land"' in ledger
+    assert "README.md" in ledger
+    assert '"condition":"auto-land-skipped"' not in ledger
+
+
+def test_run_conditions_fires_auto_land_skipped_when_truly_mergeable(tmp_path: Path) -> None:
+    wt, base = _mergeable_repo(tmp_path)
+    ledger = _run_conditions_ledger(wt, base, tmp_path)
+    assert '"condition":"auto-land-skipped"' in ledger
+    assert '"condition":"conflicted-land"' not in ledger
+
+
+def test_run_conditions_defers_while_land_lane_mid_backoff(tmp_path: Path) -> None:
+    # AC5: while the drain's LAND lane has a FRESH armed retry (future-dated warned-state-5-land),
+    # the watchdog must NOT fire condition 4 — no false "conflicted-land"/"skipped" escalation while
+    # the drain is still servicing the land. Mirrors the answer-lane servicing defer.
+    wt, base = _conflicting_repo(tmp_path)
+    ledger = _run_conditions_ledger(wt, base, tmp_path, servicing_next=int(NOW) + 500)
+    assert "conflicted-land" not in ledger and "auto-land-skipped" not in ledger
+
+
+def test_conflicted_land_dedups_across_servicing_toggle(tmp_path: Path) -> None:
+    # #285 review / #263: a single persistent conflict must ledger EXACTLY ONCE across an
+    # arm->service->elapse toggle. The servicing defer must not clear the fire-dedup marker, or the
+    # post-service tick would re-fire and double-count — corrupting the autonomy score.
+    wt, base = _conflicting_repo(tmp_path)
+    _run_conditions_ledger(wt, base, tmp_path)  # tick 1: not servicing → fire once
+    _run_conditions_ledger(
+        wt, base, tmp_path, servicing_next=int(NOW) + 500
+    )  # tick 2: servicing → defer
+    ledger = _run_conditions_ledger(wt, base, tmp_path)  # tick 3: elapsed → still deduped
+    assert ledger.count('"condition":"conflicted-land"') == 1
+
+
 # Condition 5 — supervisor dead
 def test_supervisor_dead_fires_when_drain_state_stale(tmp_path: Path) -> None:
     prelude = "_wd_drain_state() { echo stale; }"

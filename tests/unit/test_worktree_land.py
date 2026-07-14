@@ -485,6 +485,30 @@ def test_merge_conflict_aborts_cleanly(hub: Path, tmp_path: Path) -> None:
     assert wt.exists()
 
 
+def test_merge_conflict_exits_distinct_code_and_names_files(hub: Path, tmp_path: Path) -> None:
+    # #285: a deterministic merge conflict is NOT the same failure as a push rejection —
+    # worktree-land signals it with a dedicated exit code (4) and a machine-readable
+    # CONFLICT marker naming the conflicting file(s), so auto_land can branch on the
+    # failure kind and route to a resolution lane instead of blind-retrying the identical
+    # land. 1 (generic die) and 3 (cleanup-incomplete) are already taken.
+    wt = _make_spoke(hub, tmp_path, "feature/1-conflict", push=False)
+    (wt / "README.md").write_text("spoke version\n")
+    _git(wt, "add", "README.md")
+    _git(wt, "commit", "-qm", "feat: spoke readme", "-m", "Refs #1")
+    _git(wt, "push", "-q", "-u", "origin", "feature/1-conflict")
+    _git(wt, "tag", "ready/1")
+    _git(wt, "push", "-q", "origin", "ready/1")
+    (hub / "README.md").write_text("hub version\n")
+    _git(hub, "add", "README.md")
+    _git(hub, "commit", "-qm", "chore: hub readme", "-m", "Refs #0")
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode == 4, proc.stderr
+    assert "CONFLICT" in proc.stderr
+    assert "README.md" in proc.stderr
+
+
 def test_refuses_dirty_spoke_worktree(hub: Path, tmp_path: Path) -> None:
     wt = _make_spoke(hub, tmp_path, "feature/1-dirty", push=True)
     (wt / "wip.txt").write_text("uncommitted\n")

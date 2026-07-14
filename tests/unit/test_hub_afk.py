@@ -2783,6 +2783,220 @@ def test_auto_land_lands_foreign_ready_spoke_by_default(spoke_repo: Path, tmp_pa
     )
 
 
+# ── auto_land conflicted-land endgame (issue #285) ────────────────────────────
+# A deterministic merge conflict (worktree-land exit 4) is NOT a transient push
+# rejection (exit 1): re-running the identical land is futile (a conflict is a pure
+# function of the two tips). auto_land records a land-conflict-<issue> fingerprint
+# "<branch_tip> <main_tip>", short-circuits an identical re-land while the tips are
+# unchanged, and routes to a resolution lane (relaunch a dead spoke reusing its
+# spoke_run_id / inject a live one with a merge-origin/main->resolve->re-push prompt).
+# The resolution budget is DISTINCT from the crash-resume budget so the two never
+# consume or starve each other. A push rejection keeps the existing generic warn-park.
+
+
+def _land_stub(tmp_path: Path, exit_code: int) -> tuple[Path, Path]:
+    """A worktree-land stub that logs the issue it was asked to land, then exits `exit_code`."""
+    land_log = tmp_path / "land-calls.log"
+    stub = tmp_path / "wtland.sh"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$1" >> "{land_log}"\nexit {exit_code}\n')
+    stub.chmod(0o755)
+    return stub, land_log
+
+
+_WT_LAND_CONFLICT_EXIT = 4
+
+
+def test_auto_land_conflict_routes_to_resolution(spoke_repo: Path, tmp_path: Path) -> None:
+    # A conflict (exit 4) records the fingerprint AND dispatches the resolution lane —
+    # it does NOT treat the failure as a generic push-rejection warn-park.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
+    wt_land, _ = _land_stub(tmp_path, _WT_LAND_CONFLICT_EXIT)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    dispatch_log = tmp_path / "dispatch.log"
+    # Seam the dead-pane relaunch so no real tmux is needed; it stands in for the revive.
+    expr = (
+        f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; '
+        f'_afk_conflict_resolve_relaunch() {{ printf "relaunch %s\\n" "$2" >> "{dispatch_log}"; return 0; }}; '
+        f"auto_land"
+    )
+
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
+        },
+    )
+
+    assert (statedir / "land-conflict-5").exists(), "a conflict must record the tip fingerprint"
+    assert dispatch_log.exists() and "relaunch 5" in dispatch_log.read_text(), (
+        "a conflict must route to the resolution lane (dead-pane relaunch)"
+    )
+
+
+def test_auto_land_conflict_does_not_rerun_identical_land(spoke_repo: Path, tmp_path: Path) -> None:
+    # AC: on a deterministic conflict with both tips unchanged, auto_land must NOT re-run the
+    # identical (expensive) land. Seam the resolution to a no-op so the LAND-lane backoff never
+    # arms — isolating the fingerprint short-circuit from the warn-park pacing.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
+    wt_land, land_log = _land_stub(tmp_path, _WT_LAND_CONFLICT_EXIT)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    expr = (
+        f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; '
+        f"_afk_route_conflict_resolution() {{ return 0; }}; "
+        f"auto_land"
+    )
+    base_env = {
+        "WT_LAND": str(wt_land),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    # AFK_NOW advances well past any land-lane backoff on the second tick, so a land skipped
+    # on tick 2 can ONLY be the fingerprint short-circuit — never the warn-park backoff (which
+    # the pre-fix generic path would arm and which would otherwise mask the missing fix).
+    _call(expr, env={**base_env, "AFK_NOW": "1000"})  # tick 1: conflicts, records the fingerprint
+    _call(expr, env={**base_env, "AFK_NOW": "9999999999"})  # tick 2: tips unchanged → short-circuit
+
+    assert land_log.read_text().split() == ["5"], (
+        "the identical land must run ONCE — the unchanged fingerprint suppresses the re-land"
+    )
+
+
+def test_auto_land_relands_after_tips_move(spoke_repo: Path, tmp_path: Path) -> None:
+    # When the spoke resolves + re-pushes (branch tip moves), the stored fingerprint no longer
+    # matches, so auto_land clears it and attempts a fresh land (here the stub lands cleanly).
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
+    wt_land, land_log = _land_stub(tmp_path, 0)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    # A stale fingerprint from a PRIOR conflict whose tips no longer match the current HEAD.
+    (statedir / "land-conflict-5").write_text("deadbeef stalemainshaxxxxxxxxxxxxxxxxxxxx\n")
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
+        },
+    )
+
+    assert land_log.read_text().split() == ["5"], (
+        "a moved tip (fingerprint mismatch) must allow a fresh land attempt"
+    )
+    assert not (statedir / "land-conflict-5").exists(), "a successful land clears the fingerprint"
+
+
+def test_auto_land_push_rejection_takes_generic_warn_park(spoke_repo: Path, tmp_path: Path) -> None:
+    # A transient push rejection (exit 1, NOT 4) is not a deterministic conflict: it keeps the
+    # existing generic land warn-park and writes NO conflict fingerprint / dispatches NO resolution.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
+    wt_land, _ = _land_stub(tmp_path, 1)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    dispatch_log = tmp_path / "dispatch.log"
+    expr = (
+        f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; '
+        f'_afk_route_conflict_resolution() {{ printf "routed\\n" >> "{dispatch_log}"; }}; '
+        f"auto_land"
+    )
+
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
+        },
+    )
+
+    assert not dispatch_log.exists(), "a push rejection must NOT route to the resolution lane"
+    assert not (statedir / "land-conflict-5").exists(), (
+        "a push rejection must NOT write a conflict fingerprint"
+    )
+    assert (statedir / "warned-state-5-land").exists(), (
+        "a push rejection keeps the existing generic land warn-park"
+    )
+
+
+def test_auto_land_conflict_budget_distinct_from_crash_resume(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The conflict-resolution budget must be its own per-window marker (conflict-resolved-<issue>),
+    # NOT the crash-resume stamp (resumed-<issue>) — so a conflict revive neither consumes nor is
+    # starved by the once-per-window crash-resume budget.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
+    wt_land, _ = _land_stub(tmp_path, _WT_LAND_CONFLICT_EXIT)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    expr = (
+        f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; '
+        f"_afk_conflict_resolve_relaunch() {{ return 0; }}; "
+        f"auto_land"
+    )
+
+    _call(
+        expr,
+        env={
+            "WT_LAND": str(wt_land),
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
+        },
+    )
+
+    assert (statedir / "conflict-resolved-5").exists(), (
+        "a dispatched resolution marks its own distinct per-window budget"
+    )
+    assert not (statedir / "resumed-5").exists(), (
+        "the conflict-resolution budget must not touch the crash-resume stamp"
+    )
+
+
+def test_conflict_resolution_no_redispatch_while_spoke_tip_unchanged(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #285 review: the budget is keyed on the SPOKE branch tip, so a re-land triggered by a
+    # sibling advancing main (fingerprint moves, spoke tip does NOT) must NOT re-inject the
+    # resolve prompt into a spoke already resolving. Two route calls at the same tip dispatch once.
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    dispatch_log = tmp_path / "dispatch.log"
+    expr = (
+        f'_afk_conflict_resolve_relaunch() {{ printf "relaunch %s\\n" "$2" >> "{dispatch_log}"; return 0; }}; '
+        f"_afk_route_conflict_resolution '{spoke_repo}' 5; "
+        f"_afk_route_conflict_resolution '{spoke_repo}' 5"
+    )
+
+    _call(
+        expr,
+        env={
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_HEARTBEAT": str(tmp_path / "heartbeat"),
+            "AFK_JOURNAL_GH_COMMENT": "0",
+        },
+    )
+
+    assert dispatch_log.exists() and dispatch_log.read_text().count("relaunch 5") == 1, (
+        "resolution must dispatch ONCE per spoke tip — a same-tip re-route (sibling main advance) "
+        "must not re-inject into an already-resolving spoke"
+    )
+
+
 # ── landed tally + drain-complete emit (issue #150) ───────────────────────────
 # A completed /afk drain must fire ONE "drain complete — <k> landed" ping, but the
 # count is not externally derivable: log() writes to stderr (redirected to

@@ -327,11 +327,29 @@ if [ -z "$LOCAL" ] && [ -z "$FORCE_LAND" ] && [ -n "$ISSUE" ]; then
 fi
 
 # --- merge ----------------------------------------------------------------------
+# A DETERMINISTIC merge conflict is a distinct failure from a transient push rejection
+# (issue #285): a conflict is a pure function of the two tips, so an unattended auto_land
+# must route it to a resolution lane (revive the spoke to merge origin/<default> + resolve
+# + re-push) rather than blind-retry the identical, expensive land. Signal it with a
+# dedicated exit code (WT_LAND_CONFLICT_EXIT, default 4 — 1 is the generic die and 3 is
+# cleanup-incomplete) plus a machine-readable CONFLICT marker naming the conflicting
+# file(s), captured BEFORE `git merge --abort` wipes the unmerged index entries.
+# The exit code IS the machine contract, so a non-numeric override falls back to 4 rather
+# than reaching `exit` with a bareword.
+: "${WT_LAND_CONFLICT_EXIT:=4}"
+case "$WT_LAND_CONFLICT_EXIT" in '' | *[!0-9]*) WT_LAND_CONFLICT_EXIT=4 ;; esac
 PRE_SHA="$(git rev-parse HEAD)"
 echo "→ merging $WT_BRANCH into $DEFAULT"
 if ! git merge --no-edit "$WT_BRANCH"; then
+  # `|| true`: guard the capture under set -e so a nonzero pipeline can never abort the
+  # script BEFORE the abort + exit below (which guarantee a clean hub + the conflict code).
+  CONFLICT_FILES="$(git diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ' || true)"
+  CONFLICT_FILES="${CONFLICT_FILES% }"
   git merge --abort 2>/dev/null || true
-  wt_die "merge of $WT_BRANCH conflicts with $DEFAULT — rebase the branch on $DEFAULT (on the spoke, then push, when it has one) and re-run"
+  printf '%s: CONFLICT %s\n' "$WT_PROG" "$CONFLICT_FILES" >&2
+  printf '%s: merge of %s conflicts with %s on: %s — rebase the branch on %s (on the spoke, then push, when it has one) and re-run\n' \
+    "$WT_PROG" "$WT_BRANCH" "$DEFAULT" "${CONFLICT_FILES:-(unknown)}" "$DEFAULT" >&2
+  exit "$WT_LAND_CONFLICT_EXIT"
 fi
 MERGED_SHA="$(git rev-parse HEAD)"
 
