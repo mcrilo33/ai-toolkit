@@ -467,18 +467,23 @@ _broker_present_qcm() {
 # saved round trip. The downstream RED/GREEN/REVIEW + acceptance gates remain the backstop that
 # a plan-gate approval never was the only guard against an incomplete implementation.
 
-# _broker_try_fastpath_gate <wt> <issue> <plan> <mode> -> rc 0 when the gate was WAIVED
-# (auto-approved + injected + recorded — the caller returns), rc 1 when the fast path does not
-# apply (attended mode, disabled, empty plan, not a restatement, no pane, or the inject failed —
-# the caller falls through to run_answerer). UNATTENDED-only: an attended reviewer chose to
-# watch the drain, so they get the reasoner's plan assessment (or the QCM), never a silent waive.
-# Synchronous (one gh call + a local python coverage check), so the minutes-long staleness the
-# reasoner path guards against does not apply — no _still_parked_same recompute needed.
+# _broker_try_fastpath_gate <wt> <issue> <mode> -> rc 0 when the gate was WAIVED (auto-approved +
+# injected + recorded — the caller returns), rc 1 when the fast path does not apply (attended mode,
+# disabled, no POSTED plan artifact, not a restatement, no pane, or the inject failed — the caller
+# falls through to run_answerer). UNATTENDED-only: an attended reviewer chose to watch the drain, so
+# they get the reasoner's plan assessment (or the QCM), never a silent waive.
+# The plan is read HERE from _read_gate_artifact (the SCRIPTED handoff a spoke wrote with
+# spoke-ready.sh --gate), NEVER the caller's transcript-extraction fallback: a bare --gate park that
+# wrote no artifact is NOT waivable — its transcript narration is not a plan the spoke authored, and
+# (issue-derived) it scores high coverage, so trusting it could auto-approve a plan never written
+# (#277 review). Synchronous (one gh call + a local python coverage check), so the minutes-long
+# staleness the reasoner path guards against does not apply — no _still_parked_same recompute needed.
 _broker_try_fastpath_gate() {
-  local wt="$1" issue="$2" plan="$3" mode="$4" body cov target
+  local wt="$1" issue="$2" mode="$3" plan body cov target
   [ "$mode" = unattended ] || return 1
   [ "${AFK_FASTPATH:-1}" != 0 ] || return 1
-  [ -n "$plan" ] || return 1
+  plan="$(_read_gate_artifact "$wt" "$issue")"
+  [ -n "$plan" ] || return 1   # no real posted artifact -> never fast-path the transcript fallback
   body="$(_broker_issue_body "$issue")"
   cov="$(_broker_plan_is_restatement "$plan" "$body")" || return 1   # rc 1 -> not a restatement
   target="$(_spoke_pane_target "$wt")"
@@ -577,12 +582,13 @@ broker_service_gate() {
     # artifact (issue #175: a script reads what a script wrote) over transcript extraction;
     # orig_question (the transcript walk) stays as the fallback for an unextractable gate
     # park (rotated transcript, no gate Bash record) or a bare --gate that wrote no artifact.
+    # #277 fast-path: a POSTED plan artifact that merely RESTATES the issue body is auto-approved
+    # here WITHOUT the expensive run_answerer round trip (the reason step below). The helper reads
+    # the artifact itself and fires ONLY on a real posted plan — never the transcript fallback — so
+    # a bare --gate park below still reasons. Anything not a confident restatement falls through.
+    if _broker_try_fastpath_gate "$wt" "$issue" "$mode"; then return 0; fi
     local plan; plan="$(_read_gate_artifact "$wt" "$issue")"
     [ -n "$plan" ] || plan="$orig_question"
-    # #277 fast-path: a posted plan that merely RESTATES the issue body is auto-approved here
-    # WITHOUT the expensive run_answerer round trip (the reason step below). Only a confident
-    # restatement short-circuits; anything else falls through to the full reasoner unchanged.
-    if _broker_try_fastpath_gate "$wt" "$issue" "$plan" "$mode"; then return 0; fi
     question="The spoke is parked at its PLAN gate; below is the plan it posted. Approve it or state precise amendments to it. Do NOT restate or re-issue the task itself.
 
 ${plan:-(the plan prose could not be extracted — approve or amend from the issue contract above)}"
