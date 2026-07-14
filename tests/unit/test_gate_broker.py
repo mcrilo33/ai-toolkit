@@ -552,6 +552,122 @@ def test_judge_unparseable_verdict_is_not_cached(tmp_path: Path) -> None:
     assert second.stdout.strip() == "SAFE", second.stdout
 
 
+# ── issue #268 AC3: the fail-closed reason names a timeout distinctly ──────────
+# A SIGALRM/coreutils timeout (rc 142/124 -- the structural failure #268 documents)
+# must read differently in the decision journal from a crashed/errored judge, so a
+# morning review can tell "the judge budget was too short" from "the judge is broken".
+
+
+def test_judge_timeout_reason_names_timeout(tmp_path: Path) -> None:
+    # A judge that hangs past the bound is killed by the timeout wrapper (perl alarm -> 142,
+    # coreutils timeout -> 124). The reason (field 2) must say it TIMED OUT, not "unavailable".
+    env = _judge_env(tmp_path, AFK_JUDGE_CMD="sleep 5", AFK_JUDGE_TIMEOUT="1")
+
+    result = _call('judge_permission "slow-cmd" | cut -f2', env=env)
+
+    assert "timed out" in result.stdout, result.stdout
+    assert "unavailable" not in result.stdout, result.stdout
+
+
+def test_judge_generic_failure_reason_says_unavailable(tmp_path: Path) -> None:
+    # A non-timeout nonzero rc (a crashed/errored CLI) keeps the generic "unavailable" wording,
+    # so the two failure classes stay distinguishable in the journal (#268 AC3).
+    env = _judge_env(tmp_path, AFK_JUDGE_CMD="exit 3")
+
+    result = _call('judge_permission "boom" | cut -f2', env=env)
+
+    assert "unavailable" in result.stdout, result.stdout
+    assert "rc=3" in result.stdout, result.stdout
+    assert "timed out" not in result.stdout, result.stdout
+
+
+# ── issue #268 AC4: N consecutive judge-unavailable outcomes raise a halt ──────
+# A dead judge otherwise denies one command at a time, silently, for the whole window.
+# After AFK_JUDGE_HALT_STREAK consecutive unavailable outcomes a drain-level flag is
+# raised (a file the supervisor reads to pause dispatch, mirroring the answerer
+# auth-failure path); a reachable judge clears it so the drain resumes.
+
+
+def _judge_journal(tmp_path: Path) -> str:
+    j = tmp_path / "afk-state" / "decision-journal.jsonl"
+    return j.read_text() if j.exists() else ""
+
+
+def test_judge_consecutive_unavailable_raises_halt(tmp_path: Path) -> None:
+    # One continuous streak (single shell, single state dir) so the boundary is exact: the
+    # halt is still clear after the 2nd failure and raised only when the 3rd crosses N=3.
+    env = _judge_env(tmp_path, AFK_JUDGE_CMD="exit 3", AFK_JUDGE_HALT_STREAK="3")
+
+    result = _call(
+        'judge_permission "a" >/dev/null; judge_permission "b" >/dev/null; '
+        "broker_judge_halt_pending && echo after2-RAISED || echo after2-clear; "
+        'judge_permission "c" >/dev/null; '
+        "broker_judge_halt_pending && echo after3-RAISED || echo after3-clear",
+        env=env,
+    )
+
+    lines = result.stdout.split()
+    assert lines == ["after2-clear", "after3-RAISED"], result.stdout + result.stderr
+    assert '"park":"judge"' in _judge_journal(tmp_path), _judge_journal(tmp_path)
+
+
+def test_judge_parsed_verdict_resets_streak(tmp_path: Path) -> None:
+    # Two unavailable outcomes then a reachable (parsed) judge: the streak resets, so a later
+    # failure starts counting from zero and the halt is NOT raised at the old threshold (#268).
+    env_dead = _judge_env(tmp_path, AFK_JUDGE_CMD="exit 3", AFK_JUDGE_HALT_STREAK="3")
+    env_ok = _judge_env(
+        tmp_path, AFK_JUDGE_CMD="printf 'VERDICT: safe\\n'", AFK_JUDGE_HALT_STREAK="3"
+    )
+
+    _call('judge_permission "a" >/dev/null; judge_permission "b" >/dev/null', env=env_dead)
+    _call('judge_permission "recover" >/dev/null', env=env_ok)
+    after = _call(
+        'judge_permission "c" >/dev/null; broker_judge_halt_pending && echo RAISED || echo clear',
+        env=env_dead,
+    )
+
+    assert after.stdout.strip() == "clear", after.stdout + after.stderr
+
+
+def test_judge_recovery_auto_clears_raised_halt(tmp_path: Path) -> None:
+    # The drain-resume safety property: once the halt is RAISED, a single reachable (rc 0) judge
+    # must auto-clear it via _judge_note_available -- else a recovered judge leaves dispatch
+    # paused forever. Raise with a dead judge, then one healthy call clears it (same state dir).
+    env_dead = _judge_env(tmp_path, AFK_JUDGE_CMD="exit 3", AFK_JUDGE_HALT_STREAK="2")
+    env_ok = _judge_env(
+        tmp_path, AFK_JUDGE_CMD="printf 'VERDICT: safe\\n'", AFK_JUDGE_HALT_STREAK="2"
+    )
+
+    raise_ = _call(
+        'judge_permission "a" >/dev/null; judge_permission "b" >/dev/null; '
+        "broker_judge_halt_pending && echo RAISED || echo clear",
+        env=env_dead,
+    )
+    recovered = _call(
+        'judge_permission "healthy" >/dev/null; '
+        "broker_judge_halt_pending && echo still-RAISED || echo cleared",
+        env=env_ok,
+    )
+
+    assert raise_.stdout.strip() == "RAISED", raise_.stdout + raise_.stderr
+    assert recovered.stdout.strip() == "cleared", recovered.stdout + recovered.stderr
+
+
+def test_broker_reset_judge_halt_clears_flag(tmp_path: Path) -> None:
+    env = _judge_env(tmp_path, AFK_JUDGE_CMD="exit 3", AFK_JUDGE_HALT_STREAK="2")
+
+    result = _call(
+        'judge_permission "a" >/dev/null; judge_permission "b" >/dev/null; '
+        "broker_judge_halt_pending && echo before-RAISED; "
+        "broker_reset_judge_halt; "
+        "broker_judge_halt_pending && echo still-RAISED || echo cleared",
+        env=env,
+    )
+
+    assert "before-RAISED" in result.stdout, result.stdout + result.stderr
+    assert result.stdout.strip().splitlines()[-1] == "cleared", result.stdout + result.stderr
+
+
 # ── the shared orchestrator: broker_service_gate ──────────────────────────────
 
 

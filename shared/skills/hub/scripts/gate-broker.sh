@@ -2456,6 +2456,73 @@ _judge_timeout() {
   printf '%s\n' "$s"
 }
 
+# --- drain-level judge-unavailable halt (#268 AC4) ----------------------------
+# A dead judge (a bad model, a revoked token, a structural budget bug) otherwise DENIES one
+# tier-3 command at a time, silently, for the whole window. After N CONSECUTIVE unavailable
+# (nonzero-rc) outcomes we raise a drain-level flag -- a FILE in the shared afk state dir, since
+# the judge runs in the SPOKE's PreToolUse hook subprocess (not the supervisor loop, so the
+# process-global _AFK_AUTH_FAILED the answerer uses cannot reach it). A supervisor that consults
+# broker_judge_halt_pending can then pause dispatch + re-probe, mirroring the answerer
+# auth-failure path (#241 §9) -- that consult is the drain's to wire (kept out of this change's
+# scope). A reachable judge (rc 0) clears the streak + the flag so the drain resumes on recovery.
+# The streak counter is a best-effort read-modify-write shared across concurrent spoke hooks: a
+# lost increment only DELAYS the halt (fires a failure or two later), never spuriously raises it
+# -- fine for an advisory heuristic; no lock is warranted until a consumer needs the exact count.
+
+# _judge_streak_file -> the consecutive judge-unavailable counter (reset by any reachable judge).
+_judge_streak_file() { printf '%s\n' "$(_afk_state_dir)/judge-unavailable-streak"; }
+
+# _judge_halt_file -> the raised drain-level halt flag; its content is a human-readable reason.
+_judge_halt_file() { printf '%s\n' "$(_afk_state_dir)/judge-halt"; }
+
+# _judge_halt_streak -> consecutive unavailable outcomes before the halt is raised
+# (AFK_JUDGE_HALT_STREAK, default 3). A non-numeric/non-positive override falls back to the
+# default so the threshold is never silently disabled (mirrors _judge_timeout).
+_judge_halt_streak() {
+  local n="${AFK_JUDGE_HALT_STREAK:-3}"
+  case "$n" in '' | *[!0-9]*) n=3 ;; esac
+  [ "$n" -lt 1 ] && n=3
+  printf '%s\n' "$n"
+}
+
+# broker_judge_halt_pending -> rc 0 when the drain-level judge halt is raised. A supervisor
+# consults this to pause dispatch and re-probe (the judge counterpart of _AFK_AUTH_FAILED, #268).
+broker_judge_halt_pending() { [ -f "$(_judge_halt_file)" ]; }
+
+# broker_reset_judge_halt -> clear the halt flag AND the streak counter (the judge recovered, or
+# a manual reset). Best-effort; never aborts.
+broker_reset_judge_halt() {
+  rm -f "$(_judge_halt_file)" "$(_judge_streak_file)" 2>/dev/null || true
+}
+
+# _judge_note_unavailable -> record one consecutive judge-unavailable outcome; at the threshold
+# crossing raise the halt flag ONCE and journal a distinct drain-level event (so the morning
+# review sees "the judge died, dispatch paused" rather than a scatter of per-command DENYs).
+_judge_note_unavailable() {
+  local sf hf n streak
+  sf="$(_judge_streak_file)"; hf="$(_judge_halt_file)"
+  mkdir -p "$(dirname "$sf")" 2>/dev/null || true
+  streak="$(cat "$sf" 2>/dev/null)"; case "$streak" in '' | *[!0-9]*) streak=0 ;; esac
+  streak=$(( streak + 1 ))
+  printf '%s\n' "$streak" > "$sf" 2>/dev/null || true
+  n="$(_judge_halt_streak)"
+  # Raise only on the threshold crossing (flag not already present) so the distinct journal
+  # event fires once, not on every further failure past the threshold.
+  if [ "$streak" -ge "$n" ] && [ ! -f "$hf" ]; then
+    printf 'judge unavailable %sx in a row -- dispatch paused, re-probing (#268)\n' "$streak" \
+      > "$hf" 2>/dev/null || true
+    _broker_journal_line "" judge "judge unavailable ${streak}x in a row -- pausing dispatch" scope
+  fi
+}
+
+# _judge_note_available -> a reachable judge (rc 0): clear the streak + any raised halt so the
+# drain resumes. Only touches disk when there is state to clear (no write on the healthy path).
+_judge_note_available() {
+  if [ -f "$(_judge_streak_file)" ] || [ -f "$(_judge_halt_file)" ]; then
+    broker_reset_judge_halt
+  fi
+}
+
 # _judge_base_cmd -> the headless judge command (AFK_JUDGE_CMD override for tests). TOOLLESS by
 # construction: `--allowedTools ''` grants NO tools, so the judge can make no tool calls -- it can
 # never fire afk_danger_guard or recurse. Haiku + `-p` for a cheap, non-interactive run.
@@ -2489,7 +2556,9 @@ EOF
 # run the toolless headless judge, bounded and fail-closed. Only a PARSED verdict (VERDICT:
 # safe|dangerous) is cached: an unavailable or unparseable judge fails closed for THIS decision
 # but is never cached, so a transient failure cannot poison the command for the whole window
-# (#268). Always rc 0 (the verdict is on stdout, like classify_permission / classify_danger).
+# (#268). A nonzero rc also feeds the consecutive-unavailable streak (_judge_note_unavailable):
+# at the threshold a drain-level halt is raised; a reachable judge clears it (_judge_note_available).
+# Always rc 0 (the verdict is on stdout, like classify_permission / classify_danger).
 judge_permission() {
   local cmd="$1" key cache f raw rc verdict secs jcmd prompt pf tag cacheable=0
   key="$(_judge_cache_key "$cmd")"
@@ -2507,7 +2576,18 @@ judge_permission() {
   raw="$(_broker_run_bounded "$secs" bash -c "$jcmd" <<<"$prompt" 2>/dev/null)"; rc=$?
   [ -n "$pf" ] && rm -f "$pf" 2>/dev/null
   if [ "$rc" -ne 0 ]; then
-    verdict="$(printf 'DANGEROUS\tjudge unavailable (rc=%s) -- fail-closed' "$rc")"
+    # #268 AC3: distinguish a TIMEOUT (coreutils `timeout` -> 124, perl `alarm`/SIGALRM -> 142,
+    # the path this macOS host hits with no coreutils installed) from any other judge failure,
+    # so the decision journal separates "the budget was too short" from "the judge is broken".
+    # 137/143 (SIGKILL/SIGTERM) are deliberately NOT treated as timeouts -- they overlap with
+    # non-timeout kills and would over-claim.
+    case "$rc" in
+      124 | 142) verdict="$(printf 'DANGEROUS\tjudge timed out (rc=%s) -- fail-closed' "$rc")" ;;
+      *) verdict="$(printf 'DANGEROUS\tjudge unavailable (rc=%s) -- fail-closed' "$rc")" ;;
+    esac
+    # #268 AC4: an unavailable judge is a transient outcome -- count the consecutive streak and,
+    # at the threshold, raise the drain-level halt so dispatch pauses instead of grinding on.
+    _judge_note_unavailable
   else
     tag="$(printf '%s' "$raw" | grep -ioE 'VERDICT:[[:space:]]*(safe|dangerous)' | tail -1 \
       | grep -ioE 'safe|dangerous' | tr '[:upper:]' '[:lower:]')"
@@ -2516,6 +2596,9 @@ judge_permission() {
       dangerous) verdict="$(printf 'DANGEROUS\tjudge verdict: dangerous')"; cacheable=1 ;;
       *) verdict="$(printf 'DANGEROUS\tjudge verdict unparseable -- fail-closed')" ;;
     esac
+    # #268 AC4: rc 0 means the judge is REACHABLE (even an unparseable answer proves the CLI ran)
+    # -- clear the consecutive-unavailable streak + any raised halt so the drain resumes.
+    _judge_note_available
   fi
   if [ -n "$key" ] && [ "$cacheable" -eq 1 ]; then
     mkdir -p "$cache" 2>/dev/null || true
