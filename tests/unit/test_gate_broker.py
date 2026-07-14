@@ -4055,6 +4055,78 @@ def test_danger_guard_allows_marker_emission_without_judge(
     )
 
 
+# ── issue #282: tier-1 lane for the sanctioned nohup detached-push ─────────────
+# The documented long-gate mitigation — `nohup ./scripts/spoke-push.sh --ready <N>
+# >.ai-toolkit/push.log 2>&1 &` — had NO tier-1 lane: classify_permission never stripped the
+# `nohup` wrapper (so the verb read as `nohup` and no lane matched), and _permission_seg_safe
+# blanket-rejected the in-tree log redirect. Both are now Tier-1 APPROVEs — a leading
+# env/command/nohup/setsid wrapper is stripped per segment (mirroring classify_danger), and a
+# redirect whose every target resolves in-tree is validated + stripped at the RAW-command level,
+# BEFORE the `&`-split that would otherwise shatter a `2>&1` into a bogus `1` segment.
+# Out-of-tree / unparseable / substitution redirects still escalate.
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # the contract's verbatim detached push: exec lane behind nohup + in-tree redirect + 2>&1
+        "nohup ./scripts/spoke-push.sh --ready 5 >.ai-toolkit/push.log 2>&1",
+        # the trailing background `&` as an operator actually types it
+        "nohup ./scripts/spoke-push.sh --ready 5 >.ai-toolkit/push.log 2>&1 &",
+        # the marker-lane variant behind nohup, no redirect
+        "nohup bash .ai-toolkit/scripts/spoke-push.sh --ready 5",
+        # marker lane behind nohup WITH the in-tree redirect + fd-dup (the strip lets the marker
+        # lane accept it — otherwise the trailing `>log` reads as a bogus positional arg)
+        "nohup bash scripts/spoke-push.sh --ready 5 >.ai-toolkit/push.log 2>&1",
+        # a plain in-tree redirect with no wrapper still approves (the exec lane, redirect only)
+        "./scripts/dev/afk-gate-smoke.sh >.ai-toolkit/run.log",
+        # setsid wrapper + append redirect
+        "setsid ./scripts/spoke-push.sh --ready 5 >>.ai-toolkit/push.log 2>&1",
+    ],
+)
+def test_classify_permission_approves_nohup_detached_push(
+    cmd: str, spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The sanctioned detach mitigation is a deterministic Tier-1 APPROVE: the wrapper strips to
+    # the recognised exec/marker self-op and every redirect target resolves inside the worktree.
+    tasks = tmp_path / "tasks"
+
+    assert _classify_with_wt(cmd, spoke_repo, tasks) == "APPROVE"
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "nohup ./scripts/spoke-push.sh --ready 5 >/etc/passwd 2>&1",  # out-of-tree redirect
+        "./x > ../sibling/y",  # traversal out of the worktree via redirect
+        "nohup ./x >.ai-toolkit/log $(rm -rf ~)",  # substitution survives the redirect strip
+        "nohup ./scripts/spoke-push.sh --ready 5 >.ai-toolkit/../../escape.log",  # `..` in target
+        "setsid rm -rf /",  # a dangerous op behind a wrapper is NOT laundered into an approve
+    ],
+)
+def test_classify_permission_escalates_nohup_detached_push_escapes(
+    cmd: str, spoke_repo: Path, tmp_path: Path
+) -> None:
+    # Stripping the wrapper and relaxing in-tree redirects must not launder a boundary crossing:
+    # an out-of-tree / traversal redirect target, a command substitution, or a dangerous op
+    # behind the wrapper all still escalate (the lanes stay confined; substitution reject fires).
+    tasks = tmp_path / "tasks"
+
+    assert _classify_with_wt(cmd, spoke_repo, tasks) == "ESCALATE"
+
+
+def test_classify_permission_escalates_redirect_without_worktree(spoke_repo: Path) -> None:
+    # With no worktree context an in-tree claim cannot be verified, so a redirect fails closed →
+    # escalate (the raw-level redirect validator is inert without a worktree, mirroring the lanes).
+    result = _call(
+        'classify_permission "$CMD" | cut -f1',
+        env={"CMD": "nohup ./scripts/spoke-push.sh --ready 5 >.ai-toolkit/push.log 2>&1"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ESCALATE"
+
+
 def test_classify_permission_escalates_brace_expansion_escape(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
@@ -6163,6 +6235,38 @@ def test_danger_guard_allows_238_smoke(afk_bypass_spoke: tuple[Path, dict[str, s
     result = _decide(_hook_payload("Bash", wt, command="chmod +x ./x.sh && ./x.sh"), env)
 
     assert result.stdout.strip() == "", result.stdout
+
+
+def test_danger_guard_allows_nohup_detached_push_without_judge(
+    afk_bypass_spoke: tuple[Path, dict[str, str]],
+) -> None:
+    # The #282 load-bearing property: the sanctioned long-gate mitigation — a nohup-detached
+    # push with an in-tree log redirect — is a Tier-1 benign self-op, so the wall stays SILENT
+    # and the Tier-3 judge is NEVER consulted. The judge stub is wired to DENY: a silent verdict
+    # proves Tier 1 short-circuited before the coin-flip judge that #274 lost.
+    wt, env = afk_bypass_spoke
+    env = {**env, "AFK_JUDGE_CMD": "printf 'VERDICT: dangerous\\n'"}
+    cmd = "nohup ./scripts/spoke-push.sh --ready 261 >.ai-toolkit/push.log 2>&1"
+
+    result = _decide(_hook_payload("Bash", wt, command=cmd), env)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "", (
+        f"the detached push must be a Tier-1 silent allow, never judged: {result.stdout}"
+    )
+
+
+def test_danger_guard_denies_nohup_rm_at_tier2(
+    afk_bypass_spoke: tuple[Path, dict[str, str]],
+) -> None:
+    # The wrapper strip must not weaken the deny wall: `nohup rm -rf /` is still caught at Tier 2
+    # (classify_danger strips the wrapper too and runs FIRST), never reaching the Tier-1 approve
+    # side. The judge stub is SAFE — a deny here proves the static Tier-2 rule fired, not the judge.
+    wt, env = afk_bypass_spoke
+
+    result = _decide(_hook_payload("Bash", wt, command="nohup rm -rf /"), env)
+
+    assert _perm(result.stdout) == "deny", result.stdout
 
 
 def test_danger_guard_judge_dangerous_denies(
