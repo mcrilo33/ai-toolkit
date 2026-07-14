@@ -362,6 +362,29 @@ def test_park_unanswered_quiet_when_not_waiting(tmp_path: Path) -> None:
     assert _detect(prelude, "_wd_detect_park_unanswered /wt 5 " + NOW) == 1
 
 
+def test_park_unanswered_end_to_end_real_stamp_feeds_real_detector(tmp_path: Path) -> None:
+    # End-to-end (no stubbed epoch reader): the REAL slot_state stamps park-onset on a gate park,
+    # and the REAL detector reads it back — a one-sided rename of the park-onset file would make
+    # the read miss and this fire fail. First tick stamps onset at an old AFK_NOW; a later tick
+    # past the ceiling, with no answer ever delivered, fires the never-attempted branch.
+    wt = _git_repo(tmp_path)
+    subprocess.run(["git", "tag", "gate/5"], cwd=wt, check=True, capture_output=True)
+    statedir = tmp_path / "afk-state"
+    old = str(int(NOW) - 700)  # onset 700s before NOW (> 600s ceiling)
+
+    # Tick 1: real slot_state reads the gate park as waiting and stamps park-onset-5.epoch=old.
+    stamp = _call(f"slot_state '{wt}' 5", env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": old})
+    assert stamp.stdout.strip() == "waiting", stamp.stdout + stamp.stderr
+    assert (statedir / "park-onset-5.epoch").read_text().strip() == old
+
+    # Tick 2: the real detector (no read_park_onset_epoch stub) reads that onset and fires.
+    fire = _call(
+        f"_wd_detect_park_unanswered '{wt}' 5 {NOW}",
+        env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": NOW},
+    )
+    assert fire.returncode == 0, fire.stdout + fire.stderr
+
+
 # AC3 (#265): the firing reason reports the MEASURED age + which branch fired — never the
 # constant "> 600s" that made a 1-second-old park's ledger + auto-filed defect claim a 600s
 # breach. The never-attempted branch measures from park onset; the stale-attempt branch from the
@@ -504,9 +527,12 @@ def test_supervisor_dead_fires_when_drain_state_stale(tmp_path: Path) -> None:
 def test_intervene_answer_invokes_the_seam(tmp_path: Path) -> None:
     marker = tmp_path / "answered"
     # An idle drain (no fresh attempt, no live supervisor) is not mid-service → the seam fires.
+    # AFK_STATE_DIR isolates read_answer_attempt off the live host state dir (else a real drain's
+    # answer-attempt-5.epoch could read "fresh" under the past-pinned AFK_NOW and defer the seam).
     env = {
         "HUB_WATCHDOG_ANSWER_CMD": f'printf "%s %s" "$1" "$2" > {marker}',
         "AFK_STATE": str(tmp_path / "absent-afk-state"),
+        "AFK_STATE_DIR": str(tmp_path / "afk-state"),
         "AFK_NOW": NOW,
     }
 

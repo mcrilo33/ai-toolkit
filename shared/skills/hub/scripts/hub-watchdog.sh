@@ -330,12 +330,15 @@ _wd_last_action() {
   [ -f "$f" ] && head -n1 "$f" 2>/dev/null || true
 }
 
-# _wd_supervisor_servicing <issue> -> true when the tier-1 drain is CURRENTLY servicing this
+# _wd_supervisor_servicing <issue> -> true when the tier-1 drain is CURRENTLY working this
 # park, so the watchdog must NOT run a second decide_and_act and race the in-flight answerer
 # (#265 AC4; the #89 stale-answer/strand hazard). Two positive signals: a FRESH answer-delivery
 # stamp (the supervisor delivered within the ceiling), or — for the never-attempted window where
-# no stamp exists yet — a LIVE drain whose last action names this issue (its answerer, a
-# high-effort headless `claude`, is mid-reasoning pre-delivery). Either ⇒ defer.
+# no stamp exists yet — a LIVE drain whose LAST ACTION names this issue (any drain pass touching
+# it: an `answer` mid-reasoning pre-delivery, or a revive/nudge/land in flight). Deferring on any
+# such action is deliberately conservative — never race the drain while it is on this issue. The
+# defer can't wedge: the firing is still ledgered, and the answer lane's re-answer ceiling
+# (-> blocked/<issue>) plus the supervisor-dead detector bound a genuinely stuck drain. Either ⇒ defer.
 _wd_supervisor_servicing() {
   local issue="$1" attempt
   attempt="$(read_answer_attempt "$issue" 2>/dev/null)"
