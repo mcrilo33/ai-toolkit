@@ -86,6 +86,11 @@ write_lifecycle_sources() {
   # filed: the issue's creation instant (ISO). Run gh from the worktree so it resolves THIS spoke's
   # repo (not the land's cwd remote). Best-effort — no gh / not authed / no such issue omits the leg.
   filed="$( (cd "$wt" && gh issue view "$issue" --json createdAt -q .createdAt) 2>/dev/null)" || filed=""
+  # Default the drain-derived locals so the JSON block below never reads an unset var
+  # under `set -u` on bash>=4.4 when no afk state dir exists (issue #284): they are
+  # assigned only inside the state-dir branch, which the land case outside a live drain
+  # (and CI) skips. spokes/interventions are already `:-`-guarded there.
+  dispatched="" answer="" window_start=""
   state_dir="$(_lifecycle_afk_state_dir "$wt")"
   if [ -n "$state_dir" ] && [ -d "$state_dir" ]; then
     dispatched="$(_lifecycle_read_epoch "$state_dir/dispatch-$issue.epoch")"
