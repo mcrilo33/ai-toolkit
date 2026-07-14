@@ -2140,14 +2140,29 @@ _permission_redirect_scan() {
 import os, re, shlex
 
 cmd = os.environ["_PERM_CMD"]
-try:
-    toks = shlex.split(cmd)
-except Exception:
-    print("__UNPARSEABLE__"); raise SystemExit(0)
 
 
 def bail():
     print("__UNPARSEABLE__"); raise SystemExit(0)
+
+
+# shlex.split flattens command STRUCTURE the space-rejoin cannot faithfully rebuild, so bail on the
+# two compound forms that would otherwise launder a second command / an out-of-tree write past the
+# tier-1 vouch (#282 re-review):
+#   * a NEWLINE separates commands but is whitespace shlex silently eats -- `cat x >log\nrm -rf ~`
+#     would rejoin to one segment `cat x rm -rf ~` and skip the operator-split + judge;
+#   * a `cd` changes the base dir for a LATER redirect target, which this raw-command validation
+#     (cwd=$wt, before the caller's cd-tracking) cannot follow -- `cd sub && echo x >link/out` would
+#     validate link/out against $wt while the shell writes it under sub/ (a symlink escape).
+# Both escalate (safe): the sanctioned detach shapes are a single command with no cd.
+if "\n" in cmd:
+    bail()
+try:
+    toks = shlex.split(cmd)
+except Exception:
+    bail()
+if "cd" in toks:
+    bail()
 
 
 # A token that STARTS like a redirect operator: an optional fd number or `&`, then `>`/`>>`/`<`,

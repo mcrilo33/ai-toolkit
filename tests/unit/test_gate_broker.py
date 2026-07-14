@@ -4208,6 +4208,50 @@ def test_classify_permission_approves_noclobber_to_in_tree(
     )
 
 
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # (#282 review round 3, finding 2) a `cd` changes the base dir for a LATER redirect target
+        # that the raw-command validation (cwd=$wt) cannot follow; a symlink under the cd'd dir
+        # escapes the worktree. The scanner bails on a `cd` in a redirect-bearing command.
+        "cd sub && echo pwned > link/out",
+        "cd .ai-toolkit && ./scripts/dev/afk-gate-smoke.sh >out.log",  # in-tree, still conservative
+    ],
+)
+def test_classify_permission_escalates_cd_redirect(
+    cmd: str, spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A cd-relative redirect target is validated at the wrong base (raw command uses cwd=$wt, before
+    # the cd), so a symlink under the cd'd dir would escape; the raw-command strip refuses it.
+    tasks = tmp_path / "tasks"
+
+    assert _classify_with_wt(cmd, spoke_repo, tasks) == "ESCALATE"
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # (#282 review round 3, finding 1) a NEWLINE separates commands but is whitespace shlex
+        # silently eats — the second command would merge into a tier-1 safe verb's args. The scanner
+        # bails on any newline in a redirect-bearing command. (The ESCALATE reason echoes the raw
+        # multi-line command, so assert the verdict token on the FIRST output line, not the whole.)
+        "git add . > log.txt\nnpm install evil",
+        "cat x >log\nrm -rf ~",
+    ],
+)
+def test_classify_permission_escalates_newline_redirect(
+    cmd: str, spoke_repo: Path, tmp_path: Path
+) -> None:
+    result = _call(
+        'classify_permission "$CMD" "$WT"',
+        env={"CMD": cmd, "WT": str(spoke_repo), "AFK_TASKS_ROOT": str(tmp_path / "tasks")},
+    )
+
+    assert result.returncode == 0, result.stderr
+    # First line, first tab-field is the verdict — never APPROVE for a newline-flattened compound.
+    assert result.stdout.splitlines()[0].split("\t")[0] == "ESCALATE"
+
+
 def test_classify_permission_escalates_brace_expansion_escape(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
