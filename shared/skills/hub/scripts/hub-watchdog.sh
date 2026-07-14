@@ -297,12 +297,61 @@ _wd_detect_dead_idle() {
 # Condition 3: a stale blocked/ marker reconcile_markers should have cleared.
 _wd_detect_stale_marker() { _wd_blocked_stale "$1" "$2"; }
 
+# _wd_land_lane_servicing <issue> -> true when the drain's LAND lane has a FRESH armed retry
+# (warned-state-<issue>-land next-due in the FUTURE): the drain is actively re-attempting the land
+# on its backoff, so condition 4 must defer — the analogue of the answer-lane servicing defer
+# (_wd_supervisor_servicing) for the LAND lane (#285 AC5). Reads the same backoff record auto_land
+# arms (_afk_warned_next, in scope via gate-broker); absent/elapsed ⇒ not servicing (fall through).
+_wd_land_lane_servicing() {
+  local issue="$1" now next
+  command -v _afk_warned_next >/dev/null 2>&1 || return 1
+  next="$(_afk_warned_next "$issue" land 2>/dev/null)"
+  case "$next" in '' | *[!0-9]*) return 1 ;; esac
+  now="$(_wd_now)"
+  [ "$next" -gt "$now" ]
+}
+
+# _wd_land_base_ref <wt> -> the ref a land would merge the branch INTO: the local base branch
+# (refs/heads/<base>) when present — the same tip worktree-land merges onto — else origin/<base>.
+# Resolves <base> via the canonical wt_base_branch (in scope via worktree-lib); defaults to main.
+_wd_land_base_ref() {
+  local wt="$1" base=""
+  command -v wt_base_branch >/dev/null 2>&1 && base="$(wt_base_branch "$wt" 2>/dev/null || true)"
+  [ -n "$base" ] || base=main
+  if git -C "$wt" show-ref --verify --quiet "refs/heads/$base" 2>/dev/null; then printf '%s\n' "$base"; return; fi
+  if git -C "$wt" show-ref --verify --quiet "refs/remotes/origin/$base" 2>/dev/null; then printf 'origin/%s\n' "$base"; return; fi
+  printf '%s\n' "$base"
+}
+
+# _wd_land_conflicts <wt> -> the space-separated conflicting file(s) when the checked-out branch
+# does NOT merge cleanly into the base, else empty. Uses `git merge-tree --write-tree --name-only`
+# (git >= 2.38): rc 0 = mergeable (empty), rc 1 = conflict (line 1 is the tree OID; the conflicted
+# paths follow up to the first blank line), any other rc = probe unavailable/errored ⇒ empty so a
+# tooling gap never mislabels a branch as conflicted (it stays on the mergeable path).
+_wd_land_conflicts() {
+  local wt="$1" branch base out rc
+  branch="$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  base="$(_wd_land_base_ref "$wt")"
+  [ -n "$branch" ] && [ -n "$base" ] || return 0
+  out="$(git -C "$wt" merge-tree --write-tree --name-only "$base" "$branch" 2>/dev/null)"; rc=$?
+  case "$rc" in
+    0) return 0 ;;   # mergeable
+    1) ;;            # conflict — extract the file list below
+    *) return 0 ;;   # probe error (old git / bad ref) — never claim a conflict
+  esac
+  printf '%s\n' "$out" | awk 'NR==1{next} /^$/{exit} {printf "%s ", $0}'
+}
+
 # Condition 4: a mergeable (ready-at-tip) branch auto_land terminal-skipped. NOT blocked-at-tip
 # (a deliberate skip is never a false-skip), issue still open, un-landed past the ceiling.
 # Staleness is measured from the DONE epoch — stamped when slot_state first reads the spoke
 # `done` — not the progress epoch, which is stamped only on tip advances and pre-ages during a
 # pre-ready park (#263): a parked-then-ready spoke would otherwise trip an instant false-skip.
 # slot_state itself stamps the done epoch on that first done tick, so the ceiling starts here.
+# The LAND-lane servicing defer (#285 AC5) and the mergeability probe both live in the DISPATCHER,
+# NOT here: a servicing tick must neither fire NOR clear the fire-dedup marker (clearing mid-service
+# would let one persistent conflict re-fire and double-count in the ledger, #263), so it is gated
+# BEFORE this detector — mirroring how the answer lane defers the INTERVENTION, not the detector.
 _wd_detect_mergeable_skipped() {
   local wt="$1" issue="$2" now="$3"
   command -v slot_state >/dev/null 2>&1 || return 1
@@ -405,8 +454,9 @@ _wd_clear_landed_landmarks() {
     git -C "$repo" tag -d "$tag" >/dev/null 2>&1 || true
     git -C "$repo" push origin ":refs/tags/$tag" >/dev/null 2>&1 || true
     # The landed issue is gone from the in-flight loop, so the dispatcher's else-clear never runs
-    # for it — clear its condition-4 firing marker here so the autonomy score re-arms (#263).
+    # for it — clear its condition-4 firing markers here so the autonomy score re-arms (#263/#285).
     _wd_clear_fired auto-land-skipped "$issue"
+    _wd_clear_fired conflicted-land "$issue"
     _wd_log "cleared resolved landmark $tag (issue #$issue closed/landed)"
   done < <(git -C "$repo" tag -l 'needs-human-land/*' 2>/dev/null)
 }
@@ -569,7 +619,7 @@ _wd_fire() {
 # intervention. Supervisor-dead is a single global check; the other four run per in-flight spoke.
 # Best-effort throughout: a missing drain reader (standalone watchdog) simply skips its condition.
 _wd_run_conditions() {
-  local now="${1:-$(_wd_now)}" state="${2:-$(_wd_drain_state)}" wt issue
+  local now="${1:-$(_wd_now)}" state="${2:-$(_wd_drain_state)}" wt issue wd_conflicts
   # Use the drain state the loop already read (passed as $2) rather than re-probing — the loop
   # reads it once per tick, and a second _wd_drain_state call would double-count under stubs.
   if [ "$state" = "stale" ]; then
@@ -605,11 +655,32 @@ _wd_run_conditions() {
     else
       _wd_clear_fired stale-marker "$issue"
     fi
-    if _wd_detect_mergeable_skipped "$wt" "$issue" "$now"; then
-      _wd_fire auto-land-skipped "$issue" "mergeable branch un-landed > ${HUB_WATCHDOG_LAND_CEILING}s (escalate-only: human land)"
+    if _wd_land_lane_servicing "$issue"; then
+      # #285 AC5: the drain's LAND lane has a FRESH armed retry — it is still servicing this land.
+      # DEFER: neither fire (no false "skipped"/"conflicted-land" while the drain retries) NOR clear
+      # a prior firing's dedup marker (clearing mid-service would let one persistent conflict re-fire
+      # and double-count in the ledger, corrupting the #263 autonomy score). Mirrors the answer-lane
+      # servicing defer; a genuinely stuck land still escalates once the backoff elapses and the
+      # drain stops re-arming, when the branches below run.
+      :
+    elif _wd_detect_mergeable_skipped "$wt" "$issue" "$now"; then
+      # #285: probe ACTUAL mergeability before labeling. A conflicted branch fires a DISTINCT
+      # `conflicted-land` reason naming the files (a human following "mergeable" walks into the
+      # same conflict); a truly-mergeable one keeps the historical auto-land-skipped. Both escalate
+      # via the SAME needs-human-land tag (no second tripwire-racing tag, #272) — only the reason
+      # differs, so the ledger/defect is honest about what the human must do.
+      wd_conflicts="$(_wd_land_conflicts "$wt")"; wd_conflicts="${wd_conflicts% }"
+      if [ -n "$wd_conflicts" ]; then
+        _wd_fire conflicted-land "$issue" "branch conflicts with $(_wd_land_base_ref "$wt") on: $wd_conflicts — resolve on the spoke (merge the base branch), do not blind-land"
+        _wd_clear_fired auto-land-skipped "$issue"   # not a clean skip → drop any stale skip firing
+      else
+        _wd_fire auto-land-skipped "$issue" "mergeable branch un-landed > ${HUB_WATCHDOG_LAND_CEILING}s (escalate-only: human land)"
+        _wd_clear_fired conflicted-land "$issue"     # cleanly mergeable now → drop any stale conflict firing
+      fi
       _wd_intervene_landmark "$wt" "$issue"
     else
       _wd_clear_fired auto-land-skipped "$issue"
+      _wd_clear_fired conflicted-land "$issue"
     fi
   done < <(inflight_worktrees)
 }
