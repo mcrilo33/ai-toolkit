@@ -321,6 +321,91 @@ def test_clear_progress_state_also_clears_watchdog_firing_markers(tmp_path: Path
     assert not marker.exists(), "a fresh window drops the stale firing-dedup marker"
 
 
+# ── issue #283: the park-onset epoch tracks the CURRENT park episode ───────────
+# park-onset is stamp-once while `waiting` and cleared only by a slot_state tick that observes
+# the spoke past EVERY park check. Under dense permission traffic (#276) no tick ever observed
+# "not parked", so many distinct park episodes FUSED into one onset that still held the original
+# gate's timestamp 20 minutes later — and the watchdog's park-unanswered ceiling measured against
+# it. note_park_episode re-stamps the onset whenever the pending park's SIGNATURE changes (the
+# same content hash the broker already keys reanswer-<issue> on), so the onset names the episode
+# actually pending rather than the oldest one in a fused run.
+
+
+def _episode(sig: str, issue: str = "5") -> str:
+    """A note_park_episode call with the park signature stubbed to `sig` (empty = unextractable)."""
+    return f"_broker_park_signature() {{ printf '%s' '{sig}'; }}; note_park_episode /wt {issue}"
+
+
+def test_note_park_episode_restamps_onset_when_signature_changes(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    _call(_episode("sigA"), env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1000"})
+
+    _call(_episode("sigB"), env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1600"})
+
+    assert (statedir / "park-onset-5.epoch").read_text().strip() == "1600", (
+        "a changed park signature is a NEW episode — the onset restarts at it"
+    )
+
+
+def test_note_park_episode_holds_onset_when_signature_unchanged(tmp_path: Path) -> None:
+    # The same park still pending is ONE episode: its onset must not creep forward each tick, or
+    # a genuinely stranded park would never outlive the ceiling.
+    statedir = tmp_path / "sd"
+    _call(_episode("sigA"), env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1000"})
+
+    _call(_episode("sigA"), env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1600"})
+
+    assert (statedir / "park-onset-5.epoch").read_text().strip() == "1000"
+
+
+def test_note_park_episode_restamps_when_onset_missing_but_sig_record_survives(
+    tmp_path: Path,
+) -> None:
+    # slot_state's clear_park_onset_epoch (detect.sh) drops the onset on a not-parked tick but
+    # knows nothing about the sig record. A re-park raising the IDENTICAL dialog would then read
+    # "signature unchanged" over a missing onset — so a missing onset re-stamps regardless.
+    statedir = tmp_path / "sd"
+    _call(_episode("sigA"), env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1000"})
+    (statedir / "park-onset-5.epoch").unlink()
+
+    _call(_episode("sigA"), env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1600"})
+
+    assert (statedir / "park-onset-5.epoch").read_text().strip() == "1600"
+
+
+def test_note_park_episode_prints_the_current_episode_onset(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    _call(_episode("sigA"), env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1000"})
+
+    result = _call(_episode("sigA"), env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1600"})
+
+    assert result.stdout.strip() == "1000", "the caller reads the episode base off stdout"
+
+
+def test_note_park_episode_noop_on_empty_signature(tmp_path: Path) -> None:
+    # An unextractable park (_broker_park_signature fail-opens to empty) must leave the onset
+    # exactly as slot_state's stamp-once left it: no episode claim we cannot substantiate.
+    statedir = tmp_path / "sd"
+    _call("stamp_park_onset_epoch 5", env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1000"})
+
+    _call(_episode(""), env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1600"})
+
+    assert (statedir / "park-onset-5.epoch").read_text().strip() == "1000"
+    assert not (statedir / "park-sig-5").exists(), "an empty signature records no episode"
+
+
+def test_clear_progress_state_also_clears_the_park_sig_record(tmp_path: Path) -> None:
+    # Per-window state, like park-onset itself: a leftover sig record would make the next
+    # window's first park read as "signature unchanged" against a foreign episode.
+    statedir = tmp_path / "sd"
+    _call(_episode("sigA"), env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1000"})
+    assert (statedir / "park-sig-5").exists()
+
+    _call("_clear_progress_state", env={"AFK_STATE_DIR": str(statedir)})
+
+    assert not (statedir / "park-sig-5").exists()
+
+
 def test_refresh_offline_clocks_stamps_progress_and_answer_attempt(tmp_path: Path) -> None:
     # The idle-clock exclusion for an outage tick: every in-flight spoke gets a fresh progress
     # epoch (soft ceiling) AND answer-attempt epoch (idle clock), so the blackout is not counted
