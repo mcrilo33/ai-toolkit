@@ -20,6 +20,17 @@ provably docs-only or python-only runs the full suite.
 A `*.py` file counts as python even under `docs/` (e.g. `docs/conf.py`): testmon
 judges its impact rather than the path skipping it as a doc.
 
+## Parallelism (pytest-xdist)
+
+The **non-testmon** legs — the full suite and the SELECTED mapped-files leg — run
+under `pytest-xdist`'s `-n auto` (one worker per core), since the suite is
+I/O-bound and embarrassingly parallel. The post-land full sweep
+(`gate-sweep.sh`) parallelizes the same way. The `--testmon` legs stay
+single-process: testmon serializes a single-writer DB and does not compose with
+xdist (`pytest --testmon -n auto` is unsupported). This is guarded on the runner
+advertising `-n numprocesses` in `pytest --help`, so a checkout without
+`pytest-xdist` installed degrades to single-process rather than erroring the push.
+
 ## Safe fallbacks
 
 The gate is built to fail toward *more* testing, never toward silently skipping:
