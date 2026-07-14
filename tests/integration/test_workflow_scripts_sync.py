@@ -68,7 +68,7 @@ SOURCES["gate-broker.sh"] = HUB_SCRIPTS_DIR / "gate-broker.sh"
 # alongside gate-broker.sh so the entry lib can source it as a co-located sibling. A module
 # absent from .ai-toolkit/scripts/ makes the deny-wall fail CLOSED (see gate-broker.sh's
 # fail-closed source loop) — but it must never be absent, hence this end-to-end guard.
-for _gb_mod in ("markers", "detect", "classify"):
+for _gb_mod in ("markers", "detect", "classify", "danger"):
     SOURCES[f"gate-broker-{_gb_mod}.sh"] = HUB_SCRIPTS_DIR / f"gate-broker-{_gb_mod}.sh"
 # The hardened tmux-inject primitive (issue #251) MUST install alongside gate-broker.sh: the
 # broker now sources it as a co-located sibling ($SCRIPT_DIR/hub-inject.sh) for the ONE
