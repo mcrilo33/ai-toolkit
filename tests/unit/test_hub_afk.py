@@ -26,9 +26,11 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from bash_session import BashSession, fresh_call
 
 # hub-afk.sh targets the macOS control plane: it reads transcript mtimes with BSD
 # `stat -f %m`. GNU stat treats `-f` as *filesystem* stat, so on Linux the call
@@ -100,28 +102,77 @@ def _isolated_afk_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("AFK_NET_PROBE_CMD", "true")
 
 
-def _call(fn_call: str, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-    """Source hub-afk.sh and invoke a shell expression against its functions.
+# The #236 gh lifecycle-label mirror is forced OFF for every call: this host has an
+# authed `gh` and _call runs with cwd = the git-cwd sandbox, so a reap/escalation
+# exercising _afk_escalate_blocked would otherwise fire a REAL `gh issue edit`. The
+# label-assertion tests opt back in (=1) behind a PATH gh stub (_blocked_label_env).
+_BASE_ENV = {"AI_TOOLKIT_GH_LIFECYCLE_LABELS": "0"}
 
-    TZ=UTC is forced so the window clock is deterministic regardless of host TZ.
+# Source-time resolution keys (issue #276): hub-afk.sh reads these while being SOURCED
+# to locate its own dir and the helper scripts it resolves once (worktree-lib.sh,
+# gate-broker.sh, telemetry-ingest-spoke.sh). A call overriding one cannot reuse the
+# already-sourced coprocess (the resolution is baked at source), so it routes to a
+# fresh source. (AFK_ORIG_SCRIPT / AFK_SELF_COPY are read inside functions at call
+# time, and the self-copy exec is guarded by BASH_SOURCE==$0 — never on a source — so
+# they are runtime-safe and stay on the coprocess.)
+_FRESH_SOURCE_KEYS = frozenset({"SCRIPT_DIR", "AFK_WT_LIB", "AFK_GATE_BROKER", "AFK_INGEST_BIN"})
+
+_SESSION: BashSession | None = None
+
+
+def _session() -> BashSession:
+    """The module-scoped bash that sources hub-afk.sh once (issue #276)."""
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = BashSession(HUB_AFK, base_env=_BASE_ENV)
+    return _SESSION
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _close_bash_session() -> Iterator[None]:
+    yield
+    global _SESSION
+    if _SESSION is not None:
+        _SESSION.close()
+        _SESSION = None
+
+
+def _call(
+    fn_call: str, *, env: dict[str, str] | None = None, fresh: bool = False
+) -> subprocess.CompletedProcess[str]:
+    """Invoke a shell expression against hub-afk.sh's functions.
+
+    Reuses a module-scoped bash that sources hub-afk.sh ONCE (issue #276) and runs
+    each call in a fresh subshell — the multi-thousand-line source cost is paid once
+    per module, not once per test. TZ=UTC is forced so the window clock is
+    deterministic regardless of host TZ.
+
+    Routes to a FRESH source (the pre-#276 per-call ``bash -c 'source; fn'``) when:
+      * ``fresh=True`` — the call needs whole-shell semantics the shared coprocess's
+        per-call SUBSHELL cannot reproduce: a signal/trap targeting ``$$`` (which in a
+        subshell is the parent's pid, and whose trap lives in the parent), or a
+        source-time ``: "${VAR:=default}"`` default the caller overrides with an empty
+        string (the default is applied once at source, not re-derived per call); or
+      * env overrides a SOURCE-TIME resolution key (SCRIPT_DIR / AFK_WT_LIB /
+        AFK_GATE_BROKER).
     """
-    # Default the #236 gh lifecycle-label mirror OFF: this host has an authed `gh` and
-    # _call runs with cwd = the real repo, so a reap/escalation exercising
-    # _afk_escalate_blocked would otherwise fire a REAL `gh issue edit` at the live repo.
-    # The label-assertion tests opt back in (=1) behind a PATH gh stub (_blocked_label_env).
-    full_env = {**os.environ, "TZ": "UTC", "AI_TOOLKIT_GH_LIFECYCLE_LABELS": "0"}
-    if env:
-        full_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", f'source "{HUB_AFK}"; {fn_call}'],
-        capture_output=True,
-        text=True,
-        env=full_env,
-    )
+    if fresh or (env and _FRESH_SOURCE_KEYS.intersection(env)):
+        return fresh_call(HUB_AFK, fn_call, env=env, base_env=_BASE_ENV)
+    return _session().call(fn_call, env=env)
 
 
 def _epoch(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> int:
     return int(datetime.datetime(year, month, day, hour, minute, tzinfo=datetime.UTC).timestamp())
+
+
+def test_hub_afk_lib_is_sourced_once_per_module() -> None:
+    # Issue #276: the module-scoped coprocess sources hub-afk.sh exactly ONCE, not
+    # once per test — the whole point of the source-once harness. hub-afk.sh is the
+    # multi-thousand-line lib whose per-test re-source dominated this suite.
+    session = _session()
+    _call("true")
+    _call("true")
+    assert session.source_count == 1
 
 
 # ── the pure TIME layer ───────────────────────────────────────────────────────
@@ -6586,7 +6637,9 @@ def test_kickoff_instructs_gate_plan_passthrough() -> None:
 
 def test_afk_tick_seconds_defaults_to_300() -> None:
     # The relaxed backstop tick (#176): the poll is no longer the primary answer latency.
-    result = _call("echo $AFK_TICK_SECONDS", env={"AFK_TICK_SECONDS": ""})
+    # fresh=True: the `: "${AFK_TICK_SECONDS:=300}"` default is applied at SOURCE time, so
+    # an empty-string override must re-source to re-derive it (issue #276).
+    result = _call("echo $AFK_TICK_SECONDS", env={"AFK_TICK_SECONDS": ""}, fresh=True)
 
     assert result.stdout.strip() == "300"
 
@@ -6594,14 +6647,19 @@ def test_afk_tick_seconds_defaults_to_300() -> None:
 def test_afk_stale_ticks_defaults_to_4() -> None:
     # Scaled to the 300s tick so the wedge threshold stays ~20min (4x300s), not the ~50min
     # a 120s-era default of 10 would silently stretch to.
-    result = _call("echo $AFK_STALE_TICKS", env={"AFK_STALE_TICKS": ""})
+    # fresh=True: the `: "${AFK_STALE_TICKS:=4}"` default is applied at SOURCE time, so
+    # an empty-string override must re-source to re-derive it (issue #276).
+    result = _call("echo $AFK_STALE_TICKS", env={"AFK_STALE_TICKS": ""}, fresh=True)
 
     assert result.stdout.strip() == "4"
 
 
 def test_usr1_sets_the_woken_flag() -> None:
     # The trap the whole wake path hangs on: a delivered USR1 flips _AFK_WOKEN.
-    result = _call('kill -USR1 $$; sleep 0.1; echo "woken=$_AFK_WOKEN"')
+    # fresh=True: the trap and $$ must be the executing shell's own, not the shared
+    # coprocess parent's — a per-call subshell can neither own the trap nor be the
+    # target of `kill $$` (issue #276).
+    result = _call('kill -USR1 $$; sleep 0.1; echo "woken=$_AFK_WOKEN"', fresh=True)
 
     assert "woken=1" in result.stdout, result.stdout + result.stderr
 
