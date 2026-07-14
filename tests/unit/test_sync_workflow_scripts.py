@@ -28,7 +28,7 @@ HUB_SCRIPTS_DIR = REPO_ROOT / "shared" / "skills" / "hub" / "scripts"
 # registered exactly like a hub-skill sibling so it lands in a synced target's
 # .ai-toolkit/scripts/ — otherwise the entry lib sources a missing sibling and the deny-wall
 # fails CLOSED (a walled-shut spoke). Extend this tuple as each module is extracted.
-GB_MODULES = ("markers", "detect", "classify", "danger", "answerer")
+GB_MODULES = ("markers", "detect", "classify", "danger", "answerer", "permission")
 
 
 def _sync_workflow_scripts_body() -> str:
