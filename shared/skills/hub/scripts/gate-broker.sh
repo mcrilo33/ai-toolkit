@@ -176,6 +176,17 @@ clear_done_epoch()      { rm -f "$(_afk_state_dir)/done-$1.epoch" 2>/dev/null ||
 # stamp-once: a ready-at-tip spoke's un-landed clock starts at the FIRST done tick and does not
 # reset while it stays done, so the full ceiling elapses before the watchdog can fire.
 stamp_done_epoch_once() { [ -n "$(read_done_epoch "$1")" ] || stamp_done_epoch "$1"; }
+# park-onset-<issue>.epoch — the watchdog's park-unanswered never-attempted reference (#265):
+# stamped the FIRST tick slot_state reads a spoke `waiting`, so the park-unanswered ceiling
+# measures from park onset rather than zero. The answer-attempt epoch is stamped only at answer
+# DELIVERY (minutes into the answerer's reasoning), so before it exists the watchdog had no
+# park-age floor and false-fired 1s after every fresh park. Held constant across consecutive
+# waiting ticks (stamp-once) and cleared once the spoke is no longer parked, so a later re-park
+# re-stamps fresh. Cleared on a fresh arm (_clear_progress_state), like done-<issue>.epoch.
+stamp_park_onset_epoch()      { _stamp_issue_epoch park-onset "$1"; }
+read_park_onset_epoch()       { _read_issue_epoch park-onset "$1"; }
+clear_park_onset_epoch()      { rm -f "$(_afk_state_dir)/park-onset-$1.epoch" 2>/dev/null || true; }
+stamp_park_onset_epoch_once() { [ -n "$(read_park_onset_epoch "$1")" ] || stamp_park_onset_epoch "$1"; }
 
 # --- network-outage state (issue #249) ----------------------------------------
 # A connectivity blackout makes the pre-reap auth probe fail for the WRONG reason. The two
@@ -223,6 +234,7 @@ _afk_refresh_offline_clocks() {
 _clear_progress_state() {
   local dir; dir="$(_afk_state_dir)"
   rm -f "$dir"/progress-*.epoch "$dir"/answer-attempt-*.epoch "$dir"/done-*.epoch "$dir"/tip-* \
+    "$dir"/park-onset-*.epoch \
     "$dir"/reanswer-* "$dir"/gate-voided-* "$dir"/terminal-logged-* \
     "$dir"/wd-fire-dedup-* \
     "$dir"/offline-since.epoch 2>/dev/null || true   # #249: drop a stale outage marker too
@@ -628,7 +640,7 @@ slot_state() {
     # land on top.
     if [ "$(git -C "$wt_path" rev-parse -q --verify "refs/tags/blocked/${issue}^{commit}" 2>/dev/null)" = "$tip" ]; then
       if [ -n "$(extract_pending_question "$wt_path")" ] || _permission_pending "$wt_path"; then
-        printf 'waiting\n'; return
+        stamp_park_onset_epoch_once "$issue"; printf 'waiting\n'; return
       fi
       printf 'done\n'; return
     fi
@@ -637,7 +649,7 @@ slot_state() {
     # can't see it. Checking at the tip is self-clearing: once approved and the spoke
     # commits its first RED/GREEN, the tip moves past the gate commit and it reads busy.
     if [ "$(git -C "$wt_path" rev-parse -q --verify "refs/tags/gate/${issue}^{commit}" 2>/dev/null)" = "$tip" ]; then
-      printf 'waiting\n'; return
+      stamp_park_onset_epoch_once "$issue"; printf 'waiting\n'; return
     fi
   fi
   # Ledger progress (a tip advance since the last tick) refreshes the ceiling before
@@ -651,10 +663,15 @@ slot_state() {
   # genuinely-stuck dialog could form is bounded NOT here but in the answer lane
   # (broker_service_gate's _broker_reanswer_exhausted / AFK_REANSWER_CEILING + the _afk_warned_arm
   # backoff, escalating to blocked/<issue> on a real judgment call), so park-wins is unconditional.
-  if [ -n "$(extract_pending_question "$wt_path")" ]; then printf 'waiting\n'; return; fi
+  if [ -n "$(extract_pending_question "$wt_path")" ]; then stamp_park_onset_epoch_once "$issue"; printf 'waiting\n'; return; fi
   # A pending permission dialog (a CC confirmation prompt, no transcript entry) is decided by
   # the supervisor's classifier, so it waits — never reaped as idle (#149) or over-ceiling (#246).
-  if _permission_pending "$wt_path"; then printf 'waiting\n'; return; fi
+  if _permission_pending "$wt_path"; then stamp_park_onset_epoch_once "$issue"; printf 'waiting\n'; return; fi
+  # Past every park check ⇒ the spoke is NOT parked (busy/reap). Reset its park-onset clock so a
+  # later re-park measures the watchdog's park-unanswered ceiling from the NEW onset, not a stale
+  # one (#265). Placed here, not in _afk_note_tip_progress above: that runs BEFORE the two waiting
+  # returns just above, so clearing there would clear-then-restamp a still-parked spoke every tick.
+  clear_park_onset_epoch "$issue"
   if _spoke_over_any_ceiling "$issue" "$(afk_now)"; then printf 'reap\n'; return; fi
   age="$(_spoke_idle_seconds "$wt_path" "$issue")"
   if [ -n "$age" ] && [ "$age" -gt $(( AFK_IDLE_MINUTES * 60 )) ]; then printf 'reap\n'; return; fi

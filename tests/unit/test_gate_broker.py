@@ -3029,6 +3029,111 @@ def test_note_tip_progress_clears_done_epoch_on_first_sighting(
     assert not (statedir / "done-5.epoch").exists()
 
 
+# ── #265: slot_state stamps the park-onset clock the first tick it reads waiting ───
+# The watchdog's park-unanswered never-attempted branch measures its ceiling from this onset,
+# NOT from zero — so a fresh park gets the full HUB_WATCHDOG_PARK_CEILING before it may fire.
+# A parked spoke stamps it once on its first waiting read; a not-parked spoke clears it so a
+# later re-park re-stamps fresh. Mirrors the #263 done-epoch machinery.
+def test_slot_state_gate_parked_stamps_park_onset(spoke_repo: Path, tmp_path: Path) -> None:
+    statedir = tmp_path / "afk-state"
+    subprocess.run(["git", "tag", "gate/5"], cwd=spoke_repo, check=True, capture_output=True)
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    (pd / "session.jsonl").write_text(
+        json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "parked"}]}}
+        )
+        + "\n"
+    )
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={
+            "AFK_STATE_DIR": str(statedir),
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_NOW": "1700000000",
+        },
+    )
+
+    assert result.stdout.strip() == "waiting", result.stdout + result.stderr
+    assert (statedir / "park-onset-5.epoch").read_text().strip() == "1700000000"
+
+
+def test_slot_state_question_parked_stamps_park_onset(spoke_repo: Path, tmp_path: Path) -> None:
+    # A permission/question park (no gate tag) still gets an onset stamp — the false-fire
+    # window is structural to every park type, not just the PLAN gate the incident hit.
+    statedir = tmp_path / "afk-state"
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    (pd / "session.jsonl").write_text(
+        json.dumps(_ask_record("Which store?", [("Redis", "fast")])) + "\n"
+    )
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={
+            "AFK_STATE_DIR": str(statedir),
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_NOW": "1700000000",
+        },
+    )
+
+    assert result.stdout.strip() == "waiting", result.stdout + result.stderr
+    assert (statedir / "park-onset-5.epoch").read_text().strip() == "1700000000"
+
+
+def test_stamp_park_onset_epoch_once_is_idempotent(tmp_path: Path) -> None:
+    # Stamp-once: the onset clock is fixed at the FIRST waiting tick and never resets while the
+    # spoke stays parked, so the full ceiling elapses before the watchdog can fire.
+    statedir = tmp_path / "afk-state"
+    env = {"AFK_STATE_DIR": str(statedir)}
+
+    _call("stamp_park_onset_epoch_once 5", env={**env, "AFK_NOW": "1700000000"})
+    _call("stamp_park_onset_epoch_once 5", env={**env, "AFK_NOW": "1700009999"})  # second tick
+
+    assert (statedir / "park-onset-5.epoch").read_text().strip() == "1700000000"
+
+
+def test_slot_state_busy_spoke_clears_park_onset(spoke_repo: Path, tmp_path: Path) -> None:
+    # A spoke that has moved on (no park signal) must drop a stale onset so a later re-park
+    # measures the watchdog ceiling from the NEW onset, not the prior park's.
+    statedir = tmp_path / "afk-state"
+    statedir.mkdir(parents=True)
+    (statedir / "park-onset-5.epoch").write_text("1700000000\n")  # a stale onset
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    (pd / "session.jsonl").write_text(
+        json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "working"}]}}
+        )
+        + "\n"
+    )
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={
+            "AFK_STATE_DIR": str(statedir),
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_NOW": "1700000000",
+        },
+    )
+
+    assert result.stdout.strip() == "busy", result.stdout + result.stderr
+    assert not (statedir / "park-onset-5.epoch").exists()
+
+
+def test_clear_progress_state_drops_park_onset(tmp_path: Path) -> None:
+    # Per-window state: a leftover onset from a prior drain window would suppress a fresh
+    # park's full grace in the next window. A fresh arm wipes it, like done-*.epoch.
+    statedir = tmp_path / "afk-state"
+    statedir.mkdir(parents=True)
+    (statedir / "park-onset-5.epoch").write_text("1700000000\n")
+
+    _call("_clear_progress_state", env={"AFK_STATE_DIR": str(statedir)})
+
+    assert not (statedir / "park-onset-5.epoch").exists()
+
+
 # subtask 4: the inject-verify budget default widened 20 -> 60 ──
 
 
