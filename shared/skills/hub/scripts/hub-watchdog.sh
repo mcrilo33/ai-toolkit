@@ -317,8 +317,45 @@ _wd_detect_supervisor_dead() { [ "$(_wd_drain_state)" = "stale" ]; }
 
 # --- the 5 scripted interventions (each behind a HUB_WATCHDOG_*_CMD seam) ------
 # The seam receives the worktree + issue as positional args ($1 $2 after the argv0 sentinel).
+# _wd_last_action -> the drain supervisor's most-recent-action label (hub-afk.sh's #202 record,
+# e.g. "answer #5"), read directly from the shared state dir so the watchdog needs no hub-afk.sh
+# source. Honors the AFK_LAST_ACTION override exactly as hub-afk.sh does (tests point it at a
+# scratch file). Empty when unreadable / the state dir reader is absent (standalone watchdog).
+_wd_last_action() {
+  local f="${AFK_LAST_ACTION:-}"
+  if [ -z "$f" ]; then
+    command -v _afk_state_dir >/dev/null 2>&1 || return 0
+    f="$(_afk_state_dir)/last-action"
+  fi
+  [ -f "$f" ] && head -n1 "$f" 2>/dev/null || true
+}
+
+# _wd_supervisor_servicing <issue> -> true when the tier-1 drain is CURRENTLY servicing this
+# park, so the watchdog must NOT run a second decide_and_act and race the in-flight answerer
+# (#265 AC4; the #89 stale-answer/strand hazard). Two positive signals: a FRESH answer-delivery
+# stamp (the supervisor delivered within the ceiling), or — for the never-attempted window where
+# no stamp exists yet — a LIVE drain whose last action names this issue (its answerer, a
+# high-effort headless `claude`, is mid-reasoning pre-delivery). Either ⇒ defer.
+_wd_supervisor_servicing() {
+  local issue="$1" attempt
+  attempt="$(read_answer_attempt "$issue" 2>/dev/null)"
+  case "$attempt" in
+    '' | *[!0-9]*) ;;   # no delivery yet — fall through to the heartbeat + last-action check
+    *) _wd_epoch_stale "$attempt" "$(_wd_now)" "$HUB_WATCHDOG_PARK_CEILING" || return 0 ;;
+  esac
+  [ "$(_wd_drain_state)" = "live" ] || return 1
+  case "$(_wd_last_action)" in *"#$issue") return 0 ;; esac
+  return 1
+}
+
 _wd_intervene_answer() {   # route to the reasoner/permission lane directly
   local wt="$1" issue="$2"
+  # #265 AC4: defer when the supervisor is mid-service on this same park — a second answer here
+  # duplicate-injects and races the in-flight answerer (the #89 hazard) + wastes a costly run.
+  if _wd_supervisor_servicing "$issue"; then
+    _wd_log "deferring answer intervention on #$issue — supervisor is mid-service on this park"
+    return 0
+  fi
   if [ -n "${HUB_WATCHDOG_ANSWER_CMD:-}" ]; then bash -c "$HUB_WATCHDOG_ANSWER_CMD" hub-watchdog "$wt" "$issue" >/dev/null 2>&1 || true; return 0; fi
   command -v decide_and_act >/dev/null 2>&1 && decide_and_act "$wt" "$issue" >/dev/null 2>&1 || true
 }

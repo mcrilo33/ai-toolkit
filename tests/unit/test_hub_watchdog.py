@@ -503,11 +503,69 @@ def test_supervisor_dead_fires_when_drain_state_stale(tmp_path: Path) -> None:
 # ── interventions fire the seam with the worktree + issue ─────────────────────
 def test_intervene_answer_invokes_the_seam(tmp_path: Path) -> None:
     marker = tmp_path / "answered"
-    env = {"HUB_WATCHDOG_ANSWER_CMD": f'printf "%s %s" "$1" "$2" > {marker}'}
+    # An idle drain (no fresh attempt, no live supervisor) is not mid-service → the seam fires.
+    env = {
+        "HUB_WATCHDOG_ANSWER_CMD": f'printf "%s %s" "$1" "$2" > {marker}',
+        "AFK_STATE": str(tmp_path / "absent-afk-state"),
+        "AFK_NOW": NOW,
+    }
 
     _call("_wd_intervene_answer /the/wt 5", env=env)
 
     assert marker.read_text() == "/the/wt 5"
+
+
+# AC4 (#265): the watchdog must NOT run a second decide_and_act while the supervisor is
+# mid-service on the SAME park — a duplicate answer races the in-flight answerer (the #89
+# stale-answer/strand hazard + a wasted high-effort run). Two mid-service signals defer it.
+def test_intervene_answer_defers_when_attempt_stamp_fresh(tmp_path: Path) -> None:
+    # A fresh answer-delivery stamp ⇒ the supervisor delivered within the ceiling → defer.
+    marker = tmp_path / "answered"
+    fresh = str(int(NOW) - 60)  # delivered 60s ago (< 600s ceiling)
+    env = {
+        "HUB_WATCHDOG_ANSWER_CMD": f"printf x > {marker}",
+        "AFK_STATE": str(tmp_path / "absent-afk-state"),
+        "AFK_NOW": NOW,
+    }
+
+    _call(f"read_answer_attempt() {{ echo {fresh}; }}; _wd_intervene_answer /the/wt 5", env=env)
+
+    assert not marker.exists()
+
+
+def test_intervene_answer_defers_when_live_drain_last_action_names_issue(tmp_path: Path) -> None:
+    # No delivery stamp yet (the never-attempted window), but the drain is live and its
+    # last-action names this issue ⇒ the answerer is mid-reasoning → defer.
+    marker = tmp_path / "answered"
+    last_action = tmp_path / "last-action"
+    last_action.write_text("answer #5\n")
+    env = {
+        "HUB_WATCHDOG_ANSWER_CMD": f"printf x > {marker}",
+        "AFK_LAST_ACTION": str(last_action),
+        "AFK_NOW": NOW,
+    }
+    prelude = '_wd_drain_state() { echo live; }; read_answer_attempt() { echo ""; }'
+
+    _call(f"{prelude}; _wd_intervene_answer /the/wt 5", env=env)
+
+    assert not marker.exists()
+
+
+def test_intervene_answer_fires_when_last_action_names_other_issue(tmp_path: Path) -> None:
+    # A live drain whose last-action names a DIFFERENT issue is not servicing this park → fire.
+    marker = tmp_path / "answered"
+    last_action = tmp_path / "last-action"
+    last_action.write_text("answer #9\n")
+    env = {
+        "HUB_WATCHDOG_ANSWER_CMD": f"printf x > {marker}",
+        "AFK_LAST_ACTION": str(last_action),
+        "AFK_NOW": NOW,
+    }
+    prelude = '_wd_drain_state() { echo live; }; read_answer_attempt() { echo ""; }'
+
+    _call(f"{prelude}; _wd_intervene_answer /the/wt 5", env=env)
+
+    assert marker.read_text() == "x"
 
 
 def test_landmark_intervention_never_lands_only_marks(tmp_path: Path) -> None:
@@ -657,6 +715,8 @@ def test_run_conditions_dedupes_ledger_but_keeps_intervening(tmp_path: Path) -> 
         "HUB_WATCHDOG_LEDGER": str(ledger),
         "HUB_WATCHDOG_ANSWER_CMD": f"printf 'x\\n' >> {answers}",
         "HUB_WATCHDOG_LANDMARK_REPO": str(tmp_path / "no-landmark-repo"),
+        # Drain off so the AC4 mid-service guard never defers (hermetic vs a real armed drain).
+        "AFK_STATE": str(tmp_path / "absent-afk-state"),
         "AFK_NOW": NOW,
     }
     # A parked spoke never answered, parked past the ceiling → park-unanswered fires; the same
@@ -704,6 +764,8 @@ def test_run_conditions_fires_park_and_invokes_answer_seam(tmp_path: Path) -> No
         "HUB_WATCHDOG_ANSWER_CMD": f"touch {answered}",
         # Isolate the landmark sweep off the real repo (a nonexistent path → git no-ops).
         "HUB_WATCHDOG_LANDMARK_REPO": str(tmp_path / "no-landmark-repo"),
+        # Drain off so the AC4 mid-service guard never defers (hermetic vs a real armed drain).
+        "AFK_STATE": str(tmp_path / "absent-afk-state"),
         "AFK_NOW": NOW,
     }
     onset = str(
