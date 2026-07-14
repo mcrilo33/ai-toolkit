@@ -5,6 +5,11 @@
 # --testmon` (absent, the gate falls back to the full suite). See docs/test-gate.md.
 pytest>=8,<9
 pytest-testmon>=2,<3
+# Issue #276: the non-testmon test legs (the FULL suite + the SELECTED mapped-files
+# leg in test-select.sh, and gate-sweep.sh's post-land full sweep) run under
+# `-n auto` to parallelize the I/O-bound suite. NOT applied to the `--testmon` legs:
+# testmon serializes a single-writer DB and does not compose with xdist.
+pytest-xdist>=3,<4
 pyyaml>=6,<7
 # Issue #22: telemetry/queries.py exposes the unified push+pull span dataset as
 # in-memory DuckDB views/queries for the Issue #23 dashboard.

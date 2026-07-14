@@ -13,10 +13,12 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 from shlex import quote as shlex_quote
 
 import pytest
+from bash_session import BashSession, fresh_call
 
 # gate-broker.sh, like hub-afk.sh, targets the macOS control plane (BSD stat / tmux).
 pytestmark = pytest.mark.skipif(
@@ -36,20 +38,47 @@ def _isolated_afk_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("AFK_HEARTBEAT", str(tmp_path / "afk-heartbeat"))
 
 
+# Source-time resolution keys (issue #276): these are read while gate-broker.sh is
+# being SOURCED (to locate its co-located hub-inject.sh / worktree-lib.sh). A call
+# that overrides one cannot reuse the already-sourced coprocess (the resolution is
+# baked at source), so it routes to a fresh source instead. INVARIANT: any NEW
+# top-level (source-time) env read added to gate-broker.sh must be listed here, or a
+# test overriding it would silently get the stale baked value.
+_FRESH_SOURCE_KEYS = frozenset({"SCRIPT_DIR", "AFK_HUB_INJECT", "AFK_WT_LIB"})
+
+_SESSION: BashSession | None = None
+
+
+def _session() -> BashSession:
+    """The module-scoped bash that sources gate-broker.sh once (issue #276)."""
+    global _SESSION
+    if _SESSION is None or not _SESSION.alive:
+        _SESSION = BashSession(GATE_BROKER)
+    return _SESSION
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _close_bash_session() -> Iterator[None]:
+    yield
+    global _SESSION
+    if _SESSION is not None:
+        _SESSION.close()
+        _SESSION = None
+
+
 def _call(
     fn_call: str, *, env: dict[str, str] | None = None, stdin: str | None = None
 ) -> subprocess.CompletedProcess[str]:
-    """Source gate-broker.sh directly and invoke a shell expression against its functions."""
-    full_env = {**os.environ, "TZ": "UTC"}
-    if env:
-        full_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", f'source "{GATE_BROKER}"; {fn_call}'],
-        capture_output=True,
-        text=True,
-        env=full_env,
-        input=stdin,
-    )
+    """Invoke a shell expression against gate-broker.sh's functions.
+
+    Reuses a module-scoped bash that sources gate-broker.sh ONCE (issue #276) and
+    runs each call in a fresh subshell — the multi-thousand-line source cost is paid
+    once per module, not once per test. A call whose env changes SOURCE-TIME
+    resolution (SCRIPT_DIR / AFK_HUB_INJECT) routes to a fresh source instead.
+    """
+    if env and _FRESH_SOURCE_KEYS.intersection(env):
+        return fresh_call(GATE_BROKER, fn_call, env=env, stdin=stdin)
+    return _session().call(fn_call, env=env, stdin=stdin)
 
 
 # ── the core is sourceable on its own ─────────────────────────────────────────
@@ -66,6 +95,16 @@ def test_gate_broker_defines_the_core() -> None:
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip().splitlines()[-1] == "OK"
+
+
+def test_gate_broker_lib_is_sourced_once_per_module() -> None:
+    # Issue #276: the module-scoped coprocess sources gate-broker.sh exactly ONCE,
+    # not once per test — the whole point of the source-once harness. Multiple _call
+    # invocations must not re-parse the multi-thousand-line lib.
+    session = _session()
+    _call("true")
+    _call("true")
+    assert session.source_count == 1
 
 
 def test_hub_inject_loads_under_foreign_script_dir(tmp_path: Path) -> None:

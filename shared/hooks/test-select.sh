@@ -342,6 +342,25 @@ if [ -z "$RUNNER" ]; then
 fi
 read -r -a RUNNER_ARR <<< "$RUNNER"
 
+# pytest-xdist on the non-testmon legs (issue #276): the FULL suite and the SELECTED
+# mapped-files leg are I/O-bound and embarrassingly parallel, so run them under
+# `-n auto` (one worker per core). This is NEVER spliced into the `--testmon` legs:
+# testmon serializes a single-writer DB and `pytest --testmon -n auto` is unsupported.
+# Guarded on the plugin actually being present — an installed venv without pytest-xdist
+# degrades to single-process rather than erroring the push ("unrecognized -n").
+XDIST=()
+runner_has_xdist() {
+  local help=""
+  help="$("${RUNNER_ARR[@]}" --help 2>/dev/null || true)"
+  case "$help" in
+    *"-n numprocesses"*|*"--numprocesses"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+if runner_has_xdist; then
+  XDIST=(-n auto)
+fi
+
 runner_has_testmon() {
   # testmon advertises --testmon in `pytest --help` when its plugin is installed.
   # Capture the help text rather than piping into grep: under pipefail an early
@@ -441,8 +460,8 @@ case "$DECISION" in
         [ "$rc" -ne 0 ] || rc=$rc2
       fi
     else
-      note "python-only diff but testmon not installed — full suite"
-      run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" || rc=$?
+      note "python-only diff but testmon not installed — full suite (parallel: ${XDIST[*]:-off})"
+      run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" ${XDIST[@]+"${XDIST[@]}"} || rc=$?
     fi
     ;;
   SELECTED)
@@ -453,8 +472,8 @@ case "$DECISION" in
     if [ -f "$META_TEST_FILE" ]; then
       SEL_ARR+=("$META_TEST_NODE")
     fi
-    note "mapped diff — selected test files: ${SEL_ARR[*]}"
-    run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" "${SEL_ARR[@]}" || rc=$?
+    note "mapped diff — selected test files: ${SEL_ARR[*]} (parallel: ${XDIST[*]:-off})"
+    run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" ${XDIST[@]+"${XDIST[@]}"} "${SEL_ARR[@]}" || rc=$?
     if [ "$has_py" = "1" ]; then
       # Dedup (issue #270): the mapped test files ALREADY ran, in full, above. When
       # the changed .py IS a mapped mirror test (the common tooling shape: a *.sh
@@ -487,11 +506,11 @@ case "$DECISION" in
     ;;
   FULL)
     if [ -n "$UNMAPPED_FILE" ]; then
-      note "unmapped non-exempt change ($UNMAPPED_FILE) — full suite; add a test referencing it or a .test-select-exempt entry"
+      note "unmapped non-exempt change ($UNMAPPED_FILE) — full suite; add a test referencing it or a .test-select-exempt entry (parallel: ${XDIST[*]:-off})"
     else
-      note "non-python or unrecognized changes — full suite"
+      note "non-python or unrecognized changes — full suite (parallel: ${XDIST[*]:-off})"
     fi
-    run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" || rc=$?
+    run_under_tripwire_scoped "$PUSH_SCOPE" "${GIT_HOOK_UNSET[@]}" "${RUNNER_ARR[@]}" ${XDIST[@]+"${XDIST[@]}"} || rc=$?
     ;;
 esac
 

@@ -103,8 +103,13 @@ def _run_sweep(
     *args: str,
     cmd: str,
     gh_exit: int = 0,
+    testmon_cmd: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
-    """Run gate-sweep.sh in `repo` with a stubbed runner + gh; return (proc, gh log)."""
+    """Run gate-sweep.sh in `repo` with a stubbed runner + gh; return (proc, gh log).
+
+    `testmon_cmd` (issue #276) stubs the baseline-refresh command via
+    GATE_SWEEP_TESTMON_CMD — it runs with TESTMON_DATAFILE pointed at the baseline.
+    """
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     gh_log = tmp_path / "gh-calls.log"
@@ -115,6 +120,10 @@ def _run_sweep(
         **_GIT_ENV,
         "PATH": f"{bindir}:{os.environ['PATH']}",
         "GATE_SWEEP_CMD": cmd,
+        # Default the #276 baseline refresh to a no-op so a green GATE_SWEEP_CMD sweep
+        # never falls through to a REAL `pytest --testmon` run (the real pytest on PATH
+        # carries testmon). The baseline-refresh tests pass their own stub.
+        "GATE_SWEEP_TESTMON_CMD": testmon_cmd if testmon_cmd is not None else ":",
     }
     proc = subprocess.run(
         ["bash", str(GATE_SWEEP), *args],
@@ -208,6 +217,109 @@ def test_run_green_sweep_upgrades_stamp_to_full(repo: Path, tmp_path: Path) -> N
     assert proc.returncode == 0, proc.stderr
     assert runner_log.exists()
     assert "tier=full\n" in _stamp_text(repo)  # back-to-back lands now dedupe
+
+
+# --- --run: refresh the pre-warmed .testmondata baseline on a green sweep (#276) ----
+
+
+def _baseline(repo: Path) -> Path:
+    return repo / ".git" / ".testmondata-baseline"
+
+
+def test_run_green_sweep_refreshes_the_testmon_baseline(repo: Path, tmp_path: Path) -> None:
+    # After a green full sweep, refresh the maintained baseline .testmondata (built via
+    # `pytest --testmon` at TESTMON_DATAFILE) so future spokes copy it and run a
+    # first-push incremental instead of the full-suite seed (issue #276).
+    _mint(repo, "testmon")
+    runner_log = tmp_path / "runner.log"
+
+    proc, _ = _run_sweep(
+        repo,
+        tmp_path,
+        "--run",
+        _head(repo),
+        cmd=_runner_cmd(runner_log),
+        testmon_cmd='printf "DB" > "$TESTMON_DATAFILE"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert _wait_for(_baseline(repo)), "a green sweep must refresh the baseline .testmondata"
+    assert _baseline(repo).read_text() == "DB"
+
+
+def test_run_red_sweep_does_not_refresh_the_baseline(repo: Path, tmp_path: Path) -> None:
+    # A red sweep proved the opposite of full-green — it must not mint a baseline off a
+    # tree whose suite is failing.
+    _mint(repo, "testmon")
+    runner_log = tmp_path / "runner.log"
+
+    _run_sweep(
+        repo,
+        tmp_path,
+        "--run",
+        _head(repo),
+        "--branch",
+        "feature/9-x",
+        "--issue",
+        "9",
+        cmd=_runner_cmd(runner_log, exit_code=1),
+        testmon_cmd='printf "DB" > "$TESTMON_DATAFILE"',
+    )
+
+    time.sleep(0.8)
+    assert not _baseline(repo).exists(), "a red sweep must not refresh the baseline"
+
+
+def test_run_green_sweep_replaces_baseline_atomically(repo: Path, tmp_path: Path) -> None:
+    # Atomic publish (#276 review): a refresh over an existing baseline replaces its
+    # content via temp+mv and leaves no partial/temp file behind, so a concurrent
+    # worktree-new `cp` reader sees only a complete old-or-new inode.
+    _mint(repo, "testmon")
+    baseline = _baseline(repo)
+    baseline.parent.mkdir(parents=True, exist_ok=True)
+    baseline.write_text("OLD")
+    runner_log = tmp_path / "runner.log"
+
+    proc, _ = _run_sweep(
+        repo,
+        tmp_path,
+        "--run",
+        _head(repo),
+        cmd=_runner_cmd(runner_log),
+        testmon_cmd='printf "NEW" > "$TESTMON_DATAFILE"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert _wait_for(baseline)
+    assert baseline.read_text() == "NEW"
+    leftovers = list(baseline.parent.glob(".testmondata-baseline.*"))
+    assert leftovers == [], f"temp build files leaked: {leftovers}"
+
+
+def test_baseline_refresh_failure_keeps_old_baseline(repo: Path, tmp_path: Path) -> None:
+    # A failed baseline BUILD (nonzero exit) on an otherwise-green sweep must never
+    # publish a partial DB: the old baseline stays, the temp is cleaned, and the sweep
+    # still returns 0 (best-effort — a refresh failure never fails the land tail).
+    _mint(repo, "testmon")
+    baseline = _baseline(repo)
+    baseline.parent.mkdir(parents=True, exist_ok=True)
+    baseline.write_text("OLD")
+    runner_log = tmp_path / "runner.log"
+
+    proc, _ = _run_sweep(
+        repo,
+        tmp_path,
+        "--run",
+        _head(repo),
+        cmd=_runner_cmd(runner_log),
+        testmon_cmd='printf "PARTIAL" > "$TESTMON_DATAFILE"; exit 1',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    time.sleep(0.3)
+    assert baseline.read_text() == "OLD", "a failed build must not publish over the baseline"
+    leftovers = list(baseline.parent.glob(".testmondata-baseline.*"))
+    assert leftovers == [], f"temp build files leaked after a failed build: {leftovers}"
 
 
 def test_run_never_sweeps_a_full_stamped_tree(repo: Path, tmp_path: Path) -> None:
@@ -396,6 +508,38 @@ def test_run_red_under_concurrent_drain_still_files_issue(repo: Path, tmp_path: 
     assert proc.returncode == 0, proc.stderr
     assert gh_log.exists() and "issue create" in gh_log.read_text()  # real red still files
     assert "tier=testmon\n" in _stamp_text(repo)  # red keeps the pruned stamp
+
+
+def test_run_suite_parallelizes_the_full_sweep(repo: Path, tmp_path: Path) -> None:
+    # Part 1 (issue #276): the post-land full sweep is embarrassingly parallel, so
+    # run_suite threads `-n auto` onto the real-runner invocation. Assert the suite
+    # actually saw it (an argv-logging pytest stub on the real-runner path).
+    _mint(repo, "testmon")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    argv_log = tmp_path / "argv.log"
+    pytest_stub = bindir / "pytest"
+    pytest_stub.write_text(
+        "#!/bin/sh\n"
+        'case "$1" in --help|-h) echo "usage: pytest"; echo "  -n numprocesses"; exit 0 ;; '
+        '--version|-V) echo "pytest 9.9"; exit 0 ;; esac\n'
+        f'printf "%s\\n" "$*" >> "{argv_log}"\n'
+        "exit 0\n"
+    )
+    pytest_stub.chmod(0o755)
+    env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
+
+    subprocess.run(
+        ["bash", str(GATE_SWEEP), "--run", _head(repo)],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+
+    assert argv_log.exists(), "the real-runner sweep never invoked pytest"
+    assert "-n auto" in argv_log.read_text()  # the full sweep, parallelized
 
 
 # --- --run: one sweep at a time per checkout (lock + newest-wins queue) ------------

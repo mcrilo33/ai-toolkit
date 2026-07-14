@@ -200,6 +200,33 @@ if [ -n "$EXCLUDE_FILE" ]; then
   done
 fi
 
+# --- pre-warm .testmondata from the hub baseline (issue #276) -----------------
+# The first push per fresh worktree otherwise runs the FULL multi-thousand-test suite
+# SOLELY to build .testmondata (12-47 min observed): test-select.sh's python tier has no
+# incremental path on a worktree whose testmon DB is missing. Copy a maintained baseline
+# from the hub's git-common-dir (refreshed by gate-sweep.sh after a green post-land full
+# sweep) into the new worktree root, so the first push runs a testmon INCREMENTAL — only
+# the branch diff's affected tests — instead of the seed. No path rewrite is needed:
+# testmon stores rootdir-relative paths only, so a DB built at one absolute path is fully
+# reused at another. Best-effort and guarded: a missing/unreadable baseline copies
+# nothing and the first push falls back to today's full-suite seed — NEVER a wrong-green,
+# because testmon's own `environment` row (system_packages + python_version) invalidates a
+# copied baseline whose venv dep-set differs (a requirements-dev.txt bump re-runs full).
+# The `.testmondata*` exclude seeded just above keeps the copied DB from dirtying the tree.
+HUB_COMMON_DIR="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+case "$HUB_COMMON_DIR" in
+  "")  ;;                                       # not resolvable — skip the pre-warm
+  /*)  ;;                                        # already absolute
+  *)   HUB_COMMON_DIR="$REPO_ROOT/$HUB_COMMON_DIR" ;;
+esac
+if [ -n "$HUB_COMMON_DIR" ] && [ -r "$HUB_COMMON_DIR/.testmondata-baseline" ]; then
+  if cp "$HUB_COMMON_DIR/.testmondata-baseline" "$WT_DIR/.testmondata" 2>/dev/null; then
+    echo "→ pre-warmed .testmondata (hub baseline; first push runs a testmon incremental)"
+  else
+    wt_warn "could not copy the .testmondata baseline — first push falls back to the full-suite seed"
+  fi
+fi
+
 SPOKE_RUN_ID="${BRANCH}+$(date +%s)"
 mkdir -p "$WT_DIR/.ai-toolkit"
 printf '%s\n' "$SPOKE_RUN_ID" > "$WT_DIR/.ai-toolkit/spoke-run-id"
