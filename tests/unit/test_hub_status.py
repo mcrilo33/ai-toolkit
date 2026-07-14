@@ -1367,3 +1367,30 @@ def test_waived_gates_survives_non_object_journal_line(
     assert "#277" in section and "#278" in section, (
         f"a malformed line must not drop later waives: {section}"
     )
+
+
+def test_waived_gates_negative_limit_never_hides_a_waive(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    # `-1` is the canonical "unlimited" reach and int("-1") does not raise, so an unclamped limit
+    # would slice rows[:-1] (dropping a waive) while reporting len-limit = N+1 older — hiding a
+    # waive behind an inflated count. Clamped to 0: no rows, but a truthful total.
+    state = tmp_path / "afk-state"
+    _write_decision_journal(
+        state,
+        [
+            {
+                "ts": 1751328000 + i,
+                "issue": str(500 + i),
+                "park": "gate",
+                "decision": "fast-path auto-approved: plan restates issue body (coverage 0.90)",
+            }
+            for i in range(3)
+        ],
+    )
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, afk_state_dir=state, waive_limit="-1")
+
+    section = out[out.index("Waived gates") :]
+    assert "+4 older waives" not in section, f"must not overcount the remainder: {section}"
+    assert "+3 older waives" in section, f"3 waives exist, so all 3 must be accounted: {section}"

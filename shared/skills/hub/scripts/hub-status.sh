@@ -506,8 +506,12 @@ if [ -f "$_journal" ] && command -v python3 >/dev/null 2>&1; then
 import json, os
 from datetime import datetime
 
+# Clamp at 0: int("-1") does NOT raise, and a negative limit would make rows[:limit] drop the
+# LAST rows while len(rows) - limit OVERCOUNTS the remainder — silently hiding a waive behind an
+# inflated "older" count, the exact no-silent-caps failure this section exists to avoid. limit 0
+# is coherent: no rows plus a truthful "(+N older waives)".
 try:
-    limit = int(os.environ.get("HUB_STATUS_WAIVE_LIMIT", "10"))
+    limit = max(0, int(os.environ.get("HUB_STATUS_WAIVE_LIMIT", "10")))
 except ValueError:
     limit = 10
 
@@ -530,7 +534,9 @@ with open(os.environ["HUB_STATUS_JOURNAL"], encoding="utf-8", errors="replace") 
             ts = float(rec.get("ts"))
             when = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
         except (TypeError, ValueError, OSError, OverflowError):
-            ts, when = -1.0, "?" * 5
+            # Width-matched to "%Y-%m-%d %H:%M" so a degraded row keeps the issue column aligned
+            # in a section built for scanning; the -1.0 sentinel sorts it below every real epoch.
+            ts, when = -1.0, "?" * 16
         rows.append((ts, f"{when}  #{rec.get('issue', '?')}  {decision}"))
 
 rows.sort(key=lambda r: r[0], reverse=True)   # newest first
