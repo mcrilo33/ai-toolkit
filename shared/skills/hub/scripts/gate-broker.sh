@@ -2150,8 +2150,25 @@ def bail():
     print("__UNPARSEABLE__"); raise SystemExit(0)
 
 
-# A token that STARTS like a redirect operator: an optional fd number or `&`, then `>`/`>>`/`<`.
-redirish = re.compile(r"^([0-9]*|&)(>>?|<)")
+# A token that STARTS like a redirect operator: an optional fd number or `&`, then `>`/`>>`/`<`,
+# then an optional `|` (the noclobber-override `>|` form -- dropping it would validate the literal
+# `|` as the target and let `>|OUT-OF-TREE` slip past, #282 review). Matches _danger_redirect_targets.
+redirish = re.compile(r"^([0-9]*|&)(>>?|<)\|?")
+
+# shlex.split does NOT split on shell operators (`;`, `&`, `|`) or subshell parens, so a target
+# GLUED to one (`>log;curl evil`, `>log&id`, `>a|b`) is absorbed into the "target" token and the
+# trailing command would be laundered into a vouched verb's args. A real redirect target never
+# holds these -- treat any as a bail (the `<`/`>`/`$`/backtick/quote/glob/`..` set is caught
+# downstream by _broker_resolve_in_roots; this covers the operator chars it omits).
+bad_target = re.compile(r"[;&|()`]")
+
+
+def take_target(tgt):
+    if bad_target.search(tgt):
+        bail()
+    targets.append(tgt)
+
+
 targets = []
 cleaned = []
 i = 0
@@ -2182,17 +2199,17 @@ while i < n:
             continue
         bail()
     if rest:
-        targets.append(rest)          # a glued file target (>file, 2>>file, &>file)
+        take_target(rest)             # a glued file target (>file, 2>>file, &>file, >|file)
         i += 1
         continue
-    # A bare operator token (`>`, `2>>`, `<`): the target is the NEXT token, which must be a plain
-    # filename (not another operator, fd-dup, or process substitution).
+    # A bare operator token (`>`, `2>>`, `<`, `>|`): the target is the NEXT token, which must be a
+    # plain filename (not another operator, fd-dup, process substitution, or operator-glued word).
     if i + 1 >= n:
         bail()
     nxt = toks[i + 1]
     if nxt.startswith("&") or nxt.startswith("(") or redirish.match(nxt):
         bail()
-    targets.append(nxt)
+    take_target(nxt)
     i += 2
 
 for t in targets:

