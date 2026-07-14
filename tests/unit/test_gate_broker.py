@@ -5176,6 +5176,35 @@ def test_land_lane_cap_stays_below_the_watchdog_land_ceiling() -> None:
     assert lines[1] == "", r.stdout  # non-land → no override
 
 
+def test_land_lane_cap_rejects_a_non_numeric_override(spoke_repo: Path, tmp_path: Path) -> None:
+    # #274 review (CONFIRMED): a typo'd AFK_LAND_BACKOFF_CAP (e.g. "15m") must clamp to the LAND
+    # default (600s) at the lane, NOT fall through to _afk_warned_arm's 1800s answer default — else
+    # the land backoff would exceed the 900s watchdog ceiling and re-invert the fix.
+    r = _call(
+        'printf "[%s]\\n" "$(_afk_warned_lane_cap land)"',
+        env={"AFK_LAND_BACKOFF_CAP": "15m"},
+    )
+    assert "[600]" in r.stdout, r.stdout + r.stderr
+
+    # End-to-end: an arm through broker_warn_continue with a bad cap env still caps at 600, so even
+    # a high attempt count cannot push the next-due past 600s past now.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "warned-state-5-land").write_text("20\t0\n")  # pre-seed a high attempt count
+    _call(
+        f"broker_warn_continue '{spoke_repo}' 5 land x reversible",
+        env={
+            "AFK_STATE_DIR": str(statedir),
+            "AFK_JOURNAL_GH_COMMENT": "0",
+            "AFK_WARN_BACKOFF_BASE": "60",
+            "AFK_LAND_BACKOFF_CAP": "nonsense",
+            "AFK_NOW": "1000",
+        },
+    )
+    nxt = int((statedir / "warned-state-5-land").read_text().split("\t")[1])
+    assert nxt <= 1000 + 600, f"a bad land cap env must clamp to 600, not 1800; got {nxt - 1000}s"
+
+
 def test_broker_warn_continue_routes_land_park_to_the_land_lane(
     spoke_repo: Path, tmp_path: Path
 ) -> None:

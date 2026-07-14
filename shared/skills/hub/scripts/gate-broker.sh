@@ -1254,11 +1254,17 @@ _afk_warned_lane() {
 }
 
 # _afk_warned_lane_cap <park_kind> -> the backoff CAP a park kind uses (empty => the default
-# AFK_WARN_BACKOFF_CAP). The land lane caps at AFK_LAND_BACKOFF_CAP (default 600s), deliberately
-# BELOW the watchdog land ceiling (HUB_WATCHDOG_LAND_CEILING, 900s), so a done spoke's land is
-# always re-attempted before the watchdog escalates — the #274 AC4 ceiling-inversion fix.
+# AFK_WARN_BACKOFF_CAP). Land-lane membership is derived from _afk_warned_lane so "which kinds are
+# land-lane" lives in ONE place (#274 review). A land-lane kind caps at AFK_LAND_BACKOFF_CAP
+# (default 600s), deliberately BELOW the watchdog land ceiling (HUB_WATCHDOG_LAND_CEILING, 900s),
+# so a done spoke's land is always re-attempted before the watchdog escalates (#274 AC4). A
+# NON-NUMERIC override falls back to 600 HERE — not to _afk_warned_arm's 1800s answer default — so
+# an AFK_LAND_BACKOFF_CAP typo (e.g. "15m") can never silently re-invert the ceiling (#274 review).
 _afk_warned_lane_cap() {
-  case "$1" in land | review) printf '%s\n' "${AFK_LAND_BACKOFF_CAP:-600}" ;; *) ;; esac
+  local cap
+  [ "$(_afk_warned_lane "$1")" = land ] || return 0
+  cap="${AFK_LAND_BACKOFF_CAP:-600}"; case "$cap" in '' | *[!0-9]*) cap=600 ;; esac
+  printf '%s\n' "$cap"
 }
 
 # _afk_warned_arm <issue> [lane] [cap] -> advance the warned-retry backoff for one lane: read the
@@ -1280,26 +1286,26 @@ _afk_warned_arm() {
   printf '%s\t%s\n' "$(( attempt + 1 ))" "$(( now + delay ))" >"$f" 2>/dev/null || true
 }
 
-# _afk_warned_due <issue> [now] [lane] -> rc 0 when the spoke is due for a retry on that lane
-# (never warned, or the backoff window has elapsed), rc 1 when still inside the backoff (parked
-# LAST this tick). An empty lane reads the default (answer/service) lane.
-_afk_warned_due() {
-  local issue="$1" now="${2:-$(afk_now)}" lane="${3:-}" f next=""
-  f="$(_afk_warned_state_file "$issue" "$lane")"
-  [ -f "$f" ] || return 0
-  IFS=$'\t' read -r _ next <"$f" 2>/dev/null || true
-  case "$next" in '' | *[!0-9]*) return 0 ;; esac
-  [ "$now" -ge "$next" ]
-}
-
 # _afk_warned_next <issue> [lane] -> echo the lane's next-due epoch (empty when never armed). The
-# auto_land skip log names it so a paced land is visible, not a silent continue (#274 AC3).
+# single reader of the backoff record's <next> field: _afk_warned_due gates on it and the auto_land
+# skip log names it, so a paced land is visible, not a silent continue (#274 AC3). One parse site so
+# the two callers can never diverge on the record format (#274 review).
 _afk_warned_next() {
   local f next=""
   f="$(_afk_warned_state_file "$1" "${2:-}")"
   [ -f "$f" ] || return 0
   IFS=$'\t' read -r _ next <"$f" 2>/dev/null || true
   printf '%s\n' "$next"
+}
+
+# _afk_warned_due <issue> [now] [lane] -> rc 0 when the spoke is due for a retry on that lane
+# (never warned, or the backoff window has elapsed), rc 1 when still inside the backoff (parked
+# LAST this tick). An empty lane reads the default (answer/service) lane.
+_afk_warned_due() {
+  local issue="$1" now="${2:-$(afk_now)}" lane="${3:-}" next
+  next="$(_afk_warned_next "$issue" "$lane")"
+  case "$next" in '' | *[!0-9]*) return 0 ;; esac
+  [ "$now" -ge "$next" ]
 }
 
 # _afk_clear_warned <issue> -> drop one spoke's warned record + backoff for EVERY lane (called on
