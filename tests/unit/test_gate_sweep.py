@@ -103,8 +103,13 @@ def _run_sweep(
     *args: str,
     cmd: str,
     gh_exit: int = 0,
+    testmon_cmd: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
-    """Run gate-sweep.sh in `repo` with a stubbed runner + gh; return (proc, gh log)."""
+    """Run gate-sweep.sh in `repo` with a stubbed runner + gh; return (proc, gh log).
+
+    `testmon_cmd` (issue #276) stubs the baseline-refresh command via
+    GATE_SWEEP_TESTMON_CMD — it runs with TESTMON_DATAFILE pointed at the baseline.
+    """
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     gh_log = tmp_path / "gh-calls.log"
@@ -116,6 +121,8 @@ def _run_sweep(
         "PATH": f"{bindir}:{os.environ['PATH']}",
         "GATE_SWEEP_CMD": cmd,
     }
+    if testmon_cmd is not None:
+        env["GATE_SWEEP_TESTMON_CMD"] = testmon_cmd
     proc = subprocess.run(
         ["bash", str(GATE_SWEEP), *args],
         cwd=str(repo),
@@ -208,6 +215,57 @@ def test_run_green_sweep_upgrades_stamp_to_full(repo: Path, tmp_path: Path) -> N
     assert proc.returncode == 0, proc.stderr
     assert runner_log.exists()
     assert "tier=full\n" in _stamp_text(repo)  # back-to-back lands now dedupe
+
+
+# --- --run: refresh the pre-warmed .testmondata baseline on a green sweep (#276) ----
+
+
+def _baseline(repo: Path) -> Path:
+    return repo / ".git" / ".testmondata-baseline"
+
+
+def test_run_green_sweep_refreshes_the_testmon_baseline(repo: Path, tmp_path: Path) -> None:
+    # After a green full sweep, refresh the maintained baseline .testmondata (built via
+    # `pytest --testmon` at TESTMON_DATAFILE) so future spokes copy it and run a
+    # first-push incremental instead of the full-suite seed (issue #276).
+    _mint(repo, "testmon")
+    runner_log = tmp_path / "runner.log"
+
+    proc, _ = _run_sweep(
+        repo,
+        tmp_path,
+        "--run",
+        _head(repo),
+        cmd=_runner_cmd(runner_log),
+        testmon_cmd='printf "DB" > "$TESTMON_DATAFILE"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert _wait_for(_baseline(repo)), "a green sweep must refresh the baseline .testmondata"
+    assert _baseline(repo).read_text() == "DB"
+
+
+def test_run_red_sweep_does_not_refresh_the_baseline(repo: Path, tmp_path: Path) -> None:
+    # A red sweep proved the opposite of full-green — it must not mint a baseline off a
+    # tree whose suite is failing.
+    _mint(repo, "testmon")
+    runner_log = tmp_path / "runner.log"
+
+    _run_sweep(
+        repo,
+        tmp_path,
+        "--run",
+        _head(repo),
+        "--branch",
+        "feature/9-x",
+        "--issue",
+        "9",
+        cmd=_runner_cmd(runner_log, exit_code=1),
+        testmon_cmd='printf "DB" > "$TESTMON_DATAFILE"',
+    )
+
+    time.sleep(0.8)
+    assert not _baseline(repo).exists(), "a red sweep must not refresh the baseline"
 
 
 def test_run_never_sweeps_a_full_stamped_tree(repo: Path, tmp_path: Path) -> None:

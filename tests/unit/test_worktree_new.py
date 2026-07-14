@@ -1545,6 +1545,52 @@ def test_testmondata_exclude_seeded_at_most_once(hub: Path) -> None:
     assert lines.count(".testmondata*") == 1, f"duplicate .testmondata* exclude\n{lines}"
 
 
+# ── Pre-warmed .testmondata baseline (issue #276) ──
+#
+# The first push per fresh worktree runs the FULL suite solely to build .testmondata
+# (12-47 min observed). worktree-new copies a maintained baseline .testmondata from
+# the hub's git-common-dir into the new worktree so that first push runs a testmon
+# INCREMENTAL (only the branch diff's affected tests) instead of the full-suite seed.
+# testmon's own environment row (system_packages + python_version) invalidates a
+# copied baseline whose venv differs, so a missing/stale baseline degrades to today's
+# full-suite seed — never a wrong-green.
+
+
+def _hub_common_dir(hub: Path) -> Path:
+    """The hub's git-common-dir (absolute) — where the baseline .testmondata lives."""
+    raw = subprocess.run(
+        ["git", "-C", str(hub), "rev-parse", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=_GIT_ENV,
+    ).stdout.strip()
+    p = Path(raw)
+    return p if p.is_absolute() else hub / p
+
+
+def test_copies_baseline_testmondata_into_new_worktree(hub: Path) -> None:
+    baseline = _hub_common_dir(hub) / ".testmondata-baseline"
+    baseline.parent.mkdir(parents=True, exist_ok=True)
+    baseline.write_bytes(b"BASELINE-TESTMON-DB")
+
+    proc = _run_new_quiet(hub, "99", "pushguard")
+
+    assert proc.returncode == 0, proc.stderr
+    copied = _worktree_dir(hub, "99") / ".testmondata"
+    assert copied.exists(), "baseline .testmondata was not copied into the new worktree"
+    assert copied.read_bytes() == b"BASELINE-TESTMON-DB"
+
+
+def test_missing_baseline_leaves_no_testmondata_and_still_succeeds(hub: Path) -> None:
+    # No baseline present: the spawn still succeeds and copies nothing, so the first
+    # push falls back to today's full-suite seed (never a wrong-green from a stale DB).
+    proc = _run_new_quiet(hub, "99", "pushguard")
+
+    assert proc.returncode == 0, proc.stderr
+    assert not (_worktree_dir(hub, "99") / ".testmondata").exists()
+
+
 @pytest.mark.skipif(shutil.which("jq") is None, reason="merge templating requires jq")
 def test_merges_existing_settings_local(hub: Path) -> None:
     existing = {
