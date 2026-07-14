@@ -124,6 +124,12 @@ def _run(
     # tests can assert the resolved import path exactly.
     env.pop("PYTHONPATH", None)
     env.pop("LANGFUSE_BASIC_AUTH", None)
+    # These tests run inside a live /afk drain, which exports AFK_STATE_DIR — and
+    # _lifecycle_afk_state_dir prefers it over the worktree's git-common-dir sibling.
+    # A leaked value would make the #280 lifecycle tests read the DRAIN's real state
+    # dir instead of the fixture's, so drop it: the state-dir presence is decided
+    # solely by whether the fixture created wt/.git/ai-toolkit-afk (issue #284).
+    env.pop("AFK_STATE_DIR", None)
     if auth is not None:
         env["LANGFUSE_BASIC_AUTH"] = auth
     if extra_env:
@@ -536,12 +542,18 @@ _GIT_ENV = {
 }
 
 
-def _git_worktree(tmp_path: Path, *, branch: str = "feature/280-demo") -> tuple[Path, Path]:
+def _git_worktree(
+    tmp_path: Path, *, branch: str = "feature/280-demo", make_afk: bool = True
+) -> tuple[Path, Path]:
     """An OTel spoke worktree that is a real git checkout on `branch`, plus its afk state dir.
 
     write_lifecycle_sources derives the issue number from the branch and reads the drain epochs /
     ledger from `git rev-parse --git-common-dir`/ai-toolkit-afk, so the #280 gathering needs a real
     git checkout (unlike the git-less hermetic `worktree` fixture).
+
+    With `make_afk=False` the afk state dir is NOT created — the land case outside a live /afk drain
+    (and CI): `_lifecycle_afk_state_dir` resolves to a path that does not exist, so the state-dir
+    branch is skipped entirely (issue #284). The second tuple element is the (non-existent) path.
     """
     wt = tmp_path / "wt"
     ait = wt / ".ai-toolkit"
@@ -555,7 +567,8 @@ def _git_worktree(tmp_path: Path, *, branch: str = "feature/280-demo") -> tuple[
         ["git", "-C", str(wt), "commit", "-q", "--allow-empty", "-m", "init"], check=True, env=env
     )
     afk = wt / ".git" / "ai-toolkit-afk"
-    afk.mkdir(parents=True)
+    if make_afk:
+        afk.mkdir(parents=True)
     return wt, afk
 
 
@@ -622,3 +635,32 @@ def test_ad_hoc_non_numeric_branch_skips_lifecycle(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "--lifecycle" not in runlog.read_text()
+
+
+def test_itemization_runs_when_no_afk_state_dir(tmp_path: Path) -> None:
+    # Regression for #284: with NO afk state dir present (every land outside a live /afk
+    # drain, and CI), write_lifecycle_sources skips the state-dir branch, so dispatched /
+    # answer / window_start are never assigned. On bash>=4.4 the unguarded reads in the JSON
+    # block tripped `set -u` (unbound variable) and self-aborted the whole ingest BEFORE the
+    # loaded-context itemization ran — the land still reported success (best-effort swallow),
+    # losing the telemetry silently. Post-fix those locals are initialized up-front, so the
+    # itemization runs and the lifecycle JSON is well-formed: only `issue` + `landed` when the
+    # state dir is absent (`filed` is omitted too — gh is unavailable in the hermetic run).
+    #
+    # NOTE: on bash 3.2 (macOS dev host) an unset `local` expands to empty without tripping
+    # `set -u`, so this passes pre-fix locally; the CI Ubuntu (bash 5.x) run is the effective
+    # backstop. The JSON-shape assertion pins the durable contract on every bash.
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+    wt, afk = _git_worktree(tmp_path, make_afk=False)
+    assert not afk.exists()  # the state-dir branch must be genuinely skipped
+
+    result = _run(wt, bindir)
+
+    assert result.returncode == 0, result.stderr
+    (tree,) = runlog.read_text().splitlines()
+    assert "langfuse_spoke_tree.py" in tree  # the itemization ran, not self-aborted
+    assert "--lifecycle" in tree
+    lifecycle = json.loads((wt / ".ai-toolkit" / "lifecycle.json").read_text())
+    assert set(lifecycle) == {"issue", "landed"}, lifecycle
+    assert lifecycle["issue"] == "280"
