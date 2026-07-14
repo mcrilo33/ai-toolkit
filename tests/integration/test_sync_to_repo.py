@@ -1225,9 +1225,11 @@ class TestConfigDrivenSync:
         env = target_repo / ".ai-toolkit" / "scripts" / "spoke-model.env"
         assert env.exists()
         text = env.read_text()
-        # Values are shell-quoted so the consumer can source/eval them safely.
-        assert "WT_AGENT_MODEL_DEFAULT='claude-opus-4-8[1m]'" in text
-        assert "WT_AGENT_EFFORT_DEFAULT=max" in text
+        # Budget routing (2026-07-15): routine spokes on Sonnet/high, no 1m tier.
+        # (The emitter shell-quotes only values that need it — the old [1m] did;
+        # a plain model id is emitted bare.)
+        assert "WT_AGENT_MODEL_DEFAULT=claude-sonnet-5" in text
+        assert "WT_AGENT_EFFORT_DEFAULT=high" in text
 
     def test_base_branch_set_from_config(self, target_repo: Path, tmp_path: Path) -> None:
         config = tmp_path / "cfg.yml"
