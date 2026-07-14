@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 from telemetry.spoke_tree.commits import (
     _COMMIT_FIELD_SEP,
     _commit_events,
+    _first_commit_at,
     _gate_park_bounds,
     _gate_park_event,
     _gate_park_ms,
@@ -43,6 +44,36 @@ class TestParseCommits:
     def test_binary_counts_contribute_zero(self) -> None:
         dump = _dump(("b" * 40, "2026-01-02T00:00:00Z", "bin", [(0, 0, "img.png")]))
         assert _parse_commits(dump.replace("0\t0", "-\t-"))[0]["additions"] == 0
+
+
+class TestFirstCommitAt:
+    def test_returns_earliest_author_time_regardless_of_order(self) -> None:
+        commits = [
+            {"authored_at": "2026-01-02T00:00:05Z"},
+            {"authored_at": "2026-01-02T00:00:01Z"},
+            {"authored_at": "2026-01-02T00:00:09Z"},
+        ]
+        assert _first_commit_at(commits) == "2026-01-02T00:00:01Z"
+
+    def test_orders_by_parsed_datetime_across_mixed_iso_forms(self) -> None:
+        commits = [
+            {"authored_at": "2026-01-02T00:00:03+00:00"},
+            {"authored_at": "2026-01-02T00:00:02Z"},
+        ]
+        assert _first_commit_at(commits) == "2026-01-02T00:00:02Z"
+
+    def test_empty_commits_yields_none(self) -> None:
+        assert _first_commit_at([]) is None
+
+    def test_unparseable_author_times_are_skipped(self) -> None:
+        commits = [{"authored_at": "not-a-date"}, {"authored_at": "2026-01-02T00:00:04Z"}]
+        assert _first_commit_at(commits) == "2026-01-02T00:00:04Z"
+
+    def test_mixed_naive_and_aware_author_times_do_not_crash(self) -> None:
+        # A naive vs aware pair is uncomparable; the loop must skip rather than raise TypeError and
+        # abort the best-effort land-time build (mirrors _earliest_after's guard).
+        commits = [{"authored_at": "2026-01-02T05:00:00"}, {"authored_at": "2026-01-02T04:00:00Z"}]
+        assert _first_commit_at(commits) == "2026-01-02T05:00:00"
 
 
 class TestCommitEvents:

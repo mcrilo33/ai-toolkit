@@ -10,10 +10,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 
+from telemetry.spoke_tree.ids import root_id_for
+from telemetry.spoke_tree.observations import Lifecycle
 from telemetry.spoke_tree.scores import (
     _step_phase,
     _step_phase_of,
     build_agent_verdict_scores,
+    build_lifecycle_stage_scores,
     build_mcp_call_scores,
     build_mcp_carry_cost_scores,
     build_mcp_def_load_scores,
@@ -23,9 +26,44 @@ from telemetry.spoke_tree.scores import (
     build_step_cost_scores,
     build_step_duration_scores,
     build_step_total_cost_scores,
+    build_window_rollup_scores,
 )
 
 SPOKE = "feature/22-demo+1700000000"
+_BASE_TS = "2026-01-02T00:00:00Z"
+
+
+def _span(name: str, start: str, end: str, **attrs: str) -> dict:
+    obs: dict[str, object] = {"name": name, "startTime": start, "endTime": end}
+    if attrs:
+        obs["metadata"] = {"attributes": attrs}
+    return obs
+
+
+def _stage_traces() -> list:
+    """Source traces carrying every stage-window span the #280 stage scores read."""
+    # The real-duration review signal is the code-review Agent container (otelcol-renamed to
+    # sub-agent:code-review); the broker's agent:review intervention spans are zero-duration.
+    review = _span(
+        "sub-agent:code-review", "2026-01-02T00:10:00Z", "2026-01-02T00:12:00Z"
+    )  # 120_000 ms
+    push = _span("spoke-push", "2026-01-02T00:20:00Z", "2026-01-02T00:22:00Z")  # 120_000 ms
+    land = _span("worktree-land", "2026-01-02T00:30:00Z", "2026-01-02T00:33:00Z")  # 180_000 ms
+    gate = _span("script:gate", "2026-01-02T00:59:00Z", "2026-01-02T01:00:00Z")  # onset = end
+    resume = {
+        "name": "llm_request",
+        "type": "GENERATION",
+        "startTime": "2026-01-02T02:00:00Z",
+        "endTime": "2026-01-02T02:00:01Z",
+    }
+    return [("tr", [review, push, land, gate, resume])]
+
+
+# dispatched 00:00:00Z; first commit 00:05:00Z -> spawn+seed = 300_000 ms.
+_DISPATCHED = 1767312000  # 2026-01-02T00:00:00Z
+_FIRST_COMMIT = [{"authored_at": "2026-01-02T00:05:00Z"}]
+# gate onset 01:00:00Z; answer attempt 01:05:00Z -> gate answer = 300_000 ms.
+_ANSWER_ATTEMPT = 1767315900  # 2026-01-02T01:05:00Z
 
 
 class TestBuildScoreEvents:
@@ -490,3 +528,153 @@ class TestBuildStepDurationScores:
             }
         ]
         assert build_step_duration_scores(SPOKE, cycle_batch, base_ts="t") == []
+
+
+class TestBuildLifecycleStageScores:
+    def _scores(self, **kw) -> dict:
+        lifecycle = Lifecycle(
+            dispatched=kw.pop("dispatched", _DISPATCHED),
+            answer_attempt=kw.pop("answer_attempt", _ANSWER_ATTEMPT),
+            **kw,
+        )
+        events = build_lifecycle_stage_scores(
+            SPOKE, _stage_traces(), _FIRST_COMMIT, lifecycle, base_ts=_BASE_TS
+        )
+        assert all(e["type"] == "score-create" for e in events)
+        return {e["body"]["name"]: e["body"]["value"] for e in events}
+
+    def test_all_five_stages_when_every_source_present(self) -> None:
+        assert self._scores() == {
+            "stage_spawn_seed_ms": 300_000,
+            "stage_gate_answer_ms": 300_000,
+            "stage_review_ms": 120_000,
+            "stage_push_gate_ms": 120_000,
+            "stage_land_ms": 180_000,
+        }
+
+    def test_absent_dispatch_epoch_skips_spawn_seed(self) -> None:
+        assert "stage_spawn_seed_ms" not in self._scores(dispatched=None)
+
+    def test_absent_answer_attempt_skips_gate_answer(self) -> None:
+        assert "stage_gate_answer_ms" not in self._scores(answer_attempt=None)
+
+    def test_first_commit_before_dispatch_skips_spawn_seed(self) -> None:
+        # A relaunch re-stamps dispatch to the LAST dispatch; an earlier dead-run commit yields a
+        # negative delta that must be dropped, not double-counted.
+        assert "stage_spawn_seed_ms" not in self._scores(dispatched=_DISPATCHED + 10_000)
+
+    def test_no_stage_spans_yields_no_scores(self) -> None:
+        events = build_lifecycle_stage_scores(
+            SPOKE, [("tr", [])], [], Lifecycle(), base_ts=_BASE_TS
+        )
+        assert events == []
+
+    def test_zero_duration_review_span_skips_the_review_stage(self) -> None:
+        # The broker's agent:review drain-intervention spans carry no --start-ms (zero duration), so
+        # a spoke with only those (no real code review) must skip stage_review_ms, not emit 0.
+        instant = _span(
+            "agent:review",
+            "2026-01-02T00:10:00Z",
+            "2026-01-02T00:10:00Z",
+            **{"workflow.phase": "review", "workflow.kind": "agent"},
+        )
+        events = build_lifecycle_stage_scores(
+            SPOKE, [("tr", [instant])], [], Lifecycle(), base_ts=_BASE_TS
+        )
+        assert all(e["body"]["name"] != "stage_review_ms" for e in events)
+
+    def test_afk_review_span_with_duration_is_counted(self) -> None:
+        # Forward-compat: if _afk_emit_span ever gains a --start-ms, its agent:review window counts.
+        timed = _span(
+            "agent:review",
+            "2026-01-02T00:10:00Z",
+            "2026-01-02T00:10:30Z",
+            **{"workflow.phase": "review", "workflow.kind": "agent"},
+        )
+        events = build_lifecycle_stage_scores(
+            SPOKE, [("tr", [timed])], [], Lifecycle(), base_ts=_BASE_TS
+        )
+        review = next(e for e in events if e["body"]["name"] == "stage_review_ms")
+        assert review["body"]["value"] == 30_000
+
+    def test_score_ids_are_deterministic_across_reruns(self) -> None:
+        first = build_lifecycle_stage_scores(
+            SPOKE,
+            _stage_traces(),
+            _FIRST_COMMIT,
+            Lifecycle(dispatched=_DISPATCHED),
+            base_ts=_BASE_TS,
+        )
+        second = build_lifecycle_stage_scores(
+            SPOKE,
+            _stage_traces(),
+            _FIRST_COMMIT,
+            Lifecycle(dispatched=_DISPATCHED),
+            base_ts=_BASE_TS,
+        )
+        assert [e["id"] for e in first] == [e["id"] for e in second]
+
+
+def _root_batch(components: dict) -> list:
+    return [
+        {
+            "type": "span-create",
+            "body": {
+                "id": root_id_for(SPOKE),
+                "metadata": {"rollup": {"duration": {"components": components}}},
+            },
+        }
+    ]
+
+
+def _stage_score_events(*values: int) -> list:
+    return [{"body": {"value": v}} for v in values]
+
+
+class TestBuildWindowRollupScores:
+    def test_issues_per_hour_and_autonomy_from_window_snapshot(self) -> None:
+        lifecycle = Lifecycle(
+            spokes_serviced=4,
+            interventions=1,
+            window_start=_DISPATCHED,
+            landed=_DISPATCHED + 18_000,
+        )
+        events = build_window_rollup_scores(SPOKE, [], [], lifecycle, base_ts=_BASE_TS)
+        scores = {e["body"]["name"]: e["body"]["value"] for e in events}
+        assert scores["issues_per_hour"] == pytest.approx(0.8)  # 4 spokes / 5h
+        assert scores["autonomy_score"] == pytest.approx(0.75)  # 1 - 1/4
+
+    def test_overhead_work_ratio_divides_stage_sum_by_work_buckets(self) -> None:
+        batch = _root_batch({"llm_request": 1000, "tool": 500, "wait": 9999, "self": 8888})
+        stage_scores = _stage_score_events(300_000)
+        events = build_window_rollup_scores(
+            SPOKE, batch, stage_scores, Lifecycle(), base_ts=_BASE_TS
+        )
+        scores = {e["body"]["name"]: e["body"]["value"] for e in events}
+        assert scores["overhead_work_ratio"] == pytest.approx(300_000 / 1500)
+
+    def test_zero_work_buckets_skips_ratio(self) -> None:
+        batch = _root_batch({"wait": 5000, "self": 3000})  # no work classes
+        events = build_window_rollup_scores(
+            SPOKE, batch, _stage_score_events(100), Lifecycle(), base_ts=_BASE_TS
+        )
+        assert all(e["body"]["name"] != "overhead_work_ratio" for e in events)
+
+    def test_no_spokes_serviced_skips_throughput_and_autonomy(self) -> None:
+        events = build_window_rollup_scores(
+            SPOKE, [], [], Lifecycle(spokes_serviced=0), base_ts=_BASE_TS
+        )
+        names = {e["body"]["name"] for e in events}
+        assert "issues_per_hour" not in names and "autonomy_score" not in names
+
+    def test_absent_ledger_counts_as_zero_interventions(self) -> None:
+        # interventions None (no ledger) -> 0 firings -> fully autonomous, matching _wd_intervention_count.
+        lifecycle = Lifecycle(spokes_serviced=3, interventions=None)
+        events = build_window_rollup_scores(SPOKE, [], [], lifecycle, base_ts=_BASE_TS)
+        autonomy = next(e["body"]["value"] for e in events if e["body"]["name"] == "autonomy_score")
+        assert autonomy == pytest.approx(1.0)
+
+    def test_non_positive_window_skips_issues_per_hour(self) -> None:
+        lifecycle = Lifecycle(spokes_serviced=2, window_start=_DISPATCHED, landed=_DISPATCHED)
+        events = build_window_rollup_scores(SPOKE, [], [], lifecycle, base_ts=_BASE_TS)
+        assert all(e["body"]["name"] != "issues_per_hour" for e in events)

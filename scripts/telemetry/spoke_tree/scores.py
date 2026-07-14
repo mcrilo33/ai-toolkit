@@ -19,10 +19,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from telemetry.spoke_tree.commits import _gate_park_ms
+from telemetry.spoke_tree.commits import _first_commit_at, _gate_park_bounds, _gate_park_ms
 from telemetry.spoke_tree.cycle import _POST_STEP_KEY, _PRE_STEP_KEY
 from telemetry.spoke_tree.ids import (
     _CYCLE_STEP_PREFIX,
@@ -37,13 +38,17 @@ from telemetry.spoke_tree.observations import (
     _SKILL_SPAN_PREFIX,
     _SUB_AGENT_PREFIX,
     IngestEvent,
+    Lifecycle,
+    Observation,
     TraceObservations,
     _attr,
+    _duration_ms,
     _is_gate_observation,
     _is_hook_event,
     _is_mcp_group,
     _is_script_node,
     _is_skill_span,
+    _iso_to_epoch,
     _llm_requests_in_order,
     _mcp_server,
     _parse_utc,
@@ -142,6 +147,33 @@ _STEP_DURATION_SCORE = "step_duration_ms"  # per View B step observation, from i
 _STEP_PHASES = ("ANCHOR", "RED", "GREEN", "REVIEW", "PUSH")
 _STEP_PHASE_OTHER = "other"
 _STEP_PHASE_RE = re.compile(rf"\b({'|'.join(_STEP_PHASES)})\b")
+
+# Per-stage overhead decomposition (#280): the wall-clock a spoke spends in each lifecycle overhead
+# stage, as trace-level NUMERIC scores chartable exactly like gate_park_ms. Each is derived from
+# already-on-disk / in-trace sources at land time (backfill), and skipped (never 0) when its source
+# is absent so "not measured" reads distinctly from a real zero.
+_STAGE_SPAWN_SEED_SCORE = "stage_spawn_seed_ms"  # dispatch epoch -> first-commit author time
+_STAGE_GATE_ANSWER_SCORE = "stage_gate_answer_ms"  # PLAN-gate park onset -> auto-answer attempt
+_STAGE_REVIEW_SCORE = "stage_review_ms"  # Σ phase:review agent + code-review span windows
+_STAGE_PUSH_GATE_SCORE = "stage_push_gate_ms"  # Σ spoke-push span windows (the pre-push test gate)
+_STAGE_LAND_SCORE = "stage_land_ms"  # the worktree-land span window (absent until the land closes)
+# The review / control-script span identities the stage windows read off the source traces.
+_REVIEW_PHASE = "review"
+_CODE_REVIEW_AGENT_PREFIX = "sub-agent:code-review"
+_PUSH_SCRIPT_NAME = "spoke-push"
+_LAND_SCRIPT_NAME = "worktree-land"
+
+# Per-drain-window rollups (#280): a snapshot of the whole drain window, read off the afk state dir
+# at THIS spoke's land time and stamped as trace-level scores on its own trace (the per-spoke
+# builder never sees sibling spokes, so a dashboard filtered to mode:afk reads the latest snapshot).
+_ISSUES_PER_HOUR_SCORE = "issues_per_hour"  # spokes serviced ÷ window hours (throughput)
+_OVERHEAD_WORK_RATIO_SCORE = "overhead_work_ratio"  # Σ overhead stages ÷ Σ work duration buckets
+_AUTONOMY_SCORE = "autonomy_score"  # 1 - interventions ÷ spokes serviced (#251 autonomy)
+_SECONDS_PER_HOUR = 3600
+# The duration-rollup component classes that count as productive WORK (the denominator of the
+# overhead-vs-work ratio): model calls, tool calls, the cycle-step spine, and turn containers. The
+# wait / script / hook / self / other buckets are overhead and excluded.
+_WORK_DURATION_CLASSES = ("llm_request", "tool", "step", "turn")
 
 # Per-rule / per-tooldef carry-cost scores (#232): what a rule or tool schema costs EVERY request
 # just by being loaded, whether it is ever invoked. A loaded prefix is cache-WRITTEN once, then
@@ -1308,3 +1340,213 @@ def build_step_duration_scores(
             )
         )
     return events
+
+
+def _is_review_span(observation: Observation) -> bool:
+    """Whether a source observation is a review span the #280 review-stage window sums.
+
+    Two shapes, per the issue's "afk-answer / code-review agent spans ... plus the spoke-side
+    code-review spans":
+
+    - the spoke-side code-review Agent container, otelcol-renamed to ``sub-agent:code-review`` —
+      the real-duration review signal today;
+    - an ``_afk_emit_span --phase review`` agent span (``agent:review``, ``workflow.phase ==
+      "review"``). These broker drain-review spans carry no ``--start-ms`` so they are zero-duration
+      instants today (contributing 0, and :func:`_sum_span_ms` skips the score when only they match),
+      but the branch keeps the window correct if that emitter ever gains a duration.
+
+    A ``workflow.kind == "step"`` cycle-step REVIEW marker is an instant, not a review window, so it
+    is excluded.
+    """
+    if (observation.get("name") or "").startswith(_CODE_REVIEW_AGENT_PREFIX):
+        return True
+    return (
+        _attr(observation, "workflow.phase") == _REVIEW_PHASE
+        and _attr(observation, "workflow.kind", "kind") != "step"
+    )
+
+
+def _sum_span_ms(
+    traces: list[TraceObservations], predicate: Callable[[Observation], bool]
+) -> int | None:
+    """Sum the wall-clock ms of every source observation matching ``predicate``, or None (#280).
+
+    None (not 0) when nothing with a measurable duration matched, so a stage skips its score rather
+    than reading a misleading zero. This covers two absence shapes uniformly: no span matched at all,
+    AND only zero-duration instants matched — e.g. an afk drain-intervention ``agent:review`` span
+    (``_afk_emit_span`` emits it with no ``--start-ms``), so a spoke that had an auto-answer but no
+    real code review skips ``stage_review_ms`` instead of emitting 0. Concurrent matching spans each
+    book their full window (span-time, matching the duration-rollup buckets).
+    """
+    total = sum(
+        _duration_ms(observation) or 0
+        for _orig_trace_id, observations in traces
+        for observation in observations
+        if predicate(observation)
+    )
+    return total if total > 0 else None
+
+
+def _spawn_seed_ms(commits: list[dict[str, Any]], lifecycle: Lifecycle) -> int | None:
+    """Return the spawn+seed stage ms: dispatch epoch -> first-commit author time, or None (#280).
+
+    None when either instant is absent, or when the first commit predates the dispatch epoch (a
+    relaunch reusing the ``spoke_run_id`` re-stamps the dispatch epoch to the LAST dispatch, so an
+    earlier dead-run commit yields a negative delta — dropped, not double-counted; the wall-clock is
+    then read from the last dispatch, reconciled against ``relaunch_count``).
+    """
+    dispatched = lifecycle.dispatched
+    first_commit = _iso_to_epoch(_first_commit_at(commits))
+    if dispatched is None or first_commit is None or first_commit < dispatched:
+        return None
+    return (first_commit - dispatched) * 1000
+
+
+def _gate_answer_ms(traces: list[TraceObservations], lifecycle: Lifecycle) -> int | None:
+    """Return the PLAN-gate answer-latency ms: park onset -> auto-answer attempt, or None (#280).
+
+    Extends the trace-level ``gate_park_ms`` window (:func:`_gate_park_bounds`, the park onset) with
+    the ``answer-attempt-<N>.epoch`` the drain stamps when it delivers a PLAN-gate answer. None when
+    the spoke never parked at a gate, no answer was attempted, or the attempt predates the park
+    onset (an unrelated stale epoch).
+    """
+    bounds = _gate_park_bounds(traces)
+    answer = lifecycle.answer_attempt
+    if bounds is None or answer is None:
+        return None
+    onset = _iso_to_epoch(bounds[0])
+    if onset is None or answer < onset:
+        return None
+    return (answer - onset) * 1000
+
+
+def build_lifecycle_stage_scores(
+    spoke_run_id: str,
+    traces: list[TraceObservations],
+    commits: list[dict[str, Any]],
+    lifecycle: Lifecycle,
+    *,
+    base_ts: str,
+) -> list[IngestEvent]:
+    """Build the five per-stage overhead scores decomposing a spoke's wall-clock (#280).
+
+    Each stage is a trace-level NUMERIC score chartable like ``gate_park_ms``, derived at land time
+    from already-on-disk / in-trace sources (backfill — no broker change):
+
+    - ``stage_spawn_seed_ms`` — dispatch epoch -> first-commit author time (:func:`_spawn_seed_ms`).
+    - ``stage_gate_answer_ms`` — PLAN-gate park onset -> auto-answer attempt (:func:`_gate_answer_ms`).
+    - ``stage_review_ms`` — Σ the review span windows (:func:`_is_review_span`).
+    - ``stage_push_gate_ms`` — Σ the ``spoke-push`` span windows (the pre-push test gate).
+    - ``stage_land_ms`` — the ``worktree-land`` span window (absent until the land span closes, so
+      usually skipped at land time and captured on a later backfill re-run).
+
+    A stage whose source is absent is SKIPPED (never emitted as 0) so "not measured" reads
+    distinctly from a real zero, matching the #231 graceful-skip idiom. All ids derive from the
+    spoke run id, so a rerun overwrites the same scores (idempotent).
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids).
+        traces: The source traces (review / push / land / gate-park windows read here).
+        commits: The parsed commit records (for the first-commit author time).
+        lifecycle: The gathered per-issue sources (dispatch / answer-attempt epochs).
+        base_ts: ISO timestamp stamped on every score event.
+
+    Returns:
+        The ``score-create`` events, one per stage whose source was present (empty when none).
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    stages: dict[str, int | None] = {
+        _STAGE_SPAWN_SEED_SCORE: _spawn_seed_ms(commits, lifecycle),
+        _STAGE_GATE_ANSWER_SCORE: _gate_answer_ms(traces, lifecycle),
+        _STAGE_REVIEW_SCORE: _sum_span_ms(traces, _is_review_span),
+        _STAGE_PUSH_GATE_SCORE: _sum_span_ms(
+            traces, lambda o: (o.get("name") or "") == _PUSH_SCRIPT_NAME
+        ),
+        _STAGE_LAND_SCORE: _sum_span_ms(
+            traces, lambda o: (o.get("name") or "") == _LAND_SCRIPT_NAME
+        ),
+    }
+    return [
+        _score_event(spoke_run_id, name=name, value=value, trace_id=trace_id, base_ts=base_ts)
+        for name, value in stages.items()
+        if value is not None
+    ]
+
+
+def _root_duration_components(spoke_run_id: str, batch: list[IngestEvent]) -> dict[str, float]:
+    """Return the View A root's ``rollup.duration.components`` map, or ``{}`` (#280).
+
+    ``_apply_container_rollups`` stamps the per-class exclusive-time split on the synthetic root; a
+    batch built before that pass (or a malformed one) yields ``{}`` rather than crashing.
+    """
+    root_id = root_id_for(spoke_run_id)
+    for event in batch:
+        if event["body"].get("id") != root_id:
+            continue
+        duration = ((event["body"].get("metadata") or {}).get("rollup") or {}).get("duration") or {}
+        components = duration.get("components") or {}
+        return components if isinstance(components, dict) else {}
+    return {}
+
+
+def build_window_rollup_scores(
+    spoke_run_id: str,
+    batch: list[IngestEvent],
+    stage_scores: list[IngestEvent],
+    lifecycle: Lifecycle,
+    *,
+    base_ts: str,
+) -> list[IngestEvent]:
+    """Build the per-drain-window rollup scores, snapshotted at this spoke's land time (#280).
+
+    The per-spoke builder never sees sibling spokes, so the window rollups are read off the afk
+    state dir the shell snapshotted (dispatch-epoch count + intervention-ledger line count) and
+    stamped as trace-level scores on THIS spoke's own trace; a dashboard filtered to ``mode:afk``
+    reads the latest (fullest) snapshot per window:
+
+    - ``issues_per_hour`` — ``spokes_serviced ÷ window_hours`` (window = earliest dispatch epoch ->
+      landed). Skipped when the window is non-positive or the count is absent.
+    - ``overhead_work_ratio`` — Σ the five overhead stage scores ÷ Σ the root's WORK duration
+      components (:data:`_WORK_DURATION_CLASSES`). Skipped when the work sum is 0 (no divide-by-zero).
+    - ``autonomy_score`` — ``max(0, 1 - interventions ÷ spokes_serviced)`` (#251). Absent ledger
+      counts as 0 firings (an unwritten ledger is "no interventions", matching ``_wd_intervention_count``);
+      skipped only when no spoke was serviced.
+
+    All ids derive from the spoke run id (idempotent reruns).
+
+    Args:
+        spoke_run_id: The spoke run identifier (keys the deterministic score ids).
+        batch: The assembled View A events (the root's work duration components read here).
+        stage_scores: The stage score events from :func:`build_lifecycle_stage_scores` (the ratio
+            numerator).
+        lifecycle: The gathered window snapshot (spokes serviced / interventions / window bounds).
+        base_ts: ISO timestamp stamped on every score event.
+
+    Returns:
+        The ``score-create`` events for each rollup whose inputs resolved (empty when none).
+    """
+    trace_id = trace_id_for(spoke_run_id)
+    values: dict[str, float] = {}
+    spokes = lifecycle.spokes_serviced
+    if spokes and lifecycle.landed is not None and lifecycle.window_start is not None:
+        window_s = lifecycle.landed - lifecycle.window_start
+        if window_s > 0:
+            values[_ISSUES_PER_HOUR_SCORE] = spokes / (window_s / _SECONDS_PER_HOUR)
+    overhead_ms = sum(event["body"]["value"] for event in stage_scores)
+    work_ms = sum(
+        float(v)
+        for cls, v in _root_duration_components(spoke_run_id, batch).items()
+        if cls in _WORK_DURATION_CLASSES and isinstance(v, (int, float))
+    )
+    # Skip when NO overhead stage was measured (``not stage_scores``) as well as on a zero work
+    # denominator, so a ratio is never a misleading 0.0 that reads as "0% overhead" when it is really
+    # "overhead not measured" — the same skip-vs-real-zero care the stage scores take.
+    if work_ms > 0 and stage_scores:
+        values[_OVERHEAD_WORK_RATIO_SCORE] = overhead_ms / work_ms
+    if spokes:
+        interventions = lifecycle.interventions or 0
+        values[_AUTONOMY_SCORE] = max(0.0, 1 - interventions / spokes)
+    return [
+        _score_event(spoke_run_id, name=name, value=value, trace_id=trace_id, base_ts=base_ts)
+        for name, value in values.items()
+    ]

@@ -12,14 +12,20 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 from telemetry.request_body import parse_request_body
+from telemetry.spoke_tree.commits import _first_commit_at
 from telemetry.spoke_tree.ids import _copy_id
 from telemetry.spoke_tree.loaded_context import find_request_files
 from telemetry.spoke_tree.observations import (
     IngestEvent,
+    Lifecycle,
     TraceObservations,
+    _epoch_to_iso,
     _llm_requests_in_order,
+    _normalize_iso,
+    _ready_at,
 )
 
 logger = logging.getLogger("langfuse_spoke_tree")
@@ -166,6 +172,69 @@ def apply_outcome_tag(batch: list[IngestEvent], outcome: str | None) -> None:
     if trace is None:
         return  # defensive: build_batch always emits one
     trace["body"].setdefault("metadata", {})["outcome"] = outcome
+
+
+# The per-issue lifecycle timeline legs, in chronological order (#280). Stamped as an ordered
+# ``metadata.lifecycle`` mapping on both views' trace so a dashboard reads the five instants
+# ``filed → dispatched → first-commit → ready → landed`` as one row. Any leg whose source was
+# absent is omitted (never a wrong/guessed value), so "no dispatch epoch" reads distinctly from a
+# zero.
+_LIFECYCLE_LEGS = ("filed", "dispatched", "first_commit", "ready", "landed")
+
+
+def build_lifecycle_timeline(
+    lifecycle: Lifecycle,
+    commits: list[dict[str, Any]],
+    traces: list[TraceObservations],
+) -> dict[str, str]:
+    """Assemble the ``filed → dispatched → first-commit → ready → landed`` timeline (ISO) (#280).
+
+    Each leg is sourced independently and an absent one is omitted (graceful skip, never guessed):
+    ``filed`` from the ``gh createdAt`` the shell gathered, ``dispatched`` / ``landed`` from the
+    on-disk epochs (unix seconds -> ISO), ``first_commit`` from the earliest commit's author time
+    (:func:`~telemetry.spoke_tree.commits._first_commit_at`), and ``ready`` from the completion
+    ``spoke-ready`` span already in the traces (:func:`~telemetry.spoke_tree.observations._ready_at`).
+
+    Args:
+        lifecycle: The gathered per-issue sources (any field may be None).
+        commits: The parsed ``git log --numstat`` records (for the first-commit leg).
+        traces: The source traces (for the ready leg).
+
+    Returns:
+        An ordered mapping of the present legs to their ISO instants (empty when none resolved).
+    """
+    resolved: dict[str, str | None] = {
+        "filed": _normalize_iso(lifecycle.filed),
+        "dispatched": _epoch_to_iso(lifecycle.dispatched),
+        "first_commit": _normalize_iso(_first_commit_at(commits)),
+        "ready": _normalize_iso(_ready_at(traces)),
+        "landed": _epoch_to_iso(lifecycle.landed),
+    }
+    return {leg: value for leg in _LIFECYCLE_LEGS if (value := resolved[leg])}
+
+
+def apply_lifecycle_metadata(
+    batch: list[IngestEvent], cycle_batch: list[IngestEvent], timeline: dict[str, str]
+) -> None:
+    """Stamp the per-issue lifecycle ``timeline`` onto both views' trace metadata (#280).
+
+    Surfaces as ``metadata.lifecycle`` on each view's ``trace-create`` event so the five-instant
+    timeline (:func:`build_lifecycle_timeline`) is a direct trace-metadata lookup, the same idiom
+    :func:`apply_outcome_tag` uses. A None/empty timeline (a pre-#280 spoke, or every source absent)
+    leaves both traces untouched rather than stamping an empty map.
+
+    Args:
+        batch: The assembled View A events; its ``trace-create`` is mutated in place.
+        cycle_batch: The assembled View B events; its ``trace-create`` is mutated in place.
+        timeline: The resolved lifecycle legs (present-only), from :func:`build_lifecycle_timeline`.
+    """
+    if not timeline:
+        return
+    for events in (batch, cycle_batch):
+        trace = next((event for event in events if event.get("type") == "trace-create"), None)
+        if trace is None:
+            continue  # defensive: build_batch always emits one
+        trace["body"].setdefault("metadata", {})["lifecycle"] = dict(timeline)
 
 
 def apply_request_body_metadata(
