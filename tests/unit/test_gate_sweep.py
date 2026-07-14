@@ -398,6 +398,38 @@ def test_run_red_under_concurrent_drain_still_files_issue(repo: Path, tmp_path: 
     assert "tier=testmon\n" in _stamp_text(repo)  # red keeps the pruned stamp
 
 
+def test_run_suite_parallelizes_the_full_sweep(repo: Path, tmp_path: Path) -> None:
+    # Part 1 (issue #276): the post-land full sweep is embarrassingly parallel, so
+    # run_suite threads `-n auto` onto the real-runner invocation. Assert the suite
+    # actually saw it (an argv-logging pytest stub on the real-runner path).
+    _mint(repo, "testmon")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    argv_log = tmp_path / "argv.log"
+    pytest_stub = bindir / "pytest"
+    pytest_stub.write_text(
+        "#!/bin/sh\n"
+        'case "$1" in --help|-h) echo "usage: pytest"; exit 0 ;; '
+        '--version|-V) echo "pytest 9.9"; exit 0 ;; esac\n'
+        f'printf "%s\\n" "$*" >> "{argv_log}"\n'
+        "exit 0\n"
+    )
+    pytest_stub.chmod(0o755)
+    env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
+
+    subprocess.run(
+        ["bash", str(GATE_SWEEP), "--run", _head(repo)],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+
+    assert argv_log.exists(), "the real-runner sweep never invoked pytest"
+    assert "-n auto" in argv_log.read_text()  # the full sweep, parallelized
+
+
 # --- --run: one sweep at a time per checkout (lock + newest-wins queue) ------------
 
 

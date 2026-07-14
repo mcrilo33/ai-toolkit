@@ -1513,3 +1513,82 @@ def test_missing_lib_ignores_exempt_entries_and_runs_full(repo: Path, tmp_path: 
 
     assert proc.returncode == 0, proc.stderr
     assert "RUN \n" in _runlog(runlog)  # FULL, never a silent exempt skip
+
+
+# ── Part 1 (issue #276): pytest-xdist on the non-testmon legs ────────────────────
+# The FULL suite and the SELECTED mapped-files leg are I/O-bound and embarrassingly
+# parallel, so test-select.sh threads `-n auto` onto them. The `--testmon` legs stay
+# single-process — testmon serializes a single-writer DB and does not compose with
+# xdist (`pytest --testmon -n auto` is unsupported). The runlog records each leg's
+# argv as `RUN <args>`, so these pin exactly which legs got parallelized.
+
+
+def test_full_suite_runs_under_xdist(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    tip = _commit(repo, {"scripts/thing.sh": "echo hi\n"})  # unmapped shell → FULL
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN -n auto\n" in _runlog(runlog)  # the full suite, parallelized
+
+
+def test_python_without_testmon_full_suite_runs_under_xdist(repo: Path, tmp_path: Path) -> None:
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})  # python, but no testmon → FULL
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=False)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN -n auto\n" in _runlog(runlog)
+
+
+def test_selected_mapped_leg_runs_under_xdist(repo: Path, tmp_path: Path) -> None:
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
+    tip = _commit(repo, {"scripts/do.sh": "echo hi\n"})  # mapped shell → SELECTED
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "RUN -n auto tests/unit/test_do.py\n" in _runlog(runlog)
+
+
+def test_selected_mixed_leg_parallelizes_mapped_but_not_testmon(repo: Path, tmp_path: Path) -> None:
+    # A mixed mapped-shell + python diff: the explicit mapped-files leg runs under
+    # `-n auto`, but the `--testmon` leg for the python part stays single-process.
+    _write_ref_test(repo, "tests/unit/test_do.py", "do.sh")
+    base = _commit(repo, {}, "test: seed referencing tests")
+    tip = _commit(repo, {"scripts/do.sh": "echo hi\n", "pkg/mod.py": "x = 1\n"})
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    log = _runlog(runlog)
+    assert "RUN -n auto tests/unit/test_do.py\n" in log  # mapped leg parallelized …
+    # … the testmon leg is NOT — verbatim, no -n auto spliced in (issue #270 dedup form)
+    assert "RUN --testmon --ignore=tests/unit/test_do.py\n" in log
+
+
+def test_testmon_leg_is_never_parallelized(repo: Path, tmp_path: Path) -> None:
+    # Regression guard: a python-only diff runs `pytest --testmon` and never gains
+    # `-n auto` (testmon's single-writer DB does not compose with xdist).
+    base = _rev(repo)
+    tip = _commit(repo, {"pkg/mod.py": "x = 1\n"})  # python-only → testmon
+    runlog = tmp_path / "run.log"
+    _make_pytest_stub(tmp_path / "bin", runlog, testmon=True)
+
+    proc = _run_select(repo, _stdin(tip, base), tmp_path / "bin")
+
+    assert proc.returncode == 0, proc.stderr
+    log = _runlog(runlog)
+    assert "RUN --testmon\n" in log  # the testmon leg ran …
+    assert "-n auto" not in log  # … and was never parallelized
