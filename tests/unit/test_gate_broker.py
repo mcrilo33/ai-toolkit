@@ -4006,6 +4006,8 @@ def test_classify_permission_approves_marker_emission(
         "bash scripts/spoke-ready.sh --gate $(rm -rf ~)",  # command substitution
         "bash scripts/spoke-ready.sh --gate 270 > /etc/afk_probe",  # redirection
         "bash scripts/spoke-ready.sh --gate 270 --plan-file /etc/passwd",  # out-of-tree plan-file
+        "bash scripts/spoke-ready.sh --gate 270 --plan-file .env",  # in-tree SECRET plan-file
+        "bash scripts/spoke-ready.sh --gate 270 --plan-file=deploy.pem",  # secret via = form
         "bash scripts/spoke-ready.sh --gate 270; rm -rf .",  # a risky tail segment
     ],
 )

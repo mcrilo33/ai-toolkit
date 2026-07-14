@@ -549,6 +549,8 @@ try:
                 # A gate emission that resolved with is_error (a hook DENY or a script failure)
                 # never established a park (issue #271): un-latch the plan so a spoke that keeps
                 # working is read as busy, not `waiting` — the phantom park the watchdog answered.
+                # This reads Claude Code's current shape: a failed/denied tool_use surfaces as a
+                # user-turn tool_result carrying the tool_use_id and a truthy is_error.
                 for b in content:
                     if (isinstance(b, dict) and b.get("type") == "tool_result"
                             and b.get("tool_use_id") in gate_ids and b.get("is_error")):
@@ -1828,13 +1830,22 @@ _permission_seg_marker_ok() {
     tok="${rest%%[[:space:]]*}"                   # first token
     rest="${rest#"$tok"}"
     if [ "$val_pending" = plan ]; then           # a separate-token --plan-file value
+      # In-tree AND not secret-like: spoke-ready.sh reads --plan-file into the pushed tag body,
+      # so a `--plan-file .env` would leak an in-tree secret to the remote (same guard the
+      # mutation/exec lanes apply to their path tokens).
+      _broker_seg_secretlike "$tok" && return 1
       _broker_resolve_in_roots "$tok" "$cwd" "$wt" "$slug" "$tasks" >/dev/null || return 1
       val_pending=""; continue
     fi
     case "$tok" in
-      -m | --message | --message=*) return 0 ;;   # free-form reason tail — accept the remainder
+      # A -m/--message reason is free-form: accept the remainder (the segment-level metachar
+      # reject already fired). spoke-ready.sh rejects -m together with --plan-file, so a
+      # --plan-file smuggled AFTER -m never reaches its file read (usage error) — but that
+      # exclusion lives downstream; do not add a --plan-file after -m expecting this lane to vet it.
+      -m | --message | --message=*) return 0 ;;
       --plan-file) val_pending=plan ;;
       --plan-file=*)
+        _broker_seg_secretlike "${tok#--plan-file=}" && return 1
         _broker_resolve_in_roots "${tok#--plan-file=}" "$cwd" "$wt" "$slug" "$tasks" \
           >/dev/null || return 1 ;;
       --gate | --accept | --blocked | --ready | -h | --help) ;;

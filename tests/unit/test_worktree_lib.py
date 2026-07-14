@@ -2083,11 +2083,12 @@ def test_wt_marker_script_dir_prefers_tracked_scripts(tmp_path: Path) -> None:
 
 
 def test_wt_marker_script_dir_falls_back_to_ai_toolkit(tmp_path: Path) -> None:
-    # A synced target has no tracked scripts/spoke-ready.sh; the emitters are synced into the
-    # gitignored .ai-toolkit/scripts/.
+    # A synced target's shape: NO tracked scripts/spoke-ready.sh (the emitters are synced into
+    # the gitignored .ai-toolkit/scripts/). The fallback is UNCONDITIONAL — the function keys
+    # only off the absence of scripts/spoke-ready.sh, so no .ai-toolkit/scripts/ file is seeded
+    # here (that would falsely imply the function verifies it).
     root = tmp_path / "target"
-    (root / ".ai-toolkit" / "scripts").mkdir(parents=True)
-    (root / ".ai-toolkit" / "scripts" / "spoke-ready.sh").write_text("#!/usr/bin/env bash\n")
+    (root / "src").mkdir(parents=True)  # a non-empty repo dir, but no tracked scripts/
 
     result = _call(f"wt_marker_script_dir '{root}'")
 

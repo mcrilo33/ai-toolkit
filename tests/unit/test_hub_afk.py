@@ -6240,6 +6240,16 @@ def test_kickoff_for_marker_path_matches_repo_layout() -> None:
     assert ".ai-toolkit/scripts/spoke-push.sh" not in result.stdout, result.stdout
 
 
+def test_finish_up_prompt_marker_path_matches_repo_layout() -> None:
+    # #271: the #256 finish-up nudge must name the marker path that EXISTS in the worktree too —
+    # a hardcoded `.ai-toolkit/scripts/spoke-push.sh` hands an ai-toolkit spoke a non-runnable
+    # path (deny-wall approves it textually, then exec fails), the exact bug #271 fixes.
+    result = _call("_afk_finish_up_prompt 42")
+
+    assert "scripts/spoke-push.sh --ready 42" in result.stdout, result.stdout
+    assert ".ai-toolkit/scripts/spoke-push.sh" not in result.stdout, result.stdout
+
+
 # ── ST6: dispatch-failure ceiling ─────────────────────────────────────────────
 
 

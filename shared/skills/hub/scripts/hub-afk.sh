@@ -862,12 +862,17 @@ EOF
 # whose task ledger is near-complete: it is essentially DONE, so it is told to do the LAST step
 # (verify committed + pushed, then emit ready / the final push), NOT to start fresh work.
 _afk_finish_up_prompt() {
-  local issue="$1"
+  local issue="$1" marker_dir
+  # Name the marker-emitter path that EXISTS in the spoke's worktree (#271): `scripts` in the
+  # ai-toolkit checkout, `.ai-toolkit/scripts` in a synced target — probed off the hub layout the
+  # spoke shares. A hardcoded `.ai-toolkit/scripts/` here hands an ai-toolkit spoke a path the
+  # deny-wall approves (textually in-tree) but that then fails to exec — the #271 failure mode.
+  marker_dir="$(wt_marker_script_dir "${_AFK_TOPLEVEL:-.}")"
   cat <<EOF
 You have run past the AFK time ceiling, but your task ledger shows you are essentially DONE --
 almost every todo is complete and nothing is blocking you. Do the LAST step now: make sure your
 work is committed and pushed, then emit the ready marker
-(bash .ai-toolkit/scripts/spoke-push.sh --ready $issue) once the issue's acceptance criteria are
+(bash ${marker_dir}/spoke-push.sh --ready $issue) once the issue's acceptance criteria are
 all met. If a final push is still pending, push it first. Do NOT start new work and do NOT
 self-land -- the hub lands #$issue.
 EOF
