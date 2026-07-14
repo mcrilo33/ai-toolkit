@@ -270,6 +270,58 @@ def test_run_red_sweep_does_not_refresh_the_baseline(repo: Path, tmp_path: Path)
     assert not _baseline(repo).exists(), "a red sweep must not refresh the baseline"
 
 
+def test_run_green_sweep_replaces_baseline_atomically(repo: Path, tmp_path: Path) -> None:
+    # Atomic publish (#276 review): a refresh over an existing baseline replaces its
+    # content via temp+mv and leaves no partial/temp file behind, so a concurrent
+    # worktree-new `cp` reader sees only a complete old-or-new inode.
+    _mint(repo, "testmon")
+    baseline = _baseline(repo)
+    baseline.parent.mkdir(parents=True, exist_ok=True)
+    baseline.write_text("OLD")
+    runner_log = tmp_path / "runner.log"
+
+    proc, _ = _run_sweep(
+        repo,
+        tmp_path,
+        "--run",
+        _head(repo),
+        cmd=_runner_cmd(runner_log),
+        testmon_cmd='printf "NEW" > "$TESTMON_DATAFILE"',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert _wait_for(baseline)
+    assert baseline.read_text() == "NEW"
+    leftovers = list(baseline.parent.glob(".testmondata-baseline.*"))
+    assert leftovers == [], f"temp build files leaked: {leftovers}"
+
+
+def test_baseline_refresh_failure_keeps_old_baseline(repo: Path, tmp_path: Path) -> None:
+    # A failed baseline BUILD (nonzero exit) on an otherwise-green sweep must never
+    # publish a partial DB: the old baseline stays, the temp is cleaned, and the sweep
+    # still returns 0 (best-effort — a refresh failure never fails the land tail).
+    _mint(repo, "testmon")
+    baseline = _baseline(repo)
+    baseline.parent.mkdir(parents=True, exist_ok=True)
+    baseline.write_text("OLD")
+    runner_log = tmp_path / "runner.log"
+
+    proc, _ = _run_sweep(
+        repo,
+        tmp_path,
+        "--run",
+        _head(repo),
+        cmd=_runner_cmd(runner_log),
+        testmon_cmd='printf "PARTIAL" > "$TESTMON_DATAFILE"; exit 1',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    time.sleep(0.3)
+    assert baseline.read_text() == "OLD", "a failed build must not publish over the baseline"
+    leftovers = list(baseline.parent.glob(".testmondata-baseline.*"))
+    assert leftovers == [], f"temp build files leaked after a failed build: {leftovers}"
+
+
 def test_run_never_sweeps_a_full_stamped_tree(repo: Path, tmp_path: Path) -> None:
     _mint(repo, "full")
     runner_log = tmp_path / "runner.log"

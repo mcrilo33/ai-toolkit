@@ -298,16 +298,32 @@ ${fails}
 # `pytest --testmon` (relocated with TESTMON_DATAFILE so the hub's own .testmondata is
 # untouched) so the next fresh worktree copies it and runs a first-push testmon
 # INCREMENTAL instead of the full-suite seed. SERIAL — testmon serializes a single-writer
-# DB and does not compose with xdist, so this leg never gets `-n auto`. Best-effort: any
-# failure is logged and leaves the previous baseline in place (a stale baseline degrades to
-# a full seed at spawn, never a wrong-green — testmon's environment row re-runs full on a
-# dep mismatch). GATE_SWEEP_TESTMON_CMD stubs the build for tests (mirrors GATE_SWEEP_CMD).
+# DB and does not compose with xdist, so this leg never gets `-n auto`.
+#
+# ATOMIC PUBLISH (#276 review): build into a sibling temp seeded from the current baseline
+# (keeps the rebuild incremental), then `mv` it over the baseline. worktree-new.sh copies
+# the baseline with a bare `cp` and can run concurrently under an /afk drain; an in-place
+# rewrite could hand that reader a torn DB mid-checkpoint. The temp+mv means a reader sees
+# only the complete old inode or the complete new one. testmon checkpoints its WAL into the
+# main file on connection close, so the published file needs no -wal/-shm sidecar.
+#
+# The refresh runs the suite WITHOUT the #267 observe-only tripwire that wraps the verdict
+# run: the verdict pass already observed this exact (green, clean) tree moments earlier, so
+# re-wrapping would only re-log a ref escape — not prevent one — for a best-effort DB build.
+# It runs inline in the worker, so the first-ever (full) build doubles the worker's runtime;
+# subsequent refreshes are incremental (fast). Best-effort: any failure is logged and leaves
+# the previous baseline untouched (a stale/missing baseline degrades to a full seed at spawn,
+# never a wrong-green — testmon's environment row re-runs full on a dep mismatch).
+# GATE_SWEEP_TESTMON_CMD stubs the build for tests (mirrors GATE_SWEEP_CMD).
 refresh_testmon_baseline() {
-  local tree="$1" baseline out rc=0
+  local tree="$1" baseline work out rc=0
   baseline="$(baseline_path)" || { log "baseline refresh: cannot resolve git-common-dir — skipped"; return 0; }
   out="$(mktemp "${TMPDIR:-/tmp}/gate-sweep-tm.XXXXXX")" || return 0
+  # The build temp is a SIBLING of the baseline (same .git dir → same filesystem → atomic mv).
+  work="$(mktemp "${baseline}.XXXXXX")" || { rm -f "$out"; return 0; }
+  [ -r "$baseline" ] && cp "$baseline" "$work" 2>/dev/null || true   # seed → incremental rebuild
   if [ -n "${GATE_SWEEP_TESTMON_CMD:-}" ]; then
-    TESTMON_DATAFILE="$baseline" bash -c "$GATE_SWEEP_TESTMON_CMD" > "$out" 2>&1 || rc=$?
+    TESTMON_DATAFILE="$work" bash -c "$GATE_SWEEP_TESTMON_CMD" > "$out" 2>&1 || rc=$?
   else
     # Resolve the runner if run_suite did not already (e.g. the GATE_SWEEP_CMD path).
     if [ -z "${RUNNER_ARR+x}" ]; then
@@ -316,10 +332,10 @@ refresh_testmon_baseline() {
       # shellcheck disable=SC1090
       source "$utils" 2>/dev/null || true
       if ! command -v detect_pytest >/dev/null 2>&1; then
-        log "baseline refresh: no runner resolvable — skipped"; rm -f "$out"; return 0
+        log "baseline refresh: no runner resolvable — skipped"; rm -f "$out" "$work"; return 0
       fi
       runner="$(detect_pytest "." || true)"
-      [ -n "$runner" ] || { log "baseline refresh: no pytest — skipped"; rm -f "$out"; return 0; }
+      [ -n "$runner" ] || { log "baseline refresh: no pytest — skipped"; rm -f "$out" "$work"; return 0; }
       read -r -a RUNNER_ARR <<< "$runner"
     fi
     # testmon must be present; capture --help then case-match (a piped `grep -q` would
@@ -328,15 +344,16 @@ refresh_testmon_baseline() {
     help="$("${RUNNER_ARR[@]}" --help 2>/dev/null || true)"
     case "$help" in
       *--testmon*) ;;
-      *) log "baseline refresh: runner lacks testmon — skipped"; rm -f "$out"; return 0 ;;
+      *) log "baseline refresh: runner lacks testmon — skipped"; rm -f "$out" "$work"; return 0 ;;
     esac
-    TESTMON_DATAFILE="$baseline" "${RUNNER_ARR[@]}" --testmon > "$out" 2>&1 || rc=$?
+    TESTMON_DATAFILE="$work" "${RUNNER_ARR[@]}" --testmon > "$out" 2>&1 || rc=$?
   fi
-  if [ "$rc" -eq 0 ]; then
+  if [ "$rc" -eq 0 ] && mv -f "$work" "$baseline" 2>/dev/null; then
     log "baseline refresh: .testmondata-baseline updated for tree $tree"
   else
     log "baseline refresh FAILED (exit $rc) for tree $tree — previous baseline kept:"
     tail -n 20 "$out" >> "$LOG" 2>/dev/null || true
+    rm -f "$work"
   fi
   rm -f "$out"
 }
