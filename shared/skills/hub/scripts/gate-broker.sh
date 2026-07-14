@@ -454,19 +454,29 @@ _broker_present_qcm() {
 # and fix directions; the spoke's posted plan is then a near-restatement of that same body,
 # and spending a full high-effort run_answerer round trip (3-5 min, plus the #265/#271
 # park-window watchdog exposure) on it adds nothing. When the posted plan is substantively a
-# RESTATEMENT of the issue body we WAIVE the reasoner and auto-approve here — recording the
-# waive on all three audit surfaces (journal + gh comment, a distinct fast-path span, and the
-# hub-status waived-gates ledger that reads the journal) so the hub stays aware of every waive.
-# Anything that is NOT a confident restatement falls through to the full reasoner unchanged:
-# the fast path is a pure optimization, never a worse outcome. Disable with AFK_FASTPATH=0.
+# RESTATEMENT of the issue body we WAIVE the reasoner and auto-approve here, and record the
+# waive so the hub stays AWARE of it: a park:gate journal line + gh issue comment (the durable
+# record the hub-status waived-gates ledger surfaces and that survives the land) and a distinct
+# fast-path span. Anything that is NOT a confident restatement falls through to the full reasoner
+# unchanged. Disable with AFK_FASTPATH=0.
+#
+# HONEST TRADE-OFF: the coverage metric is a bag-of-words CONTAINMENT proxy (does the plan say
+# anything the body did not?), so it detects "the plan adds new design" but NOT "the plan OMITS
+# a required step" — a plan that silently drops a body requirement can still score high and be
+# waived. The reasoner would have flagged the omission; the fast path trades that check for the
+# saved round trip. The downstream RED/GREEN/REVIEW + acceptance gates remain the backstop that
+# a plan-gate approval never was the only guard against an incomplete implementation.
 
 # _broker_try_fastpath_gate <wt> <issue> <plan> <mode> -> rc 0 when the gate was WAIVED
-# (auto-approved + injected + recorded — the caller returns), rc 1 when the plan is not a
-# restatement OR the inject failed (the caller falls through to run_answerer). Synchronous (one
-# gh call + a local python coverage check), so the minutes-long staleness the reasoner path
-# guards against does not apply — no _still_parked_same recompute needed.
+# (auto-approved + injected + recorded — the caller returns), rc 1 when the fast path does not
+# apply (attended mode, disabled, empty plan, not a restatement, no pane, or the inject failed —
+# the caller falls through to run_answerer). UNATTENDED-only: an attended reviewer chose to
+# watch the drain, so they get the reasoner's plan assessment (or the QCM), never a silent waive.
+# Synchronous (one gh call + a local python coverage check), so the minutes-long staleness the
+# reasoner path guards against does not apply — no _still_parked_same recompute needed.
 _broker_try_fastpath_gate() {
   local wt="$1" issue="$2" plan="$3" mode="$4" body cov target
+  [ "$mode" = unattended ] || return 1
   [ "${AFK_FASTPATH:-1}" != 0 ] || return 1
   [ -n "$plan" ] || return 1
   body="$(_broker_issue_body "$issue")"

@@ -580,7 +580,9 @@ body = toks(os.environ.get("_AFK_BODY", ""))
 thresh = envnum("AFK_FASTPATH_COVERAGE", 0.85)
 min_toks = envnum("AFK_FASTPATH_MIN_TOKENS", 12)
 
-cov = (len(plan & body) / len(plan)) if plan else 0.0
+# Round BEFORE both the echo and the gate so the recorded number can never disagree with the
+# decision at the boundary (0.846 must not print "0.85" while the reasoner actually ran).
+cov = round((len(plan & body) / len(plan)) if plan else 0.0, 2)
 sys.stdout.write(f"{cov:.2f}")
 sys.exit(0 if (len(plan) >= min_toks and cov >= thresh) else 1)
 PYEOF

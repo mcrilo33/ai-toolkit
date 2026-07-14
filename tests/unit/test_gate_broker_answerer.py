@@ -2367,6 +2367,56 @@ def test_broker_service_gate_reasoner_runs_on_divergent_plan(
     assert canary.exists(), "a divergent plan must fall through to the full reasoner"
 
 
+def test_broker_service_gate_fastpath_disabled_falls_through(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # AFK_FASTPATH=0 is the documented kill switch: even a restating plan runs the full reasoner.
+    canary = tmp_path / "reasoner-ran"
+    env = _fastpath_env(
+        spoke_repo,
+        tmp_path,
+        plan=_RESTATING_PLAN,
+        body=_RESTATE_BODY,
+        canary=canary,
+        extra={"AFK_FASTPATH": "0"},
+    )
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert canary.exists(), "AFK_FASTPATH=0 must disable the waive and run the reasoner"
+
+
+def test_broker_service_gate_fastpath_inject_failure_falls_through(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A fast-path whose approve inject cannot be confirmed must NOT swallow the gate — it falls
+    # through to the full reasoner. Model a broken pane: list-panes maps it, but the submitting
+    # Enter never advances the transcript, so inject_and_verify fails.
+    canary = tmp_path / "reasoner-ran"
+    env = _fastpath_env(
+        spoke_repo,
+        tmp_path,
+        plan=_RESTATING_PLAN,
+        body=_RESTATE_BODY,
+        canary=canary,
+        extra={"AFK_INJECT_MENU_PAUSE": "0", "AFK_INJECT_VERIFY_SECONDS": "0"},
+    )
+    fake_bin = tmp_path / "bin"
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        "esac\nexit 0\n"  # never advances the transcript -> verify fails
+    )
+    (fake_bin / "tmux").chmod(0o755)
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert canary.exists(), "a failed fast-path inject must fall through to the reasoner"
+
+
 def test_broker_service_gate_fastpath_emits_distinct_span(spoke_repo: Path, tmp_path: Path) -> None:
     # AC4: the waive emits a DISTINCT afk-answer span variant (status fast-path), never folded
     # into a normal success answer; telemetry-off stays a no-op (no events file at all).
