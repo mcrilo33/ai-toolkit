@@ -120,9 +120,11 @@ def _run_sweep(
         **_GIT_ENV,
         "PATH": f"{bindir}:{os.environ['PATH']}",
         "GATE_SWEEP_CMD": cmd,
+        # Default the #276 baseline refresh to a no-op so a green GATE_SWEEP_CMD sweep
+        # never falls through to a REAL `pytest --testmon` run (the real pytest on PATH
+        # carries testmon). The baseline-refresh tests pass their own stub.
+        "GATE_SWEEP_TESTMON_CMD": testmon_cmd if testmon_cmd is not None else ":",
     }
-    if testmon_cmd is not None:
-        env["GATE_SWEEP_TESTMON_CMD"] = testmon_cmd
     proc = subprocess.run(
         ["bash", str(GATE_SWEEP), *args],
         cwd=str(repo),

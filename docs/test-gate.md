@@ -31,6 +31,28 @@ xdist (`pytest --testmon -n auto` is unsupported). This is guarded on the runner
 advertising `-n numprocesses` in `pytest --help`, so a checkout without
 `pytest-xdist` installed degrades to single-process rather than erroring the push.
 
+## Pre-warmed `.testmondata` baseline
+
+A fresh worktree has no testmon DB, so its **first push** would run the whole suite
+just to build `.testmondata` (12–47 min observed) before any later push can prune.
+To skip that seed, a maintained baseline `.testmondata` lives at
+`<git-common-dir>/.testmondata-baseline` on the hub:
+
+- **Spawn copy.** `worktree-new.sh` copies the baseline into each new worktree's
+  root, so its first push runs a testmon **incremental** (only the branch diff's
+  affected tests) instead of the full seed. No path rewrite is needed — testmon
+  stores rootdir-relative paths, so a DB built at one absolute path is reused at
+  another.
+- **Refresh.** `gate-sweep.sh` rebuilds the baseline after a **green** post-land full
+  sweep, running `pytest --testmon` with `TESTMON_DATAFILE` pointed at the baseline
+  (single-process — testmon does not compose with xdist) so the hub's own
+  `.testmondata` is untouched.
+- **Staleness.** testmon keys its `environment` row on `system_packages` +
+  `python_version`, so a copied baseline whose `.venv` dep set differs (e.g. after a
+  `requirements-dev.txt` bump) is invalidated automatically — testmon re-runs the
+  full suite. A missing or unreadable baseline likewise degrades to today's
+  full-suite seed. Both paths fail toward *more* testing, never a wrong-green.
+
 ## Safe fallbacks
 
 The gate is built to fail toward *more* testing, never toward silently skipping:

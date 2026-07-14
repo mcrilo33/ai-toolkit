@@ -117,6 +117,19 @@ sweep_dir() {
   printf '%s/.gate-sweep' "$common"
 }
 
+# <git-common-dir>/.testmondata-baseline — the maintained testmon DB this sweep
+# refreshes on green (issue #276), copied into every fresh worktree by worktree-new.sh
+# so its first push runs a testmon incremental instead of the full-suite seed.
+baseline_path() {
+  local common
+  common="$(git rev-parse --git-common-dir 2>/dev/null)" || return 1
+  case "$common" in
+    /*) ;;
+    *)  common="$PWD/$common" ;;
+  esac
+  printf '%s/.testmondata-baseline' "$common"
+}
+
 SWEEP_DIR="$(sweep_dir)" || { warn "not inside a git repo — no sweep"; exit 0; }
 LOG="$SWEEP_DIR/sweep.log"
 
@@ -280,6 +293,54 @@ ${fails}
   fi
 }
 
+# Refresh the pre-warmed .testmondata baseline (issue #276). After a GREEN full sweep,
+# rebuild the maintained baseline at <git-common-dir>/.testmondata-baseline via
+# `pytest --testmon` (relocated with TESTMON_DATAFILE so the hub's own .testmondata is
+# untouched) so the next fresh worktree copies it and runs a first-push testmon
+# INCREMENTAL instead of the full-suite seed. SERIAL — testmon serializes a single-writer
+# DB and does not compose with xdist, so this leg never gets `-n auto`. Best-effort: any
+# failure is logged and leaves the previous baseline in place (a stale baseline degrades to
+# a full seed at spawn, never a wrong-green — testmon's environment row re-runs full on a
+# dep mismatch). GATE_SWEEP_TESTMON_CMD stubs the build for tests (mirrors GATE_SWEEP_CMD).
+refresh_testmon_baseline() {
+  local tree="$1" baseline out rc=0
+  baseline="$(baseline_path)" || { log "baseline refresh: cannot resolve git-common-dir — skipped"; return 0; }
+  out="$(mktemp "${TMPDIR:-/tmp}/gate-sweep-tm.XXXXXX")" || return 0
+  if [ -n "${GATE_SWEEP_TESTMON_CMD:-}" ]; then
+    TESTMON_DATAFILE="$baseline" bash -c "$GATE_SWEEP_TESTMON_CMD" > "$out" 2>&1 || rc=$?
+  else
+    # Resolve the runner if run_suite did not already (e.g. the GATE_SWEEP_CMD path).
+    if [ -z "${RUNNER_ARR+x}" ]; then
+      local utils runner
+      utils="$(dirname "$GS_LIB")/utils.sh"
+      # shellcheck disable=SC1090
+      source "$utils" 2>/dev/null || true
+      if ! command -v detect_pytest >/dev/null 2>&1; then
+        log "baseline refresh: no runner resolvable — skipped"; rm -f "$out"; return 0
+      fi
+      runner="$(detect_pytest "." || true)"
+      [ -n "$runner" ] || { log "baseline refresh: no pytest — skipped"; rm -f "$out"; return 0; }
+      read -r -a RUNNER_ARR <<< "$runner"
+    fi
+    # testmon must be present; capture --help then case-match (a piped `grep -q` would
+    # SIGPIPE the runner under pipefail and falsely report it absent).
+    local help
+    help="$("${RUNNER_ARR[@]}" --help 2>/dev/null || true)"
+    case "$help" in
+      *--testmon*) ;;
+      *) log "baseline refresh: runner lacks testmon — skipped"; rm -f "$out"; return 0 ;;
+    esac
+    TESTMON_DATAFILE="$baseline" "${RUNNER_ARR[@]}" --testmon > "$out" 2>&1 || rc=$?
+  fi
+  if [ "$rc" -eq 0 ]; then
+    log "baseline refresh: .testmondata-baseline updated for tree $tree"
+  else
+    log "baseline refresh FAILED (exit $rc) for tree $tree — previous baseline kept:"
+    tail -n 20 "$out" >> "$LOG" 2>/dev/null || true
+  fi
+  rm -f "$out"
+}
+
 process_request() {
   local tree tier cap rc
   if ! tree="$(gate_stamp_tree)"; then
@@ -303,6 +364,8 @@ process_request() {
     gate_stamp_mint "$tree" full "$(sweep_fingerprint)" \
       || log "stamp upgrade failed (non-fatal — a later gate re-proves the tree)"
     log "sweep green: stamp upgraded to full for tree $tree"
+    # Refresh the pre-warmed testmon baseline off the just-proven-green tree (issue #276).
+    refresh_testmon_baseline "$tree"
   else
     log "sweep RED (suite exit $rc) for landed ${SHA:0:9} — filing issue"
     file_red_issue "$cap"
