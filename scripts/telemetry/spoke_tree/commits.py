@@ -148,6 +148,30 @@ def _parse_commits(dump: str) -> list[dict[str, Any]]:
     return commits
 
 
+def _first_commit_at(commits: list[dict[str, Any]]) -> str | None:
+    """Return the earliest commit's ``authored_at`` ISO instant, or None when there are none (#280).
+
+    The lifecycle timeline's ``first-commit`` leg: the spoke's first real work landing on the
+    branch. Compares PARSED datetimes so mixed ISO forms order correctly; a commit whose author
+    time fails to parse is skipped. None when ``commits`` is empty or all author times are
+    unparseable, so the dependent metric skips rather than emitting a wrong value.
+    """
+    best_dt: datetime | None = None
+    best_str: str | None = None
+    for commit in commits:
+        authored_at = commit.get("authored_at")
+        parsed = _parse_ts(authored_at) if authored_at else None
+        if parsed is None:
+            continue
+        try:
+            earlier = best_dt is None or parsed < best_dt
+        except TypeError:
+            continue  # naive vs aware — uncomparable, skip (mirrors _earliest_after)
+        if earlier:
+            best_dt, best_str = parsed, str(authored_at)
+    return best_str
+
+
 def _load_commits(path: Path | None) -> list[dict[str, Any]]:
     """Read and parse a commit dump path, or return ``[]`` when absent/unreadable (best-effort)."""
     if path is None:

@@ -46,6 +46,77 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
 info() { printf '%s: %s\n' "$PROG" "$*"; }
 
+# --- per-issue cycle-time sources (#280) --------------------------------------
+# Gather the lifecycle-timeline instants + drain-window snapshot the view builder cannot derive
+# from the Langfuse traces alone (the on-disk afk epochs/ledger + the gh filed time + the land
+# instant) into one JSON the builder reads via --lifecycle. Every source is best-effort: an absent
+# one is omitted from the JSON, and the builder skips the dependent metric — never a wrong value.
+
+# _lifecycle_afk_state_dir <wt> -> the drain's shared afk state dir, matching gate-broker.sh's
+# canonical `_afk_state_dir`: the AFK_STATE_DIR override wins, else the git-common-dir sibling the
+# broker/watchdog key on. Empty when neither resolves (the checkout has no git dir).
+_lifecycle_afk_state_dir() {
+  if [ -n "${AFK_STATE_DIR:-}" ]; then printf '%s\n' "$AFK_STATE_DIR"; return 0; fi
+  local common
+  common="$(git -C "$1" rev-parse --git-common-dir 2>/dev/null)" || return 0
+  # rev-parse may print a relative ".git"; resolve it against the worktree so the path is absolute.
+  case "$common" in /*) : ;; *) common="$1/$common" ;; esac
+  printf '%s\n' "$common/ai-toolkit-afk"
+}
+
+# _lifecycle_read_epoch <file> -> the unix-second epoch in <file> when it holds a bare integer,
+# else nothing (a missing/blank/non-numeric file yields no value, so the field is omitted).
+_lifecycle_read_epoch() {
+  local v
+  [ -r "$1" ] || return 0
+  v="$(head -n1 "$1" 2>/dev/null | tr -d '[:space:]')"
+  case "$v" in '' | *[!0-9]*) return 0 ;; *) printf '%s\n' "$v" ;; esac
+}
+
+# write_lifecycle_sources <wt> <out> -> assemble the lifecycle JSON at <out>, or return 1 to skip.
+# Skips (return 1) only when the issue number is not derivable from the branch — the dispatch epochs,
+# the gh filed time, and the ledger are all keyed by issue number, so an ad-hoc (non-numeric) spoke
+# has no per-issue timeline to gather.
+write_lifecycle_sources() {
+  local wt="$1" out="$2" branch issue state_dir filed dispatched answer landed window_start spokes interventions
+  branch="$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null)" || return 1
+  issue="${branch#*/}"; issue="${issue%%-*}"   # feature/<issue>-<slug> -> <issue>
+  case "$issue" in '' | *[!0-9]*) return 1 ;; esac
+  landed="$(date +%s)"
+  # filed: the issue's creation instant (ISO). Run gh from the worktree so it resolves THIS spoke's
+  # repo (not the land's cwd remote). Best-effort — no gh / not authed / no such issue omits the leg.
+  filed="$( (cd "$wt" && gh issue view "$issue" --json createdAt -q .createdAt) 2>/dev/null)" || filed=""
+  state_dir="$(_lifecycle_afk_state_dir "$wt")"
+  if [ -n "$state_dir" ] && [ -d "$state_dir" ]; then
+    dispatched="$(_lifecycle_read_epoch "$state_dir/dispatch-$issue.epoch")"
+    answer="$(_lifecycle_read_epoch "$state_dir/answer-attempt-$issue.epoch")"
+    spokes=0; window_start=""
+    local f v
+    for f in "$state_dir"/dispatch-*.epoch; do
+      [ -e "$f" ] || continue
+      spokes=$((spokes + 1))
+      v="$(_lifecycle_read_epoch "$f")"
+      [ -n "$v" ] || continue
+      { [ -z "$window_start" ] || [ "$v" -lt "$window_start" ]; } && window_start="$v"
+    done
+    interventions=0
+    [ -r "$state_dir/intervention-ledger.jsonl" ] && \
+      interventions="$(grep -c . "$state_dir/intervention-ledger.jsonl" 2>/dev/null)" || interventions=0
+    case "$interventions" in '' | *[!0-9]*) interventions=0 ;; esac
+  fi
+  {
+    printf '{"issue":"%s","landed":%s' "$issue" "$landed"
+    [ -n "$filed" ]        && printf ',"filed":"%s"' "$filed"
+    [ -n "$dispatched" ]   && printf ',"dispatched":%s' "$dispatched"
+    [ -n "$answer" ]       && printf ',"answer_attempt":%s' "$answer"
+    [ -n "$window_start" ] && printf ',"window_start":%s' "$window_start"
+    [ -n "${spokes:-}" ]   && printf ',"spokes_serviced":%s' "$spokes"
+    [ -n "${interventions:-}" ] && printf ',"interventions":%s' "$interventions"
+    printf '}\n'
+  } > "$out" 2>/dev/null || return 1
+  return 0
+}
+
 # Two invocation modes (issue #151):
 #   <worktree-dir>          land-time: read the worktree's spoke-run-id + raw-bodies
 #                           and itemize the full loaded context (the OTel gate applies).
@@ -189,6 +260,15 @@ if [ -n "$BODY_DIR" ]; then
   if git -C "$WT_DIR" log --numstat --format="commit${US}%H${US}%aI${US}%s" \
        origin/main..HEAD > "$COMMITS_DUMP" 2>/dev/null && [ -s "$COMMITS_DUMP" ]; then
     BUILD_ARGS+=(--commits "$COMMITS_DUMP")
+  fi
+  # Per-issue cycle-time sources (#280): gather the timeline instants + drain-window snapshot the
+  # view builder cannot see from the traces alone into one JSON file and pass --lifecycle. Best-
+  # effort throughout — any source that is absent is simply omitted from the JSON, and the builder
+  # skips the dependent metric rather than emitting a wrong value; a total failure here never fails
+  # the land.
+  LIFECYCLE_JSON="$AIT_DIR/lifecycle.json"
+  if write_lifecycle_sources "$WT_DIR" "$LIFECYCLE_JSON"; then
+    BUILD_ARGS+=(--lifecycle "$LIFECYCLE_JSON")
   fi
 fi
 [ -n "$REBUILD" ] && BUILD_ARGS+=("$REBUILD")

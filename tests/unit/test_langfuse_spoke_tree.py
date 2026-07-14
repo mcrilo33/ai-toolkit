@@ -26,9 +26,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 from telemetry.langfuse_spoke_tree import (
     _DISK_CATEGORY_ORDER,
     _REQUEST_CATEGORY_ORDER,
+    EnrichmentContext,
+    Lifecycle,
     ToolContent,
     _copy_id,
+    _enrich_scores,
     _is_own_output,
+    _load_lifecycle,
     _memoized_counter,
     apply_context_deltas,
     apply_llm_decomposition,
@@ -6795,3 +6799,113 @@ class TestMcpGrouping:
         tools = [e for e in cycle if (e["body"].get("name") or "").startswith("tool:mcp__chrome__")]
         assert len(tools) == 2
         assert {t["body"]["parentObservationId"] for t in tools} == {group_id}
+
+
+class TestLoadLifecycle:
+    """#280: parse the ingest shell's lifecycle-sources JSON into a Lifecycle, best-effort."""
+
+    def test_parses_all_fields(self, tmp_path: Path) -> None:
+        path = tmp_path / "lifecycle.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "issue": "280",
+                    "filed": "2026-01-01T00:00:00Z",
+                    "dispatched": 1767312000,
+                    "answer_attempt": 1767315900,
+                    "landed": 1767330000,
+                    "window_start": 1767311000,
+                    "spokes_serviced": 4,
+                    "interventions": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        lifecycle = _load_lifecycle(path)
+        assert lifecycle == Lifecycle(
+            issue="280",
+            filed="2026-01-01T00:00:00Z",
+            dispatched=1767312000,
+            answer_attempt=1767315900,
+            landed=1767330000,
+            window_start=1767311000,
+            spokes_serviced=4,
+            interventions=1,
+        )
+
+    def test_missing_path_yields_empty_lifecycle(self) -> None:
+        assert _load_lifecycle(None) == Lifecycle()
+
+    def test_unreadable_path_yields_empty_lifecycle(self, tmp_path: Path) -> None:
+        assert _load_lifecycle(tmp_path / "absent.json") == Lifecycle()
+
+    def test_malformed_json_yields_empty_lifecycle(self, tmp_path: Path) -> None:
+        path = tmp_path / "bad.json"
+        path.write_text("{not json", encoding="utf-8")
+        assert _load_lifecycle(path) == Lifecycle()
+
+    def test_non_object_body_yields_empty_lifecycle(self, tmp_path: Path) -> None:
+        path = tmp_path / "arr.json"
+        path.write_text("[1, 2, 3]", encoding="utf-8")
+        assert _load_lifecycle(path) == Lifecycle()
+
+    def test_partial_sources_leave_absent_fields_none(self, tmp_path: Path) -> None:
+        path = tmp_path / "partial.json"
+        path.write_text(json.dumps({"issue": "280", "landed": 1767330000}), encoding="utf-8")
+        lifecycle = _load_lifecycle(path)
+        assert lifecycle.issue == "280"
+        assert lifecycle.landed == 1767330000
+        assert lifecycle.dispatched is None
+        assert lifecycle.spokes_serviced is None
+
+    def test_non_integer_epoch_coerces_to_none(self, tmp_path: Path) -> None:
+        path = tmp_path / "weird.json"
+        path.write_text(
+            json.dumps({"dispatched": "notanint", "spokes_serviced": True}), encoding="utf-8"
+        )
+        lifecycle = _load_lifecycle(path)
+        assert lifecycle.dispatched is None
+        assert lifecycle.spokes_serviced is None  # bool guarded out
+
+
+class TestLifecycleScoresAccumulateSeparately:
+    """#280: the cycle-time scores land on ctx.lifecycle_scores, NOT ctx.score_events.
+
+    Keeping them off score_events is what leaves the out-of-scope test_spoke_tree_registry.py
+    equality assertion (score_events == build_score_events(...)) transparently true for any input.
+    """
+
+    def _ctx(self, lifecycle: Lifecycle) -> EnrichmentContext:
+        traces = _traces()
+        return EnrichmentContext(
+            spoke_run_id=SPOKE,
+            traces=traces,
+            batch=build_batch(traces, SPOKE),
+            cycle_batch=build_cycle_batch(traces, SPOKE),
+            tool_content={},
+            bodies_dir=Path("/absent"),
+            counter=len,
+            price=0.0,
+            base_ts="2026-01-02T00:00:00Z",
+            root=Path("/absent"),
+            lifecycle=lifecycle,
+        )
+
+    def test_score_events_stays_exactly_build_score_events(self) -> None:
+        # A window snapshot that DOES produce a rollup (autonomy_score) must not leak into score_events.
+        ctx = self._ctx(Lifecycle(spokes_serviced=2, interventions=0))
+        _enrich_scores(ctx)
+        assert ctx.score_events == build_score_events(
+            SPOKE, ctx.traces, ctx.batch, base_ts="2026-01-02T00:00:00Z"
+        )
+
+    def test_window_rollup_lands_on_lifecycle_scores(self) -> None:
+        ctx = self._ctx(Lifecycle(spokes_serviced=2, interventions=0))
+        _enrich_scores(ctx)
+        names = {e["body"]["name"] for e in ctx.lifecycle_scores}
+        assert "autonomy_score" in names
+
+    def test_no_lifecycle_sources_yields_no_lifecycle_scores(self) -> None:
+        ctx = self._ctx(Lifecycle())
+        _enrich_scores(ctx)
+        assert ctx.lifecycle_scores == []

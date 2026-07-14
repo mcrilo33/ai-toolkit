@@ -24,6 +24,7 @@ from _gate_broker_support import (
     _project_dir_for,
     _resumed_gate_transcript,
     _seed_transcript,
+    _session,
     _tag_gate_at_head,
     _user_record,
     _write_fake_tmux,
@@ -51,6 +52,16 @@ def test_gate_broker_defines_the_core() -> None:
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip().splitlines()[-1] == "OK"
+
+
+def test_gate_broker_lib_is_sourced_once_per_module() -> None:
+    # Issue #276: the coprocess sources gate-broker.sh exactly ONCE and reuses it — the whole
+    # point of the source-once harness. Multiple _call invocations must not re-parse the
+    # multi-thousand-line lib.
+    session = _session()
+    _call("true")
+    _call("true")
+    assert session.source_count == 1
 
 
 def test_hub_inject_loads_under_foreign_script_dir(tmp_path: Path) -> None:

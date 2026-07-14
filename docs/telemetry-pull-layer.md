@@ -309,6 +309,70 @@ production environment drops them without a fragile name-based filter:
 - **Compare repos** — break down by the `repo:` tag (Traces view, group by `tags`) to read
   cost/latency per repository once multiple projects export to the same store.
 
+## Per-issue cycle-time metrics (Issue #280)
+
+The #128 spoke-latency dashboard charts *within-spoke* step/script/gate latency, but nothing
+recorded a per-issue **lifecycle timeline** or decomposed a spoke's wall-clock into **work vs
+overhead** — so the #275–#278 throughput work had no on-record baseline to verify against. The
+land-time view build now enriches every assembled `spoketree-`/`spokecycle-` trace with three
+families sourced entirely from data already on disk / in the traces (a **backfill** — no
+`gate-broker.sh` change, no live epochs). `telemetry-ingest-spoke.sh` gathers the off-trace
+sources into `.ai-toolkit/lifecycle.json` and passes `--lifecycle`; every source is best-effort,
+so an absent one skips its metric rather than emitting a wrong value.
+
+### Lifecycle timeline
+
+A `metadata.lifecycle` map on both views' trace records the five instants
+`filed → dispatched → first-commit → ready → landed` (ISO), each sourced independently:
+
+- **filed** — `gh issue view <N> --json createdAt` (the shell derives `<N>` from the branch).
+- **dispatched** — `dispatch-<N>.epoch` in the drain's afk state dir (`git-common-dir`/`ai-toolkit-afk`).
+- **first-commit** — the earliest commit's author time in the `--commits` numstat dump.
+- **ready** — the completion `spoke-ready --phase ready` span already in the traces. Its OTLP span
+  name is the `script:ready` label (like the sibling gate span is `script:gate`), so it is matched
+  by the `workflow.kind == "script"` / `workflow.phase == "ready"` attributes, not the `--name`.
+- **landed** — the instant the land-time ingest ran.
+
+Any leg whose source is absent is omitted, so a partial timeline (e.g. `first-commit` + `ready`
+from the traces alone, on a spoke with no lifecycle file) reads distinctly from a guessed value.
+
+### Per-stage overhead scores
+
+Five trace-level numeric scores decompose the wall-clock, chartable exactly like `gate_park_ms`:
+
+- **`stage_spawn_seed_ms`** — dispatch epoch → first-commit author time.
+- **`stage_gate_answer_ms`** — PLAN-gate park onset → the `answer-attempt-<N>.epoch` the drain
+  stamped (the auto-answer leg, extending the existing `gate_park_ms` park window).
+- **`stage_review_ms`** — Σ the review span windows: the `sub-agent:code-review` containers (the
+  real-duration signal) plus any `agent:review` broker span (zero-duration today, so it contributes
+  0 and the score skips when only those match).
+- **`stage_push_gate_ms`** — Σ the `spoke-push` span windows (each brackets a pre-push test gate).
+- **`stage_land_ms`** — the `worktree-land` span window. Usually absent at land time (the land
+  span has not closed yet), so it is skipped then and captured on a later `--rebuild` backfill.
+
+A stage whose source is absent is skipped (never emitted as 0). A relaunched spoke reuses its
+`spoke_run_id`, so its dispatch epoch is re-stamped to the *last* dispatch; a dead-run commit
+earlier than that yields a negative spawn+seed delta and is dropped, cross-checked against
+`relaunch_count` — no double-count of the dead run.
+
+### Per-drain-window rollups
+
+The per-spoke builder never sees sibling spokes, so the window rollups are read off the afk state
+dir the shell snapshotted (dispatch-epoch count + intervention-ledger line count) and stamped as
+trace-level scores on **each spoke's own trace**; a dashboard filtered to `mode:afk` reads the
+latest (fullest) snapshot per window:
+
+- **`issues_per_hour`** — `spokes_serviced ÷ window_hours` (window = earliest dispatch epoch →
+  landed). Skipped when the window is non-positive.
+- **`overhead_work_ratio`** — Σ the five overhead stage scores ÷ Σ the root duration rollup's WORK
+  components (`llm_request` + `tool` + `step` + `turn`). Skipped when the work sum is 0.
+- **`autonomy_score`** — `max(0, 1 - interventions ÷ spokes_serviced)` (#251). An absent ledger
+  counts as 0 firings (matching `hub-watchdog`'s `_wd_intervention_count`); skipped only when no
+  spoke was serviced.
+
+All scores derive their ids from the spoke run id, so re-running the builder overwrites the same
+scores (idempotent), matching the #128 `fetch_session` self-exclusion.
+
 ## Verification notes and follow-ups
 
 - **Timestamps** — every `user` and `assistant` record (the ones bracketed)

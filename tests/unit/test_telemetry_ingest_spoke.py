@@ -15,6 +15,7 @@ that logs `RUN <args>` and exits a chosen code. No real python, network, or git.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -524,3 +525,100 @@ def test_no_commits_flag_when_not_a_git_repo(worktree: Path, tmp_path: Path) -> 
     assert result.returncode == 0, result.stderr
     (tree,) = runlog.read_text().splitlines()
     assert "--commits" not in tree
+
+
+# --- #280 per-issue cycle-time source gathering -------------------------------
+_GIT_ENV = {
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_AUTHOR_EMAIL": "t@t",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_COMMITTER_EMAIL": "t@t",
+}
+
+
+def _git_worktree(tmp_path: Path, *, branch: str = "feature/280-demo") -> tuple[Path, Path]:
+    """An OTel spoke worktree that is a real git checkout on `branch`, plus its afk state dir.
+
+    write_lifecycle_sources derives the issue number from the branch and reads the drain epochs /
+    ledger from `git rev-parse --git-common-dir`/ai-toolkit-afk, so the #280 gathering needs a real
+    git checkout (unlike the git-less hermetic `worktree` fixture).
+    """
+    wt = tmp_path / "wt"
+    ait = wt / ".ai-toolkit"
+    ait.mkdir(parents=True)
+    (ait / "spoke-run-id").write_text(SPOKE_RUN_ID + "\n")
+    (ait / "raw-bodies").mkdir()
+    env = {**os.environ, **_GIT_ENV}
+    subprocess.run(["git", "init", "-q", str(wt)], check=True)
+    subprocess.run(["git", "-C", str(wt), "checkout", "-q", "-b", branch], check=True, env=env)
+    subprocess.run(
+        ["git", "-C", str(wt), "commit", "-q", "--allow-empty", "-m", "init"], check=True, env=env
+    )
+    afk = wt / ".git" / "ai-toolkit-afk"
+    afk.mkdir(parents=True)
+    return wt, afk
+
+
+def test_gathers_lifecycle_sources_and_passes_flag(tmp_path: Path) -> None:
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+    wt, afk = _git_worktree(tmp_path)
+    (afk / "dispatch-280.epoch").write_text("1767312000\n")
+    (afk / "dispatch-279.epoch").write_text("1767311000\n")
+    (afk / "answer-attempt-280.epoch").write_text("1767315900\n")
+    (afk / "intervention-ledger.jsonl").write_text('{"a":1}\n{"b":2}\n')
+
+    result = _run(wt, bindir)
+
+    assert result.returncode == 0, result.stderr
+    (tree,) = runlog.read_text().splitlines()
+    assert "--lifecycle" in tree
+    lifecycle = json.loads((wt / ".ai-toolkit" / "lifecycle.json").read_text())
+    assert lifecycle["issue"] == "280"
+    assert lifecycle["dispatched"] == 1767312000
+    assert lifecycle["answer_attempt"] == 1767315900
+    assert lifecycle["window_start"] == 1767311000  # min across both dispatch epochs
+    assert lifecycle["spokes_serviced"] == 2
+    assert lifecycle["interventions"] == 2
+    assert "landed" in lifecycle
+
+
+def test_lifecycle_degrades_gracefully_without_epochs(tmp_path: Path) -> None:
+    # No afk state dir at all: the issue + land instant are still gathered, the epoch/ledger legs
+    # are omitted, and the land never fails.
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+    wt, _afk = _git_worktree(tmp_path)
+
+    result = _run(wt, bindir)
+
+    assert result.returncode == 0, result.stderr
+    assert "--lifecycle" in runlog.read_text()
+    lifecycle = json.loads((wt / ".ai-toolkit" / "lifecycle.json").read_text())
+    assert lifecycle["issue"] == "280"
+    assert "dispatched" not in lifecycle
+    assert lifecycle["spokes_serviced"] == 0
+
+
+def test_non_git_worktree_skips_lifecycle(worktree: Path, tmp_path: Path) -> None:
+    # The git-less hermetic worktree has no branch to derive the issue from, so the lifecycle
+    # gathering is skipped (no --lifecycle, no file) and the rest of the ingest still runs.
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+
+    result = _run(worktree, bindir)
+
+    assert result.returncode == 0, result.stderr
+    assert "--lifecycle" not in runlog.read_text()
+    assert not (worktree / ".ai-toolkit" / "lifecycle.json").exists()
+
+
+def test_ad_hoc_non_numeric_branch_skips_lifecycle(tmp_path: Path) -> None:
+    bindir, runlog = tmp_path / "bin", tmp_path / "runlog"
+    _make_python_stub(bindir, runlog)
+    wt, _afk = _git_worktree(tmp_path, branch="chore/adhoc-slug")
+
+    result = _run(wt, bindir)
+
+    assert result.returncode == 0, result.stderr
+    assert "--lifecycle" not in runlog.read_text()

@@ -8,12 +8,22 @@ import os
 import subprocess
 from pathlib import Path
 
+import _gate_broker_support as _gbs
 import pytest
 from _gate_broker_support import (
     _ask_record,
     _install_fake_claude,
     _project_dir_for,
 )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _close_gate_broker_session():
+    """Tear down the shared gate-broker bash coprocess at session end (issue #276)."""
+    yield
+    if _gbs._SESSION is not None:
+        _gbs._SESSION.close()
+        _gbs._SESSION = None
 
 
 @pytest.fixture

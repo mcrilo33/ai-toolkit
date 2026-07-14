@@ -9,6 +9,7 @@ on :class:`~telemetry.langfuse_rollup.Observation`, so it stays a foundation lea
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
@@ -92,6 +93,63 @@ class ToolContent(NamedTuple):
 
     input: object | None  # the tool_use input args
     output: object | None  # the tool_result content
+
+
+@dataclass(frozen=True, slots=True)
+class Lifecycle:
+    """The per-issue cycle-time sources the ingest shell gathered off disk at land time (#280).
+
+    Every field is optional: a source that was absent (no dispatch epoch, no ``gh`` reach, a
+    pre-#280 spoke with no lifecycle file at all) leaves its field None so the dependent metric
+    skips rather than emitting a wrong value. Epoch fields are unix seconds (``afk_now`` / ``date
+    +%s``); ``filed`` is the ISO timestamp ``gh issue view --json createdAt`` returns.
+
+    Attributes:
+        issue: The issue number the spoke serviced (from the branch), for reference.
+        filed: ISO instant the issue was filed (``gh`` ``createdAt``).
+        dispatched: Unix epoch the spoke was (last) dispatched (``dispatch-<N>.epoch``).
+        answer_attempt: Unix epoch the drain attempted a PLAN-gate answer (``answer-attempt-<N>.epoch``).
+        landed: Unix epoch the ingest ran (the land instant).
+        window_start: Unix epoch of the drain window's earliest dispatch (min ``dispatch-*.epoch``).
+        spokes_serviced: Distinct spokes the drain dispatched this window (``dispatch-*.epoch`` count).
+        interventions: Watchdog firings this window (``intervention-ledger.jsonl`` line count).
+    """
+
+    issue: str | None = None
+    filed: str | None = None
+    dispatched: int | None = None
+    answer_attempt: int | None = None
+    landed: int | None = None
+    window_start: int | None = None
+    spokes_serviced: int | None = None
+    interventions: int | None = None
+
+
+def _epoch_to_iso(epoch: int | None) -> str | None:
+    """Return an ISO-8601 UTC string for a unix-second epoch, or None when absent/unparseable."""
+    if epoch is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(epoch), tz=UTC).isoformat().replace("+00:00", "Z")
+    except (ValueError, TypeError, OSError, OverflowError):
+        return None
+
+
+def _iso_to_epoch(value: str | None) -> int | None:
+    """Return the unix-second epoch for an ISO-8601 timestamp, or None when absent/unparseable."""
+    parsed = _parse_utc(value) if value else None
+    return int(parsed.timestamp()) if parsed is not None else None
+
+
+def _normalize_iso(value: str | None) -> str | None:
+    """Return an ISO instant re-rendered as UTC ``…Z`` (second precision), or the raw value.
+
+    Keeps the lifecycle timeline's legs uniform: a git author time carrying a ``+02:00`` offset and
+    an epoch-derived ``…Z`` leg then read consistently. Falls back to the raw string when it does not
+    parse, so a nonstandard value is never dropped.
+    """
+    epoch = _iso_to_epoch(value)
+    return _epoch_to_iso(epoch) if epoch is not None else value
 
 
 def _tool_use_id(observation: Observation) -> str | None:
@@ -426,6 +484,42 @@ def _latest_time(traces: list[TraceObservations]) -> str:
         if observation.get("endTime") or observation.get("startTime")
     ]
     return max(times) if times else _INGEST_TIMESTAMP
+
+
+# The completion-marker span (#280 lifecycle "ready" leg). Its OTLP span NAME is the ``<kind>:<phase>``
+# label (telemetry.sh) — so ``spoke-ready --phase ready`` lands as ``script:ready``, exactly like the
+# sibling gate span is ``script:gate`` (:data:`_GATE_OBSERVATION_NAME`). Matched robustly by the
+# ``workflow`` attributes so a label-format change never silently drops the leg.
+_READY_OBSERVATION_NAME = "script:ready"
+_READY_PHASE = "ready"  # a bare --gate / --accept / --blocked emission is a different phase
+
+
+def _is_ready_observation(observation: Observation) -> bool:
+    """Whether an observation is the ``spoke-ready --phase ready`` completion-marker span (#280)."""
+    if (observation.get("name") or "") == _READY_OBSERVATION_NAME:
+        return True
+    return (
+        _attr(observation, "workflow.kind") == "script"
+        and _attr(observation, "workflow.phase") == _READY_PHASE
+    )
+
+
+def _ready_at(traces: list[TraceObservations]) -> str | None:
+    """Return the ISO instant the spoke announced ``ready`` (the completion marker), or None (#280).
+
+    Sourced from the completion ``spoke-ready --phase ready`` script span
+    (:func:`_is_ready_observation`, OTLP name ``script:ready``); its ``endTime`` (else ``startTime``)
+    is the ready leg of the lifecycle timeline. The latest such instant wins when a spoke re-emitted.
+    None when the spoke never pushed a completion marker, so the timeline leg is omitted not guessed.
+    """
+    instants = [
+        observation.get("endTime") or observation.get("startTime")
+        for _orig_trace_id, observations in traces
+        for observation in observations
+        if _is_ready_observation(observation)
+        and (observation.get("endTime") or observation.get("startTime"))
+    ]
+    return max(instants, key=lambda s: _parse_utc(s) or datetime.min) if instants else None
 
 
 def _llm_requests_in_order(traces: list[TraceObservations]) -> list[tuple[str, Observation]]:
