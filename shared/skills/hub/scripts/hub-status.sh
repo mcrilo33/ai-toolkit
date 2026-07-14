@@ -484,4 +484,41 @@ else
 fi
 echo
 
+# --- Waived gates (issue #277) -----------------------------------------------
+# Surface every PLAN gate the /afk fast-path WAIVED (auto-approved without the reasoner)
+# from the decision journal, so an operator sees "this gate was fast-pathed, and why" at a
+# glance rather than grepping the journal — the gh comment alone is not a hub view. The state
+# dir resolves like gate-broker's _afk_state_dir: AFK_STATE_DIR override, else
+# <git-common-dir>/ai-toolkit-afk. Read-only, best-effort: a missing/empty journal or absent
+# python3 just yields the "none" marker.
+bold "Waived gates"
+_afk_common="$(git -C "$main_root" rev-parse --git-common-dir 2>/dev/null || echo .git)"
+case "$_afk_common" in /*) ;; *) _afk_common="$main_root/$_afk_common" ;; esac
+_journal="${AFK_STATE_DIR:-$_afk_common/ai-toolkit-afk}/decision-journal.jsonl"
+if [ -f "$_journal" ] && command -v python3 >/dev/null 2>&1; then
+  _waived="$(HUB_STATUS_JOURNAL="$_journal" python3 - <<'PYEOF'
+import json, os
+
+with open(os.environ["HUB_STATUS_JOURNAL"], encoding="utf-8", errors="replace") as fh:
+    for line in fh:
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        decision = rec.get("decision") or ""
+        # A fast-path WAIVE is a park:gate journal line naming the fast path.
+        if rec.get("park") == "gate" and "fast-path" in decision:
+            print(f"#{rec.get('issue', '?')}  {decision}")
+PYEOF
+)"
+  if [ -n "$_waived" ]; then
+    printf '%s\n' "$_waived" | sed 's/^/  /'
+  else
+    echo "  (none this run)"
+  fi
+else
+  echo "  (no decision journal yet)"
+fi
+echo
+
 exit 0
