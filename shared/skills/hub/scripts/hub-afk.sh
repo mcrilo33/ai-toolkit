@@ -67,9 +67,12 @@
 #                                block below); AFK_SYNC_CMD / AFK_SELFUPDATE_SMOKE_CMD are seams.
 #   AFK_ARM_PRECHECK=1           arm-precondition gate (=0 skips live/dirty/branch/gh-auth checks)
 #   AFK_ARM_SELFCHECK=1          arm-time LIVENESS self-check (#279): real round trips against
-#                                the judge, claude, the gh API, testmon + the telemetry
-#                                preflight, folded into ONE verdict before any state is
-#                                written. =0 skips every probe (independent of ARM_PRECHECK)
+#                                the judge, claude, the gh API and testmon, reported with the
+#                                telemetry preflight as ONE verdict before any state is
+#                                written. =0 waives those four LIVE PROBES (independent of
+#                                AFK_ARM_PRECHECK); the telemetry gate still runs — its own
+#                                opt-out is AI_TOOLKIT_OTEL=0. Arm-only: NOT run on --reconcile
+#                                or a watchdog respawn, which are recovery paths
 #   AFK_ARM_AUTH_TIMEOUT=120     seconds bounding the arm-time claude round trip (#279) — a COLD
 #                                start, so between the reap probe's 30s and the answerer's 900s
 #   AFK_GH_PROBE_ENDPOINT        the arm-time gh api round-trip endpoint [default: rate_limit];
@@ -3108,15 +3111,22 @@ afk_reconcile() {
     log "/afk reconcile: preconditions not met — not re-arming (see above)"
     return 1
   fi
-  # The #279 liveness self-check travels with the resume: a crashed supervisor must not be
-  # brought back into a dead judge / answerer / API either. It subsumes the telemetry
-  # preflight this branch used to call directly, so the resume runs exactly the gates a fresh
-  # arm runs. (The bare no-arg resume — a watchdog respawn — deliberately does NOT run it:
-  # gating a RECOVERY path on live probes would let a transient outage respawn-loop into a
-  # refusal forever, and a dependency that dies mid-window is already caught at runtime by the
-  # #268 judge halt and the #241 §9 auth halt.)
-  if ! afk_arm_selfcheck "$repo_root"; then
-    log "/afk reconcile: arm self-check failed — not re-arming (see above)"
+  # NO #279 liveness self-check here, deliberately. Reconcile looks like a re-arm, but it is
+  # the RECOVERY path: hub-watchdog.sh's _wd_intervene_rearm recovers a crashed drain with
+  # `bash hub-afk.sh --reconcile >/dev/null 2>&1 || true`, discarding both the output and the
+  # exit code. Gating that on live judge/claude/gh round trips would mean a transient outage
+  # (the very thing most likely to be happening around a crash) SILENTLY blocks recovery: the
+  # watchdog records the intervention, the refusal log goes to /dev/null, .afk-state stays
+  # armed, and every in-flight spoke strands with no answerer or lander — the ~10h overnight
+  # strand this function exists to prevent (#202 A). It would also block each watchdog tick for
+  # up to ~4 minutes of probes before the per-spoke detectors run.
+  #
+  # Refusing to resume is strictly worse than resuming degraded: a dead judge still leaves the
+  # lander and reaper working, and #268's judge halt plus #241 §9's auth halt already catch a
+  # dependency that dies mid-window. The self-check is therefore ARM-ONLY (#279) — the moment
+  # a fresh window is about to dispatch its first spoke into those dependencies.
+  if ! afk_telemetry_preflight "$repo_root"; then
+    log "/afk reconcile: telemetry preflight failed — not re-arming (see above)"
     return 1
   fi
   _afk_watchdog_respawn   # detached no-arg resume — re-adopts the in-flight spokes
@@ -3615,7 +3625,10 @@ afk_arm_selfcheck() {
       log "/afk: refusing to arm — the network is up but 'claude' reports an AUTH failure: the subscription token is dead and every spoke would stall on it. Run 'claude' → /login (see docs/remote-afk.md) and re-arm (#279)"
       return 1 ;;
     *)
-      log "/afk: refusing to arm — 'claude' did not answer a bounded ${AFK_ARM_AUTH_TIMEOUT:-120}s probe (no auth error, just no answer): the CLI may be absent from PATH, wedged, or slower than the budget. An arm-time gate must PROVE the answerer works before dispatching into it (#279)"
+      # Name the budget the probe ACTUALLY used -- the same ladder _afk_arm_claude_check
+      # resolves -- or an operator who raised AFK_AUTH_PROBE_TIMEOUT is told to debug against
+      # a number that was never applied.
+      log "/afk: refusing to arm — 'claude' did not answer a bounded ${AFK_ARM_AUTH_TIMEOUT:-${AFK_AUTH_PROBE_TIMEOUT:-120}}s probe (no auth error, just no answer): the CLI may be absent from PATH, wedged, or slower than the budget. An arm-time gate must PROVE the answerer works before dispatching into it (#279)"
       return 1 ;;
   esac
 
@@ -3842,7 +3855,12 @@ main() {
       echo "/afk: off (state cleared; the supervisor + watchdog stop on their next tick)"; return 0 ;;
     --watchdog)  watchdog_loop; return $? ;;
     --reconcile) afk_reconcile "$MAIN_ROOT"; return $? ;;
-    -h|--help)   sed -n '2,87p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
+    # Print the header comment block: every line from 2 up to (not including) the first
+    # non-comment line. Derived rather than a hard-coded upper bound (was '2,87p'): the #279
+    # env knobs pushed the block past 87, which silently truncated the whole Usage section out
+    # of --help. A line range that must be hand-maintained on every header edit will drift
+    # again; `/^[^#]/q` cannot.
+    -h|--help)   sed -n '2,${/^[^#]/q;p;}' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
   esac
 
   local once=0

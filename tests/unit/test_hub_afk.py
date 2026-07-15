@@ -4320,24 +4320,36 @@ def test_reconcile_refuses_when_telemetry_preflight_fails(tmp_path: Path) -> Non
     assert not resp.exists(), "no re-arm when the telemetry preflight fails"
 
 
-def test_reconcile_refuses_when_the_arm_selfcheck_fails(tmp_path: Path) -> None:
-    # #279: reconcile re-runs the SAME gates a fresh arm runs, so the liveness self-check
-    # travels with it -- a crashed supervisor must not be resumed into a dead judge either.
+def test_reconcile_does_not_run_the_arm_selfcheck(tmp_path: Path) -> None:
+    # #279 cadence: the liveness self-check is ARM-ONLY. Reconcile looks like a re-arm but is
+    # the RECOVERY path -- hub-watchdog.sh's _wd_intervene_rearm recovers a crashed drain via
+    # `bash hub-afk.sh --reconcile >/dev/null 2>&1 || true`, discarding output AND exit code.
+    # Gating that on live judge/claude/gh probes would let a transient outage (the thing most
+    # likely to be happening around a crash) SILENTLY block recovery: the watchdog would record
+    # the intervention, the refusal would go to /dev/null, and every in-flight spoke would
+    # strand with no answerer or lander -- the ~10h overnight strand afk_reconcile exists to
+    # prevent (#202 A). Resuming degraded beats refusing to resume; the #268 judge halt and the
+    # #241 §9 auth halt already catch a dependency that dies mid-window.
     resp, wsp, wf = tmp_path / "resp", tmp_path / "wsp", tmp_path / "wf"
     env = _reconcile_env(tmp_path, resp=resp, wsp=wsp, wf=wf)
-    env["AI_TOOLKIT_OTEL"] = "0"  # isolate: telemetry is not what refuses here
+    env["AI_TOOLKIT_OTEL"] = "0"
+    probed = tmp_path / "probed"
     hb = env["AFK_HEARTBEAT"]
     expr = (
         f'printf "drain\\n" > "{env["AFK_STATE"]}"; '
         f'dead=$(sh -c "echo \\$$"); printf "%s 1700000000\\n" "$dead" > "{hb}"; '
-        "afk_arm_selfcheck() { return 1; }; "
-        f"afk_reconcile ."
+        f'afk_arm_selfcheck() {{ touch "{probed}"; return 1; }}; '
+        "afk_reconcile ."
     )
 
     result = _call(expr, env=env)
 
-    assert result.returncode == 1, "a failed arm self-check must refuse to re-arm"
-    assert not resp.exists(), "no re-arm when the self-check fails"
+    assert not probed.exists(), (
+        "reconcile must NOT run the liveness self-check: it is the watchdog's crash-recovery "
+        "path, and a refusal there is discarded, leaving the drain silently dead"
+    )
+    assert result.returncode == 0, "a healthy reconcile must re-arm"
+    assert resp.exists(), "recovery must not be blocked by the arm-time gate"
 
 
 # ── telemetry preflight (issue #108) ──────────────────────────────────────────
@@ -6886,11 +6898,26 @@ def test_selfcheck_refuses_on_a_dead_judge(tmp_path: Path) -> None:
 
 def test_selfcheck_refuses_on_the_268_judge_timeout(tmp_path: Path) -> None:
     # The literal #268 reproduction named in the issue's acceptance criteria: a budget too
-    # short for a `claude -p` cold start. It must refuse, and say the budget timed out.
+    # short for a `claude -p` cold start. It must refuse AND name the budget as the cause.
+    #
+    # The assertion targets the REASON clause, not a bare "timed out" anywhere in stderr: the
+    # refusal's static remedy text ends "...raise AFK_JUDGE_TIMEOUT if it timed out", so a
+    # loose substring match passes on ANY judge failure — including a plain crashed judge —
+    # and would stay green if the timeout mapping regressed to "unavailable".
     result = _run_selfcheck(tmp_path, AFK_JUDGE_CMD="sleep 5", AFK_JUDGE_TIMEOUT="1")
 
     assert "RC=1" in result.stdout, "a judge that cannot answer in budget must refuse the arm"
-    assert "timed out" in result.stderr, result.stderr
+    assert "is not usable: judge timed out" in result.stderr, result.stderr
+
+
+def test_selfcheck_broken_judge_is_not_reported_as_a_timeout(tmp_path: Path) -> None:
+    # The discriminating twin: a judge that CRASHED must not be described as a timeout, or the
+    # operator raises AFK_JUDGE_TIMEOUT forever against a broken model/token. This is the test
+    # that makes the one above mean something.
+    result = _run_selfcheck(tmp_path, AFK_JUDGE_CMD="exit 3")
+
+    assert "RC=1" in result.stdout
+    assert "is not usable: judge unavailable (rc=3)" in result.stderr, result.stderr
 
 
 def test_selfcheck_refuses_on_auth_dead_claude(tmp_path: Path) -> None:
@@ -6900,7 +6927,10 @@ def test_selfcheck_refuses_on_auth_dead_claude(tmp_path: Path) -> None:
     )
 
     assert "RC=1" in result.stdout, "a dead subscription token must refuse the arm"
-    assert "auth" in result.stderr.lower()
+    # Target the diagnosis, not a bare "auth" (which the unresponsive refusal also contains,
+    # in "no auth error") -- the two states have different remedies and must not blur.
+    assert "reports an AUTH failure" in result.stderr, result.stderr
+    assert "/login" in result.stderr, "name the remedy for a dead token"
 
 
 def test_selfcheck_refuses_when_offline_with_a_distinct_message(tmp_path: Path) -> None:
@@ -9042,6 +9072,38 @@ def test_main_runs_the_selfcheck_before_writing_state(tmp_path: Path) -> None:
     )
 
     assert seen.read_text() == "no", "the self-check must run BEFORE afk_write_state"
+
+
+def test_main_refuses_end_to_end_through_the_real_selfcheck(tmp_path: Path) -> None:
+    # The COMPOSED production path, which every other test in this group stubs away: main()
+    # calling the REAL afk_arm_selfcheck with the gate ON (the autouse fixture pins it off
+    # module-wide, so this opts back in) and every probe stubbed at its own seam. Without this,
+    # a regression in the composition -- the gate refusing on a healthy host, or main ignoring
+    # its verdict -- ships green through the whole suite and only surfaces on a live arm.
+    state = tmp_path / "state"
+    fake_bin = _gh_api_stub(tmp_path, auth_exit=0, api_exit=0)
+    env = _selfcheck_env(tmp_path, PATH=f"{fake_bin}:{os.environ['PATH']}")
+    env.update({"AFK_STATE": str(state), "AFK_ARM_PRECHECK": "0", "AI_TOOLKIT_OTEL": "0"})
+    env["AFK_JUDGE_CMD"] = "exit 3"  # the one broken dependency
+
+    result = _call(f"{_arm_neuter()}main 30m; echo RC=$?", env=env)
+
+    assert "RC=2" in result.stdout, f"a dead judge must refuse a real arm: {result.stdout!r}"
+    assert not state.exists(), "the real refusal path must write no state"
+    assert "judge" in result.stderr
+
+
+def test_main_arms_end_to_end_through_the_real_selfcheck(tmp_path: Path) -> None:
+    # The healthy composition: the real gate, every probe stubbed healthy, must not block.
+    state = tmp_path / "state"
+    fake_bin = _gh_api_stub(tmp_path, auth_exit=0, api_exit=0)
+    env = _selfcheck_env(tmp_path, PATH=f"{fake_bin}:{os.environ['PATH']}")
+    env.update({"AFK_STATE": str(state), "AFK_ARM_PRECHECK": "0", "AI_TOOLKIT_OTEL": "0"})
+
+    result = _call(f"{_arm_neuter()}main 30m", env=env)
+
+    assert state.exists(), f"a healthy host must arm through the real gate: {result.stderr!r}"
+    assert "arm self-check OK" in result.stderr, result.stderr
 
 
 def test_main_selfcheck_runs_after_the_static_preconditions(tmp_path: Path) -> None:

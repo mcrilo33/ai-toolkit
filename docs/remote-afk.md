@@ -207,11 +207,15 @@ testmon present, telemetry wired (collector :4317, bridge :4319)
 | OTel collector + Langfuse bridge | **Refuses to arm** | The dashboard is the single source of truth for an unattended run. `AI_TOOLKIT_OTEL=0` drains without telemetry. |
 
 On any refusal **no state is written** — the window is not half-armed, and nothing dispatches.
-Fix the named dependency and re-trigger. The same check runs on `--reconcile` (the
-session-start resume), so a crashed supervisor is never brought back into a dead dependency.
-It deliberately does **not** run on a watchdog respawn: gating a recovery path on live probes
-would let a transient outage respawn-loop into a permanent refusal, and a dependency that dies
-mid-window is already caught at runtime by the judge halt and the auth halt.
+Fix the named dependency and re-trigger.
+
+The check is **arm-only**. It deliberately does *not* run on `--reconcile` or a watchdog
+respawn, because those are *recovery* paths: the watchdog recovers a crashed drain by running
+`hub-afk.sh --reconcile` and discarding its output, so gating that on live probes would let a
+transient outage — the very thing most likely to be happening around a crash — silently block
+recovery and strand every in-flight spoke with no answerer or lander. Refusing to resume is
+worse than resuming degraded, and a dependency that dies mid-window is already caught at
+runtime by the judge halt and the auth halt.
 
 Knobs: `AFK_ARM_SELFCHECK=0` skips every probe (independent of `AFK_ARM_PRECHECK`),
 `AFK_ARM_AUTH_TIMEOUT` (default 120s) bounds the cold `claude` round trip, `AFK_JUDGE_TIMEOUT`
