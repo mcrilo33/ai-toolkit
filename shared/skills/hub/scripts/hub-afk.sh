@@ -61,7 +61,9 @@
 #                                (4x300s), not the ~50min a 120s-era default of 10 would stretch to
 #   AFK_DISPATCH_MAX_FAILURES=3  consecutive worktree-new.sh failures before an issue is blocked
 #   AFK_SELFUPDATE_SCOPE         basenames whose land triggers a self-update redeploy (#250);
-#                                default: the supervisor's own scripts + the afk-answering rule.
+#                                default: the supervisor's own scripts + the afk-answering rule
+#                                + ai-toolkit.yml (#291 — a config-only land, e.g. model routing,
+#                                also redeploys the synced spoke-model.env snapshot).
 #                                A supervisor-scope land re-syncs + re-execs the drain in place
 #                                onto the new code at the next tick boundary (see the self-update
 #                                block below); AFK_SYNC_CMD / AFK_SELFUPDATE_SMOKE_CMD are seams.
@@ -2748,7 +2750,7 @@ _afk_watchdog_respawn() {
 # (.ai-toolkit/scripts/hub-afk.sh), and scripts/worktree-land.sh all hit. AFK_SELFUPDATE_SCOPE
 # overrides the whole set (tests / operator tuning).
 _afk_selfupdate_scope_paths() {
-  printf '%s\n' "${AFK_SELFUPDATE_SCOPE:-hub-afk.sh gate-broker.sh hub-notify.sh worktree-lib.sh worktree-land.sh batch-plan.sh afk-answering.md}"
+  printf '%s\n' "${AFK_SELFUPDATE_SCOPE:-hub-afk.sh gate-broker.sh hub-notify.sh worktree-lib.sh worktree-land.sh batch-plan.sh afk-answering.md ai-toolkit.yml}"
 }
 
 # _afk_paths_in_scope <newline-separated paths> -> true when ANY path's basename is in the
@@ -2813,7 +2815,10 @@ _afk_detect_selfupdate() {
 # NOTE (#250 review finding 5): this is the FIXED set the DEFAULT AFK_SELFUPDATE_SCOPE fully
 # covers. AFK_SELFUPDATE_SCOPE only widens DETECTION (which land triggers a redeploy); it does
 # NOT extend this validated set. If you add a custom supervisor helper to AFK_SELFUPDATE_SCOPE,
-# add its source path here too, or a broken version of it would deploy unvalidated.
+# add its source path here too, or a broken version of it would deploy unvalidated. EXCEPTION
+# (#291): ai-toolkit.yml is data, not a supervisor script, so it has no source path here —
+# `bash -n` has nothing to parse-check. It's still safe to redeploy on since sync-to-repo.sh
+# re-renders spoke-model.env from it on every _afk_resync.
 _afk_selfupdate_source_scripts() {
   local root="${1:-${MAIN_ROOT:-.}}"
   printf '%s\n' \

@@ -9884,6 +9884,34 @@ def test_detect_selfupdate_noop_when_branch_did_not_advance(tmp_path: Path) -> N
     assert not (statedir / "self-update-pending").exists()
 
 
+def test_paths_in_scope_matches_config_only_basename() -> None:
+    # #291: a config-only land (settings/ai-toolkit.yml) must hit the default scope too,
+    # matched by basename like every other supervisor-scope entry.
+    result = _call("_afk_paths_in_scope 'settings/ai-toolkit.yml'")
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_detect_selfupdate_flags_config_only_diff(tmp_path: Path) -> None:
+    # #291: a land whose merged diff touches only settings/ai-toolkit.yml (e.g. a
+    # model-routing change) must flag a pending self-update the same as a supervisor-code
+    # land, so the next redeploy re-syncs spoke-model.env with the new values.
+    repo = _su_repo(tmp_path)
+    before = _su_git(repo, "rev-parse", "HEAD")
+    after = _su_commit(repo, "settings/ai-toolkit.yml", "# changed\n")
+    statedir = tmp_path / "sd"
+
+    result = _call(
+        f"_afk_detect_selfupdate {before} {after} 236 '{repo}'",
+        env={"AFK_STATE_DIR": str(statedir)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    flag = statedir / "self-update-pending"
+    assert flag.exists(), "a config-only land must flag a pending self-update"
+    assert flag.read_text().strip() == "236", "the flag records the triggering issue"
+
+
 # ── #250: afk self-update — DEPLOY (validate + smoke + resync + in-place exec) ──
 # At a tick boundary the drain validates + smoke-tests the SOURCE, re-syncs the gitignored
 # scripts, journals, then execs in place onto the new code. The SOURCE is proven healthy
