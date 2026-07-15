@@ -1547,6 +1547,23 @@ def test_dead_idle_reason_names_the_measured_base(tmp_path: Path) -> None:
     assert "ceiling 3600s" in out
 
 
+def test_dead_idle_reason_falls_back_to_a_live_done_epoch_read_when_omitted(tmp_path: Path) -> None:
+    # The omitted-4th-arg branch (`${4-...}`, not `${4:-...}`): a direct caller that passes no
+    # pre-read epoch gets a live read, while an explicitly-EMPTY 4th arg stays empty. Pinned so the
+    # two are never collapsed to `:-`, which would silently re-read on every dispatcher call.
+    state_dir = tmp_path / "afk-state"
+    state_dir.mkdir()
+    (state_dir / "done-284.epoch").write_text("1784066007\n")
+    env = _dead_pane_env(tmp_path)
+    prelude = f"slot_state() {{ echo busy; }}; read_progress_epoch() {{ echo {int(NOW) - 4459}; }}"
+
+    omitted = _call(f"{prelude}; _wd_dead_idle_reason /the/wt 284 {NOW}", env=env).stdout
+    explicit_empty = _call(f'{prelude}; _wd_dead_idle_reason /the/wt 284 {NOW} ""', env=env).stdout
+
+    assert "done-epoch=1784066007" in omitted  # unset ⇒ live read finds the stamp
+    assert "done-epoch=none" in explicit_empty  # set-but-empty ⇒ honored as empty
+
+
 def test_run_conditions_dead_pane_ledger_line_carries_the_measured_base(tmp_path: Path) -> None:
     # End-to-end: the reason reaches the LEDGER, not just stdout — AC4 is about the ledger line.
     ledger = tmp_path / "l.jsonl"

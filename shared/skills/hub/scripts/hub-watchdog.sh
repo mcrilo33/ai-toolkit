@@ -563,6 +563,30 @@ _wd_detect_dead_idle() {
   _wd_epoch_stale "$(read_progress_epoch "$issue" 2>/dev/null)" "$now" "$HUB_WATCHDOG_IDLE_CEILING"
 }
 
+# _wd_dead_idle_reason <wt> <issue> <now> [done-epoch] -> the MEASURED firing reason (#290 AC4):
+# the age, plus every input the decision turned on — which epoch it measured from, the live
+# slot_state, whether a done epoch was present, and what the drain last did — so a future false
+# positive is diagnosable from the ledger line alone instead of re-deriving the timeline from four
+# state files. Mirrors _wd_park_unanswered_reason's measured-base contract (#283 AC5); the reason
+# field is where this file records a base, so _wd_fire's JSON shape needs no new key.
+# Takes the SAME pre-read done epoch the detector was given, so the reported classification cannot
+# disagree with the one that actually fired (a live re-read here would come back empty every time —
+# the park detectors' slot_state call has already cleared it, per #263).
+# UPGRADE: this re-reads slot_state for the diagnostic, and as a command-substitution argument to
+# _wd_fire it re-runs every tick the condition holds, not just the deduped first firing — thread
+# the detector's own read through if a persistent dead pane ever makes the repeat cost matter. It
+# is safe today: every slot_state mutation is stamp-once/clear-idempotent, and the dead-idle path
+# has no pane, so _permission_pending short-circuits before any tmux capture (not the #269 class).
+_wd_dead_idle_reason() {
+  local wt="$1" issue="$2" now="$3" done_epoch="${4-$(_wd_done_epoch "$2")}" progress
+  progress="$(read_progress_epoch "$issue" 2>/dev/null)"
+  printf 'reaper missed a dead/idle pane: no pane, last progress %s ago' \
+    "$(_wd_age_seconds "$progress" "$now")"
+  printf ' (ceiling %ss; base=progress@%s, slot_state=%s, done-epoch=%s, last-action=%s)' \
+    "$HUB_WATCHDOG_IDLE_CEILING" "${progress:-?}" "$(slot_state "$wt" "$issue" 2>/dev/null)" \
+    "${done_epoch:-none}" "$(_wd_last_action)"
+}
+
 # Condition 3: a stale blocked/ marker reconcile_markers should have cleared.
 _wd_detect_stale_marker() { _wd_blocked_stale "$1" "$2"; }
 
@@ -693,6 +717,20 @@ _wd_intervene_answer() {   # route to the reasoner/answer lane directly
 }
 _wd_intervene_revive() {   # claude --continue revive in the worktree
   local wt="$1" issue="$2"
+  # #290 AC3: NEVER resume a session into a worktree that is finished or being torn down. On #284
+  # this launched `nohup claude --continue` inside a worktree the land removed seconds later — a
+  # headless run against a vanishing cwd. The detector's done-epoch guard already stops the
+  # dispatcher path; this is the second lock, for any DIRECT caller (mirroring the permission-lane
+  # re-check in _wd_intervene_answer). Reading the epoch live is right here: a direct caller has not
+  # necessarily run the slot_state that would clear it.
+  if [ -n "$(_wd_done_epoch "$issue")" ]; then
+    _wd_log "deferring revive on #$issue — the spoke is done-stamped (terminal, not a hang)"
+    return 0
+  fi
+  if _wd_land_in_flight "$issue" "$(_wd_now)"; then
+    _wd_log "deferring revive on #$issue — a land is in flight (its teardown is removing the worktree)"
+    return 0
+  fi
   if [ -n "${HUB_WATCHDOG_REVIVE_CMD:-}" ]; then bash -c "$HUB_WATCHDOG_REVIVE_CMD" hub-watchdog "$wt" "$issue" >/dev/null 2>&1 || true; return 0; fi
   command -v claude >/dev/null 2>&1 && ( cd "$wt" 2>/dev/null && nohup claude --continue >/dev/null 2>&1 & ) || true
 }
@@ -946,7 +984,7 @@ _wd_run_conditions() {
       # genuinely leaves a dead pane behind still fires once the land stops running.
       :
     elif _wd_detect_dead_idle "$wt" "$issue" "$now" "$wd_done"; then
-      _wd_fire dead-pane "$issue" "reaper missed a dead/idle pane (> ${HUB_WATCHDOG_IDLE_CEILING}s)"
+      _wd_fire dead-pane "$issue" "$(_wd_dead_idle_reason "$wt" "$issue" "$now" "$wd_done")"
       _wd_intervene_revive "$wt" "$issue"
     else
       _wd_clear_fired dead-pane "$issue"
