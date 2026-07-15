@@ -704,6 +704,182 @@ def test_clear_progress_state_also_clears_answer_drop(tmp_path: Path) -> None:
     assert not (statedir / "answer-drop-5").exists()
 
 
+# ── issue #294: the served-permission-park marker (an APPROVE already delivered) ───────────────
+# _decide_permission's APPROVE branches delivered approve_permission and recorded NOTHING about
+# the park they served, so an UNCHANGED pending dialog — a pane that has not redrawn, or an
+# approved `nohup ... &` whose gate keeps the gated tool_use unresolved — was re-approved on the
+# next tick, bounded only by AFK_REANSWER_CEILING (exactly one duplicate keypress at the default
+# 2, the #135/#188 concurrent-gate shape).
+#
+# Keyed like _broker_reanswer_exhausted's own (tip, sig) record PLUS the pending tool_use id. The
+# id is what separates "the same dialog is still on screen" from "the spoke re-asked the identical
+# command" — a repeatable safe command re-issued at the SAME tip (a failed push retried verbatim)
+# is a NEW dialog with a NEW id, and a (tip, sig)-only marker would refuse to serve it forever:
+# the tip cannot advance while the spoke is parked, so nothing would ever clear it.
+
+
+def _serve(sig: str, wt: str, issue: str, tid: str) -> str:
+    """note_permission_served takes the caller's ALREADY-CAPTURED park signature and the tool id
+    captured BEFORE delivery — never re-derived (the #288 note_answer_drop lesson: re-deriving
+    attributes the record to whichever park is live at call time, not the one that was served)."""
+    return f"note_permission_served '{wt}' {issue} '{sig}' '{tid}'"
+
+
+def _is_served(sig: str, wt: str, issue: str, tid: str) -> str:
+    """The predicate reads the LIVE pending tool_use id; the stub models what the dialog is gating
+    at READ time, independent of what note_permission_served recorded."""
+    return (
+        f"extract_pending_tool_id() {{ printf '%s' '{tid}'; }}; "
+        f"_broker_permission_served '{wt}' {issue} '{sig}' && echo SERVED || echo FRESH"
+    )
+
+
+def test_permission_served_reads_back_the_same_tip_signature_and_tool_id(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The bug's shape: the identical dialog is still pending on the next tick. Same tip, same
+    # signature, same gated tool_use → already served, so no second keypress.
+    env = {"AFK_STATE_DIR": str(tmp_path / "sd")}
+    _call(_serve("sigA", str(spoke_repo), "5", "toolu_01"), env=env)
+
+    out = _call(_is_served("sigA", str(spoke_repo), "5", "toolu_01"), env=env).stdout
+
+    assert out.strip().splitlines()[-1] == "SERVED"
+
+
+def test_permission_served_false_for_a_new_pending_tool_id(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The case a (tip, sig)-only key would strand: the spoke re-asks the IDENTICAL command at the
+    # same tip (a failed push retried verbatim). Same tip, same signature — but a new tool_use, so
+    # it is a genuinely new dialog and must be served.
+    env = {"AFK_STATE_DIR": str(tmp_path / "sd")}
+    _call(_serve("sigA", str(spoke_repo), "5", "toolu_01"), env=env)
+
+    out = _call(_is_served("sigA", str(spoke_repo), "5", "toolu_02"), env=env).stdout
+
+    assert out.strip().splitlines()[-1] == "FRESH", (
+        "an identical command re-asked at the same tip is a NEW dialog — never skip it"
+    )
+
+
+def test_permission_served_false_on_a_new_signature(spoke_repo: Path, tmp_path: Path) -> None:
+    env = {"AFK_STATE_DIR": str(tmp_path / "sd")}
+    _call(_serve("sigA", str(spoke_repo), "5", "toolu_01"), env=env)
+
+    out = _call(_is_served("sigB", str(spoke_repo), "5", "toolu_01"), env=env).stdout
+
+    assert out.strip().splitlines()[-1] == "FRESH", "a changed park signature is a new park"
+
+
+def test_permission_served_false_after_a_tip_advance(spoke_repo: Path, tmp_path: Path) -> None:
+    # Issue item 3's "clear on tip advance", by the family's key-invalidation convention: a record
+    # for a PAST tip stops matching, exactly as _broker_reanswer_exhausted / note_answer_drop do.
+    env = {"AFK_STATE_DIR": str(tmp_path / "sd")}
+    _call(_serve("sigA", str(spoke_repo), "5", "toolu_01"), env=env)
+
+    subprocess.run(
+        ["git", "commit", "-q", "--allow-empty", "-m", "progress"],
+        cwd=spoke_repo,
+        check=True,
+        capture_output=True,
+        env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t"},
+    )
+    out = _call(_is_served("sigA", str(spoke_repo), "5", "toolu_01"), env=env).stdout
+
+    assert out.strip().splitlines()[-1] == "FRESH", "a park at a NEW tip is never already-served"
+
+
+def test_permission_served_false_when_the_dialog_flushed_no_tool_id(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The #269 unflushed-dialog window: the pane shows the dialog but the gated tool_use is not in
+    # the transcript, so there is no id to compare. Fail OPEN — never suppress on an unprovable
+    # match (that path declines-as-unreadable and never approves anyway).
+    env = {"AFK_STATE_DIR": str(tmp_path / "sd")}
+    _call(_serve("sigA", str(spoke_repo), "5", "toolu_01"), env=env)
+
+    out = _call(_is_served("sigA", str(spoke_repo), "5", ""), env=env).stdout
+
+    assert out.strip().splitlines()[-1] == "FRESH"
+
+
+@pytest.mark.parametrize("sig,tid", [("", "toolu_01"), ("sigA", "")])
+def test_note_permission_served_records_nothing_unsubstantiated(
+    sig: str, tid: str, spoke_repo: Path, tmp_path: Path
+) -> None:
+    # note_park_episode's posture: never claim a park we cannot substantiate. Without BOTH a
+    # signature and the id of the tool_use we approved, there is no key — record nothing.
+    statedir = tmp_path / "sd"
+
+    _call(_serve(sig, str(spoke_repo), "5", tid), env={"AFK_STATE_DIR": str(statedir)})
+
+    assert not (statedir / "served-5").exists()
+
+
+def test_served_skip_due_inside_the_window_is_not_due(tmp_path: Path) -> None:
+    # The skip is BACKOFF-PACED, never terminal: approve_permission verifies only that the
+    # transcript mtime advanced, not that the dialog was consumed, so an approve whose keypress
+    # never landed leaves the identical park pending. Inside the window the tick skips.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "served-5").write_text("abc\tsigA\ttoolu_01\t1000\n")
+
+    result = _call(
+        "_broker_served_skip_due 5 1030 && echo DUE || echo WAIT",
+        env={"AFK_STATE_DIR": str(statedir), "AFK_SERVED_SKIP_SECONDS": "60"},
+    )
+
+    assert result.stdout.strip().splitlines()[-1] == "WAIT", "30s into a 60s window → still skip"
+
+
+def test_served_skip_due_once_the_window_elapses(tmp_path: Path) -> None:
+    # Once it elapses the marker is dropped for ONE supervised re-serve — the re-answer ceiling
+    # and the #241 curve bound a standing failure from there, so this is never a strand.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "served-5").write_text("abc\tsigA\ttoolu_01\t1000\n")
+
+    result = _call(
+        "_broker_served_skip_due 5 1060 && echo DUE || echo WAIT",
+        env={"AFK_STATE_DIR": str(statedir), "AFK_SERVED_SKIP_SECONDS": "60"},
+    )
+
+    assert result.stdout.strip().splitlines()[-1] == "DUE"
+
+
+def test_served_skip_due_when_nothing_was_ever_served(tmp_path: Path) -> None:
+    # Mirrors _afk_warned_due's "never armed → due": no record can never suppress a serve.
+    result = _call(
+        "_broker_served_skip_due 5 && echo DUE || echo WAIT",
+        env={"AFK_STATE_DIR": str(tmp_path / "sd")},
+    )
+
+    assert result.stdout.strip().splitlines()[-1] == "DUE"
+
+
+def test_clear_permission_served_drops_the_record(spoke_repo: Path, tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    env = {"AFK_STATE_DIR": str(statedir)}
+    _call(_serve("sigA", str(spoke_repo), "5", "toolu_01"), env=env)
+    assert (statedir / "served-5").exists()
+
+    _call("clear_permission_served 5", env=env)
+
+    assert not (statedir / "served-5").exists()
+
+
+def test_clear_progress_state_also_clears_permission_served(tmp_path: Path) -> None:
+    # Per-window state, like reanswer-* / answer-drop-*: a fresh arm starts with no served record.
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "served-5").write_text("abc\tsigA\ttoolu_01\t1000\n")
+
+    _call("_clear_progress_state", env={"AFK_STATE_DIR": str(statedir)})
+
+    assert not (statedir / "served-5").exists()
+
+
 def test_refresh_offline_clocks_stamps_progress_and_answer_attempt(tmp_path: Path) -> None:
     # The idle-clock exclusion for an outage tick: every in-flight spoke gets a fresh progress
     # epoch (soft ceiling) AND answer-attempt epoch (idle clock), so the blackout is not counted
