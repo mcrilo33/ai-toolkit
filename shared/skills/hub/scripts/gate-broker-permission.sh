@@ -18,10 +18,15 @@ set -uo pipefail
 # _extract_pending_tool_field <wt_path> <field> -> one field of the spoke's trailing UNRESOLVED
 # assistant tool_use — the one a permission dialog is gating. field is `command` or `id`.
 #
-# ONE walk definition for both fields (#294): the id names the exact tool_use the command was read
-# from, so a second, separately-written walk could drift and let the served-park marker key an id
-# onto a DIFFERENT block's command — the marker would then suppress the wrong dialog. Both wrappers
-# below share this pass; neither re-implements the resolution rules.
+# ONE walk DEFINITION for both fields (#294): a separately-written second walk could drift from
+# this one's resolution rules (#240's skip-the-resolved-blocks scan above all) and name an id from
+# a different block than the command was read from, keying the served marker onto the wrong dialog.
+#
+# What that does NOT buy, since each wrapper is its own python pass: two calls are two independent
+# reads of the transcript, so a park that MOVES between them yields a command and an id from
+# different states. That degrades safely — a mismatched record matches no live park, so the lane
+# fails open to a re-serve rather than suppressing one — but it is why the served id is captured
+# BEFORE a delivery (and before the reasoner's minutes-long step), never re-read after it.
 _extract_pending_tool_field() {
   local jsonl; jsonl="$(_spoke_jsonl "$1")"
   [ -n "$jsonl" ] || return 0
