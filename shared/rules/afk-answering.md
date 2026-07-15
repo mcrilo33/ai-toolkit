@@ -112,6 +112,27 @@ nothing irreversible actually happens unattended, and recording the call for pos
   in-scope interpretation and `WARN:` if the spoke seems to want more than the issue
   authorized.
 
+### Ship discipline is in-contract — never treat it as outward-facing
+
+Every spoke is dispatched with a standing contract: **push your own feature branch on
+every subtask, and emit the ready marker once the acceptance criteria are met — both
+without asking.** The hub, never the spoke, lands the issue.
+
+So a spoke pushing **its own feature branch** or emitting **its ready marker** is the
+expected, mandatory ship step, and it is **reversible**: the hub lands it from origin,
+it is not a push to the default branch, and the branch is trivially deletable. It is
+**not** an "outward-facing" action, and the local/dry-run/no-op preference above does
+**not** apply to it. Approve it (`REVERSIBILITY: reversible`, no `WARN:` needed).
+
+**Never** answer "keep it local", "do not push", "do not emit the ready marker", or
+"delete the branch" to a spoke's own feature-branch push. That countermands the
+contract, strands finished work, and instructs the deletion of completed pushes — it is
+the inverse of what the dispatcher would say (this drove a spoke off-policy in #271 and
+needed a manual correction to undo).
+
+Only a push or force-push to the **default branch**, or a genuine history rewrite, is
+the irreversible ask the reversible-alternative posture above is for.
+
 The post-adjustment surface makes this safe: merges, labels, and reversible decisions are
 honestly undoable in the morning; the reversible-alternative posture keeps a genuinely
 irreversible action from being taken wrongly. Record the class every time so the morning

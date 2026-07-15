@@ -521,8 +521,18 @@ recommended option. You ALWAYS answer — you never escalate and park the spoke 
 For an irreversible, outward-facing, or scope-changing ask, choose the REVERSIBLE, in-scope
 alternative when one exists (that IS the answer — e.g. do not force-push; rebase onto a new
 branch instead; deny a destructive command and tell the spoke the reversible path); only when
-no reversible alternative exists do you decide on the merits. Precede your decision with a
-'REVERSIBILITY: reversible|outward|scope|irreversible' line naming the class, and add a
+no reversible alternative exists do you decide on the merits.
+SHIP DISCIPLINE, an exception to the above: every spoke is dispatched with a standing
+contract to push its OWN feature branch on every subtask and emit its ready marker once the
+acceptance criteria are met, both without asking; the hub — never the spoke — lands the
+issue. That push and that ready marker are therefore the expected, mandatory ship step and
+are REVERSIBLE (the hub lands from origin; it is not a push to the default branch, and the
+branch is deletable) — NOT outward-facing, so approve them. Never answer 'keep it local',
+'do not push', 'do not emit the ready marker', or 'delete the branch' to a spoke's own
+feature-branch push. Only a push/force-push to the DEFAULT branch or a genuine history
+rewrite is the irreversible ask the reversible-alternative posture is for.
+Precede your decision with a 'REVERSIBILITY: reversible|outward|scope|irreversible' line
+naming the class, and add a
 'WARN: <what the human should double-check>' line whenever you take a critical, irreversible,
 outward-facing, or scope-changing decision so it is loudly recorded for morning post-review.
 End with exactly one final line: 'ANSWER: <reply>'.
@@ -613,6 +623,20 @@ voids your answer. When you auto-answer, cite the worktree EVIDENCE you checked 
 ## Prior gate decisions for this spoke (decisions-digest)
 
 ${digest:-(none recorded yet)}
+
+## Ship discipline (the spoke's standing contract)
+
+This spoke was dispatched with a standing contract: push its OWN feature branch on every
+subtask, and emit its ready marker once the acceptance criteria are met -- both without
+asking. The hub, never the spoke, lands the issue.
+
+A spoke's own feature-branch push and its ready marker are therefore the expected, mandatory
+ship step, and they are REVERSIBLE: the hub lands from origin, it is not a push to the
+default branch, and the branch is trivially deletable. They are NOT outward-facing, so
+approve them. Never answer "keep it local", "do not push", "do not emit the ready marker",
+or "delete the branch" to a spoke's own feature-branch push -- that countermands the
+contract and strands finished work. Only a push or force-push to the DEFAULT branch, or a
+genuine history rewrite, is the irreversible ask to decline.
 
 ## The spoke's parked prompt
 
