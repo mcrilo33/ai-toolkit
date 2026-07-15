@@ -500,8 +500,19 @@ _wd_supervisor_servicing() {
   return 1
 }
 
-_wd_intervene_answer() {   # route to the reasoner/permission lane directly
+_wd_intervene_answer() {   # route to the reasoner/answer lane directly
   local wt="$1" issue="$2"
+  # #283 AC4: NEVER inject into a permission dialog — that is the BROKER's lane, with its own
+  # classifier, timers and re-answer ceiling. Answering one is how the watchdog ends up servicing a
+  # park it does not own (#271) and interrupting a live tool call (#89): on #276 this armed
+  # re-answers that churned against a dialog the broker was already clearing. The detector no
+  # longer fires on a permission park, so this is the second lock — it guards any direct caller.
+  # Gated on `permission` specifically, not on "is answer lane": an UNKNOWN lane keeps the historic
+  # behaviour (the detector, not this seam, is where the race-vs-strand call is made).
+  if [ "$(_wd_park_lane "$wt" "$issue")" = "permission" ]; then
+    _wd_log "deferring answer intervention on #$issue — the park is a permission dialog (broker's lane)"
+    return 0
+  fi
   # #265 AC4: defer when the supervisor is mid-service on this same park — a second answer here
   # duplicate-injects and races the in-flight answerer (the #89 hazard) + wastes a costly run.
   if _wd_supervisor_servicing "$issue"; then
