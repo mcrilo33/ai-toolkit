@@ -527,6 +527,32 @@ def test_park_unanswered_quiet_when_the_park_is_a_permission_dialog(tmp_path: Pa
     assert rc == 1
 
 
+def test_last_decision_ts_reads_a_record_written_by_the_real_journal_writer(
+    tmp_path: Path,
+) -> None:
+    # End-to-end across the module boundary: the REAL _broker_journal_line writes the record and
+    # the REAL extractor reads it back. _wd_last_decision_ts parses the journal's field ORDER (ts
+    # first), so a writer-side reorder would otherwise silently return empty for every issue —
+    # killing the servicing suppression and resurrecting the #276 false-fire with no test failure.
+    sd = tmp_path / "sd"
+    env = {"AFK_STATE_DIR": str(sd), "AFK_NOW": NOW}
+    _call('_broker_journal_line 5 permission "hook auto-approved: pytest" reversible', env=env)
+
+    out = _call("_wd_last_decision_ts 5", env=env).stdout
+
+    assert out.strip() == NOW, "the extractor must track the real journal writer's format"
+
+
+def test_last_decision_ts_does_not_confuse_a_longer_issue_number(tmp_path: Path) -> None:
+    sd = tmp_path / "sd"
+    env = {"AFK_STATE_DIR": str(sd), "AFK_NOW": NOW}
+    _call('_broker_journal_line 15 permission "approved" reversible', env=env)
+
+    assert _call("_wd_last_decision_ts 5", env=env).stdout.strip() == "", (
+        "issue 15's record must not read as servicing for issue 5"
+    )
+
+
 def test_park_unanswered_quiet_when_the_drain_decided_recently(tmp_path: Path) -> None:
     # AC1: a broker decision for this issue since the delivery is proof the drain is SERVICING the
     # spoke. "Being handled" and "abandoned" must be distinguishable.

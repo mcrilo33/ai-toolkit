@@ -239,7 +239,10 @@ _wd_issue_open() {
   case "$state" in [Cc]losed | CLOSED) return 1 ;; *) return 0 ;; esac
 }
 
-# --- the 5 detectors (pure predicates over the drain's own state readers) ------
+# --- the 5 detectors (predicates over the drain's own state readers) -----------
+# Read-only EXCEPT condition 1, which notes the current park episode as it measures (#283) — the
+# same way slot_state stamps the epochs it reads. So a detector is safe to run on a tick, but NOT
+# speculatively (a dry-run / status probe would re-stamp the park-onset clock it reads).
 # _wd_park_lane <wt> <issue> -> permission | gate | question | unknown: WHOSE lane the pending park
 # belongs to (#283). Probes STRUCTURALLY, in _broker_park_signature's own precedence order, rather
 # than parsing that signature: a gate-tagged park whose plan artifact is unreadable hashes to EMPTY
@@ -300,7 +303,12 @@ _wd_park_base() {
 
 # _wd_last_decision_ts <issue> -> the ts of the drain's most recent decision-journal record for
 # this issue, or empty. The journal is the drain's own "I acted on this spoke" evidence (#241),
-# keyed by issue and already written per broker decision — no new plumbing needed.
+# keyed by issue and already written per broker decision — no new plumbing needed. Append-only and
+# chronological, so the LAST match is the newest.
+# CONTRACT: this parses the record's field ORDER (ts first) written by _broker_journal_line
+# (gate-broker-answerer.sh) — the journal's sole writer. A reorder there would make this return
+# empty for every issue and silently disable the servicing suppression, so the pairing is pinned
+# end-to-end by test_last_decision_ts_reads_a_record_written_by_the_real_journal_writer.
 _wd_last_decision_ts() {
   local issue="$1" f
   command -v _broker_journal_file >/dev/null 2>&1 || return 0
@@ -346,10 +354,10 @@ _wd_detect_park_unanswered() {
 # state files. Reads the epochs on demand (no cross-pass global — the #241 leak trap); the episode
 # onset was already noted by the detector on this tick, so this only reads it back.
 _wd_park_unanswered_reason() {
-  local wt="$1" issue="$2" now="$3" attempt onset base sig
+  local wt="$1" issue="$2" now="$3" attempt onset base sig=""   # sig="": the guard below may skip it (set -u)
   attempt="$(read_answer_attempt "$issue" 2>/dev/null)"
   onset="$(read_park_onset_epoch "$issue" 2>/dev/null)"
-  sig="$(read_park_sig "$issue" 2>/dev/null)"
+  command -v read_park_sig >/dev/null 2>&1 && sig="$(read_park_sig "$issue" 2>/dev/null)"
   sig="${sig#*$'\t'}"                          # drop the tip half of the "<tip>\t<sig>" record
   case "$attempt" in '' | *[!0-9]*) attempt="" ;; esac
   case "$onset" in '' | *[!0-9]*) onset="" ;; esac
