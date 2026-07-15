@@ -900,31 +900,214 @@ def test_self_heal_clears_park_onset_so_a_following_tick_is_quiet(tmp_path: Path
 
 
 # Condition 2 — dead / idle pane
+# The #290 guards read the drain state, the last-action record and the drain state dir, so every
+# condition-2 test pins all three off the LIVE host hub: unpinned, a real armed drain on this host
+# would make `_wd_drain_state` read `live` and a stray done-<issue>.epoch would suppress a fire.
+def _dead_pane_env(tmp_path: Path, **extra: str) -> dict[str, str]:
+    env = {
+        "AFK_NOW": NOW,
+        "AFK_STATE": str(tmp_path / "absent-afk-state"),  # no drain armed ⇒ _wd_drain_state = off
+        "AFK_STATE_DIR": str(tmp_path / "afk-state"),
+        "AFK_LAST_ACTION": str(tmp_path / "absent-last-action"),
+    }
+    env.update(extra)
+    return env
+
+
+_NO_DONE_EPOCH = 'read_done_epoch() { echo ""; }'
+
+
 def test_dead_idle_fires_when_pane_dead_and_progress_stale(tmp_path: Path) -> None:
     old = str(int(NOW) - 4000)  # > 3600s ceiling
     prelude = (
         '_spoke_pane_target() { echo ""; }; slot_state() { echo busy; }; '
-        f"read_progress_epoch() {{ echo {old}; }}"
+        f"{_NO_DONE_EPOCH}; read_progress_epoch() {{ echo {old}; }}"
     )
-    assert _detect(prelude, "_wd_detect_dead_idle /wt 5 " + NOW) == 0
+    assert _detect(prelude, "_wd_detect_dead_idle /wt 5 " + NOW, env=_dead_pane_env(tmp_path)) == 0
 
 
 def test_dead_idle_quiet_when_pane_alive(tmp_path: Path) -> None:
     old = str(int(NOW) - 4000)
     prelude = (
         '_spoke_pane_target() { echo "hub:0"; }; slot_state() { echo busy; }; '
-        f"read_progress_epoch() {{ echo {old}; }}"
+        f"{_NO_DONE_EPOCH}; read_progress_epoch() {{ echo {old}; }}"
     )
-    assert _detect(prelude, "_wd_detect_dead_idle /wt 5 " + NOW) == 1
+    assert _detect(prelude, "_wd_detect_dead_idle /wt 5 " + NOW, env=_dead_pane_env(tmp_path)) == 1
 
 
 def test_dead_idle_quiet_when_done(tmp_path: Path) -> None:
     old = str(int(NOW) - 4000)
     prelude = (
         '_spoke_pane_target() { echo ""; }; slot_state() { echo done; }; '
-        f"read_progress_epoch() {{ echo {old}; }}"
+        f"{_NO_DONE_EPOCH}; read_progress_epoch() {{ echo {old}; }}"
     )
-    assert _detect(prelude, "_wd_detect_dead_idle /wt 5 " + NOW) == 1
+    assert _detect(prelude, "_wd_detect_dead_idle /wt 5 " + NOW, env=_dead_pane_env(tmp_path)) == 1
+
+
+# ── #290: condition 2 is blind to a successful land's teardown window ──────────
+# On #284 the watchdog fired "reaper missed a dead/idle pane" while auto_land was 13 minutes into
+# the land's push gate and seconds from removing the worktree. The land had already consumed the
+# ready/284 tag (so LIVE slot_state stopped reading `done`) and killed the tmux window, leaving
+# exactly the detector's firing shape on a spoke that was landing successfully. Two facts each
+# suppress it: the durable done-<N>.epoch (a terminal classification, checked in the detector), and
+# a land running RIGHT NOW (a servicing defer, gated in the dispatcher so it cannot clear the
+# firing-dedup marker mid-land — the #263 double-count hazard).
+_LAND_IN_FLIGHT_284 = "_wd_land_in_flight 284 " + NOW
+
+
+def test_land_in_flight_when_a_live_drain_is_landing_this_issue(tmp_path: Path) -> None:
+    # auto_land stamps `land #<issue>` BEFORE the synchronous land, so it names the issue for the
+    # land's whole duration — the primary signal.
+    last_action = tmp_path / "last-action"
+    last_action.write_text("land #284\n")
+    env = _dead_pane_env(tmp_path, AFK_LAST_ACTION=str(last_action))
+
+    result = _call(f"_wd_drain_state() {{ echo live; }}; {_LAND_IN_FLIGHT_284}", env=env)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_land_in_flight_false_when_the_drain_is_landing_another_issue(tmp_path: Path) -> None:
+    last_action = tmp_path / "last-action"
+    last_action.write_text("land #999\n")
+    env = _dead_pane_env(tmp_path, AFK_LAST_ACTION=str(last_action))
+
+    assert (
+        _call(f"_wd_drain_state() {{ echo live; }}; {_LAND_IN_FLIGHT_284}", env=env).returncode == 1
+    )
+
+
+def test_land_in_flight_false_when_the_drain_crashed_mid_land(tmp_path: Path) -> None:
+    # A stale last-action outlives a crashed drain: the record still says `land #284` but nothing is
+    # running it. Only a LIVE drain counts — else a crash would silence condition 2 forever.
+    last_action = tmp_path / "last-action"
+    last_action.write_text("land #284\n")
+    env = _dead_pane_env(tmp_path, AFK_LAST_ACTION=str(last_action))
+
+    assert (
+        _call(f"_wd_drain_state() {{ echo stale; }}; {_LAND_IN_FLIGHT_284}", env=env).returncode
+        == 1
+    )
+
+
+def _land_log(tmp_path: Path, issue: str, age: int) -> Path:
+    """Write <state-dir>/land-<issue>.log with an mtime `age` seconds before NOW."""
+    state_dir = tmp_path / "afk-state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    log = state_dir / f"land-{issue}.log"
+    log.write_text("running the push gate...\n")
+    os.utime(log, (int(NOW) - age, int(NOW) - age))
+    return log
+
+
+def test_land_in_flight_when_the_land_log_is_fresh(tmp_path: Path) -> None:
+    # The fallback signal for a clobbered/stale last-action: the land's own log is still being
+    # written. The drain is off here, so ONLY the log mtime can carry the verdict.
+    _land_log(tmp_path, "284", age=60)
+
+    assert _call(_LAND_IN_FLIGHT_284, env=_dead_pane_env(tmp_path)).returncode == 0
+
+
+def test_land_in_flight_false_when_the_land_log_is_stale(tmp_path: Path) -> None:
+    # The defer is BOUNDED, not permanent: a land log untouched past HUB_WATCHDOG_LAND_ACTIVE
+    # (900s) is a finished/abandoned land, not one in flight — else a single land log on disk would
+    # silence condition 2 for that issue forever.
+    _land_log(tmp_path, "284", age=1000)
+
+    assert _call(_LAND_IN_FLIGHT_284, env=_dead_pane_env(tmp_path)).returncode == 1
+
+
+def test_land_in_flight_false_when_nothing_signals_a_land(tmp_path: Path) -> None:
+    assert _call(_LAND_IN_FLIGHT_284, env=_dead_pane_env(tmp_path)).returncode == 1
+
+
+def test_dead_idle_quiet_when_the_done_epoch_is_stamped(tmp_path: Path) -> None:
+    # AC1 (the detector half): the stamped done epoch records that the spoke reached terminal
+    # state. A land consuming the ready/284 tag flips LIVE slot_state off `done` while the worktree
+    # still exists — the durable epoch does not follow it, so this shape is never a reaper miss.
+    # Post-done staleness is condition 4's (mergeable-skipped) ceiling.
+    prelude = (
+        '_spoke_pane_target() { echo ""; }; slot_state() { echo busy; }; '
+        f"read_done_epoch() {{ echo {int(NOW) - 4600}; }}; "
+        f"read_progress_epoch() {{ echo {int(NOW) - 4459}; }}"
+    )
+
+    assert (
+        _detect(prelude, "_wd_detect_dead_idle /wt 284 " + NOW, env=_dead_pane_env(tmp_path)) == 1
+    )
+
+
+# The #284 replay, through the DISPATCHER — the servicing defer lives there, not in the detector.
+def _dead_pane_dispatch_env(tmp_path: Path, **extra: str) -> dict[str, str]:
+    env = _dead_pane_env(
+        tmp_path,
+        HUB_WATCHDOG_LEDGER=str(tmp_path / "l.jsonl"),
+        HUB_WATCHDOG_LANDMARK_REPO=str(tmp_path / "no-landmark-repo"),
+        # The revive seam MUST be stubbed: the default runs `nohup claude --continue` for real.
+        HUB_WATCHDOG_REVIVE_CMD=f'printf "%s" "$2" > {tmp_path / "revived"}',
+    )
+    env.update(extra)
+    return env
+
+
+def _dead_pane_dispatch_prelude(*, done_epoch: str, drain: str = "off") -> str:
+    """The #284 tick shape: worktree in-flight, ready tag consumed, window killed, progress stale."""
+    return (
+        'inflight_worktrees() { printf "/the/wt\\t284\\n"; }; '
+        f"_wd_drain_state() {{ echo {drain}; }}; "
+        '_spoke_pane_target() { echo ""; }; '  # the land killed the tmux window
+        "slot_state() { echo busy; }; "  # the land consumed ready/284 ⇒ no longer `done`
+        f'read_done_epoch() {{ echo "{done_epoch}"; }}; '
+        f"read_progress_epoch() {{ echo {int(NOW) - 4459}; }}; "
+        'read_answer_attempt() { echo ""; }'
+    )
+
+
+def test_run_conditions_defers_dead_pane_during_a_land_teardown(tmp_path: Path) -> None:
+    # AC1: the full #284 shape — done epoch stamped, land mid-flight, ready tag consumed, window
+    # killed, worktree still present, progress epoch past the ceiling ⇒ NO fire and NO revive.
+    last_action = tmp_path / "last-action"
+    last_action.write_text("land #284\n")
+    ledger = tmp_path / "l.jsonl"
+    env = _dead_pane_dispatch_env(tmp_path, AFK_LAST_ACTION=str(last_action))
+    prelude = _dead_pane_dispatch_prelude(done_epoch=str(int(NOW) - 4600), drain="live")
+
+    _call(f"{prelude}; _wd_run_conditions {NOW} live", env=env)
+
+    assert not ledger.exists(), "a successful land's teardown is not a reaper miss"
+    assert not (tmp_path / "revived").exists(), "never revive into a worktree being removed"
+
+
+def test_run_conditions_defer_keeps_the_dead_pane_dedup_marker_during_a_land(
+    tmp_path: Path,
+) -> None:
+    # The amendment's rationale (#263): the defer must NOT clear a prior firing's dedup marker.
+    # Clearing it mid-land would let a subsequently-failed land re-fire and double-count in the
+    # ledger — which is exactly why the defer is gated in the dispatcher rather than the detector
+    # (a detector returning 1 falls into the else-branch, which clears).
+    marker = tmp_path / "wd-fire-dedup-dead-pane-284"  # dir == dirname(ledger)
+    marker.write_text("")
+    last_action = tmp_path / "last-action"
+    last_action.write_text("land #284\n")
+    env = _dead_pane_dispatch_env(tmp_path, AFK_LAST_ACTION=str(last_action))
+    prelude = _dead_pane_dispatch_prelude(done_epoch=str(int(NOW) - 4600), drain="live")
+
+    _call(f"{prelude}; _wd_run_conditions {NOW} live", env=env)
+
+    assert marker.exists(), "a servicing defer must neither fire nor clear the firing marker"
+
+
+def test_run_conditions_fires_dead_pane_on_a_genuine_reaper_miss(tmp_path: Path) -> None:
+    # AC2: the complement — no done epoch, no land in flight, drain not servicing the issue, pane
+    # gone with progress past the ceiling. A real abandoned spoke still fires AND still revives.
+    ledger = tmp_path / "l.jsonl"
+    env = _dead_pane_dispatch_env(tmp_path)
+    prelude = _dead_pane_dispatch_prelude(done_epoch="", drain="off")
+
+    _call(f"{prelude}; _wd_run_conditions {NOW} off", env=env)
+
+    assert '"condition":"dead-pane"' in ledger.read_text()
+    assert (tmp_path / "revived").read_text() == "284"
 
 
 # Condition 3 — stale blocked marker (real git)
