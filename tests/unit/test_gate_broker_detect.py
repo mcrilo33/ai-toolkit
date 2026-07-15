@@ -791,6 +791,109 @@ def test_broker_gate_route_falls_back_to_transcript_without_artifact(
     )
 
 
+# ── #289: stat flavor ordering (the CI-red bug class already fixed once in #132) ──
+#
+# Every stat fallback must try the GNU spelling FIRST. GNU stat's `-f` means "display
+# filesystem status" and takes no inline format, so a BSD-first `stat -f %m F || stat -c %Y F`
+# chain has GNU read `%m` as a missing file operand: it errors on %m yet still PRINTS a
+# multi-line filesystem-status block for F and exits nonzero -- so the `||` fallback fires
+# too and the capture holds the garbage block AND the epoch. GNU-first inverts this: BSD
+# fails the `-c` probe CLEANLY (usage error, empty stdout), so only one answer is ever
+# captured. These stubs simulate both flavors, so each pins the ordering on any host.
+
+_GNU_STAT_STUB = (
+    "#!/bin/sh\n"
+    'if [ "$1" = "-c" ]; then\n'
+    '  case "$2" in\n'
+    "    %Y) echo 1000003500; exit 0 ;;\n"
+    "    %s) echo 4096; exit 0 ;;\n"
+    "  esac\n"
+    "fi\n"
+    'if [ "$1" = "-f" ]; then\n'
+    '  echo "  File: \\"$3\\""\n'
+    '  echo "    ID: b505c8e079f9471 Namelen: 255     Type: ext2/ext3"\n'
+    '  echo "  Block size: 4096       Fundamental block size: 4096"\n'
+    '  echo "stat: cannot read file system information for $2" >&2\n'
+    "  exit 1\n"
+    "fi\n"
+    "exit 1\n"
+)
+
+_BSD_STAT_STUB = (
+    "#!/bin/sh\n"
+    'if [ "$1" = "-c" ]; then echo "stat: illegal option -- c" >&2; exit 1; fi\n'
+    'if [ "$1" = "-f" ]; then\n'
+    '  case "$2" in\n'
+    "    %m) echo 1000003500; exit 0 ;;\n"
+    "    %z) echo 4096; exit 0 ;;\n"
+    "  esac\n"
+    "fi\n"
+    "exit 1\n"
+)
+
+
+def _stat_stub_path(tmp_path: Path, stub_body: str) -> str:
+    """Install a fake `stat` and return a PATH with it in front of the real one."""
+    bindir = tmp_path / "stat-stub-bin"
+    bindir.mkdir(exist_ok=True)
+    stub = bindir / "stat"
+    stub.write_text(stub_body)
+    stub.chmod(0o755)
+    return f"{bindir}:{os.environ['PATH']}"
+
+
+def _seed_transcript(projects: Path, wt: Path) -> None:
+    _project_dir_for(projects, wt).joinpath("session.jsonl").write_text("{}\n")
+
+
+@pytest.mark.parametrize("stub", [_GNU_STAT_STUB, _BSD_STAT_STUB], ids=["gnu", "bsd"])
+def test_transcript_idle_seconds_survives_both_stat_flavors(
+    spoke_repo: Path, tmp_path: Path, stub: str
+) -> None:
+    # The mtime capture must hold the bare epoch on both flavors: under GNU the fs-status
+    # block must never leak in, or the `$(afk_now) - mtime` arithmetic chokes on a
+    # multi-line string and the caller's RC goes wrong (the four red test_gate_broker nodes).
+    projects = tmp_path / "projects"
+    _seed_transcript(projects, spoke_repo)
+
+    result = _call(
+        f"_transcript_idle_seconds '{spoke_repo}'",
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_NOW": "1000003600",
+            "PATH": _stat_stub_path(tmp_path, stub),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "100", (
+        f"idle must read as a bare epoch delta: {result.stdout!r}{result.stderr}"
+    )
+
+
+@pytest.mark.parametrize("stub", [_GNU_STAT_STUB, _BSD_STAT_STUB], ids=["gnu", "bsd"])
+def test_task_output_mtime_survives_both_stat_flavors(
+    spoke_repo: Path, tmp_path: Path, stub: str
+) -> None:
+    # Same ordering contract on the task-output clock: a polluted capture would make the
+    # `[ "$mt" -gt "$newest" ]` comparison error and mis-read the reaper's busy signal.
+    tasks_root = tmp_path / "tasks-root"
+    _seed_task_output(tasks_root, spoke_repo, 1_000_003_500)
+
+    result = _call(
+        f"_task_output_mtime '{spoke_repo}'",
+        env={
+            "AFK_TASKS_ROOT": str(tasks_root),
+            "PATH": _stat_stub_path(tmp_path, stub),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1000003500", (
+        f"task-output mtime must be a bare epoch: {result.stdout!r}{result.stderr}"
+    )
+
+
 def test_consume_gate_tag_removes_artifact(spoke_repo: Path) -> None:
     (spoke_repo / ".ai-toolkit").mkdir()
     artifact = spoke_repo / ".ai-toolkit" / "gate-5.md"
