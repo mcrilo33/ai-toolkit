@@ -30,6 +30,7 @@ DANGER_SURFACE = (
     "_danger_eval_seg",
     "_danger_gh_seg",
     "judge_permission",
+    "broker_judge_probe",
     "broker_judge_halt_pending",
     "broker_reset_judge_halt",
 )
@@ -556,3 +557,250 @@ def test_broker_reset_judge_halt_clears_flag(tmp_path: Path) -> None:
 
     assert "before-RAISED" in result.stdout, result.stdout + result.stderr
     assert result.stdout.strip().splitlines()[-1] == "cleared", result.stdout + result.stderr
+
+
+# ── issue #279: the arm-time judge round-trip probe (broker_judge_probe) ──────
+# The /afk arm-time self-check proves the tier-3 judge is STRUCTURALLY ALIVE before a single
+# spoke dispatches: the #268 failure (a 2s budget vs a `claude -p` cold start that alone
+# exceeds it) passed every STATIC check and still fail-closed every uncached tier-3 verdict
+# for an hour. The probe runs ONE real round trip through the same judge internals
+# judge_permission uses, on a benign sentinel, and requires a PARSED verdict -- so a
+# structurally-dead judge is caught at arm rather than autopsied mid-drain.
+#
+# Contract: rc 0 + "AVAILABLE<TAB><verdict>" when a verdict parsed; rc 1 +
+# "UNAVAILABLE<TAB><reason>" otherwise, the reason keeping judge_permission's three-way split
+# (timed out / unavailable / unparseable). Only PARSE-ability is required, never a specific
+# verdict value: a judge answering "dangerous" for a read-only sentinel is odd but
+# demonstrably alive, and asserting the value would make LLM nondeterminism a false refusal.
+#
+# It is a PROBE, not a decision, so it must leave NO per-window state behind: no verdict cache
+# entry (the #268 cache-poisoning subtlety), no consecutive-unavailable streak, no halt flag.
+
+
+def _probe_report(tmp_path: Path, **extra: str) -> tuple[str, str, str]:
+    """Run broker_judge_probe under a stubbed judge -> (kind, reason, "RC=<n>")."""
+    result = _call("broker_judge_probe; echo RC=$?", env=_judge_env(tmp_path, **extra))
+    lines = result.stdout.strip().splitlines()
+    kind, _, reason = (lines[0] if len(lines) > 1 else "").partition("\t")
+    return kind, reason, (lines[-1] if lines else "")
+
+
+def test_judge_probe_available_on_parsed_safe_verdict(tmp_path: Path) -> None:
+    kind, reason, rc = _probe_report(tmp_path, AFK_JUDGE_CMD="printf 'VERDICT: safe\\n'")
+
+    assert (kind, reason, rc) == ("AVAILABLE", "judge verdict: safe", "RC=0")
+
+
+def test_judge_probe_available_on_parsed_dangerous_verdict(tmp_path: Path) -> None:
+    # A PARSED verdict of either value proves the judge ran and answered -- that is the whole
+    # liveness question. The probe must not require the sentinel to be judged safe. Asserting
+    # the REPORTED verdict (not just AVAILABLE) is what distinguishes this from the safe case:
+    # a probe that hard-coded "judge verdict: safe" would otherwise pass both.
+    kind, reason, rc = _probe_report(
+        tmp_path, AFK_JUDGE_CMD="printf 'reason\\nVERDICT: dangerous\\n'"
+    )
+
+    assert (kind, reason, rc) == ("AVAILABLE", "judge verdict: dangerous", "RC=0")
+
+
+def test_judge_probe_unavailable_on_error(tmp_path: Path) -> None:
+    kind, reason, rc = _probe_report(tmp_path, AFK_JUDGE_CMD="exit 3")
+
+    assert (kind, rc) == ("UNAVAILABLE", "RC=1"), f"{kind!r} {reason!r} {rc!r}"
+    assert "rc=3" in reason, reason
+
+
+def test_judge_probe_reason_carries_the_judges_own_diagnostic(tmp_path: Path) -> None:
+    # The probe exists to REPLACE the #268 autopsy with an answer, so a bare "rc=1" is not
+    # enough: an expired token, a mistyped model, and a missing `claude` all exit nonzero and
+    # are indistinguishable without the CLI's own message -- which it prints on STDERR.
+    kind, reason, _ = _probe_report(
+        tmp_path, AFK_JUDGE_CMD='sh -c "echo \\"Invalid API key - please run /login\\" >&2; exit 1"'
+    )
+
+    assert kind == "UNAVAILABLE", reason
+    assert "Invalid API key" in reason, (
+        f"the judge's own stderr must reach the operator: {reason!r}"
+    )
+
+
+def test_judge_probe_unavailable_on_timeout(tmp_path: Path) -> None:
+    # The #268 repro: a judge whose round trip cannot finish inside its own budget. The probe
+    # runs under the REAL _judge_timeout, so AFK_JUDGE_TIMEOUT=1 reproduces the dead-judge host
+    # at arm time -- and the reason must name the TIMEOUT distinctly (#268 AC3).
+    kind, reason, rc = _probe_report(tmp_path, AFK_JUDGE_CMD="sleep 5", AFK_JUDGE_TIMEOUT="1")
+
+    assert (kind, rc) == ("UNAVAILABLE", "RC=1"), f"{kind!r} {reason!r} {rc!r}"
+    assert "timed out" in reason, reason
+
+
+def test_judge_probe_unavailable_on_unparseable_verdict(tmp_path: Path) -> None:
+    # A judge that ANSWERED but not in the contract's shape is not usable for tier-3 decisions
+    # (every verdict would fail closed) -- so the arm-time probe reports it unavailable.
+    kind, reason, rc = _probe_report(tmp_path, AFK_JUDGE_CMD="printf 'I am not sure\\n'")
+
+    assert (kind, rc) == ("UNAVAILABLE", "RC=1"), f"{kind!r} {reason!r} {rc!r}"
+    assert "unparseable" in reason, reason
+
+
+def _recording_judge_env(tmp_path: Path, seen: Path, **extra: str) -> dict[str, str]:
+    """A stubbed judge that records the prompt it received, then answers `safe`."""
+    return _judge_env(
+        tmp_path,
+        SEEN=str(seen),
+        AFK_JUDGE_CMD='sh -c "cat > \\"$SEEN\\"; printf VERDICT:\\\\ safe\\\\n"',
+        **extra,
+    )
+
+
+def test_judge_probe_round_trips_the_sentinel(tmp_path: Path) -> None:
+    # Proof it is a REAL round trip, not a liveness fiction: the stub records the prompt it
+    # received, which must carry the sentinel command the probe was asked to judge.
+    seen = tmp_path / "prompt"
+    env = _recording_judge_env(tmp_path, seen, AFK_JUDGE_SENTINEL="sentinel-xyz")
+
+    _call("broker_judge_probe >/dev/null", env=env)
+
+    assert "sentinel-xyz" in seen.read_text(), seen.read_text()
+
+
+def test_judge_probe_round_trips_an_explicit_sentinel_argument(tmp_path: Path) -> None:
+    # The documented positional (`broker_judge_probe [sentinel]`) is the arm path's seam, so it
+    # needs its own pin: with only the env-var test above, simplifying the body to ignore "$1"
+    # would leave the whole suite green while the caller silently probed something else.
+    seen = tmp_path / "prompt"
+    env = _recording_judge_env(tmp_path, seen, AFK_JUDGE_SENTINEL="from-the-env")
+
+    _call('broker_judge_probe "explicit-arg-cmd" >/dev/null', env=env)
+
+    prompt = seen.read_text()
+    assert "explicit-arg-cmd" in prompt, prompt
+    assert "from-the-env" not in prompt, "the positional must WIN over AFK_JUDGE_SENTINEL"
+
+
+def test_judge_probe_writes_no_verdict_cache(tmp_path: Path) -> None:
+    # THE #268 subtlety, and the one regression a future refactor would silently reintroduce:
+    # the sentinel probe must never write the per-window verdict cache. judge_permission caches
+    # PARSED verdicts by command hash -- so the healthy path is exactly where a shared-code
+    # refactor would start caching the sentinel.
+    env = _judge_env(tmp_path, AFK_JUDGE_CMD="printf 'VERDICT: safe\\n'")
+
+    _call("broker_judge_probe >/dev/null", env=env)
+
+    cache = tmp_path / "afk-state" / "judge-cache"
+    entries = sorted(p.name for p in cache.iterdir()) if cache.is_dir() else []
+    assert entries == [], f"the probe cached a verdict: {entries}"
+
+
+def test_judge_probe_does_not_poison_a_later_real_verdict(tmp_path: Path) -> None:
+    # The consequence the cache-write pin protects, driven through the HEALTHY probe. Driving it
+    # with a dead judge would be vacuous: an unavailable verdict is never cacheable (#268), so
+    # even a probe routed straight through judge_permission would leave the cache clean and the
+    # test green. A PARSED sentinel verdict is the only outcome judge_permission WOULD cache, so
+    # it is the only one that proves the probe is not caching. The later real call must re-run
+    # the judge -- here it answers `dangerous`, which a poisoned `SAFE` cache entry would mask.
+    healthy = _judge_env(
+        tmp_path, AFK_JUDGE_SENTINEL="probe-sentinel", AFK_JUDGE_CMD="printf 'VERDICT: safe\\n'"
+    )
+    strict = _judge_env(tmp_path, AFK_JUDGE_CMD="printf 'VERDICT: dangerous\\n'")
+
+    _call("broker_judge_probe >/dev/null", env=healthy)
+    later = _call('judge_permission "probe-sentinel" | cut -f1', env=strict)
+
+    assert later.stdout.strip() == "DANGEROUS", (
+        "the probe cached its sentinel verdict, so the later real decision was never judged"
+    )
+
+
+def test_judge_probe_never_reads_the_verdict_cache(tmp_path: Path) -> None:
+    # The read-path twin of the cache-write pin. The cache lives under the git COMMON dir and no
+    # fresh-arm reset clears it, so a sentinel entry left by any earlier window would let a
+    # cache-first probe report AVAILABLE having never contacted the judge -- arming clean against
+    # a dead judge and certifying the exact #268 host the probe exists to catch. Seed the cache
+    # by hand, then assert the probe still round-trips to the judge.
+    cache = tmp_path / "afk-state" / "judge-cache"
+    cache.mkdir(parents=True)
+    key = _call('_judge_cache_key "probe-sentinel"', env=_judge_env(tmp_path)).stdout.strip()
+    (cache / key).write_text("SAFE\n")
+    seen = tmp_path / "prompt"
+    env = _recording_judge_env(tmp_path, seen, AFK_JUDGE_SENTINEL="probe-sentinel")
+
+    _call("broker_judge_probe >/dev/null", env=env)
+
+    assert seen.exists(), "the probe answered from the verdict cache instead of the judge"
+    assert "probe-sentinel" in seen.read_text(), seen.read_text()
+
+
+# ── #279 review: the timeout rc is caller-context-dependent ──────────────────
+# _broker_run_bounded resolves its bound differently depending on who sourced it: the
+# danger-guard hook (gate-broker.sh alone) gets perl `alarm` -> 142, a coreutils host gets
+# `timeout` -> 124, and the SUPERVISOR -- which sources hub-afk.sh, so _afk_with_timeout wins
+# and its portable fallback tree-kills with TERM -> 143. Keying "timed out" on the rc ALONE
+# therefore reported the #268 budget failure as "judge unavailable" in exactly the arm-time
+# context #279 adds, inverting the AC3 split at the one moment it pays off. These pin the
+# mapping directly, since the pytest harness sources gate-broker.sh WITHOUT hub-afk.sh and so
+# can never reach the 143 path end-to-end (the supervisor-context test lives in test_hub_afk).
+
+
+@pytest.mark.parametrize(
+    "rc,elapsed,budget,expected",
+    [
+        pytest.param("124", "0", "120", "timed out", id="coreutils-timeout-rc"),
+        pytest.param("142", "0", "120", "timed out", id="perl-alarm-rc"),
+        pytest.param("143", "120", "120", "timed out", id="supervisor-tree-kill-at-budget"),
+        pytest.param("143", "2", "120", "unavailable", id="sigterm-well-before-budget"),
+        pytest.param("137", "120", "120", "timed out", id="sigkill-at-budget"),
+        pytest.param("3", "0", "120", "unavailable", id="crashed-judge"),
+        pytest.param("1", "121", "120", "timed out", id="any-rc-past-the-budget"),
+    ],
+)
+def test_judge_fail_reason_names_a_timeout_by_elapsed_not_just_rc(
+    tmp_path: Path, rc: str, elapsed: str, budget: str, expected: str
+) -> None:
+    result = _call(f"_judge_fail_reason {rc} {elapsed} {budget}", env=_judge_env(tmp_path))
+
+    assert expected in result.stdout, f"rc={rc} elapsed={elapsed}/{budget}: {result.stdout!r}"
+    assert f"rc={rc}" in result.stdout, result.stdout
+
+
+def test_judge_fail_reason_does_not_overclaim_a_timeout_without_timing(tmp_path: Path) -> None:
+    # Called with no timing (the pre-#279 arity), an ambiguous kill rc must stay "unavailable":
+    # 137/143 overlap with a real operator SIGTERM/SIGKILL, so they may never read as a timeout
+    # on the rc alone. Only the elapsed evidence promotes them.
+    result = _call("_judge_fail_reason 143", env=_judge_env(tmp_path))
+
+    assert "unavailable" in result.stdout, result.stdout
+    assert "timed out" not in result.stdout, result.stdout
+
+
+def test_judge_probe_leaves_streak_and_halt_untouched(tmp_path: Path) -> None:
+    # A probe is not a DECISION: repeated unavailable probes must not feed the #268
+    # consecutive-unavailable streak or raise the drain-level halt. Only real judge_permission
+    # calls count -- else an arm-time self-check would hand the fresh window a pre-raised halt.
+    env = _judge_env(tmp_path, AFK_JUDGE_CMD="exit 3", AFK_JUDGE_HALT_STREAK="2")
+
+    result = _call(
+        "broker_judge_probe >/dev/null; broker_judge_probe >/dev/null; "
+        "broker_judge_halt_pending && echo RAISED || echo clear",
+        env=env,
+    )
+
+    assert result.stdout.strip() == "clear", result.stdout + result.stderr
+    assert not (tmp_path / "afk-state" / "judge-unavailable-streak").exists()
+
+
+def test_judge_probe_does_not_clear_a_raised_halt(tmp_path: Path) -> None:
+    # The mirror invariant: a HEALTHY probe must not clear a halt raised by real decisions
+    # either. Only a real reachable judge_permission proves the drain can resume (#268 AC4);
+    # a sentinel probe silently clearing the flag would resume dispatch on no evidence.
+    dead = _judge_env(tmp_path, AFK_JUDGE_CMD="exit 3", AFK_JUDGE_HALT_STREAK="2")
+    healthy = _judge_env(tmp_path, AFK_JUDGE_CMD="printf 'VERDICT: safe\\n'")
+
+    _call('judge_permission "a" >/dev/null; judge_permission "b" >/dev/null', env=dead)
+    after = _call(
+        "broker_judge_probe >/dev/null; "
+        "broker_judge_halt_pending && echo still-RAISED || echo cleared",
+        env=healthy,
+    )
+
+    assert after.stdout.strip() == "still-RAISED", after.stdout + after.stderr

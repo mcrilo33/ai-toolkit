@@ -66,6 +66,23 @@
 #                                onto the new code at the next tick boundary (see the self-update
 #                                block below); AFK_SYNC_CMD / AFK_SELFUPDATE_SMOKE_CMD are seams.
 #   AFK_ARM_PRECHECK=1           arm-precondition gate (=0 skips live/dirty/branch/gh-auth checks)
+#   AFK_ARM_SELFCHECK=1          arm-time LIVENESS self-check (#279): real round trips against
+#                                the judge, claude, the gh API and testmon, reported with the
+#                                telemetry preflight as ONE verdict before any state is
+#                                written. =0 waives those four LIVE PROBES (independent of
+#                                AFK_ARM_PRECHECK); the telemetry gate still runs — its own
+#                                opt-out is AI_TOOLKIT_OTEL=0. Arm-only: NOT run on --reconcile
+#                                or a watchdog respawn, which are recovery paths
+#   AFK_ARM_AUTH_TIMEOUT=120     seconds bounding the arm-time claude round trip (#279) — a COLD
+#                                start, so between the reap probe's 30s and the answerer's 900s
+#   AFK_GH_PROBE_ENDPOINT        the arm-time gh api round-trip endpoint [default: rate_limit];
+#                                proves the API answers, not just that a token exists (#279)
+#   AFK_TESTMON_PROBE_CMD        override the whole pytest-testmon probe (tests); rc 0 ⇒ present.
+#                                Missing testmon WARNS (every first push degrades to the full
+#                                suite) — it never blocks the arm (#279)
+#   AFK_TESTMON_PROBE_TIMEOUT=60 seconds bounding the testmon probe's runner --help call (#279)
+#   AFK_JUDGE_SENTINEL           the benign command the arm-time judge probe classifies (#279);
+#                                see gate-broker-danger.sh (AFK_JUDGE_TIMEOUT bounds it)
 #   AFK_AUTH_PROBE_CMD           auth probe: reap-time AND the #241 §9 per-tick auth-halt re-probe (default: a bounded headless claude no-op)
 #   AFK_NET_PROBE_URL            #249 reachability probe target (default: https://api.anthropic.com)
 #   AFK_NET_PROBE_TIMEOUT=10     seconds bounding the #249 reachability probe (via _afk_with_timeout)
@@ -3094,6 +3111,20 @@ afk_reconcile() {
     log "/afk reconcile: preconditions not met — not re-arming (see above)"
     return 1
   fi
+  # NO #279 liveness self-check here, deliberately. Reconcile looks like a re-arm, but it is
+  # the RECOVERY path: hub-watchdog.sh's _wd_intervene_rearm recovers a crashed drain with
+  # `bash hub-afk.sh --reconcile >/dev/null 2>&1 || true`, discarding both the output and the
+  # exit code. Gating that on live judge/claude/gh round trips would mean a transient outage
+  # (the very thing most likely to be happening around a crash) SILENTLY blocks recovery: the
+  # watchdog records the intervention, the refusal log goes to /dev/null, .afk-state stays
+  # armed, and every in-flight spoke strands with no answerer or lander — the ~10h overnight
+  # strand this function exists to prevent (#202 A). It would also block each watchdog tick for
+  # up to ~4 minutes of probes before the per-spoke detectors run.
+  #
+  # Refusing to resume is strictly worse than resuming degraded: a dead judge still leaves the
+  # lander and reaper working, and #268's judge halt plus #241 §9's auth halt already catch a
+  # dependency that dies mid-window. The self-check is therefore ARM-ONLY (#279) — the moment
+  # a fresh window is about to dispatch its first spoke into those dependencies.
   if ! afk_telemetry_preflight "$repo_root"; then
     log "/afk reconcile: telemetry preflight failed — not re-arming (see above)"
     return 1
@@ -3349,6 +3380,134 @@ _afk_warn_no_inhibitor() {
   log "/afk: WARNING — 'caffeinate' not found (non-macOS?); the drain will NOT inhibit system sleep — the equivalent here is 'systemd-inhibit --what=sleep'"
 }
 
+# --- arm-time liveness probes (issue #279) ------------------------------------
+# afk_arm_preconditions below is STATIC: a live supervisor, a clean tree, HEAD on base, a
+# valid gh token. Every one of those passed on the #268 host while the tier-3 judge was
+# structurally dead (a 2s budget could not cover a `claude -p` cold start), so /afk armed
+# clean, dispatched, and fail-closed every uncached tier-3 verdict to DENY for ~an hour --
+# diagnosed only by autopsying a stranded spoke's judge-cache.
+#
+# The whole failure CLASS is that shape: a dependency the drain cannot run without is dead,
+# every static check passes anyway, and the drain silently grinds. These are the REAL round
+# trips that catch it before a single spoke dispatches. Each is bounded (a dead dependency
+# must never hang the arm itself) and each has a stub seam so no test needs a live `claude`,
+# a network, or a real `gh`.
+
+# _afk_arm_judge_check -> rc 0 when the tier-3 judge answered with a parsed verdict, else rc 1.
+# Prints the probe's reason either way (the caller logs it). Delegates to gate-broker-danger's
+# broker_judge_probe, which runs the REAL prompt/command/budget on a benign sentinel and writes
+# no verdict cache, streak, or halt (#268). hub-afk.sh already sources gate-broker.sh, so this
+# is a direct call; a broker without the probe (a stale sync) reads as unavailable rather than
+# silently passing -- an unprovable judge is exactly what this check exists to refuse.
+_afk_arm_judge_check() {
+  if ! command -v broker_judge_probe >/dev/null 2>&1; then
+    printf 'judge probe unavailable (stale gate-broker.sh -- re-sync)\n'
+    return 1
+  fi
+  local report
+  report="$(broker_judge_probe)"; local rc=$?
+  printf '%s\n' "${report#*$'\t'}"   # drop the AVAILABLE/UNAVAILABLE tag, keep the reason
+  return "$rc"
+}
+
+# _afk_arm_claude_check -> print offline | auth-dead | unresponsive | alive; rc 0 ONLY for
+# alive. Reuses #249's machinery -- _afk_network_is_down first (so a connectivity blackout is
+# never reported as "your token is dead"), the same AFK_AUTH_PROBE_CMD seam, and the same
+# is_auth_failure signature detector -- but it deliberately does NOT call _afk_probe_state.
+#
+# WHY NOT: _afk_probe_state fails OPEN by design. A nonzero exit WITHOUT an auth signature --
+# `claude` absent from PATH, a wedged CLI, a probe killed at its budget -- reads as "alive"
+# there, and that is CORRECT at reap time: a transient hiccup must never halt a drain that is
+# already running and doing useful work. An ARM-time gate needs the opposite polarity: it must
+# refuse unless liveness is PROVEN, because arming wrong dispatches every spoke into a
+# dependency that cannot answer. Reusing it verbatim made this check pass on exactly the
+# conditions it exists to catch (verified: a nonexistent probe binary reported alive/rc 0),
+# which is the #268 failure class the arm-time self-check was added to close. The sibling
+# probes (gh, judge) already fail closed; this one was the lone hole.
+#
+# So: rc 0 is POSITIVE PROOF the CLI answered -> alive. A nonzero exit carrying an auth
+# signature -> auth-dead (the recoverable, operator-actionable state). Any other nonzero ->
+# unresponsive, a FOURTH state the reap path has no need for and does not see.
+#
+# The budget is the other arm-time difference. The reap probe's 30s bounds a warm, repeated
+# tick check; an arm-time round trip is COLD (CLI start + model round trip) -- the same cold
+# start whose 2s bound caused #268. AFK_ARM_AUTH_TIMEOUT (120s) sits between that 30s and the
+# answerer's 900s, and an operator who already raised AFK_AUTH_PROBE_TIMEOUT globally is
+# honored rather than silently narrowed back down.
+_afk_arm_claude_check() {
+  local secs cmd raw rc
+  secs="${AFK_ARM_AUTH_TIMEOUT:-${AFK_AUTH_PROBE_TIMEOUT:-120}}"
+  case "$secs" in '' | *[!0-9]*) secs=120 ;; esac   # never let a typo lift the bound
+  [ "$secs" -lt 1 ] && secs=120
+  if _afk_network_is_down; then printf 'offline\n'; return 1; fi
+  cmd="${AFK_AUTH_PROBE_CMD:-claude -p --no-session-persistence --model claude-opus-4-8 ok}"
+  raw="$(_afk_with_timeout "$secs" bash -c "$cmd" 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ]; then printf 'alive\n'; return 0; fi
+  if is_auth_failure "$raw"; then printf 'auth-dead\n'; return 1; fi
+  printf 'unresponsive\n'; return 1
+}
+
+# _afk_arm_gh_check -> rc 0 when a bounded REAL gh API round trip succeeds. afk_arm_preconditions
+# already runs `gh auth status`, which proves only that a token EXISTS -- a host whose token is
+# valid but whose API is unreachable (DNS, a proxy, an outage, a revoked scope) passes it and
+# then fails every dispatch, land, and answer. `rate_limit` is the cheapest authenticated
+# endpoint and mutates nothing, so the probe is free of side effects.
+_afk_arm_gh_check() {
+  _afk_with_timeout "$AFK_GH_TIMEOUT" gh api "${AFK_GH_PROBE_ENDPOINT:-rate_limit}" \
+    >/dev/null 2>&1
+}
+
+# _afk_arm_testmon_check [repo_root] -> print ok | missing | unknown; rc 0 only for ok.
+# Without pytest-testmon the pre-push gate cannot select affected tests, so EVERY first push
+# per worktree degrades to the full multi-thousand-test suite -- slow-but-correct, which is why
+# the caller warns rather than blocks. DETECTION ONLY: never install anything.
+#
+# The runner ladder deliberately MIRRORS shared/hooks/lib/utils.sh's detect_pytest instead of
+# sourcing it. utils.sh is a HOOK lib with source-time side effects that are wrong in a
+# supervisor: `set -euo pipefail`, an `ai_toolkit_enabled || exit 0` off-switch (#154), and
+# telemetry_arm_hook_span's EXIT trap. Sourcing it made this probe report a FALSE "ok" -- the
+# off-marker's `exit 0` is not catchable by a `|| exit 3` guard, so a probe that ran NOTHING
+# read as a clean pass -- and a false "missing" when the lib's own source-time work failed. It
+# is also unreachable in a synced target (sync-to-repo.sh co-locates only telemetry/base-branch/
+# enabled next to hub-afk.sh; utils.sh ships to the platform hooks dir), so the probe would be
+# permanently `unknown` on every deployed hub. Four lines of duplication beat all of that.
+# UPGRADE: if detect_pytest ever grows a rung, mirror it here -- a drift only mis-WARNS.
+#
+# Each rung invokes its own argv rather than word-splitting a resolved string, so a repo path
+# containing a space cannot shred the command. The runner is asked whether it advertises
+# --testmon -- the exact check test-select.sh and gate-sweep.sh use to decide the degrade, so
+# this probe can never disagree with the gate it is warning about. `--help` is captured then
+# case-matched, never piped to `grep -q`, which would SIGPIPE the runner under pipefail and
+# falsely report testmon absent (the trap test-select.sh documents).
+#
+# `unknown` (a runner that will not answer) is deliberately NOT `missing`: a probe with no
+# evidence must not manufacture a warning. AFK_TESTMON_PROBE_CMD overrides the whole probe
+# (rc 0 => ok) for tests.
+_afk_arm_testmon_check() {
+  local repo_root="${1:-.}" venv secs help=""
+  secs="${AFK_TESTMON_PROBE_TIMEOUT:-60}"
+  case "$secs" in '' | *[!0-9]*) secs=60 ;; esac
+  if [ -n "${AFK_TESTMON_PROBE_CMD:-}" ]; then
+    if _afk_with_timeout "$secs" bash -c "$AFK_TESTMON_PROBE_CMD" >/dev/null 2>&1; then
+      printf 'ok\n'; return 0
+    fi
+    printf 'missing\n'; return 1
+  fi
+  venv="$repo_root/.venv/bin/pytest"
+  if [ -x "$venv" ]; then
+    help="$(_afk_with_timeout "$secs" "$venv" --help 2>/dev/null)"
+  elif command -v pytest >/dev/null 2>&1; then
+    help="$(_afk_with_timeout "$secs" pytest --help 2>/dev/null)"
+  elif command -v python3 >/dev/null 2>&1 && python3 -c 'import pytest' >/dev/null 2>&1; then
+    help="$(_afk_with_timeout "$secs" python3 -m pytest --help 2>/dev/null)"
+  else
+    printf 'missing\n'; return 1        # no pytest resolves at all -> certainly no testmon
+  fi
+  [ -n "$help" ] || { printf 'unknown\n'; return 1; }   # the runner would not answer
+  case "$help" in *--testmon*) printf 'ok\n'; return 0 ;; esac
+  printf 'missing\n'; return 1
+}
+
 # --- arm preconditions (issue #170 ST4) ---------------------------------------
 # Mirror the telemetry preflight's refuse-to-arm posture for the drain's OWN prerequisites:
 # a second supervisor clobbers per-run state, a dirty tree / off-base HEAD means the drain
@@ -3386,6 +3545,112 @@ afk_arm_preconditions() {
     log "/afk: refusing to arm — 'gh auth status' failed; run 'gh auth login' (dispatch/land/answer all need GitHub)"
     return 1
   fi
+  return 0
+}
+
+# --- the ONE arm-time verdict (issue #279) ------------------------------------
+
+# _afk_arm_telemetry_gate <repo_root> -> the #108 preflight with a self-check-shaped refusal
+# line. Runs on BOTH the probed and the opted-out path: AI_TOOLKIT_OTEL=0 is the telemetry
+# opt-out, AFK_ARM_SELFCHECK=0 is the liveness-probe opt-out, and neither may stand in for the
+# other. Called LAST on the probed path because it is the only check with side effects (it
+# launches the collector/bridge and exports auth) -- nothing gets started on a host that was
+# going to be refused anyway.
+_afk_arm_telemetry_gate() {
+  afk_telemetry_preflight "$1" && return 0
+  log "/afk: refusing to arm — the telemetry pipeline could not be wired (see above); the dashboard is the single source of truth for an unattended run (AI_TOOLKIT_OTEL=0 to drain without it)"
+  return 1
+}
+
+# _afk_telemetry_desc -> the verdict line's telemetry clause: never claim "wired" when the
+# operator opted out.
+_afk_telemetry_desc() {
+  if afk_telemetry_enabled; then
+    printf 'telemetry wired (collector :4317, bridge :4319)\n'
+  else
+    printf 'telemetry off (AI_TOOLKIT_OTEL=0)\n'
+  fi
+}
+# afk_arm_selfcheck <repo_root> -> rc 0 when the drain may arm (possibly DEGRADED), rc 1 to
+# refuse. Chained in main() AFTER afk_arm_preconditions (so the instant static refusals — a
+# dirty tree, an off-base HEAD, a live supervisor — never wait ~2 minutes on real round trips)
+# and BEFORE afk_write_state, so a refusal writes no state, reaches no loop, and dispatches
+# no spoke. AFK_ARM_SELFCHECK=0 opts the whole gate out, independently of AFK_ARM_PRECHECK.
+#
+# Per-check policy, and why each falls where it does:
+#   judge     BLOCK — a dead judge grinds EVERY tier-3 permission to DENY for the whole
+#                     window. This is #268 itself, the incident that motivated the issue.
+#   claude    BLOCK — no answerer means every parked spoke escalates to blocked/<issue>.
+#   gh api    BLOCK — dispatch, land, and answer all need the API, not merely a valid token.
+#   testmon   WARN  — the ONLY degradation that is still CORRECT, just slow (every first push
+#                     runs the full suite). Refusing the whole drain over it would be worse
+#                     than the problem.
+#   telemetry BLOCK — unchanged #108 posture (the dashboard is the SSOT for an unattended
+#                     run); AI_TOOLKIT_OTEL=0 remains its opt-out.
+#
+# Order: gh first (bounded 30s, the cheapest real proof), then the two ~2-minute LLM round
+# trips, then the free local testmon read, and telemetry LAST because it is the only check
+# with side effects — it launches the collector/bridge containers and exports auth. Nothing
+# gets started on a host that was going to be refused anyway.
+afk_arm_selfcheck() {
+  local repo_root="$1" judge_reason claude_state testmon_state telemetry_desc
+  # The opt-out waives the LIVE PROBES only -- never the telemetry preflight below. Folding
+  # telemetry inside this early return would have made AFK_ARM_SELFCHECK=0 a second, silent
+  # opt-out for a gate that already has its own explicit one (AI_TOOLKIT_OTEL=0), so an
+  # operator skipping the slow round trips would also have lost the #108 hard-fail without
+  # asking to.
+  if [ "${AFK_ARM_SELFCHECK:-1}" = "0" ]; then
+    _afk_arm_telemetry_gate "$repo_root" || return 1
+    log "/afk: arm self-check SKIPPED (AFK_ARM_SELFCHECK=0) — judge/claude/gh/testmon liveness NOT probed; $(_afk_telemetry_desc)"
+    return 0
+  fi
+
+  if ! _afk_arm_gh_check; then
+    log "/afk: refusing to arm — the GitHub API did not answer a bounded '${AFK_GH_PROBE_ENDPOINT:-rate_limit}' round trip (the token is present — 'gh auth status' passed — but the API is unreachable: check the network, a proxy, or an outage). Dispatch, land, and answer all need it (#279)"
+    return 1
+  fi
+
+  judge_reason="$(_afk_arm_judge_check)" || {
+    log "/afk: refusing to arm — the tier-3 permission judge is not usable: $judge_reason. An unusable judge fails EVERY uncached tier-3 verdict closed, so every spoke's permissions grind to DENY for the whole window (#268). Fix the judge, or raise AFK_JUDGE_TIMEOUT if it timed out (#279)"
+    return 1
+  }
+
+  claude_state="$(_afk_arm_claude_check)"
+  case "$claude_state" in
+    alive) ;;
+    offline)
+      log "/afk: refusing to arm — this host cannot reach the network (${AFK_NET_PROBE_URL:-https://api.anthropic.com} did not answer). Nothing is wrong with your credentials; restore connectivity and re-arm (#249/#279)"
+      return 1 ;;
+    auth-dead)
+      log "/afk: refusing to arm — the network is up but 'claude' reports an AUTH failure: the subscription token is dead and every spoke would stall on it. Run 'claude' → /login (see docs/remote-afk.md) and re-arm (#279)"
+      return 1 ;;
+    *)
+      # Name the budget the probe ACTUALLY used -- the same ladder _afk_arm_claude_check
+      # resolves -- or an operator who raised AFK_AUTH_PROBE_TIMEOUT is told to debug against
+      # a number that was never applied.
+      log "/afk: refusing to arm — 'claude' did not answer a bounded ${AFK_ARM_AUTH_TIMEOUT:-${AFK_AUTH_PROBE_TIMEOUT:-120}}s probe (no auth error, just no answer): the CLI may be absent from PATH, wedged, or slower than the budget. An arm-time gate must PROVE the answerer works before dispatching into it (#279)"
+      return 1 ;;
+  esac
+
+  # WARN-only: name the consequence the operator will actually feel, not the missing package.
+  testmon_state="$(_afk_arm_testmon_check "$repo_root")"
+  case "$testmon_state" in
+    ok) testmon_state="testmon present" ;;
+    missing)
+      log "/afk: DEGRADED — pytest-testmon is not importable by the resolved pytest runner, so EVERY first push per worktree runs the full multi-thousand-test suite instead of the affected set. Arming anyway (slow but correct); 'pip install -r requirements-dev.txt' to fix (#279)"
+      testmon_state="testmon MISSING (every first push runs the full suite)" ;;
+    *)
+      log "/afk: DEGRADED — could not determine whether pytest-testmon is installed (no pytest runner answered). Arming anyway; if it is absent, every first push runs the full suite (#279)"
+      testmon_state="testmon UNKNOWN" ;;
+  esac
+
+  # LAST: the only check that starts things. Its own refusal lines are already loud (#108).
+  _afk_arm_telemetry_gate "$repo_root" || return 1
+  telemetry_desc="$(_afk_telemetry_desc)"
+
+  # ONE line, all five dependencies, honest about a degradation: an operator scanning an
+  # unattended run's log gets a single arm-time verdict rather than five scattered notes.
+  log "/afk: arm self-check OK — judge alive ($judge_reason), claude alive, gh api reachable, $testmon_state, $telemetry_desc"
   return 0
 }
 
@@ -3590,7 +3855,12 @@ main() {
       echo "/afk: off (state cleared; the supervisor + watchdog stop on their next tick)"; return 0 ;;
     --watchdog)  watchdog_loop; return $? ;;
     --reconcile) afk_reconcile "$MAIN_ROOT"; return $? ;;
-    -h|--help)   sed -n '2,87p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
+    # Print the header comment block: every line from 2 up to (not including) the first
+    # non-comment line. Derived rather than a hard-coded upper bound (was '2,87p'): the #279
+    # env knobs pushed the block past 87, which silently truncated the whole Usage section out
+    # of --help. A line range that must be hand-maintained on every header edit will drift
+    # again; `/^[^#]/q` cannot.
+    -h|--help)   sed -n '2,${/^[^#]/q;p;}' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
   esac
 
   local once=0
@@ -3604,10 +3874,13 @@ main() {
     # dirty tree, an off-base HEAD, or dead gh auth — the drain's own prerequisites, checked
     # the same refuse-to-arm way the telemetry preflight checks the pipeline's.
     afk_arm_preconditions "$MAIN_ROOT" || return 2
-    # Telemetry preflight BEFORE arming: an unattended drain must not dispatch spokes into
-    # a dead telemetry pipeline (the dashboard is the SSOT). Refuse to arm — write no state,
-    # never reach the loop — when collector/bridge/auth can't be wired (#108).
-    afk_telemetry_preflight "$MAIN_ROOT" || return 2
+    # Liveness self-check BEFORE arming (#279): the static preconditions above all passed on
+    # the #268 host while the tier-3 judge was structurally dead, so the drain armed clean and
+    # ground every permission to DENY for an hour. This runs the REAL round trips — judge,
+    # claude, gh API, testmon — and folds in the #108 telemetry preflight, so the operator
+    # gets ONE arm-time verdict. Same refuse-to-arm posture: write no state, never reach the
+    # loop, dispatch nothing into a dependency that cannot answer.
+    afk_arm_selfcheck "$MAIN_ROOT" || return 2
     afk_write_state "$end"
     # Mint + bind a fresh arm generation (#252): the old sleeper from a prior arm reads its bound
     # token as superseded on its next tick and steps down, so an off/re-arm recycle never runs two.

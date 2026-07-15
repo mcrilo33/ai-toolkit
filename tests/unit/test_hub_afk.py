@@ -101,6 +101,13 @@ def _isolated_afk_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     # stub that always reports the network UP (exit 0); the offline-path tests override it to
     # "false" (down), and the fail-open test clears it and points AFK_CURL_BIN at a bogus binary.
     monkeypatch.setenv("AFK_NET_PROBE_CMD", "true")
+    # Neutralize the #279 arm-time liveness self-check by default: afk_arm_selfcheck runs REAL
+    # round trips (a `claude -p` judge probe, a `claude` auth probe, a `gh api` call) before
+    # main() writes state, so without this pin every main()-arming test would fire live network
+    # calls and arm-or-refuse by the host's actual health. Pinning the OPT-OUT (rather than
+    # editing each arming call site) also keeps a future arming test safe by default. The
+    # dedicated self-check tests turn it back on (=1) behind fully stubbed probes.
+    monkeypatch.setenv("AFK_ARM_SELFCHECK", "0")
 
 
 # The #236 gh lifecycle-label mirror is forced OFF for every call: this host has an
@@ -4336,6 +4343,38 @@ def test_reconcile_refuses_when_telemetry_preflight_fails(tmp_path: Path) -> Non
     assert not resp.exists(), "no re-arm when the telemetry preflight fails"
 
 
+def test_reconcile_does_not_run_the_arm_selfcheck(tmp_path: Path) -> None:
+    # #279 cadence: the liveness self-check is ARM-ONLY. Reconcile looks like a re-arm but is
+    # the RECOVERY path -- hub-watchdog.sh's _wd_intervene_rearm recovers a crashed drain via
+    # `bash hub-afk.sh --reconcile >/dev/null 2>&1 || true`, discarding output AND exit code.
+    # Gating that on live judge/claude/gh probes would let a transient outage (the thing most
+    # likely to be happening around a crash) SILENTLY block recovery: the watchdog would record
+    # the intervention, the refusal would go to /dev/null, and every in-flight spoke would
+    # strand with no answerer or lander -- the ~10h overnight strand afk_reconcile exists to
+    # prevent (#202 A). Resuming degraded beats refusing to resume; the #268 judge halt and the
+    # #241 §9 auth halt already catch a dependency that dies mid-window.
+    resp, wsp, wf = tmp_path / "resp", tmp_path / "wsp", tmp_path / "wf"
+    env = _reconcile_env(tmp_path, resp=resp, wsp=wsp, wf=wf)
+    env["AI_TOOLKIT_OTEL"] = "0"
+    probed = tmp_path / "probed"
+    hb = env["AFK_HEARTBEAT"]
+    expr = (
+        f'printf "drain\\n" > "{env["AFK_STATE"]}"; '
+        f'dead=$(sh -c "echo \\$$"); printf "%s 1700000000\\n" "$dead" > "{hb}"; '
+        f'afk_arm_selfcheck() {{ touch "{probed}"; return 1; }}; '
+        "afk_reconcile ."
+    )
+
+    result = _call(expr, env=env)
+
+    assert not probed.exists(), (
+        "reconcile must NOT run the liveness self-check: it is the watchdog's crash-recovery "
+        "path, and a refusal there is discarded, leaving the drain silently dead"
+    )
+    assert result.returncode == 0, "a healthy reconcile must re-arm"
+    assert resp.exists(), "recovery must not be blocked by the arm-time gate"
+
+
 # ── telemetry preflight (issue #108) ──────────────────────────────────────────
 # The hub's posture is the INVERSE of the spoke's (#106 wt_otel_*_preflight, which
 # warn-and-continue): for an unattended drain the dashboard is the single source of
@@ -6497,6 +6536,524 @@ def test_arm_preconditions_opt_out_skips_all_checks(tmp_path: Path) -> None:
     assert "RC=0" in result.stdout, "AFK_ARM_PRECHECK=0 skips the whole gate"
 
 
+# ── issue #279: arm-time LIVENESS probes ─────────────────────────────────────
+# afk_arm_preconditions is STATIC: a live supervisor, a clean tree, HEAD on base, a valid gh
+# token. Every one of those passed on the #268 host while the tier-3 judge was structurally
+# dead (a 2s budget vs a `claude -p` cold start), so /afk armed clean, dispatched, and ground
+# every spoke's permissions to DENY for an hour before anyone autopsied a stranded spoke.
+#
+# The gap is LIVENESS: a dependency can pass every static check and still be dead. These four
+# probes are the real round trips that close it, each stubbed so no test needs a live `claude`,
+# a network, or a real `gh`.
+
+
+def _judge_probe_env(tmp_path: Path, **extra: str) -> dict[str, str]:
+    env = {
+        "AFK_STATE_DIR": str(tmp_path / "afk-state"),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_JUDGE_SENTINEL": "arm-sentinel",
+    }
+    env.update(extra)
+    return env
+
+
+def test_arm_judge_check_passes_on_a_live_judge(tmp_path: Path) -> None:
+    env = _judge_probe_env(tmp_path, AFK_JUDGE_CMD="printf 'VERDICT: safe\\n'")
+
+    result = _call("_afk_arm_judge_check; echo RC=$?", env=env)
+
+    assert "RC=0" in result.stdout, result.stdout + result.stderr
+
+
+def test_arm_judge_check_fails_on_a_dead_judge(tmp_path: Path) -> None:
+    # The #268 catch: a judge that cannot answer must fail the arm-time check.
+    env = _judge_probe_env(tmp_path, AFK_JUDGE_CMD="exit 3")
+
+    result = _call("_afk_arm_judge_check; echo RC=$?", env=env)
+
+    assert "RC=1" in result.stdout, result.stdout + result.stderr
+    assert "unavailable" in result.stdout, result.stdout
+
+
+def test_arm_judge_check_names_the_268_timeout_in_the_supervisor_context(tmp_path: Path) -> None:
+    # THE regression test for the #279 review finding, and it can only live here. The bound's
+    # rc depends on WHO sourced gate-broker.sh: the danger-guard hook sources it alone and gets
+    # perl alarm (142), but the SUPERVISOR also defines _afk_with_timeout, which
+    # _broker_run_bounded prefers -- and its portable fallback tree-kills with TERM (143).
+    # test_gate_broker_danger.py sources gate-broker.sh WITHOUT hub-afk.sh, so it structurally
+    # cannot reach the 143 path; this module sources hub-afk.sh, so it is the real arm context.
+    # A reason of "unavailable" here would send the #268 operator to check the model when the
+    # actual fix is to raise AFK_JUDGE_TIMEOUT -- inverting the AC3 split at the one moment it
+    # is supposed to pay off.
+    env = _judge_probe_env(tmp_path, AFK_JUDGE_CMD="sleep 5", AFK_JUDGE_TIMEOUT="1")
+
+    result = _call("_afk_arm_judge_check; echo RC=$?", env=env)
+
+    assert "RC=1" in result.stdout, result.stdout + result.stderr
+    assert "timed out" in result.stdout, (
+        f"the supervisor-context timeout must read as a TIMEOUT, not a broken judge: "
+        f"{result.stdout!r}"
+    )
+
+
+def test_arm_claude_check_reports_alive(tmp_path: Path) -> None:
+    env = {"AFK_NET_PROBE_CMD": "true", "AFK_AUTH_PROBE_CMD": "true"}
+
+    result = _call("_afk_arm_claude_check; echo RC=$?", env=env)
+
+    assert result.stdout.split()[0] == "alive", result.stdout + result.stderr
+    assert "RC=0" in result.stdout
+
+
+def test_arm_claude_check_distinguishes_offline_from_auth_dead(tmp_path: Path) -> None:
+    # #249's whole point, generalized from reap-time to arm-time: a connectivity blackout must
+    # never be misread as a dead subscription token. The reachability probe runs FIRST.
+    env = {"AFK_NET_PROBE_CMD": "false", "AFK_AUTH_PROBE_CMD": "true"}
+
+    result = _call("_afk_arm_claude_check; echo RC=$?", env=env)
+
+    assert result.stdout.split()[0] == "offline", result.stdout + result.stderr
+    assert "RC=1" in result.stdout
+
+
+def test_arm_claude_check_reports_auth_dead(tmp_path: Path) -> None:
+    env = {
+        "AFK_NET_PROBE_CMD": "true",  # network up...
+        # ...but the CLI reports an auth failure (nonzero + an auth signature)
+        "AFK_AUTH_PROBE_CMD": 'sh -c "echo \\"Invalid API key - please run /login\\"; exit 1"',
+    }
+
+    result = _call("_afk_arm_claude_check; echo RC=$?", env=env)
+
+    assert result.stdout.split()[0] == "auth-dead", result.stdout + result.stderr
+    assert "RC=1" in result.stdout
+
+
+def test_arm_claude_check_uses_the_arm_time_budget_not_the_reap_one(tmp_path: Path) -> None:
+    # A cold arm-time round trip needs a budget between the reap probe's 30s and the answerer's
+    # 900s, so AFK_ARM_AUTH_TIMEOUT must actually bound the probe. Observable via a probe that
+    # only speaks after a delay: a budget that kills it first never sees the auth signature (so
+    # the state is `unresponsive` -- the CLI proved nothing), while a budget that lets it finish
+    # reads the signature and reports `auth-dead`. If the override were ignored, the default
+    # would let it finish in BOTH cases and the first assert would read auth-dead.
+    slow_auth_failure = 'sh -c "sleep 2; echo \\"Invalid API key\\"; exit 1"'
+
+    tight = _call(
+        "_afk_arm_claude_check",
+        env={
+            "AFK_NET_PROBE_CMD": "true",
+            "AFK_AUTH_PROBE_CMD": slow_auth_failure,
+            "AFK_ARM_AUTH_TIMEOUT": "1",
+        },
+    )
+    generous = _call(
+        "_afk_arm_claude_check",
+        env={
+            "AFK_NET_PROBE_CMD": "true",
+            "AFK_AUTH_PROBE_CMD": slow_auth_failure,
+            "AFK_ARM_AUTH_TIMEOUT": "20",
+        },
+    )
+
+    assert tight.stdout.strip() == "unresponsive", "a 1s arm budget must cut the probe off"
+    assert generous.stdout.strip() == "auth-dead", "a 20s arm budget must let it answer"
+
+
+def test_arm_claude_check_fails_closed_when_the_cli_is_absent(tmp_path: Path) -> None:
+    # THE fail-open the #279 review caught, and the reason this check does not call
+    # _afk_probe_state. That helper reads a nonzero exit WITHOUT an auth signature as "alive"
+    # -- correct at REAP time (a hiccup must not halt a drain already doing useful work), fatal
+    # at ARM time. A `claude` that is not on PATH exits 127 with no signature, so reusing the
+    # reap tri-state verbatim ARMED CLEAN into a host with no CLI at all: every spoke would
+    # then dispatch, park, and escalate to blocked. An arm gate must prove liveness, not merely
+    # fail to disprove it.
+    result = _call(
+        "_afk_arm_claude_check; echo RC=$?",
+        env={"AFK_NET_PROBE_CMD": "true", "AFK_AUTH_PROBE_CMD": "definitely-not-a-real-binary"},
+    )
+
+    assert result.stdout.split()[0] == "unresponsive", (
+        f"an absent CLI must never read as alive: {result.stdout!r}"
+    )
+    assert "RC=1" in result.stdout, "the arm-time claude check must fail CLOSED"
+
+
+def test_arm_claude_check_fails_closed_when_the_cli_is_wedged(tmp_path: Path) -> None:
+    # The same polarity for a CLI that hangs past its budget: killed at the bound, it proved
+    # nothing, so it must not report alive.
+    result = _call(
+        "_afk_arm_claude_check; echo RC=$?",
+        env={
+            "AFK_NET_PROBE_CMD": "true",
+            "AFK_AUTH_PROBE_CMD": "sleep 30",
+            "AFK_ARM_AUTH_TIMEOUT": "1",
+        },
+    )
+
+    assert result.stdout.split()[0] == "unresponsive", result.stdout
+    assert "RC=1" in result.stdout
+
+
+def test_arm_claude_check_ignores_a_non_numeric_budget(tmp_path: Path) -> None:
+    # A typo must never silently LIFT the bound (an unbounded arm-time probe could hang the
+    # arm forever) -- it falls back to the default, mirroring _judge_timeout's discipline.
+    result = _call(
+        "_afk_arm_claude_check; echo RC=$?",
+        env={
+            "AFK_NET_PROBE_CMD": "true",
+            "AFK_AUTH_PROBE_CMD": "true",
+            "AFK_ARM_AUTH_TIMEOUT": "two minutes",
+        },
+    )
+
+    assert result.stdout.split()[0] == "alive", result.stdout + result.stderr
+    assert "RC=0" in result.stdout
+
+
+def test_arm_claude_check_honors_an_operator_raised_global_budget(tmp_path: Path) -> None:
+    # An operator who already raised AFK_AUTH_PROBE_TIMEOUT for a slow host must not have the
+    # arm silently narrow it back to the 120s default. With a 2s probe and a 20s global, the
+    # probe finishes and reports auth-dead; a hard-coded 1s would report unresponsive.
+    result = _call(
+        "_afk_arm_claude_check",
+        env={
+            "AFK_NET_PROBE_CMD": "true",
+            "AFK_AUTH_PROBE_CMD": 'sh -c "sleep 2; echo \\"Invalid API key\\"; exit 1"',
+            "AFK_AUTH_PROBE_TIMEOUT": "20",
+        },
+    )
+
+    assert result.stdout.strip() == "auth-dead", result.stdout + result.stderr
+
+
+def _gh_api_stub(tmp_path: Path, *, auth_exit: int, api_exit: int) -> Path:
+    """A `gh` whose `auth status` and `api` outcomes are set independently."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    (fake_bin / "gh").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "${1:-}" in\n'
+        f"  auth) exit {auth_exit} ;;\n"
+        f"  api) exit {api_exit} ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    (fake_bin / "gh").chmod(0o755)
+    return fake_bin
+
+
+def test_arm_gh_check_passes_when_the_api_answers(tmp_path: Path) -> None:
+    fake_bin = _gh_api_stub(tmp_path, auth_exit=0, api_exit=0)
+
+    result = _call(
+        "_afk_arm_gh_check; echo RC=$?", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    )
+
+    assert "RC=0" in result.stdout, result.stdout + result.stderr
+
+
+def test_arm_gh_check_fails_when_the_token_is_valid_but_the_api_is_unreachable(
+    tmp_path: Path,
+) -> None:
+    # The gap a static `gh auth status` leaves: the token is fine, the API is not. Dispatch,
+    # land, and answer all need the API itself, so a real round trip is the only proof.
+    fake_bin = _gh_api_stub(tmp_path, auth_exit=0, api_exit=1)
+
+    result = _call(
+        "_afk_arm_gh_check; echo RC=$?", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    )
+
+    assert "RC=1" in result.stdout, "a token-valid-but-API-down host must be caught"
+
+
+def test_arm_testmon_check_reports_ok(tmp_path: Path) -> None:
+    result = _call("_afk_arm_testmon_check; echo RC=$?", env={"AFK_TESTMON_PROBE_CMD": "true"})
+
+    assert result.stdout.split()[0] == "ok", result.stdout + result.stderr
+    assert "RC=0" in result.stdout
+
+
+def test_arm_testmon_check_reports_missing(tmp_path: Path) -> None:
+    result = _call("_afk_arm_testmon_check; echo RC=$?", env={"AFK_TESTMON_PROBE_CMD": "false"})
+
+    assert result.stdout.split()[0] == "missing", result.stdout + result.stderr
+    assert "RC=1" in result.stdout
+
+
+def _venv_pytest(tmp_path: Path, *, help_text: str, exit_code: int = 0) -> Path:
+    """A repo root whose .venv/bin/pytest is a fake runner printing `help_text`.
+
+    Drives the probe's REAL resolution ladder (the venv rung, which detect_pytest and
+    test-select.sh also try first) rather than stubbing the resolution away.
+    """
+    repo = tmp_path / "repo"
+    (repo / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+    runner = repo / ".venv" / "bin" / "pytest"
+    runner.write_text(f"#!/usr/bin/env bash\ncat <<'HELP'\n{help_text}\nHELP\nexit {exit_code}\n")
+    runner.chmod(0o755)
+    return repo
+
+
+def test_arm_testmon_check_detects_a_runner_without_testmon(tmp_path: Path) -> None:
+    # The real default path: resolve the runner, then ask the RUNNER ITSELF. This mirrors
+    # exactly how test-select.sh decides to degrade, so the probe agrees with the gate it is
+    # warning about (a runner lacking testmon => every first push runs the full suite).
+    repo = _venv_pytest(tmp_path, help_text="usage: pytest [options]\n  -k EXPRESSION")
+
+    result = _call(f"_afk_arm_testmon_check '{repo}'; echo RC=$?")
+
+    assert result.stdout.split()[0] == "missing", result.stdout + result.stderr
+    assert "RC=1" in result.stdout
+
+
+def test_arm_testmon_check_accepts_a_runner_advertising_testmon(tmp_path: Path) -> None:
+    repo = _venv_pytest(
+        tmp_path, help_text="usage: pytest [options]\n  --testmon  select affected tests"
+    )
+
+    result = _call(f"_afk_arm_testmon_check '{repo}'; echo RC=$?")
+
+    assert result.stdout.split()[0] == "ok", result.stdout + result.stderr
+    assert "RC=0" in result.stdout
+
+
+def test_arm_testmon_check_reports_unknown_when_the_runner_will_not_answer(
+    tmp_path: Path,
+) -> None:
+    # A runner that resolves but produces nothing (crashed, wedged, killed at the bound) must
+    # NEVER read as `missing`: testmon is WARN-only, and a probe with no evidence must not
+    # manufacture a warning. This is the branch a sourced utils.sh silently broke -- its
+    # source-time `ai_toolkit_enabled || exit 0` (#154) exited the probe with status 0, which
+    # an rc-based mapping read as a clean `ok` from a probe that had run nothing at all.
+    repo = _venv_pytest(tmp_path, help_text="", exit_code=1)
+
+    result = _call(f"_afk_arm_testmon_check '{repo}'; echo RC=$?")
+
+    assert result.stdout.split()[0] == "unknown", result.stdout + result.stderr
+
+
+def test_arm_testmon_check_survives_a_repo_path_containing_a_space(tmp_path: Path) -> None:
+    # The runner is invoked as its own argv, never word-split from a resolved string, so a
+    # worktree under e.g. "~/My Repos/" cannot shred the command into a bogus one.
+    spaced = tmp_path / "my repos"
+    spaced.mkdir()
+    repo = _venv_pytest(spaced, help_text="usage: pytest\n  --testmon  select affected tests")
+
+    result = _call(f"_afk_arm_testmon_check '{repo}'; echo RC=$?")
+
+    assert result.stdout.split()[0] == "ok", result.stdout + result.stderr
+
+
+def test_arm_testmon_check_reports_missing_when_no_pytest_resolves(tmp_path: Path) -> None:
+    # No runner at all: certainly no testmon, so the first push cannot be testmon-selected.
+    # Still WARN-only here -- a runner-less checkout is the PUSH gate's business (#213 fails
+    # that closed), not the arm's.
+    empty = tmp_path / "no-venv"
+    empty.mkdir()
+    result = _call(
+        f"_afk_arm_testmon_check '{empty}'; echo RC=$?",
+        env={"PATH": "/nonexistent-bin-dir"},  # no pytest, no python3 on PATH
+    )
+
+    assert result.stdout.split()[0] == "missing", result.stdout + result.stderr
+
+
+# ── issue #279: afk_arm_selfcheck — the ONE arm-time verdict ─────────────────
+# The five probes above are useless unless something runs them before the first dispatch.
+# afk_arm_selfcheck is that seam: chained in main() after the STATIC afk_arm_preconditions and
+# BEFORE afk_write_state, so a hard-fail writes no state and never reaches the loop.
+#
+# Per-check policy (fixed at the plan gate): a dead judge, a dead/offline/unresponsive claude,
+# an unreachable gh API, and a dead telemetry pipeline each BLOCK the arm -- every one of them
+# means the drain cannot do its job. A missing pytest-testmon only WARNS: it degrades the drain
+# to slow-but-correct (every first push runs the full suite), which is not worth refusing over.
+
+
+def _selfcheck_env(tmp_path: Path, **extra: str) -> dict[str, str]:
+    """Every probe stubbed HEALTHY; individual tests break exactly one."""
+    env = {
+        "AFK_ARM_SELFCHECK": "1",  # opt back in (the autouse fixture pins the gate off)
+        "AFK_STATE_DIR": str(tmp_path / "afk-state"),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_JUDGE_SENTINEL": "arm-sentinel",
+        "AFK_JUDGE_CMD": "printf 'VERDICT: safe\\n'",
+        "AFK_NET_PROBE_CMD": "true",
+        "AFK_AUTH_PROBE_CMD": "true",
+        "AFK_TESTMON_PROBE_CMD": "true",
+    }
+    env.update(extra)
+    return env
+
+
+def _run_selfcheck(
+    tmp_path: Path, *, api_exit: int = 0, telemetry_rc: int = 0, **extra: str
+) -> subprocess.CompletedProcess[str]:
+    # afk_telemetry_preflight is stubbed rather than driven: its collector/bridge machinery has
+    # its own tests above, and what this seam owns is whether the RESULT is folded into the one
+    # verdict -- not how the ports come up.
+    fake_bin = _gh_api_stub(tmp_path, auth_exit=0, api_exit=api_exit)
+    env = _selfcheck_env(tmp_path, PATH=f"{fake_bin}:{os.environ['PATH']}", **extra)
+    expr = (
+        f"afk_telemetry_preflight() {{ return {telemetry_rc}; }}; "
+        "afk_arm_selfcheck /repo; echo RC=$?"
+    )
+    return _call(expr, env=env)
+
+
+def test_selfcheck_healthy_host_logs_one_ok_line_covering_all_five(tmp_path: Path) -> None:
+    result = _run_selfcheck(tmp_path)
+
+    assert "RC=0" in result.stdout, result.stdout + result.stderr
+    ok_lines = [ln for ln in result.stderr.splitlines() if "arm self-check OK" in ln]
+    assert len(ok_lines) == 1, f"exactly ONE arm-time verdict line, got: {ok_lines}"
+    line = ok_lines[0]
+    for dependency in ("judge", "claude", "gh", "testmon", "telemetry"):
+        assert dependency in line, f"the OK line must name {dependency}: {line!r}"
+
+
+def test_selfcheck_refuses_on_a_dead_judge(tmp_path: Path) -> None:
+    # THE #268 acceptance criterion: a structurally-dead judge never silently dispatches.
+    result = _run_selfcheck(tmp_path, AFK_JUDGE_CMD="exit 3")
+
+    assert "RC=1" in result.stdout, "a dead judge must refuse the arm"
+    assert "judge" in result.stderr
+
+
+def test_selfcheck_refuses_on_the_268_judge_timeout(tmp_path: Path) -> None:
+    # The literal #268 reproduction named in the issue's acceptance criteria: a budget too
+    # short for a `claude -p` cold start. It must refuse AND name the budget as the cause.
+    #
+    # The assertion targets the REASON clause, not a bare "timed out" anywhere in stderr: the
+    # refusal's static remedy text ends "...raise AFK_JUDGE_TIMEOUT if it timed out", so a
+    # loose substring match passes on ANY judge failure — including a plain crashed judge —
+    # and would stay green if the timeout mapping regressed to "unavailable".
+    result = _run_selfcheck(tmp_path, AFK_JUDGE_CMD="sleep 5", AFK_JUDGE_TIMEOUT="1")
+
+    assert "RC=1" in result.stdout, "a judge that cannot answer in budget must refuse the arm"
+    assert "is not usable: judge timed out" in result.stderr, result.stderr
+
+
+def test_selfcheck_broken_judge_is_not_reported_as_a_timeout(tmp_path: Path) -> None:
+    # The discriminating twin: a judge that CRASHED must not be described as a timeout, or the
+    # operator raises AFK_JUDGE_TIMEOUT forever against a broken model/token. This is the test
+    # that makes the one above mean something.
+    result = _run_selfcheck(tmp_path, AFK_JUDGE_CMD="exit 3")
+
+    assert "RC=1" in result.stdout
+    assert "is not usable: judge unavailable (rc=3)" in result.stderr, result.stderr
+
+
+def test_selfcheck_refuses_on_auth_dead_claude(tmp_path: Path) -> None:
+    result = _run_selfcheck(
+        tmp_path,
+        AFK_AUTH_PROBE_CMD='sh -c "echo \\"Invalid API key - please run /login\\"; exit 1"',
+    )
+
+    assert "RC=1" in result.stdout, "a dead subscription token must refuse the arm"
+    # Target the diagnosis, not a bare "auth" (which the unresponsive refusal also contains,
+    # in "no auth error") -- the two states have different remedies and must not blur.
+    assert "reports an AUTH failure" in result.stderr, result.stderr
+    assert "/login" in result.stderr, "name the remedy for a dead token"
+
+
+def test_selfcheck_refuses_when_offline_with_a_distinct_message(tmp_path: Path) -> None:
+    # #249's distinction survives to arm-time: an offline host is told it is OFFLINE, not that
+    # its token is dead -- they have completely different remedies.
+    result = _run_selfcheck(tmp_path, AFK_NET_PROBE_CMD="false")
+
+    assert "RC=1" in result.stdout
+    assert "offline" in result.stderr.lower() or "network" in result.stderr.lower(), result.stderr
+    assert "token" not in result.stderr.lower(), "an offline host must not be blamed on auth"
+
+
+def test_selfcheck_refuses_on_an_unresponsive_claude(tmp_path: Path) -> None:
+    result = _run_selfcheck(tmp_path, AFK_AUTH_PROBE_CMD="definitely-not-a-real-binary")
+
+    assert "RC=1" in result.stdout, "an absent/wedged claude must refuse the arm"
+
+
+def test_selfcheck_refuses_when_the_gh_api_is_unreachable(tmp_path: Path) -> None:
+    result = _run_selfcheck(tmp_path, api_exit=1)
+
+    assert "RC=1" in result.stdout, "a token-valid-but-API-down host must refuse the arm"
+    assert "gh" in result.stderr
+
+
+def test_selfcheck_refuses_when_the_telemetry_pipeline_is_down(tmp_path: Path) -> None:
+    # The collector keeps its existing hard-fail, folded into the one verdict.
+    result = _run_selfcheck(tmp_path, telemetry_rc=1)
+
+    assert "RC=1" in result.stdout, "a dead telemetry pipeline must refuse the arm"
+
+
+def test_selfcheck_warns_but_arms_on_missing_testmon(tmp_path: Path) -> None:
+    # The one WARN-only check: slow-but-correct is not worth refusing over.
+    result = _run_selfcheck(tmp_path, AFK_TESTMON_PROBE_CMD="false")
+
+    assert "RC=0" in result.stdout, "missing testmon must NOT block the arm"
+    assert "testmon" in result.stderr
+    assert "DEGRADED" in result.stderr, "a missing testmon must be LOUD, not silent"
+    assert "full suite" in result.stderr, "name the consequence the operator will feel"
+
+
+def test_selfcheck_ok_line_reports_the_testmon_degradation(tmp_path: Path) -> None:
+    # The single verdict line must stay honest about the degraded dependency, not print a
+    # clean "OK ... testmon present" while a warning scrolls past above it.
+    result = _run_selfcheck(tmp_path, AFK_TESTMON_PROBE_CMD="false")
+
+    ok_lines = [ln for ln in result.stderr.splitlines() if "arm self-check" in ln and "OK" in ln]
+    assert len(ok_lines) == 1, ok_lines
+    assert "MISSING" in ok_lines[0], f"the verdict line must name the degradation: {ok_lines[0]!r}"
+
+
+def test_selfcheck_opt_out_runs_no_probe_at_all(tmp_path: Path) -> None:
+    # AFK_ARM_SELFCHECK=0 must skip every probe, not just ignore their verdicts: the probes
+    # cost ~2 minutes of real round trips, which is the whole reason the opt-out exists.
+    fired = tmp_path / "judge-fired"
+    result = _run_selfcheck(
+        tmp_path,
+        AFK_ARM_SELFCHECK="0",
+        FIRED=str(fired),
+        AFK_JUDGE_CMD='sh -c "touch \\"$FIRED\\"; exit 3"',
+    )
+
+    assert "RC=0" in result.stdout, "the opt-out must arm"
+    assert not fired.exists(), "the opt-out must not run the probes at all"
+
+
+def test_selfcheck_opt_out_still_enforces_the_telemetry_gate(tmp_path: Path) -> None:
+    # AFK_ARM_SELFCHECK=0 waives the LIVE PROBES; it must not become a second, silent opt-out
+    # for the #108 telemetry hard-fail, which already has its own explicit one
+    # (AI_TOOLKIT_OTEL=0). Folding telemetry inside the opt-out's early return regressed this:
+    # an operator skipping the slow round trips also lost the collector gate without asking.
+    result = _run_selfcheck(tmp_path, AFK_ARM_SELFCHECK="0", telemetry_rc=1)
+
+    assert "RC=1" in result.stdout, (
+        "the liveness opt-out must NOT waive the telemetry gate — AI_TOOLKIT_OTEL=0 is that gate's opt-out"
+    )
+
+
+def test_selfcheck_opt_out_says_it_did_not_probe(tmp_path: Path) -> None:
+    # An opted-out arm must not print a verdict line claiming the dependencies are alive:
+    # nothing was probed, and a log that says otherwise is worse than no log at all.
+    result = _run_selfcheck(tmp_path, AFK_ARM_SELFCHECK="0")
+
+    assert "SKIPPED" in result.stderr, result.stderr
+    assert "arm self-check OK" not in result.stderr, (
+        "an unprobed arm must never claim a clean self-check"
+    )
+
+
+def test_selfcheck_reports_telemetry_opt_out_rather_than_claiming_it_is_wired(
+    tmp_path: Path,
+) -> None:
+    result = _run_selfcheck(tmp_path, AI_TOOLKIT_OTEL="0")
+
+    ok_lines = [ln for ln in result.stderr.splitlines() if "arm self-check OK" in ln]
+    assert len(ok_lines) == 1, ok_lines
+    assert "off" in ok_lines[0], f"telemetry opted out must read as off: {ok_lines[0]!r}"
+
+
 # ── ST5: the kickoff seeds /source-task, not the nonexistent /source ──────────
 
 
@@ -8471,6 +9028,123 @@ def test_watchdog_live_arms_the_inhibitor(tmp_path: Path) -> None:
         assert pidfile.read_text().split()[0].isdigit()
     finally:
         _kill_inhibitor(pidfile)
+
+
+# ── #279: main() refuses to arm when the liveness self-check hard-fails ───────
+# The issue's central acceptance criterion. afk_arm_selfcheck is chained BEFORE
+# afk_write_state, so a hard-fail leaves NO state file: nothing to reconcile, no half-armed
+# window, and above all not one spoke dispatched into the dead dependency.
+
+
+def _arm_neuter() -> str:
+    """Neuter the supervisor loop so main() arms (or refuses) and exits without dispatching.
+
+    afk_done returns 1 (never "done") and the tick's idle wait exits the shell, so the loop
+    stops after arming with the state file INTACT — an afk_done of 0 would run the done branch,
+    which calls afk_clear_state and would delete the very state these tests assert on.
+
+    The exit stub must replace afk_interruptible_sleep, NOT `sleep`: the wrapper backgrounds
+    its timer (`sleep "$secs" & wait "$t"`), so a `sleep` function stub would exit only the
+    forked subshell, `wait` would return instantly, and the loop would spin forever.
+    """
+    return (
+        "afk_arm_preconditions() { return 0; }; supervise_tick() { return 0; }; "
+        "dispatch_batch() { :; }; _afk_spawn_watchdog() { :; }; _afk_arm_inhibitor() { :; }; "
+        "afk_done() { return 1; }; afk_interruptible_sleep() { exit 0; }; "
+    )
+
+
+def test_main_writes_no_state_when_the_selfcheck_hard_fails(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+
+    result = _call(
+        f"{_arm_neuter()}afk_arm_selfcheck() {{ return 1; }}; main 30m; echo RC=$?",
+        env={"AFK_STATE": str(state), "AFK_ARM_PRECHECK": "0", "AI_TOOLKIT_OTEL": "0"},
+    )
+
+    assert not state.exists(), (
+        "a failed arm self-check must write NO state — a half-armed window would leave the "
+        "drain looking armed with nothing draining"
+    )
+    assert "RC=2" in result.stdout, f"main must refuse with exit 2: {result.stdout!r}"
+
+
+def test_main_arms_normally_when_the_selfcheck_passes(tmp_path: Path) -> None:
+    # The other half: a healthy host is not blocked by the new gate.
+    state = tmp_path / "state"
+
+    _call(
+        f"{_arm_neuter()}afk_arm_selfcheck() {{ return 0; }}; main 30m",
+        env={"AFK_STATE": str(state), "AFK_ARM_PRECHECK": "0", "AI_TOOLKIT_OTEL": "0"},
+    )
+
+    assert state.exists(), "a passing self-check must arm normally"
+
+
+def test_main_runs_the_selfcheck_before_writing_state(tmp_path: Path) -> None:
+    # Ordering is the whole safety property: if the self-check ran AFTER afk_write_state, a
+    # refusal would leave a state file behind and the watchdog would resume the window.
+    state = tmp_path / "state"
+    seen = tmp_path / "state-at-selfcheck-time"
+
+    _call(
+        f"{_arm_neuter()}"
+        f'afk_arm_selfcheck() {{ [ -f "{state}" ] && printf yes > "{seen}" || printf no > "{seen}"; '
+        "return 0; }; main 30m",
+        env={"AFK_STATE": str(state), "AFK_ARM_PRECHECK": "0", "AI_TOOLKIT_OTEL": "0"},
+    )
+
+    assert seen.read_text() == "no", "the self-check must run BEFORE afk_write_state"
+
+
+def test_main_refuses_end_to_end_through_the_real_selfcheck(tmp_path: Path) -> None:
+    # The COMPOSED production path, which every other test in this group stubs away: main()
+    # calling the REAL afk_arm_selfcheck with the gate ON (the autouse fixture pins it off
+    # module-wide, so this opts back in) and every probe stubbed at its own seam. Without this,
+    # a regression in the composition -- the gate refusing on a healthy host, or main ignoring
+    # its verdict -- ships green through the whole suite and only surfaces on a live arm.
+    state = tmp_path / "state"
+    fake_bin = _gh_api_stub(tmp_path, auth_exit=0, api_exit=0)
+    env = _selfcheck_env(tmp_path, PATH=f"{fake_bin}:{os.environ['PATH']}")
+    env.update({"AFK_STATE": str(state), "AFK_ARM_PRECHECK": "0", "AI_TOOLKIT_OTEL": "0"})
+    env["AFK_JUDGE_CMD"] = "exit 3"  # the one broken dependency
+
+    result = _call(f"{_arm_neuter()}main 30m; echo RC=$?", env=env)
+
+    assert "RC=2" in result.stdout, f"a dead judge must refuse a real arm: {result.stdout!r}"
+    assert not state.exists(), "the real refusal path must write no state"
+    assert "judge" in result.stderr
+
+
+def test_main_arms_end_to_end_through_the_real_selfcheck(tmp_path: Path) -> None:
+    # The healthy composition: the real gate, every probe stubbed healthy, must not block.
+    state = tmp_path / "state"
+    fake_bin = _gh_api_stub(tmp_path, auth_exit=0, api_exit=0)
+    env = _selfcheck_env(tmp_path, PATH=f"{fake_bin}:{os.environ['PATH']}")
+    env.update({"AFK_STATE": str(state), "AFK_ARM_PRECHECK": "0", "AI_TOOLKIT_OTEL": "0"})
+
+    result = _call(f"{_arm_neuter()}main 30m", env=env)
+
+    assert state.exists(), f"a healthy host must arm through the real gate: {result.stderr!r}"
+    assert "arm self-check OK" in result.stderr, result.stderr
+
+
+def test_main_selfcheck_runs_after_the_static_preconditions(tmp_path: Path) -> None:
+    # Cheap static refusals (dirty tree, off-base HEAD, a live supervisor) must fire FIRST:
+    # they are instant, while the self-check costs ~2 minutes of real round trips. A dirty
+    # checkout should never wait on a judge probe to be told to commit its work.
+    state = tmp_path / "state"
+    probed = tmp_path / "probed"
+
+    result = _call(
+        f"{_arm_neuter()}afk_arm_preconditions() {{ return 1; }}; "
+        f'afk_arm_selfcheck() {{ touch "{probed}"; return 0; }}; main 30m; echo RC=$?',
+        env={"AFK_STATE": str(state), "AI_TOOLKIT_OTEL": "0"},
+    )
+
+    assert "RC=2" in result.stdout
+    assert not probed.exists(), "a static precondition failure must refuse before probing"
+    assert not state.exists()
 
 
 # ── the inhibitor --status line + arm-time power warnings (issue #242) ─────────
