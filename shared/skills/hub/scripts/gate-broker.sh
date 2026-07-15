@@ -553,6 +553,27 @@ broker_service_gate() {
   # tip from the prior escalation — until the prompt changes or the tip moves. Checked before
   # BOTH the permission path (#203 finding 4's compound dialog) and the answerer path.
   local park_sig; park_sig="$(_broker_park_signature "$wt" "$issue")"
+  # An APPROVE already DELIVERED for this exact park (#294): the same (tip, sig) AND the same gated
+  # tool_use is still pending, so the dialog on the pane is the one we just answered — not a new
+  # ask. Without this the ceiling below recomputed the same key, found the counter still under
+  # AFK_REANSWER_CEILING, and re-approved the identical command a second time (the #135/#188
+  # two-concurrent-gates shape). Keyed on the tool_use id too, so a repeatable safe command the
+  # spoke re-issues VERBATIM at the same tip is a NEW dialog and is still served.
+  #
+  # Checked BEFORE the ceiling, like the void marker above and for the same reason: a skipped tick
+  # must not burn ceiling budget, or a stale pane would exhaust it and warn + arm the #241 backoff
+  # over a spoke that never failed at anything. It needs no extra _permission_pending call either —
+  # only a perm: signature can match a served record, so an answer/gate park never does (the tick's
+  # single pane read stays single, #269).
+  #
+  # NEVER terminal (the void block's shape): approve_permission verifies only that the transcript
+  # mtime advanced, not that the dialog was consumed, so an approve whose keypress never landed
+  # leaves the identical park pending — a permanent skip would strand it. Inside the window: skip.
+  # Once it elapses: drop the marker for ONE supervised re-serve, and the ceiling paces from there.
+  if _broker_permission_served "$wt" "$issue" "$park_sig"; then
+    _broker_served_skip_due "$issue" || return 0                  # inside the window → already served
+    clear_permission_served "$issue"                              # elapsed → one supervised re-serve
+  fi
   if _broker_reanswer_exhausted "$wt" "$issue" "$park_sig"; then
     # #241 §5: the ceiling is no longer TERMINAL — it warns and retries on an exponential
     # backoff, so a doom-loop is throttled by the growing curve, not abandoned. On the FIRST
@@ -583,8 +604,11 @@ broker_service_gate() {
     _afk_warned_arm "$issue"
     # fall through for one supervised retry; the arm above paces the next
   fi
-  # A pending permission dialog is decided by the rules classifier, not the answerer (#149).
-  if _permission_pending "$wt"; then _decide_permission "$wt" "$issue"; return; fi
+  # A pending permission dialog is decided by the rules classifier, not the answerer (#149). The
+  # tick's already-captured signature rides along (#294): a delivered approve records the park it
+  # served, and re-deriving the signature after the delivery could name a DIFFERENT park (the #288
+  # note_answer_drop lesson).
+  if _permission_pending "$wt"; then _decide_permission "$wt" "$issue" "$park_sig"; return; fi
   # Snapshot the transcript clock BEFORE the park checks: a write landing between
   # this and the pre-inject re-check must count as movement (review nit, ST2).
   local parked_mtime; parked_mtime="$(_transcript_mtime "$wt")"

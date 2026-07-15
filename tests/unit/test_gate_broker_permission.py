@@ -23,6 +23,7 @@ from _gate_broker_support import (
     _hook_payload,
     _named_tool_record,
     _perm,
+    _perm_env,
     _project_dir_for,
     _read_tool_record,
     _resolved_only_transcript,
@@ -118,6 +119,51 @@ def test_extract_pending_command_returns_unresolved_pending_command(
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == _SMOKE_COMPOUND
+
+
+def test_extract_pending_tool_id_returns_the_unresolved_blocks_id(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #294 keys the served marker on this id, so #240's rule binds it exactly as it binds the
+    # command: the RESOLVED trailing calls are ones the spoke already ran, and keying on one of
+    # their ids would mark a dialog served that was never approved. Only the trailing UNRESOLVED
+    # block's id may surface — and it must be the id of the block the command came from (tu_1),
+    # never the resolved Read (tu_r) or Write (tu_n) before it.
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    records = [
+        _read_tool_record(str(spoke_repo / "task.md")),
+        _tool_result_record("tu_r"),
+        _named_tool_record("Write", {"file_path": "scripts/x.sh", "content": "y"}),
+        _tool_result_record("tu_n"),
+        _bash_tool_record(_SMOKE_COMPOUND),  # tu_1, no tool_result → the pending dialog
+    ]
+    (pd / "session.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+    env = {"CLAUDE_PROJECTS_DIR": str(projects)}
+
+    result = _call(f"extract_pending_tool_id '{spoke_repo}'", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "tu_1"
+    # The id and the command must name the SAME block — the pairing the served key depends on.
+    cmd = _call(f"extract_pending_command '{spoke_repo}'", env=env)
+    assert cmd.stdout.strip() == _SMOKE_COMPOUND
+
+
+def test_extract_pending_tool_id_empty_when_nothing_is_unresolved(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # No pending tool_use → no id → note_permission_served records nothing and the approve lane
+    # fails OPEN to its pre-#294 behavior, rather than keying on a stale resolved call.
+    projects = tmp_path / "projects"
+    _resolved_only_transcript(_project_dir_for(projects, spoke_repo))
+
+    result = _call(
+        f"extract_pending_tool_id '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == ""
 
 
 def test_permission_pending_true_on_pane_prompt_with_empty_command(
@@ -844,3 +890,98 @@ def test_danger_guard_registered_like_permission_hook() -> None:
     perm = _handler("afk-permission-hook.sh")
     assert danger is not None, "afk-danger-guard not registered for Claude PreToolUse"
     assert perm is not None, "afk-permission-hook baseline missing"
+
+
+# ── issue #294 AC1: an APPROVE is delivered ONCE per pending dialog ────────────────────────────
+# _decide_permission called approve_permission and returned success without recording that THIS
+# park was served, so an unchanged dialog — a pane that has not redrawn, or an approved
+# `nohup ... &` whose gate keeps the gated tool_use unresolved — was re-approved on the very next
+# tick: the (tip, sig) re-answer ceiling computed the SAME key, found the counter still under
+# AFK_REANSWER_CEILING, and fell through to a second keypress. At the default ceiling of 2 that is
+# exactly one duplicate delivery — the #135/#188 two-concurrent-gates shape.
+
+_AUTO_APPROVABLE = "git reset -q; git add tests/x.py"  # classify_permission APPROVEs a self-stage
+
+
+def _served_marker(env: dict[str, str]) -> Path:
+    return Path(env["_STATEDIR"]) / "served-5"
+
+
+def _yes_keystrokes(env: dict[str, str]) -> list[str]:
+    """Every "Yes" (option 1) keypress the broker sent to the dialog — approve_permission's own
+    delivery, so counting these counts real approvals, not intentions."""
+    keylog = Path(env["_KEYLOG"])
+    keys = keylog.read_text() if keylog.exists() else ""
+    return [line for line in keys.splitlines() if line.split()[-1] == "1"]
+
+
+def _age_transcript(spoke_repo: Path, env: dict[str, str]) -> None:
+    """Backdate the spoke's transcript so approve_permission's _transcript_advanced check has an
+    mtime to advance PAST (BSD stat is whole-second, so a same-second append would not register
+    and the approve would read as undelivered)."""
+    jsonl = _project_dir_for(Path(env["CLAUDE_PROJECTS_DIR"]), spoke_repo) / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+
+
+def test_two_ticks_on_an_unchanged_dialog_approve_exactly_once(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # _perm_env's fake tmux keeps showing the SAME dialog, and its Enter appends a non-turn record
+    # that never resolves the gated tool_use — i.e. the identical (tip, sig, tool_use) is still
+    # pending on tick 2, exactly the state the duplicate needs.
+    env = _perm_env(tmp_path, spoke_repo, _AUTO_APPROVABLE, "printf 'ANSWER: APPROVE'")
+    _age_transcript(spoke_repo, env)
+
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert len(_yes_keystrokes(env)) == 1, (
+        "an unchanged dialog must be approved ONCE — a second keypress lands in whatever the pane "
+        "shows next (the #89 stale-inject class) and re-runs the command it authorized"
+    )
+
+
+def test_a_delivered_approve_records_the_served_park(spoke_repo: Path, tmp_path: Path) -> None:
+    # The mechanism behind the exactly-once guarantee: the mechanical auto-approve stamps the park
+    # it served, naming the id of the tool_use it actually approved.
+    env = _perm_env(tmp_path, spoke_repo, _AUTO_APPROVABLE, "printf 'ANSWER: APPROVE'")
+    _age_transcript(spoke_repo, env)
+
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert len(_yes_keystrokes(env)) == 1, "sanity: the first tick really did approve"
+    record = _served_marker(env).read_text().strip().split("\t")
+    assert record[2] == "tu_1", f"the served record must name the approved tool_use: {record}"
+
+
+def _break_the_keypress(spoke_repo: Path, tmp_path: Path, env: dict[str, str]) -> None:
+    """Replace _perm_env's tmux with one that still shows the dialog and still records the
+    keystroke, but whose Enter never advances the transcript — approve_permission's exact
+    "sent it, could not confirm it landed" failure (it verifies the mtime moved, nothing more)."""
+    tmux = tmp_path / "bin" / "tmux"
+    tmux.write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f'  send-keys) printf "%s\\n" "$*" >> "{env["_KEYLOG"]}" ;;\n'
+        f'  capture-pane) printf "%s\\n" "{_PERMISSION_PROMPT}" ;;\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        "esac\nexit 0\n"
+    )
+    tmux.chmod(0o755)
+
+
+def test_a_failed_approve_delivery_records_no_served_park(spoke_repo: Path, tmp_path: Path) -> None:
+    # Only a CONFIRMED delivery is served — this is what keeps the marker from becoming the strand
+    # it exists to prevent. The keypress goes out but the transcript never moves, so
+    # approve_permission returns failure and this park must stay retryable on the next tick rather
+    # than reading as already-answered. (The mtime is frozen by the stub, NOT by racing the
+    # whole-second clock — a delivery must fail here by construction, not by luck.)
+    env = _perm_env(tmp_path, spoke_repo, _AUTO_APPROVABLE, "printf 'ANSWER: APPROVE'")
+    _break_the_keypress(spoke_repo, tmp_path, env)
+
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert len(_yes_keystrokes(env)) == 1, "sanity: the approve really was attempted"
+    assert not _served_marker(env).exists(), (
+        "a delivery the broker could not confirm must never read as served"
+    )

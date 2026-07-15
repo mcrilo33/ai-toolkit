@@ -16,11 +16,13 @@ from _gate_broker_support import (
     HUB_INJECT,
     WT_LIB,
     _ask_record,
+    _bash_tool_record,
     _call,
     _fake_tmux_pane,
     _gate_broker_env,
     _gate_park_transcript,
     _inject_env,
+    _perm_env,
     _project_dir_for,
     _resumed_gate_transcript,
     _seed_transcript,
@@ -785,3 +787,97 @@ def test_broker_self_heal_clears_park_onset_and_warned_backoff(
         "a re-park on the same tip/signature must not inherit the resolved episode's drop record"
     )
     assert not prompt_log.exists(), "a resumed spoke must NOT be re-answered"
+
+
+# ── issue #294 AC2: an already-served permission park is not re-dispatched ─────────────────────
+# broker_service_gate dispatched _decide_permission on every tick a dialog was pending, so an
+# approve already delivered for THIS exact park bought nothing: the identical dialog was decided
+# and re-approved. The served check sits BEFORE the re-answer ceiling — like the _broker_gate_voided
+# check above it, and for the same reason: a skipped tick must not burn ceiling budget, or the
+# ceiling would exhaust on a healthy approve and warn + arm the #241 backoff over a spoke that
+# never failed at anything.
+
+
+def _served_probe(spoke_repo: Path, calls: Path) -> str:
+    """Count dispatches into the permission decider without running it — the routing decision IS
+    the unit here (whether the identical dialog is decided a second time)."""
+    return (
+        f"_decide_permission() {{ printf 'x' >> '{calls}'; }}; "
+        f"broker_service_gate '{spoke_repo}' 5 unattended"
+    )
+
+
+def _seed_served(spoke_repo: Path, env: dict[str, str], tool_id: str = "tu_1") -> str:
+    """Record the live park as already-approved, exactly as a delivered approve would."""
+    sig = _call(f"_broker_park_signature '{spoke_repo}' 5", env=env).stdout.strip()
+    assert sig, "the park must carry a signature to key the served record on"
+    _call(f"note_permission_served '{spoke_repo}' 5 '{sig}' {tool_id}", env=env)
+    return sig
+
+
+def test_broker_service_gate_skips_the_dispatch_for_an_already_served_park(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    env = _perm_env(tmp_path, spoke_repo, "git reset -q; git add tests/x.py", "printf 'x'")
+    _seed_served(spoke_repo, env)
+    calls = tmp_path / "dispatch.calls"
+
+    result = _call(_served_probe(spoke_repo, calls), env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert not calls.exists(), "the identical dialog must not be decided (and re-approved) twice"
+
+
+def test_a_served_skip_does_not_burn_the_reanswer_ceiling(spoke_repo: Path, tmp_path: Path) -> None:
+    # Pins the check's PLACEMENT, not just its effect: were it after the ceiling, the skipped tick
+    # would still bump the counter, and a couple of stale-pane ticks would exhaust it and warn.
+    env = _perm_env(tmp_path, spoke_repo, "git reset -q; git add tests/x.py", "printf 'x'")
+    _seed_served(spoke_repo, env)
+
+    _call(_served_probe(spoke_repo, tmp_path / "dispatch.calls"), env=env)
+
+    statedir = Path(env["_STATEDIR"])
+    assert not (statedir / "reanswer-5").exists(), (
+        "a skipped tick must not count as a re-answer attempt against the ceiling"
+    )
+    assert not (statedir / "warned-state-5").exists(), (
+        "a healthy served park must never arm the warned-retry backoff (#274)"
+    )
+
+
+def test_broker_service_gate_serves_the_park_again_once_the_tip_advances(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The legitimate case the served marker must not break (issue item 2): once the tip moves, a
+    # pending dialog is a new occurrence and is decided normally on the next tick.
+    env = _perm_env(tmp_path, spoke_repo, "git reset -q; git add tests/x.py", "printf 'x'")
+    _seed_served(spoke_repo, env)
+    calls = tmp_path / "dispatch.calls"
+
+    subprocess.run(
+        ["git", "commit", "-q", "--allow-empty", "-m", "progress"],
+        cwd=spoke_repo,
+        check=True,
+        capture_output=True,
+        env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t"},
+    )
+    _call(_served_probe(spoke_repo, calls), env=env)
+
+    assert calls.read_text() == "x", "a park at a NEW tip must be served normally"
+
+
+def test_broker_service_gate_serves_a_changed_command_on_the_next_tick(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The signature dimension of the same guarantee: the spoke asks for something ELSE at the same
+    # tip. The gated tool_use keeps its id here, so only the signature moves — proving the sig is
+    # load-bearing in the key and not carried by the id alone.
+    env = _perm_env(tmp_path, spoke_repo, "git reset -q; git add tests/x.py", "printf 'x'")
+    _seed_served(spoke_repo, env)
+    calls = tmp_path / "dispatch.calls"
+
+    jsonl = _project_dir_for(Path(env["CLAUDE_PROJECTS_DIR"]), spoke_repo) / "session.jsonl"
+    jsonl.write_text(json.dumps(_bash_tool_record("git status --short")) + "\n")
+    _call(_served_probe(spoke_repo, calls), env=env)
+
+    assert calls.read_text() == "x", "a DIFFERENT pending command is a different park"

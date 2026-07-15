@@ -15,19 +15,23 @@ set -uo pipefail
 # decision. _decide_permission is reached from decide_and_act, which routes a
 # permission-pending spoke here instead of to the answerer.
 
-# extract_pending_command <wt_path> -> the command of the spoke's trailing UNRESOLVED
-# assistant tool_use — the one a permission dialog is gating (Bash -> its command string;
-# Read -> "Read <file_path>"; any other tool -> the tool name, so the classifier escalates
-# non-Bash tools like browser/computer/mcp). A tool_use is UNRESOLVED when no later
-# tool_result carries its id; the PRIOR calls a parked spoke already completed are resolved
-# and MUST be skipped (#240: returning the last resolved tool surfaced a phantom "Write" and
-# escalated a spoke that needed no human). Empty when nothing is unresolved -> the caller
-# escalates honestly ("unreadable command"), never on a stale resolved tool name.
-extract_pending_command() {
+# _extract_pending_tool_field <wt_path> <field> -> one field of the spoke's trailing UNRESOLVED
+# assistant tool_use — the one a permission dialog is gating. field is `command` or `id`.
+#
+# ONE walk DEFINITION for both fields (#294): a separately-written second walk could drift from
+# this one's resolution rules (#240's skip-the-resolved-blocks scan above all) and name an id from
+# a different block than the command was read from, keying the served marker onto the wrong dialog.
+#
+# What that does NOT buy, since each wrapper is its own python pass: two calls are two independent
+# reads of the transcript, so a park that MOVES between them yields a command and an id from
+# different states. That degrades safely — a mismatched record matches no live park, so the lane
+# fails open to a re-serve rather than suppressing one — but it is why the served id is captured
+# BEFORE a delivery (and before the reasoner's minutes-long step), never re-read after it.
+_extract_pending_tool_field() {
   local jsonl; jsonl="$(_spoke_jsonl "$1")"
   [ -n "$jsonl" ] || return 0
   command -v python3 >/dev/null 2>&1 || return 0
-  _AFK_JSONL="$jsonl" python3 2>/dev/null <<'PYEOF'
+  _AFK_JSONL="$jsonl" _AFK_FIELD="${2:-command}" python3 2>/dev/null <<'PYEOF'
 import json, os
 
 # Two passes over the transcript: first collect every tool_result's tool_use_id (a
@@ -64,6 +68,7 @@ except Exception:
     tool_uses = []
 
 cmd = ""
+pending_id = ""
 for tid, name, inp in reversed(tool_uses):
     if tid in resolved:       # a completed call the spoke already ran — never the pending one
         continue
@@ -78,6 +83,8 @@ for tid, name, inp in reversed(tool_uses):
         cmd = f"{name} {fp}" if fp else name
     elif name:
         cmd = name
+    # The id of THIS block -- the one cmd was just read from, never a neighbour's (#294).
+    pending_id = (tid or "").strip()
     break                     # the trailing unresolved tool_use is the pending command
 # NB: NOT truncated since #257 -- this command feeds the default-deny classify_permission and the
 # _reason_permission prompt in the pane path. Truncating a benign prefix off a risky tail could
@@ -86,9 +93,28 @@ for tid, name, inp in reversed(tool_uses):
 # not here. The other consumers tolerate the full command: _permission_pending tests non-emptiness
 # and _broker_park_signature hashes the basis.
 # Plain ASCII, no backticks/parens: bash 3.2 mis-parses those inside a heredoc.
-print(cmd.strip())
+print(pending_id if os.environ.get("_AFK_FIELD") == "id" else cmd.strip())
 PYEOF
 }
+
+# extract_pending_command <wt_path> -> the command of the spoke's trailing UNRESOLVED
+# assistant tool_use — the one a permission dialog is gating (Bash -> its command string;
+# Read -> "Read <file_path>"; any other tool -> the tool name, so the classifier escalates
+# non-Bash tools like browser/computer/mcp). A tool_use is UNRESOLVED when no later
+# tool_result carries its id; the PRIOR calls a parked spoke already completed are resolved
+# and MUST be skipped (#240: returning the last resolved tool surfaced a phantom "Write" and
+# escalated a spoke that needed no human). Empty when nothing is unresolved -> the caller
+# escalates honestly ("unreadable command"), never on a stale resolved tool name.
+extract_pending_command() { _extract_pending_tool_field "$1" command; }
+
+# extract_pending_tool_id <wt_path> -> the tool_use ID of that same pending block (#294): the
+# API-assigned, per-call-unique id of the tool the dialog is gating. It is what separates "the
+# same dialog is STILL on screen" (same id -> an approve already delivered for it must not be
+# delivered twice) from "the spoke re-asked the IDENTICAL command" (a new id at the same tip and
+# signature -> a genuinely new dialog that must still be served). Empty when the gated tool_use is
+# not flushed yet (the #269 dialog-pending window) -> the served marker records nothing and the
+# lane fails OPEN to its pre-#294 behavior.
+extract_pending_tool_id() { _extract_pending_tool_field "$1" id; }
 
 # _permission_pending <wt_path> -> true when the spoke is parked on a permission dialog. #269
 # (#254 option b): DETECTION is decoupled from EXTRACTION. A shown pane dialog IS a park even
@@ -131,14 +157,16 @@ _reason_permission_record() {
   afk_emit_decision "$wt" warn
 }
 
-# _reason_permission <wt> <issue> <cmd> <classify_reason> -> the reasoner decides a permission
-# dialog the fixed rules would NOT auto-approve (#241 §2: the reasoner decides even irreversible
-# asks). It runs in run_answerer's read-only snapshot copy and answers 'ANSWER: APPROVE' or
-# 'ANSWER: DENY: <reversible path>'. APPROVE delivers Yes; DENY (or any unclear reply — the safe
-# default) declines the dialog and injects the reversible-path guidance. Either way the taken
-# decision is warned + journaled with its reversibility class, and the spoke is NEVER parked.
+# _reason_permission <wt> <issue> <cmd> <classify_reason> [park_sig] [tool_id] -> the reasoner
+# decides a permission dialog the fixed rules would NOT auto-approve (#241 §2: the reasoner decides
+# even irreversible asks). It runs in run_answerer's read-only snapshot copy and answers
+# 'ANSWER: APPROVE' or 'ANSWER: DENY: <reversible path>'. APPROVE delivers Yes; DENY (or any
+# unclear reply — the safe default) declines the dialog and injects the reversible-path guidance.
+# Either way the taken decision is warned + journaled with its reversibility class, and the spoke
+# is NEVER parked. park_sig/tool_id identify the park being decided (#294) and are the CALLER's,
+# captured before the minutes-long reason step: only the DELIVERED-approve branch records them.
 _reason_permission() {
-  local wt="$1" issue="$2" cmd="$3" why="$4" q raw rc ans text rev guidance
+  local wt="$1" issue="$2" cmd="$3" why="$4" sig="${5:-}" tid="${6:-}" q raw rc ans text rev guidance
   q="The spoke is parked on a PERMISSION dialog and wants to run this command:
 
 $cmd
@@ -184,6 +212,9 @@ path to tell the spoke>'."
       # is written after (#241 review).
       _broker_journal_line "$issue" permission "reasoner APPROVING (delivery pending): $cmd" "${rev:-unknown}"
       if approve_permission "$wt"; then
+        # #294: this exact park is served — the next tick must not re-approve it if the pane still
+        # shows the same dialog. Only on a CONFIRMED delivery: an unconfirmed one stays retryable.
+        note_permission_served "$wt" "$issue" "$sig" "$tid"
         _broker_journal_line "$issue" permission "reasoner APPROVED (delivered): $cmd" "${rev:-unknown}"
         _reason_permission_record "$wt" "$issue" "reasoner APPROVED (delivered): $cmd" "${rev:-unknown}"
       else
@@ -219,22 +250,30 @@ path to tell the spoke>'."
   esac
 }
 
-# _decide_permission <wt_path> <issue> -> classify the spoke's pending permission dialog and act.
-# AUTO-APPROVE a safe scoped self-op (mechanical fast path, unchanged, unwarned). Anything the
-# fixed rules will not auto-approve — an ESCALATE verdict or an unreadable command — no longer
+# _decide_permission <wt_path> <issue> [park_sig] -> classify the spoke's pending permission dialog
+# and act. AUTO-APPROVE a safe scoped self-op (mechanical fast path, unchanged, unwarned). Anything
+# the fixed rules will not auto-approve — an ESCALATE verdict or an unreadable command — no longer
 # parks the spoke: it routes to the always-answering reasoner (#241) which approves a safe
 # command or declines-and-redirects a risky one, warning + journaling the taken decision.
+#
+# park_sig is the caller's already-captured signature of the park being decided (#294); it keys the
+# served record a delivered APPROVE stamps. Self-derived when absent so a direct caller still works,
+# but broker_service_gate passes its own so the tick's single pane read stays single (#269).
 _decide_permission() {
-  local wt="$1" issue="$2" cmd cmd_display decision kind reason
+  local wt="$1" issue="$2" sig="${3:-}" cmd cmd_display decision kind reason tid
   cmd="$(extract_pending_command "$wt")"
   if [ -z "$cmd" ]; then
     # Unreadable command: cannot classify. Decline it (the reversible action) + warn — never
-    # park. The spoke gets a denial and keeps going; the backoff paces any retry.
+    # park. The spoke gets a denial and keeps going; the backoff paces any retry. Nothing is
+    # served here (a decline is not an approve), so this path needs no signature at all.
     stamp_answer_attempt "$issue"
     _deny_permission "$wt" "Declined an unreadable permission command — re-issue it in a clearer form." || true
     broker_warn_continue "$wt" "$issue" permission "declined an unreadable permission command" reversible
     return 0
   fi
+  # Self-derived only for a direct caller (broker_service_gate passes its own): after the unreadable
+  # early return, so the decline path never pays _broker_park_signature's pane read (#269).
+  [ -n "$sig" ] || sig="$(_broker_park_signature "$wt" "$issue")"
   # #257: classify the WHOLE command (uncapped) so a risky tail past 2000 chars can't hide behind
   # a benign prefix. The 2000-char cap is DISPLAY-only now, applied to a copy used solely for the
   # log/codify surfaces HERE (log_decision's signature + the drain log line) — kept byte-identical
@@ -251,11 +290,19 @@ _decide_permission() {
   # -q` APPROVE vs `git reset --hard` ESCALATE, which share the signature git-reset+git-add)
   # correctly read as a CONFLICT, so codify never proposes it as a safe unanimous rule (#155 D).
   log_decision "$issue" permission "$cmd_display" "$kind"
+  # The id of the tool_use this dialog gates, read BEFORE any delivery (#294): it is what the
+  # served record keys on, and after the keypress the trailing unresolved tool_use can already be
+  # a different one. Empty in the #269 unflushed-dialog window → nothing is recorded and the lane
+  # keeps its pre-#294 behavior.
+  tid="$(extract_pending_tool_id "$wt")"
   if [ "$kind" = "APPROVE" ]; then
     log "→ auto-approving safe permission for #$issue: $cmd_display"
     # Stamp the delivery attempt FIRST: the approve→resume window must not read as idle.
     stamp_answer_attempt "$issue"
     if approve_permission "$wt"; then
+      # #294: record the park we just served so the next tick does not re-approve the same dialog.
+      # Only a CONFIRMED delivery is served — the failure path below stays retryable.
+      note_permission_served "$wt" "$issue" "$sig" "$tid"
       log "  approved permission for #$issue"
       afk_emit_decision "$wt" success
       return 0
@@ -267,7 +314,7 @@ _decide_permission() {
   # ESCALATE: the fixed rules will not auto-approve this one. The reasoner decides it (#241) —
   # approve a safe/reversible command, or decline an irreversible one and name the reversible
   # path — and warns + journals the taken decision. Never park.
-  _reason_permission "$wt" "$issue" "$cmd" "$reason"
+  _reason_permission "$wt" "$issue" "$cmd" "$reason" "$sig" "$tid"
 }
 
 # --- programmatic PreToolUse permission decision (issue #253) ------------------
