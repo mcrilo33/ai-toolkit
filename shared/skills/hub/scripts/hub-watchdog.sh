@@ -778,6 +778,36 @@ _wd_clear_landed_landmarks() {
     _wd_log "cleared resolved landmark $tag (issue #$issue closed/landed)"
   done < <(git -C "$repo" tag -l 'needs-human-land/*' 2>/dev/null)
 }
+# _wd_sweep_dead_pane_markers <in-flight issues> -> drop every dangling wd-fire-dedup-dead-pane-<N>
+# (#290 AC5). Condition 2 raises no needs-human-land tag, so _wd_clear_landed_landmarks never
+# revisits its firings; and the dispatcher's else-clear runs ONLY for in-flight worktrees, which a
+# landed issue no longer has — so its marker dangles for the rest of the run and a genuine later
+# recurrence would stay deduped into silence. Mirrors the landmark sweep, including its fail-safe:
+# _wd_issue_open reads an ambiguous state (gh down, empty query) as OPEN, so an outage never
+# mass-clears live markers.
+# <in-flight issues> is this tick's space-separated issue list; those are the DISPATCHER's to clear
+# (their detector may still be firing, and re-arming the dedup mid-fire would let one unresolved
+# condition double-count in the ledger, #263). Scoped to the dead-pane stem on purpose: the other
+# conditions' markers dangle the same way, but auto-land-skipped/conflicted-land are already swept
+# by the landmark sweep, and widening this glob would re-arm park markers whose detector can still
+# fire on a closed issue. Best-effort throughout.
+_wd_sweep_dead_pane_markers() {
+  local inflight=" ${1:-} " dir f issue
+  dir="$(dirname "$(_wd_ledger_file)")"
+  [ -d "$dir" ] || return 0
+  for f in "$dir"/wd-fire-dedup-dead-pane-*; do
+    [ -e "$f" ] || continue
+    issue="${f##*-}"
+    case "$issue" in '' | *[!0-9]*) continue ;; esac    # never resolve a non-numeric stem as an issue
+    # Space-padded on BOTH sides (the list, above, and the pattern): a bare *"$issue"* would let
+    # #4 match an in-flight list containing 14 or 284 and silently skip a real dangling marker.
+    case "$inflight" in *" $issue "*) continue ;; esac  # still in flight ⇒ the dispatcher's to clear
+    _wd_issue_open "$issue" && continue                 # still open ⇒ a real unresolved condition
+    _wd_clear_fired dead-pane "$issue"
+    _wd_log "cleared dangling dead-pane firing marker for landed/closed #$issue"
+  done
+}
+
 _wd_intervene_rearm() {   # re-arm the crashed drain (self-update aware via hub-afk --reconcile)
   if [ -n "${HUB_WATCHDOG_REARM_CMD:-}" ]; then bash -c "$HUB_WATCHDOG_REARM_CMD" hub-watchdog >/dev/null 2>&1 || true; return 0; fi
   local afk=""
@@ -938,6 +968,7 @@ _wd_fire() {
 # Best-effort throughout: a missing drain reader (standalone watchdog) simply skips its condition.
 _wd_run_conditions() {
   local now="${1:-$(_wd_now)}" state="${2:-$(_wd_drain_state)}" wt issue wd_conflicts wd_done
+  local wd_seen=""   # the issues this tick saw in flight — the sweep below leaves them alone
   # Use the drain state the loop already read (passed as $2) rather than re-probing — the loop
   # reads it once per tick, and a second _wd_drain_state call would double-count under stubs.
   if [ "$state" = "stale" ]; then
@@ -953,6 +984,7 @@ _wd_run_conditions() {
   command -v inflight_worktrees >/dev/null 2>&1 || return 0
   while IFS=$'\t' read -r wt issue; do
     [ -n "$issue" ] || continue
+    wd_seen="$wd_seen $issue"
     # #290: pre-read the done epoch BEFORE any detector below calls slot_state — a non-terminal
     # slot_state read deletes it (#263), and the park detectors run first, so a read at
     # condition-2 time always comes back empty. Per-iteration local, passed explicitly: not a
@@ -1023,6 +1055,10 @@ _wd_run_conditions() {
       _wd_clear_fired conflicted-land "$issue"
     fi
   done < <(inflight_worktrees)
+  # #290 AC5: sweep dead-pane firing markers for issues that have since landed. Runs AFTER the loop
+  # so it knows which issues were in flight this tick (those are the dispatcher's to clear above).
+  # The loop is fed by process substitution, NOT a pipe, so wd_seen survives into this call.
+  _wd_sweep_dead_pane_markers "${wd_seen# }"
 }
 
 # --- the autonomy score + morning report (issue #251) -------------------------

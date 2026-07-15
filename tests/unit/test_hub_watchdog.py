@@ -1725,6 +1725,20 @@ def test_sweep_keeps_the_dead_pane_marker_for_an_in_flight_issue(tmp_path: Path)
     assert marker.exists(), "an in-flight issue is the dispatcher's to clear, not the sweep's"
 
 
+def test_sweep_in_flight_check_does_not_substring_match_a_longer_issue(tmp_path: Path) -> None:
+    # The in-flight membership test is a substring match over a space-joined list. Both the list and
+    # the pattern are space-padded so #4 cannot match an in-flight list of "14 284" — an unpadded
+    # match would skip #4's genuinely dangling marker and leave it deduped into silence forever.
+    ledger = tmp_path / "l.jsonl"
+    marker = tmp_path / "wd-fire-dedup-dead-pane-4"
+    marker.write_text("")
+    env = {"HUB_WATCHDOG_LEDGER": str(ledger), "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo closed"}
+
+    _call('_wd_sweep_dead_pane_markers "14 284"', env=env)
+
+    assert not marker.exists(), "#4 is not in flight — 14/284 must not mask it"
+
+
 def test_sweep_keeps_the_dead_pane_marker_when_the_issue_state_is_ambiguous(tmp_path: Path) -> None:
     # Fail-safe, mirroring _wd_clear_landed_landmarks: a gh outage / empty read must never be
     # treated as "landed". _wd_issue_open reads an unknown state as OPEN.
