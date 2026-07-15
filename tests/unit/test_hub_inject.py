@@ -306,6 +306,113 @@ def test_transcript_mtime_reads_newest_jsonl(tmp_path: Path) -> None:
     assert result.stdout.strip() == "1700000000", result.stderr
 
 
+# ── #289: stat flavor ordering (the CI-red bug class already fixed once in #132) ──
+#
+# Both stat fallbacks here must probe the GNU spelling FIRST. GNU stat's `-f` means
+# "display filesystem status" and takes no inline format, so under a BSD-first
+# `stat -f %m F || stat -c %Y F` chain GNU reads `%m` as a missing file operand: it errors
+# on %m yet still PRINTS a multi-line filesystem-status block for F and exits nonzero, so
+# the `||` fallback fires too and the capture holds the garbage block AND the real value.
+# GNU-first inverts this: BSD fails the `-c` probe CLEANLY (usage error, empty stdout), so
+# exactly one answer is ever captured. The stubs simulate BOTH flavors, so these pin the
+# ordering regardless of host -- this module is darwin-gated, so they guard the dev host
+# where such a regression would be authored, while test_gate_broker_detect.py (ungated)
+# carries the same contract on the ubuntu CI runner.
+
+_GNU_STAT_STUB = (
+    "#!/bin/sh\n"
+    'if [ "$1" = "-c" ]; then\n'
+    '  case "$2" in\n'
+    "    %Y) echo 1700000000; exit 0 ;;\n"
+    "    %s) echo 4096; exit 0 ;;\n"
+    "  esac\n"
+    "fi\n"
+    'if [ "$1" = "-f" ]; then\n'
+    '  echo "  File: \\"$3\\""\n'
+    '  echo "    ID: b505c8e079f9471 Namelen: 255     Type: ext2/ext3"\n'
+    '  echo "  Block size: 4096       Fundamental block size: 4096"\n'
+    '  echo "stat: cannot read file system information for $2" >&2\n'
+    "  exit 1\n"
+    "fi\n"
+    "exit 1\n"
+)
+
+_BSD_STAT_STUB = (
+    "#!/bin/sh\n"
+    'if [ "$1" = "-c" ]; then echo "stat: illegal option -- c" >&2; exit 1; fi\n'
+    'if [ "$1" = "-f" ]; then\n'
+    '  case "$2" in\n'
+    "    %m) echo 1700000000; exit 0 ;;\n"
+    "    %z) echo 4096; exit 0 ;;\n"
+    "  esac\n"
+    "fi\n"
+    "exit 1\n"
+)
+
+
+def _stat_stub_path(tmp_path: Path, stub_body: str) -> str:
+    """Install a fake `stat` and return a PATH with it in front of the real one."""
+    bindir = tmp_path / "stat-stub-bin"
+    bindir.mkdir(exist_ok=True)
+    stub = bindir / "stat"
+    stub.write_text(stub_body)
+    stub.chmod(0o755)
+    return f"{bindir}:{os.environ['PATH']}"
+
+
+def _wt_with_transcript(tmp_path: Path) -> tuple[Path, Path]:
+    wt = tmp_path / "wt"
+    wt.mkdir(exist_ok=True)
+    projects = tmp_path / "projects"
+    _project_dir_for(projects, wt).joinpath("session.jsonl").write_text("{}\n")
+    return wt, projects
+
+
+@pytest.mark.parametrize("stub", [_GNU_STAT_STUB, _BSD_STAT_STUB], ids=["gnu", "bsd"])
+def test_transcript_mtime_survives_both_stat_flavors(tmp_path: Path, stub: str) -> None:
+    # The registration signal for inject verification: a polluted capture makes the
+    # caller's `[ "$now" -gt "$before" ]` compare error out, so a delivered answer reads as
+    # unregistered and inject_and_verify returns the wrong RC (the red CI nodes).
+    wt, projects = _wt_with_transcript(tmp_path)
+
+    result = _call(
+        f"_transcript_mtime '{wt}'",
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "PATH": _stat_stub_path(tmp_path, stub),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1700000000", (
+        f"mtime must be a bare epoch: {result.stdout!r}{result.stderr}"
+    )
+
+
+@pytest.mark.parametrize("stub", [_GNU_STAT_STUB, _BSD_STAT_STUB], ids=["gnu", "bsd"])
+def test_transcript_sizes_survives_both_stat_flavors(tmp_path: Path, stub: str) -> None:
+    # The size-sort helper takes the `-c %s` / `-f %z` variant of the same chain; its
+    # snapshot feeds _answer_appended's byte-level delivery proof, so a leaked fs block
+    # would corrupt the pre-inject baseline rather than any mtime compare.
+    wt, projects = _wt_with_transcript(tmp_path)
+
+    result = _call(
+        f"_transcript_sizes '{wt}'",
+        env={
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "PATH": _stat_stub_path(tmp_path, stub),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(result.stdout.strip().splitlines()) == 1, (
+        f"one size<TAB>path line per jsonl: {result.stdout!r}{result.stderr}"
+    )
+    assert result.stdout.split("\t")[0] == "4096", (
+        f"size must be a bare byte count: {result.stdout!r}{result.stderr}"
+    )
+
+
 # ── #255: the finished-turn-idle transcript read ───────────────────────────────
 
 
