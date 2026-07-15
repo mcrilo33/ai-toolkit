@@ -1310,6 +1310,18 @@ FORBIDDEN_RULES = [
 ]
 
 
+# The AskUserQuestion deny-wall (issue #281). A spoke must ask in prose plus a gate marker,
+# never an AskUserQuestion: the /afk injector's Esc-first menu-cancel (built for the #74
+# PLAN-gate QCM) can only CANCEL a spoke's QCM, never select an option, so the pane is left
+# showing "User declined to answer questions" while the injector types a free-text answer to a
+# question the spoke never got answered. Denying the tool structurally removes the QCM the
+# broker cannot drive. `AskUserQuestion` is the CANONICAL tool name — rules match the canonical
+# name only, and a rule written against a display label silently never matches.
+DENY_RULES = [
+    "AskUserQuestion",
+]
+
+
 def _bare_push_rules(branch: str) -> list[str]:
     """The two exact-match push rules issue #37 drops."""
     return [f"Bash(git push origin {branch})", f"Bash(git push -u origin {branch})"]
@@ -1370,6 +1382,59 @@ def test_seeds_spoke_command_allowlist(hub: Path) -> None:
     allow = _load_allowlist(_worktree_dir(hub, "99"))["permissions"]["allow"]
     for rule in SEEDED_RULES:
         assert rule in allow, f"missing seeded rule: {rule}"
+
+
+def test_afk_spoke_denies_askuserquestion(hub: Path) -> None:
+    """#281 head (c): an afk spoke gets a structural AskUserQuestion deny-wall.
+
+    The /afk injector cannot answer a QCM — inject_answer sends Escape first (the #74
+    PLAN-gate menu-cancel), which CANCELS a spoke's AskUserQuestion rather than selecting an
+    option, then types free text at the prompt behind it. In #271 that left the pane reading
+    "User declined to answer questions" while the drain believed it had answered. The spoke's
+    own PLAN gate does not need the tool: it is tag-based (spoke-ready.sh --gate writes
+    gate/<N>), so the wall cannot strand it.
+
+    The rule is BARE (no parenthesised specifier), which removes the tool from the spoke's
+    context entirely rather than erroring on use — so the spoke never renders a QCM at all.
+    """
+    _seed_hub_claude(hub)
+
+    proc = _run_new_quiet(hub, "99", "pushguard", "--mode", "afk")
+
+    assert proc.returncode == 0, proc.stderr
+    settings = _load_allowlist(_worktree_dir(hub, "99"))
+    deny = settings["permissions"].get("deny", [])
+    for rule in DENY_RULES:
+        assert rule in deny, f"missing seeded deny rule: {rule} (got {deny})"
+
+
+def test_attended_spoke_keeps_askuserquestion(hub: Path) -> None:
+    """The wall is afk-ONLY: an attended spoke has a human at the keyboard who can answer a
+    QCM, and nothing Esc-cancels it. Mirrors the afk-only `--permission-mode bypassPermissions`
+    gating — attended lanes keep the interactive surfaces the human is there to drive.
+    """
+    _seed_hub_claude(hub)
+
+    proc = _run_new_quiet(hub, "99", "pushguard")
+
+    assert proc.returncode == 0, proc.stderr
+    settings = _load_allowlist(_worktree_dir(hub, "99"))
+    deny = settings["permissions"].get("deny", [])
+    assert "AskUserQuestion" not in deny, f"attended spoke must not be walled: {deny}"
+
+
+def test_deny_merge_preserves_existing_rules(hub: Path) -> None:
+    """The jq merge path must APPEND to a pre-existing deny list, never replace it — dropping
+    a user's own deny rule would silently widen what the spoke may do.
+    """
+    _seed_hub_claude(hub, settings={"permissions": {"deny": ["Bash(curl:*)"], "allow": []}})
+
+    proc = _run_new_quiet(hub, "99", "pushguard", "--mode", "afk")
+
+    assert proc.returncode == 0, proc.stderr
+    deny = _load_allowlist(_worktree_dir(hub, "99"))["permissions"]["deny"]
+    assert "Bash(curl:*)" in deny, f"pre-existing deny rule dropped: {deny}"
+    assert "AskUserQuestion" in deny, f"seeded deny rule missing: {deny}"
 
 
 def test_drops_bare_push_rules(hub: Path) -> None:
