@@ -1102,6 +1102,8 @@ def test_run_conditions_dedupes_ledger_but_keeps_intervening(tmp_path: Path) -> 
         "HUB_WATCHDOG_LANDMARK_REPO": str(tmp_path / "no-landmark-repo"),
         # Drain off so the AC4 mid-service guard never defers (hermetic vs a real armed drain).
         "AFK_STATE": str(tmp_path / "absent-afk-state"),
+        # #283: pin the state dir so a REAL decision-journal record cannot read as servicing.
+        "AFK_STATE_DIR": str(tmp_path / "afk-state"),
         "AFK_NOW": NOW,
     }
     # A parked spoke never answered, parked past the ceiling → park-unanswered fires; the same
@@ -1109,9 +1111,11 @@ def test_run_conditions_dedupes_ledger_but_keeps_intervening(tmp_path: Path) -> 
     onset = str(int(NOW) - 700)
     prelude = (
         'inflight_worktrees() { printf "/the/wt\\t5\\n"; }; '
+        f"{_GATE_LANE}; "  # #283: the answer ceiling applies to answer-lane parks only
         'slot_state() { echo waiting; }; read_answer_attempt() { echo ""; }; '
         f"read_park_onset_epoch() {{ echo {onset}; }}; "
-        '_spoke_pane_target() { echo "hub:0"; }; read_progress_epoch() { echo ' + NOW + "; }"
+        # Progress stays EMPTY: a fresh progress epoch now reads as the drain servicing the spoke.
+        '_spoke_pane_target() { echo "hub:0"; }; read_progress_epoch() { echo ""; }'
     )
 
     _call(f"{prelude}; _wd_run_conditions {NOW} live", env=env)  # tick 1: fire + intervene
@@ -1151,6 +1155,9 @@ def test_run_conditions_fires_park_and_invokes_answer_seam(tmp_path: Path) -> No
         "HUB_WATCHDOG_LANDMARK_REPO": str(tmp_path / "no-landmark-repo"),
         # Drain off so the AC4 mid-service guard never defers (hermetic vs a real armed drain).
         "AFK_STATE": str(tmp_path / "absent-afk-state"),
+        # #283: the servicing check reads the drain's decision journal out of the state dir —
+        # pin it at a scratch path so a REAL journal record for this issue cannot suppress the fire.
+        "AFK_STATE_DIR": str(tmp_path / "afk-state"),
         "AFK_NOW": NOW,
     }
     onset = str(
@@ -1158,9 +1165,12 @@ def test_run_conditions_fires_park_and_invokes_answer_seam(tmp_path: Path) -> No
     )  # parked past the ceiling (#265) so the never-attempted branch fires
     prelude = (
         'inflight_worktrees() { printf "/the/wt\\t5\\n"; }; '
+        f"{_GATE_LANE}; "  # #283: the answer ceiling applies to answer-lane parks only
         'slot_state() { echo waiting; }; read_answer_attempt() { echo ""; }; '
         f"read_park_onset_epoch() {{ echo {onset}; }}; "
-        '_spoke_pane_target() { echo "hub:0"; }; read_progress_epoch() { echo ' + NOW + "; }"
+        # A live pane is what keeps dead-idle quiet here; progress must stay EMPTY, since a fresh
+        # progress epoch now reads as the drain servicing the spoke and would suppress the fire.
+        '_spoke_pane_target() { echo "hub:0"; }; read_progress_epoch() { echo ""; }'
     )
 
     _call(f"{prelude}; _wd_run_conditions {NOW} live", env=env)
