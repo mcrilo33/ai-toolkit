@@ -243,6 +243,68 @@ def test_daemon_appends_loop_output_to_logfile(tmp_path: Path) -> None:
     )
 
 
+# ── singleton recycle of a live but STALE-GENERATION daemon (issue #296 AC2) ───
+# #296 mechanism 2: a self-update redeploy resumes a FRESH copy, but its arm was singleton-
+# guarded by liveness ALONE — a live pidfile always refused, even when the fresh copy can prove
+# (via the recorded generation stamp) that the live daemon is running code an intervening land
+# already replaced. These pin the recycle-instead-of-refuse path; a genfile the arming daemon
+# never wrote (an old daemon that predates this stamp, or a genuinely current one) is
+# unmeasurable and must NOT be touched — the existing refuse tests above cover that fail-safe.
+
+
+def test_daemon_recycles_a_live_daemon_running_a_stale_generation(tmp_path: Path) -> None:
+    pidfile = tmp_path / "wd.pid"
+    genfile = tmp_path / "wd.gen"
+    parts = [
+        _drain_pattern_stub(tmp_path, "L"),
+        _LOOP_ENV,
+        f'export HUB_WATCHDOG_PIDFILE="{pidfile}"',
+        f'export HUB_WATCHDOG_GENFILE="{genfile}"',
+        f'export HUB_WATCHDOG_LOG="{tmp_path / "wd.log"}"',
+        "export HUB_WATCHDOG_RECYCLE_GRACE=2",
+        "_wd_source_hash() { echo FRESH; }",
+        f'printf "%s" "STALE" > "{genfile}"',
+        f'sleep 20 & printf "%s" "$!" > "{pidfile}"',
+        "_wd_daemon",
+    ]
+
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "already running" not in result.stdout + result.stderr, (
+        "a live daemon PROVEN stale (recorded gen != current origin hash) must be recycled, "
+        "not deferred to forever"
+    )
+    assert (tmp_path / "ticks").read_text() == "1", "the reclaiming daemon actually ran a tick"
+    assert genfile.read_text() == "FRESH", "the new daemon stamps its own (current) generation"
+
+
+def test_daemon_leaves_a_live_daemon_alone_when_generation_is_unmeasurable(tmp_path: Path) -> None:
+    # No genfile at all (an old daemon that predates the stamp, or the first arm ever) — must
+    # NOT be treated as stale by default; that would let a fresh arm attempt kill a daemon it
+    # has no positive proof is behind. Sibling of test_daemon_refuses_second_start_while_pid_alive,
+    # using our own pid (like that test does) rather than a background job — the fix must never
+    # reach for `kill` on this path at all when the generation is unmeasurable.
+    pidfile = tmp_path / "wd.pid"
+    parts = [
+        _drain_pattern_stub(tmp_path, "L"),
+        _LOOP_ENV,
+        f'export HUB_WATCHDOG_PIDFILE="{pidfile}"',
+        f'export HUB_WATCHDOG_GENFILE="{tmp_path / "absent.gen"}"',
+        f'export HUB_WATCHDOG_LOG="{tmp_path / "wd.log"}"',
+        "_wd_source_hash() { echo FRESH; }",
+        f'printf "%s" "$$" > "{pidfile}"',  # a LIVE pid (our own shell)
+        "_wd_daemon",
+    ]
+
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "already running" in result.stdout + result.stderr
+    assert not (tmp_path / "ticks").exists(), "the loop never ticked — the daemon refused"
+    assert pidfile.exists(), "the other (unmeasurable) daemon's pidfile is left intact"
+
+
 # ── the self-recycle source bundle (issue #296) ────────────────────────────────
 # A daemon armed by the drain EXECUTES from hub-afk.sh's frozen self-copy (/tmp/hub-afk-self.*/)
 # — a bundle no land ever rewrites. Hashing THAT is structurally dead: the stamp can never move,

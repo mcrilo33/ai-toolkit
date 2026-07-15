@@ -9990,6 +9990,34 @@ def test_detect_selfupdate_flags_config_only_diff(tmp_path: Path) -> None:
     assert flag.read_text().strip() == "236", "the flag records the triggering issue"
 
 
+def test_paths_in_scope_matches_watchdog_basename() -> None:
+    # #296: a watchdog-only land (hub-watchdog.sh) must flag a redeploy too — mirrors #291's
+    # ai-toolkit.yml pin. Without this, a land touching only the watchdog never even sets the
+    # pending-self-update flag, so mechanism 3 of #296 (the missing scope entry) stays broken.
+    result = _call("_afk_paths_in_scope 'shared/skills/hub/scripts/hub-watchdog.sh'")
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_detect_selfupdate_flags_watchdog_only_diff(tmp_path: Path) -> None:
+    # #296: a land whose merged diff touches only hub-watchdog.sh must flag a pending
+    # self-update, so the redeploy actually happens for a watchdog-only fix.
+    repo = _su_repo(tmp_path)
+    before = _su_git(repo, "rev-parse", "HEAD")
+    after = _su_commit(repo, "shared/skills/hub/scripts/hub-watchdog.sh", "# changed\n")
+    statedir = tmp_path / "sd"
+
+    result = _call(
+        f"_afk_detect_selfupdate {before} {after} 296 '{repo}'",
+        env={"AFK_STATE_DIR": str(statedir)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    flag = statedir / "self-update-pending"
+    assert flag.exists(), "a watchdog-only land must flag a pending self-update"
+    assert flag.read_text().strip() == "296", "the flag records the triggering issue"
+
+
 # ── #250: afk self-update — DEPLOY (validate + smoke + resync + in-place exec) ──
 # At a tick boundary the drain validates + smoke-tests the SOURCE, re-syncs the gitignored
 # scripts, journals, then execs in place onto the new code. The SOURCE is proven healthy
