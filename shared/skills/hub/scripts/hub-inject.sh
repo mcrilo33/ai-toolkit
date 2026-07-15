@@ -376,15 +376,65 @@ _pane_shows_permission_prompt() {
 # spoke resumed. Sends "1" then a SEPARATE Enter — option 1 is "Yes" (this once), NEVER option 2
 # ("Yes, don't ask again"), so nothing is silently broadened — then verifies the transcript
 # advanced. rc 0 approved; rc 1 no pane / not confirmed (the caller escalates).
+#
+# ONE bounded retry on an unconfirmed attempt (#299), for the lost-Enter shape inject_and_verify
+# has always retried. It is deliberately NOT that function's retry, which is a bare Enter:
+#   - A bare Enter lands in a COMPOSER there, where it is a harmless no-op. Here it would land in
+#     a MENU, where Enter submits whatever is CURRENTLY highlighted — so a drifted highlight
+#     could select option 2 and silently broaden the approval. Every Enter this function sends is
+#     therefore immediately preceded by an explicit "1": the selection is asserted, never assumed.
+#   - Re-asserting "1" is safe precisely BECAUSE of the retry gate below: in a menu a repeated
+#     "1" just re-selects option 1 (idempotent), whereas a "1" sent to a pane that already
+#     consumed the dialog would type a stray character into the spoke's next message. The
+#     sibling's never-re-send rule guards a composer; the gate replaces it here.
+# Bounded at one retry: _transcript_advanced already polls AFK_INJECT_VERIFY_SECONDS per attempt,
+# so a second failure is a wedged pane — the caller's backoff to own (a failed approve records
+# nothing, so the serve stays retryable, #294).
 approve_permission() {
-  local wt="$1" target before
+  local wt="$1" target before pane
   command -v tmux >/dev/null 2>&1 || return 1
   target="$(_spoke_pane_target "$wt")"
   [ -n "$target" ] || return 1
   before="$(_transcript_mtime "$wt")"
+  pane="$(_approve_pane_snapshot "$target")"   # BEFORE the first keypress: the dialog as classified
+  _approve_send_selection "$target" || return 1
+  _transcript_advanced "$wt" "$before" && return 0
+  _approve_retry_is_safe "$wt" "$target" "$pane" || return 1
+  log "  approve did not register and the dialog is unchanged — re-asserting the selection once"
+  _approve_send_selection "$target" || return 1
+  _transcript_advanced "$wt" "$before"
+}
+_approve_pane_snapshot() { tmux capture-pane -p -t "$1" 2>/dev/null; }
+# _approve_send_selection <pane_target> -> assert option 1, then submit it with a SEPARATE Enter.
+# Factored out so the retry cannot drift from the first attempt: both paths send the digit and
+# the Enter together, which is what keeps the "never a bare Enter" invariant true by construction
+# rather than by convention.
+_approve_send_selection() {
+  local target="$1"
   tmux send-keys -t "$target" 1 2>/dev/null || return 1
   tmux send-keys -t "$target" Enter 2>/dev/null || return 1
-  _transcript_advanced "$wt" "$before"
+}
+# _approve_retry_is_safe <wt> <pane_target> <snapshot> -> rc 0 only when a second keypress is
+# provably harmless: it would land in the EXACT dialog the caller already classified.
+#
+# "A permission prompt is pending" is NOT enough on its own — it cannot tell the dialog we served
+# from a DIFFERENT one raised since. That is not hypothetical: #269's unflushed-dialog window has
+# a pane rendering a dialog the transcript does not yet reflect, so the no-transcript-advance
+# that brought us here does not by itself prove nothing moved. Approving an unseen dialog would
+# authorize a command no classifier ever read — the one thing this lane exists to prevent. So the
+# gate is byte-identity of the pane against the snapshot taken before the first keypress: an
+# unchanged pane is the same dialog AND (since the highlight is rendered in it) the same
+# highlight. The prompt check stays as well, for the direct/CLI caller that may aim this at a
+# pane holding no dialog at all, where an idempotent "1" would instead type a stray character.
+#
+# Fail-CLOSED on every ambiguity (unreadable pane, changed pane, no prompt): the caller simply
+# re-serves next tick, exactly as it did before this retry existed. The cost of a wrong retry is
+# an unclassified approval; the cost of a skipped one is a tick of latency.
+_approve_retry_is_safe() {
+  local wt="$1" target="$2" pane="$3"
+  [ -n "$pane" ] || return 1
+  _pane_shows_permission_prompt "$wt" || return 1
+  [ "$pane" = "$(_approve_pane_snapshot "$target")" ]
 }
 # _deny_permission <wt_path> <guidance> -> decline the pending permission dialog and tell the
 # spoke the reversible path: the hardened injector Esc-cancels the menu, then submits <guidance>

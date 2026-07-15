@@ -280,6 +280,46 @@ def test_approve_permission_sends_nothing_more_once_the_dialog_is_gone(tmp_path:
     assert result.returncode == 1, "unconfirmed stays rc 1 so the caller re-serves next tick"
 
 
+def test_approve_permission_does_not_retry_into_a_dialog_it_never_classified(
+    tmp_path: Path,
+) -> None:
+    # The hazard the byte-identity gate exists for: a permission prompt is STILL on the pane, but
+    # it is a DIFFERENT one (the #269 unflushed-dialog window renders a dialog the transcript does
+    # not yet reflect, so "no transcript advance" alone does not prove nothing moved). Retrying
+    # here would approve a command no classifier ever read. A changed pane must draw no keys.
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    log = tmp_path / "tmux.log"
+    counter = tmp_path / "captures"
+    # Every capture-pane returns a DIFFERENT dialog, both matching the permission-prompt regex.
+    script = f"""#!/usr/bin/env bash
+case "$1" in
+  list-panes)   printf 'hub:0\\t%s\\n' "{wt}" ;;
+  capture-pane) printf 'x' >> "{counter}"
+                printf 'rm -rf /tmp/run-%s\\n{_PROMPT}\\n' "$(wc -c < "{counter}" | tr -d ' ')" ;;
+  *)            printf '%s\\n' "$*" >> "{log}" ;;
+esac
+exit 0
+"""
+    (fake_bin / "tmux").write_text(script)
+    (fake_bin / "tmux").chmod(0o755)
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "CLAUDE_PROJECTS_DIR": str(tmp_path / "projects"),
+    }
+
+    result = _call(f"approve_permission '{wt}'", env=env)
+
+    assert _keys(log) == ["1", "Enter"], (
+        "a pane showing a DIFFERENT dialog must draw no retry — approving it would authorize a "
+        "command the classifier never saw"
+    )
+    assert result.returncode == 1
+
+
 def test_approve_permission_recovers_a_lost_enter_on_the_retry(tmp_path: Path) -> None:
     # The payoff: the first Enter is lost, the retry lands, and the approve reports success —
     # instead of costing a whole tick of drain latency and a re-run of the classifier.
