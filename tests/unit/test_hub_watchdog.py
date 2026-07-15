@@ -1752,21 +1752,131 @@ def test_dead_idle_base_is_empty_when_nothing_is_measurable(tmp_path: Path) -> N
     assert out == ""
 
 
-def test_dead_idle_base_epoch_agrees_with_the_real_reaper_ceiling(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "dispatch_age,progress_age",
+    [
+        pytest.param(4000, None, id="dispatch-only"),
+        pytest.param(None, 900, id="progress-only"),
+        pytest.param(4000, 900, id="both-progress-newer"),
+        pytest.param(900, 4000, id="both-dispatch-newer"),
+        pytest.param(900, 900, id="tie"),
+        pytest.param(None, None, id="neither"),
+    ],
+)
+def test_dead_idle_base_epoch_agrees_with_the_real_reaper_ceiling(
+    tmp_path: Path, dispatch_age: int | None, progress_age: int | None
+) -> None:
     # The parity pin: this helper duplicates _afk_ceiling_epoch's max() so it can name the winner.
-    # Pinned against the REAL reaper function so the two can never silently diverge on WHEN a spoke
-    # is over its ceiling — a divergence would mean the watchdog and the reaper disagree about
-    # whether the same spoke is abandoned.
+    # Pinned against the REAL reaper across EVERY combination of present/absent epochs — the two
+    # max() expressions are independently written (different operators, different emptiness
+    # handling), so pinning only the case where progress wins outright would let a future edit to
+    # either one diverge unnoticed. A divergence means the watchdog and the reaper contradict each
+    # other about whether the same spoke is over its ceiling.
+    # NOT parametrized over future-dated epochs: the watchdog deliberately screens those and the
+    # reaper does not (see _wd_dead_idle_base). That divergence is the point, and is pinned
+    # separately by test_dead_idle_base_screens_a_future_dated_epoch.
+    sd = tmp_path / "afk-state"
+    sd.mkdir()
+    if dispatch_age is not None:
+        (sd / "dispatch-284.epoch").write_text(f"{int(NOW) - dispatch_age}\n")
+    if progress_age is not None:
+        (sd / "progress-284.epoch").write_text(f"{int(NOW) - progress_age}\n")
+    env = _dead_pane_env(tmp_path)
+
+    base = _call(f"_wd_dead_idle_base 284 {NOW}", env=env).stdout.strip()
+    reaper = _call("_afk_ceiling_epoch 284", env=env).stdout.strip()
+
+    mine = base.split("\t")[-1] if base else ""
+    assert mine == reaper, f"base {base!r} must carry the reaper's ceiling epoch {reaper!r}"
+
+
+def test_dead_idle_base_screens_a_future_dated_epoch(tmp_path: Path) -> None:
+    # A future-dated epoch is unmeasurable, not fresh. Taking max() blindly would let a skewed
+    # dispatch stamp OUTRANK a genuinely stale progress clock: now-epoch goes negative, which is
+    # never > the ceiling, so condition 2 would go silent for the whole window — the unbounded
+    # silence of #284, worse than the blindness this subtask removes. Fail toward firing, the same
+    # rule _wd_land_in_flight applies to its log mtime. Reachable via a clock that steps forward
+    # (VM resume, bad NTP) while spokes stamp dispatch, then corrects back.
+    sd = tmp_path / "afk-state"
+    sd.mkdir()
+    stale_progress = str(int(NOW) - 9000)
+    (sd / "dispatch-284.epoch").write_text(f"{int(NOW) + 100000}\n")  # clock skew
+    (sd / "progress-284.epoch").write_text(stale_progress + "\n")
+
+    base = _call(f"_wd_dead_idle_base 284 {NOW}", env=_dead_pane_env(tmp_path)).stdout.strip()
+
+    assert base == f"progress\t{stale_progress}", "a skewed epoch must not outrank a real one"
+
+
+def test_dead_idle_fires_despite_a_future_dated_dispatch_epoch(tmp_path: Path) -> None:
+    # The screen's whole point, end to end: the dead pane still fires rather than being silenced
+    # for the window by a bogus stamp.
+    sd = tmp_path / "afk-state"
+    sd.mkdir()
+    (sd / "dispatch-284.epoch").write_text(f"{int(NOW) + 100000}\n")
+    (sd / "progress-284.epoch").write_text(f"{int(NOW) - 9000}\n")
+    prelude = (
+        f'_spoke_pane_target() {{ echo ""; }}; slot_state() {{ echo busy; }}; {_NO_DONE_EPOCH}'
+    )
+
+    assert (
+        _detect(prelude, "_wd_detect_dead_idle /wt 284 " + NOW, env=_dead_pane_env(tmp_path)) == 0
+    ), "clock skew must not silence a genuinely dead pane"
+
+
+def test_dead_idle_quiet_for_a_parked_spoke_that_never_committed(tmp_path: Path) -> None:
+    # `waiting` is PARKED, not hung, and must be excluded now that the base falls back to dispatch.
+    # A spoke parked at a gate before its first commit has no progress epoch, so the old
+    # progress-only base made condition 2 structurally silent for it; measuring from dispatch arms
+    # it — and _wd_intervene_revive checks slot_state nowhere, so it would `claude --continue` a
+    # spoke parked at an UNAPPROVED plan gate straight into implementing unreviewed work.
+    # Parked spokes are conditions 1/3's, exactly as the drain's recover_dead_panes skips them.
     sd = tmp_path / "afk-state"
     sd.mkdir()
     (sd / "dispatch-284.epoch").write_text(f"{int(NOW) - 4000}\n")
-    (sd / "progress-284.epoch").write_text(f"{int(NOW) - 900}\n")
+    prelude = (
+        f'_spoke_pane_target() {{ echo ""; }}; slot_state() {{ echo waiting; }}; {_NO_DONE_EPOCH}'
+    )
+
+    assert (
+        _detect(prelude, "_wd_detect_dead_idle /wt 284 " + NOW, env=_dead_pane_env(tmp_path)) == 1
+    ), "never revive a parked spoke — its gate may be waiting on a human"
+
+
+def test_dead_idle_reason_reports_the_base_it_was_handed_not_a_fresh_read(tmp_path: Path) -> None:
+    # The reason takes the detector's measured base for the same reason it takes the pre-read done
+    # epoch: a live re-read can disagree with the epoch that actually fired (a concurrent revive
+    # stamping progress, a fresh arm clearing both), emitting a line whose age contradicts its own
+    # ceiling. Here disk says "progress 5s ago" while the detector fired on dispatch@4000s.
+    sd = tmp_path / "afk-state"
+    sd.mkdir()
+    (sd / "progress-284.epoch").write_text(f"{int(NOW) - 5}\n")  # what a fresh read would find
+    dispatched = str(int(NOW) - 4000)
     env = _dead_pane_env(tmp_path)
 
-    mine = _call("_wd_dead_idle_base 284", env=env).stdout.strip().split("\t")[-1]
-    reaper = _call("_afk_ceiling_epoch 284", env=env).stdout.strip()
+    out = _call(
+        f'slot_state() {{ echo busy; }}; _wd_dead_idle_reason /the/wt 284 {NOW} "" '
+        f"$'dispatch\\t{dispatched}'",
+        env=env,
+    ).stdout
 
-    assert mine == reaper, "the watchdog's base must be the reaper's ceiling epoch"
+    assert f"base=dispatch@{dispatched}" in out, out
+    assert "4000s" in out, "the age must come from the base that fired, not a racing re-read"
+
+
+def test_dead_idle_reason_does_not_claim_progress_when_there_is_no_base(tmp_path: Path) -> None:
+    # The fallback arm must not print the progress noun beside base=none: telling a human "last
+    # progress, unknown time" for a spoke with no epoch at all reads as a BROKEN clock rather than
+    # an absent one — the #290 AC4 diagnosability contract failing in the exact way it must not.
+    (tmp_path / "afk-state").mkdir()
+
+    out = _call(
+        f'slot_state() {{ echo busy; }}; _wd_dead_idle_reason /the/wt 284 {NOW} "" ""',
+        env=_dead_pane_env(tmp_path),
+    ).stdout
+
+    assert "base=none@?" in out, out
+    assert "last progress" not in out, "do not report progress for a spoke that has no progress"
 
 
 def test_dead_idle_fires_for_a_spoke_that_died_before_its_first_commit(tmp_path: Path) -> None:

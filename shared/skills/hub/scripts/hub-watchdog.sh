@@ -570,11 +570,22 @@ _wd_land_in_flight() {
 # never invent a ceiling with no clock behind it. Both reads are case-screened, so an absent reader
 # (a standalone watchdog with no gate-broker) degrades to the other rather than erroring.
 _wd_dead_idle_base() {
-  local issue="$1" d p
+  local issue="$1" now="${2:-$(_wd_now)}" d p
   d="$(read_dispatch_epoch "$issue" 2>/dev/null)"
   p="$(read_progress_epoch "$issue" 2>/dev/null)"
   case "$d" in '' | *[!0-9]*) d=0 ;; esac
   case "$p" in '' | *[!0-9]*) p=0 ;; esac
+  case "$now" in '' | *[!0-9]*) now=0 ;; esac
+  # A FUTURE-dated epoch is unmeasurable, not fresh — and taking max() would let it OUTRANK a
+  # genuinely stale clock and silence this condition for the whole window (now-epoch goes negative,
+  # which is never > the ceiling). That is the unbounded silence #284 was: worse than the blindness
+  # this fix removes. Drop each skewed epoch so the other still measures — the same fail-toward-
+  # firing rule _wd_land_in_flight applies to its log mtime 40 lines above. Reachable via a clock
+  # that steps forward (VM resume, a bad NTP source) while spokes stamp dispatch, then corrects.
+  # This screen is ALSO why this cannot simply call _afk_ceiling_epoch: the reaper's base has no
+  # such bound, and tier-2 exists to not go blind in the same breath as tier-1.
+  [ "$now" -gt 0 ] && [ "$d" -gt "$now" ] && d=0
+  [ "$now" -gt 0 ] && [ "$p" -gt "$now" ] && p=0
   # Ties go to progress: at equal epochs it is the more specific statement (the spoke actually
   # committed), and it keeps the label stable for a spoke whose first commit lands on its
   # dispatch second.
@@ -584,12 +595,19 @@ _wd_dead_idle_base() {
 }
 
 _wd_detect_dead_idle() {
-  local wt="$1" issue="$2" now="$3" done_epoch="${4-$(_wd_done_epoch "$2")}" base
+  local wt="$1" issue="$2" now="$3" done_epoch="${4-$(_wd_done_epoch "$2")}" \
+        base="${5-$(_wd_dead_idle_base "$2" "$3")}"
   command -v slot_state >/dev/null 2>&1 || return 1
   [ -z "$(_spoke_pane_target "$wt" 2>/dev/null)" ] || return 1   # a live pane is the reaper's job
   [ -n "$done_epoch" ] && return 1                               # done-stamped ⇒ not a reaper miss
-  [ "$(slot_state "$wt" "$issue")" = "done" ] && return 1        # terminal ⇒ not a hang
-  base="$(_wd_dead_idle_base "$issue")"
+  # done ⇒ terminal, waiting ⇒ PARKED — neither is a hang. `waiting` must be excluded explicitly
+  # now that the base falls back to dispatch (#297): a spoke parked at a gate before its first
+  # commit has no progress epoch, so the old progress-only base made this structurally silent for
+  # it; measuring from dispatch arms it, and the revive seam checks slot_state nowhere — a spoke
+  # parked at an UNAPPROVED plan gate would be resumed headless and implement unreviewed work.
+  # A parked spoke is conditions 1/3's (park-unanswered / stale-marker), exactly as the drain's own
+  # recover_dead_panes skips it: `case "$state" in done | waiting) continue`.
+  case "$(slot_state "$wt" "$issue")" in done | waiting) return 1 ;; esac
   _wd_epoch_stale "${base#*$'\t'}" "$now" "$HUB_WATCHDOG_IDLE_CEILING"
 }
 
@@ -612,17 +630,28 @@ _wd_detect_dead_idle() {
 # different story from a stalled-after-progress `base=progress@N`, and the first thing a human needs
 # when triaging. The activity noun follows the base for the same reason: reporting "last progress"
 # for a spoke that never made any is how a reader concludes the epoch is broken rather than absent.
+# Takes the detector's ALREADY-MEASURED base as $5 for the same reason it takes the pre-read done
+# epoch as $4: a live re-read here can disagree with the epoch that actually fired (a concurrent
+# revive stamping progress, or a fresh arm clearing both), emitting a self-contradictory ledger line
+# — "ceiling 3600s breached" beside a 5s age. Falls back to a live read for a direct caller.
 _wd_dead_idle_reason() {
-  local wt="$1" issue="$2" now="$3" done_epoch="${4-$(_wd_done_epoch "$2")}" base kind epoch what
-  base="$(_wd_dead_idle_base "$issue")"
+  local wt="$1" issue="$2" now="$3" done_epoch="${4-$(_wd_done_epoch "$2")}" \
+        base="${5-$(_wd_dead_idle_base "$2" "$3")}" kind epoch
   kind="${base%%$'\t'*}"; epoch="${base#*$'\t'}"
+  # The activity noun follows the base: reporting "last progress" for a spoke that never made any
+  # is how a reader concludes the epoch is BROKEN rather than absent — the opposite of the #290 AC4
+  # diagnosability this line exists for.
   case "$kind" in
-    dispatch) what="dispatched (no commit yet)" ;;
-    progress) what="last progress" ;;
-    *)        kind="none"; epoch=""; what="last progress" ;;
+    dispatch)
+      printf 'reaper missed a dead/idle pane: no pane, dispatched (no commit yet) %s ago' \
+        "$(_wd_age_seconds "$epoch" "$now")" ;;
+    progress)
+      printf 'reaper missed a dead/idle pane: no pane, last progress %s ago' \
+        "$(_wd_age_seconds "$epoch" "$now")" ;;
+    *)
+      kind="none"; epoch=""
+      printf 'reaper missed a dead/idle pane: no pane, no dispatch or progress epoch to measure from' ;;
   esac
-  printf 'reaper missed a dead/idle pane: no pane, %s %s ago' \
-    "$what" "$(_wd_age_seconds "$epoch" "$now")"
   printf ' (ceiling %ss; base=%s@%s, slot_state=%s, done-epoch=%s, last-action=%s)' \
     "$HUB_WATCHDOG_IDLE_CEILING" "$kind" "${epoch:-?}" "$(slot_state "$wt" "$issue" 2>/dev/null)" \
     "${done_epoch:-none}" "$(_wd_last_action)"
@@ -1080,7 +1109,7 @@ _wd_fire() {
 # intervention. Supervisor-dead is a single global check; the other four run per in-flight spoke.
 # Best-effort throughout: a missing drain reader (standalone watchdog) simply skips its condition.
 _wd_run_conditions() {
-  local now="${1:-$(_wd_now)}" state="${2:-$(_wd_drain_state)}" wt issue wd_conflicts wd_done
+  local now="${1:-$(_wd_now)}" state="${2:-$(_wd_drain_state)}" wt issue wd_conflicts wd_done wd_base
   local wd_seen=""   # the issues this tick saw in flight — the sweep below leaves them alone
   # Use the drain state the loop already read (passed as $2) rather than re-probing — the loop
   # reads it once per tick, and a second _wd_drain_state call would double-count under stubs.
@@ -1103,6 +1132,11 @@ _wd_run_conditions() {
     # condition-2 time always comes back empty. Per-iteration local, passed explicitly: not a
     # tick-global (the #241 cross-pass leak trap).
     wd_done="$(_wd_done_epoch "$issue")"
+    # #297: measure condition 2's base ONCE per tick and thread it into both the detector and the
+    # reason, exactly as wd_done is. Re-reading it in the reason lets a concurrent progress stamp or
+    # a fresh arm render a base that did not fire — a ledger line that contradicts its own ceiling.
+    # Per-iteration local, passed explicitly: not a tick-global (the #241 cross-pass leak trap).
+    wd_base="$(_wd_dead_idle_base "$issue" "$now")"
     # Each detector: fire (deduped by _wd_fire's marker) + intervene when it trips; else clear the
     # firing marker so a genuinely resolved-then-recurring condition re-fires (#263).
     # park-undeliverable (#288 AC3) is checked FIRST: a serviced-but-never-deliverable park must
@@ -1128,8 +1162,8 @@ _wd_run_conditions() {
       # double-count in the ledger, #263). Mirrors the land-lane servicing defer below; a land that
       # genuinely leaves a dead pane behind still fires once the land stops running.
       :
-    elif _wd_detect_dead_idle "$wt" "$issue" "$now" "$wd_done"; then
-      _wd_fire dead-pane "$issue" "$(_wd_dead_idle_reason "$wt" "$issue" "$now" "$wd_done")"
+    elif _wd_detect_dead_idle "$wt" "$issue" "$now" "$wd_done" "$wd_base"; then
+      _wd_fire dead-pane "$issue" "$(_wd_dead_idle_reason "$wt" "$issue" "$now" "$wd_done" "$wd_base")"
       _wd_intervene_revive "$wt" "$issue"
     else
       _wd_clear_fired dead-pane "$issue"
