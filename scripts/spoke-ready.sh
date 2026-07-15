@@ -461,6 +461,25 @@ _afk_emit_wake_event() {
 }
 _afk_emit_wake_event "$ISSUE" "$KIND"
 
+# #300 writer: record the lifecycle transition this marker REPRESENTS. The tag is
+# the transport; this is the record — same actor, same instant, plus the `cause`
+# and (for a gate) the plan-artifact evidence a tag cannot carry. Shadow-only:
+# slot_state still derives from the tag-at-tip, nothing decides on the log yet.
+# The kind->state map is explicit rather than reusing $KIND verbatim, so the log's
+# vocabulary is the #300 state table's, not the marker namespace's — notably
+# `accept` is a DISTINCT state from `ready` (the #292 conflation this fixes).
+_tlog_state_for_kind() {
+  case "$1" in
+    gate)    printf 'parked-gate\n' ;;
+    ready)   printf 'ready\n' ;;
+    accept)  printf 'accepted\n' ;;
+    blocked) printf 'blocked\n' ;;
+    *)       printf '%s\n' "$1" ;;
+  esac
+}
+wt_tlog_transition "$ISSUE" "$(_tlog_state_for_kind "$KIND")" spoke-ready.sh \
+  "--$KIND" "{\"tip\":\"$(git rev-parse --short HEAD 2>/dev/null || echo unknown)\"}"
+
 # --- drain this subtask from the queue (issue #278) ---------------------------
 # A per-subtask ready/<N> that REACHED origin is the proof that subtask shipped, so drop its
 # entry: the queue is what gates the terminal ready/<primary>, and an un-cleared entry would

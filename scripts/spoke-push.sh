@@ -96,8 +96,27 @@ fi
 # the push triggers nest under spoke-push rather than the Bash tool call. Empty
 # span id (telemetry off) is harmless — it resolves to the file/spoke-root
 # fallback exactly as an unset var would.
+# #300 writer: the issue this push belongs to. --ready carries it explicitly; a
+# mid-cycle push carries none, so derive it from the branch slug (feature/299-foo
+# -> 299), the same self-limiting idiom afk-notify-wake.sh uses — an ad-hoc /quick
+# slug yields no number and the wt_tlog_* wrappers then no-op.
+_SP_SLUG="${BRANCH##*/}"
+_SP_ISSUE="${READY:-${_SP_SLUG%%[!0-9]*}}"
+
 echo "→ git push -u origin $BRANCH"
+# #300 writer, INTENT-FIRST: record `pushing` BEFORE the push starts, because the
+# pre-push gate runs the suite for minutes (a first push seeds testmon and can run
+# 12-45min) and today that phase is UNLEARNABLE — a working gate looks identical to
+# a stalled spoke, so idle/ceiling detectors measure it as silence. A recorded
+# `pushing` with an onset lets a reader say "gate running 8m", not "spoke hung".
+# If the push dies the state stays `pushing` with its onset — an explicit in-flight
+# state is the point (a crash mid-phase is exactly what today's model cannot express).
+wt_tlog_transition "$_SP_ISSUE" pushing spoke-push.sh \
+  "git push -u origin $BRANCH" "{\"branch\":\"$BRANCH\"}"
 AI_TOOLKIT_PARENT_SPAN="$_SP_SPAN_ID" wt_git_push -u origin "$BRANCH"
+# The gate passed and the ref moved: the multi-minute phase ended.
+wt_tlog_transition "$_SP_ISSUE" pushed spoke-push.sh "push gate green" \
+  "{\"tip\":\"$(git rev-parse --short HEAD 2>/dev/null || echo unknown)\"}"
 
 # Cycle-step marker (#139): a successful ship push IS the solo-cycle PUSH step,
 # so its container in the spokecycle- trace is populated with no manual marker

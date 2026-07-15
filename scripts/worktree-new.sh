@@ -288,6 +288,15 @@ printf '%s\n' "$LANE" > "$WT_DIR/.ai-toolkit/lane"
 printf '%s\n' "$MODE" > "$WT_DIR/.ai-toolkit/mode"
 echo "→ lane / mode        $LANE / $MODE"
 
+# #300 writer: record `dispatched` — the actor that CAUSES the transition (this
+# spawn) records it at the instant it happens. Shadow-only: the drain still reads
+# dispatch-<issue>.epoch and nothing decides on the log yet. AFK_TLOG_RUN stamps
+# the freshly-minted spoke_run_id onto the record, so a spoke's whole lifecycle is
+# greppable by run even across a relaunch. Best-effort (wt_tlog_* no-op without the
+# lib, and skip an ad-hoc slug with no issue number).
+AFK_TLOG_RUN="$SPOKE_RUN_ID" wt_tlog_transition "$ISSUE" dispatched worktree-new.sh \
+  "spawn --mode $MODE" "{\"branch\":\"$BRANCH\",\"lane\":\"$LANE\",\"mode\":\"$MODE\"}"
+
 
 # --- write the task contract to disk (issue #177) ----------------------------
 # Anchoring used to be an LLM errand: the seed prompt told the spoke to run

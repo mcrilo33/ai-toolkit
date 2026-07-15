@@ -1277,3 +1277,37 @@ wt_gh_clear_lifecycle_labels() {
 wt_gh_dispatch_comment() {
   wt_gh issue comment "$1" --body "$2"
 }
+
+# --- #300 lifecycle transition log ------------------------------------------
+# The four lifecycle ACTORS (worktree-new, spoke-ready, spoke-push,
+# worktree-land) all source this lib, so the log's locator + a guarded wrapper
+# live here ONCE rather than in each. Dual layout, mirroring the telemetry.sh
+# block above: a synced target has transition-log.sh as our sibling in
+# .ai-toolkit/scripts/; the source tree has it at shared/skills/hub/scripts/.
+# Best-effort by contract (#300): if the lib is absent the wrappers are no-ops,
+# so no actor ever fails because the log could not be written.
+for _c in "$_WT_LIB_DIR/transition-log.sh" \
+          "$_WT_LIB_DIR/../shared/skills/hub/scripts/transition-log.sh"; do
+  if [ -f "$_c" ]; then
+    # shellcheck source=/dev/null
+    . "$_c" 2>/dev/null || true
+    break
+  fi
+done
+unset _c
+
+# wt_tlog_transition <issue> <to> <actor> <cause> [evidence-json] [episode]
+# wt_tlog_event      <issue> <event> <actor> [lane] [episode] [evidence-json]
+# Guarded fronts for the log: silently no-op when the lib is unavailable or the
+# issue is not numeric (an ad-hoc /quick slug has no issue to key a log by).
+wt_tlog_transition() {
+  case "${1:-}" in '' | *[!0-9]*) return 0 ;; esac
+  command -v afk_tlog_transition >/dev/null 2>&1 || return 0
+  afk_tlog_transition "$@" || true
+}
+
+wt_tlog_event() {
+  case "${1:-}" in '' | *[!0-9]*) return 0 ;; esac
+  command -v afk_tlog_event >/dev/null 2>&1 || return 0
+  afk_tlog_event "$@" || true
+}

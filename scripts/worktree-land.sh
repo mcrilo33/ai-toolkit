@@ -398,7 +398,17 @@ fi
 : "${WT_LAND_CONFLICT_EXIT:=4}"
 case "$WT_LAND_CONFLICT_EXIT" in '' | *[!0-9]*) WT_LAND_CONFLICT_EXIT=4 ;; esac
 PRE_SHA="$(git rev-parse HEAD)"
+# #300 writer, INTENT-FIRST: record `landing` BEFORE the merge starts. This is the
+# state the design table calls literally unlearnable today, and its absence caused
+# #290: a land consumes the ready tag and kills the spoke's window BEFORE removing
+# the worktree, so for that window the watchdog sees "no marker, dead pane" and
+# fires dead-pane on a spoke that is being landed successfully. With `landing`
+# recorded up front, that read becomes "landing, 40s in" — the false-fire has no
+# room to exist. Recorded even if the merge then conflicts or the gate kills us:
+# an explicit in-flight state with an onset is exactly the point.
 echo "→ merging $WT_BRANCH into $DEFAULT"
+wt_tlog_transition "$ISSUE" landing worktree-land.sh "merge $WT_BRANCH into $DEFAULT" \
+  "{\"branch\":\"$WT_BRANCH\",\"base\":\"$PRE_SHA\"}"
 if ! git merge --no-edit "$WT_BRANCH"; then
   # `|| true`: guard the capture under set -e so a nonzero pipeline can never abort the
   # script BEFORE the abort + exit below (which guarantee a clean hub + the conflict code).
@@ -408,6 +418,10 @@ if ! git merge --no-edit "$WT_BRANCH"; then
   printf '%s: CONFLICT %s\n' "$WT_PROG" "$CONFLICT_FILES" >&2
   printf '%s: merge of %s conflicts with %s on: %s — rebase the branch on %s (on the spoke, then push, when it has one) and re-run\n' \
     "$WT_PROG" "$WT_BRANCH" "$DEFAULT" "${CONFLICT_FILES:-(unknown)}" "$DEFAULT" >&2
+  # #300 writer: the landing attempt ended in a deterministic conflict. Recorded so a
+  # reader can tell "land tried and needs resolution" from "land never ran" (#285).
+  wt_tlog_transition "$ISSUE" land_failed worktree-land.sh "merge conflict" \
+    "{\"conflicts\":\"${CONFLICT_FILES:-unknown}\"}"
   exit "$WT_LAND_CONFLICT_EXIT"
 fi
 MERGED_SHA="$(git rev-parse HEAD)"
@@ -862,6 +876,11 @@ cleanup_tmux
 bash "${GATE_SWEEP_BIN:-$SCRIPT_DIR/gate-sweep.sh}" --spawn "$MERGED_SHA" \
   --branch "$WT_BRANCH" ${ISSUE:+--issue} ${ISSUE:+"$ISSUE"} \
   || wt_warn "post-land sweep failed to launch — landing is unaffected"
+
+# #300 writer: terminal success. Today `landed` is recorded only as ABSENCES (tag
+# consumed, worktree gone, issue closed); an explicit record closes the lifecycle.
+wt_tlog_transition "$ISSUE" landed worktree-land.sh "merged into $DEFAULT" \
+  "{\"merged\":\"$MERGED_SHA\"}"
 
 # --- report -------------------------------------------------------------------------
 echo
