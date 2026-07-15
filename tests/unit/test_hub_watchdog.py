@@ -979,6 +979,45 @@ def test_intervene_answer_fires_when_last_action_names_other_issue(tmp_path: Pat
     assert marker.read_text() == "x"
 
 
+# AC4 (#283): the answer intervention belongs to the ANSWER lane. A permission dialog is the
+# broker's, with its own classifier, timers and re-answer ceiling — injecting an answer into one is
+# how the watchdog ends up answering a park it does not own (#271), interrupting a live tool call
+# (#89). The detector already refuses to fire on a permission park; this is the second lock, for
+# any direct caller.
+def test_intervene_answer_defers_on_a_permission_dialog(tmp_path: Path) -> None:
+    marker = tmp_path / "answered"
+    wt = _git_repo(tmp_path)
+    env = {
+        "HUB_WATCHDOG_ANSWER_CMD": f"printf x > {marker}",
+        "AFK_STATE": str(tmp_path / "absent-afk-state"),  # drain off ⇒ the #265 guard never defers
+        "AFK_STATE_DIR": str(tmp_path / "afk-state"),
+        "AFK_NOW": NOW,
+    }
+    prelude = "_permission_pending() { return 0; }"
+
+    _call(f"{prelude}; _wd_intervene_answer '{wt}' 5", env=env)
+
+    assert not marker.exists(), "a permission dialog is the broker's lane — never inject into it"
+
+
+def test_intervene_answer_answers_a_gate_park(tmp_path: Path) -> None:
+    # The complement: a real answer-lane park still gets the intervention.
+    marker = tmp_path / "answered"
+    wt = _git_repo(tmp_path)
+    subprocess.run(["git", "tag", "gate/5"], cwd=wt, check=True, capture_output=True)
+    env = {
+        "HUB_WATCHDOG_ANSWER_CMD": f"printf x > {marker}",
+        "AFK_STATE": str(tmp_path / "absent-afk-state"),
+        "AFK_STATE_DIR": str(tmp_path / "afk-state"),
+        "AFK_NOW": NOW,
+    }
+    prelude = "_permission_pending() { return 1; }"
+
+    _call(f"{prelude}; _wd_intervene_answer '{wt}' 5", env=env)
+
+    assert marker.read_text() == "x"
+
+
 def test_landmark_intervention_never_lands_only_marks(tmp_path: Path) -> None:
     # Escalate-only: the default raises a needs-human-land tag and NEVER runs a land.
     wt = _git_repo(tmp_path)
