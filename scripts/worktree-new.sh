@@ -409,6 +409,42 @@ ALLOW_RULES=(
   # absolute-path read pattern (REPO_ROOT is already absolute, so the leading `/` yields `//`).
   "Read(/${REPO_ROOT}/**)"
 )
+
+# --- the afk deny-wall (issue #281) -------------------------------------------
+# A spoke must ask in PROSE plus a gate marker, never an `AskUserQuestion`. The /afk
+# injector cannot answer a QCM: inject_answer sends Escape FIRST (the #74 menu-cancel, built
+# for the PLAN-gate QCM), which CANCELS a spoke's AskUserQuestion rather than selecting an
+# option, then types free text at the plain prompt behind it. In #271 that left the pane
+# reading "User declined to answer questions" with the options intact while the drain logged
+# an injected answer -- and the free text it typed answered an EARLIER park, not the question
+# actually on screen. Denying the tool removes the QCM the broker cannot drive.
+#
+# The rule is BARE (no parenthesised specifier) on purpose: a bare tool-name deny removes the
+# tool from the model's context entirely, so the spoke never renders a QCM at all, whereas a
+# scoped deny would leave the tool present and merely error on use. A deny RULE also outranks
+# the permission MODE (rules > mode), so it still fires under the afk `bypassPermissions`
+# launch below -- the same precedence that let a global `ask` rule pierce bypass in #238.
+#
+# afk-ONLY, mirroring the `--permission-mode bypassPermissions` gating below: an attended
+# spoke has a human at the keyboard who can answer a QCM, and no injector Esc-cancels it.
+# The spoke's own PLAN gate is unaffected in both modes -- it is TAG-based (spoke-ready.sh
+# --gate writes gate/<N>, which plan-gate-guard reads), never an AskUserQuestion -- so the
+# wall can never strand a spoke at its own gate.
+DENY_RULES=()
+[ "$MODE" = afk ] && DENY_RULES=("AskUserQuestion")
+
+# wt_warn_deny_rules -> name the deny rules a failed merge did NOT apply. A dropped ALLOW rule
+# only costs a permission prompt (loud, and the operator sees it); a dropped DENY rule silently
+# removes a safety wall, so an unapplied one must never pass unremarked. No-op when there are
+# none — and it guards the COUNT rather than expanding the array, which on an EMPTY array under
+# `set -u` aborts on bash 3.2 (the macOS default shell).
+wt_warn_deny_rules() {
+  local r
+  [ "${#DENY_RULES[@]}" -gt 0 ] || return 0
+  wt_warn "  the afk deny-wall below is NOT applied — this spoke can still raise a QCM the drain cannot answer:"
+  for r in "${DENY_RULES[@]}"; do wt_warn "  deny: $r"; done
+}
+
 SETTINGS_LOCAL="$WT_DIR/.claude/settings.local.json"
 mkdir -p "$WT_DIR/.claude"
 if [ ! -f "$SETTINGS_LOCAL" ]; then
@@ -418,9 +454,20 @@ if [ ! -f "$SETTINGS_LOCAL" ]; then
       sep=","; [ "$i" -eq "$(( ${#ALLOW_RULES[@]} - 1 ))" ] && sep=""
       printf '      "%s"%s\n' "${ALLOW_RULES[$i]}" "$sep"
     done
+    # An attended spoke seeds no deny rules at all, so it keeps no empty "deny" key. Guard on
+    # the COUNT and never expand the array bare: `"${DENY_RULES[@]}"` on an EMPTY array is an
+    # unbound-variable abort under `set -u` on bash 3.2 (the macOS default shell).
+    if [ "${#DENY_RULES[@]}" -gt 0 ]; then
+      printf '    ],\n    "deny": [\n'
+      for i in "${!DENY_RULES[@]}"; do
+        sep=","; [ "$i" -eq "$(( ${#DENY_RULES[@]} - 1 ))" ] && sep=""
+        printf '      "%s"%s\n' "${DENY_RULES[$i]}" "$sep"
+      done
+    fi
     printf '    ]\n  }\n}\n'
   } > "$SETTINGS_LOCAL"
   echo "→ seeded spoke command allowlist (.claude/settings.local.json)"
+  if [ "${#DENY_RULES[@]}" -gt 0 ]; then echo "→ seeded afk deny-wall (AskUserQuestion)"; fi
 elif command -v jq >/dev/null 2>&1; then
   # Append-without-churn: existing entries keep their order (no jq `unique`,
   # which would lexicographically re-sort a user-curated list); only rules not
@@ -429,9 +476,22 @@ elif command -v jq >/dev/null 2>&1; then
   # warn and leave the file untouched rather than abort the wiring or
   # silently truncate (-s catches the empty-output case).
   RULES_JSON="$(printf '%s\n' "${ALLOW_RULES[@]}" | jq -Rn '[inputs]')"
+  # Same empty-array care as the seed path: never expand DENY_RULES bare (bash 3.2 + set -u).
+  # An attended spoke merges `[]`, and the jq filter's guard then leaves the file's `deny` key
+  # exactly as it found it — adding an empty `deny: []` to a user's settings would be churn.
+  if [ "${#DENY_RULES[@]}" -gt 0 ]; then
+    DENY_JSON="$(printf '%s\n' "${DENY_RULES[@]}" | jq -Rn '[inputs]')"
+  else
+    DENY_JSON='[]'
+  fi
   TMP_SETTINGS="$(mktemp)"
-  if jq --argjson rules "$RULES_JSON" \
-       '(.permissions.allow // []) as $cur | .permissions.allow = ($cur + ($rules - $cur))' \
+  # Append-without-churn for BOTH lists: only rules not already present are added, so a
+  # pre-existing user deny rule is preserved (dropping one would silently widen the spoke).
+  if jq --argjson rules "$RULES_JSON" --argjson deny "$DENY_JSON" \
+       '((.permissions.allow // []) as $cur | .permissions.allow = ($cur + ($rules - $cur)))
+        | if ($deny | length) > 0
+          then ((.permissions.deny // []) as $dcur | .permissions.deny = ($dcur + ($deny - $dcur)))
+          else . end' \
        "$SETTINGS_LOCAL" > "$TMP_SETTINGS" 2>/dev/null && [ -s "$TMP_SETTINGS" ]; then
     mv "$TMP_SETTINGS" "$SETTINGS_LOCAL"
     echo "→ merged spoke command allowlist into settings.local.json"
@@ -439,10 +499,12 @@ elif command -v jq >/dev/null 2>&1; then
     rm -f "$TMP_SETTINGS"
     wt_warn "could not merge into settings.local.json (invalid JSON?) — add the allow rules yourself:"
     for r in "${ALLOW_RULES[@]}"; do wt_warn "  $r"; done
+    wt_warn_deny_rules
   fi
 else
   wt_warn "settings.local.json exists but jq is missing — add the allow rules yourself:"
   for r in "${ALLOW_RULES[@]}"; do wt_warn "  $r"; done
+  wt_warn_deny_rules
 fi
 
 echo
