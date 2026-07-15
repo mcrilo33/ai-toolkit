@@ -103,6 +103,35 @@ def test_hub_inject_source_exists_and_is_executable() -> None:
     assert os.access(HUB_INJECT, os.X_OK), "hub-inject.sh is not executable"
 
 
+# ── transition-log.sh registration (issue #300, phase 1) ────────────────────────
+# The per-spoke lifecycle transition log lib. Migration steps wire spoke-side scripts
+# (spoke-ready.sh, spoke-push.sh) to source it as a co-located sibling in a synced
+# target's .ai-toolkit/scripts/ — unregistered, those writers would source a missing
+# file. Hub-skill script, so it takes the hub-skill case mapping.
+TRANSITION_LOG = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "transition-log.sh"
+
+
+def test_transition_log_registered_in_sync_loop() -> None:
+    assert "transition-log.sh" in _for_name_list(), (
+        "transition-log.sh is not registered in sync_workflow_scripts() — #300's actor "
+        "writers would source a missing sibling in a synced target"
+    )
+
+
+def test_transition_log_takes_the_hub_skill_source_case() -> None:
+    body = _sync_workflow_scripts_body()
+    hub_case = re.search(r"\n\s*([\w.|-]*transition-log\.sh[\w.|-]*)\)\s+src=", body)
+    assert hub_case is not None, (
+        "transition-log.sh must have the hub-skill case mapping "
+        '(src="$SHARED_DIR/skills/hub/scripts/$name"), not the toolkit-root default'
+    )
+
+
+def test_transition_log_source_exists_and_is_executable() -> None:
+    assert TRANSITION_LOG.is_file(), "shared/skills/hub/scripts/transition-log.sh missing"
+    assert os.access(TRANSITION_LOG, os.X_OK), "transition-log.sh is not executable"
+
+
 # ── hub-watchdog.sh registration (issue #251) ─────────────────────────────────
 # The tier-2 supervision daemon is a hub-skill script; it must sync into a target's
 # .ai-toolkit/scripts/ so /afk / the hub skill can arm it, and take the hub-skill case mapping.
