@@ -314,9 +314,17 @@ def _git_repo(tmp_path: Path, name: str = "wt") -> Path:
     return wt
 
 
-def _detect(prelude: str, call: str, *, env: dict[str, str] | None = None) -> int:
-    """Run a detector with the drain readers stubbed by `prelude`; return its rc."""
+def _detect(
+    prelude: str, call: str, *, env: dict[str, str] | None = None, state_dir: Path | None = None
+) -> int:
+    """Run a detector with the drain readers stubbed by `prelude`; return its rc.
+
+    `state_dir` pins AFK_STATE_DIR: the park-unanswered detector notes the park EPISODE (a real
+    write) before measuring, so without it a detector test would stamp the LIVE hub state dir.
+    """
     e = {"AFK_NOW": NOW}
+    if state_dir is not None:
+        e["AFK_STATE_DIR"] = str(state_dir)
     if env:
         e.update(env)
     return _call(f"{prelude}; {call}", env=e).returncode
@@ -327,39 +335,50 @@ def _detect(prelude: str, call: str, *, env: dict[str, str] | None = None) -> in
 # answer-attempt epoch is stamped only at answer DELIVERY (minutes into the answerer's run), so
 # a zero-grace floor false-fired 1s after every fresh park. A freshly parked spoke with no
 # attempt stays quiet; only once the park itself outlives the ceiling may it fire.
+# The lane stub (#283): the ceiling applies to ANSWER-lane parks only, so every ceiling-arithmetic
+# test below declares one. The lane itself is pinned separately, against real probes.
+_GATE_LANE = "_wd_park_lane() { echo gate; }"
+
+
 def test_park_unanswered_quiet_when_fresh_park_never_attempted(tmp_path: Path) -> None:
     fresh = str(int(NOW) - 60)  # parked 60s ago (< 600s ceiling)
     prelude = (
-        "slot_state() { echo waiting; }; read_answer_attempt() { echo ''; }; "
+        f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; read_answer_attempt() {{ echo ''; }}; "
         f"read_park_onset_epoch() {{ echo {fresh}; }}"
     )
-    assert _detect(prelude, "_wd_detect_park_unanswered /wt 5 " + NOW) == 1
+    assert _detect(prelude, "_wd_detect_park_unanswered /wt 5 " + NOW, state_dir=tmp_path) == 1
 
 
 def test_park_unanswered_fires_when_park_onset_stale_never_attempted(tmp_path: Path) -> None:
     old = str(int(NOW) - 700)  # parked > 600s ago, still no answer → a real shortfall
     prelude = (
-        "slot_state() { echo waiting; }; read_answer_attempt() { echo ''; }; "
+        f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; read_answer_attempt() {{ echo ''; }}; "
         f"read_park_onset_epoch() {{ echo {old}; }}"
     )
-    assert _detect(prelude, "_wd_detect_park_unanswered /wt 5 " + NOW) == 0
+    assert _detect(prelude, "_wd_detect_park_unanswered /wt 5 " + NOW, state_dir=tmp_path) == 0
 
 
 def test_park_unanswered_fires_when_attempt_is_stale(tmp_path: Path) -> None:
     old = str(int(NOW) - 700)  # > 600s ceiling
-    prelude = f"slot_state() {{ echo waiting; }}; read_answer_attempt() {{ echo {old}; }}"
-    assert _detect(prelude, "_wd_detect_park_unanswered /wt 5 " + NOW) == 0
+    prelude = (
+        f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; read_answer_attempt() {{ echo {old}; }}; "
+        f"read_park_onset_epoch() {{ echo {old}; }}"
+    )
+    assert _detect(prelude, "_wd_detect_park_unanswered /wt 5 " + NOW, state_dir=tmp_path) == 0
 
 
 def test_park_unanswered_quiet_when_attempt_is_fresh(tmp_path: Path) -> None:
     fresh = str(int(NOW) - 60)  # < 600s ceiling
-    prelude = f"slot_state() {{ echo waiting; }}; read_answer_attempt() {{ echo {fresh}; }}"
-    assert _detect(prelude, "_wd_detect_park_unanswered /wt 5 " + NOW) == 1
+    prelude = (
+        f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; "
+        f"read_answer_attempt() {{ echo {fresh}; }}; read_park_onset_epoch() {{ echo {fresh}; }}"
+    )
+    assert _detect(prelude, "_wd_detect_park_unanswered /wt 5 " + NOW, state_dir=tmp_path) == 1
 
 
 def test_park_unanswered_quiet_when_not_waiting(tmp_path: Path) -> None:
-    prelude = 'slot_state() { echo busy; }; read_answer_attempt() { echo ""; }'
-    assert _detect(prelude, "_wd_detect_park_unanswered /wt 5 " + NOW) == 1
+    prelude = f'{_GATE_LANE}; slot_state() {{ echo busy; }}; read_answer_attempt() {{ echo ""; }}'
+    assert _detect(prelude, "_wd_detect_park_unanswered /wt 5 " + NOW, state_dir=tmp_path) == 1
 
 
 def test_park_unanswered_end_to_end_real_stamp_feeds_real_detector(tmp_path: Path) -> None:
@@ -391,18 +410,222 @@ def test_park_unanswered_end_to_end_real_stamp_feeds_real_detector(tmp_path: Pat
 # last delivery.
 def test_park_unanswered_reason_never_attempted_reports_onset_age(tmp_path: Path) -> None:
     old = str(int(NOW) - 700)
-    prelude = f"read_answer_attempt() {{ echo ''; }}; read_park_onset_epoch() {{ echo {old}; }}"
-    out = _call(f"{prelude}; _wd_park_unanswered_reason 5 {NOW}").stdout
+    prelude = (
+        f"{_GATE_LANE}; read_answer_attempt() {{ echo ''; }}; "
+        f"read_park_onset_epoch() {{ echo {old}; }}"
+    )
+    out = _call(f"{prelude}; _wd_park_unanswered_reason /wt 5 {NOW}").stdout
     assert "never-attempted" in out
     assert "700s" in out  # the measured park age, not a constant ceiling
 
 
 def test_park_unanswered_reason_stale_attempt_reports_delivery_age(tmp_path: Path) -> None:
     old = str(int(NOW) - 900)
-    prelude = f"read_answer_attempt() {{ echo {old}; }}"
-    out = _call(f"{prelude}; _wd_park_unanswered_reason 5 {NOW}").stdout
+    prelude = (
+        f"{_GATE_LANE}; read_answer_attempt() {{ echo {old}; }}; "
+        f"read_park_onset_epoch() {{ echo {old}; }}"
+    )
+    out = _call(f"{prelude}; _wd_park_unanswered_reason /wt 5 {NOW}").stdout
     assert "stale-attempt" in out
     assert "900s" in out
+
+
+# ── issue #283: the ceiling measures the CURRENT park episode, not the last delivery ──────────
+# The #276 false-fire: a spoke answered ONE plan gate, then worked productively for ten minutes
+# under normal tier-3 judge traffic. The detector gated on `slot_state == waiting` (true for ANY
+# park, including the permission dialogs the BROKER owns) and then measured from
+# answer-attempt-<issue>.epoch — an epoch that ages monotonically while the spoke works. At the
+# tick, the "park" was a transient permission dialog the broker cleared 12s later.
+
+
+def _tag(wt: Path, name: str) -> None:
+    subprocess.run(["git", "tag", "-f", name], cwd=wt, check=True, capture_output=True)
+
+
+def _journal(state_dir: Path, issue: str, ts: int, park: str = "permission") -> None:
+    """Append one broker decision-journal record — the drain's own 'I serviced this' evidence."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "decision-journal.jsonl").write_text(
+        f'{{"ts":{ts},"issue":"{issue}","park":"{park}",'
+        f'"decision":"hook auto-approved: pytest","reversibility":"reversible"}}\n'
+    )
+
+
+# The lane probe — structural, in _broker_park_signature's precedence order. NOT derived from the
+# signature's output: a gate-tagged park whose plan artifact is unreadable hashes to EMPTY, which
+# would read as `unknown` and (under "unknown never fires") silence #265's never-attempted branch.
+def test_park_lane_reads_a_permission_dialog_first(tmp_path: Path) -> None:
+    wt = _git_repo(tmp_path)
+    _tag(wt, "gate/5")  # a gate tag is ALSO at the tip — permission still wins, as the broker does
+    out = _call(f"_permission_pending() {{ return 0; }}; _wd_park_lane '{wt}' 5").stdout
+    assert out.strip() == "permission"
+
+
+def test_park_lane_reads_a_gate_tag_at_tip(tmp_path: Path) -> None:
+    wt = _git_repo(tmp_path)
+    _tag(wt, "gate/5")
+    out = _call(f"_permission_pending() {{ return 1; }}; _wd_park_lane '{wt}' 5").stdout
+    assert out.strip() == "gate"
+
+
+def test_park_lane_reads_a_pending_question(tmp_path: Path) -> None:
+    wt = _git_repo(tmp_path)
+    prelude = (
+        "_permission_pending() { return 1; }; extract_pending_question() { echo 'which one?'; }"
+    )
+    assert _call(f"{prelude}; _wd_park_lane '{wt}' 5").stdout.strip() == "question"
+
+
+def test_park_lane_unknown_when_nothing_is_extractable(tmp_path: Path) -> None:
+    # slot_state's `waiting` derives from these same three probes, so waiting-with-no-lane means
+    # the park resolved between the two calls — a race, not a strand. The detector stays quiet.
+    wt = _git_repo(tmp_path)
+    prelude = "_permission_pending() { return 1; }; extract_pending_question() { echo ''; }"
+    assert _call(f"{prelude}; _wd_park_lane '{wt}' 5").stdout.strip() == "unknown"
+
+
+def test_park_lane_gate_survives_an_unreadable_plan_artifact(tmp_path: Path) -> None:
+    # The lane must NOT be read off _broker_park_signature: a gate tag with no readable artifact
+    # hashes to empty. _gate_parked is a tag-at-tip check, immune to artifact readability.
+    wt = _git_repo(tmp_path)
+    _tag(wt, "gate/5")
+    prelude = (
+        "_permission_pending() { return 1; }; _read_gate_artifact() { echo ''; }; "
+        "extract_pending_question() { echo ''; }"
+    )
+    sig = _call(f"{prelude}; _broker_park_signature '{wt}' 5").stdout.strip()
+    lane = _call(f"{prelude}; _wd_park_lane '{wt}' 5").stdout.strip()
+    assert sig == "", "precondition: this park's signature is genuinely unextractable"
+    assert lane == "gate", "the lane comes from the tag at the tip, not from the signature"
+
+
+def test_park_unanswered_fires_on_a_gate_park_with_an_unreadable_artifact(tmp_path: Path) -> None:
+    # #265's never-attempted strand must keep firing through the new lane gate: a real gate park,
+    # no delivery ever, onset past the ceiling, and nothing servicing it.
+    wt = _git_repo(tmp_path)
+    _tag(wt, "gate/5")
+    old = str(int(NOW) - 700)
+    prelude = (
+        f"slot_state() {{ echo waiting; }}; _permission_pending() {{ return 1; }}; "
+        f"_read_gate_artifact() {{ echo ''; }}; extract_pending_question() {{ echo ''; }}; "
+        f"read_answer_attempt() {{ echo ''; }}; read_park_onset_epoch() {{ echo {old}; }}"
+    )
+    rc = _detect(prelude, f"_wd_detect_park_unanswered '{wt}' 5 {NOW}", state_dir=tmp_path / "sd")
+    assert rc == 0, "a genuinely stranded gate park still fires"
+
+
+def test_park_unanswered_quiet_when_the_park_is_a_permission_dialog(tmp_path: Path) -> None:
+    # The answer ceiling is the ANSWER lane's. Permission dialogs are the broker's lane, with its
+    # own timers — the watchdog must never answer them (#271).
+    wt = _git_repo(tmp_path)
+    old = str(int(NOW) - 700)
+    prelude = (
+        f"slot_state() {{ echo waiting; }}; _permission_pending() {{ return 0; }}; "
+        f"read_answer_attempt() {{ echo {old}; }}; read_park_onset_epoch() {{ echo {old}; }}"
+    )
+    rc = _detect(prelude, f"_wd_detect_park_unanswered '{wt}' 5 {NOW}", state_dir=tmp_path / "sd")
+    assert rc == 1
+
+
+def test_park_unanswered_quiet_when_the_drain_decided_recently(tmp_path: Path) -> None:
+    # AC1: a broker decision for this issue since the delivery is proof the drain is SERVICING the
+    # spoke. "Being handled" and "abandoned" must be distinguishable.
+    wt = _git_repo(tmp_path)
+    _tag(wt, "gate/5")
+    sd = tmp_path / "sd"
+    _journal(sd, "5", int(NOW) - 12)  # the broker approved a tier-3 command 12s ago
+    old = str(int(NOW) - 700)
+    prelude = (
+        f"slot_state() {{ echo waiting; }}; _permission_pending() {{ return 1; }}; "
+        f"read_answer_attempt() {{ echo {old}; }}; read_park_onset_epoch() {{ echo {old}; }}"
+    )
+    rc = _detect(prelude, f"_wd_detect_park_unanswered '{wt}' 5 {NOW}", state_dir=sd)
+    assert rc == 1
+
+
+def test_park_unanswered_quiet_when_progress_advanced_recently(tmp_path: Path) -> None:
+    wt = _git_repo(tmp_path)
+    _tag(wt, "gate/5")
+    old = str(int(NOW) - 700)
+    prelude = (
+        f"slot_state() {{ echo waiting; }}; _permission_pending() {{ return 1; }}; "
+        f"read_answer_attempt() {{ echo {old}; }}; read_park_onset_epoch() {{ echo {old}; }}; "
+        f"read_progress_epoch() {{ echo {int(NOW) - 30}; }}"
+    )
+    rc = _detect(prelude, f"_wd_detect_park_unanswered '{wt}' 5 {NOW}", state_dir=tmp_path / "sd")
+    assert rc == 1, "a progress-epoch advance is servicing evidence too"
+
+
+def test_park_unanswered_fires_when_the_delivery_is_genuinely_stranded(tmp_path: Path) -> None:
+    # AC2: answer delivered, the SAME park persists past the ceiling, and nothing has touched the
+    # issue since — no broker decisions, no progress. That is a real shortfall and must fire.
+    wt = _git_repo(tmp_path)
+    _tag(wt, "gate/5")
+    sd = tmp_path / "sd"
+    old = int(NOW) - 700
+    _journal(sd, "5", old, park="answer")  # the delivery's OWN record — not evidence of servicing
+    prelude = (
+        f"slot_state() {{ echo waiting; }}; _permission_pending() {{ return 1; }}; "
+        f"read_answer_attempt() {{ echo {old}; }}; read_park_onset_epoch() {{ echo {old}; }}"
+    )
+    rc = _detect(prelude, f"_wd_detect_park_unanswered '{wt}' 5 {NOW}", state_dir=sd)
+    assert rc == 0
+
+
+def test_park_unanswered_ignores_a_delivery_that_predates_the_current_episode(
+    tmp_path: Path,
+) -> None:
+    # An answer delivered BEFORE the current park began cannot count against it: the base is the
+    # episode onset, so a fresh episode is quiet however old the last lifetime delivery is.
+    wt = _git_repo(tmp_path)
+    _tag(wt, "gate/5")
+    prelude = (
+        f"slot_state() {{ echo waiting; }}; _permission_pending() {{ return 1; }}; "
+        f"read_answer_attempt() {{ echo {int(NOW) - 5000}; }}; "
+        f"read_park_onset_epoch() {{ echo {int(NOW) - 60}; }}"
+    )
+    rc = _detect(prelude, f"_wd_detect_park_unanswered '{wt}' 5 {NOW}", state_dir=tmp_path / "sd")
+    assert rc == 1, "the episode began 60s ago; a 5000s-old delivery belongs to a past park"
+
+
+def test_park_unanswered_quiet_on_the_276_replay(tmp_path: Path) -> None:
+    # The whole #276 shape end to end: the gate was answered at T0, the broker has been deciding
+    # for the issue since (one 12s before this tick), a transient permission dialog is pending at
+    # the tick, and the answer is 608s old — just past the 600s ceiling. It must NOT fire.
+    wt = _git_repo(tmp_path)
+    sd = tmp_path / "sd"
+    t0 = int(NOW) - 608
+    _journal(sd, "5", int(NOW) - 12)
+    prelude = (
+        f"slot_state() {{ echo waiting; }}; _permission_pending() {{ return 0; }}; "
+        f"read_answer_attempt() {{ echo {t0}; }}; read_park_onset_epoch() {{ echo {t0 - 225}; }}"
+    )
+    rc = _detect(prelude, f"_wd_detect_park_unanswered '{wt}' 5 {NOW}", state_dir=sd)
+    assert rc == 1, "a healthy, actively-brokered spoke is not an afk defect"
+
+
+# AC5: the ledger line must carry the MEASURED base — which epoch, the episode, the lane — so a
+# future false positive is diagnosable from the ledger alone, without re-deriving the timeline.
+def test_park_unanswered_reason_names_the_base_episode_and_lane(tmp_path: Path) -> None:
+    wt = _git_repo(tmp_path)
+    _tag(wt, "gate/5")
+    sd = tmp_path / "sd"
+    sd.mkdir()
+    old = int(NOW) - 900
+    (sd / "park-sig-5").write_text("deadbeef\tabc123def456\n")
+    prelude = (
+        f"_permission_pending() {{ return 1; }}; read_answer_attempt() {{ echo {old}; }}; "
+        f"read_park_onset_epoch() {{ echo {old}; }}"
+    )
+    out = _call(
+        f"{prelude}; _wd_park_unanswered_reason '{wt}' 5 {NOW}",
+        env={"AFK_STATE_DIR": str(sd), "AFK_NOW": NOW},
+    ).stdout
+
+    assert "stale-attempt" in out and "900s" in out
+    assert f"answer-attempt@{old}" in out, "names WHICH epoch was measured, and its value"
+    assert "abc123de" in out, "names the current park episode's signature"
+    assert "lane=gate" in out
 
 
 # Condition 2 — dead / idle pane
