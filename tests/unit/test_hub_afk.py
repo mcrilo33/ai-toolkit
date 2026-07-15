@@ -4221,6 +4221,36 @@ def test_hub_watchdog_co_arm_is_opt_outable(tmp_path: Path) -> None:
     assert not coarm.exists(), "HUB_WATCHDOG_COARM=0 disables the co-arm"
 
 
+def test_arm_hub_watchdog_hands_over_the_origin_script(tmp_path: Path) -> None:
+    # #296 mechanism 1: hub-afk.sh normally runs from its own frozen self-copy (#133), so
+    # _afk_find_script resolves hub-watchdog.sh to that SAME copy dir — a bundle no land ever
+    # rewrites. Without an origin handoff, hub-watchdog.sh's self-recycle hashes the frozen
+    # copy forever (structurally dead, the ORIGINAL #296 bug). AFK_ORIG_SCRIPT (the origin
+    # checkout hub-afk.sh carries for ITSELF) must be used to derive hub-watchdog.sh's origin
+    # sibling and hand it over as HUB_WATCHDOG_ORIG_SCRIPT — bypassing HUB_WATCHDOG_ARM_CMD
+    # (which stubs out the real launch entirely) to exercise the actual invocation.
+    origin_dir = tmp_path / "origin"
+    origin_dir.mkdir()
+    (origin_dir / "hub-afk.sh").write_text("# origin hub-afk\n")
+    (origin_dir / "hub-watchdog.sh").write_text("# origin hub-watchdog\n")
+
+    stub = tmp_path / "copy" / "hub-watchdog.sh"
+    stub.parent.mkdir()
+    dump = tmp_path / "seen-orig"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s" "$HUB_WATCHDOG_ORIG_SCRIPT" > "{dump}"\n')
+    stub.chmod(0o755)
+
+    env = {"AFK_ORIG_SCRIPT": str(origin_dir / "hub-afk.sh"), "HUB_WATCHDOG_BIN": str(stub)}
+
+    _call("_afk_arm_hub_watchdog", env=env)
+
+    assert dump.exists(), "the real --arm invocation must run (not a stubbed CMD)"
+    assert dump.read_text() == str(origin_dir / "hub-watchdog.sh"), (
+        "HUB_WATCHDOG_ORIG_SCRIPT must point at the ORIGIN checkout's sibling, not the frozen "
+        "copy _afk_find_script resolved $wd to"
+    )
+
+
 def test_spawn_watchdog_spawns_when_recorded_pid_dead(tmp_path: Path) -> None:
     wf = tmp_path / "watchdog"
     marker = tmp_path / "spawned"

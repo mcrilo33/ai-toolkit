@@ -307,6 +307,68 @@ def test_daemon_leaves_a_live_daemon_alone_when_generation_is_unmeasurable(tmp_p
     assert pidfile.exists(), "the other (unmeasurable) daemon's pidfile is left intact"
 
 
+# ── the --arm entry point's OWN singleton guard (issue #296 AC2, real path) ────
+# _wd_arm (not _wd_daemon) is what the drain actually calls every tick via `hub-watchdog.sh
+# --arm`. It used to run its own independent liveness-only refusal that returned before ever
+# reaching _wd_daemon's new stale-recycle logic — so mechanism 2 had zero coverage through its
+# real entry point. These exercise _wd_arm directly, standing in _WD_SELF with a lightweight
+# stub (never the real script) so a "relaunch happened" assertion doesn't require running an
+# actual daemon loop.
+
+
+def test_arm_refuses_when_a_live_daemon_generation_is_unmeasurable(tmp_path: Path) -> None:
+    pidfile = tmp_path / "wd.pid"
+    marker = tmp_path / "relaunched"
+    stub = tmp_path / "stub.sh"
+    stub.write_text(f'#!/usr/bin/env bash\ntouch "{marker}"\n')
+    stub.chmod(0o755)
+    parts = [
+        f'export HUB_WATCHDOG_PIDFILE="{pidfile}"',
+        f'export HUB_WATCHDOG_GENFILE="{tmp_path / "absent.gen"}"',
+        f'_WD_SELF="{stub}"',
+        f'printf "%s" "$$" > "{pidfile}"',  # a LIVE pid (our own shell)
+        "_wd_arm",
+    ]
+
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "already armed" in result.stdout + result.stderr
+    assert not marker.exists(), "a live, unmeasurable-generation daemon must not be relaunched"
+
+
+def test_arm_recycles_a_live_daemon_running_a_stale_generation(tmp_path: Path) -> None:
+    pidfile = tmp_path / "wd.pid"
+    genfile = tmp_path / "wd.gen"
+    marker = tmp_path / "relaunched"
+    stub = tmp_path / "stub.sh"
+    stub.write_text(f'#!/usr/bin/env bash\ntouch "{marker}"\n')
+    stub.chmod(0o755)
+    parts = [
+        f'export HUB_WATCHDOG_PIDFILE="{pidfile}"',
+        f'export HUB_WATCHDOG_GENFILE="{genfile}"',
+        "export HUB_WATCHDOG_RECYCLE_GRACE=2",
+        f'_WD_SELF="{stub}"',
+        "_wd_source_hash() { echo FRESH; }",
+        f'printf "%s" "STALE" > "{genfile}"',
+        f'sleep 20 & printf "%s" "$!" > "{pidfile}"',
+        "_wd_arm",
+    ]
+
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "already armed" not in result.stdout + result.stderr, (
+        "a live daemon PROVEN stale must be recycled, not deferred to forever"
+    )
+    # nohup backgrounds the relaunch; give the (near-instant) stub a beat to run.
+    for _ in range(20):
+        if marker.exists():
+            break
+        time.sleep(0.1)
+    assert marker.exists(), "the recycled slot must be relaunched with a fresh daemon"
+
+
 # ── the self-recycle source bundle (issue #296) ────────────────────────────────
 # A daemon armed by the drain EXECUTES from hub-afk.sh's frozen self-copy (/tmp/hub-afk-self.*/)
 # — a bundle no land ever rewrites. Hashing THAT is structurally dead: the stamp can never move,
