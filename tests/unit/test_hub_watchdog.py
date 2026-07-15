@@ -1347,6 +1347,207 @@ def test_run_conditions_fires_auto_land_skipped_when_truly_mergeable(tmp_path: P
     assert '"condition":"conflicted-land"' not in ledger
 
 
+# ── issue #292: condition 4 is marker-kind-blind ──────────────────────────────
+# slot_state returns `done` for BOTH ready/ and accept/ at the tip (its `for kind in ready accept`
+# loop), so _wd_detect_mergeable_skipped conflates two opposite situations: ready/ means the drain
+# SHOULD have landed and didn't (a real shortfall, #274's class), while accept/ is the deliberate
+# human-eyeball terminal the drain MUST NOT land (spoke-ready's EYEBALL row; auto_land lands only
+# _ready_at_tip). On #286 an accept/ spoke with ZERO commits of its own — the spoke concluded the
+# work was already shipped and moved to close without code — escalated as "mergeable branch
+# un-landed: human land". Three costs: the remediation misdirects (landing a zero-diff branch would
+# close the issue as shipped when the pending decision is "confirm the duplicate, or re-kick"), the
+# firing lands as class afk-defect and docks the #251 autonomy score for a by-design human wait, and
+# it auto-spawns a bug-scoper per accept-spoke per run (this issue's own provenance).
+def _accept_tag(wt: Path, issue: str = "5") -> None:
+    """Tag accept/<issue> at the tip the way spoke-ready does — ANNOTATED (`git tag -f -a`)."""
+    _git(wt, "tag", "-f", "-a", f"accept/{issue}", "-m", "built+reviewed; human sign-off")
+
+
+def _ready_tag(wt: Path, issue: str = "5") -> None:
+    _git(wt, "tag", "-f", "-a", f"ready/{issue}", "-m", "ready to land")
+
+
+def _zero_diff_repo(tmp_path: Path) -> tuple[Path, str]:
+    """The #286 shape: a branch at the base tip with NO commits of its own."""
+    wt = _git_repo(tmp_path)
+    base = _base_branch(wt)
+    (wt / "README.md").write_text("base\n")
+    _git(wt, "add", "README.md")
+    _git(wt, "commit", "-qm", "chore: base readme")
+    _git(wt, "checkout", "-qb", "feature/5-x")  # branched, never committed
+    return wt, base
+
+
+def test_terminal_marker_kind_reads_accept(tmp_path: Path) -> None:
+    wt, _ = _mergeable_repo(tmp_path)
+    _accept_tag(wt)
+    assert _call(f"_wd_terminal_marker_kind '{wt}' 5").stdout.strip() == "accept"
+
+
+def test_terminal_marker_kind_reads_ready(tmp_path: Path) -> None:
+    wt, _ = _mergeable_repo(tmp_path)
+    _ready_tag(wt)
+    assert _call(f"_wd_terminal_marker_kind '{wt}' 5").stdout.strip() == "ready"
+
+
+def test_terminal_marker_kind_prefers_ready_when_both_sit_at_the_tip(tmp_path: Path) -> None:
+    # Must agree with slot_state's own precedence (`for kind in ready accept` — ready wins), or the
+    # watchdog would classify off a different marker than the one that made the spoke read `done`.
+    wt, _ = _mergeable_repo(tmp_path)
+    _accept_tag(wt)
+    _ready_tag(wt)
+    assert _call(f"_wd_terminal_marker_kind '{wt}' 5").stdout.strip() == "ready"
+
+
+def test_terminal_marker_kind_empty_when_no_terminal_marker(tmp_path: Path) -> None:
+    # Unreadable kind must fall through to the historical afk-defect path, never to the silent one.
+    wt, _ = _mergeable_repo(tmp_path)
+    assert _call(f"_wd_terminal_marker_kind '{wt}' 5").stdout.strip() == ""
+
+
+def test_own_commits_counts_zero_for_a_close_without_code_branch(tmp_path: Path) -> None:
+    wt, base = _zero_diff_repo(tmp_path)
+    out = _call(f"_wd_own_commits '{wt}'", env={"AI_TOOLKIT_BASE_BRANCH": base}).stdout.strip()
+    assert out == "0"
+
+
+def test_own_commits_counts_the_branchs_own_work(tmp_path: Path) -> None:
+    wt, base = _mergeable_repo(tmp_path)
+    out = _call(f"_wd_own_commits '{wt}'", env={"AI_TOOLKIT_BASE_BRANCH": base}).stdout.strip()
+    assert out == "1"
+
+
+def test_classify_accept_unsigned_is_a_novel_decision() -> None:
+    # The by-design human sign-off wait is not a drain shortfall: it must not dock the autonomy
+    # score, and must not auto-file a bug against afk.
+    assert _call("_wd_classify accept-unsigned 5").stdout.strip() == "novel-decision"
+
+
+def test_run_conditions_fires_accept_unsigned_for_an_accept_spoke(tmp_path: Path) -> None:
+    wt, base = _mergeable_repo(tmp_path)
+    _accept_tag(wt)
+    ledger = _run_conditions_ledger(wt, base, tmp_path)
+
+    assert '"condition":"accept-unsigned"' in ledger, ledger
+    assert '"class":"novel-decision"' in ledger, "a by-design human wait is not an afk defect"
+    assert '"condition":"auto-land-skipped"' not in ledger, (
+        "telling a human to LAND an accept/ spoke is the misdirection #292 is about"
+    )
+
+
+def test_accept_unsigned_reason_names_sign_off_and_the_zero_diff(tmp_path: Path) -> None:
+    # The #286 shape end-to-end: the reason must say what the human actually owes — confirm the
+    # close-without-code — not "land it", which would close the issue as shipped on an empty merge.
+    wt, base = _zero_diff_repo(tmp_path)
+    _accept_tag(wt)
+    ledger = _run_conditions_ledger(wt, base, tmp_path)
+
+    assert "sign-off" in ledger, ledger
+    assert "no own commits" in ledger, ledger
+    assert "do not land" in ledger, ledger
+
+
+def test_run_conditions_files_no_defect_for_an_accept_spoke(tmp_path: Path) -> None:
+    # The filing-spam consequence: every accept/ a human does not service within the ceiling was
+    # spawning a fresh headless bug-scoper per run.
+    wt, base = _mergeable_repo(tmp_path)
+    _accept_tag(wt)
+    scoped = tmp_path / "scoped"
+    ledger = tmp_path / "ledger.jsonl"
+    statedir = tmp_path / "statedir"
+    statedir.mkdir(exist_ok=True)
+    old = str(int(NOW) - 1000)
+    prelude = (
+        f'inflight_worktrees() {{ printf "%s\\t5\\n" "{wt}"; }}; '
+        f"slot_state() {{ echo done; }}; read_done_epoch() {{ echo {old}; }}"
+    )
+    env = {
+        "AFK_NOW": NOW,
+        "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo open",
+        "HUB_WATCHDOG_LEDGER": str(ledger),
+        "HUB_WATCHDOG_LANDMARK_CMD": "true",
+        "HUB_WATCHDOG_LANDMARK_REPO": str(tmp_path / "nolandmarks"),
+        "AI_TOOLKIT_BASE_BRANCH": base,
+        "AFK_STATE_DIR": str(statedir),
+        "HUB_WATCHDOG_FILE": "1",  # opt filing back on — the point of the test
+        "HUB_WATCHDOG_DEDUP_CMD": "true",
+        "HUB_WATCHDOG_LABEL_CMD": "true",
+        "HUB_WATCHDOG_SCOPER_CMD": f'printf "%s %s" "$1" "$2" >> {scoped}',
+    }
+
+    _call(f"{prelude}; _wd_run_conditions {NOW} off", env=env)
+
+    assert not scoped.exists(), (
+        "an accept/ human-sign-off wait must not auto-file a bug against afk"
+    )
+
+
+def test_run_conditions_still_escalates_the_landmark_for_an_accept_spoke(tmp_path: Path) -> None:
+    # Quieter classification must NOT mean invisible: the human still needs pointing at the spoke.
+    # Reuses needs-human-land/<N> per #272 (no second tripwire-racing tag) — and the existing
+    # _wd_clear_landed_landmarks sweep then self-clears it once the human closes the issue.
+    wt, base = _mergeable_repo(tmp_path)
+    _accept_tag(wt)
+    marked = tmp_path / "marked"
+    ledger = tmp_path / "ledger.jsonl"
+    statedir = tmp_path / "statedir"
+    statedir.mkdir(exist_ok=True)
+    old = str(int(NOW) - 1000)
+    prelude = (
+        f'inflight_worktrees() {{ printf "%s\\t5\\n" "{wt}"; }}; '
+        f"slot_state() {{ echo done; }}; read_done_epoch() {{ echo {old}; }}"
+    )
+    env = {
+        "AFK_NOW": NOW,
+        "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo open",
+        "HUB_WATCHDOG_LEDGER": str(ledger),
+        "HUB_WATCHDOG_LANDMARK_CMD": f'printf "%s" "$2" > {marked}',
+        "HUB_WATCHDOG_LANDMARK_REPO": str(tmp_path / "nolandmarks"),
+        "AI_TOOLKIT_BASE_BRANCH": base,
+        "AFK_STATE_DIR": str(statedir),
+    }
+
+    _call(f"{prelude}; _wd_run_conditions {NOW} off", env=env)
+
+    assert marked.read_text() == "5", "the escalation must stay visible to a human"
+
+
+def test_run_conditions_keeps_auto_land_skipped_for_a_ready_spoke(tmp_path: Path) -> None:
+    # The complement, and the load-bearing half: ready/ at tip IS a genuine drain shortfall (#274)
+    # and must keep firing afk-defect. A novel-decision here would hide a real bug and flatter the
+    # autonomy score — the direction that must never widen.
+    wt, base = _mergeable_repo(tmp_path)
+    _ready_tag(wt)
+    ledger = _run_conditions_ledger(wt, base, tmp_path)
+
+    assert '"condition":"auto-land-skipped"' in ledger, ledger
+    assert '"class":"afk-defect"' in ledger, (
+        "a drain that should have landed and didn't IS a defect"
+    )
+    assert '"condition":"accept-unsigned"' not in ledger
+
+
+def test_sweep_clears_the_accept_unsigned_marker_for_a_closed_issue(tmp_path: Path) -> None:
+    # The landmark sweep already re-arms auto-land-skipped/conflicted-land once the issue closes;
+    # the new condition needs the same treatment or a later recurrence stays deduped into silence.
+    root = _git_repo(tmp_path, name="landmarks")
+    _git(root, "tag", "needs-human-land/5")
+    ledger = tmp_path / "ledger.jsonl"
+    # Co-located with the ledger, because _wd_fired_marker resolves off dirname(_wd_ledger_file) —
+    # the same placement the sibling dead-pane sweep tests use.
+    marker = tmp_path / "wd-fire-dedup-accept-unsigned-5"
+    marker.write_text("")
+    env = {
+        "HUB_WATCHDOG_LEDGER": str(ledger),
+        "HUB_WATCHDOG_LANDMARK_REPO": str(root),
+        "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo closed",
+    }
+
+    _call("_wd_clear_landed_landmarks", env=env)
+
+    assert not marker.exists(), "a closed accept/ issue must re-arm the condition for a recurrence"
+
+
 def test_run_conditions_defers_while_land_lane_mid_backoff(tmp_path: Path) -> None:
     # AC5: while the drain's LAND lane has a FRESH armed retry (future-dated warned-state-5-land),
     # the watchdog must NOT fire condition 4 — no false "conflicted-land"/"skipped" escalation while
