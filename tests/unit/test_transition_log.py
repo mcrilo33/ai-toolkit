@@ -287,6 +287,29 @@ def test_concurrent_appends_interleave_whole_lines(tmp_path: Path) -> None:
     assert len(set(tags)) == 40
 
 
+def test_no_torn_write_when_writers_pile_behind_a_stale_lock(tmp_path: Path) -> None:
+    # The stale-lock-break path (validation, 2026-07-15): with a tiny break
+    # cadence and a lock wedged long enough to force the break, multiple queued
+    # writers must NEVER produce a torn line — the winner-only invariant. Records
+    # may be dropped (safe: reads as "unknown"); a torn record must never appear.
+    env = _env(tmp_path, AFK_TLOG_LOCK_WAIT="1")
+    log = _log_file(tmp_path, 42)
+    log.parent.mkdir(parents=True, exist_ok=True)
+
+    fresh_call(
+        TRANSITION_LOG,
+        f'( mkdir "{log}.lock"; sleep 0.3; rmdir "{log}.lock" ) & '
+        'pad=$(printf "x%.0s" $(seq 1 3000)); '
+        "for i in $(seq 1 6); do afk_tlog_event 42 w-$i broker answer ep "
+        "'{\"pad\":\"'$pad'\"}' & done; wait",
+        env=env,
+    )
+
+    lines = log.read_text().splitlines()
+    # every line present is a COMPLETE record — zero tears is the invariant
+    assert all(ln.startswith("{") and ln.endswith("}") and len(ln) > 3000 for ln in lines)
+
+
 def test_large_line_written_whole(tmp_path: Path) -> None:
     # A single big record (free-text + big evidence) is written intact — the lock
     # makes line size a non-issue, replacing the old evidence-size cap.

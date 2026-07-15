@@ -77,29 +77,44 @@ _tlog_json_escape() {
 # episode) can push a line arbitrarily large regardless. A torn record mid-file
 # is worse than a torn TRAILING line — readers tolerate only the latter. So the
 # write is serialized with `mkdir` (the one filesystem primitive that is atomic
-# and portable — macOS has no flock(1)): the winner appends, losers spin briefly.
-# The lock is held only for one printf, so contention windows are microscopic.
-# A stale lock (writer crashed mid-append) is force-broken past a bound so a dead
-# writer can't wedge the log; the append then proceeds (best-effort > blocked).
-_tlog_lock_wait="${AFK_TLOG_LOCK_WAIT:-50}"   # ~50 x 20ms spins = up to ~1s
+# and portable — macOS has no flock(1)).
+#
+# WINNER-ONLY WRITES (the load-bearing invariant). A writer appends ONLY after
+# its OWN `mkdir "$lock"` succeeds. A writer that never wins the lock DROPS its
+# record rather than appending unlocked — because per #300's contract a MISSING
+# record reads as "unknown" (safe, never a firing basis), whereas a TORN record
+# corrupts a sibling's complete-looking line (unsafe). An earlier revision let
+# losers fall through to a naked append at the spin ceiling; adversarial testing
+# reproduced torn writes at just 2+ writers piled behind one stale lock. Never
+# again: no path writes without holding.
+#
+# STALE-LOCK BREAK. A crashed writer's lock would wedge the log forever, so every
+# _tlog_lock_wait spins a waiter rmdir's the lock (breaking a possibly-dead
+# holder) and keeps racing — it does NOT then write on faith. Since a live hold
+# is one printf (microseconds), the ~1s break cadence only ever fires on a truly
+# dead holder; breaking a live holder would require it frozen >1s mid-printf, and
+# even then that holder is not writing, so the winner's write stays clean.
+_tlog_lock_wait="${AFK_TLOG_LOCK_WAIT:-50}"   # spins between stale-lock breaks (~1s at 20ms)
+_tlog_lock_max="${AFK_TLOG_LOCK_MAX:-250}"    # hard spin cap (~5s) before dropping the record
 
 _tlog_append() {
-  local issue="$1" line="$2" f dir lock i="0"
+  local issue="$1" line="$2" f dir lock i="0" held="0"
   f="$(_tlog_file "$issue")" || return 0
   dir="${f%/*}"
   mkdir -p "$dir" 2>/dev/null || return 0
   lock="$f.lock"
-  while ! mkdir "$lock" 2>/dev/null; do
+  while [ "$i" -lt "$_tlog_lock_max" ]; do
+    if mkdir "$lock" 2>/dev/null; then held="1"; break; fi
     i=$(( i + 1 ))
-    if [ "$i" -ge "$_tlog_lock_wait" ]; then
-      rmdir "$lock" 2>/dev/null || true   # break a stale lock, then race for it
-      mkdir "$lock" 2>/dev/null || break  # got it, or give up and append anyway
-      break
-    fi
+    # Periodically break a possibly-stale lock, then keep racing (winner-only).
+    [ $(( i % _tlog_lock_wait )) -eq 0 ] && { rmdir "$lock" 2>/dev/null || true; }
     sleep 0.02 2>/dev/null || sleep 1
   done
-  printf '%s\n' "$line" >> "$f" 2>/dev/null || true
-  rmdir "$lock" 2>/dev/null || true
+  if [ "$held" = "1" ]; then
+    printf '%s\n' "$line" >> "$f" 2>/dev/null || true
+    rmdir "$lock" 2>/dev/null || true
+  fi
+  # held=0 (never acquired in ~5s) -> drop the record; unknown > corrupt.
   return 0
 }
 
