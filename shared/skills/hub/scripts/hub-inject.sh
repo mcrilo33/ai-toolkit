@@ -269,22 +269,36 @@ _transcript_advanced() {
     waited=$(( waited + poll ))
   done
 }
-# _answer_delivered <wt> <target> <text> <sizes> -> after _transcript_advanced
-# succeeded, decide whether the answer actually LEFT the composer (#201: an advance
-# alone scored two wedged pastes as "injected answer into #182" while the answer sat
-# unsubmitted). NOT delivered only on the full #182 signature — positive evidence the
-# composer still holds the text: the scan worked, the needle did NOT land in appended
-# transcript bytes (so a pane match is not the echo of a genuine submit), and a
-# readable pane still shows it. Everything short of that keeps the pre-#201 contract
-# (advance alone = delivered): an unobservable pane or unavailable scan is NO evidence
-# of a wedge, and a false success parks one spoke where a false NOT-delivered would
-# stray-Enter, escalate, or respawn healthy panes on every echoed submit.
+# _answer_delivered <wt> <text> <sizes> -> after _transcript_advanced succeeded, decide
+# whether the answer actually LEFT the composer. The needle landing in an APPENDED
+# type:"user" record is the SOLE positive proof (#281); a transcript advance is not, because
+# the advance can be the injector's OWN doing.
+#   rc 0 — the needle landed in appended bytes as a user record: delivered.
+#   rc 0 — the scan is UNAVAILABLE (no python3 / no project dir): no evidence either way, so
+#          keep the pre-#201 contract (advance alone = delivered) rather than escalate on
+#          every degraded env.
+#   rc 1 — the scan RAN and the needle is NOT there: NOT delivered, whatever the pane says.
+#
+# #281 removed the composer read from this decision. It used to rescue a not-found scan to
+# "delivered" whenever the pane did not show the needle — two independent false-negatives
+# that ANDed into a false positive: inject_answer's Esc-first menu-cancel (#74) DECLINES a
+# spoke's live AskUserQuestion, and Claude Code writes that decline as its own type:"user"
+# turn, so the transcript advances without the answer ever being submitted; meanwhile
+# capture-pane wraps a 40-char needle across lines, so grep -qF misses the paste sitting in
+# the composer. The drain logged "injected answer into #271" four times against an answer
+# nobody read. The pane read still classifies wedge-vs-refuted in inject_and_verify — it is
+# just no longer allowed to manufacture a delivery.
+#
+# The accepted cost (#281): a genuine submit whose needle the scan cannot find now takes one
+# stray bare Enter and escalates, where it used to pass. A real submit records the needle in
+# a user record and gets three scan chances (initial, post-grace, post-retry), and the retry
+# is a bare Enter that never re-pastes (#133) — so the trade is a rare extra Enter against
+# never again reporting an unread answer as delivered.
 _answer_delivered() {
-  local wt="$1" target="$2" text="$3" sizes="$4" rc
+  local wt="$1" text="$2" sizes="$3" rc
   _answer_appended "$wt" "$text" "$sizes"; rc=$?
   [ "$rc" -eq 0 ] && return 0
   [ "$rc" -eq 2 ] && return 0
-  _composer_shows_text "$target" "$text" || return 0
   return 1
 }
 # inject_and_verify <wt_path> <pane_target> <text> -> deliver the answer and CONFIRM
@@ -313,7 +327,7 @@ inject_and_verify() {
   sizes="$(_transcript_sizes "$wt")"
   inject_answer "$target" "$text" || return 1
   if _transcript_advanced "$wt" "$before"; then
-    _answer_delivered "$wt" "$target" "$text" "$sizes" && return 0
+    _answer_delivered "$wt" "$text" "$sizes" && return 0
     # The advance may have raced the submit's own user-record write by milliseconds:
     # one grace re-check before treating the veto as real (#201 review).
     sleep "${AFK_INJECT_POLL_SECONDS:-2}" 2>/dev/null || true
@@ -328,7 +342,7 @@ inject_and_verify() {
   log "  injected answer did not register — retrying with a bare Enter (never a re-paste)"
   tmux send-keys -t "$target" Enter 2>/dev/null || true
   if _transcript_advanced "$wt" "$before"; then
-    _answer_delivered "$wt" "$target" "$text" "$sizes" && return 0
+    _answer_delivered "$wt" "$text" "$sizes" && return 0
     vetoed=1
   fi
   # Last look before classifying: the bare-Enter submit can land in the same whole

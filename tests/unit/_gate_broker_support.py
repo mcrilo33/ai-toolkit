@@ -214,15 +214,40 @@ def _result_event(text: str) -> str:
 
 
 def _fake_tmux_pane(fake_bin: Path, wt: Path, jsonl: Path) -> Path:
-    """A tmux stub: list-panes maps a pane to <wt>; the submitting Enter advances the
-    spoke transcript so inject_and_verify confirms; every send-keys is logged."""
+    """A tmux stub: list-panes maps a pane to <wt>; the submitting Enter records the pasted
+    answer as a type:"user" turn (what Claude Code really writes on submit); send-keys logged.
+
+    The Enter used to append a bare `{}` — enough to bump the mtime, but NOT the user record a
+    real submit writes. Since #281 the appended user record is the SOLE proof of delivery
+    (_answer_delivered), so a stub that only bumped the clock would score every inject in this
+    suite as non-delivered — and, worse, would have kept passing against the pre-#281 fail-open
+    that let an unsubmitted paste read as delivered. The paste is remembered on the literal
+    `send-keys -l --` and replayed into the record on the following Enter, mirroring the real
+    two-keystroke contract; an Enter with nothing pasted still writes a bare `{}` (a non-turn
+    write that advances the transcript without proving delivery).
+    """
     log = fake_bin / "tmux.log"
+    paste = fake_bin / "pasted.txt"
+    # json.dumps in the stub: the needle is matched byte-wise against its JSON-ESCAPED form,
+    # so the record has to be encoded exactly as Claude Code encodes it (raw UTF-8, no \\u).
+    encode = (
+        "python3 -c 'import json,os,sys;"
+        'print(json.dumps({"type":"user","message":{"content":[{"type":"text",'
+        '"text":open(os.environ[chr(95)+"AFK_PASTE"]).read()}]}},ensure_ascii=False))'
+        "'"
+    )
     (fake_bin / "tmux").write_text(
         "#!/usr/bin/env bash\n"
         f'printf "%s\\n" "$*" >> "{log}"\n'
         'case "$1" in\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{wt}" ;;\n'
-        f'  send-keys) case "$*" in *Enter*) printf "{{}}\\n" >> "{jsonl}" ;; esac ;;\n'
+        "  send-keys)\n"
+        '    case "$*" in\n'
+        f'      *" -l "*) printf "%s" "${{@: -1}}" > "{paste}" ;;\n'
+        f'      *Enter*)  if [ -s "{paste}" ]; then\n'
+        f'                  _AFK_PASTE="{paste}" {encode} >> "{jsonl}"\n'
+        f'                else printf "{{}}\\n" >> "{jsonl}"; fi ;;\n'
+        "    esac ;;\n"
         "esac\nexit 0\n"
     )
     (fake_bin / "tmux").chmod(0o755)

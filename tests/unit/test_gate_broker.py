@@ -215,15 +215,24 @@ def test_broker_service_gate_defaults_to_unattended(
 def test_inject_and_verify_registers_when_transcript_advances(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
-    # The submitting Enter advances the transcript and the pane (readable, empty) no
-    # longer shows the answer — the paste was submitted, not stranded: rc 0.
+    """A genuine submit records the answer as a user turn, and that is what proves delivery.
+
+    #281 raised this stub's fidelity: the submitting Enter used to append a bare `{}`, which
+    bumped the mtime without writing the type:"user" record a real Claude Code submit writes.
+    The old contract accepted that (advance + a pane not showing the needle = delivered), so
+    the stub never had to be honest. It does now — the appended user record is the sole proof.
+    The scenario is unchanged; only the fake got truthful.
+    """
+    answer = "Approved — proceed."
     projects = tmp_path / "projects"
     jsonl = _seed_transcript(projects, spoke_repo)
-    fake_bin = _write_fake_tmux(tmp_path, on_enter=f'printf "{{}}\\n" >> "{jsonl}"')
+    record_file = tmp_path / "user-record.json"
+    record_file.write_text(_user_record(answer) + "\n")
+    fake_bin = _write_fake_tmux(tmp_path, on_enter=f'cat "{record_file}" >> "{jsonl}"')
 
     result = _call(
-        f"inject_and_verify '{spoke_repo}' afk:1 'Approved — proceed.'; echo RC=$?",
-        env=_inject_env(projects, fake_bin),
+        f"inject_and_verify '{spoke_repo}' afk:1 \"$ANSWER\"; echo RC=$?",
+        env=_inject_env(projects, fake_bin, ANSWER=answer),
     )
 
     assert result.stdout.strip().splitlines()[-1] == "RC=0", result.stdout + result.stderr
@@ -428,14 +437,23 @@ def test_broker_service_gate_escalates_wedge_despite_advanced_mtime(
     assert "composer wedged" in result.stderr
 
 
-def test_inject_and_verify_unobservable_pane_degrades_to_advance(
+def test_inject_and_verify_unobservable_pane_refutes_unproven_delivery(
     spoke_repo: Path, tmp_path: Path
 ) -> None:
-    """capture-pane starts erroring right after the paste (tmux busy, pane dying).
-    An unreadable pane is no evidence the composer still holds the text, so the
-    injector keeps the pre-#201 contract: advance alone => rc 0. NOT-delivered needs
-    the full #182 signature (readable pane showing a needle absent from appended
-    bytes) — vetoing on an unobservable pane would escalate on every tmux blip.
+    """capture-pane starts erroring right after the paste (tmux busy, pane dying), and a
+    non-turn write bumps the transcript. Nothing here proves the answer was submitted.
+
+    #281 FLIPPED this case from rc 0 to rc 3. It used to degrade to the pre-#201 contract —
+    an unreadable pane is no evidence of a wedge, so advance alone scored as delivered. But
+    that is precisely the false-positive shape #281 is about: the advance is explained by the
+    sidecar, the needle never landed in a user record, and "the pane is unreadable" is not
+    evidence FOR delivery either. An unproven delivery is now REFUTED (rc 3), which #241 makes
+    a warn-and-continue rather than a park, so the drain retries instead of logging an
+    "injected answer" nobody received.
+
+    The scan being AVAILABLE and finding nothing is what distinguishes this from
+    test_inject_and_verify_degrades_to_advance_when_scan_unavailable, where rc 2 still
+    degrades to advance-alone.
     """
     projects = tmp_path / "projects"
     _seed_transcript(projects, spoke_repo)
@@ -452,7 +470,7 @@ def test_inject_and_verify_unobservable_pane_degrades_to_advance(
         env=_inject_env(projects, fake_bin),
     )
 
-    assert result.stdout.strip().splitlines()[-1] == "RC=0", result.stdout + result.stderr
+    assert result.stdout.strip().splitlines()[-1] == "RC=3", result.stdout + result.stderr
 
 
 def test_inject_and_verify_degrades_to_advance_when_scan_unavailable(
