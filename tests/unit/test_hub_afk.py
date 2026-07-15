@@ -30,6 +30,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from _gate_broker_support import _fake_tmux_pane
 from bash_session import BashSession, fresh_call
 
 # hub-afk.sh targets the macOS control plane: it reads transcript mtimes with BSD
@@ -1164,9 +1165,16 @@ def test_inject_and_verify_succeeds_when_transcript_advances(
     jsonl = pd / "session.jsonl"
     old = 1_000_000_000
     os.utime(jsonl, (old, old))  # backdate so the spoke's reaction is strictly newer
-    # inject_answer is stubbed to advance the transcript (the spoke reacting to input).
+    # inject_answer is stubbed to model the spoke reacting to input: a real submit records
+    # the answer as a user turn. Since #281 that record — not the bare mtime bump this stub
+    # used to write — is what proves delivery, because the injector's own Escape can advance
+    # the transcript while the answer sits unsubmitted (#271).
+    record = json.dumps(
+        {"type": "user", "message": {"content": [{"type": "text", "text": "use Redis"}]}},
+        ensure_ascii=False,
+    )
     expr = (
-        f'inject_answer() {{ printf "{{}}\\n" >> "{jsonl}"; return 0; }}; '
+        f"inject_answer() {{ printf '%s\\n' '{record}' >> \"{jsonl}\"; return 0; }}; "
         f"inject_and_verify '{spoke_repo}' 'afk:1' 'use Redis'; echo RC=$?"
     )
 
@@ -1238,6 +1246,14 @@ def _injector_tmux(
     `touch` (the respawned `claude --continue` session writing its first message)
     unless `fail_new_window`. `list-panes` / `list-windows` answer from fixture
     lines so decide_and_act can map the pane and a respawn can find its window.
+
+    The landing submit writes the pasted answer as a real type:"user" record, and consumes
+    the buffer as a real submit empties the composer. Since #281 that record is the SOLE
+    proof of delivery (_answer_delivered), so a submit that only bumped the transcript mtime
+    — what this stub did before — no longer reads as delivered, and rightly: that bare-mtime
+    signal is exactly what let an Esc-cancelled QCM score an unsubmitted paste as an
+    "injected answer" in #271. A non-submit transcript write (the respawn's new-window) stays
+    a bare `{}`: it advances the clock without proving the spoke read anything.
     """
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
@@ -1250,6 +1266,23 @@ def _injector_tmux(
     windows.write_text(window_line)
     counter = tmp_path / "enters.txt"
     touch_cmd = f'printf "{{}}\\n" >> "{touch}"' if touch is not None else ":"
+    # The landing submit records the pasted answer as a user turn (what Claude Code writes),
+    # encoded exactly as it encodes it — raw UTF-8, no \\u — since _answer_appended matches the
+    # needle byte-wise against its JSON-escaped form.
+    pasted = tmp_path / "pasted.txt"
+    if touch is not None:
+        encode = (
+            "python3 -c 'import json,os;"
+            'print(json.dumps({"type":"user","message":{"content":[{"type":"text",'
+            '"text":open(os.environ[chr(95)+"AFK_PASTE"]).read()}]}},ensure_ascii=False))'
+            "'"
+        )
+        submit_cmd = (
+            f'if [ -s "{pasted}" ]; then _AFK_PASTE="{pasted}" {encode} >> "{touch}"; '
+            f': > "{pasted}"; else {touch_cmd}; fi'
+        )
+    else:
+        submit_cmd = ":"
     (fake_bin / "tmux").write_text(
         "#!/usr/bin/env bash\n"
         f'printf "%s\\n" "$*" >> "{log}"\n'
@@ -1263,12 +1296,13 @@ def _injector_tmux(
         "    exit 0 ;;\n"
         "esac\n"
         'if [ "$1" = "send-keys" ]; then\n'
-        f'  case " $* " in *" -l "*) printf "%s\\n" "${{@: -1}}" >> "{capture_file}" ;; esac\n'
+        f'  case " $* " in *" -l "*) printf "%s\\n" "${{@: -1}}" >> "{capture_file}"; '
+        f'printf "%s" "${{@: -1}}" > "{pasted}" ;; esac\n'
         '  if [ "${@: -1}" = "Enter" ]; then\n'
         f'    n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n+1)); printf "%s\\n" "$n" > "{counter}"\n'
         f'    if [ {clear_on_enter} -gt 0 ] && [ "$n" -ge {clear_on_enter} ]; then\n'
         f'      : > "{capture_file}"\n'
-        f"      {touch_cmd}\n"
+        f"      {submit_cmd}\n"
         "    fi\n"
         "  fi\n"
         "fi\n"
@@ -1918,17 +1952,11 @@ def test_decide_and_act_injects_and_emits_success_span(spoke_repo: Path, tmp_pat
     fake_bin.mkdir()
     (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
     (fake_bin / "gh").chmod(0o755)
-    # Fake tmux: list-panes maps a pane to this worktree; send-keys succeeds and, on the
-    # submitting Enter, advances the spoke's transcript — modelling the spoke reacting so
-    # inject_and_verify confirms the answer registered.
-    (fake_bin / "tmux").write_text(
-        "#!/usr/bin/env bash\n"
-        'case "$1" in\n'
-        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
-        f'  send-keys) case "$*" in *Enter*) printf "{{}}\\n" >> "{jsonl}" ;; esac ;;\n'
-        "esac\nexit 0\n"
-    )
-    (fake_bin / "tmux").chmod(0o755)
+    # Fake tmux: list-panes maps a pane to this worktree; the submitting Enter records the
+    # pasted answer as a user turn — the shared stub, so this test drives the same delivery
+    # contract as every other inject test (a bare mtime bump has not proven delivery since
+    # #281, and an inline fake would silently drift from that).
+    _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
 
     tel_dir = tmp_path / "tel"
     env = {
@@ -1971,14 +1999,9 @@ def test_decide_and_act_consumes_gate_tag_on_inject(spoke_repo: Path, tmp_path: 
     fake_bin.mkdir()
     (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "Title\\n\\nbody"\n')
     (fake_bin / "gh").chmod(0o755)
-    (fake_bin / "tmux").write_text(
-        "#!/usr/bin/env bash\n"
-        'case "$1" in\n'
-        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
-        f'  send-keys) case "$*" in *Enter*) printf "{{}}\\n" >> "{jsonl}" ;; esac ;;\n'
-        "esac\nexit 0\n"
-    )
-    (fake_bin / "tmux").chmod(0o755)
+    # The shared stub: the submitting Enter records the answer as a user turn, which is what
+    # proves delivery since #281 (a bare mtime bump no longer does).
+    _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
 
     env = {
         "CLAUDE_PROJECTS_DIR": str(projects),
