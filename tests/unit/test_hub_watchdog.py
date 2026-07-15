@@ -1240,8 +1240,13 @@ def test_run_conditions_fires_park_and_invokes_answer_seam(tmp_path: Path) -> No
 
     _call(f"{prelude}; _wd_run_conditions {NOW} live", env=env)
 
-    assert '"condition":"park-unanswered"' in ledger.read_text()
+    line = ledger.read_text()
+    assert '"condition":"park-unanswered"' in line
     assert answered.exists(), "a park firing must invoke the answer intervention"
+    # #283 AC5: the MEASURED base reaches the ledger line itself — not just the reason function —
+    # so a future false positive is diagnosable from the ledger alone.
+    assert f"base=park-onset@{onset}" in line, "the ledger line names which epoch was measured"
+    assert "lane=gate" in line
 
 
 # ── the instrument: classify + file the defect (issue #251, subtask 4) ─────────
