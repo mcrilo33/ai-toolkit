@@ -225,6 +225,12 @@ def _fake_tmux_pane(fake_bin: Path, wt: Path, jsonl: Path) -> Path:
     `send-keys -l --` and replayed into the record on the following Enter, mirroring the real
     two-keystroke contract; an Enter with nothing pasted still writes a bare `{}` (a non-turn
     write that advances the transcript without proving delivery).
+
+    The submitting Enter CONSUMES the buffer, exactly as a real submit empties the composer.
+    Without that, the bare-Enter retry (#133) would re-emit the same answer as a second user
+    record and manufacture a "delivered" verdict against an injector that never submitted
+    anything — the stub would pass while the real code was broken, which is the whole failure
+    mode #281 is about.
     """
     log = fake_bin / "tmux.log"
     paste = fake_bin / "pasted.txt"
@@ -246,6 +252,7 @@ def _fake_tmux_pane(fake_bin: Path, wt: Path, jsonl: Path) -> Path:
         f'      *" -l "*) printf "%s" "${{@: -1}}" > "{paste}" ;;\n'
         f'      *Enter*)  if [ -s "{paste}" ]; then\n'
         f'                  _AFK_PASTE="{paste}" {encode} >> "{jsonl}"\n'
+        f'                  : > "{paste}"\n'
         f'                else printf "{{}}\\n" >> "{jsonl}"; fi ;;\n'
         "    esac ;;\n"
         "esac\nexit 0\n"
