@@ -1153,7 +1153,13 @@ _afk_capture_hang_forensics() {
   jsonl="$(_spoke_jsonl "$wt")"
   if [ -n "$jsonl" ]; then
     tail -n 50 "$jsonl" > "$dir/transcript-tail.jsonl" 2>/dev/null || true
-    mtime="$(stat -f %m "$jsonl" 2>/dev/null || stat -c %Y "$jsonl" 2>/dev/null)"
+    # GNU `-c %Y` FIRST, BSD `-f %m` second (#289/#132). Reversed, this breaks on GNU: there
+    # `-f` selects filesystem-status mode and takes no inline format, so `%m` is read as a file
+    # operand -- GNU errors on it yet still PRINTS a multi-line fs block for the real file and
+    # exits nonzero, so the `||` fallback ALSO runs and the capture holds the garbage AND the
+    # epoch. That fails _afk_write_fingerprint's all-digits guard, stranding the silence delta
+    # (the hang's tell) as `unknown`. BSD rejects `-c` cleanly, so GNU-first is safe on both.
+    mtime="$(stat -c %Y "$jsonl" 2>/dev/null || stat -f %m "$jsonl" 2>/dev/null)"
   fi
   _afk_write_fingerprint "$issue" "$now" "${mtime:-}" "$jsonl" > "$dir/fingerprint.txt" 2>/dev/null || true
   printf '%s\n' "$dir"
