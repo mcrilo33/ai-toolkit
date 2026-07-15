@@ -2114,8 +2114,11 @@ def test_permission_approve_journals_before_inject(spoke_repo: Path, tmp_path: P
     result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
     assert result.returncode == 0, result.stderr
 
-    assert probe.read_text().strip() == "EXISTS", (
-        "the decision must be journaled BEFORE the approve keystroke fires"
+    # The fake pane never advances/changes, so the #299 bounded retry fires too — both the
+    # first attempt's keystroke and the retry's must see the journal already written; a
+    # "MISSING" anywhere would mean a keypress raced ahead of the journal write.
+    assert probe.read_text().splitlines() == ["EXISTS", "EXISTS"], (
+        "every approve keystroke, including the #299 retry, must be journaled BEFORE it fires"
     )
     # The approve keystroke does not advance the transcript here, so delivery FAILS — the durable
     # journal must record the PROVISIONAL pre-keypress intent and the delivery-failure distinctly,
@@ -2286,8 +2289,11 @@ def test_ceiling_mechanical_approve_is_paced_not_every_tick(
     for now in ("1000", "1000", "1100", "1100", "1100"):
         _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env={**base, "AFK_NOW": now})
 
+    # Pacing is a per-CALL invariant (<=2 approve() calls across the 5 ticks); each call can
+    # legitimately emit up to 2 keystrokes now (the #299 bounded retry, since this fixture's
+    # pane never advances or changes), so the raw-keystroke ceiling is 2 calls x 2 keys = 4.
     approves = keylog.read_text().count("1") if keylog.exists() else 0
-    assert approves <= 2, (
+    assert approves <= 4, (
         f"a re-appearing auto-approve must be backoff-paced, not every tick; fired {approves}"
     )
 
