@@ -715,25 +715,37 @@ _wd_intervene_answer() {   # route to the reasoner/answer lane directly
   if [ -n "${HUB_WATCHDOG_ANSWER_CMD:-}" ]; then bash -c "$HUB_WATCHDOG_ANSWER_CMD" hub-watchdog "$wt" "$issue" >/dev/null 2>&1 || true; return 0; fi
   command -v decide_and_act >/dev/null 2>&1 && decide_and_act "$wt" "$issue" >/dev/null 2>&1 || true
 }
-# _wd_revive_marker <issue> -> the once-per-window revive BUDGET marker (#297). Deliberately built
-# from _wd_fired_marker's `wd-fire-dedup-` family (condition slug `revive`) so it inherits that
-# family's lifetime EXACTLY: _clear_progress_state's wd-fire-dedup-* glob drops it on a fresh arm,
-# and it is co-located with the ledger so tests pointing HUB_WATCHDOG_LEDGER at tmp isolate it too.
-# It is a BUDGET, not a firing: nothing calls `_wd_clear_fired revive`, so the spawn stays spent
-# for the whole window even after the condition resolves — mirroring the drain's resumed-<issue>
-# ("a second crash escalates to a human", hub-afk.sh's _afk_already_resumed). The dead-pane sweep's
-# narrower wd-fire-dedup-dead-pane-* glob does not match this stem.
-_wd_revive_marker() { _wd_fired_marker revive "$1"; }
+# _wd_revive_marker <issue> -> the once-per-window revive BUDGET marker (#297). The
+# `wd-fire-dedup-` stem is deliberate: _clear_progress_state's wd-fire-dedup-* glob drops it on a
+# fresh arm, so the budget gets a per-window lifetime with no edit to that file. It is a BUDGET, not
+# a firing — nothing calls `_wd_clear_fired revive`, so the spawn stays spent for the whole window
+# even after the condition resolves, mirroring the drain's resumed-<issue> ("a second crash
+# escalates to a human", hub-afk.sh's _afk_already_resumed). The dead-pane sweep's narrower
+# wd-fire-dedup-dead-pane-* glob does not match this stem.
+# The DIRECTORY resolves like _wd_filed_marker's (state-dir first), NOT like _wd_fired_marker's
+# (ledger-dir first): the only glob that clears this lives in _clear_progress_state and looks solely
+# in _afk_state_dir, so minting the marker beside a relocated HUB_WATCHDOG_LEDGER would strand it
+# past every future arm and leave that spoke permanently un-revivable. A budget that outlives its
+# window is a worse failure than one cleared early — the ledger firing is what a human reads either
+# way, but a stranded budget silently disables the whole lane.
+_wd_revive_marker() {
+  local dir
+  if command -v _afk_state_dir >/dev/null 2>&1; then dir="$(_afk_state_dir)"; else dir="$(_wd_common_dir)"; fi
+  printf '%s\n' "$dir/wd-fire-dedup-revive-$1"
+}
 _wd_already_revived() { [ -f "$(_wd_revive_marker "$1")" ]; }
 
-# _wd_mark_revived <issue> <pid> -> spend the window's revive budget, recording `<ts>\t<pid>` of the
-# run we launched. The pid is the liveness half (#297): a revive that orphans a headless claude
-# leaves an operator something to inspect and kill rather than hunting stray processes by hand.
-# `-` when the HUB_WATCHDOG_REVIVE_CMD seam ran — that command's process is not ours to own.
+# _wd_mark_revived <issue> <pid> -> record `<ts>\t<pid>` for this window's revive, non-zero when the
+# record could NOT be written. The caller must then refuse to spawn: an unrecordable budget is an
+# unbounded one, and this lane's failure directions are asymmetric — every other miss costs one
+# deferred revive, while this one costs the #297 spawn storm (a fresh headless claude every tick,
+# forever). Fail closed. The pid is the liveness half: a revive that orphans a headless run leaves
+# an operator something to inspect and kill instead of hunting stray processes by hand.
 _wd_mark_revived() {
   local m; m="$(_wd_revive_marker "$1")"
   mkdir -p "$(dirname "$m")" 2>/dev/null || true
-  printf '%s\t%s\n' "$(_wd_now)" "${2:--}" > "$m" 2>/dev/null || true
+  printf '%s\t%s\n' "$(_wd_now)" "${2:--}" > "$m" 2>/dev/null || return 1
+  [ -f "$m" ]
 }
 
 _wd_intervene_revive() {   # claude --continue revive in the worktree
@@ -752,41 +764,47 @@ _wd_intervene_revive() {   # claude --continue revive in the worktree
     _wd_log "deferring revive on #$issue — a land is in flight (its teardown is removing the worktree)"
     return 0
   fi
-  # #297: the drain's own recover_dead_panes revives crashed panes too. Racing it puts TWO claudes
-  # in one worktree racing each other's writes — the hazard the budget below cannot bound on its
-  # own (one watchdog spawn + one drain resume = two). _wd_land_in_flight above covers only the
-  # mid-LAND race; this covers any live drain pass that names this issue. A stale/off drain is not
-  # servicing anything, so it never defers — the same fail-toward-firing direction as the others.
-  if [ "$(_wd_drain_state)" = "live" ]; then
-    case "$(_wd_last_action)" in
-      *"#$issue")
-        _wd_log "deferring revive on #$issue — the drain is mid-action on this same spoke"
-        return 0 ;;
-    esac
-  fi
   # #297: ONE revive per issue per armed window. The dedup marker in _wd_fire gates only the ledger
   # append, so before this the intervention re-ran every tick the condition held — and since no
   # revive advances the epoch the detector measures, and a headless claude creates no pane, the
   # condition held forever: a fresh run per minute, dozens concurrent. A second crash is now a
   # human's call, exactly as it is for the drain's own resume lane.
+  #
+  # NOT paired with a "the drain is working this issue" defer keyed on _wd_last_action: that record
+  # is the drain's LAST action, not its CURRENT one, and is never cleared mid-window — so the
+  # drain's own give-up label (`warn-park #<issue>`) would read as "busy here" and disable this lane
+  # for the rest of the window, on exactly the abandoned spoke tier-2 exists to catch. The narrow
+  # drain-resume overlap this would have covered is bounded to a single extra run by the budget
+  # below; _wd_land_in_flight (above) still covers the mid-land race, on a freshness-bounded signal.
   if _wd_already_revived "$issue"; then
     _wd_log "deferring revive on #$issue — this window's revive budget is already spent"
     return 0
   fi
+  # Claim the budget BEFORE launching, and refuse to launch if it cannot be recorded: the record is
+  # the only thing bounding this lane, so an unwritable state dir must cost a revive, not restore
+  # the spawn storm. The seam owns its whole launch (tests + operator overrides), so it claims here.
   if [ -n "${HUB_WATCHDOG_REVIVE_CMD:-}" ]; then
+    _wd_mark_revived "$issue" "-" || { _wd_log "refusing revive on #$issue — could not record the revive budget"; return 0; }
     bash -c "$HUB_WATCHDOG_REVIVE_CMD" hub-watchdog "$wt" "$issue" >/dev/null 2>&1 || true
-    _wd_mark_revived "$issue" "-"
     return 0
   fi
   command -v claude >/dev/null 2>&1 || return 0
+  # A worktree already torn down cannot be revived into. Checked BEFORE the claim: the spawn below
+  # is async, so this is the one launch failure observable in time to keep the budget unspent.
+  [ -d "$wt" ] || { _wd_log "deferring revive on #$issue — worktree $wt is gone"; return 0; }
+  _wd_mark_revived "$issue" pending \
+    || { _wd_log "refusing revive on #$issue — could not record the revive budget"; return 0; }
   # `exec` so the backgrounded subshell BECOMES claude: $! is then the revived run's own pid, not a
   # short-lived wrapper's — the pid recorded below has to be the one an operator can kill. The
-  # subshell keeps the cd off the caller's cwd. The spawn is async, so a failed cd (a worktree torn
-  # down under us) cannot be observed here and still spends the budget — deliberately: a revive that
-  # cannot land will not land on the next tick either, and retrying it per tick is this bug.
+  # subshell keeps the cd off the caller's cwd.
+  # TRADE-OFF: a claude that dies at startup still spends the window's budget, where hub-afk's
+  # resume_spoke retries (it launches a tmux window and can read the failure synchronously; we
+  # detach a headless run and cannot). Bounded-without-retry is the deliberate choice: the ledger
+  # firing + filed defect that precede this call are what put a human on the spoke, and retry-per-
+  # tick without a backoff is the defect being fixed. The `pending` claim above stands if we die here.
   ( cd "$wt" 2>/dev/null && exec nohup claude --continue >/dev/null 2>&1 ) &
   pid=$!
-  _wd_mark_revived "$issue" "$pid"
+  _wd_mark_revived "$issue" "$pid" || true
 }
 _wd_intervene_reconcile() {  # clear the stale blocked/ marker (local + remote)
   local wt="$1" issue="$2"

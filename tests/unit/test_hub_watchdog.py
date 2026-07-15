@@ -1551,6 +1551,20 @@ def _spawn_count(counter: Path) -> int:
     return counter.read_text().count("spawn") if counter.exists() else 0
 
 
+def _await_file(path: Path, timeout: float = 15.0) -> str | None:
+    """Wait for a detached process to write `path`; its content, or None if it never landed.
+
+    Returning None rather than raising keeps a slow spawn under a loaded push gate reporting the
+    caller's assertion message instead of a bare FileNotFoundError naming a tmp path.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return path.read_text()
+        time.sleep(0.05)
+    return None
+
+
 def test_intervene_revive_spends_its_budget_once_per_window(tmp_path: Path) -> None:
     # The core of the defect: three ticks with the condition still holding must launch ONE run.
     counter = tmp_path / "spawns"
@@ -1600,11 +1614,7 @@ def test_revive_budget_marker_records_the_spawned_run(tmp_path: Path) -> None:
     assert marker.exists(), "the spawn must be recorded so the next tick sees the budget spent"
     ts, pid = marker.read_text().strip().split("\t")
     assert ts.isdigit(), f"the marker must carry the spawn ts, got {ts!r}"
-    for _ in range(100):  # the fake claude is detached — give it a beat to land its pid
-        if claude_pid.exists():
-            break
-        time.sleep(0.05)
-    assert claude_pid.read_text() == pid, "the marker must name the pid of the run it spawned"
+    assert _await_file(claude_pid) == pid, "the marker must name the pid of the run it spawned"
 
 
 def test_a_fresh_arm_clears_the_revive_budget(tmp_path: Path) -> None:
@@ -1623,34 +1633,79 @@ def test_a_fresh_arm_clears_the_revive_budget(tmp_path: Path) -> None:
     assert _spawn_count(counter) == 2, "a fresh arm must re-grant the revive budget"
 
 
-def test_intervene_revive_defers_while_a_live_drain_is_acting_on_this_issue(
+def test_the_revive_lane_survives_the_drains_give_up_label(tmp_path: Path) -> None:
+    # A watchdog revive must NOT be gated on _wd_last_action naming this issue. That record is the
+    # drain's LAST action, not its CURRENT one, and is never cleared mid-window — so the drain's own
+    # give-up label (_warn_parked_last stamps `warn-park #284` when its resume budget is spent)
+    # would read as "the drain is busy here" and disable this lane for the rest of the window, on
+    # precisely the abandoned spoke tier-2 exists to catch. Pinned so the defer cannot come back.
+    counter = tmp_path / "spawns"
+    last_action = tmp_path / "last-action"
+    last_action.write_text("warn-park #284\n")
+    env = _revive_counter_env(tmp_path, counter, AFK_LAST_ACTION=str(last_action))
+
+    _call("_wd_drain_state() { echo live; }; _wd_intervene_revive /the/wt 284", env=env)
+
+    assert _spawn_count(counter) == 1, (
+        "the drain having GIVEN UP on this spoke is the watchdog's cue to act, not to stand down"
+    )
+
+
+def test_a_relocated_ledger_still_leaves_the_budget_clearable(tmp_path: Path) -> None:
+    # HUB_WATCHDOG_LEDGER is a documented override. Minting the budget beside the ledger (as the
+    # wd-fire-dedup- FIRING markers do) would put it outside the only glob that clears it —
+    # _clear_progress_state globs _afk_state_dir alone — stranding it past every future arm and
+    # leaving the spoke permanently un-revivable. The budget must live where its clearer looks.
+    counter = tmp_path / "spawns"
+    far_ledger = tmp_path / "elsewhere" / "ledger.jsonl"
+    far_ledger.parent.mkdir()
+    env = _revive_counter_env(tmp_path, counter, HUB_WATCHDOG_LEDGER=str(far_ledger))
+
+    _call("_wd_intervene_revive /the/wt 284", env=env)
+    assert (tmp_path / "afk-state" / _REVIVE_BUDGET_MARKER).exists(), (
+        "the budget must be minted in the state dir its clearer globs, not beside the ledger"
+    )
+    _call("_clear_progress_state", env=env)
+    _call("_wd_intervene_revive /the/wt 284", env=env)
+
+    assert _spawn_count(counter) == 2, "a relocated ledger must not strand the budget past an arm"
+
+
+def test_intervene_revive_refuses_to_spawn_when_the_budget_cannot_be_recorded(
     tmp_path: Path,
 ) -> None:
-    # The drain's own recover_dead_panes revives crashed panes too. Racing it puts TWO claudes in
-    # one worktree — the "racing writes" half of the defect, which the once-per-window budget alone
-    # does not prevent (one watchdog spawn + one drain resume = two). _wd_land_in_flight covers only
-    # the mid-LAND race; this covers any live drain pass that names this issue.
+    # The record is the ONLY thing bounding this lane, so its failure directions are asymmetric: an
+    # unwritable state dir must cost one revive, never restore the every-tick spawn storm. Fail
+    # closed — the pre-#297 behaviour was to spawn regardless, which is the bug.
     counter = tmp_path / "spawns"
-    last_action = tmp_path / "last-action"
-    last_action.write_text("revive #284\n")
-    env = _revive_counter_env(tmp_path, counter, AFK_LAST_ACTION=str(last_action))
+    readonly = tmp_path / "readonly"
+    readonly.mkdir()
+    env = _revive_counter_env(tmp_path, counter, AFK_STATE_DIR=str(readonly / "state"))
+    readonly.chmod(0o555)
+    try:
+        _call("_wd_intervene_revive /the/wt 284", env=env)
+    finally:
+        readonly.chmod(0o755)
 
-    _call("_wd_drain_state() { echo live; }; _wd_intervene_revive /the/wt 284", env=env)
-
-    assert _spawn_count(counter) == 0, "never race the drain while it is working this same spoke"
+    assert _spawn_count(counter) == 0, "an unrecordable budget is an unbounded one — do not spawn"
 
 
-def test_intervene_revive_runs_when_the_live_drain_is_on_another_issue(tmp_path: Path) -> None:
-    # The complement, so the defer above cannot silently widen into "never revive while armed":
-    # a live drain busy elsewhere leaves this spoke abandoned, and the watchdog still owns it.
-    counter = tmp_path / "spawns"
-    last_action = tmp_path / "last-action"
-    last_action.write_text("answer #999\n")
-    env = _revive_counter_env(tmp_path, counter, AFK_LAST_ACTION=str(last_action))
+def test_intervene_revive_keeps_its_budget_when_the_worktree_is_gone(tmp_path: Path) -> None:
+    # The spawn is detached, so a vanished worktree is the one launch failure observable in time to
+    # keep the budget unspent. Burning it here would let a torn-down-then-restored path (or simply a
+    # wrong wt) consume the window's only revive on a run that never started.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "claude"
+    fake.write_text("#!/usr/bin/env bash\ntrue\n")
+    fake.chmod(0o755)
+    env = _dead_pane_env(tmp_path, PATH=f"{bindir}:{os.environ['PATH']}")
 
-    _call("_wd_drain_state() { echo live; }; _wd_intervene_revive /the/wt 284", env=env)
+    _call(f"_wd_intervene_revive '{tmp_path / 'no-such-worktree'}' 284", env=env)
 
-    assert _spawn_count(counter) == 1
+    assert not (tmp_path / "afk-state" / _REVIVE_BUDGET_MARKER).exists(), (
+        "a revive that could not even start must not spend the window's budget"
+    )
 
 
 # AC4 (#290): a dead-pane ledger line must carry the base it was MEASURED from, so a future false
