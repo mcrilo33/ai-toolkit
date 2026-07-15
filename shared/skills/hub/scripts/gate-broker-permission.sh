@@ -152,14 +152,16 @@ _reason_permission_record() {
   afk_emit_decision "$wt" warn
 }
 
-# _reason_permission <wt> <issue> <cmd> <classify_reason> -> the reasoner decides a permission
-# dialog the fixed rules would NOT auto-approve (#241 §2: the reasoner decides even irreversible
-# asks). It runs in run_answerer's read-only snapshot copy and answers 'ANSWER: APPROVE' or
-# 'ANSWER: DENY: <reversible path>'. APPROVE delivers Yes; DENY (or any unclear reply — the safe
-# default) declines the dialog and injects the reversible-path guidance. Either way the taken
-# decision is warned + journaled with its reversibility class, and the spoke is NEVER parked.
+# _reason_permission <wt> <issue> <cmd> <classify_reason> [park_sig] [tool_id] -> the reasoner
+# decides a permission dialog the fixed rules would NOT auto-approve (#241 §2: the reasoner decides
+# even irreversible asks). It runs in run_answerer's read-only snapshot copy and answers
+# 'ANSWER: APPROVE' or 'ANSWER: DENY: <reversible path>'. APPROVE delivers Yes; DENY (or any
+# unclear reply — the safe default) declines the dialog and injects the reversible-path guidance.
+# Either way the taken decision is warned + journaled with its reversibility class, and the spoke
+# is NEVER parked. park_sig/tool_id identify the park being decided (#294) and are the CALLER's,
+# captured before the minutes-long reason step: only the DELIVERED-approve branch records them.
 _reason_permission() {
-  local wt="$1" issue="$2" cmd="$3" why="$4" q raw rc ans text rev guidance
+  local wt="$1" issue="$2" cmd="$3" why="$4" sig="${5:-}" tid="${6:-}" q raw rc ans text rev guidance
   q="The spoke is parked on a PERMISSION dialog and wants to run this command:
 
 $cmd
@@ -205,6 +207,9 @@ path to tell the spoke>'."
       # is written after (#241 review).
       _broker_journal_line "$issue" permission "reasoner APPROVING (delivery pending): $cmd" "${rev:-unknown}"
       if approve_permission "$wt"; then
+        # #294: this exact park is served — the next tick must not re-approve it if the pane still
+        # shows the same dialog. Only on a CONFIRMED delivery: an unconfirmed one stays retryable.
+        note_permission_served "$wt" "$issue" "$sig" "$tid"
         _broker_journal_line "$issue" permission "reasoner APPROVED (delivered): $cmd" "${rev:-unknown}"
         _reason_permission_record "$wt" "$issue" "reasoner APPROVED (delivered): $cmd" "${rev:-unknown}"
       else
@@ -240,22 +245,30 @@ path to tell the spoke>'."
   esac
 }
 
-# _decide_permission <wt_path> <issue> -> classify the spoke's pending permission dialog and act.
-# AUTO-APPROVE a safe scoped self-op (mechanical fast path, unchanged, unwarned). Anything the
-# fixed rules will not auto-approve — an ESCALATE verdict or an unreadable command — no longer
+# _decide_permission <wt_path> <issue> [park_sig] -> classify the spoke's pending permission dialog
+# and act. AUTO-APPROVE a safe scoped self-op (mechanical fast path, unchanged, unwarned). Anything
+# the fixed rules will not auto-approve — an ESCALATE verdict or an unreadable command — no longer
 # parks the spoke: it routes to the always-answering reasoner (#241) which approves a safe
 # command or declines-and-redirects a risky one, warning + journaling the taken decision.
+#
+# park_sig is the caller's already-captured signature of the park being decided (#294); it keys the
+# served record a delivered APPROVE stamps. Self-derived when absent so a direct caller still works,
+# but broker_service_gate passes its own so the tick's single pane read stays single (#269).
 _decide_permission() {
-  local wt="$1" issue="$2" cmd cmd_display decision kind reason
+  local wt="$1" issue="$2" sig="${3:-}" cmd cmd_display decision kind reason tid
   cmd="$(extract_pending_command "$wt")"
   if [ -z "$cmd" ]; then
     # Unreadable command: cannot classify. Decline it (the reversible action) + warn — never
-    # park. The spoke gets a denial and keeps going; the backoff paces any retry.
+    # park. The spoke gets a denial and keeps going; the backoff paces any retry. Nothing is
+    # served here (a decline is not an approve), so this path needs no signature at all.
     stamp_answer_attempt "$issue"
     _deny_permission "$wt" "Declined an unreadable permission command — re-issue it in a clearer form." || true
     broker_warn_continue "$wt" "$issue" permission "declined an unreadable permission command" reversible
     return 0
   fi
+  # Self-derived only for a direct caller (broker_service_gate passes its own): after the unreadable
+  # early return, so the decline path never pays _broker_park_signature's pane read (#269).
+  [ -n "$sig" ] || sig="$(_broker_park_signature "$wt" "$issue")"
   # #257: classify the WHOLE command (uncapped) so a risky tail past 2000 chars can't hide behind
   # a benign prefix. The 2000-char cap is DISPLAY-only now, applied to a copy used solely for the
   # log/codify surfaces HERE (log_decision's signature + the drain log line) — kept byte-identical
@@ -272,11 +285,19 @@ _decide_permission() {
   # -q` APPROVE vs `git reset --hard` ESCALATE, which share the signature git-reset+git-add)
   # correctly read as a CONFLICT, so codify never proposes it as a safe unanimous rule (#155 D).
   log_decision "$issue" permission "$cmd_display" "$kind"
+  # The id of the tool_use this dialog gates, read BEFORE any delivery (#294): it is what the
+  # served record keys on, and after the keypress the trailing unresolved tool_use can already be
+  # a different one. Empty in the #269 unflushed-dialog window → nothing is recorded and the lane
+  # keeps its pre-#294 behavior.
+  tid="$(extract_pending_tool_id "$wt")"
   if [ "$kind" = "APPROVE" ]; then
     log "→ auto-approving safe permission for #$issue: $cmd_display"
     # Stamp the delivery attempt FIRST: the approve→resume window must not read as idle.
     stamp_answer_attempt "$issue"
     if approve_permission "$wt"; then
+      # #294: record the park we just served so the next tick does not re-approve the same dialog.
+      # Only a CONFIRMED delivery is served — the failure path below stays retryable.
+      note_permission_served "$wt" "$issue" "$sig" "$tid"
       log "  approved permission for #$issue"
       afk_emit_decision "$wt" success
       return 0
@@ -288,7 +309,7 @@ _decide_permission() {
   # ESCALATE: the fixed rules will not auto-approve this one. The reasoner decides it (#241) —
   # approve a safe/reversible command, or decline an irreversible one and name the reversible
   # path — and warns + journals the taken decision. Never park.
-  _reason_permission "$wt" "$issue" "$cmd" "$reason"
+  _reason_permission "$wt" "$issue" "$cmd" "$reason" "$sig" "$tid"
 }
 
 # --- programmatic PreToolUse permission decision (issue #253) ------------------
