@@ -2305,16 +2305,111 @@ def test_run_conditions_fires_park_and_invokes_answer_seam(tmp_path: Path) -> No
 # #251 autonomy score for the reasoner doing its job correctly. The authoritative signal is the tag
 # itself, which the dispatcher already trusts 150 lines earlier (_wd_detect_mergeable_skipped's
 # `_wd_tag_at_tip "$wt" blocked`); _wd_classify simply never got the wt to check it with.
+def _blocked_tag(wt: Path, issue: str = "5") -> None:
+    """Tag blocked/<issue> at the tip the way production does — ANNOTATED (spoke-ready's `-a`).
+
+    Lightweight tags resolve straight to the commit, so they cannot catch a `_wd_tag_at_tip` that
+    forgets its `^{commit}` peel; an annotated tag resolves to the TAG OBJECT and would never equal
+    HEAD. The fixture has to be the real shape or the peel is unpinned.
+    """
+    subprocess.run(
+        ["git", "tag", "-f", "-a", f"blocked/{issue}", "-m", "needs a human"],
+        cwd=wt,
+        check=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
+
+
+def _blocked_tag_epoch(wt: Path, issue: str = "5") -> int:
+    """The blocked tag's own creation epoch — the clock _wd_escalation_is_live compares against."""
+    return int(
+        subprocess.run(
+            ["git", "for-each-ref", "--format=%(creatordate:unix)", f"refs/tags/blocked/{issue}"],
+            cwd=wt,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    )
+
+
 def test_classify_reads_the_blocked_tag_at_tip_as_a_novel_decision(tmp_path: Path) -> None:
     # The common escalation: spoke-ready pushed blocked/5 successfully, so NO durable record exists.
     wt = _git_repo(tmp_path)
-    subprocess.run(["git", "tag", "blocked/5"], cwd=wt, check=True, capture_output=True)
+    _blocked_tag(wt)
     env = {"AFK_STATE_DIR": str(tmp_path / "state")}  # no blocked-5.txt — the push succeeded
 
     out = _call(f"_wd_classify park-unanswered 5 '{wt}'", env=env).stdout.strip()
 
     assert out == "novel-decision", (
         "a deliberately escalated park is a human call, not an afk defect to file a bug against"
+    )
+
+
+def test_classify_files_a_defect_for_a_park_that_began_after_the_escalation(
+    tmp_path: Path,
+) -> None:
+    # A blocked tag is only ever cleared by a later COMMIT — a human answering clears nothing, the
+    # spoke resuming clears nothing. So a spoke that escalates, gets answered, resumes and re-parks
+    # on a NEW question (all before its first commit — the common shape, since escalations usually
+    # precede any RED/GREEN) carries its old tag at the tip. Reading that as "a human call" would
+    # exempt the spoke from defect filing for the rest of the window and flatter the autonomy score
+    # — the dangerous direction, since the score exists to be honest about afk's shortfalls.
+    # The park ONSET names the episode actually pending: newer than the tag ⇒ a different question.
+    wt = _git_repo(tmp_path)
+    _blocked_tag(wt)
+    state = tmp_path / "state"
+    state.mkdir()
+    # Relative to the tag's OWN epoch, not the suite's fake NOW: git stamps the tag with the real
+    # wall clock, so a fixed constant would land on whichever side of it the calendar happens to put.
+    (state / "park-onset-5.epoch").write_text(f"{_blocked_tag_epoch(wt) + 500}\n")
+    env = {"AFK_STATE_DIR": str(state)}
+
+    out = _call(f"_wd_classify park-unanswered 5 '{wt}'", env=env).stdout.strip()
+
+    assert out == "afk-defect", (
+        "a park that began AFTER the escalation is a new question — its non-answer is a real defect"
+    )
+
+
+def test_classify_keeps_novel_decision_for_the_escalations_own_episode(tmp_path: Path) -> None:
+    # The complement, so the episode bound cannot widen into "never novel-decision": the escalation
+    # is raised DURING the episode it belongs to, so that onset precedes the tag.
+    wt = _git_repo(tmp_path)
+    _blocked_tag(wt)
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "park-onset-5.epoch").write_text(f"{_blocked_tag_epoch(wt) - 500}\n")
+    env = {"AFK_STATE_DIR": str(state)}
+
+    out = _call(f"_wd_classify park-unanswered 5 '{wt}'", env=env).stdout.strip()
+
+    assert out == "novel-decision"
+
+
+def test_classify_park_undeliverable_still_files_despite_a_blocked_tag(tmp_path: Path) -> None:
+    # The blocked tag is emitted BY a delivery failure (gate-broker's _escalate_blocked when the
+    # inject cannot be verified), so reading it as a human call here would silence exactly the
+    # defect class #288 AC3 added park-undeliverable to surface. The drain being unable to deliver
+    # an answer is afk's shortfall, not a novel decision — it must keep filing.
+    wt = _git_repo(tmp_path)
+    _blocked_tag(wt)
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "blocked-5.txt").write_text("1784066007\tcould not inject\n")  # same writer, same lane
+    env = {"AFK_STATE_DIR": str(state)}
+
+    out = _call(f"_wd_classify park-undeliverable 5 '{wt}'", env=env).stdout.strip()
+
+    assert out == "afk-defect", (
+        "the escalation IS the delivery failure — it must not excuse afk from the defect"
     )
 
 
@@ -2337,7 +2432,7 @@ def test_classify_is_an_afk_defect_when_the_blocked_tag_is_behind_the_tip(tmp_pa
     # _wd_blocked_stale exists for) — live state wins, so this is not a live escalation and the
     # firing is a real afk defect. Pins that the fix uses tag-AT-TIP, not merely tag-exists.
     wt = _git_repo(tmp_path)
-    subprocess.run(["git", "tag", "blocked/5"], cwd=wt, check=True, capture_output=True)
+    _blocked_tag(wt)
     subprocess.run(
         ["git", "commit", "-q", "--allow-empty", "-m", "c2"],
         cwd=wt,
@@ -2362,7 +2457,7 @@ def test_fire_threads_the_worktree_into_classify(tmp_path: Path) -> None:
     # The plumbing: _wd_fire is where the class is decided, so it must carry the wt through or the
     # tag can never be read at the only place it matters — the real firing path.
     wt = _git_repo(tmp_path)
-    subprocess.run(["git", "tag", "blocked/5"], cwd=wt, check=True, capture_output=True)
+    _blocked_tag(wt)
     ledger = tmp_path / "l.jsonl"
     env = {
         "HUB_WATCHDOG_LEDGER": str(ledger),
@@ -2393,7 +2488,7 @@ def test_run_conditions_does_not_file_a_defect_for_a_deliberate_escalation(tmp_p
     # the ledger as novel-decision and dispatch NO bug-scoper. This is the defect's real cost — a
     # bogus auto-filed issue against afk every time the reasoner correctly escalates.
     wt = _git_repo(tmp_path)
-    subprocess.run(["git", "tag", "blocked/5"], cwd=wt, check=True, capture_output=True)
+    _blocked_tag(wt)
     ledger = tmp_path / "l.jsonl"
     scoped = tmp_path / "scoped"
     env = _dead_pane_env(

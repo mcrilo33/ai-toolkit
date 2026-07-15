@@ -982,6 +982,41 @@ _wd_json_escape() {
 # HUB_WATCHDOG_CLASSIFY_CMD seam overrides the whole decision (echo the class).
 : "${HUB_WATCHDOG_AFK_DEFECT_LABEL:=afk-defect}"
 
+# _wd_blocked_tag_epoch <wt> <issue> -> when blocked/<issue> was raised, or empty. `creatordate`
+# reads the tagger date of an ANNOTATED tag (what spoke-ready.sh actually emits: `git tag -f -a`)
+# and falls back to the commit date for a lightweight one, so both shapes answer.
+_wd_blocked_tag_epoch() {
+  local wt="$1" issue="$2" ts
+  ts="$(git -C "$wt" for-each-ref --format='%(creatordate:unix)' "refs/tags/blocked/${issue}" 2>/dev/null)"
+  case "$ts" in '' | *[!0-9]*) return 0 ;; esac
+  printf '%s\n' "$ts"
+}
+
+# _wd_escalation_is_live <wt> <issue> -> true when the blocked/<issue> tag at the tip belongs to the
+# park episode CURRENTLY pending, rather than an older, already-answered one.
+# Why this is not just "the tag is at the tip": a blocked tag is only ever cleared by a later COMMIT
+# (both _clear_stale_blocked_marker and _wd_intervene_reconcile gate on the tag being a STRICT
+# ancestor of the tip). A human answering clears nothing; the spoke resuming clears nothing. So a
+# spoke that escalates, gets answered, resumes and re-parks on a NEW question — all before its first
+# commit, the common shape, since escalations usually precede any RED/GREEN — would carry its old
+# tag at the tip forever and have EVERY later park classified novel-decision. That silences real
+# drain defects and inflates the #251 autonomy score: the dangerous direction, since the score's
+# whole purpose is to be honest about afk's shortfalls.
+# The park onset names the episode actually pending (stamp-once, re-stamped when the park's context
+# changes — #283). An onset strictly NEWER than the tag means the pending park began after the
+# escalation, so this is a different question and its non-answer is a real defect. Unmeasurable
+# either side ⇒ trust the tag (the historic reading); ties ⇒ live, since the escalation is stamped
+# during the episode it belongs to.
+_wd_escalation_is_live() {
+  local wt="$1" issue="$2" tag_ts onset
+  tag_ts="$(_wd_blocked_tag_epoch "$wt" "$issue")"
+  case "$tag_ts" in '' | *[!0-9]*) return 0 ;; esac
+  onset="$(read_park_onset_epoch "$issue" 2>/dev/null)"
+  case "$onset" in '' | *[!0-9]*) return 0 ;; esac
+  [ "$onset" -gt "$tag_ts" ] && return 1
+  return 0
+}
+
 # _wd_classify <condition> <issue> [wt] -> the firing's class. <wt> is optional: supervisor-dead
 # has no worktree, and a direct caller may omit it (the tag check is then simply skipped).
 _wd_classify() {
@@ -990,7 +1025,7 @@ _wd_classify() {
     bash -c "$HUB_WATCHDOG_CLASSIFY_CMD" hub-watchdog "$condition" "$issue" "$wt" 2>/dev/null; return
   fi
   case "$condition" in
-    park-unanswered | park-undeliverable)
+    park-unanswered)
       # A deliberate escalation is a real human call, not an afk bug. TWO signals say so, and only
       # the second was checked before (#297): the blocked/<issue> TAG at the spoke's tip — what
       # spoke-ready actually emits, and the signal the dispatcher already trusts in
@@ -998,9 +1033,18 @@ _wd_classify() {
       # writes ONLY when that tag's push FAILS (the #109 fallback). Reading the record alone meant
       # the COMMON case (the push succeeded, so no file exists) was misfiled as an afk-defect: a
       # bogus auto-filed bug against afk, and the #251 autonomy score docked for the reasoner
-      # behaving correctly. AT-TIP, not merely present: a blocked/ tag the spoke has since committed
-      # past is stale (the #103 coexistence), and live state wins — that firing IS a real defect.
-      if [ -n "$wt" ] && _wd_tag_at_tip "$wt" blocked "$issue"; then
+      # behaving correctly.
+      # Two bounds keep this from over-silencing, both in the direction that MATTERS (a wrong
+      # novel-decision hides a real defect and flatters the autonomy score):
+      #   * AT-TIP, not merely present — a tag the spoke has committed past is stale (#103), and
+      #     live state wins, so that firing IS a real defect;
+      #   * and the escalation must still be the LIVE one (see _wd_escalation_is_live).
+      # NOT applied to park-undeliverable: that tag is emitted BY a delivery failure (gate-broker's
+      # _escalate_blocked when the inject cannot be verified), so reading it as "a human call" would
+      # silence exactly the defect class #288 AC3 added that condition to surface — the drain
+      # failing to deliver an answer is afk's shortfall, not a novel human decision, and it must
+      # keep filing. The durable record is skipped there for the identical reason: same writer.
+      if [ -n "$wt" ] && _wd_tag_at_tip "$wt" blocked "$issue" && _wd_escalation_is_live "$wt" "$issue"; then
         printf 'novel-decision\n'; return
       fi
       if command -v _afk_blocked_record >/dev/null 2>&1 && [ -f "$(_afk_blocked_record "$issue" 2>/dev/null)" ]; then
