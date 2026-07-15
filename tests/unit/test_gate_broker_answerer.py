@@ -1668,6 +1668,58 @@ def test_default_answerer_policy_binds_to_rule_file() -> None:
             assert cls in low, f"{name} must name the {cls} risk class for WARN"
 
 
+def test_ship_discipline_carve_out_binds_to_rule_file() -> None:
+    """#281 head (a): both answerer-policy surfaces carve a spoke's own ship step out of the
+    outward-facing / irreversible postures, in lockstep.
+
+    Without it the "Outward-facing — publishing, sending, deploying … prefer the local/dry-run
+    form" clause reads a spoke's OWN feature-branch push as outward, and the reasoner answers
+    "keep it local / do not push / delete the branch" — the precise inverse of the ship contract
+    every spoke is dispatched with (it drove #271 off-policy four times).
+    """
+    policy = _call("_default_answerer_policy").stdout
+    rule = RULE_FILE.read_text()
+
+    for surface, name in ((policy, "fallback policy"), (rule, "rule file")):
+        low = surface.lower()
+        # The two in-contract ship actions must be named, or the carve-out cannot be applied
+        # to the action the spoke is actually parked on.
+        assert "feature branch" in low, f"{name} must name the spoke's own feature-branch push"
+        assert "ready marker" in low, f"{name} must name the spoke's ready marker"
+        # Both surfaces name the forbidden answer VERBATIM: the reasoner has to recognize the
+        # exact shape it produced in #271, not infer it from a principle.
+        assert "keep it local" in low, f"{name} must forbid the 'keep it local' answer verbatim"
+        # The carve-out must stay bounded — a push to the DEFAULT branch is still the real
+        # irreversible ask. A carve-out that dropped this would license any push at all.
+        assert "default branch" in low, f"{name} must still except a default-branch push"
+
+
+def test_answerer_prompt_carries_the_ship_contract(tmp_path: Path) -> None:
+    """#281 task 2: the ship contract reaches the reasoner as a STATIC prompt line.
+
+    It lives only in the spoke's seed (hub-afk.sh kickoff_for), which build_answerer_prompt
+    deliberately excludes — replaying the seed is what made the answerer redo the task in #124.
+    So the contract is re-stated as a fixed literal here: the reasoner learns push + ready is
+    mandatory without the seed ever being replayed.
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "gh").write_text('#!/usr/bin/env bash\necho "T\\n\\nbody"\n')
+    (fake_bin / "gh").chmod(0o755)
+
+    result = _call(
+        "build_answerer_prompt 5 'Should I push my feature branch and emit the ready marker?'",
+        env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    low = result.stdout.lower()
+    assert "ship discipline" in low, "the prompt must carry a ship-discipline section"
+    assert "feature branch" in low, "the prompt must name the spoke's own feature-branch push"
+    assert "ready marker" in low, "the prompt must name the spoke's ready marker"
+    assert "keep it local" in low, "the prompt must forbid the 'keep it local' answer verbatim"
+
+
 def test_answerer_prompt_instructs_answer_only(tmp_path: Path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -1681,6 +1733,69 @@ def test_answerer_prompt_instructs_answer_only(tmp_path: Path) -> None:
 
     assert "ANSWER:" in out, "the prompt must instruct the reasoner to end with ANSWER:"
     assert "ESCALATE:" not in out, "the always-answer prompt must not offer an ESCALATE output"
+
+
+def test_push_and_ready_park_is_answered_with_the_ship_contract_in_context(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    """#281 acceptance, scenario: a "should I push my feature branch + emit ready?" park.
+
+    WHAT THIS DOES NOT ASSERT, on purpose: that the reasoner *decides* to approve the push.
+    Every test in this suite stubs AFK_ANSWERER_CMD — there is no live-reasoner lane — so no
+    hermetic test can prove an LLM's judgment. Over-claiming that would make a stub's canned
+    reply read as evidence about the model.
+
+    What it does own, end to end through the real broker_service_gate path: the ship-discipline
+    carve-out is in the prompt actually handed to the reasoner for THIS park (captured off the
+    reasoner's stdin, not re-derived), and an approving ANSWER: flows through delivery to a
+    taken, journaled answer. That the carve-out drives the decision is pinned by the
+    rule/policy lockstep in test_ship_discipline_carve_out_binds_to_rule_file.
+    """
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    fake_bin = tmp_path / "bin"
+    pd = _project_dir_for(Path(waiting_spoke_env["CLAUDE_PROJECTS_DIR"]), spoke_repo)
+    jsonl = pd / "session.jsonl"
+    # Re-park the spoke on the #271 question: it had already pushed and asked what to do.
+    jsonl.write_text(
+        json.dumps(
+            _ask_record(
+                "I pushed my feature branch for this subtask. Should I keep that push and "
+                "emit the ready marker, or is the push in error?",
+                [("Keep the push", "ship it"), ("Keep it local", "undo the push")],
+            )
+        )
+        + "\n"
+    )
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # stale, so the inject's append advances it
+    _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
+    prompt_file = tmp_path / "reasoner-prompt.txt"
+    answer = "Approved — the push is correct; emit the ready marker."
+    env = {
+        **waiting_spoke_env,
+        # The stub captures the prompt off stdin (exactly what a real reasoner reads), then
+        # answers in contract. Capturing beats rebuilding the prompt: a build_answerer_prompt
+        # that stopped being CALLED here would still pass a re-derived assertion.
+        "AFK_ANSWERER_CMD": (
+            f"cat > '{prompt_file}'; printf 'REVERSIBILITY: reversible\\nANSWER: {answer}'"
+        ),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    prompt = prompt_file.read_text().lower()
+    assert "ship discipline" in prompt, "the reasoner was handed no ship-discipline section"
+    assert "ready marker" in prompt, "the reasoner's context never names the ready marker"
+    assert "keep it local" in prompt, "the reasoner was not told to refuse 'keep it local'"
+    # The approving answer reached the spoke and was recorded as taken.
+    assert "injected answer into #5" in result.stderr, result.stderr
+    journal = (statedir / "decision-journal.jsonl").read_text()
+    assert "injected answer" in journal, journal
 
 
 def test_parse_decision_field_extracts_reversibility_and_warn() -> None:
