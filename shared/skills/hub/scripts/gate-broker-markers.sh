@@ -260,12 +260,14 @@ _afk_refresh_offline_clocks() {
 # (#203) would strand a spoke at a ceiling reached in a prior window; a leftover gate-voided /
 # terminal-logged marker (#237) would keep a since-resolved gate terminal across windows; a
 # leftover warned-retry backoff (#241) would inherit a prior window's grown cadence and skip
-# the clean first-exhaustion re-service.
+# the clean first-exhaustion re-service; a leftover served record (#294) would skip the first
+# serve of a park whose approve was delivered in a window that is already over.
 _clear_progress_state() {
   local dir; dir="$(_afk_state_dir)"
   rm -f "$dir"/progress-*.epoch "$dir"/answer-attempt-*.epoch "$dir"/done-*.epoch "$dir"/tip-* \
     "$dir"/park-onset-*.epoch "$dir"/park-sig-* \
-    "$dir"/reanswer-* "$dir"/answer-drop-* "$dir"/gate-voided-* "$dir"/terminal-logged-* \
+    "$dir"/reanswer-* "$dir"/answer-drop-* "$dir"/served-* "$dir"/gate-voided-* \
+    "$dir"/terminal-logged-* \
     "$dir"/wd-fire-dedup-* \
     "$dir"/offline-since.epoch 2>/dev/null || true   # #249: drop a stale outage marker too
   # #263: the watchdog's firing-dedup markers are per-window too — a leftover would suppress a
@@ -394,6 +396,96 @@ read_answer_drop() {
 }
 
 clear_answer_drop() { rm -f "$(_answer_drop_state_file "$1")" 2>/dev/null || true; }
+
+# --- served permission parks (issue #294) -------------------------------------
+# served-<issue> — the permission lane's record that an APPROVE was already DELIVERED for one
+# specific park: "<tip>\t<sig>\t<tool_use_id>\t<epoch>". _decide_permission's APPROVE branches
+# called approve_permission and recorded nothing, so an UNCHANGED pending dialog — a pane that has
+# not redrawn, or an approved `nohup ... &` whose gate keeps the gated tool_use unresolved — was
+# re-dispatched on the next tick: _broker_reanswer_exhausted computed the SAME (tip, sig), found
+# the counter still under the ceiling, and the identical command was approved a SECOND time
+# (exactly one duplicate at the default ceiling of 2 — the #135/#188 concurrent-gate shape).
+#
+# Deliberately NOT folded into reanswer-<issue>: that counter's exhausted branch warns, journals,
+# and calls _afk_warned_arm, so paying for a routine auto-approve with it would arm the
+# warned-retry backoff on every healthy approve — pacing the whole service lane for that spoke
+# (hub-afk.sh's _afk_warned_due gate) and mislabelling a success as a ceiling failure. The two
+# records answer different questions: the ceiling asks "have we tried enough?", this asks "did we
+# already succeed?".
+#
+# THE KEY IS (tip, sig, tool_use_id), one field wider than the family's usual (tip, sig). The
+# extra field is load-bearing, not symmetry: a repeatable safe command re-issued VERBATIM at the
+# same tip (a failed push retried) has an identical (tip, sig) but is a genuinely NEW dialog, and
+# the tip cannot advance while the spoke is parked — so a (tip, sig)-only marker would refuse to
+# serve it forever, stranding the spoke until the watchdog escalated it to a human. The gated
+# tool_use's id is unique per call, so it separates the two cases exactly. A tip advance or a
+# changed signature invalidates the record by key, the same convention reanswer-<issue> and
+# answer-drop-<issue> use (they are not explicitly rm'd on progress either — only NON-keyed
+# records like the warned state are). Per-window, so _clear_progress_state drops it on a fresh arm.
+_permission_served_file() { printf '%s\n' "$(_afk_state_dir)/served-$1"; }
+
+# note_permission_served <wt> <issue> <sig> <tool_id> -> record that <tool_id>'s dialog was
+# approved at this (tip, sig). <sig> and <tool_id> are the caller's ALREADY-CAPTURED values from
+# BEFORE the delivery — never re-derived here (the #288 note_answer_drop lesson: a re-derived sig
+# attributes the record to whichever park is live at call time, which after a delivery can be a
+# DIFFERENT one). Records NOTHING without both: an unsubstantiable park is never claimed
+# (note_park_episode's posture), and the lane falls back to its pre-#294 behavior.
+note_permission_served() {
+  local wt="$1" issue="$2" sig="$3" tid="$4" tip f
+  [ -n "$sig" ] && [ -n "$tid" ] || return 0
+  tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"
+  f="$(_permission_served_file "$issue")"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  printf '%s\t%s\t%s\t%s\n' "$tip" "$sig" "$tid" "$(afk_now)" > "$f" 2>/dev/null || true
+  return 0
+}
+
+# _broker_permission_served <wt> <issue> <sig> -> rc 0 when the LIVE park is the very one an
+# approve was already delivered for: the record's tip, signature, AND pending tool_use id all match
+# what is pending right now. Takes <sig> as a parameter for the same reason note_answer_drop does —
+# the caller (broker_service_gate) has already captured it from the tick's single pane read (#269).
+# An empty live id (the #269 unflushed-dialog window) never matches: fail OPEN, never suppress a
+# serve on an unprovable match.
+_broker_permission_served() {
+  local wt="$1" issue="$2" sig="$3" f tip tid rec_tip rec_sig rec_tid
+  [ -n "$sig" ] || return 1
+  f="$(_permission_served_file "$issue")"
+  [ -f "$f" ] || return 1
+  IFS=$'\t' read -r rec_tip rec_sig rec_tid _ < "$f" 2>/dev/null || return 1
+  [ -n "$rec_tid" ] || return 1
+  tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"
+  [ "$rec_tip" = "$tip" ] && [ "$rec_sig" = "$sig" ] || return 1
+  tid="$(extract_pending_tool_id "$wt")"
+  [ -n "$tid" ] && [ "$tid" = "$rec_tid" ]
+}
+
+# _broker_served_skip_due <issue> [now] -> rc 0 when a served park is due for ONE supervised
+# re-serve (never served, or the skip window has elapsed), rc 1 while the window still holds.
+# Mirrors _afk_warned_due's shape and its never-armed-means-due default.
+#
+# The skip MUST NOT be terminal: approve_permission verifies only that the transcript mtime
+# advanced, NOT that the dialog was consumed, so an approve whose keypress never landed leaves the
+# identical (tip, sig, id) pending — and a permanent skip would never retry it, the same unbounded
+# strand the tool_use id exists to avoid. The window is paced on the served record's own epoch
+# rather than the shared warned-retry backoff precisely so a healthy auto-approve never arms that
+# backoff. AFK_SERVED_SKIP_SECONDS (default 60) sits between the two cadences that matter: well
+# above the event-driven wake burst (#176) that re-services a spoke seconds apart while the pane
+# has not redrawn — the duplicate this closes — and well below the AFK_TICK_SECONDS backstop (300),
+# so a dialog still pending on the next backstop tick reads as a genuinely undelivered approve and
+# is re-served. From there the re-answer ceiling and the #241 curve bound a standing failure.
+_broker_served_skip_due() {
+  local issue="$1" now="${2:-$(afk_now)}" f window stamped
+  f="$(_permission_served_file "$issue")"
+  [ -f "$f" ] || return 0
+  IFS=$'\t' read -r _ _ _ stamped < "$f" 2>/dev/null || return 0
+  case "$stamped" in '' | *[!0-9]*) return 0 ;; esac
+  case "$now" in '' | *[!0-9]*) return 0 ;; esac
+  window="${AFK_SERVED_SKIP_SECONDS:-60}"
+  case "$window" in '' | *[!0-9]*) window=60 ;; esac
+  [ "$now" -ge "$(( stamped + window ))" ]
+}
+
+clear_permission_served() { rm -f "$(_permission_served_file "$1")" 2>/dev/null || true; }
 
 # --- terminal gate markers (issue #237) ---------------------------------------
 # A reasoner mutation-void is terminal on the FIRST occurrence: the reasoner wrote the

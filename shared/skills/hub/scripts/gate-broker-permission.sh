@@ -15,19 +15,18 @@ set -uo pipefail
 # decision. _decide_permission is reached from decide_and_act, which routes a
 # permission-pending spoke here instead of to the answerer.
 
-# extract_pending_command <wt_path> -> the command of the spoke's trailing UNRESOLVED
-# assistant tool_use — the one a permission dialog is gating (Bash -> its command string;
-# Read -> "Read <file_path>"; any other tool -> the tool name, so the classifier escalates
-# non-Bash tools like browser/computer/mcp). A tool_use is UNRESOLVED when no later
-# tool_result carries its id; the PRIOR calls a parked spoke already completed are resolved
-# and MUST be skipped (#240: returning the last resolved tool surfaced a phantom "Write" and
-# escalated a spoke that needed no human). Empty when nothing is unresolved -> the caller
-# escalates honestly ("unreadable command"), never on a stale resolved tool name.
-extract_pending_command() {
+# _extract_pending_tool_field <wt_path> <field> -> one field of the spoke's trailing UNRESOLVED
+# assistant tool_use — the one a permission dialog is gating. field is `command` or `id`.
+#
+# ONE walk definition for both fields (#294): the id names the exact tool_use the command was read
+# from, so a second, separately-written walk could drift and let the served-park marker key an id
+# onto a DIFFERENT block's command — the marker would then suppress the wrong dialog. Both wrappers
+# below share this pass; neither re-implements the resolution rules.
+_extract_pending_tool_field() {
   local jsonl; jsonl="$(_spoke_jsonl "$1")"
   [ -n "$jsonl" ] || return 0
   command -v python3 >/dev/null 2>&1 || return 0
-  _AFK_JSONL="$jsonl" python3 2>/dev/null <<'PYEOF'
+  _AFK_JSONL="$jsonl" _AFK_FIELD="${2:-command}" python3 2>/dev/null <<'PYEOF'
 import json, os
 
 # Two passes over the transcript: first collect every tool_result's tool_use_id (a
@@ -64,6 +63,7 @@ except Exception:
     tool_uses = []
 
 cmd = ""
+pending_id = ""
 for tid, name, inp in reversed(tool_uses):
     if tid in resolved:       # a completed call the spoke already ran — never the pending one
         continue
@@ -78,6 +78,8 @@ for tid, name, inp in reversed(tool_uses):
         cmd = f"{name} {fp}" if fp else name
     elif name:
         cmd = name
+    # The id of THIS block -- the one cmd was just read from, never a neighbour's (#294).
+    pending_id = (tid or "").strip()
     break                     # the trailing unresolved tool_use is the pending command
 # NB: NOT truncated since #257 -- this command feeds the default-deny classify_permission and the
 # _reason_permission prompt in the pane path. Truncating a benign prefix off a risky tail could
@@ -86,9 +88,28 @@ for tid, name, inp in reversed(tool_uses):
 # not here. The other consumers tolerate the full command: _permission_pending tests non-emptiness
 # and _broker_park_signature hashes the basis.
 # Plain ASCII, no backticks/parens: bash 3.2 mis-parses those inside a heredoc.
-print(cmd.strip())
+print(pending_id if os.environ.get("_AFK_FIELD") == "id" else cmd.strip())
 PYEOF
 }
+
+# extract_pending_command <wt_path> -> the command of the spoke's trailing UNRESOLVED
+# assistant tool_use — the one a permission dialog is gating (Bash -> its command string;
+# Read -> "Read <file_path>"; any other tool -> the tool name, so the classifier escalates
+# non-Bash tools like browser/computer/mcp). A tool_use is UNRESOLVED when no later
+# tool_result carries its id; the PRIOR calls a parked spoke already completed are resolved
+# and MUST be skipped (#240: returning the last resolved tool surfaced a phantom "Write" and
+# escalated a spoke that needed no human). Empty when nothing is unresolved -> the caller
+# escalates honestly ("unreadable command"), never on a stale resolved tool name.
+extract_pending_command() { _extract_pending_tool_field "$1" command; }
+
+# extract_pending_tool_id <wt_path> -> the tool_use ID of that same pending block (#294): the
+# API-assigned, per-call-unique id of the tool the dialog is gating. It is what separates "the
+# same dialog is STILL on screen" (same id -> an approve already delivered for it must not be
+# delivered twice) from "the spoke re-asked the IDENTICAL command" (a new id at the same tip and
+# signature -> a genuinely new dialog that must still be served). Empty when the gated tool_use is
+# not flushed yet (the #269 dialog-pending window) -> the served marker records nothing and the
+# lane fails OPEN to its pre-#294 behavior.
+extract_pending_tool_id() { _extract_pending_tool_field "$1" id; }
 
 # _permission_pending <wt_path> -> true when the spoke is parked on a permission dialog. #269
 # (#254 option b): DETECTION is decoupled from EXTRACTION. A shown pane dialog IS a park even
