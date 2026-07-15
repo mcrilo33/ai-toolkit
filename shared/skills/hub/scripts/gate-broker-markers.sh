@@ -285,7 +285,9 @@ _clear_progress_state() {
 
 # _broker_park_signature <wt> <issue> -> a stable hash of WHATEVER prompt the spoke is
 # parked on (a permission command, a PLAN-gate plan, or an AskUserQuestion), or empty when
-# nothing is extractable. Empty ⇒ the ceiling never engages (fail-open to answering).
+# nothing is extractable. Empty ⇒ the ceiling never engages (fail-open to answering), so the
+# hash MUST be the portable one: a bare `shasum` is absent on a slim Linux image and would
+# empty the signature on every park there, silently lifting the #203/#269 ceiling (#298).
 _broker_park_signature() {
   local wt="$1" issue="$2" basis=""
   if _permission_pending "$wt"; then
@@ -302,7 +304,7 @@ _broker_park_signature() {
     basis="q:$(extract_pending_question "$wt")"
   fi
   case "$basis" in perm: | gate: | q:) return 0 ;; esac    # nothing extractable
-  printf '%s' "$basis" | shasum -a 256 2>/dev/null | awk '{print $1}'
+  printf '%s' "$basis" | wt_sha256_stdin
 }
 
 # _reanswer_state_file <issue> -> the per-issue counter file: "<tip>\t<sig>\t<count>".
