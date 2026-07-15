@@ -8439,7 +8439,12 @@ def test_capture_hang_forensics_includes_process_tree_and_sample(tmp_path: Path)
 
 _GNU_STAT_STUB = (
     "#!/bin/sh\n"
-    'if [ "$1" = "-c" ] && [ "$2" = "%Y" ]; then echo 1000003500; exit 0; fi\n'
+    'if [ "$1" = "-c" ]; then\n'
+    '  case "$2" in\n'
+    "    %Y) echo 1000003500; exit 0 ;;\n"
+    "    %s) echo 4096; exit 0 ;;\n"
+    "  esac\n"
+    "fi\n"
     'if [ "$1" = "-f" ]; then\n'
     '  echo "  File: \\"$3\\""\n'
     '  echo "    ID: b505c8e079f9471 Namelen: 255     Type: ext2/ext3"\n'
@@ -8453,7 +8458,12 @@ _GNU_STAT_STUB = (
 _BSD_STAT_STUB = (
     "#!/bin/sh\n"
     'if [ "$1" = "-c" ]; then echo "stat: illegal option -- c" >&2; exit 1; fi\n'
-    'if [ "$1" = "-f" ] && [ "$2" = "%m" ]; then echo 1000003500; exit 0; fi\n'
+    'if [ "$1" = "-f" ]; then\n'
+    '  case "$2" in\n'
+    "    %m) echo 1000003500; exit 0 ;;\n"
+    "    %z) echo 4096; exit 0 ;;\n"
+    "  esac\n"
+    "fi\n"
     "exit 1\n"
 )
 

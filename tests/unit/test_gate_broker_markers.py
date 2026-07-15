@@ -5,6 +5,7 @@ See shared/skills/hub/scripts/gate-broker-markers.sh.
 
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -910,24 +911,30 @@ def test_refresh_offline_clocks_stamps_progress_and_answer_attempt(tmp_path: Pat
 # sha256sum) exists for exactly this and is in scope here: gate-broker.sh sources
 # worktree-lib.sh before it sources this module.
 #
-# The stub exits WITHOUT reading stdin, mirroring a genuinely missing binary — bash's own
-# command-not-found leaves the piped bytes for the `||` fallback to consume, and a stub
-# that drained stdin first would starve sha256sum and pass a broken fix.
+# The `shasum` stub exits WITHOUT reading stdin, mirroring a genuinely missing binary —
+# bash's own command-not-found leaves the piped bytes for the `||` fallback to consume, and
+# a stub that drained stdin first would starve sha256sum and pass a broken fix.
 
 _ABSENT_SHASUM_STUB = "#!/bin/sh\nexit 127\n"
 
-_SHA256SUM_STUB = (
-    "#!/bin/sh\n"
-    "exec python3 -c 'import hashlib,sys;"
-    'print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest() + "  -")\'\n'
-)
+# Resolved before any masking, from the test process's own (unmasked) PATH.
+_REAL_SHASUM = shutil.which("shasum")
 
 
 def _mask_shasum(fake_bin: Path) -> None:
-    """Make PATH look like a slim Linux host: no `shasum`, a working GNU `sha256sum`."""
+    """Make PATH look like a slim Linux host: no `shasum`, a working GNU `sha256sum`.
+
+    The sha256sum stub delegates to the REAL shasum by ABSOLUTE path, so the mask above
+    cannot shadow it and the stub needs no interpreter of its own. That matters because
+    wt_sha256_stdin discards the fallback's stderr: a stub that could fail to exec (a
+    `python3 -c` shim, say) would red these tests with an empty digest and empty stderr —
+    byte-identical to the defect under test, so a green fix would look broken. What is
+    under test is that the CODE tries the sha256sum SPELLING, never how the stub hashes.
+    """
+    assert _REAL_SHASUM, "this suite already requires the macOS hasher (see pytestmark)"
     (fake_bin / "shasum").write_text(_ABSENT_SHASUM_STUB)
     (fake_bin / "shasum").chmod(0o755)
-    (fake_bin / "sha256sum").write_text(_SHA256SUM_STUB)
+    (fake_bin / "sha256sum").write_text(f'#!/bin/sh\nexec "{_REAL_SHASUM}" -a 256\n')
     (fake_bin / "sha256sum").chmod(0o755)
 
 
@@ -961,6 +968,14 @@ def test_park_signature_is_identical_across_hasher_flavors(
     _mask_shasum(tmp_path / "bin")
     without_shasum = _call(expr, env=env)
 
+    # Pin the baseline non-empty FIRST: _broker_park_signature returns empty with rc 0
+    # whenever nothing is extractable, so should the park setup ever drift (a tmux-stub or
+    # dialog-text change that stops _permission_pending firing) both calls would return ''
+    # and a bare equality check would pass vacuously — inert forever, exactly when a real
+    # flavor-dependent digest regression needs catching.
+    assert re.fullmatch(r"[0-9a-f]{64}", with_shasum.stdout.strip()), (
+        f"the park must produce a real digest to compare: {with_shasum.stdout!r}"
+    )
     assert with_shasum.stdout.strip() == without_shasum.stdout.strip(), (
         "the digest must be hasher-flavor independent"
     )
