@@ -41,6 +41,7 @@
 #   HUB_WATCHDOG_PARK_CEILING=600    a waiting spoke unanswered this long ⇒ the drain fell short
 #   HUB_WATCHDOG_IDLE_CEILING=3600   a dead/idle spoke unrevived this long ⇒ the reaper missed it
 #   HUB_WATCHDOG_LAND_CEILING=900    a ready-at-tip branch un-landed this long ⇒ auto-land skipped
+#   HUB_WATCHDOG_LAND_ACTIVE=900     a land-<issue>.log quiet this long ⇒ that land is not in flight
 #   HUB_WATCHDOG_FILE=1          auto-file afk-defects via the headless bug-scoper (0 disables)
 #   HUB_WATCHDOG_COARM=1         (read by hub-afk.sh) co-arm this watchdog alongside the drain
 #   AFK_STATE / AFK_HEARTBEAT     the drain's state + heartbeat files it cross-checks (must
@@ -195,6 +196,7 @@ _wd_reexec() {
 : "${HUB_WATCHDOG_PARK_CEILING:=600}"   # a waiting spoke unanswered this long ⇒ drain fell short
 : "${HUB_WATCHDOG_IDLE_CEILING:=3600}"  # a dead/idle spoke unrevived this long ⇒ reaper missed it
 : "${HUB_WATCHDOG_LAND_CEILING:=900}"   # a ready-at-tip branch un-landed this long ⇒ auto-land skipped
+: "${HUB_WATCHDOG_LAND_ACTIVE:=900}"    # a land-<issue>.log quiet this long ⇒ that land is NOT in flight
 
 # _wd_epoch_stale <epoch> <now> <ceiling> -> true when now-epoch > ceiling. Empty/non-numeric
 # reads as NOT stale (can't measure → never fire), guarding set -u arithmetic against a bareword.
@@ -484,11 +486,79 @@ _wd_age_seconds() {
   printf '%ss' "$(( now - epoch ))"
 }
 
+# _wd_done_epoch <issue> -> the stamped done epoch, or empty when unstamped / the reader is absent
+# (a standalone watchdog with no gate-broker). Wrapped rather than calling read_done_epoch inline so
+# the detector and _wd_intervene_revive's second lock read the same guarded way.
+_wd_done_epoch() {
+  command -v read_done_epoch >/dev/null 2>&1 || return 0
+  read_done_epoch "$1" 2>/dev/null
+}
+
+# _wd_land_log <issue> -> the per-issue land log auto_land writes (<state-dir>/land-<issue>.log,
+# hub-afk.sh's #198 record), or empty when the state-dir reader is absent (standalone watchdog).
+_wd_land_log() {
+  command -v _afk_state_dir >/dev/null 2>&1 || return 0
+  printf '%s\n' "$(_afk_state_dir)/land-$1.log"
+}
+
+# _wd_file_mtime <path> -> the file's mtime epoch, or empty when unreadable. GNU stat first, BSD
+# second — the house idiom (gate-broker-detect.sh's _transcript_mtime): this hub is macOS, CI is
+# GNU, and a one-flavor probe reads empty on the other (#289).
+_wd_file_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
+
+# _wd_land_in_flight <issue> <now> -> true when a land for this issue is running RIGHT NOW, so the
+# watchdog must not read its teardown as an abandoned spoke (#290). Two signals: a LIVE drain whose
+# last action is `land #<issue>` (auto_land stamps it before the synchronous land, so it names the
+# issue for the land's whole duration — the primary signal), or a land-<issue>.log written within
+# HUB_WATCHDOG_LAND_ACTIVE (the fallback for a clobbered/stale last-action). Both fail toward NOT
+# in flight — a crashed drain's stale last-action, or an unreadable mtime, must never silence
+# condition 2 forever.
+# NOT the same as _wd_land_lane_servicing (#285), and the two must not be collapsed: that one reads
+# the land lane's ARMED RETRY backoff — a land that already FAILED and is scheduled to be
+# re-attempted; this one reads a land executing at this instant.
+_wd_land_in_flight() {
+  local issue="$1" now="$2" log mtime
+  if [ "$(_wd_drain_state)" = "live" ]; then
+    case "$(_wd_last_action)" in "land #$issue") return 0 ;; esac
+  fi
+  log="$(_wd_land_log "$issue")"
+  [ -n "$log" ] && [ -f "$log" ] || return 1
+  mtime="$(_wd_file_mtime "$log")"
+  # _wd_epoch_stale reads an unmeasurable epoch as NOT stale, which negates to "in flight" — the
+  # wrong direction for a defer. Screen both operands first so only a real, fresh mtime defers.
+  case "$mtime" in '' | *[!0-9]*) return 1 ;; esac
+  case "$now" in '' | *[!0-9]*) return 1 ;; esac
+  # A FUTURE-dated mtime (clock skew, a corrupted timestamp) is unmeasurable, not fresh: negating
+  # _wd_epoch_stale on it would defer until wall-clock caught up to the bogus stamp — an unbounded
+  # silence rather than the documented HUB_WATCHDOG_LAND_ACTIVE window. Fail toward firing.
+  [ "$mtime" -le "$now" ] || return 1
+  ! _wd_epoch_stale "$mtime" "$now" "$HUB_WATCHDOG_LAND_ACTIVE"
+}
+
 # Condition 2: a dead/crashed pane recover_dead_panes/reap_pass never revived, past the ceiling.
+# A DONE-stamped spoke is never a reaper miss (#290): the epoch records that the spoke reached
+# terminal state, and a land consuming the ready/<issue> tag flips LIVE slot_state off `done` while
+# the worktree still exists — the teardown gap that false-fired on #284.
+#
+# <done-epoch> MUST be read BEFORE anything on this tick calls slot_state, which is why the
+# dispatcher pre-reads it and passes it in rather than letting this read it live: a non-terminal
+# slot_state read DELETES the epoch (_afk_note_tip_progress -> clear_done_epoch, deliberate per
+# #263 — "non-terminal at this tip ⇒ any live done-epoch is stale"), and the park detectors call
+# slot_state ahead of this one every tick. Read live here, the epoch is always already gone and the
+# guard is dead code. Omit the argument and it falls back to a live read for a direct caller.
+# The guard is therefore self-limiting rather than permanent: it holds only while the last
+# slot_state read was terminal, and expires one tick after the spoke is observed non-terminal —
+# after which _wd_land_in_flight carries the defer for the rest of the land.
+# That defer lives in the DISPATCHER, not here, for the reason documented at condition 4: a
+# detector returning 1 falls into the else-branch, which CLEARS the firing-dedup marker — mid-land
+# that would let a subsequently-failed land re-fire and double-count (#263).
 _wd_detect_dead_idle() {
-  local wt="$1" issue="$2" now="$3"
+  local wt="$1" issue="$2" now="$3" done_epoch="${4-$(_wd_done_epoch "$2")}"
   command -v slot_state >/dev/null 2>&1 || return 1
   [ -z "$(_spoke_pane_target "$wt" 2>/dev/null)" ] || return 1   # a live pane is the reaper's job
+  [ -n "$done_epoch" ] && return 1                               # done-stamped ⇒ not a reaper miss
   [ "$(slot_state "$wt" "$issue")" = "done" ] && return 1        # terminal ⇒ not a hang
   _wd_epoch_stale "$(read_progress_epoch "$issue" 2>/dev/null)" "$now" "$HUB_WATCHDOG_IDLE_CEILING"
 }
@@ -829,7 +899,7 @@ _wd_fire() {
 # intervention. Supervisor-dead is a single global check; the other four run per in-flight spoke.
 # Best-effort throughout: a missing drain reader (standalone watchdog) simply skips its condition.
 _wd_run_conditions() {
-  local now="${1:-$(_wd_now)}" state="${2:-$(_wd_drain_state)}" wt issue wd_conflicts
+  local now="${1:-$(_wd_now)}" state="${2:-$(_wd_drain_state)}" wt issue wd_conflicts wd_done
   # Use the drain state the loop already read (passed as $2) rather than re-probing — the loop
   # reads it once per tick, and a second _wd_drain_state call would double-count under stubs.
   if [ "$state" = "stale" ]; then
@@ -845,6 +915,11 @@ _wd_run_conditions() {
   command -v inflight_worktrees >/dev/null 2>&1 || return 0
   while IFS=$'\t' read -r wt issue; do
     [ -n "$issue" ] || continue
+    # #290: pre-read the done epoch BEFORE any detector below calls slot_state — a non-terminal
+    # slot_state read deletes it (#263), and the park detectors run first, so a read at
+    # condition-2 time always comes back empty. Per-iteration local, passed explicitly: not a
+    # tick-global (the #241 cross-pass leak trap).
+    wd_done="$(_wd_done_epoch "$issue")"
     # Each detector: fire (deduped by _wd_fire's marker) + intervene when it trips; else clear the
     # firing marker so a genuinely resolved-then-recurring condition re-fires (#263).
     # park-undeliverable (#288 AC3) is checked FIRST: a serviced-but-never-deliverable park must
@@ -861,7 +936,16 @@ _wd_run_conditions() {
       _wd_clear_fired park-unanswered "$issue"
       _wd_clear_fired park-undeliverable "$issue"
     fi
-    if _wd_detect_dead_idle "$wt" "$issue" "$now"; then
+    if _wd_land_in_flight "$issue" "$now"; then
+      # #290: a land for this issue is executing RIGHT NOW. Its teardown consumes the ready/<issue>
+      # tag and kills the tmux window BEFORE removing the worktree, so a tick inside that gap sees
+      # exactly the dead-pane shape on a spoke that is landing successfully — on #284 that burned a
+      # revive into a worktree deleted seconds later. DEFER: neither fire NOR clear a prior firing's
+      # dedup marker (clearing mid-land would let a subsequently-failed land re-fire and
+      # double-count in the ledger, #263). Mirrors the land-lane servicing defer below; a land that
+      # genuinely leaves a dead pane behind still fires once the land stops running.
+      :
+    elif _wd_detect_dead_idle "$wt" "$issue" "$now" "$wd_done"; then
       _wd_fire dead-pane "$issue" "reaper missed a dead/idle pane (> ${HUB_WATCHDOG_IDLE_CEILING}s)"
       _wd_intervene_revive "$wt" "$issue"
     else

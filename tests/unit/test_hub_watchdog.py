@@ -1017,6 +1017,15 @@ def test_land_in_flight_false_when_the_land_log_is_stale(tmp_path: Path) -> None
     assert _call(_LAND_IN_FLIGHT_284, env=_dead_pane_env(tmp_path)).returncode == 1
 
 
+def test_land_in_flight_false_when_the_land_log_mtime_is_in_the_future(tmp_path: Path) -> None:
+    # Clock skew / a corrupted timestamp: a future mtime is unmeasurable, not fresh. Negating the
+    # staleness check on it would defer until wall-clock caught up to the bogus stamp — an
+    # unbounded silence, not the documented 900s window. Fail toward firing.
+    _land_log(tmp_path, "284", age=-86400)  # dated a day AHEAD of NOW
+
+    assert _call(_LAND_IN_FLIGHT_284, env=_dead_pane_env(tmp_path)).returncode == 1
+
+
 def test_land_in_flight_false_when_nothing_signals_a_land(tmp_path: Path) -> None:
     assert _call(_LAND_IN_FLIGHT_284, env=_dead_pane_env(tmp_path)).returncode == 1
 
@@ -1095,6 +1104,37 @@ def test_run_conditions_defer_keeps_the_dead_pane_dedup_marker_during_a_land(
     _call(f"{prelude}; _wd_run_conditions {NOW} live", env=env)
 
     assert marker.exists(), "a servicing defer must neither fire nor clear the firing marker"
+
+
+def test_run_conditions_reads_the_done_epoch_before_slot_state_clears_it(tmp_path: Path) -> None:
+    # The ordering contract, against the REAL readers (no read_done_epoch / slot_state stub — those
+    # are exactly what hid this). A non-terminal slot_state read DELETES the done epoch
+    # (_afk_note_tip_progress -> clear_done_epoch, deliberate per #263), and the park detectors call
+    # slot_state ahead of condition 2 every tick. So a done epoch read at condition-2 time is always
+    # already gone: the dispatcher must pre-read it at the top of the iteration and pass it in.
+    # Here the land has consumed ready/284, so real slot_state reads non-terminal and clears the
+    # epoch mid-tick — yet the spoke must still be classified terminal and NOT fire.
+    wt = _git_repo(tmp_path)
+    state_dir = tmp_path / "afk-state"
+    state_dir.mkdir()
+    (state_dir / "done-284.epoch").write_text("1784066007\n")  # stamped at the ready transition
+    (state_dir / "progress-284.epoch").write_text(str(int(NOW) - 4459) + "\n")
+    ledger = tmp_path / "l.jsonl"
+    env = _dead_pane_dispatch_env(tmp_path)
+    # No pane (the land killed the window); the drain is off and no land log exists, so
+    # _wd_land_in_flight CANNOT defer — the done-epoch guard is the only thing that can hold.
+    prelude = (
+        f"inflight_worktrees() {{ printf '{wt}\\t284\\n'; }}; "
+        '_wd_drain_state() { echo off; }; _spoke_pane_target() { echo ""; }'
+    )
+
+    _call(f"{prelude}; _wd_run_conditions {NOW} off", env=env)
+
+    assert not (state_dir / "done-284.epoch").exists(), (
+        "precondition: the real slot_state must clear the epoch mid-tick, else this proves nothing"
+    )
+    assert not ledger.exists(), "the done epoch must be read before slot_state destroys it"
+    assert not (tmp_path / "revived").exists()
 
 
 def test_run_conditions_fires_dead_pane_on_a_genuine_reaper_miss(tmp_path: Path) -> None:
