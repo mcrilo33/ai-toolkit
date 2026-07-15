@@ -1708,6 +1708,100 @@ def test_intervene_revive_keeps_its_budget_when_the_worktree_is_gone(tmp_path: P
     )
 
 
+# ── issue #297 defect 2: condition 2 is blind to a spoke that dies before its first commit ────
+# The progress epoch is stamped ONLY on a branch-tip ADVANCE (_afk_note_tip_progress), so a pane
+# that crashes before its first commit leaves it empty forever — and _wd_epoch_stale reads an empty
+# epoch as "unmeasurable ⇒ never fire". The spoke sits dead for the whole window and condition 2,
+# whose entire job is catching a reaper miss, is structurally incapable of seeing it. This is the
+# inverse face of defect 1: an empty epoch never fires, a stale one fired forever.
+# The drain's own reaper already solved this — _afk_ceiling_epoch measures max(dispatch, progress),
+# so a never-committed spoke is still measured from the moment it was dispatched. Condition 2 now
+# uses the same base, via a helper that also names WHICH epoch won (the reason string needs it).
+def test_dead_idle_base_falls_back_to_dispatch_before_the_first_commit(tmp_path: Path) -> None:
+    sd = tmp_path / "afk-state"
+    sd.mkdir()
+    dispatched = str(int(NOW) - 4000)
+    (sd / "dispatch-284.epoch").write_text(dispatched + "\n")  # never committed ⇒ no progress epoch
+
+    out = _call("_wd_dead_idle_base 284", env=_dead_pane_env(tmp_path)).stdout.strip()
+
+    assert out == f"dispatch\t{dispatched}", "a never-committed spoke measures from its dispatch"
+
+
+def test_dead_idle_base_prefers_progress_once_the_spoke_commits(tmp_path: Path) -> None:
+    # max(dispatch, progress): a committing spoke's ceiling restarts from its last real progress,
+    # exactly as the reaper's does — else every long-running spoke would fire off its dispatch.
+    sd = tmp_path / "afk-state"
+    sd.mkdir()
+    progressed = str(int(NOW) - 100)
+    (sd / "dispatch-284.epoch").write_text(f"{int(NOW) - 4000}\n")
+    (sd / "progress-284.epoch").write_text(progressed + "\n")
+
+    out = _call("_wd_dead_idle_base 284", env=_dead_pane_env(tmp_path)).stdout.strip()
+
+    assert out == f"progress\t{progressed}"
+
+
+def test_dead_idle_base_is_empty_when_nothing_is_measurable(tmp_path: Path) -> None:
+    # Neither epoch ⇒ no base ⇒ the detector cannot fire. Preserves _afk_ceiling_epoch's contract
+    # ("can't measure → never reap"): the watchdog must not invent a ceiling it has no clock for.
+    (tmp_path / "afk-state").mkdir()
+
+    out = _call("_wd_dead_idle_base 284", env=_dead_pane_env(tmp_path)).stdout.strip()
+
+    assert out == ""
+
+
+def test_dead_idle_base_epoch_agrees_with_the_real_reaper_ceiling(tmp_path: Path) -> None:
+    # The parity pin: this helper duplicates _afk_ceiling_epoch's max() so it can name the winner.
+    # Pinned against the REAL reaper function so the two can never silently diverge on WHEN a spoke
+    # is over its ceiling — a divergence would mean the watchdog and the reaper disagree about
+    # whether the same spoke is abandoned.
+    sd = tmp_path / "afk-state"
+    sd.mkdir()
+    (sd / "dispatch-284.epoch").write_text(f"{int(NOW) - 4000}\n")
+    (sd / "progress-284.epoch").write_text(f"{int(NOW) - 900}\n")
+    env = _dead_pane_env(tmp_path)
+
+    mine = _call("_wd_dead_idle_base 284", env=env).stdout.strip().split("\t")[-1]
+    reaper = _call("_afk_ceiling_epoch 284", env=env).stdout.strip()
+
+    assert mine == reaper, "the watchdog's base must be the reaper's ceiling epoch"
+
+
+def test_dead_idle_fires_for_a_spoke_that_died_before_its_first_commit(tmp_path: Path) -> None:
+    # The defect end-to-end, through the detector: dead pane, non-terminal, never committed, past
+    # the ceiling since dispatch. Today the empty progress epoch makes this permanently quiet.
+    sd = tmp_path / "afk-state"
+    sd.mkdir()
+    (sd / "dispatch-284.epoch").write_text(f"{int(NOW) - 4000}\n")  # > 3600s ceiling
+    prelude = (
+        f'_spoke_pane_target() {{ echo ""; }}; slot_state() {{ echo busy; }}; {_NO_DONE_EPOCH}'
+    )
+
+    assert (
+        _detect(prelude, "_wd_detect_dead_idle /wt 284 " + NOW, env=_dead_pane_env(tmp_path)) == 0
+    ), "a spoke that crashed before its first commit is exactly the reaper miss condition 2 is for"
+
+
+def test_dead_idle_reason_names_dispatch_when_it_is_the_measured_base(tmp_path: Path) -> None:
+    # #290 AC4's measured-base contract, extended: the ledger line must name WHICH epoch it
+    # measured, so `base=dispatch@N` tells a human this spoke never committed at all — a materially
+    # different story from a stalled-after-progress one, and the first thing to know when triaging.
+    sd = tmp_path / "afk-state"
+    sd.mkdir()
+    dispatched = str(int(NOW) - 4000)
+    (sd / "dispatch-284.epoch").write_text(dispatched + "\n")
+    env = _dead_pane_env(tmp_path)
+
+    out = _call(
+        f'slot_state() {{ echo busy; }}; _wd_dead_idle_reason /the/wt 284 {NOW} ""', env=env
+    )
+
+    assert f"base=dispatch@{dispatched}" in out.stdout, out.stdout
+    assert "4000s" in out.stdout, "the measured age must come from the base that actually won"
+
+
 # AC4 (#290): a dead-pane ledger line must carry the base it was MEASURED from, so a future false
 # positive is diagnosable from the line alone rather than by re-deriving the timeline from four
 # state files. Mirrors #283 AC5's measured-base reason for park-unanswered.
