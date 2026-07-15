@@ -20,19 +20,16 @@
 # the AFK_STATE_DIR override for tests. Per-issue files avoid cross-issue lock
 # contention and GC trivially.
 #
-# CRASH CONSISTENCY / ATOMICITY. macOS ships no flock(1), so appends rely on
-# POSIX O_APPEND semantics: each record is ONE printf of ONE line opened in
-# append mode. Bash's BUILTIN printf chunks its output at 2048 bytes (verified
-# empirically 2026-07-15: >2048-byte lines tear under concurrent writers), so
-# the atomicity domain is "line < 2048 bytes" — enforced here by capping the
-# caller-supplied evidence at 1024 bytes (_tlog_cap_evidence summarizes an
-# oversize object instead of splicing it). Within that domain concurrent
-# writers interleave whole lines on a local filesystem. Readers accept only COMPLETE lines (a torn trailing line —
-# no closing brace + newline — is ignored), so a crash mid-write costs one
-# record, never a wrong parse. Writes are best-effort and NEVER fail the calling
-# operation (the hooks' always-exit-0 discipline): a missing expected record
-# reads as "unknown", and per #300's contract "unknown" is never a firing basis
-# by itself.
+# CRASH CONSISTENCY / ATOMICITY. Appends are serialized with a per-issue `mkdir`
+# lock (the one atomic, portable filesystem primitive — macOS has no flock(1)),
+# so a record is written whole regardless of its size. A crashed writer's stale
+# lock is force-broken past a bound (see _tlog_append) so a dead process can't
+# wedge the log. Readers additionally tolerate a torn TRAILING line (a crash
+# between the printf and rmdir, or a pre-lock legacy write): a complete record is
+# `^{...}$`, and an unterminated last fragment is dropped. Writes are best-effort
+# and NEVER fail the calling operation (the hooks' always-exit-0 discipline): a
+# missing expected record reads as "unknown", and per #300's contract "unknown"
+# is never a firing basis by itself.
 #
 # RECORD SHAPE (v1). One JSON object per line, flat, fixed keys:
 #   {"v":1,"ts":<epoch>,"issue":<n>,"kind":"transition","to":"<state>",
@@ -69,27 +66,40 @@ _tlog_json_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n\t' '  '
 }
 
-# _tlog_cap_evidence <evidence-json> -> the evidence unchanged when it fits the
-# atomicity budget (1024 bytes), else a small summary object — an oversize blob
-# would push the line past the 2048-byte single-write chunk and tear under
-# concurrency. Summarize, never truncate (truncated JSON would corrupt the line).
-_tlog_cap_evidence() {
-  local ev="$1"
-  if [ "${#ev}" -gt 1024 ]; then
-    printf '{"truncated":true,"bytes":%s}\n' "${#ev}"
-  else
-    printf '%s\n' "$ev"
-  fi
-}
+# _tlog_append <issue> <line> -> append one complete record line under a
+# per-issue mkdir lock. Best-effort: ALWAYS rc 0, never fails the calling
+# operation.
+#
+# WHY A LOCK (not "small lines are atomic"). An earlier version relied on a
+# single `printf >>` being atomic below a size threshold. Adversarial testing
+# (2026-07-15) disproved it: bash's builtin printf tears interleaved appends at
+# ~1KB on this hardware, probabilistically, and free-text fields (cause/actor/
+# episode) can push a line arbitrarily large regardless. A torn record mid-file
+# is worse than a torn TRAILING line — readers tolerate only the latter. So the
+# write is serialized with `mkdir` (the one filesystem primitive that is atomic
+# and portable — macOS has no flock(1)): the winner appends, losers spin briefly.
+# The lock is held only for one printf, so contention windows are microscopic.
+# A stale lock (writer crashed mid-append) is force-broken past a bound so a dead
+# writer can't wedge the log; the append then proceeds (best-effort > blocked).
+_tlog_lock_wait="${AFK_TLOG_LOCK_WAIT:-50}"   # ~50 x 20ms spins = up to ~1s
 
-# _tlog_append <issue> <line> -> append one complete record line. Best-effort:
-# ALWAYS rc 0, never fails the calling operation.
 _tlog_append() {
-  local issue="$1" line="$2" f dir
+  local issue="$1" line="$2" f dir lock i="0"
   f="$(_tlog_file "$issue")" || return 0
   dir="${f%/*}"
   mkdir -p "$dir" 2>/dev/null || return 0
+  lock="$f.lock"
+  while ! mkdir "$lock" 2>/dev/null; do
+    i=$(( i + 1 ))
+    if [ "$i" -ge "$_tlog_lock_wait" ]; then
+      rmdir "$lock" 2>/dev/null || true   # break a stale lock, then race for it
+      mkdir "$lock" 2>/dev/null || break  # got it, or give up and append anyway
+      break
+    fi
+    sleep 0.02 2>/dev/null || sleep 1
+  done
   printf '%s\n' "$line" >> "$f" 2>/dev/null || true
+  rmdir "$lock" 2>/dev/null || true
   return 0
 }
 
@@ -98,7 +108,6 @@ _tlog_append() {
 # signature + onset the broker already mints for the reanswer key).
 afk_tlog_transition() {
   local issue="$1" to="$2" actor="$3" cause="$4" evidence="${5:-}" episode="${6:-}" line run
-  [ -n "$evidence" ] && evidence="$(_tlog_cap_evidence "$evidence")"
   line="{\"v\":1,\"ts\":$(date +%s),\"issue\":${issue:-0}"
   line="$line,\"kind\":\"transition\",\"to\":\"$(_tlog_json_escape "$to")\""
   line="$line,\"actor\":\"$(_tlog_json_escape "$actor")\""
@@ -115,7 +124,6 @@ afk_tlog_transition() {
 # Record an action WITHIN a state (answer_delivered, nudge, revive, ...).
 afk_tlog_event() {
   local issue="$1" event="$2" actor="$3" lane="${4:-}" episode="${5:-}" evidence="${6:-}" line run
-  [ -n "$evidence" ] && evidence="$(_tlog_cap_evidence "$evidence")"
   line="{\"v\":1,\"ts\":$(date +%s),\"issue\":${issue:-0}"
   line="$line,\"kind\":\"event\",\"event\":\"$(_tlog_json_escape "$event")\""
   line="$line,\"actor\":\"$(_tlog_json_escape "$actor")\""
@@ -219,7 +227,6 @@ afk_last_service_event() {
   _tlog_complete_lines "$issue" | awk -v ep="\"episode\":\"$episode\"" -v ln="$lane" '{
       h = $0; i = index(h, ",\"evidence\":"); if (i) h = substr(h, 1, i - 1)
       if (index(h, "\"kind\":\"event\"") == 0) next
-      if (index(h, ep "\"") == 0 && index(h, ep) == 0) next
       if (index(h, ep) == 0) next
       if (ln != "" && index(h, "\"lane\":\"" ln "\"") == 0) next
       l = $0

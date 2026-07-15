@@ -264,11 +264,13 @@ def test_concurrent_appends_interleave_whole_lines(tmp_path: Path) -> None:
     # yield 40 COMPLETE lines (the atomicity contract the readers depend on).
     env = _env(tmp_path)
 
-    # Bulky evidence near the 1KB cap: atomicity must hold at realistic line
-    # sizes, not just tiny lines (validation finding, 2026-07-15).
+    # 40 concurrent writers, each a LARGE line (~3KB evidence) — well past the
+    # ~1KB size where an unlocked printf tears (validation finding, 2026-07-15).
+    # The mkdir lock must still yield exactly 40 complete, uncorrupted records:
+    # size is irrelevant once writes are serialized.
     fresh_call(
         TRANSITION_LOG,
-        'pad=$(printf "x%.0s" $(seq 1 900)); '
+        'pad=$(printf "x%.0s" $(seq 1 3000)); '
         "for i in $(seq 1 20); do afk_tlog_event 42 w1-$i broker answer ep1 "
         "'{\"pad\":\"'$pad'\"}' & done; "
         "for i in $(seq 1 20); do afk_tlog_event 42 w2-$i broker land ep2 "
@@ -277,26 +279,26 @@ def test_concurrent_appends_interleave_whole_lines(tmp_path: Path) -> None:
     )
 
     lines = _log_file(tmp_path, 42).read_text().splitlines()
-    assert len(lines) == 40
+    assert len(lines) == 40  # no lost or merged records
     assert all(ln.startswith("{") and ln.endswith("}") for ln in lines)
-    assert all(len(ln) > 900 for ln in lines)
-    assert all(len(ln) < 2048 for ln in lines)  # inside the single-write chunk domain
+    assert all(len(ln) > 3000 for ln in lines)  # large lines survive intact
+    # every record is a distinct writer's whole line (no interleaving)
+    tags = sorted(ln.split('"event":"', 1)[1].split('"', 1)[0] for ln in lines)
+    assert len(set(tags)) == 40
 
 
-def test_oversize_evidence_is_summarized_not_spliced(tmp_path: Path) -> None:
-    # >1024-byte evidence would cross the 2048-byte tear boundary — the writer
-    # must record a summary object instead (never truncated JSON).
+def test_large_line_written_whole(tmp_path: Path) -> None:
+    # A single big record (free-text + big evidence) is written intact — the lock
+    # makes line size a non-issue, replacing the old evidence-size cap.
     env = _env(tmp_path)
 
     fresh_call(
         TRANSITION_LOG,
-        'pad=$(printf "x%.0s" $(seq 1 3000)); '
+        'pad=$(printf "x%.0s" $(seq 1 5000)); '
         "afk_tlog_transition 42 working a b '{\"pad\":\"'$pad'\"}'",
         env=env,
     )
 
     line = _log_file(tmp_path, 42).read_text().splitlines()[0]
-    assert len(line) < 2048
-    assert line.endswith("}")
-    assert '"truncated":true' in line
-    assert "xxx" not in line
+    assert line.startswith("{") and line.endswith("}")
+    assert len(line) > 5000
