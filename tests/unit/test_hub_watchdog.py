@@ -1486,6 +1486,82 @@ def test_intervene_answer_answers_a_gate_park(tmp_path: Path) -> None:
     assert marker.read_text() == "x"
 
 
+# AC3 (#290): the revive must never `nohup claude --continue` into a worktree a land is about to
+# remove — on #284 it did exactly that, resuming a headless session against a vanishing cwd. The
+# detector guard upstream already stops the dispatcher path; this is the second lock, for any
+# direct caller (mirroring _wd_intervene_answer's permission-lane re-check).
+def test_intervene_revive_defers_when_the_issue_is_done_stamped(tmp_path: Path) -> None:
+    marker = tmp_path / "revived"
+    state_dir = tmp_path / "afk-state"
+    state_dir.mkdir()
+    (state_dir / "done-284.epoch").write_text("1784066007\n")  # reached terminal state
+    env = _dead_pane_env(tmp_path, HUB_WATCHDOG_REVIVE_CMD=f"printf x > {marker}")
+
+    _call("_wd_intervene_revive /the/wt 284", env=env)
+
+    assert not marker.exists(), "a done-stamped spoke is finished — never revive it"
+
+
+def test_intervene_revive_defers_when_a_land_is_in_flight(tmp_path: Path) -> None:
+    marker = tmp_path / "revived"
+    last_action = tmp_path / "last-action"
+    last_action.write_text("land #284\n")
+    env = _dead_pane_env(
+        tmp_path,
+        AFK_LAST_ACTION=str(last_action),
+        HUB_WATCHDOG_REVIVE_CMD=f"printf x > {marker}",
+    )
+
+    _call("_wd_drain_state() { echo live; }; _wd_intervene_revive /the/wt 284", env=env)
+
+    assert not marker.exists(), "never revive into a worktree the land is removing"
+
+
+def test_intervene_revive_runs_for_a_genuinely_dead_spoke(tmp_path: Path) -> None:
+    # The complement: no done epoch, no land in flight ⇒ a real abandoned spoke still gets revived.
+    marker = tmp_path / "revived"
+    env = _dead_pane_env(tmp_path, HUB_WATCHDOG_REVIVE_CMD=f'printf "%s" "$2" > {marker}')
+
+    _call("_wd_intervene_revive /the/wt 284", env=env)
+
+    assert marker.read_text() == "284"
+
+
+# AC4 (#290): a dead-pane ledger line must carry the base it was MEASURED from, so a future false
+# positive is diagnosable from the line alone rather than by re-deriving the timeline from four
+# state files. Mirrors #283 AC5's measured-base reason for park-unanswered.
+def test_dead_idle_reason_names_the_measured_base(tmp_path: Path) -> None:
+    last_action = tmp_path / "last-action"
+    last_action.write_text("answer #7\n")
+    env = _dead_pane_env(tmp_path, AFK_LAST_ACTION=str(last_action))
+    progress = str(int(NOW) - 4459)
+    prelude = f"slot_state() {{ echo busy; }}; read_progress_epoch() {{ echo {progress}; }}"
+
+    out = _call(f'{prelude}; _wd_dead_idle_reason /the/wt 284 {NOW} ""', env=env).stdout
+
+    assert "4459s" in out  # the measured age
+    assert f"base=progress@{progress}" in out  # WHICH epoch it measured from
+    assert "slot_state=busy" in out  # the live state at firing time
+    assert "done-epoch=none" in out  # the terminal classification it checked
+    assert "last-action=answer #7" in out  # what the drain was doing
+    assert "ceiling 3600s" in out
+
+
+def test_run_conditions_dead_pane_ledger_line_carries_the_measured_base(tmp_path: Path) -> None:
+    # End-to-end: the reason reaches the LEDGER, not just stdout — AC4 is about the ledger line.
+    ledger = tmp_path / "l.jsonl"
+    env = _dead_pane_dispatch_env(tmp_path)
+    prelude = _dead_pane_dispatch_prelude(done_epoch="", drain="off")
+
+    _call(f"{prelude}; _wd_run_conditions {NOW} off", env=env)
+
+    line = ledger.read_text()
+    assert '"condition":"dead-pane"' in line
+    assert f"base=progress@{int(NOW) - 4459}" in line
+    assert "slot_state=busy" in line
+    assert "done-epoch=none" in line
+
+
 def test_landmark_intervention_never_lands_only_marks(tmp_path: Path) -> None:
     # Escalate-only: the default raises a needs-human-land tag and NEVER runs a land.
     wt = _git_repo(tmp_path)
