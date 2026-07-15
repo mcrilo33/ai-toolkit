@@ -336,6 +336,32 @@ _broker_journal_line() {
     "$(_broker_json_escape "$ref")" >>"$f" 2>/dev/null || true
 }
 
+# _broker_save_reasoning <issue> <text> -> persist the reasoner's OWN output under the afk
+# state dir and ECHO the path (empty when there is nothing to save or the write fails).
+#
+# The journal's reasoning_ref field has existed since #241, but every caller passed 4 args, so
+# every record carried reasoning_ref:"" — including the four "injected answer (routine)" records
+# the #271 answerer wrote while telling a spoke to abandon its correctly-pushed branch. Its
+# reasoning existed nowhere on disk, so the diagnosis had to be rebuilt from the spoke pane.
+# The journal says WHAT was decided; this says WHY, which is the half a morning review needs to
+# tell a wrong answer from a wrongly-recorded one.
+#
+# Best-effort, like every helper on this path: a failed write costs the audit trail, never the
+# answer — the caller journals an empty ref exactly as it did before. The filename carries the
+# issue and the epoch so a re-answered gate keeps each attempt.
+# UPGRADE: two answers for the same issue within ONE second collide on the filename and the
+# later overwrites the earlier; the re-answer ceiling paces attempts minutes apart, so this is
+# not reachable today — add a counter/pid suffix if that pacing ever goes.
+_broker_save_reasoning() {
+  local issue="$1" text="$2" dir f
+  [ -n "$text" ] || return 0
+  dir="$(_afk_state_dir)/reasoning"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  f="$dir/$issue-$(afk_now).txt"
+  printf '%s\n' "$text" >"$f" 2>/dev/null || return 0
+  printf '%s\n' "$f"
+}
+
 # broker_journal_decision <issue> <park_kind> <decision> <reversibility> [reasoning_ref] ->
 # journal the record (file) AND post a best-effort GitHub issue comment, so the morning review
 # reads either surface. Used for NOTEWORTHY decisions (a warned/parked call, a WARN-flagged or

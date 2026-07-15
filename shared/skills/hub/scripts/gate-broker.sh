@@ -729,7 +729,11 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
           # 'WARN:' note and 'REVERSIBILITY:' class off the reply. A WARN or a non-reversible class
           # is a NOTEWORTHY decision → a loud warned record + a journal line WITH a gh comment. A
           # routine reversible answer is a cheap FILE-ONLY journal line (no per-answer gh spam).
-          local ans_rev_raw ans_rev ans_warn
+          local ans_rev_raw ans_rev ans_warn ans_ref
+          # Persist the reasoner's own output and journal a ref to it (#281): the record says
+          # WHAT was decided, the ref says WHY. Empty when the save failed — the pre-#281
+          # behavior — so a lost audit trail never costs the delivered answer.
+          ans_ref="$(_broker_save_reasoning "$issue" "$raw_text")"
           ans_rev_raw="$(parse_decision_field "$raw_text" REVERSIBILITY)"
           # Normalize to the first ALPHABETIC RUN (portable lowercasing, tolerant of quotes,
           # parens, or a trailing period around the class word) so 'Reversible', 'reversible.',
@@ -743,9 +747,9 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
             # The clear above dropped the retry BACKOFF (progress); this warned record is the
             # DELIBERATE loud review flag for the noteworthy decision — not a stale leftover.
             broker_warn "$issue" "answered [${ans_rev:-unknown}]${ans_warn:+ — WARN: $ans_warn}"
-            broker_journal_decision "$issue" answer "injected answer${ans_warn:+ (WARN: $ans_warn)}" "${ans_rev:-unknown}"
+            broker_journal_decision "$issue" answer "injected answer${ans_warn:+ (WARN: $ans_warn)}" "${ans_rev:-unknown}" "$ans_ref"
           else
-            _broker_journal_line "$issue" answer "injected answer (routine)" "${ans_rev:-reversible}"
+            _broker_journal_line "$issue" answer "injected answer (routine)" "${ans_rev:-reversible}" "$ans_ref"
           fi
           afk_emit_decision "$wt" success
           return 0
