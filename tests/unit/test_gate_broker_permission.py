@@ -23,6 +23,7 @@ from _gate_broker_support import (
     _hook_payload,
     _named_tool_record,
     _perm,
+    _perm_env,
     _project_dir_for,
     _read_tool_record,
     _resolved_only_transcript,
@@ -844,3 +845,78 @@ def test_danger_guard_registered_like_permission_hook() -> None:
     perm = _handler("afk-permission-hook.sh")
     assert danger is not None, "afk-danger-guard not registered for Claude PreToolUse"
     assert perm is not None, "afk-permission-hook baseline missing"
+
+
+# ── issue #294 AC1: an APPROVE is delivered ONCE per pending dialog ────────────────────────────
+# _decide_permission called approve_permission and returned success without recording that THIS
+# park was served, so an unchanged dialog — a pane that has not redrawn, or an approved
+# `nohup ... &` whose gate keeps the gated tool_use unresolved — was re-approved on the very next
+# tick: the (tip, sig) re-answer ceiling computed the SAME key, found the counter still under
+# AFK_REANSWER_CEILING, and fell through to a second keypress. At the default ceiling of 2 that is
+# exactly one duplicate delivery — the #135/#188 two-concurrent-gates shape.
+
+_AUTO_APPROVABLE = "git reset -q; git add tests/x.py"  # classify_permission APPROVEs a self-stage
+
+
+def _served_marker(env: dict[str, str]) -> Path:
+    return Path(env["_STATEDIR"]) / "served-5"
+
+
+def _yes_keystrokes(env: dict[str, str]) -> list[str]:
+    """Every "Yes" (option 1) keypress the broker sent to the dialog — approve_permission's own
+    delivery, so counting these counts real approvals, not intentions."""
+    keylog = Path(env["_KEYLOG"])
+    keys = keylog.read_text() if keylog.exists() else ""
+    return [line for line in keys.splitlines() if line.split()[-1] == "1"]
+
+
+def _age_transcript(spoke_repo: Path, env: dict[str, str]) -> None:
+    """Backdate the spoke's transcript so approve_permission's _transcript_advanced check has an
+    mtime to advance PAST (BSD stat is whole-second, so a same-second append would not register
+    and the approve would read as undelivered)."""
+    jsonl = _project_dir_for(Path(env["CLAUDE_PROJECTS_DIR"]), spoke_repo) / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+
+
+def test_two_ticks_on_an_unchanged_dialog_approve_exactly_once(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # _perm_env's fake tmux keeps showing the SAME dialog, and its Enter appends a non-turn record
+    # that never resolves the gated tool_use — i.e. the identical (tip, sig, tool_use) is still
+    # pending on tick 2, exactly the state the duplicate needs.
+    env = _perm_env(tmp_path, spoke_repo, _AUTO_APPROVABLE, "printf 'ANSWER: APPROVE'")
+    _age_transcript(spoke_repo, env)
+
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert len(_yes_keystrokes(env)) == 1, (
+        "an unchanged dialog must be approved ONCE — a second keypress lands in whatever the pane "
+        "shows next (the #89 stale-inject class) and re-runs the command it authorized"
+    )
+
+
+def test_a_delivered_approve_records_the_served_park(spoke_repo: Path, tmp_path: Path) -> None:
+    # The mechanism behind the exactly-once guarantee: the mechanical auto-approve stamps the park
+    # it served, naming the id of the tool_use it actually approved.
+    env = _perm_env(tmp_path, spoke_repo, _AUTO_APPROVABLE, "printf 'ANSWER: APPROVE'")
+    _age_transcript(spoke_repo, env)
+
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert len(_yes_keystrokes(env)) == 1, "sanity: the first tick really did approve"
+    record = _served_marker(env).read_text().strip().split("\t")
+    assert record[2] == "tu_1", f"the served record must name the approved tool_use: {record}"
+
+
+def test_a_failed_approve_delivery_records_no_served_park(spoke_repo: Path, tmp_path: Path) -> None:
+    # Only a DELIVERED approve is served. Without _age_transcript the fake tmux's append lands in
+    # the same whole second, so _transcript_advanced never registers and approve_permission fails —
+    # an unconfirmed delivery must stay retryable and never suppress the next tick.
+    env = _perm_env(tmp_path, spoke_repo, _AUTO_APPROVABLE, "printf 'ANSWER: APPROVE'")
+
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert not _served_marker(env).exists(), (
+        "a delivery the broker could not confirm must never read as served"
+    )
