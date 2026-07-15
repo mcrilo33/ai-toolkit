@@ -2296,6 +2296,133 @@ def test_run_conditions_fires_park_and_invokes_answer_seam(tmp_path: Path) -> No
 # gated by HUB_WATCHDOG_FILE (default OFF in _call) so no test hits the live gh/hub-agent.
 
 
+# ── issue #297 defect 3: _wd_classify reads the push-failure-only blocked record ──────────────
+# A park the reasoner deliberately escalated is a novel-decision (a real human call), not an afk
+# bug. But _wd_classify detected that solely via _afk_blocked_record — the DURABLE LOCAL record
+# gate-broker-markers.sh writes ONLY when the `git push` of the blocked/<issue> tag FAILS (the #109
+# fallback). The common case — the tag pushes fine — leaves no file at all, so the watchdog called
+# every successful escalation an afk-defect: it auto-filed a bogus bug against afk and docked the
+# #251 autonomy score for the reasoner doing its job correctly. The authoritative signal is the tag
+# itself, which the dispatcher already trusts 150 lines earlier (_wd_detect_mergeable_skipped's
+# `_wd_tag_at_tip "$wt" blocked`); _wd_classify simply never got the wt to check it with.
+def test_classify_reads_the_blocked_tag_at_tip_as_a_novel_decision(tmp_path: Path) -> None:
+    # The common escalation: spoke-ready pushed blocked/5 successfully, so NO durable record exists.
+    wt = _git_repo(tmp_path)
+    subprocess.run(["git", "tag", "blocked/5"], cwd=wt, check=True, capture_output=True)
+    env = {"AFK_STATE_DIR": str(tmp_path / "state")}  # no blocked-5.txt — the push succeeded
+
+    out = _call(f"_wd_classify park-unanswered 5 '{wt}'", env=env).stdout.strip()
+
+    assert out == "novel-decision", (
+        "a deliberately escalated park is a human call, not an afk defect to file a bug against"
+    )
+
+
+def test_classify_still_reads_the_durable_record_when_the_tag_push_failed(tmp_path: Path) -> None:
+    # The #109 fallback must keep working: no tag (the push failed), but the durable local record
+    # says the reasoner escalated. Both signals mean the same thing — a real human call.
+    wt = _git_repo(tmp_path)
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "blocked-5.txt").write_text("1784066007\tneeds a human\n")
+    env = {"AFK_STATE_DIR": str(state)}
+
+    out = _call(f"_wd_classify park-unanswered 5 '{wt}'", env=env).stdout.strip()
+
+    assert out == "novel-decision"
+
+
+def test_classify_is_an_afk_defect_when_the_blocked_tag_is_behind_the_tip(tmp_path: Path) -> None:
+    # A blocked/ tag the spoke has since committed on top of is STALE (the #103 coexistence
+    # _wd_blocked_stale exists for) — live state wins, so this is not a live escalation and the
+    # firing is a real afk defect. Pins that the fix uses tag-AT-TIP, not merely tag-exists.
+    wt = _git_repo(tmp_path)
+    subprocess.run(["git", "tag", "blocked/5"], cwd=wt, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "--allow-empty", "-m", "c2"],
+        cwd=wt,
+        check=True,
+        capture_output=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
+    env = {"AFK_STATE_DIR": str(tmp_path / "state")}
+
+    out = _call(f"_wd_classify park-unanswered 5 '{wt}'", env=env).stdout.strip()
+
+    assert out == "afk-defect", "a stale blocked tag behind the tip is not a live escalation"
+
+
+def test_fire_threads_the_worktree_into_classify(tmp_path: Path) -> None:
+    # The plumbing: _wd_fire is where the class is decided, so it must carry the wt through or the
+    # tag can never be read at the only place it matters — the real firing path.
+    wt = _git_repo(tmp_path)
+    subprocess.run(["git", "tag", "blocked/5"], cwd=wt, check=True, capture_output=True)
+    ledger = tmp_path / "l.jsonl"
+    env = {
+        "HUB_WATCHDOG_LEDGER": str(ledger),
+        "AFK_STATE_DIR": str(tmp_path / "state"),
+        "AFK_NOW": NOW,
+    }
+
+    _call(f"_wd_fire park-unanswered 5 'parked too long' '{wt}'", env=env)
+
+    assert '"class":"novel-decision"' in ledger.read_text()
+
+
+def test_classify_seam_receives_the_worktree(tmp_path: Path) -> None:
+    # The override seam owns the whole decision, so it must be handed every input the built-in has
+    # — else an operator's classifier cannot reach the authoritative signal either.
+    seen = tmp_path / "seen"
+    env = {
+        "HUB_WATCHDOG_CLASSIFY_CMD": f'printf "%s %s %s" "$1" "$2" "$3" > {seen}; echo afk-defect'
+    }
+
+    _call("_wd_classify park-unanswered 5 /the/wt", env=env)
+
+    assert seen.read_text() == "park-unanswered 5 /the/wt"
+
+
+def test_run_conditions_does_not_file_a_defect_for_a_deliberate_escalation(tmp_path: Path) -> None:
+    # End to end through the DISPATCHER, with filing switched on: a blocked-at-tip park must reach
+    # the ledger as novel-decision and dispatch NO bug-scoper. This is the defect's real cost — a
+    # bogus auto-filed issue against afk every time the reasoner correctly escalates.
+    wt = _git_repo(tmp_path)
+    subprocess.run(["git", "tag", "blocked/5"], cwd=wt, check=True, capture_output=True)
+    ledger = tmp_path / "l.jsonl"
+    scoped = tmp_path / "scoped"
+    env = _dead_pane_env(
+        tmp_path,
+        HUB_WATCHDOG_LEDGER=str(ledger),
+        HUB_WATCHDOG_LANDMARK_REPO=str(tmp_path / "no-landmark-repo"),
+        HUB_WATCHDOG_FILE="1",
+        HUB_WATCHDOG_DEDUP_CMD="true",
+        HUB_WATCHDOG_LABEL_CMD="true",
+        HUB_WATCHDOG_SCOPER_CMD=f'printf "%s %s" "$1" "$2" >> {scoped}',
+        AFK_STATE_DIR=str(tmp_path / "state"),
+    )
+    prelude = (
+        f"inflight_worktrees() {{ printf '%s\\t5\\n' '{wt}'; }}; "
+        "_wd_detect_park_unanswered() { return 0; }; "
+        "_wd_detect_park_undeliverable() { return 1; }; "
+        "_wd_detect_dead_idle() { return 1; }; "
+        "_wd_detect_stale_marker() { return 1; }; "
+        "_wd_detect_mergeable_skipped() { return 1; }; "
+        '_wd_park_unanswered_reason() { echo "parked too long"; }; '
+        "_wd_intervene_answer() { :; }"
+    )
+
+    _call(f"{prelude}; _wd_run_conditions {NOW} off", env=env)
+
+    assert '"class":"novel-decision"' in ledger.read_text(), ledger.read_text()
+    assert not scoped.exists(), "a correct escalation must never auto-file a bug against afk"
+
+
 def test_classify_defaults_to_afk_defect() -> None:
     assert _call("_wd_classify dead-pane 5").stdout.strip() == "afk-defect"
 
