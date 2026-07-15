@@ -686,6 +686,51 @@ _wd_land_base_ref() {
   printf '%s\n' "$base"
 }
 
+# _wd_terminal_marker_kind <wt> <issue> -> `ready`, `accept`, or empty — WHICH terminal marker sits
+# at the branch tip (#292). slot_state reads BOTH as `done`, which is why condition 4 could not tell
+# them apart: ready/ means the drain SHOULD have landed and did not (a genuine shortfall, #274's
+# class), while accept/ is the deliberate human-eyeball terminal the drain MUST NOT land (auto_land
+# lands only _ready_at_tip: "accept/ awaits a human sign-off").
+# READY IS CHECKED FIRST, mirroring slot_state's own `for kind in ready accept` precedence: when
+# both tags sit at the tip, the watchdog must classify off the SAME marker that made the spoke read
+# `done`, or the two disagree about what the spoke even is.
+# Empty when neither is at the tip (or the probe fails) — callers must then keep the historical
+# afk-defect path, never the quieter accept one: an unreadable marker must not silence a defect.
+_wd_terminal_marker_kind() {
+  local wt="$1" issue="$2" kind
+  for kind in ready accept; do
+    _wd_tag_at_tip "$wt" "$kind" "$issue" && { printf '%s\n' "$kind"; return 0; }
+  done
+  return 0
+}
+
+# _wd_own_commits <wt> -> how many commits the checked-out branch has that the land base does not.
+# Zero is the #286 close-without-code shape: the spoke judged the work already shipped and minted
+# accept/ at the base tip, so a land would merge nothing and close the issue as SHIPPED — which is
+# not the decision actually pending. Empty when the probe fails, so the reason simply omits the
+# claim rather than asserting a count it did not measure.
+_wd_own_commits() {
+  local wt="$1" base n
+  base="$(_wd_land_base_ref "$wt")"
+  [ -n "$base" ] || return 0
+  n="$(git -C "$wt" rev-list --count "$base..HEAD" 2>/dev/null)" || return 0
+  case "$n" in '' | *[!0-9]*) return 0 ;; esac
+  printf '%s\n' "$n"
+}
+
+# _wd_accept_unsigned_reason <wt> <issue> -> the honest remediation for an accept/ spoke. NOT "human
+# land": on #286 that told a human to land a zero-diff branch, which would have closed the issue as
+# shipped when the pending decision was "confirm the duplicate finding, or reject it and re-kick".
+# Same reason-honesty contract #285 established for the conflicted case, one marker-kind over.
+_wd_accept_unsigned_reason() {
+  local wt="$1" issue="$2" own
+  printf 'accept/%s awaits human sign-off (escalate-only: the drain must NOT land accept/ — it is the human-eyeball terminal)' "$issue"
+  own="$(_wd_own_commits "$wt")"
+  [ "$own" = "0" ] && printf ' — no own commits vs %s: confirm close-without-code, do not land' \
+    "$(_wd_land_base_ref "$wt")"
+  return 0
+}
+
 # _wd_land_conflicts <wt> -> the space-separated conflicting file(s) when the checked-out branch
 # does NOT merge cleanly into the base, else empty. Uses `git merge-tree --write-tree --name-only`
 # (git >= 2.38): rc 0 = mergeable (empty), rc 1 = conflict (line 1 is the tree OID; the conflicted
@@ -917,6 +962,7 @@ _wd_clear_landed_landmarks() {
     # for it — clear its condition-4 firing markers here so the autonomy score re-arms (#263/#285).
     _wd_clear_fired auto-land-skipped "$issue"
     _wd_clear_fired conflicted-land "$issue"
+    _wd_clear_fired accept-unsigned "$issue"   # #292: same lane, same landmark → same re-arm
     _wd_log "cleared resolved landmark $tag (issue #$issue closed/landed)"
   done < <(git -C "$repo" tag -l 'needs-human-land/*' 2>/dev/null)
 }
@@ -1025,6 +1071,14 @@ _wd_classify() {
     bash -c "$HUB_WATCHDOG_CLASSIFY_CMD" hub-watchdog "$condition" "$issue" "$wt" 2>/dev/null; return
   fi
   case "$condition" in
+    accept-unsigned)
+      # #292: accept/<N> at the tip is the drain behaving CORRECTLY — spoke-ready's human-eyeball
+      # terminal, which auto_land deliberately never lands ("accept/ awaits a human sign-off"). The
+      # wait is a by-design human decision, not a drain shortfall, so it must not dock the #251
+      # autonomy score nor auto-file a bug against afk (which spawned a fresh bug-scoper per
+      # accept-spoke per run — this issue's own provenance). The escalation still ledgers and still
+      # raises the landmark; only the CLASS changes.
+      printf 'novel-decision\n'; return ;;
     park-unanswered)
       # A deliberate escalation is a real human call, not an afk bug. TWO signals say so, and only
       # the second was checked before (#297): the blocked/<issue> TAG at the spoke's tip — what
@@ -1242,23 +1296,38 @@ _wd_run_conditions() {
       # drain stops re-arming, when the branches below run.
       :
     elif _wd_detect_mergeable_skipped "$wt" "$issue" "$now"; then
-      # #285: probe ACTUAL mergeability before labeling. A conflicted branch fires a DISTINCT
-      # `conflicted-land` reason naming the files (a human following "mergeable" walks into the
-      # same conflict); a truly-mergeable one keeps the historical auto-land-skipped. Both escalate
-      # via the SAME needs-human-land tag (no second tripwire-racing tag, #272) — only the reason
-      # differs, so the ledger/defect is honest about what the human must do.
-      wd_conflicts="$(_wd_land_conflicts "$wt")"; wd_conflicts="${wd_conflicts% }"
-      if [ -n "$wd_conflicts" ]; then
-        _wd_fire conflicted-land "$issue" "branch conflicts with $(_wd_land_base_ref "$wt") on: $wd_conflicts — resolve on the spoke (merge the base branch), do not blind-land" "$wt"
-        _wd_clear_fired auto-land-skipped "$issue"   # not a clean skip → drop any stale skip firing
+      # #292: read WHICH terminal marker is at the tip before labeling. slot_state reads ready/ and
+      # accept/ alike as `done`, but they are opposites: ready/ is a drain that should have landed
+      # and didn't; accept/ is the human-eyeball terminal the drain must NOT land. Only the ready/
+      # (or unreadable — never assume the quiet path) branch keeps the historical afk-defect
+      # treatment. All three escalate via the SAME needs-human-land tag (#272: no second
+      # tripwire-racing tag) and _wd_clear_landed_landmarks self-clears it once the human closes
+      # the issue; only the reason and class differ.
+      if [ "$(_wd_terminal_marker_kind "$wt" "$issue")" = "accept" ]; then
+        _wd_fire accept-unsigned "$issue" "$(_wd_accept_unsigned_reason "$wt" "$issue")" "$wt"
+        _wd_clear_fired auto-land-skipped "$issue"   # not a drain skip → drop any stale skip firing
+        _wd_clear_fired conflicted-land "$issue"
       else
-        _wd_fire auto-land-skipped "$issue" "mergeable branch un-landed > ${HUB_WATCHDOG_LAND_CEILING}s (escalate-only: human land)" "$wt"
-        _wd_clear_fired conflicted-land "$issue"     # cleanly mergeable now → drop any stale conflict firing
+        # #285: probe ACTUAL mergeability before labeling. A conflicted branch fires a DISTINCT
+        # `conflicted-land` reason naming the files (a human following "mergeable" walks into the
+        # same conflict); a truly-mergeable one keeps the historical auto-land-skipped. Both escalate
+        # via the SAME needs-human-land tag (no second tripwire-racing tag, #272) — only the reason
+        # differs, so the ledger/defect is honest about what the human must do.
+        wd_conflicts="$(_wd_land_conflicts "$wt")"; wd_conflicts="${wd_conflicts% }"
+        if [ -n "$wd_conflicts" ]; then
+          _wd_fire conflicted-land "$issue" "branch conflicts with $(_wd_land_base_ref "$wt") on: $wd_conflicts — resolve on the spoke (merge the base branch), do not blind-land" "$wt"
+          _wd_clear_fired auto-land-skipped "$issue"   # not a clean skip → drop any stale skip firing
+        else
+          _wd_fire auto-land-skipped "$issue" "mergeable branch un-landed > ${HUB_WATCHDOG_LAND_CEILING}s (escalate-only: human land)" "$wt"
+          _wd_clear_fired conflicted-land "$issue"     # cleanly mergeable now → drop any stale conflict firing
+        fi
+        _wd_clear_fired accept-unsigned "$issue"       # a ready/ tip is not an accept wait
       fi
       _wd_intervene_landmark "$wt" "$issue"
     else
       _wd_clear_fired auto-land-skipped "$issue"
       _wd_clear_fired conflicted-land "$issue"
+      _wd_clear_fired accept-unsigned "$issue"
     fi
   done < <(inflight_worktrees)
   # #290 AC5: sweep dead-pane firing markers for issues that have since landed. Runs AFTER the loop
