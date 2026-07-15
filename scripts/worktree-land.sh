@@ -197,6 +197,18 @@ land_resume_finalize() {
   git tag -d "ready/${issue}" >/dev/null 2>&1 || true
   wt_git_push origin ":refs/tags/ready/${issue}" >/dev/null 2>&1 || true
 
+  # UPGRADE (#278): closes only the PRIMARY, so a packed branch resumed here leaves its
+  # subtask issues open. This path CANNOT reuse the main path's ISSUES derivation: that
+  # bounds markers to `$DEFAULT..$WT_BRANCH`, and this function's own precondition is that
+  # the marker is already merged INTO $DEFAULT — so the range is empty by construction, and
+  # the branch may already be pruned. Ancestors-of-marker_sha would find them, but would
+  # also sweep in any sibling's marker merged along from $DEFAULT, i.e. exactly the foreign
+  # close the main path guards against. Narrow in practice (it needs a land INTERRUPTED
+  # mid-teardown, after the merge but before the close, on a PACKED branch), and the
+  # leftover issues stay open and visible rather than silently wrong. Worth closing properly
+  # once packed branches are common — most likely by recording the shipped set at merge time
+  # rather than re-deriving it from refs here.
+  #
   # Close the issue ONLY when it is still OPEN — never re-close / re-comment a done
   # issue whose merged tag merely lingered.
   if command -v gh >/dev/null 2>&1; then
@@ -298,6 +310,53 @@ fi
 BSLUG="${WT_BRANCH##*/}"
 ISSUE="${BSLUG%%-*}"
 [[ "$ISSUE" =~ ^[0-9]+$ ]] || ISSUE=""
+
+# --- every issue this branch ships (issue #278) -------------------------------
+# A packed spoke carries several same-scope issues on ONE branch, so the branch slug names
+# only the PRIMARY. Closing that scalar alone would leave the shipped subtasks open forever
+# with nothing recording that they were done.
+#
+# The per-subtask ready/<N> markers ARE that record — but they are NOT all at the tip. The
+# spoke emits ready/<subtask> as each one lands and defers ready/<primary> to LAST (the
+# at-tip marker guard below requires it there), so every earlier subtask's marker sits on an
+# ANCESTOR commit. A `--points-at HEAD` scan would therefore find only the final subtask and
+# the primary, silently dropping the rest of a 3+ chain.
+#
+# So: markers REACHABLE FROM the tip, bounded to this branch's OWN commits via
+# `$DEFAULT..HEAD`. The bound is load-bearing — an un-landed ready/<X> from a sibling spoke
+# that already reached $DEFAULT is reachable from our tip once main is merged in, and closing
+# it would mark someone else's in-flight issue done. `git tag --merged` cannot express that
+# (it has no exclusion side), hence the explicit rev-list membership test.
+#
+# UPGRADE: the range reads the hub's LOCAL $DEFAULT. The hub lands serially and this runs
+# after the merge guards, so local $DEFAULT is current in practice — but nothing here proves
+# it. A local ref lagging origin/$DEFAULT would widen the range to commits already on the
+# remote, and a sibling's still-open ready/<X> among them would be closed as ours. Pin it
+# with `git fetch && git merge --ff-only origin/$DEFAULT` before this block if the hub ever
+# lands concurrently, or if a lagging local default is ever observed in the wild.
+#
+# ISSUES always leads with the primary, so the close comment order matches the branch's own
+# story, and stays a single element for the overwhelmingly common unpacked spoke.
+ISSUES=()
+if [ -n "$ISSUE" ]; then
+  ISSUES=("$ISSUE")
+  # The commits this branch adds on top of the default branch — empty for an already-merged
+  # or empty branch, which just leaves ISSUES at the primary.
+  BRANCH_COMMITS="$(git rev-list "$DEFAULT..$WT_BRANCH" 2>/dev/null || true)"
+  if [ -n "$BRANCH_COMMITS" ]; then
+    while IFS= read -r _tag; do
+      [ -n "$_tag" ] || continue
+      _n="${_tag#ready/}"
+      case "$_n" in '' | *[!0-9]*) continue ;; esac
+      [ "$_n" = "$ISSUE" ] && continue                  # the primary is already first
+      _tag_sha="$(git rev-parse -q --verify "refs/tags/$_tag^{commit}" 2>/dev/null || true)"
+      [ -n "$_tag_sha" ] || continue
+      printf '%s\n' "$BRANCH_COMMITS" | grep -qxF "$_tag_sha" || continue   # not ours
+      ISSUES+=("$_n")
+    done < <(git for-each-ref --format='%(refname:short)' 'refs/tags/ready/*' 2>/dev/null || true)
+  fi
+  [ "${#ISSUES[@]}" -gt 1 ] && echo "→ branch ships ${#ISSUES[@]} issues: ${ISSUES[*]}"
+fi
 
 # --- guard: the ready-to-land marker (issue #16) --------------------------------
 # A per-subtask push is indistinguishable from task completion. For a numbered,
@@ -704,31 +763,52 @@ fi
 # so the tag has done its job. Leaving it behind would let a stale marker
 # re-flag a future branch reusing the issue number as mergeable. Local then
 # remote, warn-only — a missing tag (--force-land, ad-hoc) is a no-op.
+# Looped over ISSUES (#278): a packed branch's SUBTASK markers must be consumed too — this
+# block's own reason applies to each of them. A lingering ready/265 would re-flag a future
+# branch reusing that number as mergeable, which is exactly the stale-marker hazard here.
 if [ -n "$ISSUE" ] && [ -z "$LOCAL" ]; then
-  MARKER="ready/${ISSUE}"
-  if git rev-parse -q --verify "refs/tags/${MARKER}" >/dev/null 2>&1; then
-    git tag -d "$MARKER" >/dev/null 2>&1 \
-      || wt_warn "couldn't delete local tag $MARKER — delete it by hand: git tag -d $MARKER"
-    wt_git_push origin ":refs/tags/${MARKER}" >/dev/null 2>&1 \
-      || wt_warn "couldn't delete remote tag $MARKER — delete it by hand: git push origin :refs/tags/$MARKER"
+  for LAND_ISSUE in "${ISSUES[@]}"; do
+    MARKER="ready/${LAND_ISSUE}"
+    if git rev-parse -q --verify "refs/tags/${MARKER}" >/dev/null 2>&1; then
+      git tag -d "$MARKER" >/dev/null 2>&1 \
+        || wt_warn "couldn't delete local tag $MARKER — delete it by hand: git tag -d $MARKER"
+      wt_git_push origin ":refs/tags/${MARKER}" >/dev/null 2>&1 \
+        || wt_warn "couldn't delete remote tag $MARKER — delete it by hand: git push origin :refs/tags/$MARKER"
+    fi
+  done
+fi
+
+# Looped over ISSUES (#278): every issue the branch shipped is closed and has its lifecycle
+# labels cleared, not just the primary the slug happens to name.
+if [ -n "$ISSUE" ]; then
+  if command -v gh >/dev/null 2>&1; then
+    for LAND_ISSUE in "${ISSUES[@]}"; do
+      if gh issue close "$LAND_ISSUE" --comment "Landed on $DEFAULT in $MERGED_SHA (suite: $SUITE_RESULT)."; then
+        echo "✓ closed issue #$LAND_ISSUE"
+      else
+        wt_warn "couldn't close issue #$LAND_ISSUE — close it by hand: gh issue close $LAND_ISSUE"
+      fi
+      # Mirror teardown (issue #236): the spoke no longer has live local state, so
+      # strip the status:*/mode:*/lane:* labels dispatch stamped. Best-effort and
+      # separate from the close comment above (which is unchanged): a failed gh here
+      # never fails the land.
+      wt_gh_clear_lifecycle_labels "$LAND_ISSUE"
+    done
+  else
+    wt_warn "gh not found — close issue(s) #${ISSUES[*]} by hand"
   fi
 fi
 
+# The spoke is landed and its worktree gone, so any queued-subtask channel it still carries
+# (#278) is dead state. Drop it: a leftover queue keyed on this primary would refuse the
+# terminal ready of a LATER, unrelated spoke that reused the issue number. The path contract
+# is inlined (gate-broker-markers.sh is a hub-skill module this script cannot source from a
+# synced target), matching how worktree-new.sh seeds it. Best-effort — never fails the land.
 if [ -n "$ISSUE" ]; then
-  if command -v gh >/dev/null 2>&1; then
-    if gh issue close "$ISSUE" --comment "Landed on $DEFAULT in $MERGED_SHA (suite: $SUITE_RESULT)."; then
-      echo "✓ closed issue #$ISSUE"
-    else
-      wt_warn "couldn't close issue #$ISSUE — close it by hand: gh issue close $ISSUE"
-    fi
-    # Mirror teardown (issue #236): the spoke no longer has live local state, so
-    # strip the status:*/mode:*/lane:* labels dispatch stamped. Best-effort and
-    # separate from the close comment above (which is unchanged): a failed gh here
-    # never fails the land.
-    wt_gh_clear_lifecycle_labels "$ISSUE"
-  else
-    wt_warn "gh not found — close issue #$ISSUE by hand"
-  fi
+  _q_common="$(git rev-parse --git-common-dir 2>/dev/null || printf '.git')"
+  case "$_q_common" in /*) ;; *) _q_common="$REPO_ROOT/$_q_common" ;; esac
+  rm -rf "${AFK_STATE_DIR:-$_q_common/ai-toolkit-afk}/queued-$ISSUE" 2>/dev/null || true
+  unset _q_common
 fi
 
 # --- tmux: kill the task's stranded window in the project session -----------------
@@ -771,6 +851,14 @@ cleanup_tmux
 # red. A `full` stamp or no stamp (docs-only skip, --skip-tests) launches
 # nothing. Best-effort like the rest of the tail: a sweep that fails to launch
 # warns and never fails the land. GATE_SWEEP_BIN is the test seam.
+# NOT looped over ISSUES (#278), unlike the close/label/marker blocks above. The sweep is
+# keyed by the MERGED SHA, not by issue: one landed tree needs exactly one full-suite sweep,
+# and gate-sweep dedupes on the stamp and serializes on a one-at-a-time lock anyway — so a
+# per-issue loop would launch N identical sweeps of the same SHA and burn the box on N-1
+# no-ops. `--issue` is scalar (last-wins) and exists only to attribute a red sweep's filed
+# issue, for which the branch's primary is the right owner. Teaching gate-sweep a repeated
+# --issue so a red sweep could name every packed issue would be a genuine improvement, but
+# gate-sweep.sh is outside this issue's Scope: line.
 bash "${GATE_SWEEP_BIN:-$SCRIPT_DIR/gate-sweep.sh}" --spawn "$MERGED_SHA" \
   --branch "$WT_BRANCH" ${ISSUE:+--issue} ${ISSUE:+"$ISSUE"} \
   || wt_warn "post-land sweep failed to launch — landing is unaffected"
