@@ -982,14 +982,27 @@ _wd_json_escape() {
 # HUB_WATCHDOG_CLASSIFY_CMD seam overrides the whole decision (echo the class).
 : "${HUB_WATCHDOG_AFK_DEFECT_LABEL:=afk-defect}"
 
+# _wd_classify <condition> <issue> [wt] -> the firing's class. <wt> is optional: supervisor-dead
+# has no worktree, and a direct caller may omit it (the tag check is then simply skipped).
 _wd_classify() {
-  local condition="$1" issue="$2"
+  local condition="$1" issue="$2" wt="${3:-}"
   if [ -n "${HUB_WATCHDOG_CLASSIFY_CMD:-}" ]; then
-    bash -c "$HUB_WATCHDOG_CLASSIFY_CMD" hub-watchdog "$condition" "$issue" 2>/dev/null; return
+    bash -c "$HUB_WATCHDOG_CLASSIFY_CMD" hub-watchdog "$condition" "$issue" "$wt" 2>/dev/null; return
   fi
   case "$condition" in
     park-unanswered | park-undeliverable)
-      # A blocked/ record means the reasoner made a real human-call escalation — not a bug.
+      # A deliberate escalation is a real human call, not an afk bug. TWO signals say so, and only
+      # the second was checked before (#297): the blocked/<issue> TAG at the spoke's tip — what
+      # spoke-ready actually emits, and the signal the dispatcher already trusts in
+      # _wd_detect_mergeable_skipped — and the durable local record, which gate-broker-markers.sh
+      # writes ONLY when that tag's push FAILS (the #109 fallback). Reading the record alone meant
+      # the COMMON case (the push succeeded, so no file exists) was misfiled as an afk-defect: a
+      # bogus auto-filed bug against afk, and the #251 autonomy score docked for the reasoner
+      # behaving correctly. AT-TIP, not merely present: a blocked/ tag the spoke has since committed
+      # past is stale (the #103 coexistence), and live state wins — that firing IS a real defect.
+      if [ -n "$wt" ] && _wd_tag_at_tip "$wt" blocked "$issue"; then
+        printf 'novel-decision\n'; return
+      fi
       if command -v _afk_blocked_record >/dev/null 2>&1 && [ -f "$(_afk_blocked_record "$issue" 2>/dev/null)" ]; then
         printf 'novel-decision\n'; return
       fi ;;
@@ -1087,11 +1100,13 @@ ONE afk-defect issue (label $HUB_WATCHDOG_AFK_DEFECT_LABEL). Dedup against open 
 # JSONL line to the intervention-ledger (with the class), log it, and — for an afk-defect — file
 # it via the headless bug-scoper (deduped). Every firing is a bug report against afk; subtask 5's
 # autonomy score counts these lines. Best-effort.
+# <wt> ($4) is optional and threaded through to _wd_classify, which needs it to read the
+# blocked/<issue> tag at the spoke's tip (#297). supervisor-dead has no worktree and passes none.
 _wd_fire() {
-  local condition="$1" issue="$2" reason="$3" lf klass marker
+  local condition="$1" issue="$2" reason="$3" wt="${4:-}" lf klass marker
   marker="$(_wd_fired_marker "$condition" "$issue")"
   [ -f "$marker" ] && return 0   # already fired this unresolved occurrence — dedupe ledger + file
-  klass="$(_wd_classify "$condition" "$issue")"
+  klass="$(_wd_classify "$condition" "$issue" "$wt")"
   case "$klass" in afk-defect | novel-decision) ;; *) klass="afk-defect" ;; esac
   lf="$(_wd_ledger_file)"
   mkdir -p "$(dirname "$lf")" 2>/dev/null || true
@@ -1142,11 +1157,11 @@ _wd_run_conditions() {
     # park-undeliverable (#288 AC3) is checked FIRST: a serviced-but-never-deliverable park must
     # never ALSO read as the misleading never-attempted label.
     if _wd_detect_park_undeliverable "$wt" "$issue" "$now"; then
-      _wd_fire park-undeliverable "$issue" "$(_wd_park_undeliverable_reason "$wt" "$issue" "$now")"
+      _wd_fire park-undeliverable "$issue" "$(_wd_park_undeliverable_reason "$wt" "$issue" "$now")" "$wt"
       _wd_intervene_answer "$wt" "$issue"
       _wd_clear_fired park-unanswered "$issue"
     elif _wd_detect_park_unanswered "$wt" "$issue" "$now"; then
-      _wd_fire park-unanswered "$issue" "$(_wd_park_unanswered_reason "$wt" "$issue" "$now")"
+      _wd_fire park-unanswered "$issue" "$(_wd_park_unanswered_reason "$wt" "$issue" "$now")" "$wt"
       _wd_intervene_answer "$wt" "$issue"
       _wd_clear_fired park-undeliverable "$issue"
     else
@@ -1163,13 +1178,13 @@ _wd_run_conditions() {
       # genuinely leaves a dead pane behind still fires once the land stops running.
       :
     elif _wd_detect_dead_idle "$wt" "$issue" "$now" "$wd_done" "$wd_base"; then
-      _wd_fire dead-pane "$issue" "$(_wd_dead_idle_reason "$wt" "$issue" "$now" "$wd_done" "$wd_base")"
+      _wd_fire dead-pane "$issue" "$(_wd_dead_idle_reason "$wt" "$issue" "$now" "$wd_done" "$wd_base")" "$wt"
       _wd_intervene_revive "$wt" "$issue"
     else
       _wd_clear_fired dead-pane "$issue"
     fi
     if _wd_detect_stale_marker "$wt" "$issue"; then
-      _wd_fire stale-marker "$issue" "stale blocked/ marker the drain did not reconcile"
+      _wd_fire stale-marker "$issue" "stale blocked/ marker the drain did not reconcile" "$wt"
       _wd_intervene_reconcile "$wt" "$issue"
     else
       _wd_clear_fired stale-marker "$issue"
@@ -1190,10 +1205,10 @@ _wd_run_conditions() {
       # differs, so the ledger/defect is honest about what the human must do.
       wd_conflicts="$(_wd_land_conflicts "$wt")"; wd_conflicts="${wd_conflicts% }"
       if [ -n "$wd_conflicts" ]; then
-        _wd_fire conflicted-land "$issue" "branch conflicts with $(_wd_land_base_ref "$wt") on: $wd_conflicts — resolve on the spoke (merge the base branch), do not blind-land"
+        _wd_fire conflicted-land "$issue" "branch conflicts with $(_wd_land_base_ref "$wt") on: $wd_conflicts — resolve on the spoke (merge the base branch), do not blind-land" "$wt"
         _wd_clear_fired auto-land-skipped "$issue"   # not a clean skip → drop any stale skip firing
       else
-        _wd_fire auto-land-skipped "$issue" "mergeable branch un-landed > ${HUB_WATCHDOG_LAND_CEILING}s (escalate-only: human land)"
+        _wd_fire auto-land-skipped "$issue" "mergeable branch un-landed > ${HUB_WATCHDOG_LAND_CEILING}s (escalate-only: human land)" "$wt"
         _wd_clear_fired conflicted-land "$issue"     # cleanly mergeable now → drop any stale conflict firing
       fi
       _wd_intervene_landmark "$wt" "$issue"
