@@ -176,8 +176,51 @@ stamp_done_epoch_once() { [ -n "$(read_done_epoch "$1")" ] || stamp_done_epoch "
 # re-stamps fresh. Cleared on a fresh arm (_clear_progress_state), like done-<issue>.epoch.
 stamp_park_onset_epoch()      { _stamp_issue_epoch park-onset "$1"; }
 read_park_onset_epoch()       { _read_issue_epoch park-onset "$1"; }
-clear_park_onset_epoch()      { rm -f "$(_afk_state_dir)/park-onset-$1.epoch" 2>/dev/null || true; }
+# Credits the CLOSING episode's park seconds before dropping the onset (#299): slot_state calls
+# this once a spoke reads past every park check, so it is the single UNPARK edge and the only
+# place that knows the episode just ended. Idempotent across the several slot_state reads per
+# tick — the first call credits and removes the onset, the rest find none and no-op.
+clear_park_onset_epoch()      {
+  _credit_park_seconds "$1" "$(read_park_onset_epoch "$1")"
+  rm -f "$(_afk_state_dir)/park-onset-$1.epoch" 2>/dev/null || true
+}
 stamp_park_onset_epoch_once() { [ -n "$(read_park_onset_epoch "$1")" ] || stamp_park_onset_epoch "$1"; }
+
+# parked-total-<issue>.seconds — the cumulative seconds this window's spoke spent PARKED (#299).
+# The hard ceiling (_spoke_over_any_ceiling below) measures from the dispatch epoch, which
+# NOTHING refreshes, so time the spoke spent waiting on the supervisor's own answer lane pre-ages
+# it — the shape #263 fixed for the done clock. Park-wins (#246) hides the damage while parked:
+# slot_state classifies a parked spoke `waiting`, never `reap`. The kill lands on the FIRST tick
+# AFTER it unparks, when an actively-working spoke has no #256 completion signal, so
+# _afk_finish_up_or_revive falls through to kill + relaunch mid-work.
+#
+# Ignoring PROGRESS stays deliberate (the doom-loop backstop documented at _spoke_over_any_ceiling);
+# crediting park time cannot weaken it. A doom-loop that COMMITS never parks, so it earns no
+# credit; a spoke that IS parked is already unreapable by construction. The credit only stops the
+# ceiling charging a spoke for the hub's own answer latency. Per-window, so _clear_progress_state
+# drops it on a fresh arm.
+_parked_total_file() { printf '%s\n' "$(_afk_state_dir)/parked-total-$1.seconds"; }
+read_parked_total() {
+  local f v; f="$(_parked_total_file "$1")"
+  v="$([ -f "$f" ] && cat "$f" 2>/dev/null || true)"
+  case "$v" in '' | *[!0-9]*) v=0 ;; esac
+  printf '%s\n' "$v"
+}
+# _credit_park_seconds <issue> <onset> -> add the elapsed seconds of the episode <onset> opened to
+# the running total. An absent/non-numeric onset (no episode to close) or a non-positive delta (a
+# same-second unpark, a future onset from clock skew) credits NOTHING rather than corrupting the
+# total. Best-effort throughout, like every writer in this family.
+_credit_park_seconds() {
+  local issue="$1" onset="$2" now delta
+  case "$onset" in '' | *[!0-9]*) return 0 ;; esac
+  now="$(afk_now)"
+  case "$now" in '' | *[!0-9]*) return 0 ;; esac
+  delta=$(( now - onset ))
+  [ "$delta" -gt 0 ] || return 0
+  mkdir -p "$(_afk_state_dir)" 2>/dev/null || true
+  printf '%s\n' "$(( $(read_parked_total "$issue") + delta ))" \
+    > "$(_parked_total_file "$issue")" 2>/dev/null || true
+}
 
 # park-sig-<issue> — the park CONTEXT ("<tip>\t<sig>") the live park-onset epoch belongs to (#283).
 # stamp-once + clear-when-not-parked (above) makes the onset track a park EPISODE only when some
@@ -211,6 +254,11 @@ note_park_episode() {
   key="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"$'\t'"$sig"
   prev="$(read_park_sig "$issue")"
   if [ "$prev" != "$key" ] || [ -z "$onset" ]; then
+    # A CHANGED context closes the previous episode, so credit its park seconds before the onset
+    # is overwritten (#299) — otherwise an episode the watchdog rolls over here is silently
+    # dropped from the total. No-ops on the empty-onset arm: clear_park_onset_epoch already
+    # credited that episode at the unpark edge, and double-crediting would inflate the ceiling.
+    _credit_park_seconds "$issue" "$onset"
     stamp_park_onset_epoch "$issue"     # _stamp_issue_epoch mkdir -p's the state dir for both writes
     printf '%s\n' "$key" > "$(_park_sig_file "$issue")" 2>/dev/null || true
     onset="$(read_park_onset_epoch "$issue")"
@@ -265,7 +313,7 @@ _afk_refresh_offline_clocks() {
 _clear_progress_state() {
   local dir; dir="$(_afk_state_dir)"
   rm -f "$dir"/progress-*.epoch "$dir"/answer-attempt-*.epoch "$dir"/done-*.epoch "$dir"/tip-* \
-    "$dir"/park-onset-*.epoch "$dir"/park-sig-* \
+    "$dir"/park-onset-*.epoch "$dir"/park-sig-* "$dir"/parked-total-*.seconds \
     "$dir"/reanswer-* "$dir"/answer-drop-* "$dir"/served-* "$dir"/gate-voided-* \
     "$dir"/terminal-logged-* \
     "$dir"/wd-fire-dedup-* \
@@ -566,14 +614,20 @@ _afk_ceiling_epoch() {
 # doom-loop that commits every <180m would evade the reaper for the whole drain
 # window, the exact outcome the reaper exists to prevent (ST3 review).
 _spoke_over_any_ceiling() {
-  local issue="$1" now="$2" d mult
+  local issue="$1" now="$2" d mult age
   spoke_over_ceiling "$(_afk_ceiling_epoch "$issue")" "$now" && return 0
   d="$(read_dispatch_epoch "$issue")"
   case "$d" in '' | *[!0-9]*) return 1 ;; esac
   case "$now" in '' | *[!0-9]*) return 1 ;; esac
   mult="${AFK_SPOKE_HARD_CEILING_MULT:-3}"
   case "$mult" in '' | *[!0-9]*) mult=3 ;; esac
-  [ "$(( (now - d) / 60 ))" -gt "$(( AFK_SPOKE_MAX_MINUTES * mult ))" ]
+  # #299: charge only the time the spoke could actually WORK. Park time is the supervisor's own
+  # answer latency, so crediting it back is what stops the first post-unpark tick killing a
+  # healthy spoke mid-work. Clamped at 0: a credit exceeding the age (clock skew, a hand-edited
+  # state file) must read as "just dispatched", never wrap into a negative age.
+  age=$(( now - d - $(read_parked_total "$issue") ))
+  [ "$age" -lt 0 ] && age=0
+  [ "$(( age / 60 ))" -gt "$(( AFK_SPOKE_MAX_MINUTES * mult ))" ]
 }
 
 # --- sibling-script resolution ------------------------------------------------

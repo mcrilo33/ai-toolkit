@@ -672,6 +672,109 @@ def test_hard_ceiling_credit_does_not_rescue_a_spoke_past_the_ceiling_on_running
     assert _over_ceiling(statedir) == "over"
 
 
+def test_hard_ceiling_clamps_a_credit_larger_than_the_dispatch_age(tmp_path: Path) -> None:
+    # Clock skew or a hand-edited state file must read as "just dispatched", never wrap into a
+    # negative age (which would still compare -gt against the ceiling, but on garbage).
+    statedir = tmp_path / "sd"
+    _ceiling_state(statedir, dispatch_min=600, parked_sec=9_999 * 60)
+
+    assert _over_ceiling(statedir) == "under"
+
+
+def test_park_credit_accrues_when_the_spoke_unparks(tmp_path: Path) -> None:
+    # clear_park_onset_epoch is slot_state's single unpark edge, so it is where the closing
+    # episode's park seconds land.
+    statedir = tmp_path / "sd"
+    env = {"AFK_STATE_DIR": str(statedir)}
+    _call("stamp_park_onset_epoch 5", env={**env, "AFK_NOW": "1000"})
+
+    _call("clear_park_onset_epoch 5", env={**env, "AFK_NOW": "1600"})
+
+    assert (statedir / "parked-total-5.seconds").read_text().strip() == "600"
+    assert not (statedir / "park-onset-5.epoch").exists()
+
+
+def test_park_credit_is_not_double_counted_across_a_tick(tmp_path: Path) -> None:
+    # slot_state is re-derived independently by several passes per tick (answer_pass, reap_pass,
+    # recover_dead_panes), so clear_park_onset_epoch runs repeatedly on the same unpark. Only the
+    # first call may credit — the rest find no onset and must no-op, or one park would be charged
+    # back several times and the ceiling would drift out of reach.
+    statedir = tmp_path / "sd"
+    env = {"AFK_STATE_DIR": str(statedir)}
+    _call("stamp_park_onset_epoch 5", env={**env, "AFK_NOW": "1000"})
+
+    _call("clear_park_onset_epoch 5", env={**env, "AFK_NOW": "1600"})
+    _call("clear_park_onset_epoch 5", env={**env, "AFK_NOW": "1900"})
+
+    assert (statedir / "parked-total-5.seconds").read_text().strip() == "600"
+
+
+def test_park_credit_accumulates_across_separate_episodes(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    env = {"AFK_STATE_DIR": str(statedir)}
+    _call("stamp_park_onset_epoch 5", env={**env, "AFK_NOW": "1000"})
+    _call("clear_park_onset_epoch 5", env={**env, "AFK_NOW": "1600"})
+
+    _call("stamp_park_onset_epoch 5", env={**env, "AFK_NOW": "2000"})
+    _call("clear_park_onset_epoch 5", env={**env, "AFK_NOW": "2500"})
+
+    assert (statedir / "parked-total-5.seconds").read_text().strip() == "1100"
+
+
+def test_note_park_episode_credits_the_superseded_episode_on_a_context_change(
+    tmp_path: Path,
+) -> None:
+    # The watchdog rolls one episode into the next here when the park CONTEXT changes (#283).
+    # Without crediting the outgoing onset first, that episode's park time is overwritten and
+    # silently lost from the total.
+    statedir = tmp_path / "sd"
+    _call(_episode("sigA"), env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1000"})
+
+    _call(_episode("sigB"), env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1600"})
+
+    assert (statedir / "parked-total-5.seconds").read_text().strip() == "600"
+    assert (statedir / "park-onset-5.epoch").read_text().strip() == "1600"
+
+
+def test_note_park_episode_does_not_credit_an_unchanged_context(tmp_path: Path) -> None:
+    # One park still pending is ONE episode: it is credited once, at the unpark edge. Crediting
+    # per tick here would charge the same park back on every watchdog read.
+    statedir = tmp_path / "sd"
+    _call(_episode("sigA"), env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1000"})
+
+    _call(_episode("sigA"), env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1600"})
+
+    assert not (statedir / "parked-total-5.seconds").exists()
+
+
+def test_clear_progress_state_also_clears_the_park_credit(tmp_path: Path) -> None:
+    # Per-window, like every other record here: a leftover total would credit the next window's
+    # spoke for a park it never took.
+    statedir = tmp_path / "sd"
+    env = {"AFK_STATE_DIR": str(statedir)}
+    _call("stamp_park_onset_epoch 5", env={**env, "AFK_NOW": "1000"})
+    _call("clear_park_onset_epoch 5", env={**env, "AFK_NOW": "1600"})
+    assert (statedir / "parked-total-5.seconds").exists()
+
+    _call("_clear_progress_state", env=env)
+
+    assert not (statedir / "parked-total-5.seconds").exists()
+
+
+@pytest.mark.parametrize("garbage", ["", "abc", "-5"])
+def test_read_parked_total_reads_unusable_state_as_zero(tmp_path: Path, garbage: str) -> None:
+    # The family's guard convention: unreadable state degrades to today's behavior (no credit),
+    # never to a `set -u` arithmetic abort that would take the whole reap pass down.
+    statedir = tmp_path / "sd"
+    statedir.mkdir(parents=True)
+    (statedir / "parked-total-5.seconds").write_text(f"{garbage}\n")
+
+    result = _call("read_parked_total 5", env={"AFK_STATE_DIR": str(statedir)})
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "0"
+
+
 # ── issue #288 AC3: answer-drop record (computed-then-dropped answers, no delivery) ────────────
 # Distinct from reanswer-<issue> (the REASONER-RAN counter, armed BEFORE the outcome is known):
 # this records only the SUBSET of attempts that ended in a DROP (never injected) — so the
