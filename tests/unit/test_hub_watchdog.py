@@ -1690,6 +1690,87 @@ def test_clear_landed_landmarks_clears_the_condition4_firing_marker(tmp_path: Pa
     assert not marker.exists()
 
 
+# ── #290 AC5: the dangling dead-pane firing marker is swept once the issue lands ──
+# A dead-pane fire raises no needs-human-land tag, so _wd_clear_landed_landmarks never revisits it.
+# The dispatcher's else-clear only runs for IN-FLIGHT worktrees, and a landed issue's worktree is
+# gone next tick — so wd-fire-dedup-dead-pane-<N> dangles forever (the #284 marker still on disk).
+def test_sweep_drops_the_dead_pane_marker_for_a_landed_issue(tmp_path: Path) -> None:
+    ledger = tmp_path / "l.jsonl"
+    landed = tmp_path / "wd-fire-dedup-dead-pane-284"  # dir == dirname(ledger)
+    still_open = tmp_path / "wd-fire-dedup-dead-pane-7"
+    landed.write_text("")
+    still_open.write_text("")
+    env = {
+        "HUB_WATCHDOG_LEDGER": str(ledger),
+        "HUB_WATCHDOG_ISSUE_STATE_CMD": '[ "$1" = 284 ] && echo closed || echo open',
+    }
+
+    _call('_wd_sweep_dead_pane_markers ""', env=env)
+
+    assert not landed.exists()  # closed/landed → swept
+    assert still_open.exists()  # still open → a genuine unresolved condition, kept
+
+
+def test_sweep_keeps_the_dead_pane_marker_for_an_in_flight_issue(tmp_path: Path) -> None:
+    # An issue whose worktree is still in-flight this tick is the DISPATCHER's to clear — its
+    # detector may legitimately still be firing. Sweeping it here would re-arm the dedup mid-fire
+    # and let the same unresolved condition double-count in the ledger (#263).
+    ledger = tmp_path / "l.jsonl"
+    marker = tmp_path / "wd-fire-dedup-dead-pane-284"
+    marker.write_text("")
+    env = {"HUB_WATCHDOG_LEDGER": str(ledger), "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo closed"}
+
+    _call("_wd_sweep_dead_pane_markers 284", env=env)
+
+    assert marker.exists(), "an in-flight issue is the dispatcher's to clear, not the sweep's"
+
+
+def test_sweep_keeps_the_dead_pane_marker_when_the_issue_state_is_ambiguous(tmp_path: Path) -> None:
+    # Fail-safe, mirroring _wd_clear_landed_landmarks: a gh outage / empty read must never be
+    # treated as "landed". _wd_issue_open reads an unknown state as OPEN.
+    ledger = tmp_path / "l.jsonl"
+    marker = tmp_path / "wd-fire-dedup-dead-pane-9"
+    marker.write_text("")
+    env = {"HUB_WATCHDOG_LEDGER": str(ledger), "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo ''"}
+
+    _call('_wd_sweep_dead_pane_markers ""', env=env)
+
+    assert marker.exists()
+
+
+def test_sweep_ignores_a_non_numeric_marker_stem(tmp_path: Path) -> None:
+    # The supervisor-dead condition files its firing under the issue "-"; the glob must not try to
+    # resolve that as an issue number.
+    ledger = tmp_path / "l.jsonl"
+    marker = tmp_path / "wd-fire-dedup-dead-pane--"
+    marker.write_text("")
+    env = {"HUB_WATCHDOG_LEDGER": str(ledger), "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo closed"}
+
+    result = _call('_wd_sweep_dead_pane_markers ""', env=env)
+
+    assert result.returncode == 0
+    assert marker.exists()
+
+
+def test_run_conditions_sweeps_a_landed_dead_pane_marker(tmp_path: Path) -> None:
+    # End-to-end: the #284 shape after the land completed — the worktree is gone, so the issue is
+    # no longer in-flight and the dispatcher's else-clear can never run for it again.
+    ledger = tmp_path / "l.jsonl"
+    marker = tmp_path / "wd-fire-dedup-dead-pane-284"
+    marker.write_text("")
+    env = {
+        "HUB_WATCHDOG_LEDGER": str(ledger),
+        "HUB_WATCHDOG_LANDMARK_REPO": str(tmp_path / "no-landmark-repo"),
+        "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo closed",
+        "AFK_NOW": NOW,
+    }
+    prelude = 'inflight_worktrees() { printf ""; }'  # #284 landed → nothing in flight
+
+    _call(f"{prelude}; _wd_run_conditions {NOW} live", env=env)
+
+    assert not marker.exists()
+
+
 # ── the dispatcher: firing dedup re-arms when a condition resolves (#263) ──────
 def test_run_conditions_clears_firing_marker_when_condition_resolves(tmp_path: Path) -> None:
     # #263: a detector that does NOT fire this tick clears its firing marker, so a genuinely
