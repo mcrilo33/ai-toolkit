@@ -166,11 +166,12 @@ def _acceptance_graph() -> list[dict]:
 
 
 def test_acceptance_batch_honors_criticalpath_scope_and_exclusivity() -> None:
-    batch = _plan(_acceptance_graph())
+    groups = _groups(_acceptance_graph())
 
-    # Critical-path depth puts #1 first; #5 is the only disjoint ready peer.
-    # #2/#3 are blocked, #4 collides with #1, #6 is exclusive.
-    assert batch == [1, 5]
+    # Critical-path depth puts #1's unit first; #5 is the only disjoint ready peer.
+    # #2/#3 are blocked and #6 is exclusive. #4 shares #1's exact scope, so since #278 it
+    # rides #1's spoke as an ordered subtask rather than waiting out a whole lifecycle.
+    assert groups == [[1, 4], [5]]
 
 
 def test_blocked_issues_are_not_ready() -> None:
@@ -179,10 +180,14 @@ def test_blocked_issues_are_not_ready() -> None:
     assert 2 not in batch and 3 not in batch
 
 
-def test_scope_collision_excludes_lower_priority_issue() -> None:
-    batch = _plan(_acceptance_graph())
+def test_scope_collision_does_not_give_the_colliding_issue_its_own_spoke() -> None:
+    # Pre-#278 this asserted `4 not in batch`. #4 still never gets a SPOKE of its own —
+    # the invariant that mattered — but it is no longer dropped from the plan: sharing
+    # #1's exact scope now makes it a subtask on #1's branch.
+    groups = _groups(_acceptance_graph())
 
-    assert 4 not in batch, "#4 shares scope a.py with the higher-priority #1"
+    assert [4] not in groups, "#4 shares scope a.py with #1 — it must not get its own spoke"
+    assert groups[0] == [1, 4], "it ships as an ordered subtask under #1 instead"
 
 
 def test_star_scope_is_exclusive() -> None:
@@ -221,10 +226,10 @@ def test_mixed_blockers_block_when_any_is_open() -> None:
 
 def test_inflight_scope_excludes_colliding_ready_issue() -> None:
     # An in-flight spoke already owns d.py, so #5 can no longer join.
-    batch = _plan(_acceptance_graph(), inflight=["d.py"])
+    groups = _groups(_acceptance_graph(), inflight=["d.py"])
 
-    assert 5 not in batch
-    assert batch == [1]
+    assert 5 not in [n for group in groups for n in group]
+    assert groups == [[1, 4]]
 
 
 def test_inflight_exclusive_spoke_blocks_the_whole_batch() -> None:
@@ -297,10 +302,9 @@ def test_priority_read_unaffected_by_lifecycle_labels() -> None:
         _node(20, "shared.py"),
     ]
 
-    batch = _plan(nodes)
-
-    assert batch[0] == 10, "lifecycle labels must not mask the priority read"
-    assert 20 not in batch
+    # Sharing a scope, the two now form ONE unit (#278) — and the unit LEADS with the
+    # ranked winner, so the leader is still exactly what proves the priority read.
+    assert _groups(nodes) == [[10, 20]], "lifecycle labels must not mask the priority read"
 
 
 # ── priority label: dispatched ahead of equally-eligible peers (issue #147) ───
@@ -308,18 +312,15 @@ def test_priority_read_unaffected_by_lifecycle_labels() -> None:
 
 def test_priority_label_outranks_higher_criticalpath_depth() -> None:
     # #20 has the deeper critical-path tail (it blocks #21), so by depth alone it
-    # ranks first — but #10 carries `priority` and they collide on shared.py, so
-    # only one is picked. Priority must win the seat.
+    # ranks first — but #10 carries `priority` and they share shared.py, so they pack
+    # into one unit. Priority must win the LEAD (the primary that names the branch).
     nodes = [
         _node(10, "shared.py", labels=["priority"]),
         _node(20, "shared.py"),
         _node(21, "a.py", blocked_by=[(20, "OPEN")]),
     ]
 
-    batch = _plan(nodes)
-
-    assert batch[0] == 10, "a priority issue outranks a deeper-critical-path peer"
-    assert 20 not in batch, "#20 collides on shared.py with the higher-priority #10"
+    assert _groups(nodes) == [[10, 20]], "a priority issue outranks a deeper-path peer"
 
 
 def test_priority_issue_still_batches_with_disjoint_peer() -> None:
@@ -540,8 +541,16 @@ def test_split_marker_requires_intentional_value() -> None:
 
 
 def test_unchained_merge_candidates_warn_for_ready_colliding_cluster() -> None:
-    # Four ready, dependency-free issues on an identical scope — the #165 case.
-    nodes = [_node(n, "langfuse_spoke_tree.py") for n in (158, 160, 161, 162)]
+    # Four ready, dependency-free issues colliding on langfuse_spoke_tree.py — the #165
+    # case. Each also owns a file the others don't, so no pair is packable (#278) and the
+    # cluster is still the real, un-absorbed serialization this lint exists to surface.
+    # (The identical-scope variant is now auto-packed; see the #278 suppression tests.)
+    nodes = [
+        _node(158, "langfuse_spoke_tree.py a.py"),
+        _node(160, "langfuse_spoke_tree.py b.py"),
+        _node(161, "langfuse_spoke_tree.py c.py"),
+        _node(162, "langfuse_spoke_tree.py d.py"),
+    ]
 
     proc = _run_plan(nodes)
 
@@ -586,11 +595,12 @@ def test_unchained_not_double_reported_with_chain() -> None:
 
 def test_unchained_and_chain_reported_separately() -> None:
     # A #125 chain (a.py) and an unchained ready cluster (b.py) each print one line.
+    # The ready pair overlaps only partially, so #278 packing leaves it alone.
     nodes = [
         _node(1, "a.py"),
         _node(2, "a.py", blocked_by=[(1, "OPEN")]),
-        _node(31, "b.py"),
-        _node(32, "b.py"),
+        _node(31, "b.py x.py"),
+        _node(32, "b.py y.py"),
     ]
 
     proc = _run_plan(nodes)
@@ -603,14 +613,14 @@ def test_unchained_and_chain_reported_separately() -> None:
 
 
 def test_unchained_lint_is_detection_only() -> None:
-    # The lint fires but leaves the greedy-pack batch and exit code untouched: two
-    # ready issues colliding on a.py still dispatch exactly one.
-    nodes = [_node(1, "a.py"), _node(2, "a.py")]
+    # The lint fires but leaves the greedy-pack batch and exit code untouched: two ready
+    # issues partially overlapping on a.py (unpackable, so still serialized) dispatch one.
+    nodes = [_node(1, "a.py m.py"), _node(2, "a.py z.py")]
 
     proc = _run_plan(nodes)
 
     assert proc.returncode == 0
-    assert [int(tok) for tok in proc.stdout.split()] == [1]
+    assert _batch_line(proc.stdout) == "1"
     assert "ready & unchained" in proc.stderr
 
 
@@ -618,12 +628,12 @@ def test_unchained_reports_collision_across_separate_chains() -> None:
     # #1 and #5 each head their own colliding chain (#125 reports each pair), but they
     # also collide with EACH OTHER on a.py — a cross-chain ready collision #125 never
     # pairs. The unchained lint must still surface #1/#5 rather than drop both as
-    # already-flagged.
+    # already-flagged. The two heads overlap only partially, so #278 does not pack them.
     nodes = [
-        _node(1, "a.py"),
-        _node(2, "a.py", blocked_by=[(1, "OPEN")]),
-        _node(5, "a.py"),
-        _node(6, "a.py", blocked_by=[(5, "OPEN")]),
+        _node(1, "a.py m.py"),
+        _node(2, "a.py m.py", blocked_by=[(1, "OPEN")]),
+        _node(5, "a.py z.py"),
+        _node(6, "a.py z.py", blocked_by=[(5, "OPEN")]),
     ]
 
     proc = _run_plan(nodes)
@@ -933,8 +943,8 @@ def test_scopeless_warning_excludes_held_issue() -> None:
 
 def test_tiebreak_prefers_more_direct_dependents() -> None:
     # #10 and #20 are both ready with depth 2, but #10 directly unblocks two issues
-    # while #20 unblocks one. They share scope, so only the higher-priority one is
-    # picked — proving #10 (more direct dependents) outranks #20.
+    # while #20 unblocks one. They share scope, so they pack into one unit and #10 must
+    # LEAD it — proving #10 (more direct dependents) outranks #20.
     nodes = [
         _node(10, "shared.py"),
         _node(20, "shared.py"),
@@ -943,10 +953,9 @@ def test_tiebreak_prefers_more_direct_dependents() -> None:
         _node(21, "c.py", blocked_by=[(20, "OPEN")]),
     ]
 
-    batch = _plan(nodes)
+    groups = _groups(nodes)
 
-    assert batch[0] == 10, "equal depth ⇒ the issue with more direct dependents ranks first"
-    assert 20 not in batch, "#20 collides on shared.py with the higher-priority #10"
+    assert groups == [[10, 20]], "equal depth ⇒ more direct dependents leads the unit"
 
 
 # ── concurrency cap: bound live spokes across dispatch (issue #151) ───────────
@@ -1006,11 +1015,11 @@ def test_absent_cap_preserves_unlimited_batch() -> None:
 
 
 def test_cap_does_not_reorder_or_add_issues() -> None:
-    # The cap only removes from the tail of the priority-ordered batch; a scope
-    # collision still excludes #4 and exclusivity still bars #6 even under a cap.
-    batch = _plan(_acceptance_graph(), cap=5)
+    # The cap only removes from the tail of the priority-ordered batch; #4 still gets no
+    # spoke of its own (it packs into #1's) and exclusivity still bars #6 even under a cap.
+    groups = _groups(_acceptance_graph(), cap=5)
 
-    assert batch == [1, 5], "cap ≥ batch leaves the greedy pack untouched"
+    assert groups == [[1, 4], [5]], "cap ≥ batch leaves the greedy pack untouched"
 
 
 # ── end-to-end: mock gh through main (fetch → plan) ───────────────────────────
@@ -1040,7 +1049,8 @@ def test_main_fetches_via_gh_and_prints_batch(tmp_path: Path) -> None:
     proc = subprocess.run(["bash", str(BATCH_PLAN)], capture_output=True, text=True, env=env)
 
     assert proc.returncode == 0, proc.stderr
-    assert [int(t) for t in proc.stdout.split()] == [1, 5]
+    # #1 and #4 share a scope, so they reach the wire as one comma-joined dispatch unit.
+    assert _batch_line(proc.stdout) == "1,4 5"
 
 
 # ── doc guards: the skill is registered and dispatches ────────────────────────
@@ -1271,9 +1281,11 @@ def test_explain_marks_disjoint_ready_issue_queued() -> None:
 
 
 def test_explain_ready_scope_collision_between_peers_blocks_lower_priority() -> None:
-    # Two ready issues share a.py, nothing in-flight: the lower-numbered wins the slot
-    # (queued) and the other is blocked-by-scope on it — mirrors the greedy pack.
-    out = _explain([_node(10, "a.py"), _node(11, "a.py")])
+    # Two ready issues collide on a.py without either containing the other, nothing
+    # in-flight: the lower-numbered wins the slot (queued) and the other is
+    # blocked-by-scope on it — mirrors the greedy pack. (An IDENTICAL scope now packs
+    # instead; see test_explain_reports_the_pack_not_a_scope_collision.)
+    out = _explain([_node(10, "a.py m.py"), _node(11, "a.py z.py")])
 
     assert re.search(r"^#10\b.*\bqueued\b", out, re.M)
     assert re.search(r"^#11\b.*\bblocked-by-scope:#10\b", out, re.M)
@@ -1289,7 +1301,10 @@ def test_explain_labels_collapse_to_the_four_label_set() -> None:
 
 
 def test_explain_labels_mark_queued_and_exclusive() -> None:
-    labels = _label_map([_node(10, "a.py"), _node(11, "b.py"), _node(12, "a.py")])
+    # #12 overlaps #10 on a.py without either containing the other, so it is genuinely
+    # held back. (An identical scope packs and reads afk:queued — see
+    # test_explain_labels_mark_a_packed_peer_queued.)
+    labels = _label_map([_node(10, "a.py m.py"), _node(11, "b.py"), _node(12, "a.py z.py")])
 
     assert labels["10"] == "afk:queued"
     assert labels["11"] == "afk:queued"
@@ -1391,6 +1406,83 @@ def test_held_peer_never_packs_into_a_unit() -> None:
     groups = _groups([_node(10, scope), _node(11, scope, labels=["hold"])])
 
     assert groups == [[10]]
+
+
+def test_a_peer_never_widens_a_unit_into_an_inflight_spokes_scope() -> None:
+    # #1 is correctly refused a slot of its own — it collides with the in-flight z. It
+    # must not then slip in through the back door as #2's subtask: absorbing it would
+    # widen the unit from {w} to {w, z} and put two spokes on z.py at once, the exact
+    # collision the planner exists to prevent. Containment forbids it (#1 is a superset
+    # of the leader, so it never fits inside).
+    groups = _groups([_node(1, "w z"), _node(2, "w")], inflight=["z"])
+
+    assert groups == [[2]]
+
+
+def test_a_peer_never_widens_a_unit_into_an_earlier_units_scope() -> None:
+    # The same invariant against an already-chosen GROUP rather than an in-flight spoke.
+    # #1 takes a slot owning {a, z}. #2 then leads its own unit with {w} — disjoint, fine.
+    # Absorbing #3 {w, z} into #2 would widen that unit onto z.py, which #1's unit already
+    # owns. Containment refuses it (a superset never fits), so #3 waits its turn.
+    groups = _groups([_node(1, "a z"), _node(2, "w"), _node(3, "w z")])
+
+    assert groups == [[1], [2]], "#3 must not widen #2's unit onto #1's z.py"
+
+
+def test_packing_never_de_parallelizes_two_disjoint_issues() -> None:
+    # THE regression guard for the whole feature. #1 {w} and #10 {b} are disjoint and
+    # dispatch as two CONCURRENT spokes — both before #278 and after. #2 {w, b} collides
+    # with both and waits, exactly as it always did.
+    #
+    # Absorbing #2 into #1 would widen that unit onto b.py and swallow #10 too, collapsing
+    # three issues into ONE serial spoke: a parallelism LOSS in the very change meant to
+    # buy throughput. Containment (a peer must fit INSIDE the leader's scope) is what
+    # forbids it — #2 is a superset of #1, so it is never absorbed.
+    groups = _groups([_node(1, "w"), _node(2, "w b"), _node(10, "b")])
+
+    assert groups == [[1], [10]], "#1 and #10 must stay concurrent; #2 waits its turn"
+
+
+def test_a_superset_peer_is_deferred_not_absorbed() -> None:
+    # #11's footprint is strictly WIDER than the leader's, so packing it would grow the
+    # unit past the scope #10 won its slot with. It waits instead — and is not lost: when
+    # ranking makes the superset the leader, the subset packs into it (see
+    # test_subset_scope_packs_into_its_superset_peer).
+    groups = _groups([_node(10, "a.py"), _node(11, "a.py b.py")])
+
+    assert groups == [[10]]
+
+
+def test_an_inflight_issue_is_never_packed_into_a_new_unit() -> None:
+    # The in-flight spoke's own issue is still OPEN in the backlog, so it is still a `ready`
+    # node the peer sweep can see. Folding it into a fresh unit would re-dispatch live work
+    # to a second spoke — the worst shape of the widening bug.
+    groups = _groups([_node(100, "z"), _node(1, "w z"), _node(2, "w")], inflight=["z"])
+
+    assert 100 not in [n for group in groups for n in group]
+
+
+def test_split_intentional_opts_an_issue_out_of_packing() -> None:
+    # `Split: intentional` records that the operator DECIDED these stay apart. Auto-packing
+    # them into one spoke is exactly the merge they declined, so the marker must gate
+    # packing, not merely silence the lint — on both sides of the relation.
+    scope = "a.py"
+    assert _groups([_node(1, scope), _node(2, scope, split="intentional — kept apart")]) == [[1]]
+    assert _groups([_node(1, scope, split="intentional — kept apart"), _node(2, scope)]) == [[1]]
+
+
+def test_split_intentional_blocks_a_route_to_a_live_spoke() -> None:
+    # The same operator decision must survive trigger B: a deliberate split is never
+    # routed into the running spoke it collides with.
+    proc = _run_plan(
+        [_node(263, "a.py"), _node(264, "a.py", split="intentional — kept apart")],
+        inflight=["a.py"],
+        inflight_issue=[263],
+        route=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    assert _routes(proc.stdout) == []
 
 
 def test_pack_max_bounds_group_size_and_overflows_the_rest() -> None:
@@ -1502,6 +1594,20 @@ def test_route_is_silent_when_the_issue_is_packable_into_two_live_spokes() -> No
     proc = _run_plan(
         [_node(263, "a.py"), _node(265, "a.py"), _node(264, "a.py")],
         inflight=["a.py", "a.py"],
+        inflight_issue=[263, 265],
+        route=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    assert _routes(proc.stdout) == []
+
+
+def test_route_is_silent_when_the_target_spoke_is_not_the_only_collision() -> None:
+    # #264 is packable into #263's spoke only, but its scope also overlaps live #265 on
+    # b.py. Routing it would put two spokes on b.py, so fail closed.
+    proc = _run_plan(
+        [_node(263, "a.py b.py"), _node(265, "b.py z.py"), _node(264, "a.py b.py")],
+        inflight=["a.py b.py", "b.py z.py"],
         inflight_issue=[263, 265],
         route=True,
     )
