@@ -6968,6 +6968,29 @@ def test_selfcheck_opt_out_runs_no_probe_at_all(tmp_path: Path) -> None:
     assert not fired.exists(), "the opt-out must not run the probes at all"
 
 
+def test_selfcheck_opt_out_still_enforces_the_telemetry_gate(tmp_path: Path) -> None:
+    # AFK_ARM_SELFCHECK=0 waives the LIVE PROBES; it must not become a second, silent opt-out
+    # for the #108 telemetry hard-fail, which already has its own explicit one
+    # (AI_TOOLKIT_OTEL=0). Folding telemetry inside the opt-out's early return regressed this:
+    # an operator skipping the slow round trips also lost the collector gate without asking.
+    result = _run_selfcheck(tmp_path, AFK_ARM_SELFCHECK="0", telemetry_rc=1)
+
+    assert "RC=1" in result.stdout, (
+        "the liveness opt-out must NOT waive the telemetry gate — AI_TOOLKIT_OTEL=0 is that gate's opt-out"
+    )
+
+
+def test_selfcheck_opt_out_says_it_did_not_probe(tmp_path: Path) -> None:
+    # An opted-out arm must not print a verdict line claiming the dependencies are alive:
+    # nothing was probed, and a log that says otherwise is worse than no log at all.
+    result = _run_selfcheck(tmp_path, AFK_ARM_SELFCHECK="0")
+
+    assert "SKIPPED" in result.stderr, result.stderr
+    assert "arm self-check OK" not in result.stderr, (
+        "an unprobed arm must never claim a clean self-check"
+    )
+
+
 def test_selfcheck_reports_telemetry_opt_out_rather_than_claiming_it_is_wired(
     tmp_path: Path,
 ) -> None:

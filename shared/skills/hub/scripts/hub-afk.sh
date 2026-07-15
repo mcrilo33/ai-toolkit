@@ -66,6 +66,10 @@
 #                                onto the new code at the next tick boundary (see the self-update
 #                                block below); AFK_SYNC_CMD / AFK_SELFUPDATE_SMOKE_CMD are seams.
 #   AFK_ARM_PRECHECK=1           arm-precondition gate (=0 skips live/dirty/branch/gh-auth checks)
+#   AFK_ARM_SELFCHECK=1          arm-time LIVENESS self-check (#279): real round trips against
+#                                the judge, claude, the gh API, testmon + the telemetry
+#                                preflight, folded into ONE verdict before any state is
+#                                written. =0 skips every probe (independent of ARM_PRECHECK)
 #   AFK_ARM_AUTH_TIMEOUT=120     seconds bounding the arm-time claude round trip (#279) — a COLD
 #                                start, so between the reap probe's 30s and the answerer's 900s
 #   AFK_GH_PROBE_ENDPOINT        the arm-time gh api round-trip endpoint [default: rate_limit];
@@ -3104,8 +3108,15 @@ afk_reconcile() {
     log "/afk reconcile: preconditions not met — not re-arming (see above)"
     return 1
   fi
-  if ! afk_telemetry_preflight "$repo_root"; then
-    log "/afk reconcile: telemetry preflight failed — not re-arming (see above)"
+  # The #279 liveness self-check travels with the resume: a crashed supervisor must not be
+  # brought back into a dead judge / answerer / API either. It subsumes the telemetry
+  # preflight this branch used to call directly, so the resume runs exactly the gates a fresh
+  # arm runs. (The bare no-arg resume — a watchdog respawn — deliberately does NOT run it:
+  # gating a RECOVERY path on live probes would let a transient outage respawn-loop into a
+  # refusal forever, and a dependency that dies mid-window is already caught at runtime by the
+  # #268 judge halt and the #241 §9 auth halt.)
+  if ! afk_arm_selfcheck "$repo_root"; then
+    log "/afk reconcile: arm self-check failed — not re-arming (see above)"
     return 1
   fi
   _afk_watchdog_respawn   # detached no-arg resume — re-adopts the in-flight spokes
@@ -3527,6 +3538,109 @@ afk_arm_preconditions() {
   return 0
 }
 
+# --- the ONE arm-time verdict (issue #279) ------------------------------------
+
+# _afk_arm_telemetry_gate <repo_root> -> the #108 preflight with a self-check-shaped refusal
+# line. Runs on BOTH the probed and the opted-out path: AI_TOOLKIT_OTEL=0 is the telemetry
+# opt-out, AFK_ARM_SELFCHECK=0 is the liveness-probe opt-out, and neither may stand in for the
+# other. Called LAST on the probed path because it is the only check with side effects (it
+# launches the collector/bridge and exports auth) -- nothing gets started on a host that was
+# going to be refused anyway.
+_afk_arm_telemetry_gate() {
+  afk_telemetry_preflight "$1" && return 0
+  log "/afk: refusing to arm — the telemetry pipeline could not be wired (see above); the dashboard is the single source of truth for an unattended run (AI_TOOLKIT_OTEL=0 to drain without it)"
+  return 1
+}
+
+# _afk_telemetry_desc -> the verdict line's telemetry clause: never claim "wired" when the
+# operator opted out.
+_afk_telemetry_desc() {
+  if afk_telemetry_enabled; then
+    printf 'telemetry wired (collector :4317, bridge :4319)\n'
+  else
+    printf 'telemetry off (AI_TOOLKIT_OTEL=0)\n'
+  fi
+}
+# afk_arm_selfcheck <repo_root> -> rc 0 when the drain may arm (possibly DEGRADED), rc 1 to
+# refuse. Chained in main() AFTER afk_arm_preconditions (so the instant static refusals — a
+# dirty tree, an off-base HEAD, a live supervisor — never wait ~2 minutes on real round trips)
+# and BEFORE afk_write_state, so a refusal writes no state, reaches no loop, and dispatches
+# no spoke. AFK_ARM_SELFCHECK=0 opts the whole gate out, independently of AFK_ARM_PRECHECK.
+#
+# Per-check policy, and why each falls where it does:
+#   judge     BLOCK — a dead judge grinds EVERY tier-3 permission to DENY for the whole
+#                     window. This is #268 itself, the incident that motivated the issue.
+#   claude    BLOCK — no answerer means every parked spoke escalates to blocked/<issue>.
+#   gh api    BLOCK — dispatch, land, and answer all need the API, not merely a valid token.
+#   testmon   WARN  — the ONLY degradation that is still CORRECT, just slow (every first push
+#                     runs the full suite). Refusing the whole drain over it would be worse
+#                     than the problem.
+#   telemetry BLOCK — unchanged #108 posture (the dashboard is the SSOT for an unattended
+#                     run); AI_TOOLKIT_OTEL=0 remains its opt-out.
+#
+# Order: gh first (bounded 30s, the cheapest real proof), then the two ~2-minute LLM round
+# trips, then the free local testmon read, and telemetry LAST because it is the only check
+# with side effects — it launches the collector/bridge containers and exports auth. Nothing
+# gets started on a host that was going to be refused anyway.
+afk_arm_selfcheck() {
+  local repo_root="$1" judge_reason claude_state testmon_state telemetry_desc
+  # The opt-out waives the LIVE PROBES only -- never the telemetry preflight below. Folding
+  # telemetry inside this early return would have made AFK_ARM_SELFCHECK=0 a second, silent
+  # opt-out for a gate that already has its own explicit one (AI_TOOLKIT_OTEL=0), so an
+  # operator skipping the slow round trips would also have lost the #108 hard-fail without
+  # asking to.
+  if [ "${AFK_ARM_SELFCHECK:-1}" = "0" ]; then
+    _afk_arm_telemetry_gate "$repo_root" || return 1
+    log "/afk: arm self-check SKIPPED (AFK_ARM_SELFCHECK=0) — judge/claude/gh/testmon liveness NOT probed; $(_afk_telemetry_desc)"
+    return 0
+  fi
+
+  if ! _afk_arm_gh_check; then
+    log "/afk: refusing to arm — the GitHub API did not answer a bounded '${AFK_GH_PROBE_ENDPOINT:-rate_limit}' round trip (the token is present — 'gh auth status' passed — but the API is unreachable: check the network, a proxy, or an outage). Dispatch, land, and answer all need it (#279)"
+    return 1
+  fi
+
+  judge_reason="$(_afk_arm_judge_check)" || {
+    log "/afk: refusing to arm — the tier-3 permission judge is not usable: $judge_reason. An unusable judge fails EVERY uncached tier-3 verdict closed, so every spoke's permissions grind to DENY for the whole window (#268). Fix the judge, or raise AFK_JUDGE_TIMEOUT if it timed out (#279)"
+    return 1
+  }
+
+  claude_state="$(_afk_arm_claude_check)"
+  case "$claude_state" in
+    alive) ;;
+    offline)
+      log "/afk: refusing to arm — this host cannot reach the network (${AFK_NET_PROBE_URL:-https://api.anthropic.com} did not answer). Nothing is wrong with your credentials; restore connectivity and re-arm (#249/#279)"
+      return 1 ;;
+    auth-dead)
+      log "/afk: refusing to arm — the network is up but 'claude' reports an AUTH failure: the subscription token is dead and every spoke would stall on it. Run 'claude' → /login (see docs/remote-afk.md) and re-arm (#279)"
+      return 1 ;;
+    *)
+      log "/afk: refusing to arm — 'claude' did not answer a bounded ${AFK_ARM_AUTH_TIMEOUT:-120}s probe (no auth error, just no answer): the CLI may be absent from PATH, wedged, or slower than the budget. An arm-time gate must PROVE the answerer works before dispatching into it (#279)"
+      return 1 ;;
+  esac
+
+  # WARN-only: name the consequence the operator will actually feel, not the missing package.
+  testmon_state="$(_afk_arm_testmon_check "$repo_root")"
+  case "$testmon_state" in
+    ok) testmon_state="testmon present" ;;
+    missing)
+      log "/afk: DEGRADED — pytest-testmon is not importable by the resolved pytest runner, so EVERY first push per worktree runs the full multi-thousand-test suite instead of the affected set. Arming anyway (slow but correct); 'pip install -r requirements-dev.txt' to fix (#279)"
+      testmon_state="testmon MISSING (every first push runs the full suite)" ;;
+    *)
+      log "/afk: DEGRADED — could not determine whether pytest-testmon is installed (no pytest runner answered). Arming anyway; if it is absent, every first push runs the full suite (#279)"
+      testmon_state="testmon UNKNOWN" ;;
+  esac
+
+  # LAST: the only check that starts things. Its own refusal lines are already loud (#108).
+  _afk_arm_telemetry_gate "$repo_root" || return 1
+  telemetry_desc="$(_afk_telemetry_desc)"
+
+  # ONE line, all five dependencies, honest about a degradation: an operator scanning an
+  # unattended run's log gets a single arm-time verdict rather than five scattered notes.
+  log "/afk: arm self-check OK — judge alive ($judge_reason), claude alive, gh api reachable, $testmon_state, $telemetry_desc"
+  return 0
+}
+
 # --- CLI ----------------------------------------------------------------------
 
 # _afk_status_state_line <state> <now> -> echo the window's state line, distinguishing the
@@ -3742,10 +3856,13 @@ main() {
     # dirty tree, an off-base HEAD, or dead gh auth — the drain's own prerequisites, checked
     # the same refuse-to-arm way the telemetry preflight checks the pipeline's.
     afk_arm_preconditions "$MAIN_ROOT" || return 2
-    # Telemetry preflight BEFORE arming: an unattended drain must not dispatch spokes into
-    # a dead telemetry pipeline (the dashboard is the SSOT). Refuse to arm — write no state,
-    # never reach the loop — when collector/bridge/auth can't be wired (#108).
-    afk_telemetry_preflight "$MAIN_ROOT" || return 2
+    # Liveness self-check BEFORE arming (#279): the static preconditions above all passed on
+    # the #268 host while the tier-3 judge was structurally dead, so the drain armed clean and
+    # ground every permission to DENY for an hour. This runs the REAL round trips — judge,
+    # claude, gh API, testmon — and folds in the #108 telemetry preflight, so the operator
+    # gets ONE arm-time verdict. Same refuse-to-arm posture: write no state, never reach the
+    # loop, dispatch nothing into a dependency that cannot answer.
+    afk_arm_selfcheck "$MAIN_ROOT" || return 2
     afk_write_state "$end"
     # Mint + bind a fresh arm generation (#252): the old sleeper from a prior arm reads its bound
     # token as superseded on its next tick and steps down, so an off/re-arm recycle never runs two.
