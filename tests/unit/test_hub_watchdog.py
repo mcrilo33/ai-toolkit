@@ -1401,8 +1401,51 @@ def test_terminal_marker_kind_prefers_ready_when_both_sit_at_the_tip(tmp_path: P
 
 def test_terminal_marker_kind_empty_when_no_terminal_marker(tmp_path: Path) -> None:
     # Unreadable kind must fall through to the historical afk-defect path, never to the silent one.
+    # returncode is asserted too: a missing/broken helper exits 127 with empty stdout, which would
+    # satisfy a stdout-only assertion and leave this safety-critical fallthrough unguarded.
     wt, _ = _mergeable_repo(tmp_path)
-    assert _call(f"_wd_terminal_marker_kind '{wt}' 5").stdout.strip() == ""
+    out = _call(f"_wd_terminal_marker_kind '{wt}' 5")
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == ""
+
+
+def test_accept_unsigned_reason_names_conflicts_too(tmp_path: Path) -> None:
+    # #285's honesty contract applies to accept/ as well. accept/ is normally eyeball-THEN-land and
+    # auto_land never touches it, so condition 4 is the ONLY mergeability probe it ever gets: drop
+    # the file list and a human who approves the code walks straight into an unannounced conflict.
+    wt, base = _conflicting_repo(tmp_path)
+    _accept_tag(wt)
+    ledger = _run_conditions_ledger(wt, base, tmp_path)
+
+    assert '"condition":"accept-unsigned"' in ledger, ledger
+    assert "README.md" in ledger, "an accept/ escalation must still name the conflicting files"
+
+
+def test_own_commits_is_zero_when_the_local_base_lags_origin(tmp_path: Path) -> None:
+    # Spokes branch from origin/<base> (wt_base_start_point: "the hub's local base may lag or carry
+    # unpushed work"), while _wd_land_base_ref PREFERS the local ref. Measuring <local-base>..HEAD
+    # then reports the base's OWN missing commits as the spoke's work, dropping the zero-diff clause
+    # on exactly #292's headline scenario — the human lands an empty branch and closes it as shipped.
+    wt = _git_repo(tmp_path)
+    base = _base_branch(wt)
+    (wt / "README.md").write_text("base\n")
+    _git(wt, "add", "README.md")
+    _git(wt, "commit", "-qm", "chore: base readme")
+    # origin/<base> is two commits AHEAD of the local base; the spoke branched from origin's tip.
+    _git(wt, "update-ref", f"refs/remotes/origin/{base}", "HEAD")
+    _git(wt, "checkout", "-qb", "feature/5-x")
+    for n in (1, 2):
+        (wt / f"sibling{n}.txt").write_text("landed by someone else\n")
+        _git(wt, "add", f"sibling{n}.txt")
+        _git(wt, "commit", "-qm", f"feat: sibling work {n}")
+    _git(wt, "update-ref", f"refs/remotes/origin/{base}", "HEAD")  # origin absorbed them
+    # The local base still points at the old readme commit — it LAGS origin by two.
+
+    out = _call(f"_wd_own_commits '{wt}'", env={"AI_TOOLKIT_BASE_BRANCH": base}).stdout.strip()
+
+    assert out == "0", (
+        "a branch holding only commits the base's remote already has authored nothing of its own"
+    )
 
 
 def test_own_commits_counts_zero_for_a_close_without_code_branch(tmp_path: Path) -> None:

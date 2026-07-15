@@ -704,30 +704,63 @@ _wd_terminal_marker_kind() {
   return 0
 }
 
-# _wd_own_commits <wt> -> how many commits the checked-out branch has that the land base does not.
-# Zero is the #286 close-without-code shape: the spoke judged the work already shipped and minted
-# accept/ at the base tip, so a land would merge nothing and close the issue as SHIPPED — which is
-# not the decision actually pending. Empty when the probe fails, so the reason simply omits the
-# claim rather than asserting a count it did not measure.
+# _wd_base_name <wt> -> the bare base-branch name (no origin/ prefix); defaults to main.
+_wd_base_name() {
+  local wt="$1" base=""
+  command -v wt_base_branch >/dev/null 2>&1 && base="$(wt_base_branch "$wt" 2>/dev/null || true)"
+  [ -n "$base" ] || base=main
+  printf '%s\n' "$base"
+}
+
+# _wd_own_commits <wt> -> how many commits the branch has that the base's history does not — i.e.
+# what the spoke itself authored. Zero is the #286 close-without-code shape: the spoke judged the
+# work already shipped and minted accept/ at the branch point, so a land would merge nothing and
+# close the issue as SHIPPED — not the decision actually pending.
+# Excludes BOTH refs/heads/<base> AND refs/remotes/origin/<base>, whichever exist, rather than
+# measuring `<land-base>..HEAD`. Two ways that single-base measure lies, in opposite directions:
+#   * spokes branch from origin/<base> (wt_base_start_point, "the hub's local base may lag or carry
+#     unpushed work"), while _wd_land_base_ref PREFERS the local ref — so a lagging local base makes
+#     a genuinely empty branch report the base's own missing commits as "own work", silently
+#     dropping the zero-diff clause on exactly #292's headline scenario;
+#   * and a base that has already absorbed the branch reports 0 for real authored work, which would
+#     tell a human not to land it.
+# Subtracting every base ref that exists answers the question actually asked — did this spoke write
+# anything the base does not already have — under both skews.
+# Empty when nothing is measurable, so the reason OMITS the claim rather than asserting a count it
+# did not measure: silence is the safe direction here, a wrong "no own commits" is not.
 _wd_own_commits() {
-  local wt="$1" base n
-  base="$(_wd_land_base_ref "$wt")"
-  [ -n "$base" ] || return 0
-  n="$(git -C "$wt" rev-list --count "$base..HEAD" 2>/dev/null)" || return 0
+  local wt="$1" base ref n
+  local -a nots=()
+  base="$(_wd_base_name "$wt")"
+  for ref in "refs/heads/$base" "refs/remotes/origin/$base"; do
+    git -C "$wt" show-ref --verify --quiet "$ref" 2>/dev/null && nots+=("$ref")
+  done
+  [ "${#nots[@]}" -gt 0 ] || return 0
+  n="$(git -C "$wt" rev-list --count HEAD --not "${nots[@]}" 2>/dev/null)" || return 0
   case "$n" in '' | *[!0-9]*) return 0 ;; esac
   printf '%s\n' "$n"
 }
 
-# _wd_accept_unsigned_reason <wt> <issue> -> the honest remediation for an accept/ spoke. NOT "human
-# land": on #286 that told a human to land a zero-diff branch, which would have closed the issue as
-# shipped when the pending decision was "confirm the duplicate finding, or reject it and re-kick".
-# Same reason-honesty contract #285 established for the conflicted case, one marker-kind over.
+# _wd_accept_unsigned_reason <wt> <issue> [conflicts] -> the honest remediation for an accept/ spoke.
+# NOT "human land": on #286 that told a human to land a zero-diff branch, which would have closed
+# the issue as shipped when the pending decision was "confirm the duplicate finding, or reject it
+# and re-kick". Same reason-honesty contract #285 established for the conflicted case, one
+# marker-kind over — and for the same reason it must ALSO carry #285's conflict list when there is
+# one: accept/ is normally eyeball-THEN-land, and condition 4 is the only thing that probes
+# mergeability for it (auto_land never touches an accept/ branch, so it never routes a conflict
+# resolution either). Dropping the files would send a human who approves the code straight into an
+# unannounced conflict — exactly the misdirection #285 exists to prevent.
+# <conflicts> and <base> are passed in already-measured rather than re-probed: the base that is
+# PRINTED must be the one the count was measured against (the measured-base contract this file
+# documents at _wd_dead_idle_reason), and the reason re-runs every tick as a _wd_fire argument.
 _wd_accept_unsigned_reason() {
-  local wt="$1" issue="$2" own
+  local wt="$1" issue="$2" conflicts="${3:-}" own base
+  base="$(_wd_land_base_ref "$wt")"
   printf 'accept/%s awaits human sign-off (escalate-only: the drain must NOT land accept/ — it is the human-eyeball terminal)' "$issue"
   own="$(_wd_own_commits "$wt")"
-  [ "$own" = "0" ] && printf ' — no own commits vs %s: confirm close-without-code, do not land' \
-    "$(_wd_land_base_ref "$wt")"
+  [ "$own" = "0" ] && printf ' — no own commits vs %s: confirm close-without-code, do not land' "$base"
+  [ -n "$conflicts" ] && printf ' — NOTE: the branch also conflicts with %s on: %s — resolve on the spoke before any land' \
+    "$base" "$conflicts"
   return 0
 }
 
@@ -1074,10 +1107,16 @@ _wd_classify() {
     accept-unsigned)
       # #292: accept/<N> at the tip is the drain behaving CORRECTLY — spoke-ready's human-eyeball
       # terminal, which auto_land deliberately never lands ("accept/ awaits a human sign-off"). The
-      # wait is a by-design human decision, not a drain shortfall, so it must not dock the #251
-      # autonomy score nor auto-file a bug against afk (which spawned a fresh bug-scoper per
-      # accept-spoke per run — this issue's own provenance). The escalation still ledgers and still
-      # raises the landmark; only the CLASS changes.
+      # wait is a by-design human decision, not a drain shortfall, so it must not auto-file a bug
+      # against afk (which spawned a fresh bug-scoper per accept-spoke per run — this issue's own
+      # provenance). The escalation still ledgers and still raises the landmark; only the CLASS
+      # changes, and only FILING is class-gated (_wd_fire).
+      # It does NOT spare the #251 autonomy score, contrary to what #292 assumed: _wd_autonomy_score
+      # counts _wd_intervention_count (every ledger line), not the class-filtered _wd_defect_count,
+      # so a novel-decision docks the score exactly like a defect. That is pre-existing and shared
+      # with the park-unanswered escape hatch — _wd_report deliberately prints `interventions` and
+      # `defects_filed` as separate figures — so making the score class-aware is a change to #251's
+      # instrument, not something to smuggle in here. Tracked separately.
       printf 'novel-decision\n'; return ;;
     park-unanswered)
       # A deliberate escalation is a real human call, not an afk bug. TWO signals say so, and only
@@ -1303,17 +1342,20 @@ _wd_run_conditions() {
       # treatment. All three escalate via the SAME needs-human-land tag (#272: no second
       # tripwire-racing tag) and _wd_clear_landed_landmarks self-clears it once the human closes
       # the issue; only the reason and class differ.
+      # #285: probe ACTUAL mergeability before labeling — for BOTH marker kinds. An accept/ branch
+      # is normally eyeball-then-land, and this is the only probe it ever gets, so its reason must
+      # name the conflicting files too or an approving human walks into an unannounced conflict.
+      wd_conflicts="$(_wd_land_conflicts "$wt")"; wd_conflicts="${wd_conflicts% }"
       if [ "$(_wd_terminal_marker_kind "$wt" "$issue")" = "accept" ]; then
-        _wd_fire accept-unsigned "$issue" "$(_wd_accept_unsigned_reason "$wt" "$issue")" "$wt"
+        _wd_fire accept-unsigned "$issue" "$(_wd_accept_unsigned_reason "$wt" "$issue" "$wd_conflicts")" "$wt"
         _wd_clear_fired auto-land-skipped "$issue"   # not a drain skip → drop any stale skip firing
         _wd_clear_fired conflicted-land "$issue"
       else
-        # #285: probe ACTUAL mergeability before labeling. A conflicted branch fires a DISTINCT
-        # `conflicted-land` reason naming the files (a human following "mergeable" walks into the
-        # same conflict); a truly-mergeable one keeps the historical auto-land-skipped. Both escalate
-        # via the SAME needs-human-land tag (no second tripwire-racing tag, #272) — only the reason
-        # differs, so the ledger/defect is honest about what the human must do.
-        wd_conflicts="$(_wd_land_conflicts "$wt")"; wd_conflicts="${wd_conflicts% }"
+        # A conflicted ready/ branch fires a DISTINCT `conflicted-land` reason naming the files (a
+        # human following "mergeable" walks into the same conflict); a truly-mergeable one keeps the
+        # historical auto-land-skipped. All three escalate via the SAME needs-human-land tag (no
+        # second tripwire-racing tag, #272) — only the reason and class differ, so the
+        # ledger/defect is honest about what the human must do.
         if [ -n "$wd_conflicts" ]; then
           _wd_fire conflicted-land "$issue" "branch conflicts with $(_wd_land_base_ref "$wt") on: $wd_conflicts — resolve on the spoke (merge the base branch), do not blind-land" "$wt"
           _wd_clear_fired auto-land-skipped "$issue"   # not a clean skip → drop any stale skip firing
