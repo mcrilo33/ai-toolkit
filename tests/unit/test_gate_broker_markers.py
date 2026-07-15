@@ -602,6 +602,76 @@ def test_clear_progress_state_also_clears_the_park_sig_record(tmp_path: Path) ->
     assert not (statedir / "park-sig-5").exists()
 
 
+# ── issue #299 finding 1: the hard ceiling must not count PARK time ────────────────────────────
+# The absolute backstop measures (now - dispatch), so time a spoke spent PARKED — waiting on the
+# supervisor's own answer lane — pre-ages it exactly as park time pre-aged the done clock before
+# #263. The kill does not land while parked (slot_state's park-wins keeps a parked spoke out of
+# `reap`, #246); it lands on the FIRST tick AFTER it unparks, when an actively-working spoke has
+# no #256 completion signal and _afk_finish_up_or_revive falls through to kill + relaunch.
+# Ignoring PROGRESS is deliberate (the doom-loop backstop, markers.sh ST3 review); counting the
+# hub's own answer latency against the spoke is not.
+#
+# Epochs are pinned via AFK_NOW/AFK_STATE_DIR rather than the real clock, and the arithmetic uses
+# the SOURCE-TIME default AFK_SPOKE_MAX_MINUTES=180 (gate-broker.sh:43) x the call-time default
+# AFK_SPOKE_HARD_CEILING_MULT=3 — a 540m hard ceiling. AFK_SPOKE_MAX_MINUTES is a `:=` default
+# read when the harness sources the lib, so it is NOT overridden per-call (#276); the scenarios
+# below are built from epochs instead.
+_HARD_CEILING_NOW = 1_000_000
+
+
+def _ceiling_state(statedir: Path, *, dispatch_min: int, parked_sec: int | None) -> None:
+    """Pin a spoke that has been alive dispatch_min minutes with fresh progress.
+
+    Fresh progress keeps the SOFT ceiling (max(dispatch, progress), markers.sh:548-560) silent,
+    so the assertion isolates the HARD ceiling's own dispatch-epoch arithmetic.
+    """
+    statedir.mkdir(parents=True, exist_ok=True)
+    (statedir / "dispatch-5.epoch").write_text(f"{_HARD_CEILING_NOW - dispatch_min * 60}\n")
+    (statedir / "progress-5.epoch").write_text(f"{_HARD_CEILING_NOW - 60}\n")
+    if parked_sec is not None:
+        (statedir / "parked-total-5.seconds").write_text(f"{parked_sec}\n")
+
+
+def _over_ceiling(statedir: Path) -> str:
+    result = _call(
+        f"_spoke_over_any_ceiling 5 {_HARD_CEILING_NOW} && echo over || echo under",
+        env={"AFK_STATE_DIR": str(statedir)},
+    )
+    return result.stdout.strip()
+
+
+def test_hard_ceiling_credits_park_time_against_the_dispatch_clock(tmp_path: Path) -> None:
+    # 600m alive, 120m of it parked -> 480m actually running, under the 540m ceiling.
+    statedir = tmp_path / "sd"
+    _ceiling_state(statedir, dispatch_min=600, parked_sec=120 * 60)
+
+    assert _over_ceiling(statedir) == "under", (
+        "park time is the hub's own answer latency, not the spoke's runtime — crediting it is "
+        "what stops the first post-unpark tick from killing a healthy spoke mid-work"
+    )
+
+
+def test_hard_ceiling_still_reaps_a_runaway_that_never_parked(tmp_path: Path) -> None:
+    # The anti-vacuity pin: with NO park credit the SAME age still reaps. The backstop exists to
+    # catch a doom-loop that commits every <180m (so the soft ceiling never fires) and would
+    # otherwise evade the reaper for the whole window — crediting park time must not weaken it.
+    statedir = tmp_path / "sd"
+    _ceiling_state(statedir, dispatch_min=600, parked_sec=None)
+
+    assert _over_ceiling(statedir) == "over"
+
+
+def test_hard_ceiling_credit_does_not_rescue_a_spoke_past_the_ceiling_on_running_time(
+    tmp_path: Path,
+) -> None:
+    # Credit is subtracted, not a blanket exemption: 700m alive with 120m parked is still 580m of
+    # real running time, past the 540m ceiling.
+    statedir = tmp_path / "sd"
+    _ceiling_state(statedir, dispatch_min=700, parked_sec=120 * 60)
+
+    assert _over_ceiling(statedir) == "over"
+
+
 # ── issue #288 AC3: answer-drop record (computed-then-dropped answers, no delivery) ────────────
 # Distinct from reanswer-<issue> (the REASONER-RAN counter, armed BEFORE the outcome is known):
 # this records only the SUBSET of attempts that ended in a DROP (never injected) — so the
