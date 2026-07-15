@@ -104,6 +104,45 @@ read_park_onset_epoch()       { _read_issue_epoch park-onset "$1"; }
 clear_park_onset_epoch()      { rm -f "$(_afk_state_dir)/park-onset-$1.epoch" 2>/dev/null || true; }
 stamp_park_onset_epoch_once() { [ -n "$(read_park_onset_epoch "$1")" ] || stamp_park_onset_epoch "$1"; }
 
+# park-sig-<issue> — the park CONTEXT ("<tip>\t<sig>") the live park-onset epoch belongs to (#283).
+# stamp-once + clear-when-not-parked (above) makes the onset track a park EPISODE only when some
+# tick actually observes the spoke unparked. Under dense permission traffic (#276) none ever did:
+# a dialog was pending on nearly every tick, so twenty minutes of distinct episodes fused into one
+# onset still holding the original PLAN gate's timestamp — and the watchdog's park-unanswered
+# ceiling measured against it. Pairing the onset with the CONTEXT of the park it was stamped for
+# closes that: a changed context is a new episode however busy the spoke is. Keyed on (tip, sig)
+# like the broker's own park record (_broker_reanswer_exhausted below), and for the same reason:
+# a signature alone repeats across episodes, so an identical dialog re-raised after a commit would
+# otherwise inherit the previous episode's age — the fused-onset bug one layer down.
+_park_sig_file() { printf '%s\n' "$(_afk_state_dir)/park-sig-$1"; }
+read_park_sig()  { local f; f="$(_park_sig_file "$1")"; [ -f "$f" ] && cat "$f" 2>/dev/null || true; }
+
+# note_park_episode <wt> <issue> -> print the CURRENT park episode's onset epoch, re-stamping it
+# first when this is a new episode. New means either the pending park's (tip, signature) context
+# differs from the one the live onset was stamped for, or the onset is gone while the context
+# record survives (slot_state's clear_park_onset_epoch drops the epoch on a not-parked tick and
+# knows nothing about this record, so an identical dialog re-raised later must not inherit the
+# dead episode's age). An empty signature — _broker_park_signature fail-opens to empty on an
+# unextractable park, e.g. a gate tag whose plan artifact is unreadable (`gate:` -> empty) —
+# records NOTHING and leaves the onset exactly as stamp-once left it: never claim an episode we
+# cannot substantiate. Called by the watchdog (park-onset's only reader) on each waiting tick;
+# best-effort throughout.
+note_park_episode() {
+  local wt="$1" issue="$2" sig key prev onset
+  sig="$(_broker_park_signature "$wt" "$issue" 2>/dev/null)"
+  onset="$(read_park_onset_epoch "$issue")"
+  case "$onset" in '' | *[!0-9]*) onset="" ;; esac
+  [ -n "$sig" ] || { printf '%s\n' "$onset"; return 0; }
+  key="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"$'\t'"$sig"
+  prev="$(read_park_sig "$issue")"
+  if [ "$prev" != "$key" ] || [ -z "$onset" ]; then
+    stamp_park_onset_epoch "$issue"     # _stamp_issue_epoch mkdir -p's the state dir for both writes
+    printf '%s\n' "$key" > "$(_park_sig_file "$issue")" 2>/dev/null || true
+    onset="$(read_park_onset_epoch "$issue")"
+  fi
+  printf '%s\n' "$onset"
+}
+
 # --- network-outage state (issue #249) ----------------------------------------
 # A connectivity blackout makes the pre-reap auth probe fail for the WRONG reason. The two
 # _afk_auth_is_dead callers in hub-afk.sh (reap_pass + _afk_service_auth_halt) share this state:
@@ -150,7 +189,7 @@ _afk_refresh_offline_clocks() {
 _clear_progress_state() {
   local dir; dir="$(_afk_state_dir)"
   rm -f "$dir"/progress-*.epoch "$dir"/answer-attempt-*.epoch "$dir"/done-*.epoch "$dir"/tip-* \
-    "$dir"/park-onset-*.epoch \
+    "$dir"/park-onset-*.epoch "$dir"/park-sig-* \
     "$dir"/reanswer-* "$dir"/gate-voided-* "$dir"/terminal-logged-* \
     "$dir"/wd-fire-dedup-* \
     "$dir"/offline-since.epoch 2>/dev/null || true   # #249: drop a stale outage marker too

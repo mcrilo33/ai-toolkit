@@ -239,41 +239,141 @@ _wd_issue_open() {
   case "$state" in [Cc]losed | CLOSED) return 1 ;; *) return 0 ;; esac
 }
 
-# --- the 5 detectors (pure predicates over the drain's own state readers) ------
-# Condition 1: a parked spoke answer_pass left unanswered past the grace margin. The
-# never-attempted branch measures from PARK ONSET, not zero (#265): the answer-attempt epoch is
-# stamped only at answer DELIVERY (minutes into the answerer's reasoning), so a zero-grace floor
-# false-fired 1s after every fresh park. slot_state stamps the onset the first tick it reads
-# waiting; both branches then require now - base > the ceiling before firing.
-_wd_detect_park_unanswered() {
-  local wt="$1" issue="$2" now="$3" attempt
-  command -v slot_state >/dev/null 2>&1 || return 1
-  [ "$(slot_state "$wt" "$issue")" = "waiting" ] || return 1
-  attempt="$(read_answer_attempt "$issue" 2>/dev/null)"
-  case "$attempt" in
-    '' | *[!0-9]*)   # no delivery yet ⇒ measure the park itself, from onset
-      _wd_epoch_stale "$(read_park_onset_epoch "$issue" 2>/dev/null)" "$now" "$HUB_WATCHDOG_PARK_CEILING" ;;
-    *)               # a delivery was stamped ⇒ measure staleness from it
-      _wd_epoch_stale "$attempt" "$now" "$HUB_WATCHDOG_PARK_CEILING" ;;
-  esac
+# --- the 5 detectors (predicates over the drain's own state readers) -----------
+# Read-only EXCEPT condition 1, which notes the current park episode as it measures (#283) — the
+# same way slot_state stamps the epochs it reads. So a detector is safe to run on a tick, but NOT
+# speculatively (a dry-run / status probe would re-stamp the park-onset clock it reads).
+# _wd_park_lane <wt> <issue> -> permission | gate | question | unknown: WHOSE lane the pending park
+# belongs to (#283). Probes STRUCTURALLY, in _broker_park_signature's own precedence order, rather
+# than parsing that signature: a gate-tagged park whose plan artifact is unreadable hashes to EMPTY
+# (`gate:` -> ''), which would read as `unknown` here and — under the "unknown never fires" rule
+# below — silence #265's never-attempted strand. _gate_parked is a tag-at-tip check, immune to
+# artifact readability, so the strand keeps firing. Permission wins over a gate tag still at the
+# tip, exactly as the broker orders it.
+_wd_park_lane() {
+  local wt="$1" issue="$2"
+  if command -v _permission_pending >/dev/null 2>&1 && _permission_pending "$wt"; then
+    printf 'permission\n'; return
+  fi
+  if command -v _gate_parked >/dev/null 2>&1 && _gate_parked "$wt" "$issue"; then
+    printf 'gate\n'; return
+  fi
+  if command -v extract_pending_question >/dev/null 2>&1 &&
+     [ -n "$(extract_pending_question "$wt" 2>/dev/null)" ]; then
+    printf 'question\n'; return
+  fi
+  printf 'unknown\n'
 }
 
-# _wd_park_unanswered_reason <issue> <now> -> the MEASURED firing reason for a park-unanswered
-# firing (#265): which branch fired (never-attempted vs stale-attempt) and the actual age, so the
-# ledger + auto-filed defect never claim a constant "> ${ceiling}s" for a seconds-old park. Reads
-# the same epochs the detector does, on demand (no cross-pass global — the #241 leak trap).
-_wd_park_unanswered_reason() {
-  local issue="$1" now="$2" attempt
+# _wd_park_is_answer_lane <wt> <issue> -> true for a park the ANSWER lane owns (a plan gate or a
+# question). A permission dialog is the BROKER's lane with its own timers and its own re-answer
+# ceiling; the watchdog must not answer it (#271) and must not measure it against the answer
+# ceiling. `unknown` is NOT the answer lane: slot_state's `waiting` is derived from these same
+# three probes, so waiting-with-no-lane means the park resolved between the two calls — a race,
+# not a strand. The deliberate trade-off (journaled per AC3): a churning permission dialog is now
+# unbounded BY THE WATCHDOG. That is on purpose — it is the broker's lane, and its re-answer
+# ceiling escalating to blocked/<issue> is what bounds it. A second ceiling here would re-create
+# the lane confusion this fix exists to remove.
+_wd_park_is_answer_lane() {
+  case "$(_wd_park_lane "$1" "$2")" in gate | question) return 0 ;; esac
+  return 1
+}
+
+# _wd_park_base <wt> <issue> -> the epoch the park-unanswered ceiling measures FROM:
+# max(current episode onset, answer delivery). An answer delivered BEFORE the current park began
+# cannot count against it (#283) — that was the #276 false-fire: one answered plan gate, then ten
+# productive minutes, and the ceiling still measured from that one delivery. note_park_episode
+# re-stamps the onset when the pending park's context changes, so the onset names the episode
+# actually pending; a delivery INSIDE it is the more recent word and wins. Empty when neither is
+# measurable (the detector then cannot fire — same contract as _afk_ceiling_epoch).
+_wd_park_base() {
+  local wt="$1" issue="$2" onset attempt
+  if command -v note_park_episode >/dev/null 2>&1; then
+    onset="$(note_park_episode "$wt" "$issue" 2>/dev/null)"
+  else
+    onset="$(read_park_onset_epoch "$issue" 2>/dev/null)"
+  fi
   attempt="$(read_answer_attempt "$issue" 2>/dev/null)"
-  case "$attempt" in
-    '' | *[!0-9]*)
-      printf 'park-unanswered (never-attempted): parked %s with no answer delivered (ceiling %ss)' \
-        "$(_wd_age_seconds "$(read_park_onset_epoch "$issue" 2>/dev/null)" "$now")" \
-        "$HUB_WATCHDOG_PARK_CEILING" ;;
-    *)
-      printf 'park-unanswered (stale-attempt): last answer delivery %s ago (ceiling %ss)' \
-        "$(_wd_age_seconds "$attempt" "$now")" "$HUB_WATCHDOG_PARK_CEILING" ;;
-  esac
+  case "$onset" in '' | *[!0-9]*) onset=0 ;; esac
+  case "$attempt" in '' | *[!0-9]*) attempt=0 ;; esac
+  [ "$attempt" -gt "$onset" ] && onset="$attempt"
+  [ "$onset" -gt 0 ] && printf '%s\n' "$onset"
+  return 0
+}
+
+# _wd_last_decision_ts <issue> -> the ts of the drain's most recent decision-journal record for
+# this issue, or empty. The journal is the drain's own "I acted on this spoke" evidence (#241),
+# keyed by issue and already written per broker decision — no new plumbing needed. Append-only and
+# chronological, so the LAST match is the newest.
+# CONTRACT: this parses the record's field ORDER (ts first) written by _broker_journal_line
+# (gate-broker-answerer.sh) — the journal's sole writer. A reorder there would make this return
+# empty for every issue and silently disable the servicing suppression, so the pairing is pinned
+# end-to-end by test_last_decision_ts_reads_a_record_written_by_the_real_journal_writer.
+_wd_last_decision_ts() {
+  local issue="$1" f
+  command -v _broker_journal_file >/dev/null 2>&1 || return 0
+  f="$(_broker_journal_file)"
+  [ -f "$f" ] || return 0
+  grep -F "\"issue\":\"$issue\"" "$f" 2>/dev/null | sed -n 's/^{"ts":\([0-9][0-9]*\).*/\1/p' | tail -n1
+}
+
+# _wd_drain_touched_recently <issue> <now> -> true when the drain acted on this issue within the
+# ceiling window: a broker decision for it, or a progress-epoch advance. This is what separates
+# "being handled" from "abandoned" (#283) — on #276 the broker approved a tier-3 command 12s
+# BEFORE the firing and three more within 8 minutes after it.
+# Measured as RECENCY, not "after the base", on purpose: the answerer journals its own delivery a
+# beat AFTER stamp_answer_attempt, so an "after the base" test would read the delivery's own record
+# as servicing and a genuinely stranded park could never fire (AC2).
+_wd_drain_touched_recently() {
+  local issue="$1" now="$2" cand newest=""
+  for cand in "$(_wd_last_decision_ts "$issue")" "$(read_progress_epoch "$issue" 2>/dev/null)"; do
+    case "$cand" in '' | *[!0-9]*) continue ;; esac
+    if [ -z "$newest" ] || [ "$cand" -gt "$newest" ]; then newest="$cand"; fi
+  done
+  [ -n "$newest" ] || return 1
+  ! _wd_epoch_stale "$newest" "$now" "$HUB_WATCHDOG_PARK_CEILING"
+}
+
+# Condition 1: a parked spoke answer_pass left unanswered past the grace margin. Three gates, in
+# order: the park must be the ANSWER lane's (#283/#271), the CURRENT episode's base must be older
+# than the ceiling (#283/#265 — never zero, and never a delivery from a long-resolved park), and
+# the drain must not be visibly servicing the spoke. Only then did the drain genuinely fall short.
+_wd_detect_park_unanswered() {
+  local wt="$1" issue="$2" now="$3"
+  command -v slot_state >/dev/null 2>&1 || return 1
+  [ "$(slot_state "$wt" "$issue")" = "waiting" ] || return 1
+  _wd_park_is_answer_lane "$wt" "$issue" || return 1
+  _wd_epoch_stale "$(_wd_park_base "$wt" "$issue")" "$now" "$HUB_WATCHDOG_PARK_CEILING" || return 1
+  ! _wd_drain_touched_recently "$issue" "$now"
+}
+
+# _wd_park_unanswered_reason <wt> <issue> <now> -> the MEASURED firing reason (#265/#283): which
+# branch fired (never-attempted vs stale-attempt), the actual age, AND the base it was measured
+# from — which epoch, the current park episode, the lane — so a future false positive is
+# diagnosable from the ledger line alone (#283 AC5) instead of re-deriving the timeline from four
+# state files. Reads the epochs on demand (no cross-pass global — the #241 leak trap); the episode
+# onset was already noted by the detector on this tick, so this only reads it back.
+_wd_park_unanswered_reason() {
+  local wt="$1" issue="$2" now="$3" attempt onset base sig=""   # sig="": the guard below may skip it (set -u)
+  attempt="$(read_answer_attempt "$issue" 2>/dev/null)"
+  onset="$(read_park_onset_epoch "$issue" 2>/dev/null)"
+  command -v read_park_sig >/dev/null 2>&1 && sig="$(read_park_sig "$issue" 2>/dev/null)"
+  sig="${sig#*$'\t'}"                          # drop the tip half of the "<tip>\t<sig>" record
+  case "$attempt" in '' | *[!0-9]*) attempt="" ;; esac
+  case "$onset" in '' | *[!0-9]*) onset="" ;; esac
+  # The delivery counts only when it falls INSIDE the current episode — the same rule _wd_park_base
+  # measures by, so the reported branch can never disagree with the epoch that actually fired.
+  if [ -n "$attempt" ] && { [ -z "$onset" ] || [ "$attempt" -ge "$onset" ]; }; then
+    base="answer-attempt@$attempt"
+    printf 'park-unanswered (stale-attempt): last answer delivery %s ago' \
+      "$(_wd_age_seconds "$attempt" "$now")"
+  else
+    base="park-onset@${onset:-?}"
+    printf 'park-unanswered (never-attempted): parked %s with no answer delivered' \
+      "$(_wd_age_seconds "$onset" "$now")"
+  fi
+  printf ' (ceiling %ss; base=%s, episode=%s@%s, lane=%s)' \
+    "$HUB_WATCHDOG_PARK_CEILING" "$base" "${sig:0:8}" "${onset:-?}" "$(_wd_park_lane "$wt" "$issue")"
 }
 
 # _wd_age_seconds <epoch> <now> -> "<n>s" elapsed, or "an unknown time" when unmeasurable
@@ -400,8 +500,19 @@ _wd_supervisor_servicing() {
   return 1
 }
 
-_wd_intervene_answer() {   # route to the reasoner/permission lane directly
+_wd_intervene_answer() {   # route to the reasoner/answer lane directly
   local wt="$1" issue="$2"
+  # #283 AC4: NEVER inject into a permission dialog — that is the BROKER's lane, with its own
+  # classifier, timers and re-answer ceiling. Answering one is how the watchdog ends up servicing a
+  # park it does not own (#271) and interrupting a live tool call (#89): on #276 this armed
+  # re-answers that churned against a dialog the broker was already clearing. The detector no
+  # longer fires on a permission park, so this is the second lock — it guards any direct caller.
+  # Gated on `permission` specifically, not on "is answer lane": an UNKNOWN lane keeps the historic
+  # behaviour (the detector, not this seam, is where the race-vs-strand call is made).
+  if [ "$(_wd_park_lane "$wt" "$issue")" = "permission" ]; then
+    _wd_log "deferring answer intervention on #$issue — the park is a permission dialog (broker's lane)"
+    return 0
+  fi
   # #265 AC4: defer when the supervisor is mid-service on this same park — a second answer here
   # duplicate-injects and races the in-flight answerer (the #89 hazard) + wastes a costly run.
   if _wd_supervisor_servicing "$issue"; then
@@ -638,7 +749,7 @@ _wd_run_conditions() {
     # Each detector: fire (deduped by _wd_fire's marker) + intervene when it trips; else clear the
     # firing marker so a genuinely resolved-then-recurring condition re-fires (#263).
     if _wd_detect_park_unanswered "$wt" "$issue" "$now"; then
-      _wd_fire park-unanswered "$issue" "$(_wd_park_unanswered_reason "$issue" "$now")"
+      _wd_fire park-unanswered "$issue" "$(_wd_park_unanswered_reason "$wt" "$issue" "$now")"
       _wd_intervene_answer "$wt" "$issue"
     else
       _wd_clear_fired park-unanswered "$issue"
