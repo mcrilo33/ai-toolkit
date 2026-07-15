@@ -7,10 +7,17 @@
 set -uo pipefail
 
 # --- transcript helpers (newest .jsonl in the spoke's Claude project dir) -----
+# Every stat fallback below probes GNU `-c %Y` FIRST, BSD `-f %m` second (#289, the same
+# ordering fix #132 made in worktree-lib.sh). The reverse order breaks on GNU coreutils:
+# there `-f` selects filesystem-status mode and takes no inline format, so `%m` is read as
+# a file operand -- GNU errors on it yet still PRINTS a multi-line fs block for the real
+# file and exits nonzero, so the `||` fallback ALSO runs and the capture holds both the
+# garbage and the epoch. BSD instead rejects `-c` cleanly (usage error, empty stdout), so
+# GNU-first is the order that fails safe on both.
 _transcript_idle_seconds() {
   local jsonl mtime; jsonl="$(_spoke_jsonl "$1")"
   [ -n "$jsonl" ] || return 0
-  mtime="$(stat -f %m "$jsonl" 2>/dev/null || stat -c %Y "$jsonl" 2>/dev/null)"
+  mtime="$(stat -c %Y "$jsonl" 2>/dev/null || stat -f %m "$jsonl" 2>/dev/null)"
   [ -n "$mtime" ] || return 0
   printf '%s\n' "$(( $(afk_now) - mtime ))"
 }
@@ -27,7 +34,7 @@ _task_output_mtime() {
   root="${AFK_TASKS_ROOT:-/private/tmp}"
   for f in "$root"/claude-*/"$slug"/*/tasks/*.output; do
     [ -f "$f" ] || continue        # no match: the glob stays literal, skipped here
-    mt="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)"
+    mt="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null)"
     [ -n "$mt" ] || continue
     if [ -z "$newest" ] || [ "$mt" -gt "$newest" ]; then newest="$mt"; fi
   done
