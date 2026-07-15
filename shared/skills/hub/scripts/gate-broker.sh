@@ -524,14 +524,16 @@ broker_service_gate() {
   # #288 AC1/AC4: this is the exact moment the broker PROVES the park episode ended — end it
   # right here rather than waiting for a later slot_state tick to happen to observe "not
   # parked" (the #277 gap: the watchdog fired off a park-onset that outlived the episode it was
-  # stamped for). Clear the onset AND the answer-lane warned-retry backoff, so a later re-park
-  # on the same tip gets a fresh ceiling instead of inheriting one exhausted by the resolved
-  # episode's own retries.
+  # stamped for). Clear the onset, the answer-lane warned-retry backoff, AND any answer-drop
+  # record (review: a re-park on the SAME tip/signature would otherwise inherit a stale drop
+  # count from the now-resolved episode), so a later re-park gets a fresh ceiling instead of
+  # inheriting one exhausted by the resolved episode's own retries.
   if _gate_parked "$wt" "$issue" && _gate_answer_landed "$wt"; then
     log "  #$issue resumed past its PLAN gate outside the broker — consuming the stale gate/$issue tag"
     _consume_gate_tag "$wt" "$issue"
     clear_park_onset_epoch "$issue"
     _afk_clear_warned "$issue"
+    clear_answer_drop "$issue"
     return 0
   fi
   # A prior tick found the reasoner mutated the live tree for this gate (#237). The mutation
@@ -680,7 +682,7 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
     # and inject mid-turn, #89): no gate-voided marker, no blocked/<issue> on an actively-working
     # spoke. A fresh park next tick is serviced anew.
     log "  #$issue's live tree changed but the reasoner did not write it — dropping the stale answer (#247)"
-    note_answer_drop "$wt" "$issue" "live tree changed but the reasoner did not write it (#247)"
+    note_answer_drop "$wt" "$issue" "$park_sig" "live tree changed but the reasoner did not write it (#247)"
     return 0
   fi
   # The answerer is the supervisor's own `claude`; if its credentials are dead, every
@@ -719,7 +721,7 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
         return $?
       fi
       log "  #$issue is no longer parked on that prompt — dropping the stale answer (spoke moved on)"
-      note_answer_drop "$wt" "$issue" "no longer parked on that prompt (spoke moved on)"
+      note_answer_drop "$wt" "$issue" "$park_sig" "no longer parked on that prompt (spoke moved on)"
       return 0
     elif _is_seed_replay "$wt" "$text"; then
       log "  answer to #$issue replays the spoke's own seed prompt — suppressing (#124)"

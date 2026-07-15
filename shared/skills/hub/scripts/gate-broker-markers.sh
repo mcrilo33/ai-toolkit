@@ -254,6 +254,23 @@ _broker_reanswer_exhausted() {
   return 1
 }
 
+# read_reanswer_count <wt> <issue> -> the re-answer attempt COUNT recorded for the CURRENT
+# (tip, sig), or empty when none/stale. The single reader of reanswer-<issue>'s record layout —
+# so a caller outside this module (the watchdog's servicing-evidence probe, #288 AC2) never
+# hand-parses the file and risks drifting from _broker_reanswer_exhausted's own writer if the
+# layout ever changes.
+read_reanswer_count() {
+  local wt="$1" issue="$2" f tip sig rec_tip rec_sig rec_n
+  f="$(_reanswer_state_file "$issue")"
+  [ -f "$f" ] || return 0
+  IFS=$'\t' read -r rec_tip rec_sig rec_n < "$f" 2>/dev/null || return 0
+  tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"
+  sig="$(_broker_park_signature "$wt" "$issue" 2>/dev/null)"
+  [ "$rec_tip" = "$tip" ] && [ "$rec_sig" = "$sig" ] || return 0
+  case "$rec_n" in '' | *[!0-9]*) return 0 ;; esac
+  printf '%s\n' "$rec_n"
+}
+
 # --- computed-then-dropped answers (issue #288 AC3) ---------------------------
 # answer-drop-<issue> — the SUBSET of reanswer-<issue>'s attempts that ended in a DROP (never
 # injected): the #247 live-tree-changed drop and the "no longer parked on that prompt" drop both
@@ -265,13 +282,17 @@ _broker_reanswer_exhausted() {
 # the drop count + last verdict in the park-undeliverable ledger line.
 _answer_drop_state_file() { printf '%s\n' "$(_afk_state_dir)/answer-drop-$1"; }
 
-# note_answer_drop <wt> <issue> <reason> -> record ONE computed-then-dropped answer for the park
-# CURRENTLY at <wt>'s tip: "<tip>\t<sig>\t<count>\t<reason>". <reason> is the drop's own log text
-# (the LAST one wins), so the watchdog names the actual verdict without re-deriving it from the
-# drain log. Best-effort; never aborts the caller.
+# note_answer_drop <wt> <issue> <sig> <reason> -> record ONE computed-then-dropped answer:
+# "<tip>\t<sig>\t<count>\t<reason>". <sig> is the signature of the park the DROPPED answer was
+# actually computed for (the caller's own already-captured park_sig, e.g. broker_service_gate's
+# re-answer-ceiling signature) — NOT re-derived here, exactly like _broker_reanswer_exhausted
+# takes its sig as a parameter. Recomputing it internally would attribute the drop to whatever
+# park happens to be live at CALL time, which can be a DIFFERENT park than the one the answerer
+# actually reasoned about when the spoke moved on mid-reasoning (#288 review). <reason> is the
+# drop's own log text (the LAST one wins), so the watchdog names the actual verdict without
+# re-deriving it from the drain log. Best-effort; never aborts the caller.
 note_answer_drop() {
-  local wt="$1" issue="$2" reason="$3" sig tip f prev_tip="" prev_sig="" prev_n=0
-  sig="$(_broker_park_signature "$wt" "$issue" 2>/dev/null)"
+  local wt="$1" issue="$2" sig="$3" reason="$4" tip f prev_tip="" prev_sig="" prev_n=0
   tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"
   f="$(_answer_drop_state_file "$issue")"
   if [ -f "$f" ]; then

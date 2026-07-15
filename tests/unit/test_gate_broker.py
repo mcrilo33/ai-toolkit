@@ -760,6 +760,9 @@ def test_broker_self_heal_clears_park_onset_and_warned_backoff(
     (statedir / "park-onset-5.epoch").write_text("1000\n")  # stale onset from the resolved park
     (statedir / "warned-state-5").write_text("2\t9999999999\n")  # an armed, not-yet-due backoff
     (statedir / "warned-5.txt").write_text("1000\tre-answer ceiling reached\n")
+    (statedir / "answer-drop-5").write_text(
+        "deadbeef\tsigA\t2\tstale drop from the resolved park\n"
+    )
     pd = _project_dir_for(Path(env["CLAUDE_PROJECTS_DIR"]), spoke_repo)
     (pd / "session.jsonl").write_text(_resumed_gate_transcript("stale PLAN prose"))
     (spoke_repo / ".ai-toolkit").mkdir()
@@ -777,5 +780,8 @@ def test_broker_self_heal_clears_park_onset_and_warned_backoff(
     )
     assert not (statedir / "warned-5.txt").exists(), (
         "the human-facing warned record must be cleared too"
+    )
+    assert not (statedir / "answer-drop-5").exists(), (
+        "a re-park on the same tip/signature must not inherit the resolved episode's drop record"
     )
     assert not prompt_log.exists(), "a resumed spoke must NOT be re-answered"

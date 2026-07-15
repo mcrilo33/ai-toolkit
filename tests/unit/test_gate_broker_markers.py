@@ -441,14 +441,16 @@ def test_clear_progress_state_also_clears_the_park_sig_record(tmp_path: Path) ->
 
 
 def _drop(sig: str, wt: str, issue: str, reason: str) -> str:
-    """A note_answer_drop call with the park signature stubbed to `sig`."""
-    return (
-        f"_broker_park_signature() {{ printf '%s' '{sig}'; }}; "
-        f"note_answer_drop '{wt}' {issue} '{reason}'"
-    )
+    """A note_answer_drop call with the ORIGINAL park's signature passed explicitly — mirroring
+    _broker_reanswer_exhausted's own already-captured-sig parameter, never a re-derived one
+    (#288 review: recomputing it internally would attribute the drop to whichever park happens
+    to be live at read time, not the one the answer was actually computed for)."""
+    return f"note_answer_drop '{wt}' {issue} '{sig}' '{reason}'"
 
 
 def _read_drop(sig: str, wt: str, issue: str) -> str:
+    """read_answer_drop still reads the CURRENT live park's signature — a stubbed sig here
+    models what is CURRENTLY pending at read time, independent of what note_answer_drop wrote."""
     return f"_broker_park_signature() {{ printf '%s' '{sig}'; }}; read_answer_drop '{wt}' {issue}"
 
 

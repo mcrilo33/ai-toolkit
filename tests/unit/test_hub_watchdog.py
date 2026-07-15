@@ -797,6 +797,44 @@ def test_park_undeliverable_reason_names_the_count_and_last_verdict(tmp_path: Pa
     assert "700s" in out
 
 
+def test_park_undeliverable_refreshes_a_stale_onset_before_checking_delivery(
+    tmp_path: Path,
+) -> None:
+    # #288 review: _wd_detect_park_undeliverable must refresh park-onset (via _wd_park_base's
+    # note_park_episode) BEFORE checking _wd_park_attempt_in_episode. A resolved prior episode
+    # (A) left a stale onset + delivery on file; a NEW episode (B, a different signature) starts
+    # with a fresh drop. Tick 1 (the transition) must refresh the onset and stay quiet (too
+    # fresh); tick 2, once B itself ages past the ceiling, must fire — not stay silently masked
+    # by A's stale delivery epoch, which a pre-fix direct read would still be comparing against.
+    wt = _git_repo(tmp_path)
+    sd = tmp_path / "sd"
+    sd.mkdir()
+    t1 = int(NOW) - 700
+    old_onset = t1 - 500  # episode A resolved well before B began
+    (sd / "park-onset-5.epoch").write_text(f"{old_onset}\n")
+    (sd / "park-sig-5").write_text(f"{_head(wt)}\told-sig\n")
+    (sd / "answer-drop-5").write_text(f"{_head(wt)}\tsigB\t1\tspoke moved on\n")
+    prelude = (
+        f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; "
+        "_broker_park_signature() { printf '%s' 'sigB'; }; "
+        f"read_answer_attempt() {{ echo {old_onset}; }}"
+    )
+
+    rc1 = _detect(
+        prelude,
+        f"_wd_detect_park_undeliverable '{wt}' 5 {t1}",
+        env={"AFK_NOW": str(t1)},
+        state_dir=sd,
+    )
+    assert rc1 == 1, "a just-transitioned episode must not fire before it ages"
+    assert (sd / "park-onset-5.epoch").read_text().strip() == str(t1), (
+        "the onset must be refreshed to the NEW episode's start, not left at episode A's"
+    )
+
+    rc2 = _detect(prelude, f"_wd_detect_park_undeliverable '{wt}' 5 {NOW}", state_dir=sd)
+    assert rc2 == 0, "the fresh episode must fire once it ages past the ceiling, not stay masked"
+
+
 def test_run_conditions_fires_park_undeliverable_instead_of_park_unanswered(tmp_path: Path) -> None:
     wt = _git_repo(tmp_path)
     ledger = tmp_path / "ledger.jsonl"
