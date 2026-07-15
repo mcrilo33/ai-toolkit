@@ -59,6 +59,31 @@ kill -0 "$PID" 2>/dev/null || exit 0
 DIR="${AFK_STATE_DIR:-$COMMON/ai-toolkit-afk}/events"
 mkdir -p "$DIR" 2>/dev/null || exit 0
 : > "$DIR/$(date +%s)-$ISSUE-park" 2>/dev/null || exit 0
+
+# Shadow-write the park transition to the #300 lifecycle log (migration step 1):
+# the notify-wake hook fires at the exact instant a spoke parks on a permission
+# dialog or an AskUserQuestion — the two states nothing records today (the
+# watchdog INFERS them from pane text / transcript, the #263/#265/#283/#288
+# false-fire root). This is purely additive: no detector reads the log yet, so a
+# missing or extra record changes no behavior. Locate the synced lib across both
+# layouts (same candidate-path idiom as afk-danger-guard.sh — this hook deploys
+# to the platform hooks dir, apart from the hub scripts). Best-effort, never
+# fails the hook. Generic `parked`: the Notification payload does not reliably
+# distinguish the two park kinds, and a detector that needs the subtype resolves
+# it from the pane at read time (a later migration step).
+for _tl in \
+  "${CLAUDE_PROJECT_DIR:-}/.claude/skills/hub/scripts/transition-log.sh" \
+  "${AFK_STATE_DIR:-}/../transition-log.sh" \
+  "$COMMON/../.ai-toolkit/scripts/transition-log.sh" \
+  "$HOOK_DIR/../skills/hub/scripts/transition-log.sh"; do
+  if [ -n "$_tl" ] && [ -f "$_tl" ]; then
+    # shellcheck source=/dev/null
+    source "$_tl" 2>/dev/null \
+      && command -v afk_tlog_transition >/dev/null 2>&1 \
+      && afk_tlog_transition "$ISSUE" parked afk-notify-wake notification
+    break
+  fi
+done
 # Signal ONLY a wake-capable supervisor (#207): the heartbeat's third field is the capability
 # token a trap-armed supervisor advertises. A bare "<pid> <epoch>" heartbeat — a pre-#176
 # supervisor with no USR1 trap — gets the spool write above (the tick backstop services it) but

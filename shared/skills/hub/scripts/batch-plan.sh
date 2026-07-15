@@ -17,10 +17,33 @@
 #     longest blocked-by chain rooted at the issue (one topo pass). Unblocking the
 #     longest serial tail earliest minimizes makespan. Ties: direct-dependent count,
 #     then issue number.
-#   * GREEDY DISJOINT-SCOPE PACK — walk ready issues in priority order; add to the
-#     batch only when its `Scope:` is disjoint from every issue already in the batch
-#     AND every in-flight spoke (passed in via --inflight). `Scope: *` / a missing
+#   * GREEDY DISJOINT-SCOPE PACK — walk ready issues in priority order; open a new
+#     dispatch UNIT only when its `Scope:` is disjoint from every unit already in the
+#     batch AND every in-flight spoke (passed in via --inflight). `Scope: *` / a missing
 #     line ⇒ exclusive (runs alone, never batched).
+#   * SAME-SCOPE SUBTASK PACK (issue #278) — a unit is a GROUP of issues, not one issue.
+#     When a ready issue wins a slot, the remaining ranked ready set is swept for peers
+#     CONTAINED in its scope (`packable`), and they are folded in as ordered subtasks on
+#     ONE branch. Such peers could never run concurrently anyway (they collide), so
+#     serializing them into separate dispatches paid the whole spoke lifecycle tax —
+#     worktree, first-push suite seed, PLAN gate, review, land — twice for nothing
+#     (measured: #263/#265 shipped byte-identical `Scope:` footers and ran as two
+#     back-to-back lifecycles).
+#     Containment (not mere overlap) makes the pack STRICTLY ADDITIVE: a unit's footprint
+#     stays exactly its leader's declared scope, so which units form — and every other
+#     issue's slot — is bit-for-bit what it would have been without packing. A PARTIAL
+#     overlap never packs, and neither does a SUPERSET peer (absorbing it would widen the
+#     unit past the scope its slot was granted for and can de-parallelize disjoint work);
+#     both merely wait, exactly as they do today. `Split: intentional` opts an issue out.
+#     --pack-max bounds a unit's size (a spoke's context window is finite); the overflow
+#     falls back to a later dispatch.
+#   * OUTPUT SHAPE — members are comma-joined within a unit, units space-separated
+#     (`263,265 270`), so a one-issue unit is byte-identical to the pre-#278 line.
+#   * ROUTE (issue #278, --route) — the pack above can only group issues ready in the
+#     SAME tick. An issue filed while a matching spoke is already LIVE is instead named
+#     on a `route:<issue> <spoke>` line, so the drain can hand it to that running spoke as
+#     a subtask rather than wait out its whole lifecycle. Advisory: the drain owns the
+#     decision (only it knows the spoke's queue depth). Omitted ⇒ stdout is unchanged.
 #   * CONCURRENCY CAP (issue #151) — `--cap N` bounds the TOTAL live spokes: the batch
 #     is truncated so (in-flight count + batched count) never exceeds N, so a wide
 #     batch can't starve the box or the co-located Langfuse. Pure tail truncation of
@@ -55,8 +78,9 @@
 # tests can drive `plan_from_json` with a fixture graph without any network round-trip.
 #
 # Usage:
-#   batch-plan.sh [--inflight "<scope tokens>"]... [--cap N]
-#     one --inflight per in-flight spoke; --cap N bounds total concurrent spokes (0=off)
+#   batch-plan.sh [--inflight "<scope tokens>"]... [--cap N] [--pack-max N] [--route]
+#     one --inflight per in-flight spoke; --cap N bounds total concurrent spokes (0=off);
+#     --pack-max N bounds issues per dispatch unit (0=off); --route adds route: lines
 #
 # Env:
 #   BATCH_PLAN_OWNER / BATCH_PLAN_REPO   override the gh-resolved owner/repo (tests)
@@ -121,6 +145,8 @@ plan_from_json() {
   local inflight_nums=()
   local explain=""
   local cap=0
+  local pack_max=0
+  local route=0
   local repo_root=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -141,6 +167,14 @@ plan_from_json() {
       --cap) [ "$#" -ge 2 ] || { echo "batch-plan: --cap needs a value" >&2; return 2; }
              cap="$2"; shift 2 ;;
       --cap=*) cap="${1#--cap=}"; shift ;;
+      # --pack-max N (#278) bounds how many issues one dispatch UNIT may carry (the
+      # chain-length cap: a spoke's context window is finite). 0/omitted ⇒ unbounded.
+      # --route (#278) ADDS `route:<issue> <spoke>` lines after the batch line, naming the
+      # live spoke a ready issue is packable into. Omitted ⇒ stdout is byte-identical.
+      --pack-max) [ "$#" -ge 2 ] || { echo "batch-plan: --pack-max needs a value" >&2; return 2; }
+                  pack_max="$2"; shift 2 ;;
+      --pack-max=*) pack_max="${1#--pack-max=}"; shift ;;
+      --route) route=1; shift ;;
       # --repo-root DIR enables the undeclared-dependency lint's create-detection
       # (a scope path absent under DIR is a to-be-created file). OMITTED ⇒ the lint's
       # filesystem probe is off and the planner's output stays byte-identical.
@@ -151,6 +185,7 @@ plan_from_json() {
     esac
   done
   case "$cap" in ''|*[!0-9]*) echo "batch-plan: --cap needs a non-negative integer (got '$cap')" >&2; return 2 ;; esac
+  case "$pack_max" in ''|*[!0-9]*) echo "batch-plan: --pack-max needs a non-negative integer (got '$pack_max')" >&2; return 2 ;; esac
   # Marshal the in-flight scopes to python via the environment (one newline-
   # separated line per --inflight value), kept out of argv. python then splits each
   # line into scope tokens, so a multi-file spoke scope and a single one converge to
@@ -169,7 +204,8 @@ plan_from_json() {
   # The program is read from fd 3 (the heredoc), leaving python's stdin free to
   # carry the issue-node JSON piped in from fetch_issues / the tests.
   _BATCH_INFLIGHT="$joined" _BATCH_INFLIGHT_NUMS="$joined_nums" _BATCH_EXPLAIN="$explain" \
-    _BATCH_CAP="$cap" _BATCH_REPO_ROOT="$repo_root" python3 /dev/fd/3 3<<'PYEOF'
+    _BATCH_CAP="$cap" _BATCH_PACK_MAX="$pack_max" _BATCH_ROUTE="$route" \
+    _BATCH_REPO_ROOT="$repo_root" python3 /dev/fd/3 3<<'PYEOF'
 import json
 import os
 import sys
@@ -239,6 +275,50 @@ def conflict(a, b):
     return bool(a & b)
 
 
+def packable(host, guest):
+    """True when a spoke owning `host` can also carry `guest` as an ordered subtask (#278).
+
+    CONTAINMENT, not mere overlap: `guest <= host`. The guest's whole footprint already
+    sits inside the scope the host's dispatch reserved, so absorbing it does not widen the
+    unit by a single token. Two issues in this relation could never run concurrently
+    anyway (they conflict), so the planner used to SERIALIZE them into separate
+    dispatches — paying the full spoke lifecycle tax (worktree, first-push suite seed,
+    PLAN-gate round-trip, review, land) twice for work one branch could carry. The
+    measured motivator: #263/#265 shipped byte-identical `Scope:` footers (containment
+    holds both ways) and ran as two back-to-back lifecycles.
+
+    Containment is what makes packing STRICTLY ADDITIVE, and that property is the whole
+    reason this is safe: the unit's footprint stays exactly the host's declared scope, so
+    the set of units the planner forms — and every other issue's slot — is bit-for-bit
+    what it would have been without packing. Packing only fills issues that were already
+    doomed to wait into a spoke that was already running.
+
+    Deliberately NARROWER than `not conflict(host, guest)` in BOTH directions:
+
+      * A PARTIAL overlap (`{a,m}` vs `{a,z}`) never packs: neither spoke owns the other's
+        full footprint, so a subtask would edit files outside the scope its dispatch
+        reserved — the disjointness `conflict()` guarantees BETWEEN units would silently
+        not hold WITHIN one.
+      * A SUPERSET guest never packs either, even though it is "identical-or-subset" in
+        the loose sense. Absorbing it would widen the unit past the scope the host won its
+        slot with, and a widened unit can collide with live work or steal a token a
+        genuinely disjoint peer needed — de-parallelizing issues that had no reason to be
+        ordered. (Concretely: `{w}`, `{w,b}`, `{b}` — the first and last are disjoint and
+        dispatch as two concurrent spokes today. Letting `{w,b}` be absorbed by `{w}`
+        widens that unit onto b.py and collapses all three into ONE serial spoke: a real
+        parallelism LOSS versus the pre-#278 planner.) Such a pair is not dropped, merely
+        deferred: rank decides which of the two leads, and when the superset leads, the
+        subset packs into IT next round.
+
+    Exclusive (None — `Scope: *` or a missing line) NEVER packs, in either position: an
+    unknown footprint cannot be proven to sit inside another. That fails CLOSED, matching
+    how `conflict()` treats None (collides with everything) rather than inverting it.
+    """
+    if host is None or guest is None:
+        return False
+    return guest <= host
+
+
 def parse_inflight(blob):
     """One non-empty line per in-flight spoke ⇒ its scope (set, or None exclusive)."""
     scopes = []
@@ -301,7 +381,51 @@ def connected_components(adj):
     return comps
 
 
-def print_merge_candidates(issues, children):
+def print_routes(issues, ready_nums, inflight_nums):
+    """Print `route:<issue> <spoke>` for each ready issue packable into ONE live spoke.
+
+    Trigger B of issue #278 (`--route`). The dispatch-time pack above can only group
+    issues that are ready in the SAME tick; an issue filed while a matching spoke is
+    already running is merely held back by the in-flight scope collision and waits out
+    that spoke's whole lifecycle before starting its own. This names the running spoke it
+    could instead join as a subtask, so the drain can hand it over — no second worktree,
+    no second first-push suite seed.
+
+    Each live spoke's scope is looked up from the BACKLOG by issue number, exactly as
+    `_explain_dispositions` does, rather than positionally zipping `--inflight` scopes to
+    `--inflight-issue` numbers: the two flags are populated from separate walks, so
+    trusting their order would silently mis-attribute a route to the wrong spoke. An
+    in-flight issue absent from the fetched backlog contributes no scope and simply never
+    matches — it can only miss a route, never invent one.
+
+    The live spoke is the HOST and the new issue the GUEST, so `packable` requires the
+    issue to sit INSIDE the running spoke's declared scope. A superset issue is refused:
+    routing it would silently widen a live spoke's footprint past what its dispatch
+    reserved, onto files another spoke may hold.
+
+    Fails CLOSED on ambiguity: an issue packable into TWO live spokes has no single
+    correct target, so it is left to the normal collision hold-back. The chain-length cap
+    is NOT applied here — how full a spoke's queue already is, is state only the drain
+    holds (the queued-subtask marker); this names candidates and the drain decides.
+    """
+    live = sorted(n for n in inflight_nums if n in issues and not issues[n]["split"])
+    for num in sorted(ready_nums):
+        if num in inflight_nums or issues[num]["split"]:
+            continue  # a deliberate split is never auto-merged into a shared spoke
+        scope = issues[num]["scope"]
+        targets = [m for m in live if packable(issues[m]["scope"], scope)]
+        if len(targets) != 1:
+            continue  # unmatched, or ambiguous (2+ candidate spokes) — fail closed
+        # Joining the target spoke must not collide with a DIFFERENT live spoke: being
+        # packable into one says nothing about the others. (Two live spokes should never
+        # overlap in the first place, but a hand-dispatched pair can, and routing must not
+        # compound it.)
+        if any(conflict(issues[m]["scope"], scope) for m in live if m != targets[0]):
+            continue
+        print(f"route:{num} {targets[0]}")
+
+
+def print_merge_candidates(issues, children, packed_clusters=()):
     """Warn on stderr about blocked-by chains of open issues with colliding scopes.
 
     Such a chain is strictly serialized AND scope-colliding — the planner can never
@@ -328,6 +452,8 @@ def print_merge_candidates(issues, children):
     for comp in connected_components(adj):
         if any(issues[n]["split"] for n in comp):
             continue  # deliberate split — the chain opted out of the proposal
+        if any(comp <= cluster for cluster in packed_clusters):
+            continue  # #278 auto-packed it into one spoke — nothing left to propose
         reported.append(comp)
         comp_edges = [(a, b) for a, b in edges if a in comp and b in comp]
         shared = set()
@@ -347,7 +473,7 @@ def print_merge_candidates(issues, children):
     return reported
 
 
-def print_unchained_merge_candidates(issues, ready_nums, flagged_components):
+def print_unchained_merge_candidates(issues, ready_nums, flagged_components, packed_clusters=()):
     """Warn on stderr about a cluster of ready issues sharing scope with no deps.
 
     The #125 lint fires only on blocked-by CHAINS. An UNCHAINED cluster — ready,
@@ -387,6 +513,13 @@ def print_unchained_merge_candidates(issues, ready_nums, flagged_components):
             continue
         if any(comp <= fc for fc in flagged_components):
             continue  # already reported on a #125 chain line — don't double-report
+        # #278: this lint's whole proposal ("consider one umbrella issue") is what the
+        # planner now performs automatically for a packable cluster. Warning about work
+        # already batched into one spoke would train the operator to tune out a lint that
+        # fires on solved problems. A cluster only PARTLY packed (a subset-vs-partial-
+        # overlap mix) is not covered by any single group and still warrants the hint.
+        if any(comp <= cluster for cluster in packed_clusters):
+            continue
         members = sorted(comp)
         shared = set()
         for i, a in enumerate(members):
@@ -522,14 +655,17 @@ def _explain_dispositions(issues, children, depth, is_ready):
     track what the scheduler actually does. (An in-flight issue absent from the fetched
     backlog is dropped from the seed here, whereas dispatch fails it closed to `*`; that
     rare not-in-fetch case can only under-report a collision, never invent one.) Returns
-    (ranked, inflight_present, inflight_nums, collider_of, holds_back) where:
+    (ranked, inflight_present, inflight_nums, collider_of, holds_back, packed_with) where:
       * ranked          — dispatchable issues (all blockers closed, incl. held) in priority order
       * inflight_present— the in-flight issue numbers that are in the backlog, ascending
       * collider_of[n]  — the already-chosen issue whose scope blocks n (in-flight or a
                           higher-priority batched peer), when n is held back
       * holds_back[m]   — the issues m blocks, in priority order (m names what it holds back)
+      * packed_with[n]  — the leader whose spoke carries n as an ordered subtask (#278),
+                          when n is absorbed rather than held back; disjoint from collider_of
     """
     inflight_nums = _inflight_issue_nums()
+    pack_max = int(os.environ.get("_BATCH_PACK_MAX", "0") or "0")
     dispatchable = [n for n in issues if is_ready(issues[n])]
     ranked = sorted(
         dispatchable,
@@ -544,20 +680,41 @@ def _explain_dispositions(issues, children, depth, is_ready):
     chosen_order = list(inflight_present)
     chosen_scope = {n: issues[n]["scope"] for n in inflight_present}
     collider_of = {}
+    packed_with = {}
+    group_size = {}
     for n in ranked:
         if n in inflight_nums or issues[n]["hold"]:
             continue  # in-flight is already running; held is staged out — neither is packed
         scope = issues[n]["scope"]
         collider = next((m for m in chosen_order if conflict(chosen_scope[m], scope)), None)
-        if collider is not None:
-            collider_of[n] = collider
-        else:
+        if collider is None:
             chosen_order.append(n)
             chosen_scope[n] = scope
+            group_size[n] = 1
+            continue
+        # #278: a collider the issue is PACKABLE into is not holding it back at all — it
+        # ships in that spoke as a subtask. Reporting the old `blocked-by-scope` here
+        # would be a lie about work that is scheduled to run.
+        #
+        # Mirrors main()'s pack exactly: same ranked order, same containment test against
+        # the LEADER's (never-widening) scope, same chain cap, same split opt-out. An
+        # in-flight collider is excluded: that issue is ROUTED (the `--route` channel), a
+        # decision only the drain can make, since the spoke's queue depth lives there.
+        if (
+            collider not in inflight_nums
+            and not issues[n]["split"]
+            and not issues[collider]["split"]
+            and packable(chosen_scope[collider], scope)
+            and (pack_max <= 0 or group_size.get(collider, 1) < pack_max)
+        ):
+            packed_with[n] = collider
+            group_size[collider] = group_size.get(collider, 1) + 1
+        else:
+            collider_of[n] = collider
     holds_back = {}
     for n, m in collider_of.items():  # collider_of was built in ranked (priority) order
         holds_back.setdefault(m, []).append(n)
-    return ranked, inflight_present, inflight_nums, collider_of, holds_back
+    return ranked, inflight_present, inflight_nums, collider_of, holds_back, packed_with
 
 
 def _explain_label(issues, ranked_set, inflight_nums, collider_of, n):
@@ -578,7 +735,9 @@ def _explain_label(issues, ranked_set, inflight_nums, collider_of, n):
     return "afk:queued"
 
 
-def _print_explain_view(issues, ranked, inflight_present, inflight_nums, collider_of, holds_back):
+def _print_explain_view(
+    issues, ranked, inflight_present, inflight_nums, collider_of, holds_back, packed_with
+):
     """Print the human `--explain` view: one `#N  <disposition>  <reason>` line per issue."""
 
     def excl(n):
@@ -605,6 +764,9 @@ def _print_explain_view(issues, ranked, inflight_present, inflight_nums, collide
                 detail = scope_detail(n) + held_back_suffix(n)
         elif issues[n]["hold"]:
             primary, detail = "held", "(hold label)"
+        elif n in packed_with:
+            # #278: not held back — it rides #M's spoke as an ordered subtask.
+            primary, detail = f"packed-with:#{packed_with[n]}", scope_detail(n)
         elif n in collider_of:
             # A held-back issue reads as blocked FIRST — even an exclusive one waiting behind
             # another chosen spoke — so its reason is the collider, not a false "runs alone".
@@ -626,16 +788,21 @@ def _print_explain_view(issues, ranked, inflight_present, inflight_nums, collide
 def render_explain(issues, children, depth, is_ready, mode):
     """Render the disposition of every open issue (issue #223): the human `--explain` view
     (mode 'view') or the machine-readable `<num>\\t<afk:label|->` TSV (mode 'labels')."""
-    ranked, inflight_present, inflight_nums, collider_of, holds_back = _explain_dispositions(
-        issues, children, depth, is_ready
-    )
+    (
+        ranked,
+        inflight_present,
+        inflight_nums,
+        collider_of,
+        holds_back,
+        packed_with,
+    ) = _explain_dispositions(issues, children, depth, is_ready)
     if mode == "labels":
         ranked_set = set(ranked)
         for n in sorted(issues):
             print(f"{n}\t{_explain_label(issues, ranked_set, inflight_nums, collider_of, n)}")
     else:
         _print_explain_view(
-            issues, ranked, inflight_present, inflight_nums, collider_of, holds_back
+            issues, ranked, inflight_present, inflight_nums, collider_of, holds_back, packed_with
         )
 
 
@@ -732,31 +899,83 @@ def main():
 
     # Greedy disjoint-scope pack, seeded with the in-flight spoke scopes so a ready
     # issue colliding with live work is held back.
+    #
+    # Since #278 the unit of dispatch is a GROUP (one spoke), not one issue: when a ready
+    # issue wins a slot, sweep the remaining ranked ready set for `packable` peers and
+    # fold them in as ordered subtasks on one branch. The group's FIRST member is the
+    # primary — it names the branch slug and is what `inflight_worktrees` / worktree-land
+    # parse — so the group leads with the RANKED winner and peers follow in ranked order.
+    #
+    # (The issue proposed ordering groups with `order_chain()`. That topo-sort is vacuous
+    # here: only READY issues pack, and `is_ready` means every blocker is CLOSED, so a
+    # blocked-by edge between two group members is impossible. It would degenerate to
+    # sort-by-number and silently demote a `priority`-labelled issue to a subtask under a
+    # lower-numbered peer — discarding the rank the block above just computed.)
     inflight_scopes = parse_inflight(os.environ.get("_BATCH_INFLIGHT", ""))
+    pack_max = int(os.environ.get("_BATCH_PACK_MAX", "0") or "0")
     chosen_scopes = list(inflight_scopes)
     batch = []
+    packed = set()
     for info in ready:
+        n = info["number"]
+        if n in packed:
+            continue  # already folded into an earlier group as a subtask
         scope = info["scope"]
-        if all(not conflict(scope, existing) for existing in chosen_scopes):
-            batch.append(info["number"])
-            chosen_scopes.append(scope)
+        if any(conflict(scope, existing) for existing in chosen_scopes):
+            continue
+        group = [n]
+        packed.add(n)
+        # `Split: intentional` opts an issue out of PACKING, not just out of the lint. The
+        # marker records that this issue's separation from its scope-peers is deliberate —
+        # auto-folding it into a shared spoke is precisely the merge the operator declined.
+        # Honoured on both sides: a marked leader absorbs nobody, a marked peer joins nobody.
+        if scope is not None and not info["split"]:
+            for peer in ready:
+                if pack_max > 0 and len(group) >= pack_max:
+                    break  # chain-length cap: the rest overflow to a later dispatch
+                m = peer["number"]
+                if m in packed or peer["split"] or not packable(scope, peer["scope"]):
+                    continue
+                group.append(m)
+                packed.add(m)
+        batch.append(group)
+        # The unit's footprint is the LEADER's scope, unchanged: `packable` only absorbs
+        # peers already contained in it (see its docstring), so no peer can widen the unit
+        # past the scope this slot was granted for. That is what keeps the pack strictly
+        # additive — every other issue's disposition is exactly what it would have been
+        # without packing — and it is why no re-validation is needed here.
+        chosen_scopes.append(scope)
+
+    # The clusters packing ABSORBED, for the merge-candidate lints below. Captured before
+    # the cap truncates: a group the cap defers is still packed (it dispatches whole next
+    # window), so the lint must stay silent about it either way.
+    packed_clusters = [set(group) for group in batch if len(group) > 1]
 
     # Concurrency cap (issue #151): bound the total live spokes so a wide batch can't
     # starve the box / the co-located Langfuse. `_BATCH_CAP` (>0) is the ceiling on
     # (in-flight + newly-dispatched); the free slots are what remain after the spokes
     # already running. Cap 0 / unset ⇒ the historical unbounded batch. Pure tail
     # truncation of the priority-ordered pack — never reorders, never adds.
+    # `batch` is a list of GROUPS since #278, so this slices dispatch UNITS (spokes) —
+    # which is what the cap has always meant. Counting issues would starve a packed batch
+    # to a fraction of the live spokes the operator asked for.
     cap = int(os.environ.get("_BATCH_CAP", "0") or "0")
     if cap > 0:
         slots = max(0, cap - len(inflight_scopes))
         batch = batch[:slots]
 
+    # The wire format: members comma-joined within a unit, units space-separated. A
+    # one-issue unit renders exactly as it did pre-#278, so every consumer that never
+    # meets a pack — and afk_done's bare planner call — sees byte-identical output.
     if batch:
-        print(" ".join(str(n) for n in batch))
+        print(" ".join(",".join(str(n) for n in group) for group in batch))
 
-    flagged_components = print_merge_candidates(issues, children)
     ready_nums = {info["number"] for info in ready}
-    print_unchained_merge_candidates(issues, ready_nums, flagged_components)
+    if os.environ.get("_BATCH_ROUTE", "0") == "1":
+        print_routes(issues, ready_nums, _inflight_issue_nums())
+
+    flagged_components = print_merge_candidates(issues, children, packed_clusters)
+    print_unchained_merge_candidates(issues, ready_nums, flagged_components, packed_clusters)
     print_undeclared_dependencies(issues, children, os.environ.get("_BATCH_REPO_ROOT", ""))
     print_scopeless_ready(issues, ready_nums)
 
@@ -783,14 +1002,15 @@ _batch_inflight_issue_nums() {
 # to-be-created scope path from an existing file. An explicit --repo-root in "$@"
 # (last-wins in the arg loop) still overrides this default.
 #
-# In an explain mode (#223) the in-flight issue NUMBERS are derived from the worktree
-# list and fed in as --inflight-issue flags, so `batch-plan --explain` reflects live work
-# standalone; the pure plan_from_json stays network-free for the tests.
+# In an explain mode (#223) — and under --route (#278), which likewise has to attribute a
+# pack to a specific LIVE spoke — the in-flight issue NUMBERS are derived from the worktree
+# list and fed in as --inflight-issue flags, so `batch-plan --explain` / `--route` reflects
+# live work standalone; the pure plan_from_json stays network-free for the tests.
 main() {
   local root
   root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   case " $* " in
-    *" --explain "* | *" --explain-labels "*)
+    *" --explain "* | *" --explain-labels "* | *" --route "*)
       local ifargs=() num
       while IFS= read -r num; do
         [ -n "$num" ] && ifargs+=("--inflight-issue" "$num")

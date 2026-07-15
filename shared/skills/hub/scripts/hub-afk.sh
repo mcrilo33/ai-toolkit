@@ -877,6 +877,30 @@ self-land -- the hub lands #$issue.
 EOF
 }
 
+# _afk_route_subtask_prompt <spoke> <issue> -> the #278 message telling a LIVE spoke that a
+# newly-filed issue sharing its scope has been queued onto its branch. Deliberately does NOT
+# say "stop what you are doing": the spoke finishes its current subtask first, and the queue
+# is consumed at the ready boundary — the only point where its tree is provably clean and
+# pushed, so a fresh RED can never land in a tree with an in-flight push gate running.
+_afk_route_subtask_prompt() {
+  local spoke="$1" issue="$2" marker_dir
+  marker_dir="$(wt_marker_script_dir "${_AFK_TOPLEVEL:-.}")"
+  cat <<EOF
+Issue #$issue was just filed and shares this spoke's scope, so it has been QUEUED onto THIS
+branch as a subtask rather than spawning a second worktree (which would pay another full
+spawn + first-push suite seed + review + land for the same files).
+
+Finish what you are doing first -- do NOT abandon the current subtask. Then, at your next
+clean-and-pushed boundary: run '/source-task $issue' to re-anchor on it, work its full
+solo-cycle (RED -> GREEN -> REVIEW -> PUSH), and emit
+'bash ${marker_dir}/spoke-push.sh --ready $issue' -- that clears it from your queue.
+
+Check what you still owe with 'bash ${marker_dir}/spoke-ready.sh --queued $spoke'. Your
+terminal 'bash ${marker_dir}/spoke-push.sh --ready $spoke' is REFUSED until that prints
+nothing, so emit it only once the queue is empty. Do NOT self-land -- the hub lands these.
+EOF
+}
+
 # _afk_finish_up_prompt <issue> -> the #256 finish-up nudge message for an over-ceiling spoke
 # whose task ledger is near-complete: it is essentially DONE, so it is told to do the LAST step
 # (verify committed + pushed, then emit ready / the final push), NOT to start fresh work.
@@ -1560,13 +1584,110 @@ _afk_dispatch_max_failures() {
   printf '%s\n' "$max"
 }
 
+# --- subtask chain cap (issue #278) -------------------------------------------
+# The most issues ONE spoke may carry: its own primary plus the packed/routed subtasks. A
+# spoke's context window is finite (they reach ~45% on a single issue today), so an unbounded
+# chain would exhaust it mid-run. Past the cap an issue is simply not packed/routed — it stays
+# in the backlog and dispatches normally once the spoke lands, so nothing is ever dropped.
+#
+# Env-only for now. Every sibling dispatch knob (concurrency_cap, stagger) also reads
+# settings/ai-toolkit.yml via `ai_toolkit_config.py batch-env`, but that file and the parser
+# are outside this issue's Scope: line; surfacing this as `batch.subtask_chain_max` is a
+# follow-up. AFK_SUBTASK_CHAIN_MAX stays the operator/test seam either way.
+: "${AFK_SUBTASK_CHAIN_MAX:=3}"
+_afk_subtask_chain_max() {
+  local n="${AFK_SUBTASK_CHAIN_MAX:-3}"
+  case "$n" in '' | *[!0-9]* | 0) n=3 ;; esac
+  printf '%s\n' "$n"
+}
+
+# _afk_route_subtask_nudge <wt> <spoke> <issue> -> tell a LIVE spoke it just gained a subtask.
+# Mirrors _afk_nudge_spoke/_afk_finish_up_nudge (same inject_and_verify + journal + span
+# shape) but carries the routing prompt. Advisory: the queued marker is the authority —
+# spoke-ready.sh refuses the terminal ready while the queue is non-empty, so a nudge that
+# never lands only delays the pickup to the spoke's own ready boundary, it cannot lose the
+# work. Stamps only the answer-attempt epoch, never the progress epoch: routing must not buy
+# a spoke a fresh reap ceiling (the #241 rule).
+_afk_route_subtask_nudge() {
+  local wt="$1" spoke="$2" issue="$3" target rc
+  log "→ route #$issue: packable into the live spoke #$spoke — queued as a subtask (no second worktree/suite seed)"
+  _afk_set_last_action "route #$issue -> #$spoke"
+  target="$(_spoke_pane_target "$wt")"
+  [ -n "$target" ] || { log "  no live pane for #$spoke — queued anyway; it consumes at its ready boundary"; return 1; }
+  stamp_answer_attempt "$spoke"
+  inject_and_verify "$wt" "$target" "$(_afk_route_subtask_prompt "$spoke" "$issue")"; rc=$?
+  broker_journal_decision "$spoke" route \
+    "issue #$issue shares this spoke's scope — queued onto its branch as a subtask instead of a fresh spoke (#278)" reversible
+  if [ "$rc" -eq 0 ]; then _afk_emit_span "$wt" afk-route success; else _afk_emit_span "$wt" afk-route retry; fi
+  return "$rc"
+}
+
+# _afk_route_queued_subtasks <route-lines> <chain-max> -> trigger B of #278.
+#
+# Each line is "<issue> <spoke>": batch-plan judged <issue>'s scope to fit INSIDE the live
+# <spoke>'s, so one spoke can ship both. Queue it there instead of letting it wait out that
+# spoke's entire lifecycle (12-47 min of first-push suite seed alone) only to spawn a fresh
+# worktree over the same files.
+#
+# The planner proposes; this decides, because only the drain holds the two facts that matter:
+#
+#   * CHAIN CAP — how full the spoke's queue already is. Past the cap the issue is left alone:
+#     it stays in the backlog and dispatches normally once the spoke lands. Nothing dropped.
+#   * PAST-FINAL-PUSH — whether the spoke already emitted its terminal ready. If so the entry
+#     arrived too late to ever be consumed (the spoke is about to be landed and torn down), so
+#     RECLAIM it: clear the queue and let the issue take a fresh dispatch. Deterministic, and
+#     unlike nudging it to consume, it does not depend on the spoke still being alive.
+#
+# Writing an entry is always safe — it is a file in the hub's state dir and touches no spoke
+# tree. Only CONSUMPTION can introduce RED tests, and that happens at the spoke's ready
+# boundary, where clean-tree + HEAD==@{upstream} are already proven, so a subtask can never
+# land RED into a tree with a push gate running.
+_afk_route_queued_subtasks() {
+  local lines="$1" chain_max="$2" issue spoke wt depth
+  [ -n "$(printf '%s' "$lines" | tr -d '[:space:]')" ] || return 0
+  while read -r issue spoke; do
+    # Both fields must be present AND numeric. Checking the CONCATENATION would accept a
+    # one-field line ("264" -> issue=264, spoke="") as all-digits; that only fails to route by
+    # accident downstream (the awk lookup never matches an empty spoke), which is not a
+    # property to lean on. Reject it here, where the shape is actually known.
+    case "$issue" in '' | *[!0-9]*) continue ;; esac
+    case "$spoke" in '' | *[!0-9]*) continue ;; esac
+    wt="$(inflight_worktrees | awk -F'\t' -v n="$spoke" '$2 == n { print $1; exit }')"
+    [ -n "$wt" ] || continue   # the spoke landed between the plan and here — next tick re-routes
+    # Past-final-push: reclaim rather than queue into a spoke that is already done.
+    if _ready_at_tip "$wt" "$spoke"; then
+      if [ -n "$(read_queued_subtask "$spoke")" ]; then
+        log "  reclaim queued subtask(s) from #$spoke — it already emitted its terminal ready; they fall back to a fresh dispatch"
+        clear_queued_subtask "$spoke"
+      fi
+      continue
+    fi
+    # Already queued (the drain re-derives every tick): nothing to do, and re-nudging would
+    # just spam the pane. stamp is idempotent, but the nudge is not.
+    read_queued_subtask "$spoke" | grep -qxF "$issue" && continue
+    # Chain cap counts the spoke's OWN issue plus everything queued.
+    depth=$(( $(read_queued_subtask "$spoke" | grep -c '^[0-9]' || true) + 1 ))
+    if [ "$depth" -ge "$chain_max" ]; then
+      log "  not routing #$issue -> #$spoke — chain cap $chain_max reached (spoke already carries $depth); it dispatches fresh once #$spoke lands"
+      continue
+    fi
+    stamp_queued_subtask "$spoke" "$issue"
+    _afk_run_with_heartbeat_fg _afk_route_subtask_nudge "$wt" "$spoke" "$issue" || true
+  done <<EOF
+$lines
+EOF
+}
+
 # dispatch_batch -> plan the next concurrent batch (batch-plan.sh, capped) and spawn a
 # spoke for each issue not already in flight, seeded with the ultra kickoff and staggered
 # so first-push suites don't all hit at once. A missing planner or dispatcher logs and is
-# a no-op (the next tick retries).
+# a no-op (the next tick retries). Since #278 the batch is a list of ordered GROUPS: a
+# comma-joined unit spawns ONE spoke carrying its peers as subtasks, and `route:` lines hand
+# a newly-packable issue to an already-live spoke instead of spawning a second worktree.
 dispatch_batch() {
   [ "$_AFK_AUTH_FAILED" -eq 1 ] && return 0   # auth is dead — don't spawn spokes into it
   local bp wt_new inflight args=() batch n cap stagger spawned=0 fails max
+  local raw units="" route_lines="" line unit primary subtasks member chain_max
   bp="$(_afk_find_script "${BATCH_PLAN:-}" batch-plan.sh)" || { log "batch-plan.sh not found — skipping dispatch"; return 0; }
   wt_new="$(_afk_find_script "${WT_NEW:-}" worktree-new.sh)" || { log "worktree-new.sh not found — skipping dispatch"; return 0; }
   inflight="$(inflight_issues)"
@@ -1574,21 +1695,65 @@ dispatch_batch() {
   # Bound total live spokes: batch-plan truncates so (in-flight + dispatched) ≤ cap.
   cap="$(_afk_dispatch_cap)"
   stagger="$(_afk_dispatch_stagger)"
+  chain_max="$(_afk_subtask_chain_max)"
   args+=("--cap" "$cap")
+  # #278: --pack-max bounds a dispatch-time pack to the same chain cap routing uses, so a
+  # spoke's context ceiling is one number however the subtasks got there. --route asks for the
+  # `route:<issue> <spoke>` lines naming issues packable into an ALREADY-LIVE spoke — the pack
+  # above can only group issues ready in the same tick, so without this an issue filed later
+  # just waits out the live spoke's whole lifecycle before starting its own.
+  args+=("--pack-max" "$chain_max" "--route")
   # Bound the planner (#170 ST1): a wedged batch-plan.sh used to hang the tick. A timeout
   # or nonzero exit logs and skips dispatch THIS tick (retry next tick) — never a silent
   # empty batch that would look like "nothing to dispatch".
-  if ! batch="$(_afk_with_timeout "$AFK_PLANNER_TIMEOUT" bash "$bp" "${args[@]+"${args[@]}"}" 2>/dev/null)"; then
+  if ! raw="$(_afk_with_timeout "$AFK_PLANNER_TIMEOUT" bash "$bp" "${args[@]+"${args[@]}"}" 2>/dev/null)"; then
     log "batch-plan.sh timed out or failed — skipping dispatch this tick (retry next tick)"
     return 0
   fi
+  # Split the planner's stdout into its two channels: the batch line (space-separated UNITS,
+  # each a comma-joined group) and the `route:` lines. A bare `for n in $raw` would iterate
+  # over "route:264" as if it were an issue number.
+  while IFS= read -r line; do
+    case "$line" in
+      route:*) route_lines="${route_lines}${line#route:}"$'\n' ;;
+      '')      ;;
+      *)       [ -n "$units" ] || units="$line" ;;
+    esac
+  done <<EOF
+$raw
+EOF
+  batch="$units"
+
+  # --- trigger B: route a packable issue onto an already-live spoke ------------
+  _afk_route_queued_subtasks "$route_lines" "$chain_max"
+
   max="$(_afk_dispatch_max_failures)"
-  for n in $batch; do
+  for unit in $batch; do
+    # A unit is a comma-joined GROUP (#278): "263,265" ships both on ONE branch as ordered
+    # subtasks. The primary leads (it names the branch slug, which inflight_worktrees and
+    # worktree-land parse); the rest ride along via --subtasks.
+    primary="${unit%%,*}"
+    subtasks=""
+    [ "$unit" != "$primary" ] && subtasks="${unit#*,}"
+    # The in-flight guard below compares a BARE issue number, so it must see members, never
+    # the whole token: "263,265" can never equal "263", and an un-split unit would silently
+    # re-dispatch a live spoke. Skip the whole unit when ANY member is already in flight —
+    # that spoke owns the scope, and re-spawning any of it is exactly the collision the
+    # planner exists to prevent.
+    for member in ${unit//,/ }; do
+      if printf '%s\n' "$inflight" | grep -qxF "$member"; then
+        primary=""
+        break
+      fi
+    done
+    [ -n "$primary" ] || continue
+    n="$primary"
     # Dispatch is a LONG phase (a bounded planner, per-spawn staggers, worktree spawns);
     # stamp the heartbeat each iteration so the wedged-supervisor watchdog (#170 ST2) never
     # mistakes a busy dispatch for a hang and kills a working supervisor mid-spawn.
     afk_write_heartbeat
-    printf '%s\n' "$inflight" | grep -qxF "$n" && continue   # already in flight (idempotent)
+    # (the in-flight check moved above the loop body: it now runs PER MEMBER, since a grouped
+    # token can never match a bare issue number)
     # Ceiling (#170 ST6): an issue that already failed to dispatch AFK_DISPATCH_MAX_FAILURES
     # times this window is durably blocked — skip it instead of retrying forever. Uses the
     # cached `max` (computed once above) rather than recomputing it per issue.
@@ -1596,11 +1761,18 @@ dispatch_batch() {
     # Stagger consecutive spawns (before the 2nd onward), so the co-located Langfuse
     # isn't hit by several first-push full suites at the same instant.
     [ "$spawned" -gt 0 ] && [ "$stagger" -gt 0 ] && sleep "$stagger" 2>/dev/null || true
-    log "→ dispatch #$n"
+    if [ -n "$subtasks" ]; then
+      log "→ dispatch #$n (+ packed subtasks ${subtasks//,/ } on the same branch)"
+    else
+      log "→ dispatch #$n"
+    fi
     _afk_set_last_action "dispatch #$n"
     # --mode afk stamps the spoke's trace as drain-driven (#102); a hand-dispatched
-    # spoke defaults to attended in worktree-new.sh.
-    if bash "$wt_new" "$n" --type feature --mode afk --prompt "$(kickoff_for "$n")"; then
+    # spoke defaults to attended in worktree-new.sh. --subtasks (#278) hands the packed peers
+    # to worktree-new, which seeds them into the spoke's queued-subtask channel and appends
+    # the chain note to this kickoff.
+    if bash "$wt_new" "$n" --type feature --mode afk ${subtasks:+--subtasks} ${subtasks:+"$subtasks"} \
+         --prompt "$(kickoff_for "$n")"; then
       stamp_dispatch_epoch "$n"
       _afk_clear_dispatch_failures "$n"   # a success resets the consecutive-failure count
       spawned=$(( spawned + 1 ))
@@ -2492,8 +2664,25 @@ _afk_issue_poisoned() {
 # backlog is drained (the planner returns no DISPATCHABLE issue AND nothing is in flight) --
 # a clock-bound window ignores an empty backlog and ticks until its clock, so window_expired
 # is its sole completion path (#222).
+# _afk_pending_queued_subtasks -> every issue still queued for some spoke, one per line.
+# Empty when nothing is owed. Walks the channel's per-spoke dirs (#278) directly rather than
+# via read_queued_subtask, because the spoke numbers are exactly what we don't know here.
+_afk_pending_queued_subtasks() {
+  local dir d f
+  dir="$(_afk_state_dir)"
+  [ -d "$dir" ] || return 0
+  for d in "$dir"/queued-*; do
+    [ -d "$d" ] || continue
+    for f in "$d"/*; do
+      [ -f "$f" ] || continue
+      printf '%s\n' "${f##*/}"
+    done
+  done
+  return 0
+}
+
 afk_done() {
-  local state="$1" now="$2" bp inflight_count batch tok remaining=""
+  local state="$1" now="$2" bp inflight_count batch tok sub remaining=""
   [ -n "$state" ] || return 0
   window_expired "$state" "$now" && return 0
   # The backlog-drained stop below is drain-mode-only: a non-expired clock-bound (numeric)
@@ -2502,6 +2691,15 @@ afk_done() {
   [ "$state" = drain ] || return 1
   inflight_count="$(inflight_issues | grep -c '^[0-9]' || true)"
   [ "$inflight_count" -eq 0 ] || return 1
+  # #278: a routed-but-unconsumed subtask is real work this window still owes. Declaring the
+  # drain complete over it would end the window with an issue queued and never done — and the
+  # queue outlives the spoke's worktree, so "nothing in flight" is no longer proof of an idle
+  # drain on its own. An empty queue DIR is not pending work (the spoke drained it and the dir
+  # simply remains), so test the entries, not the directory.
+  if [ -n "$(_afk_pending_queued_subtasks)" ]; then
+    log "/afk: subtask(s) still queued for a spoke — not declaring the drain done"
+    return 1
+  fi
   bp="$(_afk_find_script "${BATCH_PLAN:-}" batch-plan.sh)" || return 1
   # A planner ERROR is not an empty backlog (#170 ST3): declare drain-done only when
   # batch-plan EXITS 0 and prints an empty batch. A nonzero exit (a `gh` blip, a timeout)
@@ -2513,10 +2711,18 @@ afk_done() {
   fi
   # Discount poisoned issues (#202 F): a dispatch-ceiling-skipped / locally-blocked issue is
   # not dispatchable, so a batch of only poisoned issues is a drained backlog, not live work.
+  # A token is a comma-joined GROUP since #278 ("263,265"), so split it: left whole it matches
+  # the non-numeric arm below and is KEPT as an unrecognized token, holding a fully-poisoned
+  # backlog open forever — the exact never-completing drain #202 F fixed for single issues.
   for tok in $batch; do
-    case "$tok" in *[!0-9]*) remaining="$remaining $tok"; continue ;; esac   # non-issue token — keep
-    _afk_issue_poisoned "$tok" && continue
-    remaining="$remaining $tok"
+    case "$tok" in
+      route:*) continue ;;   # the #278 route channel is not backlog work
+    esac
+    for sub in ${tok//,/ }; do
+      case "$sub" in *[!0-9]*) remaining="$remaining $sub"; continue ;; esac   # non-issue token — keep
+      _afk_issue_poisoned "$sub" && continue
+      remaining="$remaining $sub"
+    done
   done
   [ -z "$(printf '%s' "$remaining" | tr -d '[:space:]')" ]
 }

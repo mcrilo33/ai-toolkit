@@ -201,3 +201,39 @@ def test_signal_delivery_is_prompt(tmp_path: Path) -> None:
     elapsed = time.monotonic() - start
 
     assert elapsed < 5, f"the wake signal must arrive promptly, took {elapsed:.1f}s"
+
+
+def test_shadow_writes_a_park_transition_to_the_lifecycle_log(tmp_path: Path) -> None:
+    # #300 migration step 1: the hook records a `parked` transition alongside the
+    # wake spool. Purely additive — no detector reads it yet. Proves the spoke-side
+    # deploy path (the hook sources the synced transition-log.sh across layouts).
+    repo = _spoke(tmp_path)
+    proc = subprocess.Popen(["sleep", "30"])
+    hb = tmp_path / "hb"
+    hb.write_text(f"{proc.pid} 1000000\n")
+    state = tmp_path / "afk-state"
+    try:
+        result = _run(repo, _wake_env(hb, state))
+    finally:
+        proc.terminate()
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    log = state / "transitions" / "176.jsonl"
+    assert log.is_file(), "a park must shadow-write a transition record"
+    line = log.read_text().splitlines()[-1]
+    assert '"kind":"transition"' in line
+    assert '"to":"parked"' in line
+    assert '"actor":"afk-notify-wake"' in line
+
+
+def test_no_transition_written_on_a_hub_checkout(tmp_path: Path) -> None:
+    # The hook no-ops before the shadow write on a non-spoke (slug has no issue),
+    # so no stray transition file appears.
+    repo = _spoke(tmp_path, branch="main")
+    state = tmp_path / "afk-state"
+    hb = tmp_path / "hb"
+    hb.write_text("1 1000000\n")
+
+    _run(repo, _wake_env(hb, state))
+
+    assert not (state / "transitions").exists()

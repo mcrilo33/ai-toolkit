@@ -22,12 +22,40 @@ round-trip and prints the issue numbers of the next concurrent batch:
   blocked-by chain rooted at each one, so the longest serial tail is unblocked
   earliest (minimizes makespan). Ties break on direct-dependent count, then issue
   number.
-- **Greedy disjoint-scope pack** — it walks ready issues in priority order and adds
-  one only when its `Scope:` is disjoint from every issue already in the batch **and**
-  every in-flight spoke. `Scope: *` or a missing line marks an issue **exclusive** —
+- **Greedy disjoint-scope pack** — it walks ready issues in priority order and opens a new
+  dispatch **unit** only when its `Scope:` is disjoint from every unit already in the batch
+  **and** every in-flight spoke. `Scope: *` or a missing line marks an issue **exclusive** —
   it runs alone, never batched.
+- **Same-scope subtask pack** (issue #278) — a unit is a **group** of issues, not one issue.
+  When an issue wins a slot, the planner sweeps the remaining ready set for peers whose scope
+  sits *inside* its own and folds them in as ordered subtasks on **one branch**. Such peers
+  could never run concurrently anyway (they collide), so filing them separately used to pay
+  the whole spoke lifecycle — worktree, first-push suite seed, PLAN gate, review, land —
+  twice for nothing.
 
 It prints issue numbers only and never dispatches.
+
+### Output shape
+
+Members are comma-joined within a unit, units space-separated. A lone issue looks exactly as
+it always did:
+
+```
+263,265 270
+```
+
+That reads: **two spokes.** One on `#263`'s branch also shipping `#265` as a subtask, and one
+on `#270`. `--cap` counts units (spokes), so a packed group consumes **one** slot.
+
+Packing is deliberately conservative — it only ever *adds* work to a spoke that was already
+going to run, and never changes which units form:
+
+- A **partial overlap** (`a.py m.py` vs `a.py z.py`) does **not** pack. Neither spoke owns the
+  other's full footprint, so they still serialize.
+- A **superset** peer does not pack either — absorbing it would widen the unit past the scope
+  its slot was granted for. It simply waits, and packs the other way round when *it* leads.
+- `Split: intentional` opts an issue out entirely: it records that you *decided* these stay
+  apart, and auto-packing them is exactly the merge you declined.
 
 ## Workflow
 
@@ -68,15 +96,24 @@ and note any notable exclusions (an issue held back by a scope collision or an o
 blocker). Get a quick OK before spawning anything — the planner proposes; the human
 confirms the fan-out.
 
-### 3. Dispatch each issue
+### 3. Dispatch each unit
 
-For every issue `N` in the batch, spawn its worktree and seed the spoke with the full
-ultra kickoff (same handoff `start-task` uses). Each gets its own issue, worktree, and
-tmux window:
+Spawn **one worktree per unit**, not per issue. For a lone issue `N`, unchanged:
 
 ```bash
 .ai-toolkit/scripts/worktree-new.sh N --prompt "<kickoff>"
 ```
+
+For a packed unit `263,265`, the **primary leads** and the peers ride along:
+
+```bash
+.ai-toolkit/scripts/worktree-new.sh 263 --subtasks 265 --prompt "<kickoff>"
+```
+
+The branch still leads with the primary (`feature/263-<slug>`) — that is load-bearing, since
+`inflight_worktrees` and `worktree-land` both parse the issue out of the leading digits of the
+slug. `--subtasks` seeds the peers into the spoke's queued-subtask channel and appends a chain
+note to the kickoff, so you do not write anything extra into the prompt yourself.
 
 The kickoff hands the spoke everything it needs to run on its own — anchor to the
 issue, build a task ledger, honor the issue's `Gate:` line, then run the solo-cycle
@@ -84,11 +121,17 @@ issue, build a task ledger, honor the issue's `Gate:` line, then run the solo-cy
 are met. Use the kickoff template documented in the `start-task` skill (step 4); do
 not invent a new one.
 
+A packed spoke works its primary first, then re-anchors on each queued issue
+(`/source-task <N>`) and emits `ready/<N>` per subtask. Its **terminal** `ready/<primary>` is
+refused until the queue drains — that refusal is what stops the branch being landed with
+subtasks outstanding — and `/land <primary>` then closes **every** issue the branch shipped.
+
 ### 4. Report the fan-out
 
-Tell the user the issues dispatched, their branches, worktree paths, and tmux windows.
-The spokes are now running in parallel. The hub lands each one (`/land <id>`) as it
-reaches `ready/N`.
+Tell the user the issues dispatched, their branches, worktree paths, and tmux windows —
+naming which issues share a spoke as packed subtasks, since that is the one thing the branch
+name does not tell them. The spokes are now running in parallel. The hub lands each one
+(`/land <primary>`) as it reaches `ready/<primary>`, closing every issue on that branch.
 
 ## Rules of thumb
 
@@ -98,6 +141,9 @@ reaches `ready/N`.
   unblock its dependents and free its scope for a colliding peer.
 - Keep `Scope:` lines tight and honest. An over-broad scope (or `*`) needlessly
   serializes work that could have run in parallel.
+- Two issues on the **same** scope are no longer a scheduling mistake — the planner packs them
+  onto one spoke automatically (issue #278), which is what the `⚠ merge candidates` lint used
+  to ask you to do by hand. The lint now fires only for clusters packing *cannot* absorb.
 - It honors the **`batch.concurrency_cap`** ceiling (issue #151): pass `--cap` so the
   batch (plus in-flight spokes) never exceeds the cap. Beyond that, the batch is
   whatever the dependency graph and scope-disjointness allow; dispatch a subset by hand
