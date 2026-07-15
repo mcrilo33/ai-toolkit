@@ -554,13 +554,61 @@ _wd_land_in_flight() {
 # That defer lives in the DISPATCHER, not here, for the reason documented at condition 4: a
 # detector returning 1 falls into the else-branch, which CLEARS the firing-dedup marker — mid-land
 # that would let a subsequently-failed land re-fire and double-count (#263).
+# _wd_dead_idle_base <issue> -> "<kind>\t<epoch>" — the epoch condition 2's ceiling measures FROM
+# and WHICH clock it is, or empty when neither is measurable (#297). max(dispatch, progress), the
+# same base the drain's reaper uses (_afk_ceiling_epoch): progress alone is stamped only on a
+# branch-tip ADVANCE, so a pane that crashes BEFORE its first commit leaves it empty forever and
+# _wd_epoch_stale reads empty as never-fire — condition 2 was structurally blind to the very reaper
+# miss it exists to catch. Dispatch is the floor: a spoke has been running since it was dispatched
+# whether or not it ever committed.
+# Duplicates _afk_ceiling_epoch's max() rather than calling it because the reason string must name
+# the WINNER (base=dispatch@N vs base=progress@N tells a triaging human whether the spoke ever
+# committed at all). The two are pinned to agree by
+# test_dead_idle_base_epoch_agrees_with_the_real_reaper_ceiling — they must never diverge on WHEN a
+# spoke is over its ceiling, or the watchdog and the reaper disagree about the same spoke.
+# Neither measurable ⇒ empty ⇒ the detector cannot fire, preserving _afk_ceiling_epoch's contract:
+# never invent a ceiling with no clock behind it. Both reads are case-screened, so an absent reader
+# (a standalone watchdog with no gate-broker) degrades to the other rather than erroring.
+_wd_dead_idle_base() {
+  local issue="$1" now="${2:-$(_wd_now)}" d p
+  d="$(read_dispatch_epoch "$issue" 2>/dev/null)"
+  p="$(read_progress_epoch "$issue" 2>/dev/null)"
+  case "$d" in '' | *[!0-9]*) d=0 ;; esac
+  case "$p" in '' | *[!0-9]*) p=0 ;; esac
+  case "$now" in '' | *[!0-9]*) now=0 ;; esac
+  # A FUTURE-dated epoch is unmeasurable, not fresh — and taking max() would let it OUTRANK a
+  # genuinely stale clock and silence this condition for the whole window (now-epoch goes negative,
+  # which is never > the ceiling). That is the unbounded silence #284 was: worse than the blindness
+  # this fix removes. Drop each skewed epoch so the other still measures — the same fail-toward-
+  # firing rule _wd_land_in_flight applies to its log mtime 40 lines above. Reachable via a clock
+  # that steps forward (VM resume, a bad NTP source) while spokes stamp dispatch, then corrects.
+  # This screen is ALSO why this cannot simply call _afk_ceiling_epoch: the reaper's base has no
+  # such bound, and tier-2 exists to not go blind in the same breath as tier-1.
+  [ "$now" -gt 0 ] && [ "$d" -gt "$now" ] && d=0
+  [ "$now" -gt 0 ] && [ "$p" -gt "$now" ] && p=0
+  # Ties go to progress: at equal epochs it is the more specific statement (the spoke actually
+  # committed), and it keeps the label stable for a spoke whose first commit lands on its
+  # dispatch second.
+  if [ "$p" -gt 0 ] && [ "$p" -ge "$d" ]; then printf 'progress\t%s\n' "$p"; return 0; fi
+  [ "$d" -gt 0 ] && printf 'dispatch\t%s\n' "$d"
+  return 0
+}
+
 _wd_detect_dead_idle() {
-  local wt="$1" issue="$2" now="$3" done_epoch="${4-$(_wd_done_epoch "$2")}"
+  local wt="$1" issue="$2" now="$3" done_epoch="${4-$(_wd_done_epoch "$2")}" \
+        base="${5-$(_wd_dead_idle_base "$2" "$3")}"
   command -v slot_state >/dev/null 2>&1 || return 1
   [ -z "$(_spoke_pane_target "$wt" 2>/dev/null)" ] || return 1   # a live pane is the reaper's job
   [ -n "$done_epoch" ] && return 1                               # done-stamped ⇒ not a reaper miss
-  [ "$(slot_state "$wt" "$issue")" = "done" ] && return 1        # terminal ⇒ not a hang
-  _wd_epoch_stale "$(read_progress_epoch "$issue" 2>/dev/null)" "$now" "$HUB_WATCHDOG_IDLE_CEILING"
+  # done ⇒ terminal, waiting ⇒ PARKED — neither is a hang. `waiting` must be excluded explicitly
+  # now that the base falls back to dispatch (#297): a spoke parked at a gate before its first
+  # commit has no progress epoch, so the old progress-only base made this structurally silent for
+  # it; measuring from dispatch arms it, and the revive seam checks slot_state nowhere — a spoke
+  # parked at an UNAPPROVED plan gate would be resumed headless and implement unreviewed work.
+  # A parked spoke is conditions 1/3's (park-unanswered / stale-marker), exactly as the drain's own
+  # recover_dead_panes skips it: `case "$state" in done | waiting) continue`.
+  case "$(slot_state "$wt" "$issue")" in done | waiting) return 1 ;; esac
+  _wd_epoch_stale "${base#*$'\t'}" "$now" "$HUB_WATCHDOG_IDLE_CEILING"
 }
 
 # _wd_dead_idle_reason <wt> <issue> <now> [done-epoch] -> the MEASURED firing reason (#290 AC4):
@@ -577,13 +625,35 @@ _wd_detect_dead_idle() {
 # the detector's own read through if a persistent dead pane ever makes the repeat cost matter. It
 # is safe today: every slot_state mutation is stamp-once/clear-idempotent, and the dead-idle path
 # has no pane, so _permission_pending short-circuits before any tmux capture (not the #269 class).
+# The base is read from the SAME _wd_dead_idle_base the detector measured, and the label names
+# which clock won (#297): `base=dispatch@N` says the spoke never committed at all — a materially
+# different story from a stalled-after-progress `base=progress@N`, and the first thing a human needs
+# when triaging. The activity noun follows the base for the same reason: reporting "last progress"
+# for a spoke that never made any is how a reader concludes the epoch is broken rather than absent.
+# Takes the detector's ALREADY-MEASURED base as $5 for the same reason it takes the pre-read done
+# epoch as $4: a live re-read here can disagree with the epoch that actually fired (a concurrent
+# revive stamping progress, or a fresh arm clearing both), emitting a self-contradictory ledger line
+# — "ceiling 3600s breached" beside a 5s age. Falls back to a live read for a direct caller.
 _wd_dead_idle_reason() {
-  local wt="$1" issue="$2" now="$3" done_epoch="${4-$(_wd_done_epoch "$2")}" progress
-  progress="$(read_progress_epoch "$issue" 2>/dev/null)"
-  printf 'reaper missed a dead/idle pane: no pane, last progress %s ago' \
-    "$(_wd_age_seconds "$progress" "$now")"
-  printf ' (ceiling %ss; base=progress@%s, slot_state=%s, done-epoch=%s, last-action=%s)' \
-    "$HUB_WATCHDOG_IDLE_CEILING" "${progress:-?}" "$(slot_state "$wt" "$issue" 2>/dev/null)" \
+  local wt="$1" issue="$2" now="$3" done_epoch="${4-$(_wd_done_epoch "$2")}" \
+        base="${5-$(_wd_dead_idle_base "$2" "$3")}" kind epoch
+  kind="${base%%$'\t'*}"; epoch="${base#*$'\t'}"
+  # The activity noun follows the base: reporting "last progress" for a spoke that never made any
+  # is how a reader concludes the epoch is BROKEN rather than absent — the opposite of the #290 AC4
+  # diagnosability this line exists for.
+  case "$kind" in
+    dispatch)
+      printf 'reaper missed a dead/idle pane: no pane, dispatched (no commit yet) %s ago' \
+        "$(_wd_age_seconds "$epoch" "$now")" ;;
+    progress)
+      printf 'reaper missed a dead/idle pane: no pane, last progress %s ago' \
+        "$(_wd_age_seconds "$epoch" "$now")" ;;
+    *)
+      kind="none"; epoch=""
+      printf 'reaper missed a dead/idle pane: no pane, no dispatch or progress epoch to measure from' ;;
+  esac
+  printf ' (ceiling %ss; base=%s@%s, slot_state=%s, done-epoch=%s, last-action=%s)' \
+    "$HUB_WATCHDOG_IDLE_CEILING" "$kind" "${epoch:-?}" "$(slot_state "$wt" "$issue" 2>/dev/null)" \
     "${done_epoch:-none}" "$(_wd_last_action)"
 }
 
@@ -614,6 +684,84 @@ _wd_land_base_ref() {
   if git -C "$wt" show-ref --verify --quiet "refs/heads/$base" 2>/dev/null; then printf '%s\n' "$base"; return; fi
   if git -C "$wt" show-ref --verify --quiet "refs/remotes/origin/$base" 2>/dev/null; then printf 'origin/%s\n' "$base"; return; fi
   printf '%s\n' "$base"
+}
+
+# _wd_terminal_marker_kind <wt> <issue> -> `ready`, `accept`, or empty — WHICH terminal marker sits
+# at the branch tip (#292). slot_state reads BOTH as `done`, which is why condition 4 could not tell
+# them apart: ready/ means the drain SHOULD have landed and did not (a genuine shortfall, #274's
+# class), while accept/ is the deliberate human-eyeball terminal the drain MUST NOT land (auto_land
+# lands only _ready_at_tip: "accept/ awaits a human sign-off").
+# READY IS CHECKED FIRST, mirroring slot_state's own `for kind in ready accept` precedence: when
+# both tags sit at the tip, the watchdog must classify off the SAME marker that made the spoke read
+# `done`, or the two disagree about what the spoke even is.
+# Empty when neither is at the tip (or the probe fails) — callers must then keep the historical
+# afk-defect path, never the quieter accept one: an unreadable marker must not silence a defect.
+_wd_terminal_marker_kind() {
+  local wt="$1" issue="$2" kind
+  for kind in ready accept; do
+    _wd_tag_at_tip "$wt" "$kind" "$issue" && { printf '%s\n' "$kind"; return 0; }
+  done
+  return 0
+}
+
+# _wd_base_name <wt> -> the bare base-branch name (no origin/ prefix); defaults to main.
+_wd_base_name() {
+  local wt="$1" base=""
+  command -v wt_base_branch >/dev/null 2>&1 && base="$(wt_base_branch "$wt" 2>/dev/null || true)"
+  [ -n "$base" ] || base=main
+  printf '%s\n' "$base"
+}
+
+# _wd_own_commits <wt> -> how many commits the branch has that the base's history does not — i.e.
+# what the spoke itself authored. Zero is the #286 close-without-code shape: the spoke judged the
+# work already shipped and minted accept/ at the branch point, so a land would merge nothing and
+# close the issue as SHIPPED — not the decision actually pending.
+# Excludes BOTH refs/heads/<base> AND refs/remotes/origin/<base>, whichever exist, rather than
+# measuring `<land-base>..HEAD`. Two ways that single-base measure lies, in opposite directions:
+#   * spokes branch from origin/<base> (wt_base_start_point, "the hub's local base may lag or carry
+#     unpushed work"), while _wd_land_base_ref PREFERS the local ref — so a lagging local base makes
+#     a genuinely empty branch report the base's own missing commits as "own work", silently
+#     dropping the zero-diff clause on exactly #292's headline scenario;
+#   * and a base that has already absorbed the branch reports 0 for real authored work, which would
+#     tell a human not to land it.
+# Subtracting every base ref that exists answers the question actually asked — did this spoke write
+# anything the base does not already have — under both skews.
+# Empty when nothing is measurable, so the reason OMITS the claim rather than asserting a count it
+# did not measure: silence is the safe direction here, a wrong "no own commits" is not.
+_wd_own_commits() {
+  local wt="$1" base ref n
+  local -a nots=()
+  base="$(_wd_base_name "$wt")"
+  for ref in "refs/heads/$base" "refs/remotes/origin/$base"; do
+    git -C "$wt" show-ref --verify --quiet "$ref" 2>/dev/null && nots+=("$ref")
+  done
+  [ "${#nots[@]}" -gt 0 ] || return 0
+  n="$(git -C "$wt" rev-list --count HEAD --not "${nots[@]}" 2>/dev/null)" || return 0
+  case "$n" in '' | *[!0-9]*) return 0 ;; esac
+  printf '%s\n' "$n"
+}
+
+# _wd_accept_unsigned_reason <wt> <issue> [conflicts] -> the honest remediation for an accept/ spoke.
+# NOT "human land": on #286 that told a human to land a zero-diff branch, which would have closed
+# the issue as shipped when the pending decision was "confirm the duplicate finding, or reject it
+# and re-kick". Same reason-honesty contract #285 established for the conflicted case, one
+# marker-kind over — and for the same reason it must ALSO carry #285's conflict list when there is
+# one: accept/ is normally eyeball-THEN-land, and condition 4 is the only thing that probes
+# mergeability for it (auto_land never touches an accept/ branch, so it never routes a conflict
+# resolution either). Dropping the files would send a human who approves the code straight into an
+# unannounced conflict — exactly the misdirection #285 exists to prevent.
+# <conflicts> and <base> are passed in already-measured rather than re-probed: the base that is
+# PRINTED must be the one the count was measured against (the measured-base contract this file
+# documents at _wd_dead_idle_reason), and the reason re-runs every tick as a _wd_fire argument.
+_wd_accept_unsigned_reason() {
+  local wt="$1" issue="$2" conflicts="${3:-}" own base
+  base="$(_wd_land_base_ref "$wt")"
+  printf 'accept/%s awaits human sign-off (escalate-only: the drain must NOT land accept/ — it is the human-eyeball terminal)' "$issue"
+  own="$(_wd_own_commits "$wt")"
+  [ "$own" = "0" ] && printf ' — no own commits vs %s: confirm close-without-code, do not land' "$base"
+  [ -n "$conflicts" ] && printf ' — NOTE: the branch also conflicts with %s on: %s — resolve on the spoke before any land' \
+    "$base" "$conflicts"
+  return 0
 }
 
 # _wd_land_conflicts <wt> -> the space-separated conflicting file(s) when the checked-out branch
@@ -715,8 +863,41 @@ _wd_intervene_answer() {   # route to the reasoner/answer lane directly
   if [ -n "${HUB_WATCHDOG_ANSWER_CMD:-}" ]; then bash -c "$HUB_WATCHDOG_ANSWER_CMD" hub-watchdog "$wt" "$issue" >/dev/null 2>&1 || true; return 0; fi
   command -v decide_and_act >/dev/null 2>&1 && decide_and_act "$wt" "$issue" >/dev/null 2>&1 || true
 }
+# _wd_revive_marker <issue> -> the once-per-window revive BUDGET marker (#297). The
+# `wd-fire-dedup-` stem is deliberate: _clear_progress_state's wd-fire-dedup-* glob drops it on a
+# fresh arm, so the budget gets a per-window lifetime with no edit to that file. It is a BUDGET, not
+# a firing — nothing calls `_wd_clear_fired revive`, so the spawn stays spent for the whole window
+# even after the condition resolves, mirroring the drain's resumed-<issue> ("a second crash
+# escalates to a human", hub-afk.sh's _afk_already_resumed). The dead-pane sweep's narrower
+# wd-fire-dedup-dead-pane-* glob does not match this stem.
+# The DIRECTORY resolves like _wd_filed_marker's (state-dir first), NOT like _wd_fired_marker's
+# (ledger-dir first): the only glob that clears this lives in _clear_progress_state and looks solely
+# in _afk_state_dir, so minting the marker beside a relocated HUB_WATCHDOG_LEDGER would strand it
+# past every future arm and leave that spoke permanently un-revivable. A budget that outlives its
+# window is a worse failure than one cleared early — the ledger firing is what a human reads either
+# way, but a stranded budget silently disables the whole lane.
+_wd_revive_marker() {
+  local dir
+  if command -v _afk_state_dir >/dev/null 2>&1; then dir="$(_afk_state_dir)"; else dir="$(_wd_common_dir)"; fi
+  printf '%s\n' "$dir/wd-fire-dedup-revive-$1"
+}
+_wd_already_revived() { [ -f "$(_wd_revive_marker "$1")" ]; }
+
+# _wd_mark_revived <issue> <pid> -> record `<ts>\t<pid>` for this window's revive, non-zero when the
+# record could NOT be written. The caller must then refuse to spawn: an unrecordable budget is an
+# unbounded one, and this lane's failure directions are asymmetric — every other miss costs one
+# deferred revive, while this one costs the #297 spawn storm (a fresh headless claude every tick,
+# forever). Fail closed. The pid is the liveness half: a revive that orphans a headless run leaves
+# an operator something to inspect and kill instead of hunting stray processes by hand.
+_wd_mark_revived() {
+  local m; m="$(_wd_revive_marker "$1")"
+  mkdir -p "$(dirname "$m")" 2>/dev/null || true
+  printf '%s\t%s\n' "$(_wd_now)" "${2:--}" > "$m" 2>/dev/null || return 1
+  [ -f "$m" ]
+}
+
 _wd_intervene_revive() {   # claude --continue revive in the worktree
-  local wt="$1" issue="$2"
+  local wt="$1" issue="$2" pid=""
   # #290 AC3: NEVER resume a session into a worktree that is finished or being torn down. On #284
   # this launched `nohup claude --continue` inside a worktree the land removed seconds later — a
   # headless run against a vanishing cwd. The detector's done-epoch guard already stops the
@@ -731,8 +912,47 @@ _wd_intervene_revive() {   # claude --continue revive in the worktree
     _wd_log "deferring revive on #$issue — a land is in flight (its teardown is removing the worktree)"
     return 0
   fi
-  if [ -n "${HUB_WATCHDOG_REVIVE_CMD:-}" ]; then bash -c "$HUB_WATCHDOG_REVIVE_CMD" hub-watchdog "$wt" "$issue" >/dev/null 2>&1 || true; return 0; fi
-  command -v claude >/dev/null 2>&1 && ( cd "$wt" 2>/dev/null && nohup claude --continue >/dev/null 2>&1 & ) || true
+  # #297: ONE revive per issue per armed window. The dedup marker in _wd_fire gates only the ledger
+  # append, so before this the intervention re-ran every tick the condition held — and since no
+  # revive advances the epoch the detector measures, and a headless claude creates no pane, the
+  # condition held forever: a fresh run per minute, dozens concurrent. A second crash is now a
+  # human's call, exactly as it is for the drain's own resume lane.
+  #
+  # NOT paired with a "the drain is working this issue" defer keyed on _wd_last_action: that record
+  # is the drain's LAST action, not its CURRENT one, and is never cleared mid-window — so the
+  # drain's own give-up label (`warn-park #<issue>`) would read as "busy here" and disable this lane
+  # for the rest of the window, on exactly the abandoned spoke tier-2 exists to catch. The narrow
+  # drain-resume overlap this would have covered is bounded to a single extra run by the budget
+  # below; _wd_land_in_flight (above) still covers the mid-land race, on a freshness-bounded signal.
+  if _wd_already_revived "$issue"; then
+    _wd_log "deferring revive on #$issue — this window's revive budget is already spent"
+    return 0
+  fi
+  # Claim the budget BEFORE launching, and refuse to launch if it cannot be recorded: the record is
+  # the only thing bounding this lane, so an unwritable state dir must cost a revive, not restore
+  # the spawn storm. The seam owns its whole launch (tests + operator overrides), so it claims here.
+  if [ -n "${HUB_WATCHDOG_REVIVE_CMD:-}" ]; then
+    _wd_mark_revived "$issue" "-" || { _wd_log "refusing revive on #$issue — could not record the revive budget"; return 0; }
+    bash -c "$HUB_WATCHDOG_REVIVE_CMD" hub-watchdog "$wt" "$issue" >/dev/null 2>&1 || true
+    return 0
+  fi
+  command -v claude >/dev/null 2>&1 || return 0
+  # A worktree already torn down cannot be revived into. Checked BEFORE the claim: the spawn below
+  # is async, so this is the one launch failure observable in time to keep the budget unspent.
+  [ -d "$wt" ] || { _wd_log "deferring revive on #$issue — worktree $wt is gone"; return 0; }
+  _wd_mark_revived "$issue" pending \
+    || { _wd_log "refusing revive on #$issue — could not record the revive budget"; return 0; }
+  # `exec` so the backgrounded subshell BECOMES claude: $! is then the revived run's own pid, not a
+  # short-lived wrapper's — the pid recorded below has to be the one an operator can kill. The
+  # subshell keeps the cd off the caller's cwd.
+  # TRADE-OFF: a claude that dies at startup still spends the window's budget, where hub-afk's
+  # resume_spoke retries (it launches a tmux window and can read the failure synchronously; we
+  # detach a headless run and cannot). Bounded-without-retry is the deliberate choice: the ledger
+  # firing + filed defect that precede this call are what put a human on the spoke, and retry-per-
+  # tick without a backoff is the defect being fixed. The `pending` claim above stands if we die here.
+  ( cd "$wt" 2>/dev/null && exec nohup claude --continue >/dev/null 2>&1 ) &
+  pid=$!
+  _wd_mark_revived "$issue" "$pid" || true
 }
 _wd_intervene_reconcile() {  # clear the stale blocked/ marker (local + remote)
   local wt="$1" issue="$2"
@@ -775,6 +995,7 @@ _wd_clear_landed_landmarks() {
     # for it — clear its condition-4 firing markers here so the autonomy score re-arms (#263/#285).
     _wd_clear_fired auto-land-skipped "$issue"
     _wd_clear_fired conflicted-land "$issue"
+    _wd_clear_fired accept-unsigned "$issue"   # #292: same lane, same landmark → same re-arm
     _wd_log "cleared resolved landmark $tag (issue #$issue closed/landed)"
   done < <(git -C "$repo" tag -l 'needs-human-land/*' 2>/dev/null)
 }
@@ -840,14 +1061,85 @@ _wd_json_escape() {
 # HUB_WATCHDOG_CLASSIFY_CMD seam overrides the whole decision (echo the class).
 : "${HUB_WATCHDOG_AFK_DEFECT_LABEL:=afk-defect}"
 
+# _wd_blocked_tag_epoch <wt> <issue> -> when blocked/<issue> was raised, or empty. `creatordate`
+# reads the tagger date of an ANNOTATED tag (what spoke-ready.sh actually emits: `git tag -f -a`)
+# and falls back to the commit date for a lightweight one, so both shapes answer.
+_wd_blocked_tag_epoch() {
+  local wt="$1" issue="$2" ts
+  ts="$(git -C "$wt" for-each-ref --format='%(creatordate:unix)' "refs/tags/blocked/${issue}" 2>/dev/null)"
+  case "$ts" in '' | *[!0-9]*) return 0 ;; esac
+  printf '%s\n' "$ts"
+}
+
+# _wd_escalation_is_live <wt> <issue> -> true when the blocked/<issue> tag at the tip belongs to the
+# park episode CURRENTLY pending, rather than an older, already-answered one.
+# Why this is not just "the tag is at the tip": a blocked tag is only ever cleared by a later COMMIT
+# (both _clear_stale_blocked_marker and _wd_intervene_reconcile gate on the tag being a STRICT
+# ancestor of the tip). A human answering clears nothing; the spoke resuming clears nothing. So a
+# spoke that escalates, gets answered, resumes and re-parks on a NEW question — all before its first
+# commit, the common shape, since escalations usually precede any RED/GREEN — would carry its old
+# tag at the tip forever and have EVERY later park classified novel-decision. That silences real
+# drain defects and inflates the #251 autonomy score: the dangerous direction, since the score's
+# whole purpose is to be honest about afk's shortfalls.
+# The park onset names the episode actually pending (stamp-once, re-stamped when the park's context
+# changes — #283). An onset strictly NEWER than the tag means the pending park began after the
+# escalation, so this is a different question and its non-answer is a real defect. Unmeasurable
+# either side ⇒ trust the tag (the historic reading); ties ⇒ live, since the escalation is stamped
+# during the episode it belongs to.
+_wd_escalation_is_live() {
+  local wt="$1" issue="$2" tag_ts onset
+  tag_ts="$(_wd_blocked_tag_epoch "$wt" "$issue")"
+  case "$tag_ts" in '' | *[!0-9]*) return 0 ;; esac
+  onset="$(read_park_onset_epoch "$issue" 2>/dev/null)"
+  case "$onset" in '' | *[!0-9]*) return 0 ;; esac
+  [ "$onset" -gt "$tag_ts" ] && return 1
+  return 0
+}
+
+# _wd_classify <condition> <issue> [wt] -> the firing's class. <wt> is optional: supervisor-dead
+# has no worktree, and a direct caller may omit it (the tag check is then simply skipped).
 _wd_classify() {
-  local condition="$1" issue="$2"
+  local condition="$1" issue="$2" wt="${3:-}"
   if [ -n "${HUB_WATCHDOG_CLASSIFY_CMD:-}" ]; then
-    bash -c "$HUB_WATCHDOG_CLASSIFY_CMD" hub-watchdog "$condition" "$issue" 2>/dev/null; return
+    bash -c "$HUB_WATCHDOG_CLASSIFY_CMD" hub-watchdog "$condition" "$issue" "$wt" 2>/dev/null; return
   fi
   case "$condition" in
-    park-unanswered | park-undeliverable)
-      # A blocked/ record means the reasoner made a real human-call escalation — not a bug.
+    accept-unsigned)
+      # #292: accept/<N> at the tip is the drain behaving CORRECTLY — spoke-ready's human-eyeball
+      # terminal, which auto_land deliberately never lands ("accept/ awaits a human sign-off"). The
+      # wait is a by-design human decision, not a drain shortfall, so it must not auto-file a bug
+      # against afk (which spawned a fresh bug-scoper per accept-spoke per run — this issue's own
+      # provenance). The escalation still ledgers and still raises the landmark; only the CLASS
+      # changes, and only FILING is class-gated (_wd_fire).
+      # It does NOT spare the #251 autonomy score, contrary to what #292 assumed: _wd_autonomy_score
+      # counts _wd_intervention_count (every ledger line), not the class-filtered _wd_defect_count,
+      # so a novel-decision docks the score exactly like a defect. That is pre-existing and shared
+      # with the park-unanswered escape hatch — _wd_report deliberately prints `interventions` and
+      # `defects_filed` as separate figures — so making the score class-aware is a change to #251's
+      # instrument, not something to smuggle in here. Tracked separately.
+      printf 'novel-decision\n'; return ;;
+    park-unanswered)
+      # A deliberate escalation is a real human call, not an afk bug. TWO signals say so, and only
+      # the second was checked before (#297): the blocked/<issue> TAG at the spoke's tip — what
+      # spoke-ready actually emits, and the signal the dispatcher already trusts in
+      # _wd_detect_mergeable_skipped — and the durable local record, which gate-broker-markers.sh
+      # writes ONLY when that tag's push FAILS (the #109 fallback). Reading the record alone meant
+      # the COMMON case (the push succeeded, so no file exists) was misfiled as an afk-defect: a
+      # bogus auto-filed bug against afk, and the #251 autonomy score docked for the reasoner
+      # behaving correctly.
+      # Two bounds keep this from over-silencing, both in the direction that MATTERS (a wrong
+      # novel-decision hides a real defect and flatters the autonomy score):
+      #   * AT-TIP, not merely present — a tag the spoke has committed past is stale (#103), and
+      #     live state wins, so that firing IS a real defect;
+      #   * and the escalation must still be the LIVE one (see _wd_escalation_is_live).
+      # NOT applied to park-undeliverable: that tag is emitted BY a delivery failure (gate-broker's
+      # _escalate_blocked when the inject cannot be verified), so reading it as "a human call" would
+      # silence exactly the defect class #288 AC3 added that condition to surface — the drain
+      # failing to deliver an answer is afk's shortfall, not a novel human decision, and it must
+      # keep filing. The durable record is skipped there for the identical reason: same writer.
+      if [ -n "$wt" ] && _wd_tag_at_tip "$wt" blocked "$issue" && _wd_escalation_is_live "$wt" "$issue"; then
+        printf 'novel-decision\n'; return
+      fi
       if command -v _afk_blocked_record >/dev/null 2>&1 && [ -f "$(_afk_blocked_record "$issue" 2>/dev/null)" ]; then
         printf 'novel-decision\n'; return
       fi ;;
@@ -945,11 +1237,13 @@ ONE afk-defect issue (label $HUB_WATCHDOG_AFK_DEFECT_LABEL). Dedup against open 
 # JSONL line to the intervention-ledger (with the class), log it, and — for an afk-defect — file
 # it via the headless bug-scoper (deduped). Every firing is a bug report against afk; subtask 5's
 # autonomy score counts these lines. Best-effort.
+# <wt> ($4) is optional and threaded through to _wd_classify, which needs it to read the
+# blocked/<issue> tag at the spoke's tip (#297). supervisor-dead has no worktree and passes none.
 _wd_fire() {
-  local condition="$1" issue="$2" reason="$3" lf klass marker
+  local condition="$1" issue="$2" reason="$3" wt="${4:-}" lf klass marker
   marker="$(_wd_fired_marker "$condition" "$issue")"
   [ -f "$marker" ] && return 0   # already fired this unresolved occurrence — dedupe ledger + file
-  klass="$(_wd_classify "$condition" "$issue")"
+  klass="$(_wd_classify "$condition" "$issue" "$wt")"
   case "$klass" in afk-defect | novel-decision) ;; *) klass="afk-defect" ;; esac
   lf="$(_wd_ledger_file)"
   mkdir -p "$(dirname "$lf")" 2>/dev/null || true
@@ -967,7 +1261,7 @@ _wd_fire() {
 # intervention. Supervisor-dead is a single global check; the other four run per in-flight spoke.
 # Best-effort throughout: a missing drain reader (standalone watchdog) simply skips its condition.
 _wd_run_conditions() {
-  local now="${1:-$(_wd_now)}" state="${2:-$(_wd_drain_state)}" wt issue wd_conflicts wd_done
+  local now="${1:-$(_wd_now)}" state="${2:-$(_wd_drain_state)}" wt issue wd_conflicts wd_done wd_base
   local wd_seen=""   # the issues this tick saw in flight — the sweep below leaves them alone
   # Use the drain state the loop already read (passed as $2) rather than re-probing — the loop
   # reads it once per tick, and a second _wd_drain_state call would double-count under stubs.
@@ -990,16 +1284,21 @@ _wd_run_conditions() {
     # condition-2 time always comes back empty. Per-iteration local, passed explicitly: not a
     # tick-global (the #241 cross-pass leak trap).
     wd_done="$(_wd_done_epoch "$issue")"
+    # #297: measure condition 2's base ONCE per tick and thread it into both the detector and the
+    # reason, exactly as wd_done is. Re-reading it in the reason lets a concurrent progress stamp or
+    # a fresh arm render a base that did not fire — a ledger line that contradicts its own ceiling.
+    # Per-iteration local, passed explicitly: not a tick-global (the #241 cross-pass leak trap).
+    wd_base="$(_wd_dead_idle_base "$issue" "$now")"
     # Each detector: fire (deduped by _wd_fire's marker) + intervene when it trips; else clear the
     # firing marker so a genuinely resolved-then-recurring condition re-fires (#263).
     # park-undeliverable (#288 AC3) is checked FIRST: a serviced-but-never-deliverable park must
     # never ALSO read as the misleading never-attempted label.
     if _wd_detect_park_undeliverable "$wt" "$issue" "$now"; then
-      _wd_fire park-undeliverable "$issue" "$(_wd_park_undeliverable_reason "$wt" "$issue" "$now")"
+      _wd_fire park-undeliverable "$issue" "$(_wd_park_undeliverable_reason "$wt" "$issue" "$now")" "$wt"
       _wd_intervene_answer "$wt" "$issue"
       _wd_clear_fired park-unanswered "$issue"
     elif _wd_detect_park_unanswered "$wt" "$issue" "$now"; then
-      _wd_fire park-unanswered "$issue" "$(_wd_park_unanswered_reason "$wt" "$issue" "$now")"
+      _wd_fire park-unanswered "$issue" "$(_wd_park_unanswered_reason "$wt" "$issue" "$now")" "$wt"
       _wd_intervene_answer "$wt" "$issue"
       _wd_clear_fired park-undeliverable "$issue"
     else
@@ -1015,14 +1314,14 @@ _wd_run_conditions() {
       # double-count in the ledger, #263). Mirrors the land-lane servicing defer below; a land that
       # genuinely leaves a dead pane behind still fires once the land stops running.
       :
-    elif _wd_detect_dead_idle "$wt" "$issue" "$now" "$wd_done"; then
-      _wd_fire dead-pane "$issue" "$(_wd_dead_idle_reason "$wt" "$issue" "$now" "$wd_done")"
+    elif _wd_detect_dead_idle "$wt" "$issue" "$now" "$wd_done" "$wd_base"; then
+      _wd_fire dead-pane "$issue" "$(_wd_dead_idle_reason "$wt" "$issue" "$now" "$wd_done" "$wd_base")" "$wt"
       _wd_intervene_revive "$wt" "$issue"
     else
       _wd_clear_fired dead-pane "$issue"
     fi
     if _wd_detect_stale_marker "$wt" "$issue"; then
-      _wd_fire stale-marker "$issue" "stale blocked/ marker the drain did not reconcile"
+      _wd_fire stale-marker "$issue" "stale blocked/ marker the drain did not reconcile" "$wt"
       _wd_intervene_reconcile "$wt" "$issue"
     else
       _wd_clear_fired stale-marker "$issue"
@@ -1036,23 +1335,41 @@ _wd_run_conditions() {
       # drain stops re-arming, when the branches below run.
       :
     elif _wd_detect_mergeable_skipped "$wt" "$issue" "$now"; then
-      # #285: probe ACTUAL mergeability before labeling. A conflicted branch fires a DISTINCT
-      # `conflicted-land` reason naming the files (a human following "mergeable" walks into the
-      # same conflict); a truly-mergeable one keeps the historical auto-land-skipped. Both escalate
-      # via the SAME needs-human-land tag (no second tripwire-racing tag, #272) — only the reason
-      # differs, so the ledger/defect is honest about what the human must do.
+      # #292: read WHICH terminal marker is at the tip before labeling. slot_state reads ready/ and
+      # accept/ alike as `done`, but they are opposites: ready/ is a drain that should have landed
+      # and didn't; accept/ is the human-eyeball terminal the drain must NOT land. Only the ready/
+      # (or unreadable — never assume the quiet path) branch keeps the historical afk-defect
+      # treatment. All three escalate via the SAME needs-human-land tag (#272: no second
+      # tripwire-racing tag) and _wd_clear_landed_landmarks self-clears it once the human closes
+      # the issue; only the reason and class differ.
+      # #285: probe ACTUAL mergeability before labeling — for BOTH marker kinds. An accept/ branch
+      # is normally eyeball-then-land, and this is the only probe it ever gets, so its reason must
+      # name the conflicting files too or an approving human walks into an unannounced conflict.
       wd_conflicts="$(_wd_land_conflicts "$wt")"; wd_conflicts="${wd_conflicts% }"
-      if [ -n "$wd_conflicts" ]; then
-        _wd_fire conflicted-land "$issue" "branch conflicts with $(_wd_land_base_ref "$wt") on: $wd_conflicts — resolve on the spoke (merge the base branch), do not blind-land"
-        _wd_clear_fired auto-land-skipped "$issue"   # not a clean skip → drop any stale skip firing
+      if [ "$(_wd_terminal_marker_kind "$wt" "$issue")" = "accept" ]; then
+        _wd_fire accept-unsigned "$issue" "$(_wd_accept_unsigned_reason "$wt" "$issue" "$wd_conflicts")" "$wt"
+        _wd_clear_fired auto-land-skipped "$issue"   # not a drain skip → drop any stale skip firing
+        _wd_clear_fired conflicted-land "$issue"
       else
-        _wd_fire auto-land-skipped "$issue" "mergeable branch un-landed > ${HUB_WATCHDOG_LAND_CEILING}s (escalate-only: human land)"
-        _wd_clear_fired conflicted-land "$issue"     # cleanly mergeable now → drop any stale conflict firing
+        # A conflicted ready/ branch fires a DISTINCT `conflicted-land` reason naming the files (a
+        # human following "mergeable" walks into the same conflict); a truly-mergeable one keeps the
+        # historical auto-land-skipped. All three escalate via the SAME needs-human-land tag (no
+        # second tripwire-racing tag, #272) — only the reason and class differ, so the
+        # ledger/defect is honest about what the human must do.
+        if [ -n "$wd_conflicts" ]; then
+          _wd_fire conflicted-land "$issue" "branch conflicts with $(_wd_land_base_ref "$wt") on: $wd_conflicts — resolve on the spoke (merge the base branch), do not blind-land" "$wt"
+          _wd_clear_fired auto-land-skipped "$issue"   # not a clean skip → drop any stale skip firing
+        else
+          _wd_fire auto-land-skipped "$issue" "mergeable branch un-landed > ${HUB_WATCHDOG_LAND_CEILING}s (escalate-only: human land)" "$wt"
+          _wd_clear_fired conflicted-land "$issue"     # cleanly mergeable now → drop any stale conflict firing
+        fi
+        _wd_clear_fired accept-unsigned "$issue"       # a ready/ tip is not an accept wait
       fi
       _wd_intervene_landmark "$wt" "$issue"
     else
       _wd_clear_fired auto-land-skipped "$issue"
       _wd_clear_fired conflicted-land "$issue"
+      _wd_clear_fired accept-unsigned "$issue"
     fi
   done < <(inflight_worktrees)
   # #290 AC5: sweep dead-pane firing markers for issues that have since landed. Runs AFTER the loop
