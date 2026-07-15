@@ -183,6 +183,81 @@ def test_inject_and_verify_retries_with_bare_enter_never_repastes(tmp_path: Path
     assert len(bare_enters) >= 2, f"expected a submit Enter + a bare-Enter retry: {lines}"
 
 
+def _decline_tmux(tmp_path: Path, *, wt: Path, jsonl: Path) -> tuple[Path, Path]:
+    """The #281 pane: Esc DECLINES a pending AskUserQuestion, the paste never submits.
+
+    Models the real sequence in the #271 spoke pane. inject_answer sends Escape first (the
+    #74 menu-cancel, built for the PLAN-gate QCM); against a live AskUserQuestion that Escape
+    CANCELS the menu, and Claude Code records the cancel as its own type:"user" turn ("User
+    declined to answer questions") — which bumps the transcript mtime. The free-text answer
+    typed after it then sits in the composer and its Enter is swallowed, so the answer's own
+    needle NEVER lands in a user record.
+
+    capture-pane returns empty: a 40-char needle is wrapped across lines by the composer's
+    box, so the grep -qF in _composer_shows_text misses it and the pane reads as "no text
+    here" even though the paste is sitting right there. That false-negative is what let the
+    unsubmitted paste score as delivered.
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    log = tmp_path / "tmux.log"
+    decline = json.dumps(
+        {"type": "user", "message": {"content": [{"type": "text", "text": "User declined"}]}}
+    )
+    script = f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "{log}"
+case "$1" in
+  list-panes)   printf 'hub:0\\t%s\\n' "{wt}" ;;
+  capture-pane) : ;;
+  send-keys)
+    case "$*" in
+      *Escape*) printf '%s\\n' '{decline}' >> "{jsonl}" ;;
+    esac ;;
+esac
+exit 0
+"""
+    (fake_bin / "tmux").write_text(script)
+    (fake_bin / "tmux").chmod(0o755)
+    return fake_bin, log
+
+
+def test_inject_and_verify_rejects_qcm_decline_advance_as_delivery(tmp_path: Path) -> None:
+    """#281 head (b): an Esc-cancelled QCM must never score as the answer's own delivery.
+
+    The decline record advances the transcript, so _transcript_advanced fires — but it is the
+    INJECTOR's own Escape that wrote it, not the spoke reading the answer. Delivery proof has
+    to be the answer's needle landing in an appended type:"user" record; anything else lets a
+    paste nobody submitted be logged as "injected answer into #271" (four times, against an
+    answer the spoke never saw).
+    """
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    projects = tmp_path / "projects"
+    jsonl = _project_dir_for(projects, wt) / "session.jsonl"
+    jsonl.write_text("{}\n")
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))  # stale: the decline reads as an advance
+    fake_bin, log = _decline_tmux(tmp_path, wt=wt, jsonl=jsonl)
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_INJECT_POLL_SECONDS": "0",
+        "CLAUDE_PROJECTS_DIR": str(projects),
+    }
+    answer = "Approved — the push is correct; emit the ready marker."
+
+    result = _call(
+        f'inject_and_verify "{wt}" hub:0 "$ANSWER"; echo RC=$?', env={**env, "ANSWER": answer}
+    )
+
+    rc = result.stdout.strip().splitlines()[-1]
+    assert rc == "RC=3", f"an unsubmitted paste must be REFUTED, not delivered: {result.stdout}"
+    # The retry is a bare Enter, never a re-paste (#133): a second paste would stack the
+    # answer on top of the first in the composer.
+    pastes = [ln for ln in log.read_text().splitlines() if answer in ln]
+    assert len(pastes) == 1, f"answer must be pasted exactly once, got {len(pastes)}"
+
+
 # ── pane + permission detection ────────────────────────────────────────────────
 
 
