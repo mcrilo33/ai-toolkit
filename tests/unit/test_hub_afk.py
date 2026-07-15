@@ -4240,7 +4240,11 @@ def test_arm_hub_watchdog_hands_over_the_origin_script(tmp_path: Path) -> None:
     stub.write_text(f'#!/usr/bin/env bash\nprintf "%s" "$HUB_WATCHDOG_ORIG_SCRIPT" > "{dump}"\n')
     stub.chmod(0o755)
 
-    env = {"AFK_ORIG_SCRIPT": str(origin_dir / "hub-afk.sh"), "HUB_WATCHDOG_BIN": str(stub)}
+    env = {
+        "AFK_ORIG_SCRIPT": str(origin_dir / "hub-afk.sh"),
+        "HUB_WATCHDOG_BIN": str(stub),
+        "HUB_WATCHDOG_ARM_CMD": "",  # override the autouse no-op stub pin below
+    }
 
     _call("_afk_arm_hub_watchdog", env=env)
 

@@ -1588,29 +1588,40 @@ _wd_recycle_stale_pid() {
   return 0
 }
 
-# _wd_daemon [--reexec] -> singleton wrapper around _wd_loop. The pidfile makes N arms arm
-# exactly one daemon: when it names a still-live pid (kill -0), a genfile-PROVEN-stale daemon is
-# recycled (#296 AC2 — a self-update redeploy must not defer to a daemon a land already
-# replaced); otherwise refuse and leave the other daemon's pidfile alone. A stale pidfile (dead
-# pid) is reclaimed. A re-exec keeps this pid, so `--reexec` reclaims our own file instead of
-# refusing/recycling. Loop output appends to the logfile so a recovery is auditable after the
-# fact. Always returns 0.
+# _wd_singleton_guard <pidfile> <genfile> -> 0 (proceed: claim/relaunch) when the pidfile is
+# absent, names a dead pid, or names a live pid _wd_daemon_is_stale can PROVE is behind (which
+# this also recycles, as a side effect, before returning). 1 (refuse — a live, unmeasurable-or-
+# current daemon already holds the slot) otherwise. Shared by both real entry points (#296
+# AC2 review): _wd_daemon (the foreground `--daemon` loop) and _wd_arm (the detached `--arm`
+# launcher the drain actually calls every tick) must agree on this decision, or a fix to one
+# and not the other leaves the daemon un-recyclable through the path that matters in production.
+_wd_singleton_guard() {
+  local pidfile="$1" genfile="$2" pid
+  [ -f "$pidfile" ] || return 0
+  pid="$(cat "$pidfile" 2>/dev/null)"
+  _wd_pid_alive "$pid" || return 0
+  if _wd_daemon_is_stale "$genfile"; then
+    _wd_log "live daemon (pid $pid) is running a generation a land already replaced — recycling"
+    _wd_recycle_stale_pid "$pid"
+    return 0
+  fi
+  return 1
+}
+
+# _wd_daemon [--reexec] -> singleton wrapper around _wd_loop. _wd_singleton_guard makes N arms
+# arm exactly one daemon: refuse (leaving the other daemon's pidfile alone) unless the pidfile
+# is absent, dead, or PROVEN stale (recycled as a side effect, #296 AC2). A re-exec keeps this
+# pid, so `--reexec` reclaims our own file instead of guarding at all. Loop output appends to
+# the logfile so a recovery is auditable after the fact. Always returns 0.
 _wd_daemon() {
   local reexec="${1:-}" pidfile logfile genfile pid baseline
   pidfile="$(_wd_pidfile)"
   logfile="$(_wd_logfile)"
   genfile="$(_wd_genfile)"
-  if [ "$reexec" != "--reexec" ] && [ -f "$pidfile" ]; then
+  if [ "$reexec" != "--reexec" ] && ! _wd_singleton_guard "$pidfile" "$genfile"; then
     pid="$(cat "$pidfile" 2>/dev/null)"
-    if _wd_pid_alive "$pid"; then
-      if _wd_daemon_is_stale "$genfile"; then
-        _wd_log "live daemon (pid $pid) is running a generation a land already replaced — recycling"
-        _wd_recycle_stale_pid "$pid"
-      else
-        printf '%s\n' "hub-watchdog: already running (pid $pid, pidfile $pidfile)"
-        return 0
-      fi
-    fi
+    printf '%s\n' "hub-watchdog: already running (pid $pid, pidfile $pidfile)"
+    return 0
   fi
   printf '%s' "$$" > "$pidfile"
   # Claimed: this shell owns the pidfile, so remove it on exit. The path rides a global — a
@@ -1627,18 +1638,19 @@ _wd_daemon() {
 }
 
 # _wd_arm -> nohup-detach the daemon so it survives THIS session's death (the whole point:
-# ScheduleWakeup/Monitor die with the session; an OS process does not). Singleton-guarded: a
-# live pidfile means one is already armed. Best-effort; never fails the caller (the drain
-# co-arms it each tick, so a transient miss self-heals).
+# ScheduleWakeup/Monitor die with the session; an OS process does not). Shares _wd_singleton_
+# guard with _wd_daemon (#296 AC2 review): a live pidfile means one is already armed UNLESS its
+# generation is PROVEN stale, in which case the guard recycles it and we relaunch fresh — this
+# is the real entry point the drain calls every tick, so the recycle logic is inert everywhere
+# else if it only lived in _wd_daemon's own guard. Best-effort; never fails the caller (the
+# drain co-arms it each tick, so a transient miss self-heals).
 _wd_arm() {
   local pidfile pid
   pidfile="$(_wd_pidfile)"
-  if [ -f "$pidfile" ]; then
+  if ! _wd_singleton_guard "$pidfile" "$(_wd_genfile)"; then
     pid="$(cat "$pidfile" 2>/dev/null)"
-    if _wd_pid_alive "$pid"; then
-      printf '%s\n' "hub-watchdog: already armed (pid $pid)"
-      return 0
-    fi
+    printf '%s\n' "hub-watchdog: already armed (pid $pid)"
+    return 0
   fi
   nohup bash "$_WD_SELF" --daemon >/dev/null 2>&1 &
   printf '%s\n' "hub-watchdog: armed (nohup daemon detached)"

@@ -3269,11 +3269,22 @@ _afk_watchdog_alive() {
 # Best-effort: a missing script or a failed launch never aborts the drain. Opt-out
 # HUB_WATCHDOG_COARM=0; HUB_WATCHDOG_ARM_CMD overrides the launch (the tests' seam), and
 # HUB_WATCHDOG_BIN pins the script path.
+# We normally run from OUR OWN frozen self-copy (#133), so _afk_find_script resolves $wd to
+# hub-watchdog.sh's copy in that SAME tmp dir — a bundle no land ever rewrites. Hand over the
+# ORIGIN sibling as HUB_WATCHDOG_ORIG_SCRIPT (mirroring AFK_ORIG_SCRIPT, the same contract we
+# carry for ourselves), derived from AFK_ORIG_SCRIPT's directory since it and hub-watchdog.sh
+# live side by side in the real checkout; without this the watchdog's #296 self-recycle hashes
+# the frozen copy forever, structurally dead exactly like before that fix.
 _afk_arm_hub_watchdog() {
   [ "${HUB_WATCHDOG_COARM:-1}" = "1" ] || return 0
   if [ -n "${HUB_WATCHDOG_ARM_CMD:-}" ]; then bash -c "$HUB_WATCHDOG_ARM_CMD" >/dev/null 2>&1 || true; return 0; fi
-  local wd; wd="$(_afk_find_script "${HUB_WATCHDOG_BIN:-}" hub-watchdog.sh)" || return 0
-  bash "$wd" --arm >/dev/null 2>&1 || true
+  local wd orig
+  wd="$(_afk_find_script "${HUB_WATCHDOG_BIN:-}" hub-watchdog.sh)" || return 0
+  orig="$wd"
+  if [ -n "${AFK_ORIG_SCRIPT:-}" ] && [ -f "$(dirname "$AFK_ORIG_SCRIPT")/hub-watchdog.sh" ]; then
+    orig="$(dirname "$AFK_ORIG_SCRIPT")/hub-watchdog.sh"
+  fi
+  HUB_WATCHDOG_ORIG_SCRIPT="$orig" bash "$wd" --arm >/dev/null 2>&1 || true
 }
 
 _afk_spawn_watchdog() {
