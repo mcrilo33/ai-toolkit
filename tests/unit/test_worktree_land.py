@@ -2196,3 +2196,113 @@ def test_land_mirror_opt_out_clears_no_labels(hub: Path, tmp_path: Path) -> None
 
     assert proc.returncode == 0, proc.stderr
     assert "issue edit" not in _log_text(logs["gh"])
+
+
+# ── #278: one branch carrying N packed subtask issues closes ALL of them ──────
+#
+# A packed spoke ships several same-scope issues on ONE branch. The branch slug names only
+# the PRIMARY, so a slug-derived scalar closes exactly one issue and silently leaves the rest
+# open forever — they were shipped, but nothing says so.
+#
+# The subtask markers are the record of what shipped, but they are NOT all at the tip: under
+# the deferred-terminal design the spoke emits ready/<subtask> as each one lands and
+# ready/<primary> LAST, so earlier subtasks' markers sit on ANCESTOR commits. A `--points-at
+# HEAD` scan therefore finds only the last subtask plus the primary — which is exactly why
+# these fixtures are THREE-deep: a two-issue chain passes under both readings and would hide
+# the bug. The list must come from markers REACHABLE FROM the tip, bounded to this branch's
+# own commits ($DEFAULT..HEAD) so a foreign marker merged in from main is never closed.
+
+
+def _make_packed_spoke(hub: Path, tmp_path: Path, primary: str, subtasks: list[str]) -> Path:
+    """A branch shipping <primary> plus <subtasks>, marked the way a packed spoke marks it.
+
+    Commit 1 is the primary's own work. Each subtask then gets its own commit and its
+    ready/<N> tag as it ships. ready/<primary> is emitted LAST, at the final tip — the order
+    worktree-land's at-tip marker guard requires. So every subtask marker except the last
+    sits on an ancestor.
+    """
+    branch = f"feature/{primary}-packed"
+    wt = tmp_path / branch.replace("/", "-")
+    _git(hub, "worktree", "add", "-q", "-b", branch, str(wt))
+    (wt / "primary.txt").write_text("primary work\n")
+    _git(wt, "add", "primary.txt")
+    _git(wt, "commit", "-qm", "feat: primary work", "-m", f"Refs #{primary}")
+    for sub in subtasks:
+        (wt / f"sub-{sub}.txt").write_text(f"subtask {sub}\n")
+        _git(wt, "add", f"sub-{sub}.txt")
+        _git(wt, "commit", "-qm", f"feat: subtask {sub}", "-m", f"Refs #{sub}")
+        _git(wt, "tag", f"ready/{sub}")  # shipped here; the tip moves on after it
+    _git(wt, "tag", f"ready/{primary}")  # terminal, at the final tip
+    _git(wt, "push", "-q", "-u", "origin", branch)
+    _git(wt, "push", "-q", "origin", "--tags")
+    return wt
+
+
+def test_land_closes_every_packed_subtask_issue(hub: Path, tmp_path: Path) -> None:
+    _make_packed_spoke(hub, tmp_path, "263", ["265", "270"])
+
+    proc, logs = _run_land(hub, tmp_path, "263")
+
+    assert proc.returncode == 0, proc.stderr
+    gh = _log_text(logs["gh"])
+    assert "issue close 263" in gh, "the primary still closes"
+    # #270's marker is at the tip; #265's is an ANCESTOR — the case a --points-at scan drops.
+    assert "issue close 270" in gh, "the last subtask closes"
+    assert "issue close 265" in gh, "an ancestor-marked subtask must close too"
+
+
+def test_land_clears_lifecycle_labels_for_every_packed_subtask(hub: Path, tmp_path: Path) -> None:
+    # The label mirror (#236) is per-issue: leaving status:in-progress on a shipped subtask
+    # would show it as live work forever.
+    _make_packed_spoke(hub, tmp_path, "263", ["265", "270"])
+
+    proc, logs = _run_land(hub, tmp_path, "263")
+
+    assert proc.returncode == 0, proc.stderr
+    gh = _log_text(logs["gh"])
+    for issue in ("263", "265", "270"):
+        assert f"issue edit {issue}" in gh, f"#{issue}'s lifecycle labels must be cleared"
+
+
+def test_land_consumes_every_packed_subtask_marker(hub: Path, tmp_path: Path) -> None:
+    # The marker-consumption block's own reason applies to all N: a lingering ready/265 would
+    # re-flag a FUTURE branch reusing that number as mergeable.
+    _make_packed_spoke(hub, tmp_path, "263", ["265", "270"])
+
+    proc, _ = _run_land(hub, tmp_path, "263")
+
+    assert proc.returncode == 0, proc.stderr
+    for issue in ("263", "265", "270"):
+        tags = _git(hub, "tag", "--list", f"ready/{issue}")
+        assert tags.strip() == "", f"ready/{issue} must be consumed once landed"
+
+
+def test_land_does_not_close_a_foreign_marker_merged_from_main(hub: Path, tmp_path: Path) -> None:
+    # The bound is load-bearing: an un-landed ready/<X> from a sibling spoke that reached main
+    # is reachable from our tip once main is merged in, but it is NOT our work. Closing it
+    # would silently mark someone else's in-flight issue done.
+    (hub / "foreign.txt").write_text("a sibling's landed work\n")
+    _git(hub, "add", "foreign.txt")
+    _git(hub, "commit", "-qm", "feat: sibling work", "-m", "Refs #999")
+    _git(hub, "tag", "ready/999")  # a marker sitting on main
+    _git(hub, "push", "-q", "origin", "main", "--tags")
+
+    _make_packed_spoke(hub, tmp_path, "263", ["265"])
+
+    proc, logs = _run_land(hub, tmp_path, "263")
+
+    assert proc.returncode == 0, proc.stderr
+    gh = _log_text(logs["gh"])
+    assert "issue close 263" in gh and "issue close 265" in gh
+    assert "issue close 999" not in gh, "a marker already on main is not this branch's work"
+
+
+def test_single_issue_land_is_unchanged(hub: Path, tmp_path: Path) -> None:
+    # The overwhelmingly common path: an unpacked branch closes exactly its one issue.
+    _make_spoke(hub, tmp_path, "feature/7-solo", push=True)
+
+    proc, logs = _run_land(hub, tmp_path, "7")
+
+    assert proc.returncode == 0, proc.stderr
+    closes = [ln for ln in _log_text(logs["gh"]).splitlines() if ln.startswith("issue close")]
+    assert len(closes) == 1 and "issue close 7" in closes[0]

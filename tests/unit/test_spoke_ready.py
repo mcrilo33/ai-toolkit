@@ -1028,3 +1028,166 @@ def test_spoke_ready_emits_no_gh_calls(
     assert proc.returncode == 0, proc.stderr
     calls = log.read_text() if log.exists() else ""
     assert calls == "", f"spoke-ready must not touch gh — the hub mirrors, not the spoke: {calls!r}"
+
+
+# ── #278: the queued-subtask channel, consumed at the ready boundary ──────────
+#
+# A packed spoke carries several same-scope issues on ONE branch. Its terminal marker is
+# ready/<primary> — the issue in the branch slug — because worktree-land requires exactly
+# that tag AT THE TIP (worktree-land.sh:317-327). So the primary's marker is DEFERRED until
+# every queued subtask has shipped, even though the primary's own work comes first.
+#
+# This refusal is the mechanical fail-safe, not a nicety: auto_land fires on
+# _ready_at_tip <path> <primary>, so an early ready/<primary> would land the spoke and tear
+# down its worktree with subtasks still outstanding. The kickoff text and the drain's nudge
+# are advisory; THIS is what makes the chain safe.
+#
+# The channel is the hub's (gate-broker-markers.sh owns it), but a spoke cannot source a
+# hub-skill module, so the path is inlined here exactly as the OUTBOUND event spool already
+# is — the two sides share only the contract: <state-dir>/queued-<primary>/<issue>.
+
+QUEUE_PRIMARY = "45"  # OWN = fix/45-spoke-ready, so the branch slug's primary is 45
+
+
+def _queue(state: Path, issue: str, primary: str = QUEUE_PRIMARY) -> Path:
+    """Create a queued-subtask entry for <primary>, mirroring the broker's layout."""
+    d = state / f"queued-{primary}"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / issue).touch()
+    return d
+
+
+def test_queued_flag_prints_the_queue(spoke: Path, tmp_path: Path) -> None:
+    # The read-only query the spoke uses to see what it still owes.
+    state = tmp_path / "afk-state"
+    _queue(state, "265")
+    _queue(state, "270")
+
+    proc = _run(spoke, "--queued", QUEUE_PRIMARY, env={**_GIT_ENV, "AFK_STATE_DIR": str(state)})
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split() == ["265", "270"]
+
+
+def test_queued_flag_is_empty_and_silent_with_no_queue(spoke: Path, tmp_path: Path) -> None:
+    proc = _run(
+        spoke,
+        "--queued",
+        QUEUE_PRIMARY,
+        env={**_GIT_ENV, "AFK_STATE_DIR": str(tmp_path / "afk-state")},
+    )
+
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == ""
+
+
+def test_queued_flag_emits_no_marker(spoke: Path, remote: Path, tmp_path: Path) -> None:
+    # A pure query: it must never tag anything, or merely LOOKING at the queue would land
+    # the spoke.
+    state = tmp_path / "afk-state"
+    _queue(state, "265")
+
+    _run(spoke, "--queued", QUEUE_PRIMARY, env={**_GIT_ENV, "AFK_STATE_DIR": str(state)})
+
+    assert not _remote_has_ref(remote, f"refs/tags/ready/{QUEUE_PRIMARY}")
+
+
+def test_terminal_ready_is_refused_while_the_queue_is_non_empty(
+    spoke: Path, remote: Path, tmp_path: Path
+) -> None:
+    # THE fail-safe. auto_land fires on ready/<primary> at the tip, so letting this through
+    # would land the branch and tear the worktree down with #265 never done.
+    state = tmp_path / "afk-state"
+    _queue(state, "265")
+
+    proc = _run(spoke, QUEUE_PRIMARY, env={**_GIT_ENV, "AFK_STATE_DIR": str(state)})
+
+    assert proc.returncode == 5, "a queue-blocked ready exits a DISTINCT code, not the generic 1"
+    assert "265" in proc.stderr, "the refusal must name what is still owed"
+    assert not _remote_has_ref(remote, f"refs/tags/ready/{QUEUE_PRIMARY}"), "no marker emitted"
+
+
+def test_terminal_ready_succeeds_once_the_queue_drains(
+    spoke: Path, remote: Path, tmp_path: Path
+) -> None:
+    state = tmp_path / "afk-state"
+    (state / f"queued-{QUEUE_PRIMARY}").mkdir(parents=True)  # present but EMPTY
+
+    proc = _run(spoke, QUEUE_PRIMARY, env={**_GIT_ENV, "AFK_STATE_DIR": str(state)})
+
+    assert proc.returncode == 0, proc.stderr
+    assert _remote_has_ref(remote, f"refs/tags/ready/{QUEUE_PRIMARY}")
+
+
+def test_a_subtask_ready_is_not_gated_by_the_queue(
+    spoke: Path, remote: Path, tmp_path: Path
+) -> None:
+    # Only the PRIMARY's marker is terminal. ready/265 is a per-subtask completion record —
+    # gating it on the queue would deadlock the chain, since shipping #265 is exactly how the
+    # queue drains.
+    state = tmp_path / "afk-state"
+    _queue(state, "265")
+    _queue(state, "270")
+
+    proc = _run(spoke, "265", env={**_GIT_ENV, "AFK_STATE_DIR": str(state)})
+
+    assert proc.returncode == 0, proc.stderr
+    assert _remote_has_ref(remote, "refs/tags/ready/265")
+
+
+def test_a_subtask_ready_clears_its_own_queue_entry(spoke: Path, tmp_path: Path) -> None:
+    # Shipping a subtask is what drains the queue; the peers stay owed.
+    state = tmp_path / "afk-state"
+    _queue(state, "265")
+    _queue(state, "270")
+
+    proc = _run(spoke, "265", env={**_GIT_ENV, "AFK_STATE_DIR": str(state)})
+
+    assert proc.returncode == 0, proc.stderr
+    assert not (state / f"queued-{QUEUE_PRIMARY}" / "265").exists()
+    assert (state / f"queued-{QUEUE_PRIMARY}" / "270").is_file(), "#270 is still owed"
+
+
+def test_an_unpacked_spoke_is_never_queue_gated(spoke: Path, remote: Path, tmp_path: Path) -> None:
+    # The overwhelmingly common path: no queue dir at all ⇒ the gate is invisible.
+    proc = _run(
+        spoke, QUEUE_PRIMARY, env={**_GIT_ENV, "AFK_STATE_DIR": str(tmp_path / "afk-state")}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert _remote_has_ref(remote, f"refs/tags/ready/{QUEUE_PRIMARY}")
+
+
+def test_gate_and_blocked_markers_are_never_queue_gated(
+    spoke: Path, remote: Path, tmp_path: Path
+) -> None:
+    # gate/ and blocked/ are STOP signals over incomplete work — they make no landable claim,
+    # and the hub itself emits blocked/. A queue must never suppress a park or an escalation:
+    # that would strand a chained spoke with no way to signal for help.
+    state = tmp_path / "afk-state"
+    _queue(state, "265")
+    env = {**_GIT_ENV, "AFK_STATE_DIR": str(state)}
+
+    assert _run(spoke, "--gate", QUEUE_PRIMARY, env=env).returncode == 0
+    assert _run(spoke, "--blocked", QUEUE_PRIMARY, env=env).returncode == 0
+    # rc 0 alone would also hold if the marker were quietly skipped — assert both REACHED
+    # origin, which is what actually gets the spoke un-stuck.
+    assert _remote_has_ref(remote, f"refs/tags/gate/{QUEUE_PRIMARY}")
+    assert _remote_has_ref(remote, f"refs/tags/blocked/{QUEUE_PRIMARY}")
+
+
+def test_queue_gate_outranks_an_unmet_precondition(spoke: Path, tmp_path: Path) -> None:
+    # When BOTH are unmet, the queue wins. A queue is a structural fact (whole issues left to
+    # ship); the preconditions judge whether the CURRENT tip is shippable. "Your tree is dirty"
+    # would send the spoke to tidy up and retry the same wrong marker, whereas "you still owe
+    # #265" is the real next step — and after shipping #265 the tree is pushed and clean, so
+    # the precondition complaint was usually moot anyway.
+    state = tmp_path / "afk-state"
+    _queue(state, "265")
+    (spoke / "work.txt").write_text("uncommitted\n")  # also fails precondition 1 (clean tree)
+
+    proc = _run(spoke, QUEUE_PRIMARY, env={**_GIT_ENV, "AFK_STATE_DIR": str(state)})
+
+    assert proc.returncode == 5, "the queue's distinct code, not the precondition's generic 1"
+    assert "265" in proc.stderr
+    assert "not clean" not in proc.stderr, "the queue is reported, not the incidental dirt"

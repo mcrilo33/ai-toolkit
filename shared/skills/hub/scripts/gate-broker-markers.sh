@@ -32,6 +32,81 @@ _clear_dispatch_epochs() {
   rm -f "$dir"/dispatch-*.epoch 2>/dev/null || true
 }
 
+# --- queued-subtask channel (issue #278) --------------------------------------
+# The drain's INBOUND channel to a LIVE spoke — the mirror of the outbound event spool
+# above. When a ready issue's scope is packable into a spoke that is already running, the
+# drain queues it here instead of spawning a second worktree and paying its whole lifecycle
+# tax again (spawn + first-push suite seed 12-47 min, PLAN gate, review, land). The spoke
+# consumes the queue at its ready boundary: while it is non-empty, spoke-ready.sh REFUSES
+# the terminal ready/<primary>, which is what stops auto_land from landing a spoke — and
+# tearing down its worktree — with subtasks still outstanding.
+#
+# ONE FILE PER QUEUED ISSUE — `queued-<spoke>/<issue>` — not one file of many lines. The
+# hub and the spoke are separate processes sharing this dir, so a line-based queue would need
+# a read-modify-write to remove an entry, and a concurrent append between its read and its
+# rewrite is silently LOST (verified, not theoretical: the drain routing #270 while the spoke
+# clears the #264 it just shipped drops #270). This host has no flock(1), and the repo's only
+# lock (worktree-lib.sh) shells to python — far too heavy for a per-tick path. A file per
+# issue sidesteps all of it: create and unlink are atomic, and each entry is independent, so
+# no writer can clobber another's. Cheaper AND stronger than locking a shared file.
+#
+# ORDER is deliberately not preserved: the queue reads back ascending by issue number, not in
+# the order entries were added. Insertion order buys nothing here — the members are same-scope
+# peers, batch-plan has already picked the one that matters (the LEADER, which names the
+# branch and is never queued), and the rest are independent issues whose completion order does
+# not change the wall clock. Ascending is deterministic, which is what tests and logs need.
+#
+# Written with mkdir -p + a plain create, NOT _afk_atomic_write: that helper lives in
+# hub-afk.sh, which gate-broker.sh does not source, so calling it here would be an unbound
+# command whenever the broker runs standalone (e.g. hub-watchdog.sh).
+#
+# Three writers share only this path contract, because neither of the other two can source
+# this module: worktree-new.sh seeds a dispatch-time pack's subtasks, hub-afk.sh routes a
+# filing-time match, and spoke-ready.sh reads + clears from inside the spoke.
+_queued_subtask_dir() { printf '%s\n' "$(_afk_state_dir)/queued-$1"; }
+
+# stamp_queued_subtask <spoke> <issue> -> queue <issue> as a subtask for <spoke>.
+# Idempotent for free: re-creating an existing entry is the same entry. The drain re-derives
+# routing every tick and may re-route the same issue, and a duplicate would make the spoke
+# re-anchor on work it already shipped.
+stamp_queued_subtask() {
+  local dir; dir="$(_queued_subtask_dir "$1")"
+  mkdir -p "$dir" 2>/dev/null || true
+  : > "$dir/$2" 2>/dev/null || true
+  return 0
+}
+# read_queued_subtask <spoke> -> the queued issue numbers, one per line, ascending.
+# Empty (rc 0) for a spoke with no queue — the common case on every tick.
+read_queued_subtask() {
+  local dir f; dir="$(_queued_subtask_dir "$1")"
+  [ -d "$dir" ] || return 0
+  for f in "$dir"/*; do
+    [ -f "$f" ] || continue
+    printf '%s\n' "${f##*/}"
+  done | sort -n
+  return 0
+}
+# clear_queued_subtask <spoke> [issue] -> drop ONE entry (the spoke shipped that subtask), or
+# the WHOLE queue when no issue is given (the reclaim path: a spoke that reached its terminal
+# ready before the entry was consumed drops it, and the issues fall back to a fresh dispatch).
+# An exact filename, so clearing #4 cannot touch #264 or #40 — no substring hazard at all.
+clear_queued_subtask() {
+  local dir; dir="$(_queued_subtask_dir "$1")"
+  if [ -z "${2:-}" ]; then
+    rm -rf "$dir" 2>/dev/null || true
+  else
+    rm -f "$dir/$2" 2>/dev/null || true
+  fi
+  return 0
+}
+# NOTE: deliberately NOT cleared on a fresh arm, unlike the dispatch epochs / progress state
+# above. Those are per-WINDOW; a queue is bound to a live SPOKE's lifetime, and worktrees
+# outlive `/afk off` (the drain only tags them blocked/<N>, and re-arm reconciles that away).
+# Wiping the channel at arm would silently drop subtasks already routed to a spoke that is
+# still running them, forcing each back through a full fresh lifecycle — the exact waste this
+# issue exists to remove. A queue whose spoke is gone is reclaimed by liveness instead
+# (hub-afk.sh clears it once the target is terminal or no longer in flight).
+
 # --- event spool (issue #176) -------------------------------------------------
 # The event-driven wake path: a spoke ANNOUNCES a state change (a marker push, a
 # permission/question park) by dropping one content-free file per event, named

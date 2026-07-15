@@ -53,6 +53,10 @@ LAUNCH_AGENT=1
 PROMPT=""              # seed the spawned claude with this first message
 TYPE_FLAG=""           # --type overrides the positional type (no footgun)
 MODE="attended"        # execution mode stamped on the trace (attended | afk); #102
+# --subtasks N,M: extra issues this ONE spoke ships (#278). NOT named SUBTASKS: that name is
+# already taken further down for the ledger skeleton's body-derived subtask list, which would
+# silently clobber this one.
+SUBTASK_ARG=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --new-window)  OPEN_MODE="new-window"; shift ;;
@@ -65,6 +69,10 @@ while [ "$#" -gt 0 ]; do
     --prompt=*)    PROMPT="${1#--prompt=}"; shift ;;
     --mode)        [ "$#" -ge 2 ] || wt_die "--mode needs a value"; MODE="$2"; shift 2 ;;
     --mode=*)      MODE="${1#--mode=}"; shift ;;
+    # --subtasks N,M (#278): the extra issues batch-plan packed onto THIS spoke. They ride
+    # the primary's branch as ordered subtasks instead of each paying a full spoke lifecycle.
+    --subtasks)    [ "$#" -ge 2 ] || wt_die "--subtasks needs a value"; SUBTASK_ARG="$2"; shift 2 ;;
+    --subtasks=*)  SUBTASK_ARG="${1#--subtasks=}"; shift ;;
     -*)            wt_die "unknown option: $1" ;;
     *)             POSITIONAL+=("$1"); shift ;;
   esac
@@ -122,6 +130,46 @@ else
   BRANCH="${TYPE}/${SLUG}"
   WT_TAG="$SLUG"
   LANE="express"          # ad-hoc, no-issue express spoke (#102)
+fi
+
+# --- packed subtasks (issue #278) --------------------------------------------
+# batch-plan emits an ordered GROUP per spoke ("263,265 270"): same-scope issues that could
+# never run concurrently ride ONE branch as ordered subtasks, instead of each paying the
+# whole spoke lifecycle tax (worktree, first-push suite seed 12-47 min, PLAN gate, review,
+# land). The branch keeps leading with the PRIMARY — inflight_worktrees and worktree-land
+# both parse the issue out of the leading digits of the branch slug — and the extra issues
+# go into the queued-subtask channel, which is what holds the spoke's terminal
+# ready/<primary> until it has shipped them all.
+#
+# SUBTASK_LIST is normalized here (validated, primary dropped, deduped) so the seed prompt
+# below and the queue seeding agree on one list.
+SUBTASK_LIST=()
+if [ -n "$SUBTASK_ARG" ]; then
+  [[ "$ISSUE" =~ ^[0-9]+$ ]] || wt_die "--subtasks needs a numbered primary issue (got '$ISSUE')"
+  _seen=" "
+  # noglob for the split: the word-splitting expansion below is deliberately unquoted, so
+  # without this `--subtasks '2*'` GLOBS against the cwd and any files named 20/21/22 expand
+  # into the list — and then sail through the numeric check below as if they were real issue
+  # numbers. Validation cannot catch that; it runs after the shell has already substituted.
+  # (batch-plan.sh disables globbing script-wide for the same class of hazard.) Restored
+  # immediately after, since the rest of this script relies on globbing.
+  set -f
+  # Split on commas AND whitespace, so `--subtasks "265, 270"` works like `265,270`.
+  for _st in ${SUBTASK_ARG//,/ }; do
+    # Fail LOUDLY rather than skip: a malformed entry silently dropped would lose a real
+    # issue from the group, and nothing downstream would notice it was meant to ship here.
+    [[ "$_st" =~ ^[0-9]+$ ]] || { set +f; wt_die "--subtasks: '$_st' is not an issue number"; }
+    # `continue` on a match, but never let the FAILING test abort the loop under `set -e`:
+    # a test followed by && is exempt, and an if/fi keeps that obvious rather than subtle.
+    if [ "$_st" != "$ISSUE" ]; then           # the primary IS the branch, never a subtask
+      case "$_seen" in
+        *" $_st "*) ;;                        # dedupe: already queued
+        *) _seen="${_seen}${_st} "; SUBTASK_LIST+=("$_st") ;;
+      esac
+    fi
+  done
+  set +f
+  unset _seen _st
 fi
 
 # --- per-issue Model: override (issue #142) ----------------------------------
@@ -239,6 +287,7 @@ echo "→ spoke_run_id       $SPOKE_RUN_ID"
 printf '%s\n' "$LANE" > "$WT_DIR/.ai-toolkit/lane"
 printf '%s\n' "$MODE" > "$WT_DIR/.ai-toolkit/mode"
 echo "→ lane / mode        $LANE / $MODE"
+
 
 # --- write the task contract to disk (issue #177) ----------------------------
 # Anchoring used to be an LLM errand: the seed prompt told the spoke to run
@@ -647,7 +696,26 @@ wt_resolve_agent_model "$SCRIPT_DIR" "$WT_CONFIG"
 # /source-task round-trip. An explicit --prompt (start-task, hub-afk's
 # kickoff_for) still wins; ad-hoc slugs (no task.md) keep the unseeded launch.
 if [ -z "$PROMPT" ] && [ -f "$TASK_MD" ]; then
+  # A packed spoke (#278) owns a CHAIN, not one issue. Without this the spoke reads task.md,
+  # sees a single issue, and has no idea the queue is waiting on it — so name the queued
+  # issues and the order of work up front. The queue is still the mechanical authority
+  # (spoke-ready.sh refuses ready/${ISSUE} while it is non-empty); this is the heads-up that
   PROMPT="Read your task contract at .ai-toolkit/task.md (issue #${ISSUE}, fetched at spawn -- no need to run /source-task). Break it into a task ledger (one entry per subtask x the solo-cycle steps ANCHOR/RED/GREEN/REVIEW/PUSH, exactly one in_progress) -- a skeleton is pre-seeded at .ai-toolkit/ledger-skeleton.md; seed your ledger from its rows so your entries match the '#<issue>.<slug> - <STEP> - <label>' schema. Honor its Gate: line: plan (the default for non-trivial work, and whenever no Gate: line is present) means the PLAN gate comes first -- explore, print the full implementation plan, emit 'bash ${MARKER_DIR}/spoke-ready.sh --gate ${ISSUE}', and WAIT for approval before GREEN; only Gate: none runs autonomous straight through. Then implement via the solo-cycle (/cycle: RED -> GREEN -> REVIEW -> PUSH). Push your own branch each subtask; when the acceptance criteria are all met, push the final subtask and emit 'bash ${MARKER_DIR}/spoke-push.sh --ready ${ISSUE}'. Do NOT self-land. If task.md is missing, or the issue was edited after spawn, run /source-task ${ISSUE} to re-anchor from the live issue."
+fi
+
+# A packed spoke (#278) owns a CHAIN, not one issue: untold, it reads task.md, sees a single
+# issue, and has no idea a queue is waiting on it — then hits an unexplained ready/${ISSUE}
+# refusal at the very end. So APPEND the chain note to whatever prompt is being seeded,
+# INCLUDING a caller-supplied --prompt. That placement is load-bearing: every packed dispatch
+# comes from hub-afk's dispatch_batch, which ALWAYS passes --prompt "$(kickoff_for ...)", so a
+# note built only on the default-prompt branch above would never once reach a real packed
+# spoke. Appending here also keeps --subtasks self-contained — no caller has to duplicate the
+# wording for packing to work.
+#
+# The queue stays the mechanical authority (spoke-ready.sh refuses the terminal ready while it
+# is non-empty); this is the heads-up that stops that refusal from being a surprise.
+if [ "${#SUBTASK_LIST[@]}" -gt 0 ] && [ -n "$PROMPT" ]; then
+  PROMPT="${PROMPT} This spoke also carries these PACKED subtask issues on this SAME branch, in order: ${SUBTASK_LIST[*]} (they share #${ISSUE}'s scope, so ONE spoke ships them all instead of each paying a full spawn + suite-seed + review + land cycle). Finish #${ISSUE}'s own work first, then for EACH queued issue run '/source-task <N>' to re-anchor, run its full solo-cycle, and emit 'bash ${MARKER_DIR}/spoke-push.sh --ready <N>' -- that clears it from the queue. Inspect the queue any time with 'bash ${MARKER_DIR}/spoke-ready.sh --queued ${ISSUE}'. Only once the queue is EMPTY do you emit the terminal 'bash ${MARKER_DIR}/spoke-push.sh --ready ${ISSUE}' -- it is REFUSED while the queue is non-empty."
 fi
 
 # afk_ask_rule_preflight -> warn (stderr, best-effort) when the user-global settings carry a
@@ -694,6 +762,39 @@ AGENT_CMD="${OTEL_PREFIX}WT_SPOKE=$(printf '%q' "$WT_TAG") CLAUDE_EFFORT=$(print
 # reliable ceiling; this is a backstop.
 [ -n "${WT_AGENT_BUDGET_ARGS:-}" ] && AGENT_CMD="$AGENT_CMD ${WT_AGENT_BUDGET_ARGS}"
 [ -n "$PROMPT" ] && AGENT_CMD="$AGENT_CMD $(printf '%q' "$PROMPT")"
+
+# --- seed the queued-subtask channel (issue #278) ----------------------------
+# The packed group's extra issues become this spoke's subtask queue. Seeded HERE, at spawn,
+# rather than only on hub-afk's routing pass: /next-batch dispatches interactively with no
+# drain running, so a packed spoke would otherwise find an empty queue, emit ready/<primary>,
+# and silently drop its subtasks on the floor.
+#
+# Placed THIS LATE on purpose — after every fallible setup step (task.md, the allowlist
+# merge, model resolution, the gh label mirror), immediately before the launch. This dir is
+# keyed by ISSUE and SHARED, not worktree-local, so a spawn that dies after seeding would
+# strand it: a later, unrelated spoke for the same issue would inherit the entries and be
+# refused at ready/<primary> forever. Nothing before this point can now leave that behind.
+#
+# The path contract (<git-common-dir>/ai-toolkit-afk/queued-<spoke>/<issue>, one empty file
+# per queued issue) is INLINED rather than sourced: its owner, gate-broker-markers.sh, is a
+# hub-skill module this script cannot reach from a synced target — the same split the
+# outbound event spool already lives with, where the two sides share only the path. One file
+# per issue keeps create/unlink atomic, so this can never race the spoke's own clears.
+# Best-effort: the queue is a scheduling optimization and must not fail an otherwise-fine
+# spawn (the spoke would simply ship its primary and the subtasks dispatch fresh).
+if [ "${#SUBTASK_LIST[@]}" -gt 0 ]; then
+  # --git-common-dir answers RELATIVE to cwd (a bare `.git` from the checkout root), so
+  # anchor it on $REPO_ROOT rather than trusting wherever this script happens to stand.
+  _q_common="$(cd "$REPO_ROOT" && git rev-parse --git-common-dir 2>/dev/null || printf '.git')"
+  case "$_q_common" in /*) ;; *) _q_common="$REPO_ROOT/$_q_common" ;; esac
+  _q_dir="${AFK_STATE_DIR:-$_q_common/ai-toolkit-afk}/queued-$ISSUE"
+  mkdir -p "$_q_dir" 2>/dev/null || true
+  for _st in "${SUBTASK_LIST[@]}"; do
+    : > "$_q_dir/$_st" 2>/dev/null || true
+  done
+  echo "→ queued subtasks    ${SUBTASK_LIST[*]} (shipped on this branch before ready/$ISSUE)"
+  unset _q_common _q_dir _st
+fi
 
 # Bring up the otelcol collector, then the Langfuse message bridge, before the
 # spoke starts streaming, so an opted-in (AI_TOOLKIT_OTEL=1) spoke auto-populates

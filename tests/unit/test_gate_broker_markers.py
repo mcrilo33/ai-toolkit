@@ -58,6 +58,173 @@ def test_afk_drain_event_issues_empty_when_no_spool(tmp_path: Path) -> None:
     assert result.stdout.strip() == ""
 
 
+# ── #278: the queued-subtask channel (hub -> a live spoke) ────────────────────
+# The drain's INBOUND channel: when a ready issue is packable into a spoke that is already
+# running, the drain queues it here instead of spawning a second worktree (and its 20-minute
+# first-push suite seed). The spoke drains the queue at its ready boundary. Keyed by the
+# TARGET spoke, listing the routed issue numbers in dispatch order.
+
+
+def test_queued_subtask_round_trips(tmp_path: Path) -> None:
+    env = {"AFK_STATE_DIR": str(tmp_path / "st")}
+    _call("stamp_queued_subtask 263 264", env=env)
+
+    result = _call("read_queued_subtask 263", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == ["264"]
+
+
+def test_queued_subtask_is_empty_before_anything_is_queued(tmp_path: Path) -> None:
+    result = _call("read_queued_subtask 263", env={"AFK_STATE_DIR": str(tmp_path / "st")})
+
+    assert result.returncode == 0, "a spoke with no queue reads empty, never errors"
+    assert result.stdout.strip() == ""
+
+
+def test_queued_subtask_reads_back_in_deterministic_ascending_order(tmp_path: Path) -> None:
+    # Insertion order is deliberately NOT preserved (one file per issue buys atomicity at
+    # that price). It costs nothing: the members are same-scope peers, batch-plan already
+    # picked the one that matters (the LEADER, never queued), and the rest are independent
+    # issues whose completion order does not move the wall clock. Ascending is deterministic,
+    # which is what the spoke's re-anchor loop and the drain's logs actually need. Numeric,
+    # so #40 sorts before #264 rather than lexically after it.
+    env = {"AFK_STATE_DIR": str(tmp_path / "st")}
+    _call("stamp_queued_subtask 263 270", env=env)
+    _call("stamp_queued_subtask 263 40", env=env)
+    _call("stamp_queued_subtask 263 264", env=env)
+
+    result = _call("read_queued_subtask 263", env=env)
+
+    assert result.stdout.split() == ["40", "264", "270"]
+
+
+def test_clearing_one_entry_leaves_every_other_entry_untouched(tmp_path: Path) -> None:
+    # The STRUCTURAL property that makes this channel race-free: entries are independent
+    # files, so a clear unlinks its own and provably cannot rewrite — or lose — another.
+    #
+    # A line-based queue instead removes an entry by read-modify-write, so a concurrent
+    # append from the hub landing between the read and the rewrite is silently dropped (the
+    # drain routing #270 while the spoke clears the #264 it just shipped). That race cannot
+    # be pinned by a sequential test — the interleaving IS the bug, and any sequential
+    # ordering of the same calls passes on the racy design too — so it is designed out
+    # rather than tested for. This asserts the invariant that does the designing-out: the
+    # untouched entry keeps its inode, i.e. nothing rewrote it.
+    env = {"AFK_STATE_DIR": str(tmp_path / "st")}
+    _call("stamp_queued_subtask 263 264", env=env)
+    _call("stamp_queued_subtask 263 270", env=env)
+    survivor = tmp_path / "st" / "queued-263" / "270"
+    before = survivor.stat().st_ino
+
+    _call("clear_queued_subtask 263 264", env=env)
+
+    assert survivor.stat().st_ino == before, "#270's entry is never rewritten by #264's clear"
+    assert _call("read_queued_subtask 263", env=env).stdout.split() == ["270"]
+
+
+def test_queued_subtask_stamp_is_idempotent(tmp_path: Path) -> None:
+    # The drain re-derives state every tick and may re-queue the same issue; a duplicate
+    # entry would make the spoke re-anchor on an issue it already shipped.
+    env = {"AFK_STATE_DIR": str(tmp_path / "st")}
+    _call("stamp_queued_subtask 263 264", env=env)
+    _call("stamp_queued_subtask 263 264", env=env)
+
+    result = _call("read_queued_subtask 263", env=env)
+
+    assert result.stdout.split() == ["264"]
+
+
+def test_queued_subtask_is_keyed_per_spoke(tmp_path: Path) -> None:
+    env = {"AFK_STATE_DIR": str(tmp_path / "st")}
+    _call("stamp_queued_subtask 263 264", env=env)
+    _call("stamp_queued_subtask 300 301", env=env)
+
+    assert _call("read_queued_subtask 263", env=env).stdout.split() == ["264"]
+    assert _call("read_queued_subtask 300", env=env).stdout.split() == ["301"]
+
+
+def test_clear_queued_subtask_drops_one_entry_and_keeps_the_rest(tmp_path: Path) -> None:
+    # The spoke clears each issue as it ships it, so the queue drains one subtask at a time.
+    env = {"AFK_STATE_DIR": str(tmp_path / "st")}
+    _call("stamp_queued_subtask 263 264", env=env)
+    _call("stamp_queued_subtask 263 270", env=env)
+
+    _call("clear_queued_subtask 263 264", env=env)
+
+    assert _call("read_queued_subtask 263", env=env).stdout.split() == ["270"]
+
+
+def test_clear_queued_subtask_without_an_issue_drops_the_whole_queue(tmp_path: Path) -> None:
+    # The reclaim path (#278): a spoke that reached its terminal ready before the entry was
+    # consumed has its queue dropped whole, and the issues fall back to a fresh dispatch.
+    env = {"AFK_STATE_DIR": str(tmp_path / "st")}
+    _call("stamp_queued_subtask 263 264", env=env)
+    _call("stamp_queued_subtask 263 270", env=env)
+
+    _call("clear_queued_subtask 263", env=env)
+
+    assert _call("read_queued_subtask 263", env=env).stdout.strip() == ""
+
+
+def test_clear_queued_subtask_of_the_last_entry_leaves_an_empty_queue(tmp_path: Path) -> None:
+    env = {"AFK_STATE_DIR": str(tmp_path / "st")}
+    _call("stamp_queued_subtask 263 264", env=env)
+
+    _call("clear_queued_subtask 263 264", env=env)
+
+    result = _call("read_queued_subtask 263", env=env)
+    assert result.returncode == 0
+    assert result.stdout.strip() == ""
+
+
+def test_clear_queued_subtask_ignores_an_issue_not_in_the_queue(tmp_path: Path) -> None:
+    env = {"AFK_STATE_DIR": str(tmp_path / "st")}
+    _call("stamp_queued_subtask 263 264", env=env)
+
+    result = _call("clear_queued_subtask 263 999", env=env)
+
+    assert result.returncode == 0, "clearing an absent entry is a no-op, never an error"
+    assert _call("read_queued_subtask 263", env=env).stdout.split() == ["264"]
+
+
+def test_clear_queued_subtask_does_not_match_a_number_substring(tmp_path: Path) -> None:
+    # Clearing #4 must not eat #264 or #40. An entry is its own file named for the issue, so
+    # the clear is an exact unlink and the substring hazard a grep-based queue would have
+    # cannot arise at all.
+    env = {"AFK_STATE_DIR": str(tmp_path / "st")}
+    _call("stamp_queued_subtask 263 264", env=env)
+    _call("stamp_queued_subtask 263 40", env=env)
+
+    _call("clear_queued_subtask 263 4", env=env)
+
+    assert _call("read_queued_subtask 263", env=env).stdout.split() == ["40", "264"]
+
+
+def test_queued_subtask_survives_a_fresh_arm(tmp_path: Path) -> None:
+    # The channel is deliberately NOT per-window. Worktrees outlive `/afk off` (the drain
+    # only tags them blocked/<N>, which re-arm reconciles away), so a spoke resuming in the
+    # next window still owes its routed subtasks. Wiping the queue at arm — the way dispatch
+    # epochs and progress state are wiped — would drop them and force each back through the
+    # full fresh lifecycle this issue exists to avoid.
+    env = {"AFK_STATE_DIR": str(tmp_path / "st")}
+    _call("stamp_queued_subtask 263 264", env=env)
+
+    _call("_clear_dispatch_epochs", env=env)
+    _call("_clear_progress_state", env=env)
+
+    assert _call("read_queued_subtask 263", env=env).stdout.split() == ["264"]
+
+
+def test_queued_subtask_entry_lives_under_the_state_dir(tmp_path: Path) -> None:
+    # The spoke-side reader (spoke-ready.sh) and worktree-new.sh cannot source this module, so
+    # they INLINE the path — exactly as the outbound event spool already does. This pins the
+    # path contract all three sides share: <state-dir>/queued-<spoke>/<issue>.
+    env = {"AFK_STATE_DIR": str(tmp_path / "st")}
+    _call("stamp_queued_subtask 263 264", env=env)
+
+    assert (tmp_path / "st" / "queued-263" / "264").is_file()
+
+
 # ── issue #203 finding 1: re-answer ceiling on the same prompt ─────────────────
 # A legitimately-escalated spoke (answerer ESCALATE, timeout, unconfirmable inject) stays
 # parked on the SAME prompt; #171's blocked-at-tip→waiting fix had no ceiling, so every tick

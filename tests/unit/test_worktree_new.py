@@ -2013,3 +2013,183 @@ def test_dispatch_mirror_opt_out_makes_no_label_calls(hub: Path, tmp_path: Path)
     calls = _gh_calls(tmp_path)
     assert not [c for c in calls if c.startswith("issue edit")]
     assert not [c for c in calls if c.startswith("issue comment")]
+
+
+# ── #278: --subtasks, the dispatch-time pack's ordered extra issues ───────────
+#
+# batch-plan now emits an ordered GROUP per spoke ("263,265 270") instead of one issue per
+# spoke: same-scope issues that could never run concurrently ride ONE branch as ordered
+# subtasks rather than paying the whole spoke lifecycle tax each. This is the spawn side.
+#
+# The branch still leads with the PRIMARY — inflight_worktrees and worktree-land both derive
+# the issue from the leading digits of the branch slug — and the extra issues are seeded into
+# the queued-subtask channel, which is what makes the spoke work them before its terminal
+# ready/<primary>.
+
+
+def _queued_dir(state_dir: Path, primary: str) -> Path:
+    """The queued-subtask channel's per-spoke dir (the contract shared with the broker)."""
+    return state_dir / f"queued-{primary}"
+
+
+def test_subtasks_are_seeded_into_the_queued_channel(hub: Path, tmp_path: Path) -> None:
+    # The seeding must happen HERE, not only in hub-afk's routing pass: /next-batch dispatches
+    # interactively with no drain running, so a packed spoke would otherwise find an empty
+    # queue, emit ready/<primary>, and silently drop its subtasks on the floor.
+    state = tmp_path / "afk-state"
+    env = {
+        "GH_ISSUE_TITLE": "Primary of a packed group",
+        "GH_ISSUE_BODY": "Do the thing.\nScope: a.py\nGate: none\n",
+        "AFK_STATE_DIR": str(state),
+    }
+
+    proc, _ = _run_new(
+        hub, tmp_path, "263", "some-slug", "--no-code", "--subtasks", "265,270", extra_env=env
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert (_queued_dir(state, "263") / "265").is_file()
+    assert (_queued_dir(state, "263") / "270").is_file()
+
+
+def test_subtasks_do_not_queue_the_primary_itself(hub: Path, tmp_path: Path) -> None:
+    # The primary IS the branch, not a queued subtask. Queueing it would make the spoke
+    # re-anchor on the issue it is already working and never reach its terminal ready.
+    state = tmp_path / "afk-state"
+    env = {
+        "GH_ISSUE_TITLE": "Primary",
+        "GH_ISSUE_BODY": "Do the thing.\nGate: none\n",
+        "AFK_STATE_DIR": str(state),
+    }
+
+    proc, _ = _run_new(
+        hub, tmp_path, "263", "some-slug", "--no-code", "--subtasks", "263,265", extra_env=env
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert not (_queued_dir(state, "263") / "263").exists(), "the primary must never self-queue"
+    assert (_queued_dir(state, "263") / "265").is_file()
+
+
+def test_branch_slug_still_leads_with_the_primary_when_packed(hub: Path, tmp_path: Path) -> None:
+    # Load-bearing: inflight_worktrees and worktree-land both parse the issue out of the
+    # LEADING digits of the branch slug. A branch named for the group would strand both.
+    env = {
+        "GH_ISSUE_TITLE": "Primary of a packed group",
+        "GH_ISSUE_BODY": "Do the thing.\nGate: none\n",
+        "AFK_STATE_DIR": str(tmp_path / "afk-state"),
+    }
+
+    proc, _ = _run_new(
+        hub, tmp_path, "263", "some-slug", "--no-code", "--subtasks", "265,270", extra_env=env
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "feature/263-some-slug" in _git(hub, "branch", "--list", "feature/263-some-slug")
+    assert _worktree_dir(hub, "263").is_dir(), "the worktree tag stays the primary"
+
+
+def test_subtasks_absent_seeds_no_queue(hub: Path, tmp_path: Path) -> None:
+    # The overwhelmingly common path: an unpacked single-issue spoke must leave the channel
+    # untouched, or a stray queue would refuse its ready/<N>.
+    state = tmp_path / "afk-state"
+    env = {
+        "GH_ISSUE_TITLE": "Solo issue",
+        "GH_ISSUE_BODY": "Do the thing.\nGate: none\n",
+        "AFK_STATE_DIR": str(state),
+    }
+
+    proc, _ = _run_new(hub, tmp_path, "8", "some-slug", "--no-code", extra_env=env)
+
+    assert proc.returncode == 0, proc.stderr
+    assert not _queued_dir(state, "8").exists()
+
+
+def test_subtasks_rejects_a_non_numeric_entry(hub: Path, tmp_path: Path) -> None:
+    # Fail loudly at spawn: a malformed entry silently skipped would drop a real issue from
+    # the group, and nothing downstream would notice it was meant to ship on this branch.
+    env = {
+        "GH_ISSUE_TITLE": "Primary",
+        "GH_ISSUE_BODY": "Do the thing.\nGate: none\n",
+        "AFK_STATE_DIR": str(tmp_path / "afk-state"),
+    }
+
+    proc, _ = _run_new(
+        hub, tmp_path, "263", "some-slug", "--no-code", "--subtasks", "265,oops", extra_env=env
+    )
+
+    assert proc.returncode != 0, "a non-numeric subtask must abort the spawn"
+    # Name the offending value, not just the flag: "unknown option: --subtasks" would satisfy
+    # a laxer assertion while the feature does not exist at all.
+    assert "oops" in proc.stderr + proc.stdout
+
+
+def test_subtasks_seed_prompt_names_the_queued_group(hub: Path, tmp_path: Path) -> None:
+    # With no --prompt, the default seed must tell the spoke it owns a chain — otherwise it
+    # reads task.md, sees one issue, and has no idea the queue is waiting on it.
+    env = {
+        "GH_ISSUE_TITLE": "Primary of a packed group",
+        "GH_ISSUE_BODY": "Do the thing.\nGate: none\n",
+        "AFK_STATE_DIR": str(tmp_path / "afk-state"),
+    }
+
+    proc, log = _run_new(
+        hub, tmp_path, "263", "some-slug", "--no-code", "--subtasks", "265,270", extra_env=env
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    launch = log.read_text()
+    assert "265" in launch and "270" in launch, "the seed prompt must name the queued subtasks"
+
+
+def test_subtasks_note_reaches_an_explicit_prompt_too(hub: Path, tmp_path: Path) -> None:
+    # THE path that matters: every real packed dispatch comes from hub-afk's dispatch_batch,
+    # which always passes --prompt "$(kickoff_for ...)". A chain note wired only into the
+    # default-prompt branch would therefore never reach a single genuinely packed spoke —
+    # it would be seeded a queue it was never told about, and hit an unexplained ready
+    # refusal at the end of its run.
+    env = {
+        "GH_ISSUE_TITLE": "Primary of a packed group",
+        "GH_ISSUE_BODY": "Do the thing.\nGate: none\n",
+        "AFK_STATE_DIR": str(tmp_path / "afk-state"),
+    }
+
+    proc, log = _run_new(
+        hub,
+        tmp_path,
+        "263",
+        "some-slug",
+        "--no-code",
+        "--subtasks",
+        "265,270",
+        "--prompt",
+        "CALLER_SUPPLIED_KICKOFF",  # single token: the launch %q-quotes the prompt
+        extra_env=env,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    launch = log.read_text()
+    assert "CALLER_SUPPLIED_KICKOFF" in launch, "the caller's prompt must survive"
+    assert "265" in launch and "270" in launch, "the chain note must be appended to it"
+
+
+def test_subtasks_do_not_glob_against_the_cwd(hub: Path, tmp_path: Path) -> None:
+    # The split expansion is deliberately unquoted (it word-splits), so without noglob a
+    # value like '2*' expands against the cwd — and files named 20/21/22 would then PASS the
+    # numeric check as if they were real issue numbers, silently dispatching a spoke bound to
+    # invented work. Validation cannot catch it: the shell substitutes first.
+    for name in ("20", "21", "22"):
+        (hub / name).write_text("decoy\n")
+    env = {
+        "GH_ISSUE_TITLE": "Primary",
+        "GH_ISSUE_BODY": "Do the thing.\nGate: none\n",
+        "AFK_STATE_DIR": str(tmp_path / "afk-state"),
+    }
+
+    proc, _ = _run_new(
+        hub, tmp_path, "263", "some-slug", "--no-code", "--subtasks", "2*", extra_env=env
+    )
+
+    assert proc.returncode != 0, "a glob must be rejected, never silently expanded"
+    assert "2*" in proc.stderr + proc.stdout, "the literal value is what gets refused"
+    assert not (tmp_path / "afk-state" / "queued-263").exists()
