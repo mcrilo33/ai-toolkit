@@ -10290,3 +10290,225 @@ def test_watchdog_crashloop_escalation_debounces(tmp_path: Path) -> None:
 
     journal = (statedir / "decision-journal.jsonl").read_text()
     assert journal.count("crash-loop guard tripped") == 1, "escalation must debounce to once"
+
+
+# ── #278: grouped dispatch, live-spoke routing, and the afk_done queue gate ────
+#
+# batch-plan now emits ordered dispatch UNITS ("263,265 270") instead of a flat issue list:
+# same-scope issues that could never run concurrently ride ONE spoke as ordered subtasks
+# rather than each paying the whole lifecycle tax. Two consumers here:
+#
+#   * TRIGGER A — a comma-joined unit spawns ONE worktree with --subtasks.
+#   * TRIGGER B — an issue filed while a matching spoke is already LIVE is `route:`d onto
+#     that spoke's queue instead of waiting out its whole lifecycle for a fresh worktree.
+#
+# The pre-existing in-flight guard (`grep -qxF "$n"` against a whole batch token) silently
+# stops matching once tokens are groups — "263,265" can never equal "263" — so the unit must
+# be split and filtered per member.
+
+
+def _grouped_planner(tmp_path: Path, *, batch: str = "", routes: str = "") -> Path:
+    """A batch-plan.sh stub emitting a grouped batch line plus optional `route:` lines.
+
+    `routes` is space-separated "<issue>,<spoke>" pairs. %b (not %s) so the "\\n"s become real
+    newlines — with %s the planner would emit one line ending in a literal backslash-n, and
+    the last unit/route would silently carry it into an issue number.
+    """
+    bp = tmp_path / "batch-plan.sh"
+    out = batch + "\n" if batch else ""
+    out += "".join(f"route:{r.replace(',', ' ')}\n" for r in routes.split() if r)
+    bp.write_text(f'#!/usr/bin/env bash\nprintf "%b" {json.dumps(out)}\nexit 0\n')
+    bp.chmod(0o755)
+    return bp
+
+
+def _wt_new_logger(tmp_path: Path) -> tuple[Path, Path]:
+    """A worktree-new.sh stub logging its argv as ONE line per spawn.
+
+    Newlines are flattened: the seeded --prompt is a multi-line kickoff, so a raw "$*" would
+    log ~50 lines per spawn and make "one line per spawn" meaningless.
+    """
+    log = tmp_path / "dispatched.log"
+    log.touch()  # pre-created: a run that spawns NOTHING must read as empty, not as missing
+    wt_new = tmp_path / "wtnew.sh"
+    wt_new.write_text(
+        f'#!/usr/bin/env bash\n{{ printf "%s" "$*" | tr "\\n" " "; printf "\\n"; }} >> "{log}"\n'
+    )
+    wt_new.chmod(0o755)
+    return wt_new, log
+
+
+def _dispatch_env(tmp_path: Path, bp: Path, wt_new: Path, **extra: str) -> dict[str, str]:
+    return {
+        "BATCH_PLAN": str(bp),
+        "WT_NEW": str(wt_new),
+        "AFK_STATE_DIR": str(tmp_path / "afk-state"),
+        "AFK_DISPATCH_STAGGER": "0",
+        # Defense in depth, like the afk_spoke fixtures: the routing path journals its
+        # decision, and broker_journal_decision mirrors to `gh issue comment` unless this is
+        # off. A fixture spoke number is a REAL issue in this repo, so an un-stubbed nudge
+        # would post a spurious auto-decision comment onto it.
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        **extra,
+    }
+
+
+def test_dispatch_batch_spawns_one_worktree_per_group(tmp_path: Path) -> None:
+    # The #263/#265 shape: ONE spoke, the primary leading, the peer passed as a subtask.
+    bp = _grouped_planner(tmp_path, batch="263,265 270")
+    wt_new, log = _wt_new_logger(tmp_path)
+    expr = "inflight_issues() { :; }; inflight_worktrees() { :; }; dispatch_batch"
+
+    result = _call(expr, env=_dispatch_env(tmp_path, bp, wt_new))
+
+    assert result.returncode == 0, result.stderr
+    spawns = log.read_text().splitlines()
+    assert len(spawns) == 2, f"one spawn per UNIT, not per issue: {spawns}"
+    assert spawns[0].startswith("263 "), "the unit's primary leads the argv"
+    assert "--subtasks 265" in spawns[0], "the packed peer rides along as a subtask"
+    assert spawns[1].startswith("270 ")
+    assert "--subtasks" not in spawns[1], "a lone issue gets no subtask arg"
+
+
+def test_dispatch_batch_passes_every_packed_peer(tmp_path: Path) -> None:
+    bp = _grouped_planner(tmp_path, batch="263,265,270")
+    wt_new, log = _wt_new_logger(tmp_path)
+    expr = "inflight_issues() { :; }; inflight_worktrees() { :; }; dispatch_batch"
+
+    result = _call(expr, env=_dispatch_env(tmp_path, bp, wt_new))
+
+    assert result.returncode == 0, result.stderr
+    spawns = log.read_text().splitlines()
+    assert len(spawns) == 1
+    assert "--subtasks 265,270" in spawns[0]
+
+
+def test_dispatch_batch_skips_an_inflight_member_of_a_group(tmp_path: Path) -> None:
+    # The in-flight guard used to compare whole batch TOKENS; a group token can never equal
+    # a bare issue number, so without a per-member split a live spoke would be re-dispatched.
+    bp = _grouped_planner(tmp_path, batch="263,265")
+    wt_new, log = _wt_new_logger(tmp_path)
+    expr = 'inflight_issues() { printf "263\\n"; }; inflight_worktrees() { :; }; dispatch_batch'
+
+    result = _call(expr, env=_dispatch_env(tmp_path, bp, wt_new))
+
+    assert result.returncode == 0, result.stderr
+    assert log.read_text().strip() == "", "#263 is already live — the unit must not respawn it"
+
+
+def test_dispatch_batch_routes_a_packable_issue_to_the_live_spoke(tmp_path: Path) -> None:
+    # AC3: no second worktree, no second suite seed — the issue joins the running spoke.
+    bp = _grouped_planner(tmp_path, routes="264,263")
+    wt_new, log = _wt_new_logger(tmp_path)
+    state = tmp_path / "afk-state"
+    expr = (
+        'inflight_issues() { printf "263\\n"; }; inflight_worktrees() { printf "/wt\\t263\\n"; }; '
+        "_ready_at_tip() { return 1; }; _afk_route_subtask_nudge() { return 0; }; dispatch_batch"
+    )
+
+    result = _call(expr, env=_dispatch_env(tmp_path, bp, wt_new))
+
+    assert result.returncode == 0, result.stderr
+    assert (state / "queued-263" / "264").is_file(), "#264 is queued onto the live spoke"
+    assert log.read_text().strip() == "", "and NO second worktree is spawned"
+
+
+def test_dispatch_batch_honors_the_subtask_chain_cap(tmp_path: Path) -> None:
+    # Spokes hit ~45% context today, so a runaway chain would exhaust the window. Past the
+    # cap the issue is simply not routed — it stays in the backlog for a fresh dispatch.
+    bp = _grouped_planner(tmp_path, routes="270,263")
+    wt_new, _ = _wt_new_logger(tmp_path)
+    state = tmp_path / "afk-state"
+    (state / "queued-263").mkdir(parents=True)
+    (state / "queued-263" / "264").touch()  # primary + 1 queued == the default cap of 2
+    expr = (
+        'inflight_issues() { printf "263\\n"; }; inflight_worktrees() { printf "/wt\\t263\\n"; }; '
+        "_ready_at_tip() { return 1; }; _afk_route_subtask_nudge() { return 0; }; dispatch_batch"
+    )
+
+    result = _call(expr, env=_dispatch_env(tmp_path, bp, wt_new, AFK_SUBTASK_CHAIN_MAX="2"))
+
+    assert result.returncode == 0, result.stderr
+    assert not (state / "queued-263" / "270").exists(), "the cap overflows it to fresh dispatch"
+
+
+def test_dispatch_batch_reclaims_a_late_route_to_a_finished_spoke(tmp_path: Path) -> None:
+    # The past-final-push fallback: the spoke already emitted its terminal ready, so the entry
+    # arrived too late to ever be consumed. Reclaim it (and log) so the issue falls back to a
+    # fresh dispatch rather than being silently swallowed by a spoke that is about to land.
+    bp = _grouped_planner(tmp_path, routes="264,263")
+    wt_new, _ = _wt_new_logger(tmp_path)
+    state = tmp_path / "afk-state"
+    expr = (
+        'inflight_issues() { printf "263\\n"; }; inflight_worktrees() { printf "/wt\\t263\\n"; }; '
+        "_ready_at_tip() { return 0; }; _afk_route_subtask_nudge() { return 0; }; dispatch_batch"
+    )
+
+    result = _call(expr, env=_dispatch_env(tmp_path, bp, wt_new))
+
+    assert result.returncode == 0, result.stderr
+    assert not (state / "queued-263" / "264").exists(), "a ready-at-tip spoke takes no new work"
+
+
+def test_dispatch_batch_ignores_a_malformed_route_line(tmp_path: Path) -> None:
+    # A route line is "<issue> <spoke>". A one-field or non-numeric line must be dropped, not
+    # half-applied: queueing under an empty spoke key would write queued-/<issue>, which no
+    # spoke ever reads and afk_done would then count as pending work forever.
+    bp = tmp_path / "batch-plan.sh"
+    bp.write_text('#!/usr/bin/env bash\nprintf "%b" "route:264\\nroute:oops 263\\n"\nexit 0\n')
+    bp.chmod(0o755)
+    wt_new, log = _wt_new_logger(tmp_path)
+    state = tmp_path / "afk-state"
+    expr = (
+        'inflight_issues() { printf "263\\n"; }; inflight_worktrees() { printf "/wt\\t263\\n"; }; '
+        "_ready_at_tip() { return 1; }; _afk_route_subtask_nudge() { return 0; }; dispatch_batch"
+    )
+
+    result = _call(expr, env=_dispatch_env(tmp_path, bp, wt_new))
+
+    assert result.returncode == 0, result.stderr
+    assert not (state / "queued-").exists(), "a one-field line must not queue under an empty key"
+    assert not (state / "queued-263").exists(), "and a non-numeric issue must not be queued"
+    assert log.read_text().strip() == ""
+
+
+def test_afk_done_not_done_while_a_subtask_is_queued(tmp_path: Path) -> None:
+    # AC4: the drain must not declare itself complete while a routed subtask is unconsumed —
+    # that would end the window with real work queued and never done.
+    bp = _planner_stub(tmp_path, exit_code=0, out="")
+    state = tmp_path / "afk-state"
+    (state / "queued-263").mkdir(parents=True)
+    (state / "queued-263" / "264").touch()
+    expr = 'inflight_issues() { :; }; afk_done drain 1700000000; echo "RC=$?"'
+
+    result = _call(expr, env={"BATCH_PLAN": str(bp), "AFK_STATE_DIR": str(state)})
+
+    assert "RC=1" in result.stdout, result.stdout + result.stderr
+
+
+def test_afk_done_done_when_the_queue_dir_is_empty(tmp_path: Path) -> None:
+    # A drained queue leaves the dir behind; an empty dir must not wedge the drain open.
+    bp = _planner_stub(tmp_path, exit_code=0, out="")
+    state = tmp_path / "afk-state"
+    (state / "queued-263").mkdir(parents=True)
+    expr = 'inflight_issues() { :; }; afk_done drain 1700000000; echo "RC=$?"'
+
+    result = _call(expr, env={"BATCH_PLAN": str(bp), "AFK_STATE_DIR": str(state)})
+
+    assert "RC=0" in result.stdout, result.stdout + result.stderr
+
+
+def test_afk_done_poison_filter_reads_grouped_tokens(tmp_path: Path) -> None:
+    # The poison filter walks `for tok in $batch`; a grouped token "263,265" is not a number,
+    # so without a comma split it would fall through as a non-issue token and hold the drain
+    # open forever on a fully-poisoned backlog.
+    bp = _planner_stub(tmp_path, exit_code=0, out="263,265\n")
+    state = tmp_path / "afk-state"
+    state.mkdir(parents=True)
+    for issue in ("263", "265"):
+        (state / f"dispatch-fail-{issue}.count").write_text("3\n")  # both poisoned
+    expr = 'inflight_issues() { :; }; afk_done drain 1700000000; echo "RC=$?"'
+
+    result = _call(expr, env={"BATCH_PLAN": str(bp), "AFK_STATE_DIR": str(state)})
+
+    assert "RC=0" in result.stdout, "a group of only-poisoned issues is a drained backlog"
