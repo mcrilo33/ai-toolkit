@@ -206,6 +206,56 @@ def test_lane_event_count_scoped_to_episode(tmp_path: Path) -> None:
     assert _call("afk_lane_event_count 42 review", env=env).stdout.strip() == "0"
 
 
+# --- evidence must never shadow top-level fields (validation findings, 2026-07-15) ---
+
+
+def test_evidence_to_key_does_not_hijack_current_state(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+
+    _call("afk_tlog_transition 42 working reconciler heal '{\"to\":\"somewhere\"}'", env=env)
+
+    assert _call("afk_current_state 42", env=env).stdout.strip() == "working"
+
+
+def test_evidence_ts_key_does_not_corrupt_age(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    _call("afk_tlog_transition 42 pushing a b '{\"ts\":999}'", env=env)
+    onset = int(_call("afk_state_onset 42", env=env).stdout.strip())
+
+    assert onset > 1_700_000_000  # the real epoch, not evidence's 999
+    assert _call(f"afk_age_in_state 42 {onset + 60}", env=env).stdout.strip() == "60"
+
+
+def test_evidence_episode_key_does_not_mint_an_episode(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    _call('afk_tlog_transition 42 parked-gate a b "" sigA:100', env=env)
+    _call("afk_tlog_transition 42 working a b '{\"episode\":\"bogus:999\"}'", env=env)
+
+    assert _call("afk_current_episode 42", env=env).stdout.strip() == "sigA:100"
+
+
+def test_evidence_lane_and_episode_do_not_count_against_other_lanes(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    _call(
+        'afk_tlog_event 42 probe broker diagnostics sigC:300 \'{"episode":"sigA:100","lane":"answer"}\'',
+        env=env,
+    )
+
+    assert _call("afk_lane_event_count 42 answer sigA:100", env=env).stdout.strip() == "0"
+    assert _call("afk_last_service_event 42 sigA:100 answer", env=env).stdout.strip() == ""
+
+
+def test_evidence_kind_transition_in_event_does_not_masquerade(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    _call("afk_tlog_transition 42 working a b", env=env)
+    _call(
+        'afk_tlog_event 42 note broker answer "" \'{"kind":"transition","to":"fake"}\'',
+        env=env,
+    )
+
+    assert _call("afk_current_state 42", env=env).stdout.strip() == "working"
+
+
 # --- concurrency ---
 
 
@@ -214,13 +264,39 @@ def test_concurrent_appends_interleave_whole_lines(tmp_path: Path) -> None:
     # yield 40 COMPLETE lines (the atomicity contract the readers depend on).
     env = _env(tmp_path)
 
+    # Bulky evidence near the 1KB cap: atomicity must hold at realistic line
+    # sizes, not just tiny lines (validation finding, 2026-07-15).
     fresh_call(
         TRANSITION_LOG,
-        "for i in $(seq 1 20); do afk_tlog_event 42 w1-$i broker answer & done; "
-        "for i in $(seq 1 20); do afk_tlog_event 42 w2-$i broker land & done; wait",
+        'pad=$(printf "x%.0s" $(seq 1 900)); '
+        "for i in $(seq 1 20); do afk_tlog_event 42 w1-$i broker answer ep1 "
+        "'{\"pad\":\"'$pad'\"}' & done; "
+        "for i in $(seq 1 20); do afk_tlog_event 42 w2-$i broker land ep2 "
+        "'{\"pad\":\"'$pad'\"}' & done; wait",
         env=env,
     )
 
     lines = _log_file(tmp_path, 42).read_text().splitlines()
     assert len(lines) == 40
     assert all(ln.startswith("{") and ln.endswith("}") for ln in lines)
+    assert all(len(ln) > 900 for ln in lines)
+    assert all(len(ln) < 2048 for ln in lines)  # inside the single-write chunk domain
+
+
+def test_oversize_evidence_is_summarized_not_spliced(tmp_path: Path) -> None:
+    # >1024-byte evidence would cross the 2048-byte tear boundary — the writer
+    # must record a summary object instead (never truncated JSON).
+    env = _env(tmp_path)
+
+    fresh_call(
+        TRANSITION_LOG,
+        'pad=$(printf "x%.0s" $(seq 1 3000)); '
+        "afk_tlog_transition 42 working a b '{\"pad\":\"'$pad'\"}'",
+        env=env,
+    )
+
+    line = _log_file(tmp_path, 42).read_text().splitlines()[0]
+    assert len(line) < 2048
+    assert line.endswith("}")
+    assert '"truncated":true' in line
+    assert "xxx" not in line

@@ -21,9 +21,13 @@
 # contention and GC trivially.
 #
 # CRASH CONSISTENCY / ATOMICITY. macOS ships no flock(1), so appends rely on
-# POSIX O_APPEND semantics: each record is ONE printf of ONE line (well under
-# 4KB) opened in append mode — concurrent writers interleave whole lines on a
-# local filesystem. Readers accept only COMPLETE lines (a torn trailing line —
+# POSIX O_APPEND semantics: each record is ONE printf of ONE line opened in
+# append mode. Bash's BUILTIN printf chunks its output at 2048 bytes (verified
+# empirically 2026-07-15: >2048-byte lines tear under concurrent writers), so
+# the atomicity domain is "line < 2048 bytes" — enforced here by capping the
+# caller-supplied evidence at 1024 bytes (_tlog_cap_evidence summarizes an
+# oversize object instead of splicing it). Within that domain concurrent
+# writers interleave whole lines on a local filesystem. Readers accept only COMPLETE lines (a torn trailing line —
 # no closing brace + newline — is ignored), so a crash mid-write costs one
 # record, never a wrong parse. Writes are best-effort and NEVER fail the calling
 # operation (the hooks' always-exit-0 discipline): a missing expected record
@@ -65,6 +69,19 @@ _tlog_json_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n\t' '  '
 }
 
+# _tlog_cap_evidence <evidence-json> -> the evidence unchanged when it fits the
+# atomicity budget (1024 bytes), else a small summary object — an oversize blob
+# would push the line past the 2048-byte single-write chunk and tear under
+# concurrency. Summarize, never truncate (truncated JSON would corrupt the line).
+_tlog_cap_evidence() {
+  local ev="$1"
+  if [ "${#ev}" -gt 1024 ]; then
+    printf '{"truncated":true,"bytes":%s}\n' "${#ev}"
+  else
+    printf '%s\n' "$ev"
+  fi
+}
+
 # _tlog_append <issue> <line> -> append one complete record line. Best-effort:
 # ALWAYS rc 0, never fails the calling operation.
 _tlog_append() {
@@ -81,6 +98,7 @@ _tlog_append() {
 # signature + onset the broker already mints for the reanswer key).
 afk_tlog_transition() {
   local issue="$1" to="$2" actor="$3" cause="$4" evidence="${5:-}" episode="${6:-}" line run
+  [ -n "$evidence" ] && evidence="$(_tlog_cap_evidence "$evidence")"
   line="{\"v\":1,\"ts\":$(date +%s),\"issue\":${issue:-0}"
   line="$line,\"kind\":\"transition\",\"to\":\"$(_tlog_json_escape "$to")\""
   line="$line,\"actor\":\"$(_tlog_json_escape "$actor")\""
@@ -97,6 +115,7 @@ afk_tlog_transition() {
 # Record an action WITHIN a state (answer_delivered, nudge, revive, ...).
 afk_tlog_event() {
   local issue="$1" event="$2" actor="$3" lane="${4:-}" episode="${5:-}" evidence="${6:-}" line run
+  [ -n "$evidence" ] && evidence="$(_tlog_cap_evidence "$evidence")"
   line="{\"v\":1,\"ts\":$(date +%s),\"issue\":${issue:-0}"
   line="$line,\"kind\":\"event\",\"event\":\"$(_tlog_json_escape "$event")\""
   line="$line,\"actor\":\"$(_tlog_json_escape "$actor")\""
@@ -121,18 +140,38 @@ _tlog_complete_lines() {
   return 0
 }
 
+# _tlog_head <line> -> the record with the caller-supplied evidence suffix
+# stripped. Both builders append `,"evidence":...` strictly LAST, so everything
+# before it is lib-written, escaped, fixed-key content — the ONLY safe surface
+# for field extraction. Matching the whole line lets an evidence key shadow a
+# top-level field (greedy sed/index take the rightmost/any occurrence): a
+# reconciler's evidence naming expected/actual states would hijack
+# afk_current_state, an evidence ts would corrupt ages (validation findings,
+# 2026-07-15). Every reader below extracts from this head only.
+_tlog_head() {
+  printf '%s\n' "${1%%,\"evidence\":*}"
+}
+
 # _tlog_field <line> <key> -> the string value of "key":"value" (first match),
-# or the numeric value of "key":123. Empty when absent.
+# or the numeric value of "key":123, read from the pre-evidence head only.
+# Empty when absent.
 _tlog_field() {
-  local line="$1" key="$2" v
-  v="$(printf '%s' "$line" | sed -n -E 's/.*"'"$key"'":"([^"]*)".*/\1/p')"
-  [ -n "$v" ] || v="$(printf '%s' "$line" | sed -n -E 's/.*"'"$key"'":([0-9]+).*/\1/p')"
+  local head key="$2" v
+  head="$(_tlog_head "$1")"
+  v="$(printf '%s' "$head" | sed -n -E 's/.*"'"$key"'":"([^"]*)".*/\1/p')"
+  [ -n "$v" ] || v="$(printf '%s' "$head" | sed -n -E 's/.*"'"$key"'":([0-9]+).*/\1/p')"
   printf '%s\n' "$v"
 }
 
-# _tlog_last_transition <issue> -> the last complete kind=transition line.
+# _tlog_last_transition <issue> -> the last complete kind=transition line
+# (kind matched on the pre-evidence head, so an event whose evidence quotes
+# "kind":"transition" cannot masquerade).
 _tlog_last_transition() {
-  _tlog_complete_lines "$1" | awk '/"kind":"transition"/ { l = $0 } END { if (l != "") print l }'
+  _tlog_complete_lines "$1" | awk '{
+      h = $0; i = index(h, ",\"evidence\":"); if (i) h = substr(h, 1, i - 1)
+      if (index(h, "\"kind\":\"transition\"")) l = $0
+    }
+    END { if (l != "") print l }'
 }
 
 # afk_current_state <issue> -> the state name of the last recorded transition,
@@ -162,10 +201,14 @@ afk_age_in_state() {
 }
 
 # afk_current_episode <issue> -> the episode of the last transition that carried
-# one (park transitions mint it), empty when none.
+# one (park transitions mint it), empty when none. All matching happens on the
+# pre-evidence head (see _tlog_head).
 afk_current_episode() {
-  _tlog_complete_lines "$1" \
-    | awk '/"kind":"transition"/ && /"episode":"/ { l = $0 } END { if (l != "") print l }' \
+  _tlog_complete_lines "$1" | awk '{
+      h = $0; i = index(h, ",\"evidence\":"); if (i) h = substr(h, 1, i - 1)
+      if (index(h, "\"kind\":\"transition\"") && index(h, "\"episode\":\"")) l = h
+    }
+    END { if (l != "") print l }' \
     | sed -n -E 's/.*"episode":"([^"]*)".*/\1/p'
 }
 
@@ -173,10 +216,12 @@ afk_current_episode() {
 # line matching the episode (and lane when given), whole line on stdout.
 afk_last_service_event() {
   local issue="$1" episode="$2" lane="${3:-}"
-  _tlog_complete_lines "$issue" | awk -v ep="\"episode\":\"$episode\"" -v ln="$lane" '
-    /"kind":"event"/ {
-      if (index($0, ep) == 0) next
-      if (ln != "" && index($0, "\"lane\":\"" ln "\"") == 0) next
+  _tlog_complete_lines "$issue" | awk -v ep="\"episode\":\"$episode\"" -v ln="$lane" '{
+      h = $0; i = index(h, ",\"evidence\":"); if (i) h = substr(h, 1, i - 1)
+      if (index(h, "\"kind\":\"event\"") == 0) next
+      if (index(h, ep "\"") == 0 && index(h, ep) == 0) next
+      if (index(h, ep) == 0) next
+      if (ln != "" && index(h, "\"lane\":\"" ln "\"") == 0) next
       l = $0
     }
     END { if (l != "") print l }'
@@ -186,10 +231,11 @@ afk_last_service_event() {
 # recorded (optionally within one episode). 0 when none.
 afk_lane_event_count() {
   local issue="$1" lane="$2" episode="${3:-}" n
-  n="$(_tlog_complete_lines "$issue" | awk -v ln="\"lane\":\"$lane\"" -v ep="$episode" '
-    /"kind":"event"/ {
-      if (index($0, ln) == 0) next
-      if (ep != "" && index($0, "\"episode\":\"" ep "\"") == 0) next
+  n="$(_tlog_complete_lines "$issue" | awk -v ln="\"lane\":\"$lane\"" -v ep="$episode" '{
+      h = $0; i = index(h, ",\"evidence\":"); if (i) h = substr(h, 1, i - 1)
+      if (index(h, "\"kind\":\"event\"") == 0) next
+      if (index(h, ln) == 0) next
+      if (ep != "" && index(h, "\"episode\":\"" ep "\"") == 0) next
       c++
     }
     END { print c + 0 }')"
