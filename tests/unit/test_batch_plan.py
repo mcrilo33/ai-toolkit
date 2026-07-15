@@ -66,7 +66,10 @@ def _run_plan(
     nodes: list[dict],
     *,
     inflight: list[str] | None = None,
+    inflight_issue: list[int] | None = None,
     cap: int | None = None,
+    pack_max: int | None = None,
+    route: bool = False,
     repo_root: Path | str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Pipe a fixture graph into plan_from_json and return the completed process."""
@@ -74,8 +77,14 @@ def _run_plan(
     args = ""
     for spoke in inflight or []:
         args += f" --inflight {json_quote(spoke)}"
+    for num in inflight_issue or []:
+        args += f" --inflight-issue {num}"
     if cap is not None:
         args += f" --cap {cap}"
+    if pack_max is not None:
+        args += f" --pack-max {pack_max}"
+    if route:
+        args += " --route"
     if repo_root is not None:
         args += f" --repo-root {json_quote(str(repo_root))}"
     return subprocess.run(
@@ -87,6 +96,33 @@ def _run_plan(
     )
 
 
+def _batch_line(stdout: str) -> str:
+    """The batch line of a plan run: the first stdout line that is not a `route:` line.
+
+    Since #278 the batch is a list of ordered dispatch UNITS (`263,265 270`), and
+    `--route` appends `route:<issue> <spoke>` lines after it; every other stdout line
+    belongs to those channels, so the batch is the first non-route line (or empty).
+    """
+    return next((ln for ln in stdout.splitlines() if not ln.startswith("route:")), "")
+
+
+def _groups(
+    nodes: list[dict],
+    *,
+    inflight: list[str] | None = None,
+    cap: int | None = None,
+    pack_max: int | None = None,
+) -> list[list[int]]:
+    """The batch as ordered dispatch UNITS — one inner list per spoke (issue #278).
+
+    A unit's members are comma-joined on the wire, units space-separated, so a lone
+    issue is byte-identical to the pre-#278 output.
+    """
+    proc = _run_plan(nodes, inflight=inflight, cap=cap, pack_max=pack_max)
+    assert proc.returncode == 0, proc.stderr
+    return [[int(n) for n in unit.split(",")] for unit in _batch_line(proc.stdout).split()]
+
+
 def _plan(
     nodes: list[dict],
     *,
@@ -94,10 +130,15 @@ def _plan(
     cap: int | None = None,
     repo_root: Path | str | None = None,
 ) -> list[int]:
-    """Pipe a fixture graph into plan_from_json and return the batch as issue numbers."""
+    """Pipe a fixture graph into plan_from_json and return the batch as issue numbers.
+
+    The FLATTENED view: dispatch-unit grouping (#278) is erased, so a membership
+    assertion ("#4 is / isn't dispatched") reads the same before and after packing.
+    Use `_groups` when the unit boundaries themselves are what's under test.
+    """
     proc = _run_plan(nodes, inflight=inflight, cap=cap, repo_root=repo_root)
     assert proc.returncode == 0, proc.stderr
-    return [int(tok) for tok in proc.stdout.split()]
+    return [int(n) for unit in _batch_line(proc.stdout).split() for n in unit.split(",")]
 
 
 def json_quote(s: str) -> str:
@@ -1278,3 +1319,231 @@ def test_explain_exclusive_waiting_behind_another_reads_blocked_not_alone() -> N
     labels = _label_map(nodes)
     assert labels["9"] == "afk:exclusive"
     assert labels["10"] == "afk:blocked-by-scope"
+
+
+# ── #278: same-scope packing into one ordered dispatch unit ───────────────────
+#
+# Before #278 the planner did the OPPOSITE of packing: `conflict()` returns True on ANY
+# scope-token intersection, so two issues with byte-identical Scope: lines (the measured
+# #263/#265 shape) were treated as a collision and SERIALIZED into separate dispatches —
+# paying the whole spoke lifecycle tax (worktree, first-push suite seed, review, land)
+# twice for work one spoke could have done as ordered subtasks on one branch.
+#
+# `packable()` is the new relation beside `conflict()`: identical-or-subset scope. It is
+# deliberately NARROWER than "not conflict" — a PARTIAL overlap (neither side contains
+# the other) still serializes, because neither issue's spoke could own the other's full
+# footprint. `conflict()` is untouched and still governs cross-UNIT disjointness.
+
+
+def test_identical_scope_pair_packs_into_one_ordered_unit() -> None:
+    # The motivating shape: #263/#265 carried byte-identical Scope: footers yet ran as two
+    # full spoke lifecycles back-to-back. They must now form ONE ordered dispatch unit.
+    scope = "hub-watchdog.sh gate-broker.sh test_hub_watchdog.py"
+    groups = _groups([_node(263, scope), _node(265, scope)])
+
+    assert groups == [[263, 265]]
+
+
+def test_disjoint_scopes_stay_separate_dispatch_units() -> None:
+    # The control: packing must not swallow genuinely independent work into one spoke.
+    groups = _groups([_node(10, "a.py"), _node(11, "b.py")])
+
+    assert groups == [[10], [11]]
+
+
+def test_subset_scope_packs_into_its_superset_peer() -> None:
+    # #11's footprint is contained in #10's, so one spoke can own both.
+    groups = _groups([_node(10, "a.py b.py"), _node(11, "a.py")])
+
+    assert groups == [[10, 11]]
+
+
+def test_partial_overlap_is_not_packable_and_still_serializes() -> None:
+    # Neither scope contains the other (m.py vs z.py), so neither spoke could own the
+    # other's full footprint: this stays a collision and #11 is held back, NOT packed.
+    groups = _groups([_node(10, "a.py m.py"), _node(11, "a.py z.py")])
+
+    assert groups == [[10]]
+
+
+def test_exclusive_scope_never_packs() -> None:
+    # `Scope: *` / a missing line means "footprint unknown ⇒ runs alone". Packing an
+    # unknown footprint into a shared spoke is exactly the fail-OPEN this must not do.
+    assert _groups([_node(9, "*"), _node(10, "*")]) == [[9]]
+    assert _groups([_node(9, "*"), _node(10, None)]) == [[9]]
+
+
+def test_group_primary_is_the_ranked_leader_not_the_lowest_number() -> None:
+    # The unit's FIRST member is the primary: it names the branch slug, and it is what
+    # inflight_worktrees / worktree-land parse. So the group must lead with the RANKED
+    # winner (here #265, priority-labelled), not the lowest issue number — ordering the
+    # unit by number would silently demote the higher-priority issue to a subtask.
+    scope = "a.py"
+    groups = _groups([_node(263, scope), _node(265, scope, labels=["priority"])])
+
+    assert groups == [[265, 263]]
+
+
+def test_held_peer_never_packs_into_a_unit() -> None:
+    # A `hold`-labelled issue is staged out of every batch; packing must not smuggle it
+    # into a spoke as a subtask through the back door.
+    scope = "a.py"
+    groups = _groups([_node(10, scope), _node(11, scope, labels=["hold"])])
+
+    assert groups == [[10]]
+
+
+def test_pack_max_bounds_group_size_and_overflows_the_rest() -> None:
+    # The chain-length cap (AFK_SUBTASK_CHAIN_MAX): spokes hit ~45% context today, so a
+    # runaway chain would exhaust the window. The excess peer is left OUT of the unit and
+    # falls back to normal dispatch once the unit's spoke lands.
+    scope = "a.py"
+    groups = _groups([_node(1, scope), _node(2, scope), _node(3, scope)], pack_max=2)
+
+    assert groups == [[1, 2]]
+
+
+def test_pack_max_of_one_disables_packing_entirely() -> None:
+    scope = "a.py"
+    groups = _groups([_node(1, scope), _node(2, scope)], pack_max=1)
+
+    assert groups == [[1]]
+
+
+def test_cap_counts_dispatch_units_not_issues() -> None:
+    # AC2: a group of N packed issues consumes ONE slot, because it spawns one spoke.
+    # Counting issues here would starve the batch to half its real width.
+    nodes = [_node(1, "a.py"), _node(2, "a.py"), _node(3, "b.py"), _node(4, "b.py")]
+    groups = _groups(nodes, cap=2)
+
+    assert groups == [[1, 2], [3, 4]]
+
+
+def test_cap_truncates_whole_units_never_splitting_one() -> None:
+    nodes = [_node(1, "a.py"), _node(2, "a.py"), _node(3, "b.py")]
+    groups = _groups(nodes, cap=1)
+
+    assert groups == [[1, 2]], "the cap drops the 2nd UNIT whole; it never severs a pack"
+
+
+# ── #278: --explain stays truthful about the pack ─────────────────────────────
+
+
+def test_explain_reports_the_pack_not_a_scope_collision() -> None:
+    # Pre-#278 this pair read `blocked-by-scope:#10` — which would now be a LIE: #11 is
+    # not held back at all, it ships in #10's spoke as a subtask.
+    out = _explain([_node(10, "a.py"), _node(11, "a.py")])
+
+    assert re.search(r"^#10\b.*\bqueued\b", out, re.M)
+    assert re.search(r"^#11\b.*\bpacked-with:#10\b.*\(a\.py\)", out, re.M)
+
+
+def test_explain_labels_mark_a_packed_peer_queued() -> None:
+    # The label set stays the four-label one: a packed peer IS queued to run (in a shared
+    # spoke), so `afk:queued` is truthful and no new GitHub label needs registering.
+    labels = _label_map([_node(10, "a.py"), _node(11, "a.py")])
+
+    assert labels["10"] == "afk:queued"
+    assert labels["11"] == "afk:queued"
+
+
+def test_explain_still_reports_a_real_collision_as_blocked_by_scope() -> None:
+    # Partial overlap is not packable, so the collision disposition must survive.
+    out = _explain([_node(10, "a.py m.py"), _node(11, "a.py z.py")])
+
+    assert re.search(r"^#11\b.*\bblocked-by-scope:#10\b", out, re.M)
+
+
+# ── #278 trigger B: --route names the live spoke for a packable new issue ─────
+
+
+def _routes(stdout: str) -> list[tuple[int, int]]:
+    """The `route:<issue> <spoke>` lines parsed into (issue, spoke) pairs."""
+    out = []
+    for line in stdout.splitlines():
+        if line.startswith("route:"):
+            issue, spoke = line[len("route:") :].split()
+            out.append((int(issue), int(spoke)))
+    return out
+
+
+def test_route_names_the_live_spoke_a_packable_issue_belongs_to() -> None:
+    # #264 files while #263's spoke is live and owns the same scope. Without routing it
+    # is merely held back (blocked-by-scope) and waits out the whole lifecycle; with it,
+    # the drain hands it to the running spoke as a subtask — no 2nd worktree/suite seed.
+    proc = _run_plan(
+        [_node(263, "a.py"), _node(264, "a.py")],
+        inflight=["a.py"],
+        inflight_issue=[263],
+        route=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    assert _routes(proc.stdout) == [(264, 263)]
+    assert _batch_line(proc.stdout) == "", "a routed issue must not ALSO spawn its own spoke"
+
+
+def test_route_is_silent_for_an_unpackable_collision() -> None:
+    # Partial overlap: #264 cannot ride #263's spoke, so it stays held back with no route.
+    proc = _run_plan(
+        [_node(263, "a.py m.py"), _node(264, "a.py z.py")],
+        inflight=["a.py m.py"],
+        inflight_issue=[263],
+        route=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    assert _routes(proc.stdout) == []
+
+
+def test_route_is_silent_when_the_issue_is_packable_into_two_live_spokes() -> None:
+    # "packable into EXACTLY ONE already-running spoke" — an ambiguous match has no single
+    # correct target, so fail closed and let the normal collision hold it back.
+    proc = _run_plan(
+        [_node(263, "a.py"), _node(265, "a.py"), _node(264, "a.py")],
+        inflight=["a.py", "a.py"],
+        inflight_issue=[263, 265],
+        route=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    assert _routes(proc.stdout) == []
+
+
+def test_route_lines_are_absent_without_the_flag() -> None:
+    # The flag is inert on the normal path: byte-identical stdout, so afk_done's bare
+    # batch-plan call and every existing consumer are untouched.
+    nodes = [_node(263, "a.py"), _node(264, "a.py")]
+    with_flag = _run_plan(nodes, inflight=["a.py"], inflight_issue=[263], route=True)
+    without = _run_plan(nodes, inflight=["a.py"], inflight_issue=[263])
+
+    assert "route:" not in without.stdout
+    assert _batch_line(with_flag.stdout) == _batch_line(without.stdout)
+
+
+# ── #278: the merge-candidate lints stop nagging about auto-packed clusters ───
+
+
+def test_unchained_merge_lint_is_silent_for_an_autopacked_cluster() -> None:
+    # The #167 lint DETECTS exactly this cluster and recommends "one umbrella issue" — a
+    # manual fix the planner now performs automatically. Keeping the warning would train
+    # the operator to ignore a lint that fires on already-solved work.
+    proc = _run_plan([_node(10, "a.py"), _node(11, "a.py")])
+
+    assert "merge candidates" not in proc.stderr
+
+
+def test_unchained_merge_lint_still_fires_for_an_unpackable_overlap() -> None:
+    # Partial overlap is NOT auto-packed, so the cluster is still real serialization the
+    # operator should know about — the lint must survive for the case it was written for.
+    proc = _run_plan([_node(10, "a.py m.py"), _node(11, "a.py z.py")])
+
+    assert "merge candidates" in proc.stderr
+
+
+def test_chain_merge_lint_survives_for_a_blocked_chain() -> None:
+    # The #125 chain lint is about BLOCKED chains, which packing can never absorb (only
+    # ready issues pack), so it must be untouched by the suppression.
+    proc = _run_plan([_node(1, "a.py"), _node(2, "a.py", blocked_by=[(1, "OPEN")])])
+
+    assert "merge candidates" in proc.stderr
