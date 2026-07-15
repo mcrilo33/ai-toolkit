@@ -68,6 +68,19 @@ interest of finishing the issue well, and within the conventions the repo alread
    approach right before I write code?" If the plan is correct, in scope, and complete,
    approve it and let it proceed to GREEN. If the plan is wrong or out of scope, say what
    to change rather than approving — that is still an answer, not an escalation.
+
+   **You will not see every PLAN gate.** The broker runs a cheap *fast-path* pre-check
+   first: when the plan the spoke **posted to its gate artifact** is substantively a
+   restatement of the issue body (a bag-of-words coverage check — most drain issues are
+   scoper-filed and already carry the fix direction, so the plan adds nothing to weigh), the
+   gate is auto-approved **without invoking you at all**, and the waive is recorded on three
+   surfaces: a `park: gate` decision-journal line + a GitHub issue comment, a distinct
+   `fast-path` answer span, and a waived-gates row in the hub survey. So the gates that do
+   reach you are the ones that carry real judgment — a plan that adds new design, a bare
+   `--gate` park that posted no plan artifact (never fast-pathed: narration the spoke never
+   authored must not self-approve), an attended run, or `AFK_FASTPATH=0`. Note the coverage
+   proxy cannot detect a plan that *omits* a required step, so when a plan does reach you,
+   still check it for completeness against the contract, not just for added scope.
 4. **Choose the reversible, in-scope, convention-matching option.** When you must pick
    between real alternatives, favor the one that is easy to undo, stays inside the issue's
    scope, and matches existing patterns. Decisiveness beats deferral here.

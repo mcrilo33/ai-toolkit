@@ -484,4 +484,76 @@ else
 fi
 echo
 
+# --- Waived gates (issue #277) -----------------------------------------------
+# Surface every PLAN gate the /afk fast-path WAIVED (auto-approved without the reasoner)
+# from the decision journal, so an operator sees "this gate was fast-pathed, and why" at a
+# glance rather than grepping the journal — the gh comment alone is not a hub view. The state
+# dir resolves like gate-broker's _afk_state_dir: AFK_STATE_DIR override, else
+# <git-common-dir>/ai-toolkit-afk (absolute OR relative — --git-common-dir returns either).
+#
+# The journal is APPEND-ONLY and deliberately never cleared (#241: it is the durable
+# morning-review record that outlives the window and the land), so this view is CROSS-RUN
+# history, not current-run state. Every row is therefore DATED from the record's own `ts`,
+# newest first, and capped — with the omitted count named, never silently truncated (the
+# no-silent-caps rule) — so a stale waive can never read as this run's activity.
+# Read-only, best-effort: a missing/empty journal or absent python3 just yields a marker.
+bold "Waived gates"
+_afk_common="$(git -C "$main_root" rev-parse --git-common-dir 2>/dev/null || echo .git)"
+case "$_afk_common" in /*) ;; *) _afk_common="$main_root/$_afk_common" ;; esac
+_journal="${AFK_STATE_DIR:-$_afk_common/ai-toolkit-afk}/decision-journal.jsonl"
+if [ -f "$_journal" ] && command -v python3 >/dev/null 2>&1; then
+  _waived="$(HUB_STATUS_JOURNAL="$_journal" HUB_STATUS_WAIVE_LIMIT="${HUB_STATUS_WAIVE_LIMIT:-10}" python3 - <<'PYEOF'
+import json, os
+from datetime import datetime
+
+# Clamp at 0: int("-1") does NOT raise, and a negative limit would make rows[:limit] drop the
+# LAST rows while len(rows) - limit OVERCOUNTS the remainder — silently hiding a waive behind an
+# inflated "older" count, the exact no-silent-caps failure this section exists to avoid. limit 0
+# is coherent: no rows plus a truthful "(+N older waives)".
+try:
+    limit = max(0, int(os.environ.get("HUB_STATUS_WAIVE_LIMIT", "10")))
+except ValueError:
+    limit = 10
+
+rows = []
+with open(os.environ["HUB_STATUS_JOURNAL"], encoding="utf-8", errors="replace") as fh:
+    for line in fh:
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        # A valid-JSON NON-object line must skip, not raise: rec.get() outside this guard
+        # would abort the loop and silently drop every LATER waive (review finding).
+        if not isinstance(rec, dict):
+            continue
+        decision = rec.get("decision") or ""
+        # A fast-path WAIVE is a park:gate journal line naming the fast path.
+        if rec.get("park") != "gate" or "fast-path" not in decision:
+            continue
+        try:
+            ts = float(rec.get("ts"))
+            when = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+        except (TypeError, ValueError, OSError, OverflowError):
+            # Width-matched to "%Y-%m-%d %H:%M" so a degraded row keeps the issue column aligned
+            # in a section built for scanning; the -1.0 sentinel sorts it below every real epoch.
+            ts, when = -1.0, "?" * 16
+        rows.append((ts, f"{when}  #{rec.get('issue', '?')}  {decision}"))
+
+rows.sort(key=lambda r: r[0], reverse=True)   # newest first
+for _, text in rows[:limit]:
+    print(text)
+if len(rows) > limit:
+    print(f"(+{len(rows) - limit} older waives in the decision journal)")
+PYEOF
+)"
+  if [ -n "$_waived" ]; then
+    printf '%s\n' "$_waived" | sed 's/^/  /'
+  else
+    echo "  (none)"
+  fi
+else
+  echo "  (no decision journal yet)"
+fi
+echo
+
 exit 0

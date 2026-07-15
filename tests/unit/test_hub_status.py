@@ -85,6 +85,8 @@ def _run_hub_status_proc(
     otel: str | None = None,
     batch_plan: str | None = None,
     hub_agents_dir: Path | None = None,
+    afk_state_dir: Path | None = None,
+    waive_limit: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run hub-status.sh from the hub with `gh`, `tmux` and `lsof` stubs on PATH.
 
@@ -182,6 +184,12 @@ def _run_hub_status_proc(
     env["AI_TOOLKIT_HUB_AGENTS_DIR"] = str(
         hub_agents_dir if hub_agents_dir is not None else fallback_agents
     )
+    # AFK state dir (#277): default to a nonexistent dir so the host's real decision journal
+    # can never leak into a test; the waived-gates section then reads a seeded journal here.
+    fallback_afk = tmp_path / "no-afk-state"
+    env["AFK_STATE_DIR"] = str(afk_state_dir if afk_state_dir is not None else fallback_afk)
+    if waive_limit is not None:
+        env["HUB_STATUS_WAIVE_LIMIT"] = waive_limit
     return subprocess.run(
         ["bash", str(HUB_STATUS)],
         cwd=str(hub),
@@ -205,6 +213,8 @@ def _run_hub_status(
     otel: str | None = None,
     batch_plan: str | None = None,
     hub_agents_dir: Path | None = None,
+    afk_state_dir: Path | None = None,
+    waive_limit: str | None = None,
 ) -> str:
     """Run hub-status.sh and return its stdout (see _run_hub_status_proc)."""
     return _run_hub_status_proc(
@@ -220,6 +230,8 @@ def _run_hub_status(
         otel=otel,
         batch_plan=batch_plan,
         hub_agents_dir=hub_agents_dir,
+        afk_state_dir=afk_state_dir,
+        waive_limit=waive_limit,
     ).stdout
 
 
@@ -1206,3 +1218,179 @@ def test_hub_agents_section_keeps_live_sibling_when_same_label_ends(
     section = out[out.index("Hub agents") :]
     assert "hub:review-236" in section
     assert "second pass" in section
+
+
+# ── Waived gates section (issue #277) ─────────────────────────────────────────
+# Every PLAN gate the /afk fast-path WAIVED (auto-approved without the reasoner) is a
+# park:gate line in the decision journal. The hub survey surfaces those so an operator sees
+# "this gate was fast-pathed, and why" at a glance — the gh comment alone is not a hub view.
+
+
+def _write_decision_journal(state_dir: Path, records: list[dict]) -> None:
+    """Seed <state_dir>/decision-journal.jsonl with one JSON record per line."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "decision-journal.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in records) + "\n"
+    )
+
+
+def test_waived_gates_section_renders_fast_path_waives(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    state = tmp_path / "afk-state"
+    _write_decision_journal(
+        state,
+        [
+            {
+                "ts": 1000,
+                "issue": "277",
+                "park": "gate",
+                "decision": "fast-path auto-approved: plan restates issue body (coverage 0.92)",
+                "reversibility": "reversible",
+                "reasoning_ref": "",
+            },
+            # A non-gate answer must NOT appear under waived gates.
+            {"ts": 1001, "issue": "300", "park": "answer", "decision": "injected answer"},
+        ],
+    )
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, afk_state_dir=state)
+
+    assert "Waived gates" in out
+    section = out[out.index("Waived gates") :]
+    assert "#277" in section
+    assert "coverage 0.92" in section
+    assert "#300" not in section, "a non-gate answer must not surface as a waived gate"
+
+
+def test_waived_gates_section_graceful_without_journal(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    # No decision journal (state dir absent): the section still renders with a clear marker.
+    out = _run_hub_status(hub_with_spokes, tmp_path, afk_state_dir=tmp_path / "nonexistent-afk")
+
+    assert "Waived gates" in out
+    section = out[out.index("Waived gates") :]
+    assert re.search(r"none|no decision journal", section, re.I)
+
+
+def test_waived_gates_rows_are_dated_and_newest_first(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    # The journal is append-only cross-run history, so an undated row would read as this run's
+    # activity. Every row carries its own record's date, newest first.
+    state = tmp_path / "afk-state"
+    _write_decision_journal(
+        state,
+        [
+            {
+                "ts": 1751328000,  # 2025-07-01
+                "issue": "301",
+                "park": "gate",
+                "decision": "fast-path auto-approved: plan restates issue body (coverage 0.91)",
+            },
+            {
+                "ts": 1753920000,  # 2025-07-31
+                "issue": "302",
+                "park": "gate",
+                "decision": "fast-path auto-approved: plan restates issue body (coverage 0.95)",
+            },
+        ],
+    )
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, afk_state_dir=state)
+
+    section = out[out.index("Waived gates") :]
+    assert "2025-07-01" in section and "2025-07-31" in section, f"rows must be dated: {section}"
+    assert section.index("#302") < section.index("#301"), "newest waive must render first"
+
+
+def test_waived_gates_caps_and_names_the_omitted_count(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    # A capped view must never silently truncate — the omitted count is named.
+    state = tmp_path / "afk-state"
+    _write_decision_journal(
+        state,
+        [
+            {
+                "ts": 1751328000 + i,
+                "issue": str(400 + i),
+                "park": "gate",
+                "decision": f"fast-path auto-approved: plan restates issue body (coverage 0.9{i})",
+            }
+            for i in range(5)
+        ],
+    )
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, afk_state_dir=state, waive_limit="2")
+
+    section = out[out.index("Waived gates") :]
+    assert "+3 older waives" in section, f"the omitted count must be named: {section}"
+
+
+def test_waived_gates_survives_non_object_journal_line(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    # A valid-JSON NON-object line must not abort the scan and drop LATER waives.
+    state = tmp_path / "afk-state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "decision-journal.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "ts": 1751328000,
+                        "issue": "277",
+                        "park": "gate",
+                        "decision": "fast-path auto-approved: plan restates issue body (coverage 0.92)",
+                    }
+                ),
+                "not json at all {{{",
+                json.dumps("a bare json string"),
+                json.dumps(
+                    {
+                        "ts": 1751328001,
+                        "issue": "278",
+                        "park": "gate",
+                        "decision": "fast-path auto-approved: plan restates issue body (coverage 0.88)",
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, afk_state_dir=state)
+
+    section = out[out.index("Waived gates") :]
+    assert "#277" in section and "#278" in section, (
+        f"a malformed line must not drop later waives: {section}"
+    )
+
+
+def test_waived_gates_negative_limit_never_hides_a_waive(
+    hub_with_spokes: Path, tmp_path: Path
+) -> None:
+    # `-1` is the canonical "unlimited" reach and int("-1") does not raise, so an unclamped limit
+    # would slice rows[:-1] (dropping a waive) while reporting len-limit = N+1 older — hiding a
+    # waive behind an inflated count. Clamped to 0: no rows, but a truthful total.
+    state = tmp_path / "afk-state"
+    _write_decision_journal(
+        state,
+        [
+            {
+                "ts": 1751328000 + i,
+                "issue": str(500 + i),
+                "park": "gate",
+                "decision": "fast-path auto-approved: plan restates issue body (coverage 0.90)",
+            }
+            for i in range(3)
+        ],
+    )
+
+    out = _run_hub_status(hub_with_spokes, tmp_path, afk_state_dir=state, waive_limit="-1")
+
+    section = out[out.index("Waived gates") :]
+    assert "+4 older waives" not in section, f"must not overcount the remainder: {section}"
+    assert "+3 older waives" in section, f"3 waives exist, so all 3 must be accounted: {section}"
