@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -1525,6 +1526,131 @@ def test_intervene_revive_runs_for_a_genuinely_dead_spoke(tmp_path: Path) -> Non
     _call("_wd_intervene_revive /the/wt 284", env=env)
 
     assert marker.read_text() == "284"
+
+
+# ── issue #297 defect 1: the revive intervention re-fired on EVERY tick ────────
+# The wd-fire-dedup marker gated only the LEDGER append (_wd_fire); the intervention itself ran
+# every tick the condition held. Nothing in the revive path advances the epoch the detector
+# measures, and `nohup claude --continue` creates no tmux pane — so pane-absence stayed true and a
+# stale drain plus one crashed spoke past the ceiling launched a fresh headless run into the same
+# worktree EVERY MINUTE: dozens of concurrent claudes racing each other's writes in one checkout.
+# The revive is now budgeted once per armed window, mirroring the drain's own resumed-<issue>
+# stamp (_afk_already_resumed / _afk_mark_resumed, hub-afk.sh): revive once, and a second crash
+# escalates to a human rather than re-spawning.
+_REVIVE_BUDGET_MARKER = "wd-fire-dedup-revive-284"
+
+
+def _revive_counter_env(tmp_path: Path, counter: Path, **extra: str) -> dict[str, str]:
+    """A dead-pane env whose revive seam APPENDS one line per spawn, so spawns are countable."""
+    return _dead_pane_env(
+        tmp_path, HUB_WATCHDOG_REVIVE_CMD=f'printf "spawn\\n" >> {counter}', **extra
+    )
+
+
+def _spawn_count(counter: Path) -> int:
+    return counter.read_text().count("spawn") if counter.exists() else 0
+
+
+def test_intervene_revive_spends_its_budget_once_per_window(tmp_path: Path) -> None:
+    # The core of the defect: three ticks with the condition still holding must launch ONE run.
+    counter = tmp_path / "spawns"
+    env = _revive_counter_env(tmp_path, counter)
+
+    for _ in range(3):
+        _call("_wd_intervene_revive /the/wt 284", env=env)
+
+    assert _spawn_count(counter) == 1, (
+        "the revive is budgeted once per armed window — a second crash escalates to a human"
+    )
+
+
+def test_run_conditions_revives_a_persistent_dead_pane_only_once(tmp_path: Path) -> None:
+    # The same bound through the DISPATCHER — the path that actually burned the subscription: a
+    # persistent dead pane across N ticks is one ledger firing AND one spawn, not N.
+    counter = tmp_path / "spawns"
+    env = _dead_pane_dispatch_env(
+        tmp_path, HUB_WATCHDOG_REVIVE_CMD=f'printf "spawn\\n" >> {counter}'
+    )
+    prelude = _dead_pane_dispatch_prelude(done_epoch="")
+
+    for _ in range(3):
+        _call(f"{prelude}; _wd_run_conditions {NOW} off", env=env)
+
+    assert _spawn_count(counter) == 1, "a persistent dead pane must not re-spawn a claude per tick"
+
+
+def test_revive_budget_marker_records_the_spawned_run(tmp_path: Path) -> None:
+    # Liveness bookkeeping: the budget marker carries `<ts>\t<pid>` of the run it launched, so an
+    # operator returning to a burnt window can find and kill the orphan instead of hunting stray
+    # `claude` processes by hand. A fake `claude` on PATH records its own $$ — that must be the pid
+    # the marker names, which also proves the recorded pid IS the spawned run and not the daemon's.
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    claude_pid = tmp_path / "claude-pid"
+    fake = bindir / "claude"
+    fake.write_text(f'#!/usr/bin/env bash\nprintf "%s" "$$" > "{claude_pid}"\n')
+    fake.chmod(0o755)
+    env = _dead_pane_env(tmp_path, PATH=f"{bindir}:{os.environ['PATH']}")
+
+    _call(f"_wd_intervene_revive '{wt}' 284", env=env)
+
+    marker = tmp_path / "afk-state" / _REVIVE_BUDGET_MARKER
+    assert marker.exists(), "the spawn must be recorded so the next tick sees the budget spent"
+    ts, pid = marker.read_text().strip().split("\t")
+    assert ts.isdigit(), f"the marker must carry the spawn ts, got {ts!r}"
+    for _ in range(100):  # the fake claude is detached — give it a beat to land its pid
+        if claude_pid.exists():
+            break
+        time.sleep(0.05)
+    assert claude_pid.read_text() == pid, "the marker must name the pid of the run it spawned"
+
+
+def test_a_fresh_arm_clears_the_revive_budget(tmp_path: Path) -> None:
+    # The budget is per-WINDOW, not per-run: it rides the `wd-fire-dedup-` family precisely so the
+    # REAL _clear_progress_state glob drops it on a fresh arm. Pinned against the actual function
+    # (not a copy of its glob) so a rename there fails here instead of silently stranding a spoke
+    # un-revivable for every future window.
+    counter = tmp_path / "spawns"
+    env = _revive_counter_env(tmp_path, counter)
+
+    _call("_wd_intervene_revive /the/wt 284", env=env)
+    assert (tmp_path / "afk-state" / _REVIVE_BUDGET_MARKER).exists()
+    _call("_clear_progress_state", env=env)
+    _call("_wd_intervene_revive /the/wt 284", env=env)
+
+    assert _spawn_count(counter) == 2, "a fresh arm must re-grant the revive budget"
+
+
+def test_intervene_revive_defers_while_a_live_drain_is_acting_on_this_issue(
+    tmp_path: Path,
+) -> None:
+    # The drain's own recover_dead_panes revives crashed panes too. Racing it puts TWO claudes in
+    # one worktree — the "racing writes" half of the defect, which the once-per-window budget alone
+    # does not prevent (one watchdog spawn + one drain resume = two). _wd_land_in_flight covers only
+    # the mid-LAND race; this covers any live drain pass that names this issue.
+    counter = tmp_path / "spawns"
+    last_action = tmp_path / "last-action"
+    last_action.write_text("revive #284\n")
+    env = _revive_counter_env(tmp_path, counter, AFK_LAST_ACTION=str(last_action))
+
+    _call("_wd_drain_state() { echo live; }; _wd_intervene_revive /the/wt 284", env=env)
+
+    assert _spawn_count(counter) == 0, "never race the drain while it is working this same spoke"
+
+
+def test_intervene_revive_runs_when_the_live_drain_is_on_another_issue(tmp_path: Path) -> None:
+    # The complement, so the defer above cannot silently widen into "never revive while armed":
+    # a live drain busy elsewhere leaves this spoke abandoned, and the watchdog still owns it.
+    counter = tmp_path / "spawns"
+    last_action = tmp_path / "last-action"
+    last_action.write_text("answer #999\n")
+    env = _revive_counter_env(tmp_path, counter, AFK_LAST_ACTION=str(last_action))
+
+    _call("_wd_drain_state() { echo live; }; _wd_intervene_revive /the/wt 284", env=env)
+
+    assert _spawn_count(counter) == 1
 
 
 # AC4 (#290): a dead-pane ledger line must carry the base it was MEASURED from, so a future false
