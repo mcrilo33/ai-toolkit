@@ -25,6 +25,7 @@ pytestmark = pytest.mark.skipif(
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HUB_WATCHDOG = REPO_ROOT / "shared" / "skills" / "hub" / "scripts" / "hub-watchdog.sh"
+WT_LIB = REPO_ROOT / "scripts" / "worktree-lib.sh"
 
 
 def _call(fn_call: str, *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -240,6 +241,226 @@ def test_daemon_appends_loop_output_to_logfile(tmp_path: Path) -> None:
     assert "drain supervisor is live" not in result.stdout, (
         "loop output goes to the log, not stdout"
     )
+
+
+# ── singleton recycle of a live but STALE-GENERATION daemon (issue #296 AC2) ───
+# #296 mechanism 2: a self-update redeploy resumes a FRESH copy, but its arm was singleton-
+# guarded by liveness ALONE — a live pidfile always refused, even when the fresh copy can prove
+# (via the recorded generation stamp) that the live daemon is running code an intervening land
+# already replaced. These pin the recycle-instead-of-refuse path; a genfile the arming daemon
+# never wrote (an old daemon that predates this stamp, or a genuinely current one) is
+# unmeasurable and must NOT be touched — the existing refuse tests above cover that fail-safe.
+
+
+def test_daemon_recycles_a_live_daemon_running_a_stale_generation(tmp_path: Path) -> None:
+    pidfile = tmp_path / "wd.pid"
+    genfile = tmp_path / "wd.gen"
+    parts = [
+        _drain_pattern_stub(tmp_path, "L"),
+        _LOOP_ENV,
+        f'export HUB_WATCHDOG_PIDFILE="{pidfile}"',
+        f'export HUB_WATCHDOG_GENFILE="{genfile}"',
+        f'export HUB_WATCHDOG_LOG="{tmp_path / "wd.log"}"',
+        "export HUB_WATCHDOG_RECYCLE_GRACE=2",
+        "_wd_source_hash() { echo FRESH; }",
+        f'printf "%s" "STALE" > "{genfile}"',
+        f'sleep 20 & printf "%s" "$!" > "{pidfile}"',
+        "_wd_daemon",
+    ]
+
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "already running" not in result.stdout + result.stderr, (
+        "a live daemon PROVEN stale (recorded gen != current origin hash) must be recycled, "
+        "not deferred to forever"
+    )
+    # "L" then off-to-exhaustion: one live tick + 3 idle ticks (the default idle grace) before
+    # the loop tears itself down — same shape as test_daemon_reclaims_stale_pidfile's "3".
+    assert (tmp_path / "ticks").read_text() == "4", "the reclaiming daemon actually ran the loop"
+    assert genfile.read_text() == "FRESH", "the new daemon stamps its own (current) generation"
+
+
+def test_daemon_leaves_a_live_daemon_alone_when_generation_is_unmeasurable(tmp_path: Path) -> None:
+    # No genfile at all (an old daemon that predates the stamp, or the first arm ever) — must
+    # NOT be treated as stale by default; that would let a fresh arm attempt kill a daemon it
+    # has no positive proof is behind. Sibling of test_daemon_refuses_second_start_while_pid_alive,
+    # using our own pid (like that test does) rather than a background job — the fix must never
+    # reach for `kill` on this path at all when the generation is unmeasurable.
+    pidfile = tmp_path / "wd.pid"
+    parts = [
+        _drain_pattern_stub(tmp_path, "L"),
+        _LOOP_ENV,
+        f'export HUB_WATCHDOG_PIDFILE="{pidfile}"',
+        f'export HUB_WATCHDOG_GENFILE="{tmp_path / "absent.gen"}"',
+        f'export HUB_WATCHDOG_LOG="{tmp_path / "wd.log"}"',
+        "_wd_source_hash() { echo FRESH; }",
+        f'printf "%s" "$$" > "{pidfile}"',  # a LIVE pid (our own shell)
+        "_wd_daemon",
+    ]
+
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "already running" in result.stdout + result.stderr
+    assert not (tmp_path / "ticks").exists(), "the loop never ticked — the daemon refused"
+    assert pidfile.exists(), "the other (unmeasurable) daemon's pidfile is left intact"
+
+
+# ── the --arm entry point's OWN singleton guard (issue #296 AC2, real path) ────
+# _wd_arm (not _wd_daemon) is what the drain actually calls every tick via `hub-watchdog.sh
+# --arm`. It used to run its own independent liveness-only refusal that returned before ever
+# reaching _wd_daemon's new stale-recycle logic — so mechanism 2 had zero coverage through its
+# real entry point. These exercise _wd_arm directly, standing in _WD_SELF with a lightweight
+# stub (never the real script) so a "relaunch happened" assertion doesn't require running an
+# actual daemon loop.
+
+
+def test_arm_refuses_when_a_live_daemon_generation_is_unmeasurable(tmp_path: Path) -> None:
+    pidfile = tmp_path / "wd.pid"
+    marker = tmp_path / "relaunched"
+    stub = tmp_path / "stub.sh"
+    stub.write_text(f'#!/usr/bin/env bash\ntouch "{marker}"\n')
+    stub.chmod(0o755)
+    parts = [
+        f'export HUB_WATCHDOG_PIDFILE="{pidfile}"',
+        f'export HUB_WATCHDOG_GENFILE="{tmp_path / "absent.gen"}"',
+        f'_WD_SELF="{stub}"',
+        f'printf "%s" "$$" > "{pidfile}"',  # a LIVE pid (our own shell)
+        "_wd_arm",
+    ]
+
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "already armed" in result.stdout + result.stderr
+    assert not marker.exists(), "a live, unmeasurable-generation daemon must not be relaunched"
+
+
+def test_arm_recycles_a_live_daemon_running_a_stale_generation(tmp_path: Path) -> None:
+    pidfile = tmp_path / "wd.pid"
+    genfile = tmp_path / "wd.gen"
+    marker = tmp_path / "relaunched"
+    stub = tmp_path / "stub.sh"
+    stub.write_text(f'#!/usr/bin/env bash\ntouch "{marker}"\n')
+    stub.chmod(0o755)
+    parts = [
+        f'export HUB_WATCHDOG_PIDFILE="{pidfile}"',
+        f'export HUB_WATCHDOG_GENFILE="{genfile}"',
+        "export HUB_WATCHDOG_RECYCLE_GRACE=2",
+        f'_WD_SELF="{stub}"',
+        "_wd_source_hash() { echo FRESH; }",
+        f'printf "%s" "STALE" > "{genfile}"',
+        f'sleep 20 & printf "%s" "$!" > "{pidfile}"',
+        "_wd_arm",
+    ]
+
+    result = _call("; ".join(parts))
+
+    assert result.returncode == 0, result.stderr
+    assert "already armed" not in result.stdout + result.stderr, (
+        "a live daemon PROVEN stale must be recycled, not deferred to forever"
+    )
+    # nohup backgrounds the relaunch; give the (near-instant) stub a beat to run.
+    for _ in range(20):
+        if marker.exists():
+            break
+        time.sleep(0.1)
+    assert marker.exists(), "the recycled slot must be relaunched with a fresh daemon"
+
+
+# ── the self-recycle source bundle (issue #296) ────────────────────────────────
+# A daemon armed by the drain EXECUTES from hub-afk.sh's frozen self-copy (/tmp/hub-afk-self.*/)
+# — a bundle no land ever rewrites. Hashing THAT is structurally dead: the stamp can never move,
+# so the #251/#190 contract ("a land of the watchdog's own code re-execs it live") never fires
+# and a stale daemon patrols for the rest of the window, false-firing detectors the landed code
+# already fixed (#296, the pre-#283 daemon on #278). The daemon must hash the ORIGIN bundle (the
+# real checkout, handed over as HUB_WATCHDOG_ORIG_SCRIPT) while still executing from the copy.
+
+_FRESH_STUB = '#!/usr/bin/env bash\necho "FRESH DAEMON argv=$* self=$0"\n'
+_STALE_STUB = '#!/usr/bin/env bash\necho "STALE DAEMON self=$0"\n'
+
+
+def _bundle(tmp_path: Path, *, origin_body: str, copy_body: str) -> dict[str, str]:
+    """An origin checkout + a frozen self-copy of it, as the drain's arm leaves them.
+
+    Returns the env pinning a daemon that executes from the copy and (post-#296) hashes the
+    origin: HUB_WATCHDOG_SCRIPT_DIR is the frozen copy dir (so _WD_SELF resolves there, exactly
+    as `_afk_find_script` leaves it), HUB_WATCHDOG_ORIG_SCRIPT the real checkout path. The
+    wt-lib pin keeps wt_source_hash resolvable from a tmp copy dir that has no sibling ladder.
+    """
+    origin = tmp_path / "origin"
+    copy = tmp_path / "copy"
+    origin.mkdir()
+    copy.mkdir()
+    (origin / "hub-watchdog.sh").write_text(origin_body)
+    (copy / "hub-watchdog.sh").write_text(copy_body)
+    return {
+        "HUB_WATCHDOG_SCRIPT_DIR": str(copy),
+        "HUB_WATCHDOG_ORIG_SCRIPT": str(origin / "hub-watchdog.sh"),
+        "HUB_WATCHDOG_WT_LIB": str(WT_LIB),
+    }
+
+
+def test_source_hash_tracks_the_origin_bundle(tmp_path: Path) -> None:
+    env = _bundle(tmp_path, origin_body="# origin v1\n", copy_body="# frozen copy\n")
+
+    before = _call("_wd_source_hash", env=env)
+    (tmp_path / "origin" / "hub-watchdog.sh").write_text("# origin v2 — a land\n")
+    after = _call("_wd_source_hash", env=env)
+
+    assert before.stdout.strip(), before.stderr
+    assert after.stdout.strip() != before.stdout.strip(), (
+        "a land rewriting the ORIGIN bundle must move the stamp the self-recycle watches"
+    )
+
+
+def test_source_hash_ignores_the_frozen_copy(tmp_path: Path) -> None:
+    # The other half of the pin: the frozen copy is not what a land rewrites, so it must not be
+    # what the stamp is taken over. Hashing it is what made the recycle structurally dead.
+    env = _bundle(tmp_path, origin_body="# origin v1\n", copy_body="# frozen copy\n")
+
+    before = _call("_wd_source_hash", env=env)
+    (tmp_path / "copy" / "hub-watchdog.sh").write_text("# the copy, scribbled on\n")
+    after = _call("_wd_source_hash", env=env)
+
+    assert before.stdout.strip(), before.stderr
+    assert after.stdout.strip() == before.stdout.strip(), (
+        "the frozen copy must not pin (nor move) the self-recycle stamp"
+    )
+
+
+def test_reexec_runs_the_landed_code_from_a_fresh_copy(tmp_path: Path) -> None:
+    # The stub origin really is exec'd, so this reads which generation the daemon lands on and
+    # where it runs from — no `exec` stubbing, the one thing that would hide the bug.
+    env = _bundle(tmp_path, origin_body=_FRESH_STUB, copy_body=_STALE_STUB)
+
+    result = _call("_wd_reexec", env=env)
+
+    assert "FRESH DAEMON" in result.stdout, f"the re-exec must land on ORIGIN code: {result.stdout}"
+    assert "STALE DAEMON" not in result.stdout, (
+        "re-exec'ing the frozen copy re-runs the same stale code with a fresh baseline — the "
+        "silent no-op that leaves a landed fix inert"
+    )
+    assert "argv=--daemon --reexec" in result.stdout, "the fresh daemon reclaims its own pidfile"
+    ran = result.stdout.split("self=")[1].strip()
+    assert ran != env["HUB_WATCHDOG_ORIG_SCRIPT"], (
+        "must exec a FRESH COPY of the origin, never the rewritable checkout file itself (#133)"
+    )
+    assert Path(ran).name == "hub-watchdog.sh", ran
+
+
+def test_reexec_refuses_a_parse_broken_landed_bundle(tmp_path: Path) -> None:
+    # A DEAD watchdog is worse than a stale one, so a land shipping unparseable code keeps the
+    # current daemon running. The `bash -n` guard only protects anything once the files it reads
+    # are the ORIGIN's — over the frozen copy it would parse-check code no land can break.
+    env = _bundle(tmp_path, origin_body="if [ ; then\n", copy_body=_STALE_STUB)
+
+    result = _call("_wd_reexec; echo STILL-RUNNING", env=env)
+
+    assert "fails to parse" in result.stdout, result.stdout
+    assert "STILL-RUNNING" in result.stdout, "a parse-broken land must not kill the daemon"
+    assert "STALE DAEMON" not in result.stdout, "and must not exec the frozen copy either"
 
 
 # ── CLI dispatch ───────────────────────────────────────────────────────────────

@@ -44,6 +44,8 @@
 #   HUB_WATCHDOG_LAND_ACTIVE=900     a land-<issue>.log quiet this long ⇒ that land is not in flight
 #   HUB_WATCHDOG_FILE=1          auto-file afk-defects via the headless bug-scoper (0 disables)
 #   HUB_WATCHDOG_COARM=1         (read by hub-afk.sh) co-arm this watchdog alongside the drain
+#   HUB_WATCHDOG_ORIG_SCRIPT      the CHECKOUT path of this script when we were armed from a
+#                                 private copy — the bundle the self-recycle hashes (#296)
 #   AFK_STATE / AFK_HEARTBEAT     the drain's state + heartbeat files it cross-checks (must
 #                                 match hub-afk.sh's contract — same <git-common-dir> defaults)
 #   *_CMD seams (tests / overrides): HUB_WATCHDOG_ANSWER_CMD / _REVIVE_CMD / _RECONCILE_CMD /
@@ -55,6 +57,18 @@ set -uo pipefail
 HUB_WATCHDOG_SCRIPT_DIR="${HUB_WATCHDOG_SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 # Absolute path to THIS script, so a re-exec / nohup-arm resolves regardless of cwd.
 _WD_SELF="$HUB_WATCHDOG_SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+
+# Our ORIGIN: the checkout path a land rewrites, as opposed to the private copy we may be
+# EXECUTING from. The drain arms us out of hub-afk.sh's frozen self-copy (/tmp/hub-afk-self.*/,
+# #133) and hands the origin over in HUB_WATCHDOG_ORIG_SCRIPT — the same contract hub-afk.sh's
+# own AFK_ORIG_SCRIPT carries. Absent (a standalone arm straight from the checkout) we ARE the
+# origin. A stale override naming no file is IGNORED rather than trusted: hashing a path that
+# does not exist stamps every tick alike, which is the dead self-recycle this fixes (#296).
+_WD_ORIGIN_SELF="$_WD_SELF"
+if [ -n "${HUB_WATCHDOG_ORIG_SCRIPT:-}" ] && [ -f "${HUB_WATCHDOG_ORIG_SCRIPT:-}" ]; then
+  _WD_ORIGIN_SELF="$HUB_WATCHDOG_ORIG_SCRIPT"
+fi
+_WD_ORIGIN_DIR="$(cd "$(dirname "$_WD_ORIGIN_SELF")" && pwd)" || _WD_ORIGIN_DIR="$HUB_WATCHDOG_SCRIPT_DIR"
 
 # --- source worktree-lib.sh (wt_source_hash, wt_realpath) + hub-inject.sh ------
 # Same dual-layout ladder as the hub siblings: the checkout (scripts/ four levels up) and a
@@ -104,9 +118,30 @@ unset _wdgb 2>/dev/null || true
 # Guarded log fallback (hub-inject/gate-broker may already provide one; same stderr contract).
 declare -F log >/dev/null 2>&1 || log() { printf '%s\n' "$*" >&2; }
 
-# The daemon's own source bundle: this script + the libs it sources. Stamped at daemon start
-# and re-checked each tick so a land of the watchdog's own code re-execs it live (#251/#190).
-_WD_SOURCE_FILES=("$_WD_SELF" "$_WD_RESOLVED_BROKER" "$_WD_RESOLVED_INJECT" "$_WD_RESOLVED_WT_LIB")
+# _wd_origin_of <path> -> <path>'s counterpart in the ORIGIN bundle when one exists, else <path>
+# unchanged. Maps by basename: a self-copy is a flat `cp <dir>/*.sh` of the origin dir, so a
+# copied sibling and its origin differ only in directory. A lib resolved from OUTSIDE the copy
+# (the checkout-layout worktree-lib.sh, reached via the toplevel ladder) has no counterpart there
+# and is already an origin path — keep it. Identity when we were not armed from a copy.
+_wd_origin_of() {
+  local p="${1:-}" cand
+  [ -n "$p" ] || return 0
+  cand="$_WD_ORIGIN_DIR/${p##*/}"
+  if [ "$cand" != "$p" ] && [ -f "$cand" ]; then printf '%s\n' "$cand"; return; fi
+  printf '%s\n' "$p"
+}
+
+# The daemon's own source bundle: this script + the libs it sources, resolved to their ORIGIN
+# paths. Stamped at daemon start and re-checked each tick so a land of the watchdog's own code
+# re-execs it live (#251/#190). Hashing the paths we EXECUTE from instead would watch the frozen
+# self-copy the drain armed us out of — a bundle no land ever rewrites, so the stamp could never
+# move and the recycle was structurally dead whenever the drain armed us, i.e. always (#296).
+_WD_SOURCE_FILES=(
+  "$(_wd_origin_of "$_WD_SELF")"
+  "$(_wd_origin_of "$_WD_RESOLVED_BROKER")"
+  "$(_wd_origin_of "$_WD_RESOLVED_INJECT")"
+  "$(_wd_origin_of "$_WD_RESOLVED_WT_LIB")"
+)
 
 # --- paths --------------------------------------------------------------------
 # The hub's git common dir — shared across worktrees, per-repo — where the daemon's pidfile,
@@ -119,6 +154,10 @@ _wd_common_dir() {
 }
 _wd_pidfile()   { printf '%s\n' "${HUB_WATCHDOG_PIDFILE:-$(_wd_common_dir)/hub-watchdog.pid}"; }
 _wd_logfile()   { printf '%s\n' "${HUB_WATCHDOG_LOG:-$(_wd_common_dir)/hub-watchdog.log}"; }
+# The generation stamp: the origin source hash the CURRENTLY-armed daemon booted with (#296
+# AC2). Lets a fresh arm attempt tell "a live daemon I can prove is behind a land" from "a live
+# daemon I have no evidence about" without asking the live process anything.
+_wd_genfile()   { printf '%s\n' "${HUB_WATCHDOG_GENFILE:-$(_wd_common_dir)/hub-watchdog.gen}"; }
 _wd_heartbeat_file() { printf '%s\n' "${HUB_WATCHDOG_HEARTBEAT:-$(_wd_common_dir)/.hub-watchdog-heartbeat}"; }
 # The DRAIN's state + heartbeat files — the same contract hub-afk.sh writes, so the cross-check
 # reads live truth. AFK_STATE / AFK_HEARTBEAT override exactly as they do in hub-afk.sh.
@@ -167,14 +206,31 @@ _wd_source_hash() {
   wt_source_hash "${_WD_SOURCE_FILES[@]}"
 }
 
+# _wd_fresh_copy -> a private copy of the ORIGIN bundle in a fresh tmp dir, printing the copied
+# hub-watchdog.sh path (empty on failure). The daemon must EXECUTE from a copy and never from the
+# checkout: bash lazily re-reads a running script past main(), so the NEXT land rewriting the
+# origin under a live daemon corrupts the interpreter mid-run (the #133 death, which is why
+# hub-afk.sh has _afk_exec_self_copy at all). The whole sibling set rides along via a flat glob,
+# not an enumerated list, so a helper moved to a new sibling file needs no registration (#262).
+_wd_fresh_copy() {
+  local dir copy
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/hub-watchdog-self.XXXXXX" 2>/dev/null)" || return 0
+  copy="$dir/${_WD_ORIGIN_SELF##*/}"
+  cp "$_WD_ORIGIN_DIR"/*.sh "$dir"/ 2>/dev/null || cp "$_WD_ORIGIN_SELF" "$copy" 2>/dev/null || return 0
+  [ -f "$copy" ] || cp "$_WD_ORIGIN_SELF" "$copy" 2>/dev/null || return 0
+  printf '%s\n' "$copy"
+}
+
 # _wd_reexec -> replace this daemon with a fresh copy running the on-disk (post-land) code.
 # `exec` preserves the pid, so the pidfile keeps naming a live process and no second daemon is
 # armed; the `--reexec` flag (passed ONLY here) tells the fresh _wd_daemon to reclaim its own
 # pidfile rather than refuse as "already running". First `bash -n`-checks the whole bundle: a
 # DEAD watchdog is worse than a stale one, so if a land shipped parse-broken code we keep
-# running the current (working) code and return — the loop retries next tick.
+# running the current (working) code and return — the loop retries next tick. Both the check and
+# the exec read the ORIGIN (#296): re-exec'ing our own frozen copy would re-run the very code the
+# land replaced, under a freshly-stamped baseline — a silent no-op that looks like a recycle.
 _wd_reexec() {
-  local f
+  local f fresh
   for f in "${_WD_SOURCE_FILES[@]}"; do
     [ -n "$f" ] && [ -f "$f" ] || continue
     if ! bash -n "$f" 2>/dev/null; then
@@ -183,7 +239,15 @@ _wd_reexec() {
     fi
   done
   _wd_log "source changed on disk (a land) — re-exec'ing into fresh code"
-  exec bash "$_WD_SELF" --daemon --reexec
+  # Fail-OPEN to the origin path itself when no copy could be made: running the landed code
+  # unprotected still beats patrolling forever on code a land already replaced.
+  fresh="$(_wd_fresh_copy)"
+  [ -n "$fresh" ] || fresh="$_WD_ORIGIN_SELF"
+  # HUB_WATCHDOG_SCRIPT_DIR is stripped so the fresh copy resolves its OWN dir — inheriting ours
+  # would pin the next generation's sibling ladder back to the dir we are leaving. The origin
+  # rides along so it keeps hashing the checkout rather than the copy we just made.
+  exec env -u HUB_WATCHDOG_SCRIPT_DIR HUB_WATCHDOG_ORIG_SCRIPT="$_WD_ORIGIN_SELF" \
+    bash "$fresh" --daemon --reexec
 }
 
 # --- detection conditions + scripted interventions (issue #251) ---------------
@@ -1493,21 +1557,71 @@ _wd_once() {
 }
 
 # --- daemon singleton ---------------------------------------------------------
-# _wd_daemon [--reexec] -> singleton wrapper around _wd_loop. The pidfile makes N arms arm
-# exactly one daemon: when it names a still-live pid (kill -0) refuse to start and leave the
-# other daemon's pidfile alone; a stale pidfile (dead pid) is reclaimed. A re-exec keeps this
-# pid, so `--reexec` reclaims our own file instead of refusing. Loop output appends to the
-# logfile so a recovery is auditable after the fact. Always returns 0.
+# _wd_daemon_is_stale <genfile> -> true when a LIVE daemon's recorded generation stamp differs
+# from the CURRENT origin hash (#296 AC2). An unreadable/empty genfile — an old daemon that
+# predates this stamp, or the very first arm — reads as UNMEASURABLE, never stale: this mirrors
+# the fail-safe default everywhere else in this file (an epoch we can't read never fires, an
+# unknown park lane never fires). We only ever recycle a daemon we can PROVE is behind.
+_wd_daemon_is_stale() {
+  local genfile="$1" recorded cur
+  [ -f "$genfile" ] || return 1
+  recorded="$(cat "$genfile" 2>/dev/null)"
+  [ -n "$recorded" ] || return 1
+  cur="$(_wd_source_hash)"
+  [ -n "$cur" ] || return 1
+  [ "$cur" != "$recorded" ]
+}
+
+# _wd_recycle_stale_pid <pid> -> TERM a live daemon _wd_daemon_is_stale already proved is
+# behind, wait a bounded grace for its own EXIT trap to release the pidfile, then KILL a
+# survivor. Falls through either way — the caller's normal claim path below reclaims the
+# pidfile exactly as it already does for a plain dead pid.
+_wd_recycle_stale_pid() {
+  local pid="$1" grace="${HUB_WATCHDOG_RECYCLE_GRACE:-5}" waited=0
+  case "$grace" in '' | *[!0-9]*) grace=5 ;; esac
+  kill -TERM "$pid" 2>/dev/null
+  while [ "$waited" -lt "$grace" ] && _wd_pid_alive "$pid"; do
+    sleep 1 2>/dev/null || true
+    waited=$((waited + 1))
+  done
+  _wd_pid_alive "$pid" && kill -KILL "$pid" 2>/dev/null
+  return 0
+}
+
+# _wd_singleton_guard <pidfile> <genfile> -> 0 (proceed: claim/relaunch) when the pidfile is
+# absent, names a dead pid, or names a live pid _wd_daemon_is_stale can PROVE is behind (which
+# this also recycles, as a side effect, before returning). 1 (refuse — a live, unmeasurable-or-
+# current daemon already holds the slot) otherwise. Shared by both real entry points (#296
+# AC2 review): _wd_daemon (the foreground `--daemon` loop) and _wd_arm (the detached `--arm`
+# launcher the drain actually calls every tick) must agree on this decision, or a fix to one
+# and not the other leaves the daemon un-recyclable through the path that matters in production.
+_wd_singleton_guard() {
+  local pidfile="$1" genfile="$2" pid
+  [ -f "$pidfile" ] || return 0
+  pid="$(cat "$pidfile" 2>/dev/null)"
+  _wd_pid_alive "$pid" || return 0
+  if _wd_daemon_is_stale "$genfile"; then
+    _wd_log "live daemon (pid $pid) is running a generation a land already replaced — recycling"
+    _wd_recycle_stale_pid "$pid"
+    return 0
+  fi
+  return 1
+}
+
+# _wd_daemon [--reexec] -> singleton wrapper around _wd_loop. _wd_singleton_guard makes N arms
+# arm exactly one daemon: refuse (leaving the other daemon's pidfile alone) unless the pidfile
+# is absent, dead, or PROVEN stale (recycled as a side effect, #296 AC2). A re-exec keeps this
+# pid, so `--reexec` reclaims our own file instead of guarding at all. Loop output appends to
+# the logfile so a recovery is auditable after the fact. Always returns 0.
 _wd_daemon() {
-  local reexec="${1:-}" pidfile logfile pid baseline
+  local reexec="${1:-}" pidfile logfile genfile pid baseline
   pidfile="$(_wd_pidfile)"
   logfile="$(_wd_logfile)"
-  if [ "$reexec" != "--reexec" ] && [ -f "$pidfile" ]; then
+  genfile="$(_wd_genfile)"
+  if [ "$reexec" != "--reexec" ] && ! _wd_singleton_guard "$pidfile" "$genfile"; then
     pid="$(cat "$pidfile" 2>/dev/null)"
-    if _wd_pid_alive "$pid"; then
-      printf '%s\n' "hub-watchdog: already running (pid $pid, pidfile $pidfile)"
-      return 0
-    fi
+    printf '%s\n' "hub-watchdog: already running (pid $pid, pidfile $pidfile)"
+    return 0
   fi
   printf '%s' "$$" > "$pidfile"
   # Claimed: this shell owns the pidfile, so remove it on exit. The path rides a global — a
@@ -1518,23 +1632,25 @@ _wd_daemon() {
   trap 'exit 0' TERM INT
   printf '%s\n' "hub-watchdog: daemon armed (pid $$, log $logfile)"
   baseline="$(_wd_source_hash)"
+  printf '%s' "$baseline" > "$genfile" 2>/dev/null || true
   _wd_loop "$baseline" >> "$logfile" 2>&1
   return 0
 }
 
 # _wd_arm -> nohup-detach the daemon so it survives THIS session's death (the whole point:
-# ScheduleWakeup/Monitor die with the session; an OS process does not). Singleton-guarded: a
-# live pidfile means one is already armed. Best-effort; never fails the caller (the drain
-# co-arms it each tick, so a transient miss self-heals).
+# ScheduleWakeup/Monitor die with the session; an OS process does not). Shares _wd_singleton_
+# guard with _wd_daemon (#296 AC2 review): a live pidfile means one is already armed UNLESS its
+# generation is PROVEN stale, in which case the guard recycles it and we relaunch fresh — this
+# is the real entry point the drain calls every tick, so the recycle logic is inert everywhere
+# else if it only lived in _wd_daemon's own guard. Best-effort; never fails the caller (the
+# drain co-arms it each tick, so a transient miss self-heals).
 _wd_arm() {
   local pidfile pid
   pidfile="$(_wd_pidfile)"
-  if [ -f "$pidfile" ]; then
+  if ! _wd_singleton_guard "$pidfile" "$(_wd_genfile)"; then
     pid="$(cat "$pidfile" 2>/dev/null)"
-    if _wd_pid_alive "$pid"; then
-      printf '%s\n' "hub-watchdog: already armed (pid $pid)"
-      return 0
-    fi
+    printf '%s\n' "hub-watchdog: already armed (pid $pid)"
+    return 0
   fi
   nohup bash "$_WD_SELF" --daemon >/dev/null 2>&1 &
   printf '%s\n' "hub-watchdog: armed (nohup daemon detached)"
@@ -1560,7 +1676,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     --once)    _wd_once ;;
     --status)  _wd_status ;;
     --report)  _wd_report ;;
-    -h | --help) sed -n '2,51p' "$_WD_SELF" ;;
+    -h | --help) sed -n '2,53p' "$_WD_SELF" ;;
     *)         _wd_status ;;
   esac
 fi
