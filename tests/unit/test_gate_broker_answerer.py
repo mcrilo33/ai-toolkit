@@ -2096,6 +2096,52 @@ def test_permission_approve_journals_before_inject(spoke_repo: Path, tmp_path: P
     )
 
 
+def test_taken_answer_journals_a_resolvable_reasoning_ref(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    """#281 item 5: a taken answer must persist the reasoning behind it.
+
+    _broker_journal_line has accepted a reasoning_ref 5th arg since #241, but no caller ever
+    passed one, so every record journaled reasoning_ref:"". When the #271 answerer injected
+    four off-policy "keep it local" answers, its actual reasoning existed nowhere on disk and
+    the diagnosis had to be reconstructed from the spoke pane — the forensic gap this closes.
+
+    The ref must RESOLVE, not merely be non-empty: a path naming a file that does not exist,
+    or an empty one, would satisfy "non-empty" while leaving the morning review with nothing.
+    """
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    fake_bin = tmp_path / "bin"
+    jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+    _fake_tmux_pane(fake_bin, spoke_repo, jsonl)
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": (
+            "printf 'weighing the push against the ship contract\\n"
+            "REVERSIBILITY: reversible\\nANSWER: use Redis'"
+        ),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+    assert result.returncode == 0, result.stderr
+
+    record = json.loads((statedir / "decision-journal.jsonl").read_text().strip().splitlines()[-1])
+    ref = record["reasoning_ref"]
+    assert ref, f"a taken answer must journal a reasoning_ref: {record}"
+    saved = Path(ref)
+    assert saved.is_file(), f"reasoning_ref must name a real file, got {ref!r}"
+    # The persisted text is the REASONING, not just the one-line answer — the reasoning is what
+    # would have shown #271's answerer talking itself into "keep it local".
+    body = saved.read_text()
+    assert "weighing the push against the ship contract" in body, body
+    assert "ANSWER: use Redis" in body, body
+
+
 def test_success_answer_journals_warn_and_reversibility(
     spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
 ) -> None:
