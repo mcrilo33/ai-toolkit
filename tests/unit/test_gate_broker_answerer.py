@@ -1976,6 +1976,43 @@ def test_staleness_recomputes_against_current_park(
     assert n == 2, f"a still-parked staleness must recompute once (not bare-drop); ran {n}"
 
 
+# ── issue #288 AC3: a genuine drop must be recorded on answer-drop-<issue> ──────
+# Every pre-inject drop path (#247 live-tree-changed, this "spoke moved on" path, the re-answer
+# ceiling backoff+retry) previously left NO trace the watchdog could read — a park serviced
+# several times but never delivered on read identically to one nobody ever touched (#277). A
+# REAL reply landing mid-reasoning (not a #241 non-turn bump) is a definite "spoke moved on" —
+# straight to the drop, no recompute — so this exercises the drop site directly.
+
+
+def test_broker_service_gate_records_an_answer_drop_when_the_spoke_moved_on(
+    spoke_repo: Path, waiting_spoke_env: dict[str, str], tmp_path: Path
+) -> None:
+    live_jsonl = _project_dir_for(tmp_path / "projects", spoke_repo) / "session.jsonl"
+    reply = json.dumps(
+        {
+            "type": "user",
+            "promptSource": "typed",
+            "message": {"content": "Handled in-pane already."},
+        }
+    )
+    statedir = tmp_path / "sd"
+    env = {
+        **waiting_spoke_env,
+        "AFK_ANSWERER_CMD": (f"printf '{reply}\\n' >> '{live_jsonl}'; printf 'ANSWER: pick Redis'"),
+        "AFK_STATE_DIR": str(statedir),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+    }
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "dropping the stale answer" in result.stderr, result.stderr
+    out = _call(f"read_answer_drop '{spoke_repo}' 5", env={"AFK_STATE_DIR": str(statedir)}).stdout
+    count, _, reason = out.strip().partition("\t")
+    assert count == "1", f"the drop must be recorded on answer-drop-5, got: {out!r}"
+    assert "moved on" in reason
+
+
 # ── issue #241 S5: the human-decision chokepoint warns-and-continues, never parks ──
 # _broker_on_human_decision (unattended) is the ONE seam every void/fingerprint/inject-failure/
 # ESCALATE/no-decision escalation funnels through. #241 converts it from _escalate_blocked

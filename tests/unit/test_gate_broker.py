@@ -742,3 +742,40 @@ def test_broker_consumes_stale_tag_when_answer_already_landed(
     assert tags.stdout.strip() == "", "the stale gate tag must be consumed"
     assert not artifact.exists(), "the spent plan artifact must be dropped too"
     assert not prompt_log.exists(), "a resumed spoke must NOT be re-answered"
+
+
+def test_broker_self_heal_clears_park_onset_and_warned_backoff(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #288 AC1/AC4: the #204 self-heal is the exact moment the broker proves the park episode
+    # ended (an outside-broker approval landed); it must END the episode right there — clearing
+    # the STALE park-onset epoch (not waiting for a later slot_state tick to observe not-parked,
+    # #277's false-fire gap) and the answer-lane warned-retry backoff (so a later re-park on the
+    # same tip gets a fresh ceiling, not one inherited from the now-resolved episode's exhausted
+    # retries).
+    prompt_log = tmp_path / "prompt.log"
+    env = _gate_broker_env(spoke_repo, tmp_path, prompt_log=prompt_log)
+    statedir = Path(env["AFK_STATE_DIR"])
+    statedir.mkdir(parents=True, exist_ok=True)
+    (statedir / "park-onset-5.epoch").write_text("1000\n")  # stale onset from the resolved park
+    (statedir / "warned-state-5").write_text("2\t9999999999\n")  # an armed, not-yet-due backoff
+    (statedir / "warned-5.txt").write_text("1000\tre-answer ceiling reached\n")
+    pd = _project_dir_for(Path(env["CLAUDE_PROJECTS_DIR"]), spoke_repo)
+    (pd / "session.jsonl").write_text(_resumed_gate_transcript("stale PLAN prose"))
+    (spoke_repo / ".ai-toolkit").mkdir()
+    (spoke_repo / ".ai-toolkit" / "gate-5.md").write_text("stale plan\n")
+    _tag_gate_at_head(spoke_repo, 5)
+
+    result = _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert not (statedir / "park-onset-5.epoch").exists(), (
+        "the resolved episode's park-onset must be cleared, not left to go stale"
+    )
+    assert not (statedir / "warned-state-5").exists(), (
+        "the answer-lane warned-retry backoff must be cleared"
+    )
+    assert not (statedir / "warned-5.txt").exists(), (
+        "the human-facing warned record must be cleared too"
+    )
+    assert not prompt_log.exists(), "a resumed spoke must NOT be re-answered"

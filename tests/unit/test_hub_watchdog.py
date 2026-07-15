@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from _gate_broker_support import _project_dir_for, _resumed_gate_transcript
 
 # hub-watchdog.sh cross-checks the macOS afk hub (kill -0, BSD tooling) like its siblings.
 pytestmark = pytest.mark.skipif(
@@ -652,6 +653,212 @@ def test_park_unanswered_reason_names_the_base_episode_and_lane(tmp_path: Path) 
     assert f"answer-attempt@{old}" in out, "names WHICH epoch was measured, and its value"
     assert "abc123de" in out, "names the current park episode's signature"
     assert "lane=gate" in out
+
+
+def _head(wt: Path) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=wt, capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+# ── issue #288 AC2: never-attempted suppression when the drain HAS attempted + is paced ────────
+# answer-attempt-<issue>.epoch (stamped only at DELIVERY) is blind to every pre-inject drop path.
+# Two records the re-answer-ceiling code ALREADY writes prove otherwise: reanswer-<issue> (an
+# attempt genuinely ran on the CURRENT (tip, sig)) and an armed, not-yet-due warned-retry backoff
+# (the drain is paced to retry, not abandoned). Together, firing "never-attempted" would be a lie.
+
+
+def test_park_unanswered_never_attempted_suppressed_when_attempted_and_backing_off(
+    tmp_path: Path,
+) -> None:
+    wt = _git_repo(tmp_path)
+    sd = tmp_path / "sd"
+    sd.mkdir()
+    (sd / "reanswer-5").write_text(f"{_head(wt)}\tsigA\t1\n")
+    (sd / "warned-state-5").write_text(f"1\t{int(NOW) + 300}\n")  # armed, not due for 300s
+    old = str(int(NOW) - 700)  # past the 600s ceiling
+    prelude = (
+        f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; "
+        "_broker_park_signature() { printf '%s' 'sigA'; }; "
+        f"read_answer_attempt() {{ echo ''; }}; read_park_onset_epoch() {{ echo {old}; }}"
+    )
+    rc = _detect(prelude, f"_wd_detect_park_unanswered '{wt}' 5 {NOW}", state_dir=sd)
+    assert rc == 1, "an attempted + backing-off park must not fire under the never-attempted label"
+
+
+def test_park_unanswered_genuinely_unserviced_still_fires(tmp_path: Path) -> None:
+    # AC2's counter-case: no reanswer record at all -> the suppression must not engage.
+    wt = _git_repo(tmp_path)
+    sd = tmp_path / "sd"
+    sd.mkdir()
+    old = str(int(NOW) - 700)
+    prelude = (
+        f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; "
+        "_broker_park_signature() { printf '%s' 'sigA'; }; "
+        f"read_answer_attempt() {{ echo ''; }}; read_park_onset_epoch() {{ echo {old}; }}"
+    )
+    rc = _detect(prelude, f"_wd_detect_park_unanswered '{wt}' 5 {NOW}", state_dir=sd)
+    assert rc == 0, "a genuinely untouched park must still fire"
+
+
+def test_park_unanswered_fires_when_attempted_but_backoff_already_due(tmp_path: Path) -> None:
+    # A reanswer record alone is not enough: the retry must still be PENDING (not yet due) or the
+    # drain has simply stopped, and the fire must go through.
+    wt = _git_repo(tmp_path)
+    sd = tmp_path / "sd"
+    sd.mkdir()
+    (sd / "reanswer-5").write_text(f"{_head(wt)}\tsigA\t1\n")
+    (sd / "warned-state-5").write_text(f"1\t{int(NOW) - 10}\n")  # already due
+    old = str(int(NOW) - 700)
+    prelude = (
+        f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; "
+        "_broker_park_signature() { printf '%s' 'sigA'; }; "
+        f"read_answer_attempt() {{ echo ''; }}; read_park_onset_epoch() {{ echo {old}; }}"
+    )
+    rc = _detect(prelude, f"_wd_detect_park_unanswered '{wt}' 5 {NOW}", state_dir=sd)
+    assert rc == 0, (
+        "a backoff that is already due is not 'paced to retry' — the fire must go through"
+    )
+
+
+# ── issue #288 AC3: park-undeliverable — serviced but never deliverable ────────────────────────
+# A never-attempted park with a DROP on record (answers were computed but every one was dropped
+# before injection) surfaces under its own honest reason instead of the misleading
+# "never-attempted" label — and instead of silence, the other #277 failure mode.
+
+
+def test_park_undeliverable_fires_when_drops_are_on_record(tmp_path: Path) -> None:
+    wt = _git_repo(tmp_path)
+    sd = tmp_path / "sd"
+    sd.mkdir()
+    (sd / "answer-drop-5").write_text(
+        f"{_head(wt)}\tsigA\t3\tno longer parked on that prompt (spoke moved on)\n"
+    )
+    old = str(int(NOW) - 700)
+    prelude = (
+        f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; "
+        "_broker_park_signature() { printf '%s' 'sigA'; }; "
+        f"read_answer_attempt() {{ echo ''; }}; read_park_onset_epoch() {{ echo {old}; }}"
+    )
+    rc = _detect(prelude, f"_wd_detect_park_undeliverable '{wt}' 5 {NOW}", state_dir=sd)
+    assert rc == 0
+
+
+def test_park_undeliverable_quiet_without_a_drop_record(tmp_path: Path) -> None:
+    wt = _git_repo(tmp_path)
+    sd = tmp_path / "sd"
+    sd.mkdir()
+    old = str(int(NOW) - 700)
+    prelude = (
+        f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; "
+        "_broker_park_signature() { printf '%s' 'sigA'; }; "
+        f"read_answer_attempt() {{ echo ''; }}; read_park_onset_epoch() {{ echo {old}; }}"
+    )
+    rc = _detect(prelude, f"_wd_detect_park_undeliverable '{wt}' 5 {NOW}", state_dir=sd)
+    assert rc == 1
+
+
+def test_park_undeliverable_quiet_when_a_delivery_already_landed_in_episode(tmp_path: Path) -> None:
+    # A delivery inside the current episode is the stale-attempt branch's turf, not this one.
+    wt = _git_repo(tmp_path)
+    sd = tmp_path / "sd"
+    sd.mkdir()
+    (sd / "answer-drop-5").write_text(f"{_head(wt)}\tsigA\t1\tstale tree\n")
+    old = str(int(NOW) - 700)
+    prelude = (
+        f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; "
+        "_broker_park_signature() { printf '%s' 'sigA'; }; "
+        f"read_answer_attempt() {{ echo {old}; }}; read_park_onset_epoch() {{ echo {old}; }}"
+    )
+    rc = _detect(prelude, f"_wd_detect_park_undeliverable '{wt}' 5 {NOW}", state_dir=sd)
+    assert rc == 1
+
+
+def test_park_undeliverable_reason_names_the_count_and_last_verdict(tmp_path: Path) -> None:
+    wt = _git_repo(tmp_path)
+    sd = tmp_path / "sd"
+    sd.mkdir()
+    (sd / "answer-drop-5").write_text(
+        f"{_head(wt)}\tsigA\t3\tno longer parked on that prompt (spoke moved on)\n"
+    )
+    old = int(NOW) - 700
+    prelude = (
+        "_broker_park_signature() { printf '%s' 'sigA'; }; "
+        f"read_park_onset_epoch() {{ echo {old}; }}"
+    )
+    out = _call(
+        f"{prelude}; _wd_park_undeliverable_reason '{wt}' 5 {NOW}",
+        env={"AFK_STATE_DIR": str(sd), "AFK_NOW": NOW},
+    ).stdout
+
+    assert "park-undeliverable" in out
+    assert "3" in out
+    assert "no longer parked on that prompt (spoke moved on)" in out
+    assert "700s" in out
+
+
+def test_run_conditions_fires_park_undeliverable_instead_of_park_unanswered(tmp_path: Path) -> None:
+    wt = _git_repo(tmp_path)
+    ledger = tmp_path / "ledger.jsonl"
+    sd = tmp_path / "afk-state"
+    sd.mkdir()
+    (sd / "answer-drop-5").write_text(f"{_head(wt)}\tsigA\t2\tspoke moved on\n")
+    onset = str(int(NOW) - 700)
+    env = {
+        "HUB_WATCHDOG_LEDGER": str(ledger),
+        "HUB_WATCHDOG_LANDMARK_REPO": str(tmp_path / "no-landmark-repo"),
+        "AFK_STATE": str(tmp_path / "absent-afk-state"),
+        "AFK_STATE_DIR": str(sd),
+        "AFK_NOW": NOW,
+    }
+    prelude = (
+        f'inflight_worktrees() {{ printf "{wt}\\t5\\n"; }}; '
+        f"{_GATE_LANE}; _broker_park_signature() {{ printf '%s' 'sigA'; }}; "
+        'slot_state() { echo waiting; }; read_answer_attempt() { echo ""; }; '
+        f"read_park_onset_epoch() {{ echo {onset}; }}; "
+        '_spoke_pane_target() { echo "hub:0"; }; read_progress_epoch() { echo ""; }'
+    )
+
+    _call(f"{prelude}; _wd_run_conditions {NOW} live", env=env)
+
+    line = ledger.read_text()
+    assert '"condition":"park-undeliverable"' in line
+    assert '"condition":"park-unanswered"' not in line, (
+        "a serviced-but-undeliverable park must not ALSO fire the misleading never-attempted label"
+    )
+
+
+def test_classify_park_undeliverable_defaults_to_afk_defect() -> None:
+    assert _call("_wd_classify park-undeliverable 5").stdout.strip() == "afk-defect"
+
+
+# ── issue #288 AC1: the #204 self-heal must end the park episode there, not at a lucky tick ────
+def test_self_heal_clears_park_onset_so_a_following_tick_is_quiet(tmp_path: Path) -> None:
+    # The #277 shape: a gate park, >=2 computed-then-dropped answer passes (recorded on
+    # answer-drop-5, no injection landed), then an outside-broker typed approval lands. The
+    # self-heal must clear park-onset right there so a watchdog tick immediately after — before
+    # any lucky slot_state tick would otherwise have observed "not parked" — stays quiet.
+    wt = _git_repo(tmp_path)
+    subprocess.run(["git", "tag", "gate/5"], cwd=wt, check=True, capture_output=True)
+    sd = tmp_path / "sd"
+    sd.mkdir()
+    old = str(int(NOW) - 700)
+    (sd / "park-onset-5.epoch").write_text(old + "\n")
+    (sd / "answer-drop-5").write_text(f"{_head(wt)}\tsigA\t2\tno longer parked (spoke moved on)\n")
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, wt)
+    pd.mkdir(parents=True, exist_ok=True)
+    (pd / "session.jsonl").write_text(_resumed_gate_transcript("stale PLAN prose"))
+    env = {"AFK_STATE_DIR": str(sd), "CLAUDE_PROJECTS_DIR": str(projects), "AFK_NOW": NOW}
+
+    heal = _call(f"broker_service_gate '{wt}' 5 unattended", env=env)
+    assert heal.returncode == 0, heal.stderr
+    assert not (sd / "park-onset-5.epoch").exists(), "the self-heal must clear the resolved onset"
+
+    quiet_unanswered = _call(f"_wd_detect_park_unanswered '{wt}' 5 {NOW}", env=env)
+    assert quiet_unanswered.returncode == 1, "a tick right after the self-heal must not fire"
+    quiet_undeliverable = _call(f"_wd_detect_park_undeliverable '{wt}' 5 {NOW}", env=env)
+    assert quiet_undeliverable.returncode == 1
 
 
 # Condition 2 — dead / idle pane

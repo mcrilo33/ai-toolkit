@@ -432,6 +432,109 @@ def test_clear_progress_state_also_clears_the_park_sig_record(tmp_path: Path) ->
     assert not (statedir / "park-sig-5").exists()
 
 
+# ── issue #288 AC3: answer-drop record (computed-then-dropped answers, no delivery) ────────────
+# Distinct from reanswer-<issue> (the REASONER-RAN counter, armed BEFORE the outcome is known):
+# this records only the SUBSET of attempts that ended in a DROP (never injected) — so the
+# watchdog can tell "tried and still trying" from "tried and nothing has ever been deliverable"
+# (the #277 shape). Keyed like _broker_reanswer_exhausted's own (tip, sig) counter, for the same
+# reason: a changed tip or park content starts a fresh episode's count at 1.
+
+
+def _drop(sig: str, wt: str, issue: str, reason: str) -> str:
+    """A note_answer_drop call with the park signature stubbed to `sig`."""
+    return (
+        f"_broker_park_signature() {{ printf '%s' '{sig}'; }}; "
+        f"note_answer_drop '{wt}' {issue} '{reason}'"
+    )
+
+
+def _read_drop(sig: str, wt: str, issue: str) -> str:
+    return f"_broker_park_signature() {{ printf '%s' '{sig}'; }}; read_answer_drop '{wt}' {issue}"
+
+
+def test_note_answer_drop_increments_within_the_same_tip_and_signature(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    statedir = tmp_path / "sd"
+    env = {"AFK_STATE_DIR": str(statedir)}
+    _call(_drop("sigA", str(spoke_repo), "5", "reason one"), env=env)
+    _call(_drop("sigA", str(spoke_repo), "5", "reason two"), env=env)
+
+    out = _call(_read_drop("sigA", str(spoke_repo), "5"), env=env).stdout.strip()
+
+    count, _, reason = out.partition("\t")
+    assert count == "2", f"a second drop on the SAME (tip, sig) must increment, got: {out!r}"
+    assert reason == "reason two", "the LAST drop's own reason is what's kept"
+
+
+def test_note_answer_drop_resets_on_a_new_signature(spoke_repo: Path, tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    env = {"AFK_STATE_DIR": str(statedir)}
+    _call(_drop("sigA", str(spoke_repo), "5", "first episode"), env=env)
+
+    _call(_drop("sigB", str(spoke_repo), "5", "second episode"), env=env)
+
+    out = _call(_read_drop("sigB", str(spoke_repo), "5"), env=env).stdout.strip()
+    assert out == "1\tsecond episode", "a changed park signature starts a fresh drop count"
+
+
+def test_note_answer_drop_resets_on_a_tip_advance(spoke_repo: Path, tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    env = {"AFK_STATE_DIR": str(statedir)}
+    _call(_drop("sigA", str(spoke_repo), "5", "first episode"), env=env)
+
+    subprocess.run(
+        ["git", "commit", "-q", "--allow-empty", "-m", "progress"],
+        cwd=spoke_repo,
+        check=True,
+        capture_output=True,
+        env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t"},
+    )
+    _call(_drop("sigA", str(spoke_repo), "5", "second episode"), env=env)
+
+    out = _call(_read_drop("sigA", str(spoke_repo), "5"), env=env).stdout.strip()
+    assert out == "1\tsecond episode", (
+        "a park at a NEW tip is a new episode even when its signature is identical"
+    )
+
+
+def test_read_answer_drop_empty_for_a_resolved_episode(spoke_repo: Path, tmp_path: Path) -> None:
+    # A record for a PAST (tip, sig) must not leak into a query for the current one — mirrors
+    # _broker_reanswer_exhausted's own stale-context handling.
+    statedir = tmp_path / "sd"
+    env = {"AFK_STATE_DIR": str(statedir)}
+    _call(_drop("sigA", str(spoke_repo), "5", "old episode"), env=env)
+
+    out = _call(_read_drop("sigB", str(spoke_repo), "5"), env=env).stdout.strip()
+    assert out == "", "a different current signature reads as no drop on record"
+
+
+def test_read_answer_drop_empty_when_none_recorded(spoke_repo: Path, tmp_path: Path) -> None:
+    env = {"AFK_STATE_DIR": str(tmp_path / "sd")}
+    assert _call(f"read_answer_drop '{spoke_repo}' 5", env=env).stdout.strip() == ""
+
+
+def test_clear_answer_drop_drops_the_record(spoke_repo: Path, tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    env = {"AFK_STATE_DIR": str(statedir)}
+    _call(_drop("sigA", str(spoke_repo), "5", "x"), env=env)
+    assert (statedir / "answer-drop-5").exists()
+
+    _call("clear_answer_drop 5", env=env)
+
+    assert not (statedir / "answer-drop-5").exists()
+
+
+def test_clear_progress_state_also_clears_answer_drop(tmp_path: Path) -> None:
+    statedir = tmp_path / "sd"
+    statedir.mkdir()
+    (statedir / "answer-drop-5").write_text("abc\txyz\t1\treason\n")
+
+    _call("_clear_progress_state", env={"AFK_STATE_DIR": str(statedir)})
+
+    assert not (statedir / "answer-drop-5").exists()
+
+
 def test_refresh_offline_clocks_stamps_progress_and_answer_attempt(tmp_path: Path) -> None:
     # The idle-clock exclusion for an outage tick: every in-flight spoke gets a fresh progress
     # epoch (soft ceiling) AND answer-attempt epoch (idle clock), so the blackout is not counted
