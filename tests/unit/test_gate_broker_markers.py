@@ -4,12 +4,14 @@ See shared/skills/hub/scripts/gate-broker-markers.sh.
 """
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
 import pytest
 from _gate_broker_support import (
     _call,
+    _perm_env,
 )
 
 
@@ -894,3 +896,71 @@ def test_refresh_offline_clocks_stamps_progress_and_answer_attempt(tmp_path: Pat
     for issue in ("5", "7"):
         assert (statedir / f"progress-{issue}.epoch").read_text().strip() == "1700000000"
         assert (statedir / f"answer-attempt-{issue}.epoch").read_text().strip() == "1700000000"
+
+
+# ── issue #298: the park signature must hash PORTABLY (no bare shasum) ─────────
+#
+# _broker_park_signature hashed its basis with a bare `shasum -a 256`. shasum is a perl
+# script that ships with macOS but NOT with a slim Linux image, where the coreutils
+# spelling `sha256sum` is the one that exists. With shasum absent the pipeline yields
+# EMPTY — and every reader treats an empty signature as "nothing extractable" and
+# fail-opens: note_park_episode records no episode, and _broker_reanswer_exhausted never
+# engages, so the #203/#269 re-answer ceiling silently stops bounding the reasoner and the
+# doom-loop it exists to stop is back. worktree-lib's wt_sha256_stdin (shasum ||
+# sha256sum) exists for exactly this and is in scope here: gate-broker.sh sources
+# worktree-lib.sh before it sources this module.
+#
+# The stub exits WITHOUT reading stdin, mirroring a genuinely missing binary — bash's own
+# command-not-found leaves the piped bytes for the `||` fallback to consume, and a stub
+# that drained stdin first would starve sha256sum and pass a broken fix.
+
+_ABSENT_SHASUM_STUB = "#!/bin/sh\nexit 127\n"
+
+_SHA256SUM_STUB = (
+    "#!/bin/sh\n"
+    "exec python3 -c 'import hashlib,sys;"
+    'print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest() + "  -")\'\n'
+)
+
+
+def _mask_shasum(fake_bin: Path) -> None:
+    """Make PATH look like a slim Linux host: no `shasum`, a working GNU `sha256sum`."""
+    (fake_bin / "shasum").write_text(_ABSENT_SHASUM_STUB)
+    (fake_bin / "shasum").chmod(0o755)
+    (fake_bin / "sha256sum").write_text(_SHA256SUM_STUB)
+    (fake_bin / "sha256sum").chmod(0o755)
+
+
+def test_park_signature_still_hashes_when_shasum_is_absent(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The defect: on a shasum-less host the signature came back EMPTY, which the contract
+    # reads as "ceiling never engages" — the #203/#269 doom-loop, re-enabled silently.
+    env = _perm_env(tmp_path, spoke_repo, "git reset -q", "printf 'ESCALATE: unused'")
+    _mask_shasum(tmp_path / "bin")
+
+    result = _call(f"_broker_park_signature '{spoke_repo}' 5", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert re.fullmatch(r"[0-9a-f]{64}", result.stdout.strip()), (
+        "an absent shasum must fall back to sha256sum, not fail-open to an empty "
+        f"signature that disables the re-answer ceiling: {result.stdout!r}{result.stderr}"
+    )
+
+
+def test_park_signature_is_identical_across_hasher_flavors(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The signature is persisted (_park_sig_file) and keys the re-answer ceiling, so the
+    # digest must depend on the PARK, never on which hasher the host happens to ship —
+    # otherwise the same unchanged park re-stamps its onset the moment the flavor differs.
+    env = _perm_env(tmp_path, spoke_repo, "git reset -q", "printf 'ESCALATE: unused'")
+    expr = f"_broker_park_signature '{spoke_repo}' 5"
+
+    with_shasum = _call(expr, env=env)
+    _mask_shasum(tmp_path / "bin")
+    without_shasum = _call(expr, env=env)
+
+    assert with_shasum.stdout.strip() == without_shasum.stdout.strip(), (
+        "the digest must be hasher-flavor independent"
+    )
