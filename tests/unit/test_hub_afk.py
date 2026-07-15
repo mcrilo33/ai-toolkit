@@ -100,6 +100,13 @@ def _isolated_afk_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     # stub that always reports the network UP (exit 0); the offline-path tests override it to
     # "false" (down), and the fail-open test clears it and points AFK_CURL_BIN at a bogus binary.
     monkeypatch.setenv("AFK_NET_PROBE_CMD", "true")
+    # Neutralize the #279 arm-time liveness self-check by default: afk_arm_selfcheck runs REAL
+    # round trips (a `claude -p` judge probe, a `claude` auth probe, a `gh api` call) before
+    # main() writes state, so without this pin every main()-arming test would fire live network
+    # calls and arm-or-refuse by the host's actual health. Pinning the OPT-OUT (rather than
+    # editing each arming call site) also keeps a future arming test safe by default. The
+    # dedicated self-check tests turn it back on (=1) behind fully stubbed probes.
+    monkeypatch.setenv("AFK_ARM_SELFCHECK", "0")
 
 
 # The #236 gh lifecycle-label mirror is forced OFF for every call: this host has an
@@ -4313,6 +4320,26 @@ def test_reconcile_refuses_when_telemetry_preflight_fails(tmp_path: Path) -> Non
     assert not resp.exists(), "no re-arm when the telemetry preflight fails"
 
 
+def test_reconcile_refuses_when_the_arm_selfcheck_fails(tmp_path: Path) -> None:
+    # #279: reconcile re-runs the SAME gates a fresh arm runs, so the liveness self-check
+    # travels with it -- a crashed supervisor must not be resumed into a dead judge either.
+    resp, wsp, wf = tmp_path / "resp", tmp_path / "wsp", tmp_path / "wf"
+    env = _reconcile_env(tmp_path, resp=resp, wsp=wsp, wf=wf)
+    env["AI_TOOLKIT_OTEL"] = "0"  # isolate: telemetry is not what refuses here
+    hb = env["AFK_HEARTBEAT"]
+    expr = (
+        f'printf "drain\\n" > "{env["AFK_STATE"]}"; '
+        f'dead=$(sh -c "echo \\$$"); printf "%s 1700000000\\n" "$dead" > "{hb}"; '
+        "afk_arm_selfcheck() { return 1; }; "
+        f"afk_reconcile ."
+    )
+
+    result = _call(expr, env=env)
+
+    assert result.returncode == 1, "a failed arm self-check must refuse to re-arm"
+    assert not resp.exists(), "no re-arm when the self-check fails"
+
+
 # ── telemetry preflight (issue #108) ──────────────────────────────────────────
 # The hub's posture is the INVERSE of the spoke's (#106 wt_otel_*_preflight, which
 # warn-and-continue): for an unattended drain the dashboard is the single source of
@@ -6796,6 +6823,161 @@ def test_arm_testmon_check_reports_missing_when_no_pytest_resolves(tmp_path: Pat
     assert result.stdout.split()[0] == "missing", result.stdout + result.stderr
 
 
+# ── issue #279: afk_arm_selfcheck — the ONE arm-time verdict ─────────────────
+# The five probes above are useless unless something runs them before the first dispatch.
+# afk_arm_selfcheck is that seam: chained in main() after the STATIC afk_arm_preconditions and
+# BEFORE afk_write_state, so a hard-fail writes no state and never reaches the loop.
+#
+# Per-check policy (fixed at the plan gate): a dead judge, a dead/offline/unresponsive claude,
+# an unreachable gh API, and a dead telemetry pipeline each BLOCK the arm -- every one of them
+# means the drain cannot do its job. A missing pytest-testmon only WARNS: it degrades the drain
+# to slow-but-correct (every first push runs the full suite), which is not worth refusing over.
+
+
+def _selfcheck_env(tmp_path: Path, **extra: str) -> dict[str, str]:
+    """Every probe stubbed HEALTHY; individual tests break exactly one."""
+    env = {
+        "AFK_ARM_SELFCHECK": "1",  # opt back in (the autouse fixture pins the gate off)
+        "AFK_STATE_DIR": str(tmp_path / "afk-state"),
+        "AFK_JOURNAL_GH_COMMENT": "0",
+        "AFK_JUDGE_SENTINEL": "arm-sentinel",
+        "AFK_JUDGE_CMD": "printf 'VERDICT: safe\\n'",
+        "AFK_NET_PROBE_CMD": "true",
+        "AFK_AUTH_PROBE_CMD": "true",
+        "AFK_TESTMON_PROBE_CMD": "true",
+    }
+    env.update(extra)
+    return env
+
+
+def _run_selfcheck(
+    tmp_path: Path, *, api_exit: int = 0, telemetry_rc: int = 0, **extra: str
+) -> subprocess.CompletedProcess[str]:
+    # afk_telemetry_preflight is stubbed rather than driven: its collector/bridge machinery has
+    # its own tests above, and what this seam owns is whether the RESULT is folded into the one
+    # verdict -- not how the ports come up.
+    fake_bin = _gh_api_stub(tmp_path, auth_exit=0, api_exit=api_exit)
+    env = _selfcheck_env(tmp_path, PATH=f"{fake_bin}:{os.environ['PATH']}", **extra)
+    expr = (
+        f"afk_telemetry_preflight() {{ return {telemetry_rc}; }}; "
+        "afk_arm_selfcheck /repo; echo RC=$?"
+    )
+    return _call(expr, env=env)
+
+
+def test_selfcheck_healthy_host_logs_one_ok_line_covering_all_five(tmp_path: Path) -> None:
+    result = _run_selfcheck(tmp_path)
+
+    assert "RC=0" in result.stdout, result.stdout + result.stderr
+    ok_lines = [ln for ln in result.stderr.splitlines() if "arm self-check OK" in ln]
+    assert len(ok_lines) == 1, f"exactly ONE arm-time verdict line, got: {ok_lines}"
+    line = ok_lines[0]
+    for dependency in ("judge", "claude", "gh", "testmon", "telemetry"):
+        assert dependency in line, f"the OK line must name {dependency}: {line!r}"
+
+
+def test_selfcheck_refuses_on_a_dead_judge(tmp_path: Path) -> None:
+    # THE #268 acceptance criterion: a structurally-dead judge never silently dispatches.
+    result = _run_selfcheck(tmp_path, AFK_JUDGE_CMD="exit 3")
+
+    assert "RC=1" in result.stdout, "a dead judge must refuse the arm"
+    assert "judge" in result.stderr
+
+
+def test_selfcheck_refuses_on_the_268_judge_timeout(tmp_path: Path) -> None:
+    # The literal #268 reproduction named in the issue's acceptance criteria: a budget too
+    # short for a `claude -p` cold start. It must refuse, and say the budget timed out.
+    result = _run_selfcheck(tmp_path, AFK_JUDGE_CMD="sleep 5", AFK_JUDGE_TIMEOUT="1")
+
+    assert "RC=1" in result.stdout, "a judge that cannot answer in budget must refuse the arm"
+    assert "timed out" in result.stderr, result.stderr
+
+
+def test_selfcheck_refuses_on_auth_dead_claude(tmp_path: Path) -> None:
+    result = _run_selfcheck(
+        tmp_path,
+        AFK_AUTH_PROBE_CMD='sh -c "echo \\"Invalid API key - please run /login\\"; exit 1"',
+    )
+
+    assert "RC=1" in result.stdout, "a dead subscription token must refuse the arm"
+    assert "auth" in result.stderr.lower()
+
+
+def test_selfcheck_refuses_when_offline_with_a_distinct_message(tmp_path: Path) -> None:
+    # #249's distinction survives to arm-time: an offline host is told it is OFFLINE, not that
+    # its token is dead -- they have completely different remedies.
+    result = _run_selfcheck(tmp_path, AFK_NET_PROBE_CMD="false")
+
+    assert "RC=1" in result.stdout
+    assert "offline" in result.stderr.lower() or "network" in result.stderr.lower(), result.stderr
+    assert "token" not in result.stderr.lower(), "an offline host must not be blamed on auth"
+
+
+def test_selfcheck_refuses_on_an_unresponsive_claude(tmp_path: Path) -> None:
+    result = _run_selfcheck(tmp_path, AFK_AUTH_PROBE_CMD="definitely-not-a-real-binary")
+
+    assert "RC=1" in result.stdout, "an absent/wedged claude must refuse the arm"
+
+
+def test_selfcheck_refuses_when_the_gh_api_is_unreachable(tmp_path: Path) -> None:
+    result = _run_selfcheck(tmp_path, api_exit=1)
+
+    assert "RC=1" in result.stdout, "a token-valid-but-API-down host must refuse the arm"
+    assert "gh" in result.stderr
+
+
+def test_selfcheck_refuses_when_the_telemetry_pipeline_is_down(tmp_path: Path) -> None:
+    # The collector keeps its existing hard-fail, folded into the one verdict.
+    result = _run_selfcheck(tmp_path, telemetry_rc=1)
+
+    assert "RC=1" in result.stdout, "a dead telemetry pipeline must refuse the arm"
+
+
+def test_selfcheck_warns_but_arms_on_missing_testmon(tmp_path: Path) -> None:
+    # The one WARN-only check: slow-but-correct is not worth refusing over.
+    result = _run_selfcheck(tmp_path, AFK_TESTMON_PROBE_CMD="false")
+
+    assert "RC=0" in result.stdout, "missing testmon must NOT block the arm"
+    assert "testmon" in result.stderr
+    assert "DEGRADED" in result.stderr, "a missing testmon must be LOUD, not silent"
+    assert "full suite" in result.stderr, "name the consequence the operator will feel"
+
+
+def test_selfcheck_ok_line_reports_the_testmon_degradation(tmp_path: Path) -> None:
+    # The single verdict line must stay honest about the degraded dependency, not print a
+    # clean "OK ... testmon present" while a warning scrolls past above it.
+    result = _run_selfcheck(tmp_path, AFK_TESTMON_PROBE_CMD="false")
+
+    ok_lines = [ln for ln in result.stderr.splitlines() if "arm self-check" in ln and "OK" in ln]
+    assert len(ok_lines) == 1, ok_lines
+    assert "MISSING" in ok_lines[0], f"the verdict line must name the degradation: {ok_lines[0]!r}"
+
+
+def test_selfcheck_opt_out_runs_no_probe_at_all(tmp_path: Path) -> None:
+    # AFK_ARM_SELFCHECK=0 must skip every probe, not just ignore their verdicts: the probes
+    # cost ~2 minutes of real round trips, which is the whole reason the opt-out exists.
+    fired = tmp_path / "judge-fired"
+    result = _run_selfcheck(
+        tmp_path,
+        AFK_ARM_SELFCHECK="0",
+        FIRED=str(fired),
+        AFK_JUDGE_CMD='sh -c "touch \\"$FIRED\\"; exit 3"',
+    )
+
+    assert "RC=0" in result.stdout, "the opt-out must arm"
+    assert not fired.exists(), "the opt-out must not run the probes at all"
+
+
+def test_selfcheck_reports_telemetry_opt_out_rather_than_claiming_it_is_wired(
+    tmp_path: Path,
+) -> None:
+    result = _run_selfcheck(tmp_path, AI_TOOLKIT_OTEL="0")
+
+    ok_lines = [ln for ln in result.stderr.splitlines() if "arm self-check OK" in ln]
+    assert len(ok_lines) == 1, ok_lines
+    assert "off" in ok_lines[0], f"telemetry opted out must read as off: {ok_lines[0]!r}"
+
+
 # ── ST5: the kickoff seeds /source-task, not the nonexistent /source ──────────
 
 
@@ -8770,6 +8952,91 @@ def test_watchdog_live_arms_the_inhibitor(tmp_path: Path) -> None:
         assert pidfile.read_text().split()[0].isdigit()
     finally:
         _kill_inhibitor(pidfile)
+
+
+# ── #279: main() refuses to arm when the liveness self-check hard-fails ───────
+# The issue's central acceptance criterion. afk_arm_selfcheck is chained BEFORE
+# afk_write_state, so a hard-fail leaves NO state file: nothing to reconcile, no half-armed
+# window, and above all not one spoke dispatched into the dead dependency.
+
+
+def _arm_neuter() -> str:
+    """Neuter the supervisor loop so main() arms (or refuses) and exits without dispatching.
+
+    afk_done returns 1 (never "done") and the tick's idle wait exits the shell, so the loop
+    stops after arming with the state file INTACT — an afk_done of 0 would run the done branch,
+    which calls afk_clear_state and would delete the very state these tests assert on.
+
+    The exit stub must replace afk_interruptible_sleep, NOT `sleep`: the wrapper backgrounds
+    its timer (`sleep "$secs" & wait "$t"`), so a `sleep` function stub would exit only the
+    forked subshell, `wait` would return instantly, and the loop would spin forever.
+    """
+    return (
+        "afk_arm_preconditions() { return 0; }; supervise_tick() { return 0; }; "
+        "dispatch_batch() { :; }; _afk_spawn_watchdog() { :; }; _afk_arm_inhibitor() { :; }; "
+        "afk_done() { return 1; }; afk_interruptible_sleep() { exit 0; }; "
+    )
+
+
+def test_main_writes_no_state_when_the_selfcheck_hard_fails(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+
+    result = _call(
+        f"{_arm_neuter()}afk_arm_selfcheck() {{ return 1; }}; main 30m; echo RC=$?",
+        env={"AFK_STATE": str(state), "AFK_ARM_PRECHECK": "0", "AI_TOOLKIT_OTEL": "0"},
+    )
+
+    assert not state.exists(), (
+        "a failed arm self-check must write NO state — a half-armed window would leave the "
+        "drain looking armed with nothing draining"
+    )
+    assert "RC=2" in result.stdout, f"main must refuse with exit 2: {result.stdout!r}"
+
+
+def test_main_arms_normally_when_the_selfcheck_passes(tmp_path: Path) -> None:
+    # The other half: a healthy host is not blocked by the new gate.
+    state = tmp_path / "state"
+
+    _call(
+        f"{_arm_neuter()}afk_arm_selfcheck() {{ return 0; }}; main 30m",
+        env={"AFK_STATE": str(state), "AFK_ARM_PRECHECK": "0", "AI_TOOLKIT_OTEL": "0"},
+    )
+
+    assert state.exists(), "a passing self-check must arm normally"
+
+
+def test_main_runs_the_selfcheck_before_writing_state(tmp_path: Path) -> None:
+    # Ordering is the whole safety property: if the self-check ran AFTER afk_write_state, a
+    # refusal would leave a state file behind and the watchdog would resume the window.
+    state = tmp_path / "state"
+    seen = tmp_path / "state-at-selfcheck-time"
+
+    _call(
+        f"{_arm_neuter()}"
+        f'afk_arm_selfcheck() {{ [ -f "{state}" ] && printf yes > "{seen}" || printf no > "{seen}"; '
+        "return 0; }; main 30m",
+        env={"AFK_STATE": str(state), "AFK_ARM_PRECHECK": "0", "AI_TOOLKIT_OTEL": "0"},
+    )
+
+    assert seen.read_text() == "no", "the self-check must run BEFORE afk_write_state"
+
+
+def test_main_selfcheck_runs_after_the_static_preconditions(tmp_path: Path) -> None:
+    # Cheap static refusals (dirty tree, off-base HEAD, a live supervisor) must fire FIRST:
+    # they are instant, while the self-check costs ~2 minutes of real round trips. A dirty
+    # checkout should never wait on a judge probe to be told to commit its work.
+    state = tmp_path / "state"
+    probed = tmp_path / "probed"
+
+    result = _call(
+        f"{_arm_neuter()}afk_arm_preconditions() {{ return 1; }}; "
+        f'afk_arm_selfcheck() {{ touch "{probed}"; return 0; }}; main 30m; echo RC=$?',
+        env={"AFK_STATE": str(state), "AI_TOOLKIT_OTEL": "0"},
+    )
+
+    assert "RC=2" in result.stdout
+    assert not probed.exists(), "a static precondition failure must refuse before probing"
+    assert not state.exists()
 
 
 # ── the inhibitor --status line + arm-time power warnings (issue #242) ─────────
