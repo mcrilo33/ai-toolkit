@@ -6569,11 +6569,11 @@ def test_arm_claude_check_reports_auth_dead(tmp_path: Path) -> None:
 
 def test_arm_claude_check_uses_the_arm_time_budget_not_the_reap_one(tmp_path: Path) -> None:
     # A cold arm-time round trip needs a budget between the reap probe's 30s and the answerer's
-    # 900s, so AFK_ARM_AUTH_TIMEOUT must actually reach _afk_auth_is_dead (which reads
-    # AFK_AUTH_PROBE_TIMEOUT). Observable via a probe that only speaks after a delay: a budget
-    # that kills it first yields no auth signature (fail-open "alive"), a budget that lets it
-    # finish yields "auth-dead". If the override were ignored, the 30s default would let it
-    # finish in BOTH cases and the first assert would read auth-dead.
+    # 900s, so AFK_ARM_AUTH_TIMEOUT must actually bound the probe. Observable via a probe that
+    # only speaks after a delay: a budget that kills it first never sees the auth signature (so
+    # the state is `unresponsive` -- the CLI proved nothing), while a budget that lets it finish
+    # reads the signature and reports `auth-dead`. If the override were ignored, the default
+    # would let it finish in BOTH cases and the first assert would read auth-dead.
     slow_auth_failure = 'sh -c "sleep 2; echo \\"Invalid API key\\"; exit 1"'
 
     tight = _call(
@@ -6593,8 +6593,75 @@ def test_arm_claude_check_uses_the_arm_time_budget_not_the_reap_one(tmp_path: Pa
         },
     )
 
-    assert tight.stdout.strip() == "alive", "a 1s arm budget must cut the probe off"
+    assert tight.stdout.strip() == "unresponsive", "a 1s arm budget must cut the probe off"
     assert generous.stdout.strip() == "auth-dead", "a 20s arm budget must let it answer"
+
+
+def test_arm_claude_check_fails_closed_when_the_cli_is_absent(tmp_path: Path) -> None:
+    # THE fail-open the #279 review caught, and the reason this check does not call
+    # _afk_probe_state. That helper reads a nonzero exit WITHOUT an auth signature as "alive"
+    # -- correct at REAP time (a hiccup must not halt a drain already doing useful work), fatal
+    # at ARM time. A `claude` that is not on PATH exits 127 with no signature, so reusing the
+    # reap tri-state verbatim ARMED CLEAN into a host with no CLI at all: every spoke would
+    # then dispatch, park, and escalate to blocked. An arm gate must prove liveness, not merely
+    # fail to disprove it.
+    result = _call(
+        "_afk_arm_claude_check; echo RC=$?",
+        env={"AFK_NET_PROBE_CMD": "true", "AFK_AUTH_PROBE_CMD": "definitely-not-a-real-binary"},
+    )
+
+    assert result.stdout.split()[0] == "unresponsive", (
+        f"an absent CLI must never read as alive: {result.stdout!r}"
+    )
+    assert "RC=1" in result.stdout, "the arm-time claude check must fail CLOSED"
+
+
+def test_arm_claude_check_fails_closed_when_the_cli_is_wedged(tmp_path: Path) -> None:
+    # The same polarity for a CLI that hangs past its budget: killed at the bound, it proved
+    # nothing, so it must not report alive.
+    result = _call(
+        "_afk_arm_claude_check; echo RC=$?",
+        env={
+            "AFK_NET_PROBE_CMD": "true",
+            "AFK_AUTH_PROBE_CMD": "sleep 30",
+            "AFK_ARM_AUTH_TIMEOUT": "1",
+        },
+    )
+
+    assert result.stdout.split()[0] == "unresponsive", result.stdout
+    assert "RC=1" in result.stdout
+
+
+def test_arm_claude_check_ignores_a_non_numeric_budget(tmp_path: Path) -> None:
+    # A typo must never silently LIFT the bound (an unbounded arm-time probe could hang the
+    # arm forever) -- it falls back to the default, mirroring _judge_timeout's discipline.
+    result = _call(
+        "_afk_arm_claude_check; echo RC=$?",
+        env={
+            "AFK_NET_PROBE_CMD": "true",
+            "AFK_AUTH_PROBE_CMD": "true",
+            "AFK_ARM_AUTH_TIMEOUT": "two minutes",
+        },
+    )
+
+    assert result.stdout.split()[0] == "alive", result.stdout + result.stderr
+    assert "RC=0" in result.stdout
+
+
+def test_arm_claude_check_honors_an_operator_raised_global_budget(tmp_path: Path) -> None:
+    # An operator who already raised AFK_AUTH_PROBE_TIMEOUT for a slow host must not have the
+    # arm silently narrow it back to the 120s default. With a 2s probe and a 20s global, the
+    # probe finishes and reports auth-dead; a hard-coded 1s would report unresponsive.
+    result = _call(
+        "_afk_arm_claude_check",
+        env={
+            "AFK_NET_PROBE_CMD": "true",
+            "AFK_AUTH_PROBE_CMD": 'sh -c "sleep 2; echo \\"Invalid API key\\"; exit 1"',
+            "AFK_AUTH_PROBE_TIMEOUT": "20",
+        },
+    )
+
+    assert result.stdout.strip() == "auth-dead", result.stdout + result.stderr
 
 
 def _gh_api_stub(tmp_path: Path, *, auth_exit: int, api_exit: int) -> Path:
@@ -6651,51 +6718,82 @@ def test_arm_testmon_check_reports_missing(tmp_path: Path) -> None:
     assert "RC=1" in result.stdout
 
 
-def _fake_utils_lib(tmp_path: Path, *, runner_help: str) -> Path:
-    """A stub utils.sh whose detect_pytest resolves a fake runner printing `runner_help`."""
-    fake_bin = tmp_path / "fakebin"
-    fake_bin.mkdir(exist_ok=True)
-    runner = fake_bin / "fake-pytest"
-    runner.write_text(f"#!/usr/bin/env bash\ncat <<'HELP'\n{runner_help}\nHELP\n")
+def _venv_pytest(tmp_path: Path, *, help_text: str, exit_code: int = 0) -> Path:
+    """A repo root whose .venv/bin/pytest is a fake runner printing `help_text`.
+
+    Drives the probe's REAL resolution ladder (the venv rung, which detect_pytest and
+    test-select.sh also try first) rather than stubbing the resolution away.
+    """
+    repo = tmp_path / "repo"
+    (repo / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+    runner = repo / ".venv" / "bin" / "pytest"
+    runner.write_text(f"#!/usr/bin/env bash\ncat <<'HELP'\n{help_text}\nHELP\nexit {exit_code}\n")
     runner.chmod(0o755)
-    utils = tmp_path / "utils.sh"
-    utils.write_text(f'detect_pytest() {{ echo "{runner}"; }}\n')
-    return utils
+    return repo
 
 
 def test_arm_testmon_check_detects_a_runner_without_testmon(tmp_path: Path) -> None:
-    # The real default path: resolve the runner via the canonical detect_pytest, then ask the
-    # runner itself. This mirrors exactly how test-select.sh decides to degrade, so the probe
-    # agrees with the gate it is warning about (a runner lacking testmon => every first push
-    # per worktree runs the full multi-thousand-test suite).
-    utils = _fake_utils_lib(tmp_path, runner_help="usage: pytest [options]\n  -k EXPRESSION")
+    # The real default path: resolve the runner, then ask the RUNNER ITSELF. This mirrors
+    # exactly how test-select.sh decides to degrade, so the probe agrees with the gate it is
+    # warning about (a runner lacking testmon => every first push runs the full suite).
+    repo = _venv_pytest(tmp_path, help_text="usage: pytest [options]\n  -k EXPRESSION")
 
-    result = _call("_afk_arm_testmon_check .; echo RC=$?", env={"AFK_UTILS_LIB": str(utils)})
+    result = _call(f"_afk_arm_testmon_check '{repo}'; echo RC=$?")
 
     assert result.stdout.split()[0] == "missing", result.stdout + result.stderr
+    assert "RC=1" in result.stdout
 
 
 def test_arm_testmon_check_accepts_a_runner_advertising_testmon(tmp_path: Path) -> None:
-    utils = _fake_utils_lib(
-        tmp_path, runner_help="usage: pytest [options]\n  --testmon  select affected tests"
+    repo = _venv_pytest(
+        tmp_path, help_text="usage: pytest [options]\n  --testmon  select affected tests"
     )
 
-    result = _call("_afk_arm_testmon_check .; echo RC=$?", env={"AFK_UTILS_LIB": str(utils)})
+    result = _call(f"_afk_arm_testmon_check '{repo}'; echo RC=$?")
+
+    assert result.stdout.split()[0] == "ok", result.stdout + result.stderr
+    assert "RC=0" in result.stdout
+
+
+def test_arm_testmon_check_reports_unknown_when_the_runner_will_not_answer(
+    tmp_path: Path,
+) -> None:
+    # A runner that resolves but produces nothing (crashed, wedged, killed at the bound) must
+    # NEVER read as `missing`: testmon is WARN-only, and a probe with no evidence must not
+    # manufacture a warning. This is the branch a sourced utils.sh silently broke -- its
+    # source-time `ai_toolkit_enabled || exit 0` (#154) exited the probe with status 0, which
+    # an rc-based mapping read as a clean `ok` from a probe that had run nothing at all.
+    repo = _venv_pytest(tmp_path, help_text="", exit_code=1)
+
+    result = _call(f"_afk_arm_testmon_check '{repo}'; echo RC=$?")
+
+    assert result.stdout.split()[0] == "unknown", result.stdout + result.stderr
+
+
+def test_arm_testmon_check_survives_a_repo_path_containing_a_space(tmp_path: Path) -> None:
+    # The runner is invoked as its own argv, never word-split from a resolved string, so a
+    # worktree under e.g. "~/My Repos/" cannot shred the command into a bogus one.
+    spaced = tmp_path / "my repos"
+    spaced.mkdir()
+    repo = _venv_pytest(spaced, help_text="usage: pytest\n  --testmon  select affected tests")
+
+    result = _call(f"_afk_arm_testmon_check '{repo}'; echo RC=$?")
 
     assert result.stdout.split()[0] == "ok", result.stdout + result.stderr
 
 
-def test_arm_testmon_check_reports_unknown_when_the_runner_cannot_be_resolved(
-    tmp_path: Path,
-) -> None:
-    # An unresolvable utils.sh must NEVER read as `missing`: testmon is a WARN-only check, and
-    # a probe that cannot run must not manufacture a warning it has no evidence for.
+def test_arm_testmon_check_reports_missing_when_no_pytest_resolves(tmp_path: Path) -> None:
+    # No runner at all: certainly no testmon, so the first push cannot be testmon-selected.
+    # Still WARN-only here -- a runner-less checkout is the PUSH gate's business (#213 fails
+    # that closed), not the arm's.
+    empty = tmp_path / "no-venv"
+    empty.mkdir()
     result = _call(
-        "_afk_arm_testmon_check .; echo RC=$?",
-        env={"AFK_UTILS_LIB": str(tmp_path / "nope.sh")},
+        f"_afk_arm_testmon_check '{empty}'; echo RC=$?",
+        env={"PATH": "/nonexistent-bin-dir"},  # no pytest, no python3 on PATH
     )
 
-    assert result.stdout.split()[0] == "unknown", result.stdout + result.stderr
+    assert result.stdout.split()[0] == "missing", result.stdout + result.stderr
 
 
 # ── ST5: the kickoff seeds /source-task, not the nonexistent /source ──────────

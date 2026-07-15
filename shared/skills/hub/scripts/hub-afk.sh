@@ -73,7 +73,7 @@
 #   AFK_TESTMON_PROBE_CMD        override the whole pytest-testmon probe (tests); rc 0 ⇒ present.
 #                                Missing testmon WARNS (every first push degrades to the full
 #                                suite) — it never blocks the arm (#279)
-#   AFK_UTILS_LIB                override the sourced shared/hooks/lib/utils.sh (detect_pytest)
+#   AFK_TESTMON_PROBE_TIMEOUT=60 seconds bounding the testmon probe's runner --help call (#279)
 #   AFK_JUDGE_SENTINEL           the benign command the arm-time judge probe classifies (#279);
 #                                see gate-broker-danger.sh (AFK_JUDGE_TIMEOUT bounds it)
 #   AFK_AUTH_PROBE_CMD           auth probe: reap-time AND the #241 §9 per-tick auth-halt re-probe (default: a bounded headless claude no-op)
@@ -3389,21 +3389,41 @@ _afk_arm_judge_check() {
   return "$rc"
 }
 
-# _afk_arm_claude_check -> print the #249 tri-state (offline | auth-dead | alive); rc 0 only
-# when alive. Reuses _afk_probe_state verbatim so arm-time inherits the reap-time distinction
-# between a connectivity blackout and a dead subscription token -- a merely-offline host must
-# never be reported as "your token is dead".
+# _afk_arm_claude_check -> print offline | auth-dead | unresponsive | alive; rc 0 ONLY for
+# alive. Reuses #249's machinery -- _afk_network_is_down first (so a connectivity blackout is
+# never reported as "your token is dead"), the same AFK_AUTH_PROBE_CMD seam, and the same
+# is_auth_failure signature detector -- but it deliberately does NOT call _afk_probe_state.
 #
-# The one arm-time difference is the BUDGET. The reap probe's 30s bounds a warm, repeated tick
-# check; an arm-time round trip is COLD (CLI start + model round trip), the same cold start
-# whose 2s bound caused #268. AFK_ARM_AUTH_TIMEOUT (120s) sits between that 30s and the
-# answerer's 900s. Assigning it as a `local` hands it to _afk_auth_is_dead through bash's
-# dynamic scoping without disturbing the reap-time default anywhere else.
+# WHY NOT: _afk_probe_state fails OPEN by design. A nonzero exit WITHOUT an auth signature --
+# `claude` absent from PATH, a wedged CLI, a probe killed at its budget -- reads as "alive"
+# there, and that is CORRECT at reap time: a transient hiccup must never halt a drain that is
+# already running and doing useful work. An ARM-time gate needs the opposite polarity: it must
+# refuse unless liveness is PROVEN, because arming wrong dispatches every spoke into a
+# dependency that cannot answer. Reusing it verbatim made this check pass on exactly the
+# conditions it exists to catch (verified: a nonexistent probe binary reported alive/rc 0),
+# which is the #268 failure class the arm-time self-check was added to close. The sibling
+# probes (gh, judge) already fail closed; this one was the lone hole.
+#
+# So: rc 0 is POSITIVE PROOF the CLI answered -> alive. A nonzero exit carrying an auth
+# signature -> auth-dead (the recoverable, operator-actionable state). Any other nonzero ->
+# unresponsive, a FOURTH state the reap path has no need for and does not see.
+#
+# The budget is the other arm-time difference. The reap probe's 30s bounds a warm, repeated
+# tick check; an arm-time round trip is COLD (CLI start + model round trip) -- the same cold
+# start whose 2s bound caused #268. AFK_ARM_AUTH_TIMEOUT (120s) sits between that 30s and the
+# answerer's 900s, and an operator who already raised AFK_AUTH_PROBE_TIMEOUT globally is
+# honored rather than silently narrowed back down.
 _afk_arm_claude_check() {
-  local AFK_AUTH_PROBE_TIMEOUT="${AFK_ARM_AUTH_TIMEOUT:-120}" state
-  state="$(_afk_probe_state)"
-  printf '%s\n' "$state"
-  [ "$state" = "alive" ]
+  local secs cmd raw rc
+  secs="${AFK_ARM_AUTH_TIMEOUT:-${AFK_AUTH_PROBE_TIMEOUT:-120}}"
+  case "$secs" in '' | *[!0-9]*) secs=120 ;; esac   # never let a typo lift the bound
+  [ "$secs" -lt 1 ] && secs=120
+  if _afk_network_is_down; then printf 'offline\n'; return 1; fi
+  cmd="${AFK_AUTH_PROBE_CMD:-claude -p --no-session-persistence --model claude-opus-4-8 ok}"
+  raw="$(_afk_with_timeout "$secs" bash -c "$cmd" 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ]; then printf 'alive\n'; return 0; fi
+  if is_auth_failure "$raw"; then printf 'auth-dead\n'; return 1; fi
+  printf 'unresponsive\n'; return 1
 }
 
 # _afk_arm_gh_check -> rc 0 when a bounded REAL gh API round trip succeeds. afk_arm_preconditions
@@ -3416,72 +3436,55 @@ _afk_arm_gh_check() {
     >/dev/null 2>&1
 }
 
-# _afk_utils_lib -> the shared hooks utils.sh (home of the canonical detect_pytest), or empty.
-# Resolution covers all three layouts, mirroring the worktree-lib/gate-broker loops above: an
-# explicit override (tests), a synced target's co-located copy, the ai-toolkit checkout's
-# shared/hooks/lib/, and the repo top-level (the #262 fallback -- the self-copy supervisor's
-# SCRIPT_DIR points at a temp dir holding only hub-afk.sh, so a relative walk fails there).
-_afk_utils_lib() {
-  local c
-  # An EXPLICIT override is AUTHORITATIVE: unlike the source-time loops above (where a stale
-  # override silently falls through to the next candidate), a typo'd AFK_UTILS_LIB must fail
-  # the resolve rather than quietly probe a DIFFERENT lib -- that would both hide the
-  # operator's mistake and make the unresolvable branch untestable, since the real utils.sh
-  # always exists in a checkout.
-  if [ -n "${AFK_UTILS_LIB:-}" ]; then
-    [ -f "$AFK_UTILS_LIB" ] && { printf '%s\n' "$AFK_UTILS_LIB"; return 0; }
-    return 1
-  fi
-  for c in \
-    "$SCRIPT_DIR/utils.sh" \
-    "$SCRIPT_DIR/../../../hooks/lib/utils.sh" \
-    "${_AFK_TOPLEVEL:-}/shared/hooks/lib/utils.sh"; do
-    if [ -f "$c" ]; then printf '%s\n' "$c"; return 0; fi
-  done
-  return 1
-}
-
 # _afk_arm_testmon_check [repo_root] -> print ok | missing | unknown; rc 0 only for ok.
 # Without pytest-testmon the pre-push gate cannot select affected tests, so EVERY first push
 # per worktree degrades to the full multi-thousand-test suite -- slow-but-correct, which is why
 # the caller warns rather than blocks. DETECTION ONLY: never install anything.
 #
-# The default probe resolves the runner through the canonical detect_pytest and then asks the
-# RUNNER ITSELF (`--help` advertises --testmon when the plugin is installed) -- the exact check
-# test-select.sh and gate-sweep.sh use to decide the degrade, so this probe can never disagree
-# with the gate it is warning about. It runs in a SUBSHELL so sourcing utils.sh leaks nothing
-# into the supervisor. `unknown` (utils.sh or detect_pytest unresolvable) is deliberately NOT
-# `missing`: a probe that cannot run must not manufacture a warning it has no evidence for.
-# AFK_TESTMON_PROBE_CMD overrides the whole probe (rc 0 => ok) for tests.
+# The runner ladder deliberately MIRRORS shared/hooks/lib/utils.sh's detect_pytest instead of
+# sourcing it. utils.sh is a HOOK lib with source-time side effects that are wrong in a
+# supervisor: `set -euo pipefail`, an `ai_toolkit_enabled || exit 0` off-switch (#154), and
+# telemetry_arm_hook_span's EXIT trap. Sourcing it made this probe report a FALSE "ok" -- the
+# off-marker's `exit 0` is not catchable by a `|| exit 3` guard, so a probe that ran NOTHING
+# read as a clean pass -- and a false "missing" when the lib's own source-time work failed. It
+# is also unreachable in a synced target (sync-to-repo.sh co-locates only telemetry/base-branch/
+# enabled next to hub-afk.sh; utils.sh ships to the platform hooks dir), so the probe would be
+# permanently `unknown` on every deployed hub. Four lines of duplication beat all of that.
+# UPGRADE: if detect_pytest ever grows a rung, mirror it here -- a drift only mis-WARNS.
+#
+# Each rung invokes its own argv rather than word-splitting a resolved string, so a repo path
+# containing a space cannot shred the command. The runner is asked whether it advertises
+# --testmon -- the exact check test-select.sh and gate-sweep.sh use to decide the degrade, so
+# this probe can never disagree with the gate it is warning about. `--help` is captured then
+# case-matched, never piped to `grep -q`, which would SIGPIPE the runner under pipefail and
+# falsely report testmon absent (the trap test-select.sh documents).
+#
+# `unknown` (a runner that will not answer) is deliberately NOT `missing`: a probe with no
+# evidence must not manufacture a warning. AFK_TESTMON_PROBE_CMD overrides the whole probe
+# (rc 0 => ok) for tests.
 _afk_arm_testmon_check() {
-  local repo_root="${1:-.}" utils rc
+  local repo_root="${1:-.}" venv secs help=""
+  secs="${AFK_TESTMON_PROBE_TIMEOUT:-60}"
+  case "$secs" in '' | *[!0-9]*) secs=60 ;; esac
   if [ -n "${AFK_TESTMON_PROBE_CMD:-}" ]; then
-    if _afk_with_timeout "${AFK_TESTMON_PROBE_TIMEOUT:-60}" \
-         bash -c "$AFK_TESTMON_PROBE_CMD" >/dev/null 2>&1; then
+    if _afk_with_timeout "$secs" bash -c "$AFK_TESTMON_PROBE_CMD" >/dev/null 2>&1; then
       printf 'ok\n'; return 0
     fi
     printf 'missing\n'; return 1
   fi
-  utils="$(_afk_utils_lib)" || { printf 'unknown\n'; return 1; }
-  (
-    # shellcheck disable=SC1090
-    . "$utils" 2>/dev/null || exit 3
-    command -v detect_pytest >/dev/null 2>&1 || exit 3
-    runner="$(detect_pytest "$repo_root" || true)"
-    [ -n "$runner" ] || exit 4
-    # detect_pytest may return a multi-word prefix ("python3 -m pytest") -- split it.
-    read -r -a runner_arr <<< "$runner"
-    # Capture --help then case-match: a piped `grep -q` would SIGPIPE the runner under
-    # pipefail and falsely report testmon absent (the trap test-select.sh documents).
-    help="$("${runner_arr[@]}" --help 2>/dev/null || true)"
-    case "$help" in *--testmon*) exit 0 ;; *) exit 1 ;; esac
-  ) >/dev/null 2>&1
-  rc=$?
-  case "$rc" in
-    0) printf 'ok\n'; return 0 ;;
-    1 | 4) printf 'missing\n'; return 1 ;;   # runner lacks testmon, or no pytest at all
-    *) printf 'unknown\n'; return 1 ;;       # the probe itself could not run
-  esac
+  venv="$repo_root/.venv/bin/pytest"
+  if [ -x "$venv" ]; then
+    help="$(_afk_with_timeout "$secs" "$venv" --help 2>/dev/null)"
+  elif command -v pytest >/dev/null 2>&1; then
+    help="$(_afk_with_timeout "$secs" pytest --help 2>/dev/null)"
+  elif command -v python3 >/dev/null 2>&1 && python3 -c 'import pytest' >/dev/null 2>&1; then
+    help="$(_afk_with_timeout "$secs" python3 -m pytest --help 2>/dev/null)"
+  else
+    printf 'missing\n'; return 1        # no pytest resolves at all -> certainly no testmon
+  fi
+  [ -n "$help" ] || { printf 'unknown\n'; return 1; }   # the runner would not answer
+  case "$help" in *--testmon*) printf 'ok\n'; return 0 ;; esac
+  printf 'missing\n'; return 1
 }
 
 # --- arm preconditions (issue #170 ST4) ---------------------------------------
