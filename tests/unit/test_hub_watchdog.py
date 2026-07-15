@@ -275,7 +275,9 @@ def test_daemon_recycles_a_live_daemon_running_a_stale_generation(tmp_path: Path
         "a live daemon PROVEN stale (recorded gen != current origin hash) must be recycled, "
         "not deferred to forever"
     )
-    assert (tmp_path / "ticks").read_text() == "1", "the reclaiming daemon actually ran a tick"
+    # "L" then off-to-exhaustion: one live tick + 3 idle ticks (the default idle grace) before
+    # the loop tears itself down — same shape as test_daemon_reclaims_stale_pidfile's "3".
+    assert (tmp_path / "ticks").read_text() == "4", "the reclaiming daemon actually ran the loop"
     assert genfile.read_text() == "FRESH", "the new daemon stamps its own (current) generation"
 
 

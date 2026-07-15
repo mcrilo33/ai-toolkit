@@ -2962,7 +2962,7 @@ _afk_watchdog_respawn() {
 # (.ai-toolkit/scripts/hub-afk.sh), and scripts/worktree-land.sh all hit. AFK_SELFUPDATE_SCOPE
 # overrides the whole set (tests / operator tuning).
 _afk_selfupdate_scope_paths() {
-  printf '%s\n' "${AFK_SELFUPDATE_SCOPE:-hub-afk.sh gate-broker.sh hub-notify.sh worktree-lib.sh worktree-land.sh batch-plan.sh afk-answering.md ai-toolkit.yml}"
+  printf '%s\n' "${AFK_SELFUPDATE_SCOPE:-hub-afk.sh hub-watchdog.sh gate-broker.sh hub-notify.sh worktree-lib.sh worktree-land.sh batch-plan.sh afk-answering.md ai-toolkit.yml}"
 }
 
 # _afk_paths_in_scope <newline-separated paths> -> true when ANY path's basename is in the
@@ -3035,6 +3035,7 @@ _afk_selfupdate_source_scripts() {
   local root="${1:-${MAIN_ROOT:-.}}"
   printf '%s\n' \
     "$root/shared/skills/hub/scripts/hub-afk.sh" \
+    "$root/shared/skills/hub/scripts/hub-watchdog.sh" \
     "$root/shared/skills/hub/scripts/gate-broker.sh" \
     "$root/shared/skills/hub/scripts/hub-notify.sh" \
     "$root/shared/skills/hub/scripts/batch-plan.sh" \

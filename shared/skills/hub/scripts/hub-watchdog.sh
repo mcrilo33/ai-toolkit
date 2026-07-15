@@ -154,6 +154,10 @@ _wd_common_dir() {
 }
 _wd_pidfile()   { printf '%s\n' "${HUB_WATCHDOG_PIDFILE:-$(_wd_common_dir)/hub-watchdog.pid}"; }
 _wd_logfile()   { printf '%s\n' "${HUB_WATCHDOG_LOG:-$(_wd_common_dir)/hub-watchdog.log}"; }
+# The generation stamp: the origin source hash the CURRENTLY-armed daemon booted with (#296
+# AC2). Lets a fresh arm attempt tell "a live daemon I can prove is behind a land" from "a live
+# daemon I have no evidence about" without asking the live process anything.
+_wd_genfile()   { printf '%s\n' "${HUB_WATCHDOG_GENFILE:-$(_wd_common_dir)/hub-watchdog.gen}"; }
 _wd_heartbeat_file() { printf '%s\n' "${HUB_WATCHDOG_HEARTBEAT:-$(_wd_common_dir)/.hub-watchdog-heartbeat}"; }
 # The DRAIN's state + heartbeat files — the same contract hub-afk.sh writes, so the cross-check
 # reads live truth. AFK_STATE / AFK_HEARTBEAT override exactly as they do in hub-afk.sh.
@@ -1553,20 +1557,59 @@ _wd_once() {
 }
 
 # --- daemon singleton ---------------------------------------------------------
+# _wd_daemon_is_stale <genfile> -> true when a LIVE daemon's recorded generation stamp differs
+# from the CURRENT origin hash (#296 AC2). An unreadable/empty genfile — an old daemon that
+# predates this stamp, or the very first arm — reads as UNMEASURABLE, never stale: this mirrors
+# the fail-safe default everywhere else in this file (an epoch we can't read never fires, an
+# unknown park lane never fires). We only ever recycle a daemon we can PROVE is behind.
+_wd_daemon_is_stale() {
+  local genfile="$1" recorded cur
+  [ -f "$genfile" ] || return 1
+  recorded="$(cat "$genfile" 2>/dev/null)"
+  [ -n "$recorded" ] || return 1
+  cur="$(_wd_source_hash)"
+  [ -n "$cur" ] || return 1
+  [ "$cur" != "$recorded" ]
+}
+
+# _wd_recycle_stale_pid <pid> -> TERM a live daemon _wd_daemon_is_stale already proved is
+# behind, wait a bounded grace for its own EXIT trap to release the pidfile, then KILL a
+# survivor. Falls through either way — the caller's normal claim path below reclaims the
+# pidfile exactly as it already does for a plain dead pid.
+_wd_recycle_stale_pid() {
+  local pid="$1" grace="${HUB_WATCHDOG_RECYCLE_GRACE:-5}" waited=0
+  case "$grace" in '' | *[!0-9]*) grace=5 ;; esac
+  kill -TERM "$pid" 2>/dev/null
+  while [ "$waited" -lt "$grace" ] && _wd_pid_alive "$pid"; do
+    sleep 1 2>/dev/null || true
+    waited=$((waited + 1))
+  done
+  _wd_pid_alive "$pid" && kill -KILL "$pid" 2>/dev/null
+  return 0
+}
+
 # _wd_daemon [--reexec] -> singleton wrapper around _wd_loop. The pidfile makes N arms arm
-# exactly one daemon: when it names a still-live pid (kill -0) refuse to start and leave the
-# other daemon's pidfile alone; a stale pidfile (dead pid) is reclaimed. A re-exec keeps this
-# pid, so `--reexec` reclaims our own file instead of refusing. Loop output appends to the
-# logfile so a recovery is auditable after the fact. Always returns 0.
+# exactly one daemon: when it names a still-live pid (kill -0), a genfile-PROVEN-stale daemon is
+# recycled (#296 AC2 — a self-update redeploy must not defer to a daemon a land already
+# replaced); otherwise refuse and leave the other daemon's pidfile alone. A stale pidfile (dead
+# pid) is reclaimed. A re-exec keeps this pid, so `--reexec` reclaims our own file instead of
+# refusing/recycling. Loop output appends to the logfile so a recovery is auditable after the
+# fact. Always returns 0.
 _wd_daemon() {
-  local reexec="${1:-}" pidfile logfile pid baseline
+  local reexec="${1:-}" pidfile logfile genfile pid baseline
   pidfile="$(_wd_pidfile)"
   logfile="$(_wd_logfile)"
+  genfile="$(_wd_genfile)"
   if [ "$reexec" != "--reexec" ] && [ -f "$pidfile" ]; then
     pid="$(cat "$pidfile" 2>/dev/null)"
     if _wd_pid_alive "$pid"; then
-      printf '%s\n' "hub-watchdog: already running (pid $pid, pidfile $pidfile)"
-      return 0
+      if _wd_daemon_is_stale "$genfile"; then
+        _wd_log "live daemon (pid $pid) is running a generation a land already replaced — recycling"
+        _wd_recycle_stale_pid "$pid"
+      else
+        printf '%s\n' "hub-watchdog: already running (pid $pid, pidfile $pidfile)"
+        return 0
+      fi
     fi
   fi
   printf '%s' "$$" > "$pidfile"
@@ -1578,6 +1621,7 @@ _wd_daemon() {
   trap 'exit 0' TERM INT
   printf '%s\n' "hub-watchdog: daemon armed (pid $$, log $logfile)"
   baseline="$(_wd_source_hash)"
+  printf '%s' "$baseline" > "$genfile" 2>/dev/null || true
   _wd_loop "$baseline" >> "$logfile" 2>&1
   return 0
 }
