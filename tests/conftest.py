@@ -96,6 +96,20 @@ for _var in _LEAKED_GIT_HOOK_VARS:
 for _var in [_k for _k in os.environ if _k.startswith("GIT_CONFIG_")]:
     os.environ.pop(_var, None)
 
+# Hermetic commit identity (issue #295, the third CI-red-on-main incident). Many tests
+# `git commit` inside a throwaway repo. Once the isolation above scrubs GIT_CONFIG_*, git
+# falls back to ~/.gitconfig for the committer identity — PRESENT on the dev machine, ABSENT
+# on CI's clean ubuntu runner, where `git commit` then dies with exit 128 ("committer
+# identity unknown"). That is a pure environment divergence: green locally, red on main
+# (#295 broke test_gate_broker_markers.py's #283 park-episode tests exactly this way). Pin a
+# deterministic identity via GIT_AUTHOR_*/GIT_COMMITTER_* env, which git honors OVER any
+# config, so a committing test is hermetic on both platforms. Set AFTER the scrubs so nothing
+# above removes it. Regression guard: tests/unit/test_conftest_git_identity.py.
+os.environ.setdefault("GIT_AUTHOR_NAME", "ai-toolkit-tests")
+os.environ.setdefault("GIT_AUTHOR_EMAIL", "tests@ai-toolkit.invalid")
+os.environ.setdefault("GIT_COMMITTER_NAME", "ai-toolkit-tests")
+os.environ.setdefault("GIT_COMMITTER_EMAIL", "tests@ai-toolkit.invalid")
+
 # Ready-gate bypass isolation (issue #206). AI_TOOLKIT_READY_FORCE=1 makes spoke-ready.sh
 # skip the whole #172 ready-gate precondition check (clean tree / pushed tip / review
 # artifact) — auto_land's ENTIRE trust basis. A dev shell that exported it as a convenience,
