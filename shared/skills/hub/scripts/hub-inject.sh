@@ -60,10 +60,16 @@ _spoke_jsonl() {
 # _transcript_mtime <wt_path> -> epoch mtime of the spoke's newest transcript, or empty.
 # The registration signal for inject verification: it bumps when the spoke writes its
 # next turn after an injected answer is submitted.
+# Probes GNU `-c %Y` FIRST, BSD `-f %m` second (#289, the ordering fix #132 made in
+# worktree-lib.sh). The reverse breaks on GNU coreutils: there `-f` selects
+# filesystem-status mode and takes no inline format, so `%m` is read as a file operand --
+# GNU errors on it yet still PRINTS a multi-line fs block for the real file and exits
+# nonzero, so the `||` fallback ALSO runs and the capture holds both the garbage and the
+# epoch. BSD rejects `-c` cleanly (usage error, empty stdout), so GNU-first is safe on both.
 _transcript_mtime() {
   local jsonl; jsonl="$(_spoke_jsonl "$1")"
   [ -n "$jsonl" ] || return 0
-  stat -f %m "$jsonl" 2>/dev/null || stat -c %Y "$jsonl" 2>/dev/null
+  stat -c %Y "$jsonl" 2>/dev/null || stat -f %m "$jsonl" 2>/dev/null
 }
 # _transcript_finished_turn_idle <wt_path> -> rc 0 when the spoke's newest transcript ends
 # with a COMPLETED assistant turn (no pending tool_use): the finished-turn-idle shape (#255).
@@ -178,7 +184,8 @@ _transcript_sizes() {
   [ -d "$dir" ] || return 0
   for f in "$dir"/*.jsonl; do
     [ -e "$f" ] || continue
-    printf '%s\t%s\n' "$(stat -f %z "$f" 2>/dev/null || stat -c %s "$f" 2>/dev/null)" "$f"
+    # GNU `-c %s` first, BSD `-f %z` second -- same ordering contract as _transcript_mtime (#289).
+    printf '%s\t%s\n' "$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f" 2>/dev/null)" "$f"
   done
 }
 # _answer_appended <wt_path> <text> <sizes> -> did the answer land as a USER record in
