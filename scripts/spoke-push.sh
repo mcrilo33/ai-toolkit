@@ -135,7 +135,18 @@ if [ -n "$READY" ]; then
   # failure and re-run just the marker. The re-run is safe: spoke-ready emits via `git tag -f`
   # + a force tag-push, so re-running `spoke-push.sh --ready <N>` at the same tip re-marks
   # idempotently (the branch push is then a no-op) once the refusal is fixed.
-  if ! AI_TOOLKIT_PARENT_SPAN="$_SP_SPAN_ID" bash "$SCRIPT_DIR/spoke-ready.sh" "$READY"; then
+  # A queue-blocked terminal ready (#278) is NOT the two-phase failure below: exit 5 means the
+  # branch pushed fine and the marker was deliberately withheld because this packed spoke still
+  # owes queued subtask issues on this branch. spoke-ready has already printed which, and what
+  # to run. Shouting PUSHED-BUT-UNMARKED here would send the spoke chasing a phantom emission
+  # bug instead of doing the work it still owes, so pass the distinct code straight through.
+  READY_RC=0
+  AI_TOOLKIT_PARENT_SPAN="$_SP_SPAN_ID" bash "$SCRIPT_DIR/spoke-ready.sh" "$READY" || READY_RC=$?
+  if [ "$READY_RC" -eq "${WT_READY_QUEUED_EXIT:-5}" ]; then
+    echo "spoke-push: ✓ pushed $BRANCH — the terminal ready/$READY is deferred (queued subtasks remain; see above)." >&2
+    exit "$READY_RC"
+  fi
+  if [ "$READY_RC" -ne 0 ]; then
     echo "spoke-push: ⚠ PUSHED-BUT-UNMARKED — branch $BRANCH reached origin but ready/$READY did NOT." >&2
     echo "  origin is ahead with no completion signal. Fix the refusal above, then re-run the marker" >&2
     echo "  (idempotent; the branch push is a no-op): bash .ai-toolkit/scripts/spoke-push.sh --ready $READY" >&2

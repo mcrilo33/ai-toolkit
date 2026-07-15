@@ -307,6 +307,33 @@ def test_ready_refusal_surfaces_pushed_but_unmarked(spoke: Path, remote: Path) -
     assert "PUSHED-BUT-UNMARKED" in result.stderr, "the gap must be surfaced visibly"
 
 
+def test_queued_subtasks_defer_the_marker_without_a_false_unmarked_alarm(
+    spoke: Path, remote: Path, tmp_path: Path
+) -> None:
+    # #278: a packed spoke's terminal ready is REFUSED while it still owes queued subtasks —
+    # by design, not by failure. That is not the two-phase gap above: the branch pushed fine
+    # and the marker was deliberately withheld. Shouting PUSHED-BUT-UNMARKED would send the
+    # spoke chasing a phantom emission bug instead of doing the work it still owes, so the
+    # distinct code (5) must pass straight through with a truthful message.
+    state = tmp_path / "afk-state"
+    (state / "queued-37").mkdir(parents=True)
+    (state / "queued-37" / "265").touch()
+
+    result = subprocess.run(
+        ["bash", str(SPOKE_PUSH), "--ready", "37"],
+        cwd=str(spoke),
+        capture_output=True,
+        text=True,
+        env={**_GIT_ENV, "AFK_STATE_DIR": str(state)},
+    )
+
+    assert result.returncode == 5, result.stdout + result.stderr
+    assert _remote_has_ref(remote, f"refs/heads/{OWN}"), "the branch push still reached origin"
+    assert not _remote_has_ref(remote, "refs/tags/ready/37"), "the terminal marker is withheld"
+    assert "PUSHED-BUT-UNMARKED" not in result.stderr, "a deferred marker is not a failed one"
+    assert "265" in result.stderr, "it must name what is still owed"
+
+
 def test_ready_force_emits_despite_unmet_precondition(spoke: Path, remote: Path) -> None:
     shutil.rmtree(spoke / ".review")
 

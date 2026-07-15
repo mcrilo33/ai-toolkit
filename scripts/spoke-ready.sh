@@ -54,6 +54,7 @@ _SR_T0="$(command -v _telemetry_now_ms >/dev/null 2>&1 && _telemetry_now_ms || t
 
 usage() {
   echo "usage: spoke-ready.sh [--gate|--accept|--blocked] <issue> [-m <reason>]" >&2
+  echo "       spoke-ready.sh --queued <primary>   # print this spoke's queued subtasks" >&2
   exit 2
 }
 
@@ -72,6 +73,7 @@ STATE_FLAG=""
 ISSUE=""
 BODY=""
 PLAN_FILE=""
+QUERY_QUEUE=0   # --queued <N>: print the queued subtasks and exit (read-only, #278)
 
 # set_state <kind> <subject> — select the marker namespace, rejecting a second
 # state flag so e.g. `--gate --accept` can't emit an ambiguous marker.
@@ -96,6 +98,9 @@ while [ "$#" -gt 0 ]; do
     --plan-file)   [ "$#" -ge 2 ] || { echo "spoke-ready: --plan-file needs a value" >&2; usage; }
                    PLAN_FILE="$2"; shift 2 ;;
     --plan-file=*) PLAN_FILE="${1#--plan-file=}"; shift ;;
+    # --queued <N> (#278): print the subtask issues still queued for this spoke and exit.
+    # Read-only — it emits no marker, so merely LOOKING at the queue can never land the spoke.
+    --queued)      QUERY_QUEUE=1; shift ;;
     -h|--help)     usage ;;
     -*)            echo "spoke-ready: unknown option: $1" >&2; usage ;;
     *)             [ -z "$ISSUE" ] || { echo "spoke-ready: unexpected argument: $1" >&2; usage; }
@@ -104,6 +109,50 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$ISSUE" ] || { echo "spoke-ready: an issue number is required" >&2; usage; }
+
+# ── queued-subtask channel (issue #278) ──────────────────────────────────────
+# The INBOUND half of the hub<->spoke channel (the outbound half is the event spool at the
+# bottom of this file). A packed spoke carries several same-scope issues on ONE branch: the
+# drain, or worktree-new at spawn, queues the extras here rather than paying a whole spoke
+# lifecycle for each.
+#
+# The queue's owner is gate-broker-markers.sh, but a spoke cannot source a hub-skill module,
+# so the PATH CONTRACT is inlined — the same split _afk_emit_wake_event already lives with,
+# and it honors the same AFK_STATE_DIR override. Contract: one empty file per queued issue at
+# <state-dir>/queued-<primary>/<issue>. (One file per issue, not one file of lines, so the
+# hub's writes and this side's clears can never race.)
+_queued_dir() {
+  local common
+  common="$(git rev-parse --git-common-dir 2>/dev/null)" || common=".git"
+  printf '%s\n' "${AFK_STATE_DIR:-$common/ai-toolkit-afk}/queued-$1"
+}
+# _queued_subtasks <primary> -> the issues still owed, ascending. Empty (rc 0) is the norm.
+_queued_subtasks() {
+  local dir f; dir="$(_queued_dir "$1")"
+  [ -d "$dir" ] || return 0
+  for f in "$dir"/*; do
+    [ -f "$f" ] || continue
+    printf '%s\n' "${f##*/}"
+  done | sort -n
+  return 0
+}
+# _branch_primary -> the issue in THIS branch's slug (feature/263-foo -> 263), or empty.
+# Derived exactly as worktree-land.sh does (BSLUG="${WT_BRANCH##*/}"; "${BSLUG%%-*}"), because
+# that is what decides which marker is TERMINAL: land requires ready/<primary> at the tip, and
+# auto_land fires on it. The two must agree or the chain breaks.
+_branch_primary() {
+  local br slug num
+  br="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || return 0
+  slug="${br##*/}"; num="${slug%%-*}"
+  case "$num" in '' | *[!0-9]*) return 0 ;; esac
+  printf '%s\n' "$num"
+}
+
+# --queued <N>: the read-only query, answered before anything can emit a marker.
+if [ "$QUERY_QUEUE" -eq 1 ]; then
+  _queued_subtasks "$ISSUE"
+  exit 0
+fi
 
 # The plan text (a PLAN-gate park's handoff, issue #175) comes either inline (-m) or
 # from a file (--plan-file); both feed BODY, so they are mutually exclusive. --plan-file
@@ -230,6 +279,41 @@ verify_ready_preconditions() {
 # READY_FORCED records a force bypass so it can be stamped into the tag annotation
 # below — a bypass of auto_land's trust gate must be auditable at LAND time, not just
 # a line in this shell's stderr the hub never sees (issue #206).
+# ── the queued-subtask gate (issue #278) ─────────────────────────────────────
+# Refuse the TERMINAL ready — ready/<primary>, the issue in this branch's slug — while this
+# spoke still owes queued subtasks. This is the mechanical fail-safe of the whole packing
+# design, not a nicety: auto_land fires on `_ready_at_tip <path> <primary>`, so an early
+# ready/<primary> would land the branch and tear down the worktree with subtasks never
+# started. The drain's nudge and the kickoff text are advisory; only this stops it.
+#
+# Scoped to the PRIMARY on purpose. A per-subtask ready/<N> must NOT be gated: shipping a
+# subtask is exactly how the queue drains, so gating it would deadlock the chain. gate/ and
+# blocked/ are exempt too — they are STOP signals over incomplete work that make no landable
+# claim, and suppressing them would strand a chained spoke with no way to ask for help.
+#
+# Exit 5 is a DISTINCT code (1 = generic refusal, 4 = spoke-push's pushed-but-unmarked): the
+# spoke has not failed, it simply has more to do, and spoke-push keys off 5 to say so rather
+# than raise a false pushed-but-unmarked alarm.
+#
+# Ordered BEFORE verify_ready_preconditions deliberately. A queue is a STRUCTURAL fact — this
+# spoke has whole issues left to ship — whereas the preconditions judge whether the CURRENT
+# tip is shippable. When both are unmet, "your tree is dirty" sends the spoke to tidy up and
+# retry the same wrong marker, while "you still owe #265" is the actual next step; and once it
+# has shipped #265 its tree is pushed and clean anyway, so the precondition complaint was
+# usually moot. Pinned by test_queue_gate_outranks_an_unmet_precondition.
+: "${WT_READY_QUEUED_EXIT:=5}"
+if [ "$KIND" = "ready" ] && [ "$ISSUE" = "$(_branch_primary)" ]; then
+  QUEUED="$(_queued_subtasks "$ISSUE" | tr '\n' ' ')"
+  QUEUED="${QUEUED% }"
+  if [ -n "$QUEUED" ]; then
+    echo "spoke-ready: refusing the terminal ready/$ISSUE — this spoke still owes queued subtask issue(s): $QUEUED" >&2
+    echo "  They are packed onto THIS branch (same scope), so they ship here rather than each paying a fresh spawn + suite seed." >&2
+    echo "  For EACH: /source-task <N> to re-anchor, run its cycle, then 'bash .ai-toolkit/scripts/spoke-push.sh --ready <N>' (that clears it)." >&2
+    echo "  Re-run this terminal marker once 'bash .ai-toolkit/scripts/spoke-ready.sh --queued $ISSUE' prints nothing." >&2
+    exit "$WT_READY_QUEUED_EXIT"
+  fi
+fi
+
 READY_FORCED=0
 if [ "$KIND" = "ready" ]; then
   if [ "${AI_TOOLKIT_READY_FORCE:-}" = "1" ]; then
@@ -376,6 +460,20 @@ _afk_emit_wake_event() {
   kill -USR1 "$pid" 2>/dev/null || true
 }
 _afk_emit_wake_event "$ISSUE" "$KIND"
+
+# --- drain this subtask from the queue (issue #278) ---------------------------
+# A per-subtask ready/<N> that REACHED origin is the proof that subtask shipped, so drop its
+# entry: the queue is what gates the terminal ready/<primary>, and an un-cleared entry would
+# refuse it forever. Done only after the tag push above succeeded (a marker that never landed
+# proves nothing), and only for a ready/ — a gate/ or blocked/ park is not completion.
+#
+# Never clears the primary's own entry, because the primary is never queued (worktree-new and
+# the drain both refuse to self-queue it). Unlinking one file cannot disturb the others, so
+# this can never race the hub's concurrent writes. Best-effort: a failure here just leaves the
+# terminal ready refused, which is the safe direction — it never lands unfinished work.
+if [ "$KIND" = "ready" ]; then
+  rm -f "$(_queued_dir "$(_branch_primary)")/$ISSUE" 2>/dev/null || true
+fi
 
 # Trace node: this run as a kind=script span, tagged with the marker namespace it
 # emitted (phase = ready|gate|accept|blocked) so the trace tells a completion
