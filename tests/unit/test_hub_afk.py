@@ -8422,6 +8422,74 @@ def test_capture_hang_forensics_includes_process_tree_and_sample(tmp_path: Path)
     assert "Sample stub" in tree, "a macOS `sample` is appended when available"
 
 
+# ── issue #298: the hang bundle's stat probe must be GNU-first (the #289 class) ──
+#
+# _afk_capture_hang_forensics probed BSD `stat -f %m` FIRST — the exact ordering #289
+# reversed in gate-broker-detect.sh and hub-inject.sh, and #132 reversed in worktree-lib.sh.
+# On GNU coreutils `-f` selects filesystem-status mode and takes no inline format, so `%m` is
+# read as a file operand: GNU errors on it yet still PRINTS a multi-line fs block for the real
+# file and exits nonzero, so the `||` fallback ALSO runs and the capture holds the garbage AND
+# the epoch. That multi-line string then fails _afk_write_fingerprint's all-digits guard, so
+# transcript_silence_seconds records `unknown` — the transcript-activity-vs-UI-freeze delta
+# is the hang's tell and the single signal the bundle exists to record. BSD rejects `-c`
+# cleanly (usage error, empty stdout), so GNU-first is correct on both flavors.
+#
+# Stubs local to this module, mirroring the pair in test_gate_broker_detect.py /
+# test_hub_inject.py, so the ordering is pinned on any host rather than only where CI runs.
+
+_GNU_STAT_STUB = (
+    "#!/bin/sh\n"
+    'if [ "$1" = "-c" ] && [ "$2" = "%Y" ]; then echo 1000003500; exit 0; fi\n'
+    'if [ "$1" = "-f" ]; then\n'
+    '  echo "  File: \\"$3\\""\n'
+    '  echo "    ID: b505c8e079f9471 Namelen: 255     Type: ext2/ext3"\n'
+    '  echo "  Block size: 4096       Fundamental block size: 4096"\n'
+    '  echo "stat: cannot read file system information for $2" >&2\n'
+    "  exit 1\n"
+    "fi\n"
+    "exit 1\n"
+)
+
+_BSD_STAT_STUB = (
+    "#!/bin/sh\n"
+    'if [ "$1" = "-c" ]; then echo "stat: illegal option -- c" >&2; exit 1; fi\n'
+    'if [ "$1" = "-f" ] && [ "$2" = "%m" ]; then echo 1000003500; exit 0; fi\n'
+    "exit 1\n"
+)
+
+
+@pytest.mark.parametrize("stub", [_GNU_STAT_STUB, _BSD_STAT_STUB], ids=["gnu", "bsd"])
+def test_hang_forensics_records_silence_on_both_stat_flavors(tmp_path: Path, stub: str) -> None:
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    projects = tmp_path / "projects"
+    _write_transcript(
+        _project_dir_for(projects, spoke), [{"type": "assistant", "message": {"content": []}}]
+    )
+    fake_bin, _ = _forensics_bin(tmp_path, pane_path=spoke)
+    (fake_bin / "stat").write_text(stub)
+    (fake_bin / "stat").chmod(0o755)
+
+    result = _call(
+        f"_afk_capture_hang_forensics '{spoke}' 5",
+        env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_HANG_FORENSICS_DIR": str(tmp_path / "hang-forensics"),
+            "AFK_NOW": "1000003600",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    fp = (Path(result.stdout.strip()) / "fingerprint.txt").read_text()
+    assert "transcript_mtime=1000003500\n" in fp, (
+        f"the mtime must be captured as a BARE epoch, with no fs-status block: {fp!r}"
+    )
+    assert "transcript_silence_seconds=100\n" in fp, (
+        "the silence delta is the hang's tell — a polluted mtime fails the all-digits "
+        f"guard and strands it as `unknown`: {fp!r}"
+    )
+
+
 def test_hang_sample_pid_prefers_the_agent_descendant(tmp_path: Path) -> None:
     # The pane is `sh -c "<cmd>; exec zsh"`, so pane_pid is a wrapper shell blocked in wait4() —
     # `sample` must target the claude/node descendant that is actually hung, not the shell.
