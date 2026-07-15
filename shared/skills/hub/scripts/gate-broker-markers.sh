@@ -190,7 +190,7 @@ _clear_progress_state() {
   local dir; dir="$(_afk_state_dir)"
   rm -f "$dir"/progress-*.epoch "$dir"/answer-attempt-*.epoch "$dir"/done-*.epoch "$dir"/tip-* \
     "$dir"/park-onset-*.epoch "$dir"/park-sig-* \
-    "$dir"/reanswer-* "$dir"/gate-voided-* "$dir"/terminal-logged-* \
+    "$dir"/reanswer-* "$dir"/answer-drop-* "$dir"/gate-voided-* "$dir"/terminal-logged-* \
     "$dir"/wd-fire-dedup-* \
     "$dir"/offline-since.epoch 2>/dev/null || true   # #249: drop a stale outage marker too
   # #263: the watchdog's firing-dedup markers are per-window too — a leftover would suppress a
@@ -253,6 +253,51 @@ _broker_reanswer_exhausted() {
   printf '%s\t%s\t%s\n' "$tip" "$sig" "$(( prev_n + 1 ))" > "$f" 2>/dev/null || true
   return 1
 }
+
+# --- computed-then-dropped answers (issue #288 AC3) ---------------------------
+# answer-drop-<issue> — the SUBSET of reanswer-<issue>'s attempts that ended in a DROP (never
+# injected): the #247 live-tree-changed drop and the "no longer parked on that prompt" drop both
+# leave no trace the watchdog can read otherwise, since neither journals and the delivery epoch
+# (answer-attempt-<issue>.epoch) is stamped only on a SUCCESSFUL inject. Keyed like
+# _broker_reanswer_exhausted's own (tip, sig) counter and for the same reason: a changed tip or
+# park content starts a fresh episode's count at 1, not a running total across resolved parks.
+# Read back by the watchdog to tell "never touched" from "touched, never deliverable" and to name
+# the drop count + last verdict in the park-undeliverable ledger line.
+_answer_drop_state_file() { printf '%s\n' "$(_afk_state_dir)/answer-drop-$1"; }
+
+# note_answer_drop <wt> <issue> <reason> -> record ONE computed-then-dropped answer for the park
+# CURRENTLY at <wt>'s tip: "<tip>\t<sig>\t<count>\t<reason>". <reason> is the drop's own log text
+# (the LAST one wins), so the watchdog names the actual verdict without re-deriving it from the
+# drain log. Best-effort; never aborts the caller.
+note_answer_drop() {
+  local wt="$1" issue="$2" reason="$3" sig tip f prev_tip="" prev_sig="" prev_n=0
+  sig="$(_broker_park_signature "$wt" "$issue" 2>/dev/null)"
+  tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"
+  f="$(_answer_drop_state_file "$issue")"
+  if [ -f "$f" ]; then
+    IFS=$'\t' read -r prev_tip prev_sig prev_n _ < "$f" 2>/dev/null || true
+    case "$prev_n" in '' | *[!0-9]*) prev_n=0 ;; esac
+  fi
+  if [ "$prev_tip" != "$tip" ] || [ "$prev_sig" != "$sig" ]; then prev_n=0; fi   # new context
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  printf '%s\t%s\t%s\t%s\n' "$tip" "$sig" "$(( prev_n + 1 ))" "$reason" > "$f" 2>/dev/null || true
+}
+
+# read_answer_drop <wt> <issue> -> "<count>\t<reason>" for the CURRENT (tip, sig), or empty when
+# no drop is on record for this exact park episode (none ever happened, or the episode moved on).
+read_answer_drop() {
+  local wt="$1" issue="$2" f tip sig rec_tip rec_sig rec_n rec_reason
+  f="$(_answer_drop_state_file "$issue")"
+  [ -f "$f" ] || return 0
+  IFS=$'\t' read -r rec_tip rec_sig rec_n rec_reason < "$f" 2>/dev/null || return 0
+  tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"
+  sig="$(_broker_park_signature "$wt" "$issue" 2>/dev/null)"
+  [ "$rec_tip" = "$tip" ] && [ "$rec_sig" = "$sig" ] || return 0
+  case "$rec_n" in '' | *[!0-9]*) return 0 ;; esac
+  printf '%s\t%s\n' "$rec_n" "$rec_reason"
+}
+
+clear_answer_drop() { rm -f "$(_answer_drop_state_file "$1")" 2>/dev/null || true; }
 
 # --- terminal gate markers (issue #237) ---------------------------------------
 # A reasoner mutation-void is terminal on the FIRST occurrence: the reasoner wrote the

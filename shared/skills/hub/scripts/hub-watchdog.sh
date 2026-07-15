@@ -334,6 +334,58 @@ _wd_drain_touched_recently() {
   ! _wd_epoch_stale "$newest" "$now" "$HUB_WATCHDOG_PARK_CEILING"
 }
 
+# _wd_park_attempt_in_episode <issue> -> true when a delivery landed INSIDE the current park
+# episode (attempt >= onset, or onset unmeasurable): the same rule _wd_park_base measures by, and
+# the branch split _wd_park_unanswered_reason reports on (#283/#288) — shared here so the
+# detectors and the reason string can never disagree.
+_wd_park_attempt_in_episode() {
+  local issue="$1" attempt onset
+  attempt="$(read_answer_attempt "$issue" 2>/dev/null)"
+  onset="$(read_park_onset_epoch "$issue" 2>/dev/null)"
+  case "$attempt" in '' | *[!0-9]*) return 1 ;; esac
+  case "$onset" in '' | *[!0-9]*) return 0 ;; esac
+  [ "$attempt" -ge "$onset" ]
+}
+
+# _wd_park_answer_attempted <wt> <issue> -> true when reanswer-<issue> records at least one
+# attempt for the CURRENT (tip, sig) — proof the reasoner ran on THIS exact park, so labeling it
+# "never-attempted" would be a lie (#288 AC2). Reads the SAME record _broker_reanswer_exhausted
+# writes; a record from a resolved episode (a different tip or signature) does not count.
+_wd_park_answer_attempted() {
+  local wt="$1" issue="$2" sig tip f rec_tip="" rec_sig="" rec_n=0
+  command -v _broker_park_signature >/dev/null 2>&1 || return 1
+  command -v _reanswer_state_file >/dev/null 2>&1 || return 1
+  sig="$(_broker_park_signature "$wt" "$issue" 2>/dev/null)"
+  [ -n "$sig" ] || return 1
+  tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"
+  f="$(_reanswer_state_file "$issue")"
+  [ -f "$f" ] || return 1
+  IFS=$'\t' read -r rec_tip rec_sig rec_n < "$f" 2>/dev/null || return 1
+  case "$rec_n" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$rec_tip" = "$tip" ] && [ "$rec_sig" = "$sig" ] && [ "$rec_n" -gt 0 ]
+}
+
+# _wd_park_warned_backoff_pending <issue> -> true when the default (answer) lane's warned-retry
+# backoff is armed and NOT YET due — the drain is paced to retry, not abandoned (#288 AC2). This
+# reads a signal _wd_drain_touched_recently structurally cannot: the backoff's own next-due epoch
+# can be scheduled further out than the fixed recency window (AFK_WARN_BACKOFF_CAP defaults to
+# 1800s, 3x the 600s park ceiling — the #274 land-lane inversion, unfixed here).
+_wd_park_warned_backoff_pending() {
+  local issue="$1" next
+  command -v _afk_warned_next >/dev/null 2>&1 || return 1
+  next="$(_afk_warned_next "$issue" 2>/dev/null)"
+  case "$next" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$next" -gt "$(_wd_now)" ]
+}
+
+# _wd_park_drop_info <wt> <issue> -> "<count>\t<reason>" for the CURRENT (tip, sig)'s recorded
+# answer-drop episode (issue #288 AC3), or empty when none/stale/unavailable.
+_wd_park_drop_info() {
+  local wt="$1" issue="$2"
+  command -v read_answer_drop >/dev/null 2>&1 || return 0
+  read_answer_drop "$wt" "$issue" 2>/dev/null
+}
+
 # Condition 1: a parked spoke answer_pass left unanswered past the grace margin. Three gates, in
 # order: the park must be the ANSWER lane's (#283/#271), the CURRENT episode's base must be older
 # than the ceiling (#283/#265 — never zero, and never a delivery from a long-resolved park), and
@@ -344,7 +396,47 @@ _wd_detect_park_unanswered() {
   [ "$(slot_state "$wt" "$issue")" = "waiting" ] || return 1
   _wd_park_is_answer_lane "$wt" "$issue" || return 1
   _wd_epoch_stale "$(_wd_park_base "$wt" "$issue")" "$now" "$HUB_WATCHDOG_PARK_CEILING" || return 1
-  ! _wd_drain_touched_recently "$issue" "$now"
+  _wd_drain_touched_recently "$issue" "$now" && return 1
+  # #288 AC2: the never-attempted branch specifically must not fire "no answer delivered" when
+  # the drain plainly HAS attempted one on this exact park and is paced to retry — neither drop
+  # path journals (so _wd_drain_touched_recently's recency window can't see it), and a warned
+  # backoff can legitimately be scheduled past that window. A genuinely-untouched park (no
+  # reanswer record at all) still fires unchanged. The drop-evidence case gets its own honest
+  # condition (park-undeliverable) below, so this suppression must not engage there either.
+  if ! _wd_park_attempt_in_episode "$issue" \
+     && _wd_park_answer_attempted "$wt" "$issue" \
+     && _wd_park_warned_backoff_pending "$issue"; then
+    return 1
+  fi
+  return 0
+}
+
+# Condition 1b (issue #288 AC3): a never-attempted park the drain DID service (>=1 reasoner run)
+# but every delivery was dropped before injection — the #277 shape. Fires INSTEAD of
+# park-unanswered whenever a drop is on record for the current episode, regardless of backoff
+# phase: a park that has exhausted its backoff and still has nothing to show must still surface,
+# just under the honest reason (a serviced-but-undeliverable park must never read as silence).
+_wd_detect_park_undeliverable() {
+  local wt="$1" issue="$2" now="$3"
+  command -v slot_state >/dev/null 2>&1 || return 1
+  [ "$(slot_state "$wt" "$issue")" = "waiting" ] || return 1
+  _wd_park_is_answer_lane "$wt" "$issue" || return 1
+  _wd_park_attempt_in_episode "$issue" && return 1   # a delivery landed -> stale-attempt's turf
+  _wd_epoch_stale "$(_wd_park_base "$wt" "$issue")" "$now" "$HUB_WATCHDOG_PARK_CEILING" || return 1
+  [ -n "$(_wd_park_drop_info "$wt" "$issue")" ]
+}
+
+# _wd_park_undeliverable_reason <wt> <issue> <now> -> names the drop count + last drop's own
+# verdict, so the ledger line is diagnosable alone (#288 AC3, mirroring #283 AC5's measured-base
+# reason).
+_wd_park_undeliverable_reason() {
+  local wt="$1" issue="$2" now="$3" info count reason onset
+  info="$(_wd_park_drop_info "$wt" "$issue")"
+  count="${info%%$'\t'*}"
+  reason="${info#*$'\t'}"
+  onset="$(read_park_onset_epoch "$issue" 2>/dev/null)"
+  printf 'park-undeliverable: %s computed-then-dropped answer(s), last drop: %s (parked %s; ceiling %ss)' \
+    "${count:-?}" "${reason:-unknown}" "$(_wd_age_seconds "$onset" "$now")" "$HUB_WATCHDOG_PARK_CEILING"
 }
 
 # _wd_park_unanswered_reason <wt> <issue> <now> -> the MEASURED firing reason (#265/#283): which
@@ -361,9 +453,9 @@ _wd_park_unanswered_reason() {
   sig="${sig#*$'\t'}"                          # drop the tip half of the "<tip>\t<sig>" record
   case "$attempt" in '' | *[!0-9]*) attempt="" ;; esac
   case "$onset" in '' | *[!0-9]*) onset="" ;; esac
-  # The delivery counts only when it falls INSIDE the current episode — the same rule _wd_park_base
-  # measures by, so the reported branch can never disagree with the epoch that actually fired.
-  if [ -n "$attempt" ] && { [ -z "$onset" ] || [ "$attempt" -ge "$onset" ]; }; then
+  # The branch decision is shared with _wd_park_attempt_in_episode, so the reported branch can
+  # never disagree with the epoch that actually fired.
+  if _wd_park_attempt_in_episode "$issue"; then
     base="answer-attempt@$attempt"
     printf 'park-unanswered (stale-attempt): last answer delivery %s ago' \
       "$(_wd_age_seconds "$attempt" "$now")"
@@ -609,7 +701,7 @@ _wd_classify() {
     bash -c "$HUB_WATCHDOG_CLASSIFY_CMD" hub-watchdog "$condition" "$issue" 2>/dev/null; return
   fi
   case "$condition" in
-    park-unanswered)
+    park-unanswered | park-undeliverable)
       # A blocked/ record means the reasoner made a real human-call escalation — not a bug.
       if command -v _afk_blocked_record >/dev/null 2>&1 && [ -f "$(_afk_blocked_record "$issue" 2>/dev/null)" ]; then
         printf 'novel-decision\n'; return
@@ -748,11 +840,19 @@ _wd_run_conditions() {
     [ -n "$issue" ] || continue
     # Each detector: fire (deduped by _wd_fire's marker) + intervene when it trips; else clear the
     # firing marker so a genuinely resolved-then-recurring condition re-fires (#263).
-    if _wd_detect_park_unanswered "$wt" "$issue" "$now"; then
+    # park-undeliverable (#288 AC3) is checked FIRST: a serviced-but-never-deliverable park must
+    # never ALSO read as the misleading never-attempted label.
+    if _wd_detect_park_undeliverable "$wt" "$issue" "$now"; then
+      _wd_fire park-undeliverable "$issue" "$(_wd_park_undeliverable_reason "$wt" "$issue" "$now")"
+      _wd_intervene_answer "$wt" "$issue"
+      _wd_clear_fired park-unanswered "$issue"
+    elif _wd_detect_park_unanswered "$wt" "$issue" "$now"; then
       _wd_fire park-unanswered "$issue" "$(_wd_park_unanswered_reason "$wt" "$issue" "$now")"
       _wd_intervene_answer "$wt" "$issue"
+      _wd_clear_fired park-undeliverable "$issue"
     else
       _wd_clear_fired park-unanswered "$issue"
+      _wd_clear_fired park-undeliverable "$issue"
     fi
     if _wd_detect_dead_idle "$wt" "$issue" "$now"; then
       _wd_fire dead-pane "$issue" "reaper missed a dead/idle pane (> ${HUB_WATCHDOG_IDLE_CEILING}s)"

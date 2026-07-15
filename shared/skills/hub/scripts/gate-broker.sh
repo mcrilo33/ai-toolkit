@@ -500,6 +500,7 @@ _broker_try_fastpath_gate() {
   log "  fast-path auto-approved #$issue (plan restates issue body, coverage ${cov:-?})"
   _consume_gate_tag "$wt" "$issue"
   _afk_clear_warned "$issue"   # a waive is genuine progress → drop any warned-retry backoff
+  clear_answer_drop "$issue"   # #288: a waive is a delivery — any prior drop record is moot
   # broker_journal_decision (not the file-only _broker_journal_line): it ALSO posts a best-effort
   # gh issue comment, the DURABLE record that survives the land so an operator reviewing a landed
   # issue can still tell it was fast-pathed and why. park kind `gate` is distinct from answer/permission.
@@ -519,9 +520,18 @@ broker_service_gate() {
   # the confirmed-inject path), consume the stale tag and stop — do NOT re-answer, and do NOT
   # count it against the re-answer ceiling (checked BEFORE it, so a resumed spoke heals even
   # once exhausted). The plan-gate-guard self-heals the same signal from the spoke side.
+  #
+  # #288 AC1/AC4: this is the exact moment the broker PROVES the park episode ended — end it
+  # right here rather than waiting for a later slot_state tick to happen to observe "not
+  # parked" (the #277 gap: the watchdog fired off a park-onset that outlived the episode it was
+  # stamped for). Clear the onset AND the answer-lane warned-retry backoff, so a later re-park
+  # on the same tip gets a fresh ceiling instead of inheriting one exhausted by the resolved
+  # episode's own retries.
   if _gate_parked "$wt" "$issue" && _gate_answer_landed "$wt"; then
     log "  #$issue resumed past its PLAN gate outside the broker — consuming the stale gate/$issue tag"
     _consume_gate_tag "$wt" "$issue"
+    clear_park_onset_epoch "$issue"
+    _afk_clear_warned "$issue"
     return 0
   fi
   # A prior tick found the reasoner mutated the live tree for this gate (#237). The mutation
@@ -670,6 +680,7 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
     # and inject mid-turn, #89): no gate-voided marker, no blocked/<issue> on an actively-working
     # spoke. A fresh park next tick is serviced anew.
     log "  #$issue's live tree changed but the reasoner did not write it — dropping the stale answer (#247)"
+    note_answer_drop "$wt" "$issue" "live tree changed but the reasoner did not write it (#247)"
     return 0
   fi
   # The answerer is the supervisor's own `claude`; if its credentials are dead, every
@@ -708,6 +719,7 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
         return $?
       fi
       log "  #$issue is no longer parked on that prompt — dropping the stale answer (spoke moved on)"
+      note_answer_drop "$wt" "$issue" "no longer parked on that prompt (spoke moved on)"
       return 0
     elif _is_seed_replay "$wt" "$text"; then
       log "  answer to #$issue replays the spoke's own seed prompt — suppressing (#124)"
@@ -725,6 +737,7 @@ ${plan:-(the plan prose could not be extracted — approve or amend from the iss
           log "  injected answer into #$issue"
           _consume_gate_tag "$wt" "$issue"
           _afk_clear_warned "$issue"   # #241: genuine progress → drop this issue's warned-retry backoff
+          clear_answer_drop "$issue"   # #288: a delivery landed — any prior drop record is moot
           # #241 review B2: record the taken answer for morning review. Read the reasoner's own
           # 'WARN:' note and 'REVERSIBILITY:' class off the reply. A WARN or a non-reversible class
           # is a NOTEWORTHY decision → a loud warned record + a journal line WITH a gh comment. A
