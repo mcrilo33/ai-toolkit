@@ -2816,9 +2816,9 @@ _afk_detect_selfupdate() {
 # covers. AFK_SELFUPDATE_SCOPE only widens DETECTION (which land triggers a redeploy); it does
 # NOT extend this validated set. If you add a custom supervisor helper to AFK_SELFUPDATE_SCOPE,
 # add its source path here too, or a broken version of it would deploy unvalidated. EXCEPTION
-# (#291): ai-toolkit.yml is data, not a supervisor script — it has no source path here because
-# `bash -n` has nothing to parse-check; it's still safe to redeploy on since sync-to-repo.sh
-# re-renders spoke-model.env from it on every _afk_resync, with no bash syntax to validate.
+# (#291): ai-toolkit.yml is data, not a supervisor script, so it has no source path here —
+# `bash -n` has nothing to parse-check. It's still safe to redeploy on since sync-to-repo.sh
+# re-renders spoke-model.env from it on every _afk_resync.
 _afk_selfupdate_source_scripts() {
   local root="${1:-${MAIN_ROOT:-.}}"
   printf '%s\n' \
