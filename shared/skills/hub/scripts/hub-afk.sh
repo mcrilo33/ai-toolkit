@@ -601,9 +601,27 @@ _afk_escalate_blocked() {
 # blocked we distinguish a DEAD pane (session crashed → re-adopt the worktree ONCE,
 # reusing the spoke_run_id) from a LIVE-but-idle pane (truly hung → block).
 
-# _spoke_pane_alive <wt> -> true when a live tmux pane maps to the worktree. Empty target
-# (the spoke's pane crashed / its window is gone) ⇒ dead.
-_spoke_pane_alive() { [ -n "$(_spoke_pane_target "$1")" ]; }
+# _spoke_pane_alive <wt> -> true when the spoke's AGENT is running in a tmux pane mapped to
+# the worktree. Two ways to be dead: no pane maps at all (the window crashed / is gone), OR a
+# pane maps but runs a bare shell with no agent beneath it (#301: the spoke is launched as
+# `sh -c "<cmd>; exec zsh"`, so a killed claude — reboot, OOM, a human quitting it — leaves the
+# pane alive running zsh in the worktree). Before #301 only the first was checked, so the second
+# read as a healthy spoke and stranded #296/#299: never revived, and answers typed into the shell.
+#
+# The agent probe fails OPEN here — the OPPOSITE direction from the inject primitives' write-side
+# _pane_agent_ready. A write refuses on an unprovable probe (rc 2) because the cost of guessing
+# wrong is prose executed as a shell command; liveness instead keeps an unobservable pane ALIVE,
+# because the cost of guessing wrong is killing + relaunching a HEALTHY spoke. So only a PROVEN
+# dead agent (rc 1) flips a mapped pane to dead; rc 0 and rc 2 both read alive.
+# The pane target is resolved ONCE and reused for the probe: a second _spoke_pane_target would
+# be a second `tmux list-panes` against a loaded server, the shape that flaked #269.
+_spoke_pane_alive() {
+  local target rc
+  target="$(_spoke_pane_target "$1")"
+  [ -n "$target" ] || return 1     # no pane maps ⇒ the window crashed / is gone
+  _pane_agent_alive "$target"; rc=$?
+  [ "$rc" -ne 1 ]                  # rc 1 (proven dead) ⇒ dead; rc 0 alive, rc 2 unprovable ⇒ alive
+}
 
 # _afk_default_ref <wt> -> the ref the spoke branched from, so "has commits" measures work
 # ABOVE the branch point. AFK_DEFAULT_BRANCH wins (historical top precedence, kept for
@@ -2398,8 +2416,17 @@ recover_dead_panes() {
   while IFS=$'\t' read -r path issue; do
     [ -n "$issue" ] || continue
     state="$(slot_state "$path" "$issue")"
-    case "$state" in done | waiting) continue ;; esac   # terminal / parked — not a crash
-    _spoke_pane_alive "$path" && continue                # live pane — reap_pass owns idle/hung
+    # `done` is terminal regardless of liveness (a ready/accept/blocked marker is a human/gate
+    # decision — never revive over it).
+    case "$state" in done) continue ;; esac
+    # `waiting` means "parked, the answer lane owns it" — but a park is only real if the AGENT is
+    # there to be answered. #301: a dead agent whose pane still renders a stale dialog, or carries
+    # a gate/<issue> tag at the tip (the #296/#299 shape), classifies `waiting` off scrollback / a
+    # git tag that outlived the agent; skipping such a pane here would strand the very crash this
+    # function exists to recover. So honor `waiting` (and hand the live pane to reap_pass) only
+    # when the agent is alive — ST3 also stops slot_state emitting it, this is the belt to that
+    # braces. Probed ONCE (a second _spoke_pane_alive is a second `tmux list-panes` — the #269 flake).
+    if _spoke_pane_alive "$path"; then continue; fi        # live pane — reap_pass / answer lane own it
     # An over-ceiling runaway always blocks (as reap_pass does) — resume/re-dispatch never
     # applies. Checked first so a crashed-but-over-ceiling spoke is not revived here only to
     # be blocked by reap_pass in the same tick (the hard ceiling ignores fresh progress).

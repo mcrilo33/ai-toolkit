@@ -233,19 +233,25 @@ _AGENT_PID = 4243
 _DISPLAY_CASE = f'  display-message) printf "{_PANE_PID}\\n" ;;\n'
 
 
-def _agent_ps_stub(fake_bin: Path, *, agent_alive: bool = True) -> None:
+def _agent_ps_stub(fake_bin: Path, *, agent_alive: bool = True, pane_pid: int = _PANE_PID) -> None:
     """PATH-stub `ps` for the #301 agent probe. Default ALIVE: a stub that silently reported
     every pane's agent as dead would disable the inject lane across the whole suite, and the
     tests that pin delivery would pass for the wrong reason.
+
+    `pane_pid` is the shell pid the tmux stub advertises via display-message; the stubbed
+    agent hangs off it so the probe's ancestor-walk resolves. It defaults to _PANE_PID (what
+    the shared tmux stubs report) but a fixture that advertises a different pid — the
+    forensics builder reports the live pytest pid so the real process-tree capture has
+    descendants — passes its own.
 
     Only the probe's exact `-eo pid=,ppid=,comm=` form is answered; every other `ps` call
     execs the REAL ps — hub-afk reads `-o comm= -p`, `-o command= -p` and a
     `-o pid,stat,etime,wchan` hang snapshot through the same PATH, and a blanket stub would
     silently corrupt them.
     """
-    table = f"{_PANE_PID} 1 -zsh\n"
+    table = f"{pane_pid} 1 -zsh\n"
     if agent_alive:
-        table += f"{_AGENT_PID} {_PANE_PID} claude\n"
+        table += f"{_AGENT_PID} {pane_pid} claude\n"
     # A foreign claude OUTSIDE this pane's tree: it must never vouch for this pane.
     table += "999 1 /Applications/Other.app/Contents/MacOS/claude\n"
     tbl = fake_bin / "ps_table.txt"

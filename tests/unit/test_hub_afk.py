@@ -5475,6 +5475,46 @@ def test_recover_dead_panes_resumes_a_pane_whose_agent_died(tmp_path: Path) -> N
     )
 
 
+def test_recover_dead_panes_revives_a_phantom_waiting_dead_pane(tmp_path: Path) -> None:
+    """The #296/#299 stranding, pinned at the recover_dead_panes belt.
+
+    A dead agent's pane keeps a gate/<issue> tag at the tip (a git tag outlives the process)
+    or a stale dialog in its scrollback, so slot_state classifies it `waiting`. Before #301
+    recover_dead_panes skipped every `waiting` state outright — so the crash it exists to fix
+    was invisible and the spoke sat stranded. slot_state is forced to `waiting` here so the
+    belt is proven in isolation: a dead-agent `waiting` pane is revived, not skipped, whatever
+    ST3's slot_state gating does upstream.
+    """
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke, agent_alive=False)
+    expr, env, ready_log, _statedir = _recover_env(spoke, tmp_path, fake_bin)
+    expr = f'slot_state() {{ printf "waiting\\n"; }}; {expr}'
+
+    _call(expr, env=env)
+
+    assert "new-window" in tmux_log.read_text(), (
+        "a `waiting` classification on a DEAD agent is a phantom park (stale scrollback / a "
+        f"gate tag) — it must be revived, not skipped as if the answer lane owned it: "
+        f"{tmux_log.read_text()}"
+    )
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
+
+
+def test_recover_dead_panes_skips_a_live_waiting_pane(tmp_path: Path) -> None:
+    """The other side of the belt: a `waiting` pane whose agent IS alive is left to the answer
+    lane — reviving a genuinely parked live spoke would kill the agent mid-park (#246)."""
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke, agent_alive=True)
+    expr, env, _ready_log, _statedir = _recover_env(spoke, tmp_path, fake_bin)
+    expr = f'slot_state() {{ printf "waiting\\n"; }}; {expr}'
+
+    _call(expr, env=env)
+
+    assert "new-window" not in tmux_log.read_text(), (
+        "a live parked pane is the answer lane's job — recover_dead_panes must not revive it"
+    )
+
+
 def test_recover_dead_panes_warns_after_one_resume(tmp_path: Path) -> None:
     # #241 §7: a second crash after an auto-resume warns-and-parks-LAST (retried at low
     # frequency), never blocks. Resume stays bounded to once per window.
@@ -8495,6 +8535,12 @@ def _forensics_bin(
         '#!/usr/bin/env bash\nprintf "Sample stub for pid %s\\n" "$1"\nexit 0\n'
     )
     (fake_bin / "sample").chmod(0o755)
+    # #301: a hung-but-LIVE pane is a frozen AGENT, not a dead one — the liveness probe must
+    # read it alive. Point the stubbed agent at the pane pid this builder advertises so the
+    # ancestor-walk resolves. Only when a real pane maps: pane_path=None is the older
+    # window-gone shape and must keep reading dead.
+    if pane_path is not None:
+        _agent_ps_stub(fake_bin, pane_pid=int(pid))
     return fake_bin, log
 
 
