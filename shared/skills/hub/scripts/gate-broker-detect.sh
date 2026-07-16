@@ -110,6 +110,15 @@ try:
             if not isinstance(content, list):
                 if last_type == "user":
                     pending = None
+                    # A real reply — a human typing in the pane, or the broker's own tmux
+                    # inject — is recorded as a TYPED string-content user turn, not a text
+                    # block. That reply resolves the PLAN gate, so un-latch gate_plan just as
+                    # the list-content text-block branch does (#313). Mirror _gate_answer_landed
+                    # (#204): only a typed, non-meta submission counts, so every synthetic
+                    # string-content harness turn leaves a still-unanswered park latched.
+                    if (isinstance(content, str) and content.strip()
+                            and obj.get("promptSource") == "typed" and not obj.get("isMeta")):
+                        gate_plan = ""
                 continue
             if last_type == "assistant":
                 asks, texts, gate_id = [], [], None
