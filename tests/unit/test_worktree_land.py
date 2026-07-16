@@ -2322,10 +2322,13 @@ def _land_lock_dir(statedir: Path) -> Path:
 
 
 def _seed_land_lock(statedir: Path, *, pid: int, ts: int, host: str = "testhost") -> Path:
-    """Pre-create the land lock owned by <pid> stamped at <ts> (models a held lock)."""
+    """Pre-create the land lock owned by <pid> stamped at <ts> (models a held lock).
+
+    The owner line is "<pid> <ts> <host>" — ts before host so it parses by fixed field.
+    """
     lock = _land_lock_dir(statedir)
     lock.mkdir(parents=True, exist_ok=True)
-    (lock / "owner").write_text(f"{pid} {host} {ts}\n")
+    (lock / "owner").write_text(f"{pid} {ts} {host}\n")
     return lock
 
 
@@ -2341,7 +2344,7 @@ def test_land_breaks_dead_holder_lock(hub: Path, tmp_path: Path) -> None:
     proc, _ = _run_land(hub, tmp_path, "1", extra_env={"AFK_STATE_DIR": str(statedir)})
 
     assert proc.returncode == 0, proc.stderr
-    assert "breaking a stale land lock" in proc.stderr.lower(), proc.stderr
+    assert "broke a stale land lock" in proc.stderr.lower(), proc.stderr
     assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
     assert not _land_lock_dir(statedir).exists(), "the broken-then-owned lock is released after"
 
@@ -2361,7 +2364,7 @@ def test_land_breaks_lock_older_than_stale_bound(hub: Path, tmp_path: Path) -> N
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert "breaking a stale land lock" in proc.stderr.lower(), proc.stderr
+    assert "broke a stale land lock" in proc.stderr.lower(), proc.stderr
     assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
 
 
@@ -2397,3 +2400,61 @@ def test_waiting_land_logs_and_bounded_timeout_keeps_live_holder(hub: Path, tmp_
     finally:
         holder.terminate()
         holder.wait()
+
+
+def test_garbage_stale_seconds_does_not_disable_the_mutex(hub: Path, tmp_path: Path) -> None:
+    # Principle 2: a non-numeric LAND_LOCK_STALE_SECONDS must sanitize to the SAFE default,
+    # not 0 — a zeroed bound would read every live lock as stale and silently break it. With a
+    # garbage value, a fresh LIVE holder is still waited on (not broken), so the land times out.
+    statedir = tmp_path / "afk-state"
+    holder = subprocess.Popen(["sleep", "30"])
+    try:
+        _seed_land_lock(statedir, pid=holder.pid, ts=int(time.time()))
+        _make_spoke(hub, tmp_path, "feature/1-done", push=True)
+
+        proc, _ = _run_land(
+            hub,
+            tmp_path,
+            "1",
+            extra_env={
+                "AFK_STATE_DIR": str(statedir),
+                "LAND_LOCK_STALE_SECONDS": "1800s",  # operator typo — a unit suffix
+                "LAND_LOCK_WAIT_MAX": "2",
+                "LAND_LOCK_POLL": "1",
+            },
+        )
+
+        assert proc.returncode != 0, "a garbage stale bound must not silently disable the mutex"
+        assert "timed out" in proc.stderr.lower(), proc.stderr
+        assert _land_lock_dir(statedir).exists(), "the fresh live holder's lock must survive"
+    finally:
+        holder.terminate()
+        holder.wait()
+
+
+def test_absent_owner_lock_is_waited_on_not_prematurely_broken(hub: Path, tmp_path: Path) -> None:
+    # The mkdir->owner-write gap: a lock dir whose mkdir just won but whose owner file is a
+    # microsecond from being written must NOT be broken by a concurrent waiter (else two lands
+    # both own it — the exact #315 race). An owner-less lock reads as wait; the land is bounded
+    # and fails loud, never racing.
+    statedir = tmp_path / "afk-state"
+    lock = _land_lock_dir(statedir)
+    lock.mkdir(parents=True, exist_ok=True)  # a claimed dir with NO owner file yet
+    _make_spoke(hub, tmp_path, "feature/1-done", push=True)
+    before = _remote_sha(hub, "main")
+
+    proc, _ = _run_land(
+        hub,
+        tmp_path,
+        "1",
+        extra_env={
+            "AFK_STATE_DIR": str(statedir),
+            "LAND_LOCK_WAIT_MAX": "2",
+            "LAND_LOCK_POLL": "1",
+        },
+    )
+
+    assert proc.returncode != 0, "an owner-less just-claimed lock must be waited on, not broken"
+    assert "timed out" in proc.stderr.lower(), proc.stderr
+    assert lock.exists(), "the owner-less lock must not be prematurely broken"
+    assert _remote_sha(hub, "main") == before, "the waiting land must not touch main"

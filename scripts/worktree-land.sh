@@ -59,16 +59,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # flock(1), the same #300 rationale) at ${AFK_STATE_DIR:-<git-common-dir>/ai-toolkit-afk}
 # /land.lock — the shared state dir every actor already uses, resolved inline (this
 # script is synced to spoke targets that cannot source hub-skill modules). It holds an
-# `owner` file "<pid> <host> <ts>". A crashed holder is broken (dead pid, or a hard age
+# `owner` file "<pid> <ts> <host>" (ts BEFORE host so ts parses by fixed position even
+# if a host ever carried spaces). A crashed holder is broken (dead pid, or a hard age
 # bound as a wedged-alive/pid-reuse backstop); a live holder is waited on and the wait
 # is LOGGED, never silent (fail-loud, Principle 2). Bounds are env-tunable for tests.
 : "${LAND_LOCK_WAIT_MAX:=1200}"        # hard cap (s) to wait before failing loud
-: "${LAND_LOCK_STALE_SECONDS:=1800}"   # break even a live-looking holder past this age
+: "${LAND_LOCK_STALE_SECONDS:=1800}"   # break even a live-looking holder past this age (0 disables)
 : "${LAND_LOCK_POLL:=2}"               # poll interval (s) between acquire attempts
-for _v in LAND_LOCK_WAIT_MAX LAND_LOCK_STALE_SECONDS LAND_LOCK_POLL; do
-  eval "case \"\${$_v}\" in '' | *[!0-9]*) $_v=0 ;; esac"
-done
-[ "$LAND_LOCK_POLL" -gt 0 ] || LAND_LOCK_POLL=2   # a 0 poll would busy-spin; floor it
+# Sanitize a garbage value to the SAFE default, never to 0 (Principle 2): a STALE_SECONDS
+# silently zeroed would read EVERY live lock as stale and disable the mutex. An EXPLICIT
+# numeric 0 is honored as "no age backstop" (dead-pid break only), handled in _land_lock_stale.
+case "$LAND_LOCK_WAIT_MAX"      in '' | *[!0-9]*) LAND_LOCK_WAIT_MAX=1200 ;; esac
+case "$LAND_LOCK_STALE_SECONDS" in '' | *[!0-9]*) LAND_LOCK_STALE_SECONDS=1800 ;; esac
+case "$LAND_LOCK_POLL"          in '' | *[!0-9]* | 0) LAND_LOCK_POLL=2 ;; esac
 
 _LAND_LOCK=""   # the lock dir once WE own it — the release guard's ownership witness
 
@@ -86,24 +89,29 @@ _land_lock_owner_pid() {
   awk '{ print $1; exit }' "$f" 2>/dev/null || true
 }
 
-# _land_lock_age <lock> -> seconds since the owner ts, empty when unknown.
+# _land_lock_age <lock> -> seconds since the owner ts (field 2), empty when unknown.
 _land_lock_age() {
   local f="$1/owner" ts now
   [ -f "$f" ] || return 0
-  ts="$(awk '{ print $3; exit }' "$f" 2>/dev/null || true)"
+  ts="$(awk '{ print $2; exit }' "$f" 2>/dev/null || true)"
   case "$ts" in '' | *[!0-9]*) return 0 ;; esac
   now="$(date +%s)"
   printf '%s\n' "$(( now - ts ))"
 }
 
-# _land_lock_stale <lock> -> rc 0 (stale, break it) when the holder is DEAD (probe the
-# real pid, Principle 4) or the lock is older than the hard bound; rc 1 (live, wait) else.
-# A missing/torn/non-numeric owner reads stale — an unowned dir must never wedge landing.
+# _land_lock_stale <lock> -> rc 0 (stale, break it) ONLY when the owner pid is DEAD
+# (probe the real process, Principle 4) or the lock is older than the hard age bound;
+# rc 1 (live, wait) otherwise. An ABSENT/torn owner reads NOT-stale (wait): a lock whose
+# mkdir just won but whose owner file is a microsecond from being written must never be
+# broken by a concurrent waiter (the #315 review's premature-break race). A genuinely
+# owner-less orphan (a crash in that microsecond window) is caught by the loud WAIT_MAX
+# timeout, not raced. STALE_SECONDS=0 disables the age backstop (dead-pid break only).
 _land_lock_stale() {
   local lock="$1" pid age
   pid="$(_land_lock_owner_pid "$lock")"
-  case "$pid" in '' | *[!0-9]*) return 0 ;; esac
+  case "$pid" in '' | *[!0-9]*) return 1 ;; esac    # no/torn owner -> wait, never break
   kill -0 "$pid" 2>/dev/null || return 0            # holder dead -> stale
+  [ "$LAND_LOCK_STALE_SECONDS" -gt 0 ] || return 1  # age backstop disabled -> live holder waits
   age="$(_land_lock_age "$lock")"
   case "$age" in '' | *[!0-9]*) return 1 ;; esac    # unknown age on a live holder -> wait
   [ "$age" -ge "$LAND_LOCK_STALE_SECONDS" ]
@@ -114,20 +122,35 @@ _land_lock_stale() {
 # and wt_die's if it never wins within LAND_LOCK_WAIT_MAX (a stuck land is surfaced, not
 # raced). Call AFTER the cheap hub guards so an arg error never takes or leaks the lock.
 acquire_land_lock() {
-  local lock waited=0 warned="" host
+  local lock waited=0 warned="" host stale_pid aside now
   lock="$(_land_state_dir)/land.lock"
   mkdir -p "$(dirname "$lock")" 2>/dev/null || true
   host="$(hostname 2>/dev/null || printf 'unknown')"
   while :; do
+    # Stamp the ts BEFORE mkdir so no `$(date)` fork sits in the mkdir->owner-write gap,
+    # shrinking that window (which a concurrent waiter must never mistake for an orphan)
+    # to a single builtin printf.
+    now="$(date +%s)"
     if mkdir "$lock" 2>/dev/null; then
-      printf '%s %s %s\n' "$$" "$host" "$(date +%s)" > "$lock/owner" 2>/dev/null || true
+      printf '%s %s %s\n' "$$" "$now" "$host" > "$lock/owner" 2>/dev/null || true
       _LAND_LOCK="$lock"
       trap '_release_land_lock' EXIT
       return 0
     fi
     if _land_lock_stale "$lock"; then
-      wt_warn "breaking a stale land lock (holder pid $(_land_lock_owner_pid "$lock") is dead or older than ${LAND_LOCK_STALE_SECONDS}s) — issue #315"
-      rm -rf "$lock" 2>/dev/null || true
+      # Break ATOMICALLY: `mv` the stale dir aside so that when two waiters break the SAME
+      # dead lock only ONE mv wins (the loser's source is already gone). NEITHER reclaims
+      # here — both fall through to re-race the mkdir above, the single source of ownership
+      # truth, so simultaneous breakers can never both own it (the #315 review's double-break).
+      # UPGRADE: a residual micro-TOCTOU remains (a waiter that passed the staleness check
+      # could mv a lock a third lander reclaimed in the same instant); it needs a live owner
+      # to reclaim within a few instructions and is backstopped by the non-ff push recovery.
+      stale_pid="$(_land_lock_owner_pid "$lock")"
+      aside="$lock.stale.$$"
+      if mv "$lock" "$aside" 2>/dev/null; then
+        wt_warn "broke a stale land lock (holder pid ${stale_pid:-unknown} is dead or older than ${LAND_LOCK_STALE_SECONDS}s) — issue #315"
+        rm -rf "$aside" 2>/dev/null || true
+      fi
       continue
     fi
     if [ -z "$warned" ]; then
@@ -208,7 +231,10 @@ HUB_BRANCH="$(git symbolic-ref --short -q HEAD || true)"
 
 # Take the land mutex (issue #315) now that the cheap hub guards passed: serialize the
 # fetch -> sync -> merge -> push critical section against a concurrent land (manual or
-# auto_land) so a rejected push can never leave the hub behind origin. Released on EXIT.
+# auto_land) so a rejected push can never leave the hub behind origin. Released on EXIT,
+# so the lock intentionally spans the post-push teardown/telemetry tail too — a concurrent
+# lander waits out the full land, which is correct (never interleave) and bounded by
+# LAND_LOCK_WAIT_MAX.
 acquire_land_lock
 
 # wt_pane_stranded <path> -> a tmux pane's cwd is teardown RESIDUE, not a live
