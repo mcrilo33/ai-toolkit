@@ -5,6 +5,7 @@ See shared/skills/hub/scripts/gate-broker-detect.sh.
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -1327,4 +1328,45 @@ def test_slot_state_question_park_records_a_parked_transition_with_an_episode(
         if '"to":"parked"' in ln and '"actor":"reconciler"' in ln
     ]
     assert len(parked) == 1, _transitions(statedir, 5)
-    assert '"episode":"' in parked[0], "the parked transition must carry the broker's episode key"
+    # The transition's episode must be the EXACT key _gb_episode_key resolves — the same key the
+    # broker stamps on its answer-lane events — not merely present (the agreement property #304 AC1
+    # relies on for the watchdog's episode-keyed service reads).
+    episode = re.search(r'"episode":"([^"]+)"', parked[0])
+    assert episode, parked[0]
+    key = _call(
+        "_gb_episode_key 5",
+        env={
+            "AFK_STATE_DIR": str(statedir),
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_NOW": "1700000000",
+        },
+    ).stdout.strip()
+    assert episode.group(1) == key, f"transition episode {episode.group(1)!r} != broker key {key!r}"
+
+
+def test_note_park_context_re_stamps_the_onset_on_a_signature_change(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # WARNING-1 regression guard: _afk_note_park_context must DELEGATE the coupled onset+sig roll-over
+    # to note_park_episode (park-sig's single owner). A drain-side park-sig write decoupled from the
+    # onset re-stamp would let a waiting->waiting signature change strand episode A's onset on episode
+    # B — the #276/#283 fused-onset false-fire. Seed episode A (stale onset + sigA), then observe a
+    # NEW signature (sigB) and require the onset to re-stamp.
+    statedir = tmp_path / "afk-state"
+    statedir.mkdir(parents=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=spoke_repo, capture_output=True, text=True
+    ).stdout.strip()
+    (statedir / "park-onset-5.epoch").write_text("1700000000\n")  # episode A onset (stale)
+    (statedir / "park-sig-5").write_text(f"{head}\tsigA\n")  # episode A signature
+    prelude = "_broker_park_signature() { printf '%s' 'sigB'; }"  # a NEW park episode
+
+    _call(
+        f"{prelude}; _afk_note_park_context '{spoke_repo}' 5",
+        env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1700009999"},
+    )
+
+    onset = (statedir / "park-onset-5.epoch").read_text().strip()
+    assert onset == "1700009999", (
+        f"a changed signature must re-stamp the onset, not keep A's: {onset}"
+    )

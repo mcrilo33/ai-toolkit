@@ -162,8 +162,14 @@ read_answer_attempt()   { _read_issue_epoch answer-attempt "$1"; }
 # moment, so the un-landed clock no longer depends on slot_state stamping a side-effect of merely
 # observing the spoke. A done-<issue>.epoch FILE is still read as a FALLBACK (a pre-#304 stamp, or a
 # standalone watchdog with no log API in scope), so no reader regresses; empty when neither exists
-# (unknown — never a firing basis alone, #300). clear_done_epoch stays: _afk_note_tip_progress
-# drops a stale FALLBACK file on a tip advance, and _clear_progress_state wipes it on a fresh arm.
+# (unknown — never a firing basis alone, #300). The PROJECTION is authoritative: once the log records
+# a terminal state it wins over the file. clear_done_epoch stays but only heals the FALLBACK — it
+# drops a stale done FILE (a tip advance via _afk_note_tip_progress; a fresh arm via
+# _clear_progress_state). A revived spoke's stale TERMINAL projection is healed instead by the
+# non-terminal transition its reviver records (hub-afk's `revived`), which flips the state off
+# ready/accepted; and the only firing consumer (_wd_detect_mergeable_skipped) also independently gates
+# on slot_state=done (the tag still at the tip), so a projection lagging a live-pane re-ready cannot
+# false-fire it.
 read_done_epoch() {
   local issue="$1"
   if command -v afk_current_state >/dev/null 2>&1; then

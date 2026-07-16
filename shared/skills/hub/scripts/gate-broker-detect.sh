@@ -271,24 +271,26 @@ _afk_record_reconciled() {
   afk_tlog_transition "$issue" "$to" reconciler ground-truth "$ev" "$episode"
 }
 
-# _afk_note_park_context <wt> <issue> -> the reconciler's park-recording write: stamp the park-onset
-# epoch (stamp-once, the first waiting tick) and the park-sig record the episode key is built from,
-# then echo the episode "<sig>:<onset>" _gb_episode_key resolves — the SAME key the broker stamps on
-# its answer-lane events (both read these two files), so the recorded `parked` transition and the
-# lane events share one episode and the watchdog's episode-keyed service reads engage (#304 AC1).
-# Empty episode when nothing is extractable (a park with no signature): the transition still records,
-# just without an episode, and the detector falls back to the epoch side-channels there (#300).
-# UPGRADE: re-derives the park signature (a pane read slot_state's park probe just did) — thread the
-# already-read signal through if the extra per-park capture ever matters (#269). The onset re-stamp
-# on a CHANGED episode stays the watchdog's note_park_episode job; here stamp-once seeds the floor.
+# _afk_note_park_context <wt> <issue> -> seed the park episode context and echo the episode
+# "<sig>:<onset>" the recorded `parked` transition carries — the SAME key _gb_episode_key resolves
+# and the broker stamps on its answer-lane events, so the transition and the lane events share one
+# episode and the watchdog's episode-keyed service reads engage (#304 AC1). Empty episode when
+# nothing is extractable (a park with no signature): the transition still records, just without an
+# episode, and the detector falls back to the epoch side-channels there (#300).
+#
+# The park-onset+park-sig pair has ONE owner — note_park_episode (gate-broker-markers.sh) — which
+# re-stamps the onset (and credits the closing episode) EXACTLY when the signature changes. The drain
+# must NOT write park-sig itself: a decoupled write in the drain's format would front-run
+# note_park_episode's prev!=key guard, letting a waiting->waiting episode change slip past it and
+# strand a stale onset — the #276/#283 fused-onset false-fire, and an AFK-principle-#5 violation. So
+# delegate: stamp-once seeds the onset FLOOR for a signature-less park (note_park_episode no-ops on an
+# empty sig), then note_park_episode owns the coupled onset+sig roll-over.
+# UPGRADE: note_park_episode re-derives the signature via a pane read slot_state's park probe just
+# did — thread the already-read signal through if the extra per-park capture ever matters (#269).
 _afk_note_park_context() {
-  local wt="$1" issue="$2" sig tip
+  local wt="$1" issue="$2"
   stamp_park_onset_epoch_once "$issue"
-  sig="$(_broker_park_signature "$wt" "$issue" 2>/dev/null)"
-  if [ -n "$sig" ]; then
-    tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"
-    printf '%s\t%s\n' "$tip" "$sig" > "$(_park_sig_file "$issue")" 2>/dev/null || true
-  fi
+  command -v note_park_episode >/dev/null 2>&1 && note_park_episode "$wt" "$issue" >/dev/null 2>&1
   command -v _gb_episode_key >/dev/null 2>&1 && _gb_episode_key "$issue" 2>/dev/null || true
 }
 
