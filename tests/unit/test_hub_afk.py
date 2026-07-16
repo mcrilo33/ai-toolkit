@@ -6086,6 +6086,13 @@ def test_drain_survives_source_rewrite_mid_run(spoke_repo: Path, tmp_path: Path)
     script = orig_dir / "hub-afk.sh"
     script.write_text(HUB_AFK.read_text())
     script.chmod(0o755)
+    # A real checkout carries the hub-afk-<lane>.sh modules next to the entry (the #307 split),
+    # and the self-copy globs them along; stage them so the drain resolves them from orig_dir
+    # (the rewrite below only garbles hub-afk.sh, leaving the already-sourced modules intact).
+    for _mod in HUB_AFK.parent.glob("hub-afk-*.sh"):
+        dest = orig_dir / _mod.name
+        dest.write_text(_mod.read_text())
+        dest.chmod(0o755)
     bp = tmp_path / "batch-plan.sh"
     bp.write_text("#!/usr/bin/env bash\nsleep 3\n")
     bp.chmod(0o755)
@@ -11251,7 +11258,8 @@ def test_redispatch_reads_run_before_teardown() -> None:
 def test_reap_reads_run_before_the_land() -> None:
     # auto_land's clean land tears the worktree down, so the run id for the `reaped` record must
     # be read BEFORE the land runs (the same intent-first property #290 needed for `landing`).
-    src = HUB_AFK.read_text()
+    # auto_land now lives in hub-afk-land.sh (the #307 split), so inspect the module source.
+    src = (HUB_AFK.parent / "hub-afk-land.sh").read_text()
     read_at = src.find('land_run="$(_afk_spoke_run_id')
     land_at = src.find('bash "$wt_land" "$issue" --skip-tests')
     reaped_at = src.find('wt_tlog_transition "$issue" reaped')
