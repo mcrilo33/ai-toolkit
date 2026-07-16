@@ -3094,7 +3094,7 @@ _afk_self() { printf '%s\n' "${AFK_ORIG_SCRIPT:-${BASH_SOURCE[0]}}"; }
 _afk_exec_self_copy() {
   [ "${AFK_SELF_COPY:-1}" = "0" ] && return 0
   [ "${AFK_RUNNING_COPY:-}" = "1" ] && return 0
-  local src src_dir dir copy
+  local src src_dir dir copy cfg
   src="${BASH_SOURCE[0]}"
   src_dir="$(cd "$(dirname "$src")" && pwd)" || return 0
   dir="$(mktemp -d "${TMPDIR:-/tmp}/hub-afk-self.XXXXXX" 2>/dev/null)" || return 0
@@ -3107,6 +3107,15 @@ _afk_exec_self_copy() {
   # run from the original rather than refuse to arm.
   cp "$src_dir"/*.sh "$dir"/ 2>/dev/null || cp "$src" "$copy" 2>/dev/null || return 0
   [ -f "$copy" ] || cp "$src" "$copy" 2>/dev/null || return 0
+  # Seed the model-config manifest too (#306): spoke-model.env / ai_toolkit_config.py are
+  # NOT *.sh, so the glob above skips them. Without spoke-model.env, worktree-new.sh -- which
+  # the drain resolves to THIS self-copy dir -- finds no config in wt_resolve_agent_model and
+  # falls to the literal fallback, dispatching EVERY freshly-armed spoke on the wrong tier
+  # until the first _afk_resync reseeds. Parity with _afk_resync (which re-renders both).
+  # Best-effort / fail-open: a source-run hub has neither, and the copy proceeds regardless.
+  for cfg in spoke-model.env ai_toolkit_config.py; do
+    [ -f "$src_dir/$cfg" ] && cp "$src_dir/$cfg" "$dir"/ 2>/dev/null
+  done
   export AFK_RUNNING_COPY=1
   export AFK_ORIG_SCRIPT="$src"
   exec bash "$copy" "$@"
