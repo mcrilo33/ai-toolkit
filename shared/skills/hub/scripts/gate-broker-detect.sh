@@ -222,10 +222,22 @@ PYEOF
 }
 
 # --- slot state ---------------------------------------------------------------
+# _detect_agent_dead <wt_path> -> #301: rc 0 when the spoke's agent is PROVEN gone. A thin,
+# GUARDED shim over hub-inject's _spoke_agent_dead: a standalone source of this module (no
+# hub-inject in the chain) falls through to "not dead" (rc 1) rather than erroring, preserving
+# the pre-#301 park behavior exactly. Every waiting classification below is gated through it so a
+# pane whose agent died — but whose scrollback dialog or gate/<issue> tag lingers — is read as the
+# crash it is, not a live park the answer lane keeps trying (and failing) to serve.
+_detect_agent_dead() {
+  declare -F _spoke_agent_dead >/dev/null 2>&1 || return 1
+  _spoke_agent_dead "$1"
+}
+
 # slot_state <wt_path> <issue> -> done|waiting|reap|busy.
 #   done    — a TERMINAL marker (ready/accept/blocked) at the branch tip.
-#   waiting — parked on a question / gate / permission dialog (auto-answer it; never reaped,
-#             regardless of ceiling — park detection precedes both reap verdicts, #246).
+#   waiting — parked on a question / gate / permission dialog, AGENT ALIVE (auto-answer it; never
+#             reaped, regardless of ceiling — park detection precedes both reap verdicts, #246). A
+#             dead agent whose park signal lingers in scrollback / a git tag is NOT waiting (#301).
 #   reap    — over the wall-clock ceiling, or idle past AFK_IDLE_MINUTES, AND with no
 #             detectable pending park (a hung/working spoke, not a park).
 #   busy    — actively working (or just spawned, no transcript yet).
@@ -254,7 +266,11 @@ slot_state() {
     # it as waiting (re-answerable); reconcile_markers keeps clearing the tag once commits
     # land on top.
     if [ "$(git -C "$wt_path" rev-parse -q --verify "refs/tags/blocked/${issue}^{commit}" 2>/dev/null)" = "$tip" ]; then
-      if [ -n "$(extract_pending_question "$wt_path")" ] || _permission_pending "$wt_path"; then
+      # …still parked on a live agent ⇒ re-answerable. A DEAD agent's lingering dialog is NOT a
+      # live park: fall through to `done` (blocked is terminal; a human already owns it — never
+      # auto-revived over the escalation, unlike the gate/question cases below).
+      if { [ -n "$(extract_pending_question "$wt_path")" ] || _permission_pending "$wt_path"; } \
+         && ! _detect_agent_dead "$wt_path"; then
         stamp_park_onset_epoch_once "$issue"; printf 'waiting\n'; return
       fi
       printf 'done\n'; return
@@ -264,7 +280,13 @@ slot_state() {
     # can't see it. Checking at the tip is self-clearing: once approved and the spoke
     # commits its first RED/GREEN, the tip moves past the gate commit and it reads busy.
     if [ "$(git -C "$wt_path" rev-parse -q --verify "refs/tags/gate/${issue}^{commit}" 2>/dev/null)" = "$tip" ]; then
-      stamp_park_onset_epoch_once "$issue"; printf 'waiting\n'; return
+      # #301: a gate/<issue> tag OUTLIVES the process (a git tag is the most durable phantom-park
+      # source there is), so the #296/#299 crash — agent dead, tag still at the tip — kept reading
+      # `waiting` and was never revived. Only a LIVE agent at the gate is a real park; a dead one
+      # falls through to busy/reap so recover_dead_panes revives it in place.
+      if ! _detect_agent_dead "$wt_path"; then
+        stamp_park_onset_epoch_once "$issue"; printf 'waiting\n'; return
+      fi
     fi
   fi
   # Ledger progress (a tip advance since the last tick) refreshes the ceiling before
@@ -278,10 +300,17 @@ slot_state() {
   # genuinely-stuck dialog could form is bounded NOT here but in the answer lane
   # (broker_service_gate's _broker_reanswer_exhausted / AFK_REANSWER_CEILING + the _afk_warned_arm
   # backoff, escalating to blocked/<issue> on a real judgment call), so park-wins is unconditional.
-  if [ -n "$(extract_pending_question "$wt_path")" ]; then stamp_park_onset_epoch_once "$issue"; printf 'waiting\n'; return; fi
+  # #301: `&& ! _detect_agent_dead` — a question/dialog left by an agent that has since died is a
+  # crash, not a live park. The probe runs only AFTER the cheap park signal is already true (&&
+  # short-circuits), so a busy spoke never pays for it.
+  if [ -n "$(extract_pending_question "$wt_path")" ] && ! _detect_agent_dead "$wt_path"; then
+    stamp_park_onset_epoch_once "$issue"; printf 'waiting\n'; return
+  fi
   # A pending permission dialog (a CC confirmation prompt, no transcript entry) is decided by
   # the supervisor's classifier, so it waits — never reaped as idle (#149) or over-ceiling (#246).
-  if _permission_pending "$wt_path"; then stamp_park_onset_epoch_once "$issue"; printf 'waiting\n'; return; fi
+  if _permission_pending "$wt_path" && ! _detect_agent_dead "$wt_path"; then
+    stamp_park_onset_epoch_once "$issue"; printf 'waiting\n'; return
+  fi
   # Past every park check ⇒ the spoke is NOT parked (busy/reap). Reset its park-onset clock so a
   # later re-park measures the watchdog's park-unanswered ceiling from the NEW onset, not a stale
   # one (#265). Placed here, not in _afk_note_tip_progress above: that runs BEFORE the two waiting
@@ -428,6 +457,10 @@ _still_parked_same() {
 # -mid-turn guard). A positive park signal, so an ambiguous read fails toward "moved on" (drop).
 _spoke_still_parked() {
   local wt="$1" issue="$2"
+  # #301: a dead agent has no LIVE park to service — its dialog / gate tag is scrollback and git
+  # state that outlived the process. Fail toward "moved on" (not parked) so _reap_or_resume
+  # REVIVES it rather than routing it back to the answerer, which would only inject into a shell.
+  _detect_agent_dead "$wt" && return 1
   _permission_pending "$wt" && return 0
   _gate_parked "$wt" "$issue" && return 0
   [ -n "$(extract_pending_question "$wt")" ]

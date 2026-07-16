@@ -226,6 +226,26 @@ _pane_agent_ready() {
   return 1
 }
 
+# _spoke_agent_dead <wt_path> -> rc 0 ONLY when the spoke's pane maps AND its agent is PROVEN
+# gone (#301: the bare shell a killed claude leaves behind — the launcher `exec zsh` keeps the
+# pane). rc 1 otherwise: agent alive, probe unprovable (rc 2 — fail toward the existing park
+# behavior), OR no pane maps at all.
+#
+# The read-side gate for the detector (slot_state / _spoke_still_parked): a park signal derived
+# from tmux scrollback or a git tag OUTLIVES the agent, so a dead spoke keeps classifying
+# `waiting` off a stale dialog or a gate/<issue> tag — which makes the answer lane serve a shell
+# and hides the crash from recover_dead_panes. Gating those signals on "is the agent PROVEN dead"
+# suppresses the phantom park without touching the live-park path. It deliberately does NOT treat
+# "no pane maps" as dead: that case is recover_dead_panes' to classify (via _spoke_pane_alive),
+# and it is already revived there — suppressing `waiting` for it here would be out of remit.
+_spoke_agent_dead() {
+  local target
+  target="$(_spoke_pane_target "$1")"
+  [ -n "$target" ] || return 1
+  _pane_agent_alive "$target"
+  [ "$?" -eq 1 ]
+}
+
 # inject_answer <pane_target> <text> -> type the answer into the spoke and submit it.
 # A PLAN gate renders as an interactive AskUserQuestion MENU (tab/arrow/enter) that
 # IGNORES typed free text, so the most common gate is never answered by a bare inject
