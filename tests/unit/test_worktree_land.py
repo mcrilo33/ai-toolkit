@@ -20,6 +20,7 @@ import os
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -2458,3 +2459,142 @@ def test_absent_owner_lock_is_waited_on_not_prematurely_broken(hub: Path, tmp_pa
     assert "timed out" in proc.stderr.lower(), proc.stderr
     assert lock.exists(), "the owner-less lock must not be prematurely broken"
     assert _remote_sha(hub, "main") == before, "the waiting land must not touch main"
+
+
+# ── never leave the hub behind origin (issue #315, AC2 + AC4) ──────────────────
+def _advance_origin_main(tmp_path: Path, name: str) -> str:
+    """Push a fresh commit to origin/main out-of-band (models a concurrent sibling land).
+
+    Clones the bare remote, commits, pushes to main; returns the new origin/main SHA. The
+    hub's own local main is left BEHIND origin (it has not fetched), the exact state a racy
+    reset --keep produced on 2026-07-16.
+    """
+    clone = tmp_path / f"clone-{name}"
+    subprocess.run(
+        ["git", "clone", "-q", str(tmp_path / "remote.git"), str(clone)],
+        check=True,
+        capture_output=True,
+        env=_GIT_ENV,
+    )
+    for k, v in (("user.email", "t@t.t"), ("user.name", "t"), ("commit.gpgsign", "false")):
+        _git(clone, "config", k, v)
+    (clone / f"{name}.txt").write_text(f"sibling {name} landed\n")
+    _git(clone, "add", f"{name}.txt")
+    _git(clone, "commit", "-qm", f"feat: {name}", "-m", "Refs #0")
+    _git(clone, "push", "-q", "origin", "main")
+    return _git(clone, "rev-parse", "HEAD").strip()
+
+
+def test_pre_merge_heal_when_hub_behind_origin(hub: Path, tmp_path: Path) -> None:
+    # AC2: a hub whose local main is BEHIND origin (a sibling advanced origin) must heal —
+    # fast-forward local main up to origin BEFORE merging — so the push is clean and the hub
+    # ends AT origin, never behind. Pre-fix, the land merges into the stale local main, the
+    # push is non-ff rejected, and the rollback strands the hub behind (the #315 incident).
+    _make_spoke(hub, tmp_path, "feature/1-behindhub", push=True)
+    sibling = _advance_origin_main(tmp_path, "sib1")
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode == 0, proc.stderr + "\n---\n" + proc.stdout
+    head = _git(hub, "rev-parse", "HEAD").strip()
+    assert _remote_sha(hub, "main") == head, "the hub must end at origin, not behind it"
+    reachable = _git(hub, "rev-list", "HEAD").split()
+    assert sibling in reachable, "the sibling's landed commit must be an ancestor (healed forward)"
+    assert (hub / "feature-1-behindhub.txt").exists(), "the spoke's work landed too"
+
+
+def _stub_bindir(bindir: Path, sandbox: Path) -> dict[str, str]:
+    """gh/tmux/code/pytest logging stubs in `bindir`; returns the land env (shared by threads)."""
+    bindir.mkdir(parents=True, exist_ok=True)
+    for name in ("gh", "tmux", "code", "pytest"):
+        body = "#!/bin/sh\n"
+        if name == "gh":
+            body += 'case "$*" in *"issue view"*state*) printf "OPEN\\n" ;; esac\n'
+        body += "exit 0\n"
+        (bindir / name).write_text(body)
+        (bindir / name).chmod(0o755)
+    env = {**_GIT_ENV, "PATH": f"{bindir}:{os.environ['PATH']}"}
+    env["AFK_TELEMETRY_CONF"] = str(sandbox / "no-such-conf")
+    for var in (
+        "TMUX",
+        "LANGFUSE_BASIC_AUTH",
+        "LANGFUSE_HOST",
+        "AI_TOOLKIT_OTEL_SPAN_ENDPOINT",
+        "WT_SPOKE",
+        "AI_TOOLKIT_GH_LIFECYCLE_LABELS",
+    ):
+        env.pop(var, None)
+    return env
+
+
+def test_two_concurrent_lands_serialize_main_never_rewound(hub: Path, tmp_path: Path) -> None:
+    # AC4 (headline regression): two lands launched CONCURRENTLY on one hub checkout produce
+    # two clean SEQUENTIAL lands — the mutex serializes them — and main is only ever advanced,
+    # never rewound. Pre-mutex, the two `git merge`/`reset` sequences collide in the shared
+    # worktree (index.lock contention) or race the push, and one fails or strands the hub.
+    _make_spoke(hub, tmp_path, "feature/1-alpha", push=True)
+    _make_spoke(hub, tmp_path, "feature/2-beta", push=True)
+    seed = _remote_sha(hub, "main")
+    env = _stub_bindir(tmp_path / "bin", tmp_path)
+    env.update({"LAND_LOCK_POLL": "1", "LAND_LOCK_WAIT_MAX": "180"})
+
+    def _land(target: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", str(WORKTREE_LAND), target],
+            cwd=str(hub),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f1, f2 = ex.submit(_land, "1"), ex.submit(_land, "2")
+        r1, r2 = f1.result(), f2.result()
+
+    assert r1.returncode == 0, r1.stderr
+    assert r2.returncode == 0, r2.stderr
+    final = _remote_sha(hub, "main")
+    reachable = _git(hub, "rev-list", final).split()
+    assert seed in reachable, "main was rewound below its starting tip — the race #315 forbids"
+    assert (hub / "feature-1-alpha.txt").exists()
+    assert (hub / "feature-2-beta.txt").exists()
+
+
+def test_nonff_push_rejection_recovers_and_reruns_gate(hub: Path, tmp_path: Path) -> None:
+    # AC2 recovery clause: if a push still races (origin advances DURING our gate, despite the
+    # lock — e.g. a non-honoring pusher), the land must AUTOMATICALLY re-fetch + re-merge + retry
+    # under the lock, not die with the hub behind. The re-merge is a NEW combined tree, so the
+    # retry must RE-RUN its gate — asserted via the pre-push hook firing twice.
+    _make_spoke(hub, tmp_path, "feature/1-racy", push=True)
+    count = tmp_path / "prepush-count"
+    advanced = tmp_path / "origin-advanced"
+    remote = tmp_path / "remote.git"
+    hook = hub / ".git" / "hooks" / "pre-push"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f'c=$(cat "{count}" 2>/dev/null || echo 0); echo $((c + 1)) > "{count}"\n'
+        # On the FIRST gate run only, a sibling wins the push race by advancing origin/main.
+        f'if [ ! -f "{advanced}" ]; then\n'
+        f'  touch "{advanced}"\n'
+        "  d=$(mktemp -d)\n"
+        f'  git clone -q "{remote}" "$d/c" >/dev/null 2>&1 || exit 0\n'
+        '  ( cd "$d/c" \\\n'
+        "    && git config user.email t@t.t && git config user.name t \\\n"
+        "    && git config commit.gpgsign false \\\n"
+        '    && printf "sib\\n" > sib.txt && git add sib.txt \\\n'
+        '    && git commit -qm "feat: sibling" -m "Refs #0" \\\n'
+        "    && git push -q origin main ) >/dev/null 2>&1 || exit 0\n"
+        "fi\n"
+        "exit 0\n"
+    )
+    hook.chmod(0o755)
+
+    proc, _ = _run_land(hub, tmp_path, "1")
+
+    assert proc.returncode == 0, proc.stderr + "\n---\n" + proc.stdout
+    assert int(count.read_text().strip()) >= 2, (
+        "the retry must RE-RUN the gate on the re-merged tree"
+    )
+    head = _git(hub, "rev-parse", "HEAD").strip()
+    assert _remote_sha(hub, "main") == head, "the hub must end at origin, not behind it"
+    assert (hub / "feature-1-racy.txt").exists(), "the spoke's work landed after recovery"
