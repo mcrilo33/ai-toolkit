@@ -149,8 +149,21 @@ wt_resolve_agent_model() {
   elif [ -f "$script_dir/ai_toolkit_config.py" ] && [ -f "$config" ]; then
     eval "$(python3 "$script_dir/ai_toolkit_config.py" spoke-env "$config" 2>/dev/null || true)"
   fi
-  WT_AGENT_MODEL="${WT_AGENT_MODEL:-${WT_AGENT_MODEL_DEFAULT:-claude-opus-4-8[1m]}}"
-  WT_AGENT_EFFORT="${WT_AGENT_EFFORT:-${WT_AGENT_EFFORT_DEFAULT:-max}}"
+  # Literal fallback when neither spoke-model.env nor the config is readable (a
+  # config-less self-copy — the drain's temp copy omits spoke-model.env on every
+  # recycle, #306). This value is what a spoke ACTUALLY launches on in that case, so
+  # it must be a SANE default, not the priciest tier: an earlier `claude-opus-4-8[1m]`
+  # / `max` literal silently dispatched the drain's spokes on the 1M premium tier
+  # whenever the self-copy lacked the config (observed thrice: the budget-routing
+  # land, #291, #305). A silent fallback to the MOST expensive option is the worst
+  # shape a default can have. `claude-opus-4-8` (no 1m) / `high` matches the intended
+  # driver default and keeps compaction on. When the config IS present it wins, so
+  # a Sonnet/budget posture is still honored — this only bounds the config-less case.
+  if [ -z "${WT_AGENT_MODEL:-}" ] && [ -z "${WT_AGENT_MODEL_DEFAULT:-}" ]; then
+    wt_warn "spoke model config not found (no spoke-model.env / config) — using the safe default claude-opus-4-8/high; a synced target or seeded self-copy should override this (see #306)" || true
+  fi
+  WT_AGENT_MODEL="${WT_AGENT_MODEL:-${WT_AGENT_MODEL_DEFAULT:-claude-opus-4-8}}"
+  WT_AGENT_EFFORT="${WT_AGENT_EFFORT:-${WT_AGENT_EFFORT_DEFAULT:-high}}"
 }
 
 # --- client-side telemetry config resolution (issue #228) -----------------------

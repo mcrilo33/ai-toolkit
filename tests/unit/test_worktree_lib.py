@@ -2106,3 +2106,40 @@ def test_wt_marker_script_dir_defaults_when_neither_present(tmp_path: Path) -> N
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == ".ai-toolkit/scripts"
+
+
+def test_config_less_model_fallback_is_a_sane_non_1m_default() -> None:
+    # #306: when a self-copy has no spoke-model.env and no readable config (the drain's
+    # temp copy on every recycle), wt_resolve_agent_model falls to a literal. That literal
+    # is what a spoke ACTUALLY launches on, so it must NOT be the priciest tier — the old
+    # claude-opus-4-8[1m]/max silently dispatched drain spokes on the 1M premium tier
+    # (observed thrice). It must be a sane opus/high (no 1m), and the config wins when present.
+    result = _call(
+        "wt_resolve_agent_model /nonexistent-dir /nonexistent-config; "
+        'echo "M=$WT_AGENT_MODEL E=$WT_AGENT_EFFORT"'
+    )
+
+    assert "M=claude-opus-4-8 E=high" in result.stdout, result.stdout
+    assert "[1m]" not in result.stdout, "the config-less fallback must never be the 1M tier (#306)"
+
+
+def test_config_less_fallback_warns_loudly() -> None:
+    # A silent fallback to a hardcoded model hides config loss (it cost real money thrice).
+    # The fallback must announce itself on stderr so the miss is visible.
+    result = _call("wt_resolve_agent_model /nonexistent-dir /nonexistent-config")
+
+    assert "model config not found" in result.stderr, result.stderr
+
+
+def test_present_config_overrides_the_literal_fallback(tmp_path: Path) -> None:
+    # The literal is ONLY a last resort — a real spoke-model.env (e.g. a Sonnet budget
+    # posture) must still win, so this fix never overrides an intended routing.
+    (tmp_path / "spoke-model.env").write_text(
+        "WT_AGENT_MODEL_DEFAULT=claude-sonnet-5\nWT_AGENT_EFFORT_DEFAULT=high\n"
+    )
+    result = _call(
+        f"wt_resolve_agent_model {tmp_path} /nonexistent-config; "
+        'echo "M=$WT_AGENT_MODEL E=$WT_AGENT_EFFORT"'
+    )
+
+    assert "M=claude-sonnet-5 E=high" in result.stdout, result.stdout
