@@ -334,6 +334,15 @@ _gb_tlog_event() {
   wt_tlog_event "$1" "$2" gate-broker.sh "$3" "$4" "${5:-}"
 }
 
+# _gb_lane_event <issue> <event> <lane> <sig> [evidence-json] -> the guard-first front the wiring
+# calls: the transition-log guard runs BEFORE the episode is derived, so when the lib is absent
+# the shadow path is a STRICT no-op (not even the persisted-park-sig file read fires). <sig> is
+# the caller's captured park signature (empty ⇒ derive from the persisted record).
+_gb_lane_event() {
+  command -v wt_tlog_event >/dev/null 2>&1 || return 0
+  _gb_tlog_event "$1" "$2" "$3" "$(_gb_episode_key "$1" "$4")" "${5:-}"
+}
+
 # --- decision journal + warn-and-continue (issue #241) ------------------------
 # The /afk answerer ALWAYS answers: every former terminal stop site (escalate-blocked, reap,
 # ceiling, void, inject-failure, dispatch/land/auth halts) now TAKES the best action, WARNS
@@ -410,8 +419,8 @@ broker_journal_decision() {
   # #300 step 3b: the #277 plan-restatement fast-path is the ONLY decision journaled with park
   # kind `gate` (the answer/permission/ceiling kinds journal under their own names) — surface it
   # as a `waived` lane event so a detector reads the auto-approval explicitly. Shadow, best-effort.
-  [ "$park" = gate ] && _gb_tlog_event "$issue" waived gate "$(_gb_episode_key "$issue")" \
-    "{\"rev\":\"$rev\"}"
+  [ "$park" = gate ] && _gb_lane_event "$issue" waived gate "" \
+    "{\"rev\":\"$(_broker_json_escape "$rev")\"}"
   return 0
 }
 
@@ -558,8 +567,8 @@ broker_warn_continue() {
   # escalation. Shadow-only, episode from the persisted park-sig (no pane read).
   local _gb_ev=escalated
   [ "$park" = answer ] && _gb_ev=answer_dropped
-  _gb_tlog_event "$issue" "$_gb_ev" "$park" "$(_gb_episode_key "$issue")" \
-    "{\"rev\":\"$rev\",\"reason\":\"$(_broker_json_escape "$decision")\"}"
+  _gb_lane_event "$issue" "$_gb_ev" "$park" "" \
+    "{\"rev\":\"$(_broker_json_escape "$rev")\",\"reason\":\"$(_broker_json_escape "$decision")\"}"
   return 0
 }
 
@@ -837,8 +846,7 @@ run_answerer() {
   # #300 step 3b: the reasoner just computed a decision — record it. lane defaults to the answer
   # lane; the permission reasoner runs us under AFK_TLOG_LANE=permission so its own compute is
   # labelled correctly. Shadow-only, episode from the persisted park-sig (no pane read).
-  _gb_tlog_event "$issue" answer_computed "${AFK_TLOG_LANE:-answer}" \
-    "$(_gb_episode_key "$issue")" "{\"rc\":$rc}"
+  _gb_lane_event "$issue" answer_computed "${AFK_TLOG_LANE:-answer}" "" "{\"rc\":$rc}"
   return "$rc"
 }
 

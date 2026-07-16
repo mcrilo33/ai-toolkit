@@ -208,7 +208,7 @@ path to tell the spoke>'."
     APPROVE*)
       # #300 step 3b: the reasoned permission verdict — approve_decided, keyed by the park episode
       # the caller already captured ($sig). The delivery (approval_injected) is hub-inject's.
-      _gb_tlog_event "$issue" approve_decided permission "$(_gb_episode_key "$issue" "$sig")" \
+      _gb_lane_event "$issue" approve_decided permission "$sig" \
         '{"decision":"approve","kind":"reasoned"}'
       # #241 review B1: journal the decision to the FILE BEFORE approve_permission delivers the
       # keypress (durable if the inject crashes/races the command it authorized) — file-only, so
@@ -244,7 +244,7 @@ path to tell the spoke>'."
       esac
       [ -n "$guidance" ] || guidance="Declined that command — take the reversible, in-scope path instead."
       # #300 step 3b: the reasoned decline is the same lane decision, recorded with decision=deny.
-      _gb_tlog_event "$issue" approve_decided permission "$(_gb_episode_key "$issue" "$sig")" \
+      _gb_lane_event "$issue" approve_decided permission "$sig" \
         '{"decision":"deny","kind":"reasoned"}'
       # B1 generalized to DENY (#241 review): a provisional FILE line before _deny_permission
       # injects (survives a crash between inject and record), then the OUTCOME. The delivery rc is
@@ -311,8 +311,8 @@ _decide_permission() {
     log "→ auto-approving safe permission for #$issue: $cmd_display"
     # #300 step 3b: the MECHANICAL auto-approve is a lane decision too — approve_decided with
     # kind=mechanical, so a detector tells the fixed-rule fast path from a reasoned verdict.
-    _gb_tlog_event "$issue" approve_decided permission "$(_gb_episode_key "$issue" "$sig")" \
-      '{"decision":"approve","kind":"mechanical"}'
+    _gb_lane_event "$issue" approve_decided permission "$sig" \
+        '{"decision":"approve","kind":"mechanical"}'
     # Stamp the delivery attempt FIRST: the approve→resume window must not read as idle.
     stamp_answer_attempt "$issue"
     # Thread the issue + lane + episode so hub-inject's approval_injected delivery event keys on
