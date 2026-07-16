@@ -24,7 +24,7 @@ import pytest
 # `ps` table and pane-pid answer drive the same primitive, so they live in one place. Only
 # the bash SOURCE is standalone here (that is what this suite exists to prove), not the
 # python fixtures.
-from _gate_broker_support import _DISPLAY_CASE, _agent_ps_stub
+from _gate_broker_support import _DISPLAY_CASE, _PANE_PID, _agent_ps_stub
 
 # hub-inject.sh reads transcript mtimes/sizes with BSD `stat -f` and drives the macOS tmux
 # hub, exactly like its parent hub-afk.sh — so the suite is macOS-only for the same reason.
@@ -870,6 +870,69 @@ def test_pane_agent_alive_ignores_a_claude_outside_the_pane_tree(tmp_path: Path)
     result = _call("_pane_agent_alive 'hub:0'", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
 
     assert result.returncode == 1, "only a DESCENDANT of the pane pid counts as this pane's agent"
+
+
+def test_pane_agent_alive_rejects_a_substring_match_on_the_agent_name(tmp_path: Path) -> None:
+    """The match is the executable BASENAME, anchored — never a bare substring.
+
+    `ps -eo comm=` yields full paths, so an unanchored `node`/`claude` substring would let a
+    process whose path merely CONTAINS the agent name vouch for a dead pane. Here the pane pid's
+    only descendant is `/usr/local/bin/inode-watcher` (contains "node") — the agent is genuinely
+    gone, so the probe must read DEAD. A false ALIVE here re-opens the incident: keys back into a
+    bare shell.
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "tmux").write_text(
+        f'#!/usr/bin/env bash\n[ "$1" = display-message ] && printf "{_PANE_PID}\\n"\nexit 0\n'
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    tbl = fake_bin / "ps_table.txt"
+    tbl.write_text(f"{_PANE_PID} 1 -zsh\n4400 {_PANE_PID} /usr/local/bin/inode-watcher\n")
+    (fake_bin / "ps").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$*" in\n'
+        f'  "-eo pid=,ppid=,comm=") cat "{tbl}" ;;\n'
+        '  *) exec /bin/ps "$@" ;;\n'
+        "esac\n"
+    )
+    (fake_bin / "ps").chmod(0o755)
+
+    result = _call("_pane_agent_alive 'hub:0'", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+
+    assert result.returncode == 1, (
+        "a process whose path merely contains 'node' is not the agent — a substring match here "
+        f"would let a dead pane read alive and re-open the inject hole: {result.stdout}{result.stderr}"
+    )
+
+
+def test_pane_agent_alive_matches_a_full_path_claude_basename(tmp_path: Path) -> None:
+    """The other side: the real IDE agent runs as `.../native-binary/claude` — a full path whose
+    BASENAME is `claude`. Anchoring to the basename must still recognize it as the agent."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "tmux").write_text(
+        f'#!/usr/bin/env bash\n[ "$1" = display-message ] && printf "{_PANE_PID}\\n"\nexit 0\n'
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    tbl = fake_bin / "ps_table.txt"
+    tbl.write_text(
+        f"{_PANE_PID} 1 -zsh\n4500 {_PANE_PID} /Users/x/.vscode/extensions/native-binary/claude\n"
+    )
+    (fake_bin / "ps").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$*" in\n'
+        f'  "-eo pid=,ppid=,comm=") cat "{tbl}" ;;\n'
+        '  *) exec /bin/ps "$@" ;;\n'
+        "esac\n"
+    )
+    (fake_bin / "ps").chmod(0o755)
+
+    result = _call("_pane_agent_alive 'hub:0'", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+
+    assert result.returncode == 0, (
+        f"a full-path claude whose basename is 'claude' is the live agent: {result.stderr}"
+    )
 
 
 def test_pane_agent_alive_is_unprovable_when_the_pane_pid_is_unreadable(tmp_path: Path) -> None:

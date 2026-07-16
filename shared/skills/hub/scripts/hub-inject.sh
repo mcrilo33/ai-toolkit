@@ -192,7 +192,14 @@ _pane_agent_alive() {
   # read silently strands the fields, which here would read as "agent dead" and revive a live
   # spoke. Walk UP from each agent-looking process to see whether this pane is an ancestor —
   # bounded by a hop ceiling so a pid cycle can never spin.
-  printf '%s\n' "$table" | awk -v root="$pane_pid" -v re="${AFK_AGENT_PROC_RE:-[Cc]laude|node}" '
+  #
+  # The agent match is against the executable BASENAME, anchored (AFK_AGENT_PROC_RE, default
+  # `^([Cc]laude|node)$`). `ps -eo comm=` yields the full path (e.g. .../native-binary/claude),
+  # so a bare substring match would let ANY process whose path merely contains "node" or "claude"
+  # — an `inode-watcher`, a `claude-backup` — vouch for a pane whose real agent is dead, re-opening
+  # the exact hole this guard closes. Stripping to the basename and anchoring is what makes the
+  # match mean "this process IS the agent", not "its path mentions the agent".
+  printf '%s\n' "$table" | awk -v root="$pane_pid" -v re="${AFK_AGENT_PROC_RE:-^([Cc]laude|node)$}" '
     {
       parent[$1] = $2
       cmd = $0; sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/, "", cmd)
@@ -200,7 +207,8 @@ _pane_agent_alive() {
     }
     END {
       for (p in comm) {
-        if (comm[p] !~ re) continue
+        base = comm[p]; sub(/.*\//, "", base)   # executable basename (last path component)
+        if (base !~ re) continue
         q = p
         for (hops = 0; q != "" && (q + 0) > 0 && hops < 64; hops++) {
           if ((q + 0) == (root + 0)) exit 0     # the agent is this pane pid, or below it

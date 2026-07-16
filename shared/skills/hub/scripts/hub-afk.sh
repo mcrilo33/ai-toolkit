@@ -613,8 +613,14 @@ _afk_escalate_blocked() {
 # wrong is prose executed as a shell command; liveness instead keeps an unobservable pane ALIVE,
 # because the cost of guessing wrong is killing + relaunching a HEALTHY spoke. So only a PROVEN
 # dead agent (rc 1) flips a mapped pane to dead; rc 0 and rc 2 both read alive.
-# The pane target is resolved ONCE and reused for the probe: a second _spoke_pane_target would
-# be a second `tmux list-panes` against a loaded server, the shape that flaked #269.
+# The pane target is resolved ONCE per call and reused for the probe: a second _spoke_pane_target
+# would be a second `tmux list-panes` against a loaded server, the shape that flaked #269.
+# UPGRADE: memoize the verdict per (wt, tick) if reap-tick cost becomes a problem — this went from
+# one `tmux list-panes` to list-panes + display-message + a `ps -eo` scan, and a single tick calls
+# it several times per spoke across _reap_or_resume / _afk_finish_up_or_revive / recover_dead_panes
+# (plus slot_state's own _detect_agent_dead). Not cached yet on purpose: a per-tick cache risks a
+# stale ALIVE masking a pane that crashed mid-tick, and one ps scan is cheap next to the hours of
+# stranding a miss costs — revisit only if profiling shows the probe dominating a tick.
 _spoke_pane_alive() {
   local target rc
   target="$(_spoke_pane_target "$1")"
