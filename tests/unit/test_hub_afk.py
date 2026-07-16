@@ -2626,6 +2626,31 @@ def test_auto_land_lands_on_clean_approve(spoke_repo: Path, tmp_path: Path) -> N
     assert land_log.read_text().split() == ["5"], "a clean APPROVE verdict must land"
 
 
+def test_auto_land_delegates_to_the_lock_holding_land_script(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # Issue #315: the land mutex that serializes a manual land and the drain's auto_land lives
+    # in worktree-land.sh, and auto_land acquires it TRANSITIVELY — by shelling out to that
+    # script with --skip-tests, never merging/pushing the base branch itself. This guards that
+    # wiring: were auto_land ever refactored to land inline, it would bypass the lock and reopen
+    # the #315 race, and this assertion on the exact delegated argv would fail.
+    subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    _seed_clean_review(spoke_repo)
+    land_log = tmp_path / "land-argv.log"
+    stub = tmp_path / "wtland.sh"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{land_log}"\n')
+    stub.chmod(0o755)
+    statedir = tmp_path / "statedir"
+    expr = f'inflight_worktrees() {{ printf "{spoke_repo}\\t5\\n"; }}; auto_land'
+
+    _call(expr, env={"WT_LAND": str(stub), "AFK_STATE_DIR": str(statedir), "AFK_REVIEW_GATE": "1"})
+
+    argv = land_log.read_text().strip()
+    assert argv.split() == ["5", "--skip-tests"], (
+        f"auto_land must delegate the land to the lock-holding worktree-land.sh, not land inline: {argv!r}"
+    )
+
+
 def test_auto_land_warns_on_request_changes(spoke_repo: Path, tmp_path: Path) -> None:
     subprocess.run(["git", "tag", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
     # Latest-wins: an older APPROVE then a newer REQUEST_CHANGES ⇒ the reviewer's FINAL
