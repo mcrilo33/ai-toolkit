@@ -147,6 +147,85 @@ _spoke_pane_target() {
   done < <(tmux list-panes -a -F '#{session_name}:#{window_index}'$'\t''#{pane_current_path}' 2>/dev/null)
   return 0
 }
+# --- #301: the agent must be RUNNING before any keystroke reaches the pane -----
+#
+# A tmux pane OUTLIVES the agent that ran in it: _afk_open_spoke_window launches the spoke as
+# `sh -c "<cmd>; exec zsh"`, so when claude dies (reboot, OOM, a human quitting it) the pane
+# stays alive running a bare shell IN THE WORKTREE. Every pane read (list-panes, capture-pane)
+# still answers, and the dialog claude rendered before dying is still in the scrollback — so
+# the pane looks exactly like a parked, healthy spoke.
+#
+# On 2026-07-15 that shape ate two spokes: the answerer typed its answer into the surviving
+# zsh, which read the prose as a COMMAND (zsh's autocorrect caught a mangled first word; only
+# luck kept it from executing). Text injected into a pane whose agent is gone is not a lost
+# answer — it is arbitrary shell input in a git worktree. Hence a HARD precondition here, in
+# the primitives, so every lane (answer, permission approve, nudge, watchdog) inherits it.
+#
+# _pane_agent_alive <pane_target> -> is the agent running in this pane?
+#   rc 0 — a process matching AFK_AGENT_PROC_RE is the pane pid or one of its descendants.
+#   rc 1 — the pane's tree holds no agent: PROVEN dead (the incident's bare shell).
+#   rc 2 — UNPROVABLE (no tmux, no pane pid, no readable process table). Callers must choose
+#          their own safe direction: a WRITE refuses (never type into an unobservable pane),
+#          while liveness reads it as alive (never kill a spoke we merely cannot observe).
+#
+# Why the process TREE and not `#{pane_current_command}`: a LIVE spoke's pane reports `zsh`.
+# The launcher shell is the pane's process-group leader and claude runs beneath it, so the
+# pane's own command is `zsh` whether the agent is alive or dead — it cannot tell them apart.
+# Verified on this hub: pane pid 43305 (zsh) with claude 43308 as its child.
+#
+# Why `ps` and not `pgrep -P`: BSD pgrep excludes the CALLER'S OWN ANCESTORS by default (see
+# `man pgrep`: "-a  Include process ancestors in the match list. By default, the current pgrep
+# or pkill process and all of its ancestors are excluded"). That makes the answer depend on WHO
+# is asking — this file also ships a CLI meant to be driven as a subprocess, and run from inside
+# a spoke's own tree a pgrep probe would report that spoke's LIVE agent as dead and refuse to
+# serve it. A liveness primitive must not have a "depends who's asking" answer. One `ps`
+# snapshot is caller-independent, and cheaper than the pgrep-per-node a recursive walk costs.
+_pane_agent_alive() {
+  local target="$1" pane_pid table
+  command -v tmux >/dev/null 2>&1 || return 2
+  [ -n "$target" ] || return 2
+  pane_pid="$(tmux display-message -p -t "$target" '#{pane_pid}' 2>/dev/null | tr -d '[:space:]')"
+  case "$pane_pid" in '' | *[!0-9]*) return 2 ;; esac   # no readable pane pid ⇒ no evidence
+  table="$(LC_ALL=C ps -eo pid=,ppid=,comm= 2>/dev/null)" || return 2
+  [ -n "$table" ] || return 2
+  # LC_ALL=C on the ps read is the repo's locale trap (#189): a localized/8-bit-hostile column
+  # read silently strands the fields, which here would read as "agent dead" and revive a live
+  # spoke. Walk UP from each agent-looking process to see whether this pane is an ancestor —
+  # bounded by a hop ceiling so a pid cycle can never spin.
+  printf '%s\n' "$table" | awk -v root="$pane_pid" -v re="${AFK_AGENT_PROC_RE:-[Cc]laude|node}" '
+    {
+      parent[$1] = $2
+      cmd = $0; sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/, "", cmd)
+      comm[$1] = cmd
+    }
+    END {
+      for (p in comm) {
+        if (comm[p] !~ re) continue
+        q = p
+        for (hops = 0; q != "" && (q + 0) > 0 && hops < 64; hops++) {
+          if ((q + 0) == (root + 0)) exit 0     # the agent is this pane pid, or below it
+          q = parent[q]
+        }
+      }
+      exit 1
+    }'
+}
+
+# _pane_agent_ready <pane_target> -> rc 0 only when the agent is PROVEN alive. The write-side
+# reading of _pane_agent_alive: rc 2 (unprovable) fails CLOSED, because the cost of guessing
+# wrong is prose executed as shell, while the cost of refusing is one logged non-delivery that
+# the caller's existing escalation (#281) already surfaces. Every keystroke primitive below
+# passes through here, so no lane can opt out by construction.
+_pane_agent_ready() {
+  local target="$1" rc
+  _pane_agent_alive "$target"; rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  [ "$rc" -eq 1 ] \
+    && log "  refusing to send keys to $target: no agent is running in that pane (#301)" \
+    || log "  refusing to send keys to $target: could not prove an agent is running (#301)"
+  return 1
+}
+
 # inject_answer <pane_target> <text> -> type the answer into the spoke and submit it.
 # A PLAN gate renders as an interactive AskUserQuestion MENU (tab/arrow/enter) that
 # IGNORES typed free text, so the most common gate is never answered by a bare inject
@@ -155,10 +234,13 @@ _spoke_pane_target() {
 # spoke is already at a plain text prompt. A short, tunable pause lets that prompt
 # re-render before we type. Then `send-keys -l` sends the text literally (no key-name
 # interpretation) and a separate Enter submits — the gotcha-proof re-drive pattern.
+# Refuses outright when no agent is running in the pane (#301): the text would land in the
+# surviving shell as a command.
 inject_answer() {
   local target="$1" text="$2"
   command -v tmux >/dev/null 2>&1 || return 1
   [ -n "$target" ] || return 1
+  _pane_agent_ready "$target" || return 1
   tmux send-keys -t "$target" Escape 2>/dev/null || return 1
   sleep "${AFK_INJECT_MENU_PAUSE:-0.3}" 2>/dev/null || true
   tmux send-keys -t "$target" -l -- "$text" 2>/dev/null || return 1
@@ -409,8 +491,13 @@ _approve_pane_snapshot() { tmux capture-pane -p -t "$1" 2>/dev/null; }
 # Factored out so the retry cannot drift from the first attempt: both paths send the digit and
 # the Enter together, which is what keeps the "never a bare Enter" invariant true by construction
 # rather than by convention.
+# This lane does NOT go through inject_answer, so it carries the #301 precondition itself: a
+# permission dialog left in a dead pane's scrollback still matches the prompt regex, and "1"
+# + Enter typed into the surviving shell would run `1` as a command. Placing the guard here
+# (rather than only in approve_permission) also covers the retry.
 _approve_send_selection() {
   local target="$1"
+  _pane_agent_ready "$target" || return 1
   tmux send-keys -t "$target" 1 2>/dev/null || return 1
   tmux send-keys -t "$target" Enter 2>/dev/null || return 1
 }

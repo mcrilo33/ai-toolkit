@@ -132,6 +132,7 @@ def _write_fake_tmux(
     on_enter: str = ":",
     on_capture: str = ":",
     pane_path: Path | None = None,
+    agent_alive: bool = True,
 ) -> Path:
     """Fake tmux encoding inject_answer's key contract (Escape, `send-keys -l --`
     paste, separate Enter): one single-line bash snippet runs per event, capture-pane
@@ -140,6 +141,11 @@ def _write_fake_tmux(
     pane_path additionally makes list-panes advertise an afk:1 pane at that path
     (for callers that locate the pane via _spoke_pane_target). Returns the bin dir
     to prepend to PATH.
+
+    Since #301 every keystroke primitive first proves an agent is RUNNING in the pane, so
+    the builder answers that probe too — `agent_alive=True` by default, because these tests
+    exercise delivery into a healthy spoke. Without it every inject here would refuse and
+    the suite would go green on refusals rather than on the contract it means to pin.
     """
     list_panes = f'printf "afk:1\\t%s\\n" "{pane_path}"' if pane_path else ":"
     fake_bin = tmp_path / "bin"
@@ -154,9 +160,11 @@ def _write_fake_tmux(
         "    esac ;;\n"
         f"  capture-pane) {on_capture} ;;\n"
         f"  list-panes) {list_panes} ;;\n"
+        f"{_DISPLAY_CASE}"
         "esac\nexit 0\n"
     )
     (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin, agent_alive=agent_alive)
     return fake_bin
 
 
@@ -213,7 +221,46 @@ def _result_event(text: str) -> str:
 # ── subtask C: attended QCM surface + interactive per-gate resolver ────────────
 
 
-def _fake_tmux_pane(fake_bin: Path, wt: Path, jsonl: Path) -> Path:
+# ── #301: the agent-liveness probe's two stubbed halves ───────────────────────
+#
+# The probe reads the pane's pid from tmux, then looks for the agent among that pid's
+# DESCENDANTS in a `ps` snapshot. The pane pid is ALWAYS a bare shell — that is the point of
+# the incident: a LIVE spoke's pane reports `pane_current_command=zsh` exactly like a dead
+# one, because the launcher shell is the process-group leader and claude runs beneath it. So
+# the ONLY thing separating the two shapes is whether a `claude` descendant exists.
+_PANE_PID = 4242
+_AGENT_PID = 4243
+_DISPLAY_CASE = f'  display-message) printf "{_PANE_PID}\\n" ;;\n'
+
+
+def _agent_ps_stub(fake_bin: Path, *, agent_alive: bool = True) -> None:
+    """PATH-stub `ps` for the #301 agent probe. Default ALIVE: a stub that silently reported
+    every pane's agent as dead would disable the inject lane across the whole suite, and the
+    tests that pin delivery would pass for the wrong reason.
+
+    Only the probe's exact `-eo pid=,ppid=,comm=` form is answered; every other `ps` call
+    execs the REAL ps — hub-afk reads `-o comm= -p`, `-o command= -p` and a
+    `-o pid,stat,etime,wchan` hang snapshot through the same PATH, and a blanket stub would
+    silently corrupt them.
+    """
+    table = f"{_PANE_PID} 1 -zsh\n"
+    if agent_alive:
+        table += f"{_AGENT_PID} {_PANE_PID} claude\n"
+    # A foreign claude OUTSIDE this pane's tree: it must never vouch for this pane.
+    table += "999 1 /Applications/Other.app/Contents/MacOS/claude\n"
+    tbl = fake_bin / "ps_table.txt"
+    tbl.write_text(table)
+    (fake_bin / "ps").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$*" in\n'
+        f'  "-eo pid=,ppid=,comm=") cat "{tbl}" ;;\n'
+        '  *) exec /bin/ps "$@" ;;\n'
+        "esac\n"
+    )
+    (fake_bin / "ps").chmod(0o755)
+
+
+def _fake_tmux_pane(fake_bin: Path, wt: Path, jsonl: Path, *, agent_alive: bool = True) -> Path:
     """A tmux stub: list-panes maps a pane to <wt>; the submitting Enter records the pasted
     answer as a type:"user" turn (what Claude Code really writes on submit); send-keys logged.
 
@@ -247,6 +294,7 @@ def _fake_tmux_pane(fake_bin: Path, wt: Path, jsonl: Path) -> Path:
         f'printf "%s\\n" "$*" >> "{log}"\n'
         'case "$1" in\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{wt}" ;;\n'
+        f"{_DISPLAY_CASE}"
         "  send-keys)\n"
         '    case "$*" in\n'
         f'      *" -l "*) printf "%s" "${{@: -1}}" > "{paste}" ;;\n'
@@ -258,6 +306,7 @@ def _fake_tmux_pane(fake_bin: Path, wt: Path, jsonl: Path) -> Path:
         "esac\nexit 0\n"
     )
     (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin, agent_alive=agent_alive)
     return log
 
 

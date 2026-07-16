@@ -20,6 +20,12 @@ from pathlib import Path
 
 import pytest
 
+# The agent-probe stubs (#301) are shared with the hub-afk / gate-broker suites: the same
+# `ps` table and pane-pid answer drive the same primitive, so they live in one place. Only
+# the bash SOURCE is standalone here (that is what this suite exists to prove), not the
+# python fixtures.
+from _gate_broker_support import _DISPLAY_CASE, _agent_ps_stub
+
 # hub-inject.sh reads transcript mtimes/sizes with BSD `stat -f` and drives the macOS tmux
 # hub, exactly like its parent hub-afk.sh — so the suite is macOS-only for the same reason.
 pytestmark = pytest.mark.skipif(
@@ -51,44 +57,6 @@ def _run_cli(*args: str, env: dict[str, str] | None = None) -> subprocess.Comple
     return subprocess.run(
         ["bash", str(HUB_INJECT), *args], capture_output=True, text=True, env=full_env
     )
-
-
-# The agent-liveness probe (#301) reads the pane's pid from tmux, then looks for the agent
-# among that pid's DESCENDANTS in a `ps` snapshot. Both halves are stubbed here.
-_PANE_PID = 4242
-_AGENT_PID = 4243
-# Every tmux stub answers `display-message` with the pane pid, so the probe can resolve it.
-_DISPLAY_CASE = f'  display-message) printf "{_PANE_PID}\\n" ;;\n'
-
-
-def _agent_ps_stub(fake_bin: Path, *, agent_alive: bool = True) -> None:
-    """PATH-stub `ps` for the #301 agent probe: is the agent a descendant of the pane pid?
-
-    The pane pid is ALWAYS a bare shell — that is the whole point of the incident. A live
-    spoke's pane reports `pane_current_command=zsh` exactly like a dead one (the launcher
-    shell is the pgrp leader; claude runs as its child), so the ONLY thing separating the
-    two shapes is whether a `claude` descendant exists. `agent_alive=False` is the incident:
-    a pane whose agent died but whose shell survived `exec $SHELL`.
-
-    Only the probe's exact `-eo pid=,ppid=,comm=` form is answered; every other `ps` call
-    (hub-afk's `-o comm= -p`, `-o command= -p`, the hang-capture snapshot) execs the REAL
-    ps, so a stub on PATH can never silently corrupt an unrelated process read.
-    """
-    table = f"{_PANE_PID} 1 -zsh\n"
-    if agent_alive:
-        table += f"{_AGENT_PID} {_PANE_PID} claude\n"
-    # A foreign claude that is NOT under this pane: the probe must not mistake it for ours.
-    table += "999 1 /Applications/Other.app/Contents/MacOS/claude\n"
-    tbl = fake_bin / "ps_table.txt"
-    tbl.write_text(table)
-    (fake_bin / "ps").write_text(
-        "#!/usr/bin/env bash\n"
-        'case "$*" in\n'
-        f'  "-eo pid=,ppid=,comm=") cat "{tbl}" ;;\n'
-        '  *) exec /bin/ps "$@" ;;\n'
-        "esac\n"
-    )
-    (fake_bin / "ps").chmod(0o755)
 
 
 def _recording_tmux(tmp_path: Path, *, agent_alive: bool = True) -> tuple[Path, Path]:
@@ -261,6 +229,11 @@ exit 0
 
 
 def _sends(log: Path) -> list[str]:
+    # A MISSING log is the strongest "no keystrokes" evidence there is: the stub never ran a
+    # branch that writes it. Since #301 a refused inject can leave the pane entirely untouched,
+    # so an absent log is an expected outcome, not a broken fixture.
+    if not log.exists():
+        return []
     return [ln for ln in log.read_text().splitlines() if "send-keys" in ln]
 
 

@@ -30,7 +30,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from _gate_broker_support import _fake_tmux_pane
+from _gate_broker_support import _DISPLAY_CASE, _agent_ps_stub, _fake_tmux_pane
 from bash_session import BashSession, fresh_call
 
 # hub-afk.sh targets the macOS control plane: it reads transcript mtimes with BSD
@@ -1018,10 +1018,12 @@ def test_decide_and_act_stamps_answer_attempt(spoke_repo: Path, tmp_path: Path) 
         "#!/usr/bin/env bash\n"
         'case "$1" in\n'
         f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        f"{_DISPLAY_CASE}"
         f'  send-keys) case "$*" in *Enter*) printf "{{}}\\n" >> "{jsonl}" ;; esac ;;\n'
         "esac\nexit 0\n"
     )
     (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin)
     statedir = tmp_path / "statedir"
     statedir.mkdir()
     env = {
@@ -1132,13 +1134,21 @@ def test_spoke_idle_seconds_prefers_fresher_transcript(spoke_repo: Path, tmp_pat
 # opens a free-text prompt — then inject the literal answer and submit with Enter.
 
 
-def _recording_tmux(tmp_path: Path) -> tuple[Path, Path]:
+def _recording_tmux(tmp_path: Path, *, agent_alive: bool = True) -> tuple[Path, Path]:
     """A tmux stub that appends each invocation's args to a log and exits 0."""
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
     log = tmp_path / "tmux.log"
-    (fake_bin / "tmux").write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\nexit 0\n')
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> "{log}"\n'
+        'case "$1" in\n'
+        f"{_DISPLAY_CASE}"
+        "esac\n"
+        "exit 0\n"
+    )
     (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin, agent_alive=agent_alive)
     return fake_bin, log
 
 
@@ -1297,6 +1307,7 @@ def _injector_tmux(
         f'  capture-pane) cat "{capture_file}" 2>/dev/null ;;\n'
         f'  list-panes) cat "{panes}" 2>/dev/null ;;\n'
         f'  list-windows) cat "{windows}" 2>/dev/null ;;\n'
+        f"{_DISPLAY_CASE}"
         "  new-window)\n"
         f"    [ {1 if fail_new_window else 0} -eq 1 ] && exit 1\n"
         f"    {touch_cmd}\n"
@@ -1316,6 +1327,7 @@ def _injector_tmux(
         "exit 0\n"
     )
     (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin)
     return fake_bin, log
 
 
@@ -2052,9 +2064,14 @@ def test_decide_and_act_warns_when_answer_does_not_register(
     (fake_bin / "gh").chmod(0o755)
     # Pane maps, send-keys succeeds, but the transcript is never advanced.
     (fake_bin / "tmux").write_text(
-        f'#!/usr/bin/env bash\ncase "$1" in\n  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\nesac\nexit 0\n'
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        f"{_DISPLAY_CASE}"
+        "esac\nexit 0\n"
     )
     (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin)
 
     env = {
         "CLAUDE_PROJECTS_DIR": str(projects),
