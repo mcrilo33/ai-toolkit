@@ -66,6 +66,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${LAND_LOCK_WAIT_MAX:=1200}"        # hard cap (s) to wait before failing loud
 : "${LAND_LOCK_STALE_SECONDS:=1800}"   # break even a live-looking holder past this age (0 disables)
 : "${LAND_LOCK_POLL:=2}"               # poll interval (s) between acquire attempts
+: "${LAND_LOCK_PUSH_RETRIES:=1}"       # non-ff push-recovery re-merge+retry attempts (issue #315)
+case "$LAND_LOCK_PUSH_RETRIES" in '' | *[!0-9]*) LAND_LOCK_PUSH_RETRIES=1 ;; esac
 # Sanitize a garbage value to the SAFE default, never to 0 (Principle 2): a STALE_SECONDS
 # silently zeroed would read EVERY live lock as stale and disable the mutex. An EXPLICIT
 # numeric 0 is honored as "no age backstop" (dead-pid break only), handled in _land_lock_stale.
@@ -445,6 +447,29 @@ else
     || wt_die "branch $WT_BRANCH has an upstream — not a micro-spoke; land it without --local"
 fi
 
+# --- heal a hub left behind origin (issue #315) ---------------------------------
+# Under the land lock, and with origin freshly fetched, fast-forward local $DEFAULT up to
+# origin/$DEFAULT when it is strictly BEHIND — the exact state a prior racy land's
+# `git reset --keep` produced (#315). Doing it here, before the ISSUES range derivation and
+# the merge, makes PRE_SHA the current remote tip so the push is a clean fast-forward and the
+# hub is never left behind. A hub carrying its OWN local commits (ahead of / diverged from
+# origin, e.g. a not-yet-pushed hub change) is NOT an ancestor of origin/$DEFAULT, so this
+# skips it and the normal merge+push handles it (a genuine non-ff at push is recovered below).
+ORIGIN_DEFAULT="refs/remotes/origin/$DEFAULT"
+land_heal_behind() {
+  [ -z "$LOCAL" ] || return 0
+  git rev-parse -q --verify "$ORIGIN_DEFAULT" >/dev/null 2>&1 || return 0
+  local head origin
+  head="$(git rev-parse HEAD)"
+  origin="$(git rev-parse "$ORIGIN_DEFAULT")"
+  [ "$head" != "$origin" ] || return 0
+  git merge-base --is-ancestor "$head" "$origin" 2>/dev/null || return 0   # ahead/diverged -> leave it
+  echo "→ fast-forwarding local $DEFAULT up to origin/$DEFAULT (behind by an origin advance, issue #315)"
+  git merge --ff-only "$ORIGIN_DEFAULT" >/dev/null \
+    || wt_die "could not fast-forward local $DEFAULT to origin/$DEFAULT — reconcile by hand, then re-run"
+}
+land_heal_behind
+
 # Issue number = leading number of the branch slug (feature/42-foo → 42);
 # ad-hoc branches have none and skip the issue close.
 BSLUG="${WT_BRANCH##*/}"
@@ -791,7 +816,70 @@ land_rollback() {
   rm -f "$PUSH_LOG"
   wt_warn "$1 — rolling back: git reset --keep $PRE_SHA"
   land_reset_keep_or_die
+  # Never leave the hub BEHIND origin (issue #315): if origin advanced under us, re-fetch and
+  # ff local $DEFAULT back up to it (best-effort) so even a FAILED land is at origin, not behind.
+  if [ -z "$LOCAL" ]; then
+    git fetch origin --quiet 2>/dev/null || true
+    land_heal_behind || true
+  fi
   wt_die "landing aborted; nothing was pushed. Fix on the branch (push from the spoke when it has one) and re-run."
+}
+
+# land_push_remote_advanced -> rc 0 when PUSH_LOG carries a signature that origin/$DEFAULT moved
+# UNDER us specifically: a non-fast-forward / fetch-first rejection, or the compare-and-swap
+# "cannot lock ref ... is at X but expected Y" a concurrent push to the same ref produces. Kept
+# NARROW on purpose: a bare "[remote rejected]" / "failed to update ref" also accompanies a
+# server-side POLICY decline (a pre-receive hook), which a re-fetch+retry can never fix and must
+# still roll back (issue #315). A pre-push GATE failure exits before transfer and matches none.
+land_push_remote_advanced() {
+  grep -qiE 'non-fast-forward|fetch first|cannot lock ref' "$PUSH_LOG"
+}
+
+# land_nonff_recover -> a push the remote refused because origin advanced under us, reconciled
+# and retried under the still-held land lock — up to LAND_LOCK_PUSH_RETRIES times (issue #315).
+# Each attempt: roll our merge back, re-fetch, ff local $DEFAULT to the NEW origin tip, RE-MERGE
+# the branch (a NEW combined tree), and re-push. The re-merge is untested, so the retry RE-RUNS
+# its gate — a gated land pushes through land_push "" so the pre-push hook fires on the new
+# HEAD^{tree} (which has no green stamp), and a --skip-tests land re-runs the bounded merge-sanity
+# check on the fresh diverged tree first. Updates PRE_SHA/MERGED_SHA/SUITE_RESULT and returns 0
+# when a retry lands; returns 1 (caller rolls back) on a fresh conflict, a fetch/ff failure, a
+# non-advance push failure, or exhausted retries.
+land_nonff_recover() {
+  local attempt=0 conflict_files ms_rc
+  while [ "$attempt" -lt "$LAND_LOCK_PUSH_RETRIES" ]; do
+    attempt=$(( attempt + 1 ))
+    wt_warn "push refused: origin/$DEFAULT advanced under the land — reconciling and retrying under the lock (attempt $attempt/$LAND_LOCK_PUSH_RETRIES, issue #315)"
+    git reset --keep "$PRE_SHA" || { wt_warn "recovery: reset --keep failed"; return 1; }
+    git fetch origin --quiet 2>/dev/null || git fetch origin --quiet 2>/dev/null \
+      || { wt_warn "recovery: re-fetch from origin failed"; return 1; }
+    git merge --ff-only "$ORIGIN_DEFAULT" >/dev/null 2>&1 \
+      || { wt_warn "recovery: could not fast-forward to origin/$DEFAULT"; return 1; }
+    PRE_SHA="$(git rev-parse HEAD)"
+    if ! git merge --no-edit "$WT_BRANCH"; then
+      conflict_files="$(git diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ' || true)"
+      git merge --abort 2>/dev/null || true
+      wt_warn "recovery: re-merge now conflicts with $DEFAULT on: ${conflict_files:-unknown}"
+      return 1   # a fresh deterministic conflict — caller rolls back (auto_land routes to #285)
+    fi
+    MERGED_SHA="$(git rev-parse HEAD)"
+    # --skip-tests + a real merge commit builds an untested combined tree: re-run the bounded
+    # merge-sanity check on it (issue #174) before re-pushing skipped. A gated land instead
+    # re-runs the full gate via the hook on land_push "" below, so it needs nothing here.
+    if [ -n "$SKIP_TESTS" ] && [ "$MERGED_SHA" != "$(git rev-parse "refs/heads/$WT_BRANCH")" ]; then
+      ms_rc=0; run_merge_sanity || ms_rc=$?
+      [ "$ms_rc" -ne 1 ] || { wt_warn "recovery: merge-sanity failed on the re-merged tree (issue #174)"; return 1; }
+    fi
+    PUSH_RC=0
+    land_push "" 2>&1 | tee "$PUSH_LOG" || PUSH_RC=$?
+    if [ "$PUSH_RC" -eq 0 ]; then
+      SUITE_RESULT="$SUITE_RESULT; origin advanced mid-land — re-merged on the fresh tip and re-pushed under the lock (issue #315)"
+      return 0
+    fi
+    land_push_remote_advanced || { wt_warn "recovery: retry push failed for a non-advance reason"; return 1; }
+    # origin advanced AGAIN — loop for another bounded attempt
+  done
+  wt_warn "recovery: exhausted $LAND_LOCK_PUSH_RETRIES retry attempt(s) — origin keeps advancing under the land (issue #315)"
+  return 1
 }
 
 # Capture the push's combined output while streaming it live: tee exits 0 and
@@ -834,6 +922,13 @@ if [ "$PUSH_RC" -ne 0 ]; then
     else
       land_rollback "push exited $PUSH_RC with no test summary and no green-tree stamp for this tree — the gate was killed mid-run (not a post-green transport death), or no stamp was minted; refusing to retry with the suite skipped. Re-run the land to re-run the gate (issue #214)"
     fi
+  elif land_push_remote_advanced; then
+    # origin/$DEFAULT advanced under us (a push race despite the lock — a non-honoring pusher
+    # or CI): reconcile + retry under the lock rather than rolling back behind origin (issue
+    # #315). If recovery can't complete, land_rollback re-syncs to origin so the hub is never
+    # left behind, then aborts.
+    land_nonff_recover \
+      || land_rollback "push rejected: origin advanced under the land and automatic recovery could not complete (issue #315)"
   else
     land_rollback "push rejected (pre-push test gate or remote)"
   fi
