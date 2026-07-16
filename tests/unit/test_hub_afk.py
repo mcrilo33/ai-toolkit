@@ -5949,7 +5949,7 @@ def test_self_copy_copies_sibling_set(tmp_path: Path) -> None:
     # The #307 hub-afk-<lane>.sh modules the entry sources must ride along too, or a self-copy
     # supervisor sources missing siblings and (fail-closed) refuses to arm — the *.sh glob
     # carries them, and this pins that it does.
-    for _mod in ("land", "dispatch", "arm", "supervise"):
+    for _mod in ("land", "dispatch", "arm", "supervise", "recover"):
         assert _wait_for_glob(tmp_path, f"hub-afk-self.*/hub-afk-{_mod}.sh"), (
             f"hub-afk-{_mod}.sh must ride along in the self-copy"
         )
@@ -11252,7 +11252,8 @@ def test_redispatch_records_redispatched_with_the_run(tmp_path: Path) -> None:
 def test_redispatch_reads_run_before_teardown() -> None:
     # Source guard for the property above: the run-id read must PRECEDE _kill_spoke_window /
     # worktree-done — otherwise the record keys by a synthesized fallback, not the real run.
-    src = HUB_AFK.read_text()
+    # _redispatch_dead_pane now lives in hub-afk-recover.sh (the #307 split).
+    src = (HUB_AFK.parent / "hub-afk-recover.sh").read_text()
     body = src[src.index("_redispatch_dead_pane()") :]
     body = body[: body.index("\nrecover_dead_panes")]
     read_at = body.find('run="$(_afk_spoke_run_id')
@@ -11279,7 +11280,8 @@ def test_reap_reads_run_before_the_land() -> None:
 def test_revive_and_resume_record_the_revived_transition() -> None:
     # Both revive paths (_revive_spoke kill+relaunch, resume_spoke re-adopt-in-place) record a
     # `revived` transition — the state the watchdog cannot learn from a relaunched pane today.
-    src = HUB_AFK.read_text()
+    # These revive paths now live in hub-afk-recover.sh (the #307 split).
+    src = (HUB_AFK.parent / "hub-afk-recover.sh").read_text()
 
     assert src.count('_afk_tlog_transition "$wt" "$issue" revived') >= 2
 
@@ -11287,6 +11289,7 @@ def test_revive_and_resume_record_the_revived_transition() -> None:
 def test_nudge_records_the_255_lane_event() -> None:
     # The #255 nudge lane records its event so a reader tells "the drain nudged this spoke" from
     # "the spoke is silently idle" — an event (within a state), not a transition.
-    src = HUB_AFK.read_text()
+    # The #255 nudge lane now lives in hub-afk-recover.sh (the #307 split).
+    src = (HUB_AFK.parent / "hub-afk-recover.sh").read_text()
 
     assert '_afk_tlog_event "$wt" "$issue" nudge nudge' in src
