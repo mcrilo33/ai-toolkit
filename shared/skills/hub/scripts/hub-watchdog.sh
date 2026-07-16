@@ -345,19 +345,40 @@ _wd_park_is_answer_lane() {
   return 1
 }
 
+# _wd_park_log_onset <issue> -> the onset ts of the CURRENT park as RECORDED in the #300 transition
+# log (the `parked`/`parked-gate` transition's own ts), or empty when the log records no park state
+# (#304). This is the #265 zero-grace fix made log-native: the onset was recorded by the actor at
+# park time, not reconstructed from a slot_state side-effect. Gated on the current log state being a
+# park — afk_state_onset returns the LAST transition's ts regardless of kind, so a later
+# `pushed`/`landed` transition's ts must not masquerade as a park onset. Empty (no API / not parked
+# in the log) falls back to the epoch path, per the #300 unknown-never-fires-nor-suppresses contract.
+_wd_park_log_onset() {
+  local issue="$1"
+  command -v afk_current_state >/dev/null 2>&1 || return 0
+  command -v afk_state_onset >/dev/null 2>&1 || return 0
+  case "$(afk_current_state "$issue" 2>/dev/null)" in
+    parked | parked-gate) afk_state_onset "$issue" 2>/dev/null ;;
+  esac
+}
+
 # _wd_park_base <wt> <issue> -> the epoch the park-unanswered ceiling measures FROM:
 # max(current episode onset, answer delivery). An answer delivered BEFORE the current park began
 # cannot count against it (#283) — that was the #276 false-fire: one answered plan gate, then ten
-# productive minutes, and the ceiling still measured from that one delivery. note_park_episode
-# re-stamps the onset when the pending park's context changes, so the onset names the episode
-# actually pending; a delivery INSIDE it is the more recent word and wins. Empty when neither is
-# measurable (the detector then cannot fire — same contract as _afk_ceiling_epoch).
+# productive minutes, and the ceiling still measured from that one delivery. The onset comes
+# log-first from the recorded park transition (#304); on an unknown log it falls back to
+# note_park_episode, which re-stamps the epoch when the pending park's context changes, so the onset
+# names the episode actually pending. A delivery INSIDE the episode is the more recent word and
+# wins. Empty when neither is measurable (the detector then cannot fire — same contract as
+# _afk_ceiling_epoch).
 _wd_park_base() {
   local wt="$1" issue="$2" onset attempt
-  if command -v note_park_episode >/dev/null 2>&1; then
-    onset="$(note_park_episode "$wt" "$issue" 2>/dev/null)"
-  else
-    onset="$(read_park_onset_epoch "$issue" 2>/dev/null)"
+  onset="$(_wd_park_log_onset "$issue")"
+  if [ -z "$onset" ]; then
+    if command -v note_park_episode >/dev/null 2>&1; then
+      onset="$(note_park_episode "$wt" "$issue" 2>/dev/null)"
+    else
+      onset="$(read_park_onset_epoch "$issue" 2>/dev/null)"
+    fi
   fi
   attempt="$(read_answer_attempt "$issue" 2>/dev/null)"
   case "$onset" in '' | *[!0-9]*) onset=0 ;; esac
@@ -400,12 +421,59 @@ _wd_drain_touched_recently() {
   ! _wd_epoch_stale "$newest" "$now" "$HUB_WATCHDOG_PARK_CEILING"
 }
 
+# _wd_episode_service <issue> -> delivered | dropped | none | unknown: the CURRENT park episode's
+# service state, read from the transition log's episode-keyed answer-lane events (#304). This is the
+# log-native replacement for the two side-channels the pre-#304 branch split read — the
+# answer-attempt epoch (a delivery) and the answer-drop file (a drop) — unified into ONE
+# episode-scoped read, so a delivery/drop from a RESOLVED park (a different episode key) can never be
+# misattributed to the pending one (the canonical #241/#283/#288 bug). `unknown` (no read API, or the
+# log records no park episode) means fall back to the epoch side-channels — NEVER a firing NOR a
+# suppression basis on its own (#300). Gated on the current log state being a park so a stale episode
+# left by a resolved park cannot be read as live.
+#   delivered — the episode's last answer-lane event is a delivery/compute (#283 stale-attempt turf)
+#   dropped   — the episode's last answer-lane event is a computed-then-dropped answer (#288 turf)
+#   none      — the episode is recorded but carries no answer-lane event yet (never-attempted)
+_wd_episode_service() {
+  local issue="$1" ep ev
+  command -v afk_current_state >/dev/null 2>&1 || { printf 'unknown\n'; return 0; }
+  case "$(afk_current_state "$issue" 2>/dev/null)" in
+    parked | parked-gate) ;;
+    *) printf 'unknown\n'; return 0 ;;
+  esac
+  command -v afk_current_episode >/dev/null 2>&1 || { printf 'unknown\n'; return 0; }
+  command -v afk_last_service_event >/dev/null 2>&1 || { printf 'unknown\n'; return 0; }
+  ep="$(afk_current_episode "$issue" 2>/dev/null)"
+  [ -n "$ep" ] || { printf 'unknown\n'; return 0; }
+  ev="$(afk_last_service_event "$issue" "$ep" answer 2>/dev/null)"
+  [ -n "$ev" ] || { printf 'none\n'; return 0; }
+  case "$ev" in
+    *'"event":"answer_dropped"'*) printf 'dropped\n' ;;
+    *) printf 'delivered\n' ;;
+  esac
+}
+
+# _wd_delivered_in_episode <wt> <issue> <attempt> <onset> -> rc 0 when a delivery landed INSIDE the
+# current park episode (the #283 stale-attempt branch), rc 1 for never-attempted. Log-first: a
+# `delivered` episode-service reading decides it, and `none`/`dropped` decide never-attempted; only an
+# `unknown` log falls back to the epoch compare (_wd_park_attempt_in_episode), preserving the pre-#304
+# behavior when the log is absent. The single branch oracle both the detector and the reason consult,
+# so the reported branch can never disagree with the one that fired.
+_wd_delivered_in_episode() {
+  local wt="$1" issue="$2" attempt="$3" onset="$4"
+  case "$(_wd_episode_service "$issue")" in
+    delivered) return 0 ;;
+    none | dropped) return 1 ;;
+  esac
+  _wd_park_attempt_in_episode "$attempt" "$onset"
+}
+
 # _wd_park_attempt_in_episode <attempt> <onset> -> true when a delivery landed INSIDE the current
 # park episode (attempt >= onset, or onset unmeasurable): the same rule _wd_park_base measures by,
 # and the branch split _wd_park_unanswered_reason reports on (#283/#288). Takes the ALREADY-READ
 # values rather than re-reading them, so a caller that captured attempt/onset once (for a printed
 # reason, or after refreshing the episode via _wd_park_base) can never have the branch decision
-# disagree with a second, independently-timed read of the same epochs (#288 review).
+# disagree with a second, independently-timed read of the same epochs (#288 review). The epoch
+# FALLBACK for _wd_delivered_in_episode when the transition log is unknown (#304).
 _wd_park_attempt_in_episode() {
   local attempt="$1" onset="$2"
   case "$attempt" in '' | *[!0-9]*) return 1 ;; esac
@@ -466,7 +534,7 @@ _wd_detect_park_unanswered() {
   # condition (park-undeliverable) below, so this suppression must not engage there either.
   attempt="$(read_answer_attempt "$issue" 2>/dev/null)"
   onset="$(read_park_onset_epoch "$issue" 2>/dev/null)"
-  if ! _wd_park_attempt_in_episode "$attempt" "$onset" \
+  if ! _wd_delivered_in_episode "$wt" "$issue" "$attempt" "$onset" \
      && _wd_park_answer_attempted "$wt" "$issue" \
      && _wd_park_warned_backoff_pending "$issue"; then
     return 1
@@ -480,22 +548,27 @@ _wd_detect_park_unanswered() {
 # phase: a park that has exhausted its backoff and still has nothing to show must still surface,
 # just under the honest reason (a serviced-but-undeliverable park must never read as silence).
 _wd_detect_park_undeliverable() {
-  local wt="$1" issue="$2" now="$3" base attempt onset
+  local wt="$1" issue="$2" now="$3" base attempt onset svc
   command -v slot_state >/dev/null 2>&1 || return 1
   # Cheap pre-check BEFORE the slot_state/lane/base probe chain (each a tmux capture-pane call,
-  # #269's load-flake class): the vast majority of parked spokes never had a drop recorded at
-  # all, so bail on a bare file-existence check rather than repeating _wd_detect_park_unanswered's
-  # entire probe chain for nothing (#288 review).
-  command -v _answer_drop_state_file >/dev/null 2>&1 || return 1
-  [ -f "$(_answer_drop_state_file "$issue")" ] || return 1
+  # #269's load-flake class): the vast majority of parked spokes never had a drop recorded at all.
+  # #304: a drop is on record either as an episode-keyed `answer_dropped` lane event (log-native) OR
+  # as the pre-#304 answer-drop file; bail only when NEITHER exists rather than repeating
+  # _wd_detect_park_unanswered's entire probe chain for nothing (#288 review).
+  svc="$(_wd_episode_service "$issue")"
+  if [ "$svc" != dropped ]; then
+    command -v _answer_drop_state_file >/dev/null 2>&1 || return 1
+    [ -f "$(_answer_drop_state_file "$issue")" ] || return 1
+  fi
   [ "$(slot_state "$wt" "$issue")" = "waiting" ] || return 1
   _wd_park_is_answer_lane "$wt" "$issue" || return 1
   base="$(_wd_park_base "$wt" "$issue")"   # refreshes the episode onset BEFORE it is read below
   attempt="$(read_answer_attempt "$issue" 2>/dev/null)"
   onset="$(read_park_onset_epoch "$issue" 2>/dev/null)"
-  _wd_park_attempt_in_episode "$attempt" "$onset" && return 1   # a delivery landed -> stale-attempt's turf
+  _wd_delivered_in_episode "$wt" "$issue" "$attempt" "$onset" && return 1   # a delivery landed -> stale-attempt's turf
   _wd_epoch_stale "$base" "$now" "$HUB_WATCHDOG_PARK_CEILING" || return 1
-  [ -n "$(_wd_park_drop_info "$wt" "$issue")" ]
+  # A drop is proven by the log episode (dropped) or the pre-#304 drop file.
+  [ "$svc" = dropped ] || [ -n "$(_wd_park_drop_info "$wt" "$issue")" ]
 }
 
 # _wd_park_undeliverable_reason <wt> <issue> <now> -> names the drop count + last drop's own
@@ -525,10 +598,10 @@ _wd_park_unanswered_reason() {
   sig="${sig#*$'\t'}"                          # drop the tip half of the "<tip>\t<sig>" record
   case "$attempt" in '' | *[!0-9]*) attempt="" ;; esac
   case "$onset" in '' | *[!0-9]*) onset="" ;; esac
-  # The branch decision is shared with _wd_park_attempt_in_episode, fed the SAME attempt/onset
-  # locals used for the printed text below, so the reported branch can never disagree with the
-  # epoch that actually fired.
-  if _wd_park_attempt_in_episode "$attempt" "$onset"; then
+  # The branch decision is shared with the detector via _wd_delivered_in_episode (log-first, epoch
+  # fallback), fed the SAME attempt/onset locals used for the printed text below, so the reported
+  # branch can never disagree with the one that actually fired.
+  if _wd_delivered_in_episode "$wt" "$issue" "$attempt" "$onset"; then
     base="answer-attempt@$attempt"
     printf 'park-unanswered (stale-attempt): last answer delivery %s ago' \
       "$(_wd_age_seconds "$attempt" "$now")"
