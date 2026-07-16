@@ -174,6 +174,144 @@ def test_slot_state_busy_after_failed_gate_emission(spoke_repo: Path, tmp_path: 
     assert result.stdout.strip() == "busy", result.stdout + result.stderr
 
 
+# ── #313: a TYPED string-content reply un-latches the PLAN gate ────────────────
+# Claude Code records a real reply — a human typing in the pane AND the broker's own
+# tmux-injected approval — as a STRING-content user turn, not a text block. The pre-#313
+# extractor cleared only `pending` on such a turn, so `gate_plan` stayed latched for the
+# whole life of the spoke: every post-approval tick returned the stale plan → slot_state
+# `waiting` → the answer lane recomputed and every answer was dropped by the #247
+# tree-changed guard, burning reasoner runs until park-undeliverable fired.
+
+
+def _typed_string_reply(text: str = "Approved, proceed with the plan.") -> dict:
+    """A genuine reply as Claude Code records it on submit: a STRING-content user turn
+    carrying promptSource == "typed" (a human pane reply or the broker's tmux inject)."""
+    return {"type": "user", "promptSource": "typed", "message": {"content": text}}
+
+
+def test_extract_pending_question_clears_plan_on_typed_string_reply(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # AC1: gate emission, then a typed string-content approval, then the spoke resumes work.
+    # The reply resolved the gate → extract must return empty (no phantom park).
+    projects = tmp_path / "projects"
+    _write_transcript(
+        projects,
+        spoke_repo,
+        [
+            _gate_bash_turn("PLAN PROSE that must not latch a phantom park"),
+            _typed_string_reply(),
+            _spoke_activity_turn(),
+        ],
+    )
+
+    result = _call(
+        f"extract_pending_question '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
+    )
+
+    assert result.stdout.strip() == "", (
+        f"a typed string-content reply must un-latch the gate plan: {result.stdout!r}"
+    )
+
+
+def test_slot_state_busy_after_typed_string_gate_reply(spoke_repo: Path, tmp_path: Path) -> None:
+    # AC1/AC4 end to end: the injected approval landed as a string-content turn and the spoke
+    # keeps working. slot_state must read `busy`, not `waiting` — so no park onset is stamped
+    # and the answer lane never services (consumes zero reasoner runs on) the retired gate.
+    projects = tmp_path / "projects"
+    _write_transcript(
+        projects,
+        spoke_repo,
+        [
+            _gate_bash_turn("PLAN PROSE"),
+            _typed_string_reply(),
+            _spoke_activity_turn(),
+        ],
+    )
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={"CLAUDE_PROJECTS_DIR": str(projects), "AFK_NOW": "1000000100"},
+    )
+
+    assert result.stdout.strip() == "busy", result.stdout + result.stderr
+
+
+def test_extract_pending_question_keeps_plan_without_reply(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # AC2 regression: a genuinely-unanswered gate park — the emission, then the spoke's own
+    # assistant activity but NO user reply of any shape — still extracts the plan so the
+    # answerer keeps its reasoning payload.
+    projects = tmp_path / "projects"
+    _write_transcript(
+        projects,
+        spoke_repo,
+        [
+            _gate_bash_turn("REAL PLAN PROSE for a genuine park"),
+            _spoke_activity_turn(),
+        ],
+    )
+
+    result = _call(
+        f"extract_pending_question '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
+    )
+
+    assert "REAL PLAN PROSE" in result.stdout, (
+        f"an unanswered gate park must still surface the plan: {result.stdout!r}"
+    )
+
+
+def test_extract_pending_question_keeps_plan_on_nontyped_string_reply(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The typed guard: only a promptSource == "typed" string turn is a genuine reply. A
+    # string-content user turn WITHOUT it (every synthetic harness turn is non-typed) must
+    # NOT false-clear a still-unanswered park — mirrors _gate_answer_landed (#204).
+    projects = tmp_path / "projects"
+    _write_transcript(
+        projects,
+        spoke_repo,
+        [
+            _gate_bash_turn("REAL PLAN PROSE awaiting a real reply"),
+            {"type": "user", "message": {"content": "a synthetic non-typed string turn"}},
+        ],
+    )
+
+    result = _call(
+        f"extract_pending_question '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
+    )
+
+    assert "REAL PLAN PROSE" in result.stdout, (
+        f"a non-typed string turn must not un-latch the park: {result.stdout!r}"
+    )
+
+
+def test_extract_pending_question_clears_plan_on_list_content_reply(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # AC3 regression: the pre-existing list-content text-block un-latch is unchanged — a user
+    # turn whose LIST content carries a text block still resolves the gate.
+    projects = tmp_path / "projects"
+    _write_transcript(
+        projects,
+        spoke_repo,
+        [
+            _gate_bash_turn("PLAN PROSE that a list-content reply must clear"),
+            {"type": "user", "message": {"content": [{"type": "text", "text": "Approved."}]}},
+            _spoke_activity_turn(),
+        ],
+    )
+
+    result = _call(
+        f"extract_pending_question '{spoke_repo}'", env={"CLAUDE_PROJECTS_DIR": str(projects)}
+    )
+
+    assert result.stdout.strip() == "", (
+        f"a list-content text-block reply must still un-latch the plan: {result.stdout!r}"
+    )
+
+
 def test_spoke_idle_seconds_not_refreshed_by_reasoner_write(
     spoke_repo: Path, reasoner_env: dict[str, str]
 ) -> None:
