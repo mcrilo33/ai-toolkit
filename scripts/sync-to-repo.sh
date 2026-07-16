@@ -576,8 +576,16 @@ sync_config_files() {
 # Apply the config's `base_branch` to `git config ai-toolkit.base-branch` on the
 # target, so the canonical wt_base_branch resolver (issue #117) — consumed by
 # worktree-new/land/done/quick, the hub scripts and every guard — picks it up
-# unchanged. The config OWNS the value: an empty/absent base_branch clears any
-# prior setting, restoring today's origin/HEAD→main auto-detection.
+# unchanged. A NON-EMPTY base_branch is authoritative and is written through.
+#
+# An EMPTY/absent base_branch does NOT clobber the target (issue #309): ai-toolkit
+# ships an empty base_branch, so unsetting on every re-sync would wipe a
+# downstream's own per-project ai-toolkit.base-branch — the resolver's tier-1,
+# re-sync-proof seat. So empty leaves the target's key untouched; a downstream/
+# operator that wants auto-detection back unsets ai-toolkit.base-branch itself.
+#
+# Also warns (issue #309) when the target carries a mis-cased ai-toolkit.baseBranch
+# but not the hyphenated key the resolver reads — a silently-ignored footgun.
 apply_base_branch_config() {
     [ -e "$TARGET/.git" ] || return 0   # only a git repo carries config
     local bb
@@ -591,10 +599,29 @@ apply_base_branch_config() {
             info "base-branch → $bb"
         fi
     elif [ "$DRY_RUN" -eq 1 ]; then
-        echo "[dry-run] would clear git config ai-toolkit.base-branch (auto-detect)"
+        echo "[dry-run] base_branch empty in config — leaving target's ai-toolkit.base-branch untouched"
     else
-        git -C "$TARGET" config --unset ai-toolkit.base-branch 2>/dev/null || true
-        info "base-branch → auto-detect (unset)"
+        local own
+        own="$(git -C "$TARGET" config --get ai-toolkit.base-branch 2>/dev/null || true)"
+        if [ -n "$own" ]; then
+            info "base-branch → $own (preserved; empty in config, downstream's own value kept)"
+        else
+            info "base-branch → auto-detect (empty in config; nothing to preserve)"
+        fi
+    fi
+    warn_base_branch_camelcase
+}
+
+# Warn (issue #309) when the target carries a camelCase ai-toolkit.baseBranch (git
+# flattens it to the distinct key `basebranch`) but NOT the hyphenated
+# ai-toolkit.base-branch the wt_base_branch resolver actually reads — a silently
+# ignored footgun. Loud here (fail-loud, AFK principle #2) so the mis-cased set is
+# caught at sync time rather than surfacing as a wrong resolved branch later.
+warn_base_branch_camelcase() {
+    [ -e "$TARGET/.git" ] || return 0
+    if git -C "$TARGET" config --get ai-toolkit.basebranch >/dev/null 2>&1 \
+        && ! git -C "$TARGET" config --get ai-toolkit.base-branch >/dev/null 2>&1; then
+        warn "git config ai-toolkit.baseBranch is set but the resolver reads ai-toolkit.base-branch (hyphenated); the camelCase key is IGNORED. Run: git config ai-toolkit.base-branch \"<branch>\""
     fi
 }
 

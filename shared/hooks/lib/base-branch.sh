@@ -27,6 +27,14 @@
 wt_base_branch() {
   local root="${1:-.}" b
   b="$(git -C "$root" config --get ai-toolkit.base-branch 2>/dev/null)" || true
+  if [ -z "$b" ] && git -C "$root" config --get ai-toolkit.basebranch >/dev/null 2>&1; then
+    # camelCase footgun (issue #309): git flattens a hand-set
+    # `ai-toolkit.baseBranch` to the distinct key `basebranch`, which this
+    # resolver never reads — so it would silently fall through to origin/HEAD.
+    # Warn LOUDLY to stderr (stdout stays the clean branch name) rather than
+    # resolve the wrong branch in silence.
+    printf 'ai-toolkit: WARNING: git config ai-toolkit.baseBranch is set but the resolver reads ai-toolkit.base-branch (hyphenated); the camelCase key is IGNORED. Run: git config ai-toolkit.base-branch "<branch>"\n' >&2
+  fi
   [ -n "$b" ] && { printf '%s' "$b"; return 0; }
   if [ -n "${AI_TOOLKIT_BASE_BRANCH:-}" ]; then
     printf '%s' "$AI_TOOLKIT_BASE_BRANCH"

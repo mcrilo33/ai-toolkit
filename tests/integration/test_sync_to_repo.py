@@ -1249,13 +1249,14 @@ class TestConfigDrivenSync:
 
         assert _git_config(target_repo, "ai-toolkit.base-branch").returncode != 0
 
-    def test_empty_base_branch_unsets_a_prior_value(
+    def test_empty_base_branch_preserves_a_prior_value(
         self, target_repo: Path, tmp_path: Path
     ) -> None:
-        # A previously-configured base branch is cleared when the config goes empty,
-        # restoring auto-detection (the config owns the value).
+        # A downstream's own base branch survives a re-sync from an EMPTY source
+        # yml (issue #309): the empty ai-toolkit source must NOT clobber the
+        # downstream's per-project ai-toolkit.base-branch.
         subprocess.run(
-            ["git", "-C", str(target_repo), "config", "ai-toolkit.base-branch", "stale"],
+            ["git", "-C", str(target_repo), "config", "ai-toolkit.base-branch", "develop"],
             check=True,
             capture_output=True,
         )
@@ -1264,7 +1265,7 @@ class TestConfigDrivenSync:
 
         _run_sync_with_config(target_repo, config)
 
-        assert _git_config(target_repo, "ai-toolkit.base-branch").returncode != 0
+        assert _git_config(target_repo, "ai-toolkit.base-branch").stdout.strip() == "develop"
 
     def test_base_branch_resolves_via_wt_base_branch(
         self, target_repo: Path, tmp_path: Path
@@ -1282,3 +1283,79 @@ class TestConfigDrivenSync:
             text=True,
         )
         assert got.stdout.strip() == "develop"
+
+
+def _resolve_base_branch(root: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "-c", f'source "{BASE_BRANCH_LIB}"; wt_base_branch "{root}"'],
+        capture_output=True,
+        text=True,
+    )
+
+
+class TestBaseBranchCamelCaseGuard:
+    """The camelCase key footgun (issue #309): ai-toolkit.baseBranch flattens to
+    `basebranch`, but the resolver reads the hyphenated ai-toolkit.base-branch, so
+    a mis-cased hand-set is silently ignored → falls through to origin/HEAD. The
+    resolver and the sync must both WARN when the camelCase key is set alone."""
+
+    def test_resolver_warns_when_only_camelcase_key_set(self, target_repo: Path) -> None:
+        subprocess.run(
+            ["git", "-C", str(target_repo), "config", "ai-toolkit.baseBranch", "develop"],
+            check=True,
+            capture_output=True,
+        )
+
+        got = _resolve_base_branch(target_repo)
+
+        # stdout stays the clean resolved branch (fell through — camelCase ignored);
+        # stderr carries the loud warning naming the hyphenated key.
+        assert got.stdout.strip() == "main"
+        assert "base-branch" in got.stderr
+        assert "baseBranch" in got.stderr
+
+    def test_resolver_silent_when_hyphenated_key_set(self, target_repo: Path) -> None:
+        # Both keys present: the hyphenated one wins and there is no footgun, so no warn.
+        subprocess.run(
+            ["git", "-C", str(target_repo), "config", "ai-toolkit.baseBranch", "wrongcase"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(target_repo), "config", "ai-toolkit.base-branch", "develop"],
+            check=True,
+            capture_output=True,
+        )
+
+        got = _resolve_base_branch(target_repo)
+
+        assert got.stdout.strip() == "develop"
+        assert got.stderr.strip() == ""
+
+    def test_resolver_silent_when_no_base_branch_config(self, target_repo: Path) -> None:
+        got = _resolve_base_branch(target_repo)
+
+        assert got.stdout.strip() == "main"
+        assert got.stderr.strip() == ""
+
+    def test_sync_warns_when_only_camelcase_key_set(
+        self, target_repo: Path, tmp_path: Path
+    ) -> None:
+        subprocess.run(
+            ["git", "-C", str(target_repo), "config", "ai-toolkit.baseBranch", "develop"],
+            check=True,
+            capture_output=True,
+        )
+        config = tmp_path / "cfg.yml"
+        config.write_text("base_branch:\nmodel:\n  spoke:\n    model: claude-opus-4-8[1m]\n")
+
+        result = subprocess.run(
+            ["bash", str(SYNC_SCRIPT), str(target_repo), "claude"],
+            capture_output=True,
+            text=True,
+            check=True,
+            env={**os.environ, "AI_TOOLKIT_CONFIG": str(config)},
+        )
+
+        assert "base-branch" in result.stdout
+        assert "baseBranch" in result.stdout
