@@ -2717,3 +2717,130 @@ def test_broker_service_gate_fastpath_telemetry_off_is_noop(
 
     assert result.returncode == 0, result.stderr
     assert not (tele / "events.jsonl").exists(), "telemetry-off must be a no-op"
+
+
+# ── #300 step 3b: broker lane transition-log events ───────────────────────────
+# The broker records the lane action it CAUSES (answer computed / dropped / escalated, a #277
+# plan waive) as a transition-log EVENT keyed by the park episode. Shadow-only: these assert the
+# RECORD, not a behavior change. The episode signature matches _broker_park_signature by
+# construction (the persisted / passed sig IS that hash).
+
+_NO_GH = {"AFK_JOURNAL_GH_COMMENT": "0"}
+
+
+def _tlog(state_dir: Path, issue: int) -> str:
+    p = state_dir / "transitions" / f"{issue}.jsonl"
+    return p.read_text() if p.is_file() else ""
+
+
+def test_gb_tlog_event_records_with_the_broker_actor(tmp_path: Path) -> None:
+    state = tmp_path / "afk-state"
+
+    _call('_gb_tlog_event 311 answer_computed answer "sighash:1700" \'{"rc":0}\'', env=_NO_GH)
+
+    line = _tlog(state, 311)
+    assert '"event":"answer_computed"' in line
+    assert '"actor":"gate-broker.sh"' in line
+    assert '"lane":"answer"' in line
+    assert '"episode":"sighash:1700"' in line
+
+
+def test_gb_episode_key_uses_an_explicit_sig(tmp_path: Path) -> None:
+    # The caller-supplied signature keys the episode; onset is the live park-onset epoch. No pane
+    # read happens — the sig is passed in.
+    result = _call("stamp_park_onset_epoch 311; _gb_episode_key 311 mysig", env=_NO_GH)
+
+    key = result.stdout.strip()
+    assert key.startswith("mysig:")
+    assert key.split(":", 1)[1].isdigit()  # <sig>:<onset-epoch>
+
+
+def test_gb_episode_key_falls_back_to_the_persisted_park_sig(tmp_path: Path) -> None:
+    # Absent an explicit sig, the episode reads the PERSISTED park-sig record (a cheap file read),
+    # so the shadow path never pays an extra capture-pane. The record is "<tip>\t<sig>".
+    state = tmp_path / "afk-state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "park-sig-311").write_text("tipsha\tPERSISTEDSIG")
+
+    result = _call("stamp_park_onset_epoch 311; _gb_episode_key 311", env=_NO_GH)
+
+    assert result.stdout.strip().startswith("PERSISTEDSIG:")
+
+
+def test_broker_warn_continue_records_answer_dropped_on_the_answer_lane(tmp_path: Path) -> None:
+    # A warn-and-continue on the ANSWER lane means the computed answer reached no delivery — a
+    # dropped answer, recorded WITH its reason.
+    state = tmp_path / "afk-state"
+
+    _call(
+        f"broker_warn_continue '{tmp_path}' 311 answer 'answer never registered' reversible",
+        env=_NO_GH,
+    )
+
+    line = _tlog(state, 311)
+    assert '"event":"answer_dropped"' in line
+    assert '"lane":"answer"' in line
+    assert "answer never registered" in line  # the reason rides in the evidence
+
+
+def test_broker_warn_continue_records_escalated_off_the_answer_lane(tmp_path: Path) -> None:
+    # Every non-answer park kind's fallback is an escalation, not a drop.
+    state = tmp_path / "afk-state"
+
+    _call(
+        f"broker_warn_continue '{tmp_path}' 311 ceiling 're-answer ceiling reached' reversible",
+        env=_NO_GH,
+    )
+
+    line = _tlog(state, 311)
+    assert '"event":"escalated"' in line
+    assert '"lane":"ceiling"' in line
+    assert "answer_dropped" not in line
+
+
+def test_broker_journal_decision_records_waived_only_for_a_gate_park(tmp_path: Path) -> None:
+    state = tmp_path / "afk-state"
+
+    _call("broker_journal_decision 311 gate 'fast-path auto-approved' reversible", env=_NO_GH)
+    _call("broker_journal_decision 312 answer 'injected answer (routine)' reversible", env=_NO_GH)
+
+    assert '"event":"waived"' in _tlog(state, 311)
+    assert '"lane":"gate"' in _tlog(state, 311)
+    assert "waived" not in _tlog(state, 312)  # only the #277 gate park waives
+
+
+def test_run_answerer_records_answer_computed(tmp_path: Path) -> None:
+    state = tmp_path / "afk-state"
+    env = {**_NO_GH, "AFK_ANSWERER_CMD": "printf 'ANSWER: go ahead'"}
+
+    _call("run_answerer 311 'the parked question'", env=env)
+
+    line = _tlog(state, 311)
+    assert '"event":"answer_computed"' in line
+    assert '"lane":"answer"' in line  # the default lane
+
+
+def test_run_answerer_labels_the_permission_reasoner_lane(tmp_path: Path) -> None:
+    # The permission reasoner runs run_answerer under AFK_TLOG_LANE=permission, so its own compute
+    # is labelled on the permission lane rather than the default answer lane.
+    state = tmp_path / "afk-state"
+    env = {**_NO_GH, "AFK_ANSWERER_CMD": "printf 'ANSWER: APPROVE'", "AFK_TLOG_LANE": "permission"}
+
+    _call("run_answerer 311 'q'", env=env)
+
+    assert '"lane":"permission"' in _tlog(state, 311)
+
+
+def test_broker_lane_events_are_best_effort_without_the_transition_log(tmp_path: Path) -> None:
+    # The #300 contract: a shadow write NEVER fails the broker. With both transition-log wrappers
+    # unset, broker_warn_continue still returns success and no transitions file is written.
+    state = tmp_path / "afk-state"
+
+    result = _call(
+        "unset -f wt_tlog_event afk_tlog_event; "
+        f"broker_warn_continue '{tmp_path}' 311 answer 'x' reversible; echo rc=$?",
+        env=_NO_GH,
+    )
+
+    assert "rc=0" in result.stdout
+    assert not (state / "transitions").exists()

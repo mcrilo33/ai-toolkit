@@ -179,7 +179,9 @@ name the reversible path. Your ANSWER line MUST begin with 'APPROVE' or 'DENY: <
 path to tell the spoke>'."
   # Stamp the attempt FIRST so the reason→deliver window never reads as idle (#202 C).
   stamp_answer_attempt "$issue"
-  raw="$(run_answerer "$issue" "$q" "$wt")"; rc=$?
+  # #300 step 3b: label the reasoner's answer_computed event on the PERMISSION lane (run_answerer
+  # defaults to the answer lane); the env scopes to this one call.
+  raw="$(AFK_TLOG_LANE=permission run_answerer "$issue" "$q" "$wt")"; rc=$?
   # #247: run_answerer streams stream-json; normalize ONCE to the final text for the DECISION
   # parsers. is_auth_failure reads the RAW stream (below) so an auth signature in a dropped event
   # is never missed.
@@ -204,6 +206,10 @@ path to tell the spoke>'."
   # classifier (#155 D).
   case "$text" in
     APPROVE*)
+      # #300 step 3b: the reasoned permission verdict — approve_decided, keyed by the park episode
+      # the caller already captured ($sig). The delivery (approval_injected) is hub-inject's.
+      _gb_lane_event "$issue" approve_decided permission "$sig" \
+        '{"decision":"approve","kind":"reasoned"}'
       # #241 review B1: journal the decision to the FILE BEFORE approve_permission delivers the
       # keypress (durable if the inject crashes/races the command it authorized) — file-only, so
       # no network gh-comment sits on the spoke's unblock critical path. The pre-keypress line is
@@ -211,7 +217,10 @@ path to tell the spoke>'."
       # in-flight intent for a delivered-and-ran approval; the OUTCOME line (delivered / FAILED)
       # is written after (#241 review).
       _broker_journal_line "$issue" permission "reasoner APPROVING (delivery pending): $cmd" "${rev:-unknown}"
-      if approve_permission "$wt"; then
+      # Thread the issue + lane + episode so hub-inject's approval_injected delivery event keys on
+      # the broker's KNOWN issue (explicit beats the branch-slug fallback) and carries the episode.
+      if AFK_TLOG_ISSUE="$issue" AFK_TLOG_LANE=permission \
+        AFK_TLOG_EPISODE="$(_gb_episode_key "$issue" "$sig")" approve_permission "$wt"; then
         # #294: this exact park is served — the next tick must not re-approve it if the pane still
         # shows the same dialog. Only on a CONFIRMED delivery: an unconfirmed one stays retryable.
         note_permission_served "$wt" "$issue" "$sig" "$tid"
@@ -234,6 +243,9 @@ path to tell the spoke>'."
         *) guidance="" ;;
       esac
       [ -n "$guidance" ] || guidance="Declined that command — take the reversible, in-scope path instead."
+      # #300 step 3b: the reasoned decline is the same lane decision, recorded with decision=deny.
+      _gb_lane_event "$issue" approve_decided permission "$sig" \
+        '{"decision":"deny","kind":"reasoned"}'
       # B1 generalized to DENY (#241 review): a provisional FILE line before _deny_permission
       # injects (survives a crash between inject and record), then the OUTCOME. The delivery rc is
       # NOT swallowed: a failed redirect (dead pane / failed inject) is journaled DISTINCTLY, so a
@@ -297,9 +309,16 @@ _decide_permission() {
   tid="$(extract_pending_tool_id "$wt")"
   if [ "$kind" = "APPROVE" ]; then
     log "→ auto-approving safe permission for #$issue: $cmd_display"
+    # #300 step 3b: the MECHANICAL auto-approve is a lane decision too — approve_decided with
+    # kind=mechanical, so a detector tells the fixed-rule fast path from a reasoned verdict.
+    _gb_lane_event "$issue" approve_decided permission "$sig" \
+        '{"decision":"approve","kind":"mechanical"}'
     # Stamp the delivery attempt FIRST: the approve→resume window must not read as idle.
     stamp_answer_attempt "$issue"
-    if approve_permission "$wt"; then
+    # Thread the issue + lane + episode so hub-inject's approval_injected delivery event keys on
+    # the broker's KNOWN issue (explicit beats the branch-slug fallback) and carries the episode.
+    if AFK_TLOG_ISSUE="$issue" AFK_TLOG_LANE=permission \
+      AFK_TLOG_EPISODE="$(_gb_episode_key "$issue" "$sig")" approve_permission "$wt"; then
       # #294: record the park we just served so the next tick does not re-approve the same dialog.
       # Only a CONFIRMED delivery is served — the failure path below stays retryable.
       note_permission_served "$wt" "$issue" "$sig" "$tid"
