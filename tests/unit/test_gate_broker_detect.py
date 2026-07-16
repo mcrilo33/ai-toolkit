@@ -1190,3 +1190,149 @@ def test_consume_gate_tag_removes_artifact(spoke_repo: Path) -> None:
         ["git", "tag", "-l", "gate/5"], cwd=spoke_repo, capture_output=True, text=True
     )
     assert tags.stdout.strip() == "", "the local gate tag must also be dropped"
+
+
+# ── #304 (#300 step 5): slot_state is a pure read + a RECONCILER ──────────────────────────────
+# Observing a spoke no longer silently stamps the done epoch: the reconciler records the terminal /
+# park state as a VISIBLE `actor:reconciler` transition, and read_done_epoch projects its onset from
+# the log. A divergence between the log tail and ground truth (a tag at the tip) appends a corrective
+# record; a cold start (empty log) rebuilds one record marked lossy.
+
+
+def _transitions(state_dir: Path, issue: int) -> list[str]:
+    p = state_dir / "transitions" / f"{issue}.jsonl"
+    return p.read_text().splitlines() if p.is_file() else []
+
+
+def test_slot_state_ready_at_tip_records_a_ready_transition_not_a_done_epoch(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #2/#3: the done epoch is RETIRED — a ready-at-tip spoke records a VISIBLE ready transition
+    # instead of a silent done-5.epoch stamp.
+    statedir = tmp_path / "afk-state"
+    subprocess.run(["git", "tag", "-f", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1700000000"},
+    )
+
+    assert result.stdout.strip() == "done", result.stdout + result.stderr
+    assert not (statedir / "done-5.epoch").exists(), "the done epoch is retired to the log"
+    lines = _transitions(statedir, 5)
+    assert any('"to":"ready"' in ln and '"actor":"reconciler"' in ln for ln in lines), lines
+
+
+def test_slot_state_ready_read_is_idempotent_second_tick_writes_nothing(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #2: steady state — a second read of an already-recorded terminal appends no new record.
+    statedir = tmp_path / "afk-state"
+    subprocess.run(["git", "tag", "-f", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1700000000"}
+
+    _call(f"slot_state '{spoke_repo}' 5", env=env)
+    first = _transitions(statedir, 5)
+    _call(f"slot_state '{spoke_repo}' 5", env=env)
+    second = _transitions(statedir, 5)
+
+    assert second == first, "an unchanged terminal must not re-record on a steady read"
+
+
+def test_slot_state_busy_spoke_writes_no_state_epoch(spoke_repo: Path, tmp_path: Path) -> None:
+    # #2: a working spoke stamps neither the done nor the park-onset epoch (the state-inference side
+    # effects the issue removes) and records no terminal/park transition.
+    statedir = tmp_path / "afk-state"
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    (pd / "session.jsonl").write_text(
+        json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "working"}]}}
+        )
+        + "\n"
+    )
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={
+            "AFK_STATE_DIR": str(statedir),
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_NOW": "1700000000",
+        },
+    )
+
+    assert result.stdout.strip() == "busy", result.stdout + result.stderr
+    assert not (statedir / "done-5.epoch").exists()
+    assert not (statedir / "park-onset-5.epoch").exists()
+    assert not any('"actor":"reconciler"' in ln for ln in _transitions(statedir, 5))
+
+
+def test_reconciler_records_a_divergence_naming_the_stale_log_state(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # #3: the log tail says `dispatched` but a ready tag sits at the tip — the reconciler appends a
+    # corrective ready record whose evidence names the divergence (expected dispatched, got ready).
+    statedir = tmp_path / "afk-state"
+    d = statedir / "transitions"
+    d.mkdir(parents=True)
+    (d / "5.jsonl").write_text(
+        '{"v":1,"ts":1699990000,"issue":5,"kind":"transition","to":"dispatched",'
+        '"actor":"worktree-new.sh","cause":"spawn"}\n'
+    )
+    subprocess.run(["git", "tag", "-f", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+
+    _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1700000000"},
+    )
+
+    recon = [ln for ln in _transitions(statedir, 5) if '"actor":"reconciler"' in ln]
+    assert len(recon) == 1, recon
+    assert '"to":"ready"' in recon[0]
+    assert '"dispatched"' in recon[0], "the record must name the divergence it corrected"
+    assert '"lossy":true' not in recon[0], "a log with prior history is not a lossy rebuild"
+
+
+def test_reconciler_cold_start_rebuilds_one_lossy_record(spoke_repo: Path, tmp_path: Path) -> None:
+    # #4: no log at all + a ready tag at the tip → exactly one reconciler record, marked lossy
+    # (the history before the log existed is unknowable).
+    statedir = tmp_path / "afk-state"
+    subprocess.run(["git", "tag", "-f", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+
+    _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1700000000"},
+    )
+
+    recon = [ln for ln in _transitions(statedir, 5) if '"actor":"reconciler"' in ln]
+    assert len(recon) == 1, recon
+    assert '"to":"ready"' in recon[0]
+    assert '"lossy":true' in recon[0], "a cold-start rebuild has no prior history to trust"
+
+
+def test_slot_state_question_park_records_a_parked_transition_with_an_episode(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # A live question park records a VISIBLE `parked` transition carrying the episode key the broker's
+    # lane events use (via _gb_episode_key), so the watchdog's episode-keyed service reads go live.
+    statedir = tmp_path / "afk-state"
+    projects = tmp_path / "projects"
+    _write_transcript(projects, spoke_repo, [_ask_record("Ship it?", ["yes", "no"])])
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={
+            "AFK_STATE_DIR": str(statedir),
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "AFK_NOW": "1700000000",
+        },
+    )
+
+    assert result.stdout.strip() == "waiting", result.stdout + result.stderr
+    parked = [
+        ln
+        for ln in _transitions(statedir, 5)
+        if '"to":"parked"' in ln and '"actor":"reconciler"' in ln
+    ]
+    assert len(parked) == 1, _transitions(statedir, 5)
+    assert '"episode":"' in parked[0], "the parked transition must carry the broker's episode key"

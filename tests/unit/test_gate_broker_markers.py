@@ -1152,3 +1152,34 @@ def test_park_signature_is_identical_across_hasher_flavors(
     assert with_shasum.stdout.strip() == without_shasum.stdout.strip(), (
         "the digest must be hasher-flavor independent"
     )
+
+
+# ── #304: read_done_epoch projects the terminal transition's onset ─────────────────────────────
+
+
+def test_read_done_epoch_projects_a_ready_transition_onset(tmp_path: Path) -> None:
+    # #304: the done epoch is retired to a derived view — read_done_epoch reads the onset of the
+    # recorded ready/accepted transition from the #300 log, not a stamped done-<issue>.epoch file.
+    statedir = tmp_path / "afk-state"
+    d = statedir / "transitions"
+    d.mkdir(parents=True)
+    (d / "5.jsonl").write_text(
+        '{"v":1,"ts":1700000123,"issue":5,"kind":"transition","to":"ready",'
+        '"actor":"spoke-ready.sh","cause":"--ready"}\n'
+    )
+
+    result = _call("read_done_epoch 5", env={"AFK_STATE_DIR": str(statedir)})
+
+    assert result.stdout.strip() == "1700000123", result.stdout + result.stderr
+
+
+def test_read_done_epoch_falls_back_to_the_file_without_a_log(tmp_path: Path) -> None:
+    # The projection keeps a file fallback so a pre-#304 done epoch (or a non-terminal log) still
+    # reads — the #300 unknown-log contract.
+    statedir = tmp_path / "afk-state"
+    statedir.mkdir(parents=True)
+    (statedir / "done-5.epoch").write_text("1699999999\n")
+
+    result = _call("read_done_epoch 5", env={"AFK_STATE_DIR": str(statedir)})
+
+    assert result.stdout.strip() == "1699999999", result.stdout + result.stderr
