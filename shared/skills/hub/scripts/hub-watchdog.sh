@@ -601,6 +601,34 @@ _wd_land_in_flight() {
   ! _wd_epoch_stale "$mtime" "$now" "$HUB_WATCHDOG_LAND_ACTIVE"
 }
 
+# _wd_current_state <issue> -> the spoke's last RECORDED lifecycle state from the #300 transition
+# log (afk_current_state), or "unknown" when the read API is absent (a standalone watchdog with no
+# gate-broker/worktree-lib in scope) or nothing has been recorded. Wrapped rather than calling
+# afk_current_state inline so every detector reads the log the same guarded way and a missing API
+# degrades to "unknown" — which per #300's contract is NEVER a firing basis NOR a suppression basis
+# on its own (each caller falls back to today's side-effect inference on unknown).
+_wd_current_state() {
+  command -v afk_current_state >/dev/null 2>&1 || { printf 'unknown\n'; return 0; }
+  afk_current_state "$1" 2>/dev/null
+}
+
+# _wd_state_phase_fresh <issue> <now> -> true when the RECORDED phase's onset (afk_state_onset) is
+# still within HUB_WATCHDOG_IDLE_CEILING — i.e. the landing/pushing phase is plausibly in progress,
+# not stuck. This BOUNDS the dead-pane defer so it can never silence the reaper-miss backstop forever
+# (the sibling _wd_land_in_flight bounds its own defer for exactly this reason — "must never silence
+# condition 2 forever"). spoke-push/worktree-land record landing/pushing INTENT-FIRST and leave them
+# stuck on a mid-phase crash (#299's silent-stall class), so a phase older than the ceiling has run
+# impossibly long: re-arm the backstop. An unmeasurable onset fails toward re-arming (return 1),
+# never toward an unbounded silence — the same fail-toward-firing direction _wd_land_in_flight takes
+# on an unmeasurable mtime. The worst-case legitimate gate (a first-push seed, tens of minutes) sits
+# well under the ceiling, so a healthy phase never re-arms early; only a genuinely stuck one does.
+_wd_state_phase_fresh() {
+  local onset now="$2"
+  onset="$(afk_state_onset "$1" 2>/dev/null)"
+  case "$onset" in '' | *[!0-9]*) return 1 ;; esac
+  ! _wd_epoch_stale "$onset" "$now" "$HUB_WATCHDOG_IDLE_CEILING"
+}
+
 # Condition 2: a dead/crashed pane recover_dead_panes/reap_pass never revived, past the ceiling.
 # A DONE-stamped spoke is never a reaper miss (#290): the epoch records that the spoke reached
 # terminal state, and a land consuming the ready/<issue> tag flips LIVE slot_state off `done` while
@@ -1325,7 +1353,7 @@ _wd_fire() {
 # intervention. Supervisor-dead is a single global check; the other four run per in-flight spoke.
 # Best-effort throughout: a missing drain reader (standalone watchdog) simply skips its condition.
 _wd_run_conditions() {
-  local now="${1:-$(_wd_now)}" state="${2:-$(_wd_drain_state)}" wt issue wd_conflicts wd_done wd_base
+  local now="${1:-$(_wd_now)}" state="${2:-$(_wd_drain_state)}" wt issue wd_conflicts wd_done wd_base wd_state
   local wd_seen=""   # the issues this tick saw in flight — the sweep below leaves them alone
   # Use the drain state the loop already read (passed as $2) rather than re-probing — the loop
   # reads it once per tick, and a second _wd_drain_state call would double-count under stubs.
@@ -1353,6 +1381,11 @@ _wd_run_conditions() {
     # a fresh arm render a base that did not fire — a ledger line that contradicts its own ceiling.
     # Per-iteration local, passed explicitly: not a tick-global (the #241 cross-pass leak trap).
     wd_base="$(_wd_dead_idle_base "$issue" "$now")"
+    # #303 (#300 step 4): the spoke's last RECORDED state, read ONCE per tick and threaded into the
+    # detectors below (exactly as wd_done/wd_base are). Per-iteration local, not a tick-global (the
+    # #241 cross-pass leak trap). "unknown" when the log is absent — each reader falls back to its
+    # side-effect inference there, never firing NOR suppressing on unknown alone (#300 contract).
+    wd_state="$(_wd_current_state "$issue")"
     # Each detector: fire (deduped by _wd_fire's marker) + intervene when it trips; else clear the
     # firing marker so a genuinely resolved-then-recurring condition re-fires (#263).
     # park-undeliverable (#288 AC3) is checked FIRST: a serviced-but-never-deliverable park must
@@ -1377,6 +1410,21 @@ _wd_run_conditions() {
       # dedup marker (clearing mid-land would let a subsequently-failed land re-fire and
       # double-count in the ledger, #263). Mirrors the land-lane servicing defer below; a land that
       # genuinely leaves a dead pane behind still fires once the land stops running.
+      :
+    elif { [ "$wd_state" = landing ] || [ "$wd_state" = pushing ]; } && _wd_state_phase_fresh "$issue" "$now"; then
+      # #303: the transition log RECORDS the spoke in a known multi-minute phase (landing or
+      # pushing) that is still plausibly in progress (_wd_state_phase_fresh bounds it), so a gone
+      # pane + stale epoch here is the phase, not a reaper miss — structurally unable to be a dead
+      # pane. This is the #290/#301 residual gap: it catches what _wd_land_in_flight cannot (a
+      # clobbered last-action, no fresh land log, an in-flight PUSH the land signal never covered)
+      # because the state was RECORDED by the actor, not inferred from silence. The freshness bound is
+      # load-bearing: without it a mid-phase crash (state stuck at landing/pushing) would silence this
+      # backstop forever (#299). DEFER like the land-in-flight arm above — neither fire NOR clear the
+      # dedup marker (the #263 double-count hazard). Never silent (#300): when the epoch-inference
+      # WOULD have fired, log the divergence so a suppressed fire is auditable rather than invisible.
+      if _wd_detect_dead_idle "$wt" "$issue" "$now" "$wd_done" "$wd_base"; then
+        _wd_log "dead-pane suppressed on #$issue: transition-log state '$wd_state' — epoch-inference would have fired (divergence: log wins, #290/#300)"
+      fi
       :
     elif _wd_detect_dead_idle "$wt" "$issue" "$now" "$wd_done" "$wd_base"; then
       _wd_fire dead-pane "$issue" "$(_wd_dead_idle_reason "$wt" "$issue" "$now" "$wd_done" "$wd_base")" "$wt"

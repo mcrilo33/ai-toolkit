@@ -1441,6 +1441,29 @@ def test_run_conditions_dead_pane_still_fires_when_state_is_not_a_land_or_push(
     assert (tmp_path / "revived").read_text() == "284"
 
 
+@pytest.mark.parametrize("state", ["landing", "pushing"])
+def test_run_conditions_dead_pane_re_arms_when_a_recorded_phase_is_impossibly_old(
+    tmp_path: Path, state: str
+) -> None:
+    # The suppression is BOUNDED, never permanent (#299's silent-stall class). spoke-push and
+    # worktree-land record landing|pushing INTENT-FIRST and leave them stuck on a mid-phase crash, so
+    # an unbounded defer would silence the dead-pane backstop forever — the exact hazard the adjacent
+    # _wd_land_in_flight bounds with its mtime window ("must never silence condition 2 forever"). A
+    # recorded phase whose onset is older than the dead-idle ceiling has run impossibly long: stop
+    # deferring and let the reaper-miss backstop re-arm.
+    ledger = tmp_path / "l.jsonl"
+    env = _dead_pane_dispatch_env(tmp_path)
+    _write_transition(
+        tmp_path / "afk-state", 284, state, ts=str(int(NOW) - 4000)
+    )  # > 3600s ceiling
+    prelude = _dead_pane_dispatch_prelude(done_epoch="", drain="off")
+
+    _call(f"{prelude}; _wd_run_conditions {NOW} off", env=env)
+
+    assert '"condition":"dead-pane"' in ledger.read_text(), f"a stuck {state} phase must re-arm"
+    assert (tmp_path / "revived").read_text() == "284"
+
+
 # Condition 3 — stale blocked marker (real git)
 def test_stale_marker_fires_when_blocked_is_ancestor_of_tip(tmp_path: Path) -> None:
     wt = _git_repo(tmp_path)
