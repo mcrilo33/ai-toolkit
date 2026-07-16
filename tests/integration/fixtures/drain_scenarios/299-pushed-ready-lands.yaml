@@ -1,0 +1,19 @@
+id: 299-pushed-ready-lands
+stresses:
+  incident: 299
+  invariant: I2
+  principle: "2,3"
+spokes:
+  - issue: 299
+    slug: land
+    initial:
+      agent_alive: true
+timeline:
+  - { t: 0, spoke: 299, do: push }
+  - { t: 10, spoke: 299, do: ready }
+  - { t: 20, run: [drain] }
+expect:
+  violations: []
+mutation:
+  land_fail: true
+  expect_violation: I2
