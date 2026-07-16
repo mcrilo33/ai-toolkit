@@ -97,6 +97,7 @@ ALL_RULE_NAMES = {
     "planning-hub",
     "issue-hygiene",
     "afk-answering",
+    "afk-design-principles",
     "bug-triage",
 }
 
@@ -111,6 +112,7 @@ RULES_WITHOUT_GLOB = {
 
 # Rules that define 'paths' in metadata → generated as Claude rules
 CLAUDE_RULES_WITH_PATHS = {
+    "afk-design-principles",
     "code-quality",
     "python-style",
     "gitignore-template",

@@ -77,6 +77,14 @@ operational-gotchas:
   paths: "**"
   alwaysApply: false
 
+afk-design-principles:
+  name: "AFK Design Principles"
+  description: "Durable principles for the unattended /afk control plane, distilled from a week of incidents: explicit state over inference, fail-loud-never-silent-worst-case fallbacks, act-when-unattended, liveness by real-process probe, single-writer cross-lane semantics, best-effort writes, and structure-for-parallelism (no monolith becomes everyone's Scope)."
+  applyTo: "**"
+  globs: "**"
+  paths: "**"
+  alwaysApply: false
+
 github-actions:
   name: "GitHub Actions"
   description: "Workflow structure, SHA pinning, permissions, secrets, caching, and job conventions for GitHub Actions"
