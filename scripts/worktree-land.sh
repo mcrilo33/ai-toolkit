@@ -46,6 +46,115 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=worktree-lib.sh
 . "$SCRIPT_DIR/worktree-lib.sh"
 
+# --- land mutex (issue #315) ----------------------------------------------------
+# A manual/quick operator land and the drain's auto_land BOTH merge+push $DEFAULT
+# through THIS script (auto_land shells out to it), with nothing coordinating them.
+# They raced on 2026-07-16: a rejected push's `git reset --keep` left the hub BEHIND
+# origin. So every land takes a shared mutex before the merge+push critical section;
+# whoever holds it lands, the other WAITS (bounded) and re-checks state. Because ALL
+# land paths funnel through here, one lock here serializes them all — manual, /quick,
+# /land, and auto_land (transitively).
+#
+# The lock is a `mkdir` dir (the one atomic, portable FS primitive — macOS has no
+# flock(1), the same #300 rationale) at ${AFK_STATE_DIR:-<git-common-dir>/ai-toolkit-afk}
+# /land.lock — the shared state dir every actor already uses, resolved inline (this
+# script is synced to spoke targets that cannot source hub-skill modules). It holds an
+# `owner` file "<pid> <host> <ts>". A crashed holder is broken (dead pid, or a hard age
+# bound as a wedged-alive/pid-reuse backstop); a live holder is waited on and the wait
+# is LOGGED, never silent (fail-loud, Principle 2). Bounds are env-tunable for tests.
+: "${LAND_LOCK_WAIT_MAX:=1200}"        # hard cap (s) to wait before failing loud
+: "${LAND_LOCK_STALE_SECONDS:=1800}"   # break even a live-looking holder past this age
+: "${LAND_LOCK_POLL:=2}"               # poll interval (s) between acquire attempts
+for _v in LAND_LOCK_WAIT_MAX LAND_LOCK_STALE_SECONDS LAND_LOCK_POLL; do
+  eval "case \"\${$_v}\" in '' | *[!0-9]*) $_v=0 ;; esac"
+done
+[ "$LAND_LOCK_POLL" -gt 0 ] || LAND_LOCK_POLL=2   # a 0 poll would busy-spin; floor it
+
+_LAND_LOCK=""   # the lock dir once WE own it — the release guard's ownership witness
+
+_land_state_dir() {
+  if [ -n "${AFK_STATE_DIR:-}" ]; then printf '%s\n' "$AFK_STATE_DIR"; return; fi
+  local common
+  common="$(git rev-parse --git-common-dir 2>/dev/null)" || common=".git"
+  case "$common" in /*) ;; *) common="${REPO_ROOT:-.}/$common" ;; esac
+  printf '%s\n' "$common/ai-toolkit-afk"
+}
+
+_land_lock_owner_pid() {
+  local f="$1/owner"
+  [ -f "$f" ] || return 0
+  awk '{ print $1; exit }' "$f" 2>/dev/null || true
+}
+
+# _land_lock_age <lock> -> seconds since the owner ts, empty when unknown.
+_land_lock_age() {
+  local f="$1/owner" ts now
+  [ -f "$f" ] || return 0
+  ts="$(awk '{ print $3; exit }' "$f" 2>/dev/null || true)"
+  case "$ts" in '' | *[!0-9]*) return 0 ;; esac
+  now="$(date +%s)"
+  printf '%s\n' "$(( now - ts ))"
+}
+
+# _land_lock_stale <lock> -> rc 0 (stale, break it) when the holder is DEAD (probe the
+# real pid, Principle 4) or the lock is older than the hard bound; rc 1 (live, wait) else.
+# A missing/torn/non-numeric owner reads stale — an unowned dir must never wedge landing.
+_land_lock_stale() {
+  local lock="$1" pid age
+  pid="$(_land_lock_owner_pid "$lock")"
+  case "$pid" in '' | *[!0-9]*) return 0 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 0            # holder dead -> stale
+  age="$(_land_lock_age "$lock")"
+  case "$age" in '' | *[!0-9]*) return 1 ;; esac    # unknown age on a live holder -> wait
+  [ "$age" -ge "$LAND_LOCK_STALE_SECONDS" ]
+}
+
+# acquire_land_lock -> block until this process owns the land lock, then arm the EXIT
+# release. Loud + bounded: warns once on first wait, breaks a stale holder and retries,
+# and wt_die's if it never wins within LAND_LOCK_WAIT_MAX (a stuck land is surfaced, not
+# raced). Call AFTER the cheap hub guards so an arg error never takes or leaks the lock.
+acquire_land_lock() {
+  local lock waited=0 warned="" host
+  lock="$(_land_state_dir)/land.lock"
+  mkdir -p "$(dirname "$lock")" 2>/dev/null || true
+  host="$(hostname 2>/dev/null || printf 'unknown')"
+  while :; do
+    if mkdir "$lock" 2>/dev/null; then
+      printf '%s %s %s\n' "$$" "$host" "$(date +%s)" > "$lock/owner" 2>/dev/null || true
+      _LAND_LOCK="$lock"
+      trap '_release_land_lock' EXIT
+      return 0
+    fi
+    if _land_lock_stale "$lock"; then
+      wt_warn "breaking a stale land lock (holder pid $(_land_lock_owner_pid "$lock") is dead or older than ${LAND_LOCK_STALE_SECONDS}s) — issue #315"
+      rm -rf "$lock" 2>/dev/null || true
+      continue
+    fi
+    if [ -z "$warned" ]; then
+      wt_warn "waiting for the land lock (held by pid $(_land_lock_owner_pid "$lock"), $(_land_lock_age "$lock")s) — another land is in progress; serializing to avoid the #315 race"
+      warned=1
+    fi
+    if [ "$waited" -ge "$LAND_LOCK_WAIT_MAX" ]; then
+      wt_die "timed out after ${LAND_LOCK_WAIT_MAX}s waiting for the land lock (held by pid $(_land_lock_owner_pid "$lock")). Another land looks stuck — investigate, then re-run."
+    fi
+    sleep "$LAND_LOCK_POLL" 2>/dev/null || sleep 1
+    waited=$(( waited + LAND_LOCK_POLL ))
+  done
+}
+
+# _release_land_lock -> drop the lock, but ONLY when we still own it: a lock broken as
+# stale and reacquired by another lander now belongs to them, so an ownership check
+# (owner pid == ours, or a torn/empty owner) prevents us from removing their lock.
+_release_land_lock() {
+  [ -n "$_LAND_LOCK" ] || return 0
+  local pid
+  pid="$(_land_lock_owner_pid "$_LAND_LOCK")"
+  if [ "$pid" = "$$" ] || [ -z "$pid" ]; then
+    rm -rf "$_LAND_LOCK" 2>/dev/null || true
+  fi
+  _LAND_LOCK=""
+}
+
 # --- guard: role, not directory (issue #26) -------------------------------------
 # A spoke's claude has full filesystem access, so it can cd into the main checkout
 # and slip past a "must run from the hub" directory check. worktree-new.sh stamps
@@ -96,6 +205,11 @@ HUB_BRANCH="$(git symbolic-ref --short -q HEAD || true)"
   || wt_die "hub is on '${HUB_BRANCH:-detached HEAD}' — land from the base branch '$DEFAULT'"
 [ -z "$(git status --porcelain -uno)" ] \
   || wt_die "hub checkout is dirty — commit or stash before landing"
+
+# Take the land mutex (issue #315) now that the cheap hub guards passed: serialize the
+# fetch -> sync -> merge -> push critical section against a concurrent land (manual or
+# auto_land) so a rejected push can never leave the hub behind origin. Released on EXIT.
+acquire_land_lock
 
 # wt_pane_stranded <path> -> a tmux pane's cwd is teardown RESIDUE, not a live
 # worktree: it is gone, OR its only surviving entries are the gitignored scratch
