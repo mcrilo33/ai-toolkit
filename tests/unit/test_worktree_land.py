@@ -2306,3 +2306,94 @@ def test_single_issue_land_is_unchanged(hub: Path, tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     closes = [ln for ln in _log_text(logs["gh"]).splitlines() if ln.startswith("issue close")]
     assert len(closes) == 1 and "issue close 7" in closes[0]
+
+
+# ── land mutex (issue #315) ───────────────────────────────────────────────────
+# A manual/quick operator land and the drain's auto_land both merge+push main via
+# THIS script, with nothing coordinating them; the two raced on 2026-07-16 and a
+# rejected push left the hub BEHIND origin. worktree-land.sh now takes a shared land
+# lock — a `mkdir` dir under ${AFK_STATE_DIR:-<git-common-dir>/ai-toolkit-afk}/land.lock
+# (the #300 primitive + state dir) holding an `owner` file "<pid> <host> <ts>" — before
+# the merge+push critical section, so concurrent lands serialize. A crashed holder is
+# broken (dead pid, or past LAND_LOCK_STALE_SECONDS); a live holder is WAITED on
+# (bounded by LAND_LOCK_WAIT_MAX) and the wait is LOGGED, never silent.
+def _land_lock_dir(statedir: Path) -> Path:
+    return statedir / "land.lock"
+
+
+def _seed_land_lock(statedir: Path, *, pid: int, ts: int, host: str = "testhost") -> Path:
+    """Pre-create the land lock owned by <pid> stamped at <ts> (models a held lock)."""
+    lock = _land_lock_dir(statedir)
+    lock.mkdir(parents=True, exist_ok=True)
+    (lock / "owner").write_text(f"{pid} {host} {ts}\n")
+    return lock
+
+
+def test_land_breaks_dead_holder_lock(hub: Path, tmp_path: Path) -> None:
+    # A crashed lander must not wedge landing forever (AC3): a dead owner pid is broken.
+    statedir = tmp_path / "afk-state"
+    dead = subprocess.Popen(["sleep", "30"])
+    dead.terminate()
+    dead.wait()  # pid now dead — kill -0 fails
+    _seed_land_lock(statedir, pid=dead.pid, ts=int(time.time()))
+    _make_spoke(hub, tmp_path, "feature/1-done", push=True)
+
+    proc, _ = _run_land(hub, tmp_path, "1", extra_env={"AFK_STATE_DIR": str(statedir)})
+
+    assert proc.returncode == 0, proc.stderr
+    assert "breaking a stale land lock" in proc.stderr.lower(), proc.stderr
+    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
+    assert not _land_lock_dir(statedir).exists(), "the broken-then-owned lock is released after"
+
+
+def test_land_breaks_lock_older_than_stale_bound(hub: Path, tmp_path: Path) -> None:
+    # Backstop for a wedged-but-alive holder / pid reuse: a lock older than the stale bound is
+    # broken even when its owner pid still resolves alive (use this test process's live pid).
+    statedir = tmp_path / "afk-state"
+    _seed_land_lock(statedir, pid=os.getpid(), ts=int(time.time()) - 100000)
+    _make_spoke(hub, tmp_path, "feature/1-done", push=True)
+
+    proc, _ = _run_land(
+        hub,
+        tmp_path,
+        "1",
+        extra_env={"AFK_STATE_DIR": str(statedir), "LAND_LOCK_STALE_SECONDS": "10"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "breaking a stale land lock" in proc.stderr.lower(), proc.stderr
+    assert _remote_sha(hub, "main") == _git(hub, "rev-parse", "HEAD").strip()
+
+
+def test_waiting_land_logs_and_bounded_timeout_keeps_live_holder(hub: Path, tmp_path: Path) -> None:
+    # A LIVE, fresh holder is NOT broken (probe the real process, Principle 4): the waiting land
+    # LOGS that it is waiting (AC3, never silent) and gives up LOUDLY at the bound rather than
+    # racing the push. The held lock and main are both untouched.
+    statedir = tmp_path / "afk-state"
+    holder = subprocess.Popen(["sleep", "30"])
+    try:
+        _seed_land_lock(statedir, pid=holder.pid, ts=int(time.time()))
+        _make_spoke(hub, tmp_path, "feature/1-done", push=True)
+        before = _remote_sha(hub, "main")
+
+        proc, _ = _run_land(
+            hub,
+            tmp_path,
+            "1",
+            extra_env={
+                "AFK_STATE_DIR": str(statedir),
+                "LAND_LOCK_WAIT_MAX": "2",
+                "LAND_LOCK_POLL": "1",
+                "LAND_LOCK_STALE_SECONDS": "100000",
+            },
+        )
+
+        assert proc.returncode != 0, "a bounded wait that never wins must fail loud, not race"
+        low = proc.stderr.lower()
+        assert "waiting for the land lock" in low, proc.stderr
+        assert "timed out" in low, proc.stderr
+        assert _land_lock_dir(statedir).exists(), "a live holder's lock must not be broken"
+        assert _remote_sha(hub, "main") == before, "the waiting land must not touch main"
+    finally:
+        holder.terminate()
+        holder.wait()
