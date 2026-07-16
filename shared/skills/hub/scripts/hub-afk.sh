@@ -872,6 +872,25 @@ _afk_spoke_run_id() {
   printf '%s\n' "$id"
 }
 
+# --- #300 step 3 lifecycle transition log (shadow writers) --------------------
+# The drain-side actors record the transition/event they CAUSE at the moment they act, the
+# same principle step 2 wired into the spoke/land actors (9d7acbe). These front the guarded
+# worktree-lib wrappers (no-op on a non-numeric issue or an absent transition-log lib, so a
+# write never fails the drain) and stamp the spoke's run id onto every record, so a whole
+# lifecycle is greppable by run even across a revive/redispatch. Shadow-only: no detector
+# reads the log for decisions in this step. <wt> supplies the run id; pass it BEFORE a
+# redispatch tears the worktree down.
+_afk_tlog_transition() {
+  local wt="$1" issue="$2" to="$3" cause="$4" evidence="${5:-}"
+  AFK_TLOG_RUN="$(_afk_spoke_run_id "$wt")" \
+    wt_tlog_transition "$issue" "$to" hub-afk.sh "$cause" "$evidence"
+}
+_afk_tlog_event() {
+  local wt="$1" issue="$2" event="$3" lane="${4:-}" evidence="${5:-}"
+  AFK_TLOG_RUN="$(_afk_spoke_run_id "$wt")" \
+    wt_tlog_event "$issue" "$event" hub-afk.sh "$lane" "" "$evidence"
+}
+
 # _afk_resume_prompt <issue> -> the plain-English first message for the resumed session.
 # Deliberately NOT a slash command: `/cycle` is not a real command (the skill is
 # solo-cycle), so a seeded `/cycle` would fail and re-strand the spoke.
@@ -1058,6 +1077,10 @@ resume_spoke() {
   # answer-attempt epoch is the idle clock's exclusion, so stamping it reads the revived spoke
   # busy until its new session writes a transcript.
   stamp_answer_attempt "$issue"
+  # #300 step 3: re-adopting a crashed-but-intact pane is a revive transition (cause distinct
+  # from _revive_spoke's kill-and-relaunch — this one never kills, the pane was already dead).
+  _afk_tlog_transition "$wt" "$issue" revived \
+    "pane crashed with work intact — re-adopted in place once" '{"path":"resume"}'
   _afk_bump_count "$wt" relaunch-count   # #231: a relaunch — failure economics vs a clean run
   _afk_clear_park_episode "$wt"          # #231: a fresh run may re-park → count the next block anew
   _afk_emit_span "$wt" afk-resume success
@@ -1304,6 +1327,10 @@ _revive_spoke() {
   # forensics bundle in the journal line so the morning review can open it.
   broker_journal_decision "$issue" revive \
     "revived a hung/crashed pane (killed + relaunched claude --continue)${bundle:+ — hang forensics: $bundle}" reversible
+  # #300 step 3: the drain reviving this spoke is a lifecycle transition — record it.
+  _afk_tlog_transition "$wt" "$issue" revived \
+    "killed a hung/crashed pane and relaunched claude --continue" \
+    "{\"path\":\"revive\"${bundle:+,\"forensics\":\"$bundle\"}}"
   _afk_bump_count "$wt" relaunch-count   # #231: a relaunch — failure economics vs a clean run
   _afk_clear_park_episode "$wt"          # #231: a fresh run may re-park → count the next block anew
   _afk_emit_span "$wt" afk-revive success
@@ -1334,6 +1361,10 @@ _afk_nudge_spoke() {
   inject_and_verify "$wt" "$target" "$(_afk_nudge_prompt "$issue")"; rc=$?
   broker_journal_decision "$issue" nudge \
     "finished-turn-idle: injected a continue-nudge into the live session (no relaunch)" reversible
+  # #300 step 3: the #255 nudge lane records its event (delivered vs retry via the rc), so a
+  # reader can tell "the drain nudged this spoke" apart from "the spoke is silently idle".
+  _afk_tlog_event "$wt" "$issue" nudge nudge \
+    "{\"delivered\":$([ "$rc" -eq 0 ] && printf true || printf false)}"
   if [ "$rc" -eq 0 ]; then _afk_emit_span "$wt" afk-nudge success; else _afk_emit_span "$wt" afk-nudge retry; fi
   return "$rc"
 }
@@ -2392,6 +2423,9 @@ auto_land() {
     # Bracket the land with the local default-branch SHA so a supervisor-scope merge is
     # detectable from the pre..post diff (#250 self-update DETECT).
     land_before="$(_afk_local_default_sha)"
+    # #300 step 3: read the run id BEFORE the land — a clean land tears the worktree down, so
+    # .ai-toolkit/spoke-run-id is gone by the time we record the reaped transition.
+    land_run="$(_afk_spoke_run_id "$path")"
     _afk_run_with_heartbeat bash "$wt_land" "$issue" --skip-tests >"$land_log" 2>&1; land_rc=$?
     if [ "$land_rc" -eq 0 ]; then
       log "  landed #$issue"
@@ -2399,6 +2433,10 @@ auto_land() {
       _afk_clear_warned "$issue"         # #241: progress → drop the land's warned-retry backoff
       _afk_incr_landed   # tally for the drain-complete notification (#150)
       _afk_detect_selfupdate "$land_before" "$(_afk_local_default_sha)" "$issue"  # #250
+      # #300 step 3: the drain reaping the landed spoke is a lifecycle transition (distinct from
+      # worktree-land.sh's own `landed` — this is the DRAIN acting on completion, tallied + torn down).
+      AFK_TLOG_RUN="$land_run" wt_tlog_transition "$issue" reaped hub-afk.sh \
+        "landed and reaped by the drain" "{\"land_log\":\"$land_log\"}"
     elif [ "$land_rc" -eq 3 ]; then
       # Sentinel (#198 / #202 I): main ADVANCED but a teardown step failed — the code IS
       # shipped, so NEVER stamp blocked over merged work. Tally it and point at the log.
@@ -2407,6 +2445,11 @@ auto_land() {
       _afk_clear_warned "$issue"         # #241: shipped → drop the warned-retry backoff
       _afk_incr_landed
       _afk_detect_selfupdate "$land_before" "$(_afk_local_default_sha)" "$issue"  # #250: shipped ⇒ still deploy
+      # #300 step 3: shipped, so record the reap — the evidence flags the incomplete teardown so a
+      # reader sees a reaped spoke whose worktree may still be on disk.
+      AFK_TLOG_RUN="$land_run" wt_tlog_transition "$issue" reaped hub-afk.sh \
+        "landed; teardown incomplete (worktree-land exit 3)" \
+        "{\"land_log\":\"$land_log\",\"teardown\":\"incomplete\"}"
     elif [ "$land_rc" -eq "$WT_LAND_CONFLICT_EXIT" ]; then
       # #285: a DETERMINISTIC merge conflict — record the tip fingerprint and route to the
       # resolution lane (relaunch/inject the spoke to merge the base branch + resolve + re-push).
@@ -2559,16 +2602,26 @@ reap_pass() {
 # editor-workspace edit). Records the once-per-window stamp on success. AFK_REDISPATCH_CMD
 # overrides the teardown for tests. rc 1 when the teardown can't run (caller escalates).
 _redispatch_dead_pane() {
-  local wt="$1" issue="$2" wt_done
+  local wt="$1" issue="$2" wt_done run
+  # #300 step 3: read the run id BEFORE the teardown — worktree-done.sh removes the worktree,
+  # so .ai-toolkit/spoke-run-id is gone by the time we'd record the redispatched transition.
+  run="$(_afk_spoke_run_id "$wt")"
   log "→ redispatch #$issue: pane crashed with no work to preserve — tearing down the empty worktree so it re-dispatches"
   _kill_spoke_window "$issue"
   if [ -n "${AFK_REDISPATCH_CMD:-}" ]; then
-    bash -c "$AFK_REDISPATCH_CMD"; _afk_mark_redispatched "$issue"; return 0
+    bash -c "$AFK_REDISPATCH_CMD"; _afk_mark_redispatched "$issue"
+    AFK_TLOG_RUN="$run" wt_tlog_transition "$issue" redispatched hub-afk.sh \
+      "pane crashed with no work to preserve — tore down the empty worktree to re-dispatch" \
+      '{"path":"redispatch-cmd"}'
+    return 0
   fi
   wt_done="$(_afk_find_script "${WT_DONE:-}" worktree-done.sh)" \
     || { log "  worktree-done.sh not found — cannot re-dispatch #$issue"; return 1; }
   if bash "$wt_done" "$issue" --force --no-code >/dev/null 2>&1; then
     _afk_mark_redispatched "$issue"
+    AFK_TLOG_RUN="$run" wt_tlog_transition "$issue" redispatched hub-afk.sh \
+      "pane crashed with no work to preserve — tore down the empty worktree to re-dispatch" \
+      '{"path":"worktree-done"}'
     return 0
   fi
   log "  worktree-done.sh failed for #$issue — leaving the worktree in place"

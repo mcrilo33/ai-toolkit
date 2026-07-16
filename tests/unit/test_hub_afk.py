@@ -11154,3 +11154,124 @@ def test_warn_parked_last_attended_never_escalates(tmp_path: Path) -> None:
         "attended stays warn-and-wait — never escalated by the drain"
     )
     assert (statedir / "warned-5.txt").exists()
+
+
+# ── #300 step 3: drain-side lifecycle transition writers ──────────────────────
+# The drain records the transition/event it CAUSES (reap / revive / redispatch / nudge)
+# at the moment it acts, keyed by the spoke's run id. Shadow-only: nothing reads the log
+# for a decision in this step, so these assert the RECORD, not a behavior change.
+
+
+def _tlog(state_dir: Path, issue: int) -> str:
+    p = state_dir / "transitions" / f"{issue}.jsonl"
+    return p.read_text() if p.is_file() else ""
+
+
+def _spoke_wt_with_run(tmp_path: Path, run_id: str) -> Path:
+    wt = tmp_path / "wt"
+    (wt / ".ai-toolkit").mkdir(parents=True)
+    (wt / ".ai-toolkit" / "spoke-run-id").write_text(run_id + "\n")
+    return wt
+
+
+def test_afk_tlog_transition_stamps_the_run(tmp_path: Path) -> None:
+    wt = _spoke_wt_with_run(tmp_path, "run-abc")
+    state = tmp_path / "sd"
+
+    _call(
+        f"""_afk_tlog_transition "{wt}" 302 revived "killed and relaunched" '{{"path":"revive"}}'""",
+        env={"AFK_STATE_DIR": str(state)},
+    )
+
+    line = _tlog(state, 302)
+    assert '"to":"revived"' in line
+    assert '"actor":"hub-afk.sh"' in line
+    assert '"run":"run-abc"' in line  # the run id groups a whole lifecycle across a revive
+
+
+def test_afk_tlog_event_carries_lane(tmp_path: Path) -> None:
+    wt = _spoke_wt_with_run(tmp_path, "run-xyz")
+    state = tmp_path / "sd"
+
+    _call(
+        f"""_afk_tlog_event "{wt}" 302 nudge nudge '{{"delivered":true}}'""",
+        env={"AFK_STATE_DIR": str(state)},
+    )
+
+    line = _tlog(state, 302)
+    assert '"event":"nudge"' in line
+    assert '"lane":"nudge"' in line  # the #255 nudge lane
+
+
+def test_afk_tlog_no_ops_on_an_adhoc_slug(tmp_path: Path) -> None:
+    # A /quick worktree keyed by a non-numeric slug has no issue to log by — the guarded
+    # wrapper must skip, never scatter a stray file or fail the drain.
+    wt = _spoke_wt_with_run(tmp_path, "run-q")
+    state = tmp_path / "sd"
+
+    result = _call(
+        f'_afk_tlog_transition "{wt}" quick-slug reaped x; echo rc=$?',
+        env={"AFK_STATE_DIR": str(state)},
+    )
+
+    assert "rc=0" in result.stdout
+    assert not (state / "transitions").exists()
+
+
+def test_redispatch_records_redispatched_with_the_run(tmp_path: Path) -> None:
+    # The full redispatch path (test-override lane): _redispatch_dead_pane tears the worktree
+    # down, then records `redispatched`. The run id must survive that teardown — it is read
+    # from .ai-toolkit/spoke-run-id BEFORE the teardown, so the record still carries it.
+    wt = _spoke_wt_with_run(tmp_path, "run-redispatch")
+    state = tmp_path / "sd"
+
+    _call(
+        f'_redispatch_dead_pane "{wt}" 302',
+        env={"AFK_STATE_DIR": str(state), "AFK_REDISPATCH_CMD": "true"},
+    )
+
+    line = _tlog(state, 302)
+    assert '"to":"redispatched"' in line
+    assert '"run":"run-redispatch"' in line, "run id must survive the worktree teardown"
+
+
+def test_redispatch_reads_run_before_teardown() -> None:
+    # Source guard for the property above: the run-id read must PRECEDE _kill_spoke_window /
+    # worktree-done — otherwise the record keys by a synthesized fallback, not the real run.
+    src = HUB_AFK.read_text()
+    body = src[src.index("_redispatch_dead_pane()") :]
+    body = body[: body.index("\nrecover_dead_panes")]
+    read_at = body.find('run="$(_afk_spoke_run_id')
+    kill_at = body.find("_kill_spoke_window")
+
+    assert read_at != -1, "_redispatch_dead_pane must capture the run id"
+    assert read_at < kill_at, "the run id must be read BEFORE the teardown removes the worktree"
+
+
+def test_reap_reads_run_before_the_land() -> None:
+    # auto_land's clean land tears the worktree down, so the run id for the `reaped` record must
+    # be read BEFORE the land runs (the same intent-first property #290 needed for `landing`).
+    src = HUB_AFK.read_text()
+    read_at = src.find('land_run="$(_afk_spoke_run_id')
+    land_at = src.find('bash "$wt_land" "$issue" --skip-tests')
+    reaped_at = src.find('wt_tlog_transition "$issue" reaped')
+
+    assert read_at != -1, "auto_land must capture the run id for the reaped record"
+    assert read_at < land_at, "the run id must be read BEFORE the land tears the worktree down"
+    assert reaped_at != -1, "auto_land must record the reaped transition"
+
+
+def test_revive_and_resume_record_the_revived_transition() -> None:
+    # Both revive paths (_revive_spoke kill+relaunch, resume_spoke re-adopt-in-place) record a
+    # `revived` transition — the state the watchdog cannot learn from a relaunched pane today.
+    src = HUB_AFK.read_text()
+
+    assert src.count('_afk_tlog_transition "$wt" "$issue" revived') >= 2
+
+
+def test_nudge_records_the_255_lane_event() -> None:
+    # The #255 nudge lane records its event so a reader tells "the drain nudged this spoke" from
+    # "the spoke is silently idle" — an event (within a state), not a transition.
+    src = HUB_AFK.read_text()
+
+    assert '_afk_tlog_event "$wt" "$issue" nudge nudge' in src
