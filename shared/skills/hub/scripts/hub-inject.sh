@@ -44,6 +44,55 @@ fi
 # only fires for a standalone source (the watchdog / tests). Same stderr contract.
 declare -F log >/dev/null 2>&1 || log() { printf '%s\n' "$*" >&2; }
 
+# --- #300 step 3b delivery-event shadow writers -------------------------------
+# The injector is the ONE place that KNOWS the #281 delivery verdict (inject_and_verify's rc
+# 0/1/2/3, approve_permission's rc 0/1), so it records that verdict as a transition-log EVENT
+# at the moment it computes it — the same actor-records-what-it-causes principle #302 wired
+# into the drain's recovery lane. Shadow-only + best-effort: the write is guarded (a no-op when
+# the transition-log lib is unavailable or the issue is not derivable) and NEVER changes the
+# injector's return value. worktree-lib.sh (sourced above) supplies wt_tlog_event; its own
+# guard no-ops when transition-log.sh is absent, so a missing lib degrades cleanly.
+#
+# The injector receives only <wt> (the answer path passes no issue), so the issue is derived
+# from the spoke's branch slug — the same feature/<issue>-<slug> read afk_permission_hook_decide
+# uses — with AFK_TLOG_ISSUE as an explicit override (tests, and any caller that already knows
+# it). lane/episode ride env vars (AFK_TLOG_LANE / AFK_TLOG_EPISODE) so a caller that owns the
+# park context (the permission lane) threads it in, while the answer path degrades to a bare
+# delivery lane with no episode — the broker's own lane events carry the episode key instead.
+
+# _hi_issue_for_wt <wt> -> the numeric issue this worktree belongs to (AFK_TLOG_ISSUE wins,
+# else the branch slug's leading digits), or empty (rc 1) when none is derivable.
+_hi_issue_for_wt() {
+  local wt="$1" issue="${AFK_TLOG_ISSUE:-}" br slug
+  if [ -z "$issue" ]; then
+    br="$(git -C "$wt" branch --show-current 2>/dev/null)" || true
+    slug="${br##*/}"; issue="${slug%%[!0-9]*}"
+  fi
+  case "$issue" in '' | *[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$issue"
+}
+
+# _hi_tlog_delivery <wt> <event> <default_lane> [evidence-json] -> record one delivery event.
+# Best-effort: no-ops when the log lib is absent or the issue is not derivable; never fails the
+# injector. lane defaults to <default_lane> unless the caller set AFK_TLOG_LANE.
+_hi_tlog_delivery() {
+  local wt="$1" event="$2" default_lane="$3" evidence="${4:-}" issue
+  command -v wt_tlog_event >/dev/null 2>&1 || return 0
+  issue="$(_hi_issue_for_wt "$wt")" || return 0
+  wt_tlog_event "$issue" "$event" hub-inject.sh \
+    "${AFK_TLOG_LANE:-$default_lane}" "${AFK_TLOG_EPISODE:-}" "$evidence"
+}
+
+# _hi_delivery_verdict <rc> -> the #281 delivery-verdict event name for an inject_and_verify rc.
+_hi_delivery_verdict() {
+  case "$1" in
+    0) printf 'answer_delivered\n' ;;
+    2) printf 'inject_wedged\n' ;;
+    3) printf 'inject_refuted\n' ;;
+    *) printf 'answer_not_registered\n' ;;
+  esac
+}
+
 # === the moved primitives (verbatim from gate-broker.sh, issue #251) ==========
 
 _spoke_project_dir() {
@@ -433,7 +482,10 @@ _answer_delivered() {
 #          advance is EXPLAINED: callers must NOT read it as the spoke moving on — a
 #          moved-on drop here leaves the gate tag and re-pastes forever (#201 review).
 #   rc 1 — not registered and no text observable in the composer — the caller escalates.
-inject_and_verify() {
+# The public entry point is a thin wrapper (below) that records the #281 verdict as a shadow
+# delivery event; the classification logic itself lives here, untouched, so no return path or
+# gotcha comment moved for the telemetry.
+_inject_and_verify() {
   local wt="$1" target="$2" text="$3" before baseline_shows=0 sizes vetoed=0
   before="$(_transcript_mtime "$wt")"
   # Baseline BEFORE pasting: a short answer often also appears in the rendered
@@ -443,6 +495,10 @@ inject_and_verify() {
   _composer_shows_text "$target" "$text" && baseline_shows=1
   sizes="$(_transcript_sizes "$wt")"
   inject_answer "$target" "$text" || return 1
+  # #300 step 3b: the keystrokes went to the pane — the "injected" moment, distinct from the
+  # verdict the wrapper records. A pre-inject failure returns above WITHOUT this, so a reader
+  # sees a verdict with no answer_injected only when the inject itself never happened.
+  _hi_tlog_delivery "$wt" answer_injected answer
   if _transcript_advanced "$wt" "$before"; then
     _answer_delivered "$wt" "$text" "$sizes" && return 0
     # The advance may have raced the submit's own user-record write by milliseconds:
@@ -469,6 +525,15 @@ inject_and_verify() {
   [ "$baseline_shows" -eq 0 ] && _composer_shows_text "$target" "$text" && return 2
   [ "$vetoed" -eq 1 ] && return 3
   return 1
+}
+# inject_and_verify <wt_path> <pane_target> <text> -> _inject_and_verify plus a shadow record of
+# the #281 delivery verdict (answer_delivered / answer_not_registered / inject_wedged /
+# inject_refuted). Best-effort: the event never changes the returned rc.
+inject_and_verify() {
+  local rc
+  _inject_and_verify "$@"; rc=$?
+  _hi_tlog_delivery "$1" "$(_hi_delivery_verdict "$rc")" answer "{\"rc\":$rc}"
+  return "$rc"
 }
 # _pane_shows_permission_prompt <wt_path> -> true when the spoke's pane shows a Claude Code
 # permission dialog. The signature regex is tunable via AFK_PERMISSION_PROMPT_RE. Fail-CLOSED
@@ -501,6 +566,16 @@ _pane_shows_permission_prompt() {
 # so a second failure is a wedged pane — the caller's backoff to own (a failed approve records
 # nothing, so the serve stays retryable, #294).
 approve_permission() {
+  local rc
+  _approve_permission "$@"; rc=$?
+  # #300 step 3b: the permission lane's delivery record — approval_injected, with the delivered
+  # verdict in evidence. Best-effort, never changes the returned rc. The permission broker wraps
+  # this call with AFK_TLOG_LANE/EPISODE so the event carries the park episode key.
+  _hi_tlog_delivery "$1" approval_injected permission \
+    "{\"delivered\":$([ "$rc" -eq 0 ] && printf true || printf false)}"
+  return "$rc"
+}
+_approve_permission() {
   local wt="$1" target before pane
   command -v tmux >/dev/null 2>&1 || return 1
   target="$(_spoke_pane_target "$wt")"

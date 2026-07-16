@@ -995,3 +995,84 @@ def test_a_failed_approve_delivery_records_no_served_park(spoke_repo: Path, tmp_
     assert not _served_marker(env).exists(), (
         "a delivery the broker could not confirm must never read as served"
     )
+
+
+# ── #300 step 3b: permission lane transition-log events ───────────────────────
+# The permission lane records its per-episode decision (approve_decided, kind=reasoned|mechanical)
+# and threads the issue+lane+episode so hub-inject's approval_injected delivery event keys on the
+# broker's KNOWN issue. Shadow-only: these assert the RECORD, not a behavior change.
+
+_PUSH_MAIN = "git push origin main"  # a main-touching command classify_permission ESCALATEs
+
+
+def _events(state_dir: Path, issue: int) -> list[dict]:
+    p = state_dir / "transitions" / f"{issue}.jsonl"
+    if not p.is_file():
+        return []
+    return [json.loads(ln) for ln in p.read_text().splitlines() if ln.strip()]
+
+
+def _events_named(state_dir: Path, issue: int, name: str) -> list[dict]:
+    return [e for e in _events(state_dir, issue) if e.get("event") == name]
+
+
+def test_decide_permission_records_mechanical_approve_decided(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
+    # The fixed-rule fast path records approve_decided with kind=mechanical, and threads the
+    # lane onto hub-inject's approval_injected delivery event.
+    env = _perm_env(tmp_path, spoke_repo, _AUTO_APPROVABLE, "printf 'ANSWER: APPROVE'")
+    _age_transcript(spoke_repo, env)
+    state = Path(env["_STATEDIR"])
+
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    decided = _events_named(state, 5, "approve_decided")
+    assert any(e["evidence"]["kind"] == "mechanical" for e in decided), decided
+    assert all(e["lane"] == "permission" for e in decided)
+    injected = _events_named(state, 5, "approval_injected")
+    assert injected and all(e["lane"] == "permission" for e in injected), injected
+
+
+def test_reason_permission_records_reasoned_approve(spoke_repo: Path, tmp_path: Path) -> None:
+    # An ESCALATE command routes to the reasoner; an ANSWER: APPROVE records approve_decided with
+    # kind=reasoned and decision=approve, and the reasoner's own answer_computed is labelled on
+    # the permission lane (run_answerer defaults to the answer lane).
+    env = _perm_env(tmp_path, spoke_repo, _PUSH_MAIN, "printf 'ANSWER: APPROVE'")
+    _age_transcript(spoke_repo, env)
+    state = Path(env["_STATEDIR"])
+
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    decided = _events_named(state, 5, "approve_decided")
+    assert decided, "the reasoned verdict must record approve_decided"
+    ev = decided[-1]["evidence"]
+    assert ev == {"decision": "approve", "kind": "reasoned"}
+    computed = _events_named(state, 5, "answer_computed")
+    assert computed and computed[-1]["lane"] == "permission", computed
+
+
+def test_reason_permission_records_reasoned_deny(spoke_repo: Path, tmp_path: Path) -> None:
+    env = _perm_env(tmp_path, spoke_repo, _PUSH_MAIN, "printf 'ANSWER: DENY: use your own branch'")
+    _age_transcript(spoke_repo, env)
+    state = Path(env["_STATEDIR"])
+
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    decided = _events_named(state, 5, "approve_decided")
+    assert decided and decided[-1]["evidence"]["decision"] == "deny", decided
+
+
+def test_permission_lane_events_carry_the_episode(spoke_repo: Path, tmp_path: Path) -> None:
+    # The episode key is <sig>:<onset>; the sig is _broker_park_signature's hash, so the recorded
+    # episode is non-empty and matches the broker's own re-answer/served signature.
+    env = _perm_env(tmp_path, spoke_repo, _AUTO_APPROVABLE, "printf 'ANSWER: APPROVE'")
+    _age_transcript(spoke_repo, env)
+    state = Path(env["_STATEDIR"])
+
+    _call(f"broker_service_gate '{spoke_repo}' 5 unattended", env=env)
+
+    decided = _events_named(state, 5, "approve_decided")
+    assert decided, "sanity: a decision was recorded"
+    episode = decided[-1].get("episode", "")
+    assert episode and ":" in episode, f"expected a <sig>:<onset> episode, got {episode!r}"

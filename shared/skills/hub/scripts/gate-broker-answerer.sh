@@ -298,6 +298,42 @@ codify_decisions() {
     }' "$log" 2>/dev/null | sort || true
 }
 
+# --- #300 step 3b lifecycle transition-log lane events (shadow writers) --------
+# The broker records the lane action it CAUSES — an answer computed / dropped / escalated, a
+# #277 plan waive, a permission approve/deny — as a transition-log EVENT keyed by the park
+# EPISODE, the same actor-records-the-cause principle #302 wired into the drain's recovery lane.
+# Shadow-only: nothing reads the log for a decision in this step. Best-effort throughout: a write
+# never fails the broker (guarded when the transition-log lib is unavailable) and adds NO pane
+# read — the episode signature comes from the caller (the permission lane already holds it) or
+# the PERSISTED park-sig record, never a fresh capture-pane on the shadow path (#269).
+
+# _gb_episode_key <issue> [sig] -> the broker's park episode key "<sig>:<onset>" for a
+# transition-log event, or empty when no episode is substantiable. <sig> is the caller's
+# already-captured park signature; absent, it is read from the PERSISTED park-sig record (a
+# cheap file read), so the shadow path never pays an extra capture-pane. Both the passed sig and
+# the persisted one ARE _broker_park_signature's hash, so the recorded episode keys on the very
+# signature the broker's own re-answer/onset state does (the "episode key matches the broker's
+# signature" contract). onset is the live park-onset epoch (empty when none).
+_gb_episode_key() {
+  local issue="$1" sig="${2:-}" onset stored
+  command -v read_park_onset_epoch >/dev/null 2>&1 || return 0
+  if [ -z "$sig" ]; then
+    stored="$(read_park_sig "$issue" 2>/dev/null)"
+    sig="${stored##*$'\t'}"
+  fi
+  [ -n "$sig" ] || return 0
+  onset="$(read_park_onset_epoch "$issue" 2>/dev/null)"
+  printf '%s:%s\n' "$sig" "$onset"
+}
+
+# _gb_tlog_event <issue> <event> <lane> <episode> [evidence-json] -> record one broker lane
+# event. Best-effort: no-ops when the transition-log lib is unavailable (the #300 contract) or
+# the issue is not numeric (the wt_tlog_event wrapper enforces both).
+_gb_tlog_event() {
+  command -v wt_tlog_event >/dev/null 2>&1 || return 0
+  wt_tlog_event "$1" "$2" gate-broker.sh "$3" "$4" "${5:-}"
+}
+
 # --- decision journal + warn-and-continue (issue #241) ------------------------
 # The /afk answerer ALWAYS answers: every former terminal stop site (escalate-blocked, reap,
 # ceiling, void, inject-failure, dispatch/land/auth halts) now TAKES the best action, WARNS
@@ -371,6 +407,11 @@ broker_journal_decision() {
   local issue="$1" park="$2" decision="$3" rev="${4:-unknown}"
   _broker_journal_line "$@"
   _broker_journal_gh_comment "$issue" "$park" "$decision" "$rev"
+  # #300 step 3b: the #277 plan-restatement fast-path is the ONLY decision journaled with park
+  # kind `gate` (the answer/permission/ceiling kinds journal under their own names) — surface it
+  # as a `waived` lane event so a detector reads the auto-approval explicitly. Shadow, best-effort.
+  [ "$park" = gate ] && _gb_tlog_event "$issue" waived gate "$(_gb_episode_key "$issue")" \
+    "{\"rev\":\"$rev\"}"
   return 0
 }
 
@@ -512,6 +553,13 @@ broker_warn_continue() {
   # (capped below the watchdog ceiling); every other kind paces the default answer/service lane.
   _afk_warned_arm "$issue" "$(_afk_warned_lane "$park")" "$(_afk_warned_lane_cap "$park")"
   afk_emit_decision "$wt" warn
+  # #300 step 3b: a warn-and-continue on the ANSWER lane means the computed answer reached no
+  # delivery — a dropped answer, recorded WITH its reason; every other park kind's fallback is an
+  # escalation. Shadow-only, episode from the persisted park-sig (no pane read).
+  local _gb_ev=escalated
+  [ "$park" = answer ] && _gb_ev=answer_dropped
+  _gb_tlog_event "$issue" "$_gb_ev" "$park" "$(_gb_episode_key "$issue")" \
+    "{\"rev\":\"$rev\",\"reason\":\"$(_broker_json_escape "$decision")\"}"
   return 0
 }
 
@@ -786,6 +834,11 @@ run_answerer() {
   rc=$?
   [ -n "$pf" ] && rm -f "$pf"
   [ -n "$snap" ] && rm -rf "$snap" 2>/dev/null || true
+  # #300 step 3b: the reasoner just computed a decision — record it. lane defaults to the answer
+  # lane; the permission reasoner runs us under AFK_TLOG_LANE=permission so its own compute is
+  # labelled correctly. Shadow-only, episode from the persisted park-sig (no pane read).
+  _gb_tlog_event "$issue" answer_computed "${AFK_TLOG_LANE:-answer}" \
+    "$(_gb_episode_key "$issue")" "{\"rc\":$rc}"
   return "$rc"
 }
 

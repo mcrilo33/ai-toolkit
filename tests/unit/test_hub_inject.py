@@ -1056,3 +1056,144 @@ def test_cli_unknown_command_exits_two(tmp_path: Path) -> None:
 
     assert result.returncode == 2
     assert "unknown command" in result.stderr
+
+
+# ── #300 step 3b: delivery-event shadow writers ───────────────────────────────
+# The injector records the #281 delivery verdict as a transition-log EVENT at the moment it
+# computes it (answer_injected, then answer_delivered / answer_not_registered / inject_wedged /
+# inject_refuted; approval_injected for the permission lane). Shadow-only + best-effort: the
+# events NEVER change the injector's return value, and a missing transition-log lib no-ops.
+
+
+def _tlog(state_dir: Path, issue: int) -> str:
+    p = state_dir / "transitions" / f"{issue}.jsonl"
+    return p.read_text() if p.is_file() else ""
+
+
+def test_hi_issue_for_wt_prefers_the_explicit_override(tmp_path: Path) -> None:
+    # AFK_TLOG_ISSUE wins over any branch derivation (the answer path passes no issue, so tests
+    # and future callers that already know it thread it in without a git worktree).
+    result = _call(
+        f'_hi_issue_for_wt "{tmp_path}"; echo rc=$?',
+        env={"AFK_TLOG_ISSUE": "311"},
+    )
+
+    assert "311" in result.stdout
+    assert "rc=0" in result.stdout
+
+
+def test_hi_issue_for_wt_empty_on_a_non_numeric_slug(tmp_path: Path) -> None:
+    # A non-numeric override (an ad-hoc /quick slug) yields no issue — the caller then skips the
+    # write rather than keying a log by a bad id.
+    result = _call(
+        f'out="$(_hi_issue_for_wt "{tmp_path}")"; echo "rc=$? out=[$out]"',
+        env={"AFK_TLOG_ISSUE": "quick-slug"},
+    )
+
+    assert "rc=1 out=[]" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "rc,event",
+    [
+        ("0", "answer_delivered"),
+        ("1", "answer_not_registered"),
+        ("2", "inject_wedged"),
+        ("3", "inject_refuted"),
+    ],
+)
+def test_hi_delivery_verdict_maps_each_rc(rc: str, event: str) -> None:
+    result = _call(f"_hi_delivery_verdict {rc}")
+
+    assert result.stdout.strip() == event
+
+
+def test_hi_tlog_delivery_records_the_event_with_lane_and_episode(tmp_path: Path) -> None:
+    state = tmp_path / "sd"
+
+    _call(
+        f'_hi_tlog_delivery "{tmp_path / "wt"}" answer_delivered answer \'{{"rc":0}}\'',
+        env={
+            "AFK_STATE_DIR": str(state),
+            "AFK_TLOG_ISSUE": "311",
+            "AFK_TLOG_LANE": "permission",
+            "AFK_TLOG_EPISODE": "abc123:1700",
+        },
+    )
+
+    line = _tlog(state, 311)
+    assert '"event":"answer_delivered"' in line
+    assert '"actor":"hub-inject.sh"' in line
+    assert '"lane":"permission"' in line  # AFK_TLOG_LANE overrides the default lane
+    assert '"episode":"abc123:1700"' in line  # a caller that owns the park context threads it in
+
+
+def test_hi_tlog_delivery_defaults_the_lane_when_env_unset(tmp_path: Path) -> None:
+    state = tmp_path / "sd"
+
+    _call(
+        f'_hi_tlog_delivery "{tmp_path / "wt"}" answer_injected answer',
+        env={"AFK_STATE_DIR": str(state), "AFK_TLOG_ISSUE": "311"},
+    )
+
+    assert '"lane":"answer"' in _tlog(state, 311)
+
+
+def test_hi_tlog_delivery_is_best_effort_without_the_transition_log(tmp_path: Path) -> None:
+    # The #300 contract: a write NEVER fails the injector. With the transition-log lib absent
+    # (both wrappers unset), the helper is a clean no-op returning success — no file, no error.
+    state = tmp_path / "sd"
+
+    result = _call(
+        f"unset -f wt_tlog_event afk_tlog_event; "
+        f'_hi_tlog_delivery "{tmp_path / "wt"}" answer_delivered answer; echo rc=$?',
+        env={"AFK_STATE_DIR": str(state), "AFK_TLOG_ISSUE": "311"},
+    )
+
+    assert "rc=0" in result.stdout
+    assert not (state / "transitions").exists()
+
+
+def test_inject_and_verify_records_injected_then_the_verdict(tmp_path: Path) -> None:
+    # End-to-end: an unregistered inject (empty pane, no transcript) returns rc 1 AND records
+    # answer_injected (the keystrokes went out) followed by answer_not_registered (the verdict).
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    state = tmp_path / "sd"
+    fake_bin, _ = _pane_tmux(tmp_path, pane_path=wt, capture="")
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_INJECT_POLL_SECONDS": "0",
+        "CLAUDE_PROJECTS_DIR": str(tmp_path / "projects"),
+        "AFK_STATE_DIR": str(state),
+        "AFK_TLOG_ISSUE": "311",
+    }
+
+    result = _call(f"inject_and_verify '{wt}' 'hub:0' 'use Redis'", env=env)
+
+    assert result.returncode == 1, result.stderr
+    log = _tlog(state, 311)
+    assert '"event":"answer_injected"' in log
+    assert '"event":"answer_not_registered"' in log
+
+
+def test_approve_permission_records_approval_injected(tmp_path: Path) -> None:
+    # The permission lane's delivery record. The dialog is served; approval_injected lands
+    # whatever the delivery outcome (the evidence carries delivered:true|false).
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    state = tmp_path / "sd"
+    fake_bin, _ = _pane_tmux(tmp_path, pane_path=wt, capture=_PROMPT)
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "CLAUDE_PROJECTS_DIR": str(tmp_path / "projects"),
+        "AFK_STATE_DIR": str(state),
+        "AFK_TLOG_ISSUE": "311",
+    }
+
+    _call(f"approve_permission '{wt}'", env=env)
+
+    assert '"event":"approval_injected"' in _tlog(state, 311)
