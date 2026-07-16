@@ -615,21 +615,23 @@ def test_decide_permission_logs_escalate_verdict(spoke_repo: Path, tmp_path: Pat
     assert "git-reset+git-add" not in codify.stdout, "a flag-dependent conflict must not codify"
 
 
-# ── #263: slot_state stamps the un-landed clock on the first done tick ─────────
-# The watchdog's auto-land-skipped ceiling measures from this done epoch, NOT the progress
-# epoch (which pre-ages during a pre-ready park). A ready-at-tip spoke stamps it once on its
-# first done read; a still-working/waiting spoke never does; a tip advance clears it.
-def test_slot_state_ready_at_tip_stamps_done_epoch(spoke_repo: Path, tmp_path: Path) -> None:
+# ── #263/#304: the un-landed clock reads the recorded terminal transition ──────
+# The watchdog's auto-land-skipped ceiling measures from the done epoch, which #304 retires to a
+# projection of the ready/accepted transition slot_state records (not a stamped file). The
+# round-trip: a ready-at-tip read records the transition, and read_done_epoch projects its onset.
+def test_slot_state_ready_at_tip_feeds_read_done_epoch_via_the_log(
+    spoke_repo: Path, tmp_path: Path
+) -> None:
     statedir = tmp_path / "afk-state"
     subprocess.run(["git", "tag", "-f", "ready/5"], cwd=spoke_repo, check=True, capture_output=True)
+    env = {"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1700000000"}
 
-    result = _call(
-        f"slot_state '{spoke_repo}' 5",
-        env={"AFK_STATE_DIR": str(statedir), "AFK_NOW": "1700000000"},
-    )
+    result = _call(f"slot_state '{spoke_repo}' 5", env=env)
+    onset = _call("read_done_epoch 5", env=env).stdout.strip()
 
     assert result.stdout.strip() == "done", result.stdout + result.stderr
-    assert (statedir / "done-5.epoch").read_text().strip() == "1700000000"
+    assert not (statedir / "done-5.epoch").exists(), "the epoch file is retired to the log"
+    assert onset.isdigit() and int(onset) > 0, f"read_done_epoch must project the onset: {onset!r}"
 
 
 def test_slot_state_busy_spoke_does_not_stamp_done_epoch(spoke_repo: Path, tmp_path: Path) -> None:
@@ -655,18 +657,6 @@ def test_slot_state_busy_spoke_does_not_stamp_done_epoch(spoke_repo: Path, tmp_p
 
     assert result.stdout.strip() == "busy", result.stdout + result.stderr
     assert not (statedir / "done-5.epoch").exists()
-
-
-def test_stamp_done_epoch_once_is_idempotent(tmp_path: Path) -> None:
-    # Stamp-once: the un-landed clock is fixed at the FIRST done tick and never resets while the
-    # spoke stays done, so the full ceiling elapses before the watchdog can fire.
-    statedir = tmp_path / "afk-state"
-    env = {"AFK_STATE_DIR": str(statedir)}
-
-    _call("stamp_done_epoch_once 5", env={**env, "AFK_NOW": "1700000000"})
-    _call("stamp_done_epoch_once 5", env={**env, "AFK_NOW": "1700009999"})  # second tick
-
-    assert (statedir / "done-5.epoch").read_text().strip() == "1700000000"
 
 
 def test_note_tip_progress_clears_done_epoch_on_tip_advance(
@@ -1317,7 +1307,9 @@ def test_slot_state_question_park_records_a_parked_transition_with_an_episode(
     # lane events use (via _gb_episode_key), so the watchdog's episode-keyed service reads go live.
     statedir = tmp_path / "afk-state"
     projects = tmp_path / "projects"
-    _write_transcript(projects, spoke_repo, [_ask_record("Ship it?", ["yes", "no"])])
+    _write_transcript(
+        projects, spoke_repo, [_ask_record("Ship it?", [("yes", "ship"), ("no", "hold")])]
+    )
 
     result = _call(
         f"slot_state '{spoke_repo}' 5",

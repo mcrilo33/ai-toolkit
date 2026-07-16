@@ -156,17 +156,24 @@ stamp_progress_epoch()  { _stamp_issue_epoch progress "$1"; }
 read_progress_epoch()   { _read_issue_epoch progress "$1"; }
 stamp_answer_attempt()  { _stamp_issue_epoch answer-attempt "$1"; }
 read_answer_attempt()   { _read_issue_epoch answer-attempt "$1"; }
-# done-<issue>.epoch — the un-landed clock's reference for the watchdog's auto-land-skipped
-# check (#263): stamped the FIRST tick slot_state reads a ready/accept-at-tip terminal, so the
-# ceiling measures from the done/ready transition, NOT the progress epoch (which is stamped
-# only on tip advances and pre-ages during a pre-ready park — the false-fire this fixes).
-# Cleared on a tip advance (a revived spoke re-stamps fresh) and on a fresh arm.
-stamp_done_epoch()      { _stamp_issue_epoch done "$1"; }
-read_done_epoch()       { _read_issue_epoch done "$1"; }
+# done-<issue>.epoch — the un-landed clock's reference for the watchdog's auto-land-skipped check
+# (#263). #304 RETIRES it to a DERIVED VIEW: read_done_epoch projects the onset of the recorded
+# ready/accepted transition in the #300 log — the actor (spoke-ready.sh) stamped it AT the terminal
+# moment, so the un-landed clock no longer depends on slot_state stamping a side-effect of merely
+# observing the spoke. A done-<issue>.epoch FILE is still read as a FALLBACK (a pre-#304 stamp, or a
+# standalone watchdog with no log API in scope), so no reader regresses; empty when neither exists
+# (unknown — never a firing basis alone, #300). clear_done_epoch stays: _afk_note_tip_progress
+# drops a stale FALLBACK file on a tip advance, and _clear_progress_state wipes it on a fresh arm.
+read_done_epoch() {
+  local issue="$1"
+  if command -v afk_current_state >/dev/null 2>&1; then
+    case "$(afk_current_state "$issue" 2>/dev/null)" in
+      ready | accepted) afk_state_onset "$issue" 2>/dev/null; return ;;
+    esac
+  fi
+  _read_issue_epoch done "$issue"
+}
 clear_done_epoch()      { rm -f "$(_afk_state_dir)/done-$1.epoch" 2>/dev/null || true; }
-# stamp-once: a ready-at-tip spoke's un-landed clock starts at the FIRST done tick and does not
-# reset while it stays done, so the full ceiling elapses before the watchdog can fire.
-stamp_done_epoch_once() { [ -n "$(read_done_epoch "$1")" ] || stamp_done_epoch "$1"; }
 # park-onset-<issue>.epoch — the watchdog's park-unanswered never-attempted reference (#265):
 # stamped the FIRST tick slot_state reads a spoke `waiting`, so the park-unanswered ceiling
 # measures from park onset rather than zero. The answer-attempt epoch is stamped only at answer

@@ -242,6 +242,65 @@ _detect_agent_dead() {
   _spoke_agent_dead "$1"
 }
 
+# --- the reconciler (issue #304) ----------------------------------------------
+# slot_state is a pure READ of the #300 log; where the log DIVERGES from ground truth it heals the
+# log by APPENDING a visible actor:reconciler transition, never a silent epoch stamp (#300 principle
+# 1). Steady observation — the log already agrees — writes nothing, so a status read is side-effect
+# free (#304 AC2). These helpers are the ONLY writers slot_state now invokes.
+
+# _afk_record_reconciled <issue> <to> [episode] -> append a reconciler transition recording ground
+# truth <to>, but ONLY when the log tail does not already record it (a divergence). Evidence NAMES
+# the divergence so healing is auditable: a cold start (empty log — afk_current_state "unknown") is
+# marked lossy (no prior history to trust, #304 AC4); otherwise the stale recorded state is named.
+# For a park, a CHANGED episode is a new state even when the state NAME is unchanged. Best-effort:
+# no-ops without the log write API (#300 contract) and never fails the caller.
+_afk_record_reconciled() {
+  local issue="$1" to="$2" episode="${3:-}" cur ev
+  command -v afk_tlog_transition >/dev/null 2>&1 || return 0
+  command -v afk_current_state >/dev/null 2>&1 || return 0
+  cur="$(afk_current_state "$issue" 2>/dev/null)"
+  if [ "$cur" = "$to" ]; then
+    [ -n "$episode" ] || return 0                                          # settled: no divergence
+    [ "$(afk_current_episode "$issue" 2>/dev/null)" = "$episode" ] && return 0
+  fi
+  if [ "$cur" = unknown ]; then
+    ev="{\"lossy\":true,\"actual\":\"$to\"}"                               # cold start, no history
+  else
+    ev="{\"expected\":\"$cur\",\"actual\":\"$to\"}"
+  fi
+  afk_tlog_transition "$issue" "$to" reconciler ground-truth "$ev" "$episode"
+}
+
+# _afk_note_park_context <wt> <issue> -> the reconciler's park-recording write: stamp the park-onset
+# epoch (stamp-once, the first waiting tick) and the park-sig record the episode key is built from,
+# then echo the episode "<sig>:<onset>" _gb_episode_key resolves — the SAME key the broker stamps on
+# its answer-lane events (both read these two files), so the recorded `parked` transition and the
+# lane events share one episode and the watchdog's episode-keyed service reads engage (#304 AC1).
+# Empty episode when nothing is extractable (a park with no signature): the transition still records,
+# just without an episode, and the detector falls back to the epoch side-channels there (#300).
+# UPGRADE: re-derives the park signature (a pane read slot_state's park probe just did) — thread the
+# already-read signal through if the extra per-park capture ever matters (#269). The onset re-stamp
+# on a CHANGED episode stays the watchdog's note_park_episode job; here stamp-once seeds the floor.
+_afk_note_park_context() {
+  local wt="$1" issue="$2" sig tip
+  stamp_park_onset_epoch_once "$issue"
+  sig="$(_broker_park_signature "$wt" "$issue" 2>/dev/null)"
+  if [ -n "$sig" ]; then
+    tip="$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)"
+    printf '%s\t%s\n' "$tip" "$sig" > "$(_park_sig_file "$issue")" 2>/dev/null || true
+  fi
+  command -v _gb_episode_key >/dev/null 2>&1 && _gb_episode_key "$issue" 2>/dev/null || true
+}
+
+# _afk_reconcile_park <wt> <issue> -> record a live park: seed the episode context, then append the
+# visible `parked` transition on a divergence (a new park episode). The single park-recording site
+# the four waiting branches of slot_state share.
+_afk_reconcile_park() {
+  local wt="$1" issue="$2" episode
+  episode="$(_afk_note_park_context "$wt" "$issue")"
+  _afk_record_reconciled "$issue" parked "$episode"
+}
+
 # slot_state <wt_path> <issue> -> done|waiting|reap|busy.
 #   done    — a TERMINAL marker (ready/accept/blocked) at the branch tip.
 #   waiting — parked on a question / gate / permission dialog, AGENT ALIVE (auto-answer it; never
@@ -256,16 +315,24 @@ slot_state() {
   if [ -n "$tip" ]; then
     for kind in ready accept; do
       marker="$(git -C "$wt_path" rev-parse -q --verify "refs/tags/${kind}/${issue}^{commit}" 2>/dev/null)"
-      # Stamp the un-landed clock on the FIRST done tick (#263) so the watchdog measures the
-      # ceiling from here, not a progress epoch that pre-aged during a pre-ready park.
+      # Record the terminal state so the watchdog's un-landed clock (read_done_epoch, now a log
+      # projection) measures from the ready/accepted transition (#263), not a progress epoch that
+      # pre-aged during a pre-ready park.
       if [ "$marker" = "$tip" ]; then
         # #274: a fresh ready/accept marker at the tip is genuine progress — drop the stale
         # warned-retry backoff (both lanes), per _afk_clear_warned's "fresh marker → stale" contract.
-        # Gated on the done epoch being unstamped so it fires ONCE on the transition (mirrors
-        # stamp_done_epoch_once): an unconditional clear each done tick would wipe a land failure's
-        # own land-lane backoff and defeat the #241 low-frequency land-retry pacing.
+        # Gated on read_done_epoch (now the log projection) being empty so it fires ONCE on the
+        # transition: an unconditional clear each done tick would wipe a land failure's own land-lane
+        # backoff and defeat the #241 low-frequency land-retry pacing.
         [ -n "$(read_done_epoch "$issue")" ] || _afk_clear_warned "$issue"
-        stamp_done_epoch_once "$issue"; printf 'done\n'; return
+        # #304: record the terminal state as a VISIBLE reconciler transition (read_done_epoch
+        # projects its onset) instead of a silent done-epoch stamp. ready -> ready, accept ->
+        # accepted (spoke-ready.sh's own log vocabulary).
+        case "$kind" in
+          ready) _afk_record_reconciled "$issue" ready ;;
+          accept) _afk_record_reconciled "$issue" accepted ;;
+        esac
+        printf 'done\n'; return
       fi
     done
     # blocked/<issue> at the tip is terminal ONLY if the spoke is not still parked. A
@@ -280,7 +347,7 @@ slot_state() {
       # auto-revived over the escalation, unlike the gate/question cases below).
       if { [ -n "$(extract_pending_question "$wt_path")" ] || _permission_pending "$wt_path"; } \
          && ! _detect_agent_dead "$wt_path"; then
-        stamp_park_onset_epoch_once "$issue"; printf 'waiting\n'; return
+        _afk_reconcile_park "$wt_path" "$issue"; printf 'waiting\n'; return
       fi
       printf 'done\n'; return
     fi
@@ -294,7 +361,7 @@ slot_state() {
       # `waiting` and was never revived. Only a LIVE agent at the gate is a real park; a dead one
       # falls through to busy/reap so recover_dead_panes revives it in place.
       if ! _detect_agent_dead "$wt_path"; then
-        stamp_park_onset_epoch_once "$issue"; printf 'waiting\n'; return
+        _afk_reconcile_park "$wt_path" "$issue"; printf 'waiting\n'; return
       fi
     fi
   fi
@@ -313,12 +380,12 @@ slot_state() {
   # crash, not a live park. The probe runs only AFTER the cheap park signal is already true (&&
   # short-circuits), so a busy spoke never pays for it.
   if [ -n "$(extract_pending_question "$wt_path")" ] && ! _detect_agent_dead "$wt_path"; then
-    stamp_park_onset_epoch_once "$issue"; printf 'waiting\n'; return
+    _afk_reconcile_park "$wt_path" "$issue"; printf 'waiting\n'; return
   fi
   # A pending permission dialog (a CC confirmation prompt, no transcript entry) is decided by
   # the supervisor's classifier, so it waits — never reaped as idle (#149) or over-ceiling (#246).
   if _permission_pending "$wt_path" && ! _detect_agent_dead "$wt_path"; then
-    stamp_park_onset_epoch_once "$issue"; printf 'waiting\n'; return
+    _afk_reconcile_park "$wt_path" "$issue"; printf 'waiting\n'; return
   fi
   # Past every park check ⇒ the spoke is NOT parked (busy/reap). Reset its park-onset clock so a
   # later re-park measures the watchdog's park-unanswered ceiling from the NEW onset, not a stale
