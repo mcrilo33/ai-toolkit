@@ -1883,6 +1883,100 @@ def test_run_conditions_keeps_auto_land_skipped_for_a_ready_spoke(tmp_path: Path
     assert '"condition":"accept-unsigned"' not in ledger
 
 
+# ── #303 (#300 step 4): auto-land-skipped READS the transition log ─────────────
+# Two conversions, each with a fallback so an unknown/absent log never fires nor suppresses alone:
+#   1. Staleness is measured from the RECORDED terminal transition (ready/accepted onset), the
+#      log-native replacement for the done-epoch proxy — done epoch is the fallback when unknown.
+#   2. accept-vs-ready is classified from the RECORDED state (accepted is DISTINCT from ready at the
+#      source, spoke-ready's _tlog_state_for_kind), so a human-sign-off close can never escalate as
+#      an un-landed branch (#292) — the tip-tag probe (_wd_terminal_marker_kind) is the fallback.
+# A log-vs-tag disagreement logs a divergence line (never silent, #300); the log wins.
+def test_mergeable_skipped_measures_staleness_from_the_ready_transition_onset(
+    tmp_path: Path,
+) -> None:
+    # #303: the ceiling is measured from the RECORDED ready transition, not the done epoch. A FRESH
+    # ready onset means auto_land still has its full window, even when a STALE done epoch (the proxy
+    # this replaces) would already read past the ceiling — so the detector stays quiet.
+    wt = _git_repo(tmp_path)
+    _write_transition(tmp_path / "afk-state", 5, "ready", ts=str(int(NOW) - 100))  # fresh onset
+    prelude = (
+        "slot_state() { echo done; }; "
+        f"read_done_epoch() {{ echo {int(NOW) - 4000}; }}"  # stale proxy — would fire today
+    )
+    env = {
+        "AFK_NOW": NOW,
+        "AFK_STATE_DIR": str(tmp_path / "afk-state"),
+        "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo open",
+    }
+    assert _call(f"{prelude}; _wd_detect_mergeable_skipped '{wt}' 5 {NOW}", env=env).returncode == 1
+
+
+def test_mergeable_skipped_fires_when_the_ready_transition_onset_is_stale(tmp_path: Path) -> None:
+    # The complement: a ready transition older than the ceiling IS a genuine un-landed skip — and it
+    # fires from the transition ALONE, with no done epoch on record (the log is now the primary read).
+    wt = _git_repo(tmp_path)
+    _write_transition(tmp_path / "afk-state", 5, "ready", ts=str(int(NOW) - 4000))  # stale onset
+    prelude = "slot_state() { echo done; }; read_done_epoch() { echo ''; }"  # no done epoch at all
+    env = {
+        "AFK_NOW": NOW,
+        "AFK_STATE_DIR": str(tmp_path / "afk-state"),
+        "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo open",
+    }
+    assert _call(f"{prelude}; _wd_detect_mergeable_skipped '{wt}' 5 {NOW}", env=env).returncode == 0
+
+
+def test_run_conditions_accepted_in_the_log_never_escalates_even_against_a_ready_tag(
+    tmp_path: Path,
+) -> None:
+    # The #292 structural proof: the transition log is AUTHORITATIVE over the tip tag. A recorded
+    # `accepted` routes to accept-unsigned (human sign-off), NEVER auto-land-skipped — even when a
+    # (misleading) ready/ tag sits at the tip that today's tag-only probe would classify as a ready
+    # drain shortfall. This is the fix the log makes structural: accepted is a distinct recorded
+    # state, not something inferred from a tag that can be stale or mid-move.
+    wt, base = _mergeable_repo(tmp_path)
+    _ready_tag(wt)  # tip tag says ready — today's inference would escalate as un-landed
+    (tmp_path / "statedir").mkdir(exist_ok=True)
+    _write_transition(tmp_path / "statedir", 5, "accepted", ts=str(int(NOW) - 1000))
+    ledger = _run_conditions_ledger(wt, base, tmp_path)
+
+    assert '"condition":"accept-unsigned"' in ledger, ledger
+    assert '"condition":"auto-land-skipped"' not in ledger, (
+        "a recorded accepted state must win over a ready tag — the #292 misdirection"
+    )
+
+
+def test_run_conditions_logs_a_classify_divergence_when_log_and_tag_disagree(
+    tmp_path: Path,
+) -> None:
+    # Never silent (#300): the log (accepted) and the tip tag (ready) disagree about the terminal
+    # kind, so a DIVERGENCE line names it; the log wins. Mirrors _run_conditions_ledger's setup but
+    # captures stdout (where _wd_log writes) instead of only the ledger.
+    wt, base = _mergeable_repo(tmp_path)
+    _ready_tag(wt)
+    statedir = tmp_path / "statedir"
+    statedir.mkdir(exist_ok=True)
+    _write_transition(statedir, 5, "accepted", ts=str(int(NOW) - 1000))
+    old = str(int(NOW) - 1000)
+    prelude = (
+        f'inflight_worktrees() {{ printf "%s\\t5\\n" "{wt}"; }}; '
+        f"slot_state() {{ echo done; }}; read_done_epoch() {{ echo {old}; }}"
+    )
+    env = {
+        "AFK_NOW": NOW,
+        "HUB_WATCHDOG_ISSUE_STATE_CMD": "echo open",
+        "HUB_WATCHDOG_LEDGER": str(tmp_path / "ledger.jsonl"),
+        "HUB_WATCHDOG_LANDMARK_CMD": "true",
+        "HUB_WATCHDOG_LANDMARK_REPO": str(tmp_path / "nolandmarks"),
+        "AI_TOOLKIT_BASE_BRANCH": base,
+        "AFK_STATE_DIR": str(statedir),
+    }
+
+    result = _call(f"{prelude}; _wd_run_conditions {NOW} off", env=env)
+
+    assert "divergence" in result.stdout.lower(), result.stdout
+    assert "accept" in result.stdout and "ready" in result.stdout
+
+
 def test_sweep_clears_the_accept_unsigned_marker_for_a_closed_issue(tmp_path: Path) -> None:
     # The landmark sweep already re-arms auto-land-skipped/conflicted-land once the issue closes;
     # the new condition needs the same treatment or a later recurrence stays deduped into silence.
