@@ -10,7 +10,9 @@ from pathlib import Path
 
 import pytest
 from _gate_broker_support import (
+    _DISPLAY_CASE,
     _PERMISSION_PROMPT,
+    _agent_ps_stub,
     _ask_record,
     _bash_tool_record,
     _call,
@@ -25,6 +27,27 @@ from _gate_broker_support import (
     _tag_gate_at_head,
     _write_transcript,
 )
+
+
+def _dead_agent_bin(tmp_path: Path, spoke_repo: Path, *, capture: str = "") -> Path:
+    """A PATH bin whose tmux maps a pane to <spoke_repo> and reports a pane pid, but whose ps
+    shows NO agent under it: the #301 incident shape — a pane very much alive (list-panes maps
+    it), running a bare shell after the reboot killed claude. `capture` optionally renders a
+    stale permission dialog left in the scrollback. Returns the bin dir to prepend to PATH.
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f'  capture-pane) printf "%s\\n" "{capture}" ;;\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        f"{_DISPLAY_CASE}"
+        "esac\nexit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin, agent_alive=False)  # the pane pid has no claude descendant
+    return fake_bin
 
 
 @pytest.fixture(autouse=True)
@@ -592,6 +615,127 @@ def test_slot_state_question_parked_stamps_park_onset(spoke_repo: Path, tmp_path
 
     assert result.stdout.strip() == "waiting", result.stdout + result.stderr
     assert (statedir / "park-onset-5.epoch").read_text().strip() == "1700000000"
+
+
+# ── #301: a DEAD agent is a crash, not a park — slot_state must not read `waiting` ──
+#
+# tmux scrollback and git tags OUTLIVE the agent. When a reboot kills claude but the pane
+# survives (bare shell), the dialog claude last rendered is still captured and any gate/<issue>
+# tag is still at the tip — so every waiting signal still fires. Before #301 slot_state read that
+# as `waiting`, the answer lane tried to inject into the shell (ST1 now refuses, but every tick
+# fired a spurious "answer did not register — escalating"), and recover_dead_panes SKIPPED the
+# `waiting` state so the crash was never revived. The gate/<issue> case is the exact #296/#299
+# shape: a git tag is the most durable phantom-park source there is.
+
+
+def test_slot_state_gate_parked_dead_agent_is_not_waiting(spoke_repo: Path, tmp_path: Path) -> None:
+    """The #296/#299 shape: gate/<issue> at the tip, but the agent is gone."""
+    subprocess.run(["git", "tag", "gate/5"], cwd=spoke_repo, check=True, capture_output=True)
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    (pd / "session.jsonl").write_text(
+        json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}})
+        + "\n"
+    )
+    fake_bin = _dead_agent_bin(tmp_path, spoke_repo)
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={
+            "AFK_STATE_DIR": str(tmp_path / "afk-state"),
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "AFK_NOW": "1700000000",
+        },
+    )
+
+    assert result.stdout.strip() != "waiting", (
+        "a gate tag that outlived its agent is a crash, not a park — reading it `waiting` makes "
+        f"the answer lane serve a dead shell and hides it from recover_dead_panes: {result.stdout}"
+    )
+
+
+def test_slot_state_permission_dead_agent_is_not_waiting(spoke_repo: Path, tmp_path: Path) -> None:
+    """A stale permission dialog in a dead pane's scrollback must not read as a live park."""
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    jsonl = pd / "session.jsonl"
+    jsonl.write_text(json.dumps(_bash_tool_record("git reset -q")) + "\n")
+    os.utime(jsonl, (1_000_000_000, 1_000_000_000))
+    fake_bin = _dead_agent_bin(tmp_path, spoke_repo, capture=_PERMISSION_PROMPT)
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={
+            "AFK_STATE_DIR": str(tmp_path / "afk-state"),
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "AFK_NOW": "1000000000",
+        },
+    )
+
+    assert result.stdout.strip() != "waiting", (
+        f"a permission dialog left in a crashed pane's scrollback is not a live park: {result.stdout}"
+    )
+
+
+def test_slot_state_gate_parked_live_agent_stays_waiting(spoke_repo: Path, tmp_path: Path) -> None:
+    """Preservation: a gate-parked spoke whose agent IS alive still classifies `waiting`."""
+    subprocess.run(["git", "tag", "gate/5"], cwd=spoke_repo, check=True, capture_output=True)
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    (pd / "session.jsonl").write_text(
+        json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "x"}]}})
+        + "\n"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$1" in\n'
+        f'  list-panes) printf "afk:1\\t%s\\n" "{spoke_repo}" ;;\n'
+        f"{_DISPLAY_CASE}"
+        "esac\nexit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin, agent_alive=True)
+
+    result = _call(
+        f"slot_state '{spoke_repo}' 5",
+        env={
+            "AFK_STATE_DIR": str(tmp_path / "afk-state"),
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "AFK_NOW": "1700000000",
+        },
+    )
+
+    assert result.stdout.strip() == "waiting", (
+        f"a live agent parked at the gate is a genuine park: {result.stdout}{result.stderr}"
+    )
+
+
+def test_spoke_still_parked_is_false_for_a_dead_agent(spoke_repo: Path, tmp_path: Path) -> None:
+    """_spoke_still_parked drives _reap_or_resume: a dead agent showing a stale dialog must read
+    NOT parked, so the reaper revives it instead of routing it back to the answerer (#246)."""
+    projects = tmp_path / "projects"
+    pd = _project_dir_for(projects, spoke_repo)
+    (pd / "session.jsonl").write_text(json.dumps(_bash_tool_record("git reset -q")) + "\n")
+    fake_bin = _dead_agent_bin(tmp_path, spoke_repo, capture=_PERMISSION_PROMPT)
+
+    result = _call(
+        f"_spoke_still_parked '{spoke_repo}' 5 && echo PARKED || echo NOT_PARKED",
+        env={
+            "AFK_STATE_DIR": str(tmp_path / "afk-state"),
+            "CLAUDE_PROJECTS_DIR": str(projects),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        },
+    )
+
+    assert result.stdout.strip() == "NOT_PARKED", (
+        "a dead agent has no live park to service — _spoke_still_parked must fail toward "
+        f"'moved on' so the reaper revives rather than re-answers: {result.stdout}{result.stderr}"
+    )
 
 
 def test_stamp_park_onset_epoch_once_is_idempotent(tmp_path: Path) -> None:
