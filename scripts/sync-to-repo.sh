@@ -18,13 +18,16 @@ error()   { echo -e "${RED}✗${NC} $1" >&2; }
 section() { echo -e "\n${BLUE}── $1 ──${NC}"; }
 
 usage() {
-    echo "Usage: $0 <target-repo-path> [tool] [--with-git-hooks] [--dry-run]"
+    echo "Usage: $0 <target-repo-path> [tool] [--with-git-hooks] [--local-only] [--dry-run]"
     echo ""
     echo "Tools: copilot, cursor, claude, all (default: all)"
     echo ""
     echo "Flags:"
     echo "  --with-git-hooks   Also install the cage scripts as NATIVE git hooks"
     echo "                     (fallback enforcement, independent of the agent runtime)"
+    echo "  --local-only       Exclude the synced ai-toolkit paths in the target's"
+    echo "                     .git/info/exclude (per-clone, never committed), so a"
+    echo "                     PERSONAL deployment does not propagate to teammates"
     echo "  --dry-run          Print what would be written/deleted without touching"
     echo "                     the target"
     echo ""
@@ -43,10 +46,12 @@ TARGET=""
 TOOL="all"
 WITH_GIT_HOOKS=0
 DRY_RUN=0
+LOCAL_ONLY=0
 for arg in "$@"; do
     case "$arg" in
         --with-git-hooks) WITH_GIT_HOOKS=1 ;;
         --dry-run) DRY_RUN=1 ;;
+        --local-only) LOCAL_ONLY=1 ;;
         copilot|cursor|claude|all) TOOL="$arg" ;;
         -*) error "Unknown flag: $arg"; usage ;;
         *)
@@ -717,6 +722,43 @@ sync_git_hooks() {
     bash "$SCRIPT_DIR/install-git-hooks.sh" "$TARGET"
 }
 
+# --local-only: exclude the ai-toolkit-managed paths from the target repo LOCALLY, so a
+# personal deployment never gets committed or propagated to teammates. Uses the target's
+# .git/info/exclude (per-clone, NOT tracked) rather than .gitignore (which would itself be a
+# committed change). Idempotent: a marked block is replaced, never duplicated. Surgical about
+# .github — only the ai-toolkit SUBDIRS are excluded, never .github/ or .github/workflows/
+# (the project's real CI). Resolves the git common dir so it also works from inside a worktree.
+sync_local_exclude() {
+    section "Local git exclude (personal, not committed)"
+    local common exclude
+    common="$(git -C "$TARGET" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || {
+        warn "Target is not a git repository — skipping --local-only exclude"
+        return 0
+    }
+    exclude="$common/info/exclude"
+    local begin="# >>> ai-toolkit (local, personal — do not commit) >>>"
+    local end="# <<< ai-toolkit <<<"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "[dry-run] would write the ai-toolkit block to $exclude"
+        return 0
+    fi
+    make_dir "$common/info"
+    # Strip any prior block (idempotent), then append a fresh one.
+    if [ -f "$exclude" ]; then
+        awk -v b="$begin" -v e="$end" '
+            $0==b {skip=1} skip && $0==e {skip=0; next} !skip {print}
+        ' "$exclude" > "$exclude.tmp" && mv "$exclude.tmp" "$exclude"
+    fi
+    {
+        printf '%s\n' "$begin"
+        printf '/.claude/\n/.cursor/\n/.ai-toolkit/\n'
+        printf '/.github/instructions/\n/.github/skills/\n/.github/agents/\n/.github/prompts/\n/.github/hooks/\n'
+        printf '.testmondata\n.testmondata-shm\n.testmondata-wal\n'
+        printf '%s\n' "$end"
+    } >> "$exclude"
+    info "wrote local exclude block to .git/info/exclude (ai-toolkit paths ignored on this clone only)"
+}
+
 # ═══════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════
@@ -736,6 +778,10 @@ apply_enabled_config
 
 if [ "$WITH_GIT_HOOKS" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
     sync_git_hooks
+fi
+
+if [ "$LOCAL_ONLY" -eq 1 ]; then
+    sync_local_exclude
 fi
 
 echo ""

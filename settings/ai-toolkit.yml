@@ -17,9 +17,25 @@
 #
 # Effort defaults to `max` everywhere it is omitted.
 
-# The integration branch the hub operates on and that spokes branch from and
-# land to. Empty ⇒ today's auto-detection (origin/HEAD → main); see the
-# wt_base_branch resolver in shared/hooks/lib/base-branch.sh (issue #117).
+# The integration branch THIS repo (ai-toolkit itself) operates on and that its
+# spokes branch from and land to. Empty ⇒ auto-detection (origin/HEAD → main); see
+# the wt_base_branch resolver in shared/hooks/lib/base-branch.sh (issue #117).
+#
+# ┌─ DOWNSTREAM / CONSUMING PROJECTS — READ BEFORE EDITING ──────────────────────┐
+# │ Do NOT put your project's branch here. This is the ai-toolkit SOURCE config:  │
+# │ it is committed, `sync-to-repo.sh` copies its effect into EVERY consuming     │
+# │ project, and it governs ai-toolkit's OWN hub. A branch name here (e.g. a       │
+# │ feature branch) breaks the ai-toolkit drain and propagates to all downstreams. │
+# │                                                                                │
+# │ To set a CONSUMING project's base branch, in THAT project's shell/session set  │
+# │   export AI_TOOLKIT_BASE_BRANCH=<your-branch>                                   │
+# │ The resolver honors it (config > AI_TOOLKIT_BASE_BRANCH > origin/HEAD) and it   │
+# │ SURVIVES re-sync — unlike `git config ai-toolkit.base-branch`, which every      │
+# │ sync overwrites from this file. Keep it in your shell profile or a per-project  │
+# │ env (e.g. direnv .envrc) so it persists. See docs/downstream-setup.md.         │
+# │ NOTE: the git config key is HYPHENATED (`ai-toolkit.base-branch`); the          │
+# │ camelCase `ai-toolkit.baseBranch` is a DIFFERENT key the resolver ignores.      │
+# └────────────────────────────────────────────────────────────────────────────┘
 base_branch:
 
 # Global on/off switch (issue #154). The master toggle for ALL toolkit

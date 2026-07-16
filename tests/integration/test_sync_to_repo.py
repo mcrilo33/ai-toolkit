@@ -1359,3 +1359,65 @@ class TestBaseBranchCamelCaseGuard:
 
         assert "base-branch" in result.stdout
         assert "baseBranch" in result.stdout
+
+
+class TestLocalOnlyExclude:
+    """--local-only writes the ai-toolkit paths to the target's .git/info/exclude,
+    so a personal deployment never propagates to teammates (per-clone, not committed)."""
+
+    def _exclude(self, target: Path) -> Path:
+        return target / ".git" / "info" / "exclude"
+
+    def _run(self, target: Path, tool: str = "claude") -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(SYNC_SCRIPT), str(target), tool, "--local-only"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    def test_writes_the_ai_toolkit_block(self, target_repo: Path) -> None:
+        self._run(target_repo)
+
+        text = self._exclude(target_repo).read_text()
+        assert "# >>> ai-toolkit (local, personal — do not commit) >>>" in text
+        assert "/.claude/" in text
+        assert "/.ai-toolkit/" in text
+
+    def test_ai_toolkit_paths_are_ignored(self, target_repo: Path) -> None:
+        self._run(target_repo)
+
+        for p in (".claude/", ".ai-toolkit/", ".github/hooks/", ".cursor/"):
+            r = subprocess.run(
+                ["git", "check-ignore", p], cwd=target_repo, capture_output=True, text=True
+            )
+            assert r.returncode == 0, f"{p} should be locally ignored, got rc={r.returncode}"
+
+    def test_real_github_ci_is_not_ignored(self, target_repo: Path) -> None:
+        # SURGICAL: the project's real .github/workflows must never be caught.
+        (target_repo / ".github" / "workflows").mkdir(parents=True)
+        (target_repo / ".github" / "workflows" / "ci.yml").write_text("name: ci\n")
+        self._run(target_repo)
+
+        r = subprocess.run(
+            ["git", "check-ignore", ".github/workflows/ci.yml"],
+            cwd=target_repo,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode != 0, ".github/workflows/ci.yml must NOT be excluded (real CI)"
+
+    def test_is_idempotent(self, target_repo: Path) -> None:
+        self._run(target_repo)
+        self._run(target_repo)
+
+        text = self._exclude(target_repo).read_text()
+        assert text.count("# >>> ai-toolkit") == 1, "the block must not duplicate on re-sync"
+
+    def test_default_sync_writes_no_exclude(self, target_repo: Path) -> None:
+        # Opt-in only: without --local-only, nothing is added (teams that commit
+        # ai-toolkit are unaffected).
+        _run_sync(target_repo, "claude")
+
+        exclude = self._exclude(target_repo)
+        assert not exclude.exists() or "ai-toolkit (local" not in exclude.read_text()
