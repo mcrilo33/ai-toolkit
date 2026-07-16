@@ -219,3 +219,37 @@ def test_hub_afk_module_source_exists_and_is_executable(module: str) -> None:
     src = HUB_SCRIPTS_DIR / f"hub-afk-{module}.sh"
     assert src.is_file(), f"shared/skills/hub/scripts/hub-afk-{module}.sh missing"
     assert os.access(src, os.X_OK), f"hub-afk-{module}.sh is not executable"
+
+
+# ── hub-watchdog functional modules (issue #308) ──────────────────────────────
+# hub-watchdog.sh sources each hub-watchdog-<lane>.sh as a co-located sibling; a module
+# absent from a synced target sets _WD_MODULES_OK=0 and the daemon refuses to run there
+# (a silently-blind watchdog no-ops every detector — AFK Design Principle 2). So every
+# module must be in the loop, take the hub-skill case mapping, and exist executable —
+# mirroring the gate-broker/hub-afk module guards. Extend this tuple as each lane splits.
+HUB_WATCHDOG_MODULES = ("detect", "intervene")
+
+
+@pytest.mark.parametrize("module", HUB_WATCHDOG_MODULES)
+def test_hub_watchdog_module_registered_in_sync_loop(module: str) -> None:
+    assert f"hub-watchdog-{module}.sh" in _for_name_list(), (
+        f"hub-watchdog-{module}.sh is not registered in sync_workflow_scripts() — the entry "
+        "lib would source a missing sibling in a synced target and the daemon would refuse to run"
+    )
+
+
+@pytest.mark.parametrize("module", HUB_WATCHDOG_MODULES)
+def test_hub_watchdog_module_takes_the_hub_skill_source_case(module: str) -> None:
+    body = _sync_workflow_scripts_body()
+    hub_case = re.search(rf"\n\s*([\w.|-]*hub-watchdog-{module}\.sh[\w.|-]*)\)\s+src=", body)
+    assert hub_case is not None, (
+        f"hub-watchdog-{module}.sh must have the hub-skill case mapping "
+        '(src="$SHARED_DIR/skills/hub/scripts/$name"), not the toolkit-root default'
+    )
+
+
+@pytest.mark.parametrize("module", HUB_WATCHDOG_MODULES)
+def test_hub_watchdog_module_source_exists_and_is_executable(module: str) -> None:
+    src = HUB_SCRIPTS_DIR / f"hub-watchdog-{module}.sh"
+    assert src.is_file(), f"shared/skills/hub/scripts/hub-watchdog-{module}.sh missing"
+    assert os.access(src, os.X_OK), f"hub-watchdog-{module}.sh is not executable"

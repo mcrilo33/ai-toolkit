@@ -3508,3 +3508,118 @@ def test_defect_count_is_single_line_when_no_afk_defects(tmp_path: Path) -> None
 
     assert result.stdout.strip() == "0"
     assert result.stdout.count("0") == 1, f"exactly one '0', not a double-print: {result.stdout!r}"
+
+
+# ── the detect / intervene split (issue #308) ─────────────────────────────────
+# hub-watchdog.sh is split into hub-watchdog-detect.sh (the `_wd_detect_*` conditions + their
+# readers) and hub-watchdog-intervene.sh (the `_wd_intervene_*` actions + fire/dedup/defect-
+# filing + the autonomy ledger/report), mirroring #275/#307 — so disjoint watchdog subtasks
+# stop colliding on one multi-thousand-line Scope: token (AFK Design Principle 7). The entry
+# keeps the daemon loop + heartbeat/pidfile + the `_wd_run_conditions` dispatcher, and sources
+# the two modules fail-CLOSED.
+
+# A representative function from each module — the split must keep them all resolvable when
+# only the entry is sourced (the entry sources both modules at load), or the ~3500-test suite
+# above (which calls these directly) turns red wholesale.
+_DETECT_FUNCS = (
+    "_wd_detect_park_unanswered",
+    "_wd_detect_dead_idle",
+    "_wd_detect_mergeable_skipped",
+    "_wd_epoch_stale",
+    "_wd_current_state",
+)
+_INTERVENE_FUNCS = (
+    "_wd_intervene_answer",
+    "_wd_intervene_revive",
+    "_wd_fire",
+    "_wd_classify",
+    "_wd_file_defect",
+    "_wd_autonomy_score",
+    "_wd_report",
+)
+
+
+@pytest.mark.parametrize("fn", _DETECT_FUNCS + _INTERVENE_FUNCS)
+def test_entry_sources_modules_so_every_function_resolves(fn: str) -> None:
+    # Sourcing the entry ALONE must make every detector/intervener resolve — the entry sources
+    # hub-watchdog-detect.sh + hub-watchdog-intervene.sh at load, so a function moved into a
+    # module is still reachable through the entry exactly as before the split.
+    result = _call(f"command -v {fn} >/dev/null && echo OK")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "OK", f"{fn} did not resolve after sourcing the entry"
+
+
+def test_source_recycle_bundle_includes_both_modules() -> None:
+    # The self-recycle hashes _WD_SOURCE_FILES each tick; a land rewriting ONLY a module (not
+    # the entry) must still trip the recycle, so both module paths must be in the hashed bundle.
+    result = _call('printf "%s\\n" "${_WD_SOURCE_FILES[@]}"')
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    basenames = {line.rsplit("/", 1)[-1] for line in result.stdout.split()}
+    assert "hub-watchdog-detect.sh" in basenames, (
+        f"hub-watchdog-detect.sh missing from _WD_SOURCE_FILES: {result.stdout!r}"
+    )
+    assert "hub-watchdog-intervene.sh" in basenames, (
+        f"hub-watchdog-intervene.sh missing from _WD_SOURCE_FILES: {result.stdout!r}"
+    )
+
+
+def test_missing_required_module_refuses_to_run(tmp_path: Path) -> None:
+    # Fail-CLOSED (#211 / AFK Design Principle 2): the modules ARE the detectors/interventions,
+    # so a required module that resolves nowhere must make the daemon refuse to run LOUDLY —
+    # never silently no-op every condition. Copy the entry ALONE into a module-less dir and
+    # point _WD_TOPLEVEL at a nonexistent tree so no module candidate hits: --once must exit
+    # nonzero with a FATAL log, not run a blind, detector-less tick.
+    entry = tmp_path / "hub-watchdog.sh"
+    entry.write_bytes(HUB_WATCHDOG.read_bytes())  # NB: no hub-watchdog-*.sh copied alongside
+    env = {
+        **os.environ,
+        "TZ": "UTC",
+        "HUB_WATCHDOG_FILE": "0",
+        "HUB_WATCHDOG_WT_LIB": str(WT_LIB),
+        "_WD_TOPLEVEL": str(tmp_path / "no-such-toplevel"),
+    }
+
+    result = subprocess.run(
+        ["bash", str(entry), "--once"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode != 0, "a missing required module must refuse to run, not tick blind"
+    combined = result.stdout + result.stderr
+    assert "FATAL" in combined and "hub-watchdog-" in combined, combined
+
+
+def test_report_refuses_when_intervene_module_missing(tmp_path: Path) -> None:
+    # --report dispatches to _wd_report, which the #308 split moved into hub-watchdog-intervene.sh.
+    # A partial sync where the intervene module did not resolve leaves _wd_report UNDEFINED, so the
+    # --report CLI must fail CLOSED through _wd_require_modules (a loud FATAL, nonzero) rather than
+    # crash with `_wd_report: command not found` — the guarded parity the other entry points have.
+    entry = tmp_path / "hub-watchdog.sh"
+    entry.write_bytes(HUB_WATCHDOG.read_bytes())  # NB: no hub-watchdog-*.sh copied alongside
+    env = {
+        **os.environ,
+        "TZ": "UTC",
+        "HUB_WATCHDOG_FILE": "0",
+        "HUB_WATCHDOG_WT_LIB": str(WT_LIB),
+        "_WD_TOPLEVEL": str(tmp_path / "no-such-toplevel"),
+    }
+
+    result = subprocess.run(
+        ["bash", str(entry), "--report"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode != 0, "a missing intervene module must make --report refuse, not crash"
+    combined = result.stdout + result.stderr
+    assert "FATAL" in combined, combined
+    assert "command not found" not in combined, (
+        f"raw undefined-fn crash, not a clean refusal: {combined}"
+    )

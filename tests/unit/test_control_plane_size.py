@@ -31,9 +31,7 @@ LINE_BUDGET = 1200
 # Files knowingly over budget, each with the issue tracking its split. A file may sit
 # here ONLY while its split is an open, tracked commitment — this is a countdown, not
 # a parking lot. Removing the entry (by landing the split) is the goal.
-KNOWN_OVER_BUDGET = {
-    "hub-watchdog.sh": "#308 — split into detect/intervene modules (may shrink under budget via #300)",
-}
+KNOWN_OVER_BUDGET: dict[str, str] = {}
 
 
 def _control_plane_scripts() -> list[Path]:
