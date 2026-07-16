@@ -677,13 +677,73 @@ _afk_pushed_unmarked_nudge() {
   return "$rc"
 }
 
-# _afk_revive_or_park_last <wt> <issue> <reason> -> revive-first, then warned-parked-LAST. If a
-# revival was already tried this window (_afk_already_resumed) OR the relaunch cannot start, the
-# spoke is warned-and-parked-LAST rather than reaped — retried at low frequency, never abandoned.
+# _afk_crash_reresume_or_escalate <wt> <issue> <reason> <retry_fn> -> the #310 crash terminus that
+# replaces the eternal "parked LAST, retried at low frequency" warn (which never retried — only the
+# warn re-fired). UNATTENDED ONLY: the whole ladder (re-resume + escalate) is gated on mode=afk, so
+# an ATTENDED crashed-again spoke keeps today's warn-and-wait — the human is the wall (AC5). Under
+# afk, on the warned-lane (default/reap) backoff cadence: while the warned-retry attempt count is
+# UNDER AFK_WARN_ESCALATE_ATTEMPTS, genuinely RE-ATTEMPT the revival (<retry_fn> is _revive_spoke for
+# a kill+relaunch site or resume_spoke for a re-adopt site) so a transient crash (an API blip, a
+# sleep/wake) self-heals mid-window — advancing the backoff and journaling each try. Inside the
+# backoff window it is a SILENT park (nothing is scheduled this tick, so nothing is claimed). Once
+# the budget is spent it hands to the crash terminus. The message is HONEST: it names the scheduled
+# retry (attempt k/N) or the escalation, never a retry that will not happen (AC4). The attempt count
+# REUSES the warned-lane record (_afk_warn_attempt), so the retry cadence and the escalation bound
+# share one clock — no separate marker to drift (reuse of AFK_WARN_ESCALATE_ATTEMPTS, not a new knob).
+_afk_crash_reresume_or_escalate() {
+  local wt="$1" issue="$2" reason="$3" retry_fn="$4" lane attempts max
+  # AC5 regression pin: attended (and worktree-less) parks keep the old warn-and-parked-LAST — no
+  # auto relaunch, no escalation. The entire #310 crash ladder is an unattended-drain behavior.
+  if [ -z "$wt" ] || [ "$(_afk_spoke_mode "$wt")" != afk ]; then
+    _warn_parked_last "$wt" "$issue" "$reason — parked LAST, retried at low frequency"
+    return 0
+  fi
+  lane="$(_afk_warned_lane reap)"                       # the default/reap lane (empty)
+  _afk_warned_due "$issue" "" "$lane" || return 0       # inside the backoff — parked LAST silently
+  attempts="$(_afk_warn_attempt "$issue" "$lane")"
+  max="$AFK_WARN_ESCALATE_ATTEMPTS"
+  if [ "$attempts" -lt "$max" ]; then
+    local msg="$reason — re-attempting the revival (attempt $(( attempts + 1 ))/$max)"
+    log "→ crash-reresume #$issue: $msg"
+    _afk_set_last_action "crash-reresume #$issue"
+    broker_journal_decision "$issue" reap "$msg" reversible
+    _afk_warned_arm "$issue" "$lane"                    # advance the backoff for the next attempt/escalation
+    "$retry_fn" "$wt" "$issue" \
+      || log "  crash-reresume #$issue: revival relaunch could not be started; retrying next cadence"
+    return 0
+  fi
+  _afk_crash_escalate_or_park "$wt" "$issue" "$reason — resume budget exhausted (${max} attempts)"
+}
+
+# _afk_crash_escalate_or_park <wt> <issue> <reason> -> the terminus for a spoke whose crash-retry
+# budget is spent (#310). Under an unattended drain (mode=afk) the parked issue IS the stalled work,
+# so escalate a loud, reversible blocked/<issue> + notification EVEN WITH ZERO scope-blocked
+# dependents (Principle 3 — act when unattended). This is a DEDICATED crash path, so _warn_parked_last's
+# generic #305 dependents gate is deliberately left untouched (a benign land/backoff park must not
+# escalate without dependents). blocked/ flips slot_state terminal, silencing the watchdog's dead-pane
+# race instead of losing the rest of the window to it. Attended (mode != afk) keeps today's
+# warn-and-wait — the human is the wall (the AC5 regression pin).
+_afk_crash_escalate_or_park() {
+  local wt="$1" issue="$2" reason="$3"
+  if [ -n "$wt" ] && [ "$(_afk_spoke_mode "$wt")" = afk ]; then
+    local ereason="$reason. Escalated blocked/$issue for a human (#310)."
+    log "→ crash-escalate #$issue: $ereason"
+    _afk_set_last_action "crash-escalate #$issue"
+    broker_journal_decision "$issue" reap "$ereason" reversible
+    _afk_park_terminal "$wt"
+    _afk_escalate_blocked "$wt" "$issue" "$ereason"
+    return 0
+  fi
+  _warn_parked_last "$wt" "$issue" "$reason"
+}
+
+# _afk_revive_or_park_last <wt> <issue> <reason> -> revive-first, then the #310 crash ladder. If a
+# revival was already tried this window (_afk_already_resumed) the spoke enters the bounded re-revive
+# -> escalate terminus (never abandoned, never an eternal warn); otherwise it revives once here.
 _afk_revive_or_park_last() {
   local wt="$1" issue="$2" reason="$3"
   if _afk_already_resumed "$issue"; then
-    _warn_parked_last "$wt" "$issue" "$reason — revival already tried this window; parked LAST, retried at low frequency"
+    _afk_crash_reresume_or_escalate "$wt" "$issue" "$reason — revival already tried this window" _revive_spoke
     return 0
   fi
   _revive_spoke "$wt" "$issue" \
@@ -839,7 +899,7 @@ _reap_or_resume() {
   elif ! _spoke_has_commits "$wt"; then
     _afk_revive_or_park_last "$wt" "$issue" "pane crashed with no committed work to preserve"
   elif _afk_already_resumed "$issue"; then
-    _warn_parked_last "$wt" "$issue" "pane crashed again after an auto-resume — parked LAST, retried at low frequency"
+    _afk_crash_reresume_or_escalate "$wt" "$issue" "pane crashed again after an auto-resume" resume_spoke
   else
     resume_spoke "$wt" "$issue" \
       || _warn_parked_last "$wt" "$issue" "pane crashed and the auto-resume could not be launched — retrying"
@@ -1060,7 +1120,7 @@ recover_dead_panes() {
       _afk_finish_up_or_revive "$path" "$issue" "time ceiling: ran >${AFK_SPOKE_MAX_MINUTES}m without finishing"
     elif _spoke_has_work "$path"; then
       if _afk_already_resumed "$issue"; then
-        _warn_parked_last "$path" "$issue" "pane crashed again after an auto-resume — parked LAST, retried at low frequency"
+        _afk_crash_reresume_or_escalate "$path" "$issue" "pane crashed again after an auto-resume" resume_spoke
       else
         resume_spoke "$path" "$issue" \
           || _warn_parked_last "$path" "$issue" "pane crashed and the auto-resume could not be launched — retrying"

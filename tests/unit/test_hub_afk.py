@@ -5243,10 +5243,11 @@ def test_slot_state_ignores_ready_behind_tip(spoke_repo: Path) -> None:
 # (#241 §8): a hung live pane is REVIVED, not blocked — the inverse of the old "block" test.
 
 
-def test_reap_pass_warns_pane_dead_spoke_after_one_resume(tmp_path: Path) -> None:
-    # #241 §7: a second crash after a resume warns-and-parks-LAST, never blocks. Resume stays
-    # bounded to once per window.
-    spoke = _branched_spoke(tmp_path, ahead=True)
+def test_reap_pass_attended_re_crash_warns_not_reresumes(tmp_path: Path) -> None:
+    # AC5 (integration pin): a NON-afk (attended / mode-less) spoke that crashes again after a resume
+    # keeps today's warn-and-parked-LAST — NO auto relaunch, NO escalation. The #310 crash ladder is
+    # an unattended-drain behavior only; the human is the wall here.
+    spoke = _branched_spoke(tmp_path, ahead=True)  # no .ai-toolkit/mode => non-afk
     fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD again
     expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
     (statedir / "resumed-5").write_text("1700000000\n")  # already resumed once this window
@@ -5254,9 +5255,11 @@ def test_reap_pass_warns_pane_dead_spoke_after_one_resume(tmp_path: Path) -> Non
     _call(expr, env=env)
 
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
-        "a second crash after a resume warns-and-parks-LAST, never blocks"
+        "attended re-crash warns-and-parks-LAST, never blocks"
     )
-    assert "new-window" not in tmux_log.read_text(), "resume is bounded to once per window"
+    assert "new-window" not in tmux_log.read_text(), (
+        "attended stays warn-and-wait — no auto relaunch"
+    )
     assert (statedir / "warned-5.txt").exists()
 
 
@@ -5515,10 +5518,13 @@ def test_recover_dead_panes_skips_a_live_waiting_pane(tmp_path: Path) -> None:
     )
 
 
-def test_recover_dead_panes_warns_after_one_resume(tmp_path: Path) -> None:
-    # #241 §7: a second crash after an auto-resume warns-and-parks-LAST (retried at low
-    # frequency), never blocks. Resume stays bounded to once per window.
-    spoke = _branched_spoke(tmp_path, ahead=True)
+def test_recover_dead_panes_reresumes_after_one_resume(tmp_path: Path) -> None:
+    # #310: a second crash after an auto-resume no longer dead-ends in an eternal warn-park. On the
+    # first DUE warned-lane cadence (no prior backoff -> due, attempt 0 < AFK_WARN_ESCALATE_ATTEMPTS)
+    # it genuinely RE-ATTEMPTS the resume — a transient crash self-heals mid-window — rather than
+    # warn-parking forever. It still never blocks on this first re-crash. mode=afk: the ladder is
+    # unattended-only (attended is pinned by test_reap_pass_attended_re_crash_warns_not_reresumes).
+    spoke = _afk_mode_spoke(tmp_path, "afk")
     fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD again
     expr, env, ready_log, statedir = _recover_env(spoke, tmp_path, fake_bin)
     (statedir / "resumed-5").write_text("1700000000\n")  # already resumed once this window
@@ -5526,10 +5532,13 @@ def test_recover_dead_panes_warns_after_one_resume(tmp_path: Path) -> None:
     _call(expr, env=env)
 
     assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
-        "a re-crash after resume warns-and-parks-LAST, never blocks"
+        "the first re-crash re-attempts the resume, it does not block"
     )
-    assert "new-window" not in tmux_log.read_text(), "resume is bounded to once per window"
-    assert (statedir / "warned-5.txt").exists()
+    assert "new-window" in tmux_log.read_text(), (
+        "a due re-crash re-attempts the resume (the #310 bounded retry), not a once-per-window dead end"
+    )
+    attempt, _next = (statedir / "warned-state-5").read_text().split("\t")
+    assert attempt == "1", "the crash backoff advanced for the next cadence (attempt 0 -> 1)"
 
 
 def test_recover_dead_panes_redispatches_clean_dead_pane(tmp_path: Path) -> None:
@@ -8357,20 +8366,25 @@ def test_clear_nudge_counts_removes_per_window_stamps(tmp_path: Path) -> None:
     assert not (statedir / "nudge-7.count").exists()
 
 
-def test_reap_pass_revival_exhausted_parks_last_not_blocked(tmp_path: Path) -> None:
-    # After a revival already happened this window, a second stuck tick warns-and-parks-LAST
-    # (retried at low frequency on the backoff) — NEVER blocked, NEVER killed/abandoned.
-    spoke = _branched_spoke(tmp_path, ahead=True)
+def test_reap_pass_revival_exhausted_escalates_under_afk(tmp_path: Path) -> None:
+    # #310 (end-to-end through reap_pass, the #302 replay): once the resume budget is spent
+    # (warned attempt >= AFK_WARN_ESCALATE_ATTEMPTS), a mode=afk crashed-again spoke escalates
+    # blocked/<issue> — flipping slot_state terminal and silencing the watchdog's dead-pane race —
+    # instead of an eternal warn-park. (The attended terminus stays warn-and-wait, pinned by
+    # test_crash_escalate_or_park_attended_never_escalates.)
+    spoke = _afk_mode_spoke(tmp_path, "afk")
     fake_bin, _ = _reaper_tmux(tmp_path, pane_path=None)  # pane DEAD again
     expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
     (statedir / "resumed-5").write_text("1700000000\n")  # a revival already happened this window
+    (statedir / "warned-state-5").write_text(
+        "3\t1\n"
+    )  # resume budget spent (attempt 3 >= bound), due
 
     _call(expr, env=env)
 
-    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
-        "a twice-failed revival parks LAST, never blocks"
+    assert ready_log.exists() and "--blocked 5" in ready_log.read_text(), (
+        "a budget-exhausted afk crash park escalates blocked/5 (the #302 fix)"
     )
-    assert (statedir / "warned-5.txt").exists()
 
 
 def test_reap_pass_pushed_but_unmarked_warns_not_reaps(tmp_path: Path) -> None:
@@ -11168,6 +11182,198 @@ def test_warn_parked_last_attended_never_escalates(tmp_path: Path) -> None:
         "attended stays warn-and-wait — never escalated by the drain"
     )
     assert (statedir / "warned-5.txt").exists()
+
+
+# ── #310: the crash-retry ladder (crashed-twice spoke no longer dead-ends) ────
+# A spoke that crashed after its once-per-window resume used to warn-park forever ("retried at
+# low frequency" that never retried) and, with no scope-blocked dependents, never escalated —
+# so it lost the window and guaranteed a watchdog dead-pane fire. #310 replaces that terminus
+# with a bounded, aging RE-RESUME on the warned-lane cadence, then a real escalation.
+
+
+def _crash_ready_env(tmp_path: Path, spoke: Path, statedir: Path) -> dict[str, str]:
+    """A spoke-ready recorder + planner stub for the crash-terminus escalation path."""
+    statedir.mkdir(exist_ok=True)
+    ready_log = tmp_path / "ready.log"
+    ready = tmp_path / "spoke-ready.sh"
+    ready.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready.chmod(0o755)
+    return {
+        "WT": str(spoke),
+        "AFK_STATE_DIR": str(statedir),
+        "SPOKE_READY": str(ready),
+        # No dependents behind it — the whole point of the #302 replay.
+        "BATCH_PLAN": str(
+            _planner_stub(tmp_path, exit_code=0, out="#5  in-flight  (a.py) — runs alone\\n")
+        ),
+    }
+
+
+def test_crash_reresume_retries_within_budget(tmp_path: Path) -> None:
+    # AC1: while the warned-retry attempt count is under AFK_WARN_ESCALATE_ATTEMPTS and the backoff
+    # is due, the crash terminus genuinely RE-ATTEMPTS the revival (a transient crash self-heals)
+    # and advances the backoff — it does not warn-park-forever.
+    spoke = _afk_mode_spoke(tmp_path, "afk")
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "warned-state-5").write_text("1\t1\n")  # attempt 1 (< bound 3), next-due long past
+    retry_log = tmp_path / "retry.log"
+    env = {"WT": str(spoke), "AFK_STATE_DIR": str(statedir), "RETRY_LOG": str(retry_log)}
+
+    _call(
+        'resume_spoke() { printf "RESUMED %s\\n" "$2" >> "$RETRY_LOG"; }; '
+        '_afk_crash_reresume_or_escalate "$WT" 5 "pane crashed again" resume_spoke',
+        env=env,
+    )
+
+    assert retry_log.exists() and "RESUMED 5" in retry_log.read_text(), (
+        "under budget + due -> the resume is actually re-attempted"
+    )
+    attempt, _ = (statedir / "warned-state-5").read_text().split("\t")
+    assert attempt == "2", "the backoff advanced (attempt 1 -> 2) for the next cadence"
+
+
+def test_crash_reresume_silent_inside_backoff(tmp_path: Path) -> None:
+    # Inside the backoff window (not yet due) it is a SILENT park — no retry, no escalation this
+    # tick — so a permanently-crashing spoke is retried at low frequency, not every tick.
+    spoke = _afk_mode_spoke(tmp_path, "afk")
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "warned-state-5").write_text("1\t9999999999\n")  # next-due far in the future
+    retry_log = tmp_path / "retry.log"
+    env = {"WT": str(spoke), "AFK_STATE_DIR": str(statedir), "RETRY_LOG": str(retry_log)}
+
+    _call(
+        'resume_spoke() { printf "RESUMED\\n" >> "$RETRY_LOG"; }; '
+        '_afk_crash_reresume_or_escalate "$WT" 5 "pane crashed again" resume_spoke',
+        env=env,
+    )
+
+    assert not retry_log.exists(), "inside the backoff -> parked LAST silently, no retry"
+
+
+def test_crash_reresume_escalates_past_budget_without_dependents(tmp_path: Path) -> None:
+    # AC2 (the #302 replay): once the resume budget is spent, a mode=afk crash park escalates
+    # blocked/<issue> + notification EVEN WITH ZERO scope-blocked dependents — the parked issue is
+    # itself the stalled work. This is what #302 never did.
+    spoke = _afk_mode_spoke(tmp_path, "afk")
+    statedir = tmp_path / "statedir"
+    env = _crash_ready_env(tmp_path, spoke, statedir)
+    (statedir / "warned-state-5").write_text("3\t1\n")  # attempt 3 (>= bound), due
+    retry_log = tmp_path / "retry.log"
+    env["RETRY_LOG"] = str(retry_log)
+
+    _call(
+        'resume_spoke() { printf "RESUMED\\n" >> "$RETRY_LOG"; }; '
+        '_afk_crash_reresume_or_escalate "$WT" 5 "pane crashed again" resume_spoke',
+        env=env,
+    )
+
+    ready_log = tmp_path / "ready.log"
+    assert ready_log.exists() and "--blocked 5" in ready_log.read_text(), (
+        "budget spent -> escalate blocked/5 with no dependents behind it (the #302 fix)"
+    )
+    assert not retry_log.exists(), "no further resume once the budget is spent"
+
+
+def test_crash_reresume_attended_warn_parks_without_relaunch(tmp_path: Path) -> None:
+    # AC5: the whole ladder is unattended-only. An ATTENDED crashed-again spoke warn-parks (no auto
+    # relaunch of retry_fn, no escalation) exactly as before #310 — even with a spent budget.
+    spoke = _afk_mode_spoke(tmp_path, "attended")
+    statedir = tmp_path / "statedir"
+    env = _crash_ready_env(tmp_path, spoke, statedir)
+    (statedir / "warned-state-5").write_text("3\t1\n")  # budget spent, due — still no escalation
+    retry_log = tmp_path / "retry.log"
+    env["RETRY_LOG"] = str(retry_log)
+
+    _call(
+        'resume_spoke() { printf "RESUMED\\n" >> "$RETRY_LOG"; }; '
+        '_afk_crash_reresume_or_escalate "$WT" 5 "pane crashed again" resume_spoke',
+        env=env,
+    )
+
+    ready_log = tmp_path / "ready.log"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "attended never escalates via the crash ladder"
+    )
+    assert not retry_log.exists(), (
+        "attended never auto-relaunches — it warn-parks (human is the wall)"
+    )
+    assert (statedir / "warned-5.txt").exists(), "attended still warn-parks as before"
+
+
+def test_crash_escalate_or_park_attended_never_escalates(tmp_path: Path) -> None:
+    # AC5 regression pin: an ATTENDED crash terminus keeps today's warn-and-wait — the human is the
+    # wall. No blocked escalation regardless of the spent budget.
+    spoke = _afk_mode_spoke(tmp_path, "attended")
+    statedir = tmp_path / "statedir"
+    env = _crash_ready_env(tmp_path, spoke, statedir)
+    (statedir / "warned-state-5").write_text("3\t1\n")
+
+    _call('_afk_crash_escalate_or_park "$WT" 5 "resume budget exhausted"', env=env)
+
+    ready_log = tmp_path / "ready.log"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "attended stays warn-and-wait — never escalated by the drain"
+    )
+
+
+def test_crash_escalate_journals_the_decision(tmp_path: Path) -> None:
+    # AC6: every crash escalation is journaled (#241 decision journal) so the morning review can
+    # audit the taken decision.
+    spoke = _afk_mode_spoke(tmp_path, "afk")
+    statedir = tmp_path / "statedir"
+    env = _crash_ready_env(tmp_path, spoke, statedir)
+
+    _call('_afk_crash_escalate_or_park "$WT" 5 "resume budget exhausted (3 attempts)"', env=env)
+
+    journal = (statedir / "decision-journal.jsonl").read_text()
+    assert "resume budget exhausted" in journal, "the escalation decision is journaled"
+
+
+def test_crash_reresume_message_names_the_scheduled_action(tmp_path: Path) -> None:
+    # AC4 message honesty: while retrying, the reason names the scheduled retry (attempt k/N), not a
+    # bare "retried at low frequency" that may never happen.
+    spoke = _afk_mode_spoke(tmp_path, "afk")
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "warned-state-5").write_text("0\t1\n")
+    env = {"WT": str(spoke), "AFK_STATE_DIR": str(statedir)}
+
+    result = _call(
+        "resume_spoke() { :; }; "
+        '_afk_crash_reresume_or_escalate "$WT" 5 "pane crashed again" resume_spoke',
+        env=env,
+    )
+
+    assert "attempt 1/3" in result.stderr, (
+        f"the retry message must name the scheduled attempt, got: {result.stderr}"
+    )
+
+
+def test_reap_or_resume_302_replay_reaches_terminal(tmp_path: Path) -> None:
+    # AC3 replay pin: #302's exact state — a crashed pane that was ALREADY resumed this window, with
+    # its resume budget spent and NO dependents — reaches a terminal blocked/<issue> (silencing the
+    # watchdog's dead-pane race) instead of an eternal warn-park.
+    spoke = _afk_mode_spoke(tmp_path, "afk")
+    statedir = tmp_path / "statedir"
+    env = _crash_ready_env(tmp_path, spoke, statedir)
+    (statedir / "resumed-5").write_text("1\n")  # already resumed this window (#302)
+    (statedir / "warned-state-5").write_text("3\t1\n")  # budget spent, due
+
+    _call(
+        # Drive the crashed-again-with-commits branch of _reap_or_resume directly: no live pane, has
+        # commits, already resumed. Stub the liveness probes so the branch is deterministic.
+        "_spoke_still_parked() { return 1; }; _spoke_pane_alive() { return 1; }; "
+        "_spoke_over_any_ceiling() { return 1; }; _spoke_has_commits() { return 0; }; "
+        '_reap_or_resume "$WT" 5',
+        env=env,
+    )
+
+    ready_log = tmp_path / "ready.log"
+    assert ready_log.exists() and "--blocked 5" in ready_log.read_text(), (
+        "#302's crashed-twice, no-dependents state reaches a terminal blocked marker"
+    )
 
 
 # ── #300 step 3: drain-side lifecycle transition writers ──────────────────────
