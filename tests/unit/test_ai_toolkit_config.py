@@ -53,10 +53,10 @@ EXPECTED_AGENT_ROUTING = {
     "planner": (FABLE, "max"),
     "debug": (OPUS, "max"),
     "security-reviewer": (OPUS, "max"),
-    "code-review": (SONNET, "high"),
+    "code-review": (OPUS, "high"),
     "tdd-red": (OPUS, "high"),
     "devops": (OPUS, "max"),
-    "bug-scoper": (SONNET, "high"),
+    "bug-scoper": (OPUS, "high"),
     "tdd-green": (SONNET, "high"),
     "tdd-refactor": (SONNET, "high"),
     "refactor": (SONNET, "high"),
@@ -402,12 +402,12 @@ def test_batch_env_cli_empty_when_unset(tmp_path: Path) -> None:
     assert cfg._cli(["ai_toolkit_config.py", "batch-env", str(path)]) == ""
 
 
-def test_real_config_batch_cap_pinned_stagger_autoderives(real_config: dict) -> None:
-    # Budget is ample, so the cap sits at 6 — the hardware-safe ceiling now that
-    # #188/#203 landed (see the config comment); drop it toward 3 to stretch a
-    # tight weekly budget. The stagger stays blank ⇒ the consumer auto-derives.
-    assert cfg.batch_concurrency_cap(real_config) == 6
-    assert cfg.batch_stagger_seconds(real_config) is None
+def test_real_config_batch_cap_and_stagger(real_config: dict) -> None:
+    # Speed routing (2026-07-16, ample budget): cap raised to 8 for more parallel
+    # spokes on future disjoint batches, and the stagger pinned to 20s (down from the
+    # blank auto-derive ~45) now that #276's testmon pre-warm shrank first-push spikes.
+    assert cfg.batch_concurrency_cap(real_config) == 8
+    assert cfg.batch_stagger_seconds(real_config) == 20
 
 
 # ─── real config: seed routing completeness ───
@@ -421,7 +421,7 @@ def real_config() -> dict:
 def test_real_config_spoke_seed(real_config: dict) -> None:
     # Budget routing (2026-07-15): routine spokes on Sonnet/high, no 1m tier;
     # per-issue escalation via lane:reasoning or an explicit Model: line.
-    assert cfg.spoke_model(real_config) == ("claude-sonnet-5", "high")
+    assert cfg.spoke_model(real_config) == ("claude-opus-4-8", "high")
 
 
 def test_real_config_base_branch_defaults_to_autodetect(real_config: dict) -> None:

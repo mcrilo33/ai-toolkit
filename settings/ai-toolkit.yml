@@ -79,10 +79,10 @@ batch:
   # hits before CPU/RAM. Capped at 3 to stretch the weekly budget across more of
   # the backlog; raise toward 6 when budget is ample. #188/#203 (the failure
   # modes that widen with the batch) have landed, so 6 is safe hardware-wise.
-  concurrency_cap: 6
+  concurrency_cap: 8
   # Seconds to wait between consecutive spawns in one batch, so first-push full
   # suites don't all hit at once. Empty ⇒ 45; 0 disables the stagger.
-  stagger_seconds:
+  stagger_seconds: 20
 
 model:
   # The interactive spoke driver launched by worktree-new.sh. Routine spokes run
@@ -91,7 +91,7 @@ model:
   # Escalate a genuinely reasoning-heavy issue via the `lane:reasoning` label
   # (model.overrides.by_label below) or an explicit `Model:` line in the issue.
   spoke:
-    model: claude-sonnet-5
+    model: claude-opus-4-8
     effort: high
 
   # Model per solo-cycle step (issue #182). Realized by delegating each step to
@@ -111,7 +111,7 @@ model:
       model: claude-sonnet-5
       effort: high
     review:
-      model: claude-sonnet-5
+      model: claude-opus-4-8
       effort: high
 
   # Per sub-agent model routing (issue #141): Fable is scarce, so it is reserved
@@ -132,7 +132,7 @@ model:
       model: claude-opus-4-8
       effort: max
     code-review:
-      model: claude-sonnet-5
+      model: claude-opus-4-8
       effort: high
     tdd-red:
       model: claude-opus-4-8
@@ -143,7 +143,7 @@ model:
     # Accurate Scope: derivation is the whole value of bug-scoper (#220); route
     # it to the strongest reasoning model.
     bug-scoper:
-      model: claude-sonnet-5
+      model: claude-opus-4-8
       effort: high
     tdd-green:
       model: claude-sonnet-5
