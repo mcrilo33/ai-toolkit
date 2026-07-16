@@ -30,7 +30,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from _gate_broker_support import _DISPLAY_CASE, _agent_ps_stub, _fake_tmux_pane
+from _gate_broker_support import _DISPLAY_CASE, _PANE_PID, _agent_ps_stub, _fake_tmux_pane
 from bash_session import BashSession, fresh_call
 
 # hub-afk.sh targets the macOS control plane: it reads transcript mtimes with BSD
@@ -4874,9 +4874,16 @@ def _branched_spoke(
     return wt
 
 
-def _reaper_tmux(tmp_path: Path, *, pane_path: Path | None) -> tuple[Path, Path]:
+def _reaper_tmux(
+    tmp_path: Path, *, pane_path: Path | None, agent_alive: bool = True
+) -> tuple[Path, Path]:
     """A tmux stub that records every call and answers `list-panes` with one line
     pointing at `pane_path` (pane alive) or nothing (pane dead). Everything else exits 0.
+
+    `agent_alive` is the #301 axis, and it is INDEPENDENT of `pane_path`: the incident's
+    shape is a pane that very much exists (list-panes maps it) whose agent is gone, leaving
+    a bare shell in the worktree. `pane_path=None` remains the older shape — the window
+    itself is gone. Default True: every pre-#301 test here means "a healthy live spoke".
     """
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
@@ -4887,9 +4894,11 @@ def _reaper_tmux(tmp_path: Path, *, pane_path: Path | None) -> tuple[Path, Path]
         "#!/usr/bin/env bash\n"
         f'printf "%s\\n" "$*" >> "{log}"\n'
         f'if [ "$1" = "list-panes" ]; then cat "{panes}"; fi\n'
+        f'if [ "$1" = "display-message" ]; then printf "{_PANE_PID}\\n"; fi\n'
         "exit 0\n"
     )
     (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin, agent_alive=agent_alive)
     return fake_bin, log
 
 
@@ -5373,6 +5382,97 @@ def test_recover_dead_panes_skips_live_pane(tmp_path: Path) -> None:
         "a live pane is not a crash — never resumed here"
     )
     assert not ready_log.exists() or "--blocked" not in ready_log.read_text()
+
+
+# ── #301: a pane whose AGENT is dead is a crash, however alive the pane looks ──
+#
+# The 2026-07-15 incident. A reboot killed both spokes' claude processes; the terminal
+# restored their tmux panes, which came back running a bare zsh in the worktree (the spoke
+# is launched as `sh -c "<cmd>; exec zsh"`, so the window is DESIGNED to outlive the agent).
+# _spoke_pane_alive only ever asked "does a pane map to this worktree?", so a bare shell
+# read as a healthy spoke: #296 and #299 were never revived and sat stranded for hours with
+# committed, unpushed work, while the answerer typed into their shells.
+
+
+def test_spoke_pane_alive_is_false_when_the_pane_runs_a_bare_shell(tmp_path: Path) -> None:
+    """AC4(a): a pane with no agent must not read as a live spoke."""
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, _ = _reaper_tmux(tmp_path, pane_path=spoke, agent_alive=False)
+    env = {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+    result = _call(f"_spoke_pane_alive '{spoke}' && echo ALIVE || echo DEAD", env=env)
+
+    assert result.stdout.strip() == "DEAD", (
+        "a pane running a bare shell is a CRASHED spoke, not a live one — reading it as "
+        f"alive is what stranded #296/#299: {result.stdout}{result.stderr}"
+    )
+
+
+def test_spoke_pane_alive_is_true_when_the_agent_runs_below_the_pane_shell(
+    tmp_path: Path,
+) -> None:
+    """The other half of AC4(a): a REAL live spoke must keep reading as alive.
+
+    Its pane also reports `pane_current_command=zsh` — the agent is a child of the pane's
+    launcher shell — so this is the pin that would fail if liveness were ever re-derived
+    from the pane's own command.
+    """
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, _ = _reaper_tmux(tmp_path, pane_path=spoke, agent_alive=True)
+    env = {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+    result = _call(f"_spoke_pane_alive '{spoke}' && echo ALIVE || echo DEAD", env=env)
+
+    assert result.stdout.strip() == "ALIVE", (
+        f"a pane with claude running under its shell is a LIVE spoke: {result.stderr}"
+    )
+
+
+def test_spoke_pane_alive_reads_an_unprovable_probe_as_alive(tmp_path: Path) -> None:
+    """Liveness fails OPEN — the OPPOSITE direction from the write side, deliberately.
+
+    A write refuses when it cannot prove an agent is there, because the cost of guessing
+    wrong is prose executed as shell. Here the cost of guessing wrong is killing and
+    relaunching a HEALTHY spoke, so an unobservable pane keeps its old benefit of the doubt.
+    """
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    # list-panes maps the pane, but nothing answers the pane-pid probe: rc 2, unprovable.
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        f'if [ "$1" = "list-panes" ]; then printf "afk:1\\t%s\\n" "{spoke}"; fi\n'
+        "exit 0\n"
+    )
+    (fake_bin / "tmux").chmod(0o755)
+    env = {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+    result = _call(f"_spoke_pane_alive '{spoke}' && echo ALIVE || echo DEAD", env=env)
+
+    assert result.stdout.strip() == "ALIVE", (
+        "an unprovable probe must never kill a spoke we merely cannot observe"
+    )
+
+
+def test_recover_dead_panes_resumes_a_pane_whose_agent_died(tmp_path: Path) -> None:
+    """AC2 + AC4(c): the agent-dead pane is revived IN PLACE — worktree and commits intact.
+
+    This is the whole point of the issue: the ONE condition tier-1 recovery exists to fix
+    was invisible to it.
+    """
+    spoke = _branched_spoke(tmp_path, ahead=True)
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke, agent_alive=False)
+    expr, env, ready_log, _statedir = _recover_env(spoke, tmp_path, fake_bin)
+
+    _call(expr, env=env)
+
+    assert "new-window" in tmux_log.read_text(), (
+        "a pane whose agent is gone must route to resume_spoke — the commits are intact, so "
+        f"it is re-adopted in place, never abandoned: {tmux_log.read_text()}"
+    )
+    assert not ready_log.exists() or "--blocked" not in ready_log.read_text(), (
+        "a crashed agent is revived, never blocked"
+    )
 
 
 def test_recover_dead_panes_warns_after_one_resume(tmp_path: Path) -> None:
