@@ -46,6 +46,140 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=worktree-lib.sh
 . "$SCRIPT_DIR/worktree-lib.sh"
 
+# --- land mutex (issue #315) ----------------------------------------------------
+# A manual/quick operator land and the drain's auto_land BOTH merge+push $DEFAULT
+# through THIS script (auto_land shells out to it), with nothing coordinating them.
+# They raced on 2026-07-16: a rejected push's `git reset --keep` left the hub BEHIND
+# origin. So every land takes a shared mutex before the merge+push critical section;
+# whoever holds it lands, the other WAITS (bounded) and re-checks state. Because ALL
+# land paths funnel through here, one lock here serializes them all — manual, /quick,
+# /land, and auto_land (transitively).
+#
+# The lock is a `mkdir` dir (the one atomic, portable FS primitive — macOS has no
+# flock(1), the same #300 rationale) at ${AFK_STATE_DIR:-<git-common-dir>/ai-toolkit-afk}
+# /land.lock — the shared state dir every actor already uses, resolved inline (this
+# script is synced to spoke targets that cannot source hub-skill modules). It holds an
+# `owner` file "<pid> <ts> <host>" (ts BEFORE host so ts parses by fixed position even
+# if a host ever carried spaces). A crashed holder is broken (dead pid, or a hard age
+# bound as a wedged-alive/pid-reuse backstop); a live holder is waited on and the wait
+# is LOGGED, never silent (fail-loud, Principle 2). Bounds are env-tunable for tests.
+: "${LAND_LOCK_WAIT_MAX:=1200}"        # hard cap (s) to wait before failing loud
+: "${LAND_LOCK_STALE_SECONDS:=1800}"   # break even a live-looking holder past this age (0 disables)
+: "${LAND_LOCK_POLL:=2}"               # poll interval (s) between acquire attempts
+: "${LAND_LOCK_PUSH_RETRIES:=1}"       # non-ff push-recovery re-merge+retry attempts (issue #315)
+case "$LAND_LOCK_PUSH_RETRIES" in '' | *[!0-9]*) LAND_LOCK_PUSH_RETRIES=1 ;; esac
+# Sanitize a garbage value to the SAFE default, never to 0 (Principle 2): a STALE_SECONDS
+# silently zeroed would read EVERY live lock as stale and disable the mutex. An EXPLICIT
+# numeric 0 is honored as "no age backstop" (dead-pid break only), handled in _land_lock_stale.
+case "$LAND_LOCK_WAIT_MAX"      in '' | *[!0-9]*) LAND_LOCK_WAIT_MAX=1200 ;; esac
+case "$LAND_LOCK_STALE_SECONDS" in '' | *[!0-9]*) LAND_LOCK_STALE_SECONDS=1800 ;; esac
+case "$LAND_LOCK_POLL"          in '' | *[!0-9]* | 0) LAND_LOCK_POLL=2 ;; esac
+
+_LAND_LOCK=""   # the lock dir once WE own it — the release guard's ownership witness
+
+_land_state_dir() {
+  if [ -n "${AFK_STATE_DIR:-}" ]; then printf '%s\n' "$AFK_STATE_DIR"; return; fi
+  local common
+  common="$(git rev-parse --git-common-dir 2>/dev/null)" || common=".git"
+  case "$common" in /*) ;; *) common="${REPO_ROOT:-.}/$common" ;; esac
+  printf '%s\n' "$common/ai-toolkit-afk"
+}
+
+_land_lock_owner_pid() {
+  local f="$1/owner"
+  [ -f "$f" ] || return 0
+  awk '{ print $1; exit }' "$f" 2>/dev/null || true
+}
+
+# _land_lock_age <lock> -> seconds since the owner ts (field 2), empty when unknown.
+_land_lock_age() {
+  local f="$1/owner" ts now
+  [ -f "$f" ] || return 0
+  ts="$(awk '{ print $2; exit }' "$f" 2>/dev/null || true)"
+  case "$ts" in '' | *[!0-9]*) return 0 ;; esac
+  now="$(date +%s)"
+  printf '%s\n' "$(( now - ts ))"
+}
+
+# _land_lock_stale <lock> -> rc 0 (stale, break it) ONLY when the owner pid is DEAD
+# (probe the real process, Principle 4) or the lock is older than the hard age bound;
+# rc 1 (live, wait) otherwise. An ABSENT/torn owner reads NOT-stale (wait): a lock whose
+# mkdir just won but whose owner file is a microsecond from being written must never be
+# broken by a concurrent waiter (the #315 review's premature-break race). A genuinely
+# owner-less orphan (a crash in that microsecond window) is caught by the loud WAIT_MAX
+# timeout, not raced. STALE_SECONDS=0 disables the age backstop (dead-pid break only).
+_land_lock_stale() {
+  local lock="$1" pid age
+  pid="$(_land_lock_owner_pid "$lock")"
+  case "$pid" in '' | *[!0-9]*) return 1 ;; esac    # no/torn owner -> wait, never break
+  kill -0 "$pid" 2>/dev/null || return 0            # holder dead -> stale
+  [ "$LAND_LOCK_STALE_SECONDS" -gt 0 ] || return 1  # age backstop disabled -> live holder waits
+  age="$(_land_lock_age "$lock")"
+  case "$age" in '' | *[!0-9]*) return 1 ;; esac    # unknown age on a live holder -> wait
+  [ "$age" -ge "$LAND_LOCK_STALE_SECONDS" ]
+}
+
+# acquire_land_lock -> block until this process owns the land lock, then arm the EXIT
+# release. Loud + bounded: warns once on first wait, breaks a stale holder and retries,
+# and wt_die's if it never wins within LAND_LOCK_WAIT_MAX (a stuck land is surfaced, not
+# raced). Call AFTER the cheap hub guards so an arg error never takes or leaks the lock.
+acquire_land_lock() {
+  local lock waited=0 warned="" host stale_pid aside now
+  lock="$(_land_state_dir)/land.lock"
+  mkdir -p "$(dirname "$lock")" 2>/dev/null || true
+  host="$(hostname 2>/dev/null || printf 'unknown')"
+  while :; do
+    # Stamp the ts BEFORE mkdir so no `$(date)` fork sits in the mkdir->owner-write gap,
+    # shrinking that window (which a concurrent waiter must never mistake for an orphan)
+    # to a single builtin printf.
+    now="$(date +%s)"
+    if mkdir "$lock" 2>/dev/null; then
+      printf '%s %s %s\n' "$$" "$now" "$host" > "$lock/owner" 2>/dev/null || true
+      _LAND_LOCK="$lock"
+      trap '_release_land_lock' EXIT
+      return 0
+    fi
+    if _land_lock_stale "$lock"; then
+      # Break ATOMICALLY: `mv` the stale dir aside so that when two waiters break the SAME
+      # dead lock only ONE mv wins (the loser's source is already gone). NEITHER reclaims
+      # here — both fall through to re-race the mkdir above, the single source of ownership
+      # truth, so simultaneous breakers can never both own it (the #315 review's double-break).
+      # UPGRADE: a residual micro-TOCTOU remains (a waiter that passed the staleness check
+      # could mv a lock a third lander reclaimed in the same instant); it needs a live owner
+      # to reclaim within a few instructions and is backstopped by the non-ff push recovery.
+      stale_pid="$(_land_lock_owner_pid "$lock")"
+      aside="$lock.stale.$$"
+      if mv "$lock" "$aside" 2>/dev/null; then
+        wt_warn "broke a stale land lock (holder pid ${stale_pid:-unknown} is dead or older than ${LAND_LOCK_STALE_SECONDS}s) — issue #315"
+        rm -rf "$aside" 2>/dev/null || true
+      fi
+      continue
+    fi
+    if [ -z "$warned" ]; then
+      wt_warn "waiting for the land lock (held by pid $(_land_lock_owner_pid "$lock"), $(_land_lock_age "$lock")s) — another land is in progress; serializing to avoid the #315 race"
+      warned=1
+    fi
+    if [ "$waited" -ge "$LAND_LOCK_WAIT_MAX" ]; then
+      wt_die "timed out after ${LAND_LOCK_WAIT_MAX}s waiting for the land lock (held by pid $(_land_lock_owner_pid "$lock")). Another land looks stuck — investigate, then re-run."
+    fi
+    sleep "$LAND_LOCK_POLL" 2>/dev/null || sleep 1
+    waited=$(( waited + LAND_LOCK_POLL ))
+  done
+}
+
+# _release_land_lock -> drop the lock, but ONLY when we still own it: a lock broken as
+# stale and reacquired by another lander now belongs to them, so an ownership check
+# (owner pid == ours, or a torn/empty owner) prevents us from removing their lock.
+_release_land_lock() {
+  [ -n "$_LAND_LOCK" ] || return 0
+  local pid
+  pid="$(_land_lock_owner_pid "$_LAND_LOCK")"
+  if [ "$pid" = "$$" ] || [ -z "$pid" ]; then
+    rm -rf "$_LAND_LOCK" 2>/dev/null || true
+  fi
+  _LAND_LOCK=""
+}
+
 # --- guard: role, not directory (issue #26) -------------------------------------
 # A spoke's claude has full filesystem access, so it can cd into the main checkout
 # and slip past a "must run from the hub" directory check. worktree-new.sh stamps
@@ -96,6 +230,14 @@ HUB_BRANCH="$(git symbolic-ref --short -q HEAD || true)"
   || wt_die "hub is on '${HUB_BRANCH:-detached HEAD}' — land from the base branch '$DEFAULT'"
 [ -z "$(git status --porcelain -uno)" ] \
   || wt_die "hub checkout is dirty — commit or stash before landing"
+
+# Take the land mutex (issue #315) now that the cheap hub guards passed: serialize the
+# fetch -> sync -> merge -> push critical section against a concurrent land (manual or
+# auto_land) so a rejected push can never leave the hub behind origin. Released on EXIT,
+# so the lock intentionally spans the post-push teardown/telemetry tail too — a concurrent
+# lander waits out the full land, which is correct (never interleave) and bounded by
+# LAND_LOCK_WAIT_MAX.
+acquire_land_lock
 
 # wt_pane_stranded <path> -> a tmux pane's cwd is teardown RESIDUE, not a live
 # worktree: it is gone, OR its only surviving entries are the gitignored scratch
@@ -304,6 +446,29 @@ else
   ! git rev-parse --symbolic-full-name "${WT_BRANCH}@{upstream}" >/dev/null 2>&1 \
     || wt_die "branch $WT_BRANCH has an upstream — not a micro-spoke; land it without --local"
 fi
+
+# --- heal a hub left behind origin (issue #315) ---------------------------------
+# Under the land lock, and with origin freshly fetched, fast-forward local $DEFAULT up to
+# origin/$DEFAULT when it is strictly BEHIND — the exact state a prior racy land's
+# `git reset --keep` produced (#315). Doing it here, before the ISSUES range derivation and
+# the merge, makes PRE_SHA the current remote tip so the push is a clean fast-forward and the
+# hub is never left behind. A hub carrying its OWN local commits (ahead of / diverged from
+# origin, e.g. a not-yet-pushed hub change) is NOT an ancestor of origin/$DEFAULT, so this
+# skips it and the normal merge+push handles it (a genuine non-ff at push is recovered below).
+ORIGIN_DEFAULT="refs/remotes/origin/$DEFAULT"
+land_heal_behind() {
+  [ -z "$LOCAL" ] || return 0
+  git rev-parse -q --verify "$ORIGIN_DEFAULT" >/dev/null 2>&1 || return 0
+  local head origin
+  head="$(git rev-parse HEAD)"
+  origin="$(git rev-parse "$ORIGIN_DEFAULT")"
+  [ "$head" != "$origin" ] || return 0
+  git merge-base --is-ancestor "$head" "$origin" 2>/dev/null || return 0   # ahead/diverged -> leave it
+  echo "→ fast-forwarding local $DEFAULT up to origin/$DEFAULT (behind by an origin advance, issue #315)"
+  git merge --ff-only "$ORIGIN_DEFAULT" >/dev/null \
+    || wt_die "could not fast-forward local $DEFAULT to origin/$DEFAULT — reconcile by hand, then re-run"
+}
+land_heal_behind
 
 # Issue number = leading number of the branch slug (feature/42-foo → 42);
 # ad-hoc branches have none and skip the issue close.
@@ -651,7 +816,90 @@ land_rollback() {
   rm -f "$PUSH_LOG"
   wt_warn "$1 — rolling back: git reset --keep $PRE_SHA"
   land_reset_keep_or_die
+  # Never leave the hub BEHIND origin (issue #315): if origin advanced under us, re-fetch and
+  # ff local $DEFAULT back up to it (best-effort) so even a FAILED land is at origin, not behind.
+  if [ -z "$LOCAL" ]; then
+    git fetch origin --quiet 2>/dev/null || true
+    land_heal_behind || true
+  fi
   wt_die "landing aborted; nothing was pushed. Fix on the branch (push from the spoke when it has one) and re-run."
+}
+
+# land_push_remote_advanced -> rc 0 when PUSH_LOG carries a signature that origin/$DEFAULT moved
+# UNDER us specifically: a non-fast-forward / fetch-first rejection, or the compare-and-swap
+# "cannot lock ref ... is at X but expected Y" a concurrent push to the same ref produces. Kept
+# NARROW on purpose: a bare "[remote rejected]" / "failed to update ref" also accompanies a
+# server-side POLICY decline (a pre-receive hook), which a re-fetch+retry can never fix and must
+# still roll back (issue #315). A pre-push GATE failure exits before transfer and matches none.
+land_push_remote_advanced() {
+  grep -qiE 'non-fast-forward|fetch first|cannot lock ref' "$PUSH_LOG"
+}
+
+# land_nonff_recover -> a push the remote refused because origin advanced under us, reconciled
+# and retried under the still-held land lock — up to LAND_LOCK_PUSH_RETRIES times (issue #315).
+# Each attempt: roll our merge back, re-fetch, ff local $DEFAULT to the NEW origin tip, RE-MERGE
+# the branch (a NEW combined tree), and re-push. The re-merge is untested, so the retry RE-RUNS
+# its gate — a gated land pushes through land_push "" so the pre-push hook fires on the new
+# HEAD^{tree} (which has no green stamp), and a --skip-tests land re-runs the bounded merge-sanity
+# check on the fresh diverged tree first. Updates PRE_SHA/MERGED_SHA/SUITE_RESULT and returns 0
+# when a retry lands; returns 1 (caller rolls back) on a fresh conflict, a fetch/ff failure, a
+# non-advance push failure, or exhausted retries.
+land_nonff_recover() {
+  local attempt=0 conflict_files ms_rc
+  # The recovery re-merge always builds a NEW combined tree (origin gained a commit the branch
+  # lacks — that is WHY the push was non-ff), so any clean-FF gate skip (#96 / #270 AUTO_SKIP)
+  # is no longer valid: clear it so land_push "" runs the REAL pre-push gate on the new tree.
+  # A --skip-tests land keeps SKIP_TESTS and re-runs the bounded merge-sanity check instead.
+  AUTO_SKIP=""
+  AUTO_SKIP_STAMP=""
+  while [ "$attempt" -lt "$LAND_LOCK_PUSH_RETRIES" ]; do
+    attempt=$(( attempt + 1 ))
+    wt_warn "push refused: origin/$DEFAULT advanced under the land — reconciling and retrying under the lock (attempt $attempt/$LAND_LOCK_PUSH_RETRIES, issue #315)"
+    git reset --keep "$PRE_SHA" || { wt_warn "recovery: reset --keep failed"; return 1; }
+    git fetch origin --quiet 2>/dev/null || git fetch origin --quiet 2>/dev/null \
+      || { wt_warn "recovery: re-fetch from origin failed"; return 1; }
+    git merge --ff-only "$ORIGIN_DEFAULT" >/dev/null 2>&1 \
+      || { wt_warn "recovery: could not fast-forward to origin/$DEFAULT"; return 1; }
+    PRE_SHA="$(git rev-parse HEAD)"
+    if ! git merge --no-edit "$WT_BRANCH"; then
+      # A conflict against the advanced origin is DETERMINISTIC (a re-run fetches the same origin
+      # and re-conflicts), so it carries the #285 conflict contract — the CONFLICT marker + the
+      # dedicated exit code — NOT a generic rollback, so auto_land routes it to the resolution lane
+      # instead of blind-retrying. The tree is left clean (abort) and at origin (PRE_SHA), so the
+      # EXIT-trap lock release and a fresh land both start from a sane state.
+      conflict_files="$(git diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ' || true)"
+      conflict_files="${conflict_files% }"
+      git merge --abort 2>/dev/null || true
+      printf '%s: CONFLICT %s\n' "$WT_PROG" "$conflict_files" >&2
+      printf '%s: re-merge of %s conflicts with %s after origin advanced mid-land on: %s — resolve on the spoke and re-push\n' \
+        "$WT_PROG" "$WT_BRANCH" "$DEFAULT" "${conflict_files:-(unknown)}" >&2
+      wt_tlog_transition "$ISSUE" land_failed worktree-land.sh "merge conflict after origin advanced" \
+        "{\"conflicts\":\"${conflict_files:-unknown}\"}"
+      exit "$WT_LAND_CONFLICT_EXIT"
+    fi
+    MERGED_SHA="$(git rev-parse HEAD)"
+    # --skip-tests + a real merge commit builds an untested combined tree: re-run the bounded
+    # merge-sanity check on it (issue #174) before re-pushing skipped. A gated land instead
+    # re-runs the full gate via the hook on land_push "" below (AUTO_SKIP cleared above).
+    if [ -n "$SKIP_TESTS" ] && [ "$MERGED_SHA" != "$(git rev-parse "refs/heads/$WT_BRANCH")" ]; then
+      ms_rc=0; run_merge_sanity || ms_rc=$?
+      [ "$ms_rc" -ne 1 ] || { wt_warn "recovery: merge-sanity failed on the re-merged tree (issue #174)"; return 1; }
+    fi
+    PUSH_RC=0
+    land_push "" 2>&1 | tee "$PUSH_LOG" || PUSH_RC=$?
+    if [ "$PUSH_RC" -eq 0 ]; then
+      if [ -n "$SKIP_TESTS" ]; then
+        SUITE_RESULT="skipped (--skip-tests); origin advanced mid-land — re-merged on the fresh tip (merge-sanity re-checked the diverged tree) and re-pushed under the lock (issue #315)"
+      else
+        SUITE_RESULT="via pre-push hook — re-gated on the re-merged tree after origin advanced mid-land (issue #315)"
+      fi
+      return 0
+    fi
+    land_push_remote_advanced || { wt_warn "recovery: retry push failed for a non-advance reason"; return 1; }
+    # origin advanced AGAIN — loop for another bounded attempt
+  done
+  wt_warn "recovery: exhausted $LAND_LOCK_PUSH_RETRIES retry attempt(s) — origin keeps advancing under the land (issue #315)"
+  return 1
 }
 
 # Capture the push's combined output while streaming it live: tee exits 0 and
@@ -694,6 +942,13 @@ if [ "$PUSH_RC" -ne 0 ]; then
     else
       land_rollback "push exited $PUSH_RC with no test summary and no green-tree stamp for this tree — the gate was killed mid-run (not a post-green transport death), or no stamp was minted; refusing to retry with the suite skipped. Re-run the land to re-run the gate (issue #214)"
     fi
+  elif land_push_remote_advanced; then
+    # origin/$DEFAULT advanced under us (a push race despite the lock — a non-honoring pusher
+    # or CI): reconcile + retry under the lock rather than rolling back behind origin (issue
+    # #315). If recovery can't complete, land_rollback re-syncs to origin so the hub is never
+    # left behind, then aborts.
+    land_nonff_recover \
+      || land_rollback "push rejected: origin advanced under the land and automatic recovery could not complete (issue #315)"
   else
     land_rollback "push rejected (pre-push test gate or remote)"
   fi
