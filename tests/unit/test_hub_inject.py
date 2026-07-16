@@ -53,22 +53,71 @@ def _run_cli(*args: str, env: dict[str, str] | None = None) -> subprocess.Comple
     )
 
 
-def _recording_tmux(tmp_path: Path) -> tuple[Path, Path]:
+# The agent-liveness probe (#301) reads the pane's pid from tmux, then looks for the agent
+# among that pid's DESCENDANTS in a `ps` snapshot. Both halves are stubbed here.
+_PANE_PID = 4242
+_AGENT_PID = 4243
+# Every tmux stub answers `display-message` with the pane pid, so the probe can resolve it.
+_DISPLAY_CASE = f'  display-message) printf "{_PANE_PID}\\n" ;;\n'
+
+
+def _agent_ps_stub(fake_bin: Path, *, agent_alive: bool = True) -> None:
+    """PATH-stub `ps` for the #301 agent probe: is the agent a descendant of the pane pid?
+
+    The pane pid is ALWAYS a bare shell — that is the whole point of the incident. A live
+    spoke's pane reports `pane_current_command=zsh` exactly like a dead one (the launcher
+    shell is the pgrp leader; claude runs as its child), so the ONLY thing separating the
+    two shapes is whether a `claude` descendant exists. `agent_alive=False` is the incident:
+    a pane whose agent died but whose shell survived `exec $SHELL`.
+
+    Only the probe's exact `-eo pid=,ppid=,comm=` form is answered; every other `ps` call
+    (hub-afk's `-o comm= -p`, `-o command= -p`, the hang-capture snapshot) execs the REAL
+    ps, so a stub on PATH can never silently corrupt an unrelated process read.
+    """
+    table = f"{_PANE_PID} 1 -zsh\n"
+    if agent_alive:
+        table += f"{_AGENT_PID} {_PANE_PID} claude\n"
+    # A foreign claude that is NOT under this pane: the probe must not mistake it for ours.
+    table += "999 1 /Applications/Other.app/Contents/MacOS/claude\n"
+    tbl = fake_bin / "ps_table.txt"
+    tbl.write_text(table)
+    (fake_bin / "ps").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$*" in\n'
+        f'  "-eo pid=,ppid=,comm=") cat "{tbl}" ;;\n'
+        '  *) exec /bin/ps "$@" ;;\n'
+        "esac\n"
+    )
+    (fake_bin / "ps").chmod(0o755)
+
+
+def _recording_tmux(tmp_path: Path, *, agent_alive: bool = True) -> tuple[Path, Path]:
     """A tmux stub that appends each invocation's args to a log and exits 0."""
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
     log = tmp_path / "tmux.log"
-    (fake_bin / "tmux").write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\nexit 0\n')
+    (fake_bin / "tmux").write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> "{log}"\n'
+        'case "$1" in\n'
+        f"{_DISPLAY_CASE}"
+        "esac\n"
+        "exit 0\n"
+    )
     (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin, agent_alive=agent_alive)
     return fake_bin, log
 
 
-def _pane_tmux(tmp_path: Path, *, pane_path: Path, capture: str = "") -> tuple[Path, Path]:
+def _pane_tmux(
+    tmp_path: Path, *, pane_path: Path, capture: str = "", agent_alive: bool = True
+) -> tuple[Path, Path]:
     """A tmux stub that answers list-panes/capture-pane from fixtures and logs send-keys.
 
     list-panes -> one pane `hub:0<TAB><pane_path>`; capture-pane -> the `capture` text;
-    every other call (send-keys) is appended to the log. Enough to drive _spoke_pane_target,
-    _pane_shows_permission_prompt, and the keystroke ordering without a live tmux server.
+    display-message -> the pane pid (the #301 agent probe); every other call (send-keys) is
+    appended to the log. Enough to drive _spoke_pane_target, _pane_shows_permission_prompt,
+    and the keystroke ordering without a live tmux server.
     """
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
@@ -79,12 +128,14 @@ def _pane_tmux(tmp_path: Path, *, pane_path: Path, capture: str = "") -> tuple[P
 case "$1" in
   list-panes)  printf 'hub:0\\t%s\\n' "{pane_path}" ;;
   capture-pane) cat "{cap_file}" ;;
+{_DISPLAY_CASE.rstrip()}
   *)           printf '%s\\n' "$*" >> "{log}" ;;
 esac
 exit 0
 """
     (fake_bin / "tmux").write_text(script)
     (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin, agent_alive=agent_alive)
     return fake_bin, log
 
 
@@ -189,6 +240,7 @@ def _pane_tmux_landing_on_nth_enter(
 case "$1" in
   list-panes)   printf 'hub:0\\t%s\\n' "{pane_path}" ;;
   capture-pane) cat "{cap_file}" ;;
+{_DISPLAY_CASE.rstrip()}
   *)
     printf '%s\\n' "$*" >> "{log}"
     case "$*" in
@@ -204,6 +256,7 @@ exit 0
 """
     (fake_bin / "tmux").write_text(script)
     (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin)
     return fake_bin, log
 
 
@@ -299,12 +352,14 @@ case "$1" in
   list-panes)   printf 'hub:0\\t%s\\n' "{wt}" ;;
   capture-pane) printf 'x' >> "{counter}"
                 printf 'rm -rf /tmp/run-%s\\n{_PROMPT}\\n' "$(wc -c < "{counter}" | tr -d ' ')" ;;
+{_DISPLAY_CASE.rstrip()}
   *)            printf '%s\\n' "$*" >> "{log}" ;;
 esac
 exit 0
 """
     (fake_bin / "tmux").write_text(script)
     (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin)
     env = {
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "AFK_INJECT_VERIFY_SECONDS": "0",
@@ -393,6 +448,7 @@ printf '%s\\n' "$*" >> "{log}"
 case "$1" in
   list-panes)   printf 'hub:0\\t%s\\n' "{wt}" ;;
   capture-pane) : ;;
+{_DISPLAY_CASE.rstrip()}
   send-keys)
     case "$*" in
       *Escape*) printf '%s\\n' '{decline}' >> "{jsonl}" ;;
@@ -402,6 +458,7 @@ exit 0
 """
     (fake_bin / "tmux").write_text(script)
     (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin)
     return fake_bin, log
 
 
@@ -786,6 +843,163 @@ def test_finished_turn_idle_false_when_no_transcript(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 1, result.stderr
+
+
+# ── #301: the agent-liveness probe + the never-inject-into-a-shell precondition ─
+#
+# The 2026-07-15 incident: a reboot killed both spokes' `claude` processes, but the terminal
+# restored their tmux panes running a bare zsh in the worktree. The answerer then typed its
+# answer into that shell, where zsh's autocorrect read the prose as a COMMAND:
+#
+#     > pproved — proceed to ST4. Answers to your three questions: ...
+#     zsh: correct 'pproved' to 'prove' [nyae]?
+#
+# It was harmless only by luck. An answer whose first word happened to be a real command —
+# or one carrying shell metacharacters — would have EXECUTED inside a git worktree. So the
+# precondition lives in the inject PRIMITIVES, not in the callers: every lane (answer,
+# permission approve, nudge, watchdog) inherits it by construction.
+
+
+def test_pane_agent_alive_finds_the_agent_below_a_bare_shell_pane(tmp_path: Path) -> None:
+    """A LIVE spoke pane runs a bare shell — the agent is its CHILD.
+
+    This is the pin that kills the tempting-but-wrong probe. On a real hub a live spoke's
+    pane reports `pane_current_command=zsh`, byte-identical to the dead pane in the
+    incident, because the launcher shell is the process-group leader and claude runs
+    beneath it. Anything reading the pane's own command would declare every healthy spoke
+    dead and kill it. Liveness is a property of the pane's process TREE, not its foreground
+    command.
+    """
+    fake_bin, _ = _recording_tmux(tmp_path, agent_alive=True)
+
+    result = _call("_pane_agent_alive 'hub:0'", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+
+    assert result.returncode == 0, (
+        f"a claude child of the pane pid is a LIVE agent: {result.stderr}"
+    )
+
+
+def test_pane_agent_alive_reports_dead_for_a_pane_whose_agent_exited(tmp_path: Path) -> None:
+    """The incident shape: pane alive (`exec $SHELL` kept it), agent gone."""
+    fake_bin, _ = _recording_tmux(tmp_path, agent_alive=False)
+
+    result = _call("_pane_agent_alive 'hub:0'", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+
+    assert result.returncode == 1, (
+        f"a pane with no agent descendant must read DEAD, not alive: {result.stdout}{result.stderr}"
+    )
+
+
+def test_pane_agent_alive_ignores_a_claude_outside_the_pane_tree(tmp_path: Path) -> None:
+    """A foreign claude (another spoke, the IDE's own) must not vouch for THIS pane."""
+    fake_bin, _ = _recording_tmux(tmp_path, agent_alive=False)
+
+    result = _call("_pane_agent_alive 'hub:0'", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+
+    assert result.returncode == 1, "only a DESCENDANT of the pane pid counts as this pane's agent"
+
+
+def test_pane_agent_alive_is_unprovable_when_the_pane_pid_is_unreadable(tmp_path: Path) -> None:
+    """rc 2 = no evidence either way — distinct from a proven-dead rc 1.
+
+    The two consumers take OPPOSITE safe directions from this: a write (inject/approve)
+    refuses, while liveness reads it as alive rather than kill a spoke it cannot observe.
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    # tmux answers display-message with nothing: no pane pid, so the tree cannot be walked.
+    (fake_bin / "tmux").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin)
+
+    result = _call("_pane_agent_alive 'hub:0'", env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+
+    assert result.returncode == 2, (
+        f"an unreadable pane pid is UNPROVABLE, not dead: {result.stderr}"
+    )
+
+
+def test_inject_answer_sends_no_keys_when_the_agent_is_dead(tmp_path: Path) -> None:
+    """THE safety pin (AC3 + AC4b): never type prose into a bare shell.
+
+    Asserts on the keystrokes, not just the return code: a non-zero rc that had already sent
+    the text would still have executed it. Zero send-keys is the only honest proof.
+    """
+    fake_bin, log = _recording_tmux(tmp_path, agent_alive=False)
+    env = {"PATH": f"{fake_bin}:{os.environ['PATH']}", "AFK_INJECT_MENU_PAUSE": "0"}
+
+    result = _call("inject_answer 'hub:0' 'Approved — proceed to ST4.'", env=env)
+
+    assert result.returncode != 0, (
+        "injecting into a pane with no agent must FAIL, not silently pass"
+    )
+    assert _sends(log) == [], (
+        f"a dead-agent pane must receive ZERO keystrokes — these would have run as shell "
+        f"commands in the worktree: {_sends(log)}"
+    )
+
+
+def test_inject_answer_refuses_when_the_agent_probe_is_unprovable(tmp_path: Path) -> None:
+    """Writes fail CLOSED: an unobservable pane is never typed into.
+
+    Not silent — inject_and_verify's non-zero rc routes to the existing #281 escalation.
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    log = tmp_path / "tmux.log"
+    (fake_bin / "tmux").write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\nexit 0\n')
+    (fake_bin / "tmux").chmod(0o755)
+    _agent_ps_stub(fake_bin)
+    env = {"PATH": f"{fake_bin}:{os.environ['PATH']}", "AFK_INJECT_MENU_PAUSE": "0"}
+
+    result = _call("inject_answer 'hub:0' 'use Redis'", env=env)
+
+    assert result.returncode != 0, "an unprovable agent must not be typed into"
+    assert _sends(log) == [], f"no keys may reach an unobservable pane: {_sends(log)}"
+
+
+def test_approve_permission_sends_no_keys_when_the_agent_is_dead(tmp_path: Path) -> None:
+    """The permission lane inherits the precondition too.
+
+    approve_permission does NOT go through inject_answer — it drives the menu itself — so a
+    guard placed only in the answer path would leave this lane typing "1<Enter>" into a
+    shell. Guarding both send-keys primitives is what makes "every lane inherits it" true.
+    """
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    fake_bin, log = _pane_tmux(tmp_path, pane_path=wt, capture=_PROMPT, agent_alive=False)
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "CLAUDE_PROJECTS_DIR": str(tmp_path / "projects"),
+    }
+
+    result = _call(f"approve_permission '{wt}'", env=env)
+
+    assert result.returncode != 0, "approving a dead pane's stale dialog must fail"
+    assert _sends(log) == [], (
+        f"a dead-agent pane must draw no selection keys — the rendered dialog is scrollback "
+        f"left behind by an agent that is gone: {_sends(log)}"
+    )
+
+
+def test_inject_and_verify_refuses_a_dead_agent_without_touching_the_pane(tmp_path: Path) -> None:
+    """The wrapper every answer lane calls inherits the guard from inject_answer."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    fake_bin, log = _pane_tmux(tmp_path, pane_path=wt, agent_alive=False)
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "AFK_INJECT_MENU_PAUSE": "0",
+        "AFK_INJECT_VERIFY_SECONDS": "0",
+        "AFK_INJECT_POLL_SECONDS": "0",
+        "CLAUDE_PROJECTS_DIR": str(tmp_path / "projects"),
+    }
+
+    result = _call(f"inject_and_verify '{wt}' 'hub:0' 'use Redis'", env=env)
+
+    assert result.returncode != 0, "a dead-agent pane cannot register an answer"
+    assert _sends(log) == [], f"not even the bare-Enter retry may reach a dead pane: {_sends(log)}"
 
 
 # ── the CLI (direct invocation, no bash-source seam) ───────────────────────────
