@@ -299,6 +299,8 @@ _wd_detect_park_unanswered() {
 # park-unanswered whenever a drop is on record for the current episode, regardless of backoff
 # phase: a park that has exhausted its backoff and still has nothing to show must still surface,
 # just under the honest reason (a serviced-but-undeliverable park must never read as silence).
+# #312: like condition 1, suppressed while the drain is VISIBLY servicing the spoke
+# (_wd_drain_touched_recently) — a drop off a stale onset is not a shortfall mid-service.
 _wd_detect_park_undeliverable() {
   local wt="$1" issue="$2" now="$3" base attempt onset svc
   command -v slot_state >/dev/null 2>&1 || return 1
@@ -319,6 +321,15 @@ _wd_detect_park_undeliverable() {
   onset="$(read_park_onset_epoch "$issue" 2>/dev/null)"
   _wd_delivered_in_episode "$wt" "$issue" "$attempt" "$onset" && return 1   # a delivery landed -> stale-attempt's turf
   _wd_epoch_stale "$base" "$now" "$HUB_WATCHDOG_PARK_CEILING" || return 1
+  # #312: inherit condition 1's drain-touched suppression (line above in _wd_detect_park_unanswered).
+  # A drain journaling a decision for this spoke — or advancing its progress epoch — inside the
+  # ceiling window is visibly SERVICING it, so a drop off a stale onset is not a shortfall (the #307
+  # false-fire: the spoke coded past its gate and hit a permission dialog every ~30s, each resolved
+  # in seconds, while the un-retired onset aged). This is DISTINCT from the warned-backoff
+  # suppression #288 deliberately omits here: that one stays dropped so an exhausted-backoff drop
+  # still surfaces; this one suppresses only ACTIVE, in-window servicing, which a genuinely-abandoned
+  # park never shows.
+  _wd_drain_touched_recently "$issue" "$now" && return 1
   # A drop is proven by the log episode (dropped) or the pre-#304 drop file.
   [ "$svc" = dropped ] || [ -n "$(_wd_park_drop_info "$wt" "$issue")" ]
 }
