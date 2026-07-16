@@ -846,6 +846,12 @@ land_push_remote_advanced() {
 # non-advance push failure, or exhausted retries.
 land_nonff_recover() {
   local attempt=0 conflict_files ms_rc
+  # The recovery re-merge always builds a NEW combined tree (origin gained a commit the branch
+  # lacks — that is WHY the push was non-ff), so any clean-FF gate skip (#96 / #270 AUTO_SKIP)
+  # is no longer valid: clear it so land_push "" runs the REAL pre-push gate on the new tree.
+  # A --skip-tests land keeps SKIP_TESTS and re-runs the bounded merge-sanity check instead.
+  AUTO_SKIP=""
+  AUTO_SKIP_STAMP=""
   while [ "$attempt" -lt "$LAND_LOCK_PUSH_RETRIES" ]; do
     attempt=$(( attempt + 1 ))
     wt_warn "push refused: origin/$DEFAULT advanced under the land — reconciling and retrying under the lock (attempt $attempt/$LAND_LOCK_PUSH_RETRIES, issue #315)"
@@ -856,15 +862,25 @@ land_nonff_recover() {
       || { wt_warn "recovery: could not fast-forward to origin/$DEFAULT"; return 1; }
     PRE_SHA="$(git rev-parse HEAD)"
     if ! git merge --no-edit "$WT_BRANCH"; then
+      # A conflict against the advanced origin is DETERMINISTIC (a re-run fetches the same origin
+      # and re-conflicts), so it carries the #285 conflict contract — the CONFLICT marker + the
+      # dedicated exit code — NOT a generic rollback, so auto_land routes it to the resolution lane
+      # instead of blind-retrying. The tree is left clean (abort) and at origin (PRE_SHA), so the
+      # EXIT-trap lock release and a fresh land both start from a sane state.
       conflict_files="$(git diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ' ' || true)"
+      conflict_files="${conflict_files% }"
       git merge --abort 2>/dev/null || true
-      wt_warn "recovery: re-merge now conflicts with $DEFAULT on: ${conflict_files:-unknown}"
-      return 1   # a fresh deterministic conflict — caller rolls back (auto_land routes to #285)
+      printf '%s: CONFLICT %s\n' "$WT_PROG" "$conflict_files" >&2
+      printf '%s: re-merge of %s conflicts with %s after origin advanced mid-land on: %s — resolve on the spoke and re-push\n' \
+        "$WT_PROG" "$WT_BRANCH" "$DEFAULT" "${conflict_files:-(unknown)}" >&2
+      wt_tlog_transition "$ISSUE" land_failed worktree-land.sh "merge conflict after origin advanced" \
+        "{\"conflicts\":\"${conflict_files:-unknown}\"}"
+      exit "$WT_LAND_CONFLICT_EXIT"
     fi
     MERGED_SHA="$(git rev-parse HEAD)"
     # --skip-tests + a real merge commit builds an untested combined tree: re-run the bounded
     # merge-sanity check on it (issue #174) before re-pushing skipped. A gated land instead
-    # re-runs the full gate via the hook on land_push "" below, so it needs nothing here.
+    # re-runs the full gate via the hook on land_push "" below (AUTO_SKIP cleared above).
     if [ -n "$SKIP_TESTS" ] && [ "$MERGED_SHA" != "$(git rev-parse "refs/heads/$WT_BRANCH")" ]; then
       ms_rc=0; run_merge_sanity || ms_rc=$?
       [ "$ms_rc" -ne 1 ] || { wt_warn "recovery: merge-sanity failed on the re-merged tree (issue #174)"; return 1; }
@@ -872,7 +888,11 @@ land_nonff_recover() {
     PUSH_RC=0
     land_push "" 2>&1 | tee "$PUSH_LOG" || PUSH_RC=$?
     if [ "$PUSH_RC" -eq 0 ]; then
-      SUITE_RESULT="$SUITE_RESULT; origin advanced mid-land — re-merged on the fresh tip and re-pushed under the lock (issue #315)"
+      if [ -n "$SKIP_TESTS" ]; then
+        SUITE_RESULT="skipped (--skip-tests); origin advanced mid-land — re-merged on the fresh tip (merge-sanity re-checked the diverged tree) and re-pushed under the lock (issue #315)"
+      else
+        SUITE_RESULT="via pre-push hook — re-gated on the re-merged tree after origin advanced mid-land (issue #315)"
+      fi
       return 0
     fi
     land_push_remote_advanced || { wt_warn "recovery: retry push failed for a non-advance reason"; return 1; }

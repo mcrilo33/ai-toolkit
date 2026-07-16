@@ -2563,17 +2563,21 @@ def test_two_concurrent_lands_serialize_main_never_rewound(hub: Path, tmp_path: 
 def test_nonff_push_rejection_recovers_and_reruns_gate(hub: Path, tmp_path: Path) -> None:
     # AC2 recovery clause: if a push still races (origin advances DURING our gate, despite the
     # lock — e.g. a non-honoring pusher), the land must AUTOMATICALLY re-fetch + re-merge + retry
-    # under the lock, not die with the hub behind. The re-merge is a NEW combined tree, so the
-    # retry must RE-RUN its gate — asserted via the pre-push hook firing twice.
+    # under the lock, not die with the hub behind. The re-merge is a NEW combined DIVERGED tree,
+    # so the retry must RE-RUN its gate — NOT reuse a clean-FF skip. This land is a clean-FF land
+    # with a ready marker (AUTO_SKIP): the FIRST push threads TEST_SELECT_SKIP=1, but the recovery
+    # push must run the gate for real (TEST_SELECT_SKIP unset) on the diverged tree.
     _make_spoke(hub, tmp_path, "feature/1-racy", push=True)
-    count = tmp_path / "prepush-count"
+    invocations = tmp_path / "prepush-invocations"
     advanced = tmp_path / "origin-advanced"
     remote = tmp_path / "remote.git"
     hook = hub / ".git" / "hooks" / "pre-push"
     hook.write_text(
         "#!/bin/sh\n"
-        f'c=$(cat "{count}" 2>/dev/null || echo 0); echo $((c + 1)) > "{count}"\n'
-        # On the FIRST gate run only, a sibling wins the push race by advancing origin/main.
+        # Record the threaded skip flag per invocation so the test can prove the recovery push
+        # actually re-gated (skip empty) rather than riding the stale clean-FF skip.
+        'printf "skip=[%s]\\n" "${TEST_SELECT_SKIP:-}" >> "' + str(invocations) + '"\n'
+        # On the FIRST push only, a sibling wins the race by advancing origin/main out-of-band.
         f'if [ ! -f "{advanced}" ]; then\n'
         f'  touch "{advanced}"\n'
         "  d=$(mktemp -d)\n"
@@ -2592,8 +2596,10 @@ def test_nonff_push_rejection_recovers_and_reruns_gate(hub: Path, tmp_path: Path
     proc, _ = _run_land(hub, tmp_path, "1")
 
     assert proc.returncode == 0, proc.stderr + "\n---\n" + proc.stdout
-    assert int(count.read_text().strip()) >= 2, (
-        "the retry must RE-RUN the gate on the re-merged tree"
+    invs = invocations.read_text().splitlines()
+    assert len(invs) >= 2, f"the gate must re-run on the re-merged tree: {invs}"
+    assert invs[-1] == "skip=[]", (
+        f"recovery must RE-GATE the diverged tree, not ride the clean-FF skip: {invs}"
     )
     head = _git(hub, "rev-parse", "HEAD").strip()
     assert _remote_sha(hub, "main") == head, "the hub must end at origin, not behind it"
