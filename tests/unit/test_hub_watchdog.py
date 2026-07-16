@@ -1372,6 +1372,75 @@ def test_run_conditions_fires_dead_pane_on_a_genuine_reaper_miss(tmp_path: Path)
     assert (tmp_path / "revived").read_text() == "284"
 
 
+# ── #303 (#300 step 4): dead-pane READS the transition log ─────────────────────
+# The residual #290/#301 gap: when _wd_land_in_flight cannot see the land (a clobbered
+# last-action, no fresh land log, drain off), the epoch-inference still fires "reaper
+# missed a dead pane" on a spoke that is landing or pushing — those are RECORDED states,
+# not silence. A recorded landing|pushing state suppresses the fire structurally, and the
+# suppression is logged as a DIVERGENCE (never silent, #300). unknown ⇒ fall back to the
+# inference (never a firing basis alone, never a suppression basis alone).
+def _write_transition(state_dir: Path, issue: int, to: str, *, ts: str = NOW) -> None:
+    """Append one complete transition record the read API parses (afk_current_state/onset)."""
+    d = state_dir / "transitions"
+    d.mkdir(parents=True, exist_ok=True)
+    line = (
+        f'{{"v":1,"ts":{ts},"issue":{issue},"kind":"transition",'
+        f'"to":"{to}","actor":"test","cause":"pin"}}'
+    )
+    (d / f"{issue}.jsonl").write_text(line + "\n")
+
+
+@pytest.mark.parametrize("state", ["landing", "pushing"])
+def test_run_conditions_suppresses_dead_pane_when_state_is_landing_or_pushing(
+    tmp_path: Path, state: str
+) -> None:
+    # The genuine-reaper-miss shape (no done epoch, drain off, no land log, pane gone,
+    # progress past the ceiling) — today's inference FIRES. A recorded landing|pushing
+    # transition is a known multi-minute phase, so #303 suppresses the fire and the revive.
+    ledger = tmp_path / "l.jsonl"
+    env = _dead_pane_dispatch_env(tmp_path)
+    _write_transition(tmp_path / "afk-state", 284, state)
+    prelude = _dead_pane_dispatch_prelude(done_epoch="", drain="off")
+
+    _call(f"{prelude}; _wd_run_conditions {NOW} off", env=env)
+
+    assert not ledger.exists(), f"a recorded {state} state is not a reaper miss"
+    assert not (tmp_path / "revived").exists(), "never revive a spoke recorded landing/pushing"
+
+
+@pytest.mark.parametrize("state", ["landing", "pushing"])
+def test_run_conditions_logs_a_divergence_when_the_log_suppresses_a_dead_pane_fire(
+    tmp_path: Path, state: str
+) -> None:
+    # The suppression is never silent (#300): when the epoch-inference WOULD have fired but
+    # the recorded state vetoes it, a DIVERGENCE line names the disagreement (log wins).
+    env = _dead_pane_dispatch_env(tmp_path)
+    _write_transition(tmp_path / "afk-state", 284, state)
+    prelude = _dead_pane_dispatch_prelude(done_epoch="", drain="off")
+
+    result = _call(f"{prelude}; _wd_run_conditions {NOW} off", env=env)
+
+    assert "divergence" in result.stdout.lower(), result.stdout
+    assert state in result.stdout
+
+
+def test_run_conditions_dead_pane_still_fires_when_state_is_not_a_land_or_push(
+    tmp_path: Path,
+) -> None:
+    # The veto is NARROW: only landing|pushing suppress. A recorded `dispatched` (a spoke
+    # that crashed before ever pushing) is exactly the reaper miss condition 2 exists to
+    # catch — the log must NOT suppress it, mirroring the unknown-log fallback.
+    ledger = tmp_path / "l.jsonl"
+    env = _dead_pane_dispatch_env(tmp_path)
+    _write_transition(tmp_path / "afk-state", 284, "dispatched")
+    prelude = _dead_pane_dispatch_prelude(done_epoch="", drain="off")
+
+    _call(f"{prelude}; _wd_run_conditions {NOW} off", env=env)
+
+    assert '"condition":"dead-pane"' in ledger.read_text()
+    assert (tmp_path / "revived").read_text() == "284"
+
+
 # Condition 3 — stale blocked marker (real git)
 def test_stale_marker_fires_when_blocked_is_ancestor_of_tip(tmp_path: Path) -> None:
     wt = _git_repo(tmp_path)
