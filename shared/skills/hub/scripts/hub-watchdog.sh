@@ -345,40 +345,25 @@ _wd_park_is_answer_lane() {
   return 1
 }
 
-# _wd_park_log_onset <issue> -> the onset ts of the CURRENT park as RECORDED in the #300 transition
-# log (the `parked`/`parked-gate` transition's own ts), or empty when the log records no park state
-# (#304). This is the #265 zero-grace fix made log-native: the onset was recorded by the actor at
-# park time, not reconstructed from a slot_state side-effect. Gated on the current log state being a
-# park — afk_state_onset returns the LAST transition's ts regardless of kind, so a later
-# `pushed`/`landed` transition's ts must not masquerade as a park onset. Empty (no API / not parked
-# in the log) falls back to the epoch path, per the #300 unknown-never-fires-nor-suppresses contract.
-_wd_park_log_onset() {
-  local issue="$1"
-  command -v afk_current_state >/dev/null 2>&1 || return 0
-  command -v afk_state_onset >/dev/null 2>&1 || return 0
-  case "$(afk_current_state "$issue" 2>/dev/null)" in
-    parked | parked-gate) afk_state_onset "$issue" 2>/dev/null ;;
-  esac
-}
-
 # _wd_park_base <wt> <issue> -> the epoch the park-unanswered ceiling measures FROM:
 # max(current episode onset, answer delivery). An answer delivered BEFORE the current park began
 # cannot count against it (#283) — that was the #276 false-fire: one answered plan gate, then ten
-# productive minutes, and the ceiling still measured from that one delivery. The onset comes
-# log-first from the recorded park transition (#304); on an unknown log it falls back to
-# note_park_episode, which re-stamps the epoch when the pending park's context changes, so the onset
-# names the episode actually pending. A delivery INSIDE the episode is the more recent word and
-# wins. Empty when neither is measurable (the detector then cannot fire — same contract as
-# _afk_ceiling_epoch).
+# productive minutes, and the ceiling still measured from that one delivery. note_park_episode
+# re-stamps the onset when the pending park's context changes, so the onset names the episode
+# actually pending; a delivery INSIDE it is the more recent word and wins. Empty when neither is
+# measurable (the detector then cannot fire — same contract as _afk_ceiling_epoch).
+#
+# #304 note: the onset is the reconciler-stamped park-onset epoch (read_park_onset_epoch), a
+# side-channel the #304 reconciler now writes on the FIRST park observation in slot_state's place.
+# The park EPISODE the answer-lane events key on comes off this same onset (via _gb_episode_key), so
+# note_park_episode's re-stamp on a changed park signature is load-bearing: dropping it would strand
+# a stale onset and re-open the #276/#283 mis-attribution. It stays unconditional here.
 _wd_park_base() {
   local wt="$1" issue="$2" onset attempt
-  onset="$(_wd_park_log_onset "$issue")"
-  if [ -z "$onset" ]; then
-    if command -v note_park_episode >/dev/null 2>&1; then
-      onset="$(note_park_episode "$wt" "$issue" 2>/dev/null)"
-    else
-      onset="$(read_park_onset_epoch "$issue" 2>/dev/null)"
-    fi
+  if command -v note_park_episode >/dev/null 2>&1; then
+    onset="$(note_park_episode "$wt" "$issue" 2>/dev/null)"
+  else
+    onset="$(read_park_onset_epoch "$issue" 2>/dev/null)"
   fi
   attempt="$(read_answer_attempt "$issue" 2>/dev/null)"
   case "$onset" in '' | *[!0-9]*) onset=0 ;; esac
@@ -446,6 +431,12 @@ _wd_episode_service() {
   [ -n "$ep" ] || { printf 'unknown\n'; return 0; }
   ev="$(afk_last_service_event "$issue" "$ep" answer 2>/dev/null)"
   [ -n "$ev" ] || { printf 'none\n'; return 0; }
+  # Classify on the pre-evidence HEAD only (transition-log.sh's _tlog_head discipline): the event
+  # line carries a caller-supplied evidence object whose free-text `reason` is built from captured
+  # tool output, so an answer_delivered whose evidence text happens to contain the substring
+  # "event":"answer_dropped" would otherwise misclassify as a drop. The builders append
+  # ,"evidence":... strictly LAST, so everything before it is lib-written fixed-key content.
+  ev="${ev%%,\"evidence\":*}"
   case "$ev" in
     *'"event":"answer_dropped"'*) printf 'dropped\n' ;;
     *) printf 'delivered\n' ;;

@@ -1057,66 +1057,49 @@ def test_park_undeliverable_refreshes_a_stale_onset_before_checking_delivery(
     assert rc2 == 0, "the fresh episode must fire once it ages past the ceiling, not stay masked"
 
 
-# ── issue #304 (#300 step 5): the park detectors READ the transition log ──────────────────────
-# The four side-channels (answer-attempt epoch, park-onset epoch, reanswer counter, answer-drop
-# file) collapse into ONE episode-keyed read of the lifecycle log: the park's onset comes from the
-# recorded `parked` transition (#265), and whether it was serviced — delivered vs dropped — from
-# the episode's own lane events (#283/#288). The epoch side-channels stay as the fallback the
-# `unknown`-log contract requires; these pins seed ONLY the log (epoch readers stubbed EMPTY) so a
-# pass proves the detector read the log, not a leftover epoch.
+# ── issue #304 (#300 step 5): the park detectors READ the episode's lane events ────────────────
+# Whether a park was serviced — delivered vs dropped vs never-attempted — is read from the current
+# episode's OWN answer-lane events in the lifecycle log, not reconstructed from the answer-attempt
+# epoch + answer-drop file. The park onset (#265) stays on read_park_onset_epoch, which the #304
+# reconciler now stamps on the first park observation (in slot_state's place). The #304 reconciler
+# mints the `parked` transition WITH the episode (via _gb_episode_key, the same key the broker's
+# lane events carry), so `_seed_parked` with an episode is the production shape; a park transition
+# with NO episode reads `unknown` and falls back to the epoch side-channels (the #300 contract).
 
 
-def _seed_parked(state_dir: Path, issue: int, episode: str, *, onset: int) -> None:
-    """Append a `parked` transition carrying an episode, with a controlled onset ts."""
+def _seed_parked(state_dir: Path, issue: int, episode: str | None = None, *, onset: int) -> None:
+    """Append a `parked` transition (as the reconciler mints it), optionally carrying an episode."""
     d = state_dir / "transitions"
     d.mkdir(parents=True, exist_ok=True)
+    ep = f',"episode":"{episode}"' if episode else ""
     line = (
         f'{{"v":1,"ts":{onset},"issue":{issue},"kind":"transition",'
-        f'"to":"parked","actor":"reconciler","cause":"park","episode":"{episode}"}}'
+        f'"to":"parked","actor":"reconciler","cause":"park"{ep}}}'
     )
     with (d / f"{issue}.jsonl").open("a") as fh:
         fh.write(line + "\n")
 
 
 def _seed_lane_event(
-    state_dir: Path, issue: int, event: str, episode: str, *, lane: str = "answer", ts: str = NOW
+    state_dir: Path,
+    issue: int,
+    event: str,
+    episode: str,
+    *,
+    lane: str = "answer",
+    ts: str = NOW,
+    evidence: str | None = None,
 ) -> None:
     """Append one lane event (answer_delivered / answer_dropped / …) keyed by episode."""
     d = state_dir / "transitions"
     d.mkdir(parents=True, exist_ok=True)
+    ev = f',"evidence":{evidence}' if evidence else ""
     line = (
         f'{{"v":1,"ts":{ts},"issue":{issue},"kind":"event",'
-        f'"event":"{event}","actor":"test","lane":"{lane}","episode":"{episode}"}}'
+        f'"event":"{event}","actor":"test","lane":"{lane}","episode":"{episode}"{ev}}}'
     )
     with (d / f"{issue}.jsonl").open("a") as fh:
         fh.write(line + "\n")
-
-
-def test_park_unanswered_reads_stale_onset_from_the_transition_log(tmp_path: Path) -> None:
-    # #265 via the log: the park onset is the recorded `parked` transition's ts. With the epoch
-    # reader EMPTY, the pre-#304 base is unmeasurable (quiet); reading the log's onset (700s old,
-    # past the 600s ceiling) is what fires the never-attempted branch.
-    sd = tmp_path / "sd"
-    onset = int(NOW) - 700
-    _seed_parked(sd, 5, f"sigA:{onset}", onset=onset)
-    prelude = (
-        f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; "
-        "read_answer_attempt() { echo ''; }; read_park_onset_epoch() { echo ''; }"
-    )
-    assert _detect(prelude, f"_wd_detect_park_unanswered /wt 5 {NOW}", state_dir=sd) == 0
-
-
-def test_park_unanswered_quiet_when_the_logged_park_is_fresh(tmp_path: Path) -> None:
-    # The log onset is honored in BOTH directions: a park recorded 60s ago (< ceiling) stays quiet
-    # even with no epoch to measure from.
-    sd = tmp_path / "sd"
-    onset = int(NOW) - 60
-    _seed_parked(sd, 5, f"sigA:{onset}", onset=onset)
-    prelude = (
-        f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; "
-        "read_answer_attempt() { echo ''; }; read_park_onset_epoch() { echo ''; }"
-    )
-    assert _detect(prelude, f"_wd_detect_park_unanswered /wt 5 {NOW}", state_dir=sd) == 1
 
 
 def test_park_unanswered_reason_reads_stale_attempt_from_a_delivery_lane_event(
@@ -1138,19 +1121,22 @@ def test_park_unanswered_reason_reads_stale_attempt_from_a_delivery_lane_event(
     assert "stale-attempt" in out
 
 
-def test_park_unanswered_ignores_a_delivery_in_a_different_episode(tmp_path: Path) -> None:
+def test_park_unanswered_reason_ignores_a_delivery_in_a_different_episode(tmp_path: Path) -> None:
     # #283 episode-scoping, now structural: a delivery recorded under a PRIOR episode's key cannot
-    # service the CURRENT park. The current episode (sigB) has no delivery of its own, so the
-    # never-attempted branch fires despite a sigA delivery on record.
+    # service the CURRENT park. The current episode (sigB) has no delivery of its own, so the reason
+    # reports never-attempted despite a sigA delivery on record — proving the scoping (a whole-log
+    # read would see the delivery and mislabel it stale-attempt).
     sd = tmp_path / "sd"
     onset = int(NOW) - 700
     _seed_parked(sd, 5, f"sigB:{onset}", onset=onset)
     _seed_lane_event(sd, 5, "answer_delivered", f"sigA:{onset - 400}", ts=str(onset - 400))
-    prelude = (
-        f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; "
-        "read_answer_attempt() { echo ''; }; read_park_onset_epoch() { echo ''; }"
-    )
-    assert _detect(prelude, f"_wd_detect_park_unanswered /wt 5 {NOW}", state_dir=sd) == 0
+    prelude = f"{_GATE_LANE}; read_answer_attempt() {{ echo ''; }}; read_park_onset_epoch() {{ echo ''; }}"
+    out = _call(
+        f"{prelude}; _wd_park_unanswered_reason /wt 5 {NOW}",
+        env={"AFK_STATE_DIR": str(sd), "AFK_NOW": NOW},
+    ).stdout
+    assert "never-attempted" in out
+    assert "stale-attempt" not in out
 
 
 def test_park_undeliverable_reads_a_dropped_lane_event_from_the_log(tmp_path: Path) -> None:
@@ -1163,9 +1149,45 @@ def test_park_undeliverable_reads_a_dropped_lane_event_from_the_log(tmp_path: Pa
     ep = f"sigA:{onset}"
     _seed_parked(sd, 5, ep, onset=onset)
     _seed_lane_event(sd, 5, "answer_dropped", ep)
+    # The ceiling base still comes from the reconciler-stamped onset epoch (700s old, past the
+    # ceiling); it is the DROP that is read from the log, not the answer-drop file (none exists).
     prelude = (
         f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; "
-        "read_answer_attempt() { echo ''; }; read_park_onset_epoch() { echo ''; }"
+        f"read_answer_attempt() {{ echo ''; }}; read_park_onset_epoch() {{ echo {onset}; }}"
+    )
+    assert _detect(prelude, f"_wd_detect_park_undeliverable '{wt}' 5 {NOW}", state_dir=sd) == 0
+
+
+def test_episode_service_classifies_on_the_event_head_not_the_evidence(tmp_path: Path) -> None:
+    # An answer_delivered whose evidence free-text contains the substring "event":"answer_dropped"
+    # (the drain's reason is built from captured tool output) must classify as `delivered`: the read
+    # is on the pre-evidence HEAD only, matching transition-log.sh's own _tlog_head discipline.
+    sd = tmp_path / "sd"
+    onset = int(NOW) - 700
+    ep = f"sigA:{onset}"
+    _seed_parked(sd, 5, ep, onset=onset)
+    _seed_lane_event(
+        sd, 5, "answer_delivered", ep, evidence='{"reason":"\\"event\\":\\"answer_dropped\\""}'
+    )
+    out = _call("_wd_episode_service 5", env={"AFK_STATE_DIR": str(sd)}).stdout.strip()
+    assert out == "delivered"
+
+
+def test_park_undeliverable_falls_back_to_the_drop_file_without_a_logged_episode(
+    tmp_path: Path,
+) -> None:
+    # Production-shape without the reconciler: a `parked` transition carries NO episode, so
+    # afk_current_episode is empty and _wd_episode_service is `unknown` — the detector must fall
+    # back to the answer-drop FILE, never fire nor suppress on the unknown log alone (#300 contract).
+    wt = _git_repo(tmp_path)
+    sd = tmp_path / "sd"
+    onset = int(NOW) - 700
+    _seed_parked(sd, 5, onset=onset)  # no episode: the pre-reconciler / hook-written shape
+    (sd / "answer-drop-5").write_text(f"{_head(wt)}\tsigA\t2\tstale tree\n")
+    prelude = (
+        f"{_GATE_LANE}; slot_state() {{ echo waiting; }}; "
+        "_broker_park_signature() { printf '%s' 'sigA'; }; "
+        f"read_answer_attempt() {{ echo ''; }}; read_park_onset_epoch() {{ echo {onset}; }}"
     )
     assert _detect(prelude, f"_wd_detect_park_undeliverable '{wt}' 5 {NOW}", state_dir=sd) == 0
 
