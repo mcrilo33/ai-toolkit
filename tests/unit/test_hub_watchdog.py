@@ -3592,3 +3592,34 @@ def test_missing_required_module_refuses_to_run(tmp_path: Path) -> None:
     assert result.returncode != 0, "a missing required module must refuse to run, not tick blind"
     combined = result.stdout + result.stderr
     assert "FATAL" in combined and "hub-watchdog-" in combined, combined
+
+
+def test_report_refuses_when_intervene_module_missing(tmp_path: Path) -> None:
+    # --report dispatches to _wd_report, which the #308 split moved into hub-watchdog-intervene.sh.
+    # A partial sync where the intervene module did not resolve leaves _wd_report UNDEFINED, so the
+    # --report CLI must fail CLOSED through _wd_require_modules (a loud FATAL, nonzero) rather than
+    # crash with `_wd_report: command not found` — the guarded parity the other entry points have.
+    entry = tmp_path / "hub-watchdog.sh"
+    entry.write_bytes(HUB_WATCHDOG.read_bytes())  # NB: no hub-watchdog-*.sh copied alongside
+    env = {
+        **os.environ,
+        "TZ": "UTC",
+        "HUB_WATCHDOG_FILE": "0",
+        "HUB_WATCHDOG_WT_LIB": str(WT_LIB),
+        "_WD_TOPLEVEL": str(tmp_path / "no-such-toplevel"),
+    }
+
+    result = subprocess.run(
+        ["bash", str(entry), "--report"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(tmp_path),
+    )
+
+    assert result.returncode != 0, "a missing intervene module must make --report refuse, not crash"
+    combined = result.stdout + result.stderr
+    assert "FATAL" in combined, combined
+    assert "command not found" not in combined, (
+        f"raw undefined-fn crash, not a clean refusal: {combined}"
+    )

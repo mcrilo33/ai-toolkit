@@ -627,7 +627,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     --arm)     _wd_arm ;;
     --once)    _wd_once ;;
     --status)  _wd_status ;;
-    --report)  _wd_report ;;
+    --report)  _wd_require_modules && _wd_report ;;   # _wd_report lives in the intervene module (#308)
     -h | --help) sed -n '2,53p' "$_WD_SELF" ;;
     *)         _wd_status ;;
   esac
