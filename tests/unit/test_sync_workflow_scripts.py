@@ -193,7 +193,7 @@ def test_gate_broker_module_source_exists_and_is_executable(module: str) -> None
 # synced target sets _AFK_MODULES_OK=0 and the drain refuses to arm there. So every module
 # must be in the loop, take the hub-skill case mapping, and exist executable — mirroring the
 # gate-broker-module guards. Extend this tuple as each lane is extracted.
-HUB_AFK_MODULES = ("land", "dispatch", "arm")
+HUB_AFK_MODULES = ("land", "dispatch", "arm", "supervise")
 
 
 @pytest.mark.parametrize("module", HUB_AFK_MODULES)
