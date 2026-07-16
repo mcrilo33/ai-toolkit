@@ -24,6 +24,30 @@ The bar is the **quality of the answer**. Reason about the decision with a real 
 budget; a wrong auto-answer costs a cycle, but leaving the drain stalled costs the whole
 window. When in doubt, take the reversible, in-scope option and flag it with `WARN:`.
 
+## The scripted reaper acts on ambiguity too (mode=afk)
+
+The same principle governs the **scripted** side of the drain, not just this reasoning
+step. When the reaper meets an *ambiguous* stuck spoke under `mode=afk` — most sharply a
+**pushed-but-unmarked** tip (clean tree, pushed to `@{upstream}`, but no `ready/<issue>`
+marker: finished-with-a-failed-marker vs idle-between-subtasks) — it must **act**, not
+warn-park for a human who is not there. Warn-parking such a spoke silently once cost a
+10-hour window and jammed every issue scope-blocked behind it (#299). So the reaper walks
+the same ladder the answerer's "always answer" embodies:
+
+1. **nudge** the live session to finish and emit its marker (reusing the #255
+   finished-turn-idle nudge budget);
+2. if unresponsive past that budget, **relaunch** it (`claude --continue`; the worktree +
+   commits survive);
+3. if it still produces no marker, **decide**: escalate a loud, reversible
+   `blocked/<issue>` (never an auto-land of ambiguous work) that names the dependents it is
+   stalling — so it is never a silent log line.
+
+`mode=attended` keeps warn-and-wait — the human *is* the wall. And the genuinely
+irreversible + outward-facing carve-out below (force-push, history rewrite, the default
+branch, deletions outside the worktree) is untouched: this ladder is only for the
+**ambiguous middle**, and its terminal is a reversible `blocked/<issue>`, not a destructive
+act.
+
 ## Who you are answering for
 
 You are standing in for the human who dispatched this work and then stepped away. You are

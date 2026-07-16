@@ -10815,3 +10815,225 @@ def test_afk_done_poison_filter_reads_grouped_tokens(tmp_path: Path) -> None:
     result = _call(expr, env={"BATCH_PLAN": str(bp), "AFK_STATE_DIR": str(state)})
 
     assert "RC=0" in result.stdout, "a group of only-poisoned issues is a drained backlog"
+
+
+# ── issue #305: afk must ACT on a pushed-but-unmarked spoke, not warn-park forever ──
+# The #299 incident: a drain spoke finished, pushed a clean tip, then stopped WITHOUT emitting
+# ready/299. The pushed-but-unmarked classifier short-circuited PAST the #255 nudge lane straight
+# to a warn-park that re-fired the same warning every tick for ~10h with NO action, jamming every
+# issue scope-blocked behind it. #305 makes the reaper ACT under mode=afk (nudge -> relaunch ->
+# decide=blocked) while keeping attended's warn-and-wait untouched (the human is the wall).
+
+
+def _afk_mode_spoke(tmp_path: Path, mode: str, *, ahead: bool = True, name: str = "spoke") -> Path:
+    """A branched spoke worktree carrying an explicit .ai-toolkit/mode pointer (#305)."""
+    spoke = _branched_spoke(tmp_path, ahead=ahead, name=name)
+    (spoke / ".ai-toolkit").mkdir(parents=True, exist_ok=True)
+    (spoke / ".ai-toolkit" / "mode").write_text(f"{mode}\n")
+    return spoke
+
+
+# batch-plan --explain output for the #299 shape: issue 5 is in-flight and holds back #301, #302
+# (their Scope: collides), which read as `blocked-by-scope:#5`. _afk_scope_blocked_behind parses it.
+_HOLDS_BACK_5 = (
+    "#5     in-flight              (a.py) — holds back #301, #302\\n"
+    "#301   blocked-by-scope:#5    (a.py)\\n"
+    "#302   blocked-by-scope:#5    (a.py)\\n"
+)
+
+
+def test_pushed_but_unmarked_attended_still_warns(tmp_path: Path) -> None:
+    # AC2 regression pin: an ATTENDED pushed-but-unmarked spoke keeps today's warn-and-parked-LAST
+    # behavior — the human is the wall. No nudge, no relaunch, no blocked escalation.
+    spoke = _afk_mode_spoke(tmp_path, "attended")
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane alive
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    expr = "_afk_pushed_but_unmarked() { return 0; }; " + expr
+
+    _call(expr, env=env)
+
+    assert (statedir / "warned-5.txt").exists(), "attended keeps the warn-park"
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "attended must NOT escalate blocked"
+    )
+    assert "new-window" not in tmux_log.read_text(), "attended must NOT relaunch"
+
+
+def test_pushed_but_unmarked_afk_nudges_first(tmp_path: Path) -> None:
+    # AC1 rung 1: an afk pushed-but-unmarked finished-turn-idle spoke is NUDGED (emit-ready /
+    # continue) into its LIVE session — never warn-parked, never relaunched — and journaled.
+    spoke = _afk_mode_spoke(tmp_path, "afk")
+    projects = tmp_path / "projects"
+    jsonl = _project_dir_for(projects, spoke) / "session.jsonl"
+    fake_bin, tmux_log = _injector_tmux(
+        tmp_path, capture="│ > │\n", pane_path=spoke, clear_on_enter=1, touch=jsonl
+    )
+    expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    env["AFK_INJECT_VERIFY_SECONDS"] = "5"
+    env["AFK_INJECT_POLL_SECONDS"] = "1"
+    expr = "_afk_pushed_but_unmarked() { return 0; }; " + expr
+
+    _call(expr, env=env)
+
+    calls = tmux_log.read_text()
+    assert "send-keys -t afk:1 -l" in calls, f"afk pushed-but-unmarked is nudged: {calls}"
+    assert "new-window" not in calls, f"the nudge must NOT relaunch: {calls}"
+    assert "markready" in (statedir / "decision-journal.jsonl").read_text()
+    assert (statedir / "nudge-5.count").read_text().strip() == "1", "the nudge is counted"
+    assert not (statedir / "warned-5.txt").exists(), "afk acts — it does not warn-park"
+
+
+def test_pushed_but_unmarked_afk_revives_after_nudge_budget(tmp_path: Path) -> None:
+    # AC1 rung 2: past the shared #255 nudge budget, an afk pushed-but-unmarked spoke relaunches
+    # (kill + claude --continue) — the worktree + commits survive, as #299's did.
+    spoke = _afk_mode_spoke(tmp_path, "afk")
+    fake_bin, tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane alive
+    expr, env, _ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    (statedir / "nudge-5.count").write_text("2\n")  # budget spent
+    expr = "_afk_pushed_but_unmarked() { return 0; }; " + expr
+
+    _call(expr, env=env)
+
+    assert "new-window" in tmux_log.read_text(), "past the nudge budget, afk relaunches"
+    assert "revive" in (statedir / "decision-journal.jsonl").read_text()
+
+
+def test_pushed_but_unmarked_afk_escalates_after_nudge_and_relaunch(tmp_path: Path) -> None:
+    # AC1 rung 3 + AC4 replay: nudge budget spent AND a relaunch already tried this window ->
+    # the ladder's terminal LOUD escalation: blocked/5, naming the scope-blocked dependents.
+    spoke = _afk_mode_spoke(tmp_path, "afk")
+    fake_bin, _tmux_log = _reaper_tmux(tmp_path, pane_path=spoke)  # pane alive
+    expr, env, ready_log, statedir = _reaper_env(spoke, tmp_path, fake_bin, idle=True)
+    (statedir / "nudge-5.count").write_text("2\n")  # budget spent
+    (statedir / "resumed-5").write_text("1700000000\n")  # a revival already happened this window
+    env["BATCH_PLAN"] = str(_planner_stub(tmp_path, exit_code=0, out=_HOLDS_BACK_5))
+    expr = "_afk_pushed_but_unmarked() { return 0; }; " + expr
+
+    _call(expr, env=env)
+
+    assert "--blocked 5" in ready_log.read_text(), "the ladder's terminal escalates blocked/5"
+    journal = (statedir / "decision-journal.jsonl").read_text()
+    assert "#301" in journal and "#302" in journal, "the escalation names the stalled dependents"
+
+
+def test_scope_blocked_behind_parses_dependents(tmp_path: Path) -> None:
+    # AC3 helper: _afk_scope_blocked_behind returns the `#N` set batch-plan holds back behind
+    # this in-flight issue (the `blocked-by-scope:#<issue>` lines of --explain).
+    bp = _planner_stub(tmp_path, exit_code=0, out=_HOLDS_BACK_5)
+    expr = (
+        "inflight_issues() { printf '5\\n'; }; "
+        "_inflight_scope_args() { printf -- '--inflight\\na.py\\n'; }; "
+        "_afk_scope_blocked_behind 5"
+    )
+
+    result = _call(expr, env={"BATCH_PLAN": str(bp)})
+
+    assert result.stdout.strip() == "#301 #302", result.stdout + result.stderr
+
+
+def test_scope_blocked_behind_empty_when_none_held(tmp_path: Path) -> None:
+    # No `blocked-by-scope:#5` line -> nothing is stalled behind it -> empty (the escalation gate
+    # stays closed, so a harmless warn-park with nobody waiting keeps warn-parking).
+    bp = _planner_stub(
+        tmp_path, exit_code=0, out="#5     in-flight              (a.py) — runs alone\\n"
+    )
+    expr = (
+        "inflight_issues() { printf '5\\n'; }; "
+        "_inflight_scope_args() { printf -- '--inflight\\na.py\\n'; }; "
+        "_afk_scope_blocked_behind 5"
+    )
+
+    result = _call(expr, env={"BATCH_PLAN": str(bp)})
+
+    assert result.stdout.strip() == "", result.stdout + result.stderr
+
+
+def _warn_escalate_expr(issue: int = 5) -> str:
+    """Drive _warn_parked_last with the scope-graph helpers stubbed for a deterministic run."""
+    return (
+        "inflight_issues() { printf '%s\\n' 5; }; "
+        "_inflight_scope_args() { printf -- '--inflight\\na.py\\n'; }; "
+        f"_warn_parked_last \"$WT\" {issue} 'stuck at a clean tip' reap"
+    )
+
+
+def test_warn_parked_last_escalates_past_bound_with_dependents(tmp_path: Path) -> None:
+    # AC3: a mode=afk warn-park that has persisted past AFK_WARN_ESCALATE_ATTEMPTS WHILE dependents
+    # are scope-blocked behind it escalates blocked/5 + names them — never silent forever (the #299
+    # cost). This is the GENERAL rule applied to any ambiguous warn-park branch (req #2/#3).
+    spoke = _afk_mode_spoke(tmp_path, "afk")
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "warned-state-5").write_text("3\t1\n")  # attempt 3 (>= bound), next-due long past
+    ready_log = tmp_path / "ready.log"
+    ready = tmp_path / "spoke-ready.sh"
+    ready.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready.chmod(0o755)
+    env = {
+        "WT": str(spoke),
+        "AFK_STATE_DIR": str(statedir),
+        "SPOKE_READY": str(ready),
+        "BATCH_PLAN": str(_planner_stub(tmp_path, exit_code=0, out=_HOLDS_BACK_5)),
+    }
+
+    _call(_warn_escalate_expr(), env=env)
+
+    assert "--blocked 5" in ready_log.read_text(), "a dependent-stalling afk warn-park escalates"
+    journal = (statedir / "decision-journal.jsonl").read_text()
+    assert "#301" in journal and "#302" in journal, "the escalation names the stalled dependents"
+
+
+def test_warn_parked_last_no_escalate_without_dependents(tmp_path: Path) -> None:
+    # AC3 gate: past the bound but NOTHING scope-blocked behind it -> keep the reversible warn-park
+    # (nobody is waiting, so silence is harmless). No blocked escalation.
+    spoke = _afk_mode_spoke(tmp_path, "afk")
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "warned-state-5").write_text("3\t1\n")
+    ready_log = tmp_path / "ready.log"
+    ready = tmp_path / "spoke-ready.sh"
+    ready.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready.chmod(0o755)
+    env = {
+        "WT": str(spoke),
+        "AFK_STATE_DIR": str(statedir),
+        "SPOKE_READY": str(ready),
+        "BATCH_PLAN": str(
+            _planner_stub(tmp_path, exit_code=0, out="#5  in-flight  (a.py) — runs alone\\n")
+        ),
+    }
+
+    _call(_warn_escalate_expr(), env=env)
+
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "no dependents behind it -> no escalation, just the reversible warn-park"
+    )
+    assert (statedir / "warned-5.txt").exists(), (
+        "it still warn-parks (loud, retried on the backoff)"
+    )
+
+
+def test_warn_parked_last_attended_never_escalates(tmp_path: Path) -> None:
+    # AC2 (general): an ATTENDED warn-park is untouched even past the bound with dependents present —
+    # the human is the wall. No blocked escalation regardless of how long it has persisted.
+    spoke = _afk_mode_spoke(tmp_path, "attended")
+    statedir = tmp_path / "statedir"
+    statedir.mkdir()
+    (statedir / "warned-state-5").write_text("9\t1\n")  # well past any bound
+    ready_log = tmp_path / "ready.log"
+    ready = tmp_path / "spoke-ready.sh"
+    ready.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{ready_log}"\n')
+    ready.chmod(0o755)
+    env = {
+        "WT": str(spoke),
+        "AFK_STATE_DIR": str(statedir),
+        "SPOKE_READY": str(ready),
+        "BATCH_PLAN": str(_planner_stub(tmp_path, exit_code=0, out=_HOLDS_BACK_5)),
+    }
+
+    _call(_warn_escalate_expr(), env=env)
+
+    assert not ready_log.exists() or "--blocked 5" not in ready_log.read_text(), (
+        "attended stays warn-and-wait — never escalated by the drain"
+    )
+    assert (statedir / "warned-5.txt").exists()

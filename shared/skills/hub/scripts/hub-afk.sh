@@ -945,6 +945,24 @@ self-land -- the hub lands #$issue.
 EOF
 }
 
+# _afk_pushed_unmarked_prompt <issue> -> the #305 nudge for a clean-pushed tip that carries NO
+# ready marker and is NOT over the ceiling (the #200 shape #299 stranded on): the tree is pushed
+# and clean but the spoke stopped without emitting ready. Distinct from _afk_finish_up_prompt (an
+# over-ceiling finish-up) so the message is accurate -- it says nothing about a time ceiling. Names
+# the marker-emitter path that EXISTS in the spoke's worktree (the #271 probe).
+_afk_pushed_unmarked_prompt() {
+  local issue="$1" marker_dir
+  marker_dir="$(wt_marker_script_dir "${_AFK_TOPLEVEL:-.}")"
+  cat <<EOF
+Your branch is pushed and your working tree is clean, but you never emitted the ready marker for
+#$issue -- and nothing is blocking you (no question or permission dialog is pending). If the
+issue's acceptance criteria are ALL met, emit the ready marker now
+(bash ${marker_dir}/spoke-push.sh --ready $issue). If you still owe subtasks, re-read your task
+ledger and the working tree, then continue the solo flow (RED -> GREEN -> REVIEW -> PUSH) from
+where you left off, pushing each subtask. Do NOT self-land -- the hub lands #$issue.
+EOF
+}
+
 # _afk_conflict_resolve_prompt <issue> -> the #285 resolution message for a spoke whose land
 # hit a DETERMINISTIC merge conflict (a sibling landed edits to a file this spoke also owns).
 # The hub cannot resolve it — the spoke must merge the base branch on its side and re-push, so
@@ -1195,18 +1213,62 @@ _afk_capture_hang_forensics() {
 # revival was ALREADY tried this window downgrades to warned-and-parked-LAST (warn + journal +
 # arm the warned-retry backoff, retried at low frequency), NEVER killed or abandoned.
 
+# AFK_WARN_ESCALATE_ATTEMPTS: #305 — the warn count after which a mode=afk warn-park that is
+# STALLING scope-blocked dependents stops warn-parking silently and escalates blocked/<issue>. The
+# count is the warned-retry `attempt` (exponential backoff), so the default 3 is ~7 min of standing
+# failure (60 + 120 + 240s), not 3 ticks — long enough that a transient blip clears first, short
+# enough that a night is never lost. A non-numeric override falls back so a typo can't disable the
+# escalation (mirroring AFK_NUDGE_MAX_ATTEMPTS' guard).
+: "${AFK_WARN_ESCALATE_ATTEMPTS:=3}"
+case "$AFK_WARN_ESCALATE_ATTEMPTS" in '' | *[!0-9]*) AFK_WARN_ESCALATE_ATTEMPTS=3 ;; esac
+
+# _afk_warn_attempt <issue> [lane] -> the warned-retry attempt count already tracked in
+# _afk_warned_state_file ("<attempt>\t<next>"), or 0 when never warned on that lane. Reads the
+# gate-broker record directly (the file has no field-1 reader — _afk_warned_next reads field 2).
+_afk_warn_attempt() {
+  local f a=0
+  f="$(_afk_warned_state_file "$1" "${2:-}")"
+  [ -f "$f" ] && IFS=$'\t' read -r a _ <"$f" 2>/dev/null || true
+  case "$a" in '' | *[!0-9]*) a=0 ;; esac
+  printf '%s\n' "$a"
+}
+
 # _warn_parked_last <wt> <issue> <reason> [park_kind=reap] -> the never-abandon replacement for
 # reap_spoke: keep the spoke in rotation on the warned-retry backoff. NO window kill, NO
 # blocked/<issue>. It HONORS the backoff — it warns + journals only when the spoke is DUE, and
 # parks LAST SILENTLY inside the backoff window — so a permanently-stuck spoke is retried (and
 # re-warned) at LOW frequency, not warned + gh-commented every 5-minute tick. reversible: the
 # spoke's committed work is intact.
+#
+# #305 exception — the ONE place a warn-park is NOT cheap: an unattended (mode=afk) park that has
+# persisted past AFK_WARN_ESCALATE_ATTEMPTS WHILE other issues are scope-blocked behind it. Silence
+# there costs the whole window + everything queued (the #299 shape). So a DUE such park escalates a
+# loud, reversible blocked/<issue> (the one marker hub-notify pings under a live drain) naming the
+# stalled dependents, instead of warn-parking again. Gated on all three — a positive afk read, the
+# attempt bound, AND real dependents — so it is inert for: attended parks (the human is the wall,
+# AC2), worktree-less parks (dispatch failures, wt=""), and any park with nothing waiting behind it
+# (warn-parking is genuinely harmless then). The irreversible/outward carve-out is untouched.
 _warn_parked_last() {
-  local wt="$1" issue="$2" reason="$3" park="${4:-reap}"
+  local wt="$1" issue="$2" reason="$3" park="${4:-reap}" lane
+  lane="$(_afk_warned_lane "$park")"
   # Gate on the SAME lane broker_warn_continue arms for this park kind (#274): a land/review park
   # reads/arms auto_land's LAND lane, every other kind the default lane — so the due-check and the
   # arm stay on one clock. Inside the backoff → parked LAST silently this tick.
-  _afk_warned_due "$issue" "" "$(_afk_warned_lane "$park")" || return 0
+  _afk_warned_due "$issue" "" "$lane" || return 0
+  # #305: past-bound afk park stalling dependents → escalate loudly instead of re-warning.
+  if [ -n "$wt" ] && [ "$(_afk_spoke_mode "$wt")" = afk ] \
+     && [ "$(_afk_warn_attempt "$issue" "$lane")" -ge "$AFK_WARN_ESCALATE_ATTEMPTS" ]; then
+    local behind; behind="$(_afk_scope_blocked_behind "$issue")"
+    if [ -n "$behind" ]; then
+      local ereason="$reason — persisted past its warn bound (${AFK_WARN_ESCALATE_ATTEMPTS} warns) while STALLING scope-blocked dependents: $behind. Escalated blocked/$issue for a human (#305)."
+      log "→ warn-escalate #$issue: $ereason"
+      _afk_set_last_action "warn-escalate #$issue"
+      broker_journal_decision "$issue" "$park" "$ereason" reversible
+      _afk_park_terminal "$wt"
+      _afk_escalate_blocked "$wt" "$issue" "$ereason"
+      return 0
+    fi
+  fi
   log "→ warn-park-LAST #$issue: $reason"
   _afk_set_last_action "warn-park #$issue"
   broker_warn_continue "$wt" "$issue" "$park" "$reason" reversible
@@ -1301,6 +1363,29 @@ _afk_finish_up_nudge() {
   return "$rc"
 }
 
+# _afk_pushed_unmarked_nudge <wt> <issue> -> #305: the first rung of the pushed-but-unmarked ACT
+# ladder. Injects the emit-ready / continue nudge (_afk_pushed_unmarked_prompt) into the LIVE
+# session via the shared hardened injector, then journals a `markready` decision. Mirrors
+# _afk_finish_up_nudge: stamps only the answer-attempt epoch (never the progress epoch — a nudge
+# must not buy a fresh full ceiling), and rc mirrors inject_and_verify (the caller counts the
+# attempt against the shared #255 budget). Caller wraps this in _afk_run_with_heartbeat_fg.
+_afk_pushed_unmarked_nudge() {
+  local wt="$1" issue="$2" target rc
+  log "→ pushed-unmarked-nudge #$issue: clean pushed tip, no ready marker — injecting the emit-ready / continue nudge (no relaunch)"
+  _afk_set_last_action "pushed-unmarked-nudge #$issue"
+  target="$(_spoke_pane_target "$wt")"
+  if [ -z "$target" ]; then
+    log "  no live pane for #$issue — cannot nudge"
+    return 1
+  fi
+  stamp_answer_attempt "$issue"
+  inject_and_verify "$wt" "$target" "$(_afk_pushed_unmarked_prompt "$issue")"; rc=$?
+  broker_journal_decision "$issue" markready \
+    "pushed-but-unmarked: nudged the live session to emit ready / continue the cycle (no relaunch, #305)" reversible
+  if [ "$rc" -eq 0 ]; then _afk_emit_span "$wt" afk-pushed-unmarked-nudge success; else _afk_emit_span "$wt" afk-pushed-unmarked-nudge retry; fi
+  return "$rc"
+}
+
 # _afk_revive_or_park_last <wt> <issue> <reason> -> revive-first, then warned-parked-LAST. If a
 # revival was already tried this window (_afk_already_resumed) OR the relaunch cannot start, the
 # spoke is warned-and-parked-LAST rather than reaped — retried at low frequency, never abandoned.
@@ -1348,17 +1433,70 @@ _afk_finish_up_or_revive() {
   _afk_revive_or_park_last "$wt" "$issue" "$reason"
 }
 
-# _afk_warn_pushed_but_unmarked <wt> <issue> -> #200/#241: a clean-pushed tip with no completion
-# marker is warned-and-parked-LAST with an ACTIONABLE reason, NOT auto-marked. The shape is
-# AMBIGUOUS — genuinely finished (the marker just failed) vs idle BETWEEN subtasks (more work to
-# come, cf. _afk_pushed_but_unmarked's own caution) — so auto-emitting ready/<issue> could
-# auto-LAND incomplete work onto main (hard to reverse). Never abandoned: the loud warning
-# surfaces it for the human to re-run --ready or land by hand.
+# _afk_warn_pushed_but_unmarked <wt> <issue> -> #200/#241/#305: the pushed-but-unmarked handler,
+# dispatched on the spoke's execution mode. The shape is AMBIGUOUS — genuinely finished (the marker
+# just failed, as #299) vs idle BETWEEN subtasks — and today's warn-and-wait is correct ONLY when a
+# human is the wall. So:
+#   * mode=attended -> keep the warn-and-parked-LAST warn (the human re-runs --ready or lands by
+#     hand); NOT auto-marked, since auto-emitting ready could auto-LAND incomplete work onto main.
+#   * mode=afk -> the human is NOT there, so warn-parking forever wastes the window (the #299
+#     incident: a 10h stall that jammed everything scope-blocked behind it). ACT via the
+#     nudge -> relaunch -> decide ladder (_afk_act_pushed_but_unmarked) instead.
+# The mode is read from _afk_spoke_mode (gate-broker-permission.sh's empty-default helper, the
+# deny-wall's fail-safe signal); the attended DEFAULT is applied HERE (afk only on a positive read),
+# so a missing/unknown pointer keeps today's warn-and-wait — the conservative, regression-safe side.
 _afk_warn_pushed_but_unmarked() {
   local wt="$1" issue="$2"
+  if [ "$(_afk_spoke_mode "$wt")" = afk ]; then
+    _afk_act_pushed_but_unmarked "$wt" "$issue"
+    return
+  fi
   _warn_parked_last "$wt" "$issue" \
     "pushed-but-unmarked (#200): clean tip, no ready/$issue marker — if finished, re-run 'spoke-push.sh --ready $issue' or land by hand" \
     markready
+}
+
+# _afk_act_pushed_but_unmarked <wt> <issue> -> #305: the ACT ladder for a mode=afk clean-pushed tip
+# with no marker. nudge -> relaunch -> decide, each rung bounded by an existing per-window counter so
+# it CANNOT loop forever (the AC1 "never warn-parks indefinitely" guarantee):
+#   1. nudge   — a finished-turn-idle pane under the shared #255 nudge budget gets the emit-ready /
+#                continue nudge injected into its LIVE session (no relaunch). This is exactly the
+#                lane the pushed-but-unmarked warn short-circuited PAST before #305.
+#   2. relaunch— nudge budget spent (or the pane is hung/dead) and not yet revived this window ->
+#                _revive_spoke (kill + claude --continue; committed work survives, as #299's did).
+#   3. decide  — nudge budget spent AND already revived -> _afk_decide_pushed_but_unmarked: a LOUD
+#                terminal blocked/<issue> escalation (never an auto-land of ambiguous work).
+# Because blocked/<issue> at the tip reads terminal (`done`) in slot_state, the decide rung takes the
+# spoke OUT of the reap rotation — the ladder always terminates.
+_afk_act_pushed_but_unmarked() {
+  local wt="$1" issue="$2"
+  if _spoke_pane_alive "$wt" \
+     && _transcript_finished_turn_idle "$wt" \
+     && [ "$(_afk_read_nudge_count "$issue")" -lt "$AFK_NUDGE_MAX_ATTEMPTS" ]; then
+    _afk_incr_nudge_count "$issue" >/dev/null
+    _afk_run_with_heartbeat_fg _afk_pushed_unmarked_nudge "$wt" "$issue"
+    return 0
+  fi
+  if ! _afk_already_resumed "$issue"; then
+    _revive_spoke "$wt" "$issue" && return 0
+    # revival launch could not start — fall through to the terminal decision.
+  fi
+  _afk_decide_pushed_but_unmarked "$wt" "$issue"
+}
+
+# _afk_decide_pushed_but_unmarked <wt> <issue> -> #305: the ladder's terminal rung. Nudge + relaunch
+# both failed to produce a marker, so the spoke is genuinely stuck at a clean-pushed tip. The
+# acceptance evidence is on disk (clean tree, pushed==upstream), but the shape is ambiguous with
+# idle-between-subtasks, so we do NOT auto-land — we escalate a LOUD, reversible blocked/<issue> (the
+# one marker hub-notify pings under a live drain) naming any scope-blocked dependents, and journal
+# the decision (#241) so the morning review can land it or re-run --ready.
+_afk_decide_pushed_but_unmarked() {
+  local wt="$1" issue="$2" behind reason
+  behind="$(_afk_scope_blocked_behind "$issue")"
+  reason="pushed-but-unmarked (#200/#305): clean pushed tip, no ready/$issue marker; nudge + relaunch both failed to produce it${behind:+ — STALLING scope-blocked dependents: $behind}. Landing evidence is on disk (clean tree, pushed==upstream); escalated blocked/$issue for a human to land or re-run --ready."
+  broker_journal_decision "$issue" markready "$reason" reversible
+  _afk_park_terminal "$wt"
+  _afk_escalate_blocked "$wt" "$issue" "$reason"
 }
 
 # _reap_or_resume <wt> <issue> -> #241 §7/§8: revive-first, never block. A finished-but-unmarked
@@ -1523,6 +1661,26 @@ _inflight_scope_args() {
     scope="$(printf '%s\n' "$body" | sed -n 's/^[[:space:]]*[Ss]cope:[[:space:]]*//p' | head -1)"
     printf -- '--inflight\n%s\n' "${scope:-*}"
   done < <(inflight_issues)
+}
+
+# _afk_scope_blocked_behind <issue> -> #305: the space-joined `#N` list of OPEN issues batch-plan
+# is holding back specifically because their Scope: collides with THIS in-flight issue — i.e. the
+# work stalled behind it. Runs the SAME `batch-plan.sh --explain` the label sync uses, seeded with
+# the live in-flight scopes (_inflight_scope_args) + issue numbers (inflight_issues), and collects
+# every line whose disposition is `blocked-by-scope:#<issue>` (verified empirically — batch-plan
+# prints one such line per held issue, and a `— holds back #A, #B` suffix on the in-flight line).
+# Best-effort + timeout-bounded like every gh/planner call on this path: EMPTY on any failure (no
+# batch-plan, no python3, a planner error), so a naming miss never blocks the escalation it annotates.
+_afk_scope_blocked_behind() {
+  local issue="$1" bp out n
+  case "$issue" in '' | *[!0-9]*) return 0 ;; esac
+  bp="$(_afk_find_script "${BATCH_PLAN:-}" batch-plan.sh)" || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  local args=() line
+  while IFS= read -r line; do args+=("$line"); done < <(_inflight_scope_args)
+  while IFS= read -r n; do [ -n "$n" ] && args+=("--inflight-issue" "$n"); done < <(inflight_issues)
+  out="$(_afk_with_timeout "$AFK_PLANNER_TIMEOUT" bash "$bp" --explain ${args[@]+"${args[@]}"} 2>/dev/null)" || return 0
+  printf '%s\n' "$out" | awk -v want="blocked-by-scope:#${issue}" '$2 == want { printf "%s ", $1 }' | sed 's/ $//'
 }
 
 # --- concurrency cap + dispatch stagger (issue #151) --------------------------
