@@ -3,7 +3,9 @@
 #
 # The runtime-SUPERVISION lane of the /afk supervisor: the sleep inhibitor (caffeinate), the
 # watchdog + respawn, the self-update / self-deploy protocol (deploy the supervisor's own
-# landed code), the respawn crash-loop guard + kill-wedged, and the restart-survival re-arm.
+# landed code), the respawn crash-loop guard + kill-wedged, the restart-survival re-arm, and
+# the #243 hang-forensics capture (proc-tree + fingerprint before a kill; called by recover's
+# revive path).
 # A pure function-definition module sourced by the entry lib hub-afk.sh AFTER worktree-lib /
 # gate-broker / log / afk_now and the entry's own state/time primitives, and BEFORE any
 # function is called, so every cross-module helper resolves at call time. Not run on its own.
@@ -655,5 +657,121 @@ afk_reconcile() {
   _afk_spawn_watchdog     # keep exactly one watchdog alive (idempotent)
   log "/afk reconcile: re-armed — supervisor resumed, watchdog ensured"
   return 0
+}
+
+
+# --- #243: hang-forensics capture before the reaper's revival kills the pane --------
+# A live-but-frozen claude spoke (idle>AFK_IDLE_MINUTES with a live pane) is REVIVED by
+# _revive_spoke — which kills the pane and relaunches (#241), DESTROYING the evidence a hang
+# autopsy / upstream Claude Code report needs (process state, pane content, the wedged-input
+# symptom). So just before the kill, capture a best-effort, BOUNDED bundle. A spoke whose tmux
+# window is gone (no pane to observe) has nothing to capture and skips gracefully. Evidence
+# collection ONLY — the revive itself is #241's job; this is the microscope, not the fix.
+#
+# Bundles intentionally OUTLIVE the drain: unlike per-window state (dispatch epochs, resume
+# markers, warned records — all cleared on a fresh arm), a bundle is evidence the operator triages
+# later, so it is NOT cleared on re-arm and afk_hang_forensics_status counts every bundle on disk.
+# UPGRADE: add an age- or count-capped retention/prune policy if the bundle root grows unwieldy —
+# each bundle holds a full pane scrollback (capture-pane -S -, itself bounded by tmux's own
+# history-limit) plus a sample, so a long unattended run with many revives accumulates disk.
+
+# _afk_hang_forensics_dir -> the bundle root <git-common-dir>/hang-forensics. AFK_HANG_FORENSICS_DIR
+# overrides it for tests (mirrors _afk_state_dir).
+_afk_hang_forensics_dir() {
+  if [ -n "${AFK_HANG_FORENSICS_DIR:-}" ]; then printf '%s\n' "$AFK_HANG_FORENSICS_DIR"; return; fi
+  local common; common="$(git rev-parse --git-common-dir 2>/dev/null)" || common=".git"
+  printf '%s\n' "$common/hang-forensics"
+}
+
+# _afk_hang_sample_pid <pane_pid> <descendant_pids...> -> the pid `sample` should profile: the
+# AGENT process, NOT the pane's wrapper shell. The pane is launched as `sh -c "<cmd>; exec zsh"`
+# (see _afk_open_spoke_window), so pane_pid is a shell blocked in wait4() and claude runs as its
+# descendant — sampling pane_pid would only ever show the idle shell's wait loop. Prefer a
+# descendant whose command is claude/node; else the first descendant (the pane shell's direct
+# child is the launched claude); else pane_pid itself when there are no descendants.
+_afk_hang_sample_pid() {
+  local pane_pid="$1"; shift
+  local pid comm first=""
+  for pid in "$@"; do
+    [ -n "$first" ] || first="$pid"
+    comm="$(LC_ALL=C ps -o comm= -p "$pid" 2>/dev/null)"
+    case "$comm" in *[Cc]laude* | *node*) printf '%s\n' "$pid"; return 0 ;; esac
+  done
+  printf '%s\n' "${first:-$pane_pid}"
+}
+
+# _afk_capture_proc_tree <pane_pid> <out> -> write the pane process tree's ps snapshot
+# (pid/stat/etime/wchan) plus, on macOS, a short `sample` of the AGENT descendant, to <out>. The
+# ps read forces LC_ALL=C (the repo's locale trap: parsing localized columns silently strands the
+# fields), and the sample is time-BOUNDED with a tight KILL grace so it can never delay the reap
+# past the ~10s budget even under the coreutils-absent timeout fallback. Both best-effort: an empty
+# pane_pid or a failed probe leaves an empty/partial file, never an error.
+_afk_capture_proc_tree() {
+  local pane_pid="$1" out="$2" pids secs target kids k
+  case "$pane_pid" in '' | *[!0-9]*) return 0 ;; esac
+  kids="$(_afk_descendant_pids "$pane_pid" | tr '\n' ' ')"
+  pids="$pane_pid"
+  for k in $kids; do pids="$pids,$k"; done
+  LC_ALL=C ps -o pid,stat,etime,wchan -p "$pids" > "$out" 2>/dev/null || true
+  command -v sample >/dev/null 2>&1 || return 0
+  secs="${AFK_HANG_SAMPLE_SECONDS:-2}"; case "$secs" in '' | *[!0-9]*) secs=2 ;; esac
+  target="$(_afk_hang_sample_pid "$pane_pid" $kids)"
+  AFK_TIMEOUT_KILL_AFTER=2 _afk_with_timeout "$(( secs + 2 ))" sample "$target" "$secs" >> "$out" 2>/dev/null || true
+}
+
+# _afk_write_fingerprint <issue> <now> <mtime> <jsonl> -> emit the run fingerprint on stdout: the
+# transcript-activity-vs-UI-freeze delta (the hang's tell), elapsed since dispatch, the claude
+# version + model, and the OTEL env (the untested heavy-OTEL-logging correlation the issue flags).
+# The version + model are read from the SPOKE's transcript (each JSONL line carries both), NOT a
+# `claude --version` fork — forking the very binary that may be hung risks wedging the reap tick,
+# and the transcript reflects what the spoke actually ran. All best-effort; a missing field records
+# `unknown` rather than aborting.
+_afk_write_fingerprint() {
+  local issue="$1" now="$2" mtime="$3" jsonl="$4" disp elapsed=unknown silence=unknown ver model
+  disp="$(read_dispatch_epoch "$issue" | tr -d '[:space:]')"
+  case "$disp" in '' | *[!0-9]*) : ;; *) elapsed=$(( now - disp )) ;; esac
+  case "$mtime" in '' | *[!0-9]*) : ;; *) silence=$(( now - mtime )) ;; esac
+  if [ -n "$jsonl" ]; then
+    ver="$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$jsonl" 2>/dev/null | tail -1 | sed 's/.*: *"//;s/"$//')"
+    model="$(grep -oE '"model"[[:space:]]*:[[:space:]]*"[^"]*"' "$jsonl" 2>/dev/null | tail -1 | sed 's/.*: *"//;s/"$//')"
+  fi
+  printf 'issue=%s\ncaptured_epoch=%s\ntranscript_mtime=%s\ntranscript_silence_seconds=%s\nelapsed_since_dispatch_seconds=%s\n' \
+    "$issue" "$now" "${mtime:-unknown}" "$silence" "$elapsed"
+  printf 'claude_version=%s\nmodel=%s\n' "${ver:-unknown}" "${model:-unknown}"
+  printf 'AI_TOOLKIT_OTEL=%s\nOTEL_EXPORTER_OTLP_ENDPOINT=%s\nAI_TOOLKIT_OTEL_SPAN_ENDPOINT=%s\nOTEL_RESOURCE_ATTRIBUTES=%s\n' \
+    "${AI_TOOLKIT_OTEL:-}" "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" "${AI_TOOLKIT_OTEL_SPAN_ENDPOINT:-}" "${OTEL_RESOURCE_ATTRIBUTES:-}"
+}
+
+# _afk_capture_hang_forensics <wt> <issue> -> capture the hang bundle (best-effort, bounded) and
+# ECHO its path; echo NOTHING when there is no live pane to capture (a crashed spoke — the AC1
+# clean-reap skip). The bundle lands at <hang-forensics-dir>/<issue>-<epoch>/. Called from
+# _revive_spoke BEFORE the kill, so the frozen pane + its process tree are still observable.
+_afk_capture_hang_forensics() {
+  local wt="$1" issue="$2" target pane_pid dir jsonl now mtime
+  command -v tmux >/dev/null 2>&1 || return 0
+  target="$(_spoke_pane_target "$wt")"
+  [ -n "$target" ] || return 0            # no pane (window gone) — nothing to observe, skip gracefully
+  now="$(afk_now)"
+  dir="$(_afk_hang_forensics_dir)/$issue-$now"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  pane_pid="$(tmux display-message -p -t "$target" '#{pane_pid}' 2>/dev/null | tr -d '[:space:]')"
+  _afk_capture_proc_tree "$pane_pid" "$dir/process-tree.txt"
+  tmux capture-pane -p -S - -t "$target" > "$dir/pane.txt" 2>/dev/null || true
+  tmux display-message -p -t "$target" \
+    'pane_in_mode=#{pane_in_mode} pane_current_command=#{pane_current_command}' \
+    > "$dir/pane-meta.txt" 2>/dev/null || true
+  jsonl="$(_spoke_jsonl "$wt")"
+  if [ -n "$jsonl" ]; then
+    tail -n 50 "$jsonl" > "$dir/transcript-tail.jsonl" 2>/dev/null || true
+    # GNU `-c %Y` FIRST, BSD `-f %m` second (#289/#132). Reversed, this breaks on GNU: there
+    # `-f` selects filesystem-status mode and takes no inline format, so `%m` is read as a file
+    # operand -- GNU errors on it yet still PRINTS a multi-line fs block for the real file and
+    # exits nonzero, so the `||` fallback ALSO runs and the capture holds the garbage AND the
+    # epoch. That fails _afk_write_fingerprint's all-digits guard, stranding the silence delta
+    # (the hang's tell) as `unknown`. BSD rejects `-c` cleanly, so GNU-first is safe on both.
+    mtime="$(stat -c %Y "$jsonl" 2>/dev/null || stat -f %m "$jsonl" 2>/dev/null)"
+  fi
+  _afk_write_fingerprint "$issue" "$now" "${mtime:-}" "$jsonl" > "$dir/fingerprint.txt" 2>/dev/null || true
+  printf '%s\n' "$dir"
 }
 

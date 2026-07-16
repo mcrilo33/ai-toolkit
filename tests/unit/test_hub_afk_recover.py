@@ -26,7 +26,6 @@ RECOVER_FUNCTIONS = [
     "respawn_wedged_spoke",
     "_afk_finish_up_or_revive",
     "_afk_nudge_spoke",
-    "_afk_capture_hang_forensics",
     "_afk_auth_is_dead",
     "_afk_network_is_down",
     "_redispatch_dead_pane",

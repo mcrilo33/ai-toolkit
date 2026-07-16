@@ -27,6 +27,7 @@ SUPERVISE_FUNCTIONS = [
     "_afk_selfupdate_source_scripts",
     "_afk_respawn_allowed",
     "afk_reconcile",
+    "_afk_capture_hang_forensics",
 ]
 
 ALL_MODULES = ("land", "dispatch", "arm", "supervise", "recover")
